@@ -1,0 +1,48 @@
+# XPS5X default theme (spec `2026-07-13-xps5x-shell-design.md` §6, §11).
+#
+# Ships with the repository. Original palette/metric values only — no
+# third-party assets. This file's values are required to agree exactly
+# with the in-code fallback at `crates/xps5x-gui/src/theme/mod.rs::
+# default_theme()`; the two are covered by a test that loads this file and
+# compares it field-by-field against that function.
+#
+# A user-installed theme (never committed — see `.gitignore`) follows the
+# same shape and may add an `[assets]` section pointing at a local font
+# and/or background image the user supplies themselves:
+#
+#   [assets]
+#   font = "font.ttf"                    # relative to this theme's own directory
+#   background = "backgrounds/hero.png"  # ditto — no ".." or absolute paths
+
+name = "XPS5X Default"
+
+[palette]
+ground     = "#0a1017"
+raised     = "#141d29"
+line       = "#ffffff1a"
+text       = "#f3f7fc"
+text_dim   = "#a7b6c8"
+text_faint = "#6b7c90"
+accent     = "#1f8fff"
+accent_hi  = "#57b0ff"
+focus      = "#ffffff"
+scrim      = "#060a10eb"
+cc_scrim   = "#04070c8c"
+
+[metrics]
+topbar_padding_x       = 54.0
+topbar_padding_top     = 28.0
+content_padding_x      = 54.0
+content_padding_bottom = 18.0
+tile_size              = 150.0
+tile_gap               = 22.0
+tile_focus_scale       = 1.13
+tile_focus_lift        = 14.0
+rail_padding_left      = 54.0
+corner_radius          = 12.0
+button_radius          = 8.0
+card_width             = 190.0
+card_height            = 104.0
+card_gap               = 14.0
+cc_item_size           = 60.0
+cc_item_gap            = 12.0

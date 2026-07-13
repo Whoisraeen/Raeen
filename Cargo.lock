@@ -1802,6 +1802,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -4848,7 +4850,10 @@ dependencies = [
  "anyhow",
  "eframe",
  "egui",
+ "gilrs",
+ "image",
  "serde",
+ "thiserror 2.0.18",
  "toml",
  "tracing",
  "tracing-subscriber",

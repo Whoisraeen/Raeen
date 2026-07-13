@@ -38,6 +38,11 @@ pub struct GeneralConfig {
     pub window_height: u32,
     /// Enable VSync.
     pub vsync: bool,
+    /// Name of the active Shell theme (spec `2026-07-13-xps5x-shell-design.md`
+    /// §6/§10). SM2a only ships the in-code default theme, so this is a
+    /// single-item selector for now; SM2b's on-disk theme loader is what
+    /// actually resolves this name to a `themes/<name>` directory.
+    pub selected_theme: String,
 }
 
 impl Default for GeneralConfig {
@@ -47,6 +52,7 @@ impl Default for GeneralConfig {
             window_width: 1920,
             window_height: 1080,
             vsync: true,
+            selected_theme: "default".to_string(),
         }
     }
 }
@@ -171,6 +177,15 @@ pub struct PathConfig {
     pub shader_cache_dir: PathBuf,
     /// Directory for log files.
     pub log_dir: PathBuf,
+    /// User game-library folders the Shell scans for titles (Settings ▸
+    /// Game Folders). May contain zero, one, or many entries; `games_dir`
+    /// above remains the loader/kernel's own single game-data root and is
+    /// untouched by the Shell's folder list.
+    pub game_folders: Vec<PathBuf>,
+    /// Path to the user's KeyProvider file (the firmware-decryption seam).
+    /// The Shell only stores and displays this path — it never reads,
+    /// parses, or otherwise handles key material itself.
+    pub key_provider_path: PathBuf,
 }
 
 impl Default for PathConfig {
@@ -181,6 +196,8 @@ impl Default for PathConfig {
             save_dir: PathBuf::from("savedata"),
             shader_cache_dir: PathBuf::from("shader_cache"),
             log_dir: PathBuf::from("logs"),
+            game_folders: vec![PathBuf::from("Games")],
+            key_provider_path: PathBuf::new(),
         }
     }
 }

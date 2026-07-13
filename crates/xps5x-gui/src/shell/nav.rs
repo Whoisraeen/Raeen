@@ -1,0 +1,652 @@
+//! Focus model + input mapping (spec §3, §9, §10).
+//!
+//! Pure state machine: `(NavState, NavInput) -> (NavState, NavAction)`. No
+//! egui, no I/O — this is what the table-driven navigation tests exercise.
+//! `shell/mod.rs` is responsible for translating keyboard/gamepad events
+//! into [`NavInput`] and for acting on the returned [`NavAction`].
+//!
+//! SM1 adds a third mode, [`NavMode::ControlCenterOption`], for Control
+//! Center cards that expose a selectable option list (e.g. Power: Rest
+//! Mode / Restart / Turn Off). Confirming on a card with `option_count() >
+//! 0` drills into that list; Confirming an option there yields
+//! [`NavAction::ActivateOption`] and returns to the card view.
+//!
+//! SM2a adds two more things (spec §10 SM2):
+//! - A [`NavMode::Settings`] mode with its own two-dimensional focus
+//!   (`settings_section` + `settings_row`), navigated with Up/Down (which
+//!   also crosses section boundaries) and adjusted with Left/Right/Confirm.
+//! - A [`RailTab`] (Games/Media) on the Home rail, switched with
+//!   [`NavInput::Tab`]. Confirm behaves differently per tab: on Games,
+//!   confirming the wired-up Settings tile opens Settings instead of
+//!   launching; on Media it reports [`NavAction::LaunchMedia`] since there's
+//!   no media-playback engine to hand off to yet.
+
+/// A single navigation input, already normalized from keyboard or gamepad.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavInput {
+    Left,
+    Right,
+    /// Settings mode only: move row focus up (crossing into the previous
+    /// section at the top of the current one).
+    Up,
+    /// Settings mode only: move row focus down (crossing into the next
+    /// section at the bottom of the current one).
+    Down,
+    Confirm,
+    /// PS/Guide button (keyboard: `C`).
+    Guide,
+    Back,
+    /// Switch the Home rail between Games and Media (keyboard `Tab`,
+    /// gamepad L1/R1 — spec §10 SM2).
+    Tab,
+}
+
+/// A side effect the caller must perform in response to a [`NavInput`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavAction {
+    None,
+    /// Launch the Games-rail item at this index.
+    Launch(usize),
+    /// Confirm on a Media-rail tile. There's no media-playback engine to
+    /// hand off to yet, so the caller just logs/no-ops (spec §10 SM2).
+    LaunchMedia(usize),
+    OpenControlCenter,
+    CloseControlCenter,
+    /// Confirm selected `option` within Control Center card `card`.
+    ActivateOption { card: usize, option: usize },
+    /// The Settings tile was confirmed on the Games rail.
+    OpenSettings,
+    /// Settings was left via Back — the caller should persist any changes.
+    CloseSettings,
+    /// The focused Settings row's value should step by `delta` (`-1`/`1`) —
+    /// e.g. resolution scale, volume, deadzone, or the theme selector.
+    /// `nav.rs` has no notion of what a row actually is; the caller maps
+    /// `(section, row)` to a concrete field.
+    AdjustSetting { section: usize, row: usize, delta: i32 },
+    /// The focused Settings row was confirmed — a bool toggle, or a
+    /// semantic action (add/remove a game folder) only the caller knows how
+    /// to interpret.
+    ActivateSetting { section: usize, row: usize },
+    /// The Home rail's active tab changed.
+    SwitchTab(RailTab),
+}
+
+/// Which Home rail tab is active (spec §10 SM2: Games shows the library,
+/// Media shows the built-in media apps). Both tabs share the same rail
+/// rendering and focus model — only the backing item list differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RailTab {
+    #[default]
+    Games,
+    Media,
+}
+
+impl RailTab {
+    fn toggled(self) -> Self {
+        match self {
+            RailTab::Games => RailTab::Media,
+            RailTab::Media => RailTab::Games,
+        }
+    }
+}
+
+/// Which surface currently owns navigation input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavMode {
+    Home,
+    ControlCenter,
+    /// Drilled into the focused Control Center card's own option list.
+    ControlCenterOption,
+    /// Full-screen Settings surface (spec §10 SM2).
+    Settings,
+}
+
+/// The Shell's full navigation state: which surface is active, and the
+/// focus index within each of the rail, the Control Center row, and (when
+/// drilled in) the focused card's option list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavState {
+    pub mode: NavMode,
+    pub rail_index: usize,
+    pub rail_len: usize,
+    pub cc_index: usize,
+    pub cc_len: usize,
+    pub cc_option_index: usize,
+    /// Number of selectable options each Control Center card exposes; `0`
+    /// for cards that are display-only. Indexed in parallel with the
+    /// Control Center row (`cc_index`).
+    cc_option_counts: Vec<usize>,
+
+    /// Which Home rail is active.
+    pub tab: RailTab,
+    games_rail_len: usize,
+    media_rail_len: usize,
+
+    /// Games-rail index that opens Settings on Confirm instead of
+    /// launching (the "Settings" app tile). `None` if the caller never
+    /// wired one up (e.g. a bare test fixture with no Settings tile).
+    settings_tile_index: Option<usize>,
+    pub settings_section: usize,
+    pub settings_row: usize,
+    /// Number of rows in each Settings section, in display order.
+    /// `settings_row_counts.len()` is the section count.
+    settings_row_counts: Vec<usize>,
+}
+
+impl NavState {
+    /// Construct with every Control Center card display-only (no options)
+    /// and no Settings/Media wiring. Kept as a convenience constructor for
+    /// tests and any future caller that only needs the Home/Control Center
+    /// graph; the Shell itself chains [`NavState::with_settings`] and
+    /// [`NavState::with_media_rail_len`] onto [`NavState::with_cc_options`].
+    #[allow(dead_code)]
+    pub fn new(rail_len: usize, cc_len: usize) -> Self {
+        Self::with_cc_options(rail_len, cc_len, vec![0; cc_len])
+    }
+
+    /// Construct with an explicit per-card option count, in the same order
+    /// as the Control Center row.
+    pub fn with_cc_options(rail_len: usize, cc_len: usize, cc_option_counts: Vec<usize>) -> Self {
+        Self {
+            mode: NavMode::Home,
+            rail_index: 0,
+            rail_len,
+            cc_index: 0,
+            cc_len,
+            cc_option_index: 0,
+            cc_option_counts,
+            tab: RailTab::Games,
+            games_rail_len: rail_len,
+            media_rail_len: 0,
+            settings_tile_index: None,
+            settings_section: 0,
+            settings_row: 0,
+            settings_row_counts: Vec::new(),
+        }
+    }
+
+    /// Builder: wire up which Games-rail index opens Settings, and the
+    /// per-section row-count table Settings navigation uses.
+    pub fn with_settings(mut self, settings_tile_index: Option<usize>, settings_row_counts: Vec<usize>) -> Self {
+        self.settings_tile_index = settings_tile_index;
+        self.settings_row_counts = settings_row_counts;
+        self
+    }
+
+    /// Builder: the Media tab's rail length (spec §10 SM2).
+    pub fn with_media_rail_len(mut self, media_rail_len: usize) -> Self {
+        self.media_rail_len = media_rail_len;
+        self
+    }
+
+    /// Replace the Settings section/row-count table — e.g. after adding or
+    /// removing a game folder changes the Game Folders section's row count
+    /// — clamping the current section/row focus back into range.
+    pub fn set_settings_row_counts(&mut self, counts: Vec<usize>) {
+        self.settings_row_counts = counts;
+        if self.settings_section >= self.settings_row_counts.len() {
+            self.settings_section = self.settings_row_counts.len().saturating_sub(1);
+        }
+        let rows = self.settings_row_counts.get(self.settings_section).copied().unwrap_or(0);
+        self.settings_row = if rows == 0 { 0 } else { self.settings_row.min(rows - 1) };
+    }
+
+    /// Apply one input, mutating focus in place and returning the resulting
+    /// action (if any).
+    pub fn apply(&mut self, input: NavInput) -> NavAction {
+        match self.mode {
+            NavMode::Home => self.apply_home(input),
+            NavMode::ControlCenter => self.apply_control_center(input),
+            NavMode::ControlCenterOption => self.apply_control_center_option(input),
+            NavMode::Settings => self.apply_settings(input),
+        }
+    }
+
+    fn focused_option_count(&self) -> usize {
+        self.cc_option_counts.get(self.cc_index).copied().unwrap_or(0)
+    }
+
+    fn apply_home(&mut self, input: NavInput) -> NavAction {
+        match input {
+            NavInput::Left => {
+                self.rail_index = self.rail_index.saturating_sub(1);
+                NavAction::None
+            }
+            NavInput::Right => {
+                if self.rail_len > 0 {
+                    self.rail_index = (self.rail_index + 1).min(self.rail_len - 1);
+                }
+                NavAction::None
+            }
+            NavInput::Up | NavInput::Down => NavAction::None,
+            NavInput::Confirm => match self.tab {
+                RailTab::Games => {
+                    if self.settings_tile_index == Some(self.rail_index) {
+                        self.mode = NavMode::Settings;
+                        self.settings_section = 0;
+                        self.settings_row = 0;
+                        NavAction::OpenSettings
+                    } else {
+                        NavAction::Launch(self.rail_index)
+                    }
+                }
+                RailTab::Media => NavAction::LaunchMedia(self.rail_index),
+            },
+            NavInput::Guide => {
+                self.mode = NavMode::ControlCenter;
+                self.cc_index = 0;
+                NavAction::OpenControlCenter
+            }
+            NavInput::Back => NavAction::None,
+            NavInput::Tab => {
+                self.tab = self.tab.toggled();
+                self.rail_len = match self.tab {
+                    RailTab::Games => self.games_rail_len,
+                    RailTab::Media => self.media_rail_len,
+                };
+                self.rail_index = 0;
+                NavAction::SwitchTab(self.tab)
+            }
+        }
+    }
+
+    fn apply_control_center(&mut self, input: NavInput) -> NavAction {
+        match input {
+            NavInput::Left => {
+                self.cc_index = self.cc_index.saturating_sub(1);
+                NavAction::None
+            }
+            NavInput::Right => {
+                if self.cc_len > 0 {
+                    self.cc_index = (self.cc_index + 1).min(self.cc_len - 1);
+                }
+                NavAction::None
+            }
+            NavInput::Up | NavInput::Down | NavInput::Tab => NavAction::None,
+            NavInput::Confirm => {
+                if self.focused_option_count() > 0 {
+                    self.mode = NavMode::ControlCenterOption;
+                    self.cc_option_index = 0;
+                }
+                NavAction::None
+            }
+            NavInput::Guide | NavInput::Back => {
+                self.mode = NavMode::Home;
+                NavAction::CloseControlCenter
+            }
+        }
+    }
+
+    fn apply_control_center_option(&mut self, input: NavInput) -> NavAction {
+        let count = self.focused_option_count();
+        match input {
+            NavInput::Left => {
+                self.cc_option_index = self.cc_option_index.saturating_sub(1);
+                NavAction::None
+            }
+            NavInput::Right => {
+                if count > 0 {
+                    self.cc_option_index = (self.cc_option_index + 1).min(count - 1);
+                }
+                NavAction::None
+            }
+            NavInput::Up | NavInput::Down | NavInput::Tab => NavAction::None,
+            NavInput::Confirm => {
+                let action = NavAction::ActivateOption { card: self.cc_index, option: self.cc_option_index };
+                self.mode = NavMode::ControlCenter;
+                action
+            }
+            NavInput::Back => {
+                self.mode = NavMode::ControlCenter;
+                NavAction::None
+            }
+            NavInput::Guide => {
+                self.mode = NavMode::Home;
+                NavAction::CloseControlCenter
+            }
+        }
+    }
+
+    fn apply_settings(&mut self, input: NavInput) -> NavAction {
+        let section_count = self.settings_row_counts.len();
+        match input {
+            NavInput::Up => {
+                if self.settings_row > 0 {
+                    self.settings_row -= 1;
+                } else if self.settings_section > 0 {
+                    self.settings_section -= 1;
+                    let rows = self.settings_row_counts.get(self.settings_section).copied().unwrap_or(0);
+                    self.settings_row = rows.saturating_sub(1);
+                }
+                NavAction::None
+            }
+            NavInput::Down => {
+                let rows = self.settings_row_counts.get(self.settings_section).copied().unwrap_or(0);
+                if rows > 0 && self.settings_row + 1 < rows {
+                    self.settings_row += 1;
+                } else if self.settings_section + 1 < section_count {
+                    self.settings_section += 1;
+                    self.settings_row = 0;
+                }
+                NavAction::None
+            }
+            NavInput::Left => NavAction::AdjustSetting { section: self.settings_section, row: self.settings_row, delta: -1 },
+            NavInput::Right => NavAction::AdjustSetting { section: self.settings_section, row: self.settings_row, delta: 1 },
+            NavInput::Confirm => NavAction::ActivateSetting { section: self.settings_section, row: self.settings_row },
+            NavInput::Back => {
+                self.mode = NavMode::Home;
+                NavAction::CloseSettings
+            }
+            NavInput::Guide | NavInput::Tab => NavAction::None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Table-driven: (starting state, input) -> (expected rail/cc index,
+    /// expected mode, expected action).
+    #[test]
+    fn home_navigation_table() {
+        struct Case {
+            name: &'static str,
+            start_index: usize,
+            rail_len: usize,
+            input: NavInput,
+            expect_index: usize,
+            expect_action: NavAction,
+        }
+
+        let cases = [
+            Case { name: "right moves forward", start_index: 0, rail_len: 5, input: NavInput::Right, expect_index: 1, expect_action: NavAction::None },
+            Case { name: "left clamps at zero", start_index: 0, rail_len: 5, input: NavInput::Left, expect_index: 0, expect_action: NavAction::None },
+            Case { name: "right clamps at the end", start_index: 4, rail_len: 5, input: NavInput::Right, expect_index: 4, expect_action: NavAction::None },
+            Case { name: "left moves backward", start_index: 3, rail_len: 5, input: NavInput::Left, expect_index: 2, expect_action: NavAction::None },
+            Case { name: "confirm launches focused index", start_index: 2, rail_len: 5, input: NavInput::Confirm, expect_index: 2, expect_action: NavAction::Launch(2) },
+        ];
+
+        for case in cases {
+            let mut nav = NavState::new(case.rail_len, 11);
+            nav.rail_index = case.start_index;
+            let action = nav.apply(case.input);
+            assert_eq!(action, case.expect_action, "case: {}", case.name);
+            assert_eq!(nav.rail_index, case.expect_index, "case: {}", case.name);
+            assert_eq!(nav.mode, NavMode::Home, "case: {}", case.name);
+        }
+    }
+
+    #[test]
+    fn guide_opens_control_center_and_resets_its_focus() {
+        let mut nav = NavState::new(9, 11);
+        nav.rail_index = 5;
+        nav.cc_index = 7; // stale from a previous session
+        let action = nav.apply(NavInput::Guide);
+        assert_eq!(action, NavAction::OpenControlCenter);
+        assert_eq!(nav.mode, NavMode::ControlCenter);
+        assert_eq!(nav.cc_index, 0);
+        // Home focus is preserved for when we return.
+        assert_eq!(nav.rail_index, 5);
+    }
+
+    #[test]
+    fn control_center_navigation_table() {
+        struct Case {
+            name: &'static str,
+            start_index: usize,
+            cc_len: usize,
+            input: NavInput,
+            expect_index: usize,
+            expect_action: NavAction,
+            expect_mode: NavMode,
+        }
+
+        let cases = [
+            Case { name: "right moves forward", start_index: 0, cc_len: 11, input: NavInput::Right, expect_index: 1, expect_action: NavAction::None, expect_mode: NavMode::ControlCenter },
+            Case { name: "left clamps at zero", start_index: 0, cc_len: 11, input: NavInput::Left, expect_index: 0, expect_action: NavAction::None, expect_mode: NavMode::ControlCenter },
+            Case { name: "right clamps at the end", start_index: 10, cc_len: 11, input: NavInput::Right, expect_index: 10, expect_action: NavAction::None, expect_mode: NavMode::ControlCenter },
+            Case { name: "escape (Back) closes", start_index: 4, cc_len: 11, input: NavInput::Back, expect_index: 4, expect_action: NavAction::CloseControlCenter, expect_mode: NavMode::Home },
+            Case { name: "guide toggles closed", start_index: 4, cc_len: 11, input: NavInput::Guide, expect_index: 4, expect_action: NavAction::CloseControlCenter, expect_mode: NavMode::Home },
+        ];
+
+        for case in cases {
+            let mut nav = NavState::new(9, case.cc_len);
+            nav.mode = NavMode::ControlCenter;
+            nav.cc_index = case.start_index;
+            let action = nav.apply(case.input);
+            assert_eq!(action, case.expect_action, "case: {}", case.name);
+            assert_eq!(nav.cc_index, case.expect_index, "case: {}", case.name);
+            assert_eq!(nav.mode, case.expect_mode, "case: {}", case.name);
+        }
+    }
+
+    #[test]
+    fn empty_rail_does_not_panic_on_right() {
+        let mut nav = NavState::new(0, 0);
+        assert_eq!(nav.apply(NavInput::Right), NavAction::None);
+        assert_eq!(nav.rail_index, 0);
+    }
+
+    #[test]
+    fn confirm_on_a_display_only_card_does_not_drill_in() {
+        let mut nav = NavState::with_cc_options(9, 3, vec![0, 0, 3]);
+        nav.mode = NavMode::ControlCenter;
+        nav.cc_index = 0;
+        let action = nav.apply(NavInput::Confirm);
+        assert_eq!(action, NavAction::None);
+        assert_eq!(nav.mode, NavMode::ControlCenter);
+    }
+
+    /// Table-driven: the Control Center's option-drilldown transitions
+    /// (e.g. Power's Rest Mode / Restart / Turn Off list).
+    #[test]
+    fn control_center_option_navigation_table() {
+        struct Case {
+            name: &'static str,
+            start_mode: NavMode,
+            start_option_index: usize,
+            input: NavInput,
+            expect_mode: NavMode,
+            expect_option_index: usize,
+            expect_action: NavAction,
+        }
+
+        // Card index 2 has 3 options (mirrors Power in `control_center::ITEMS`).
+        let option_counts = vec![0, 0, 3];
+        let power_card = 2;
+
+        let cases = [
+            Case { name: "confirm on the options card drills in", start_mode: NavMode::ControlCenter, start_option_index: 0, input: NavInput::Confirm, expect_mode: NavMode::ControlCenterOption, expect_option_index: 0, expect_action: NavAction::None },
+            Case { name: "right moves within options", start_mode: NavMode::ControlCenterOption, start_option_index: 0, input: NavInput::Right, expect_mode: NavMode::ControlCenterOption, expect_option_index: 1, expect_action: NavAction::None },
+            Case { name: "right clamps at the last option", start_mode: NavMode::ControlCenterOption, start_option_index: 2, input: NavInput::Right, expect_mode: NavMode::ControlCenterOption, expect_option_index: 2, expect_action: NavAction::None },
+            Case { name: "left clamps at zero", start_mode: NavMode::ControlCenterOption, start_option_index: 0, input: NavInput::Left, expect_mode: NavMode::ControlCenterOption, expect_option_index: 0, expect_action: NavAction::None },
+            Case { name: "confirm activates the selected option and returns to the card", start_mode: NavMode::ControlCenterOption, start_option_index: 1, input: NavInput::Confirm, expect_mode: NavMode::ControlCenter, expect_option_index: 1, expect_action: NavAction::ActivateOption { card: power_card, option: 1 } },
+            Case { name: "back leaves option mode without activating", start_mode: NavMode::ControlCenterOption, start_option_index: 1, input: NavInput::Back, expect_mode: NavMode::ControlCenter, expect_option_index: 1, expect_action: NavAction::None },
+            Case { name: "guide closes control center entirely from option mode", start_mode: NavMode::ControlCenterOption, start_option_index: 1, input: NavInput::Guide, expect_mode: NavMode::Home, expect_option_index: 1, expect_action: NavAction::CloseControlCenter },
+        ];
+
+        for case in cases {
+            let mut nav = NavState::with_cc_options(9, option_counts.len(), option_counts.clone());
+            nav.mode = case.start_mode;
+            nav.cc_index = power_card;
+            nav.cc_option_index = case.start_option_index;
+            let action = nav.apply(case.input);
+            assert_eq!(action, case.expect_action, "case: {}", case.name);
+            assert_eq!(nav.mode, case.expect_mode, "case: {}", case.name);
+            assert_eq!(nav.cc_option_index, case.expect_option_index, "case: {}", case.name);
+        }
+    }
+
+    // --- SM2a: Settings mode ------------------------------------------------
+
+    #[test]
+    fn confirm_on_the_settings_tile_opens_settings_instead_of_launching() {
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), vec![4, 3, 2, 3, 1, 1]);
+        nav.rail_index = 8;
+        let action = nav.apply(NavInput::Confirm);
+        assert_eq!(action, NavAction::OpenSettings);
+        assert_eq!(nav.mode, NavMode::Settings);
+        assert_eq!(nav.settings_section, 0);
+        assert_eq!(nav.settings_row, 0);
+    }
+
+    #[test]
+    fn confirm_on_a_non_settings_tile_still_launches() {
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), vec![4]);
+        nav.rail_index = 2;
+        assert_eq!(nav.apply(NavInput::Confirm), NavAction::Launch(2));
+        assert_eq!(nav.mode, NavMode::Home);
+    }
+
+    #[test]
+    fn no_settings_tile_wired_up_never_diverts_confirm() {
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]); // settings_tile_index left None
+        nav.rail_index = 0;
+        assert_eq!(nav.apply(NavInput::Confirm), NavAction::Launch(0));
+    }
+
+    /// Table-driven: Settings' Up/Down row navigation, including crossing
+    /// section boundaries and clamping at the very top/bottom.
+    #[test]
+    fn settings_row_navigation_crosses_section_boundaries() {
+        struct Case {
+            name: &'static str,
+            start_section: usize,
+            start_row: usize,
+            input: NavInput,
+            expect_section: usize,
+            expect_row: usize,
+        }
+
+        let counts = vec![4, 3, 2]; // three sections for this table
+
+        let cases = [
+            Case { name: "down within a section", start_section: 0, start_row: 0, input: NavInput::Down, expect_section: 0, expect_row: 1 },
+            Case { name: "down at the last row of a section moves to the next section", start_section: 0, start_row: 3, input: NavInput::Down, expect_section: 1, expect_row: 0 },
+            Case { name: "down at the very last row clamps", start_section: 2, start_row: 1, input: NavInput::Down, expect_section: 2, expect_row: 1 },
+            Case { name: "up within a section", start_section: 1, start_row: 2, input: NavInput::Up, expect_section: 1, expect_row: 1 },
+            Case { name: "up at the first row of a section moves to the previous section's last row", start_section: 1, start_row: 0, input: NavInput::Up, expect_section: 0, expect_row: 3 },
+            Case { name: "up at the very first row clamps", start_section: 0, start_row: 0, input: NavInput::Up, expect_section: 0, expect_row: 0 },
+        ];
+
+        for case in cases {
+            let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), counts.clone());
+            nav.mode = NavMode::Settings;
+            nav.settings_section = case.start_section;
+            nav.settings_row = case.start_row;
+            let action = nav.apply(case.input);
+            assert_eq!(action, NavAction::None, "case: {}", case.name);
+            assert_eq!(nav.settings_section, case.expect_section, "case: {}", case.name);
+            assert_eq!(nav.settings_row, case.expect_row, "case: {}", case.name);
+        }
+    }
+
+    #[test]
+    fn settings_left_right_and_confirm_report_the_focused_row() {
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), vec![4, 3]);
+        nav.mode = NavMode::Settings;
+        nav.settings_section = 1;
+        nav.settings_row = 2;
+        assert_eq!(nav.apply(NavInput::Right), NavAction::AdjustSetting { section: 1, row: 2, delta: 1 });
+        assert_eq!(nav.apply(NavInput::Left), NavAction::AdjustSetting { section: 1, row: 2, delta: -1 });
+        assert_eq!(nav.apply(NavInput::Confirm), NavAction::ActivateSetting { section: 1, row: 2 });
+        // Adjusting/activating a row never itself leaves Settings.
+        assert_eq!(nav.mode, NavMode::Settings);
+    }
+
+    #[test]
+    fn back_leaves_settings_and_restores_home_focus() {
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), vec![4]);
+        nav.rail_index = 8;
+        assert_eq!(nav.apply(NavInput::Confirm), NavAction::OpenSettings);
+        assert_eq!(nav.mode, NavMode::Settings);
+
+        let action = nav.apply(NavInput::Back);
+        assert_eq!(action, NavAction::CloseSettings);
+        assert_eq!(nav.mode, NavMode::Home);
+        // The Home rail focus (the Settings tile itself) survived the trip.
+        assert_eq!(nav.rail_index, 8);
+    }
+
+    #[test]
+    fn set_settings_row_counts_clamps_focus_when_a_section_shrinks() {
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), vec![4, 3]);
+        nav.mode = NavMode::Settings;
+        nav.settings_section = 1;
+        nav.settings_row = 2; // last row of a 3-row section
+        nav.set_settings_row_counts(vec![4, 1]); // that section shrinks to 1 row
+        assert_eq!(nav.settings_row, 0);
+    }
+
+    #[test]
+    fn set_settings_row_counts_clamps_section_when_the_section_count_shrinks() {
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), vec![4, 3, 2]);
+        nav.mode = NavMode::Settings;
+        nav.settings_section = 2;
+        nav.set_settings_row_counts(vec![4, 3]);
+        assert_eq!(nav.settings_section, 1);
+        assert_eq!(nav.settings_row, 0);
+    }
+
+    #[test]
+    fn empty_settings_section_list_does_not_panic_on_up_or_down() {
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), vec![]);
+        nav.mode = NavMode::Settings;
+        assert_eq!(nav.apply(NavInput::Down), NavAction::None);
+        assert_eq!(nav.apply(NavInput::Up), NavAction::None);
+        assert_eq!(nav.settings_section, 0);
+        assert_eq!(nav.settings_row, 0);
+    }
+
+    // --- SM2a: Games/Media tab switching -------------------------------------
+
+    #[test]
+    fn tab_switches_between_games_and_media_and_resets_rail_focus() {
+        let mut nav = NavState::with_cc_options(5, 11, vec![0; 11]).with_media_rail_len(3);
+        nav.rail_index = 4;
+
+        let action = nav.apply(NavInput::Tab);
+        assert_eq!(action, NavAction::SwitchTab(RailTab::Media));
+        assert_eq!(nav.tab, RailTab::Media);
+        assert_eq!(nav.rail_len, 3);
+        assert_eq!(nav.rail_index, 0);
+
+        nav.rail_index = 2;
+        let action = nav.apply(NavInput::Tab);
+        assert_eq!(action, NavAction::SwitchTab(RailTab::Games));
+        assert_eq!(nav.tab, RailTab::Games);
+        assert_eq!(nav.rail_len, 5);
+        assert_eq!(nav.rail_index, 0);
+    }
+
+    #[test]
+    fn media_tab_rail_navigation_clamps_independently_of_games_rail_len() {
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_media_rail_len(2);
+        nav.apply(NavInput::Tab); // -> Media, rail_len == 2
+        assert_eq!(nav.apply(NavInput::Right), NavAction::None);
+        assert_eq!(nav.rail_index, 1);
+        assert_eq!(nav.apply(NavInput::Right), NavAction::None);
+        assert_eq!(nav.rail_index, 1, "clamps at the Media rail's own length, not the Games rail's");
+    }
+
+    #[test]
+    fn confirm_on_the_media_tab_reports_launch_media_not_launch() {
+        let mut nav = NavState::with_cc_options(5, 11, vec![0; 11]).with_media_rail_len(3);
+        nav.apply(NavInput::Tab); // -> Media
+        nav.rail_index = 1;
+        assert_eq!(nav.apply(NavInput::Confirm), NavAction::LaunchMedia(1));
+        assert_eq!(nav.mode, NavMode::Home);
+    }
+
+    #[test]
+    fn media_tab_confirm_ignores_the_games_tab_settings_tile_index() {
+        // Settings tile is Games-rail index 1; on the Media tab, index 1
+        // must never be diverted into Settings.
+        let mut nav = NavState::with_cc_options(5, 11, vec![0; 11]).with_settings(Some(1), vec![4]).with_media_rail_len(3);
+        nav.apply(NavInput::Tab); // -> Media
+        nav.rail_index = 1;
+        assert_eq!(nav.apply(NavInput::Confirm), NavAction::LaunchMedia(1));
+        assert_eq!(nav.mode, NavMode::Home);
+    }
+}
