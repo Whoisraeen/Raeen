@@ -109,6 +109,48 @@ impl VirtualMemoryManager {
         Ok(())
     }
 
+    /// Record region metadata for a mapping whose bytes are backed
+    /// *externally* — i.e. by the runtime's `GuestArena`, not a `Vec` owned
+    /// by this VMM (RT2 Task 5, design doc §5). Inserts a [`MemoryRegion`]
+    /// into `regions` only; deliberately does **not** touch `backing`.
+    ///
+    /// Because there is no `backing` entry, this VMM's own [`Self::read`]/
+    /// [`Self::write`] will not find bytes for `addr` — that is intentional:
+    /// the real bytes live in the arena, and callers must go through the
+    /// same [`xps5x_hle::GuestMemory`]-style view that owns them (the
+    /// arena itself), not through this VMM. `is_mapped`/`region_containing`
+    /// still work, since those only ever consult `regions`.
+    pub fn record_mapping(&self, addr: VAddr, size: u64, prot: u32) {
+        let aligned_size = align_up(size, xps5x_core::PS5_PAGE_SIZE as u64);
+        let protection = MemoryProtection::from_bits_truncate(prot);
+
+        let region = MemoryRegion {
+            vaddr: addr,
+            size: aligned_size,
+            protection,
+            memory_type: Ps5MemoryType::Onion,
+            name: Some("arena_mmap".to_string()),
+        };
+
+        debug!(
+            "record_mapping: {:#x}..{:#x} ({} bytes, prot={:?}) [externally backed]",
+            addr,
+            addr + aligned_size,
+            aligned_size,
+            protection
+        );
+
+        self.regions.write().insert(addr, region);
+    }
+
+    /// Remove metadata previously recorded by [`Self::record_mapping`].
+    /// Like `record_mapping`, this only touches `regions` — there is no
+    /// `backing` entry to remove, since this VMM never owned the bytes.
+    pub fn remove_mapping(&self, addr: VAddr) {
+        debug!("remove_mapping: {:#x}", addr);
+        self.regions.write().remove(&addr);
+    }
+
     /// Change memory protection (mprotect equivalent).
     pub fn mprotect(&self, addr: u64, _length: u64, prot: u32) -> Result<(), KernelError> {
         let protection = MemoryProtection::from_bits_truncate(prot);
@@ -300,5 +342,28 @@ mod tests {
         let region = vmm.region_containing(addr + 0x10).unwrap();
         assert_eq!(region.vaddr, addr);
         assert_eq!(region.size, 0x8000);
+    }
+
+    #[test]
+    fn record_mapping_and_remove_mapping_are_metadata_only() {
+        let vmm = VirtualMemoryManager::new();
+        let addr = 0x0000_1000_A000_0000;
+
+        vmm.record_mapping(addr, 0x4000, 0x3);
+
+        assert!(vmm.is_mapped(addr));
+        assert!(vmm.is_mapped(addr + 0x1234)); // Somewhere in the middle.
+        assert!(!vmm.is_mapped(addr + 0x4000)); // One past the end.
+
+        let region = vmm.region_containing(addr + 0x1234).unwrap();
+        assert_eq!(region.vaddr, addr);
+        assert_eq!(region.size, 0x4000);
+
+        // No `backing` entry was created — reads/writes through this VMM
+        // must not find bytes for an externally (arena-)backed region.
+        assert!(vmm.read(addr, 4).is_err());
+
+        vmm.remove_mapping(addr);
+        assert!(!vmm.is_mapped(addr));
     }
 }

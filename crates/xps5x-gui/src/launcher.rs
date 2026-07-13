@@ -146,11 +146,12 @@ impl GameLauncher for StubLauncher {
     }
 }
 
-/// Guest virtual address linked modules are laid out at. Matches the
-/// convention `xps5x-firmware`'s own homebrew-pipeline test and the
-/// `xps5x --load-sprx` diagnostic use; nothing claims this range as real
-/// memory yet since this milestone links modules but does not run them.
-const DEFAULT_LOAD_BASE: u64 = 0x8000_0000;
+/// Guest virtual address linked modules are laid out at. Must equal
+/// [`xps5x_runtime::GUEST_ARENA_BASE`] — RT2's `GuestArena` always
+/// identity-maps a module's image at that fixed base (guest address `A` is
+/// host address `A`), so a mismatched link base would make any
+/// `R_X86_64_RELATIVE` relocation resolve to the wrong host address.
+const DEFAULT_LOAD_BASE: u64 = xps5x_runtime::GUEST_ARENA_BASE;
 
 /// What came of trying to load+link (and, on Windows, run) one module for a
 /// launch.

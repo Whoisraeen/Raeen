@@ -16,9 +16,9 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 #[cfg(target_os = "windows")]
-mod dispatch;
+mod arena;
 #[cfg(target_os = "windows")]
-mod mem;
+mod dispatch;
 #[cfg(target_os = "windows")]
 mod trampoline;
 
@@ -26,6 +26,19 @@ use thiserror::Error;
 use xps5x_firmware::LinkedModule;
 use xps5x_hle::HleRegistry;
 use xps5x_kernel::OrbisKernel;
+
+/// The guest address space's fixed base (design doc §2/§3): a 4 GiB host
+/// region reserved at this exact address by [`arena::GuestArena`] (RT2 Task
+/// 2), identity-mapped so guest address `A` is host address `A`. High and
+/// normally free, clear of the trampoline guard at `0x4000_0000_0000` and
+/// the unresolved-stub sentinel at `0x5000_0000_0000`.
+///
+/// This is the single source of truth for the link base: the LM1 linker must
+/// link a module so guest vaddr `0` lands here, and `xps5x-gui`'s
+/// `FirmwareLauncher` passes this as the load base (RT2 Task 3). Exported
+/// unconditionally (not `cfg(windows)`-gated) since it is a pure constant —
+/// only [`arena::GuestArena`]'s reservation mechanism is Windows-specific.
+pub const GUEST_ARENA_BASE: u64 = 0x0000_1000_0000_0000;
 
 /// Errors [`execute_linked`] can return (design doc §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -63,11 +76,20 @@ const MAX_ARGS: usize = 6;
 /// `module.image`) natively, passing `args` (up to 6 integer/pointer
 /// values, SysV) and servicing every HLE trampoline call it makes through
 /// `hle`. Each serviced call gets an [`xps5x_hle::HleContext`] built from
-/// `kernel` and a [`mem::MappedImage`]-backed [`xps5x_hle::GuestMemory`]
-/// view of `module.image` (design doc §2's dispatch-context milestone), so
-/// HLE functions can touch the kernel and read/write guest memory, not just
-/// log. Returns the guest function's `RAX` on success. See the design doc
-/// §2 for the full trap-and-dispatch mechanism and §5 for this signature.
+/// `kernel` and a real, identity-mapped [`arena::GuestArena`] (design doc
+/// §2/§5's dispatch-context milestone), passed as both the
+/// [`xps5x_hle::GuestMemory`] and [`xps5x_hle::GuestAllocator`] views — so
+/// HLE functions can touch the kernel, read/write guest memory, and allocate
+/// real guest heap/mmap memory, not just log. Returns the guest function's
+/// `RAX` on success. See the design doc §2 for the full trap-and-dispatch
+/// mechanism and §5 for this signature.
+///
+/// **Requirement:** `module` must have been linked with `link_module`'s
+/// `base` set to [`GUEST_ARENA_BASE`] — the arena always maps `module.image`
+/// at `GUEST_ARENA_BASE` (identity: guest address `A` is host address `A`),
+/// so any `R_X86_64_RELATIVE` relocation baked in at a different base would
+/// resolve to the wrong host address. `entry_offset` is still a plain offset
+/// into `module.image` (host addr = `GUEST_ARENA_BASE + entry_offset`).
 #[cfg(target_os = "windows")]
 pub fn execute_linked(
     module: &LinkedModule,
@@ -86,15 +108,17 @@ pub fn execute_linked(
     // (design doc §4/§6/§9); held for this entire function, not just the
     // guest call inside `dispatch::run` below — see `dispatch::CALL_LOCK`'s
     // doc comment for why the trampoline guard reservation just below also
-    // needs this.
+    // needs this. It also serializes construction of the fixed-base
+    // `GuestArena` below, which only one caller may hold at a time (design
+    // doc §2/§9, `arena::GuestArena`'s doc comment).
     let _call_lock = dispatch::call_lock();
 
-    let image = mem::MappedImage::map(&module.image)?;
-    let entry_ptr = image.entry_ptr(entry_offset)?;
+    let arena = arena::GuestArena::new(&module.image)?;
+    let entry_ptr = arena.entry_ptr(entry_offset)?;
     let guard = trampoline::TrampolineGuard::reserve(module.hle_trampolines.len())?;
 
-    // SAFETY: `entry_ptr` is a host address inside `image`'s
-    // `PAGE_EXECUTE_READWRITE` mapping, at the caller-specified
+    // SAFETY: `entry_ptr` is a host address inside `arena`'s
+    // `PAGE_EXECUTE_READWRITE` image sub-region, at the caller-specified
     // `entry_offset` into `module.image` — code the LM1 pipeline produced,
     // and the only thing this crate ever executes (design doc §6).
     // Transmuting a data pointer to an `extern "sysv64"` function pointer
@@ -103,18 +127,20 @@ pub fn execute_linked(
     let entry: unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> u64 =
         unsafe { core::mem::transmute::<*const u8, _>(entry_ptr) };
 
-    // `image` doubles as the guest-memory view HLE calls get: RT0 images
-    // lay guest vaddrs from 0, so `image`'s own `GuestMemory` impl (guest
-    // vaddr `V` == mapped offset `V`) is exactly right (see `mem.rs`).
+    // `arena` doubles as both the guest-memory view and the guest allocator
+    // HLE calls get: it is identity-mapped (guest address `A` is host
+    // address `A`) and implements both `GuestMemory` and `GuestAllocator`
+    // (see `arena.rs`).
     //
     // SAFETY: `entry` is exactly the function pointer `dispatch::run`'s
     // safety contract requires (a valid `sysv64` pointer into the
-    // `MappedImage` we just built); `module.hle_trampolines`, `hle`,
-    // `kernel`, and `image` (as `&dyn GuestMemory`) all outlive this call
-    // (borrowed for its entire duration); `guard`'s region covers every
-    // address `module.hle_trampolines` can resolve (it was sized from that
-    // same table, immediately above).
-    unsafe { dispatch::run(entry, padded, &module.hle_trampolines, hle, kernel, &image, &guard) }
+    // `GuestArena` we just built); `module.hle_trampolines`, `hle`,
+    // `kernel`, and `arena` (as both `&dyn GuestMemory` and `&dyn
+    // GuestAllocator`) all outlive this call (borrowed for its entire
+    // duration); `guard`'s region covers every address
+    // `module.hle_trampolines` can resolve (it was sized from that same
+    // table, immediately above).
+    unsafe { dispatch::run(entry, padded, &module.hle_trampolines, hle, kernel, &arena, &arena, &guard) }
 }
 
 /// RT0 is Windows-first; a POSIX backend lands at a later milestone without

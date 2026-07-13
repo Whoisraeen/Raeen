@@ -52,14 +52,44 @@ pub trait GuestMemory {
     fn write(&self, guest_addr: u64, data: &[u8]) -> bool;
 }
 
+/// Allocates and releases guest memory on behalf of an HLE function —
+/// `malloc`/`free`/`realloc`/`mmap`/`munmap`'s underlying mechanism.
+///
+/// Every method is total: an exhausted arena, an overflowing size/alignment
+/// request, or an unrecognized address returns a sentinel (`None`, or simply
+/// doing nothing) rather than panicking. Nothing calls this trait's methods
+/// yet (that lands in RT2 Task 3/4/5, once a real implementation —
+/// `xps5x-runtime`'s `GuestArena` — exists); it is threaded through
+/// [`HleContext`] now so every call site is ready ahead of that.
+pub trait GuestAllocator {
+    /// Allocate at least `size` bytes, aligned to `align`, returning the
+    /// guest address of the new block, or `None` if the request cannot be
+    /// satisfied (exhausted arena, overflowing size/align, ...).
+    fn alloc(&self, size: u64, align: u64) -> Option<u64>;
+    /// Release a block previously returned by `alloc`/`realloc`/`mmap`. An
+    /// unrecognized `addr` is simply ignored.
+    fn free(&self, addr: u64);
+    /// Resize the block at `addr` to `new_size`, returning the (possibly
+    /// new) guest address, or `None` if the request cannot be satisfied —
+    /// `addr` is left untouched in that case.
+    fn realloc(&self, addr: u64, new_size: u64) -> Option<u64>;
+    /// Reserve a `length`-byte region aligned to `align`, returning its
+    /// guest address, or `None` if the request cannot be satisfied.
+    fn mmap(&self, length: u64, align: u64) -> Option<u64>;
+    /// Release a `length`-byte region previously returned by `mmap` starting
+    /// at `addr`. An unrecognized `addr` is simply ignored.
+    fn munmap(&self, addr: u64, length: u64);
+}
+
 /// Everything an HLE function may touch: the emulated kernel (memory,
-/// threads, filesystem, ...) and the guest's address space.
+/// threads, filesystem, ...), the guest's address space, and the guest
+/// allocator.
 ///
 /// This is the dispatch-context milestone: before it existed, an HLE
 /// function was a bare `fn(&[u64]) -> u64` with no way to read/write guest
 /// pointers or reach a live [`xps5x_kernel::OrbisKernel`] — every stub was
 /// necessarily a no-op that just logged and returned a plausible value. Now
-/// every HLE call gets both, so functions like `memcpy`/`strlen`/
+/// every HLE call gets all three, so functions like `memcpy`/`strlen`/
 /// `sceKernelMapFlexibleMemory` can do the real operation.
 pub struct HleContext<'a> {
     /// The live emulated kernel (memory manager, thread manager, VFS, ...).
@@ -67,6 +97,10 @@ pub struct HleContext<'a> {
     /// The guest's address space, as seen from wherever this call
     /// originated (e.g. the runtime's mapped module image).
     pub mem: &'a dyn GuestMemory,
+    /// The guest allocator backing `malloc`/`mmap` and friends. Not yet
+    /// consumed by any HLE function body — see [`GuestAllocator`]'s doc
+    /// comment.
+    pub alloc: &'a dyn GuestAllocator,
 }
 
 /// HLE function signature: takes a dispatch context and integer arguments,
@@ -185,13 +219,62 @@ impl GuestMemory for TestMemory {
     }
 }
 
-/// Build an [`HleContext`] over a test kernel and [`TestMemory`]. Defined at
-/// the crate root (not inside `mod tests`) so every submodule's own
-/// `#[cfg(test)] mod tests` can reach it as `crate::test_ctx` — Rust
-/// visibility lets descendant modules see their ancestors' private items.
 #[cfg(test)]
-pub(crate) fn test_ctx<'a>(kernel: &'a xps5x_kernel::OrbisKernel, mem: &'a TestMemory) -> HleContext<'a> {
-    HleContext { kernel, mem }
+/// A minimal in-memory [`GuestAllocator`] test double, for unit tests that
+/// need a complete [`HleContext`] but don't exercise allocation behavior
+/// (nothing calls `ctx.alloc` yet — see [`GuestAllocator`]'s doc comment).
+/// `alloc`/`mmap` are a bump allocator over a `Cell<u64>`; `free`/`munmap`
+/// are no-ops; `realloc` always bumps a fresh block rather than reusing
+/// `addr`.
+pub(crate) struct TestAllocator(std::cell::Cell<u64>);
+
+#[cfg(test)]
+impl TestAllocator {
+    pub(crate) fn new(base: u64) -> Self {
+        Self(std::cell::Cell::new(base))
+    }
+
+    fn bump(&self, size: u64, align: u64) -> Option<u64> {
+        let align = align.max(1);
+        let cur = self.0.get();
+        let aligned = cur.checked_add(align - 1)? & !(align - 1);
+        let next = aligned.checked_add(size)?;
+        self.0.set(next);
+        Some(aligned)
+    }
+}
+
+#[cfg(test)]
+impl GuestAllocator for TestAllocator {
+    fn alloc(&self, size: u64, align: u64) -> Option<u64> {
+        self.bump(size, align)
+    }
+
+    fn free(&self, _addr: u64) {}
+
+    fn realloc(&self, _addr: u64, new_size: u64) -> Option<u64> {
+        self.bump(new_size, 1)
+    }
+
+    fn mmap(&self, length: u64, align: u64) -> Option<u64> {
+        self.bump(length, align)
+    }
+
+    fn munmap(&self, _addr: u64, _length: u64) {}
+}
+
+/// Build an [`HleContext`] over a test kernel, [`TestMemory`], and
+/// [`TestAllocator`]. Defined at the crate root (not inside `mod tests`) so
+/// every submodule's own `#[cfg(test)] mod tests` can reach it as
+/// `crate::test_ctx` — Rust visibility lets descendant modules see their
+/// ancestors' private items.
+#[cfg(test)]
+pub(crate) fn test_ctx<'a>(
+    kernel: &'a xps5x_kernel::OrbisKernel,
+    mem: &'a TestMemory,
+    alloc: &'a TestAllocator,
+) -> HleContext<'a> {
+    HleContext { kernel, mem, alloc }
 }
 
 #[cfg(test)]
@@ -234,7 +317,8 @@ mod tests {
         let registry = HleRegistry::new();
         let kernel = xps5x_kernel::OrbisKernel::new();
         let mem = TestMemory::new(0x1000);
-        let ctx = test_ctx(&kernel, &mem);
+        let alloc = TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
         let samples: &[(&str, &str)] = &[
             ("libkernel", "sceKernelAllocateDirectMemory"),
             ("libkernel", "scePthreadCreate"),
