@@ -83,17 +83,21 @@ fn main() -> anyhow::Result<()> {
     // Launch the GUI.
     info!("Launching XPS5X GUI...");
 
-    // The Shell is a full-screen, PS5-style console experience — borderless
-    // and maximized rather than a resizable desktop window (spec §7).
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("XPS5X")
-            .with_fullscreen(true)
-            .with_decorations(false)
-            .with_inner_size([config.general.window_width as f32, config.general.window_height as f32])
-            .with_min_inner_size([800.0, 600.0]),
-        ..Default::default()
+    // The Shell is a full-screen, PS5-style console experience by default
+    // (spec §7): borderless fullscreen, sized by the OS to the active
+    // monitor. Forcing an inner_size alongside fullscreen used to strand a
+    // 1920x1080 window in the corner of larger displays, so the configured
+    // window size only applies when `general.fullscreen = false` opts into
+    // a normal desktop window.
+    let viewport = egui::ViewportBuilder::default()
+        .with_title("XPS5X")
+        .with_min_inner_size([800.0, 600.0]);
+    let viewport = if config.general.fullscreen {
+        viewport.with_fullscreen(true).with_decorations(false)
+    } else {
+        viewport.with_inner_size([config.general.window_width as f32, config.general.window_height as f32])
     };
+    let native_options = eframe::NativeOptions { viewport, ..Default::default() };
 
     eframe::run_native(
         "XPS5X",

@@ -249,7 +249,12 @@ impl Shell {
                 self.config.graphics.resolution_scale =
                     settings::adjust_stepped(self.config.graphics.resolution_scale, delta, 0.25, 0.5, 4.0)
             }
-            (0, 1) => self.config.general.fullscreen = !self.config.general.fullscreen,
+            (0, 1) => {
+                // Apply live — the viewport command is what actually moves
+                // the window in and out of fullscreen, not the config bit.
+                self.config.general.fullscreen = !self.config.general.fullscreen;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.config.general.fullscreen));
+            }
             (0, 2) => self.config.graphics.shader_cache = !self.config.graphics.shader_cache,
             (0, 3) => self.config.graphics.validation_layers = !self.config.graphics.validation_layers,
             (1, 0) => self.config.audio.enabled = !self.config.audio.enabled,

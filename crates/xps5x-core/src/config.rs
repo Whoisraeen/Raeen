@@ -30,7 +30,9 @@ pub struct EmulatorConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GeneralConfig {
-    /// Whether to run in fullscreen mode.
+    /// Whether to run as a borderless fullscreen shell (the default,
+    /// console-style experience) or a normal window sized by
+    /// `window_width`/`window_height`.
     pub fullscreen: bool,
     /// Window width (when not fullscreen).
     pub window_width: u32,
@@ -48,7 +50,7 @@ pub struct GeneralConfig {
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
-            fullscreen: false,
+            fullscreen: true,
             window_width: 1920,
             window_height: 1080,
             vsync: true,
