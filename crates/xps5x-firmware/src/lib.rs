@@ -13,9 +13,11 @@ pub const CRATE_NAME: &str = "xps5x-firmware";
 
 pub mod slb2;
 pub mod pup;
+pub mod crypto;
 
 pub use slb2::{parse_slb2, Slb2Entry};
 pub use pup::Firmware;
+pub use crypto::{require_key, KeyProvider, KeyRequest, NoKeysProvider, SegmentKey};
 
 #[cfg(test)]
 mod tests {
