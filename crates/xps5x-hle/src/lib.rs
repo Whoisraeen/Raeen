@@ -52,6 +52,8 @@ impl HleRegistry {
         };
 
         // Register all implemented HLE functions.
+        libkernel::register(&registry);
+        libc::register(&registry);
         libsce_sysmodule::register(&registry);
         libsce_video_out::register(&registry);
         libsce_pad::register(&registry);
@@ -127,6 +129,39 @@ mod tests {
                 registry.is_implemented(library, function),
                 "registered_names produced ({library}, {function}) that is_implemented doesn't recognize"
             );
+        }
+    }
+
+    #[test]
+    fn new_registers_substantially_more_than_the_original_three_libraries() {
+        let registry = HleRegistry::new();
+        // Before this change, `new()` only wired up libSceSysmodule (3
+        // functions), libSceVideoOut (5 functions), and libScePad (4
+        // functions) — 12 functions total. Broadening libkernel/libc
+        // coverage should push this well past that.
+        assert!(
+            registry.functions.len() > 12,
+            "expected substantially more than the original 3-library baseline (12 functions), got {}",
+            registry.functions.len()
+        );
+    }
+
+    #[test]
+    fn representative_libkernel_and_libc_functions_are_implemented_and_callable() {
+        let registry = HleRegistry::new();
+        let samples: &[(&str, &str)] = &[
+            ("libkernel", "sceKernelAllocateDirectMemory"),
+            ("libkernel", "scePthreadCreate"),
+            ("libc", "malloc"),
+            ("libc", "memcpy"),
+        ];
+        for (library, function) in samples {
+            assert!(
+                registry.is_implemented(library, function),
+                "expected {library}::{function} to be implemented"
+            );
+            let result = registry.call(library, function, &[1, 2, 3, 4]);
+            assert!(result.is_some(), "{library}::{function} should return a value, not None");
         }
     }
 

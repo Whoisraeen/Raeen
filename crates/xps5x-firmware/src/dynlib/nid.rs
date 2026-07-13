@@ -247,6 +247,25 @@ mod nid_database_tests {
         assert!(!db.is_empty());
     }
 
+    /// The payoff test for broadening HLE coverage (see xps5x-hle's
+    /// `libkernel`/`libc` modules): a `NidDatabase` built from the *real*
+    /// `HleRegistry::new()` (not a hand-built fixture) must resolve a real
+    /// PS5 import NID — `sceKernelAllocateDirectMemory` — straight through to
+    /// its HLE `"library::function"` name. This proves a real module's
+    /// import of this function now resolves to HLE instead of `Unresolved`.
+    #[test]
+    fn real_hle_registry_resolves_sce_kernel_allocate_direct_memory_nid() {
+        let hle = xps5x_hle::HleRegistry::new();
+        let db = NidDatabase::from_hle_names(hle.registered_names());
+
+        let nid = nid_of("sceKernelAllocateDirectMemory");
+        assert_eq!(
+            db.resolve(nid),
+            Some("libkernel::sceKernelAllocateDirectMemory"),
+            "expected sceKernelAllocateDirectMemory's NID to resolve via the real HLE registry"
+        );
+    }
+
     #[test]
     fn collision_keeps_first_and_does_not_panic() {
         // Same function name registered under two different libraries maps
