@@ -52,6 +52,8 @@ Allocate a **TCB** (thread control block) plus the module's TLS block in the are
 - **RT2c-b — TLS / `fsbase`.** Spike first (§3); then, if viable, TCB + TLS block + `WRFSBASE`. **Acceptance:** a guest function that reads `fs:[0]` returns the TCB pointer we installed, and a value stored at a TLS offset round-trips — run through `execute_linked` on Windows. If the spike shows `WRFSBASE` unusable, the deliverable is the documented limitation + the spike test, not a fragile implementation.
 - **RT2c+ (future):** per-thread stacks/TLS for guest threads (`scePthreadCreate` executing real code), full `_start`/crt0 (argc/argv/auxv), guard-page stack overflow detection, POSIX backend.
 
+> **Note (RT2c-a review):** the guest stack region currently abuts the mmap region directly (`stack_top == base + MMAP_OFFSET`), with **no guard page** between them. A guest stack overflow therefore silently grows into the adjacent guest mmap region instead of faulting — contained within guest memory (no host impact), but it means the RT1a fault-recovery net does not catch guest stack overflow. Adding a `PAGE_NOACCESS` guard page below the stack region (so overflow faults and is recovered as `Faulted`) is a small follow-up folded into the guard-page item above.
+
 ## 6. Verification
 
 - **RT2c-a (`cargo test`, Windows):** the RSP-in-stack-region assertion via a test HLE function; a recursion/large-local guest stub returning a known value; the existing fault-recovery test unchanged; existing execute tests green.
