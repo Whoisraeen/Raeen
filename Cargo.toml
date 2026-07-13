@@ -67,6 +67,8 @@ gilrs = "0.11"
 # Compression / Decompression
 lz4_flex = "0.11"
 zstd = "0.13"
+flate2 = "1"
+lzma-rs = "0.3"
 
 # Firmware crypto + NID hashing
 aes = "0.9"
