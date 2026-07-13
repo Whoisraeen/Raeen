@@ -55,7 +55,8 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 };
 
 use xps5x_firmware::HleTrampoline;
-use xps5x_hle::HleRegistry;
+use xps5x_hle::{GuestMemory, HleContext, HleRegistry};
+use xps5x_kernel::OrbisKernel;
 
 use crate::RuntimeError;
 use crate::trampoline::{self, TrampolineGuard};
@@ -92,6 +93,15 @@ pub(crate) fn call_lock() -> std::sync::MutexGuard<'static, ()> {
 struct ActiveContext {
     trampolines: *const [HleTrampoline],
     hle: *const HleRegistry,
+    /// The live kernel an HLE call's [`HleContext::kernel`] borrows from.
+    /// Stored as a raw pointer for the same reason `trampolines`/`hle` are
+    /// (see `CALL_LOCK`'s doc comment): only one OS thread is ever "inside"
+    /// a guarded call at a time, and the VEH only ever runs synchronously
+    /// on that same thread, so a non-atomic raw pointer read here is sound.
+    kernel: *const OrbisKernel,
+    /// The guest memory view an HLE call's [`HleContext::mem`] borrows
+    /// from — a trait object pointer (fat pointer) for the same reason.
+    mem: *const dyn GuestMemory,
     region_base: u64,
     region_len: u64,
     error: Cell<Option<RuntimeError>>,
@@ -127,15 +137,18 @@ static ACTIVE_CONTEXT: AtomicPtr<ActiveContext> = AtomicPtr::new(ptr::null_mut()
 /// `extern "sysv64"` calling convention, into memory the caller mapped
 /// specifically so it can be executed (i.e. a live
 /// [`crate::mem::MappedImage`]'s contents) — calling it runs that code
-/// natively on the current thread. `trampolines` and `hle` must outlive this
-/// call (guaranteed by `execute_linked`'s borrows). `guard` must be the
-/// [`TrampolineGuard`] whose region covers every address `trampolines`
-/// resolves.
+/// natively on the current thread. `trampolines`, `hle`, `kernel`, and `mem`
+/// must outlive this call (guaranteed by `execute_linked`'s borrows). `guard`
+/// must be the [`TrampolineGuard`] whose region covers every address
+/// `trampolines` resolves.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run(
     entry: unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> u64,
     args: [u64; 6],
     trampolines: &[HleTrampoline],
     hle: &HleRegistry,
+    kernel: &OrbisKernel,
+    mem: &dyn GuestMemory,
     guard: &TrampolineGuard,
 ) -> Result<u64, RuntimeError> {
     // Serialization (only one native guest execution at a time, RT0) is
@@ -153,9 +166,30 @@ pub(crate) unsafe fn run(
     // never reads it).
     let mut recovery_ctx: CONTEXT = unsafe { core::mem::zeroed() };
 
+    // `dyn GuestMemory` written bare (as `ActiveContext.mem`'s field type is)
+    // carries an implicit `'static` bound, unlike `&dyn GuestMemory`, whose
+    // bound follows the reference's own lifetime — so building the raw
+    // pointer needs an explicit lifetime-erasing transmute here, the same
+    // trick applied implicitly by the plain `as *const _` casts just below
+    // for `trampolines`/`hle`/`kernel` (those aren't trait objects, so they
+    // don't hit this). Sound for the same reason those are: `run`'s safety
+    // contract requires `mem` to outlive this call, it is only ever
+    // dereferenced synchronously on this thread while `ctx` is alive (see
+    // `CALL_LOCK`'s doc comment), and `ACTIVE_CONTEXT` is cleared before
+    // `run` returns.
+    //
+    // SAFETY: `&dyn GuestMemory` and `&'static dyn GuestMemory` have
+    // identical layout (data pointer + vtable pointer); this only widens the
+    // *type-level* lifetime, which the actual borrow (`mem`, tied to
+    // `execute_linked`'s stack frame for this whole call) still outlives in
+    // practice.
+    let mem_erased: &'static dyn GuestMemory = unsafe { core::mem::transmute::<&dyn GuestMemory, &'static dyn GuestMemory>(mem) };
+
     let ctx = ActiveContext {
         trampolines: trampolines as *const [HleTrampoline],
         hle: hle as *const HleRegistry,
+        kernel: kernel as *const OrbisKernel,
+        mem: mem_erased as *const dyn GuestMemory,
         region_base: guard.base(),
         region_len: guard.len(),
         error: Cell::new(None),
@@ -305,17 +339,21 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
-    // SAFETY: `ctx.trampolines`/`ctx.hle` were stored by `run` from live
-    // `&[HleTrampoline]`/`&HleRegistry` references that, per `run`'s safety
-    // contract, outlive this call.
+    // SAFETY: `ctx.trampolines`/`ctx.hle`/`ctx.kernel`/`ctx.mem` were stored
+    // by `run` from live `&[HleTrampoline]`/`&HleRegistry`/`&OrbisKernel`/
+    // `&dyn GuestMemory` references that, per `run`'s safety contract,
+    // outlive this call.
     let trampolines = unsafe { &*ctx.trampolines };
     let hle = unsafe { &*ctx.hle };
+    let kernel = unsafe { &*ctx.kernel };
+    let mem = unsafe { &*ctx.mem };
 
     let result = match trampoline::resolve(fault_addr, trampolines) {
         Some(t) => {
             // SysV integer argument registers (design doc §3).
             let args = [context.Rdi, context.Rsi, context.Rdx, context.Rcx, context.R8, context.R9];
-            hle.call(&t.library, &t.function, &args).unwrap_or(0)
+            let hle_ctx = HleContext { kernel, mem };
+            hle.call(&hle_ctx, &t.library, &t.function, &args).unwrap_or(0)
         }
         None => {
             // A call landed in the guarded region but names no known

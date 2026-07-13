@@ -33,6 +33,11 @@ pub(crate) struct MappedImage {
     /// The real (unpadded) `LinkedModule.image` length, for entry-offset
     /// bounds checks. The underlying allocation may be larger (page-rounded).
     image_len: usize,
+    /// The actual (page-rounded) committed allocation length — the full
+    /// range of host bytes backing this mapping, and therefore the bound
+    /// [`GuestMemory`] read/write checks against (guest offsets into the
+    /// zero-padding past `image_len` are still valid, committed memory).
+    alloc_len: usize,
 }
 
 impl MappedImage {
@@ -70,6 +75,7 @@ impl MappedImage {
         Ok(Self {
             ptr,
             image_len: image.len(),
+            alloc_len,
         })
     }
 
@@ -84,6 +90,50 @@ impl MappedImage {
         // `self.ptr` is at least `self.image_len` bytes (see `map`), so the
         // resulting pointer stays within the allocation.
         Ok(unsafe { self.ptr.as_ptr().add(offset) })
+    }
+}
+
+/// [`crate::dispatch`]'s VEH gives every HLE call a [`xps5x_hle::GuestMemory`]
+/// view of the currently-executing guest's address space. RT0 images are
+/// laid out with guest vaddr `0` at the start of the mapping (design doc
+/// §2), so "guest vaddr `V`" and "`mapped_base + V`" are the same offset —
+/// translation is just pointer arithmetic, bounds-checked against
+/// `alloc_len` (the real, committed allocation size, not just the unpadded
+/// `image_len`) so an HLE function handed a wild guest pointer gets `false`
+/// rather than an OOB host read/write.
+impl xps5x_hle::GuestMemory for MappedImage {
+    fn read(&self, guest_addr: u64, out: &mut [u8]) -> bool {
+        let Ok(addr) = usize::try_from(guest_addr) else { return false };
+        let Some(end) = addr.checked_add(out.len()) else { return false };
+        if end > self.alloc_len {
+            return false;
+        }
+        // SAFETY: `addr + out.len() <= self.alloc_len`, and `self.ptr` is a
+        // committed, readable allocation of at least `self.alloc_len` bytes
+        // (see `map`) that this `MappedImage` exclusively owns for its
+        // lifetime — no other live reference can be writing these same
+        // bytes concurrently under RT0's single-active-execution invariant
+        // (design doc §4/§6/§9, `dispatch::CALL_LOCK`).
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.ptr.as_ptr().add(addr), out.as_mut_ptr(), out.len());
+        }
+        true
+    }
+
+    fn write(&self, guest_addr: u64, data: &[u8]) -> bool {
+        let Ok(addr) = usize::try_from(guest_addr) else { return false };
+        let Some(end) = addr.checked_add(data.len()) else { return false };
+        if end > self.alloc_len {
+            return false;
+        }
+        // SAFETY: same bounds argument as `read` above; the allocation is
+        // `PAGE_EXECUTE_READWRITE` (see `map`), so it is writable, and the
+        // single-active-execution invariant means no concurrent access to
+        // these bytes exists while this call runs.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.as_ptr().add(addr), data.len());
+        }
+        true
     }
 }
 

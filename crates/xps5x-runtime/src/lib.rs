@@ -25,6 +25,7 @@ mod trampoline;
 use thiserror::Error;
 use xps5x_firmware::LinkedModule;
 use xps5x_hle::HleRegistry;
+use xps5x_kernel::OrbisKernel;
 
 /// Errors [`execute_linked`] can return (design doc §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -61,12 +62,17 @@ const MAX_ARGS: usize = 6;
 /// Run `module`'s function at `entry_offset` (an offset into
 /// `module.image`) natively, passing `args` (up to 6 integer/pointer
 /// values, SysV) and servicing every HLE trampoline call it makes through
-/// `hle`. Returns the guest function's `RAX` on success. See the design doc
+/// `hle`. Each serviced call gets an [`xps5x_hle::HleContext`] built from
+/// `kernel` and a [`mem::MappedImage`]-backed [`xps5x_hle::GuestMemory`]
+/// view of `module.image` (design doc §2's dispatch-context milestone), so
+/// HLE functions can touch the kernel and read/write guest memory, not just
+/// log. Returns the guest function's `RAX` on success. See the design doc
 /// §2 for the full trap-and-dispatch mechanism and §5 for this signature.
 #[cfg(target_os = "windows")]
 pub fn execute_linked(
     module: &LinkedModule,
     hle: &HleRegistry,
+    kernel: &OrbisKernel,
     entry_offset: u64,
     args: &[u64],
 ) -> Result<u64, RuntimeError> {
@@ -97,13 +103,18 @@ pub fn execute_linked(
     let entry: unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> u64 =
         unsafe { core::mem::transmute::<*const u8, _>(entry_ptr) };
 
+    // `image` doubles as the guest-memory view HLE calls get: RT0 images
+    // lay guest vaddrs from 0, so `image`'s own `GuestMemory` impl (guest
+    // vaddr `V` == mapped offset `V`) is exactly right (see `mem.rs`).
+    //
     // SAFETY: `entry` is exactly the function pointer `dispatch::run`'s
     // safety contract requires (a valid `sysv64` pointer into the
-    // `MappedImage` we just built); `module.hle_trampolines` and `hle`
-    // outlive this call (both borrowed for its entire duration); `guard`'s
-    // region covers every address `module.hle_trampolines` can resolve (it
-    // was sized from that same table, immediately above).
-    unsafe { dispatch::run(entry, padded, &module.hle_trampolines, hle, &guard) }
+    // `MappedImage` we just built); `module.hle_trampolines`, `hle`,
+    // `kernel`, and `image` (as `&dyn GuestMemory`) all outlive this call
+    // (borrowed for its entire duration); `guard`'s region covers every
+    // address `module.hle_trampolines` can resolve (it was sized from that
+    // same table, immediately above).
+    unsafe { dispatch::run(entry, padded, &module.hle_trampolines, hle, kernel, &image, &guard) }
 }
 
 /// RT0 is Windows-first; a POSIX backend lands at a later milestone without
@@ -112,6 +123,7 @@ pub fn execute_linked(
 pub fn execute_linked(
     _module: &LinkedModule,
     _hle: &HleRegistry,
+    _kernel: &OrbisKernel,
     _entry_offset: u64,
     _args: &[u64],
 ) -> Result<u64, RuntimeError> {
