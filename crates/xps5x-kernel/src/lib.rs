@@ -29,6 +29,9 @@ pub mod memory;
 pub mod threading;
 pub mod filesystem;
 pub mod hypervisor;
+pub mod process;
+
+pub use process::ProcessImage;
 
 use dashmap::DashMap;
 use parking_lot::RwLock;

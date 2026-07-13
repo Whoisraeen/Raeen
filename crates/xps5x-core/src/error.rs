@@ -28,6 +28,10 @@ pub enum XPS5XError {
     #[error("I/O error: {0}")]
     Io(#[from] IoError),
 
+    /// Firmware ingestion errors (PUP, module loading, dynamic linking).
+    #[error("Firmware error: {0}")]
+    Firmware(#[from] FirmwareError),
+
     /// Configuration errors.
     #[error("Config error: {0}")]
     Config(String),
@@ -102,6 +106,9 @@ pub enum KernelError {
 pub enum GpuError {
     #[error("Vulkan initialization failed: {0}")]
     VulkanInitFailed(String),
+
+    #[error("Metal initialization failed: {0}")]
+    MetalInitFailed(String),
 
     #[error("No suitable GPU device found")]
     NoSuitableDevice,

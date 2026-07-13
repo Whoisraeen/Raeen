@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 xps5x-core = { workspace = true }
+xps5x-loader = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }

@@ -28,6 +28,9 @@ config.toml
 games/
 firmware/
 savedata/
+.PS5 Firmware/
+.PS5 Games/
+PS5 Firmware/
 
 # Logs
 logs/

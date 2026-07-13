@@ -5,7 +5,9 @@
 
 pub mod instance;
 
+use crate::backend::{BackendKind, GpuBackend};
 use tracing::info;
+use xps5x_core::error::GpuError;
 
 /// Placeholder Vulkan backend.
 /// Full implementation will use ash (Vulkan bindings) for:
@@ -29,5 +31,27 @@ impl VulkanBackend {
             validation,
             initialized: false,
         }
+    }
+}
+
+impl GpuBackend for VulkanBackend {
+    fn name(&self) -> &'static str {
+        "Vulkan"
+    }
+
+    fn kind(&self) -> BackendKind {
+        BackendKind::Vulkan
+    }
+
+    fn init(&mut self) -> Result<(), GpuError> {
+        // TODO: create VkInstance, select physical device, create logical
+        // device + queues via ash. See vulkan::instance.
+        info!("Vulkan backend init (validation={})", self.validation);
+        self.initialized = true;
+        Ok(())
+    }
+
+    fn is_initialized(&self) -> bool {
+        self.initialized
     }
 }

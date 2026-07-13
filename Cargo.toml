@@ -10,6 +10,7 @@ members = [
     "crates/xps5x-input",
     "crates/xps5x-hle",
     "crates/xps5x-gui",
+    "crates/xps5x-firmware",
 ]
 
 [workspace.package]
@@ -63,6 +64,12 @@ gilrs = "0.11"
 lz4_flex = "0.11"
 zstd = "0.13"
 
+# Firmware crypto + NID hashing
+aes = "0.8"
+cbc = "0.10"
+sha1 = "0.10"
+base64 = "0.22"
+
 # Internal crates
 xps5x-core = { path = "crates/xps5x-core" }
 xps5x-loader = { path = "crates/xps5x-loader" }
@@ -73,6 +80,7 @@ xps5x-io = { path = "crates/xps5x-io" }
 xps5x-input = { path = "crates/xps5x-input" }
 xps5x-hle = { path = "crates/xps5x-hle" }
 xps5x-gui = { path = "crates/xps5x-gui" }
+xps5x-firmware = { path = "crates/xps5x-firmware" }
 
 [profile.release]
 lto = "thin"

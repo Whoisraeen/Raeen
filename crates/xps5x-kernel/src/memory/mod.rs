@@ -128,12 +128,17 @@ impl VirtualMemoryManager {
     }
 
     /// Read bytes from emulated memory.
+    ///
+    /// The read must fall entirely within a single mapped region; it may
+    /// start anywhere inside that region, not only at its base.
     pub fn read(&self, addr: VAddr, size: usize) -> Result<Vec<u8>, KernelError> {
         let backing = self.backing.read();
 
-        // Find the region containing this address.
-        for (base, data) in backing.iter() {
-            if addr >= *base && addr + size as u64 <= *base + data.len() as u64 {
+        // Find the region with the greatest base address <= addr, then
+        // verify the whole read fits within it (O(log n) lookup).
+        if let Some((base, data)) = backing.range(..=addr).next_back() {
+            let end = base + data.len() as u64;
+            if addr.checked_add(size as u64).is_some_and(|read_end| read_end <= end) {
                 let offset = (addr - base) as usize;
                 return Ok(data[offset..offset + size].to_vec());
             }
@@ -143,18 +148,38 @@ impl VirtualMemoryManager {
     }
 
     /// Write bytes to emulated memory.
+    ///
+    /// The write must fall entirely within a single mapped region.
     pub fn write(&self, addr: VAddr, data: &[u8]) -> Result<(), KernelError> {
         let mut backing = self.backing.write();
 
-        for (base, storage) in backing.iter_mut() {
-            if addr >= *base && addr + data.len() as u64 <= *base + storage.len() as u64 {
-                let offset = (addr - base) as usize;
+        if let Some((base, storage)) = backing.range_mut(..=addr).next_back() {
+            let end = *base + storage.len() as u64;
+            if addr.checked_add(data.len() as u64).is_some_and(|write_end| write_end <= end) {
+                let offset = (addr - *base) as usize;
                 storage[offset..offset + data.len()].copy_from_slice(data);
                 return Ok(());
             }
         }
 
         Err(KernelError::InvalidMemoryAccess(addr))
+    }
+
+    /// Find the mapped region containing `addr`, if any.
+    ///
+    /// Returns a clone of the region metadata (not the backing bytes).
+    pub fn region_containing(&self, addr: VAddr) -> Option<MemoryRegion> {
+        self.regions
+            .read()
+            .range(..=addr)
+            .next_back()
+            .filter(|(base, region)| addr < **base + region.size)
+            .map(|(_, region)| region.clone())
+    }
+
+    /// Whether `addr` falls within any mapped region.
+    pub fn is_mapped(&self, addr: VAddr) -> bool {
+        self.region_containing(addr).is_some()
     }
 
     /// Load a binary segment into emulated memory.
@@ -240,5 +265,40 @@ mod tests {
 
         // Reading from unmapped memory should fail.
         assert!(vmm.read(addr, 4).is_err());
+    }
+
+    #[test]
+    fn test_read_from_middle_of_region() {
+        let vmm = VirtualMemoryManager::new();
+        let addr = vmm.mmap(0, 0x10000, 0x7, 0x22, -1, 0).unwrap();
+
+        // Write at an offset inside the region, then read it back.
+        vmm.write(addr + 0x100, &[0xAA, 0xBB, 0xCC]).unwrap();
+        let data = vmm.read(addr + 0x100, 3).unwrap();
+        assert_eq!(data, vec![0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn test_read_spanning_region_end_fails() {
+        let vmm = VirtualMemoryManager::new();
+        let addr = vmm.mmap(0, 0x4000, 0x7, 0x22, -1, 0).unwrap();
+
+        // A read that starts in-bounds but extends past the region end fails.
+        assert!(vmm.read(addr + 0x3FFF, 4).is_err());
+    }
+
+    #[test]
+    fn test_region_containing_and_is_mapped() {
+        let vmm = VirtualMemoryManager::new();
+        let addr = vmm.mmap(0, 0x8000, 0x5, 0x22, -1, 0).unwrap();
+
+        assert!(vmm.is_mapped(addr));
+        assert!(vmm.is_mapped(addr + 0x7FFF));
+        assert!(!vmm.is_mapped(addr + 0x8000)); // One past the end.
+        assert!(!vmm.is_mapped(addr - 1));
+
+        let region = vmm.region_containing(addr + 0x10).unwrap();
+        assert_eq!(region.vaddr, addr);
+        assert_eq!(region.size, 0x8000);
     }
 }
