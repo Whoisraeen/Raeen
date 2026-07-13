@@ -47,3 +47,8 @@ themes/*
 
 # Claude Code worktrees / local scratch (never commit embedded git repos)
 .claude/worktrees/
+
+# Third-party reference sources — cloned locally for study/porting only
+# (e.g. Kyty, MIT). NEVER committed: we re-implement in Rust from these,
+# with attribution in THIRD_PARTY_NOTICES.md, never vendoring their trees.
+reference/
