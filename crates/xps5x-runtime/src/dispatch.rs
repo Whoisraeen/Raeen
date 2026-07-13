@@ -124,18 +124,6 @@ struct ActiveContext {
     /// `ContextRecord`; it is never read on the (unchanged) trampoline
     /// path.
     recovery_ctx: *const CONTEXT,
-    /// The memory slot [`crate::stack::call_on_guest_stack`] saves the host
-    /// RSP into before switching to the guest stack, and restores it from
-    /// afterward (design doc §2/§4, RT2c-a). Lives here (not a plain local
-    /// in `run`) purely so its address is easy to hand to the asm
-    /// trampoline via `Cell::as_ptr`; it is never read or written by
-    /// `veh_callback` or by the `resumed`/recovery mechanism — those are
-    /// entirely unaffected by which stack the guest runs on (see this
-    /// module's doc comment and `run`'s doc comment for why). `Cell<u64>`
-    /// has the same in-memory representation as `u64` (guaranteed:
-    /// `Cell`/`UnsafeCell` are `#[repr(transparent)]`), so `as_ptr` yields a
-    /// plain `*mut u64` the asm block can address directly.
-    host_rsp: Cell<u64>,
 }
 
 /// `AtomicPtr<T>` is `Send + Sync` regardless of `T` — see `CALL_LOCK`'s doc
@@ -229,7 +217,6 @@ pub(crate) unsafe fn run(
         error: Cell::new(None),
         resumed: Cell::new(false),
         recovery_ctx: &recovery_ctx as *const CONTEXT,
-        host_rsp: Cell::new(0),
     };
 
     // SAFETY: `veh_callback` has the `unsafe extern "system" fn(*mut
@@ -292,12 +279,11 @@ pub(crate) unsafe fn run(
         // above: `recovery_ctx` was captured with the *host* RSP before this
         // switch ever happens, so a genuine fault still restores the host
         // RSP and abandons the guest stack entirely (`call_on_guest_stack`'s
-        // own doc comment covers the RSP-switch mechanism itself; see this
-        // module's doc comment for the full compatibility argument).
-        // `ctx.host_rsp`'s address is passed as the save slot via
-        // `Cell::as_ptr` (an ordinary host-stack field, unreachable from
-        // guest memory).
-        let r = unsafe { crate::stack::call_on_guest_stack(entry, args, guest_rsp_top, ctx.host_rsp.as_ptr()) };
+        // own doc comment covers the RSP-switch mechanism itself — including
+        // why its host-RSP save/restore survives the guest clobbering any
+        // register; see this module's doc comment for the full compatibility
+        // argument).
+        let r = unsafe { crate::stack::call_on_guest_stack(entry, args, guest_rsp_top) };
         // Returned normally: no genuine fault occurred on this call.
         // Disarm so `resumed` doesn't linger set for no reason (it's about
         // to be dropped along with `ctx` regardless, but this keeps the

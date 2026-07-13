@@ -7,6 +7,34 @@
 //! genuine-fault recovery.
 
 use core::arch::asm;
+use core::cell::UnsafeCell;
+
+/// The single host-RSP save slot used by [`call_on_guest_stack`], addressed
+/// **RIP-relative** from the asm below. Storing the host stack pointer here
+/// (rather than in a register or a register-addressed slot) is what makes the
+/// restore after the guest returns depend on **no** general-purpose register
+/// surviving the guest `call`: `[rip + slot]` needs only RIP, which the guest
+/// cannot influence.
+///
+/// `UnsafeCell` (a mutable static) is required so the slot lives in writable
+/// memory — a plain immutable `static` would be placed in read-only `.rodata`
+/// and the asm's store into it would fault.
+///
+/// A single process-wide slot is sound because all guest execution is
+/// serialized by `dispatch::CALL_LOCK` (design doc §2/§9): exactly one
+/// `call_on_guest_stack` is ever in flight, so the slot is never accessed
+/// concurrently despite the `Sync` impl, and never needs to nest.
+struct HostRspSlot(
+    // Only ever accessed by the asm below via its `sym` operand (RIP-relative),
+    // never through this field in Rust, so dead-code analysis can't see the use.
+    #[allow(dead_code)] UnsafeCell<u64>,
+);
+
+// SAFETY: access is serialized process-wide by `dispatch::CALL_LOCK` — only
+// one guest execution (hence one write/read of this slot) happens at a time.
+unsafe impl Sync for HostRspSlot {}
+
+static HOST_RSP_SLOT: HostRspSlot = HostRspSlot(UnsafeCell::new(0));
 
 /// Call `entry` with `args` (the SysV integer argument registers, in order)
 /// on the guest stack whose top (highest address) is `guest_rsp_top`,
@@ -24,73 +52,54 @@ use core::arch::asm;
 ///   the `call` instruction below pushes an 8-byte return address, so
 ///   `entry` observes `rsp ≡ 8 mod 16` on entry — exactly what the SysV ABI
 ///   requires a called function to see. A non-16-aligned `guest_rsp_top` is
-///   a caller bug; debug builds catch it via `debug_assert!` below rather
-///   than silently mis-aligning the guest's stack.
-/// - `host_rsp_save` must point at 8 bytes of writable memory, valid for the
-///   entire duration of this call, that guest code cannot reach through any
-///   pointer it might construct (i.e. it must lie outside the arena) — the
-///   caller ([`crate::dispatch::run`]) passes `ActiveContext::host_rsp`'s
-///   address, a host-stack-local field, never exposed to guest memory.
+///   a caller bug; debug builds catch it via `debug_assert!` below.
+/// - Must be called with `dispatch::CALL_LOCK` held (as `execute_linked`
+///   does), so the single [`HOST_RSP_SLOT`] is never used re-entrantly.
 ///
-/// # Mechanism (why a memory save, not a register save)
+/// # Mechanism (robust host-RSP save/restore)
 ///
-/// The current (host) RSP is saved to `*host_rsp_save` **before** RSP is
-/// overwritten, addressed via a register holding the *pointer* (`r15`) —
-/// not `rsp`/`rbp`-relative addressing, since RSP is exactly what is about
-/// to change. After `entry` returns, RSP is restored by reading back through
-/// that same pointer.
+/// The host RSP is saved to the process-static [`HOST_RSP_SLOT`] **before**
+/// RSP is switched, and restored from it **after** the guest returns — both
+/// via RIP-relative addressing (`[rip + slot]`):
 ///
-/// This is deliberately a **memory** save of the RSP *value*, not a
-/// register save. The tempting alternative — stash the raw host RSP value
-/// itself in a single callee-saved register (say `r15`) across the call —
-/// relies on `entry` honoring the SysV callee-saved convention for that
-/// register. `entry` is guest code produced by the LM1 pipeline, not
-/// necessarily a compiler-emitted function with a textbook
-/// prologue/epilogue; a hand-written or otherwise non-conforming leaf
-/// routine can clobber *any* general-purpose register it likes without
-/// saving/restoring it, since nothing calls into it expecting SysV
-/// callee-saved discipline to hold across a single "leaf" execution. If the
-/// raw RSP value were trusted to survive in such a register, a guest that
-/// merely *uses* that register (not even maliciously — just carelessly)
-/// would silently corrupt the host's stack pointer on return, which is
-/// exactly the kind of fragility this milestone must not ship (design doc
-/// §7: "must be robust against a guest that does not perfectly honor the
-/// SysV ABI").
+/// ```text
+/// mov [rip + slot], rsp   ; save host RSP (no GP register involved)
+/// mov rsp, guest_rsp_top  ; switch to the guest stack
+/// call entry              ; run guest code (may clobber any register)
+/// mov rsp, [rip + slot]   ; restore host RSP (no GP register involved)
+/// ```
 ///
-/// Saving the value to memory instead removes that dependency entirely: the
-/// saved RSP survives no matter what `entry` does to the general-purpose
-/// registers, *except* the one register (`r15`) that carries the memory
-/// slot's address across the call, and except a wild write through
-/// `*host_rsp_save` itself. Both of those residual cases are already
-/// governed by this function's safety contract and by `entry`'s existing
-/// trust boundary (design doc §6/§7): only LM1-pipeline (clean-room
-/// re-implemented) images are ever executed here, never arbitrary or
-/// adversarial machine code, so a guest that goes out of its way to clobber
-/// `r15` (a register nothing in the ABI obligates it to touch at all,
-/// SysV-callee-saved or not) or to scribble over host memory it was never
-/// given a pointer to is already outside what this runtime promises to
-/// survive gracefully — the same as a guest that corrupts its own return
-/// address or jumps to an arbitrary instruction. It is categorically more
-/// robust than a register-only save, which a perfectly ordinary
-/// (non-adversarial, just not compiler-conventional) guest routine could
-/// defeat by accident.
+/// The crucial property: the **restore depends on no general-purpose register
+/// surviving the `call`.** A tempting simpler design stashes the host RSP
+/// (or a pointer to it) in a callee-saved register such as `r15` across the
+/// call — but that relies on `entry` honoring the SysV callee-saved
+/// convention for that register. `entry` is guest code from the LM1 pipeline,
+/// not necessarily a compiler-emitted function with a textbook epilogue; a
+/// hand-written or non-conforming routine can return normally yet leave `r15`
+/// (or any callee-saved register) altered, and the restore would then load a
+/// guest-controlled value into the **host** RSP — silently corrupting the host
+/// thread on an otherwise "successful" call. Addressing the save slot
+/// RIP-relative removes that dependency entirely: the host RSP is recovered no
+/// matter what `entry` did to the general-purpose registers, meeting the
+/// design doc §7 requirement to be robust against a guest that does not
+/// perfectly honor the SysV ABI. (A guest can still corrupt its own execution
+/// — its return address, or, since it runs natively on an identity map, host
+/// memory it was never handed a pointer to — but that is the same residual
+/// trust boundary the whole runtime already operates under, design doc §6/§7,
+/// not a fragility of this trampoline.)
 ///
-/// `clobber_abi("sysv64")` tells the compiler that the internal `call`
-/// clobbers the full SysV caller-saved register/XMM set; combined with the
-/// explicit `in("...")` operands binding `args` directly to the SysV integer
-/// argument registers (rdi/rsi/rdx/rcx/r8/r9 — no `mov`-into-place
-/// instructions are needed in the body at all), this trampoline clobbers
-/// exactly what an ordinary `sysv64` call through `entry` would, so no
-/// Rust-visible state is corrupted beyond what a ordinary call already
-/// implies.
+/// `clobber_abi("sysv64")` tells the compiler the internal `call` clobbers the
+/// full SysV caller-saved register/XMM set; combined with the explicit
+/// `in("...")` operands binding `args` directly to the SysV integer argument
+/// registers, this trampoline clobbers exactly what an ordinary `sysv64` call
+/// through `entry` would, so no Rust-visible state is corrupted beyond what an
+/// ordinary call already implies.
 pub(crate) unsafe fn call_on_guest_stack(
     entry: unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> u64,
     args: [u64; 6],
     guest_rsp_top: u64,
-    host_rsp_save: *mut u64,
 ) -> u64 {
     debug_assert_eq!(guest_rsp_top % 16, 0, "guest_rsp_top must be 16-byte aligned (SysV call ABI)");
-    debug_assert!(!host_rsp_save.is_null(), "host_rsp_save must be a valid memory slot");
 
     // Function pointers aren't directly usable as `asm!` register operands;
     // `entry as usize` is the address value the `call` below needs. This is
@@ -104,31 +113,33 @@ pub(crate) unsafe fn call_on_guest_stack(
     //    operand list below (SysV integer argument registers) — `entry`
     //    reads its arguments from exactly these registers, per its
     //    `extern "sysv64"` signature.
-    //  - r15: holds `host_rsp_save` (a pointer, not the RSP value itself),
-    //    used both before and after the `call` to save/restore the host RSP
-    //    through memory.
     //  - `{entry_reg}`/`{guest_rsp}`: compiler-chosen scratch registers
-    //    (guaranteed disjoint from rdi/rsi/rdx/rcx/r8/r9/r15, all of which
-    //    are explicitly reserved above) holding `entry`'s address and the
-    //    target RSP value; neither needs to survive past the `call`.
+    //    (disjoint from the reserved rdi/rsi/rdx/rcx/r8/r9) holding `entry`'s
+    //    address and the target RSP value; both are consumed before/at the
+    //    `call` and need not survive it.
     //  - rax: the guest's return value, read out as `result` after the call.
+    //  - No general-purpose register carries the host RSP (or a pointer to
+    //    it) across the `call` — it is saved to / restored from the static
+    //    `HOST_RSP_SLOT` via RIP-relative addressing, so the restore is
+    //    correct regardless of how `entry` treats the registers.
     unsafe {
         asm!(
-            // Save the host RSP to memory *before* switching stacks —
-            // addressed via r15 (a pointer), never rsp/rbp-relative, since
-            // rsp is what's about to change.
-            "mov [r15], rsp",
+            // Save the host RSP to the static slot *before* switching stacks,
+            // addressed RIP-relative (no GP register), since rsp is about to
+            // change and no callee-saved register can be trusted to survive
+            // the guest call.
+            "mov qword ptr [rip + {slot}], rsp",
             // Switch to the guest stack. `guest_rsp_top` is 16-aligned (see
             // this function's `debug_assert!` and doc comment); the `call`
             // immediately below pushes an 8-byte return address, so `entry`
             // observes rsp ≡ 8 mod 16 on entry, exactly as SysV requires.
             "mov rsp, {guest_rsp}",
             "call {entry_reg}",
-            // Restore the host RSP from the same memory slot, still
-            // addressed via r15 (see this function's doc comment for why a
-            // guest that clobbers r15 is out of scope / UB, same as the
-            // rest of `entry`'s trust boundary).
-            "mov rsp, [r15]",
+            // Restore the host RSP from the same static slot, again
+            // RIP-relative — this is the key line: it does not depend on any
+            // general-purpose register having survived the guest call.
+            "mov rsp, qword ptr [rip + {slot}]",
+            slot = sym HOST_RSP_SLOT,
             guest_rsp = in(reg) guest_rsp_top,
             entry_reg = in(reg) entry_addr,
             in("rdi") args[0],
@@ -137,7 +148,6 @@ pub(crate) unsafe fn call_on_guest_stack(
             in("rcx") args[3],
             in("r8") args[4],
             in("r9") args[5],
-            in("r15") host_rsp_save,
             lateout("rax") result,
             clobber_abi("sysv64"),
         );

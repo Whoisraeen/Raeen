@@ -1046,6 +1046,58 @@ fn guest_stub_uses_real_guest_stack_memory_and_returns_correct_value() {
     assert_eq!(
         result, 0x1234,
         "a value written below RSP on the guest stack must read back correctly, proving the guest stack region \
-         is real writable memory and RSP switch/restore around the guest call is sound"
+         is real writable memory. (This stub returns 0x1234 whether it runs on the guest or host stack, so it \
+         proves stack usability, not the switch itself — the switch is proven by \
+         `guest_call_runs_on_dedicated_guest_stack_region` above; here a broken RSP *restore* would instead crash \
+         the host after the guest's `ret`.)"
+    );
+}
+
+/// RT2c-a robustness regression (design doc §7): a guest that returns
+/// normally but leaves a callee-saved register (`r15`) clobbered must NOT
+/// corrupt the host stack pointer. `call_on_guest_stack` saves/restores the
+/// host RSP through a RIP-relative static slot, depending on *no*
+/// general-purpose register surviving the guest `call` — so this runs to
+/// completion and returns cleanly. Under the earlier design (which carried the
+/// save-slot pointer in `r15` across the call), this stub's `mov r15, <wild>`
+/// would have made the post-`call` `mov rsp, [r15]` restore load a
+/// guest-controlled value into the host RSP, crashing the process. If this
+/// test returns at all, the RIP-relative fix holds.
+#[test]
+fn guest_clobbering_r15_does_not_corrupt_host_rsp() {
+    const ENTRY_OFF: usize = 0x0;
+
+    let hle = HleRegistry::new();
+
+    let mut image = vec![0u8; 0x100];
+    let mut off = ENTRY_OFF;
+
+    // mov r15, 0xFFFFFFFFDEADBEEF  (49 C7 C7 imm32, sign-extended) — clobber a
+    // callee-saved register with a wild value, without restoring it, then
+    // return normally.
+    image[off..off + 7].copy_from_slice(&[0x49, 0xC7, 0xC7, 0xEF, 0xBE, 0xAD, 0xDE]);
+    off += 7;
+
+    // mov eax, 0x1234  (B8 imm32) — the return value.
+    image[off..off + 5].copy_from_slice(&[0xB8, 0x34, 0x12, 0x00, 0x00]);
+    off += 5;
+
+    // ret
+    image[off] = 0xC3;
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: ENTRY_OFF as u64,
+    };
+
+    let kernel = OrbisKernel::new();
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
+    assert_eq!(
+        result, 0x1234,
+        "a guest that clobbers r15 and returns normally must not corrupt the host RSP — the RIP-relative \
+         host-RSP restore must not depend on the guest preserving any register"
     );
 }
