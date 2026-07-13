@@ -26,6 +26,7 @@ pub use crypto::{
 };
 pub use sprx::{parse_sprx, SprxModule, SprxSegment};
 pub use registry::{ModulePolicy, ModuleRegistry, Resolver};
+pub use dynlib::linker::{link_module, HleTrampoline, LinkedModule, HLE_TRAMPOLINE_BASE, UNRESOLVED_STUB_ADDR};
 pub use report::summarize;
 
 #[cfg(test)]

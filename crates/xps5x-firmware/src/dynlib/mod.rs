@@ -20,6 +20,7 @@
 //! its table, returns [`FirmwareError::MalformedDynlibData`] — never a
 //! panic.
 
+pub mod linker;
 pub mod nid;
 
 use tracing::{debug, warn};
@@ -77,11 +78,27 @@ pub struct SceRela {
     pub addend: i64,
 }
 
+/// One `Elf64_Sym` record, decoded in original symtab order so that
+/// `symbols[i]` corresponds to `r_sym == i` (the `r_sym = info >> 32` field
+/// of an [`SceRela`]) — the index a symbol relocation names its symbol by.
+/// This is a strict superset of the classification already split into
+/// [`DynlibData::imports`]/[`DynlibData::exports`]: every symtab entry,
+/// import or export, appears here at its table index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DynSymbol {
+    pub nid: u64,
+    pub value: u64,
+    pub is_import: bool,
+}
+
 /// The decoded contents of a `PT_SCE_DYNLIBDATA` blob.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DynlibData {
     pub imports: Vec<SymbolRef>,
     pub exports: Vec<SymbolExport>,
+    /// Every decoded symtab entry, in table order — `symbols[i]` is the
+    /// symbol named by `r_sym == i` in an [`SceRela`]'s `info` field.
+    pub symbols: Vec<DynSymbol>,
     /// `DT_SCE_RELA` entries followed by `DT_SCE_JMPREL` entries, in that
     /// order.
     pub relocations: Vec<SceRela>,
@@ -142,13 +159,14 @@ pub fn parse_dynlibdata(blob: &[u8], dyn_tags: &[(u64, u64)]) -> Result<DynlibDa
 
     let mut imports = Vec::new();
     let mut exports = Vec::new();
+    let mut symbols = Vec::new();
     if let (Some(sym_off), Some(sym_sz)) = (
         tag_val(dyn_tags, DT_SCE_SYMTAB),
         tag_val(dyn_tags, DT_SCE_SYMTABSZ),
     ) {
         let syment = tag_val(dyn_tags, DT_SCE_SYMENT).unwrap_or(ELF64_SYM_SIZE);
         let symtab = slice_range(blob, sym_off, sym_sz, "DT_SCE_SYMTAB")?;
-        decode_symbols(symtab, syment, strtab, &mut imports, &mut exports)?;
+        decode_symbols(symtab, syment, strtab, &mut imports, &mut exports, &mut symbols)?;
     }
 
     let mut relocations = Vec::new();
@@ -187,6 +205,7 @@ pub fn parse_dynlibdata(blob: &[u8], dyn_tags: &[(u64, u64)]) -> Result<DynlibDa
     Ok(DynlibData {
         imports,
         exports,
+        symbols,
         relocations,
         needed_modules,
     })
@@ -235,12 +254,21 @@ fn read_cstr(strtab: &[u8], start: usize) -> Option<String> {
 /// Decode `symtab` as a sequence of `entsize`-byte `Elf64_Sym` records,
 /// resolving each symbol's name against `strtab` and classifying it as an
 /// import (undefined) or export (defined).
+///
+/// `symbols` receives one [`DynSymbol`] per symtab record, **in table
+/// order**, regardless of whether the record's name decoded as an NID — a
+/// relocation's `r_sym = info >> 32` indexes the *original* `Elf64_Sym`
+/// table, so `symbols[i]` must line up with index `i` even for entries this
+/// function otherwise skips out of `imports`/`exports`. A record whose name
+/// doesn't decode gets a `nid: 0` placeholder (never a panic, never a
+/// dropped index).
 fn decode_symbols(
     symtab: &[u8],
     entsize: u64,
     strtab: &[u8],
     imports: &mut Vec<SymbolRef>,
     exports: &mut Vec<SymbolExport>,
+    symbols: &mut Vec<DynSymbol>,
 ) -> Result<(), FirmwareError> {
     let entsize = usize::try_from(entsize)
         .map_err(|_| FirmwareError::MalformedDynlibData("DT_SCE_SYMENT overflows usize".to_string()))?;
@@ -261,11 +289,19 @@ fn decode_symbols(
         let st_shndx = u16::from_le_bytes(chunk[6..8].try_into().unwrap());
         let st_value = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
 
+        let is_import = st_shndx == 0 || st_value == 0;
+
         let Some(name) = read_cstr(strtab, st_name as usize) else {
             warn!(
-                "symbol st_name {st_name:#x} is out of range of the strtab (len {}); skipping",
+                "symbol st_name {st_name:#x} is out of range of the strtab (len {}); skipping \
+                 classification but keeping its symtab index (r_sym alignment)",
                 strtab.len()
             );
+            symbols.push(DynSymbol {
+                nid: 0,
+                value: st_value,
+                is_import,
+            });
             continue;
         };
 
@@ -275,9 +311,23 @@ fn decode_symbols(
         };
 
         let Some(symbol_nid) = nid::decode_nid(nid_part) else {
-            debug!("symbol name {name:?} does not decode as an SCE NID; skipping");
+            debug!(
+                "symbol name {name:?} does not decode as an SCE NID; skipping classification but \
+                 keeping its symtab index (r_sym alignment)"
+            );
+            symbols.push(DynSymbol {
+                nid: 0,
+                value: st_value,
+                is_import,
+            });
             continue;
         };
+
+        symbols.push(DynSymbol {
+            nid: symbol_nid,
+            value: st_value,
+            is_import,
+        });
 
         if st_shndx == 0 || st_value == 0 {
             // TODO(LM1+): verify index encoding. `rest` is expected to be
@@ -434,6 +484,26 @@ mod tests {
         assert_eq!(data.exports[0].nid, fx.export_nid);
         assert_eq!(data.exports[0].value, 0x2000);
 
+        // `symbols` is the ordered symtab: index 0 is the import symbol,
+        // index 1 is the export symbol, matching the fixture's symtab layout.
+        assert_eq!(data.symbols.len(), 2);
+        assert_eq!(
+            data.symbols[0],
+            DynSymbol {
+                nid: fx.import_nid,
+                value: 0,
+                is_import: true,
+            }
+        );
+        assert_eq!(
+            data.symbols[1],
+            DynSymbol {
+                nid: fx.export_nid,
+                value: 0x2000,
+                is_import: false,
+            }
+        );
+
         assert_eq!(data.relocations.len(), 2);
         assert_eq!(
             data.relocations[0],
@@ -451,6 +521,71 @@ mod tests {
                 addend: 0,
             }
         );
+    }
+
+    /// `SceRela::info >> 32` (`r_sym`) indexes the *original* symtab, so
+    /// `DynlibData::symbols[r_sym]` must be the symbol the relocation names
+    /// — even when that symbol isn't the first or only entry in the table.
+    #[test]
+    fn symbols_are_indexable_by_relocation_r_sym() {
+        // strtab: two throwaway names before the target, so its symtab
+        // index (2) isn't trivially 0.
+        let mut strtab = vec![0u8];
+        let mut name_offsets = Vec::new();
+        for n in ["dummyA", "dummyB", "targetImport"] {
+            let off = strtab.len() as u32;
+            strtab.extend_from_slice(encode_nid(nid_of(n)).as_bytes());
+            strtab.push(0);
+            name_offsets.push(off);
+        }
+
+        // symtab: three undefined (import) symbols; the target is index 2.
+        let mut symtab = Vec::new();
+        for &name_off in &name_offsets {
+            symtab.extend_from_slice(&name_off.to_le_bytes());
+            symtab.push(0);
+            symtab.push(0);
+            symtab.extend_from_slice(&0u16.to_le_bytes());
+            symtab.extend_from_slice(&0u64.to_le_bytes());
+            symtab.extend_from_slice(&0u64.to_le_bytes());
+        }
+
+        // One RELA entry whose r_sym (2) names the target symbol.
+        let r_sym: u64 = 2;
+        let r_type: u64 = 1; // R_X86_64_64
+        let mut rela = Vec::new();
+        rela.extend_from_slice(&0x100u64.to_le_bytes());
+        rela.extend_from_slice(&((r_sym << 32) | r_type).to_le_bytes());
+        rela.extend_from_slice(&0i64.to_le_bytes());
+
+        let strtab_off = 0u64;
+        let symtab_off = strtab.len() as u64;
+        let rela_off = symtab_off + symtab.len() as u64;
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&strtab);
+        blob.extend_from_slice(&symtab);
+        blob.extend_from_slice(&rela);
+
+        let dyn_tags = vec![
+            (DT_SCE_STRTAB, strtab_off),
+            (DT_SCE_STRSZ, strtab.len() as u64),
+            (DT_SCE_SYMTAB, symtab_off),
+            (DT_SCE_SYMTABSZ, symtab.len() as u64),
+            (DT_SCE_SYMENT, ELF64_SYM_SIZE),
+            (DT_SCE_RELA, rela_off),
+            (DT_SCE_RELASZ, rela.len() as u64),
+            (DT_SCE_RELAENT, ELF64_RELA_SIZE),
+        ];
+
+        let data = parse_dynlibdata(&blob, &dyn_tags).expect("synthetic dynlibdata parses");
+        assert_eq!(data.symbols.len(), 3);
+
+        let reloc = data.relocations[0];
+        let resolved_r_sym = (reloc.info >> 32) as usize;
+        assert_eq!(resolved_r_sym, 2);
+        assert_eq!(data.symbols[resolved_r_sym].nid, nid_of("targetImport"));
+        assert!(data.symbols[resolved_r_sym].is_import);
     }
 
     #[test]
