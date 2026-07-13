@@ -27,6 +27,41 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Diagnostic: `xps5x --load-sprx <sprx>` runs the LM1 homebrew pipeline
+    // (SELF decrypt-or-passthrough -> .sprx parse -> dynlibdata decode ->
+    // NID link against HLE) over a file and prints a summary, then exits
+    // without launching the GUI. Uses `NoKeysProvider` throughout — it never
+    // decrypts anything without a user-supplied key.
+    if let Some(pos) = args.iter().position(|a| a == "--load-sprx") {
+        let path = args
+            .get(pos + 1)
+            .ok_or_else(|| anyhow::anyhow!("--load-sprx requires a path to a .sprx/SELF file"))?;
+        let bytes = std::fs::read(path)?;
+        let decrypted = xps5x_firmware::decrypt_self(&bytes, &xps5x_firmware::NoKeysProvider)?;
+        let module = xps5x_firmware::parse_sprx(&decrypted.elf)?;
+        let dyn_tags = match &module.dynamic {
+            Some(d) => xps5x_firmware::dynlib::parse_sce_dynamic(d)?,
+            None => Vec::new(),
+        };
+        let dynlib_data = xps5x_firmware::dynlib::parse_dynlibdata(
+            module.dynlib_data.as_deref().unwrap_or(&[]),
+            &dyn_tags,
+        )?;
+        let hle = xps5x_hle::HleRegistry::new();
+        let db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
+        let mut registry = xps5x_firmware::ModuleRegistry::new(db);
+        registry.register_module_exports(&module.name, &dynlib_data.exports);
+        let linked = xps5x_firmware::link_module(&module, &dynlib_data, &registry, &hle, 0)?;
+        println!("module: {}", module.name);
+        println!("imports: {}  exports: {}", dynlib_data.imports.len(), dynlib_data.exports.len());
+        println!(
+            "resolved HLE trampolines: {}  unresolved: {}",
+            linked.hle_trampolines.len(),
+            linked.unresolved.len()
+        );
+        return Ok(());
+    }
+
     info!("╔══════════════════════════════════════════════╗");
     info!("║          XPS5X — PS5 Emulator v{}        ║", xps5x_core::VERSION);
     info!("║        Cross-Platform Compatibility Layer     ║");

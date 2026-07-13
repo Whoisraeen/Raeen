@@ -84,10 +84,63 @@ impl HleRegistry {
         let key = format!("{}::{}", library, function);
         self.functions.contains_key(&key)
     }
+
+    /// Every registered function as `(library, function)` pairs.
+    ///
+    /// Each internal key is `"library::function"`; this splits on the first
+    /// `"::"` to recover the pair. Used to seed a `NidDatabase` from what the
+    /// HLE registry actually implements.
+    pub fn registered_names(&self) -> Vec<(String, String)> {
+        self.functions
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .key()
+                    .split_once("::")
+                    .map(|(library, function)| (library.to_string(), function.to_string()))
+            })
+            .collect()
+    }
 }
 
 impl Default for HleRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registered_names_splits_library_and_function() {
+        let registry = HleRegistry::new();
+        let names = registry.registered_names();
+        assert!(!names.is_empty(), "HleRegistry::new() should register some functions");
+        assert_eq!(names.len(), registry.functions.len());
+
+        // Every name must round-trip: is_implemented(lib, func) is true for
+        // each pair we enumerated.
+        for (library, function) in &names {
+            assert!(
+                registry.is_implemented(library, function),
+                "registered_names produced ({library}, {function}) that is_implemented doesn't recognize"
+            );
+        }
+    }
+
+    #[test]
+    fn registered_names_reflects_manual_registration() {
+        let registry = HleRegistry {
+            functions: DashMap::new(),
+        };
+        fn stub(_args: &[u64]) -> u64 {
+            0
+        }
+        registry.register("libFoo", "someFunction", stub);
+
+        let names = registry.registered_names();
+        assert_eq!(names, vec![("libFoo".to_string(), "someFunction".to_string())]);
     }
 }

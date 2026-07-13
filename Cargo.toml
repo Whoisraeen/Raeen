@@ -66,8 +66,8 @@ lz4_flex = "0.11"
 zstd = "0.13"
 
 # Firmware crypto + NID hashing
-aes = "0.8"
-cbc = "0.10"
+aes = "0.9"
+cbc = "0.2"
 sha1 = "0.10"
 base64 = "0.22"
 

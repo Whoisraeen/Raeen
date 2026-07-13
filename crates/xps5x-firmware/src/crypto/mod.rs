@@ -8,6 +8,9 @@
 
 use xps5x_core::error::FirmwareError;
 
+pub mod self_crypto;
+pub use self_crypto::{decrypt_self, DecryptedSelf};
+
 /// Identifies which key a SELF/module segment needs, read from its metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyRequest {

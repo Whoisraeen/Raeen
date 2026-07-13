@@ -162,6 +162,9 @@ pub enum FirmwareError {
     #[error("No key available for key_id {key_id:#x} (user-supplied KeyProvider returned none)")]
     MissingKey { key_id: u64 },
 
+    #[error("Malformed SELF: {0}")]
+    MalformedSelf(String),
+
     #[error("Unsupported SCE relocation type: {0:#x}")]
     UnsupportedRelocation(u32),
 
