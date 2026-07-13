@@ -416,12 +416,16 @@ impl Shell {
 
     fn poll_session(&mut self) {
         let Some(session) = &self.session else { return };
-        match self.launcher.session_state(&session.handle) {
-            SessionState::Exited | SessionState::Faulted => {
-                self.nav.rail_index = session.target_index;
-                self.session = None;
-            }
-            SessionState::Loading | SessionState::Running => {}
+        // Only `Exited` clears the overlay. `Faulted` used to be lumped in
+        // with `Exited` here, but that meant a synchronous fault (e.g. the
+        // real firmware launcher's "no module file" case) would vanish
+        // before the very first `draw` ever painted it — the user would
+        // never see why. A fault now stays on screen, same as `Running`,
+        // until the user presses Back (which calls `quit`, landing on
+        // `Exited` on the next poll).
+        if self.launcher.session_state(&session.handle) == SessionState::Exited {
+            self.nav.rail_index = session.target_index;
+            self.session = None;
         }
     }
 
@@ -543,10 +547,22 @@ fn draw_session_overlay(ui: &mut egui::Ui, theme: &Theme, session: &ActiveSessio
     painter.rect_filled(screen, 0.0, theme.palette.ground);
 
     let state = launcher.session_state(&session.handle);
+    // `session_detail` carries the engine's honest account of what actually
+    // happened — a fault reason, or (for the real firmware launcher) a
+    // "linked, not executed" summary — so the overlay never claims more
+    // than SM3 actually does (spec: link, don't pretend to play).
+    let detail = launcher.session_detail(&session.handle);
     let (headline, sub) = match state {
         SessionState::Loading => (format!("Launching {}…", session.title), "Handing off to the engine".to_string()),
-        SessionState::Running => (session.title.clone(), "Running — Esc to return to the Shell".to_string()),
-        SessionState::Faulted | SessionState::Exited => (session.title.clone(), "Returning to Shell…".to_string()),
+        SessionState::Running => (
+            session.title.clone(),
+            detail.unwrap_or_else(|| "Running — Esc to return to the Shell".to_string()),
+        ),
+        SessionState::Faulted => (
+            session.title.clone(),
+            detail.unwrap_or_else(|| "Launch failed — Esc to return to the Shell".to_string()),
+        ),
+        SessionState::Exited => (session.title.clone(), "Returning to Shell…".to_string()),
     };
 
     let center = screen.center();
