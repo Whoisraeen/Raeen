@@ -102,7 +102,7 @@ graph TD
       fn segment_key(&self, req: &KeyRequest) -> Option<SegmentKey>;
   }
   ```
-- **Default `NoKeysProvider`:** returns `None` for everything → decryption yields `LoaderError::EncryptedSelf` (reuses the existing error; see [self_format.rs:161](../../../crates/xps5x-loader/src/self_format.rs)).
+- **Default `NoKeysProvider`:** returns `None` for everything → the crypto layer requests a key, gets none, and raises `FirmwareError::MissingKey { key_id }`. Logged at `info`, non-fatal (default path).
 - **User-supplied provider:** loads a `keys.toml`/keyfile the user points to. Not committed; documented format only.
 - **`self_crypto.rs`:** implements the SELF segment decryption *machinery* (the algorithm shape is community-documented; only the keys are secret). Given a decrypted-or-not SELF and a `KeyProvider`, it produces the plaintext inner ELF, or a clean error if keys are unavailable. This replaces the current hard `EncryptedSelf` bail with: *route encrypted segments through the provider; error only if the provider has no key.*
 - **Boundary reaffirmed:** this module consumes keys; it never derives, guesses, brute-forces, or extracts them.
@@ -137,8 +137,8 @@ The heart of "LLE userland on HLE kernel."
 
 ### 3.4 Error handling
 
-- Extend `LoaderError` (or add a sibling `FirmwareError` in `xps5x-core::error`) with: `InvalidPupMagic`, `PupEntryOutOfBounds`, `MissingKey { key_id }`, `UnsupportedRelocation(u32)`, `MalformedDynlibData(String)`.
-- `EncryptedSelf` is retained but demoted: it now specifically means "encrypted and no key available," raised from `crypto` rather than from `self_format` directly.
+- A dedicated `FirmwareError` enum now exists in `xps5x-core::error` (added alongside this design) with: `InvalidPupMagic(u32)`, `PupEntryOutOfBounds { index }`, `MissingKey { key_id }`, `UnsupportedRelocation(u32)`, `MalformedDynlibData(String)`, and `Loader(#[from] LoaderError)`. It is wired into the top-level `XPS5XError` as `Firmware(#[from] FirmwareError)`.
+- Missing-key decryption failures raise `FirmwareError::MissingKey { key_id }` from the `crypto` layer. The legacy `LoaderError::EncryptedSelf` is superseded by this and retained only for backward compatibility.
 - Decryption failure due to missing keys is a **normal, expected, non-fatal** condition (the default path), logged at `info`, not `error`.
 
 ---
