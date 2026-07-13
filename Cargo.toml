@@ -72,12 +72,14 @@ cbc = "0.2"
 sha1 = "0.10"
 base64 = "0.22"
 
-# Runtime (Windows OS APIs — VirtualAlloc/VEH); scoped to xps5x-runtime only
+# Windows OS APIs — VirtualAlloc/VEH for xps5x-runtime, GetLocalTime for
+# xps5x-gui's top-bar clock
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Memory",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
+    "Win32_System_SystemInformation",
 ] }
 
 # Internal crates

@@ -30,16 +30,16 @@ scrim      = "#060a10eb"
 cc_scrim   = "#04070c8c"
 
 [metrics]
-topbar_padding_x       = 48.0
-topbar_padding_top     = 20.0
-content_padding_x      = 48.0
-content_padding_bottom = 36.0
-tile_size              = 118.0
-tile_gap               = 14.0
-tile_focus_scale       = 1.55
+topbar_padding_x       = 88.0
+topbar_padding_top     = 44.0
+content_padding_x      = 88.0
+content_padding_bottom = 44.0
+tile_size              = 252.0
+tile_gap               = 18.0
+tile_focus_scale       = 1.2
 tile_focus_lift        = 0.0
-rail_padding_left      = 48.0
-corner_radius          = 14.0
+rail_padding_left      = 88.0
+corner_radius          = 16.0
 button_radius          = 8.0
 card_width             = 250.0
 card_height            = 140.0

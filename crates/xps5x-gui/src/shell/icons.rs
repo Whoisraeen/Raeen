@@ -26,6 +26,16 @@ pub enum Glyph {
     Grid,
     /// Media tab (spec §10 SM2): a rounded frame with a play triangle.
     Video,
+    /// Top-bar status: circled "i".
+    Info,
+    /// Trophy cup — top-bar status and the "Last trophy" stat.
+    Trophy,
+    /// Speech bubble (bottom-bar status).
+    Chat,
+    /// Cross/X face-button shape (bottom-bar "Play" hint).
+    Cross,
+    /// Three-line menu (bottom-bar "Options" hint).
+    Menu,
 }
 
 pub fn draw(painter: &Painter, glyph: Glyph, center: Pos2, size: f32, color: Color32) {
@@ -139,6 +149,38 @@ pub fn draw(painter: &Painter, glyph: Glyph, center: Pos2, size: f32, color: Col
                 center + vec2(r * 0.35, 0.0),
             ];
             painter.add(Shape::convex_polygon(tri, color, Stroke::NONE));
+        }
+        Glyph::Info => {
+            painter.circle_stroke(center, r * 0.8, stroke);
+            painter.circle_filled(center + vec2(0.0, -r * 0.38), r * 0.1, color);
+            painter.line_segment([center + vec2(0.0, -r * 0.08), center + vec2(0.0, r * 0.42)], stroke);
+        }
+        Glyph::Trophy => {
+            let cup = egui::Rect::from_min_max(center + vec2(-r * 0.45, -r * 0.7), center + vec2(r * 0.45, r * 0.05));
+            painter.rect_stroke(cup, r * 0.2, stroke, StrokeKind::Outside);
+            painter.arc(center + vec2(-r * 0.55, -r * 0.45), r * 0.25, (std::f32::consts::PI * 0.5)..=(std::f32::consts::PI * 1.5), stroke);
+            painter.arc(center + vec2(r * 0.55, -r * 0.45), r * 0.25, (-std::f32::consts::PI * 0.5)..=(std::f32::consts::PI * 0.5), stroke);
+            painter.line_segment([center + vec2(0.0, r * 0.05), center + vec2(0.0, r * 0.45)], stroke);
+            painter.line_segment([center + vec2(-r * 0.35, r * 0.6), center + vec2(r * 0.35, r * 0.6)], stroke);
+        }
+        Glyph::Chat => {
+            let body = egui::Rect::from_min_max(center + vec2(-r * 0.75, -r * 0.6), center + vec2(r * 0.75, r * 0.35));
+            painter.rect_stroke(body, r * 0.25, stroke, StrokeKind::Outside);
+            painter.line_segment([center + vec2(-r * 0.3, r * 0.35), center + vec2(-r * 0.45, r * 0.7)], stroke);
+            painter.line_segment([center + vec2(-r * 0.45, r * 0.7), center + vec2(-0.05 * r, r * 0.35)], stroke);
+        }
+        Glyph::Cross => {
+            let d = r * 0.62;
+            painter.line_segment([center + vec2(-d, -d), center + vec2(d, d)], stroke);
+            painter.line_segment([center + vec2(-d, d), center + vec2(d, -d)], stroke);
+        }
+        Glyph::Menu => {
+            for dy in [-0.45_f32, 0.0, 0.45] {
+                painter.line_segment(
+                    [center + vec2(-r * 0.65, r * dy), center + vec2(r * 0.65, r * dy)],
+                    stroke,
+                );
+            }
         }
     }
 }

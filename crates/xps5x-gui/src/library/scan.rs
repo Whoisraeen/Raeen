@@ -40,6 +40,14 @@ struct TitleToml {
     rating: u8,
     #[serde(default = "default_ready")]
     ready: String,
+    /// Total play time as display text ("2h 1m") — Home's "Time played"
+    /// stat. Absent → shown as an em-dash.
+    #[serde(default)]
+    time_played: String,
+    /// Most recently earned trophy name — Home's "Last trophy" stat.
+    /// Absent → shown as an em-dash.
+    #[serde(default)]
+    last_trophy: String,
     #[serde(default)]
     activity: Vec<ActivityToml>,
     /// Two hex colors (`"#rrggbb"`, `"0xrrggbb"`, or `"rrggbb"`), bright
@@ -104,6 +112,8 @@ pub fn parse_title_meta(contents: &str) -> Option<ParsedTitleMeta> {
             players: raw.players,
             rating: raw.rating.min(5),
             kicker: raw.ready,
+            time_played: raw.time_played,
+            last_trophy: raw.last_trophy,
             activity,
         },
         gradient,
@@ -223,6 +233,8 @@ mod tests {
         players = "Single-player"
         rating = 5
         ready = "Ready to play"
+        time_played = "2h 1m"
+        last_trophy = "Hollow Walker"
         gradient = ["#ff4d6d", "#7a1338"]
 
         [[activity]]
@@ -245,6 +257,9 @@ mod tests {
         assert_eq!(parsed.meta.players, "Single-player");
         assert_eq!(parsed.meta.rating, 5);
         assert_eq!(parsed.meta.kicker, "Ready to play");
+        assert_eq!(parsed.meta.time_played, "2h 1m");
+        assert_eq!(parsed.meta.last_trophy, "Hollow Walker");
+        assert_eq!(parsed.meta.progress_percent(), Some(58));
         assert_eq!(parsed.meta.activity.len(), 2);
         assert_eq!(parsed.meta.activity[0].top, "Continue");
         assert_eq!(parsed.meta.activity[0].main, "Chapter 4 — The Hollow");
@@ -277,6 +292,9 @@ mod tests {
         assert_eq!(parsed.meta.players, "");
         assert_eq!(parsed.meta.rating, 0);
         assert_eq!(parsed.meta.kicker, "Ready to play");
+        assert_eq!(parsed.meta.time_played, "");
+        assert_eq!(parsed.meta.last_trophy, "");
+        assert_eq!(parsed.meta.progress_percent(), None);
         assert!(parsed.meta.activity.is_empty());
         assert!(parsed.gradient.is_none());
     }

@@ -158,16 +158,16 @@ pub fn default_theme() -> Theme {
             cc_scrim: Color32::from_rgba_premultiplied(4, 7, 12, 140),
         },
         metrics: Metrics {
-            topbar_padding_x: 48.0,
-            topbar_padding_top: 20.0,
-            content_padding_x: 48.0,
-            content_padding_bottom: 36.0,
-            tile_size: 118.0,
-            tile_gap: 14.0,
-            tile_focus_scale: 1.55,
+            topbar_padding_x: 88.0,
+            topbar_padding_top: 44.0,
+            content_padding_x: 88.0,
+            content_padding_bottom: 44.0,
+            tile_size: 252.0,
+            tile_gap: 18.0,
+            tile_focus_scale: 1.2,
             tile_focus_lift: 0.0,
-            rail_padding_left: 48.0,
-            corner_radius: 14.0,
+            rail_padding_left: 88.0,
+            corner_radius: 16.0,
             button_radius: 8.0,
             card_size: egui::vec2(250.0, 140.0),
             card_gap: 16.0,
@@ -189,8 +189,8 @@ mod tests {
         assert_eq!(theme.palette.ground, rgb(0x0a1017));
         assert_eq!(theme.palette.text, rgb(0xf3f7fc));
         assert_eq!(theme.palette.accent_hi, rgb(0x57b0ff));
-        assert_eq!(theme.metrics.tile_size, 118.0);
-        assert_eq!(theme.metrics.rail_padding_left, 48.0);
+        assert_eq!(theme.metrics.tile_size, 252.0);
+        assert_eq!(theme.metrics.rail_padding_left, 88.0);
         assert!(theme.metrics.tile_focus_scale > 1.0);
         assert!(theme.assets.font.is_none());
         assert!(theme.assets.background.is_none());

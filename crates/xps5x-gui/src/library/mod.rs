@@ -205,31 +205,55 @@ impl MetaCache {
     }
 }
 
-/// One activity card (Continue / Trophies / Game Help / friends…).
+/// One activity card (Continue / Trophies / Game Help / friends…). Parsed
+/// from `xps5x-title.toml`; the concept-style Home renders only the trophy
+/// progress (via [`GameMeta::progress_percent`]) — the text fields are kept
+/// for a future detail/library view.
 #[derive(Debug, Clone)]
 pub struct ActivityCard {
+    #[allow(dead_code)]
     pub top: String,
+    #[allow(dead_code)]
     pub main: String,
+    #[allow(dead_code)]
     pub sub: String,
-    /// `Some(0..=100)` renders a progress bar (e.g. trophy completion).
+    /// `Some(0..=100)` — trophy/completion progress.
     pub progress: Option<u8>,
 }
 
 /// Game-specific metadata shown in the Home context block.
 #[derive(Debug, Clone)]
 pub struct GameMeta {
+    /// Parsed from `xps5x-title.toml` but not rendered by the concept-style
+    /// Home (title + play stats only) — kept for a future detail view.
+    #[allow(dead_code)]
     pub genre: String,
+    /// Same parsed-but-not-rendered status as `genre`.
+    #[allow(dead_code)]
     pub players: String,
-    /// Star rating, 0..=5. Parsed from `xps5x-title.toml` but not rendered
-    /// by the PS5-style Home (the console shows no ratings) — kept for a
-    /// future detail/library view.
+    /// Star rating, 0..=5. Same parsed-but-not-rendered status as `genre`.
     #[allow(dead_code)]
     pub rating: u8,
     /// Kicker line ("Ready to play", "Continue — Chapter 4"…). Same
-    /// parsed-but-not-rendered status as `rating`.
+    /// parsed-but-not-rendered status as `genre`.
     #[allow(dead_code)]
     pub kicker: String,
+    /// Total play time as display text ("2h 1m") — the Home "Time played"
+    /// stat. Empty when unknown.
+    pub time_played: String,
+    /// Most recently earned trophy name — the Home "Last trophy" stat.
+    /// Empty when unknown.
+    pub last_trophy: String,
     pub activity: Vec<ActivityCard>,
+}
+
+impl GameMeta {
+    /// Trophy/completion percent for the Home "Progress" stat: the first
+    /// activity card that carries a progress bar (the Trophies card, by
+    /// convention).
+    pub fn progress_percent(&self) -> Option<u8> {
+        self.activity.iter().find_map(|card| card.progress)
+    }
 }
 
 /// Where the engine should be pointed to launch this item.
@@ -318,6 +342,8 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 players: "Single-player".to_string(),
                 rating: 5,
                 kicker: "Ready to play".to_string(),
+                time_played: "2h 1m".to_string(),
+                last_trophy: "Hollow Walker".to_string(),
                 activity: vec![
                     ActivityCard { top: "Continue".to_string(), main: "Chapter 4 — The Hollow".to_string(), sub: "2h ago".to_string(), progress: None },
                     ActivityCard { top: "Trophies".to_string(), main: "58%".to_string(), sub: "24 / 41".to_string(), progress: Some(58) },
@@ -339,6 +365,8 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 players: "Online Co-op".to_string(),
                 rating: 4,
                 kicker: "Continue — Sector 12".to_string(),
+                time_played: "31h 6m".to_string(),
+                last_trophy: "Drift Racer".to_string(),
                 activity: vec![
                     ActivityCard { top: "Continue".to_string(), main: "Sector 12 — Drift Run".to_string(), sub: "Yesterday".to_string(), progress: None },
                     ActivityCard { top: "Trophies".to_string(), main: "31%".to_string(), sub: "12 / 38".to_string(), progress: Some(31) },
@@ -360,6 +388,8 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 players: "Single-player".to_string(),
                 rating: 5,
                 kicker: "Ready to play".to_string(),
+                time_played: "104h 22m".to_string(),
+                last_trophy: "Dune Strider".to_string(),
                 activity: vec![
                     ActivityCard { top: "Continue".to_string(), main: "The Dunes".to_string(), sub: "3d ago".to_string(), progress: None },
                     ActivityCard { top: "Trophies".to_string(), main: "92%".to_string(), sub: "33 / 36".to_string(), progress: Some(92) },
@@ -381,6 +411,8 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 players: "Single-player".to_string(),
                 rating: 4,
                 kicker: "Continue — Ashen Keep".to_string(),
+                time_played: "12h 40m".to_string(),
+                last_trophy: "Ashen Victor".to_string(),
                 activity: vec![
                     ActivityCard { top: "Continue".to_string(), main: "Ashen Keep — Boss".to_string(), sub: "1h ago".to_string(), progress: None },
                     ActivityCard { top: "Trophies".to_string(), main: "44%".to_string(), sub: "18 / 41".to_string(), progress: Some(44) },
@@ -402,6 +434,8 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 players: "Multiplayer".to_string(),
                 rating: 4,
                 kicker: "Ready to play".to_string(),
+                time_played: "5h 12m".to_string(),
+                last_trophy: "Division Climber".to_string(),
                 activity: vec![
                     ActivityCard { top: "Continue".to_string(), main: "Ranked — Div 2".to_string(), sub: "5h ago".to_string(), progress: None },
                     ActivityCard { top: "Trophies".to_string(), main: "27%".to_string(), sub: "9 / 33".to_string(), progress: Some(27) },
@@ -423,6 +457,8 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 players: "Online Co-op".to_string(),
                 rating: 4,
                 kicker: "Ready to play".to_string(),
+                time_played: "48m".to_string(),
+                last_trophy: "First Dive".to_string(),
                 activity: vec![
                     ActivityCard { top: "Continue".to_string(), main: "Deep Reef Camp".to_string(), sub: "2d ago".to_string(), progress: None },
                     ActivityCard { top: "Trophies".to_string(), main: "15%".to_string(), sub: "6 / 40".to_string(), progress: Some(15) },
