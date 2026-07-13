@@ -7,16 +7,19 @@
 //! ## Stub status
 //!
 //! Every HLE call now gets an [`crate::HleContext`] (a live
-//! [`xps5x_kernel::OrbisKernel`] plus guest-memory access), so functions
-//! *can* do real work. Most functions below still just log the call and
-//! return a plausible value (an `SCE_OK`-style `0`, a fake handle, or a
-//! fake address/size) — thread creation, event queues, and most
-//! out-parameters still aren't backed by real state. `sceKernelAllocateDirectMemory`
-//! and `sceKernelMapFlexibleMemory` are the exceptions: they route through
-//! `ctx.kernel.memory.mmap` and write their out-parameter through
-//! `ctx.mem`, as a proof that the context threads all the way through.
-//! Broadening the rest is future work, not a limitation of the dispatch
-//! signature anymore.
+//! [`xps5x_kernel::OrbisKernel`] plus guest-memory and guest-allocator
+//! access), so functions *can* do real work. Most functions below still
+//! just log the call and return a plausible value (an `SCE_OK`-style `0`,
+//! a fake handle, or a fake address/size) — thread creation, event queues,
+//! and most out-parameters still aren't backed by real state.
+//! `sceKernelAllocateDirectMemory`, `sceKernelMapFlexibleMemory`, and
+//! `sceKernelMmap` are the exceptions: they route through `ctx.alloc.mmap`
+//! (the arena's mmap region, in production — `xps5x-runtime`'s
+//! `GuestArena`) and record the mapping in `ctx.kernel.memory` so
+//! `is_mapped`/`region_containing` see it, writing the resulting address
+//! through their out-parameter (where the ABI has one) via `ctx.mem`.
+//! `sceKernelMunmap` mirrors this on the way out. Broadening the rest is
+//! future work, not a limitation of the dispatch signature anymore.
 
 use crate::{HleContext, HleRegistry};
 use tracing::{debug, warn};
@@ -90,11 +93,15 @@ pub fn register(registry: &HleRegistry) {
 /// memory (this call) from *mapping* it into the process's virtual address
 /// space (`sceKernelMapDirectMemory`). This HLE doesn't yet model physical
 /// memory as distinct from virtual mappings, so as a documented shortcut
-/// this routes straight through `ctx.kernel.memory.mmap` — treating the
-/// "physical" address handed back as already virtual-mapped — and writes
-/// it through the `physAddrOut` out-parameter (`args[5]`) via `ctx.mem`.
-/// Returns `SCE_OK` on success; `HLE_ERROR` if the mmap fails or
-/// `physAddrOut` is out of bounds (bounds-checked, never a panic/OOB).
+/// this now allocates from the arena's mmap region (`ctx.alloc.mmap`) —
+/// treating the "physical" address handed back as already virtual-mapped —
+/// records the mapping's metadata in `ctx.kernel.memory` (so
+/// `is_mapped`/`region_containing` see it), and writes the address through
+/// the `physAddrOut` out-parameter (`args[5]`) via `ctx.mem`. Returns
+/// `SCE_OK` on success; `HLE_ERROR` if the arena is exhausted or
+/// `physAddrOut` is out of bounds (bounds-checked, never a panic/OOB) — in
+/// the latter case the just-recorded metadata is rolled back via
+/// `remove_mapping` so no dangling record is left behind.
 fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     let search_start = args.first().copied().unwrap_or(0);
     let search_end = args.get(1).copied().unwrap_or(0);
@@ -106,19 +113,20 @@ fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
         "sceKernelAllocateDirectMemory(searchStart={search_start:#x}, searchEnd={search_end:#x}, len={len:#x}, alignment={alignment:#x}, memoryType={memory_type}, physAddrOut={phys_addr_out:#x})"
     );
 
-    match ctx.kernel.memory.mmap(0, len, 0x3, 0, -1, 0) {
-        Ok(addr) => {
-            if phys_addr_out != 0 && !ctx.mem.write(phys_addr_out, &addr.to_le_bytes()) {
-                warn!("sceKernelAllocateDirectMemory: physAddrOut {phys_addr_out:#x} out of bounds");
-                return HLE_ERROR;
-            }
-            SCE_OK
-        }
-        Err(err) => {
-            warn!("sceKernelAllocateDirectMemory: mmap failed: {err:?}");
-            HLE_ERROR
-        }
+    const DEFAULT_PROT: u32 = 0x3; // R+W — matches the old `ctx.kernel.memory.mmap(0, len, 0x3, ...)` call this replaces.
+
+    let Some(addr) = ctx.alloc.mmap(len, xps5x_core::PS5_PAGE_SIZE as u64) else {
+        warn!("sceKernelAllocateDirectMemory: arena mmap failed (len={len:#x})");
+        return HLE_ERROR;
+    };
+    ctx.kernel.memory.record_mapping(addr, len, DEFAULT_PROT);
+
+    if phys_addr_out != 0 && !ctx.mem.write(phys_addr_out, &addr.to_le_bytes()) {
+        warn!("sceKernelAllocateDirectMemory: physAddrOut {phys_addr_out:#x} out of bounds");
+        ctx.kernel.memory.remove_mapping(addr);
+        return HLE_ERROR;
     }
+    SCE_OK
 }
 
 fn hle_allocate_main_direct_memory(_ctx: &HleContext, args: &[u64]) -> u64 {
@@ -153,54 +161,79 @@ fn hle_map_direct_memory(_ctx: &HleContext, args: &[u64]) -> u64 {
 /// Real signature: `sceKernelMapFlexibleMemory(void **addrOut, size_t len,
 /// int prot, int flags)`.
 ///
-/// Routes through `ctx.kernel.memory.mmap` for real: maps `len` bytes with
-/// `prot` and writes the resulting guest address through `addrOut`
-/// (`args[0]`) via `ctx.mem`. Returns `SCE_OK` on success; `HLE_ERROR` if
-/// the mmap fails or `addrOut` is out of bounds.
+/// Allocates `len` bytes from the arena's mmap region (`ctx.alloc.mmap`),
+/// records the mapping's metadata in `ctx.kernel.memory` (so
+/// `is_mapped`/`region_containing` reflect it), and writes the resulting
+/// guest address through `addrOut` (`args[0]`) via `ctx.mem`. Returns
+/// `SCE_OK` on success; `HLE_ERROR` if the arena is exhausted or `addrOut`
+/// is out of bounds — in the latter case `remove_mapping` rolls back the
+/// just-recorded metadata so no dangling record is left behind.
 fn hle_map_flexible_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     let addr_out = args.first().copied().unwrap_or(0);
     let len = args.get(1).copied().unwrap_or(0);
     let prot = args.get(2).copied().unwrap_or(0x3) as u32;
     debug!("sceKernelMapFlexibleMemory(addrOut={addr_out:#x}, len={len:#x}, prot={prot})");
 
-    match ctx.kernel.memory.mmap(0, len, prot, 0, -1, 0) {
-        Ok(addr) => {
-            if addr_out != 0 && !ctx.mem.write(addr_out, &addr.to_le_bytes()) {
-                warn!("sceKernelMapFlexibleMemory: addrOut {addr_out:#x} out of bounds");
-                return HLE_ERROR;
-            }
-            SCE_OK
-        }
-        Err(err) => {
-            warn!("sceKernelMapFlexibleMemory: mmap failed: {err:?}");
-            HLE_ERROR
-        }
+    let Some(addr) = ctx.alloc.mmap(len, xps5x_core::PS5_PAGE_SIZE as u64) else {
+        warn!("sceKernelMapFlexibleMemory: arena mmap failed (len={len:#x})");
+        return HLE_ERROR;
+    };
+    ctx.kernel.memory.record_mapping(addr, len, prot);
+
+    if addr_out != 0 && !ctx.mem.write(addr_out, &addr.to_le_bytes()) {
+        warn!("sceKernelMapFlexibleMemory: addrOut {addr_out:#x} out of bounds");
+        ctx.kernel.memory.remove_mapping(addr);
+        return HLE_ERROR;
     }
+    SCE_OK
 }
 
-fn hle_munmap(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!(
-        "sceKernelMunmap(addr={:#x}, len={:#x})",
-        args.first().copied().unwrap_or(0),
-        args.get(1).copied().unwrap_or(0)
-    );
-    0
+/// Releases a mapping previously returned by `sceKernelMapFlexibleMemory`/
+/// `sceKernelAllocateDirectMemory`/`sceKernelMmap`: releases the arena
+/// allocation (`ctx.alloc.munmap`, best-effort — see
+/// [`xps5x_hle::GuestAllocator::munmap`]'s contract) and removes the VMM
+/// metadata (`ctx.kernel.memory.remove_mapping`) so `is_mapped` stops
+/// reporting the address as mapped. Always reports success (`SCE_OK`),
+/// matching real `munmap`'s behavior on an already-unmapped/unrecognized
+/// address.
+fn hle_munmap(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    let len = args.get(1).copied().unwrap_or(0);
+    debug!("sceKernelMunmap(addr={addr:#x}, len={len:#x})");
+
+    ctx.alloc.munmap(addr, len);
+    ctx.kernel.memory.remove_mapping(addr);
+    SCE_OK
 }
 
-/// Stub: returns a plausible fake mapped address rather than actually
-/// mapping through `ctx.kernel.memory` — `sceKernelMmap`'s real `void
-/// **res` out-parameter semantics (and fd-backed mappings) are a later
-/// milestone; `sceKernelMapFlexibleMemory`/`sceKernelAllocateDirectMemory`
-/// above are this milestone's proof that the context threads through.
-fn hle_mmap(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!(
-        "sceKernelMmap(addr={:#x}, len={:#x}, prot={}, flags={})",
-        args.first().copied().unwrap_or(0),
-        args.get(1).copied().unwrap_or(0),
-        args.get(2).copied().unwrap_or(0),
-        args.get(3).copied().unwrap_or(0)
-    );
-    0x0000_2000_0000_0000
+/// Real signature: `sceKernelMmap(void *addr, size_t len, int prot, int
+/// flags, int fd, off_t offset, void **res)`. This HLE only models
+/// anonymous mappings — `fd`/`offset` (file-backed mmap) are ignored, a
+/// documented shortcut, same as the rest of this file's memory functions.
+///
+/// Allocates `len` bytes from the arena's mmap region (`ctx.alloc.mmap`)
+/// and records the mapping's metadata in `ctx.kernel.memory`, same as
+/// `sceKernelMapFlexibleMemory` above. Unlike that function, this HLE
+/// binding returns the mapped address directly as the call's result rather
+/// than through an out-parameter (the real ABI's `void **res` is not
+/// modeled here — no `args` slot maps cleanly to it, and every existing
+/// caller of this HLE function already expects the address in the return
+/// value); on failure returns `0` rather than `HLE_ERROR`, since `0` is
+/// `sceKernelMmap`'s real `NULL`-ish failure convention for an
+/// address-returning call.
+fn hle_mmap(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    let len = args.get(1).copied().unwrap_or(0);
+    let prot = args.get(2).copied().unwrap_or(0x3) as u32;
+    let flags = args.get(3).copied().unwrap_or(0);
+    debug!("sceKernelMmap(addr={addr:#x}, len={len:#x}, prot={prot}, flags={flags:#x})");
+
+    let Some(mapped) = ctx.alloc.mmap(len, xps5x_core::PS5_PAGE_SIZE as u64) else {
+        warn!("sceKernelMmap: arena mmap failed (len={len:#x})");
+        return 0;
+    };
+    ctx.kernel.memory.record_mapping(mapped, len, prot);
+    mapped
 }
 
 /// Stub: plausible fixed size (1 GiB), not the real configured direct-memory
@@ -406,11 +439,15 @@ mod tests {
     }
 
     #[test]
-    fn map_flexible_memory_actually_maps_through_the_kernel_and_writes_addr_out() {
+    fn map_flexible_memory_actually_maps_through_the_arena_and_writes_addr_out() {
         let registry = HleRegistry::new();
         let kernel = xps5x_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
-        let alloc = crate::TestAllocator::new(0);
+        // Nonzero base: `TestAllocator` is a bump allocator, so its returned
+        // address is real evidence the call routed through `ctx.alloc`
+        // (`kernel.memory.mmap` would instead pick from its own
+        // `next_anon_addr`, which starts far above this test's TestMemory).
+        let alloc = crate::TestAllocator::new(0x10);
         let ctx = test_ctx(&kernel, &mem, &alloc);
 
         let addr_out: u64 = 0x100;
@@ -423,15 +460,23 @@ mod tests {
         assert!(mem.read(addr_out, &mut mapped_addr_bytes));
         let mapped_addr = u64::from_le_bytes(mapped_addr_bytes);
         assert_ne!(mapped_addr, 0, "sceKernelMapFlexibleMemory should write a real mapped address");
-        assert!(kernel.memory.is_mapped(mapped_addr), "the address written to addrOut must actually be mapped");
+        assert!(
+            kernel.memory.is_mapped(mapped_addr),
+            "the address written to addrOut must be recorded as mapped in the VMM"
+        );
+
+        // munmap must clear the recorded metadata.
+        let munmap_result = registry.call(&ctx, "libkernel", "sceKernelMunmap", &[mapped_addr, 0x4000]).unwrap();
+        assert_eq!(munmap_result, SCE_OK);
+        assert!(!kernel.memory.is_mapped(mapped_addr), "sceKernelMunmap must remove the VMM mapping record");
     }
 
     #[test]
-    fn allocate_direct_memory_actually_maps_through_the_kernel_and_writes_phys_addr_out() {
+    fn allocate_direct_memory_actually_maps_through_the_arena_and_writes_phys_addr_out() {
         let registry = HleRegistry::new();
         let kernel = xps5x_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
-        let alloc = crate::TestAllocator::new(0);
+        let alloc = crate::TestAllocator::new(0x10);
         let ctx = test_ctx(&kernel, &mem, &alloc);
 
         let phys_addr_out: u64 = 0x200;
@@ -450,5 +495,24 @@ mod tests {
         let addr = u64::from_le_bytes(addr_bytes);
         assert_ne!(addr, 0);
         assert!(kernel.memory.is_mapped(addr));
+    }
+
+    #[test]
+    fn mmap_returns_a_real_mapped_address_directly_and_munmap_clears_it() {
+        let registry = HleRegistry::new();
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x10);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // sceKernelMmap's ABI returns the mapped address as the call result
+        // (not through an out-parameter), unlike sceKernelMapFlexibleMemory.
+        let addr = registry.call(&ctx, "libkernel", "sceKernelMmap", &[0, 0x4000, 0x3, 0]).unwrap();
+        assert_ne!(addr, 0, "sceKernelMmap should return a real mapped address, not the old fake sentinel");
+        assert!(kernel.memory.is_mapped(addr), "sceKernelMmap must record its mapping in the VMM");
+
+        let munmap_result = registry.call(&ctx, "libkernel", "sceKernelMunmap", &[addr, 0x4000]).unwrap();
+        assert_eq!(munmap_result, SCE_OK);
+        assert!(!kernel.memory.is_mapped(addr), "sceKernelMunmap must remove the VMM mapping record");
     }
 }

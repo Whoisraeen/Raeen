@@ -649,3 +649,237 @@ fn malloc_then_memset_then_readback_proves_real_guest_heap_memory() {
          the write is visible back through the identity-mapped GuestArena"
     );
 }
+
+/// Writes a guest entry that: calls `sceKernelMapFlexibleMemory(addrOut,
+/// len, prot)` through `slot_map_off` — where `addrOut` is `scratch_addr`, an
+/// *arena-absolute* guest address the HLE call can `ctx.mem.write` its
+/// 8-byte result pointer to (this test uses the same in-image location, at
+/// `scratch_off`, both as that absolute address and as the RIP-relative
+/// reload target below, since the arena is identity-mapped) — reloads the
+/// address `sceKernelMapFlexibleMemory` just wrote as `memset`'s first
+/// argument, calls `memset(ptr, memset_value, len)` through
+/// `slot_memset_off`, reloads the pointer once more, and reads byte 0 of the
+/// block back with a zero-extending byte load into `EAX`, which becomes the
+/// guest's return value. Mirrors [`write_malloc_memset_readback_stub`], with
+/// `sceKernelMapFlexibleMemory`'s three-register call in place of `malloc`'s
+/// one-register call and (crucially) no explicit store back to `scratch_off`
+/// after the first call — unlike `malloc`, which returns its result in
+/// `RAX`, `sceKernelMapFlexibleMemory` writes its result directly to
+/// `addrOut` (i.e. `scratch_off`) itself.
+#[allow(clippy::too_many_arguments)]
+fn write_mmap_memset_readback_stub(
+    buf: &mut [u8],
+    entry_off: usize,
+    slot_map_off: usize,
+    slot_memset_off: usize,
+    scratch_off: usize,
+    scratch_addr: u64,
+    len: u64,
+    prot: u32,
+    memset_value: u32,
+) {
+    let mut off = entry_off;
+
+    // mov rdi, scratch_addr (sceKernelMapFlexibleMemory's addrOut arg)
+    buf[off] = 0x48;
+    buf[off + 1] = 0xBF;
+    buf[off + 2..off + 10].copy_from_slice(&scratch_addr.to_le_bytes());
+    off += 10;
+
+    // mov esi, len (sceKernelMapFlexibleMemory's len arg)
+    buf[off] = 0xBE;
+    buf[off + 1..off + 5].copy_from_slice(&(len as u32).to_le_bytes());
+    off += 5;
+
+    // mov edx, prot (sceKernelMapFlexibleMemory's prot arg)
+    buf[off] = 0xBA;
+    buf[off + 1..off + 5].copy_from_slice(&prot.to_le_bytes());
+    off += 5;
+
+    // call qword ptr [rip+disp32]  -> slot_map_off
+    let call1_rip_after = off as i64 + 6;
+    let call1_disp32 = (slot_map_off as i64 - call1_rip_after) as i32;
+    buf[off] = 0xFF;
+    buf[off + 1] = 0x15;
+    buf[off + 2..off + 6].copy_from_slice(&call1_disp32.to_le_bytes());
+    off += 6;
+
+    // mov rdi, [rip+disp32]  <- scratch_off (memset's dst arg: the address
+    // sceKernelMapFlexibleMemory just wrote to addrOut)
+    let load1_rip_after = off as i64 + 7;
+    let load1_disp32 = (scratch_off as i64 - load1_rip_after) as i32;
+    buf[off] = 0x48;
+    buf[off + 1] = 0x8B;
+    buf[off + 2] = 0x3D;
+    buf[off + 3..off + 7].copy_from_slice(&load1_disp32.to_le_bytes());
+    off += 7;
+
+    // mov esi, memset_value
+    buf[off] = 0xBE;
+    buf[off + 1..off + 5].copy_from_slice(&memset_value.to_le_bytes());
+    off += 5;
+
+    // mov edx, len (memset's n arg)
+    buf[off] = 0xBA;
+    buf[off + 1..off + 5].copy_from_slice(&(len as u32).to_le_bytes());
+    off += 5;
+
+    // call qword ptr [rip+disp32]  -> slot_memset_off
+    let call2_rip_after = off as i64 + 6;
+    let call2_disp32 = (slot_memset_off as i64 - call2_rip_after) as i32;
+    buf[off] = 0xFF;
+    buf[off + 1] = 0x15;
+    buf[off + 2..off + 6].copy_from_slice(&call2_disp32.to_le_bytes());
+    off += 6;
+
+    // mov rdi, [rip+disp32]  <- scratch_off (reload the pointer for read-back)
+    let load2_rip_after = off as i64 + 7;
+    let load2_disp32 = (scratch_off as i64 - load2_rip_after) as i32;
+    buf[off] = 0x48;
+    buf[off + 1] = 0x8B;
+    buf[off + 2] = 0x3D;
+    buf[off + 3..off + 7].copy_from_slice(&load2_disp32.to_le_bytes());
+    off += 7;
+
+    // movzx eax, byte [rdi]
+    buf[off] = 0x0F;
+    buf[off + 1] = 0xB6;
+    buf[off + 2] = 0x07;
+    off += 3;
+
+    // ret
+    buf[off] = 0xC3;
+}
+
+/// RT2b acceptance test (design doc §6/§8): a synthetic module's entry calls
+/// the real, HLE-registered `libkernel::sceKernelMapFlexibleMemory` to map a
+/// region from the arena's mmap region, calls the real `libc::memset` to
+/// fill it with a known byte, and reads byte 0 of that same block straight
+/// back out through the guest's own load instruction — proving
+/// `sceKernelMapFlexibleMemory` now allocates real, dereferenceable arena
+/// memory (RT2 Task 5; it no longer returns the old fake-address stub) and
+/// that `memset` actually wrote through it, all via the genuine VEH
+/// trap-and-dispatch path (no test-only accessor into the arena).
+///
+/// Separately — using the *same* [`OrbisKernel`] instance passed to
+/// `execute_linked` — asserts that `kernel.memory.is_mapped` reflects the
+/// mapping `sceKernelMapFlexibleMemory` recorded, and that the mapped
+/// address falls inside the arena's mmap region (`arena.rs`'s private
+/// `MMAP_OFFSET`/`ARENA_SPAN` constants, mirrored here for the same reason
+/// as the RT2a heap-region test above: this is a black-box integration test
+/// with no access to `xps5x_runtime::arena`'s internals).
+#[test]
+fn mmap_then_memset_then_readback_proves_real_arena_memory_and_records_vmm_metadata() {
+    const ENTRY_OFF: usize = 0x0;
+    const SLOT_MAP_OFF: usize = 0x80;
+    const SLOT_MEMSET_OFF: usize = 0x88;
+    const SCRATCH_OFF: usize = 0x90;
+    const MMAP_LEN: u64 = 0x40;
+    const MMAP_PROT: u32 = 0x3; // R+W
+    const MEMSET_VALUE: u32 = 0xCD;
+
+    const MMAP_OFFSET: u64 = 0xA000_0000;
+    const ARENA_SPAN: u64 = 0x1_0000_0000;
+
+    let hle = HleRegistry::new();
+    let map_nid = nid_of("sceKernelMapFlexibleMemory");
+    let memset_nid = nid_of("memset");
+
+    let scratch_addr = GUEST_ARENA_BASE + SCRATCH_OFF as u64;
+
+    let mut image = vec![0u8; 0x100];
+    write_mmap_memset_readback_stub(
+        &mut image,
+        ENTRY_OFF,
+        SLOT_MAP_OFF,
+        SLOT_MEMSET_OFF,
+        SCRATCH_OFF,
+        scratch_addr,
+        MMAP_LEN,
+        MMAP_PROT,
+        MEMSET_VALUE,
+    );
+
+    let module = SprxModule {
+        name: "rt2b-mmap-memset-test".to_string(),
+        e_type: 0xFE18, // ET_SCE_DYNAMIC
+        segments: vec![SprxSegment {
+            vaddr: 0,
+            data: image,
+            flags: 7, // R+W+X: this segment is both the executed code and the scratch slot
+            mem_size: 0x100,
+        }],
+        dynlib_data: None,
+        relro: None,
+        dynamic: None,
+        entry: ENTRY_OFF as u64,
+    };
+
+    let dynlib = DynlibData {
+        symbols: vec![
+            DynSymbol {
+                nid: map_nid,
+                value: 0,
+                is_import: true,
+            },
+            DynSymbol {
+                nid: memset_nid,
+                value: 0,
+                is_import: true,
+            },
+        ],
+        relocations: vec![
+            SceRela {
+                offset: SLOT_MAP_OFF as u64,
+                info: R_X86_64_JUMP_SLOT, // r_sym = 0 -> sceKernelMapFlexibleMemory
+                addend: 0,
+            },
+            SceRela {
+                offset: SLOT_MEMSET_OFF as u64,
+                info: (1u64 << 32) | R_X86_64_JUMP_SLOT, // r_sym = 1 -> memset
+                addend: 0,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let db = NidDatabase::from_hle_names(hle.registered_names());
+    let registry = ModuleRegistry::new(db);
+    let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE)
+        .expect("sceKernelMapFlexibleMemory/memset imports resolve against the built-in HLE registration");
+    assert_eq!(linked.hle_trampolines.len(), 2, "exactly two HLE imports resolved");
+    assert!(linked.unresolved.is_empty());
+
+    let kernel = OrbisKernel::new();
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
+
+    assert_eq!(
+        result, MEMSET_VALUE as u64,
+        "guest RAX (byte 0 of the mmap'd block, read back after the real memset call) must equal the byte \
+         memset wrote — proving sceKernelMapFlexibleMemory allocated real, dereferenceable arena memory and \
+         memset actually wrote through it"
+    );
+
+    // Separately, using the same `kernel` instance: the VMM must have
+    // recorded the arena mapping's metadata (record_mapping tags it
+    // "arena_mmap"), and the recorded address must fall inside the arena's
+    // mmap region.
+    let mapped_region = kernel
+        .memory
+        .dump_regions()
+        .into_iter()
+        .find(|region| region.name.as_deref() == Some("arena_mmap"))
+        .expect("sceKernelMapFlexibleMemory must have recorded a VMM mapping via record_mapping");
+    let mapped_addr = mapped_region.vaddr;
+
+    assert!(
+        kernel.memory.is_mapped(mapped_addr),
+        "kernel.memory.is_mapped must reflect the arena mapping sceKernelMapFlexibleMemory recorded"
+    );
+    let mmap_start = GUEST_ARENA_BASE + MMAP_OFFSET;
+    let mmap_end = GUEST_ARENA_BASE + ARENA_SPAN;
+    assert!(
+        mapped_addr >= mmap_start && mapped_addr < mmap_end,
+        "mapped address {mapped_addr:#x} must fall inside the arena's mmap region [{mmap_start:#x}, {mmap_end:#x})"
+    );
+}
