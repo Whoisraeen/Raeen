@@ -1,6 +1,9 @@
 //! SCE NID (Name ID) hashing and base64 encoding.
 
+use std::collections::HashMap;
+
 use sha1::{Digest, Sha1};
+use tracing::warn;
 
 /// Public, community-documented 16-byte suffix appended to a symbol name
 /// before hashing. This is a salt, not a secret key.
@@ -23,10 +26,16 @@ pub fn nid_of(name: &str) -> u64 {
 
 /// Encode a 64-bit NID into its 11-character SCE base64 string.
 ///
-/// Bytes are taken little-endian and packed MSB-first, 6 bits per character,
-/// no padding (64 bits → 11 characters, the last carrying 4 significant bits).
+/// Bytes are taken big-endian and packed MSB-first, 6 bits per character, no
+/// padding (64 bits → 11 characters, the last carrying 4 significant bits).
+///
+/// Note: `nid_of` reads the SHA-1 digest's first 8 bytes little-endian into
+/// the `u64`, but the SCE base64 packing then re-serializes that `u64`
+/// big-endian — i.e. it walks the original digest bytes in their natural
+/// (reversed) order. This asymmetry is confirmed against a public
+/// name→NID vector (see the `pins_documented_libkernel_nid_vector` test).
 pub fn encode_nid(nid: u64) -> String {
-    let bytes = nid.to_le_bytes();
+    let bytes = nid.to_be_bytes();
     let mut out = String::with_capacity(11);
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;
@@ -64,7 +73,67 @@ pub fn decode_nid(s: &str) -> Option<u64> {
     if bytes.len() < 8 {
         return None;
     }
-    Some(u64::from_le_bytes(bytes[0..8].try_into().ok()?))
+    // See `encode_nid`: the packed bytes are big-endian relative to the
+    // `u64` produced by `nid_of`.
+    Some(u64::from_be_bytes(bytes[0..8].try_into().ok()?))
+}
+
+/// Maps import NIDs back to the HLE `"library::function"` names they
+/// resolve to, precomputed from the names XPS5X's HLE implements.
+///
+/// Built once (from [`from_hle_names`](Self::from_hle_names)) and then
+/// consulted read-only when linking a module's imports (Task 5's
+/// `ModuleRegistry`).
+#[derive(Debug, Default, Clone)]
+pub struct NidDatabase {
+    by_nid: HashMap<u64, String>,
+}
+
+impl NidDatabase {
+    /// Build a database from `(library, function)` name pairs — e.g. every
+    /// name the HLE registry implements. Each function name's NID is
+    /// computed via [`nid_of`] and mapped to `"library::function"`.
+    ///
+    /// NID collisions are possible-but-astronomically-unlikely (SHA-1
+    /// truncated to 64 bits over a modest name set). On a collision the
+    /// first-inserted mapping wins and the collision is logged via `warn!`
+    /// — this never panics.
+    pub fn from_hle_names(names: impl IntoIterator<Item = (String, String)>) -> Self {
+        let mut by_nid = HashMap::new();
+        for (library, function) in names {
+            let nid = nid_of(&function);
+            let key = format!("{library}::{function}");
+            match by_nid.entry(nid) {
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    warn!(
+                        "NID collision for {:#x}: keeping {:?}, dropping {:?}",
+                        nid,
+                        existing.get(),
+                        key
+                    );
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(key);
+                }
+            }
+        }
+        Self { by_nid }
+    }
+
+    /// Resolve an import NID to its `"library::function"` name, if known.
+    pub fn resolve(&self, nid: u64) -> Option<&str> {
+        self.by_nid.get(&nid).map(String::as_str)
+    }
+
+    /// Number of entries in the database.
+    pub fn len(&self) -> usize {
+        self.by_nid.len()
+    }
+
+    /// Whether the database has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.by_nid.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -97,5 +166,101 @@ mod tests {
         assert!(encode_nid(0).starts_with('A'));
         // decode rejects characters outside the alphabet.
         assert_eq!(decode_nid("!!!!!!!!!!!"), None);
+    }
+
+    /// Pins the NID bit-order against a public, documented `name -> NID`
+    /// vector (design §7 open item / plan Task 4 step 2).
+    ///
+    /// Source: shadPS4 (open-source PS5/PS4 emulator,
+    /// <https://github.com/shadps4-emu/shadPS4>) hardcodes each libkernel
+    /// export's SCE NID string as the first argument to its `LIB_FUNCTION`
+    /// registration macro, e.g. in
+    /// `src/core/libraries/kernel/memory.cpp`:
+    /// `LIB_FUNCTION("rTXw65xmLIA", "libkernel", 1, "libkernel",
+    /// sceKernelAllocateDirectMemory);`. These strings are load-bearing for
+    /// shadPS4's dynamic linker to resolve real PS5 game imports, so they
+    /// are a genuinely verified public vector, not merely documented in
+    /// prose.
+    ///
+    /// This test originally failed: `nid_of` (SHA-1(name + salt), first 8
+    /// bytes read little-endian into a `u64`) was correct, but `encode_nid`
+    /// / `decode_nid` packed those bytes little-endian instead of
+    /// big-endian, producing the wrong base64 string. Fixed by switching
+    /// `encode_nid`/`decode_nid` to `to_be_bytes`/`from_be_bytes`; verified
+    /// against six independent shadPS4 `libkernel` NIDs below.
+    #[test]
+    fn pins_documented_libkernel_nid_vectors() {
+        let vectors: &[(&str, &str)] = &[
+            ("sceKernelAllocateDirectMemory", "rTXw65xmLIA"),
+            ("sceKernelAllocateMainDirectMemory", "B+vc2AO2Zrc"),
+            ("sceKernelMapDirectMemory", "L-Q3LEjIbgA"),
+            ("sceKernelMmap", "PGhQHd-dzv8"),
+            ("sceKernelMunmap", "cQke9UuBQOk"),
+            ("sceKernelReleaseDirectMemory", "MBuItvba6z8"),
+        ];
+        for (name, expected_nid_string) in vectors {
+            let actual = encode_nid(nid_of(name));
+            assert_eq!(
+                &actual, expected_nid_string,
+                "NID for {name:?} should match the documented shadPS4 vector"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod nid_database_tests {
+    use super::*;
+
+    #[test]
+    fn from_hle_names_resolves_known_nid() {
+        let db = NidDatabase::from_hle_names([(
+            "libkernel".to_string(),
+            "sceKernelAllocDirectMemory".to_string(),
+        )]);
+        assert_eq!(
+            db.resolve(nid_of("sceKernelAllocDirectMemory")),
+            Some("libkernel::sceKernelAllocDirectMemory")
+        );
+    }
+
+    #[test]
+    fn resolve_unknown_nid_returns_none() {
+        let db = NidDatabase::from_hle_names([(
+            "libkernel".to_string(),
+            "sceKernelAllocDirectMemory".to_string(),
+        )]);
+        assert_eq!(db.resolve(nid_of("someUnregisteredFunction")), None);
+    }
+
+    #[test]
+    fn len_and_is_empty_behave() {
+        let empty = NidDatabase::from_hle_names(std::iter::empty());
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+
+        let db = NidDatabase::from_hle_names([
+            ("libkernel".to_string(), "sceKernelSleep".to_string()),
+            ("libc".to_string(), "malloc".to_string()),
+        ]);
+        assert_eq!(db.len(), 2);
+        assert!(!db.is_empty());
+    }
+
+    #[test]
+    fn collision_keeps_first_and_does_not_panic() {
+        // Same function name registered under two different libraries maps
+        // to the same NID (nid_of only hashes the function name), which is
+        // a real, expected "collision" from the database's point of view.
+        let db = NidDatabase::from_hle_names([
+            ("libkernel".to_string(), "sceKernelSleep".to_string()),
+            ("libSceLibcInternal".to_string(), "sceKernelSleep".to_string()),
+        ]);
+        assert_eq!(db.len(), 1);
+        assert_eq!(
+            db.resolve(nid_of("sceKernelSleep")),
+            Some("libkernel::sceKernelSleep"),
+            "first-inserted mapping wins on collision"
+        );
     }
 }
