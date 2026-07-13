@@ -1101,3 +1101,258 @@ fn guest_clobbering_r15_does_not_corrupt_host_rsp() {
          host-RSP restore must not depend on the guest preserving any register"
     );
 }
+
+// --- RT2c-b: TLS via fsbase (design doc §3/§5's acceptance tests) ---
+//
+// `xps5x_runtime::tls` is a private module, so this black-box test file
+// duplicates the same minimal FSGSBASE probe/read it uses internally (the
+// same pattern already used elsewhere in this file for private arena
+// constants like `HEAP_OFFSET`/`STACK_OFFSET`) -- purely to (a) gate these
+// tests on FSGSBASE actually being available on the machine running them,
+// since that's environment-dependent, and (b) observe the *host* thread's FS
+// base for the "no leak"/"restored" assertions, which requires reading it
+// from outside `execute_linked` entirely.
+
+/// Duplicate of `xps5x_runtime::tls::fsgsbase_available`'s CPUID probe.
+fn fsgsbase_available() -> bool {
+    // SAFETY: `__cpuid_count` is a safe fn on this target/rustc -- `CPUID`
+    // is unconditionally available on x86-64; leaf 7/sub-leaf 0 is a
+    // standard, always-queryable "Extended Features" leaf.
+    let regs = core::arch::x86_64::__cpuid_count(7, 0);
+    (regs.ebx & 1) != 0
+}
+
+/// Duplicate of `xps5x_runtime::tls::read_fsbase` -- reads the *host*
+/// thread's current FS base, used only to observe that `execute_linked`
+/// restores it after a guest call.
+///
+/// # Safety
+/// Caller must have confirmed `fsgsbase_available()` returns `true` first.
+unsafe fn read_host_fsbase() -> u64 {
+    let value: u64;
+    // SAFETY: per this function's contract, the caller has confirmed
+    // FSGSBASE is available. Same `RDFSBASE RAX` encoding
+    // (`F3 48 0F AE C0`) as `xps5x_runtime::tls::read_fsbase`.
+    unsafe {
+        core::arch::asm!(
+            ".byte 0xf3, 0x48, 0x0f, 0xae, 0xc0", // rdfsbase rax
+            out("rax") value,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    value
+}
+
+/// A trivial hand-mapped module (`ret`) with no HLE imports -- reused by
+/// several of the tests below that only care about `execute_linked`'s
+/// TLS/fsbase side effects, not any particular guest computation.
+fn trivial_ret_module() -> LinkedModule {
+    LinkedModule {
+        image: vec![0xC3], // ret
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        hle_trampolines: Vec::new(),
+        entry: 0,
+    }
+}
+
+/// RT2c-b acceptance test, part 1 (design doc §5): a hand-assembled guest
+/// entry that is exactly `mov rax, fs:[0]; ret` (`64 48 8B 04 25 00 00 00 00
+/// C3`, the RT2c-b task brief's stub) must return the TCB guest address
+/// `GuestArena::setup_main_tcb` installed -- proving a real `fs:`-prefixed
+/// guest load sees the FS base `dispatch::run` set via `WRFSBASE`.
+///
+/// `setup_main_tcb` is the very first heap allocation `execute_linked` makes
+/// on a freshly constructed (hence freshly heap-bumped) `GuestArena`, so its
+/// address is deterministically `GUEST_ARENA_BASE + HEAP_OFFSET` -- mirrors
+/// the same private-constant-duplication pattern the RT2a heap-region test
+/// above (`malloc_hle_call_returns_a_pointer_inside_the_heap_region`) uses,
+/// for the same reason (black-box test, no access to `arena.rs`'s private
+/// `HEAP_OFFSET`).
+#[test]
+fn guest_fs_zero_load_reads_the_installed_tcb() {
+    if !fsgsbase_available() {
+        println!("FSGSBASE not available on this CPU; skipping guest_fs_zero_load_reads_the_installed_tcb");
+        return;
+    }
+
+    const ENTRY_OFF: usize = 0x0;
+    const HEAP_OFFSET: u64 = 0x4000_0000;
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+    image[ENTRY_OFF..ENTRY_OFF + 9].copy_from_slice(&[0x64, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00]);
+    image[ENTRY_OFF + 9] = 0xC3;
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: ENTRY_OFF as u64,
+    };
+
+    let kernel = OrbisKernel::new();
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
+
+    let expected_tcb = GUEST_ARENA_BASE + HEAP_OFFSET;
+    println!("guest_fs_zero_load_reads_the_installed_tcb: RAX = {result:#x}, expected TCB = {expected_tcb:#x}");
+    assert_eq!(
+        result, expected_tcb,
+        "guest `mov rax, fs:[0]` must read the TCB self-pointer `setup_main_tcb` installed"
+    );
+}
+
+/// RT2c-b acceptance test, part 2 (design doc §5): a hand-assembled guest
+/// entry that writes a known 64-bit value to `fs:[8]`, clears `rax`, then
+/// reads it back through `fs:[8]` and returns it -- proving `fs:`-relative
+/// addressing at a *non-zero* offset round-trips (not just the `fs:[0]`
+/// self-pointer read above), i.e. real TLS-offset accesses (stack-protector
+/// canary, TLS variables) resolve correctly through the FS base
+/// `dispatch::run` set.
+#[test]
+fn guest_fs_offset_round_trip_writes_and_reads_back() {
+    if !fsgsbase_available() {
+        println!("FSGSBASE not available on this CPU; skipping guest_fs_offset_round_trip_writes_and_reads_back");
+        return;
+    }
+
+    const ENTRY_OFF: usize = 0x0;
+    const TLS_VALUE: u64 = 0x1122_3344_5566_7788;
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+    let mut off = ENTRY_OFF;
+
+    // mov rax, TLS_VALUE (48 B8 imm64)
+    image[off] = 0x48;
+    image[off + 1] = 0xB8;
+    image[off + 2..off + 10].copy_from_slice(&TLS_VALUE.to_le_bytes());
+    off += 10;
+
+    // mov fs:[8], rax (64 48 89 04 25 08 00 00 00)
+    image[off..off + 9].copy_from_slice(&[0x64, 0x48, 0x89, 0x04, 0x25, 0x08, 0x00, 0x00, 0x00]);
+    off += 9;
+
+    // xor rax, rax (48 31 C0) -- prove the load below actually reloads a
+    // fresh value rather than the assembler's own register state.
+    image[off..off + 3].copy_from_slice(&[0x48, 0x31, 0xC0]);
+    off += 3;
+
+    // mov rax, fs:[8] (64 48 8B 04 25 08 00 00 00)
+    image[off..off + 9].copy_from_slice(&[0x64, 0x48, 0x8B, 0x04, 0x25, 0x08, 0x00, 0x00, 0x00]);
+    off += 9;
+
+    // ret
+    image[off] = 0xC3;
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: ENTRY_OFF as u64,
+    };
+
+    let kernel = OrbisKernel::new();
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
+
+    println!("guest_fs_offset_round_trip_writes_and_reads_back: RAX = {result:#x}, expected = {TLS_VALUE:#x}");
+    assert_eq!(
+        result, TLS_VALUE,
+        "a value written to fs:[8] must read back through fs:[8], proving TLS-offset addressing (not just \
+         fs:[0]) round-trips correctly"
+    );
+}
+
+/// RT2c-b acceptance test, part 3 (design doc §7's restore requirement): the
+/// *host* thread's FS base must be back to its pre-call value after
+/// `execute_linked` returns -- proving `dispatch::run`'s shared continuation
+/// restore (`write_fsbase(ctx.orig_fsbase.get())`) actually runs. Calls
+/// `execute_linked` twice in a row to also prove no leak accumulates across
+/// repeated calls (each call sets fsbase to a *different* TCB address, since
+/// each builds a fresh `GuestArena`, so a broken restore that merely "worked
+/// once" would still be caught by the second call).
+#[test]
+fn host_fsbase_is_restored_after_execute_linked_returns() {
+    if !fsgsbase_available() {
+        println!("FSGSBASE not available on this CPU; skipping host_fsbase_is_restored_after_execute_linked_returns");
+        return;
+    }
+
+    // SAFETY: `fsgsbase_available()` just returned `true` above.
+    let before = unsafe { read_host_fsbase() };
+
+    let hle = HleRegistry::new();
+    let kernel = OrbisKernel::new();
+    let _ = execute_linked(&trivial_ret_module(), &hle, &kernel, 0, &[]).expect("native execution succeeds");
+
+    // SAFETY: same as above.
+    let after_first = unsafe { read_host_fsbase() };
+    println!("host_fsbase_is_restored_after_execute_linked_returns: before={before:#x} after_first={after_first:#x}");
+    assert_eq!(
+        after_first, before,
+        "host FS base must be restored to its pre-call value after execute_linked returns"
+    );
+
+    let hle2 = HleRegistry::new();
+    let kernel2 = OrbisKernel::new();
+    let _ = execute_linked(&trivial_ret_module(), &hle2, &kernel2, 0, &[]).expect("native execution succeeds");
+
+    // SAFETY: same as above.
+    let after_second = unsafe { read_host_fsbase() };
+    println!("host_fsbase_is_restored_after_execute_linked_returns: after_second={after_second:#x}");
+    assert_eq!(
+        after_second, before,
+        "host FS base must still equal the pre-call value after a second, independent execute_linked call"
+    );
+}
+
+/// RT2c-b + RT1a interaction test (design doc §5's "fault path still
+/// restores fsbase"): reuses the genuine-wild-fault shape
+/// (`genuine_wild_fault_recovers_as_faulted_then_process_keeps_running`
+/// above) but additionally asserts the *host* FS base is restored to its
+/// pre-call value even when the guest call is recovered via RT1a's
+/// `RtlCaptureContext`-based fault path, not just on the ordinary-return
+/// path covered by the test above -- proving the restore in `dispatch::run`'s
+/// shared continuation runs on *both* arrivals, exactly as documented.
+#[test]
+fn host_fsbase_is_restored_after_a_recovered_genuine_fault() {
+    if !fsgsbase_available() {
+        println!("FSGSBASE not available on this CPU; skipping host_fsbase_is_restored_after_a_recovered_genuine_fault");
+        return;
+    }
+
+    const ENTRY_OFF: usize = 0x0;
+
+    // SAFETY: `fsgsbase_available()` just returned `true` above.
+    let before = unsafe { read_host_fsbase() };
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+    image[ENTRY_OFF..ENTRY_OFF + 9].copy_from_slice(&[0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xC3]);
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: ENTRY_OFF as u64,
+    };
+
+    let kernel = OrbisKernel::new();
+    let err = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).unwrap_err();
+    match err {
+        RuntimeError::Faulted { .. } => {}
+        other => panic!("expected Err(Faulted {{ .. }}), got {other:?}"),
+    }
+
+    // SAFETY: same as above.
+    let after = unsafe { read_host_fsbase() };
+    println!("host_fsbase_is_restored_after_a_recovered_genuine_fault: before={before:#x} after={after:#x}");
+    assert_eq!(
+        after, before,
+        "host FS base must be restored even after a recovered genuine guest fault (RT1a path), not just on \
+         ordinary return"
+    );
+}
