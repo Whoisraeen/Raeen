@@ -1,0 +1,27 @@
+[package]
+name = "xps5x-gui"
+description = "XPS5X desktop application — game library browser, settings, and debug tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "xps5x"
+path = "src/main.rs"
+
+[dependencies]
+xps5x-core = { workspace = true }
+xps5x-loader = { workspace = true }
+xps5x-kernel = { workspace = true }
+xps5x-gpu = { workspace = true }
+xps5x-audio = { workspace = true }
+xps5x-io = { workspace = true }
+xps5x-input = { workspace = true }
+xps5x-hle = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }

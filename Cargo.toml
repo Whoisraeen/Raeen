@@ -1,0 +1,84 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/xps5x-core",
+    "crates/xps5x-loader",
+    "crates/xps5x-kernel",
+    "crates/xps5x-gpu",
+    "crates/xps5x-audio",
+    "crates/xps5x-io",
+    "crates/xps5x-input",
+    "crates/xps5x-hle",
+    "crates/xps5x-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+repository = "https://github.com/XPS5X/xps5x"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Core
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+bitflags = "2"
+bytemuck = { version = "1", features = ["derive"] }
+zerocopy = { version = "0.8", features = ["derive"] }
+memmap2 = "0.9"
+rayon = "1"
+parking_lot = "0.12"
+dashmap = "6"
+crossbeam = "0.8"
+
+# ELF / Binary parsing
+goblin = "0.9"
+scroll = "0.12"
+
+# Graphics (Vulkan)
+ash = "0.38"
+gpu-allocator = { version = "0.27", features = ["vulkan"] }
+
+# Windowing
+winit = "0.30"
+raw-window-handle = "0.6"
+
+# GUI
+egui = "0.31"
+eframe = { version = "0.31", features = ["wgpu"] }
+
+# Audio
+cpal = "0.15"
+tracing-appender = "0.2"
+
+# Input
+gilrs = "0.11"
+
+# Compression / Decompression
+lz4_flex = "0.11"
+zstd = "0.13"
+
+# Internal crates
+xps5x-core = { path = "crates/xps5x-core" }
+xps5x-loader = { path = "crates/xps5x-loader" }
+xps5x-kernel = { path = "crates/xps5x-kernel" }
+xps5x-gpu = { path = "crates/xps5x-gpu" }
+xps5x-audio = { path = "crates/xps5x-audio" }
+xps5x-io = { path = "crates/xps5x-io" }
+xps5x-input = { path = "crates/xps5x-input" }
+xps5x-hle = { path = "crates/xps5x-hle" }
+xps5x-gui = { path = "crates/xps5x-gui" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+
+[profile.dev]
+opt-level = 1  # Slightly optimized dev builds for emulator performance

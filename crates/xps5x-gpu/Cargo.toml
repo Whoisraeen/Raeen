@@ -1,0 +1,19 @@
+[package]
+name = "xps5x-gpu"
+description = "GPU command translation — GNM/PM4 to Vulkan, shader recompiler, texture translation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+xps5x-core = { workspace = true }
+ash = { workspace = true }
+gpu-allocator = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+bitflags = { workspace = true }
+bytemuck = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+raw-window-handle = { workspace = true }

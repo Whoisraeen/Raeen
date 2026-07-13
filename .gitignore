@@ -1,0 +1,34 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment
+.env
+.env.local
+
+# Shader cache (generated at runtime)
+shader_cache/
+
+# User configuration (generated at runtime)
+config.toml
+
+# Game data (user-provided)
+games/
+firmware/
+savedata/
+
+# Logs
+logs/
+*.log

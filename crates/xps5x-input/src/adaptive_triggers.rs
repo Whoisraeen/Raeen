@@ -1,0 +1,1 @@
+//! Adaptive trigger resistance emulation.

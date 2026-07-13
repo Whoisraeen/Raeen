@@ -1,0 +1,12 @@
+[package]
+name = "xps5x-audio"
+description = "Tempest 3D audio emulation with HRTF-based spatial processing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+xps5x-core = { workspace = true }
+cpal = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
