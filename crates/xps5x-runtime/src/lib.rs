@@ -40,12 +40,12 @@ pub enum RuntimeError {
     /// diagnostics.
     #[error("call to unresolved HLE trampoline at {0:#x}")]
     UnresolvedTrampoline(u64),
-    /// A genuine guest fault outside the trampoline guard region. RT0 does
-    /// not currently construct this variant — see `dispatch.rs`'s module
-    /// doc comment for why converting an arbitrary wild fault into a safe
-    /// Rust-level return needs machinery (a saved recovery point) RT0
-    /// doesn't implement yet. Kept in the public API now so callers can
-    /// already match on it; wiring it up is a later milestone.
+    /// A genuine guest fault (an access violation) outside the trampoline
+    /// guard region — e.g. a wild pointer dereference in guest code, not an
+    /// HLE call. Recovered rather than crashing the process (RT1a): the VEH
+    /// restores a pre-call register snapshot taken via `RtlCaptureContext`
+    /// (see `dispatch.rs`'s module doc comment for the exact mechanism).
+    /// `addr` is the faulting instruction's `Rip`.
     #[error("guest fault at {addr:#x}")]
     Faulted { addr: u64 },
     /// More than 6 integer/pointer arguments were requested — RT0 only
@@ -75,6 +75,13 @@ pub fn execute_linked(
     }
     let mut padded = [0u64; MAX_ARGS];
     padded[..args.len()].copy_from_slice(args);
+
+    // RT0 supports exactly one active native guest execution at a time
+    // (design doc §4/§6/§9); held for this entire function, not just the
+    // guest call inside `dispatch::run` below — see `dispatch::CALL_LOCK`'s
+    // doc comment for why the trampoline guard reservation just below also
+    // needs this.
+    let _call_lock = dispatch::call_lock();
 
     let image = mem::MappedImage::map(&module.image)?;
     let entry_ptr = image.entry_ptr(entry_offset)?;

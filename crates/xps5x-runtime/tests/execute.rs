@@ -154,11 +154,59 @@ fn more_than_six_args_is_rejected() {
     assert_eq!(err, RuntimeError::TooManyArgs);
 }
 
-// A genuine-wild-fault test (guest code writing through a deliberately
-// invalid pointer, outside the trampoline guard region) is deferred: RT0's
-// VEH intentionally passes such faults on with EXCEPTION_CONTINUE_SEARCH
-// rather than converting them to `RuntimeError::Faulted` (see
-// `dispatch.rs`'s module doc comment) -- there is currently no safe
-// recovery point to resume Rust execution from after a genuine access
-// violation, so a real one would terminate the test process rather than
-// return an `Err`. Wiring up `Faulted` is left to a later milestone.
+/// RT1a acceptance test (design doc §7/§8's "genuine fault -> `Faulted`, not
+/// a hang or silent pass"): a hand-mapped module (no `link_module` needed --
+/// this entry never calls an HLE import) whose entry function is
+/// `mov rax, [0]; ret` (`48 8B 04 25 00 00 00 00 C3`) -- a wild dereference
+/// of address `0`, reliably unmapped, entirely outside the trampoline guard
+/// region (`HLE_TRAMPOLINE_BASE`, a high fixed sentinel far from any
+/// `VirtualAlloc`-chosen address). `execute_linked` must recover this as
+/// `Err(Faulted { .. })` via the VEH's `RtlCaptureContext`-based restore
+/// (`dispatch.rs`) instead of crashing the test process -- and the test
+/// process proves it survived by going on to make an entirely ordinary RT0
+/// call (through the ordinary sentinel-dispatch path) right after, in the
+/// same test.
+#[test]
+fn genuine_wild_fault_recovers_as_faulted_then_process_keeps_running() {
+    const ENTRY_OFF: usize = 0x0;
+
+    let hle = HleRegistry::new();
+
+    let mut image = vec![0u8; 0x100];
+    image[ENTRY_OFF..ENTRY_OFF + 9].copy_from_slice(&[0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xC3]);
+
+    let linked = LinkedModule {
+        image,
+        base: 0,
+        unresolved: Vec::new(),
+        hle_trampolines: Vec::<HleTrampoline>::new(),
+    };
+
+    let err = execute_linked(&linked, &hle, ENTRY_OFF as u64, &[]).unwrap_err();
+    match err {
+        RuntimeError::Faulted { addr } => {
+            // `addr` is the *faulting instruction's* Rip (the mapped
+            // entry's host address), not the wild pointer (`0`) it
+            // dereferenced.
+            assert_ne!(addr, 0, "Faulted::addr is the faulting Rip, which is a real mapped-image address");
+        }
+        other => panic!("expected Err(Faulted {{ .. }}), got {other:?}"),
+    }
+
+    // The process survived: prove it with a completely ordinary RT0 call,
+    // in this same test/thread, right after the recovered fault. Also
+    // proves `run`'s `CALL_LOCK`/`ACTIVE_CONTEXT`/VEH state was fully torn
+    // down and re-armed correctly by the faulted call rather than left
+    // corrupted.
+    let sentinel_hle = HleRegistry::new();
+    sentinel_hle.register("libtest", "sceTestSentinel", sentinel);
+    let import_nid = nid_of("sceTestSentinel");
+    let (module, dynlib) = build_synthetic_module(import_nid, 0x0, 0x10);
+    let db = NidDatabase::from_hle_names(sentinel_hle.registered_names());
+    let registry = ModuleRegistry::new(db);
+    let linked = link_module(&module, &dynlib, &registry, &sentinel_hle, 0x1_0000_0000)
+        .expect("synthetic module links against the HLE-registered sentinel");
+
+    let result = execute_linked(&linked, &sentinel_hle, 0x0, &[]).expect("native execution succeeds after a recovered fault");
+    assert_eq!(result, 0xC0DE, "trampoline dispatch still works normally after a recovered fault");
+}
