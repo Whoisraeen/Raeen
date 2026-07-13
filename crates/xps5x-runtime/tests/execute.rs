@@ -365,3 +365,287 @@ fn memcpy_hle_call_moves_real_bytes_through_the_runtime() {
          HleContext + GuestMemory + VEH dispatch routed a real byte-for-byte copy, not a no-op stub"
     );
 }
+
+/// Writes `mov rdi, imm64; call qword ptr [rip+disp32]; ret` into `buf`
+/// starting at `entry_off`: sets up `malloc(size)`'s SysV first integer
+/// argument register, calls through the import slot at `slot_off` (trapping
+/// into the VEH, which dispatches to the real HLE `malloc`), then returns
+/// immediately — the guest's own `RAX` on return *is* `malloc`'s result,
+/// with no further guest instructions needed.
+fn write_malloc_entry_stub(buf: &mut [u8], entry_off: usize, slot_off: usize, size: u64) {
+    let mut off = entry_off;
+
+    buf[off] = 0x48; // REX.W
+    buf[off + 1] = 0xBF; // mov rdi, imm64
+    buf[off + 2..off + 10].copy_from_slice(&size.to_le_bytes());
+    off += 10;
+
+    let call_rip_after = off as i64 + 6;
+    let call_disp32 = (slot_off as i64 - call_rip_after) as i32;
+    buf[off] = 0xFF;
+    buf[off + 1] = 0x15;
+    buf[off + 2..off + 6].copy_from_slice(&call_disp32.to_le_bytes());
+    off += 6;
+
+    buf[off] = 0xC3; // ret
+}
+
+/// RT2a acceptance test, part 1 (design doc §6/§8): a synthetic module's
+/// entry calls the real, HLE-registered `libc::malloc` through the genuine
+/// VEH trap-and-dispatch path and simply returns whatever it got back in
+/// `RAX` — `malloc`'s actual return value, unmediated by any further guest
+/// code. Asserts the returned address falls inside the arena's heap region
+/// (`[GUEST_ARENA_BASE + HEAP_OFFSET, GUEST_ARENA_BASE + STACK_OFFSET)`,
+/// `arena.rs`'s layout constants), proving `malloc` allocated real guest
+/// memory from the arena rather than returning a fixed sentinel.
+#[test]
+fn malloc_hle_call_returns_a_pointer_inside_the_heap_region() {
+    const ENTRY_OFF: usize = 0x0;
+    const SLOT_OFF: usize = 0x20;
+    const MALLOC_SIZE: u64 = 0x40;
+
+    // Mirrors `arena.rs`'s private `HEAP_OFFSET`/`STACK_OFFSET` constants —
+    // duplicated here (this is a black-box integration test in a separate
+    // crate-external file, with no access to `xps5x_runtime::arena`) so the
+    // heap-region assertion below doesn't rely on any of that module's
+    // internals being exported.
+    const HEAP_OFFSET: u64 = 0x4000_0000;
+    const STACK_OFFSET: u64 = 0x8000_0000;
+
+    let hle = HleRegistry::new();
+    let malloc_nid = nid_of("malloc");
+
+    let mut image = vec![0u8; 0x100];
+    write_malloc_entry_stub(&mut image, ENTRY_OFF, SLOT_OFF, MALLOC_SIZE);
+
+    let module = SprxModule {
+        name: "rt2a-malloc-test".to_string(),
+        e_type: 0xFE18, // ET_SCE_DYNAMIC
+        segments: vec![SprxSegment {
+            vaddr: 0,
+            data: image,
+            flags: 5, // R+X
+            mem_size: 0x100,
+        }],
+        dynlib_data: None,
+        relro: None,
+        dynamic: None,
+        entry: ENTRY_OFF as u64,
+    };
+
+    let dynlib = DynlibData {
+        symbols: vec![DynSymbol {
+            nid: malloc_nid,
+            value: 0,
+            is_import: true,
+        }],
+        relocations: vec![SceRela {
+            offset: SLOT_OFF as u64,
+            info: R_X86_64_JUMP_SLOT, // r_sym = 0 (only symtab entry)
+            addend: 0,
+        }],
+        ..Default::default()
+    };
+
+    let db = NidDatabase::from_hle_names(hle.registered_names());
+    let registry = ModuleRegistry::new(db);
+    let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE)
+        .expect("malloc import resolves against the built-in libc HLE registration");
+    assert_eq!(linked.hle_trampolines.len(), 1, "exactly one HLE import resolved");
+    assert_eq!(linked.hle_trampolines[0].library, "libc");
+    assert_eq!(linked.hle_trampolines[0].function, "malloc");
+    assert!(linked.unresolved.is_empty());
+
+    let kernel = OrbisKernel::new();
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
+
+    assert_ne!(result, 0, "malloc must not return NULL for a small, easily satisfiable request");
+    let heap_start = GUEST_ARENA_BASE + HEAP_OFFSET;
+    let heap_end = GUEST_ARENA_BASE + STACK_OFFSET;
+    assert!(
+        result >= heap_start && result < heap_end,
+        "malloc'd address {result:#x} must fall inside the heap region [{heap_start:#x}, {heap_end:#x})"
+    );
+}
+
+/// Writes a guest entry that: calls `malloc(0x40)` (arg in RDI) through
+/// `slot_malloc_off`, stashes the returned pointer at `scratch_off` (a
+/// RIP-relative store into the mapped image itself — this test has no other
+/// scratch storage available to a hand-assembled stub), reloads it as
+/// `memset`'s first argument, calls `memset(ptr, 0xAB, 0x40)` through
+/// `slot_memset_off`, reloads the pointer once more, and reads byte 0 of the
+/// block back with a zero-extending byte load into `EAX`, which becomes the
+/// guest's return value.
+fn write_malloc_memset_readback_stub(
+    buf: &mut [u8],
+    entry_off: usize,
+    slot_malloc_off: usize,
+    slot_memset_off: usize,
+    scratch_off: usize,
+    malloc_size: u64,
+    memset_value: u32,
+) {
+    let mut off = entry_off;
+
+    // mov rdi, malloc_size
+    buf[off] = 0x48;
+    buf[off + 1] = 0xBF;
+    buf[off + 2..off + 10].copy_from_slice(&malloc_size.to_le_bytes());
+    off += 10;
+
+    // call qword ptr [rip+disp32]  ->  slot_malloc_off
+    let call1_rip_after = off as i64 + 6;
+    let call1_disp32 = (slot_malloc_off as i64 - call1_rip_after) as i32;
+    buf[off] = 0xFF;
+    buf[off + 1] = 0x15;
+    buf[off + 2..off + 6].copy_from_slice(&call1_disp32.to_le_bytes());
+    off += 6;
+
+    // mov [rip+disp32], rax  -> scratch_off (stash the malloc'd pointer)
+    let store_rip_after = off as i64 + 7;
+    let store_disp32 = (scratch_off as i64 - store_rip_after) as i32;
+    buf[off] = 0x48;
+    buf[off + 1] = 0x89;
+    buf[off + 2] = 0x05;
+    buf[off + 3..off + 7].copy_from_slice(&store_disp32.to_le_bytes());
+    off += 7;
+
+    // mov rdi, [rip+disp32]  <- scratch_off (memset's dst arg)
+    let load1_rip_after = off as i64 + 7;
+    let load1_disp32 = (scratch_off as i64 - load1_rip_after) as i32;
+    buf[off] = 0x48;
+    buf[off + 1] = 0x8B;
+    buf[off + 2] = 0x3D;
+    buf[off + 3..off + 7].copy_from_slice(&load1_disp32.to_le_bytes());
+    off += 7;
+
+    // mov esi, memset_value
+    buf[off] = 0xBE;
+    buf[off + 1..off + 5].copy_from_slice(&memset_value.to_le_bytes());
+    off += 5;
+
+    // mov edx, malloc_size (low 32 bits; MALLOC_SIZE is small in this test)
+    buf[off] = 0xBA;
+    buf[off + 1..off + 5].copy_from_slice(&(malloc_size as u32).to_le_bytes());
+    off += 5;
+
+    // call qword ptr [rip+disp32]  -> slot_memset_off
+    let call2_rip_after = off as i64 + 6;
+    let call2_disp32 = (slot_memset_off as i64 - call2_rip_after) as i32;
+    buf[off] = 0xFF;
+    buf[off + 1] = 0x15;
+    buf[off + 2..off + 6].copy_from_slice(&call2_disp32.to_le_bytes());
+    off += 6;
+
+    // mov rdi, [rip+disp32]  <- scratch_off (reload the pointer for read-back)
+    let load2_rip_after = off as i64 + 7;
+    let load2_disp32 = (scratch_off as i64 - load2_rip_after) as i32;
+    buf[off] = 0x48;
+    buf[off + 1] = 0x8B;
+    buf[off + 2] = 0x3D;
+    buf[off + 3..off + 7].copy_from_slice(&load2_disp32.to_le_bytes());
+    off += 7;
+
+    // movzx eax, byte [rdi]
+    buf[off] = 0x0F;
+    buf[off + 1] = 0xB6;
+    buf[off + 2] = 0x07;
+    off += 3;
+
+    // ret
+    buf[off] = 0xC3;
+}
+
+/// RT2a acceptance test, part 2 (design doc §6/§8's full payoff): a
+/// synthetic module's entry calls the real, HLE-registered `libc::malloc`
+/// to get a block of guest heap memory, calls the real `libc::memset` to
+/// fill it with a known byte, and reads byte 0 of that same block straight
+/// back out through the guest's own load instruction — proving malloc
+/// returned real, dereferenceable guest memory, memset actually wrote
+/// through it, and the write is visible back through the identity-mapped
+/// arena, all via the genuine VEH trap-and-dispatch path (no test-only
+/// accessor into the arena).
+#[test]
+fn malloc_then_memset_then_readback_proves_real_guest_heap_memory() {
+    const ENTRY_OFF: usize = 0x0;
+    const SLOT_MALLOC_OFF: usize = 0x80;
+    const SLOT_MEMSET_OFF: usize = 0x88;
+    const SCRATCH_OFF: usize = 0x90;
+    const MALLOC_SIZE: u64 = 0x40;
+    const MEMSET_VALUE: u32 = 0xAB;
+
+    let hle = HleRegistry::new();
+    let malloc_nid = nid_of("malloc");
+    let memset_nid = nid_of("memset");
+
+    let mut image = vec![0u8; 0x100];
+    write_malloc_memset_readback_stub(
+        &mut image,
+        ENTRY_OFF,
+        SLOT_MALLOC_OFF,
+        SLOT_MEMSET_OFF,
+        SCRATCH_OFF,
+        MALLOC_SIZE,
+        MEMSET_VALUE,
+    );
+
+    let module = SprxModule {
+        name: "rt2a-malloc-memset-test".to_string(),
+        e_type: 0xFE18, // ET_SCE_DYNAMIC
+        segments: vec![SprxSegment {
+            vaddr: 0,
+            data: image,
+            flags: 7, // R+W+X: this segment is both the executed code and the scratch slot
+            mem_size: 0x100,
+        }],
+        dynlib_data: None,
+        relro: None,
+        dynamic: None,
+        entry: ENTRY_OFF as u64,
+    };
+
+    let dynlib = DynlibData {
+        symbols: vec![
+            DynSymbol {
+                nid: malloc_nid,
+                value: 0,
+                is_import: true,
+            },
+            DynSymbol {
+                nid: memset_nid,
+                value: 0,
+                is_import: true,
+            },
+        ],
+        relocations: vec![
+            SceRela {
+                offset: SLOT_MALLOC_OFF as u64,
+                info: R_X86_64_JUMP_SLOT, // r_sym = 0 -> malloc
+                addend: 0,
+            },
+            SceRela {
+                offset: SLOT_MEMSET_OFF as u64,
+                info: (1u64 << 32) | R_X86_64_JUMP_SLOT, // r_sym = 1 -> memset
+                addend: 0,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let db = NidDatabase::from_hle_names(hle.registered_names());
+    let registry = ModuleRegistry::new(db);
+    let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE)
+        .expect("malloc/memset imports resolve against the built-in libc HLE registration");
+    assert_eq!(linked.hle_trampolines.len(), 2, "exactly two HLE imports resolved");
+    assert!(linked.unresolved.is_empty());
+
+    let kernel = OrbisKernel::new();
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
+
+    assert_eq!(
+        result, MEMSET_VALUE as u64,
+        "guest RAX (byte 0 of the malloc'd block, read back after the real memset call) must equal the byte \
+         memset wrote — proving the guest malloc'd real arena memory, memset actually wrote through it, and \
+         the write is visible back through the identity-mapped GuestArena"
+    );
+}
