@@ -4901,6 +4901,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "cbc",
+ "goblin",
  "memmap2",
  "sha1",
  "tracing",
