@@ -20,7 +20,7 @@ use xps5x_firmware::dynlib::{DynSymbol, DynlibData, SceRela};
 use xps5x_firmware::{HLE_TRAMPOLINE_BASE, HleTrampoline, LinkedModule, ModuleRegistry, SprxModule, SprxSegment, link_module};
 use xps5x_hle::{HleContext, HleRegistry};
 use xps5x_kernel::OrbisKernel;
-use xps5x_runtime::{RuntimeError, execute_linked};
+use xps5x_runtime::{GUEST_ARENA_BASE, RuntimeError, execute_linked};
 
 const R_X86_64_JUMP_SLOT: u64 = 7;
 
@@ -96,7 +96,7 @@ fn sentinel_call_through_real_lm1_linker_dispatches_to_hle() {
     let db = NidDatabase::from_hle_names(hle.registered_names());
     let registry = ModuleRegistry::new(db);
 
-    let linked = link_module(&module, &dynlib, &registry, &hle, 0x1_0000_0000)
+    let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE)
         .expect("synthetic module links against the HLE-registered sentinel");
     assert_eq!(linked.hle_trampolines.len(), 1, "exactly one HLE import resolved");
     assert_eq!(linked.hle_trampolines[0].library, "libtest");
@@ -130,7 +130,7 @@ fn call_to_unmapped_trampoline_index_returns_unresolved() {
 
     let linked = LinkedModule {
         image,
-        base: 0,
+        base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
@@ -149,7 +149,7 @@ fn more_than_six_args_is_rejected() {
     let hle = HleRegistry::new();
     let linked = LinkedModule {
         image: vec![0xC3], // ret
-        base: 0,
+        base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
         hle_trampolines: Vec::new(),
         entry: 0,
@@ -184,7 +184,7 @@ fn genuine_wild_fault_recovers_as_faulted_then_process_keeps_running() {
 
     let linked = LinkedModule {
         image,
-        base: 0,
+        base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
@@ -213,7 +213,7 @@ fn genuine_wild_fault_recovers_as_faulted_then_process_keeps_running() {
     let (module, dynlib) = build_synthetic_module(import_nid, 0x0, 0x10);
     let db = NidDatabase::from_hle_names(sentinel_hle.registered_names());
     let registry = ModuleRegistry::new(db);
-    let linked = link_module(&module, &dynlib, &registry, &sentinel_hle, 0x1_0000_0000)
+    let linked = link_module(&module, &dynlib, &registry, &sentinel_hle, GUEST_ARENA_BASE)
         .expect("synthetic module links against the HLE-registered sentinel");
 
     let sentinel_kernel = OrbisKernel::new();
@@ -222,24 +222,38 @@ fn genuine_wild_fault_recovers_as_faulted_then_process_keeps_running() {
     assert_eq!(result, 0xC0DE, "trampoline dispatch still works normally after a recovered fault");
 }
 
-/// Writes `mov edi, dst; mov esi, src; mov edx, n; call qword ptr
+/// Writes `mov rdi, dst_addr; mov rsi, src_addr; mov edx, n; call qword ptr
 /// [rip+disp32]; mov eax, dword ptr [rip+disp32]; ret` into `buf` starting
-/// at `entry_off`: sets up `memcpy(dst, src, n)`'s SysV integer argument
-/// registers, calls through the import slot at `slot_off` (trapping into
-/// the VEH, which dispatches to the real HLE `memcpy`), then — proof that
-/// bytes actually moved, without needing any accessor beyond the guest's
-/// own `RAX` return value — reads the first 4 bytes now sitting at `dst`
+/// at `entry_off`: sets up `memcpy(dst_addr, src_addr, n)`'s SysV integer
+/// argument registers with arena-absolute 64-bit guest addresses (the arena
+/// is identity-mapped far above the 32-bit range, so `dst`/`src` need a
+/// 64-bit immediate load, unlike RT0's original flat-image addressing),
+/// calls through the import slot at `slot_off` (trapping into the VEH,
+/// which dispatches to the real HLE `memcpy`), then — proof that bytes
+/// actually moved, without needing any accessor beyond the guest's own
+/// `RAX` return value — reads the first 4 bytes now sitting at `dst_off`
+/// (the same location's plain in-image offset, for the RIP-relative load)
 /// straight back out of the same mapped image and returns them.
-fn write_memcpy_entry_stub(buf: &mut [u8], entry_off: usize, slot_off: usize, dst: u32, src: u32, n: u32) {
+fn write_memcpy_entry_stub(
+    buf: &mut [u8],
+    entry_off: usize,
+    slot_off: usize,
+    dst_off: usize,
+    dst_addr: u64,
+    src_addr: u64,
+    n: u32,
+) {
     let mut off = entry_off;
 
-    buf[off] = 0xBF; // mov edi, imm32
-    buf[off + 1..off + 5].copy_from_slice(&dst.to_le_bytes());
-    off += 5;
+    buf[off] = 0x48; // REX.W
+    buf[off + 1] = 0xBF; // mov rdi, imm64
+    buf[off + 2..off + 10].copy_from_slice(&dst_addr.to_le_bytes());
+    off += 10;
 
-    buf[off] = 0xBE; // mov esi, imm32
-    buf[off + 1..off + 5].copy_from_slice(&src.to_le_bytes());
-    off += 5;
+    buf[off] = 0x48; // REX.W
+    buf[off + 1] = 0xBE; // mov rsi, imm64
+    buf[off + 2..off + 10].copy_from_slice(&src_addr.to_le_bytes());
+    off += 10;
 
     buf[off] = 0xBA; // mov edx, imm32
     buf[off + 1..off + 5].copy_from_slice(&n.to_le_bytes());
@@ -255,7 +269,7 @@ fn write_memcpy_entry_stub(buf: &mut [u8], entry_off: usize, slot_off: usize, ds
 
     let load_off = off;
     let load_rip_after = load_off as i64 + 6;
-    let load_disp32 = (dst as i64) - load_rip_after;
+    let load_disp32 = (dst_off as i64) - load_rip_after;
     buf[load_off] = 0x8B; // mov eax, [rip+disp32]
     buf[load_off + 1] = 0x05;
     buf[load_off + 2..load_off + 6].copy_from_slice(&(load_disp32 as i32).to_le_bytes());
@@ -290,7 +304,15 @@ fn memcpy_hle_call_moves_real_bytes_through_the_runtime() {
     let memcpy_nid = nid_of("memcpy");
 
     let mut image = vec![0u8; 0x100];
-    write_memcpy_entry_stub(&mut image, ENTRY_OFF, SLOT_OFF, DST_OFF, SRC_OFF, PAYLOAD.len() as u32);
+    write_memcpy_entry_stub(
+        &mut image,
+        ENTRY_OFF,
+        SLOT_OFF,
+        DST_OFF as usize,
+        GUEST_ARENA_BASE + DST_OFF as u64,
+        GUEST_ARENA_BASE + SRC_OFF as u64,
+        PAYLOAD.len() as u32,
+    );
     image[SRC_OFF as usize..SRC_OFF as usize + PAYLOAD.len()].copy_from_slice(&PAYLOAD);
     // dst region (image[DST_OFF..]) is left zeroed, so a nonzero read-back
     // can only mean the HLE `memcpy` actually wrote it.
@@ -326,7 +348,7 @@ fn memcpy_hle_call_moves_real_bytes_through_the_runtime() {
 
     let db = NidDatabase::from_hle_names(hle.registered_names());
     let registry = ModuleRegistry::new(db);
-    let linked = link_module(&module, &dynlib, &registry, &hle, 0x3_0000_0000)
+    let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE)
         .expect("memcpy import resolves against the built-in libc HLE registration");
     assert_eq!(linked.hle_trampolines.len(), 1, "exactly one HLE import resolved");
     assert_eq!(linked.hle_trampolines[0].library, "libc");

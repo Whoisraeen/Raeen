@@ -7,16 +7,14 @@
 //! Guest address `A` *is* host address `A` here (identity mapping): a guest
 //! pointer returned by `alloc`/`mmap`, or baked into the image by the
 //! linker's relocations, is directly dereferenceable by the native CPU — no
-//! translation layer, unlike [`crate::mem::MappedImage`] (which RT2 Task 3
-//! retires in favor of this module).
+//! translation layer, unlike the now-retired `mem::MappedImage` this module
+//! replaces.
 //!
 //! # RT2 status
 //!
-//! This module is not yet wired into [`crate::execute_linked`] (that is RT2
-//! Task 3) — `#[allow(dead_code)]` below is temporary and expected to be
-//! removed once `execute_linked` starts constructing a real `GuestArena`.
-
-#![allow(dead_code)]
+//! Wired into [`crate::execute_linked`] since RT2 Task 3: every guest
+//! execution builds a real `GuestArena` and passes it as both the
+//! `GuestMemory` and `GuestAllocator` view.
 
 use core::ffi::c_void;
 use std::collections::HashMap;
@@ -220,8 +218,7 @@ impl GuestArena {
     }
 
     /// The host address of guest offset `entry_offset` into the mapped
-    /// image, bounds-checked against the real (unpadded) image length —
-    /// mirrors `mem::MappedImage::entry_ptr`.
+    /// image, bounds-checked against the real (unpadded) image length.
     pub(crate) fn entry_ptr(&self, entry_offset: u64) -> Result<*const u8, RuntimeError> {
         if entry_offset >= self.image_len {
             return Err(RuntimeError::MapFailed);

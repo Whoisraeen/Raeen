@@ -139,8 +139,8 @@ static ACTIVE_CONTEXT: AtomicPtr<ActiveContext> = AtomicPtr::new(ptr::null_mut()
 /// `entry` must be a valid function pointer, callable with the
 /// `extern "sysv64"` calling convention, into memory the caller mapped
 /// specifically so it can be executed (i.e. a live
-/// [`crate::mem::MappedImage`]'s contents) — calling it runs that code
-/// natively on the current thread. `trampolines`, `hle`, `kernel`, `mem`,
+/// [`crate::arena::GuestArena`]'s image sub-region) — calling it runs that
+/// code natively on the current thread. `trampolines`, `hle`, `kernel`, `mem`,
 /// and `alloc` must outlive this call (guaranteed by `execute_linked`'s
 /// borrows). `guard` must be the [`TrampolineGuard`] whose region covers
 /// every address `trampolines` resolves.
