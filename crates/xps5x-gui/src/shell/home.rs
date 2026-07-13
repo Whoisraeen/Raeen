@@ -9,7 +9,7 @@
 use super::anim::lerp_color;
 use super::icons::{self, Glyph};
 use super::nav::NavState;
-use crate::library::{ArtSource, GlyphKind, Gradient, ItemKind, LibraryItem, TileGradient};
+use crate::library::{ArtSource, GlyphKind, Gradient, ItemKind, LibraryItem, MetaCache, TileGradient};
 use crate::theme::Theme;
 use egui::{Align, Color32, Layout, Mesh, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, UiBuilder, vec2};
 
@@ -24,7 +24,7 @@ pub struct HomeAnim {
     pub focus_pop: f32,
 }
 
-pub fn draw(ui: &mut egui::Ui, theme: &Theme, items: &[LibraryItem], nav: &NavState, anim: &HomeAnim) {
+pub fn draw(ui: &mut egui::Ui, theme: &Theme, items: &[LibraryItem], nav: &NavState, anim: &HomeAnim, meta_cache: &MetaCache) {
     let screen = ui.max_rect();
     let painter = ui.painter().clone();
 
@@ -44,7 +44,7 @@ pub fn draw(ui: &mut egui::Ui, theme: &Theme, items: &[LibraryItem], nav: &NavSt
     let content_rect = Rect::from_min_max(Pos2::new(screen.left(), topbar_rect.bottom()), Pos2::new(screen.right(), rail_rect.top()));
 
     let focused = items.get(nav.rail_index);
-    draw_context_block(ui, theme, content_rect, focused);
+    draw_context_block(ui, theme, content_rect, focused, meta_cache);
     draw_rail(ui, theme, rail_rect, items, nav, anim);
     draw_hints(&painter, theme, screen);
 }
@@ -145,8 +145,12 @@ fn icon_button(ui: &mut egui::Ui, theme: &Theme, glyph: Glyph) {
     icons::draw(ui.painter(), glyph, rect.center(), 22.0, theme.palette.text_dim);
 }
 
-fn draw_context_block(ui: &mut egui::Ui, theme: &Theme, rect: Rect, focused: Option<&LibraryItem>) {
+fn draw_context_block(ui: &mut egui::Ui, theme: &Theme, rect: Rect, focused: Option<&LibraryItem>, meta_cache: &MetaCache) {
     let Some(item) = focused else { return };
+    // Home reads a focused item's metadata from the cache rather than the
+    // item directly, so rendering stays decoupled from how (or whether)
+    // metadata was sourced (parsed `xps5x-title.toml`, or none) — spec §4.
+    let meta = meta_cache.get(item.id.as_str());
     let max_width = rect.width().min(660.0);
     let text_rect = Rect::from_min_size(rect.min, vec2(max_width, rect.height()));
 
@@ -156,7 +160,8 @@ fn draw_context_block(ui: &mut egui::Ui, theme: &Theme, rect: Rect, focused: Opt
             ui.add_space(theme.metrics.content_padding_bottom);
 
             // Activity cards (bottom-most element added first under bottom_up).
-            if let Some(meta) = &item.meta {
+            // A game with no metadata renders no cards — just title + Play.
+            if let Some(meta) = meta {
                 ui.horizontal(|ui| {
                     ui.add_space(theme.metrics.content_padding_x);
                     for card in &meta.activity {
@@ -172,7 +177,7 @@ fn draw_context_block(ui: &mut egui::Ui, theme: &Theme, rect: Rect, focused: Opt
                 ui.add_space(theme.metrics.content_padding_x);
                 play_button(ui, theme);
                 ui.add_space(14.0);
-                if item.meta.is_some() {
+                if meta.is_some() {
                     ghost_button(ui, theme, "•••  More");
                 }
             });
@@ -181,7 +186,7 @@ fn draw_context_block(ui: &mut egui::Ui, theme: &Theme, rect: Rect, focused: Opt
             // Meta row (rating/genre/players) or system subtitle.
             ui.horizontal(|ui| {
                 ui.add_space(theme.metrics.content_padding_x);
-                match &item.meta {
+                match meta {
                     Some(meta) => {
                         ui.label(RichText::new(stars(meta.rating)).color(theme.palette.accent_hi).size(14.0));
                         dot(ui, theme);
@@ -206,7 +211,7 @@ fn draw_context_block(ui: &mut egui::Ui, theme: &Theme, rect: Rect, focused: Opt
             // Kicker (top-most element, added last under bottom_up).
             ui.horizontal(|ui| {
                 ui.add_space(theme.metrics.content_padding_x);
-                let kicker = item.meta.as_ref().map(|m| m.kicker.as_str()).unwrap_or("System");
+                let kicker = meta.map(|m| m.kicker.as_str()).unwrap_or("System");
                 ui.label(
                     RichText::new(kicker.to_uppercase())
                         .color(theme.palette.accent_hi)

@@ -14,7 +14,7 @@ pub mod icons;
 pub mod nav;
 
 use crate::launcher::{GameLauncher, SessionHandle, SessionState};
-use crate::library::{Gradient, LibraryItem};
+use crate::library::{Gradient, LibraryItem, MetaCache};
 use crate::theme::Theme;
 use anim::Animated;
 use boot::BootSequence;
@@ -36,15 +36,22 @@ struct ActiveSession {
     target_index: usize,
 }
 
+/// Cap on the Switcher's recent-titles history (spec §10).
+const MAX_RECENT_TITLES: usize = 6;
+
 /// The full Shell: navigation, animation, library, and the launcher seam.
 pub struct Shell {
     theme: Theme,
     library: Vec<LibraryItem>,
+    meta_cache: MetaCache,
     nav: NavState,
     screen: Screen,
     launcher: Box<dyn GameLauncher>,
     session: Option<ActiveSession>,
     gilrs: Option<gilrs::Gilrs>,
+    /// Ids of launched titles, most-recent-first, deduplicated and capped —
+    /// backs the Control Center's Switcher panel (spec §10).
+    recent: Vec<String>,
 
     rail_offset: Animated,
     focus_pop: Animated,
@@ -59,11 +66,13 @@ impl Shell {
     pub fn new(theme: Theme, library: Vec<LibraryItem>, launcher: Box<dyn GameLauncher>) -> Self {
         let rail_len = library.len();
         let cc_len = control_center::ITEMS.len();
+        let cc_option_counts: Vec<usize> = control_center::ITEMS.iter().map(|item| item.option_count()).collect();
         let hero_to = library.first().map(|i| i.art.hero()).unwrap_or(Gradient {
             hi: theme.palette.raised,
             mid: theme.palette.raised,
             lo: theme.palette.ground,
         });
+        let meta_cache = MetaCache::from_items(&library);
 
         let gilrs = gilrs::Gilrs::new().ok();
         if gilrs.is_none() {
@@ -73,11 +82,13 @@ impl Shell {
         Self {
             theme,
             library,
-            nav: NavState::new(rail_len, cc_len),
+            meta_cache,
+            nav: NavState::with_cc_options(rail_len, cc_len, cc_option_counts),
             screen: Screen::Boot(BootSequence::new()),
             launcher,
             session: None,
             gilrs,
+            recent: Vec::new(),
             rail_offset: Animated::new(0.0),
             focus_pop: Animated::with_speed(1.0, 12.0),
             hero_from: None,
@@ -121,8 +132,28 @@ impl Shell {
         for input in inputs {
             match self.nav.apply(input) {
                 NavAction::Launch(index) => self.begin_launch(index),
+                NavAction::ActivateOption { card, option } => self.handle_cc_option(ctx, card, option),
                 NavAction::OpenControlCenter | NavAction::CloseControlCenter | NavAction::None => {}
             }
+        }
+    }
+
+    /// Handle Confirm on a Control Center card's option list (currently
+    /// only Power: Rest Mode / Restart / Turn Off — spec §10). Rest/Restart
+    /// are no-op stubs for SM1; Turn Off actually closes the Shell.
+    fn handle_cc_option(&mut self, ctx: &egui::Context, card: usize, option: usize) {
+        let Some(item) = control_center::ITEMS.get(card) else { return };
+        if item.name != "Power" {
+            return;
+        }
+        match option {
+            0 => tracing::info!("Rest Mode requested (stub — no-op in SM1)"),
+            1 => tracing::info!("Restart requested (stub — no-op in SM1)"),
+            2 => {
+                tracing::info!("Turn Off requested — closing XPS5X");
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            _ => {}
         }
     }
 
@@ -167,6 +198,7 @@ impl Shell {
         let Some(item) = self.library.get(index) else { return };
         match self.launcher.launch(&item.launch) {
             Ok(handle) => {
+                push_recent(&mut self.recent, &item.id, MAX_RECENT_TITLES);
                 self.session = Some(ActiveSession { handle, title: item.title.clone(), target_index: index });
             }
             Err(err) => {
@@ -247,11 +279,30 @@ impl Shell {
                 hero: self.blended_hero(),
                 focus_pop: self.focus_pop.value,
             };
-            home::draw(ui, &theme, &self.library, &self.nav, &anim);
+            home::draw(ui, &theme, &self.library, &self.nav, &anim, &self.meta_cache);
 
-            control_center::draw(ui, &theme, &self.nav, self.cc_open.value);
+            let recent_titles = self.recent_titles();
+            control_center::draw(ui, &theme, &self.nav, self.cc_open.value, &recent_titles);
         });
     }
+
+    /// Resolve the recent-titles id history to display titles, most-recent-
+    /// first, for the Switcher panel.
+    fn recent_titles(&self) -> Vec<String> {
+        self.recent
+            .iter()
+            .filter_map(|id| self.library.iter().find(|item| &item.id == id).map(|item| item.title.clone()))
+            .collect()
+    }
+}
+
+/// Record a launch in the recent-titles history: most-recent-first,
+/// de-duplicated (a repeat launch moves to the front instead of appearing
+/// twice), and capped at `cap` entries (spec §10).
+fn push_recent(recent: &mut Vec<String>, id: &str, cap: usize) {
+    recent.retain(|existing| existing != id);
+    recent.insert(0, id.to_string());
+    recent.truncate(cap);
 }
 
 fn draw_session_overlay(ui: &mut egui::Ui, theme: &Theme, session: &ActiveSession, launcher: &dyn GameLauncher) {
@@ -283,4 +334,42 @@ fn draw_session_overlay(ui: &mut egui::Ui, theme: &Theme, session: &ActiveSessio
     );
 
     ui.ctx().request_repaint();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_recent_orders_most_recent_first() {
+        let mut recent = Vec::new();
+        push_recent(&mut recent, "a", 6);
+        push_recent(&mut recent, "b", 6);
+        assert_eq!(recent, vec!["b".to_string(), "a".to_string()]);
+    }
+
+    #[test]
+    fn push_recent_deduplicates_repeats() {
+        let mut recent = Vec::new();
+        push_recent(&mut recent, "a", 6);
+        push_recent(&mut recent, "b", 6);
+        push_recent(&mut recent, "a", 6);
+        assert_eq!(recent, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn push_recent_is_capped() {
+        let mut recent = Vec::new();
+        for id in ["a", "b", "c", "d"] {
+            push_recent(&mut recent, id, 2);
+        }
+        assert_eq!(recent, vec!["d".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn push_recent_cap_zero_yields_empty_history() {
+        let mut recent = Vec::new();
+        push_recent(&mut recent, "a", 0);
+        assert!(recent.is_empty());
+    }
 }

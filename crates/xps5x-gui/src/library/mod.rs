@@ -8,6 +8,7 @@
 pub mod scan;
 
 use egui::Color32;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Parse a `0xRRGGBB` literal into a [`Color32`] at full opacity.
@@ -76,20 +77,125 @@ impl ArtSource {
         }
     }
 
-    /// A neutral placeholder gradient for freshly-scanned titles that don't
-    /// yet have real metadata (SM1 will attach real art).
-    pub fn placeholder() -> Self {
-        ArtSource::Game {
-            hero: Gradient {
-                hi: rgb(0x2b3a4e),
-                mid: rgb(0x17222f),
-                lo: rgb(0x0a1017),
-            },
-            tile: TileGradient {
-                from: rgb(0x2b3a4e),
-                to: rgb(0x17222f),
-            },
+}
+
+/// Blend two color channels, `t` in `0.0..=1.0`.
+fn lerp_channel(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t).round().clamp(0.0, 255.0) as u8
+}
+
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    Color32::from_rgb(lerp_channel(a.r(), b.r(), t), lerp_channel(a.g(), b.g(), t), lerp_channel(a.b(), b.b(), t))
+}
+
+/// Build gradient art (hero + tile) from two explicit stops — a bright
+/// highlight and a dark base. Used both for `xps5x-title.toml`'s optional
+/// `gradient` field and for id-derived art (spec §4: gradients only, no
+/// image decoding in SM1).
+pub fn art_from_stops(hi: Color32, lo: Color32) -> ArtSource {
+    let mid = lerp_color(hi, lo, 0.5);
+    ArtSource::Game {
+        hero: Gradient { hi, mid, lo },
+        tile: TileGradient { from: hi, to: lo },
+    }
+}
+
+/// Deterministically derive gradient art from a stable id string — used
+/// when a game has no `xps5x-title.toml`, or one without an explicit
+/// `gradient`. Pure hash + HSL math, no image assets or new dependencies
+/// (spec §11).
+pub fn art_from_id(id: &str) -> ArtSource {
+    let hue = (fnv1a(id) % 360) as f32;
+    let hi = hsl_to_rgb(hue, 0.68, 0.60);
+    let lo = hsl_to_rgb(hue, 0.55, 0.09);
+    art_from_stops(hi, lo)
+}
+
+/// FNV-1a 32-bit hash — small, dependency-free, deterministic.
+fn fnv1a(s: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in s.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// Minimal HSL → RGB conversion (`h` in degrees `0..360`, `s`/`l` in
+/// `0.0..=1.0`).
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> Color32 {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h / 60.0;
+    let x = c * (1.0 - (hp.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    Color32::from_rgb(
+        ((r1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
+}
+
+/// In-memory cache of parsed per-game metadata, keyed by [`LibraryItem::id`]
+/// (spec §4). The Shell builds one from the scanned/sample library and Home
+/// reads a focused item's metadata from it, decoupling rendering from how
+/// (or whether) the metadata was sourced.
+#[derive(Debug, Clone, Default)]
+pub struct MetaCache {
+    entries: HashMap<String, GameMeta>,
+}
+
+impl MetaCache {
+    /// Reserved for callers that build a cache incrementally (e.g. a future
+    /// async/background scan) rather than from a finished item list.
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a cache from a set of items' already-embedded metadata. Works
+    /// uniformly for a scanned library and the in-code sample library.
+    pub fn from_items(items: &[LibraryItem]) -> Self {
+        let mut entries = HashMap::new();
+        for item in items {
+            if let Some(meta) = &item.meta {
+                entries.insert(item.id.clone(), meta.clone());
+            }
         }
+        Self { entries }
+    }
+
+    pub fn get(&self, id: &str) -> Option<&GameMeta> {
+        self.entries.get(id)
+    }
+
+    /// Reserved for callers that update a single game's metadata in place
+    /// (e.g. a future Settings "rescan" action) without rebuilding the
+    /// whole cache via [`MetaCache::from_items`].
+    #[allow(dead_code)]
+    pub fn insert(&mut self, id: String, meta: GameMeta) {
+        self.entries.insert(id, meta);
+    }
+
+    /// Reserved for callers (e.g. a future Settings library summary) that
+    /// need the count without iterating.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Reserved for callers that need an early-out before iterating (no
+    /// current call site iterates the cache directly).
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -317,5 +423,44 @@ mod tests {
         assert_eq!(items[0].title, "Nova Requiem");
         assert_eq!(items.iter().filter(|i| i.kind == ItemKind::Game).count(), 6);
         assert_eq!(items.iter().filter(|i| i.kind == ItemKind::App).count(), 3);
+    }
+
+    #[test]
+    fn art_from_id_is_deterministic() {
+        let a = art_from_id("nova-requiem").tile();
+        let b = art_from_id("nova-requiem").tile();
+        assert_eq!(a.from, b.from);
+        assert_eq!(a.to, b.to);
+    }
+
+    #[test]
+    fn art_from_id_varies_across_ids() {
+        let a = art_from_id("nova-requiem").tile();
+        let b = art_from_id("sable-horizon").tile();
+        assert!(a.from != b.from || a.to != b.to);
+    }
+
+    #[test]
+    fn art_from_stops_uses_exact_stops() {
+        let hi = rgb(0xff0000);
+        let lo = rgb(0x000000);
+        let art = art_from_stops(hi, lo);
+        let tile = art.tile();
+        assert_eq!(tile.from, hi);
+        assert_eq!(tile.to, lo);
+        let hero = art.hero();
+        assert_eq!(hero.hi, hi);
+        assert_eq!(hero.lo, lo);
+    }
+
+    #[test]
+    fn meta_cache_from_items_only_keeps_games_with_meta() {
+        let items = sample_library();
+        let cache = MetaCache::from_items(&items);
+        // 6 games in the sample library, all with meta; 3 apps, none.
+        assert_eq!(cache.len(), 6);
+        assert!(cache.get("nova").is_some());
+        assert!(cache.get("store").is_none());
+        assert!(cache.get("does-not-exist").is_none());
     }
 }
