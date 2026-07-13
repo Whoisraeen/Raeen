@@ -4814,6 +4814,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "xps5x-firmware"
+version = "0.1.0"
+dependencies = [
+ "memmap2",
+ "sha1",
+ "tracing",
+ "xps5x-core",
+ "xps5x-loader",
+]
+
+[[package]]
 name = "xps5x-gpu"
 version = "0.1.0"
 dependencies = [

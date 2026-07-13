@@ -1,0 +1,13 @@
+[package]
+name = "xps5x-firmware"
+description = "PS5 firmware ingestion — PUP parsing, user-supplied key decryption seam, SCE module loading and NID linking"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+xps5x-core = { workspace = true }
+xps5x-loader = { workspace = true }
+tracing = { workspace = true }
+memmap2 = { workspace = true }
+sha1 = { workspace = true }
