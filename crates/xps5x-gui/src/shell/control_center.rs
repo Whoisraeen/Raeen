@@ -14,7 +14,7 @@
 use super::icons::{self, Glyph};
 use super::nav::{NavMode, NavState};
 use crate::theme::Theme;
-use egui::{Align2, Color32, FontId, Pos2, Stroke};
+use egui::{Align2, Color32, FontId, Mesh, Pos2, Rect, Shape, Stroke, StrokeKind, vec2};
 
 /// What a Control Center card's summary panel renders.
 pub enum CcPanelKind {
@@ -117,26 +117,32 @@ pub fn draw(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, open_amount: f32, 
     let item_size = theme.metrics.cc_item_size;
     let gap = theme.metrics.cc_item_gap;
     let content_x = theme.metrics.content_padding_x;
-    let bottom_pad = 26.0;
+    let bottom_pad = 30.0;
+
+    // Bottom gradient so the icon row reads against any hero art.
+    let ground = theme.palette.ground;
+    let grad_rect = Rect::from_min_max(Pos2::new(screen.left(), screen.bottom() - 260.0), screen.max);
+    vertical_gradient(
+        painter,
+        grad_rect,
+        Color32::TRANSPARENT,
+        Color32::from_rgba_unmultiplied(ground.r(), ground.g(), ground.b(), (225.0 * open_amount) as u8),
+    );
 
     // Slide the whole overlay up from below the screen as it opens.
     let slide_off = (1.0 - open_amount) * (item_size + 140.0);
 
     let row_y = screen.bottom() - bottom_pad - item_size + slide_off;
-    let row_start_x = content_x;
+    // Icon row centered on the screen, like the console's control center.
+    let total_w = ITEMS.len() as f32 * item_size + (ITEMS.len() as f32 - 1.0).max(0.0) * gap;
+    let row_start_x = screen.center().x - total_w / 2.0;
 
-    // Summary panel above the row.
+    // Focused card's summary panel: a rounded card floating above the row,
+    // anchored near the focused icon but clamped to the content margins.
     if let Some(focused) = ITEMS.get(nav.cc_index) {
-        let panel_y = row_y - 40.0;
-        painter.text(
-            Pos2::new(row_start_x, panel_y),
-            Align2::LEFT_BOTTOM,
-            focused.name,
-            FontId::proportional(26.0),
-            theme.palette.text.gamma_multiply(open_amount),
-        );
         let panel_ctx = PanelRenderCtx { open_amount, nav, recent_titles };
-        draw_panel_content(painter, theme, Pos2::new(row_start_x, panel_y + 22.0), focused, &panel_ctx);
+        let focused_cx = row_start_x + nav.cc_index as f32 * (item_size + gap) + item_size / 2.0;
+        draw_panel_card(painter, theme, screen, focused_cx, row_y, content_x, focused, &panel_ctx);
     }
 
     for (i, item) in ITEMS.iter().enumerate() {
@@ -178,6 +184,57 @@ struct PanelRenderCtx<'a> {
     open_amount: f32,
     nav: &'a NavState,
     recent_titles: &'a [String],
+}
+
+/// Number of content lines the focused card's panel renders — sizes the
+/// floating card before [`draw_panel_content`] fills it in.
+fn panel_line_count(item: &CcItem, recent_titles: &[String]) -> usize {
+    match &item.panel {
+        CcPanelKind::Simple => 1,
+        CcPanelKind::Fields(fields) => fields.len(),
+        CcPanelKind::Switcher => recent_titles.len().clamp(1, 5),
+        CcPanelKind::Power(options) => options.len(),
+    }
+}
+
+/// The focused card's summary panel: a rounded card floating above the icon
+/// row, horizontally anchored near the focused icon.
+#[allow(clippy::too_many_arguments)]
+fn draw_panel_card(painter: &egui::Painter, theme: &Theme, screen: Rect, focused_cx: f32, row_y: f32, margin_x: f32, item: &CcItem, ctx: &PanelRenderCtx) {
+    const PANEL_W: f32 = 380.0;
+    const PAD: f32 = 20.0;
+    const TITLE_H: f32 = 32.0;
+    const LINE_H: f32 = 24.0;
+
+    let open = ctx.open_amount;
+    let h = PAD * 2.0 + TITLE_H + panel_line_count(item, ctx.recent_titles) as f32 * LINE_H;
+    let x = (focused_cx - PANEL_W / 2.0).clamp(margin_x, (screen.right() - margin_x - PANEL_W).max(margin_x));
+    let rect = Rect::from_min_size(Pos2::new(x, row_y - 46.0 - h), vec2(PANEL_W, h));
+
+    painter.rect_filled(rect, 18.0, Color32::from_rgba_unmultiplied(16, 23, 32, (242.0 * open) as u8));
+    painter.rect_stroke(rect, 18.0, Stroke::new(1.0, theme.palette.line.gamma_multiply(open)), StrokeKind::Inside);
+
+    painter.text(
+        rect.min + vec2(PAD, PAD),
+        Align2::LEFT_TOP,
+        item.name,
+        FontId::proportional(20.0),
+        theme.palette.text.gamma_multiply(open),
+    );
+    draw_panel_content(painter, theme, Pos2::new(rect.left() + PAD, rect.top() + PAD + TITLE_H), item, ctx);
+}
+
+/// Vertical two-stop gradient (egui has no CSS gradients, so build a
+/// two-triangle mesh with per-vertex colors).
+fn vertical_gradient(painter: &egui::Painter, rect: Rect, top: Color32, bottom: Color32) {
+    let mut mesh = Mesh::default();
+    mesh.colored_vertex(rect.left_top(), top);
+    mesh.colored_vertex(rect.right_top(), top);
+    mesh.colored_vertex(rect.left_bottom(), bottom);
+    mesh.colored_vertex(rect.right_bottom(), bottom);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(1, 2, 3);
+    painter.add(Shape::mesh(mesh));
 }
 
 /// Render the focused card's structured panel content starting at

@@ -158,21 +158,21 @@ pub fn default_theme() -> Theme {
             cc_scrim: Color32::from_rgba_premultiplied(4, 7, 12, 140),
         },
         metrics: Metrics {
-            topbar_padding_x: 54.0,
-            topbar_padding_top: 28.0,
-            content_padding_x: 54.0,
-            content_padding_bottom: 18.0,
-            tile_size: 150.0,
-            tile_gap: 22.0,
-            tile_focus_scale: 1.13,
-            tile_focus_lift: 14.0,
-            rail_padding_left: 54.0,
-            corner_radius: 12.0,
+            topbar_padding_x: 48.0,
+            topbar_padding_top: 20.0,
+            content_padding_x: 48.0,
+            content_padding_bottom: 36.0,
+            tile_size: 118.0,
+            tile_gap: 14.0,
+            tile_focus_scale: 1.55,
+            tile_focus_lift: 0.0,
+            rail_padding_left: 48.0,
+            corner_radius: 14.0,
             button_radius: 8.0,
-            card_size: egui::vec2(190.0, 104.0),
-            card_gap: 14.0,
-            cc_item_size: 60.0,
-            cc_item_gap: 12.0,
+            card_size: egui::vec2(250.0, 140.0),
+            card_gap: 16.0,
+            cc_item_size: 56.0,
+            cc_item_gap: 14.0,
         },
         assets: ThemeAssets { font: None, background: None },
     }
@@ -189,8 +189,8 @@ mod tests {
         assert_eq!(theme.palette.ground, rgb(0x0a1017));
         assert_eq!(theme.palette.text, rgb(0xf3f7fc));
         assert_eq!(theme.palette.accent_hi, rgb(0x57b0ff));
-        assert_eq!(theme.metrics.tile_size, 150.0);
-        assert_eq!(theme.metrics.rail_padding_left, 54.0);
+        assert_eq!(theme.metrics.tile_size, 118.0);
+        assert_eq!(theme.metrics.rail_padding_left, 48.0);
         assert!(theme.metrics.tile_focus_scale > 1.0);
         assert!(theme.assets.font.is_none());
         assert!(theme.assets.background.is_none());

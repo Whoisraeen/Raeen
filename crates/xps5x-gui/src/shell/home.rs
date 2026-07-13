@@ -1,5 +1,11 @@
-//! Home screen: function bar, hero background, context block, tile rail
+//! Home screen: function bar, top tile rail, hero background, context block
 //! (spec §3, screen 2).
+//!
+//! Layout mirrors the PS5 home screen: Games/Media tabs top-left with
+//! search/settings/avatar/clock top-right, the tile rail directly under
+//! them with the focused tile enlarged in place, and the focused game's
+//! wordmark + activity cards over the hero art in the lower-left. All art
+//! remains original (gradients + monograms — spec §11, zero Sony assets).
 //!
 //! Pure rendering — all animated values (rail slide, hero crossfade, focus
 //! pop) are resolved by `shell/mod.rs` before calling [`draw`], so this
@@ -20,9 +26,14 @@ pub struct HomeAnim {
     /// Current (possibly crossfading) hero gradient.
     pub hero: Gradient,
     /// 0.0 (just changed focus) .. 1.0 (settled) — eases the focused tile's
-    /// scale/lift in rather than snapping it.
+    /// scale in rather than snapping it.
     pub focus_pop: f32,
 }
+
+/// Height of the top function bar (tabs + status icons).
+const TOPBAR_H: f32 = 72.0;
+/// Breathing room between the function bar and the tile rail.
+const RAIL_TOP_GAP: f32 = 10.0;
 
 pub fn draw(
     ui: &mut egui::Ui,
@@ -39,22 +50,26 @@ pub fn draw(
     painter.rect_filled(screen, 0.0, theme.palette.ground);
     draw_hero(&painter, screen, theme, &anim.hero, background);
 
-    let topbar_h = 96.0;
-    let topbar_rect = Rect::from_min_size(screen.min, vec2(screen.width(), topbar_h));
+    let topbar_rect = Rect::from_min_size(screen.min, vec2(screen.width(), TOPBAR_H));
     draw_topbar(ui, theme, topbar_rect, nav.tab);
 
-    let rail_h = theme.metrics.tile_size * theme.metrics.tile_focus_scale
-        + theme.metrics.tile_focus_lift
-        + 34.0
-        + 36.0;
-    let rail_rect = Rect::from_min_max(Pos2::new(screen.left(), screen.bottom() - rail_h), screen.max);
+    // Tile rail: top of the screen, directly under the function bar, with
+    // the focused tile enlarged in place — the PS5 home arrangement.
+    let focused_size = theme.metrics.tile_size * theme.metrics.tile_focus_scale;
+    let rail_rect = Rect::from_min_size(
+        Pos2::new(screen.left(), topbar_rect.bottom() + RAIL_TOP_GAP),
+        vec2(screen.width(), focused_size + 12.0),
+    );
+    draw_rail(ui, theme, rail_rect, items, nav, anim);
 
-    let content_rect = Rect::from_min_max(Pos2::new(screen.left(), topbar_rect.bottom()), Pos2::new(screen.right(), rail_rect.top()));
-
+    let content_rect = Rect::from_min_max(Pos2::new(screen.left(), rail_rect.bottom()), screen.max);
     let focused = items.get(nav.rail_index);
     draw_context_block(ui, theme, content_rect, focused, meta_cache);
-    draw_rail(ui, theme, rail_rect, items, nav, anim);
     draw_hints(&painter, theme, screen);
+
+    // The focus ring pulses and the clock ticks even when nothing else is
+    // animating, so keep the screen gently alive.
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
 }
 
 /// Paint the Home hero. When the active theme provides a background image
@@ -69,7 +84,8 @@ fn draw_hero(painter: &egui::Painter, rect: Rect, theme: &Theme, g: &Gradient, b
             painter.image(texture.id(), rect, uv, Color32::WHITE);
         }
         None => {
-            // Approximate the mockup's upper-right radial glow with a 4-corner mesh.
+            // Approximate full-bleed key art's upper-right glow with a
+            // 4-corner mesh.
             let top_right = g.hi;
             let top_left = lerp_color(g.hi, g.mid, 0.55);
             let bottom_right = lerp_color(g.mid, g.lo, 0.4);
@@ -131,30 +147,28 @@ fn draw_topbar(ui: &mut egui::Ui, theme: &Theme, rect: Rect, active_tab: RailTab
             ui.add_space(theme.metrics.topbar_padding_x);
             let games_color = if active_tab == RailTab::Games { theme.palette.text } else { theme.palette.text_faint };
             let media_color = if active_tab == RailTab::Media { theme.palette.text } else { theme.palette.text_faint };
-            ui.label(RichText::new("Games").color(games_color).size(21.0).strong());
-            ui.add_space(30.0);
-            ui.label(RichText::new("Media").color(media_color).size(21.0).strong());
+            ui.label(RichText::new("Games").color(games_color).size(22.0).strong());
+            ui.add_space(26.0);
+            ui.label(RichText::new("Media").color(media_color).size(22.0).strong());
 
+            // Right cluster, right-most first: clock, avatar, settings,
+            // search — reading left-to-right as search · gear · avatar ·
+            // time, the console's top-bar order. Time only, no date.
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(theme.metrics.topbar_padding_x);
 
-                // Clock (right-most).
-                let (time_s, date_s) = current_clock_strings();
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(time_s).color(theme.palette.text).size(20.0).strong());
-                    ui.label(RichText::new(date_s).color(theme.palette.text_dim).size(12.0));
-                });
-                ui.add_space(10.0);
+                ui.label(RichText::new(current_clock_string()).color(theme.palette.text).size(19.0).strong());
+                ui.add_space(20.0);
 
                 // Avatar.
-                let (rect, _resp) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
-                ui.painter().circle_filled(rect.center(), 20.0, theme.palette.accent);
-                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "X5", egui::FontId::proportional(14.0), theme.palette.text);
-                ui.add_space(14.0);
+                let (rect, _resp) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::hover());
+                ui.painter().circle_filled(rect.center(), 17.0, theme.palette.accent);
+                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "X5", egui::FontId::proportional(13.0), theme.palette.text);
+                ui.add_space(16.0);
 
-                for glyph in [Glyph::Gear, Glyph::Bell, Glyph::Friends, Glyph::Search] {
+                for glyph in [Glyph::Gear, Glyph::Search] {
                     icon_button(ui, theme, glyph);
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
                 }
             });
         });
@@ -162,177 +176,152 @@ fn draw_topbar(ui: &mut egui::Ui, theme: &Theme, rect: Rect, active_tab: RailTab
 }
 
 fn icon_button(ui: &mut egui::Ui, theme: &Theme, glyph: Glyph) {
-    let (rect, resp) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
-    let bg = if resp.hovered() { Color32::from_rgba_unmultiplied(255, 255, 255, 30) } else { Color32::TRANSPARENT };
-    ui.painter().circle_filled(rect.center(), 20.0, bg);
-    icons::draw(ui.painter(), glyph, rect.center(), 22.0, theme.palette.text_dim);
+    let (rect, resp) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::hover());
+    if resp.hovered() {
+        ui.painter().circle_filled(rect.center(), 18.0, Color32::from_rgba_unmultiplied(255, 255, 255, 30));
+    }
+    icons::draw(ui.painter(), glyph, rect.center(), 20.0, theme.palette.text);
 }
 
+/// The focused item's hero block: wordmark, meta line, and activity cards,
+/// anchored to the bottom-left with explicit painter rects. Deliberately
+/// not an egui layout — nested `bottom_up` scopes mis-place tall rows and
+/// their overflow grows the parent `Ui`'s rects, which then mis-anchors
+/// everything drawn after Home (the Control Center).
 fn draw_context_block(ui: &mut egui::Ui, theme: &Theme, rect: Rect, focused: Option<&LibraryItem>, meta_cache: &MetaCache) {
     let Some(item) = focused else { return };
     // Home reads a focused item's metadata from the cache rather than the
     // item directly, so rendering stays decoupled from how (or whether)
     // metadata was sourced (parsed `xps5x-title.toml`, or none) — spec §4.
     let meta = meta_cache.get(item.id.as_str());
-    let max_width = rect.width().min(660.0);
-    let text_rect = Rect::from_min_size(rect.min, vec2(max_width, rect.height()));
+    let painter = ui.painter();
+    let m = &theme.metrics;
+    let left = rect.left() + m.content_padding_x;
+    let mut y = rect.bottom() - m.content_padding_bottom;
 
-    ui.scope_builder(
-        UiBuilder::new().max_rect(text_rect).layout(Layout::bottom_up(Align::Min)),
-        |ui| {
-            ui.add_space(theme.metrics.content_padding_bottom);
+    // Activity cards row along the bottom edge. A game with no metadata
+    // renders no cards — just the wordmark block.
+    if let Some(meta) = meta {
+        let card_top = y - m.card_size.y;
+        let mut x = left;
+        for card in &meta.activity {
+            let card_rect = Rect::from_min_size(Pos2::new(x, card_top), m.card_size);
+            draw_activity_card(painter, theme, card_rect, card);
+            x += m.card_size.x + m.card_gap;
+        }
+        y = card_top - 30.0;
+    }
 
-            // Activity cards (bottom-most element added first under bottom_up).
-            // A game with no metadata renders no cards — just title + Play.
-            if let Some(meta) = meta {
-                ui.horizontal(|ui| {
-                    ui.add_space(theme.metrics.content_padding_x);
-                    for card in &meta.activity {
-                        draw_activity_card(ui, theme, card);
-                        ui.add_space(theme.metrics.card_gap);
-                    }
-                });
-                ui.add_space(20.0);
-            }
+    // Meta line (genre/players) or system subtitle — the PS5 home shows no
+    // persistent Play button; Confirm on the tile launches.
+    let meta_text = match meta {
+        Some(meta) => format!("{}   \u{00B7}   {}", meta.genre, meta.players),
+        None => format!("Open {}", item.title),
+    };
+    painter.text(
+        Pos2::new(left, y),
+        egui::Align2::LEFT_BOTTOM,
+        meta_text,
+        egui::FontId::proportional(15.0),
+        theme.palette.text_dim,
+    );
+    y -= 15.0 + 14.0;
 
-            // Actions row.
-            ui.horizontal(|ui| {
-                ui.add_space(theme.metrics.content_padding_x);
-                play_button(ui, theme);
-                ui.add_space(14.0);
-                if meta.is_some() {
-                    ghost_button(ui, theme, "•••  More");
-                }
-            });
-            ui.add_space(20.0);
-
-            // Meta row (rating/genre/players) or system subtitle.
-            ui.horizontal(|ui| {
-                ui.add_space(theme.metrics.content_padding_x);
-                match meta {
-                    Some(meta) => {
-                        ui.label(RichText::new(stars(meta.rating)).color(theme.palette.accent_hi).size(14.0));
-                        dot(ui, theme);
-                        ui.label(RichText::new(&meta.genre).color(theme.palette.text_dim).size(14.0));
-                        dot(ui, theme);
-                        ui.label(RichText::new(&meta.players).color(theme.palette.text_dim).size(14.0));
-                    }
-                    None => {
-                        ui.label(RichText::new(format!("Open {}", item.title)).color(theme.palette.text_dim).size(14.0));
-                    }
-                }
-            });
-            ui.add_space(12.0);
-
-            // Wordmark.
-            ui.horizontal(|ui| {
-                ui.add_space(theme.metrics.content_padding_x);
-                ui.label(RichText::new(&item.title).color(theme.palette.text).size(58.0).strong());
-            });
-            ui.add_space(10.0);
-
-            // Kicker (top-most element, added last under bottom_up).
-            ui.horizontal(|ui| {
-                ui.add_space(theme.metrics.content_padding_x);
-                let kicker = meta.map(|m| m.kicker.as_str()).unwrap_or("System");
-                ui.label(
-                    RichText::new(kicker.to_uppercase())
-                        .color(theme.palette.accent_hi)
-                        .size(12.0)
-                        .strong(),
-                );
-            });
-        },
+    // Wordmark.
+    painter.text(
+        Pos2::new(left, y),
+        egui::Align2::LEFT_BOTTOM,
+        &item.title,
+        egui::FontId::proportional(64.0),
+        theme.palette.text,
     );
 }
 
-fn dot(ui: &mut egui::Ui, theme: &Theme) {
-    let (rect, _) = ui.allocate_exact_size(vec2(10.0, 14.0), Sense::hover());
-    ui.painter().circle_filled(rect.center(), 1.5, theme.palette.text_faint);
-}
+fn draw_activity_card(painter: &egui::Painter, theme: &Theme, rect: Rect, card: &crate::library::ActivityCard) {
+    let size = rect.size();
+    painter.rect_filled(rect, theme.metrics.corner_radius, Color32::from_rgba_unmultiplied(14, 20, 28, 200));
+    painter.rect_stroke(rect, theme.metrics.corner_radius, Stroke::new(1.0, theme.palette.line), StrokeKind::Inside);
 
-fn stars(rating: u8) -> String {
-    let filled = rating.min(5) as usize;
-    format!("{}{}", "\u{2605}".repeat(filled), "\u{2606}".repeat(5 - filled))
-}
-
-fn play_button(ui: &mut egui::Ui, theme: &Theme) {
-    let (rect, _resp) = ui.allocate_exact_size(vec2(120.0, 48.0), Sense::hover());
-    ui.painter().rect_filled(rect, theme.metrics.button_radius, theme.palette.focus);
-    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "\u{25B6}  Play", egui::FontId::proportional(16.0), theme.palette.ground);
-}
-
-fn ghost_button(ui: &mut egui::Ui, theme: &Theme, label: &str) {
-    let galley = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(16.0), theme.palette.text);
-    let w = galley.size().x + 40.0;
-    let (rect, _resp) = ui.allocate_exact_size(vec2(w, 48.0), Sense::hover());
-    ui.painter().rect_filled(rect, theme.metrics.button_radius, Color32::from_rgba_unmultiplied(255, 255, 255, 20));
-    ui.painter().rect_stroke(rect, theme.metrics.button_radius, Stroke::new(1.0, theme.palette.line), StrokeKind::Inside);
-    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(16.0), theme.palette.text);
-}
-
-fn draw_activity_card(ui: &mut egui::Ui, theme: &Theme, card: &crate::library::ActivityCard) {
-    let size = theme.metrics.card_size;
-    let (rect, _resp) = ui.allocate_exact_size(size, Sense::hover());
-    ui.painter().rect_filled(rect, theme.metrics.corner_radius, Color32::from_rgba_unmultiplied(20, 29, 41, 184));
-    ui.painter().rect_stroke(rect, theme.metrics.corner_radius, Stroke::new(1.0, theme.palette.line), StrokeKind::Inside);
-
-    let pad = 14.0;
-    ui.painter().text(
+    let pad = 16.0;
+    painter.text(
         rect.min + vec2(pad, pad),
         egui::Align2::LEFT_TOP,
         card.top.to_uppercase(),
         egui::FontId::proportional(11.0),
         theme.palette.text_faint,
     );
-    ui.painter().text(
-        rect.min + vec2(pad, pad + 22.0),
+    painter.text(
+        rect.min + vec2(pad, pad + 24.0),
         egui::Align2::LEFT_TOP,
         &card.main,
-        egui::FontId::proportional(16.0),
+        egui::FontId::proportional(17.0),
         theme.palette.text,
     );
     if !card.sub.is_empty() {
-        ui.painter().text(
-            rect.min + vec2(pad, pad + 42.0),
+        painter.text(
+            rect.min + vec2(pad, pad + 48.0),
             egui::Align2::LEFT_TOP,
             &card.sub,
-            egui::FontId::proportional(12.0),
+            egui::FontId::proportional(13.0),
             theme.palette.text_dim,
         );
     }
     if let Some(progress) = card.progress {
         let bar_rect = Rect::from_min_size(rect.min + vec2(pad, size.y - pad - 5.0), vec2(size.x - pad * 2.0, 5.0));
-        ui.painter().rect_filled(bar_rect, 2.5, Color32::from_rgba_unmultiplied(255, 255, 255, 30));
+        painter.rect_filled(bar_rect, 2.5, Color32::from_rgba_unmultiplied(255, 255, 255, 30));
         let filled_w = bar_rect.width() * (progress as f32 / 100.0).clamp(0.0, 1.0);
         let filled_rect = Rect::from_min_size(bar_rect.min, vec2(filled_w, bar_rect.height()));
-        ui.painter().rect_filled(filled_rect, 2.5, theme.palette.accent_hi);
+        painter.rect_filled(filled_rect, 2.5, theme.palette.accent_hi);
     }
 }
 
 fn draw_rail(ui: &mut egui::Ui, theme: &Theme, rect: Rect, items: &[LibraryItem], nav: &NavState, anim: &HomeAnim) {
-    let painter = ui.painter_at(rect);
+    // Slightly expanded clip so the focused tile's glow isn't cut off.
+    let painter = ui.painter_at(rect.expand(10.0));
     let m = &theme.metrics;
     let step = m.tile_size + m.tile_gap;
-    let base_y = rect.top() + 40.0;
+    let anchor_x = rect.left() + m.rail_padding_left;
+    let focused_size = m.tile_size * m.tile_focus_scale;
+    // All tiles share the focused tile's vertical center.
+    let center_y = rect.top() + focused_size / 2.0;
+    // Extra room the growing focused tile opens up in front of its
+    // followers, so they never sit underneath it.
+    let extra = (focused_size - m.tile_size) * anim.focus_pop;
+    let pulse = 0.5 + 0.5 * (ui.input(|i| i.time) as f32 * 2.4).sin();
 
-    for (i, item) in items.iter().enumerate() {
+    // Focused tile drawn last so its ring/glow sits above its neighbors.
+    let mut order: Vec<usize> = (0..items.len()).filter(|&i| i != nav.rail_index).collect();
+    if nav.rail_index < items.len() {
+        order.push(nav.rail_index);
+    }
+
+    for i in order {
+        let item = &items[i];
         let focused = i == nav.rail_index;
-        let base_x = rect.left() + m.rail_padding_left + i as f32 * step + anim.rail_offset;
 
-        if base_x + m.tile_size < rect.left() - 40.0 || base_x > rect.right() + 40.0 {
+        let size = if focused { m.tile_size + (focused_size - m.tile_size) * anim.focus_pop } else { m.tile_size };
+        let mut x = anchor_x + i as f32 * step + anim.rail_offset;
+        if i > nav.rail_index {
+            x += extra;
+        }
+
+        if x + size < rect.left() - 60.0 || x > rect.right() + 60.0 {
             continue; // off-screen, skip
         }
 
-        let scale = if focused { 1.0 + (m.tile_focus_scale - 1.0) * anim.focus_pop } else { 1.0 };
-        let lift = if focused { m.tile_focus_lift * anim.focus_pop } else { 0.0 };
-        let size = m.tile_size * scale;
-        let center_x = base_x + m.tile_size / 2.0;
-        let bottom_y = base_y + m.tile_size - lift;
-        let tile_rect = Rect::from_min_size(Pos2::new(center_x - size / 2.0, bottom_y - size), vec2(size, size));
+        // Passed tiles fade out as they slide behind the left anchor
+        // instead of poking out of the margin.
+        let alpha = ((x - (anchor_x - step)) / step).clamp(0.0, 1.0);
+        if alpha <= 0.0 {
+            continue;
+        }
 
-        let tile_gradient = item.art.tile();
-        tile_gradient_rect(&painter, tile_rect, m.corner_radius, &tile_gradient);
+        let tile_rect = Rect::from_min_size(Pos2::new(x, center_y - size / 2.0), vec2(size, size));
+        let radius = m.corner_radius * size / m.tile_size;
+
+        let g = item.art.tile();
+        let faded = TileGradient { from: with_alpha(g.from, alpha), to: with_alpha(g.to, alpha) };
+        tile_gradient_rect(&painter, tile_rect, radius, &faded);
 
         match &item.art {
             ArtSource::App { glyph, .. } => {
@@ -344,33 +333,38 @@ fn draw_rail(ui: &mut egui::Ui, theme: &Theme, rect: Rect, items: &[LibraryItem]
                     GlyphKind::Video => Glyph::Video,
                     GlyphKind::Network => Glyph::Network,
                 };
-                icons::draw(&painter, g, tile_rect.center(), size * 0.32, Color32::from_rgba_unmultiplied(255, 255, 255, 235));
+                icons::draw(&painter, g, tile_rect.center(), size * 0.34, with_alpha(Color32::WHITE, 0.92 * alpha));
             }
             ArtSource::Game { .. } => {
                 if item.kind == ItemKind::Game {
-                    let initial = item.title.split_whitespace().next().unwrap_or(&item.title);
+                    // Original stand-in key art: a large centered monogram
+                    // over the gradient (spec §11 — never real box art).
+                    let monogram = item.title.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
                     painter.text(
-                        tile_rect.min + vec2(14.0, size - 22.0),
-                        egui::Align2::LEFT_TOP,
-                        initial,
-                        egui::FontId::proportional(15.0),
-                        Color32::WHITE,
+                        tile_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        monogram,
+                        egui::FontId::proportional(size * 0.42),
+                        with_alpha(Color32::WHITE, 0.45 * alpha),
                     );
                 }
             }
         }
 
         if focused {
-            painter.rect_stroke(tile_rect, m.corner_radius, Stroke::new(3.0, theme.palette.focus), StrokeKind::Inside);
-            painter.text(
-                Pos2::new(tile_rect.center().x, tile_rect.top() - 18.0),
-                egui::Align2::CENTER_CENTER,
-                &item.title,
-                egui::FontId::proportional(14.0),
-                theme.palette.text,
-            );
-        } else {
-            painter.rect_stroke(tile_rect, m.corner_radius, Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 90)), StrokeKind::Inside);
+            // Soft outer glow, then the crisp pulsing ring on the tile edge.
+            for k in 1..=3 {
+                let spread = k as f32 * 2.0;
+                let a = 26.0 * (1.0 - k as f32 / 4.0) * (0.6 + 0.4 * pulse) / 255.0;
+                painter.rect_stroke(
+                    tile_rect.expand(spread),
+                    radius + spread,
+                    Stroke::new(3.0, with_alpha(theme.palette.focus, a)),
+                    StrokeKind::Outside,
+                );
+            }
+            let ring_a = (0.84 + 0.16 * pulse) * alpha;
+            painter.rect_stroke(tile_rect, radius, Stroke::new(2.5, with_alpha(theme.palette.focus, ring_a)), StrokeKind::Outside);
         }
     }
 }
@@ -378,24 +372,23 @@ fn draw_rail(ui: &mut egui::Ui, theme: &Theme, rect: Rect, items: &[LibraryItem]
 fn draw_hints(painter: &egui::Painter, theme: &Theme, screen: Rect) {
     let hints = "\u{25C0} \u{25B6} Navigate    Enter Play    Tab Media/Games    C Control Center";
     painter.text(
-        Pos2::new(screen.right() - theme.metrics.content_padding_x, screen.bottom() - 18.0),
+        Pos2::new(screen.right() - theme.metrics.content_padding_x, screen.bottom() - 14.0),
         egui::Align2::RIGHT_BOTTOM,
         hints,
-        egui::FontId::proportional(13.0),
-        theme.palette.text_dim,
+        egui::FontId::proportional(12.0),
+        theme.palette.text_faint,
     );
 }
 
-/// UTC-based clock/date strings. No timezone/calendar crate is in the
-/// workspace, so this uses a small epoch→civil-date conversion rather than
-/// pulling in a new dependency for a cosmetic clock (spec §11 keeps deps to
-/// the existing workspace set).
-fn current_clock_strings() -> (String, String) {
+/// UTC-based clock string (time only, like the console's top bar). No
+/// timezone crate is in the workspace, so this stays a plain epoch
+/// breakdown rather than pulling in a new dependency for a cosmetic clock
+/// (spec §11 keeps deps to the existing workspace set).
+fn current_clock_string() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = now.as_secs();
-    let days = (secs / 86400) as i64;
     let sec_of_day = secs % 86400;
     let hour24 = sec_of_day / 3600;
     let minute = (sec_of_day % 3600) / 60;
@@ -405,53 +398,5 @@ fn current_clock_strings() -> (String, String) {
         12 => (12, "PM"),
         _ => (hour24 - 12, "PM"),
     };
-    let time_s = format!("{h12}:{minute:02} {ampm}");
-
-    let (_year, _month, _day) = civil_from_days(days);
-    let weekday = WEEKDAYS[(days.rem_euclid(7)) as usize];
-    let month_name = MONTHS[(_month - 1) as usize];
-    let date_s = format!("{weekday}, {month_name} {_day}");
-    (time_s, date_s)
-}
-
-const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-
-/// Howard Hinnant's `civil_from_days`: days-since-epoch (1970-01-01) to a
-/// proleptic Gregorian (year, month, day).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn civil_from_days_epoch_is_1970_01_01() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-    }
-
-    #[test]
-    fn civil_from_days_known_date() {
-        // 2000-03-01 is day 11017 since the epoch.
-        assert_eq!(civil_from_days(11017), (2000, 3, 1));
-    }
-
-    #[test]
-    fn stars_renders_expected_glyph_counts() {
-        assert_eq!(stars(0).chars().filter(|c| *c == '\u{2605}').count(), 0);
-        assert_eq!(stars(5).chars().filter(|c| *c == '\u{2605}').count(), 5);
-        assert_eq!(stars(3).chars().filter(|c| *c == '\u{2606}').count(), 2);
-    }
+    format!("{h12}:{minute:02} {ampm}")
 }

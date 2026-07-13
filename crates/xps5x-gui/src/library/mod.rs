@@ -220,9 +220,14 @@ pub struct ActivityCard {
 pub struct GameMeta {
     pub genre: String,
     pub players: String,
-    /// Star rating, 0..=5.
+    /// Star rating, 0..=5. Parsed from `xps5x-title.toml` but not rendered
+    /// by the PS5-style Home (the console shows no ratings) — kept for a
+    /// future detail/library view.
+    #[allow(dead_code)]
     pub rating: u8,
-    /// Kicker line ("Ready to play", "Continue — Chapter 4"…).
+    /// Kicker line ("Ready to play", "Continue — Chapter 4"…). Same
+    /// parsed-but-not-rendered status as `rating`.
+    #[allow(dead_code)]
     pub kicker: String,
     pub activity: Vec<ActivityCard>,
 }
