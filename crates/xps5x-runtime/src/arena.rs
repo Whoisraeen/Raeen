@@ -190,10 +190,23 @@ impl GuestArena {
         if raw.is_null() {
             return Err(RuntimeError::MapFailed);
         }
-        debug_assert_eq!(
-            raw as u64, base,
-            "VirtualAlloc with an explicit lpAddress must return that exact address on success"
-        );
+        // `VirtualAlloc` with an explicit non-null `lpAddress` reserves exactly
+        // that (allocation-granularity-aligned) range or returns null — it
+        // never relocates — so `raw == base` always holds here. Guard it as a
+        // hard error rather than only a `debug_assert` anyway: if that
+        // invariant were ever violated, the rest of this function (and every
+        // identity read/write) uses the `base` *constant*, so a mismatched
+        // `raw` would leak the real reservation (Drop frees `base`) and commit
+        // into unreserved space. Free `raw` and fail cleanly instead.
+        if raw as u64 != base {
+            // SAFETY: `raw` is the exact non-null pointer `VirtualAlloc` just
+            // returned; releasing it once with `dwSize = 0` (`MEM_RELEASE`) is
+            // well-formed and undoes this reservation.
+            unsafe {
+                VirtualFree(raw, 0, MEM_RELEASE);
+            }
+            return Err(RuntimeError::MapFailed);
+        }
 
         commit_region(base, base + IMAGE_OFFSET, IMAGE_SIZE, PAGE_EXECUTE_READWRITE)?;
         commit_region(base, base + HEAP_OFFSET, HEAP_SIZE, PAGE_READWRITE)?;

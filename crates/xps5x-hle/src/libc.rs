@@ -121,72 +121,126 @@ fn hle_realloc(ctx: &HleContext, args: &[u64]) -> u64 {
     ctx.alloc.realloc(ptr, size).unwrap_or(0)
 }
 
-/// Real `memcpy` returns `dst` unchanged. Now actually copies: reads `n`
-/// bytes from `ctx.mem` at `src` and writes them at `dst`, bounds-checked —
-/// if either side is out of bounds, logs and returns `dst` without moving
-/// any bytes (never a panic or OOB host access).
+/// Bounded host staging-buffer size for the block memory ops (`memcpy`,
+/// `memmove`, `memset`). They act on a guest-controlled length `n`; staging
+/// the transfer in fixed-size chunks — rather than one `vec![0u8; n]` — keeps
+/// host memory use `O(MEM_OP_CHUNK)` regardless of `n`. Otherwise, since
+/// `usize == u64` on this target, `usize::try_from(n)` always succeeds and a
+/// guest passing e.g. `n = 0x0000_FFFF_FFFF_FFFF` would make the host attempt
+/// a ~256 TiB allocation, aborting the process via `handle_alloc_error`
+/// before any bounds check runs. Bytes still only move where `ctx.mem`
+/// permits; an out-of-bounds chunk stops the transfer (a partial move may
+/// have occurred, as with a bad pointer in C — but never a panic, abort, or
+/// OOB host access).
+const MEM_OP_CHUNK: usize = 16 * 1024;
+
+/// Copy `n` guest bytes `src`→`dst` low-address-first, in [`MEM_OP_CHUNK`]
+/// chunks through `ctx.mem`. Correct for non-overlapping ranges and for
+/// overlaps where `dst <= src`. Returns `false` on the first out-of-bounds or
+/// address-overflowing chunk.
+fn mem_copy_forward(ctx: &HleContext, dst: u64, src: u64, n: u64) -> bool {
+    let mut buf = [0u8; MEM_OP_CHUNK];
+    let mut done: u64 = 0;
+    while done < n {
+        let chunk = (n - done).min(MEM_OP_CHUNK as u64) as usize;
+        let (Some(s), Some(d)) = (src.checked_add(done), dst.checked_add(done)) else {
+            return false;
+        };
+        if !ctx.mem.read(s, &mut buf[..chunk]) || !ctx.mem.write(d, &buf[..chunk]) {
+            return false;
+        }
+        done += chunk as u64;
+    }
+    true
+}
+
+/// Copy `n` guest bytes `src`→`dst` high-address-first, in [`MEM_OP_CHUNK`]
+/// chunks through `ctx.mem` — the overlap-safe direction when `dst > src`.
+/// Returns `false` on the first out-of-bounds or address-overflowing chunk.
+fn mem_copy_backward(ctx: &HleContext, dst: u64, src: u64, n: u64) -> bool {
+    let mut buf = [0u8; MEM_OP_CHUNK];
+    let mut remaining = n;
+    while remaining > 0 {
+        let chunk = remaining.min(MEM_OP_CHUNK as u64);
+        let off = remaining - chunk;
+        let (Some(s), Some(d)) = (src.checked_add(off), dst.checked_add(off)) else {
+            return false;
+        };
+        let chunk = chunk as usize;
+        if !ctx.mem.read(s, &mut buf[..chunk]) || !ctx.mem.write(d, &buf[..chunk]) {
+            return false;
+        }
+        remaining = off;
+    }
+    true
+}
+
+/// Fill `n` guest bytes at `dst` with `value`, in [`MEM_OP_CHUNK`] chunks
+/// through `ctx.mem`. Returns `false` on the first out-of-bounds or
+/// address-overflowing chunk.
+fn mem_fill(ctx: &HleContext, dst: u64, value: u8, n: u64) -> bool {
+    let buf = [value; MEM_OP_CHUNK];
+    let mut done: u64 = 0;
+    while done < n {
+        let chunk = (n - done).min(MEM_OP_CHUNK as u64) as usize;
+        let Some(d) = dst.checked_add(done) else {
+            return false;
+        };
+        if !ctx.mem.write(d, &buf[..chunk]) {
+            return false;
+        }
+        done += chunk as u64;
+    }
+    true
+}
+
+/// Real `memcpy` returns `dst` unchanged. Copies `n` bytes `src`→`dst`
+/// through `ctx.mem` in bounded chunks (see [`MEM_OP_CHUNK`]) — a huge
+/// guest-controlled `n` never triggers a giant host allocation. Out of bounds
+/// on either side stops the copy and returns `dst` (never a panic or OOB host
+/// access).
 fn hle_memcpy(ctx: &HleContext, args: &[u64]) -> u64 {
     let dst = args.first().copied().unwrap_or(0);
     let src = args.get(1).copied().unwrap_or(0);
     let n = args.get(2).copied().unwrap_or(0);
     debug!("memcpy(dst={dst:#x}, src={src:#x}, n={n:#x})");
-
-    let Ok(len) = usize::try_from(n) else {
-        warn!("memcpy: n={n:#x} does not fit a host usize");
-        return dst;
-    };
-    let mut buf = vec![0u8; len];
-    if !ctx.mem.read(src, &mut buf) {
-        warn!("memcpy: src {src:#x} (len {n:#x}) out of bounds");
-        return dst;
-    }
-    if !ctx.mem.write(dst, &buf) {
-        warn!("memcpy: dst {dst:#x} (len {n:#x}) out of bounds");
+    if !mem_copy_forward(ctx, dst, src, n) {
+        warn!("memcpy: out of bounds (dst={dst:#x}, src={src:#x}, n={n:#x})");
     }
     dst
 }
 
-/// Real `memset` returns `dst` unchanged. Now actually fills `n` bytes at
-/// `dst` with `c`, bounds-checked through `ctx.mem`.
+/// Real `memset` returns `dst` unchanged. Fills `n` bytes at `dst` with `c`
+/// through `ctx.mem` in bounded chunks (see [`MEM_OP_CHUNK`]).
 fn hle_memset(ctx: &HleContext, args: &[u64]) -> u64 {
     let dst = args.first().copied().unwrap_or(0);
     let value = args.get(1).copied().unwrap_or(0) as u8;
     let n = args.get(2).copied().unwrap_or(0);
     debug!("memset(s={dst:#x}, c={value}, n={n:#x})");
-
-    let Ok(len) = usize::try_from(n) else {
-        warn!("memset: n={n:#x} does not fit a host usize");
-        return dst;
-    };
-    let buf = vec![value; len];
-    if !ctx.mem.write(dst, &buf) {
+    if !mem_fill(ctx, dst, value, n) {
         warn!("memset: dst {dst:#x} (len {n:#x}) out of bounds");
     }
     dst
 }
 
-/// Real `memmove` returns `dst` unchanged. Now actually moves `n` bytes from
-/// `src` to `dst`, bounds-checked through `ctx.mem`. Implemented exactly like
-/// [`hle_memcpy`] — reading the source into a host-side buffer before
-/// writing it out is inherently overlap-safe (unlike a naive byte-by-byte
-/// forward copy), so this is a real `memmove`, not just a `memcpy` alias.
+/// Real `memmove` returns `dst` unchanged. Moves `n` bytes `src`→`dst`
+/// through `ctx.mem` in bounded chunks, choosing copy direction from the
+/// `dst`/`src` order so overlapping ranges are handled correctly (forward when
+/// `dst <= src`, backward when `dst > src`) — a real `memmove`, not a `memcpy`
+/// alias, and with the same huge-`n` safety (see [`MEM_OP_CHUNK`]) as the
+/// others.
 fn hle_memmove(ctx: &HleContext, args: &[u64]) -> u64 {
     let dst = args.first().copied().unwrap_or(0);
     let src = args.get(1).copied().unwrap_or(0);
     let n = args.get(2).copied().unwrap_or(0);
     debug!("memmove(dst={dst:#x}, src={src:#x}, n={n:#x})");
-
-    let Ok(len) = usize::try_from(n) else {
-        warn!("memmove: n={n:#x} does not fit a host usize");
-        return dst;
+    let ok = if dst <= src {
+        mem_copy_forward(ctx, dst, src, n)
+    } else {
+        mem_copy_backward(ctx, dst, src, n)
     };
-    let mut buf = vec![0u8; len];
-    if !ctx.mem.read(src, &mut buf) {
-        warn!("memmove: src {src:#x} (len {n:#x}) out of bounds");
-        return dst;
-    }
-    if !ctx.mem.write(dst, &buf) {
-        warn!("memmove: dst {dst:#x} (len {n:#x}) out of bounds");
+    if !ok {
+        warn!("memmove: out of bounds (dst={dst:#x}, src={src:#x}, n={n:#x})");
     }
     dst
 }
@@ -419,6 +473,67 @@ mod tests {
         let mut filled = [0u8; 6];
         assert!(mem.read(dst, &mut filled));
         assert_eq!(filled, [0xAB; 6]);
+    }
+
+    /// Regression: a huge guest-controlled length must not make the host try
+    /// a gigantic allocation (which would abort the process via
+    /// `handle_alloc_error`). The block ops stage in bounded chunks, so this
+    /// returns `dst` harmlessly instead of dying. If this test process
+    /// survives the call, the fix holds.
+    #[test]
+    fn block_ops_with_huge_guest_length_do_not_abort() {
+        let registry = HleRegistry::new();
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // ~256 TiB — would abort if any op did `vec![0u8; n]` up front.
+        let huge = 0x0000_FFFF_FFFF_FFFF;
+        assert_eq!(registry.call(&ctx, "libc", "memcpy", &[0x0, 0x8, huge]).unwrap(), 0x0);
+        assert_eq!(registry.call(&ctx, "libc", "memset", &[0x0, 0xAB, huge]).unwrap(), 0x0);
+        assert_eq!(registry.call(&ctx, "libc", "memmove", &[0x0, 0x8, huge]).unwrap(), 0x0);
+    }
+
+    /// `memmove` with `dst > src` and overlapping ranges must copy
+    /// high-address-first, or it would clobber source bytes it hasn't read.
+    #[test]
+    fn memmove_overlapping_upward_is_correct() {
+        let registry = HleRegistry::new();
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x10, &[1, 2, 3, 4, 5]));
+        // Move [0x10..0x14] up by one into [0x11..0x15].
+        let result = registry.call(&ctx, "libc", "memmove", &[0x11, 0x10, 4]).unwrap();
+        assert_eq!(result, 0x11);
+
+        let mut out = [0u8; 5];
+        assert!(mem.read(0x10, &mut out));
+        assert_eq!(out, [1, 1, 2, 3, 4], "upward overlapping memmove must not smear the first byte");
+    }
+
+    /// `memmove` with `dst < src` and overlapping ranges must copy
+    /// low-address-first (a `memcpy`-style forward copy is already correct
+    /// here); verifies the direction choice doesn't corrupt this case.
+    #[test]
+    fn memmove_overlapping_downward_is_correct() {
+        let registry = HleRegistry::new();
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x10, &[1, 2, 3, 4, 5]));
+        // Move [0x11..0x15] down by one into [0x10..0x14].
+        let result = registry.call(&ctx, "libc", "memmove", &[0x10, 0x11, 4]).unwrap();
+        assert_eq!(result, 0x10);
+
+        let mut out = [0u8; 5];
+        assert!(mem.read(0x10, &mut out));
+        assert_eq!(out, [2, 3, 4, 5, 5], "downward overlapping memmove must shift bytes down cleanly");
     }
 
     #[test]
