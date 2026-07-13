@@ -11,6 +11,7 @@ members = [
     "crates/xps5x-hle",
     "crates/xps5x-gui",
     "crates/xps5x-firmware",
+    "crates/xps5x-runtime",
 ]
 
 [workspace.package]
@@ -71,6 +72,14 @@ cbc = "0.2"
 sha1 = "0.10"
 base64 = "0.22"
 
+# Runtime (Windows OS APIs — VirtualAlloc/VEH); scoped to xps5x-runtime only
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+] }
+
 # Internal crates
 xps5x-core = { path = "crates/xps5x-core" }
 xps5x-loader = { path = "crates/xps5x-loader" }
@@ -82,6 +91,7 @@ xps5x-input = { path = "crates/xps5x-input" }
 xps5x-hle = { path = "crates/xps5x-hle" }
 xps5x-gui = { path = "crates/xps5x-gui" }
 xps5x-firmware = { path = "crates/xps5x-firmware" }
+xps5x-runtime = { path = "crates/xps5x-runtime" }
 
 [profile.release]
 lto = "thin"
