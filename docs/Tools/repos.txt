@@ -1,0 +1,4 @@
+https://github.com/phantomptr/ps5upload
+https://github.com/cy33hc/ps5-payload-loader
+https://github.com/SvenGDK/PS5PKGReader
+https://github.com/InoriRus/Kyty

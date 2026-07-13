@@ -18,4 +18,7 @@ zstd.workspace = true
 flate2.workspace = true
 lzma-rs.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
