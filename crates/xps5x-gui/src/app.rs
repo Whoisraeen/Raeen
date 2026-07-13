@@ -11,18 +11,24 @@ use crate::theme::loader::load_theme;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Root directory installed Shell themes live under: `themes/<name>/
+/// theme.toml` (spec §6, §10 SM2b). Relative, like the default `Games`
+/// scan root, so it resolves from wherever the Shell is launched.
+const THEMES_ROOT: &str = "themes";
+
 /// Top-level XPS5X application state.
 pub struct XPS5XApp {
     shell: Shell,
 }
 
 impl XPS5XApp {
-    pub fn new(config: xps5x_core::config::EmulatorConfig, config_path: PathBuf) -> Self {
-        // SM0 ships only the default theme; `load_theme` is the seam SM2b
-        // uses to install user themes from `themes/<name>`. Settings'
-        // `selected_theme` config field is stored/edited already (SM2a) but
-        // not yet threaded into `load_theme` — that wiring is SM2b's job.
-        let theme = load_theme(Path::new("themes/default"));
+    pub fn new(ctx: &egui::Context, config: xps5x_core::config::EmulatorConfig, config_path: PathBuf) -> Self {
+        let themes_root = PathBuf::from(THEMES_ROOT);
+        // Load whichever theme Settings last selected (SM2a persisted the
+        // field; SM2b is what actually resolves it to a `themes/<name>`
+        // directory on disk), falling back field-by-field to the in-code
+        // default for anything missing, invalid, or not yet installed.
+        let theme = load_theme(&themes_root, &config.general.selected_theme);
 
         // Scan the default game folder; fall back to the mockup's sample
         // library (with its original gradient art) when nothing is found —
@@ -39,7 +45,7 @@ impl XPS5XApp {
 
         let launcher = Box::new(StubLauncher::new(Duration::from_millis(900)));
 
-        Self { shell: Shell::new(theme, library, launcher, config, config_path) }
+        Self { shell: Shell::new(ctx, theme, themes_root, library, launcher, config, config_path) }
     }
 }
 

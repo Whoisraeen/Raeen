@@ -66,7 +66,7 @@ fn main() -> anyhow::Result<()> {
         Box::new(|cc| {
             // Set dark theme.
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            Ok(Box::new(app::XPS5XApp::new(config, config_path.to_path_buf())))
+            Ok(Box::new(app::XPS5XApp::new(&cc.egui_ctx, config, config_path.to_path_buf())))
         }),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {}", e))?;

@@ -52,6 +52,7 @@ raw-window-handle = "0.6"
 # GUI
 egui = "0.31"
 eframe = { version = "0.31", features = ["wgpu"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # Audio
 cpal = "0.15"

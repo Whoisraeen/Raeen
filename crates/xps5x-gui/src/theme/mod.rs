@@ -6,12 +6,17 @@
 //! hard-coded in widget code (spec §6).
 //!
 //! SM0 ships a single in-code [`default_theme`] built entirely from
-//! original XPS5X colors. On-disk theme loading (user themes extracted from
-//! hardware they own) arrives in SM1 via [`loader`].
+//! original XPS5X colors. SM2b adds real on-disk loading via [`loader`]:
+//! a theme directory (`themes/<name>/theme.toml` plus optional font/
+//! background files a *user* supplies) resolves to a [`Theme`], falling
+//! back field-by-field to [`default_theme`] for anything missing or
+//! invalid. The repository itself only ever ships `themes/default/
+//! theme.toml` — no binary assets (spec §11).
 
 pub mod loader;
 
 use egui::Color32;
+use std::sync::Arc;
 
 /// Parse a `0xRRGGBB` literal into a [`Color32`] at full opacity.
 const fn rgb(hex: u32) -> Color32 {
@@ -23,7 +28,7 @@ const fn rgb(hex: u32) -> Color32 {
 }
 
 /// Palette tokens — mirrors the mockup's `:root` custom properties.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Palette {
     /// Base background ("ground").
     pub ground: Color32,
@@ -50,7 +55,7 @@ pub struct Palette {
 }
 
 /// Layout metrics — mirrors the mockup's px values.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Metrics {
     /// Top function-bar horizontal padding.
     pub topbar_padding_x: f32,
@@ -84,14 +89,55 @@ pub struct Metrics {
     pub cc_item_gap: f32,
 }
 
-/// A fully-resolved theme: palette + metrics.
+/// Optional user-supplied presentation assets loaded from a theme directory
+/// (spec §6). Every field is `None` for the in-code default and for any
+/// on-disk theme that doesn't provide that particular asset — callers must
+/// treat `None` as "use the built-in fallback", never as an error.
+///
+/// Wrapped in [`Arc`] (rather than owned `Vec`/`ColorImage`) because `Theme`
+/// is cloned once per frame (`shell/mod.rs::draw`); an `Arc` clone is a
+/// refcount bump, not a multi-megabyte copy.
+#[derive(Debug, Clone, Default)]
+pub struct ThemeAssets {
+    /// Custom UI font bytes, ready for [`egui::FontData::from_owned`].
+    /// Installed into the egui context once per theme (re)load via
+    /// [`install_fonts`] — widgets never read this directly.
+    pub font: Option<Arc<[u8]>>,
+    /// Decoded hero/background image. `shell/mod.rs` turns this into an
+    /// `egui::TextureHandle` once per theme (re)load; `home.rs` draws the
+    /// handle, never the raw pixels.
+    pub background: Option<Arc<egui::ColorImage>>,
+}
+
+/// A fully-resolved theme: palette + metrics + optional user assets.
 #[derive(Debug, Clone)]
 pub struct Theme {
-    /// Reserved for the Settings theme picker (SM2); not yet read by SM0.
+    /// Display name (from the theme's manifest, or the in-code default's).
+    /// Not currently rendered anywhere in the Shell UI — Settings' theme
+    /// selector shows the directory/id instead — but kept for a future
+    /// theme-picker preview.
     #[allow(dead_code)]
     pub name: String,
     pub palette: Palette,
     pub metrics: Metrics,
+    pub assets: ThemeAssets,
+}
+
+/// Install `theme`'s custom UI font (if any) into `ctx` as the primary
+/// proportional/monospace family, falling back to egui's built-in fonts for
+/// any glyph the custom font doesn't cover — and, when the theme carries no
+/// font at all, resetting `ctx` back to those built-ins entirely. Call once
+/// per theme (re)load, never per-frame.
+pub fn install_fonts(ctx: &egui::Context, theme: &Theme) {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(font_bytes) = &theme.assets.font {
+        let name = "xps5x-theme-font".to_string();
+        let data = egui::FontData::from_owned(font_bytes.to_vec());
+        fonts.font_data.insert(name.clone(), Arc::new(data));
+        fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, name.clone());
+        fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, name);
+    }
+    ctx.set_fonts(fonts);
 }
 
 /// The default, original-asset XPS5X theme (spec §6, §11 — zero Sony assets).
@@ -128,6 +174,7 @@ pub fn default_theme() -> Theme {
             cc_item_size: 60.0,
             cc_item_gap: 12.0,
         },
+        assets: ThemeAssets { font: None, background: None },
     }
 }
 
@@ -145,6 +192,8 @@ mod tests {
         assert_eq!(theme.metrics.tile_size, 150.0);
         assert_eq!(theme.metrics.rail_padding_left, 54.0);
         assert!(theme.metrics.tile_focus_scale > 1.0);
+        assert!(theme.assets.font.is_none());
+        assert!(theme.assets.background.is_none());
     }
 
     #[test]

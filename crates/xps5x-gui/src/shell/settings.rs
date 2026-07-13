@@ -12,13 +12,15 @@
 //!
 //! Key Provider is a path field only — the Shell stores and displays the
 //! string but never reads, parses, or otherwise touches key material (spec
-//! §11). Theme is a single-item selector for now; on-disk theme
-//! installation (and populating this list from `themes/*` directories) is
-//! SM2b, not this milestone (see `available_themes` below).
+//! §11). Theme is populated from installed `themes/<name>/theme.toml`
+//! directories on disk (spec §6, §10 SM2b) via [`available_themes`];
+//! selecting one updates `general.selected_theme` and `shell/mod.rs`
+//! reloads the active [`Theme`] from disk.
 
 use super::nav::NavState;
 use crate::theme::Theme;
 use egui::{Align, Layout, RichText, UiBuilder};
+use std::path::Path;
 use xps5x_core::config::EmulatorConfig;
 
 /// Section names, in the order `nav::NavState::settings_section` indexes.
@@ -39,12 +41,13 @@ pub fn adjust_stepped(value: f32, delta: i32, step: f32, min: f32, max: f32) -> 
     (value + delta as f32 * step).clamp(min, max)
 }
 
-/// Theme names the Settings screen's Theme selector can choose between.
-/// SM2a ships only the in-code default theme, so this is a single-item
-/// list. TODO(SM2b): populate this from installed `themes/<name>/theme.toml`
-/// directories on disk instead (spec §6, §10).
-pub fn available_themes() -> Vec<String> {
-    vec!["default".to_string()]
+/// Theme names the Settings screen's Theme selector can choose between:
+/// `"default"` plus whatever's installed under `themes_root` (spec §6,
+/// §10 SM2b). Thin wrapper over [`crate::theme::loader::list_themes`] kept
+/// here so `shell/mod.rs` has one place to go for "what can Theme cycle
+/// through" without reaching into `theme::loader` directly.
+pub fn available_themes(themes_root: &Path) -> Vec<String> {
+    crate::theme::loader::list_themes(themes_root)
 }
 
 fn on_off(b: bool) -> &'static str {
@@ -191,7 +194,7 @@ fn draw_theme(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, config: &Emulato
     ui.label(RichText::new(format!("{prefix}Theme: {}", config.general.selected_theme)).color(color).size(15.0));
     ui.add_space(10.0);
     ui.label(
-        RichText::new("Left/Right or Confirm cycles themes. TODO(SM2b): populate from installed themes/ directories.")
+        RichText::new("Left/Right or Confirm cycles installed themes (themes/<name>/theme.toml).")
             .color(theme.palette.text_faint)
             .size(12.0),
     );
@@ -232,7 +235,7 @@ mod tests {
 
     #[test]
     fn available_themes_lists_at_least_the_default() {
-        let themes = available_themes();
+        let themes = available_themes(std::path::Path::new("this/does/not/exist"));
         assert!(themes.contains(&"default".to_string()));
     }
 }

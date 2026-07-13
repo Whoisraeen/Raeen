@@ -24,12 +24,20 @@ pub struct HomeAnim {
     pub focus_pop: f32,
 }
 
-pub fn draw(ui: &mut egui::Ui, theme: &Theme, items: &[LibraryItem], nav: &NavState, anim: &HomeAnim, meta_cache: &MetaCache) {
+pub fn draw(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    items: &[LibraryItem],
+    nav: &NavState,
+    anim: &HomeAnim,
+    meta_cache: &MetaCache,
+    background: Option<&egui::TextureHandle>,
+) {
     let screen = ui.max_rect();
     let painter = ui.painter().clone();
 
     painter.rect_filled(screen, 0.0, theme.palette.ground);
-    draw_hero(&painter, screen, theme, &anim.hero);
+    draw_hero(&painter, screen, theme, &anim.hero, background);
 
     let topbar_h = 96.0;
     let topbar_rect = Rect::from_min_size(screen.min, vec2(screen.width(), topbar_h));
@@ -49,13 +57,26 @@ pub fn draw(ui: &mut egui::Ui, theme: &Theme, items: &[LibraryItem], nav: &NavSt
     draw_hints(&painter, theme, screen);
 }
 
-fn draw_hero(painter: &egui::Painter, rect: Rect, theme: &Theme, g: &Gradient) {
-    // Approximate the mockup's upper-right radial glow with a 4-corner mesh.
-    let top_right = g.hi;
-    let top_left = lerp_color(g.hi, g.mid, 0.55);
-    let bottom_right = lerp_color(g.mid, g.lo, 0.4);
-    let bottom_left = g.lo;
-    corner_gradient(painter, rect, top_left, top_right, bottom_left, bottom_right);
+/// Paint the Home hero. When the active theme provides a background image
+/// (spec §6 — a user's own local theme), that image is drawn stretched to
+/// fill `rect` instead of the original mesh-gradient art; either way, the
+/// legibility scrim on top is unconditional so context-block text stays
+/// readable.
+fn draw_hero(painter: &egui::Painter, rect: Rect, theme: &Theme, g: &Gradient, background: Option<&egui::TextureHandle>) {
+    match background {
+        Some(texture) => {
+            let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+            painter.image(texture.id(), rect, uv, Color32::WHITE);
+        }
+        None => {
+            // Approximate the mockup's upper-right radial glow with a 4-corner mesh.
+            let top_right = g.hi;
+            let top_left = lerp_color(g.hi, g.mid, 0.55);
+            let bottom_right = lerp_color(g.mid, g.lo, 0.4);
+            let bottom_left = g.lo;
+            corner_gradient(painter, rect, top_left, top_right, bottom_left, bottom_right);
+        }
+    }
 
     // Legibility scrim: darker toward the bottom-left where text sits.
     let s = theme.palette.scrim;

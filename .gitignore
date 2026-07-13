@@ -35,3 +35,12 @@ PS5 Firmware/
 # Logs
 logs/
 *.log
+
+# User-installed Shell themes (spec `2026-07-13-xps5x-shell-design.md`
+# §6/§11): the default theme's manifest is original content and ships in
+# the repo, but everything else under themes/ is either a user-installed
+# theme or user-supplied binary assets (fonts, backgrounds, icons) and must
+# never be committed.
+themes/*
+!themes/default/
+!themes/default/theme.toml

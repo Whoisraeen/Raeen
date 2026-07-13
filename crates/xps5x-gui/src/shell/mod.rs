@@ -17,7 +17,7 @@ pub mod settings;
 
 use crate::launcher::{GameLauncher, SessionHandle, SessionState};
 use crate::library::{Gradient, LibraryItem, MetaCache};
-use crate::theme::Theme;
+use crate::theme::{self, Theme};
 use anim::Animated;
 use boot::BootSequence;
 use egui::Key;
@@ -63,6 +63,13 @@ pub struct Shell {
     /// via `EmulatorConfig::save` when the user backs out of Settings.
     config: EmulatorConfig,
     config_path: PathBuf,
+    /// Root directory theme names are resolved under: `themes_root/<name>/
+    /// theme.toml` (spec §6, §10 SM2b).
+    themes_root: PathBuf,
+    /// The active theme's background image, if any, uploaded to the GPU
+    /// once per theme (re)load — `home.rs` draws this instead of the mesh
+    /// gradient hero when present (spec §6).
+    background_texture: Option<egui::TextureHandle>,
     /// Scratch text-entry buffers for Settings' two path fields. Kept on
     /// `Shell` rather than `nav::NavState`, which stays free of raw text
     /// state so it can remain a pure, egui-free state machine.
@@ -80,8 +87,15 @@ pub struct Shell {
 }
 
 impl Shell {
+    /// `ctx` is used once here to install the initial theme's font (if any)
+    /// and upload its background image (if any) — see [`Self::reload_theme`],
+    /// which this delegates to for that work so construction and a later
+    /// Settings-driven theme switch share one code path.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        ctx: &egui::Context,
         theme: Theme,
+        themes_root: PathBuf,
         library: Vec<LibraryItem>,
         launcher: Box<dyn GameLauncher>,
         config: EmulatorConfig,
@@ -115,6 +129,9 @@ impl Shell {
 
         let settings_key_provider_input = config.paths.key_provider_path.display().to_string();
 
+        theme::install_fonts(ctx, &theme);
+        let background_texture = background_texture_for(ctx, &theme);
+
         Self {
             theme,
             library,
@@ -128,6 +145,8 @@ impl Shell {
             recent: Vec::new(),
             config,
             config_path,
+            themes_root,
+            background_texture,
             settings_new_folder_input: String::new(),
             settings_key_provider_input,
             rail_offset: Animated::new(0.0),
@@ -185,8 +204,8 @@ impl Shell {
                 NavAction::ActivateOption { card, option } => self.handle_cc_option(ctx, card, option),
                 NavAction::OpenSettings => self.enter_settings(),
                 NavAction::CloseSettings => self.leave_settings(),
-                NavAction::AdjustSetting { section, row, delta } => self.apply_setting_adjust(section, row, delta),
-                NavAction::ActivateSetting { section, row } => self.apply_setting_activate(section, row),
+                NavAction::AdjustSetting { section, row, delta } => self.apply_setting_adjust(ctx, section, row, delta),
+                NavAction::ActivateSetting { section, row } => self.apply_setting_activate(ctx, section, row),
                 NavAction::OpenControlCenter | NavAction::CloseControlCenter | NavAction::SwitchTab(_) | NavAction::None => {}
             }
         }
@@ -222,8 +241,9 @@ impl Shell {
     /// Step the config field addressed by `(section, row)` — see
     /// `settings::SETTINGS_SECTION_NAMES` for what each section is.
     /// Sections 3 (Game Folders) and 4 (Key Provider) are pure text-entry
-    /// and have nothing to step with Left/Right.
-    fn apply_setting_adjust(&mut self, section: usize, row: usize, delta: i32) {
+    /// and have nothing to step with Left/Right. `ctx` is only needed by
+    /// the Theme row, which reloads fonts/textures on the egui context.
+    fn apply_setting_adjust(&mut self, ctx: &egui::Context, section: usize, row: usize, delta: i32) {
         match (section, row) {
             (0, 0) => {
                 self.config.graphics.resolution_scale =
@@ -237,7 +257,7 @@ impl Shell {
             (1, 2) => self.config.audio.spatial_audio = !self.config.audio.spatial_audio,
             (2, 0) => self.config.input.dualsense_features = !self.config.input.dualsense_features,
             (2, 1) => self.config.input.deadzone = settings::adjust_stepped(self.config.input.deadzone, delta, 0.05, 0.0, 1.0),
-            (5, 0) => self.cycle_theme(delta),
+            (5, 0) => self.cycle_theme(ctx, delta),
             _ => {}
         }
     }
@@ -247,9 +267,9 @@ impl Shell {
     /// way; the theme selector cycles forward) — spec's "Left/Right or
     /// Confirm to adjust". Game Folders and Key Provider have their own
     /// Confirm semantics.
-    fn apply_setting_activate(&mut self, section: usize, row: usize) {
+    fn apply_setting_activate(&mut self, ctx: &egui::Context, section: usize, row: usize) {
         match section {
-            0 | 1 | 2 | 5 => self.apply_setting_adjust(section, row, 1),
+            0 | 1 | 2 | 5 => self.apply_setting_adjust(ctx, section, row, 1),
             3 => self.activate_game_folder_row(row),
             _ => {} // Key Provider (4): pure text-entry, nothing to "confirm".
         }
@@ -274,8 +294,12 @@ impl Shell {
         self.nav.set_settings_row_counts(settings::settings_row_counts(self.config.paths.game_folders.len()));
     }
 
-    fn cycle_theme(&mut self, delta: i32) {
-        let themes = settings::available_themes();
+    /// Cycle `general.selected_theme` by `delta` steps through the themes
+    /// installed under `themes_root` and reload the active theme from disk
+    /// (spec §6, §10 SM2b: "selecting a theme updates `general.
+    /// selected_theme` and reloads the active theme").
+    fn cycle_theme(&mut self, ctx: &egui::Context, delta: i32) {
+        let themes = settings::available_themes(&self.themes_root);
         if themes.is_empty() {
             return;
         }
@@ -283,6 +307,19 @@ impl Shell {
         let len = themes.len() as i32;
         let next = (current as i32 + delta).rem_euclid(len) as usize;
         self.config.general.selected_theme = themes[next].clone();
+        self.reload_theme(ctx);
+    }
+
+    /// Load `config.general.selected_theme` from `themes_root`, install its
+    /// font (or fall back to egui's built-ins) into `ctx`, and (re)upload
+    /// its background image, if any, to the GPU. Called once at
+    /// construction (via [`Self::new`]) and again whenever Settings' theme
+    /// selector changes the active theme.
+    fn reload_theme(&mut self, ctx: &egui::Context) {
+        let theme = theme::loader::load_theme(&self.themes_root, &self.config.general.selected_theme);
+        theme::install_fonts(ctx, &theme);
+        self.background_texture = background_texture_for(ctx, &theme);
+        self.theme = theme;
     }
 
     /// Handle Confirm on a Control Center card's option list (currently
@@ -463,7 +500,7 @@ impl Shell {
                 focus_pop: self.focus_pop.value,
             };
             let items = self.active_items();
-            home::draw(ui, &theme, items, &self.nav, &anim, &self.meta_cache);
+            home::draw(ui, &theme, items, &self.nav, &anim, &self.meta_cache, self.background_texture.as_ref());
 
             let recent_titles = self.recent_titles();
             control_center::draw(ui, &theme, &self.nav, self.cc_open.value, &recent_titles);
@@ -487,6 +524,17 @@ fn push_recent(recent: &mut Vec<String>, id: &str, cap: usize) {
     recent.retain(|existing| existing != id);
     recent.insert(0, id.to_string());
     recent.truncate(cap);
+}
+
+/// Upload `theme`'s background image (if any) to the GPU as a fresh
+/// texture. `None` when the theme carries no background — `home.rs` falls
+/// back to its mesh-gradient hero in that case (spec §6).
+fn background_texture_for(ctx: &egui::Context, theme: &Theme) -> Option<egui::TextureHandle> {
+    theme
+        .assets
+        .background
+        .as_ref()
+        .map(|image| ctx.load_texture("xps5x-theme-background", (**image).clone(), egui::TextureOptions::LINEAR))
 }
 
 fn draw_session_overlay(ui: &mut egui::Ui, theme: &Theme, session: &ActiveSession, launcher: &dyn GameLauncher) {
