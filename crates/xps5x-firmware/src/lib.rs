@@ -11,6 +11,10 @@
 /// Crate identifier, used in diagnostics.
 pub const CRATE_NAME: &str = "xps5x-firmware";
 
+pub mod slb2;
+
+pub use slb2::{parse_slb2, Slb2Entry};
+
 #[cfg(test)]
 mod tests {
     #[test]
