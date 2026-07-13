@@ -37,8 +37,11 @@ impl Firmware {
     /// surfaces as [`FirmwareError::InvalidPupMagic`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, FirmwareError> {
         let file = std::fs::File::open(path.as_ref()).map_err(LoaderError::from)?;
-        // SAFETY: opened read-only; treated as an immutable byte slice for the
-        // lifetime of the mapping. We never mutate through it.
+        // SAFETY: `Mmap::map` is unsafe because the mapping aliases the file's
+        // bytes: if the backing file is modified or truncated by another
+        // process while mapped, reads can observe torn data or fault (SIGBUS).
+        // XPS5X accepts this risk for a user-supplied, locally-owned firmware
+        // file it only reads; it never writes through the mapping.
         let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(LoaderError::from)?;
         let entries = parse_slb2(&mmap)?;
         Ok(Self {
