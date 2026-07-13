@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 xps5x-core = { workspace = true }
 xps5x-loader = { workspace = true }
+xps5x-hle = { workspace = true }
 tracing = { workspace = true }
 memmap2 = { workspace = true }
 sha1 = { workspace = true }

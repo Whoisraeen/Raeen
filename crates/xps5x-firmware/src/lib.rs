@@ -16,6 +16,7 @@ pub mod pup;
 pub mod crypto;
 pub mod dynlib;
 pub mod sprx;
+pub mod registry;
 pub mod report;
 
 pub use slb2::{parse_slb2, Slb2Entry};
@@ -24,6 +25,7 @@ pub use crypto::{
     decrypt_self, require_key, DecryptedSelf, KeyProvider, KeyRequest, NoKeysProvider, SegmentKey,
 };
 pub use sprx::{parse_sprx, SprxModule, SprxSegment};
+pub use registry::{ModulePolicy, ModuleRegistry, Resolver};
 pub use report::summarize;
 
 #[cfg(test)]
