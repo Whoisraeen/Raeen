@@ -24,8 +24,38 @@ mod trampoline;
 
 use thiserror::Error;
 use xps5x_firmware::LinkedModule;
+#[cfg(target_os = "windows")]
+use xps5x_hle::GuestAllocator;
 use xps5x_hle::HleRegistry;
 use xps5x_kernel::OrbisKernel;
+
+/// Stand-in [`GuestAllocator`] that satisfies no request: every method is a
+/// `None`/no-op. `execute_linked` doesn't yet call anything that reaches
+/// `ctx.alloc` (no HLE function consumes it — RT2 Task 1 only threads the
+/// seam through), so this keeps the workspace compiling and every existing
+/// test passing until a real allocator exists.
+// TODO(RT2 Task 3): replaced by GuestArena
+#[cfg(target_os = "windows")]
+struct NullAllocator;
+
+#[cfg(target_os = "windows")]
+impl GuestAllocator for NullAllocator {
+    fn alloc(&self, _size: u64, _align: u64) -> Option<u64> {
+        None
+    }
+
+    fn free(&self, _addr: u64) {}
+
+    fn realloc(&self, _addr: u64, _new_size: u64) -> Option<u64> {
+        None
+    }
+
+    fn mmap(&self, _length: u64, _align: u64) -> Option<u64> {
+        None
+    }
+
+    fn munmap(&self, _addr: u64, _length: u64) {}
+}
 
 /// Errors [`execute_linked`] can return (design doc §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -63,11 +93,13 @@ const MAX_ARGS: usize = 6;
 /// `module.image`) natively, passing `args` (up to 6 integer/pointer
 /// values, SysV) and servicing every HLE trampoline call it makes through
 /// `hle`. Each serviced call gets an [`xps5x_hle::HleContext`] built from
-/// `kernel` and a [`mem::MappedImage`]-backed [`xps5x_hle::GuestMemory`]
-/// view of `module.image` (design doc §2's dispatch-context milestone), so
-/// HLE functions can touch the kernel and read/write guest memory, not just
-/// log. Returns the guest function's `RAX` on success. See the design doc
-/// §2 for the full trap-and-dispatch mechanism and §5 for this signature.
+/// `kernel`, a [`mem::MappedImage`]-backed [`xps5x_hle::GuestMemory`] view
+/// of `module.image` (design doc §2's dispatch-context milestone), and a
+/// [`xps5x_hle::GuestAllocator`] (currently a no-op [`NullAllocator`] — RT2
+/// Task 3 replaces it with a real arena), so HLE functions can touch the
+/// kernel and read/write guest memory, not just log. Returns the guest
+/// function's `RAX` on success. See the design doc §2 for the full
+/// trap-and-dispatch mechanism and §5 for this signature.
 #[cfg(target_os = "windows")]
 pub fn execute_linked(
     module: &LinkedModule,
@@ -107,14 +139,22 @@ pub fn execute_linked(
     // lay guest vaddrs from 0, so `image`'s own `GuestMemory` impl (guest
     // vaddr `V` == mapped offset `V`) is exactly right (see `mem.rs`).
     //
+    // `NullAllocator` is a temporary stand-in for the guest allocator seam
+    // (RT2 Task 1): nothing yet routes an HLE call through `ctx.alloc`, so
+    // this satisfies `dispatch::run`'s new parameter without changing any
+    // observed behavior.
+    // TODO(RT2 Task 3): replaced by GuestArena
+    let alloc = NullAllocator;
+
     // SAFETY: `entry` is exactly the function pointer `dispatch::run`'s
     // safety contract requires (a valid `sysv64` pointer into the
     // `MappedImage` we just built); `module.hle_trampolines`, `hle`,
-    // `kernel`, and `image` (as `&dyn GuestMemory`) all outlive this call
-    // (borrowed for its entire duration); `guard`'s region covers every
-    // address `module.hle_trampolines` can resolve (it was sized from that
-    // same table, immediately above).
-    unsafe { dispatch::run(entry, padded, &module.hle_trampolines, hle, kernel, &image, &guard) }
+    // `kernel`, `image` (as `&dyn GuestMemory`), and `alloc` (as `&dyn
+    // GuestAllocator`) all outlive this call (borrowed for its entire
+    // duration); `guard`'s region covers every address
+    // `module.hle_trampolines` can resolve (it was sized from that same
+    // table, immediately above).
+    unsafe { dispatch::run(entry, padded, &module.hle_trampolines, hle, kernel, &image, &alloc, &guard) }
 }
 
 /// RT0 is Windows-first; a POSIX backend lands at a later milestone without

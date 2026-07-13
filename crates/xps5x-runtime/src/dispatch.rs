@@ -55,7 +55,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 };
 
 use xps5x_firmware::HleTrampoline;
-use xps5x_hle::{GuestMemory, HleContext, HleRegistry};
+use xps5x_hle::{GuestAllocator, GuestMemory, HleContext, HleRegistry};
 use xps5x_kernel::OrbisKernel;
 
 use crate::RuntimeError;
@@ -102,6 +102,9 @@ struct ActiveContext {
     /// The guest memory view an HLE call's [`HleContext::mem`] borrows
     /// from — a trait object pointer (fat pointer) for the same reason.
     mem: *const dyn GuestMemory,
+    /// The guest allocator an HLE call's [`HleContext::alloc`] borrows
+    /// from — a trait object pointer (fat pointer), same reasoning as `mem`.
+    alloc: *const dyn GuestAllocator,
     region_base: u64,
     region_len: u64,
     error: Cell<Option<RuntimeError>>,
@@ -137,10 +140,10 @@ static ACTIVE_CONTEXT: AtomicPtr<ActiveContext> = AtomicPtr::new(ptr::null_mut()
 /// `extern "sysv64"` calling convention, into memory the caller mapped
 /// specifically so it can be executed (i.e. a live
 /// [`crate::mem::MappedImage`]'s contents) — calling it runs that code
-/// natively on the current thread. `trampolines`, `hle`, `kernel`, and `mem`
-/// must outlive this call (guaranteed by `execute_linked`'s borrows). `guard`
-/// must be the [`TrampolineGuard`] whose region covers every address
-/// `trampolines` resolves.
+/// natively on the current thread. `trampolines`, `hle`, `kernel`, `mem`,
+/// and `alloc` must outlive this call (guaranteed by `execute_linked`'s
+/// borrows). `guard` must be the [`TrampolineGuard`] whose region covers
+/// every address `trampolines` resolves.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run(
     entry: unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> u64,
@@ -149,6 +152,7 @@ pub(crate) unsafe fn run(
     hle: &HleRegistry,
     kernel: &OrbisKernel,
     mem: &dyn GuestMemory,
+    alloc: &dyn GuestAllocator,
     guard: &TrampolineGuard,
 ) -> Result<u64, RuntimeError> {
     // Serialization (only one native guest execution at a time, RT0) is
@@ -185,11 +189,23 @@ pub(crate) unsafe fn run(
     // practice.
     let mem_erased: &'static dyn GuestMemory = unsafe { core::mem::transmute::<&dyn GuestMemory, &'static dyn GuestMemory>(mem) };
 
+    // SAFETY: same reasoning as `mem_erased` immediately above, applied to
+    // `alloc` instead of `mem` — `&dyn GuestAllocator` carries the same
+    // implicit non-`'static` bound that `&dyn GuestMemory` does, so building
+    // `ActiveContext.alloc`'s raw pointer needs the same lifetime-erasing
+    // transmute. Sound for the same reason: `run`'s safety contract requires
+    // `alloc` to outlive this call, it is only ever dereferenced
+    // synchronously on this thread while `ctx` is alive, and
+    // `ACTIVE_CONTEXT` is cleared before `run` returns.
+    let alloc_erased: &'static dyn GuestAllocator =
+        unsafe { core::mem::transmute::<&dyn GuestAllocator, &'static dyn GuestAllocator>(alloc) };
+
     let ctx = ActiveContext {
         trampolines: trampolines as *const [HleTrampoline],
         hle: hle as *const HleRegistry,
         kernel: kernel as *const OrbisKernel,
         mem: mem_erased as *const dyn GuestMemory,
+        alloc: alloc_erased as *const dyn GuestAllocator,
         region_base: guard.base(),
         region_len: guard.len(),
         error: Cell::new(None),
@@ -339,20 +355,21 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
-    // SAFETY: `ctx.trampolines`/`ctx.hle`/`ctx.kernel`/`ctx.mem` were stored
-    // by `run` from live `&[HleTrampoline]`/`&HleRegistry`/`&OrbisKernel`/
-    // `&dyn GuestMemory` references that, per `run`'s safety contract,
-    // outlive this call.
+    // SAFETY: `ctx.trampolines`/`ctx.hle`/`ctx.kernel`/`ctx.mem`/`ctx.alloc`
+    // were stored by `run` from live `&[HleTrampoline]`/`&HleRegistry`/
+    // `&OrbisKernel`/`&dyn GuestMemory`/`&dyn GuestAllocator` references
+    // that, per `run`'s safety contract, outlive this call.
     let trampolines = unsafe { &*ctx.trampolines };
     let hle = unsafe { &*ctx.hle };
     let kernel = unsafe { &*ctx.kernel };
     let mem = unsafe { &*ctx.mem };
+    let alloc = unsafe { &*ctx.alloc };
 
     let result = match trampoline::resolve(fault_addr, trampolines) {
         Some(t) => {
             // SysV integer argument registers (design doc §3).
             let args = [context.Rdi, context.Rsi, context.Rdx, context.Rcx, context.R8, context.R9];
-            let hle_ctx = HleContext { kernel, mem };
+            let hle_ctx = HleContext { kernel, mem, alloc };
             hle.call(&hle_ctx, &t.library, &t.function, &args).unwrap_or(0)
         }
         None => {

@@ -364,7 +364,8 @@ mod tests {
         let registry = HleRegistry::new();
         let kernel = xps5x_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
-        let ctx = test_ctx(&kernel, &mem);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
         for name in [
             "sceKernelAllocateDirectMemory",
             "sceKernelAllocateMainDirectMemory",
@@ -409,7 +410,8 @@ mod tests {
         let registry = HleRegistry::new();
         let kernel = xps5x_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
-        let ctx = test_ctx(&kernel, &mem);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
 
         let addr_out: u64 = 0x100;
         let result = registry
@@ -429,7 +431,8 @@ mod tests {
         let registry = HleRegistry::new();
         let kernel = xps5x_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
-        let ctx = test_ctx(&kernel, &mem);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
 
         let phys_addr_out: u64 = 0x200;
         let result = registry

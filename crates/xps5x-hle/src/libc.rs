@@ -275,7 +275,8 @@ mod tests {
         let registry = HleRegistry::new();
         let kernel = xps5x_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
-        let ctx = test_ctx(&kernel, &mem);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
         for name in [
             "malloc",
             "free",
@@ -307,7 +308,8 @@ mod tests {
         let registry = HleRegistry::new();
         let kernel = xps5x_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x100);
-        let ctx = test_ctx(&kernel, &mem);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
 
         let src: u64 = 0x10;
         let dst: u64 = 0x50;
@@ -327,7 +329,8 @@ mod tests {
         let registry = HleRegistry::new();
         let kernel = xps5x_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x20);
-        let ctx = test_ctx(&kernel, &mem);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
 
         // src is entirely outside the 0x20-byte test memory.
         let result = registry.call(&ctx, "libc", "memcpy", &[0x0, 0xFFFF, 8]).unwrap();
@@ -339,7 +342,8 @@ mod tests {
         let registry = HleRegistry::new();
         let kernel = xps5x_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x100);
-        let ctx = test_ctx(&kernel, &mem);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
 
         let dst: u64 = 0x20;
         let result = registry.call(&ctx, "libc", "memset", &[dst, 0xAB, 6]).unwrap();
@@ -355,7 +359,8 @@ mod tests {
         let registry = HleRegistry::new();
         let kernel = xps5x_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x100);
-        let ctx = test_ctx(&kernel, &mem);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
 
         let s: u64 = 0x8;
         assert!(mem.write(s, b"hello\0garbage"));
@@ -369,7 +374,8 @@ mod tests {
         let registry = HleRegistry::new();
         let kernel = xps5x_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x10);
-        let ctx = test_ctx(&kernel, &mem);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
 
         // Pointer entirely outside the 0x10-byte test memory: strlen should
         // report 0 (nothing readable), not panic or spin.
