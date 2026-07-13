@@ -15,10 +15,12 @@ pub mod slb2;
 pub mod pup;
 pub mod crypto;
 pub mod dynlib;
+pub mod report;
 
 pub use slb2::{parse_slb2, Slb2Entry};
 pub use pup::Firmware;
 pub use crypto::{require_key, KeyProvider, KeyRequest, NoKeysProvider, SegmentKey};
+pub use report::summarize;
 
 #[cfg(test)]
 mod tests {

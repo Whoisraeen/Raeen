@@ -11,6 +11,18 @@ fn main() -> anyhow::Result<()> {
     // Initialize logging.
     xps5x_core::logging::init("info");
 
+    // Diagnostic: `xps5x --firmware-info <PUP>` inspects a firmware package
+    // and exits without launching the GUI. It never decrypts anything.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--firmware-info") {
+        let path = args
+            .get(pos + 1)
+            .ok_or_else(|| anyhow::anyhow!("--firmware-info requires a path to a PUP file"))?;
+        let firmware = xps5x_firmware::Firmware::open(path)?;
+        print!("{}", xps5x_firmware::summarize(&firmware));
+        return Ok(());
+    }
+
     info!("╔══════════════════════════════════════════════╗");
     info!("║          XPS5X — PS5 Emulator v{}        ║", xps5x_core::VERSION);
     info!("║        Cross-Platform Compatibility Layer     ║");

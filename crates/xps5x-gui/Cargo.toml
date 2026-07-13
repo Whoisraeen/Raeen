@@ -18,6 +18,7 @@ xps5x-audio = { workspace = true }
 xps5x-io = { workspace = true }
 xps5x-input = { workspace = true }
 xps5x-hle = { workspace = true }
+xps5x-firmware = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 tracing = { workspace = true }
