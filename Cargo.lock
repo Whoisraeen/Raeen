@@ -5031,6 +5031,7 @@ dependencies = [
  "xps5x-core",
  "xps5x-firmware",
  "xps5x-hle",
+ "xps5x-kernel",
 ]
 
 [[package]]

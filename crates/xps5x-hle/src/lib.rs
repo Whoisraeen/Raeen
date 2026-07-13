@@ -34,8 +34,44 @@ pub mod libsce_sysmodule;
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
 
-/// HLE function signature: takes arguments, returns result.
-pub type HleFunction = fn(&[u64]) -> u64;
+/// Access to the guest (emulated PS5) address space from an HLE function.
+///
+/// Every implementation must be bounds-checked: an out-of-bounds
+/// `guest_addr`/length combination returns `false` (touching nothing)
+/// rather than panicking or reading/writing outside the guest's actual
+/// backing storage. An HLE function handed a wild pointer by buggy or
+/// malicious guest code must never be able to turn that into a host OOB
+/// access or a panic.
+pub trait GuestMemory {
+    /// Read `out.len()` bytes starting at `guest_addr` into `out`. Returns
+    /// `false` (leaving `out`'s contents unspecified) if the read would
+    /// fall outside the guest's mapped memory.
+    fn read(&self, guest_addr: u64, out: &mut [u8]) -> bool;
+    /// Write `data` starting at `guest_addr`. Returns `false` (writing
+    /// nothing) if the write would fall outside the guest's mapped memory.
+    fn write(&self, guest_addr: u64, data: &[u8]) -> bool;
+}
+
+/// Everything an HLE function may touch: the emulated kernel (memory,
+/// threads, filesystem, ...) and the guest's address space.
+///
+/// This is the dispatch-context milestone: before it existed, an HLE
+/// function was a bare `fn(&[u64]) -> u64` with no way to read/write guest
+/// pointers or reach a live [`xps5x_kernel::OrbisKernel`] — every stub was
+/// necessarily a no-op that just logged and returned a plausible value. Now
+/// every HLE call gets both, so functions like `memcpy`/`strlen`/
+/// `sceKernelMapFlexibleMemory` can do the real operation.
+pub struct HleContext<'a> {
+    /// The live emulated kernel (memory manager, thread manager, VFS, ...).
+    pub kernel: &'a xps5x_kernel::OrbisKernel,
+    /// The guest's address space, as seen from wherever this call
+    /// originated (e.g. the runtime's mapped module image).
+    pub mem: &'a dyn GuestMemory,
+}
+
+/// HLE function signature: takes a dispatch context and integer arguments,
+/// returns a result.
+pub type HleFunction = fn(&HleContext, &[u64]) -> u64;
 
 /// Registry of all HLE'd library functions.
 pub struct HleRegistry {
@@ -69,12 +105,13 @@ impl HleRegistry {
         self.functions.insert(key, implementation);
     }
 
-    /// Look up and call an HLE function.
-    pub fn call(&self, library: &str, function: &str, args: &[u64]) -> Option<u64> {
+    /// Look up and call an HLE function, giving it `ctx` (the kernel +
+    /// guest memory) alongside its integer arguments.
+    pub fn call(&self, ctx: &HleContext, library: &str, function: &str, args: &[u64]) -> Option<u64> {
         let key = format!("{}::{}", library, function);
         if let Some(func) = self.functions.get(&key) {
             debug!("HLE call: {}({:?})", key, args);
-            Some(func(args))
+            Some(func(ctx, args))
         } else {
             warn!("HLE: unimplemented function {}", key);
             None
@@ -109,6 +146,52 @@ impl Default for HleRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(test)]
+/// A tiny in-memory [`GuestMemory`] backed by a `Vec<u8>`, for unit tests
+/// that need to exercise real read/write behavior without a runtime.
+pub(crate) struct TestMemory(std::cell::RefCell<Vec<u8>>);
+
+#[cfg(test)]
+impl TestMemory {
+    pub(crate) fn new(size: usize) -> Self {
+        Self(std::cell::RefCell::new(vec![0u8; size]))
+    }
+}
+
+#[cfg(test)]
+impl GuestMemory for TestMemory {
+    fn read(&self, guest_addr: u64, out: &mut [u8]) -> bool {
+        let Ok(addr) = usize::try_from(guest_addr) else { return false };
+        let buf = self.0.borrow();
+        let Some(end) = addr.checked_add(out.len()) else { return false };
+        if end > buf.len() {
+            return false;
+        }
+        out.copy_from_slice(&buf[addr..end]);
+        true
+    }
+
+    fn write(&self, guest_addr: u64, data: &[u8]) -> bool {
+        let Ok(addr) = usize::try_from(guest_addr) else { return false };
+        let mut buf = self.0.borrow_mut();
+        let Some(end) = addr.checked_add(data.len()) else { return false };
+        if end > buf.len() {
+            return false;
+        }
+        buf[addr..end].copy_from_slice(data);
+        true
+    }
+}
+
+/// Build an [`HleContext`] over a test kernel and [`TestMemory`]. Defined at
+/// the crate root (not inside `mod tests`) so every submodule's own
+/// `#[cfg(test)] mod tests` can reach it as `crate::test_ctx` — Rust
+/// visibility lets descendant modules see their ancestors' private items.
+#[cfg(test)]
+pub(crate) fn test_ctx<'a>(kernel: &'a xps5x_kernel::OrbisKernel, mem: &'a TestMemory) -> HleContext<'a> {
+    HleContext { kernel, mem }
 }
 
 #[cfg(test)]
@@ -149,6 +232,9 @@ mod tests {
     #[test]
     fn representative_libkernel_and_libc_functions_are_implemented_and_callable() {
         let registry = HleRegistry::new();
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = TestMemory::new(0x1000);
+        let ctx = test_ctx(&kernel, &mem);
         let samples: &[(&str, &str)] = &[
             ("libkernel", "sceKernelAllocateDirectMemory"),
             ("libkernel", "scePthreadCreate"),
@@ -160,7 +246,7 @@ mod tests {
                 registry.is_implemented(library, function),
                 "expected {library}::{function} to be implemented"
             );
-            let result = registry.call(library, function, &[1, 2, 3, 4]);
+            let result = registry.call(&ctx, library, function, &[1, 2, 3, 4]);
             assert!(result.is_some(), "{library}::{function} should return a value, not None");
         }
     }
@@ -170,7 +256,7 @@ mod tests {
         let registry = HleRegistry {
             functions: DashMap::new(),
         };
-        fn stub(_args: &[u64]) -> u64 {
+        fn stub(_ctx: &HleContext, _args: &[u64]) -> u64 {
             0
         }
         registry.register("libFoo", "someFunction", stub);

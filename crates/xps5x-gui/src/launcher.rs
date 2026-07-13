@@ -217,6 +217,13 @@ struct FirmwareSession {
 /// locked only for the duration of one `load_module` call.
 pub struct FirmwareLauncher {
     hle: xps5x_hle::HleRegistry,
+    /// The live emulated kernel HLE calls get access to via
+    /// [`xps5x_hle::HleContext::kernel`] (dispatch-context milestone — see
+    /// `xps5x_runtime::execute_linked`'s doc comment). One instance per
+    /// launcher, not per launch: kernel state (the virtual memory manager,
+    /// thread manager, ...) is process-wide, matching a real PS5's single
+    /// kernel serving every loaded module.
+    kernel: xps5x_kernel::OrbisKernel,
     registry: Mutex<xps5x_firmware::ModuleRegistry>,
     sessions: Mutex<HashMap<u64, FirmwareSession>>,
     next_id: Mutex<u64>,
@@ -228,6 +235,7 @@ impl FirmwareLauncher {
         let nid_db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
         Self {
             hle,
+            kernel: xps5x_kernel::OrbisKernel::new(),
             registry: Mutex::new(xps5x_firmware::ModuleRegistry::new(nid_db)),
             sessions: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
@@ -271,7 +279,7 @@ impl FirmwareLauncher {
 
         #[cfg(target_os = "windows")]
         {
-            match xps5x_runtime::execute_linked(&linked, &self.hle, linked.entry, &[]) {
+            match xps5x_runtime::execute_linked(&linked, &self.hle, &self.kernel, linked.entry, &[]) {
                 Ok(returned) => SessionOutcome::Ran { returned, resolved, unresolved },
                 Err(xps5x_runtime::RuntimeError::Faulted { addr }) => {
                     SessionOutcome::Faulted(format!("Faulted at {addr:#x} during execution"))
@@ -761,7 +769,7 @@ mod firmware_launcher_tests {
             path
         }
 
-        fn sentinel(_args: &[u64]) -> u64 {
+        fn sentinel(_ctx: &xps5x_hle::HleContext, _args: &[u64]) -> u64 {
             0xC0DE
         }
 
@@ -786,6 +794,7 @@ mod firmware_launcher_tests {
             let nid_db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
             let launcher = FirmwareLauncher {
                 hle,
+                kernel: xps5x_kernel::OrbisKernel::new(),
                 registry: Mutex::new(xps5x_firmware::ModuleRegistry::new(nid_db)),
                 sessions: Mutex::new(HashMap::new()),
                 next_id: Mutex::new(0),
@@ -822,6 +831,7 @@ mod firmware_launcher_tests {
             let nid_db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
             let launcher = FirmwareLauncher {
                 hle,
+                kernel: xps5x_kernel::OrbisKernel::new(),
                 registry: Mutex::new(xps5x_firmware::ModuleRegistry::new(nid_db)),
                 sessions: Mutex::new(HashMap::new()),
                 next_id: Mutex::new(0),

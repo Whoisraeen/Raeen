@@ -9,6 +9,7 @@ license.workspace = true
 xps5x-core = { workspace = true }
 xps5x-firmware = { workspace = true }
 xps5x-hle = { workspace = true }
+xps5x-kernel = { workspace = true }
 thiserror = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
