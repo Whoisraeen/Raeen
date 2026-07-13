@@ -21,8 +21,10 @@ xps5x-hle = { workspace = true }
 xps5x-firmware = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
+gilrs = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
+thiserror = { workspace = true }
 toml = { workspace = true }

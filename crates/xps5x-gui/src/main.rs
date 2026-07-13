@@ -4,6 +4,10 @@
 //! Initializes the emulator subsystems and launches the GUI.
 
 mod app;
+mod launcher;
+mod library;
+mod shell;
+mod theme;
 
 use tracing::info;
 
@@ -44,9 +48,13 @@ fn main() -> anyhow::Result<()> {
     // Launch the GUI.
     info!("Launching XPS5X GUI...");
 
+    // The Shell is a full-screen, PS5-style console experience — borderless
+    // and maximized rather than a resizable desktop window (spec §7).
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("XPS5X — PS5 Emulator")
+            .with_title("XPS5X")
+            .with_fullscreen(true)
+            .with_decorations(false)
             .with_inner_size([config.general.window_width as f32, config.general.window_height as f32])
             .with_min_inner_size([800.0, 600.0]),
         ..Default::default()
