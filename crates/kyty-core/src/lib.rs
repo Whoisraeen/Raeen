@@ -17,9 +17,24 @@
 // (`exit!`, `exit_if!`, `assert_kyty!`, `exit_not_implemented!`,
 // `not_implemented!`) are exported crate-wide via `#[macro_export]`, so later
 // Core modules and downstream `kyty-*` crates can use them directly.
+pub mod array_wrapper;
+pub mod byte_buffer;
 pub mod common;
 pub mod dbg_assert;
+pub mod hash;
+pub mod link_list;
+pub mod magic_enum;
+pub mod ref_counter;
 pub mod safe_delete;
+pub mod simple_array;
 pub mod singleton;
+pub mod vector;
 
+pub use array_wrapper::{Array, Array2, Array3};
+pub use byte_buffer::ByteBuffer;
+pub use link_list::{List, ListIndex, ListSet};
+pub use magic_enum::{enum_name, enum_name8, enum_value, MagicEnum};
+pub use ref_counter::RefCounter;
+pub use simple_array::SimpleArray;
 pub use singleton::Singleton;
+pub use vector::{Vector, INVALID_INDEX};
