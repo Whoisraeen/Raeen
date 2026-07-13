@@ -29,6 +29,41 @@ pub use registry::{ModulePolicy, ModuleRegistry, Resolver};
 pub use dynlib::linker::{link_module, HleTrampoline, LinkedModule, HLE_TRAMPOLINE_BASE, UNRESOLVED_STUB_ADDR};
 pub use report::summarize;
 
+use xps5x_core::error::FirmwareError;
+
+/// End-to-end LM1 pipeline: SELF decrypt-or-passthrough -> `.sprx` parse ->
+/// `PT_SCE_DYNLIBDATA` decode -> export registration -> link.
+///
+/// This is the convenience chain Task 6 handed off: [`crypto::decrypt_self`]
+/// (missing-key is a genuine, propagated `Err` — a caller with no matching
+/// key gets `FirmwareError::MissingKey` here, not a partial result), then
+/// [`sprx::parse_sprx`], then (if the module has a `PT_DYNAMIC` segment)
+/// [`dynlib::parse_sce_dynamic`] + [`dynlib::parse_dynlibdata`] — a module
+/// with no `dynamic`/`dynlib_data` is treated as having zero imports/
+/// exports/relocations, not an error. The decoded exports are registered
+/// into `registry` (so later-loaded modules can resolve LLE imports against
+/// this one), then [`dynlib::linker::link_module`] performs the actual
+/// relocation. An unresolved import NID is recorded in the returned
+/// [`LinkedModule::unresolved`] and logged, non-fatal — only a genuine
+/// parse/decrypt/link error propagates as `Err`.
+pub fn load_module(
+    bytes: &[u8],
+    provider: &dyn crypto::KeyProvider,
+    registry: &mut registry::ModuleRegistry,
+    hle: &xps5x_hle::HleRegistry,
+    base: u64,
+) -> Result<dynlib::linker::LinkedModule, FirmwareError> {
+    let decrypted = crypto::self_crypto::decrypt_self(bytes, provider)?;
+    let module = sprx::parse_sprx(&decrypted.elf)?;
+    let dyn_tags = match &module.dynamic {
+        Some(d) => dynlib::parse_sce_dynamic(d)?,
+        None => Vec::new(),
+    };
+    let dynlib_data = dynlib::parse_dynlibdata(module.dynlib_data.as_deref().unwrap_or(&[]), &dyn_tags)?;
+    registry.register_module_exports(&module.name, &dynlib_data.exports);
+    dynlib::linker::link_module(&module, &dynlib_data, registry, hle, base)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
