@@ -12,8 +12,10 @@
 pub const CRATE_NAME: &str = "xps5x-firmware";
 
 pub mod slb2;
+pub mod pup;
 
 pub use slb2::{parse_slb2, Slb2Entry};
+pub use pup::Firmware;
 
 #[cfg(test)]
 mod tests {
