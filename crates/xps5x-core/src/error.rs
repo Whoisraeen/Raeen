@@ -148,3 +148,26 @@ pub enum IoError {
     #[error("DMA transfer error: source {src:#x}, dest {dst:#x}, size {size:#x}")]
     DmaTransferError { src: u64, dst: u64, size: u64 },
 }
+
+/// Errors from the firmware ingestion subsystem (PUP, SELF decryption seam,
+/// SCE module loading, NID linking).
+#[derive(Debug, Error)]
+pub enum FirmwareError {
+    #[error("Invalid PUP magic: got {0:#010x}")]
+    InvalidPupMagic(u32),
+
+    #[error("PUP entry {index} extends beyond file bounds")]
+    PupEntryOutOfBounds { index: usize },
+
+    #[error("No key available for key_id {key_id:#x} (user-supplied KeyProvider returned none)")]
+    MissingKey { key_id: u64 },
+
+    #[error("Unsupported SCE relocation type: {0:#x}")]
+    UnsupportedRelocation(u32),
+
+    #[error("Malformed PT_SCE_DYNLIBDATA: {0}")]
+    MalformedDynlibData(String),
+
+    #[error("Loader error: {0}")]
+    Loader(#[from] LoaderError),
+}
