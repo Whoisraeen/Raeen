@@ -855,5 +855,293 @@ mod firmware_launcher_tests {
 
             let _ = std::fs::remove_dir_all(&tmp);
         }
+
+        // --- Homebrew gap-analysis milestone: a "more realistic" module -----
+        // Everything above proves a single sentinel/HLE import dispatches
+        // correctly. This proves something stronger: a synthetic module
+        // whose entry does *real work* through several distinct real
+        // HLE-registered imports (not a test-local sentinel) — `malloc`,
+        // `memset`, and libkernel's `sceKernelMapFlexibleMemory` — resolved
+        // via genuine NIDs, run through the Shell's actual load path
+        // (`FirmwareLauncher::launch` -> `load` -> `execute_linked`), both
+        // by loading a temp file directly and by discovering it on disk via
+        // the real `scan_dir` first. Entirely hand-built buffers; no real
+        // firmware bytes anywhere; `NoKeysProvider` throughout (inherited
+        // from `FirmwareLauncher::new()`).
+
+        const SLOT_MALLOC_OFF: usize = 0x80;
+        const SLOT_MEMSET_OFF: usize = 0x88;
+        /// `sceKernelMapFlexibleMemory`'s relocation slot — resolved to a
+        /// real HLE trampoline during linking (so it counts toward
+        /// `resolved`) even though the entry stub below never actually
+        /// calls through it; the point is proving the linker handles
+        /// *several* distinct imports, not just the ones a given entry
+        /// happens to execute.
+        const SLOT_MAP_OFF: usize = 0x90;
+        const SCRATCH_OFF: usize = 0x98;
+        const MALLOC_SIZE: u64 = 0x40;
+        const MEMSET_VALUE: u32 = 0xAB;
+
+        /// Writes `mov rdi, malloc_size; call [malloc]; mov [scratch], rax;
+        /// mov rdi, [scratch]; mov esi, memset_value; mov edx, malloc_size;
+        /// call [memset]; mov rdi, [scratch]; movzx eax, byte [rdi]; ret` —
+        /// `malloc(N)`, `memset(ptr, byte, N)`, then read byte 0 of the
+        /// block back into the guest's return value. Mirrors
+        /// `xps5x-runtime/tests/execute.rs`'s
+        /// `write_malloc_memset_readback_stub` (not importable across
+        /// crates, so replicated here).
+        fn write_malloc_memset_readback_stub(
+            buf: &mut [u8],
+            entry_off: usize,
+            slot_malloc_off: usize,
+            slot_memset_off: usize,
+            scratch_off: usize,
+            malloc_size: u64,
+            memset_value: u32,
+        ) {
+            let mut off = entry_off;
+
+            // mov rdi, malloc_size
+            buf[off] = 0x48;
+            buf[off + 1] = 0xBF;
+            buf[off + 2..off + 10].copy_from_slice(&malloc_size.to_le_bytes());
+            off += 10;
+
+            // call qword ptr [rip+disp32]  -> slot_malloc_off
+            let call1_rip_after = off as i64 + 6;
+            let call1_disp32 = (slot_malloc_off as i64 - call1_rip_after) as i32;
+            buf[off] = 0xFF;
+            buf[off + 1] = 0x15;
+            buf[off + 2..off + 6].copy_from_slice(&call1_disp32.to_le_bytes());
+            off += 6;
+
+            // mov [rip+disp32], rax  -> scratch_off (stash the malloc'd pointer)
+            let store_rip_after = off as i64 + 7;
+            let store_disp32 = (scratch_off as i64 - store_rip_after) as i32;
+            buf[off] = 0x48;
+            buf[off + 1] = 0x89;
+            buf[off + 2] = 0x05;
+            buf[off + 3..off + 7].copy_from_slice(&store_disp32.to_le_bytes());
+            off += 7;
+
+            // mov rdi, [rip+disp32]  <- scratch_off (memset's dst arg)
+            let load1_rip_after = off as i64 + 7;
+            let load1_disp32 = (scratch_off as i64 - load1_rip_after) as i32;
+            buf[off] = 0x48;
+            buf[off + 1] = 0x8B;
+            buf[off + 2] = 0x3D;
+            buf[off + 3..off + 7].copy_from_slice(&load1_disp32.to_le_bytes());
+            off += 7;
+
+            // mov esi, memset_value
+            buf[off] = 0xBE;
+            buf[off + 1..off + 5].copy_from_slice(&memset_value.to_le_bytes());
+            off += 5;
+
+            // mov edx, malloc_size (low 32 bits; MALLOC_SIZE is small here)
+            buf[off] = 0xBA;
+            buf[off + 1..off + 5].copy_from_slice(&(malloc_size as u32).to_le_bytes());
+            off += 5;
+
+            // call qword ptr [rip+disp32]  -> slot_memset_off
+            let call2_rip_after = off as i64 + 6;
+            let call2_disp32 = (slot_memset_off as i64 - call2_rip_after) as i32;
+            buf[off] = 0xFF;
+            buf[off + 1] = 0x15;
+            buf[off + 2..off + 6].copy_from_slice(&call2_disp32.to_le_bytes());
+            off += 6;
+
+            // mov rdi, [rip+disp32]  <- scratch_off (reload the pointer for read-back)
+            let load2_rip_after = off as i64 + 7;
+            let load2_disp32 = (scratch_off as i64 - load2_rip_after) as i32;
+            buf[off] = 0x48;
+            buf[off + 1] = 0x8B;
+            buf[off + 2] = 0x3D;
+            buf[off + 3..off + 7].copy_from_slice(&load2_disp32.to_le_bytes());
+            off += 7;
+
+            // movzx eax, byte [rdi]
+            buf[off] = 0x0F;
+            buf[off + 1] = 0xB6;
+            buf[off + 2] = 0x07;
+            off += 3;
+
+            // ret
+            buf[off] = 0xC3;
+        }
+
+        /// The `PT_SCE_DYNLIBDATA` blob + matching `PT_DYNAMIC` bytes for
+        /// several imports at once, each bound to its own relocation slot —
+        /// generalizes this module's `build_dynlib_and_dynamic` (single
+        /// import) to prove a realistic homebrew module importing several
+        /// distinct HLE functions via NID. `imports` is `(nid, slot_offset)`
+        /// pairs; symtab index order matches `imports`' order, so each
+        /// relocation's `r_sym` is just that import's position.
+        fn build_dynlib_and_dynamic_multi(imports: &[(u64, u64)]) -> (Vec<u8>, Vec<u8>) {
+            let mut strtab = vec![0u8];
+            let mut name_offsets = Vec::with_capacity(imports.len());
+            for (nid, _) in imports {
+                let name = format!("{}#A#A", xps5x_firmware::dynlib::nid::encode_nid(*nid));
+                name_offsets.push(strtab.len() as u32);
+                strtab.extend_from_slice(name.as_bytes());
+                strtab.push(0);
+            }
+
+            let mut symtab = Vec::new();
+            for &name_off in &name_offsets {
+                symtab.extend_from_slice(&name_off.to_le_bytes());
+                symtab.push(0);
+                symtab.push(0);
+                symtab.extend_from_slice(&0u16.to_le_bytes());
+                symtab.extend_from_slice(&0u64.to_le_bytes());
+                symtab.extend_from_slice(&0u64.to_le_bytes());
+            }
+
+            let mut jmprel = Vec::new();
+            for (index, (_, slot_off)) in imports.iter().enumerate() {
+                jmprel.extend_from_slice(&slot_off.to_le_bytes());
+                jmprel.extend_from_slice(&(((index as u64) << 32) | R_X86_64_JUMP_SLOT).to_le_bytes());
+                jmprel.extend_from_slice(&0i64.to_le_bytes());
+            }
+
+            let strtab_off = 0u64;
+            let symtab_off = strtab.len() as u64;
+            let jmprel_off = symtab_off + symtab.len() as u64;
+
+            let mut blob = Vec::new();
+            blob.extend_from_slice(&strtab);
+            blob.extend_from_slice(&symtab);
+            blob.extend_from_slice(&jmprel);
+
+            let mut dynamic = Vec::new();
+            let mut push_tag = |tag: u64, val: u64| {
+                dynamic.extend_from_slice(&tag.to_le_bytes());
+                dynamic.extend_from_slice(&val.to_le_bytes());
+            };
+            push_tag(DT_SCE_STRTAB, strtab_off);
+            push_tag(DT_SCE_STRSZ, strtab.len() as u64);
+            push_tag(DT_SCE_SYMTAB, symtab_off);
+            push_tag(DT_SCE_SYMTABSZ, symtab.len() as u64);
+            push_tag(DT_SCE_SYMENT, 24);
+            push_tag(DT_SCE_JMPREL, jmprel_off);
+            push_tag(DT_SCE_PLTRELSZ, jmprel.len() as u64);
+            push_tag(DT_NULL, 0);
+
+            (blob, dynamic)
+        }
+
+        /// A plaintext-SELF-wrapped `.sprx` whose entry calls `malloc` then
+        /// `memset` then reads a byte back (see
+        /// `write_malloc_memset_readback_stub`), importing `malloc`,
+        /// `memset`, and `sceKernelMapFlexibleMemory` via real NIDs — the
+        /// last resolved but never called by this entry.
+        fn build_realistic_homebrew_sprx() -> Vec<u8> {
+            let malloc_nid = xps5x_firmware::dynlib::nid::nid_of("malloc");
+            let memset_nid = xps5x_firmware::dynlib::nid::nid_of("memset");
+            let map_nid = xps5x_firmware::dynlib::nid::nid_of("sceKernelMapFlexibleMemory");
+
+            let (dynlib_blob, dynamic_bytes) = build_dynlib_and_dynamic_multi(&[
+                (malloc_nid, SLOT_MALLOC_OFF as u64),
+                (memset_nid, SLOT_MEMSET_OFF as u64),
+                (map_nid, SLOT_MAP_OFF as u64),
+            ]);
+
+            let mut load_bytes = vec![0u8; 0x100];
+            write_malloc_memset_readback_stub(
+                &mut load_bytes,
+                0x0,
+                SLOT_MALLOC_OFF,
+                SLOT_MEMSET_OFF,
+                SCRATCH_OFF,
+                MALLOC_SIZE,
+                MEMSET_VALUE,
+            );
+
+            let elf = build_elf_with_entry(
+                ET_SCE_DYNAMIC,
+                0x0,
+                &[
+                    PhdrSpec { p_type: PT_LOAD, p_flags: 7, p_vaddr: 0, data: load_bytes },
+                    PhdrSpec { p_type: 0x6100_0000 /* PT_SCE_DYNLIBDATA */, p_flags: 4, p_vaddr: 0, data: dynlib_blob },
+                    PhdrSpec { p_type: PT_DYNAMIC, p_flags: 6, p_vaddr: 0x2000, data: dynamic_bytes },
+                ],
+            );
+
+            build_plaintext_self(&elf)
+        }
+
+        fn write_realistic_homebrew_sprx(dir: &Path, name: &str) -> PathBuf {
+            let bytes = build_realistic_homebrew_sprx();
+            let path = dir.join(name);
+            std::fs::write(&path, &bytes).expect("write synthetic realistic-homebrew .sprx to temp dir");
+            path
+        }
+
+        /// Part 2 "Direct" of the homebrew end-to-end proof: the Shell's
+        /// real `FirmwareLauncher::launch` (-> `load` -> `execute_linked`)
+        /// runs this realistic synthetic module to completion — a real
+        /// `malloc`, a real `memset`, and a real read-back all actually
+        /// happen through the genuine HLE registry and runtime, and the
+        /// linker resolves all three imports even though the guest entry
+        /// only calls two of them.
+        #[test]
+        fn realistic_homebrew_module_executes_malloc_memset_readback_through_firmware_launcher() {
+            let tmp =
+                std::env::temp_dir().join(format!("xps5x-gui-realistic-homebrew-direct-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp).expect("create temp dir");
+            let path = write_realistic_homebrew_sprx(&tmp, "eboot.bin");
+
+            let launcher = FirmwareLauncher::new();
+            let handle = launcher.launch(&LaunchTarget::Game { path }).expect("launch always returns a handle");
+
+            assert_eq!(launcher.session_state(&handle), SessionState::Running);
+            let detail = launcher.session_detail(&handle).expect("a ran session has detail text");
+            assert!(detail.starts_with("Executed — entry returned 0xab"), "unexpected message: {detail}");
+            assert!(detail.contains("3 HLE calls resolved"), "unexpected message: {detail}");
+            assert!(detail.contains("0 unresolved"), "unexpected message: {detail}");
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        /// Part 2 "Full scan→launch" of the homebrew end-to-end proof: the
+        /// same realistic module, written as `Games/<name>/eboot.bin` (with
+        /// an `xps5x-title.toml` alongside it), discovered by the Shell's
+        /// real `scan_dir`, then launched through `FirmwareLauncher` using
+        /// the discovered `LaunchTarget` exactly as the Shell's Play button
+        /// would — proving the entire path: discover on disk -> load -> run
+        /// -> outcome.
+        #[test]
+        fn realistic_homebrew_discovered_by_scan_dir_then_launched_through_firmware_launcher() {
+            let tmp = std::env::temp_dir().join(format!("xps5x-gui-realistic-homebrew-scan-{}", std::process::id()));
+            let game_dir = tmp.join("Games").join("realistic-homebrew-demo");
+            std::fs::create_dir_all(&game_dir).expect("create temp game dir");
+
+            let bytes = build_realistic_homebrew_sprx();
+            let eboot_path = game_dir.join("eboot.bin");
+            std::fs::write(&eboot_path, &bytes).expect("write synthetic realistic-homebrew .sprx to temp dir");
+            std::fs::write(game_dir.join("xps5x-title.toml"), "title = \"Realistic Homebrew Demo\"\n")
+                .expect("write optional title metadata");
+
+            let games_root = tmp.join("Games");
+            let items = crate::library::scan::scan_dir(&games_root);
+            assert_eq!(items.len(), 1, "scan_dir should discover exactly the one synthetic game folder");
+            let item = &items[0];
+            assert_eq!(item.title, "Realistic Homebrew Demo");
+            let LaunchTarget::Game { path } = &item.launch else {
+                panic!("expected a Game launch target");
+            };
+            assert_eq!(path, &eboot_path);
+
+            let launcher = FirmwareLauncher::new();
+            let handle = launcher.launch(&item.launch).expect("launch always returns a handle");
+
+            assert_eq!(launcher.session_state(&handle), SessionState::Running);
+            let detail = launcher.session_detail(&handle).expect("a ran session has detail text");
+            assert!(detail.starts_with("Executed — entry returned 0xab"), "unexpected message: {detail}");
+            assert!(detail.contains("3 HLE calls resolved"), "unexpected message: {detail}");
+            assert!(detail.contains("0 unresolved"), "unexpected message: {detail}");
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
     }
 }
