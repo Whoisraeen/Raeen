@@ -13,17 +13,22 @@ Surface: native eframe window (`xps5x.exe`), fullscreen-borderless, sized from
    working directory — it scans `Games/`, loads `themes/`, and writes a
    default `config.toml` if missing (don't commit that file). Wait ~6s
    (startup + ~2.1s boot animation).
-3. Focus guard before any keystrokes: `WScript.Shell.AppActivate($proc.Id)`,
-   then verify the app owns the foreground via Win32 `GetForegroundWindow` +
-   `GetWindowThreadProcessId`; abort if not, so keys can't land in another app.
-4. Drive with `[System.Windows.Forms.SendKeys]::SendWait`:
-   `{RIGHT}`/`{LEFT}` rail nav, `{ENTER}` launch, `c` control center, `{TAB}`
-   Games/Media tab, `{ESC}` back. Sleep 200–800ms after each so animations
-   settle (exponential easers, speed 6–12).
-5. Capture: `System.Drawing.Bitmap` + `Graphics.CopyFromScreen` over
-   `0,0,1920,1080`, save PNG to the scratchpad, then Read it. Crop a strip
-   with `Graphics.DrawImage` when you need pixel-accurate measurements.
-6. `Stop-Process` the app when done.
+3. Drive by posting key messages straight to the app's window handle — no
+   focus needed, and keys can never land in another app. (SendKeys +
+   AppActivate loses whenever the user is actively typing: Windows blocks
+   focus stealing.) `PostMessage(hwnd, WM_KEYDOWN/WM_KEYUP, vk, lParam)`
+   with the scancode from `MapVirtualKey` in lParam bits 16–23 and the
+   extended-key bit (24) set for arrows; hwnd from `$proc.MainWindowHandle`
+   after `$proc.Refresh()`. Keys: RIGHT/LEFT rail nav, RETURN launch, `C`
+   control center, TAB Games/Media tab, ESC back. Sleep 200–800ms after
+   each so animations settle (exponential easers, speed 6–12).
+4. Capture: `System.Drawing.Bitmap` + `Graphics.CopyFromScreen` over the
+   primary screen bounds, save PNG to the scratchpad, then Read it. Crop a
+   strip with `Graphics.DrawImage` when you need pixel-accurate
+   measurements. Window geometry claims (size/decorations) need no
+   screenshot at all: `GetClientRect` + `GetWindowLong(GWL_STYLE) &
+   WS_CAPTION` measure the window even when it's occluded.
+5. `Stop-Process` the app when done.
 
 Gotchas:
 - `Add-Type` Win32 wrapper types do NOT persist between PowerShell tool
