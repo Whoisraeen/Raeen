@@ -20,7 +20,7 @@ use xps5x_firmware::dynlib::{DynSymbol, DynlibData, SceRela};
 use xps5x_firmware::{HLE_TRAMPOLINE_BASE, HleTrampoline, LinkedModule, ModuleRegistry, SprxModule, SprxSegment, link_module};
 use xps5x_hle::{HleContext, HleRegistry};
 use xps5x_kernel::OrbisKernel;
-use xps5x_runtime::{GUEST_ARENA_BASE, RuntimeError, execute_linked};
+use xps5x_runtime::{GUEST_ARENA_BASE, RunOutcome, RuntimeError, execute_linked, execute_process};
 
 const R_X86_64_JUMP_SLOT: u64 = 7;
 
@@ -1354,5 +1354,266 @@ fn host_fsbase_is_restored_after_a_recovered_genuine_fault() {
         after, before,
         "host FS base must be restored even after a recovered genuine guest fault (RT1a path), not just on \
          ordinary return"
+    );
+}
+
+// --- Wall #1 (crt0 / process environment): W1a process stack + `_start`
+// entry, W1b `exit()` termination (design doc
+// `2026-07-13-xps5x-crt0-process-env-design.md` §6/§7) ---
+//
+// `execute_process` enters `_start` via a `jmp`, not a `call` (`stack.rs`'s
+// `enter_guest_at_start`), so the guest's first instruction sees `rsp`
+// pointing directly at `argc` -- no pushed return address for a plain `ret`
+// to safely pop. A hand-assembled `_start` therefore can't "return" a value
+// the way a function-mode stub (`execute_linked`'s tests, above) does: a
+// `ret` here would pop `argc` itself and jump to it as if it were code. This
+// is exactly the design doc's documented "malformed `_start`" case -- caught
+// by the existing RT1a genuine-fault recovery, not a new mechanism -- and it
+// doubles as this milestone's observation channel: jumping deliberately to
+// a value read off the process stack makes that value observable as
+// `RuntimeError::Faulted { addr }`, without inventing any new return path.
+
+/// Writes `mov rax, [rsp]` (`48 8B 04 24`) followed by `jmp rax` (`FF E0`)
+/// into `buf` at `entry_off`: reads `argc` off the process stack and jumps
+/// to it as an address, faulting (Rip == argc) -- the W1a "prove argc is
+/// ABI-correct" stub.
+fn write_start_read_argc_and_jump_stub(buf: &mut [u8], entry_off: usize) {
+    buf[entry_off..entry_off + 4].copy_from_slice(&[0x48, 0x8B, 0x04, 0x24]); // mov rax, [rsp]
+    buf[entry_off + 4..entry_off + 6].copy_from_slice(&[0xFF, 0xE0]); // jmp rax
+}
+
+/// Writes `mov rax, [rsp+8]` (`48 8B 44 24 08`), `movzx eax, byte [rax]`
+/// (`0F B6 00`), then `jmp rax` (`FF E0`) into `buf` at `entry_off`: reads
+/// `argv[0]`'s pointer off the process stack, loads that string's first
+/// byte, and jumps to it as an address, faulting (Rip == that byte) -- the
+/// W1a "prove the argv pointer table + strings are correct" stub.
+fn write_start_read_argv0_byte_and_jump_stub(buf: &mut [u8], entry_off: usize) {
+    buf[entry_off..entry_off + 5].copy_from_slice(&[0x48, 0x8B, 0x44, 0x24, 0x08]); // mov rax, [rsp+8]
+    buf[entry_off + 5..entry_off + 8].copy_from_slice(&[0x0F, 0xB6, 0x00]); // movzx eax, byte [rax]
+    buf[entry_off + 8..entry_off + 10].copy_from_slice(&[0xFF, 0xE0]); // jmp rax
+}
+
+/// W1a acceptance test, part 1 (design doc §6/§8): a hand-assembled `_start`
+/// stub reads `argc` from `[rsp]` and jumps to it as an address. With a
+/// single `argv` entry (`argc == 1`), that fault's `Rip` is observably `1` --
+/// proving `build_process_stack` + `enter_guest_at_start` deliver a real,
+/// ABI-correct `argc` at the guest's very first instruction.
+#[test]
+fn start_stub_observes_argc_equal_to_one_via_the_process_stack() {
+    const ENTRY_OFF: usize = 0x0;
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+    write_start_read_argc_and_jump_stub(&mut image, ENTRY_OFF);
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: ENTRY_OFF as u64,
+    };
+
+    let kernel = OrbisKernel::new();
+    let err = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[]).unwrap_err();
+    match err {
+        RuntimeError::Faulted { addr } => {
+            assert_eq!(addr, 1, "observed argc must equal 1 (a single argv entry was passed)");
+        }
+        other => panic!("expected Err(Faulted {{ .. }}), got {other:?}"),
+    }
+}
+
+/// W1a acceptance test, part 2 (design doc §6/§8): a hand-assembled `_start`
+/// stub reads `argv[0]` from `[rsp+8]`, loads that string's first byte, and
+/// jumps to it as an address. With `argv[0] == "/app/eboot.bin"`, that
+/// fault's `Rip` is observably `0x2F` (`'/'`) -- proving the argv pointer
+/// table and the strings it points to are both laid out correctly.
+#[test]
+fn start_stub_observes_argv0_first_byte_via_the_process_stack() {
+    const ENTRY_OFF: usize = 0x0;
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+    write_start_read_argv0_byte_and_jump_stub(&mut image, ENTRY_OFF);
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: ENTRY_OFF as u64,
+    };
+
+    let kernel = OrbisKernel::new();
+    let err = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[]).unwrap_err();
+    match err {
+        RuntimeError::Faulted { addr } => {
+            assert_eq!(addr, 0x2F, "observed argv[0][0] must equal '/' (0x2F)");
+        }
+        other => panic!("expected Err(Faulted {{ .. }}), got {other:?}"),
+    }
+}
+
+/// Writes `mov edi, code` (`BF <imm32>`) followed by `call qword ptr
+/// [rip+disp32]` (`FF 15 <disp32>`) into `buf` at `entry_off`, targeting the
+/// 8-byte trampoline slot at `slot_off`: sets up `exit(code)`'s SysV first
+/// integer argument register and calls through the trampoline slot. Nothing
+/// follows the `call` -- a terminating call never resumes the guest (design
+/// doc §4), so there is no "after" for this stub to reach.
+fn write_start_exit_stub(buf: &mut [u8], entry_off: usize, slot_off: usize, code: u32) {
+    let mut off = entry_off;
+
+    buf[off] = 0xBF; // mov edi, imm32
+    buf[off + 1..off + 5].copy_from_slice(&code.to_le_bytes());
+    off += 5;
+
+    let call_rip_after = off as i64 + 6;
+    let call_disp32 = (slot_off as i64 - call_rip_after) as i32;
+    buf[off] = 0xFF;
+    buf[off + 1] = 0x15;
+    buf[off + 2..off + 6].copy_from_slice(&call_disp32.to_le_bytes());
+}
+
+/// W1b acceptance test (design doc §6/§8): a hand-assembled `_start` stub
+/// calls `exit(0x2A)` through its HLE trampoline slot. `veh_callback`
+/// recognizes `libc::exit` as a terminating function (design doc §4) and
+/// performs the exit-longjmp instead of servicing-and-resuming, so
+/// `execute_process` returns `Ok(RunOutcome::Exited(0x2A))` -- not
+/// `Returned`, and not a hang. The trampoline entry is hand-built directly
+/// (as `call_to_unmapped_trampoline_index_returns_unresolved` above does),
+/// bypassing `link_module`, since this test only needs the VEH to resolve
+/// `(library, function) == ("libc", "exit")` at the guarded slot, not a full
+/// NID-based link. The process surviving is proven by making an entirely
+/// ordinary `execute_linked` call right after, in the same test.
+#[test]
+fn start_stub_calling_exit_returns_exited_with_the_given_code() {
+    const ENTRY_OFF: usize = 0x0;
+    const SLOT_OFF: usize = 0x10;
+    const EXIT_CODE: u32 = 0x2A;
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+    write_start_exit_stub(&mut image, ENTRY_OFF, SLOT_OFF, EXIT_CODE);
+    image[SLOT_OFF..SLOT_OFF + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        hle_trampolines: vec![HleTrampoline {
+            library: "libc".to_string(),
+            function: "exit".to_string(),
+            addr: HLE_TRAMPOLINE_BASE,
+        }],
+        entry: ENTRY_OFF as u64,
+    };
+
+    let kernel = OrbisKernel::new();
+    let outcome = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[]).expect("exit() must not fault");
+    assert_eq!(
+        outcome,
+        RunOutcome::Exited(EXIT_CODE as u64),
+        "execute_process must report the exit code passed to exit(), not a normal return"
+    );
+
+    // The process survived: an entirely ordinary execute_linked call, in
+    // this same test/thread, right after the exit-longjmp -- also proves
+    // `run`'s CALL_LOCK/ACTIVE_CONTEXT/VEH state was fully torn down and
+    // re-armed correctly, exactly like the RT1a fault-recovery test above.
+    let sentinel_hle = HleRegistry::new();
+    sentinel_hle.register("libtest", "sceTestSentinel", sentinel);
+    let import_nid = nid_of("sceTestSentinel");
+    let (module, dynlib) = build_synthetic_module(import_nid, 0x0, 0x10);
+    let db = NidDatabase::from_hle_names(sentinel_hle.registered_names());
+    let registry = ModuleRegistry::new(db);
+    let linked2 = link_module(&module, &dynlib, &registry, &sentinel_hle, GUEST_ARENA_BASE)
+        .expect("synthetic module links against the HLE-registered sentinel");
+
+    let sentinel_kernel = OrbisKernel::new();
+    let result = execute_linked(&linked2, &sentinel_hle, &sentinel_kernel, 0x0, &[])
+        .expect("native execution succeeds after an exit-longjmp");
+    assert_eq!(result, 0xC0DE, "trampoline dispatch still works normally after an exit-longjmp");
+}
+
+/// W1b regression (design doc §7): a `_start` that genuinely faults (not
+/// via the argc/argv-jump trick above, but a real wild dereference, mirroring
+/// the RT1a `execute_linked` test) must still return `Err(Faulted { .. })`
+/// through `execute_process`, exactly as it does through `execute_linked`.
+#[test]
+fn start_stub_wild_fault_still_recovers_as_faulted_through_execute_process() {
+    const ENTRY_OFF: usize = 0x0;
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+    // mov rax, [0]  -- a wild dereference of address 0, reliably unmapped.
+    image[ENTRY_OFF..ENTRY_OFF + 9].copy_from_slice(&[0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xC3]);
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: ENTRY_OFF as u64,
+    };
+
+    let kernel = OrbisKernel::new();
+    let err = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[]).unwrap_err();
+    match err {
+        RuntimeError::Faulted { addr } => {
+            assert_ne!(addr, 0, "Faulted::addr is the faulting Rip, a real mapped-image address");
+        }
+        other => panic!("expected Err(Faulted {{ .. }}), got {other:?}"),
+    }
+}
+
+/// W1b + RT2c-b interaction (design doc §7): the *host* FS base must be
+/// restored to its pre-call value after `execute_process` returns, exactly
+/// as `execute_linked` already guarantees (mirrors
+/// `host_fsbase_is_restored_after_execute_linked_returns` above) -- proving
+/// the exit-longjmp still reaches `run`'s shared fsbase-restore
+/// continuation (design doc §4's "keep the fsbase-restore/host-RSP
+/// discipline" requirement) rather than skipping it.
+#[test]
+fn execute_process_restores_host_fsbase_after_an_exit_longjmp() {
+    if !fsgsbase_available() {
+        println!("FSGSBASE not available on this CPU; skipping execute_process_restores_host_fsbase_after_an_exit_longjmp");
+        return;
+    }
+
+    const ENTRY_OFF: usize = 0x0;
+    const SLOT_OFF: usize = 0x10;
+    const EXIT_CODE: u32 = 7;
+
+    // SAFETY: `fsgsbase_available()` just returned `true` above.
+    let before = unsafe { read_host_fsbase() };
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+    write_start_exit_stub(&mut image, ENTRY_OFF, SLOT_OFF, EXIT_CODE);
+    image[SLOT_OFF..SLOT_OFF + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        hle_trampolines: vec![HleTrampoline {
+            library: "libc".to_string(),
+            function: "exit".to_string(),
+            addr: HLE_TRAMPOLINE_BASE,
+        }],
+        entry: ENTRY_OFF as u64,
+    };
+
+    let kernel = OrbisKernel::new();
+    let outcome = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[]).expect("exit() must not fault");
+    assert_eq!(outcome, RunOutcome::Exited(EXIT_CODE as u64));
+
+    // SAFETY: same as above.
+    let after = unsafe { read_host_fsbase() };
+    println!("execute_process_restores_host_fsbase_after_an_exit_longjmp: before={before:#x} after={after:#x}");
+    assert_eq!(
+        after, before,
+        "host FS base must be restored after execute_process returns, even via the exit-longjmp path"
     );
 }

@@ -20,6 +20,8 @@ mod arena;
 #[cfg(target_os = "windows")]
 mod dispatch;
 #[cfg(target_os = "windows")]
+mod process;
+#[cfg(target_os = "windows")]
 mod stack;
 #[cfg(target_os = "windows")]
 mod tls;
@@ -30,6 +32,22 @@ use thiserror::Error;
 use xps5x_firmware::LinkedModule;
 use xps5x_hle::HleRegistry;
 use xps5x_kernel::OrbisKernel;
+
+/// How a guest call ended (design doc §3/§4, wall #1): [`execute_linked`]'s
+/// function-mode calls only ever produce `Returned` (mapped straight to its
+/// `Ok(u64)` return), but [`execute_process`]'s `_start` entries can also end
+/// via `exit`/`exit_group`/`_exit` (or `sceKernelExit`), which surfaces as
+/// `Exited` instead of a normal return — `_start` never returns to its
+/// caller in a well-formed program, so `Exited` is the expected, honest way
+/// a process-mode run ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// The guest entry point returned normally; the value is its `RAX`.
+    Returned(u64),
+    /// The guest called a terminating function (`exit`-family); the value
+    /// is the exit code passed to it (SysV arg 0, i.e. `Rdi`).
+    Exited(u64),
+}
 
 /// The guest address space's fixed base (design doc §2/§3): a 4 GiB host
 /// region reserved at this exact address by [`arena::GuestArena`] (RT2 Task
@@ -145,30 +163,41 @@ pub fn execute_linked(
     // address `A`) and implements both `GuestMemory` and `GuestAllocator`
     // (see `arena.rs`).
     //
-    // SAFETY: `entry` is exactly the function pointer `dispatch::run`'s
-    // safety contract requires (a valid `sysv64` pointer into the
-    // `GuestArena` we just built); `module.hle_trampolines`, `hle`,
-    // `kernel`, and `arena` (as both `&dyn GuestMemory` and `&dyn
+    // SAFETY: `entry` is exactly the function pointer
+    // `call_on_guest_stack`'s safety contract requires (a valid `sysv64`
+    // pointer into the `GuestArena` we just built), called on
+    // `arena.stack_top()` (the 16-aligned top of `arena`'s own committed,
+    // writable stack region, RT2c-a, design doc §2/§4) — satisfying
+    // `dispatch::run`'s `call_guest` contract. `module.hle_trampolines`,
+    // `hle`, `kernel`, and `arena` (as both `&dyn GuestMemory` and `&dyn
     // GuestAllocator`) all outlive this call (borrowed for its entire
     // duration); `guard`'s region covers every address
     // `module.hle_trampolines` can resolve (it was sized from that same
-    // table, immediately above); `arena.stack_top()` is the 16-aligned top
-    // of `arena`'s own committed, writable stack region (RT2c-a, design doc
-    // §2/§4).
-    unsafe {
+    // table, immediately above).
+    let outcome = unsafe {
         dispatch::run(
-            entry,
-            padded,
             &module.hle_trampolines,
             hle,
             kernel,
             &arena,
             &arena,
             &guard,
-            arena.stack_top(),
             tcb,
+            // No inner `unsafe {}` here: this closure literal is written
+            // directly inside the `unsafe { dispatch::run(...) }` block
+            // below, so it's already inside that unsafe scope (rustc flags
+            // a nested one as `unused_unsafe`) — the SAFETY justification
+            // for this call is the comment on that outer block.
+            || crate::stack::call_on_guest_stack(entry, padded, arena.stack_top()),
         )
-    }
+    }?;
+    // Function-mode callers only ever care about the value: a bare `exit()`
+    // call from a synthetic stub is unusual but harmless here (design doc
+    // §4) — it surfaces as `Exited(code)`, which is treated exactly like an
+    // ordinary return of `code`.
+    Ok(match outcome {
+        RunOutcome::Returned(v) | RunOutcome::Exited(v) => v,
+    })
 }
 
 /// RT0 is Windows-first; a POSIX backend lands at a later milestone without
@@ -181,5 +210,92 @@ pub fn execute_linked(
     _entry_offset: u64,
     _args: &[u64],
 ) -> Result<u64, RuntimeError> {
+    Err(RuntimeError::MapFailed)
+}
+
+/// Run `module` as a real ELF process (design doc §2/§3, wall #1): build the
+/// initial `argc`/`argv`/`envp`/`auxv` process stack (§2) and enter
+/// `module.entry` as `_start` — no pushed return address, so the guest's
+/// first instruction sees `rsp` pointing at `argc` — servicing HLE trampoline
+/// calls exactly as [`execute_linked`] does. A well-formed `_start` never
+/// returns; it ends the program via `exit`/`exit_group`/`_exit`
+/// (`RunOutcome::Exited`, §4). A malformed `_start` that returns anyway, or
+/// that faults, is recovered as `Err(Faulted)` (RT1a) rather than crashing.
+///
+/// **Requirement:** same as [`execute_linked`] — `module` must have been
+/// linked with `link_module`'s `base` set to [`GUEST_ARENA_BASE`].
+#[cfg(target_os = "windows")]
+pub fn execute_process(
+    module: &LinkedModule,
+    hle: &HleRegistry,
+    kernel: &OrbisKernel,
+    argv: &[&str],
+    envp: &[&str],
+) -> Result<RunOutcome, RuntimeError> {
+    // RT0 single-active-execution invariant (design doc §4/§6/§9) — see
+    // `dispatch::CALL_LOCK`'s doc comment.
+    let _call_lock = dispatch::call_lock();
+
+    let arena = arena::GuestArena::new(&module.image)?;
+    let entry_ptr = arena.entry_ptr(module.entry)?;
+    let guard = trampoline::TrampolineGuard::reserve(module.hle_trampolines.len())?;
+
+    // RT2c-b (design doc §3): same honest-degradation TCB setup as
+    // `execute_linked` above.
+    let tcb = if tls::fsgsbase_available() { arena.setup_main_tcb() } else { None };
+
+    // Lay out the process stack in the arena's stack region (design doc §2);
+    // `process::build_process_stack` writes only through `&arena` (bounds-
+    // checked `GuestMemory`), never panicking on `argv`/`envp` content.
+    let process_rsp = process::build_process_stack(arena.stack_top(), argv, envp, &arena)?;
+
+    // SAFETY: same reasoning as `execute_linked`'s `entry` transmute above —
+    // `entry_ptr` is a host address inside `arena`'s `PAGE_EXECUTE_READWRITE`
+    // image sub-region, at `module.entry` (the ELF `e_entry`), which is the
+    // only thing this crate ever executes (design doc §6). This function
+    // pointer is never actually *called* with these six registers as
+    // arguments (a `_start` entry ignores them and reads `argc`/`argv`/
+    // `envp` off the stack instead) — see `stack::enter_guest_at_start`'s doc
+    // comment — but the same fn-pointer type is reused here for consistency
+    // with `execute_linked`, since `entry_ptr` (a `*const u8`) needs some
+    // callable type to become the address `enter_guest_at_start`'s asm jumps
+    // to.
+    let entry: unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+        unsafe { core::mem::transmute::<*const u8, _>(entry_ptr) };
+
+    // SAFETY: `entry` is exactly the function pointer
+    // `enter_guest_at_start`'s safety contract requires; `process_rsp` is the
+    // 16-aligned process-stack pointer `build_process_stack` just computed,
+    // inside `arena`'s own committed, writable stack region — satisfying
+    // `dispatch::run`'s `call_guest` contract. The remaining arguments carry
+    // the same safety argument as `execute_linked`'s call to `dispatch::run`
+    // above.
+    unsafe {
+        dispatch::run(
+            &module.hle_trampolines,
+            hle,
+            kernel,
+            &arena,
+            &arena,
+            &guard,
+            tcb,
+            // Same "no inner `unsafe {}`" note as `execute_linked`'s closure
+            // above — already inside the outer `unsafe { dispatch::run(...)
+            // }` block's scope.
+            || crate::stack::enter_guest_at_start(entry, process_rsp),
+        )
+    }
+}
+
+/// RT0 is Windows-first; a POSIX backend lands at a later milestone without
+/// changing this signature (design doc §7/§9).
+#[cfg(not(target_os = "windows"))]
+pub fn execute_process(
+    _module: &LinkedModule,
+    _hle: &HleRegistry,
+    _kernel: &OrbisKernel,
+    _argv: &[&str],
+    _envp: &[&str],
+) -> Result<RunOutcome, RuntimeError> {
     Err(RuntimeError::MapFailed)
 }

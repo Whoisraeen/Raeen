@@ -155,3 +155,103 @@ pub(crate) unsafe fn call_on_guest_stack(
 
     result
 }
+
+/// Enter `entry` as a process's `_start` (design doc §3, wall #1 W1a): set
+/// `rsp = process_rsp` and transfer control with a **`jmp`, not a `call`** —
+/// no return address is pushed, so `entry`'s very first instruction sees
+/// `[rsp]` exactly as `process_rsp` left it (`argc`, per
+/// [`crate::process::build_process_stack`]'s layout), matching what a real
+/// kernel-invoked `_start` observes.
+///
+/// # Safety
+/// - `entry` must be a valid function pointer into mapped, executable guest
+///   code (the same contract [`call_on_guest_stack`]'s `entry` parameter
+///   carries), even though it is never actually *called* with SysV register
+///   arguments — see the control-flow note below for why its Rust type is
+///   reused as-is regardless.
+/// - `process_rsp` must be a **16-byte-aligned** address pointing at the top
+///   of a fully-built process stack inside a committed, writable memory
+///   region — exactly [`crate::process::build_process_stack`]'s return
+///   value. 16-alignment matters because, unlike `call_on_guest_stack`, no
+///   `call` here pushes an 8-byte return address to shift it to `8 mod 16`:
+///   `_start`'s ABI requires `rsp ≡ 0 mod 16` at its very first instruction,
+///   so `process_rsp` must already be exactly that.
+/// - Must be called with `dispatch::CALL_LOCK` held (as `execute_process`
+///   does), for the same [`HOST_RSP_SLOT`] reentrancy reason as
+///   `call_on_guest_stack`.
+///
+/// # Control flow (why a `jmp`, and why the "restore" line is unreachable)
+///
+/// A well-formed `_start` never returns to this function at all: it ends the
+/// program via `exit`/`exit_group`/`_exit`, which `dispatch::veh_callback`
+/// recognizes and answers with the *same* `RtlCaptureContext`-based longjmp
+/// RT1a uses for a genuine fault (design doc §4) — that longjmp overwrites
+/// the OS-delivered `CONTEXT` with the snapshot `dispatch::run` captured
+/// *before* this function was ever called, so execution resumes directly
+/// inside `run`, never passing back through this function's own asm at all.
+/// A malformed `_start` that instead executes a plain `ret` doesn't return
+/// here either: `ret` pops `[rsp]` (which holds `argc`, not a return
+/// address this function ever pushed — there is none, by design, since this
+/// is a `jmp`) and jumps to *that* value as if it were code, which reliably
+/// faults on essentially any real `argc`/pointer value; that fault is then
+/// recovered the same RT1a way. So the `mov rsp, [rip + slot]` line below,
+/// immediately after the `jmp`, is unreachable in every path this runtime
+/// actually exercises — it exists purely as defense in depth (design doc
+/// §3: "the asm itself may simply also restore-on-return for the malformed
+/// case"), so that even a control-flow path nobody has anticipated still
+/// can't leave the *host* `rsp` pointing into guest memory. Because it's a
+/// `jmp` (not a `call`), `entry`'s incoming SysV argument registers are
+/// never set up — a real `_start` reads `argc`/`argv`/`envp` off the stack,
+/// not out of registers, exactly like a kernel-invoked entry would.
+///
+/// `clobber_abi("sysv64")` is kept for the same reason as
+/// `call_on_guest_stack`: the guest can do anything to the caller-saved
+/// register/XMM set before it (if ever) reaches the unreachable tail below.
+pub(crate) unsafe fn enter_guest_at_start(
+    entry: unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> u64,
+    process_rsp: u64,
+) -> u64 {
+    debug_assert_eq!(process_rsp % 16, 0, "process_rsp must be 16-byte aligned (_start ABI)");
+
+    // Function pointers aren't directly usable as `asm!` register operands;
+    // `entry as usize` is the address value the `jmp` below needs. This is a
+    // plain integer cast of a function pointer, not a dereference.
+    let entry_addr = entry as usize;
+    let result: u64;
+
+    // SAFETY: see this function's doc comment for the full ABI/control-flow
+    // argument. Register usage:
+    //  - `{entry_reg}`/`{guest_rsp}`: compiler-chosen scratch registers
+    //    holding `entry`'s address and `process_rsp`; both are consumed by
+    //    the `mov rsp, ...`/`jmp` sequence and need not survive it.
+    //  - rax: only meaningful if the unreachable tail is somehow reached
+    //    (see the doc comment); bound as `lateout` so the compiler doesn't
+    //    assume it holds a valid value on the (never-taken) fallthrough.
+    //  - No general-purpose register carries the host RSP across the `jmp`
+    //    — saved to / restored from the RIP-relative static [`HOST_RSP_SLOT`]
+    //    exactly like `call_on_guest_stack`.
+    unsafe {
+        asm!(
+            // Save the host RSP before switching stacks, RIP-relative (no
+            // GP register) — same reasoning as `call_on_guest_stack`.
+            "mov qword ptr [rip + {slot}], rsp",
+            // Switch to the process stack. `process_rsp` is 16-aligned (see
+            // this function's `debug_assert!` and doc comment) and points at
+            // `argc`, per `_start`'s ABI.
+            "mov rsp, {guest_rsp}",
+            // Transfer control WITHOUT pushing a return address: `entry`'s
+            // first instruction sees `[rsp] == argc`, unperturbed.
+            "jmp {entry_reg}",
+            // Unreachable on every path this runtime exercises (see this
+            // function's doc comment) — present only as defense in depth.
+            "mov rsp, qword ptr [rip + {slot}]",
+            slot = sym HOST_RSP_SLOT,
+            guest_rsp = in(reg) process_rsp,
+            entry_reg = in(reg) entry_addr,
+            lateout("rax") result,
+            clobber_abi("sysv64"),
+        );
+    }
+
+    result
+}

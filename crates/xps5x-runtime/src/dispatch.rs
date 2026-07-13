@@ -59,7 +59,27 @@ use xps5x_hle::{GuestAllocator, GuestMemory, HleContext, HleRegistry};
 use xps5x_kernel::OrbisKernel;
 
 use crate::RuntimeError;
+use crate::RunOutcome;
 use crate::trampoline::{self, TrampolineGuard};
+
+/// The `(library, function)` set that ends a process-mode run instead of
+/// being serviced-and-resumed like an ordinary HLE call (design doc §4, wall
+/// #1 W1b): `_start` ends the program by calling one of these, and never
+/// returns to its caller in a well-formed program. `veh_callback` recognizes
+/// a resolved trampoline call against this table *before* dispatching to
+/// `hle.call`, and answers it with the exit-longjmp instead (see
+/// [`veh_callback`]'s doc comment).
+const TERMINATING_FUNCTIONS: &[(&str, &str)] = &[
+    ("libc", "exit"),
+    ("libc", "exit_group"),
+    ("libc", "_exit"),
+    ("libkernel", "sceKernelExit"),
+];
+
+/// Whether `(library, function)` names a [`TERMINATING_FUNCTIONS`] entry.
+fn is_terminating(library: &str, function: &str) -> bool {
+    TERMINATING_FUNCTIONS.iter().any(|&(l, f)| l == library && f == function)
+}
 
 /// Serializes [`crate::execute_linked`] end to end: RT0 supports exactly
 /// one active native guest execution at a time (design doc §4/§6/§9 —
@@ -145,6 +165,23 @@ struct ActiveContext {
     /// (which runs on both arrivals). Same "must live in `ctx`, not a local
     /// carried across `RtlCaptureContext`" reasoning as `orig_fsbase` above.
     tls_active: Cell<bool>,
+    /// Set by `veh_callback` (design doc §4, wall #1 W1b) when a resolved
+    /// trampoline call targets a [`TERMINATING_FUNCTIONS`] entry, alongside
+    /// `exited`, just before it performs the same `recovery_ctx` longjmp the
+    /// genuine-fault path uses. Lives here — not a plain local in `run` —
+    /// for the exact same "must survive a register-only context restore"
+    /// reason `resumed`/`orig_fsbase` do (see `resumed`'s doc comment):
+    /// `veh_callback` writes it *before* the longjmp, and `run` reads it
+    /// only after control has already jumped back to the recovery point.
+    exit_code: Cell<u64>,
+    /// Set to `true` by `veh_callback` alongside `exit_code`, immediately
+    /// before the exit-longjmp (design doc §4). `run`'s shared continuation
+    /// checks this *first* (before `error`) on the resumed arrival: a
+    /// terminating call and a genuine fault are mutually exclusive —
+    /// `veh_callback` only ever sets one of `exited`/`error` for a given
+    /// call — but checking `exited` first matches the design doc's
+    /// documented arrival order exactly.
+    exited: Cell<bool>,
 }
 
 /// `AtomicPtr<T>` is `Send + Sync` regardless of `T` — see `CALL_LOCK`'s doc
@@ -152,41 +189,47 @@ struct ActiveContext {
 /// is guaranteed here despite that.
 static ACTIVE_CONTEXT: AtomicPtr<ActiveContext> = AtomicPtr::new(ptr::null_mut());
 
-/// Call `entry` (a mapped guest function) with `args`, servicing any HLE
-/// trampoline calls it makes via a VEH for the duration of the call (design
-/// doc §2).
+/// Call the guest — via `call_guest`, invoked exactly once — servicing any
+/// HLE trampoline calls it makes via a VEH for the duration of the call
+/// (design doc §2), and distinguishing three ways that call can end: a
+/// normal return (`RunOutcome::Returned`), the guest calling a terminating
+/// function like `exit` (`RunOutcome::Exited`, design doc §4, wall #1 W1b),
+/// or a genuine fault (`Err(Faulted)`, RT1a). `execute_linked` (function
+/// mode, via [`crate::stack::call_on_guest_stack`]) and `execute_process`
+/// (process mode `_start` entry, via
+/// [`crate::stack::enter_guest_at_start`]) both funnel through this single
+/// function so the fault-recovery/exit-longjmp machinery below is never
+/// duplicated (design doc §8).
 ///
 /// # Safety
-/// `entry` must be a valid function pointer, callable with the
-/// `extern "sysv64"` calling convention, into memory the caller mapped
-/// specifically so it can be executed (i.e. a live
-/// [`crate::arena::GuestArena`]'s image sub-region) — calling it runs that
-/// code natively on the current thread. `trampolines`, `hle`, `kernel`, `mem`,
-/// and `alloc` must outlive this call (guaranteed by `execute_linked`'s
-/// borrows). `guard` must be the [`TrampolineGuard`] whose region covers
-/// every address `trampolines` resolves. `guest_rsp_top` must be a
-/// 16-byte-aligned address that is the top of a committed, writable region
-/// big enough to serve as `entry`'s stack (i.e.
-/// [`crate::arena::GuestArena::stack_top`]) — see
-/// [`crate::stack::call_on_guest_stack`]'s doc comment for the full
-/// RSP-switch contract. `tcb`, if `Some`, is the guest TCB address (from
+/// `call_guest` must, when called, transfer control to mapped guest code the
+/// caller set up specifically so it can be executed (i.e. a live
+/// [`crate::arena::GuestArena`]'s image sub-region) exactly as
+/// `call_on_guest_stack`'s or `enter_guest_at_start`'s own safety contract
+/// requires, and return the value that should surface as
+/// `RunOutcome::Returned` on a normal, non-terminating, non-faulting return.
+/// It must be safe to call exactly once, synchronously, on this thread, for
+/// the duration this function's VEH and RT1a recovery point are armed (both
+/// are set up before it is called, and torn down/read only after it
+/// returns). `trampolines`, `hle`, `kernel`, `mem`, and `alloc` must outlive
+/// this call (guaranteed by `execute_linked`/`execute_process`'s borrows).
+/// `guard` must be the [`TrampolineGuard`] whose region covers every address
+/// `trampolines` resolves. `tcb`, if `Some`, is the guest TCB address (from
 /// [`crate::arena::GuestArena::setup_main_tcb`]) to point the FS base at for
 /// the duration of the guest call (RT2c-b, design doc §3); `None` means TLS
 /// isn't set up for this call (e.g. FSGSBASE unavailable), in which case no
 /// fsbase instruction is ever executed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run(
-    entry: unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> u64,
-    args: [u64; 6],
     trampolines: &[HleTrampoline],
     hle: &HleRegistry,
     kernel: &OrbisKernel,
     mem: &dyn GuestMemory,
     alloc: &dyn GuestAllocator,
     guard: &TrampolineGuard,
-    guest_rsp_top: u64,
     tcb: Option<u64>,
-) -> Result<u64, RuntimeError> {
+    call_guest: impl FnOnce() -> u64,
+) -> Result<RunOutcome, RuntimeError> {
     // Serialization (only one native guest execution at a time, RT0) is
     // provided by the caller: `execute_linked` holds `call_lock()` for its
     // entire pipeline, not just this call — see `CALL_LOCK`'s doc comment.
@@ -245,6 +288,8 @@ pub(crate) unsafe fn run(
         recovery_ctx: &recovery_ctx as *const CONTEXT,
         orig_fsbase: Cell::new(0),
         tls_active: Cell::new(false),
+        exit_code: Cell::new(0),
+        exited: Cell::new(false),
     };
 
     // SAFETY: `veh_callback` has the `unsafe extern "system" fn(*mut
@@ -327,30 +372,37 @@ pub(crate) unsafe fn run(
                 crate::tls::write_fsbase(tcb.expect("tls_active implies tcb.is_some()"));
             }
         }
-        // SAFETY: `entry` is a valid `sysv64` function pointer into mapped,
-        // executable guest code per this function's safety contract. The
-        // VEH is armed (just above) for the entire duration of this call,
-        // so any guest `call [import_slot]` into the guarded trampoline
-        // region is trapped and serviced by `veh_callback`, and any
-        // genuine wild fault is recovered via the `RtlCaptureContext`
-        // snapshot just taken above, rather than crashing the process.
+        // SAFETY: `call_guest`'s contract (this function's `# Safety`
+        // section) guarantees it transfers control to mapped, executable
+        // guest code exactly as `call_on_guest_stack`'s/
+        // `enter_guest_at_start`'s own safety contract requires. The VEH is
+        // armed (just above) for the entire duration of this call, so any
+        // guest `call [import_slot]` into the guarded trampoline region is
+        // trapped and serviced by `veh_callback`, and any genuine wild fault
+        // is recovered via the `RtlCaptureContext` snapshot just taken
+        // above, rather than crashing the process.
         //
-        // `entry` now runs on the guest's own stack (`guest_rsp_top`),
-        // switched to and back by `call_on_guest_stack`, instead of directly
-        // on this (host) stack — this does not change the recovery argument
-        // above: `recovery_ctx` was captured with the *host* RSP before this
-        // switch ever happens, so a genuine fault still restores the host
-        // RSP and abandons the guest stack entirely (`call_on_guest_stack`'s
-        // own doc comment covers the RSP-switch mechanism itself — including
-        // why its host-RSP save/restore survives the guest clobbering any
-        // register; see this module's doc comment for the full compatibility
-        // argument).
-        let r = unsafe { crate::stack::call_on_guest_stack(entry, args, guest_rsp_top) };
-        // Returned normally: no genuine fault occurred on this call.
-        // Disarm so `resumed` doesn't linger set for no reason (it's about
-        // to be dropped along with `ctx` regardless, but this keeps the
-        // invariant "armed only while the guest call is actually in
-        // flight" honest).
+        // `entry` runs on the guest's own stack, switched to and back (or,
+        // for a process-mode `_start` entry, never back at all on a
+        // well-formed run — see `enter_guest_at_start`'s doc comment) by
+        // whichever of `call_on_guest_stack`/`enter_guest_at_start`
+        // `call_guest` wraps, instead of directly on this (host) stack —
+        // this does not change the recovery argument above: `recovery_ctx`
+        // was captured with the *host* RSP before this switch ever happens,
+        // so a genuine fault (or an exit-longjmp) still restores the host
+        // RSP and abandons the guest stack entirely.
+        //
+        // Note: invoking `call_guest` here is an ordinary (safe-typed)
+        // closure call — the `unsafe` obligations described above are
+        // discharged by whichever `unsafe { crate::stack::... }` block the
+        // caller built the closure from (see `execute_linked`/
+        // `execute_process`), not by this call site itself.
+        let r = call_guest();
+        // Returned normally: no genuine fault or exit-longjmp occurred on
+        // this call. Disarm so `resumed` doesn't linger set for no reason
+        // (it's about to be dropped along with `ctx` regardless, but this
+        // keeps the invariant "armed only while the guest call is actually
+        // in flight" honest).
         ctx.resumed.set(false);
         r
     };
@@ -376,9 +428,20 @@ pub(crate) unsafe fn run(
         RemoveVectoredExceptionHandler(handle);
     }
 
+    // Design doc §4: on the resumed arrival, an exit-family termination is
+    // checked first, then a genuine fault; only the arrival that actually
+    // fell out of `call_guest` normally reaches the ordinary-return arm.
+    // `veh_callback` only ever sets one of `ctx.exited`/`ctx.error` for a
+    // given call (the exit-longjmp and the fault-recovery longjmp are
+    // mutually exclusive outcomes of the same guarded call), so the order
+    // between the first two arms doesn't change behavior — it's written
+    // this way to match the design doc's documented arrival order exactly.
+    if ctx.exited.get() {
+        return Ok(RunOutcome::Exited(ctx.exit_code.get()));
+    }
     match ctx.error.take() {
         Some(err) => Err(err),
-        None => Ok(result),
+        None => Ok(RunOutcome::Returned(result)),
     }
 }
 
@@ -460,6 +523,31 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
 
     let result = match trampoline::resolve(fault_addr, trampolines) {
         Some(t) => {
+            if is_terminating(&t.library, &t.function) {
+                // Design doc §4 (wall #1 W1b): `_start` ends the program by
+                // calling `exit`/`exit_group`/`_exit` (or `sceKernelExit`) —
+                // read the exit code from SysV arg 0 (`Rdi`), record it plus
+                // the `exited` flag in `ctx` (memory, returns-twice-safe —
+                // see `ActiveContext::exited`'s doc comment), then perform
+                // the *same* longjmp the genuine-fault path below uses:
+                // overwrite the delivered context with `run`'s pre-call
+                // `RtlCaptureContext` snapshot and resume there, instead of
+                // servicing this call and resuming the guest. `run`
+                // distinguishes this arrival from a genuine fault by
+                // checking `ctx.exited` first.
+                ctx.exit_code.set(context.Rdi);
+                ctx.exited.set(true);
+
+                // SAFETY: same reasoning as the genuine-fault restore below
+                // — `ctx.recovery_ctx` points at a still-live stack local in
+                // `run`'s frame, necessarily below this callback on the same
+                // thread's stack (vectored exceptions are delivered
+                // synchronously on the faulting thread). `CONTEXT` is
+                // `Copy`, so this is a plain struct copy.
+                *context = unsafe { *ctx.recovery_ctx };
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+
             // SysV integer argument registers (design doc §3).
             let args = [context.Rdi, context.Rsi, context.Rdx, context.Rcx, context.R8, context.R9];
             let hle_ctx = HleContext { kernel, mem, alloc };
