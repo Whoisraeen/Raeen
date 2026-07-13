@@ -61,6 +61,7 @@ fn build_synthetic_module(import_nid: u64, entry_off: usize, slot_off: usize) ->
         dynlib_data: None,
         relro: None,
         dynamic: None,
+        entry: entry_off as u64,
     };
 
     let dynlib = DynlibData {
@@ -130,6 +131,7 @@ fn call_to_unmapped_trampoline_index_returns_unresolved() {
         base: 0,
         unresolved: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: ENTRY_OFF as u64,
     };
 
     let err = execute_linked(&linked, &hle, ENTRY_OFF as u64, &[]).unwrap_err();
@@ -147,6 +149,7 @@ fn more_than_six_args_is_rejected() {
         base: 0,
         unresolved: Vec::new(),
         hle_trampolines: Vec::new(),
+        entry: 0,
     };
 
     let args = [1u64, 2, 3, 4, 5, 6, 7];
@@ -180,6 +183,7 @@ fn genuine_wild_fault_recovers_as_faulted_then_process_keeps_running() {
         base: 0,
         unresolved: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: ENTRY_OFF as u64,
     };
 
     let err = execute_linked(&linked, &hle, ENTRY_OFF as u64, &[]).unwrap_err();

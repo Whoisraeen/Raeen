@@ -19,6 +19,7 @@ xps5x-io = { workspace = true }
 xps5x-input = { workspace = true }
 xps5x-hle = { workspace = true }
 xps5x-firmware = { workspace = true }
+xps5x-runtime = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 image = { workspace = true }
