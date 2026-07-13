@@ -47,6 +47,14 @@ pub fn parse_slb2(data: &[u8]) -> Result<Vec<Slb2Entry>, FirmwareError> {
 
     let file_count = u32::from_le_bytes(data[0x0C..0x10].try_into().unwrap()) as usize;
 
+    // A valid container's entry table must fit within the data we were given.
+    // Guard against a malformed `file_count` (attacker-controlled, read from
+    // the header) driving a huge pre-allocation that would abort the process.
+    let max_entries = (data.len() - SLB2_HEADER_SIZE) / SLB2_ENTRY_SIZE;
+    if file_count > max_entries {
+        return Err(FirmwareError::PupEntryOutOfBounds { index: max_entries });
+    }
+
     let mut entries = Vec::with_capacity(file_count);
     for index in 0..file_count {
         let base = SLB2_HEADER_SIZE + index * SLB2_ENTRY_SIZE;
@@ -114,6 +122,20 @@ mod tests {
         assert!(matches!(
             parse_slb2(&buf),
             Err(FirmwareError::PupEntryOutOfBounds { index: 0 })
+        ));
+    }
+
+    #[test]
+    fn rejects_absurd_file_count_without_aborting() {
+        // Valid magic but a malformed, attacker-controlled file_count that far
+        // exceeds what the buffer can hold. Must return a clean error rather
+        // than pre-allocating ~170 GB and aborting the process.
+        let mut buf = vec![0u8; 0x20];
+        buf[0..4].copy_from_slice(b"SLB2");
+        buf[0x0C..0x10].copy_from_slice(&u32::MAX.to_le_bytes()); // file_count = 0xFFFFFFFF
+        assert!(matches!(
+            parse_slb2(&buf),
+            Err(FirmwareError::PupEntryOutOfBounds { .. })
         ));
     }
 }
