@@ -13,7 +13,7 @@
 //! bounds-checking every offset/size against the buffer — malformed or
 //! truncated input returns a [`FirmwareError`], never panics.
 
-use goblin::elf::program_header::{ProgramHeader, PT_LOAD};
+use goblin::elf::program_header::{ProgramHeader, PT_DYNAMIC, PT_LOAD};
 use tracing::{debug, info, warn};
 use xps5x_core::error::FirmwareError;
 
@@ -59,6 +59,10 @@ pub struct SprxModule {
     pub dynlib_data: Option<Vec<u8>>,
     /// The `PT_SCE_RELRO` segment, if present.
     pub relro: Option<SprxSegment>,
+    /// Raw `PT_DYNAMIC` segment bytes, if present — the `Elf64_Dyn` array
+    /// consumed by [`crate::dynlib::parse_sce_dynamic`] to locate the
+    /// string/symbol/relocation tables within `dynlib_data`.
+    pub dynamic: Option<Vec<u8>>,
 }
 
 /// Parse a plaintext inner ELF into an [`SprxModule`].
@@ -92,6 +96,7 @@ pub fn parse_sprx(elf: &[u8]) -> Result<SprxModule, FirmwareError> {
     let mut segments = Vec::new();
     let mut dynlib_data = None;
     let mut relro = None;
+    let mut dynamic = None;
     let mut has_module_param = false;
 
     for phdr in &parsed.program_headers {
@@ -129,6 +134,13 @@ pub fn parse_sprx(elf: &[u8]) -> Result<SprxModule, FirmwareError> {
                     mem_size: phdr.p_memsz,
                 });
             }
+            PT_DYNAMIC => {
+                debug!(
+                    "  PT_DYNAMIC: offset={:#x} size={:#x}",
+                    phdr.p_offset, phdr.p_filesz
+                );
+                dynamic = Some(slice_phdr(elf, phdr, "PT_DYNAMIC")?);
+            }
             PT_SCE_MODULE_PARAM => {
                 // TODO(LM1+): decode SceModuleParam to extract the real
                 // module name string; for now we only note its presence.
@@ -157,6 +169,7 @@ pub fn parse_sprx(elf: &[u8]) -> Result<SprxModule, FirmwareError> {
         segments,
         dynlib_data,
         relro,
+        dynamic,
     })
 }
 
@@ -269,6 +282,47 @@ mod tests {
         assert_eq!(module.segments[0].flags, 5);
         assert_eq!(module.dynlib_data, Some(dynlib_blob));
         assert_eq!(module.relro, None);
+        assert_eq!(module.dynamic, None);
+    }
+
+    #[test]
+    fn dynamic_segment_is_captured() {
+        let load_bytes = vec![0xAAu8; 16];
+        let dynlib_blob = vec![0x01, 0x02];
+        // A minimal synthetic Elf64_Dyn array: one (d_tag, d_val) pair
+        // followed by DT_NULL. Not a real firmware fragment.
+        let mut dynamic_bytes = Vec::new();
+        dynamic_bytes.extend_from_slice(&0x6100_0035u64.to_le_bytes()); // DT_SCE_STRTAB
+        dynamic_bytes.extend_from_slice(&0u64.to_le_bytes());
+        dynamic_bytes.extend_from_slice(&0u64.to_le_bytes()); // DT_NULL
+        dynamic_bytes.extend_from_slice(&0u64.to_le_bytes());
+
+        let elf = build_elf(
+            ET_SCE_DYNAMIC,
+            &[
+                PhdrSpec {
+                    p_type: PT_LOAD,
+                    p_flags: 5,
+                    p_vaddr: 0x1000,
+                    data: load_bytes,
+                },
+                PhdrSpec {
+                    p_type: PT_SCE_DYNLIBDATA,
+                    p_flags: 4,
+                    p_vaddr: 0,
+                    data: dynlib_blob,
+                },
+                PhdrSpec {
+                    p_type: PT_DYNAMIC,
+                    p_flags: 6,
+                    p_vaddr: 0x4000,
+                    data: dynamic_bytes.clone(),
+                },
+            ],
+        );
+
+        let module = parse_sprx(&elf).expect("valid synthetic ELF with PT_DYNAMIC parses");
+        assert_eq!(module.dynamic, Some(dynamic_bytes));
     }
 
     #[test]
