@@ -2,22 +2,46 @@
 //! (design doc §2/§4), plus [`run`], which arms it around a single native
 //! call into mapped guest code.
 //!
-//! # Genuine faults are not (yet) converted to `RuntimeError::Faulted`
+//! # Genuine-fault recovery (RT1a)
 //!
-//! The VEH only ever resumes execution for `EXCEPTION_ACCESS_VIOLATION`s
-//! whose faulting address lands inside the active trampoline guard region
-//! (a `call` through an HLE-resolved import slot). Any other exception —
-//! including a genuine wild guest fault — is passed on with
-//! `EXCEPTION_CONTINUE_SEARCH` and is *not* swallowed or silently converted
-//! into a `Faulted` return: doing that safely for an arbitrary faulting
-//! program counter would require a saved recovery point (a
-//! setjmp/longjmp-equivalent host register snapshot taken before calling
-//! the guest, restored on fault) that RT0 does not implement yet, because
-//! rebuilding it correctly on top of Rust's own stack/unwind machinery is
-//! its own piece of delicate `unsafe` work. `RuntimeError::Faulted` is kept
-//! in the public API for callers to already match on; wiring it up is
-//! deferred to a later milestone (see the design doc §7 RT1/RT2 notes and
-//! the crate-level module docs).
+//! A guest fault *outside* the trampoline guard region — a genuine wild
+//! access violation, not an HLE call — is recovered as `Err(Faulted { addr
+//! })` instead of crashing the process. This is Windows' setjmp/longjmp
+//! equivalent, built from `RtlCaptureContext` plus a manual `CONTEXT`
+//! overwrite (the same "edit the delivered `CONTEXT` and
+//! `EXCEPTION_CONTINUE_EXECUTION`" mechanism the trampoline path below
+//! already uses, just with a much bigger jump):
+//!
+//! 1. Before calling the guest, [`run`] calls `RtlCaptureContext` to
+//!    snapshot the calling thread's *entire* register state — Rip, Rsp,
+//!    Rbp, every GPR — into a stack-local `CONTEXT` (`recovery_ctx`). This
+//!    is the recovery point: "the state of this thread right before it
+//!    called the guest."
+//! 2. `run` stores a pointer to `recovery_ctx` in [`ActiveContext`], then
+//!    calls `entry(...)`.
+//! 3. If `entry` faults genuinely (access violation outside the guard
+//!    region), [`veh_callback`] records `RuntimeError::Faulted { addr:
+//!    context.Rip }`, copies `*recovery_ctx` over the OS-delivered
+//!    `ContextRecord` (a plain struct copy — `CONTEXT` is `Copy`), and
+//!    returns `EXCEPTION_CONTINUE_EXECUTION`. The OS then resumes the
+//!    faulting thread with *that* (restored) register state, which lands
+//!    it back at the exact instruction after step 1's `RtlCaptureContext`
+//!    call — i.e. exactly as if `entry(...)` had "returned" — discarding
+//!    every stack frame `entry()` (and anything it called) pushed below
+//!    that point.
+//! 4. `run` distinguishes this "resumed after a fault" arrival from the
+//!    original "about to call the guest" arrival using
+//!    `ActiveContext::resumed`, a `Cell<bool>` armed immediately before the
+//!    guest call. A register-only context restore never touches memory, so
+//!    this `Cell` (ordinary host stack memory) reliably survives the jump
+//!    and tells the two arrivals apart — see `run`'s doc comment for the
+//!    full control-flow argument.
+//!
+//! Servicing an HLE trampoline call (the pre-existing mechanism, unchanged)
+//! never touches `recovery_ctx`/`resumed` and never restores; it only
+//! happens for faults *inside* the guard region. Non-access-violation
+//! exceptions are still passed on with `EXCEPTION_CONTINUE_SEARCH`,
+//! unchanged.
 
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
@@ -26,8 +50,8 @@ use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
-    RemoveVectoredExceptionHandler,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+    EXCEPTION_POINTERS, RemoveVectoredExceptionHandler, RtlCaptureContext,
 };
 
 use xps5x_firmware::HleTrampoline;
@@ -36,14 +60,29 @@ use xps5x_hle::HleRegistry;
 use crate::RuntimeError;
 use crate::trampoline::{self, TrampolineGuard};
 
-/// Serializes calls to [`run`] (and thus [`crate::execute_linked`]): RT0
-/// supports exactly one active native guest execution at a time (design doc
-/// §4/§6/§9 — "RT0 is single-threaded-execution"). Held for the *entire*
-/// duration of the guest call, setup through teardown; that's also what
-/// makes `ACTIVE_CONTEXT` below safe to touch from the VEH without a lock of
-/// its own — only one OS thread is ever "inside" a guarded call at a time,
-/// and the VEH only ever runs synchronously on that same thread.
+/// Serializes [`crate::execute_linked`] end to end: RT0 supports exactly
+/// one active native guest execution at a time (design doc §4/§6/§9 —
+/// "RT0 is single-threaded-execution"). [`call_lock`] is acquired by
+/// `execute_linked` itself (not just around the guest call in [`run`]),
+/// because `TrampolineGuard::reserve`'s fixed-address `VirtualAlloc` (in
+/// `trampoline.rs`) is process-global state just as much as `run`'s guest
+/// call is — two concurrent `execute_linked` calls racing to reserve the
+/// same fixed `HLE_TRAMPOLINE_BASE` region would spuriously fail with
+/// `MapFailed`, lock or no lock inside `run` alone. Holding it for the
+/// whole pipeline is also what makes `ACTIVE_CONTEXT` below safe to touch
+/// from the VEH without a lock of its own — only one OS thread is ever
+/// "inside" a guarded call at a time, and the VEH only ever runs
+/// synchronously on that same thread.
 static CALL_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire [`CALL_LOCK`] for the entire [`crate::execute_linked`] pipeline.
+/// Called once, at the very top of `execute_linked`; the returned guard is
+/// held (as a local binding) until that function returns. `run` no longer
+/// acquires `CALL_LOCK` itself — it's not reentrant, and the lock must
+/// already be held by the time `run` is called.
+pub(crate) fn call_lock() -> std::sync::MutexGuard<'static, ()> {
+    CALL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// The context [`veh_callback`] consults while a guest call is in flight.
 /// Written by [`run`] before calling the guest, read (and, on an unresolved
@@ -56,6 +95,22 @@ struct ActiveContext {
     region_base: u64,
     region_len: u64,
     error: Cell<Option<RuntimeError>>,
+    /// Armed (`true`) by `run` immediately before it calls the guest, and
+    /// read by `run` right after the `RtlCaptureContext` recovery point —
+    /// on *both* the original arrival there and, if the guest faults
+    /// genuinely, the restored arrival (see this module's doc comment).
+    /// `veh_callback` never writes this; only `run` does. It has to live
+    /// here (not a plain local in `run`) because it must survive the
+    /// register-only context restore that jumps back to before `entry` was
+    /// called — ordinary host stack memory like this `Cell` is untouched
+    /// by that restore, which is exactly why it works as the signal.
+    resumed: Cell<bool>,
+    /// Pointer to `run`'s stack-local recovery `CONTEXT`, populated by
+    /// `RtlCaptureContext` before the guest call. On a genuine fault,
+    /// `veh_callback` copies `*recovery_ctx` over the OS-delivered
+    /// `ContextRecord`; it is never read on the (unchanged) trampoline
+    /// path.
+    recovery_ctx: *const CONTEXT,
 }
 
 /// `AtomicPtr<T>` is `Send + Sync` regardless of `T` — see `CALL_LOCK`'s doc
@@ -83,8 +138,20 @@ pub(crate) unsafe fn run(
     hle: &HleRegistry,
     guard: &TrampolineGuard,
 ) -> Result<u64, RuntimeError> {
-    // Serialize: only one native guest execution at a time (RT0).
-    let _lock = CALL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Serialization (only one native guest execution at a time, RT0) is
+    // provided by the caller: `execute_linked` holds `call_lock()` for its
+    // entire pipeline, not just this call — see `CALL_LOCK`'s doc comment.
+
+    // The RT1a recovery point's storage. A stack local here (not inside
+    // `ctx`) so its address is stable for exactly this call's duration,
+    // same as `ctx` itself; `ctx.recovery_ctx` below just points at it.
+    //
+    // SAFETY: zero-initializing a `CONTEXT` is valid — it's a plain
+    // `repr(C)` struct of integers/arrays with no pointer/validity
+    // invariants — and `RtlCaptureContext` fully populates it below before
+    // it is ever read (by `veh_callback`, on a genuine fault; `run` itself
+    // never reads it).
+    let mut recovery_ctx: CONTEXT = unsafe { core::mem::zeroed() };
 
     let ctx = ActiveContext {
         trampolines: trampolines as *const [HleTrampoline],
@@ -92,6 +159,8 @@ pub(crate) unsafe fn run(
         region_base: guard.base(),
         region_len: guard.len(),
         error: Cell::new(None),
+        resumed: Cell::new(false),
+        recovery_ctx: &recovery_ctx as *const CONTEXT,
     };
 
     // SAFETY: `veh_callback` has the `unsafe extern "system" fn(*mut
@@ -109,12 +178,53 @@ pub(crate) unsafe fn run(
     // (never moved), which is exactly the lifetime the VEH needs it for.
     ACTIVE_CONTEXT.store(&ctx as *const ActiveContext as *mut ActiveContext, Ordering::Release);
 
-    // SAFETY: `entry` is a valid `sysv64` function pointer into mapped,
-    // executable guest code per this function's safety contract. The VEH is
-    // armed (just above) for the entire duration of this call, so any guest
-    // `call [import_slot]` into the guarded trampoline region is trapped
-    // and serviced by `veh_callback` rather than crashing the process.
-    let result = unsafe { entry(args[0], args[1], args[2], args[3], args[4], args[5]) };
+    // SAFETY: `RtlCaptureContext` only requires a valid, writable `CONTEXT`
+    // out-pointer, which `&mut recovery_ctx` is. It captures the calling
+    // thread's complete register state as of right now: `Rip` becomes the
+    // address right after this call returns, and `Rsp`/`Rbp`/every GPR
+    // reflect exactly this point in `run`'s frame. This is RT1a's recovery
+    // point — see this module's doc comment and `veh_callback`.
+    unsafe { RtlCaptureContext(&mut recovery_ctx) };
+
+    // Execution reaches this exact point in two different ways (see this
+    // module's doc comment for the full mechanism):
+    //  1. Normally, immediately after the `RtlCaptureContext` call above
+    //     returns. `ctx.resumed` is still `false` (just initialized), so
+    //     the `else` arm runs: it arms `resumed`, then calls the guest.
+    //  2. If the guest then faults genuinely (outside the trampoline guard
+    //     region), `veh_callback` overwrites the OS-delivered exception
+    //     context with a copy of `recovery_ctx` and returns
+    //     `EXCEPTION_CONTINUE_EXECUTION`. The OS resumes this thread with
+    //     that restored register state, landing back at this exact
+    //     instruction with the exact registers arrival (1) had — except
+    //     `ctx.resumed` now reads `true`, because it was set right before
+    //     the guest call in arrival (1), and a register-only context
+    //     restore never touches memory (`ctx.resumed` lives in ordinary
+    //     host stack memory, not a register). So this second arrival takes
+    //     the `if` branch: `entry` is *not* called again — its frame, and
+    //     everything `run` pushed while inside it, is gone (`Rsp` was reset
+    //     by the restore) — and `ctx.error` already holds `Faulted { addr
+    //     }`, set by `veh_callback` before it restored us here.
+    let result = if ctx.resumed.get() {
+        0
+    } else {
+        ctx.resumed.set(true);
+        // SAFETY: `entry` is a valid `sysv64` function pointer into mapped,
+        // executable guest code per this function's safety contract. The
+        // VEH is armed (just above) for the entire duration of this call,
+        // so any guest `call [import_slot]` into the guarded trampoline
+        // region is trapped and serviced by `veh_callback`, and any
+        // genuine wild fault is recovered via the `RtlCaptureContext`
+        // snapshot just taken above, rather than crashing the process.
+        let r = unsafe { entry(args[0], args[1], args[2], args[3], args[4], args[5]) };
+        // Returned normally: no genuine fault occurred on this call.
+        // Disarm so `resumed` doesn't linger set for no reason (it's about
+        // to be dropped along with `ctx` regardless, but this keeps the
+        // invariant "armed only while the guest call is actually in
+        // flight" honest).
+        ctx.resumed.set(false);
+        r
+    };
 
     ACTIVE_CONTEXT.store(ptr::null_mut(), Ordering::Release);
     // SAFETY: `handle` is exactly the handle `AddVectoredExceptionHandler`
@@ -129,11 +239,13 @@ pub(crate) unsafe fn run(
     }
 }
 
-/// The VEH callback. Only services `EXCEPTION_ACCESS_VIOLATION`s whose
-/// faulting address falls inside the currently-active `TrampolineGuard`
-/// region; everything else is passed on with `EXCEPTION_CONTINUE_SEARCH` —
-/// see this module's doc comment for why genuine faults are never
-/// swallowed.
+/// The VEH callback. Services `EXCEPTION_ACCESS_VIOLATION`s whose faulting
+/// address falls inside the currently-active `TrampolineGuard` region (an
+/// HLE call) by dispatching to HLE and resuming the guest; genuine faults
+/// outside that region are recovered via the `RtlCaptureContext`-based
+/// restore described in this module's doc comment. Any other exception, or
+/// an access violation with no `execute_linked` call in flight, is passed
+/// on with `EXCEPTION_CONTINUE_SEARCH`.
 ///
 /// # Safety
 /// Called by the OS (via the Vectored Exception Handler mechanism) with a
@@ -170,9 +282,27 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
 
     if fault_addr < ctx.region_base || fault_addr >= ctx.region_base + ctx.region_len {
         // Outside our guarded trampoline region: a genuine guest fault.
-        // Never swallow it — hand it to the next handler / default
-        // unhandled-exception path. See this module's doc comment.
-        return EXCEPTION_CONTINUE_SEARCH;
+        // Recover rather than crash (RT1a): record the error, then
+        // overwrite the delivered context with the pre-call snapshot `run`
+        // took via `RtlCaptureContext`, and resume there. See this module's
+        // doc comment for the full control-flow argument.
+        ctx.error.set(Some(RuntimeError::Faulted { addr: fault_addr }));
+
+        // SAFETY: `ctx.recovery_ctx` was populated by `run`'s
+        // `RtlCaptureContext` call before it called the guest, and is
+        // still valid here: it points at a stack local in `run`'s frame,
+        // which is necessarily still live on this same thread's stack
+        // below this callback (vectored exceptions are delivered
+        // synchronously on the faulting thread, and `run`'s call to
+        // `entry` — the only place a guest fault can originate — is on
+        // this thread's stack beneath us). `CONTEXT` is `Copy`, so this is
+        // a plain struct copy, not a move of anything with drop glue.
+        // Overwriting `*context` and returning
+        // `EXCEPTION_CONTINUE_EXECUTION` below makes the OS resume this
+        // thread with exactly that (restored) register state.
+        *context = unsafe { *ctx.recovery_ctx };
+
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
 
     // SAFETY: `ctx.trampolines`/`ctx.hle` were stored by `run` from live
