@@ -16,6 +16,8 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 #[cfg(target_os = "windows")]
+mod arena;
+#[cfg(target_os = "windows")]
 mod dispatch;
 #[cfg(target_os = "windows")]
 mod mem;
@@ -28,6 +30,19 @@ use xps5x_firmware::LinkedModule;
 use xps5x_hle::GuestAllocator;
 use xps5x_hle::HleRegistry;
 use xps5x_kernel::OrbisKernel;
+
+/// The guest address space's fixed base (design doc §2/§3): a 4 GiB host
+/// region reserved at this exact address by [`arena::GuestArena`] (RT2 Task
+/// 2), identity-mapped so guest address `A` is host address `A`. High and
+/// normally free, clear of the trampoline guard at `0x4000_0000_0000` and
+/// the unresolved-stub sentinel at `0x5000_0000_0000`.
+///
+/// This is the single source of truth for the link base: the LM1 linker must
+/// link a module so guest vaddr `0` lands here, and `xps5x-gui`'s
+/// `FirmwareLauncher` passes this as the load base (RT2 Task 3). Exported
+/// unconditionally (not `cfg(windows)`-gated) since it is a pure constant —
+/// only [`arena::GuestArena`]'s reservation mechanism is Windows-specific.
+pub const GUEST_ARENA_BASE: u64 = 0x0000_1000_0000_0000;
 
 /// Stand-in [`GuestAllocator`] that satisfies no request: every method is a
 /// `None`/no-op. `execute_linked` doesn't yet call anything that reaches
