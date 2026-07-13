@@ -191,11 +191,20 @@ fn build_dynlib_and_dynamic(import_nid: u64) -> (Vec<u8>, Vec<u8>) {
 /// `ET_SCE_DYNAMIC` ELF) with one `PT_LOAD`, `PT_SCE_DYNLIBDATA`, and
 /// `PT_DYNAMIC` importing `import_nid` via a single `JUMP_SLOT` relocation.
 fn build_homebrew_sprx(import_nid: u64) -> Vec<u8> {
+    build_homebrew_sprx_with_entry(import_nid, 0)
+}
+
+/// Same as [`build_homebrew_sprx`], but patches `e_entry` to `entry` — used
+/// to prove RT1b's entry-offset plumbing (`SprxModule::entry` ->
+/// `LinkedModule::entry`) end to end through the real [`load_module`]
+/// pipeline, not just the unit-level extraction/propagation tests in
+/// `sprx.rs`/`dynlib/linker.rs`.
+fn build_homebrew_sprx_with_entry(import_nid: u64, entry: u64) -> Vec<u8> {
     let (dynlib_blob, dynamic_bytes) = build_dynlib_and_dynamic(import_nid);
 
     let load_bytes = vec![0u8; 0x100];
 
-    let elf = build_elf(
+    let mut elf = build_elf(
         ET_SCE_DYNAMIC,
         &[
             PhdrSpec {
@@ -218,6 +227,7 @@ fn build_homebrew_sprx(import_nid: u64) -> Vec<u8> {
             },
         ],
     );
+    elf[24..32].copy_from_slice(&entry.to_le_bytes()); // e_entry
 
     build_plaintext_self(&elf)
 }
@@ -278,4 +288,26 @@ fn homebrew_sprx_with_unknown_import_is_unresolved_not_fatal() {
     assert_eq!(read_slot(&linked.image, RELOC_SLOT_OFFSET), UNRESOLVED_STUB_ADDR);
     assert_eq!(linked.unresolved, vec![bogus_nid]);
     assert!(linked.hle_trampolines.is_empty());
+}
+
+#[test]
+fn homebrew_sprx_entry_point_propagates_through_load_module() {
+    let hle = HleRegistry::new();
+    let (_, func) = hle
+        .registered_names()
+        .into_iter()
+        .next()
+        .expect("HLE registers at least one fn");
+    let import_nid = nid_of(&func);
+
+    let sprx = build_homebrew_sprx_with_entry(import_nid, 0x40);
+
+    let db = NidDatabase::from_hle_names(hle.registered_names());
+    let mut registry = ModuleRegistry::new(db);
+
+    let base = 0x8000_0000u64;
+    let linked = load_module(&sprx, &NoKeysProvider, &mut registry, &hle, base)
+        .expect("fully synthetic homebrew .sprx links end-to-end against HLE");
+
+    assert_eq!(linked.entry, 0x40, "e_entry rides along as an image offset through the whole load_module pipeline");
 }

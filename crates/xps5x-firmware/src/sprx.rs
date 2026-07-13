@@ -63,6 +63,14 @@ pub struct SprxModule {
     /// consumed by [`crate::dynlib::parse_sce_dynamic`] to locate the
     /// string/symbol/relocation tables within `dynlib_data`.
     pub dynamic: Option<Vec<u8>>,
+    /// The ELF header's `e_entry`. [`crate::dynlib::linker::link_module`]
+    /// carries this through to [`crate::dynlib::linker::LinkedModule::entry`]
+    /// unchanged, treating it as an *image offset* rather than a virtual
+    /// address — valid because this crate's synthetic/homebrew modules build
+    /// `PT_LOAD` segments whose `p_vaddr`s already start at 0 (see
+    /// `linker.rs`'s module docs). A real `.sprx` with a non-zero load bias
+    /// would need `entry - load_bias` here; that's out of LM1/RT1b scope.
+    pub entry: u64,
 }
 
 /// Parse a plaintext inner ELF into an [`SprxModule`].
@@ -170,6 +178,7 @@ pub fn parse_sprx(elf: &[u8]) -> Result<SprxModule, FirmwareError> {
         dynlib_data,
         relro,
         dynamic,
+        entry: parsed.header.e_entry,
     })
 }
 
@@ -359,6 +368,42 @@ mod tests {
         let relro = module.relro.expect("relro segment present");
         assert_eq!(relro.vaddr, 0x3000);
         assert_eq!(relro.data, relro_bytes);
+    }
+
+    #[test]
+    fn entry_point_is_captured_from_e_entry() {
+        let load_bytes = vec![0xAAu8; 16];
+        let mut elf = build_elf(
+            ET_SCE_DYNAMIC,
+            &[PhdrSpec {
+                p_type: PT_LOAD,
+                p_flags: 5,
+                p_vaddr: 0,
+                data: load_bytes,
+            }],
+        );
+        let entry = 0x1234u64;
+        elf[24..32].copy_from_slice(&entry.to_le_bytes()); // e_entry
+
+        let module = parse_sprx(&elf).expect("valid synthetic ELF parses");
+        assert_eq!(module.entry, entry);
+    }
+
+    #[test]
+    fn zero_e_entry_defaults_to_zero() {
+        let load_bytes = vec![0xAAu8; 16];
+        let elf = build_elf(
+            ET_SCE_DYNAMIC,
+            &[PhdrSpec {
+                p_type: PT_LOAD,
+                p_flags: 5,
+                p_vaddr: 0,
+                data: load_bytes,
+            }],
+        );
+
+        let module = parse_sprx(&elf).expect("valid synthetic ELF parses");
+        assert_eq!(module.entry, 0);
     }
 
     #[test]

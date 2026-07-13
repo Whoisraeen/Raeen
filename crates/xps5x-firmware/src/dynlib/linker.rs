@@ -69,6 +69,11 @@ pub struct LinkedModule {
     /// by NID (a NID referenced by more than one relocation reuses the same
     /// trampoline address and appears here once).
     pub hle_trampolines: Vec<HleTrampoline>,
+    /// [`SprxModule::entry`] (the ELF `e_entry`), carried through unchanged
+    /// as an offset into `image` — a later milestone that gives modules a
+    /// non-zero load bias will need to rebase this (see the module docs'
+    /// "Image layout assumption").
+    pub entry: u64,
 }
 
 /// Lay `module`'s `PT_LOAD` segments into a flat image at `base` and apply
@@ -163,6 +168,7 @@ pub fn link_module(
         base,
         unresolved,
         hle_trampolines,
+        entry: module.entry,
     })
 }
 
@@ -236,6 +242,7 @@ mod tests {
             dynlib_data: None,
             relro: None,
             dynamic: None,
+            entry: 0,
         }
     }
 
@@ -375,6 +382,17 @@ mod tests {
 
         assert_eq!(read_slot(&linked.image, 0x20), UNRESOLVED_STUB_ADDR);
         assert_eq!(linked.unresolved, vec![nid]);
+    }
+
+    #[test]
+    fn entry_offset_propagates_from_module_to_linked_module() {
+        let (hle, registry) = empty_registry();
+        let mut module = test_module(0x100);
+        module.entry = 0x40;
+        let dynlib = DynlibData::default();
+
+        let linked = link_module(&module, &dynlib, &registry, &hle, 0x1000).expect("links");
+        assert_eq!(linked.entry, 0x40);
     }
 
     #[test]

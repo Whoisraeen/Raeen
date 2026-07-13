@@ -4952,6 +4952,7 @@ dependencies = [
  "xps5x-io",
  "xps5x-kernel",
  "xps5x-loader",
+ "xps5x-runtime",
 ]
 
 [[package]]
