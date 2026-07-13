@@ -26,15 +26,14 @@
 //!   `from_system_utc` (UTC); this is a documented, intentional gap, not a
 //!   silent behavior change for the *format specifiers and calendar math*
 //!   this module owns.
-//! - `Kyty::Core::LanguageId` / `Kyty::Core::Language::GetNameOf*`
-//!   (`Kyty/Core/Language.h`) -> the `Language` subsystem is not ported yet
-//!   either. [`LanguageId`] and the private month/day name tables below are a
-//!   minimal local stand-in covering exactly what `Date`/`DateTime::ToString`
-//!   need (English + Russian, matching what Kyty's `Language.cpp` actually
-//!   implements — every other enumerator is `EXIT("unknown language")` in the
-//!   original too). When `Language` is ported for real, this stand-in should
-//!   be deleted and these call sites repointed at it.
+//! - `Kyty::Core::LanguageId` comes from the ported [`crate::language`]
+//!   subsystem ([`LanguageId`] is re-exported here for call-site convenience).
+//!   The private month/day name tables below remain local to this module,
+//!   covering exactly what `Date`/`DateTime::ToString` need (English +
+//!   Russian, matching what Kyty's `Language.cpp` actually implements — every
+//!   other enumerator is `EXIT("unknown language")` in the original too).
 
+use crate::language::LanguageId;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// `jd_t` — a Julian Day Number.
@@ -56,21 +55,6 @@ pub const MONTH_SEPTEMBER: i32 = 9;
 pub const MONTH_OCTOBER: i32 = 10;
 pub const MONTH_NOVEMBER: i32 = 11;
 pub const MONTH_DECEMBER: i32 = 12;
-
-/// Minimal stand-in for the not-yet-ported `Kyty::Core::LanguageId`. See the
-/// module doc comment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum LanguageId {
-    Unknown,
-    German,
-    #[default]
-    English,
-    French,
-    Italian,
-    Portuguese,
-    Russian,
-    Spanish,
-}
 
 const SHORT_MONTH_ENGLISH: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
