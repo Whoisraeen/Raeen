@@ -22,6 +22,8 @@ mod dispatch;
 #[cfg(target_os = "windows")]
 mod stack;
 #[cfg(target_os = "windows")]
+mod tls;
+#[cfg(target_os = "windows")]
 mod trampoline;
 
 use thiserror::Error;
@@ -119,6 +121,15 @@ pub fn execute_linked(
     let entry_ptr = arena.entry_ptr(entry_offset)?;
     let guard = trampoline::TrampolineGuard::reserve(module.hle_trampolines.len())?;
 
+    // RT2c-b (design doc §3): set up a minimal main-thread TCB so the guest
+    // can use `fs:`-relative TLS, but only when FSGSBASE is actually
+    // available — on a CPU without it, `tcb` stays `None` and `dispatch::run`
+    // never executes an fsbase instruction (honest degradation, not a
+    // fragile half-working `fsbase`). `setup_main_tcb` allocates from the
+    // same arena the guest otherwise uses, so this fails closed (`None`)
+    // rather than panicking if the heap allocation itself fails.
+    let tcb = if tls::fsgsbase_available() { arena.setup_main_tcb() } else { None };
+
     // SAFETY: `entry_ptr` is a host address inside `arena`'s
     // `PAGE_EXECUTE_READWRITE` image sub-region, at the caller-specified
     // `entry_offset` into `module.image` — code the LM1 pipeline produced,
@@ -155,6 +166,7 @@ pub fn execute_linked(
             &arena,
             &guard,
             arena.stack_top(),
+            tcb,
         )
     }
 }

@@ -60,6 +60,13 @@ const MMAP_SIZE: u64 = 0x6000_0000; // 1.5 GiB
 /// no gaps (design doc §3's layout table).
 const ARENA_SPAN: u64 = 0x1_0000_0000; // 4 GiB
 
+/// Size of the minimal main-thread TCB [`GuestArena::setup_main_tcb`] carves
+/// from the heap region (design doc §3, RT2c-b). Large enough for the
+/// self-pointer at offset 0 plus headroom for small TLS-offset probes; a
+/// real per-module `PT_TLS` init-image copy (which would need a
+/// module-supplied `memsz`) is a follow-up, not implemented here.
+const TCB_SIZE: u64 = 0x800; // 2 KiB
+
 /// Round `align` up to a power of two no smaller than 16 (the minimum
 /// alignment `GuestAllocator` methods honor, design doc §5), returning
 /// `None` — rather than panicking — if `align` is too large for
@@ -257,6 +264,30 @@ impl GuestArena {
     /// relies on this alignment.
     pub(crate) fn stack_top(&self) -> u64 {
         self.base + STACK_OFFSET + STACK_SIZE
+    }
+
+    /// Set up a minimal main-thread TCB (design doc §3, RT2c-b): carves a
+    /// [`TCB_SIZE`]-byte block from the heap allocator, writes a
+    /// self-pointer at offset 0 (the FreeBSD/Orbis "variant II" TLS
+    /// convention: `fs:[0]` is the TCB's own address), and zeroes the rest.
+    /// Returns the TCB's guest address, or `None` if the heap allocation (or
+    /// the write-back through [`GuestMemory::write`]) fails.
+    ///
+    /// This is intentionally minimal: no per-module `PT_TLS` init-image copy
+    /// happens here — that is a follow-up (design doc §3's "bonus" note).
+    /// It provides just enough (the self-pointer, plus headroom zeroed to a
+    /// known state) for a small TLS-offset access to be valid, which is all
+    /// RT2c-b's acceptance criteria require.
+    pub(crate) fn setup_main_tcb(&self) -> Option<u64> {
+        let tcb = self.alloc(TCB_SIZE, 16)?;
+
+        let mut block = vec![0u8; TCB_SIZE as usize];
+        block[0..8].copy_from_slice(&tcb.to_le_bytes());
+
+        if !self.write(tcb, &block) {
+            return None;
+        }
+        Some(tcb)
     }
 }
 

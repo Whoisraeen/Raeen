@@ -124,6 +124,27 @@ struct ActiveContext {
     /// `ContextRecord`; it is never read on the (unchanged) trampoline
     /// path.
     recovery_ctx: *const CONTEXT,
+    /// The FS base to restore after this call (RT2c-b, design doc §3),
+    /// captured via `tls::read_fsbase()` before `RtlCaptureContext` — only
+    /// when TLS is active for this call (see `tls_active` below). Read back
+    /// in the shared continuation after the `if`/`else` in `run`, which runs
+    /// on *both* the normal-return and RT1a-fault-recovery arrivals.
+    ///
+    /// Lives here (memory reached through `ACTIVE_CONTEXT`), not a plain
+    /// local in `run`, for the same reason `resumed` does (see its doc
+    /// comment just below): the RT2c-b spike found that a value carried as
+    /// an ordinary local across `RtlCaptureContext`, then read again after a
+    /// possible fault-driven resume, is not reliably restored — the fix,
+    /// verified 20/20 clean runs in the spike, is storing it in memory
+    /// reached through this struct instead, exactly like `resumed`/`error`
+    /// already do.
+    orig_fsbase: Cell<u64>,
+    /// Whether TLS (fsbase set/restore) is active for this call — set once,
+    /// before `RtlCaptureContext`, from `tcb.is_some() &&
+    /// tls::fsgsbase_available()`, and read again in the shared continuation
+    /// (which runs on both arrivals). Same "must live in `ctx`, not a local
+    /// carried across `RtlCaptureContext`" reasoning as `orig_fsbase` above.
+    tls_active: Cell<bool>,
 }
 
 /// `AtomicPtr<T>` is `Send + Sync` regardless of `T` — see `CALL_LOCK`'s doc
@@ -148,7 +169,11 @@ static ACTIVE_CONTEXT: AtomicPtr<ActiveContext> = AtomicPtr::new(ptr::null_mut()
 /// big enough to serve as `entry`'s stack (i.e.
 /// [`crate::arena::GuestArena::stack_top`]) — see
 /// [`crate::stack::call_on_guest_stack`]'s doc comment for the full
-/// RSP-switch contract.
+/// RSP-switch contract. `tcb`, if `Some`, is the guest TCB address (from
+/// [`crate::arena::GuestArena::setup_main_tcb`]) to point the FS base at for
+/// the duration of the guest call (RT2c-b, design doc §3); `None` means TLS
+/// isn't set up for this call (e.g. FSGSBASE unavailable), in which case no
+/// fsbase instruction is ever executed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run(
     entry: unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> u64,
@@ -160,6 +185,7 @@ pub(crate) unsafe fn run(
     alloc: &dyn GuestAllocator,
     guard: &TrampolineGuard,
     guest_rsp_top: u64,
+    tcb: Option<u64>,
 ) -> Result<u64, RuntimeError> {
     // Serialization (only one native guest execution at a time, RT0) is
     // provided by the caller: `execute_linked` holds `call_lock()` for its
@@ -217,6 +243,8 @@ pub(crate) unsafe fn run(
         error: Cell::new(None),
         resumed: Cell::new(false),
         recovery_ctx: &recovery_ctx as *const CONTEXT,
+        orig_fsbase: Cell::new(0),
+        tls_active: Cell::new(false),
     };
 
     // SAFETY: `veh_callback` has the `unsafe extern "system" fn(*mut
@@ -233,6 +261,24 @@ pub(crate) unsafe fn run(
     // `ctx` is a local; its address is stable for the rest of this function
     // (never moved), which is exactly the lifetime the VEH needs it for.
     ACTIVE_CONTEXT.store(&ctx as *const ActiveContext as *mut ActiveContext, Ordering::Release);
+
+    // RT2c-b (design doc §3): if a guest TCB was set up and FSGSBASE is
+    // available, capture the current FS base into `ctx.orig_fsbase` —
+    // memory reached through `ACTIVE_CONTEXT` (already stored just above) —
+    // *before* `RtlCaptureContext`, so it can be restored in the shared
+    // continuation below regardless of which arrival gets there. See
+    // `ActiveContext::orig_fsbase`'s doc comment and the RT2c-b spike report
+    // for why this must live in `ctx`, not a plain local carried across
+    // `RtlCaptureContext`. If FSGSBASE is unavailable or no TCB was set up,
+    // `ctx.tls_active` stays `false` and no fsbase instruction is ever
+    // executed for this call (honest degradation).
+    if tcb.is_some() && crate::tls::fsgsbase_available() {
+        ctx.tls_active.set(true);
+        // SAFETY: `fsgsbase_available()` just returned `true`, so `RDFSBASE`
+        // is permitted on this CPU. This only reads the current FS base; it
+        // does not modify any CPU state.
+        ctx.orig_fsbase.set(unsafe { crate::tls::read_fsbase() });
+    }
 
     // SAFETY: `RtlCaptureContext` only requires a valid, writable `CONTEXT`
     // out-pointer, which `&mut recovery_ctx` is. It captures the calling
@@ -265,6 +311,22 @@ pub(crate) unsafe fn run(
         0
     } else {
         ctx.resumed.set(true);
+        if ctx.tls_active.get() {
+            // SAFETY: `ctx.tls_active` is only `true` when
+            // `fsgsbase_available()` returned `true` (checked above, before
+            // `RtlCaptureContext`) and `tcb.is_some()` (checked in that same
+            // condition, so the `expect` below cannot fail). This `else`
+            // branch only ever runs on the original, not-yet-faulted
+            // arrival (a resumed arrival always takes the `if` branch
+            // above), so `tcb` here is still exactly the guest TCB address
+            // `execute_linked` passed in — a valid guest address inside the
+            // arena, set up by `GuestArena::setup_main_tcb`. Setting FS base
+            // here, immediately before the guest call, does not touch GS or
+            // any other CPU state.
+            unsafe {
+                crate::tls::write_fsbase(tcb.expect("tls_active implies tcb.is_some()"));
+            }
+        }
         // SAFETY: `entry` is a valid `sysv64` function pointer into mapped,
         // executable guest code per this function's safety contract. The
         // VEH is armed (just above) for the entire duration of this call,
@@ -292,6 +354,20 @@ pub(crate) unsafe fn run(
         ctx.resumed.set(false);
         r
     };
+
+    if ctx.tls_active.get() {
+        // SAFETY: `ctx.tls_active` being `true` guarantees FSGSBASE is
+        // available (see where it's set, before `RtlCaptureContext`, above).
+        // This is the shared continuation reached after the `if`/`else`
+        // above — i.e. on *both* the normal-return and RT1a-fault-recovery
+        // arrivals (see this module's doc comment) — so it restores the FS
+        // base captured into `ctx.orig_fsbase` before the guest call,
+        // reading it fresh from memory here rather than trusting a local
+        // carried across `RtlCaptureContext`.
+        unsafe {
+            crate::tls::write_fsbase(ctx.orig_fsbase.get());
+        }
+    }
 
     ACTIVE_CONTEXT.store(ptr::null_mut(), Ordering::Release);
     // SAFETY: `handle` is exactly the handle `AddVectoredExceptionHandler`
