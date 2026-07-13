@@ -11,7 +11,9 @@ pub mod boot;
 pub mod control_center;
 pub mod home;
 pub mod icons;
+pub mod media;
 pub mod nav;
+pub mod settings;
 
 use crate::launcher::{GameLauncher, SessionHandle, SessionState};
 use crate::library::{Gradient, LibraryItem, MetaCache};
@@ -20,7 +22,9 @@ use anim::Animated;
 use boot::BootSequence;
 use egui::Key;
 use home::HomeAnim;
-use nav::{NavAction, NavInput, NavMode, NavState};
+use nav::{NavAction, NavInput, NavMode, NavState, RailTab};
+use std::path::PathBuf;
+use xps5x_core::config::EmulatorConfig;
 
 enum Screen {
     Boot(BootSequence),
@@ -43,6 +47,8 @@ const MAX_RECENT_TITLES: usize = 6;
 pub struct Shell {
     theme: Theme,
     library: Vec<LibraryItem>,
+    /// The Media tab's rail (spec §10 SM2) — built once, same as `library`.
+    library_media: Vec<LibraryItem>,
     meta_cache: MetaCache,
     nav: NavState,
     screen: Screen,
@@ -53,6 +59,16 @@ pub struct Shell {
     /// backs the Control Center's Switcher panel (spec §10).
     recent: Vec<String>,
 
+    /// Live settings, edited in place by the Settings screen and persisted
+    /// via `EmulatorConfig::save` when the user backs out of Settings.
+    config: EmulatorConfig,
+    config_path: PathBuf,
+    /// Scratch text-entry buffers for Settings' two path fields. Kept on
+    /// `Shell` rather than `nav::NavState`, which stays free of raw text
+    /// state so it can remain a pure, egui-free state machine.
+    settings_new_folder_input: String,
+    settings_key_provider_input: String,
+
     rail_offset: Animated,
     focus_pop: Animated,
     hero_from: Option<Gradient>,
@@ -60,10 +76,17 @@ pub struct Shell {
     hero_t: Animated,
     cc_open: Animated,
     last_rail_index: usize,
+    last_tab: RailTab,
 }
 
 impl Shell {
-    pub fn new(theme: Theme, library: Vec<LibraryItem>, launcher: Box<dyn GameLauncher>) -> Self {
+    pub fn new(
+        theme: Theme,
+        library: Vec<LibraryItem>,
+        launcher: Box<dyn GameLauncher>,
+        config: EmulatorConfig,
+        config_path: PathBuf,
+    ) -> Self {
         let rail_len = library.len();
         let cc_len = control_center::ITEMS.len();
         let cc_option_counts: Vec<usize> = control_center::ITEMS.iter().map(|item| item.option_count()).collect();
@@ -74,21 +97,39 @@ impl Shell {
         });
         let meta_cache = MetaCache::from_items(&library);
 
+        let library_media = media::media_items();
+        // Settings is always one of the built-in apps (spec §10 SM2); if a
+        // caller ever hands the Shell a library without one, Confirm on
+        // that index simply never matches and nothing opens Settings.
+        let settings_tile_index = library.iter().position(|item| item.id == "settings");
+        let settings_row_counts = settings::settings_row_counts(config.paths.game_folders.len());
+
+        let nav = NavState::with_cc_options(rail_len, cc_len, cc_option_counts)
+            .with_settings(settings_tile_index, settings_row_counts)
+            .with_media_rail_len(library_media.len());
+
         let gilrs = gilrs::Gilrs::new().ok();
         if gilrs.is_none() {
             tracing::warn!("gamepad support unavailable (gilrs init failed) — keyboard still works");
         }
 
+        let settings_key_provider_input = config.paths.key_provider_path.display().to_string();
+
         Self {
             theme,
             library,
+            library_media,
             meta_cache,
-            nav: NavState::with_cc_options(rail_len, cc_len, cc_option_counts),
+            nav,
             screen: Screen::Boot(BootSequence::new()),
             launcher,
             session: None,
             gilrs,
             recent: Vec::new(),
+            config,
+            config_path,
+            settings_new_folder_input: String::new(),
+            settings_key_provider_input,
             rail_offset: Animated::new(0.0),
             focus_pop: Animated::with_speed(1.0, 12.0),
             hero_from: None,
@@ -96,6 +137,14 @@ impl Shell {
             hero_t: Animated::with_speed(1.0, 6.0),
             cc_open: Animated::with_speed(0.0, 11.0),
             last_rail_index: 0,
+            last_tab: RailTab::Games,
+        }
+    }
+
+    fn active_items(&self) -> &[LibraryItem] {
+        match self.nav.tab {
+            RailTab::Games => &self.library,
+            RailTab::Media => &self.library_media,
         }
     }
 
@@ -132,10 +181,108 @@ impl Shell {
         for input in inputs {
             match self.nav.apply(input) {
                 NavAction::Launch(index) => self.begin_launch(index),
+                NavAction::LaunchMedia(index) => self.confirm_media(index),
                 NavAction::ActivateOption { card, option } => self.handle_cc_option(ctx, card, option),
-                NavAction::OpenControlCenter | NavAction::CloseControlCenter | NavAction::None => {}
+                NavAction::OpenSettings => self.enter_settings(),
+                NavAction::CloseSettings => self.leave_settings(),
+                NavAction::AdjustSetting { section, row, delta } => self.apply_setting_adjust(section, row, delta),
+                NavAction::ActivateSetting { section, row } => self.apply_setting_activate(section, row),
+                NavAction::OpenControlCenter | NavAction::CloseControlCenter | NavAction::SwitchTab(_) | NavAction::None => {}
             }
         }
+    }
+
+    /// Confirm on a Media-tab tile (spec §10 SM2). There is no media
+    /// playback engine yet, so this is a stub: just log it.
+    fn confirm_media(&mut self, index: usize) {
+        let title = self.library_media.get(index).map(|i| i.title.as_str()).unwrap_or("unknown");
+        tracing::info!(title, "media app confirmed (stub — no media engine yet)");
+    }
+
+    /// Confirm on the Settings tile: reset the Settings screen's scratch
+    /// text-entry buffers to match the current config.
+    fn enter_settings(&mut self) {
+        self.settings_new_folder_input.clear();
+        self.settings_key_provider_input = self.config.paths.key_provider_path.display().to_string();
+    }
+
+    /// Back out of Settings: fold the KeyProvider path text field back into
+    /// config (it's edited free-form, not row-by-row like the other
+    /// sections) and persist via the existing `EmulatorConfig::save` path.
+    fn leave_settings(&mut self) {
+        self.config.paths.key_provider_path = PathBuf::from(self.settings_key_provider_input.trim());
+        if let Err(err) = self.config.save(&self.config_path) {
+            // TODO: surface a save failure to the user in-UI instead of
+            // just logging it (spec doesn't yet define a Settings toast/
+            // error surface).
+            tracing::warn!(error = %err, path = %self.config_path.display(), "failed to save settings");
+        }
+    }
+
+    /// Step the config field addressed by `(section, row)` — see
+    /// `settings::SETTINGS_SECTION_NAMES` for what each section is.
+    /// Sections 3 (Game Folders) and 4 (Key Provider) are pure text-entry
+    /// and have nothing to step with Left/Right.
+    fn apply_setting_adjust(&mut self, section: usize, row: usize, delta: i32) {
+        match (section, row) {
+            (0, 0) => {
+                self.config.graphics.resolution_scale =
+                    settings::adjust_stepped(self.config.graphics.resolution_scale, delta, 0.25, 0.5, 4.0)
+            }
+            (0, 1) => self.config.general.fullscreen = !self.config.general.fullscreen,
+            (0, 2) => self.config.graphics.shader_cache = !self.config.graphics.shader_cache,
+            (0, 3) => self.config.graphics.validation_layers = !self.config.graphics.validation_layers,
+            (1, 0) => self.config.audio.enabled = !self.config.audio.enabled,
+            (1, 1) => self.config.audio.volume = settings::adjust_stepped(self.config.audio.volume, delta, 0.05, 0.0, 1.0),
+            (1, 2) => self.config.audio.spatial_audio = !self.config.audio.spatial_audio,
+            (2, 0) => self.config.input.dualsense_features = !self.config.input.dualsense_features,
+            (2, 1) => self.config.input.deadzone = settings::adjust_stepped(self.config.input.deadzone, delta, 0.05, 0.0, 1.0),
+            (5, 0) => self.cycle_theme(delta),
+            _ => {}
+        }
+    }
+
+    /// Confirm on the focused Settings row. Video/Audio/Input/Theme all
+    /// behave the same as an adjust with `delta: 1` (a toggle flips either
+    /// way; the theme selector cycles forward) — spec's "Left/Right or
+    /// Confirm to adjust". Game Folders and Key Provider have their own
+    /// Confirm semantics.
+    fn apply_setting_activate(&mut self, section: usize, row: usize) {
+        match section {
+            0 | 1 | 2 | 5 => self.apply_setting_adjust(section, row, 1),
+            3 => self.activate_game_folder_row(row),
+            _ => {} // Key Provider (4): pure text-entry, nothing to "confirm".
+        }
+    }
+
+    /// Confirm within the Game Folders section: the last row ("Add
+    /// Folder") pushes the typed path; any other row removes that folder.
+    fn activate_game_folder_row(&mut self, row: usize) {
+        let folder_count = self.config.paths.game_folders.len();
+        if row == folder_count {
+            let trimmed = self.settings_new_folder_input.trim();
+            if !trimmed.is_empty() {
+                let path = PathBuf::from(trimmed);
+                if !self.config.paths.game_folders.contains(&path) {
+                    self.config.paths.game_folders.push(path);
+                }
+                self.settings_new_folder_input.clear();
+            }
+        } else if row < folder_count {
+            self.config.paths.game_folders.remove(row);
+        }
+        self.nav.set_settings_row_counts(settings::settings_row_counts(self.config.paths.game_folders.len()));
+    }
+
+    fn cycle_theme(&mut self, delta: i32) {
+        let themes = settings::available_themes();
+        if themes.is_empty() {
+            return;
+        }
+        let current = themes.iter().position(|t| t == &self.config.general.selected_theme).unwrap_or(0);
+        let len = themes.len() as i32;
+        let next = (current as i32 + delta).rem_euclid(len) as usize;
+        self.config.general.selected_theme = themes[next].clone();
     }
 
     /// Handle Confirm on a Control Center card's option list (currently
@@ -160,32 +307,55 @@ impl Shell {
     fn poll_nav_inputs(&mut self, ctx: &egui::Context) -> Vec<NavInput> {
         let mut inputs = Vec::new();
 
-        ctx.input(|i| {
-            if i.key_pressed(Key::ArrowLeft) {
-                inputs.push(NavInput::Left);
-            }
-            if i.key_pressed(Key::ArrowRight) {
-                inputs.push(NavInput::Right);
-            }
-            if i.key_pressed(Key::Enter) {
-                inputs.push(NavInput::Confirm);
-            }
-            if i.key_pressed(Key::Escape) {
-                inputs.push(NavInput::Back);
-            }
-            if i.key_pressed(Key::C) {
-                inputs.push(NavInput::Guide);
-            }
-        });
+        // While an egui widget (e.g. one of Settings' text fields) holds
+        // keyboard focus, let it consume typing/arrow keys instead of the
+        // Shell stealing them for rail/section navigation. Gamepad input
+        // never fights a text field, so it's still polled below regardless.
+        let widget_has_focus = ctx.memory(|m| m.focused().is_some());
+
+        if !widget_has_focus {
+            ctx.input(|i| {
+                if i.key_pressed(Key::ArrowLeft) {
+                    inputs.push(NavInput::Left);
+                }
+                if i.key_pressed(Key::ArrowRight) {
+                    inputs.push(NavInput::Right);
+                }
+                if i.key_pressed(Key::ArrowUp) {
+                    inputs.push(NavInput::Up);
+                }
+                if i.key_pressed(Key::ArrowDown) {
+                    inputs.push(NavInput::Down);
+                }
+                if i.key_pressed(Key::Enter) {
+                    inputs.push(NavInput::Confirm);
+                }
+                if i.key_pressed(Key::Escape) {
+                    inputs.push(NavInput::Back);
+                }
+                if i.key_pressed(Key::C) {
+                    inputs.push(NavInput::Guide);
+                }
+                if i.key_pressed(Key::Tab) {
+                    inputs.push(NavInput::Tab);
+                }
+            });
+        }
 
         if let Some(gilrs) = self.gilrs.as_mut() {
             while let Some(gilrs::Event { event, .. }) = gilrs.next_event() {
                 match event {
                     gilrs::EventType::ButtonPressed(gilrs::Button::DPadLeft, _) => inputs.push(NavInput::Left),
                     gilrs::EventType::ButtonPressed(gilrs::Button::DPadRight, _) => inputs.push(NavInput::Right),
+                    gilrs::EventType::ButtonPressed(gilrs::Button::DPadUp, _) => inputs.push(NavInput::Up),
+                    gilrs::EventType::ButtonPressed(gilrs::Button::DPadDown, _) => inputs.push(NavInput::Down),
                     gilrs::EventType::ButtonPressed(gilrs::Button::South, _) => inputs.push(NavInput::Confirm),
                     gilrs::EventType::ButtonPressed(gilrs::Button::East, _) => inputs.push(NavInput::Back),
                     gilrs::EventType::ButtonPressed(gilrs::Button::Mode, _) => inputs.push(NavInput::Guide),
+                    // Shoulder buttons (L1/R1) both toggle the two-item
+                    // Games/Media tab (spec §10 SM2: "L1/R1 if easy").
+                    gilrs::EventType::ButtonPressed(gilrs::Button::LeftTrigger, _) => inputs.push(NavInput::Tab),
+                    gilrs::EventType::ButtonPressed(gilrs::Button::RightTrigger, _) => inputs.push(NavInput::Tab),
                     _ => {}
                 }
             }
@@ -222,12 +392,13 @@ impl Shell {
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
         let mut animating = false;
 
-        if self.nav.rail_index != self.last_rail_index {
+        if self.nav.rail_index != self.last_rail_index || self.nav.tab != self.last_tab {
             self.last_rail_index = self.nav.rail_index;
+            self.last_tab = self.nav.tab;
             self.focus_pop.value = 0.0;
             self.focus_pop.set_target(1.0);
 
-            let new_hero = self.library.get(self.nav.rail_index).map(|i| i.art.hero());
+            let new_hero = self.active_items().get(self.nav.rail_index).map(|i| i.art.hero());
             if let Some(new_hero) = new_hero {
                 self.hero_from = Some(self.blended_hero());
                 self.hero_to = new_hero;
@@ -264,7 +435,7 @@ impl Shell {
         }
     }
 
-    fn draw(&self, ctx: &egui::Context) {
+    fn draw(&mut self, ctx: &egui::Context) {
         let theme = self.theme.clone();
         let frame = egui::Frame::NONE.fill(theme.palette.ground);
 
@@ -274,12 +445,25 @@ impl Shell {
                 return;
             }
 
+            if self.nav.mode == NavMode::Settings {
+                settings::draw(
+                    ui,
+                    &theme,
+                    &self.nav,
+                    &self.config,
+                    &mut self.settings_new_folder_input,
+                    &mut self.settings_key_provider_input,
+                );
+                return;
+            }
+
             let anim = HomeAnim {
                 rail_offset: self.rail_offset.value,
                 hero: self.blended_hero(),
                 focus_pop: self.focus_pop.value,
             };
-            home::draw(ui, &theme, &self.library, &self.nav, &anim, &self.meta_cache);
+            let items = self.active_items();
+            home::draw(ui, &theme, items, &self.nav, &anim, &self.meta_cache);
 
             let recent_titles = self.recent_titles();
             control_center::draw(ui, &theme, &self.nav, self.cc_open.value, &recent_titles);

@@ -5,7 +5,7 @@
 //! Every glyph is painted directly with `egui::Painter`, sized to fit
 //! within a `size`×`size` box centered at `center`.
 
-use egui::{Color32, Painter, Pos2, Stroke, StrokeKind, vec2};
+use egui::{Color32, Painter, Pos2, Shape, Stroke, StrokeKind, vec2};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Glyph {
@@ -24,6 +24,8 @@ pub enum Glyph {
     Power,
     Bag,
     Grid,
+    /// Media tab (spec §10 SM2): a rounded frame with a play triangle.
+    Video,
 }
 
 pub fn draw(painter: &Painter, glyph: Glyph, center: Pos2, size: f32, color: Color32) {
@@ -127,6 +129,16 @@ pub fn draw(painter: &Painter, glyph: Glyph, center: Pos2, size: f32, color: Col
                     painter.rect_stroke(rect, 1.0, stroke, StrokeKind::Outside);
                 }
             }
+        }
+        Glyph::Video => {
+            let body = egui::Rect::from_center_size(center, vec2(r * 1.6, r * 1.15));
+            painter.rect_stroke(body, r * 0.18, stroke, StrokeKind::Outside);
+            let tri = vec![
+                center + vec2(-r * 0.2, -r * 0.32),
+                center + vec2(-r * 0.2, r * 0.32),
+                center + vec2(r * 0.35, 0.0),
+            ];
+            painter.add(Shape::convex_polygon(tri, color, Stroke::NONE));
         }
     }
 }

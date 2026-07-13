@@ -8,7 +8,7 @@
 
 use super::anim::lerp_color;
 use super::icons::{self, Glyph};
-use super::nav::NavState;
+use super::nav::{NavState, RailTab};
 use crate::library::{ArtSource, GlyphKind, Gradient, ItemKind, LibraryItem, MetaCache, TileGradient};
 use crate::theme::Theme;
 use egui::{Align, Color32, Layout, Mesh, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, UiBuilder, vec2};
@@ -33,7 +33,7 @@ pub fn draw(ui: &mut egui::Ui, theme: &Theme, items: &[LibraryItem], nav: &NavSt
 
     let topbar_h = 96.0;
     let topbar_rect = Rect::from_min_size(screen.min, vec2(screen.width(), topbar_h));
-    draw_topbar(ui, theme, topbar_rect);
+    draw_topbar(ui, theme, topbar_rect, nav.tab);
 
     let rail_h = theme.metrics.tile_size * theme.metrics.tile_focus_scale
         + theme.metrics.tile_focus_lift
@@ -103,14 +103,16 @@ fn corner_gradient_rounded(painter: &egui::Painter, rect: Rect, rounding: f32, t
     clipped.rect_stroke(rect, rounding, Stroke::NONE, StrokeKind::Inside);
 }
 
-fn draw_topbar(ui: &mut egui::Ui, theme: &Theme, rect: Rect) {
+fn draw_topbar(ui: &mut egui::Ui, theme: &Theme, rect: Rect, active_tab: RailTab) {
     ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
         ui.add_space(theme.metrics.topbar_padding_top);
         ui.horizontal(|ui| {
             ui.add_space(theme.metrics.topbar_padding_x);
-            ui.label(RichText::new("Games").color(theme.palette.text).size(21.0).strong());
+            let games_color = if active_tab == RailTab::Games { theme.palette.text } else { theme.palette.text_faint };
+            let media_color = if active_tab == RailTab::Media { theme.palette.text } else { theme.palette.text_faint };
+            ui.label(RichText::new("Games").color(games_color).size(21.0).strong());
             ui.add_space(30.0);
-            ui.label(RichText::new("Media").color(theme.palette.text_faint).size(21.0).strong());
+            ui.label(RichText::new("Media").color(media_color).size(21.0).strong());
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(theme.metrics.topbar_padding_x);
@@ -317,6 +319,9 @@ fn draw_rail(ui: &mut egui::Ui, theme: &Theme, rect: Rect, items: &[LibraryItem]
                     GlyphKind::Bag => Glyph::Bag,
                     GlyphKind::Grid => Glyph::Grid,
                     GlyphKind::Gear => Glyph::Gear,
+                    GlyphKind::Music => Glyph::Music,
+                    GlyphKind::Video => Glyph::Video,
+                    GlyphKind::Network => Glyph::Network,
                 };
                 icons::draw(&painter, g, tile_rect.center(), size * 0.32, Color32::from_rgba_unmultiplied(255, 255, 255, 235));
             }
@@ -350,7 +355,7 @@ fn draw_rail(ui: &mut egui::Ui, theme: &Theme, rect: Rect, items: &[LibraryItem]
 }
 
 fn draw_hints(painter: &egui::Painter, theme: &Theme, screen: Rect) {
-    let hints = "\u{25C0} \u{25B6} Navigate    Enter Play    C Control Center";
+    let hints = "\u{25C0} \u{25B6} Navigate    Enter Play    Tab Media/Games    C Control Center";
     painter.text(
         Pos2::new(screen.right() - theme.metrics.content_padding_x, screen.bottom() - 18.0),
         egui::Align2::RIGHT_BOTTOM,

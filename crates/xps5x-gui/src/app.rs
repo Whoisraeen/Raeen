@@ -5,10 +5,10 @@
 //! under `shell/`; this file is intentionally thin.
 
 use crate::launcher::StubLauncher;
-use crate::library::{sample_library, scan::scan_dir};
+use crate::library::{built_in_apps, sample_library, scan::scan_dir};
 use crate::shell::Shell;
 use crate::theme::loader::load_theme;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Top-level XPS5X application state.
@@ -17,22 +17,29 @@ pub struct XPS5XApp {
 }
 
 impl XPS5XApp {
-    pub fn new(_config: xps5x_core::config::EmulatorConfig) -> Self {
-        // SM0 ships only the default theme; `load_theme` is the seam SM2
-        // uses to install user themes from `themes/<name>`.
+    pub fn new(config: xps5x_core::config::EmulatorConfig, config_path: PathBuf) -> Self {
+        // SM0 ships only the default theme; `load_theme` is the seam SM2b
+        // uses to install user themes from `themes/<name>`. Settings'
+        // `selected_theme` config field is stored/edited already (SM2a) but
+        // not yet threaded into `load_theme` — that wiring is SM2b's job.
         let theme = load_theme(Path::new("themes/default"));
 
         // Scan the default game folder; fall back to the mockup's sample
         // library (with its original gradient art) when nothing is found —
-        // covers a fresh checkout with no `Games/` folder yet.
+        // covers a fresh checkout with no `Games/` folder yet. Either way,
+        // the built-in apps (Store, Game Library, Settings) are always
+        // appended so Settings stays reachable from the Home rail (spec
+        // §10 SM2) regardless of what a real scan turns up.
         let mut library = scan_dir(Path::new("Games"));
         if library.is_empty() {
             library = sample_library();
+        } else {
+            library.extend(built_in_apps());
         }
 
         let launcher = Box::new(StubLauncher::new(Duration::from_millis(900)));
 
-        Self { shell: Shell::new(theme, library, launcher) }
+        Self { shell: Shell::new(theme, library, launcher, config, config_path) }
     }
 }
 

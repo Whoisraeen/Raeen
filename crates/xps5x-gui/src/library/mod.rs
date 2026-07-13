@@ -51,6 +51,12 @@ pub enum GlyphKind {
     Bag,
     Grid,
     Gear,
+    /// Media tab (spec §10 SM2): music app.
+    Music,
+    /// Media tab (spec §10 SM2): video app.
+    Video,
+    /// Media tab (spec §10 SM2): web browser app.
+    Network,
 }
 
 /// Where a [`LibraryItem`]'s art comes from.
@@ -246,6 +252,50 @@ pub struct LibraryItem {
     pub launch: LaunchTarget,
 }
 
+/// The Shell's built-in apps (Store, Game Library, Settings) — always
+/// present on the Games rail regardless of whether the library came from a
+/// real scan or the sample fallback, so Settings (and, later, Store/
+/// Library) stay reachable even on a fresh checkout with real games but no
+/// prior apps baked in (spec §10 SM2: Settings must be reachable from its
+/// Home rail tile).
+pub fn built_in_apps() -> Vec<LibraryItem> {
+    vec![
+        LibraryItem {
+            id: "store".to_string(),
+            title: "Store".to_string(),
+            kind: ItemKind::App,
+            art: ArtSource::App {
+                tile: TileGradient { from: rgb(0x1f8fff), to: rgb(0x0a4bc2) },
+                glyph: GlyphKind::Bag,
+            },
+            meta: None,
+            launch: LaunchTarget::App { id: "store".to_string() },
+        },
+        LibraryItem {
+            id: "library".to_string(),
+            title: "Game Library".to_string(),
+            kind: ItemKind::App,
+            art: ArtSource::App {
+                tile: TileGradient { from: rgb(0x2b3a4e), to: rgb(0x17222f) },
+                glyph: GlyphKind::Grid,
+            },
+            meta: None,
+            launch: LaunchTarget::App { id: "library".to_string() },
+        },
+        LibraryItem {
+            id: "settings".to_string(),
+            title: "Settings".to_string(),
+            kind: ItemKind::App,
+            art: ArtSource::App {
+                tile: TileGradient { from: rgb(0x2b3a4e), to: rgb(0x17222f) },
+                glyph: GlyphKind::Gear,
+            },
+            meta: None,
+            launch: LaunchTarget::App { id: "settings".to_string() },
+        },
+    ]
+}
+
 /// The mockup's sample library — original invented titles and gradient art,
 /// used until real game-folder scanning (SM1) is wired to the Shell.
 pub fn sample_library() -> Vec<LibraryItem> {
@@ -376,40 +426,10 @@ pub fn sample_library() -> Vec<LibraryItem> {
             }),
             launch: LaunchTarget::Game { path: PathBuf::from("Games/tide") },
         },
-        LibraryItem {
-            id: "store".to_string(),
-            title: "Store".to_string(),
-            kind: ItemKind::App,
-            art: ArtSource::App {
-                tile: TileGradient { from: rgb(0x1f8fff), to: rgb(0x0a4bc2) },
-                glyph: GlyphKind::Bag,
-            },
-            meta: None,
-            launch: LaunchTarget::App { id: "store".to_string() },
-        },
-        LibraryItem {
-            id: "library".to_string(),
-            title: "Game Library".to_string(),
-            kind: ItemKind::App,
-            art: ArtSource::App {
-                tile: TileGradient { from: rgb(0x2b3a4e), to: rgb(0x17222f) },
-                glyph: GlyphKind::Grid,
-            },
-            meta: None,
-            launch: LaunchTarget::App { id: "library".to_string() },
-        },
-        LibraryItem {
-            id: "settings".to_string(),
-            title: "Settings".to_string(),
-            kind: ItemKind::App,
-            art: ArtSource::App {
-                tile: TileGradient { from: rgb(0x2b3a4e), to: rgb(0x17222f) },
-                glyph: GlyphKind::Gear,
-            },
-            meta: None,
-            launch: LaunchTarget::App { id: "settings".to_string() },
-        },
     ]
+    .into_iter()
+    .chain(built_in_apps())
+    .collect()
 }
 
 #[cfg(test)]
@@ -423,6 +443,23 @@ mod tests {
         assert_eq!(items[0].title, "Nova Requiem");
         assert_eq!(items.iter().filter(|i| i.kind == ItemKind::Game).count(), 6);
         assert_eq!(items.iter().filter(|i| i.kind == ItemKind::App).count(), 3);
+    }
+
+    #[test]
+    fn built_in_apps_always_includes_a_settings_tile() {
+        let apps = built_in_apps();
+        assert_eq!(apps.len(), 3);
+        assert!(apps.iter().all(|i| i.kind == ItemKind::App));
+        assert!(apps.iter().any(|i| i.id == "settings"), "Settings must always be reachable on the Games rail");
+    }
+
+    #[test]
+    fn sample_library_ends_with_the_built_in_apps() {
+        let items = sample_library();
+        let apps = built_in_apps();
+        let tail_ids: Vec<&str> = items[items.len() - apps.len()..].iter().map(|i| i.id.as_str()).collect();
+        let app_ids: Vec<&str> = apps.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(tail_ids, app_ids);
     }
 
     #[test]
