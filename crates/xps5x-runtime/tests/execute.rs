@@ -883,3 +883,169 @@ fn mmap_then_memset_then_readback_proves_real_arena_memory_and_records_vmm_metad
         "mapped address {mapped_addr:#x} must fall inside the arena's mmap region [{mmap_start:#x}, {mmap_end:#x})"
     );
 }
+
+// --- RT2c-a: guest stack / RSP switch (design doc §5's acceptance tests) ---
+
+/// Sentinel HLE function for the RSP-in-region test below: simply echoes
+/// back its first argument (the guest RSP the entry stub captured into
+/// `rdi` right before making this call), so the test can inspect it via the
+/// guest's own returned `RAX` — no accessor into the runtime's internals is
+/// needed.
+fn capture_rsp(_ctx: &HleContext, args: &[u64]) -> u64 {
+    args[0]
+}
+
+/// Writes `mov rdi, rsp` (`48 89 E7`) followed by `call qword ptr
+/// [rip+disp32]` (`FF 15 <disp32>`) and `ret` (`C3`) into `buf` starting at
+/// `entry_off`, targeting the 8-byte import slot at `slot_off`: the guest
+/// captures its *own* current RSP into the HLE call's first SysV argument
+/// register before trapping into the VEH, proving (via the trampoline's own
+/// established arg-marshaling path) exactly what RSP the guest was running
+/// on at the moment of the call.
+fn write_rsp_capture_entry_stub(buf: &mut [u8], entry_off: usize, slot_off: usize) {
+    let mut off = entry_off;
+
+    // mov rdi, rsp
+    buf[off] = 0x48;
+    buf[off + 1] = 0x89;
+    buf[off + 2] = 0xE7;
+    off += 3;
+
+    // call qword ptr [rip+disp32]  -> slot_off
+    let call_rip_after = off as i64 + 6;
+    let call_disp32 = (slot_off as i64 - call_rip_after) as i32;
+    buf[off] = 0xFF;
+    buf[off + 1] = 0x15;
+    buf[off + 2..off + 6].copy_from_slice(&call_disp32.to_le_bytes());
+    off += 6;
+
+    // ret
+    buf[off] = 0xC3;
+}
+
+/// RT2c-a acceptance test, part 1 (design doc §5): the guest entry captures
+/// its own RSP into the HLE trampoline call's first argument register (`rdi`)
+/// right before trapping into the VEH; the registered `sceCaptureRsp` HLE
+/// function simply echoes that value back as its return, so it ends up in
+/// the guest's own `RAX` and, after the stub's final `ret`, becomes
+/// `execute_linked`'s result. Asserts that value falls inside the arena's
+/// guest stack region — proving `entry` actually ran on the dedicated guest
+/// stack (via `dispatch::run`'s `call_on_guest_stack` RSP switch), not on the
+/// host thread's own stack.
+///
+/// Mirrors the RT2a heap-region test above: `STACK_OFFSET`/`STACK_SIZE` are
+/// duplicated here (this is a black-box integration test with no access to
+/// `xps5x_runtime::arena`'s private constants).
+#[test]
+fn guest_call_runs_on_dedicated_guest_stack_region() {
+    const ENTRY_OFF: usize = 0x0;
+    const SLOT_OFF: usize = 0x10;
+
+    const STACK_OFFSET: u64 = 0x8000_0000;
+    const STACK_SIZE: u64 = 0x2000_0000;
+
+    let hle = HleRegistry::new();
+    hle.register("libtest", "sceCaptureRsp", capture_rsp);
+    let import_nid = nid_of("sceCaptureRsp");
+
+    let mut image = vec![0u8; 0x100];
+    write_rsp_capture_entry_stub(&mut image, ENTRY_OFF, SLOT_OFF);
+
+    let module = SprxModule {
+        name: "rt2c-rsp-region-test".to_string(),
+        e_type: 0xFE18, // ET_SCE_DYNAMIC
+        segments: vec![SprxSegment {
+            vaddr: 0,
+            data: image,
+            flags: 5, // R+X
+            mem_size: 0x100,
+        }],
+        dynlib_data: None,
+        relro: None,
+        dynamic: None,
+        entry: ENTRY_OFF as u64,
+    };
+
+    let dynlib = DynlibData {
+        symbols: vec![DynSymbol {
+            nid: import_nid,
+            value: 0,
+            is_import: true,
+        }],
+        relocations: vec![SceRela {
+            offset: SLOT_OFF as u64,
+            info: R_X86_64_JUMP_SLOT, // r_sym = 0 (only symtab entry)
+            addend: 0,
+        }],
+        ..Default::default()
+    };
+
+    let db = NidDatabase::from_hle_names(hle.registered_names());
+    let registry = ModuleRegistry::new(db);
+    let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE)
+        .expect("synthetic module links against the HLE-registered sceCaptureRsp");
+    assert_eq!(linked.hle_trampolines.len(), 1, "exactly one HLE import resolved");
+
+    let kernel = OrbisKernel::new();
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
+
+    let stack_start = GUEST_ARENA_BASE + STACK_OFFSET;
+    let stack_end = GUEST_ARENA_BASE + STACK_OFFSET + STACK_SIZE;
+    assert!(
+        result >= stack_start && result < stack_end,
+        "guest RSP {result:#x} observed during the HLE call must fall inside the arena's guest stack region \
+         [{stack_start:#x}, {stack_end:#x}) — proving entry ran on the dedicated guest stack, not the host stack"
+    );
+}
+
+/// RT2c-a acceptance test, part 2 (design doc §5): a hand-assembled guest
+/// entry that actually *uses* its stack — `sub rsp, 16; mov qword ptr [rsp],
+/// 0x1234; mov rax, [rsp]; add rsp, 16; ret` — writing a value below RSP and
+/// reading it back, proving the guest stack region is real, writable memory
+/// and that `call_on_guest_stack`'s RSP switch/restore leaves the guest able
+/// to push/pop and address its own locals correctly. No HLE import needed —
+/// hand-mapped directly, like the RT1a fault-recovery test below.
+#[test]
+fn guest_stub_uses_real_guest_stack_memory_and_returns_correct_value() {
+    const ENTRY_OFF: usize = 0x0;
+
+    let hle = HleRegistry::new();
+
+    let mut image = vec![0u8; 0x100];
+    let mut off = ENTRY_OFF;
+
+    // sub rsp, 16
+    image[off..off + 4].copy_from_slice(&[0x48, 0x83, 0xEC, 0x10]);
+    off += 4;
+
+    // mov qword ptr [rsp], 0x1234
+    image[off..off + 8].copy_from_slice(&[0x48, 0xC7, 0x04, 0x24, 0x34, 0x12, 0x00, 0x00]);
+    off += 8;
+
+    // mov rax, [rsp]
+    image[off..off + 4].copy_from_slice(&[0x48, 0x8B, 0x04, 0x24]);
+    off += 4;
+
+    // add rsp, 16
+    image[off..off + 4].copy_from_slice(&[0x48, 0x83, 0xC4, 0x10]);
+    off += 4;
+
+    // ret
+    image[off] = 0xC3;
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: ENTRY_OFF as u64,
+    };
+
+    let kernel = OrbisKernel::new();
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
+    assert_eq!(
+        result, 0x1234,
+        "a value written below RSP on the guest stack must read back correctly, proving the guest stack region \
+         is real writable memory and RSP switch/restore around the guest call is sound"
+    );
+}
