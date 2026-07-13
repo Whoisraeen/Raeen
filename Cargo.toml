@@ -12,6 +12,8 @@ members = [
     "crates/xps5x-gui",
     "crates/xps5x-firmware",
     "crates/xps5x-runtime",
+    # Kyty port (docs/superpowers/plans/2026-07-13-kyty-full-port.md)
+    "crates/kyty-core",
 ]
 
 [workspace.package]

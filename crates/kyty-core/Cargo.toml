@@ -1,0 +1,17 @@
+[package]
+name = "kyty-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# Faithful Rust port of Kyty's `lib/Core` foundation (MIT © 2021 InoriRus;
+# see /THIRD_PARTY_NOTICES.md). Std-reimplementation types are thin wrappers
+# over `std` exposing Kyty's API; see docs/superpowers/plans/
+# 2026-07-13-kyty-full-port.md for conventions.
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
