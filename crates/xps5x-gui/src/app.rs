@@ -4,12 +4,11 @@
 //! screen logic (boot, Home, Control Center, navigation, animation) lives
 //! under `shell/`; this file is intentionally thin.
 
-use crate::launcher::StubLauncher;
+use crate::launcher::FirmwareLauncher;
 use crate::library::{built_in_apps, sample_library, scan::scan_dir};
 use crate::shell::Shell;
 use crate::theme::loader::load_theme;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 /// Root directory installed Shell themes live under: `themes/<name>/
 /// theme.toml` (spec §6, §10 SM2b). Relative, like the default `Games`
@@ -43,7 +42,14 @@ impl XPS5XApp {
             library.extend(built_in_apps());
         }
 
-        let launcher = Box::new(StubLauncher::new(Duration::from_millis(900)));
+        // SM3: the Shell now hands launches to the real firmware spine
+        // (`xps5x_firmware::load_module`) instead of `StubLauncher`. It
+        // links a selected module — SELF decrypt-or-passthrough -> `.sprx`
+        // parse -> dynlibdata decode -> NID link against HLE — but does not
+        // yet execute it; see `launcher::FirmwareLauncher`'s docs. Holds no
+        // key material of its own, so encrypted retail modules fault with
+        // an informative message rather than a crash.
+        let launcher = Box::new(FirmwareLauncher::new());
 
         Self { shell: Shell::new(ctx, theme, themes_root, library, launcher, config, config_path) }
     }
