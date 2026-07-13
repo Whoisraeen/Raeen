@@ -14,6 +14,7 @@ pub const CRATE_NAME: &str = "xps5x-firmware";
 pub mod slb2;
 pub mod pup;
 pub mod crypto;
+pub mod dynlib;
 
 pub use slb2::{parse_slb2, Slb2Entry};
 pub use pup::Firmware;
