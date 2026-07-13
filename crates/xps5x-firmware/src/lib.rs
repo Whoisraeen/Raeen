@@ -19,7 +19,9 @@ pub mod report;
 
 pub use slb2::{parse_slb2, Slb2Entry};
 pub use pup::Firmware;
-pub use crypto::{require_key, KeyProvider, KeyRequest, NoKeysProvider, SegmentKey};
+pub use crypto::{
+    decrypt_self, require_key, DecryptedSelf, KeyProvider, KeyRequest, NoKeysProvider, SegmentKey,
+};
 pub use report::summarize;
 
 #[cfg(test)]

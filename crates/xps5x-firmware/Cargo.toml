@@ -11,3 +11,5 @@ xps5x-loader = { workspace = true }
 tracing = { workspace = true }
 memmap2 = { workspace = true }
 sha1 = { workspace = true }
+aes = { workspace = true }
+cbc = { workspace = true }
