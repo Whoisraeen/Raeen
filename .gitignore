@@ -44,3 +44,6 @@ logs/
 themes/*
 !themes/default/
 !themes/default/theme.toml
+
+# Claude Code worktrees / local scratch (never commit embedded git repos)
+.claude/worktrees/

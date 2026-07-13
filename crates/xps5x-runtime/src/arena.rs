@@ -246,6 +246,18 @@ impl GuestArena {
     fn lock_state(&self) -> std::sync::MutexGuard<'_, AllocState> {
         self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    /// The host address of the top (highest address) of the guest stack
+    /// region — `[base + STACK_OFFSET, base + STACK_OFFSET + STACK_SIZE)`
+    /// (design doc §2/§7, RT2c-a). This is the initial RSP a guest call
+    /// should start with; the stack grows down from here toward `base +
+    /// STACK_OFFSET`. Always 16-byte aligned: `base` (`GUEST_ARENA_BASE`),
+    /// `STACK_OFFSET`, and `STACK_SIZE` are all far-more-than-16-aligned
+    /// constants, so their sum is too — [`crate::stack::call_on_guest_stack`]
+    /// relies on this alignment.
+    pub(crate) fn stack_top(&self) -> u64 {
+        self.base + STACK_OFFSET + STACK_SIZE
+    }
 }
 
 impl Drop for GuestArena {
@@ -519,6 +531,20 @@ mod tests {
         let overflowing_addr = u64::MAX - 2;
         assert!(!arena.read(overflowing_addr, &mut mut_buf));
         assert!(!arena.write(overflowing_addr, &buf));
+    }
+
+    /// (h) `stack_top` is 16-aligned and lands exactly at the end of the
+    /// stack region (design doc §2/§7's alignment requirement for
+    /// `call_on_guest_stack`).
+    #[test]
+    fn stack_top_is_aligned_and_bounds_the_stack_region() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+
+        let top = arena.stack_top();
+        assert_eq!(top % 16, 0, "stack_top must be 16-byte aligned");
+        assert_eq!(top, GUEST_ARENA_BASE + STACK_OFFSET + STACK_SIZE);
+        assert!(top > GUEST_ARENA_BASE + STACK_OFFSET);
     }
 
     /// (g) construct, drop, construct again: the fixed base is reusable —

@@ -20,6 +20,8 @@ mod arena;
 #[cfg(target_os = "windows")]
 mod dispatch;
 #[cfg(target_os = "windows")]
+mod stack;
+#[cfg(target_os = "windows")]
 mod trampoline;
 
 use thiserror::Error;
@@ -139,8 +141,22 @@ pub fn execute_linked(
     // GuestAllocator`) all outlive this call (borrowed for its entire
     // duration); `guard`'s region covers every address
     // `module.hle_trampolines` can resolve (it was sized from that same
-    // table, immediately above).
-    unsafe { dispatch::run(entry, padded, &module.hle_trampolines, hle, kernel, &arena, &arena, &guard) }
+    // table, immediately above); `arena.stack_top()` is the 16-aligned top
+    // of `arena`'s own committed, writable stack region (RT2c-a, design doc
+    // §2/§4).
+    unsafe {
+        dispatch::run(
+            entry,
+            padded,
+            &module.hle_trampolines,
+            hle,
+            kernel,
+            &arena,
+            &arena,
+            &guard,
+            arena.stack_top(),
+        )
+    }
 }
 
 /// RT0 is Windows-first; a POSIX backend lands at a later milestone without
