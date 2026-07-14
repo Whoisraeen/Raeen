@@ -33,6 +33,7 @@ const IT_INDEX_BASE: u32 = 0x26;
 const IT_DRAW_INDEX_2: u32 = 0x27;
 const IT_NUM_INSTANCES: u32 = 0x2F;
 const IT_DISPATCH_DIRECT: u32 = 0x15;
+const IT_EVENT_WRITE: u32 = 0x46;
 const IT_SET_SH_REG: u32 = 0x76;
 /// Marker DWORD preceding a `CbSetShRegisterRange` packet.
 const SET_SH_RANGE_MARKER: u32 = 0x6875_000D;
@@ -46,6 +47,8 @@ const R_FLIP: u32 = 0x17;
 
 /// The `DRAW_INDEX_AUTO` modifier a valid call must pass.
 const DRAW_AUTO_MODIFIER: u64 = 0x4000_0000;
+/// Generic SCE "invalid argument" error (`0x8002_0000 | EINVAL`).
+const SCE_ERROR_INVALID_ARGUMENT: u64 = 0x8002_0016;
 
 /// Register the libSceAgc DCB command emitters.
 pub fn register(registry: &HleRegistry) {
@@ -82,6 +85,46 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcCbSetShRegisterRangeDirect",
         hle_cb_set_sh_register_range,
     );
+    registry.register("libSceAgc", "sceAgcInit", hle_init);
+    registry.register("libSceAgc", "sceAgcDcbEventWrite", hle_dcb_event_write);
+}
+
+/// Supported Agc register-defaults versions (see `sceAgcInit`).
+fn is_supported_version(version: u32) -> bool {
+    matches!(version, 7 | 8 | 10 | 13)
+}
+
+/// `sceAgcInit(state, version)`: initialize the Agc state for a supported
+/// register-defaults version.
+fn hle_init(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let state = args.first().copied().unwrap_or(0);
+    let version = args.get(1).copied().unwrap_or(0) as u32;
+    if state == 0 || !is_supported_version(version) {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    0
+}
+
+/// `sceAgcDcbEventWrite(dcb, eventType, eventAddress)`: emit an EVENT_WRITE
+/// packet. `eventType` ≤ 0x3F and `eventAddress` must be 0.
+fn hle_dcb_event_write(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let event_type = (args.get(1).copied().unwrap_or(0) & 0xFF) as u32;
+    let event_address = args.get(2).copied().unwrap_or(0);
+    if cb == 0 || event_type > 0x3F || event_address != 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 2) else {
+        return 0;
+    };
+    if !ctx
+        .mem
+        .write(addr, &pm4(2, IT_EVENT_WRITE, R_ZERO).to_le_bytes())
+        || !ctx.mem.write(addr + 4, &event_type.to_le_bytes())
+    {
+        return 0;
+    }
+    addr
 }
 
 /// Agc PM4 header: type-3 (`0xC000_0000`), `len_dwords` is the **total** packet
@@ -697,6 +740,42 @@ mod tests {
             hle_cb_set_sh_register_range(&ctx, &[cb, 0x400, 0x100, 1]),
             0
         );
+    }
+
+    #[test]
+    fn init_validates_version_and_event_write_emits() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // Init: supported versions {7,8,10,13} with a non-null state → OK.
+        assert_eq!(hle_init(&ctx, &[0x40, 8]), 0);
+        assert_eq!(hle_init(&ctx, &[0x40, 13]), 0);
+        assert_eq!(
+            hle_init(&ctx, &[0x40, 9]),
+            SCE_ERROR_INVALID_ARGUMENT,
+            "bad version"
+        );
+        assert_eq!(
+            hle_init(&ctx, &[0, 8]),
+            SCE_ERROR_INVALID_ARGUMENT,
+            "null state"
+        );
+
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        // EventWrite: type ≤ 0x3F, address must be 0.
+        assert_eq!(
+            hle_dcb_event_write(&ctx, &[cb, 0x40, 0]),
+            0,
+            "type > 0x3F rejected"
+        );
+        assert_eq!(
+            hle_dcb_event_write(&ctx, &[cb, 0x14, 1]),
+            0,
+            "non-zero address rejected"
+        );
+        assert_eq!(hle_dcb_event_write(&ctx, &[cb, 0x14, 0]), 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(2, IT_EVENT_WRITE, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), 0x14, "event type");
     }
 
     #[test]
