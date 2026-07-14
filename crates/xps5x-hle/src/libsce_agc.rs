@@ -32,10 +32,12 @@ const IT_INDEX_BUFFER_SIZE: u32 = 0x13;
 const IT_INDEX_BASE: u32 = 0x26;
 const IT_DRAW_INDEX_2: u32 = 0x27;
 const IT_NUM_INSTANCES: u32 = 0x2F;
+const IT_DISPATCH_DIRECT: u32 = 0x15;
 const R_ZERO: u32 = 0x00;
 const R_DRAW_INDEX_AUTO: u32 = 0x04;
 const R_DRAW_RESET: u32 = 0x05;
 const R_WAIT_FLIP_DONE: u32 = 0x06;
+const R_POP_MARKER: u32 = 0x0C;
 
 /// The `DRAW_INDEX_AUTO` modifier a valid call must pass.
 const DRAW_AUTO_MODIFIER: u64 = 0x4000_0000;
@@ -65,6 +67,8 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcDcbWaitUntilSafeForRendering",
         hle_dcb_wait_until_safe,
     );
+    registry.register("libSceAgc", "sceAgcDcbPopMarker", hle_dcb_pop_marker);
+    registry.register("libSceAgc", "sceAgcCbDispatch", hle_cb_dispatch);
 }
 
 /// Agc PM4 header: type-3 (`0xC000_0000`), `len_dwords` is the **total** packet
@@ -301,6 +305,54 @@ fn hle_dcb_wait_until_safe(ctx: &HleContext, args: &[u64]) -> u64 {
     addr
 }
 
+/// `sceAgcDcbPopMarker(dcb)`: emit a pop-marker packet (2 DWORDs).
+fn hle_dcb_pop_marker(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 2) else {
+        return 0;
+    };
+    if !ctx
+        .mem
+        .write(addr, &pm4(2, IT_NOP, R_POP_MARKER).to_le_bytes())
+        || !ctx.mem.write(addr + 4, &0u32.to_le_bytes())
+    {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcCbDispatch(cb, groupCountX, groupCountY, groupCountZ, modifier)`:
+/// emit a direct compute dispatch (5 DWORDs). The last DWORD folds the
+/// dispatch initiator bits (`(modifier & 0xA038) | 0x41`).
+fn hle_cb_dispatch(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let x = args.get(1).copied().unwrap_or(0) as u32;
+    let y = args.get(2).copied().unwrap_or(0) as u32;
+    let z = args.get(3).copied().unwrap_or(0) as u32;
+    let modifier = args.get(4).copied().unwrap_or(0) as u32;
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 5) else {
+        return 0;
+    };
+    let initiator = (modifier & 0xA038) | 0x41;
+    let ok = ctx
+        .mem
+        .write(addr, &pm4(5, IT_DISPATCH_DIRECT, R_ZERO).to_le_bytes())
+        && ctx.mem.write(addr + 4, &x.to_le_bytes())
+        && ctx.mem.write(addr + 8, &y.to_le_bytes())
+        && ctx.mem.write(addr + 12, &z.to_le_bytes())
+        && ctx.mem.write(addr + 16, &initiator.to_le_bytes());
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +491,30 @@ mod tests {
         assert_eq!(read_u32(&ctx, 0x40C), 9, "video-out handle");
         assert_eq!(read_u32(&ctx, 0x410), 1, "display buffer index");
         assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x408 + 28);
+    }
+
+    #[test]
+    fn pop_marker_and_dispatch_emit_correctly() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        // Pop marker: 2-dword packet.
+        assert_eq!(hle_dcb_pop_marker(&ctx, &[cb]), 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(2, IT_NOP, R_POP_MARKER));
+        // Dispatch: 5-dword packet with group counts + initiator.
+        let ret = hle_cb_dispatch(&ctx, &[cb, 4, 2, 1, 0]);
+        assert_eq!(ret, 0x408);
+        assert_eq!(read_u32(&ctx, 0x408), pm4(5, IT_DISPATCH_DIRECT, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x40C), 4);
+        assert_eq!(read_u32(&ctx, 0x410), 2);
+        assert_eq!(read_u32(&ctx, 0x414), 1);
+        assert_eq!(
+            read_u32(&ctx, 0x418),
+            0x41,
+            "initiator = (0 & 0xA038) | 0x41"
+        );
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x408 + 20);
     }
 
     #[test]
