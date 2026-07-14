@@ -24,9 +24,14 @@ Claude `/goal` (≤200 chars):
 |-----------|------|---------|----------|--------|-------------|
 | Kyty | `reference/kyty` | MIT | https://github.com/InoriRus/Kyty | `active` | all rows done/skip |
 | SharpEmu | `reference/sharpemu` | GPL-2.0 | https://github.com/par274/sharpemu | `active` | all rows done/skip |
-| KytyPS5 | `reference/kytyps5` | (check) | https://github.com/Nmzik/KytyPS5 | `active` (optional clone) | all rows done/skip |
-| shadPS4 | `reference/shadps4` | GPL-2.0 | https://github.com/shadps4-emu/shadPS4 | `active` (optional) | patterns only; keep if still consulting |
-| PS5SDK | `reference/ps5sdk` | GPL-2.0 | https://github.com/PS5Dev/PS5SDK | fixtures | keep for M1 toolchain builds |
+| KytyPS5 | `reference/kytyps5` | (check) | https://github.com/Nmzik/KytyPS5 | `not-cloned` | optional — clone only if a Kyty gap needs its PS5 deltas |
+| shadPS4 | `reference/shadps4` | GPL-2.0 | https://github.com/shadps4-emu/shadPS4 | `not-cloned` | optional — clone only when consulting its Orbis HLE patterns |
+| PS5SDK | `reference/ps5sdk` | GPL-2.0 | https://github.com/PS5Dev/PS5SDK | `not-cloned` | clone when building the M1 toolchain Hello World fixture |
+
+> **Actual `reference/*` scope right now: `kyty` + `sharpemu` only** (the three
+> rows above are not cloned — aspirational, and do not block the delete rule
+> for the two present trees). The "delete when fully ported" condition applies
+> only to trees that exist on disk.
 
 ---
 
