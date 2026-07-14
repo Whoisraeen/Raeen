@@ -166,12 +166,30 @@ pub struct OrbisKernel {
     pub kernel_equeue_events: DashMap<(u64, u64), EqueueUserEvent>,
     /// Next event-queue handle to hand out.
     kernel_equeue_next: std::sync::atomic::AtomicU64,
+    /// Guest network sockets (offline — no host connectivity), keyed by fd.
+    pub kernel_sockets: DashMap<i32, GuestSocket>,
+    /// Next socket fd to hand out (a high range, distinct from VFS fds).
+    kernel_socket_next: std::sync::atomic::AtomicI32,
     /// Registered pthread TLS keys → their destructor address (0 = none).
     pub pthread_tls_keys: DashMap<i32, u64>,
     /// Thread-local specific values, keyed by (thread handle, TLS key).
     pub pthread_tls_values: DashMap<(u64, i32), u64>,
     /// Next TLS key id to hand out.
     pthread_tls_next_key: std::sync::atomic::AtomicI32,
+}
+
+/// A guest network socket. XPS5X models **no host connectivity**, so a socket
+/// can be created and bound (bookkeeping the guest reads back via
+/// `getsockname`) but `connect` never succeeds. Ported from SharpEmu's socket
+/// state (GPL-2.0), minus the real host-TCP path.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GuestSocket {
+    /// Bound IPv4 address (network byte order, as the guest supplied it).
+    pub bound_ip: [u8; 4],
+    /// Bound port (host byte order).
+    pub bound_port: u16,
+    /// Whether `bind` has been called.
+    pub bound: bool,
 }
 
 /// A user event registered on a kernel event queue (`EVFILT_USER`). Ported
@@ -295,6 +313,8 @@ impl OrbisKernel {
             kernel_equeues: DashMap::new(),
             kernel_equeue_events: DashMap::new(),
             kernel_equeue_next: std::sync::atomic::AtomicU64::new(1),
+            kernel_sockets: DashMap::new(),
+            kernel_socket_next: std::sync::atomic::AtomicI32::new(0x4000_0000),
             pthread_tls_keys: DashMap::new(),
             pthread_tls_values: DashMap::new(),
             pthread_tls_next_key: std::sync::atomic::AtomicI32::new(0),
@@ -341,6 +361,16 @@ impl OrbisKernel {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.kernel_equeues.insert(handle, attributes);
         handle
+    }
+
+    /// Allocate a fresh (offline) socket fd. See the `xps5x-hle`
+    /// `kernel_socket` module.
+    pub fn create_socket(&self) -> i32 {
+        let fd = self
+            .kernel_socket_next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.kernel_sockets.insert(fd, GuestSocket::default());
+        fd
     }
 
     /// Allocate a fresh pthread TLS key registered with `destructor` (0 = none),

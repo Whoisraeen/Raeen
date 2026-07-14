@@ -25,6 +25,7 @@ pub(crate) mod fmt;
 pub mod kernel_equeue;
 pub mod kernel_eventflag;
 pub mod kernel_semaphore;
+pub mod kernel_socket;
 pub mod libc;
 pub mod libkernel;
 pub mod libsce_app_content;
@@ -154,6 +155,8 @@ impl HleRegistry {
         kernel_semaphore::register(&registry);
         // Kernel event queues + user events (supersedes libkernel's equeue stubs).
         kernel_equeue::register(&registry);
+        // BSD sockets (offline) + pure net helpers (htons/inet_pton/bzero).
+        kernel_socket::register(&registry);
         libc::register(&registry);
         libsce_sysmodule::register(&registry);
         libsce_video_out::register(&registry);
