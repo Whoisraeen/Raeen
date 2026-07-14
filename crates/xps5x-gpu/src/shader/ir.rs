@@ -4,8 +4,9 @@
 //! which is closer to SPIR-V's SSA form. This allows optimization
 //! passes before final SPIR-V emission.
 
-use super::gcn_decoder::{Encoding, Instruction};
+use super::gcn_decoder::{Encoding, Instruction, Operand};
 use super::ShaderType;
+use std::collections::HashMap;
 
 /// An IR program ready for SPIR-V emission.
 #[derive(Debug)]
@@ -129,18 +130,32 @@ pub fn lift_to_ir(instructions: &[Instruction], shader_type: ShaderType) -> IrPr
     let mut output_count = 0u32;
     let mut ubo_count = 0u32;
     let mut texture_count = 0u32;
+    // Local value numbering: which SSA value currently lives in each VGPR.
+    // A read of a VGPR no prior instruction wrote is a shader live-in.
+    let mut vgpr_def: HashMap<u32, u32> = HashMap::new();
 
     for inst in instructions {
         let node = match inst.encoding {
             Encoding::Vop2 | Encoding::Vop1 | Encoding::Vop3 => {
-                // Vector ALU → arithmetic IR ops.
+                // Vector ALU → arithmetic IR ops. Thread each decoded source
+                // operand to the SSA value it refers to.
+                let sources = inst
+                    .src
+                    .iter()
+                    .map(|op| resolve_source(op, &vgpr_def))
+                    .collect();
+
                 let result_reg = next_ssa;
                 next_ssa += 1;
+                // The destination VGPR now holds this SSA value.
+                if let Some(Operand::Vgpr(n)) = &inst.dst {
+                    vgpr_def.insert(*n, result_reg);
+                }
 
                 IrNode {
                     op: map_vop_to_ir(inst.opcode, inst.encoding),
                     result: Some(IrValue::Reg(result_reg)),
-                    sources: vec![], // Populated by detailed operand decoding.
+                    sources,
                 }
             }
             Encoding::Sop2 | Encoding::Sop1 | Encoding::Sopk => {
@@ -230,6 +245,26 @@ pub fn lift_to_ir(instructions: &[Instruction], shader_type: ShaderType) -> IrPr
     }
 }
 
+/// Resolve a decoded GCN operand to the IR value it references.
+///
+/// A VGPR read resolves to the SSA value a prior instruction wrote into it
+/// (`vgpr_def`); a VGPR with no prior definition is a shader live-in
+/// (`Input`). Inline integer constants and literals fold to IR constants.
+/// SGPR/special sources are modelled as live-ins for now (a full port needs a
+/// parallel scalar SSA map — see the ledger's remaining-work note).
+fn resolve_source(op: &Operand, vgpr_def: &HashMap<u32, u32>) -> IrValue {
+    match op {
+        Operand::Vgpr(n) => match vgpr_def.get(n) {
+            Some(&ssa) => IrValue::Reg(ssa),
+            None => IrValue::Input(*n),
+        },
+        Operand::Sgpr(n) => IrValue::Input(*n),
+        Operand::InlineConst(c) => IrValue::ConstI32(*c),
+        Operand::Literal(bits) => IrValue::ConstU32(*bits),
+        Operand::Special(_) => IrValue::Input(0),
+    }
+}
+
 /// Map VOP opcodes to IR operations (simplified).
 fn map_vop_to_ir(opcode: u32, encoding: Encoding) -> IrOp {
     match encoding {
@@ -287,6 +322,8 @@ mod tests {
     use super::*;
     use crate::shader::gcn_decoder::{Encoding, Instruction};
 
+    use crate::shader::gcn_decoder::Operand;
+
     /// Build a bare decoded instruction of the given encoding/opcode. Operand
     /// fields stay empty — `lift_to_ir` classifies by encoding+opcode, which is
     /// exactly the surface under test here.
@@ -297,6 +334,19 @@ mod tests {
             raw: 0,
             src: vec![],
             dst: None,
+            size: 4,
+            offset: 0,
+        }
+    }
+
+    /// Build a VOP2 instruction with explicit operands.
+    fn vop2(opcode: u32, src: Vec<Operand>, dst: Operand) -> Instruction {
+        Instruction {
+            encoding: Encoding::Vop2,
+            opcode,
+            raw: 0,
+            src,
+            dst: Some(dst),
             size: 4,
             offset: 0,
         }
@@ -370,6 +420,49 @@ mod tests {
         assert_eq!(prog.nodes[1].op, IrOp::Return, "S_ENDPGM -> Return");
         assert!(prog.nodes[1].result.is_none());
         assert_eq!(prog.output_count, 1, "the EXP bumped the output count");
+    }
+
+    #[test]
+    fn sources_thread_vgpr_defs_into_an_ssa_def_use_chain() {
+        // v2 = v0 + v1        (node 0, SSA reg 0; v0/v1 are live-ins)
+        // v3 = v2 * v2        (node 1, SSA reg 1; both operands are node 0's def)
+        let stream = [
+            vop2(
+                0x01,
+                vec![Operand::Vgpr(0), Operand::Vgpr(1)],
+                Operand::Vgpr(2),
+            ),
+            vop2(
+                0x04,
+                vec![Operand::Vgpr(2), Operand::Vgpr(2)],
+                Operand::Vgpr(3),
+            ),
+        ];
+        let prog = lift_to_ir(&stream, ShaderType::Vertex);
+
+        // Node 0: reads two undefined VGPRs → live-in Inputs; defines SSA 0.
+        assert_eq!(prog.nodes[0].op, IrOp::Add);
+        assert!(matches!(prog.nodes[0].result, Some(IrValue::Reg(0))));
+        assert!(matches!(prog.nodes[0].sources[0], IrValue::Input(0)));
+        assert!(matches!(prog.nodes[0].sources[1], IrValue::Input(1)));
+
+        // Node 1: both operands read v2, which node 0 wrote → SSA reg 0.
+        assert_eq!(prog.nodes[1].op, IrOp::Mul);
+        assert!(matches!(prog.nodes[1].result, Some(IrValue::Reg(1))));
+        assert!(matches!(prog.nodes[1].sources[0], IrValue::Reg(0)));
+        assert!(matches!(prog.nodes[1].sources[1], IrValue::Reg(0)));
+    }
+
+    #[test]
+    fn inline_constants_fold_into_ir_source_values() {
+        // v1 = v0 + (inline 5)
+        let stream = [vop2(
+            0x01,
+            vec![Operand::Vgpr(0), Operand::InlineConst(5)],
+            Operand::Vgpr(1),
+        )];
+        let prog = lift_to_ir(&stream, ShaderType::Vertex);
+        assert!(matches!(prog.nodes[0].sources[1], IrValue::ConstI32(5)));
     }
 
     #[test]
