@@ -160,12 +160,32 @@ pub struct OrbisKernel {
     pub kernel_semaphores: DashMap<u32, Semaphore>,
     /// Next semaphore handle to hand out.
     kernel_semaphore_next: std::sync::atomic::AtomicU32,
+    /// Kernel event queues (existence), keyed by handle → attributes.
+    pub kernel_equeues: DashMap<u64, u32>,
+    /// Registered user events on event queues, keyed by (equeue, ident).
+    pub kernel_equeue_events: DashMap<(u64, u64), EqueueUserEvent>,
+    /// Next event-queue handle to hand out.
+    kernel_equeue_next: std::sync::atomic::AtomicU64,
     /// Registered pthread TLS keys → their destructor address (0 = none).
     pub pthread_tls_keys: DashMap<i32, u64>,
     /// Thread-local specific values, keyed by (thread handle, TLS key).
     pub pthread_tls_values: DashMap<(u64, i32), u64>,
     /// Next TLS key id to hand out.
     pthread_tls_next_key: std::sync::atomic::AtomicI32,
+}
+
+/// A user event registered on a kernel event queue (`EVFILT_USER`). Ported
+/// from SharpEmu's event-queue registration (GPL-2.0). `Trigger` marks it
+/// pending with `udata`; `WaitEqueue` delivers pending events and (edge)
+/// clears them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EqueueUserEvent {
+    /// User data delivered with the event.
+    pub udata: u64,
+    /// Whether the event is currently pending (triggered, not yet delivered).
+    pub triggered: bool,
+    /// Trigger count (delivered as the event's `fflags`).
+    pub fflags: u32,
 }
 
 /// A kernel counting semaphore. Ported from SharpEmu's `KernelSemaphoreState`
@@ -272,6 +292,9 @@ impl OrbisKernel {
             kernel_event_flag_next: std::sync::atomic::AtomicU64::new(1),
             kernel_semaphores: DashMap::new(),
             kernel_semaphore_next: std::sync::atomic::AtomicU32::new(1),
+            kernel_equeues: DashMap::new(),
+            kernel_equeue_events: DashMap::new(),
+            kernel_equeue_next: std::sync::atomic::AtomicU64::new(1),
             pthread_tls_keys: DashMap::new(),
             pthread_tls_values: DashMap::new(),
             pthread_tls_next_key: std::sync::atomic::AtomicI32::new(0),
@@ -307,6 +330,16 @@ impl OrbisKernel {
                 max_count: max,
             },
         );
+        handle
+    }
+
+    /// Create an event queue with `attributes`, returning its handle. See the
+    /// `xps5x-hle` `kernel_equeue` module.
+    pub fn create_equeue(&self, attributes: u32) -> u64 {
+        let handle = self
+            .kernel_equeue_next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.kernel_equeues.insert(handle, attributes);
         handle
     }
 

@@ -22,6 +22,7 @@
 //! | libSceSysmodule.sprx | Partial | Module registry |
 
 pub(crate) mod fmt;
+pub mod kernel_equeue;
 pub mod kernel_eventflag;
 pub mod kernel_semaphore;
 pub mod libc;
@@ -151,6 +152,8 @@ impl HleRegistry {
         kernel_eventflag::register(&registry);
         // Kernel counting semaphores (create/signal/wait/poll/cancel/delete).
         kernel_semaphore::register(&registry);
+        // Kernel event queues + user events (supersedes libkernel's equeue stubs).
+        kernel_equeue::register(&registry);
         libc::register(&registry);
         libsce_sysmodule::register(&registry);
         libsce_video_out::register(&registry);

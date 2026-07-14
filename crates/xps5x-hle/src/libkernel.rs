@@ -398,8 +398,8 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadCondInit", hle_pthread_cond_init);
     registry.register("libkernel", "scePthreadCondWait", hle_pthread_cond_wait);
     registry.register("libkernel", "scePthreadCondSignal", hle_pthread_cond_signal);
-    registry.register("libkernel", "sceKernelCreateEqueue", hle_create_equeue);
-    registry.register("libkernel", "sceKernelWaitEqueue", hle_wait_equeue);
+    // sceKernelCreateEqueue/WaitEqueue are registered by the `kernel_equeue`
+    // module (real user-event queue) — see xps5x_hle::kernel_equeue.
 
     // -- Misc / process / clock --
     registry.register("libkernel", "sceKernelGetProcessType", hle_get_process_type);
@@ -713,20 +713,6 @@ fn hle_pthread_cond_wait(_ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_pthread_cond_signal(_ctx: &HleContext, args: &[u64]) -> u64 {
     debug!(
         "scePthreadCondSignal(cond={:#x})",
-        args.first().copied().unwrap_or(0)
-    );
-    0
-}
-
-/// Stub: returns a fake, always-`1` event-queue handle.
-fn hle_create_equeue(_ctx: &HleContext, _args: &[u64]) -> u64 {
-    debug!("sceKernelCreateEqueue()");
-    1
-}
-
-fn hle_wait_equeue(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!(
-        "sceKernelWaitEqueue(eq={:#x})",
         args.first().copied().unwrap_or(0)
     );
     0
