@@ -44,6 +44,14 @@ pub fn register(registry: &HleRegistry) {
         hle_get_reachability,
     );
     registry.register("libSceNpManager", "sceNpGameIntentInitialize", hle_ok);
+    // libSceNpManagerForToolkit is a sibling library (same offline Np state);
+    // its state callback registration behaves like the base one. Ported from
+    // SharpEmu's `NpManagerExports` (GPL-2.0).
+    registry.register(
+        "libSceNpManagerForToolkit",
+        "sceNpRegisterStateCallbackForToolkit",
+        hle_register_callback,
+    );
 }
 
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
@@ -122,6 +130,15 @@ mod tests {
         assert!(mem.read(0x100, &mut s));
         assert_eq!(u32::from_le_bytes(s), NP_STATE_SIGNED_OUT);
         assert_eq!(hle_get_state(&ctx, &[1000, 0]), ERROR_INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn np_manager_for_toolkit_state_callback_is_registered() {
+        let reg = HleRegistry::new();
+        assert!(reg.is_implemented(
+            "libSceNpManagerForToolkit",
+            "sceNpRegisterStateCallbackForToolkit"
+        ));
     }
 
     #[test]

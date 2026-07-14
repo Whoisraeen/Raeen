@@ -183,6 +183,24 @@ pub struct OrbisKernel {
     pub pthread_tls_values: DashMap<(u64, i32), u64>,
     /// Next TLS key id to hand out.
     pthread_tls_next_key: std::sync::atomic::AtomicI32,
+    /// libSceHttp contexts (existence set for `sceHttpTerm`), keyed by context
+    /// id → recorded pool size. Ported from SharpEmu HttpExports (GPL-2.0).
+    pub http_contexts: DashMap<i32, u64>,
+    /// Next libSceHttp context id (increment-before-use; first id is 1).
+    pub http_next_context: std::sync::atomic::AtomicI32,
+    /// libSceHttp templates, keyed by template id → owning context id (so
+    /// `sceHttpTerm` can cascade-remove all of a context's templates).
+    pub http_templates: DashMap<i32, i32>,
+    /// Next libSceHttp template id (starts at 0x1000).
+    pub http_next_template: std::sync::atomic::AtomicI32,
+    /// libSceHttp2 contexts, keyed by context id → recorded pool size.
+    pub http2_contexts: DashMap<i32, u64>,
+    /// Next libSceHttp2 context id (increment-before-use; first id is 1).
+    pub http2_next_context: std::sync::atomic::AtomicI32,
+    /// libSceSsl contexts, keyed by context id → recorded pool size.
+    pub ssl_contexts: DashMap<i32, u64>,
+    /// Next libSceSsl context id (increment-before-use; first id is 1).
+    pub ssl_next_context: std::sync::atomic::AtomicI32,
 }
 
 /// A guest network socket. XPS5X models **no host connectivity**, so a socket
@@ -328,6 +346,14 @@ impl OrbisKernel {
             pthread_tls_keys: DashMap::new(),
             pthread_tls_values: DashMap::new(),
             pthread_tls_next_key: std::sync::atomic::AtomicI32::new(0),
+            http_contexts: DashMap::new(),
+            http_next_context: std::sync::atomic::AtomicI32::new(0),
+            http_templates: DashMap::new(),
+            http_next_template: std::sync::atomic::AtomicI32::new(0x1000),
+            http2_contexts: DashMap::new(),
+            http2_next_context: std::sync::atomic::AtomicI32::new(0),
+            ssl_contexts: DashMap::new(),
+            ssl_next_context: std::sync::atomic::AtomicI32::new(0),
         }
     }
 

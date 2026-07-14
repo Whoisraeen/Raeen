@@ -1,7 +1,7 @@
 //! HLE for small headless system/peripheral libraries: **libSceMouse**,
 //! **libSceIme** (on-screen keyboard), **libSceGameUpdate**,
-//! **libSceSystemGesture** (touch recognizers), **libSceShare**, and
-//! **libSceNpGameIntent**.
+//! **libSceSystemGesture** (touch recognizers), and **libSceNpGameIntent**.
+//! (libSceShareUtility lives in `libsce_share.rs`.)
 //!
 //! XPS5X runs headless with no mouse, no active IME session, no touch input, no
 //! store connection, and no share facility, so each of these reports its benign
@@ -73,9 +73,10 @@ pub fn register(registry: &HleRegistry) {
         hle_ok,
     );
 
-    // libSceShare — no share/broadcast facility; initialization succeeds.
-    registry.register("libSceShare", "sceShareInitialize", hle_ok);
-    registry.register("libSceShare", "sceShareSetContentParam", hle_ok);
+    // libSceShareUtility (sceShareInitialize/sceShareSetContentParam) is ported
+    // faithfully in `libsce_share.rs` under its correct SharpEmu library name;
+    // it is registered there (the old `libSceShare` stubs here were a wrong-name
+    // duplicate — NIDs are computed from the function name, so they collided).
 
     // libSceNpGameIntent — no game-intent events offline.
     registry.register("libSceNpGameIntent", "sceNpGameIntentInitialize", hle_ok);
@@ -106,7 +107,6 @@ mod tests {
             ("libSceGameUpdate", "sceGameUpdateInitialize"),
             ("libSceSystemGesture", "sceSystemGestureGetTouchEventsCount"),
             ("libSceSystemGesture", "sceSystemGestureOpen"),
-            ("libSceShare", "sceShareInitialize"),
             ("libSceNpGameIntent", "sceNpGameIntentInitialize"),
         ] {
             let kernel = xps5x_kernel::OrbisKernel::new();

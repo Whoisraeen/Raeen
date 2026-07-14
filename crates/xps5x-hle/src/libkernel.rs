@@ -393,6 +393,9 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadCreate", hle_pthread_create);
     registry.register("libkernel", "scePthreadJoin", hle_pthread_join);
     registry.register("libkernel", "scePthreadExit", hle_pthread_exit);
+    // libScePosix aliases the POSIX name `pthread_exit` onto the same handler
+    // (its sole export; ported from SharpEmu's `libScePosix` in KernelExports).
+    registry.register("libScePosix", "pthread_exit", hle_pthread_exit);
     // scePthreadMutex* are registered by the `pthread_sync` module (real state
     // machine) — see xps5x_hle::pthread_sync.
     registry.register("libkernel", "scePthreadCondInit", hle_pthread_cond_init);

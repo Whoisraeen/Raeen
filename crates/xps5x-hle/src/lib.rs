@@ -32,20 +32,30 @@ pub mod libsce_agc;
 pub mod libsce_ampr;
 pub mod libsce_app_content;
 pub mod libsce_audio_out;
+pub mod libsce_audio_out2;
 pub mod libsce_common_dialog;
+pub mod libsce_coredump;
 pub mod libsce_disc_map;
 pub mod libsce_fiber;
 pub mod libsce_gnm_driver;
+pub mod libsce_http;
 pub mod libsce_json;
 pub mod libsce_media;
 pub mod libsce_net;
 pub mod libsce_np;
+pub mod libsce_np_entitlement;
+pub mod libsce_np_session_signaling;
+pub mod libsce_np_trophy2;
+pub mod libsce_np_universal_data;
+pub mod libsce_np_web_api2;
 pub mod libsce_pad;
 pub mod libsce_peripheral;
 pub mod libsce_playgo;
 pub mod libsce_rtc;
 pub mod libsce_save_data;
 pub mod libsce_save_data_dialog;
+pub mod libsce_share;
+pub mod libsce_ssl;
 pub mod libsce_sysmodule;
 pub mod libsce_system_service;
 pub mod libsce_user_service;
@@ -185,6 +195,17 @@ impl HleRegistry {
         libsce_media::register(&registry);
         libsce_agc::register(&registry);
         libsce_ampr::register(&registry);
+        // SharpEmu-ported service-library handshake stubs (no host backend):
+        libsce_np_trophy2::register(&registry);
+        libsce_np_universal_data::register(&registry);
+        libsce_np_web_api2::register(&registry);
+        libsce_np_entitlement::register(&registry);
+        libsce_np_session_signaling::register(&registry);
+        libsce_http::register(&registry);
+        libsce_ssl::register(&registry);
+        libsce_audio_out2::register(&registry);
+        libsce_coredump::register(&registry);
+        libsce_share::register(&registry);
 
         info!(
             "HLE registry: {} functions registered",
