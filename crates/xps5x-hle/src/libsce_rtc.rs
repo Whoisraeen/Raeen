@@ -28,6 +28,10 @@ const ERR_INVALID_MINUTE: u64 = 0x80B5_000C;
 const ERR_INVALID_SECOND: u64 = 0x80B5_000D;
 const ERR_INVALID_MICROSECOND: u64 = 0x80B5_000E;
 
+/// Microseconds from `0001-01-01` (the Rtc tick epoch) to the Unix epoch
+/// (`1970-01-01`). Adding host Unix-microseconds to this yields an Rtc tick.
+const UNIX_EPOCH_TICKS: u64 = 62_135_596_800_000_000;
+
 const MICROSECONDS_PER_SECOND: u64 = 1_000_000;
 const MICROSECONDS_PER_MINUTE: u64 = 60 * MICROSECONDS_PER_SECOND;
 const MICROSECONDS_PER_HOUR: u64 = 60 * MICROSECONDS_PER_MINUTE;
@@ -42,6 +46,29 @@ pub fn register(registry: &HleRegistry) {
         "libSceRtc",
         "sceRtcGetTickResolution",
         hle_get_tick_resolution,
+    );
+    // Wall-clock "current tick" family — all report the host UTC time as an
+    // Rtc tick (offline: no separate network clock).
+    registry.register("libSceRtc", "sceRtcGetCurrentTick", hle_get_current_tick);
+    registry.register(
+        "libSceRtc",
+        "sceRtcGetCurrentNetworkTick",
+        hle_get_current_tick,
+    );
+    registry.register(
+        "libSceRtc",
+        "sceRtcGetCurrentRawNetworkTick",
+        hle_get_current_tick,
+    );
+    registry.register(
+        "libSceRtc",
+        "sceRtcGetCurrentAdNetworkTick",
+        hle_get_current_tick,
+    );
+    registry.register(
+        "libSceRtc",
+        "sceRtcGetCurrentDebugNetworkTick",
+        hle_get_current_tick,
     );
     registry.register("libSceRtc", "sceRtcIsLeapYear", hle_is_leap_year);
     registry.register("libSceRtc", "sceRtcGetDaysInMonth", hle_get_days_in_month);
@@ -110,6 +137,30 @@ fn day_of_week(mut year: i32, month: i32, day: i32) -> i32 {
 /// `sceRtcGetTickResolution()`: microsecond ticks → 1,000,000 per second.
 fn hle_get_tick_resolution(_ctx: &HleContext, _args: &[u64]) -> u64 {
     MICROSECONDS_PER_SECOND
+}
+
+/// The current host UTC time as an Rtc tick (microseconds since 0001-01-01).
+/// A pre-epoch host clock clamps to the epoch base rather than wrapping.
+fn current_tick() -> u64 {
+    let unix_micros = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_micros() as u64,
+        Err(_) => 0,
+    };
+    UNIX_EPOCH_TICKS.saturating_add(unix_micros)
+}
+
+/// `sceRtcGetCurrentTick(SceRtcTick *out)` and the network-tick aliases: write
+/// the current host UTC time as an Rtc tick. Offline, the "network" clock is
+/// just the wall clock.
+fn hle_get_current_tick(ctx: &HleContext, args: &[u64]) -> u64 {
+    let out = args.first().copied().unwrap_or(0);
+    if out == 0 {
+        return ERR_INVALID_POINTER;
+    }
+    if !ctx.mem.write(out, &current_tick().to_le_bytes()) {
+        return ERR_INVALID_POINTER;
+    }
+    OK
 }
 
 /// `sceRtcIsLeapYear(year)`: 1 if leap, 0 if not, error for an out-of-range year.
@@ -314,6 +365,25 @@ mod tests {
         write_dt(2024, 1, 1, 24, 0, 0, 0);
         assert_eq!(hle_check_valid(&ctx, &[0x40]), ERR_INVALID_HOUR);
         assert_eq!(hle_check_valid(&ctx, &[0]), ERR_INVALID_POINTER);
+    }
+
+    #[test]
+    fn current_tick_is_a_plausible_recent_wall_clock() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // Rtc tick for 2020-01-01 = UNIX_EPOCH_TICKS + (50 years of µs).
+        let tick_2020 = UNIX_EPOCH_TICKS + 1_577_836_800 * MICROSECONDS_PER_SECOND;
+        assert_eq!(hle_get_current_tick(&ctx, &[0x100]), OK);
+        let mut buf = [0u8; 8];
+        assert!(ctx.mem.read(0x100, &mut buf));
+        let t1 = u64::from_le_bytes(buf);
+        assert!(t1 > tick_2020, "current tick must be after 2020 (got {t1})");
+        // A second sample is monotonic non-decreasing.
+        assert_eq!(hle_get_current_tick(&ctx, &[0x108]), OK);
+        assert!(ctx.mem.read(0x108, &mut buf));
+        assert!(u64::from_le_bytes(buf) >= t1);
+        // NULL out-pointer → error.
+        assert_eq!(hle_get_current_tick(&ctx, &[0]), ERR_INVALID_POINTER);
     }
 
     #[test]
