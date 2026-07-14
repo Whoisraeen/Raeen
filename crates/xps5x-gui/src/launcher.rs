@@ -153,6 +153,15 @@ impl GameLauncher for StubLauncher {
 /// `R_X86_64_RELATIVE` relocation resolve to the wrong host address.
 const DEFAULT_LOAD_BASE: u64 = xps5x_runtime::GUEST_ARENA_BASE;
 
+/// `argv[0]` every launched module sees (M1-A, crt0/process environment):
+/// the PS4/PS5 convention mounts a title's content at `/app0`, so its main
+/// module is `/app0/eboot.bin` regardless of where the file lives on the
+/// host. The host path is deliberately *not* leaked into the guest — a real
+/// filesystem mapping layer (host dir ↔ `/app0`) comes with save-data/file
+/// I/O work, but the argv convention is stable now.
+#[cfg(target_os = "windows")]
+const GUEST_ARGV0: &str = "/app0/eboot.bin";
+
 /// What came of trying to load+link (and, on Windows, run) one module for a
 /// launch.
 #[derive(Debug, Clone)]
@@ -175,13 +184,24 @@ enum SessionOutcome {
         #[allow(dead_code)]
         image_size: usize,
     },
-    /// Linked *and* executed (Windows only, RT1b): `xps5x_runtime::execute_linked`
-    /// ran the module's entry point to completion and returned. This does
-    /// not mean the module "plays" anything — RT0/RT1 is an early native
-    /// call-and-return runtime with no process environment yet (see
-    /// `session_detail`'s honest wording).
+    /// Linked and executed as a process (Windows only, M1-A), but the
+    /// module's `_start` *returned* instead of calling an exit-family
+    /// function — malformed for a real program (`_start` is entered via
+    /// `jmp` with no return address; see `xps5x_runtime::execute_process`),
+    /// tolerated and reported honestly rather than treated as a fault.
     Ran {
         returned: u64,
+        resolved: usize,
+        unresolved: usize,
+    },
+    /// Linked and executed as a real process (Windows only, M1-A):
+    /// `xps5x_runtime::execute_process` entered the module's `_start` on a
+    /// genuine argc/argv/envp/auxv stack and the module ended itself via an
+    /// exit-family call — the well-formed way a process run ends. This does
+    /// not mean the module "plays" anything; it means the crt0/process
+    /// contract held from Shell to exit.
+    Exited {
+        code: u64,
         resolved: usize,
         unresolved: usize,
     },
@@ -280,8 +300,16 @@ impl FirmwareLauncher {
 
         #[cfg(target_os = "windows")]
         {
-            match xps5x_runtime::execute_linked(&linked, &self.hle, &self.kernel, linked.entry, &[]) {
-                Ok(returned) => SessionOutcome::Ran { returned, resolved, unresolved },
+            // M1-A: enter the module as a real process — `_start` on a
+            // genuine argc/argv/envp/auxv stack (`execute_process`), not a
+            // bare 6-register function call. A well-formed run ends via an
+            // exit-family call (`Exited`); a `_start` that returns anyway is
+            // reported as `Ran` (malformed but tolerated).
+            match xps5x_runtime::execute_process(&linked, &self.hle, &self.kernel, &[GUEST_ARGV0], &[]) {
+                Ok(xps5x_runtime::RunOutcome::Exited(code)) => SessionOutcome::Exited { code, resolved, unresolved },
+                Ok(xps5x_runtime::RunOutcome::Returned(returned)) => {
+                    SessionOutcome::Ran { returned, resolved, unresolved }
+                }
                 Err(xps5x_runtime::RuntimeError::Faulted { addr }) => {
                     SessionOutcome::Faulted(format!("Faulted at {addr:#x} during execution"))
                 }
@@ -332,6 +360,11 @@ impl GameLauncher for FirmwareLauncher {
             Some(session) => match &session.outcome {
                 SessionOutcome::Linked { .. } => SessionState::Running,
                 SessionOutcome::Ran { .. } => SessionState::Running,
+                // A run that ended via exit() stays `Running` so the session
+                // overlay shows the outcome until the user quits — the Shell
+                // auto-returns Home the moment it polls `Exited` (see
+                // `shell/mod.rs`), which would flash past the detail text.
+                SessionOutcome::Exited { .. } => SessionState::Running,
                 SessionOutcome::Faulted(_) => SessionState::Faulted,
             },
         }
@@ -344,8 +377,12 @@ impl GameLauncher for FirmwareLauncher {
                 "Linked — {resolved} imports resolved to HLE, {unresolved} unresolved · execution not yet implemented (Esc to return)"
             ),
             SessionOutcome::Ran { returned, resolved, unresolved } => format!(
-                "Executed — entry returned {returned:#x} · {resolved} HLE calls resolved, {unresolved} unresolved \
-                 (early runtime — full game execution needs more HLE + a process environment)"
+                "Executed — _start returned {returned:#x} (malformed: a process ends via exit) · \
+                 {resolved} HLE imports resolved, {unresolved} unresolved"
+            ),
+            SessionOutcome::Exited { code, resolved, unresolved } => format!(
+                "Ran to exit({code:#x}) — {resolved} HLE imports resolved, {unresolved} unresolved \
+                 (early runtime — full game execution needs more HLE breadth)"
             ),
             SessionOutcome::Faulted(message) => message.clone(),
         })
@@ -425,10 +462,11 @@ mod firmware_launcher_tests {
     // `PT_DYNAMIC`/`PT_SCE_DYNLIBDATA` at all — the load-module pipeline
     // treats that as a module with zero imports/exports, not an error, so it
     // links cleanly with `resolved == 0` and `unresolved == 0`. On Windows,
-    // RT1b's `FirmwareLauncher` now actually *executes* this too (`e_entry`
-    // defaults to 0, and the segment's first byte is a bare `ret`, so the
-    // entry returns immediately instead of running past whatever garbage
-    // follows). Entirely synthetic bytes; no real firmware anywhere.
+    // M1-A's `FirmwareLauncher` executes this as a *process* (`e_entry`
+    // defaults to 0, and the segment's first byte is a bare `ret` — a
+    // malformed `_start` that pops `argc` off the process stack and jumps to
+    // it as an address, faulting at Rip == argc == 1). Entirely synthetic
+    // bytes; no real firmware anywhere.
 
     const EHDR_SIZE: usize = 64;
     const PHDR_SIZE: usize = 56;
@@ -545,22 +583,26 @@ mod firmware_launcher_tests {
         let target = LaunchTarget::Game { path };
         let handle = launcher.launch(&target).expect("launch always returns a handle");
 
-        assert_eq!(launcher.session_state(&handle), SessionState::Running);
-        let detail = launcher.session_detail(&handle).expect("a running session has detail text");
-
-        // On Windows, RT1b actually runs this module's entry (a bare `ret`)
-        // through the runtime, so the outcome is `Ran`, not `Linked`. Every
-        // other target has no runtime backend, so `execute_linked` is never
-        // reached and the pipeline stops at `Linked` (see `load`'s `#[cfg]`
-        // gate).
+        // On Windows, M1-A runs this module as a process. A bare `ret` at
+        // `_start` is malformed (entered via `jmp`, there is no return
+        // address): it pops `argc` (== 1, one argv entry) and jumps to it,
+        // faulting at Rip == 0x1 — itself proof the process stack delivered
+        // a real `argc` at the entry's first instruction. Every other target
+        // has no runtime backend, so execution is never reached and the
+        // pipeline stops at `Linked` (see `load`'s `#[cfg]` gate).
         #[cfg(target_os = "windows")]
         {
-            assert!(detail.starts_with("Executed — entry returned 0x"), "unexpected message: {detail}");
-            assert!(detail.contains("0 HLE calls resolved"), "unexpected message: {detail}");
-            assert!(detail.contains("0 unresolved"), "unexpected message: {detail}");
+            assert_eq!(launcher.session_state(&handle), SessionState::Faulted);
+            let detail = launcher.session_detail(&handle).expect("a faulted session has detail text");
+            assert!(
+                detail.starts_with("Faulted at 0x1 during execution"),
+                "a bare-ret _start must fault at Rip == argc == 1 — unexpected message: {detail}"
+            );
         }
         #[cfg(not(target_os = "windows"))]
         {
+            assert_eq!(launcher.session_state(&handle), SessionState::Running);
+            let detail = launcher.session_detail(&handle).expect("a running session has detail text");
             assert!(detail.contains("0 imports resolved to HLE"), "unexpected message: {detail}");
             assert!(detail.contains("0 unresolved"), "unexpected message: {detail}");
             assert!(detail.contains("execution not yet implemented"), "unexpected message: {detail}");
@@ -577,6 +619,13 @@ mod firmware_launcher_tests {
 
         let launcher = FirmwareLauncher::new();
         let handle = launcher.launch(&LaunchTarget::Game { path }).expect("launch should succeed");
+        // The minimal bare-`ret` fixture faults as a process on Windows (see
+        // `valid_synthetic_module_links_and_exposes_resolved_counts`) and
+        // stops at `Linked` (`Running`) elsewhere — either way, `quit` must
+        // transition the session to `Exited`.
+        #[cfg(target_os = "windows")]
+        assert_eq!(launcher.session_state(&handle), SessionState::Faulted);
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(launcher.session_state(&handle), SessionState::Running);
 
         launcher.quit(&handle).expect("quit should succeed");
@@ -774,10 +823,13 @@ mod firmware_launcher_tests {
             0xC0DE
         }
 
-        /// The genuine RT1b acceptance test: the shell's `FirmwareLauncher`
-        /// loads a synthetic `.sprx` whose entry calls a real HLE-registered
-        /// import and asserts that `session_detail` reports the sentinel
-        /// value the HLE function returned — i.e. the module really ran.
+        /// The genuine HLE-dispatch acceptance test: the shell's
+        /// `FirmwareLauncher` loads a synthetic `_start`-shaped `.sprx` whose
+        /// entry calls a real HLE-registered import, moves its return value
+        /// into `rdi`, and passes it to the imported `exit` — asserting that
+        /// `session_detail` reports the sentinel value as the exit code,
+        /// i.e. the module really ran, HLE dispatch really happened, and the
+        /// run ended the well-formed process way (M1-A).
         ///
         /// Constructs `FirmwareLauncher` via its private-field struct
         /// literal (this test module is a descendant of `launcher`, so the
@@ -790,7 +842,8 @@ mod firmware_launcher_tests {
         fn play_executes_module_and_reports_sentinel_return_value() {
             let hle = xps5x_hle::HleRegistry::new();
             hle.register("libtest", "sceTestSentinel", sentinel);
-            let import_nid = xps5x_firmware::dynlib::nid::nid_of("sceTestSentinel");
+            let sentinel_nid = xps5x_firmware::dynlib::nid::nid_of("sceTestSentinel");
+            let exit_nid = xps5x_firmware::dynlib::nid::nid_of("exit");
 
             let nid_db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
             let launcher = FirmwareLauncher {
@@ -801,9 +854,42 @@ mod firmware_launcher_tests {
                 next_id: Mutex::new(0),
             };
 
+            const SLOT_SENTINEL_OFF: usize = 0x40;
+            const SLOT_EXIT_OFF: usize = 0x48;
+            let (dynlib_blob, dynamic_bytes) = build_dynlib_and_dynamic_multi(&[
+                (sentinel_nid, SLOT_SENTINEL_OFF as u64),
+                (exit_nid, SLOT_EXIT_OFF as u64),
+            ]);
+
+            let mut load_bytes = vec![0u8; 0x100];
+            // call qword ptr [rip+disp32] -> sentinel slot
+            let call1_disp32 = (SLOT_SENTINEL_OFF as i64 - 6) as i32;
+            load_bytes[0] = 0xFF;
+            load_bytes[1] = 0x15;
+            load_bytes[2..6].copy_from_slice(&call1_disp32.to_le_bytes());
+            // mov rdi, rax — the sentinel's return value becomes exit's arg
+            load_bytes[6..9].copy_from_slice(&[0x48, 0x89, 0xC7]);
+            // call qword ptr [rip+disp32] -> exit slot (never returns)
+            let call2_disp32 = (SLOT_EXIT_OFF as i64 - 15) as i32;
+            load_bytes[9] = 0xFF;
+            load_bytes[10] = 0x15;
+            load_bytes[11..15].copy_from_slice(&call2_disp32.to_le_bytes());
+
+            let elf = build_elf_with_entry(
+                ET_SCE_DYNAMIC,
+                0x0,
+                &[
+                    PhdrSpec { p_type: PT_LOAD, p_flags: 5, p_vaddr: 0, data: load_bytes },
+                    PhdrSpec { p_type: 0x6100_0000 /* PT_SCE_DYNLIBDATA */, p_flags: 4, p_vaddr: 0, data: dynlib_blob },
+                    PhdrSpec { p_type: PT_DYNAMIC, p_flags: 6, p_vaddr: 0x2000, data: dynamic_bytes },
+                ],
+            );
+            let sprx_bytes = build_plaintext_self(&elf);
+
             let tmp = std::env::temp_dir().join(format!("xps5x-gui-launcher-exec-test-{}", std::process::id()));
             std::fs::create_dir_all(&tmp).expect("create temp dir");
-            let path = write_executable_sprx(&tmp, "eboot.bin", import_nid);
+            let path = tmp.join("eboot.bin");
+            std::fs::write(&path, &sprx_bytes).expect("write synthetic .sprx to temp dir");
 
             let handle = launcher
                 .launch(&LaunchTarget::Game { path })
@@ -811,8 +897,8 @@ mod firmware_launcher_tests {
 
             assert_eq!(launcher.session_state(&handle), SessionState::Running);
             let detail = launcher.session_detail(&handle).expect("a ran session has detail text");
-            assert!(detail.starts_with("Executed — entry returned 0xc0de"), "unexpected message: {detail}");
-            assert!(detail.contains("1 HLE calls resolved"), "unexpected message: {detail}");
+            assert!(detail.starts_with("Ran to exit(0xc0de)"), "unexpected message: {detail}");
+            assert!(detail.contains("2 HLE imports resolved"), "unexpected message: {detail}");
             assert!(detail.contains("0 unresolved"), "unexpected message: {detail}");
 
             let _ = std::fs::remove_dir_all(&tmp);
@@ -856,6 +942,65 @@ mod firmware_launcher_tests {
             let _ = std::fs::remove_dir_all(&tmp);
         }
 
+        /// M1-A acceptance test (crt0/process environment through the Shell):
+        /// a hand-assembled `_start`-shaped module — entry reads `argc` off
+        /// the process stack (`mov rdi, [rsp]`) and passes it straight to the
+        /// imported `exit` — launched through the Shell's real
+        /// `FirmwareLauncher::launch` path. The launcher passes exactly one
+        /// argv entry, so the reported exit code must be 1 == argc: proof the
+        /// Shell now enters modules as a real process (`execute_process` +
+        /// argc/argv/envp/auxv stack), not a bare 6-register function call
+        /// (under which `[rsp]` at entry would be a return address, never 1).
+        #[test]
+        fn start_shaped_module_reads_argc_from_process_stack_and_exits_with_it() {
+            let exit_nid = xps5x_firmware::dynlib::nid::nid_of("exit");
+            let (dynlib_blob, dynamic_bytes) = build_dynlib_and_dynamic(exit_nid);
+
+            let mut load_bytes = vec![0u8; 0x100];
+            // mov rdi, [rsp] — argc, the first thing a real _start reads.
+            load_bytes[0..4].copy_from_slice(&[0x48, 0x8B, 0x3C, 0x24]);
+            // call qword ptr [rip+disp32] -> the exit relocation slot. exit
+            // never returns (the runtime's exit-longjmp ends the run), so
+            // nothing follows.
+            let rip_after = 4i64 + 6;
+            let disp32 = (RELOC_SLOT_OFFSET as i64 - rip_after) as i32;
+            load_bytes[4] = 0xFF;
+            load_bytes[5] = 0x15;
+            load_bytes[6..10].copy_from_slice(&disp32.to_le_bytes());
+
+            let elf = build_elf_with_entry(
+                ET_SCE_DYNAMIC,
+                0x0,
+                &[
+                    PhdrSpec { p_type: PT_LOAD, p_flags: 5, p_vaddr: 0, data: load_bytes },
+                    PhdrSpec { p_type: 0x6100_0000 /* PT_SCE_DYNLIBDATA */, p_flags: 4, p_vaddr: 0, data: dynlib_blob },
+                    PhdrSpec { p_type: PT_DYNAMIC, p_flags: 6, p_vaddr: 0x2000, data: dynamic_bytes },
+                ],
+            );
+            let sprx_bytes = build_plaintext_self(&elf);
+
+            let tmp = std::env::temp_dir().join(format!("xps5x-gui-launcher-argc-test-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp).expect("create temp dir");
+            let path = tmp.join("eboot.bin");
+            std::fs::write(&path, &sprx_bytes).expect("write synthetic _start-shaped .sprx to temp dir");
+
+            // `FirmwareLauncher::new()`'s default registry already has libc's
+            // `exit` registered — no test-local registration needed.
+            let launcher = FirmwareLauncher::new();
+            let handle = launcher
+                .launch(&LaunchTarget::Game { path })
+                .expect("launch always returns a handle");
+
+            assert_eq!(launcher.session_state(&handle), SessionState::Running);
+            let detail = launcher.session_detail(&handle).expect("a completed session has detail text");
+            assert!(
+                detail.starts_with("Ran to exit(0x1)"),
+                "exit code must equal argc == 1 (one argv entry) — unexpected message: {detail}"
+            );
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
         // --- Homebrew gap-analysis milestone: a "more realistic" module -----
         // Everything above proves a single sentinel/HLE import dispatches
         // correctly. This proves something stronger: a synthetic module
@@ -879,22 +1024,26 @@ mod firmware_launcher_tests {
         /// happens to execute.
         const SLOT_MAP_OFF: usize = 0x90;
         const SCRATCH_OFF: usize = 0x98;
+        const SLOT_EXIT_OFF: usize = 0xA0;
         const MALLOC_SIZE: u64 = 0x40;
         const MEMSET_VALUE: u32 = 0xAB;
 
         /// Writes `mov rdi, malloc_size; call [malloc]; mov [scratch], rax;
         /// mov rdi, [scratch]; mov esi, memset_value; mov edx, malloc_size;
-        /// call [memset]; mov rdi, [scratch]; movzx eax, byte [rdi]; ret` —
-        /// `malloc(N)`, `memset(ptr, byte, N)`, then read byte 0 of the
-        /// block back into the guest's return value. Mirrors
-        /// `xps5x-runtime/tests/execute.rs`'s
+        /// call [memset]; mov rdi, [scratch]; movzx edi, byte [rdi];
+        /// call [exit]` — `malloc(N)`, `memset(ptr, byte, N)`, then read byte
+        /// 0 of the block back and end the process with it as the exit code
+        /// (M1-A: a `_start`-shaped entry ends via exit, it never `ret`s).
+        /// Derived from `xps5x-runtime/tests/execute.rs`'s
         /// `write_malloc_memset_readback_stub` (not importable across
-        /// crates, so replicated here).
+        /// crates, so replicated here), retailed for process mode.
+        #[allow(clippy::too_many_arguments)] // test-fixture assembler; args mirror the stub's slots
         fn write_malloc_memset_readback_stub(
             buf: &mut [u8],
             entry_off: usize,
             slot_malloc_off: usize,
             slot_memset_off: usize,
+            slot_exit_off: usize,
             scratch_off: usize,
             malloc_size: u64,
             memset_value: u32,
@@ -960,14 +1109,18 @@ mod firmware_launcher_tests {
             buf[off + 3..off + 7].copy_from_slice(&load2_disp32.to_le_bytes());
             off += 7;
 
-            // movzx eax, byte [rdi]
+            // movzx edi, byte [rdi] — the read-back byte becomes exit's arg
             buf[off] = 0x0F;
             buf[off + 1] = 0xB6;
-            buf[off + 2] = 0x07;
+            buf[off + 2] = 0x3F;
             off += 3;
 
-            // ret
-            buf[off] = 0xC3;
+            // call qword ptr [rip+disp32]  -> slot_exit_off (never returns)
+            let call3_rip_after = off as i64 + 6;
+            let call3_disp32 = (slot_exit_off as i64 - call3_rip_after) as i32;
+            buf[off] = 0xFF;
+            buf[off + 1] = 0x15;
+            buf[off + 2..off + 6].copy_from_slice(&call3_disp32.to_le_bytes());
         }
 
         /// The `PT_SCE_DYNLIBDATA` blob + matching `PT_DYNAMIC` bytes for
@@ -1031,19 +1184,22 @@ mod firmware_launcher_tests {
         }
 
         /// A plaintext-SELF-wrapped `.sprx` whose entry calls `malloc` then
-        /// `memset` then reads a byte back (see
+        /// `memset` then reads a byte back and exits with it (see
         /// `write_malloc_memset_readback_stub`), importing `malloc`,
-        /// `memset`, and `sceKernelMapFlexibleMemory` via real NIDs — the
-        /// last resolved but never called by this entry.
+        /// `memset`, `sceKernelMapFlexibleMemory`, and `exit` via real NIDs
+        /// — `sceKernelMapFlexibleMemory` resolved but never called by this
+        /// entry.
         fn build_realistic_homebrew_sprx() -> Vec<u8> {
             let malloc_nid = xps5x_firmware::dynlib::nid::nid_of("malloc");
             let memset_nid = xps5x_firmware::dynlib::nid::nid_of("memset");
             let map_nid = xps5x_firmware::dynlib::nid::nid_of("sceKernelMapFlexibleMemory");
+            let exit_nid = xps5x_firmware::dynlib::nid::nid_of("exit");
 
             let (dynlib_blob, dynamic_bytes) = build_dynlib_and_dynamic_multi(&[
                 (malloc_nid, SLOT_MALLOC_OFF as u64),
                 (memset_nid, SLOT_MEMSET_OFF as u64),
                 (map_nid, SLOT_MAP_OFF as u64),
+                (exit_nid, SLOT_EXIT_OFF as u64),
             ]);
 
             let mut load_bytes = vec![0u8; 0x100];
@@ -1052,6 +1208,7 @@ mod firmware_launcher_tests {
                 0x0,
                 SLOT_MALLOC_OFF,
                 SLOT_MEMSET_OFF,
+                SLOT_EXIT_OFF,
                 SCRATCH_OFF,
                 MALLOC_SIZE,
                 MEMSET_VALUE,
@@ -1096,8 +1253,8 @@ mod firmware_launcher_tests {
 
             assert_eq!(launcher.session_state(&handle), SessionState::Running);
             let detail = launcher.session_detail(&handle).expect("a ran session has detail text");
-            assert!(detail.starts_with("Executed — entry returned 0xab"), "unexpected message: {detail}");
-            assert!(detail.contains("3 HLE calls resolved"), "unexpected message: {detail}");
+            assert!(detail.starts_with("Ran to exit(0xab)"), "unexpected message: {detail}");
+            assert!(detail.contains("4 HLE imports resolved"), "unexpected message: {detail}");
             assert!(detail.contains("0 unresolved"), "unexpected message: {detail}");
 
             let _ = std::fs::remove_dir_all(&tmp);
@@ -1137,8 +1294,8 @@ mod firmware_launcher_tests {
 
             assert_eq!(launcher.session_state(&handle), SessionState::Running);
             let detail = launcher.session_detail(&handle).expect("a ran session has detail text");
-            assert!(detail.starts_with("Executed — entry returned 0xab"), "unexpected message: {detail}");
-            assert!(detail.contains("3 HLE calls resolved"), "unexpected message: {detail}");
+            assert!(detail.starts_with("Ran to exit(0xab)"), "unexpected message: {detail}");
+            assert!(detail.contains("4 HLE imports resolved"), "unexpected message: {detail}");
             assert!(detail.contains("0 unresolved"), "unexpected message: {detail}");
 
             let _ = std::fs::remove_dir_all(&tmp);
