@@ -33,6 +33,27 @@ Claude `/goal` (≤200 chars):
 > for the two present trees). The "delete when fully ported" condition applies
 > only to trees that exist on disk.
 
+### Remaining-work classification (as of the latest batch)
+
+Every **self-contained, verifiable** module in both references is `done`/`skip`
+— including *every* SharpEmu-implemented libSce. What keeps both trees `active`
+(not yet `fully_ported`) is exclusively work that needs a **subsystem stood up**
+or a **real fixture**, none of which can be honestly completed as a stub:
+
+1. **M2 GPU draw pipeline** — Kyty `emulator/Graphics` (PM4→GCN-shader→Vulkan) +
+   SharpEmu VideoOut real present + GraphicsDriver + macro/other tiling modes.
+   Needs the draw path built and verified against real command streams / rendered
+   output. (Tiling Z-order + flip-status already done.)
+2. **M1-E execution contexts** — Kyty `Threads`, SharpEmu `pthread`, `Fiber`,
+   `AMPR`. All need real guest execution on a fresh context; an init-only stub is
+   the "no-op instead of real execution" anti-pattern (verified for Fiber).
+3. **Fixture-blocked loader** — non-zero load-bias rebase, real user `.prx` chain.
+   Need a real toolchain-built `.sprx` (the `not-cloned` `PS5SDK` fixture row) to
+   verify against rather than guess.
+
+These are the same items as the M2 / M1-E / loader milestones — i.e. finishing the
+port == finishing the emulator's remaining big milestones. Not stub-shaped work.
+
 ---
 
 ## Kyty (`reference/kyty`) — status: `active`
@@ -93,7 +114,7 @@ Second-opinion PS5 emu (C#). Re-implement in Rust; do not vendor C#.
 | Sysmodule load chain (system modules, all HLE) | Libs | `xps5x-hle` | `done` | `e2e9eb2` | sceSysmoduleLoadModule/LoadModuleInternalWithArg/Unload/IsLoaded all succeed — every SCE_SYSMODULE_* is HLE-registered, so "loading" resolves without bringing anything into memory. Panic-safe arg access + test |
 | Real user .prx load chain (file-backed) | Kernel / Libs | `xps5x-firmware`/`hle` | `todo` | | a title's own split-out .prx from disk — needs a module-load service reachable from HleContext (the M1-D architectural blocker) |
 | Np (PSN) manager — offline | Np | `xps5x-hle` | `done` | `df2ad63` | new libsce_np.rs: sceNpGetState reports SIGNED_OUT (SharpEmu value 1), reachability UNAVAILABLE, GetOnlineId="Player", callbacks accepted-but-never-fire — a title sees "offline", disables online features, and boots instead of hanging on a PSN check. Online Np (trophy sync, matchmaking) out of scope. 2 tests |
-| Fiber / AMPR | Kernel | `xps5x-hle`/`runtime` | `todo` | | |
+| Fiber / AMPR | Kernel | `xps5x-hle`/`runtime` | `todo` | | verified blocked on infrastructure, not stubbable: sceFiberRun/Switch transfer control to *run the fiber's guest entry* → needs the guest execution-context machinery (M1-E family) — an init-only stub is the "no-op instead of real execution" anti-pattern. AMPR command buffers ultimately need a DMA/compute processing backend (overlaps M2). |
 | PlayGo | Libs | `xps5x-hle` | `done` | `39f7e58` | new libsce_playgo.rs: all chunks LOCUS_LOCAL_FAST, progress==total (complete), empty to-do list, handle out — "everything installed" so titles skip download gating (SharpEmu-cross-checked values). 13 NIDs; 3 tests |
 | UserService (initial user / login list / name / event) | UserService | `xps5x-hle` | `done` | `3d44b94` | new libsce_user_service.rs: single local user id 1000 (SharpEmu PrimaryUserId), GetInitialUser/GetLoginUserIdList/GetUserName("Player")/GetEvent(NO_EVENT) — supplies the userId scePadOpen/save-data need. 6 NIDs; 3 tests |
 | SystemService (status / param / safe-area) | SystemService | `xps5x-hle` | `done` | `46432e4` | new libsce_system_service.rs: GetStatus(eventNum=0, quiet), ParamGetInt (SharpEmu mapping 1/2/3/1000→1, 4→180), GetDisplaySafeAreaInfo(ratio 1.0), HideSplashScreen/ReportAbnormalTermination OK — a title's per-frame poll runs undisturbed. 5 NIDs; 3 tests |
