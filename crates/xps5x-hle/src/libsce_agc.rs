@@ -181,6 +181,16 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceAgc", "sceAgcDriverSubmitAcb", hle_driver_submit_acb);
     registry.register(
         "libSceAgc",
+        "sceAgcDriverSubmitMultiDcbs",
+        hle_driver_submit_multi_dcbs,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDriverQueryResourceRegistrationUserMemoryRequirements",
+        hle_driver_query_resource_memory,
+    );
+    registry.register(
+        "libSceAgc",
         "sceAgcQueueEndOfPipeActionPatchAddress",
         hle_queue_eop_patch_address,
     );
@@ -217,6 +227,9 @@ pub fn register(registry: &HleRegistry) {
 
 /// Resource-registration maximum name length (`sceAgcDriver...`).
 const RESOURCE_REGISTRATION_MAX_NAME_LENGTH: u32 = 256;
+/// Resource-registration memory sizing.
+const RESOURCE_REGISTRATION_BYTES_PER_RESOURCE: u64 = 0x118;
+const RESOURCE_REGISTRATION_BYTES_PER_OWNER: u64 = 0x1E0;
 
 /// `sceAgcDcbDispatchIndirect(dcb, dataOffset, modifier)`: emit a 3-DWORD
 /// indirect dispatch packet (data offset + initiator).
@@ -300,6 +313,51 @@ fn hle_driver_submit_dcb(ctx: &HleContext, args: &[u64]) -> u64 {
 
 fn hle_driver_submit_acb(ctx: &HleContext, args: &[u64]) -> u64 {
     submit_validate(ctx, args.get(1).copied().unwrap_or(0))
+}
+
+/// `sceAgcDriverSubmitMultiDcbs(addressArray, sizeArray, bufferCount)`:
+/// validate each command buffer in the arrays and succeed (no real
+/// submission yet — the Vulkan gate).
+fn hle_driver_submit_multi_dcbs(ctx: &HleContext, args: &[u64]) -> u64 {
+    let address_array = args.first().copied().unwrap_or(0);
+    let size_array = args.get(1).copied().unwrap_or(0);
+    let buffer_count = args.get(2).copied().unwrap_or(0);
+    if address_array == 0 || size_array == 0 || buffer_count == 0 || buffer_count > 4096 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    for i in 0..buffer_count {
+        let cmd = read_u64_or_zero(ctx, address_array + i * 8);
+        let dwords = read_u64_or_zero(ctx, size_array + i * 8);
+        if cmd == 0 || dwords == 0 {
+            return SCE_ERROR_INVALID_ARGUMENT;
+        }
+    }
+    0
+}
+
+/// `sceAgcDriverQueryResourceRegistrationUserMemoryRequirements(sizeOut,
+/// resourceCount, ownerCount)`: write the required backing-memory size.
+fn hle_driver_query_resource_memory(ctx: &HleContext, args: &[u64]) -> u64 {
+    let size_out = args.first().copied().unwrap_or(0);
+    let resource_count = args.get(1).copied().unwrap_or(0);
+    let owner_count = args.get(2).copied().unwrap_or(0);
+    if size_out == 0 || resource_count == 0 || owner_count == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    let required = resource_count
+        .checked_mul(RESOURCE_REGISTRATION_BYTES_PER_RESOURCE)
+        .and_then(|r| {
+            owner_count
+                .checked_mul(RESOURCE_REGISTRATION_BYTES_PER_OWNER)
+                .and_then(|o| r.checked_add(o))
+        });
+    let Some(required) = required else {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    };
+    if !ctx.mem.write(size_out, &required.to_le_bytes()) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
 }
 
 fn submit_validate(ctx: &HleContext, packet: u64) -> u64 {
@@ -1641,6 +1699,19 @@ mod tests {
             hle_driver_submit_dcb(&ctx, &[0]),
             SCE_ERROR_INVALID_ARGUMENT
         );
+        // SubmitMultiDcbs: two buffers with valid addresses + sizes.
+        assert!(ctx.mem.write(0x1A0, &0x400u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x1A8, &0x500u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x1C0, &8u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x1C8, &4u64.to_le_bytes()));
+        assert_eq!(hle_driver_submit_multi_dcbs(&ctx, &[0x1A0, 0x1C0, 2]), 0);
+        assert_eq!(
+            hle_driver_submit_multi_dcbs(&ctx, &[0, 0x1C0, 2]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+        // Query: required = resourceCount*0x118 + ownerCount*0x1E0.
+        assert_eq!(hle_driver_query_resource_memory(&ctx, &[0x1E0, 2, 3]), 0);
+        assert_eq!(read_u64(&ctx, 0x1E0), 2 * 0x118 + 3 * 0x1E0);
     }
 
     #[test]
