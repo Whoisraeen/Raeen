@@ -4,6 +4,24 @@
   <strong>A cross-platform PS5 compatibility layer that translates PS5 system calls and GPU commands to run natively on your PC hardware.</strong>
 </p>
 
+<p align="center">
+  <a href="https://github.com/Whoisraeen/XPS5X/actions/workflows/ci.yml"><img src="https://github.com/Whoisraeen/XPS5X/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/Whoisraeen/XPS5X/releases/latest"><img src="https://img.shields.io/github/v/release/Whoisraeen/XPS5X?include_prereleases&label=download" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--2.0--only-blue" alt="License"></a>
+</p>
+
+<p align="center">
+  <a href="https://whoisraeen.github.io/xps5x-website/"><strong>Website</strong></a> ·
+  <a href="https://github.com/Whoisraeen/XPS5X/releases/latest">Download (Windows x64)</a> ·
+  <a href="https://github.com/Whoisraeen/XPS5X/issues">Issues</a>
+</p>
+
+> **Status: early alpha.** XPS5X currently runs homebrew-style test binaries
+> (process launch, TLS, printf/write observability). It does not play
+> commercial games yet. Releases include a built-in auto-updater
+> (Settings → System) that downloads new versions from GitHub Releases and
+> applies them on restart.
+
 ---
 
 ## What is XPS5X?
