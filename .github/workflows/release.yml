@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release)
+        run: cargo build --release -p xps5x-gui
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist/xps5x | Out-Null
+          Copy-Item target/release/xps5x.exe dist/xps5x/
+          Copy-Item LICENSE, README.md, THIRD_PARTY_NOTICES.md dist/xps5x/
+          Copy-Item -Recurse themes dist/xps5x/themes
+          Compress-Archive -Path dist/xps5x/* -DestinationPath dist/xps5x-windows-x86_64.zip
+          # Bare exe published alongside the zip: the in-app updater downloads
+          # this directly so it never needs to unpack an archive.
+          Copy-Item target/release/xps5x.exe dist/xps5x-windows-x86_64.exe
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/xps5x-windows-x86_64.zip
+            dist/xps5x-windows-x86_64.exe
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

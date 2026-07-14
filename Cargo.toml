@@ -20,7 +20,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "GPL-2.0-only"
-repository = "https://github.com/XPS5X/xps5x"
+repository = "https://github.com/Whoisraeen/XPS5X"
 rust-version = "1.85"
 
 [workspace.dependencies]
@@ -69,6 +69,10 @@ lz4_flex = "0.11"
 zstd = "0.13"
 flate2 = "1"
 lzma-rs = "0.3"
+
+# Updater (GitHub Releases over HTTPS + release JSON)
+ureq = "2"
+serde_json = "1"
 
 # Firmware crypto + NID hashing
 aes = "0.9"
