@@ -171,6 +171,20 @@ fn decode_operands(encoding: Encoding, word: u32) -> (Vec<Operand>, Option<Opera
             let vdst = Operand::Vgpr((word >> 17) & 0xFF);
             (vec![src0], Some(vdst))
         }
+        // SOP2: SSRC0[7:0], SSRC1[15:8] (8-bit scalar sources — never VGPRs),
+        // SDST[22:16] (SGPR/special).
+        Encoding::Sop2 => {
+            let ssrc0 = decode_src9(word & 0xFF);
+            let ssrc1 = decode_src9((word >> 8) & 0xFF);
+            let sdst = decode_src9((word >> 16) & 0x7F);
+            (vec![ssrc0, ssrc1], Some(sdst))
+        }
+        // SOP1: SSRC0[7:0], OP[15:8], SDST[22:16].
+        Encoding::Sop1 => {
+            let ssrc0 = decode_src9(word & 0xFF);
+            let sdst = decode_src9((word >> 16) & 0x7F);
+            (vec![ssrc0], Some(sdst))
+        }
         _ => (Vec::new(), None),
     }
 }
@@ -354,6 +368,24 @@ mod tests {
         let (src, dst) = decode_operands(Encoding::Vop1, word);
         assert_eq!(src, vec![Operand::Sgpr(10)]);
         assert_eq!(dst, Some(Operand::Vgpr(2)));
+    }
+
+    #[test]
+    fn sop2_operands_decode_ssrc0_ssrc1_sdst() {
+        // S_ADD_U32 s2, s0, s1: SSRC0[7:0]=0, SSRC1[15:8]=1, SDST[22:16]=2.
+        let word = (1 << 8) | (2 << 16);
+        let (src, dst) = decode_operands(Encoding::Sop2, word);
+        assert_eq!(src, vec![Operand::Sgpr(0), Operand::Sgpr(1)]);
+        assert_eq!(dst, Some(Operand::Sgpr(2)));
+    }
+
+    #[test]
+    fn sop1_operands_decode_ssrc0_and_sdst() {
+        // S_MOV_B32 s5, s3: SSRC0[7:0]=3, SDST[22:16]=5.
+        let word = 3 | (5 << 16);
+        let (src, dst) = decode_operands(Encoding::Sop1, word);
+        assert_eq!(src, vec![Operand::Sgpr(3)]);
+        assert_eq!(dst, Some(Operand::Sgpr(5)));
     }
 
     #[test]
