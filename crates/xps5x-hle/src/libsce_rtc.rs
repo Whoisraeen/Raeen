@@ -70,6 +70,12 @@ pub fn register(registry: &HleRegistry) {
         "sceRtcGetCurrentDebugNetworkTick",
         hle_get_current_tick,
     );
+    registry.register("libSceRtc", "sceRtcGetCurrentClock", hle_get_current_clock);
+    registry.register(
+        "libSceRtc",
+        "sceRtcGetCurrentClockLocalTime",
+        hle_get_current_clock,
+    );
     registry.register("libSceRtc", "sceRtcIsLeapYear", hle_is_leap_year);
     registry.register("libSceRtc", "sceRtcGetDaysInMonth", hle_get_days_in_month);
     registry.register("libSceRtc", "sceRtcGetDayOfWeek", hle_get_day_of_week);
@@ -158,6 +164,77 @@ fn hle_get_current_tick(ctx: &HleContext, args: &[u64]) -> u64 {
         return ERR_INVALID_POINTER;
     }
     if !ctx.mem.write(out, &current_tick().to_le_bytes()) {
+        return ERR_INVALID_POINTER;
+    }
+    OK
+}
+
+/// A calendar date-time broken out from an Rtc tick.
+struct DateTime {
+    year: u16,
+    month: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    micro: u32,
+}
+
+/// Convert an Rtc tick (µs since 0001-01-01) to a broken-out date-time. The
+/// date is derived with Howard Hinnant's `civil_from_days` algorithm; the
+/// time-of-day is the intra-day remainder.
+fn tick_to_datetime(tick: u64) -> DateTime {
+    // Microseconds since the Unix epoch (ticks before 1970 clamp to 0).
+    let unix_micros = tick.saturating_sub(UNIX_EPOCH_TICKS);
+    let days = (unix_micros / MICROSECONDS_PER_DAY) as i64;
+    let rem = unix_micros % MICROSECONDS_PER_DAY;
+
+    // civil_from_days: days since 1970-01-01 → (year, month, day).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = year + i64::from(month <= 2);
+
+    DateTime {
+        year: year as u16,
+        month: month as u16,
+        day: day as u16,
+        hour: (rem / MICROSECONDS_PER_HOUR) as u16,
+        minute: ((rem % MICROSECONDS_PER_HOUR) / MICROSECONDS_PER_MINUTE) as u16,
+        second: ((rem % MICROSECONDS_PER_MINUTE) / MICROSECONDS_PER_SECOND) as u16,
+        micro: (rem % MICROSECONDS_PER_SECOND) as u32,
+    }
+}
+
+/// Write a `DateTime` into a 16-byte guest `SceRtcDateTime` at `addr`.
+fn write_datetime(ctx: &HleContext, addr: u64, dt: &DateTime) -> bool {
+    let mut b = [0u8; 16];
+    b[0..2].copy_from_slice(&dt.year.to_le_bytes());
+    b[2..4].copy_from_slice(&dt.month.to_le_bytes());
+    b[4..6].copy_from_slice(&dt.day.to_le_bytes());
+    b[6..8].copy_from_slice(&dt.hour.to_le_bytes());
+    b[8..10].copy_from_slice(&dt.minute.to_le_bytes());
+    b[10..12].copy_from_slice(&dt.second.to_le_bytes());
+    b[12..16].copy_from_slice(&dt.micro.to_le_bytes());
+    ctx.mem.write(addr, &b)
+}
+
+/// `sceRtcGetCurrentClock(SceRtcDateTime *out, tz)` / `...LocalTime(out)`:
+/// write the current wall-clock time as a broken-out date-time. Offline there
+/// is no timezone database, so local time is treated as UTC.
+fn hle_get_current_clock(ctx: &HleContext, args: &[u64]) -> u64 {
+    let out = args.first().copied().unwrap_or(0);
+    if out == 0 {
+        return ERR_INVALID_POINTER;
+    }
+    let dt = tick_to_datetime(current_tick());
+    if !write_datetime(ctx, out, &dt) {
         return ERR_INVALID_POINTER;
     }
     OK
@@ -384,6 +461,44 @@ mod tests {
         assert!(u64::from_le_bytes(buf) >= t1);
         // NULL out-pointer → error.
         assert_eq!(hle_get_current_tick(&ctx, &[0]), ERR_INVALID_POINTER);
+    }
+
+    #[test]
+    fn tick_to_datetime_recovers_known_dates() {
+        // 2000-01-01 00:00:00: 10957 days after the Unix epoch.
+        let tick_2000 = UNIX_EPOCH_TICKS + 10_957 * MICROSECONDS_PER_DAY;
+        let dt = tick_to_datetime(tick_2000);
+        assert_eq!((dt.year, dt.month, dt.day), (2000, 1, 1));
+        assert_eq!((dt.hour, dt.minute, dt.second), (0, 0, 0));
+        // Add 13h 37m 42.5s and check the time-of-day breakdown.
+        let t = tick_2000
+            + 13 * MICROSECONDS_PER_HOUR
+            + 37 * MICROSECONDS_PER_MINUTE
+            + 42 * MICROSECONDS_PER_SECOND
+            + 500_000;
+        let dt = tick_to_datetime(t);
+        assert_eq!((dt.year, dt.month, dt.day), (2000, 1, 1));
+        assert_eq!(
+            (dt.hour, dt.minute, dt.second, dt.micro),
+            (13, 37, 42, 500_000)
+        );
+    }
+
+    #[test]
+    fn get_current_clock_writes_a_plausible_datetime() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_get_current_clock(&ctx, &[0x40, 0]), OK);
+        let mut b = [0u8; 16];
+        assert!(ctx.mem.read(0x40, &mut b));
+        let year = u16::from_le_bytes([b[0], b[1]]);
+        let month = u16::from_le_bytes([b[2], b[3]]);
+        assert!(
+            (2020..=2100).contains(&year),
+            "plausible current year (got {year})"
+        );
+        assert!((1..=12).contains(&month), "valid month (got {month})");
+        assert_eq!(hle_get_current_clock(&ctx, &[0, 0]), ERR_INVALID_POINTER);
     }
 
     #[test]
