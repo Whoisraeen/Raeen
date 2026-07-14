@@ -51,6 +51,11 @@ pub fn register(registry: &HleRegistry) {
         "sceAmprCommandBufferGetCurrentOffset",
         hle_get_current_offset,
     );
+    registry.register(
+        "libSceAmpr",
+        "sceAmprAprCommandBufferReadFile",
+        hle_apr_read_file,
+    );
     // MeasureCommandSize* report a command record's byte size.
     registry.register("libSceAmpr", "sceAmprMeasureCommandSizeReadFile", |_, _| {
         READ_FILE_RECORD_SIZE
@@ -193,6 +198,40 @@ fn hle_get_current_offset(ctx: &HleContext, args: &[u64]) -> u64 {
         .unwrap_or(0)
 }
 
+/// `sceAmprAprCommandBufferReadFile(cb, _, _, fileId, destination, size,
+/// fileOffset)`: read `size` bytes of PAK file `fileId` at `fileOffset` into
+/// guest `destination`. `fileOffset` is SysV arg7 (`args[6]`, on the stack at
+/// `[Rsp+8]`, captured by the runtime dispatch). Mirrors SharpEmu's
+/// `AprCommandBufferReadFile` for the **unregistered/missing-file** case, which
+/// is the only case in-tree: XPS5X has no populated Ampr file registry, so every
+/// `fileId` is missing and the guest region is zero-filled (games queue
+/// speculative reads and only consume bytes on success paths — zero-fill, not
+/// failure, is the documented behavior). Real file-backed reads (host-path
+/// registry + PAK sequential-offset tracking) land with the I/O backend; a
+/// registered read would append a command record, which is deferred with it.
+fn hle_apr_read_file(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let destination = args.get(4).copied().unwrap_or(0);
+    let size = args.get(5).copied().unwrap_or(0);
+    if cb == 0 || (destination == 0 && size != 0) {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    // Missing-file path: zero-fill in chunks, stopping if a write faults (a
+    // partial fill still returns OK, matching the reference).
+    if destination != 0 && size > 0 {
+        let zeros = [0u8; 4096];
+        let mut written = 0u64;
+        while written < size {
+            let chunk = (size - written).min(zeros.len() as u64) as usize;
+            if !ctx.mem.write(destination + written, &zeros[..chunk]) {
+                break;
+            }
+            written += chunk as u64;
+        }
+    }
+    OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,5 +306,30 @@ mod tests {
             ),
             Some(WRITE_ADDRESS_RECORD_SIZE)
         );
+    }
+
+    #[test]
+    fn apr_read_file_zero_fills_missing_files() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb: u64 = 0x100;
+        let dst: u64 = 0x200;
+        // Pre-dirty the destination so a successful zero-fill is observable.
+        assert!(ctx.mem.write(dst, &0xDEAD_BEEF_CAFE_F00Du64.to_le_bytes()));
+        // args: cb, _, _, fileId=7, destination, size=16, fileOffset=0 (args[6]).
+        assert_eq!(hle_apr_read_file(&ctx, &[cb, 0, 0, 7, dst, 16, 0]), OK);
+        assert_eq!(read_u64(&ctx, dst), 0, "first 8 bytes zeroed");
+        assert_eq!(read_u64(&ctx, dst + 8), 0, "next 8 bytes zeroed");
+        // NULL command buffer and (dst==0, size!=0) are argument errors.
+        assert_eq!(
+            hle_apr_read_file(&ctx, &[0, 0, 0, 7, dst, 16, 0]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            hle_apr_read_file(&ctx, &[cb, 0, 0, 7, 0, 16, 0]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+        // A zero-size read (dst==0 allowed) is a benign OK.
+        assert_eq!(hle_apr_read_file(&ctx, &[cb, 0, 0, 7, 0, 0, 0]), OK);
     }
 }
