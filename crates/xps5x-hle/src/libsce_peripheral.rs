@@ -1,13 +1,14 @@
 //! HLE for small headless system/peripheral libraries: **libSceMouse**,
-//! **libSceIme** (on-screen keyboard), and **libSceGameUpdate**.
+//! **libSceIme** (on-screen keyboard), **libSceGameUpdate**,
+//! **libSceSystemGesture** (touch recognizers), **libSceShare**, and
+//! **libSceNpGameIntent**.
 //!
-//! XPS5X runs headless with no mouse, no active IME session, and no store
-//! connection, so each of these reports its benign "nothing here" state:
-//! `sceMouseOpen`/`Read` succeed with zero entries (no mouse), `sceImeUpdate`/
-//! keyboard calls succeed with no pending events (no IME session), and
-//! `sceGameUpdateInitialize` succeeds. These NIDs are cross-checked against
-//! SharpEmu; without them a title that polls a mouse or an IME (e.g. Quake KEX
-//! calls `sceImeUpdate` from its main loop) hits an unresolved import and dies.
+//! XPS5X runs headless with no mouse, no active IME session, no touch input, no
+//! store connection, and no share facility, so each of these reports its benign
+//! "nothing here" state (open/init/update succeed; readers report zero
+//! entries/events). These NIDs are cross-checked against SharpEmu; without them
+//! a title that polls a mouse, an IME (e.g. Quake KEX calls `sceImeUpdate` from
+//! its main loop), or a gesture recognizer hits an unresolved import and dies.
 
 use crate::{HleContext, HleRegistry};
 
@@ -32,6 +33,52 @@ pub fn register(registry: &HleRegistry) {
     // libSceGameUpdate — no store connection; initialization succeeds.
     registry.register("libSceGameUpdate", "sceGameUpdateInitialize", hle_ok);
     registry.register("libSceGameUpdate", "sceGameUpdateTerminate", hle_ok);
+
+    // libSceSystemGesture — touch-gesture recognizers succeed but report zero
+    // touch events (no touch input is fed in headless).
+    registry.register(
+        "libSceSystemGesture",
+        "sceSystemGestureInitializePrimitiveTouchRecognizer",
+        hle_ok,
+    );
+    registry.register(
+        "libSceSystemGesture",
+        "sceSystemGestureCreateTouchRecognizer",
+        hle_ok,
+    );
+    registry.register("libSceSystemGesture", "sceSystemGestureOpen", hle_ok);
+    registry.register(
+        "libSceSystemGesture",
+        "sceSystemGestureUpdatePrimitiveTouchRecognizer",
+        hle_ok,
+    );
+    registry.register(
+        "libSceSystemGesture",
+        "sceSystemGestureUpdateTouchRecognizer",
+        hle_ok,
+    );
+    registry.register(
+        "libSceSystemGesture",
+        "sceSystemGestureGetTouchEventsCount",
+        hle_ok,
+    ); // 0 events
+    registry.register(
+        "libSceSystemGesture",
+        "sceSystemGestureAppendTouchRecognizer",
+        hle_ok,
+    );
+    registry.register(
+        "libSceSystemGesture",
+        "sceSystemGestureUpdateAllTouchRecognizer",
+        hle_ok,
+    );
+
+    // libSceShare — no share/broadcast facility; initialization succeeds.
+    registry.register("libSceShare", "sceShareInitialize", hle_ok);
+    registry.register("libSceShare", "sceShareSetContentParam", hle_ok);
+
+    // libSceNpGameIntent — no game-intent events offline.
+    registry.register("libSceNpGameIntent", "sceNpGameIntentInitialize", hle_ok);
 }
 
 /// Report benign success (`rax = 0`): no device, no session, no pending event.
@@ -54,6 +101,10 @@ mod tests {
             ("libSceIme", "sceImeUpdate"),
             ("libSceIme", "sceImeKeyboardOpen"),
             ("libSceGameUpdate", "sceGameUpdateInitialize"),
+            ("libSceSystemGesture", "sceSystemGestureGetTouchEventsCount"),
+            ("libSceSystemGesture", "sceSystemGestureOpen"),
+            ("libSceShare", "sceShareInitialize"),
+            ("libSceNpGameIntent", "sceNpGameIntentInitialize"),
         ] {
             let kernel = xps5x_kernel::OrbisKernel::new();
             let mem = crate::TestMemory::new(0x10);
