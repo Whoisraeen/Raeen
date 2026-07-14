@@ -89,7 +89,7 @@ Second-opinion PS5 emu (C#). Re-implement in Rust; do not vendor C#.
 | SELF / eboot / Prospero loader | Loader | `xps5x-firmware` | `todo` | | cross-check vs Kyty |
 | PRX / sysmodule load chain | Kernel / Libs | `xps5x-firmware`/`hle` | `todo` | | |
 | Fiber / AMPR | Kernel | `xps5x-hle`/`runtime` | `todo` | | |
-| PlayGo | Libs | `xps5x-hle` | `done` | (playgo batch) | new libsce_playgo.rs: all chunks LOCUS_LOCAL_FAST, progress==total (complete), empty to-do list, handle out — "everything installed" so titles skip download gating (SharpEmu-cross-checked values). 13 NIDs; 3 tests |
+| PlayGo | Libs | `xps5x-hle` | `done` | `39f7e58` | new libsce_playgo.rs: all chunks LOCUS_LOCAL_FAST, progress==total (complete), empty to-do list, handle out — "everything installed" so titles skip download gating (SharpEmu-cross-checked values). 13 NIDs; 3 tests |
 | pthread / threads | Kernel | `xps5x-runtime`/`hle` | `todo` | | M1-E |
 | VideoOut / AGC / shaders→Vulkan | Graphics | `xps5x-gpu`/`hle` | `todo` | | M2+ |
 | DualSense / pad (digital+analog state) | Input | `xps5x-input`/`hle` | `done` | `0ceb7db` | ControllerState→Orbis ScePadData encoder (documented button masks, stick/trigger byte mapping) in xps5x-input; scePadReadState writes a valid state + returns 1 (was garbage + 0 → homebrew read-loop hang). Live host-input routing (InputManager→HleContext) + haptics/adaptive-triggers still todo |
