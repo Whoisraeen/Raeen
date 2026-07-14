@@ -140,6 +140,59 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcCreateInterpolantMapping",
         hle_create_interpolant_mapping,
     );
+    // The Cx/Sh/Uc patch-set NIDs are behaviorally identical (the register
+    // space only affects tracing), so each family shares one handler.
+    for space in ["Cx", "Sh", "Uc"] {
+        registry.register(
+            "libSceAgc",
+            &format!("sceAgcSet{space}RegIndirectPatchSetAddress"),
+            hle_set_indirect_patch_address,
+        );
+        registry.register(
+            "libSceAgc",
+            &format!("sceAgcSet{space}RegIndirectPatchAddRegisters"),
+            hle_add_indirect_patch_registers,
+        );
+    }
+}
+
+/// `sceAgcSet{Cx,Sh,Uc}RegIndirectPatchSetAddress(command, registers)`: bind the
+/// register-block address into the indirect-patch command at `command + 8/12`.
+fn hle_set_indirect_patch_address(ctx: &HleContext, args: &[u64]) -> u64 {
+    let command = args.first().copied().unwrap_or(0);
+    let registers = args.get(1).copied().unwrap_or(0);
+    if command == 0 || registers == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    if !ctx
+        .mem
+        .write(command + 8, &(registers as u32).to_le_bytes())
+        || !ctx
+            .mem
+            .write(command + 12, &((registers >> 32) as u32).to_le_bytes())
+    {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
+/// `sceAgcSet{Cx,Sh,Uc}RegIndirectPatchAddRegisters(command, registerCount)`:
+/// accumulate `registerCount` into the patch command's count field (`+4`).
+fn hle_add_indirect_patch_registers(ctx: &HleContext, args: &[u64]) -> u64 {
+    let command = args.first().copied().unwrap_or(0);
+    let register_count = args.get(1).copied().unwrap_or(0) as u32;
+    if command == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    let mut buf = [0u8; 4];
+    if !ctx.mem.read(command + 4, &mut buf) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    let updated = u32::from_le_bytes(buf).wrapping_add(register_count);
+    if !ctx.mem.write(command + 4, &updated.to_le_bytes()) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
 }
 
 /// Read a `u32` from guest memory, or 0 if unreadable.
@@ -1090,6 +1143,46 @@ mod tests {
         assert_eq!(read_u32(&ctx, cx), pm4(4, IT_NOP, R_CX_REGS_INDIRECT));
         let uc = hle_dcb_set_uc_regs_indirect(&ctx, &[cb, regs, 1]);
         assert_eq!(read_u32(&ctx, uc), pm4(4, IT_NOP, R_UC_REGS_INDIRECT));
+    }
+
+    #[test]
+    fn indirect_patch_set_address_and_add_registers() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let command: u64 = 0x100;
+        // SetAddress writes the register block address at command+8/+12.
+        assert_eq!(
+            hle_set_indirect_patch_address(&ctx, &[command, 0x00AB_1234_5678_0000]),
+            0
+        );
+        assert_eq!(read_u32(&ctx, command + 8), 0x5678_0000);
+        assert_eq!(read_u32(&ctx, command + 12), 0x00AB_1234);
+        // AddRegisters accumulates the count field at command+4.
+        assert!(ctx.mem.write(command + 4, &10u32.to_le_bytes()));
+        assert_eq!(hle_add_indirect_patch_registers(&ctx, &[command, 5]), 0);
+        assert_eq!(read_u32(&ctx, command + 4), 15);
+        assert_eq!(hle_add_indirect_patch_registers(&ctx, &[command, 3]), 0);
+        assert_eq!(read_u32(&ctx, command + 4), 18);
+        // Validation.
+        assert_eq!(
+            hle_set_indirect_patch_address(&ctx, &[0, 1]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            hle_add_indirect_patch_registers(&ctx, &[0, 1]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+        // All 6 NIDs resolve (Cx/Sh/Uc × SetAddress/AddRegisters).
+        let reg = HleRegistry::new();
+        for space in ["Cx", "Sh", "Uc"] {
+            for suffix in ["SetAddress", "AddRegisters"] {
+                let name = format!("sceAgcSet{space}RegIndirectPatch{suffix}");
+                assert!(
+                    reg.call(&ctx, "libSceAgc", &name, &[command, 1]).is_some(),
+                    "{name} must be registered"
+                );
+            }
+        }
     }
 
     #[test]
