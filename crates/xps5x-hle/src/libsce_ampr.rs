@@ -40,6 +40,11 @@ pub fn register(registry: &HleRegistry) {
         hle_set_buffer,
     );
     registry.register("libSceAmpr", "sceAmprCommandBufferReset", hle_reset);
+    registry.register(
+        "libSceAmpr",
+        "sceAmprCommandBufferClearBuffer",
+        hle_clear_buffer,
+    );
     registry.register("libSceAmpr", "sceAmprCommandBufferGetSize", hle_get_size);
     registry.register(
         "libSceAmpr",
@@ -142,6 +147,26 @@ fn hle_reset(ctx: &HleContext, args: &[u64]) -> u64 {
     OK
 }
 
+/// `sceAmprCommandBufferClearBuffer(cb)`: zero the visible buffer/size
+/// pointers in the struct and return the previously-bound buffer pointer.
+fn hle_clear_buffer(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    if cb == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    let mut data = [0u8; 8];
+    if !ctx.mem.read(cb + CB_DATA_OFFSET, &mut data) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    let old_buffer = u64::from_le_bytes(data);
+    if !ctx.mem.write(cb + CB_DATA_OFFSET, &0u64.to_le_bytes())
+        || !ctx.mem.write(cb + CB_SIZE_OFFSET, &0u64.to_le_bytes())
+    {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    old_buffer
+}
+
 /// `sceAmprCommandBufferGetSize(cb)`: return the buffer size (in `rax`).
 fn hle_get_size(ctx: &HleContext, args: &[u64]) -> u64 {
     let cb = args.first().copied().unwrap_or(0);
@@ -210,6 +235,10 @@ mod tests {
         assert_eq!(hle_set_buffer(&ctx, &[cb, 0x2000, 0x400]), OK);
         assert_eq!(hle_get_size(&ctx, &[cb]), 0x400);
         assert_eq!(read_u64(&ctx, cb + CB_DATA_OFFSET), 0x2000);
+        // ClearBuffer returns the bound buffer and zeroes the visible pointers.
+        assert_eq!(hle_clear_buffer(&ctx, &[cb]), 0x2000);
+        assert_eq!(read_u64(&ctx, cb + CB_DATA_OFFSET), 0);
+        assert_eq!(read_u64(&ctx, cb + CB_SIZE_OFFSET), 0);
         // Destruct drops the cursor state; NULL cb constructor is a no-op.
         assert_eq!(hle_dtor(&ctx, &[cb]), 0);
         assert!(!kernel.ampr_write_offsets.contains_key(&cb));
