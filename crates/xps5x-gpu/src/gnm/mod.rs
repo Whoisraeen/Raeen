@@ -122,27 +122,29 @@ impl GnmContext {
             // ─── Register writes ───────────────────────────
             command_buffer::PM4_SET_CONTEXT_REG => {
                 if body.len() >= 2 {
-                    let reg_offset = body[0] & 0xFFFF;
+                    // The packet's register offset is relative to the context
+                    // base; store at the absolute index base + offset.
+                    let base_addr = registers::CONTEXT_REG_BASE + (body[0] & 0xFFFF);
                     for (i, &value) in body[1..].iter().enumerate() {
-                        self.registers.write_context(reg_offset + i as u32, value);
+                        self.registers.write_context(base_addr + i as u32, value);
                         self.stats.register_writes += 1;
                     }
                 }
             }
             command_buffer::PM4_SET_SH_REG => {
                 if body.len() >= 2 {
-                    let reg_offset = body[0] & 0xFFFF;
+                    let base_addr = registers::SH_REG_BASE + (body[0] & 0xFFFF);
                     for (i, &value) in body[1..].iter().enumerate() {
-                        self.registers.write_sh(reg_offset + i as u32, value);
+                        self.registers.write_sh(base_addr + i as u32, value);
                         self.stats.register_writes += 1;
                     }
                 }
             }
             command_buffer::PM4_SET_UCONFIG_REG => {
                 if body.len() >= 2 {
-                    let reg_offset = body[0] & 0xFFFF;
+                    let base_addr = registers::UCONFIG_REG_BASE + (body[0] & 0xFFFF);
                     for (i, &value) in body[1..].iter().enumerate() {
-                        self.registers.write_uconfig(reg_offset + i as u32, value);
+                        self.registers.write_uconfig(base_addr + i as u32, value);
                         self.stats.register_writes += 1;
                     }
                 }

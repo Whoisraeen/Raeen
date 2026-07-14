@@ -10,10 +10,12 @@
 use std::collections::HashMap;
 use tracing::debug;
 
-/// Register space bases (RDNA2).
-const CONTEXT_REG_BASE: u32 = 0xA000;
-const SH_REG_BASE: u32 = 0x2C00;
-const UCONFIG_REG_BASE: u32 = 0xC000;
+/// Register space bases (RDNA2). A PM4 `SET_*_REG` packet carries a register
+/// offset relative to one of these; the absolute register index (the key used
+/// throughout this module) is `base + offset`.
+pub const CONTEXT_REG_BASE: u32 = 0xA000;
+pub const SH_REG_BASE: u32 = 0x2C00;
+pub const UCONFIG_REG_BASE: u32 = 0xC000;
 
 // ─── Well-known context registers ──────────────────────────
 /// Depth buffer control.
@@ -65,30 +67,32 @@ impl RegisterState {
         }
     }
 
-    /// Write a context register (offset from CONTEXT_REG_BASE).
-    pub fn write_context(&mut self, offset: u32, value: u32) {
-        let addr = CONTEXT_REG_BASE + offset;
+    /// Write a context register by **absolute** address (e.g.
+    /// [`DB_DEPTH_CONTROL`]). Symmetric with [`read_context`](Self::read_context):
+    /// `write_context(a, v)` then `read_context(a)` returns `v`. A PM4 caller
+    /// with a base-relative offset passes `CONTEXT_REG_BASE + offset`.
+    pub fn write_context(&mut self, addr: u32, value: u32) {
         self.context_regs.insert(addr, value);
     }
 
-    /// Write a shader register (offset from SH_REG_BASE).
-    pub fn write_sh(&mut self, offset: u32, value: u32) {
-        let addr = SH_REG_BASE + offset;
+    /// Write a shader register by **absolute** address. Symmetric with
+    /// [`read_sh`](Self::read_sh). PM4 callers pass `SH_REG_BASE + offset`.
+    pub fn write_sh(&mut self, addr: u32, value: u32) {
         self.sh_regs.insert(addr, value);
     }
 
-    /// Write a UCONFIG register (offset from UCONFIG_REG_BASE).
-    pub fn write_uconfig(&mut self, offset: u32, value: u32) {
-        let addr = UCONFIG_REG_BASE + offset;
+    /// Write a UCONFIG register by **absolute** address. PM4 callers pass
+    /// `UCONFIG_REG_BASE + offset`.
+    pub fn write_uconfig(&mut self, addr: u32, value: u32) {
         self.uconfig_regs.insert(addr, value);
     }
 
-    /// Read a context register.
+    /// Read a context register by absolute address.
     pub fn read_context(&self, addr: u32) -> u32 {
         self.context_regs.get(&addr).copied().unwrap_or(0)
     }
 
-    /// Read a shader register.
+    /// Read a shader register by absolute address.
     pub fn read_sh(&self, addr: u32) -> u32 {
         self.sh_regs.get(&addr).copied().unwrap_or(0)
     }
@@ -158,5 +162,41 @@ pub enum CullMode {
 impl Default for RegisterState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_and_sh_writes_round_trip_by_absolute_address() {
+        let mut regs = RegisterState::new();
+        // write_* and read_* are symmetric: the same absolute address recovers
+        // the value (the earlier asymmetry returned 0 here).
+        regs.write_context(DB_DEPTH_CONTROL, 0xDEAD_BEEF);
+        assert_eq!(regs.read_context(DB_DEPTH_CONTROL), 0xDEAD_BEEF);
+        regs.write_context(CONTEXT_REG_BASE + 0x10, 0x1234);
+        assert_eq!(regs.read_context(CONTEXT_REG_BASE + 0x10), 0x1234);
+
+        regs.write_sh(SH_REG_BASE + 0x20, 0xABCD);
+        assert_eq!(regs.read_sh(SH_REG_BASE + 0x20), 0xABCD);
+        // An unwritten register reads as 0.
+        assert_eq!(regs.read_context(CB_COLOR_CONTROL), 0);
+    }
+
+    #[test]
+    fn state_readers_see_writes_at_their_documented_addresses() {
+        let mut regs = RegisterState::new();
+        // DB_DEPTH_CONTROL bit0 = depth test, bit1 = depth write.
+        regs.write_context(DB_DEPTH_CONTROL, 0x3);
+        assert!(regs.is_depth_test_enabled());
+        assert!(regs.is_depth_write_enabled());
+        // PA_SU_SC_MODE_CNTL bits[4:3] = polygon mode (1 = Line).
+        regs.write_context(PA_SU_SC_MODE_CNTL, 1 << 3);
+        assert_eq!(regs.polygon_mode(), PolygonMode::Line);
+        // bits[1:0] = cull front/back.
+        regs.write_context(PA_SU_SC_MODE_CNTL, 0x2);
+        assert_eq!(regs.cull_mode(), CullMode::Back);
     }
 }
