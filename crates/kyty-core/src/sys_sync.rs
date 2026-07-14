@@ -157,10 +157,30 @@ impl SysCS {
 }
 
 impl Drop for SysCS {
-    /// `~SysCS()` — fatal if `delete()` was never called
-    /// (`m_check_ptr != nullptr`), exactly like the original destructor.
+    /// Safe-Rust equivalent of Kyty's `~SysCS() { EXIT_IF(m_check_ptr !=
+    /// nullptr); }`. Kyty's destructor *aborts* if the section was never
+    /// `delete()`-d — a manual-memory-scaffolding assertion. Transliterating
+    /// that abort into a panic is actively unsound here: a caught panic (or a
+    /// panic during unwinding) would leave an initialized `CRITICAL_SECTION`
+    /// stranded on about-to-be-freed memory, still linked in the OS's
+    /// critical-section debug list — which corrupts the process and trips the
+    /// stack-buffer-overrun guard at exit.
+    ///
+    /// So the faithful safe port **releases the OS resource** on drop instead
+    /// of aborting: an explicit `init()`/`delete()` lifecycle is still the
+    /// intended API (and `delete()` remains available), but dropping while
+    /// live is tolerated and cleaned up rather than fatal.
     fn drop(&mut self) {
-        exit_if!(!self.check_ptr().is_null());
+        if !self.check_ptr().is_null() {
+            // SAFETY: a non-null `check_ptr` means `init()` ran and the
+            // `CRITICAL_SECTION` is live at this still-stable address (the
+            // struct doc forbids moving it while initialized); release it
+            // exactly once and clear the guard.
+            unsafe {
+                DeleteCriticalSection(self.cs.get());
+                *self.check_ptr.get() = ptr::null();
+            }
+        }
     }
 }
 
@@ -214,11 +234,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "KYTY EXIT_IF failed")]
-    fn drop_without_delete_panics() {
+    fn drop_while_initialized_releases_the_os_resource() {
         let cs = SysCS::new();
         cs.init();
-        // `cs` drops here without a matching `delete()` -> Drop panics.
+        // Dropping without an explicit `delete()` must release the OS
+        // `CRITICAL_SECTION` (not abort, and not leave it dangling in the OS
+        // debug list on freed memory) — the safe-Rust equivalent of Kyty's
+        // manual delete discipline. The proof this is sound is that the test
+        // binary no longer crashes with STATUS_STACK_BUFFER_OVERRUN at exit.
+        drop(cs);
     }
 
     #[test]
@@ -269,8 +293,10 @@ mod tests {
         handle.join().unwrap();
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
-        // Unwrap the Arc (now sole owner again) so we can delete() before drop.
-        let cs = Arc::try_unwrap(cs).unwrap_or_else(|_| panic!("still shared"));
+        // `delete()` through the `Arc` (it takes `&self`) — the section must
+        // NOT be moved out of the `Arc` after `init()` registered its address
+        // with the OS (the struct doc forbids moving while initialized). The
+        // `Arc`'s `SysCS` then drops as a no-op (already deleted).
         cs.delete();
     }
 
