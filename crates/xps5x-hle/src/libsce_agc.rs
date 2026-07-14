@@ -37,7 +37,12 @@ const IT_DISPATCH_DIRECT: u32 = 0x15;
 const IT_DISPATCH_INDIRECT: u32 = 0x16;
 const IT_SET_BASE: u32 = 0x11;
 const IT_EVENT_WRITE: u32 = 0x46;
+const IT_WAIT_REG_MEM: u32 = 0x3C;
 const IT_SET_SH_REG: u32 = 0x76;
+const R_WAIT_MEM32: u32 = 0x0A;
+const R_WAIT_MEM64: u32 = 0x16;
+const R_RELEASE_MEM: u32 = 0x18;
+const R_DMA_DATA: u32 = 0x19;
 /// Marker DWORD preceding a `CbSetShRegisterRange` packet.
 const SET_SH_RANGE_MARKER: u32 = 0x6875_000D;
 const R_ZERO: u32 = 0x00;
@@ -176,6 +181,21 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceAgc", "sceAgcDriverSubmitAcb", hle_driver_submit_acb);
     registry.register(
         "libSceAgc",
+        "sceAgcQueueEndOfPipeActionPatchAddress",
+        hle_queue_eop_patch_address,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDmaDataPatchSetDstAddressOrOffset",
+        hle_dma_data_patch_address,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcWaitRegMemPatchAddress",
+        hle_wait_reg_mem_patch_address,
+    );
+    registry.register(
+        "libSceAgc",
         "sceAgcDriverInitResourceRegistration",
         hle_driver_init_resource_registration,
     );
@@ -290,6 +310,75 @@ fn submit_validate(ctx: &HleContext, packet: u64) -> u64 {
     let mut buf = [0u8; 8];
     if !ctx.mem.read(packet, &mut buf) {
         return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    0
+}
+
+/// Decode a command packet's identity: `(op, register)` from its Agc PM4
+/// header (the inverse of [`pm4`]). Returns `None` if the header is unreadable.
+fn packet_identity(ctx: &HleContext, command: u64) -> Option<(u32, u32)> {
+    if command == 0 {
+        return None;
+    }
+    let mut hdr = [0u8; 4];
+    if !ctx.mem.read(command, &mut hdr) {
+        return None;
+    }
+    let header = u32::from_le_bytes(hdr);
+    Some(((header >> 8) & 0xFF, (header >> 2) & 0x3F))
+}
+
+/// `sceAgcQueueEndOfPipeActionPatchAddress(command, address)`: patch a
+/// RELEASE_MEM packet's destination address (at `command + 12`).
+fn hle_queue_eop_patch_address(ctx: &HleContext, args: &[u64]) -> u64 {
+    let command = args.first().copied().unwrap_or(0);
+    let address = args.get(1).copied().unwrap_or(0);
+    match packet_identity(ctx, command) {
+        Some((op, reg)) if op == IT_NOP && reg == R_RELEASE_MEM => {}
+        _ => return SCE_ERROR_INVALID_ARGUMENT,
+    }
+    if !ctx.mem.write(command + 12, &address.to_le_bytes()) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
+/// `sceAgcDmaDataPatchSetDstAddressOrOffset(command, destination)`: patch a
+/// DMA_DATA packet's destination address (at `command + 16`).
+fn hle_dma_data_patch_address(ctx: &HleContext, args: &[u64]) -> u64 {
+    let command = args.first().copied().unwrap_or(0);
+    let destination = args.get(1).copied().unwrap_or(0);
+    match packet_identity(ctx, command) {
+        Some((op, reg)) if op == IT_NOP && reg == R_DMA_DATA => {}
+        _ => return SCE_ERROR_INVALID_ARGUMENT,
+    }
+    if !ctx.mem.write(command + 16, &destination.to_le_bytes()) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
+/// `sceAgcWaitRegMemPatchAddress(command, address)`: patch the poll address of
+/// a WAIT_REG_MEM packet — field offset 8 for the real WAIT_REG_MEM op, or 4
+/// for a 32/64-bit wait-memory NOP.
+fn hle_wait_reg_mem_patch_address(ctx: &HleContext, args: &[u64]) -> u64 {
+    let command = args.first().copied().unwrap_or(0);
+    let address = args.get(1).copied().unwrap_or(0);
+    let Some((op, reg)) = packet_identity(ctx, command) else {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    };
+    let field_offset = if op == IT_WAIT_REG_MEM {
+        8
+    } else if op == IT_NOP && (reg == R_WAIT_MEM32 || reg == R_WAIT_MEM64) {
+        4
+    } else {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    };
+    if !ctx
+        .mem
+        .write(command + field_offset, &address.to_le_bytes())
+    {
+        return SCE_ERROR_MEMORY_FAULT;
     }
     0
 }
@@ -1552,6 +1641,47 @@ mod tests {
             hle_driver_submit_dcb(&ctx, &[0]),
             SCE_ERROR_INVALID_ARGUMENT
         );
+    }
+
+    #[test]
+    fn patch_address_setters_validate_packet_identity() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // A RELEASE_MEM packet (NOP op + R_RELEASE_MEM discriminator) at 0x200.
+        assert!(
+            ctx.mem
+                .write(0x200, &pm4(8, IT_NOP, R_RELEASE_MEM).to_le_bytes())
+        );
+        assert_eq!(
+            hle_queue_eop_patch_address(&ctx, &[0x200, 0xDEAD_BEEF_0000]),
+            0
+        );
+        assert_eq!(read_u64(&ctx, 0x200 + 12), 0xDEAD_BEEF_0000);
+        // Wrong packet identity → rejected.
+        assert!(
+            ctx.mem
+                .write(0x200, &pm4(8, IT_NOP, R_DMA_DATA).to_le_bytes())
+        );
+        assert_eq!(
+            hle_queue_eop_patch_address(&ctx, &[0x200, 1]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+        // DMA_DATA patch → +16.
+        assert_eq!(hle_dma_data_patch_address(&ctx, &[0x200, 0xC0DE_0000]), 0);
+        assert_eq!(read_u64(&ctx, 0x200 + 16), 0xC0DE_0000);
+        // WAIT_REG_MEM op → field offset 8; wait-mem NOP → offset 4.
+        assert!(
+            ctx.mem
+                .write(0x300, &pm4(7, IT_WAIT_REG_MEM, R_ZERO).to_le_bytes())
+        );
+        assert_eq!(hle_wait_reg_mem_patch_address(&ctx, &[0x300, 0xAA00]), 0);
+        assert_eq!(read_u64(&ctx, 0x300 + 8), 0xAA00);
+        assert!(
+            ctx.mem
+                .write(0x300, &pm4(6, IT_NOP, R_WAIT_MEM32).to_le_bytes())
+        );
+        assert_eq!(hle_wait_reg_mem_patch_address(&ctx, &[0x300, 0xBB00]), 0);
+        assert_eq!(read_u64(&ctx, 0x300 + 4), 0xBB00);
     }
 
     #[test]
