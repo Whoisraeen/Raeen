@@ -31,6 +31,7 @@ pub fn media_items() -> Vec<LibraryItem> {
                 glyph: GlyphKind::Music,
             },
             meta: None,
+            cover_path: None,
             launch: LaunchTarget::App { id: "media:wavelength".to_string() },
         },
         LibraryItem {
@@ -42,6 +43,7 @@ pub fn media_items() -> Vec<LibraryItem> {
                 glyph: GlyphKind::Video,
             },
             meta: None,
+            cover_path: None,
             launch: LaunchTarget::App { id: "media:screening-room".to_string() },
         },
         LibraryItem {
@@ -53,6 +55,7 @@ pub fn media_items() -> Vec<LibraryItem> {
                 glyph: GlyphKind::Network,
             },
             meta: None,
+            cover_path: None,
             launch: LaunchTarget::App { id: "media:wayfinder".to_string() },
         },
         LibraryItem {
@@ -64,6 +67,7 @@ pub fn media_items() -> Vec<LibraryItem> {
                 glyph: GlyphKind::Grid,
             },
             meta: None,
+            cover_path: None,
             launch: LaunchTarget::App { id: "media:snapshots".to_string() },
         },
     ]

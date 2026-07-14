@@ -20,6 +20,13 @@
 //!   confirming the wired-up Settings tile opens Settings instead of
 //!   launching; on Media it reports [`NavAction::LaunchMedia`] since there's
 //!   no media-playback engine to hand off to yet.
+//!
+//! The concept-mock Home adds [`NavMode::Pills`]: Up from the rail moves
+//! focus into the pill navigation row (Store / My games / Media / Library /
+//! Settings / "…"), Left/Right move along it, Down/Back return to the rail,
+//! and Confirm activates the focused pill — tab pills switch the rail tab,
+//! Settings opens the Settings surface, and Store/Library jump the rail to
+//! their app tiles.
 
 /// A single navigation input, already normalized from keyboard or gamepad.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,10 +97,24 @@ impl RailTab {
     }
 }
 
+// Pill-row focus indices, in display order (the leading icon-only pill is
+// decorative and not focusable). `home.rs` renders labels in this same
+// order — the two must agree.
+pub const PILL_STORE: usize = 0;
+pub const PILL_MY_GAMES: usize = 1;
+pub const PILL_MEDIA: usize = 2;
+pub const PILL_LIBRARY: usize = 3;
+pub const PILL_SETTINGS: usize = 4;
+pub const PILL_MORE: usize = 5;
+pub const PILL_COUNT: usize = 6;
+
 /// Which surface currently owns navigation input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavMode {
     Home,
+    /// Focus is in Home's pill navigation row (reached with Up from the
+    /// rail); Home still renders underneath, only input routing differs.
+    Pills,
     ControlCenter,
     /// Drilled into the focused Control Center card's own option list.
     ControlCenterOption,
@@ -121,6 +142,14 @@ pub struct NavState {
     pub tab: RailTab,
     games_rail_len: usize,
     media_rail_len: usize,
+
+    /// Focused pill while `mode == Pills` (one of the `PILL_*` indices).
+    pub pill_index: usize,
+    /// Games-rail indices of the Store / Game Library app tiles, so their
+    /// pills can jump the rail there. `None` when the caller's library has
+    /// no such tile — that pill's Confirm is then a no-op.
+    store_tile_index: Option<usize>,
+    library_tile_index: Option<usize>,
 
     /// Games-rail index that opens Settings on Confirm instead of
     /// launching (the "Settings" app tile). `None` if the caller never
@@ -158,6 +187,9 @@ impl NavState {
             tab: RailTab::Games,
             games_rail_len: rail_len,
             media_rail_len: 0,
+            pill_index: PILL_MY_GAMES,
+            store_tile_index: None,
+            library_tile_index: None,
             settings_tile_index: None,
             settings_section: 0,
             settings_row: 0,
@@ -179,6 +211,14 @@ impl NavState {
         self
     }
 
+    /// Builder: wire up which Games-rail indices the Store and Library
+    /// pills jump to on Confirm.
+    pub fn with_app_tiles(mut self, store_tile_index: Option<usize>, library_tile_index: Option<usize>) -> Self {
+        self.store_tile_index = store_tile_index;
+        self.library_tile_index = library_tile_index;
+        self
+    }
+
     /// Replace the Settings section/row-count table — e.g. after adding or
     /// removing a game folder changes the Game Folders section's row count
     /// — clamping the current section/row focus back into range.
@@ -196,9 +236,29 @@ impl NavState {
     pub fn apply(&mut self, input: NavInput) -> NavAction {
         match self.mode {
             NavMode::Home => self.apply_home(input),
+            NavMode::Pills => self.apply_pills(input),
             NavMode::ControlCenter => self.apply_control_center(input),
             NavMode::ControlCenterOption => self.apply_control_center_option(input),
             NavMode::Settings => self.apply_settings(input),
+        }
+    }
+
+    /// Switch the active rail tab, resetting rail length and focus.
+    fn set_tab(&mut self, tab: RailTab) {
+        self.tab = tab;
+        self.rail_len = match tab {
+            RailTab::Games => self.games_rail_len,
+            RailTab::Media => self.media_rail_len,
+        };
+        self.rail_index = 0;
+    }
+
+    /// The pill that corresponds to the active rail tab — where pill focus
+    /// starts when Up moves it out of the rail.
+    fn active_tab_pill(&self) -> usize {
+        match self.tab {
+            RailTab::Games => PILL_MY_GAMES,
+            RailTab::Media => PILL_MEDIA,
         }
     }
 
@@ -218,7 +278,12 @@ impl NavState {
                 }
                 NavAction::None
             }
-            NavInput::Up | NavInput::Down => NavAction::None,
+            NavInput::Up => {
+                self.mode = NavMode::Pills;
+                self.pill_index = self.active_tab_pill();
+                NavAction::None
+            }
+            NavInput::Down => NavAction::None,
             NavInput::Confirm => match self.tab {
                 RailTab::Games => {
                     if self.settings_tile_index == Some(self.rail_index) {
@@ -239,15 +304,69 @@ impl NavState {
             }
             NavInput::Back => NavAction::None,
             NavInput::Tab => {
-                self.tab = self.tab.toggled();
-                self.rail_len = match self.tab {
-                    RailTab::Games => self.games_rail_len,
-                    RailTab::Media => self.media_rail_len,
-                };
-                self.rail_index = 0;
+                self.set_tab(self.tab.toggled());
                 NavAction::SwitchTab(self.tab)
             }
         }
+    }
+
+    fn apply_pills(&mut self, input: NavInput) -> NavAction {
+        match input {
+            NavInput::Left => {
+                self.pill_index = self.pill_index.saturating_sub(1);
+                NavAction::None
+            }
+            NavInput::Right => {
+                self.pill_index = (self.pill_index + 1).min(PILL_COUNT - 1);
+                NavAction::None
+            }
+            NavInput::Up => NavAction::None,
+            NavInput::Down | NavInput::Back => {
+                self.mode = NavMode::Home;
+                NavAction::None
+            }
+            NavInput::Confirm => match self.pill_index {
+                PILL_MY_GAMES => {
+                    self.set_tab(RailTab::Games);
+                    self.mode = NavMode::Home;
+                    NavAction::SwitchTab(RailTab::Games)
+                }
+                PILL_MEDIA => {
+                    self.set_tab(RailTab::Media);
+                    self.mode = NavMode::Home;
+                    NavAction::SwitchTab(RailTab::Media)
+                }
+                PILL_STORE => self.jump_to_games_tile(self.store_tile_index),
+                PILL_LIBRARY => self.jump_to_games_tile(self.library_tile_index),
+                PILL_SETTINGS => {
+                    self.mode = NavMode::Settings;
+                    self.settings_section = 0;
+                    self.settings_row = 0;
+                    NavAction::OpenSettings
+                }
+                PILL_MORE | _ => NavAction::None, // "…" — decorative for now
+            },
+            NavInput::Guide => {
+                self.mode = NavMode::ControlCenter;
+                self.cc_index = 0;
+                NavAction::OpenControlCenter
+            }
+            NavInput::Tab => {
+                self.set_tab(self.tab.toggled());
+                NavAction::SwitchTab(self.tab)
+            }
+        }
+    }
+
+    /// Confirm on the Store/Library pill: return focus to the Games rail on
+    /// that app's tile. A pill with no wired-up tile keeps pill focus and
+    /// does nothing.
+    fn jump_to_games_tile(&mut self, tile_index: Option<usize>) -> NavAction {
+        let Some(index) = tile_index else { return NavAction::None };
+        self.set_tab(RailTab::Games);
+        self.rail_index = index.min(self.rail_len.saturating_sub(1));
+        self.mode = NavMode::Home;
+        NavAction::None
     }
 
     fn apply_control_center(&mut self, input: NavInput) -> NavAction {
@@ -637,6 +756,118 @@ mod tests {
         nav.rail_index = 1;
         assert_eq!(nav.apply(NavInput::Confirm), NavAction::LaunchMedia(1));
         assert_eq!(nav.mode, NavMode::Home);
+    }
+
+    // --- Pill-row focus (concept-mock Home) ----------------------------------
+
+    #[test]
+    fn up_from_the_rail_enters_pills_on_the_active_tabs_pill() {
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_media_rail_len(3);
+        assert_eq!(nav.apply(NavInput::Up), NavAction::None);
+        assert_eq!(nav.mode, NavMode::Pills);
+        assert_eq!(nav.pill_index, PILL_MY_GAMES);
+
+        nav.apply(NavInput::Back); // back to the rail
+        nav.apply(NavInput::Tab); // -> Media
+        nav.apply(NavInput::Up);
+        assert_eq!(nav.mode, NavMode::Pills);
+        assert_eq!(nav.pill_index, PILL_MEDIA, "pill focus starts on the pill matching the active tab");
+    }
+
+    /// Table-driven: pill-row movement and exits.
+    #[test]
+    fn pills_navigation_table() {
+        struct Case {
+            name: &'static str,
+            start_pill: usize,
+            input: NavInput,
+            expect_pill: usize,
+            expect_mode: NavMode,
+        }
+
+        let cases = [
+            Case { name: "right moves forward", start_pill: PILL_MY_GAMES, input: NavInput::Right, expect_pill: PILL_MEDIA, expect_mode: NavMode::Pills },
+            Case { name: "left moves backward", start_pill: PILL_MEDIA, input: NavInput::Left, expect_pill: PILL_MY_GAMES, expect_mode: NavMode::Pills },
+            Case { name: "left clamps at Store", start_pill: PILL_STORE, input: NavInput::Left, expect_pill: PILL_STORE, expect_mode: NavMode::Pills },
+            Case { name: "right clamps at the last pill", start_pill: PILL_MORE, input: NavInput::Right, expect_pill: PILL_MORE, expect_mode: NavMode::Pills },
+            Case { name: "down returns to the rail", start_pill: PILL_LIBRARY, input: NavInput::Down, expect_pill: PILL_LIBRARY, expect_mode: NavMode::Home },
+            Case { name: "back returns to the rail", start_pill: PILL_LIBRARY, input: NavInput::Back, expect_pill: PILL_LIBRARY, expect_mode: NavMode::Home },
+            Case { name: "up stays put", start_pill: PILL_STORE, input: NavInput::Up, expect_pill: PILL_STORE, expect_mode: NavMode::Pills },
+        ];
+
+        for case in cases {
+            let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]);
+            nav.mode = NavMode::Pills;
+            nav.pill_index = case.start_pill;
+            let action = nav.apply(case.input);
+            assert_eq!(action, NavAction::None, "case: {}", case.name);
+            assert_eq!(nav.pill_index, case.expect_pill, "case: {}", case.name);
+            assert_eq!(nav.mode, case.expect_mode, "case: {}", case.name);
+        }
+    }
+
+    #[test]
+    fn confirming_the_tab_pills_switches_the_rail_tab_and_returns_home() {
+        let mut nav = NavState::with_cc_options(5, 11, vec![0; 11]).with_media_rail_len(3);
+        nav.mode = NavMode::Pills;
+        nav.pill_index = PILL_MEDIA;
+        assert_eq!(nav.apply(NavInput::Confirm), NavAction::SwitchTab(RailTab::Media));
+        assert_eq!(nav.mode, NavMode::Home);
+        assert_eq!(nav.tab, RailTab::Media);
+        assert_eq!(nav.rail_len, 3);
+        assert_eq!(nav.rail_index, 0);
+
+        nav.apply(NavInput::Up);
+        nav.pill_index = PILL_MY_GAMES;
+        assert_eq!(nav.apply(NavInput::Confirm), NavAction::SwitchTab(RailTab::Games));
+        assert_eq!(nav.tab, RailTab::Games);
+        assert_eq!(nav.rail_len, 5);
+    }
+
+    #[test]
+    fn confirming_the_settings_pill_opens_settings() {
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), vec![4, 3]);
+        nav.mode = NavMode::Pills;
+        nav.pill_index = PILL_SETTINGS;
+        assert_eq!(nav.apply(NavInput::Confirm), NavAction::OpenSettings);
+        assert_eq!(nav.mode, NavMode::Settings);
+        assert_eq!(nav.settings_section, 0);
+        assert_eq!(nav.settings_row, 0);
+    }
+
+    #[test]
+    fn confirming_store_and_library_pills_jumps_the_games_rail_to_their_tiles() {
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_media_rail_len(3).with_app_tiles(Some(6), Some(7));
+        nav.apply(NavInput::Tab); // -> Media, to prove the jump also switches back
+        nav.apply(NavInput::Up);
+        nav.pill_index = PILL_STORE;
+        assert_eq!(nav.apply(NavInput::Confirm), NavAction::None);
+        assert_eq!(nav.mode, NavMode::Home);
+        assert_eq!(nav.tab, RailTab::Games);
+        assert_eq!(nav.rail_index, 6);
+
+        nav.apply(NavInput::Up);
+        nav.pill_index = PILL_LIBRARY;
+        nav.apply(NavInput::Confirm);
+        assert_eq!(nav.rail_index, 7);
+    }
+
+    #[test]
+    fn store_pill_without_a_wired_tile_is_a_no_op_that_keeps_pill_focus() {
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]); // no app tiles wired
+        nav.mode = NavMode::Pills;
+        nav.pill_index = PILL_STORE;
+        assert_eq!(nav.apply(NavInput::Confirm), NavAction::None);
+        assert_eq!(nav.mode, NavMode::Pills);
+    }
+
+    #[test]
+    fn guide_from_pills_opens_control_center() {
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]);
+        nav.mode = NavMode::Pills;
+        assert_eq!(nav.apply(NavInput::Guide), NavAction::OpenControlCenter);
+        assert_eq!(nav.mode, NavMode::ControlCenter);
+        assert_eq!(nav.cc_index, 0);
     }
 
     #[test]

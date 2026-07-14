@@ -278,6 +278,11 @@ pub struct LibraryItem {
     pub kind: ItemKind,
     pub art: ArtSource,
     pub meta: Option<GameMeta>,
+    /// User-supplied cover image (`cover.png`/`cover.jpg` in the game's own
+    /// folder), drawn as the rail tile art when present. Always `None` for
+    /// built-in apps and the sample library — the repository ships no image
+    /// assets (spec §11); covers are the user's, like theme backgrounds.
+    pub cover_path: Option<PathBuf>,
     pub launch: LaunchTarget,
 }
 
@@ -298,6 +303,7 @@ pub fn built_in_apps() -> Vec<LibraryItem> {
                 glyph: GlyphKind::Bag,
             },
             meta: None,
+            cover_path: None,
             launch: LaunchTarget::App { id: "store".to_string() },
         },
         LibraryItem {
@@ -309,6 +315,7 @@ pub fn built_in_apps() -> Vec<LibraryItem> {
                 glyph: GlyphKind::Grid,
             },
             meta: None,
+            cover_path: None,
             launch: LaunchTarget::App { id: "library".to_string() },
         },
         LibraryItem {
@@ -320,6 +327,7 @@ pub fn built_in_apps() -> Vec<LibraryItem> {
                 glyph: GlyphKind::Gear,
             },
             meta: None,
+            cover_path: None,
             launch: LaunchTarget::App { id: "settings".to_string() },
         },
     ]
@@ -350,6 +358,7 @@ pub fn sample_library() -> Vec<LibraryItem> {
                     ActivityCard { top: "Game Help".to_string(), main: "3 tips available".to_string(), sub: String::new(), progress: None },
                 ],
             }),
+            cover_path: None,
             launch: LaunchTarget::Game { path: PathBuf::from("Games/nova") },
         },
         LibraryItem {
@@ -373,6 +382,7 @@ pub fn sample_library() -> Vec<LibraryItem> {
                     ActivityCard { top: "2 friends playing".to_string(), main: "Join session".to_string(), sub: String::new(), progress: None },
                 ],
             }),
+            cover_path: None,
             launch: LaunchTarget::Game { path: PathBuf::from("Games/astral") },
         },
         LibraryItem {
@@ -396,6 +406,7 @@ pub fn sample_library() -> Vec<LibraryItem> {
                     ActivityCard { top: "Game Help".to_string(), main: "1 tip available".to_string(), sub: String::new(), progress: None },
                 ],
             }),
+            cover_path: None,
             launch: LaunchTarget::Game { path: PathBuf::from("Games/sable") },
         },
         LibraryItem {
@@ -419,6 +430,7 @@ pub fn sample_library() -> Vec<LibraryItem> {
                     ActivityCard { top: "Game Help".to_string(), main: "Boss strategy".to_string(), sub: String::new(), progress: None },
                 ],
             }),
+            cover_path: None,
             launch: LaunchTarget::Game { path: PathBuf::from("Games/kingfall") },
         },
         LibraryItem {
@@ -442,6 +454,7 @@ pub fn sample_library() -> Vec<LibraryItem> {
                     ActivityCard { top: "5 friends online".to_string(), main: "Invite to party".to_string(), sub: String::new(), progress: None },
                 ],
             }),
+            cover_path: None,
             launch: LaunchTarget::Game { path: PathBuf::from("Games/neon") },
         },
         LibraryItem {
@@ -465,6 +478,7 @@ pub fn sample_library() -> Vec<LibraryItem> {
                     ActivityCard { top: "Game Help".to_string(), main: "Crafting guide".to_string(), sub: String::new(), progress: None },
                 ],
             }),
+            cover_path: None,
             launch: LaunchTarget::Game { path: PathBuf::from("Games/tide") },
         },
     ]

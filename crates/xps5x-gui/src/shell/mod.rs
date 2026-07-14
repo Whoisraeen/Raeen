@@ -23,6 +23,7 @@ use boot::BootSequence;
 use egui::Key;
 use home::HomeAnim;
 use nav::{NavAction, NavInput, NavMode, NavState, RailTab};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use xps5x_core::config::EmulatorConfig;
 
@@ -70,6 +71,10 @@ pub struct Shell {
     /// once per theme (re)load — `home.rs` draws this instead of the mesh
     /// gradient hero when present (spec §6).
     background_texture: Option<egui::TextureHandle>,
+    /// Per-game cover images (user-supplied `cover.png`/`cover.jpg` found by
+    /// the library scan), decoded and uploaded once at construction, keyed
+    /// by `LibraryItem::id`. Games without one keep gradient + monogram art.
+    cover_textures: HashMap<String, egui::TextureHandle>,
     /// Scratch text-entry buffers for Settings' two path fields. Kept on
     /// `Shell` rather than `nav::NavState`, which stays free of raw text
     /// state so it can remain a pure, egui-free state machine.
@@ -117,10 +122,15 @@ impl Shell {
         // that index simply never matches and nothing opens Settings.
         let settings_tile_index = library.iter().position(|item| item.id == "settings");
         let settings_row_counts = settings::settings_row_counts(config.paths.game_folders.len());
+        // Store / Game Library tiles, so their nav pills can jump the rail
+        // there (same "absent tile → pill no-ops" contract as Settings).
+        let store_tile_index = library.iter().position(|item| item.id == "store");
+        let library_tile_index = library.iter().position(|item| item.id == "library");
 
         let nav = NavState::with_cc_options(rail_len, cc_len, cc_option_counts)
             .with_settings(settings_tile_index, settings_row_counts)
-            .with_media_rail_len(library_media.len());
+            .with_media_rail_len(library_media.len())
+            .with_app_tiles(store_tile_index, library_tile_index);
 
         let gilrs = gilrs::Gilrs::new().ok();
         if gilrs.is_none() {
@@ -131,6 +141,7 @@ impl Shell {
 
         theme::install_fonts(ctx, &theme);
         let background_texture = background_texture_for(ctx, &theme);
+        let cover_textures = cover_textures_for(ctx, &library);
 
         Self {
             theme,
@@ -147,6 +158,7 @@ impl Shell {
             config_path,
             themes_root,
             background_texture,
+            cover_textures,
             settings_new_folder_input: String::new(),
             settings_key_provider_input,
             rail_offset: Animated::new(0.0),
@@ -509,7 +521,7 @@ impl Shell {
                 focus_pop: self.focus_pop.value,
             };
             let items = self.active_items();
-            home::draw(ui, &theme, items, &self.nav, &anim, &self.meta_cache, self.background_texture.as_ref());
+            home::draw(ui, &theme, items, &self.nav, &anim, &self.meta_cache, self.background_texture.as_ref(), &self.cover_textures);
 
             let recent_titles = self.recent_titles();
             control_center::draw(ui, &theme, &self.nav, self.cc_open.value, &recent_titles);
@@ -544,6 +556,25 @@ fn background_texture_for(ctx: &egui::Context, theme: &Theme) -> Option<egui::Te
         .background
         .as_ref()
         .map(|image| ctx.load_texture("xps5x-theme-background", (**image).clone(), egui::TextureOptions::LINEAR))
+}
+
+/// Decode + upload every scanned game's user-supplied cover image, keyed by
+/// item id. Uses the theme loader's bounds-checked image path (covers are
+/// untrusted content exactly like theme backgrounds); anything missing,
+/// oversized, or malformed is simply skipped — that game keeps its
+/// gradient + monogram tile art.
+fn cover_textures_for(ctx: &egui::Context, library: &[LibraryItem]) -> HashMap<String, egui::TextureHandle> {
+    let mut textures = HashMap::new();
+    for item in library {
+        let Some(path) = &item.cover_path else { continue };
+        let Some(image) = theme::loader::load_image_file_capped(path) else {
+            tracing::warn!(path = %path.display(), title = %item.title, "cover image failed to load — using gradient art");
+            continue;
+        };
+        let texture = ctx.load_texture(format!("xps5x-cover-{}", item.id), image, egui::TextureOptions::LINEAR);
+        textures.insert(item.id.clone(), texture);
+    }
+    textures
 }
 
 fn draw_session_overlay(ui: &mut egui::Ui, theme: &Theme, session: &ActiveSession, launcher: &dyn GameLauncher) {

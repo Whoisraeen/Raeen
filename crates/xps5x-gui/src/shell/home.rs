@@ -18,10 +18,12 @@
 
 use super::anim::lerp_color;
 use super::icons::{self, Glyph};
-use super::nav::{NavState, RailTab};
+use super::nav::{self, NavMode, NavState, RailTab};
 use crate::library::{ArtSource, GlyphKind, Gradient, ItemKind, LibraryItem, MetaCache, TileGradient};
 use crate::theme::Theme;
+use egui::epaint::RectShape;
 use egui::{Align2, Color32, FontId, Mesh, Pos2, Rect, Shape, Stroke, StrokeKind, vec2};
+use std::collections::HashMap;
 
 /// Animated values resolved once per frame by `shell/mod.rs`.
 pub struct HomeAnim {
@@ -52,6 +54,7 @@ const RAIL_TOP: f32 = 306.0;
 /// the mock's gold trophy marks).
 const GOLD: Color32 = Color32::from_rgb(230, 190, 92);
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -60,6 +63,7 @@ pub fn draw(
     anim: &HomeAnim,
     meta_cache: &MetaCache,
     background: Option<&egui::TextureHandle>,
+    covers: &HashMap<String, egui::TextureHandle>,
 ) {
     let screen = ui.max_rect();
     let painter = ui.painter().clone();
@@ -68,14 +72,14 @@ pub fn draw(
     draw_hero(&painter, screen, theme, &anim.hero, background);
 
     draw_topbar(&painter, theme, screen);
-    draw_nav_pills(&painter, theme, screen, nav.tab);
+    draw_nav_pills(&painter, theme, screen, nav);
 
     let focused_size = theme.metrics.tile_size * theme.metrics.tile_focus_scale;
     let rail_rect = Rect::from_min_size(
         Pos2::new(screen.left(), screen.top() + RAIL_TOP),
         vec2(screen.width(), focused_size + 16.0),
     );
-    draw_rail(ui, theme, rail_rect, items, nav, anim);
+    draw_rail(ui, theme, rail_rect, items, nav, anim, covers);
 
     let focused = items.get(nav.rail_index);
     draw_context_block(&painter, theme, screen, rail_rect.top() + focused_size, focused, meta_cache);
@@ -201,42 +205,65 @@ fn draw_topbar(painter: &egui::Painter, theme: &Theme, screen: Rect) {
 }
 
 /// Pill tab row: an icon pill, then Store / My games / Media / Library /
-/// Settings / "…". The active pill tracks the rail's Games/Media tab; the
-/// other pills are wayfinding for surfaces that are reached through their
-/// rail tiles today (Settings, Store, Library).
-fn draw_nav_pills(painter: &egui::Painter, theme: &Theme, screen: Rect, tab: RailTab) {
+/// Settings / "…". The active pill tracks the rail's Games/Media tab. When
+/// pill focus is live (`NavMode::Pills`, entered with Up from the rail),
+/// the focused pill wears an accent ring and a brighter fill; Confirm
+/// activates it (see `nav::apply_pills`).
+fn draw_nav_pills(painter: &egui::Painter, theme: &Theme, screen: Rect, nav: &NavState) {
     let y = screen.top() + PILLS_TOP;
     let inactive_bg = Color32::from_rgba_unmultiplied(255, 255, 255, 20);
+    let focused_bg = Color32::from_rgba_unmultiplied(255, 255, 255, 44);
     let mut x = screen.left() + theme.metrics.topbar_padding_x;
 
-    // Leading icon-only pill.
+    // Leading icon-only pill (decorative, not focusable — see `nav::PILL_*`).
     let icon_rect = Rect::from_min_size(Pos2::new(x, y), vec2(PILL_H, PILL_H));
     painter.rect_filled(icon_rect, PILL_H / 2.0, inactive_bg);
     icons::draw(painter, Glyph::Grid, icon_rect.center(), 16.0, theme.palette.text_dim);
     x += PILL_H + PILL_GAP;
 
+    // Label order must match the `nav::PILL_*` focus indices.
     let labels = [
         ("Store", false),
-        ("My games", tab == RailTab::Games),
-        ("Media", tab == RailTab::Media),
+        ("My games", nav.tab == RailTab::Games),
+        ("Media", nav.tab == RailTab::Media),
         ("Library", false),
         ("Settings", false),
         ("\u{2022}\u{2022}\u{2022}", false),
     ];
-    for (label, active) in labels {
+    debug_assert_eq!(labels.len(), nav::PILL_COUNT);
+    for (i, (label, active)) in labels.into_iter().enumerate() {
+        let focused = nav.mode == NavMode::Pills && i == nav.pill_index;
         let text_color = if active { theme.palette.ground } else { theme.palette.text_dim };
         let galley = painter.layout_no_wrap(label.to_string(), FontId::proportional(15.0), text_color);
         let galley_size = galley.size();
         let w = galley_size.x + 40.0;
         let rect = Rect::from_min_size(Pos2::new(x, y), vec2(w, PILL_H));
-        let bg = if active { theme.palette.focus } else { inactive_bg };
+        let bg = if active {
+            theme.palette.focus
+        } else if focused {
+            focused_bg
+        } else {
+            inactive_bg
+        };
         painter.rect_filled(rect, PILL_H / 2.0, bg);
+        if focused {
+            let ring = rect.expand(4.0);
+            painter.rect_stroke(ring, ring.height() / 2.0, Stroke::new(2.5, theme.palette.accent), StrokeKind::Outside);
+        }
         painter.galley(rect.center() - galley_size / 2.0, galley, text_color);
         x += w + PILL_GAP;
     }
 }
 
-fn draw_rail(ui: &mut egui::Ui, theme: &Theme, rect: Rect, items: &[LibraryItem], nav: &NavState, anim: &HomeAnim) {
+fn draw_rail(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    rect: Rect,
+    items: &[LibraryItem],
+    nav: &NavState,
+    anim: &HomeAnim,
+    covers: &HashMap<String, egui::TextureHandle>,
+) {
     // Slightly expanded clip so the focused tile's offset ring isn't cut off.
     let painter = ui.painter_at(rect.expand(18.0));
     let m = &theme.metrics;
@@ -297,7 +324,14 @@ fn draw_rail(ui: &mut egui::Ui, theme: &Theme, rect: Rect, items: &[LibraryItem]
                 icons::draw(&painter, g, tile_rect.center(), size * 0.3, with_alpha(Color32::WHITE, 0.92 * alpha));
             }
             ArtSource::Game { .. } => {
-                if item.kind == ItemKind::Game {
+                if let Some(texture) = covers.get(item.id.as_str()) {
+                    // The user's own cover image (spec §11: user-supplied,
+                    // like theme backgrounds), center-cropped to the square
+                    // tile and tinted for the passed-tile fade.
+                    let shape = RectShape::filled(tile_rect, radius, with_alpha(Color32::WHITE, alpha))
+                        .with_texture(texture.id(), cover_crop_uv(texture));
+                    painter.add(Shape::Rect(shape));
+                } else if item.kind == ItemKind::Game {
                     // Original stand-in key art: a large centered monogram
                     // over the gradient (spec §11 — never real box art).
                     let monogram = item.title.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
@@ -330,6 +364,23 @@ fn draw_rail(ui: &mut egui::Ui, theme: &Theme, rect: Rect, items: &[LibraryItem]
             let ring_a = (0.82 + 0.18 * pulse) * alpha;
             painter.rect_stroke(ring_rect, ring_radius, Stroke::new(3.5, with_alpha(theme.palette.accent, ring_a)), StrokeKind::Outside);
         }
+    }
+}
+
+/// UV rect that center-crops a cover texture to the rail tile's square
+/// aspect — the shorter axis maps 0..1, the longer axis is trimmed equally
+/// on both sides.
+fn cover_crop_uv(texture: &egui::TextureHandle) -> Rect {
+    let size = texture.size_vec2();
+    if size.x <= 0.0 || size.y <= 0.0 {
+        return Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    }
+    if size.x > size.y {
+        let dx = (1.0 - size.y / size.x) / 2.0;
+        Rect::from_min_max(Pos2::new(dx, 0.0), Pos2::new(1.0 - dx, 1.0))
+    } else {
+        let dy = (1.0 - size.x / size.y) / 2.0;
+        Rect::from_min_max(Pos2::new(0.0, dy), Pos2::new(1.0, 1.0 - dy))
     }
 }
 

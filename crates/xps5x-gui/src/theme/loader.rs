@@ -212,7 +212,16 @@ fn load_font(theme_dir: &Path, reference: &str) -> Option<Vec<u8>> {
 
 fn load_background(theme_dir: &Path, reference: &str) -> Option<ColorImage> {
     let path = resolve_asset_path(theme_dir, reference)?;
-    let bytes = read_capped(&path, MAX_IMAGE_ENCODED_BYTES)?;
+    load_image_file_capped(&path)
+}
+
+/// Read + decode an image file under the same size caps as a theme
+/// background. Shared with the Shell's per-game cover loading (`shell/
+/// mod.rs`) — covers are user-supplied untrusted content exactly like theme
+/// backgrounds, so they get the identical bounds-checked path. Returns
+/// `None` — never panics — for anything missing, oversized, or malformed.
+pub(crate) fn load_image_file_capped(path: &Path) -> Option<ColorImage> {
+    let bytes = read_capped(path, MAX_IMAGE_ENCODED_BYTES)?;
     decode_image_capped(&bytes)
 }
 

@@ -169,8 +169,19 @@ pub fn item_from_folder(name: &str, path: &Path, has_eboot: bool, title_toml: Op
         kind: ItemKind::Game,
         art,
         meta,
+        cover_path: None,
         launch: LaunchTarget::Game { path: path.join("eboot.bin") },
     })
+}
+
+/// Conventional cover-image file names looked for inside a game folder, in
+/// priority order. User-supplied, like theme backgrounds — the repository
+/// itself never ships cover images (spec §11).
+const COVER_FILE_NAMES: [&str; 3] = ["cover.png", "cover.jpg", "cover.jpeg"];
+
+/// The first conventional cover file that exists inside `folder`, if any.
+fn find_cover(folder: &Path) -> Option<std::path::PathBuf> {
+    COVER_FILE_NAMES.iter().map(|name| folder.join(name)).find(|p| p.is_file())
 }
 
 /// Turn a folder name like `nova-requiem` or `sable_horizon` into a display
@@ -214,7 +225,8 @@ pub fn scan_dir(root: &Path) -> Vec<LibraryItem> {
         };
         let has_eboot = path.join("eboot.bin").is_file();
         let title_toml = std::fs::read_to_string(path.join("xps5x-title.toml")).ok();
-        if let Some(item) = item_from_folder(name, &path, has_eboot, title_toml.as_deref()) {
+        if let Some(mut item) = item_from_folder(name, &path, has_eboot, title_toml.as_deref()) {
+            item.cover_path = find_cover(&path);
             items.push(item);
         }
     }
@@ -378,5 +390,47 @@ mod tests {
     fn scan_dir_on_missing_root_returns_empty_not_panic() {
         let items = scan_dir(&PathBuf::from("this/path/does/not/exist/anywhere"));
         assert!(items.is_empty());
+    }
+
+    /// A fresh scratch directory under the OS temp dir (same pattern as the
+    /// theme loader's tests) — cover detection needs real files on disk.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("xps5x-gui-scan-tests").join(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn scan_dir_picks_up_a_conventional_cover_file() {
+        let root = scratch_dir("with-cover");
+        let game = root.join("nova-requiem");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("eboot.bin"), b"stub").unwrap();
+        std::fs::write(game.join("cover.png"), b"not decoded here - detection only").unwrap();
+
+        let items = scan_dir(&root);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].cover_path.as_deref(), Some(game.join("cover.png").as_path()));
+    }
+
+    #[test]
+    fn scan_dir_without_a_cover_file_leaves_cover_path_none() {
+        let root = scratch_dir("no-cover");
+        let game = root.join("kingfall");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("eboot.bin"), b"stub").unwrap();
+
+        let items = scan_dir(&root);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].cover_path.is_none());
+    }
+
+    #[test]
+    fn find_cover_prefers_png_over_jpg() {
+        let root = scratch_dir("cover-priority");
+        std::fs::write(root.join("cover.jpg"), b"jpg").unwrap();
+        std::fs::write(root.join("cover.png"), b"png").unwrap();
+        assert_eq!(find_cover(&root), Some(root.join("cover.png")));
     }
 }
