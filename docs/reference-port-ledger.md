@@ -75,7 +75,7 @@ Second-opinion PS5 emu (C#). Re-implement in Rust; do not vendor C#.
 | libc string/mem + atexit | compat exports | `xps5x-hle` | `done` | `c485704` | +review fixes `2ab04fa` (strstr DoS→memchr, truncation warn) |
 | libc atoi/strtol/strtoul | compat exports | `xps5x-hle` | `done` | `4f86ea0` | real base-0 parse + endptr |
 | time / usleep | kernel time exports | `xps5x-hle` | `done` | `922d0bf` | real host clock; usleep really sleeps |
-| GetCompiledSdkVersion / getpid | KernelExports | `xps5x-hle` | `done` | (this batch) | PS5 SDK 9.00 (Gen5); stable pid |
+| GetCompiledSdkVersion / getpid | KernelExports | `xps5x-hle` | `done` | `9457258` | PS5 SDK 9.00 (Gen5); stable pid |
 | SELF / eboot / Prospero loader | Loader | `xps5x-firmware` | `todo` | | cross-check vs Kyty |
 | PRX / sysmodule load chain | Kernel / Libs | `xps5x-firmware`/`hle` | `todo` | | |
 | Fiber / AMPR | Kernel | `xps5x-hle`/`runtime` | `todo` | | |
