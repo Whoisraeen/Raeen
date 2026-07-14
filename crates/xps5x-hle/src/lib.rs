@@ -32,6 +32,7 @@ pub mod libsce_gnm_driver;
 pub mod libsce_net;
 pub mod libsce_np;
 pub mod libsce_pad;
+pub mod libsce_peripheral;
 pub mod libsce_playgo;
 pub mod libsce_rtc;
 pub mod libsce_save_data;
@@ -159,6 +160,7 @@ impl HleRegistry {
         libsce_net::register(&registry);
         libsce_disc_map::register(&registry);
         libsce_rtc::register(&registry);
+        libsce_peripheral::register(&registry);
 
         info!(
             "HLE registry: {} functions registered",
