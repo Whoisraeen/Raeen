@@ -122,7 +122,9 @@ impl ModuleRegistry {
     }
 
     fn try_lle(&self, nid: u64) -> Option<Resolver> {
-        self.lle_exports.get(&nid).map(|&addr| Resolver::Lle { addr })
+        self.lle_exports
+            .get(&nid)
+            .map(|&addr| Resolver::Lle { addr })
     }
 }
 
@@ -168,7 +170,10 @@ mod tests {
         let nid = nid_of("someFreshLleOnlyExport");
         registry.register_module_exports(
             "otherModule",
-            &[SymbolExport { nid, value: 0xDEAD_BEEF }],
+            &[SymbolExport {
+                nid,
+                value: 0xDEAD_BEEF,
+            }],
         );
 
         match registry.resolve(&hle, "someModule", nid) {
@@ -183,7 +188,10 @@ mod tests {
         let registry = ModuleRegistry::new(db);
 
         let nid = nid_of("totallyUnknownFunctionNameNobodyRegistered");
-        assert_eq!(registry.resolve(&hle, "someModule", nid), Resolver::Unresolved);
+        assert_eq!(
+            registry.resolve(&hle, "someModule", nid),
+            Resolver::Unresolved
+        );
     }
 
     #[test]

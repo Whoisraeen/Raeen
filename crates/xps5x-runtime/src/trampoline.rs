@@ -6,9 +6,11 @@
 
 use core::ffi::c_void;
 
-use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree};
+use windows_sys::Win32::System::Memory::{
+    VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS,
+};
 
-use xps5x_firmware::{HLE_TRAMPOLINE_BASE, HleTrampoline};
+use xps5x_firmware::{HleTrampoline, HLE_TRAMPOLINE_BASE};
 
 use crate::RuntimeError;
 

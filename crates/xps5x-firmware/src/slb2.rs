@@ -89,7 +89,7 @@ mod tests {
         buf[0..4].copy_from_slice(b"SLB2");
         buf[4..8].copy_from_slice(&3u32.to_le_bytes()); // version
         buf[0x0C..0x10].copy_from_slice(&1u32.to_le_bytes()); // file_count = 1
-        // entry 0 at 0x20
+                                                              // entry 0 at 0x20
         buf[0x20..0x24].copy_from_slice(&2u32.to_le_bytes()); // block_offset = 2
         buf[0x24..0x28].copy_from_slice(&0x100u32.to_le_bytes()); // size = 256
         let name = b"PS5UPDATE1.PUP";

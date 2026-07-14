@@ -152,7 +152,10 @@ pub fn parse_sce_dynamic(dynamic_bytes: &[u8]) -> Result<Vec<(u64, u64)>, Firmwa
 /// (`// TODO(LM1+): verify index encoding`): the `lib_id`/`mod_id` indices
 /// parsed from the `"<nid>#<lib_id>#<mod_id>"` strtab name convention.
 pub fn parse_dynlibdata(blob: &[u8], dyn_tags: &[(u64, u64)]) -> Result<DynlibData, FirmwareError> {
-    let strtab = match (tag_val(dyn_tags, DT_SCE_STRTAB), tag_val(dyn_tags, DT_SCE_STRSZ)) {
+    let strtab = match (
+        tag_val(dyn_tags, DT_SCE_STRTAB),
+        tag_val(dyn_tags, DT_SCE_STRSZ),
+    ) {
         (Some(off), Some(sz)) => slice_range(blob, off, sz, "DT_SCE_STRTAB")?,
         _ => &[],
     };
@@ -166,7 +169,14 @@ pub fn parse_dynlibdata(blob: &[u8], dyn_tags: &[(u64, u64)]) -> Result<DynlibDa
     ) {
         let syment = tag_val(dyn_tags, DT_SCE_SYMENT).unwrap_or(ELF64_SYM_SIZE);
         let symtab = slice_range(blob, sym_off, sym_sz, "DT_SCE_SYMTAB")?;
-        decode_symbols(symtab, syment, strtab, &mut imports, &mut exports, &mut symbols)?;
+        decode_symbols(
+            symtab,
+            syment,
+            strtab,
+            &mut imports,
+            &mut exports,
+            &mut symbols,
+        )?;
     }
 
     let mut relocations = Vec::new();
@@ -191,9 +201,10 @@ pub fn parse_dynlibdata(blob: &[u8], dyn_tags: &[(u64, u64)]) -> Result<DynlibDa
     // DT_SCE_HASH/DT_SCE_HASHSZ are bounds-checked-if-present but otherwise
     // unused for LM1 (per the plan, the SCE symbol hash table may be
     // ignored for now).
-    if let (Some(hash_off), Some(hash_sz)) =
-        (tag_val(dyn_tags, DT_SCE_HASH), tag_val(dyn_tags, DT_SCE_HASHSZ))
-    {
+    if let (Some(hash_off), Some(hash_sz)) = (
+        tag_val(dyn_tags, DT_SCE_HASH),
+        tag_val(dyn_tags, DT_SCE_HASHSZ),
+    ) {
         slice_range(blob, hash_off, hash_sz, "DT_SCE_HASH")?;
     }
 
@@ -219,14 +230,21 @@ fn tag_val(dyn_tags: &[(u64, u64)], tag: u64) -> Option<u64> {
 /// Slice `blob[offset .. offset + size]`, bounds-checked. Never panics;
 /// returns [`FirmwareError::MalformedDynlibData`] on overflow or
 /// out-of-bounds ranges.
-fn slice_range<'a>(blob: &'a [u8], offset: u64, size: u64, label: &str) -> Result<&'a [u8], FirmwareError> {
-    let start = usize::try_from(offset)
-        .map_err(|_| FirmwareError::MalformedDynlibData(format!("{label} offset {offset:#x} overflows usize")))?;
-    let len = usize::try_from(size)
-        .map_err(|_| FirmwareError::MalformedDynlibData(format!("{label} size {size:#x} overflows usize")))?;
-    let end = start
-        .checked_add(len)
-        .ok_or_else(|| FirmwareError::MalformedDynlibData(format!("{label} offset+size overflow")))?;
+fn slice_range<'a>(
+    blob: &'a [u8],
+    offset: u64,
+    size: u64,
+    label: &str,
+) -> Result<&'a [u8], FirmwareError> {
+    let start = usize::try_from(offset).map_err(|_| {
+        FirmwareError::MalformedDynlibData(format!("{label} offset {offset:#x} overflows usize"))
+    })?;
+    let len = usize::try_from(size).map_err(|_| {
+        FirmwareError::MalformedDynlibData(format!("{label} size {size:#x} overflows usize"))
+    })?;
+    let end = start.checked_add(len).ok_or_else(|| {
+        FirmwareError::MalformedDynlibData(format!("{label} offset+size overflow"))
+    })?;
     if end > blob.len() {
         return Err(FirmwareError::MalformedDynlibData(format!(
             "{label} range [{start:#x}, {end:#x}) exceeds blob size {:#x}",
@@ -270,8 +288,9 @@ fn decode_symbols(
     exports: &mut Vec<SymbolExport>,
     symbols: &mut Vec<DynSymbol>,
 ) -> Result<(), FirmwareError> {
-    let entsize = usize::try_from(entsize)
-        .map_err(|_| FirmwareError::MalformedDynlibData("DT_SCE_SYMENT overflows usize".to_string()))?;
+    let entsize = usize::try_from(entsize).map_err(|_| {
+        FirmwareError::MalformedDynlibData("DT_SCE_SYMENT overflows usize".to_string())
+    })?;
     if (entsize as u64) < ELF64_SYM_SIZE {
         return Err(FirmwareError::MalformedDynlibData(format!(
             "DT_SCE_SYMENT {entsize} is smaller than Elf64_Sym ({ELF64_SYM_SIZE})"
@@ -358,8 +377,9 @@ fn decode_symbols(
 /// Decode `data` as a sequence of `entsize`-byte `Elf64_Rela` records,
 /// appending each to `out`.
 fn decode_relas(data: &[u8], entsize: u64, out: &mut Vec<SceRela>) -> Result<(), FirmwareError> {
-    let entsize = usize::try_from(entsize)
-        .map_err(|_| FirmwareError::MalformedDynlibData("relocation entsize overflows usize".to_string()))?;
+    let entsize = usize::try_from(entsize).map_err(|_| {
+        FirmwareError::MalformedDynlibData("relocation entsize overflows usize".to_string())
+    })?;
     if (entsize as u64) < ELF64_RELA_SIZE {
         return Err(FirmwareError::MalformedDynlibData(format!(
             "relocation entsize {entsize} is smaller than Elf64_Rela ({ELF64_RELA_SIZE})"
@@ -376,7 +396,11 @@ fn decode_relas(data: &[u8], entsize: u64, out: &mut Vec<SceRela>) -> Result<(),
         let offset = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
         let info = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
         let addend = i64::from_le_bytes(chunk[16..24].try_into().unwrap());
-        out.push(SceRela { offset, info, addend });
+        out.push(SceRela {
+            offset,
+            info,
+            addend,
+        });
     }
 
     Ok(())
@@ -665,10 +689,7 @@ mod tests {
         bytes.extend_from_slice(&[0xFFu8; 16]);
 
         let tags = parse_sce_dynamic(&bytes).expect("well-formed Elf64_Dyn array parses");
-        assert_eq!(
-            tags,
-            vec![(DT_SCE_STRTAB, 0x100), (DT_SCE_STRSZ, 0x20)]
-        );
+        assert_eq!(tags, vec![(DT_SCE_STRTAB, 0x100), (DT_SCE_STRSZ, 0x20)]);
     }
 
     #[test]

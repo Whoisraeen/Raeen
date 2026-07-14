@@ -7,7 +7,11 @@ use std::fmt::Write;
 pub fn summarize(firmware: &Firmware) -> String {
     let entries = firmware.entries();
     let mut s = String::new();
-    let plural = if entries.len() == 1 { "entry" } else { "entries" };
+    let plural = if entries.len() == 1 {
+        "entry"
+    } else {
+        "entries"
+    };
     let _ = writeln!(s, "SLB2 firmware container: {} {}", entries.len(), plural);
     for (i, e) in entries.iter().enumerate() {
         let _ = writeln!(

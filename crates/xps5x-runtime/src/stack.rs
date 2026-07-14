@@ -99,7 +99,11 @@ pub(crate) unsafe fn call_on_guest_stack(
     args: [u64; 6],
     guest_rsp_top: u64,
 ) -> u64 {
-    debug_assert_eq!(guest_rsp_top % 16, 0, "guest_rsp_top must be 16-byte aligned (SysV call ABI)");
+    debug_assert_eq!(
+        guest_rsp_top % 16,
+        0,
+        "guest_rsp_top must be 16-byte aligned (SysV call ABI)"
+    );
 
     // Function pointers aren't directly usable as `asm!` register operands;
     // `entry as usize` is the address value the `call` below needs. This is
@@ -211,7 +215,11 @@ pub(crate) unsafe fn enter_guest_at_start(
     entry: unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> u64,
     process_rsp: u64,
 ) -> u64 {
-    debug_assert_eq!(process_rsp % 16, 0, "process_rsp must be 16-byte aligned (_start ABI)");
+    debug_assert_eq!(
+        process_rsp % 16,
+        0,
+        "process_rsp must be 16-byte aligned (_start ABI)"
+    );
 
     // Function pointers aren't directly usable as `asm!` register operands;
     // `entry as usize` is the address value the `jmp` below needs. This is a

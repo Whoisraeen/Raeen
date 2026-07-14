@@ -50,17 +50,17 @@ use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
-    EXCEPTION_POINTERS, RemoveVectoredExceptionHandler, RtlCaptureContext,
+    AddVectoredExceptionHandler, RemoveVectoredExceptionHandler, RtlCaptureContext, CONTEXT,
+    EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
 };
 
 use xps5x_firmware::HleTrampoline;
 use xps5x_hle::{GuestAllocator, GuestMemory, HleContext, HleRegistry};
 use xps5x_kernel::OrbisKernel;
 
-use crate::RuntimeError;
-use crate::RunOutcome;
 use crate::trampoline::{self, TrampolineGuard};
+use crate::RunOutcome;
+use crate::RuntimeError;
 
 /// The `(library, function)` set that ends a process-mode run instead of
 /// being serviced-and-resumed like an ordinary HLE call (design doc §4, wall
@@ -78,7 +78,9 @@ const TERMINATING_FUNCTIONS: &[(&str, &str)] = &[
 
 /// Whether `(library, function)` names a [`TERMINATING_FUNCTIONS`] entry.
 fn is_terminating(library: &str, function: &str) -> bool {
-    TERMINATING_FUNCTIONS.iter().any(|&(l, f)| l == library && f == function)
+    TERMINATING_FUNCTIONS
+        .iter()
+        .any(|&(l, f)| l == library && f == function)
 }
 
 /// Serializes [`crate::execute_linked`] end to end: RT0 supports exactly
@@ -102,7 +104,9 @@ static CALL_LOCK: Mutex<()> = Mutex::new(());
 /// acquires `CALL_LOCK` itself — it's not reentrant, and the lock must
 /// already be held by the time `run` is called.
 pub(crate) fn call_lock() -> std::sync::MutexGuard<'static, ()> {
-    CALL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    CALL_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The context [`veh_callback`] consults while a guest call is in flight.
@@ -262,7 +266,8 @@ pub(crate) unsafe fn run(
     // *type-level* lifetime, which the actual borrow (`mem`, tied to
     // `execute_linked`'s stack frame for this whole call) still outlives in
     // practice.
-    let mem_erased: &'static dyn GuestMemory = unsafe { core::mem::transmute::<&dyn GuestMemory, &'static dyn GuestMemory>(mem) };
+    let mem_erased: &'static dyn GuestMemory =
+        unsafe { core::mem::transmute::<&dyn GuestMemory, &'static dyn GuestMemory>(mem) };
 
     // SAFETY: same reasoning as `mem_erased` immediately above, applied to
     // `alloc` instead of `mem` — `&dyn GuestAllocator` carries the same
@@ -305,7 +310,10 @@ pub(crate) unsafe fn run(
 
     // `ctx` is a local; its address is stable for the rest of this function
     // (never moved), which is exactly the lifetime the VEH needs it for.
-    ACTIVE_CONTEXT.store(&ctx as *const ActiveContext as *mut ActiveContext, Ordering::Release);
+    ACTIVE_CONTEXT.store(
+        &ctx as *const ActiveContext as *mut ActiveContext,
+        Ordering::Release,
+    );
 
     // RT2c-b (design doc §3): if a guest TCB was set up and FSGSBASE is
     // available, capture the current FS base into `ctx.orig_fsbase` —
@@ -492,7 +500,8 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         // overwrite the delivered context with the pre-call snapshot `run`
         // took via `RtlCaptureContext`, and resume there. See this module's
         // doc comment for the full control-flow argument.
-        ctx.error.set(Some(RuntimeError::Faulted { addr: fault_addr }));
+        ctx.error
+            .set(Some(RuntimeError::Faulted { addr: fault_addr }));
 
         // SAFETY: `ctx.recovery_ctx` was populated by `run`'s
         // `RtlCaptureContext` call before it called the guest, and is
@@ -549,9 +558,17 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             }
 
             // SysV integer argument registers (design doc §3).
-            let args = [context.Rdi, context.Rsi, context.Rdx, context.Rcx, context.R8, context.R9];
+            let args = [
+                context.Rdi,
+                context.Rsi,
+                context.Rdx,
+                context.Rcx,
+                context.R8,
+                context.R9,
+            ];
             let hle_ctx = HleContext { kernel, mem, alloc };
-            hle.call(&hle_ctx, &t.library, &t.function, &args).unwrap_or(0)
+            hle.call(&hle_ctx, &t.library, &t.function, &args)
+                .unwrap_or(0)
         }
         None => {
             // A call landed in the guarded region but names no known
@@ -560,7 +577,8 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             // returns, but still service the call as a 0-returning stub so
             // we can safely resume (design doc §7 step 2's suggested
             // approach) rather than needing an unwind-style abort.
-            ctx.error.set(Some(RuntimeError::UnresolvedTrampoline(fault_addr)));
+            ctx.error
+                .set(Some(RuntimeError::UnresolvedTrampoline(fault_addr)));
             0
         }
     };

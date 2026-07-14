@@ -71,7 +71,9 @@ pub(crate) fn build_process_stack(
     // strings just written above it), then align its start down to 16 bytes
     // — rounding down only ever moves the start *further* from `cursor`, so
     // the no-overlap property still holds after alignment.
-    let block_end = cursor.checked_sub(block_bytes).ok_or(RuntimeError::MapFailed)?;
+    let block_end = cursor
+        .checked_sub(block_bytes)
+        .ok_or(RuntimeError::MapFailed)?;
     let rsp = block_end & !0xF;
 
     let mut slot = rsp;
@@ -138,16 +140,23 @@ mod tests {
 
         fn read_u64(&self, addr: u64) -> u64 {
             let mut buf = [0u8; 8];
-            assert!(GuestMemory::read(self, addr, &mut buf), "read at {addr:#x} should succeed");
+            assert!(
+                GuestMemory::read(self, addr, &mut buf),
+                "read at {addr:#x} should succeed"
+            );
             u64::from_le_bytes(buf)
         }
     }
 
     impl GuestMemory for VecMemory {
         fn read(&self, guest_addr: u64, out: &mut [u8]) -> bool {
-            let Ok(addr) = usize::try_from(guest_addr) else { return false };
+            let Ok(addr) = usize::try_from(guest_addr) else {
+                return false;
+            };
             let buf = self.0.borrow();
-            let Some(end) = addr.checked_add(out.len()) else { return false };
+            let Some(end) = addr.checked_add(out.len()) else {
+                return false;
+            };
             if end > buf.len() {
                 return false;
             }
@@ -156,9 +165,13 @@ mod tests {
         }
 
         fn write(&self, guest_addr: u64, data: &[u8]) -> bool {
-            let Ok(addr) = usize::try_from(guest_addr) else { return false };
+            let Ok(addr) = usize::try_from(guest_addr) else {
+                return false;
+            };
             let mut buf = self.0.borrow_mut();
-            let Some(end) = addr.checked_add(data.len()) else { return false };
+            let Some(end) = addr.checked_add(data.len()) else {
+                return false;
+            };
             if end > buf.len() {
                 return false;
             }
@@ -174,7 +187,8 @@ mod tests {
     #[test]
     fn layout_argc_argv0_pointer_and_string_round_trip() {
         let mem = VecMemory::new(0x1000);
-        let rsp = build_process_stack(0x1000, &["/app/eboot.bin"], &[], &mem).expect("layout should succeed");
+        let rsp = build_process_stack(0x1000, &["/app/eboot.bin"], &[], &mem)
+            .expect("layout should succeed");
 
         assert_eq!(rsp % 16, 0, "rsp must be 16-byte aligned (the _start ABI)");
 
@@ -197,8 +211,16 @@ mod tests {
 
         assert_eq!(rsp % 16, 0);
         assert_eq!(mem.read_u64(rsp), 0, "argc == 0");
-        assert_eq!(mem.read_u64(rsp + 8), 0, "argv NULL terminator immediately follows argc");
-        assert_eq!(mem.read_u64(rsp + 16), 0, "envp NULL terminator immediately follows argv's");
+        assert_eq!(
+            mem.read_u64(rsp + 8),
+            0,
+            "argv NULL terminator immediately follows argc"
+        );
+        assert_eq!(
+            mem.read_u64(rsp + 16),
+            0,
+            "envp NULL terminator immediately follows argv's"
+        );
         assert_eq!(mem.read_u64(rsp + 24), AT_PAGESZ);
         assert_eq!(mem.read_u64(rsp + 32), AUXV_PAGESZ_VALUE);
         assert_eq!(mem.read_u64(rsp + 40), AT_NULL);
@@ -211,17 +233,26 @@ mod tests {
     #[test]
     fn populated_argv_and_envp_layout_is_fully_correct() {
         let mem = VecMemory::new(0x1000);
-        let rsp = build_process_stack(0x1000, &["a", "bb"], &["FOO=1"], &mem).expect("layout should succeed");
+        let rsp = build_process_stack(0x1000, &["a", "bb"], &["FOO=1"], &mem)
+            .expect("layout should succeed");
 
         assert_eq!(rsp % 16, 0);
         assert_eq!(mem.read_u64(rsp), 2, "argc == 2");
 
         let argv0 = mem.read_u64(rsp + 8);
         let argv1 = mem.read_u64(rsp + 16);
-        assert_eq!(mem.read_u64(rsp + 24), 0, "argv NULL terminator after both entries");
+        assert_eq!(
+            mem.read_u64(rsp + 24),
+            0,
+            "argv NULL terminator after both entries"
+        );
 
         let envp0 = mem.read_u64(rsp + 32);
-        assert_eq!(mem.read_u64(rsp + 40), 0, "envp NULL terminator after the one entry");
+        assert_eq!(
+            mem.read_u64(rsp + 40),
+            0,
+            "envp NULL terminator after the one entry"
+        );
 
         assert_eq!(mem.read_u64(rsp + 48), AT_PAGESZ);
         assert_eq!(mem.read_u64(rsp + 56), AUXV_PAGESZ_VALUE);

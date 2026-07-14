@@ -12,8 +12,7 @@ const SCE_NID_SALT: [u8; 16] = [
 ];
 
 /// Custom base64 alphabet used for NID strings.
-const NID_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
+const NID_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
 
 /// Compute the 64-bit NID for a symbol name.
 pub fn nid_of(name: &str) -> u64 {
@@ -273,7 +272,10 @@ mod nid_database_tests {
         // a real, expected "collision" from the database's point of view.
         let db = NidDatabase::from_hle_names([
             ("libkernel".to_string(), "sceKernelSleep".to_string()),
-            ("libSceLibcInternal".to_string(), "sceKernelSleep".to_string()),
+            (
+                "libSceLibcInternal".to_string(),
+                "sceKernelSleep".to_string(),
+            ),
         ]);
         assert_eq!(db.len(), 1);
         assert_eq!(

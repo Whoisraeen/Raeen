@@ -68,13 +68,19 @@ mod tests {
 
     #[test]
     fn no_keys_provider_returns_none() {
-        let req = KeyRequest { key_type: 1, key_id: 0xABCD };
+        let req = KeyRequest {
+            key_type: 1,
+            key_id: 0xABCD,
+        };
         assert_eq!(NoKeysProvider.segment_key(&req), None);
     }
 
     #[test]
     fn require_key_maps_missing_to_error() {
-        let req = KeyRequest { key_type: 1, key_id: 0xABCD };
+        let req = KeyRequest {
+            key_type: 1,
+            key_id: 0xABCD,
+        };
         let err = require_key(&NoKeysProvider, &req).unwrap_err();
         assert!(matches!(err, FirmwareError::MissingKey { key_id: 0xABCD }));
     }
@@ -84,10 +90,16 @@ mod tests {
         struct FixedProvider;
         impl KeyProvider for FixedProvider {
             fn segment_key(&self, _req: &KeyRequest) -> Option<SegmentKey> {
-                Some(SegmentKey { key: [1u8; 16], iv: [2u8; 16] })
+                Some(SegmentKey {
+                    key: [1u8; 16],
+                    iv: [2u8; 16],
+                })
             }
         }
-        let req = KeyRequest { key_type: 0, key_id: 7 };
+        let req = KeyRequest {
+            key_type: 0,
+            key_id: 7,
+        };
         let key = require_key(&FixedProvider, &req).unwrap();
         assert_eq!(key.key, [1u8; 16]);
         assert_eq!(key.iv, [2u8; 16]);
