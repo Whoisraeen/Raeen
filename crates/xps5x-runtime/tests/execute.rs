@@ -15,15 +15,15 @@
 
 #![cfg(target_os = "windows")]
 
-use xps5x_firmware::dynlib::nid::{NidDatabase, nid_of};
+use xps5x_firmware::dynlib::nid::{nid_of, NidDatabase};
 use xps5x_firmware::dynlib::{DynSymbol, DynlibData, SceRela};
 use xps5x_firmware::{
-    HLE_TRAMPOLINE_BASE, HleTrampoline, LinkedModule, ModuleRegistry, SprxModule, SprxSegment,
-    TlsTemplate, link_module,
+    link_module, HleTrampoline, LinkedModule, ModuleRegistry, SprxModule, SprxSegment, TlsTemplate,
+    HLE_TRAMPOLINE_BASE,
 };
 use xps5x_hle::{HleContext, HleRegistry};
 use xps5x_kernel::OrbisKernel;
-use xps5x_runtime::{GUEST_ARENA_BASE, RunOutcome, RuntimeError, execute_linked, execute_process};
+use xps5x_runtime::{execute_linked, execute_process, RunOutcome, RuntimeError, GUEST_ARENA_BASE};
 
 const R_X86_64_JUMP_SLOT: u64 = 7;
 
@@ -2145,5 +2145,111 @@ fn load_start_module_from_guest_returns_a_usable_handle() {
     assert!(
         kernel.find_module("libSceSysmodule").is_some(),
         "the pseudo-module must be registered in the kernel module table"
+    );
+}
+
+// --- M1 HLE-breadth hardening: new libc string fns resolve + dispatch -----
+
+/// Proves the M1 hardening batch (memcmp/strchr/... ported from SharpEmu +
+/// Kyty references) resolves through the *real* LM1 linker and dispatches:
+/// a `_start` calls `strchr("a/b", '/')` on an image-resident string and
+/// exits with the returned pointer's low byte offset from the string base
+/// (== 1). If the NID didn't resolve, linking would leave it unresolved and
+/// the call would fault instead.
+#[test]
+fn new_libc_strchr_resolves_and_dispatches_through_the_linker() {
+    const ENTRY_OFF: usize = 0x0;
+    const SLOT_STRCHR_OFF: usize = 0x80;
+    const SLOT_EXIT_OFF: usize = 0x88;
+    const STR_OFF: usize = 0x90;
+    const STR_BASE: u64 = GUEST_ARENA_BASE + STR_OFF as u64;
+
+    let mut image = vec![0u8; 0x100];
+    let mut off = ENTRY_OFF;
+    // lea rdi, [rip+disp32] -> STR_OFF
+    let disp = (STR_OFF as i64 - (off as i64 + 7)) as i32;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x8D, 0x3D]);
+    image[off + 3..off + 7].copy_from_slice(&disp.to_le_bytes());
+    off += 7;
+    // mov esi, '/'
+    image[off] = 0xBE;
+    image[off + 1..off + 5].copy_from_slice(&(b'/' as u32).to_le_bytes());
+    off += 5;
+    // call [rip -> SLOT_STRCHR_OFF]  (rax = guest ptr to '/')
+    let disp = (SLOT_STRCHR_OFF as i64 - (off as i64 + 6)) as i32;
+    image[off] = 0xFF;
+    image[off + 1] = 0x15;
+    image[off + 2..off + 6].copy_from_slice(&disp.to_le_bytes());
+    off += 6;
+    // mov rdi, rax — exit with the full returned pointer
+    image[off..off + 3].copy_from_slice(&[0x48, 0x89, 0xC7]);
+    off += 3;
+    // call [rip -> SLOT_EXIT_OFF]
+    let disp = (SLOT_EXIT_OFF as i64 - (off as i64 + 6)) as i32;
+    image[off] = 0xFF;
+    image[off + 1] = 0x15;
+    image[off + 2..off + 6].copy_from_slice(&disp.to_le_bytes());
+
+    image[STR_OFF..STR_OFF + 4].copy_from_slice(b"a/b\0");
+
+    let module = SprxModule {
+        name: "strchrTest".to_string(),
+        e_type: 0xFE18,
+        segments: vec![SprxSegment {
+            vaddr: 0,
+            data: image,
+            flags: 5,
+            mem_size: 0x100,
+        }],
+        dynlib_data: None,
+        relro: None,
+        dynamic: None,
+        entry: ENTRY_OFF as u64,
+        tls: None,
+    };
+    let dynlib = DynlibData {
+        symbols: vec![
+            DynSymbol {
+                nid: nid_of("strchr"),
+                value: 0,
+                is_import: true,
+            },
+            DynSymbol {
+                nid: nid_of("exit"),
+                value: 0,
+                is_import: true,
+            },
+        ],
+        relocations: vec![
+            SceRela {
+                offset: SLOT_STRCHR_OFF as u64,
+                info: R_X86_64_JUMP_SLOT,
+                addend: 0,
+            },
+            SceRela {
+                offset: SLOT_EXIT_OFF as u64,
+                info: (1u64 << 32) | R_X86_64_JUMP_SLOT,
+                addend: 0,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let hle = HleRegistry::new();
+    let db = NidDatabase::from_hle_names(hle.registered_names());
+    let registry = ModuleRegistry::new(db);
+    let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE).expect("links");
+    assert!(
+        linked.unresolved.is_empty(),
+        "strchr and exit must resolve to HLE (the batch is registered)"
+    );
+
+    let kernel = OrbisKernel::new();
+    let outcome =
+        execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[]).expect("must not fault");
+    assert_eq!(
+        outcome,
+        RunOutcome::Exited(STR_BASE + 1),
+        "strchr must return the guest address of '/' — offset 1 of \"a/b\" at STR_BASE"
     );
 }

@@ -34,6 +34,23 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libc", "strcmp", hle_strcmp);
     registry.register("libc", "strcpy", hle_strcpy);
     registry.register("libc", "strncpy", hle_strncpy);
+    // M1 hardening batch (real guest-memory behavior; ported with reference
+    // to SharpEmu's KernelMemoryCompatExports + Kyty libc): the string/buffer
+    // functions crt0 and ordinary homebrew hit constantly.
+    registry.register("libc", "memcmp", hle_memcmp);
+    registry.register("libc", "memchr", hle_memchr);
+    registry.register("libc", "strncmp", hle_strncmp);
+    registry.register("libc", "strnlen", hle_strnlen);
+    registry.register("libc", "strchr", hle_strchr);
+    registry.register("libc", "strrchr", hle_strrchr);
+    registry.register("libc", "strcat", hle_strcat);
+    registry.register("libc", "strncat", hle_strncat);
+    registry.register("libc", "strstr", hle_strstr);
+    // crt0 / C++ static-init registration: record-and-succeed. Real homebrew
+    // registers atexit/global-dtor callbacks during startup; failing these
+    // aborts init before `main`.
+    registry.register("libc", "atexit", hle_atexit);
+    registry.register("libc", "__cxa_atexit", hle_cxa_atexit);
     registry.register("libc", "snprintf", hle_snprintf);
     registry.register("libc", "printf", hle_printf);
     registry.register("libc", "puts", hle_puts);
@@ -345,6 +362,253 @@ fn hle_strncpy(ctx: &HleContext, args: &[u64]) -> u64 {
     dst
 }
 
+/// Cap on how many bytes a single comparison/scan reads out of guest memory,
+/// so a wild `n` can't balloon a host buffer. Matches `STRLEN_MAX_SCAN`'s
+/// rationale (both are 1 MiB).
+const CMP_MAX_BYTES: u64 = 1 << 20;
+
+/// Read `n` guest bytes at `addr` (capped by [`CMP_MAX_BYTES`]) into an owned
+/// buffer, or `None` if the range isn't fully readable. Used by the compare/
+/// scan functions below, which need a concrete byte window rather than a
+/// NUL-terminated string.
+fn read_guest_bytes(ctx: &HleContext, addr: u64, n: u64) -> Option<Vec<u8>> {
+    let capped = n.min(CMP_MAX_BYTES);
+    let len = usize::try_from(capped).ok()?;
+    let mut buf = vec![0u8; len];
+    if len == 0 {
+        return Some(buf);
+    }
+    if ctx.mem.read(addr, &mut buf) {
+        Some(buf)
+    } else {
+        None
+    }
+}
+
+/// Real `memcmp(a, b, n)`: reads `n` bytes from each pointer and returns the
+/// sign of the first differing byte pair (unsigned), `0` if equal. An
+/// unreadable range logs and reports `0` (equal) — the least-surprising
+/// degradation for a comparison with no error channel.
+fn hle_memcmp(ctx: &HleContext, args: &[u64]) -> u64 {
+    let a = args.first().copied().unwrap_or(0);
+    let b = args.get(1).copied().unwrap_or(0);
+    let n = args.get(2).copied().unwrap_or(0);
+    debug!("memcmp(a={a:#x}, b={b:#x}, n={n:#x})");
+
+    let (Some(ba), Some(bb)) = (read_guest_bytes(ctx, a, n), read_guest_bytes(ctx, b, n)) else {
+        warn!("memcmp: unreadable range (a={a:#x}, b={b:#x}, n={n:#x})");
+        return 0;
+    };
+    for (x, y) in ba.iter().zip(bb.iter()) {
+        if x != y {
+            return if x < y { (-1i32) as u32 as u64 } else { 1 };
+        }
+    }
+    0
+}
+
+/// Real `memchr(s, c, n)`: returns the guest address of the first byte equal
+/// to `c` (low 8 bits) within the first `n` bytes of `s`, or `0` (`NULL`) if
+/// not found or the range is unreadable.
+fn hle_memchr(ctx: &HleContext, args: &[u64]) -> u64 {
+    let s = args.first().copied().unwrap_or(0);
+    let c = (args.get(1).copied().unwrap_or(0) & 0xFF) as u8;
+    let n = args.get(2).copied().unwrap_or(0);
+    debug!("memchr(s={s:#x}, c={c:#x}, n={n:#x})");
+
+    let Some(bytes) = read_guest_bytes(ctx, s, n) else {
+        warn!("memchr: unreadable range (s={s:#x}, n={n:#x})");
+        return 0;
+    };
+    match bytes.iter().position(|&b| b == c) {
+        Some(off) => s.wrapping_add(off as u64),
+        None => 0,
+    }
+}
+
+/// Real `strncmp(a, b, n)`: compares up to `n` bytes of the two guest
+/// strings, stopping at the first NUL, unsigned. Unreadable pointer → `0`.
+fn hle_strncmp(ctx: &HleContext, args: &[u64]) -> u64 {
+    let a = args.first().copied().unwrap_or(0);
+    let b = args.get(1).copied().unwrap_or(0);
+    let n = args.get(2).copied().unwrap_or(0);
+    debug!("strncmp(a={a:#x}, b={b:#x}, n={n:#x})");
+
+    let (Some(sa), Some(sb)) = (
+        crate::fmt::read_cstr(ctx.mem, a),
+        crate::fmt::read_cstr(ctx.mem, b),
+    ) else {
+        warn!("strncmp: unreadable string (a={a:#x}, b={b:#x})");
+        return 0;
+    };
+    let limit = usize::try_from(n).unwrap_or(usize::MAX);
+    let ta = &sa[..sa.len().min(limit)];
+    let tb = &sb[..sb.len().min(limit)];
+    match ta.cmp(tb) {
+        std::cmp::Ordering::Less => (-1i32) as u32 as u64,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// Real `strnlen(s, maxlen)`: length of the guest string, capped at `maxlen`
+/// (and at `read_cstr`'s own 1 MiB scan bound). Unreadable → `0`.
+fn hle_strnlen(ctx: &HleContext, args: &[u64]) -> u64 {
+    let s = args.first().copied().unwrap_or(0);
+    let maxlen = args.get(1).copied().unwrap_or(0);
+    debug!("strnlen(s={s:#x}, maxlen={maxlen:#x})");
+
+    match crate::fmt::read_cstr(ctx.mem, s) {
+        Some(bytes) => (bytes.len() as u64).min(maxlen),
+        None => 0,
+    }
+}
+
+/// Real `strchr(s, c)`: guest address of the first byte equal to `c` (low 8
+/// bits) in the string, or `0`. Per the C contract, `c == 0` matches (and
+/// returns the address of) the terminating NUL.
+fn hle_strchr(ctx: &HleContext, args: &[u64]) -> u64 {
+    let s = args.first().copied().unwrap_or(0);
+    let c = (args.get(1).copied().unwrap_or(0) & 0xFF) as u8;
+    debug!("strchr(s={s:#x}, c={c:#x})");
+
+    let Some(bytes) = crate::fmt::read_cstr(ctx.mem, s) else {
+        warn!("strchr: unreadable string at {s:#x}");
+        return 0;
+    };
+    if c == 0 {
+        return s.wrapping_add(bytes.len() as u64); // the NUL terminator
+    }
+    match bytes.iter().position(|&b| b == c) {
+        Some(off) => s.wrapping_add(off as u64),
+        None => 0,
+    }
+}
+
+/// Real `strrchr(s, c)`: guest address of the *last* byte equal to `c`, or
+/// `0`. `c == 0` matches the terminating NUL.
+fn hle_strrchr(ctx: &HleContext, args: &[u64]) -> u64 {
+    let s = args.first().copied().unwrap_or(0);
+    let c = (args.get(1).copied().unwrap_or(0) & 0xFF) as u8;
+    debug!("strrchr(s={s:#x}, c={c:#x})");
+
+    let Some(bytes) = crate::fmt::read_cstr(ctx.mem, s) else {
+        warn!("strrchr: unreadable string at {s:#x}");
+        return 0;
+    };
+    if c == 0 {
+        return s.wrapping_add(bytes.len() as u64);
+    }
+    match bytes.iter().rposition(|&b| b == c) {
+        Some(off) => s.wrapping_add(off as u64),
+        None => 0,
+    }
+}
+
+/// Real `strcat(dst, src)`: appends the `src` string to `dst` (writing a new
+/// NUL), returning `dst`. Reads `dst`'s current length, then writes
+/// `src + NUL` at `dst + len`.
+fn hle_strcat(ctx: &HleContext, args: &[u64]) -> u64 {
+    let dst = args.first().copied().unwrap_or(0);
+    let src = args.get(1).copied().unwrap_or(0);
+    debug!("strcat(dst={dst:#x}, src={src:#x})");
+
+    let (Some(dst_bytes), Some(mut src_bytes)) = (
+        crate::fmt::read_cstr(ctx.mem, dst),
+        crate::fmt::read_cstr(ctx.mem, src),
+    ) else {
+        warn!("strcat: unreadable string (dst={dst:#x}, src={src:#x})");
+        return dst;
+    };
+    let append_at = dst.wrapping_add(dst_bytes.len() as u64);
+    src_bytes.push(0);
+    if !ctx.mem.write(append_at, &src_bytes) {
+        warn!(
+            "strcat: failed to append {} bytes at {append_at:#x}",
+            src_bytes.len()
+        );
+    }
+    dst
+}
+
+/// Real `strncat(dst, src, n)`: appends at most `n` bytes of `src` to `dst`,
+/// always writing a terminating NUL after them.
+fn hle_strncat(ctx: &HleContext, args: &[u64]) -> u64 {
+    let dst = args.first().copied().unwrap_or(0);
+    let src = args.get(1).copied().unwrap_or(0);
+    let n = args.get(2).copied().unwrap_or(0);
+    debug!("strncat(dst={dst:#x}, src={src:#x}, n={n:#x})");
+
+    let (Some(dst_bytes), Some(src_bytes)) = (
+        crate::fmt::read_cstr(ctx.mem, dst),
+        crate::fmt::read_cstr(ctx.mem, src),
+    ) else {
+        warn!("strncat: unreadable string (dst={dst:#x}, src={src:#x})");
+        return dst;
+    };
+    let take = usize::try_from(n)
+        .unwrap_or(usize::MAX)
+        .min(src_bytes.len());
+    let mut out = src_bytes[..take].to_vec();
+    out.push(0);
+    let append_at = dst.wrapping_add(dst_bytes.len() as u64);
+    if !ctx.mem.write(append_at, &out) {
+        warn!(
+            "strncat: failed to append {} bytes at {append_at:#x}",
+            out.len()
+        );
+    }
+    dst
+}
+
+/// Real `strstr(haystack, needle)`: guest address of the first occurrence of
+/// `needle` in `haystack`, or `0`. An empty needle returns `haystack` (the C
+/// contract).
+fn hle_strstr(ctx: &HleContext, args: &[u64]) -> u64 {
+    let haystack = args.first().copied().unwrap_or(0);
+    let needle = args.get(1).copied().unwrap_or(0);
+    debug!("strstr(haystack={haystack:#x}, needle={needle:#x})");
+
+    let (Some(hay), Some(ndl)) = (
+        crate::fmt::read_cstr(ctx.mem, haystack),
+        crate::fmt::read_cstr(ctx.mem, needle),
+    ) else {
+        warn!("strstr: unreadable string (haystack={haystack:#x}, needle={needle:#x})");
+        return 0;
+    };
+    if ndl.is_empty() {
+        return haystack;
+    }
+    match hay.windows(ndl.len()).position(|w| w == ndl.as_slice()) {
+        Some(off) => haystack.wrapping_add(off as u64),
+        None => 0,
+    }
+}
+
+/// `atexit(fn)`: record-and-succeed. A real libc runs registered callbacks at
+/// `exit`; XPS5X's `exit` HLE ends the process without running them (honest —
+/// no atexit dispatch yet), but the registration itself must *succeed* (`0`)
+/// or crt0/C++ static init aborts before `main`.
+fn hle_atexit(_ctx: &HleContext, args: &[u64]) -> u64 {
+    debug!(
+        "atexit(fn={:#x}) [registered; not dispatched at exit yet]",
+        args.first().copied().unwrap_or(0)
+    );
+    0
+}
+
+/// `__cxa_atexit(fn, arg, dso)`: the C++ ABI variant of `atexit` for global/
+/// static destructors. Same record-and-succeed contract (`0`).
+fn hle_cxa_atexit(_ctx: &HleContext, args: &[u64]) -> u64 {
+    debug!(
+        "__cxa_atexit(fn={:#x}, arg={:#x}, dso={:#x}) [registered; not dispatched at exit yet]",
+        args.first().copied().unwrap_or(0),
+        args.get(1).copied().unwrap_or(0),
+        args.get(2).copied().unwrap_or(0)
+    );
+    0
+}
+
 /// Placeholder: real `snprintf` returns the number of characters that
 /// would've been written; this stub reports `0` since it does no formatting.
 /// Real `snprintf` (M1-C): reads the guest format string, formats it against
@@ -477,7 +741,7 @@ fn hle_posix_memalign(ctx: &HleContext, args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GuestMemory, test_ctx};
+    use crate::{test_ctx, GuestMemory};
 
     /// M1-C: `printf` reads the guest format string and `%s` pointee, formats
     /// against the captured registers, and lands the output in the kernel
@@ -575,6 +839,87 @@ mod tests {
         assert_eq!(&buf2, b"ab");
     }
 
+    /// M1 hardening batch: the string/buffer functions do real guest-memory
+    /// work — compare, scan, concatenate — not lie.
+    #[test]
+    fn string_and_buffer_batch_do_real_work() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // memcmp / memchr
+        assert!(mem.write(0x100, b"abcd"));
+        assert!(mem.write(0x110, b"abce"));
+        assert_eq!(hle_memcmp(&ctx, &[0x100, 0x110, 4]) as u32 as i32, -1);
+        assert_eq!(
+            hle_memcmp(&ctx, &[0x100, 0x110, 3]),
+            0,
+            "first 3 bytes equal"
+        );
+        assert_eq!(hle_memchr(&ctx, &[0x100, b'c' as u64, 4]), 0x102);
+        assert_eq!(
+            hle_memchr(&ctx, &[0x100, b'z' as u64, 4]),
+            0,
+            "not found → NULL"
+        );
+
+        // strncmp / strnlen
+        assert!(mem.write(0x200, b"hello\0"));
+        assert!(mem.write(0x210, b"help\0"));
+        assert_eq!(hle_strncmp(&ctx, &[0x200, 0x210, 3]), 0, "first 3 equal");
+        assert_eq!(
+            hle_strncmp(&ctx, &[0x200, 0x210, 4]) as u32 as i32,
+            -1,
+            "'l' < 'p'"
+        );
+        assert_eq!(hle_strnlen(&ctx, &[0x200, 100]), 5);
+        assert_eq!(hle_strnlen(&ctx, &[0x200, 3]), 3, "capped at maxlen");
+
+        // strchr / strrchr
+        assert!(mem.write(0x300, b"a/b/c\0"));
+        assert_eq!(hle_strchr(&ctx, &[0x300, b'/' as u64]), 0x301);
+        assert_eq!(hle_strrchr(&ctx, &[0x300, b'/' as u64]), 0x303);
+        assert_eq!(hle_strchr(&ctx, &[0x300, 0]), 0x305, "c==0 matches the NUL");
+        assert_eq!(hle_strchr(&ctx, &[0x300, b'z' as u64]), 0);
+
+        // strstr
+        assert!(mem.write(0x400, b"foobarbaz\0"));
+        assert!(mem.write(0x420, b"bar\0"));
+        assert_eq!(hle_strstr(&ctx, &[0x400, 0x420]), 0x403);
+        assert!(mem.write(0x430, b"\0"));
+        assert_eq!(
+            hle_strstr(&ctx, &[0x400, 0x430]),
+            0x400,
+            "empty needle → haystack"
+        );
+
+        // strcat / strncat
+        assert!(mem.write(0x500, b"foo\0"));
+        assert!(mem.write(0x520, b"bar\0"));
+        assert_eq!(hle_strcat(&ctx, &[0x500, 0x520]), 0x500);
+        let mut buf = [0u8; 7];
+        assert!(mem.read(0x500, &mut buf));
+        assert_eq!(&buf, b"foobar\0");
+
+        assert!(mem.write(0x600, b"x\0"));
+        assert!(mem.write(0x620, b"yzABC\0"));
+        assert_eq!(hle_strncat(&ctx, &[0x600, 0x620, 2]), 0x600);
+        let mut buf2 = [0u8; 4];
+        assert!(mem.read(0x600, &mut buf2));
+        assert_eq!(&buf2, b"xyz\0", "only 2 src bytes appended + NUL");
+    }
+
+    #[test]
+    fn atexit_family_registers_and_succeeds() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_atexit(&ctx, &[0x1234]), 0);
+        assert_eq!(hle_cxa_atexit(&ctx, &[0x1234, 0, 0]), 0);
+    }
+
     #[test]
     fn register_adds_expected_functions() {
         let registry = HleRegistry::new();
@@ -594,6 +939,17 @@ mod tests {
             "strcmp",
             "strcpy",
             "strncpy",
+            "memcmp",
+            "memchr",
+            "strncmp",
+            "strnlen",
+            "strchr",
+            "strrchr",
+            "strcat",
+            "strncat",
+            "strstr",
+            "atexit",
+            "__cxa_atexit",
             "snprintf",
             "printf",
             "puts",
