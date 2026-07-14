@@ -56,6 +56,15 @@ const SCE_ERROR_INVALID_ARGUMENT: u64 = 0x8002_0016;
 /// Generic SCE "memory fault" error (`0x8002_0000 | EFAULT`).
 const SCE_ERROR_MEMORY_FAULT: u64 = 0x8002_000E;
 
+// Shader-header layout + magic (byte offsets/values, from SharpEmu).
+const SHADER_FILE_HEADER: u32 = 0x3433_3231;
+const SHADER_VERSION: u32 = 0x18;
+const SHADER_USER_DATA_OFFSET: u64 = 0x08;
+const SHADER_CODE_OFFSET: u64 = 0x10;
+const SHADER_CX_REGISTERS_OFFSET: u64 = 0x18;
+const SHADER_SH_REGISTERS_OFFSET: u64 = 0x20;
+const SHADER_INPUT_SEMANTICS_OFFSET: u64 = 0x30;
+const SHADER_OUTPUT_SEMANTICS_OFFSET: u64 = 0x38;
 // PrimState shader-register layout (byte offsets, from SharpEmu).
 const SHADER_SPECIALS_OFFSET: u64 = 0x28;
 const SPECIAL_GE_CNTL_OFFSET: u64 = 0x00;
@@ -121,6 +130,73 @@ pub fn register(registry: &HleRegistry) {
         hle_dcb_set_uc_regs_indirect,
     );
     registry.register("libSceAgc", "sceAgcCreatePrimState", hle_create_prim_state);
+    registry.register("libSceAgc", "sceAgcCreateShader", hle_create_shader);
+}
+
+/// Relocate a self-relative pointer field: read the relative offset at
+/// `field`, and (if non-zero) rewrite it as the absolute `field + rel`.
+fn relocate_pointer_field(ctx: &HleContext, field: u64) -> bool {
+    let mut buf = [0u8; 8];
+    if !ctx.mem.read(field, &mut buf) {
+        return false;
+    }
+    let rel = u64::from_le_bytes(buf);
+    if rel == 0 {
+        return true;
+    }
+    ctx.mem.write(field, &field.wrapping_add(rel).to_le_bytes())
+}
+
+/// `sceAgcCreateShader(destination, header, code)`: validate the shader header
+/// (magic + version), relocate its self-relative pointer fields to absolute,
+/// bind the code address, relocate the user-data table, and publish the shader
+/// object pointer to `*destination`. Faithful to SharpEmu's layout.
+fn hle_create_shader(ctx: &HleContext, args: &[u64]) -> u64 {
+    let destination = args.first().copied().unwrap_or(0);
+    let header = args.get(1).copied().unwrap_or(0);
+    let code = args.get(2).copied().unwrap_or(0);
+    if header == 0 || code == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    // Validate the file header + version.
+    let (mut fh, mut ver) = ([0u8; 4], [0u8; 4]);
+    if !ctx.mem.read(header, &mut fh) || !ctx.mem.read(header + 4, &mut ver) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    if u32::from_le_bytes(fh) != SHADER_FILE_HEADER || u32::from_le_bytes(ver) != SHADER_VERSION {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    // Relocate the header's pointer fields, then bind the code address.
+    let ok = relocate_pointer_field(ctx, header + SHADER_CX_REGISTERS_OFFSET)
+        && relocate_pointer_field(ctx, header + SHADER_SH_REGISTERS_OFFSET)
+        && relocate_pointer_field(ctx, header + SHADER_USER_DATA_OFFSET)
+        && relocate_pointer_field(ctx, header + SHADER_SPECIALS_OFFSET)
+        && relocate_pointer_field(ctx, header + SHADER_INPUT_SEMANTICS_OFFSET)
+        && relocate_pointer_field(ctx, header + SHADER_OUTPUT_SEMANTICS_OFFSET)
+        && ctx
+            .mem
+            .write(header + SHADER_CODE_OFFSET, &code.to_le_bytes());
+    if !ok {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    // Relocate the user-data table's own pointer fields, if present.
+    let mut ud = [0u8; 8];
+    if !ctx.mem.read(header + SHADER_USER_DATA_OFFSET, &mut ud) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    let user_data = u64::from_le_bytes(ud);
+    if user_data != 0 {
+        for off in [0x08u64, 0x10, 0x18, 0x20] {
+            if !relocate_pointer_field(ctx, user_data + off) {
+                return SCE_ERROR_MEMORY_FAULT;
+            }
+        }
+    }
+    // Publish the shader object pointer.
+    if !ctx.mem.write(destination, &header.to_le_bytes()) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
 }
 
 /// Copy an 8-byte shader register (offset:u32, value:u32) from `src` to `dst`.
@@ -943,6 +1019,43 @@ mod tests {
         assert_eq!(read_u32(&ctx, cx), pm4(4, IT_NOP, R_CX_REGS_INDIRECT));
         let uc = hle_dcb_set_uc_regs_indirect(&ctx, &[cb, regs, 1]);
         assert_eq!(read_u32(&ctx, uc), pm4(4, IT_NOP, R_UC_REGS_INDIRECT));
+    }
+
+    #[test]
+    fn create_shader_relocates_fields_and_binds_code() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let header: u64 = 0x200;
+        // Valid magic + version.
+        assert!(ctx.mem.write(header, &SHADER_FILE_HEADER.to_le_bytes()));
+        assert!(ctx.mem.write(header + 4, &SHADER_VERSION.to_le_bytes()));
+        // A self-relative Cx-registers pointer of +0x40 (→ absolute header+0x18+0x40).
+        assert!(
+            ctx.mem
+                .write(header + SHADER_CX_REGISTERS_OFFSET, &0x40u64.to_le_bytes())
+        );
+        // User-data field left 0 (skips user-data relocation).
+        let dest: u64 = 0x100;
+        let code: u64 = 0xC0DE_0000;
+        assert_eq!(hle_create_shader(&ctx, &[dest, header, code]), 0);
+        // Cx field relocated to absolute.
+        let mut b = [0u8; 8];
+        assert!(ctx.mem.read(header + SHADER_CX_REGISTERS_OFFSET, &mut b));
+        assert_eq!(
+            u64::from_le_bytes(b),
+            header + SHADER_CX_REGISTERS_OFFSET + 0x40
+        );
+        // Code bound + shader object published to *dest.
+        assert!(ctx.mem.read(header + SHADER_CODE_OFFSET, &mut b));
+        assert_eq!(u64::from_le_bytes(b), code);
+        assert!(ctx.mem.read(dest, &mut b));
+        assert_eq!(u64::from_le_bytes(b), header);
+        // A bad magic is rejected.
+        assert!(ctx.mem.write(header, &0xDEADu32.to_le_bytes()));
+        assert_eq!(
+            hle_create_shader(&ctx, &[dest, header, code]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
     }
 
     #[test]
