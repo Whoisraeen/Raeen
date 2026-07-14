@@ -56,8 +56,8 @@ Primary full port. Plan: `docs/superpowers/plans/2026-07-13-kyty-full-port.md`.
 
 | Module | Target | Status | Commit | Notes |
 |--------|--------|--------|--------|-------|
-| lib/Math: VectorAndMatrix (Vec2/3/4, Mat2/3/4) | `kyty-math` | `done` | (kyty-math batch) | `vector_and_matrix.rs` aliases Kyty vec/mat to `glam` (column-major, GNM/GLSL-order) + Kyty-named ctor helpers (splat/vec3_w/identity); 4 tests |
-| lib/Math: Rand (mt19937) | `kyty-math` | `done` | (kyty-math batch) | `rand.rs` — Kyty `Rand::*` API (uint/int/double/float + inclusive/exclusive ranges + seed) over the `rand` crate (StdRng, thread-local; not bit-identical to mt19937 — clean-room, sequence not load-bearing); 4 tests |
+| lib/Math: VectorAndMatrix (Vec2/3/4, Mat2/3/4) | `kyty-math` | `done` | `f9ecddf` | `vector_and_matrix.rs` aliases Kyty vec/mat to `glam` (column-major, GNM/GLSL-order) + Kyty-named ctor helpers (splat/vec3_w/identity); 4 tests |
+| lib/Math: Rand (mt19937) | `kyty-math` | `done` | `f9ecddf` | `rand.rs` — Kyty `Rand::*` API (uint/int/double/float + inclusive/exclusive ranges + seed) over the `rand` crate (StdRng, thread-local; not bit-identical to mt19937 — clean-room, sequence not load-bearing); 4 tests |
 | lib/Math: Crypto (AES + Hash) | `kyty-math` | `skip` | | AES/SHA → RustCrypto (`aes`/`cbc`/`sha1` already workspace deps used by xps5x-firmware SELF decrypt); 3rdparty→workspace-crate convention, do not transliterate |
 | lib/Scripts | `kyty-scripts` | `skip` | | Lua scripting — unused by XPS5X's execution path (guest games are native binaries, not Kyty Lua demos); per goal "skip unused Scripts/lua unless config needs it" |
 | emulator/Loader | `kyty-loader` → `xps5x-firmware`/`loader` | `todo` | | |
