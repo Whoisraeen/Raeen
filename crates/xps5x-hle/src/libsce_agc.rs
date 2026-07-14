@@ -44,6 +44,7 @@ const R_DRAW_INDEX_AUTO: u32 = 0x04;
 const R_DRAW_RESET: u32 = 0x05;
 const R_WAIT_FLIP_DONE: u32 = 0x06;
 const R_ACB_RESET: u32 = 0x09;
+const R_PUSH_MARKER: u32 = 0x0B;
 const R_SH_REGS_INDIRECT: u32 = 0x11;
 const R_CX_REGS_INDIRECT: u32 = 0x12;
 const R_UC_REGS_INDIRECT: u32 = 0x13;
@@ -163,6 +164,12 @@ pub fn register(registry: &HleRegistry) {
         hle_dcb_draw_index_offset,
     );
     registry.register("libSceAgc", "sceAgcUnknownQj7QZpgr9Uw", hle_unknown_filler);
+    registry.register("libSceAgc", "sceAgcDcbPushMarker", hle_dcb_push_marker);
+    registry.register(
+        "libSceAgc",
+        "sceAgcDriverInitResourceRegistration",
+        hle_driver_init_resource_registration,
+    );
     // The Cx/Sh/Uc patch-set NIDs are behaviorally identical (the register
     // space only affects tracing), so each family shares one handler.
     for space in ["Cx", "Sh", "Uc"] {
@@ -224,6 +231,76 @@ fn hle_get_resource_max_name_length(ctx: &HleContext, args: &[u64]) -> u64 {
 
 /// `sceAgcSuspendPoint()`: a no-op suspension marker; succeeds.
 fn hle_suspend_point(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    0
+}
+
+/// Read a NUL-terminated guest C-string (up to `max` bytes, excluding the NUL).
+fn read_guest_cstring(ctx: &HleContext, addr: u64, max: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for i in 0..max {
+        let mut b = [0u8; 1];
+        if !ctx.mem.read(addr + i as u64, &mut b) {
+            return None;
+        }
+        if b[0] == 0 {
+            return Some(out);
+        }
+        out.push(b[0]);
+    }
+    Some(out)
+}
+
+/// `sceAgcDcbPushMarker(dcb, markerString)`: emit a debug-marker packet whose
+/// payload is the NUL-terminated marker string packed into DWORDs.
+fn hle_dcb_push_marker(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let marker_addr = args.get(1).copied().unwrap_or(0);
+    if cb == 0 {
+        return 0;
+    }
+    let Some(marker) = read_guest_cstring(ctx, marker_addr, 4095) else {
+        return 0;
+    };
+    let payload_dwords = (((marker.len() as u32) + 4) / 4).max(1);
+    let packet_dwords = payload_dwords + 1;
+    let Some(addr) = alloc_command_dwords(ctx, cb, u64::from(packet_dwords)) else {
+        return 0;
+    };
+    if !ctx.mem.write(
+        addr,
+        &pm4(packet_dwords, IT_NOP, R_PUSH_MARKER).to_le_bytes(),
+    ) {
+        return 0;
+    }
+    for i in 0..payload_dwords {
+        // Pack up to four marker bytes little-endian into this DWORD.
+        let mut value = 0u32;
+        for byte in 0..4u32 {
+            let idx = (i * 4 + byte) as usize;
+            if idx < marker.len() {
+                value |= u32::from(marker[idx]) << (byte * 8);
+            }
+        }
+        if !ctx
+            .mem
+            .write(addr + 4 + u64::from(i) * 4, &value.to_le_bytes())
+        {
+            return 0;
+        }
+    }
+    addr
+}
+
+/// `sceAgcDriverInitResourceRegistration(memory, memorySize, ownerCount)`:
+/// validate the resource-registration setup. (The registration state machine
+/// itself is not modelled; the call succeeds so a title's init proceeds.)
+fn hle_driver_init_resource_registration(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let memory = args.first().copied().unwrap_or(0);
+    let memory_size = args.get(1).copied().unwrap_or(0);
+    let owner_count = args.get(2).copied().unwrap_or(0);
+    if memory == 0 || memory_size == 0 || owner_count == 0 || owner_count > u64::from(u32::MAX) {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
     0
 }
 
@@ -1321,6 +1398,32 @@ mod tests {
         // Unknown filler: a single 0x8000_0000 dword.
         let f = hle_unknown_filler(&ctx, &[cb]);
         assert_eq!(read_u32(&ctx, f), 0x8000_0000);
+    }
+
+    #[test]
+    fn push_marker_packs_the_string_and_init_validates() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        // Marker string "AB" at 0x100.
+        assert!(ctx.mem.write(0x100, b"AB\0"));
+        let ret = hle_dcb_push_marker(&ctx, &[cb, 0x100]);
+        assert_eq!(ret, 0x400);
+        // len 2 → payload = max((2+4)/4,1) = 1 dword; packet = 2 dwords.
+        assert_eq!(read_u32(&ctx, 0x400), pm4(2, IT_NOP, R_PUSH_MARKER));
+        // 'A'=0x41, 'B'=0x42 packed little-endian → 0x00004241.
+        assert_eq!(read_u32(&ctx, 0x404), 0x0000_4241);
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x408);
+        // InitResourceRegistration validates its args.
+        assert_eq!(
+            hle_driver_init_resource_registration(&ctx, &[0x1000, 0x100, 4]),
+            0
+        );
+        assert_eq!(
+            hle_driver_init_resource_registration(&ctx, &[0, 0x100, 4]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
     }
 
     #[test]
