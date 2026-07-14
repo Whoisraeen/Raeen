@@ -33,6 +33,7 @@ pub mod libsce_audio_out;
 pub mod libsce_common_dialog;
 pub mod libsce_disc_map;
 pub mod libsce_gnm_driver;
+pub mod libsce_json;
 pub mod libsce_net;
 pub mod libsce_np;
 pub mod libsce_pad;
@@ -173,6 +174,7 @@ impl HleRegistry {
         libsce_disc_map::register(&registry);
         libsce_rtc::register(&registry);
         libsce_peripheral::register(&registry);
+        libsce_json::register(&registry);
 
         info!(
             "HLE registry: {} functions registered",

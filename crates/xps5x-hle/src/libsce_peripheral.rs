@@ -79,6 +79,9 @@ pub fn register(registry: &HleRegistry) {
 
     // libSceNpGameIntent — no game-intent events offline.
     registry.register("libSceNpGameIntent", "sceNpGameIntentInitialize", hle_ok);
+
+    // libSceVoiceQoS — no voice-chat QoS backend; init succeeds.
+    registry.register("libSceVoiceQoS", "sceVoiceQoSInit", hle_ok);
 }
 
 /// Report benign success (`rax = 0`): no device, no session, no pending event.
