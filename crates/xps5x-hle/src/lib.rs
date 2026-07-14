@@ -31,6 +31,7 @@ pub mod libsce_pad;
 pub mod libsce_playgo;
 pub mod libsce_save_data;
 pub mod libsce_sysmodule;
+pub mod libsce_user_service;
 pub mod libsce_video_out;
 
 use dashmap::DashMap;
@@ -130,6 +131,7 @@ impl HleRegistry {
         libsce_video_out::register(&registry);
         libsce_pad::register(&registry);
         libsce_playgo::register(&registry);
+        libsce_user_service::register(&registry);
 
         info!(
             "HLE registry: {} functions registered",
