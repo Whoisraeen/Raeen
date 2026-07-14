@@ -54,8 +54,9 @@ Primary full port. Plan: `docs/superpowers/plans/2026-07-13-kyty-full-port.md`.
 | VirtualMemory (Core wrapper) | `kyty-core` | `done` | `e06b0d3` | `virtual_memory.rs` forwards 1:1 to sys_virtual (as Kyty's Core does on Windows); ExceptionHandler `skip` — xps5x-runtime VEH supersedes |
 | MemoryAlloc / MSpace | `kyty-core` | `skip` | | manual C++ heap (`mem_alloc`/`mem_free` + stats) — superseded by Rust's global allocator (host) + `xps5x-runtime` `GuestArena` (guest); same rationale as skipped `SafeDelete`. Convention: manual-memory scaffolding → safe Rust equivalent. |
 | Threads | `kyty-core`/`xps5x-runtime` | `todo` | | overlaps M1-E (real guest threads) — deferred, see SDD sketch |
-| File | `kyty-core` | `todo` | | 1311-line buffered File class over sys_file_io; port only if a ported Kyty subsystem needs it (else xps5x-kernel VFS supersedes on the hot path) |
-| Debug / Subsystems / SDL / Core.cpp | `kyty-core` | `todo` | | init glue, port last |
+| File | `kyty-core` | `skip` | | 1311-line buffered File class over sys_file_io — superseded by xps5x-kernel VFS on the hot path; verified the one ported consumer (json_reader) uses std, not Core::File, so nothing needs it. Port later only if a future Kyty subsystem does |
+| SDLSubsystem | `kyty-core` | `skip` | | SDL window/input/audio init — superseded by xps5x-gui's eframe/egui (verified main.rs uses eframe) + xps5x-input/audio crates |
+| Debug / Subsystems / Core.cpp | `kyty-core` | `todo` | | init glue over sys_dbg — port last (or skip: tracing + per-crate init supersede) |
 
 ### Later Kyty trees
 
@@ -103,6 +104,7 @@ Second-opinion PS5 emu (C#). Re-implement in Rust; do not vendor C#.
 | Filesystem: open/read/close/lseek | KernelExports/FS | `xps5x-kernel`/`hle` | `done` | `896495d` | VFS-backed, real host files under /app0; write persistence + fstat still todo |
 | Filesystem: write persistence (savedata) | FS | `xps5x-kernel`/`hle` | `done` | `5285857` | VFS honors O_WRONLY/RDWR/CREAT/TRUNC/APPEND; write buffers + flush-on-close to host file; ".." traversal refused on writable open; hle write() routes non-console fds to VFS; hle open() honors O_CREAT. E2E: guest open+write+close persists to host, read-back works |
 | Filesystem: fstat / directory ops | FS | `xps5x-kernel`/`hle` | `todo` | | needs SCE stat struct layout |
+| SaveData mount | SaveData | `xps5x-hle` | `done` | (savedata batch) | new libsce_save_data.rs (was empty stub): sceSaveDataMount{,2,3} writes the /savedata0 mount point into the 64-byte result; Umount/Initialize/Terminate OK. Completes the save path — mount → open/write under /savedata0 → VFS persists to host savedata dir (write-persistence 5285857). SharpEmu-cross-checked. 2 tests |
 | GUI patterns | app | `xps5x-gui` | `skip` | | optional UX only |
 
 **Delete SharpEmu when:** all non-`skip` rows `done`, and no open M# work still citing this tree.
