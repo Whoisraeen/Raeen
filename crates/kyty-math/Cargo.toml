@@ -1,0 +1,15 @@
+[package]
+name = "kyty-math"
+description = "Kyty lib/Math port: vector/matrix types (over glam) and Rand (over the rand crate)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Kyty's vec2/3/4 + mat2/3/4 map to glam's SIMD-accelerated types, per the
+# port convention (3rdparty/heavily-templated C++ -> a maintained workspace
+# crate, not a hand transliteration).
+glam = "0.29"
+# Kyty's Rand wraps std::mt19937 + uniform distributions; the rand crate is
+# the idiomatic Rust equivalent for the same API surface.
+rand = "0.8"
