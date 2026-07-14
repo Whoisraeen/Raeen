@@ -21,13 +21,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
-    VirtualFree,
+    VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+    PAGE_NOACCESS, PAGE_READWRITE,
 };
 
 use xps5x_hle::{GuestAllocator, GuestMemory};
 
-use crate::{GUEST_ARENA_BASE, RuntimeError};
+use crate::{RuntimeError, GUEST_ARENA_BASE};
 
 /// x86-64 Windows' page size (see `mem.rs`/`trampoline.rs`'s equivalent
 /// constants); also the default alignment `mmap` bumps to.
@@ -60,12 +60,40 @@ const MMAP_SIZE: u64 = 0x6000_0000; // 1.5 GiB
 /// no gaps (design doc §3's layout table).
 const ARENA_SPAN: u64 = 0x1_0000_0000; // 4 GiB
 
-/// Size of the minimal main-thread TCB [`GuestArena::setup_main_tcb`] carves
-/// from the heap region (design doc §3, RT2c-b). Large enough for the
-/// self-pointer at offset 0 plus headroom for small TLS-offset probes; a
-/// real per-module `PT_TLS` init-image copy (which would need a
-/// module-supplied `memsz`) is a follow-up, not implemented here.
+/// Size of the main-thread TCB [`GuestArena::setup_main_tcb`] carves from
+/// the heap region (design doc §3, RT2c-b/M1-B). Large enough for the
+/// self-pointer at offset 0, the `__stack_chk_guard` canary at the
+/// ABI-mandated `fs:0x28`, and headroom for small TLS-offset probes. The
+/// module's `PT_TLS` init image is laid out immediately *below* the TCB
+/// (variant-II x86-64 TLS), sized separately from its template.
 const TCB_SIZE: u64 = 0x800; // 2 KiB
+
+/// The `fs:`-relative offset of the stack-protector canary
+/// (`__stack_chk_guard`) in the x86-64 ABI as extended by glibc/Orbis libc:
+/// compiler-generated prologues/epilogues read `fs:0x28` unconditionally
+/// whenever stack-protector is enabled (M1-B, wall #2).
+const CANARY_TCB_OFFSET: usize = 0x28;
+
+/// A per-process stack-protector canary value: derived from
+/// [`std::collections::hash_map::RandomState`]'s per-process random keys
+/// (no new dependency), with the low byte forced to zero (glibc's
+/// "terminator canary" convention — a NUL so string functions can't leak
+/// it) and guaranteed nonzero (the m1-homebrew anti-pattern: a zero canary
+/// would let stack-protected code "work" by coincidence against a zeroed
+/// TCB rather than proving a real install).
+fn stack_canary() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(0x5A_FE_57_AC_C4_AA_2D_00);
+    let masked = hasher.finish() & !0xFF;
+    if masked == 0 {
+        0x100
+    } else {
+        masked
+    }
+}
 
 /// Round `align` up to a power of two no smaller than 16 (the minimum
 /// alignment `GuestAllocator` methods honor, design doc §5), returning
@@ -193,7 +221,14 @@ impl GuestArena {
         // `PAGE_NOACCESS` is a well-formed request; the reservation is
         // released exactly once, either by `commit_region`'s cleanup path
         // below or by `Drop`.
-        let raw = unsafe { VirtualAlloc(base as *const c_void, ARENA_SPAN as usize, MEM_RESERVE, PAGE_NOACCESS) };
+        let raw = unsafe {
+            VirtualAlloc(
+                base as *const c_void,
+                ARENA_SPAN as usize,
+                MEM_RESERVE,
+                PAGE_NOACCESS,
+            )
+        };
         if raw.is_null() {
             return Err(RuntimeError::MapFailed);
         }
@@ -215,7 +250,12 @@ impl GuestArena {
             return Err(RuntimeError::MapFailed);
         }
 
-        commit_region(base, base + IMAGE_OFFSET, IMAGE_SIZE, PAGE_EXECUTE_READWRITE)?;
+        commit_region(
+            base,
+            base + IMAGE_OFFSET,
+            IMAGE_SIZE,
+            PAGE_EXECUTE_READWRITE,
+        )?;
         commit_region(base, base + HEAP_OFFSET, HEAP_SIZE, PAGE_READWRITE)?;
         commit_region(base, base + STACK_OFFSET, STACK_SIZE, PAGE_READWRITE)?;
         commit_region(base, base + MMAP_OFFSET, MMAP_SIZE, PAGE_READWRITE)?;
@@ -251,7 +291,9 @@ impl GuestArena {
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, AllocState> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The host address of the top (highest address) of the guest stack
@@ -266,25 +308,43 @@ impl GuestArena {
         self.base + STACK_OFFSET + STACK_SIZE
     }
 
-    /// Set up a minimal main-thread TCB (design doc §3, RT2c-b): carves a
-    /// [`TCB_SIZE`]-byte block from the heap allocator, writes a
-    /// self-pointer at offset 0 (the FreeBSD/Orbis "variant II" TLS
-    /// convention: `fs:[0]` is the TCB's own address), and zeroes the rest.
-    /// Returns the TCB's guest address, or `None` if the heap allocation (or
-    /// the write-back through [`GuestMemory::write`]) fails.
+    /// Set up the main-thread TCB and, if the module has a `PT_TLS`
+    /// template, its static TLS block (design doc §3, RT2c-b/M1-B):
     ///
-    /// This is intentionally minimal: no per-module `PT_TLS` init-image copy
-    /// happens here — that is a follow-up (design doc §3's "bonus" note).
-    /// It provides just enough (the self-pointer, plus headroom zeroed to a
-    /// known state) for a small TLS-offset access to be valid, which is all
-    /// RT2c-b's acceptance criteria require.
-    pub(crate) fn setup_main_tcb(&self) -> Option<u64> {
-        let tcb = self.alloc(TCB_SIZE, 16)?;
+    /// - Carves `tls.block_size() + TCB_SIZE` bytes from the heap allocator
+    ///   (variant-II x86-64 layout: the TLS block sits immediately *below*
+    ///   the TCB, so a `TPOFF64`-relocated `fs:[-off]` access lands in it).
+    ///   `TlsTemplate::block_size` is the same size the LM1 linker computed
+    ///   `TPOFF64` offsets against — the two must agree exactly.
+    /// - Copies the `.tdata` init image into the block's start; `.tbss` and
+    ///   padding stay zero.
+    /// - Writes the TCB self-pointer at `fs:[0]` (the FreeBSD/Orbis
+    ///   "variant II" convention) and a real, nonzero `__stack_chk_guard`
+    ///   canary at the ABI-mandated `fs:0x28` ([`CANARY_TCB_OFFSET`]).
+    ///
+    /// Returns the TCB's guest address (the FS base to install), or `None`
+    /// if the heap allocation or the write-back fails.
+    pub(crate) fn setup_main_tcb(&self, tls: Option<&xps5x_firmware::TlsTemplate>) -> Option<u64> {
+        let tls_block = tls.map(|t| t.block_size()).unwrap_or(0);
+        let align = tls.map(|t| t.align.max(16)).unwrap_or(16);
+        let total = tls_block.checked_add(TCB_SIZE)?;
+        let base = self.alloc(total, align)?;
+        let tcb = base.checked_add(tls_block)?;
 
-        let mut block = vec![0u8; TCB_SIZE as usize];
-        block[0..8].copy_from_slice(&tcb.to_le_bytes());
+        let mut block = vec![0u8; total as usize];
+        if let Some(t) = tls {
+            // `.tdata` at the block's start; a template whose `data`
+            // somehow exceeds `block_size()` (malformed: filesz > memsz)
+            // is truncated rather than trusted.
+            let n = t.data.len().min(tls_block as usize);
+            block[..n].copy_from_slice(&t.data[..n]);
+        }
+        let tcb_off = tls_block as usize;
+        block[tcb_off..tcb_off + 8].copy_from_slice(&tcb.to_le_bytes());
+        block[tcb_off + CANARY_TCB_OFFSET..tcb_off + CANARY_TCB_OFFSET + 8]
+            .copy_from_slice(&stack_canary().to_le_bytes());
 
-        if !self.write(tcb, &block) {
+        if !self.write(base, &block) {
             return None;
         }
         Some(tcb)
@@ -426,7 +486,11 @@ impl GuestAllocator for GuestArena {
                 // `alloc` above never reuses a still-`heap_sizes`-tracked
                 // address).
                 unsafe {
-                    core::ptr::copy_nonoverlapping(addr as *const u8, new_addr as *mut u8, copy_len);
+                    core::ptr::copy_nonoverlapping(
+                        addr as *const u8,
+                        new_addr as *mut u8,
+                        copy_len,
+                    );
                 }
             }
         }
@@ -475,7 +539,10 @@ mod tests {
         let ptr0 = arena.entry_ptr(0).expect("offset 0 is within the image");
         assert_eq!(ptr0 as u64, GUEST_ARENA_BASE);
 
-        assert!(arena.entry_ptr(image.len() as u64).is_err(), "offset == image_len must be rejected");
+        assert!(
+            arena.entry_ptr(image.len() as u64).is_err(),
+            "offset == image_len must be rejected"
+        );
     }
 
     /// (b) `alloc` returns a 16-aligned address inside the heap region;
@@ -509,7 +576,10 @@ mod tests {
         arena.free(a);
         let b = arena.alloc(128, 16).expect("heap alloc should succeed");
 
-        assert_eq!(a, b, "freeing then re-allocating the same size should reuse the freed block");
+        assert_eq!(
+            a, b,
+            "freeing then re-allocating the same size should reuse the freed block"
+        );
     }
 
     /// (d) `mmap` returns a page-aligned address inside the mmap region.
@@ -586,6 +656,7 @@ mod tests {
         {
             let _arena = GuestArena::new(&[]).expect("first reservation should succeed");
         }
-        let _arena2 = GuestArena::new(&[]).expect("second reservation, after Drop, should also succeed");
+        let _arena2 =
+            GuestArena::new(&[]).expect("second reservation, after Drop, should also succeed");
     }
 }

@@ -15,12 +15,15 @@
 
 #![cfg(target_os = "windows")]
 
-use xps5x_firmware::dynlib::nid::{NidDatabase, nid_of};
+use xps5x_firmware::dynlib::nid::{nid_of, NidDatabase};
 use xps5x_firmware::dynlib::{DynSymbol, DynlibData, SceRela};
-use xps5x_firmware::{HLE_TRAMPOLINE_BASE, HleTrampoline, LinkedModule, ModuleRegistry, SprxModule, SprxSegment, link_module};
+use xps5x_firmware::{
+    link_module, HleTrampoline, LinkedModule, ModuleRegistry, SprxModule, SprxSegment, TlsTemplate,
+    HLE_TRAMPOLINE_BASE,
+};
 use xps5x_hle::{HleContext, HleRegistry};
 use xps5x_kernel::OrbisKernel;
-use xps5x_runtime::{GUEST_ARENA_BASE, RunOutcome, RuntimeError, execute_linked, execute_process};
+use xps5x_runtime::{execute_linked, execute_process, RunOutcome, RuntimeError, GUEST_ARENA_BASE};
 
 const R_X86_64_JUMP_SLOT: u64 = 7;
 
@@ -46,7 +49,11 @@ fn write_entry_stub(buf: &mut [u8], entry_off: usize, slot_off: usize) {
 /// import through `slot_off`) plus the [`DynlibData`] declaring that import
 /// (NID `import_nid`, symtab index 0, one `R_X86_64_JUMP_SLOT` relocation at
 /// `slot_off`) and the [`SprxModule`] wrapping it.
-fn build_synthetic_module(import_nid: u64, entry_off: usize, slot_off: usize) -> (SprxModule, DynlibData) {
+fn build_synthetic_module(
+    import_nid: u64,
+    entry_off: usize,
+    slot_off: usize,
+) -> (SprxModule, DynlibData) {
     let mut image = vec![0u8; 0x100];
     write_entry_stub(&mut image, entry_off, slot_off);
 
@@ -63,6 +70,7 @@ fn build_synthetic_module(import_nid: u64, entry_off: usize, slot_off: usize) ->
         relro: None,
         dynamic: None,
         entry: entry_off as u64,
+        tls: None,
     };
 
     let dynlib = DynlibData {
@@ -98,14 +106,22 @@ fn sentinel_call_through_real_lm1_linker_dispatches_to_hle() {
 
     let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE)
         .expect("synthetic module links against the HLE-registered sentinel");
-    assert_eq!(linked.hle_trampolines.len(), 1, "exactly one HLE import resolved");
+    assert_eq!(
+        linked.hle_trampolines.len(),
+        1,
+        "exactly one HLE import resolved"
+    );
     assert_eq!(linked.hle_trampolines[0].library, "libtest");
     assert_eq!(linked.hle_trampolines[0].function, "sceTestSentinel");
     assert!(linked.unresolved.is_empty());
 
     let kernel = OrbisKernel::new();
-    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
-    assert_eq!(result, 0xC0DE, "guest RAX after the trapped HLE call is the sentinel's return value");
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[])
+        .expect("native execution succeeds");
+    assert_eq!(
+        result, 0xC0DE,
+        "guest RAX after the trapped HLE call is the sentinel's return value"
+    );
 }
 
 /// A guest `call` through a trampoline slot whose index has no
@@ -134,6 +150,7 @@ fn call_to_unmapped_trampoline_index_returns_unresolved() {
         unresolved: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
+        tls: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -153,6 +170,7 @@ fn more_than_six_args_is_rejected() {
         unresolved: Vec::new(),
         hle_trampolines: Vec::new(),
         entry: 0,
+        tls: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -180,7 +198,8 @@ fn genuine_wild_fault_recovers_as_faulted_then_process_keeps_running() {
     let hle = HleRegistry::new();
 
     let mut image = vec![0u8; 0x100];
-    image[ENTRY_OFF..ENTRY_OFF + 9].copy_from_slice(&[0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xC3]);
+    image[ENTRY_OFF..ENTRY_OFF + 9]
+        .copy_from_slice(&[0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xC3]);
 
     let linked = LinkedModule {
         image,
@@ -188,6 +207,7 @@ fn genuine_wild_fault_recovers_as_faulted_then_process_keeps_running() {
         unresolved: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
+        tls: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -197,7 +217,10 @@ fn genuine_wild_fault_recovers_as_faulted_then_process_keeps_running() {
             // `addr` is the *faulting instruction's* Rip (the mapped
             // entry's host address), not the wild pointer (`0`) it
             // dereferenced.
-            assert_ne!(addr, 0, "Faulted::addr is the faulting Rip, which is a real mapped-image address");
+            assert_ne!(
+                addr, 0,
+                "Faulted::addr is the faulting Rip, which is a real mapped-image address"
+            );
         }
         other => panic!("expected Err(Faulted {{ .. }}), got {other:?}"),
     }
@@ -219,7 +242,10 @@ fn genuine_wild_fault_recovers_as_faulted_then_process_keeps_running() {
     let sentinel_kernel = OrbisKernel::new();
     let result = execute_linked(&linked, &sentinel_hle, &sentinel_kernel, 0x0, &[])
         .expect("native execution succeeds after a recovered fault");
-    assert_eq!(result, 0xC0DE, "trampoline dispatch still works normally after a recovered fault");
+    assert_eq!(
+        result, 0xC0DE,
+        "trampoline dispatch still works normally after a recovered fault"
+    );
 }
 
 /// Writes `mov rdi, dst_addr; mov rsi, src_addr; mov edx, n; call qword ptr
@@ -330,6 +356,7 @@ fn memcpy_hle_call_moves_real_bytes_through_the_runtime() {
         relro: None,
         dynamic: None,
         entry: ENTRY_OFF as u64,
+        tls: None,
     };
 
     let dynlib = DynlibData {
@@ -350,13 +377,18 @@ fn memcpy_hle_call_moves_real_bytes_through_the_runtime() {
     let registry = ModuleRegistry::new(db);
     let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE)
         .expect("memcpy import resolves against the built-in libc HLE registration");
-    assert_eq!(linked.hle_trampolines.len(), 1, "exactly one HLE import resolved");
+    assert_eq!(
+        linked.hle_trampolines.len(),
+        1,
+        "exactly one HLE import resolved"
+    );
     assert_eq!(linked.hle_trampolines[0].library, "libc");
     assert_eq!(linked.hle_trampolines[0].function, "memcpy");
     assert!(linked.unresolved.is_empty());
 
     let kernel = OrbisKernel::new();
-    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[])
+        .expect("native execution succeeds");
 
     let expected = u32::from_le_bytes(PAYLOAD) as u64;
     assert_eq!(
@@ -431,6 +463,7 @@ fn malloc_hle_call_returns_a_pointer_inside_the_heap_region() {
         relro: None,
         dynamic: None,
         entry: ENTRY_OFF as u64,
+        tls: None,
     };
 
     let dynlib = DynlibData {
@@ -451,15 +484,23 @@ fn malloc_hle_call_returns_a_pointer_inside_the_heap_region() {
     let registry = ModuleRegistry::new(db);
     let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE)
         .expect("malloc import resolves against the built-in libc HLE registration");
-    assert_eq!(linked.hle_trampolines.len(), 1, "exactly one HLE import resolved");
+    assert_eq!(
+        linked.hle_trampolines.len(),
+        1,
+        "exactly one HLE import resolved"
+    );
     assert_eq!(linked.hle_trampolines[0].library, "libc");
     assert_eq!(linked.hle_trampolines[0].function, "malloc");
     assert!(linked.unresolved.is_empty());
 
     let kernel = OrbisKernel::new();
-    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[])
+        .expect("native execution succeeds");
 
-    assert_ne!(result, 0, "malloc must not return NULL for a small, easily satisfiable request");
+    assert_ne!(
+        result, 0,
+        "malloc must not return NULL for a small, easily satisfiable request"
+    );
     let heap_start = GUEST_ARENA_BASE + HEAP_OFFSET;
     let heap_end = GUEST_ARENA_BASE + STACK_OFFSET;
     assert!(
@@ -602,6 +643,7 @@ fn malloc_then_memset_then_readback_proves_real_guest_heap_memory() {
         relro: None,
         dynamic: None,
         entry: ENTRY_OFF as u64,
+        tls: None,
     };
 
     let dynlib = DynlibData {
@@ -636,11 +678,16 @@ fn malloc_then_memset_then_readback_proves_real_guest_heap_memory() {
     let registry = ModuleRegistry::new(db);
     let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE)
         .expect("malloc/memset imports resolve against the built-in libc HLE registration");
-    assert_eq!(linked.hle_trampolines.len(), 2, "exactly two HLE imports resolved");
+    assert_eq!(
+        linked.hle_trampolines.len(),
+        2,
+        "exactly two HLE imports resolved"
+    );
     assert!(linked.unresolved.is_empty());
 
     let kernel = OrbisKernel::new();
-    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[])
+        .expect("native execution succeeds");
 
     assert_eq!(
         result, MEMSET_VALUE as u64,
@@ -813,6 +860,7 @@ fn mmap_then_memset_then_readback_proves_real_arena_memory_and_records_vmm_metad
         relro: None,
         dynamic: None,
         entry: ENTRY_OFF as u64,
+        tls: None,
     };
 
     let dynlib = DynlibData {
@@ -845,13 +893,19 @@ fn mmap_then_memset_then_readback_proves_real_arena_memory_and_records_vmm_metad
 
     let db = NidDatabase::from_hle_names(hle.registered_names());
     let registry = ModuleRegistry::new(db);
-    let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE)
-        .expect("sceKernelMapFlexibleMemory/memset imports resolve against the built-in HLE registration");
-    assert_eq!(linked.hle_trampolines.len(), 2, "exactly two HLE imports resolved");
+    let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE).expect(
+        "sceKernelMapFlexibleMemory/memset imports resolve against the built-in HLE registration",
+    );
+    assert_eq!(
+        linked.hle_trampolines.len(),
+        2,
+        "exactly two HLE imports resolved"
+    );
     assert!(linked.unresolved.is_empty());
 
     let kernel = OrbisKernel::new();
-    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[])
+        .expect("native execution succeeds");
 
     assert_eq!(
         result, MEMSET_VALUE as u64,
@@ -964,6 +1018,7 @@ fn guest_call_runs_on_dedicated_guest_stack_region() {
         relro: None,
         dynamic: None,
         entry: ENTRY_OFF as u64,
+        tls: None,
     };
 
     let dynlib = DynlibData {
@@ -984,10 +1039,15 @@ fn guest_call_runs_on_dedicated_guest_stack_region() {
     let registry = ModuleRegistry::new(db);
     let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE)
         .expect("synthetic module links against the HLE-registered sceCaptureRsp");
-    assert_eq!(linked.hle_trampolines.len(), 1, "exactly one HLE import resolved");
+    assert_eq!(
+        linked.hle_trampolines.len(),
+        1,
+        "exactly one HLE import resolved"
+    );
 
     let kernel = OrbisKernel::new();
-    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[])
+        .expect("native execution succeeds");
 
     let stack_start = GUEST_ARENA_BASE + STACK_OFFSET;
     let stack_end = GUEST_ARENA_BASE + STACK_OFFSET + STACK_SIZE;
@@ -1039,10 +1099,12 @@ fn guest_stub_uses_real_guest_stack_memory_and_returns_correct_value() {
         unresolved: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
+        tls: None,
     };
 
     let kernel = OrbisKernel::new();
-    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[])
+        .expect("native execution succeeds");
     assert_eq!(
         result, 0x1234,
         "a value written below RSP on the guest stack must read back correctly, proving the guest stack region \
@@ -1091,10 +1153,12 @@ fn guest_clobbering_r15_does_not_corrupt_host_rsp() {
         unresolved: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
+        tls: None,
     };
 
     let kernel = OrbisKernel::new();
-    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[])
+        .expect("native execution succeeds");
     assert_eq!(
         result, 0x1234,
         "a guest that clobbers r15 and returns normally must not corrupt the host RSP — the RIP-relative \
@@ -1153,6 +1217,7 @@ fn trivial_ret_module() -> LinkedModule {
         unresolved: Vec::new(),
         hle_trampolines: Vec::new(),
         entry: 0,
+        tls: None,
     }
 }
 
@@ -1181,7 +1246,8 @@ fn guest_fs_zero_load_reads_the_installed_tcb() {
 
     let hle = HleRegistry::new();
     let mut image = vec![0u8; 0x100];
-    image[ENTRY_OFF..ENTRY_OFF + 9].copy_from_slice(&[0x64, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00]);
+    image[ENTRY_OFF..ENTRY_OFF + 9]
+        .copy_from_slice(&[0x64, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00]);
     image[ENTRY_OFF + 9] = 0xC3;
 
     let linked = LinkedModule {
@@ -1190,10 +1256,12 @@ fn guest_fs_zero_load_reads_the_installed_tcb() {
         unresolved: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
+        tls: None,
     };
 
     let kernel = OrbisKernel::new();
-    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[])
+        .expect("native execution succeeds");
 
     let expected_tcb = GUEST_ARENA_BASE + HEAP_OFFSET;
     println!("guest_fs_zero_load_reads_the_installed_tcb: RAX = {result:#x}, expected TCB = {expected_tcb:#x}");
@@ -1252,10 +1320,12 @@ fn guest_fs_offset_round_trip_writes_and_reads_back() {
         unresolved: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
+        tls: None,
     };
 
     let kernel = OrbisKernel::new();
-    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).expect("native execution succeeds");
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[])
+        .expect("native execution succeeds");
 
     println!("guest_fs_offset_round_trip_writes_and_reads_back: RAX = {result:#x}, expected = {TLS_VALUE:#x}");
     assert_eq!(
@@ -1285,7 +1355,8 @@ fn host_fsbase_is_restored_after_execute_linked_returns() {
 
     let hle = HleRegistry::new();
     let kernel = OrbisKernel::new();
-    let _ = execute_linked(&trivial_ret_module(), &hle, &kernel, 0, &[]).expect("native execution succeeds");
+    let _ = execute_linked(&trivial_ret_module(), &hle, &kernel, 0, &[])
+        .expect("native execution succeeds");
 
     // SAFETY: same as above.
     let after_first = unsafe { read_host_fsbase() };
@@ -1297,11 +1368,14 @@ fn host_fsbase_is_restored_after_execute_linked_returns() {
 
     let hle2 = HleRegistry::new();
     let kernel2 = OrbisKernel::new();
-    let _ = execute_linked(&trivial_ret_module(), &hle2, &kernel2, 0, &[]).expect("native execution succeeds");
+    let _ = execute_linked(&trivial_ret_module(), &hle2, &kernel2, 0, &[])
+        .expect("native execution succeeds");
 
     // SAFETY: same as above.
     let after_second = unsafe { read_host_fsbase() };
-    println!("host_fsbase_is_restored_after_execute_linked_returns: after_second={after_second:#x}");
+    println!(
+        "host_fsbase_is_restored_after_execute_linked_returns: after_second={after_second:#x}"
+    );
     assert_eq!(
         after_second, before,
         "host FS base must still equal the pre-call value after a second, independent execute_linked call"
@@ -1330,7 +1404,8 @@ fn host_fsbase_is_restored_after_a_recovered_genuine_fault() {
 
     let hle = HleRegistry::new();
     let mut image = vec![0u8; 0x100];
-    image[ENTRY_OFF..ENTRY_OFF + 9].copy_from_slice(&[0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xC3]);
+    image[ENTRY_OFF..ENTRY_OFF + 9]
+        .copy_from_slice(&[0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xC3]);
 
     let linked = LinkedModule {
         image,
@@ -1338,6 +1413,7 @@ fn host_fsbase_is_restored_after_a_recovered_genuine_fault() {
         unresolved: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
+        tls: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -1412,13 +1488,17 @@ fn start_stub_observes_argc_equal_to_one_via_the_process_stack() {
         unresolved: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
+        tls: None,
     };
 
     let kernel = OrbisKernel::new();
     let err = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[]).unwrap_err();
     match err {
         RuntimeError::Faulted { addr } => {
-            assert_eq!(addr, 1, "observed argc must equal 1 (a single argv entry was passed)");
+            assert_eq!(
+                addr, 1,
+                "observed argc must equal 1 (a single argv entry was passed)"
+            );
         }
         other => panic!("expected Err(Faulted {{ .. }}), got {other:?}"),
     }
@@ -1443,6 +1523,7 @@ fn start_stub_observes_argv0_first_byte_via_the_process_stack() {
         unresolved: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
+        tls: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -1507,10 +1588,12 @@ fn start_stub_calling_exit_returns_exited_with_the_given_code() {
             addr: HLE_TRAMPOLINE_BASE,
         }],
         entry: ENTRY_OFF as u64,
+        tls: None,
     };
 
     let kernel = OrbisKernel::new();
-    let outcome = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[]).expect("exit() must not fault");
+    let outcome = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[])
+        .expect("exit() must not fault");
     assert_eq!(
         outcome,
         RunOutcome::Exited(EXIT_CODE as u64),
@@ -1533,7 +1616,10 @@ fn start_stub_calling_exit_returns_exited_with_the_given_code() {
     let sentinel_kernel = OrbisKernel::new();
     let result = execute_linked(&linked2, &sentinel_hle, &sentinel_kernel, 0x0, &[])
         .expect("native execution succeeds after an exit-longjmp");
-    assert_eq!(result, 0xC0DE, "trampoline dispatch still works normally after an exit-longjmp");
+    assert_eq!(
+        result, 0xC0DE,
+        "trampoline dispatch still works normally after an exit-longjmp"
+    );
 }
 
 /// W1b regression (design doc §7): a `_start` that genuinely faults (not
@@ -1547,7 +1633,8 @@ fn start_stub_wild_fault_still_recovers_as_faulted_through_execute_process() {
     let hle = HleRegistry::new();
     let mut image = vec![0u8; 0x100];
     // mov rax, [0]  -- a wild dereference of address 0, reliably unmapped.
-    image[ENTRY_OFF..ENTRY_OFF + 9].copy_from_slice(&[0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xC3]);
+    image[ENTRY_OFF..ENTRY_OFF + 9]
+        .copy_from_slice(&[0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xC3]);
 
     let linked = LinkedModule {
         image,
@@ -1555,13 +1642,17 @@ fn start_stub_wild_fault_still_recovers_as_faulted_through_execute_process() {
         unresolved: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
+        tls: None,
     };
 
     let kernel = OrbisKernel::new();
     let err = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[]).unwrap_err();
     match err {
         RuntimeError::Faulted { addr } => {
-            assert_ne!(addr, 0, "Faulted::addr is the faulting Rip, a real mapped-image address");
+            assert_ne!(
+                addr, 0,
+                "Faulted::addr is the faulting Rip, a real mapped-image address"
+            );
         }
         other => panic!("expected Err(Faulted {{ .. }}), got {other:?}"),
     }
@@ -1603,10 +1694,12 @@ fn execute_process_restores_host_fsbase_after_an_exit_longjmp() {
             addr: HLE_TRAMPOLINE_BASE,
         }],
         entry: ENTRY_OFF as u64,
+        tls: None,
     };
 
     let kernel = OrbisKernel::new();
-    let outcome = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[]).expect("exit() must not fault");
+    let outcome = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[])
+        .expect("exit() must not fault");
     assert_eq!(outcome, RunOutcome::Exited(EXIT_CODE as u64));
 
     // SAFETY: same as above.
@@ -1615,5 +1708,188 @@ fn execute_process_restores_host_fsbase_after_an_exit_longjmp() {
     assert_eq!(
         after, before,
         "host FS base must be restored after execute_process returns, even via the exit-longjmp path"
+    );
+}
+
+// --- M1-B (wall #2): PT_TLS materialization + TPOFF64 + fs:0x28 canary ----
+//
+// These are the acceptance tests for the TLS wall: a module with a real
+// `PT_TLS` template and a real `TPOFF64` relocation — linked through the
+// genuine LM1 linker, not hand-patched — reads its `.tdata` value back
+// through an fs-relative access at the linker-computed offset; and a
+// stack-protected-style read of `fs:0x28` observes a real, nonzero canary
+// with glibc's zero terminator byte.
+
+/// A module whose `_start` loads the linker-resolved `TPOFF64` offset from a
+/// data slot, reads the TLS variable through `fs:[rax]`, and exits with it:
+///
+/// ```text
+/// mov rax, [rip -> slot_tls]   ; 48 8B 05 <disp32>   the tpoff (negative)
+/// mov rdi, fs:[rax]            ; 64 48 8B 38         the TLS variable
+/// call [rip -> slot_exit]      ; FF 15 <disp32>      exit(rdi)
+/// ```
+#[test]
+fn tls_variable_read_through_linker_computed_tpoff64_round_trips_tdata() {
+    if !fsgsbase_available() {
+        println!("FSGSBASE not available on this CPU; skipping tls_variable_read_through_linker_computed_tpoff64_round_trips_tdata");
+        return;
+    }
+
+    const ENTRY_OFF: usize = 0x0;
+    const SLOT_EXIT_OFF: usize = 0x40;
+    const SLOT_TLS_OFF: usize = 0x48;
+    const TLS_VALUE: u64 = 0x5AFE_C0DE;
+    const TLS_VAR_OFF: u64 = 0x8; // the variable's offset inside the template
+    const R_X86_64_TPOFF64: u64 = 18;
+
+    let mut image = vec![0u8; 0x100];
+    let mut off = ENTRY_OFF;
+    // mov rax, [rip+disp32] -> SLOT_TLS_OFF
+    let disp_tls = (SLOT_TLS_OFF as i64 - (off as i64 + 7)) as i32;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x8B, 0x05]);
+    image[off + 3..off + 7].copy_from_slice(&disp_tls.to_le_bytes());
+    off += 7;
+    // mov rdi, fs:[rax]
+    image[off..off + 4].copy_from_slice(&[0x64, 0x48, 0x8B, 0x38]);
+    off += 4;
+    // call qword ptr [rip+disp32] -> SLOT_EXIT_OFF (never returns)
+    let disp_exit = (SLOT_EXIT_OFF as i64 - (off as i64 + 6)) as i32;
+    image[off] = 0xFF;
+    image[off + 1] = 0x15;
+    image[off + 2..off + 6].copy_from_slice(&disp_exit.to_le_bytes());
+
+    // `.tdata`: 16 file-backed bytes with TLS_VALUE at TLS_VAR_OFF;
+    // `mem_size` 0x18 adds 8 bytes of `.tbss`. block_size() =
+    // align_up(0x18, max(0x10, 16)) = 0x20, so the linker must write
+    // TLS_VAR_OFF - 0x20 = -0x18 into the TPOFF64 slot.
+    let mut tdata = vec![0u8; 0x10];
+    tdata[TLS_VAR_OFF as usize..TLS_VAR_OFF as usize + 8].copy_from_slice(&TLS_VALUE.to_le_bytes());
+
+    let module = SprxModule {
+        name: "tlsTestModule".to_string(),
+        e_type: 0xFE18, // ET_SCE_DYNAMIC
+        segments: vec![SprxSegment {
+            vaddr: 0,
+            data: image,
+            flags: 5, // R+X
+            mem_size: 0x100,
+        }],
+        dynlib_data: None,
+        relro: None,
+        dynamic: None,
+        entry: ENTRY_OFF as u64,
+        tls: Some(TlsTemplate {
+            vaddr: 0,
+            data: tdata,
+            mem_size: 0x18,
+            align: 0x10,
+        }),
+    };
+
+    let dynlib = DynlibData {
+        symbols: vec![DynSymbol {
+            nid: nid_of("exit"),
+            value: 0,
+            is_import: true,
+        }],
+        relocations: vec![
+            SceRela {
+                offset: SLOT_EXIT_OFF as u64,
+                info: R_X86_64_JUMP_SLOT, // r_sym = 0 -> the exit import
+                addend: 0,
+            },
+            SceRela {
+                offset: SLOT_TLS_OFF as u64,
+                info: R_X86_64_TPOFF64, // r_sym = 0: offset entirely in the addend
+                addend: TLS_VAR_OFF as i64,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let hle = HleRegistry::new();
+    let db = NidDatabase::from_hle_names(hle.registered_names());
+    let registry = ModuleRegistry::new(db);
+    let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE)
+        .expect("a module with a TPOFF64 relocation must link without hard-failing (M1-B)");
+
+    // The linker's half of the contract, asserted directly: the TPOFF64
+    // slot holds the negative, block-relative fs offset.
+    let slot = u64::from_le_bytes(
+        linked.image[SLOT_TLS_OFF..SLOT_TLS_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(
+        slot,
+        (-0x18i64) as u64,
+        "TPOFF64 slot must hold TLS_VAR_OFF - block_size()"
+    );
+
+    let kernel = OrbisKernel::new();
+    let outcome = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[])
+        .expect("TLS read must not fault");
+    assert_eq!(
+        outcome,
+        RunOutcome::Exited(TLS_VALUE),
+        "the guest must read its .tdata value back through the linker-computed fs-relative offset"
+    );
+}
+
+/// M1-B canary acceptance: a `_start` that reads `fs:0x28` — exactly what a
+/// stack-protector prologue does — and exits with it must observe a real,
+/// nonzero canary whose low byte is zero (glibc's terminator convention).
+/// A zeroed TCB would make stack-protected code "work" by coincidence; this
+/// pins the honest ABI contract instead (the m1-homebrew anti-pattern).
+#[test]
+fn stack_chk_guard_canary_at_fs_0x28_is_nonzero_with_terminator_byte() {
+    if !fsgsbase_available() {
+        println!("FSGSBASE not available on this CPU; skipping stack_chk_guard_canary_at_fs_0x28_is_nonzero_with_terminator_byte");
+        return;
+    }
+
+    const ENTRY_OFF: usize = 0x0;
+    const SLOT_OFF: usize = 0x20;
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+    // mov rdi, fs:[0x28]  (64 48 8B 3C 25 28 00 00 00)
+    image[ENTRY_OFF..ENTRY_OFF + 9]
+        .copy_from_slice(&[0x64, 0x48, 0x8B, 0x3C, 0x25, 0x28, 0x00, 0x00, 0x00]);
+    // call qword ptr [rip+disp32] -> SLOT_OFF
+    let off = ENTRY_OFF + 9;
+    let disp = (SLOT_OFF as i64 - (off as i64 + 6)) as i32;
+    image[off] = 0xFF;
+    image[off + 1] = 0x15;
+    image[off + 2..off + 6].copy_from_slice(&disp.to_le_bytes());
+    image[SLOT_OFF..SLOT_OFF + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        hle_trampolines: vec![HleTrampoline {
+            library: "libc".to_string(),
+            function: "exit".to_string(),
+            addr: HLE_TRAMPOLINE_BASE,
+        }],
+        entry: ENTRY_OFF as u64,
+        tls: None,
+    };
+
+    let kernel = OrbisKernel::new();
+    let outcome = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[])
+        .expect("canary read must not fault");
+    let RunOutcome::Exited(canary) = outcome else {
+        panic!("expected the guest to exit with the canary value, got {outcome:?}");
+    };
+    assert_ne!(
+        canary, 0,
+        "fs:0x28 must hold a real, nonzero __stack_chk_guard canary (no zero-canary soft-success)"
+    );
+    assert_eq!(
+        canary & 0xFF,
+        0,
+        "the canary's low byte is the glibc-style NUL terminator"
     );
 }

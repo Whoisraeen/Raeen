@@ -11,23 +11,25 @@
 /// Crate identifier, used in diagnostics.
 pub const CRATE_NAME: &str = "xps5x-firmware";
 
-pub mod slb2;
-pub mod pup;
 pub mod crypto;
 pub mod dynlib;
-pub mod sprx;
+pub mod pup;
 pub mod registry;
 pub mod report;
+pub mod slb2;
+pub mod sprx;
 
-pub use slb2::{parse_slb2, Slb2Entry};
-pub use pup::Firmware;
 pub use crypto::{
     decrypt_self, require_key, DecryptedSelf, KeyProvider, KeyRequest, NoKeysProvider, SegmentKey,
 };
-pub use sprx::{parse_sprx, SprxModule, SprxSegment};
+pub use dynlib::linker::{
+    link_module, HleTrampoline, LinkedModule, HLE_TRAMPOLINE_BASE, UNRESOLVED_STUB_ADDR,
+};
+pub use pup::Firmware;
 pub use registry::{ModulePolicy, ModuleRegistry, Resolver};
-pub use dynlib::linker::{link_module, HleTrampoline, LinkedModule, HLE_TRAMPOLINE_BASE, UNRESOLVED_STUB_ADDR};
 pub use report::summarize;
+pub use slb2::{parse_slb2, Slb2Entry};
+pub use sprx::{parse_sprx, SprxModule, SprxSegment, TlsTemplate};
 
 use xps5x_core::error::FirmwareError;
 
@@ -59,7 +61,8 @@ pub fn load_module(
         Some(d) => dynlib::parse_sce_dynamic(d)?,
         None => Vec::new(),
     };
-    let dynlib_data = dynlib::parse_dynlibdata(module.dynlib_data.as_deref().unwrap_or(&[]), &dyn_tags)?;
+    let dynlib_data =
+        dynlib::parse_dynlibdata(module.dynlib_data.as_deref().unwrap_or(&[]), &dyn_tags)?;
     registry.register_module_exports(&module.name, &dynlib_data.exports);
     dynlib::linker::link_module(&module, &dynlib_data, registry, hle, base)
 }

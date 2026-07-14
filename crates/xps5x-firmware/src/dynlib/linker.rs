@@ -46,6 +46,14 @@ const R_X86_64_64: u32 = 1;
 const R_X86_64_GLOB_DAT: u32 = 6;
 const R_X86_64_JUMP_SLOT: u32 = 7;
 const R_X86_64_RELATIVE: u32 = 8;
+const R_X86_64_DTPMOD64: u32 = 16;
+const R_X86_64_DTPOFF64: u32 = 17;
+const R_X86_64_TPOFF64: u32 = 18;
+
+/// The TLS module ID this (single, main) module's `DTPMOD64` relocations
+/// resolve to. There is exactly one guest module with TLS today; a general
+/// dynamic-TLS module table comes with `sceKernelLoadStartModule` (M1-D).
+const MAIN_TLS_MODULE_ID: u64 = 1;
 
 /// One HLE import resolved during linking: which `library::function` a
 /// relocation's slot now points at, via its deterministic trampoline
@@ -74,6 +82,11 @@ pub struct LinkedModule {
     /// non-zero load bias will need to rebase this (see the module docs'
     /// "Image layout assumption").
     pub entry: u64,
+    /// The module's `PT_TLS` static TLS template (M1-B, wall #2), carried
+    /// through from [`SprxModule::tls`] so the runtime can materialize the
+    /// per-thread TLS block whose layout this module's `TPOFF64`/`DTPOFF64`
+    /// relocations were resolved against.
+    pub tls: Option<crate::sprx::TlsTemplate>,
 }
 
 /// Lay `module`'s `PT_LOAD` segments into a flat image at `base` and apply
@@ -97,7 +110,10 @@ pub fn link_module(
 
     for seg in &module.segments {
         let start = usize::try_from(seg.vaddr).map_err(|_| {
-            FirmwareError::MalformedDynlibData(format!("segment vaddr {:#x} overflows usize", seg.vaddr))
+            FirmwareError::MalformedDynlibData(format!(
+                "segment vaddr {:#x} overflows usize",
+                seg.vaddr
+            ))
         })?;
         let end = start.checked_add(seg.data.len()).ok_or_else(|| {
             FirmwareError::MalformedDynlibData(format!(
@@ -125,9 +141,42 @@ pub fn link_module(
 
         let value = match r_type {
             R_X86_64_RELATIVE => base.wrapping_add(reloc.addend as u64),
+            // TLS relocations (M1-B, wall #2). Symbol semantics: `r_sym == 0`
+            // means a local TLS reference whose template-relative offset is
+            // carried entirely in the addend; otherwise the symbol's `value`
+            // is its offset within the module's `PT_TLS` template.
+            R_X86_64_TPOFF64 => {
+                // Variant-II x86-64 static TLS: the block sits immediately
+                // below the TCB the FS base points at, so the fs-relative
+                // offset of template offset `o` is `o - block_size`
+                // (negative, wrapped). `TlsTemplate::block_size` is the
+                // single source of truth both here and in the runtime's
+                // block placement — they must agree exactly.
+                let tls = module.tls.as_ref().ok_or_else(|| {
+                    FirmwareError::MalformedDynlibData(
+                        "TPOFF64 relocation in a module with no PT_TLS segment".to_string(),
+                    )
+                })?;
+                let sym_off = tls_symbol_offset(dynlib, r_sym)?;
+                sym_off
+                    .wrapping_add(reloc.addend as u64)
+                    .wrapping_sub(tls.block_size())
+            }
+            R_X86_64_DTPMOD64 => MAIN_TLS_MODULE_ID,
+            R_X86_64_DTPOFF64 => {
+                if module.tls.is_none() {
+                    return Err(FirmwareError::MalformedDynlibData(
+                        "DTPOFF64 relocation in a module with no PT_TLS segment".to_string(),
+                    ));
+                }
+                let sym_off = tls_symbol_offset(dynlib, r_sym)?;
+                sym_off.wrapping_add(reloc.addend as u64)
+            }
             R_X86_64_64 | R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT => {
                 let sym_index = usize::try_from(r_sym).map_err(|_| {
-                    FirmwareError::MalformedDynlibData(format!("relocation r_sym {r_sym:#x} overflows usize"))
+                    FirmwareError::MalformedDynlibData(format!(
+                        "relocation r_sym {r_sym:#x} overflows usize"
+                    ))
                 })?;
                 let symbol = dynlib.symbols.get(sym_index).ok_or_else(|| {
                     FirmwareError::MalformedDynlibData(format!(
@@ -141,7 +190,11 @@ pub fn link_module(
                         let nid = symbol.nid;
                         let addr = *hle_addrs.entry(nid).or_insert_with(|| {
                             let addr = HLE_TRAMPOLINE_BASE + (hle_trampolines.len() as u64 * 8);
-                            hle_trampolines.push(HleTrampoline { library, function, addr });
+                            hle_trampolines.push(HleTrampoline {
+                                library,
+                                function,
+                                addr,
+                            });
                             addr
                         });
                         if r_type == R_X86_64_64 {
@@ -169,7 +222,29 @@ pub fn link_module(
         unresolved,
         hle_trampolines,
         entry: module.entry,
+        tls: module.tls.clone(),
     })
+}
+
+/// The template-relative offset a TLS relocation's symbol contributes:
+/// 0 for `r_sym == 0` (local reference, offset in the addend), else the
+/// symbol's `value`. Out-of-range `r_sym` is
+/// [`FirmwareError::MalformedDynlibData`], mirroring the symbol lookup for
+/// the address relocation types above.
+fn tls_symbol_offset(dynlib: &DynlibData, r_sym: u64) -> Result<u64, FirmwareError> {
+    if r_sym == 0 {
+        return Ok(0);
+    }
+    let sym_index = usize::try_from(r_sym).map_err(|_| {
+        FirmwareError::MalformedDynlibData(format!("relocation r_sym {r_sym:#x} overflows usize"))
+    })?;
+    let symbol = dynlib.symbols.get(sym_index).ok_or_else(|| {
+        FirmwareError::MalformedDynlibData(format!(
+            "TLS relocation r_sym {sym_index} is out of range of symbols (len {})",
+            dynlib.symbols.len()
+        ))
+    })?;
+    Ok(symbol.value)
 }
 
 /// Size the flat image to `max(seg.vaddr + seg.mem_size)` over `module`'s
@@ -196,19 +271,21 @@ fn image_size(module: &SprxModule) -> Result<usize, FirmwareError> {
             })?;
         max_end = max_end.max(mem_end).max(data_end);
     }
-    usize::try_from(max_end)
-        .map_err(|_| FirmwareError::MalformedDynlibData(format!("image size {max_end:#x} overflows usize")))
+    usize::try_from(max_end).map_err(|_| {
+        FirmwareError::MalformedDynlibData(format!("image size {max_end:#x} overflows usize"))
+    })
 }
 
 /// Write `value` little-endian into `image[offset .. offset + 8]`,
 /// bounds-checked. Never panics; out-of-range `offset` returns
 /// [`FirmwareError::MalformedDynlibData`].
 fn write_slot(image: &mut [u8], offset: u64, value: u64) -> Result<(), FirmwareError> {
-    let start = usize::try_from(offset)
-        .map_err(|_| FirmwareError::MalformedDynlibData(format!("relocation offset {offset:#x} overflows usize")))?;
-    let end = start
-        .checked_add(8)
-        .ok_or_else(|| FirmwareError::MalformedDynlibData(format!("relocation offset {offset:#x} + 8 overflows")))?;
+    let start = usize::try_from(offset).map_err(|_| {
+        FirmwareError::MalformedDynlibData(format!("relocation offset {offset:#x} overflows usize"))
+    })?;
+    let end = start.checked_add(8).ok_or_else(|| {
+        FirmwareError::MalformedDynlibData(format!("relocation offset {offset:#x} + 8 overflows"))
+    })?;
     if end > image.len() {
         return Err(FirmwareError::MalformedDynlibData(format!(
             "relocation slot [{start:#x}, {end:#x}) exceeds image size {:#x}",
@@ -243,7 +320,22 @@ mod tests {
             relro: None,
             dynamic: None,
             entry: 0,
+            tls: None,
         }
+    }
+
+    /// `test_module` plus a `PT_TLS` template: 3 bytes of `.tdata`
+    /// (`[0xAB, 0xCD, 0xEF]`), `mem_size` 0x30 (so 0x2D bytes of `.tbss`),
+    /// align 0x20 — `block_size()` = 0x40.
+    fn test_module_with_tls(mem_size: u64) -> SprxModule {
+        let mut module = test_module(mem_size);
+        module.tls = Some(crate::sprx::TlsTemplate {
+            vaddr: 0x800,
+            data: vec![0xAB, 0xCD, 0xEF],
+            mem_size: 0x30,
+            align: 0x20,
+        });
+        module
     }
 
     fn empty_registry() -> (HleRegistry, ModuleRegistry) {
@@ -271,7 +363,8 @@ mod tests {
         };
 
         let base = 0x1_0000_0000u64;
-        let linked = link_module(&module, &dynlib, &registry, &hle, base).expect("relative reloc links");
+        let linked =
+            link_module(&module, &dynlib, &registry, &hle, base).expect("relative reloc links");
 
         assert_eq!(read_slot(&linked.image, 0x8), base + 0x20);
         assert!(linked.unresolved.is_empty());
@@ -291,7 +384,11 @@ mod tests {
 
         let module = test_module(0x100);
         let dynlib = DynlibData {
-            symbols: vec![DynSymbol { nid, value: 0, is_import: true }],
+            symbols: vec![DynSymbol {
+                nid,
+                value: 0,
+                is_import: true,
+            }],
             relocations: vec![SceRela {
                 offset: 0x10,
                 info: R_X86_64_JUMP_SLOT as u64, // r_sym = 0
@@ -300,7 +397,8 @@ mod tests {
             ..Default::default()
         };
 
-        let linked = link_module(&module, &dynlib, &registry, &hle, 0).expect("HLE-resolved reloc links");
+        let linked =
+            link_module(&module, &dynlib, &registry, &hle, 0).expect("HLE-resolved reloc links");
 
         assert_eq!(read_slot(&linked.image, 0x10), HLE_TRAMPOLINE_BASE);
         assert_eq!(linked.hle_trampolines.len(), 1);
@@ -322,10 +420,22 @@ mod tests {
 
         let module = test_module(0x100);
         let dynlib = DynlibData {
-            symbols: vec![DynSymbol { nid, value: 0, is_import: true }],
+            symbols: vec![DynSymbol {
+                nid,
+                value: 0,
+                is_import: true,
+            }],
             relocations: vec![
-                SceRela { offset: 0x10, info: R_X86_64_JUMP_SLOT as u64, addend: 0 },
-                SceRela { offset: 0x18, info: R_X86_64_GLOB_DAT as u64, addend: 0 },
+                SceRela {
+                    offset: 0x10,
+                    info: R_X86_64_JUMP_SLOT as u64,
+                    addend: 0,
+                },
+                SceRela {
+                    offset: 0x18,
+                    info: R_X86_64_GLOB_DAT as u64,
+                    addend: 0,
+                },
             ],
             ..Default::default()
         };
@@ -346,7 +456,11 @@ mod tests {
 
         let module = test_module(0x100);
         let dynlib = DynlibData {
-            symbols: vec![DynSymbol { nid, value: 0, is_import: true }],
+            symbols: vec![DynSymbol {
+                nid,
+                value: 0,
+                is_import: true,
+            }],
             relocations: vec![SceRela {
                 offset: 0x18,
                 info: R_X86_64_64 as u64, // r_sym = 0
@@ -355,7 +469,8 @@ mod tests {
             ..Default::default()
         };
 
-        let linked = link_module(&module, &dynlib, &registry, &hle, 0).expect("LLE-resolved reloc links");
+        let linked =
+            link_module(&module, &dynlib, &registry, &hle, 0).expect("LLE-resolved reloc links");
 
         assert_eq!(read_slot(&linked.image, 0x18), 0x9999 + 0x5);
         assert!(linked.unresolved.is_empty());
@@ -369,7 +484,11 @@ mod tests {
 
         let module = test_module(0x100);
         let dynlib = DynlibData {
-            symbols: vec![DynSymbol { nid, value: 0, is_import: true }],
+            symbols: vec![DynSymbol {
+                nid,
+                value: 0,
+                is_import: true,
+            }],
             relocations: vec![SceRela {
                 offset: 0x20,
                 info: R_X86_64_GLOB_DAT as u64, // r_sym = 0
@@ -378,7 +497,8 @@ mod tests {
             ..Default::default()
         };
 
-        let linked = link_module(&module, &dynlib, &registry, &hle, 0).expect("unresolved import is non-fatal");
+        let linked = link_module(&module, &dynlib, &registry, &hle, 0)
+            .expect("unresolved import is non-fatal");
 
         assert_eq!(read_slot(&linked.image, 0x20), UNRESOLVED_STUB_ADDR);
         assert_eq!(linked.unresolved, vec![nid]);
@@ -395,12 +515,137 @@ mod tests {
         assert_eq!(linked.entry, 0x40);
     }
 
+    // --- TLS relocations (M1-B, wall #2) ---------------------------------
+
+    #[test]
+    fn tpoff64_writes_negative_block_relative_offset() {
+        let (hle, registry) = empty_registry();
+        let module = test_module_with_tls(0x100);
+        let dynlib = DynlibData {
+            // r_sym == 0: local TLS reference, offset carried in the addend.
+            relocations: vec![SceRela {
+                offset: 0x10,
+                info: R_X86_64_TPOFF64 as u64,
+                addend: 0x8,
+            }],
+            ..Default::default()
+        };
+
+        let linked = link_module(&module, &dynlib, &registry, &hle, 0).expect("TPOFF64 links");
+
+        // block_size = 0x40 (0x30 rounded to align 0x20, min 16); the
+        // fs-relative offset of template offset 0x8 is 0x8 - 0x40 = -0x38.
+        assert_eq!(read_slot(&linked.image, 0x10), (-0x38i64) as u64);
+    }
+
+    #[test]
+    fn tpoff64_uses_symbol_value_for_nonzero_r_sym() {
+        let (hle, registry) = empty_registry();
+        let module = test_module_with_tls(0x100);
+        let dynlib = DynlibData {
+            symbols: vec![
+                DynSymbol {
+                    nid: 0,
+                    value: 0,
+                    is_import: false,
+                },
+                DynSymbol {
+                    nid: nid_of("someTlsVar"),
+                    value: 0x10,
+                    is_import: false,
+                },
+            ],
+            relocations: vec![SceRela {
+                offset: 0x18,
+                info: (1u64 << 32) | R_X86_64_TPOFF64 as u64,
+                addend: 0x4,
+            }],
+            ..Default::default()
+        };
+
+        let linked = link_module(&module, &dynlib, &registry, &hle, 0).expect("TPOFF64 links");
+        // 0x10 (symbol) + 0x4 (addend) - 0x40 (block) = -0x2C.
+        assert_eq!(read_slot(&linked.image, 0x18), (-0x2Ci64) as u64);
+    }
+
+    #[test]
+    fn dtpmod64_writes_main_module_id() {
+        let (hle, registry) = empty_registry();
+        let module = test_module_with_tls(0x100);
+        let dynlib = DynlibData {
+            relocations: vec![SceRela {
+                offset: 0x20,
+                info: R_X86_64_DTPMOD64 as u64,
+                addend: 0,
+            }],
+            ..Default::default()
+        };
+
+        let linked = link_module(&module, &dynlib, &registry, &hle, 0).expect("DTPMOD64 links");
+        assert_eq!(
+            read_slot(&linked.image, 0x20),
+            1,
+            "single-module world: TLS module id is 1"
+        );
+    }
+
+    #[test]
+    fn dtpoff64_writes_template_relative_offset() {
+        let (hle, registry) = empty_registry();
+        let module = test_module_with_tls(0x100);
+        let dynlib = DynlibData {
+            relocations: vec![SceRela {
+                offset: 0x28,
+                info: R_X86_64_DTPOFF64 as u64,
+                addend: 0xC,
+            }],
+            ..Default::default()
+        };
+
+        let linked = link_module(&module, &dynlib, &registry, &hle, 0).expect("DTPOFF64 links");
+        assert_eq!(read_slot(&linked.image, 0x28), 0xC);
+    }
+
+    #[test]
+    fn tpoff64_without_pt_tls_is_a_hard_link_error() {
+        let (hle, registry) = empty_registry();
+        let module = test_module(0x100); // no TLS template
+        let dynlib = DynlibData {
+            relocations: vec![SceRela {
+                offset: 0x10,
+                info: R_X86_64_TPOFF64 as u64,
+                addend: 0,
+            }],
+            ..Default::default()
+        };
+
+        let err = link_module(&module, &dynlib, &registry, &hle, 0).unwrap_err();
+        assert!(matches!(err, FirmwareError::MalformedDynlibData(_)));
+    }
+
+    #[test]
+    fn tls_template_is_carried_into_linked_module() {
+        let (hle, registry) = empty_registry();
+        let module = test_module_with_tls(0x100);
+        let dynlib = DynlibData::default();
+
+        let linked = link_module(&module, &dynlib, &registry, &hle, 0).expect("links");
+        let tls = linked.tls.expect("TLS template carried through");
+        assert_eq!(tls.data, vec![0xAB, 0xCD, 0xEF]);
+        assert_eq!(tls.mem_size, 0x30);
+        assert_eq!(tls.block_size(), 0x40);
+    }
+
     #[test]
     fn unsupported_relocation_type_errors() {
         let (hle, registry) = empty_registry();
         let module = test_module(0x100);
         let dynlib = DynlibData {
-            relocations: vec![SceRela { offset: 0x0, info: 99, addend: 0 }],
+            relocations: vec![SceRela {
+                offset: 0x0,
+                info: 99,
+                addend: 0,
+            }],
             ..Default::default()
         };
 

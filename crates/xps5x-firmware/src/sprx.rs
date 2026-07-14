@@ -13,7 +13,7 @@
 //! bounds-checking every offset/size against the buffer — malformed or
 //! truncated input returns a [`FirmwareError`], never panics.
 
-use goblin::elf::program_header::{ProgramHeader, PT_DYNAMIC, PT_LOAD};
+use goblin::elf::program_header::{ProgramHeader, PT_DYNAMIC, PT_LOAD, PT_TLS};
 use tracing::{debug, info, warn};
 use xps5x_core::error::FirmwareError;
 
@@ -44,6 +44,40 @@ pub struct SprxSegment {
     pub mem_size: u64,
 }
 
+/// The module's `PT_TLS` segment: the initialization template for its
+/// static TLS block (M1-B, wall #2). `data` is the file-backed `.tdata`
+/// image; `mem_size` covers `.tdata` + zero-initialized `.tbss`; `align`
+/// is `p_align`. The runtime materializes one such block per thread
+/// (variant-II x86-64 TLS: the block sits immediately *below* the TCB the
+/// FS base points at), and the linker resolves `TPOFF64`/`DTPOFF64`
+/// relocations against this template's layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsTemplate {
+    /// `p_vaddr` — where the template's file bytes live in the image
+    /// (informational; TLS offsets are template-relative, not image-relative).
+    pub vaddr: u64,
+    /// File-backed `.tdata` initialization bytes.
+    pub data: Vec<u8>,
+    /// Total in-memory size (`p_memsz`): `.tdata` + `.tbss`.
+    pub mem_size: u64,
+    /// Required alignment (`p_align`).
+    pub align: u64,
+}
+
+impl TlsTemplate {
+    /// The static TLS block size both the linker (computing `TPOFF64`
+    /// offsets) and the runtime (placing the block below the TCB) must
+    /// agree on: `mem_size` rounded up to `max(align, 16)`. 16 is the
+    /// x86-64 psABI minimum TCB alignment — folding it in here keeps the
+    /// TCB address (block base + this size) properly aligned even for a
+    /// template declaring a smaller `p_align`. Self-consistency between
+    /// the two consumers is the load-bearing property.
+    pub fn block_size(&self) -> u64 {
+        let align = self.align.max(16);
+        self.mem_size.div_ceil(align).saturating_mul(align)
+    }
+}
+
 /// A parsed `.sprx` (SCE dynamic ELF) module: its loadable segments plus
 /// the raw `PT_SCE_DYNLIBDATA` blob for [`crate::dynlib`] to decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +105,9 @@ pub struct SprxModule {
     /// `linker.rs`'s module docs). A real `.sprx` with a non-zero load bias
     /// would need `entry - load_bias` here; that's out of LM1/RT1b scope.
     pub entry: u64,
+    /// The `PT_TLS` segment (the static TLS initialization template), if
+    /// present (M1-B, wall #2).
+    pub tls: Option<TlsTemplate>,
 }
 
 /// Parse a plaintext inner ELF into an [`SprxModule`].
@@ -105,10 +142,23 @@ pub fn parse_sprx(elf: &[u8]) -> Result<SprxModule, FirmwareError> {
     let mut dynlib_data = None;
     let mut relro = None;
     let mut dynamic = None;
+    let mut tls = None;
     let mut has_module_param = false;
 
     for phdr in &parsed.program_headers {
         match phdr.p_type {
+            PT_TLS => {
+                debug!(
+                    "  PT_TLS: vaddr={:#x} filesz={:#x} memsz={:#x} align={:#x}",
+                    phdr.p_vaddr, phdr.p_filesz, phdr.p_memsz, phdr.p_align
+                );
+                tls = Some(TlsTemplate {
+                    vaddr: phdr.p_vaddr,
+                    data: slice_phdr(elf, phdr, "PT_TLS")?,
+                    mem_size: phdr.p_memsz,
+                    align: phdr.p_align,
+                });
+            }
             PT_LOAD => {
                 let data = slice_phdr(elf, phdr, "PT_LOAD")?;
                 debug!(
@@ -179,6 +229,7 @@ pub fn parse_sprx(elf: &[u8]) -> Result<SprxModule, FirmwareError> {
         relro,
         dynamic,
         entry: parsed.header.e_entry,
+        tls,
     })
 }
 
@@ -188,9 +239,9 @@ pub fn parse_sprx(elf: &[u8]) -> Result<SprxModule, FirmwareError> {
 fn slice_phdr(elf: &[u8], phdr: &ProgramHeader, label: &str) -> Result<Vec<u8>, FirmwareError> {
     let start = phdr.p_offset as usize;
     let len = phdr.p_filesz as usize;
-    let end = start
-        .checked_add(len)
-        .ok_or_else(|| FirmwareError::MalformedDynlibData(format!("{label} offset/filesz overflow")))?;
+    let end = start.checked_add(len).ok_or_else(|| {
+        FirmwareError::MalformedDynlibData(format!("{label} offset/filesz overflow"))
+    })?;
     if end > elf.len() {
         return Err(FirmwareError::MalformedDynlibData(format!(
             "{label} range [{start:#x}, {end:#x}) exceeds buffer size {:#x}",
@@ -368,6 +419,60 @@ mod tests {
         let relro = module.relro.expect("relro segment present");
         assert_eq!(relro.vaddr, 0x3000);
         assert_eq!(relro.data, relro_bytes);
+    }
+
+    #[test]
+    fn tls_segment_is_captured_with_memsz_and_align() {
+        let load_bytes = vec![0x11u8; 8];
+        let tdata = vec![0xAB, 0xCD, 0xEF];
+
+        let mut elf = build_elf(
+            ET_SCE_DYNAMIC,
+            &[
+                PhdrSpec {
+                    p_type: PT_LOAD,
+                    p_flags: 5,
+                    p_vaddr: 0,
+                    data: load_bytes,
+                },
+                PhdrSpec {
+                    p_type: PT_TLS,
+                    p_flags: 4,
+                    p_vaddr: 0x800,
+                    data: tdata.clone(),
+                },
+            ],
+        );
+        // `build_elf` sets p_memsz == p_filesz and leaves p_align 0; a real
+        // PT_TLS has p_memsz > p_filesz (.tbss) and a nonzero p_align —
+        // poke both into the second program header directly.
+        let tls_phdr_off = EHDR_SIZE + PHDR_SIZE; // second phdr
+        elf[tls_phdr_off + 40..tls_phdr_off + 48].copy_from_slice(&0x30u64.to_le_bytes()); // p_memsz
+        elf[tls_phdr_off + 48..tls_phdr_off + 56].copy_from_slice(&0x20u64.to_le_bytes()); // p_align
+
+        let module = parse_sprx(&elf).expect("valid synthetic ELF with PT_TLS parses");
+        let tls = module.tls.expect("TLS template present");
+        assert_eq!(tls.vaddr, 0x800);
+        assert_eq!(tls.data, tdata);
+        assert_eq!(tls.mem_size, 0x30);
+        assert_eq!(tls.align, 0x20);
+        // block_size: 0x30 rounded up to max(0x20, 16) = 0x40.
+        assert_eq!(tls.block_size(), 0x40);
+    }
+
+    #[test]
+    fn module_without_pt_tls_has_no_template() {
+        let elf = build_elf(
+            ET_SCE_DYNAMIC,
+            &[PhdrSpec {
+                p_type: PT_LOAD,
+                p_flags: 5,
+                p_vaddr: 0,
+                data: vec![0u8; 8],
+            }],
+        );
+        let module = parse_sprx(&elf).expect("parses");
+        assert_eq!(module.tls, None);
     }
 
     #[test]

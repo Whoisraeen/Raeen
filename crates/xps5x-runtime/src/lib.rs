@@ -145,8 +145,14 @@ pub fn execute_linked(
     // never executes an fsbase instruction (honest degradation, not a
     // fragile half-working `fsbase`). `setup_main_tcb` allocates from the
     // same arena the guest otherwise uses, so this fails closed (`None`)
-    // rather than panicking if the heap allocation itself fails.
-    let tcb = if tls::fsgsbase_available() { arena.setup_main_tcb() } else { None };
+    // rather than panicking if the heap allocation itself fails. The
+    // module's `PT_TLS` template (if any) is materialized below the TCB
+    // (M1-B) so TLS-relocated accesses resolve against real init data.
+    let tcb = if tls::fsgsbase_available() {
+        arena.setup_main_tcb(module.tls.as_ref())
+    } else {
+        None
+    };
 
     // SAFETY: `entry_ptr` is a host address inside `arena`'s
     // `PAGE_EXECUTE_READWRITE` image sub-region, at the caller-specified
@@ -241,8 +247,13 @@ pub fn execute_process(
     let guard = trampoline::TrampolineGuard::reserve(module.hle_trampolines.len())?;
 
     // RT2c-b (design doc §3): same honest-degradation TCB setup as
-    // `execute_linked` above.
-    let tcb = if tls::fsgsbase_available() { arena.setup_main_tcb() } else { None };
+    // `execute_linked` above, including the module's `PT_TLS` template and
+    // the fs:0x28 canary (M1-B).
+    let tcb = if tls::fsgsbase_available() {
+        arena.setup_main_tcb(module.tls.as_ref())
+    } else {
+        None
+    };
 
     // Lay out the process stack in the arena's stack region (design doc §2);
     // `process::build_process_stack` writes only through `&arena` (bounds-
