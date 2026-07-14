@@ -22,6 +22,7 @@
 //! | libSceSysmodule.sprx | Partial | Module registry |
 
 pub(crate) mod fmt;
+pub mod kernel_eventflag;
 pub mod libc;
 pub mod libkernel;
 pub mod libsce_app_content;
@@ -145,6 +146,8 @@ impl HleRegistry {
         pthread_tls::register(&registry);
         // pthread thread identity/control (self / equal / yield / rename).
         pthread_thread::register(&registry);
+        // Kernel event flags (create/set/clear/poll/wait/cancel/delete).
+        kernel_eventflag::register(&registry);
         libc::register(&registry);
         libsce_sysmodule::register(&registry);
         libsce_video_out::register(&registry);

@@ -152,12 +152,28 @@ pub struct OrbisKernel {
     /// Guest pthread thread-attribute objects, keyed by both the guest
     /// `pthread_attr_t` address and its allocated handle.
     pub pthread_attrs: DashMap<u64, PthreadAttr>,
+    /// Kernel event flags, keyed by handle.
+    pub kernel_event_flags: DashMap<u64, EventFlag>,
+    /// Next event-flag handle to hand out.
+    kernel_event_flag_next: std::sync::atomic::AtomicU64,
     /// Registered pthread TLS keys → their destructor address (0 = none).
     pub pthread_tls_keys: DashMap<i32, u64>,
     /// Thread-local specific values, keyed by (thread handle, TLS key).
     pub pthread_tls_values: DashMap<(u64, i32), u64>,
     /// Next TLS key id to hand out.
     pthread_tls_next_key: std::sync::atomic::AtomicI32,
+}
+
+/// A kernel event flag: a 64-bit set of condition bits a title waits on / sets
+/// / clears. Ported from SharpEmu's `EventFlagState` (GPL-2.0). The bit state
+/// is fully correct under single-active-execution; true cross-thread blocking
+/// waits need the M1-E scheduler.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EventFlag {
+    /// Current condition bits.
+    pub bits: u64,
+    /// Creation attributes (queue/thread mode).
+    pub attributes: u32,
 }
 
 /// A guest pthread thread-attribute object (`pthread_attr_t`) — the stack
@@ -237,10 +253,28 @@ impl OrbisKernel {
             pthread_mutex_attrs: DashMap::new(),
             pthread_rwlocks: DashMap::new(),
             pthread_attrs: DashMap::new(),
+            kernel_event_flags: DashMap::new(),
+            kernel_event_flag_next: std::sync::atomic::AtomicU64::new(1),
             pthread_tls_keys: DashMap::new(),
             pthread_tls_values: DashMap::new(),
             pthread_tls_next_key: std::sync::atomic::AtomicI32::new(0),
         }
+    }
+
+    /// Create an event flag with `attributes` and `initial_bits`, returning its
+    /// handle. See the `xps5x-hle` `kernel_eventflag` module.
+    pub fn create_event_flag(&self, attributes: u32, initial_bits: u64) -> u64 {
+        let handle = self
+            .kernel_event_flag_next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.kernel_event_flags.insert(
+            handle,
+            EventFlag {
+                bits: initial_bits,
+                attributes,
+            },
+        );
+        handle
     }
 
     /// Allocate a fresh pthread TLS key registered with `destructor` (0 = none),
