@@ -24,6 +24,7 @@
 pub(crate) mod fmt;
 pub mod libc;
 pub mod libkernel;
+pub mod libsce_app_content;
 pub mod libsce_audio_out;
 pub mod libsce_common_dialog;
 pub mod libsce_gnm_driver;
@@ -138,6 +139,7 @@ impl HleRegistry {
         libsce_audio_out::register(&registry);
         libsce_save_data::register(&registry);
         libsce_common_dialog::register(&registry);
+        libsce_app_content::register(&registry);
 
         info!(
             "HLE registry: {} functions registered",
