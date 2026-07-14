@@ -63,6 +63,8 @@ const DRAW_AUTO_MODIFIER: u64 = 0x4000_0000;
 const SCE_ERROR_INVALID_ARGUMENT: u64 = 0x8002_0016;
 /// Generic SCE "memory fault" error (`0x8002_0000 | EFAULT`).
 const SCE_ERROR_MEMORY_FAULT: u64 = 0x8002_000E;
+/// Generic SCE "not found" error (`0x8002_0000 | ESRCH`).
+const SCE_ERROR_NOT_FOUND: u64 = 0x8002_0003;
 
 // Shader-header layout + magic (byte offsets/values, from SharpEmu).
 const SHADER_FILE_HEADER: u32 = 0x3433_3231;
@@ -165,6 +167,26 @@ pub fn register(registry: &HleRegistry) {
         hle_get_resource_max_name_length,
     );
     registry.register("libSceAgc", "sceAgcSuspendPoint", hle_suspend_point);
+    registry.register(
+        "libSceAgc",
+        "sceAgcDriverRegisterDefaultOwner",
+        hle_driver_register_default_owner,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDriverGetDefaultOwner",
+        hle_driver_get_default_owner,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDriverAddEqEvent",
+        hle_driver_add_eq_event,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDriverDeleteEqEvent",
+        hle_driver_delete_eq_event,
+    );
     registry.register(
         "libSceAgc",
         "sceAgcDcbDrawIndexOffset",
@@ -273,6 +295,62 @@ fn hle_get_resource_max_name_length(ctx: &HleContext, args: &[u64]) -> u64 {
 
 /// `sceAgcSuspendPoint()`: a no-op suspension marker; succeeds.
 fn hle_suspend_point(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    0
+}
+
+/// `sceAgcDriverRegisterDefaultOwner(owner)`: record the default resource owner.
+fn hle_driver_register_default_owner(ctx: &HleContext, args: &[u64]) -> u64 {
+    let owner = args.first().copied().unwrap_or(0) as u32;
+    ctx.kernel
+        .agc_default_owner
+        .store(owner, std::sync::atomic::Ordering::Relaxed);
+    0
+}
+
+/// `sceAgcDriverGetDefaultOwner(out)`: write the registered default owner.
+fn hle_driver_get_default_owner(ctx: &HleContext, args: &[u64]) -> u64 {
+    let out = args.first().copied().unwrap_or(0);
+    if out == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    let owner = ctx
+        .kernel
+        .agc_default_owner
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if !ctx.mem.write(out, &owner.to_le_bytes()) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
+/// `sceAgcDriverAddEqEvent(equeue, eventId, userData)`: register an Agc event on
+/// the event queue (reuses the kernel event-queue user-event machinery).
+fn hle_driver_add_eq_event(ctx: &HleContext, args: &[u64]) -> u64 {
+    let equeue = args.first().copied().unwrap_or(0);
+    let event_id = args.get(1).copied().unwrap_or(0);
+    let user_data = args.get(2).copied().unwrap_or(0);
+    if !ctx.kernel.kernel_equeues.contains_key(&equeue) {
+        return SCE_ERROR_NOT_FOUND;
+    }
+    ctx.kernel.kernel_equeue_events.insert(
+        (equeue, event_id),
+        xps5x_kernel::EqueueUserEvent {
+            udata: user_data,
+            triggered: false,
+            fflags: 0,
+        },
+    );
+    0
+}
+
+/// `sceAgcDriverDeleteEqEvent(equeue, eventId)`: remove a previously-added event.
+fn hle_driver_delete_eq_event(ctx: &HleContext, args: &[u64]) -> u64 {
+    let equeue = args.first().copied().unwrap_or(0);
+    let event_id = args.get(1).copied().unwrap_or(0);
+    if !ctx.kernel.kernel_equeues.contains_key(&equeue) {
+        return SCE_ERROR_NOT_FOUND;
+    }
+    ctx.kernel.kernel_equeue_events.remove(&(equeue, event_id));
     0
 }
 
@@ -1712,6 +1790,30 @@ mod tests {
         // Query: required = resourceCount*0x118 + ownerCount*0x1E0.
         assert_eq!(hle_driver_query_resource_memory(&ctx, &[0x1E0, 2, 3]), 0);
         assert_eq!(read_u64(&ctx, 0x1E0), 2 * 0x118 + 3 * 0x1E0);
+    }
+
+    #[test]
+    fn driver_owner_and_eq_events() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // Default-owner register/get round-trips through kernel state.
+        assert_eq!(hle_driver_register_default_owner(&ctx, &[42]), 0);
+        assert_eq!(hle_driver_get_default_owner(&ctx, &[0x100]), 0);
+        assert_eq!(read_u32(&ctx, 0x100), 42);
+        assert_eq!(
+            hle_driver_get_default_owner(&ctx, &[0]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+        // AddEqEvent on an unknown queue → NOT_FOUND; on a real one → OK.
+        assert_eq!(
+            hle_driver_add_eq_event(&ctx, &[0xDEAD, 5, 9]),
+            SCE_ERROR_NOT_FOUND
+        );
+        let eq = kernel.create_equeue(0);
+        assert_eq!(hle_driver_add_eq_event(&ctx, &[eq, 5, 9]), 0);
+        assert!(kernel.kernel_equeue_events.contains_key(&(eq, 5)));
+        assert_eq!(hle_driver_delete_eq_event(&ctx, &[eq, 5]), 0);
+        assert!(!kernel.kernel_equeue_events.contains_key(&(eq, 5)));
     }
 
     #[test]
