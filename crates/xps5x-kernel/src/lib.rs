@@ -149,6 +149,39 @@ pub struct OrbisKernel {
     /// Guest pthread read-write lock state, keyed by both the guest
     /// `pthread_rwlock_t` address and its allocated handle.
     pub pthread_rwlocks: DashMap<u64, PthreadRwlock>,
+    /// Guest pthread thread-attribute objects, keyed by both the guest
+    /// `pthread_attr_t` address and its allocated handle.
+    pub pthread_attrs: DashMap<u64, PthreadAttr>,
+}
+
+/// A guest pthread thread-attribute object (`pthread_attr_t`) — the stack
+/// size, detach state, guard size, and scheduling parameters a title sets
+/// before `scePthreadCreate`. Pure configuration data with no runtime
+/// dependency; defaults match SharpEmu's `PthreadAttrState.Default` (GPL-2.0).
+#[derive(Clone, Copy, Debug)]
+pub struct PthreadAttr {
+    /// 0 = joinable, 1 = detached.
+    pub detach_state: i32,
+    /// Requested stack size in bytes (default 1 MiB).
+    pub stack_size: u64,
+    /// Guard-page size in bytes (default 4 KiB).
+    pub guard_size: u64,
+    /// Scheduling policy (default 1).
+    pub sched_policy: i32,
+    /// Scheduling priority.
+    pub sched_priority: i32,
+}
+
+impl Default for PthreadAttr {
+    fn default() -> Self {
+        Self {
+            detach_state: 0,
+            stack_size: 0x10_0000,
+            guard_size: 0x1000,
+            sched_policy: 1,
+            sched_priority: 700,
+        }
+    }
 }
 
 /// State of a guest pthread read-write lock. Single-active-execution means one
@@ -197,6 +230,7 @@ impl OrbisKernel {
             pthread_mutexes: DashMap::new(),
             pthread_mutex_attrs: DashMap::new(),
             pthread_rwlocks: DashMap::new(),
+            pthread_attrs: DashMap::new(),
         }
     }
 
