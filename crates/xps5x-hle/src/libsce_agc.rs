@@ -53,6 +53,17 @@ const R_FLIP: u32 = 0x17;
 const DRAW_AUTO_MODIFIER: u64 = 0x4000_0000;
 /// Generic SCE "invalid argument" error (`0x8002_0000 | EINVAL`).
 const SCE_ERROR_INVALID_ARGUMENT: u64 = 0x8002_0016;
+/// Generic SCE "memory fault" error (`0x8002_0000 | EFAULT`).
+const SCE_ERROR_MEMORY_FAULT: u64 = 0x8002_000E;
+
+// PrimState shader-register layout (byte offsets, from SharpEmu).
+const SHADER_SPECIALS_OFFSET: u64 = 0x28;
+const SPECIAL_GE_CNTL_OFFSET: u64 = 0x00;
+const SPECIAL_VGT_SHADER_STAGES_EN_OFFSET: u64 = 0x08;
+const SPECIAL_VGT_GS_OUT_PRIM_TYPE_OFFSET: u64 = 0x20;
+const SPECIAL_GE_USER_VGPR_EN_OFFSET: u64 = 0x28;
+/// `VGT_PRIMITIVE_TYPE` register offset.
+const VGT_PRIMITIVE_TYPE: u32 = 0x242;
 
 /// Register the libSceAgc DCB command emitters.
 pub fn register(registry: &HleRegistry) {
@@ -109,6 +120,48 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcDcbSetUcRegistersIndirect",
         hle_dcb_set_uc_regs_indirect,
     );
+    registry.register("libSceAgc", "sceAgcCreatePrimState", hle_create_prim_state);
+}
+
+/// Copy an 8-byte shader register (offset:u32, value:u32) from `src` to `dst`.
+fn copy_shader_register(ctx: &HleContext, src: u64, dst: u64) -> bool {
+    let mut buf = [0u8; 8];
+    ctx.mem.read(src, &mut buf) && ctx.mem.write(dst, &buf)
+}
+
+/// `sceAgcCreatePrimState(cxRegisters, ucRegisters, hullShader, geometryShader,
+/// primitiveType)`: assemble the primitive-state register block by copying
+/// stage-enable / prim-type / GE registers out of the geometry shader's
+/// "specials" table, then writing the VGT primitive type. Faithful to
+/// SharpEmu's offsets.
+fn hle_create_prim_state(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cx = args.first().copied().unwrap_or(0);
+    let uc = args.get(1).copied().unwrap_or(0);
+    let hull = args.get(2).copied().unwrap_or(0);
+    let geometry = args.get(3).copied().unwrap_or(0);
+    let primitive_type = args.get(4).copied().unwrap_or(0) as u32;
+    if cx == 0 || uc == 0 || hull != 0 || geometry == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    // The geometry shader points at a "specials" register table.
+    let mut sp = [0u8; 8];
+    if !ctx.mem.read(geometry + SHADER_SPECIALS_OFFSET, &mut sp) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    let specials = u64::from_le_bytes(sp);
+    if specials == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    let ok = copy_shader_register(ctx, specials + SPECIAL_VGT_SHADER_STAGES_EN_OFFSET, cx)
+        && copy_shader_register(ctx, specials + SPECIAL_VGT_GS_OUT_PRIM_TYPE_OFFSET, cx + 8)
+        && copy_shader_register(ctx, specials + SPECIAL_GE_CNTL_OFFSET, uc)
+        && copy_shader_register(ctx, specials + SPECIAL_GE_USER_VGPR_EN_OFFSET, uc + 8)
+        && ctx.mem.write(uc + 16, &VGT_PRIMITIVE_TYPE.to_le_bytes())
+        && ctx.mem.write(uc + 20, &primitive_type.to_le_bytes());
+    if !ok {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
 }
 
 /// Supported Agc register-defaults versions (see `sceAgcInit`).
@@ -890,6 +943,45 @@ mod tests {
         assert_eq!(read_u32(&ctx, cx), pm4(4, IT_NOP, R_CX_REGS_INDIRECT));
         let uc = hle_dcb_set_uc_regs_indirect(&ctx, &[cb, regs, 1]);
         assert_eq!(read_u32(&ctx, uc), pm4(4, IT_NOP, R_UC_REGS_INDIRECT));
+    }
+
+    #[test]
+    fn create_prim_state_copies_specials_and_writes_prim_type() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // Geometry shader at 0x200 → specials table pointer at +0x28.
+        let geometry: u64 = 0x200;
+        let specials: u64 = 0x280;
+        assert!(
+            ctx.mem
+                .write(geometry + SHADER_SPECIALS_OFFSET, &specials.to_le_bytes())
+        );
+        // Specials entries: (offset, value) pairs at the documented sub-offsets.
+        assert!(ctx.mem.write(
+            specials + SPECIAL_VGT_SHADER_STAGES_EN_OFFSET,
+            &[0x11u8, 0, 0, 0, 0xAA, 0, 0, 0]
+        ));
+        assert!(ctx.mem.write(
+            specials + SPECIAL_GE_CNTL_OFFSET,
+            &[0x22u8, 0, 0, 0, 0xBB, 0, 0, 0]
+        ));
+        let cx = 0x100;
+        let uc = 0x140;
+        assert_eq!(hle_create_prim_state(&ctx, &[cx, uc, 0, geometry, 5]), 0);
+        // Stage-enable pair copied to cx[0..8].
+        assert_eq!(read_u32(&ctx, cx), 0x11);
+        assert_eq!(read_u32(&ctx, cx + 4), 0xAA);
+        // GE_CNTL pair copied to uc[0..8].
+        assert_eq!(read_u32(&ctx, uc), 0x22);
+        assert_eq!(read_u32(&ctx, uc + 4), 0xBB);
+        // VGT primitive type + the caller's primitive type.
+        assert_eq!(read_u32(&ctx, uc + 16), VGT_PRIMITIVE_TYPE);
+        assert_eq!(read_u32(&ctx, uc + 20), 5);
+        // Validation: a non-zero hull shader is rejected.
+        assert_eq!(
+            hle_create_prim_state(&ctx, &[cx, uc, 1, geometry, 5]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
     }
 
     #[test]
