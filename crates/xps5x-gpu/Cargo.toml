@@ -17,3 +17,9 @@ bytemuck = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 raw-window-handle = { workspace = true }
+
+[dev-dependencies]
+# SPIR-V structural validator for the shader-emitter tests. Used under its MIT
+# license option (GPL-2.0-only compatible). Test-only — not linked into the
+# distributed emulator. See docs/reference-port-ledger.md (SPIR-V body rows).
+rspirv = "0.12"

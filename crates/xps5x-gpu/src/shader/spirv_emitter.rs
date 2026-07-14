@@ -334,6 +334,54 @@ mod tests {
         out
     }
 
+    /// Every emitted module must parse as structurally-valid SPIR-V through
+    /// rspirv (magic/version, per-instruction word counts, operand layout).
+    /// This is a real external structural check — stronger than reading raw
+    /// words by hand — short of full `spirv-val` semantic validation.
+    #[test]
+    fn every_stage_parses_as_structural_spirv() {
+        for ty in [
+            ShaderType::Vertex,
+            ShaderType::Pixel,
+            ShaderType::Compute,
+            ShaderType::Geometry,
+            ShaderType::Hull,
+            ShaderType::Domain,
+        ] {
+            let module = emit_spirv(&prog(ty)).unwrap();
+            let parsed = rspirv::dr::load_words(&module);
+            assert!(
+                parsed.is_ok(),
+                "stage {ty:?} must parse as SPIR-V: {:?}",
+                parsed.err()
+            );
+        }
+    }
+
+    #[test]
+    fn a_module_with_a_constant_pool_parses() {
+        use crate::shader::ir::{IrNode, IrOp};
+        let program = IrProgram {
+            nodes: vec![IrNode {
+                op: IrOp::IAdd,
+                result: Some(IrValue::Reg(0)),
+                sources: vec![IrValue::ConstI32(7), IrValue::ConstU32(0xDEAD_BEEF)],
+            }],
+            shader_type: ShaderType::Vertex,
+            input_count: 0,
+            output_count: 0,
+            ubo_count: 0,
+            texture_count: 0,
+        };
+        let module = emit_spirv(&program).unwrap();
+        let parsed = rspirv::dr::load_words(&module);
+        assert!(
+            parsed.is_ok(),
+            "a module carrying an OpConstant pool must still parse: {:?}",
+            parsed.err()
+        );
+    }
+
     #[test]
     fn integer_constants_are_materialized_once_in_the_constant_pool() {
         use crate::shader::ir::{IrNode, IrOp};
