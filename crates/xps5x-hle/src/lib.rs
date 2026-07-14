@@ -34,6 +34,7 @@ pub mod libsce_app_content;
 pub mod libsce_audio_out;
 pub mod libsce_common_dialog;
 pub mod libsce_disc_map;
+pub mod libsce_fiber;
 pub mod libsce_gnm_driver;
 pub mod libsce_json;
 pub mod libsce_media;
@@ -178,6 +179,7 @@ impl HleRegistry {
         libsce_rtc::register(&registry);
         libsce_peripheral::register(&registry);
         libsce_json::register(&registry);
+        libsce_fiber::register(&registry);
         libsce_media::register(&registry);
         libsce_agc::register(&registry);
         libsce_ampr::register(&registry);

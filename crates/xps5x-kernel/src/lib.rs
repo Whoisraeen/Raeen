@@ -171,6 +171,8 @@ pub struct OrbisKernel {
     /// AMPR command-buffer write offsets, keyed by the command-buffer address
     /// (the current write cursor `sceAmprCommandBufferGetCurrentOffset` reads).
     pub ampr_write_offsets: DashMap<u64, u64>,
+    /// The libSceFiber context-size-check profiling toggle (0 = off, 1 = on).
+    pub fiber_context_size_check: std::sync::atomic::AtomicU32,
     /// Guest network sockets (offline — no host connectivity), keyed by fd.
     pub kernel_sockets: DashMap<i32, GuestSocket>,
     /// Next socket fd to hand out (a high range, distinct from VFS fds).
@@ -320,6 +322,7 @@ impl OrbisKernel {
             kernel_equeue_next: std::sync::atomic::AtomicU64::new(1),
             agc_default_owner: std::sync::atomic::AtomicU32::new(0),
             ampr_write_offsets: DashMap::new(),
+            fiber_context_size_check: std::sync::atomic::AtomicU32::new(0),
             kernel_sockets: DashMap::new(),
             kernel_socket_next: std::sync::atomic::AtomicI32::new(0x4000_0000),
             pthread_tls_keys: DashMap::new(),
