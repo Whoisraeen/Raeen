@@ -288,6 +288,48 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "sceKernelIsNeoMode", hle_is_neo_mode);
     registry.register("libkernel", "sceKernelGetCpumode", hle_get_cpumode);
     registry.register("libkernel", "sceKernelError", hle_kernel_error);
+    registry.register(
+        "libkernel",
+        "sceKernelGetCompiledSdkVersion",
+        hle_get_compiled_sdk_version,
+    );
+    registry.register("libkernel", "getpid", hle_getpid);
+    registry.register("libkernel", "sceKernelGetProcessId", hle_getpid);
+}
+
+/// The PS5 (Gen5) compiled-SDK version XPS5X reports: `0x09000000` == SDK
+/// 9.00 (same value SharpEmu's `Gen5CompiledSdkVersion` reports). Homebrew
+/// commonly gates feature use on this.
+const GEN5_SDK_VERSION: u32 = 0x0900_0000;
+
+/// `SCE_KERNEL_ERROR_EINVAL` (`0x80020016`): invalid argument (EINVAL = 22).
+const SCE_KERNEL_ERROR_EINVAL: u64 = 0x8002_0016;
+
+/// A fixed, plausible process id XPS5X reports for the single guest process.
+const GUEST_PID: u64 = 0x2A2A; // arbitrary stable nonzero pid
+
+/// Real `sceKernelGetCompiledSdkVersion(unsigned int *version)` (M1
+/// hardening, reference SharpEmu KernelExports): writes the PS5 SDK version
+/// through the out-param and returns `SCE_OK`. A NULL pointer is `EINVAL`
+/// (matching SharpEmu), and an unwritable one is `EFAULT`.
+fn hle_get_compiled_sdk_version(ctx: &HleContext, args: &[u64]) -> u64 {
+    let version_ptr = args.first().copied().unwrap_or(0);
+    debug!("sceKernelGetCompiledSdkVersion(version={version_ptr:#x})");
+    if version_ptr == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    if !ctx.mem.write(version_ptr, &GEN5_SDK_VERSION.to_le_bytes()) {
+        warn!("sceKernelGetCompiledSdkVersion: version out-pointer {version_ptr:#x} not writable — EFAULT");
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    SCE_OK
+}
+
+/// `getpid()` / `sceKernelGetProcessId()`: the single guest process's pid.
+/// A real, stable nonzero value (some homebrew keys temp paths / logs on it).
+fn hle_getpid(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    debug!("getpid() -> {GUEST_PID:#x}");
+    GUEST_PID
 }
 
 // ---------------------------------------------------------------------
@@ -842,6 +884,38 @@ mod tests {
         assert_eq!(
             hle_clock_gettime(&ctx, &[0, 0xDEAD_0000]),
             SCE_KERNEL_ERROR_EFAULT
+        );
+    }
+
+    /// M1 hardening: GetCompiledSdkVersion writes the PS5 SDK version out and
+    /// validates its pointer; getpid returns a stable nonzero pid.
+    #[test]
+    fn compiled_sdk_version_and_getpid() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(hle_get_compiled_sdk_version(&ctx, &[0x40]), SCE_OK);
+        let mut v = [0u8; 4];
+        assert!(mem.read(0x40, &mut v));
+        assert_eq!(u32::from_le_bytes(v), GEN5_SDK_VERSION, "PS5 SDK 9.00");
+
+        assert_eq!(
+            hle_get_compiled_sdk_version(&ctx, &[0]),
+            SCE_KERNEL_ERROR_EINVAL,
+            "NULL → EINVAL"
+        );
+        assert_eq!(
+            hle_get_compiled_sdk_version(&ctx, &[0xDEAD_0000]),
+            SCE_KERNEL_ERROR_EFAULT
+        );
+
+        assert_ne!(hle_getpid(&ctx, &[]), 0, "pid must be nonzero");
+        assert_eq!(
+            hle_getpid(&ctx, &[]),
+            hle_getpid(&ctx, &[]),
+            "pid is stable"
         );
     }
 
