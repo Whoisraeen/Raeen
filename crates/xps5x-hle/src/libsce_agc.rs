@@ -43,6 +43,8 @@ const R_WAIT_MEM32: u32 = 0x0A;
 const R_WAIT_MEM64: u32 = 0x16;
 const R_RELEASE_MEM: u32 = 0x18;
 const R_DMA_DATA: u32 = 0x19;
+const R_ACQUIRE_MEM: u32 = 0x14;
+const R_WRITE_DATA: u32 = 0x15;
 /// Marker DWORD preceding a `CbSetShRegisterRange` packet.
 const SET_SH_RANGE_MARKER: u32 = 0x6875_000D;
 const R_ZERO: u32 = 0x00;
@@ -126,9 +128,18 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceAgc", "sceAgcInit", hle_init);
     registry.register("libSceAgc", "sceAgcDcbEventWrite", hle_dcb_event_write);
     registry.register("libSceAgc", "sceAgcAcbEventWrite", hle_acb_event_write);
-    registry.register("libSceAgc", "sceAgcAcbWriteData", hle_acb_write_data);
-    // AcbDispatchIndirect emits the identical indirect-dispatch packet.
-    registry.register("libSceAgc", "sceAgcAcbDispatchIndirect", hle_acb_write_data);
+    // sceAgcAcbWriteData is an alias of sceAgcDcbWriteData in the reference
+    // (`AcbWriteData(ctx) => DcbWriteData(ctx)`) — both emit a WRITE_DATA packet.
+    registry.register("libSceAgc", "sceAgcDcbWriteData", hle_dcb_write_data);
+    registry.register("libSceAgc", "sceAgcAcbWriteData", hle_dcb_write_data);
+    registry.register(
+        "libSceAgc",
+        "sceAgcAcbDispatchIndirect",
+        hle_acb_dispatch_indirect,
+    );
+    registry.register("libSceAgc", "sceAgcDcbWaitRegMem", hle_dcb_wait_reg_mem);
+    registry.register("libSceAgc", "sceAgcDcbDmaData", hle_dcb_dma_data);
+    registry.register("libSceAgc", "sceAgcDcbAcquireMem", hle_dcb_acquire_mem);
     registry.register(
         "libSceAgc",
         "sceAgcDcbSetCxRegistersIndirect",
@@ -933,10 +944,10 @@ fn hle_dcb_set_uc_regs_indirect(ctx: &HleContext, args: &[u64]) -> u64 {
     dcb_set_registers_indirect(ctx, args, R_UC_REGS_INDIRECT)
 }
 
-/// `sceAgcAcbWriteData` / `sceAgcAcbDispatchIndirect(acb, argumentsAddress,
-/// modifier)`: emit an indirect dispatch packet (4 DWORDs) with the arguments
-/// address + initiator. (Both NIDs emit the identical packet.)
-fn hle_acb_write_data(ctx: &HleContext, args: &[u64]) -> u64 {
+/// `sceAgcAcbDispatchIndirect(acb, argumentsAddress, modifier)`: emit an
+/// indirect dispatch packet (4 DWORDs) with the split arguments address +
+/// initiator. Mirrors SharpEmu's `AcbDispatchIndirect`.
+fn hle_acb_dispatch_indirect(ctx: &HleContext, args: &[u64]) -> u64 {
     let cb = args.first().copied().unwrap_or(0);
     let arguments = args.get(1).copied().unwrap_or(0);
     let modifier = args.get(2).copied().unwrap_or(0) as u32;
@@ -955,6 +966,203 @@ fn hle_acb_write_data(ctx: &HleContext, args: &[u64]) -> u64 {
             .mem
             .write(addr + 8, &((arguments >> 32) as u32).to_le_bytes())
         && ctx.mem.write(addr + 12, &initiator.to_le_bytes());
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcDcbWriteData(dcb, destination, cachePolicy, destinationAddress,
+/// dataAddress, dwordCount, increment, writeConfirm)`: emit a WRITE_DATA packet
+/// (`dwordCount + 4` DWORDs) copying `dwordCount` inline DWORDs from
+/// `dataAddress`. `increment` (arg7) and `writeConfirm` (arg8) arrive on the
+/// stack — captured by the runtime dispatch into `args[6]` / `args[7]` (SysV
+/// arg7 at `[Rsp+8]`, arg8 at `[Rsp+16]`). Mirrors SharpEmu's `DcbWriteData`;
+/// also serves `sceAgcAcbWriteData` (an alias). Returns the command address, or
+/// 0 on failure.
+fn hle_dcb_write_data(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let destination = (args.get(1).copied().unwrap_or(0) & 0xFF) as u32;
+    let cache_policy = (args.get(2).copied().unwrap_or(0) & 0xFF) as u32;
+    let destination_address = args.get(3).copied().unwrap_or(0);
+    let data_address = args.get(4).copied().unwrap_or(0);
+    let dword_count = args.get(5).copied().unwrap_or(0) as u32;
+    let increment = (args.get(6).copied().unwrap_or(0) & 0xFF) as u32;
+    let write_confirm = (args.get(7).copied().unwrap_or(0) & 0xFF) as u32;
+    if cb == 0 || destination_address == 0 || data_address == 0 || dword_count > 0x3FFD {
+        return 0;
+    }
+    let packet_dwords = dword_count + 4;
+    let Some(addr) = alloc_command_dwords(ctx, cb, u64::from(packet_dwords)) else {
+        return 0;
+    };
+    let control = destination | (cache_policy << 8) | (increment << 16) | (write_confirm << 24);
+    let ok = ctx.mem.write(
+        addr,
+        &pm4(packet_dwords, IT_NOP, R_WRITE_DATA).to_le_bytes(),
+    ) && ctx.mem.write(addr + 4, &control.to_le_bytes())
+        && ctx
+            .mem
+            .write(addr + 8, &(destination_address as u32).to_le_bytes())
+        && ctx.mem.write(
+            addr + 12,
+            &((destination_address >> 32) as u32).to_le_bytes(),
+        );
+    if !ok {
+        return 0;
+    }
+    for index in 0..u64::from(dword_count) {
+        let mut buf = [0u8; 4];
+        if !ctx.mem.read(data_address + index * 4, &mut buf)
+            || !ctx.mem.write(addr + 16 + index * 4, &buf)
+        {
+            return 0;
+        }
+    }
+    addr
+}
+
+/// `sceAgcDcbWaitRegMem(dcb, size, compareFunction, operation, cachePolicy,
+/// address, reference, mask, pollCycles)`: emit a WAIT_REG_MEM / conditional
+/// poll packet. `reference` (arg7), `mask` (arg8) and `pollCycles` (arg9) are
+/// stack args → `args[6]` / `args[7]` / `args[8]`. Mirrors SharpEmu's
+/// `DcbWaitRegMem`. Returns the command address, or 0 on failure.
+fn hle_dcb_wait_reg_mem(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let size = (args.get(1).copied().unwrap_or(0) & 0xFF) as u32;
+    let compare = (args.get(2).copied().unwrap_or(0) & 0xFF) as u32;
+    let operation = (args.get(3).copied().unwrap_or(0) & 0xFF) as u32;
+    let cache_policy = (args.get(4).copied().unwrap_or(0) & 0xFF) as u32;
+    let address = args.get(5).copied().unwrap_or(0);
+    let reference = args.get(6).copied().unwrap_or(0);
+    let mask = args.get(7).copied().unwrap_or(0);
+    let poll_cycles = args.get(8).copied().unwrap_or(0) as u32;
+    if cb == 0 || size > 1 || compare > 7 || operation > 4 || cache_policy > 3 {
+        return 0;
+    }
+    let standard_wait = operation == 2 || operation == 3;
+    let packet_dwords = if standard_wait {
+        7
+    } else if size == 0 {
+        6
+    } else {
+        9
+    };
+    let packet_register = if size == 0 {
+        R_WAIT_MEM32
+    } else {
+        R_WAIT_MEM64
+    };
+    let Some(addr) = alloc_command_dwords(ctx, cb, u64::from(packet_dwords)) else {
+        return 0;
+    };
+    let w = |off: u64, v: u32| ctx.mem.write(addr + off, &v.to_le_bytes());
+    let ok = if standard_wait {
+        w(0, pm4(packet_dwords, IT_WAIT_REG_MEM, R_ZERO))
+            && w(4, compare | ((operation & 1) << 8))
+            && w(8, address as u32)
+            && w(12, (address >> 32) as u32)
+            && w(16, reference as u32)
+            && w(20, mask as u32)
+            && w(24, poll_cycles / 40)
+    } else {
+        let head = w(0, pm4(packet_dwords, IT_NOP, packet_register))
+            && w(4, address as u32)
+            && w(8, (address >> 32) as u32)
+            && w(12, mask as u32);
+        if !head {
+            false
+        } else if size == 0 {
+            w(16, compare | (operation << 8)) && w(20, reference as u32)
+        } else {
+            w(16, (mask >> 32) as u32)
+                && w(20, reference as u32)
+                && w(24, (reference >> 32) as u32)
+                && w(28, compare | (operation << 8))
+                && w(32, poll_cycles / 40)
+        }
+    };
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcDcbDmaData(dcb, destination, destinationCachePolicy, source,
+/// destinationAddress, sourceCachePolicy, control4, sourceAddress, byteCount,
+/// control7, control8, control9)`: emit a DMA_DATA packet (8 DWORDs). Args 7–12
+/// are on the stack → `args[6]`..`args[11]`. Mirrors SharpEmu's `DcbDmaData`.
+/// Returns the command address, or 0 on failure.
+fn hle_dcb_dma_data(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let destination = (args.get(1).copied().unwrap_or(0) & 0xFF) as u32;
+    let dst_cache = (args.get(2).copied().unwrap_or(0) & 0xFF) as u32;
+    let source = (args.get(3).copied().unwrap_or(0) & 0xFF) as u32;
+    let destination_address = args.get(4).copied().unwrap_or(0);
+    let src_cache = (args.get(5).copied().unwrap_or(0) & 0xFF) as u32;
+    let control4 = (args.get(6).copied().unwrap_or(0) & 0xFF) as u32;
+    let source_address = args.get(7).copied().unwrap_or(0);
+    let byte_count = args.get(8).copied().unwrap_or(0) as u32;
+    let control7 = (args.get(9).copied().unwrap_or(0) & 0xFF) as u32;
+    let control8 = (args.get(10).copied().unwrap_or(0) & 0xFF) as u32;
+    let control9 = (args.get(11).copied().unwrap_or(0) & 0xFF) as u32;
+    if cb == 0 || byte_count == 0 || byte_count & 3 != 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 8) else {
+        return 0;
+    };
+    let control0 = destination | (dst_cache << 8) | (source << 16) | (src_cache << 24);
+    let control_ext = control4 | (control7 << 8) | (control8 << 16) | (control9 << 24);
+    let ok = ctx
+        .mem
+        .write(addr, &pm4(8, IT_NOP, R_DMA_DATA).to_le_bytes())
+        && ctx.mem.write(addr + 4, &control0.to_le_bytes())
+        && ctx.mem.write(addr + 8, &control_ext.to_le_bytes())
+        && ctx.mem.write(addr + 12, &byte_count.to_le_bytes())
+        && ctx.mem.write(addr + 16, &destination_address.to_le_bytes())
+        && ctx.mem.write(addr + 24, &source_address.to_le_bytes());
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcDcbAcquireMem(dcb, engine, cbDbOp, gcrControl, baseAddress, sizeBytes,
+/// pollCycles)`: emit an ACQUIRE_MEM packet (8 DWORDs). `pollCycles` (arg7) is a
+/// stack arg → `args[6]`. `sizeBytes == u64::MAX` means "no size". Mirrors
+/// SharpEmu's `DcbAcquireMem`. Returns the command address, or 0 on failure.
+fn hle_dcb_acquire_mem(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let engine = (args.get(1).copied().unwrap_or(0) & 0xFF) as u32;
+    let cb_db_op = args.get(2).copied().unwrap_or(0) as u32;
+    let gcr_control = args.get(3).copied().unwrap_or(0) as u32;
+    let base_address = args.get(4).copied().unwrap_or(0);
+    let size_bytes = args.get(5).copied().unwrap_or(0);
+    let poll_cycles = args.get(6).copied().unwrap_or(0) as u32;
+    let no_size = size_bytes == u64::MAX;
+    if cb == 0
+        || engine > 1
+        || (!no_size && size_bytes & 0xFF != 0)
+        || (!no_size && size_bytes >> 40 != 0)
+        || base_address & 0xFF != 0
+        || base_address >> 40 != 0
+    {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 8) else {
+        return 0;
+    };
+    let size_field = if no_size { 0 } else { (size_bytes >> 8) as u32 };
+    let w = |off: u64, v: u32| ctx.mem.write(addr + off, &v.to_le_bytes());
+    let ok = w(0, pm4(8, IT_NOP, R_ACQUIRE_MEM))
+        && w(4, (engine << 31) | cb_db_op)
+        && w(8, size_field)
+        && w(12, 0)
+        && w(16, (base_address >> 8) as u32)
+        && w(20, 0)
+        && w(24, poll_cycles / 40)
+        && w(28, gcr_control);
     if !ok {
         return 0;
     }
@@ -1689,12 +1897,133 @@ mod tests {
         assert_eq!(read_u32(&ctx, a2), pm4(2, IT_EVENT_WRITE, R_ZERO));
         assert_eq!(read_u32(&ctx, a2 + 4), 0x14);
 
-        // AcbWriteData: 4-dword indirect dispatch with a split args address.
-        let a = hle_acb_write_data(&ctx, &[cb, 0x00AB_1234_5678_0000, 0]);
+        // AcbDispatchIndirect: 4-dword indirect dispatch with a split args address.
+        let a = hle_acb_dispatch_indirect(&ctx, &[cb, 0x00AB_1234_5678_0000, 0]);
         assert_eq!(read_u32(&ctx, a), pm4(4, IT_DISPATCH_INDIRECT, R_ZERO));
         assert_eq!(read_u32(&ctx, a + 4), 0x5678_0000, "args low");
         assert_eq!(read_u32(&ctx, a + 8), 0x00AB_1234, "args high");
         assert_eq!(read_u32(&ctx, a + 12), 0x41, "initiator");
+    }
+
+    #[test]
+    fn dcb_write_data_copies_inline_dwords_with_stack_args() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        // Seed two source DWORDs at 0x300.
+        let src = 0x300u64;
+        assert!(ctx.mem.write(src, &0xDEAD_BEEFu32.to_le_bytes()));
+        assert!(ctx.mem.write(src + 4, &0xCAFE_F00Du32.to_le_bytes()));
+        // args: dcb, destination=2, cachePolicy=1, destAddr, dataAddr, count=2,
+        // increment=1 (arg7 → args[6]), writeConfirm=1 (arg8 → args[7]).
+        let dst_addr = 0x0000_0012_3456_0000u64;
+        let ret = hle_dcb_write_data(&ctx, &[cb, 2, 1, dst_addr, src, 2, 1, 1]);
+        assert_eq!(ret, 0x400);
+        assert_eq!(
+            read_u32(&ctx, 0x400),
+            pm4(2 + 4, IT_NOP, R_WRITE_DATA),
+            "header"
+        );
+        // control = dst | cache<<8 | increment<<16 | confirm<<24.
+        assert_eq!(read_u32(&ctx, 0x404), 2 | (1 << 8) | (1 << 16) | (1 << 24));
+        assert_eq!(read_u32(&ctx, 0x408), dst_addr as u32, "dst low");
+        assert_eq!(read_u32(&ctx, 0x40C), (dst_addr >> 32) as u32, "dst high");
+        assert_eq!(read_u32(&ctx, 0x410), 0xDEAD_BEEF, "inline dword 0");
+        assert_eq!(read_u32(&ctx, 0x414), 0xCAFE_F00D, "inline dword 1");
+        // A count over 0x3FFD is rejected.
+        assert_eq!(
+            hle_dcb_write_data(&ctx, &[cb, 0, 0, dst_addr, src, 0x3FFE, 0, 0]),
+            0
+        );
+    }
+
+    #[test]
+    fn dcb_wait_reg_mem_standard_and_wait_variants() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        // operation=2 → standard wait (7 dwords, WAIT_REG_MEM op).
+        // args: dcb, size=0, compare=3, op=2, cache=0, address,
+        // reference (args[6]), mask (args[7]), pollCycles=80 (args[8]).
+        let addr = 0x0000_0000_ABCD_0000u64;
+        let ret = hle_dcb_wait_reg_mem(&ctx, &[cb, 0, 3, 2, 0, addr, 0x11, 0x22, 80]);
+        assert_eq!(ret, 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(7, IT_WAIT_REG_MEM, R_ZERO));
+        // standard-wait folds only op's low bit: (operation & 1) with op=2 → 0.
+        assert_eq!(read_u32(&ctx, 0x404), 3, "compare | ((op & 1) << 8)");
+        assert_eq!(read_u32(&ctx, 0x418), 80 / 40, "poll cycles /40");
+        // size=0, op=0 → compact WAIT_MEM32 (6 dwords).
+        let ret2 = hle_dcb_wait_reg_mem(&ctx, &[cb, 0, 1, 0, 0, addr, 0x33, 0x44, 40]);
+        assert_eq!(read_u32(&ctx, ret2), pm4(6, IT_NOP, R_WAIT_MEM32));
+        assert_eq!(read_u32(&ctx, ret2 + 12), 0x44, "mask low");
+        assert_eq!(read_u32(&ctx, ret2 + 16), 1, "compare|op (op=0)");
+        // Out-of-range compare is rejected.
+        assert_eq!(
+            hle_dcb_wait_reg_mem(&ctx, &[cb, 0, 8, 0, 0, addr, 0, 0, 0]),
+            0
+        );
+    }
+
+    #[test]
+    fn dcb_dma_data_packs_control_and_addresses() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let dst = 0x0000_0011_1111_0000u64;
+        let src = 0x0000_0022_2222_0000u64;
+        // args 7-12 on stack: control4, sourceAddress, byteCount, control7..9.
+        let ret = hle_dcb_dma_data(
+            &ctx,
+            &[cb, 1, 2, 3, dst, 0, 0xAA, src, 16, 0xBB, 0xCC, 0xDD],
+        );
+        assert_eq!(ret, 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(8, IT_NOP, R_DMA_DATA));
+        assert_eq!(
+            read_u32(&ctx, 0x404),
+            1 | (2 << 8) | (3 << 16),
+            "control0 (src_cache=0)"
+        );
+        assert_eq!(
+            read_u32(&ctx, 0x408),
+            0xAA | (0xBB << 8) | (0xCC << 16) | (0xDD << 24)
+        );
+        assert_eq!(read_u32(&ctx, 0x40C), 16, "byte count");
+        assert_eq!(read_u64(&ctx, 0x410), dst, "dst address");
+        assert_eq!(read_u64(&ctx, 0x418), src, "src address");
+        // Unaligned byte count rejected.
+        assert_eq!(
+            hle_dcb_dma_data(&ctx, &[cb, 0, 0, 0, dst, 0, 0, src, 3, 0, 0, 0]),
+            0
+        );
+    }
+
+    #[test]
+    fn dcb_acquire_mem_encodes_engine_and_size() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let base = 0x0000_0000_1234_0000u64; // low byte 0, top-40 clear.
+        // pollCycles=80 is arg7 → args[6]. sizeBytes=0x100 (256).
+        let ret = hle_dcb_acquire_mem(&ctx, &[cb, 1, 0xF, 0x7, base, 0x100, 80]);
+        assert_eq!(ret, 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(8, IT_NOP, R_ACQUIRE_MEM));
+        assert_eq!(read_u32(&ctx, 0x404), (1u32 << 31) | 0xF, "engine|cbDbOp");
+        assert_eq!(read_u32(&ctx, 0x408), (0x100u64 >> 8) as u32, "size >>8");
+        assert_eq!(read_u32(&ctx, 0x410), (base >> 8) as u32, "base >>8");
+        assert_eq!(read_u32(&ctx, 0x418), 80 / 40, "poll /40");
+        assert_eq!(read_u32(&ctx, 0x41C), 0x7, "gcr control");
+        // no-size sentinel writes 0 in the size field.
+        let ret2 = hle_dcb_acquire_mem(&ctx, &[cb, 0, 0, 0, base, u64::MAX, 40]);
+        assert_eq!(read_u32(&ctx, ret2 + 8), 0, "no-size → 0");
+        // engine > 1 rejected.
+        assert_eq!(
+            hle_dcb_acquire_mem(&ctx, &[cb, 2, 0, 0, base, 0x100, 40]),
+            0
+        );
     }
 
     #[test]
