@@ -40,6 +40,7 @@ pub mod libsce_user_service;
 pub mod libsce_video_out;
 pub mod pthread_attr;
 pub mod pthread_sync;
+pub mod pthread_thread;
 pub mod pthread_tls;
 
 use dashmap::DashMap;
@@ -140,6 +141,8 @@ impl HleRegistry {
         pthread_attr::register(&registry);
         // pthread thread-specific data (TLS keys).
         pthread_tls::register(&registry);
+        // pthread thread identity/control (self / equal / yield / rename).
+        pthread_thread::register(&registry);
         libc::register(&registry);
         libsce_sysmodule::register(&registry);
         libsce_video_out::register(&registry);
