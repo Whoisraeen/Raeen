@@ -571,19 +571,75 @@ fn hle_get_current_cpu(_ctx: &HleContext, _args: &[u64]) -> u64 {
     0
 }
 
-fn hle_gettimeofday(_ctx: &HleContext, _args: &[u64]) -> u64 {
-    // Real function writes a `struct timeval` out-parameter; not yet wired
-    // up here. Report success only.
-    debug!("sceKernelGettimeofday()");
-    0
+/// Host wall-clock time since the Unix epoch as `(seconds, sub-second
+/// nanos)`. Clamps a pre-epoch host clock to zero rather than panicking.
+fn host_realtime() -> (i64, i64) {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => (d.as_secs() as i64, d.subsec_nanos() as i64),
+        Err(_) => (0, 0),
+    }
 }
 
-fn hle_clock_gettime(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!(
-        "sceKernelClockGettime(clockId={})",
-        args.first().copied().unwrap_or(0)
-    );
-    0
+/// Real `sceKernelGettimeofday(struct timeval *tp, ...)` (M1 hardening):
+/// writes the host wall-clock time as a PS5 `timeval` — two little-endian
+/// `int64_t`s, `tv_sec` then `tv_usec` — through `tp`. A homebrew that
+/// timestamps or measures elapsed time now reads real, advancing values
+/// instead of zero. Unwritable `tp` is a loud `EFAULT`.
+fn hle_gettimeofday(ctx: &HleContext, args: &[u64]) -> u64 {
+    let tp = args.first().copied().unwrap_or(0);
+    debug!("sceKernelGettimeofday(tp={tp:#x})");
+    if tp == 0 {
+        return SCE_OK; // NULL tp is a defined no-op in the real API.
+    }
+    let (sec, nanos) = host_realtime();
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&sec.to_le_bytes());
+    buf[8..16].copy_from_slice(&(nanos / 1_000).to_le_bytes()); // tv_usec
+    if !ctx.mem.write(tp, &buf) {
+        warn!("sceKernelGettimeofday: timeval out-pointer {tp:#x} not writable — EFAULT");
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    SCE_OK
+}
+
+/// The PS5's BSD-derived `CLOCK_MONOTONIC` id. `CLOCK_REALTIME` is 0.
+const CLOCK_MONOTONIC: u64 = 4;
+
+/// Real `sceKernelClockGettime(clockId, struct timespec *tp)` (M1
+/// hardening): writes a PS5 `timespec` — two little-endian `int64_t`s,
+/// `tv_sec` then `tv_nsec` — through `tp`. `CLOCK_MONOTONIC` reports time
+/// since a fixed process-start reference (never goes backwards); every
+/// other clock id reports host wall-clock (`CLOCK_REALTIME` semantics).
+fn hle_clock_gettime(ctx: &HleContext, args: &[u64]) -> u64 {
+    let clock_id = args.first().copied().unwrap_or(0);
+    let tp = args.get(1).copied().unwrap_or(0);
+    debug!("sceKernelClockGettime(clockId={clock_id}, tp={tp:#x})");
+    if tp == 0 {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+
+    let (sec, nsec) = if clock_id == CLOCK_MONOTONIC {
+        let elapsed = process_start().elapsed();
+        (elapsed.as_secs() as i64, elapsed.subsec_nanos() as i64)
+    } else {
+        host_realtime()
+    };
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&sec.to_le_bytes());
+    buf[8..16].copy_from_slice(&nsec.to_le_bytes());
+    if !ctx.mem.write(tp, &buf) {
+        warn!("sceKernelClockGettime: timespec out-pointer {tp:#x} not writable — EFAULT");
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    SCE_OK
+}
+
+/// A fixed monotonic reference captured on first use, so `CLOCK_MONOTONIC`
+/// reports a stable, never-decreasing elapsed time across the process.
+fn process_start() -> std::time::Instant {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    *START.get_or_init(std::time::Instant::now)
 }
 
 /// Stub: plausible PS5 base-clock TSC frequency (1.6 GHz).
@@ -592,12 +648,29 @@ fn hle_get_tsc_frequency(_ctx: &HleContext, _args: &[u64]) -> u64 {
     1_600_000_000
 }
 
+/// Upper bound on how long one `sceKernelUsleep` will actually block the
+/// host thread, so a wild/huge `usec` (or a guest bug) can't wedge the
+/// emulator. 1 second is far longer than any per-frame sleep a title
+/// issues; a larger request is honored up to this cap and logged.
+const USLEEP_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Real `sceKernelUsleep(usec)` (M1 hardening): actually sleeps the host
+/// thread for `usec` microseconds (capped by [`USLEEP_MAX`]). A no-op sleep
+/// makes timing-driven homebrew busy-spin and burn 100% CPU; a real sleep
+/// yields, matching what the title expects between frames.
 fn hle_usleep(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!(
-        "sceKernelUsleep(usec={})",
-        args.first().copied().unwrap_or(0)
-    );
-    0
+    let usec = args.first().copied().unwrap_or(0);
+    debug!("sceKernelUsleep(usec={usec})");
+    let requested = std::time::Duration::from_micros(usec);
+    let dur = requested.min(USLEEP_MAX);
+    if dur < requested {
+        warn!(
+            "sceKernelUsleep: {usec}us capped to {}us (USLEEP_MAX)",
+            dur.as_micros()
+        );
+    }
+    std::thread::sleep(dur);
+    SCE_OK
 }
 
 /// Stub: returns a fake, non-null pointer value. The real function returns
@@ -629,7 +702,7 @@ fn hle_kernel_error(_ctx: &HleContext, _args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GuestMemory, test_ctx};
+    use crate::{test_ctx, GuestMemory};
 
     /// M1-C: `write(1, buf, n)` copies real guest bytes to the kernel
     /// console and returns `n`; stderr (fd 2) lands in the same capture; an
@@ -724,6 +797,66 @@ mod tests {
         assert_eq!(
             hle_dlsym(&ctx, &[handle, 0x200, 0x400]),
             SCE_KERNEL_ERROR_ENOENT
+        );
+    }
+
+    /// M1 hardening: the clock functions write real, plausible time into
+    /// their guest out-params instead of leaving them zero.
+    #[test]
+    fn gettimeofday_and_clock_gettime_write_real_time() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // gettimeofday: tv_sec must be a recent Unix timestamp (> 2020).
+        assert_eq!(hle_gettimeofday(&ctx, &[0x100]), SCE_OK);
+        let mut tv = [0u8; 16];
+        assert!(mem.read(0x100, &mut tv));
+        let tv_sec = i64::from_le_bytes(tv[0..8].try_into().unwrap());
+        let tv_usec = i64::from_le_bytes(tv[8..16].try_into().unwrap());
+        assert!(
+            tv_sec > 1_577_836_800,
+            "tv_sec must be a real epoch time, got {tv_sec}"
+        );
+        assert!(
+            (0..1_000_000).contains(&tv_usec),
+            "tv_usec must be in [0,1e6), got {tv_usec}"
+        );
+
+        // clock_gettime(CLOCK_MONOTONIC): tv_sec/tv_nsec well-formed, nsec in range.
+        assert_eq!(hle_clock_gettime(&ctx, &[CLOCK_MONOTONIC, 0x200]), SCE_OK);
+        let mut ts = [0u8; 16];
+        assert!(mem.read(0x200, &mut ts));
+        let tv_nsec = i64::from_le_bytes(ts[8..16].try_into().unwrap());
+        assert!(
+            (0..1_000_000_000).contains(&tv_nsec),
+            "tv_nsec must be in [0,1e9), got {tv_nsec}"
+        );
+
+        // Unwritable out-pointer → EFAULT, not a panic.
+        assert_eq!(
+            hle_gettimeofday(&ctx, &[0xDEAD_0000]),
+            SCE_KERNEL_ERROR_EFAULT
+        );
+        assert_eq!(
+            hle_clock_gettime(&ctx, &[0, 0xDEAD_0000]),
+            SCE_KERNEL_ERROR_EFAULT
+        );
+    }
+
+    /// usleep sleeps a real (bounded) amount and returns OK.
+    #[test]
+    fn usleep_sleeps_and_caps() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x10);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let t0 = std::time::Instant::now();
+        assert_eq!(hle_usleep(&ctx, &[2000]), SCE_OK); // 2 ms
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_millis(1),
+            "usleep must actually sleep"
         );
     }
 
