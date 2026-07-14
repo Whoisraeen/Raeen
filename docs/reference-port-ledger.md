@@ -46,7 +46,8 @@ Primary full port. Plan: `docs/superpowers/plans/2026-07-13-kyty-full-port.md`.
 | Sys (`sys_*.rs`, 9 mods) | `kyty-core` | `done` | `4ad2f49` | were orphaned (drafted, never declared in lib.rs → never compiled); wired in `#[cfg(windows)]`, lint-fixed, 92 tests now live |
 | CharUcd | `kyty-core` | `skip` | | use unicode crate; do not transliterate |
 | Database | `kyty-core` | `skip` | | defer rusqlite unless needed |
-| VirtualMemory / Threads / File / MemoryAlloc / MSpace | `kyty-core` | `todo` | | after Sys |
+| VirtualMemory (Core wrapper) | `kyty-core` | `done` | (vm batch) | `virtual_memory.rs` forwards 1:1 to sys_virtual (as Kyty's Core does on Windows); ExceptionHandler `skip` — xps5x-runtime VEH supersedes |
+| Threads / File / MemoryAlloc / MSpace | `kyty-core` | `todo` | | after Sys/VM |
 | Debug / Subsystems / SDL / Core.cpp | `kyty-core` | `todo` | | port last |
 
 ### Later Kyty trees

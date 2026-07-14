@@ -60,6 +60,11 @@ pub mod sys_timer;
 #[cfg(windows)]
 pub mod sys_virtual;
 
+// Kyty `lib/Core` wrappers over the Sys layer (Core::VirtualMemory forwards
+// 1:1 to Sys on Windows — see the module doc).
+#[cfg(windows)]
+pub mod virtual_memory;
+
 pub use array_wrapper::{Array, Array2, Array3};
 pub use byte_buffer::ByteBuffer;
 pub use date_time::{Date, DateTime, Jd, Time};
