@@ -3,7 +3,7 @@
 //! Converts the XPS5X shader IR into SPIR-V binary modules
 //! that can be consumed by Vulkan's shader pipeline.
 
-use super::ir::IrProgram;
+use super::ir::{IrProgram, IrValue};
 use super::ShaderType;
 use tracing::info;
 use xps5x_core::error::GpuError;
@@ -18,9 +18,11 @@ const OP_MEMORY_MODEL: u16 = 14;
 const OP_ENTRY_POINT: u16 = 15;
 const OP_EXECUTION_MODE: u16 = 16;
 const OP_TYPE_VOID: u16 = 19;
+const OP_TYPE_INT: u16 = 21;
 const OP_TYPE_FLOAT: u16 = 22;
 const OP_TYPE_VECTOR: u16 = 23;
 const OP_TYPE_FUNCTION: u16 = 33;
+const OP_CONSTANT: u16 = 43;
 #[allow(dead_code)] // reserved: pointer/variable emission (I/O interface vars) not yet generated
 const OP_TYPE_POINTER: u16 = 32;
 #[allow(dead_code)] // reserved: see OP_TYPE_POINTER
@@ -58,11 +60,39 @@ pub fn emit_spirv(program: &IrProgram) -> Result<Vec<u32>, GpuError> {
     let f32_type = module.next_id();
     module.add_type_float(f32_type, 32);
 
+    let i32_type = module.next_id();
+    module.add_type_int(i32_type, 32, 1);
+
     let vec4_type = module.next_id();
     module.add_type_vector(vec4_type, f32_type, 4);
 
     let func_type = module.next_id();
     module.add_type_function(func_type, void_type, &[]);
+
+    // Constant pool: materialize each distinct constant the IR references, so
+    // the arithmetic body (emitted later) can point at these ids. Integer and
+    // float constants use their respective scalar types; deduplicated by
+    // (type, bit-pattern).
+    let mut constants: Vec<(u32, u32)> = Vec::new();
+    for node in &program.nodes {
+        for src in &node.sources {
+            let entry = match src {
+                IrValue::ConstI32(v) => Some((i32_type, *v as u32)),
+                IrValue::ConstU32(v) => Some((i32_type, *v)),
+                IrValue::ConstF32(v) => Some((f32_type, v.to_bits())),
+                _ => None,
+            };
+            let Some((type_id, bits)) = entry else {
+                continue;
+            };
+            if constants.contains(&(type_id, bits)) {
+                continue;
+            }
+            let id = module.next_id();
+            module.add_constant(id, type_id, bits);
+            constants.push((type_id, bits));
+        }
+    }
 
     // Declare entry point.
     let main_func = module.next_id();
@@ -142,6 +172,15 @@ impl SpirvModule {
 
     fn add_type_float(&mut self, id: u32, width: u32) {
         self.emit(OP_TYPE_FLOAT, &[id, width]);
+    }
+
+    fn add_type_int(&mut self, id: u32, width: u32, signedness: u32) {
+        self.emit(OP_TYPE_INT, &[id, width, signedness]);
+    }
+
+    /// Emit `OpConstant result_type result_id value` — a 32-bit scalar constant.
+    fn add_constant(&mut self, id: u32, type_id: u32, value: u32) {
+        self.emit(OP_CONSTANT, &[type_id, id, value]);
     }
 
     fn add_type_vector(&mut self, id: u32, component: u32, count: u32) {
@@ -275,6 +314,61 @@ mod tests {
     /// emitter is responsible for. (OpExecutionMode = opcode 16,
     /// OpCapability = opcode 17; the low 16 bits of an instruction's first
     /// word are its opcode.)
+    /// Walk a SPIR-V module instruction-by-instruction (past the 5-word
+    /// header), returning the value operand of every OpConstant.
+    fn constant_values(module: &[u32]) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut i = 5;
+        while i < module.len() {
+            let word_count = (module[i] >> 16) as usize;
+            let opcode = (module[i] & 0xFFFF) as u16;
+            if opcode == OP_CONSTANT {
+                // OpConstant: [type_id, result_id, value]; value is operand 3.
+                out.push(module[i + 3]);
+            }
+            if word_count == 0 {
+                break; // malformed; avoid looping forever
+            }
+            i += word_count;
+        }
+        out
+    }
+
+    #[test]
+    fn integer_constants_are_materialized_once_in_the_constant_pool() {
+        use crate::shader::ir::{IrNode, IrOp};
+        // An IR program whose one node reads the constant 5 twice.
+        let program = IrProgram {
+            nodes: vec![IrNode {
+                op: IrOp::IAdd,
+                result: Some(IrValue::Reg(0)),
+                sources: vec![IrValue::ConstI32(5), IrValue::ConstI32(5)],
+            }],
+            shader_type: ShaderType::Vertex,
+            input_count: 0,
+            output_count: 0,
+            ubo_count: 0,
+            texture_count: 0,
+        };
+        let module = emit_spirv(&program).unwrap();
+        let consts = constant_values(&module);
+        assert!(consts.contains(&5), "the constant 5 must be materialized");
+        assert_eq!(
+            consts.iter().filter(|&&v| v == 5).count(),
+            1,
+            "the repeated constant is deduplicated to a single OpConstant"
+        );
+    }
+
+    #[test]
+    fn a_program_without_constants_emits_no_constant_pool() {
+        let module = emit_spirv(&prog(ShaderType::Vertex)).unwrap();
+        assert!(
+            constant_values(&module).is_empty(),
+            "an empty program needs no OpConstant"
+        );
+    }
+
     #[test]
     fn stage_specific_instructions_are_present() {
         let px = emit_spirv(&prog(ShaderType::Pixel)).unwrap();
