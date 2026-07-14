@@ -27,6 +27,7 @@ pub mod libkernel;
 pub mod libsce_app_content;
 pub mod libsce_audio_out;
 pub mod libsce_common_dialog;
+pub mod libsce_disc_map;
 pub mod libsce_gnm_driver;
 pub mod libsce_net;
 pub mod libsce_np;
@@ -143,6 +144,7 @@ impl HleRegistry {
         libsce_app_content::register(&registry);
         libsce_np::register(&registry);
         libsce_net::register(&registry);
+        libsce_disc_map::register(&registry);
 
         info!(
             "HLE registry: {} functions registered",
