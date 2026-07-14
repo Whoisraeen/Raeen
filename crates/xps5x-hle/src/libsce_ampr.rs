@@ -23,6 +23,11 @@ const CB_SIZE_OFFSET: u64 = 0x10;
 const CB_AUX0_OFFSET: u64 = 0x18;
 const CB_AUX1_OFFSET: u64 = 0x20;
 
+// Per-command record sizes reported by the `MeasureCommandSize*` calls.
+const READ_FILE_RECORD_SIZE: u64 = 0x30;
+const KERNEL_EVENT_QUEUE_RECORD_SIZE: u64 = 0x30;
+const WRITE_ADDRESS_RECORD_SIZE: u64 = 0x20;
+
 /// Register the libSceAmpr command-buffer lifecycle functions.
 pub fn register(registry: &HleRegistry) {
     registry.register("libSceAmpr", "sceAmprCommandBufferConstructor", hle_ctor);
@@ -40,6 +45,20 @@ pub fn register(registry: &HleRegistry) {
         "libSceAmpr",
         "sceAmprCommandBufferGetCurrentOffset",
         hle_get_current_offset,
+    );
+    // MeasureCommandSize* report a command record's byte size.
+    registry.register("libSceAmpr", "sceAmprMeasureCommandSizeReadFile", |_, _| {
+        READ_FILE_RECORD_SIZE
+    });
+    registry.register(
+        "libSceAmpr",
+        "sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00",
+        |_, _| KERNEL_EVENT_QUEUE_RECORD_SIZE,
+    );
+    registry.register(
+        "libSceAmpr",
+        "sceAmprMeasureCommandSizeWriteAddressOnCompletion",
+        |_, _| WRITE_ADDRESS_RECORD_SIZE,
     );
 }
 
@@ -197,5 +216,27 @@ mod tests {
         assert_eq!(hle_ctor(&ctx, &[0, 0, 0]), 0);
         // Getters reject a NULL command buffer.
         assert_eq!(hle_get_size(&ctx, &[0]), SCE_ERROR_INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn measure_command_sizes_report_record_bytes() {
+        let reg = HleRegistry::new();
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x10);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(
+            reg.call(&ctx, "libSceAmpr", "sceAmprMeasureCommandSizeReadFile", &[]),
+            Some(READ_FILE_RECORD_SIZE)
+        );
+        assert_eq!(
+            reg.call(
+                &ctx,
+                "libSceAmpr",
+                "sceAmprMeasureCommandSizeWriteAddressOnCompletion",
+                &[]
+            ),
+            Some(WRITE_ADDRESS_RECORD_SIZE)
+        );
     }
 }
