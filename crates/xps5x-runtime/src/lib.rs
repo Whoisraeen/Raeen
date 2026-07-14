@@ -136,6 +136,15 @@ pub fn execute_linked(
     let _call_lock = dispatch::call_lock();
 
     let arena = arena::GuestArena::new(&module.image)?;
+    // Expose the module's PT_SCE_PROCPARAM block (if any) to the guest via
+    // `sceKernelGetProcParam`: its guest address is the arena base plus the
+    // segment's image offset (identity-mapped). `0` clears any stale value
+    // from a prior run.
+    kernel.set_proc_param_addr(
+        module
+            .procparam_offset
+            .map_or(0, |off| GUEST_ARENA_BASE + off),
+    );
     let entry_ptr = arena.entry_ptr(entry_offset)?;
     let guard = trampoline::TrampolineGuard::reserve(module.hle_trampolines.len())?;
 
@@ -243,6 +252,15 @@ pub fn execute_process(
     let _call_lock = dispatch::call_lock();
 
     let arena = arena::GuestArena::new(&module.image)?;
+    // Expose the module's PT_SCE_PROCPARAM block (if any) to the guest via
+    // `sceKernelGetProcParam`: its guest address is the arena base plus the
+    // segment's image offset (identity-mapped). `0` clears any stale value
+    // from a prior run.
+    kernel.set_proc_param_addr(
+        module
+            .procparam_offset
+            .map_or(0, |off| GUEST_ARENA_BASE + off),
+    );
     let entry_ptr = arena.entry_ptr(module.entry)?;
     let guard = trampoline::TrampolineGuard::reserve(module.hle_trampolines.len())?;
 

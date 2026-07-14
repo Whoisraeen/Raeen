@@ -152,6 +152,7 @@ fn call_to_unmapped_trampoline_index_returns_unresolved() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam_offset: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -172,6 +173,7 @@ fn more_than_six_args_is_rejected() {
         hle_trampolines: Vec::new(),
         entry: 0,
         tls: None,
+        procparam_offset: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -209,6 +211,7 @@ fn genuine_wild_fault_recovers_as_faulted_then_process_keeps_running() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam_offset: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -1106,6 +1109,7 @@ fn guest_stub_uses_real_guest_stack_memory_and_returns_correct_value() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam_offset: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -1160,6 +1164,7 @@ fn guest_clobbering_r15_does_not_corrupt_host_rsp() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam_offset: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -1224,6 +1229,7 @@ fn trivial_ret_module() -> LinkedModule {
         hle_trampolines: Vec::new(),
         entry: 0,
         tls: None,
+        procparam_offset: None,
     }
 }
 
@@ -1265,6 +1271,7 @@ fn guest_fs_zero_load_reads_the_installed_tcb() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam_offset: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -1333,6 +1340,7 @@ fn guest_fs_offset_round_trip_writes_and_reads_back() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam_offset: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -1434,6 +1442,7 @@ fn host_fsbase_is_restored_after_a_recovered_genuine_fault() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam_offset: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -1511,6 +1520,7 @@ fn start_stub_observes_argc_equal_to_one_via_the_process_stack() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam_offset: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -1546,6 +1556,7 @@ fn start_stub_observes_argv0_first_byte_via_the_process_stack() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam_offset: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -1611,6 +1622,7 @@ fn start_stub_calling_exit_returns_exited_with_the_given_code() {
         }],
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam_offset: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -1665,6 +1677,7 @@ fn start_stub_wild_fault_still_recovers_as_faulted_through_execute_process() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam_offset: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -1719,6 +1732,7 @@ fn execute_process_restores_host_fsbase_after_an_exit_longjmp() {
         }],
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam_offset: None,
     };
 
     let kernel = OrbisKernel::new();
@@ -1906,6 +1920,7 @@ fn stack_chk_guard_canary_at_fs_0x28_is_nonzero_with_terminator_byte() {
         }],
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam_offset: None,
     };
 
     let kernel = OrbisKernel::new();

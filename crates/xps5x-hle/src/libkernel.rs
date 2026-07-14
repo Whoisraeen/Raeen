@@ -869,9 +869,19 @@ fn hle_usleep(_ctx: &HleContext, args: &[u64]) -> u64 {
 /// Stub: returns a fake, non-null pointer value. The real function returns
 /// a pointer into the guest's process-parameter block, which this stub
 /// cannot construct.
-fn hle_get_proc_param(_ctx: &HleContext, _args: &[u64]) -> u64 {
-    debug!("sceKernelGetProcParam()");
-    0x0000_1000_0000_0000
+/// `sceKernelGetProcParam()`: returns the guest address of the loaded
+/// module's `PT_SCE_PROCPARAM` block — the process-parameter block carrying
+/// the SDK version and process metadata — when the runtime recorded one at
+/// load time. Falls back to a plausible non-null sentinel only when the
+/// module had no procparam segment (so a caller never gets NULL).
+fn hle_get_proc_param(ctx: &HleContext, _args: &[u64]) -> u64 {
+    let addr = ctx.kernel.proc_param_addr();
+    debug!("sceKernelGetProcParam() -> {addr:#x}");
+    if addr != 0 {
+        addr
+    } else {
+        0x0000_1000_0000_0000 // no PT_SCE_PROCPARAM in the module — sentinel
+    }
 }
 
 /// Stub: always reports base-mode (non-Neo/Pro) hardware.
@@ -1152,6 +1162,21 @@ mod tests {
 
     /// M1 hardening: GetCompiledSdkVersion writes the PS5 SDK version out and
     /// validates its pointer; getpid returns a stable nonzero pid.
+    #[test]
+    fn get_proc_param_returns_the_runtime_recorded_address() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // Before load: no procparam → the non-null sentinel (never NULL).
+        assert_ne!(hle_get_proc_param(&ctx, &[]), 0);
+
+        // Runtime records the block's guest address; GetProcParam returns it.
+        kernel.set_proc_param_addr(0x1234_5000);
+        assert_eq!(hle_get_proc_param(&ctx, &[]), 0x1234_5000);
+    }
+
     #[test]
     fn compiled_sdk_version_and_getpid() {
         let kernel = xps5x_kernel::OrbisKernel::new();

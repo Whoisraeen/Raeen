@@ -128,6 +128,11 @@ pub struct OrbisKernel {
     next_module_id: RwLock<u32>,
     /// Syscall statistics (for debugging).
     pub syscall_stats: DashMap<u64, u64>,
+    /// Guest address of the main module's `PT_SCE_PROCPARAM` block, set by
+    /// the runtime at load time (0 = none). `sceKernelGetProcParam` returns
+    /// this so a title reads its real process-parameter block (SDK version,
+    /// etc.) instead of a stub pointer.
+    proc_param_addr: std::sync::atomic::AtomicU64,
 }
 
 impl OrbisKernel {
@@ -142,7 +147,20 @@ impl OrbisKernel {
             modules: DashMap::new(),
             next_module_id: RwLock::new(1),
             syscall_stats: DashMap::new(),
+            proc_param_addr: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Record the guest address of the main module's process-parameter block
+    /// (see [`proc_param_addr`](Self::proc_param_addr)).
+    pub fn set_proc_param_addr(&self, addr: u64) {
+        self.proc_param_addr.store(addr, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The guest address `sceKernelGetProcParam` returns, or `0` if no
+    /// `PT_SCE_PROCPARAM` was present in the loaded module.
+    pub fn proc_param_addr(&self) -> u64 {
+        self.proc_param_addr.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Register a loaded module with the kernel.

@@ -87,6 +87,11 @@ pub struct LinkedModule {
     /// per-thread TLS block whose layout this module's `TPOFF64`/`DTPOFF64`
     /// relocations were resolved against.
     pub tls: Option<crate::sprx::TlsTemplate>,
+    /// Image offset of the `PT_SCE_PROCPARAM` block (from
+    /// [`SprxModule::procparam`]'s vaddr), if the module has one. The runtime
+    /// exposes `base + procparam_offset` as the guest address
+    /// `sceKernelGetProcParam` returns.
+    pub procparam_offset: Option<u64>,
 }
 
 /// Lay `module`'s `PT_LOAD` segments into a flat image at `base` and apply
@@ -223,6 +228,7 @@ pub fn link_module(
         hle_trampolines,
         entry: module.entry,
         tls: module.tls.clone(),
+        procparam_offset: module.procparam.as_ref().map(|p| p.vaddr),
     })
 }
 
