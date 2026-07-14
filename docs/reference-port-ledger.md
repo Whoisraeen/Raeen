@@ -56,7 +56,7 @@ Primary full port. Plan: `docs/superpowers/plans/2026-07-13-kyty-full-port.md`.
 | Threads | `kyty-core`/`xps5x-runtime` | `todo` | | overlaps M1-E (real guest threads) — deferred, see SDD sketch |
 | File | `kyty-core` | `skip` | | 1311-line buffered File class over sys_file_io — superseded by xps5x-kernel VFS on the hot path; verified the one ported consumer (json_reader) uses std, not Core::File, so nothing needs it. Port later only if a future Kyty subsystem does |
 | SDLSubsystem | `kyty-core` | `skip` | | SDL window/input/audio init — superseded by xps5x-gui's eframe/egui (verified main.rs uses eframe) + xps5x-input/audio crates |
-| Debug / Subsystems / Core.cpp | `kyty-core` | `todo` | | init glue over sys_dbg — port last (or skip: tracing + per-crate init supersede) |
+| Debug / Subsystems / Core.cpp | `kyty-core` | `skip` | | verified: Subsystems=a dependency-ordered init/shutdown manager (superseded by XPS5X's per-crate `new()` init, no central manager); Debug/DebugMap=C++ symbol-map (.map/.csv/MSVC) loading for backtrace symbolication (superseded by Rust's native backtraces + `tracing`); Core.cpp=Core::Init glue. All init-glue/scaffolding XPS5X's architecture replaces. sys_dbg (the substantive Sys-layer piece) already ported. |
 
 ### Later Kyty trees
 
