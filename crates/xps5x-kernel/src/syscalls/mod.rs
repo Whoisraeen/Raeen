@@ -5,9 +5,9 @@
 
 pub mod file;
 pub mod memory;
-pub mod thread;
-pub mod process;
 pub mod network;
+pub mod process;
+pub mod thread;
 
 use crate::OrbisKernel;
 use tracing::{debug, warn};
@@ -74,23 +74,28 @@ const SYS_GET_AUTHINFO: u64 = 612;
 /// Dispatch a syscall to the appropriate handler.
 ///
 /// Returns the syscall return value (rax) on success.
-pub fn dispatch(
-    kernel: &OrbisKernel,
-    number: u64,
-    args: &[u64],
-) -> Result<u64, KernelError> {
+pub fn dispatch(kernel: &OrbisKernel, number: u64, args: &[u64]) -> Result<u64, KernelError> {
     match number {
         // ─── File I/O ──────────────────────────────────────
         SYS_READ => {
-            debug!("syscall: read(fd={}, buf={:#x}, count={})", args[0], args[1], args[2]);
+            debug!(
+                "syscall: read(fd={}, buf={:#x}, count={})",
+                args[0], args[1], args[2]
+            );
             file::sys_read(kernel, args[0] as i32, args[1], args[2])
         }
         SYS_WRITE => {
-            debug!("syscall: write(fd={}, buf={:#x}, count={})", args[0], args[1], args[2]);
+            debug!(
+                "syscall: write(fd={}, buf={:#x}, count={})",
+                args[0], args[1], args[2]
+            );
             file::sys_write(kernel, args[0] as i32, args[1], args[2])
         }
         SYS_OPEN => {
-            debug!("syscall: open(path={:#x}, flags={:#x}, mode={:#o})", args[0], args[1], args[2]);
+            debug!(
+                "syscall: open(path={:#x}, flags={:#x}, mode={:#o})",
+                args[0], args[1], args[2]
+            );
             file::sys_open(kernel, args[0], args[1] as i32, args[2] as u32)
         }
         SYS_CLOSE => {
@@ -98,7 +103,10 @@ pub fn dispatch(
             file::sys_close(kernel, args[0] as i32)
         }
         SYS_LSEEK => {
-            debug!("syscall: lseek(fd={}, offset={}, whence={})", args[0], args[1] as i64, args[2]);
+            debug!(
+                "syscall: lseek(fd={}, offset={}, whence={})",
+                args[0], args[1] as i64, args[2]
+            );
             file::sys_lseek(kernel, args[0] as i32, args[1] as i64, args[2] as i32)
         }
         SYS_FSTAT | SYS_STAT => {
@@ -116,14 +124,25 @@ pub fn dispatch(
                 "syscall: mmap(addr={:#x}, len={:#x}, prot={:#x}, flags={:#x}, fd={}, offset={:#x})",
                 args[0], args[1], args[2], args[3], args[4] as i32, args[5]
             );
-            memory::sys_mmap(kernel, args[0], args[1], args[2] as u32, args[3] as u32, args[4] as i32, args[5])
+            memory::sys_mmap(
+                kernel,
+                args[0],
+                args[1],
+                args[2] as u32,
+                args[3] as u32,
+                args[4] as i32,
+                args[5],
+            )
         }
         SYS_MUNMAP => {
             debug!("syscall: munmap(addr={:#x}, len={:#x})", args[0], args[1]);
             memory::sys_munmap(kernel, args[0], args[1])
         }
         SYS_MPROTECT => {
-            debug!("syscall: mprotect(addr={:#x}, len={:#x}, prot={:#x})", args[0], args[1], args[2]);
+            debug!(
+                "syscall: mprotect(addr={:#x}, len={:#x}, prot={:#x})",
+                args[0], args[1], args[2]
+            );
             memory::sys_mprotect(kernel, args[0], args[1], args[2] as u32)
         }
 
@@ -141,7 +160,10 @@ pub fn dispatch(
             thread::sys_thr_exit(kernel, args[0])
         }
         SYS_FUTEX => {
-            debug!("syscall: futex(uaddr={:#x}, op={}, val={})", args[0], args[1], args[2]);
+            debug!(
+                "syscall: futex(uaddr={:#x}, op={}, val={})",
+                args[0], args[1], args[2]
+            );
             thread::sys_futex(kernel, args)
         }
 
@@ -167,7 +189,10 @@ pub fn dispatch(
 
         // ─── Sony-specific: Dynamic linking ────────────────
         SYS_DYNLIB_DLSYM => {
-            debug!("syscall: dynlib_dlsym(handle={}, symbol={:#x})", args[0], args[1]);
+            debug!(
+                "syscall: dynlib_dlsym(handle={}, symbol={:#x})",
+                args[0], args[1]
+            );
             Ok(0) // Stub.
         }
         SYS_DYNLIB_LOAD_PRX => {
@@ -175,7 +200,10 @@ pub fn dispatch(
             Ok(0) // Stub.
         }
         SYS_DYNLIB_GET_PROC_PARAM => {
-            debug!("syscall: dynlib_get_proc_param(param={:#x}, size={:#x})", args[0], args[1]);
+            debug!(
+                "syscall: dynlib_get_proc_param(param={:#x}, size={:#x})",
+                args[0], args[1]
+            );
             Ok(0) // Stub.
         }
 

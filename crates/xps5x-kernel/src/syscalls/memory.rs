@@ -27,11 +27,7 @@ pub fn sys_mmap(
 }
 
 /// sys_munmap — Unmap pages of memory.
-pub fn sys_munmap(
-    kernel: &OrbisKernel,
-    addr: u64,
-    length: u64,
-) -> Result<u64, KernelError> {
+pub fn sys_munmap(kernel: &OrbisKernel, addr: u64, length: u64) -> Result<u64, KernelError> {
     let mem = &kernel.memory;
     mem.munmap(addr, length)?;
     debug!("munmap(addr={:#x}, len={:#x}) -> success", addr, length);
@@ -47,6 +43,9 @@ pub fn sys_mprotect(
 ) -> Result<u64, KernelError> {
     let mem = &kernel.memory;
     mem.mprotect(addr, length, prot)?;
-    debug!("mprotect(addr={:#x}, len={:#x}, prot={:#x}) -> success", addr, length, prot);
+    debug!(
+        "mprotect(addr={:#x}, len={:#x}, prot={:#x}) -> success",
+        addr, length, prot
+    );
     Ok(0)
 }

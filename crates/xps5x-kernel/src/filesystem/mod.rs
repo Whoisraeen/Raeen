@@ -109,7 +109,9 @@ impl VirtualFileSystem {
 
     /// Open a file.
     pub fn open(&self, path: &str, _flags: i32, _mode: u32) -> Result<Fd, std::io::Error> {
-        let host_path = self.resolve_path(path).unwrap_or_else(|| PathBuf::from(path));
+        let host_path = self
+            .resolve_path(path)
+            .unwrap_or_else(|| PathBuf::from(path));
 
         let mut next = self.next_fd.write();
         let fd = *next;

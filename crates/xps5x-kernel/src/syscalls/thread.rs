@@ -13,7 +13,10 @@ pub fn sys_thr_new(
     param_addr: u64,
     param_size: u64,
 ) -> Result<u64, KernelError> {
-    debug!("thr_new(param={:#x}, size={}) -> stubbed", param_addr, param_size);
+    debug!(
+        "thr_new(param={:#x}, size={}) -> stubbed",
+        param_addr, param_size
+    );
 
     // In a full implementation:
     // 1. Read thr_param struct from emulated memory at param_addr
@@ -27,10 +30,7 @@ pub fn sys_thr_new(
 }
 
 /// sys_thr_self — Get the current thread ID.
-pub fn sys_thr_self(
-    _kernel: &OrbisKernel,
-    id_ptr: u64,
-) -> Result<u64, KernelError> {
+pub fn sys_thr_self(_kernel: &OrbisKernel, id_ptr: u64) -> Result<u64, KernelError> {
     let tid = std::thread::current().id();
     let numeric_tid: u64 = format!("{:?}", tid)
         .chars()
@@ -45,10 +45,7 @@ pub fn sys_thr_self(
 }
 
 /// sys_thr_exit — Terminate the calling thread.
-pub fn sys_thr_exit(
-    _kernel: &OrbisKernel,
-    status: u64,
-) -> Result<u64, KernelError> {
+pub fn sys_thr_exit(_kernel: &OrbisKernel, status: u64) -> Result<u64, KernelError> {
     debug!("thr_exit(status={}) -> thread terminating", status as i64);
     // In a full implementation, this would clean up thread-local state
     // and notify joiners.
@@ -58,10 +55,7 @@ pub fn sys_thr_exit(
 /// sys_futex — Fast userspace locking.
 ///
 /// Implements a subset of the futex operations used by PS5 games.
-pub fn sys_futex(
-    _kernel: &OrbisKernel,
-    args: &[u64],
-) -> Result<u64, KernelError> {
+pub fn sys_futex(_kernel: &OrbisKernel, args: &[u64]) -> Result<u64, KernelError> {
     let uaddr = args[0];
     let op = args[1] as i32;
     let val = args[2] as u32;

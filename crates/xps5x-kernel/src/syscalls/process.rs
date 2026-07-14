@@ -14,7 +14,10 @@ pub fn sys_nanosleep(
 ) -> Result<u64, KernelError> {
     // In a full implementation, read timespec from emulated memory.
     // For now, sleep a minimal amount.
-    debug!("nanosleep(req={:#x}, rem={:#x}) -> sleeping", req_addr, rem_addr);
+    debug!(
+        "nanosleep(req={:#x}, rem={:#x}) -> sleeping",
+        req_addr, rem_addr
+    );
     std::thread::sleep(std::time::Duration::from_millis(1));
     Ok(0)
 }
@@ -23,14 +26,14 @@ pub fn sys_nanosleep(
 ///
 /// PS5 games use sysctl to query hardware info (CPU count, memory size, etc.).
 /// We return spoofed PS5-like values.
-pub fn sys_sysctl(
-    _kernel: &OrbisKernel,
-    args: &[u64],
-) -> Result<u64, KernelError> {
+pub fn sys_sysctl(_kernel: &OrbisKernel, args: &[u64]) -> Result<u64, KernelError> {
     let name_addr = args[0];
     let name_len = args[1] as u32;
 
-    debug!("sysctl(name={:#x}, namelen={}) -> spoofed", name_addr, name_len);
+    debug!(
+        "sysctl(name={:#x}, namelen={}) -> spoofed",
+        name_addr, name_len
+    );
 
     // Common sysctl queries from PS5 games:
     // - hw.ncpu -> 8

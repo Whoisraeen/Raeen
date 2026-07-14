@@ -84,7 +84,7 @@ impl ThreadManager {
         let info = ThreadInfo {
             tid,
             name: format!("thread_{}", tid),
-            priority: 700, // Default PS5 priority.
+            priority: 700,  // Default PS5 priority.
             affinity: 0xFF, // All 8 cores.
             state: ThreadState::Ready,
             entry_point: param_addr,

@@ -27,7 +27,10 @@ impl HypervisorStub {
     /// performing any security checks.
     pub fn handle_hypercall(&self, call_id: u64, args: &[u64]) -> u64 {
         if self.verbose {
-            debug!("Hypercall {:#x} (args: {:?}) -> stubbed (success)", call_id, args);
+            debug!(
+                "Hypercall {:#x} (args: {:?}) -> stubbed (success)",
+                call_id, args
+            );
         }
         0 // Success.
     }
@@ -43,12 +46,10 @@ impl HypervisorStub {
             // Family/Model: Zen 2 (Family 17h, Model 60h = PS5 custom)
             0x0000_0001 => (0x00860F01, 0x0010_0800, 0x7ED8_320B, 0x178B_FBFF),
             // Extended features
-            0x0000_0007 => {
-                match subleaf {
-                    0 => (0, 0x219C_97A9, 0x0000_0040, 0),
-                    _ => (0, 0, 0, 0),
-                }
-            }
+            0x0000_0007 => match subleaf {
+                0 => (0, 0x219C_97A9, 0x0000_0040, 0),
+                _ => (0, 0, 0, 0),
+            },
             _ => (0, 0, 0, 0),
         }
     }

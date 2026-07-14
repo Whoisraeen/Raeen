@@ -73,7 +73,10 @@ impl SyncRegistry {
             max_count,
         };
 
-        debug!("Created semaphore: handle={}, name='{}', count={}/{}", handle, name, init_count, max_count);
+        debug!(
+            "Created semaphore: handle={}, name='{}', count={}/{}",
+            handle, name, init_count, max_count
+        );
         self.semaphores.lock().insert(handle, sem);
         handle
     }

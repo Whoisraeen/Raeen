@@ -4,8 +4,8 @@
 //! translating mmap/munmap/mprotect to host memory allocations.
 //! Handles PS5-specific memory types (GARLIC/ONION) for CPU↔GPU coherency.
 
-pub mod virtual_memory;
 pub mod gpu_memory;
+pub mod virtual_memory;
 
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
@@ -101,7 +101,11 @@ impl VirtualMemoryManager {
     pub fn munmap(&self, addr: u64, length: u64) -> Result<(), KernelError> {
         let aligned_length = align_up(length, xps5x_core::PS5_PAGE_SIZE as u64);
 
-        debug!("munmap: unmapping {:#x}..{:#x}", addr, addr + aligned_length);
+        debug!(
+            "munmap: unmapping {:#x}..{:#x}",
+            addr,
+            addr + aligned_length
+        );
 
         self.regions.write().remove(&addr);
         self.backing.write().remove(&addr);
@@ -180,7 +184,10 @@ impl VirtualMemoryManager {
         // verify the whole read fits within it (O(log n) lookup).
         if let Some((base, data)) = backing.range(..=addr).next_back() {
             let end = base + data.len() as u64;
-            if addr.checked_add(size as u64).is_some_and(|read_end| read_end <= end) {
+            if addr
+                .checked_add(size as u64)
+                .is_some_and(|read_end| read_end <= end)
+            {
                 let offset = (addr - base) as usize;
                 return Ok(data[offset..offset + size].to_vec());
             }
@@ -197,7 +204,10 @@ impl VirtualMemoryManager {
 
         if let Some((base, storage)) = backing.range_mut(..=addr).next_back() {
             let end = *base + storage.len() as u64;
-            if addr.checked_add(data.len() as u64).is_some_and(|write_end| write_end <= end) {
+            if addr
+                .checked_add(data.len() as u64)
+                .is_some_and(|write_end| write_end <= end)
+            {
                 let offset = (addr - *base) as usize;
                 storage[offset..offset + data.len()].copy_from_slice(data);
                 return Ok(());
