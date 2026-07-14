@@ -191,3 +191,78 @@ impl Default for GnmContext {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a PM4 Type-3 header: type 3, `count` body DWORDs, `opcode`.
+    fn t3(opcode: u32, count: u32) -> u32 {
+        (3 << 30) | ((count - 1) << 16) | (opcode << 8)
+    }
+
+    /// Build a PM4 Type-0 header: register write at `reg`, `count` values.
+    fn t0(reg: u32, count: u32) -> u32 {
+        ((count - 1) << 16) | reg
+    }
+
+    #[test]
+    fn decodes_a_mixed_command_buffer() {
+        let mut ctx = GnmContext::new();
+
+        // Type 0: write 2 values starting at absolute reg CONTEXT_REG_BASE(0xA000).
+        // Type 3 SET_CONTEXT_REG: offset 0x10 <= 0x1111, 0x2222.
+        // Type 3 DRAW_INDEX_AUTO: 3 vertices.
+        // Type 2 NOP.
+        let cb = [
+            t0(0xA000, 2),
+            0xAAAA_AAAA,
+            0xBBBB_BBBB,
+            t3(command_buffer::PM4_SET_CONTEXT_REG, 3),
+            0x10,
+            0x1111_1111,
+            0x2222_2222,
+            t3(command_buffer::PM4_DRAW_INDEX_AUTO, 1),
+            3,
+            0x8000_0000, // Type 2 NOP
+        ];
+        ctx.process_command_buffer(&cb);
+
+        assert_eq!(ctx.stats.pm4_packets_decoded, 4, "4 packets: type0, set-ctx, draw, nop");
+        assert_eq!(ctx.stats.draw_calls, 1, "one DRAW_INDEX_AUTO");
+        // 2 (type 0) + 2 (set-context-reg) register writes.
+        assert_eq!(ctx.stats.register_writes, 4);
+        assert_eq!(ctx.stats.unknown_opcodes, 0);
+
+        // The Type 0 write landed in the context range (0xA000..).
+        assert_eq!(ctx.registers.read_context(0xA000), 0xAAAA_AAAA);
+        assert_eq!(ctx.registers.read_context(0xA001), 0xBBBB_BBBB);
+        // SET_CONTEXT_REG offset 0x10 → absolute CONTEXT_REG_BASE + 0x10.
+        assert_eq!(ctx.registers.read_context(0xA000 + 0x10), 0x1111_1111);
+        assert_eq!(ctx.registers.read_context(0xA000 + 0x11), 0x2222_2222);
+    }
+
+    #[test]
+    fn draw_and_dispatch_counters() {
+        let mut ctx = GnmContext::new();
+        let cb = [
+            t3(command_buffer::PM4_DRAW_INDEX_2, 1),
+            6,
+            t3(command_buffer::PM4_DISPATCH_DIRECT, 3),
+            1,
+            1,
+            1,
+        ];
+        ctx.process_command_buffer(&cb);
+        assert_eq!(ctx.stats.draw_calls, 1);
+        assert_eq!(ctx.stats.compute_dispatches, 1);
+        assert_eq!(ctx.stats.pm4_packets_decoded, 2);
+    }
+
+    #[test]
+    fn empty_buffer_decodes_nothing() {
+        let mut ctx = GnmContext::new();
+        ctx.process_command_buffer(&[]);
+        assert_eq!(ctx.stats.pm4_packets_decoded, 0);
+    }
+}
