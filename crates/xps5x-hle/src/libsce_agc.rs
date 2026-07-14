@@ -65,6 +65,10 @@ const SHADER_CX_REGISTERS_OFFSET: u64 = 0x18;
 const SHADER_SH_REGISTERS_OFFSET: u64 = 0x20;
 const SHADER_INPUT_SEMANTICS_OFFSET: u64 = 0x30;
 const SHADER_OUTPUT_SEMANTICS_OFFSET: u64 = 0x38;
+const SHADER_NUM_INPUT_SEMANTICS_OFFSET: u64 = 0x50;
+const SHADER_NUM_OUTPUT_SEMANTICS_OFFSET: u64 = 0x56;
+/// `SPI_PS_INPUT_CNTL_0` register offset (32 interpolant slots follow).
+const SPI_PS_INPUT_CNTL0: u32 = 0x191;
 // PrimState shader-register layout (byte offsets, from SharpEmu).
 const SHADER_SPECIALS_OFFSET: u64 = 0x28;
 const SPECIAL_GE_CNTL_OFFSET: u64 = 0x00;
@@ -131,6 +135,73 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register("libSceAgc", "sceAgcCreatePrimState", hle_create_prim_state);
     registry.register("libSceAgc", "sceAgcCreateShader", hle_create_shader);
+    registry.register(
+        "libSceAgc",
+        "sceAgcCreateInterpolantMapping",
+        hle_create_interpolant_mapping,
+    );
+}
+
+/// Read a `u32` from guest memory, or 0 if unreadable.
+fn read_u32_or_zero(ctx: &HleContext, addr: u64) -> u32 {
+    let mut b = [0u8; 4];
+    if ctx.mem.read(addr, &mut b) {
+        u32::from_le_bytes(b)
+    } else {
+        0
+    }
+}
+
+/// Read a `u64` from guest memory, or 0 if unreadable.
+fn read_u64_or_zero(ctx: &HleContext, addr: u64) -> u64 {
+    let mut b = [0u8; 8];
+    if ctx.mem.read(addr, &mut b) {
+        u64::from_le_bytes(b)
+    } else {
+        0
+    }
+}
+
+/// `sceAgcCreateInterpolantMapping(registers, geometryShader, pixelShader)`:
+/// build the 32 `SPI_PS_INPUT_CNTL` interpolant registers. Each slot below the
+/// geometry shader's output-semantic count maps to interpolant `i`, with the
+/// flat-shading bit (`0x400`) taken from the matching pixel-shader input
+/// semantic (bit 22). Faithful to SharpEmu's layout.
+fn hle_create_interpolant_mapping(ctx: &HleContext, args: &[u64]) -> u64 {
+    let registers = args.first().copied().unwrap_or(0);
+    let geometry = args.get(1).copied().unwrap_or(0);
+    let pixel = args.get(2).copied().unwrap_or(0);
+    if registers == 0 || geometry == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    let output_semantics = read_u64_or_zero(ctx, geometry + SHADER_OUTPUT_SEMANTICS_OFFSET);
+    let output_count = read_u32_or_zero(ctx, geometry + SHADER_NUM_OUTPUT_SEMANTICS_OFFSET);
+    let input_semantics = if pixel != 0 {
+        // The presence read also validates the pixel shader's semantics fields.
+        let _ = read_u32_or_zero(ctx, pixel + SHADER_NUM_INPUT_SEMANTICS_OFFSET);
+        read_u64_or_zero(ctx, pixel + SHADER_INPUT_SEMANTICS_OFFSET)
+    } else {
+        0
+    };
+
+    for i in 0..32u32 {
+        let mut value = 0u32;
+        if i < output_count && output_semantics != 0 {
+            let mut flat = false;
+            if pixel != 0 && input_semantics != 0 {
+                let input_semantic = read_u32_or_zero(ctx, input_semantics + u64::from(i) * 4);
+                flat = (input_semantic >> 22) & 0x1 != 0;
+            }
+            value = i | if flat { 0x400 } else { 0 };
+        }
+        let dst = registers + u64::from(i) * 8;
+        if !ctx.mem.write(dst, &(SPI_PS_INPUT_CNTL0 + i).to_le_bytes())
+            || !ctx.mem.write(dst + 4, &value.to_le_bytes())
+        {
+            return SCE_ERROR_MEMORY_FAULT;
+        }
+    }
+    0
 }
 
 /// Relocate a self-relative pointer field: read the relative offset at
@@ -1019,6 +1090,48 @@ mod tests {
         assert_eq!(read_u32(&ctx, cx), pm4(4, IT_NOP, R_CX_REGS_INDIRECT));
         let uc = hle_dcb_set_uc_regs_indirect(&ctx, &[cb, regs, 1]);
         assert_eq!(read_u32(&ctx, uc), pm4(4, IT_NOP, R_UC_REGS_INDIRECT));
+    }
+
+    #[test]
+    fn create_interpolant_mapping_builds_input_cntl_registers() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let registers: u64 = 0x100;
+        let geometry: u64 = 0x200;
+        let pixel: u64 = 0x280;
+        // GS: 2 output semantics at 0x300.
+        assert!(ctx.mem.write(
+            geometry + SHADER_OUTPUT_SEMANTICS_OFFSET,
+            &0x300u64.to_le_bytes()
+        ));
+        assert!(ctx.mem.write(
+            geometry + SHADER_NUM_OUTPUT_SEMANTICS_OFFSET,
+            &2u32.to_le_bytes()
+        ));
+        // PS: input semantics at 0x340; slot 1 has the flat bit (bit 22) set.
+        assert!(ctx.mem.write(
+            pixel + SHADER_INPUT_SEMANTICS_OFFSET,
+            &0x340u64.to_le_bytes()
+        ));
+        assert!(ctx.mem.write(0x340, &0u32.to_le_bytes())); // slot 0: not flat
+        assert!(ctx.mem.write(0x344, &(1u32 << 22).to_le_bytes())); // slot 1: flat
+        assert_eq!(
+            hle_create_interpolant_mapping(&ctx, &[registers, geometry, pixel]),
+            0
+        );
+        // Slot 0: cntl register 0x191, value = 0 (i=0, not flat).
+        assert_eq!(read_u32(&ctx, registers), SPI_PS_INPUT_CNTL0);
+        assert_eq!(read_u32(&ctx, registers + 4), 0);
+        // Slot 1: cntl 0x192, value = 1 | 0x400 (flat).
+        assert_eq!(read_u32(&ctx, registers + 8), SPI_PS_INPUT_CNTL0 + 1);
+        assert_eq!(read_u32(&ctx, registers + 12), 1 | 0x400);
+        // Slot 2 (>= count): cntl 0x193, value = 0.
+        assert_eq!(read_u32(&ctx, registers + 16), SPI_PS_INPUT_CNTL0 + 2);
+        assert_eq!(read_u32(&ctx, registers + 20), 0);
+        assert_eq!(
+            hle_create_interpolant_mapping(&ctx, &[0, geometry, pixel]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
     }
 
     #[test]
