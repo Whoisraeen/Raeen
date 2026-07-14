@@ -264,6 +264,30 @@ mod tests {
         assert_eq!(ctx.stats.pm4_packets_decoded, 2);
     }
 
+    /// A buffer built by `Pm4Writer` (the encoder) decodes back to exactly the
+    /// intended effects — the encode/decode paths are true inverses.
+    #[test]
+    fn pm4_writer_output_round_trips_through_the_decoder() {
+        let mut w = command_buffer::Pm4Writer::new();
+        w.set_context_reg(0x10, &[0x1111_1111, 0x2222_2222]); // DB_* offset 0x10
+        w.draw_index_auto(3);
+        w.dispatch_direct(4, 1, 1);
+        w.nop();
+
+        let mut ctx = GnmContext::new();
+        ctx.process_command_buffer(w.as_slice());
+
+        // SET_CONTEXT_REG wrote two registers at CONTEXT_REG_BASE + 0x10/0x11.
+        assert_eq!(ctx.registers.read_context(0xA000 + 0x10), 0x1111_1111);
+        assert_eq!(ctx.registers.read_context(0xA000 + 0x11), 0x2222_2222);
+        assert_eq!(ctx.stats.register_writes, 2);
+        // One draw, one dispatch, and four packets (setreg, draw, dispatch, nop).
+        assert_eq!(ctx.stats.draw_calls, 1);
+        assert_eq!(ctx.stats.compute_dispatches, 1);
+        assert_eq!(ctx.stats.pm4_packets_decoded, 4);
+        assert_eq!(ctx.stats.unknown_opcodes, 0);
+    }
+
     #[test]
     fn empty_buffer_decodes_nothing() {
         let mut ctx = GnmContext::new();
