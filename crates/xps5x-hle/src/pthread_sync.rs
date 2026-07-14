@@ -16,7 +16,7 @@
 
 use crate::{HleContext, HleRegistry};
 use tracing::debug;
-use xps5x_kernel::PthreadMutex;
+use xps5x_kernel::{PthreadMutex, PthreadRwlock};
 
 // Orbis `scePthreadMutex*` return POSIX errno directly (0 = success).
 const OK: u64 = 0;
@@ -54,6 +54,20 @@ pub fn register(registry: &HleRegistry) {
         "libkernel",
         "scePthreadMutexattrSettype",
         hle_mutexattr_settype,
+    );
+
+    registry.register("libkernel", "scePthreadRwlockInit", hle_rwlock_init);
+    registry.register("libkernel", "scePthreadRwlockDestroy", hle_rwlock_destroy);
+    registry.register("libkernel", "scePthreadRwlockRdlock", hle_rwlock_rdlock);
+    registry.register("libkernel", "scePthreadRwlockTryrdlock", hle_rwlock_rdlock);
+    registry.register("libkernel", "scePthreadRwlockWrlock", hle_rwlock_wrlock);
+    registry.register("libkernel", "scePthreadRwlockTrywrlock", hle_rwlock_wrlock);
+    registry.register("libkernel", "scePthreadRwlockUnlock", hle_rwlock_unlock);
+    registry.register("libkernel", "scePthreadRwlockattrInit", hle_rwlockattr_ok);
+    registry.register(
+        "libkernel",
+        "scePthreadRwlockattrDestroy",
+        hle_rwlockattr_ok,
     );
 }
 
@@ -262,6 +276,138 @@ fn hle_mutexattr_settype(ctx: &HleContext, args: &[u64]) -> u64 {
     OK
 }
 
+/// Size of the opaque rwlock object handed to the guest.
+const RWLOCK_OBJECT_SIZE: u64 = 0x100;
+
+/// Resolve the rwlock state key for a guest `pthread_rwlock_t` address.
+fn resolve_rwlock_key(ctx: &HleContext, addr: u64) -> Option<u64> {
+    if ctx.kernel.pthread_rwlocks.contains_key(&addr) {
+        return Some(addr);
+    }
+    let mut buf = [0u8; 8];
+    if ctx.mem.read(addr, &mut buf) {
+        let handle = u64::from_le_bytes(buf);
+        if handle != 0 && ctx.kernel.pthread_rwlocks.contains_key(&handle) {
+            return Some(handle);
+        }
+    }
+    None
+}
+
+/// `scePthreadRwlockInit(rwlock, attr)`: allocate an opaque object, write its
+/// handle into `*rwlock`, and register fresh (unlocked) state.
+fn hle_rwlock_init(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    if addr == 0 {
+        return EINVAL;
+    }
+    let Some(handle) = ctx.alloc.alloc(RWLOCK_OBJECT_SIZE, 0x10) else {
+        return EINVAL;
+    };
+    if !ctx.mem.write(addr, &handle.to_le_bytes()) {
+        return EINVAL;
+    }
+    let state = PthreadRwlock::default();
+    ctx.kernel.pthread_rwlocks.insert(addr, state);
+    ctx.kernel.pthread_rwlocks.insert(handle, state);
+    debug!("scePthreadRwlockInit(rwlock={addr:#x}) -> handle {handle:#x}");
+    OK
+}
+
+/// `scePthreadRwlockDestroy(rwlock)`.
+fn hle_rwlock_destroy(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    if addr == 0 {
+        return EINVAL;
+    }
+    let Some(key) = resolve_rwlock_key(ctx, addr) else {
+        return EINVAL;
+    };
+    ctx.kernel.pthread_rwlocks.remove(&key);
+    if key != addr {
+        ctx.kernel.pthread_rwlocks.remove(&addr);
+    }
+    let _ = ctx.mem.write(addr, &0u64.to_le_bytes());
+    OK
+}
+
+/// Resolve (creating implicitly for static initializers) the rwlock state key.
+fn resolve_or_create_rwlock(ctx: &HleContext, addr: u64) -> u64 {
+    resolve_rwlock_key(ctx, addr).unwrap_or_else(|| {
+        ctx.kernel
+            .pthread_rwlocks
+            .insert(addr, PthreadRwlock::default());
+        addr
+    })
+}
+
+/// `scePthreadRwlockRdlock`/`Tryrdlock(rwlock)`: add a read hold. With one
+/// guest thread a read lock never blocks; it nests by reader count.
+fn hle_rwlock_rdlock(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    if addr == 0 {
+        return EINVAL;
+    }
+    let key = resolve_or_create_rwlock(ctx, addr);
+    let mut entry = ctx.kernel.pthread_rwlocks.get_mut(&key).unwrap();
+    // A writer held by another thread is impossible in single-active-execution;
+    // if this thread already write-owns it, the read hold nests leniently.
+    entry.readers += 1;
+    OK
+}
+
+/// `scePthreadRwlockWrlock`/`Trywrlock(rwlock)`: acquire (or recurse) the write
+/// hold. Free → own it; already write-owned by this thread → recurse.
+fn hle_rwlock_wrlock(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    if addr == 0 {
+        return EINVAL;
+    }
+    let key = resolve_or_create_rwlock(ctx, addr);
+    let mut entry = ctx.kernel.pthread_rwlocks.get_mut(&key).unwrap();
+    if entry.writer == CURRENT_THREAD {
+        entry.writer_recursion += 1;
+    } else {
+        // No other thread can hold it (single-active-execution) → acquire.
+        entry.writer = CURRENT_THREAD;
+        entry.writer_recursion = 1;
+    }
+    OK
+}
+
+/// `scePthreadRwlockUnlock(rwlock)`: release the thread's write hold (recursion
+/// first) or one read hold; `EPERM` if it holds neither.
+fn hle_rwlock_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    if addr == 0 {
+        return EINVAL;
+    }
+    let Some(key) = resolve_rwlock_key(ctx, addr) else {
+        return EINVAL;
+    };
+    let mut entry = ctx.kernel.pthread_rwlocks.get_mut(&key).unwrap();
+    if entry.writer == CURRENT_THREAD && entry.writer_recursion > 0 {
+        entry.writer_recursion -= 1;
+        if entry.writer_recursion == 0 {
+            entry.writer = 0;
+        }
+        OK
+    } else if entry.readers > 0 {
+        entry.readers -= 1;
+        OK
+    } else {
+        EPERM
+    }
+}
+
+/// `scePthreadRwlockattrInit`/`Destroy`: accepted (no attribute state modelled).
+fn hle_rwlockattr_ok(_ctx: &HleContext, args: &[u64]) -> u64 {
+    if args.first().copied().unwrap_or(0) == 0 {
+        return EINVAL;
+    }
+    OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +517,57 @@ mod tests {
         assert!(!kernel.pthread_mutexes.contains_key(&mutex));
         // Destroying an unknown mutex → EINVAL.
         assert_eq!(hle_mutex_destroy(&ctx, &[0x999]), EINVAL);
+    }
+
+    #[test]
+    fn rwlock_read_holds_nest_and_balance() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let rw = 0x600;
+        assert_eq!(hle_rwlock_init(&ctx, &[rw, 0]), OK);
+        // Two read locks nest; two unlocks balance.
+        assert_eq!(hle_rwlock_rdlock(&ctx, &[rw]), OK);
+        assert_eq!(hle_rwlock_rdlock(&ctx, &[rw]), OK);
+        let key = resolve_rwlock_key(&ctx, rw).unwrap();
+        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().readers, 2);
+        assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), OK);
+        assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), OK);
+        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().readers, 0);
+        // Unlocking with nothing held → EPERM.
+        assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), EPERM);
+    }
+
+    #[test]
+    fn rwlock_write_hold_is_exclusive_and_recursive() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let rw = 0x700;
+        hle_rwlock_init(&ctx, &[rw, 0]);
+        assert_eq!(hle_rwlock_wrlock(&ctx, &[rw]), OK);
+        assert_eq!(hle_rwlock_wrlock(&ctx, &[rw]), OK); // recursive write
+        let key = resolve_rwlock_key(&ctx, rw).unwrap();
+        {
+            let s = kernel.pthread_rwlocks.get(&key).unwrap();
+            assert_eq!(s.writer, CURRENT_THREAD);
+            assert_eq!(s.writer_recursion, 2);
+        }
+        assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), OK);
+        assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), OK);
+        let s = kernel.pthread_rwlocks.get(&key).unwrap();
+        assert_eq!(s.writer, 0, "write hold released at recursion 0");
+    }
+
+    #[test]
+    fn rwlock_destroy_removes_state_and_zeroes_handle() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let rw = 0x800;
+        hle_rwlock_init(&ctx, &[rw, 0]);
+        assert_eq!(hle_rwlock_destroy(&ctx, &[rw]), OK);
+        let mut buf = [0u8; 8];
+        assert!(mem.read(rw, &mut buf));
+        assert_eq!(u64::from_le_bytes(buf), 0);
+        assert!(!kernel.pthread_rwlocks.contains_key(&rw));
+        assert_eq!(hle_rwlock_destroy(&ctx, &[0xABC]), EINVAL);
     }
 }

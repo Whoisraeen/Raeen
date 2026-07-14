@@ -146,6 +146,23 @@ pub struct OrbisKernel {
     pub pthread_mutexes: DashMap<u64, PthreadMutex>,
     /// Guest pthread mutex-attribute type, keyed by the attr object address.
     pub pthread_mutex_attrs: DashMap<u64, i32>,
+    /// Guest pthread read-write lock state, keyed by both the guest
+    /// `pthread_rwlock_t` address and its allocated handle.
+    pub pthread_rwlocks: DashMap<u64, PthreadRwlock>,
+}
+
+/// State of a guest pthread read-write lock. Single-active-execution means one
+/// guest thread, so the lock never truly contends — read/write acquisition
+/// reduces to reader-count + writer-recursion tracking (leniently, matching
+/// SharpEmu's `PthreadRwlockState`, GPL-2.0). See `xps5x-hle` `pthread_sync`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PthreadRwlock {
+    /// Outstanding read-lock holds by the (single) thread.
+    pub readers: i32,
+    /// Write-owning thread handle (0 = no writer).
+    pub writer: u64,
+    /// Write-lock recursion depth.
+    pub writer_recursion: i32,
 }
 
 /// State of a guest pthread mutex. Under XPS5X's single-active-execution model
@@ -179,6 +196,7 @@ impl OrbisKernel {
             pad_state: parking_lot::Mutex::new(None),
             pthread_mutexes: DashMap::new(),
             pthread_mutex_attrs: DashMap::new(),
+            pthread_rwlocks: DashMap::new(),
         }
     }
 
