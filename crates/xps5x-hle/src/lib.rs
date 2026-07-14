@@ -23,6 +23,7 @@
 
 pub(crate) mod fmt;
 pub mod kernel_eventflag;
+pub mod kernel_semaphore;
 pub mod libc;
 pub mod libkernel;
 pub mod libsce_app_content;
@@ -148,6 +149,8 @@ impl HleRegistry {
         pthread_thread::register(&registry);
         // Kernel event flags (create/set/clear/poll/wait/cancel/delete).
         kernel_eventflag::register(&registry);
+        // Kernel counting semaphores (create/signal/wait/poll/cancel/delete).
+        kernel_semaphore::register(&registry);
         libc::register(&registry);
         libsce_sysmodule::register(&registry);
         libsce_video_out::register(&registry);

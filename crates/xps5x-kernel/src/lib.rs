@@ -156,12 +156,27 @@ pub struct OrbisKernel {
     pub kernel_event_flags: DashMap<u64, EventFlag>,
     /// Next event-flag handle to hand out.
     kernel_event_flag_next: std::sync::atomic::AtomicU64,
+    /// Kernel counting semaphores, keyed by handle.
+    pub kernel_semaphores: DashMap<u32, Semaphore>,
+    /// Next semaphore handle to hand out.
+    kernel_semaphore_next: std::sync::atomic::AtomicU32,
     /// Registered pthread TLS keys → their destructor address (0 = none).
     pub pthread_tls_keys: DashMap<i32, u64>,
     /// Thread-local specific values, keyed by (thread handle, TLS key).
     pub pthread_tls_values: DashMap<(u64, i32), u64>,
     /// Next TLS key id to hand out.
     pthread_tls_next_key: std::sync::atomic::AtomicI32,
+}
+
+/// A kernel counting semaphore. Ported from SharpEmu's `KernelSemaphoreState`
+/// (GPL-2.0). The count is fully correct under single-active-execution; a
+/// blocking `Wait` on an empty semaphore needs the M1-E scheduler.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Semaphore {
+    /// Current available count.
+    pub count: i32,
+    /// Maximum count (ceiling for `Signal`).
+    pub max_count: i32,
 }
 
 /// A kernel event flag: a 64-bit set of condition bits a title waits on / sets
@@ -255,6 +270,8 @@ impl OrbisKernel {
             pthread_attrs: DashMap::new(),
             kernel_event_flags: DashMap::new(),
             kernel_event_flag_next: std::sync::atomic::AtomicU64::new(1),
+            kernel_semaphores: DashMap::new(),
+            kernel_semaphore_next: std::sync::atomic::AtomicU32::new(1),
             pthread_tls_keys: DashMap::new(),
             pthread_tls_values: DashMap::new(),
             pthread_tls_next_key: std::sync::atomic::AtomicI32::new(0),
@@ -272,6 +289,22 @@ impl OrbisKernel {
             EventFlag {
                 bits: initial_bits,
                 attributes,
+            },
+        );
+        handle
+    }
+
+    /// Create a counting semaphore with `initial`/`max` count, returning its
+    /// handle. See the `xps5x-hle` `kernel_semaphore` module.
+    pub fn create_semaphore(&self, initial: i32, max: i32) -> u32 {
+        let handle = self
+            .kernel_semaphore_next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.kernel_semaphores.insert(
+            handle,
+            Semaphore {
+                count: initial,
+                max_count: max,
             },
         );
         handle
