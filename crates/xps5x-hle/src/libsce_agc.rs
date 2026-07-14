@@ -28,6 +28,9 @@ const CB_RESERVED_DW: u64 = 0x30; // u32 — reserved tail dwords
 // Agc PM4 IT (instruction type) opcodes + register sub-discriminators.
 const IT_INDEX_TYPE: u32 = 0x2A;
 const IT_NOP: u32 = 0x10;
+const IT_INDEX_BUFFER_SIZE: u32 = 0x13;
+const IT_INDEX_BASE: u32 = 0x26;
+const IT_NUM_INSTANCES: u32 = 0x2F;
 const R_ZERO: u32 = 0x00;
 const R_DRAW_INDEX_AUTO: u32 = 0x04;
 
@@ -41,6 +44,16 @@ pub fn register(registry: &HleRegistry) {
         "libSceAgc",
         "sceAgcDcbDrawIndexAuto",
         hle_dcb_draw_index_auto,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetNumInstances",
+        hle_dcb_set_num_instances,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetIndexBuffer",
+        hle_dcb_set_index_buffer,
     );
 }
 
@@ -137,6 +150,58 @@ fn hle_dcb_draw_index_auto(ctx: &HleContext, args: &[u64]) -> u64 {
     addr
 }
 
+/// `sceAgcDcbSetNumInstances(dcb, instanceCount)`: emit a NUM_INSTANCES packet.
+fn hle_dcb_set_num_instances(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let instance_count = args.get(1).copied().unwrap_or(0) as u32;
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 2) else {
+        return 0;
+    };
+    if !ctx
+        .mem
+        .write(addr, &pm4(2, IT_NUM_INSTANCES, R_ZERO).to_le_bytes())
+        || !ctx.mem.write(addr + 4, &instance_count.to_le_bytes())
+    {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcDcbSetIndexBuffer(dcb, indexBufferAddress, indexCount)`: emit an
+/// INDEX_BASE packet (address lo/hi) followed by an INDEX_BUFFER_SIZE packet.
+fn hle_dcb_set_index_buffer(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let index_buffer = args.get(1).copied().unwrap_or(0);
+    let index_count = args.get(2).copied().unwrap_or(0) as u32;
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 5) else {
+        return 0;
+    };
+    let ok = ctx
+        .mem
+        .write(addr, &pm4(3, IT_INDEX_BASE, R_ZERO).to_le_bytes())
+        && ctx
+            .mem
+            .write(addr + 4, &(index_buffer as u32).to_le_bytes())
+        && ctx
+            .mem
+            .write(addr + 8, &((index_buffer >> 32) as u32).to_le_bytes())
+        && ctx.mem.write(
+            addr + 12,
+            &pm4(2, IT_INDEX_BUFFER_SIZE, R_ZERO).to_le_bytes(),
+        )
+        && ctx.mem.write(addr + 16, &index_count.to_le_bytes());
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +268,37 @@ mod tests {
         assert_eq!(read_u32(&ctx, 0x404), 3, "index count");
         // Cursor advanced by 7 DWORDs (28 bytes).
         assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x400 + 28);
+    }
+
+    #[test]
+    fn set_num_instances_emits_a_two_dword_packet() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        assert_eq!(hle_dcb_set_num_instances(&ctx, &[cb, 8]), 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(2, IT_NUM_INSTANCES, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), 8);
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x408);
+    }
+
+    #[test]
+    fn set_index_buffer_emits_base_and_size_packets() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let ib = 0x1_2345_6780u64;
+        assert_eq!(hle_dcb_set_index_buffer(&ctx, &[cb, ib, 6]), 0x400);
+        // INDEX_BASE packet: header + addr lo/hi.
+        assert_eq!(read_u32(&ctx, 0x400), pm4(3, IT_INDEX_BASE, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), ib as u32);
+        assert_eq!(read_u32(&ctx, 0x408), (ib >> 32) as u32);
+        // INDEX_BUFFER_SIZE packet: header + count.
+        assert_eq!(read_u32(&ctx, 0x40C), pm4(2, IT_INDEX_BUFFER_SIZE, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x410), 6);
+        // 5 DWORDs total.
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x400 + 20);
     }
 
     #[test]
