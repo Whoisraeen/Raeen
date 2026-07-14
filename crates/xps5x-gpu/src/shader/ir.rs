@@ -193,10 +193,16 @@ pub fn lift_to_ir(instructions: &[Instruction], shader_type: ShaderType) -> IrPr
                     32..=63 => IrOp::ExportParam,    // PARAM0-31
                     _ => IrOp::ExportColor,
                 };
+                // The exported VGPRs resolve to the SSA values that produced them.
+                let sources = inst
+                    .src
+                    .iter()
+                    .map(|o| resolve_source(o, &vgpr_def, &sgpr_def))
+                    .collect();
                 IrNode {
                     op,
                     result: None,
-                    sources: vec![],
+                    sources,
                 }
             }
             Encoding::Smem => {
@@ -523,6 +529,35 @@ mod tests {
         )];
         let prog = lift_to_ir(&stream, ShaderType::Vertex);
         assert!(matches!(prog.nodes[0].sources[1], IrValue::ConstI32(5)));
+    }
+
+    #[test]
+    fn export_sources_reference_the_ssa_value_that_produced_them() {
+        // v2 = v0 + v1   (defines SSA reg 0)
+        // export v2      (EXP source resolves to that SSA reg, not a live-in)
+        let export = Instruction {
+            encoding: Encoding::Exp,
+            opcode: 0, // MRT0 → color
+            raw: 0,
+            src: vec![Operand::Vgpr(2)],
+            dst: None,
+            size: 8,
+            offset: 0,
+        };
+        let stream = [
+            vop2(
+                0x01,
+                vec![Operand::Vgpr(0), Operand::Vgpr(1)],
+                Operand::Vgpr(2),
+            ),
+            export,
+        ];
+        let prog = lift_to_ir(&stream, ShaderType::Pixel);
+        assert_eq!(prog.nodes[1].op, IrOp::ExportColor);
+        assert!(
+            matches!(prog.nodes[1].sources[0], IrValue::Reg(0)),
+            "the exported v2 must reference the add's SSA result"
+        );
     }
 
     #[test]

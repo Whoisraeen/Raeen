@@ -127,7 +127,7 @@ pub fn decode(binary: &[u8]) -> Result<Vec<Instruction>, GpuError> {
 
         // Populate operands for the encodings we model precisely; other
         // encodings keep empty operand lists until their layout is decoded.
-        let (src, dst) = decode_operands(encoding, word0);
+        let (src, dst) = decode_operands(encoding, raw);
 
         let instruction = Instruction {
             encoding,
@@ -154,10 +154,23 @@ pub fn decode(binary: &[u8]) -> Result<Vec<Instruction>, GpuError> {
 }
 
 /// Decode the source/destination operands for the encodings whose layout we
-/// model. VOP1/VOP2 share the 9-bit SRC0 field + 8-bit VGPR fields; other
+/// model. Takes the full (up to 64-bit) `raw`: the low word carries the
+/// primary fields; EXP's source VGPRs live in the high word. Unmodeled
 /// encodings return empty operands until their layout is added.
-fn decode_operands(encoding: Encoding, word: u32) -> (Vec<Operand>, Option<Operand>) {
+fn decode_operands(encoding: Encoding, raw: u64) -> (Vec<Operand>, Option<Operand>) {
+    let word = raw as u32;
     match encoding {
+        // EXP: EN[3:0] channel mask (word0) selects which of the four
+        // VSRC bytes (word1) are live export sources; no register dst.
+        Encoding::Exp => {
+            let en = word & 0xF;
+            let word1 = (raw >> 32) as u32;
+            let src = (0..4)
+                .filter(|i| en & (1 << i) != 0)
+                .map(|i| Operand::Vgpr((word1 >> (i * 8)) & 0xFF))
+                .collect();
+            (src, None)
+        }
         // VOP2: SRC0[8:0] (any source), VSRC1[16:9] (VGPR), VDST[24:17] (VGPR).
         Encoding::Vop2 => {
             let src0 = decode_src9(word & 0x1FF);
@@ -387,6 +400,29 @@ mod tests {
         let (src, dst) = decode_operands(Encoding::Sop1, word);
         assert_eq!(src, vec![Operand::Sgpr(3)]);
         assert_eq!(dst, Some(Operand::Sgpr(5)));
+    }
+
+    #[test]
+    fn exp_decodes_enabled_vsrc_operands_from_word1() {
+        // word1 holds VSRC0..3 = v2,v3,v4,v5; word0 EN[3:0] selects channels.
+        let word1: u32 = 2 | (3 << 8) | (4 << 16) | (5 << 24);
+        let raw_all = ((word1 as u64) << 32) | 0xF; // EN = 1111 → all four
+        let (src, dst) = decode_operands(Encoding::Exp, raw_all);
+        assert_eq!(
+            src,
+            vec![
+                Operand::Vgpr(2),
+                Operand::Vgpr(3),
+                Operand::Vgpr(4),
+                Operand::Vgpr(5)
+            ]
+        );
+        assert_eq!(dst, None, "an export has no register destination");
+
+        // EN = 0101 → only VSRC0 (v2) and VSRC2 (v4) are live.
+        let raw_partial = ((word1 as u64) << 32) | 0b0101;
+        let (src, _) = decode_operands(Encoding::Exp, raw_partial);
+        assert_eq!(src, vec![Operand::Vgpr(2), Operand::Vgpr(4)]);
     }
 
     #[test]
