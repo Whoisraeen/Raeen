@@ -70,6 +70,20 @@ re-implementations are license-compatible; this notice preserves attribution.
 
 ---
 
+## Compiled Rust crate dependencies
+
+Unlike the clean-room reference sources above (studied but never linked),
+these crates.io dependencies are compiled into XPS5X (or its test binaries).
+Only licenses compatible with GPL-2.0-only are used.
+
+- **rspirv** — https://github.com/gfx-rs/rspirv — dual MIT / Apache-2.0, used
+  here under its **MIT** option (Apache-2.0 is *not* GPLv2-linking-compatible;
+  MIT is). **Test-only** dev-dependency of `xps5x-gpu`: it structurally
+  validates the shader emitter's SPIR-V output in unit tests and is **not
+  linked into the distributed emulator binary**.
+
+---
+
 ## Not incorporated (ecosystem references only)
 
 The following projects were evaluated. Their **code is not used** in XPS5X —
