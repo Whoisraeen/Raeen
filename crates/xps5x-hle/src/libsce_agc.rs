@@ -140,6 +140,11 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcCreateInterpolantMapping",
         hle_create_interpolant_mapping,
     );
+    registry.register(
+        "libSceAgc",
+        "sceAgcGetDataPacketPayloadAddress",
+        hle_get_data_packet_payload_address,
+    );
     // The Cx/Sh/Uc patch-set NIDs are behaviorally identical (the register
     // space only affects tracing), so each family shares one handler.
     for space in ["Cx", "Sh", "Uc"] {
@@ -154,6 +159,37 @@ pub fn register(registry: &HleRegistry) {
             hle_add_indirect_patch_registers,
         );
     }
+}
+
+/// `sceAgcGetDataPacketPayloadAddress(output, command, type)`: compute the
+/// address of a command packet's payload and write it to `*output`. For
+/// `type == 0` the payload follows the header (`command + 4`), unless the
+/// packet is a max-length NOP (`header & 0x3FFF_0000 == 0x3FFF_0000`) → 0;
+/// otherwise the payload is at `command + 8`.
+fn hle_get_data_packet_payload_address(ctx: &HleContext, args: &[u64]) -> u64 {
+    let output = args.first().copied().unwrap_or(0);
+    let command = args.get(1).copied().unwrap_or(0);
+    let ty = args.get(2).copied().unwrap_or(0) as i32;
+    if output == 0 || command == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    let mut payload = command + 8;
+    if ty == 0 {
+        let mut hdr = [0u8; 4];
+        if !ctx.mem.read(command, &mut hdr) {
+            return SCE_ERROR_MEMORY_FAULT;
+        }
+        let header = u32::from_le_bytes(hdr);
+        payload = if header & 0x3FFF_0000 == 0x3FFF_0000 {
+            0
+        } else {
+            command + 4
+        };
+    }
+    if !ctx.mem.write(output, &payload.to_le_bytes()) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
 }
 
 /// `sceAgcSet{Cx,Sh,Uc}RegIndirectPatchSetAddress(command, registers)`: bind the
@@ -1143,6 +1179,38 @@ mod tests {
         assert_eq!(read_u32(&ctx, cx), pm4(4, IT_NOP, R_CX_REGS_INDIRECT));
         let uc = hle_dcb_set_uc_regs_indirect(&ctx, &[cb, regs, 1]);
         assert_eq!(read_u32(&ctx, uc), pm4(4, IT_NOP, R_UC_REGS_INDIRECT));
+    }
+
+    #[test]
+    fn get_data_packet_payload_address() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let out: u64 = 0x100;
+        let command: u64 = 0x200;
+        // type != 0 → payload at command + 8.
+        assert_eq!(
+            hle_get_data_packet_payload_address(&ctx, &[out, command, 1]),
+            0
+        );
+        assert_eq!(read_u64(&ctx, out), command + 8);
+        // type == 0, ordinary header → payload at command + 4.
+        assert!(ctx.mem.write(command, &0xC001_0000u32.to_le_bytes()));
+        assert_eq!(
+            hle_get_data_packet_payload_address(&ctx, &[out, command, 0]),
+            0
+        );
+        assert_eq!(read_u64(&ctx, out), command + 4);
+        // type == 0, max-length NOP header → payload 0.
+        assert!(ctx.mem.write(command, &0x3FFF_0000u32.to_le_bytes()));
+        assert_eq!(
+            hle_get_data_packet_payload_address(&ctx, &[out, command, 0]),
+            0
+        );
+        assert_eq!(read_u64(&ctx, out), 0);
+        assert_eq!(
+            hle_get_data_packet_payload_address(&ctx, &[0, command, 0]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
     }
 
     #[test]
