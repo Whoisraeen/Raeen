@@ -152,6 +152,12 @@ pub struct OrbisKernel {
     /// Guest pthread thread-attribute objects, keyed by both the guest
     /// `pthread_attr_t` address and its allocated handle.
     pub pthread_attrs: DashMap<u64, PthreadAttr>,
+    /// Registered pthread TLS keys → their destructor address (0 = none).
+    pub pthread_tls_keys: DashMap<i32, u64>,
+    /// Thread-local specific values, keyed by (thread handle, TLS key).
+    pub pthread_tls_values: DashMap<(u64, i32), u64>,
+    /// Next TLS key id to hand out.
+    pthread_tls_next_key: std::sync::atomic::AtomicI32,
 }
 
 /// A guest pthread thread-attribute object (`pthread_attr_t`) — the stack
@@ -231,7 +237,20 @@ impl OrbisKernel {
             pthread_mutex_attrs: DashMap::new(),
             pthread_rwlocks: DashMap::new(),
             pthread_attrs: DashMap::new(),
+            pthread_tls_keys: DashMap::new(),
+            pthread_tls_values: DashMap::new(),
+            pthread_tls_next_key: std::sync::atomic::AtomicI32::new(0),
         }
+    }
+
+    /// Allocate a fresh pthread TLS key registered with `destructor` (0 = none),
+    /// returning its id. See the `xps5x-hle` `pthread_tls` module.
+    pub fn pthread_key_create(&self, destructor: u64) -> i32 {
+        let key = self
+            .pthread_tls_next_key
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pthread_tls_keys.insert(key, destructor);
+        key
     }
 
     /// Push the current controller state (a 12-byte Orbis `ScePadData` input
