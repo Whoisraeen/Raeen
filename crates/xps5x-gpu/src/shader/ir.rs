@@ -4,8 +4,8 @@
 //! which is closer to SPIR-V's SSA form. This allows optimization
 //! passes before final SPIR-V emission.
 
-use super::ShaderType;
 use super::gcn_decoder::{Encoding, Instruction};
+use super::ShaderType;
 
 /// An IR program ready for SPIR-V emission.
 #[derive(Debug)]
@@ -279,5 +279,120 @@ fn map_sop_to_ir(opcode: u32, encoding: Encoding) -> IrOp {
             _ => IrOp::Nop,
         },
         _ => IrOp::Nop,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shader::gcn_decoder::{Encoding, Instruction};
+
+    /// Build a bare decoded instruction of the given encoding/opcode. Operand
+    /// fields stay empty — `lift_to_ir` classifies by encoding+opcode, which is
+    /// exactly the surface under test here.
+    fn inst(encoding: Encoding, opcode: u32) -> Instruction {
+        Instruction {
+            encoding,
+            opcode,
+            raw: 0,
+            src: vec![],
+            dst: None,
+            size: 4,
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn vop_and_sop_opcodes_map_to_the_right_ir_ops() {
+        // VOP2 arithmetic + integer, VOP1 unary, SOP2 scalar, SOP1 move.
+        let stream = [
+            inst(Encoding::Vop2, 0x01), // V_ADD_F32  -> Add
+            inst(Encoding::Vop2, 0x04), // V_MUL_F32  -> Mul
+            inst(Encoding::Vop2, 0x19), // V_ADD_U32  -> IAdd
+            inst(Encoding::Vop1, 0x01), // V_MOV_B32  -> Mov
+            inst(Encoding::Vop1, 0x20), // V_SQRT_F32 -> Sqrt
+            inst(Encoding::Sop2, 0x00), // S_ADD_U32  -> IAdd
+            inst(Encoding::Sop1, 0x03), // S_MOV_B32  -> Mov
+        ];
+        let prog = lift_to_ir(&stream, ShaderType::Vertex);
+        let ops: Vec<IrOp> = prog.nodes.iter().map(|n| n.op).collect();
+        assert_eq!(
+            ops,
+            vec![
+                IrOp::Add,
+                IrOp::Mul,
+                IrOp::IAdd,
+                IrOp::Mov,
+                IrOp::Sqrt,
+                IrOp::IAdd,
+                IrOp::Mov,
+            ]
+        );
+        // An unrecognized opcode within a known ALU encoding lowers to Nop, not a panic.
+        let junk = lift_to_ir(&[inst(Encoding::Vop2, 0xFF)], ShaderType::Vertex);
+        assert_eq!(junk.nodes[0].op, IrOp::Nop);
+    }
+
+    #[test]
+    fn alu_results_get_sequential_ssa_registers() {
+        // Every ALU/memory op allocates one fresh SSA result, numbered 0,1,2,…
+        let stream = [
+            inst(Encoding::Vop2, 0x01),
+            inst(Encoding::Sop2, 0x00),
+            inst(Encoding::Vop1, 0x01),
+        ];
+        let prog = lift_to_ir(&stream, ShaderType::Vertex);
+        let regs: Vec<u32> = prog
+            .nodes
+            .iter()
+            .filter_map(|n| match n.result {
+                Some(IrValue::Reg(r)) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            regs,
+            vec![0, 1, 2],
+            "SSA results are numbered in program order"
+        );
+    }
+
+    #[test]
+    fn export_and_endpgm_produce_sinks_without_ssa_results() {
+        // EXP writes an output (no SSA result); S_ENDPGM is a Return sink.
+        let stream = [inst(Encoding::Exp, 0), inst(Encoding::Sopp, 0x01)];
+        let prog = lift_to_ir(&stream, ShaderType::Pixel);
+        assert_eq!(prog.nodes[0].op, IrOp::ExportColor);
+        assert!(
+            prog.nodes[0].result.is_none(),
+            "an export has no SSA result"
+        );
+        assert_eq!(prog.nodes[1].op, IrOp::Return, "S_ENDPGM -> Return");
+        assert!(prog.nodes[1].result.is_none());
+        assert_eq!(prog.output_count, 1, "the EXP bumped the output count");
+    }
+
+    #[test]
+    fn resource_counts_reflect_memory_and_interp_instructions() {
+        // SMEM -> ubo, MIMG -> texture, VINTRP -> input, EXP -> output.
+        let stream = [
+            inst(Encoding::Smem, 0x00),
+            inst(Encoding::Mimg, 0x00),
+            inst(Encoding::Mimg, 0x00),
+            inst(Encoding::Vintrp, 0x00),
+            inst(Encoding::Exp, 0x00),
+        ];
+        let prog = lift_to_ir(&stream, ShaderType::Pixel);
+        assert_eq!(
+            prog.ubo_count, 1,
+            "SMEM load implies at least one UBO binding"
+        );
+        assert_eq!(prog.texture_count, 2, "two image samples -> two textures");
+        assert_eq!(prog.input_count, 1, "one interpolated varying");
+        assert_eq!(prog.output_count, 1, "one export");
+        // The SMEM/MIMG/VINTRP results are still SSA-numbered without collision.
+        assert_eq!(prog.nodes[0].op, IrOp::BufferLoad);
+        assert_eq!(prog.nodes[1].op, IrOp::ImageSample);
+        assert_eq!(prog.nodes[3].op, IrOp::Interp);
     }
 }
