@@ -33,6 +33,7 @@ const IT_INDEX_BASE: u32 = 0x26;
 const IT_DRAW_INDEX_2: u32 = 0x27;
 const IT_NUM_INSTANCES: u32 = 0x2F;
 const IT_DISPATCH_DIRECT: u32 = 0x15;
+const IT_DISPATCH_INDIRECT: u32 = 0x16;
 const IT_EVENT_WRITE: u32 = 0x46;
 const IT_SET_SH_REG: u32 = 0x76;
 /// Marker DWORD preceding a `CbSetShRegisterRange` packet.
@@ -87,6 +88,7 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register("libSceAgc", "sceAgcInit", hle_init);
     registry.register("libSceAgc", "sceAgcDcbEventWrite", hle_dcb_event_write);
+    registry.register("libSceAgc", "sceAgcAcbWriteData", hle_acb_write_data);
 }
 
 /// Supported Agc register-defaults versions (see `sceAgcInit`).
@@ -103,6 +105,33 @@ fn hle_init(_ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
     0
+}
+
+/// `sceAgcAcbWriteData(acb, argumentsAddress, modifier)`: emit an indirect
+/// dispatch packet (4 DWORDs) with the arguments address + initiator.
+fn hle_acb_write_data(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let arguments = args.get(1).copied().unwrap_or(0);
+    let modifier = args.get(2).copied().unwrap_or(0) as u32;
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 4) else {
+        return 0;
+    };
+    let initiator = (modifier & 0xA038) | 0x41;
+    let ok = ctx
+        .mem
+        .write(addr, &pm4(4, IT_DISPATCH_INDIRECT, R_ZERO).to_le_bytes())
+        && ctx.mem.write(addr + 4, &(arguments as u32).to_le_bytes())
+        && ctx
+            .mem
+            .write(addr + 8, &((arguments >> 32) as u32).to_le_bytes())
+        && ctx.mem.write(addr + 12, &initiator.to_le_bytes());
+    if !ok {
+        return 0;
+    }
+    addr
 }
 
 /// `sceAgcDcbEventWrite(dcb, eventType, eventAddress)`: emit an EVENT_WRITE
@@ -776,6 +805,13 @@ mod tests {
         assert_eq!(hle_dcb_event_write(&ctx, &[cb, 0x14, 0]), 0x400);
         assert_eq!(read_u32(&ctx, 0x400), pm4(2, IT_EVENT_WRITE, R_ZERO));
         assert_eq!(read_u32(&ctx, 0x404), 0x14, "event type");
+
+        // AcbWriteData: 4-dword indirect dispatch with a split args address.
+        let a = hle_acb_write_data(&ctx, &[cb, 0x00AB_1234_5678_0000, 0]);
+        assert_eq!(read_u32(&ctx, a), pm4(4, IT_DISPATCH_INDIRECT, R_ZERO));
+        assert_eq!(read_u32(&ctx, a + 4), 0x5678_0000, "args low");
+        assert_eq!(read_u32(&ctx, a + 8), 0x00AB_1234, "args high");
+        assert_eq!(read_u32(&ctx, a + 12), 0x41, "initiator");
     }
 
     #[test]
