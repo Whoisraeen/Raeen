@@ -45,6 +45,7 @@ pub mod libsce_peripheral;
 pub mod libsce_playgo;
 pub mod libsce_rtc;
 pub mod libsce_save_data;
+pub mod libsce_save_data_dialog;
 pub mod libsce_sysmodule;
 pub mod libsce_system_service;
 pub mod libsce_user_service;
@@ -171,6 +172,7 @@ impl HleRegistry {
         libsce_user_service::register(&registry);
         libsce_audio_out::register(&registry);
         libsce_save_data::register(&registry);
+        libsce_save_data_dialog::register(&registry);
         libsce_common_dialog::register(&registry);
         libsce_app_content::register(&registry);
         libsce_np::register(&registry);
