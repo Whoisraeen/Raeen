@@ -139,6 +139,28 @@ pub struct OrbisKernel {
     /// pad. The Shell updates this each frame from its `InputManager`; the
     /// HLE `scePadReadState` reads it. See [`set_pad_state`](Self::set_pad_state).
     pad_state: parking_lot::Mutex<Option<[u8; 12]>>,
+    /// Guest pthread mutex state, keyed by both the guest `pthread_mutex_t`
+    /// address and its allocated opaque handle (both map to the same logical
+    /// mutex). Manipulated by the HLE `pthread_sync` module — per-process
+    /// state, so it lives here rather than in a global.
+    pub pthread_mutexes: DashMap<u64, PthreadMutex>,
+    /// Guest pthread mutex-attribute type, keyed by the attr object address.
+    pub pthread_mutex_attrs: DashMap<u64, i32>,
+}
+
+/// State of a guest pthread mutex. Under XPS5X's single-active-execution model
+/// there is one guest thread, so a mutex reduces to its type plus owner /
+/// recursion tracking — which is exactly correct for that model. Ported from
+/// SharpEmu's `PthreadMutexState` (GPL-2.0). See the `xps5x-hle` `pthread_sync`
+/// module for the state machine.
+#[derive(Clone, Copy, Debug)]
+pub struct PthreadMutex {
+    /// Mutex type: 1 = error-check, 2 = recursive, 3 = normal, 4 = adaptive.
+    pub ty: i32,
+    /// Owning thread handle (0 = unlocked).
+    pub owner: u64,
+    /// Lock recursion count (0 = unlocked).
+    pub recursion: i32,
 }
 
 impl OrbisKernel {
@@ -155,6 +177,8 @@ impl OrbisKernel {
             syscall_stats: DashMap::new(),
             proc_param_addr: std::sync::atomic::AtomicU64::new(0),
             pad_state: parking_lot::Mutex::new(None),
+            pthread_mutexes: DashMap::new(),
+            pthread_mutex_attrs: DashMap::new(),
         }
     }
 

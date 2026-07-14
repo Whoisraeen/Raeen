@@ -38,6 +38,7 @@ pub mod libsce_sysmodule;
 pub mod libsce_system_service;
 pub mod libsce_user_service;
 pub mod libsce_video_out;
+pub mod pthread_sync;
 
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
@@ -131,6 +132,8 @@ impl HleRegistry {
 
         // Register all implemented HLE functions.
         libkernel::register(&registry);
+        // Real pthread mutex state machine — supersedes libkernel's mutex stubs.
+        pthread_sync::register(&registry);
         libc::register(&registry);
         libsce_sysmodule::register(&registry);
         libsce_video_out::register(&registry);

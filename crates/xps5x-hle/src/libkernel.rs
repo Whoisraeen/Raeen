@@ -393,13 +393,8 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadCreate", hle_pthread_create);
     registry.register("libkernel", "scePthreadJoin", hle_pthread_join);
     registry.register("libkernel", "scePthreadExit", hle_pthread_exit);
-    registry.register("libkernel", "scePthreadMutexInit", hle_pthread_mutex_init);
-    registry.register("libkernel", "scePthreadMutexLock", hle_pthread_mutex_lock);
-    registry.register(
-        "libkernel",
-        "scePthreadMutexUnlock",
-        hle_pthread_mutex_unlock,
-    );
+    // scePthreadMutex* are registered by the `pthread_sync` module (real state
+    // machine) — see xps5x_hle::pthread_sync.
     registry.register("libkernel", "scePthreadCondInit", hle_pthread_cond_init);
     registry.register("libkernel", "scePthreadCondWait", hle_pthread_cond_wait);
     registry.register("libkernel", "scePthreadCondSignal", hle_pthread_cond_signal);
@@ -694,30 +689,6 @@ fn hle_pthread_exit(_ctx: &HleContext, _args: &[u64]) -> u64 {
     // Real scePthreadExit never returns to the caller; the stub returns 0
     // since this fn-pointer signature has no way to unwind the guest thread.
     debug!("scePthreadExit()");
-    0
-}
-
-fn hle_pthread_mutex_init(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!(
-        "scePthreadMutexInit(mutex={:#x})",
-        args.first().copied().unwrap_or(0)
-    );
-    0
-}
-
-fn hle_pthread_mutex_lock(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!(
-        "scePthreadMutexLock(mutex={:#x})",
-        args.first().copied().unwrap_or(0)
-    );
-    0
-}
-
-fn hle_pthread_mutex_unlock(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!(
-        "scePthreadMutexUnlock(mutex={:#x})",
-        args.first().copied().unwrap_or(0)
-    );
     0
 }
 
