@@ -35,6 +35,7 @@ const IT_DRAW_INDEX_OFFSET_2: u32 = 0x35;
 const IT_NUM_INSTANCES: u32 = 0x2F;
 const IT_DISPATCH_DIRECT: u32 = 0x15;
 const IT_DISPATCH_INDIRECT: u32 = 0x16;
+const IT_SET_BASE: u32 = 0x11;
 const IT_EVENT_WRITE: u32 = 0x46;
 const IT_SET_SH_REG: u32 = 0x76;
 /// Marker DWORD preceding a `CbSetShRegisterRange` packet.
@@ -168,6 +169,13 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceAgc", "sceAgcDcbPushMarker", hle_dcb_push_marker);
     registry.register(
         "libSceAgc",
+        "sceAgcDcbSetBaseIndirectArgs",
+        hle_dcb_set_base_indirect_args,
+    );
+    registry.register("libSceAgc", "sceAgcDriverSubmitDcb", hle_driver_submit_dcb);
+    registry.register("libSceAgc", "sceAgcDriverSubmitAcb", hle_driver_submit_acb);
+    registry.register(
+        "libSceAgc",
         "sceAgcDriverInitResourceRegistration",
         hle_driver_init_resource_registration,
     );
@@ -232,6 +240,57 @@ fn hle_get_resource_max_name_length(ctx: &HleContext, args: &[u64]) -> u64 {
 
 /// `sceAgcSuspendPoint()`: a no-op suspension marker; succeeds.
 fn hle_suspend_point(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    0
+}
+
+/// `sceAgcDcbSetBaseIndirectArgs(dcb, baseIndex, address)`: emit a SET_BASE
+/// packet (4 DWORDs) with the base index folded into the header.
+fn hle_dcb_set_base_indirect_args(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let base_index = args.get(1).copied().unwrap_or(0) as u32;
+    let address = args.get(2).copied().unwrap_or(0);
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 4) else {
+        return 0;
+    };
+    let header = pm4(4, IT_SET_BASE, R_ZERO) | (base_index << 1);
+    let ok = ctx.mem.write(addr, &header.to_le_bytes())
+        && ctx.mem.write(addr + 4, &1u32.to_le_bytes())
+        && ctx
+            .mem
+            .write(addr + 8, &((address as u32) & !7).to_le_bytes())
+        && ctx
+            .mem
+            .write(addr + 12, &((address >> 32) as u32).to_le_bytes());
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcDriverSubmitDcb(packet)` / `sceAgcDriverSubmitAcb(owner, packet)`:
+/// validate the submission packet and its command-buffer pointer, then
+/// succeed. (No real GPU submission yet — that arrives with the Vulkan backend;
+/// SharpEmu likewise only validates here.)
+fn hle_driver_submit_dcb(ctx: &HleContext, args: &[u64]) -> u64 {
+    submit_validate(ctx, args.first().copied().unwrap_or(0))
+}
+
+fn hle_driver_submit_acb(ctx: &HleContext, args: &[u64]) -> u64 {
+    submit_validate(ctx, args.get(1).copied().unwrap_or(0))
+}
+
+fn submit_validate(ctx: &HleContext, packet: u64) -> u64 {
+    if packet == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    // The submission packet begins with a pointer to the command buffer.
+    let mut buf = [0u8; 8];
+    if !ctx.mem.read(packet, &mut buf) {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
     0
 }
 
@@ -1479,6 +1538,18 @@ mod tests {
         );
         assert_eq!(
             hle_driver_init_resource_registration(&ctx, &[0, 0x100, 4]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+        // SetBaseIndirectArgs: SET_BASE with the base index folded into header.
+        let b = hle_dcb_set_base_indirect_args(&ctx, &[cb, 3, 0x1234_5678_9ABC_DEF8]);
+        assert_eq!(read_u32(&ctx, b), pm4(4, IT_SET_BASE, R_ZERO) | (3 << 1));
+        assert_eq!(read_u32(&ctx, b + 8), 0x9ABC_DEF8 & !7);
+        // Driver submit: validates the packet pointer + its CB pointer, succeeds.
+        assert!(ctx.mem.write(0x180, &0x400u64.to_le_bytes()));
+        assert_eq!(hle_driver_submit_dcb(&ctx, &[0x180]), 0);
+        assert_eq!(hle_driver_submit_acb(&ctx, &[7, 0x180]), 0);
+        assert_eq!(
+            hle_driver_submit_dcb(&ctx, &[0]),
             SCE_ERROR_INVALID_ARGUMENT
         );
     }
