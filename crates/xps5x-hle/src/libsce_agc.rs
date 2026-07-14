@@ -43,6 +43,9 @@ const R_DRAW_INDEX_AUTO: u32 = 0x04;
 const R_DRAW_RESET: u32 = 0x05;
 const R_WAIT_FLIP_DONE: u32 = 0x06;
 const R_ACB_RESET: u32 = 0x09;
+const R_SH_REGS_INDIRECT: u32 = 0x11;
+const R_CX_REGS_INDIRECT: u32 = 0x12;
+const R_UC_REGS_INDIRECT: u32 = 0x13;
 const R_POP_MARKER: u32 = 0x0C;
 const R_FLIP: u32 = 0x17;
 
@@ -89,6 +92,21 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceAgc", "sceAgcInit", hle_init);
     registry.register("libSceAgc", "sceAgcDcbEventWrite", hle_dcb_event_write);
     registry.register("libSceAgc", "sceAgcAcbWriteData", hle_acb_write_data);
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetCxRegistersIndirect",
+        hle_dcb_set_cx_regs_indirect,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetShRegistersIndirect",
+        hle_dcb_set_sh_regs_indirect,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetUcRegistersIndirect",
+        hle_dcb_set_uc_regs_indirect,
+    );
 }
 
 /// Supported Agc register-defaults versions (see `sceAgcInit`).
@@ -105,6 +123,45 @@ fn hle_init(_ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
     0
+}
+
+/// Shared body for `sceAgcDcbSet{Cx,Sh,Uc}RegistersIndirect(dcb, registers,
+/// registerCount)`: emit a 4-DWORD packet (count + registers address lo/hi)
+/// tagged with the register-space discriminator `packet_register`.
+fn dcb_set_registers_indirect(ctx: &HleContext, args: &[u64], packet_register: u32) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let registers = args.get(1).copied().unwrap_or(0);
+    let register_count = args.get(2).copied().unwrap_or(0) as u32;
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 4) else {
+        return 0;
+    };
+    let ok = ctx
+        .mem
+        .write(addr, &pm4(4, IT_NOP, packet_register).to_le_bytes())
+        && ctx.mem.write(addr + 4, &register_count.to_le_bytes())
+        && ctx.mem.write(addr + 8, &(registers as u32).to_le_bytes())
+        && ctx
+            .mem
+            .write(addr + 12, &((registers >> 32) as u32).to_le_bytes());
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
+fn hle_dcb_set_cx_regs_indirect(ctx: &HleContext, args: &[u64]) -> u64 {
+    dcb_set_registers_indirect(ctx, args, R_CX_REGS_INDIRECT)
+}
+
+fn hle_dcb_set_sh_regs_indirect(ctx: &HleContext, args: &[u64]) -> u64 {
+    dcb_set_registers_indirect(ctx, args, R_SH_REGS_INDIRECT)
+}
+
+fn hle_dcb_set_uc_regs_indirect(ctx: &HleContext, args: &[u64]) -> u64 {
+    dcb_set_registers_indirect(ctx, args, R_UC_REGS_INDIRECT)
 }
 
 /// `sceAgcAcbWriteData(acb, argumentsAddress, modifier)`: emit an indirect
@@ -812,6 +869,24 @@ mod tests {
         assert_eq!(read_u32(&ctx, a + 4), 0x5678_0000, "args low");
         assert_eq!(read_u32(&ctx, a + 8), 0x00AB_1234, "args high");
         assert_eq!(read_u32(&ctx, a + 12), 0x41, "initiator");
+    }
+
+    #[test]
+    fn set_registers_indirect_tags_the_right_space() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let regs = 0x00CD_1234_5678_0000u64;
+        // Sh / Cx / Uc use discriminators 0x11 / 0x12 / 0x13.
+        let sh = hle_dcb_set_sh_regs_indirect(&ctx, &[cb, regs, 4]);
+        assert_eq!(read_u32(&ctx, sh), pm4(4, IT_NOP, R_SH_REGS_INDIRECT));
+        assert_eq!(read_u32(&ctx, sh + 4), 4, "register count");
+        assert_eq!(read_u32(&ctx, sh + 8), regs as u32);
+        let cx = hle_dcb_set_cx_regs_indirect(&ctx, &[cb, regs, 2]);
+        assert_eq!(read_u32(&ctx, cx), pm4(4, IT_NOP, R_CX_REGS_INDIRECT));
+        let uc = hle_dcb_set_uc_regs_indirect(&ctx, &[cb, regs, 1]);
+        assert_eq!(read_u32(&ctx, uc), pm4(4, IT_NOP, R_UC_REGS_INDIRECT));
     }
 
     #[test]
