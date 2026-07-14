@@ -117,6 +117,7 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register("libSceAgc", "sceAgcInit", hle_init);
     registry.register("libSceAgc", "sceAgcDcbEventWrite", hle_dcb_event_write);
+    registry.register("libSceAgc", "sceAgcAcbEventWrite", hle_acb_event_write);
     registry.register("libSceAgc", "sceAgcAcbWriteData", hle_acb_write_data);
     // AcbDispatchIndirect emits the identical indirect-dispatch packet.
     registry.register("libSceAgc", "sceAgcAcbDispatchIndirect", hle_acb_write_data);
@@ -665,6 +666,46 @@ fn hle_acb_write_data(ctx: &HleContext, args: &[u64]) -> u64 {
             .write(addr + 8, &((arguments >> 32) as u32).to_le_bytes())
         && ctx.mem.write(addr + 12, &initiator.to_le_bytes());
     if !ok {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcAcbEventWrite(acb, eventType, eventAddress)`: emit an EVENT_WRITE
+/// packet. Address-carrying event types (`eventType & ~1 == 0x38`) emit a
+/// 4-DWORD packet with the address; others a 2-DWORD packet.
+fn hle_acb_event_write(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let event_type = (args.get(1).copied().unwrap_or(0) & 0xFF) as u32;
+    let event_address = args.get(2).copied().unwrap_or(0);
+    if cb == 0 || event_type >= 0x40 {
+        return 0;
+    }
+    let has_address = (event_type & !1) == 0x38;
+    let packet_dwords = if has_address { 4 } else { 2 };
+    let Some(addr) = alloc_command_dwords(ctx, cb, packet_dwords) else {
+        return 0;
+    };
+    let type_word = if has_address {
+        event_type | 0x100
+    } else {
+        event_type & 0x3F
+    };
+    if !ctx.mem.write(
+        addr,
+        &pm4(packet_dwords as u32, IT_EVENT_WRITE, R_ZERO).to_le_bytes(),
+    ) || !ctx.mem.write(addr + 4, &type_word.to_le_bytes())
+    {
+        return 0;
+    }
+    if has_address
+        && (!ctx
+            .mem
+            .write(addr + 8, &((event_address as u32) & !7).to_le_bytes())
+            || !ctx
+                .mem
+                .write(addr + 12, &((event_address >> 32) as u32).to_le_bytes()))
+    {
         return 0;
     }
     addr
@@ -1341,6 +1382,22 @@ mod tests {
         assert_eq!(hle_dcb_event_write(&ctx, &[cb, 0x14, 0]), 0x400);
         assert_eq!(read_u32(&ctx, 0x400), pm4(2, IT_EVENT_WRITE, R_ZERO));
         assert_eq!(read_u32(&ctx, 0x404), 0x14, "event type");
+
+        // AcbEventWrite: address-carrying type (0x38) → 4-dword packet w/ addr.
+        setup_cb(&ctx, cb, 0x500, 0x800);
+        let a = hle_acb_event_write(&ctx, &[cb, 0x38, 0x1234_5678_9ABC_DEF8]);
+        assert_eq!(read_u32(&ctx, a), pm4(4, IT_EVENT_WRITE, R_ZERO));
+        assert_eq!(read_u32(&ctx, a + 4), 0x38 | 0x100, "address-type word");
+        assert_eq!(
+            read_u32(&ctx, a + 8),
+            0x9ABC_DEF8 & !7,
+            "addr low, 8-aligned"
+        );
+        assert_eq!(read_u32(&ctx, a + 12), 0x1234_5678, "addr high");
+        // A non-address type → compact 2-dword packet.
+        let a2 = hle_acb_event_write(&ctx, &[cb, 0x14, 0]);
+        assert_eq!(read_u32(&ctx, a2), pm4(2, IT_EVENT_WRITE, R_ZERO));
+        assert_eq!(read_u32(&ctx, a2 + 4), 0x14);
 
         // AcbWriteData: 4-dword indirect dispatch with a split args address.
         let a = hle_acb_write_data(&ctx, &[cb, 0x00AB_1234_5678_0000, 0]);
