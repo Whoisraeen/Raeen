@@ -68,7 +68,7 @@ Primary full port. Plan: `docs/superpowers/plans/2026-07-13-kyty-full-port.md`.
 | emulator/Loader | `kyty-loader` → `xps5x-firmware`/`loader` | `todo` | | |
 | emulator/Kernel | `kyty-kernel` → `xps5x-kernel`/`hle` | `todo` | | |
 | emulator/Libs | `kyty-libs` → `xps5x-hle` | `todo` | | |
-| emulator/Graphics: texture micro-tiling | `xps5x-gpu` | `done` | (tiling batch) | fixed detile_micro from a bogus linear (py*8+px) interior to the documented GCN thin micro-tile Z-order (Morton interleave x0y0x1y1x2y2); added inverse tile_micro + round-trip/bijection/known-mapping tests. DEPTH/DISPLAY/ROTATED modes + macro bank/pipe swizzle + hardware-exact validation vs real dumps still todo |
+| emulator/Graphics: texture micro-tiling | `xps5x-gpu` | `done` | `09f44c0` | fixed detile_micro from a bogus linear (py*8+px) interior to the documented GCN thin micro-tile Z-order (Morton interleave x0y0x1y1x2y2); added inverse tile_micro + round-trip/bijection/known-mapping tests. DEPTH/DISPLAY/ROTATED modes + macro bank/pipe swizzle + hardware-exact validation vs real dumps still todo |
 | emulator/Graphics: PM4→shader→Vulkan pipeline | `kyty-graphics` → `xps5x-gpu` | `todo` | | crown jewel / M2+ — the big pipeline (needs real command-stream verification) |
 | emulator top (Audio/Controller/…) | `kyty-emulator` | `todo` | | |
 
