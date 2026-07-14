@@ -1,6 +1,9 @@
 ---
 name: verify
-description: Build, launch, drive, and screenshot the XPS5X shell (native eframe GUI) to verify UI changes on Windows
+description: >
+  Build, launch, drive, and screenshot the XPS5X egui Shell on Windows
+  (PostMessage + GetClientRect). Use after Shell/UI/launcher/theme/fullscreen
+  changes or when the user asks to verify the GUI.
 ---
 
 # Verifying XPS5X shell changes

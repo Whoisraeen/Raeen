@@ -216,7 +216,7 @@ fn draw_topbar(painter: &egui::Painter, theme: &Theme, screen: Rect) {
     painter.circle_stroke(
         av_c,
         av_r,
-        Stroke::new(1.5, with_alpha(theme.palette.focus, 0.85)),
+        Stroke::new(1.5f32, with_alpha(theme.palette.focus, 0.85)),
     );
     painter.text(
         av_c,
@@ -346,7 +346,7 @@ fn draw_nav_pills(painter: &egui::Painter, theme: &Theme, screen: Rect, nav: &Na
             painter.rect_stroke(
                 ring,
                 ring.height() / 2.0,
-                Stroke::new(2.5, theme.palette.accent),
+                Stroke::new(2.5f32, theme.palette.accent),
                 StrokeKind::Outside,
             );
         }
@@ -476,7 +476,7 @@ fn draw_rail(
                 painter.rect_stroke(
                     ring_rect.expand(spread),
                     ring_radius + spread,
-                    Stroke::new(4.0, with_alpha(theme.palette.accent, a)),
+                    Stroke::new(4.0f32, with_alpha(theme.palette.accent, a)),
                     StrokeKind::Outside,
                 );
             }
@@ -484,7 +484,7 @@ fn draw_rail(
             painter.rect_stroke(
                 ring_rect,
                 ring_radius,
-                Stroke::new(3.5, with_alpha(theme.palette.accent, ring_a)),
+                Stroke::new(3.5f32, with_alpha(theme.palette.accent, ring_a)),
                 StrokeKind::Outside,
             );
         }
@@ -630,7 +630,7 @@ fn draw_bottom_bar(painter: &egui::Painter, theme: &Theme, screen: Rect) {
     for (glyph, label) in entries {
         let c = Pos2::new(x, y);
         painter.circle_filled(c, circle_r, fill);
-        painter.circle_stroke(c, circle_r, Stroke::new(1.4, theme.palette.line));
+        painter.circle_stroke(c, circle_r, Stroke::new(1.4f32, theme.palette.line));
         icons::draw(painter, glyph, c, 13.0, theme.palette.text_dim);
         let galley = painter.layout_no_wrap(
             label.to_string(),
@@ -651,7 +651,7 @@ fn draw_bottom_bar(painter: &egui::Painter, theme: &Theme, screen: Rect) {
     painter.circle_stroke(
         Pos2::new(rx - 9.0, y),
         9.0,
-        Stroke::new(1.4, theme.palette.text_faint),
+        Stroke::new(1.4f32, theme.palette.text_faint),
     );
     painter.circle_filled(Pos2::new(rx - 9.0, y), 3.2, theme.palette.text_faint);
     icons::draw(

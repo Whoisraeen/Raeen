@@ -224,7 +224,7 @@ pub fn draw(
         painter.circle_stroke(
             center,
             radius,
-            Stroke::new(1.0, theme.palette.line.gamma_multiply(open_amount)),
+            Stroke::new(1.0f32, theme.palette.line.gamma_multiply(open_amount)),
         );
 
         let glyph_color = if focused {
@@ -301,7 +301,7 @@ fn draw_panel_card(
     painter.rect_stroke(
         rect,
         18.0,
-        Stroke::new(1.0, theme.palette.line.gamma_multiply(open)),
+        Stroke::new(1.0f32, theme.palette.line.gamma_multiply(open)),
         StrokeKind::Inside,
     );
 
