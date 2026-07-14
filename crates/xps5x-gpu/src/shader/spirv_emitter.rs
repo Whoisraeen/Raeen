@@ -3,8 +3,8 @@
 //! Converts the XPS5X shader IR into SPIR-V binary modules
 //! that can be consumed by Vulkan's shader pipeline.
 
-use super::ShaderType;
 use super::ir::IrProgram;
+use super::ShaderType;
 use tracing::info;
 use xps5x_core::error::GpuError;
 
@@ -204,5 +204,91 @@ impl SpirvModule {
 
         module.extend_from_slice(&self.instructions);
         module
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shader::ir::IrProgram;
+    use crate::shader::ShaderType;
+
+    /// An empty IR program of the given shader stage.
+    fn prog(ty: ShaderType) -> IrProgram {
+        IrProgram {
+            nodes: vec![],
+            shader_type: ty,
+            input_count: 0,
+            output_count: 0,
+            ubo_count: 0,
+            texture_count: 0,
+        }
+    }
+
+    /// A minimal SPIR-V module for an empty program of `ty`: valid magic +
+    /// header, a nonzero ID bound, and body instructions past the header.
+    fn assert_valid_spirv(ty: ShaderType) {
+        let module = emit_spirv(&prog(ty)).expect("emit_spirv must succeed");
+
+        assert!(
+            module.len() > 5,
+            "module must have a 5-word header + instructions"
+        );
+        assert_eq!(
+            module[0], SPIRV_MAGIC,
+            "word 0 must be the SPIR-V magic 0x07230203"
+        );
+        assert_eq!(
+            module[1], SPIRV_VERSION,
+            "word 1 must be the SPIR-V version"
+        );
+        // word 2 = generator (0), word 3 = id bound, word 4 = reserved (0).
+        assert!(
+            module[3] > 1,
+            "id bound must reflect the ids allocated ({})",
+            module[3]
+        );
+        assert_eq!(module[4], 0, "reserved header word must be 0");
+        // Every id used must be < the declared bound (SPIR-V's core invariant).
+        assert!(
+            module[3] <= module.len() as u32 * 4,
+            "id bound is implausibly large"
+        );
+    }
+
+    #[test]
+    fn emits_valid_spirv_header_for_every_stage() {
+        for ty in [
+            ShaderType::Vertex,
+            ShaderType::Pixel,
+            ShaderType::Compute,
+            ShaderType::Geometry,
+            ShaderType::Hull,
+            ShaderType::Domain,
+        ] {
+            assert_valid_spirv(ty);
+        }
+    }
+
+    /// A pixel shader must carry the OriginUpperLeft execution mode, and a
+    /// geometry shader the Geometry capability — stage-specific structure the
+    /// emitter is responsible for. (OpExecutionMode = opcode 16,
+    /// OpCapability = opcode 17; the low 16 bits of an instruction's first
+    /// word are its opcode.)
+    #[test]
+    fn stage_specific_instructions_are_present() {
+        let px = emit_spirv(&prog(ShaderType::Pixel)).unwrap();
+        assert!(
+            px[5..].iter().any(|&w| (w & 0xFFFF) == 16),
+            "pixel shader must emit an OpExecutionMode (OriginUpperLeft)"
+        );
+
+        let gs = emit_spirv(&prog(ShaderType::Geometry)).unwrap();
+        // Two OpCapability (Shader + Geometry) for a geometry shader.
+        let caps = gs[5..].iter().filter(|&&w| (w & 0xFFFF) == 17).count();
+        assert!(
+            caps >= 2,
+            "geometry shader must declare the Geometry capability too (got {caps})"
+        );
     }
 }
