@@ -78,6 +78,120 @@ fn hle_write(ctx: &HleContext, args: &[u64]) -> u64 {
     capped
 }
 
+/// `EBADF` (bad file descriptor) as a sign-extended negative return.
+const FILE_EBADF: u64 = (-9i64) as u64;
+/// `ENOENT` (no such file) as a sign-extended negative return.
+const FILE_ENOENT: u64 = (-2i64) as u64;
+/// `EFAULT` (bad address) as a sign-extended negative return.
+const FILE_EFAULT: u64 = (-14i64) as u64;
+/// `EINVAL` (invalid argument) as a sign-extended negative return.
+const FILE_EINVAL: u64 = (-22i64) as u64;
+/// Cap on a single `read` transfer into guest memory (bounds host staging).
+const READ_MAX_BYTES: u64 = 16 << 20; // 16 MiB
+
+/// Real `open(path, flags, mode)` / `sceKernelOpen` (VFS-backed): resolves
+/// the guest path through the kernel VFS (`/app0/…` → the game directory,
+/// etc.), opens it, and returns a file descriptor (>= 3). A path that
+/// resolves to no existing host file is a genuine `ENOENT` — homebrew that
+/// probes for optional files gets the real "not found" instead of a fake
+/// success. Console fds (0/1/2) are handled by `write`, not here.
+fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
+    let path_ptr = args.first().copied().unwrap_or(0);
+    let flags = args.get(1).copied().unwrap_or(0) as i32;
+    let mode = args.get(2).copied().unwrap_or(0) as u32;
+    debug!("open(path={path_ptr:#x}, flags={flags:#x}, mode={mode:#o})");
+
+    let Some(path_bytes) = crate::fmt::read_cstr(ctx.mem, path_ptr) else {
+        warn!("open: unreadable path pointer {path_ptr:#x} — EFAULT");
+        return FILE_EFAULT;
+    };
+    let path = String::from_utf8_lossy(&path_bytes).into_owned();
+
+    // A read-only open of a file the host doesn't have is ENOENT. The VFS
+    // `open` currently succeeds with empty data for a missing file, so probe
+    // resolve_path + existence here to report the honest error.
+    if let Some(host) = ctx.kernel.filesystem.resolve_path(&path) {
+        if !host.exists() {
+            warn!(
+                "open: '{path}' → '{}' does not exist — ENOENT",
+                host.display()
+            );
+            return FILE_ENOENT;
+        }
+    } else {
+        warn!("open: '{path}' matches no VFS mount — ENOENT");
+        return FILE_ENOENT;
+    }
+
+    match ctx.kernel.filesystem.open(&path, flags, mode) {
+        Ok(fd) => fd as u64,
+        Err(e) => {
+            warn!("open: '{path}' failed: {e} — ENOENT");
+            FILE_ENOENT
+        }
+    }
+}
+
+/// Real `read(fd, buf, count)` / `sceKernelRead` (VFS-backed): reads up to
+/// `count` bytes (capped by [`READ_MAX_BYTES`]) from the open descriptor and
+/// writes them into the guest buffer, returning the byte count actually read
+/// (0 at EOF). Bad fd → `EBADF`; unwritable buffer → `EFAULT`.
+fn hle_read(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    let buf = args.get(1).copied().unwrap_or(0);
+    let count = args.get(2).copied().unwrap_or(0).min(READ_MAX_BYTES);
+    debug!("read(fd={fd}, buf={buf:#x}, count={count:#x})");
+
+    let Ok(n) = usize::try_from(count) else {
+        return FILE_EINVAL;
+    };
+    match ctx.kernel.filesystem.read(fd, n) {
+        Ok(bytes) => {
+            if bytes.is_empty() {
+                return 0; // EOF (or an empty file) — a valid short read.
+            }
+            if !ctx.mem.write(buf, &bytes) {
+                warn!(
+                    "read: guest buffer {buf:#x} (+{}) not writable — EFAULT",
+                    bytes.len()
+                );
+                return FILE_EFAULT;
+            }
+            bytes.len() as u64
+        }
+        Err(e) => {
+            warn!("read: fd {fd} failed: {e} — EBADF");
+            FILE_EBADF
+        }
+    }
+}
+
+/// Real `close(fd)` / `sceKernelClose`: closes the VFS descriptor. Unknown
+/// fd → `EBADF`.
+fn hle_close(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    debug!("close(fd={fd})");
+    match ctx.kernel.filesystem.close(fd) {
+        Ok(()) => SCE_OK,
+        Err(_) => FILE_EBADF,
+    }
+}
+
+/// Real `lseek(fd, offset, whence)` / `sceKernelLseek`: repositions the
+/// descriptor and returns the new absolute offset. Bad fd → `EBADF`; bad
+/// `whence` or a negative resulting position → `EINVAL`.
+fn hle_lseek(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    let offset = args.get(1).copied().unwrap_or(0) as i64;
+    let whence = args.get(2).copied().unwrap_or(0) as i32;
+    debug!("lseek(fd={fd}, offset={offset}, whence={whence})");
+    match ctx.kernel.filesystem.seek(fd, offset, whence) {
+        Ok(pos) => pos,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => FILE_EBADF,
+        Err(_) => FILE_EINVAL,
+    }
+}
+
 /// `SCE_KERNEL_ERROR_EFAULT` (`0x8002000E`): the documented SCE convention
 /// of `0x8002_0000 | errno` (EFAULT = 14) — returned when a guest hands a
 /// module call an unreadable pointer.
@@ -227,6 +341,16 @@ pub fn register(registry: &HleRegistry) {
     // -- File descriptors / console I/O (M1-C) --
     registry.register("libkernel", "write", hle_write);
     registry.register("libkernel", "sceKernelWrite", hle_write);
+
+    // -- File I/O (real, VFS-backed) --
+    registry.register("libkernel", "open", hle_open);
+    registry.register("libkernel", "sceKernelOpen", hle_open);
+    registry.register("libkernel", "read", hle_read);
+    registry.register("libkernel", "sceKernelRead", hle_read);
+    registry.register("libkernel", "close", hle_close);
+    registry.register("libkernel", "sceKernelClose", hle_close);
+    registry.register("libkernel", "lseek", hle_lseek);
+    registry.register("libkernel", "sceKernelLseek", hle_lseek);
 
     // -- Module loading (M1-D) --
     registry.register(
@@ -887,6 +1011,66 @@ mod tests {
         );
     }
 
+    /// Real VFS-backed file I/O: a homebrew opens a file under /app0,
+    /// reads its bytes into a guest buffer, seeks, reads again, and closes —
+    /// all against a real host temp file mounted into the VFS.
+    #[test]
+    fn file_io_open_read_seek_close_against_a_real_host_file() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // Mount a temp dir at /app0/ and drop a real file in it.
+        let tmp = std::env::temp_dir().join(format!("xps5x-hle-fileio-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("data.bin"), b"HELLO_WORLD").unwrap();
+        // Point the existing /app0/ mount at the temp dir (set_game_directory
+        // updates it in place; a fresh `mount` would append a second, lower-
+        // priority /app0/ that resolve_path never reaches).
+        kernel.filesystem.set_game_directory(&tmp);
+
+        // open("/app0/data.bin")
+        assert!(mem.write(0x100, b"/app0/data.bin\0"));
+        let fd = hle_open(&ctx, &[0x100, 0, 0]);
+        assert!(
+            (fd as i64) >= 3,
+            "open must return a real fd, got {}",
+            fd as i64
+        );
+
+        // read 5 bytes → "HELLO"
+        let n = hle_read(&ctx, &[fd, 0x200, 5]);
+        assert_eq!(n, 5);
+        let mut buf = [0u8; 5];
+        assert!(mem.read(0x200, &mut buf));
+        assert_eq!(&buf, b"HELLO");
+
+        // lseek to absolute offset 6 (SEEK_SET), read 5 → "WORLD"
+        assert_eq!(hle_lseek(&ctx, &[fd, 6, 0]), 6);
+        let n2 = hle_read(&ctx, &[fd, 0x210, 5]);
+        assert_eq!(n2, 5);
+        let mut buf2 = [0u8; 5];
+        assert!(mem.read(0x210, &mut buf2));
+        assert_eq!(&buf2, b"WORLD");
+
+        // SEEK_END gives the file size (11).
+        assert_eq!(hle_lseek(&ctx, &[fd, 0, 2]), 11);
+        // A read at EOF returns 0.
+        assert_eq!(hle_read(&ctx, &[fd, 0x220, 5]), 0);
+
+        assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
+        // Double close / bad fd → EBADF.
+        assert_eq!(hle_close(&ctx, &[fd]) as i64, -9);
+        assert_eq!(hle_read(&ctx, &[fd, 0x220, 5]) as i64, -9);
+
+        // open of a missing file → ENOENT.
+        assert!(mem.write(0x300, b"/app0/nope.bin\0"));
+        assert_eq!(hle_open(&ctx, &[0x300, 0, 0]) as i64, -2);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// M1 hardening: GetCompiledSdkVersion writes the PS5 SDK version out and
     /// validates its pointer; getpid returns a stable nonzero pid.
     #[test]
@@ -960,6 +1144,11 @@ mod tests {
             "sceKernelMapFlexibleMemory",
             "sceKernelMunmap",
             "sceKernelMmap",
+            "sceKernelOpen",
+            "sceKernelRead",
+            "sceKernelClose",
+            "sceKernelLseek",
+            "sceKernelGetCompiledSdkVersion",
             "sceKernelGetDirectMemorySize",
             "sceKernelAvailableFlexibleMemorySize",
             "sceKernelSetVirtualRangeName",

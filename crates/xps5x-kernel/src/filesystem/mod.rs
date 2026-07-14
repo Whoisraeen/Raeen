@@ -165,6 +165,52 @@ impl VirtualFileSystem {
         Ok(data.len())
     }
 
+    /// Reposition an open file descriptor. `whence` follows POSIX:
+    /// `SEEK_SET` (0) = absolute, `SEEK_CUR` (1) = relative to current,
+    /// `SEEK_END` (2) = relative to end-of-file. Returns the new absolute
+    /// position, or an error for a bad fd / negative resulting offset.
+    pub fn seek(&self, fd: Fd, offset: i64, whence: i32) -> Result<u64, std::io::Error> {
+        let mut files = self.open_files.write();
+        let Some(file) = files.get_mut(&fd) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("fd {fd} not open"),
+            ));
+        };
+        let size = file.data.as_ref().map_or(0u64, |d| d.len() as u64);
+        let base = match whence {
+            0 => 0i64,                 // SEEK_SET
+            1 => file.position as i64, // SEEK_CUR
+            2 => size as i64,          // SEEK_END
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "bad whence",
+                ))
+            }
+        };
+        let target = base
+            .checked_add(offset)
+            .filter(|t| *t >= 0)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "seek before start of file",
+                )
+            })?;
+        file.position = target as u64;
+        Ok(file.position)
+    }
+
+    /// The size in bytes of an open file's backing data (0 if the host file
+    /// was absent at open time). Used by `fstat`/`lseek(SEEK_END)`.
+    pub fn file_size(&self, fd: Fd) -> Option<u64> {
+        self.open_files
+            .read()
+            .get(&fd)
+            .map(|f| f.data.as_ref().map_or(0, |d| d.len() as u64))
+    }
+
     /// Close a file descriptor.
     pub fn close(&self, fd: Fd) -> Result<(), std::io::Error> {
         if self.open_files.write().remove(&fd).is_some() {
