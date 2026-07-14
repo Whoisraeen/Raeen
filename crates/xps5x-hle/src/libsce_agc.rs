@@ -145,6 +145,17 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcGetDataPacketPayloadAddress",
         hle_get_data_packet_payload_address,
     );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbDispatchIndirect",
+        hle_dcb_dispatch_indirect,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDriverGetResourceRegistrationMaxNameLength",
+        hle_get_resource_max_name_length,
+    );
+    registry.register("libSceAgc", "sceAgcSuspendPoint", hle_suspend_point);
     // The Cx/Sh/Uc patch-set NIDs are behaviorally identical (the register
     // space only affects tracing), so each family shares one handler.
     for space in ["Cx", "Sh", "Uc"] {
@@ -159,6 +170,54 @@ pub fn register(registry: &HleRegistry) {
             hle_add_indirect_patch_registers,
         );
     }
+}
+
+/// Resource-registration maximum name length (`sceAgcDriver...`).
+const RESOURCE_REGISTRATION_MAX_NAME_LENGTH: u32 = 256;
+
+/// `sceAgcDcbDispatchIndirect(dcb, dataOffset, modifier)`: emit a 3-DWORD
+/// indirect dispatch packet (data offset + initiator).
+fn hle_dcb_dispatch_indirect(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let data_offset = args.get(1).copied().unwrap_or(0) as u32;
+    let modifier = args.get(2).copied().unwrap_or(0) as u32;
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 3) else {
+        return 0;
+    };
+    let initiator = (modifier & 0xA038) | 0x41;
+    let ok = ctx
+        .mem
+        .write(addr, &pm4(3, IT_DISPATCH_INDIRECT, R_ZERO).to_le_bytes())
+        && ctx.mem.write(addr + 4, &data_offset.to_le_bytes())
+        && ctx.mem.write(addr + 8, &initiator.to_le_bytes());
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcDriverGetResourceRegistrationMaxNameLength(out)`: write the max
+/// resource-registration name length (256).
+fn hle_get_resource_max_name_length(ctx: &HleContext, args: &[u64]) -> u64 {
+    let out = args.first().copied().unwrap_or(0);
+    if out == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    if !ctx
+        .mem
+        .write(out, &RESOURCE_REGISTRATION_MAX_NAME_LENGTH.to_le_bytes())
+    {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
+/// `sceAgcSuspendPoint()`: a no-op suspension marker; succeeds.
+fn hle_suspend_point(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    0
 }
 
 /// `sceAgcGetDataPacketPayloadAddress(output, command, type)`: compute the
@@ -1179,6 +1238,29 @@ mod tests {
         assert_eq!(read_u32(&ctx, cx), pm4(4, IT_NOP, R_CX_REGS_INDIRECT));
         let uc = hle_dcb_set_uc_regs_indirect(&ctx, &[cb, regs, 1]);
         assert_eq!(read_u32(&ctx, uc), pm4(4, IT_NOP, R_UC_REGS_INDIRECT));
+    }
+
+    #[test]
+    fn dcb_dispatch_indirect_max_name_length_and_suspend() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        // DcbDispatchIndirect: 3-dword packet (data offset + initiator).
+        let ret = hle_dcb_dispatch_indirect(&ctx, &[cb, 0x20, 0]);
+        assert_eq!(ret, 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(3, IT_DISPATCH_INDIRECT, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), 0x20, "data offset");
+        assert_eq!(read_u32(&ctx, 0x408), 0x41, "initiator");
+        // Max name length getter writes 256.
+        assert_eq!(hle_get_resource_max_name_length(&ctx, &[0x100]), 0);
+        assert_eq!(read_u32(&ctx, 0x100), 256);
+        assert_eq!(
+            hle_get_resource_max_name_length(&ctx, &[0]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+        // SuspendPoint is a no-op success.
+        assert_eq!(hle_suspend_point(&ctx, &[]), 0);
     }
 
     #[test]
