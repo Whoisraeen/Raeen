@@ -133,6 +133,12 @@ pub struct OrbisKernel {
     /// this so a title reads its real process-parameter block (SDK version,
     /// etc.) instead of a stub pointer.
     proc_param_addr: std::sync::atomic::AtomicU64,
+    /// The current controller snapshot as a 12-byte Orbis `ScePadData` input
+    /// prefix (buttons + sticks + triggers), or `None` when the host has not
+    /// pushed live input — in which case `scePadReadState` reports a neutral
+    /// pad. The Shell updates this each frame from its `InputManager`; the
+    /// HLE `scePadReadState` reads it. See [`set_pad_state`](Self::set_pad_state).
+    pad_state: parking_lot::Mutex<Option<[u8; 12]>>,
 }
 
 impl OrbisKernel {
@@ -148,7 +154,21 @@ impl OrbisKernel {
             next_module_id: RwLock::new(1),
             syscall_stats: DashMap::new(),
             proc_param_addr: std::sync::atomic::AtomicU64::new(0),
+            pad_state: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Push the current controller state (a 12-byte Orbis `ScePadData` input
+    /// prefix) from the host, for `scePadReadState` to report. Called each
+    /// frame by the Shell from its `InputManager`.
+    pub fn set_pad_state(&self, data: [u8; 12]) {
+        *self.pad_state.lock() = Some(data);
+    }
+
+    /// The current controller snapshot, or `None` if the host hasn't pushed
+    /// live input yet (the HLE then reports a neutral pad).
+    pub fn pad_state(&self) -> Option<[u8; 12]> {
+        *self.pad_state.lock()
     }
 
     /// Record the guest address of the main module's process-parameter block

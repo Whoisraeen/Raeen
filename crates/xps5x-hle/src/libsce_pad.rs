@@ -35,17 +35,20 @@ fn hle_pad_open(_ctx: &HleContext, args: &[u64]) -> u64 {
 /// returns `1`, not `0` — a homebrew input loop reads state until the return
 /// is positive, so the old `0` made it spin/hang forever.
 ///
-/// The state written is currently the neutral default (controller connected,
-/// no buttons, sticks centered): live host input is not yet routed through
-/// `HleContext` to the `InputManager`, so actual button presses are the
-/// follow-up. But a guest now gets a well-formed, non-garbage state and its
-/// read loop makes progress.
+/// The state written is the host's current controller snapshot
+/// (`ctx.kernel.pad_state()`, pushed each frame by the Shell) when live input
+/// is available, else a neutral default (controller connected, no buttons,
+/// sticks centered) so a guest polling before any input still gets a
+/// well-formed, non-garbage state and its read loop makes progress.
 fn hle_pad_read_state(ctx: &HleContext, args: &[u64]) -> u64 {
     let handle = args.first().copied().unwrap_or(0);
     let data = args.get(1).copied().unwrap_or(0);
     debug!("scePadReadState(handle={handle}, data={data:#x})");
 
-    let state = xps5x_input::ControllerState::default().to_orbis_pad_data();
+    let state = ctx
+        .kernel
+        .pad_state()
+        .unwrap_or_else(|| xps5x_input::ControllerState::default().to_orbis_pad_data());
     if data != 0 && !ctx.mem.write(data, &state) {
         warn!("scePadReadState: ScePadData out-buffer {data:#x} not writable");
         return 0; // no state read
@@ -84,6 +87,31 @@ mod tests {
         assert_eq!(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]), 0);
         assert_eq!(buf[4], 128);
         assert_eq!(buf[7], 128);
+    }
+
+    /// Live input pushed onto the kernel by the host flows through
+    /// scePadReadState to the guest buffer (the DualSense routing path).
+    #[test]
+    fn pad_read_state_reflects_host_pushed_live_state() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // Host pushes a state with the Cross button held (bit 0x4000) and the
+        // left stick pushed right (byte 4 = 255).
+        let mut live = [0u8; 12];
+        live[0..4].copy_from_slice(&0x0000_4000u32.to_le_bytes());
+        live[4] = 255;
+        live[5] = 128;
+        live[6] = 128;
+        live[7] = 128;
+        kernel.set_pad_state(live);
+
+        assert_eq!(hle_pad_read_state(&ctx, &[1, 0x100]), 1);
+        let mut buf = [0u8; 12];
+        assert!(mem.read(0x100, &mut buf));
+        assert_eq!(buf, live, "guest must read the host-pushed live pad state");
     }
 
     #[test]
