@@ -557,15 +557,28 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
 
-            // SysV integer argument registers (design doc §3).
-            let args = [
-                context.Rdi,
-                context.Rsi,
-                context.Rdx,
-                context.Rcx,
-                context.R8,
-                context.R9,
-            ];
+            // SysV integer argument registers (args 1-6, design doc §3),
+            // followed by the first `STACK_ARGS` on-stack integer arguments
+            // (args 7+). At this trap `Rsp` points at the `call`-pushed return
+            // address, so arg7 is at `[Rsp+8]`, arg8 at `[Rsp+16]`, … . Reads
+            // are bounds-checked against the guest arena (0 if unmapped), so
+            // functions with ≤6 args are unaffected — the extra slots are
+            // simply never consulted by their HLE bodies.
+            const STACK_ARGS: usize = 8;
+            let mut args = [0u64; 6 + STACK_ARGS];
+            args[0] = context.Rdi;
+            args[1] = context.Rsi;
+            args[2] = context.Rdx;
+            args[3] = context.Rcx;
+            args[4] = context.R8;
+            args[5] = context.R9;
+            for i in 0..STACK_ARGS {
+                let slot = context.Rsp.wrapping_add(8 + (i as u64) * 8);
+                let mut buf = [0u8; 8];
+                if mem.read(slot, &mut buf) {
+                    args[6 + i] = u64::from_le_bytes(buf);
+                }
+            }
             let hle_ctx = HleContext { kernel, mem, alloc };
             hle.call(&hle_ctx, &t.library, &t.function, &args)
                 .unwrap_or(0)
