@@ -134,6 +134,7 @@ impl HleRegistry {
         libsce_playgo::register(&registry);
         libsce_system_service::register(&registry);
         libsce_user_service::register(&registry);
+        libsce_audio_out::register(&registry);
 
         info!(
             "HLE registry: {} functions registered",
