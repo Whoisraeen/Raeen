@@ -13,7 +13,7 @@
 //! bounds-checking every offset/size against the buffer — malformed or
 //! truncated input returns a [`FirmwareError`], never panics.
 
-use goblin::elf::program_header::{PT_DYNAMIC, PT_LOAD, PT_TLS, ProgramHeader};
+use goblin::elf::program_header::{ProgramHeader, PT_DYNAMIC, PT_LOAD, PT_TLS};
 use tracing::{debug, info, warn};
 use xps5x_core::error::FirmwareError;
 
@@ -25,7 +25,6 @@ const ET_SCE_DYNAMIC: u16 = 0xFE18;
 
 /// PS5-specific program header types (mirrors `xps5x_loader::elf`).
 const PT_SCE_DYNLIBDATA: u32 = 0x6100_0000;
-#[allow(dead_code)] // named for documentation parity with xps5x-loader/src/elf.rs; not matched directly below
 const PT_SCE_PROCPARAM: u32 = 0x6100_0001;
 const PT_SCE_MODULE_PARAM: u32 = 0x6100_0002;
 const PT_SCE_RELRO: u32 = 0x6100_0010;
@@ -108,6 +107,12 @@ pub struct SprxModule {
     /// The `PT_TLS` segment (the static TLS initialization template), if
     /// present (M1-B, wall #2).
     pub tls: Option<TlsTemplate>,
+    /// The `PT_SCE_PROCPARAM` segment — the process-parameter block a real
+    /// `sceKernelGetProcParam` returns a pointer to (it carries the SDK
+    /// version, magic, and process metadata). Captured here (vaddr + bytes)
+    /// so the runtime can expose its guest address instead of dropping it;
+    /// [`proc_param_sdk_version`] pulls the SDK version out of it.
+    pub procparam: Option<SprxSegment>,
 }
 
 /// Parse a plaintext inner ELF into an [`SprxModule`].
@@ -143,6 +148,7 @@ pub fn parse_sprx(elf: &[u8]) -> Result<SprxModule, FirmwareError> {
     let mut relro = None;
     let mut dynamic = None;
     let mut tls = None;
+    let mut procparam = None;
     let mut has_module_param = false;
 
     for phdr in &parsed.program_headers {
@@ -199,6 +205,18 @@ pub fn parse_sprx(elf: &[u8]) -> Result<SprxModule, FirmwareError> {
                 );
                 dynamic = Some(slice_phdr(elf, phdr, "PT_DYNAMIC")?);
             }
+            PT_SCE_PROCPARAM => {
+                debug!(
+                    "  PT_SCE_PROCPARAM: vaddr={:#x} filesz={:#x}",
+                    phdr.p_vaddr, phdr.p_filesz
+                );
+                procparam = Some(SprxSegment {
+                    vaddr: phdr.p_vaddr,
+                    data: slice_phdr(elf, phdr, "PT_SCE_PROCPARAM")?,
+                    flags: phdr.p_flags,
+                    mem_size: phdr.p_memsz,
+                });
+            }
             PT_SCE_MODULE_PARAM => {
                 // TODO(LM1+): decode SceModuleParam to extract the real
                 // module name string; for now we only note its presence.
@@ -230,7 +248,20 @@ pub fn parse_sprx(elf: &[u8]) -> Result<SprxModule, FirmwareError> {
         dynamic,
         entry: parsed.header.e_entry,
         tls,
+        procparam,
     })
+}
+
+/// Extract the SDK version from a `PT_SCE_PROCPARAM` block, if present and
+/// large enough. The Orbis process-parameter block lays out (little-endian):
+/// `u64 size`, `u32 magic`, `u32 entry_count`, `u32 sdk_version`, ... — the
+/// SDK version is at byte offset 16. Returns `None` when there's no
+/// procparam or it's too short to hold that field, so callers degrade
+/// gracefully rather than reading past the block.
+pub fn proc_param_sdk_version(module: &SprxModule) -> Option<u32> {
+    let seg = module.procparam.as_ref()?;
+    let bytes = seg.data.get(16..20)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
 /// Slice `elf[p_offset .. p_offset + p_filesz]`, bounds-checked. Never
@@ -458,6 +489,60 @@ mod tests {
         assert_eq!(tls.align, 0x20);
         // block_size: 0x30 rounded up to max(0x20, 16) = 0x40.
         assert_eq!(tls.block_size(), 0x40);
+    }
+
+    const PT_SCE_PROCPARAM_T: u32 = 0x6100_0001;
+
+    #[test]
+    fn procparam_segment_is_captured_and_sdk_version_extracted() {
+        // A minimal proc-param block: u64 size, u32 magic, u32 entry_count,
+        // u32 sdk_version (0x09000000) at byte offset 16.
+        let mut pp = vec![0u8; 24];
+        pp[0..8].copy_from_slice(&24u64.to_le_bytes());
+        pp[8..12].copy_from_slice(&0x4942_524Fu32.to_le_bytes()); // magic
+        pp[16..20].copy_from_slice(&0x0900_0000u32.to_le_bytes()); // sdk_version
+
+        let elf = build_elf(
+            ET_SCE_DYNAMIC,
+            &[
+                PhdrSpec {
+                    p_type: PT_LOAD,
+                    p_flags: 5,
+                    p_vaddr: 0,
+                    data: vec![0u8; 8],
+                },
+                PhdrSpec {
+                    p_type: PT_SCE_PROCPARAM_T,
+                    p_flags: 4,
+                    p_vaddr: 0x5000,
+                    data: pp,
+                },
+            ],
+        );
+
+        let module = parse_sprx(&elf).expect("valid synthetic ELF with PT_SCE_PROCPARAM parses");
+        let seg = module
+            .procparam
+            .as_ref()
+            .expect("procparam captured, not dropped");
+        assert_eq!(seg.vaddr, 0x5000);
+        assert_eq!(proc_param_sdk_version(&module), Some(0x0900_0000));
+    }
+
+    #[test]
+    fn no_procparam_yields_no_sdk_version() {
+        let elf = build_elf(
+            ET_SCE_DYNAMIC,
+            &[PhdrSpec {
+                p_type: PT_LOAD,
+                p_flags: 5,
+                p_vaddr: 0,
+                data: vec![0u8; 8],
+            }],
+        );
+        let module = parse_sprx(&elf).expect("parses");
+        assert_eq!(module.procparam, None);
+        assert_eq!(proc_param_sdk_version(&module), None);
     }
 
     #[test]

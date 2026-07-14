@@ -20,16 +20,16 @@ pub mod slb2;
 pub mod sprx;
 
 pub use crypto::{
-    DecryptedSelf, KeyProvider, KeyRequest, NoKeysProvider, SegmentKey, decrypt_self, require_key,
+    decrypt_self, require_key, DecryptedSelf, KeyProvider, KeyRequest, NoKeysProvider, SegmentKey,
 };
 pub use dynlib::linker::{
-    HLE_TRAMPOLINE_BASE, HleTrampoline, LinkedModule, UNRESOLVED_STUB_ADDR, link_module,
+    link_module, HleTrampoline, LinkedModule, HLE_TRAMPOLINE_BASE, UNRESOLVED_STUB_ADDR,
 };
 pub use pup::Firmware;
 pub use registry::{ModulePolicy, ModuleRegistry, Resolver};
 pub use report::summarize;
-pub use slb2::{Slb2Entry, parse_slb2};
-pub use sprx::{SprxModule, SprxSegment, TlsTemplate, parse_sprx};
+pub use slb2::{parse_slb2, Slb2Entry};
+pub use sprx::{parse_sprx, proc_param_sdk_version, SprxModule, SprxSegment, TlsTemplate};
 
 use xps5x_core::error::FirmwareError;
 

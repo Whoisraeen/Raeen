@@ -71,6 +71,7 @@ fn build_synthetic_module(
         dynamic: None,
         entry: entry_off as u64,
         tls: None,
+        procparam: None,
     };
 
     let dynlib = DynlibData {
@@ -357,6 +358,7 @@ fn memcpy_hle_call_moves_real_bytes_through_the_runtime() {
         dynamic: None,
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam: None,
     };
 
     let dynlib = DynlibData {
@@ -464,6 +466,7 @@ fn malloc_hle_call_returns_a_pointer_inside_the_heap_region() {
         dynamic: None,
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam: None,
     };
 
     let dynlib = DynlibData {
@@ -644,6 +647,7 @@ fn malloc_then_memset_then_readback_proves_real_guest_heap_memory() {
         dynamic: None,
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam: None,
     };
 
     let dynlib = DynlibData {
@@ -861,6 +865,7 @@ fn mmap_then_memset_then_readback_proves_real_arena_memory_and_records_vmm_metad
         dynamic: None,
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam: None,
     };
 
     let dynlib = DynlibData {
@@ -1019,6 +1024,7 @@ fn guest_call_runs_on_dedicated_guest_stack_region() {
         dynamic: None,
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam: None,
     };
 
     let dynlib = DynlibData {
@@ -1806,6 +1812,7 @@ fn tls_variable_read_through_linker_computed_tpoff64_round_trips_tdata() {
             mem_size: 0x18,
             align: 0x10,
         }),
+        procparam: None,
     };
 
     let dynlib = DynlibData {
@@ -1984,6 +1991,7 @@ fn printf_with_guest_format_string_lands_in_the_kernel_console() {
         dynamic: None,
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam: None,
     };
     let dynlib = DynlibData {
         symbols: vec![
@@ -2095,6 +2103,7 @@ fn load_start_module_from_guest_returns_a_usable_handle() {
         dynamic: None,
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam: None,
     };
     let dynlib = DynlibData {
         symbols: vec![
@@ -2206,6 +2215,7 @@ fn new_libc_strchr_resolves_and_dispatches_through_the_linker() {
         dynamic: None,
         entry: ENTRY_OFF as u64,
         tls: None,
+        procparam: None,
     };
     let dynlib = DynlibData {
         symbols: vec![

@@ -86,7 +86,8 @@ Second-opinion PS5 emu (C#). Re-implement in Rust; do not vendor C#.
 | libc atoi/strtol/strtoul | compat exports | `xps5x-hle` | `done` | `4f86ea0` | real base-0 parse + endptr |
 | time / usleep | kernel time exports | `xps5x-hle` | `done` | `922d0bf` | real host clock; usleep really sleeps |
 | GetCompiledSdkVersion / getpid | KernelExports | `xps5x-hle` | `done` | `9457258` | PS5 SDK 9.00 (Gen5); stable pid |
-| SELF / eboot / Prospero loader | Loader | `xps5x-firmware` | `todo` | | cross-check vs Kyty |
+| SELF / eboot loader: PT_SCE_PROCPARAM capture | Loader | `xps5x-firmware` | `done` | (procparam batch) | cross-check vs SharpEmu Loader found we silently dropped PT_SCE_PROCPARAM (the proc-param block sceKernelGetProcParam returns). Now captured in SprxModule.procparam + proc_param_sdk_version() extracts the SDK version. Runtime→HLE wiring of GetProcParam to return its guest address is the follow-up |
+| SELF / eboot loader: remaining (rebase, full param decode) | Loader | `xps5x-firmware` | `todo` | | non-zero load bias rebase, PT_SCE_MODULE_PARAM name extraction |
 | PRX / sysmodule load chain | Kernel / Libs | `xps5x-firmware`/`hle` | `todo` | | |
 | Fiber / AMPR | Kernel | `xps5x-hle`/`runtime` | `todo` | | |
 | PlayGo | Libs | `xps5x-hle` | `done` | `39f7e58` | new libsce_playgo.rs: all chunks LOCUS_LOCAL_FAST, progress==total (complete), empty to-do list, handle out — "everything installed" so titles skip download gating (SharpEmu-cross-checked values). 13 NIDs; 3 tests |
