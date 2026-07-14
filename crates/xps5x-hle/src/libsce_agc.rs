@@ -167,6 +167,12 @@ pub fn register(registry: &HleRegistry) {
         hle_get_resource_max_name_length,
     );
     registry.register("libSceAgc", "sceAgcSuspendPoint", hle_suspend_point);
+    // A Gen5 driver call whose only observable effect is a trace → benign OK.
+    registry.register(
+        "libSceAgc",
+        "sceAgcDriverUnknown_KRzWekV120",
+        hle_suspend_point,
+    );
     registry.register(
         "libSceAgc",
         "sceAgcDriverRegisterDefaultOwner",
