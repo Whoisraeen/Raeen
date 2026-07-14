@@ -206,3 +206,53 @@ fn classify_instruction(word: u32) -> (Encoding, u32, u32) {
     warn!("Unknown instruction encoding: {:#010x}", word);
     (Encoding::Sopp, 0, 4)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Flatten `words` into a little-endian byte stream (as a real shader
+    /// binary is laid out).
+    fn bytes(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn too_small_binary_errors() {
+        assert!(decode(&[0u8; 3]).is_err(), "a <4-byte binary can't hold an instruction");
+    }
+
+    #[test]
+    fn classifies_encodings_and_widths() {
+        // VOP2 (bit31=0, not the VOP1/VOPC sub-patterns) → 4 bytes.
+        assert_eq!(classify_instruction(0x0000_0000), (Encoding::Vop2, 0, 4));
+        // VOP3 (top6 == 0b110100 == 0x34) → 8 bytes.
+        assert_eq!(classify_instruction(0xD000_0000).0, Encoding::Vop3);
+        assert_eq!(classify_instruction(0xD000_0000).2, 8);
+        // SOPP (top9 == 0b101111101); opcode 1 == S_ENDPGM.
+        let endpgm = (0b1_0111_1101u32 << 23) | 0x01;
+        assert_eq!(classify_instruction(endpgm), (Encoding::Sopp, 1, 4));
+    }
+
+    #[test]
+    fn decodes_a_stream_and_stops_at_s_endpgm() {
+        let endpgm = (0b1_0111_1101u32 << 23) | 0x01;
+        // VOP2 (4B), VOP3 (8B: word0 + word1), S_ENDPGM (4B), then a trailing
+        // word that must NOT be decoded (decode stops at S_ENDPGM).
+        let binary = bytes(&[0x0000_0000, 0xD000_0000, 0x0000_0000, endpgm, 0xDEAD_BEEF]);
+        let insns = decode(&binary).expect("decodes");
+
+        assert_eq!(insns.len(), 3, "VOP2 + VOP3 + S_ENDPGM (trailing word not reached)");
+        assert_eq!(insns[0].encoding, Encoding::Vop2);
+        assert_eq!(insns[0].size, 4);
+        assert_eq!(insns[1].encoding, Encoding::Vop3);
+        assert_eq!(insns[1].size, 8);
+        assert_eq!(insns[1].raw, 0xD000_0000, "VOP3 raw is (word1<<32)|word0");
+        assert_eq!(insns[2].encoding, Encoding::Sopp);
+        assert_eq!(insns[2].opcode, 1, "S_ENDPGM");
+        // Byte offsets advance by each instruction's width.
+        assert_eq!(insns[0].offset, 0);
+        assert_eq!(insns[1].offset, 4);
+        assert_eq!(insns[2].offset, 12);
+    }
+}
