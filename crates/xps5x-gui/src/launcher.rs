@@ -766,6 +766,9 @@ mod firmware_launcher_tests {
         const PT_DYNAMIC: u32 = 2;
         const DT_SCE_JMPREL: u64 = 0x6100_0029;
         const DT_SCE_PLTRELSZ: u64 = 0x6100_002D;
+        const DT_SCE_RELA: u64 = 0x6100_002F;
+        const DT_SCE_RELASZ: u64 = 0x6100_0031;
+        const DT_SCE_RELAENT: u64 = 0x6100_0033;
         const DT_SCE_STRTAB: u64 = 0x6100_0035;
         const DT_SCE_STRSZ: u64 = 0x6100_0037;
         const DT_SCE_SYMTAB: u64 = 0x6100_0039;
@@ -780,6 +783,16 @@ mod firmware_launcher_tests {
             p_flags: u32,
             p_vaddr: u64,
             data: Vec<u8>,
+            /// `p_memsz`. Usually equals `data.len()` (`p_filesz`), but a real
+            /// compiler-produced `PT_LOAD` can have `p_memsz > p_filesz` (a
+            /// `.bss`/`.relro_padding` tail); the `PT_TLS` template likewise
+            /// needs its own `p_memsz`. Kept explicit so the M1 compiler
+            /// fixture can round-trip guest.so's segments faithfully.
+            p_memsz: u64,
+            /// `p_align` — carried through so a `PT_TLS`'s alignment reaches
+            /// the loader's `TlsTemplate` (the runtime's TLS-block placement
+            /// reads it). `0` for segments that don't care.
+            p_align: u64,
         }
 
         /// General-purpose ELF64 builder (unlike `build_minimal_elf`, takes
@@ -813,7 +826,8 @@ mod firmware_launcher_tests {
                 ph[8..16].copy_from_slice(&offset.to_le_bytes()); // p_offset
                 ph[16..24].copy_from_slice(&spec.p_vaddr.to_le_bytes()); // p_vaddr
                 ph[32..40].copy_from_slice(&(spec.data.len() as u64).to_le_bytes()); // p_filesz
-                ph[40..48].copy_from_slice(&(spec.data.len() as u64).to_le_bytes()); // p_memsz
+                ph[40..48].copy_from_slice(&spec.p_memsz.to_le_bytes()); // p_memsz
+                ph[48..56].copy_from_slice(&spec.p_align.to_le_bytes()); // p_align
                 phdr_bytes.extend_from_slice(&ph);
 
                 seg_bytes.extend_from_slice(&spec.data);
@@ -908,18 +922,24 @@ mod firmware_launcher_tests {
                         p_type: PT_LOAD,
                         p_flags: 5,
                         p_vaddr: 0,
+                        p_memsz: load_bytes.len() as u64,
+                        p_align: 0,
                         data: load_bytes,
                     },
                     PhdrSpec {
                         p_type: 0x6100_0000, /* PT_SCE_DYNLIBDATA */
                         p_flags: 4,
                         p_vaddr: 0,
+                        p_memsz: dynlib_blob.len() as u64,
+                        p_align: 0,
                         data: dynlib_blob,
                     },
                     PhdrSpec {
                         p_type: PT_DYNAMIC,
                         p_flags: 6,
                         p_vaddr: 0x2000,
+                        p_memsz: dynamic_bytes.len() as u64,
+                        p_align: 0,
                         data: dynamic_bytes,
                     },
                 ],
@@ -1000,18 +1020,24 @@ mod firmware_launcher_tests {
                         p_type: PT_LOAD,
                         p_flags: 5,
                         p_vaddr: 0,
+                        p_memsz: load_bytes.len() as u64,
+                        p_align: 0,
                         data: load_bytes,
                     },
                     PhdrSpec {
                         p_type: 0x6100_0000, /* PT_SCE_DYNLIBDATA */
                         p_flags: 4,
                         p_vaddr: 0,
+                        p_memsz: dynlib_blob.len() as u64,
+                        p_align: 0,
                         data: dynlib_blob,
                     },
                     PhdrSpec {
                         p_type: PT_DYNAMIC,
                         p_flags: 6,
                         p_vaddr: 0x2000,
+                        p_memsz: dynamic_bytes.len() as u64,
+                        p_align: 0,
                         data: dynamic_bytes,
                     },
                 ],
@@ -1129,18 +1155,24 @@ mod firmware_launcher_tests {
                         p_type: PT_LOAD,
                         p_flags: 5,
                         p_vaddr: 0,
+                        p_memsz: load_bytes.len() as u64,
+                        p_align: 0,
                         data: load_bytes,
                     },
                     PhdrSpec {
                         p_type: 0x6100_0000, /* PT_SCE_DYNLIBDATA */
                         p_flags: 4,
                         p_vaddr: 0,
+                        p_memsz: dynlib_blob.len() as u64,
+                        p_align: 0,
                         data: dynlib_blob,
                     },
                     PhdrSpec {
                         p_type: PT_DYNAMIC,
                         p_flags: 6,
                         p_vaddr: 0x2000,
+                        p_memsz: dynamic_bytes.len() as u64,
+                        p_align: 0,
                         data: dynamic_bytes,
                     },
                 ],
@@ -1398,18 +1430,24 @@ mod firmware_launcher_tests {
                         p_type: PT_LOAD,
                         p_flags: 7,
                         p_vaddr: 0,
+                        p_memsz: load_bytes.len() as u64,
+                        p_align: 0,
                         data: load_bytes,
                     },
                     PhdrSpec {
                         p_type: 0x6100_0000, /* PT_SCE_DYNLIBDATA */
                         p_flags: 4,
                         p_vaddr: 0,
+                        p_memsz: dynlib_blob.len() as u64,
+                        p_align: 0,
                         data: dynlib_blob,
                     },
                     PhdrSpec {
                         p_type: PT_DYNAMIC,
                         p_flags: 6,
                         p_vaddr: 0x2000,
+                        p_memsz: dynamic_bytes.len() as u64,
+                        p_align: 0,
                         data: dynamic_bytes,
                     },
                 ],
@@ -1527,6 +1565,350 @@ mod firmware_launcher_tests {
             assert!(
                 detail.contains("0 unresolved"),
                 "unexpected message: {detail}"
+            );
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        // --- M1 FINAL acceptance: compiler-produced homebrew ---------------
+        //
+        // Everything above is *synthetic* (hand-assembled machine code +
+        // hand-laid dynlib blobs). The M1 gate proper requires a
+        // **toolchain-built** binary: nightly `rustc` compiles a real
+        // `no_std` guest to a Linux `cdylib`, which is re-wrapped as an SCE
+        // `eboot.bin` and driven through the *same* Shell launch path. It
+        // proves, with compiler-emitted code, the full M1 wall stack at once:
+        // crt0 `argc` read at `_start`, a `#[thread_local]` resolved through a
+        // real `R_X86_64_TPOFF64`, the `fs:0x28` stack canary (`-Z
+        // stack-protector=all`), and real `printf`/`write` HLE dispatch.
+
+        /// The exact validated guest program (see the module-level rationale):
+        /// `guest_main` must return normally (else `-Z stack-protector=all`
+        /// elides the canary), `-Bsymbolic` keeps defined symbols from
+        /// becoming imports, and the `rust_eh_personality` stub avoids a
+        /// spurious unresolved import.
+        const GUEST_SRC: &str = r####"#![no_std]
+#![no_main]
+#![feature(thread_local)]
+use core::panic::PanicInfo;
+#[thread_local]
+static mut TLS_VAR: u64 = 0xAB;
+extern "C" {
+    fn printf(fmt: *const u8, ...) -> i32;
+    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn exit(code: i32) -> !;
+}
+#[no_mangle]
+pub extern "C" fn guest_main(argc: u64) -> u64 {
+    let mut buf = [0u8; 24];
+    let mut i = 0usize;
+    while i < buf.len() { buf[i] = (argc as u8).wrapping_add(i as u8); i += 1; }
+    unsafe {
+        let tls = TLS_VAR.wrapping_add(buf[0] as u64);
+        TLS_VAR = tls;
+        printf(b"argc=%d tls=%d\n\0".as_ptr(), argc as i32, tls as i32);
+        let msg = b"bye\n\0";
+        write(1, msg.as_ptr(), 4);
+        tls
+    }
+}
+core::arch::global_asm!(
+    ".global _start", "_start:",
+    "  mov rdi, [rsp]", "  call guest_main", "  xor edi, edi", "  call exit",
+);
+#[panic_handler]
+fn panic(_: &PanicInfo) -> ! { loop {} }
+#[no_mangle]
+pub extern "C" fn rust_eh_personality() {}
+"####;
+
+        /// Read a NUL-terminated string from `buf` starting at `off`.
+        fn read_cstr(buf: &[u8], off: usize) -> Option<String> {
+            let rest = buf.get(off..)?;
+            let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+            Some(String::from_utf8_lossy(&rest[..end]).into_owned())
+        }
+
+        /// Compile [`GUEST_SRC`] with the validated nightly-rustc invocation.
+        /// Returns `None` (the test then skips) if the toolchain — nightly
+        /// `rustc`, the `x86_64-unknown-linux-gnu` target, or `rust-lld` —
+        /// isn't available or the build fails for any reason.
+        fn build_guest_so(dir: &Path) -> Option<Vec<u8>> {
+            let src = dir.join("guest.rs");
+            std::fs::write(&src, GUEST_SRC).ok()?;
+            let so = dir.join("guest.so");
+
+            // A single space-joined `-C link-args=...` value (the linker
+            // splits it on spaces).
+            let link_args = "-shared -z now -nostdlib -e _start \
+                 --no-dynamic-linker --allow-shlib-undefined -Bsymbolic";
+            let output = std::process::Command::new("rustc")
+                .arg("+nightly")
+                .arg(&src)
+                .args([
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "--edition",
+                    "2021",
+                    "--crate-type",
+                    "cdylib",
+                    "-C",
+                    "panic=abort",
+                    "-C",
+                    "relocation-model=pic",
+                    "-Z",
+                    "stack-protector=all",
+                    "-Z",
+                    "tls-model=initial-exec",
+                    "-C",
+                    "linker=rust-lld",
+                    "-C",
+                    "linker-flavor=ld.lld",
+                    "-C",
+                ])
+                .arg(format!("link-args={link_args}"))
+                .arg("-o")
+                .arg(&so)
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                eprintln!(
+                    "SKIP: guest.so build failed (nightly rustc / linux target / rust-lld \
+                     unavailable):\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return None;
+            }
+            std::fs::read(&so).ok()
+        }
+
+        /// Re-synthesize a compiler-built Linux `cdylib` (`elf_bytes`) as a
+        /// plaintext-SELF SCE `eboot.bin`: every `PT_LOAD` and the `PT_TLS`
+        /// are carried through with their original vaddrs (the linker lays a
+        /// flat `image[p_vaddr..]`), the `.dynsym` is copied 1:1 with each
+        /// undefined import's name rewritten to its `encode_nid(nid)#A#A` SCE
+        /// form, and every dynamic relocation is copied verbatim — `r_offset`,
+        /// `r_info` (so `r_sym`/`r_type` are preserved), and `r_addend` (load
+        /// -bearing for `TPOFF64`, whose TLS offset lives in the addend, and
+        /// for the `RELATIVE` addend-based fixups) — bucketed into
+        /// `DT_SCE_JMPREL` (JUMP_SLOT) vs `DT_SCE_RELA` (everything else).
+        fn synthesize_sce_eboot(elf_bytes: &[u8]) -> Option<Vec<u8>> {
+            use goblin::elf::Elf;
+            const PT_TLS: u32 = 7;
+            const PT_SCE_DYNLIBDATA: u32 = 0x6100_0000;
+            const R_JUMP_SLOT: u32 = 7;
+
+            let elf = Elf::parse(elf_bytes).ok()?;
+            let entry = elf.header.e_entry;
+
+            // PT_LOAD (vaddrs preserved) + the single PT_TLS template.
+            let mut phdrs: Vec<PhdrSpec> = Vec::new();
+            let mut tls_spec: Option<PhdrSpec> = None;
+            for ph in elf.program_headers.iter() {
+                if ph.p_type != PT_LOAD && ph.p_type != PT_TLS {
+                    continue;
+                }
+                let start = ph.p_offset as usize;
+                let end = start.checked_add(ph.p_filesz as usize)?;
+                let data = elf_bytes.get(start..end)?.to_vec();
+                let spec = PhdrSpec {
+                    p_type: ph.p_type,
+                    p_flags: ph.p_flags,
+                    p_vaddr: ph.p_vaddr,
+                    p_memsz: ph.p_memsz,
+                    p_align: ph.p_align,
+                    data,
+                };
+                if ph.p_type == PT_TLS {
+                    tls_spec = Some(spec);
+                } else {
+                    phdrs.push(spec);
+                }
+            }
+            // The fixture has a `#[thread_local]`, so a PT_TLS must exist —
+            // its absence means the compiler produced something unexpected.
+            let tls_spec = tls_spec?;
+
+            // Locate the dynamic-linking sections by name, read raw.
+            let section = |name: &str| -> Option<(usize, usize)> {
+                elf.section_headers.iter().find_map(|sh| {
+                    if elf.shdr_strtab.get_at(sh.sh_name) == Some(name) {
+                        Some((sh.sh_offset as usize, sh.sh_size as usize))
+                    } else {
+                        None
+                    }
+                })
+            };
+            let (dynsym_off, dynsym_sz) = section(".dynsym")?;
+            let (dynstr_off, dynstr_sz) = section(".dynstr")?;
+            let dynsym_raw = elf_bytes.get(dynsym_off..dynsym_off.checked_add(dynsym_sz)?)?;
+            let dynstr_raw = elf_bytes.get(dynstr_off..dynstr_off.checked_add(dynstr_sz)?)?;
+
+            // Index-preserving `.dynsym` copy: undefined named symbols become
+            // NID imports (so the linker NID-resolves them to HLE); every
+            // other entry (the null symbol, defined symbols) is a benign,
+            // never-relocation-referenced placeholder with `is_import` false.
+            let mut strtab: Vec<u8> = vec![0u8];
+            let mut symtab: Vec<u8> = Vec::new();
+            for sym in dynsym_raw.chunks_exact(24) {
+                let st_name = u32::from_le_bytes(sym[0..4].try_into().unwrap());
+                let st_shndx = u16::from_le_bytes(sym[6..8].try_into().unwrap());
+                if st_shndx == 0 && st_name != 0 {
+                    let cname = read_cstr(dynstr_raw, st_name as usize)?;
+                    let nid = xps5x_firmware::dynlib::nid::nid_of(&cname);
+                    let sce_name = format!("{}#A#A", xps5x_firmware::dynlib::nid::encode_nid(nid));
+                    let name_off = strtab.len() as u32;
+                    strtab.extend_from_slice(sce_name.as_bytes());
+                    strtab.push(0);
+                    symtab.extend_from_slice(&name_off.to_le_bytes()); // st_name
+                    symtab.push(0x10); // st_info = STB_GLOBAL | STT_NOTYPE
+                    symtab.push(0); // st_other
+                    symtab.extend_from_slice(&0u16.to_le_bytes()); // st_shndx = UNDEF
+                    symtab.extend_from_slice(&0u64.to_le_bytes()); // st_value
+                    symtab.extend_from_slice(&0u64.to_le_bytes()); // st_size
+                } else {
+                    symtab.extend_from_slice(&0u32.to_le_bytes()); // st_name = 0
+                    symtab.push(0x10);
+                    symtab.push(0);
+                    symtab.extend_from_slice(&1u16.to_le_bytes()); // st_shndx != 0 (defined)
+                    symtab.extend_from_slice(&1u64.to_le_bytes()); // st_value != 0
+                    symtab.extend_from_slice(&0u64.to_le_bytes());
+                }
+            }
+
+            // Every dynamic relocation, verbatim, bucketed by type.
+            let mut rela: Vec<u8> = Vec::new();
+            let mut jmprel: Vec<u8> = Vec::new();
+            for name in [".rela.dyn", ".rela.plt"] {
+                let Some((off, sz)) = section(name) else {
+                    continue;
+                };
+                let raw = elf_bytes.get(off..off.checked_add(sz)?)?;
+                for r in raw.chunks_exact(24) {
+                    let r_info = u64::from_le_bytes(r[8..16].try_into().unwrap());
+                    if (r_info & 0xFFFF_FFFF) as u32 == R_JUMP_SLOT {
+                        jmprel.extend_from_slice(r);
+                    } else {
+                        rela.extend_from_slice(r);
+                    }
+                }
+            }
+
+            // Blob layout: [strtab][symtab][rela][jmprel]; all dynamic-table
+            // offsets below are offsets *into this blob*.
+            let strtab_off = 0u64;
+            let symtab_off = strtab.len() as u64;
+            let rela_off = symtab_off + symtab.len() as u64;
+            let jmprel_off = rela_off + rela.len() as u64;
+            let mut blob = Vec::new();
+            blob.extend_from_slice(&strtab);
+            blob.extend_from_slice(&symtab);
+            blob.extend_from_slice(&rela);
+            blob.extend_from_slice(&jmprel);
+
+            let mut dynamic = Vec::new();
+            let mut push_tag = |tag: u64, val: u64| {
+                dynamic.extend_from_slice(&tag.to_le_bytes());
+                dynamic.extend_from_slice(&val.to_le_bytes());
+            };
+            push_tag(DT_SCE_STRTAB, strtab_off);
+            push_tag(DT_SCE_STRSZ, strtab.len() as u64);
+            push_tag(DT_SCE_SYMTAB, symtab_off);
+            push_tag(DT_SCE_SYMTABSZ, symtab.len() as u64);
+            push_tag(DT_SCE_SYMENT, 24);
+            push_tag(DT_SCE_RELA, rela_off);
+            push_tag(DT_SCE_RELASZ, rela.len() as u64);
+            push_tag(DT_SCE_RELAENT, 24);
+            push_tag(DT_SCE_JMPREL, jmprel_off);
+            push_tag(DT_SCE_PLTRELSZ, jmprel.len() as u64);
+            push_tag(DT_NULL, 0);
+
+            // PT_LOADs + PT_TLS + PT_SCE_DYNLIBDATA + PT_DYNAMIC. The dynlib
+            // and dynamic segments are parsed by file offset (not mapped by
+            // vaddr), so their vaddrs are irrelevant — set to 0.
+            phdrs.push(tls_spec);
+            phdrs.push(PhdrSpec {
+                p_type: PT_SCE_DYNLIBDATA,
+                p_flags: 4,
+                p_vaddr: 0,
+                p_memsz: blob.len() as u64,
+                p_align: 0,
+                data: blob,
+            });
+            phdrs.push(PhdrSpec {
+                p_type: PT_DYNAMIC,
+                p_flags: 6,
+                p_vaddr: 0,
+                p_memsz: dynamic.len() as u64,
+                p_align: 0,
+                data: dynamic,
+            });
+
+            let sce_elf = build_elf_with_entry(ET_SCE_DYNAMIC, entry, &phdrs);
+            Some(build_plaintext_self(&sce_elf))
+        }
+
+        /// Build the M1 fixture end-to-end, writing it as
+        /// `<dir>/Games/compiler-homebrew/eboot.bin`. `None` ⇒ skip.
+        fn build_compiler_homebrew_eboot(dir: &Path) -> Option<PathBuf> {
+            let elf_bytes = build_guest_so(dir)?;
+            let sce = synthesize_sce_eboot(&elf_bytes)?;
+            let game_dir = dir.join("Games").join("compiler-homebrew");
+            std::fs::create_dir_all(&game_dir).ok()?;
+            let eboot = game_dir.join("eboot.bin");
+            std::fs::write(&eboot, &sce).ok()?;
+            Some(eboot)
+        }
+
+        /// M1 FINAL acceptance. Compiler-emitted machine code runs through the
+        /// Shell's real `FirmwareLauncher::launch` → `load_module` →
+        /// `execute_process` path and produces byte-exact observable output.
+        #[test]
+        fn compiler_built_homebrew_runs_through_shell_and_prints() {
+            let tmp = std::env::temp_dir().join(format!(
+                "xps5x-gui-compiler-homebrew-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+            let Some(eboot) = build_compiler_homebrew_eboot(&tmp) else {
+                // Toolchain unavailable — skip cleanly (see `build_guest_so`).
+                let _ = std::fs::remove_dir_all(&tmp);
+                return;
+            };
+
+            let launcher = FirmwareLauncher::new();
+            let handle = launcher
+                .launch(&LaunchTarget::Game { path: eboot })
+                .expect("launch always returns a handle");
+
+            let detail = launcher
+                .session_detail(&handle)
+                .expect("a ran session has detail text");
+            assert_eq!(
+                launcher.session_state(&handle),
+                SessionState::Running,
+                "detail: {detail}"
+            );
+            // `_start` runs `guest_main` then `exit(0)`, the well-formed way.
+            assert!(
+                detail.starts_with("Ran to exit(0x0)"),
+                "compiler homebrew should exit(0) — detail: {detail}"
+            );
+            // printf, write, exit, memset, __stack_chk_fail — all HLE.
+            assert!(
+                detail.contains("5 HLE imports resolved"),
+                "detail: {detail}"
+            );
+            assert!(detail.contains("0 unresolved"), "detail: {detail}");
+
+            // Byte-exact guest stdout: printf's `argc=1 tls=172\n` (argc == 1
+            // from the process stack; tls == 0xAB + buf[0] == 0xAB + argc ==
+            // 172) followed by write's `bye\n`.
+            let console = launcher.kernel.console.contents();
+            assert_eq!(
+                console, "argc=1 tls=172\nbye\n",
+                "unexpected guest console output; detail: {detail}"
             );
 
             let _ = std::fs::remove_dir_all(&tmp);

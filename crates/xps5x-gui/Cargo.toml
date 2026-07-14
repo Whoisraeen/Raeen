@@ -37,3 +37,10 @@ ureq = { workspace = true }
 # Local wall-clock for the Shell's top-bar time (Win32 GetLocalTime) — the
 # workspace dep, no new crates (spec §11).
 windows-sys = { workspace = true }
+
+[dev-dependencies]
+# Parse a compiler-produced `guest.so` (a real nightly-rustc cdylib) in the
+# M1 acceptance test so the synthesized SCE eboot faithfully mirrors its
+# segments, dynamic symbols, and relocations. Workspace-pinned (0.9), same as
+# xps5x-firmware.
+goblin = { workspace = true }
