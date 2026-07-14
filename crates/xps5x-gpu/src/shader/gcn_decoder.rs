@@ -61,7 +61,7 @@ pub enum Encoding {
 }
 
 /// Instruction operand.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operand {
     /// Scalar general-purpose register (s0-s103).
     Sgpr(u32),
@@ -125,12 +125,16 @@ pub fn decode(binary: &[u8]) -> Result<Vec<Instruction>, GpuError> {
             word0 as u64
         };
 
+        // Populate operands for the encodings we model precisely; other
+        // encodings keep empty operand lists until their layout is decoded.
+        let (src, dst) = decode_operands(encoding, word0);
+
         let instruction = Instruction {
             encoding,
             opcode,
             raw,
-            src: Vec::new(), // Operand decoding is encoding-specific.
-            dst: None,
+            src,
+            dst,
             size,
             offset,
         };
@@ -147,6 +151,57 @@ pub fn decode(binary: &[u8]) -> Result<Vec<Instruction>, GpuError> {
     }
 
     Ok(instructions)
+}
+
+/// Decode the source/destination operands for the encodings whose layout we
+/// model. VOP1/VOP2 share the 9-bit SRC0 field + 8-bit VGPR fields; other
+/// encodings return empty operands until their layout is added.
+fn decode_operands(encoding: Encoding, word: u32) -> (Vec<Operand>, Option<Operand>) {
+    match encoding {
+        // VOP2: SRC0[8:0] (any source), VSRC1[16:9] (VGPR), VDST[24:17] (VGPR).
+        Encoding::Vop2 => {
+            let src0 = decode_src9(word & 0x1FF);
+            let src1 = Operand::Vgpr((word >> 9) & 0xFF);
+            let vdst = Operand::Vgpr((word >> 17) & 0xFF);
+            (vec![src0, src1], Some(vdst))
+        }
+        // VOP1: SRC0[8:0] (any source), OP[16:9], VDST[24:17] (VGPR).
+        Encoding::Vop1 => {
+            let src0 = decode_src9(word & 0x1FF);
+            let vdst = Operand::Vgpr((word >> 17) & 0xFF);
+            (vec![src0], Some(vdst))
+        }
+        _ => (Vec::new(), None),
+    }
+}
+
+/// Decode a 9-bit VOP source field (SRC0 / SSRC) into an operand: SGPRs,
+/// VGPRs, inline integer/float constants, the common special registers, and
+/// the literal-follows marker. Values are per the RDNA2 ISA source encoding.
+fn decode_src9(field: u32) -> Operand {
+    match field {
+        0..=101 => Operand::Sgpr(field),
+        106 => Operand::Special(SpecialReg::Vcc), // VCC_LO
+        124 => Operand::Special(SpecialReg::M0),
+        125 => Operand::Special(SpecialReg::Null),
+        126 => Operand::Special(SpecialReg::Exec), // EXEC_LO
+        128 => Operand::InlineConst(0),
+        129..=192 => Operand::InlineConst((field - 128) as i32), // +1..+64
+        193..=208 => Operand::InlineConst(-((field - 192) as i32)), // -1..-16
+        // Inline floating-point constants — carried as their IEEE-754 bit pattern.
+        240 => Operand::Literal(0.5f32.to_bits()),
+        241 => Operand::Literal((-0.5f32).to_bits()),
+        242 => Operand::Literal(1.0f32.to_bits()),
+        243 => Operand::Literal((-1.0f32).to_bits()),
+        244 => Operand::Literal(2.0f32.to_bits()),
+        245 => Operand::Literal((-2.0f32).to_bits()),
+        246 => Operand::Literal(4.0f32.to_bits()),
+        247 => Operand::Literal((-4.0f32).to_bits()),
+        255 => Operand::Literal(0), // literal dword follows the instruction
+        256..=511 => Operand::Vgpr(field - 256),
+        // Remaining special registers (VCC_HI/EXEC_HI/TMA/TTMP/…) not yet modeled.
+        _ => Operand::Special(SpecialReg::Null),
+    }
 }
 
 /// Classify an instruction by examining the high bits of the first word.
@@ -219,7 +274,10 @@ mod tests {
 
     #[test]
     fn too_small_binary_errors() {
-        assert!(decode(&[0u8; 3]).is_err(), "a <4-byte binary can't hold an instruction");
+        assert!(
+            decode(&[0u8; 3]).is_err(),
+            "a <4-byte binary can't hold an instruction"
+        );
     }
 
     #[test]
@@ -242,7 +300,11 @@ mod tests {
         let binary = bytes(&[0x0000_0000, 0xD000_0000, 0x0000_0000, endpgm, 0xDEAD_BEEF]);
         let insns = decode(&binary).expect("decodes");
 
-        assert_eq!(insns.len(), 3, "VOP2 + VOP3 + S_ENDPGM (trailing word not reached)");
+        assert_eq!(
+            insns.len(),
+            3,
+            "VOP2 + VOP3 + S_ENDPGM (trailing word not reached)"
+        );
         assert_eq!(insns[0].encoding, Encoding::Vop2);
         assert_eq!(insns[0].size, 4);
         assert_eq!(insns[1].encoding, Encoding::Vop3);
@@ -254,5 +316,50 @@ mod tests {
         assert_eq!(insns[0].offset, 0);
         assert_eq!(insns[1].offset, 4);
         assert_eq!(insns[2].offset, 12);
+    }
+
+    #[test]
+    fn src9_decodes_each_operand_class() {
+        assert_eq!(decode_src9(0), Operand::Sgpr(0));
+        assert_eq!(decode_src9(101), Operand::Sgpr(101));
+        assert_eq!(decode_src9(256), Operand::Vgpr(0), "256 is VGPR 0");
+        assert_eq!(decode_src9(300), Operand::Vgpr(44));
+        assert_eq!(decode_src9(128), Operand::InlineConst(0));
+        assert_eq!(decode_src9(129), Operand::InlineConst(1), "129 -> +1");
+        assert_eq!(decode_src9(192), Operand::InlineConst(64), "192 -> +64");
+        assert_eq!(decode_src9(193), Operand::InlineConst(-1), "193 -> -1");
+        assert_eq!(decode_src9(208), Operand::InlineConst(-16));
+        assert_eq!(decode_src9(106), Operand::Special(SpecialReg::Vcc));
+        assert_eq!(decode_src9(126), Operand::Special(SpecialReg::Exec));
+        // Inline float 1.0 (encoding 242) carries the IEEE-754 bit pattern.
+        assert_eq!(decode_src9(242), Operand::Literal(1.0f32.to_bits()));
+        assert_eq!(decode_src9(243), Operand::Literal((-1.0f32).to_bits()));
+        // 255 is the "literal dword follows" marker.
+        assert_eq!(decode_src9(255), Operand::Literal(0));
+    }
+
+    #[test]
+    fn vop2_operands_decode_src0_vsrc1_vdst() {
+        // Fields: SRC0[8:0]=v3 (256+3=259), VSRC1[16:9]=v5, VDST[24:17]=v7.
+        let word = 259 | (5 << 9) | (7 << 17);
+        let (src, dst) = decode_operands(Encoding::Vop2, word);
+        assert_eq!(src, vec![Operand::Vgpr(3), Operand::Vgpr(5)]);
+        assert_eq!(dst, Some(Operand::Vgpr(7)));
+    }
+
+    #[test]
+    fn vop1_operands_decode_src0_and_vdst() {
+        // SRC0[8:0]=s10, VDST[24:17]=v2 (OP field [16:9] is irrelevant here).
+        let word = 10 | (2 << 17);
+        let (src, dst) = decode_operands(Encoding::Vop1, word);
+        assert_eq!(src, vec![Operand::Sgpr(10)]);
+        assert_eq!(dst, Some(Operand::Vgpr(2)));
+    }
+
+    #[test]
+    fn unmodeled_encodings_have_empty_operands() {
+        // We don't yet decode SMEM operand layout — it stays empty, not wrong.
+        let (src, dst) = decode_operands(Encoding::Smem, 0xFFFF_FFFF);
+        assert!(src.is_empty() && dst.is_none());
     }
 }
