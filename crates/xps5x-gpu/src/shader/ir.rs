@@ -206,15 +206,25 @@ pub fn lift_to_ir(instructions: &[Instruction], shader_type: ShaderType) -> IrPr
                 }
             }
             Encoding::Smem => {
-                // Scalar memory load → buffer load.
+                // Scalar memory load → buffer load. The descriptor (SBASE)
+                // source resolves through the SSA maps; the SDATA result is a
+                // new scalar SSA value.
                 ubo_count = ubo_count.max(1);
+                let sources = inst
+                    .src
+                    .iter()
+                    .map(|o| resolve_source(o, &vgpr_def, &sgpr_def))
+                    .collect();
                 let result_reg = next_ssa;
                 next_ssa += 1;
+                if let Some(Operand::Sgpr(n)) = &inst.dst {
+                    sgpr_def.insert(*n, result_reg);
+                }
 
                 IrNode {
                     op: IrOp::BufferLoad,
                     result: Some(IrValue::Reg(result_reg)),
-                    sources: vec![],
+                    sources,
                 }
             }
             Encoding::Mimg => {

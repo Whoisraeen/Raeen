@@ -184,6 +184,14 @@ fn decode_operands(encoding: Encoding, raw: u64) -> (Vec<Operand>, Option<Operan
             let vdst = Operand::Vgpr((word >> 17) & 0xFF);
             (vec![src0], Some(vdst))
         }
+        // SMEM: SBASE[5:0] is the descriptor's SGPR-pair base (encoded /2, so
+        // the real SGPR index is SBASE*2); SDATA[12:6] is the load's
+        // destination SGPR. The offset (SOFFSET/imm, word1) is not yet modelled.
+        Encoding::Smem => {
+            let sbase = Operand::Sgpr((word & 0x3F) * 2);
+            let sdata = Operand::Sgpr((word >> 6) & 0x7F);
+            (vec![sbase], Some(sdata))
+        }
         // SOP2: SSRC0[7:0], SSRC1[15:8] (8-bit scalar sources — never VGPRs),
         // SDST[22:16] (SGPR/special).
         Encoding::Sop2 => {
@@ -426,9 +434,22 @@ mod tests {
     }
 
     #[test]
-    fn unmodeled_encodings_have_empty_operands() {
-        // We don't yet decode SMEM operand layout — it stays empty, not wrong.
-        let (src, dst) = decode_operands(Encoding::Smem, 0xFFFF_FFFF);
+    fn smem_decodes_sbase_descriptor_and_sdata_dst() {
+        // SBASE[5:0]=4 → SGPR pair base 8 (4*2); SDATA[12:6]=10 → dst s10.
+        let word = 4 | (10 << 6);
+        let (src, dst) = decode_operands(Encoding::Smem, word as u64);
+        assert_eq!(
+            src,
+            vec![Operand::Sgpr(8)],
+            "SBASE is the SGPR-pair base (*2)"
+        );
+        assert_eq!(dst, Some(Operand::Sgpr(10)));
+    }
+
+    #[test]
+    fn still_unmodeled_encodings_have_empty_operands() {
+        // MTBUF operand layout isn't decoded yet — empty, not wrong.
+        let (src, dst) = decode_operands(Encoding::Mtbuf, 0xFFFF_FFFF);
         assert!(src.is_empty() && dst.is_none());
     }
 }
