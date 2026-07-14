@@ -21,15 +21,16 @@
 //! | libSceSaveData.sprx | Stub | xps5x-kernel (VFS) |
 //! | libSceSysmodule.sprx | Partial | Module registry |
 
+pub(crate) mod fmt;
 pub mod libc;
 pub mod libkernel;
-pub mod libsce_gnm_driver;
-pub mod libsce_video_out;
 pub mod libsce_audio_out;
-pub mod libsce_pad;
+pub mod libsce_gnm_driver;
 pub mod libsce_net;
+pub mod libsce_pad;
 pub mod libsce_save_data;
 pub mod libsce_sysmodule;
+pub mod libsce_video_out;
 
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
@@ -128,7 +129,10 @@ impl HleRegistry {
         libsce_video_out::register(&registry);
         libsce_pad::register(&registry);
 
-        info!("HLE registry: {} functions registered", registry.functions.len());
+        info!(
+            "HLE registry: {} functions registered",
+            registry.functions.len()
+        );
         registry
     }
 
@@ -141,7 +145,13 @@ impl HleRegistry {
 
     /// Look up and call an HLE function, giving it `ctx` (the kernel +
     /// guest memory) alongside its integer arguments.
-    pub fn call(&self, ctx: &HleContext, library: &str, function: &str, args: &[u64]) -> Option<u64> {
+    pub fn call(
+        &self,
+        ctx: &HleContext,
+        library: &str,
+        function: &str,
+        args: &[u64],
+    ) -> Option<u64> {
         let key = format!("{}::{}", library, function);
         if let Some(func) = self.functions.get(&key) {
             debug!("HLE call: {}({:?})", key, args);
@@ -197,9 +207,13 @@ impl TestMemory {
 #[cfg(test)]
 impl GuestMemory for TestMemory {
     fn read(&self, guest_addr: u64, out: &mut [u8]) -> bool {
-        let Ok(addr) = usize::try_from(guest_addr) else { return false };
+        let Ok(addr) = usize::try_from(guest_addr) else {
+            return false;
+        };
         let buf = self.0.borrow();
-        let Some(end) = addr.checked_add(out.len()) else { return false };
+        let Some(end) = addr.checked_add(out.len()) else {
+            return false;
+        };
         if end > buf.len() {
             return false;
         }
@@ -208,9 +222,13 @@ impl GuestMemory for TestMemory {
     }
 
     fn write(&self, guest_addr: u64, data: &[u8]) -> bool {
-        let Ok(addr) = usize::try_from(guest_addr) else { return false };
+        let Ok(addr) = usize::try_from(guest_addr) else {
+            return false;
+        };
         let mut buf = self.0.borrow_mut();
-        let Some(end) = addr.checked_add(data.len()) else { return false };
+        let Some(end) = addr.checked_add(data.len()) else {
+            return false;
+        };
         if end > buf.len() {
             return false;
         }
@@ -285,7 +303,10 @@ mod tests {
     fn registered_names_splits_library_and_function() {
         let registry = HleRegistry::new();
         let names = registry.registered_names();
-        assert!(!names.is_empty(), "HleRegistry::new() should register some functions");
+        assert!(
+            !names.is_empty(),
+            "HleRegistry::new() should register some functions"
+        );
         assert_eq!(names.len(), registry.functions.len());
 
         // Every name must round-trip: is_implemented(lib, func) is true for
@@ -331,7 +352,10 @@ mod tests {
                 "expected {library}::{function} to be implemented"
             );
             let result = registry.call(&ctx, library, function, &[1, 2, 3, 4]);
-            assert!(result.is_some(), "{library}::{function} should return a value, not None");
+            assert!(
+                result.is_some(),
+                "{library}::{function} should return a value, not None"
+            );
         }
     }
 
@@ -346,6 +370,9 @@ mod tests {
         registry.register("libFoo", "someFunction", stub);
 
         let names = registry.registered_names();
-        assert_eq!(names, vec![("libFoo".to_string(), "someFunction".to_string())]);
+        assert_eq!(
+            names,
+            vec![("libFoo".to_string(), "someFunction".to_string())]
+        );
     }
 }

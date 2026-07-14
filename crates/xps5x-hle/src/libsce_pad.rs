@@ -17,7 +17,10 @@ fn hle_pad_init(_ctx: &HleContext, _args: &[u64]) -> u64 {
 }
 
 fn hle_pad_open(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!("scePadOpen(userId={}, type={}, index={})", args[0], args[1], args[2]);
+    debug!(
+        "scePadOpen(userId={}, type={}, index={})",
+        args[0], args[1], args[2]
+    );
     1 // Return pad handle = 1.
 }
 

@@ -33,27 +33,100 @@ const SCE_OK: u64 = 0;
 /// value distinguishable from `SCE_OK`.
 const HLE_ERROR: u64 = 0xFFFF_FFFF;
 
+/// Cap on how many bytes one `write` call will copy out of guest memory —
+/// keeps a wild `count` from ballooning a host buffer. Generous for
+/// console output.
+const WRITE_MAX_BYTES: u64 = 1 << 20; // 1 MiB
+
+/// `EBADF` as the sign-extended negative return `write(2)` produces on a
+/// bad descriptor (the PS5's BSD libc returns `-1` and sets `errno`;
+/// `sceKernelWrite` returns a negative error directly — either way the
+/// caller sees "negative", which is the honest signal here).
+const WRITE_EBADF: u64 = (-9i64) as u64;
+
+/// Real `write(fd, buf, count)` / `sceKernelWrite` for the console
+/// descriptors (M1-C): fd 1 (stdout) and fd 2 (stderr) copy `count` guest
+/// bytes (bounded by [`WRITE_MAX_BYTES`]) to the kernel
+/// [`xps5x_kernel::Console`] and return `count`. Any other fd has no
+/// backing file table yet — logged loudly, returns [`WRITE_EBADF`], never
+/// pretends to have written.
+fn hle_write(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0);
+    let buf = args.get(1).copied().unwrap_or(0);
+    let count = args.get(2).copied().unwrap_or(0);
+    debug!("write(fd={fd}, buf={buf:#x}, count={count:#x})");
+
+    if fd != 1 && fd != 2 {
+        warn!(
+            "write: fd {fd} has no backing file table yet (only stdout/stderr are wired) — EBADF"
+        );
+        return WRITE_EBADF;
+    }
+    let capped = count.min(WRITE_MAX_BYTES);
+    let Ok(len) = usize::try_from(capped) else {
+        return WRITE_EBADF;
+    };
+    let mut bytes = vec![0u8; len];
+    if !ctx.mem.read(buf, &mut bytes) {
+        warn!("write: guest buffer [{buf:#x}, +{capped:#x}) is not readable — EFAULT-ish EBADF");
+        return WRITE_EBADF;
+    }
+    ctx.kernel.console.write_bytes(&bytes);
+    if capped < count {
+        warn!("write: count {count:#x} capped to {capped:#x} (WRITE_MAX_BYTES)");
+    }
+    capped
+}
+
 /// Register libkernel HLE functions.
 pub fn register(registry: &HleRegistry) {
     // -- Memory --
-    registry.register("libkernel", "sceKernelAllocateDirectMemory", hle_allocate_direct_memory);
+    registry.register(
+        "libkernel",
+        "sceKernelAllocateDirectMemory",
+        hle_allocate_direct_memory,
+    );
     registry.register(
         "libkernel",
         "sceKernelAllocateMainDirectMemory",
         hle_allocate_main_direct_memory,
     );
-    registry.register("libkernel", "sceKernelReleaseDirectMemory", hle_release_direct_memory);
-    registry.register("libkernel", "sceKernelMapDirectMemory", hle_map_direct_memory);
-    registry.register("libkernel", "sceKernelMapFlexibleMemory", hle_map_flexible_memory);
+    registry.register(
+        "libkernel",
+        "sceKernelReleaseDirectMemory",
+        hle_release_direct_memory,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelMapDirectMemory",
+        hle_map_direct_memory,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelMapFlexibleMemory",
+        hle_map_flexible_memory,
+    );
     registry.register("libkernel", "sceKernelMunmap", hle_munmap);
     registry.register("libkernel", "sceKernelMmap", hle_mmap);
-    registry.register("libkernel", "sceKernelGetDirectMemorySize", hle_get_direct_memory_size);
+
+    // -- File descriptors / console I/O (M1-C) --
+    registry.register("libkernel", "write", hle_write);
+    registry.register("libkernel", "sceKernelWrite", hle_write);
+    registry.register(
+        "libkernel",
+        "sceKernelGetDirectMemorySize",
+        hle_get_direct_memory_size,
+    );
     registry.register(
         "libkernel",
         "sceKernelAvailableFlexibleMemorySize",
         hle_available_flexible_memory_size,
     );
-    registry.register("libkernel", "sceKernelSetVirtualRangeName", hle_set_virtual_range_name);
+    registry.register(
+        "libkernel",
+        "sceKernelSetVirtualRangeName",
+        hle_set_virtual_range_name,
+    );
 
     // -- Thread / sync --
     registry.register("libkernel", "scePthreadCreate", hle_pthread_create);
@@ -61,7 +134,11 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadExit", hle_pthread_exit);
     registry.register("libkernel", "scePthreadMutexInit", hle_pthread_mutex_init);
     registry.register("libkernel", "scePthreadMutexLock", hle_pthread_mutex_lock);
-    registry.register("libkernel", "scePthreadMutexUnlock", hle_pthread_mutex_unlock);
+    registry.register(
+        "libkernel",
+        "scePthreadMutexUnlock",
+        hle_pthread_mutex_unlock,
+    );
     registry.register("libkernel", "scePthreadCondInit", hle_pthread_cond_init);
     registry.register("libkernel", "scePthreadCondWait", hle_pthread_cond_wait);
     registry.register("libkernel", "scePthreadCondSignal", hle_pthread_cond_signal);
@@ -73,7 +150,11 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "sceKernelGetCurrentCpu", hle_get_current_cpu);
     registry.register("libkernel", "sceKernelGettimeofday", hle_gettimeofday);
     registry.register("libkernel", "sceKernelClockGettime", hle_clock_gettime);
-    registry.register("libkernel", "sceKernelGetTscFrequency", hle_get_tsc_frequency);
+    registry.register(
+        "libkernel",
+        "sceKernelGetTscFrequency",
+        hle_get_tsc_frequency,
+    );
     registry.register("libkernel", "sceKernelUsleep", hle_usleep);
     registry.register("libkernel", "sceKernelGetProcParam", hle_get_proc_param);
     registry.register("libkernel", "sceKernelIsNeoMode", hle_is_neo_mode);
@@ -270,7 +351,10 @@ fn hle_pthread_create(_ctx: &HleContext, _args: &[u64]) -> u64 {
 }
 
 fn hle_pthread_join(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!("scePthreadJoin(thread={:#x})", args.first().copied().unwrap_or(0));
+    debug!(
+        "scePthreadJoin(thread={:#x})",
+        args.first().copied().unwrap_or(0)
+    );
     0
 }
 
@@ -282,32 +366,50 @@ fn hle_pthread_exit(_ctx: &HleContext, _args: &[u64]) -> u64 {
 }
 
 fn hle_pthread_mutex_init(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!("scePthreadMutexInit(mutex={:#x})", args.first().copied().unwrap_or(0));
+    debug!(
+        "scePthreadMutexInit(mutex={:#x})",
+        args.first().copied().unwrap_or(0)
+    );
     0
 }
 
 fn hle_pthread_mutex_lock(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!("scePthreadMutexLock(mutex={:#x})", args.first().copied().unwrap_or(0));
+    debug!(
+        "scePthreadMutexLock(mutex={:#x})",
+        args.first().copied().unwrap_or(0)
+    );
     0
 }
 
 fn hle_pthread_mutex_unlock(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!("scePthreadMutexUnlock(mutex={:#x})", args.first().copied().unwrap_or(0));
+    debug!(
+        "scePthreadMutexUnlock(mutex={:#x})",
+        args.first().copied().unwrap_or(0)
+    );
     0
 }
 
 fn hle_pthread_cond_init(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!("scePthreadCondInit(cond={:#x})", args.first().copied().unwrap_or(0));
+    debug!(
+        "scePthreadCondInit(cond={:#x})",
+        args.first().copied().unwrap_or(0)
+    );
     0
 }
 
 fn hle_pthread_cond_wait(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!("scePthreadCondWait(cond={:#x})", args.first().copied().unwrap_or(0));
+    debug!(
+        "scePthreadCondWait(cond={:#x})",
+        args.first().copied().unwrap_or(0)
+    );
     0
 }
 
 fn hle_pthread_cond_signal(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!("scePthreadCondSignal(cond={:#x})", args.first().copied().unwrap_or(0));
+    debug!(
+        "scePthreadCondSignal(cond={:#x})",
+        args.first().copied().unwrap_or(0)
+    );
     0
 }
 
@@ -318,7 +420,10 @@ fn hle_create_equeue(_ctx: &HleContext, _args: &[u64]) -> u64 {
 }
 
 fn hle_wait_equeue(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!("sceKernelWaitEqueue(eq={:#x})", args.first().copied().unwrap_or(0));
+    debug!(
+        "sceKernelWaitEqueue(eq={:#x})",
+        args.first().copied().unwrap_or(0)
+    );
     0
 }
 
@@ -346,7 +451,10 @@ fn hle_gettimeofday(_ctx: &HleContext, _args: &[u64]) -> u64 {
 }
 
 fn hle_clock_gettime(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!("sceKernelClockGettime(clockId={})", args.first().copied().unwrap_or(0));
+    debug!(
+        "sceKernelClockGettime(clockId={})",
+        args.first().copied().unwrap_or(0)
+    );
     0
 }
 
@@ -357,7 +465,10 @@ fn hle_get_tsc_frequency(_ctx: &HleContext, _args: &[u64]) -> u64 {
 }
 
 fn hle_usleep(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!("sceKernelUsleep(usec={})", args.first().copied().unwrap_or(0));
+    debug!(
+        "sceKernelUsleep(usec={})",
+        args.first().copied().unwrap_or(0)
+    );
     0
 }
 
@@ -390,7 +501,46 @@ fn hle_kernel_error(_ctx: &HleContext, _args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GuestMemory, test_ctx};
+    use crate::{test_ctx, GuestMemory};
+
+    /// M1-C: `write(1, buf, n)` copies real guest bytes to the kernel
+    /// console and returns `n`; stderr (fd 2) lands in the same capture; an
+    /// unbacked fd is a loud EBADF, never a silent "success".
+    #[test]
+    fn write_to_stdout_and_stderr_reaches_the_console_and_bad_fd_is_ebadf() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x100, b"out\n"));
+        assert!(mem.write(0x200, b"err\n"));
+        assert_eq!(hle_write(&ctx, &[1, 0x100, 4]), 4);
+        assert_eq!(hle_write(&ctx, &[2, 0x200, 4]), 4);
+        assert_eq!(kernel.console.contents(), "out\nerr\n");
+
+        assert_eq!(
+            hle_write(&ctx, &[7, 0x100, 4]) as i64,
+            -9,
+            "unbacked fd must be EBADF"
+        );
+        assert_eq!(
+            kernel.console.contents(),
+            "out\nerr\n",
+            "bad-fd write must not emit"
+        );
+    }
+
+    #[test]
+    fn write_with_unreadable_buffer_fails_loudly() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x10);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!((hle_write(&ctx, &[1, 0xDEAD_0000, 8]) as i64) < 0);
+        assert!(kernel.console.is_empty());
+    }
 
     #[test]
     fn register_adds_expected_functions() {
@@ -432,7 +582,10 @@ mod tests {
             "sceKernelGetCpumode",
             "sceKernelError",
         ] {
-            assert!(registry.is_implemented("libkernel", name), "missing libkernel::{name}");
+            assert!(
+                registry.is_implemented("libkernel", name),
+                "missing libkernel::{name}"
+            );
             // Every registered stub must be callable without panicking.
             registry.call(&ctx, "libkernel", name, &[1, 2, 3, 4, 5, 6]);
         }
@@ -452,23 +605,36 @@ mod tests {
 
         let addr_out: u64 = 0x100;
         let result = registry
-            .call(&ctx, "libkernel", "sceKernelMapFlexibleMemory", &[addr_out, 0x4000, 0x3])
+            .call(
+                &ctx,
+                "libkernel",
+                "sceKernelMapFlexibleMemory",
+                &[addr_out, 0x4000, 0x3],
+            )
             .unwrap();
         assert_eq!(result, SCE_OK);
 
         let mut mapped_addr_bytes = [0u8; 8];
         assert!(mem.read(addr_out, &mut mapped_addr_bytes));
         let mapped_addr = u64::from_le_bytes(mapped_addr_bytes);
-        assert_ne!(mapped_addr, 0, "sceKernelMapFlexibleMemory should write a real mapped address");
+        assert_ne!(
+            mapped_addr, 0,
+            "sceKernelMapFlexibleMemory should write a real mapped address"
+        );
         assert!(
             kernel.memory.is_mapped(mapped_addr),
             "the address written to addrOut must be recorded as mapped in the VMM"
         );
 
         // munmap must clear the recorded metadata.
-        let munmap_result = registry.call(&ctx, "libkernel", "sceKernelMunmap", &[mapped_addr, 0x4000]).unwrap();
+        let munmap_result = registry
+            .call(&ctx, "libkernel", "sceKernelMunmap", &[mapped_addr, 0x4000])
+            .unwrap();
         assert_eq!(munmap_result, SCE_OK);
-        assert!(!kernel.memory.is_mapped(mapped_addr), "sceKernelMunmap must remove the VMM mapping record");
+        assert!(
+            !kernel.memory.is_mapped(mapped_addr),
+            "sceKernelMunmap must remove the VMM mapping record"
+        );
     }
 
     #[test]
@@ -507,12 +673,25 @@ mod tests {
 
         // sceKernelMmap's ABI returns the mapped address as the call result
         // (not through an out-parameter), unlike sceKernelMapFlexibleMemory.
-        let addr = registry.call(&ctx, "libkernel", "sceKernelMmap", &[0, 0x4000, 0x3, 0]).unwrap();
-        assert_ne!(addr, 0, "sceKernelMmap should return a real mapped address, not the old fake sentinel");
-        assert!(kernel.memory.is_mapped(addr), "sceKernelMmap must record its mapping in the VMM");
+        let addr = registry
+            .call(&ctx, "libkernel", "sceKernelMmap", &[0, 0x4000, 0x3, 0])
+            .unwrap();
+        assert_ne!(
+            addr, 0,
+            "sceKernelMmap should return a real mapped address, not the old fake sentinel"
+        );
+        assert!(
+            kernel.memory.is_mapped(addr),
+            "sceKernelMmap must record its mapping in the VMM"
+        );
 
-        let munmap_result = registry.call(&ctx, "libkernel", "sceKernelMunmap", &[addr, 0x4000]).unwrap();
+        let munmap_result = registry
+            .call(&ctx, "libkernel", "sceKernelMunmap", &[addr, 0x4000])
+            .unwrap();
         assert_eq!(munmap_result, SCE_OK);
-        assert!(!kernel.memory.is_mapped(addr), "sceKernelMunmap must remove the VMM mapping record");
+        assert!(
+            !kernel.memory.is_mapped(addr),
+            "sceKernelMunmap must remove the VMM mapping record"
+        );
     }
 }

@@ -9,13 +9,28 @@ use tracing::debug;
 pub fn register(registry: &HleRegistry) {
     registry.register("libSceVideoOut", "sceVideoOutOpen", hle_video_out_open);
     registry.register("libSceVideoOut", "sceVideoOutClose", hle_video_out_close);
-    registry.register("libSceVideoOut", "sceVideoOutSetFlipRate", hle_video_out_set_flip_rate);
-    registry.register("libSceVideoOut", "sceVideoOutRegisterBuffers", hle_video_out_register_buffers);
-    registry.register("libSceVideoOut", "sceVideoOutSubmitFlip", hle_video_out_submit_flip);
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutSetFlipRate",
+        hle_video_out_set_flip_rate,
+    );
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutRegisterBuffers",
+        hle_video_out_register_buffers,
+    );
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutSubmitFlip",
+        hle_video_out_submit_flip,
+    );
 }
 
 fn hle_video_out_open(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!("sceVideoOutOpen(userId={}, busType={}, index={})", args[0], args[1], args[2]);
+    debug!(
+        "sceVideoOutOpen(userId={}, busType={}, index={})",
+        args[0], args[1], args[2]
+    );
     1 // Return handle = 1.
 }
 
@@ -25,7 +40,10 @@ fn hle_video_out_close(_ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 fn hle_video_out_set_flip_rate(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!("sceVideoOutSetFlipRate(handle={}, rate={})", args[0], args[1]);
+    debug!(
+        "sceVideoOutSetFlipRate(handle={}, rate={})",
+        args[0], args[1]
+    );
     0
 }
 
@@ -35,6 +53,9 @@ fn hle_video_out_register_buffers(_ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 fn hle_video_out_submit_flip(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!("sceVideoOutSubmitFlip(handle={}, bufferIndex={})", args[0], args[1]);
+    debug!(
+        "sceVideoOutSubmitFlip(handle={}, bufferIndex={})",
+        args[0], args[1]
+    );
     0
 }

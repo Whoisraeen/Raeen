@@ -1893,3 +1893,116 @@ fn stack_chk_guard_canary_at_fs_0x28_is_nonzero_with_terminator_byte() {
         "the canary's low byte is the glibc-style NUL terminator"
     );
 }
+
+// --- M1-C (wall #3): printf with real guest strings -> observable output --
+
+/// The M1-C acceptance test at the runtime layer: a `_start`-shaped module
+/// calls `printf("hello %s, %d!\n", "world", 42)` — the format string and
+/// the `%s` pointee are real bytes in the module's own image, addressed
+/// RIP-relative — then exits. The formatted output must land, byte-exact,
+/// in the kernel's captured console: guest memory -> HLE printf -> host-
+/// observable stdout, end to end through the genuine LM1 link + VEH
+/// dispatch path.
+#[test]
+fn printf_with_guest_format_string_lands_in_the_kernel_console() {
+    const ENTRY_OFF: usize = 0x0;
+    const SLOT_PRINTF_OFF: usize = 0x80;
+    const SLOT_EXIT_OFF: usize = 0x88;
+    const FMT_OFF: usize = 0x90;
+    const WORLD_OFF: usize = 0xB0;
+
+    let mut image = vec![0u8; 0x100];
+    let mut off = ENTRY_OFF;
+
+    // lea rdi, [rip+disp32] -> FMT_OFF
+    let disp = (FMT_OFF as i64 - (off as i64 + 7)) as i32;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x8D, 0x3D]);
+    image[off + 3..off + 7].copy_from_slice(&disp.to_le_bytes());
+    off += 7;
+    // lea rsi, [rip+disp32] -> WORLD_OFF
+    let disp = (WORLD_OFF as i64 - (off as i64 + 7)) as i32;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x8D, 0x35]);
+    image[off + 3..off + 7].copy_from_slice(&disp.to_le_bytes());
+    off += 7;
+    // mov edx, 42
+    image[off] = 0xBA;
+    image[off + 1..off + 5].copy_from_slice(&42u32.to_le_bytes());
+    off += 5;
+    // call qword ptr [rip+disp32] -> SLOT_PRINTF_OFF
+    let disp = (SLOT_PRINTF_OFF as i64 - (off as i64 + 6)) as i32;
+    image[off] = 0xFF;
+    image[off + 1] = 0x15;
+    image[off + 2..off + 6].copy_from_slice(&disp.to_le_bytes());
+    off += 6;
+    // mov edi, 0 ; call [rip -> SLOT_EXIT_OFF]  (exit(0), never returns)
+    image[off] = 0xBF;
+    image[off + 1..off + 5].copy_from_slice(&0u32.to_le_bytes());
+    off += 5;
+    let disp = (SLOT_EXIT_OFF as i64 - (off as i64 + 6)) as i32;
+    image[off] = 0xFF;
+    image[off + 1] = 0x15;
+    image[off + 2..off + 6].copy_from_slice(&disp.to_le_bytes());
+
+    image[FMT_OFF..FMT_OFF + 20].copy_from_slice(b"hello %s, %d!\n\0\0\0\0\0\0");
+    image[WORLD_OFF..WORLD_OFF + 6].copy_from_slice(b"world\0");
+
+    let module = SprxModule {
+        name: "printfTestModule".to_string(),
+        e_type: 0xFE18, // ET_SCE_DYNAMIC
+        segments: vec![SprxSegment {
+            vaddr: 0,
+            data: image,
+            flags: 5, // R+X
+            mem_size: 0x100,
+        }],
+        dynlib_data: None,
+        relro: None,
+        dynamic: None,
+        entry: ENTRY_OFF as u64,
+        tls: None,
+    };
+    let dynlib = DynlibData {
+        symbols: vec![
+            DynSymbol {
+                nid: nid_of("printf"),
+                value: 0,
+                is_import: true,
+            },
+            DynSymbol {
+                nid: nid_of("exit"),
+                value: 0,
+                is_import: true,
+            },
+        ],
+        relocations: vec![
+            SceRela {
+                offset: SLOT_PRINTF_OFF as u64,
+                info: R_X86_64_JUMP_SLOT, // r_sym = 0 -> printf
+                addend: 0,
+            },
+            SceRela {
+                offset: SLOT_EXIT_OFF as u64,
+                info: (1u64 << 32) | R_X86_64_JUMP_SLOT, // r_sym = 1 -> exit
+                addend: 0,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let hle = HleRegistry::new();
+    let db = NidDatabase::from_hle_names(hle.registered_names());
+    let registry = ModuleRegistry::new(db);
+    let linked =
+        link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE).expect("printf/exit imports must link");
+    assert!(linked.unresolved.is_empty(), "printf and exit must both resolve to HLE");
+
+    let kernel = OrbisKernel::new();
+    let outcome =
+        execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[]).expect("printf module must not fault");
+    assert_eq!(outcome, RunOutcome::Exited(0));
+    assert_eq!(
+        kernel.console.contents(),
+        "hello world, 42!\n",
+        "the guest's printf output must be captured byte-exact in the kernel console"
+    );
+}

@@ -6,7 +6,11 @@ use tracing::{debug, info};
 /// Register libSceSysmodule HLE functions.
 pub fn register(registry: &HleRegistry) {
     registry.register("libSceSysmodule", "sceSysmoduleLoadModule", hle_load_module);
-    registry.register("libSceSysmodule", "sceSysmoduleUnloadModule", hle_unload_module);
+    registry.register(
+        "libSceSysmodule",
+        "sceSysmoduleUnloadModule",
+        hle_unload_module,
+    );
     registry.register("libSceSysmodule", "sceSysmoduleIsLoaded", hle_is_loaded);
 }
 
