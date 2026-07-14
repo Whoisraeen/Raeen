@@ -32,8 +32,10 @@ const OP_LABEL: u16 = 248;
 const OP_RETURN: u16 = 253;
 const OP_UNDEF: u16 = 1;
 const OP_LOAD: u16 = 61;
+const OP_STORE: u16 = 62;
 // SPIR-V storage classes.
 const STORAGE_CLASS_INPUT: u32 = 1;
+const STORAGE_CLASS_OUTPUT: u32 = 3;
 // Arithmetic opcodes (integer / float binary ops).
 const OP_I_ADD: u16 = 128;
 const OP_F_ADD: u16 = 129;
@@ -127,6 +129,20 @@ pub fn emit_spirv(program: &IrProgram) -> Result<Vec<u32>, GpuError> {
         }
     }
 
+    // One Output interface variable per export node, at successive Locations.
+    // The body OpStores each export's value into its variable.
+    let export_count = program.nodes.iter().filter(|n| is_export(n.op)).count();
+    let mut output_vars: Vec<u32> = Vec::new();
+    if export_count > 0 {
+        let out_ptr_type = module.next_id();
+        module.add_type_pointer(out_ptr_type, STORAGE_CLASS_OUTPUT, f32_type);
+        for loc in 0..export_count as u32 {
+            let var = module.add_io_variable(out_ptr_type, STORAGE_CLASS_OUTPUT, loc);
+            output_vars.push(var);
+            interface.push(var);
+        }
+    }
+
     // Declare entry point.
     let main_func = module.next_id();
     let execution_model = match program.shader_type {
@@ -158,6 +174,8 @@ pub fn emit_spirv(program: &IrProgram) -> Result<Vec<u32>, GpuError> {
     let mut ssa_to_id: HashMap<u32, u32> = HashMap::new();
     // One OpLoad per input location, cached (the load dominates later uses).
     let mut input_loads: HashMap<u32, u32> = HashMap::new();
+    // Which output variable the next export writes to.
+    let mut export_idx = 0usize;
 
     for node in &program.nodes {
         let binop = spirv_binop(node.op, f32_type, i32_type);
@@ -194,8 +212,17 @@ pub fn emit_spirv(program: &IrProgram) -> Result<Vec<u32>, GpuError> {
             src_ids.push(id);
         }
 
+        // An export stores its (first) value into the matching Output variable.
+        if is_export(node.op) {
+            if let Some(&value) = src_ids.first() {
+                module.emit_store(output_vars[export_idx], value);
+            }
+            export_idx += 1;
+            continue;
+        }
+
         let Some(IrValue::Reg(result_reg)) = node.result else {
-            continue; // sinks (export / return) carry no SSA result
+            continue; // sinks (return) carry no SSA result
         };
 
         // A binary arithmetic op with two resolved operands lowers directly;
@@ -213,6 +240,14 @@ pub fn emit_spirv(program: &IrProgram) -> Result<Vec<u32>, GpuError> {
     module.add_function_end();
 
     Ok(module.build())
+}
+
+/// Whether an IR op is a shader output (export) that stores to an Output var.
+fn is_export(op: IrOp) -> bool {
+    matches!(
+        op,
+        IrOp::ExportColor | IrOp::ExportPosition | IrOp::ExportParam
+    )
 }
 
 /// Map an IR binary op to its SPIR-V opcode and result type. Float ops use the
@@ -322,6 +357,11 @@ impl SpirvModule {
         let id = self.next_id();
         self.emit(Section::Functions, OP_LOAD, &[result_type, id, pointer]);
         id
+    }
+
+    /// Emit `OpStore pointer value` in the function body (no result id).
+    fn emit_store(&mut self, pointer: u32, value: u32) {
+        self.emit(Section::Functions, OP_STORE, &[pointer, value]);
     }
 
     /// Declare a global I/O variable of `pointer_type` in `storage_class`
@@ -610,6 +650,79 @@ mod tests {
                 parsed.err()
             );
         }
+    }
+
+    #[test]
+    fn exports_become_output_variables_and_stores() {
+        use crate::shader::ir::{IrNode, IrOp};
+        // r0 = in[0] + in[1]; export r0 as color.
+        let program = IrProgram {
+            nodes: vec![
+                IrNode {
+                    op: IrOp::Add,
+                    result: Some(IrValue::Reg(0)),
+                    sources: vec![IrValue::Input(0), IrValue::Input(1)],
+                },
+                IrNode {
+                    op: IrOp::ExportColor,
+                    result: None,
+                    sources: vec![IrValue::Reg(0)],
+                },
+            ],
+            shader_type: ShaderType::Pixel,
+            input_count: 2,
+            output_count: 1,
+            ubo_count: 0,
+            texture_count: 0,
+        };
+        let module = emit_spirv(&program).unwrap();
+        let parsed = rspirv::dr::load_words(&module).expect("must parse");
+
+        use rspirv::spirv::{Op, StorageClass};
+        let output_vars: Vec<u32> = parsed
+            .types_global_values
+            .iter()
+            .filter(|i| i.class.opcode == Op::Variable)
+            .filter(|i| {
+                matches!(
+                    i.operands.first(),
+                    Some(rspirv::dr::Operand::StorageClass(StorageClass::Output))
+                )
+            })
+            .filter_map(|i| i.result_id)
+            .collect();
+        assert_eq!(
+            output_vars.len(),
+            1,
+            "the export declares one Output variable"
+        );
+
+        // The entry interface includes the output var (all I/O must be listed).
+        let iface: Vec<u32> = parsed.entry_points[0]
+            .operands
+            .iter()
+            .filter_map(|o| match o {
+                rspirv::dr::Operand::IdRef(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            iface.contains(&output_vars[0]),
+            "output var must be in the interface"
+        );
+
+        // The body OpStores the add result into the output.
+        let body_ops: Vec<Op> = parsed
+            .functions
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.instructions.iter())
+            .map(|i| i.class.opcode)
+            .collect();
+        assert!(
+            body_ops.contains(&Op::Store),
+            "the export must lower to OpStore"
+        );
     }
 
     #[test]
