@@ -56,12 +56,6 @@ fn hle_write(ctx: &HleContext, args: &[u64]) -> u64 {
     let count = args.get(2).copied().unwrap_or(0);
     debug!("write(fd={fd}, buf={buf:#x}, count={count:#x})");
 
-    if fd != 1 && fd != 2 {
-        warn!(
-            "write: fd {fd} has no backing file table yet (only stdout/stderr are wired) — EBADF"
-        );
-        return WRITE_EBADF;
-    }
     let capped = count.min(WRITE_MAX_BYTES);
     let Ok(len) = usize::try_from(capped) else {
         return WRITE_EBADF;
@@ -71,11 +65,23 @@ fn hle_write(ctx: &HleContext, args: &[u64]) -> u64 {
         warn!("write: guest buffer [{buf:#x}, +{capped:#x}) is not readable — EFAULT-ish EBADF");
         return WRITE_EBADF;
     }
-    ctx.kernel.console.write_bytes(&bytes);
     if capped < count {
         warn!("write: count {count:#x} capped to {capped:#x} (WRITE_MAX_BYTES)");
     }
-    capped
+
+    // fd 1/2 are the console; everything else routes to a VFS-backed file
+    // descriptor (real write-back on close — savedata/output files persist).
+    if fd == 1 || fd == 2 {
+        ctx.kernel.console.write_bytes(&bytes);
+        return capped;
+    }
+    match ctx.kernel.filesystem.write(fd as i32, &bytes) {
+        Ok(n) => n as u64,
+        Err(e) => {
+            warn!("write: fd {fd} failed: {e} — EBADF");
+            WRITE_EBADF
+        }
+    }
 }
 
 /// `EBADF` (bad file descriptor) as a sign-extended negative return.
@@ -107,20 +113,23 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
     };
     let path = String::from_utf8_lossy(&path_bytes).into_owned();
 
-    // A read-only open of a file the host doesn't have is ENOENT. The VFS
-    // `open` currently succeeds with empty data for a missing file, so probe
-    // resolve_path + existence here to report the honest error.
-    if let Some(host) = ctx.kernel.filesystem.resolve_path(&path) {
-        if !host.exists() {
+    // A missing file is ENOENT *unless* the guest passed O_CREAT (then the VFS
+    // creates it). O_CREAT is bit 0x200 in the Orbis/BSD flag set.
+    const O_CREAT: i32 = 0x200;
+    let creating = flags & O_CREAT != 0;
+    match ctx.kernel.filesystem.resolve_path(&path) {
+        Some(host) if host.exists() || creating => {}
+        Some(host) => {
             warn!(
-                "open: '{path}' → '{}' does not exist — ENOENT",
+                "open: '{path}' → '{}' does not exist (no O_CREAT) — ENOENT",
                 host.display()
             );
             return FILE_ENOENT;
         }
-    } else {
-        warn!("open: '{path}' matches no VFS mount — ENOENT");
-        return FILE_ENOENT;
+        None => {
+            warn!("open: '{path}' matches no VFS mount — ENOENT");
+            return FILE_ENOENT;
+        }
     }
 
     match ctx.kernel.filesystem.open(&path, flags, mode) {
@@ -1032,6 +1041,39 @@ mod tests {
     /// Real VFS-backed file I/O: a homebrew opens a file under /app0,
     /// reads its bytes into a guest buffer, seeks, reads again, and closes —
     /// all against a real host temp file mounted into the VFS.
+    #[test]
+    fn savedata_write_through_hle_open_write_close_persists_to_host() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let tmp = std::env::temp_dir().join(format!("xps5x-hle-savewrite-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        kernel.filesystem.set_game_directory(&tmp);
+
+        // open("/app0/save.dat", O_WRONLY|O_CREAT|O_TRUNC) through the HLE.
+        assert!(mem.write(0x100, b"/app0/save.dat\0"));
+        use xps5x_kernel::filesystem::open_flags::*;
+        let flags = (O_WRONLY | O_CREAT | O_TRUNC) as u64;
+        let fd = hle_open(&ctx, &[0x100, flags, 0o644]);
+        assert!(
+            (fd as i64) >= 3,
+            "open must return a real fd, got {}",
+            fd as i64
+        );
+
+        // write("PROGRESS") through the HLE write() (non-console fd → VFS).
+        assert!(mem.write(0x200, b"PROGRESS"));
+        assert_eq!(hle_write(&ctx, &[fd, 0x200, 8]), 8);
+
+        // close() flushes to the host file.
+        assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
+        assert_eq!(std::fs::read(tmp.join("save.dat")).unwrap(), b"PROGRESS");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn file_io_open_read_seek_close_against_a_real_host_file() {
         let kernel = xps5x_kernel::OrbisKernel::new();
