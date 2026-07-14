@@ -104,7 +104,7 @@ Second-opinion PS5 emu (C#). Re-implement in Rust; do not vendor C#.
 | Filesystem: open/read/close/lseek | KernelExports/FS | `xps5x-kernel`/`hle` | `done` | `896495d` | VFS-backed, real host files under /app0; write persistence + fstat still todo |
 | Filesystem: write persistence (savedata) | FS | `xps5x-kernel`/`hle` | `done` | `5285857` | VFS honors O_WRONLY/RDWR/CREAT/TRUNC/APPEND; write buffers + flush-on-close to host file; ".." traversal refused on writable open; hle write() routes non-console fds to VFS; hle open() honors O_CREAT. E2E: guest open+write+close persists to host, read-back works |
 | Filesystem: fstat / directory ops | FS | `xps5x-kernel`/`hle` | `todo` | | needs SCE stat struct layout |
-| SaveData mount | SaveData | `xps5x-hle` | `done` | (savedata batch) | new libsce_save_data.rs (was empty stub): sceSaveDataMount{,2,3} writes the /savedata0 mount point into the 64-byte result; Umount/Initialize/Terminate OK. Completes the save path — mount → open/write under /savedata0 → VFS persists to host savedata dir (write-persistence 5285857). SharpEmu-cross-checked. 2 tests |
+| SaveData mount | SaveData | `xps5x-hle` | `done` | `93a7c0a` | new libsce_save_data.rs (was empty stub): sceSaveDataMount{,2,3} writes the /savedata0 mount point into the 64-byte result; Umount/Initialize/Terminate OK. Completes the save path — mount → open/write under /savedata0 → VFS persists to host savedata dir (write-persistence 5285857). SharpEmu-cross-checked. 2 tests |
 | GUI patterns | app | `xps5x-gui` | `skip` | | optional UX only |
 
 **Delete SharpEmu when:** all non-`skip` rows `done`, and no open M# work still citing this tree.
