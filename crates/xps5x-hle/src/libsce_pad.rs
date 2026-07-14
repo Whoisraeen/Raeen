@@ -64,7 +64,7 @@ fn hle_pad_set_vibration(_ctx: &HleContext, args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_ctx, GuestMemory};
+    use crate::{GuestMemory, test_ctx};
 
     /// M3: scePadReadState writes a valid, non-garbage ScePadData prefix into
     /// the guest buffer and returns 1 (one state read) so a homebrew read

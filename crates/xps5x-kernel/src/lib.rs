@@ -269,13 +269,15 @@ impl OrbisKernel {
     /// Record the guest address of the main module's process-parameter block
     /// (see [`proc_param_addr`](Self::proc_param_addr)).
     pub fn set_proc_param_addr(&self, addr: u64) {
-        self.proc_param_addr.store(addr, std::sync::atomic::Ordering::Relaxed);
+        self.proc_param_addr
+            .store(addr, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The guest address `sceKernelGetProcParam` returns, or `0` if no
     /// `PT_SCE_PROCPARAM` was present in the loaded module.
     pub fn proc_param_addr(&self) -> u64 {
-        self.proc_param_addr.load(std::sync::atomic::Ordering::Relaxed)
+        self.proc_param_addr
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Register a loaded module with the kernel.

@@ -85,7 +85,7 @@ fn hle_get_addcont_info(_ctx: &HleContext, _args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_ctx, GuestMemory};
+    use crate::{GuestMemory, test_ctx};
 
     #[test]
     fn sku_flag_reports_full_game_and_no_dlc() {

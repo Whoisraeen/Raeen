@@ -3,8 +3,8 @@
 //! Converts the XPS5X shader IR into SPIR-V binary modules
 //! that can be consumed by Vulkan's shader pipeline.
 
-use super::ir::{IrOp, IrProgram, IrValue};
 use super::ShaderType;
+use super::ir::{IrOp, IrProgram, IrValue};
 use std::collections::HashMap;
 use tracing::info;
 use xps5x_core::error::GpuError;
@@ -510,8 +510,8 @@ impl SpirvModule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shader::ir::IrProgram;
     use crate::shader::ShaderType;
+    use crate::shader::ir::IrProgram;
 
     /// An empty IR program of the given shader stage.
     fn prog(ty: ShaderType) -> IrProgram {

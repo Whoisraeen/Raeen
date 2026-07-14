@@ -78,7 +78,7 @@ fn hle_ctl_get_state(ctx: &HleContext, args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_ctx, GuestMemory};
+    use crate::{GuestMemory, test_ctx};
 
     #[test]
     fn byte_order_helpers_are_real_swaps() {

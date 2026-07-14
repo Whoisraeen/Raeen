@@ -66,7 +66,7 @@ fn hle_mapping_triple(ctx: &HleContext, args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_ctx, GuestMemory};
+    use crate::{GuestMemory, test_ctx};
 
     #[test]
     fn request_is_reported_on_hdd() {

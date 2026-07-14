@@ -119,7 +119,7 @@ fn hle_msg_terminate(_ctx: &HleContext, _args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_ctx, GuestMemory};
+    use crate::{GuestMemory, test_ctx};
 
     #[test]
     fn msg_dialog_open_finishes_immediately_and_reports_ok() {

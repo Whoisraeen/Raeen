@@ -165,7 +165,10 @@ impl VirtualFileSystem {
 
         // O_CREAT of a missing file: ensure the parent dir exists so the
         // eventual flush-on-close succeeds.
-        if create && !exists && let Some(parent) = host_path.parent() {
+        if create
+            && !exists
+            && let Some(parent) = host_path.parent()
+        {
             let _ = std::fs::create_dir_all(parent);
         }
 
@@ -273,7 +276,7 @@ impl VirtualFileSystem {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "bad whence",
-                ))
+                ));
             }
         };
         let target = base
@@ -348,7 +351,9 @@ mod tests {
         vfs.set_game_directory(&dir);
 
         // Create + write "save data", close → must persist to the host file.
-        let fd = vfs.open("/app0/save.bin", O_WRONLY | O_CREAT | O_TRUNC, 0o644).unwrap();
+        let fd = vfs
+            .open("/app0/save.bin", O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            .unwrap();
         assert_eq!(vfs.write(fd, b"SAVEDATA").unwrap(), 8);
         vfs.close(fd).unwrap();
         assert_eq!(std::fs::read(dir.join("save.bin")).unwrap(), b"SAVEDATA");
@@ -370,7 +375,10 @@ mod tests {
         vfs.set_game_directory(&dir);
 
         let fd = vfs.open("/app0/f.bin", O_RDONLY, 0).unwrap();
-        assert!(vfs.write(fd, b"nope").is_err(), "read-only fd must reject writes");
+        assert!(
+            vfs.write(fd, b"nope").is_err(),
+            "read-only fd must reject writes"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -378,7 +386,9 @@ mod tests {
     fn writable_open_of_traversing_path_is_refused() {
         use open_flags::*;
         let vfs = VirtualFileSystem::new();
-        let err = vfs.open("/app0/../../escape.bin", O_WRONLY | O_CREAT, 0o644).unwrap_err();
+        let err = vfs
+            .open("/app0/../../escape.bin", O_WRONLY | O_CREAT, 0o644)
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
@@ -389,12 +399,17 @@ mod tests {
         let vfs = VirtualFileSystem::new();
         vfs.set_game_directory(&dir);
 
-        let fd = vfs.open("/app0/sparse.bin", O_WRONLY | O_CREAT | O_TRUNC, 0o644).unwrap();
+        let fd = vfs
+            .open("/app0/sparse.bin", O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            .unwrap();
         assert_eq!(vfs.seek(fd, 4, 0).unwrap(), 4); // SEEK_SET past start
         vfs.write(fd, b"AB").unwrap();
         vfs.close(fd).unwrap();
         // 4 zero bytes + "AB".
-        assert_eq!(std::fs::read(dir.join("sparse.bin")).unwrap(), b"\0\0\0\0AB");
+        assert_eq!(
+            std::fs::read(dir.join("sparse.bin")).unwrap(),
+            b"\0\0\0\0AB"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

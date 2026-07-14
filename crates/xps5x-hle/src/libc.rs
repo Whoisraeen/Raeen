@@ -884,7 +884,7 @@ fn hle_posix_memalign(ctx: &HleContext, args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_ctx, GuestMemory};
+    use crate::{GuestMemory, test_ctx};
 
     /// M1-C: `printf` reads the guest format string and `%s` pointee, formats
     /// against the captured registers, and lands the output in the kernel

@@ -130,7 +130,7 @@ fn hle_get_language_mask(ctx: &HleContext, args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_ctx, GuestMemory};
+    use crate::{GuestMemory, test_ctx};
 
     #[test]
     fn get_locus_reports_every_chunk_local_fast() {

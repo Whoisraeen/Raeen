@@ -124,7 +124,10 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 #[must_use]
 pub fn sys_file_to_system_time_utc(f: &SysFileTimeStruct) -> SysTimeStruct {
     if f.is_invalid {
-        return SysTimeStruct { is_invalid: true, ..Default::default() };
+        return SysTimeStruct {
+            is_invalid: true,
+            ..Default::default()
+        };
     }
 
     let total_days = (f.ticks / TICKS_PER_DAY) as i64 - FILETIME_UNIX_DIFF_DAYS;
@@ -163,7 +166,10 @@ pub fn sys_time_t_to_system(t: i64) -> SysTimeStruct {
     // reassembles via `sys_file_to_system_time_utc`, exactly as the original
     // does.
     let ticks = t * 10_000_000 + FILETIME_UNIX_DIFF_TICKS;
-    let ft = SysFileTimeStruct { ticks: ticks as u64, is_invalid: false };
+    let ft = SysFileTimeStruct {
+        ticks: ticks as u64,
+        is_invalid: false,
+    };
     sys_file_to_system_time_utc(&ft)
 }
 
@@ -171,24 +177,33 @@ pub fn sys_time_t_to_system(t: i64) -> SysTimeStruct {
 #[must_use]
 pub fn sys_system_to_file_time_utc(f: &SysTimeStruct) -> SysFileTimeStruct {
     if f.is_invalid {
-        return SysFileTimeStruct { is_invalid: true, ..Default::default() };
+        return SysFileTimeStruct {
+            is_invalid: true,
+            ..Default::default()
+        };
     }
 
-    let days = days_from_civil(i64::from(f.year), i64::from(f.month), i64::from(f.day)) + FILETIME_UNIX_DIFF_DAYS;
+    let days = days_from_civil(i64::from(f.year), i64::from(f.month), i64::from(f.day))
+        + FILETIME_UNIX_DIFF_DAYS;
     let ticks = (days as u64) * TICKS_PER_DAY
         + u64::from(f.hour) * TICKS_PER_HOUR
         + u64::from(f.minute) * TICKS_PER_MINUTE
         + u64::from(f.second) * TICKS_PER_SECOND
         + u64::from(f.milliseconds) * TICKS_PER_MS;
 
-    SysFileTimeStruct { ticks, is_invalid: false }
+    SysFileTimeStruct {
+        ticks,
+        is_invalid: false,
+    }
 }
 
 /// Shared helper backing both `sys_get_system_time` and
 /// `sys_get_system_time_utc` (see the module doc comment on why both return
 /// UTC for now).
 fn now_utc() -> SysTimeStruct {
-    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let total_secs = dur.as_secs() as i64;
     let days = total_secs.div_euclid(86400);
     let secs_of_day = total_secs.rem_euclid(86400);
@@ -261,7 +276,10 @@ mod tests {
 
     #[test]
     fn filetime_epoch_zero_is_1601_01_01_midnight() {
-        let ft = SysFileTimeStruct { ticks: 0, is_invalid: false };
+        let ft = SysFileTimeStruct {
+            ticks: 0,
+            is_invalid: false,
+        };
         let t = sys_file_to_system_time_utc(&ft);
         assert!(!t.is_invalid);
         assert_eq!((t.year, t.month, t.day), (1601, 1, 1));
@@ -270,7 +288,10 @@ mod tests {
 
     #[test]
     fn filetime_unix_diff_ticks_is_1970_01_01_midnight() {
-        let ft = SysFileTimeStruct { ticks: FILETIME_UNIX_DIFF_TICKS as u64, is_invalid: false };
+        let ft = SysFileTimeStruct {
+            ticks: FILETIME_UNIX_DIFF_TICKS as u64,
+            is_invalid: false,
+        };
         let t = sys_file_to_system_time_utc(&ft);
         assert_eq!((t.year, t.month, t.day), (1970, 1, 1));
         assert_eq!((t.hour, t.minute, t.second, t.milliseconds), (0, 0, 0, 0));
@@ -312,14 +333,20 @@ mod tests {
 
     #[test]
     fn invalid_file_time_propagates() {
-        let ft = SysFileTimeStruct { ticks: 12345, is_invalid: true };
+        let ft = SysFileTimeStruct {
+            ticks: 12345,
+            is_invalid: true,
+        };
         let t = sys_file_to_system_time_utc(&ft);
         assert!(t.is_invalid);
     }
 
     #[test]
     fn invalid_system_time_propagates() {
-        let s = SysTimeStruct { is_invalid: true, ..Default::default() };
+        let s = SysTimeStruct {
+            is_invalid: true,
+            ..Default::default()
+        };
         let ft = sys_system_to_file_time_utc(&s);
         assert!(ft.is_invalid);
     }
@@ -344,17 +371,28 @@ mod tests {
         let local = sys_get_system_time();
         let utc = sys_get_system_time_utc();
         assert!(!local.is_invalid && !utc.is_invalid);
-        let diff = (i64::from(local.hour) * 3600 + i64::from(local.minute) * 60 + i64::from(local.second))
-            - (i64::from(utc.hour) * 3600 + i64::from(utc.minute) * 60 + i64::from(utc.second));
+        let diff =
+            (i64::from(local.hour) * 3600 + i64::from(local.minute) * 60 + i64::from(local.second))
+                - (i64::from(utc.hour) * 3600 + i64::from(utc.minute) * 60 + i64::from(utc.second));
         assert!(diff.abs() <= 1);
     }
 
     #[test]
     fn civil_day_conversions_are_inverse() {
-        let cases = [(1970, 1, 1), (2026, 7, 12), (2000, 2, 29), (1601, 1, 1), (1900, 3, 1)];
+        let cases = [
+            (1970, 1, 1),
+            (2026, 7, 12),
+            (2000, 2, 29),
+            (1601, 1, 1),
+            (1900, 3, 1),
+        ];
         for (y, m, d) in cases {
             let days = days_from_civil(y, m, d);
-            assert_eq!(civil_from_days(days), (y, m, d), "roundtrip failed for {y}-{m}-{d}");
+            assert_eq!(
+                civil_from_days(days),
+                (y, m, d),
+                "roundtrip failed for {y}-{m}-{d}"
+            );
         }
     }
 }

@@ -121,7 +121,7 @@ fn hle_get_event(_ctx: &HleContext, _args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_ctx, GuestMemory};
+    use crate::{GuestMemory, test_ctx};
 
     #[test]
     fn initial_user_and_login_list() {

@@ -149,7 +149,7 @@ fn hle_get_vblank_status(ctx: &HleContext, args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_ctx, GuestMemory};
+    use crate::{GuestMemory, test_ctx};
 
     #[test]
     fn submit_flip_advances_the_reported_flip_count() {

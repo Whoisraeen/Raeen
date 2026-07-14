@@ -135,7 +135,11 @@ fn cpu_brand_string() -> Vec<u8> {
     // leaves 0x8000_0002..=0x8000_0004 are available on every x86-64 CPU
     // shipped since the early 2000s; it just runs `cpuid` and returns the
     // four output registers verbatim).
-    let leaves = [__cpuid(0x8000_0002), __cpuid(0x8000_0003), __cpuid(0x8000_0004)];
+    let leaves = [
+        __cpuid(0x8000_0002),
+        __cpuid(0x8000_0003),
+        __cpuid(0x8000_0004),
+    ];
 
     let mut bytes = Vec::with_capacity(48);
     for leaf in leaves {
@@ -228,7 +232,9 @@ fn resolve_virtual_alloc2() -> Option<VirtualAlloc2Func> {
                 return None;
             }
             let proc = GetProcAddress(h, c"VirtualAlloc2".as_ptr().cast());
-            proc.map(|f| std::mem::transmute::<unsafe extern "system" fn() -> isize, VirtualAlloc2Func>(f))
+            proc.map(|f| {
+                std::mem::transmute::<unsafe extern "system" fn() -> isize, VirtualAlloc2Func>(f)
+            })
         }
     })
 }
@@ -260,7 +266,11 @@ pub fn sys_virtual_alloc_aligned(address: u64, size: u64, mode: Mode, alignment:
         } else {
             align_up(address, alignment)
         }) as *mut c_void,
-        HighestEndingAddress: (if address == 0 { SYSTEM_MANAGED_MAX } else { USER_MAX }) as *mut c_void,
+        HighestEndingAddress: (if address == 0 {
+            SYSTEM_MANAGED_MAX
+        } else {
+            USER_MAX
+        }) as *mut c_void,
         Alignment: alignment as usize,
     };
     let mut param = MEM_EXTENDED_PARAMETER {
@@ -391,7 +401,12 @@ pub fn sys_virtual_free(address: u64) -> bool {
 
 /// Kyty `sys_virtual_protect()`: change the protection of an already-mapped
 /// region, optionally reporting the previous mode back through `old_mode`.
-pub fn sys_virtual_protect(address: u64, size: u64, mode: Mode, old_mode: Option<&mut Mode>) -> bool {
+pub fn sys_virtual_protect(
+    address: u64,
+    size: u64,
+    mode: Mode,
+    old_mode: Option<&mut Mode>,
+) -> bool {
     let mut old_protect: u32 = 0;
     // SAFETY: `address`/`size` must describe an already-mapped region within
     // this process, per `VirtualProtect`'s contract (the same contract Kyty
@@ -422,7 +437,9 @@ pub fn sys_virtual_flush_instruction_cache(address: u64, size: u64) -> bool {
     // cache lines; it does not require the range to be executable, only
     // readable and valid, which is the same precondition Kyty places on
     // callers.
-    let ok = unsafe { FlushInstructionCache(GetCurrentProcess(), address as *const c_void, size as usize) };
+    let ok = unsafe {
+        FlushInstructionCache(GetCurrentProcess(), address as *const c_void, size as usize)
+    };
     if ok == 0 {
         eprintln!("FlushInstructionCache() failed: {:#010x}", last_error());
         return false;
@@ -505,7 +522,10 @@ mod tests {
         // The Write-only and ExecuteWrite-only variants collapse onto
         // ReadWrite/ExecuteReadWrite on Win32 (there is no write-only page
         // protection), matching Kyty's mapping exactly.
-        assert_eq!(mode_to_protection_flag(Mode::Write), mode_to_protection_flag(Mode::ReadWrite));
+        assert_eq!(
+            mode_to_protection_flag(Mode::Write),
+            mode_to_protection_flag(Mode::ReadWrite)
+        );
         assert_eq!(
             mode_to_protection_flag(Mode::ExecuteWrite),
             mode_to_protection_flag(Mode::ExecuteReadWrite)
@@ -516,8 +536,15 @@ mod tests {
     fn alloc_and_free_round_trip() {
         let size = 0x1000u64;
         let addr = sys_virtual_alloc(0, size, Mode::ReadWrite);
-        assert_ne!(addr, 0, "sys_virtual_alloc should succeed for a fresh mapping");
-        assert_eq!(addr % 0x1000, 0, "VirtualAlloc always returns page-aligned addresses");
+        assert_ne!(
+            addr, 0,
+            "sys_virtual_alloc should succeed for a fresh mapping"
+        );
+        assert_eq!(
+            addr % 0x1000,
+            0,
+            "VirtualAlloc always returns page-aligned addresses"
+        );
 
         // The region must actually be writable.
         let ptr = addr as *mut u64;
@@ -534,7 +561,11 @@ mod tests {
         let alignment = 0x10000u64; // 64 KiB, the Windows allocation granularity.
         let addr = sys_virtual_alloc_aligned(0, 0x1000, Mode::ReadWrite, alignment);
         assert_ne!(addr, 0);
-        assert_eq!(addr % alignment, 0, "returned address must satisfy the requested alignment");
+        assert_eq!(
+            addr % alignment,
+            0,
+            "returned address must satisfy the requested alignment"
+        );
         assert!(sys_virtual_free(addr));
     }
 
@@ -545,7 +576,12 @@ mod tests {
         assert_ne!(addr, 0);
 
         let mut old_mode = Mode::NoAccess;
-        assert!(sys_virtual_protect(addr, size, Mode::Read, Some(&mut old_mode)));
+        assert!(sys_virtual_protect(
+            addr,
+            size,
+            Mode::Read,
+            Some(&mut old_mode)
+        ));
         assert_eq!(old_mode, Mode::ReadWrite);
 
         // Restore so the region can be freed cleanly (not strictly required
@@ -599,6 +635,9 @@ mod tests {
     fn get_system_info_reports_a_processor_name() {
         sys_virtual_init();
         let info = sys_get_system_info();
-        assert!(!info.processor_name.is_empty(), "CPUID brand string should be non-empty on x86-64");
+        assert!(
+            !info.processor_name.is_empty(),
+            "CPUID brand string should be non-empty on x86-64"
+        );
     }
 }

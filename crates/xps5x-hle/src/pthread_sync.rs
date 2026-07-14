@@ -200,11 +200,7 @@ fn lock_core(ctx: &HleContext, mutex_addr: u64, try_only: bool) -> u64 {
             }
             _ => {
                 // Error-check: self-relock is a detected deadlock.
-                if try_only {
-                    EBUSY
-                } else {
-                    EDEADLK
-                }
+                if try_only { EBUSY } else { EDEADLK }
             }
         }
     } else {
@@ -411,7 +407,7 @@ fn hle_rwlockattr_ok(_ctx: &HleContext, args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_ctx, GuestMemory};
+    use crate::{GuestMemory, test_ctx};
 
     /// Build a context with memory large enough for a mutex pointer slot plus
     /// the allocator's object arena (based well past the pointer slots).

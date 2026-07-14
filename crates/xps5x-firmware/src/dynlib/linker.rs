@@ -305,7 +305,7 @@ fn write_slot(image: &mut [u8], offset: u64, value: u64) -> Result<(), FirmwareE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dynlib::nid::{nid_of, NidDatabase};
+    use crate::dynlib::nid::{NidDatabase, nid_of};
     use crate::dynlib::{DynSymbol, SceRela, SymbolExport};
     use crate::sprx::SprxSegment;
 

@@ -87,11 +87,12 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_ALWAYS, CopyFileW, CreateDirectoryW, CreateFileW, DeleteFileW, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_BEGIN, FILE_CURRENT, FILE_FLAG_RANDOM_ACCESS,
-    FILE_SHARE_READ, FindClose, FindFirstFileW, FindNextFileW, FlushFileBuffers, GetFileAttributesExW,
-    GetFileAttributesW, GetFileExInfoStandard, GetFileSizeEx, GetFileTime, INVALID_FILE_ATTRIBUTES,
-    MoveFileW, OPEN_EXISTING, ReadFile, RemoveDirectoryW, SetEndOfFile, SetFileAttributesW,
-    SetFilePointerEx, SetFileTime, WIN32_FILE_ATTRIBUTE_DATA, WIN32_FIND_DATAW, WriteFile,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_BEGIN, FILE_CURRENT,
+    FILE_FLAG_RANDOM_ACCESS, FILE_SHARE_READ, FindClose, FindFirstFileW, FindNextFileW,
+    FlushFileBuffers, GetFileAttributesExW, GetFileAttributesW, GetFileExInfoStandard,
+    GetFileSizeEx, GetFileTime, INVALID_FILE_ATTRIBUTES, MoveFileW, OPEN_EXISTING, ReadFile,
+    RemoveDirectoryW, SetEndOfFile, SetFileAttributesW, SetFilePointerEx, SetFileTime,
+    WIN32_FILE_ATTRIBUTE_DATA, WIN32_FIND_DATAW, WriteFile,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 
@@ -129,7 +130,10 @@ fn filetime_to_u64(ft: FILETIME) -> u64 {
 }
 
 fn u64_to_filetime(v: u64) -> FILETIME {
-    FILETIME { dwLowDateTime: v as u32, dwHighDateTime: (v >> 32) as u32 }
+    FILETIME {
+        dwLowDateTime: v as u32,
+        dwHighDateTime: (v >> 32) as u32,
+    }
 }
 
 /// `sys_file_find_t`.
@@ -280,7 +284,13 @@ pub fn sys_file_read(data: &mut [u8], f: &mut SysFile) -> u32 {
             // uniquely-owned buffer of `data.len()` bytes for `ReadFile` to
             // write into, and `read` is a valid `u32` out-param.
             unsafe {
-                ReadFile(*handle, data.as_mut_ptr(), data.len() as u32, &mut read, ptr::null_mut());
+                ReadFile(
+                    *handle,
+                    data.as_mut_ptr(),
+                    data.len() as u32,
+                    &mut read,
+                    ptr::null_mut(),
+                );
             }
             read
         }
@@ -298,7 +308,13 @@ pub fn sys_file_write(data: &[u8], f: &mut SysFile) -> u32 {
             // SAFETY: `handle` is a live `HANDLE`; `data` is a valid,
             // immutably-borrowed buffer `WriteFile` only reads from.
             unsafe {
-                WriteFile(*handle, data.as_ptr(), data.len() as u32, &mut written, ptr::null_mut());
+                WriteFile(
+                    *handle,
+                    data.as_ptr(),
+                    data.len() as u32,
+                    &mut written,
+                    ptr::null_mut(),
+                );
             }
             written
         }
@@ -357,7 +373,9 @@ pub fn sys_file_create_file(file_name: &String) -> SysFile {
     };
     // No error check here, matching the original: `is_error` still detects
     // a failed create via `handle == INVALID_HANDLE_VALUE`.
-    SysFile { repr: SysFileRepr::File(handle) }
+    SysFile {
+        repr: SysFileRepr::File(handle),
+    }
 }
 
 /// `sys_file_open_r(const String&, sys_file_cache_type_t)`.
@@ -376,7 +394,11 @@ pub fn sys_file_open_r(file_name: &String, cache_type: SysFileCacheType) -> SysF
             ptr::null_mut(),
         )
     };
-    let repr = if handle == INVALID_HANDLE_VALUE { SysFileRepr::Error } else { SysFileRepr::File(handle) };
+    let repr = if handle == INVALID_HANDLE_VALUE {
+        SysFileRepr::Error
+    } else {
+        SysFileRepr::File(handle)
+    };
     SysFile { repr }
 }
 
@@ -396,7 +418,11 @@ pub fn sys_file_open_w(file_name: &String, cache_type: SysFileCacheType) -> SysF
             ptr::null_mut(),
         )
     };
-    let repr = if handle == INVALID_HANDLE_VALUE { SysFileRepr::Error } else { SysFileRepr::File(handle) };
+    let repr = if handle == INVALID_HANDLE_VALUE {
+        SysFileRepr::Error
+    } else {
+        SysFileRepr::File(handle)
+    };
     SysFile { repr }
 }
 
@@ -416,7 +442,11 @@ pub fn sys_file_open_rw(file_name: &String, cache_type: SysFileCacheType) -> Sys
             ptr::null_mut(),
         )
     };
-    let repr = if handle == INVALID_HANDLE_VALUE { SysFileRepr::Error } else { SysFileRepr::File(handle) };
+    let repr = if handle == INVALID_HANDLE_VALUE {
+        SysFileRepr::Error
+    } else {
+        SysFileRepr::File(handle)
+    };
     SysFile { repr }
 }
 
@@ -425,14 +455,26 @@ pub fn sys_file_open_rw(file_name: &String, cache_type: SysFileCacheType) -> Sys
 /// Reads/writes never grow it. Renamed — see the module doc comment.
 #[must_use]
 pub fn sys_file_open_mem(buf: Vec<u8>) -> SysFile {
-    SysFile { repr: SysFileRepr::Mem(MemBuf { data: buf, pos: 0, growable: false }) }
+    SysFile {
+        repr: SysFileRepr::Mem(MemBuf {
+            data: buf,
+            pos: 0,
+            growable: false,
+        }),
+    }
 }
 
 /// `sys_file_create()`: creates an empty, growable in-memory file
 /// (`SYS_FILE_MEMORY_DYN`). Renamed — see the module doc comment.
 #[must_use]
 pub fn sys_file_create_mem() -> SysFile {
-    SysFile { repr: SysFileRepr::Mem(MemBuf { data: Vec::new(), pos: 0, growable: true }) }
+    SysFile {
+        repr: SysFileRepr::Mem(MemBuf {
+            data: Vec::new(),
+            pos: 0,
+            growable: true,
+        }),
+    }
 }
 
 /// `sys_file_close(sys_file_t*)`: releases `f`. Equivalent to simply
@@ -470,7 +512,11 @@ pub fn sys_file_size_of_path(file_name: &String) -> u64 {
     // repr(C) struct of integers/FILETIMEs) out-param for `GetFileAttributesExW`.
     let (ok, data): (i32, WIN32_FILE_ATTRIBUTE_DATA) = unsafe {
         let mut data: WIN32_FILE_ATTRIBUTE_DATA = std::mem::zeroed();
-        let ok = GetFileAttributesExW(wide.as_ptr(), GetFileExInfoStandard, (&mut data as *mut WIN32_FILE_ATTRIBUTE_DATA).cast());
+        let ok = GetFileAttributesExW(
+            wide.as_ptr(),
+            GetFileExInfoStandard,
+            (&mut data as *mut WIN32_FILE_ATTRIBUTE_DATA).cast(),
+        );
         (ok, data)
     };
     if ok == 0 {
@@ -597,14 +643,23 @@ pub fn sys_file_flush(f: &mut SysFile) -> bool {
 #[must_use]
 pub fn sys_file_get_last_access_time_utc(name: &String) -> SysFileTimeStruct {
     let f = sys_file_open_r(name, SysFileCacheType::Auto);
-    let mut result = SysFileTimeStruct { time: 0, is_invalid: true };
+    let mut result = SysFileTimeStruct {
+        time: 0,
+        is_invalid: true,
+    };
     if let SysFileRepr::File(handle) = f.repr {
-        let mut ft = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut ft = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
         // SAFETY: `handle` is a live `HANDLE` (the `Error` variant is never
         // constructed with an invalid one — see `sys_file_open_r`); `ft` is
         // a valid out-param, the other two time slots are intentionally null.
         let ok = unsafe { GetFileTime(handle, ptr::null_mut(), &mut ft, ptr::null_mut()) != 0 };
-        result = SysFileTimeStruct { time: filetime_to_u64(ft), is_invalid: !ok };
+        result = SysFileTimeStruct {
+            time: filetime_to_u64(ft),
+            is_invalid: !ok,
+        };
     }
     sys_file_close(f);
     result
@@ -614,12 +669,21 @@ pub fn sys_file_get_last_access_time_utc(name: &String) -> SysFileTimeStruct {
 #[must_use]
 pub fn sys_file_get_last_write_time_utc(name: &String) -> SysFileTimeStruct {
     let f = sys_file_open_r(name, SysFileCacheType::Auto);
-    let mut result = SysFileTimeStruct { time: 0, is_invalid: true };
+    let mut result = SysFileTimeStruct {
+        time: 0,
+        is_invalid: true,
+    };
     if let SysFileRepr::File(handle) = f.repr {
-        let mut ft = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut ft = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
         // SAFETY: see `sys_file_get_last_access_time_utc`.
         let ok = unsafe { GetFileTime(handle, ptr::null_mut(), ptr::null_mut(), &mut ft) != 0 };
-        result = SysFileTimeStruct { time: filetime_to_u64(ft), is_invalid: !ok };
+        result = SysFileTimeStruct {
+            time: filetime_to_u64(ft),
+            is_invalid: !ok,
+        };
     }
     sys_file_close(f);
     result
@@ -629,17 +693,37 @@ pub fn sys_file_get_last_write_time_utc(name: &String) -> SysFileTimeStruct {
 /// SysFileTimeStruct&, SysFileTimeStruct&)`: the path-based overload,
 /// returning `(access, write)` instead of writing through two out-params.
 #[must_use]
-pub fn sys_file_get_last_access_and_write_time_utc(name: &String) -> (SysFileTimeStruct, SysFileTimeStruct) {
+pub fn sys_file_get_last_access_and_write_time_utc(
+    name: &String,
+) -> (SysFileTimeStruct, SysFileTimeStruct) {
     let f = sys_file_open_r(name, SysFileCacheType::Auto);
-    let mut access = SysFileTimeStruct { time: 0, is_invalid: true };
-    let mut write = SysFileTimeStruct { time: 0, is_invalid: true };
+    let mut access = SysFileTimeStruct {
+        time: 0,
+        is_invalid: true,
+    };
+    let mut write = SysFileTimeStruct {
+        time: 0,
+        is_invalid: true,
+    };
     if let SysFileRepr::File(handle) = f.repr {
-        let mut a = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
-        let mut w = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut a = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut w = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
         // SAFETY: see `sys_file_get_last_access_time_utc`.
         let ok = unsafe { GetFileTime(handle, ptr::null_mut(), &mut a, &mut w) != 0 };
-        access = SysFileTimeStruct { time: filetime_to_u64(a), is_invalid: !ok };
-        write = SysFileTimeStruct { time: filetime_to_u64(w), is_invalid: !ok };
+        access = SysFileTimeStruct {
+            time: filetime_to_u64(a),
+            is_invalid: !ok,
+        };
+        write = SysFileTimeStruct {
+            time: filetime_to_u64(w),
+            is_invalid: !ok,
+        };
     }
     sys_file_close(f);
     (access, write)
@@ -653,30 +737,56 @@ pub fn sys_file_get_last_access_and_write_time_utc(name: &String) -> (SysFileTim
 /// `sys_system_to_file_time_utc` round trip (collapsed here into one
 /// `GetSystemTimeAsFileTime` call producing the same `FILETIME` value).
 #[must_use]
-pub fn sys_file_get_file_last_access_and_write_time_utc(f: &SysFile) -> (SysFileTimeStruct, SysFileTimeStruct) {
+pub fn sys_file_get_file_last_access_and_write_time_utc(
+    f: &SysFile,
+) -> (SysFileTimeStruct, SysFileTimeStruct) {
     match f.repr {
         SysFileRepr::File(handle) => {
-            let mut a = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
-            let mut w = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+            let mut a = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
+            let mut w = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
             // SAFETY: `handle` is a live `HANDLE`.
             let ok = unsafe { GetFileTime(handle, ptr::null_mut(), &mut a, &mut w) != 0 };
             (
-                SysFileTimeStruct { time: filetime_to_u64(a), is_invalid: !ok },
-                SysFileTimeStruct { time: filetime_to_u64(w), is_invalid: !ok },
+                SysFileTimeStruct {
+                    time: filetime_to_u64(a),
+                    is_invalid: !ok,
+                },
+                SysFileTimeStruct {
+                    time: filetime_to_u64(w),
+                    is_invalid: !ok,
+                },
             )
         }
         SysFileRepr::Mem(_) => {
-            let mut now = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+            let mut now = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
             // SAFETY: `now` is a valid `FILETIME` out-param.
             unsafe {
                 GetSystemTimeAsFileTime(&mut now);
             }
-            let t = SysFileTimeStruct { time: filetime_to_u64(now), is_invalid: false };
+            let t = SysFileTimeStruct {
+                time: filetime_to_u64(now),
+                is_invalid: false,
+            };
             (t, t)
         }
         SysFileRepr::Error => (
-            SysFileTimeStruct { time: 0, is_invalid: true },
-            SysFileTimeStruct { time: 0, is_invalid: true },
+            SysFileTimeStruct {
+                time: 0,
+                is_invalid: true,
+            },
+            SysFileTimeStruct {
+                time: 0,
+                is_invalid: true,
+            },
         ),
     }
 }
@@ -823,7 +933,10 @@ pub fn sys_file_get_dents(path: &String, out: &mut Vector<SysDirEntry>) {
     loop {
         let file_name = wide_z_to_string(&data.cFileName);
         let is_file = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
-        out.add(SysDirEntry { name: file_name, is_file });
+        out.add(SysDirEntry {
+            name: file_name,
+            is_file,
+        });
 
         // SAFETY: see `sys_file_find_files`.
         let has_next = unsafe { FindNextFileW(handle, &mut data) != 0 };
@@ -872,7 +985,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_temp_dir(tag: &str) -> String {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let mut dir = std::env::temp_dir();
         dir.push(format!("xps5x_kyty_sysfileio_{tag}_{nanos}"));
         String::from(dir.to_str().unwrap())
@@ -996,7 +1112,10 @@ mod tests {
     #[test]
     fn seeking_on_error_file_is_a_harmless_no_op_returning_true() {
         // Opening a nonexistent file yields the `Error` repr.
-        let mut f = sys_file_open_r(&String::from("R:/does/not/exist_xps5x.bin"), SysFileCacheType::Auto);
+        let mut f = sys_file_open_r(
+            &String::from("R:/does/not/exist_xps5x.bin"),
+            SysFileCacheType::Auto,
+        );
         assert!(sys_file_is_error(&f));
         assert!(sys_file_seek(&mut f, 123));
         assert_eq!(sys_file_tell(&f), 0);
@@ -1057,7 +1176,11 @@ mod tests {
         assert!(sys_file_seek(&mut f, 3));
         assert!(sys_file_truncate(&mut f, 5));
         assert_eq!(sys_file_size(&f), 5);
-        assert_eq!(sys_file_tell(&f), 3, "position must be restored after truncate");
+        assert_eq!(
+            sys_file_tell(&f),
+            3,
+            "position must be restored after truncate"
+        );
         sys_file_close(f);
 
         sys_file_delete_file(&path);
@@ -1101,7 +1224,10 @@ mod tests {
 
         // An arbitrary, clearly-non-invalid FILETIME value (some point in
         // 2000), used purely to check the round trip.
-        let stamp = SysFileTimeStruct { time: 125_911_584_000_000_000, is_invalid: false };
+        let stamp = SysFileTimeStruct {
+            time: 125_911_584_000_000_000,
+            is_invalid: false,
+        };
         assert!(sys_file_set_last_write_time_utc(&path, &stamp));
 
         let read_back = sys_file_get_last_write_time_utc(&path);
@@ -1121,10 +1247,15 @@ mod tests {
         sys_file_write(b"x", &mut f);
         sys_file_close(f);
 
-        let invalid = SysFileTimeStruct { time: 0, is_invalid: true };
+        let invalid = SysFileTimeStruct {
+            time: 0,
+            is_invalid: true,
+        };
         assert!(!sys_file_set_last_access_time_utc(&path, &invalid));
         assert!(!sys_file_set_last_write_time_utc(&path, &invalid));
-        assert!(!sys_file_set_last_access_and_write_time_utc(&path, &invalid, &invalid));
+        assert!(!sys_file_set_last_access_and_write_time_utc(
+            &path, &invalid, &invalid
+        ));
 
         sys_file_delete_file(&path);
         sys_file_delete_directory(&dir);
@@ -1139,7 +1270,10 @@ mod tests {
 
         let top_file = dir.clone() + "/top.bin";
         let nested_file = sub.clone() + "/nested.bin";
-        for (p, contents) in [(&top_file, b"aa".as_slice()), (&nested_file, b"bbb".as_slice())] {
+        for (p, contents) in [
+            (&top_file, b"aa".as_slice()),
+            (&nested_file, b"bbb".as_slice()),
+        ] {
             let mut f = sys_file_create_file(p);
             sys_file_write(contents, &mut f);
             sys_file_close(f);
@@ -1148,11 +1282,18 @@ mod tests {
         let mut found: Vector<SysFileFind> = Vector::new();
         sys_file_find_files(&dir, &mut found);
 
-        assert_eq!(found.size(), 2, "must recurse into `sub` and find both files, skipping . and ..");
+        assert_eq!(
+            found.size(),
+            2,
+            "must recurse into `sub` and find both files, skipping . and .."
+        );
         let names: Vec<StdString> = found.iter().map(|e| to_std(&e.path_with_name)).collect();
         assert!(names.iter().any(|n| n.ends_with("top.bin")));
         assert!(names.iter().any(|n| n.ends_with("nested.bin")));
-        let nested_entry = found.iter().find(|e| to_std(&e.path_with_name).ends_with("nested.bin")).unwrap();
+        let nested_entry = found
+            .iter()
+            .find(|e| to_std(&e.path_with_name).ends_with("nested.bin"))
+            .unwrap();
         assert_eq!(nested_entry.size, 3);
 
         sys_file_delete_file(&top_file);
@@ -1186,7 +1327,10 @@ mod tests {
 
         let sub_entry = entries.iter().find(|e| to_std(&e.name) == "sub").unwrap();
         assert!(!sub_entry.is_file);
-        let file_entry = entries.iter().find(|e| to_std(&e.name) == "top.bin").unwrap();
+        let file_entry = entries
+            .iter()
+            .find(|e| to_std(&e.name) == "top.bin")
+            .unwrap();
         assert!(file_entry.is_file);
 
         sys_file_delete_file(&top_file);
@@ -1211,10 +1355,16 @@ mod tests {
         unsafe {
             SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_READONLY);
         }
-        assert!(!sys_file_delete_file(&path), "a read-only file should fail to delete");
+        assert!(
+            !sys_file_delete_file(&path),
+            "a read-only file should fail to delete"
+        );
 
         sys_file_remove_readonly(&path);
-        assert!(sys_file_delete_file(&path), "delete must succeed once read-only is cleared");
+        assert!(
+            sys_file_delete_file(&path),
+            "delete must succeed once read-only is cleared"
+        );
 
         sys_file_delete_directory(&dir);
     }

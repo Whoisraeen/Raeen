@@ -15,15 +15,15 @@
 
 #![cfg(target_os = "windows")]
 
-use xps5x_firmware::dynlib::nid::{nid_of, NidDatabase};
+use xps5x_firmware::dynlib::nid::{NidDatabase, nid_of};
 use xps5x_firmware::dynlib::{DynSymbol, DynlibData, SceRela};
 use xps5x_firmware::{
-    link_module, HleTrampoline, LinkedModule, ModuleRegistry, SprxModule, SprxSegment, TlsTemplate,
-    HLE_TRAMPOLINE_BASE,
+    HLE_TRAMPOLINE_BASE, HleTrampoline, LinkedModule, ModuleRegistry, SprxModule, SprxSegment,
+    TlsTemplate, link_module,
 };
 use xps5x_hle::{HleContext, HleRegistry};
 use xps5x_kernel::OrbisKernel;
-use xps5x_runtime::{execute_linked, execute_process, RunOutcome, RuntimeError, GUEST_ARENA_BASE};
+use xps5x_runtime::{GUEST_ARENA_BASE, RunOutcome, RuntimeError, execute_linked, execute_process};
 
 const R_X86_64_JUMP_SLOT: u64 = 7;
 

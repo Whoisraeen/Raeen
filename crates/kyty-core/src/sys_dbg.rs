@@ -43,14 +43,14 @@ use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{HANDLE, HMODULE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    RtlCaptureContext, RtlLookupFunctionEntry, RtlVirtualUnwind, SetUnhandledExceptionFilter,
-    CONTEXT, EXCEPTION_EXECUTE_HANDLER, EXCEPTION_POINTERS,
+    CONTEXT, EXCEPTION_EXECUTE_HANDLER, EXCEPTION_POINTERS, RtlCaptureContext,
+    RtlLookupFunctionEntry, RtlVirtualUnwind, SetUnhandledExceptionFilter,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleA;
 use windows_sys::Win32::System::Memory::{
-    VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
     PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_NOCACHE, PAGE_READONLY, PAGE_READWRITE,
-    PAGE_WRITECOPY,
+    PAGE_WRITECOPY, VirtualQuery,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 

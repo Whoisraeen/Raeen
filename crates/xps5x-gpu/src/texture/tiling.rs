@@ -143,7 +143,10 @@ mod tests {
                 seen[e] = true;
             }
         }
-        assert!(seen.iter().all(|&s| s), "micro-tile order must be a bijection over 0..64");
+        assert!(
+            seen.iter().all(|&s| s),
+            "micro-tile order must be a bijection over 0..64"
+        );
     }
 
     #[test]

@@ -37,8 +37,8 @@ use std::cell::UnsafeCell;
 use std::ptr;
 use std::time::Duration;
 use windows_sys::Win32::System::Threading::{
-    DeleteCriticalSection, EnterCriticalSection, InitializeCriticalSectionAndSpinCount,
-    LeaveCriticalSection, TryEnterCriticalSection, CRITICAL_SECTION,
+    CRITICAL_SECTION, DeleteCriticalSection, EnterCriticalSection,
+    InitializeCriticalSectionAndSpinCount, LeaveCriticalSection, TryEnterCriticalSection,
 };
 
 /// `SYS_CS_SPIN_COUNT` — the spin count `SysCS::init` passes to
@@ -269,8 +269,8 @@ mod tests {
 
     #[test]
     fn enter_leave_blocks_across_threads() {
-        use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
         let cs = Arc::new(SysCS::new());
         cs.init();

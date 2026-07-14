@@ -190,7 +190,7 @@ fn hle_get_guardsize(ctx: &HleContext, args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_ctx, GuestMemory};
+    use crate::{GuestMemory, test_ctx};
 
     fn ctx_env() -> (
         xps5x_kernel::OrbisKernel,

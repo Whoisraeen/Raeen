@@ -99,7 +99,9 @@ fn parse_int_prefix(s: &str, base: i32) -> (bool, u128, usize) {
             break;
         }
         any_digits = true;
-        magnitude = magnitude.saturating_mul(u128::from(base)).saturating_add(u128::from(digit));
+        magnitude = magnitude
+            .saturating_mul(u128::from(base))
+            .saturating_add(u128::from(digit));
         i += 1;
         end = i;
     }
@@ -182,8 +184,15 @@ pub fn sys_strtod(nptr: &str) -> (f64, usize) {
 /// Windows' `strtol(nptr, endptr, base)`, clamped to `int32_t` range.
 pub fn sys_strtoi32(nptr: &str, base: i32) -> (i32, usize) {
     let (negative, magnitude, consumed) = parse_int_prefix(nptr, base);
-    let signed: i128 = if negative { -(magnitude as i128) } else { magnitude as i128 };
-    (signed.clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32, consumed)
+    let signed: i128 = if negative {
+        -(magnitude as i128)
+    } else {
+        magnitude as i128
+    };
+    (
+        signed.clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32,
+        consumed,
+    )
 }
 
 /// `sys_strtoui32(const char *nptr, char **endptr, int base)`: ports
@@ -199,8 +208,15 @@ pub fn sys_strtoui32(nptr: &str, base: i32) -> (u32, usize) {
 /// Windows' `_strtoi64(nptr, endptr, base)`, clamped to `int64_t` range.
 pub fn sys_strtoi64(nptr: &str, base: i32) -> (i64, usize) {
     let (negative, magnitude, consumed) = parse_int_prefix(nptr, base);
-    let signed: i128 = if negative { -(magnitude as i128) } else { magnitude as i128 };
-    (signed.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64, consumed)
+    let signed: i128 = if negative {
+        -(magnitude as i128)
+    } else {
+        magnitude as i128
+    };
+    (
+        signed.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
+        consumed,
+    )
 }
 
 /// `sys_strtoui64(const char *nptr, char **endptr, int base)`: ports

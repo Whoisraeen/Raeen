@@ -34,7 +34,7 @@
 // (ported from `Kyty/Sys/Linux/SysLinuxHeap.h`) is added under its own module.
 #![cfg(windows)]
 
-use std::alloc::{alloc, dealloc, realloc as std_realloc, Layout};
+use std::alloc::{Layout, alloc, dealloc, realloc as std_realloc};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -106,7 +106,10 @@ fn raw_realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
         // keep the table consistent (defensive; `exit_if!` halts next).
         size_table().lock().unwrap().insert(ptr as usize, old_size);
     } else {
-        size_table().lock().unwrap().insert(new_ptr as usize, new_size);
+        size_table()
+            .lock()
+            .unwrap()
+            .insert(new_ptr as usize, new_size);
     }
     crate::exit_if!(new_ptr.is_null());
     new_ptr

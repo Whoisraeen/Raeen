@@ -4,8 +4,8 @@
 //! which is closer to SPIR-V's SSA form. This allows optimization
 //! passes before final SPIR-V emission.
 
-use super::gcn_decoder::{Encoding, Instruction, Operand};
 use super::ShaderType;
+use super::gcn_decoder::{Encoding, Instruction, Operand};
 use std::collections::HashMap;
 
 /// An IR program ready for SPIR-V emission.

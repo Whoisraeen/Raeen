@@ -228,7 +228,10 @@ mod tests {
         ];
         ctx.process_command_buffer(&cb);
 
-        assert_eq!(ctx.stats.pm4_packets_decoded, 4, "4 packets: type0, set-ctx, draw, nop");
+        assert_eq!(
+            ctx.stats.pm4_packets_decoded, 4,
+            "4 packets: type0, set-ctx, draw, nop"
+        );
         assert_eq!(ctx.stats.draw_calls, 1, "one DRAW_INDEX_AUTO");
         // 2 (type 0) + 2 (set-context-reg) register writes.
         assert_eq!(ctx.stats.register_writes, 4);

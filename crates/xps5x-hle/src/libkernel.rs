@@ -458,7 +458,9 @@ fn hle_get_compiled_sdk_version(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_EINVAL;
     }
     if !ctx.mem.write(version_ptr, &GEN5_SDK_VERSION.to_le_bytes()) {
-        warn!("sceKernelGetCompiledSdkVersion: version out-pointer {version_ptr:#x} not writable — EFAULT");
+        warn!(
+            "sceKernelGetCompiledSdkVersion: version out-pointer {version_ptr:#x} not writable — EFAULT"
+        );
         return SCE_KERNEL_ERROR_EFAULT;
     }
     SCE_OK
@@ -913,7 +915,7 @@ fn hle_kernel_error(_ctx: &HleContext, _args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_ctx, GuestMemory};
+    use crate::{GuestMemory, test_ctx};
 
     /// M1-C: `write(1, buf, n)` copies real guest bytes to the kernel
     /// console and returns `n`; stderr (fd 2) lands in the same capture; an

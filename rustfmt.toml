@@ -1,0 +1,5 @@
+# Pin edition/style so bare `rustfmt <file>` (editor save hooks, Claude Code
+# PostToolUse hook) matches `cargo fmt` on this edition-2024 workspace.
+# Without this, bare rustfmt defaults to style_edition 2015 and fights CI.
+edition = "2024"
+style_edition = "2024"
