@@ -3,8 +3,9 @@
 //! Converts the XPS5X shader IR into SPIR-V binary modules
 //! that can be consumed by Vulkan's shader pipeline.
 
-use super::ir::{IrProgram, IrValue};
+use super::ir::{IrOp, IrProgram, IrValue};
 use super::ShaderType;
+use std::collections::HashMap;
 use tracing::info;
 use xps5x_core::error::GpuError;
 
@@ -31,6 +32,15 @@ const OP_FUNCTION: u16 = 54;
 const OP_FUNCTION_END: u16 = 56;
 const OP_LABEL: u16 = 248;
 const OP_RETURN: u16 = 253;
+const OP_UNDEF: u16 = 1;
+// Arithmetic opcodes (integer / float binary ops).
+const OP_I_ADD: u16 = 128;
+const OP_F_ADD: u16 = 129;
+const OP_I_SUB: u16 = 130;
+const OP_F_SUB: u16 = 131;
+const OP_I_MUL: u16 = 132;
+const OP_F_MUL: u16 = 133;
+const OP_F_DIV: u16 = 136;
 #[allow(dead_code)] // reserved: decorations (Location/Binding) not yet emitted
 const OP_DECORATE: u16 = 71;
 
@@ -73,7 +83,7 @@ pub fn emit_spirv(program: &IrProgram) -> Result<Vec<u32>, GpuError> {
     // the arithmetic body (emitted later) can point at these ids. Integer and
     // float constants use their respective scalar types; deduplicated by
     // (type, bit-pattern).
-    let mut constants: Vec<(u32, u32)> = Vec::new();
+    let mut const_ids: HashMap<(u32, u32), u32> = HashMap::new();
     for node in &program.nodes {
         for src in &node.sources {
             let entry = match src {
@@ -82,15 +92,13 @@ pub fn emit_spirv(program: &IrProgram) -> Result<Vec<u32>, GpuError> {
                 IrValue::ConstF32(v) => Some((f32_type, v.to_bits())),
                 _ => None,
             };
-            let Some((type_id, bits)) = entry else {
-                continue;
-            };
-            if constants.contains(&(type_id, bits)) {
+            let Some(key) = entry else { continue };
+            if const_ids.contains_key(&key) {
                 continue;
             }
             let id = module.next_id();
-            module.add_constant(id, type_id, bits);
-            constants.push((type_id, bits));
+            module.add_constant(id, key.0, key.1);
+            const_ids.insert(key, id);
         }
     }
 
@@ -117,13 +125,73 @@ pub fn emit_spirv(program: &IrProgram) -> Result<Vec<u32>, GpuError> {
     module.add_function(main_func, void_type, 0, func_type);
     module.add_label(entry_label);
 
-    // TODO: Emit IR nodes as SPIR-V instructions.
-    // For now, emit a minimal valid shader.
+    // Emit the body: walk IR nodes in program order (SSA order, so a value is
+    // defined before it is used) and lower the arithmetic ops to SPIR-V.
+    // Sources resolve to constant-pool ids, prior SSA result ids, or a shared
+    // OpUndef for values not yet wired (live-in inputs, memory results); every
+    // node that defines an SSA result gets an id so later references resolve.
+    let mut ssa_to_id: HashMap<u32, u32> = HashMap::new();
+
+    for node in &program.nodes {
+        let binop = spirv_binop(node.op, f32_type, i32_type);
+        // A typed binary op's operands share its result type; elsewhere default
+        // to f32. Undefs (live-ins, unwired reads) are emitted with this type so
+        // an integer op never receives a float-typed operand.
+        let operand_type = binop.map(|(_, t)| t).unwrap_or(f32_type);
+
+        // Resolve this node's source operands to SPIR-V ids.
+        let mut src_ids = Vec::with_capacity(node.sources.len());
+        for s in &node.sources {
+            let id = match s {
+                IrValue::Reg(n) => ssa_to_id
+                    .get(n)
+                    .copied()
+                    .unwrap_or_else(|| module.undef(operand_type)),
+                IrValue::ConstI32(v) => const_ids[&(i32_type, *v as u32)],
+                IrValue::ConstU32(v) => const_ids[&(i32_type, *v)],
+                IrValue::ConstF32(v) => const_ids[&(f32_type, v.to_bits())],
+                // Live-ins and resource reads are not wired to real interface
+                // variables yet — model them as an undefined value for now.
+                _ => module.undef(operand_type),
+            };
+            src_ids.push(id);
+        }
+
+        let Some(IrValue::Reg(result_reg)) = node.result else {
+            continue; // sinks (export / return) carry no SSA result
+        };
+
+        // A binary arithmetic op with two resolved operands lowers directly;
+        // anything else still needs a defined id, so emit an OpUndef for it.
+        let rid = match binop {
+            Some((opcode, result_type)) if src_ids.len() >= 2 => {
+                module.emit_binop(opcode, result_type, src_ids[0], src_ids[1])
+            }
+            _ => module.undef(operand_type),
+        };
+        ssa_to_id.insert(result_reg, rid);
+    }
 
     module.add_return();
     module.add_function_end();
 
     Ok(module.build())
+}
+
+/// Map an IR binary op to its SPIR-V opcode and result type. Float ops use the
+/// f32 type, integer ops the i32 type. Returns `None` for ops that are not a
+/// simple two-operand arithmetic instruction (handled elsewhere).
+fn spirv_binop(op: IrOp, f32_type: u32, i32_type: u32) -> Option<(u16, u32)> {
+    Some(match op {
+        IrOp::Add => (OP_F_ADD, f32_type),
+        IrOp::Sub => (OP_F_SUB, f32_type),
+        IrOp::Mul => (OP_F_MUL, f32_type),
+        IrOp::Div => (OP_F_DIV, f32_type),
+        IrOp::IAdd => (OP_I_ADD, i32_type),
+        IrOp::ISub => (OP_I_SUB, i32_type),
+        IrOp::IMul => (OP_I_MUL, i32_type),
+        _ => return None,
+    })
 }
 
 /// A SPIR-V module builder.
@@ -134,6 +202,8 @@ struct SpirvModule {
     id_counter: u32,
     /// ID bound (will be set to id_counter at build time).
     id_bound: u32,
+    /// One shared `OpUndef` id per type id (lazily emitted on first use).
+    undef_ids: HashMap<u32, u32>,
 }
 
 impl SpirvModule {
@@ -142,7 +212,29 @@ impl SpirvModule {
             instructions: Vec::with_capacity(256),
             id_counter: 1,
             id_bound: 0,
+            undef_ids: HashMap::new(),
         }
+    }
+
+    /// Return (lazily creating) the shared `OpUndef` value of the given type.
+    /// Emitted at first use inside the function body, so it dominates every
+    /// later reference.
+    fn undef(&mut self, type_id: u32) -> u32 {
+        if let Some(&id) = self.undef_ids.get(&type_id) {
+            return id;
+        }
+        let id = self.next_id();
+        self.emit(OP_UNDEF, &[type_id, id]);
+        self.undef_ids.insert(type_id, id);
+        id
+    }
+
+    /// Emit a binary op (`OpFAdd`/`OpIAdd`/…): `result_type result_id a b`.
+    /// Returns the fresh result id.
+    fn emit_binop(&mut self, opcode: u16, result_type: u32, a: u32, b: u32) -> u32 {
+        let id = self.next_id();
+        self.emit(opcode, &[result_type, id, a, b]);
+        id
     }
 
     fn next_id(&mut self) -> u32 {
@@ -356,6 +448,51 @@ mod tests {
                 parsed.err()
             );
         }
+    }
+
+    #[test]
+    fn arithmetic_body_lowers_to_spirv_ops_and_validates() {
+        use crate::shader::ir::{IrNode, IrOp};
+        // r0 = 2.0 + 3.0   (float add of two constants)
+        // r1 = r0 * r0     (float mul of the add's SSA result)
+        let program = IrProgram {
+            nodes: vec![
+                IrNode {
+                    op: IrOp::Add,
+                    result: Some(IrValue::Reg(0)),
+                    sources: vec![IrValue::ConstF32(2.0), IrValue::ConstF32(3.0)],
+                },
+                IrNode {
+                    op: IrOp::Mul,
+                    result: Some(IrValue::Reg(1)),
+                    sources: vec![IrValue::Reg(0), IrValue::Reg(0)],
+                },
+            ],
+            shader_type: ShaderType::Vertex,
+            input_count: 0,
+            output_count: 0,
+            ubo_count: 0,
+            texture_count: 0,
+        };
+        let module = emit_spirv(&program).unwrap();
+
+        // Parse through rspirv and inspect the function body's opcodes.
+        let parsed = rspirv::dr::load_words(&module).expect("arithmetic body must parse");
+        let ops: Vec<rspirv::spirv::Op> = parsed
+            .functions
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.instructions.iter())
+            .map(|i| i.class.opcode)
+            .collect();
+        assert!(
+            ops.contains(&rspirv::spirv::Op::FAdd),
+            "the Add node must lower to OpFAdd (got {ops:?})"
+        );
+        assert!(
+            ops.contains(&rspirv::spirv::Op::FMul),
+            "the Mul node must lower to OpFMul (got {ops:?})"
+        );
     }
 
     #[test]
