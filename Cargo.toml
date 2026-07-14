@@ -15,6 +15,7 @@ members = [
     # Kyty port (docs/superpowers/plans/2026-07-13-kyty-full-port.md)
     "crates/kyty-core",
     "crates/kyty-math",
+    "crates/kyty-graphics",
 ]
 
 [workspace.package]

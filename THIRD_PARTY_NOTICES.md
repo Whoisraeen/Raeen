@@ -82,6 +82,14 @@ Only licenses compatible with GPL-2.0-only are used.
   validates the shader emitter's SPIR-V output in unit tests and is **not
   linked into the distributed emulator binary**.
 
+- **naga** — https://github.com/gfx-rs/wgpu (naga crate) — dual MIT /
+  Apache-2.0, used here under its **MIT** option. **Test-only** dev-dependency
+  of `kyty-graphics` (`spv-in` feature): its SPIR-V front end parses the
+  binaries produced by the `spirv_asm` assembler in unit tests as an extra
+  validity gate. It is **not linked into the distributed emulator binary**
+  through this use (naga also ships transitively inside the GUI's wgpu stack,
+  which is an unrelated, already-present dependency).
+
 ---
 
 ## Not incorporated (ecosystem references only)

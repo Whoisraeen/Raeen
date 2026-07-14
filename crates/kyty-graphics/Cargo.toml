@@ -1,0 +1,21 @@
+[package]
+name = "kyty-graphics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# Faithful Rust port of Kyty's `emulator/src/Graphics` (MIT © 2021 InoriRus;
+# see /THIRD_PARTY_NOTICES.md). Shader recompiler (ShaderParse/Shader/
+# ShaderSpirv) first; see docs/superpowers/plans/2026-07-13-kyty-full-port.md
+# Phase 5 for conventions.
+
+[dependencies]
+kyty-core = { path = "../kyty-core" }
+tracing.workspace = true
+
+[dev-dependencies]
+# Validity gate for spirv_asm tests: parse assembled binaries with a pure-Rust
+# SPIR-V front end (naga 24 is already in the workspace lockfile via eframe).
+naga = { version = "24", features = ["spv-in"] }
