@@ -37,7 +37,9 @@ const R_ZERO: u32 = 0x00;
 const R_DRAW_INDEX_AUTO: u32 = 0x04;
 const R_DRAW_RESET: u32 = 0x05;
 const R_WAIT_FLIP_DONE: u32 = 0x06;
+const R_ACB_RESET: u32 = 0x09;
 const R_POP_MARKER: u32 = 0x0C;
+const R_FLIP: u32 = 0x17;
 
 /// The `DRAW_INDEX_AUTO` modifier a valid call must pass.
 const DRAW_AUTO_MODIFIER: u64 = 0x4000_0000;
@@ -69,6 +71,9 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register("libSceAgc", "sceAgcDcbPopMarker", hle_dcb_pop_marker);
     registry.register("libSceAgc", "sceAgcCbDispatch", hle_cb_dispatch);
+    registry.register("libSceAgc", "sceAgcCbNop", hle_cb_nop);
+    registry.register("libSceAgc", "sceAgcDcbSetFlip", hle_dcb_set_flip);
+    registry.register("libSceAgc", "sceAgcAcbResetQueue", hle_acb_reset_queue);
 }
 
 /// Agc PM4 header: type-3 (`0xC000_0000`), `len_dwords` is the **total** packet
@@ -353,6 +358,78 @@ fn hle_cb_dispatch(ctx: &HleContext, args: &[u64]) -> u64 {
     addr
 }
 
+/// `sceAgcCbNop(cb, dwordCount)`: emit a NOP packet of `dwordCount` DWORDs
+/// (header + zero-filled body). `dwordCount` must be in `[2, 0x4001]`.
+fn hle_cb_nop(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let dword_count = args.get(1).copied().unwrap_or(0);
+    if cb == 0 || !(2..=0x4001).contains(&dword_count) {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, dword_count) else {
+        return 0;
+    };
+    if !ctx
+        .mem
+        .write(addr, &pm4(dword_count as u32, IT_NOP, R_ZERO).to_le_bytes())
+    {
+        return 0;
+    }
+    for i in 1..dword_count {
+        if !ctx.mem.write(addr + i * 4, &0u32.to_le_bytes()) {
+            return 0;
+        }
+    }
+    addr
+}
+
+/// `sceAgcDcbSetFlip(cb, videoOutHandle, displayBufferIndex, flipMode, flipArg)`:
+/// emit a flip packet (6 DWORDs).
+fn hle_dcb_set_flip(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let video_out = args.get(1).copied().unwrap_or(0) as u32;
+    let buffer_index = args.get(2).copied().unwrap_or(0) as u32;
+    let flip_mode = args.get(3).copied().unwrap_or(0) as u32;
+    let flip_arg = args.get(4).copied().unwrap_or(0);
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 6) else {
+        return 0;
+    };
+    let ok = ctx.mem.write(addr, &pm4(6, IT_NOP, R_FLIP).to_le_bytes())
+        && ctx.mem.write(addr + 4, &video_out.to_le_bytes())
+        && ctx.mem.write(addr + 8, &buffer_index.to_le_bytes())
+        && ctx.mem.write(addr + 12, &flip_mode.to_le_bytes())
+        && ctx.mem.write(addr + 16, &(flip_arg as u32).to_le_bytes())
+        && ctx
+            .mem
+            .write(addr + 20, &((flip_arg >> 32) as u32).to_le_bytes());
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcAcbResetQueue(acb)`: emit an async-compute-buffer reset packet.
+fn hle_acb_reset_queue(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 2) else {
+        return 0;
+    };
+    if !ctx
+        .mem
+        .write(addr, &pm4(2, IT_NOP, R_ACB_RESET).to_le_bytes())
+        || !ctx.mem.write(addr + 4, &0u32.to_le_bytes())
+    {
+        return 0;
+    }
+    addr
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +592,28 @@ mod tests {
             "initiator = (0 & 0xA038) | 0x41"
         );
         assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x408 + 20);
+    }
+
+    #[test]
+    fn cb_nop_setflip_acbreset_emit_correctly() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        // CbNop of 3 dwords: header + 2 zeros; too-small count rejected.
+        assert_eq!(hle_cb_nop(&ctx, &[cb, 1]), 0);
+        assert_eq!(hle_cb_nop(&ctx, &[cb, 3]), 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(3, IT_NOP, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), 0);
+        // SetFlip: 6-dword packet with a split 64-bit flip arg.
+        let ret = hle_dcb_set_flip(&ctx, &[cb, 7, 2, 1, 0x0000_00AB_1234_5678]);
+        assert_eq!(ret, 0x40C);
+        assert_eq!(read_u32(&ctx, 0x40C), pm4(6, IT_NOP, R_FLIP));
+        assert_eq!(read_u32(&ctx, 0x41C), 0x1234_5678, "flip arg low");
+        assert_eq!(read_u32(&ctx, 0x420), 0x0000_00AB, "flip arg high");
+        // AcbResetQueue: 2-dword async-compute reset.
+        let a = hle_acb_reset_queue(&ctx, &[cb]);
+        assert_eq!(read_u32(&ctx, a), pm4(2, IT_NOP, R_ACB_RESET));
     }
 
     #[test]
