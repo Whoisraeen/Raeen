@@ -32,11 +32,13 @@ pub mod syscalls;
 pub mod threading;
 
 pub use process::ProcessImage;
+// Re-exported so HLE module-loading calls can construct kernel module-table
+// entries without a direct xps5x-core type path (M1-D).
+pub use xps5x_core::types::ModuleInfo;
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::sync::Arc;
-use xps5x_core::types::ModuleInfo;
 
 /// Captured guest console output (M1-C): everything the guest writes via
 /// `printf`/`puts`/`write(1|2, ...)` lands here, byte-for-byte, so the

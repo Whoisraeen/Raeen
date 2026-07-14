@@ -63,6 +63,31 @@ pub fn load_module(
     };
     let dynlib_data =
         dynlib::parse_dynlibdata(module.dynlib_data.as_deref().unwrap_or(&[]), &dyn_tags)?;
+
+    // M1-D (wall #4): surface the NEEDED dependency chain loudly instead of
+    // silently dropping it. Imports resolve by NID against the HLE registry
+    // regardless of which module declares them, so an HLE-covered NEEDED
+    // entry is informational; one with no matching HLE library is the first
+    // sign a title needs a real file-backed `.prx` load (future work).
+    if !dynlib_data.needed_modules.is_empty() {
+        let hle_libs: std::collections::HashSet<String> = hle
+            .registered_names()
+            .into_iter()
+            .map(|(lib, _)| lib)
+            .collect();
+        for needed in &dynlib_data.needed_modules {
+            let stem = needed.trim_end_matches(".sprx").trim_end_matches(".prx");
+            if hle_libs.contains(stem) {
+                tracing::info!("NEEDED {needed}: covered by HLE library '{stem}'");
+            } else {
+                tracing::warn!(
+                    "NEEDED {needed}: no HLE library named '{stem}' — its imports resolve only if \
+                     their NIDs are registered elsewhere (file-backed .prx loading not implemented)"
+                );
+            }
+        }
+    }
+
     registry.register_module_exports(&module.name, &dynlib_data.exports);
     dynlib::linker::link_module(&module, &dynlib_data, registry, hle, base)
 }

@@ -29,6 +29,10 @@ use xps5x_core::error::FirmwareError;
 /// SCE dynamic tags (see module docs). Values are the community-documented
 /// common set; `PT_DYNAMIC` also carries plenty of standard ELF tags this
 /// module simply ignores (it only looks for the tags below).
+/// Standard ELF `DT_NEEDED` — its value is a strtab offset naming a
+/// dependency module (M1-D, wall #4). OpenOrbis-style toolchains emit these
+/// alongside the SCE tags; each entry is a `.prx` the module expects loaded.
+const DT_NEEDED: u64 = 1;
 const DT_SCE_HASH: u64 = 0x6100_0025;
 const DT_SCE_PLTRELSZ: u64 = 0x6100_002D;
 const DT_SCE_JMPREL: u64 = 0x6100_0029;
@@ -208,10 +212,29 @@ pub fn parse_dynlibdata(blob: &[u8], dyn_tags: &[(u64, u64)]) -> Result<DynlibDa
         slice_range(blob, hash_off, hash_sz, "DT_SCE_HASH")?;
     }
 
-    // TODO(LM1+): needed_modules requires a DT_SCE_NEEDED_MODULE-style tag
-    // not covered by the documented tag set implemented here; left empty
-    // until confirmed against a real module.
-    let needed_modules = Vec::new();
+    // M1-D (wall #4): collect every `DT_NEEDED` dependency name from the
+    // strtab. These are *recognized and surfaced* here; whether each is
+    // HLE-covered (or needs a real file-backed load) is the loader's call —
+    // see `load_module`'s NEEDED logging.
+    let mut needed_modules = Vec::new();
+    for &(tag, val) in dyn_tags {
+        if tag != DT_NEEDED {
+            continue;
+        }
+        let Ok(off) = usize::try_from(val) else {
+            tracing::warn!("DT_NEEDED strtab offset {val:#x} overflows usize; skipping entry");
+            continue;
+        };
+        match read_cstr(strtab, off) {
+            Some(name) if !name.is_empty() => needed_modules.push(name),
+            _ => {
+                tracing::warn!(
+                    "DT_NEEDED strtab offset {off:#x} is out of range (strtab len {}) or empty; skipping entry",
+                    strtab.len()
+                );
+            }
+        }
+    }
 
     Ok(DynlibData {
         imports,
@@ -410,6 +433,35 @@ fn decode_relas(data: &[u8], entsize: u64, out: &mut Vec<SceRela>) -> Result<(),
 mod tests {
     use super::nid::{encode_nid, nid_of};
     use super::*;
+
+    /// M1-D (wall #4): `DT_NEEDED` entries resolve their strtab names into
+    /// `needed_modules`; an out-of-range offset is skipped, not fatal.
+    #[test]
+    fn dt_needed_entries_are_collected_from_the_strtab() {
+        let mut strtab = vec![0u8];
+        let lib_a_off = strtab.len() as u64;
+        strtab.extend_from_slice(b"libSceLibcInternal.sprx\0");
+        let lib_b_off = strtab.len() as u64;
+        strtab.extend_from_slice(b"libSceFios2.sprx\0");
+        let blob = strtab.clone();
+
+        let dyn_tags = vec![
+            (DT_SCE_STRTAB, 0u64),
+            (DT_SCE_STRSZ, strtab.len() as u64),
+            (DT_NEEDED, lib_a_off),
+            (DT_NEEDED, lib_b_off),
+            (DT_NEEDED, 0x9999), // out of range: skipped with a warning
+        ];
+
+        let dynlib = parse_dynlibdata(&blob, &dyn_tags).expect("parses");
+        assert_eq!(
+            dynlib.needed_modules,
+            vec![
+                "libSceLibcInternal.sprx".to_string(),
+                "libSceFios2.sprx".to_string()
+            ]
+        );
+    }
 
     /// Build a synthetic dynlibdata blob laid out as: strtab, symtab, RELA
     /// table, JMPREL table (each section contiguous). Returns the blob plus

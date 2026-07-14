@@ -78,6 +78,121 @@ fn hle_write(ctx: &HleContext, args: &[u64]) -> u64 {
     capped
 }
 
+/// `SCE_KERNEL_ERROR_EFAULT` (`0x8002000E`): the documented SCE convention
+/// of `0x8002_0000 | errno` (EFAULT = 14) — returned when a guest hands a
+/// module call an unreadable pointer.
+const SCE_KERNEL_ERROR_EFAULT: u64 = 0x8002_000E;
+/// `SCE_KERNEL_ERROR_ESRCH` (`0x80020003`): no such module handle.
+const SCE_KERNEL_ERROR_ESRCH: u64 = 0x8002_0003;
+/// `SCE_KERNEL_ERROR_ENOENT` (`0x80020002`): symbol/entity not found.
+const SCE_KERNEL_ERROR_ENOENT: u64 = 0x8002_0002;
+
+/// Real-enough `sceKernelLoadStartModule(path, argc, argv, flags, opt,
+/// pRes)` (M1-D, wall #4): reads the guest path, then
+///
+/// 1. If a module with that name (or filename) is already registered with
+///    the kernel, returns its existing handle — repeated loads of the same
+///    module hand back the same handle, like the real call.
+/// 2. Otherwise registers a *synthetic* module entry and returns its fresh
+///    handle. This is honest for system `.prx`s (`libSceLibcInternal`,
+///    `libSceFios2`, ...) because their functionality is HLE: every import
+///    from them was already NID-resolved against the HLE registry at link
+///    time, so the only thing the guest actually needs from this call is a
+///    valid handle (SharpEmu's loader takes the same pseudo-handle
+///    approach). A *user-supplied* `.prx` with real code is NOT loaded by
+///    this path yet — that needs file-backed loading through the firmware
+///    pipeline, logged loudly below as future work.
+///
+/// `pRes` (the module-local `module_start` result out-param), when non-null,
+/// is written `0` — no real `module_start` runs for an HLE-backed module.
+fn hle_load_start_module(ctx: &HleContext, args: &[u64]) -> u64 {
+    let path_ptr = args.first().copied().unwrap_or(0);
+    let res_ptr = args.get(5).copied().unwrap_or(0);
+    debug!("sceKernelLoadStartModule(path={path_ptr:#x}, pRes={res_ptr:#x})");
+
+    let Some(path_bytes) = crate::fmt::read_cstr(ctx.mem, path_ptr) else {
+        warn!("sceKernelLoadStartModule: unreadable path pointer {path_ptr:#x} — EFAULT");
+        return SCE_KERNEL_ERROR_EFAULT;
+    };
+    let path = String::from_utf8_lossy(&path_bytes).into_owned();
+    // The registry keys modules by bare name; callers pass full guest paths
+    // like "/system/common/lib/libSceSysmodule.sprx".
+    let file_name = path.rsplit('/').next().unwrap_or(&path).to_string();
+    let stem = file_name
+        .trim_end_matches(".sprx")
+        .trim_end_matches(".prx")
+        .to_string();
+
+    if res_ptr != 0 && !ctx.mem.write(res_ptr, &0u32.to_le_bytes()) {
+        warn!("sceKernelLoadStartModule: pRes {res_ptr:#x} is not writable — EFAULT");
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+
+    for candidate in [path.as_str(), file_name.as_str(), stem.as_str()] {
+        if let Some(info) = ctx.kernel.find_module(candidate) {
+            debug!(
+                "sceKernelLoadStartModule: '{path}' already loaded as handle {}",
+                info.id
+            );
+            return info.id as u64;
+        }
+    }
+
+    warn!(
+        "sceKernelLoadStartModule: '{path}' registered as an HLE-backed pseudo-module — its \
+         imports resolve via NID against the HLE registry; file-backed .prx loading is not \
+         implemented"
+    );
+    let id = ctx.kernel.register_module(xps5x_kernel::ModuleInfo {
+        id: 0, // assigned by register_module
+        name: stem,
+        base_address: 0,
+        size: 0,
+        entry_point: None,
+        initialized: true,
+    });
+    id as u64
+}
+
+/// `sceKernelStopUnloadModule(handle, ...)`: validates the handle against
+/// the kernel module table and reports success without unloading — every
+/// module this HLE hands out is HLE-backed (nothing to unload), and the
+/// main module is never legitimately unloaded mid-run. An unknown handle is
+/// a loud `ESRCH`, not a silent success.
+fn hle_stop_unload_module(ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0);
+    debug!("sceKernelStopUnloadModule(handle={handle})");
+
+    let Ok(id) = u32::try_from(handle) else {
+        return SCE_KERNEL_ERROR_ESRCH;
+    };
+    if ctx.kernel.modules.contains_key(&id) {
+        SCE_OK
+    } else {
+        warn!("sceKernelStopUnloadModule: unknown module handle {handle} — ESRCH");
+        SCE_KERNEL_ERROR_ESRCH
+    }
+}
+
+/// `sceKernelDlsym(handle, symbol, addrOut)`: honestly unimplemented. The
+/// HLE trampoline table is minted at link time (LM1) from the module's
+/// declared imports; handing out a *new* callable guest address at runtime
+/// needs dynamically-minted trampolines the dispatcher doesn't support yet.
+/// Logs the requested symbol loudly and returns `ENOENT` — a title that
+/// needs dlsym will show exactly what it asked for.
+fn hle_dlsym(ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0);
+    let sym_ptr = args.get(1).copied().unwrap_or(0);
+    let symbol = crate::fmt::read_cstr(ctx.mem, sym_ptr)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_else(|| format!("<unreadable {sym_ptr:#x}>"));
+    warn!(
+        "sceKernelDlsym(handle={handle}, symbol='{symbol}'): runtime symbol lookup needs \
+         dynamically-minted trampolines (not implemented) — ENOENT"
+    );
+    SCE_KERNEL_ERROR_ENOENT
+}
+
 /// Register libkernel HLE functions.
 pub fn register(registry: &HleRegistry) {
     // -- Memory --
@@ -112,6 +227,19 @@ pub fn register(registry: &HleRegistry) {
     // -- File descriptors / console I/O (M1-C) --
     registry.register("libkernel", "write", hle_write);
     registry.register("libkernel", "sceKernelWrite", hle_write);
+
+    // -- Module loading (M1-D) --
+    registry.register(
+        "libkernel",
+        "sceKernelLoadStartModule",
+        hle_load_start_module,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelStopUnloadModule",
+        hle_stop_unload_module,
+    );
+    registry.register("libkernel", "sceKernelDlsym", hle_dlsym);
     registry.register(
         "libkernel",
         "sceKernelGetDirectMemorySize",
@@ -528,6 +656,74 @@ mod tests {
             kernel.console.contents(),
             "out\nerr\n",
             "bad-fd write must not emit"
+        );
+    }
+
+    /// M1-D: LoadStartModule returns a positive handle, writes 0 through
+    /// `pRes`, and hands the *same* handle back for a repeated load of the
+    /// same module.
+    #[test]
+    fn load_start_module_returns_stable_positive_handle_and_writes_pres() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x100, b"/system/common/lib/libSceSysmodule.sprx\0"));
+        assert!(mem.write(0x300, &0xFFFF_FFFFu32.to_le_bytes())); // pRes poisoned
+
+        let handle = hle_load_start_module(&ctx, &[0x100, 0, 0, 0, 0, 0x300]);
+        assert!(
+            (handle as i64) > 0,
+            "expected a positive handle, got {handle:#x}"
+        );
+
+        let mut pres = [0u8; 4];
+        assert!(mem.read(0x300, &mut pres));
+        assert_eq!(u32::from_le_bytes(pres), 0, "pRes must be written 0");
+
+        let again = hle_load_start_module(&ctx, &[0x100, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            again, handle,
+            "same module path must return the same handle"
+        );
+
+        // The registered name is the extension-stripped filename.
+        assert!(kernel.find_module("libSceSysmodule").is_some());
+    }
+
+    #[test]
+    fn load_start_module_with_unreadable_path_is_efault() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x10);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(
+            hle_load_start_module(&ctx, &[0xDEAD_0000, 0, 0, 0, 0, 0]),
+            SCE_KERNEL_ERROR_EFAULT
+        );
+    }
+
+    #[test]
+    fn stop_unload_validates_the_handle_and_dlsym_is_honest_enoent() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x100, b"libFoo.sprx\0"));
+        let handle = hle_load_start_module(&ctx, &[0x100, 0, 0, 0, 0, 0]);
+        assert_eq!(hle_stop_unload_module(&ctx, &[handle]), SCE_OK);
+        assert_eq!(
+            hle_stop_unload_module(&ctx, &[9999]),
+            SCE_KERNEL_ERROR_ESRCH
+        );
+
+        assert!(mem.write(0x200, b"sceSomeFunction\0"));
+        assert_eq!(
+            hle_dlsym(&ctx, &[handle, 0x200, 0x400]),
+            SCE_KERNEL_ERROR_ENOENT
         );
     }
 

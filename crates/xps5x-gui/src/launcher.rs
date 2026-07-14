@@ -112,7 +112,10 @@ impl GameLauncher for StubLauncher {
 
         self.sessions.lock().unwrap().insert(
             id,
-            StubSession { started: Instant::now(), quit_requested: false },
+            StubSession {
+                started: Instant::now(),
+                quit_requested: false,
+            },
         );
 
         Ok(SessionHandle(id))
@@ -253,7 +256,8 @@ pub struct FirmwareLauncher {
 impl FirmwareLauncher {
     pub fn new() -> Self {
         let hle = xps5x_hle::HleRegistry::new();
-        let nid_db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
+        let nid_db =
+            xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
         Self {
             hle,
             kernel: xps5x_kernel::OrbisKernel::new(),
@@ -277,19 +281,31 @@ impl FirmwareLauncher {
     fn load(&self, path: &Path) -> SessionOutcome {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
-            Err(err) => return SessionOutcome::Faulted(format!("No module file at {}: {err}", path.display())),
+            Err(err) => {
+                return SessionOutcome::Faulted(format!(
+                    "No module file at {}: {err}",
+                    path.display()
+                ));
+            }
         };
 
         let linked = {
             let mut registry = self.registry.lock().unwrap();
-            xps5x_firmware::load_module(&bytes, &xps5x_firmware::NoKeysProvider, &mut registry, &self.hle, DEFAULT_LOAD_BASE)
+            xps5x_firmware::load_module(
+                &bytes,
+                &xps5x_firmware::NoKeysProvider,
+                &mut registry,
+                &self.hle,
+                DEFAULT_LOAD_BASE,
+            )
         };
 
         let linked = match linked {
             Ok(linked) => linked,
             Err(FirmwareError::MissingKey { .. }) => {
                 return SessionOutcome::Faulted(
-                    "Encrypted module — no KeyProvider configured (Settings ▸ Key Provider)".to_string(),
+                    "Encrypted module — no KeyProvider configured (Settings ▸ Key Provider)"
+                        .to_string(),
                 );
             }
             Err(err) => return SessionOutcome::Faulted(err.to_string()),
@@ -298,6 +314,21 @@ impl FirmwareLauncher {
         let resolved = linked.hle_trampolines.len();
         let unresolved = linked.unresolved.len();
 
+        // M1-D: the main module joins the kernel's module table, so a guest
+        // `sceKernelLoadStartModule` naming it (or a Settings-style module
+        // list) can find it by name/handle.
+        self.kernel.register_module(xps5x_kernel::ModuleInfo {
+            id: 0, // assigned by register_module
+            name: path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "eboot".to_string()),
+            base_address: DEFAULT_LOAD_BASE,
+            size: linked.image.len() as u64,
+            entry_point: Some(linked.entry),
+            initialized: true,
+        });
+
         #[cfg(target_os = "windows")]
         {
             // M1-A: enter the module as a real process — `_start` on a
@@ -305,16 +336,30 @@ impl FirmwareLauncher {
             // bare 6-register function call. A well-formed run ends via an
             // exit-family call (`Exited`); a `_start` that returns anyway is
             // reported as `Ran` (malformed but tolerated).
-            match xps5x_runtime::execute_process(&linked, &self.hle, &self.kernel, &[GUEST_ARGV0], &[]) {
-                Ok(xps5x_runtime::RunOutcome::Exited(code)) => SessionOutcome::Exited { code, resolved, unresolved },
-                Ok(xps5x_runtime::RunOutcome::Returned(returned)) => {
-                    SessionOutcome::Ran { returned, resolved, unresolved }
-                }
+            match xps5x_runtime::execute_process(
+                &linked,
+                &self.hle,
+                &self.kernel,
+                &[GUEST_ARGV0],
+                &[],
+            ) {
+                Ok(xps5x_runtime::RunOutcome::Exited(code)) => SessionOutcome::Exited {
+                    code,
+                    resolved,
+                    unresolved,
+                },
+                Ok(xps5x_runtime::RunOutcome::Returned(returned)) => SessionOutcome::Ran {
+                    returned,
+                    resolved,
+                    unresolved,
+                },
                 Err(xps5x_runtime::RuntimeError::Faulted { addr }) => {
                     SessionOutcome::Faulted(format!("Faulted at {addr:#x} during execution"))
                 }
                 Err(xps5x_runtime::RuntimeError::UnresolvedTrampoline(a)) => {
-                    SessionOutcome::Faulted(format!("Called an unresolved import (trampoline {a:#x})"))
+                    SessionOutcome::Faulted(format!(
+                        "Called an unresolved import (trampoline {a:#x})"
+                    ))
                 }
                 Err(e) => SessionOutcome::Faulted(format!("Runtime error: {e:?}")),
             }
@@ -323,7 +368,11 @@ impl FirmwareLauncher {
         {
             // `execute_linked` is Windows-only (RT0 design doc §7/§9); every
             // other target stops at "linked" rather than pretending to run.
-            SessionOutcome::Linked { resolved, unresolved, image_size: linked.image.len() }
+            SessionOutcome::Linked {
+                resolved,
+                unresolved,
+                image_size: linked.image.len(),
+            }
         }
     }
 }
@@ -340,14 +389,22 @@ impl GameLauncher for FirmwareLauncher {
             LaunchTarget::Game { path } => self.load(path),
             // Built-in apps (Store, Game Library, Settings) aren't modules;
             // there's no path to read, so this can't even attempt a load.
-            LaunchTarget::App { id } => SessionOutcome::Faulted(format!("'{id}' is not a loadable module")),
+            LaunchTarget::App { id } => {
+                SessionOutcome::Faulted(format!("'{id}' is not a loadable module"))
+            }
         };
 
         let mut next_id = self.next_id.lock().unwrap();
         let id = *next_id;
         *next_id += 1;
 
-        self.sessions.lock().unwrap().insert(id, FirmwareSession { outcome, quit_requested: false });
+        self.sessions.lock().unwrap().insert(
+            id,
+            FirmwareSession {
+                outcome,
+                quit_requested: false,
+            },
+        );
 
         Ok(SessionHandle(id))
     }
@@ -406,7 +463,9 @@ mod tests {
     use std::path::PathBuf;
 
     fn target() -> LaunchTarget {
-        LaunchTarget::Game { path: PathBuf::from("Games/nova/eboot.bin") }
+        LaunchTarget::Game {
+            path: PathBuf::from("Games/nova/eboot.bin"),
+        }
     }
 
     #[test]
@@ -554,34 +613,55 @@ mod firmware_launcher_tests {
     #[test]
     fn missing_module_file_faults_without_panicking() {
         let launcher = FirmwareLauncher::new();
-        let target = LaunchTarget::Game { path: PathBuf::from("this/path/does/not/exist/eboot.bin") };
+        let target = LaunchTarget::Game {
+            path: PathBuf::from("this/path/does/not/exist/eboot.bin"),
+        };
 
-        let handle = launcher.launch(&target).expect("launch always returns a handle, even on fault");
+        let handle = launcher
+            .launch(&target)
+            .expect("launch always returns a handle, even on fault");
         assert_eq!(launcher.session_state(&handle), SessionState::Faulted);
-        let detail = launcher.session_detail(&handle).expect("fault carries a message");
-        assert!(detail.starts_with("No module file at"), "unexpected message: {detail}");
+        let detail = launcher
+            .session_detail(&handle)
+            .expect("fault carries a message");
+        assert!(
+            detail.starts_with("No module file at"),
+            "unexpected message: {detail}"
+        );
     }
 
     #[test]
     fn app_target_faults_cleanly() {
         let launcher = FirmwareLauncher::new();
-        let target = LaunchTarget::App { id: "settings".to_string() };
+        let target = LaunchTarget::App {
+            id: "settings".to_string(),
+        };
 
-        let handle = launcher.launch(&target).expect("launch always returns a handle, even on fault");
+        let handle = launcher
+            .launch(&target)
+            .expect("launch always returns a handle, even on fault");
         assert_eq!(launcher.session_state(&handle), SessionState::Faulted);
-        let detail = launcher.session_detail(&handle).expect("fault carries a message");
-        assert!(detail.contains("not a loadable module"), "unexpected message: {detail}");
+        let detail = launcher
+            .session_detail(&handle)
+            .expect("fault carries a message");
+        assert!(
+            detail.contains("not a loadable module"),
+            "unexpected message: {detail}"
+        );
     }
 
     #[test]
     fn valid_synthetic_module_links_and_exposes_resolved_counts() {
-        let tmp = std::env::temp_dir().join(format!("xps5x-gui-launcher-test-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("xps5x-gui-launcher-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).expect("create temp dir");
         let path = write_synthetic_sprx(&tmp, "eboot.bin");
 
         let launcher = FirmwareLauncher::new();
         let target = LaunchTarget::Game { path };
-        let handle = launcher.launch(&target).expect("launch always returns a handle");
+        let handle = launcher
+            .launch(&target)
+            .expect("launch always returns a handle");
 
         // On Windows, M1-A runs this module as a process. A bare `ret` at
         // `_start` is malformed (entered via `jmp`, there is no return
@@ -593,7 +673,9 @@ mod firmware_launcher_tests {
         #[cfg(target_os = "windows")]
         {
             assert_eq!(launcher.session_state(&handle), SessionState::Faulted);
-            let detail = launcher.session_detail(&handle).expect("a faulted session has detail text");
+            let detail = launcher
+                .session_detail(&handle)
+                .expect("a faulted session has detail text");
             assert!(
                 detail.starts_with("Faulted at 0x1 during execution"),
                 "a bare-ret _start must fault at Rip == argc == 1 — unexpected message: {detail}"
@@ -602,10 +684,21 @@ mod firmware_launcher_tests {
         #[cfg(not(target_os = "windows"))]
         {
             assert_eq!(launcher.session_state(&handle), SessionState::Running);
-            let detail = launcher.session_detail(&handle).expect("a running session has detail text");
-            assert!(detail.contains("0 imports resolved to HLE"), "unexpected message: {detail}");
-            assert!(detail.contains("0 unresolved"), "unexpected message: {detail}");
-            assert!(detail.contains("execution not yet implemented"), "unexpected message: {detail}");
+            let detail = launcher
+                .session_detail(&handle)
+                .expect("a running session has detail text");
+            assert!(
+                detail.contains("0 imports resolved to HLE"),
+                "unexpected message: {detail}"
+            );
+            assert!(
+                detail.contains("0 unresolved"),
+                "unexpected message: {detail}"
+            );
+            assert!(
+                detail.contains("execution not yet implemented"),
+                "unexpected message: {detail}"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -613,12 +706,17 @@ mod firmware_launcher_tests {
 
     #[test]
     fn quit_transitions_a_linked_session_to_exited() {
-        let tmp = std::env::temp_dir().join(format!("xps5x-gui-launcher-quit-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!(
+            "xps5x-gui-launcher-quit-test-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&tmp).expect("create temp dir");
         let path = write_synthetic_sprx(&tmp, "eboot.bin");
 
         let launcher = FirmwareLauncher::new();
-        let handle = launcher.launch(&LaunchTarget::Game { path }).expect("launch should succeed");
+        let handle = launcher
+            .launch(&LaunchTarget::Game { path })
+            .expect("launch should succeed");
         // The minimal bare-`ret` fixture faults as a process on Windows (see
         // `valid_synthetic_module_links_and_exposes_resolved_counts`) and
         // stops at `Linked` (`Running`) elsewhere — either way, `quit` must
@@ -746,7 +844,10 @@ mod firmware_launcher_tests {
         /// single import identified by `import_nid`. Mirrors
         /// `homebrew_pipeline.rs`'s `build_dynlib_and_dynamic`.
         fn build_dynlib_and_dynamic(import_nid: u64) -> (Vec<u8>, Vec<u8>) {
-            let import_name = format!("{}#A#A", xps5x_firmware::dynlib::nid::encode_nid(import_nid));
+            let import_name = format!(
+                "{}#A#A",
+                xps5x_firmware::dynlib::nid::encode_nid(import_nid)
+            );
             let mut strtab = vec![0u8];
             let import_off = strtab.len() as u32;
             strtab.extend_from_slice(import_name.as_bytes());
@@ -803,9 +904,24 @@ mod firmware_launcher_tests {
                 ET_SCE_DYNAMIC,
                 0x0,
                 &[
-                    PhdrSpec { p_type: PT_LOAD, p_flags: 5, p_vaddr: 0, data: load_bytes },
-                    PhdrSpec { p_type: 0x6100_0000 /* PT_SCE_DYNLIBDATA */, p_flags: 4, p_vaddr: 0, data: dynlib_blob },
-                    PhdrSpec { p_type: PT_DYNAMIC, p_flags: 6, p_vaddr: 0x2000, data: dynamic_bytes },
+                    PhdrSpec {
+                        p_type: PT_LOAD,
+                        p_flags: 5,
+                        p_vaddr: 0,
+                        data: load_bytes,
+                    },
+                    PhdrSpec {
+                        p_type: 0x6100_0000, /* PT_SCE_DYNLIBDATA */
+                        p_flags: 4,
+                        p_vaddr: 0,
+                        data: dynlib_blob,
+                    },
+                    PhdrSpec {
+                        p_type: PT_DYNAMIC,
+                        p_flags: 6,
+                        p_vaddr: 0x2000,
+                        data: dynamic_bytes,
+                    },
                 ],
             );
 
@@ -845,7 +961,8 @@ mod firmware_launcher_tests {
             let sentinel_nid = xps5x_firmware::dynlib::nid::nid_of("sceTestSentinel");
             let exit_nid = xps5x_firmware::dynlib::nid::nid_of("exit");
 
-            let nid_db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
+            let nid_db =
+                xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
             let launcher = FirmwareLauncher {
                 hle,
                 kernel: xps5x_kernel::OrbisKernel::new(),
@@ -879,14 +996,32 @@ mod firmware_launcher_tests {
                 ET_SCE_DYNAMIC,
                 0x0,
                 &[
-                    PhdrSpec { p_type: PT_LOAD, p_flags: 5, p_vaddr: 0, data: load_bytes },
-                    PhdrSpec { p_type: 0x6100_0000 /* PT_SCE_DYNLIBDATA */, p_flags: 4, p_vaddr: 0, data: dynlib_blob },
-                    PhdrSpec { p_type: PT_DYNAMIC, p_flags: 6, p_vaddr: 0x2000, data: dynamic_bytes },
+                    PhdrSpec {
+                        p_type: PT_LOAD,
+                        p_flags: 5,
+                        p_vaddr: 0,
+                        data: load_bytes,
+                    },
+                    PhdrSpec {
+                        p_type: 0x6100_0000, /* PT_SCE_DYNLIBDATA */
+                        p_flags: 4,
+                        p_vaddr: 0,
+                        data: dynlib_blob,
+                    },
+                    PhdrSpec {
+                        p_type: PT_DYNAMIC,
+                        p_flags: 6,
+                        p_vaddr: 0x2000,
+                        data: dynamic_bytes,
+                    },
                 ],
             );
             let sprx_bytes = build_plaintext_self(&elf);
 
-            let tmp = std::env::temp_dir().join(format!("xps5x-gui-launcher-exec-test-{}", std::process::id()));
+            let tmp = std::env::temp_dir().join(format!(
+                "xps5x-gui-launcher-exec-test-{}",
+                std::process::id()
+            ));
             std::fs::create_dir_all(&tmp).expect("create temp dir");
             let path = tmp.join("eboot.bin");
             std::fs::write(&path, &sprx_bytes).expect("write synthetic .sprx to temp dir");
@@ -896,10 +1031,21 @@ mod firmware_launcher_tests {
                 .expect("launch always returns a handle");
 
             assert_eq!(launcher.session_state(&handle), SessionState::Running);
-            let detail = launcher.session_detail(&handle).expect("a ran session has detail text");
-            assert!(detail.starts_with("Ran to exit(0xc0de)"), "unexpected message: {detail}");
-            assert!(detail.contains("2 HLE imports resolved"), "unexpected message: {detail}");
-            assert!(detail.contains("0 unresolved"), "unexpected message: {detail}");
+            let detail = launcher
+                .session_detail(&handle)
+                .expect("a ran session has detail text");
+            assert!(
+                detail.starts_with("Ran to exit(0xc0de)"),
+                "unexpected message: {detail}"
+            );
+            assert!(
+                detail.contains("2 HLE imports resolved"),
+                "unexpected message: {detail}"
+            );
+            assert!(
+                detail.contains("0 unresolved"),
+                "unexpected message: {detail}"
+            );
 
             let _ = std::fs::remove_dir_all(&tmp);
         }
@@ -913,9 +1059,11 @@ mod firmware_launcher_tests {
         #[test]
         fn play_faults_cleanly_when_the_module_calls_an_unresolved_import() {
             let hle = xps5x_hle::HleRegistry::new();
-            let bogus_nid = xps5x_firmware::dynlib::nid::nid_of("totallyUnknownFunctionNobodyRegistered");
+            let bogus_nid =
+                xps5x_firmware::dynlib::nid::nid_of("totallyUnknownFunctionNobodyRegistered");
 
-            let nid_db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
+            let nid_db =
+                xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
             let launcher = FirmwareLauncher {
                 hle,
                 kernel: xps5x_kernel::OrbisKernel::new(),
@@ -924,7 +1072,10 @@ mod firmware_launcher_tests {
                 next_id: Mutex::new(0),
             };
 
-            let tmp = std::env::temp_dir().join(format!("xps5x-gui-launcher-unresolved-test-{}", std::process::id()));
+            let tmp = std::env::temp_dir().join(format!(
+                "xps5x-gui-launcher-unresolved-test-{}",
+                std::process::id()
+            ));
             std::fs::create_dir_all(&tmp).expect("create temp dir");
             let path = write_executable_sprx(&tmp, "eboot.bin", bogus_nid);
 
@@ -933,7 +1084,9 @@ mod firmware_launcher_tests {
                 .expect("launch always returns a handle");
 
             assert_eq!(launcher.session_state(&handle), SessionState::Faulted);
-            let detail = launcher.session_detail(&handle).expect("fault carries a message");
+            let detail = launcher
+                .session_detail(&handle)
+                .expect("fault carries a message");
             assert!(
                 detail.starts_with("Faulted at 0x") && detail.contains("during execution"),
                 "unexpected message: {detail}"
@@ -972,17 +1125,36 @@ mod firmware_launcher_tests {
                 ET_SCE_DYNAMIC,
                 0x0,
                 &[
-                    PhdrSpec { p_type: PT_LOAD, p_flags: 5, p_vaddr: 0, data: load_bytes },
-                    PhdrSpec { p_type: 0x6100_0000 /* PT_SCE_DYNLIBDATA */, p_flags: 4, p_vaddr: 0, data: dynlib_blob },
-                    PhdrSpec { p_type: PT_DYNAMIC, p_flags: 6, p_vaddr: 0x2000, data: dynamic_bytes },
+                    PhdrSpec {
+                        p_type: PT_LOAD,
+                        p_flags: 5,
+                        p_vaddr: 0,
+                        data: load_bytes,
+                    },
+                    PhdrSpec {
+                        p_type: 0x6100_0000, /* PT_SCE_DYNLIBDATA */
+                        p_flags: 4,
+                        p_vaddr: 0,
+                        data: dynlib_blob,
+                    },
+                    PhdrSpec {
+                        p_type: PT_DYNAMIC,
+                        p_flags: 6,
+                        p_vaddr: 0x2000,
+                        data: dynamic_bytes,
+                    },
                 ],
             );
             let sprx_bytes = build_plaintext_self(&elf);
 
-            let tmp = std::env::temp_dir().join(format!("xps5x-gui-launcher-argc-test-{}", std::process::id()));
+            let tmp = std::env::temp_dir().join(format!(
+                "xps5x-gui-launcher-argc-test-{}",
+                std::process::id()
+            ));
             std::fs::create_dir_all(&tmp).expect("create temp dir");
             let path = tmp.join("eboot.bin");
-            std::fs::write(&path, &sprx_bytes).expect("write synthetic _start-shaped .sprx to temp dir");
+            std::fs::write(&path, &sprx_bytes)
+                .expect("write synthetic _start-shaped .sprx to temp dir");
 
             // `FirmwareLauncher::new()`'s default registry already has libc's
             // `exit` registered — no test-local registration needed.
@@ -992,7 +1164,9 @@ mod firmware_launcher_tests {
                 .expect("launch always returns a handle");
 
             assert_eq!(launcher.session_state(&handle), SessionState::Running);
-            let detail = launcher.session_detail(&handle).expect("a completed session has detail text");
+            let detail = launcher
+                .session_detail(&handle)
+                .expect("a completed session has detail text");
             assert!(
                 detail.starts_with("Ran to exit(0x1)"),
                 "exit code must equal argc == 1 (one argv entry) — unexpected message: {detail}"
@@ -1153,7 +1327,9 @@ mod firmware_launcher_tests {
             let mut jmprel = Vec::new();
             for (index, (_, slot_off)) in imports.iter().enumerate() {
                 jmprel.extend_from_slice(&slot_off.to_le_bytes());
-                jmprel.extend_from_slice(&(((index as u64) << 32) | R_X86_64_JUMP_SLOT).to_le_bytes());
+                jmprel.extend_from_slice(
+                    &(((index as u64) << 32) | R_X86_64_JUMP_SLOT).to_le_bytes(),
+                );
                 jmprel.extend_from_slice(&0i64.to_le_bytes());
             }
 
@@ -1218,9 +1394,24 @@ mod firmware_launcher_tests {
                 ET_SCE_DYNAMIC,
                 0x0,
                 &[
-                    PhdrSpec { p_type: PT_LOAD, p_flags: 7, p_vaddr: 0, data: load_bytes },
-                    PhdrSpec { p_type: 0x6100_0000 /* PT_SCE_DYNLIBDATA */, p_flags: 4, p_vaddr: 0, data: dynlib_blob },
-                    PhdrSpec { p_type: PT_DYNAMIC, p_flags: 6, p_vaddr: 0x2000, data: dynamic_bytes },
+                    PhdrSpec {
+                        p_type: PT_LOAD,
+                        p_flags: 7,
+                        p_vaddr: 0,
+                        data: load_bytes,
+                    },
+                    PhdrSpec {
+                        p_type: 0x6100_0000, /* PT_SCE_DYNLIBDATA */
+                        p_flags: 4,
+                        p_vaddr: 0,
+                        data: dynlib_blob,
+                    },
+                    PhdrSpec {
+                        p_type: PT_DYNAMIC,
+                        p_flags: 6,
+                        p_vaddr: 0x2000,
+                        data: dynamic_bytes,
+                    },
                 ],
             );
 
@@ -1230,7 +1421,8 @@ mod firmware_launcher_tests {
         fn write_realistic_homebrew_sprx(dir: &Path, name: &str) -> PathBuf {
             let bytes = build_realistic_homebrew_sprx();
             let path = dir.join(name);
-            std::fs::write(&path, &bytes).expect("write synthetic realistic-homebrew .sprx to temp dir");
+            std::fs::write(&path, &bytes)
+                .expect("write synthetic realistic-homebrew .sprx to temp dir");
             path
         }
 
@@ -1243,19 +1435,34 @@ mod firmware_launcher_tests {
         /// only calls two of them.
         #[test]
         fn realistic_homebrew_module_executes_malloc_memset_readback_through_firmware_launcher() {
-            let tmp =
-                std::env::temp_dir().join(format!("xps5x-gui-realistic-homebrew-direct-{}", std::process::id()));
+            let tmp = std::env::temp_dir().join(format!(
+                "xps5x-gui-realistic-homebrew-direct-{}",
+                std::process::id()
+            ));
             std::fs::create_dir_all(&tmp).expect("create temp dir");
             let path = write_realistic_homebrew_sprx(&tmp, "eboot.bin");
 
             let launcher = FirmwareLauncher::new();
-            let handle = launcher.launch(&LaunchTarget::Game { path }).expect("launch always returns a handle");
+            let handle = launcher
+                .launch(&LaunchTarget::Game { path })
+                .expect("launch always returns a handle");
 
             assert_eq!(launcher.session_state(&handle), SessionState::Running);
-            let detail = launcher.session_detail(&handle).expect("a ran session has detail text");
-            assert!(detail.starts_with("Ran to exit(0xab)"), "unexpected message: {detail}");
-            assert!(detail.contains("4 HLE imports resolved"), "unexpected message: {detail}");
-            assert!(detail.contains("0 unresolved"), "unexpected message: {detail}");
+            let detail = launcher
+                .session_detail(&handle)
+                .expect("a ran session has detail text");
+            assert!(
+                detail.starts_with("Ran to exit(0xab)"),
+                "unexpected message: {detail}"
+            );
+            assert!(
+                detail.contains("4 HLE imports resolved"),
+                "unexpected message: {detail}"
+            );
+            assert!(
+                detail.contains("0 unresolved"),
+                "unexpected message: {detail}"
+            );
 
             let _ = std::fs::remove_dir_all(&tmp);
         }
@@ -1269,19 +1476,30 @@ mod firmware_launcher_tests {
         /// -> outcome.
         #[test]
         fn realistic_homebrew_discovered_by_scan_dir_then_launched_through_firmware_launcher() {
-            let tmp = std::env::temp_dir().join(format!("xps5x-gui-realistic-homebrew-scan-{}", std::process::id()));
+            let tmp = std::env::temp_dir().join(format!(
+                "xps5x-gui-realistic-homebrew-scan-{}",
+                std::process::id()
+            ));
             let game_dir = tmp.join("Games").join("realistic-homebrew-demo");
             std::fs::create_dir_all(&game_dir).expect("create temp game dir");
 
             let bytes = build_realistic_homebrew_sprx();
             let eboot_path = game_dir.join("eboot.bin");
-            std::fs::write(&eboot_path, &bytes).expect("write synthetic realistic-homebrew .sprx to temp dir");
-            std::fs::write(game_dir.join("xps5x-title.toml"), "title = \"Realistic Homebrew Demo\"\n")
-                .expect("write optional title metadata");
+            std::fs::write(&eboot_path, &bytes)
+                .expect("write synthetic realistic-homebrew .sprx to temp dir");
+            std::fs::write(
+                game_dir.join("xps5x-title.toml"),
+                "title = \"Realistic Homebrew Demo\"\n",
+            )
+            .expect("write optional title metadata");
 
             let games_root = tmp.join("Games");
             let items = crate::library::scan::scan_dir(&games_root);
-            assert_eq!(items.len(), 1, "scan_dir should discover exactly the one synthetic game folder");
+            assert_eq!(
+                items.len(),
+                1,
+                "scan_dir should discover exactly the one synthetic game folder"
+            );
             let item = &items[0];
             assert_eq!(item.title, "Realistic Homebrew Demo");
             let LaunchTarget::Game { path } = &item.launch else {
@@ -1290,13 +1508,26 @@ mod firmware_launcher_tests {
             assert_eq!(path, &eboot_path);
 
             let launcher = FirmwareLauncher::new();
-            let handle = launcher.launch(&item.launch).expect("launch always returns a handle");
+            let handle = launcher
+                .launch(&item.launch)
+                .expect("launch always returns a handle");
 
             assert_eq!(launcher.session_state(&handle), SessionState::Running);
-            let detail = launcher.session_detail(&handle).expect("a ran session has detail text");
-            assert!(detail.starts_with("Ran to exit(0xab)"), "unexpected message: {detail}");
-            assert!(detail.contains("4 HLE imports resolved"), "unexpected message: {detail}");
-            assert!(detail.contains("0 unresolved"), "unexpected message: {detail}");
+            let detail = launcher
+                .session_detail(&handle)
+                .expect("a ran session has detail text");
+            assert!(
+                detail.starts_with("Ran to exit(0xab)"),
+                "unexpected message: {detail}"
+            );
+            assert!(
+                detail.contains("4 HLE imports resolved"),
+                "unexpected message: {detail}"
+            );
+            assert!(
+                detail.contains("0 unresolved"),
+                "unexpected message: {detail}"
+            );
 
             let _ = std::fs::remove_dir_all(&tmp);
         }

@@ -15,15 +15,15 @@
 
 #![cfg(target_os = "windows")]
 
-use xps5x_firmware::dynlib::nid::{nid_of, NidDatabase};
+use xps5x_firmware::dynlib::nid::{NidDatabase, nid_of};
 use xps5x_firmware::dynlib::{DynSymbol, DynlibData, SceRela};
 use xps5x_firmware::{
-    link_module, HleTrampoline, LinkedModule, ModuleRegistry, SprxModule, SprxSegment, TlsTemplate,
-    HLE_TRAMPOLINE_BASE,
+    HLE_TRAMPOLINE_BASE, HleTrampoline, LinkedModule, ModuleRegistry, SprxModule, SprxSegment,
+    TlsTemplate, link_module,
 };
 use xps5x_hle::{HleContext, HleRegistry};
 use xps5x_kernel::OrbisKernel;
-use xps5x_runtime::{execute_linked, execute_process, RunOutcome, RuntimeError, GUEST_ARENA_BASE};
+use xps5x_runtime::{GUEST_ARENA_BASE, RunOutcome, RuntimeError, execute_linked, execute_process};
 
 const R_X86_64_JUMP_SLOT: u64 = 7;
 
@@ -1237,7 +1237,9 @@ fn trivial_ret_module() -> LinkedModule {
 #[test]
 fn guest_fs_zero_load_reads_the_installed_tcb() {
     if !fsgsbase_available() {
-        println!("FSGSBASE not available on this CPU; skipping guest_fs_zero_load_reads_the_installed_tcb");
+        println!(
+            "FSGSBASE not available on this CPU; skipping guest_fs_zero_load_reads_the_installed_tcb"
+        );
         return;
     }
 
@@ -1264,7 +1266,9 @@ fn guest_fs_zero_load_reads_the_installed_tcb() {
         .expect("native execution succeeds");
 
     let expected_tcb = GUEST_ARENA_BASE + HEAP_OFFSET;
-    println!("guest_fs_zero_load_reads_the_installed_tcb: RAX = {result:#x}, expected TCB = {expected_tcb:#x}");
+    println!(
+        "guest_fs_zero_load_reads_the_installed_tcb: RAX = {result:#x}, expected TCB = {expected_tcb:#x}"
+    );
     assert_eq!(
         result, expected_tcb,
         "guest `mov rax, fs:[0]` must read the TCB self-pointer `setup_main_tcb` installed"
@@ -1281,7 +1285,9 @@ fn guest_fs_zero_load_reads_the_installed_tcb() {
 #[test]
 fn guest_fs_offset_round_trip_writes_and_reads_back() {
     if !fsgsbase_available() {
-        println!("FSGSBASE not available on this CPU; skipping guest_fs_offset_round_trip_writes_and_reads_back");
+        println!(
+            "FSGSBASE not available on this CPU; skipping guest_fs_offset_round_trip_writes_and_reads_back"
+        );
         return;
     }
 
@@ -1327,7 +1333,9 @@ fn guest_fs_offset_round_trip_writes_and_reads_back() {
     let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[])
         .expect("native execution succeeds");
 
-    println!("guest_fs_offset_round_trip_writes_and_reads_back: RAX = {result:#x}, expected = {TLS_VALUE:#x}");
+    println!(
+        "guest_fs_offset_round_trip_writes_and_reads_back: RAX = {result:#x}, expected = {TLS_VALUE:#x}"
+    );
     assert_eq!(
         result, TLS_VALUE,
         "a value written to fs:[8] must read back through fs:[8], proving TLS-offset addressing (not just \
@@ -1346,7 +1354,9 @@ fn guest_fs_offset_round_trip_writes_and_reads_back() {
 #[test]
 fn host_fsbase_is_restored_after_execute_linked_returns() {
     if !fsgsbase_available() {
-        println!("FSGSBASE not available on this CPU; skipping host_fsbase_is_restored_after_execute_linked_returns");
+        println!(
+            "FSGSBASE not available on this CPU; skipping host_fsbase_is_restored_after_execute_linked_returns"
+        );
         return;
     }
 
@@ -1360,7 +1370,9 @@ fn host_fsbase_is_restored_after_execute_linked_returns() {
 
     // SAFETY: same as above.
     let after_first = unsafe { read_host_fsbase() };
-    println!("host_fsbase_is_restored_after_execute_linked_returns: before={before:#x} after_first={after_first:#x}");
+    println!(
+        "host_fsbase_is_restored_after_execute_linked_returns: before={before:#x} after_first={after_first:#x}"
+    );
     assert_eq!(
         after_first, before,
         "host FS base must be restored to its pre-call value after execute_linked returns"
@@ -1393,7 +1405,9 @@ fn host_fsbase_is_restored_after_execute_linked_returns() {
 #[test]
 fn host_fsbase_is_restored_after_a_recovered_genuine_fault() {
     if !fsgsbase_available() {
-        println!("FSGSBASE not available on this CPU; skipping host_fsbase_is_restored_after_a_recovered_genuine_fault");
+        println!(
+            "FSGSBASE not available on this CPU; skipping host_fsbase_is_restored_after_a_recovered_genuine_fault"
+        );
         return;
     }
 
@@ -1425,7 +1439,9 @@ fn host_fsbase_is_restored_after_a_recovered_genuine_fault() {
 
     // SAFETY: same as above.
     let after = unsafe { read_host_fsbase() };
-    println!("host_fsbase_is_restored_after_a_recovered_genuine_fault: before={before:#x} after={after:#x}");
+    println!(
+        "host_fsbase_is_restored_after_a_recovered_genuine_fault: before={before:#x} after={after:#x}"
+    );
     assert_eq!(
         after, before,
         "host FS base must be restored even after a recovered genuine guest fault (RT1a path), not just on \
@@ -1668,7 +1684,9 @@ fn start_stub_wild_fault_still_recovers_as_faulted_through_execute_process() {
 #[test]
 fn execute_process_restores_host_fsbase_after_an_exit_longjmp() {
     if !fsgsbase_available() {
-        println!("FSGSBASE not available on this CPU; skipping execute_process_restores_host_fsbase_after_an_exit_longjmp");
+        println!(
+            "FSGSBASE not available on this CPU; skipping execute_process_restores_host_fsbase_after_an_exit_longjmp"
+        );
         return;
     }
 
@@ -1704,7 +1722,9 @@ fn execute_process_restores_host_fsbase_after_an_exit_longjmp() {
 
     // SAFETY: same as above.
     let after = unsafe { read_host_fsbase() };
-    println!("execute_process_restores_host_fsbase_after_an_exit_longjmp: before={before:#x} after={after:#x}");
+    println!(
+        "execute_process_restores_host_fsbase_after_an_exit_longjmp: before={before:#x} after={after:#x}"
+    );
     assert_eq!(
         after, before,
         "host FS base must be restored after execute_process returns, even via the exit-longjmp path"
@@ -1731,7 +1751,9 @@ fn execute_process_restores_host_fsbase_after_an_exit_longjmp() {
 #[test]
 fn tls_variable_read_through_linker_computed_tpoff64_round_trips_tdata() {
     if !fsgsbase_available() {
-        println!("FSGSBASE not available on this CPU; skipping tls_variable_read_through_linker_computed_tpoff64_round_trips_tdata");
+        println!(
+            "FSGSBASE not available on this CPU; skipping tls_variable_read_through_linker_computed_tpoff64_round_trips_tdata"
+        );
         return;
     }
 
@@ -1844,7 +1866,9 @@ fn tls_variable_read_through_linker_computed_tpoff64_round_trips_tdata() {
 #[test]
 fn stack_chk_guard_canary_at_fs_0x28_is_nonzero_with_terminator_byte() {
     if !fsgsbase_available() {
-        println!("FSGSBASE not available on this CPU; skipping stack_chk_guard_canary_at_fs_0x28_is_nonzero_with_terminator_byte");
+        println!(
+            "FSGSBASE not available on this CPU; skipping stack_chk_guard_canary_at_fs_0x28_is_nonzero_with_terminator_byte"
+        );
         return;
     }
 
@@ -1992,17 +2016,129 @@ fn printf_with_guest_format_string_lands_in_the_kernel_console() {
     let hle = HleRegistry::new();
     let db = NidDatabase::from_hle_names(hle.registered_names());
     let registry = ModuleRegistry::new(db);
-    let linked =
-        link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE).expect("printf/exit imports must link");
-    assert!(linked.unresolved.is_empty(), "printf and exit must both resolve to HLE");
+    let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE)
+        .expect("printf/exit imports must link");
+    assert!(
+        linked.unresolved.is_empty(),
+        "printf and exit must both resolve to HLE"
+    );
 
     let kernel = OrbisKernel::new();
-    let outcome =
-        execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[]).expect("printf module must not fault");
+    let outcome = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[])
+        .expect("printf module must not fault");
     assert_eq!(outcome, RunOutcome::Exited(0));
     assert_eq!(
         kernel.console.contents(),
         "hello world, 42!\n",
         "the guest's printf output must be captured byte-exact in the kernel console"
+    );
+}
+
+// --- M1-D (wall #4): sceKernelLoadStartModule pseudo-handle path ---------
+
+/// M1-D acceptance at the runtime layer: a `_start`-shaped module calls
+/// `sceKernelLoadStartModule("/system/common/lib/libSceSysmodule.sprx",
+/// 0, 0, 0, 0, NULL)` — the path string lives in the module's own image —
+/// and exits with the returned handle. On a fresh kernel the first
+/// registered module gets handle 1, so `Exited(1)` proves the guest path
+/// string was read, the module table was consulted, and a valid pseudo-
+/// handle came back through the genuine link + VEH dispatch path.
+#[test]
+fn load_start_module_from_guest_returns_a_usable_handle() {
+    const ENTRY_OFF: usize = 0x0;
+    const SLOT_LSM_OFF: usize = 0x80;
+    const SLOT_EXIT_OFF: usize = 0x88;
+    const PATH_OFF: usize = 0x90;
+
+    let mut image = vec![0u8; 0x100];
+    let mut off = ENTRY_OFF;
+
+    // lea rdi, [rip+disp32] -> PATH_OFF
+    let disp = (PATH_OFF as i64 - (off as i64 + 7)) as i32;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x8D, 0x3D]);
+    image[off + 3..off + 7].copy_from_slice(&disp.to_le_bytes());
+    off += 7;
+    // xor esi,esi ; xor edx,edx ; xor ecx,ecx ; xor r8d,r8d ; xor r9d,r9d
+    image[off..off + 12].copy_from_slice(&[0x31, 0xF6, 0x31, 0xD2, 0x31, 0xC9, 0x45, 0x31, 0xC0, 0x45, 0x31, 0xC9]);
+    off += 12;
+    // call qword ptr [rip+disp32] -> SLOT_LSM_OFF
+    let disp = (SLOT_LSM_OFF as i64 - (off as i64 + 6)) as i32;
+    image[off] = 0xFF;
+    image[off + 1] = 0x15;
+    image[off + 2..off + 6].copy_from_slice(&disp.to_le_bytes());
+    off += 6;
+    // mov rdi, rax — the handle becomes exit's code
+    image[off..off + 3].copy_from_slice(&[0x48, 0x89, 0xC7]);
+    off += 3;
+    // call qword ptr [rip+disp32] -> SLOT_EXIT_OFF (never returns)
+    let disp = (SLOT_EXIT_OFF as i64 - (off as i64 + 6)) as i32;
+    image[off] = 0xFF;
+    image[off + 1] = 0x15;
+    image[off + 2..off + 6].copy_from_slice(&disp.to_le_bytes());
+
+    let path = b"/system/common/lib/libSceSysmodule.sprx\0";
+    image[PATH_OFF..PATH_OFF + path.len()].copy_from_slice(path);
+
+    let module = SprxModule {
+        name: "lsmTestModule".to_string(),
+        e_type: 0xFE18, // ET_SCE_DYNAMIC
+        segments: vec![SprxSegment {
+            vaddr: 0,
+            data: image,
+            flags: 5, // R+X
+            mem_size: 0x100,
+        }],
+        dynlib_data: None,
+        relro: None,
+        dynamic: None,
+        entry: ENTRY_OFF as u64,
+        tls: None,
+    };
+    let dynlib = DynlibData {
+        symbols: vec![
+            DynSymbol {
+                nid: nid_of("sceKernelLoadStartModule"),
+                value: 0,
+                is_import: true,
+            },
+            DynSymbol {
+                nid: nid_of("exit"),
+                value: 0,
+                is_import: true,
+            },
+        ],
+        relocations: vec![
+            SceRela {
+                offset: SLOT_LSM_OFF as u64,
+                info: R_X86_64_JUMP_SLOT, // r_sym = 0
+                addend: 0,
+            },
+            SceRela {
+                offset: SLOT_EXIT_OFF as u64,
+                info: (1u64 << 32) | R_X86_64_JUMP_SLOT, // r_sym = 1
+                addend: 0,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let hle = HleRegistry::new();
+    let db = NidDatabase::from_hle_names(hle.registered_names());
+    let registry = ModuleRegistry::new(db);
+    let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE)
+        .expect("sceKernelLoadStartModule/exit imports must link");
+    assert!(linked.unresolved.is_empty(), "both imports must resolve to HLE");
+
+    let kernel = OrbisKernel::new();
+    let outcome = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[])
+        .expect("LoadStartModule call must not fault");
+    assert_eq!(
+        outcome,
+        RunOutcome::Exited(1),
+        "the guest must receive handle 1 (first module on a fresh kernel) from sceKernelLoadStartModule"
+    );
+    assert!(
+        kernel.find_module("libSceSysmodule").is_some(),
+        "the pseudo-module must be registered in the kernel module table"
     );
 }
