@@ -1,7 +1,7 @@
 # XPS5X — M1-E Guest Threads (real `scePthreadCreate`) Design
 
 **Date:** 2026-07-14
-**Status:** Draft (design), pending implementation plan + emulator-reviewer sign-off
+**Status:** Draft (design) — **emulator-reviewer audit complete (§6); NOT yet safe to implement as originally written.** Address C1–C3 + I1–I4 in §6, follow the §6 implementation order, per-slice reviewer sign-off.
 **Scope of this spec:** Turning `scePthreadCreate`/`scePthreadJoin`/`scePthreadExit` from HLE no-ops into a **real second guest execution context** — a genuinely concurrent guest thread that runs its entry function on the shared `GuestArena`. This is M1 wall **E** (the last synthetic-vs-real execution gap) and the enabling substrate for the reference-port ledger's `todo` rows: SharpEmu/Kyty `pthread`, `Threads`, `Fiber`, and `AMPR` become real ports only once a second context can run.
 
 ---
@@ -85,3 +85,93 @@ The worker must run on a genuinely separate OS thread with its own TCB (assert t
 ## 5. Relationship to the reference-port `/goal`
 
 M1-E is the substrate that unblocks the ledger's remaining non-graphics `todo`/`wip` rows: SharpEmu `pthread`/`Fiber`/`AMPR` and Kyty `Threads` can only be *real* ports (not init-only stubs — the flagged "no-op instead of real execution" anti-pattern) once a second guest context runs. It does not touch graphics (owned separately). Finishing M1-E + graphics + the fixture-gated loader is what moves both reference trees toward `fully_ported`.
+
+---
+
+## 6. Soundness audit findings (emulator-reviewer, 2026-07-14)
+
+A pre-implementation adversarial soundness audit against the actual runtime
+internals found the §1–§4 design **directionally correct but not safe to
+implement as written**. The per-thread `ACTIVE_CONTEXT` / `recovery_ctx` /
+`RtlCaptureContext` reasoning is confirmed sound (each `run()` frame already owns
+its survive-restore `Cell`s; making the global a `thread_local!` is the right
+move, and `OrbisKernel` is already `Sync`). But these must be fixed first:
+
+### Critical (block any code)
+
+- **C1 — `HOST_RSP_SLOT` is a single process-wide slot** (`stack.rs:27-37`), used by
+  both `call_on_guest_stack` and `enter_guest_at_start` via a RIP-relative
+  `mov [rip+slot], rsp` / `mov rsp, [rip+slot]`. Its `unsafe impl Sync` is
+  justified *only* by `CALL_LOCK` serialization. Two concurrent guest threads
+  clobber each other's saved **host** RSP → host-stack corruption on an otherwise
+  "successful" call. The original spec missed this because it lives in the *entry*
+  path, not the VEH path. Must become per-thread (a `thread_local!` slot or an
+  `enter`-provided per-thread pointer) **while preserving** the "no GP register
+  survives the guest `call`" property that `guest_clobbering_r15_does_not_corrupt_host_rsp`
+  (`execute.rs:1139`) guards.
+- **C2 — the `'static` transmute needs shared *ownership*, not just `Sync`.**
+  `dispatch.rs:269-281` erases `&dyn GuestMemory`/`GuestAllocator` to `'static`
+  on the single-active + `CALL_LOCK` argument. A worker `std::thread` borrows the
+  arena/kernel/hle/trampolines owned by `execute_process`'s stack frame; a
+  **detached** worker outlives that frame → **use-after-free** of `GuestArena`
+  (`VirtualFree`), `OrbisKernel`, and `TrampolineGuard` on parent unwind. `Sync`
+  fixes aliasing, not lifetime. Shared runtime state must move to `Arc<…>`
+  (arena / kernel / hle / trampoline table / guard) with workers holding owning
+  clones — join-before-teardown can't cover detached threads, so `Arc` is
+  effectively mandatory.
+- **C3 — process-exit teardown with live detached workers is unhandled.** When the
+  main thread `exit`s, `execute_process` returns and removes the VEH + unmaps the
+  trampoline guard region; a still-running detached worker's next import call
+  faults into a removed VEH → real crash. Must force-terminate live workers before
+  teardown (and/or keep the VEH process-lifetime, see I2).
+
+### Important
+
+- **I1 — arena `read`/`write` SAFETY comments become false** (`arena.rs:388-415`
+  assert "no concurrent writer under single-active"). Concurrent host-side
+  `copy_nonoverlapping` on shared bytes is a data race (UB at the Rust abstract-
+  machine level). Rewrite the comments to the honest weaker justification (host
+  wrappers inherit the guest's own data-race responsibility; non-atomic, may tear)
+  and record it as a deliberate deviation, not "sound". `alloc`/`free` (Mutex-guarded) are fine.
+- **I2 — register the VEH once per process** (not per `run()`), removed only at
+  final teardown — avoids N duplicate handlers under N workers and resolves C3's
+  "handler removed while worker running".
+- **I3 — Windows FS-base persistence across preemption is unverified and
+  load-bearing.** `WRFSBASE` survival across context switches was only validated
+  for a non-preempted main run. Real workers *will* be preempted; if the scheduler
+  doesn't save/restore the user-set FS-base MSR, TLS + `fs:0x28` canary silently
+  break after any switch (a heisenbug). **Spike this first** (set fsbase, force a
+  switch under contention, re-read `RDFSBASE`) before relying on TLS in workers.
+- **I4 — thread-local read inside the VEH:** use the `thread_local! { static X = const { Cell::new(null) } }`
+  form (no lazy `Once`, no `Drop`) so a first-touch inside the handler (an
+  unrelated AV on a thread that never ran guest code) is a cheap non-allocating
+  read; and write the thread-local ctx in `run()` *before* entering guest code so
+  the VEH is only ever a reader on faulting guest threads.
+
+### Revised implementation order (each slice keeps the named regression tests green)
+
+1. `ACTIVE_CONTEXT` → `thread_local!` (const-init null), `CALL_LOCK` unchanged, still single-threaded.
+2. `HOST_RSP_SLOT` → per-thread (C1); hold `guest_clobbering_r15_does_not_corrupt_host_rsp` green.
+3. VEH → once-per-process (I2); shared state → `Arc` (C2); keep `CALL_LOCK` for the whole run.
+4. Run the FS-base-across-preemption spike (I3) — gate before any worker TLS reliance.
+5. Add `spawn_guest_thread` but spawn-then-immediately-join (no real concurrency yet) to exercise the `arg`-in-`rdi` entry + return-trampoline retval capture in isolation.
+6. Only then release `CALL_LOCK` around the guest-run phase (keep it for setup/teardown — **Option B**; the fixed-base `GuestArena`@`GUEST_ARENA_BASE` / `TrampolineGuard`@`HLE_TRAMPOLINE_BASE` singletons *require* serialized reservation, also for the parallel test harness, so Option A "drop the lock" is not reachable). Add the C3 detached-thread teardown story before enabling `scePthreadDetach`.
+
+**Regression guards to hold green** (`crates/xps5x-runtime/tests/execute.rs`):
+`guest_clobbering_r15_does_not_corrupt_host_rsp` (1139),
+`host_fsbase_is_restored_after_execute_linked_returns` (1369),
+`host_fsbase_is_restored_after_a_recovered_genuine_fault` (1420),
+`execute_process_restores_host_fsbase_after_an_exit_longjmp` (1704),
+`genuine_wild_fault_recovers_as_faulted_then_process_keeps_running` (198),
+`start_stub_wild_fault_still_recovers_as_faulted_through_execute_process` (1664),
+`tls_variable_read_through_linker_computed_tpoff64_round_trips_tdata` (1772),
+`stack_chk_guard_canary_at_fs_0x28_is_nonzero_with_terminator_byte` (1888),
+`printf_with_guest_format_string_lands_in_the_kernel_console` (1953), plus all
+`arena.rs` fixed-base serialization tests.
+
+### Acceptance addendum (supersedes §3's minimum)
+
+The §3 test is an honest gate **only if** it also (a) forces a preemption in the
+worker (exercises I3 — e.g. contended yield/sleep before the canary check) and
+(b) uses a genuinely **detached**-thread variant (exercises C2/C3). Without both,
+it is a synthetic best-case that passes over the exact traps above.
