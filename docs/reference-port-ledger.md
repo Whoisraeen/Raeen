@@ -83,7 +83,7 @@ Second-opinion PS5 emu (C#). Re-implement in Rust; do not vendor C#.
 | pthread / threads | Kernel | `xps5x-runtime`/`hle` | `todo` | | M1-E |
 | VideoOut / AGC / shaders→Vulkan | Graphics | `xps5x-gpu`/`hle` | `todo` | | M2+ |
 | DualSense / pad | Input | `xps5x-input`/`hle` | `todo` | | |
-| Filesystem: open/read/close/lseek | KernelExports/FS | `xps5x-kernel`/`hle` | `done` | (fileio batch) | VFS-backed, real host files under /app0; write persistence + fstat still todo |
+| Filesystem: open/read/close/lseek | KernelExports/FS | `xps5x-kernel`/`hle` | `done` | `896495d` | VFS-backed, real host files under /app0; write persistence + fstat still todo |
 | Filesystem / save (write persist, fstat, savedata) | FS | `xps5x-kernel`/`hle` | `todo` | | |
 | GUI patterns | app | `xps5x-gui` | `skip` | | optional UX only |
 
