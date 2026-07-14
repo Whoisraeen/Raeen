@@ -618,10 +618,28 @@ fn hle_get_direct_memory_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
     0x4000_0000
 }
 
-/// Stub: plausible fixed size (256 MiB) of "available" flexible memory.
-fn hle_available_flexible_memory_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
-    debug!("sceKernelAvailableFlexibleMemorySize()");
-    0x1000_0000
+/// Plausible amount of "available" flexible memory reported to the guest
+/// (256 MiB). A real PS5 exposes a few hundred MiB of flexible memory;
+/// this fixed figure is enough for homebrew that sanity-checks headroom
+/// before mapping.
+const FLEXIBLE_MEMORY_SIZE: u64 = 0x1000_0000;
+
+/// Real `sceKernelAvailableFlexibleMemorySize(size_t *sizeOut)`: writes the
+/// available size through the out-param and returns `SCE_OK` — the previous
+/// stub returned the size *as the return value*, which is the wrong ABI (a
+/// guest reading `*sizeOut` got garbage). NULL/unwritable out-param is
+/// `EFAULT`.
+fn hle_available_flexible_memory_size(ctx: &HleContext, args: &[u64]) -> u64 {
+    let size_out = args.first().copied().unwrap_or(0);
+    debug!("sceKernelAvailableFlexibleMemorySize(sizeOut={size_out:#x})");
+    if size_out == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    if !ctx.mem.write(size_out, &FLEXIBLE_MEMORY_SIZE.to_le_bytes()) {
+        warn!("sceKernelAvailableFlexibleMemorySize: sizeOut {size_out:#x} not writable — EFAULT");
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    SCE_OK
 }
 
 fn hle_set_virtual_range_name(_ctx: &HleContext, args: &[u64]) -> u64 {
@@ -1069,6 +1087,25 @@ mod tests {
         assert_eq!(hle_open(&ctx, &[0x300, 0, 0]) as i64, -2);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// AvailableFlexibleMemorySize writes the size through its out-param
+    /// (not the return value) and returns OK; NULL → EINVAL.
+    #[test]
+    fn available_flexible_memory_writes_out_param() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(hle_available_flexible_memory_size(&ctx, &[0x40]), SCE_OK);
+        let mut v = [0u8; 8];
+        assert!(mem.read(0x40, &mut v));
+        assert_eq!(u64::from_le_bytes(v), FLEXIBLE_MEMORY_SIZE);
+        assert_eq!(
+            hle_available_flexible_memory_size(&ctx, &[0]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
     }
 
     /// M1 hardening: GetCompiledSdkVersion writes the PS5 SDK version out and
