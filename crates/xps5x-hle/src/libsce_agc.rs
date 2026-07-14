@@ -92,6 +92,8 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceAgc", "sceAgcInit", hle_init);
     registry.register("libSceAgc", "sceAgcDcbEventWrite", hle_dcb_event_write);
     registry.register("libSceAgc", "sceAgcAcbWriteData", hle_acb_write_data);
+    // AcbDispatchIndirect emits the identical indirect-dispatch packet.
+    registry.register("libSceAgc", "sceAgcAcbDispatchIndirect", hle_acb_write_data);
     registry.register(
         "libSceAgc",
         "sceAgcDcbSetCxRegistersIndirect",
@@ -164,8 +166,9 @@ fn hle_dcb_set_uc_regs_indirect(ctx: &HleContext, args: &[u64]) -> u64 {
     dcb_set_registers_indirect(ctx, args, R_UC_REGS_INDIRECT)
 }
 
-/// `sceAgcAcbWriteData(acb, argumentsAddress, modifier)`: emit an indirect
-/// dispatch packet (4 DWORDs) with the arguments address + initiator.
+/// `sceAgcAcbWriteData` / `sceAgcAcbDispatchIndirect(acb, argumentsAddress,
+/// modifier)`: emit an indirect dispatch packet (4 DWORDs) with the arguments
+/// address + initiator. (Both NIDs emit the identical packet.)
 fn hle_acb_write_data(ctx: &HleContext, args: &[u64]) -> u64 {
     let cb = args.first().copied().unwrap_or(0);
     let arguments = args.get(1).copied().unwrap_or(0);
@@ -887,6 +890,25 @@ mod tests {
         assert_eq!(read_u32(&ctx, cx), pm4(4, IT_NOP, R_CX_REGS_INDIRECT));
         let uc = hle_dcb_set_uc_regs_indirect(&ctx, &[cb, regs, 1]);
         assert_eq!(read_u32(&ctx, uc), pm4(4, IT_NOP, R_UC_REGS_INDIRECT));
+    }
+
+    #[test]
+    fn acb_dispatch_indirect_is_registered_as_the_same_packet() {
+        // Both NIDs resolve to the same 4-dword indirect-dispatch emitter.
+        let reg = HleRegistry::new();
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        setup_cb(&ctx, 0x40, 0x400, 0x800);
+        assert_eq!(
+            reg.call(
+                &ctx,
+                "libSceAgc",
+                "sceAgcAcbDispatchIndirect",
+                &[0x40, 0, 0]
+            ),
+            Some(0x400)
+        );
+        assert_eq!(read_u32(&ctx, 0x400), pm4(4, IT_DISPATCH_INDIRECT, R_ZERO));
     }
 
     #[test]
