@@ -30,9 +30,12 @@ const IT_INDEX_TYPE: u32 = 0x2A;
 const IT_NOP: u32 = 0x10;
 const IT_INDEX_BUFFER_SIZE: u32 = 0x13;
 const IT_INDEX_BASE: u32 = 0x26;
+const IT_DRAW_INDEX_2: u32 = 0x27;
 const IT_NUM_INSTANCES: u32 = 0x2F;
 const R_ZERO: u32 = 0x00;
 const R_DRAW_INDEX_AUTO: u32 = 0x04;
+const R_DRAW_RESET: u32 = 0x05;
+const R_WAIT_FLIP_DONE: u32 = 0x06;
 
 /// The `DRAW_INDEX_AUTO` modifier a valid call must pass.
 const DRAW_AUTO_MODIFIER: u64 = 0x4000_0000;
@@ -54,6 +57,13 @@ pub fn register(registry: &HleRegistry) {
         "libSceAgc",
         "sceAgcDcbSetIndexBuffer",
         hle_dcb_set_index_buffer,
+    );
+    registry.register("libSceAgc", "sceAgcDcbDrawIndex", hle_dcb_draw_index);
+    registry.register("libSceAgc", "sceAgcDcbResetQueue", hle_dcb_reset_queue);
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbWaitUntilSafeForRendering",
+        hle_dcb_wait_until_safe,
     );
 }
 
@@ -202,6 +212,95 @@ fn hle_dcb_set_index_buffer(ctx: &HleContext, args: &[u64]) -> u64 {
     addr
 }
 
+/// `sceAgcDcbDrawIndex(dcb, indexCount, indexAddress, modifier)`: emit an
+/// INDEX_BASE + INDEX_BUFFER_SIZE packet (5 DWORDs) then a DRAW_INDEX_2 packet
+/// (5 DWORDs). Returns the first (base) command address.
+fn hle_dcb_draw_index(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let index_count = args.get(1).copied().unwrap_or(0) as u32;
+    let index_addr = args.get(2).copied().unwrap_or(0);
+    let modifier = args.get(3).copied().unwrap_or(0);
+    if cb == 0 || modifier != DRAW_AUTO_MODIFIER {
+        return 0;
+    }
+    let Some(base) = alloc_command_dwords(ctx, cb, 5) else {
+        return 0;
+    };
+    let base_ok = ctx
+        .mem
+        .write(base, &pm4(3, IT_INDEX_BASE, R_ZERO).to_le_bytes())
+        && ctx.mem.write(base + 4, &(index_addr as u32).to_le_bytes())
+        && ctx
+            .mem
+            .write(base + 8, &((index_addr >> 32) as u32).to_le_bytes())
+        && ctx.mem.write(
+            base + 12,
+            &pm4(2, IT_INDEX_BUFFER_SIZE, R_ZERO).to_le_bytes(),
+        )
+        && ctx.mem.write(base + 16, &index_count.to_le_bytes());
+    if !base_ok {
+        return 0;
+    }
+    let Some(draw) = alloc_command_dwords(ctx, cb, 5) else {
+        return 0;
+    };
+    let draw_ok = ctx
+        .mem
+        .write(draw, &pm4(5, IT_DRAW_INDEX_2, R_ZERO).to_le_bytes())
+        && ctx.mem.write(draw + 4, &index_count.to_le_bytes())
+        && (2..=4).all(|i| ctx.mem.write(draw + i * 4, &0u32.to_le_bytes()));
+    if !draw_ok {
+        return 0;
+    }
+    base
+}
+
+/// `sceAgcDcbResetQueue(dcb, op, state)`: emit a draw-reset packet. Requires
+/// `op == 0x3FF` and `state == 0`.
+fn hle_dcb_reset_queue(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let op = args.get(1).copied().unwrap_or(0);
+    let state = args.get(2).copied().unwrap_or(0);
+    if cb == 0 || op != 0x3FF || state != 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 2) else {
+        return 0;
+    };
+    if !ctx
+        .mem
+        .write(addr, &pm4(2, IT_NOP, R_DRAW_RESET).to_le_bytes())
+        || !ctx.mem.write(addr + 4, &0u32.to_le_bytes())
+    {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcDcbWaitUntilSafeForRendering(dcb, videoOutHandle, displayBufferIndex)`:
+/// emit a wait-flip-done packet (7 DWORDs).
+fn hle_dcb_wait_until_safe(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let video_out = args.get(1).copied().unwrap_or(0) as u32;
+    let buffer_index = args.get(2).copied().unwrap_or(0) as u32;
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 7) else {
+        return 0;
+    };
+    let ok = ctx
+        .mem
+        .write(addr, &pm4(7, IT_NOP, R_WAIT_FLIP_DONE).to_le_bytes())
+        && ctx.mem.write(addr + 4, &video_out.to_le_bytes())
+        && ctx.mem.write(addr + 8, &buffer_index.to_le_bytes())
+        && (3..=6).all(|i| ctx.mem.write(addr + i * 4, &0u32.to_le_bytes()));
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +398,47 @@ mod tests {
         assert_eq!(read_u32(&ctx, 0x410), 6);
         // 5 DWORDs total.
         assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x400 + 20);
+    }
+
+    #[test]
+    fn draw_index_emits_base_then_draw_packets() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let ib = 0x00AB_CDEF_1234_5678u64;
+        assert_eq!(
+            hle_dcb_draw_index(&ctx, &[cb, 6, ib, 0]),
+            0,
+            "bad modifier → 0"
+        );
+        let ret = hle_dcb_draw_index(&ctx, &[cb, 6, ib, DRAW_AUTO_MODIFIER]);
+        assert_eq!(ret, 0x400);
+        // Base packet (5 dw) then draw packet (5 dw) = 10 dw total.
+        assert_eq!(read_u32(&ctx, 0x400), pm4(3, IT_INDEX_BASE, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x40C), pm4(2, IT_INDEX_BUFFER_SIZE, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x414), pm4(5, IT_DRAW_INDEX_2, R_ZERO)); // draw at 0x400+20
+        assert_eq!(read_u32(&ctx, 0x418), 6, "index count in draw packet");
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x400 + 40);
+    }
+
+    #[test]
+    fn reset_queue_validates_and_wait_emits_flip_packet() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        // ResetQueue requires op=0x3FF, state=0.
+        assert_eq!(hle_dcb_reset_queue(&ctx, &[cb, 0, 0]), 0);
+        assert_eq!(hle_dcb_reset_queue(&ctx, &[cb, 0x3FF, 0]), 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(2, IT_NOP, R_DRAW_RESET));
+        // WaitUntilSafeForRendering emits a 7-dword wait-flip packet.
+        let ret = hle_dcb_wait_until_safe(&ctx, &[cb, 9, 1]);
+        assert_eq!(ret, 0x408);
+        assert_eq!(read_u32(&ctx, 0x408), pm4(7, IT_NOP, R_WAIT_FLIP_DONE));
+        assert_eq!(read_u32(&ctx, 0x40C), 9, "video-out handle");
+        assert_eq!(read_u32(&ctx, 0x410), 1, "display buffer index");
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x408 + 28);
     }
 
     #[test]
