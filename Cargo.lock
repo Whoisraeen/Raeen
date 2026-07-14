@@ -5127,6 +5127,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dashmap",
+ "memchr",
  "tracing",
  "xps5x-audio",
  "xps5x-core",

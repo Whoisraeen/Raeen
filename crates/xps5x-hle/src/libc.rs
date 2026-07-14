@@ -373,6 +373,13 @@ const CMP_MAX_BYTES: u64 = 1 << 20;
 /// NUL-terminated string.
 fn read_guest_bytes(ctx: &HleContext, addr: u64, n: u64) -> Option<Vec<u8>> {
     let capped = n.min(CMP_MAX_BYTES);
+    if capped < n {
+        // Truncating a comparison/scan over *valid* memory yields a wrong
+        // answer (a false "equal" / "not found" past the cap), so warn —
+        // matching `read_cstr`'s own truncation warning — rather than
+        // silently returning a partial result.
+        warn!("read_guest_bytes: {n:#x} bytes at {addr:#x} capped to {capped:#x} (CMP_MAX_BYTES)");
+    }
     let len = usize::try_from(capped).ok()?;
     let mut buf = vec![0u8; len];
     if len == 0 {
@@ -458,9 +465,17 @@ fn hle_strnlen(ctx: &HleContext, args: &[u64]) -> u64 {
     let maxlen = args.get(1).copied().unwrap_or(0);
     debug!("strnlen(s={s:#x}, maxlen={maxlen:#x})");
 
-    match crate::fmt::read_cstr(ctx.mem, s) {
-        Some(bytes) => (bytes.len() as u64).min(maxlen),
-        None => 0,
+    // Real `strnlen` examines at most `maxlen` bytes — read exactly that
+    // window (bounded by CMP_MAX_BYTES) rather than scanning the whole
+    // string first, so the read footprint matches the C contract.
+    let window = maxlen.min(CMP_MAX_BYTES);
+    let Some(bytes) = read_guest_bytes(ctx, s, window) else {
+        warn!("strnlen: unreadable window at {s:#x}");
+        return 0;
+    };
+    match bytes.iter().position(|&b| b == 0) {
+        Some(nul) => nul as u64,
+        None => window, // no NUL within maxlen → maxlen (capped)
     }
 }
 
@@ -579,7 +594,11 @@ fn hle_strstr(ctx: &HleContext, args: &[u64]) -> u64 {
     if ndl.is_empty() {
         return haystack;
     }
-    match hay.windows(ndl.len()).position(|w| w == ndl.as_slice()) {
+    // `memchr::memmem::find` is linear (Two-Way + SIMD prefilter), so a
+    // hostile "aaaa…" haystack + "aaaa…b" needle can't force the O(n·m)
+    // blowup a naive `windows().position()` scan would (both inputs are
+    // guest-controlled, each up to 1 MiB from `read_cstr`).
+    match memchr::memmem::find(&hay, &ndl) {
         Some(off) => haystack.wrapping_add(off as u64),
         None => 0,
     }
@@ -908,6 +927,47 @@ mod tests {
         let mut buf2 = [0u8; 4];
         assert!(mem.read(0x600, &mut buf2));
         assert_eq!(&buf2, b"xyz\0", "only 2 src bytes appended + NUL");
+
+        // strncat with n >= src.len() appends the whole source.
+        assert!(mem.write(0x700, b"p\0"));
+        assert!(mem.write(0x720, b"qr\0"));
+        assert_eq!(hle_strncat(&ctx, &[0x700, 0x720, 10]), 0x700);
+        let mut buf3 = [0u8; 4];
+        assert!(mem.read(0x700, &mut buf3));
+        assert_eq!(&buf3, b"pqr\0");
+    }
+
+    /// The comparison functions' positive/Greater branch and the miss/
+    /// degradation contracts the batch documents (reviewer-requested gaps).
+    #[test]
+    fn compare_positive_branches_miss_and_unreadable_degradation() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x100, b"abd"));
+        assert!(mem.write(0x110, b"abc"));
+        assert_eq!(hle_memcmp(&ctx, &[0x100, 0x110, 3]), 1, "'d' > 'c' → +1");
+        assert_eq!(hle_memcmp(&ctx, &[0x100, 0x110, 0]), 0, "n==0 → equal");
+
+        assert!(mem.write(0x200, b"help\0"));
+        assert!(mem.write(0x210, b"hello\0"));
+        assert_eq!(hle_strncmp(&ctx, &[0x200, 0x210, 4]), 1, "'p' > 'l' → +1");
+
+        // strstr not-found → 0
+        assert!(mem.write(0x300, b"foobar\0"));
+        assert!(mem.write(0x320, b"xyz\0"));
+        assert_eq!(hle_strstr(&ctx, &[0x300, 0x320]), 0);
+
+        // Unreadable-pointer degradations (documented): comparisons report
+        // 0 (equal); scans report 0 (NULL); no panic, no host OOB.
+        assert_eq!(hle_memcmp(&ctx, &[0xDEAD_0000, 0x100, 4]), 0);
+        assert_eq!(hle_memchr(&ctx, &[0xDEAD_0000, b'a' as u64, 4]), 0);
+        assert_eq!(hle_strncmp(&ctx, &[0xDEAD_0000, 0x200, 4]), 0);
+        assert_eq!(hle_strchr(&ctx, &[0xDEAD_0000, b'a' as u64]), 0);
+        assert_eq!(hle_strstr(&ctx, &[0xDEAD_0000, 0x320]), 0);
+        assert_eq!(hle_strnlen(&ctx, &[0xDEAD_0000, 8]), 0);
     }
 
     #[test]
