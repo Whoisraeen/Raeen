@@ -548,6 +548,25 @@ impl std::fmt::Display for ShaderLabel {
     }
 }
 
+/// Kyty: Shader.h `ShaderDebugPrintf::Type` (L448).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ShaderDebugPrintfType {
+    Uint,
+    Int,
+    Float,
+}
+
+/// Kyty: Shader.h `ShaderDebugPrintf` (L446) — a debug-printf command
+/// injected at `pc`. The data model is ported; the global injection registry
+/// (`g_debug_printfs`, Shader.cpp L100/L3006) is not — see `analysis.rs`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShaderDebugPrintf {
+    pub pc: u32,
+    pub format: String,
+    pub types: Vec<ShaderDebugPrintfType>,
+    pub args: Vec<ShaderOperand>,
+}
+
 /// Kyty: Shader.h `ShaderControlFlowBlock` (L460).
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct ShaderControlFlowBlock {
@@ -740,6 +759,7 @@ pub struct ShaderCode {
     labels: Vec<ShaderLabel>,
     indirect_labels: Vec<ShaderLabel>,
     type_: ShaderType,
+    debug_printfs: Vec<ShaderDebugPrintf>,
     vs_embedded_id: u32,
     ps_embedded_id: u32,
     vs_embedded: bool,
@@ -763,6 +783,7 @@ impl ShaderCode {
             labels: Vec::new(),
             indirect_labels: Vec::new(),
             type_: ShaderType::Unknown,
+            debug_printfs: Vec::new(),
             vs_embedded_id: 0,
             ps_embedded_id: 0,
             vs_embedded: false,
@@ -804,6 +825,16 @@ impl ShaderCode {
 
     pub fn set_type(&mut self, type_: ShaderType) {
         self.type_ = type_;
+    }
+
+    /// Kyty: `GetDebugPrintfs` (Shader.h L487).
+    #[must_use]
+    pub fn get_debug_printfs(&self) -> &Vec<ShaderDebugPrintf> {
+        &self.debug_printfs
+    }
+
+    pub fn get_debug_printfs_mut(&mut self) -> &mut Vec<ShaderDebugPrintf> {
+        &mut self.debug_printfs
     }
 
     /// Kyty: `HasAnyOf` (Shader.h L491).
