@@ -43,7 +43,7 @@ Primary full port. Plan: `docs/superpowers/plans/2026-07-13-kyty-full-port.md`.
 | string8 / hashmap / timer / date_time | `kyty-core` | `done` | `c0639a7` | |
 | String / Compression | `kyty-core` | `done` | `c81fe71` | |
 | JsonReader / Language | `kyty-core` | `done` | `8c1e28f` | |
-| Sys (`sys_*.rs`, 9 mods) | `kyty-core` | `done` | `4ad2f49` | were orphaned (drafted, never declared in lib.rs → never compiled); wired in `#[cfg(windows)]`, lint-fixed, 92 tests now live |
+| Sys (`sys_*.rs`, 9 mods) | `kyty-core` | `done` | `4ad2f49`,`b22c891` | were orphaned (drafted, never declared → never compiled); wired in `#[cfg(windows)]`, lint-fixed. Wiring exposed a STATUS_STACK_BUFFER_OVERRUN: SysCS drop transliterated Kyty's abort into a panic, leaving a live CRITICAL_SECTION on freed memory — fixed in b22c891 (Drop releases the OS resource). 92 tests live, both binaries exit clean. |
 | CharUcd | `kyty-core` | `skip` | | use unicode crate; do not transliterate |
 | Database | `kyty-core` | `skip` | | defer rusqlite unless needed |
 | VirtualMemory (Core wrapper) | `kyty-core` | `done` | `e06b0d3` | `virtual_memory.rs` forwards 1:1 to sys_virtual (as Kyty's Core does on Windows); ExceptionHandler `skip` — xps5x-runtime VEH supersedes |
