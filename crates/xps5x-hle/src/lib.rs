@@ -29,6 +29,7 @@ pub mod kernel_socket;
 pub mod libc;
 pub mod libkernel;
 pub mod libsce_agc;
+pub mod libsce_ampr;
 pub mod libsce_app_content;
 pub mod libsce_audio_out;
 pub mod libsce_common_dialog;
@@ -179,6 +180,7 @@ impl HleRegistry {
         libsce_json::register(&registry);
         libsce_media::register(&registry);
         libsce_agc::register(&registry);
+        libsce_ampr::register(&registry);
 
         info!(
             "HLE registry: {} functions registered",

@@ -168,6 +168,9 @@ pub struct OrbisKernel {
     kernel_equeue_next: std::sync::atomic::AtomicU64,
     /// The Agc driver's registered default resource owner (`sceAgcDriver*`).
     pub agc_default_owner: std::sync::atomic::AtomicU32,
+    /// AMPR command-buffer write offsets, keyed by the command-buffer address
+    /// (the current write cursor `sceAmprCommandBufferGetCurrentOffset` reads).
+    pub ampr_write_offsets: DashMap<u64, u64>,
     /// Guest network sockets (offline — no host connectivity), keyed by fd.
     pub kernel_sockets: DashMap<i32, GuestSocket>,
     /// Next socket fd to hand out (a high range, distinct from VFS fds).
@@ -316,6 +319,7 @@ impl OrbisKernel {
             kernel_equeue_events: DashMap::new(),
             kernel_equeue_next: std::sync::atomic::AtomicU64::new(1),
             agc_default_owner: std::sync::atomic::AtomicU32::new(0),
+            ampr_write_offsets: DashMap::new(),
             kernel_sockets: DashMap::new(),
             kernel_socket_next: std::sync::atomic::AtomicI32::new(0x4000_0000),
             pthread_tls_keys: DashMap::new(),
