@@ -31,6 +31,7 @@ const IT_NOP: u32 = 0x10;
 const IT_INDEX_BUFFER_SIZE: u32 = 0x13;
 const IT_INDEX_BASE: u32 = 0x26;
 const IT_DRAW_INDEX_2: u32 = 0x27;
+const IT_DRAW_INDEX_OFFSET_2: u32 = 0x35;
 const IT_NUM_INSTANCES: u32 = 0x2F;
 const IT_DISPATCH_DIRECT: u32 = 0x15;
 const IT_DISPATCH_INDIRECT: u32 = 0x16;
@@ -156,6 +157,12 @@ pub fn register(registry: &HleRegistry) {
         hle_get_resource_max_name_length,
     );
     registry.register("libSceAgc", "sceAgcSuspendPoint", hle_suspend_point);
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbDrawIndexOffset",
+        hle_dcb_draw_index_offset,
+    );
+    registry.register("libSceAgc", "sceAgcUnknownQj7QZpgr9Uw", hle_unknown_filler);
     // The Cx/Sh/Uc patch-set NIDs are behaviorally identical (the register
     // space only affects tracing), so each family shares one handler.
     for space in ["Cx", "Sh", "Uc"] {
@@ -218,6 +225,50 @@ fn hle_get_resource_max_name_length(ctx: &HleContext, args: &[u64]) -> u64 {
 /// `sceAgcSuspendPoint()`: a no-op suspension marker; succeeds.
 fn hle_suspend_point(_ctx: &HleContext, _args: &[u64]) -> u64 {
     0
+}
+
+/// `sceAgcDcbDrawIndexOffset(dcb, indexOffset, indexCount, flags)`: emit a
+/// DRAW_INDEX_OFFSET_2 packet (5 DWORDs).
+fn hle_dcb_draw_index_offset(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let index_offset = args.get(1).copied().unwrap_or(0) as u32;
+    let index_count = args.get(2).copied().unwrap_or(0) as u32;
+    let flags = args.get(3).copied().unwrap_or(0) as u32;
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 5) else {
+        return 0;
+    };
+    let ok = ctx
+        .mem
+        .write(addr, &pm4(5, IT_DRAW_INDEX_OFFSET_2, R_ZERO).to_le_bytes())
+        && ctx.mem.write(addr + 4, &index_count.to_le_bytes())
+        && ctx.mem.write(addr + 8, &index_offset.to_le_bytes())
+        && ctx.mem.write(addr + 12, &index_count.to_le_bytes())
+        && ctx
+            .mem
+            .write(addr + 16, &(flags & 0xE000_0001).to_le_bytes());
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcUnknownQj7QZpgr9Uw(dcb, ...)`: emit a single filler DWORD
+/// (`0x8000_0000`, a Type-2 NOP header) into the command buffer.
+fn hle_unknown_filler(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 1) else {
+        return 0;
+    };
+    if !ctx.mem.write(addr, &0x8000_0000u32.to_le_bytes()) {
+        return 0;
+    }
+    addr
 }
 
 /// `sceAgcGetDataPacketPayloadAddress(output, command, type)`: compute the
@@ -1261,6 +1312,15 @@ mod tests {
         );
         // SuspendPoint is a no-op success.
         assert_eq!(hle_suspend_point(&ctx, &[]), 0);
+        // DrawIndexOffset: 5-dword packet (count, offset, count, masked flags).
+        let d = hle_dcb_draw_index_offset(&ctx, &[cb, 0x10, 6, 0xE000_0001]);
+        assert_eq!(read_u32(&ctx, d), pm4(5, IT_DRAW_INDEX_OFFSET_2, R_ZERO));
+        assert_eq!(read_u32(&ctx, d + 4), 6);
+        assert_eq!(read_u32(&ctx, d + 8), 0x10);
+        assert_eq!(read_u32(&ctx, d + 16), 0xE000_0001);
+        // Unknown filler: a single 0x8000_0000 dword.
+        let f = hle_unknown_filler(&ctx, &[cb]);
+        assert_eq!(read_u32(&ctx, f), 0x8000_0000);
     }
 
     #[test]
