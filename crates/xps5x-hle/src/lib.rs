@@ -142,6 +142,7 @@ impl HleRegistry {
         libsce_common_dialog::register(&registry);
         libsce_app_content::register(&registry);
         libsce_np::register(&registry);
+        libsce_net::register(&registry);
 
         info!(
             "HLE registry: {} functions registered",
