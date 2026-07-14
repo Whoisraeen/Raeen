@@ -417,6 +417,17 @@ pub fn register(registry: &HleRegistry) {
         hle_get_tsc_frequency,
     );
     registry.register("libkernel", "sceKernelUsleep", hle_usleep);
+    registry.register("libkernel", "sceKernelGetProcessTime", hle_get_process_time);
+    registry.register(
+        "libkernel",
+        "sceKernelGetProcessTimeCounter",
+        hle_get_process_time_counter,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelGetProcessTimeCounterFrequency",
+        hle_get_process_time_counter_frequency,
+    );
     registry.register("libkernel", "sceKernelGetProcParam", hle_get_proc_param);
     registry.register("libkernel", "sceKernelIsNeoMode", hle_is_neo_mode);
     registry.register("libkernel", "sceKernelGetCpumode", hle_get_cpumode);
@@ -827,6 +838,32 @@ fn hle_clock_gettime(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
+/// Frequency (Hz) of the process-time counter XPS5X exposes: a nanosecond
+/// domain, so `GetProcessTimeCounter` returns elapsed nanoseconds and
+/// `GetProcessTimeCounterFrequency` returns `1_000_000_000`.
+const PROCESS_TIME_COUNTER_HZ: u64 = 1_000_000_000;
+
+/// Real `sceKernelGetProcessTime()`: microseconds elapsed since the process
+/// started (a `u64` return, not an out-param). Titles use this for frame
+/// timing and delta-time.
+fn hle_get_process_time(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    let us = process_start().elapsed().as_micros();
+    debug!("sceKernelGetProcessTime() -> {us}us");
+    u64::try_from(us).unwrap_or(u64::MAX)
+}
+
+/// Real `sceKernelGetProcessTimeCounter()`: elapsed nanoseconds since process
+/// start (paired with [`PROCESS_TIME_COUNTER_HZ`]). Monotonic.
+fn hle_get_process_time_counter(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    u64::try_from(process_start().elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// `sceKernelGetProcessTimeCounterFrequency()`: the counter's frequency in
+/// Hz — the divisor a title applies to the counter to get seconds.
+fn hle_get_process_time_counter_frequency(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    PROCESS_TIME_COUNTER_HZ
+}
+
 /// A fixed monotonic reference captured on first use, so `CLOCK_MONOTONIC`
 /// reports a stable, never-decreasing elapsed time across the process.
 fn process_start() -> std::time::Instant {
@@ -1205,6 +1242,29 @@ mod tests {
             hle_getpid(&ctx, &[]),
             "pid is stable"
         );
+    }
+
+    /// Process-time counters advance monotonically and agree on their domain.
+    #[test]
+    fn process_time_counters_advance_and_are_consistent() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x10);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(
+            hle_get_process_time_counter_frequency(&ctx, &[]),
+            PROCESS_TIME_COUNTER_HZ
+        );
+        let t0 = hle_get_process_time(&ctx, &[]);
+        let c0 = hle_get_process_time_counter(&ctx, &[]);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let t1 = hle_get_process_time(&ctx, &[]);
+        let c1 = hle_get_process_time_counter(&ctx, &[]);
+        assert!(t1 >= t0, "process time must be monotonic");
+        assert!(c1 > c0, "process-time counter must advance");
+        // Counter is nanoseconds, GetProcessTime is microseconds — same clock.
+        assert!(c1 >= t1 * 1000, "counter (ns) must be ~1000× the time (us)");
     }
 
     /// usleep sleeps a real (bounded) amount and returns OK.

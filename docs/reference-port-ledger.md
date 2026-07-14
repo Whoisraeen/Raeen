@@ -68,7 +68,7 @@ Primary full port. Plan: `docs/superpowers/plans/2026-07-13-kyty-full-port.md`.
 | lib/Scripts | `kyty-scripts` | `skip` | | Lua scripting — unused by XPS5X's execution path (guest games are native binaries, not Kyty Lua demos); per goal "skip unused Scripts/lua unless config needs it" |
 | emulator/Loader | `kyty-loader` → `xps5x-firmware`/`loader` | `todo` | | |
 | emulator/Kernel | `kyty-kernel` → `xps5x-kernel`/`hle` | `todo` | | |
-| emulator/Libs | `kyty-libs` → `xps5x-hle` | `todo` | | |
+| emulator/Libs (libSce* HLE surface) | `xps5x-hle` | `wip` | (many) | realized incrementally as xps5x-hle libSce* modules: libc, libkernel (mem/time/module/proc-time), Sysmodule, PlayGo, User/System Service, Pad, AudioOut, VideoOut, SaveData. Remaining Kyty Libs: Net, Dialog, AppContent, DiscMap, GraphicsDriver (M2), Np/trophy |
 | emulator/Graphics: texture micro-tiling | `xps5x-gpu` | `done` | `09f44c0` | fixed detile_micro from a bogus linear (py*8+px) interior to the documented GCN thin micro-tile Z-order (Morton interleave x0y0x1y1x2y2); added inverse tile_micro + round-trip/bijection/known-mapping tests. DEPTH/DISPLAY/ROTATED modes + macro bank/pipe swizzle + hardware-exact validation vs real dumps still todo |
 | emulator/Graphics: PM4→shader→Vulkan pipeline | `kyty-graphics` → `xps5x-gpu` | `todo` | | crown jewel / M2+ — the big pipeline (needs real command-stream verification) |
 | emulator top (Audio/Controller/…) | `kyty-emulator` | `todo` | | |
