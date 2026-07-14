@@ -38,6 +38,28 @@ pub mod string8;
 pub mod timer;
 pub mod vector;
 
+// Kyty `lib/Sys` port (Windows-targeted, thin FFI over win32 — see each
+// module's header doc). Ported in a prior batch but left undeclared here;
+// wired in now so they actually compile and test as part of the crate.
+#[cfg(windows)]
+pub mod sys_dbg;
+#[cfg(windows)]
+pub mod sys_file_io;
+#[cfg(windows)]
+pub mod sys_heap;
+#[cfg(windows)]
+pub mod sys_stdio;
+#[cfg(windows)]
+pub mod sys_stdlib;
+#[cfg(windows)]
+pub mod sys_swap_byte_order;
+#[cfg(windows)]
+pub mod sys_sync;
+#[cfg(windows)]
+pub mod sys_timer;
+#[cfg(windows)]
+pub mod sys_virtual;
+
 pub use array_wrapper::{Array, Array2, Array3};
 pub use byte_buffer::ByteBuffer;
 pub use date_time::{Date, DateTime, Jd, Time};

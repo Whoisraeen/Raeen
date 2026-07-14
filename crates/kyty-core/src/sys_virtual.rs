@@ -131,17 +131,11 @@ pub fn sys_virtual_init() {}
 fn cpu_brand_string() -> Vec<u8> {
     use std::arch::x86_64::__cpuid;
 
-    // SAFETY: CPUID leaves 0x8000_0002..=0x8000_0004 (the processor brand
-    // string) are available on every x86-64 CPU shipped since the early
-    // 2000s; `__cpuid` just executes the `cpuid` instruction and returns its
-    // four output registers verbatim, with no aliasing or lifetime hazards.
-    let leaves = unsafe {
-        [
-            __cpuid(0x8000_0002),
-            __cpuid(0x8000_0003),
-            __cpuid(0x8000_0004),
-        ]
-    };
+    // `__cpuid` is a safe intrinsic on this toolchain (the brand-string
+    // leaves 0x8000_0002..=0x8000_0004 are available on every x86-64 CPU
+    // shipped since the early 2000s; it just runs `cpuid` and returns the
+    // four output registers verbatim).
+    let leaves = [__cpuid(0x8000_0002), __cpuid(0x8000_0003), __cpuid(0x8000_0004)];
 
     let mut bytes = Vec::with_capacity(48);
     for leaf in leaves {
@@ -255,10 +249,10 @@ pub fn sys_virtual_alloc_aligned(address: u64, size: u64, mode: Mode, alignment:
         return 0;
     }
 
-    const SYSTEM_MANAGED_MIN: u64 = 0x0000_0400_00;
-    const SYSTEM_MANAGED_MAX: u64 = 0x07FF_FFBF_FF;
-    const USER_MIN: u64 = 0x1000_0000_00;
-    const USER_MAX: u64 = 0xFBFF_FFFF_FF;
+    const SYSTEM_MANAGED_MIN: u64 = 0x00_00_04_00_00;
+    const SYSTEM_MANAGED_MAX: u64 = 0x07_FF_FF_BF_FF;
+    const USER_MIN: u64 = 0x10_00_00_00_00;
+    const USER_MAX: u64 = 0xFB_FF_FF_FF_FF;
 
     let mut req = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: (if address == 0 {

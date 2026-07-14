@@ -120,7 +120,7 @@ impl SysCS {
     /// `Delete()` — tears the critical section down. Fatal unless it was
     /// `init()`-ed on `self` (`m_check_ptr != this`).
     pub fn delete(&self) {
-        exit_if!(self.check_ptr() != self as *const SysCS);
+        exit_if!(!std::ptr::eq(self.check_ptr(), self));
         unsafe {
             *self.check_ptr.get() = ptr::null();
             // SAFETY: `self.cs` was initialized by `init()` (checked above
@@ -132,7 +132,7 @@ impl SysCS {
     /// `Enter()` — blocking acquire (recursive: the same thread may call
     /// this more than once). Fatal unless initialized.
     pub fn enter(&self) {
-        exit_if!(self.check_ptr() != self as *const SysCS);
+        exit_if!(!std::ptr::eq(self.check_ptr(), self));
         // SAFETY: initialization checked above; `EnterCriticalSection` is
         // the documented Win32 API for acquiring the section.
         unsafe { EnterCriticalSection(self.cs.get()) };
@@ -142,7 +142,7 @@ impl SysCS {
     /// Fatal unless initialized.
     #[must_use]
     pub fn try_enter(&self) -> bool {
-        exit_if!(self.check_ptr() != self as *const SysCS);
+        exit_if!(!std::ptr::eq(self.check_ptr(), self));
         // SAFETY: initialization checked above.
         unsafe { TryEnterCriticalSection(self.cs.get()) != 0 }
     }
@@ -150,7 +150,7 @@ impl SysCS {
     /// `Leave()` — releases one level of acquisition. Fatal unless
     /// initialized.
     pub fn leave(&self) {
-        exit_if!(self.check_ptr() != self as *const SysCS);
+        exit_if!(!std::ptr::eq(self.check_ptr(), self));
         // SAFETY: initialization checked above.
         unsafe { LeaveCriticalSection(self.cs.get()) };
     }

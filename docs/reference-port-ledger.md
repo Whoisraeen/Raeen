@@ -43,7 +43,7 @@ Primary full port. Plan: `docs/superpowers/plans/2026-07-13-kyty-full-port.md`.
 | string8 / hashmap / timer / date_time | `kyty-core` | `done` | `c0639a7` | |
 | String / Compression | `kyty-core` | `done` | `c81fe71` | |
 | JsonReader / Language | `kyty-core` | `done` | `8c1e28f` | |
-| Sys (`sys_*.rs`) | `kyty-core` | `wip` | | in `kyty-core`, not separate crate |
+| Sys (`sys_*.rs`, 9 mods) | `kyty-core` | `done` | (sys-wire batch) | were orphaned (drafted, never declared in lib.rs → never compiled); wired in `#[cfg(windows)]`, lint-fixed, 92 tests now live |
 | CharUcd | `kyty-core` | `skip` | | use unicode crate; do not transliterate |
 | Database | `kyty-core` | `skip` | | defer rusqlite unless needed |
 | VirtualMemory / Threads / File / MemoryAlloc / MSpace | `kyty-core` | `todo` | | after Sys |

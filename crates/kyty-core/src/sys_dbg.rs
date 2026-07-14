@@ -43,13 +43,14 @@ use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{HANDLE, HMODULE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    RtlCaptureContext, RtlLookupFunctionEntry, RtlVirtualUnwind, SetUnhandledExceptionFilter, CONTEXT, EXCEPTION_EXECUTE_HANDLER,
-    EXCEPTION_POINTERS,
+    RtlCaptureContext, RtlLookupFunctionEntry, RtlVirtualUnwind, SetUnhandledExceptionFilter,
+    CONTEXT, EXCEPTION_EXECUTE_HANDLER, EXCEPTION_POINTERS,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleA;
 use windows_sys::Win32::System::Memory::{
-    VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
-    PAGE_NOACCESS, PAGE_NOCACHE, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+    VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_NOCACHE, PAGE_READONLY, PAGE_READWRITE,
+    PAGE_WRITECOPY,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -89,17 +90,34 @@ struct ModuleInfo {
 }
 
 unsafe extern "system" {
-    fn K32GetModuleInformation(h_process: HANDLE, h_module: HMODULE, lp_mod_info: *mut ModuleInfo, cb: u32) -> i32;
+    fn K32GetModuleInformation(
+        h_process: HANDLE,
+        h_module: HMODULE,
+        lp_mod_info: *mut ModuleInfo,
+        cb: u32,
+    ) -> i32;
 }
 
-const READABLE: u32 = PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY | PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY;
+const READABLE: u32 = PAGE_EXECUTE_READ
+    | PAGE_EXECUTE_READWRITE
+    | PAGE_EXECUTE_WRITECOPY
+    | PAGE_READONLY
+    | PAGE_READWRITE
+    | PAGE_WRITECOPY;
 const PROTECTED: u32 = PAGE_GUARD | PAGE_NOCACHE | PAGE_NOACCESS;
 
 static G_EXCEPTION_FILTER_FUNC: Mutex<Option<ExceptionFilterFunc>> = Mutex::new(None);
 
 /// `sys_mem_read_allowed` — true if `ptr` refers to committed, readable
 /// memory that is not guard/no-access/no-cache protected.
+///
+/// Deliberately a *safe* function taking a raw pointer, mirroring Kyty's
+/// `bool sys_mem_read_allowed(const void*)`: `VirtualQuery` only inspects
+/// the VA region metadata containing `ptr` and never dereferences it, so
+/// any address (valid or not) is a sound argument — which is the whole
+/// point of the query.
 #[must_use]
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // VirtualQuery inspects, never derefs, `ptr` (see doc + SAFETY below)
 pub fn sys_mem_read_allowed(ptr: *const c_void) -> bool {
     let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
 
@@ -109,7 +127,9 @@ pub fn sys_mem_read_allowed(ptr: *const c_void) -> bool {
     let s = unsafe { VirtualQuery(ptr, &mut mbi, size_of::<MEMORY_BASIC_INFORMATION>()) };
     crate::exit_if!(s == 0);
 
-    (mbi.Protect & PROTECTED) == 0 && (mbi.State & MEM_COMMIT) != 0 && (mbi.AllocationProtect & READABLE) != 0
+    (mbi.Protect & PROTECTED) == 0
+        && (mbi.State & MEM_COMMIT) != 0
+        && (mbi.AllocationProtect & READABLE) != 0
 }
 
 /// `sys_stack_walk` — walks the current call stack starting at the caller,
@@ -137,7 +157,8 @@ pub fn sys_stack_walk(stack: &mut [usize]) -> usize {
             frame += 1;
 
             let mut image_base: u64 = 0;
-            let runtime_function = RtlLookupFunctionEntry(context.Rip, &mut image_base, std::ptr::null_mut());
+            let runtime_function =
+                RtlLookupFunctionEntry(context.Rip, &mut image_base, std::ptr::null_mut());
             if runtime_function.is_null() {
                 break;
             }
@@ -168,7 +189,12 @@ pub fn sys_stack_walk(stack: &mut [usize]) -> usize {
 pub fn sys_stack_usage_print(stack: &SysDbgStackInfo) {
     println!(
         "stack: (0x{:x}, {}) + (0x{:x}, {}) + (0x{:x}, {})",
-        stack.reserved_addr, stack.reserved_size, stack.guard_addr, stack.guard_size, stack.commited_addr, stack.commited_size
+        stack.reserved_addr,
+        stack.reserved_size,
+        stack.guard_addr,
+        stack.guard_size,
+        stack.commited_addr,
+        stack.commited_size
     );
 }
 
@@ -186,7 +212,11 @@ pub fn sys_stack_usage(s: &mut SysDbgStackInfo) {
     // reported `RegionSize` — i.e. the start of the next VA region, which
     // `VirtualQuery` accepts for any address (committed or not).
     unsafe {
-        let ss = VirtualQuery(std::ptr::addr_of!(mbi).cast(), &mut mbi, size_of::<MEMORY_BASIC_INFORMATION>());
+        let ss = VirtualQuery(
+            std::ptr::addr_of!(mbi).cast(),
+            &mut mbi,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        );
         crate::exit_if!(ss == 0);
         let reserved = mbi.AllocationBase;
 
@@ -194,12 +224,20 @@ pub fn sys_stack_usage(s: &mut SysDbgStackInfo) {
         crate::exit_if!(ss == 0);
         let reserved_size = mbi.RegionSize;
 
-        let ss = VirtualQuery(reserved.cast::<u8>().add(reserved_size).cast(), &mut mbi, size_of::<MEMORY_BASIC_INFORMATION>());
+        let ss = VirtualQuery(
+            reserved.cast::<u8>().add(reserved_size).cast(),
+            &mut mbi,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        );
         crate::exit_if!(ss == 0);
         let guard_page = mbi.BaseAddress;
         let guard_page_size = mbi.RegionSize;
 
-        let ss = VirtualQuery(guard_page.cast::<u8>().add(guard_page_size).cast(), &mut mbi, size_of::<MEMORY_BASIC_INFORMATION>());
+        let ss = VirtualQuery(
+            guard_page.cast::<u8>().add(guard_page_size).cast(),
+            &mut mbi,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        );
         crate::exit_if!(ss == 0);
         let commited = mbi.BaseAddress;
         let commited_size = mbi.RegionSize;
@@ -227,7 +265,12 @@ pub fn sys_get_code_info(addr: &mut usize, size: &mut usize) {
     unsafe {
         let h_process = GetCurrentProcess();
         let h_module = GetModuleHandleA(std::ptr::null());
-        K32GetModuleInformation(h_process, h_module, &mut info, size_of::<ModuleInfo>() as u32);
+        K32GetModuleInformation(
+            h_process,
+            h_module,
+            &mut info,
+            size_of::<ModuleInfo>() as u32,
+        );
     }
 
     *addr = info.lp_base_of_dll as usize;
@@ -310,7 +353,10 @@ mod tests {
         assert_eq!(info.addr, info.reserved_addr);
         assert!(info.reserved_size > 0);
         assert!(info.guard_size > 0 || info.commited_size > 0);
-        assert_eq!(info.total_size, info.reserved_size + info.guard_size + info.commited_size);
+        assert_eq!(
+            info.total_size,
+            info.reserved_size + info.guard_size + info.commited_size
+        );
     }
 
     #[test]
@@ -361,6 +407,9 @@ mod tests {
         let result = unsafe { exception_filter(std::ptr::addr_of!(pointers)) };
 
         assert_eq!(result, EXCEPTION_EXECUTE_HANDLER);
-        assert_eq!(SEEN.load(Ordering::SeqCst), std::ptr::addr_of!(fake_addr) as usize);
+        assert_eq!(
+            SEEN.load(Ordering::SeqCst),
+            std::ptr::addr_of!(fake_addr) as usize
+        );
     }
 }

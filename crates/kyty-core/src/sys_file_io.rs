@@ -596,7 +596,7 @@ pub fn sys_file_flush(f: &mut SysFile) -> bool {
 /// `sys_file_get_last_access_time_utc(const String&)`.
 #[must_use]
 pub fn sys_file_get_last_access_time_utc(name: &String) -> SysFileTimeStruct {
-    let mut f = sys_file_open_r(name, SysFileCacheType::Auto);
+    let f = sys_file_open_r(name, SysFileCacheType::Auto);
     let mut result = SysFileTimeStruct { time: 0, is_invalid: true };
     if let SysFileRepr::File(handle) = f.repr {
         let mut ft = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
@@ -613,7 +613,7 @@ pub fn sys_file_get_last_access_time_utc(name: &String) -> SysFileTimeStruct {
 /// `sys_file_get_last_write_time_utc(const String&)`.
 #[must_use]
 pub fn sys_file_get_last_write_time_utc(name: &String) -> SysFileTimeStruct {
-    let mut f = sys_file_open_r(name, SysFileCacheType::Auto);
+    let f = sys_file_open_r(name, SysFileCacheType::Auto);
     let mut result = SysFileTimeStruct { time: 0, is_invalid: true };
     if let SysFileRepr::File(handle) = f.repr {
         let mut ft = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
@@ -630,7 +630,7 @@ pub fn sys_file_get_last_write_time_utc(name: &String) -> SysFileTimeStruct {
 /// returning `(access, write)` instead of writing through two out-params.
 #[must_use]
 pub fn sys_file_get_last_access_and_write_time_utc(name: &String) -> (SysFileTimeStruct, SysFileTimeStruct) {
-    let mut f = sys_file_open_r(name, SysFileCacheType::Auto);
+    let f = sys_file_open_r(name, SysFileCacheType::Auto);
     let mut access = SysFileTimeStruct { time: 0, is_invalid: true };
     let mut write = SysFileTimeStruct { time: 0, is_invalid: true };
     if let SysFileRepr::File(handle) = f.repr {
@@ -686,7 +686,7 @@ pub fn sys_file_set_last_access_time_utc(name: &String, access: &SysFileTimeStru
     if access.is_invalid {
         return false;
     }
-    let mut f = sys_file_open_w(name, SysFileCacheType::Auto);
+    let f = sys_file_open_w(name, SysFileCacheType::Auto);
     let ok = match f.repr {
         SysFileRepr::File(handle) => {
             let ft = u64_to_filetime(access.time);
@@ -705,7 +705,7 @@ pub fn sys_file_set_last_write_time_utc(name: &String, write: &SysFileTimeStruct
     if write.is_invalid {
         return false;
     }
-    let mut f = sys_file_open_w(name, SysFileCacheType::Auto);
+    let f = sys_file_open_w(name, SysFileCacheType::Auto);
     let ok = match f.repr {
         SysFileRepr::File(handle) => {
             let ft = u64_to_filetime(write.time);
@@ -728,7 +728,7 @@ pub fn sys_file_set_last_access_and_write_time_utc(
     if access.is_invalid || write.is_invalid {
         return false;
     }
-    let mut f = sys_file_open_w(name, SysFileCacheType::Auto);
+    let f = sys_file_open_w(name, SysFileCacheType::Auto);
     let ok = match f.repr {
         SysFileRepr::File(handle) => {
             let a = u64_to_filetime(access.time);
@@ -766,7 +766,7 @@ pub fn sys_file_find_files(path: &String, out: &mut Vector<SysFileFind>) {
     loop {
         let file_name = wide_z_to_string(&data.cFileName);
 
-        if file_name != String::from(".") && file_name != String::from("..") {
+        if file_name != "." && file_name != ".." {
             if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 {
                 sys_file_find_files(&(real_path.clone() + &file_name), out);
             } else {
