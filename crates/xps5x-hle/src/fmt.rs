@@ -57,7 +57,9 @@ pub(crate) fn read_cstr(mem: &dyn GuestMemory, addr: u64) -> Option<Vec<u8>> {
         out.push(byte[0]);
         off += 1;
         if off >= CSTR_MAX_SCAN {
-            warn!("read_cstr: string at {addr:#x} unterminated after {CSTR_MAX_SCAN} bytes; truncating");
+            warn!(
+                "read_cstr: string at {addr:#x} unterminated after {CSTR_MAX_SCAN} bytes; truncating"
+            );
             break;
         }
     }

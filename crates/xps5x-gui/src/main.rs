@@ -8,6 +8,7 @@ mod launcher;
 mod library;
 mod shell;
 mod theme;
+mod updater;
 
 use tracing::info;
 
@@ -53,7 +54,11 @@ fn main() -> anyhow::Result<()> {
         registry.register_module_exports(&module.name, &dynlib_data.exports);
         let linked = xps5x_firmware::link_module(&module, &dynlib_data, &registry, &hle, 0)?;
         println!("module: {}", module.name);
-        println!("imports: {}  exports: {}", dynlib_data.imports.len(), dynlib_data.exports.len());
+        println!(
+            "imports: {}  exports: {}",
+            dynlib_data.imports.len(),
+            dynlib_data.exports.len()
+        );
         println!(
             "resolved HLE trampolines: {}  unresolved: {}",
             linked.hle_trampolines.len(),
@@ -63,7 +68,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     info!("╔══════════════════════════════════════════════╗");
-    info!("║          XPS5X — PS5 Emulator v{}        ║", xps5x_core::VERSION);
+    info!(
+        "║          XPS5X — PS5 Emulator v{}        ║",
+        xps5x_core::VERSION
+    );
     info!("║        Cross-Platform Compatibility Layer     ║");
     info!("╚══════════════════════════════════════════════╝");
 
@@ -95,9 +103,15 @@ fn main() -> anyhow::Result<()> {
     let viewport = if config.general.fullscreen {
         viewport.with_fullscreen(true).with_decorations(false)
     } else {
-        viewport.with_inner_size([config.general.window_width as f32, config.general.window_height as f32])
+        viewport.with_inner_size([
+            config.general.window_width as f32,
+            config.general.window_height as f32,
+        ])
     };
-    let native_options = eframe::NativeOptions { viewport, ..Default::default() };
+    let native_options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
 
     eframe::run_native(
         "XPS5X",
@@ -105,7 +119,11 @@ fn main() -> anyhow::Result<()> {
         Box::new(|cc| {
             // Set dark theme.
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            Ok(Box::new(app::XPS5XApp::new(&cc.egui_ctx, config, config_path.to_path_buf())))
+            Ok(Box::new(app::XPS5XApp::new(
+                &cc.egui_ctx,
+                config,
+                config_path.to_path_buf(),
+            )))
         }),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {}", e))?;

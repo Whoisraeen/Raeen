@@ -28,10 +28,13 @@ pub fn decompress(
     match compression {
         CompressionType::None => Ok(data.to_vec()),
         CompressionType::Lz4 => {
-            debug!("LZ4 decompress: {} -> {} bytes", data.len(), uncompressed_size);
-            lz4_flex::decompress(data, uncompressed_size).map_err(|e| {
-                xps5x_core::error::IoError::DecompressionFailed(format!("LZ4: {}", e))
-            })
+            debug!(
+                "LZ4 decompress: {} -> {} bytes",
+                data.len(),
+                uncompressed_size
+            );
+            lz4_flex::decompress(data, uncompressed_size)
+                .map_err(|e| xps5x_core::error::IoError::DecompressionFailed(format!("LZ4: {}", e)))
         }
         CompressionType::Zstd => {
             debug!("Zstd decompress: {} bytes", data.len());

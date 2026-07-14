@@ -60,7 +60,10 @@ pub enum NavAction {
     OpenControlCenter,
     CloseControlCenter,
     /// Confirm selected `option` within Control Center card `card`.
-    ActivateOption { card: usize, option: usize },
+    ActivateOption {
+        card: usize,
+        option: usize,
+    },
     /// The Settings tile was confirmed on the Games rail.
     OpenSettings,
     /// Settings was left via Back — the caller should persist any changes.
@@ -69,11 +72,18 @@ pub enum NavAction {
     /// e.g. resolution scale, volume, deadzone, or the theme selector.
     /// `nav.rs` has no notion of what a row actually is; the caller maps
     /// `(section, row)` to a concrete field.
-    AdjustSetting { section: usize, row: usize, delta: i32 },
+    AdjustSetting {
+        section: usize,
+        row: usize,
+        delta: i32,
+    },
     /// The focused Settings row was confirmed — a bool toggle, or a
     /// semantic action (add/remove a game folder) only the caller knows how
     /// to interpret.
-    ActivateSetting { section: usize, row: usize },
+    ActivateSetting {
+        section: usize,
+        row: usize,
+    },
     /// The Home rail's active tab changed.
     SwitchTab(RailTab),
 }
@@ -199,7 +209,11 @@ impl NavState {
 
     /// Builder: wire up which Games-rail index opens Settings, and the
     /// per-section row-count table Settings navigation uses.
-    pub fn with_settings(mut self, settings_tile_index: Option<usize>, settings_row_counts: Vec<usize>) -> Self {
+    pub fn with_settings(
+        mut self,
+        settings_tile_index: Option<usize>,
+        settings_row_counts: Vec<usize>,
+    ) -> Self {
         self.settings_tile_index = settings_tile_index;
         self.settings_row_counts = settings_row_counts;
         self
@@ -213,7 +227,11 @@ impl NavState {
 
     /// Builder: wire up which Games-rail indices the Store and Library
     /// pills jump to on Confirm.
-    pub fn with_app_tiles(mut self, store_tile_index: Option<usize>, library_tile_index: Option<usize>) -> Self {
+    pub fn with_app_tiles(
+        mut self,
+        store_tile_index: Option<usize>,
+        library_tile_index: Option<usize>,
+    ) -> Self {
         self.store_tile_index = store_tile_index;
         self.library_tile_index = library_tile_index;
         self
@@ -227,8 +245,16 @@ impl NavState {
         if self.settings_section >= self.settings_row_counts.len() {
             self.settings_section = self.settings_row_counts.len().saturating_sub(1);
         }
-        let rows = self.settings_row_counts.get(self.settings_section).copied().unwrap_or(0);
-        self.settings_row = if rows == 0 { 0 } else { self.settings_row.min(rows - 1) };
+        let rows = self
+            .settings_row_counts
+            .get(self.settings_section)
+            .copied()
+            .unwrap_or(0);
+        self.settings_row = if rows == 0 {
+            0
+        } else {
+            self.settings_row.min(rows - 1)
+        };
     }
 
     /// Apply one input, mutating focus in place and returning the resulting
@@ -263,7 +289,10 @@ impl NavState {
     }
 
     fn focused_option_count(&self) -> usize {
-        self.cc_option_counts.get(self.cc_index).copied().unwrap_or(0)
+        self.cc_option_counts
+            .get(self.cc_index)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn apply_home(&mut self, input: NavInput) -> NavAction {
@@ -344,7 +373,8 @@ impl NavState {
                     self.settings_row = 0;
                     NavAction::OpenSettings
                 }
-                PILL_MORE | _ => NavAction::None, // "…" — decorative for now
+                PILL_MORE => NavAction::None, // "…" — decorative for now
+                _ => NavAction::None,
             },
             NavInput::Guide => {
                 self.mode = NavMode::ControlCenter;
@@ -362,7 +392,9 @@ impl NavState {
     /// that app's tile. A pill with no wired-up tile keeps pill focus and
     /// does nothing.
     fn jump_to_games_tile(&mut self, tile_index: Option<usize>) -> NavAction {
-        let Some(index) = tile_index else { return NavAction::None };
+        let Some(index) = tile_index else {
+            return NavAction::None;
+        };
         self.set_tab(RailTab::Games);
         self.rail_index = index.min(self.rail_len.saturating_sub(1));
         self.mode = NavMode::Home;
@@ -411,7 +443,10 @@ impl NavState {
             }
             NavInput::Up | NavInput::Down | NavInput::Tab => NavAction::None,
             NavInput::Confirm => {
-                let action = NavAction::ActivateOption { card: self.cc_index, option: self.cc_option_index };
+                let action = NavAction::ActivateOption {
+                    card: self.cc_index,
+                    option: self.cc_option_index,
+                };
                 self.mode = NavMode::ControlCenter;
                 action
             }
@@ -434,13 +469,21 @@ impl NavState {
                     self.settings_row -= 1;
                 } else if self.settings_section > 0 {
                     self.settings_section -= 1;
-                    let rows = self.settings_row_counts.get(self.settings_section).copied().unwrap_or(0);
+                    let rows = self
+                        .settings_row_counts
+                        .get(self.settings_section)
+                        .copied()
+                        .unwrap_or(0);
                     self.settings_row = rows.saturating_sub(1);
                 }
                 NavAction::None
             }
             NavInput::Down => {
-                let rows = self.settings_row_counts.get(self.settings_section).copied().unwrap_or(0);
+                let rows = self
+                    .settings_row_counts
+                    .get(self.settings_section)
+                    .copied()
+                    .unwrap_or(0);
                 if rows > 0 && self.settings_row + 1 < rows {
                     self.settings_row += 1;
                 } else if self.settings_section + 1 < section_count {
@@ -449,9 +492,20 @@ impl NavState {
                 }
                 NavAction::None
             }
-            NavInput::Left => NavAction::AdjustSetting { section: self.settings_section, row: self.settings_row, delta: -1 },
-            NavInput::Right => NavAction::AdjustSetting { section: self.settings_section, row: self.settings_row, delta: 1 },
-            NavInput::Confirm => NavAction::ActivateSetting { section: self.settings_section, row: self.settings_row },
+            NavInput::Left => NavAction::AdjustSetting {
+                section: self.settings_section,
+                row: self.settings_row,
+                delta: -1,
+            },
+            NavInput::Right => NavAction::AdjustSetting {
+                section: self.settings_section,
+                row: self.settings_row,
+                delta: 1,
+            },
+            NavInput::Confirm => NavAction::ActivateSetting {
+                section: self.settings_section,
+                row: self.settings_row,
+            },
             NavInput::Back => {
                 self.mode = NavMode::Home;
                 NavAction::CloseSettings
@@ -479,11 +533,46 @@ mod tests {
         }
 
         let cases = [
-            Case { name: "right moves forward", start_index: 0, rail_len: 5, input: NavInput::Right, expect_index: 1, expect_action: NavAction::None },
-            Case { name: "left clamps at zero", start_index: 0, rail_len: 5, input: NavInput::Left, expect_index: 0, expect_action: NavAction::None },
-            Case { name: "right clamps at the end", start_index: 4, rail_len: 5, input: NavInput::Right, expect_index: 4, expect_action: NavAction::None },
-            Case { name: "left moves backward", start_index: 3, rail_len: 5, input: NavInput::Left, expect_index: 2, expect_action: NavAction::None },
-            Case { name: "confirm launches focused index", start_index: 2, rail_len: 5, input: NavInput::Confirm, expect_index: 2, expect_action: NavAction::Launch(2) },
+            Case {
+                name: "right moves forward",
+                start_index: 0,
+                rail_len: 5,
+                input: NavInput::Right,
+                expect_index: 1,
+                expect_action: NavAction::None,
+            },
+            Case {
+                name: "left clamps at zero",
+                start_index: 0,
+                rail_len: 5,
+                input: NavInput::Left,
+                expect_index: 0,
+                expect_action: NavAction::None,
+            },
+            Case {
+                name: "right clamps at the end",
+                start_index: 4,
+                rail_len: 5,
+                input: NavInput::Right,
+                expect_index: 4,
+                expect_action: NavAction::None,
+            },
+            Case {
+                name: "left moves backward",
+                start_index: 3,
+                rail_len: 5,
+                input: NavInput::Left,
+                expect_index: 2,
+                expect_action: NavAction::None,
+            },
+            Case {
+                name: "confirm launches focused index",
+                start_index: 2,
+                rail_len: 5,
+                input: NavInput::Confirm,
+                expect_index: 2,
+                expect_action: NavAction::Launch(2),
+            },
         ];
 
         for case in cases {
@@ -522,11 +611,51 @@ mod tests {
         }
 
         let cases = [
-            Case { name: "right moves forward", start_index: 0, cc_len: 11, input: NavInput::Right, expect_index: 1, expect_action: NavAction::None, expect_mode: NavMode::ControlCenter },
-            Case { name: "left clamps at zero", start_index: 0, cc_len: 11, input: NavInput::Left, expect_index: 0, expect_action: NavAction::None, expect_mode: NavMode::ControlCenter },
-            Case { name: "right clamps at the end", start_index: 10, cc_len: 11, input: NavInput::Right, expect_index: 10, expect_action: NavAction::None, expect_mode: NavMode::ControlCenter },
-            Case { name: "escape (Back) closes", start_index: 4, cc_len: 11, input: NavInput::Back, expect_index: 4, expect_action: NavAction::CloseControlCenter, expect_mode: NavMode::Home },
-            Case { name: "guide toggles closed", start_index: 4, cc_len: 11, input: NavInput::Guide, expect_index: 4, expect_action: NavAction::CloseControlCenter, expect_mode: NavMode::Home },
+            Case {
+                name: "right moves forward",
+                start_index: 0,
+                cc_len: 11,
+                input: NavInput::Right,
+                expect_index: 1,
+                expect_action: NavAction::None,
+                expect_mode: NavMode::ControlCenter,
+            },
+            Case {
+                name: "left clamps at zero",
+                start_index: 0,
+                cc_len: 11,
+                input: NavInput::Left,
+                expect_index: 0,
+                expect_action: NavAction::None,
+                expect_mode: NavMode::ControlCenter,
+            },
+            Case {
+                name: "right clamps at the end",
+                start_index: 10,
+                cc_len: 11,
+                input: NavInput::Right,
+                expect_index: 10,
+                expect_action: NavAction::None,
+                expect_mode: NavMode::ControlCenter,
+            },
+            Case {
+                name: "escape (Back) closes",
+                start_index: 4,
+                cc_len: 11,
+                input: NavInput::Back,
+                expect_index: 4,
+                expect_action: NavAction::CloseControlCenter,
+                expect_mode: NavMode::Home,
+            },
+            Case {
+                name: "guide toggles closed",
+                start_index: 4,
+                cc_len: 11,
+                input: NavInput::Guide,
+                expect_index: 4,
+                expect_action: NavAction::CloseControlCenter,
+                expect_mode: NavMode::Home,
+            },
         ];
 
         for case in cases {
@@ -576,13 +705,72 @@ mod tests {
         let power_card = 2;
 
         let cases = [
-            Case { name: "confirm on the options card drills in", start_mode: NavMode::ControlCenter, start_option_index: 0, input: NavInput::Confirm, expect_mode: NavMode::ControlCenterOption, expect_option_index: 0, expect_action: NavAction::None },
-            Case { name: "right moves within options", start_mode: NavMode::ControlCenterOption, start_option_index: 0, input: NavInput::Right, expect_mode: NavMode::ControlCenterOption, expect_option_index: 1, expect_action: NavAction::None },
-            Case { name: "right clamps at the last option", start_mode: NavMode::ControlCenterOption, start_option_index: 2, input: NavInput::Right, expect_mode: NavMode::ControlCenterOption, expect_option_index: 2, expect_action: NavAction::None },
-            Case { name: "left clamps at zero", start_mode: NavMode::ControlCenterOption, start_option_index: 0, input: NavInput::Left, expect_mode: NavMode::ControlCenterOption, expect_option_index: 0, expect_action: NavAction::None },
-            Case { name: "confirm activates the selected option and returns to the card", start_mode: NavMode::ControlCenterOption, start_option_index: 1, input: NavInput::Confirm, expect_mode: NavMode::ControlCenter, expect_option_index: 1, expect_action: NavAction::ActivateOption { card: power_card, option: 1 } },
-            Case { name: "back leaves option mode without activating", start_mode: NavMode::ControlCenterOption, start_option_index: 1, input: NavInput::Back, expect_mode: NavMode::ControlCenter, expect_option_index: 1, expect_action: NavAction::None },
-            Case { name: "guide closes control center entirely from option mode", start_mode: NavMode::ControlCenterOption, start_option_index: 1, input: NavInput::Guide, expect_mode: NavMode::Home, expect_option_index: 1, expect_action: NavAction::CloseControlCenter },
+            Case {
+                name: "confirm on the options card drills in",
+                start_mode: NavMode::ControlCenter,
+                start_option_index: 0,
+                input: NavInput::Confirm,
+                expect_mode: NavMode::ControlCenterOption,
+                expect_option_index: 0,
+                expect_action: NavAction::None,
+            },
+            Case {
+                name: "right moves within options",
+                start_mode: NavMode::ControlCenterOption,
+                start_option_index: 0,
+                input: NavInput::Right,
+                expect_mode: NavMode::ControlCenterOption,
+                expect_option_index: 1,
+                expect_action: NavAction::None,
+            },
+            Case {
+                name: "right clamps at the last option",
+                start_mode: NavMode::ControlCenterOption,
+                start_option_index: 2,
+                input: NavInput::Right,
+                expect_mode: NavMode::ControlCenterOption,
+                expect_option_index: 2,
+                expect_action: NavAction::None,
+            },
+            Case {
+                name: "left clamps at zero",
+                start_mode: NavMode::ControlCenterOption,
+                start_option_index: 0,
+                input: NavInput::Left,
+                expect_mode: NavMode::ControlCenterOption,
+                expect_option_index: 0,
+                expect_action: NavAction::None,
+            },
+            Case {
+                name: "confirm activates the selected option and returns to the card",
+                start_mode: NavMode::ControlCenterOption,
+                start_option_index: 1,
+                input: NavInput::Confirm,
+                expect_mode: NavMode::ControlCenter,
+                expect_option_index: 1,
+                expect_action: NavAction::ActivateOption {
+                    card: power_card,
+                    option: 1,
+                },
+            },
+            Case {
+                name: "back leaves option mode without activating",
+                start_mode: NavMode::ControlCenterOption,
+                start_option_index: 1,
+                input: NavInput::Back,
+                expect_mode: NavMode::ControlCenter,
+                expect_option_index: 1,
+                expect_action: NavAction::None,
+            },
+            Case {
+                name: "guide closes control center entirely from option mode",
+                start_mode: NavMode::ControlCenterOption,
+                start_option_index: 1,
+                input: NavInput::Guide,
+                expect_mode: NavMode::Home,
+                expect_option_index: 1,
+                expect_action: NavAction::CloseControlCenter,
+            },
         ];
 
         for case in cases {
@@ -593,7 +781,11 @@ mod tests {
             let action = nav.apply(case.input);
             assert_eq!(action, case.expect_action, "case: {}", case.name);
             assert_eq!(nav.mode, case.expect_mode, "case: {}", case.name);
-            assert_eq!(nav.cc_option_index, case.expect_option_index, "case: {}", case.name);
+            assert_eq!(
+                nav.cc_option_index, case.expect_option_index,
+                "case: {}",
+                case.name
+            );
         }
     }
 
@@ -601,7 +793,8 @@ mod tests {
 
     #[test]
     fn confirm_on_the_settings_tile_opens_settings_instead_of_launching() {
-        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), vec![4, 3, 2, 3, 1, 1]);
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11])
+            .with_settings(Some(8), vec![4, 3, 2, 3, 1, 1]);
         nav.rail_index = 8;
         let action = nav.apply(NavInput::Confirm);
         assert_eq!(action, NavAction::OpenSettings);
@@ -641,35 +834,100 @@ mod tests {
         let counts = vec![4, 3, 2]; // three sections for this table
 
         let cases = [
-            Case { name: "down within a section", start_section: 0, start_row: 0, input: NavInput::Down, expect_section: 0, expect_row: 1 },
-            Case { name: "down at the last row of a section moves to the next section", start_section: 0, start_row: 3, input: NavInput::Down, expect_section: 1, expect_row: 0 },
-            Case { name: "down at the very last row clamps", start_section: 2, start_row: 1, input: NavInput::Down, expect_section: 2, expect_row: 1 },
-            Case { name: "up within a section", start_section: 1, start_row: 2, input: NavInput::Up, expect_section: 1, expect_row: 1 },
-            Case { name: "up at the first row of a section moves to the previous section's last row", start_section: 1, start_row: 0, input: NavInput::Up, expect_section: 0, expect_row: 3 },
-            Case { name: "up at the very first row clamps", start_section: 0, start_row: 0, input: NavInput::Up, expect_section: 0, expect_row: 0 },
+            Case {
+                name: "down within a section",
+                start_section: 0,
+                start_row: 0,
+                input: NavInput::Down,
+                expect_section: 0,
+                expect_row: 1,
+            },
+            Case {
+                name: "down at the last row of a section moves to the next section",
+                start_section: 0,
+                start_row: 3,
+                input: NavInput::Down,
+                expect_section: 1,
+                expect_row: 0,
+            },
+            Case {
+                name: "down at the very last row clamps",
+                start_section: 2,
+                start_row: 1,
+                input: NavInput::Down,
+                expect_section: 2,
+                expect_row: 1,
+            },
+            Case {
+                name: "up within a section",
+                start_section: 1,
+                start_row: 2,
+                input: NavInput::Up,
+                expect_section: 1,
+                expect_row: 1,
+            },
+            Case {
+                name: "up at the first row of a section moves to the previous section's last row",
+                start_section: 1,
+                start_row: 0,
+                input: NavInput::Up,
+                expect_section: 0,
+                expect_row: 3,
+            },
+            Case {
+                name: "up at the very first row clamps",
+                start_section: 0,
+                start_row: 0,
+                input: NavInput::Up,
+                expect_section: 0,
+                expect_row: 0,
+            },
         ];
 
         for case in cases {
-            let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), counts.clone());
+            let mut nav = NavState::with_cc_options(9, 11, vec![0; 11])
+                .with_settings(Some(8), counts.clone());
             nav.mode = NavMode::Settings;
             nav.settings_section = case.start_section;
             nav.settings_row = case.start_row;
             let action = nav.apply(case.input);
             assert_eq!(action, NavAction::None, "case: {}", case.name);
-            assert_eq!(nav.settings_section, case.expect_section, "case: {}", case.name);
+            assert_eq!(
+                nav.settings_section, case.expect_section,
+                "case: {}",
+                case.name
+            );
             assert_eq!(nav.settings_row, case.expect_row, "case: {}", case.name);
         }
     }
 
     #[test]
     fn settings_left_right_and_confirm_report_the_focused_row() {
-        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), vec![4, 3]);
+        let mut nav =
+            NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), vec![4, 3]);
         nav.mode = NavMode::Settings;
         nav.settings_section = 1;
         nav.settings_row = 2;
-        assert_eq!(nav.apply(NavInput::Right), NavAction::AdjustSetting { section: 1, row: 2, delta: 1 });
-        assert_eq!(nav.apply(NavInput::Left), NavAction::AdjustSetting { section: 1, row: 2, delta: -1 });
-        assert_eq!(nav.apply(NavInput::Confirm), NavAction::ActivateSetting { section: 1, row: 2 });
+        assert_eq!(
+            nav.apply(NavInput::Right),
+            NavAction::AdjustSetting {
+                section: 1,
+                row: 2,
+                delta: 1
+            }
+        );
+        assert_eq!(
+            nav.apply(NavInput::Left),
+            NavAction::AdjustSetting {
+                section: 1,
+                row: 2,
+                delta: -1
+            }
+        );
+        assert_eq!(
+            nav.apply(NavInput::Confirm),
+            NavAction::ActivateSetting { section: 1, row: 2 }
+        );
         // Adjusting/activating a row never itself leaves Settings.
         assert_eq!(nav.mode, NavMode::Settings);
     }
@@ -690,7 +948,8 @@ mod tests {
 
     #[test]
     fn set_settings_row_counts_clamps_focus_when_a_section_shrinks() {
-        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), vec![4, 3]);
+        let mut nav =
+            NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), vec![4, 3]);
         nav.mode = NavMode::Settings;
         nav.settings_section = 1;
         nav.settings_row = 2; // last row of a 3-row section
@@ -700,7 +959,8 @@ mod tests {
 
     #[test]
     fn set_settings_row_counts_clamps_section_when_the_section_count_shrinks() {
-        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), vec![4, 3, 2]);
+        let mut nav =
+            NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), vec![4, 3, 2]);
         nav.mode = NavMode::Settings;
         nav.settings_section = 2;
         nav.set_settings_row_counts(vec![4, 3]);
@@ -746,7 +1006,10 @@ mod tests {
         assert_eq!(nav.apply(NavInput::Right), NavAction::None);
         assert_eq!(nav.rail_index, 1);
         assert_eq!(nav.apply(NavInput::Right), NavAction::None);
-        assert_eq!(nav.rail_index, 1, "clamps at the Media rail's own length, not the Games rail's");
+        assert_eq!(
+            nav.rail_index, 1,
+            "clamps at the Media rail's own length, not the Games rail's"
+        );
     }
 
     #[test]
@@ -771,7 +1034,10 @@ mod tests {
         nav.apply(NavInput::Tab); // -> Media
         nav.apply(NavInput::Up);
         assert_eq!(nav.mode, NavMode::Pills);
-        assert_eq!(nav.pill_index, PILL_MEDIA, "pill focus starts on the pill matching the active tab");
+        assert_eq!(
+            nav.pill_index, PILL_MEDIA,
+            "pill focus starts on the pill matching the active tab"
+        );
     }
 
     /// Table-driven: pill-row movement and exits.
@@ -786,13 +1052,55 @@ mod tests {
         }
 
         let cases = [
-            Case { name: "right moves forward", start_pill: PILL_MY_GAMES, input: NavInput::Right, expect_pill: PILL_MEDIA, expect_mode: NavMode::Pills },
-            Case { name: "left moves backward", start_pill: PILL_MEDIA, input: NavInput::Left, expect_pill: PILL_MY_GAMES, expect_mode: NavMode::Pills },
-            Case { name: "left clamps at Store", start_pill: PILL_STORE, input: NavInput::Left, expect_pill: PILL_STORE, expect_mode: NavMode::Pills },
-            Case { name: "right clamps at the last pill", start_pill: PILL_MORE, input: NavInput::Right, expect_pill: PILL_MORE, expect_mode: NavMode::Pills },
-            Case { name: "down returns to the rail", start_pill: PILL_LIBRARY, input: NavInput::Down, expect_pill: PILL_LIBRARY, expect_mode: NavMode::Home },
-            Case { name: "back returns to the rail", start_pill: PILL_LIBRARY, input: NavInput::Back, expect_pill: PILL_LIBRARY, expect_mode: NavMode::Home },
-            Case { name: "up stays put", start_pill: PILL_STORE, input: NavInput::Up, expect_pill: PILL_STORE, expect_mode: NavMode::Pills },
+            Case {
+                name: "right moves forward",
+                start_pill: PILL_MY_GAMES,
+                input: NavInput::Right,
+                expect_pill: PILL_MEDIA,
+                expect_mode: NavMode::Pills,
+            },
+            Case {
+                name: "left moves backward",
+                start_pill: PILL_MEDIA,
+                input: NavInput::Left,
+                expect_pill: PILL_MY_GAMES,
+                expect_mode: NavMode::Pills,
+            },
+            Case {
+                name: "left clamps at Store",
+                start_pill: PILL_STORE,
+                input: NavInput::Left,
+                expect_pill: PILL_STORE,
+                expect_mode: NavMode::Pills,
+            },
+            Case {
+                name: "right clamps at the last pill",
+                start_pill: PILL_MORE,
+                input: NavInput::Right,
+                expect_pill: PILL_MORE,
+                expect_mode: NavMode::Pills,
+            },
+            Case {
+                name: "down returns to the rail",
+                start_pill: PILL_LIBRARY,
+                input: NavInput::Down,
+                expect_pill: PILL_LIBRARY,
+                expect_mode: NavMode::Home,
+            },
+            Case {
+                name: "back returns to the rail",
+                start_pill: PILL_LIBRARY,
+                input: NavInput::Back,
+                expect_pill: PILL_LIBRARY,
+                expect_mode: NavMode::Home,
+            },
+            Case {
+                name: "up stays put",
+                start_pill: PILL_STORE,
+                input: NavInput::Up,
+                expect_pill: PILL_STORE,
+                expect_mode: NavMode::Pills,
+            },
         ];
 
         for case in cases {
@@ -811,7 +1119,10 @@ mod tests {
         let mut nav = NavState::with_cc_options(5, 11, vec![0; 11]).with_media_rail_len(3);
         nav.mode = NavMode::Pills;
         nav.pill_index = PILL_MEDIA;
-        assert_eq!(nav.apply(NavInput::Confirm), NavAction::SwitchTab(RailTab::Media));
+        assert_eq!(
+            nav.apply(NavInput::Confirm),
+            NavAction::SwitchTab(RailTab::Media)
+        );
         assert_eq!(nav.mode, NavMode::Home);
         assert_eq!(nav.tab, RailTab::Media);
         assert_eq!(nav.rail_len, 3);
@@ -819,14 +1130,18 @@ mod tests {
 
         nav.apply(NavInput::Up);
         nav.pill_index = PILL_MY_GAMES;
-        assert_eq!(nav.apply(NavInput::Confirm), NavAction::SwitchTab(RailTab::Games));
+        assert_eq!(
+            nav.apply(NavInput::Confirm),
+            NavAction::SwitchTab(RailTab::Games)
+        );
         assert_eq!(nav.tab, RailTab::Games);
         assert_eq!(nav.rail_len, 5);
     }
 
     #[test]
     fn confirming_the_settings_pill_opens_settings() {
-        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), vec![4, 3]);
+        let mut nav =
+            NavState::with_cc_options(9, 11, vec![0; 11]).with_settings(Some(8), vec![4, 3]);
         nav.mode = NavMode::Pills;
         nav.pill_index = PILL_SETTINGS;
         assert_eq!(nav.apply(NavInput::Confirm), NavAction::OpenSettings);
@@ -837,7 +1152,9 @@ mod tests {
 
     #[test]
     fn confirming_store_and_library_pills_jumps_the_games_rail_to_their_tiles() {
-        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]).with_media_rail_len(3).with_app_tiles(Some(6), Some(7));
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11])
+            .with_media_rail_len(3)
+            .with_app_tiles(Some(6), Some(7));
         nav.apply(NavInput::Tab); // -> Media, to prove the jump also switches back
         nav.apply(NavInput::Up);
         nav.pill_index = PILL_STORE;
@@ -874,7 +1191,9 @@ mod tests {
     fn media_tab_confirm_ignores_the_games_tab_settings_tile_index() {
         // Settings tile is Games-rail index 1; on the Media tab, index 1
         // must never be diverted into Settings.
-        let mut nav = NavState::with_cc_options(5, 11, vec![0; 11]).with_settings(Some(1), vec![4]).with_media_rail_len(3);
+        let mut nav = NavState::with_cc_options(5, 11, vec![0; 11])
+            .with_settings(Some(1), vec![4])
+            .with_media_rail_len(3);
         nav.apply(NavInput::Tab); // -> Media
         nav.rail_index = 1;
         assert_eq!(nav.apply(NavInput::Confirm), NavAction::LaunchMedia(1));

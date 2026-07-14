@@ -218,9 +218,10 @@ fn parse_param_json(path: &std::path::Path) -> Result<PkgMetadata, LoaderError> 
                 metadata.content_id = value;
             }
         } else if line.contains("\"applicationCategoryType\"")
-            && let Some(value) = extract_json_string_value(line) {
-                metadata.category = value;
-            }
+            && let Some(value) = extract_json_string_value(line)
+        {
+            metadata.category = value;
+        }
     }
 
     Ok(metadata)
@@ -247,8 +248,16 @@ fn parse_param_sfo(path: &std::path::Path) -> Result<PkgMetadata, LoaderError> {
             break;
         }
 
-        let key_offset = u16::from_le_bytes(data[entry_offset..entry_offset + 2].try_into().unwrap_or([0; 2])) as usize;
-        let data_offset = u32::from_le_bytes(data[entry_offset + 12..entry_offset + 16].try_into().unwrap_or([0; 4])) as usize;
+        let key_offset = u16::from_le_bytes(
+            data[entry_offset..entry_offset + 2]
+                .try_into()
+                .unwrap_or([0; 2]),
+        ) as usize;
+        let data_offset = u32::from_le_bytes(
+            data[entry_offset + 12..entry_offset + 16]
+                .try_into()
+                .unwrap_or([0; 4]),
+        ) as usize;
 
         let key_start = key_table_offset + key_offset;
         let data_start = data_table_offset + data_offset;
@@ -258,19 +267,11 @@ fn parse_param_sfo(path: &std::path::Path) -> Result<PkgMetadata, LoaderError> {
         }
 
         // Read null-terminated key string.
-        let key_end = data[key_start..]
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(0)
-            + key_start;
+        let key_end = data[key_start..].iter().position(|&b| b == 0).unwrap_or(0) + key_start;
         let key = String::from_utf8_lossy(&data[key_start..key_end]).to_string();
 
         // Read null-terminated value string.
-        let value_end = data[data_start..]
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(0)
-            + data_start;
+        let value_end = data[data_start..].iter().position(|&b| b == 0).unwrap_or(0) + data_start;
         let value = String::from_utf8_lossy(&data[data_start..value_end]).to_string();
 
         match key.as_str() {
@@ -290,7 +291,9 @@ fn parse_param_sfo(path: &std::path::Path) -> Result<PkgMetadata, LoaderError> {
 fn extract_json_string_value(line: &str) -> Option<String> {
     // Find the value after the colon.
     let after_colon = line.split(':').nth(1)?;
-    let trimmed = after_colon.trim().trim_matches(|c| c == '"' || c == ',' || c == ' ');
+    let trimmed = after_colon
+        .trim()
+        .trim_matches(|c| c == '"' || c == ',' || c == ' ');
     if trimmed.is_empty() {
         None
     } else {

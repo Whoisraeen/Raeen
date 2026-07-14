@@ -46,13 +46,13 @@ pub enum Encoding {
     Vop2,
     Vop3,
     Vopc,
-    Vop3p,  // Packed math (FP16)
+    Vop3p, // Packed math (FP16)
     // Memory
-    Smem,   // Scalar memory
-    Mubuf,  // Untyped buffer
-    Mtbuf,  // Typed buffer
-    Mimg,   // Image (texture)
-    Flat,   // Flat/global/scratch memory
+    Smem,  // Scalar memory
+    Mubuf, // Untyped buffer
+    Mtbuf, // Typed buffer
+    Mimg,  // Image (texture)
+    Flat,  // Flat/global/scratch memory
     // Export
     Exp,
     // Special
@@ -182,9 +182,13 @@ fn classify_instruction(word: u32) -> (Encoding, u32, u32) {
         _ => {}
     };
 
-    if top4 == 0b1011 { return (Encoding::Sopk, (word >> 23) & 0x1F, 4) };
+    if top4 == 0b1011 {
+        return (Encoding::Sopk, (word >> 23) & 0x1F, 4);
+    };
 
-    if top2 == 0b10 { return (Encoding::Sop2, (word >> 23) & 0x7F, 4) };
+    if top2 == 0b10 {
+        return (Encoding::Sop2, (word >> 23) & 0x7F, 4);
+    };
 
     if top1 == 0 {
         // VOP1, VOP2, VOPC based on further bits.

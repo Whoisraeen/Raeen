@@ -204,9 +204,14 @@ pub fn decompress_lzma_str(buf: &[u8]) -> String8 {
 /// `CompressZip(const uint8_t* buf, uint32_t length, ZipCompressLevel level
 /// = ZIP_DEFAULT_LEVEL)` / `CompressZip(const ByteBuffer&, ZipCompressLevel)`.
 pub fn compress_zip(buf: &[u8], level: ZipCompressLevel) -> ByteBuffer {
-    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(level as u32));
-    encoder.write_all(buf).expect("kyty: zlib compression write failed");
-    let out = encoder.finish().expect("kyty: zlib compression finish failed");
+    let mut encoder =
+        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(level as u32));
+    encoder
+        .write_all(buf)
+        .expect("kyty: zlib compression write failed");
+    let out = encoder
+        .finish()
+        .expect("kyty: zlib compression finish failed");
     ByteBuffer::from(out)
 }
 
@@ -220,7 +225,9 @@ pub fn compress_zip_str(s: &String8, level: ZipCompressLevel) -> ByteBuffer {
 pub fn decompress_zip(buf: &[u8]) -> ByteBuffer {
     let mut decoder = flate2::read::ZlibDecoder::new(buf);
     let mut out = Vec::new();
-    decoder.read_to_end(&mut out).expect("kyty: zlib decompression failed");
+    decoder
+        .read_to_end(&mut out)
+        .expect("kyty: zlib decompression failed");
     ByteBuffer::from(out)
 }
 
@@ -650,7 +657,10 @@ mod tests {
     fn zstd_round_trip_default_level() {
         let data = b"the quick brown fox jumps over the lazy dog".repeat(20);
         let compressed = compress_zstd(&data, ZSTD_DEFAULT_LEVEL);
-        assert!(compressed.size() < data.len(), "repetitive data should shrink");
+        assert!(
+            compressed.size() < data.len(),
+            "repetitive data should shrink"
+        );
         let decompressed = decompress_zstd(compressed.get_data());
         assert_eq!(decompressed.get_data(), data.as_slice());
     }
@@ -735,7 +745,12 @@ mod tests {
     #[test]
     fn zip_round_trip_all_levels() {
         let data = b"zlib framed data zlib framed data zlib framed data".repeat(10);
-        for level in [ZIP_NO_COMPRESSION, ZIP_BEST_SPEED, ZIP_DEFAULT_LEVEL, ZIP_BEST_COMPRESSION] {
+        for level in [
+            ZIP_NO_COMPRESSION,
+            ZIP_BEST_SPEED,
+            ZIP_DEFAULT_LEVEL,
+            ZIP_BEST_COMPRESSION,
+        ] {
             let compressed = compress_zip(&data, level);
             let decompressed = decompress_zip(compressed.get_data());
             assert_eq!(decompressed.get_data(), data.as_slice(), "level {level}");
@@ -758,7 +773,10 @@ mod tests {
     fn zip_str_round_trip() {
         let s = String8::from("zip str payload");
         let compressed = compress_zip_str(&s, ZIP_DEFAULT_LEVEL);
-        assert_eq!(decompress_zip(compressed.get_data()).get_data(), s.as_bytes());
+        assert_eq!(
+            decompress_zip(compressed.get_data()).get_data(),
+            s.as_bytes()
+        );
     }
 
     // -------------------------------------------------------------
@@ -777,7 +795,9 @@ mod tests {
     fn lzf_round_trip_all_literal_no_repeats() {
         // Random-looking, non-repeating bytes: forces the pure literal-run
         // path (no back-references found).
-        let data: Vec<u8> = (0u32..500).map(|i| ((i.wrapping_mul(2654435761u32)) >> 24) as u8).collect();
+        let data: Vec<u8> = (0u32..500)
+            .map(|i| ((i.wrapping_mul(2654435761u32)) >> 24) as u8)
+            .collect();
         let compressed = compress_lzf(&data);
         let decompressed = decompress_lzf(compressed.get_data());
         assert_eq!(decompressed.get_data(), data.as_slice());
@@ -821,7 +841,10 @@ mod tests {
     fn lzf_str_round_trip() {
         let s = String8::from("lzf str payload lzf str payload lzf str payload");
         let compressed = compress_lzf_str(&s);
-        assert_eq!(decompress_lzf(compressed.get_data()).get_data(), s.as_bytes());
+        assert_eq!(
+            decompress_lzf(compressed.get_data()).get_data(),
+            s.as_bytes()
+        );
     }
 
     #[test]

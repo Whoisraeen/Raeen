@@ -4,10 +4,10 @@
 //! (Instruction Set Architecture). This module decodes those binary
 //! shaders and recompiles them to SPIR-V for the host Vulkan driver.
 
+pub mod cache;
 pub mod gcn_decoder;
 pub mod ir;
 pub mod spirv_emitter;
-pub mod cache;
 
 use tracing::{debug, info};
 
@@ -15,11 +15,11 @@ use tracing::{debug, info};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShaderType {
     Vertex,
-    Pixel,     // Fragment
+    Pixel, // Fragment
     Compute,
     Geometry,
-    Hull,      // Tessellation Control
-    Domain,    // Tessellation Evaluation
+    Hull,   // Tessellation Control
+    Domain, // Tessellation Evaluation
 }
 
 /// A recompiled shader ready for Vulkan pipeline creation.

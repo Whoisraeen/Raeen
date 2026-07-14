@@ -32,7 +32,9 @@ pub struct Array<T, const N: usize> {
 
 impl<T: Default, const N: usize> Default for Array<T, N> {
     fn default() -> Self {
-        Self { data: std::array::from_fn(|_| T::default()) }
+        Self {
+            data: std::array::from_fn(|_| T::default()),
+        }
     }
 }
 
@@ -137,7 +139,8 @@ pub type Array2<T, const N1: usize, const N2: usize> = Array<Array<T, N2>, N1>;
 
 /// Kyty: `Kyty::Core::Array3<Type, Num1, Num2, Num3>` — an array of arrays of
 /// arrays.
-pub type Array3<T, const N1: usize, const N2: usize, const N3: usize> = Array<Array<Array<T, N3>, N2>, N1>;
+pub type Array3<T, const N1: usize, const N2: usize, const N3: usize> =
+    Array<Array<Array<T, N3>, N2>, N1>;
 
 #[cfg(test)]
 mod tests {

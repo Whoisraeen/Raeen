@@ -11,8 +11,8 @@
 //! them into the emulated PS5 virtual address space.
 
 pub mod elf;
-pub mod self_format;
 pub mod pkg;
+pub mod self_format;
 
 use xps5x_core::types::VAddr;
 

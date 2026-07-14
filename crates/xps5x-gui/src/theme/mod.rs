@@ -134,8 +134,16 @@ pub fn install_fonts(ctx: &egui::Context, theme: &Theme) {
         let name = "xps5x-theme-font".to_string();
         let data = egui::FontData::from_owned(font_bytes.to_vec());
         fonts.font_data.insert(name.clone(), Arc::new(data));
-        fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, name.clone());
-        fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, name);
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, name.clone());
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, name);
     }
     ctx.set_fonts(fonts);
 }
@@ -174,7 +182,10 @@ pub fn default_theme() -> Theme {
             cc_item_size: 56.0,
             cc_item_gap: 14.0,
         },
-        assets: ThemeAssets { font: None, background: None },
+        assets: ThemeAssets {
+            font: None,
+            background: None,
+        },
     }
 }
 

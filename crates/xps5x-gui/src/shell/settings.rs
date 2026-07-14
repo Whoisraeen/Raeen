@@ -24,13 +24,21 @@ use std::path::Path;
 use xps5x_core::config::EmulatorConfig;
 
 /// Section names, in the order `nav::NavState::settings_section` indexes.
-pub const SETTINGS_SECTION_NAMES: [&str; 6] = ["Video", "Audio", "Input", "Game Folders", "Key Provider", "Theme"];
+pub const SETTINGS_SECTION_NAMES: [&str; 7] = [
+    "Video",
+    "Audio",
+    "Input",
+    "Game Folders",
+    "Key Provider",
+    "Theme",
+    "System",
+];
 
 /// Number of rows in each section, in `SETTINGS_SECTION_NAMES` order. The
 /// Game Folders section grows by one row per configured folder plus a
 /// trailing "Add Folder" row, so this takes the current folder count.
 pub fn settings_row_counts(game_folder_count: usize) -> Vec<usize> {
-    vec![4, 3, 2, game_folder_count + 1, 1, 1]
+    vec![4, 3, 2, game_folder_count + 1, 1, 1, 2]
 }
 
 /// Step `value` by `delta` steps of size `step`, clamped to `[min, max]`.
@@ -56,15 +64,34 @@ fn on_off(b: bool) -> &'static str {
 
 /// Draw one row: a focus-highlighted label on the left, its current value
 /// dimmed on the right.
-fn row(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, row_index: usize, label: &str, value: String) {
+fn row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    nav: &NavState,
+    row_index: usize,
+    label: &str,
+    value: String,
+) {
     let focused = nav.settings_row == row_index;
-    let color = if focused { theme.palette.focus } else { theme.palette.text };
+    let color = if focused {
+        theme.palette.focus
+    } else {
+        theme.palette.text
+    };
     let prefix = if focused { "\u{25B6} " } else { "   " };
     ui.horizontal(|ui| {
         ui.set_width(500.0);
-        ui.label(RichText::new(format!("{prefix}{label}")).color(color).size(15.0));
+        ui.label(
+            RichText::new(format!("{prefix}{label}"))
+                .color(color)
+                .size(15.0),
+        );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(value).color(theme.palette.text_dim).size(14.0));
+            ui.label(
+                RichText::new(value)
+                    .color(theme.palette.text_dim)
+                    .size(14.0),
+            );
         });
     });
     ui.add_space(10.0);
@@ -81,6 +108,7 @@ pub fn draw(
     config: &EmulatorConfig,
     new_folder_input: &mut String,
     key_provider_input: &mut String,
+    updater: &crate::updater::UpdaterState,
 ) {
     let screen = ui.max_rect();
     ui.painter().rect_filled(screen, 0.0, theme.palette.ground);
@@ -89,7 +117,12 @@ pub fn draw(
         ui.add_space(28.0);
         ui.horizontal(|ui| {
             ui.add_space(54.0);
-            ui.label(RichText::new("SETTINGS").color(theme.palette.text).size(28.0).strong());
+            ui.label(
+                RichText::new("SETTINGS")
+                    .color(theme.palette.text)
+                    .size(28.0)
+                    .strong(),
+            );
         });
         ui.add_space(24.0);
 
@@ -100,7 +133,11 @@ pub fn draw(
                 ui.set_width(200.0);
                 for (i, name) in SETTINGS_SECTION_NAMES.iter().enumerate() {
                     let focused = i == nav.settings_section;
-                    let color = if focused { theme.palette.focus } else { theme.palette.text_dim };
+                    let color = if focused {
+                        theme.palette.focus
+                    } else {
+                        theme.palette.text_dim
+                    };
                     ui.label(RichText::new(*name).color(color).size(17.0).strong());
                     ui.add_space(16.0);
                 }
@@ -117,6 +154,7 @@ pub fn draw(
                     3 => draw_game_folders(ui, theme, nav, config, new_folder_input),
                     4 => draw_key_provider(ui, theme, nav, key_provider_input),
                     5 => draw_theme(ui, theme, nav, config),
+                    6 => draw_system(ui, theme, nav, updater),
                     _ => {}
                 }
             });
@@ -135,48 +173,140 @@ pub fn draw(
 }
 
 fn draw_video(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, config: &EmulatorConfig) {
-    row(ui, theme, nav, 0, "Resolution Scale", format!("{:.2}x", config.graphics.resolution_scale));
-    row(ui, theme, nav, 1, "Fullscreen", on_off(config.general.fullscreen).to_string());
-    row(ui, theme, nav, 2, "Shader Cache", on_off(config.graphics.shader_cache).to_string());
-    row(ui, theme, nav, 3, "Validation Layers", on_off(config.graphics.validation_layers).to_string());
+    row(
+        ui,
+        theme,
+        nav,
+        0,
+        "Resolution Scale",
+        format!("{:.2}x", config.graphics.resolution_scale),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        1,
+        "Fullscreen",
+        on_off(config.general.fullscreen).to_string(),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        2,
+        "Shader Cache",
+        on_off(config.graphics.shader_cache).to_string(),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        3,
+        "Validation Layers",
+        on_off(config.graphics.validation_layers).to_string(),
+    );
 }
 
 fn draw_audio(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, config: &EmulatorConfig) {
-    row(ui, theme, nav, 0, "Audio Enabled", on_off(config.audio.enabled).to_string());
-    row(ui, theme, nav, 1, "Master Volume", format!("{}%", (config.audio.volume * 100.0).round() as i32));
-    row(ui, theme, nav, 2, "Spatial Audio", on_off(config.audio.spatial_audio).to_string());
+    row(
+        ui,
+        theme,
+        nav,
+        0,
+        "Audio Enabled",
+        on_off(config.audio.enabled).to_string(),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        1,
+        "Master Volume",
+        format!("{}%", (config.audio.volume * 100.0).round() as i32),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        2,
+        "Spatial Audio",
+        on_off(config.audio.spatial_audio).to_string(),
+    );
 }
 
 fn draw_input(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, config: &EmulatorConfig) {
-    row(ui, theme, nav, 0, "DualSense Features", on_off(config.input.dualsense_features).to_string());
-    row(ui, theme, nav, 1, "Stick Deadzone", format!("{:.2}", config.input.deadzone));
+    row(
+        ui,
+        theme,
+        nav,
+        0,
+        "DualSense Features",
+        on_off(config.input.dualsense_features).to_string(),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        1,
+        "Stick Deadzone",
+        format!("{:.2}", config.input.deadzone),
+    );
 }
 
-fn draw_game_folders(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, config: &EmulatorConfig, new_folder_input: &mut String) {
+fn draw_game_folders(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    nav: &NavState,
+    config: &EmulatorConfig,
+    new_folder_input: &mut String,
+) {
     for (i, path) in config.paths.game_folders.iter().enumerate() {
         row(ui, theme, nav, i, "Folder", path.display().to_string());
     }
     let add_row = config.paths.game_folders.len();
     let focused = nav.settings_row == add_row;
-    let color = if focused { theme.palette.focus } else { theme.palette.text };
+    let color = if focused {
+        theme.palette.focus
+    } else {
+        theme.palette.text
+    };
     let prefix = if focused { "\u{25B6} " } else { "   " };
     ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("{prefix}Add Folder")).color(color).size(15.0));
+        ui.label(
+            RichText::new(format!("{prefix}Add Folder"))
+                .color(color)
+                .size(15.0),
+        );
         ui.text_edit_singleline(new_folder_input);
     });
     ui.add_space(10.0);
     ui.label(
-        RichText::new("Confirm on a folder row removes it; Confirm on \"Add Folder\" adds the typed path.")
-            .color(theme.palette.text_faint)
-            .size(12.0),
+        RichText::new(
+            "Confirm on a folder row removes it; Confirm on \"Add Folder\" adds the typed path.",
+        )
+        .color(theme.palette.text_faint)
+        .size(12.0),
     );
 }
 
-fn draw_key_provider(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, key_provider_input: &mut String) {
+fn draw_key_provider(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    nav: &NavState,
+    key_provider_input: &mut String,
+) {
     let focused = nav.settings_row == 0;
-    let color = if focused { theme.palette.focus } else { theme.palette.text };
+    let color = if focused {
+        theme.palette.focus
+    } else {
+        theme.palette.text
+    };
     let prefix = if focused { "\u{25B6} " } else { "   " };
-    ui.label(RichText::new(format!("{prefix}KeyProvider Path")).color(color).size(15.0));
+    ui.label(
+        RichText::new(format!("{prefix}KeyProvider Path"))
+            .color(color)
+            .size(15.0),
+    );
     ui.add_space(6.0);
     ui.text_edit_singleline(key_provider_input);
     ui.add_space(10.0);
@@ -189,12 +319,53 @@ fn draw_key_provider(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, key_provi
 
 fn draw_theme(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, config: &EmulatorConfig) {
     let focused = nav.settings_row == 0;
-    let color = if focused { theme.palette.focus } else { theme.palette.text };
+    let color = if focused {
+        theme.palette.focus
+    } else {
+        theme.palette.text
+    };
     let prefix = if focused { "\u{25B6} " } else { "   " };
-    ui.label(RichText::new(format!("{prefix}Theme: {}", config.general.selected_theme)).color(color).size(15.0));
+    ui.label(
+        RichText::new(format!("{prefix}Theme: {}", config.general.selected_theme))
+            .color(color)
+            .size(15.0),
+    );
     ui.add_space(10.0);
     ui.label(
         RichText::new("Left/Right or Confirm cycles installed themes (themes/<name>/theme.toml).")
+            .color(theme.palette.text_faint)
+            .size(12.0),
+    );
+}
+
+/// System section: current version + the updater's single action row
+/// ("Check for Updates" → "Download Update" → "Restart & Update" depending
+/// on [`crate::updater::UpdaterState`]).
+fn draw_system(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    nav: &NavState,
+    updater: &crate::updater::UpdaterState,
+) {
+    row(
+        ui,
+        theme,
+        nav,
+        0,
+        "Version",
+        format!("v{}", xps5x_core::VERSION),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        1,
+        updater.action_label(),
+        updater.status_line(),
+    );
+    ui.add_space(10.0);
+    ui.label(
+        RichText::new("Updates are fetched from GitHub Releases and applied on restart.")
             .color(theme.palette.text_faint)
             .size(12.0),
     );
@@ -223,6 +394,7 @@ mod tests {
         assert_eq!(counts[2], 2); // Input
         assert_eq!(counts[4], 1); // Key Provider
         assert_eq!(counts[5], 1); // Theme
+        assert_eq!(counts[6], 2); // System (version + updater action)
     }
 
     #[test]

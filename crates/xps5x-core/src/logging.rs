@@ -3,7 +3,7 @@
 //! Initializes the `tracing` subscriber with configurable log levels,
 //! optional file output, and structured formatting.
 
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 /// Initialize the global tracing subscriber.
 ///
@@ -15,8 +15,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 /// xps5x_core::logging::init("info");
 /// ```
 pub fn init(level: &str) {
-    let env_filter = EnvFilter::try_from_env("XPS5X_LOG")
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let env_filter = EnvFilter::try_from_env("XPS5X_LOG").unwrap_or_else(|_| EnvFilter::new(level));
 
     let subscriber = fmt::Subscriber::builder()
         .with_env_filter(env_filter)
@@ -37,8 +36,7 @@ pub fn init(level: &str) {
 pub fn init_with_file(level: &str, log_dir: &std::path::Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(log_dir)?;
 
-    let env_filter = EnvFilter::try_from_env("XPS5X_LOG")
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let env_filter = EnvFilter::try_from_env("XPS5X_LOG").unwrap_or_else(|_| EnvFilter::new(level));
 
     let file_appender = tracing_appender::rolling::daily(log_dir, "xps5x.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
@@ -53,6 +51,9 @@ pub fn init_with_file(level: &str, log_dir: &std::path::Path) -> anyhow::Result<
     tracing::subscriber::set_global_default(subscriber)
         .expect("Failed to set global tracing subscriber");
 
-    tracing::info!("XPS5X v{} — PS5 Emulator initialized (file logging)", crate::VERSION);
+    tracing::info!(
+        "XPS5X v{} — PS5 Emulator initialized (file logging)",
+        crate::VERSION
+    );
     Ok(())
 }

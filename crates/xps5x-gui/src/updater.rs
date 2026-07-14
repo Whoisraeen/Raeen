@@ -409,8 +409,10 @@ mod tests {
         let staged = Path::new(r"C:\apps\xps5x\xps5x.exe.update");
         let script = swap_script(exe, staged, 4242);
         assert!(script.contains("PID eq 4242"));
-        assert!(script
-            .contains(r#"move /Y "C:\apps\xps5x\xps5x.exe.update" "C:\apps\xps5x\xps5x.exe""#));
+        assert!(
+            script
+                .contains(r#"move /Y "C:\apps\xps5x\xps5x.exe.update" "C:\apps\xps5x\xps5x.exe""#)
+        );
         assert!(script.contains(r#"start "" "C:\apps\xps5x\xps5x.exe""#));
         assert!(script.contains("del \"%~f0\""));
     }

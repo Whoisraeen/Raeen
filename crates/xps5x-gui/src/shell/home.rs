@@ -19,7 +19,9 @@
 use super::anim::lerp_color;
 use super::icons::{self, Glyph};
 use super::nav::{self, NavMode, NavState, RailTab};
-use crate::library::{ArtSource, GlyphKind, Gradient, ItemKind, LibraryItem, MetaCache, TileGradient};
+use crate::library::{
+    ArtSource, GlyphKind, Gradient, ItemKind, LibraryItem, MetaCache, TileGradient,
+};
 use crate::theme::Theme;
 use egui::epaint::RectShape;
 use egui::{Align2, Color32, FontId, Mesh, Pos2, Rect, Shape, Stroke, StrokeKind, vec2};
@@ -82,12 +84,20 @@ pub fn draw(
     draw_rail(ui, theme, rail_rect, items, nav, anim, covers);
 
     let focused = items.get(nav.rail_index);
-    draw_context_block(&painter, theme, screen, rail_rect.top() + focused_size, focused, meta_cache);
+    draw_context_block(
+        &painter,
+        theme,
+        screen,
+        rail_rect.top() + focused_size,
+        focused,
+        meta_cache,
+    );
     draw_bottom_bar(&painter, theme, screen);
 
     // The focus ring pulses and the clock ticks even when nothing else is
     // animating, so keep the screen gently alive.
-    ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(50));
 }
 
 /// Paint the Home hero. When the active theme provides a background image
@@ -95,7 +105,13 @@ pub fn draw(
 /// fill `rect` instead of the original mesh-gradient art; either way, the
 /// legibility scrim on top is unconditional so foreground text stays
 /// readable.
-fn draw_hero(painter: &egui::Painter, rect: Rect, theme: &Theme, g: &Gradient, background: Option<&egui::TextureHandle>) {
+fn draw_hero(
+    painter: &egui::Painter,
+    rect: Rect,
+    theme: &Theme,
+    g: &Gradient,
+    background: Option<&egui::TextureHandle>,
+) {
     match background {
         Some(texture) => {
             let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
@@ -108,7 +124,14 @@ fn draw_hero(painter: &egui::Painter, rect: Rect, theme: &Theme, g: &Gradient, b
             let top_left = lerp_color(g.hi, g.mid, 0.55);
             let bottom_right = lerp_color(g.mid, g.lo, 0.4);
             let bottom_left = g.lo;
-            corner_gradient(painter, rect, top_left, top_right, bottom_left, bottom_right);
+            corner_gradient(
+                painter,
+                rect,
+                top_left,
+                top_right,
+                bottom_left,
+                bottom_right,
+            );
         }
     }
 
@@ -127,7 +150,14 @@ fn with_alpha(c: Color32, a: f32) -> Color32 {
 
 /// Paint a rect filled with a bilinear 4-corner gradient. egui has no CSS
 /// gradients, so this builds a two-triangle mesh with per-vertex colors.
-fn corner_gradient(painter: &egui::Painter, rect: Rect, top_left: Color32, top_right: Color32, bottom_left: Color32, bottom_right: Color32) {
+fn corner_gradient(
+    painter: &egui::Painter,
+    rect: Rect,
+    top_left: Color32,
+    top_right: Color32,
+    bottom_left: Color32,
+    bottom_right: Color32,
+) {
     let mut mesh = Mesh::default();
     let i0 = mesh.vertices.len() as u32;
     mesh.colored_vertex(rect.left_top(), top_left);
@@ -148,13 +178,28 @@ fn tile_gradient_rect(painter: &egui::Painter, rect: Rect, rounding: f32, g: &Ti
 /// painting the gradient then re-cutting the corners with the background —
 /// cheaper: we approximate by painting a rounded rect fill first (base
 /// color) and layering the gradient mesh with the same rounding via clip.
-fn corner_gradient_rounded(painter: &egui::Painter, rect: Rect, rounding: f32, top_left: Color32, top_right: Color32, bottom_left: Color32, bottom_right: Color32) {
+fn corner_gradient_rounded(
+    painter: &egui::Painter,
+    rect: Rect,
+    rounding: f32,
+    top_left: Color32,
+    top_right: Color32,
+    bottom_left: Color32,
+    bottom_right: Color32,
+) {
     let clip = painter.clip_rect();
     let clipped = painter.with_clip_rect(rect.intersect(clip));
     // Rounded base so corners outside the rounded silhouette stay transparent-looking
     // against whatever is already painted behind (the rail background).
     clipped.rect_filled(rect, rounding, bottom_left);
-    corner_gradient(&clipped, rect, top_left, top_right, bottom_left, bottom_right);
+    corner_gradient(
+        &clipped,
+        rect,
+        top_left,
+        top_right,
+        bottom_left,
+        bottom_right,
+    );
     clipped.rect_stroke(rect, rounding, Stroke::NONE, StrokeKind::Inside);
 }
 
@@ -168,8 +213,18 @@ fn draw_topbar(painter: &egui::Painter, theme: &Theme, screen: Rect) {
     // Avatar.
     let av_c = Pos2::new(screen.left() + margin + av_r, center_y);
     painter.circle_filled(av_c, av_r, theme.palette.accent);
-    painter.circle_stroke(av_c, av_r, Stroke::new(1.5, with_alpha(theme.palette.focus, 0.85)));
-    painter.text(av_c, Align2::CENTER_CENTER, "X5", FontId::proportional(17.0), theme.palette.text);
+    painter.circle_stroke(
+        av_c,
+        av_r,
+        Stroke::new(1.5, with_alpha(theme.palette.focus, 0.85)),
+    );
+    painter.text(
+        av_c,
+        Align2::CENTER_CENTER,
+        "X5",
+        FontId::proportional(17.0),
+        theme.palette.text,
+    );
 
     // Profile name + trophy count.
     let name_x = av_c.x + av_r + 14.0;
@@ -181,7 +236,13 @@ fn draw_topbar(painter: &egui::Painter, theme: &Theme, screen: Rect) {
         theme.palette.text,
     );
     let sub_y = screen.top() + AVATAR_TOP + 39.0;
-    icons::draw(painter, Glyph::Trophy, Pos2::new(name_x + 7.0, sub_y), 14.0, GOLD);
+    icons::draw(
+        painter,
+        Glyph::Trophy,
+        Pos2::new(name_x + 7.0, sub_y),
+        14.0,
+        GOLD,
+    );
     painter.text(
         Pos2::new(name_x + 20.0, sub_y),
         Align2::LEFT_CENTER,
@@ -191,17 +252,40 @@ fn draw_topbar(painter: &egui::Painter, theme: &Theme, screen: Rect) {
     );
 
     // Center status glyphs.
-    for (i, glyph) in [Glyph::Info, Glyph::Pad, Glyph::Trophy].into_iter().enumerate() {
+    for (i, glyph) in [Glyph::Info, Glyph::Pad, Glyph::Trophy]
+        .into_iter()
+        .enumerate()
+    {
         let x = screen.center().x + (i as f32 - 1.0) * 56.0;
-        icons::draw(painter, glyph, Pos2::new(x, center_y), 20.0, theme.palette.text_dim);
+        icons::draw(
+            painter,
+            glyph,
+            Pos2::new(x, center_y),
+            20.0,
+            theme.palette.text_dim,
+        );
     }
 
     // Wifi + clock (right-most), local time.
-    let time_galley = painter.layout_no_wrap(current_clock_string(), FontId::proportional(19.0), theme.palette.text);
+    let time_galley = painter.layout_no_wrap(
+        current_clock_string(),
+        FontId::proportional(19.0),
+        theme.palette.text,
+    );
     let time_size = time_galley.size();
     let time_x = screen.right() - margin - time_size.x;
-    painter.galley(Pos2::new(time_x, center_y - time_size.y / 2.0), time_galley, theme.palette.text);
-    icons::draw(painter, Glyph::Network, Pos2::new(time_x - 26.0, center_y), 20.0, theme.palette.text_dim);
+    painter.galley(
+        Pos2::new(time_x, center_y - time_size.y / 2.0),
+        time_galley,
+        theme.palette.text,
+    );
+    icons::draw(
+        painter,
+        Glyph::Network,
+        Pos2::new(time_x - 26.0, center_y),
+        20.0,
+        theme.palette.text_dim,
+    );
 }
 
 /// Pill tab row: an icon pill, then Store / My games / Media / Library /
@@ -218,7 +302,13 @@ fn draw_nav_pills(painter: &egui::Painter, theme: &Theme, screen: Rect, nav: &Na
     // Leading icon-only pill (decorative, not focusable — see `nav::PILL_*`).
     let icon_rect = Rect::from_min_size(Pos2::new(x, y), vec2(PILL_H, PILL_H));
     painter.rect_filled(icon_rect, PILL_H / 2.0, inactive_bg);
-    icons::draw(painter, Glyph::Grid, icon_rect.center(), 16.0, theme.palette.text_dim);
+    icons::draw(
+        painter,
+        Glyph::Grid,
+        icon_rect.center(),
+        16.0,
+        theme.palette.text_dim,
+    );
     x += PILL_H + PILL_GAP;
 
     // Label order must match the `nav::PILL_*` focus indices.
@@ -233,8 +323,13 @@ fn draw_nav_pills(painter: &egui::Painter, theme: &Theme, screen: Rect, nav: &Na
     debug_assert_eq!(labels.len(), nav::PILL_COUNT);
     for (i, (label, active)) in labels.into_iter().enumerate() {
         let focused = nav.mode == NavMode::Pills && i == nav.pill_index;
-        let text_color = if active { theme.palette.ground } else { theme.palette.text_dim };
-        let galley = painter.layout_no_wrap(label.to_string(), FontId::proportional(15.0), text_color);
+        let text_color = if active {
+            theme.palette.ground
+        } else {
+            theme.palette.text_dim
+        };
+        let galley =
+            painter.layout_no_wrap(label.to_string(), FontId::proportional(15.0), text_color);
         let galley_size = galley.size();
         let w = galley_size.x + 40.0;
         let rect = Rect::from_min_size(Pos2::new(x, y), vec2(w, PILL_H));
@@ -248,7 +343,12 @@ fn draw_nav_pills(painter: &egui::Painter, theme: &Theme, screen: Rect, nav: &Na
         painter.rect_filled(rect, PILL_H / 2.0, bg);
         if focused {
             let ring = rect.expand(4.0);
-            painter.rect_stroke(ring, ring.height() / 2.0, Stroke::new(2.5, theme.palette.accent), StrokeKind::Outside);
+            painter.rect_stroke(
+                ring,
+                ring.height() / 2.0,
+                Stroke::new(2.5, theme.palette.accent),
+                StrokeKind::Outside,
+            );
         }
         painter.galley(rect.center() - galley_size / 2.0, galley, text_color);
         x += w + PILL_GAP;
@@ -287,7 +387,11 @@ fn draw_rail(
         let item = &items[i];
         let focused = i == nav.rail_index;
 
-        let size = if focused { m.tile_size + (focused_size - m.tile_size) * anim.focus_pop } else { m.tile_size };
+        let size = if focused {
+            m.tile_size + (focused_size - m.tile_size) * anim.focus_pop
+        } else {
+            m.tile_size
+        };
         let mut x = anchor_x + i as f32 * step + anim.rail_offset;
         if i > nav.rail_index {
             x += extra;
@@ -308,7 +412,10 @@ fn draw_rail(
         let radius = m.corner_radius * size / m.tile_size;
 
         let g = item.art.tile();
-        let faded = TileGradient { from: with_alpha(g.from, alpha), to: with_alpha(g.to, alpha) };
+        let faded = TileGradient {
+            from: with_alpha(g.from, alpha),
+            to: with_alpha(g.to, alpha),
+        };
         tile_gradient_rect(&painter, tile_rect, radius, &faded);
 
         match &item.art {
@@ -321,20 +428,32 @@ fn draw_rail(
                     GlyphKind::Video => Glyph::Video,
                     GlyphKind::Network => Glyph::Network,
                 };
-                icons::draw(&painter, g, tile_rect.center(), size * 0.3, with_alpha(Color32::WHITE, 0.92 * alpha));
+                icons::draw(
+                    &painter,
+                    g,
+                    tile_rect.center(),
+                    size * 0.3,
+                    with_alpha(Color32::WHITE, 0.92 * alpha),
+                );
             }
             ArtSource::Game { .. } => {
                 if let Some(texture) = covers.get(item.id.as_str()) {
                     // The user's own cover image (spec §11: user-supplied,
                     // like theme backgrounds), center-cropped to the square
                     // tile and tinted for the passed-tile fade.
-                    let shape = RectShape::filled(tile_rect, radius, with_alpha(Color32::WHITE, alpha))
-                        .with_texture(texture.id(), cover_crop_uv(texture));
+                    let shape =
+                        RectShape::filled(tile_rect, radius, with_alpha(Color32::WHITE, alpha))
+                            .with_texture(texture.id(), cover_crop_uv(texture));
                     painter.add(Shape::Rect(shape));
                 } else if item.kind == ItemKind::Game {
                     // Original stand-in key art: a large centered monogram
                     // over the gradient (spec §11 — never real box art).
-                    let monogram = item.title.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+                    let monogram = item
+                        .title
+                        .chars()
+                        .next()
+                        .map(|c| c.to_uppercase().to_string())
+                        .unwrap_or_default();
                     painter.text(
                         tile_rect.center(),
                         Align2::CENTER_CENTER,
@@ -362,7 +481,12 @@ fn draw_rail(
                 );
             }
             let ring_a = (0.82 + 0.18 * pulse) * alpha;
-            painter.rect_stroke(ring_rect, ring_radius, Stroke::new(3.5, with_alpha(theme.palette.accent, ring_a)), StrokeKind::Outside);
+            painter.rect_stroke(
+                ring_rect,
+                ring_radius,
+                Stroke::new(3.5, with_alpha(theme.palette.accent, ring_a)),
+                StrokeKind::Outside,
+            );
         }
     }
 }
@@ -387,7 +511,14 @@ fn cover_crop_uv(texture: &egui::TextureHandle) -> Rect {
 /// The focused item's block under the rail: big title, then the
 /// Time played / Progress / Last trophy stat columns (or a plain "Open …"
 /// line for built-in apps).
-fn draw_context_block(painter: &egui::Painter, theme: &Theme, screen: Rect, rail_bottom: f32, focused: Option<&LibraryItem>, meta_cache: &MetaCache) {
+fn draw_context_block(
+    painter: &egui::Painter,
+    theme: &Theme,
+    screen: Rect,
+    rail_bottom: f32,
+    focused: Option<&LibraryItem>,
+    meta_cache: &MetaCache,
+) {
     let Some(item) = focused else { return };
     // Home reads a focused item's metadata from the cache rather than the
     // item directly, so rendering stays decoupled from how (or whether)
@@ -395,9 +526,17 @@ fn draw_context_block(painter: &egui::Painter, theme: &Theme, screen: Rect, rail
     let meta = meta_cache.get(item.id.as_str());
     let left = screen.left() + theme.metrics.content_padding_x;
 
-    let title_galley = painter.layout_no_wrap(item.title.clone(), FontId::proportional(46.0), theme.palette.text);
+    let title_galley = painter.layout_no_wrap(
+        item.title.clone(),
+        FontId::proportional(46.0),
+        theme.palette.text,
+    );
     let title_h = title_galley.size().y;
-    painter.galley(Pos2::new(left, rail_bottom + 52.0), title_galley, theme.palette.text);
+    painter.galley(
+        Pos2::new(left, rail_bottom + 52.0),
+        title_galley,
+        theme.palette.text,
+    );
 
     let stats_top = rail_bottom + 52.0 + title_h + 28.0;
     let Some(meta) = meta else {
@@ -412,9 +551,20 @@ fn draw_context_block(painter: &egui::Painter, theme: &Theme, screen: Rect, rail
     };
 
     let dash = "\u{2014}".to_string();
-    let time_played = if meta.time_played.is_empty() { dash.clone() } else { meta.time_played.clone() };
-    let progress = meta.progress_percent().map(|p| format!("{p}%")).unwrap_or_else(|| dash.clone());
-    let last_trophy = if meta.last_trophy.is_empty() { dash } else { meta.last_trophy.clone() };
+    let time_played = if meta.time_played.is_empty() {
+        dash.clone()
+    } else {
+        meta.time_played.clone()
+    };
+    let progress = meta
+        .progress_percent()
+        .map(|p| format!("{p}%"))
+        .unwrap_or_else(|| dash.clone());
+    let last_trophy = if meta.last_trophy.is_empty() {
+        dash
+    } else {
+        meta.last_trophy.clone()
+    };
 
     let columns: [(&str, String, bool); 3] = [
         ("Time played", time_played, false),
@@ -423,20 +573,39 @@ fn draw_context_block(painter: &egui::Painter, theme: &Theme, screen: Rect, rail
     ];
     let mut x = left;
     for (label, value, with_trophy) in columns {
-        let label_galley = painter.layout_no_wrap(label.to_string(), FontId::proportional(18.0), theme.palette.text_faint);
-        let value_galley = painter.layout_no_wrap(value, FontId::proportional(32.0), theme.palette.text);
+        let label_galley = painter.layout_no_wrap(
+            label.to_string(),
+            FontId::proportional(18.0),
+            theme.palette.text_faint,
+        );
+        let value_galley =
+            painter.layout_no_wrap(value, FontId::proportional(32.0), theme.palette.text);
         let label_w = label_galley.size().x;
         let value_w = value_galley.size().x;
         let value_h = value_galley.size().y;
-        painter.galley(Pos2::new(x, stats_top), label_galley, theme.palette.text_faint);
+        painter.galley(
+            Pos2::new(x, stats_top),
+            label_galley,
+            theme.palette.text_faint,
+        );
 
         let value_y = stats_top + 32.0;
         let mut value_x = x;
         if with_trophy {
-            icons::draw(painter, Glyph::Trophy, Pos2::new(x + 13.0, value_y + value_h / 2.0), 26.0, GOLD);
+            icons::draw(
+                painter,
+                Glyph::Trophy,
+                Pos2::new(x + 13.0, value_y + value_h / 2.0),
+                26.0,
+                GOLD,
+            );
             value_x += 38.0;
         }
-        painter.galley(Pos2::new(value_x, value_y), value_galley, theme.palette.text);
+        painter.galley(
+            Pos2::new(value_x, value_y),
+            value_galley,
+            theme.palette.text,
+        );
 
         let col_w = label_w.max(value_w + if with_trophy { 38.0 } else { 0.0 });
         x += col_w + 72.0;
@@ -452,24 +621,46 @@ fn draw_bottom_bar(painter: &egui::Painter, theme: &Theme, screen: Rect) {
     let circle_r = 15.0;
     let fill = Color32::from_rgba_unmultiplied(255, 255, 255, 14);
 
-    let entries = [(Glyph::Cross, "Play"), (Glyph::Search, "Search"), (Glyph::Menu, "Options")];
+    let entries = [
+        (Glyph::Cross, "Play"),
+        (Glyph::Search, "Search"),
+        (Glyph::Menu, "Options"),
+    ];
     let mut x = screen.left() + margin + circle_r;
     for (glyph, label) in entries {
         let c = Pos2::new(x, y);
         painter.circle_filled(c, circle_r, fill);
         painter.circle_stroke(c, circle_r, Stroke::new(1.4, theme.palette.line));
         icons::draw(painter, glyph, c, 13.0, theme.palette.text_dim);
-        let galley = painter.layout_no_wrap(label.to_string(), FontId::proportional(15.0), theme.palette.text_dim);
+        let galley = painter.layout_no_wrap(
+            label.to_string(),
+            FontId::proportional(15.0),
+            theme.palette.text_dim,
+        );
         let galley_size = galley.size();
-        painter.galley(Pos2::new(x + circle_r + 10.0, y - galley_size.y / 2.0), galley, theme.palette.text_dim);
+        painter.galley(
+            Pos2::new(x + circle_r + 10.0, y - galley_size.y / 2.0),
+            galley,
+            theme.palette.text_dim,
+        );
         x += circle_r + 10.0 + galley_size.x + 44.0;
     }
 
     // Right-side status glyphs (chat, capture).
     let rx = screen.right() - margin;
-    painter.circle_stroke(Pos2::new(rx - 9.0, y), 9.0, Stroke::new(1.4, theme.palette.text_faint));
+    painter.circle_stroke(
+        Pos2::new(rx - 9.0, y),
+        9.0,
+        Stroke::new(1.4, theme.palette.text_faint),
+    );
     painter.circle_filled(Pos2::new(rx - 9.0, y), 3.2, theme.palette.text_faint);
-    icons::draw(painter, Glyph::Chat, Pos2::new(rx - 48.0, y), 18.0, theme.palette.text_faint);
+    icons::draw(
+        painter,
+        Glyph::Chat,
+        Pos2::new(rx - 48.0, y),
+        18.0,
+        theme.palette.text_faint,
+    );
 }
 
 /// Local wall-clock, formatted 12-hour ("4:44 PM"). On Windows this is

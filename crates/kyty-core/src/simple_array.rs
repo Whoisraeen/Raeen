@@ -44,7 +44,10 @@ pub struct SimpleArray<T> {
 impl<T> SimpleArray<T> {
     /// `SimpleArray()` — empty array.
     pub fn new() -> Self {
-        Self { values: Vec::new(), hash_cache: std::cell::Cell::new(None) }
+        Self {
+            values: Vec::new(),
+            hash_cache: std::cell::Cell::new(None),
+        }
     }
 
     /// `Size()`.
@@ -150,7 +153,11 @@ impl<T> SimpleArray<T> {
         if index >= size {
             return false;
         }
-        let count = if index + count > size { size - index } else { count };
+        let count = if index + count > size {
+            size - index
+        } else {
+            count
+        };
         let start = index as usize;
         let end = (index + count) as usize;
         self.values.drain(start..end);
@@ -215,8 +222,13 @@ impl<T> SimpleArray<T> {
     /// `Sort(SortCompareFunc)` / `Sort(OP&& comp_func)` — sort with a
     /// strict-weak-order predicate `comp_func(a, b)` meaning "a < b".
     pub fn sort_by<F: FnMut(&T, &T) -> bool>(&mut self, mut comp_func: F) {
-        self.values
-            .sort_by(|a, b| if comp_func(a, b) { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater });
+        self.values.sort_by(|a, b| {
+            if comp_func(a, b) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        });
         self.hash_cache.set(None);
     }
 
@@ -271,7 +283,10 @@ impl<T: PartialEq> PartialEq for SimpleArray<T> {
 
 impl<T> FromIterator<T> for SimpleArray<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        Self { values: Vec::from_iter(iter), hash_cache: std::cell::Cell::new(None) }
+        Self {
+            values: Vec::from_iter(iter),
+            hash_cache: std::cell::Cell::new(None),
+        }
     }
 }
 
@@ -285,7 +300,10 @@ impl<T> IntoIterator for SimpleArray<T> {
 
 impl<T, const N: usize> From<[T; N]> for SimpleArray<T> {
     fn from(list: [T; N]) -> Self {
-        Self { values: Vec::from(list), hash_cache: std::cell::Cell::new(None) }
+        Self {
+            values: Vec::from(list),
+            hash_cache: std::cell::Cell::new(None),
+        }
     }
 }
 

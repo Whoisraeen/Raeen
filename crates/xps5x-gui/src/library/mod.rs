@@ -62,8 +62,14 @@ pub enum GlyphKind {
 /// Where a [`LibraryItem`]'s art comes from.
 #[derive(Debug, Clone)]
 pub enum ArtSource {
-    Game { hero: Gradient, tile: TileGradient },
-    App { tile: TileGradient, glyph: GlyphKind },
+    Game {
+        hero: Gradient,
+        tile: TileGradient,
+    },
+    App {
+        tile: TileGradient,
+        glyph: GlyphKind,
+    },
 }
 
 impl ArtSource {
@@ -79,19 +85,28 @@ impl ArtSource {
     pub fn hero(&self) -> Gradient {
         match self {
             ArtSource::Game { hero, .. } => *hero,
-            ArtSource::App { tile, .. } => Gradient { hi: tile.from, mid: tile.to, lo: rgb(0x0a1017) },
+            ArtSource::App { tile, .. } => Gradient {
+                hi: tile.from,
+                mid: tile.to,
+                lo: rgb(0x0a1017),
+            },
         }
     }
-
 }
 
 /// Blend two color channels, `t` in `0.0..=1.0`.
 fn lerp_channel(a: u8, b: u8, t: f32) -> u8 {
-    (a as f32 + (b as f32 - a as f32) * t).round().clamp(0.0, 255.0) as u8
+    (a as f32 + (b as f32 - a as f32) * t)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
-    Color32::from_rgb(lerp_channel(a.r(), b.r(), t), lerp_channel(a.g(), b.g(), t), lerp_channel(a.b(), b.b(), t))
+    Color32::from_rgb(
+        lerp_channel(a.r(), b.r(), t),
+        lerp_channel(a.g(), b.g(), t),
+        lerp_channel(a.b(), b.b(), t),
+    )
 }
 
 /// Build gradient art (hero + tile) from two explicit stops — a bright
@@ -299,36 +314,51 @@ pub fn built_in_apps() -> Vec<LibraryItem> {
             title: "Store".to_string(),
             kind: ItemKind::App,
             art: ArtSource::App {
-                tile: TileGradient { from: rgb(0x1f8fff), to: rgb(0x0a4bc2) },
+                tile: TileGradient {
+                    from: rgb(0x1f8fff),
+                    to: rgb(0x0a4bc2),
+                },
                 glyph: GlyphKind::Bag,
             },
             meta: None,
             cover_path: None,
-            launch: LaunchTarget::App { id: "store".to_string() },
+            launch: LaunchTarget::App {
+                id: "store".to_string(),
+            },
         },
         LibraryItem {
             id: "library".to_string(),
             title: "Game Library".to_string(),
             kind: ItemKind::App,
             art: ArtSource::App {
-                tile: TileGradient { from: rgb(0x2b3a4e), to: rgb(0x17222f) },
+                tile: TileGradient {
+                    from: rgb(0x2b3a4e),
+                    to: rgb(0x17222f),
+                },
                 glyph: GlyphKind::Grid,
             },
             meta: None,
             cover_path: None,
-            launch: LaunchTarget::App { id: "library".to_string() },
+            launch: LaunchTarget::App {
+                id: "library".to_string(),
+            },
         },
         LibraryItem {
             id: "settings".to_string(),
             title: "Settings".to_string(),
             kind: ItemKind::App,
             art: ArtSource::App {
-                tile: TileGradient { from: rgb(0x2b3a4e), to: rgb(0x17222f) },
+                tile: TileGradient {
+                    from: rgb(0x2b3a4e),
+                    to: rgb(0x17222f),
+                },
                 glyph: GlyphKind::Gear,
             },
             meta: None,
             cover_path: None,
-            launch: LaunchTarget::App { id: "settings".to_string() },
+            launch: LaunchTarget::App {
+                id: "settings".to_string(),
+            },
         },
     ]
 }
@@ -342,8 +372,15 @@ pub fn sample_library() -> Vec<LibraryItem> {
             title: "Nova Requiem".to_string(),
             kind: ItemKind::Game,
             art: ArtSource::Game {
-                hero: Gradient { hi: rgb(0xff4d6d), mid: rgb(0x7a1338), lo: rgb(0x16060f) },
-                tile: TileGradient { from: rgb(0xff5a7a), to: rgb(0x240712) },
+                hero: Gradient {
+                    hi: rgb(0xff4d6d),
+                    mid: rgb(0x7a1338),
+                    lo: rgb(0x16060f),
+                },
+                tile: TileGradient {
+                    from: rgb(0xff5a7a),
+                    to: rgb(0x240712),
+                },
             },
             meta: Some(GameMeta {
                 genre: "Action RPG".to_string(),
@@ -353,21 +390,45 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 time_played: "2h 1m".to_string(),
                 last_trophy: "Hollow Walker".to_string(),
                 activity: vec![
-                    ActivityCard { top: "Continue".to_string(), main: "Chapter 4 — The Hollow".to_string(), sub: "2h ago".to_string(), progress: None },
-                    ActivityCard { top: "Trophies".to_string(), main: "58%".to_string(), sub: "24 / 41".to_string(), progress: Some(58) },
-                    ActivityCard { top: "Game Help".to_string(), main: "3 tips available".to_string(), sub: String::new(), progress: None },
+                    ActivityCard {
+                        top: "Continue".to_string(),
+                        main: "Chapter 4 — The Hollow".to_string(),
+                        sub: "2h ago".to_string(),
+                        progress: None,
+                    },
+                    ActivityCard {
+                        top: "Trophies".to_string(),
+                        main: "58%".to_string(),
+                        sub: "24 / 41".to_string(),
+                        progress: Some(58),
+                    },
+                    ActivityCard {
+                        top: "Game Help".to_string(),
+                        main: "3 tips available".to_string(),
+                        sub: String::new(),
+                        progress: None,
+                    },
                 ],
             }),
             cover_path: None,
-            launch: LaunchTarget::Game { path: PathBuf::from("Games/nova") },
+            launch: LaunchTarget::Game {
+                path: PathBuf::from("Games/nova"),
+            },
         },
         LibraryItem {
             id: "astral".to_string(),
             title: "Astral Drift".to_string(),
             kind: ItemKind::Game,
             art: ArtSource::Game {
-                hero: Gradient { hi: rgb(0x2fe0d0), mid: rgb(0x0e6a8c), lo: rgb(0x05131f) },
-                tile: TileGradient { from: rgb(0x3ff0dc), to: rgb(0x04202f) },
+                hero: Gradient {
+                    hi: rgb(0x2fe0d0),
+                    mid: rgb(0x0e6a8c),
+                    lo: rgb(0x05131f),
+                },
+                tile: TileGradient {
+                    from: rgb(0x3ff0dc),
+                    to: rgb(0x04202f),
+                },
             },
             meta: Some(GameMeta {
                 genre: "Open World".to_string(),
@@ -377,21 +438,45 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 time_played: "31h 6m".to_string(),
                 last_trophy: "Drift Racer".to_string(),
                 activity: vec![
-                    ActivityCard { top: "Continue".to_string(), main: "Sector 12 — Drift Run".to_string(), sub: "Yesterday".to_string(), progress: None },
-                    ActivityCard { top: "Trophies".to_string(), main: "31%".to_string(), sub: "12 / 38".to_string(), progress: Some(31) },
-                    ActivityCard { top: "2 friends playing".to_string(), main: "Join session".to_string(), sub: String::new(), progress: None },
+                    ActivityCard {
+                        top: "Continue".to_string(),
+                        main: "Sector 12 — Drift Run".to_string(),
+                        sub: "Yesterday".to_string(),
+                        progress: None,
+                    },
+                    ActivityCard {
+                        top: "Trophies".to_string(),
+                        main: "31%".to_string(),
+                        sub: "12 / 38".to_string(),
+                        progress: Some(31),
+                    },
+                    ActivityCard {
+                        top: "2 friends playing".to_string(),
+                        main: "Join session".to_string(),
+                        sub: String::new(),
+                        progress: None,
+                    },
                 ],
             }),
             cover_path: None,
-            launch: LaunchTarget::Game { path: PathBuf::from("Games/astral") },
+            launch: LaunchTarget::Game {
+                path: PathBuf::from("Games/astral"),
+            },
         },
         LibraryItem {
             id: "sable".to_string(),
             title: "Sable Horizon".to_string(),
             kind: ItemKind::Game,
             art: ArtSource::Game {
-                hero: Gradient { hi: rgb(0xffb454), mid: rgb(0xc25a1a), lo: rgb(0x2a1207) },
-                tile: TileGradient { from: rgb(0xffc06a), to: rgb(0x351808) },
+                hero: Gradient {
+                    hi: rgb(0xffb454),
+                    mid: rgb(0xc25a1a),
+                    lo: rgb(0x2a1207),
+                },
+                tile: TileGradient {
+                    from: rgb(0xffc06a),
+                    to: rgb(0x351808),
+                },
             },
             meta: Some(GameMeta {
                 genre: "Adventure".to_string(),
@@ -401,21 +486,45 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 time_played: "104h 22m".to_string(),
                 last_trophy: "Dune Strider".to_string(),
                 activity: vec![
-                    ActivityCard { top: "Continue".to_string(), main: "The Dunes".to_string(), sub: "3d ago".to_string(), progress: None },
-                    ActivityCard { top: "Trophies".to_string(), main: "92%".to_string(), sub: "33 / 36".to_string(), progress: Some(92) },
-                    ActivityCard { top: "Game Help".to_string(), main: "1 tip available".to_string(), sub: String::new(), progress: None },
+                    ActivityCard {
+                        top: "Continue".to_string(),
+                        main: "The Dunes".to_string(),
+                        sub: "3d ago".to_string(),
+                        progress: None,
+                    },
+                    ActivityCard {
+                        top: "Trophies".to_string(),
+                        main: "92%".to_string(),
+                        sub: "33 / 36".to_string(),
+                        progress: Some(92),
+                    },
+                    ActivityCard {
+                        top: "Game Help".to_string(),
+                        main: "1 tip available".to_string(),
+                        sub: String::new(),
+                        progress: None,
+                    },
                 ],
             }),
             cover_path: None,
-            launch: LaunchTarget::Game { path: PathBuf::from("Games/sable") },
+            launch: LaunchTarget::Game {
+                path: PathBuf::from("Games/sable"),
+            },
         },
         LibraryItem {
             id: "kingfall".to_string(),
             title: "Kingfall".to_string(),
             kind: ItemKind::Game,
             art: ArtSource::Game {
-                hero: Gradient { hi: rgb(0x7bd88f), mid: rgb(0x1f6b45), lo: rgb(0x071710) },
-                tile: TileGradient { from: rgb(0x8fe6a2), to: rgb(0x082115) },
+                hero: Gradient {
+                    hi: rgb(0x7bd88f),
+                    mid: rgb(0x1f6b45),
+                    lo: rgb(0x071710),
+                },
+                tile: TileGradient {
+                    from: rgb(0x8fe6a2),
+                    to: rgb(0x082115),
+                },
             },
             meta: Some(GameMeta {
                 genre: "Soulslike".to_string(),
@@ -425,21 +534,45 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 time_played: "12h 40m".to_string(),
                 last_trophy: "Ashen Victor".to_string(),
                 activity: vec![
-                    ActivityCard { top: "Continue".to_string(), main: "Ashen Keep — Boss".to_string(), sub: "1h ago".to_string(), progress: None },
-                    ActivityCard { top: "Trophies".to_string(), main: "44%".to_string(), sub: "18 / 41".to_string(), progress: Some(44) },
-                    ActivityCard { top: "Game Help".to_string(), main: "Boss strategy".to_string(), sub: String::new(), progress: None },
+                    ActivityCard {
+                        top: "Continue".to_string(),
+                        main: "Ashen Keep — Boss".to_string(),
+                        sub: "1h ago".to_string(),
+                        progress: None,
+                    },
+                    ActivityCard {
+                        top: "Trophies".to_string(),
+                        main: "44%".to_string(),
+                        sub: "18 / 41".to_string(),
+                        progress: Some(44),
+                    },
+                    ActivityCard {
+                        top: "Game Help".to_string(),
+                        main: "Boss strategy".to_string(),
+                        sub: String::new(),
+                        progress: None,
+                    },
                 ],
             }),
             cover_path: None,
-            launch: LaunchTarget::Game { path: PathBuf::from("Games/kingfall") },
+            launch: LaunchTarget::Game {
+                path: PathBuf::from("Games/kingfall"),
+            },
         },
         LibraryItem {
             id: "neon".to_string(),
             title: "Neon Verge".to_string(),
             kind: ItemKind::Game,
             art: ArtSource::Game {
-                hero: Gradient { hi: rgb(0xff5cf0), mid: rgb(0x6a1bd6), lo: rgb(0x100626) },
-                tile: TileGradient { from: rgb(0xff6cf2), to: rgb(0x150931) },
+                hero: Gradient {
+                    hi: rgb(0xff5cf0),
+                    mid: rgb(0x6a1bd6),
+                    lo: rgb(0x100626),
+                },
+                tile: TileGradient {
+                    from: rgb(0xff6cf2),
+                    to: rgb(0x150931),
+                },
             },
             meta: Some(GameMeta {
                 genre: "Cyberpunk FPS".to_string(),
@@ -449,21 +582,45 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 time_played: "5h 12m".to_string(),
                 last_trophy: "Division Climber".to_string(),
                 activity: vec![
-                    ActivityCard { top: "Continue".to_string(), main: "Ranked — Div 2".to_string(), sub: "5h ago".to_string(), progress: None },
-                    ActivityCard { top: "Trophies".to_string(), main: "27%".to_string(), sub: "9 / 33".to_string(), progress: Some(27) },
-                    ActivityCard { top: "5 friends online".to_string(), main: "Invite to party".to_string(), sub: String::new(), progress: None },
+                    ActivityCard {
+                        top: "Continue".to_string(),
+                        main: "Ranked — Div 2".to_string(),
+                        sub: "5h ago".to_string(),
+                        progress: None,
+                    },
+                    ActivityCard {
+                        top: "Trophies".to_string(),
+                        main: "27%".to_string(),
+                        sub: "9 / 33".to_string(),
+                        progress: Some(27),
+                    },
+                    ActivityCard {
+                        top: "5 friends online".to_string(),
+                        main: "Invite to party".to_string(),
+                        sub: String::new(),
+                        progress: None,
+                    },
                 ],
             }),
             cover_path: None,
-            launch: LaunchTarget::Game { path: PathBuf::from("Games/neon") },
+            launch: LaunchTarget::Game {
+                path: PathBuf::from("Games/neon"),
+            },
         },
         LibraryItem {
             id: "tide".to_string(),
             title: "Tidewrought".to_string(),
             kind: ItemKind::Game,
             art: ArtSource::Game {
-                hero: Gradient { hi: rgb(0x4aa8ff), mid: rgb(0x17457e), lo: rgb(0x050f1f) },
-                tile: TileGradient { from: rgb(0x63b6ff), to: rgb(0x061a30) },
+                hero: Gradient {
+                    hi: rgb(0x4aa8ff),
+                    mid: rgb(0x17457e),
+                    lo: rgb(0x050f1f),
+                },
+                tile: TileGradient {
+                    from: rgb(0x63b6ff),
+                    to: rgb(0x061a30),
+                },
             },
             meta: Some(GameMeta {
                 genre: "Survival".to_string(),
@@ -473,13 +630,30 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 time_played: "48m".to_string(),
                 last_trophy: "First Dive".to_string(),
                 activity: vec![
-                    ActivityCard { top: "Continue".to_string(), main: "Deep Reef Camp".to_string(), sub: "2d ago".to_string(), progress: None },
-                    ActivityCard { top: "Trophies".to_string(), main: "15%".to_string(), sub: "6 / 40".to_string(), progress: Some(15) },
-                    ActivityCard { top: "Game Help".to_string(), main: "Crafting guide".to_string(), sub: String::new(), progress: None },
+                    ActivityCard {
+                        top: "Continue".to_string(),
+                        main: "Deep Reef Camp".to_string(),
+                        sub: "2d ago".to_string(),
+                        progress: None,
+                    },
+                    ActivityCard {
+                        top: "Trophies".to_string(),
+                        main: "15%".to_string(),
+                        sub: "6 / 40".to_string(),
+                        progress: Some(15),
+                    },
+                    ActivityCard {
+                        top: "Game Help".to_string(),
+                        main: "Crafting guide".to_string(),
+                        sub: String::new(),
+                        progress: None,
+                    },
                 ],
             }),
             cover_path: None,
-            launch: LaunchTarget::Game { path: PathBuf::from("Games/tide") },
+            launch: LaunchTarget::Game {
+                path: PathBuf::from("Games/tide"),
+            },
         },
     ]
     .into_iter()
@@ -505,14 +679,20 @@ mod tests {
         let apps = built_in_apps();
         assert_eq!(apps.len(), 3);
         assert!(apps.iter().all(|i| i.kind == ItemKind::App));
-        assert!(apps.iter().any(|i| i.id == "settings"), "Settings must always be reachable on the Games rail");
+        assert!(
+            apps.iter().any(|i| i.id == "settings"),
+            "Settings must always be reachable on the Games rail"
+        );
     }
 
     #[test]
     fn sample_library_ends_with_the_built_in_apps() {
         let items = sample_library();
         let apps = built_in_apps();
-        let tail_ids: Vec<&str> = items[items.len() - apps.len()..].iter().map(|i| i.id.as_str()).collect();
+        let tail_ids: Vec<&str> = items[items.len() - apps.len()..]
+            .iter()
+            .map(|i| i.id.as_str())
+            .collect();
         let app_ids: Vec<&str> = apps.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(tail_ids, app_ids);
     }

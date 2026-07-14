@@ -107,7 +107,10 @@ mod tests {
         }
         for i in 0..seen.len() {
             for j in (i + 1)..seen.len() {
-                assert_ne!(seen[i], seen[j], "collision between inputs of different length");
+                assert_ne!(
+                    seen[i], seen[j],
+                    "collision between inputs of different length"
+                );
             }
         }
     }

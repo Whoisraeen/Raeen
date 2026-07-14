@@ -56,7 +56,10 @@ pub fn draw(painter: &Painter, glyph: Glyph, center: Pos2, size: f32, color: Col
         Glyph::Bell => {
             painter.circle_stroke(center + vec2(0.0, -r * 0.1), r * 0.5, stroke);
             painter.line_segment(
-                [center + vec2(-r * 0.25, r * 0.45), center + vec2(r * 0.25, r * 0.45)],
+                [
+                    center + vec2(-r * 0.25, r * 0.45),
+                    center + vec2(r * 0.25, r * 0.45),
+                ],
                 stroke,
             );
         }
@@ -69,8 +72,14 @@ pub fn draw(painter: &Painter, glyph: Glyph, center: Pos2, size: f32, color: Col
             }
         }
         Glyph::Home => {
-            painter.line_segment([center + vec2(-r * 0.85, 0.0), center + vec2(0.0, -r * 0.75)], stroke);
-            painter.line_segment([center + vec2(0.0, -r * 0.75), center + vec2(r * 0.85, 0.0)], stroke);
+            painter.line_segment(
+                [center + vec2(-r * 0.85, 0.0), center + vec2(0.0, -r * 0.75)],
+                stroke,
+            );
+            painter.line_segment(
+                [center + vec2(0.0, -r * 0.75), center + vec2(r * 0.85, 0.0)],
+                stroke,
+            );
             let base = egui::Rect::from_min_max(
                 center + vec2(-r * 0.5, -r * 0.05),
                 center + vec2(r * 0.5, r * 0.8),
@@ -78,57 +87,151 @@ pub fn draw(painter: &Painter, glyph: Glyph, center: Pos2, size: f32, color: Col
             painter.rect_stroke(base, 1.0, stroke, StrokeKind::Outside);
         }
         Glyph::Switcher => {
-            let a = egui::Rect::from_min_max(center + vec2(-r * 0.85, -r * 0.55), center + vec2(-r * 0.05, r * 0.55));
-            let b = egui::Rect::from_min_max(center + vec2(r * 0.05, -r * 0.55), center + vec2(r * 0.85, r * 0.55));
+            let a = egui::Rect::from_min_max(
+                center + vec2(-r * 0.85, -r * 0.55),
+                center + vec2(-r * 0.05, r * 0.55),
+            );
+            let b = egui::Rect::from_min_max(
+                center + vec2(r * 0.05, -r * 0.55),
+                center + vec2(r * 0.85, r * 0.55),
+            );
             painter.rect_stroke(a, 2.0, stroke, StrokeKind::Outside);
             painter.rect_stroke(b, 2.0, stroke, StrokeKind::Outside);
         }
         Glyph::Music => {
             painter.circle_filled(center + vec2(-r * 0.35, r * 0.45), r * 0.22, color);
             painter.circle_filled(center + vec2(r * 0.4, r * 0.25), r * 0.22, color);
-            painter.line_segment([center + vec2(-r * 0.15, r * 0.45), center + vec2(-r * 0.15, -r * 0.7)], stroke);
-            painter.line_segment([center + vec2(r * 0.6, r * 0.25), center + vec2(r * 0.6, -r * 0.55)], stroke);
-            painter.line_segment([center + vec2(-r * 0.15, -r * 0.7), center + vec2(r * 0.6, -r * 0.55)], stroke);
+            painter.line_segment(
+                [
+                    center + vec2(-r * 0.15, r * 0.45),
+                    center + vec2(-r * 0.15, -r * 0.7),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center + vec2(r * 0.6, r * 0.25),
+                    center + vec2(r * 0.6, -r * 0.55),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center + vec2(-r * 0.15, -r * 0.7),
+                    center + vec2(r * 0.6, -r * 0.55),
+                ],
+                stroke,
+            );
         }
         Glyph::Sound => {
-            let body = egui::Rect::from_min_max(center + vec2(-r * 0.75, -r * 0.3), center + vec2(-r * 0.25, r * 0.3));
+            let body = egui::Rect::from_min_max(
+                center + vec2(-r * 0.75, -r * 0.3),
+                center + vec2(-r * 0.25, r * 0.3),
+            );
             painter.rect_stroke(body, 1.0, stroke, StrokeKind::Outside);
-            painter.line_segment([center + vec2(-r * 0.25, -r * 0.3), center + vec2(r * 0.1, -r * 0.65)], stroke);
-            painter.line_segment([center + vec2(-r * 0.25, r * 0.3), center + vec2(r * 0.1, r * 0.65)], stroke);
-            painter.line_segment([center + vec2(r * 0.1, -r * 0.65), center + vec2(r * 0.1, r * 0.65)], stroke);
+            painter.line_segment(
+                [
+                    center + vec2(-r * 0.25, -r * 0.3),
+                    center + vec2(r * 0.1, -r * 0.65),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center + vec2(-r * 0.25, r * 0.3),
+                    center + vec2(r * 0.1, r * 0.65),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center + vec2(r * 0.1, -r * 0.65),
+                    center + vec2(r * 0.1, r * 0.65),
+                ],
+                stroke,
+            );
             painter.arc(center + vec2(r * 0.1, 0.0), r * 0.55, -0.5..=0.5, stroke);
         }
         Glyph::Mic => {
-            let body = egui::Rect::from_center_size(center + vec2(0.0, -r * 0.15), vec2(r * 0.5, r * 0.9));
+            let body =
+                egui::Rect::from_center_size(center + vec2(0.0, -r * 0.15), vec2(r * 0.5, r * 0.9));
             painter.rect_stroke(body, r * 0.25, stroke, StrokeKind::Outside);
-            painter.arc(center + vec2(0.0, 0.1), r * 0.65, 0.35..=(std::f32::consts::PI - 0.35), stroke);
-            painter.line_segment([center + vec2(0.0, r * 0.55), center + vec2(0.0, r * 0.85)], stroke);
+            painter.arc(
+                center + vec2(0.0, 0.1),
+                r * 0.65,
+                0.35..=(std::f32::consts::PI - 0.35),
+                stroke,
+            );
+            painter.line_segment(
+                [center + vec2(0.0, r * 0.55), center + vec2(0.0, r * 0.85)],
+                stroke,
+            );
         }
         Glyph::Pad => {
             let body = egui::Rect::from_center_size(center, vec2(r * 1.7, r * 1.0));
             painter.rect_stroke(body, r * 0.4, stroke, StrokeKind::Outside);
             painter.circle_filled(center + vec2(r * 0.45, -r * 0.05), r * 0.1, color);
             painter.circle_filled(center + vec2(r * 0.65, r * 0.1), r * 0.1, color);
-            painter.line_segment([center + vec2(-r * 0.65, 0.0), center + vec2(-r * 0.35, 0.0)], stroke);
-            painter.line_segment([center + vec2(-r * 0.5, -r * 0.15), center + vec2(-r * 0.5, r * 0.15)], stroke);
+            painter.line_segment(
+                [center + vec2(-r * 0.65, 0.0), center + vec2(-r * 0.35, 0.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center + vec2(-r * 0.5, -r * 0.15),
+                    center + vec2(-r * 0.5, r * 0.15),
+                ],
+                stroke,
+            );
         }
         Glyph::Profile => {
             painter.circle_stroke(center + vec2(0.0, -r * 0.35), r * 0.32, stroke);
-            painter.arc(center + vec2(0.0, r * 0.85), r * 0.65, (std::f32::consts::PI + 0.3)..=(-0.3), stroke);
+            painter.arc(
+                center + vec2(0.0, r * 0.85),
+                r * 0.65,
+                (std::f32::consts::PI + 0.3)..=(-0.3),
+                stroke,
+            );
         }
         Glyph::Network => {
-            painter.arc(center + vec2(0.0, r * 0.2), r * 0.85, (-2.6)..=(-0.55), stroke);
-            painter.arc(center + vec2(0.0, r * 0.2), r * 0.5, (-2.5)..=(-0.65), stroke);
+            painter.arc(
+                center + vec2(0.0, r * 0.2),
+                r * 0.85,
+                (-2.6)..=(-0.55),
+                stroke,
+            );
+            painter.arc(
+                center + vec2(0.0, r * 0.2),
+                r * 0.5,
+                (-2.5)..=(-0.65),
+                stroke,
+            );
             painter.circle_filled(center + vec2(0.0, r * 0.75), r * 0.1, color);
         }
         Glyph::Power => {
-            painter.arc(center + vec2(0.0, r * 0.1), r * 0.55, 0.7..=(std::f32::consts::TAU - 0.7), stroke);
-            painter.line_segment([center + vec2(0.0, -r * 0.7), center + vec2(0.0, r * 0.05)], stroke);
+            painter.arc(
+                center + vec2(0.0, r * 0.1),
+                r * 0.55,
+                0.7..=(std::f32::consts::TAU - 0.7),
+                stroke,
+            );
+            painter.line_segment(
+                [center + vec2(0.0, -r * 0.7), center + vec2(0.0, r * 0.05)],
+                stroke,
+            );
         }
         Glyph::Bag => {
-            let body = egui::Rect::from_min_max(center + vec2(-r * 0.6, -r * 0.15), center + vec2(r * 0.6, r * 0.75));
+            let body = egui::Rect::from_min_max(
+                center + vec2(-r * 0.6, -r * 0.15),
+                center + vec2(r * 0.6, r * 0.75),
+            );
             painter.rect_stroke(body, 2.0, stroke, StrokeKind::Outside);
-            painter.arc(center + vec2(0.0, -r * 0.15), r * 0.35, (std::f32::consts::PI + 0.2)..=(-0.2), stroke);
+            painter.arc(
+                center + vec2(0.0, -r * 0.15),
+                r * 0.35,
+                (std::f32::consts::PI + 0.2)..=(-0.2),
+                stroke,
+            );
         }
         Glyph::Grid => {
             let s = r * 0.55;
@@ -153,21 +256,61 @@ pub fn draw(painter: &Painter, glyph: Glyph, center: Pos2, size: f32, color: Col
         Glyph::Info => {
             painter.circle_stroke(center, r * 0.8, stroke);
             painter.circle_filled(center + vec2(0.0, -r * 0.38), r * 0.1, color);
-            painter.line_segment([center + vec2(0.0, -r * 0.08), center + vec2(0.0, r * 0.42)], stroke);
+            painter.line_segment(
+                [center + vec2(0.0, -r * 0.08), center + vec2(0.0, r * 0.42)],
+                stroke,
+            );
         }
         Glyph::Trophy => {
-            let cup = egui::Rect::from_min_max(center + vec2(-r * 0.45, -r * 0.7), center + vec2(r * 0.45, r * 0.05));
+            let cup = egui::Rect::from_min_max(
+                center + vec2(-r * 0.45, -r * 0.7),
+                center + vec2(r * 0.45, r * 0.05),
+            );
             painter.rect_stroke(cup, r * 0.2, stroke, StrokeKind::Outside);
-            painter.arc(center + vec2(-r * 0.55, -r * 0.45), r * 0.25, (std::f32::consts::PI * 0.5)..=(std::f32::consts::PI * 1.5), stroke);
-            painter.arc(center + vec2(r * 0.55, -r * 0.45), r * 0.25, (-std::f32::consts::PI * 0.5)..=(std::f32::consts::PI * 0.5), stroke);
-            painter.line_segment([center + vec2(0.0, r * 0.05), center + vec2(0.0, r * 0.45)], stroke);
-            painter.line_segment([center + vec2(-r * 0.35, r * 0.6), center + vec2(r * 0.35, r * 0.6)], stroke);
+            painter.arc(
+                center + vec2(-r * 0.55, -r * 0.45),
+                r * 0.25,
+                (std::f32::consts::PI * 0.5)..=(std::f32::consts::PI * 1.5),
+                stroke,
+            );
+            painter.arc(
+                center + vec2(r * 0.55, -r * 0.45),
+                r * 0.25,
+                (-std::f32::consts::PI * 0.5)..=(std::f32::consts::PI * 0.5),
+                stroke,
+            );
+            painter.line_segment(
+                [center + vec2(0.0, r * 0.05), center + vec2(0.0, r * 0.45)],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center + vec2(-r * 0.35, r * 0.6),
+                    center + vec2(r * 0.35, r * 0.6),
+                ],
+                stroke,
+            );
         }
         Glyph::Chat => {
-            let body = egui::Rect::from_min_max(center + vec2(-r * 0.75, -r * 0.6), center + vec2(r * 0.75, r * 0.35));
+            let body = egui::Rect::from_min_max(
+                center + vec2(-r * 0.75, -r * 0.6),
+                center + vec2(r * 0.75, r * 0.35),
+            );
             painter.rect_stroke(body, r * 0.25, stroke, StrokeKind::Outside);
-            painter.line_segment([center + vec2(-r * 0.3, r * 0.35), center + vec2(-r * 0.45, r * 0.7)], stroke);
-            painter.line_segment([center + vec2(-r * 0.45, r * 0.7), center + vec2(-0.05 * r, r * 0.35)], stroke);
+            painter.line_segment(
+                [
+                    center + vec2(-r * 0.3, r * 0.35),
+                    center + vec2(-r * 0.45, r * 0.7),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center + vec2(-r * 0.45, r * 0.7),
+                    center + vec2(-0.05 * r, r * 0.35),
+                ],
+                stroke,
+            );
         }
         Glyph::Cross => {
             let d = r * 0.62;
@@ -177,7 +320,10 @@ pub fn draw(painter: &Painter, glyph: Glyph, center: Pos2, size: f32, color: Col
         Glyph::Menu => {
             for dy in [-0.45_f32, 0.0, 0.45] {
                 painter.line_segment(
-                    [center + vec2(-r * 0.65, r * dy), center + vec2(r * 0.65, r * dy)],
+                    [
+                        center + vec2(-r * 0.65, r * dy),
+                        center + vec2(r * 0.65, r * dy),
+                    ],
                     stroke,
                 );
             }
@@ -188,11 +334,23 @@ pub fn draw(painter: &Painter, glyph: Glyph, center: Pos2, size: f32, color: Col
 /// Small helper: draw an arc using line segments (egui's `Painter` has no
 /// built-in arc primitive, so this approximates one).
 trait ArcExt {
-    fn arc(&self, center: Pos2, radius: f32, angle_range: std::ops::RangeInclusive<f32>, stroke: Stroke);
+    fn arc(
+        &self,
+        center: Pos2,
+        radius: f32,
+        angle_range: std::ops::RangeInclusive<f32>,
+        stroke: Stroke,
+    );
 }
 
 impl ArcExt for Painter {
-    fn arc(&self, center: Pos2, radius: f32, angle_range: std::ops::RangeInclusive<f32>, stroke: Stroke) {
+    fn arc(
+        &self,
+        center: Pos2,
+        radius: f32,
+        angle_range: std::ops::RangeInclusive<f32>,
+        stroke: Stroke,
+    ) {
         const SEGMENTS: usize = 16;
         let start = *angle_range.start();
         let end = *angle_range.end();

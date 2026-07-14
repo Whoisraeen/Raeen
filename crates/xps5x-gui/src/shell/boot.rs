@@ -21,7 +21,11 @@ impl BootSequence {
     }
 
     pub fn with_durations(hold_duration: Duration, fade_duration: Duration) -> Self {
-        Self { started: Instant::now(), hold_duration, fade_duration }
+        Self {
+            started: Instant::now(),
+            hold_duration,
+            fade_duration,
+        }
     }
 
     /// 0.0 at boot start, 1.0 once the crossfade into Home has finished.
@@ -96,7 +100,8 @@ pub fn draw(ctx: &egui::Context, theme: &Theme, boot: &BootSequence) {
             );
 
             let shimmer_w = bar_w * 0.4;
-            let shimmer_x = bar_rect.left() - shimmer_w + boot.shimmer() * (bar_w + shimmer_w * 2.0);
+            let shimmer_x =
+                bar_rect.left() - shimmer_w + boot.shimmer() * (bar_w + shimmer_w * 2.0);
             let shimmer_rect = egui::Rect::from_min_size(
                 egui::pos2(shimmer_x, bar_rect.top()),
                 egui::vec2(shimmer_w, bar_h),
@@ -120,7 +125,8 @@ mod tests {
 
     #[test]
     fn fade_alpha_is_zero_during_hold() {
-        let boot = BootSequence::with_durations(Duration::from_secs(60), Duration::from_millis(200));
+        let boot =
+            BootSequence::with_durations(Duration::from_secs(60), Duration::from_millis(200));
         assert_eq!(boot.fade_alpha(), 0.0);
         assert!(!boot.is_done());
     }

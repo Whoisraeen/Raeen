@@ -2059,7 +2059,9 @@ fn load_start_module_from_guest_returns_a_usable_handle() {
     image[off + 3..off + 7].copy_from_slice(&disp.to_le_bytes());
     off += 7;
     // xor esi,esi ; xor edx,edx ; xor ecx,ecx ; xor r8d,r8d ; xor r9d,r9d
-    image[off..off + 12].copy_from_slice(&[0x31, 0xF6, 0x31, 0xD2, 0x31, 0xC9, 0x45, 0x31, 0xC0, 0x45, 0x31, 0xC9]);
+    image[off..off + 12].copy_from_slice(&[
+        0x31, 0xF6, 0x31, 0xD2, 0x31, 0xC9, 0x45, 0x31, 0xC0, 0x45, 0x31, 0xC9,
+    ]);
     off += 12;
     // call qword ptr [rip+disp32] -> SLOT_LSM_OFF
     let disp = (SLOT_LSM_OFF as i64 - (off as i64 + 6)) as i32;
@@ -2127,7 +2129,10 @@ fn load_start_module_from_guest_returns_a_usable_handle() {
     let registry = ModuleRegistry::new(db);
     let linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE)
         .expect("sceKernelLoadStartModule/exit imports must link");
-    assert!(linked.unresolved.is_empty(), "both imports must resolve to HLE");
+    assert!(
+        linked.unresolved.is_empty(),
+        "both imports must resolve to HLE"
+    );
 
     let kernel = OrbisKernel::new();
     let outcome = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[])

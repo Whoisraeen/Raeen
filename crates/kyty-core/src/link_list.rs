@@ -59,7 +59,13 @@ impl<T> Default for List<T> {
 impl<T> List<T> {
     /// Kyty: `List()`.
     pub fn new() -> Self {
-        List { slots: Vec::new(), free: Vec::new(), head: None, tail: None, size: 0 }
+        List {
+            slots: Vec::new(),
+            free: Vec::new(),
+            head: None,
+            tail: None,
+            size: 0,
+        }
     }
 
     /// Kyty: `Size()`.
@@ -81,7 +87,11 @@ impl<T> List<T> {
     /// `InsertBefore(m_head)` on a circular list, which places the new node
     /// just before the head, i.e. at the end of iteration order).
     pub fn add(&mut self, v: T) -> ListIndex {
-        let node = Node { value: v, next: None, prev: self.tail };
+        let node = Node {
+            value: v,
+            next: None,
+            prev: self.tail,
+        };
         let key = if let Some(k) = self.free.pop() {
             self.slots[k] = Some(node);
             k
@@ -192,7 +202,10 @@ impl<T> List<T> {
     /// Iterate over `&T` in list order (a safe convenience not present
     /// verbatim in Kyty, built atop `First`/`Next`).
     pub fn iter(&self) -> ListIter<'_, T> {
-        ListIter { list: self, cur: self.first() }
+        ListIter {
+            list: self,
+            cur: self.first(),
+        }
     }
 }
 

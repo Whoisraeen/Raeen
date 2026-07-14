@@ -47,15 +47,15 @@ pub fn parse_elf(data: &[u8]) -> Result<LoadedBinary, LoaderError> {
 
     // Validate 64-bit ELF.
     if data.len() < 5 || data[4] != 2 {
-        return Err(LoaderError::UnsupportedElfClass(data.get(4).copied().unwrap_or(0)));
+        return Err(LoaderError::UnsupportedElfClass(
+            data.get(4).copied().unwrap_or(0),
+        ));
     }
 
-    let elf = Elf::parse(data).map_err(|e| {
-        LoaderError::SegmentLoadFailed {
-            address: 0,
-            size: 0,
-            reason: format!("ELF parse error: {e}"),
-        }
+    let elf = Elf::parse(data).map_err(|e| LoaderError::SegmentLoadFailed {
+        address: 0,
+        size: 0,
+        reason: format!("ELF parse error: {e}"),
     })?;
 
     // Validate architecture (x86-64).
@@ -74,13 +74,22 @@ pub fn parse_elf(data: &[u8]) -> Result<LoadedBinary, LoaderError> {
     // Check for PS5-specific ELF types.
     match elf.header.e_type {
         ET_SCE_EXEC | ET_SCE_DYNEXEC | ET_SCE_DYNAMIC => {
-            info!("Detected PS5 SCE executable (type {:#x})", elf.header.e_type);
+            info!(
+                "Detected PS5 SCE executable (type {:#x})",
+                elf.header.e_type
+            );
         }
         goblin::elf::header::ET_EXEC | goblin::elf::header::ET_DYN => {
-            info!("Detected standard ELF executable (type {:#x})", elf.header.e_type);
+            info!(
+                "Detected standard ELF executable (type {:#x})",
+                elf.header.e_type
+            );
         }
         _ => {
-            warn!("Unknown ELF type: {:#x}, attempting to load anyway", elf.header.e_type);
+            warn!(
+                "Unknown ELF type: {:#x}, attempting to load anyway",
+                elf.header.e_type
+            );
         }
     }
 
@@ -99,7 +108,10 @@ pub fn parse_elf(data: &[u8]) -> Result<LoadedBinary, LoaderError> {
                 } else {
                     warn!(
                         "Segment at {:#x} extends beyond file (offset {:#x} + size {:#x} > file size {:#x})",
-                        phdr.p_vaddr, offset, file_size, data.len()
+                        phdr.p_vaddr,
+                        offset,
+                        file_size,
+                        data.len()
                     );
                     vec![0u8; phdr.p_memsz as usize]
                 };
@@ -120,16 +132,28 @@ pub fn parse_elf(data: &[u8]) -> Result<LoadedBinary, LoaderError> {
                 });
             }
             PT_SCE_DYNLIBDATA => {
-                debug!("  PT_SCE_DYNLIBDATA: offset={:#x} size={:#x}", phdr.p_offset, phdr.p_filesz);
+                debug!(
+                    "  PT_SCE_DYNLIBDATA: offset={:#x} size={:#x}",
+                    phdr.p_offset, phdr.p_filesz
+                );
             }
             PT_SCE_PROCPARAM => {
-                debug!("  PT_SCE_PROCPARAM: vaddr={:#x} size={:#x}", phdr.p_vaddr, phdr.p_filesz);
+                debug!(
+                    "  PT_SCE_PROCPARAM: vaddr={:#x} size={:#x}",
+                    phdr.p_vaddr, phdr.p_filesz
+                );
             }
             PT_SCE_MODULE_PARAM => {
-                debug!("  PT_SCE_MODULE_PARAM: vaddr={:#x} size={:#x}", phdr.p_vaddr, phdr.p_filesz);
+                debug!(
+                    "  PT_SCE_MODULE_PARAM: vaddr={:#x} size={:#x}",
+                    phdr.p_vaddr, phdr.p_filesz
+                );
             }
             PT_SCE_RELRO => {
-                debug!("  PT_SCE_RELRO: vaddr={:#x} size={:#x}", phdr.p_vaddr, phdr.p_filesz);
+                debug!(
+                    "  PT_SCE_RELRO: vaddr={:#x} size={:#x}",
+                    phdr.p_vaddr, phdr.p_filesz
+                );
             }
             _ => {
                 debug!("  Skipping program header type {:#x}", phdr.p_type);
@@ -138,11 +162,7 @@ pub fn parse_elf(data: &[u8]) -> Result<LoadedBinary, LoaderError> {
     }
 
     // Extract needed libraries from dynamic section.
-    let needed_libraries: Vec<String> = elf
-        .libraries
-        .iter()
-        .map(|lib| lib.to_string())
-        .collect();
+    let needed_libraries: Vec<String> = elf.libraries.iter().map(|lib| lib.to_string()).collect();
 
     if !needed_libraries.is_empty() {
         info!("Required libraries: {:?}", needed_libraries);

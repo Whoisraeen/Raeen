@@ -53,7 +53,9 @@ pub struct RefCounter {
 impl RefCounter {
     /// Equivalent to Kyty's `RefCounter()` — starts the count at 1.
     pub fn new() -> Self {
-        Self { refs: AtomicU32::new(1) }
+        Self {
+            refs: AtomicU32::new(1),
+        }
     }
 
     /// Equivalent to `RefCounter::Refs()` (private in Kyty, exposed here

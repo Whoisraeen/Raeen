@@ -25,7 +25,6 @@ pub struct EmulatorConfig {
     pub paths: PathConfig,
 }
 
-
 /// General emulator settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

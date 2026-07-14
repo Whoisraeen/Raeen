@@ -15,7 +15,9 @@
 //! valid game, just without metadata (title falls back to the folder name,
 //! art falls back to an id-derived gradient).
 
-use super::{ActivityCard, GameMeta, ItemKind, LaunchTarget, LibraryItem, art_from_id, art_from_stops};
+use super::{
+    ActivityCard, GameMeta, ItemKind, LaunchTarget, LibraryItem, art_from_id, art_from_stops,
+};
 use egui::Color32;
 use serde::Deserialize;
 use std::path::Path;
@@ -126,7 +128,10 @@ pub fn parse_title_meta(contents: &str) -> Option<ParsedTitleMeta> {
 /// of an otherwise-valid metadata file.
 fn parse_hex_color(s: &str) -> Option<Color32> {
     let s = s.trim();
-    let s = s.strip_prefix('#').or_else(|| s.strip_prefix("0x")).unwrap_or(s);
+    let s = s
+        .strip_prefix('#')
+        .or_else(|| s.strip_prefix("0x"))
+        .unwrap_or(s);
     if s.len() != 6 || !s.is_ascii() {
         return None;
     }
@@ -141,7 +146,12 @@ fn parse_hex_color(s: &str) -> Option<Color32> {
 /// raw text of `<folder>/xps5x-title.toml`, if one exists and was
 /// readable — parsing failures fall back to a folder-derived title and no
 /// metadata rather than skipping the game.
-pub fn item_from_folder(name: &str, path: &Path, has_eboot: bool, title_toml: Option<&str>) -> Option<LibraryItem> {
+pub fn item_from_folder(
+    name: &str,
+    path: &Path,
+    has_eboot: bool,
+    title_toml: Option<&str>,
+) -> Option<LibraryItem> {
     if !has_eboot {
         return None;
     }
@@ -170,7 +180,9 @@ pub fn item_from_folder(name: &str, path: &Path, has_eboot: bool, title_toml: Op
         art,
         meta,
         cover_path: None,
-        launch: LaunchTarget::Game { path: path.join("eboot.bin") },
+        launch: LaunchTarget::Game {
+            path: path.join("eboot.bin"),
+        },
     })
 }
 
@@ -181,7 +193,10 @@ const COVER_FILE_NAMES: [&str; 3] = ["cover.png", "cover.jpg", "cover.jpeg"];
 
 /// The first conventional cover file that exists inside `folder`, if any.
 fn find_cover(folder: &Path) -> Option<std::path::PathBuf> {
-    COVER_FILE_NAMES.iter().map(|name| folder.join(name)).find(|p| p.is_file())
+    COVER_FILE_NAMES
+        .iter()
+        .map(|name| folder.join(name))
+        .find(|p| p.is_file())
 }
 
 /// Turn a folder name like `nova-requiem` or `sable_horizon` into a display
@@ -319,17 +334,27 @@ mod tests {
 
     #[test]
     fn invalid_gradient_hex_falls_back_to_no_gradient_without_failing_whole_file() {
-        let parsed = parse_title_meta("title = \"Bad Gradient\"\ngradient = [\"not-a-color\", \"#000000\"]")
-            .expect("rest of the file is still valid");
+        let parsed =
+            parse_title_meta("title = \"Bad Gradient\"\ngradient = [\"not-a-color\", \"#000000\"]")
+                .expect("rest of the file is still valid");
         assert!(parsed.gradient.is_none());
         assert_eq!(parsed.title, "Bad Gradient");
     }
 
     #[test]
     fn hex_color_accepts_hash_and_0x_and_bare_forms() {
-        assert_eq!(parse_hex_color("#ff0000"), Some(Color32::from_rgb(0xff, 0, 0)));
-        assert_eq!(parse_hex_color("0x00ff00"), Some(Color32::from_rgb(0, 0xff, 0)));
-        assert_eq!(parse_hex_color("0000ff"), Some(Color32::from_rgb(0, 0, 0xff)));
+        assert_eq!(
+            parse_hex_color("#ff0000"),
+            Some(Color32::from_rgb(0xff, 0, 0))
+        );
+        assert_eq!(
+            parse_hex_color("0x00ff00"),
+            Some(Color32::from_rgb(0, 0xff, 0))
+        );
+        assert_eq!(
+            parse_hex_color("0000ff"),
+            Some(Color32::from_rgb(0, 0, 0xff))
+        );
         assert_eq!(parse_hex_color("nope"), None);
         assert_eq!(parse_hex_color("#ff00"), None);
     }
@@ -337,13 +362,16 @@ mod tests {
     #[test]
     fn folder_with_eboot_and_valid_metadata_uses_it() {
         let path = PathBuf::from("Games/nova-requiem");
-        let item = item_from_folder("nova-requiem", &path, true, Some(VALID_TOML)).expect("should classify");
+        let item = item_from_folder("nova-requiem", &path, true, Some(VALID_TOML))
+            .expect("should classify");
         assert_eq!(item.title, "Nova Requiem");
         assert_eq!(item.kind, ItemKind::Game);
         let meta = item.meta.expect("metadata should be attached");
         assert_eq!(meta.genre, "Action RPG");
         match item.launch {
-            LaunchTarget::Game { path } => assert_eq!(path, PathBuf::from("Games/nova-requiem/eboot.bin")),
+            LaunchTarget::Game { path } => {
+                assert_eq!(path, PathBuf::from("Games/nova-requiem/eboot.bin"))
+            }
             _ => panic!("expected a Game launch target"),
         }
     }
@@ -360,7 +388,8 @@ mod tests {
     #[test]
     fn folder_with_eboot_and_malformed_metadata_still_becomes_a_game() {
         let path = PathBuf::from("Games/nova-requiem");
-        let item = item_from_folder("nova-requiem", &path, true, Some("not valid toml [[[")).expect("should classify");
+        let item = item_from_folder("nova-requiem", &path, true, Some("not valid toml [[["))
+            .expect("should classify");
         assert_eq!(item.title, "Nova Requiem"); // falls back to folder-derived title
         assert!(item.meta.is_none());
     }
@@ -411,7 +440,10 @@ mod tests {
 
         let items = scan_dir(&root);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].cover_path.as_deref(), Some(game.join("cover.png").as_path()));
+        assert_eq!(
+            items[0].cover_path.as_deref(),
+            Some(game.join("cover.png").as_path())
+        );
     }
 
     #[test]

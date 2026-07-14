@@ -5,6 +5,6 @@
 //! - DMA transfers between SSD, memory, and GPU
 //! - Guaranteed I/O bandwidth for asset streaming
 
-pub mod ssd;
 pub mod decompression;
 pub mod dma;
+pub mod ssd;

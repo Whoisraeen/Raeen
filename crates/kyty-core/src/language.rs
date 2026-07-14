@@ -428,12 +428,18 @@ mod tests {
         // English upper+lower has no overlap, so nothing is deduped; ASCII
         // sort puts every uppercase letter before every lowercase letter.
         let letters = get_letters_list_by_id(LanguageId::English);
-        assert_eq!(letters.to_string(), "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz");
+        assert_eq!(
+            letters.to_string(),
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        );
     }
 
     #[test]
     fn get_letters_list_by_code_delegates_to_get_id() {
-        assert_eq!(get_letters_list(&String::from("en")).to_string(), get_letters_list_by_id(LanguageId::English).to_string());
+        assert_eq!(
+            get_letters_list(&String::from("en")).to_string(),
+            get_letters_list_by_id(LanguageId::English).to_string()
+        );
     }
 
     #[test]
@@ -444,10 +450,16 @@ mod tests {
 
     #[test]
     fn get_numeric_list_is_sorted_digits() {
-        assert_eq!(get_numeric_list(&String::from("en")).to_string(), "0123456789");
+        assert_eq!(
+            get_numeric_list(&String::from("en")).to_string(),
+            "0123456789"
+        );
         // The `id` argument is unused in the original; any code (or an
         // unknown one) yields the exact same result.
-        assert_eq!(get_numeric_list(&String::from("xx")).to_string(), "0123456789");
+        assert_eq!(
+            get_numeric_list(&String::from("xx")).to_string(),
+            "0123456789"
+        );
     }
 
     #[test]
@@ -501,15 +513,30 @@ mod tests {
 
     #[test]
     fn get_name_of_month_english_and_russian() {
-        assert_eq!(get_name_of_month(1, LanguageId::English).to_string(), "January");
-        assert_eq!(get_name_of_month(12, LanguageId::English).to_string(), "December");
-        assert_eq!(get_name_of_month(1, LanguageId::Russian).to_string(), "Январь");
+        assert_eq!(
+            get_name_of_month(1, LanguageId::English).to_string(),
+            "January"
+        );
+        assert_eq!(
+            get_name_of_month(12, LanguageId::English).to_string(),
+            "December"
+        );
+        assert_eq!(
+            get_name_of_month(1, LanguageId::Russian).to_string(),
+            "Январь"
+        );
     }
 
     #[test]
     fn get_name_of_month_short_english_and_russian() {
-        assert_eq!(get_name_of_month_short(7, LanguageId::English).to_string(), "Jul");
-        assert_eq!(get_name_of_month_short(7, LanguageId::Russian).to_string(), "Июл");
+        assert_eq!(
+            get_name_of_month_short(7, LanguageId::English).to_string(),
+            "Jul"
+        );
+        assert_eq!(
+            get_name_of_month_short(7, LanguageId::Russian).to_string(),
+            "Июл"
+        );
     }
 
     #[test]
@@ -528,15 +555,30 @@ mod tests {
 
     #[test]
     fn get_name_of_day_english_and_russian() {
-        assert_eq!(get_name_of_day(1, LanguageId::English).to_string(), "Monday");
-        assert_eq!(get_name_of_day(7, LanguageId::English).to_string(), "Sunday");
-        assert_eq!(get_name_of_day(1, LanguageId::Russian).to_string(), "Понедельник");
+        assert_eq!(
+            get_name_of_day(1, LanguageId::English).to_string(),
+            "Monday"
+        );
+        assert_eq!(
+            get_name_of_day(7, LanguageId::English).to_string(),
+            "Sunday"
+        );
+        assert_eq!(
+            get_name_of_day(1, LanguageId::Russian).to_string(),
+            "Понедельник"
+        );
     }
 
     #[test]
     fn get_name_of_day_short_english_and_russian() {
-        assert_eq!(get_name_of_day_short(1, LanguageId::English).to_string(), "Mon");
-        assert_eq!(get_name_of_day_short(1, LanguageId::Russian).to_string(), "Пнд");
+        assert_eq!(
+            get_name_of_day_short(1, LanguageId::English).to_string(),
+            "Mon"
+        );
+        assert_eq!(
+            get_name_of_day_short(1, LanguageId::Russian).to_string(),
+            "Пнд"
+        );
     }
 
     #[test]

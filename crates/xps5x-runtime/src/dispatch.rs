@@ -50,17 +50,17 @@ use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, RemoveVectoredExceptionHandler, RtlCaptureContext, CONTEXT,
-    EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+    EXCEPTION_POINTERS, RemoveVectoredExceptionHandler, RtlCaptureContext,
 };
 
 use xps5x_firmware::HleTrampoline;
 use xps5x_hle::{GuestAllocator, GuestMemory, HleContext, HleRegistry};
 use xps5x_kernel::OrbisKernel;
 
-use crate::trampoline::{self, TrampolineGuard};
 use crate::RunOutcome;
 use crate::RuntimeError;
+use crate::trampoline::{self, TrampolineGuard};
 
 /// The `(library, function)` set that ends a process-mode run instead of
 /// being serviced-and-resumed like an ordinary HLE call (design doc §4, wall

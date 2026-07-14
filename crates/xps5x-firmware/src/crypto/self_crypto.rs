@@ -18,9 +18,9 @@
 //! segment's plaintext bytes truncated to `uncompressed_size`. Segment
 //! compression is out of scope for this milestone.
 
-use crate::crypto::{require_key, KeyProvider, KeyRequest, SegmentKey};
-use aes::cipher::{Array, BlockCipherEncrypt, BlockModeDecrypt, KeyInit, KeyIvInit};
+use crate::crypto::{KeyProvider, KeyRequest, SegmentKey, require_key};
 use aes::Aes128;
+use aes::cipher::{Array, BlockCipherEncrypt, BlockModeDecrypt, KeyInit, KeyIvInit};
 use tracing::{debug, info};
 use xps5x_core::error::{FirmwareError, LoaderError};
 use xps5x_loader::self_format::{SelfEntry, SelfHeader};

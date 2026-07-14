@@ -8,8 +8,8 @@
 //! `NoKeysProvider` throughout — this milestone requires no keys.
 
 use xps5x_firmware::crypto::NoKeysProvider;
-use xps5x_firmware::dynlib::nid::{encode_nid, nid_of, NidDatabase};
-use xps5x_firmware::{load_module, ModuleRegistry, HLE_TRAMPOLINE_BASE, UNRESOLVED_STUB_ADDR};
+use xps5x_firmware::dynlib::nid::{NidDatabase, encode_nid, nid_of};
+use xps5x_firmware::{HLE_TRAMPOLINE_BASE, ModuleRegistry, UNRESOLVED_STUB_ADDR, load_module};
 use xps5x_hle::HleRegistry;
 
 const EHDR_SIZE: usize = 64;
@@ -256,7 +256,10 @@ fn homebrew_sprx_links_import_against_hle_trampoline() {
     let linked = load_module(&sprx, &NoKeysProvider, &mut registry, &hle, base)
         .expect("fully synthetic homebrew .sprx links end-to-end against HLE");
 
-    assert_eq!(read_slot(&linked.image, RELOC_SLOT_OFFSET), HLE_TRAMPOLINE_BASE);
+    assert_eq!(
+        read_slot(&linked.image, RELOC_SLOT_OFFSET),
+        HLE_TRAMPOLINE_BASE
+    );
     assert_eq!(linked.hle_trampolines.len(), 1);
     assert_eq!(linked.hle_trampolines[0].library, lib);
     assert_eq!(linked.hle_trampolines[0].function, func);
@@ -285,7 +288,10 @@ fn homebrew_sprx_with_unknown_import_is_unresolved_not_fatal() {
     let linked = load_module(&sprx, &NoKeysProvider, &mut registry, &hle, base)
         .expect("an unresolved import is non-fatal");
 
-    assert_eq!(read_slot(&linked.image, RELOC_SLOT_OFFSET), UNRESOLVED_STUB_ADDR);
+    assert_eq!(
+        read_slot(&linked.image, RELOC_SLOT_OFFSET),
+        UNRESOLVED_STUB_ADDR
+    );
     assert_eq!(linked.unresolved, vec![bogus_nid]);
     assert!(linked.hle_trampolines.is_empty());
 }
@@ -309,5 +315,8 @@ fn homebrew_sprx_entry_point_propagates_through_load_module() {
     let linked = load_module(&sprx, &NoKeysProvider, &mut registry, &hle, base)
         .expect("fully synthetic homebrew .sprx links end-to-end against HLE");
 
-    assert_eq!(linked.entry, 0x40, "e_entry rides along as an image offset through the whole load_module pipeline");
+    assert_eq!(
+        linked.entry, 0x40,
+        "e_entry rides along as an image offset through the whole load_module pipeline"
+    );
 }

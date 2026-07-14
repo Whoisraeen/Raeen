@@ -18,11 +18,19 @@ pub struct Animated {
 
 impl Animated {
     pub fn new(value: f32) -> Self {
-        Self { value, target: value, speed: 10.0 }
+        Self {
+            value,
+            target: value,
+            speed: 10.0,
+        }
     }
 
     pub fn with_speed(value: f32, speed: f32) -> Self {
-        Self { value, target: value, speed }
+        Self {
+            value,
+            target: value,
+            speed,
+        }
     }
 
     pub fn set_target(&mut self, target: f32) {

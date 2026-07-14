@@ -4,7 +4,7 @@
 //! file rather than reading it into RAM. Reads return borrowed slices into the
 //! mapping; no entry payload is copied or decrypted here.
 
-use crate::slb2::{parse_slb2, Slb2Entry};
+use crate::slb2::{Slb2Entry, parse_slb2};
 use std::path::Path;
 use xps5x_core::error::{FirmwareError, LoaderError};
 

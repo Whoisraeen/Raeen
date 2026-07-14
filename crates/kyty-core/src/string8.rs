@@ -138,7 +138,9 @@ fn parse_int_prefix(bytes: &[u8], mut base: u32) -> (bool, u128) {
             break;
         }
         any_digits = true;
-        magnitude = magnitude.saturating_mul(u128::from(base)).saturating_add(u128::from(digit));
+        magnitude = magnitude
+            .saturating_mul(u128::from(base))
+            .saturating_add(u128::from(digit));
         i += 1;
     }
 
@@ -211,12 +213,16 @@ impl String8 {
     /// `String8(char ch, uint32_t repeat = 1)`. Rust has no default
     /// arguments; pass `1` explicitly for the C++ default.
     pub fn from_char(ch: u8, repeat: u32) -> Self {
-        Self { data: vec![ch; repeat as usize] }
+        Self {
+            data: vec![ch; repeat as usize],
+        }
     }
 
     /// `explicit String8(const char* array, uint32_t size)`.
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        Self { data: bytes.to_vec() }
+        Self {
+            data: bytes.to_vec(),
+        }
     }
 
     /// `Size()`: number of bytes (excludes the internal `'\0'` bookkeeping
@@ -381,7 +387,11 @@ impl String8 {
 
     /// `ReplaceChar(char old_char, char new_char)`.
     pub fn replace_char(&self, old_char: u8, new_char: u8) -> String8 {
-        let data = self.data.iter().map(|&b| if b == old_char { new_char } else { b }).collect();
+        let data = self
+            .data
+            .iter()
+            .map(|&b| if b == old_char { new_char } else { b })
+            .collect();
         String8 { data }
     }
 
@@ -475,8 +485,9 @@ impl String8 {
 
     /// `SafeCsv()`.
     pub fn safe_csv(&self) -> String8 {
-        let add_space =
-            self.starts_with_char(b'+') || self.starts_with_char(b'=') || self.starts_with_char(b'-');
+        let add_space = self.starts_with_char(b'+')
+            || self.starts_with_char(b'=')
+            || self.starts_with_char(b'-');
 
         let needs_quoting = self.contains_char(b'"')
             || self.contains_char(b';')
@@ -781,7 +792,11 @@ impl String8 {
     /// `[INT32_MIN, INT32_MAX]` on overflow.
     pub fn to_int32(&self, base: i32) -> i32 {
         let (negative, magnitude) = parse_int_prefix(&self.data, base as u32);
-        let signed: i128 = if negative { -(magnitude as i128) } else { magnitude as i128 };
+        let signed: i128 = if negative {
+            -(magnitude as i128)
+        } else {
+            magnitude as i128
+        };
         signed.clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32
     }
 
@@ -789,7 +804,11 @@ impl String8 {
     /// `[INT64_MIN, INT64_MAX]` on overflow.
     pub fn to_int64(&self, base: i32) -> i64 {
         let (negative, magnitude) = parse_int_prefix(&self.data, base as u32);
-        let signed: i128 = if negative { -(magnitude as i128) } else { magnitude as i128 };
+        let signed: i128 = if negative {
+            -(magnitude as i128)
+        } else {
+            magnitude as i128
+        };
         signed.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
     }
 
@@ -847,12 +866,16 @@ impl std::fmt::Display for String8 {
 
 impl From<&str> for String8 {
     fn from(s: &str) -> Self {
-        Self { data: s.as_bytes().to_vec() }
+        Self {
+            data: s.as_bytes().to_vec(),
+        }
     }
 }
 impl From<String> for String8 {
     fn from(s: String) -> Self {
-        Self { data: s.into_bytes() }
+        Self {
+            data: s.into_bytes(),
+        }
     }
 }
 impl From<Vec<u8>> for String8 {
@@ -994,7 +1017,12 @@ impl StringList8 {
 
     /// `StringList8::Equal(const StringList8& str)`.
     pub fn equal(&self, other: &StringList8) -> bool {
-        self.items.len() == other.items.len() && self.items.iter().zip(other.items.iter()).all(|(a, b)| a.equal(b))
+        self.items.len() == other.items.len()
+            && self
+                .items
+                .iter()
+                .zip(other.items.iter())
+                .all(|(a, b)| a.equal(b))
     }
 }
 
@@ -1207,9 +1235,15 @@ mod tests {
     fn find_last_index_str_variants() {
         let s = String8::from("abcabc");
         assert_eq!(s.find_last_index(&String8::from("bc"), INVALID_INDEX), 4);
-        assert_eq!(s.find_last_index(&String8::from("zz"), INVALID_INDEX), INVALID_INDEX);
+        assert_eq!(
+            s.find_last_index(&String8::from("zz"), INVALID_INDEX),
+            INVALID_INDEX
+        );
         // Needle longer than haystack: safely INVALID_INDEX (no UB replicated).
-        assert_eq!(s.find_last_index(&String8::from("way too long!!"), INVALID_INDEX), INVALID_INDEX);
+        assert_eq!(
+            s.find_last_index(&String8::from("way too long!!"), INVALID_INDEX),
+            INVALID_INDEX
+        );
     }
 
     #[test]
@@ -1267,7 +1301,10 @@ mod tests {
         let path = String8::from("/usr/local/bin.exe");
         assert_eq!(path.directory_without_filename().as_bytes(), b"/usr/local/");
         assert_eq!(path.filename_without_directory().as_bytes(), b"bin.exe");
-        assert_eq!(path.filename_without_extension().as_bytes(), b"/usr/local/bin");
+        assert_eq!(
+            path.filename_without_extension().as_bytes(),
+            b"/usr/local/bin"
+        );
         assert_eq!(path.extension_without_filename().as_bytes(), b".exe");
 
         let no_slash = String8::from("bin.exe");

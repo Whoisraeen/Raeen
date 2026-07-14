@@ -30,7 +30,9 @@ impl<T: Default> Singleton<T> {
     /// `static`, mirroring Kyty's `static inline T* g_m_instance`.
     #[must_use]
     pub const fn new() -> Self {
-        Self { cell: OnceLock::new() }
+        Self {
+            cell: OnceLock::new(),
+        }
     }
 
     /// Kyty `Instance()`: construct the `T` (via `Default`) on first call and

@@ -88,7 +88,7 @@
 
 use crate::byte_buffer::ByteBuffer;
 use crate::string8::String8;
-use std::char::{decode_utf16, REPLACEMENT_CHARACTER};
+use std::char::{REPLACEMENT_CHARACTER, decode_utf16};
 use std::string::String as StdString;
 
 /// `STRING_INVALID_INDEX`: sentinel returned by the `Find*` family when no
@@ -303,7 +303,9 @@ impl String {
     /// `String(char32_t ch, uint32_t repeat = 1)`. Rust has no default
     /// arguments; pass `1` explicitly for the C++ default.
     pub fn from_char(ch: char, repeat: u32) -> Self {
-        Self { data: vec![ch; repeat as usize] }
+        Self {
+            data: vec![ch; repeat as usize],
+        }
     }
 
     /// `static String FromUtf8(const char* utf8_str)`. Decodes with Rust's
@@ -312,7 +314,9 @@ impl String {
     /// `Char::ReadUtf8`'s recursive BOM skip.
     pub fn from_utf8_bytes(bytes: &[u8]) -> Self {
         let text = StdString::from_utf8_lossy(bytes);
-        Self { data: text.chars().filter(|&c| c != '\u{FEFF}').collect() }
+        Self {
+            data: text.chars().filter(|&c| c != '\u{FEFF}').collect(),
+        }
     }
 
     /// `explicit String(const Utf8& utf8)`.
@@ -342,12 +346,16 @@ impl String {
     /// `static String FromCp866(const char* utf8_str)` (parameter is really
     /// CP866 bytes despite the C++ name).
     pub fn from_cp866(bytes: &[u8]) -> Self {
-        Self { data: bytes.iter().map(|&b| cp866_decode_byte(b)).collect() }
+        Self {
+            data: bytes.iter().map(|&b| cp866_decode_byte(b)).collect(),
+        }
     }
 
     /// `static String FromCp1251(const char* utf8_str)`.
     pub fn from_cp1251(bytes: &[u8]) -> Self {
-        Self { data: bytes.iter().map(|&b| cp1251_decode_byte(b)).collect() }
+        Self {
+            data: bytes.iter().map(|&b| cp1251_decode_byte(b)).collect(),
+        }
     }
 
     /// `Size()`.
@@ -447,7 +455,12 @@ impl String {
 
     /// `EqualNoCase(const String& src)`.
     pub fn equal_no_case(&self, other: &String) -> bool {
-        self.data.len() == other.data.len() && self.data.iter().zip(other.data.iter()).all(|(&a, &b)| char_eq_no_case(a, b))
+        self.data.len() == other.data.len()
+            && self
+                .data
+                .iter()
+                .zip(other.data.iter())
+                .all(|(&a, &b)| char_eq_no_case(a, b))
     }
 
     /// `EqualNoCase(char32_t ch)`.
@@ -473,7 +486,9 @@ impl String {
         if first == 0 && count == size {
             return self.clone();
         }
-        String { data: self.data[first as usize..(first + count) as usize].to_vec() }
+        String {
+            data: self.data[first as usize..(first + count) as usize].to_vec(),
+        }
     }
 
     /// `Mid(uint32_t first)` (single-argument overload).
@@ -498,12 +513,16 @@ impl String {
     /// `ToUpper()`. See module doc comment for the "first code point only"
     /// divergence from Rust's full Unicode case folding.
     pub fn to_upper(&self) -> String {
-        String { data: self.data.iter().map(|&c| char_to_upper(c)).collect() }
+        String {
+            data: self.data.iter().map(|&c| char_to_upper(c)).collect(),
+        }
     }
 
     /// `ToLower()`.
     pub fn to_lower(&self) -> String {
-        String { data: self.data.iter().map(|&c| char_to_lower(c)).collect() }
+        String {
+            data: self.data.iter().map(|&c| char_to_lower(c)).collect(),
+        }
     }
 
     /// `TrimRight()`.
@@ -668,7 +687,9 @@ impl String {
         let size = self.size();
         let mut result = self.mid(0, index);
         result.data.extend_from_slice(&s.data);
-        result.data.extend_from_slice(&self.mid(index, size.saturating_sub(index)).data);
+        result
+            .data
+            .extend_from_slice(&self.mid(index, size.saturating_sub(index)).data);
         result
     }
 
@@ -725,7 +746,8 @@ impl String {
             Case::Insensitive => {
                 let mut i = from;
                 while i + str_size <= size {
-                    if compare_equal_no_case(&self.data, &s.data, i as usize, 0, str_size as usize) {
+                    if compare_equal_no_case(&self.data, &s.data, i as usize, 0, str_size as usize)
+                    {
                         return i;
                     }
                     i += 1;
@@ -770,7 +792,8 @@ impl String {
             }
             Case::Insensitive => {
                 for i in (0..=from).rev() {
-                    if compare_equal_no_case(&self.data, &s.data, i as usize, 0, str_size as usize) {
+                    if compare_equal_no_case(&self.data, &s.data, i as usize, 0, str_size as usize)
+                    {
                         return i;
                     }
                 }
@@ -1087,7 +1110,12 @@ impl String {
 
     /// `EqualAsciiNoCase(const char* ascii_str)`.
     pub fn equal_ascii_no_case(&self, ascii: &str) -> bool {
-        self.data.len() == ascii.chars().count() && self.data.iter().zip(ascii.chars()).all(|(&a, b)| char_eq_no_case(a, b))
+        self.data.len() == ascii.chars().count()
+            && self
+                .data
+                .iter()
+                .zip(ascii.chars())
+                .all(|(&a, b)| char_eq_no_case(a, b))
     }
 
     /// `IsAlpha()`. Uses `char::is_alphabetic` (std) in place of
@@ -1292,12 +1320,22 @@ impl StringList {
 
     /// `StringList::Equal(const StringList& str)`.
     pub fn equal(&self, other: &StringList) -> bool {
-        self.items.len() == other.items.len() && self.items.iter().zip(other.items.iter()).all(|(a, b)| a.equal(b))
+        self.items.len() == other.items.len()
+            && self
+                .items
+                .iter()
+                .zip(other.items.iter())
+                .all(|(a, b)| a.equal(b))
     }
 
     /// `StringList::EqualNoCase(const StringList& str)`.
     pub fn equal_no_case(&self, other: &StringList) -> bool {
-        self.items.len() == other.items.len() && self.items.iter().zip(other.items.iter()).all(|(a, b)| a.equal_no_case(b))
+        self.items.len() == other.items.len()
+            && self
+                .items
+                .iter()
+                .zip(other.items.iter())
+                .all(|(a, b)| a.equal_no_case(b))
     }
 }
 
@@ -1486,8 +1524,14 @@ mod tests {
     #[test]
     fn replace_char_and_str_with_case() {
         let s = String::from("a-B-c");
-        assert_eq!(s.replace_char('-', '_', Case::Sensitive).to_string(), "a_B_c");
-        assert_eq!(s.replace_char('b', '_', Case::Insensitive).to_string(), "a-_-c");
+        assert_eq!(
+            s.replace_char('-', '_', Case::Sensitive).to_string(),
+            "a_B_c"
+        );
+        assert_eq!(
+            s.replace_char('b', '_', Case::Insensitive).to_string(),
+            "a-_-c"
+        );
 
         let s2 = String::from("foo bar foo");
         let replaced = s2.replace_str(&String::from("foo"), &String::from("baz"), Case::Sensitive);
@@ -1503,7 +1547,11 @@ mod tests {
         assert_eq!(s.remove_first(2).to_string(), "llo");
 
         let s2 = String::from("foo bar foo");
-        assert_eq!(s2.remove_str(&String::from("foo"), Case::Sensitive).to_string(), " bar ");
+        assert_eq!(
+            s2.remove_str(&String::from("foo"), Case::Sensitive)
+                .to_string(),
+            " bar "
+        );
     }
 
     #[test]
@@ -1518,10 +1566,19 @@ mod tests {
         let s = String::from("abcABCabc");
         assert_eq!(s.find_index(&String::from("bc"), 0, Case::Sensitive), 1);
         assert_eq!(s.find_index(&String::from("BC"), 0, Case::Insensitive), 1);
-        assert_eq!(s.find_index(&String::from("zz"), 0, Case::Sensitive), INVALID_INDEX);
-        assert_eq!(s.find_last_index(&String::from("abc"), INVALID_INDEX, Case::Sensitive), 6);
+        assert_eq!(
+            s.find_index(&String::from("zz"), 0, Case::Sensitive),
+            INVALID_INDEX
+        );
+        assert_eq!(
+            s.find_last_index(&String::from("abc"), INVALID_INDEX, Case::Sensitive),
+            6
+        );
         assert_eq!(s.find_index_char('C', 0, Case::Insensitive), 2);
-        assert_eq!(s.find_last_index_char('a', INVALID_INDEX, Case::Sensitive), 6);
+        assert_eq!(
+            s.find_last_index_char('a', INVALID_INDEX, Case::Sensitive),
+            6
+        );
     }
 
     #[test]
@@ -1549,7 +1606,10 @@ mod tests {
         let path = String::from("/usr/local/bin.exe");
         assert_eq!(path.directory_without_filename().to_string(), "/usr/local/");
         assert_eq!(path.filename_without_directory().to_string(), "bin.exe");
-        assert_eq!(path.filename_without_extension().to_string(), "/usr/local/bin");
+        assert_eq!(
+            path.filename_without_extension().to_string(),
+            "/usr/local/bin"
+        );
         assert_eq!(path.extension_without_filename().to_string(), ".exe");
 
         let win = String::from(r"a\b\c");
@@ -1561,9 +1621,17 @@ mod tests {
     #[test]
     fn split_str_and_char_with_empty_parts() {
         let s = String::from("a,,b,c");
-        let no_empty = s.split(&String::from(","), SplitType::SplitNoEmptyParts, Case::Sensitive);
+        let no_empty = s.split(
+            &String::from(","),
+            SplitType::SplitNoEmptyParts,
+            Case::Sensitive,
+        );
         assert_eq!(no_empty.size(), 3);
-        let with_empty = s.split(&String::from(","), SplitType::WithEmptyParts, Case::Sensitive);
+        let with_empty = s.split(
+            &String::from(","),
+            SplitType::WithEmptyParts,
+            Case::Sensitive,
+        );
         assert_eq!(with_empty.size(), 4);
 
         let s2 = String::from("a/b//c");
@@ -1578,8 +1646,14 @@ mod tests {
         assert_eq!(s.safe_lua().to_string(), r"it\'s a \\test\\");
 
         assert_eq!(String::from("plain").safe_csv().to_string(), "plain");
-        assert_eq!(String::from("has \"quote\"").safe_csv().to_string(), "\"has \"\"quote\"\"\"");
-        assert_eq!(String::from("=SUM(A1)").safe_csv().to_string(), "\" =SUM(A1)\"");
+        assert_eq!(
+            String::from("has \"quote\"").safe_csv().to_string(),
+            "\"has \"\"quote\"\"\""
+        );
+        assert_eq!(
+            String::from("=SUM(A1)").safe_csv().to_string(),
+            "\" =SUM(A1)\""
+        );
     }
 
     #[test]

@@ -4,9 +4,9 @@
 //! Provides HRTF-based spatial audio processing supporting
 //! up to 128 audio objects positioned in 3D space.
 
-pub mod tempest;
 pub mod hrtf;
 pub mod output;
+pub mod tempest;
 
 use tracing::info;
 
@@ -24,7 +24,10 @@ pub struct AudioEngine {
 
 impl AudioEngine {
     pub fn new(enabled: bool, spatial: bool) -> Self {
-        info!("Audio engine created (enabled={}, spatial={})", enabled, spatial);
+        info!(
+            "Audio engine created (enabled={}, spatial={})",
+            enabled, spatial
+        );
         Self {
             enabled,
             master_volume: 1.0,

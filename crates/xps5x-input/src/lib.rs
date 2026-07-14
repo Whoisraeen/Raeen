@@ -4,9 +4,9 @@
 //! Provides haptic feedback, adaptive trigger translation, and
 //! fallback to XInput/SDL for non-DualSense controllers.
 
+pub mod adaptive_triggers;
 pub mod dualsense;
 pub mod haptics;
-pub mod adaptive_triggers;
 
 use tracing::info;
 
@@ -14,16 +14,16 @@ use tracing::info;
 #[derive(Debug, Clone, Default)]
 pub struct ControllerState {
     // ─── Buttons ───────────────────────────────────
-    pub cross: bool,        // ✕
-    pub circle: bool,       // ○
-    pub square: bool,       // □
-    pub triangle: bool,     // △
+    pub cross: bool,    // ✕
+    pub circle: bool,   // ○
+    pub square: bool,   // □
+    pub triangle: bool, // △
     pub l1: bool,
     pub r1: bool,
-    pub l3: bool,           // Left stick click
-    pub r3: bool,           // Right stick click
+    pub l3: bool, // Left stick click
+    pub r3: bool, // Right stick click
     pub options: bool,
-    pub create: bool,       // Share/Create button
+    pub create: bool, // Share/Create button
     pub ps_button: bool,
     pub touchpad_click: bool,
     pub dpad_up: bool,
@@ -32,11 +32,11 @@ pub struct ControllerState {
     pub dpad_right: bool,
 
     // ─── Analog ────────────────────────────────────
-    pub left_stick_x: f32,  // -1.0 to 1.0
+    pub left_stick_x: f32, // -1.0 to 1.0
     pub left_stick_y: f32,
     pub right_stick_x: f32,
     pub right_stick_y: f32,
-    pub l2_trigger: f32,    // 0.0 to 1.0
+    pub l2_trigger: f32, // 0.0 to 1.0
     pub r2_trigger: f32,
 
     // ─── Motion ────────────────────────────────────

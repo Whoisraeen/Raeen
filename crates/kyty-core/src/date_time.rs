@@ -176,7 +176,9 @@ fn ymd_to_jd(year: i32, month: i32, day: i32) -> Jd {
     let a = floordiv(14 - t_month, 12);
     let y = t_year + 4800 - a;
     let m = t_month + 12 * a - 3;
-    t_day + floordiv(153 * m + 2, 5) + 365 * y + floordiv(y, 4) - floordiv(y, 100) + floordiv(y, 400) - 32045
+    t_day + floordiv(153 * m + 2, 5) + 365 * y + floordiv(y, 4) - floordiv(y, 100)
+        + floordiv(y, 400)
+        - 32045
 }
 
 /// Port of the free function `jd_to_ymd` in `DateTime.cpp`.
@@ -219,7 +221,9 @@ pub struct Date {
 
 impl Default for Date {
     fn default() -> Self {
-        Date { jd: DATE_JD_INVALID }
+        Date {
+            jd: DATE_JD_INVALID,
+        }
     }
 }
 
@@ -332,11 +336,7 @@ impl Date {
         if self.is_invalid() {
             return 0;
         }
-        if self.is_leap_year() {
-            366
-        } else {
-            365
-        }
+        if self.is_leap_year() { 366 } else { 365 }
     }
 
     #[must_use]
@@ -447,7 +447,9 @@ impl Date {
         if year == 0 {
             return false;
         }
-        (day >= 1) && (day <= Date::days_in_month_static(month) || (day == 29 && month == 2 && Date::is_leap_year_static(year)))
+        (day >= 1)
+            && (day <= Date::days_in_month_static(month)
+                || (day == 29 && month == 2 && Date::is_leap_year_static(year)))
     }
 
     #[must_use]
@@ -570,7 +572,9 @@ pub struct Time {
 
 impl Default for Time {
     fn default() -> Self {
-        Time { ms: TIME_MS_INVALID }
+        Time {
+            ms: TIME_MS_INVALID,
+        }
     }
 }
 
@@ -579,7 +583,9 @@ impl Time {
     #[must_use]
     pub fn new(msec: i32) -> Self {
         if !(0..TIME_MS_IN_DAY).contains(&msec) {
-            Time { ms: TIME_MS_INVALID }
+            Time {
+                ms: TIME_MS_INVALID,
+            }
         } else {
             Time { ms: msec }
         }
@@ -643,11 +649,7 @@ impl Time {
             return -1;
         }
         let h = ms_to_hms(self.ms).0 % 12;
-        if h == 0 {
-            12
-        } else {
-            h
-        }
+        if h == 0 { 12 } else { h }
     }
 
     #[must_use]
@@ -738,7 +740,10 @@ impl Time {
 
     #[must_use]
     pub fn is_valid(hour: i32, minute: i32, second: i32, msec: i32) -> bool {
-        (0..=23).contains(&hour) && (0..=59).contains(&minute) && (0..=59).contains(&second) && (0..=999).contains(&msec)
+        (0..=23).contains(&hour)
+            && (0..=59).contains(&minute)
+            && (0..=59).contains(&second)
+            && (0..=999).contains(&msec)
     }
 }
 
@@ -861,13 +866,19 @@ impl DateTime {
     /// `explicit DateTime(const Date& d)`.
     #[must_use]
     pub fn from_date(d: Date) -> Self {
-        DateTime { date: d, time: Time::default() }
+        DateTime {
+            date: d,
+            time: Time::default(),
+        }
     }
 
     /// `explicit DateTime(const Time& t)`.
     #[must_use]
     pub fn from_time(t: Time) -> Self {
-        DateTime { date: Date::default(), time: t }
+        DateTime {
+            date: Date::default(),
+            time: t,
+        }
     }
 
     /// `explicit DateTime(const Date& d, const Time& t)` (and the
@@ -898,13 +909,17 @@ impl DateTime {
         let shifted = jd + 0.5;
         let i = shifted.trunc();
         let f = shifted - i;
-        DateTime::from_date_time(Date::new(i as Jd), Time::new((f * f64::from(TIME_MS_IN_DAY)) as i32))
+        DateTime::from_date_time(
+            Date::new(i as Jd),
+            Time::new((f * f64::from(TIME_MS_IN_DAY)) as i32),
+        )
     }
 
     /// `double DateTime::ToSQLiteJulian() const`.
     #[must_use]
     pub fn to_sqlite_julian(&self) -> f64 {
-        -0.5 + f64::from(self.date.julian_day()) + f64::from(self.time.msec_total()) / f64::from(TIME_MS_IN_DAY)
+        -0.5 + f64::from(self.date.julian_day())
+            + f64::from(self.time.msec_total()) / f64::from(TIME_MS_IN_DAY)
     }
 
     /// `int64_t DateTime::ToSQLiteJulianInt64() const`.
@@ -1023,7 +1038,9 @@ impl Ord for DateTime {
 /// is, via this module's own `jd_to_ymd`/`ms_to_hms` so the result is
 /// self-consistent with `Date`/`Time`'s own calendar math.
 fn now_utc_ymd_hms() -> (i32, i32, i32, i32, i32, i32, i32) {
-    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let epoch_jd = ymd_to_jd(1970, 1, 1);
     let total_secs = dur.as_secs() as i64;
     let days = total_secs.div_euclid(86400);
@@ -1148,10 +1165,16 @@ mod tests {
     #[test]
     fn date_to_string_names_and_julian() {
         let d = Date::from_ymd(2026, 7, 12); // Sunday
-        assert_eq!(d.to_string("DAY, MON DD YYYY", LanguageId::English), "Sunday, Jul 12 2026");
+        assert_eq!(
+            d.to_string("DAY, MON DD YYYY", LanguageId::English),
+            "Sunday, Jul 12 2026"
+        );
         assert_eq!(d.to_string("DY", LanguageId::English), "Sun");
         assert_eq!(d.to_string("MONTH", LanguageId::English), "July");
-        assert_eq!(d.to_string("J", LanguageId::English), format!("{}", d.julian_day()));
+        assert_eq!(
+            d.to_string("J", LanguageId::English),
+            format!("{}", d.julian_day())
+        );
         assert_eq!(d.to_string("Q D", LanguageId::English), "3 7");
     }
 
@@ -1249,8 +1272,10 @@ mod tests {
 
     #[test]
     fn datetime_construction_and_ordering() {
-        let dt1 = DateTime::from_date_time(Date::from_ymd(2026, 7, 12), Time::from_hms(10, 0, 0, 0));
-        let dt2 = DateTime::from_date_time(Date::from_ymd(2026, 7, 12), Time::from_hms(11, 0, 0, 0));
+        let dt1 =
+            DateTime::from_date_time(Date::from_ymd(2026, 7, 12), Time::from_hms(10, 0, 0, 0));
+        let dt2 =
+            DateTime::from_date_time(Date::from_ymd(2026, 7, 12), Time::from_hms(11, 0, 0, 0));
         assert!(dt1 < dt2);
         assert!(dt2 > dt1);
         assert_ne!(dt1, dt2);
@@ -1297,12 +1322,18 @@ mod tests {
     #[test]
     fn datetime_to_string_combines_date_and_time() {
         let dt = DateTime::from_date_time(Date::from_ymd(2026, 7, 12), Time::from_hms(9, 5, 0, 0));
-        assert_eq!(dt.to_string("YYYY.MM.DD HH24:MI:SS", LanguageId::English), "2026.07.12 09:05:00");
+        assert_eq!(
+            dt.to_string("YYYY.MM.DD HH24:MI:SS", LanguageId::English),
+            "2026.07.12 09:05:00"
+        );
     }
 
     #[test]
     fn datetime_to_string_invalid_is_empty() {
-        assert_eq!(DateTime::default().to_string("YYYY.MM.DD", LanguageId::English), "");
+        assert_eq!(
+            DateTime::default().to_string("YYYY.MM.DD", LanguageId::English),
+            ""
+        );
     }
 
     #[test]

@@ -21,7 +21,11 @@ pub struct XPS5XApp {
 }
 
 impl XPS5XApp {
-    pub fn new(ctx: &egui::Context, config: xps5x_core::config::EmulatorConfig, config_path: PathBuf) -> Self {
+    pub fn new(
+        ctx: &egui::Context,
+        config: xps5x_core::config::EmulatorConfig,
+        config_path: PathBuf,
+    ) -> Self {
         let themes_root = PathBuf::from(THEMES_ROOT);
         // Load whichever theme Settings last selected (SM2a persisted the
         // field; SM2b is what actually resolves it to a `themes/<name>`
@@ -51,7 +55,20 @@ impl XPS5XApp {
         // an informative message rather than a crash.
         let launcher = Box::new(FirmwareLauncher::new());
 
-        Self { shell: Shell::new(ctx, theme, themes_root, library, launcher, config, config_path) }
+        let mut shell = Shell::new(
+            ctx,
+            theme,
+            themes_root,
+            library,
+            launcher,
+            config,
+            config_path,
+        );
+        // Fire the startup update check here (not in `Shell::new`) so unit
+        // tests constructing a Shell never touch the network.
+        shell.start_update_check();
+
+        Self { shell }
     }
 }
 

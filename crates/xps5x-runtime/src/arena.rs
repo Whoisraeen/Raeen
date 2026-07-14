@@ -21,13 +21,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use windows_sys::Win32::System::Memory::{
-    VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
-    PAGE_NOACCESS, PAGE_READWRITE,
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READWRITE,
+    VirtualAlloc, VirtualFree,
 };
 
 use xps5x_hle::{GuestAllocator, GuestMemory};
 
-use crate::{RuntimeError, GUEST_ARENA_BASE};
+use crate::{GUEST_ARENA_BASE, RuntimeError};
 
 /// x86-64 Windows' page size (see `mem.rs`/`trampoline.rs`'s equivalent
 /// constants); also the default alignment `mmap` bumps to.
@@ -88,11 +88,7 @@ fn stack_canary() -> u64 {
     let mut hasher = RandomState::new().build_hasher();
     hasher.write_u64(0x5A_FE_57_AC_C4_AA_2D_00);
     let masked = hasher.finish() & !0xFF;
-    if masked == 0 {
-        0x100
-    } else {
-        masked
-    }
+    if masked == 0 { 0x100 } else { masked }
 }
 
 /// Round `align` up to a power of two no smaller than 16 (the minimum

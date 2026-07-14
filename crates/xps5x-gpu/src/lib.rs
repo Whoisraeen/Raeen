@@ -27,7 +27,7 @@ pub mod backend;
 pub mod gnm;
 pub mod metal;
 pub mod shader;
-pub mod vulkan;
 pub mod texture;
+pub mod vulkan;
 
-pub use backend::{create_backend, default_backend_kind, BackendKind, GpuBackend, ShaderFormat};
+pub use backend::{BackendKind, GpuBackend, ShaderFormat, create_backend, default_backend_kind};

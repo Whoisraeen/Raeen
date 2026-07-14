@@ -73,10 +73,17 @@ fn loads_minimal_homebrew_elf_into_memory() {
         .memory
         .region_containing(entry)
         .expect("entry point must be mapped");
-    assert!(region.protection.contains(xps5x_core::types::MemoryProtection::EXEC));
+    assert!(
+        region
+            .protection
+            .contains(xps5x_core::types::MemoryProtection::EXEC)
+    );
 
     // The code bytes are readable back at the entry point.
-    let read_back = kernel.memory.read(entry, code.len()).expect("code readable");
+    let read_back = kernel
+        .memory
+        .read(entry, code.len())
+        .expect("code readable");
     assert_eq!(read_back, code);
 }
 

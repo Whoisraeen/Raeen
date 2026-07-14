@@ -15,8 +15,8 @@ use std::collections::HashMap;
 
 use xps5x_hle::HleRegistry;
 
-use crate::dynlib::nid::NidDatabase;
 use crate::dynlib::SymbolExport;
+use crate::dynlib::nid::NidDatabase;
 
 /// The result of resolving one import NID.
 #[derive(Debug, Clone, PartialEq, Eq)]

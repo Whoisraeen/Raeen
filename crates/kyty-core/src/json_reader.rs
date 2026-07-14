@@ -155,7 +155,10 @@ impl Json {
 
     /// `static String GetError()`.
     pub fn get_error() -> String {
-        JSON_ERROR.lock().map(|guard| guard.clone().unwrap_or_default()).unwrap_or_default()
+        JSON_ERROR
+            .lock()
+            .map(|guard| guard.clone().unwrap_or_default())
+            .unwrap_or_default()
     }
 
     /// `const Json* GetItem(const char* string) const`.
@@ -171,7 +174,11 @@ impl Json {
     /// `String GetString(const char* name, const String& default_value) const`.
     pub fn get_string(&self, name: &str, default_value: &String) -> String {
         let n = self.get_item(name);
-        if !n.is_null() { n.value_string.clone() } else { default_value.clone() }
+        if !n.is_null() {
+            n.value_string.clone()
+        } else {
+            default_value.clone()
+        }
     }
 
     /// `String GetString(const char* name) const` (defaults to `U""`).
@@ -182,19 +189,31 @@ impl Json {
     /// `double GetFloat(const char* name, double default_value) const`.
     pub fn get_float(&self, name: &str, default_value: f64) -> f64 {
         let n = self.get_item(name);
-        if !n.is_null() { n.value_double } else { default_value }
+        if !n.is_null() {
+            n.value_double
+        } else {
+            default_value
+        }
     }
 
     /// `int64_t GetInt(const char* name, int64_t default_value) const`.
     pub fn get_int(&self, name: &str, default_value: i64) -> i64 {
         let n = self.get_item(name);
-        if !n.is_null() { n.value_int } else { default_value }
+        if !n.is_null() {
+            n.value_int
+        } else {
+            default_value
+        }
     }
 
     /// `bool GetBool(const char* name, bool default_value) const`.
     pub fn get_bool(&self, name: &str, default_value: bool) -> bool {
         let n = self.get_item(name);
-        if !n.is_null() { n.value_bool } else { default_value }
+        if !n.is_null() {
+            n.value_bool
+        } else {
+            default_value
+        }
     }
 
     /// `String GetName() const`.
@@ -275,7 +294,9 @@ impl Json {
         }
 
         for child in &self.list {
-            if !(child.name.is_empty() || required.contains(&child.name, Case::Sensitive) || optional.contains(&child.name, Case::Sensitive))
+            if !(child.name.is_empty()
+                || required.contains(&child.name, Case::Sensitive)
+                || optional.contains(&child.name, Case::Sensitive))
             {
                 errors.add(String::from("unknown: ") + &child.name);
             }

@@ -7,8 +7,8 @@
 //! This module decodes PM4 packets and translates them to Vulkan.
 
 pub mod command_buffer;
-pub mod draw;
 pub mod compute;
+pub mod draw;
 pub mod registers;
 
 use tracing::{debug, info};
@@ -85,7 +85,10 @@ impl GnmContext {
                     self.stats.pm4_packets_decoded += 1;
                 }
                 _ => {
-                    debug!("Unknown PM4 packet type {} at offset {}", packet_type, offset);
+                    debug!(
+                        "Unknown PM4 packet type {} at offset {}",
+                        packet_type, offset
+                    );
                     offset += 1;
                     self.stats.unknown_opcodes += 1;
                 }

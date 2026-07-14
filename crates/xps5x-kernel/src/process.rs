@@ -12,7 +12,7 @@ use crate::OrbisKernel;
 use tracing::{debug, info};
 use xps5x_core::error::{KernelError, XPS5XError};
 use xps5x_core::types::{MemoryProtection, ModuleInfo, VAddr};
-use xps5x_loader::{self_format, LoadedBinary, LoadedSegment};
+use xps5x_loader::{LoadedBinary, LoadedSegment, self_format};
 
 /// A loaded executable image in the emulated address space.
 #[derive(Debug, Clone)]

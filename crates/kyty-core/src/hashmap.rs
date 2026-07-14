@@ -57,7 +57,11 @@ pub struct Hashmap<K, V> {
 impl<K, V> Hashmap<K, V> {
     /// `Hashmap()`: empty map.
     pub fn new() -> Self {
-        Self { map: HashMap::new(), iter_keys: RefCell::new(Vec::new()), iter_pos: Cell::new(0) }
+        Self {
+            map: HashMap::new(),
+            iter_keys: RefCell::new(Vec::new()),
+            iter_pos: Cell::new(0),
+        }
     }
 
     /// `Size()`.
@@ -145,7 +149,9 @@ impl<K: Eq + Hash + Clone, V> Hashmap<K, V> {
     pub fn value(&self) -> &V {
         let pos = self.iter_pos.get();
         let key = self.iter_keys.borrow()[pos].clone();
-        self.map.get(&key).expect("Hashmap::value(): iterator key missing from map (removed during iteration?)")
+        self.map
+            .get(&key)
+            .expect("Hashmap::value(): iterator key missing from map (removed during iteration?)")
     }
 
     /// `ForEach(callback, arg)`: visits every (key, value) pair via the

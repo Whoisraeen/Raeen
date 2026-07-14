@@ -174,7 +174,11 @@ pub fn parse_self(data: &[u8]) -> Result<LoadedBinary, LoaderError> {
         return Err(LoaderError::SegmentLoadFailed {
             address: 0,
             size: 0,
-            reason: format!("SELF header_size ({:#x}) exceeds file size ({:#x})", elf_offset, data.len()),
+            reason: format!(
+                "SELF header_size ({:#x}) exceeds file size ({:#x})",
+                elf_offset,
+                data.len()
+            ),
         });
     }
 
@@ -208,12 +212,19 @@ pub fn load_binary(data: &[u8]) -> Result<LoadedBinary, LoaderError> {
         }
         _ => {
             // Try PKG format.
-            if data.len() >= 4 && data[0] == 0x7F && data[1] == b'C' && data[2] == b'N' && data[3] == b'T' {
+            if data.len() >= 4
+                && data[0] == 0x7F
+                && data[1] == b'C'
+                && data[2] == b'N'
+                && data[3] == b'T'
+            {
                 info!("Detected PKG format — use pkg::parse_pkg() for extraction first");
                 Err(LoaderError::SegmentLoadFailed {
                     address: 0,
                     size: 0,
-                    reason: "PKG files must be extracted before loading. Use pkg::parse_pkg() first.".to_string(),
+                    reason:
+                        "PKG files must be extracted before loading. Use pkg::parse_pkg() first."
+                            .to_string(),
                 })
             } else {
                 Err(LoaderError::InvalidElfMagic(magic))

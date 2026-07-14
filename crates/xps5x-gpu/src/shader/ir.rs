@@ -4,8 +4,8 @@
 //! which is closer to SPIR-V's SSA form. This allows optimization
 //! passes before final SPIR-V emission.
 
-use super::gcn_decoder::{Encoding, Instruction};
 use super::ShaderType;
+use super::gcn_decoder::{Encoding, Instruction};
 
 /// An IR program ready for SPIR-V emission.
 #[derive(Debug)]
@@ -43,14 +43,14 @@ pub enum IrOp {
     Sub,
     Mul,
     Div,
-    Fma,        // Fused multiply-add
+    Fma, // Fused multiply-add
     Min,
     Max,
     Abs,
     Neg,
     Sqrt,
-    Rsqrt,      // Reciprocal square root
-    Rcp,        // Reciprocal
+    Rsqrt, // Reciprocal square root
+    Rcp,   // Reciprocal
     Floor,
     Ceil,
     Fract,
@@ -88,7 +88,7 @@ pub enum IrOp {
     // ─── Flow control ──────────────────────────────
     Branch,
     BranchCond,
-    Phi,        // SSA phi node
+    Phi, // SSA phi node
     Return,
     // ─── Export ─────────────────────────────────────
     ExportPosition,
@@ -96,7 +96,7 @@ pub enum IrOp {
     ExportColor,
     // ─── Misc ──────────────────────────────────────
     Mov,
-    Select,     // Ternary select (condition ? a : b)
+    Select, // Ternary select (condition ? a : b)
     Nop,
 }
 
@@ -234,27 +234,27 @@ pub fn lift_to_ir(instructions: &[Instruction], shader_type: ShaderType) -> IrPr
 fn map_vop_to_ir(opcode: u32, encoding: Encoding) -> IrOp {
     match encoding {
         Encoding::Vop2 => match opcode {
-            0x01 => IrOp::Add,    // V_ADD_F32
-            0x02 => IrOp::Sub,    // V_SUB_F32
-            0x04 => IrOp::Mul,    // V_MUL_F32
-            0x05 => IrOp::Min,    // V_MIN_F32
-            0x06 => IrOp::Max,    // V_MAX_F32
-            0x08 => IrOp::Fma,    // V_MAC_F32
-            0x19 => IrOp::IAdd,   // V_ADD_U32
-            0x1A => IrOp::ISub,   // V_SUB_U32
-            0x1B => IrOp::And,    // V_AND_B32
-            0x1C => IrOp::Or,     // V_OR_B32
-            0x1D => IrOp::Xor,    // V_XOR_B32
+            0x01 => IrOp::Add,  // V_ADD_F32
+            0x02 => IrOp::Sub,  // V_SUB_F32
+            0x04 => IrOp::Mul,  // V_MUL_F32
+            0x05 => IrOp::Min,  // V_MIN_F32
+            0x06 => IrOp::Max,  // V_MAX_F32
+            0x08 => IrOp::Fma,  // V_MAC_F32
+            0x19 => IrOp::IAdd, // V_ADD_U32
+            0x1A => IrOp::ISub, // V_SUB_U32
+            0x1B => IrOp::And,  // V_AND_B32
+            0x1C => IrOp::Or,   // V_OR_B32
+            0x1D => IrOp::Xor,  // V_XOR_B32
             _ => IrOp::Nop,
         },
         Encoding::Vop1 => match opcode {
-            0x01 => IrOp::Mov,    // V_MOV_B32
-            0x20 => IrOp::Sqrt,   // V_SQRT_F32
-            0x21 => IrOp::Rsqrt,  // V_RSQ_F32
-            0x22 => IrOp::Rcp,    // V_RCP_F32
-            0x23 => IrOp::Floor,  // V_FLOOR_F32
-            0x24 => IrOp::Ceil,   // V_CEIL_F32
-            0x25 => IrOp::Fract,  // V_FRACT_F32
+            0x01 => IrOp::Mov,      // V_MOV_B32
+            0x20 => IrOp::Sqrt,     // V_SQRT_F32
+            0x21 => IrOp::Rsqrt,    // V_RSQ_F32
+            0x22 => IrOp::Rcp,      // V_RCP_F32
+            0x23 => IrOp::Floor,    // V_FLOOR_F32
+            0x24 => IrOp::Ceil,     // V_CEIL_F32
+            0x25 => IrOp::Fract,    // V_FRACT_F32
             0x33 => IrOp::F32ToI32, // V_CVT_I32_F32
             0x34 => IrOp::I32ToF32, // V_CVT_F32_I32
             _ => IrOp::Nop,
@@ -267,15 +267,15 @@ fn map_vop_to_ir(opcode: u32, encoding: Encoding) -> IrOp {
 fn map_sop_to_ir(opcode: u32, encoding: Encoding) -> IrOp {
     match encoding {
         Encoding::Sop2 => match opcode {
-            0x00 => IrOp::IAdd,   // S_ADD_U32
-            0x01 => IrOp::ISub,   // S_SUB_U32
-            0x0E => IrOp::And,    // S_AND_B32
-            0x0F => IrOp::Or,     // S_OR_B32
-            0x10 => IrOp::Xor,    // S_XOR_B32
+            0x00 => IrOp::IAdd, // S_ADD_U32
+            0x01 => IrOp::ISub, // S_SUB_U32
+            0x0E => IrOp::And,  // S_AND_B32
+            0x0F => IrOp::Or,   // S_OR_B32
+            0x10 => IrOp::Xor,  // S_XOR_B32
             _ => IrOp::Nop,
         },
         Encoding::Sop1 => match opcode {
-            0x03 => IrOp::Mov,    // S_MOV_B32
+            0x03 => IrOp::Mov, // S_MOV_B32
             _ => IrOp::Nop,
         },
         _ => IrOp::Nop,

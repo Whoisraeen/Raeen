@@ -18,6 +18,7 @@ pub mod settings;
 use crate::launcher::{GameLauncher, SessionHandle, SessionState};
 use crate::library::{Gradient, LibraryItem, MetaCache};
 use crate::theme::{self, Theme};
+use crate::updater::{self, UpdaterEvent, UpdaterState};
 use anim::Animated;
 use boot::BootSequence;
 use egui::Key;
@@ -81,6 +82,13 @@ pub struct Shell {
     settings_new_folder_input: String,
     settings_key_provider_input: String,
 
+    /// Auto-updater state machine (Settings → System). Worker threads
+    /// (check/download) report back over the mpsc channel; `update()` pumps
+    /// it every frame. The Shell never blocks on the network.
+    updater_state: UpdaterState,
+    updater_tx: std::sync::mpsc::Sender<UpdaterEvent>,
+    updater_rx: std::sync::mpsc::Receiver<UpdaterEvent>,
+
     rail_offset: Animated,
     focus_pop: Animated,
     hero_from: Option<Gradient>,
@@ -108,7 +116,10 @@ impl Shell {
     ) -> Self {
         let rail_len = library.len();
         let cc_len = control_center::ITEMS.len();
-        let cc_option_counts: Vec<usize> = control_center::ITEMS.iter().map(|item| item.option_count()).collect();
+        let cc_option_counts: Vec<usize> = control_center::ITEMS
+            .iter()
+            .map(|item| item.option_count())
+            .collect();
         let hero_to = library.first().map(|i| i.art.hero()).unwrap_or(Gradient {
             hi: theme.palette.raised,
             mid: theme.palette.raised,
@@ -134,10 +145,17 @@ impl Shell {
 
         let gilrs = gilrs::Gilrs::new().ok();
         if gilrs.is_none() {
-            tracing::warn!("gamepad support unavailable (gilrs init failed) — keyboard still works");
+            tracing::warn!(
+                "gamepad support unavailable (gilrs init failed) — keyboard still works"
+            );
         }
 
         let settings_key_provider_input = config.paths.key_provider_path.display().to_string();
+
+        // Channel only — the initial network check is kicked off by
+        // `app.rs` via `start_update_check()`, so constructing a Shell in
+        // tests never touches the network.
+        let (updater_tx, updater_rx) = std::sync::mpsc::channel();
 
         theme::install_fonts(ctx, &theme);
         let background_texture = background_texture_for(ctx, &theme);
@@ -161,6 +179,9 @@ impl Shell {
             cover_textures,
             settings_new_folder_input: String::new(),
             settings_key_provider_input,
+            updater_state: UpdaterState::default(),
+            updater_tx,
+            updater_rx,
             rail_offset: Animated::new(0.0),
             focus_pop: Animated::with_speed(1.0, 12.0),
             hero_from: None,
@@ -192,9 +213,49 @@ impl Shell {
         }
 
         self.route_input(ctx);
+        self.pump_updater_events(ctx);
         self.poll_session();
         self.tick_animations(ctx);
         self.draw(ctx);
+    }
+
+    /// Kick off the startup update check (called once from `app.rs`, not
+    /// from `Shell::new`, so unit tests never hit the network).
+    pub fn start_update_check(&mut self) {
+        self.updater_state = UpdaterState::Checking;
+        updater::spawn_check(self.updater_tx.clone(), xps5x_core::VERSION.to_string());
+    }
+
+    /// Drain updater worker events into the state machine. A discovered
+    /// update starts downloading immediately (updates apply only on
+    /// restart, so the download is never disruptive); while a worker is in
+    /// flight we keep repainting so its result shows without user input.
+    fn pump_updater_events(&mut self, ctx: &egui::Context) {
+        while let Ok(event) = self.updater_rx.try_recv() {
+            match event {
+                UpdaterEvent::UpToDate { latest } => {
+                    self.updater_state = UpdaterState::UpToDate { latest };
+                }
+                UpdaterEvent::UpdateAvailable(info) => {
+                    tracing::info!(tag = %info.tag, "update available — downloading");
+                    self.updater_state = UpdaterState::Downloading {
+                        tag: info.tag.clone(),
+                    };
+                    updater::spawn_download(self.updater_tx.clone(), info);
+                }
+                UpdaterEvent::Staged { tag, staged } => {
+                    tracing::info!(tag = %tag, staged = %staged.display(), "update staged — restart to apply");
+                    self.updater_state = UpdaterState::Staged { tag, staged };
+                }
+                UpdaterEvent::CheckFailed(err) | UpdaterEvent::DownloadFailed(err) => {
+                    tracing::warn!(error = %err, "updater failed");
+                    self.updater_state = UpdaterState::Error(err);
+                }
+            }
+        }
+        if self.updater_state.is_busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(400));
+        }
     }
 
     fn route_input(&mut self, ctx: &egui::Context) {
@@ -213,12 +274,23 @@ impl Shell {
             match self.nav.apply(input) {
                 NavAction::Launch(index) => self.begin_launch(index),
                 NavAction::LaunchMedia(index) => self.confirm_media(index),
-                NavAction::ActivateOption { card, option } => self.handle_cc_option(ctx, card, option),
+                NavAction::ActivateOption { card, option } => {
+                    self.handle_cc_option(ctx, card, option)
+                }
                 NavAction::OpenSettings => self.enter_settings(),
                 NavAction::CloseSettings => self.leave_settings(),
-                NavAction::AdjustSetting { section, row, delta } => self.apply_setting_adjust(ctx, section, row, delta),
-                NavAction::ActivateSetting { section, row } => self.apply_setting_activate(ctx, section, row),
-                NavAction::OpenControlCenter | NavAction::CloseControlCenter | NavAction::SwitchTab(_) | NavAction::None => {}
+                NavAction::AdjustSetting {
+                    section,
+                    row,
+                    delta,
+                } => self.apply_setting_adjust(ctx, section, row, delta),
+                NavAction::ActivateSetting { section, row } => {
+                    self.apply_setting_activate(ctx, section, row)
+                }
+                NavAction::OpenControlCenter
+                | NavAction::CloseControlCenter
+                | NavAction::SwitchTab(_)
+                | NavAction::None => {}
             }
         }
     }
@@ -226,7 +298,11 @@ impl Shell {
     /// Confirm on a Media-tab tile (spec §10 SM2). There is no media
     /// playback engine yet, so this is a stub: just log it.
     fn confirm_media(&mut self, index: usize) {
-        let title = self.library_media.get(index).map(|i| i.title.as_str()).unwrap_or("unknown");
+        let title = self
+            .library_media
+            .get(index)
+            .map(|i| i.title.as_str())
+            .unwrap_or("unknown");
         tracing::info!(title, "media app confirmed (stub — no media engine yet)");
     }
 
@@ -234,14 +310,16 @@ impl Shell {
     /// text-entry buffers to match the current config.
     fn enter_settings(&mut self) {
         self.settings_new_folder_input.clear();
-        self.settings_key_provider_input = self.config.paths.key_provider_path.display().to_string();
+        self.settings_key_provider_input =
+            self.config.paths.key_provider_path.display().to_string();
     }
 
     /// Back out of Settings: fold the KeyProvider path text field back into
     /// config (it's edited free-form, not row-by-row like the other
     /// sections) and persist via the existing `EmulatorConfig::save` path.
     fn leave_settings(&mut self) {
-        self.config.paths.key_provider_path = PathBuf::from(self.settings_key_provider_input.trim());
+        self.config.paths.key_provider_path =
+            PathBuf::from(self.settings_key_provider_input.trim());
         if let Err(err) = self.config.save(&self.config_path) {
             // TODO: surface a save failure to the user in-UI instead of
             // just logging it (spec doesn't yet define a Settings toast/
@@ -255,25 +333,46 @@ impl Shell {
     /// Sections 3 (Game Folders) and 4 (Key Provider) are pure text-entry
     /// and have nothing to step with Left/Right. `ctx` is only needed by
     /// the Theme row, which reloads fonts/textures on the egui context.
-    fn apply_setting_adjust(&mut self, ctx: &egui::Context, section: usize, row: usize, delta: i32) {
+    fn apply_setting_adjust(
+        &mut self,
+        ctx: &egui::Context,
+        section: usize,
+        row: usize,
+        delta: i32,
+    ) {
         match (section, row) {
             (0, 0) => {
-                self.config.graphics.resolution_scale =
-                    settings::adjust_stepped(self.config.graphics.resolution_scale, delta, 0.25, 0.5, 4.0)
+                self.config.graphics.resolution_scale = settings::adjust_stepped(
+                    self.config.graphics.resolution_scale,
+                    delta,
+                    0.25,
+                    0.5,
+                    4.0,
+                )
             }
             (0, 1) => {
                 // Apply live — the viewport command is what actually moves
                 // the window in and out of fullscreen, not the config bit.
                 self.config.general.fullscreen = !self.config.general.fullscreen;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.config.general.fullscreen));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
+                    self.config.general.fullscreen,
+                ));
             }
             (0, 2) => self.config.graphics.shader_cache = !self.config.graphics.shader_cache,
-            (0, 3) => self.config.graphics.validation_layers = !self.config.graphics.validation_layers,
+            (0, 3) => {
+                self.config.graphics.validation_layers = !self.config.graphics.validation_layers
+            }
             (1, 0) => self.config.audio.enabled = !self.config.audio.enabled,
-            (1, 1) => self.config.audio.volume = settings::adjust_stepped(self.config.audio.volume, delta, 0.05, 0.0, 1.0),
+            (1, 1) => {
+                self.config.audio.volume =
+                    settings::adjust_stepped(self.config.audio.volume, delta, 0.05, 0.0, 1.0)
+            }
             (1, 2) => self.config.audio.spatial_audio = !self.config.audio.spatial_audio,
             (2, 0) => self.config.input.dualsense_features = !self.config.input.dualsense_features,
-            (2, 1) => self.config.input.deadzone = settings::adjust_stepped(self.config.input.deadzone, delta, 0.05, 0.0, 1.0),
+            (2, 1) => {
+                self.config.input.deadzone =
+                    settings::adjust_stepped(self.config.input.deadzone, delta, 0.05, 0.0, 1.0)
+            }
             (5, 0) => self.cycle_theme(ctx, delta),
             _ => {}
         }
@@ -288,7 +387,33 @@ impl Shell {
         match section {
             0 | 1 | 2 | 5 => self.apply_setting_adjust(ctx, section, row, 1),
             3 => self.activate_game_folder_row(row),
+            6 => self.activate_system_row(ctx, row),
             _ => {} // Key Provider (4): pure text-entry, nothing to "confirm".
+        }
+    }
+
+    /// Confirm within the System section. Row 0 (Version) is display-only;
+    /// row 1 is the updater's action row — what it does depends on where
+    /// the state machine currently is.
+    fn activate_system_row(&mut self, ctx: &egui::Context, row: usize) {
+        if row != 1 {
+            return;
+        }
+        match self.updater_state.clone() {
+            UpdaterState::Idle | UpdaterState::UpToDate { .. } | UpdaterState::Error(_) => {
+                self.start_update_check();
+            }
+            UpdaterState::Staged { staged, .. } => match updater::apply_staged(&staged) {
+                Ok(()) => {
+                    tracing::info!("update script launched — closing for swap");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to launch update script");
+                    self.updater_state = UpdaterState::Error(err);
+                }
+            },
+            UpdaterState::Checking | UpdaterState::Downloading { .. } => {}
         }
     }
 
@@ -308,7 +433,10 @@ impl Shell {
         } else if row < folder_count {
             self.config.paths.game_folders.remove(row);
         }
-        self.nav.set_settings_row_counts(settings::settings_row_counts(self.config.paths.game_folders.len()));
+        self.nav
+            .set_settings_row_counts(settings::settings_row_counts(
+                self.config.paths.game_folders.len(),
+            ));
     }
 
     /// Cycle `general.selected_theme` by `delta` steps through the themes
@@ -320,7 +448,10 @@ impl Shell {
         if themes.is_empty() {
             return;
         }
-        let current = themes.iter().position(|t| t == &self.config.general.selected_theme).unwrap_or(0);
+        let current = themes
+            .iter()
+            .position(|t| t == &self.config.general.selected_theme)
+            .unwrap_or(0);
         let len = themes.len() as i32;
         let next = (current as i32 + delta).rem_euclid(len) as usize;
         self.config.general.selected_theme = themes[next].clone();
@@ -333,7 +464,8 @@ impl Shell {
     /// construction (via [`Self::new`]) and again whenever Settings' theme
     /// selector changes the active theme.
     fn reload_theme(&mut self, ctx: &egui::Context) {
-        let theme = theme::loader::load_theme(&self.themes_root, &self.config.general.selected_theme);
+        let theme =
+            theme::loader::load_theme(&self.themes_root, &self.config.general.selected_theme);
         theme::install_fonts(ctx, &theme);
         self.background_texture = background_texture_for(ctx, &theme);
         self.theme = theme;
@@ -343,7 +475,9 @@ impl Shell {
     /// only Power: Rest Mode / Restart / Turn Off — spec §10). Rest/Restart
     /// are no-op stubs for SM1; Turn Off actually closes the Shell.
     fn handle_cc_option(&mut self, ctx: &egui::Context, card: usize, option: usize) {
-        let Some(item) = control_center::ITEMS.get(card) else { return };
+        let Some(item) = control_center::ITEMS.get(card) else {
+            return;
+        };
         if item.name != "Power" {
             return;
         }
@@ -399,17 +533,35 @@ impl Shell {
         if let Some(gilrs) = self.gilrs.as_mut() {
             while let Some(gilrs::Event { event, .. }) = gilrs.next_event() {
                 match event {
-                    gilrs::EventType::ButtonPressed(gilrs::Button::DPadLeft, _) => inputs.push(NavInput::Left),
-                    gilrs::EventType::ButtonPressed(gilrs::Button::DPadRight, _) => inputs.push(NavInput::Right),
-                    gilrs::EventType::ButtonPressed(gilrs::Button::DPadUp, _) => inputs.push(NavInput::Up),
-                    gilrs::EventType::ButtonPressed(gilrs::Button::DPadDown, _) => inputs.push(NavInput::Down),
-                    gilrs::EventType::ButtonPressed(gilrs::Button::South, _) => inputs.push(NavInput::Confirm),
-                    gilrs::EventType::ButtonPressed(gilrs::Button::East, _) => inputs.push(NavInput::Back),
-                    gilrs::EventType::ButtonPressed(gilrs::Button::Mode, _) => inputs.push(NavInput::Guide),
+                    gilrs::EventType::ButtonPressed(gilrs::Button::DPadLeft, _) => {
+                        inputs.push(NavInput::Left)
+                    }
+                    gilrs::EventType::ButtonPressed(gilrs::Button::DPadRight, _) => {
+                        inputs.push(NavInput::Right)
+                    }
+                    gilrs::EventType::ButtonPressed(gilrs::Button::DPadUp, _) => {
+                        inputs.push(NavInput::Up)
+                    }
+                    gilrs::EventType::ButtonPressed(gilrs::Button::DPadDown, _) => {
+                        inputs.push(NavInput::Down)
+                    }
+                    gilrs::EventType::ButtonPressed(gilrs::Button::South, _) => {
+                        inputs.push(NavInput::Confirm)
+                    }
+                    gilrs::EventType::ButtonPressed(gilrs::Button::East, _) => {
+                        inputs.push(NavInput::Back)
+                    }
+                    gilrs::EventType::ButtonPressed(gilrs::Button::Mode, _) => {
+                        inputs.push(NavInput::Guide)
+                    }
                     // Shoulder buttons (L1/R1) both toggle the two-item
                     // Games/Media tab (spec §10 SM2: "L1/R1 if easy").
-                    gilrs::EventType::ButtonPressed(gilrs::Button::LeftTrigger, _) => inputs.push(NavInput::Tab),
-                    gilrs::EventType::ButtonPressed(gilrs::Button::RightTrigger, _) => inputs.push(NavInput::Tab),
+                    gilrs::EventType::ButtonPressed(gilrs::Button::LeftTrigger, _) => {
+                        inputs.push(NavInput::Tab)
+                    }
+                    gilrs::EventType::ButtonPressed(gilrs::Button::RightTrigger, _) => {
+                        inputs.push(NavInput::Tab)
+                    }
                     _ => {}
                 }
             }
@@ -419,11 +571,17 @@ impl Shell {
     }
 
     fn begin_launch(&mut self, index: usize) {
-        let Some(item) = self.library.get(index) else { return };
+        let Some(item) = self.library.get(index) else {
+            return;
+        };
         match self.launcher.launch(&item.launch) {
             Ok(handle) => {
                 push_recent(&mut self.recent, &item.id, MAX_RECENT_TITLES);
-                self.session = Some(ActiveSession { handle, title: item.title.clone(), target_index: index });
+                self.session = Some(ActiveSession {
+                    handle,
+                    title: item.title.clone(),
+                    target_index: index,
+                });
             }
             Err(err) => {
                 tracing::warn!(title = %item.title, error = %err, "launch failed");
@@ -456,7 +614,10 @@ impl Shell {
             self.focus_pop.value = 0.0;
             self.focus_pop.set_target(1.0);
 
-            let new_hero = self.active_items().get(self.nav.rail_index).map(|i| i.art.hero());
+            let new_hero = self
+                .active_items()
+                .get(self.nav.rail_index)
+                .map(|i| i.art.hero());
             if let Some(new_hero) = new_hero {
                 self.hero_from = Some(self.blended_hero());
                 self.hero_to = new_hero;
@@ -465,13 +626,19 @@ impl Shell {
             }
         }
 
-        let target_offset = -(self.nav.rail_index as f32) * (self.theme.metrics.tile_size + self.theme.metrics.tile_gap);
+        let target_offset = -(self.nav.rail_index as f32)
+            * (self.theme.metrics.tile_size + self.theme.metrics.tile_gap);
         self.rail_offset.set_target(target_offset);
         animating |= self.rail_offset.tick(dt);
         animating |= self.focus_pop.tick(dt);
         animating |= self.hero_t.tick(dt);
 
-        self.cc_open.set_target(if self.nav.mode == NavMode::ControlCenter { 1.0 } else { 0.0 });
+        self.cc_open
+            .set_target(if self.nav.mode == NavMode::ControlCenter {
+                1.0
+            } else {
+                0.0
+            });
         animating |= self.cc_open.tick(dt);
 
         if animating {
@@ -511,6 +678,7 @@ impl Shell {
                     &self.config,
                     &mut self.settings_new_folder_input,
                     &mut self.settings_key_provider_input,
+                    &self.updater_state,
                 );
                 return;
             }
@@ -521,7 +689,16 @@ impl Shell {
                 focus_pop: self.focus_pop.value,
             };
             let items = self.active_items();
-            home::draw(ui, &theme, items, &self.nav, &anim, &self.meta_cache, self.background_texture.as_ref(), &self.cover_textures);
+            home::draw(
+                ui,
+                &theme,
+                items,
+                &self.nav,
+                &anim,
+                &self.meta_cache,
+                self.background_texture.as_ref(),
+                &self.cover_textures,
+            );
 
             let recent_titles = self.recent_titles();
             control_center::draw(ui, &theme, &self.nav, self.cc_open.value, &recent_titles);
@@ -533,7 +710,12 @@ impl Shell {
     fn recent_titles(&self) -> Vec<String> {
         self.recent
             .iter()
-            .filter_map(|id| self.library.iter().find(|item| &item.id == id).map(|item| item.title.clone()))
+            .filter_map(|id| {
+                self.library
+                    .iter()
+                    .find(|item| &item.id == id)
+                    .map(|item| item.title.clone())
+            })
             .collect()
     }
 }
@@ -551,11 +733,13 @@ fn push_recent(recent: &mut Vec<String>, id: &str, cap: usize) {
 /// texture. `None` when the theme carries no background — `home.rs` falls
 /// back to its mesh-gradient hero in that case (spec §6).
 fn background_texture_for(ctx: &egui::Context, theme: &Theme) -> Option<egui::TextureHandle> {
-    theme
-        .assets
-        .background
-        .as_ref()
-        .map(|image| ctx.load_texture("xps5x-theme-background", (**image).clone(), egui::TextureOptions::LINEAR))
+    theme.assets.background.as_ref().map(|image| {
+        ctx.load_texture(
+            "xps5x-theme-background",
+            (**image).clone(),
+            egui::TextureOptions::LINEAR,
+        )
+    })
 }
 
 /// Decode + upload every scanned game's user-supplied cover image, keyed by
@@ -563,21 +747,35 @@ fn background_texture_for(ctx: &egui::Context, theme: &Theme) -> Option<egui::Te
 /// untrusted content exactly like theme backgrounds); anything missing,
 /// oversized, or malformed is simply skipped — that game keeps its
 /// gradient + monogram tile art.
-fn cover_textures_for(ctx: &egui::Context, library: &[LibraryItem]) -> HashMap<String, egui::TextureHandle> {
+fn cover_textures_for(
+    ctx: &egui::Context,
+    library: &[LibraryItem],
+) -> HashMap<String, egui::TextureHandle> {
     let mut textures = HashMap::new();
     for item in library {
-        let Some(path) = &item.cover_path else { continue };
+        let Some(path) = &item.cover_path else {
+            continue;
+        };
         let Some(image) = theme::loader::load_image_file_capped(path) else {
             tracing::warn!(path = %path.display(), title = %item.title, "cover image failed to load — using gradient art");
             continue;
         };
-        let texture = ctx.load_texture(format!("xps5x-cover-{}", item.id), image, egui::TextureOptions::LINEAR);
+        let texture = ctx.load_texture(
+            format!("xps5x-cover-{}", item.id),
+            image,
+            egui::TextureOptions::LINEAR,
+        );
         textures.insert(item.id.clone(), texture);
     }
     textures
 }
 
-fn draw_session_overlay(ui: &mut egui::Ui, theme: &Theme, session: &ActiveSession, launcher: &dyn GameLauncher) {
+fn draw_session_overlay(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    session: &ActiveSession,
+    launcher: &dyn GameLauncher,
+) {
     let screen = ui.max_rect();
     let painter = ui.painter();
     painter.rect_filled(screen, 0.0, theme.palette.ground);
@@ -589,7 +787,10 @@ fn draw_session_overlay(ui: &mut egui::Ui, theme: &Theme, session: &ActiveSessio
     // than SM3 actually does (spec: link, don't pretend to play).
     let detail = launcher.session_detail(&session.handle);
     let (headline, sub) = match state {
-        SessionState::Loading => (format!("Launching {}…", session.title), "Handing off to the engine".to_string()),
+        SessionState::Loading => (
+            format!("Launching {}…", session.title),
+            "Handing off to the engine".to_string(),
+        ),
         SessionState::Running => (
             session.title.clone(),
             detail.unwrap_or_else(|| "Running — Esc to return to the Shell".to_string()),

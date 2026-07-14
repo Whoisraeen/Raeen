@@ -40,20 +40,22 @@ impl ShaderCache {
         let disk_path = self.cache_dir.join(format!("{:016x}.spv", isa_hash));
         if disk_path.exists()
             && let Ok(data) = std::fs::read(&disk_path)
-                && data.len() % 4 == 0 {
-                    let spirv: Vec<u32> = data
-                        .chunks_exact(4)
-                        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                        .collect();
+            && data.len() % 4 == 0
+        {
+            let spirv: Vec<u32> = data
+                .chunks_exact(4)
+                .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
 
-                    // Promote to memory cache.
-                    self.memory_cache.insert(isa_hash, spirv.clone());
-                    self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    debug!("Shader cache HIT (disk): {:#x}", isa_hash);
-                    return Some(spirv);
-                }
+            // Promote to memory cache.
+            self.memory_cache.insert(isa_hash, spirv.clone());
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            debug!("Shader cache HIT (disk): {:#x}", isa_hash);
+            return Some(spirv);
+        }
 
-        self.misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         debug!("Shader cache MISS: {:#x}", isa_hash);
         None
     }

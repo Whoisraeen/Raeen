@@ -13,7 +13,7 @@
 //! bounds-checking every offset/size against the buffer — malformed or
 //! truncated input returns a [`FirmwareError`], never panics.
 
-use goblin::elf::program_header::{ProgramHeader, PT_DYNAMIC, PT_LOAD, PT_TLS};
+use goblin::elf::program_header::{PT_DYNAMIC, PT_LOAD, PT_TLS, ProgramHeader};
 use tracing::{debug, info, warn};
 use xps5x_core::error::FirmwareError;
 

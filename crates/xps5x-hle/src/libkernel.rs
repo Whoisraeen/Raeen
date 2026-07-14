@@ -629,7 +629,7 @@ fn hle_kernel_error(_ctx: &HleContext, _args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_ctx, GuestMemory};
+    use crate::{GuestMemory, test_ctx};
 
     /// M1-C: `write(1, buf, n)` copies real guest bytes to the kernel
     /// console and returns `n`; stderr (fd 2) lands in the same capture; an

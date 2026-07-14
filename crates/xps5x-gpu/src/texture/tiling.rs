@@ -25,13 +25,7 @@ pub enum TilingMode {
 /// * `mode` — Source tiling mode
 ///
 /// Returns the texture data in linear (row-major) layout.
-pub fn detile(
-    src: &[u8],
-    width: u32,
-    height: u32,
-    bpp: u32,
-    mode: TilingMode,
-) -> Vec<u8> {
+pub fn detile(src: &[u8], width: u32, height: u32, bpp: u32, mode: TilingMode) -> Vec<u8> {
     match mode {
         TilingMode::Linear => src.to_vec(),
         TilingMode::MicroTiled => detile_micro(src, width, height, bpp),

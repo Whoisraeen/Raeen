@@ -63,7 +63,12 @@ impl Timer {
     /// `m_is_paused = true`) and must be started with [`Timer::start`].
     #[must_use]
     pub fn new() -> Self {
-        Self { is_paused: true, frequency: Self::query_performance_frequency(), start_time: 0, pause_time: 0 }
+        Self {
+            is_paused: true,
+            frequency: Self::query_performance_frequency(),
+            start_time: 0,
+            pause_time: 0,
+        }
     }
 
     /// Kyty `Timer::Start()`: (re)starts the stopwatch from now, discarding

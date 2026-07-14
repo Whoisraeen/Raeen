@@ -198,7 +198,11 @@ impl<T> Vector<T> {
     pub fn remove_at(&mut self, index: u32, count: u32) -> bool {
         let index = index as usize;
         let count = count as usize;
-        if count == 0 || index.checked_add(count).is_none_or(|end| end > self.data.len()) {
+        if count == 0
+            || index
+                .checked_add(count)
+                .is_none_or(|end| end > self.data.len())
+        {
             return false;
         }
         self.data.drain(index..index + count);

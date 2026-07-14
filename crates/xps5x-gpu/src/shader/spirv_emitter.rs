@@ -3,8 +3,8 @@
 //! Converts the XPS5X shader IR into SPIR-V binary modules
 //! that can be consumed by Vulkan's shader pipeline.
 
-use super::ir::IrProgram;
 use super::ShaderType;
+use super::ir::IrProgram;
 use tracing::info;
 use xps5x_core::error::GpuError;
 
@@ -67,12 +67,12 @@ pub fn emit_spirv(program: &IrProgram) -> Result<Vec<u32>, GpuError> {
     // Declare entry point.
     let main_func = module.next_id();
     let execution_model = match program.shader_type {
-        ShaderType::Vertex => 0,    // Vertex
-        ShaderType::Pixel => 4,     // Fragment
-        ShaderType::Compute => 5,   // GLCompute
-        ShaderType::Geometry => 3,  // Geometry
-        ShaderType::Hull => 1,      // TessellationControl
-        ShaderType::Domain => 2,    // TessellationEvaluation
+        ShaderType::Vertex => 0,   // Vertex
+        ShaderType::Pixel => 4,    // Fragment
+        ShaderType::Compute => 5,  // GLCompute
+        ShaderType::Geometry => 3, // Geometry
+        ShaderType::Hull => 1,     // TessellationControl
+        ShaderType::Domain => 2,   // TessellationEvaluation
     };
 
     module.add_entry_point(execution_model, main_func, "main", &[]);
@@ -123,7 +123,8 @@ impl SpirvModule {
 
     fn emit(&mut self, opcode: u16, operands: &[u32]) {
         let word_count = (1 + operands.len()) as u16;
-        self.instructions.push(((word_count as u32) << 16) | (opcode as u32));
+        self.instructions
+            .push(((word_count as u32) << 16) | (opcode as u32));
         self.instructions.extend_from_slice(operands);
     }
 

@@ -106,14 +106,27 @@ fn parse_hex_color(s: &str) -> Option<Color32> {
     let s = s.strip_prefix('#')?;
     let byte = |i: usize| u8::from_str_radix(s.get(i..i + 2)?, 16).ok();
     match s.len() {
-        6 => Some(Color32::from_rgba_premultiplied(byte(0)?, byte(2)?, byte(4)?, 255)),
-        8 => Some(Color32::from_rgba_premultiplied(byte(0)?, byte(2)?, byte(4)?, byte(6)?)),
+        6 => Some(Color32::from_rgba_premultiplied(
+            byte(0)?,
+            byte(2)?,
+            byte(4)?,
+            255,
+        )),
+        8 => Some(Color32::from_rgba_premultiplied(
+            byte(0)?,
+            byte(2)?,
+            byte(4)?,
+            byte(6)?,
+        )),
         _ => None,
     }
 }
 
 fn color_or(value: &Option<String>, fallback: Color32) -> Color32 {
-    value.as_deref().and_then(parse_hex_color).unwrap_or(fallback)
+    value
+        .as_deref()
+        .and_then(parse_hex_color)
+        .unwrap_or(fallback)
 }
 
 /// A manifest float only overrides the default when it parsed *and* is
@@ -152,7 +165,10 @@ fn resolve_metrics(m: &MetricsManifest, fallback: &super::Metrics) -> super::Met
         rail_padding_left: f32_or(m.rail_padding_left, fallback.rail_padding_left),
         corner_radius: f32_or(m.corner_radius, fallback.corner_radius),
         button_radius: f32_or(m.button_radius, fallback.button_radius),
-        card_size: egui::vec2(f32_or(m.card_width, fallback.card_size.x), f32_or(m.card_height, fallback.card_size.y)),
+        card_size: egui::vec2(
+            f32_or(m.card_width, fallback.card_size.x),
+            f32_or(m.card_height, fallback.card_size.y),
+        ),
         card_gap: f32_or(m.card_gap, fallback.card_gap),
         cc_item_size: f32_or(m.cc_item_size, fallback.cc_item_size),
         cc_item_gap: f32_or(m.cc_item_gap, fallback.cc_item_gap),
@@ -200,7 +216,10 @@ fn resolve_asset_path(theme_dir: &Path, reference: &str) -> Option<PathBuf> {
     if resolved.starts_with(&base) {
         Some(resolved)
     } else {
-        tracing::warn!(reference, "theme asset reference escapes the theme directory — rejecting");
+        tracing::warn!(
+            reference,
+            "theme asset reference escapes the theme directory — rejecting"
+        );
         None
     }
 }
@@ -248,18 +267,27 @@ fn decode_image_capped(bytes: &[u8]) -> Option<ColorImage> {
     limits.max_image_height = Some(MAX_IMAGE_DIM);
     limits.max_alloc = Some(MAX_IMAGE_DECODED_BYTES);
 
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
     reader.limits(limits);
     let decoded = reader.decode().ok()?;
 
     let (w, h) = (decoded.width(), decoded.height());
     if !dims_within_limits(w, h) {
-        tracing::warn!(width = w, height = h, "theme background image exceeds dimension/size cap — ignoring");
+        tracing::warn!(
+            width = w,
+            height = h,
+            "theme background image exceeds dimension/size cap — ignoring"
+        );
         return None;
     }
 
     let rgba = decoded.into_rgba8();
-    Some(ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw()))
+    Some(ColorImage::from_rgba_unmultiplied(
+        [w as usize, h as usize],
+        rgba.as_raw(),
+    ))
 }
 
 /// Load the theme named `name` from `themes_root/<name>/theme.toml`,
@@ -282,14 +310,25 @@ pub fn load_theme(themes_root: &Path, name: &str) -> Theme {
 
     let palette = resolve_palette(&manifest.palette, &default.palette);
     let metrics = resolve_metrics(&manifest.metrics, &default.metrics);
-    let font = manifest.assets.font.as_deref().and_then(|reference| load_font(&theme_dir, reference));
-    let background = manifest.assets.background.as_deref().and_then(|reference| load_background(&theme_dir, reference));
+    let font = manifest
+        .assets
+        .font
+        .as_deref()
+        .and_then(|reference| load_font(&theme_dir, reference));
+    let background = manifest
+        .assets
+        .background
+        .as_deref()
+        .and_then(|reference| load_background(&theme_dir, reference));
 
     Theme {
         name: manifest.name.unwrap_or(default.name),
         palette,
         metrics,
-        assets: ThemeAssets { font: font.map(Arc::from), background: background.map(Arc::new) },
+        assets: ThemeAssets {
+            font: font.map(Arc::from),
+            background: background.map(Arc::new),
+        },
     }
 }
 
@@ -300,11 +339,15 @@ pub fn list_themes(themes_root: &Path) -> Vec<String> {
     let mut names = vec!["default".to_string()];
     if let Ok(entries) = std::fs::read_dir(themes_root) {
         for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else { continue };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
             if !file_type.is_dir() {
                 continue;
             }
-            let Some(dir_name) = entry.file_name().to_str().map(str::to_string) else { continue };
+            let Some(dir_name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
             if !names.contains(&dir_name) {
                 names.push(dir_name);
             }
@@ -331,7 +374,9 @@ mod tests {
     /// keeping test fixtures (including intentionally-invalid ones, like
     /// path-traversal targets) well outside the repository tree.
     fn scratch_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("xps5x-gui-theme-loader-tests").join(tag);
+        let dir = std::env::temp_dir()
+            .join("xps5x-gui-theme-loader-tests")
+            .join(tag);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -369,8 +414,14 @@ mod tests {
 
         let theme = load_theme(&root, "custom");
         assert_eq!(theme.name, "Custom");
-        assert_eq!(theme.palette.ground, Color32::from_rgba_premultiplied(0x10, 0x10, 0x10, 255));
-        assert_eq!(theme.palette.accent, Color32::from_rgba_premultiplied(0xff, 0x00, 0xff, 255));
+        assert_eq!(
+            theme.palette.ground,
+            Color32::from_rgba_premultiplied(0x10, 0x10, 0x10, 255)
+        );
+        assert_eq!(
+            theme.palette.accent,
+            Color32::from_rgba_premultiplied(0xff, 0x00, 0xff, 255)
+        );
         assert_eq!(theme.metrics.tile_size, 200.0);
         assert_eq!(theme.metrics.card_size, egui::vec2(300.0, 50.0));
 
@@ -420,8 +471,15 @@ mod tests {
 
         let theme = load_theme(&root, "partial");
         let default = default_theme();
-        assert_eq!(theme.palette.ground, default.palette.ground, "invalid hex falls back to default");
-        assert_eq!(theme.palette.accent, Color32::from_rgba_premultiplied(0x00, 0xff, 0x00, 255), "valid hex is honored");
+        assert_eq!(
+            theme.palette.ground, default.palette.ground,
+            "invalid hex falls back to default"
+        );
+        assert_eq!(
+            theme.palette.accent,
+            Color32::from_rgba_premultiplied(0x00, 0xff, 0x00, 255),
+            "valid hex is honored"
+        );
     }
 
     #[test]
@@ -439,11 +497,18 @@ mod tests {
         let root = scratch_dir("traversal-parent");
         std::fs::create_dir_all(root.join("victim")).unwrap();
         write_file(&root, "secret.ttf", b"not a real font");
-        write_file(&root, "victim/theme.toml", br##"[assets]
-font = "../secret.ttf""##);
+        write_file(
+            &root,
+            "victim/theme.toml",
+            br##"[assets]
+font = "../secret.ttf""##,
+        );
 
         let theme = load_theme(&root, "victim");
-        assert!(theme.assets.font.is_none(), "'..' asset references must be rejected, not read");
+        assert!(
+            theme.assets.font.is_none(),
+            "'..' asset references must be rejected, not read"
+        );
     }
 
     #[test]
@@ -457,7 +522,10 @@ background = "/etc/passwd""##,
         );
 
         let theme = load_theme(&root, "victim");
-        assert!(theme.assets.background.is_none(), "absolute asset references must be rejected, not read");
+        assert!(
+            theme.assets.background.is_none(),
+            "absolute asset references must be rejected, not read"
+        );
     }
 
     #[test]
@@ -474,8 +542,12 @@ background = "/etc/passwd""##,
         let root = scratch_dir("oversized-font");
         let huge_font = vec![0u8; (MAX_FONT_BYTES + 1) as usize];
         write_file(&root, "big/font.ttf", &huge_font);
-        write_file(&root, "big/theme.toml", br##"[assets]
-font = "font.ttf""##);
+        write_file(
+            &root,
+            "big/theme.toml",
+            br##"[assets]
+font = "font.ttf""##,
+        );
 
         let theme = load_theme(&root, "big");
         assert!(theme.assets.font.is_none());
@@ -502,10 +574,22 @@ background = "backgrounds/does-not-exist.png""##,
         assert!(dims_within_limits(1, 1));
         // Comfortably under both the dimension cap and the decoded-bytes cap.
         assert!(dims_within_limits(2000, 2000));
-        assert!(!dims_within_limits(0, 10), "zero-sized dimensions are rejected");
-        assert!(!dims_within_limits(10, 0), "zero-sized dimensions are rejected");
-        assert!(!dims_within_limits(MAX_IMAGE_DIM + 1, 10), "width over the dimension cap is rejected");
-        assert!(!dims_within_limits(10, MAX_IMAGE_DIM + 1), "height over the dimension cap is rejected");
+        assert!(
+            !dims_within_limits(0, 10),
+            "zero-sized dimensions are rejected"
+        );
+        assert!(
+            !dims_within_limits(10, 0),
+            "zero-sized dimensions are rejected"
+        );
+        assert!(
+            !dims_within_limits(MAX_IMAGE_DIM + 1, 10),
+            "width over the dimension cap is rejected"
+        );
+        assert!(
+            !dims_within_limits(10, MAX_IMAGE_DIM + 1),
+            "height over the dimension cap is rejected"
+        );
         // Exactly at the dimension cap on both axes still exceeds the
         // decoded-bytes cap (4096 * 4096 * 4 > 32 MiB) — both limits apply.
         assert!(!dims_within_limits(MAX_IMAGE_DIM, MAX_IMAGE_DIM));
@@ -520,12 +604,17 @@ background = "backgrounds/does-not-exist.png""##,
         let mut bytes: Vec<u8> = Vec::new();
         {
             let mut cursor = std::io::Cursor::new(&mut bytes);
-            image::DynamicImage::ImageRgba8(img).write_to(&mut cursor, image::ImageFormat::Png).unwrap();
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut cursor, image::ImageFormat::Png)
+                .unwrap();
         }
 
         let decoded = decode_image_capped(&bytes).expect("valid PNG must decode");
         assert_eq!(decoded.size, [4, 3]);
-        assert_eq!(decoded.pixels[0], Color32::from_rgba_unmultiplied(10, 20, 30, 255));
+        assert_eq!(
+            decoded.pixels[0],
+            Color32::from_rgba_unmultiplied(10, 20, 30, 255)
+        );
     }
 
     #[test]
@@ -540,7 +629,9 @@ background = "backgrounds/does-not-exist.png""##,
         let mut bytes: Vec<u8> = Vec::new();
         {
             let mut cursor = std::io::Cursor::new(&mut bytes);
-            image::DynamicImage::ImageRgba8(img).write_to(&mut cursor, image::ImageFormat::Png).unwrap();
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut cursor, image::ImageFormat::Png)
+                .unwrap();
         }
         write_file(&root, "bg/backgrounds/hero.png", &bytes);
         write_file(
@@ -591,7 +682,13 @@ background = "backgrounds/hero.png""##,
         assert_eq!(loaded.name, expected.name);
         assert_eq!(loaded.palette, expected.palette);
         assert_eq!(loaded.metrics, expected.metrics);
-        assert!(loaded.assets.font.is_none(), "the shipped default theme carries no binary assets");
-        assert!(loaded.assets.background.is_none(), "the shipped default theme carries no binary assets");
+        assert!(
+            loaded.assets.font.is_none(),
+            "the shipped default theme carries no binary assets"
+        );
+        assert!(
+            loaded.assets.background.is_none(),
+            "the shipped default theme carries no binary assets"
+        );
     }
 }
