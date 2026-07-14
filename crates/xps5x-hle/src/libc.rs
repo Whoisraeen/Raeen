@@ -46,6 +46,11 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libc", "strcat", hle_strcat);
     registry.register("libc", "strncat", hle_strncat);
     registry.register("libc", "strstr", hle_strstr);
+    // String → integer parsing (real behavior): arg/config parsing.
+    registry.register("libc", "atoi", hle_atoi);
+    registry.register("libc", "atol", hle_atol);
+    registry.register("libc", "strtol", hle_strtol);
+    registry.register("libc", "strtoul", hle_strtoul);
     // crt0 / C++ static-init registration: record-and-succeed. Real homebrew
     // registers atexit/global-dtor callbacks during startup; failing these
     // aborts init before `main`.
@@ -604,6 +609,125 @@ fn hle_strstr(ctx: &HleContext, args: &[u64]) -> u64 {
     }
 }
 
+/// Parse a C integer out of a guest string per `strtol`/`strtoul` rules:
+/// skip leading ASCII whitespace, optional `+`/`-` sign, then digits in
+/// `base` (base 0 auto-detects `0x`/`0X` → 16, leading `0` → 8, else 10).
+/// Returns `(value_as_i128, bytes_consumed_from_string_start)`; the caller
+/// clamps/casts the value and computes the `endptr`. Stops at the first
+/// non-convertible character (the real API's behavior). Overflow saturates.
+fn parse_c_integer(s: &[u8], mut base: u32) -> (i128, usize) {
+    let mut i = 0usize;
+    while i < s.len() && s[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let mut negative = false;
+    if i < s.len() && (s[i] == b'+' || s[i] == b'-') {
+        negative = s[i] == b'-';
+        i += 1;
+    }
+    // Base auto-detection / `0x` prefix consumption.
+    if (base == 0 || base == 16)
+        && i + 1 < s.len()
+        && s[i] == b'0'
+        && (s[i + 1] == b'x' || s[i + 1] == b'X')
+        && s.get(i + 2).is_some_and(|c| c.is_ascii_hexdigit())
+    {
+        base = 16;
+        i += 2;
+    } else if base == 0 && i < s.len() && s[i] == b'0' {
+        base = 8;
+    } else if base == 0 {
+        base = 10;
+    }
+
+    let mut value: i128 = 0;
+    let mut any = false;
+    while i < s.len() {
+        let Some(digit) = (s[i] as char).to_digit(base) else {
+            break;
+        };
+        any = true;
+        value = value
+            .saturating_mul(base as i128)
+            .saturating_add(digit as i128);
+        i += 1;
+    }
+    if !any {
+        return (0, i); // no digits converted → 0, endptr at the sign/start
+    }
+    (if negative { -value } else { value }, i)
+}
+
+/// Real `atoi(nptr)`: `strtol(nptr, NULL, 10)` truncated to a 32-bit `int`.
+fn hle_atoi(ctx: &HleContext, args: &[u64]) -> u64 {
+    let nptr = args.first().copied().unwrap_or(0);
+    debug!("atoi(nptr={nptr:#x})");
+    let Some(bytes) = crate::fmt::read_cstr(ctx.mem, nptr) else {
+        warn!("atoi: unreadable string at {nptr:#x}");
+        return 0;
+    };
+    let (v, _) = parse_c_integer(&bytes, 10);
+    (v as i32) as u32 as u64
+}
+
+/// Real `atol(nptr)`: `strtol(nptr, NULL, 10)` as a 64-bit `long`.
+fn hle_atol(ctx: &HleContext, args: &[u64]) -> u64 {
+    let nptr = args.first().copied().unwrap_or(0);
+    debug!("atol(nptr={nptr:#x})");
+    let Some(bytes) = crate::fmt::read_cstr(ctx.mem, nptr) else {
+        warn!("atol: unreadable string at {nptr:#x}");
+        return 0;
+    };
+    let (v, _) = parse_c_integer(&bytes, 10);
+    (v as i64) as u64
+}
+
+/// Real `strtol(nptr, endptr, base)`: parse a `long`, and if `endptr != NULL`
+/// write the guest address of the first unconverted character through it.
+/// Value saturates to the `long` range on overflow (approximating the real
+/// `LONG_MIN`/`LONG_MAX` + `ERANGE` clamp, without the `errno` write).
+fn hle_strtol(ctx: &HleContext, args: &[u64]) -> u64 {
+    let nptr = args.first().copied().unwrap_or(0);
+    let endptr = args.get(1).copied().unwrap_or(0);
+    let base = args.get(2).copied().unwrap_or(0) as u32;
+    debug!("strtol(nptr={nptr:#x}, endptr={endptr:#x}, base={base})");
+    strtol_impl(ctx, nptr, endptr, base, false)
+}
+
+/// Real `strtoul(nptr, endptr, base)`: like `strtol` but unsigned.
+fn hle_strtoul(ctx: &HleContext, args: &[u64]) -> u64 {
+    let nptr = args.first().copied().unwrap_or(0);
+    let endptr = args.get(1).copied().unwrap_or(0);
+    let base = args.get(2).copied().unwrap_or(0) as u32;
+    debug!("strtoul(nptr={nptr:#x}, endptr={endptr:#x}, base={base})");
+    strtol_impl(ctx, nptr, endptr, base, true)
+}
+
+/// Shared `strtol`/`strtoul` body: parse, write `endptr`, clamp to the
+/// signed or unsigned 64-bit range.
+fn strtol_impl(ctx: &HleContext, nptr: u64, endptr: u64, base: u32, unsigned: bool) -> u64 {
+    if base != 0 && !(2..=36).contains(&base) {
+        warn!("strtol: invalid base {base}");
+        return 0;
+    }
+    let Some(bytes) = crate::fmt::read_cstr(ctx.mem, nptr) else {
+        warn!("strtol: unreadable string at {nptr:#x}");
+        return 0;
+    };
+    let (v, consumed) = parse_c_integer(&bytes, base);
+    if endptr != 0 {
+        let end_addr = nptr.wrapping_add(consumed as u64);
+        if !ctx.mem.write(endptr, &end_addr.to_le_bytes()) {
+            warn!("strtol: failed to write endptr at {endptr:#x}");
+        }
+    }
+    if unsigned {
+        v.clamp(0, u64::MAX as i128) as u64
+    } else {
+        v.clamp(i64::MIN as i128, i64::MAX as i128) as i64 as u64
+    }
+}
+
 /// `atexit(fn)`: record-and-succeed. A real libc runs registered callbacks at
 /// `exit`; XPS5X's `exit` HLE ends the process without running them (honest —
 /// no atexit dispatch yet), but the registration itself must *succeed* (`0`)
@@ -970,6 +1094,52 @@ mod tests {
         assert_eq!(hle_strnlen(&ctx, &[0xDEAD_0000, 8]), 0);
     }
 
+    /// M1 hardening: string→integer parsing does real conversion with base
+    /// detection, sign, endptr, and saturation.
+    #[test]
+    fn atoi_atol_strtol_parse_real_integers() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x100, b"  -42abc\0"));
+        assert_eq!(
+            hle_atoi(&ctx, &[0x100]) as u32 as i32,
+            -42,
+            "skips ws, sign, stops at 'a'"
+        );
+
+        assert!(mem.write(0x120, b"9000000000\0")); // > i32, fits i64
+        assert_eq!(hle_atol(&ctx, &[0x120]) as i64, 9_000_000_000);
+
+        // strtol base 16 with 0x prefix + endptr.
+        assert!(mem.write(0x140, b"0x1F!\0"));
+        assert_eq!(hle_strtol(&ctx, &[0x140, 0x200, 16]) as i64, 0x1F);
+        let mut ep = [0u8; 8];
+        assert!(mem.read(0x200, &mut ep));
+        assert_eq!(u64::from_le_bytes(ep), 0x140 + 4, "endptr points at '!'");
+
+        // base 0 auto-detect: octal.
+        assert!(mem.write(0x160, b"010\0"));
+        assert_eq!(hle_strtol(&ctx, &[0x160, 0, 0]) as i64, 8);
+
+        // strtoul clamps a negative to a large unsigned, and parses big values.
+        assert!(mem.write(0x180, b"4294967295\0"));
+        assert_eq!(hle_strtoul(&ctx, &[0x180, 0, 10]), 4_294_967_295);
+
+        // No digits → 0, endptr at start.
+        assert!(mem.write(0x1A0, b"xyz\0"));
+        assert_eq!(hle_strtol(&ctx, &[0x1A0, 0x220, 10]), 0);
+        let mut ep2 = [0u8; 8];
+        assert!(mem.read(0x220, &mut ep2));
+        assert_eq!(
+            u64::from_le_bytes(ep2),
+            0x1A0,
+            "endptr == nptr when nothing converts"
+        );
+    }
+
     #[test]
     fn atexit_family_registers_and_succeeds() {
         let kernel = xps5x_kernel::OrbisKernel::new();
@@ -1008,6 +1178,10 @@ mod tests {
             "strcat",
             "strncat",
             "strstr",
+            "atoi",
+            "atol",
+            "strtol",
+            "strtoul",
             "atexit",
             "__cxa_atexit",
             "snprintf",
