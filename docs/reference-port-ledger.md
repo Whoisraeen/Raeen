@@ -87,7 +87,8 @@ Second-opinion PS5 emu (C#). Re-implement in Rust; do not vendor C#.
 | PlayGo | Libs | `xps5x-hle` | `todo` | | |
 | pthread / threads | Kernel | `xps5x-runtime`/`hle` | `todo` | | M1-E |
 | VideoOut / AGC / shaders→Vulkan | Graphics | `xps5x-gpu`/`hle` | `todo` | | M2+ |
-| DualSense / pad | Input | `xps5x-input`/`hle` | `todo` | | |
+| DualSense / pad (digital+analog state) | Input | `xps5x-input`/`hle` | `done` | (pad batch) | ControllerState→Orbis ScePadData encoder (documented button masks, stick/trigger byte mapping) in xps5x-input; scePadReadState writes a valid state + returns 1 (was garbage + 0 → homebrew read-loop hang). Live host-input routing (InputManager→HleContext) + haptics/adaptive-triggers still todo |
+| DualSense: live input routing + haptics/adaptive triggers | Input | `xps5x-input`/`hle` | `todo` | | needs InputManager reachable from HleContext |
 | Filesystem: open/read/close/lseek | KernelExports/FS | `xps5x-kernel`/`hle` | `done` | `896495d` | VFS-backed, real host files under /app0; write persistence + fstat still todo |
 | Filesystem / save (write persist, fstat, savedata) | FS | `xps5x-kernel`/`hle` | `todo` | | |
 | GUI patterns | app | `xps5x-gui` | `skip` | | optional UX only |
