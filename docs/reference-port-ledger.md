@@ -47,15 +47,19 @@ Primary full port. Plan: `docs/superpowers/plans/2026-07-13-kyty-full-port.md`.
 | CharUcd | `kyty-core` | `skip` | | use unicode crate; do not transliterate |
 | Database | `kyty-core` | `skip` | | defer rusqlite unless needed |
 | VirtualMemory (Core wrapper) | `kyty-core` | `done` | `e06b0d3` | `virtual_memory.rs` forwards 1:1 to sys_virtual (as Kyty's Core does on Windows); ExceptionHandler `skip` — xps5x-runtime VEH supersedes |
-| Threads / File / MemoryAlloc / MSpace | `kyty-core` | `todo` | | after Sys/VM |
-| Debug / Subsystems / SDL / Core.cpp | `kyty-core` | `todo` | | port last |
+| MemoryAlloc / MSpace | `kyty-core` | `skip` | | manual C++ heap (`mem_alloc`/`mem_free` + stats) — superseded by Rust's global allocator (host) + `xps5x-runtime` `GuestArena` (guest); same rationale as skipped `SafeDelete`. Convention: manual-memory scaffolding → safe Rust equivalent. |
+| Threads | `kyty-core`/`xps5x-runtime` | `todo` | | overlaps M1-E (real guest threads) — deferred, see SDD sketch |
+| File | `kyty-core` | `todo` | | 1311-line buffered File class over sys_file_io; port only if a ported Kyty subsystem needs it (else xps5x-kernel VFS supersedes on the hot path) |
+| Debug / Subsystems / SDL / Core.cpp | `kyty-core` | `todo` | | init glue, port last |
 
 ### Later Kyty trees
 
 | Module | Target | Status | Commit | Notes |
 |--------|--------|--------|--------|-------|
-| lib/Math | `kyty-math` | `todo` | | |
-| lib/Scripts | `kyty-scripts` | `todo` | | skip unused lua if not needed |
+| lib/Math: VectorAndMatrix (Vec2/3/4, Mat2/3/4) | `kyty-math` | `todo` | | map to `glam` (workspace-crate convention, not transliterate 3k lines of C++ templates); needed for Graphics/M2 — create crate when GPU work starts to avoid an orphan |
+| lib/Math: Rand (mt19937) | `kyty-math` | `todo` | | map to `rand` crate w/ Kyty API (Uint/Double/Float/ranges); marginal utility until a ported subsystem needs it |
+| lib/Math: Crypto (AES + Hash) | `kyty-math` | `skip` | | AES/SHA → RustCrypto (`aes`/`cbc`/`sha1` already workspace deps used by xps5x-firmware SELF decrypt); 3rdparty→workspace-crate convention, do not transliterate |
+| lib/Scripts | `kyty-scripts` | `skip` | | Lua scripting — unused by XPS5X's execution path (guest games are native binaries, not Kyty Lua demos); per goal "skip unused Scripts/lua unless config needs it" |
 | emulator/Loader | `kyty-loader` → `xps5x-firmware`/`loader` | `todo` | | |
 | emulator/Kernel | `kyty-kernel` → `xps5x-kernel`/`hle` | `todo` | | |
 | emulator/Libs | `kyty-libs` → `xps5x-hle` | `todo` | | |
