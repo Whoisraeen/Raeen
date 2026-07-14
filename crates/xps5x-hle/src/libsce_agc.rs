@@ -33,6 +33,9 @@ const IT_INDEX_BASE: u32 = 0x26;
 const IT_DRAW_INDEX_2: u32 = 0x27;
 const IT_NUM_INSTANCES: u32 = 0x2F;
 const IT_DISPATCH_DIRECT: u32 = 0x15;
+const IT_SET_SH_REG: u32 = 0x76;
+/// Marker DWORD preceding a `CbSetShRegisterRange` packet.
+const SET_SH_RANGE_MARKER: u32 = 0x6875_000D;
 const R_ZERO: u32 = 0x00;
 const R_DRAW_INDEX_AUTO: u32 = 0x04;
 const R_DRAW_RESET: u32 = 0x05;
@@ -74,6 +77,11 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceAgc", "sceAgcCbNop", hle_cb_nop);
     registry.register("libSceAgc", "sceAgcDcbSetFlip", hle_dcb_set_flip);
     registry.register("libSceAgc", "sceAgcAcbResetQueue", hle_acb_reset_queue);
+    registry.register(
+        "libSceAgc",
+        "sceAgcCbSetShRegisterRangeDirect",
+        hle_cb_set_sh_register_range,
+    );
 }
 
 /// Agc PM4 header: type-3 (`0xC000_0000`), `len_dwords` is the **total** packet
@@ -430,6 +438,52 @@ fn hle_acb_reset_queue(ctx: &HleContext, args: &[u64]) -> u64 {
     addr
 }
 
+/// `sceAgcCbSetShRegisterRangeDirect(cb, offset, values, valueCount)`: emit a
+/// marker packet then a SET_SH_REG packet writing `valueCount` values (read
+/// from the guest `values` array) to SH registers starting at `offset`.
+fn hle_cb_set_sh_register_range(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let offset = args.get(1).copied().unwrap_or(0) as u32;
+    let values_addr = args.get(2).copied().unwrap_or(0);
+    let value_count = args.get(3).copied().unwrap_or(0);
+    if cb == 0 || offset == 0 || offset > 0x3FF || value_count == 0 {
+        return 0;
+    }
+    // Marker packet.
+    let Some(marker) = alloc_command_dwords(ctx, cb, 2) else {
+        return 0;
+    };
+    if !ctx.mem.write(marker, &pm4(2, IT_NOP, R_ZERO).to_le_bytes())
+        || !ctx
+            .mem
+            .write(marker + 4, &SET_SH_RANGE_MARKER.to_le_bytes())
+    {
+        return 0;
+    }
+    // SET_SH_REG packet: header + offset + valueCount values.
+    let Some(addr) = alloc_command_dwords(ctx, cb, value_count + 2) else {
+        return 0;
+    };
+    if !ctx.mem.write(
+        addr,
+        &pm4((value_count + 2) as u32, IT_SET_SH_REG, R_ZERO).to_le_bytes(),
+    ) || !ctx.mem.write(addr + 4, &offset.to_le_bytes())
+    {
+        return 0;
+    }
+    for i in 0..value_count {
+        // Copy each source value (0 if the source is null/unreadable).
+        let mut v = [0u8; 4];
+        if values_addr != 0 {
+            let _ = ctx.mem.read(values_addr + i * 4, &mut v);
+        }
+        if !ctx.mem.write(addr + 8 + i * 4, &v) {
+            return 0;
+        }
+    }
+    addr
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,6 +668,35 @@ mod tests {
         // AcbResetQueue: 2-dword async-compute reset.
         let a = hle_acb_reset_queue(&ctx, &[cb]);
         assert_eq!(read_u32(&ctx, a), pm4(2, IT_NOP, R_ACB_RESET));
+    }
+
+    #[test]
+    fn set_sh_register_range_emits_marker_and_copies_values() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        // Source values at 0x100.
+        assert!(ctx.mem.write(0x100, &0xAAAA_AAAAu32.to_le_bytes()));
+        assert!(ctx.mem.write(0x104, &0xBBBB_BBBBu32.to_le_bytes()));
+        let ret = hle_cb_set_sh_register_range(&ctx, &[cb, 0x2C, 0x100, 2]);
+        assert_eq!(
+            ret, 0x408,
+            "returns the SET_SH_REG packet (after the marker)"
+        );
+        // Marker packet at 0x400.
+        assert_eq!(read_u32(&ctx, 0x400), pm4(2, IT_NOP, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), SET_SH_RANGE_MARKER);
+        // SET_SH_REG packet: header, offset, then the two copied values.
+        assert_eq!(read_u32(&ctx, 0x408), pm4(4, IT_SET_SH_REG, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x40C), 0x2C, "register offset");
+        assert_eq!(read_u32(&ctx, 0x410), 0xAAAA_AAAA);
+        assert_eq!(read_u32(&ctx, 0x414), 0xBBBB_BBBB);
+        // Invalid offset (> 0x3FF) rejected.
+        assert_eq!(
+            hle_cb_set_sh_register_range(&ctx, &[cb, 0x400, 0x100, 1]),
+            0
+        );
     }
 
     #[test]
