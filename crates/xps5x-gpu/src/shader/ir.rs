@@ -183,10 +183,18 @@ pub fn lift_to_ir(instructions: &[Instruction], shader_type: ShaderType) -> IrPr
                 }
             }
             Encoding::Exp => {
-                // Export instruction → write output.
+                // Export instruction → write output. The decoded target (carried
+                // in `opcode`) picks the export kind: MRT0-7/MRTZ → color,
+                // POS0-3 → position, PARAM0-31 → interpolated varying.
                 output_count += 1;
+                let op = match inst.opcode {
+                    0..=8 => IrOp::ExportColor,      // MRT0-7 + MRTZ (depth)
+                    12..=15 => IrOp::ExportPosition, // POS0-3
+                    32..=63 => IrOp::ExportParam,    // PARAM0-31
+                    _ => IrOp::ExportColor,
+                };
                 IrNode {
-                    op: IrOp::ExportColor, // Refined based on target in detailed decode.
+                    op,
                     result: None,
                     sources: vec![],
                 }
@@ -515,6 +523,22 @@ mod tests {
         )];
         let prog = lift_to_ir(&stream, ShaderType::Vertex);
         assert!(matches!(prog.nodes[0].sources[1], IrValue::ConstI32(5)));
+    }
+
+    #[test]
+    fn export_target_selects_the_export_op() {
+        // Target carried in opcode: MRT0(0)→Color, POS0(12)→Position,
+        // PARAM3(35)→Param.
+        let stream = [
+            inst(Encoding::Exp, 0),
+            inst(Encoding::Exp, 12),
+            inst(Encoding::Exp, 35),
+        ];
+        let prog = lift_to_ir(&stream, ShaderType::Vertex);
+        assert_eq!(prog.nodes[0].op, IrOp::ExportColor);
+        assert_eq!(prog.nodes[1].op, IrOp::ExportPosition);
+        assert_eq!(prog.nodes[2].op, IrOp::ExportParam);
+        assert_eq!(prog.output_count, 3, "each export bumps the output count");
     }
 
     #[test]

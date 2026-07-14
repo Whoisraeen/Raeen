@@ -237,7 +237,8 @@ fn classify_instruction(word: u32) -> (Encoding, u32, u32) {
     };
 
     match top7 {
-        0b1111110 => return (Encoding::Exp, 0, 8),
+        // EXP: the export target (MRT/POS/PARAM) is TGT[9:4]; carry it as the opcode.
+        0b1111110 => return (Encoding::Exp, (word >> 4) & 0x3F, 8),
         0b1100100 => return (Encoding::Smem, (word >> 18) & 0x3F, 8),
         _ => {}
     };
