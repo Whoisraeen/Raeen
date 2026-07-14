@@ -28,6 +28,7 @@ pub mod libsce_audio_out;
 pub mod libsce_gnm_driver;
 pub mod libsce_net;
 pub mod libsce_pad;
+pub mod libsce_playgo;
 pub mod libsce_save_data;
 pub mod libsce_sysmodule;
 pub mod libsce_video_out;
@@ -128,6 +129,7 @@ impl HleRegistry {
         libsce_sysmodule::register(&registry);
         libsce_video_out::register(&registry);
         libsce_pad::register(&registry);
+        libsce_playgo::register(&registry);
 
         info!(
             "HLE registry: {} functions registered",
