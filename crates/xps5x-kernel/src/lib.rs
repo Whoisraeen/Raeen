@@ -181,6 +181,13 @@ pub struct OrbisKernel {
     pub pthread_tls_keys: DashMap<i32, u64>,
     /// Thread-local specific values, keyed by (thread handle, TLS key).
     pub pthread_tls_values: DashMap<(u64, i32), u64>,
+    /// Dynamic TLS blocks allocated by `libkernel::__tls_get_addr`, keyed by
+    /// the module identifier carried in the guest's TLS descriptor.
+    ///
+    /// The runtime currently executes one guest thread, so a module has one
+    /// block per process. M1-E must extend this key with the real guest-thread
+    /// identity when concurrent guest contexts land.
+    pub dynamic_tls_blocks: DashMap<u64, u64>,
     /// Next TLS key id to hand out.
     pthread_tls_next_key: std::sync::atomic::AtomicI32,
     /// libSceHttp contexts (existence set for `sceHttpTerm`), keyed by context
@@ -345,6 +352,7 @@ impl OrbisKernel {
             kernel_socket_next: std::sync::atomic::AtomicI32::new(0x4000_0000),
             pthread_tls_keys: DashMap::new(),
             pthread_tls_values: DashMap::new(),
+            dynamic_tls_blocks: DashMap::new(),
             pthread_tls_next_key: std::sync::atomic::AtomicI32::new(0),
             http_contexts: DashMap::new(),
             http_next_context: std::sync::atomic::AtomicI32::new(0),

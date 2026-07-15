@@ -349,6 +349,10 @@ pub fn execute_process(
     // `process::build_process_stack` writes only through `&arena` (bounds-
     // checked `GuestMemory`), never panicking on `argv`/`envp` content.
     let process_rsp = process::build_process_stack(arena.stack_top(), argv, envp, &arena)?;
+    // Dependency initializers are ordinary called functions. Their stack top
+    // must be 16-aligned so `call` makes their incoming RSP 8 mod 16, and it
+    // must sit below the process-parameter block so they cannot overwrite it.
+    let module_stack_top = process_rsp.checked_sub(8).ok_or(RuntimeError::MapFailed)?;
 
     // SAFETY: same reasoning as `execute_linked`'s `entry` transmute above —
     // `entry_ptr` is a host address inside `arena`'s `PAGE_EXECUTE_READWRITE`
@@ -365,7 +369,7 @@ pub fn execute_process(
 
     // SAFETY: `entry` is exactly the function pointer
     // `enter_guest_at_start`'s safety contract requires; `process_rsp` is the
-    // 16-aligned process-stack pointer `build_process_stack` just computed,
+    // 8-mod-16 Orbis process-stack pointer `build_process_stack` just computed,
     // inside `arena`'s own committed, writable stack region — satisfying
     // `dispatch::run`'s `call_guest` contract. The remaining arguments carry
     // the same safety argument as `execute_linked`'s call to `dispatch::run`
@@ -433,7 +437,8 @@ pub fn execute_process(
                         init.name,
                         init.image_offset
                     );
-                    let rc = crate::stack::call_on_guest_stack(f, [0, 0, 0, 0, 0, 0], process_rsp);
+                    let rc =
+                        crate::stack::call_on_guest_stack(f, [0, 0, 0, 0, 0, 0], module_stack_top);
                     tracing::info!("{}: module_start returned {rc:#x}", init.name);
                 }
                 crate::stack::enter_guest_at_start(entry, process_rsp, process_rsp, 0)

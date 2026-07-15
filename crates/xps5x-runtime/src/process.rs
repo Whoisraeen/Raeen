@@ -23,7 +23,9 @@ const AUXV_PAGESZ_VALUE: u64 = 0x4000;
 /// (highest addresses), then — below them, 16-byte aligned — `argc`, the
 /// `argv[]` pointer table, a `NULL`, the `envp[]` pointer table, another
 /// `NULL`, and the auxv (`AT_PAGESZ`, `AT_NULL`). Returns the final `rsp`
-/// (pointing at `argc`), which is always `% 16 == 0` (the `_start` ABI).
+/// (pointing at `argc`), which is always `% 16 == 8`: Orbis enters `_start`
+/// with ordinary called-function alignment while also passing this same block
+/// in `rdi`.
 ///
 /// Every write goes through `mem` (bounds-checked, design doc §2): overflow
 /// (too many/too-long `argv`/`envp` entries for the region, or arithmetic
@@ -68,13 +70,16 @@ pub(crate) fn build_process_stack(
     let block_bytes = n_slots.checked_mul(8).ok_or(RuntimeError::MapFailed)?;
 
     // Place the block so it ends at or below `cursor` (never overlapping the
-    // strings just written above it), then align its start down to 16 bytes
+    // strings just written above it), then align its start down to 8 mod 16
     // — rounding down only ever moves the start *further* from `cursor`, so
     // the no-overlap property still holds after alignment.
     let block_end = cursor
         .checked_sub(block_bytes)
         .ok_or(RuntimeError::MapFailed)?;
-    let rsp = block_end & !0xF;
+    let rsp = block_end
+        .checked_sub(8)
+        .map(|v| (v & !0xF) + 8)
+        .ok_or(RuntimeError::MapFailed)?;
 
     let mut slot = rsp;
     write_u64(mem, &mut slot, n_argv)?;
@@ -180,7 +185,7 @@ mod tests {
         }
     }
 
-    /// `rsp` is 16-aligned, `argc == 1`, `argv[0]`'s pointer resolves back to
+    /// `rsp` is 8 mod 16, `argc == 1`, `argv[0]`'s pointer resolves back to
     /// the exact string (NUL-terminated) — the W1a acceptance shape, at the
     /// `build_process_stack` layer (the `_start` asm-level acceptance lives
     /// in `tests/execute.rs`).
@@ -190,7 +195,7 @@ mod tests {
         let rsp = build_process_stack(0x1000, &["/app/eboot.bin"], &[], &mem)
             .expect("layout should succeed");
 
-        assert_eq!(rsp % 16, 0, "rsp must be 16-byte aligned (the _start ABI)");
+        assert_eq!(rsp % 16, 8, "rsp must have called-function alignment");
 
         let argc = mem.read_u64(rsp);
         assert_eq!(argc, 1, "argc must equal argv.len()");
@@ -209,7 +214,7 @@ mod tests {
         let mem = VecMemory::new(0x1000);
         let rsp = build_process_stack(0x1000, &[], &[], &mem).expect("layout should succeed");
 
-        assert_eq!(rsp % 16, 0);
+        assert_eq!(rsp % 16, 8);
         assert_eq!(mem.read_u64(rsp), 0, "argc == 0");
         assert_eq!(
             mem.read_u64(rsp + 8),
@@ -236,7 +241,7 @@ mod tests {
         let rsp = build_process_stack(0x1000, &["a", "bb"], &["FOO=1"], &mem)
             .expect("layout should succeed");
 
-        assert_eq!(rsp % 16, 0);
+        assert_eq!(rsp % 16, 8);
         assert_eq!(mem.read_u64(rsp), 2, "argc == 2");
 
         let argv0 = mem.read_u64(rsp + 8);

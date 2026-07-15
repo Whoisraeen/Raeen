@@ -228,6 +228,12 @@ fn build_hle_data_page(registry: &mut registry::ModuleRegistry, page_base: u64) 
         &mut page,
         &mut exports,
     );
+    // Standard IPv6 address constants exported by libSceNet. These are data,
+    // not functions: native guest code dereferences their resolved addresses.
+    add("in6addr_any", &[0u8; 16], &mut page, &mut exports);
+    let mut loopback = [0u8; 16];
+    loopback[15] = 1;
+    add("in6addr_loopback", &loopback, &mut page, &mut exports);
 
     // Registered under "libkernel" purely for the log line; `resolve` is by NID
     // and ignores the declaring module.
@@ -552,6 +558,17 @@ pub fn load_process(
         linked.unresolved.len() + dep_unresolved,
         linked.unresolved_stubs.len()
     );
+    // Name every missing NID up front (project rule: log name+NID loudly).
+    // One line per distinct NID turns "313 missing" into an actionable
+    // implement-me list without waiting to fault on each one at runtime.
+    for stub in &linked.unresolved_stubs {
+        tracing::info!(
+            "  missing NID {:#018x} ({}) wanted from library '{}'",
+            stub.nid,
+            dynlib::nid::encode_nid(stub.nid),
+            stub.library.as_deref().unwrap_or("<unknown>"),
+        );
+    }
 
     Ok(LoadedProcess {
         linked,
@@ -561,8 +578,35 @@ pub fn load_process(
 
 #[cfg(test)]
 mod tests {
+    use crate::dynlib::nid::{NidDatabase, nid_of};
+    use crate::{ModuleRegistry, Resolver};
+
     #[test]
     fn crate_name_is_set() {
         assert_eq!(super::CRATE_NAME, "xps5x-firmware");
+    }
+
+    #[test]
+    fn hle_data_page_exports_ipv6_constants_at_the_real_title_nids() {
+        let hle = xps5x_hle::HleRegistry::new();
+        let mut registry = ModuleRegistry::new(NidDatabase::from_hle(&hle));
+        let base = 0x1000;
+        let page = super::build_hle_data_page(&mut registry, base);
+
+        let addr = match registry.resolve(&hle, "eboot.bin", nid_of("in6addr_any")) {
+            Resolver::Lle { addr, .. } => addr,
+            other => panic!("in6addr_any must resolve as guest data, got {other:?}"),
+        };
+        let offset = usize::try_from(addr - base).expect("page-relative address");
+        assert_eq!(&page[offset..offset + 16], &[0u8; 16]);
+
+        let loopback_addr = match registry.resolve(&hle, "eboot.bin", nid_of("in6addr_loopback")) {
+            Resolver::Lle { addr, .. } => addr,
+            other => panic!("in6addr_loopback must resolve as guest data, got {other:?}"),
+        };
+        let loopback_offset = usize::try_from(loopback_addr - base).expect("page-relative address");
+        let mut expected = [0u8; 16];
+        expected[15] = 1;
+        assert_eq!(&page[loopback_offset..loopback_offset + 16], &expected);
     }
 }

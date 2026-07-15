@@ -22,6 +22,8 @@ const REAL_TITLE_IMPORTS: &[(&str, &str)] = &[
     ("gettimeofday", "n88vx3C5nW8"),
     // Recovered from the same title's import table.
     ("__stack_chk_guard", "f7uOxY9mM1U"),
+    ("in6addr_any", "ZRAJo-A-ukc"),
+    ("in6addr_loopback", "XCuA-GqjA-k"),
     ("__cxa_pure_virtual", "zr094EQ39Ww"),
     ("strcmp", "Ovb2dSJOAuE"),
 ];

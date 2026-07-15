@@ -40,6 +40,7 @@ pub mod libsce_fiber;
 pub mod libsce_gnm_driver;
 pub mod libsce_http;
 pub mod libsce_json;
+pub mod libsce_libc_internal;
 pub mod libsce_media;
 pub mod libsce_net;
 pub mod libsce_np;
@@ -203,6 +204,7 @@ impl HleRegistry {
         libsce_rtc::register(&registry);
         libsce_peripheral::register(&registry);
         libsce_json::register(&registry);
+        libsce_libc_internal::register(&registry);
         libsce_fiber::register(&registry);
         libsce_media::register(&registry);
         libsce_agc::register(&registry);

@@ -203,13 +203,13 @@ pub(crate) unsafe fn call_on_guest_stack(
 ///   carries), even though it is never actually *called* with SysV register
 ///   arguments — see the control-flow note below for why its Rust type is
 ///   reused as-is regardless.
-/// - `process_rsp` must be a **16-byte-aligned** address pointing at the top
+/// - `process_rsp` must be **8 modulo 16** and point at the top
 ///   of a fully-built process stack inside a committed, writable memory
 ///   region — exactly [`crate::process::build_process_stack`]'s return
 ///   value. 16-alignment matters because, unlike `call_on_guest_stack`, no
 ///   `call` here pushes an 8-byte return address to shift it to `8 mod 16`:
-///   `_start`'s ABI requires `rsp ≡ 0 mod 16` at its very first instruction,
-///   so `process_rsp` must already be exactly that.
+///   Orbis `_start` uses ordinary called-function alignment (`rsp ≡ 8 mod
+///   16`), so compiler-generated frames and aligned XMM spills depend on it.
 /// - Must be called with `dispatch::CALL_LOCK` held (as `execute_process`
 ///   does), for the same [`HOST_RSP_SLOT`] reentrancy reason as
 ///   `call_on_guest_stack`.
@@ -275,8 +275,8 @@ pub(crate) unsafe fn enter_guest_at_start(
 ) -> u64 {
     debug_assert_eq!(
         process_rsp % 16,
-        0,
-        "process_rsp must be 16-byte aligned (_start ABI)"
+        8,
+        "process_rsp must be 8 mod 16 (Orbis called-function entry ABI)"
     );
 
     // Function pointers aren't directly usable as `asm!` register operands;
@@ -301,7 +301,7 @@ pub(crate) unsafe fn enter_guest_at_start(
             // Save the host RSP before switching stacks, RIP-relative (no
             // GP register) — same reasoning as `call_on_guest_stack`.
             "mov qword ptr [rip + {slot}], rsp",
-            // Switch to the process stack. `process_rsp` is 16-aligned (see
+            // Switch to the process stack. `process_rsp` is 8 mod 16 (see
             // this function's `debug_assert!` and doc comment) and points at
             // `argc`, per `_start`'s ABI.
             "mov rsp, {guest_rsp}",

@@ -14,6 +14,8 @@ use tracing::debug;
 
 /// `SCE_OK`.
 const SCE_OK: u64 = 0;
+/// `SCE_NET_ERROR_EINVAL`.
+const NET_ERROR_INVALID_ARGUMENT: u64 = 0x8041_0116;
 /// `SCE_NET_CTL_STATE_DISCONNECTED` (0). (`CONNECTING = 1`, ...,
 /// `IPOBTAINED = 3`.)
 const NET_CTL_STATE_DISCONNECTED: u32 = 0;
@@ -32,6 +34,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceNet", "sceNetHtons", hle_htons);
     registry.register("libSceNet", "sceNetNtohl", hle_htonl); // symmetric byte swap
     registry.register("libSceNet", "sceNetNtohs", hle_htons);
+    registry.register("libSceNet", "sceNetGetMacAddress", hle_get_mac_address);
 
     registry.register("libSceNetCtl", "sceNetCtlInit", hle_ok);
     registry.register("libSceNetCtl", "sceNetCtlTerm", hle_ok);
@@ -59,6 +62,19 @@ fn hle_htonl(_ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_htons(_ctx: &HleContext, args: &[u64]) -> u64 {
     let v = args.first().copied().unwrap_or(0) as u16;
     v.to_be() as u64
+}
+
+/// `sceNetGetMacAddress(SceNetEtherAddr *addr, int flags)`: the offline
+/// compatibility layer exposes no host hardware identity, so report the
+/// conventional all-zero six-byte address. Kyty uses the same behavior.
+fn hle_get_mac_address(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    let flags = args.get(1).copied().unwrap_or(0);
+    if addr == 0 || flags != 0 || !ctx.mem.write(addr, &[0u8; 6]) {
+        return NET_ERROR_INVALID_ARGUMENT;
+    }
+    debug!("sceNetGetMacAddress(addr={addr:#x}) -> 00:00:00:00:00:00");
+    SCE_OK
 }
 
 /// `sceNetCtlGetState(int *state)`: reports `DISCONNECTED` — no network.
@@ -107,5 +123,39 @@ mod tests {
         assert_eq!(u32::from_le_bytes(s), NET_CTL_STATE_DISCONNECTED);
 
         assert!(hle_new_id(&ctx, &[]) > 0);
+    }
+
+    #[test]
+    fn get_mac_address_writes_an_offline_zero_address() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x40, &[0xAA; 6]));
+        assert_eq!(hle_get_mac_address(&ctx, &[0x40, 0]), SCE_OK);
+        let mut mac = [0xAA; 6];
+        assert!(mem.read(0x40, &mut mac));
+        assert_eq!(mac, [0; 6]);
+        assert_ne!(hle_get_mac_address(&ctx, &[0, 0]), SCE_OK);
+        assert_ne!(hle_get_mac_address(&ctx, &[0x40, 1]), SCE_OK);
+    }
+
+    #[test]
+    fn ether_ntostr_formats_a_mac_address() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x20, &[0x00, 0x11, 0x22, 0xAA, 0xBB, 0xFF]));
+        assert_eq!(hle_ether_ntostr(&ctx, &[0x20, 0x40, 18]), SCE_OK);
+        let mut text = [0u8; 18];
+        assert!(mem.read(0x40, &mut text));
+        assert_eq!(&text, b"00:11:22:aa:bb:ff\0");
+
+        assert_ne!(hle_ether_ntostr(&ctx, &[0, 0x40, 18]), SCE_OK);
+        assert_ne!(hle_ether_ntostr(&ctx, &[0x20, 0, 18]), SCE_OK);
+        assert_ne!(hle_ether_ntostr(&ctx, &[0x20, 0x40, 17]), SCE_OK);
     }
 }

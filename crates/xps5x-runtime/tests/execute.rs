@@ -1958,6 +1958,39 @@ fn start_stub_observes_argc_via_rdi_per_the_orbis_entry_abi() {
     }
 }
 
+/// Orbis enters `_start` with the alignment of an ordinary called SysV
+/// function: `rsp % 16 == 8`. Real retail code relies on this for aligned
+/// XMM spills after `push rbp`; entering at 0 mod 16 shifts every frame by
+/// eight and turns `vmovaps` into a #GP (reported by Windows as access -1).
+#[test]
+fn process_entry_has_orbis_called_function_stack_alignment() {
+    const ENTRY_OFF: usize = 0;
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+    // mov rax, rsp; and eax, 0xf; jmp rax
+    image[..8].copy_from_slice(&[0x48, 0x89, 0xE0, 0x83, 0xE0, 0x0F, 0xFF, 0xE0]);
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: Vec::new(),
+        entry: ENTRY_OFF as u64,
+        tls: None,
+        procparam_offset: None,
+    };
+
+    let kernel = OrbisKernel::new();
+    let err = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[])
+        .expect_err("jumping to rsp & 0xf must fault and expose the alignment");
+    match err {
+        RuntimeError::Faulted { addr, .. } => assert_eq!(addr, 8),
+        other => panic!("expected alignment observation fault, got {other:?}"),
+    }
+}
+
 /// W1a acceptance test, part 1 (design doc §6/§8): a hand-assembled `_start`
 /// stub reads `argc` from `[rsp]` and jumps to it as an address. With a
 /// single `argv` entry (`argc == 1`), that fault's `Rip` is observably `1` --

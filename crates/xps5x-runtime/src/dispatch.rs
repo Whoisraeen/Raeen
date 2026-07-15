@@ -75,6 +75,9 @@ const TERMINATING_FUNCTIONS: &[(&str, &str)] = &[
     ("libc", "exit_group"),
     ("libc", "_exit"),
     ("libkernel", "sceKernelExit"),
+    // libkernel's real export of _exit (NID hashed from "_exit") — libc.prx
+    // and the eboot both import it directly.
+    ("libkernel", "_exit"),
 ];
 
 /// Whether `(library, function)` names a [`TERMINATING_FUNCTIONS`] entry.
@@ -233,6 +236,9 @@ struct ActiveContext {
     region_base: u64,
     region_len: u64,
     error: Cell<Option<RuntimeError>>,
+    /// Register state and instruction bytes captured before a genuine guest
+    /// fault is long-jumped back to the host recovery point.
+    fault_snapshot: Cell<Option<FaultSnapshot>>,
     /// Armed (`true`) by `run` immediately before it calls the guest, and
     /// read by `run` right after the `RtlCaptureContext` recovery point —
     /// on *both* the original arrival there and, if the guest faults
@@ -320,6 +326,25 @@ struct ActiveContext {
     /// `AlignedContext` fix the `movaps` `#GP` that used to open this window is
     /// gone, but any other pre-capture fault is now handled safely too.
     armed: Cell<bool>,
+}
+
+#[derive(Clone, Copy)]
+struct FaultSnapshot {
+    rip: u64,
+    rsp: u64,
+    rbp: u64,
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    bytes: [u8; 16],
+    bytes_read: bool,
 }
 
 /// A `CONTEXT` forced to the SDK's mandated 16-byte alignment.
@@ -462,6 +487,7 @@ pub(crate) unsafe fn run(
         region_base: guard.base(),
         region_len: guard.len(),
         error: Cell::new(None),
+        fault_snapshot: Cell::new(None),
         resumed: Cell::new(false),
         recovery_ctx: &recovery.0 as *const CONTEXT,
         orig_fsbase: Cell::new(0),
@@ -655,6 +681,37 @@ pub(crate) unsafe fn run(
 /// `-> 0x0` a few lines above a `Faulted { access: 0 }` is very often the whole
 /// story.
 fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &RuntimeError) {
+    if let Some(snapshot) = ctx.fault_snapshot.get() {
+        let instruction = if snapshot.bytes_read {
+            snapshot
+                .bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            "<unreadable>".to_string()
+        };
+        tracing::warn!(
+            "fault snapshot: rip={:#x} rsp={:#x} rbp={:#x}\n  \
+             rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}\n  \
+             rsi={:#x} rdi={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x}\n  \
+             instruction bytes: {instruction}",
+            snapshot.rip,
+            snapshot.rsp,
+            snapshot.rbp,
+            snapshot.rax,
+            snapshot.rbx,
+            snapshot.rcx,
+            snapshot.rdx,
+            snapshot.rsi,
+            snapshot.rdi,
+            snapshot.r8,
+            snapshot.r9,
+            snapshot.r10,
+            snapshot.r11,
+        );
+    }
     let entries = ctx.trace.entries_oldest_first();
     if entries.is_empty() {
         tracing::warn!("{err} — no HLE calls were serviced before it");
@@ -817,6 +874,31 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             },
         };
         ctx.error.set(Some(err));
+
+        let mut bytes = [0u8; 16];
+        // SAFETY: `ctx.mem` points to the live guest memory view for the
+        // duration of this guarded call (same invariant used below for HLE
+        // dispatch). `read` is bounds-checked and leaves diagnosis honest if
+        // RIP itself is not readable.
+        let mem = unsafe { &*ctx.mem };
+        let bytes_read = mem.read(context.Rip, &mut bytes);
+        ctx.fault_snapshot.set(Some(FaultSnapshot {
+            rip: context.Rip,
+            rsp: context.Rsp,
+            rbp: context.Rbp,
+            rax: context.Rax,
+            rbx: context.Rbx,
+            rcx: context.Rcx,
+            rdx: context.Rdx,
+            rsi: context.Rsi,
+            rdi: context.Rdi,
+            r8: context.R8,
+            r9: context.R9,
+            r10: context.R10,
+            r11: context.R11,
+            bytes,
+            bytes_read,
+        }));
 
         // SAFETY: `ctx.recovery_ctx` was populated by `run`'s
         // `RtlCaptureContext` call before it called the guest, and is
