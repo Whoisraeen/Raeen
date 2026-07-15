@@ -136,3 +136,41 @@ existing single-module path stays for fixtures/diagnostics.
 the guest advances past the `0x5000_0000_0000` (`UNRESOLVED_STUB_ADDR`) fault it
 dies at today. That fault address moving is the honest signal of progress — it is
 how every blocker this session was found.
+
+---
+
+## POST-IMPLEMENTATION CORRECTION (chain built in `c7a764b`)
+
+The chain is built and **works**: three real `.prx` load at distinct bases,
+register absolute exports, and compose into one image (no `GuestArena` change,
+as predicted). But the headline number above is **suspect**.
+
+Measured directly against the files:
+
+* eboot has **876** distinct import NID strings; only **129** appear anywhere in
+  `libfmod.prx`.
+* Loading the chain dropped `unresolved` 87222 -> **87106** (only 116) — i.e.
+  ≈ the 129 that genuinely match. The chain resolved what it legitimately could.
+* 129 distinct symbols cannot account for 86852 unresolved *relocations* unless
+  each were referenced ~673x; and if that were so, resolving 116 of them would
+  have dropped `unresolved` by tens of thousands, not 116.
+
+**Conclusion: the `library_index -> name` attribution in the by-library ranking
+(`--load-sprx`) is probably WRONG** — a `DT_SCE_IMPORT_LIB` `id` (`val >> 48`)
+may not share numbering with a symbol's `#lib#` field. So "99.6% is libfmod" is
+likely an artifact, and the real distribution of the remaining ~87k unresolved
+relocations is **unknown**.
+
+### Do this first, before any more HLE or M2 work
+
+1. **Verify the attribution.** Take one known-unresolved NID, find its symtab
+   entry, decode its `#lib#`, map it through `import_libs`, and confirm that
+   library actually exports that NID. If it doesn't, the mapping is wrong.
+2. **Find what the 87k relocations actually are.** They may not be imports at
+   all — count them by `r_type` and by whether `symbols[r_sym].is_import`. Note
+   `linked.unresolved` holds one entry *per relocation*, so a handful of symbols
+   can dominate the count.
+3. Only then rank libraries and decide what to implement.
+
+The honest signal remains the fault address (`--run-eboot`): it still stops at
+`0x5000_0000_0000` (`UNRESOLVED_STUB_ADDR`). Move that, and you've made progress.
