@@ -131,6 +131,31 @@ fn align_up_16k(v: u64) -> u64 {
     (v + 0x3FFF) & !0x3FFF
 }
 
+/// Subdirectories of the app directory a `DT_NEEDED` module may live in,
+/// searched in order after the app directory itself.
+///
+/// `sce_module/` is where a title ships the **system** modules it wants used
+/// in preference to the console's own — `libc.prx`, `libSceNpCppWebApi.prx`.
+/// Missing it is expensive: on the measured retail title `sce_module/libc.prx`
+/// alone exports 99.4% of the eboot's import relocations.
+const DEPENDENCY_SUBDIRS: &[&str] = &["sce_module"];
+
+/// Locate a `DT_NEEDED` module's file: `dir/<needed>` first, then each of
+/// [`DEPENDENCY_SUBDIRS`]. `None` if it ships nowhere we look.
+fn find_dependency_file(dir: &std::path::Path, needed: &str) -> Option<std::path::PathBuf> {
+    let direct = dir.join(needed);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    for sub in DEPENDENCY_SUBDIRS {
+        let p = dir.join(sub).join(needed);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// Load a title as a **process**: the main module plus every `DT_NEEDED`
 /// dependency that exists as a real file next to it (M1-D, wall #4).
 ///
@@ -203,18 +228,34 @@ pub fn load_process(
 
     for needed in &dynlib_data.needed_modules {
         let stem = needed.trim_end_matches(".sprx").trim_end_matches(".prx");
+        let Some(path) = find_dependency_file(dir, needed) else {
+            if hle_libs.contains(stem) {
+                tracing::info!("NEEDED {needed}: no file shipped; covered by HLE library '{stem}'");
+            } else {
+                tracing::warn!(
+                    "NEEDED {needed}: no HLE library named '{stem}' and no file in {} or its \
+                     sce_module/ — its imports will not resolve",
+                    dir.display()
+                );
+            }
+            continue;
+        };
+        // A shipped file is loaded even when an HLE library of the same name
+        // exists. That is not a conflict: `ModuleRegistry::resolve` defaults to
+        // `PreferHle`, so our implementation still wins for every NID we
+        // actually implement, and the real module only supplies the rest.
+        //
+        // This matters enormously and used to be skipped. The measured title
+        // ships its own `sce_module/libc.prx`, whose exports cover 86883 of its
+        // 87414 import relocations (99.4%) and 260 of the 758 functions it
+        // actually calls — including the one it dies on today. Refusing to load
+        // it because "libc is HLE-covered" left all of that unresolved while our
+        // libc HLE supplied only ~31 relocations' worth.
         if hle_libs.contains(stem) {
-            tracing::info!("NEEDED {needed}: covered by HLE library '{stem}' — not file-loaded");
-            continue;
-        }
-        let path = dir.join(needed);
-        if !path.is_file() {
-            tracing::warn!(
-                "NEEDED {needed}: no HLE library named '{stem}' and no file at {} — its imports \
-                 will not resolve",
-                path.display()
+            tracing::info!(
+                "NEEDED {needed}: HLE library '{stem}' exists AND the title ships the real module \
+                 — loading it; HLE still wins per-NID (PreferHle), the file covers the rest"
             );
-            continue;
         }
 
         let dep_bytes = match std::fs::read(&path) {
