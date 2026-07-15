@@ -1,37 +1,6 @@
-//! pthread **condition variables**, to the exact extent the single-guest-thread
-//! model can implement them honestly.
-//!
-//! # What is correct here, and what is missing
-//!
-//! XPS5X runs exactly one guest execution context (see `pthread_sync`'s module
-//! docs and M1-E in the progress ledger). That is not merely a limitation for
-//! condition variables — it *determines* their semantics, and splits this API
-//! cleanly in two:
-//!
-//! * **`signal` / `broadcast` are genuinely correct, not stubs.** They wake
-//!   waiting threads. With one guest thread, the caller *is* that thread, so a
-//!   waiter cannot exist — anything waiting would be blocked and unable to make
-//!   this call. Waking nobody and returning 0 is exactly what POSIX specifies
-//!   for a condition variable with no waiters.
-//! * **`wait` / `timedwait` cannot be implemented at all**, and are deliberately
-//!   left unregistered so a guest that calls one gets a loud, self-naming
-//!   `UnimplementedImport` fault. Every alternative lies:
-//!   returning 0 fakes a spurious wakeup (POSIX permits those), so the guest
-//!   re-checks a predicate only another thread could have set and **spins
-//!   forever**; blocking really deadlocks, since no other thread can ever
-//!   signal; and returning an error makes correct guest code take a failure
-//!   path it has no reason to take. A missing import stops with the function's
-//!   name attached — a livelock stops with nothing. See
-//!   `pthread_sync::register_posix` for the same reasoning applied to
-//!   `pthread_create`.
-//!
-//! When M1-E lands real guest threads, `wait`/`timedwait` belong here and
-//! `signal`/`broadcast` grow a real wait queue — at which point the reasoning
-//! above stops holding and these must be revisited together.
-//!
-//! Only the POSIX spellings are registered: a NID hashes the function name
-//! alone, and the measured retail title imports `pthread_cond_*` from
-//! `libScePosix` and never mentions `scePthreadCond*`.
+//! Host-backed pthread condition variables for concurrent native guest
+//! workers. Wait atomically releases the associated guest mutex while holding
+//! the condition generation lock, sleeps, then reacquires before returning.
 
 use tracing::debug;
 
@@ -41,15 +10,22 @@ use crate::{HleContext, HleRegistry};
 /// matching `pthread_sync`.
 const OK: u64 = 0;
 const EINVAL: u64 = 22;
+const ETIMEDOUT: u64 = 60;
 
-/// Register the condition-variable entry points that can be implemented
-/// correctly under one guest thread. `wait`/`timedwait` are intentionally
-/// absent — see the module docs.
 pub fn register(registry: &HleRegistry) {
-    registry.register("libScePosix", "pthread_cond_init", hle_cond_init);
-    registry.register("libScePosix", "pthread_cond_destroy", hle_cond_destroy);
-    registry.register("libScePosix", "pthread_cond_signal", hle_cond_signal);
-    registry.register("libScePosix", "pthread_cond_broadcast", hle_cond_broadcast);
+    for library in ["libScePosix", "libkernel"] {
+        registry.register(library, "pthread_cond_init", hle_cond_init);
+        registry.register(library, "pthread_cond_destroy", hle_cond_destroy);
+        registry.register(library, "pthread_cond_wait", hle_cond_wait);
+        registry.register(library, "pthread_cond_timedwait", hle_cond_timedwait);
+        registry.register(library, "pthread_cond_signal", hle_cond_signal);
+        registry.register(library, "pthread_cond_broadcast", hle_cond_broadcast);
+    }
+    registry.register("libkernel", "scePthreadCondInit", hle_cond_init);
+    registry.register("libkernel", "scePthreadCondWait", hle_cond_wait);
+    registry.register("libkernel", "scePthreadCondTimedwait", hle_cond_timedwait);
+    registry.register("libkernel", "scePthreadCondSignal", hle_cond_signal);
+    registry.register("libkernel", "scePthreadCondBroadcast", hle_cond_broadcast);
     registry.register("libScePosix", "pthread_condattr_init", hle_condattr_ok);
     registry.register("libScePosix", "pthread_condattr_destroy", hle_condattr_ok);
     registry.register("libScePosix", "pthread_condattr_setclock", hle_condattr_ok);
@@ -57,17 +33,99 @@ pub fn register(registry: &HleRegistry) {
 
 /// `pthread_cond_init(cond, attr)`. A condition variable carries no state we
 /// need while it can have no waiters, so this only validates the pointer.
-fn hle_cond_init(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_cond_init(ctx: &HleContext, args: &[u64]) -> u64 {
     let cond = args.first().copied().unwrap_or(0);
     debug!("pthread_cond_init(cond={cond:#x})");
-    if cond == 0 { EINVAL } else { OK }
+    if cond == 0 {
+        EINVAL
+    } else {
+        ctx.kernel.pthread_conds.insert(
+            cond,
+            std::sync::Arc::new(xps5x_kernel::PthreadCond::default()),
+        );
+        OK
+    }
 }
 
 /// `pthread_cond_destroy(cond)`.
-fn hle_cond_destroy(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_cond_destroy(ctx: &HleContext, args: &[u64]) -> u64 {
     let cond = args.first().copied().unwrap_or(0);
     debug!("pthread_cond_destroy(cond={cond:#x})");
-    if cond == 0 { EINVAL } else { OK }
+    if cond == 0 {
+        EINVAL
+    } else {
+        ctx.kernel.pthread_conds.remove(&cond);
+        OK
+    }
+}
+
+fn condition(ctx: &HleContext, cond: u64) -> std::sync::Arc<xps5x_kernel::PthreadCond> {
+    ctx.kernel
+        .pthread_conds
+        .entry(cond)
+        .or_insert_with(|| std::sync::Arc::new(xps5x_kernel::PthreadCond::default()))
+        .clone()
+}
+
+fn hle_cond_wait(ctx: &HleContext, args: &[u64]) -> u64 {
+    wait_core(ctx, args, None)
+}
+
+fn hle_cond_timedwait(ctx: &HleContext, args: &[u64]) -> u64 {
+    let timeout = args
+        .get(2)
+        .copied()
+        .filter(|ptr| *ptr != 0)
+        .and_then(|ptr| {
+            let mut raw = [0u8; 16];
+            ctx.mem.read(ptr, &mut raw).then(|| {
+                let secs = i64::from_le_bytes(raw[..8].try_into().expect("fixed slice"));
+                let nanos = i64::from_le_bytes(raw[8..].try_into().expect("fixed slice"));
+                let target = std::time::UNIX_EPOCH
+                    + std::time::Duration::new(
+                        secs.max(0) as u64,
+                        nanos.clamp(0, 999_999_999) as u32,
+                    );
+                target
+                    .duration_since(std::time::SystemTime::now())
+                    .unwrap_or_default()
+            })
+        });
+    wait_core(ctx, args, timeout)
+}
+
+fn wait_core(ctx: &HleContext, args: &[u64], timeout: Option<std::time::Duration>) -> u64 {
+    let cond = args.first().copied().unwrap_or(0);
+    let mutex = args.get(1).copied().unwrap_or(0);
+    if cond == 0 || mutex == 0 {
+        return EINVAL;
+    }
+    let state = condition(ctx, cond);
+    let mut generation = state.generation.lock();
+    let observed = *generation;
+    let unlock = crate::pthread_sync::mutex_unlock_for_cond(ctx, mutex);
+    if unlock != OK {
+        return unlock;
+    }
+    let started = std::time::Instant::now();
+    let mut timed_out = false;
+    while *generation == observed && !ctx.guest_threads.process_is_terminating() {
+        let slice = timeout
+            .map(|limit| limit.saturating_sub(started.elapsed()))
+            .unwrap_or(std::time::Duration::from_millis(10))
+            .min(std::time::Duration::from_millis(10));
+        if timeout.is_some() && slice.is_zero() {
+            timed_out = true;
+            break;
+        }
+        state.changed.wait_for(&mut generation, slice);
+    }
+    drop(generation);
+    let relock = crate::pthread_sync::mutex_lock_for_cond(ctx, mutex);
+    if relock != OK {
+        return relock;
+    }
+    if timed_out { ETIMEDOUT } else { OK }
 }
 
 /// `pthread_cond_signal(cond)` — wake one waiter.
@@ -75,18 +133,28 @@ fn hle_cond_destroy(_ctx: &HleContext, args: &[u64]) -> u64 {
 /// Correct, not a stub: with one guest thread there are no waiters to wake, and
 /// POSIX defines signalling a condition variable with no waiters as a no-op
 /// returning success.
-fn hle_cond_signal(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_cond_signal(ctx: &HleContext, args: &[u64]) -> u64 {
     let cond = args.first().copied().unwrap_or(0);
-    debug!("pthread_cond_signal(cond={cond:#x}) [no waiters possible: one guest thread]");
-    if cond == 0 { EINVAL } else { OK }
+    if cond == 0 {
+        return EINVAL;
+    }
+    let state = condition(ctx, cond);
+    *state.generation.lock() += 1;
+    state.changed.notify_one();
+    OK
 }
 
 /// `pthread_cond_broadcast(cond)` — wake all waiters. Same reasoning as
 /// [`hle_cond_signal`].
-fn hle_cond_broadcast(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_cond_broadcast(ctx: &HleContext, args: &[u64]) -> u64 {
     let cond = args.first().copied().unwrap_or(0);
-    debug!("pthread_cond_broadcast(cond={cond:#x}) [no waiters possible: one guest thread]");
-    if cond == 0 { EINVAL } else { OK }
+    if cond == 0 {
+        return EINVAL;
+    }
+    let state = condition(ctx, cond);
+    *state.generation.lock() += 1;
+    state.changed.notify_all();
+    OK
 }
 
 /// `pthread_condattr_init/destroy/setclock` — attribute objects carry nothing
@@ -136,21 +204,11 @@ mod tests {
         assert_eq!(hle_condattr_ok(&ctx, &[0]), EINVAL);
     }
 
-    /// `wait`/`timedwait` must stay UNREGISTERED until real guest threads
-    /// exist. Registering them cannot be done honestly under one thread: 0
-    /// fakes a spurious wakeup and the guest spins forever, blocking really
-    /// deadlocks, and an error sends correct code down a failure path. An
-    /// unresolved import at least reports its own name.
     #[test]
-    fn wait_is_deliberately_not_implemented() {
+    fn wait_is_registered_for_real_guest_workers() {
         let registry = HleRegistry::new();
-        assert!(
-            !registry.is_implemented("libScePosix", "pthread_cond_wait"),
-            "pthread_cond_wait cannot be implemented under one guest thread — a fake return \
-             livelocks the guest instead of naming the missing capability (M1-E)"
-        );
-        assert!(!registry.is_implemented("libScePosix", "pthread_cond_timedwait"));
-        // ...while the half that IS implementable is registered.
+        assert!(registry.is_implemented("libScePosix", "pthread_cond_wait"));
+        assert!(registry.is_implemented("libScePosix", "pthread_cond_timedwait"));
         assert!(registry.is_implemented("libScePosix", "pthread_cond_broadcast"));
         assert!(registry.is_implemented("libScePosix", "pthread_cond_signal"));
     }

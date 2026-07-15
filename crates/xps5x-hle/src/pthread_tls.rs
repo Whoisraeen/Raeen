@@ -3,9 +3,8 @@
 //! A faithful Rust port of SharpEmu's pthread-key TLS (GPL-2.0). A title
 //! creates a key (`scePthreadKeyCreate`), stores a per-thread pointer under it
 //! (`Setspecific`), and reads it back (`Getspecific`) — the mechanism libc and
-//! runtimes use for thread-local storage. Under XPS5X's single-active-execution
-//! model there is one guest thread, so the (thread, key) → value map is exactly
-//! correct with **no runtime dependency** — this module ports completely.
+//! runtimes use for thread-local storage. Values are keyed by the runtime's
+//! current guest-thread handle, so native guest workers remain isolated.
 //!
 //! Key registry and the value map live in the kernel
 //! (`OrbisKernel::pthread_tls_keys` / `pthread_tls_values`).
@@ -15,9 +14,6 @@ use tracing::debug;
 
 const OK: u64 = 0;
 const EINVAL: u64 = 22;
-
-/// The single active guest thread's handle (single-active-execution model).
-const CURRENT_THREAD: u64 = 1;
 
 /// Register the pthread TLS-key HLE functions.
 pub fn register(registry: &HleRegistry) {
@@ -77,7 +73,7 @@ fn hle_setspecific(ctx: &HleContext, args: &[u64]) -> u64 {
     }
     ctx.kernel
         .pthread_tls_values
-        .insert((CURRENT_THREAD, key), value);
+        .insert((ctx.guest_threads.current_thread(), key), value);
     OK
 }
 
@@ -90,7 +86,7 @@ fn hle_getspecific(ctx: &HleContext, args: &[u64]) -> u64 {
     }
     ctx.kernel
         .pthread_tls_values
-        .get(&(CURRENT_THREAD, key))
+        .get(&(ctx.guest_threads.current_thread(), key))
         .map(|v| *v)
         .unwrap_or(0)
 }

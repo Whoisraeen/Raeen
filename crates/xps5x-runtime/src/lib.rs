@@ -26,6 +26,8 @@ mod stack;
 #[cfg(target_os = "windows")]
 mod stub;
 #[cfg(target_os = "windows")]
+mod thread;
+#[cfg(target_os = "windows")]
 mod tls;
 #[cfg(target_os = "windows")]
 mod trampoline;
@@ -38,7 +40,7 @@ pub use dispatch::fsbase_rearm_count;
 
 use thiserror::Error;
 use xps5x_firmware::LinkedModule;
-use xps5x_hle::HleRegistry;
+use xps5x_hle::{GuestMemory, HleRegistry};
 use xps5x_kernel::OrbisKernel;
 
 /// How a guest call ended (design doc §3/§4, wall #1): [`execute_linked`]'s
@@ -218,6 +220,13 @@ pub fn execute_linked(
     );
     let entry_ptr = arena.entry_ptr(entry_offset)?;
     let guard = trampoline::TrampolineGuard::reserve(module.hle_trampolines.len())?;
+    let guest_rsp = arena
+        .stack_top()
+        .checked_sub(8)
+        .ok_or(RuntimeError::MapFailed)?;
+    if !arena.write(guest_rsp, &guard.return_trampoline().to_le_bytes()) {
+        return Err(RuntimeError::MapFailed);
+    }
 
     // RT2c-b (design doc §3): set up a minimal main-thread TCB so the guest
     // can use `fs:`-relative TLS, but only when FSGSBASE is actually
@@ -241,8 +250,7 @@ pub fn execute_linked(
     // Transmuting a data pointer to an `extern "sysv64"` function pointer
     // matches the guest ABI (design doc §3); actually calling it happens
     // inside `dispatch::run`, guarded by the VEH armed there.
-    let entry: unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> u64 =
-        unsafe { core::mem::transmute::<*const u8, _>(entry_ptr) };
+    let entry = entry_ptr as u64;
 
     // `arena` doubles as both the guest-memory view and the guest allocator
     // HLE calls get: it is identity-mapped (guest address `A` is host
@@ -270,12 +278,14 @@ pub fn execute_linked(
             &arena,
             &guard,
             tcb,
+            None,
+            1,
             // No inner `unsafe {}` here: this closure literal is written
             // directly inside the `unsafe { dispatch::run(...) }` block
             // below, so it's already inside that unsafe scope (rustc flags
             // a nested one as `unused_unsafe`) — the SAFETY justification
             // for this call is the comment on that outer block.
-            || crate::stack::call_on_guest_stack(entry, padded, arena.stack_top()),
+            || crate::stack::enter_guest(entry, guest_rsp, padded),
         )
     }?;
     // Function-mode callers only ever care about the value: a bare `exit()`
@@ -319,22 +329,74 @@ pub fn execute_process(
     argv: &[&str],
     envp: &[&str],
 ) -> Result<RunOutcome, RuntimeError> {
-    // RT0 single-active-execution invariant (design doc §4/§6/§9) — see
-    // `dispatch::CALL_LOCK`'s doc comment.
     let _call_lock = dispatch::call_lock();
-
     let arena = arena::GuestArena::new(&module.image)?;
-    // Expose the module's PT_SCE_PROCPARAM block (if any) to the guest via
-    // `sceKernelGetProcParam`: its guest address is the arena base plus the
-    // segment's image offset (identity-mapped). `0` clears any stale value
-    // from a prior run.
+    let guard = trampoline::TrampolineGuard::reserve(module.hle_trampolines.len())?;
+    execute_process_mapped(module, hle, kernel, &arena, &guard, None, argv, envp)
+}
+
+/// Execute a process whose complete runtime state is Arc-owned. This is the
+/// M1-E/C2 entry used by real titles: workers may retain clones after
+/// `scePthreadCreate` without borrowing launcher stack frames or allowing the
+/// arena/trampoline guard to be unmapped underneath them.
+#[cfg(target_os = "windows")]
+pub fn execute_process_shared(
+    module: std::sync::Arc<LinkedModule>,
+    hle: std::sync::Arc<HleRegistry>,
+    kernel: std::sync::Arc<OrbisKernel>,
+    argv: &[&str],
+    envp: &[&str],
+) -> Result<RunOutcome, RuntimeError> {
+    let _call_lock = dispatch::call_lock();
+    let arena = std::sync::Arc::new(arena::GuestArena::new(&module.image)?);
+    let guard = std::sync::Arc::new(trampoline::TrampolineGuard::reserve(
+        module.hle_trampolines.len(),
+    )?);
+    let process = thread::GuestProcess::create(module, hle, kernel, arena, guard);
+    let result = execute_process_mapped(
+        &process.module,
+        &process.hle,
+        &process.kernel,
+        &process.arena,
+        &process.guard,
+        Some(&process),
+        argv,
+        envp,
+    );
+    let process_exit_was_requested = process.requested_exit_code().is_some();
+    let fallback_code = match &result {
+        Ok(RunOutcome::Exited(code)) => *code,
+        Ok(RunOutcome::Returned(_)) => 0,
+        Err(_) => 1,
+    };
+    process.terminate_and_reap(fallback_code);
+    if process_exit_was_requested {
+        Ok(RunOutcome::Exited(
+            process.requested_exit_code().unwrap_or(fallback_code),
+        ))
+    } else {
+        result
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn execute_process_mapped(
+    module: &LinkedModule,
+    hle: &HleRegistry,
+    kernel: &OrbisKernel,
+    arena: &arena::GuestArena,
+    guard: &trampoline::TrampolineGuard,
+    guest_threads: Option<&dyn xps5x_hle::GuestThreadScheduler>,
+    argv: &[&str],
+    envp: &[&str],
+) -> Result<RunOutcome, RuntimeError> {
     kernel.set_proc_param_addr(
         module
             .procparam_offset
             .map_or(0, |off| GUEST_ARENA_BASE + off),
     );
     let entry_ptr = arena.entry_ptr(module.entry)?;
-    let guard = trampoline::TrampolineGuard::reserve(module.hle_trampolines.len())?;
 
     // RT2c-b (design doc §3): same honest-degradation TCB setup as
     // `execute_linked` above, including the module's `PT_TLS` template and
@@ -348,11 +410,15 @@ pub fn execute_process(
     // Lay out the process stack in the arena's stack region (design doc §2);
     // `process::build_process_stack` writes only through `&arena` (bounds-
     // checked `GuestMemory`), never panicking on `argv`/`envp` content.
-    let process_rsp = process::build_process_stack(arena.stack_top(), argv, envp, &arena)?;
-    // Dependency initializers are ordinary called functions. Their stack top
-    // must be 16-aligned so `call` makes their incoming RSP 8 mod 16, and it
-    // must sit below the process-parameter block so they cannot overwrite it.
-    let module_stack_top = process_rsp.checked_sub(8).ok_or(RuntimeError::MapFailed)?;
+    let process_rsp = process::build_process_stack(arena.stack_top(), argv, envp, arena)?;
+    // Dependency initializers are ordinary called functions. Give them a
+    // return slot below the process-parameter block; the guarded address in
+    // that slot lets dispatch recover the host context without retaining a
+    // host RSP anywhere outside the captured CONTEXT.
+    let module_rsp = process_rsp.checked_sub(16).ok_or(RuntimeError::MapFailed)?;
+    if !arena.write(module_rsp, &guard.return_trampoline().to_le_bytes()) {
+        return Err(RuntimeError::MapFailed);
+    }
 
     // SAFETY: same reasoning as `execute_linked`'s `entry` transmute above —
     // `entry_ptr` is a host address inside `arena`'s `PAGE_EXECUTE_READWRITE`
@@ -364,8 +430,7 @@ pub fn execute_process(
     // to, and the same fn-pointer type is reused here for consistency with
     // `execute_linked`. The Orbis `_start(params, exit_fn)` register arguments
     // are supplied explicitly below; see `stack::enter_guest_at_start`'s doc.
-    let entry: unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> u64 =
-        unsafe { core::mem::transmute::<*const u8, _>(entry_ptr) };
+    let entry = entry_ptr as u64;
 
     // SAFETY: `entry` is exactly the function pointer
     // `enter_guest_at_start`'s safety contract requires; `process_rsp` is the
@@ -374,16 +439,62 @@ pub fn execute_process(
     // `dispatch::run`'s `call_guest` contract. The remaining arguments carry
     // the same safety argument as `execute_linked`'s call to `dispatch::run`
     // above.
+    for init in &module.module_inits {
+        let Ok(ptr) = arena.entry_ptr(init.image_offset) else {
+            tracing::warn!(
+                "{}: module_start at +{:#x} is outside the image — skipping",
+                init.name,
+                init.image_offset
+            );
+            continue;
+        };
+        tracing::info!(
+            "{}: calling module_start (+{:#x})",
+            init.name,
+            init.image_offset
+        );
+        // SAFETY: `ptr` is executable guest code in the live arena;
+        // `module_rsp` points at the guarded return address and dispatch arms
+        // recovery before `enter_guest` transfers control.
+        let outcome = unsafe {
+            dispatch::run(
+                &module.hle_trampolines,
+                &module.unresolved_stubs,
+                hle,
+                kernel,
+                arena,
+                arena,
+                guard,
+                tcb,
+                guest_threads,
+                1,
+                || crate::stack::enter_guest(ptr as u64, module_rsp, [0; 6]),
+            )
+        }?;
+        match outcome {
+            RunOutcome::Returned(rc) => {
+                tracing::info!("{}: module_start returned {rc:#x}", init.name);
+            }
+            RunOutcome::Exited(code) => return Ok(RunOutcome::Exited(code)),
+        }
+    }
+
+    // Process mode deliberately keeps the parameter block at RSP for the
+    // legacy stack-shaped entry fixture while also passing it in RDI per the
+    // real Orbis ABI. A malformed `_start` return still faults through argc
+    // and is recovered as a genuine guest fault.
     unsafe {
         dispatch::run(
             &module.hle_trampolines,
             &module.unresolved_stubs,
             hle,
             kernel,
-            &arena,
-            &arena,
-            &guard,
+            arena,
+            arena,
+            guard,
             tcb,
+            guest_threads,
+            1,
             // Same "no inner `unsafe {}`" note as `execute_linked`'s closure
             // above — already inside the outer `unsafe { dispatch::run(...)
             // }` block's scope.
@@ -397,52 +508,7 @@ pub fn execute_process(
             // `exit` through its own import first (which the VEH answers with
             // the exit-longjmp); a guest that does call it faults, which RT1a
             // recovers as `Faulted` rather than crashing the host.
-            || {
-                // Run every dependency's `module_start` (DT_INIT) FIRST, inside
-                // this same guarded session — a real loader initializes
-                // dependencies before entering the main module, and the guest
-                // relies on it: the measured title's own constructors call
-                // virtual methods on objects a dependency's constructors create.
-                //
-                // It must be here, not a separate `execute_linked` call: the
-                // arena is torn down when that returns, so anything the
-                // initializers wrote to guest memory would be discarded before
-                // `_start` ever saw it. Inside this closure they get the same
-                // arena, TCB, guest stack and HLE dispatch as the entry does.
-                //
-                // Orbis ABI (Kyty `RuntimeLinker::StartModule` -> `run_ini_fini`):
-                // `module_start(size_t args, const void *argp, module_func_t func)`,
-                // called `(0, NULL, NULL)` for a plain load. A failing
-                // initializer is logged, not fatal — a title whose optional
-                // module declines to start is still worth running as far as it
-                // goes, and a fault inside one is recovered by RT1a like any
-                // other guest fault.
-                for init in &module.module_inits {
-                    let Ok(ptr) = arena.entry_ptr(init.image_offset) else {
-                        tracing::warn!(
-                            "{}: module_start at +{:#x} is outside the image — skipping",
-                            init.name,
-                            init.image_offset
-                        );
-                        continue;
-                    };
-                    // SAFETY: same contract as `entry` above — `ptr` is a host
-                    // address inside `arena`'s PAGE_EXECUTE_READWRITE image
-                    // region, at an offset `load_process` took from the module's
-                    // own DT_INIT.
-                    let f: unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> u64 =
-                        core::mem::transmute::<*const u8, _>(ptr);
-                    tracing::info!(
-                        "{}: calling module_start (+{:#x})",
-                        init.name,
-                        init.image_offset
-                    );
-                    let rc =
-                        crate::stack::call_on_guest_stack(f, [0, 0, 0, 0, 0, 0], module_stack_top);
-                    tracing::info!("{}: module_start returned {rc:#x}", init.name);
-                }
-                crate::stack::enter_guest_at_start(entry, process_rsp, process_rsp, 0)
-            },
+            || crate::stack::enter_guest(entry, process_rsp, [process_rsp, 0, 0, 0, 0, 0]),
         )
     }
 }

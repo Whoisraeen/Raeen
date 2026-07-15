@@ -18,6 +18,7 @@ const OK: u64 = 0;
 /// Register the small headless peripheral/system libraries.
 pub fn register(registry: &HleRegistry) {
     // libSceMouse — no mouse connected.
+    registry.register("libSceMouse", "sceMouseInit", hle_ok);
     registry.register("libSceMouse", "sceMouseOpen", hle_ok);
     registry.register("libSceMouse", "sceMouseClose", hle_ok);
     registry.register("libSceMouse", "sceMouseRead", hle_ok); // 0 entries read
@@ -100,6 +101,7 @@ mod tests {
         // crash) and each reports the benign headless state.
         let reg = HleRegistry::new();
         for (lib, func) in [
+            ("libSceMouse", "sceMouseInit"),
             ("libSceMouse", "sceMouseOpen"),
             ("libSceMouse", "sceMouseRead"),
             ("libSceIme", "sceImeUpdate"),

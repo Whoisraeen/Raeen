@@ -3,6 +3,8 @@
 //! Maps PS5 mount points to host directories:
 //! - `/app0/`      → Game data directory
 //! - `/savedata0/` → Save data directory
+//! - `/download0/` → Per-title downloaded/bootstrap data
+//! - `/temp0/`     → Per-title temporary data
 //! - `/system/`    → Firmware modules
 //! - `/dev/`       → Device files (stubbed)
 //! - `/proc/`      → Process info (stubbed)
@@ -52,6 +54,18 @@ struct OpenFile {
     writable: bool,
     /// Whether `data` has unflushed writes to persist to `host_path` on close.
     dirty: bool,
+    /// Original Orbis open flags (queried/updated through `fcntl`).
+    flags: i32,
+    /// Sorted host directory entries for directory descriptors.
+    directory_entries: Option<Vec<DirectoryEntry>>,
+    /// Next directory entry returned by `getdents`.
+    directory_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DirectoryEntry {
+    name: String,
+    is_directory: bool,
 }
 
 /// Virtual filesystem mapping PS5 paths to host directories.
@@ -83,6 +97,14 @@ impl VirtualFileSystem {
         // Register standard PS5 mount points with default paths.
         vfs.mount("/app0/", "games/current");
         vfs.mount("/savedata0/", "savedata");
+        vfs.mount("/download0/", "downloads/current");
+        vfs.mount(
+            "/temp0/",
+            &std::env::temp_dir()
+                .join("xps5x")
+                .join("current")
+                .to_string_lossy(),
+        );
         vfs.mount("/system/", "firmware");
         vfs.mount("/dev/", ""); // Stubbed.
         vfs.mount("/proc/", ""); // Stubbed.
@@ -90,20 +112,31 @@ impl VirtualFileSystem {
         vfs
     }
 
-    /// Register a mount point.
+    /// Register or replace a mount point.
+    ///
+    /// Guest roots are stored without a trailing slash, so both `/temp0`
+    /// and `/temp0/file` resolve through the same mount. Re-registering a
+    /// root updates it in place instead of leaving an unreachable duplicate.
     pub fn mount(&self, ps5_prefix: &str, host_path: &str) {
-        debug!("VFS mount: '{}' -> '{}'", ps5_prefix, host_path);
-        self.mounts.write().push(MountPoint {
-            ps5_prefix: ps5_prefix.to_string(),
-            host_path: PathBuf::from(host_path),
-        });
+        let prefix = normalize_mount_root(ps5_prefix);
+        debug!("VFS mount: '{}' -> '{}'", prefix, host_path);
+        let mut mounts = self.mounts.write();
+        if let Some(existing) = mounts.iter_mut().find(|mount| mount.ps5_prefix == prefix) {
+            existing.host_path = PathBuf::from(host_path);
+        } else {
+            mounts.push(MountPoint {
+                ps5_prefix: prefix,
+                host_path: PathBuf::from(host_path),
+            });
+            mounts.sort_by_key(|mount| std::cmp::Reverse(mount.ps5_prefix.len()));
+        }
     }
 
     /// Set the game directory for /app0/.
     pub fn set_game_directory(&self, path: &std::path::Path) {
         let mut mounts = self.mounts.write();
         for mount in mounts.iter_mut() {
-            if mount.ps5_prefix == "/app0/" {
+            if mount.ps5_prefix == "/app0" {
                 mount.host_path = path.to_path_buf();
                 info!("VFS: /app0/ -> {}", path.display());
                 return;
@@ -111,16 +144,92 @@ impl VirtualFileSystem {
         }
     }
 
+    /// Set the process-private writable directory exposed at `/temp0/`.
+    pub fn set_temp_directory(&self, path: &std::path::Path) {
+        let mut mounts = self.mounts.write();
+        for mount in mounts.iter_mut() {
+            if mount.ps5_prefix == "/temp0" {
+                mount.host_path = path.to_path_buf();
+                info!("VFS: /temp0/ -> {}", path.display());
+                return;
+            }
+        }
+    }
+
+    /// Set the process-private downloaded/bootstrap-data directory exposed at
+    /// `/download0/`.
+    pub fn set_download_directory(&self, path: &std::path::Path) {
+        self.set_mount_directory("/download0", path);
+    }
+
+    /// Set the process-private save directory exposed at `/savedata0/`.
+    pub fn set_savedata_directory(&self, path: &std::path::Path) {
+        self.set_mount_directory("/savedata0", path);
+    }
+
+    fn set_mount_directory(&self, guest_root: &str, path: &std::path::Path) {
+        let root = normalize_mount_root(guest_root);
+        let mut mounts = self.mounts.write();
+        if let Some(mount) = mounts.iter_mut().find(|mount| mount.ps5_prefix == root) {
+            mount.host_path = path.to_path_buf();
+            info!("VFS: {root}/ -> {}", path.display());
+            return;
+        }
+        drop(mounts);
+        self.mount(&root, &path.to_string_lossy());
+    }
+
     /// Resolve a PS5 path to a host path.
     pub fn resolve_path(&self, ps5_path: &str) -> Option<PathBuf> {
         let mounts = self.mounts.read();
         for mount in mounts.iter() {
-            if ps5_path.starts_with(&mount.ps5_prefix) {
-                let relative = &ps5_path[mount.ps5_prefix.len()..];
+            let exact_root = ps5_path == mount.ps5_prefix;
+            let under_root = ps5_path
+                .strip_prefix(&mount.ps5_prefix)
+                .is_some_and(|suffix| suffix.starts_with('/'));
+            if exact_root || under_root {
+                let relative = ps5_path[mount.ps5_prefix.len()..].trim_start_matches('/');
+                if relative
+                    .split(['/', '\\'])
+                    .any(|component| component == "..")
+                {
+                    warn!("VFS resolve: refusing traversing guest path '{ps5_path}'");
+                    return None;
+                }
                 return Some(mount.host_path.join(relative));
             }
         }
         None
+    }
+
+    /// Read host metadata for a mounted guest path. Unmounted paths are never
+    /// interpreted as host paths.
+    pub fn metadata(&self, ps5_path: &str) -> Result<std::fs::Metadata, std::io::Error> {
+        let host_path = self.resolve_path(ps5_path).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "path is not mounted")
+        })?;
+        std::fs::metadata(host_path)
+    }
+
+    /// Create a directory (and missing parents) beneath a mounted guest root.
+    pub fn create_dir_all(&self, ps5_path: &str) -> Result<(), std::io::Error> {
+        let host_path = self.resolve_path(ps5_path).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "path is not mounted")
+        })?;
+        std::fs::create_dir_all(host_path)
+    }
+
+    /// Remove a directory tree beneath a mounted guest root. Missing paths
+    /// are already in the desired state and succeed.
+    pub fn remove_dir_all(&self, ps5_path: &str) -> Result<(), std::io::Error> {
+        let host_path = self.resolve_path(ps5_path).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "path is not mounted")
+        })?;
+        if host_path.exists() {
+            std::fs::remove_dir_all(host_path)
+        } else {
+            Ok(())
+        }
     }
 
     /// Open a file, honoring the `open`-flag subset in [`open_flags`].
@@ -153,7 +262,32 @@ impl VirtualFileSystem {
             .unwrap_or_else(|| PathBuf::from(path));
 
         let exists = host_path.exists();
-        let data = if exists && !truncate {
+        let is_directory = host_path.is_dir();
+        if is_directory && writable {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "directory opened for writing",
+            ));
+        }
+        let directory_entries = if is_directory {
+            let mut entries = std::fs::read_dir(&host_path)?
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    let name = entry.file_name().into_string().ok()?;
+                    Some(DirectoryEntry {
+                        is_directory: entry.file_type().ok()?.is_dir(),
+                        name,
+                    })
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.name.to_ascii_lowercase());
+            Some(entries)
+        } else {
+            None
+        };
+        let data = if is_directory {
+            None
+        } else if exists && !truncate {
             Some(std::fs::read(&host_path)?)
         } else if exists || create {
             // Truncated existing file, or a new file being created: start empty.
@@ -193,6 +327,9 @@ impl VirtualFileSystem {
             data,
             writable,
             dirty,
+            flags,
+            directory_entries,
+            directory_index: 0,
         };
 
         debug!("VFS open: '{path}' -> fd={fd} (writable={writable}, create={create})");
@@ -204,6 +341,12 @@ impl VirtualFileSystem {
     pub fn read(&self, fd: Fd, count: usize) -> Result<Vec<u8>, std::io::Error> {
         let mut files = self.open_files.write();
         if let Some(file) = files.get_mut(&fd) {
+            if file.directory_entries.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "fd is a directory",
+                ));
+            }
             if let Some(ref data) = file.data {
                 let pos = file.position as usize;
                 let end = (pos + count).min(data.len());
@@ -301,6 +444,99 @@ impl VirtualFileSystem {
             .map(|f| f.data.as_ref().map_or(0, |d| d.len() as u64))
     }
 
+    /// Return the descriptor's Orbis open flags.
+    pub fn flags(&self, fd: Fd) -> Option<i32> {
+        self.open_files.read().get(&fd).map(|file| file.flags)
+    }
+
+    /// Update status flags while preserving the descriptor's access mode.
+    pub fn set_status_flags(&self, fd: Fd, flags: i32) -> Result<(), std::io::Error> {
+        use open_flags::O_ACCMODE;
+        let mut files = self.open_files.write();
+        let Some(file) = files.get_mut(&fd) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("fd {fd} not open"),
+            ));
+        };
+        file.flags = (file.flags & O_ACCMODE) | (flags & !O_ACCMODE);
+        Ok(())
+    }
+
+    /// Encode as many fixed-size PS5 directory entries as fit in `requested`.
+    /// Each record is the 512-byte Gen5 layout used by `getdents`:
+    /// inode:u32, reclen:u16, type:u8, namelen:u8, name[...].
+    pub fn getdents(&self, fd: Fd, requested: usize) -> Result<(Vec<u8>, usize), std::io::Error> {
+        const DIRENT_SIZE: usize = 512;
+        if requested < DIRENT_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "directory buffer is smaller than one record",
+            ));
+        }
+        let mut files = self.open_files.write();
+        let Some(file) = files.get_mut(&fd) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("fd {fd} not open"),
+            ));
+        };
+        let Some(entries) = file.directory_entries.as_ref() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "fd is not a directory",
+            ));
+        };
+        let capacity = requested / DIRENT_SIZE;
+        let end = file
+            .directory_index
+            .saturating_add(capacity)
+            .min(entries.len());
+        let mut payload = vec![0u8; (end - file.directory_index) * DIRENT_SIZE];
+        for (slot, entry) in entries[file.directory_index..end].iter().enumerate() {
+            let record = &mut payload[slot * DIRENT_SIZE..(slot + 1) * DIRENT_SIZE];
+            let name = entry.name.as_bytes();
+            let name_len = name.len().min(255);
+            record[0..4].copy_from_slice(&fnv1a32(&name[..name_len]).to_le_bytes());
+            record[4..6].copy_from_slice(&(DIRENT_SIZE as u16).to_le_bytes());
+            record[6] = if entry.is_directory { 4 } else { 8 };
+            record[7] = name_len as u8;
+            record[8..8 + name_len].copy_from_slice(&name[..name_len]);
+        }
+        file.directory_index = end;
+        Ok((payload, end))
+    }
+
+    /// Persist an open descriptor's dirty write-back buffer without closing
+    /// it. Read-only descriptors succeed; unknown descriptors return
+    /// `NotFound`. This backs the guest's `fsync` durability boundary.
+    pub fn sync(&self, fd: Fd) -> Result<(), std::io::Error> {
+        let mut files = self.open_files.write();
+        let Some(file) = files.get_mut(&fd) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("fd {fd} not open"),
+            ));
+        };
+        if !file.dirty || !file.writable {
+            return Ok(());
+        }
+        if let Some(ref data) = file.data {
+            std::fs::write(&file.host_path, data)?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&file.host_path)?
+                .sync_all()?;
+            debug!(
+                "VFS sync: flushed {} bytes -> {}",
+                data.len(),
+                file.host_path.display()
+            );
+        }
+        file.dirty = false;
+        Ok(())
+    }
+
     /// Close a file descriptor, flushing a dirty writable fd's buffer back to
     /// its host file. A flush failure is logged but does not fail the close
     /// (the fd is still removed), matching the pragmatic behavior most guests
@@ -331,6 +567,22 @@ impl VirtualFileSystem {
         }
         Ok(())
     }
+}
+
+fn normalize_mount_root(prefix: &str) -> String {
+    let normalized = prefix.replace('\\', "/");
+    let root = normalized.trim_end_matches('/');
+    if root.is_empty() {
+        "/".to_string()
+    } else {
+        root.to_string()
+    }
+}
+
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(2_166_136_261u32, |hash, byte| {
+        (hash ^ u32::from(*byte)).wrapping_mul(16_777_619)
+    })
 }
 
 #[cfg(test)]
@@ -411,5 +663,98 @@ mod tests {
             b"\0\0\0\0AB"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_persists_without_closing_and_rejects_unknown_fd() {
+        use open_flags::*;
+        let dir = temp_dir("sync");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+        let fd = vfs
+            .open("/app0/live.bin", O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            .unwrap();
+        vfs.write(fd, b"LIVE").unwrap();
+        vfs.sync(fd).unwrap();
+        assert_eq!(std::fs::read(dir.join("live.bin")).unwrap(), b"LIVE");
+        assert_eq!(
+            vfs.sync(0x7fff).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        vfs.close(fd).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn directory_open_getdents_and_fcntl_flags_are_stateful() {
+        use open_flags::*;
+        let dir = temp_dir("getdents");
+        std::fs::write(dir.join("stone.txt"), b"x").unwrap();
+        std::fs::create_dir_all(dir.join("packs")).unwrap();
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+
+        let fd = vfs.open("/app0", O_RDONLY, 0).unwrap();
+        assert_eq!(vfs.flags(fd), Some(O_RDONLY));
+        let (bytes, base) = vfs.getdents(fd, 1024).unwrap();
+        assert_eq!(bytes.len(), 1024);
+        assert_eq!(base, 2);
+        let mut kinds_and_names = bytes
+            .chunks_exact(512)
+            .map(|entry| {
+                let len = entry[7] as usize;
+                (entry[6], std::str::from_utf8(&entry[8..8 + len]).unwrap())
+            })
+            .collect::<Vec<_>>();
+        kinds_and_names.sort_by_key(|(_, name)| *name);
+        assert_eq!(kinds_and_names, [(4, "packs"), (8, "stone.txt")]);
+        assert!(vfs.getdents(fd, 512).unwrap().0.is_empty());
+        vfs.set_status_flags(fd, O_APPEND).unwrap();
+        assert_eq!(vfs.flags(fd), Some(O_APPEND | O_RDONLY));
+        vfs.close(fd).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mount_root_and_children_resolve_without_prefix_collisions() {
+        let root = temp_dir("mount-root");
+        let nested = temp_dir("mount-nested");
+        let vfs = VirtualFileSystem::new();
+        vfs.mount("/temp0/", &root.to_string_lossy());
+        vfs.mount("/temp0/cache/", &nested.to_string_lossy());
+
+        assert_eq!(vfs.resolve_path("/temp0"), Some(root.clone()));
+        assert_eq!(
+            vfs.resolve_path("/temp0/file.bin"),
+            Some(root.join("file.bin"))
+        );
+        assert_eq!(
+            vfs.resolve_path("/temp0/cache/index.bin"),
+            Some(nested.join("index.bin"))
+        );
+        assert_eq!(vfs.resolve_path("/temp01/file.bin"), None);
+        assert_eq!(vfs.resolve_path("/temp0/../escape.bin"), None);
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(nested);
+    }
+
+    #[test]
+    fn per_title_download_and_savedata_mounts_are_replaceable() {
+        let download = temp_dir("download");
+        let savedata = temp_dir("savedata");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_download_directory(&download);
+        vfs.set_savedata_directory(&savedata);
+
+        assert_eq!(vfs.resolve_path("/download0"), Some(download.clone()));
+        assert_eq!(
+            vfs.resolve_path("/download0/bootstrap.json"),
+            Some(download.join("bootstrap.json"))
+        );
+        assert_eq!(vfs.resolve_path("/savedata0"), Some(savedata.clone()));
+
+        let _ = std::fs::remove_dir_all(download);
+        let _ = std::fs::remove_dir_all(savedata);
     }
 }

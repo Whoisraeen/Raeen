@@ -40,6 +40,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libScePosix", "clock_gettime", posix_clock_gettime);
     registry.register("libScePosix", "usleep", posix_usleep);
     registry.register("libScePosix", "getpid", libkernel::hle_getpid);
+    registry.register_nid("libScePosix", "fcntl", 0xf276_35f5_b2a8_8999, posix_fcntl);
 }
 
 /// Turn an SCE return (`0` on success, negative error code on failure) into the
@@ -81,6 +82,46 @@ fn posix_usleep(ctx: &HleContext, args: &[u64]) -> u64 {
     sce_to_posix(libkernel::hle_usleep(ctx, args))
 }
 
+/// POSIX `fcntl(fd, command, argument)` for descriptor/status flag commands.
+/// These are the commands used by libc and ordinary C++ file streams; handle
+/// duplication/locking remain explicit failures until their shared-open-file
+/// semantics are modeled.
+fn posix_fcntl(ctx: &HleContext, args: &[u64]) -> u64 {
+    const F_GETFD: i32 = 1;
+    const F_SETFD: i32 = 2;
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    let command = args.get(1).copied().unwrap_or(0) as i32;
+    let argument = args.get(2).copied().unwrap_or(0) as i32;
+    match command {
+        // Close-on-exec is process launch metadata; XPS5X does not exec a
+        // second guest image, so accepting it has the correct observable effect.
+        F_GETFD => ctx
+            .kernel
+            .filesystem
+            .flags(fd)
+            .map_or((-1i64) as u64, |_| 0),
+        F_SETFD => ctx
+            .kernel
+            .filesystem
+            .flags(fd)
+            .map_or((-1i64) as u64, |_| 0),
+        F_GETFL => ctx
+            .kernel
+            .filesystem
+            .flags(fd)
+            .map_or((-1i64) as u64, |flags| flags as u64),
+        F_SETFL => ctx
+            .kernel
+            .filesystem
+            .set_status_flags(fd, argument)
+            .map_or((-1i64) as u64, |_| 0),
+        _ => (-1i64) as u64,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +145,35 @@ mod tests {
         assert_eq!(sce_to_posix((-9i64) as u64), (-1i64) as u64);
         // A positive SCE return is still success.
         assert_eq!(sce_to_posix(5), 0);
+    }
+
+    #[test]
+    fn fcntl_gets_and_sets_status_flags_and_has_retail_nid() {
+        use crate::{TestAllocator, TestMemory, test_ctx};
+        use xps5x_kernel::filesystem::open_flags::*;
+
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = TestMemory::new(0x1000);
+        let alloc = TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let tmp = std::env::temp_dir().join(format!("xps5x-fcntl-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("file"), b"x").unwrap();
+        kernel.filesystem.set_game_directory(&tmp);
+        let fd = kernel.filesystem.open("/app0/file", O_RDONLY, 0).unwrap();
+        assert_eq!(posix_fcntl(&ctx, &[fd as u64, 3]), O_RDONLY as u64);
+        assert_eq!(posix_fcntl(&ctx, &[fd as u64, 4, O_APPEND as u64]), 0);
+        assert_eq!(posix_fcntl(&ctx, &[fd as u64, 3]), O_APPEND as u64);
+        assert_eq!(posix_fcntl(&ctx, &[0x7fff, 3]), (-1i64) as u64);
+
+        let registry = HleRegistry::new();
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| { *nid == 0xf276_35f5_b2a8_8999 && key == "libScePosix::fcntl" })
+        );
+        kernel.filesystem.close(fd).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

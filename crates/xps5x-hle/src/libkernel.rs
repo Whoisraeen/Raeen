@@ -21,8 +21,8 @@
 //! `sceKernelMunmap` mirrors this on the way out. Broadening the rest is
 //! future work, not a limitation of the dispatch signature anymore.
 
-use crate::{HleContext, HleRegistry};
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::{GuestCallCompletion, GuestCallRequest, HleContext, HleRegistry};
+use std::sync::atomic::Ordering;
 use tracing::{debug, warn};
 
 /// `SCE_OK` — the PS5 convention for "this call succeeded".
@@ -192,6 +192,46 @@ fn hle_close(ctx: &HleContext, args: &[u64]) -> u64 {
     }
 }
 
+/// `sceKernelFsync(fd)`: persist the VFS write-back buffer while leaving the
+/// descriptor open. The SCE spelling returns the kernel errno encoding.
+fn hle_fsync(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    match ctx.kernel.filesystem.sync(fd) {
+        Ok(()) => SCE_OK,
+        Err(e) => {
+            warn!("fsync: fd {fd} failed: {e} â€” EBADF");
+            0x8002_0009
+        }
+    }
+}
+
+/// Common Gen5 directory enumeration path. `sceKernelGetdirentries` supplies
+/// an optional fourth `basep` argument; `sceKernelGetdents` does not.
+fn hle_getdents(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    let buffer = args.get(1).copied().unwrap_or(0);
+    let requested = args.get(2).copied().unwrap_or(0).min(READ_MAX_BYTES);
+    let basep = args.get(3).copied().unwrap_or(0);
+    if buffer == 0 || requested < 512 {
+        return 0x8002_0016;
+    }
+    let Ok(requested) = usize::try_from(requested) else {
+        return 0x8002_0016;
+    };
+    let (payload, base) = match ctx.kernel.filesystem.getdents(fd, requested) {
+        Ok(result) => result,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0x8002_0009,
+        Err(_) => return 0x8002_0016,
+    };
+    if !payload.is_empty() && !ctx.mem.write(buffer, &payload) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    if basep != 0 && !ctx.mem.write(basep, &(base as u64).to_le_bytes()) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    payload.len() as u64
+}
+
 /// Real `lseek(fd, offset, whence)` / `sceKernelLseek`: repositions the
 /// descriptor and returns the new absolute offset. Bad fd → `EBADF`; bad
 /// `whence` or a negative resulting position → `EINVAL`.
@@ -324,6 +364,16 @@ fn hle_dlsym(ctx: &HleContext, args: &[u64]) -> u64 {
 
 /// Register libkernel HLE functions.
 pub fn register(registry: &HleRegistry) {
+    // Optional write-throttling service exported under its own library. The
+    // public name is not known; this exact NID is measured from the title and
+    // the service only supplies kernel write pacing policy, so accepting the
+    // default policy is a process-wide, title-independent fallback.
+    registry.register_nid(
+        "libkernel_write_throttling",
+        "writeThrottlingUnknownYFC3dBBipj8",
+        0x6050_B774_1062_A63F,
+        hle_write_throttling_default,
+    );
     // -- Memory --
     registry.register(
         "libkernel",
@@ -364,6 +414,16 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "sceKernelRead", hle_read);
     registry.register("libkernel", "close", hle_close);
     registry.register("libkernel", "sceKernelClose", hle_close);
+    registry.register_nid(
+        "libkernel",
+        "sceKernelFsync",
+        0x7d3c_7aea_5e62_5880,
+        hle_fsync,
+    );
+    registry.register("libkernel", "sceKernelGetdents", hle_getdents);
+    registry.register("libkernel", "sceKernelGetdirentries", hle_getdents);
+    registry.register("libkernel", "getdirentries", hle_getdents);
+    registry.register("libScePosix", "getdents", hle_getdents);
     registry.register("libkernel", "lseek", hle_lseek);
     registry.register("libkernel", "sceKernelLseek", hle_lseek);
 
@@ -399,8 +459,10 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadCreate", hle_pthread_create);
     registry.register("libkernel", "scePthreadJoin", hle_pthread_join);
     registry.register("libkernel", "scePthreadExit", hle_pthread_exit);
-    // libScePosix aliases the POSIX name `pthread_exit` onto the same handler
-    // (its sole export; ported from SharpEmu's `libScePosix` in KernelExports).
+    // POSIX spellings have distinct NIDs but the same ABI and scheduler path.
+    registry.register("libScePosix", "pthread_create", hle_pthread_create);
+    registry.register("libScePosix", "pthread_join", hle_pthread_join);
+    registry.register("libScePosix", "pthread_detach", hle_pthread_detach);
     registry.register("libScePosix", "pthread_exit", hle_pthread_exit);
     // rtld thread-teardown hooks libc.prx registers during module_start.
     registry.register(
@@ -462,6 +524,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "_exit", hle_pthread_exit);
     registry.register("libkernel", "nanosleep", hle_nanosleep);
     registry.register("libkernel", "_sigprocmask", hle_sigprocmask);
+    registry.register("libkernel", "_is_signal_return", hle_is_signal_return);
     registry.register(
         "libkernel",
         "_sceKernelRtldSetApplicationHeapAPI",
@@ -540,18 +603,18 @@ pub fn register(registry: &HleRegistry) {
         "sceKernelDebugRaiseExceptionOnReleaseMode",
         hle_debug_raise_exception,
     );
-    // Filesystem metadata — no VFS write path yet: mkdir "succeeds" (a later
-    // stat of it failing leaves a warn trail), the rest are honest ENOENT.
+    // Filesystem metadata. Path-based operations resolve through the same VFS
+    // mounts as open/read/write; no title-specific path handling lives here.
     registry.register("libkernel", "sceKernelMkdir", hle_mkdir);
     registry.register("libkernel", "sceKernelUnlink", hle_fs_enoent);
     registry.register("libkernel", "sceKernelRmdir", hle_fs_enoent);
-    registry.register("libkernel", "sceKernelStat", hle_fs_enoent);
+    registry.register("libkernel", "sceKernelStat", hle_stat);
     registry.register("libkernel", "sceKernelFstat", hle_fstat);
     registry.register("libkernel", "sceKernelGetdents", hle_fs_enoent);
     // pthread surface libc/fmod touch during init — attr/priority/affinity
     // bookkeeping has no scheduler to talk to yet, so recording nothing and
     // returning success is faithful enough for a single-thread world.
-    registry.register("libkernel", "scePthreadDetach", hle_ok_stub);
+    registry.register("libkernel", "scePthreadDetach", hle_pthread_detach);
     registry.register("libkernel", "scePthreadSetprio", hle_ok_stub);
     registry.register("libkernel", "scePthreadSetaffinity", hle_ok_stub);
     registry.register("libkernel", "scePthreadAttrSetaffinity", hle_ok_stub);
@@ -562,6 +625,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadAttrSetinheritsched", hle_ok_stub);
     registry.register("libkernel", "scePthreadGetname", hle_pthread_getname);
     registry.register("libkernel", "scePthreadOnce", hle_pthread_once);
+    registry.register("libScePosix", "pthread_once", hle_pthread_once);
     // sceKernelCreateEqueue/WaitEqueue are registered by the `kernel_equeue`
     // module (real user-event queue) — see xps5x_hle::kernel_equeue.
 
@@ -671,13 +735,24 @@ fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
 
     const DEFAULT_PROT: u32 = 0x3; // R+W — matches the old `ctx.kernel.memory.mmap(0, len, 0x3, ...)` call this replaces.
 
-    let Some(addr) = ctx.alloc.mmap(len, xps5x_core::PS5_PAGE_SIZE as u64) else {
+    if len == 0 || phys_addr_out == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let page_size = xps5x_core::PS5_PAGE_SIZE as u64;
+    let alignment = if alignment == 0 {
+        page_size
+    } else if alignment.is_power_of_two() {
+        alignment.max(page_size)
+    } else {
+        return SCE_KERNEL_ERROR_EINVAL;
+    };
+    let Some(addr) = ctx.alloc.mmap(len, alignment) else {
         warn!("sceKernelAllocateDirectMemory: arena mmap failed (len={len:#x})");
         return HLE_ERROR;
     };
     ctx.kernel.memory.record_mapping(addr, len, DEFAULT_PROT);
 
-    if phys_addr_out != 0 && !ctx.mem.write(phys_addr_out, &addr.to_le_bytes()) {
+    if !ctx.mem.write(phys_addr_out, &addr.to_le_bytes()) {
         warn!("sceKernelAllocateDirectMemory: physAddrOut {phys_addr_out:#x} out of bounds");
         ctx.kernel.memory.remove_mapping(addr);
         return HLE_ERROR;
@@ -685,33 +760,73 @@ fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
-fn hle_allocate_main_direct_memory(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_allocate_main_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     debug!(
         "sceKernelAllocateMainDirectMemory(len={:#x}, alignment={:#x}, memoryType={})",
         args.first().copied().unwrap_or(0),
         args.get(1).copied().unwrap_or(0),
         args.get(2).copied().unwrap_or(0)
     );
-    0
+    hle_allocate_direct_memory(
+        ctx,
+        &[
+            0,
+            u64::MAX,
+            args.first().copied().unwrap_or(0),
+            args.get(1).copied().unwrap_or(0),
+            args.get(2).copied().unwrap_or(0),
+            args.get(3).copied().unwrap_or(0),
+        ],
+    )
 }
 
-fn hle_release_direct_memory(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_release_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     debug!(
         "sceKernelReleaseDirectMemory(start={:#x}, len={:#x})",
         args.first().copied().unwrap_or(0),
         args.get(1).copied().unwrap_or(0)
     );
-    0
+    let start = args.first().copied().unwrap_or(0);
+    let len = args.get(1).copied().unwrap_or(0);
+    if start == 0 || len == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    ctx.alloc.munmap(start, len);
+    ctx.kernel.memory.remove_mapping(start);
+    SCE_OK
 }
 
-fn hle_map_direct_memory(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_map_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr_out = args.first().copied().unwrap_or(0);
+    let len = args.get(1).copied().unwrap_or(0);
+    let prot = args.get(2).copied().unwrap_or(0) as u32;
+    let direct_memory_start = args.get(4).copied().unwrap_or(0);
+    let alignment = args.get(5).copied().unwrap_or(0);
     debug!(
-        "sceKernelMapDirectMemory(len={:#x}, prot={}, alignment={:#x})",
-        args.first().copied().unwrap_or(0),
-        args.get(2).copied().unwrap_or(0),
-        args.get(4).copied().unwrap_or(0)
+        "sceKernelMapDirectMemory(addrOut={addr_out:#x}, len={len:#x}, prot={prot}, phys={direct_memory_start:#x}, alignment={alignment:#x})"
     );
-    0
+    if addr_out == 0 || len == 0 || direct_memory_start == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let Some(region) = ctx.kernel.memory.region_containing(direct_memory_start) else {
+        return SCE_KERNEL_ERROR_EINVAL;
+    };
+    let Some(request_end) = direct_memory_start.checked_add(len) else {
+        return SCE_KERNEL_ERROR_EINVAL;
+    };
+    let Some(region_end) = region.vaddr.checked_add(region.size) else {
+        return SCE_KERNEL_ERROR_EINVAL;
+    };
+    if request_end > region_end {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    ctx.kernel
+        .memory
+        .record_mapping(direct_memory_start, len, prot);
+    if !ctx.mem.write(addr_out, &direct_memory_start.to_le_bytes()) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    SCE_OK
 }
 
 /// Real signature: `sceKernelMapFlexibleMemory(void **addrOut, size_t len,
@@ -832,30 +947,53 @@ fn hle_set_virtual_range_name(_ctx: &HleContext, args: &[u64]) -> u64 {
     0
 }
 
+fn hle_write_throttling_default(_ctx: &HleContext, args: &[u64]) -> u64 {
+    debug!(
+        "libkernel_write_throttling::YFC3dBBipj8(context={:#x}, policy={:#x}) -> default policy",
+        args.first().copied().unwrap_or(0),
+        args.get(1).copied().unwrap_or(0)
+    );
+    SCE_OK
+}
+
 // ---------------------------------------------------------------------
 // Thread / sync
 // ---------------------------------------------------------------------
 
 /// Stub: returns a fake, always-`1` thread handle. No thread is actually
 /// spawned — real thread creation needs [`xps5x_kernel::threading`] wiring.
-fn hle_pthread_create(_ctx: &HleContext, _args: &[u64]) -> u64 {
-    debug!("scePthreadCreate()");
-    1
+fn hle_pthread_create(ctx: &HleContext, args: &[u64]) -> u64 {
+    let thread_out = args.first().copied().unwrap_or(0);
+    let attr = args.get(1).copied().unwrap_or(0);
+    let entry = args.get(2).copied().unwrap_or(0);
+    let arg = args.get(3).copied().unwrap_or(0);
+    debug!("scePthreadCreate(out={thread_out:#x}, attr={attr:#x}, entry={entry:#x}, arg={arg:#x})");
+    ctx.guest_threads.create(thread_out, attr, entry, arg)
 }
 
-fn hle_pthread_join(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!(
-        "scePthreadJoin(thread={:#x})",
-        args.first().copied().unwrap_or(0)
-    );
-    0
+fn hle_pthread_join(ctx: &HleContext, args: &[u64]) -> u64 {
+    let thread = args.first().copied().unwrap_or(0);
+    let retval_out = args.get(1).copied().unwrap_or(0);
+    debug!("scePthreadJoin(thread={thread:#x}, retval={retval_out:#x})");
+    ctx.guest_threads.join(thread, retval_out)
 }
 
-fn hle_pthread_exit(_ctx: &HleContext, _args: &[u64]) -> u64 {
+fn hle_pthread_exit(ctx: &HleContext, args: &[u64]) -> u64 {
     // Real scePthreadExit never returns to the caller; the stub returns 0
     // since this fn-pointer signature has no way to unwind the guest thread.
-    debug!("scePthreadExit()");
-    0
+    let retval = args.first().copied().unwrap_or(0);
+    debug!("scePthreadExit(retval={retval:#x})");
+    if ctx.guest_threads.request_exit(retval) {
+        SCE_OK
+    } else {
+        SCE_KERNEL_ERROR_EINVAL
+    }
+}
+
+fn hle_pthread_detach(ctx: &HleContext, args: &[u64]) -> u64 {
+    let thread = args.first().copied().unwrap_or(0);
+    debug!("scePthreadDetach(thread={thread:#x})");
+    ctx.guest_threads.detach(thread)
 }
 
 fn hle_pthread_cond_init(_ctx: &HleContext, args: &[u64]) -> u64 {
@@ -899,31 +1037,33 @@ fn hle_pthread_cond_signal(_ctx: &HleContext, args: &[u64]) -> u64 {
 // adjusts a guest-memory `u64` counter in place (saturating at zero) and
 // returns the adjusted value.
 
-static THREAD_DTORS_CALLBACK: AtomicU64 = AtomicU64::new(0);
-static THREAD_ATEXIT_COUNT_CALLBACK: AtomicU64 = AtomicU64::new(0);
-static THREAD_ATEXIT_REPORT_CALLBACK: AtomicU64 = AtomicU64::new(0);
-
 /// `_sceKernelSetThreadDtors(dtors_fn)`.
-fn hle_set_thread_dtors(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_set_thread_dtors(ctx: &HleContext, args: &[u64]) -> u64 {
     let callback = args.first().copied().unwrap_or(0);
     debug!("_sceKernelSetThreadDtors(fn={callback:#x})");
-    THREAD_DTORS_CALLBACK.store(callback, Ordering::Relaxed);
+    ctx.kernel
+        .thread_dtors_callback
+        .store(callback, Ordering::Relaxed);
     SCE_OK
 }
 
 /// `_sceKernelSetThreadAtexitCount(count_fn)`.
-fn hle_set_thread_atexit_count(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_set_thread_atexit_count(ctx: &HleContext, args: &[u64]) -> u64 {
     let callback = args.first().copied().unwrap_or(0);
     debug!("_sceKernelSetThreadAtexitCount(fn={callback:#x})");
-    THREAD_ATEXIT_COUNT_CALLBACK.store(callback, Ordering::Relaxed);
+    ctx.kernel
+        .thread_atexit_count_callback
+        .store(callback, Ordering::Relaxed);
     SCE_OK
 }
 
 /// `_sceKernelSetThreadAtexitReport(report_fn)`.
-fn hle_set_thread_atexit_report(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_set_thread_atexit_report(ctx: &HleContext, args: &[u64]) -> u64 {
     let callback = args.first().copied().unwrap_or(0);
     debug!("_sceKernelSetThreadAtexitReport(fn={callback:#x})");
-    THREAD_ATEXIT_REPORT_CALLBACK.store(callback, Ordering::Relaxed);
+    ctx.kernel
+        .thread_atexit_report_callback
+        .store(callback, Ordering::Relaxed);
     SCE_OK
 }
 
@@ -987,7 +1127,9 @@ fn hle_tls_get_addr(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_EINVAL;
     }
 
-    let base = if let Some(existing) = ctx.kernel.dynamic_tls_blocks.get(&module_id) {
+    let thread = ctx.guest_threads.current_thread();
+    let key = (thread, module_id);
+    let base = if let Some(existing) = ctx.kernel.dynamic_tls_blocks.get(&key) {
         *existing
     } else {
         let Some(base) = ctx.alloc.alloc(DYNAMIC_TLS_BLOCK_SIZE, 16) else {
@@ -999,9 +1141,19 @@ fn hle_tls_get_addr(ctx: &HleContext, args: &[u64]) -> u64 {
             ctx.alloc.free(base);
             return SCE_KERNEL_ERROR_EFAULT;
         }
-        ctx.kernel.dynamic_tls_blocks.insert(module_id, base);
-        debug!("__tls_get_addr: module {module_id:#x} -> block {base:#x}");
-        base
+        match ctx.kernel.dynamic_tls_blocks.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(existing) => {
+                ctx.alloc.free(base);
+                *existing.get()
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(base);
+                debug!(
+                    "__tls_get_addr: thread {thread:#x}, module {module_id:#x} -> block {base:#x}"
+                );
+                base
+            }
+        }
     };
 
     base + offset
@@ -1015,12 +1167,6 @@ fn hle_tls_get_addr(ctx: &HleContext, args: &[u64]) -> u64 {
 /// `_sceKernelRtldSetApplicationHeapAPI(void *api[])`. Recorded so a future
 /// heap-replacement path can consult it; nothing reads it back yet (guest
 /// malloc is HLE'd directly).
-static APPLICATION_HEAP_API: AtomicU64 = AtomicU64::new(0);
-
-/// Guest address of the 8-byte errno slot `__error` hands out, lazily
-/// allocated from the guest arena on first call (0 = not yet allocated).
-static ERRNO_SLOT: AtomicU64 = AtomicU64::new(0);
-
 /// Success for calls whose side effect has nothing to act on yet (signal
 /// masks, memory protections, pthread attr bookkeeping in a single-thread
 /// world). Logged at debug so a misbehaving title can still be traced.
@@ -1035,32 +1181,34 @@ fn hle_zero_stub(_ctx: &HleContext, _args: &[u64]) -> u64 {
 }
 
 /// `_sceKernelRtldSetApplicationHeapAPI(api[])`: record libc's heap table.
-fn hle_rtld_set_application_heap_api(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_rtld_set_application_heap_api(ctx: &HleContext, args: &[u64]) -> u64 {
     let api = args.first().copied().unwrap_or(0);
     debug!("_sceKernelRtldSetApplicationHeapAPI(api={api:#x})");
-    APPLICATION_HEAP_API.store(api, Ordering::Relaxed);
+    ctx.kernel
+        .application_heap_api
+        .store(api, Ordering::Relaxed);
     SCE_OK
 }
 
-/// `__error()`: address of the calling thread's `errno`. One process-wide
-/// slot (single guest thread today), lazily carved from the guest arena so
-/// the guest can freely read/write it.
+/// `__error()`: address of the calling thread's lazily allocated `errno`.
 fn hle_error_addr(ctx: &HleContext, _args: &[u64]) -> u64 {
-    let existing = ERRNO_SLOT.load(Ordering::Acquire);
-    if existing != 0 {
-        return existing;
+    let thread = ctx.guest_threads.current_thread();
+    if let Some(existing) = ctx.kernel.errno_slots.get(&thread) {
+        return *existing;
     }
     let Some(slot) = ctx.alloc.alloc(8, 8) else {
         warn!("__error: guest arena exhausted; returning NULL errno address");
         return 0;
     };
     let _ = ctx.mem.write(slot, &0u64.to_le_bytes());
-    // First allocator wins if two calls race (single-thread today).
-    match ERRNO_SLOT.compare_exchange(0, slot, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => slot,
-        Err(winner) => {
+    match ctx.kernel.errno_slots.entry(thread) {
+        dashmap::mapref::entry::Entry::Occupied(existing) => {
             ctx.alloc.free(slot);
-            winner
+            *existing.get()
+        }
+        dashmap::mapref::entry::Entry::Vacant(vacant) => {
+            vacant.insert(slot);
+            slot
         }
     }
 }
@@ -1101,6 +1249,16 @@ fn hle_sigprocmask(ctx: &HleContext, args: &[u64]) -> u64 {
         let _ = ctx.mem.write(oset, &[0u8; 16]);
     }
     SCE_OK
+}
+
+/// Whether an address is the kernel's signal-return trampoline. XPS5X does
+/// not deliver guest signals, so it never installs such a trampoline.
+fn hle_is_signal_return(_ctx: &HleContext, args: &[u64]) -> u64 {
+    debug!(
+        "_is_signal_return(pc={:#x}) -> false (guest signals disabled)",
+        args.first().copied().unwrap_or(0)
+    );
+    0
 }
 
 /// `sceKernelUuidCreate(SceKernelUuid *out)`: 16 bytes of per-call entropy
@@ -1214,16 +1372,88 @@ fn hle_debug_raise_exception(_ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
-/// `sceKernelMkdir(path, mode)`: no writable VFS yet — pretend success so
-/// boot-time directory scaffolding (save data, caches) proceeds; a later
-/// stat of the "created" directory warns, keeping the trail honest.
+/// `sceKernelMkdir(path, mode)`: create the directory beneath a registered
+/// VFS mount. The VFS rejects unmounted and traversing paths.
 fn hle_mkdir(ctx: &HleContext, args: &[u64]) -> u64 {
-    let path = args.first().copied().unwrap_or(0);
-    warn!(
-        "sceKernelMkdir({:?}) [no VFS write path: pretending success]",
-        crate::fmt::read_cstr(ctx.mem, path).unwrap_or_default()
+    let path_ptr = args.first().copied().unwrap_or(0);
+    let Some(path_bytes) = crate::fmt::read_cstr(ctx.mem, path_ptr) else {
+        return SCE_KERNEL_ERROR_EFAULT;
+    };
+    let path = String::from_utf8_lossy(&path_bytes);
+    match ctx.kernel.filesystem.create_dir_all(&path) {
+        Ok(()) => SCE_OK,
+        Err(error) => {
+            warn!("sceKernelMkdir('{path}') failed: {error}");
+            SCE_KERNEL_ERROR_ENOENT
+        }
+    }
+}
+
+const ORBIS_STAT_SIZE: usize = 120;
+const ORBIS_MODE_DIRECTORY: u16 = 0x41ff;
+const ORBIS_MODE_REGULAR: u16 = 0x81ff;
+
+/// `sceKernelStat(path, stat_out)`: report real metadata for any mounted VFS
+/// path. The 120-byte layout is the public Orbis/FreeBSD ABI used by titles.
+fn hle_stat(ctx: &HleContext, args: &[u64]) -> u64 {
+    let path_ptr = args.first().copied().unwrap_or(0);
+    let stat_out = args.get(1).copied().unwrap_or(0);
+    if stat_out == 0 {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    let Some(path_bytes) = crate::fmt::read_cstr(ctx.mem, path_ptr) else {
+        return SCE_KERNEL_ERROR_EFAULT;
+    };
+    let path = String::from_utf8_lossy(&path_bytes);
+    match ctx.kernel.filesystem.metadata(&path) {
+        Ok(metadata) => write_orbis_stat(ctx, stat_out, &metadata),
+        Err(error) => {
+            debug!("sceKernelStat('{path}') failed: {error}");
+            SCE_KERNEL_ERROR_ENOENT
+        }
+    }
+}
+
+fn write_orbis_stat(ctx: &HleContext, stat_out: u64, metadata: &std::fs::Metadata) -> u64 {
+    let is_directory = metadata.is_dir();
+    let size = if is_directory { 65_536 } else { metadata.len() };
+    let mut stat = [0u8; ORBIS_STAT_SIZE];
+    stat[4..8].copy_from_slice(&1u32.to_le_bytes()); // stable nonzero inode
+    stat[8..10].copy_from_slice(
+        &(if is_directory {
+            ORBIS_MODE_DIRECTORY
+        } else {
+            ORBIS_MODE_REGULAR
+        })
+        .to_le_bytes(),
     );
-    SCE_OK
+    stat[10..12].copy_from_slice(&1u16.to_le_bytes());
+    write_orbis_timespec(&mut stat[24..40], metadata.accessed().ok());
+    write_orbis_timespec(&mut stat[40..56], metadata.modified().ok());
+    write_orbis_timespec(&mut stat[56..72], metadata.modified().ok());
+    stat[72..80].copy_from_slice(&size.to_le_bytes());
+    let blocks = if is_directory {
+        128
+    } else {
+        size.div_ceil(512)
+    };
+    stat[80..88].copy_from_slice(&blocks.to_le_bytes());
+    stat[88..92].copy_from_slice(&(if is_directory { 65_536u32 } else { 512u32 }).to_le_bytes());
+    write_orbis_timespec(&mut stat[104..120], metadata.created().ok());
+    if ctx.mem.write(stat_out, &stat) {
+        SCE_OK
+    } else {
+        SCE_KERNEL_ERROR_EFAULT
+    }
+}
+
+fn write_orbis_timespec(out: &mut [u8], value: Option<std::time::SystemTime>) {
+    let Some(duration) = value.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+    else {
+        return;
+    };
+    out[..8].copy_from_slice(&(duration.as_secs() as i64).to_le_bytes());
+    out[8..16].copy_from_slice(&(duration.subsec_nanos() as i64).to_le_bytes());
 }
 
 /// Shared honest-failure stub for path metadata calls with no VFS backing.
@@ -1236,19 +1466,29 @@ fn hle_fs_enoent(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_KERNEL_ERROR_ENOENT
 }
 
-/// `fstat`/`sceKernelFstat(fd, stat_out)`: only the console descriptors
-/// exist; report a zeroed stat for them, EBADF otherwise.
+/// `fstat`/`sceKernelFstat(fd, stat_out)`: report regular-file size for VFS
+/// descriptors and a zero-sized character-like record for console fds.
 fn hle_fstat(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0);
     let stat_out = args.get(1).copied().unwrap_or(0);
-    if fd > 2 {
+    let size = if fd <= 2 {
+        0
+    } else if let Some(size) = ctx.kernel.filesystem.file_size(fd as i32) {
+        size
+    } else {
         warn!("fstat(fd={fd}): no file table backing — EBADF");
         return WRITE_EBADF;
-    }
+    };
     if stat_out != 0 {
-        // struct stat on Orbis is 120 bytes; all-zero is a character device
-        // of no size, which is truthful for the console fds.
-        let _ = ctx.mem.write(stat_out, &[0u8; 120]);
+        let mut stat = [0u8; ORBIS_STAT_SIZE];
+        stat[8..10].copy_from_slice(&ORBIS_MODE_REGULAR.to_le_bytes());
+        stat[10..12].copy_from_slice(&1u16.to_le_bytes());
+        stat[72..80].copy_from_slice(&size.to_le_bytes());
+        stat[80..88].copy_from_slice(&size.div_ceil(512).to_le_bytes());
+        stat[88..92].copy_from_slice(&512u32.to_le_bytes());
+        if !ctx.mem.write(stat_out, &stat) {
+            return SCE_KERNEL_ERROR_EFAULT;
+        }
     }
     SCE_OK
 }
@@ -1262,17 +1502,65 @@ fn hle_pthread_getname(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
-/// `scePthreadOnce(once_control, init_routine)`: HLE cannot call back into
-/// guest code, so the init routine CANNOT run — that is a real fidelity gap
-/// (once-guarded state stays uninitialized) and is logged at warn every
-/// time so a downstream crash has a visible cause upstream.
-fn hle_pthread_once(_ctx: &HleContext, args: &[u64]) -> u64 {
-    warn!(
-        "scePthreadOnce(once={:#x}, init={:#x}) — CANNOT run the guest init routine; \
-         once-guarded state stays uninitialized",
-        args.first().copied().unwrap_or(0),
-        args.get(1).copied().unwrap_or(0),
-    );
+/// `scePthreadOnce` / POSIX `pthread_once`: claim the control word and defer
+/// its initializer to the runtime's active guest-callback mechanism. The
+/// runtime marks it done only after the guest routine returns and restores it
+/// to uninitialized if the callback faults.
+fn hle_pthread_once(ctx: &HleContext, args: &[u64]) -> u64 {
+    const ONCE_UNINITIALIZED: u32 = 0;
+    const ONCE_IN_PROGRESS: u32 = 1;
+    const ONCE_DONE: u32 = 2;
+    const SCE_KERNEL_ERROR_EAGAIN: u64 = 0x8002_000B;
+
+    let once = args.first().copied().unwrap_or(0);
+    let init = args.get(1).copied().unwrap_or(0);
+    if once == 0 || init < 0x1_0000 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+
+    let mut entry_probe = [0u8; 1];
+    if !ctx.mem.read(init, &mut entry_probe) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    loop {
+        match ctx.mem.atomic_load_u32(once) {
+            Some(ONCE_DONE) => return SCE_OK,
+            Some(ONCE_IN_PROGRESS) => {
+                if ctx.guest_threads.process_is_terminating() {
+                    return SCE_KERNEL_ERROR_EAGAIN;
+                }
+                std::thread::yield_now();
+            }
+            Some(ONCE_UNINITIALIZED) => {
+                match ctx.mem.atomic_compare_exchange_u32(
+                    once,
+                    ONCE_UNINITIALIZED,
+                    ONCE_IN_PROGRESS,
+                ) {
+                    Some(ONCE_UNINITIALIZED) => break,
+                    Some(_) => continue,
+                    None => return SCE_KERNEL_ERROR_EFAULT,
+                }
+            }
+            Some(_) => return SCE_KERNEL_ERROR_EINVAL,
+            None => return SCE_KERNEL_ERROR_EFAULT,
+        }
+    }
+    let requested = ctx.guest_calls.request(GuestCallRequest {
+        entry: init,
+        args: [0; 6],
+        completion: Some(GuestCallCompletion {
+            address: once,
+            success_u32: ONCE_DONE,
+            failure_u32: ONCE_UNINITIALIZED,
+        }),
+    });
+    if !requested {
+        let _ = ctx.mem.atomic_store_u32(once, ONCE_UNINITIALIZED);
+        return SCE_KERNEL_ERROR_EAGAIN;
+    }
+
+    debug!("pthread_once(once={once:#x}, init={init:#x}) -> deferred guest call");
     SCE_OK
 }
 
@@ -1606,6 +1894,8 @@ mod tests {
             ("libkernel", "scePthreadAttrSetinheritsched"),
             ("libkernel", "scePthreadGetname"),
             ("libkernel", "scePthreadOnce"),
+            ("libScePosix", "pthread_once"),
+            ("libkernel", "_is_signal_return"),
             ("libkernel", "__tls_get_addr"),
             ("libkernel", "scePthreadCondBroadcast"),
             ("libkernel", "scePthreadCondDestroy"),
@@ -1690,7 +1980,10 @@ mod tests {
             hle_rtld_set_application_heap_api(&ctx, &[0xBEEF_0000]),
             SCE_OK
         );
-        assert_eq!(APPLICATION_HEAP_API.load(Ordering::Relaxed), 0xBEEF_0000);
+        assert_eq!(
+            kernel.application_heap_api.load(Ordering::Relaxed),
+            0xBEEF_0000
+        );
 
         // fstat: console fds report a zeroed stat, others EBADF.
         assert_eq!(hle_fstat(&ctx, &[1, 0x600]), SCE_OK);
@@ -1867,9 +2160,24 @@ mod tests {
         assert!(mem.write(0x200, b"PROGRESS"));
         assert_eq!(hle_write(&ctx, &[fd, 0x200, 8]), 8);
 
-        // close() flushes to the host file.
+        // fsync() persists while keeping the descriptor open.
+        assert_eq!(hle_fsync(&ctx, &[fd]), SCE_OK);
+        assert_eq!(std::fs::read(tmp.join("save.dat")).unwrap(), b"PROGRESS");
+        assert_eq!(hle_fsync(&ctx, &[0x7fff]), 0x8002_0009);
+
+        // close() remains valid after fsync and does not lose data.
         assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
         assert_eq!(std::fs::read(tmp.join("save.dat")).unwrap(), b"PROGRESS");
+
+        let registry = HleRegistry::new();
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| {
+                    *nid == 0x7d3c_7aea_5e62_5880 && key == "libkernel::sceKernelFsync"
+                })
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1927,6 +2235,64 @@ mod tests {
         // open of a missing file → ENOENT.
         assert!(mem.write(0x300, b"/app0/nope.bin\0"));
         assert_eq!(hle_open(&ctx, &[0x300, 0, 0]) as i64, -2);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn directory_open_and_getdents_expose_gen5_records() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x2000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let tmp = std::env::temp_dir().join(format!("xps5x-hle-dir-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("packs")).unwrap();
+        std::fs::write(tmp.join("manifest.json"), b"{}").unwrap();
+        kernel.filesystem.set_game_directory(&tmp);
+        assert!(mem.write(0x100, b"/app0\0"));
+        let fd = hle_open(&ctx, &[0x100, 0, 0]);
+        assert!((fd as i64) >= 3);
+        assert_eq!(hle_getdents(&ctx, &[fd, 0x400, 1024, 0x200]), 1024);
+        let mut first = [0u8; 512];
+        assert!(mem.read(0x400, &mut first));
+        assert_eq!(u16::from_le_bytes(first[4..6].try_into().unwrap()), 512);
+        assert!(matches!(first[6], 4 | 8));
+        assert_ne!(first[7], 0);
+        assert_eq!(hle_getdents(&ctx, &[fd, 0x400, 1024]), 0);
+        assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stat_and_mkdir_use_mounted_vfs_roots() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let tmp = std::env::temp_dir().join(format!("xps5x-hle-stat-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        kernel.filesystem.set_temp_directory(&tmp);
+
+        assert!(mem.write(0x100, b"/temp0/cache\0"));
+        assert_eq!(hle_mkdir(&ctx, &[0x100, 0o755]), SCE_OK);
+        assert!(tmp.join("cache").is_dir());
+
+        assert_eq!(hle_stat(&ctx, &[0x100, 0x200]), SCE_OK);
+        let mut stat = [0u8; ORBIS_STAT_SIZE];
+        assert!(mem.read(0x200, &mut stat));
+        assert_eq!(
+            u16::from_le_bytes(stat[8..10].try_into().unwrap()),
+            ORBIS_MODE_DIRECTORY
+        );
+        assert_eq!(u64::from_le_bytes(stat[72..80].try_into().unwrap()), 65_536);
+
+        // The exact mount root is a valid directory too; it must not require
+        // a trailing slash to resolve.
+        assert!(mem.write(0x120, b"/temp0\0"));
+        assert_eq!(hle_stat(&ctx, &[0x120, 0x300]), SCE_OK);
+
+        assert!(mem.write(0x140, b"/temp0/missing\0"));
+        assert_eq!(hle_stat(&ctx, &[0x140, 0x400]), SCE_KERNEL_ERROR_ENOENT);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2170,6 +2536,54 @@ mod tests {
         let addr = u64::from_le_bytes(addr_bytes);
         assert_ne!(addr, 0);
         assert!(kernel.memory.is_mapped(addr));
+    }
+
+    #[test]
+    fn main_direct_memory_maps_the_reserved_identity_range_and_writes_addr_out() {
+        let registry = HleRegistry::new();
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x10_0000);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(
+            registry.call(
+                &ctx,
+                "libkernel",
+                "sceKernelAllocateMainDirectMemory",
+                &[0x8000, 0x2000, 0, 0x100]
+            ),
+            Some(SCE_OK)
+        );
+        let mut bytes = [0u8; 8];
+        assert!(mem.read(0x100, &mut bytes));
+        let physical = u64::from_le_bytes(bytes);
+        assert_ne!(physical, 0);
+        assert_eq!(physical & 0x1FFF, 0);
+
+        assert_eq!(
+            registry.call(
+                &ctx,
+                "libkernel",
+                "sceKernelMapNamedDirectMemory",
+                &[0x108, 0x8000, 0x32, 0, physical, 0x2000, 0]
+            ),
+            Some(SCE_OK)
+        );
+        assert!(mem.read(0x108, &mut bytes));
+        assert_eq!(u64::from_le_bytes(bytes), physical);
+        assert!(kernel.memory.is_mapped(physical));
+
+        assert_eq!(
+            registry.call(
+                &ctx,
+                "libkernel",
+                "sceKernelReleaseDirectMemory",
+                &[physical, 0x8000]
+            ),
+            Some(SCE_OK)
+        );
+        assert!(!kernel.memory.is_mapped(physical));
     }
 
     #[test]

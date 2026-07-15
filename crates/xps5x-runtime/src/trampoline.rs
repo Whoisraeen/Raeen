@@ -18,24 +18,28 @@ use crate::RuntimeError;
 const PAGE_SIZE: u64 = 4096;
 
 /// A `PAGE_NOACCESS` reservation covering `trampoline_count` HLE trampoline
-/// slots (8 bytes each) starting at [`HLE_TRAMPOLINE_BASE`], plus one extra
-/// guarded slot past the last valid trampoline (design doc §7: `[BASE, BASE
-/// + count*8 + 8)`). Reserved, not committed — unmapped and reserved memory
+/// slots (8 bytes each) starting at [`HLE_TRAMPOLINE_BASE`], plus an invalid
+/// diagnostic sentinel at index `count` and a controlled return trampoline at
+/// index `count + 1`. Reserved, not committed — unmapped and reserved memory
 /// already faults on access exactly like committed `PAGE_NOACCESS` memory,
 /// so no commit is needed for this guard's purpose. Freed via `VirtualFree`
 /// on `Drop`.
 pub(crate) struct TrampolineGuard {
     base: u64,
     /// Actual reserved length in bytes (page-rounded; always `>=` the
-    /// logical `trampoline_count * 8 + 8` span).
+    /// logical `trampoline_count * 8 + 16` span).
     len: u64,
+    return_trampoline: u64,
 }
 
 impl TrampolineGuard {
     /// Reserve the guard region for a module with `trampoline_count`
     /// distinct HLE trampolines.
     pub(crate) fn reserve(trampoline_count: usize) -> Result<Self, RuntimeError> {
-        let logical_len = (trampoline_count as u64) * 8 + 8;
+        // Keep index `count` as the invalid-trampoline diagnostic sentinel.
+        // A normal guest return targets the following guarded slot.
+        let return_trampoline = HLE_TRAMPOLINE_BASE + (trampoline_count as u64 + 1) * 8;
+        let logical_len = (trampoline_count as u64) * 8 + 16;
         let reserved_len = logical_len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
 
         // SAFETY: `HLE_TRAMPOLINE_BASE` is a fixed, page-aligned (indeed
@@ -69,6 +73,7 @@ impl TrampolineGuard {
         Ok(Self {
             base: HLE_TRAMPOLINE_BASE,
             len: reserved_len,
+            return_trampoline,
         })
     }
 
@@ -81,6 +86,11 @@ impl TrampolineGuard {
     /// The guard region's actual (page-rounded) length in bytes.
     pub(crate) fn len(&self) -> u64 {
         self.len
+    }
+
+    /// Dedicated guarded address used as the return target for guest calls.
+    pub(crate) fn return_trampoline(&self) -> u64 {
+        self.return_trampoline
     }
 }
 

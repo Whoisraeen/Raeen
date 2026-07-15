@@ -304,6 +304,11 @@ impl GuestArena {
         self.base + STACK_OFFSET + STACK_SIZE
     }
 
+    /// Whether an absolute guest address lies in the loaded executable image.
+    pub(crate) fn is_executable_address(&self, address: u64) -> bool {
+        address >= self.base && address < self.base.saturating_add(self.image_len)
+    }
+
     /// Set up the main-thread TCB and, if the module has a `PT_TLS`
     /// template, its static TLS block (design doc §3, RT2c-b/M1-B):
     ///
@@ -345,6 +350,16 @@ impl GuestArena {
         }
         Some(tcb)
     }
+
+    /// Allocate an independent variant-II TLS block and TCB for a guest
+    /// worker. The layout is identical to the main thread; only ownership and
+    /// FS-base installation differ.
+    pub(crate) fn setup_thread_tcb(
+        &self,
+        tls: Option<&xps5x_firmware::TlsTemplate>,
+    ) -> Option<u64> {
+        self.setup_main_tcb(tls)
+    }
 }
 
 impl Drop for GuestArena {
@@ -385,9 +400,10 @@ impl GuestMemory for GuestArena {
         // exactly tile the span). Guest address == host address here
         // (identity mapping), so `guest_addr as *const u8` is a valid,
         // readable host pointer for `out.len()` bytes. No other live
-        // reference writes these bytes concurrently under the
-        // single-active-execution invariant (design doc §9,
-        // `dispatch::CALL_LOCK`).
+        // reference writes these bytes through Rust. Native guest threads can
+        // concurrently touch the same VirtualAlloc pages, just as real guest
+        // CPUs can race; these host-side copies are non-atomic and may tear.
+        // Guest synchronization is responsible for conflicting accesses.
         unsafe {
             core::ptr::copy_nonoverlapping(guest_addr as *const u8, out.as_mut_ptr(), out.len());
         }
@@ -407,11 +423,69 @@ impl GuestMemory for GuestArena {
         }
         // SAFETY: same bounds argument as `read` above. Every sub-region is
         // committed `PAGE_READWRITE` or `PAGE_EXECUTE_READWRITE` (see
-        // `new`), so it is writable, and the single-active-execution
-        // invariant means no concurrent access to these bytes exists while
-        // this call runs.
+        // `new`), so it is writable. As with `read`, native guest concurrency
+        // is deliberately inherited: unsynchronized conflicting access may
+        // tear and is the guest program's responsibility.
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), guest_addr as *mut u8, data.len());
+        }
+        true
+    }
+
+    fn atomic_load_u32(&self, guest_addr: u64) -> Option<u32> {
+        let end = guest_addr.checked_add(4)?;
+        if guest_addr < self.base
+            || end > self.base + ARENA_SPAN
+            || guest_addr % core::mem::align_of::<std::sync::atomic::AtomicU32>() as u64 != 0
+        {
+            return None;
+        }
+        // SAFETY: the checked address is 4-byte aligned and lies in committed
+        // guest memory for the lifetime of this arena. Guest synchronization
+        // words are accessed atomically through this API by HLE.
+        Some(unsafe {
+            (&*(guest_addr as *const std::sync::atomic::AtomicU32))
+                .load(std::sync::atomic::Ordering::SeqCst)
+        })
+    }
+
+    fn atomic_compare_exchange_u32(&self, guest_addr: u64, current: u32, new: u32) -> Option<u32> {
+        let end = guest_addr.checked_add(4)?;
+        if guest_addr < self.base
+            || end > self.base + ARENA_SPAN
+            || guest_addr % core::mem::align_of::<std::sync::atomic::AtomicU32>() as u64 != 0
+        {
+            return None;
+        }
+        // SAFETY: same address/alignment/lifetime proof as atomic_load_u32.
+        let atomic = unsafe { &*(guest_addr as *const std::sync::atomic::AtomicU32) };
+        Some(
+            atomic
+                .compare_exchange(
+                    current,
+                    new,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .unwrap_or_else(|observed| observed),
+        )
+    }
+
+    fn atomic_store_u32(&self, guest_addr: u64, value: u32) -> bool {
+        let end = match guest_addr.checked_add(4) {
+            Some(end) => end,
+            None => return false,
+        };
+        if guest_addr < self.base
+            || end > self.base + ARENA_SPAN
+            || guest_addr % core::mem::align_of::<std::sync::atomic::AtomicU32>() as u64 != 0
+        {
+            return false;
+        }
+        // SAFETY: same address/alignment/lifetime proof as atomic_load_u32.
+        unsafe {
+            (&*(guest_addr as *const std::sync::atomic::AtomicU32))
+                .store(value, std::sync::atomic::Ordering::SeqCst);
         }
         true
     }

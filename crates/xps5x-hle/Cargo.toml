@@ -17,3 +17,6 @@ dashmap = { workspace = true }
 # Linear-time substring/byte search (Two-Way / SIMD) for hle_strstr — avoids
 # the O(n·m) DoS a naive windows()-scan exposes to guest-controlled inputs.
 memchr = "2"
+# OS-backed CSPRNG for libSceRandom; never exposes host identifiers or a
+# deterministic emulator-global seed to titles.
+getrandom = "0.3"

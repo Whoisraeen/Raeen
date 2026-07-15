@@ -17,6 +17,7 @@ use tracing::debug;
 const OK: u64 = 0;
 
 /// The single active guest thread's handle / unique id.
+#[cfg(test)]
 const CURRENT_THREAD: u64 = 1;
 
 /// Register the pthread thread-identity/control HLE functions.
@@ -42,8 +43,8 @@ pub fn register(registry: &HleRegistry) {
 }
 
 /// `scePthreadSelf()`: the calling thread's handle (the one guest thread).
-fn hle_self(_ctx: &HleContext, _args: &[u64]) -> u64 {
-    CURRENT_THREAD
+fn hle_self(ctx: &HleContext, _args: &[u64]) -> u64 {
+    ctx.guest_threads.current_thread()
 }
 
 /// `scePthreadEqual(t1, t2)`: 1 if the two handles are the same thread, else 0.
@@ -54,8 +55,8 @@ fn hle_equal(_ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 /// `scePthreadGetthreadid()`: the calling thread's unique numeric id.
-fn hle_getthreadid(_ctx: &HleContext, _args: &[u64]) -> u64 {
-    CURRENT_THREAD
+fn hle_getthreadid(ctx: &HleContext, _args: &[u64]) -> u64 {
+    ctx.guest_threads.current_thread()
 }
 
 /// `scePthreadYield()`: hint a reschedule. With one guest thread there is

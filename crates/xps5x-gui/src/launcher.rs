@@ -240,14 +240,14 @@ struct FirmwareSession {
 /// follows suit — the registry lives behind a `std::sync::Mutex` and is
 /// locked only for the duration of one `load_module` call.
 pub struct FirmwareLauncher {
-    hle: xps5x_hle::HleRegistry,
+    hle: std::sync::Arc<xps5x_hle::HleRegistry>,
     /// The live emulated kernel HLE calls get access to via
     /// [`xps5x_hle::HleContext::kernel`] (dispatch-context milestone — see
     /// `xps5x_runtime::execute_linked`'s doc comment). One instance per
     /// launcher, not per launch: kernel state (the virtual memory manager,
     /// thread manager, ...) is process-wide, matching a real PS5's single
     /// kernel serving every loaded module.
-    kernel: xps5x_kernel::OrbisKernel,
+    kernel: std::sync::Arc<xps5x_kernel::OrbisKernel>,
     registry: Mutex<xps5x_firmware::ModuleRegistry>,
     sessions: Mutex<HashMap<u64, FirmwareSession>>,
     next_id: Mutex<u64>,
@@ -258,8 +258,8 @@ impl FirmwareLauncher {
         let hle = xps5x_hle::HleRegistry::new();
         let nid_db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
         Self {
-            hle,
-            kernel: xps5x_kernel::OrbisKernel::new(),
+            hle: std::sync::Arc::new(hle),
+            kernel: std::sync::Arc::new(xps5x_kernel::OrbisKernel::new()),
             registry: Mutex::new(xps5x_firmware::ModuleRegistry::new(nid_db)),
             sessions: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
@@ -287,6 +287,26 @@ impl FirmwareLauncher {
                 ));
             }
         };
+
+        self.kernel
+            .filesystem
+            .set_game_directory(path.parent().unwrap_or_else(|| Path::new(".")));
+        let title_dir = path.parent().and_then(Path::file_name).unwrap_or_default();
+        let writable_root = std::env::temp_dir().join("xps5x").join(title_dir);
+        let temp_dir = writable_root.join("temp");
+        let download_dir = writable_root.join("download");
+        let savedata_dir = Path::new("savedata").join(title_dir);
+        for writable_dir in [&temp_dir, &download_dir, &savedata_dir] {
+            if let Err(error) = std::fs::create_dir_all(writable_dir) {
+                return SessionOutcome::Faulted(format!(
+                    "Cannot create writable title directory {}: {error}",
+                    writable_dir.display()
+                ));
+            }
+        }
+        self.kernel.filesystem.set_temp_directory(&temp_dir);
+        self.kernel.filesystem.set_download_directory(&download_dir);
+        self.kernel.filesystem.set_savedata_directory(&savedata_dir);
 
         let linked = {
             let mut registry = self.registry.lock().unwrap();
@@ -327,6 +347,7 @@ impl FirmwareLauncher {
             entry_point: Some(linked.entry),
             initialized: true,
         });
+        let linked = std::sync::Arc::new(linked);
 
         #[cfg(target_os = "windows")]
         {
@@ -335,10 +356,10 @@ impl FirmwareLauncher {
             // bare 6-register function call. A well-formed run ends via an
             // exit-family call (`Exited`); a `_start` that returns anyway is
             // reported as `Ran` (malformed but tolerated).
-            match xps5x_runtime::execute_process(
-                &linked,
-                &self.hle,
-                &self.kernel,
+            match xps5x_runtime::execute_process_shared(
+                std::sync::Arc::clone(&linked),
+                std::sync::Arc::clone(&self.hle),
+                std::sync::Arc::clone(&self.kernel),
                 &[GUEST_ARGV0],
                 &[],
             ) {

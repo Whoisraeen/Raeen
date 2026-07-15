@@ -37,6 +37,16 @@ pub fn register(registry: &HleRegistry) {
         "sceAppContentGetAddcontInfo",
         hle_get_addcont_info,
     );
+    registry.register(
+        "libSceAppContent",
+        "sceAppContentTemporaryDataMount2",
+        hle_temporary_data_mount2,
+    );
+    registry.register(
+        "libSceAppContent",
+        "sceAppContentTemporaryDataGetAvailableSpaceKb",
+        hle_temporary_data_available_space,
+    );
 }
 
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
@@ -82,6 +92,42 @@ fn hle_get_addcont_info(_ctx: &HleContext, _args: &[u64]) -> u64 {
     ERROR_PARAMETER
 }
 
+/// Mount the process-private writable temporary-data directory and return the
+/// canonical guest mount name through the second argument. ABI and behavior
+/// are cross-checked against SharpEmu's GPL-2.0 implementation.
+fn hle_temporary_data_mount2(ctx: &HleContext, args: &[u64]) -> u64 {
+    let mount_out = args.get(1).copied().unwrap_or(0);
+    if mount_out == 0 {
+        return ERROR_PARAMETER;
+    }
+    let Some(host_root) = ctx.kernel.filesystem.resolve_path("/temp0/") else {
+        return ERROR_PARAMETER;
+    };
+    if std::fs::create_dir_all(&host_root).is_err() || !ctx.mem.write(mount_out, b"/temp0\0") {
+        return ERROR_PARAMETER;
+    }
+    SCE_OK
+}
+
+/// Report a stable 1 GiB process-private temporary-data quota. This avoids
+/// leaking host disk capacity while giving titles a realistic nonzero budget.
+fn hle_temporary_data_available_space(ctx: &HleContext, args: &[u64]) -> u64 {
+    const TEMP_QUOTA_KIB: u64 = 1024 * 1024;
+
+    let mount_ptr = args.first().copied().unwrap_or(0);
+    let available_out = args.get(1).copied().unwrap_or(0);
+    let Some(mount) = crate::fmt::read_cstr(ctx.mem, mount_ptr) else {
+        return ERROR_PARAMETER;
+    };
+    if mount != b"/temp0" || available_out == 0 {
+        return ERROR_PARAMETER;
+    }
+    if !ctx.mem.write(available_out, &TEMP_QUOTA_KIB.to_le_bytes()) {
+        return ERROR_PARAMETER;
+    }
+    SCE_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +158,23 @@ mod tests {
 
         // NULL value ptr → parameter error.
         assert_eq!(hle_app_param_get_int(&ctx, &[0, 0]), ERROR_PARAMETER);
+
+        assert_eq!(hle_temporary_data_mount2(&ctx, &[0, 0x300]), SCE_OK);
+        let mut mount = [0u8; 7];
+        assert!(mem.read(0x300, &mut mount));
+        assert_eq!(&mount, b"/temp0\0");
+        assert_eq!(hle_temporary_data_mount2(&ctx, &[0, 0]), ERROR_PARAMETER);
+
+        assert_eq!(
+            hle_temporary_data_available_space(&ctx, &[0x300, 0x380]),
+            SCE_OK
+        );
+        let mut available = [0u8; 8];
+        assert!(mem.read(0x380, &mut available));
+        assert_eq!(u64::from_le_bytes(available), 1024 * 1024);
+        assert_eq!(
+            hle_temporary_data_available_space(&ctx, &[0, 0x380]),
+            ERROR_PARAMETER
+        );
     }
 }

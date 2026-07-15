@@ -24,6 +24,12 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "bind", hle_bind);
     registry.register("libkernel", "connect", hle_connect);
     registry.register("libkernel", "getsockname", hle_getsockname);
+    registry.register_nid(
+        "libScePosix",
+        "setsockopt",
+        0x7c5c_4693_1176_6d5a,
+        hle_setsockopt,
+    );
     registry.register("libkernel", "bzero", hle_bzero);
     registry.register("libkernel", "inet_pton", hle_inet_pton);
     registry.register("libkernel", "htons", hle_htons);
@@ -79,6 +85,28 @@ fn hle_connect(ctx: &HleContext, args: &[u64]) -> u64 {
     }
     debug!("connect(fd={fd:#x}) -> refused (offline)");
     MINUS_ONE
+}
+
+/// `setsockopt(fd, level, option, value, length)`: validate the guest option
+/// payload and accept it for an offline socket. No option can enable host
+/// connectivity; the observable socket behavior remains deterministic.
+fn hle_setsockopt(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    let value = args.get(3).copied().unwrap_or(0);
+    let length = args.get(4).copied().unwrap_or(0);
+    if !ctx.kernel.kernel_sockets.contains_key(&fd) || length > 4096 {
+        return MINUS_ONE;
+    }
+    if length != 0 {
+        let Ok(length) = usize::try_from(length) else {
+            return MINUS_ONE;
+        };
+        let mut payload = vec![0u8; length];
+        if value == 0 || !ctx.mem.read(value, &mut payload) {
+            return MINUS_ONE;
+        }
+    }
+    OK
 }
 
 /// `getsockname(fd, sockaddr, addrlen)`: write back the bound `sockaddr_in`.
@@ -249,5 +277,13 @@ mod tests {
         assert_eq!(&out[4..8], &[10, 0, 0, 5]);
         // Operations on an unknown fd → -1.
         assert_eq!(hle_bind(&ctx, &[0x999, 0x100, 8]), MINUS_ONE);
+        assert!(ctx.mem.write(0x240, &1u32.to_le_bytes()));
+        assert_eq!(hle_setsockopt(&ctx, &[fd, 0xffff, 1, 0x240, 4]), OK);
+        assert_eq!(hle_setsockopt(&ctx, &[0x999, 0, 0, 0, 0]), MINUS_ONE);
+
+        let registry = HleRegistry::new();
+        assert!(registry.registered_nid_overrides().iter().any(|(nid, key)| {
+            *nid == 0x7c5c_4693_1176_6d5a && key == "libScePosix::setsockopt"
+        }));
     }
 }

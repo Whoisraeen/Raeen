@@ -55,6 +55,180 @@ pub fn register(registry: &HleRegistry) {
         "sceLibcInternalBacktraceForGame",
         hle_backtrace_for_game,
     );
+    registry.register(
+        "libSceLibcInternal",
+        "sceLibcMspaceCreate",
+        hle_mspace_create,
+    );
+    registry.register(
+        "libSceLibcInternal",
+        "sceLibcMspaceDestroy",
+        hle_mspace_destroy,
+    );
+    registry.register("libSceLibcInternal", "sceLibcMspaceFree", hle_mspace_free);
+    registry.register(
+        "libSceLibcInternal",
+        "sceLibcMspaceMemalign",
+        hle_mspace_memalign,
+    );
+    registry.register(
+        "libSceLibcInternal",
+        "sceLibcMspaceMallocUsableSize",
+        hle_mspace_malloc_usable_size,
+    );
+    registry.register(
+        "libSceLibcInternal",
+        "sceLibcMspaceMallocStats",
+        hle_mspace_malloc_stats,
+    );
+    registry.register(
+        "libSceLibcInternal",
+        "sceLibcMspaceMallocStatsFast",
+        hle_mspace_malloc_stats,
+    );
+}
+
+fn read_cstring(ctx: &HleContext, address: u64, max: usize) -> Option<String> {
+    if address == 0 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    for offset in 0..max {
+        let mut byte = [0u8; 1];
+        if !ctx.mem.read(address + offset as u64, &mut byte) {
+            return None;
+        }
+        if byte[0] == 0 {
+            return Some(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        bytes.push(byte[0]);
+    }
+    None
+}
+
+/// Create a fixed-capacity mspace over memory already owned by the guest.
+fn hle_mspace_create(ctx: &HleContext, args: &[u64]) -> u64 {
+    let name_address = args.first().copied().unwrap_or(0);
+    let base = args.get(1).copied().unwrap_or(0);
+    let capacity = args.get(2).copied().unwrap_or(0);
+    let flag = args.get(3).copied().unwrap_or(0);
+    if base == 0 || capacity < 0x100 || flag > 1 {
+        return 0;
+    }
+    let Some(name) = read_cstring(ctx, name_address, 256) else {
+        return 0;
+    };
+    ctx.kernel.libc_mspaces.insert(
+        base,
+        xps5x_kernel::LibcMspace {
+            base,
+            capacity,
+            next_offset: 0x100,
+            peak_offset: 0x100,
+            active_bytes: 0,
+            name,
+        },
+    );
+    base
+}
+
+fn hle_mspace_destroy(ctx: &HleContext, args: &[u64]) -> u64 {
+    let mspace = args.first().copied().unwrap_or(0);
+    if ctx.kernel.libc_mspaces.remove(&mspace).is_none() {
+        return 0;
+    }
+    ctx.kernel
+        .libc_mspace_allocations
+        .retain(|_, allocation| allocation.mspace != mspace);
+    1
+}
+
+fn hle_mspace_memalign(ctx: &HleContext, args: &[u64]) -> u64 {
+    let mspace = args.first().copied().unwrap_or(0);
+    let alignment = args.get(1).copied().unwrap_or(0).max(8);
+    let size = args.get(2).copied().unwrap_or(0);
+    if size == 0 || !alignment.is_power_of_two() {
+        return 0;
+    }
+    let Some(mut state) = ctx.kernel.libc_mspaces.get_mut(&mspace) else {
+        return 0;
+    };
+    let Some(aligned) = state
+        .next_offset
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
+    else {
+        return 0;
+    };
+    let Some(end) = aligned.checked_add(size) else {
+        return 0;
+    };
+    if end > state.capacity {
+        return 0;
+    }
+    let Some(address) = state.base.checked_add(aligned) else {
+        return 0;
+    };
+    state.next_offset = end;
+    state.peak_offset = state.peak_offset.max(end);
+    state.active_bytes = state.active_bytes.saturating_add(size);
+    drop(state);
+    ctx.kernel
+        .libc_mspace_allocations
+        .insert(address, xps5x_kernel::LibcMspaceAllocation { mspace, size });
+    address
+}
+
+fn hle_mspace_free(ctx: &HleContext, args: &[u64]) -> u64 {
+    let mspace = args.first().copied().unwrap_or(0);
+    let address = args.get(1).copied().unwrap_or(0);
+    let Some((_, allocation)) = ctx.kernel.libc_mspace_allocations.remove(&address) else {
+        return 0;
+    };
+    if allocation.mspace != mspace {
+        ctx.kernel
+            .libc_mspace_allocations
+            .insert(address, allocation);
+        return 0;
+    }
+    if let Some(mut state) = ctx.kernel.libc_mspaces.get_mut(&mspace) {
+        state.active_bytes = state.active_bytes.saturating_sub(allocation.size);
+    }
+    1
+}
+
+fn hle_mspace_malloc_usable_size(ctx: &HleContext, args: &[u64]) -> u64 {
+    let address = args.first().copied().unwrap_or(0);
+    ctx.kernel
+        .libc_mspace_allocations
+        .get(&address)
+        .map_or(0, |allocation| allocation.size)
+}
+
+fn hle_mspace_malloc_stats(ctx: &HleContext, args: &[u64]) -> u64 {
+    let mspace = args.first().copied().unwrap_or(0);
+    let output = args.get(1).copied().unwrap_or(0);
+    let Some(state) = ctx.kernel.libc_mspaces.get(&mspace) else {
+        return 0;
+    };
+    if output == 0 {
+        return 0;
+    }
+    let values = [
+        state.capacity,
+        state.next_offset,
+        state.peak_offset,
+        state.active_bytes,
+    ];
+    for (index, value) in values.into_iter().enumerate() {
+        if !ctx
+            .mem
+            .write(output + index as u64 * 8, &value.to_le_bytes())
+        {
+            return 0;
+        }
+    }
+    1
 }
 
 /// Lazily allocate the persistent zeroed trace storage, returning its guest
@@ -183,5 +357,51 @@ mod tests {
         let ctx = test_ctx(&kernel, &mem, &alloc);
         assert_eq!(hle_heap_error_report(&ctx, &[1, 2, 3, 4]), SCE_OK);
         assert_eq!(hle_backtrace_for_game(&ctx, &[]), 0);
+    }
+
+    #[test]
+    fn mspace_create_memalign_stats_free_and_destroy_are_process_local() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x3000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert!(mem.write(0x40, b"renderer\0"));
+
+        let mspace = hle_mspace_create(&ctx, &[0x40, 0x400, 0x1000, 0]);
+        assert_eq!(mspace, 0x400);
+        let allocation = hle_mspace_memalign(&ctx, &[mspace, 0x100, 0x180]);
+        assert_ne!(allocation, 0);
+        assert_eq!(allocation & 0xFF, 0);
+        assert_eq!(hle_mspace_malloc_usable_size(&ctx, &[allocation]), 0x180);
+
+        assert_eq!(hle_mspace_malloc_stats(&ctx, &[mspace, 0x100]), 1);
+        let mut value = [0u8; 8];
+        assert!(mem.read(0x100, &mut value));
+        assert_eq!(u64::from_le_bytes(value), 0x1000);
+        assert!(mem.read(0x118, &mut value));
+        assert_eq!(u64::from_le_bytes(value), 0x180);
+
+        assert_eq!(hle_mspace_free(&ctx, &[mspace, allocation]), 1);
+        assert_eq!(hle_mspace_malloc_usable_size(&ctx, &[allocation]), 0);
+        assert_eq!(hle_mspace_destroy(&ctx, &[mspace]), 1);
+        assert!(!kernel.libc_mspaces.contains_key(&mspace));
+
+        let registry = HleRegistry::new();
+        for function in [
+            "sceLibcMspaceCreate",
+            "sceLibcMspaceDestroy",
+            "sceLibcMspaceFree",
+            "sceLibcMspaceMemalign",
+            "sceLibcMspaceMallocStats",
+            "sceLibcMspaceMallocStatsFast",
+            "sceLibcMspaceMallocUsableSize",
+        ] {
+            assert!(
+                registry
+                    .call(&ctx, "libSceLibcInternal", function, &[0])
+                    .is_some(),
+                "{function} must be HLE-reachable"
+            );
+        }
     }
 }

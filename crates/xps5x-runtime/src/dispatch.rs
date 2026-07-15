@@ -44,18 +44,21 @@
 //! unchanged.
 
 use core::ptr;
-use std::cell::Cell;
-use std::sync::Mutex;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, CONTEXT, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
-    EXCEPTION_POINTERS, RemoveVectoredExceptionHandler, RtlCaptureContext,
+    EXCEPTION_POINTERS, RtlCaptureContext,
 };
 
 use xps5x_firmware::{HleTrampoline, UnresolvedStub};
-use xps5x_hle::{GuestAllocator, GuestMemory, HleContext, HleRegistry};
+use xps5x_hle::{
+    GuestAllocator, GuestCallCompletion, GuestCallRequest, GuestCallScheduler, GuestMemory,
+    GuestThreadScheduler, HleContext, HleRegistry,
+};
 use xps5x_kernel::OrbisKernel;
 
 use crate::RunOutcome;
@@ -96,11 +99,30 @@ fn is_terminating(library: &str, function: &str) -> bool {
 /// call is — two concurrent `execute_linked` calls racing to reserve the
 /// same fixed `HLE_TRAMPOLINE_BASE` region would spuriously fail with
 /// `MapFailed`, lock or no lock inside `run` alone. Holding it for the
-/// whole pipeline is also what makes `ACTIVE_CONTEXT` below safe to touch
-/// from the VEH without a lock of its own — only one OS thread is ever
-/// "inside" a guarded call at a time, and the VEH only ever runs
-/// synchronously on that same thread.
+/// whole pipeline still enforces RT0's single guest execution. The
+/// `ACTIVE_CONTEXT` route itself is thread-local and the VEH only reads the
+/// faulting OS thread's slot, which is the property later workers rely on.
 static CALL_LOCK: Mutex<()> = Mutex::new(());
+
+/// The process-wide VEH installation. The callback itself owns no process
+/// pointer: it consults the const-initialized thread-local `ACTIVE_CONTEXT`,
+/// so leaving one handler installed is safe for non-guest threads and avoids
+/// stacking/removing handlers while future guest workers are live.
+static VEH_HANDLE: OnceLock<usize> = OnceLock::new();
+
+fn ensure_veh() -> Result<(), RuntimeError> {
+    let handle = *VEH_HANDLE.get_or_init(|| {
+        // SAFETY: `veh_callback` has the required Windows callback ABI and is
+        // valid for the lifetime of the process. It only dereferences a
+        // context when this faulting OS thread has installed one in TLS.
+        unsafe { AddVectoredExceptionHandler(1, Some(veh_callback)) as usize }
+    });
+    if handle == 0 {
+        Err(RuntimeError::MapFailed)
+    } else {
+        Ok(())
+    }
+}
 
 /// Process-wide count of FS-base re-arms performed by [`veh_callback`] (see
 /// [`ActiveContext::guest_fsbase`]).
@@ -137,7 +159,7 @@ pub(crate) fn call_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// How many recent HLE calls [`CallTrace`] remembers.
-const CALL_TRACE_LEN: usize = 24;
+const CALL_TRACE_LEN: usize = 64;
 
 /// A bounded ring of the most recent HLE calls, for explaining a fault.
 ///
@@ -233,8 +255,24 @@ struct ActiveContext {
     /// The guest allocator an HLE call's [`HleContext::alloc`] borrows
     /// from — a trait object pointer (fat pointer), same reasoning as `mem`.
     alloc: *const dyn GuestAllocator,
+    thread_scheduler: *const dyn GuestThreadScheduler,
+    current_thread: u64,
+    thread_exit: Cell<Option<u64>>,
     region_base: u64,
     region_len: u64,
+    /// The guarded slot after the invalid-trampoline diagnostic sentinel.
+    /// Guest callbacks return here so the VEH can finish the original HLE
+    /// call and resume its caller.
+    callback_return_addr: u64,
+    /// Top-level guest calls return through the same guarded address when no
+    /// nested HLE callback frame is active.
+    returned: Cell<bool>,
+    retval: Cell<u64>,
+    /// At most one guest callback can be requested by a single HLE handler.
+    pending_guest_call: Cell<Option<GuestCallRequest>>,
+    /// Nested guest callbacks are legal (an initializer may call another API
+    /// that invokes guest code), so retain their original HLE return frames.
+    callback_frames: RefCell<Vec<GuestCallbackFrame>>,
     error: Cell<Option<RuntimeError>>,
     /// Register state and instruction bytes captured before a genuine guest
     /// fault is long-jumped back to the host recovery point.
@@ -328,6 +366,95 @@ struct ActiveContext {
     armed: Cell<bool>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GuestCallbackFrame {
+    original_return: u64,
+    hle_result: u64,
+    completion: Option<GuestCallCompletion>,
+}
+
+impl GuestCallScheduler for ActiveContext {
+    fn request(&self, request: GuestCallRequest) -> bool {
+        if self.pending_guest_call.get().is_some() {
+            return false;
+        }
+        self.pending_guest_call.set(Some(request));
+        true
+    }
+}
+
+impl GuestThreadScheduler for ActiveContext {
+    fn create(&self, thread_out: u64, attr: u64, entry: u64, arg: u64) -> u64 {
+        // SAFETY: `thread_scheduler` is installed by `run` from a scheduler
+        // that outlives this guarded call.
+        unsafe { &*self.thread_scheduler }.create(thread_out, attr, entry, arg)
+    }
+
+    fn join(&self, thread: u64, retval_out: u64) -> u64 {
+        if thread == self.current_thread {
+            return 0x8002_0023;
+        }
+        // SAFETY: same lifetime invariant as `create`.
+        unsafe { &*self.thread_scheduler }.join(thread, retval_out)
+    }
+
+    fn detach(&self, thread: u64) -> u64 {
+        // SAFETY: same lifetime invariant as `create`.
+        unsafe { &*self.thread_scheduler }.detach(thread)
+    }
+
+    fn request_exit(&self, retval: u64) -> bool {
+        self.thread_exit.set(Some(retval));
+        true
+    }
+
+    fn current_thread(&self) -> u64 {
+        self.current_thread
+    }
+
+    fn request_process_exit(&self, code: u64) {
+        // SAFETY: same lifetime invariant as `create`.
+        unsafe { &*self.thread_scheduler }.request_process_exit(code);
+    }
+
+    fn process_is_terminating(&self) -> bool {
+        // SAFETY: same lifetime invariant as `create`.
+        unsafe { &*self.thread_scheduler }.process_is_terminating()
+    }
+}
+
+struct UnsupportedGuestThreads;
+
+impl GuestThreadScheduler for UnsupportedGuestThreads {
+    fn create(&self, _thread_out: u64, _attr: u64, _entry: u64, _arg: u64) -> u64 {
+        0x8002_000B
+    }
+
+    fn join(&self, _thread: u64, _retval_out: u64) -> u64 {
+        0x8002_0003
+    }
+
+    fn detach(&self, _thread: u64) -> u64 {
+        0x8002_0003
+    }
+
+    fn request_exit(&self, _retval: u64) -> bool {
+        false
+    }
+
+    fn current_thread(&self) -> u64 {
+        1
+    }
+
+    fn request_process_exit(&self, _code: u64) {}
+
+    fn process_is_terminating(&self) -> bool {
+        false
+    }
+}
+
+static UNSUPPORTED_GUEST_THREADS: UnsupportedGuestThreads = UnsupportedGuestThreads;
+
 #[derive(Clone, Copy)]
 struct FaultSnapshot {
     rip: u64,
@@ -363,6 +490,10 @@ struct FaultSnapshot {
 #[repr(C, align(16))]
 struct AlignedContext(CONTEXT);
 
+fn never_returns(value: core::convert::Infallible) -> ! {
+    match value {}
+}
+
 thread_local! {
     /// The active-call context [`veh_callback`] consults, held **per OS
     /// thread** (M1-E step 1, spec §6): the VEH is process-wide but runs
@@ -388,24 +519,23 @@ thread_local! {
 /// (design doc §2), and distinguishing three ways that call can end: a
 /// normal return (`RunOutcome::Returned`), the guest calling a terminating
 /// function like `exit` (`RunOutcome::Exited`, design doc §4, wall #1 W1b),
-/// or a genuine fault (`Err(Faulted)`, RT1a). `execute_linked` (function
-/// mode, via [`crate::stack::call_on_guest_stack`]) and `execute_process`
-/// (process mode `_start` entry, via
-/// [`crate::stack::enter_guest_at_start`]) both funnel through this single
-/// function so the fault-recovery/exit-longjmp machinery below is never
-/// duplicated (design doc §8).
+/// or a genuine fault (`Err(Faulted)`, RT1a). Function entries, dependency
+/// initializers, and process `_start` all enter through
+/// [`crate::stack::enter_guest`] and funnel through this function so the
+/// fault-recovery/exit-longjmp machinery is never duplicated.
 ///
 /// # Safety
 /// `call_guest` must, when called, transfer control to mapped guest code the
 /// caller set up specifically so it can be executed (i.e. a live
 /// [`crate::arena::GuestArena`]'s image sub-region) exactly as
-/// `call_on_guest_stack`'s or `enter_guest_at_start`'s own safety contract
-/// requires, and return the value that should surface as
-/// `RunOutcome::Returned` on a normal, non-terminating, non-faulting return.
+/// [`crate::stack::enter_guest`]'s safety contract requires. It diverges;
+/// normal guest returns fault at the guarded return trampoline and resume
+/// through the captured recovery context.
 /// It must be safe to call exactly once, synchronously, on this thread, for
-/// the duration this function's VEH and RT1a recovery point are armed (both
-/// are set up before it is called, and torn down/read only after it
-/// returns). `trampolines`, `hle`, `kernel`, `mem`, and `alloc` must outlive
+/// the duration this function's process-wide VEH and per-call RT1a recovery
+/// point are armed. The handler is installed before entry and remains for the
+/// process lifetime; the recovery context is read only before this returns.
+/// `trampolines`, `hle`, `kernel`, `mem`, and `alloc` must outlive
 /// this call (guaranteed by `execute_linked`/`execute_process`'s borrows).
 /// `guard` must be the [`TrampolineGuard`] whose region covers every address
 /// `trampolines` resolves. `tcb`, if `Some`, is the guest TCB address (from
@@ -423,7 +553,9 @@ pub(crate) unsafe fn run(
     alloc: &dyn GuestAllocator,
     guard: &TrampolineGuard,
     tcb: Option<u64>,
-    call_guest: impl FnOnce() -> u64,
+    guest_threads: Option<&dyn GuestThreadScheduler>,
+    current_thread: u64,
+    call_guest: impl FnOnce() -> core::convert::Infallible,
 ) -> Result<RunOutcome, RuntimeError> {
     // Serialization (only one native guest execution at a time, RT0) is
     // provided by the caller: `execute_linked` holds `call_lock()` for its
@@ -476,6 +608,14 @@ pub(crate) unsafe fn run(
     // `ACTIVE_CONTEXT` is cleared before `run` returns.
     let alloc_erased: &'static dyn GuestAllocator =
         unsafe { core::mem::transmute::<&dyn GuestAllocator, &'static dyn GuestAllocator>(alloc) };
+    let thread_scheduler = guest_threads.unwrap_or(&UNSUPPORTED_GUEST_THREADS);
+    // SAFETY: shared schedulers are Arc-owned by the process, while the
+    // fallback is static; either way the scheduler outlives this run.
+    let thread_scheduler_erased: &'static dyn GuestThreadScheduler = unsafe {
+        core::mem::transmute::<&dyn GuestThreadScheduler, &'static dyn GuestThreadScheduler>(
+            thread_scheduler,
+        )
+    };
 
     let ctx = ActiveContext {
         trampolines: trampolines as *const [HleTrampoline],
@@ -484,8 +624,16 @@ pub(crate) unsafe fn run(
         kernel: kernel as *const OrbisKernel,
         mem: mem_erased as *const dyn GuestMemory,
         alloc: alloc_erased as *const dyn GuestAllocator,
+        thread_scheduler: thread_scheduler_erased as *const dyn GuestThreadScheduler,
+        current_thread,
+        thread_exit: Cell::new(None),
         region_base: guard.base(),
         region_len: guard.len(),
+        callback_return_addr: guard.return_trampoline(),
+        returned: Cell::new(false),
+        retval: Cell::new(0),
+        pending_guest_call: Cell::new(None),
+        callback_frames: RefCell::new(Vec::new()),
         error: Cell::new(None),
         fault_snapshot: Cell::new(None),
         resumed: Cell::new(false),
@@ -499,16 +647,7 @@ pub(crate) unsafe fn run(
         armed: Cell::new(false),
     };
 
-    // SAFETY: `veh_callback` has the `unsafe extern "system" fn(*mut
-    // EXCEPTION_POINTERS) -> i32` signature `AddVectoredExceptionHandler`
-    // requires. Registered as the first handler (`1`) so it sees the
-    // exception before any other handler in the process; removed before
-    // this function returns on every path below, so it never outlives `ctx`
-    // or this call.
-    let handle = unsafe { AddVectoredExceptionHandler(1, Some(veh_callback)) };
-    if handle.is_null() {
-        return Err(RuntimeError::MapFailed);
-    }
+    ensure_veh()?;
 
     // `ctx` is a local; its address is stable for the rest of this function
     // (never moved), which is exactly the lifetime the VEH needs it for.
@@ -570,9 +709,7 @@ pub(crate) unsafe fn run(
     //     everything `run` pushed while inside it, is gone (`Rsp` was reset
     //     by the restore) — and `ctx.error` already holds `Faulted { addr
     //     }`, set by `veh_callback` before it restored us here.
-    let result = if ctx.resumed.get() {
-        0
-    } else {
+    if !ctx.resumed.get() {
         ctx.resumed.set(true);
         if ctx.tls_active.get() {
             // SAFETY: `ctx.tls_active` is only `true` when
@@ -592,19 +729,16 @@ pub(crate) unsafe fn run(
         }
         // SAFETY: `call_guest`'s contract (this function's `# Safety`
         // section) guarantees it transfers control to mapped, executable
-        // guest code exactly as `call_on_guest_stack`'s/
-        // `enter_guest_at_start`'s own safety contract requires. The VEH is
+        // guest code exactly as `enter_guest`'s safety contract requires. The VEH is
         // armed (just above) for the entire duration of this call, so any
         // guest `call [import_slot]` into the guarded trampoline region is
         // trapped and serviced by `veh_callback`, and any genuine wild fault
         // is recovered via the `RtlCaptureContext` snapshot just taken
         // above, rather than crashing the process.
         //
-        // `entry` runs on the guest's own stack, switched to and back (or,
-        // for a process-mode `_start` entry, never back at all on a
-        // well-formed run — see `enter_guest_at_start`'s doc comment) by
-        // whichever of `call_on_guest_stack`/`enter_guest_at_start`
-        // `call_guest` wraps, instead of directly on this (host) stack —
+        // `entry` runs on the guest's own stack. `enter_guest` switches to it
+        // and never returns through this host frame; every terminal path
+        // restores the pre-entry context instead —
         // this does not change the recovery argument above: `recovery_ctx`
         // was captured with the *host* RSP before this switch ever happens,
         // so a genuine fault (or an exit-longjmp) still restores the host
@@ -615,15 +749,12 @@ pub(crate) unsafe fn run(
         // discharged by whichever `unsafe { crate::stack::... }` block the
         // caller built the closure from (see `execute_linked`/
         // `execute_process`), not by this call site itself.
-        let r = call_guest();
-        // Returned normally: no genuine fault or exit-longjmp occurred on
-        // this call. Disarm so `resumed` doesn't linger set for no reason
-        // (it's about to be dropped along with `ctx` regardless, but this
-        // keeps the invariant "armed only while the guest call is actually
-        // in flight" honest).
-        ctx.resumed.set(false);
-        r
-    };
+        // This rustc warns about applying a diverging eliminator to an
+        // uninhabited result even though that is precisely the stable
+        // `FnOnce -> Infallible` spelling used in place of `FnOnce -> !`.
+        #[allow(unreachable_code)]
+        never_returns(call_guest())
+    }
 
     if ctx.tls_active.get() {
         // SAFETY: `ctx.tls_active` being `true` guarantees FSGSBASE is
@@ -640,11 +771,6 @@ pub(crate) unsafe fn run(
     }
 
     ACTIVE_CONTEXT.with(|slot| slot.set(ptr::null_mut()));
-    // SAFETY: `handle` is exactly the handle `AddVectoredExceptionHandler`
-    // returned above, removed exactly once.
-    unsafe {
-        RemoveVectoredExceptionHandler(handle);
-    }
 
     // Design doc §4: on the resumed arrival, an exit-family termination is
     // checked first, then a genuine fault; only the arrival that actually
@@ -663,15 +789,19 @@ pub(crate) unsafe fn run(
             // an HLE stub handed back a null (or a bogus handle) and the guest
             // dereferenced it later. The faulting instruction is in guest code
             // and identifies no symbol, so print the recent HLE history — that
-            // is where the culprit is. Done HERE, not in the VEH: the handler is
-            // removed and the guest is no longer running, so this can safely
-            // allocate and log.
-            if matches!(err, RuntimeError::Faulted { .. }) {
+            // is where the culprit is. Done HERE, not in the VEH: this
+            // thread's active context is cleared and the guest is no longer
+            // running, so this can safely allocate and log.
+            if matches!(
+                err,
+                RuntimeError::Faulted { .. } | RuntimeError::UnimplementedImport { .. }
+            ) {
                 log_call_trace(&ctx, trampolines, &err);
             }
             Err(err)
         }
-        None => Ok(RunOutcome::Returned(result)),
+        None if ctx.returned.get() => Ok(RunOutcome::Returned(ctx.retval.get())),
+        None => Err(RuntimeError::MapFailed),
     }
 }
 
@@ -711,6 +841,47 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
             snapshot.r10,
             snapshot.r11,
         );
+
+        // The GuestMemory object is owned by the still-live process runner;
+        // this diagnostic runs synchronously before that runner drops it and
+        // after the VEH has stopped consulting the active context.
+        let mem = unsafe { &*ctx.mem };
+        let mut stack_words = Vec::new();
+        for index in 0..16u64 {
+            let address = snapshot.rsp.wrapping_add(index * 8);
+            let mut bytes = [0u8; 8];
+            if !mem.read(address, &mut bytes) {
+                break;
+            }
+            stack_words.push((address, u64::from_le_bytes(bytes)));
+        }
+        if !stack_words.is_empty() {
+            let formatted = stack_words
+                .iter()
+                .map(|(address, value)| format!("{address:#x}:{value:#x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::warn!("guest stack qwords: {formatted}");
+
+            // The first qword at RSP is normally the return address of the
+            // import call. Capturing a small window around it makes unknown
+            // NIDs diagnosable from the caller's ABI setup without retaining
+            // or dumping the guest image.
+            let return_address = stack_words[0].1;
+            let window_start = return_address.saturating_sub(16);
+            let mut return_window = [0u8; 32];
+            if mem.read(window_start, &mut return_window) {
+                let bytes = return_window
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                tracing::warn!(
+                    "guest return-site bytes: {window_start:#x}..{:#x}: {bytes}",
+                    window_start + return_window.len() as u64
+                );
+            }
+        }
     }
     let entries = ctx.trace.entries_oldest_first();
     if entries.is_empty() {
@@ -780,6 +951,45 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     // access is required to redirect execution (Rip/Rsp/Rax) below.
     let context = unsafe { &mut *info.ContextRecord };
     let fault_addr = context.Rip;
+
+    // Process exit is cooperative across native guest workers. Every import,
+    // guarded return, or FS-rearm fault is a safe point at which a worker can
+    // abandon its guest stack through the already-captured recovery context.
+    // A trap-free worker intentionally keeps teardown waiting; force-killing
+    // a host thread could leave locks and Rust frames corrupted.
+    if ctx.process_is_terminating() {
+        ctx.exited.set(true);
+        *context = unsafe { *ctx.recovery_ctx };
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // A callback requested by an HLE handler returned through the dedicated
+    // extra guard slot. Finish its synchronization update and resume exactly
+    // where the original import call would have returned.
+    if fault_addr == ctx.callback_return_addr {
+        if let Some(frame) = ctx.callback_frames.borrow_mut().pop() {
+            // SAFETY: `ctx.mem` is the live guest memory view stored by `run`
+            // for this guarded call; callback returns are delivered
+            // synchronously on the same thread before `run` can tear it down.
+            let mem = unsafe { &*ctx.mem };
+            if let Some(completion) = frame.completion {
+                let _ = mem.atomic_store_u32(completion.address, completion.success_u32);
+            }
+            context.Rip = frame.original_return;
+            context.Rax = frame.hle_result;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        // No nested HLE callback owns this return, so the top-level guest
+        // entry returned normally. Capture RAX and recover the complete host
+        // register context, including RSP, from `run`'s pre-entry snapshot.
+        ctx.retval.set(context.Rax);
+        ctx.returned.set(true);
+        // SAFETY: recovery was captured and armed before guest entry, points
+        // into the still-live `run` frame on this thread, and CONTEXT is Copy.
+        *context = unsafe { *ctx.recovery_ctx };
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
 
     if fault_addr < ctx.region_base || fault_addr >= ctx.region_base + ctx.region_len {
         // Before treating this as a genuine fault: is it just Windows having
@@ -881,6 +1091,14 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         // dispatch). `read` is bounds-checked and leaves diagnosis honest if
         // RIP itself is not readable.
         let mem = unsafe { &*ctx.mem };
+        // A failed callback must release any once/in-progress state it owns.
+        // Unwind every nested frame because the recovery jump abandons the
+        // whole guest stack, not merely the innermost callback.
+        for frame in ctx.callback_frames.borrow_mut().drain(..).rev() {
+            if let Some(completion) = frame.completion {
+                let _ = mem.atomic_store_u32(completion.address, completion.failure_u32);
+            }
+        }
         let bytes_read = mem.read(context.Rip, &mut bytes);
         ctx.fault_snapshot.set(Some(FaultSnapshot {
             rip: context.Rip,
@@ -943,6 +1161,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 // checking `ctx.exited` first.
                 ctx.exit_code.set(context.Rdi);
                 ctx.exited.set(true);
+                ctx.request_process_exit(context.Rdi);
 
                 // SAFETY: same reasoning as the genuine-fault restore below
                 // — `ctx.recovery_ctx` points at a still-live stack local in
@@ -976,10 +1195,30 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                     args[6 + i] = u64::from_le_bytes(buf);
                 }
             }
-            let hle_ctx = HleContext { kernel, mem, alloc };
+            let hle_ctx = HleContext {
+                kernel,
+                mem,
+                alloc,
+                guest_calls: ctx,
+                guest_threads: ctx,
+            };
             let ret = hle
                 .call(&hle_ctx, &t.library, &t.function, &args)
                 .unwrap_or(0);
+            if ctx.process_is_terminating() {
+                ctx.exited.set(true);
+                *context = unsafe { *ctx.recovery_ctx };
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            if let Some(retval) = ctx.thread_exit.take() {
+                ctx.retval.set(retval);
+                ctx.returned.set(true);
+                // SAFETY: the recovery context is armed and remains live for
+                // this run; pthread exit abandons the guest stack exactly like
+                // a normal top-level return.
+                *context = unsafe { *ctx.recovery_ctx };
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
             // Remember it: if the guest later faults on a null we handed back,
             // this history is the only thing that names the culprit (see
             // `CallTrace`). Index, not name — no allocation in the VEH.
@@ -1000,6 +1239,35 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         }
     };
 
+    if let Some(request) = ctx.pending_guest_call.take() {
+        let mut original_return = [0u8; 8];
+        let mut entry_probe = [0u8; 1];
+        if request.entry >= 0x1_0000
+            && mem.read(request.entry, &mut entry_probe)
+            && mem.read(context.Rsp, &mut original_return)
+            && mem.write(context.Rsp, &ctx.callback_return_addr.to_le_bytes())
+        {
+            ctx.callback_frames.borrow_mut().push(GuestCallbackFrame {
+                original_return: u64::from_le_bytes(original_return),
+                hle_result: result,
+                completion: request.completion,
+            });
+            context.Rip = request.entry;
+            context.Rdi = request.args[0];
+            context.Rsi = request.args[1];
+            context.Rdx = request.args[2];
+            context.Rcx = request.args[3];
+            context.R8 = request.args[4];
+            context.R9 = request.args[5];
+            context.Rax = 0;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        if let Some(completion) = request.completion {
+            let _ = mem.atomic_store_u32(completion.address, completion.failure_u32);
+        }
+    }
+
     context.Rax = result;
 
     // Emulate the `call` instruction's target returning. The CPU already
@@ -1008,10 +1276,20 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     // precedes the fetch of the first instruction at the new Rip, so by the
     // time we're here [Rsp] holds that return address.
     //
-    // SAFETY: `Rsp` was set by the guest's own `call` instruction per
-    // standard x86-64 `call` semantics and points at 8 bytes of the guest's
-    // (mapped, valid) stack holding the pushed return address.
-    let ret_addr = unsafe { core::ptr::read(context.Rsp as *const u64) };
+    // RSP is guest-controlled. Read it through the arena bounds check instead
+    // of dereferencing it in the VEH: a corrupt stack pointer must become a
+    // recoverable guest fault, never a recursive host exception.
+    let mut return_bytes = [0u8; 8];
+    if !mem.read(context.Rsp, &mut return_bytes) {
+        ctx.error.set(Some(RuntimeError::Faulted {
+            addr: fault_addr,
+            access: context.Rsp,
+            kind: crate::FaultKind::Read,
+        }));
+        *context = unsafe { *ctx.recovery_ctx };
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    let ret_addr = u64::from_le_bytes(return_bytes);
     context.Rip = ret_addr;
     context.Rsp = context.Rsp.wrapping_add(8);
 

@@ -8,11 +8,9 @@
 //! semantics: a recursive mutex re-locks by count, an error-check mutex
 //! reports `EDEADLK` on self-relock, and normal/adaptive mutexes are lenient.
 //!
-//! Under XPS5X's single-active-execution model there is exactly one guest
-//! thread, so ownership reduces to recursion + type tracking — which is
-//! precisely correct for that model. The blocking/contention path (real
-//! waiters) and condition variables need the per-thread scheduler and are out
-//! of scope here (they stay stubbed until M1-E stands the runtime up).
+//! Ownership uses the runtime's current guest-thread handle. Contended locks
+//! wait cooperatively on the host and re-check process termination; they never
+//! transfer ownership from another guest thread.
 
 use crate::{HleContext, HleRegistry};
 use tracing::debug;
@@ -31,7 +29,7 @@ const MUTEX_RECURSIVE: i32 = 2;
 const MUTEX_NORMAL: i32 = 3;
 const MUTEX_ADAPTIVE: i32 = 4;
 
-/// The single active guest thread's handle (single-active-execution model).
+#[cfg(test)]
 const CURRENT_THREAD: u64 = 1;
 
 /// Size of the opaque mutex object handed to the guest.
@@ -59,9 +57,17 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadRwlockInit", hle_rwlock_init);
     registry.register("libkernel", "scePthreadRwlockDestroy", hle_rwlock_destroy);
     registry.register("libkernel", "scePthreadRwlockRdlock", hle_rwlock_rdlock);
-    registry.register("libkernel", "scePthreadRwlockTryrdlock", hle_rwlock_rdlock);
+    registry.register(
+        "libkernel",
+        "scePthreadRwlockTryrdlock",
+        hle_rwlock_tryrdlock,
+    );
     registry.register("libkernel", "scePthreadRwlockWrlock", hle_rwlock_wrlock);
-    registry.register("libkernel", "scePthreadRwlockTrywrlock", hle_rwlock_wrlock);
+    registry.register(
+        "libkernel",
+        "scePthreadRwlockTrywrlock",
+        hle_rwlock_trywrlock,
+    );
     registry.register("libkernel", "scePthreadRwlockUnlock", hle_rwlock_unlock);
     registry.register("libkernel", "scePthreadRwlockattrInit", hle_rwlockattr_ok);
     registry.register(
@@ -240,33 +246,44 @@ fn lock_core(ctx: &HleContext, mutex_addr: u64, try_only: bool) -> u64 {
         mutex_addr
     });
 
-    let mut entry = ctx.kernel.pthread_mutexes.get_mut(&key).unwrap();
-    if entry.owner == CURRENT_THREAD {
-        // Already held by (the only) thread.
-        match entry.ty {
-            MUTEX_RECURSIVE => {
-                entry.recursion += 1;
-                OK
-            }
-            MUTEX_NORMAL | MUTEX_ADAPTIVE => {
-                if try_only {
-                    EBUSY
-                } else {
-                    // Lenient: real normal-mutex self-relock is UB; we bump.
+    let current = ctx.guest_threads.current_thread();
+    loop {
+        let mut entry = ctx.kernel.pthread_mutexes.get_mut(&key).unwrap();
+        if entry.owner == current {
+            return match entry.ty {
+                MUTEX_RECURSIVE => {
                     entry.recursion += 1;
                     OK
                 }
-            }
-            _ => {
-                // Error-check: self-relock is a detected deadlock.
-                if try_only { EBUSY } else { EDEADLK }
-            }
+                MUTEX_NORMAL | MUTEX_ADAPTIVE => {
+                    if try_only {
+                        EBUSY
+                    } else {
+                        // Normal self-relock is undefined; preserve the prior
+                        // lenient recursion behavior for compatibility.
+                        entry.recursion += 1;
+                        OK
+                    }
+                }
+                _ => {
+                    if try_only {
+                        EBUSY
+                    } else {
+                        EDEADLK
+                    }
+                }
+            };
         }
-    } else {
-        // Free → acquire.
-        entry.owner = CURRENT_THREAD;
-        entry.recursion = 1;
-        OK
+        if entry.owner == 0 {
+            entry.owner = current;
+            entry.recursion = 1;
+            return OK;
+        }
+        if try_only || ctx.guest_threads.process_is_terminating() {
+            return EBUSY;
+        }
+        drop(entry);
+        std::thread::yield_now();
     }
 }
 
@@ -281,12 +298,10 @@ fn hle_mutex_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
     };
     let mut entry = ctx.kernel.pthread_mutexes.get_mut(&key).unwrap();
     let lenient = matches!(entry.ty, MUTEX_NORMAL | MUTEX_ADAPTIVE);
-
     if entry.recursion <= 0 {
-        // Not locked.
         return if lenient { OK } else { EINVAL };
     }
-    if !lenient && entry.owner != CURRENT_THREAD {
+    if entry.owner != ctx.guest_threads.current_thread() {
         return EPERM;
     }
     entry.recursion -= 1;
@@ -294,6 +309,18 @@ fn hle_mutex_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
         entry.owner = 0;
     }
     OK
+}
+
+/// Condition-wait bridge: release the supplied mutex using the same owner
+/// checks as the public pthread entry point.
+pub(crate) fn mutex_unlock_for_cond(ctx: &HleContext, mutex: u64) -> u64 {
+    hle_mutex_unlock(ctx, &[mutex])
+}
+
+/// Condition-wait bridge: reacquire the supplied mutex before returning to
+/// guest code.
+pub(crate) fn mutex_lock_for_cond(ctx: &HleContext, mutex: u64) -> u64 {
+    lock_core(ctx, mutex, false)
 }
 
 /// `scePthreadMutexattrInit(attr)`: register a default (normal) attribute.
@@ -399,35 +426,68 @@ fn resolve_or_create_rwlock(ctx: &HleContext, addr: u64) -> u64 {
 /// `scePthreadRwlockRdlock`/`Tryrdlock(rwlock)`: add a read hold. With one
 /// guest thread a read lock never blocks; it nests by reader count.
 fn hle_rwlock_rdlock(ctx: &HleContext, args: &[u64]) -> u64 {
+    rwlock_rdlock_core(ctx, args, false)
+}
+
+fn hle_rwlock_tryrdlock(ctx: &HleContext, args: &[u64]) -> u64 {
+    rwlock_rdlock_core(ctx, args, true)
+}
+
+fn rwlock_rdlock_core(ctx: &HleContext, args: &[u64], try_only: bool) -> u64 {
     let addr = args.first().copied().unwrap_or(0);
     if addr == 0 {
         return EINVAL;
     }
     let key = resolve_or_create_rwlock(ctx, addr);
-    let mut entry = ctx.kernel.pthread_rwlocks.get_mut(&key).unwrap();
-    // A writer held by another thread is impossible in single-active-execution;
-    // if this thread already write-owns it, the read hold nests leniently.
-    entry.readers += 1;
-    OK
+    let current = ctx.guest_threads.current_thread();
+    loop {
+        let mut entry = ctx.kernel.pthread_rwlocks.get_mut(&key).unwrap();
+        if entry.writer == 0 || entry.writer == current {
+            entry.readers += 1;
+            return OK;
+        }
+        if try_only || ctx.guest_threads.process_is_terminating() {
+            return EBUSY;
+        }
+        drop(entry);
+        std::thread::yield_now();
+    }
 }
 
 /// `scePthreadRwlockWrlock`/`Trywrlock(rwlock)`: acquire (or recurse) the write
 /// hold. Free → own it; already write-owned by this thread → recurse.
 fn hle_rwlock_wrlock(ctx: &HleContext, args: &[u64]) -> u64 {
+    rwlock_wrlock_core(ctx, args, false)
+}
+
+fn hle_rwlock_trywrlock(ctx: &HleContext, args: &[u64]) -> u64 {
+    rwlock_wrlock_core(ctx, args, true)
+}
+
+fn rwlock_wrlock_core(ctx: &HleContext, args: &[u64], try_only: bool) -> u64 {
     let addr = args.first().copied().unwrap_or(0);
     if addr == 0 {
         return EINVAL;
     }
     let key = resolve_or_create_rwlock(ctx, addr);
-    let mut entry = ctx.kernel.pthread_rwlocks.get_mut(&key).unwrap();
-    if entry.writer == CURRENT_THREAD {
-        entry.writer_recursion += 1;
-    } else {
-        // No other thread can hold it (single-active-execution) → acquire.
-        entry.writer = CURRENT_THREAD;
-        entry.writer_recursion = 1;
+    let current = ctx.guest_threads.current_thread();
+    loop {
+        let mut entry = ctx.kernel.pthread_rwlocks.get_mut(&key).unwrap();
+        if entry.writer == current {
+            entry.writer_recursion += 1;
+            return OK;
+        }
+        if entry.writer == 0 && entry.readers == 0 {
+            entry.writer = current;
+            entry.writer_recursion = 1;
+            return OK;
+        }
+        if try_only || ctx.guest_threads.process_is_terminating() {
+            return EBUSY;
+        }
+        drop(entry);
+        std::thread::yield_now();
     }
-    OK
 }
 
 /// `scePthreadRwlockUnlock(rwlock)`: release the thread's write hold (recursion
@@ -441,7 +501,7 @@ fn hle_rwlock_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
         return EINVAL;
     };
     let mut entry = ctx.kernel.pthread_rwlocks.get_mut(&key).unwrap();
-    if entry.writer == CURRENT_THREAD && entry.writer_recursion > 0 {
+    if entry.writer == ctx.guest_threads.current_thread() && entry.writer_recursion > 0 {
         entry.writer_recursion -= 1;
         if entry.writer_recursion == 0 {
             entry.writer = 0;

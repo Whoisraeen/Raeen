@@ -53,6 +53,7 @@ pub mod libsce_pad;
 pub mod libsce_peripheral;
 pub mod libsce_playgo;
 pub mod libsce_posix;
+pub mod libsce_random;
 pub mod libsce_rtc;
 pub mod libsce_save_data;
 pub mod libsce_save_data_dialog;
@@ -60,6 +61,7 @@ pub mod libsce_share;
 pub mod libsce_ssl;
 pub mod libsce_sysmodule;
 pub mod libsce_system_service;
+pub mod libsce_text_to_speech2;
 pub mod libsce_user_service;
 pub mod libsce_video_out;
 pub mod pthread_attr;
@@ -87,6 +89,30 @@ pub trait GuestMemory {
     /// Write `data` starting at `guest_addr`. Returns `false` (writing
     /// nothing) if the write would fall outside the guest's mapped memory.
     fn write(&self, guest_addr: u64, data: &[u8]) -> bool;
+
+    /// Atomic 32-bit load used for guest synchronization words. The default
+    /// is suitable for single-threaded test memories; native runtimes must
+    /// override it with a real host atomic operation.
+    fn atomic_load_u32(&self, guest_addr: u64) -> Option<u32> {
+        let mut bytes = [0u8; 4];
+        self.read(guest_addr, &mut bytes)
+            .then(|| u32::from_le_bytes(bytes))
+    }
+
+    /// Compare/exchange a 32-bit guest synchronization word, returning the
+    /// observed value. See [`GuestMemory::atomic_load_u32`].
+    fn atomic_compare_exchange_u32(&self, guest_addr: u64, current: u32, new: u32) -> Option<u32> {
+        let observed = self.atomic_load_u32(guest_addr)?;
+        if observed == current && !self.write(guest_addr, &new.to_le_bytes()) {
+            return None;
+        }
+        Some(observed)
+    }
+
+    /// Atomic 32-bit store used to complete or roll back guest callbacks.
+    fn atomic_store_u32(&self, guest_addr: u64, value: u32) -> bool {
+        self.write(guest_addr, &value.to_le_bytes())
+    }
 }
 
 /// Allocates and releases guest memory on behalf of an HLE function —
@@ -118,6 +144,49 @@ pub trait GuestAllocator {
     fn munmap(&self, addr: u64, length: u64);
 }
 
+/// A memory update the runtime performs after a requested guest callback
+/// returns. The failure value is restored if that callback faults before
+/// completing, so synchronization state is never left permanently wedged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestCallCompletion {
+    pub address: u64,
+    pub success_u32: u32,
+    pub failure_u32: u32,
+}
+
+/// A guest function call requested while servicing an HLE import.
+///
+/// The runtime resumes guest execution at `entry` using the active guest
+/// stack/TLS context, then transparently returns to the instruction after the
+/// original import call. This is generic infrastructure for pthread once
+/// initializers and other PS5 APIs that accept guest callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestCallRequest {
+    pub entry: u64,
+    pub args: [u64; 6],
+    pub completion: Option<GuestCallCompletion>,
+}
+
+/// Sink through which an HLE implementation can request one deferred guest
+/// call. A request returns `false` if this dispatch already has one pending.
+pub trait GuestCallScheduler {
+    fn request(&self, request: GuestCallRequest) -> bool;
+}
+
+/// Runtime-owned guest pthread lifecycle. HLE knows the Orbis ABI, while the
+/// native runtime owns stacks, TCBs, host threads, and guarded guest entry.
+pub trait GuestThreadScheduler {
+    fn create(&self, thread_out: u64, attr: u64, entry: u64, arg: u64) -> u64;
+    fn join(&self, thread: u64, retval_out: u64) -> u64;
+    fn detach(&self, thread: u64) -> u64;
+    fn request_exit(&self, retval: u64) -> bool;
+    fn current_thread(&self) -> u64;
+    /// Mark the whole guest process as terminating with `code`.
+    fn request_process_exit(&self, code: u64);
+    /// Whether another guest thread has requested process termination.
+    fn process_is_terminating(&self) -> bool;
+}
+
 /// Everything an HLE function may touch: the emulated kernel (memory,
 /// threads, filesystem, ...), the guest's address space, and the guest
 /// allocator.
@@ -138,6 +207,12 @@ pub struct HleContext<'a> {
     /// consumed by any HLE function body — see [`GuestAllocator`]'s doc
     /// comment.
     pub alloc: &'a dyn GuestAllocator,
+    /// Deferred guest callbacks executed by the native runtime after the HLE
+    /// handler returns, while the caller's guest register/stack context is
+    /// still active.
+    pub guest_calls: &'a dyn GuestCallScheduler,
+    /// Process-scoped guest pthread scheduler supplied by the runtime.
+    pub guest_threads: &'a dyn GuestThreadScheduler,
 }
 
 /// HLE function signature: takes a dispatch context and integer arguments,
@@ -192,6 +267,7 @@ impl HleRegistry {
         libsce_pad::register(&registry);
         libsce_playgo::register(&registry);
         libsce_system_service::register(&registry);
+        libsce_text_to_speech2::register(&registry);
         libsce_user_service::register(&registry);
         libsce_audio_out::register(&registry);
         libsce_save_data::register(&registry);
@@ -202,6 +278,7 @@ impl HleRegistry {
         libsce_net::register(&registry);
         libsce_disc_map::register(&registry);
         libsce_rtc::register(&registry);
+        libsce_random::register(&registry);
         libsce_peripheral::register(&registry);
         libsce_json::register(&registry);
         libsce_libc_internal::register(&registry);
@@ -472,7 +549,44 @@ pub(crate) fn test_ctx<'a>(
     mem: &'a TestMemory,
     alloc: &'a TestAllocator,
 ) -> HleContext<'a> {
-    HleContext { kernel, mem, alloc }
+    struct NoGuestCalls;
+    impl GuestCallScheduler for NoGuestCalls {
+        fn request(&self, _request: GuestCallRequest) -> bool {
+            false
+        }
+    }
+    static NO_GUEST_CALLS: NoGuestCalls = NoGuestCalls;
+    struct NoGuestThreads;
+    impl GuestThreadScheduler for NoGuestThreads {
+        fn create(&self, _thread_out: u64, _attr: u64, _entry: u64, _arg: u64) -> u64 {
+            0x8002_000B
+        }
+        fn join(&self, _thread: u64, _retval_out: u64) -> u64 {
+            0x8002_0003
+        }
+        fn detach(&self, _thread: u64) -> u64 {
+            0x8002_0003
+        }
+        fn request_exit(&self, _retval: u64) -> bool {
+            false
+        }
+        fn current_thread(&self) -> u64 {
+            1
+        }
+        fn request_process_exit(&self, _code: u64) {}
+        fn process_is_terminating(&self) -> bool {
+            false
+        }
+    }
+    static NO_GUEST_THREADS: NoGuestThreads = NoGuestThreads;
+
+    HleContext {
+        kernel,
+        mem,
+        alloc,
+        guest_calls: &NO_GUEST_CALLS,
+        guest_threads: &NO_GUEST_THREADS,
+    }
 }
 
 #[cfg(test)]

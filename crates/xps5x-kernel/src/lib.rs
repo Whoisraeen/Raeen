@@ -149,6 +149,8 @@ pub struct OrbisKernel {
     /// Guest pthread read-write lock state, keyed by both the guest
     /// `pthread_rwlock_t` address and its allocated handle.
     pub pthread_rwlocks: DashMap<u64, PthreadRwlock>,
+    /// Guest pthread condition-variable wait queues, keyed by object address.
+    pub pthread_conds: DashMap<u64, Arc<PthreadCond>>,
     /// Guest pthread thread-attribute objects, keyed by both the guest
     /// `pthread_attr_t` address and its allocated handle.
     pub pthread_attrs: DashMap<u64, PthreadAttr>,
@@ -168,6 +170,36 @@ pub struct OrbisKernel {
     kernel_equeue_next: std::sync::atomic::AtomicU64,
     /// The Agc driver's registered default resource owner (`sceAgcDriver*`).
     pub agc_default_owner: std::sync::atomic::AtomicU32,
+    /// Whether the per-process Agc resource-registration arena is active.
+    pub agc_resource_registration_initialized: std::sync::atomic::AtomicBool,
+    /// Maximum number of Agc resource owners accepted for this process.
+    pub agc_resource_registration_max_owners: std::sync::atomic::AtomicU32,
+    /// Next candidate Agc owner handle.
+    pub agc_next_owner: std::sync::atomic::AtomicU32,
+    /// Registered Agc owner handles and their diagnostic names.
+    pub agc_resource_owners: DashMap<u32, String>,
+    /// Next candidate Agc resource handle.
+    pub agc_next_resource: std::sync::atomic::AtomicU32,
+    /// Guest GPU allocations registered for diagnostics and submission.
+    pub agc_resources: DashMap<u32, AgcResource>,
+    /// Number of structurally valid AGC DCBs submitted by this process.
+    pub agc_submission_count: std::sync::atomic::AtomicU64,
+    /// Draw packets observed across valid AGC DCB submissions.
+    pub agc_draw_packet_count: std::sync::atomic::AtomicU64,
+    /// Compute-dispatch packets observed across valid AGC DCB submissions.
+    pub agc_dispatch_packet_count: std::sync::atomic::AtomicU64,
+    /// VideoOut flip packets observed across valid AGC DCB submissions.
+    pub agc_flip_packet_count: std::sync::atomic::AtomicU64,
+    /// Most recently submitted DCB address (diagnostic capture metadata).
+    pub agc_last_dcb_address: std::sync::atomic::AtomicU64,
+    /// Most recently submitted DCB length in DWORDs.
+    pub agc_last_dcb_dwords: std::sync::atomic::AtomicU32,
+    /// Display buffers registered by VideoOut, keyed by `(port, slot)`.
+    pub video_out_buffers: DashMap<(i32, i32), VideoOutBuffer>,
+    /// libc fixed-capacity heaps keyed by their guest mspace handle.
+    pub libc_mspaces: DashMap<u64, LibcMspace>,
+    /// Active allocations carved from libc mspaces, keyed by guest address.
+    pub libc_mspace_allocations: DashMap<u64, LibcMspaceAllocation>,
     /// AMPR command-buffer write offsets, keyed by the command-buffer address
     /// (the current write cursor `sceAmprCommandBufferGetCurrentOffset` reads).
     pub ampr_write_offsets: DashMap<u64, u64>,
@@ -182,12 +214,26 @@ pub struct OrbisKernel {
     /// Thread-local specific values, keyed by (thread handle, TLS key).
     pub pthread_tls_values: DashMap<(u64, i32), u64>,
     /// Dynamic TLS blocks allocated by `libkernel::__tls_get_addr`, keyed by
-    /// the module identifier carried in the guest's TLS descriptor.
-    ///
-    /// The runtime currently executes one guest thread, so a module has one
-    /// block per process. M1-E must extend this key with the real guest-thread
-    /// identity when concurrent guest contexts land.
-    pub dynamic_tls_blocks: DashMap<u64, u64>,
+    /// `(guest thread, module identifier)`.
+    pub dynamic_tls_blocks: DashMap<(u64, u64), u64>,
+    /// Per-thread guest addresses returned by libkernel `__error()`.
+    pub errno_slots: DashMap<u64, u64>,
+    /// Save-data transaction resources, keyed by resource id -> memory size.
+    pub save_data_transaction_resources: DashMap<i32, u64>,
+    /// Next save-data transaction resource id.
+    pub save_data_next_transaction_resource: std::sync::atomic::AtomicI32,
+    /// Save-data metadata values keyed by (mount point, parameter type).
+    pub save_data_params: DashMap<(String, u32), Vec<u8>>,
+    /// libc/rtld callback pointers registered for this guest process.
+    pub thread_dtors_callback: std::sync::atomic::AtomicU64,
+    pub thread_atexit_count_callback: std::sync::atomic::AtomicU64,
+    pub thread_atexit_report_callback: std::sync::atomic::AtomicU64,
+    /// Guest application heap API table registered with the rtld.
+    pub application_heap_api: std::sync::atomic::AtomicU64,
+    /// Whether the optional libSceTextToSpeech2 service is initialized for
+    /// this guest process. The audio synthesis surface is layered on top of
+    /// this lifecycle state rather than using process-global statics.
+    pub text_to_speech2_initialized: std::sync::atomic::AtomicBool,
     /// Next TLS key id to hand out.
     pthread_tls_next_key: std::sync::atomic::AtomicI32,
     /// libSceHttp contexts (existence set for `sceHttpTerm`), keyed by context
@@ -204,6 +250,10 @@ pub struct OrbisKernel {
     pub http2_contexts: DashMap<i32, u64>,
     /// Next libSceHttp2 context id (increment-before-use; first id is 1).
     pub http2_next_context: std::sync::atomic::AtomicI32,
+    /// libSceHttp2 templates, keyed by template id -> owning HTTP2 context.
+    pub http2_templates: DashMap<i32, i32>,
+    /// Next libSceHttp2 template id (starts at 0x1000).
+    pub http2_next_template: std::sync::atomic::AtomicI32,
     /// libSceSsl contexts, keyed by context id → recorded pool size.
     pub ssl_contexts: DashMap<i32, u64>,
     /// Next libSceSsl context id (increment-before-use; first id is 1).
@@ -236,6 +286,56 @@ pub struct EqueueUserEvent {
     pub triggered: bool,
     /// Trigger count (delivered as the event's `fflags`).
     pub fflags: u32,
+}
+
+/// Metadata supplied through `sceAgcDriverRegisterResource`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgcResource {
+    pub owner: u32,
+    pub address: u64,
+    pub size: u64,
+    pub name: String,
+    pub resource_type: u32,
+    pub flags: u32,
+}
+
+/// Gen5 VideoOut buffer attributes needed to interpret a presented image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoOutBufferAttribute {
+    pub pixel_format: u64,
+    pub tiling_mode: u32,
+    pub width: u32,
+    pub height: u32,
+    pub option: u64,
+    pub dcc_clear_color: u64,
+    pub dcc_control: u32,
+}
+
+/// One guest display buffer captured by `sceVideoOutRegisterBuffers2`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoOutBuffer {
+    pub set_index: i32,
+    pub address: u64,
+    pub metadata: u64,
+    pub attribute: VideoOutBufferAttribute,
+}
+
+/// Process-local state for a libc mspace created over guest-owned memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibcMspace {
+    pub base: u64,
+    pub capacity: u64,
+    pub next_offset: u64,
+    pub peak_offset: u64,
+    pub active_bytes: u64,
+    pub name: String,
+}
+
+/// One allocation carved out of a libc mspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LibcMspaceAllocation {
+    pub mspace: u64,
+    pub size: u64,
 }
 
 /// A kernel counting semaphore. Ported from SharpEmu's `KernelSemaphoreState`
@@ -320,6 +420,15 @@ pub struct PthreadMutex {
     pub recursion: i32,
 }
 
+/// Host-backed generation wait queue for one guest pthread condition.
+#[derive(Debug, Default)]
+pub struct PthreadCond {
+    /// Incremented by signal/broadcast while holding `generation`'s mutex.
+    pub generation: parking_lot::Mutex<u64>,
+    /// Waiters sleep here until the generation changes.
+    pub changed: parking_lot::Condvar,
+}
+
 impl OrbisKernel {
     /// Create a new kernel instance with default configuration.
     pub fn new() -> Self {
@@ -337,6 +446,7 @@ impl OrbisKernel {
             pthread_mutexes: DashMap::new(),
             pthread_mutex_attrs: DashMap::new(),
             pthread_rwlocks: DashMap::new(),
+            pthread_conds: DashMap::new(),
             pthread_attrs: DashMap::new(),
             kernel_event_flags: DashMap::new(),
             kernel_event_flag_next: std::sync::atomic::AtomicU64::new(1),
@@ -345,7 +455,22 @@ impl OrbisKernel {
             kernel_equeues: DashMap::new(),
             kernel_equeue_events: DashMap::new(),
             kernel_equeue_next: std::sync::atomic::AtomicU64::new(1),
-            agc_default_owner: std::sync::atomic::AtomicU32::new(0),
+            agc_default_owner: std::sync::atomic::AtomicU32::new(1),
+            agc_resource_registration_initialized: std::sync::atomic::AtomicBool::new(false),
+            agc_resource_registration_max_owners: std::sync::atomic::AtomicU32::new(0),
+            agc_next_owner: std::sync::atomic::AtomicU32::new(1),
+            agc_resource_owners: DashMap::new(),
+            agc_next_resource: std::sync::atomic::AtomicU32::new(1),
+            agc_resources: DashMap::new(),
+            agc_submission_count: std::sync::atomic::AtomicU64::new(0),
+            agc_draw_packet_count: std::sync::atomic::AtomicU64::new(0),
+            agc_dispatch_packet_count: std::sync::atomic::AtomicU64::new(0),
+            agc_flip_packet_count: std::sync::atomic::AtomicU64::new(0),
+            agc_last_dcb_address: std::sync::atomic::AtomicU64::new(0),
+            agc_last_dcb_dwords: std::sync::atomic::AtomicU32::new(0),
+            video_out_buffers: DashMap::new(),
+            libc_mspaces: DashMap::new(),
+            libc_mspace_allocations: DashMap::new(),
             ampr_write_offsets: DashMap::new(),
             fiber_context_size_check: std::sync::atomic::AtomicU32::new(0),
             kernel_sockets: DashMap::new(),
@@ -353,6 +478,15 @@ impl OrbisKernel {
             pthread_tls_keys: DashMap::new(),
             pthread_tls_values: DashMap::new(),
             dynamic_tls_blocks: DashMap::new(),
+            errno_slots: DashMap::new(),
+            save_data_transaction_resources: DashMap::new(),
+            save_data_next_transaction_resource: std::sync::atomic::AtomicI32::new(0),
+            save_data_params: DashMap::new(),
+            thread_dtors_callback: std::sync::atomic::AtomicU64::new(0),
+            thread_atexit_count_callback: std::sync::atomic::AtomicU64::new(0),
+            thread_atexit_report_callback: std::sync::atomic::AtomicU64::new(0),
+            application_heap_api: std::sync::atomic::AtomicU64::new(0),
+            text_to_speech2_initialized: std::sync::atomic::AtomicBool::new(false),
             pthread_tls_next_key: std::sync::atomic::AtomicI32::new(0),
             http_contexts: DashMap::new(),
             http_next_context: std::sync::atomic::AtomicI32::new(0),
@@ -360,6 +494,8 @@ impl OrbisKernel {
             http_next_template: std::sync::atomic::AtomicI32::new(0x1000),
             http2_contexts: DashMap::new(),
             http2_next_context: std::sync::atomic::AtomicI32::new(0),
+            http2_templates: DashMap::new(),
+            http2_next_template: std::sync::atomic::AtomicI32::new(0x1000),
             ssl_contexts: DashMap::new(),
             ssl_next_context: std::sync::atomic::AtomicI32::new(0),
         }

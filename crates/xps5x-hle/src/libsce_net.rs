@@ -35,6 +35,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceNet", "sceNetNtohl", hle_htonl); // symmetric byte swap
     registry.register("libSceNet", "sceNetNtohs", hle_htons);
     registry.register("libSceNet", "sceNetGetMacAddress", hle_get_mac_address);
+    registry.register("libSceNet", "sceNetEtherNtostr", hle_ether_ntostr);
 
     registry.register("libSceNetCtl", "sceNetCtlInit", hle_ok);
     registry.register("libSceNetCtl", "sceNetCtlTerm", hle_ok);
@@ -74,6 +75,32 @@ fn hle_get_mac_address(ctx: &HleContext, args: &[u64]) -> u64 {
         return NET_ERROR_INVALID_ARGUMENT;
     }
     debug!("sceNetGetMacAddress(addr={addr:#x}) -> 00:00:00:00:00:00");
+    SCE_OK
+}
+
+/// `sceNetEtherNtostr(const SceNetEtherAddr *addr, char *str, size_t len)`:
+/// render the six-byte Ethernet address as a lower-case, colon-separated
+/// string. The ABI requires an 18-byte destination including the terminator.
+fn hle_ether_ntostr(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    let output = args.get(1).copied().unwrap_or(0);
+    let len = args.get(2).copied().unwrap_or(0);
+    if addr == 0 || output == 0 || len != 18 {
+        return NET_ERROR_INVALID_ARGUMENT;
+    }
+
+    let mut mac = [0u8; 6];
+    if !ctx.mem.read(addr, &mut mac) {
+        return NET_ERROR_INVALID_ARGUMENT;
+    }
+    let text = format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\0",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    );
+    if !ctx.mem.write(output, text.as_bytes()) {
+        return NET_ERROR_INVALID_ARGUMENT;
+    }
+    debug!("sceNetEtherNtostr(addr={addr:#x}) -> {}", &text[..17]);
     SCE_OK
 }
 

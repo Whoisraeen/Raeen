@@ -23,6 +23,7 @@
 //!                    Host GPU (Vulkan 1.3)
 //! ```
 
+pub mod agc;
 pub mod backend;
 pub mod gnm;
 pub mod metal;

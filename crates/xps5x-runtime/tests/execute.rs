@@ -24,7 +24,8 @@ use xps5x_firmware::{
 use xps5x_hle::{HleContext, HleRegistry};
 use xps5x_kernel::OrbisKernel;
 use xps5x_runtime::{
-    GUEST_ARENA_BASE, RunOutcome, RuntimeError, execute_linked, execute_process, fsbase_rearm_count,
+    GUEST_ARENA_BASE, RunOutcome, RuntimeError, execute_linked, execute_process,
+    execute_process_shared, fsbase_rearm_count,
 };
 
 const R_X86_64_JUMP_SLOT: u64 = 7;
@@ -187,6 +188,279 @@ fn sentinel_call_through_real_lm1_linker_dispatches_to_hle() {
         result, 0xC0DE,
         "guest RAX after the trapped HLE call is the sentinel's return value"
     );
+}
+
+/// A guest callback requested by an HLE function must execute in the active
+/// guest context and return to the instruction after the original import
+/// call. `pthread_once` is the first consumer, but the context-transfer
+/// mechanism is intentionally generic for callbacks used by other PS5 APIs.
+#[test]
+fn pthread_once_runs_its_guest_initializer_before_returning() {
+    const ENTRY_OFF: usize = 0x00;
+    const INIT_OFF: usize = 0x40;
+    const SLOT_OFF: usize = 0x70;
+    const ONCE_OFF: usize = 0x80;
+    const RESULT_OFF: usize = 0x88;
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+
+    // lea rdi, [rip + once_control]
+    image[0x00..0x07].copy_from_slice(&[0x48, 0x8D, 0x3D, 0x79, 0x00, 0x00, 0x00]);
+    // lea rsi, [rip + initializer]
+    image[0x07..0x0E].copy_from_slice(&[0x48, 0x8D, 0x35, 0x32, 0x00, 0x00, 0x00]);
+    // call qword ptr [rip + import_slot]
+    image[0x0E..0x14].copy_from_slice(&[0xFF, 0x15, 0x5C, 0x00, 0x00, 0x00]);
+    // Call the same once-control again. Its initializer must not repeat.
+    image[0x14..0x1A].copy_from_slice(&[0xFF, 0x15, 0x56, 0x00, 0x00, 0x00]);
+    // mov eax, dword ptr [rip + result]; ret
+    image[0x1A..0x21].copy_from_slice(&[0x8B, 0x05, 0x68, 0x00, 0x00, 0x00, 0xC3]);
+
+    // initializer: inc dword ptr [rip + result]; ret
+    image[INIT_OFF..INIT_OFF + 7].copy_from_slice(&[0xFF, 0x05, 0x42, 0x00, 0x00, 0x00, 0xC3]);
+    image[SLOT_OFF..SLOT_OFF + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: vec![HleTrampoline {
+            library: "libkernel".to_string(),
+            function: "scePthreadOnce".to_string(),
+            addr: HLE_TRAMPOLINE_BASE,
+        }],
+        entry: ENTRY_OFF as u64,
+        tls: None,
+        procparam_offset: None,
+    };
+
+    let kernel = OrbisKernel::new();
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[])
+        .expect("pthread_once guest initializer must execute and return");
+    assert_eq!(result, 1, "the once initializer must run exactly once");
+
+    // Keep the offsets used above honest if the fixture is edited.
+    assert_eq!(ONCE_OFF, 0x80);
+    assert_eq!(RESULT_OFF, 0x88);
+}
+
+fn emit_indirect_call(image: &mut [u8], off: &mut usize, slot: usize) {
+    let after = *off as i64 + 6;
+    let disp = (slot as i64 - after) as i32;
+    image[*off..*off + 2].copy_from_slice(&[0xFF, 0x15]);
+    image[*off + 2..*off + 6].copy_from_slice(&disp.to_le_bytes());
+    *off += 6;
+}
+
+/// M1-E runtime scaffold: `scePthreadCreate` launches a genuinely
+/// distinct OS thread with its own TCB, the worker survives a forced sleep,
+/// reads `fs:0x28`, reports its distinct guest handle, and join returns that
+/// value to the main guest context.
+#[test]
+fn pthread_create_join_runs_a_real_guest_worker_with_tls() {
+    const WORKER: usize = 0x100;
+    const THREAD_OUT: usize = 0x180;
+    const RETVAL_OUT: usize = 0x188;
+    const CREATE_SLOT: usize = 0x1C0;
+    const JOIN_SLOT: usize = 0x1C8;
+    const EXIT_SLOT: usize = 0x1D0;
+    const USLEEP_SLOT: usize = 0x1D8;
+    const GETTID_SLOT: usize = 0x1E0;
+
+    let hle = std::sync::Arc::new(HleRegistry::new());
+    let kernel = std::sync::Arc::new(OrbisKernel::new());
+    let mut image = vec![0u8; 0x300];
+
+    let thread_out = GUEST_ARENA_BASE + THREAD_OUT as u64;
+    let retval_out = GUEST_ARENA_BASE + RETVAL_OUT as u64;
+    let worker = GUEST_ARENA_BASE + WORKER as u64;
+    let mut off = 0;
+    image[off..off + 2].copy_from_slice(&[0x48, 0xBF]); // mov rdi, thread_out
+    image[off + 2..off + 10].copy_from_slice(&thread_out.to_le_bytes());
+    off += 10;
+    image[off..off + 2].copy_from_slice(&[0x31, 0xF6]); // xor esi, esi
+    off += 2;
+    image[off..off + 2].copy_from_slice(&[0x48, 0xBA]); // mov rdx, worker
+    image[off + 2..off + 10].copy_from_slice(&worker.to_le_bytes());
+    off += 10;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x31, 0xC9]); // xor rcx, rcx
+    off += 3;
+    emit_indirect_call(&mut image, &mut off, CREATE_SLOT);
+    image[off..off + 2].copy_from_slice(&[0x48, 0xA1]); // mov rax, [thread_out]
+    image[off + 2..off + 10].copy_from_slice(&thread_out.to_le_bytes());
+    off += 10;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
+    off += 3;
+    image[off..off + 2].copy_from_slice(&[0x48, 0xBE]); // mov rsi, retval_out
+    image[off + 2..off + 10].copy_from_slice(&retval_out.to_le_bytes());
+    off += 10;
+    emit_indirect_call(&mut image, &mut off, JOIN_SLOT);
+    image[off..off + 2].copy_from_slice(&[0x48, 0xA1]); // mov rax, [retval_out]
+    image[off + 2..off + 10].copy_from_slice(&retval_out.to_le_bytes());
+    off += 10;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
+    off += 3;
+    emit_indirect_call(&mut image, &mut off, EXIT_SLOT);
+
+    off = WORKER;
+    image[off] = 0xBF; // mov edi, 20000
+    image[off + 1..off + 5].copy_from_slice(&20_000u32.to_le_bytes());
+    off += 5;
+    emit_indirect_call(&mut image, &mut off, USLEEP_SLOT);
+    image[off..off + 9].copy_from_slice(&[0x64, 0x48, 0x8B, 0x04, 0x25, 0x28, 0, 0, 0]); // mov rax, fs:[0x28]
+    off += 9;
+    emit_indirect_call(&mut image, &mut off, GETTID_SLOT);
+    image[off] = 0xC3;
+
+    for (slot, index) in [
+        (CREATE_SLOT, 0u64),
+        (JOIN_SLOT, 1),
+        (EXIT_SLOT, 2),
+        (USLEEP_SLOT, 3),
+        (GETTID_SLOT, 4),
+    ] {
+        image[slot..slot + 8].copy_from_slice(&(HLE_TRAMPOLINE_BASE + index * 8).to_le_bytes());
+    }
+    let linked = std::sync::Arc::new(LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: vec![
+            HleTrampoline {
+                library: "libkernel".into(),
+                function: "scePthreadCreate".into(),
+                addr: HLE_TRAMPOLINE_BASE,
+            },
+            HleTrampoline {
+                library: "libkernel".into(),
+                function: "scePthreadJoin".into(),
+                addr: HLE_TRAMPOLINE_BASE + 8,
+            },
+            HleTrampoline {
+                library: "libc".into(),
+                function: "exit".into(),
+                addr: HLE_TRAMPOLINE_BASE + 16,
+            },
+            HleTrampoline {
+                library: "libkernel".into(),
+                function: "sceKernelUsleep".into(),
+                addr: HLE_TRAMPOLINE_BASE + 24,
+            },
+            HleTrampoline {
+                library: "libkernel".into(),
+                function: "scePthreadGetthreadid".into(),
+                addr: HLE_TRAMPOLINE_BASE + 32,
+            },
+        ],
+        entry: 0,
+        tls: None,
+        procparam_offset: None,
+    });
+
+    let outcome = execute_process_shared(linked, hle, kernel, &["/app0/eboot.bin"], &[])
+        .expect("real guest worker create/join must complete");
+    assert_eq!(outcome, RunOutcome::Exited(2));
+}
+
+#[test]
+fn detached_worker_is_reaped_before_the_fixed_guest_arena_is_reused() {
+    const WORKER: usize = 0x100;
+    const THREAD_OUT: usize = 0x180;
+    const CREATE_SLOT: usize = 0x1C0;
+    const DETACH_SLOT: usize = 0x1C8;
+    const EXIT_SLOT: usize = 0x1D0;
+    const USLEEP_SLOT: usize = 0x1D8;
+
+    let hle = std::sync::Arc::new(HleRegistry::new());
+    let kernel = std::sync::Arc::new(OrbisKernel::new());
+    let mut image = vec![0u8; 0x280];
+    let thread_out = GUEST_ARENA_BASE + THREAD_OUT as u64;
+    let worker = GUEST_ARENA_BASE + WORKER as u64;
+    let mut off = 0;
+    image[off..off + 2].copy_from_slice(&[0x48, 0xBF]);
+    image[off + 2..off + 10].copy_from_slice(&thread_out.to_le_bytes());
+    off += 10;
+    image[off..off + 2].copy_from_slice(&[0x31, 0xF6]);
+    off += 2;
+    image[off..off + 2].copy_from_slice(&[0x48, 0xBA]);
+    image[off + 2..off + 10].copy_from_slice(&worker.to_le_bytes());
+    off += 10;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x31, 0xC9]);
+    off += 3;
+    emit_indirect_call(&mut image, &mut off, CREATE_SLOT);
+    image[off..off + 2].copy_from_slice(&[0x48, 0xA1]);
+    image[off + 2..off + 10].copy_from_slice(&thread_out.to_le_bytes());
+    off += 10;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x89, 0xC7]);
+    off += 3;
+    emit_indirect_call(&mut image, &mut off, DETACH_SLOT);
+    image[off..off + 2].copy_from_slice(&[0x31, 0xFF]);
+    off += 2;
+    emit_indirect_call(&mut image, &mut off, EXIT_SLOT);
+
+    off = WORKER;
+    image[off] = 0xBF;
+    image[off + 1..off + 5].copy_from_slice(&20_000u32.to_le_bytes());
+    off += 5;
+    emit_indirect_call(&mut image, &mut off, USLEEP_SLOT);
+    image[off] = 0xC3;
+
+    for (slot, index) in [
+        (CREATE_SLOT, 0u64),
+        (DETACH_SLOT, 1),
+        (EXIT_SLOT, 2),
+        (USLEEP_SLOT, 3),
+    ] {
+        image[slot..slot + 8].copy_from_slice(&(HLE_TRAMPOLINE_BASE + index * 8).to_le_bytes());
+    }
+    let linked = std::sync::Arc::new(LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: vec![
+            HleTrampoline {
+                library: "libkernel".into(),
+                function: "scePthreadCreate".into(),
+                addr: HLE_TRAMPOLINE_BASE,
+            },
+            HleTrampoline {
+                library: "libkernel".into(),
+                function: "scePthreadDetach".into(),
+                addr: HLE_TRAMPOLINE_BASE + 8,
+            },
+            HleTrampoline {
+                library: "libc".into(),
+                function: "exit".into(),
+                addr: HLE_TRAMPOLINE_BASE + 16,
+            },
+            HleTrampoline {
+                library: "libkernel".into(),
+                function: "sceKernelUsleep".into(),
+                addr: HLE_TRAMPOLINE_BASE + 24,
+            },
+        ],
+        entry: 0,
+        tls: None,
+        procparam_offset: None,
+    });
+
+    for run in 0..2 {
+        let outcome = execute_process_shared(
+            std::sync::Arc::clone(&linked),
+            std::sync::Arc::clone(&hle),
+            std::sync::Arc::clone(&kernel),
+            &["/app0/eboot.bin"],
+            &[],
+        )
+        .unwrap_or_else(|error| panic!("run {run} must safely reuse fixed mappings: {error}"));
+        assert_eq!(outcome, RunOutcome::Exited(0));
+    }
 }
 
 /// A guest `call` to a per-NID unresolved stub must name **which import** the
@@ -1369,6 +1643,55 @@ fn guest_clobbering_r15_does_not_corrupt_host_rsp() {
         "a guest that clobbers r15 and returns normally must not corrupt the host RSP — the RIP-relative \
          host-RSP restore must not depend on the guest preserving any register"
     );
+}
+
+/// M1-E C1 acceptance: returning guest code may destroy every SysV
+/// callee-saved GPR and must still recover the host context. A second run on
+/// the same host thread proves recovery did not leave latent corruption.
+#[test]
+fn guest_return_recovers_host_context_through_trampoline() {
+    const RETURN_VALUE: u64 = 0x1122_3344_5566_7788;
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+    let mut off = 0;
+    for prefix in [
+        [0x48, 0xBB], // rbx
+        [0x48, 0xBD], // rbp
+        [0x49, 0xBC], // r12
+        [0x49, 0xBD], // r13
+        [0x49, 0xBE], // r14
+        [0x49, 0xBF], // r15
+    ] {
+        image[off..off + 2].copy_from_slice(&prefix);
+        image[off + 2..off + 10].copy_from_slice(&0xDEAD_BEEF_CAFE_BABEu64.to_le_bytes());
+        off += 10;
+    }
+    image[off..off + 2].copy_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+    image[off + 2..off + 10].copy_from_slice(&RETURN_VALUE.to_le_bytes());
+    image[off + 10] = 0xC3; // ret
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: Vec::new(),
+        entry: 0,
+        tls: None,
+        procparam_offset: None,
+    };
+    let kernel = OrbisKernel::new();
+
+    for run in 1..=2 {
+        assert_eq!(
+            execute_linked(&linked, &hle, &kernel, 0, &[])
+                .expect("guarded guest return must recover the host context"),
+            RETURN_VALUE,
+            "run {run} must preserve the guest retval while restoring all host registers"
+        );
+    }
 }
 
 // --- RT2c-b: TLS via fsbase (design doc §3/§5's acceptance tests) ---

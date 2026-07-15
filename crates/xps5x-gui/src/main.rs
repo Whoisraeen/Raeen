@@ -70,7 +70,7 @@ fn main() -> anyhow::Result<()> {
                 &dyn_tags,
             )?,
         };
-        let hle = xps5x_hle::HleRegistry::new();
+        let hle = std::sync::Arc::new(xps5x_hle::HleRegistry::new());
         let db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
         let mut registry = xps5x_firmware::ModuleRegistry::new(db);
         registry.register_module_exports(&module.name, &dynlib_data.exports);
@@ -185,7 +185,7 @@ fn main() -> anyhow::Result<()> {
             .get(pos + 1)
             .ok_or_else(|| anyhow::anyhow!("--missing-nids requires a path to an eboot.bin"))?;
         let bytes = std::fs::read(path)?;
-        let hle = xps5x_hle::HleRegistry::new();
+        let hle = std::sync::Arc::new(xps5x_hle::HleRegistry::new());
         let db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
         let mut registry = xps5x_firmware::ModuleRegistry::new(db);
         let dir = std::path::Path::new(path)
@@ -249,16 +249,31 @@ fn main() -> anyhow::Result<()> {
             .get(pos + 1)
             .ok_or_else(|| anyhow::anyhow!("--run-eboot requires a path to an eboot.bin"))?;
         let bytes = std::fs::read(path)?;
-        let hle = xps5x_hle::HleRegistry::new();
+        let hle = std::sync::Arc::new(xps5x_hle::HleRegistry::new());
         let db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
         let mut registry = xps5x_firmware::ModuleRegistry::new(db);
-        let kernel = xps5x_kernel::OrbisKernel::new();
+        let kernel = std::sync::Arc::new(xps5x_kernel::OrbisKernel::new());
         // Load as a whole process: the eboot plus every DT_NEEDED .prx that
         // ships beside it (M1-D). A real title's imports are overwhelmingly
         // satisfied by those bundled libraries, not by HLE.
         let dir = std::path::Path::new(path)
             .parent()
             .unwrap_or(std::path::Path::new("."));
+        // `/app0` is the directory containing the selected title's eboot,
+        // for every title and every host layout. Never leave the VFS on its
+        // placeholder `games/current` mount during a real launch.
+        kernel.filesystem.set_game_directory(dir);
+        let title_dir = dir.file_name().unwrap_or_default();
+        let writable_root = std::env::temp_dir().join("xps5x").join(title_dir);
+        let temp_dir = writable_root.join("temp");
+        let download_dir = writable_root.join("download");
+        let savedata_dir = std::path::Path::new("savedata").join(title_dir);
+        for writable_dir in [&temp_dir, &download_dir, &savedata_dir] {
+            std::fs::create_dir_all(writable_dir)?;
+        }
+        kernel.filesystem.set_temp_directory(&temp_dir);
+        kernel.filesystem.set_download_directory(&download_dir);
+        kernel.filesystem.set_savedata_directory(&savedata_dir);
         let process = xps5x_firmware::load_process(
             &bytes,
             dir,
@@ -273,7 +288,7 @@ fn main() -> anyhow::Result<()> {
                 d.name, d.image_offset, d.exports, d.unresolved
             );
         }
-        let linked = process.linked;
+        let linked = std::sync::Arc::new(process.linked);
         info!(
             "loaded: entry={:#x} image={:#x} byte(s) resolved={} unresolved={}",
             linked.entry,
@@ -282,7 +297,13 @@ fn main() -> anyhow::Result<()> {
             linked.unresolved.len()
         );
         info!("entering guest _start via execute_process ...");
-        let outcome = xps5x_runtime::execute_process(&linked, &hle, &kernel, &[path.as_str()], &[]);
+        let outcome = xps5x_runtime::execute_process_shared(
+            std::sync::Arc::clone(&linked),
+            std::sync::Arc::clone(&hle),
+            std::sync::Arc::clone(&kernel),
+            &[path.as_str()],
+            &[],
+        );
         match &outcome {
             Ok(o) => info!("RESULT: {o:?}"),
             // The whole point of the per-NID unresolved stub: say WHICH import

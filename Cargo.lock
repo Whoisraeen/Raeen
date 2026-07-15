@@ -5179,6 +5179,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dashmap",
+ "getrandom 0.3.4",
  "memchr",
  "tracing",
  "xps5x-audio",

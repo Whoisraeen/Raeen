@@ -118,6 +118,14 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceAgc", "sceAgcDcbPopMarker", hle_dcb_pop_marker);
     registry.register("libSceAgc", "sceAgcCbDispatch", hle_cb_dispatch);
     registry.register("libSceAgc", "sceAgcCbNop", hle_cb_nop);
+    // Gen5 retail imports use this observed NID (`wr23dPKyWc0`). As with
+    // sceAgcInit, the recovered export name does not derive to that identity.
+    registry.register_nid(
+        "libSceAgc",
+        "sceAgcCbReleaseMem",
+        0xc2bd_b774_f2b2_59cd,
+        hle_cb_release_mem,
+    );
     registry.register("libSceAgc", "sceAgcDcbSetFlip", hle_dcb_set_flip);
     registry.register("libSceAgc", "sceAgcAcbResetQueue", hle_acb_reset_queue);
     registry.register(
@@ -125,7 +133,10 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcCbSetShRegisterRangeDirect",
         hle_cb_set_sh_register_range,
     );
-    registry.register("libSceAgc", "sceAgcInit", hle_init);
+    // Gen5 exports this known function under the observed NID
+    // `23LRUSvYu1M`. Bind that identity explicitly: deriving a NID from the
+    // recovered name does not produce the Gen5 import used by retail titles.
+    registry.register_nid("libSceAgc", "sceAgcInit", 0xdb72_d151_2bd8_bb53, hle_init);
     registry.register("libSceAgc", "sceAgcDcbEventWrite", hle_dcb_event_write);
     registry.register("libSceAgc", "sceAgcAcbEventWrite", hle_acb_event_write);
     // sceAgcAcbWriteData is an alias of sceAgcDcbWriteData in the reference
@@ -162,9 +173,10 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcCreateInterpolantMapping",
         hle_create_interpolant_mapping,
     );
-    registry.register(
+    registry.register_nid(
         "libSceAgc",
         "sceAgcGetDataPacketPayloadAddress",
+        0x57ef_9480_1b50_867d,
         hle_get_data_packet_payload_address,
     );
     registry.register(
@@ -188,6 +200,18 @@ pub fn register(registry: &HleRegistry) {
         "libSceAgc",
         "sceAgcDriverRegisterDefaultOwner",
         hle_driver_register_default_owner,
+    );
+    registry.register_nid(
+        "libSceAgcDriver",
+        "sceAgcDriverRegisterOwner",
+        0x5ff3_66e4_a2d1_11e8,
+        hle_driver_register_owner,
+    );
+    registry.register_nid(
+        "libSceAgcDriver",
+        "sceAgcDriverRegisterResource",
+        0x5b9c_f879_9ae3_11ab,
+        hle_driver_register_resource,
     );
     registry.register(
         "libSceAgc",
@@ -226,6 +250,21 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcDcbSetBaseIndirectArgs",
         hle_dcb_set_base_indirect_args,
     );
+    // Driver submission lives in libSceAgcDriver for Gen5 retail binaries.
+    // Keep the legacy libSceAgc registration for older fixtures, but bind
+    // both observed retail identities explicitly.
+    registry.register_nid(
+        "libSceAgcDriver",
+        "sceAgcDriverSubmitDcb",
+        0x5209_4921_98c6_b2c3,
+        hle_driver_submit_dcb,
+    );
+    registry.register_nid(
+        "libSceAgcDriver",
+        "sceAgcDriverAgrSubmitDcb",
+        0x0211_afa4_84eb_7f83,
+        hle_driver_submit_dcb,
+    );
     registry.register("libSceAgc", "sceAgcDriverSubmitDcb", hle_driver_submit_dcb);
     registry.register("libSceAgc", "sceAgcDriverSubmitAcb", hle_driver_submit_acb);
     registry.register(
@@ -252,6 +291,16 @@ pub fn register(registry: &HleRegistry) {
         "libSceAgc",
         "sceAgcWaitRegMemPatchAddress",
         hle_wait_reg_mem_patch_address,
+    );
+    // This Gen5 export patches the destination field of a WRITE_DATA packet.
+    // The retail identity (`fPSCdQxgpSw`) is newer than the named tables in
+    // the current references, but its ABI and field are established by the
+    // title's packet-copy relocation sequence.
+    registry.register_nid(
+        "libSceAgc",
+        "sceAgcWriteDataPatchAddress",
+        0x7cf4_8275_0c60_a52c,
+        hle_write_data_patch_address,
     );
     registry.register(
         "libSceAgc",
@@ -350,6 +399,109 @@ fn hle_driver_get_default_owner(ctx: &HleContext, args: &[u64]) -> u64 {
     0
 }
 
+/// `sceAgcDriverRegisterOwner(ownerOut, name)`: allocate a process-local
+/// resource-owner handle after resource registration has been initialized.
+fn hle_driver_register_owner(ctx: &HleContext, args: &[u64]) -> u64 {
+    use std::sync::atomic::Ordering;
+
+    let owner_out = args.first().copied().unwrap_or(0);
+    let name_address = args.get(1).copied().unwrap_or(0);
+    if owner_out == 0 || name_address == 0 {
+        tracing::warn!("sceAgcDriverRegisterOwner: null owner/name pointer");
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    let Some(name) = read_guest_cstring(
+        ctx,
+        name_address,
+        RESOURCE_REGISTRATION_MAX_NAME_LENGTH as usize - 1,
+    ) else {
+        tracing::warn!("sceAgcDriverRegisterOwner: name at {name_address:#x} is unreadable");
+        return SCE_ERROR_INVALID_ARGUMENT;
+    };
+    let max_owners = ctx
+        .kernel
+        .agc_resource_registration_max_owners
+        .load(Ordering::Acquire) as usize;
+    if max_owners != 0 && ctx.kernel.agc_resource_owners.len() >= max_owners {
+        tracing::warn!("sceAgcDriverRegisterOwner: owner table is full ({max_owners})");
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+
+    let default_owner = ctx.kernel.agc_default_owner.load(Ordering::Relaxed);
+    let owner = loop {
+        let candidate = ctx.kernel.agc_next_owner.fetch_add(1, Ordering::AcqRel);
+        if candidate == 0 {
+            return SCE_ERROR_INVALID_ARGUMENT;
+        }
+        if candidate != default_owner && !ctx.kernel.agc_resource_owners.contains_key(&candidate) {
+            break candidate;
+        }
+    };
+    ctx.kernel
+        .agc_resource_owners
+        .insert(owner, String::from_utf8_lossy(&name).into_owned());
+    if !ctx.mem.write(owner_out, &owner.to_le_bytes()) {
+        ctx.kernel.agc_resource_owners.remove(&owner);
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    debug!(
+        "sceAgcDriverRegisterOwner: owner={owner}, name={}",
+        String::from_utf8_lossy(&name)
+    );
+    0
+}
+
+/// `sceAgcDriverRegisterResource(handleOut, owner, address, size, name, type,
+/// flags)`: retain the guest allocation metadata and return a process-local
+/// handle. Resource tracking is also used by SDK revisions that do not call
+/// the optional user-memory registration initializer first.
+fn hle_driver_register_resource(ctx: &HleContext, args: &[u64]) -> u64 {
+    use std::sync::atomic::Ordering;
+
+    let handle_out = args.first().copied().unwrap_or(0);
+    let owner = args.get(1).copied().unwrap_or(0) as u32;
+    let address = args.get(2).copied().unwrap_or(0);
+    let size = args.get(3).copied().unwrap_or(0);
+    let name_address = args.get(4).copied().unwrap_or(0);
+    let resource_type = args.get(5).copied().unwrap_or(0) as u32;
+    let flags = args.get(6).copied().unwrap_or(0) as u32;
+    let Some(name) = read_guest_cstring(
+        ctx,
+        name_address,
+        RESOURCE_REGISTRATION_MAX_NAME_LENGTH as usize - 1,
+    ) else {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    };
+    if handle_out == 0 || address == 0 || size == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    let default_owner = ctx.kernel.agc_default_owner.load(Ordering::Acquire);
+    if owner != default_owner && !ctx.kernel.agc_resource_owners.contains_key(&owner) {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+
+    let handle = ctx.kernel.agc_next_resource.fetch_add(1, Ordering::AcqRel);
+    if handle == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    ctx.kernel.agc_resources.insert(
+        handle,
+        xps5x_kernel::AgcResource {
+            owner,
+            address,
+            size,
+            name: String::from_utf8_lossy(&name).into_owned(),
+            resource_type,
+            flags,
+        },
+    );
+    if !ctx.mem.write(handle_out, &handle.to_le_bytes()) {
+        ctx.kernel.agc_resources.remove(&handle);
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
 /// `sceAgcDriverAddEqEvent(equeue, eventId, userData)`: register an Agc event on
 /// the event queue (reuses the kernel event-queue user-event machinery).
 fn hle_driver_add_eq_event(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -409,7 +561,7 @@ fn hle_dcb_set_base_indirect_args(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 /// `sceAgcDriverSubmitDcb(packet)` / `sceAgcDriverSubmitAcb(owner, packet)`:
-/// validate the submission packet and its command-buffer pointer, then
+/// capture and structurally decode the submitted Gen5 PM4 command buffer, then
 /// succeed. (No real GPU submission yet — that arrives with the Vulkan backend;
 /// SharpEmu likewise only validates here.)
 fn hle_driver_submit_dcb(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -469,10 +621,69 @@ fn submit_validate(ctx: &HleContext, packet: u64) -> u64 {
     if packet == 0 {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
-    // The submission packet begins with a pointer to the command buffer.
-    let mut buf = [0u8; 8];
-    if !ctx.mem.read(packet, &mut buf) {
+    // Gen5's DCB submission descriptor is { u64 address, u32 dwords, u32 pad }.
+    let mut descriptor = [0u8; 16];
+    if !ctx.mem.read(packet, &mut descriptor) {
         return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    let command_address = u64::from_le_bytes(descriptor[0..8].try_into().unwrap());
+    let dword_count = u32::from_le_bytes(descriptor[8..12].try_into().unwrap());
+    if command_address == 0 || dword_count == 0 || dword_count > 1_000_000 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    let Some(byte_count) = (dword_count as usize).checked_mul(4) else {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    };
+    let mut bytes = vec![0u8; byte_count];
+    if !ctx.mem.read(command_address, &mut bytes) {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .collect();
+    let Ok(decoded) = xps5x_gpu::agc::decode_submission(&words) else {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    };
+
+    use std::sync::atomic::Ordering;
+    ctx.kernel
+        .agc_last_dcb_address
+        .store(command_address, Ordering::Relaxed);
+    ctx.kernel
+        .agc_last_dcb_dwords
+        .store(dword_count, Ordering::Relaxed);
+    let prior_submissions = ctx
+        .kernel
+        .agc_submission_count
+        .fetch_add(1, Ordering::Relaxed);
+    let prior_draws = ctx
+        .kernel
+        .agc_draw_packet_count
+        .fetch_add(u64::from(decoded.draw_packets), Ordering::Relaxed);
+    ctx.kernel
+        .agc_dispatch_packet_count
+        .fetch_add(u64::from(decoded.dispatch_packets), Ordering::Relaxed);
+    let prior_flips = ctx
+        .kernel
+        .agc_flip_packet_count
+        .fetch_add(decoded.flips.len() as u64, Ordering::Relaxed);
+
+    if prior_submissions == 0
+        || (prior_draws == 0 && decoded.draw_packets != 0)
+        || (prior_flips == 0 && !decoded.flips.is_empty())
+    {
+        tracing::info!(
+            command_address,
+            dword_count,
+            packets = decoded.packets.len(),
+            draws = decoded.draw_packets,
+            dispatches = decoded.dispatch_packets,
+            flips = decoded.flips.len(),
+            packet_layout = ?decoded.packets,
+            flip_layout = ?decoded.flips,
+            "captured AGC DCB submission"
+        );
     }
     0
 }
@@ -546,6 +757,21 @@ fn hle_wait_reg_mem_patch_address(ctx: &HleContext, args: &[u64]) -> u64 {
     0
 }
 
+/// Patch the destination address of a Gen5 WRITE_DATA packet. The packet
+/// stores the 64-bit address in DWORDs 2 and 3 (`command + 8`).
+fn hle_write_data_patch_address(ctx: &HleContext, args: &[u64]) -> u64 {
+    let command = args.first().copied().unwrap_or(0);
+    let address = args.get(1).copied().unwrap_or(0);
+    match packet_identity(ctx, command) {
+        Some((op, reg)) if op == IT_NOP && reg == R_WRITE_DATA => {}
+        _ => return SCE_ERROR_INVALID_ARGUMENT,
+    }
+    if !ctx.mem.write(command + 8, &address.to_le_bytes()) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
 /// Read a NUL-terminated guest C-string (up to `max` bytes, excluding the NUL).
 fn read_guest_cstring(ctx: &HleContext, addr: u64, max: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
@@ -606,13 +832,29 @@ fn hle_dcb_push_marker(ctx: &HleContext, args: &[u64]) -> u64 {
 /// `sceAgcDriverInitResourceRegistration(memory, memorySize, ownerCount)`:
 /// validate the resource-registration setup. (The registration state machine
 /// itself is not modelled; the call succeeds so a title's init proceeds.)
-fn hle_driver_init_resource_registration(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_driver_init_resource_registration(ctx: &HleContext, args: &[u64]) -> u64 {
+    use std::sync::atomic::Ordering;
+
     let memory = args.first().copied().unwrap_or(0);
     let memory_size = args.get(1).copied().unwrap_or(0);
     let owner_count = args.get(2).copied().unwrap_or(0);
     if memory == 0 || memory_size == 0 || owner_count == 0 || owner_count > u64::from(u32::MAX) {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
+    ctx.kernel.agc_resource_owners.clear();
+    ctx.kernel.agc_resources.clear();
+    ctx.kernel.agc_next_owner.store(1, Ordering::Release);
+    ctx.kernel.agc_next_resource.store(1, Ordering::Release);
+    ctx.kernel.agc_default_owner.store(1, Ordering::Release);
+    ctx.kernel
+        .agc_resource_registration_max_owners
+        .store(owner_count as u32, Ordering::Release);
+    ctx.kernel
+        .agc_resource_registration_initialized
+        .store(true, Ordering::Release);
+    debug!(
+        "sceAgcDriverInitResourceRegistration: memory={memory:#x}, size={memory_size:#x}, owners={owner_count}"
+    );
     0
 }
 
@@ -1548,6 +1790,57 @@ fn hle_cb_nop(ctx: &HleContext, args: &[u64]) -> u64 {
     addr
 }
 
+/// `sceAgcCbReleaseMem`: emit the Gen5 RELEASE_MEM synchronization packet.
+///
+/// The first six arguments arrive in registers and the remaining six on the
+/// guest stack; `HleContext` presents both sets as one ABI-ordered slice.
+fn hle_cb_release_mem(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let action = (args.get(1).copied().unwrap_or(0) & 0xff) as u32;
+    let gcr_control = (args.get(2).copied().unwrap_or(0) & 0xffff) as u32;
+    let destination = (args.get(3).copied().unwrap_or(0) & 0xff) as u32;
+    let cache_policy = (args.get(4).copied().unwrap_or(0) & 0xff) as u32;
+    let destination_address = args.get(5).copied().unwrap_or(0);
+    let data_selection = (args.get(6).copied().unwrap_or(0) & 0xff) as u32;
+    let data = args.get(7).copied().unwrap_or(0);
+    let gds_offset = (args.get(8).copied().unwrap_or(0) & 0xffff) as u32;
+    let gds_size = (args.get(9).copied().unwrap_or(0) & 0xffff) as u32;
+    let interrupt = (args.get(10).copied().unwrap_or(0) & 0xff) as u32;
+    let interrupt_context_id = args.get(11).copied().unwrap_or(0) as u32;
+
+    if cb == 0
+        || destination > 1
+        || data_selection > 3
+        || gds_offset != 0
+        || gds_size > 2
+        || interrupt > 3
+    {
+        return 0;
+    }
+
+    let Some(addr) = alloc_command_dwords(ctx, cb, 8) else {
+        return 0;
+    };
+    let dwords = [
+        pm4(8, IT_NOP, R_RELEASE_MEM),
+        action | (cache_policy << 8),
+        gcr_control | (data_selection << 16) | (interrupt << 24),
+        destination_address as u32,
+        (destination_address >> 32) as u32,
+        data as u32,
+        (data >> 32) as u32,
+        interrupt_context_id,
+    ];
+    if !dwords
+        .iter()
+        .enumerate()
+        .all(|(index, value)| ctx.mem.write(addr + index as u64 * 4, &value.to_le_bytes()))
+    {
+        return 0;
+    }
+    addr
+}
+
 /// `sceAgcDcbSetFlip(cb, videoOutHandle, displayBufferIndex, flipMode, flipArg)`:
 /// emit a flip packet (6 DWORDs).
 fn hle_dcb_set_flip(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -1828,6 +2121,63 @@ mod tests {
     }
 
     #[test]
+    fn cb_release_mem_emits_gen5_packet_and_validates_fields() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+
+        let address = 0x1234_5678_9abc_def0;
+        let data = 0x0fed_cba9_8765_4321;
+        let args = [
+            cb,
+            0x5a,
+            0x1234,
+            1,
+            0xa5,
+            address,
+            3,
+            data,
+            0,
+            2,
+            3,
+            0xdead_beef,
+        ];
+        assert_eq!(hle_cb_release_mem(&ctx, &args), 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(8, IT_NOP, R_RELEASE_MEM));
+        assert_eq!(read_u32(&ctx, 0x404), 0x0000_a55a);
+        assert_eq!(read_u32(&ctx, 0x408), 0x0303_1234);
+        assert_eq!(read_u32(&ctx, 0x40c), address as u32);
+        assert_eq!(read_u32(&ctx, 0x410), (address >> 32) as u32);
+        assert_eq!(read_u32(&ctx, 0x414), data as u32);
+        assert_eq!(read_u32(&ctx, 0x418), (data >> 32) as u32);
+        assert_eq!(read_u32(&ctx, 0x41c), 0xdead_beef);
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x420);
+
+        for invalid in [
+            [cb, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0],
+            [cb, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0],
+            [cb, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+            [cb, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0],
+            [cb, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0],
+        ] {
+            assert_eq!(hle_cb_release_mem(&ctx, &invalid), 0);
+            assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x420);
+        }
+
+        let registry = HleRegistry::new();
+        register(&registry);
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| {
+                    *nid == 0xc2bd_b774_f2b2_59cd && key == "libSceAgc::sceAgcCbReleaseMem"
+                })
+        );
+    }
+
+    #[test]
     fn set_sh_register_range_emits_marker_and_copies_values() {
         let (kernel, mem, alloc) = ctx_env();
         let ctx = test_ctx(&kernel, &mem, &alloc);
@@ -1872,6 +2222,16 @@ mod tests {
             hle_init(&ctx, &[0, 8]),
             SCE_ERROR_INVALID_ARGUMENT,
             "null state"
+        );
+
+        let registry = HleRegistry::new();
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| {
+                    *nid == 0xdb72_d151_2bd8_bb53 && key == "libSceAgc::sceAgcInit"
+                })
         );
 
         let cb = 0x40;
@@ -2114,10 +2474,40 @@ mod tests {
         let b = hle_dcb_set_base_indirect_args(&ctx, &[cb, 3, 0x1234_5678_9ABC_DEF8]);
         assert_eq!(read_u32(&ctx, b), pm4(4, IT_SET_BASE, R_ZERO) | (3 << 1));
         assert_eq!(read_u32(&ctx, b + 8), 0x9ABC_DEF8 & !7);
-        // Driver submit: validates the packet pointer + its CB pointer, succeeds.
-        assert!(ctx.mem.write(0x180, &0x400u64.to_le_bytes()));
+        // Driver submit captures and decodes the descriptor's complete DCB.
+        assert!(
+            ctx.mem
+                .write(0x900, &pm4(2, IT_NOP, R_DRAW_INDEX_AUTO).to_le_bytes())
+        );
+        assert!(ctx.mem.write(0x904, &3u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x180, &0x900u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x188, &2u32.to_le_bytes()));
         assert_eq!(hle_driver_submit_dcb(&ctx, &[0x180]), 0);
         assert_eq!(hle_driver_submit_acb(&ctx, &[7, 0x180]), 0);
+        assert_eq!(
+            kernel
+                .agc_submission_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            kernel
+                .agc_draw_packet_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            kernel
+                .agc_last_dcb_address
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0x900
+        );
+        assert_eq!(
+            kernel
+                .agc_last_dcb_dwords
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
         assert_eq!(
             hle_driver_submit_dcb(&ctx, &[0]),
             SCE_ERROR_INVALID_ARGUMENT
@@ -2148,6 +2538,76 @@ mod tests {
         assert_eq!(
             hle_driver_get_default_owner(&ctx, &[0]),
             SCE_ERROR_INVALID_ARGUMENT
+        );
+        assert!(ctx.mem.write(0x180, b"renderer\0"));
+        assert_eq!(
+            hle_driver_register_owner(&ctx, &[0x140, 0x180]),
+            0,
+            "SDKs may use driver-owned tracking without a user-memory arena"
+        );
+        assert_eq!(
+            hle_driver_init_resource_registration(&ctx, &[0x1000, 0x800, 4]),
+            0
+        );
+        assert_eq!(hle_driver_register_owner(&ctx, &[0x140, 0x180]), 0);
+        let owner = read_u32(&ctx, 0x140);
+        assert_ne!(owner, 0);
+        assert_ne!(owner, 42, "default owner handle is reserved");
+        assert_eq!(
+            kernel
+                .agc_resource_owners
+                .get(&owner)
+                .map(|entry| entry.value().clone()),
+            Some("renderer".to_owned())
+        );
+        assert!(ctx.mem.write(0x1A0, b"framebuffer\0"));
+        assert_eq!(
+            hle_driver_register_resource(&ctx, &[0x160, owner as u64, 0x500, 0x80, 0x1A0, 3, 7]),
+            0
+        );
+        let resource = read_u32(&ctx, 0x160);
+        let metadata = kernel.agc_resources.get(&resource).unwrap();
+        assert_eq!(metadata.owner, owner);
+        assert_eq!(metadata.address, 0x500);
+        assert_eq!(metadata.size, 0x80);
+        assert_eq!(metadata.name, "framebuffer");
+        assert_eq!(metadata.resource_type, 3);
+        assert_eq!(metadata.flags, 7);
+        let registry = HleRegistry::new();
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| {
+                    *nid == 0x5ff3_66e4_a2d1_11e8
+                        && key == "libSceAgcDriver::sceAgcDriverRegisterOwner"
+                })
+        );
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| {
+                    *nid == 0x5b9c_f879_9ae3_11ab
+                        && key == "libSceAgcDriver::sceAgcDriverRegisterResource"
+                })
+        );
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| {
+                    *nid == 0x5209_4921_98c6_b2c3 && key == "libSceAgcDriver::sceAgcDriverSubmitDcb"
+                })
+        );
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| {
+                    *nid == 0x0211_afa4_84eb_7f83
+                        && key == "libSceAgcDriver::sceAgcDriverAgrSubmitDcb"
+                })
         );
         // AddEqEvent on an unknown queue → NOT_FOUND; on a real one → OK.
         assert_eq!(
@@ -2200,6 +2660,33 @@ mod tests {
         );
         assert_eq!(hle_wait_reg_mem_patch_address(&ctx, &[0x300, 0xBB00]), 0);
         assert_eq!(read_u64(&ctx, 0x300 + 4), 0xBB00);
+
+        // WRITE_DATA destination address lives at +8.
+        assert!(
+            ctx.mem
+                .write(0x380, &pm4(6, IT_NOP, R_WRITE_DATA).to_le_bytes())
+        );
+        assert_eq!(
+            hle_write_data_patch_address(&ctx, &[0x380, 0x1234_5678_9000]),
+            0
+        );
+        assert_eq!(read_u64(&ctx, 0x380 + 8), 0x1234_5678_9000);
+        assert!(ctx.mem.write(0x380, &pm4(6, IT_NOP, R_ZERO).to_le_bytes()));
+        assert_eq!(
+            hle_write_data_patch_address(&ctx, &[0x380, 1]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+
+        let registry = HleRegistry::new();
+        register(&registry);
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| {
+                    *nid == 0x7cf4_8275_0c60_a52c && key == "libSceAgc::sceAgcWriteDataPatchAddress"
+                })
+        );
     }
 
     #[test]
@@ -2231,6 +2718,18 @@ mod tests {
         assert_eq!(
             hle_get_data_packet_payload_address(&ctx, &[0, command, 0]),
             SCE_ERROR_INVALID_ARGUMENT
+        );
+
+        let registry = HleRegistry::new();
+        register(&registry);
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| {
+                    *nid == 0x57ef_9480_1b50_867d
+                        && key == "libSceAgc::sceAgcGetDataPacketPayloadAddress"
+                })
         );
     }
 

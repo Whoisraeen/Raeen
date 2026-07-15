@@ -39,6 +39,12 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register("libSceHttp", "sceHttpTerm", hle_http_term);
     registry.register("libSceHttp2", "sceHttp2Init", hle_http2_init);
+    registry.register_nid(
+        "libSceHttp2",
+        "sceHttp2CreateTemplate",
+        0xfb00_aded_f0a2_8e09,
+        hle_http2_create_template,
+    );
     registry.register("libSceHttp2", "sceHttp2Term", hle_http2_term);
 }
 
@@ -114,15 +120,33 @@ fn hle_http2_init(ctx: &HleContext, args: &[u64]) -> u64 {
     id as u32 as u64
 }
 
+/// `sceHttp2CreateTemplate(contextId, userAgent, httpVersion,
+/// autoProxyConfig)`: allocate a template owned by a live HTTP2 context.
+fn hle_http2_create_template(ctx: &HleContext, args: &[u64]) -> u64 {
+    let context_id = args.first().copied().unwrap_or(0) as i32;
+    if !ctx.kernel.http2_contexts.contains_key(&context_id) {
+        return HTTP2_ERROR_INVALID_ID;
+    }
+    let id = ctx
+        .kernel
+        .http2_next_template
+        .fetch_add(1, Ordering::Relaxed)
+        + 1;
+    ctx.kernel.http2_templates.insert(id, context_id);
+    id as u32 as u64
+}
+
 /// `sceHttp2Term(contextId)`: removes the context, or reports an invalid-id
 /// error if it was not registered.
 fn hle_http2_term(ctx: &HleContext, args: &[u64]) -> u64 {
     let context_id = args.first().copied().unwrap_or(0) as i32;
-    if ctx.kernel.http2_contexts.remove(&context_id).is_some() {
-        OK
-    } else {
-        HTTP2_ERROR_INVALID_ID
+    if ctx.kernel.http2_contexts.remove(&context_id).is_none() {
+        return HTTP2_ERROR_INVALID_ID;
     }
+    ctx.kernel
+        .http2_templates
+        .retain(|_, owner| *owner != context_id);
+    OK
 }
 
 #[cfg(test)]
@@ -192,7 +216,26 @@ mod tests {
             HTTP2_ERROR_INVALID_ARGUMENT
         );
         assert_eq!(hle_http2_init(&ctx, &[0, 0, 0x1000, 4]), 1);
+        assert_eq!(
+            hle_http2_create_template(&ctx, &[99, 0x100, 3, 1]),
+            HTTP2_ERROR_INVALID_ID
+        );
+        assert_eq!(hle_http2_create_template(&ctx, &[1, 0x100, 3, 1]), 0x1001);
+        assert!(kernel.http2_templates.contains_key(&0x1001));
+
+        let registry = HleRegistry::new();
+        register(&registry);
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| {
+                    *nid == 0xfb00_aded_f0a2_8e09 && key == "libSceHttp2::sceHttp2CreateTemplate"
+                })
+        );
+
         assert_eq!(hle_http2_term(&ctx, &[1]), OK);
+        assert!(!kernel.http2_templates.contains_key(&0x1001));
         assert_eq!(hle_http2_term(&ctx, &[1]), HTTP2_ERROR_INVALID_ID);
     }
 }
