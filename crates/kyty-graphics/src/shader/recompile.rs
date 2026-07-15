@@ -3172,7 +3172,6 @@ fn s_shift_b64(
 }
 
 /// Kyty: `Recompile_S_Lshl_B64_Sdst2Ssrc02Ssrc1` (ShaderSpirv.cpp L3316).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_s_lshl_b64(
     index: u32,
     code: &ShaderCode,
@@ -3194,7 +3193,6 @@ fn recompile_s_lshl_b64(
 }
 
 /// Kyty: `Recompile_S_Lshr_B64_Sdst2Ssrc02Ssrc1` (ShaderSpirv.cpp L3384).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_s_lshr_b64(
     index: u32,
     code: &ShaderCode,
@@ -5050,6 +5048,29 @@ const fn f(
     }
 }
 
+/// Table row backed by a ported function that needs an SCC check.
+///
+/// The counterpart of [`f`] for the `S_*` scalar ops: Kyty's table carries a
+/// `SccCheck` per row (`Recompile_S_Lshl_B64_*` is `SCC_CHECK_NONZERO`), and the
+/// recompiler reads it to emit the right `scc` update. `f` hardcodes
+/// `SccCheck::None`, so wiring an SCC-bearing function through it would silently
+/// drop that update and produce a shader whose `scc` never changes.
+const fn fs(
+    func: InstRecompileFn,
+    type_: ShaderInstructionType,
+    format: Format,
+    param: Params,
+    scc_check: SccCheck,
+) -> RecompilerFunc {
+    RecompilerFunc {
+        func: RecompileFn::Func(func),
+        type_,
+        format,
+        param,
+        scc_check,
+    }
+}
+
 /// Table row whose Kyty function is not ported yet (scc_check = None).
 const fn ni(
     kyty_func: &'static str,
@@ -5183,8 +5204,8 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
         "%td_<index> = OpSelect %uint %tsb_<index> %t1_<index> %t3_<index>"), S::None),
 
     nis("Recompile_S_Bfe_U64_Sdst2Ssrc02Ssrc1",  3452, T::SBfeU64,  F::Sdst2Ssrc02Ssrc1, p2("", ""), S::NonZero),
-    nis("Recompile_S_Lshl_B64_Sdst2Ssrc02Ssrc1", 3316, T::SLshlB64, F::Sdst2Ssrc02Ssrc1, p2("", ""), S::NonZero),
-    nis("Recompile_S_Lshr_B64_Sdst2Ssrc02Ssrc1", 3384, T::SLshrB64, F::Sdst2Ssrc02Ssrc1, p2("", ""), S::NonZero),
+    fs(recompile_s_lshl_b64, T::SLshlB64, F::Sdst2Ssrc02Ssrc1, p2("", ""), S::NonZero),
+    fs(recompile_s_lshr_b64, T::SLshrB64, F::Sdst2Ssrc02Ssrc1, p2("", ""), S::NonZero),
 
     nis("Recompile_S_XXX_B32_SVdstSVsrc0SVsrc1", 3528, T::SAndB32,      F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseAnd %uint %t0_<index> %t1_<index>"), S::NonZero),
     nis("Recompile_S_XXX_B32_SVdstSVsrc0SVsrc1", 3528, T::SBfmB32,      F::SVdstSVsrc0SVsrc1, p3("%tcount_<index> = OpBitwiseAnd %uint %t0_<index> %uint_31", "%toffset_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpBitFieldInsert %uint %uint_0 %uint_0xffffffff %toffset_<index> %tcount_<index>"), S::None),
@@ -5504,6 +5525,8 @@ mod tests {
     fn dispatch_table_counts() {
         // Kyty: g_recomp_func (ShaderSpirv.cpp L6184) has 204 rows. C1
         // implements the minimal VS/PS subset; C2 flips the NI count to 0.
+        // Each row wired from the staged set must move these two numbers and
+        // arrive with a per-opcode test — see `s_lshl_b64_is_wired_and_shifts`.
         let table = recomp_func_table();
         let implemented = table
             .iter()
@@ -5515,8 +5538,8 @@ mod tests {
             .count();
         assert_eq!(table.len(), 204, "table must mirror Kyty row-for-row");
         assert_eq!(implemented + ni, table.len());
-        assert_eq!(implemented, 77, "C1 implemented subset");
-        assert_eq!(ni, 127, "C2 remainder");
+        assert_eq!(implemented, 79, "C1 implemented subset");
+        assert_eq!(ni, 125, "C2 remainder");
 
         // Kyty EXIT_IF(map->Contains(p)) — (type, format) keys are unique.
         let mut seen = std::collections::HashSet::new();
@@ -5556,6 +5579,35 @@ mod tests {
 
         // Unknown (type, format) pair -> None.
         assert!(recomp_func(T::VMovB32, F::Label).is_none());
+    }
+
+    /// The two 64-bit scalar shifts are wired, and wired **with their SCC
+    /// check intact**.
+    ///
+    /// Both were in the staged-but-unwired set (`#[allow(dead_code)]`): the
+    /// bodies existed and compiled, but no `(type, format)` row pointed at
+    /// them, so the recompiler reported them `NotImplemented` and any shader
+    /// using `S_LSHL_B64` failed. Wiring is not just flipping the row — Kyty
+    /// gives these `SCC_CHECK_NONZERO`, and routing them through `f()` (which
+    /// hardcodes `SccCheck::None`) would compile, pass a "is it Func?" check,
+    /// and silently never update `scc`. Hence `fs()`, and hence this test
+    /// asserts the check rather than only the wiring.
+    #[test]
+    fn s_shift_b64_rows_are_wired_with_their_scc_check() {
+        for (ty, name) in [(T::SLshlB64, "S_LSHL_B64"), (T::SLshrB64, "S_LSHR_B64")] {
+            let e = recomp_func(ty, F::Sdst2Ssrc02Ssrc1)
+                .unwrap_or_else(|| panic!("{name} must have a table row"));
+            assert!(
+                matches!(e.func, RecompileFn::Func(_)),
+                "{name} is staged and must be wired, not NotImplemented"
+            );
+            assert_eq!(
+                e.scc_check,
+                SccCheck::NonZero,
+                "{name} carries Kyty's SCC_CHECK_NONZERO; dropping it silently \
+                 leaves scc never updated"
+            );
+        }
     }
 
     #[test]
