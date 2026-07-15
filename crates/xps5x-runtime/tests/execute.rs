@@ -1765,6 +1765,53 @@ fn write_start_read_argv0_byte_and_jump_stub(buf: &mut [u8], entry_off: usize) {
     buf[entry_off + 8..entry_off + 10].copy_from_slice(&[0xFF, 0xE0]); // jmp rax
 }
 
+/// The **Orbis (PS4/PS5) `_start` ABI**: the entry is called like a function,
+/// `_start(EntryParams *params /* rdi */, void (*exit_fn)(void) /* rsi */)`,
+/// where `params` points at the `argc, argv[], ...` block — it does NOT read
+/// `argc` off the stack the way a Linux `_start` does.
+///
+/// This is not a guess: a real retail PS5 title's entry begins
+/// `push rbp; mov rbp,rsp; push r15; push r14; push rbx; push rax;`
+/// `mov r14d,[rdi]; mov rbx,rsi; lea r15,[rdi+8]` — i.e. argc from `[rdi]`,
+/// argv at `rdi+8`, exit_fn in `rsi`. With `rdi` left at 0 (as a bare `jmp`
+/// leaves it) that is a null dereference, and the title died ~10 bytes into
+/// its own entry before this was fixed.
+///
+/// Mirrors the `[rsp]` test below, but reads `argc` through `rdi`:
+/// `mov eax,[rdi]; jmp rax` faults with `Rip == argc == 1`.
+#[test]
+fn start_stub_observes_argc_via_rdi_per_the_orbis_entry_abi() {
+    const ENTRY_OFF: usize = 0x0;
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+    // mov eax, [rdi]   (8B 07)   -- argc, exactly like a real title's `mov r14d,[rdi]`
+    image[ENTRY_OFF..ENTRY_OFF + 2].copy_from_slice(&[0x8B, 0x07]);
+    // jmp rax          (FF E0)
+    image[ENTRY_OFF + 2..ENTRY_OFF + 4].copy_from_slice(&[0xFF, 0xE0]);
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: ENTRY_OFF as u64,
+        tls: None,
+        procparam_offset: None,
+    };
+
+    let kernel = OrbisKernel::new();
+    let err = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[]).unwrap_err();
+    match err {
+        RuntimeError::Faulted { addr } => assert_eq!(
+            addr, 1,
+            "argc read through rdi must equal 1 — the Orbis entry ABI passes the \
+             params block in rdi, not (only) on the stack"
+        ),
+        other => panic!("expected Err(Faulted {{ .. }}), got {other:?}"),
+    }
+}
+
 /// W1a acceptance test, part 1 (design doc §6/§8): a hand-assembled `_start`
 /// stub reads `argc` from `[rsp]` and jumps to it as an address. With a
 /// single `argv` entry (`argc == 1`), that fault's `Rip` is observably `1` --

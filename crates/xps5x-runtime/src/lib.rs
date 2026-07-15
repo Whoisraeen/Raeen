@@ -288,13 +288,12 @@ pub fn execute_process(
     // `entry_ptr` is a host address inside `arena`'s `PAGE_EXECUTE_READWRITE`
     // image sub-region, at `module.entry` (the ELF `e_entry`), which is the
     // only thing this crate ever executes (design doc §6). This function
-    // pointer is never actually *called* with these six registers as
-    // arguments (a `_start` entry ignores them and reads `argc`/`argv`/
-    // `envp` off the stack instead) — see `stack::enter_guest_at_start`'s doc
-    // comment — but the same fn-pointer type is reused here for consistency
-    // with `execute_linked`, since `entry_ptr` (a `*const u8`) needs some
+    // pointer is never actually *called* through this Rust type — the entry is
+    // reached by a bare `jmp` — but `entry_ptr` (a `*const u8`) needs some
     // callable type to become the address `enter_guest_at_start`'s asm jumps
-    // to.
+    // to, and the same fn-pointer type is reused here for consistency with
+    // `execute_linked`. The Orbis `_start(params, exit_fn)` register arguments
+    // are supplied explicitly below; see `stack::enter_guest_at_start`'s doc.
     let entry: unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> u64 =
         unsafe { core::mem::transmute::<*const u8, _>(entry_ptr) };
 
@@ -317,7 +316,17 @@ pub fn execute_process(
             // Same "no inner `unsafe {}`" note as `execute_linked`'s closure
             // above — already inside the outer `unsafe { dispatch::run(...)
             // }` block's scope.
-            || crate::stack::enter_guest_at_start(entry, process_rsp),
+            // Orbis `_start(params /* rdi */, exit_fn /* rsi */)`: `params`
+            // points at the `argc, argv[], NULL, envp[], NULL, auxv` block
+            // `build_process_stack` just wrote (which is exactly what
+            // `process_rsp` addresses), NOT at the stack in the Linux sense —
+            // a real title does `mov r14d,[rdi]` / `lea r15,[rdi+8]` and would
+            // null-deref with rdi=0. `exit_fn` is passed as 0 for now: a
+            // well-formed entry only calls it to terminate, and it reaches
+            // `exit` through its own import first (which the VEH answers with
+            // the exit-longjmp); a guest that does call it faults, which RT1a
+            // recovers as `Faulted` rather than crashing the host.
+            || crate::stack::enter_guest_at_start(entry, process_rsp, process_rsp, 0),
         )
     }
 }

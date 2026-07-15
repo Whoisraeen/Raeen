@@ -89,6 +89,51 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Diagnostic: `xps5x --run-eboot <eboot.bin>` drives the **real** launch
+    // path headlessly — exactly what the Shell does (`load_module` at
+    // `GUEST_ARENA_BASE`, then `execute_process` into the module's `_start` on a
+    // genuine argc/argv/envp/auxv stack) — and reports the outcome. Same
+    // `NoKeysProvider`: it never decrypts anything without a user-supplied key.
+    // This exists so a real title's execution can be observed (and its logs
+    // read) without standing up the GUI.
+    if let Some(pos) = args.iter().position(|a| a == "--run-eboot") {
+        let path = args
+            .get(pos + 1)
+            .ok_or_else(|| anyhow::anyhow!("--run-eboot requires a path to an eboot.bin"))?;
+        let bytes = std::fs::read(path)?;
+        let hle = xps5x_hle::HleRegistry::new();
+        let db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
+        let mut registry = xps5x_firmware::ModuleRegistry::new(db);
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let linked = xps5x_firmware::load_module(
+            &bytes,
+            &xps5x_firmware::NoKeysProvider,
+            &mut registry,
+            &hle,
+            xps5x_runtime::GUEST_ARENA_BASE,
+        )?;
+        info!(
+            "loaded: entry={:#x} image={:#x} byte(s) resolved={} unresolved={}",
+            linked.entry,
+            linked.image.len(),
+            linked.hle_trampolines.len(),
+            linked.unresolved.len()
+        );
+        info!("entering guest _start via execute_process ...");
+        let outcome = xps5x_runtime::execute_process(&linked, &hle, &kernel, &[path.as_str()], &[]);
+        match &outcome {
+            Ok(o) => info!("RESULT: {o:?}"),
+            Err(e) => info!("RESULT: {e:?}"),
+        }
+        let console = kernel.console.contents();
+        if console.is_empty() {
+            info!("guest console: <empty>");
+        } else {
+            info!("guest console ({} byte(s)):\n{console}", console.len());
+        }
+        return Ok(());
+    }
+
     info!("╔══════════════════════════════════════════════╗");
     info!(
         "║          XPS5X — PS5 Emulator v{}        ║",

@@ -238,12 +238,40 @@ pub(crate) unsafe fn call_on_guest_stack(
 /// never set up — a real `_start` reads `argc`/`argv`/`envp` off the stack,
 /// not out of registers, exactly like a kernel-invoked entry would.
 ///
+/// # The Orbis (PS4/PS5) `_start` ABI — registers, not just the stack
+///
+/// A Linux `_start` reads `argc` at `[rsp]`. **Orbis does not.** Its entry is
+/// shaped like a function the kernel calls:
+///
+/// ```text
+/// _start(EntryParams *params /* rdi */, void (*exit_fn)(void) /* rsi */)
+/// ```
+///
+/// where `params` points at the same `argc, argv[], NULL, envp[], NULL, auxv`
+/// block [`crate::process::build_process_stack`] already lays out. This is not
+/// a guess — it is exactly what a real retail PS5 title's entry does:
+///
+/// ```text
+/// push rbp; mov rbp,rsp; push r15; push r14; push rbx; push rax
+/// mov  r14d, [rdi]        ; argc = *(int *)params
+/// mov  rbx,  rsi          ; save the exit function
+/// lea  r15,  [rdi+8]      ; argv = params + 8
+/// ```
+///
+/// With `rdi` left at 0 (as a bare `jmp` leaves it) that `mov r14d,[rdi]` is a
+/// null dereference, and every real title dies ~10 bytes into its own entry.
+/// So `params_rdi`/`exit_fn_rsi` are set before the jump. `rsp` still points at
+/// the same block, which is harmless and keeps a Linux-shaped `_start` working
+/// too: the guest's pushes grow *down* from `rsp`, away from the block.
+///
 /// `clobber_abi("sysv64")` is kept for the same reason as
 /// `call_on_guest_stack`: the guest can do anything to the caller-saved
 /// register/XMM set before it (if ever) reaches the unreachable tail below.
 pub(crate) unsafe fn enter_guest_at_start(
     entry: unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> u64,
     process_rsp: u64,
+    params_rdi: u64,
+    exit_fn_rsi: u64,
 ) -> u64 {
     debug_assert_eq!(
         process_rsp % 16,
@@ -278,7 +306,10 @@ pub(crate) unsafe fn enter_guest_at_start(
             // `argc`, per `_start`'s ABI.
             "mov rsp, {guest_rsp}",
             // Transfer control WITHOUT pushing a return address: `entry`'s
-            // first instruction sees `[rsp] == argc`, unperturbed.
+            // first instruction sees `[rsp] == argc`, unperturbed. `rdi`/`rsi`
+            // carry the Orbis `_start(params, exit_fn)` arguments (see this
+            // function's doc comment) — bound as explicit register operands so
+            // they are live across the `jmp`.
             "jmp {entry_reg}",
             // Unreachable on every path this runtime exercises (see this
             // function's doc comment) — present only as defense in depth.
@@ -286,6 +317,8 @@ pub(crate) unsafe fn enter_guest_at_start(
             slot = sym HOST_RSP_SLOT,
             guest_rsp = in(reg) process_rsp,
             entry_reg = in(reg) entry_addr,
+            in("rdi") params_rdi,
+            in("rsi") exit_fn_rsi,
             lateout("rax") result,
             clobber_abi("sysv64"),
         );
