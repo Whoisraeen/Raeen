@@ -24,7 +24,12 @@ shader_cache/
 # User configuration (generated at runtime)
 config.toml
 
-# Game data (user-provided)
+# Game data (user-provided) — proprietary titles the user owns; NEVER commit
+# (clean-room boundary). Both cases listed explicitly: the canonical path is
+# `Games/<name>/eboot.bin` (CLAUDE.md), and a bare `games/` matched only by
+# accident of Windows' case-insensitive filesystem — it would NOT match on a
+# case-sensitive host (Linux, or a moved repo).
+Games/
 games/
 firmware/
 savedata/
