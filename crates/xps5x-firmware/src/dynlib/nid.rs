@@ -52,10 +52,40 @@ pub fn encode_nid(nid: u64) -> String {
     out
 }
 
+/// Decode a **variable-length** SCE base64 field into an integer.
+///
+/// A real import symbol is `<nid>#<library>#<module>` — e.g. `rTXw65xmLIA#l#l`.
+/// The `nid` is a full 11-char encoding of 8 bytes, but the library/module
+/// fields are small indices encoded in as few characters as they need (usually
+/// one or two). [`decode_nid`] cannot read those: it requires >= 8 decoded
+/// bytes and returns `None` for anything shorter, so every import's library and
+/// module index silently became 0 — which matches no `DT_SCE_IMPORT_LIB` entry
+/// (real ids start at 1), making it impossible to say which library an
+/// unresolved import belongs to.
+///
+/// This decodes MSB-first, 6 bits per character, over the same alphabet.
+/// Returns `None` on a character outside the alphabet, or if the value would
+/// exceed `u16` (indices are small by construction).
+pub fn decode_index(s: &str) -> Option<u16> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut acc: u32 = 0;
+    for ch in s.chars() {
+        let val = NID_ALPHABET.iter().position(|&a| a as char == ch)? as u32;
+        acc = acc.checked_mul(64)?.checked_add(val)?;
+        if acc > u16::MAX as u32 {
+            return None;
+        }
+    }
+    Some(acc as u16)
+}
+
 /// Decode an SCE base64 NID string back into a 64-bit NID.
 ///
 /// Returns `None` if the string contains a character outside the alphabet or
-/// decodes to fewer than 8 bytes.
+/// decodes to fewer than 8 bytes. For the short library/module index fields of
+/// an import symbol, use [`decode_index`] instead.
 pub fn decode_nid(s: &str) -> Option<u64> {
     let mut acc: u64 = 0;
     let mut bits: u32 = 0;

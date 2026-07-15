@@ -254,10 +254,16 @@ pub fn standard_dynamic_view(
     // Preserve any genuine SCE tags already present (e.g. DT_SCE_SYMTABSZ,
     // which real titles supply because standard ELF has no symtab-size tag),
     // plus DT_NEEDED so module names still resolve.
+    //
+    // Only the tags this function *mapped* above are skipped. Do NOT dedupe by
+    // tag generally: DT_NEEDED and DT_SCE_IMPORT_LIB are inherently REPEATED
+    // (one per dependency / imported library — ~50 each on a real title), so a
+    // "keep the first of each tag" filter silently drops all but one, leaving
+    // exactly one library name and one NEEDED entry.
     for &(t, v) in dyn_tags {
-        if (t == DT_NEEDED || (0x6100_0000..0x6200_0000).contains(&t))
-            && !out.iter().any(|&(ot, _)| ot == t)
-        {
+        let is_interesting = t == DT_NEEDED || (0x6100_0000..0x6200_0000).contains(&t);
+        let already_mapped = MAP.iter().any(|&(_, sce)| sce == t);
+        if is_interesting && !already_mapped {
             out.push((t, v));
         }
     }
@@ -514,8 +520,13 @@ fn decode_symbols(
             // back to 0 until the real (likely much simpler) index encoding
             // is confirmed against a real module.
             let mut parts = rest.unwrap_or("").split('#');
-            let library_index = parts.next().and_then(nid::decode_nid).unwrap_or(0) as u16;
-            let module_index = parts.next().and_then(nid::decode_nid).unwrap_or(0) as u16;
+            // `decode_index`, not `decode_nid`: these are short, variable-length
+            // fields (`<nid>#<lib>#<mod>`, e.g. `rTXw65xmLIA#l#l`), and
+            // `decode_nid` requires >= 8 decoded bytes so it returned None for
+            // every one of them — silently making every import's library index
+            // 0, which matches no DT_SCE_IMPORT_LIB entry (real ids start at 1).
+            let library_index = parts.next().and_then(nid::decode_index).unwrap_or(0);
+            let module_index = parts.next().and_then(nid::decode_index).unwrap_or(0);
             imports.push(SymbolRef {
                 nid: symbol_nid,
                 module_index,

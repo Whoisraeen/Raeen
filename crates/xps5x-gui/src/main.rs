@@ -113,7 +113,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             let mut ranked: Vec<_> = per_lib.into_iter().collect();
-            ranked.sort_by(|a, b| b.1.cmp(&a.1));
+            ranked.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
             println!("\nunresolved imports by library (implement these, most-wanted first):");
             for (lib, n) in ranked.iter().take(20) {
                 println!("  {n:>6}  {lib}");
