@@ -60,10 +60,16 @@ fn main() -> anyhow::Result<()> {
             Some(d) => xps5x_firmware::dynlib::parse_sce_dynamic(d)?,
             None => Vec::new(),
         };
-        let dynlib_data = xps5x_firmware::dynlib::parse_dynlibdata(
-            module.dynlib_data.as_deref().unwrap_or(&[]),
-            &dyn_tags,
-        )?;
+        // Two dynamic models: the PT_SCE_DYNLIBDATA blob (homebrew/.sprx) or
+        // standard vaddr-based tags with no such segment (real PS5 titles).
+        let standard = xps5x_firmware::dynlib::standard_dynamic_view(&module.segments, &dyn_tags);
+        let dynlib_data = match &standard {
+            Some((image, tags)) => xps5x_firmware::dynlib::parse_dynlibdata(image, tags)?,
+            None => xps5x_firmware::dynlib::parse_dynlibdata(
+                module.dynlib_data.as_deref().unwrap_or(&[]),
+                &dyn_tags,
+            )?,
+        };
         let hle = xps5x_hle::HleRegistry::new();
         let db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
         let mut registry = xps5x_firmware::ModuleRegistry::new(db);

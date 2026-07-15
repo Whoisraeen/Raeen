@@ -23,7 +23,7 @@
 pub mod linker;
 pub mod nid;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use xps5x_core::error::FirmwareError;
 
 /// SCE dynamic tags (see module docs). Values are the community-documented
@@ -33,6 +33,20 @@ use xps5x_core::error::FirmwareError;
 /// dependency module (M1-D, wall #4). OpenOrbis-style toolchains emit these
 /// alongside the SCE tags; each entry is a `.prx` the module expects loaded.
 const DT_NEEDED: u64 = 1;
+
+// The standard (non-SCE) dynamic tags. Real PS5 titles use these — with
+// **virtual addresses** — rather than the `DT_SCE_*` tags' offsets into a
+// `PT_SCE_DYNLIBDATA` blob. See [`standard_dynamic_view`].
+const DT_PLTRELSZ: u64 = 2;
+const DT_STRTAB: u64 = 5;
+const DT_SYMTAB: u64 = 6;
+const DT_RELA: u64 = 7;
+const DT_RELASZ: u64 = 8;
+const DT_RELAENT: u64 = 9;
+const DT_STRSZ: u64 = 10;
+const DT_SYMENT: u64 = 11;
+const DT_JMPREL: u64 = 23;
+
 const DT_SCE_HASH: u64 = 0x6100_0025;
 const DT_SCE_PLTRELSZ: u64 = 0x6100_002D;
 const DT_SCE_JMPREL: u64 = 0x6100_0029;
@@ -155,6 +169,91 @@ pub fn parse_sce_dynamic(dynamic_bytes: &[u8]) -> Result<Vec<(u64, u64)>, Firmwa
 /// undefined classification, and every relocation field. What's best-effort
 /// (`// TODO(LM1+): verify index encoding`): the `lib_id`/`mod_id` indices
 /// parsed from the `"<nid>#<lib_id>#<mod_id>"` strtab name convention.
+/// What [`standard_dynamic_view`] hands to [`parse_dynlibdata`]: a
+/// virtual-address-indexed image, and the `DT_SCE_*`-shaped tags whose values
+/// are offsets into it.
+pub type StandardDynamicView = (Vec<u8>, Vec<(u64, u64)>);
+
+/// Present a module that uses the **standard, vaddr-based** dynamic model as
+/// something [`parse_dynlibdata`] can consume.
+///
+/// Two dynamic models exist in the wild:
+///
+/// * **`PT_SCE_DYNLIBDATA` blob** — `DT_SCE_*` tags give *offsets into that
+///   blob*. This is what homebrew/`.sprx` fixtures use, and what
+///   [`parse_dynlibdata`] natively speaks.
+/// * **Standard tags** — `DT_STRTAB`/`DT_SYMTAB`/`DT_RELA`/`DT_JMPREL` give
+///   **virtual addresses**, and there is no `PT_SCE_DYNLIBDATA` segment at all.
+///   Real PS5 titles use this (verified on a retail eboot: `DT_STRTAB` =
+///   `0xe416840`, which is exactly a `PT_LOAD`'s `p_vaddr`).
+///
+/// Rather than duplicate the decoder, this flattens the `PT_LOAD` segments into
+/// an image **indexed by virtual address** — so a vaddr *is* an offset into it —
+/// and rewrites the standard tags to their `DT_SCE_*` equivalents with their
+/// values unchanged. `parse_dynlibdata(&image, &tags)` then works verbatim.
+///
+/// Returns `None` if this module doesn't use the standard model (no
+/// `DT_STRTAB`), so the caller can fall back to the blob path.
+///
+/// Size tags are carried across as-is; note real titles supply
+/// `DT_SCE_SYMTABSZ` even while addressing the symtab via standard `DT_SYMTAB`
+/// (standard ELF has no symtab-size tag), so both are consulted.
+pub fn standard_dynamic_view(
+    segments: &[crate::sprx::SprxSegment],
+    dyn_tags: &[(u64, u64)],
+) -> Option<StandardDynamicView> {
+    // No standard string table => not this model; let the caller use the blob.
+    tag_val(dyn_tags, DT_STRTAB)?;
+
+    // Flatten to a vaddr-indexed image: index == virtual address.
+    let end = segments
+        .iter()
+        .map(|s| s.vaddr.saturating_add(s.data.len() as u64))
+        .max()?;
+    let mut image = vec![0u8; usize::try_from(end).ok()?];
+    for seg in segments {
+        let at = usize::try_from(seg.vaddr).ok()?;
+        let stop = at.checked_add(seg.data.len())?;
+        image.get_mut(at..stop)?.copy_from_slice(&seg.data);
+    }
+
+    // Same value, SCE-equivalent tag: the vaddr is now an image offset.
+    const MAP: &[(u64, u64)] = &[
+        (DT_STRTAB, DT_SCE_STRTAB),
+        (DT_STRSZ, DT_SCE_STRSZ),
+        (DT_SYMTAB, DT_SCE_SYMTAB),
+        (DT_SYMENT, DT_SCE_SYMENT),
+        (DT_RELA, DT_SCE_RELA),
+        (DT_RELASZ, DT_SCE_RELASZ),
+        (DT_RELAENT, DT_SCE_RELAENT),
+        (DT_JMPREL, DT_SCE_JMPREL),
+        (DT_PLTRELSZ, DT_SCE_PLTRELSZ),
+    ];
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for &(std_tag, sce_tag) in MAP {
+        if let Some(v) = tag_val(dyn_tags, std_tag) {
+            out.push((sce_tag, v));
+        }
+    }
+    // Preserve any genuine SCE tags already present (e.g. DT_SCE_SYMTABSZ,
+    // which real titles supply because standard ELF has no symtab-size tag),
+    // plus DT_NEEDED so module names still resolve.
+    for &(t, v) in dyn_tags {
+        if (t == DT_NEEDED || (0x6100_0000..0x6200_0000).contains(&t))
+            && !out.iter().any(|&(ot, _)| ot == t)
+        {
+            out.push((t, v));
+        }
+    }
+
+    info!(
+        "module uses the standard vaddr-based dynamic model ({} tag(s) mapped, {:#x}-byte vaddr image)",
+        out.len(),
+        image.len()
+    );
+    Some((image, out))
+}
+
 pub fn parse_dynlibdata(blob: &[u8], dyn_tags: &[(u64, u64)]) -> Result<DynlibData, FirmwareError> {
     let strtab = match (
         tag_val(dyn_tags, DT_SCE_STRTAB),
