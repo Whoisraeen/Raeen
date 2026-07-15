@@ -198,11 +198,29 @@ fn hle_terminate(_ctx: &HleContext, _args: &[u64]) -> u64 {
 mod tests {
     use super::*;
     use crate::test_ctx;
+    use std::sync::{Mutex, MutexGuard};
 
-    fn reset() {
+    /// The dialog is a process-wide singleton — one at a time is the real API's
+    /// constraint, and the runtime's single-active-execution invariant (see
+    /// `xps5x_runtime::dispatch::CALL_LOCK`) means one guest process per host
+    /// process ever drives it. That is right for the HLE, but it leaves these
+    /// tests sharing one dialog while `cargo test` runs them on parallel
+    /// threads of a single process — so they must not interleave. Resetting at
+    /// the top of each test is not enough: it cannot stop another test's
+    /// `Initialize` from landing between this test's reset and its first call.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take the dialog for the duration of a test, from a known-`NONE` state.
+    /// The returned guard must be held (bind it, don't discard it) for the rest
+    /// of the test. Poisoning is ignored so that one failing test reports one
+    /// failure instead of cascading into the others.
+    #[must_use]
+    fn acquire_dialog() -> MutexGuard<'static, ()> {
+        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         STATUS.store(STATUS_NONE, Ordering::Relaxed);
         LAST_MODE.store(0, Ordering::Relaxed);
         LAST_USER_DATA.store(0, Ordering::Relaxed);
+        guard
     }
 
     fn env() -> (
@@ -219,7 +237,7 @@ mod tests {
 
     #[test]
     fn init_open_result_lifecycle_finishes_immediately() {
-        reset();
+        let _dialog = acquire_dialog();
         let (kernel, mem, alloc) = env();
         let ctx = test_ctx(&kernel, &mem, &alloc);
 
@@ -262,7 +280,7 @@ mod tests {
 
     #[test]
     fn errors_when_out_of_order() {
-        reset();
+        let _dialog = acquire_dialog();
         let (kernel, mem, alloc) = env();
         let ctx = test_ctx(&kernel, &mem, &alloc);
         // Open before init → NotInitialized.

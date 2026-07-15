@@ -5246,6 +5246,7 @@ name = "xps5x-runtime"
 version = "0.1.0"
 dependencies = [
  "thiserror 2.0.18",
+ "tracing",
  "windows-sys 0.59.0",
  "xps5x-core",
  "xps5x-firmware",
