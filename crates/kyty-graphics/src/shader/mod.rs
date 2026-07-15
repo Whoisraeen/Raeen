@@ -17,7 +17,9 @@
 pub mod analysis;
 pub mod hw_regs;
 pub mod parse;
+pub mod recompile;
 pub mod resources;
+pub mod spirv;
 pub mod types;
 
 pub use analysis::{
@@ -33,10 +35,18 @@ pub use hw_regs::{
     VertexShaderInfo,
 };
 pub use parse::{ShaderParseError, operand_parse, shader_parse};
+pub use recompile::{
+    InstRecompileFn, RecompileFn, RecompilerFunc, SccCheck, get_scc_check, recomp_func,
+    recomp_func_table, shader_recompile_cs, shader_recompile_ps, shader_recompile_vs, spirv_run,
+};
 pub use resources::{
     ShaderBindResources, ShaderBufferResource, ShaderComputeInputInfo, ShaderId, ShaderMappedData,
     ShaderPixelInputInfo, ShaderSamplerResource, ShaderSemantic, ShaderSharp,
     ShaderTextureResource, ShaderUserData, ShaderVertexInputBuffer, ShaderVertexInputInfo,
+};
+pub use spirv::{
+    ShaderRecompileError, Spirv, SpirvType, SpirvValue, spirv_generate_source,
+    spirv_get_embedded_ps, spirv_get_embedded_vs,
 };
 pub use types::{
     ShaderCode, ShaderConstant, ShaderControlFlowBlock, ShaderDebugPrintf, ShaderInstruction,
