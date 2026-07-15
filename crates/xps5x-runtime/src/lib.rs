@@ -393,7 +393,51 @@ pub fn execute_process(
             // `exit` through its own import first (which the VEH answers with
             // the exit-longjmp); a guest that does call it faults, which RT1a
             // recovers as `Faulted` rather than crashing the host.
-            || crate::stack::enter_guest_at_start(entry, process_rsp, process_rsp, 0),
+            || {
+                // Run every dependency's `module_start` (DT_INIT) FIRST, inside
+                // this same guarded session — a real loader initializes
+                // dependencies before entering the main module, and the guest
+                // relies on it: the measured title's own constructors call
+                // virtual methods on objects a dependency's constructors create.
+                //
+                // It must be here, not a separate `execute_linked` call: the
+                // arena is torn down when that returns, so anything the
+                // initializers wrote to guest memory would be discarded before
+                // `_start` ever saw it. Inside this closure they get the same
+                // arena, TCB, guest stack and HLE dispatch as the entry does.
+                //
+                // Orbis ABI (Kyty `RuntimeLinker::StartModule` -> `run_ini_fini`):
+                // `module_start(size_t args, const void *argp, module_func_t func)`,
+                // called `(0, NULL, NULL)` for a plain load. A failing
+                // initializer is logged, not fatal — a title whose optional
+                // module declines to start is still worth running as far as it
+                // goes, and a fault inside one is recovered by RT1a like any
+                // other guest fault.
+                for init in &module.module_inits {
+                    let Ok(ptr) = arena.entry_ptr(init.image_offset) else {
+                        tracing::warn!(
+                            "{}: module_start at +{:#x} is outside the image — skipping",
+                            init.name,
+                            init.image_offset
+                        );
+                        continue;
+                    };
+                    // SAFETY: same contract as `entry` above — `ptr` is a host
+                    // address inside `arena`'s PAGE_EXECUTE_READWRITE image
+                    // region, at an offset `load_process` took from the module's
+                    // own DT_INIT.
+                    let f: unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                        core::mem::transmute::<*const u8, _>(ptr);
+                    tracing::info!(
+                        "{}: calling module_start (+{:#x})",
+                        init.name,
+                        init.image_offset
+                    );
+                    let rc = crate::stack::call_on_guest_stack(f, [0, 0, 0, 0, 0, 0], process_rsp);
+                    tracing::info!("{}: module_start returned {rc:#x}", init.name);
+                }
+                crate::stack::enter_guest_at_start(entry, process_rsp, process_rsp, 0)
+            },
         )
     }
 }

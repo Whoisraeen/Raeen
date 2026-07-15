@@ -514,6 +514,27 @@ pub fn load_process(
     linked.hle_trampolines = tables.hle_trampolines().to_vec();
     linked.unresolved_stubs = tables.unresolved_stubs().to_vec();
 
+    // Each dependency's `module_start` (DT_INIT), in load order — dependencies
+    // before the main module, which is what a real loader does and what the
+    // guest assumes: the eboot's own constructors use objects a dependency's
+    // constructors were supposed to create. `module_inits` runs before the
+    // process entry; see `dynlib::DT_INIT`.
+    for p in &pending {
+        let Some(init_vaddr) = p.decoded.dynlib.init else {
+            tracing::debug!("{}: no DT_INIT — nothing to initialize", p.name);
+            continue;
+        };
+        let image_offset = p.offset.wrapping_add(init_vaddr);
+        tracing::info!(
+            "{}: module_start (DT_INIT) at +{image_offset:#x} (module vaddr {init_vaddr:#x})",
+            p.name
+        );
+        linked.module_inits.push(dynlib::linker::ModuleInit {
+            name: p.name.clone(),
+            image_offset,
+        });
+    }
+
     // Count honestly: `linked.unresolved` is the MAIN module's relocations
     // only, while the stub table is process-wide. Reporting one against the
     // other invites exactly the units confusion that produced the

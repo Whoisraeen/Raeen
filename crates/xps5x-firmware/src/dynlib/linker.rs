@@ -126,6 +126,20 @@ pub struct UnresolvedStub {
     pub addr: u64,
 }
 
+/// One module's `module_start`, to be called before the process entry.
+///
+/// The Orbis ABI (confirmed against Kyty's `RuntimeLinker::StartModule` ->
+/// `run_ini_fini`, MIT © InoriRus) is
+/// `int module_start(size_t args, const void *argp, module_func_t func)`,
+/// SysV, called with `(0, NULL, NULL)` for a plain load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleInit {
+    /// The `.prx` this belongs to, for diagnostics.
+    pub name: String,
+    /// Offset of `module_start` within the composed process image.
+    pub image_offset: u64,
+}
+
 /// The result of [`link_module`]: a flat, relocated image plus a record of
 /// what each symbol relocation resolved to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +157,20 @@ pub struct LinkedModule {
     /// owns stub address `UNRESOLVED_STUB_BASE + i * 8`. The runtime inverts
     /// this to name the import a faulting guest call wanted.
     pub unresolved_stubs: Vec<UnresolvedStub>,
+    /// `module_start` entry points to run **before** the process entry, as
+    /// offsets into [`Self::image`], in the order they must be called
+    /// (dependencies first).
+    ///
+    /// A `.prx` runs its C++ global constructors from its `DT_INIT`, and a real
+    /// loader calls each dependency's before entering the main module. Nothing
+    /// did, so every dependency's globals stayed null — on the measured title
+    /// the eboot's own constructors then called a virtual method through a null
+    /// vtable. See `dynlib::DT_INIT`.
+    ///
+    /// Populated by `load_process` (which knows the dependency order); a
+    /// single-module `link_module` leaves it empty, since a lone module's entry
+    /// runs its own initializers.
+    pub module_inits: Vec<ModuleInit>,
     /// Distinct HLE imports resolved, in first-encountered order, deduped
     /// by NID (a NID referenced by more than one relocation reuses the same
     /// trampoline address and appears here once).
@@ -443,6 +471,8 @@ fn link_inner(
         // every module is linked.
         unresolved_stubs: Vec::new(),
         hle_trampolines: Vec::new(),
+        // Only `load_process` knows the dependency order, so it fills this in.
+        module_inits: Vec::new(),
         entry: module.entry,
         tls: module.tls.clone(),
         procparam_offset: module.procparam.as_ref().map(|p| p.vaddr),

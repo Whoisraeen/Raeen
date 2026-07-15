@@ -34,6 +34,19 @@ use xps5x_core::error::FirmwareError;
 /// alongside the SCE tags; each entry is a `.prx` the module expects loaded.
 const DT_NEEDED: u64 = 1;
 
+/// `DT_INIT` — the module's initializer (`module_start`), as a **vaddr**.
+///
+/// This is how a PS5 module runs its C++ global constructors: every module
+/// measured on a real title carries `DT_INIT` (at vaddr `0x10`) and an *empty*
+/// `DT_INIT_ARRAY`, and the code at that address is the textbook ctor loop
+/// (`lea __init_array_start` / `cmp __init_array_end` / `jae`). A `.prx` has
+/// `e_entry == 0` — it is a library, and `DT_INIT` is the only way in.
+///
+/// Nothing runs these and the guest notices: on the measured title the eboot's
+/// own constructors called a virtual method on a dependency's global that no
+/// constructor had ever initialized, faulting on a null vtable.
+const DT_INIT: u64 = 12;
+
 // The standard (non-SCE) dynamic tags. Real PS5 titles use these — with
 // **virtual addresses** — rather than the `DT_SCE_*` tags' offsets into a
 // `PT_SCE_DYNLIBDATA` blob. See [`standard_dynamic_view`].
@@ -186,6 +199,10 @@ pub struct DynlibData {
     /// A module is the `.prx` that *contains* one or more libraries; these
     /// names run 1:1 with [`Self::needed_modules`] (minus the `.prx` suffix).
     pub import_modules: Vec<(u16, String)>,
+    /// The module's [`DT_INIT`] initializer, as a module-relative vaddr —
+    /// `module_start`, which runs its C++ global constructors. `None` if the
+    /// module declares no initializer (or declares 0).
+    pub init: Option<u64>,
 }
 
 /// Decode the `Elf64_Dyn` `(d_tag: u64, d_val: u64)` array from a raw
@@ -306,8 +323,14 @@ pub fn standard_dynamic_view(
     // (one per dependency / imported library — ~50 each on a real title), so a
     // "keep the first of each tag" filter silently drops all but one, leaving
     // exactly one library name and one NEEDED entry.
+    // `DT_INIT` is preserved for the same reason as `DT_NEEDED`: it is a plain
+    // ELF tag this view would otherwise drop, and it is the ONLY way into a
+    // `.prx` (they have `e_entry == 0`). Dropping it silently meant no
+    // dependency's `module_start` — and so no dependency's C++ global
+    // constructors — ever ran.
     for &(t, v) in dyn_tags {
-        let is_interesting = t == DT_NEEDED || (0x6100_0000..0x6200_0000).contains(&t);
+        let is_interesting =
+            t == DT_NEEDED || t == DT_INIT || (0x6100_0000..0x6200_0000).contains(&t);
         let already_mapped = MAP.iter().any(|&(_, sce)| sce == t);
         if is_interesting && !already_mapped {
             out.push((t, v));
@@ -420,6 +443,12 @@ pub fn parse_dynlibdata(blob: &[u8], dyn_tags: &[(u64, u64)]) -> Result<DynlibDa
         "needed module",
     );
 
+    // `DT_INIT`: the module's `module_start`. Treated as absent when 0 — a
+    // module with no initializer conventionally omits the tag, but some emit
+    // it as 0 rather than dropping it, and calling address 0 would be a null
+    // jump (exactly the "never silent jump-to-null" rule).
+    let init = tag_val(dyn_tags, DT_INIT).filter(|v| *v != 0);
+
     Ok(DynlibData {
         imports,
         exports,
@@ -428,6 +457,7 @@ pub fn parse_dynlibdata(blob: &[u8], dyn_tags: &[(u64, u64)]) -> Result<DynlibDa
         needed_modules,
         import_libs,
         import_modules,
+        init,
     })
 }
 
@@ -777,6 +807,68 @@ mod tests {
             by_mod(1),
             "the two tables disagree for the same id — that is the whole point"
         );
+    }
+
+    /// `DT_INIT` must survive `standard_dynamic_view`, or no `.prx` ever runs
+    /// its constructors.
+    ///
+    /// The view rewrites a real title's standard tags into the SCE-shaped ones
+    /// the decoder expects, and used to preserve only `DT_NEEDED` plus the SCE
+    /// range — silently dropping `DT_INIT`. That is the ONLY entry into a
+    /// `.prx` (they have `e_entry == 0`), so every dependency's C++ global
+    /// constructors were skipped, and the measured title's own constructors
+    /// then called a virtual method through a null vtable on an object nobody
+    /// had created.
+    #[test]
+    fn standard_dynamic_view_preserves_dt_init() {
+        // One PT_LOAD covering the vaddrs the tags name.
+        let segments = vec![crate::sprx::SprxSegment {
+            vaddr: 0,
+            data: vec![0u8; 0x200],
+            flags: 5,
+            mem_size: 0x200,
+        }];
+        let dyn_tags = vec![
+            (DT_STRTAB, 0x10),
+            (DT_STRSZ, 0x10),
+            (DT_SYMTAB, 0x20),
+            (DT_SYMENT, ELF64_SYM_SIZE),
+            (DT_INIT, 0x10),
+        ];
+
+        let (_image, tags) =
+            standard_dynamic_view(&segments, &dyn_tags).expect("standard model recognized");
+        assert!(
+            tags.iter().any(|&(t, v)| t == DT_INIT && v == 0x10),
+            "DT_INIT was dropped by the standard-model view — every .prx's module_start \
+             would be skipped: {tags:?}"
+        );
+    }
+
+    /// `DT_INIT` reaches `DynlibData::init`, and a 0 is treated as absent
+    /// (calling address 0 is a null jump, which the linker must never do).
+    #[test]
+    fn dt_init_is_decoded_and_zero_means_absent() {
+        let mut strtab = vec![0u8];
+        strtab.extend_from_slice(b"x\0");
+        let blob = strtab.clone();
+        let base = vec![(DT_SCE_STRTAB, 0u64), (DT_SCE_STRSZ, strtab.len() as u64)];
+
+        let mut with_init = base.clone();
+        with_init.push((DT_INIT, 0x10));
+        let dynlib = parse_dynlibdata(&blob, &with_init).expect("parses");
+        assert_eq!(dynlib.init, Some(0x10));
+
+        let mut zero_init = base.clone();
+        zero_init.push((DT_INIT, 0));
+        let dynlib = parse_dynlibdata(&blob, &zero_init).expect("parses");
+        assert_eq!(
+            dynlib.init, None,
+            "DT_INIT of 0 must not become a null call"
+        );
+
+        let dynlib = parse_dynlibdata(&blob, &base).expect("parses");
+        assert_eq!(dynlib.init, None);
     }
 
     /// The PS4-era spellings of the same two tables decode identically, so a
