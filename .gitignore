@@ -62,3 +62,7 @@ reference/
 .claude/
 Claude.md
 .claude/skills
+# Diagnostic image written by xps5x-gpu's `dump_triangle_image` test
+# (override the path with XPS5X_TRIANGLE_PPM). A build artifact, not source.
+triangle.ppm
+*.ppm

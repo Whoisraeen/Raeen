@@ -4,10 +4,19 @@
 //!
 //! XPS5X's real shader path is `shader::gcn_decoder` → `shader::ir` →
 //! [`shader::spirv_emitter`](crate::shader::spirv_emitter), which translates a
-//! title's RDNA2 ISA into SPIR-V. That path is **not** finished: its I/O model
-//! is still scalar-`f32` per location with no `Position` builtin and no vec4
-//! color export, so it cannot yet produce a vertex+fragment pair a driver would
-//! accept for a real draw (see `docs/reference-port-ledger.md`).
+//! title's RDNA2 ISA into SPIR-V.
+//!
+//! That path's **I/O model is now real**: `ExportPosition` emits a `vec4`
+//! decorated `BuiltIn Position`, `ExportColor` a `vec4` at a Location, and both
+//! compose their components (padding a short export to `w = 1`). So the shape a
+//! driver requires is there — see `spirv_emitter`'s
+//! `position_export_is_a_vec4_builtin_position_not_a_location`.
+//!
+//! What is still missing before this module can be deleted is the **body**, not
+//! the interface: `gcn_decoder` must lower enough real RDNA2 ISA that a title's
+//! actual vertex/fragment pair round-trips. Until a decoded shader is proven to
+//! draw, swapping these hand-built modules out would trade a known-good input
+//! for an unknown one and make any failure ambiguous.
 //!
 //! Rather than fake that, this module emits two minimal, purpose-built shaders
 //! directly. They exist to prove the **Vulkan half** of the pipeline — device,

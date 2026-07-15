@@ -45,6 +45,8 @@ const OP_I_MUL: u16 = 132;
 const OP_F_MUL: u16 = 133;
 const OP_F_DIV: u16 = 136;
 const OP_DECORATE: u16 = 71;
+/// `OpCompositeConstruct` — build a vector from scalar components.
+const OP_COMPOSITE_CONSTRUCT: u16 = 80;
 
 /// Emit a SPIR-V module from an IR program.
 pub fn emit_spirv(program: &IrProgram) -> Result<Vec<u32>, GpuError> {
@@ -129,18 +131,69 @@ pub fn emit_spirv(program: &IrProgram) -> Result<Vec<u32>, GpuError> {
         }
     }
 
-    // One Output interface variable per export node, at successive Locations.
-    // The body OpStores each export's value into its variable.
-    let export_count = program.nodes.iter().filter(|n| is_export(n.op)).count();
+    // Outputs, one interface variable per export node.
+    //
+    // Every export used to become a scalar `f32` at a successive Location,
+    // which no driver will accept as a real shader: a vertex stage MUST write
+    // `gl_Position` (a `vec4` decorated `BuiltIn Position`), and a fragment
+    // stage's colour target is a `vec4` at a Location — not a float. That gap
+    // is why `vulkan::shaders` still hand-builds its triangle instead of using
+    // this emitter.
+    //
+    // GCN exports are 4-component by construction (`ExportPosition` = POS0-3,
+    // `ExportColor` = MRT0-7), so each export declares a `vec4` and the body
+    // composes one from the node's sources:
+    //
+    // * `ExportPosition` -> `BuiltIn Position`. NOT a Location: position is a
+    //   builtin, and decorating it with a Location makes the module invalid.
+    // * `ExportColor`    -> Location 0.., in export order (MRT0, MRT1, ...).
+    // * `ExportParam`    -> Location 0.., in export order — a vertex stage's
+    //   varyings, which the fragment stage reads back by Location.
+    //
+    // Colours and params are numbered in separate Location spaces because they
+    // never coexist in one stage: colours are fragment outputs, params are
+    // vertex outputs.
+    let out_ptr_type = module.next_id();
+    module.add_type_pointer(out_ptr_type, STORAGE_CLASS_OUTPUT, vec4_type);
+
+    /// `Decoration::BuiltIn`.
+    const DECORATION_BUILTIN: u32 = 11;
+    /// `BuiltIn::Position`.
+    const BUILTIN_POSITION: u32 = 0;
+
     let mut output_vars: Vec<u32> = Vec::new();
-    if export_count > 0 {
-        let out_ptr_type = module.next_id();
-        module.add_type_pointer(out_ptr_type, STORAGE_CLASS_OUTPUT, f32_type);
-        for loc in 0..export_count as u32 {
-            let var = module.add_io_variable(out_ptr_type, STORAGE_CLASS_OUTPUT, loc);
-            output_vars.push(var);
-            interface.push(var);
-        }
+    let mut next_color_loc = 0u32;
+    let mut next_param_loc = 0u32;
+    for node in program.nodes.iter().filter(|n| is_export(n.op)) {
+        let var = match node.op {
+            IrOp::ExportPosition => {
+                let id = module.next_id();
+                module.emit(
+                    Section::TypesVars,
+                    OP_VARIABLE,
+                    &[out_ptr_type, id, STORAGE_CLASS_OUTPUT],
+                );
+                module.emit(
+                    Section::Annotations,
+                    OP_DECORATE,
+                    &[id, DECORATION_BUILTIN, BUILTIN_POSITION],
+                );
+                id
+            }
+            IrOp::ExportColor => {
+                let loc = next_color_loc;
+                next_color_loc += 1;
+                module.add_io_variable(out_ptr_type, STORAGE_CLASS_OUTPUT, loc)
+            }
+            // ExportParam (and anything else `is_export` admits).
+            _ => {
+                let loc = next_param_loc;
+                next_param_loc += 1;
+                module.add_io_variable(out_ptr_type, STORAGE_CLASS_OUTPUT, loc)
+            }
+        };
+        output_vars.push(var);
+        interface.push(var);
     }
 
     // Declare entry point.
@@ -212,11 +265,38 @@ pub fn emit_spirv(program: &IrProgram) -> Result<Vec<u32>, GpuError> {
             src_ids.push(id);
         }
 
-        // An export stores its (first) value into the matching Output variable.
+        // An export composes a vec4 from its components and stores THAT.
+        //
+        // Storing only `src_ids.first()` (a scalar) into the variable was the
+        // other half of the unusable-output problem: the variable is a `vec4`,
+        // so a scalar store is a type mismatch a validator rejects outright.
+        //
+        // A GCN export names 4 components, but an IR node may carry fewer
+        // (disabled channels via the export's `en` mask). Pad to 4 with the
+        // conventional identity for a position/colour: 0,0,0,1 — so a 3-source
+        // position still lands at w=1 rather than w=undefined, which would put
+        // every vertex at infinity after the perspective divide.
         if is_export(node.op) {
-            if let Some(&value) = src_ids.first() {
-                module.emit_store(output_vars[export_idx], value);
+            let zero = *const_ids
+                .entry((f32_type, 0f32.to_bits()))
+                .or_insert_with(|| {
+                    let id = module.next_id();
+                    module.add_constant(id, f32_type, 0f32.to_bits());
+                    id
+                });
+            let one = *const_ids
+                .entry((f32_type, 1f32.to_bits()))
+                .or_insert_with(|| {
+                    let id = module.next_id();
+                    module.add_constant(id, f32_type, 1f32.to_bits());
+                    id
+                });
+            let mut comps = [zero, zero, zero, one];
+            for (i, &id) in src_ids.iter().take(4).enumerate() {
+                comps[i] = id;
             }
+            let composite = module.emit_composite_construct(vec4_type, &comps);
+            module.emit_store(output_vars[export_idx], composite);
             export_idx += 1;
             continue;
         }
@@ -353,6 +433,17 @@ impl SpirvModule {
 
     /// Emit `OpLoad result_type result_id pointer` in the function body.
     /// Returns the loaded value id.
+    /// `OpCompositeConstruct <result_type> <id> <components...>` — builds a
+    /// vector from scalars. Every shader export needs this: the interface
+    /// variables are `vec4`, the IR's values are scalars.
+    fn emit_composite_construct(&mut self, result_type: u32, components: &[u32]) -> u32 {
+        let id = self.next_id();
+        let mut ops = vec![result_type, id];
+        ops.extend_from_slice(components);
+        self.emit(Section::Functions, OP_COMPOSITE_CONSTRUCT, &ops);
+        id
+    }
+
     fn emit_load(&mut self, result_type: u32, pointer: u32) -> u32 {
         let id = self.next_id();
         self.emit(Section::Functions, OP_LOAD, &[result_type, id, pointer]);
@@ -722,6 +813,211 @@ mod tests {
         assert!(
             body_ops.contains(&Op::Store),
             "the export must lower to OpStore"
+        );
+    }
+
+    /// A vertex stage's position export must be a `vec4` decorated
+    /// `BuiltIn Position` — never a Location.
+    ///
+    /// This is what stood between the emitter and a real draw. Every export
+    /// used to be a scalar `f32` at a successive Location, so the vertex stage
+    /// never wrote `gl_Position`; a driver rejects that outright, which is why
+    /// `vulkan::shaders` hand-builds its triangle instead of using this path.
+    /// Decorating position with a Location instead of the builtin is equally
+    /// invalid, so this asserts both halves.
+    #[test]
+    fn position_export_is_a_vec4_builtin_position_not_a_location() {
+        use crate::shader::ir::{IrNode, IrOp};
+        use rspirv::spirv::{BuiltIn, Decoration, Op, StorageClass};
+
+        // export POS0 = (x, y, z, w) — four components, as GCN emits.
+        let program = IrProgram {
+            nodes: vec![IrNode {
+                op: IrOp::ExportPosition,
+                result: None,
+                sources: vec![
+                    IrValue::ConstF32(0.0),
+                    IrValue::ConstF32(1.0),
+                    IrValue::ConstF32(0.0),
+                    IrValue::ConstF32(1.0),
+                ],
+            }],
+            shader_type: ShaderType::Vertex,
+            input_count: 0,
+            output_count: 1,
+            ubo_count: 0,
+            texture_count: 0,
+        };
+        let module = emit_spirv(&program).unwrap();
+        let parsed = rspirv::dr::load_words(&module).expect("must parse");
+
+        // The Output variable is decorated BuiltIn Position...
+        let builtin_positions: Vec<u32> = parsed
+            .annotations
+            .iter()
+            .filter(|i| i.class.opcode == Op::Decorate)
+            .filter(|i| {
+                matches!(
+                    i.operands.get(1),
+                    Some(rspirv::dr::Operand::Decoration(Decoration::BuiltIn))
+                ) && matches!(
+                    i.operands.get(2),
+                    Some(rspirv::dr::Operand::BuiltIn(BuiltIn::Position))
+                )
+            })
+            .filter_map(|i| match i.operands.first() {
+                Some(rspirv::dr::Operand::IdRef(id)) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            builtin_positions.len(),
+            1,
+            "the position export must be decorated BuiltIn Position"
+        );
+        let pos_var = builtin_positions[0];
+
+        // ...and NOT with a Location (a builtin with a Location is invalid).
+        let has_location = parsed.annotations.iter().any(|i| {
+            i.class.opcode == Op::Decorate
+                && matches!(i.operands.first(), Some(rspirv::dr::Operand::IdRef(id)) if *id == pos_var)
+                && matches!(
+                    i.operands.get(1),
+                    Some(rspirv::dr::Operand::Decoration(Decoration::Location))
+                )
+        });
+        assert!(
+            !has_location,
+            "BuiltIn Position must not also carry a Location decoration"
+        );
+
+        // The variable's pointee is a 4-component vector, not a scalar.
+        let var = parsed
+            .types_global_values
+            .iter()
+            .find(|i| i.result_id == Some(pos_var))
+            .expect("position variable");
+        assert!(matches!(
+            var.operands.first(),
+            Some(rspirv::dr::Operand::StorageClass(StorageClass::Output))
+        ));
+        let ptr_type_id = var.result_type.expect("variable has a pointer type");
+        let ptr = parsed
+            .types_global_values
+            .iter()
+            .find(|i| i.result_id == Some(ptr_type_id))
+            .expect("pointer type");
+        let pointee = match ptr.operands.get(1) {
+            Some(rspirv::dr::Operand::IdRef(id)) => *id,
+            _ => panic!("OpTypePointer names its pointee"),
+        };
+        let vec_ty = parsed
+            .types_global_values
+            .iter()
+            .find(|i| i.result_id == Some(pointee))
+            .expect("pointee type");
+        assert_eq!(
+            vec_ty.class.opcode,
+            Op::TypeVector,
+            "position must be a vector, not a scalar float"
+        );
+        assert!(
+            matches!(
+                vec_ty.operands.get(1),
+                Some(rspirv::dr::Operand::LiteralBit32(4))
+            ),
+            "position must be a vec4, got {:?}",
+            vec_ty.operands
+        );
+
+        // The body composes the vec4 and stores it.
+        let body: Vec<Op> = parsed
+            .functions
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.instructions.iter())
+            .map(|i| i.class.opcode)
+            .collect();
+        assert!(
+            body.contains(&Op::CompositeConstruct),
+            "a vec4 export must be composed from its components"
+        );
+        assert!(body.contains(&Op::Store));
+    }
+
+    /// A fragment colour export is a `vec4` at a **Location** (not a builtin),
+    /// and a short export still lands at w=1 rather than an undefined w.
+    #[test]
+    fn color_export_is_a_vec4_at_a_location_and_pads_w_to_one() {
+        use crate::shader::ir::{IrNode, IrOp};
+        use rspirv::spirv::{Decoration, Op};
+
+        // Only 3 components supplied (a disabled `en` channel).
+        let program = IrProgram {
+            nodes: vec![IrNode {
+                op: IrOp::ExportColor,
+                result: None,
+                sources: vec![
+                    IrValue::ConstF32(1.0),
+                    IrValue::ConstF32(0.0),
+                    IrValue::ConstF32(0.0),
+                ],
+            }],
+            shader_type: ShaderType::Pixel,
+            input_count: 0,
+            output_count: 1,
+            ubo_count: 0,
+            texture_count: 0,
+        };
+        let module = emit_spirv(&program).unwrap();
+        let parsed = rspirv::dr::load_words(&module).expect("must parse");
+
+        // Decorated with Location 0, and NOT a builtin.
+        let located: Vec<u32> = parsed
+            .annotations
+            .iter()
+            .filter(|i| i.class.opcode == Op::Decorate)
+            .filter(|i| {
+                matches!(
+                    i.operands.get(1),
+                    Some(rspirv::dr::Operand::Decoration(Decoration::Location))
+                )
+            })
+            .filter_map(|i| match i.operands.first() {
+                Some(rspirv::dr::Operand::IdRef(id)) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(located.len(), 1, "colour export sits at a Location");
+        assert!(
+            !parsed.annotations.iter().any(|i| {
+                matches!(
+                    i.operands.get(1),
+                    Some(rspirv::dr::Operand::Decoration(Decoration::BuiltIn))
+                )
+            }),
+            "a colour export is not a builtin"
+        );
+
+        // w must be padded with the 1.0 constant, not left undefined: an
+        // undefined w makes the perspective divide produce garbage.
+        let has_one = parsed
+            .types_global_values
+            .iter()
+            .any(|i| i.class.opcode == Op::Constant);
+        assert!(has_one, "the 1.0 pad constant must exist in the pool");
+
+        let body: Vec<Op> = parsed
+            .functions
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.instructions.iter())
+            .map(|i| i.class.opcode)
+            .collect();
+        assert!(body.contains(&Op::CompositeConstruct));
+        assert!(
+            !body.contains(&Op::Undef),
+            "a short export pads with constants, never OpUndef"
         );
     }
 
