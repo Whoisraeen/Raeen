@@ -160,14 +160,39 @@ mod tests {
         (hle, db)
     }
 
+    /// Pick a real HLE function whose name is registered under exactly ONE
+    /// library, deterministically.
+    ///
+    /// A test that just takes `registered_names().first()` is doing two unsafe
+    /// things at once. The order comes from a `DashMap` and is not stable, and
+    /// — worse — some function names are deliberately registered under several
+    /// libraries (`getpid` in both `libkernel` and `libScePosix`; the whole
+    /// `sce::Json` set in `libSceJson`/`libSceJson2`). A NID hashes the name
+    /// alone, so those share one NID and `NidDatabase` keeps exactly one
+    /// `library::function` for them. Picking such a name and then asserting the
+    /// resolved library equals the one it came from fails whenever the two
+    /// disagree — intermittently, since the pick was random.
+    ///
+    /// Sorting makes the choice reproducible; filtering to names registered
+    /// once makes the library assertion meaningful.
+    fn uniquely_named_hle_function(hle: &HleRegistry) -> (String, String) {
+        let mut names = hle.registered_names();
+        names.sort();
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (_, f) in &names {
+            *counts.entry(f.as_str()).or_default() += 1;
+        }
+        names
+            .iter()
+            .find(|(_, f)| counts[f.as_str()] == 1)
+            .cloned()
+            .expect("the HLE registers at least one uniquely-named function")
+    }
+
     #[test]
     fn resolves_hle_implemented_function() {
         let (hle, db) = build_hle_and_db();
-        let names = hle.registered_names();
-        let (library, function) = names
-            .first()
-            .cloned()
-            .expect("HleRegistry::new() registers at least one function");
+        let (library, function) = uniquely_named_hle_function(&hle);
 
         let registry = ModuleRegistry::new(db);
         let nid = nid_of(&function);
@@ -218,11 +243,7 @@ mod tests {
     #[test]
     fn policy_flips_precedence_between_hle_and_lle() {
         let (hle, db) = build_hle_and_db();
-        let names = hle.registered_names();
-        let (library, function) = names
-            .first()
-            .cloned()
-            .expect("HleRegistry::new() registers at least one function");
+        let (library, function) = uniquely_named_hle_function(&hle);
         let nid = nid_of(&function);
 
         let mut registry = ModuleRegistry::new(db);
