@@ -25,9 +25,21 @@ use tracing::{debug, info};
 use xps5x_core::error::{FirmwareError, LoaderError};
 use xps5x_loader::self_format::{SelfEntry, SelfHeader};
 
-/// SELF magic ("OISED"/"SELF" rearranged) — matches `xps5x_loader::self_format`.
-/// This is public container-format information, not a key.
-const SELF_MAGIC: u32 = 0x4F15D17E;
+/// SELF magic used by this crate's in-tree fixtures. The real-hardware magics
+/// are accepted too — every container variant is recognized via
+/// [`xps5x_loader::self_format::is_self_magic`], which owns the canonical list.
+#[cfg(test)]
+use xps5x_loader::self_format::SELF_MAGIC;
+
+/// Fixture-only marker selecting AES-128-CBC for an encrypted segment.
+///
+/// Real PS4/PS5 SELF `properties` has no cipher selector — bits 1-3 are the
+/// independent `encrypted`/`signed`/`compressed` flags, and real encrypted
+/// segments are CTR. This project's CBC path is exercised only by in-tree
+/// fixtures, so it is selected by a **reserved** bit that cannot collide with
+/// any real flag (bit 12), rather than by re-reading the flag bits as an enum
+/// (which is what made real `signed` plaintext segments look CBC-encrypted).
+const PROP_FIXTURE_CBC: u64 = 1 << 12;
 
 /// Fixed size of the SELF header, in bytes.
 const SELF_HEADER_SIZE: usize = 32;
@@ -58,13 +70,15 @@ enum SegmentCipher {
 }
 
 impl SegmentCipher {
-    /// Decode from a [`SelfEntry::properties`] bit field. Bits 1-3 already
-    /// carry the "is encrypted" algorithm selector consumed by
-    /// [`SelfEntry::is_encrypted`]; a value of `2` there additionally
-    /// selects AES-128-CBC, any other nonzero value selects AES-128-CTR.
+    /// Decode from a [`SelfEntry::properties`] bit field. Only consulted for
+    /// segments [`SelfEntry::is_encrypted`] already flagged (real bit 1).
+    ///
+    /// Real encrypted SELF segments are AES-128-CTR; the CBC path exists for
+    /// in-tree fixtures and is selected by the reserved [`PROP_FIXTURE_CBC`]
+    /// bit. This deliberately does *not* re-read bits 1-3 as an enum — those
+    /// are the real format's independent encrypted/signed/compressed flags.
     fn from_properties(properties: u64) -> Self {
-        let algo = (properties >> 1) & 0x7;
-        if algo == 2 {
+        if properties & PROP_FIXTURE_CBC != 0 {
             SegmentCipher::Cbc
         } else {
             SegmentCipher::Ctr
@@ -101,6 +115,20 @@ pub fn decrypt_self(
         entries.len(),
         header.header_size
     );
+
+    // A real title's SELF stores each segment's data at the *entry's* offset,
+    // and the inner ELF's own header+phdrs inline right after the entry table
+    // — the phdr `p_offset`s describe the ORIGINAL (pre-SELF) layout, not where
+    // the bytes sit in this file. Reassembling by concatenating entries (the
+    // legacy model below) therefore produces a corrupt ELF for real titles.
+    //
+    // Blocked entries (properties bit 11) are the segment data, and their
+    // `segment_index()` is the ELF phdr index they belong to; the non-blocked
+    // entries are block/digest tables. If any entry is blocked this is a real
+    // SELF, so reassemble properly.
+    if entries.iter().any(|e| e.is_blocked()) {
+        return reassemble_real_self(data, &header, &entries, provider);
+    }
 
     let mut elf = Vec::new();
     let mut decrypted_segments = 0usize;
@@ -163,6 +191,211 @@ pub fn decrypt_self(
     })
 }
 
+/// Reassemble the inner ELF of a **real** (hardware) SELF.
+///
+/// Layout, verified against a real PS5 title: a 0x20-byte header, then
+/// `num_entries` 0x20-byte entries, then the inner ELF's header + program
+/// headers inline. Each *blocked* entry (properties bit 11) carries one
+/// segment's bytes at the entry's own `offset`, and its
+/// [`SelfEntry::segment_index`] names the ELF phdr those bytes belong to. The
+/// phdr's `p_offset` is where they go in the **reconstructed** ELF (the
+/// original pre-SELF layout) — which is why concatenating entries, as the
+/// legacy fixture path does, cannot work here.
+///
+/// Non-blocked entries are block/digest tables and carry no ELF bytes; they are
+/// skipped. Segments that overlap a `PT_LOAD` (e.g. `PT_DYNAMIC`,
+/// `GNU_EH_FRAME`) have no entry of their own — their bytes arrive with the
+/// containing `PT_LOAD`, which is why the output is addressed by `p_offset`
+/// rather than per-segment.
+fn reassemble_real_self(
+    data: &[u8],
+    header: &SelfHeader,
+    entries: &[SelfEntry],
+    provider: &dyn KeyProvider,
+) -> Result<DecryptedSelf, FirmwareError> {
+    let elf_start = SELF_HEADER_SIZE + entries.len() * SELF_ENTRY_SIZE;
+    let ehdr = data.get(elf_start..).ok_or_else(|| {
+        FirmwareError::MalformedSelf(format!("SELF entry table overruns file ({elf_start:#x})"))
+    })?;
+    let phdrs = parse_inner_phdrs(ehdr)?;
+
+    // Size the image to the furthest byte any phdr claims, so every segment's
+    // `p_offset` lands inside it. Any hole (a phdr with no entry that is not
+    // covered by a PT_LOAD) stays zero rather than shifting later bytes.
+    let mut elf_len = ehdr_and_phdr_span(ehdr)?;
+    for p in &phdrs {
+        let end = p.offset.saturating_add(p.filesz);
+        elf_len = elf_len.max(usize::try_from(end).unwrap_or(usize::MAX));
+    }
+    let mut elf = vec![0u8; elf_len];
+
+    // The ELF header + phdr table sit inline in the SELF; copy them verbatim.
+    let head_len = ehdr_and_phdr_span(ehdr)?;
+    elf[..head_len].copy_from_slice(&ehdr[..head_len]);
+
+    // A SELF does not carry the inner ELF's section table — only its segments.
+    // Real titles are left with an `e_shoff` describing the original,
+    // pre-SELF file (one real eboot's pointed ~2.5 GB into a 254 MB image), so
+    // the reconstructed ELF would advertise a section table that isn't there
+    // and any strict whole-file parse rejects it. Sections are irrelevant to
+    // loading (only program headers map anything), so emit an honest "no
+    // sections" header instead of a dangling pointer.
+    let e_shoff = u64::from_le_bytes(elf[0x28..0x30].try_into().unwrap());
+    let e_shnum = u16::from_le_bytes(elf[0x3C..0x3E].try_into().unwrap());
+    let sh_end = e_shoff.saturating_add(
+        u64::from(u16::from_le_bytes(elf[0x3A..0x3C].try_into().unwrap()))
+            .saturating_mul(u64::from(e_shnum)),
+    );
+    if e_shoff != 0 && sh_end > elf_len as u64 {
+        debug!(
+            "SELF inner ELF section table ({e_shnum} @ {e_shoff:#x}) is outside the reassembled \
+             image ({elf_len:#x}) — the SELF did not preserve it; clearing e_shoff/e_shnum"
+        );
+        elf[0x28..0x30].copy_from_slice(&0u64.to_le_bytes()); // e_shoff
+        elf[0x3C..0x3E].copy_from_slice(&0u16.to_le_bytes()); // e_shnum
+        elf[0x3E..0x40].copy_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+    }
+
+    let mut decrypted_segments = 0usize;
+    let mut passthrough_segments = 0usize;
+
+    for (index, entry) in entries.iter().enumerate() {
+        if !entry.is_blocked() || !entry.has_data() {
+            debug!(
+                "SELF entry {index}: props={:#x} not a blocked segment (block/digest table) — skipped",
+                entry.properties
+            );
+            continue;
+        }
+        if entry.is_compressed() {
+            return Err(FirmwareError::MalformedSelf(format!(
+                "SELF entry {index} is compressed; segment decompression is not implemented"
+            )));
+        }
+
+        let idx = usize::try_from(entry.segment_index()).unwrap_or(usize::MAX);
+        let Some(phdr) = phdrs.get(idx) else {
+            return Err(FirmwareError::MalformedSelf(format!(
+                "SELF entry {index} names phdr {idx}, but the inner ELF has {} program header(s)",
+                phdrs.len()
+            )));
+        };
+
+        let start = usize::try_from(entry.offset).unwrap_or(usize::MAX);
+        let len = usize::try_from(entry.compressed_size).unwrap_or(usize::MAX);
+        let end = start.checked_add(len).ok_or_else(|| {
+            FirmwareError::MalformedSelf(format!("SELF entry {index} offset/size overflow"))
+        })?;
+        let src = data.get(start..end).ok_or_else(|| {
+            FirmwareError::MalformedSelf(format!(
+                "SELF entry {index} data [{start:#x}, {end:#x}) exceeds file size {:#x}",
+                data.len()
+            ))
+        })?;
+
+        let bytes = if entry.is_encrypted() {
+            let req = KeyRequest {
+                key_type: header.key_type,
+                key_id: entry.segment_index(),
+            };
+            let key = require_key(provider, &req)?;
+            let cipher = SegmentCipher::from_properties(entry.properties);
+            decrypted_segments += 1;
+            decrypt_segment(src, &key, cipher, index)?
+        } else {
+            passthrough_segments += 1;
+            src.to_vec()
+        };
+
+        let dst_start = usize::try_from(phdr.offset).unwrap_or(usize::MAX);
+        let take = usize::try_from(phdr.filesz)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        let dst = elf
+            .get_mut(dst_start..dst_start.saturating_add(take))
+            .ok_or_else(|| {
+                FirmwareError::MalformedSelf(format!(
+                    "SELF entry {index} -> phdr {idx} p_offset {dst_start:#x}+{take:#x} exceeds the reassembled image ({elf_len:#x})"
+                ))
+            })?;
+        dst.copy_from_slice(&bytes[..take]);
+        debug!(
+            "SELF entry {index}: phdr {idx} <- {take:#x} byte(s) from {start:#x} to p_offset {dst_start:#x}"
+        );
+    }
+
+    info!(
+        "SELF reassembled (real layout): {decrypted_segments} decrypted, {passthrough_segments} passed through, {} phdr(s), {} ELF byte(s)",
+        phdrs.len(),
+        elf.len()
+    );
+
+    Ok(DecryptedSelf {
+        elf,
+        decrypted_segments,
+        passthrough_segments,
+    })
+}
+
+/// One inner-ELF program header, as far as reassembly cares.
+struct InnerPhdr {
+    offset: u64,
+    filesz: u64,
+}
+
+/// Byte span of the inner ELF's header plus its program-header table.
+fn ehdr_and_phdr_span(ehdr: &[u8]) -> Result<usize, FirmwareError> {
+    let (e_phoff, e_phentsize, e_phnum) = inner_phdr_table(ehdr)?;
+    let end = e_phoff
+        .saturating_add((e_phentsize as u64).saturating_mul(e_phnum as u64))
+        .max(0x40);
+    usize::try_from(end)
+        .map_err(|_| FirmwareError::MalformedSelf("inner ELF phdr table overflows".to_string()))
+}
+
+/// Read `(e_phoff, e_phentsize, e_phnum)` from the inner ELF header.
+///
+/// Parsed by hand rather than via a full ELF parse: a SELF's inner ELF
+/// routinely has a stripped/out-of-file `e_shoff` (a real title's pointed ~2.5
+/// GB into a 254 MB file), which makes a strict whole-file parse fail even
+/// though every program header is perfectly valid. Reassembly only needs the
+/// phdr table.
+fn inner_phdr_table(ehdr: &[u8]) -> Result<(u64, u16, u16), FirmwareError> {
+    if ehdr.len() < 0x40 || ehdr[0..4] != [0x7F, b'E', b'L', b'F'] {
+        return Err(FirmwareError::MalformedSelf(
+            "SELF inner ELF header missing or not an ELF".to_string(),
+        ));
+    }
+    let e_phoff = u64::from_le_bytes(ehdr[0x20..0x28].try_into().unwrap());
+    let e_phentsize = u16::from_le_bytes(ehdr[0x36..0x38].try_into().unwrap());
+    let e_phnum = u16::from_le_bytes(ehdr[0x38..0x3A].try_into().unwrap());
+    if e_phentsize < 56 {
+        return Err(FirmwareError::MalformedSelf(format!(
+            "SELF inner ELF e_phentsize {e_phentsize} is too small for a 64-bit phdr"
+        )));
+    }
+    Ok((e_phoff, e_phentsize, e_phnum))
+}
+
+/// Parse the inner ELF's program headers (offset/filesz only).
+fn parse_inner_phdrs(ehdr: &[u8]) -> Result<Vec<InnerPhdr>, FirmwareError> {
+    let (e_phoff, e_phentsize, e_phnum) = inner_phdr_table(ehdr)?;
+    let mut out = Vec::with_capacity(e_phnum as usize);
+    for i in 0..e_phnum as u64 {
+        let at = usize::try_from(e_phoff + i * e_phentsize as u64).unwrap_or(usize::MAX);
+        let p = ehdr.get(at..at.saturating_add(56)).ok_or_else(|| {
+            FirmwareError::MalformedSelf(format!(
+                "SELF inner ELF program header {i} at {at:#x} is outside the file"
+            ))
+        })?;
+        out.push(InnerPhdr {
+            offset: u64::from_le_bytes(p[0x08..0x10].try_into().unwrap()),
+            filesz: u64::from_le_bytes(p[0x20..0x28].try_into().unwrap()),
+        });
+    }
+    Ok(out)
+}
+
 /// Parse and bounds-check the fixed 32-byte SELF header.
 fn parse_header(data: &[u8]) -> Result<SelfHeader, FirmwareError> {
     if data.len() < SELF_HEADER_SIZE {
@@ -173,7 +406,7 @@ fn parse_header(data: &[u8]) -> Result<SelfHeader, FirmwareError> {
     }
 
     let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
-    if magic != SELF_MAGIC {
+    if !xps5x_loader::self_format::is_self_magic(magic) {
         return Err(LoaderError::InvalidSelfMagic(magic).into());
     }
 
@@ -431,8 +664,11 @@ mod tests {
         let elf = synthetic_elf_payload();
         let ciphertext = aes128_cbc_encrypt(TEST_KEY, TEST_IV, &elf);
 
-        // algo == 2 selects CBC.
-        let properties = (2u64 << 1) | (TEST_KEY_ID << 20);
+        // Real bit 1 = encrypted, plus the reserved fixture-only CBC selector.
+        // (This previously set bit 2 — which is `signed` in the real format,
+        // not an "algo == 2" enum value; that misreading is exactly what made
+        // real titles' signed *plaintext* segments look CBC-encrypted.)
+        let properties = 0x2u64 | PROP_FIXTURE_CBC | (TEST_KEY_ID << 20);
         let self_data = build_self(&[properties], &[&ciphertext]);
 
         let result =

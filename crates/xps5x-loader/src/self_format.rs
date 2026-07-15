@@ -13,8 +13,89 @@ use crate::LoadedBinary;
 use tracing::{debug, info, warn};
 use xps5x_core::error::LoaderError;
 
-/// SELF file magic: 0x4F15D17E ("OISED" / "SELF" rearranged).
-const SELF_MAGIC: u32 = 0x4F15D17E;
+/// SELF file magic: 0x4F15D17E ("OISED" / "SELF" rearranged). This project's
+/// in-tree fixtures use it; see [`is_self_magic`] for the real-hardware ones.
+pub const SELF_MAGIC: u32 = 0x4F15D17E;
+
+/// The SCE SELF magic used by PS4/PS5 titles (`4F 15 3D 1D` on disk).
+pub const SELF_MAGIC_SCE: u32 = 0x1D3D154F;
+
+/// The SELF magic observed on **PS5 (Prospero) title** `eboot.bin`/`.prx`
+/// files (`54 14 F5 EE` on disk).
+///
+/// Same container layout as every other SELF — a 0x20-byte header, then
+/// `num_entries` 0x20-byte segment entries, then the inner ELF — only the
+/// magic differs, so it is accepted as a container-format discriminator, not
+/// special-cased anywhere downstream. (Verified against a real title: header
+/// `num_entries = 12`, and `0x20 + 12*0x20 = 0x1A0` lands exactly on the
+/// inner `\x7fELF`.) This is public container-format information, not a key.
+pub const SELF_MAGIC_PROSPERO: u32 = 0xEEF5_1454;
+
+/// Whether `magic` names a SELF container this loader understands.
+///
+/// All variants share one layout; only the discriminator differs. Accepting
+/// the real-hardware magics (not just the in-tree fixture one) is what lets
+/// actual titles be parsed at all — nothing here decrypts anything.
+pub fn is_self_magic(magic: u32) -> bool {
+    matches!(magic, SELF_MAGIC | SELF_MAGIC_SCE | SELF_MAGIC_PROSPERO)
+}
+
+#[cfg(test)]
+mod real_format_tests {
+    use super::*;
+
+    /// Pins the real PS4/PS5 `properties` bit layout against a **real title's**
+    /// observed values, so the flags can never silently revert to being read as
+    /// an enum again.
+    ///
+    /// `0x2804` and `0x110004` are verbatim from a retail PS5 `eboot.bin`
+    /// (Prospero SELF, 12 entries). Both are *plaintext* — neither sets bit 1 —
+    /// but both set bit 2 (`signed`). The previous accessor tested bits 1-3
+    /// together, so it called them encrypted and the loader demanded keys that
+    /// cannot exist for an already-decrypted dump.
+    #[test]
+    fn real_title_property_bits_decode_as_independent_flags() {
+        // A real blocked *data* segment: signed + blocked, phdr index 0.
+        let data_seg = SelfEntry {
+            properties: 0x2804,
+            offset: 0x5c930,
+            compressed_size: 0xb7b44ec,
+            uncompressed_size: 0xb7b44ec,
+        };
+        assert!(!data_seg.is_encrypted(), "bit 1 clear => plaintext");
+        assert!(!data_seg.is_compressed(), "bit 3 clear => uncompressed");
+        assert!(data_seg.is_blocked(), "bit 11 set => blocked segment data");
+        assert_eq!(data_seg.segment_index(), 0, "bits 20+ => ELF phdr index");
+
+        // A real block/digest table entry: signed, NOT blocked.
+        let table = SelfEntry {
+            properties: 0x110004,
+            offset: 0xb70,
+            compressed_size: 0x5bdc0,
+            uncompressed_size: 0x5bdc0,
+        };
+        assert!(!table.is_encrypted());
+        assert!(
+            !table.is_blocked(),
+            "not blocked => a table, not segment data"
+        );
+        assert_eq!(table.segment_index(), 1);
+    }
+
+    /// The real-hardware magics must be accepted, not just the fixture one —
+    /// otherwise every actual title is rejected at byte 0.
+    #[test]
+    fn real_self_magics_are_accepted() {
+        assert!(is_self_magic(SELF_MAGIC), "in-tree fixture magic");
+        assert!(is_self_magic(SELF_MAGIC_SCE), "PS4/PS5 SCE SELF magic");
+        assert!(
+            is_self_magic(SELF_MAGIC_PROSPERO),
+            "PS5 title magic (observed on a real eboot.bin)"
+        );
+        assert!(!is_self_magic(0x464C457F), "a bare ELF is not a SELF");
+        assert!(!is_self_magic(0xDEAD_BEEF));
+    }
+}
 
 /// SELF header structure.
 /// This is the outer container that wraps the inner ELF.
@@ -62,14 +143,37 @@ pub struct SelfEntry {
 }
 
 impl SelfEntry {
-    /// Check if this segment is encrypted.
+    /// Whether this segment's data is encrypted — real SELF `properties`
+    /// **bit 1**.
+    ///
+    /// The bit layout is the actual PS4/PS5 one: bit 0 `ordered`, **bit 1
+    /// `encrypted`**, bit 2 `signed`, bit 3 `compressed`, bit 11 `blocked`,
+    /// bits 20+ the segment id ([`Self::segment_index`]). These are
+    /// *independent flags*, not an enum.
+    ///
+    /// This previously tested `(properties >> 1) & 0x7`, i.e. bits 1-3 —
+    /// folding `signed` and `compressed` into "encrypted". That only ever
+    /// looked right because every in-tree fixture used `properties = 0`. Real
+    /// titles set `signed` on plaintext segments (e.g. `0x2804` = signed +
+    /// blocked, id 0), so the old test reported them as encrypted and the
+    /// loader demanded keys that do not exist for an already-decrypted dump —
+    /// making every real SELF unloadable.
     pub fn is_encrypted(&self) -> bool {
-        (self.properties >> 1) & 0x7 != 0
+        self.properties & 0x2 != 0
     }
 
-    /// Check if this segment is compressed.
+    /// Whether this segment's data is compressed — real SELF `properties`
+    /// **bit 3** (was previously read from bit 8, which is not the
+    /// compression bit). See [`Self::is_encrypted`] for the full layout.
     pub fn is_compressed(&self) -> bool {
-        (self.properties >> 8) & 0x1 != 0
+        self.properties & 0x8 != 0
+    }
+
+    /// Whether this segment is stored "blocked" — real SELF `properties`
+    /// **bit 11**. Blocked segments are accompanied by a separate block/digest
+    /// table entry; see [`Self::is_encrypted`] for the full layout.
+    pub fn is_blocked(&self) -> bool {
+        self.properties & 0x800 != 0
     }
 
     /// Check if this segment has data (non-zero size).
@@ -100,7 +204,7 @@ pub fn parse_self(data: &[u8]) -> Result<LoadedBinary, LoaderError> {
 
     // Read and validate the magic.
     let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    if magic != SELF_MAGIC {
+    if !is_self_magic(magic) {
         return Err(LoaderError::InvalidSelfMagic(magic));
     }
 
@@ -201,8 +305,8 @@ pub fn load_binary(data: &[u8]) -> Result<LoadedBinary, LoaderError> {
     let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
 
     match magic {
-        SELF_MAGIC => {
-            info!("Detected SELF format");
+        m if is_self_magic(m) => {
+            info!("Detected SELF format (magic {m:#010x})");
             parse_self(data)
         }
         0x464C457F => {
