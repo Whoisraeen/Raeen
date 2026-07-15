@@ -2048,6 +2048,2899 @@ fn recompile_fetch(
     Ok(false)
 }
 
+/// Kyty: `Recompile_BufferStoreDword_Vdata1VaddrSvSoffsIdxen`
+/// (ShaderSpirv.cpp L1999).
+fn recompile_buffer_store_dword_vdata1(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_BufferStoreDword_Vdata1VaddrSvSoffsIdxen";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.storage_buffers.buffers_num > 0 {
+            if !operand_is_constant(inst.src[2]) {
+                return Err(not_supported(FUNC, "src2 is not a constant"));
+            }
+
+            let dst_value = operand_variable_to_str(inst.dst);
+            let src0_value = operand_variable_to_str(inst.src[0]);
+            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+            let src1_value1 = operand_variable_to_str_shift(inst.src[1], 1);
+            // auto src1_value3 = operand_variable_to_str(inst.src[1], 3);
+            let offset = spirv.get_constant(inst.src[2]);
+
+            if dst_value.type_ != SpirvType::Float
+                || src0_value.type_ != SpirvType::Float
+                || src1_value0.type_ != SpirvType::Uint
+                || src1_value1.type_ != SpirvType::Uint
+            {
+                return Err(not_supported(FUNC, "unexpected operand types"));
+            }
+
+            // TODO() check VSKIP
+
+            const TEXT: &str = r#"
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_hi_u_<index> = OpLoad %uint %exec_hi ; unused
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+               OpSelectionMerge %t278_<index> None
+               OpBranchConditional %exec_lo_b_<index> %t277_<index> %t278_<index>
+		%t277_<index> = OpLabel
+
+        %t100_<index> = OpLoad %float %<src0>
+        %t101_<index> = OpBitcast %int %t100_<index>
+               OpStore %temp_int_1 %t101_<index>
+        %t148_<index> = OpLoad %uint %<src1_value1>
+        %t150_<index> = OpShiftRightLogical %uint %t148_<index> %int_16
+        %t152_<index> = OpBitwiseAnd %uint %t150_<index> %uint_0x00003fff
+        %t153_<index> = OpBitcast %int %t152_<index>
+               OpStore %temp_int_3 %t153_<index>
+        %t155_<index> = OpLoad %uint %<src1_value0>
+        %t156_<index> = OpBitcast %int %t155_<index>
+               OpStore %temp_int_4 %t156_<index>
+               OpStore %temp_int_2 %<offset>
+		;%t206_<index> = OpLoad %uint %<src1_value3>
+        ;%t208_<index> = OpShiftRightLogical %uint %t206_<index> %int_12
+        ;%t210_<index> = OpBitwiseAnd %uint %t208_<index> %uint_127
+        ;%t211_<index> = OpBitcast %int %t210_<index>
+        ;       OpStore %temp_int_5 %t211_<index>
+        %t110_<index> = OpFunctionCall %void %buffer_store_float1 %<p0> %temp_int_1 %temp_int_2 %temp_int_3 %temp_int_4
+
+               OpBranch %t278_<index>
+        %t278_<index> = OpLabel
+"#;
+            *dst_source += &TEXT
+                .replace("<index>", &format!("{index}"))
+                .replace("<src0>", &src0_value.value)
+                .replace("<offset>", &offset)
+                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<src1_value1>", &src1_value1.value)
+                // .replace("<src1_value3>", ...) — commented out in Kyty too.
+                .replace("<p0>", &dst_value.value);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Kyty: `Recompile_BufferStoreFormatX_Vdata1VaddrSvSoffsIdxen`
+/// (ShaderSpirv.cpp L2068).
+fn recompile_buffer_store_format_x_vdata1(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_BufferStoreFormatX_Vdata1VaddrSvSoffsIdxen";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.storage_buffers.buffers_num > 0 {
+            if !operand_is_constant(inst.src[2]) {
+                return Err(not_supported(FUNC, "src2 is not a constant"));
+            }
+
+            let dst_value = operand_variable_to_str(inst.dst);
+            let src0_value = operand_variable_to_str(inst.src[0]);
+            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+            let src1_value1 = operand_variable_to_str_shift(inst.src[1], 1);
+            let src1_value3 = operand_variable_to_str_shift(inst.src[1], 3);
+            let offset = spirv.get_constant(inst.src[2]);
+
+            if dst_value.type_ != SpirvType::Float
+                || src0_value.type_ != SpirvType::Float
+                || src1_value0.type_ != SpirvType::Uint
+                || src1_value1.type_ != SpirvType::Uint
+                || src1_value3.type_ != SpirvType::Uint
+            {
+                return Err(not_supported(FUNC, "unexpected operand types"));
+            }
+
+            // TODO() check VSKIP
+
+            const TEXT: &str = r#"
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_hi_u_<index> = OpLoad %uint %exec_hi ; unused
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+               OpSelectionMerge %t278_<index> None
+               OpBranchConditional %exec_lo_b_<index> %t277_<index> %t278_<index>
+		%t277_<index> = OpLabel
+
+        %t100_<index> = OpLoad %float %<src0>
+        %t101_<index> = OpBitcast %int %t100_<index>
+               OpStore %temp_int_1 %t101_<index>
+        %t148_<index> = OpLoad %uint %<src1_value1>
+        %t150_<index> = OpShiftRightLogical %uint %t148_<index> %int_16
+        %t152_<index> = OpBitwiseAnd %uint %t150_<index> %uint_0x00003fff
+        %t153_<index> = OpBitcast %int %t152_<index>
+               OpStore %temp_int_3 %t153_<index>
+        %t155_<index> = OpLoad %uint %<src1_value0>
+        %t156_<index> = OpBitcast %int %t155_<index>
+               OpStore %temp_int_4 %t156_<index>
+               OpStore %temp_int_2 %<offset>
+		%t206_<index> = OpLoad %uint %<src1_value3>
+        %t208_<index> = OpShiftRightLogical %uint %t206_<index> %int_12
+        %t210_<index> = OpBitwiseAnd %uint %t208_<index> %uint_127
+        %t211_<index> = OpBitcast %int %t210_<index>
+               OpStore %temp_int_5 %t211_<index>
+        %t110_<index> = OpFunctionCall %void %tbuffer_store_format_x %<p0> %temp_int_1 %temp_int_2 %temp_int_3 %temp_int_4 %temp_int_5
+
+               OpBranch %t278_<index>
+        %t278_<index> = OpLabel
+"#;
+            *dst_source += &TEXT
+                .replace("<index>", &format!("{index}"))
+                .replace("<src0>", &src0_value.value)
+                .replace("<offset>", &offset)
+                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<src1_value1>", &src1_value1.value)
+                .replace("<src1_value3>", &src1_value3.value)
+                .replace("<p0>", &dst_value.value);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Kyty: `Recompile_BufferStoreFormatXy_Vdata2VaddrSvSoffsIdxen`
+/// (ShaderSpirv.cpp L2137).
+fn recompile_buffer_store_format_xy_vdata2(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_BufferStoreFormatXy_Vdata2VaddrSvSoffsIdxen";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.storage_buffers.buffers_num > 0 {
+            if !operand_is_constant(inst.src[2]) {
+                return Err(not_supported(FUNC, "src2 is not a constant"));
+            }
+
+            let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+            let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+            let src0_value = operand_variable_to_str(inst.src[0]);
+            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+            let src1_value1 = operand_variable_to_str_shift(inst.src[1], 1);
+            let src1_value3 = operand_variable_to_str_shift(inst.src[1], 3);
+            let offset = spirv.get_constant(inst.src[2]);
+
+            if dst_value0.type_ != SpirvType::Float
+                || src0_value.type_ != SpirvType::Float
+                || src1_value0.type_ != SpirvType::Uint
+                || src1_value1.type_ != SpirvType::Uint
+                || src1_value3.type_ != SpirvType::Uint
+            {
+                return Err(not_supported(FUNC, "unexpected operand types"));
+            }
+
+            // TODO() check VSKIP
+
+            const TEXT: &str = r#"
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_hi_u_<index> = OpLoad %uint %exec_hi ; unused
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+               OpSelectionMerge %t278_<index> None
+               OpBranchConditional %exec_lo_b_<index> %t277_<index> %t278_<index>
+		%t277_<index> = OpLabel
+
+        %t100_<index> = OpLoad %float %<src0>
+        %t101_<index> = OpBitcast %int %t100_<index>
+               OpStore %temp_int_1 %t101_<index>
+        %t148_<index> = OpLoad %uint %<src1_value1>
+        %t150_<index> = OpShiftRightLogical %uint %t148_<index> %int_16
+        %t152_<index> = OpBitwiseAnd %uint %t150_<index> %uint_0x00003fff
+        %t153_<index> = OpBitcast %int %t152_<index>
+               OpStore %temp_int_3 %t153_<index>
+        %t155_<index> = OpLoad %uint %<src1_value0>
+        %t156_<index> = OpBitcast %int %t155_<index>
+               OpStore %temp_int_4 %t156_<index>
+               OpStore %temp_int_2 %<offset>
+		%t206_<index> = OpLoad %uint %<src1_value3>
+        %t208_<index> = OpShiftRightLogical %uint %t206_<index> %int_12
+        %t210_<index> = OpBitwiseAnd %uint %t208_<index> %uint_127
+        %t211_<index> = OpBitcast %int %t210_<index>
+               OpStore %temp_int_5 %t211_<index>
+        %t110_<index> = OpFunctionCall %void %tbuffer_store_format_xy %<p0> %<p1> %temp_int_1 %temp_int_2 %temp_int_3 %temp_int_4 %temp_int_5
+
+               OpBranch %t278_<index>
+        %t278_<index> = OpLabel
+"#;
+            *dst_source += &TEXT
+                .replace("<index>", &format!("{index}"))
+                .replace("<src0>", &src0_value.value)
+                .replace("<offset>", &offset)
+                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<src1_value1>", &src1_value1.value)
+                .replace("<src1_value3>", &src1_value3.value)
+                .replace("<p0>", &dst_value0.value)
+                .replace("<p1>", &dst_value1.value);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Shared body of `Recompile_DsAppend_VdstGds` / `Recompile_DsConsume_VdstGds`
+/// (ShaderSpirv.cpp L2208/L2243) — the two Kyty functions are identical
+/// except for the atomic opcode.
+fn ds_append_consume(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    func: &'static str,
+    atomic_op: &'static str,
+) -> Result<bool, ShaderRecompileError> {
+    let inst = inst_at(code, index, func)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.gds_pointers.pointers_num > 0 {
+            let index_str = format!("{index}");
+
+            if !operand_is_variable(inst.dst) {
+                return Err(not_supported(func, "dst is not a variable"));
+            }
+
+            let dst_value = operand_variable_to_str(inst.dst);
+
+            if dst_value.type_ != SpirvType::Float {
+                return Err(not_supported(func, "dst is not float"));
+            }
+
+            // TODO() check VSKIP
+            // TODO() check EXEC
+
+            const TEXT: &str = r#"
+        %t192_<index> = OpLoad %uint %m0
+        %t194_<index> = OpShiftRightLogical %uint %t192_<index> %int_16
+        %t196_<index> = OpAccessChain %_ptr_StorageBuffer_uint %gds %int_0 %t194_<index>
+        %t198_<index> = <atomic_op> %uint %t196_<index> %uint_1 %uint_0 %uint_1
+        %t199_<index> = OpBitcast %float %t198_<index>
+               OpStore %<dst> %t199_<index>
+               OpMemoryBarrier %uint_1 %uint_72
+"#;
+            *dst_source += &TEXT
+                .replace("<atomic_op>", atomic_op)
+                .replace("<dst>", &dst_value.value)
+                .replace("<index>", &index_str);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Kyty: `Recompile_DsAppend_VdstGds` (ShaderSpirv.cpp L2208).
+fn recompile_ds_append(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    ds_append_consume(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_DsAppend_VdstGds",
+        "OpAtomicIAdd",
+    )
+}
+
+/// Kyty: `Recompile_DsConsume_VdstGds` (ShaderSpirv.cpp L2243).
+fn recompile_ds_consume(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    ds_append_consume(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_DsConsume_VdstGds",
+        "OpAtomicISub",
+    )
+}
+
+/// Shared body of the seven `Recompile_ImageSample_*` dmask variants
+/// (ShaderSpirv.cpp L2471/L2525/L2579/L2638/L2697/L2756/L2968). Upstream
+/// duplicates the whole function per dmask; the bodies differ only in which
+/// sampled channels land in which consecutive dst registers, expressed here
+/// as `(temp_id, channel)` pairs matching Kyty's temp numbering exactly.
+fn image_sample_channels(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    func: &'static str,
+    channels: &[(u32, u32)],
+) -> Result<bool, ShaderRecompileError> {
+    let inst = inst_at(code, index, func)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
+            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
+            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
+            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+            let src2_value0 = operand_variable_to_str_shift(inst.src[2], 0);
+
+            let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+            if dst_value0.type_ != SpirvType::Float
+                || src0_value0.type_ != SpirvType::Float
+                || src1_value0.type_ != SpirvType::Uint
+                || src2_value0.type_ != SpirvType::Uint
+            {
+                return Err(not_supported(func, "unexpected operand types"));
+            }
+
+            // TODO() check VSKIP
+            // TODO() check LOD_CLAMPED
+
+            const HEAD: &str = r#"
+         %t24_<index> = OpLoad %uint %<src1_value0>
+         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageS %textures2D_S %t24_<index>
+         %t27_<index> = OpLoad %ImageS %t26_<index>
+         %t33_<index> = OpLoad %uint %<src2_value0>
+         %t35_<index> = OpAccessChain %_ptr_UniformConstant_Sampler %samplers %t33_<index>
+         %t36_<index> = OpLoad %Sampler %t35_<index>
+         %t38_<index> = OpSampledImage %SampledImage %t27_<index> %t36_<index>
+         %t39_<index> = OpLoad %float %<src0_value0>
+         %t40_<index> = OpLoad %float %<src0_value1>
+         %t42_<index> = OpCompositeConstruct %v2float %t39_<index> %t40_<index>
+         %t43_<index> = OpImageSampleImplicitLod %v4float %t38_<index> %t42_<index>
+               OpStore %temp_v4float %t43_<index>
+"#;
+            const TAIL: &str = r#"         %t<t0>_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_<chan>
+         %t<t1>_<index> = OpLoad %float %t<t0>_<index>
+               OpStore %<dst_value> %t<t1>_<index>
+"#;
+
+            let mut text = HEAD.to_string();
+            for (i, (t0, chan)) in channels.iter().enumerate() {
+                let dst_value = operand_variable_to_str_shift(inst.dst, i as i32);
+                text += &TAIL
+                    .replace("<t0>", &format!("{t0}"))
+                    .replace("<t1>", &format!("{}", t0 + 1))
+                    .replace("<chan>", &format!("{chan}"))
+                    .replace("<dst_value>", &dst_value.value);
+            }
+
+            *dst_source += &text
+                .replace("<src0_value0>", &src0_value0.value)
+                .replace("<src0_value1>", &src0_value1.value)
+                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<src2_value0>", &src2_value0.value)
+                .replace("<index>", &format!("{index}"));
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Kyty: `Recompile_ImageSample_Vdata1Vaddr3StSsDmask1` (ShaderSpirv.cpp
+/// L2471).
+fn recompile_image_sample_dmask1(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSample_Vdata1Vaddr3StSsDmask1";
+    image_sample_channels(index, code, dst_source, spirv, FUNC, &[(46, 0)])
+}
+
+/// Kyty: `Recompile_ImageSample_Vdata1Vaddr3StSsDmask8` (ShaderSpirv.cpp
+/// L2525).
+fn recompile_image_sample_dmask8(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSample_Vdata1Vaddr3StSsDmask8";
+    image_sample_channels(index, code, dst_source, spirv, FUNC, &[(46, 3)])
+}
+
+/// Kyty: `Recompile_ImageSample_Vdata2Vaddr3StSsDmask3` (ShaderSpirv.cpp
+/// L2579).
+fn recompile_image_sample_dmask3(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSample_Vdata2Vaddr3StSsDmask3";
+    image_sample_channels(index, code, dst_source, spirv, FUNC, &[(46, 0), (54, 1)])
+}
+
+/// Kyty: `Recompile_ImageSample_Vdata2Vaddr3StSsDmask5` (ShaderSpirv.cpp
+/// L2638).
+fn recompile_image_sample_dmask5(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSample_Vdata2Vaddr3StSsDmask5";
+    image_sample_channels(index, code, dst_source, spirv, FUNC, &[(46, 0), (54, 2)])
+}
+
+/// Kyty: `Recompile_ImageSample_Vdata2Vaddr3StSsDmask9` (ShaderSpirv.cpp
+/// L2697).
+fn recompile_image_sample_dmask9(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSample_Vdata2Vaddr3StSsDmask9";
+    image_sample_channels(index, code, dst_source, spirv, FUNC, &[(46, 0), (54, 3)])
+}
+
+/// Kyty: `Recompile_ImageSample_Vdata3Vaddr3StSsDmask7` (ShaderSpirv.cpp
+/// L2756).
+fn recompile_image_sample_dmask7(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSample_Vdata3Vaddr3StSsDmask7";
+    image_sample_channels(
+        index,
+        code,
+        dst_source,
+        spirv,
+        FUNC,
+        &[(46, 0), (50, 1), (54, 2)],
+    )
+}
+
+/// Kyty: `Recompile_ImageSample_Vdata4Vaddr3StSsDmaskF` (ShaderSpirv.cpp
+/// L2968).
+fn recompile_image_sample_dmask_f(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSample_Vdata4Vaddr3StSsDmaskF";
+    image_sample_channels(
+        index,
+        code,
+        dst_source,
+        spirv,
+        FUNC,
+        &[(46, 0), (50, 1), (54, 2), (57, 3)],
+    )
+}
+
+/// Kyty: `Recompile_ImageSampleLz_Vdata3Vaddr3StSsDmask7` (ShaderSpirv.cpp
+/// L2821).
+fn recompile_image_sample_lz_dmask7(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSampleLz_Vdata3Vaddr3StSsDmask7";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
+            let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+            let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+            let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
+            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
+            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
+            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+            let src2_value0 = operand_variable_to_str_shift(inst.src[2], 0);
+
+            if dst_value0.type_ != SpirvType::Float
+                || src0_value0.type_ != SpirvType::Float
+                || src1_value0.type_ != SpirvType::Uint
+                || src2_value0.type_ != SpirvType::Uint
+            {
+                return Err(not_supported(FUNC, "unexpected operand types"));
+            }
+
+            // TODO() check VSKIP
+            // TODO() check LOD_CLAMPED
+
+            const TEXT: &str = r#"
+         %t24_<index> = OpLoad %uint %<src1_value0>
+         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageS %textures2D_S %t24_<index>
+         %t27_<index> = OpLoad %ImageS %t26_<index>
+         %t33_<index> = OpLoad %uint %<src2_value0>
+         %t35_<index> = OpAccessChain %_ptr_UniformConstant_Sampler %samplers %t33_<index>
+         %t36_<index> = OpLoad %Sampler %t35_<index>
+         %t38_<index> = OpSampledImage %SampledImage %t27_<index> %t36_<index>
+
+         %t39_<index> = OpLoad %float %<src0_value0>
+         %t40_<index> = OpLoad %float %<src0_value1>
+         %t42_<index> = OpCompositeConstruct %v2float %t39_<index> %t40_<index>
+
+         %t43_<index> = OpImageSampleExplicitLod %v4float %t38_<index> %t42_<index> Lod %float_0_000000
+               OpStore %temp_v4float %t43_<index>
+         %t46_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_0
+         %t47_<index> = OpLoad %float %t46_<index>
+               OpStore %<dst_value0> %t47_<index>
+         %t50_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_1
+         %t51_<index> = OpLoad %float %t50_<index>
+               OpStore %<dst_value1> %t51_<index>
+         %t54_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_2
+         %t55_<index> = OpLoad %float %t54_<index>
+               OpStore %<dst_value2> %t55_<index>
+"#;
+            *dst_source += &TEXT
+                .replace("<index>", &format!("{index}"))
+                .replace("<src0_value0>", &src0_value0.value)
+                .replace("<src0_value1>", &src0_value1.value)
+                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<src2_value0>", &src2_value0.value)
+                .replace("<dst_value0>", &dst_value0.value)
+                .replace("<dst_value1>", &dst_value1.value)
+                .replace("<dst_value2>", &dst_value2.value);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Kyty: `Recompile_ImageSampleLzO_Vdata3Vaddr4StSsDmask7` (ShaderSpirv.cpp
+/// L2887).
+fn recompile_image_sample_lzo_dmask7(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSampleLzO_Vdata3Vaddr4StSsDmask7";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
+            let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+            let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+            let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
+            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
+            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
+            let src0_value2 = operand_variable_to_str_shift(inst.src[0], 2);
+            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+            let src2_value0 = operand_variable_to_str_shift(inst.src[2], 0);
+
+            if dst_value0.type_ != SpirvType::Float
+                || src0_value0.type_ != SpirvType::Float
+                || src1_value0.type_ != SpirvType::Uint
+                || src2_value0.type_ != SpirvType::Uint
+            {
+                return Err(not_supported(FUNC, "unexpected operand types"));
+            }
+
+            // TODO() check VSKIP
+            // TODO() check LOD_CLAMPED
+
+            const TEXT: &str = r#"
+         %t24_<index> = OpLoad %uint %<src1_value0>
+         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageS %textures2D_S %t24_<index>
+         %t27_<index> = OpLoad %ImageS %t26_<index>
+         %t33_<index> = OpLoad %uint %<src2_value0>
+         %t35_<index> = OpAccessChain %_ptr_UniformConstant_Sampler %samplers %t33_<index>
+         %t36_<index> = OpLoad %Sampler %t35_<index>
+         %t38_<index> = OpSampledImage %SampledImage %t27_<index> %t36_<index>
+
+         %t39_<index> = OpLoad %float %<src0_value1>
+         %t40_<index> = OpLoad %float %<src0_value2>
+         %t42_<index> = OpCompositeConstruct %v2float %t39_<index> %t40_<index>
+
+         %90_<index> = OpLoad %float %<src0_value0>
+         %91_<index> = OpBitcast %int %90_<index>
+         %98_<index> = OpBitFieldSExtract %int %91_<index> %int_0 %int_6
+        %101_<index> = OpBitFieldSExtract %int %91_<index> %int_8 %int_6
+        %102_<index> = OpCompositeConstruct %v2int %98_<index> %101_<index>
+
+         %130_<index> = OpConvertSToF %v2float %102_<index>
+         %138_<index> = OpImage %ImageS %t38_<index>
+        %139_<index> = OpImageQuerySizeLod %v2int %138_<index> %int_0
+        %140_<index> = OpConvertSToF %v2float %139_<index>
+        %141_<index> = OpFDiv %v2float %130_<index> %140_<index>
+        %142_<index> = OpFAdd %v2float %t42_<index> %141_<index>
+
+         %t43_<index> = OpImageSampleExplicitLod %v4float %t38_<index> %142_<index> Lod %float_0_000000
+               OpStore %temp_v4float %t43_<index>
+         %t46_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_0
+         %t47_<index> = OpLoad %float %t46_<index>
+               OpStore %<dst_value0> %t47_<index>
+         %t50_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_1
+         %t51_<index> = OpLoad %float %t50_<index>
+               OpStore %<dst_value1> %t51_<index>
+         %t54_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_2
+         %t55_<index> = OpLoad %float %t54_<index>
+               OpStore %<dst_value2> %t55_<index>
+"#;
+            *dst_source += &TEXT
+                .replace("<index>", &format!("{index}"))
+                .replace("<src0_value0>", &src0_value0.value)
+                .replace("<src0_value1>", &src0_value1.value)
+                .replace("<src0_value2>", &src0_value2.value)
+                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<src2_value0>", &src2_value0.value)
+                .replace("<dst_value0>", &dst_value0.value)
+                .replace("<dst_value1>", &dst_value1.value)
+                .replace("<dst_value2>", &dst_value2.value);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Kyty: `Recompile_ImageLoad_Vdata4Vaddr3StDmaskF` (ShaderSpirv.cpp L3038).
+fn recompile_image_load_dmask_f(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageLoad_Vdata4Vaddr3StDmaskF";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.textures2d.textures2d_sampled_num > 0 {
+            let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+            let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+            let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
+            let dst_value3 = operand_variable_to_str_shift(inst.dst, 3);
+            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
+            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
+            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+
+            if dst_value0.type_ != SpirvType::Float
+                || src0_value0.type_ != SpirvType::Float
+                || src1_value0.type_ != SpirvType::Uint
+            {
+                return Err(not_supported(FUNC, "unexpected operand types"));
+            }
+
+            // TODO() check VSKIP
+            // TODO() check LOD_CLAMPED
+            // TODO() swizzle channels
+            // TODO() convert SRGB -> LINEAR if SRGB format was replaced with UNORM
+
+            const TEXT: &str = r#"
+         %t24_<index> = OpLoad %uint %<src1_value0>
+         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageS %textures2D_S %t24_<index>
+         %t27_<index> = OpLoad %ImageS %t26_<index>
+         %t67_<index> = OpLoad %float %<src0_value0>
+         %t69_<index> = OpBitcast %uint %t67_<index>
+         %t70_<index> = OpLoad %float %<src0_value1>
+         %t71_<index> = OpBitcast %uint %t70_<index>
+         %t73_<index> = OpCompositeConstruct %v2uint %t69_<index> %t71_<index>
+         %t74_<index> = OpImageFetch %v4float %t27_<index> %t73_<index>
+               OpStore %temp_v4float %t74_<index>
+         %t46_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_0
+         %t47_<index> = OpLoad %float %t46_<index>
+               OpStore %<dst_value0> %t47_<index>
+         %t50_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_1
+         %t51_<index> = OpLoad %float %t50_<index>
+               OpStore %<dst_value1> %t51_<index>
+         %t54_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_2
+         %t55_<index> = OpLoad %float %t54_<index>
+               OpStore %<dst_value2> %t55_<index>
+         %t57_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_3
+         %t58_<index> = OpLoad %float %t57_<index>
+               OpStore %<dst_value3> %t58_<index>
+"#;
+            *dst_source += &TEXT
+                .replace("<index>", &format!("{index}"))
+                .replace("<src0_value0>", &src0_value0.value)
+                .replace("<src0_value1>", &src0_value1.value)
+                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<dst_value0>", &dst_value0.value)
+                .replace("<dst_value1>", &dst_value1.value)
+                .replace("<dst_value2>", &dst_value2.value)
+                .replace("<dst_value3>", &dst_value3.value);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Kyty: `Recompile_ImageStore_Vdata4Vaddr3StDmaskF` (ShaderSpirv.cpp L3105).
+fn recompile_image_store_dmask_f(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageStore_Vdata4Vaddr3StDmaskF";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.textures2d.textures2d_storage_num > 0 {
+            let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+            let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+            let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
+            let dst_value3 = operand_variable_to_str_shift(inst.dst, 3);
+
+            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
+            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
+
+            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+            let src1_value2 = operand_variable_to_str_shift(inst.src[1], 2);
+
+            if dst_value0.type_ != SpirvType::Float
+                || src0_value0.type_ != SpirvType::Float
+                || src1_value0.type_ != SpirvType::Uint
+            {
+                return Err(not_supported(FUNC, "unexpected operand types"));
+            }
+
+            // TODO() check VSKIP
+            // TODO() check LOD_CLAMPED
+            // TODO() swizzle channels
+            // TODO() convert SRGB -> LINEAR if SRGB format was replaced with UNORM
+
+            const TEXT: &str = r#"
+         %t24_<index> = OpLoad %uint %<src1_value0>
+         %t25_<index> = OpLoad %uint %<src1_value2>
+		%t143_<index> = OpShiftRightLogical %uint %t25_<index> %uint_0
+        %t145_<index> = OpBitwiseAnd %uint %t143_<index> %uint_0x00003fff
+        %t146_<index> = OpIAdd %uint %t145_<index> %uint_1
+        %t149_<index> = OpShiftRightLogical %uint %t25_<index> %uint_14
+        %t150_<index> = OpBitwiseAnd %uint %t149_<index> %uint_0x00003fff
+        %t151_<index> = OpIAdd %uint %t150_<index> %uint_1
+         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageL %textures2D_L %t24_<index>
+         %t27_<index> = OpLoad %ImageL %t26_<index>
+         %t67_<index> = OpLoad %float %<src0_value0>
+         %t69_<index> = OpBitcast %uint %t67_<index>
+         %t70_<index> = OpLoad %float %<src0_value1>
+         %t71_<index> = OpBitcast %uint %t70_<index>
+         %t73_<index> = OpCompositeConstruct %v2uint %t69_<index> %t71_<index>
+         %t84_<index> = OpLoad %float %<dst_value0>
+         %t85_<index> = OpLoad %float %<dst_value1>
+         %t86_<index> = OpLoad %float %<dst_value2>
+         %t87_<index> = OpLoad %float %<dst_value3>
+         %t88_<index> = OpCompositeConstruct %v4float %t84_<index> %t85_<index> %t86_<index> %t87_<index>
+               OpImageWrite %t27_<index> %t73_<index> %t88_<index>
+"#;
+            *dst_source += &TEXT
+                .replace("<index>", &format!("{index}"))
+                .replace("<src0_value0>", &src0_value0.value)
+                .replace("<src0_value1>", &src0_value1.value)
+                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<src1_value2>", &src1_value2.value)
+                .replace("<dst_value0>", &dst_value0.value)
+                .replace("<dst_value1>", &dst_value1.value)
+                .replace("<dst_value2>", &dst_value2.value)
+                .replace("<dst_value3>", &dst_value3.value);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Kyty: `Recompile_ImageStoreMip_Vdata4Vaddr4StDmaskF` (ShaderSpirv.cpp
+/// L3173).
+fn recompile_image_store_mip_dmask_f(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageStoreMip_Vdata4Vaddr4StDmaskF";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.textures2d.textures2d_storage_num > 0 {
+            let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+            let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+            let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
+            let dst_value3 = operand_variable_to_str_shift(inst.dst, 3);
+
+            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
+            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
+            let src0_value2 = operand_variable_to_str_shift(inst.src[0], 2);
+
+            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+            let src1_value2 = operand_variable_to_str_shift(inst.src[1], 2);
+
+            if dst_value0.type_ != SpirvType::Float
+                || src0_value0.type_ != SpirvType::Float
+                || src1_value0.type_ != SpirvType::Uint
+            {
+                return Err(not_supported(FUNC, "unexpected operand types"));
+            }
+
+            // TODO() check VSKIP
+            // TODO() check LOD_CLAMPED
+            // TODO() swizzle channels
+            // TODO() convert SRGB -> LINEAR if SRGB format was replaced with UNORM
+
+            const TEXT: &str = r#"
+         %t24_<index> = OpLoad %uint %<src1_value0>
+         %t25_<index> = OpLoad %uint %<src1_value2>
+		%t143_<index> = OpShiftRightLogical %uint %t25_<index> %uint_0
+        %t145_<index> = OpBitwiseAnd %uint %t143_<index> %uint_0x00003fff
+        %t146_<index> = OpIAdd %uint %t145_<index> %uint_1
+        %t149_<index> = OpShiftRightLogical %uint %t25_<index> %uint_14
+        %t150_<index> = OpBitwiseAnd %uint %t149_<index> %uint_0x00003fff
+        %t151_<index> = OpIAdd %uint %t150_<index> %uint_1
+         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageL %textures2D_L %t24_<index>
+         %t27_<index> = OpLoad %ImageL %t26_<index>
+         %t67_<index> = OpLoad %float %<src0_value0>
+         %t69_<index> = OpBitcast %uint %t67_<index>
+         %t70_<index> = OpLoad %float %<src0_value1>
+         %t71_<index> = OpBitcast %uint %t70_<index>
+         %t701_<index> = OpLoad %float %<src0_value2>
+         %t711_<index> = OpBitcast %uint %t701_<index>
+         %t160_<index> = OpFunctionCall %v2uint %mipmap %t711_<index> %t146_<index> %t151_<index>
+         %t73_<index> = OpCompositeConstruct %v2uint %t69_<index> %t71_<index>
+         %t84_<index> = OpLoad %float %<dst_value0>
+         %t85_<index> = OpLoad %float %<dst_value1>
+         %t86_<index> = OpLoad %float %<dst_value2>
+         %t87_<index> = OpLoad %float %<dst_value3>
+         %t172_<index> = OpIAdd %v2uint %t160_<index> %t73_<index>
+         %t88_<index> = OpCompositeConstruct %v4float %t84_<index> %t85_<index> %t86_<index> %t87_<index>
+               OpImageWrite %t27_<index> %t172_<index> %t88_<index>
+"#;
+            *dst_source += &TEXT
+                .replace("<index>", &format!("{index}"))
+                .replace("<src0_value0>", &src0_value0.value)
+                .replace("<src0_value1>", &src0_value1.value)
+                .replace("<src0_value2>", &src0_value2.value)
+                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<src1_value2>", &src1_value2.value)
+                .replace("<dst_value0>", &dst_value0.value)
+                .replace("<dst_value1>", &dst_value1.value)
+                .replace("<dst_value2>", &dst_value2.value)
+                .replace("<dst_value3>", &dst_value3.value);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Kyty: `Recompile_S_XXX_B64_Sdst2Ssrc02Ssrc12` (ShaderSpirv.cpp L3248).
+/// XXX: Andn2, Orn2, And, Nor, Nand, Xnor, Or, Xor, Cselect (via `param`).
+fn recompile_s_xxx_b64_sdst2_ssrc02_ssrc12(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_S_XXX_B64_Sdst2Ssrc02Ssrc12";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+    let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+
+    if dst_value0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+    let mut load2 = String::new();
+    let mut load3 = String::new();
+
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, 0)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[0], "t1_<index>", &index_str, &mut load1, 1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[1], "t2_<index>", &index_str, &mut load2, 0)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[1], "t3_<index>", &index_str, &mut load3, 1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+    <load0>
+    <load1>
+    <load2>
+    <load3>
+    <param0>
+    <param1>
+    <param2>
+    <param3>
+    OpStore %<dst0> %tb_<index>
+    OpStore %<dst1> %td_<index>
+    <execz>
+    <scc>
+"#;
+
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<load2>", &load2)
+        .replace("<load3>", &load3)
+        .replace("<param0>", param[0].unwrap_or(""))
+        .replace("<param1>", param[1].unwrap_or(""))
+        .replace("<param2>", param[2].unwrap_or(""))
+        .replace("<param3>", param[3].unwrap_or(""))
+        .replace(
+            "<execz>",
+            if operand_is_exec(inst.dst) { EXECZ } else { "" },
+        )
+        .replace("<scc>", get_scc_check(scc_check, 2))
+        .replace("<dst0>", &dst_value0.value)
+        .replace("<dst1>", &dst_value1.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Shared body of `Recompile_S_Lshl_B64_Sdst2Ssrc02Ssrc1` /
+/// `Recompile_S_Lshr_B64_Sdst2Ssrc02Ssrc1` (ShaderSpirv.cpp L3316/L3384) —
+/// identical upstream except for the `shift_left`/`shift_right` callee.
+fn s_shift_b64(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    scc_check: SccCheck,
+    func: &'static str,
+    shift_func: &'static str,
+) -> Result<bool, ShaderRecompileError> {
+    let inst = inst_at(code, index, func)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(func, "dst is not a variable"));
+    }
+
+    let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+    let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+
+    if dst_value0.type_ != SpirvType::Uint {
+        return Err(not_supported(func, "dst is not uint"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+    let mut load2 = String::new();
+
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, 0)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[0], "t1_<index>", &index_str, &mut load1, 1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[1], "t2_<index>", &index_str, &mut load2, -1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+     <load0>
+     <load1>
+     <load2>
+     <param0>
+     <param1>
+     <param2>
+     <param3>
+%t22_<index> = OpBitwiseAnd %uint %t2_<index> %uint_63
+     OpStore %temp_uint_2 %t0_<index>
+     OpStore %temp_uint_3 %t1_<index>
+     OpStore %temp_uint_4 %t22_<index>
+%t_<index> = OpFunctionCall %void %<shift_func> %temp_uint_0 %temp_uint_1 %temp_uint_2 %temp_uint_3 %temp_uint_4
+%r0_<index> = OpLoad %uint %temp_uint_0
+%r1_<index> = OpLoad %uint %temp_uint_1
+     OpStore %<dst0> %r0_<index>
+     OpStore %<dst1> %r1_<index>
+     <execz>
+     <scc>
+"#;
+
+    *dst_source += &TEXT
+        .replace("<shift_func>", shift_func)
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<load2>", &load2)
+        .replace("<param0>", param[0].unwrap_or(""))
+        .replace("<param1>", param[1].unwrap_or(""))
+        .replace("<param2>", param[2].unwrap_or(""))
+        .replace("<param3>", param[3].unwrap_or(""))
+        .replace(
+            "<execz>",
+            if operand_is_exec(inst.dst) { EXECZ } else { "" },
+        )
+        .replace("<scc>", get_scc_check(scc_check, 2))
+        .replace("<dst0>", &dst_value0.value)
+        .replace("<dst1>", &dst_value1.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_S_Lshl_B64_Sdst2Ssrc02Ssrc1` (ShaderSpirv.cpp L3316).
+fn recompile_s_lshl_b64(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    s_shift_b64(
+        index,
+        code,
+        dst_source,
+        spirv,
+        param,
+        scc_check,
+        "Recompile_S_Lshl_B64_Sdst2Ssrc02Ssrc1",
+        "shift_left",
+    )
+}
+
+/// Kyty: `Recompile_S_Lshr_B64_Sdst2Ssrc02Ssrc1` (ShaderSpirv.cpp L3384).
+fn recompile_s_lshr_b64(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    s_shift_b64(
+        index,
+        code,
+        dst_source,
+        spirv,
+        param,
+        scc_check,
+        "Recompile_S_Lshr_B64_Sdst2Ssrc02Ssrc1",
+        "shift_right",
+    )
+}
+
+/// Kyty: `Recompile_S_Bfe_U64_Sdst2Ssrc02Ssrc1` (ShaderSpirv.cpp L3452).
+fn recompile_s_bfe_u64(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_S_Bfe_U64_Sdst2Ssrc02Ssrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+    let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+
+    if dst_value0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+    let mut load2 = String::new();
+
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, 0)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[0], "t1_<index>", &index_str, &mut load1, 1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[1], "t2_<index>", &index_str, &mut load2, -1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+     <load0>
+     <load1>
+     <load2>
+     <param0>
+     <param1>
+     <param2>
+     <param3>
+ %to_<index> = OpBitFieldUExtract %uint %t2_<index> %uint_0  %uint_6
+ %ts_<index> = OpBitFieldUExtract %uint %t2_<index> %uint_16 %uint_7
+%tn0_<index> = OpISub %uint %uint_64 %to_<index>
+%ts2_<index> = OpExtInst %uint %GLSL_std_450 UMin %ts_<index> %tn0_<index>
+%tn1_<index> = OpISub %uint %uint_64 %ts2_<index>
+%tn2_<index> = OpISub %uint %tn1_<index> %to_<index>
+     OpStore %temp_uint_2 %t0_<index>
+     OpStore %temp_uint_3 %t1_<index>
+     OpStore %temp_uint_4 %tn2_<index>
+%tf1_<index> = OpFunctionCall %void %shift_left %temp_uint_0 %temp_uint_1 %temp_uint_2 %temp_uint_3 %temp_uint_4
+     OpStore %temp_uint_4 %tn1_<index>
+%tf2_<index> = OpFunctionCall %void %shift_right %temp_uint_2 %temp_uint_3 %temp_uint_0 %temp_uint_1 %temp_uint_4
+ %r0_<index> = OpLoad %uint %temp_uint_2
+ %r1_<index> = OpLoad %uint %temp_uint_3
+     OpStore %<dst0> %r0_<index>
+     OpStore %<dst1> %r1_<index>
+     <execz>
+     <scc>
+"#;
+
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<load2>", &load2)
+        .replace("<param0>", param[0].unwrap_or(""))
+        .replace("<param1>", param[1].unwrap_or(""))
+        .replace("<param2>", param[2].unwrap_or(""))
+        .replace("<param3>", param[3].unwrap_or(""))
+        .replace(
+            "<execz>",
+            if operand_is_exec(inst.dst) { EXECZ } else { "" },
+        )
+        .replace("<scc>", get_scc_check(scc_check, 2))
+        .replace("<dst0>", &dst_value0.value)
+        .replace("<dst1>", &dst_value1.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_S_XXX_B32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp L3528).
+/// XXX: And, Bfm, Cselect, Lshl, Lshr, Or (via `param`).
+fn recompile_s_xxx_b32_svdst_svsrc01(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_S_XXX_B32_SVdstSVsrc0SVsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value = operand_variable_to_str(inst.dst);
+
+    if dst_value.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+    if operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "exec destination"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, -1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1, -1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+              <load0>
+              <load1>
+              <param0>
+              <param1>
+              <param2>
+              OpStore %<dst> %t_<index>
+              <scc>
+"#;
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<param0>", param[0].unwrap_or(""))
+        .replace("<param1>", param[1].unwrap_or(""))
+        .replace("<param2>", param[2].unwrap_or(""))
+        .replace("<scc>", get_scc_check(scc_check, 1))
+        .replace("<dst>", &dst_value.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_S_XXX_I32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp L3576).
+/// XXX: Add, Mul, Sub (via `param`).
+fn recompile_s_xxx_i32_svdst_svsrc01(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_S_XXX_I32_SVdstSVsrc0SVsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value = operand_variable_to_str(inst.dst);
+
+    if dst_value.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+    if operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "exec destination"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_int(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0)? {
+        return Ok(false);
+    }
+    if !operand_load_int(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+              <load0>
+              <load1>
+              <param>
+              %tu_<index> = OpBitcast %uint %t_<index>
+              OpStore %<dst> %tu_<index>
+              <scc>
+"#;
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<param>", param[0].unwrap_or(""))
+        .replace("<scc>", get_scc_check(scc_check, 1))
+        .replace("<dst>", &dst_value.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_S_XXX_U32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp L3621).
+/// XXX: Add, Addc, Bfe, Lshl4Add, MulHi (via `param`).
+fn recompile_s_xxx_u32_svdst_svsrc01(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_S_XXX_U32_SVdstSVsrc0SVsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value = operand_variable_to_str(inst.dst);
+
+    if dst_value.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+    if operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "exec destination"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, -1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1, -1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+              <load0>
+              <load1>
+              <param0>
+              <param1>
+              <param2>
+              <param3>
+              OpStore %<dst> %t_<index>
+              <scc>
+"#;
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<param0>", param[0].unwrap_or(""))
+        .replace("<param1>", param[1].unwrap_or(""))
+        .replace("<param2>", param[2].unwrap_or(""))
+        .replace("<param3>", param[3].unwrap_or(""))
+        .replace("<scc>", get_scc_check(scc_check, 1))
+        .replace("<dst>", &dst_value.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_SAndSaveexecB64_Sdst2Ssrc02` (ShaderSpirv.cpp L3670).
+fn recompile_s_and_saveexec_b64(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SAndSaveexecB64_Sdst2Ssrc02";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+    let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+
+    if dst_value0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+    if operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "exec destination"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, 0)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[0], "t1_<index>", &index_str, &mut load1, 1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load0>
+        <load1>
+        %t190_<index> = OpLoad %uint %exec_lo
+               OpStore %<dst0> %t190_<index>
+        %t191_<index> = OpLoad %uint %exec_hi
+               OpStore %<dst1> %t191_<index>
+        %t194_<index> = OpBitwiseAnd %uint %t0_<index> %t190_<index>
+               OpStore %exec_lo %t194_<index>
+        %t197_<index> = OpBitwiseAnd %uint %t1_<index> %t191_<index>
+               OpStore %exec_hi %t197_<index>
+        <execz>
+        <scc>
+"#;
+
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<execz>", EXECZ)
+        .replace("<scc>", get_scc_check(scc_check, 2))
+        .replace("<dst0>", &dst_value0.value)
+        .replace("<dst1>", &dst_value1.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_SCmp_XXX_I32_Ssrc0Ssrc1` (ShaderSpirv.cpp L3725).
+/// XXX: Eq, Ge, Gt, Lg, Lt, Le (comparison opcode via `param[0]`).
+fn recompile_scmp_xxx_i32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SCmp_XXX_I32_Ssrc0Ssrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_int(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0)? {
+        return Ok(false);
+    }
+    if !operand_load_int(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+          <load0>
+          <load1>
+          %t2_<index> = <param> %bool %t0_<index> %t1_<index>
+          %t3_<index> = OpSelect %uint %t2_<index> %uint_1 %uint_0
+          OpStore %scc %t3_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<param>", param[0].unwrap_or(""))
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_SCmp_XXX_U32_Ssrc0Ssrc1` (ShaderSpirv.cpp L3760).
+/// XXX: Eq, Ge, Gt, Le, Lt, Lg (comparison opcode via `param[0]`).
+fn recompile_scmp_xxx_u32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SCmp_XXX_U32_Ssrc0Ssrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, -1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1, -1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+          <load0>
+          <load1>
+          %t2_<index> = <param> %bool %t0_<index> %t1_<index>
+          %t3_<index> = OpSelect %uint %t2_<index> %uint_1 %uint_0
+          OpStore %scc %t3_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<param>", param[0].unwrap_or(""))
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_SMulkI32_SVdstSVsrc0` (ShaderSpirv.cpp L4437).
+fn recompile_smulk_i32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SMulkI32_SVdstSVsrc0";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value = operand_variable_to_str(inst.dst);
+
+    if dst_value.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+    if operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "exec destination"));
+    }
+
+    let mut load0 = String::new();
+    if !operand_load_int(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0)? {
+        return Ok(false);
+    }
+
+    let mut load_dst = String::new();
+    if !operand_load_int(spirv, inst.dst, "tdst_<index>", &index_str, &mut load_dst)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+    <load0>
+    <load_dst>
+%t_<index> = OpIMul %int %tdst_<index> %t0_<index>
+%tu_<index> = OpBitcast %uint %t_<index>
+    OpStore %<dst> %tu_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<dst>", &dst_value.value)
+        .replace("<load0>", &load0)
+        .replace("<load_dst>", &load_dst)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_SWqmB64_Sdst2Ssrc02` (ShaderSpirv.cpp L4621).
+fn recompile_swqm_b64(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SWqmB64_Sdst2Ssrc02";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if inst.dst.type_ == ShaderOperandType::ExecLo && inst.src[0].type_ == ShaderOperandType::ExecLo
+    {
+        return Ok(true);
+    }
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+    let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+
+    if dst_value0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, 0)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[0], "t1_<index>", &index_str, &mut load1, 1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load0>
+        <load1>
+        %t170_<index> = OpFunctionCall %uint %wqm %t0_<index> %uint_0 %uint_15
+        %t172_<index> = OpBitwiseOr %uint %uint_0 %t170_<index>
+        %t179_<index> = OpFunctionCall %uint %wqm %t0_<index> %uint_4 %uint_240
+        %t181_<index> = OpBitwiseOr %uint %t172_<index> %t179_<index>
+        %t188_<index> = OpFunctionCall %uint %wqm %t0_<index> %uint_8 %uint_0x00000f00
+        %t190_<index> = OpBitwiseOr %uint %t181_<index> %t188_<index>
+        %t197_<index> = OpFunctionCall %uint %wqm %t0_<index> %uint_12 %uint_0x0000f000
+        %t199_<index> = OpBitwiseOr %uint %t190_<index> %t197_<index>
+        %t206_<index> = OpFunctionCall %uint %wqm %t0_<index> %uint_16 %uint_0x000f0000
+        %t208_<index> = OpBitwiseOr %uint %t199_<index> %t206_<index>
+        %t215_<index> = OpFunctionCall %uint %wqm %t0_<index> %uint_20 %uint_0x00f00000
+        %t217_<index> = OpBitwiseOr %uint %t208_<index> %t215_<index>
+        %t224_<index> = OpFunctionCall %uint %wqm %t0_<index> %uint_24 %uint_0x0f000000
+        %t226_<index> = OpBitwiseOr %uint %t217_<index> %t224_<index>
+        %t233_<index> = OpFunctionCall %uint %wqm %t0_<index> %uint_28 %uint_0xf0000000
+        %t235_<index> = OpBitwiseOr %uint %t226_<index> %t233_<index>
+        %t1701_<index> = OpFunctionCall %uint %wqm %t1_<index> %uint_0 %uint_15
+        %t1721_<index> = OpBitwiseOr %uint %uint_0 %t1701_<index>
+        %t1791_<index> = OpFunctionCall %uint %wqm %t1_<index> %uint_4 %uint_240
+        %t1811_<index> = OpBitwiseOr %uint %t1721_<index> %t1791_<index>
+        %t1881_<index> = OpFunctionCall %uint %wqm %t1_<index> %uint_8 %uint_0x00000f00
+        %t1901_<index> = OpBitwiseOr %uint %t1811_<index> %t1881_<index>
+        %t1971_<index> = OpFunctionCall %uint %wqm %t1_<index> %uint_12 %uint_0x0000f000
+        %t1991_<index> = OpBitwiseOr %uint %t1901_<index> %t1971_<index>
+        %t2061_<index> = OpFunctionCall %uint %wqm %t1_<index> %uint_16 %uint_0x000f0000
+        %t2081_<index> = OpBitwiseOr %uint %t1991_<index> %t2061_<index>
+        %t2151_<index> = OpFunctionCall %uint %wqm %t1_<index> %uint_20 %uint_0x00f00000
+        %t2171_<index> = OpBitwiseOr %uint %t2081_<index> %t2151_<index>
+        %t2241_<index> = OpFunctionCall %uint %wqm %t1_<index> %uint_24 %uint_0x0f000000
+        %t2261_<index> = OpBitwiseOr %uint %t2171_<index> %t2241_<index>
+        %t2331_<index> = OpFunctionCall %uint %wqm %t1_<index> %uint_28 %uint_0xf0000000
+        %t2351_<index> = OpBitwiseOr %uint %t2261_<index> %t2331_<index>
+               OpStore %<dst0> %t235_<index>
+               OpStore %<dst1> %t2351_<index>
+        <execz>
+        <scc>
+"#;
+
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace(
+            "<execz>",
+            if operand_is_exec(inst.dst) { EXECZ } else { "" },
+        )
+        .replace("<scc>", get_scc_check(scc_check, 2))
+        .replace("<dst0>", &dst_value0.value)
+        .replace("<dst1>", &dst_value1.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_SBufferLoadDwordx2_Sdst2SvSoffset` (ShaderSpirv.cpp
+/// L3831).
+fn recompile_sbuffer_load_dwordx2(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SBufferLoadDwordx2_Sdst2SvSoffset";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.storage_buffers.buffers_num > 0 {
+            if !operand_is_constant(inst.src[1]) {
+                return Err(not_supported(FUNC, "src1 is not a constant"));
+            }
+
+            let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+            let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
+            let offset = spirv.get_constant(inst.src[1]);
+
+            if dst_value0.type_ != SpirvType::Uint || src0_value0.type_ != SpirvType::Uint {
+                return Err(not_supported(FUNC, "unexpected operand types"));
+            }
+            if operand_is_exec(inst.dst) {
+                return Err(not_supported(FUNC, "exec destination"));
+            }
+
+            const TEXT: &str = r#"
+        %t100_<index> = OpLoad %uint %<src0_value0>
+        %t101_<index> = OpBitcast %int %t100_<index>
+               OpStore %temp_int_2 %t101_<index>
+        %t102_<index> = OpBitcast %int %<offset>
+               OpStore %temp_int_1 %t102_<index>
+        %t110_<index> = OpFunctionCall %void %sbuffer_load_dword_2 %<p0> %<p1> %temp_int_1 %temp_int_2
+"#;
+            *dst_source += &TEXT
+                .replace("<index>", &format!("{index}"))
+                .replace("<offset>", &offset)
+                .replace("<src0_value0>", &src0_value0.value)
+                .replace("<p0>", &dst_value0.value)
+                .replace("<p1>", &dst_value1.value);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Shared body of `Recompile_SBufferLoadDwordx8/x16_Sdst*SvSoffset`
+/// (ShaderSpirv.cpp L3928/L3976) — identical upstream except for N and the
+/// `sbuffer_load_dword_N` callee.
+fn sbuffer_load_dword_n(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    func: &'static str,
+    n: usize,
+    callee: &'static str,
+) -> Result<bool, ShaderRecompileError> {
+    let inst = inst_at(code, index, func)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.storage_buffers.buffers_num > 0 {
+            if !operand_is_constant(inst.src[1]) {
+                return Err(not_supported(func, "src1 is not a constant"));
+            }
+
+            let dst_value: Vec<_> = (0..n)
+                .map(|i| operand_variable_to_str_shift(inst.dst, i as i32))
+                .collect();
+
+            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
+            let offset = spirv.get_constant(inst.src[1]);
+
+            if dst_value[0].type_ != SpirvType::Uint || src0_value0.type_ != SpirvType::Uint {
+                return Err(not_supported(func, "unexpected operand types"));
+            }
+            if operand_is_exec(inst.dst) {
+                return Err(not_supported(func, "exec destination"));
+            }
+
+            const TEXT: &str = r#"
+        %t100_<index> = OpLoad %uint %<src0_value0>
+        %t101_<index> = OpBitcast %int %t100_<index>
+               OpStore %temp_int_2 %t101_<index>
+        %t102_<index> = OpBitcast %int %<offset>
+               OpStore %temp_int_1 %t102_<index>
+        %t110_<index> = OpFunctionCall %void %<callee> <regs> %temp_int_1 %temp_int_2
+"#;
+            let regs: Vec<String> = dst_value.iter().map(|v| format!("%{}", v.value)).collect();
+
+            *dst_source += &TEXT
+                .replace("<callee>", callee)
+                .replace("<regs>", &regs.join(" "))
+                .replace("<index>", &format!("{index}"))
+                .replace("<offset>", &offset)
+                .replace("<src0_value0>", &src0_value0.value);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Kyty: `Recompile_SBufferLoadDwordx8_Sdst8SvSoffset` (ShaderSpirv.cpp
+/// L3928).
+fn recompile_sbuffer_load_dwordx8(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    sbuffer_load_dword_n(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_SBufferLoadDwordx8_Sdst8SvSoffset",
+        8,
+        "sbuffer_load_dword_8",
+    )
+}
+
+/// Kyty: `Recompile_SBufferLoadDwordx16_Sdst16SvSoffset` (ShaderSpirv.cpp
+/// L3976).
+fn recompile_sbuffer_load_dwordx16(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    sbuffer_load_dword_n(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_SBufferLoadDwordx16_Sdst16SvSoffset",
+        16,
+        "sbuffer_load_dword_16",
+    )
+}
+
+/// Kyty: `Recompile_TBufferLoadFormatXyzw_Vdata4Vaddr2SvSoffsOffenIdxenFloat4`
+/// (ShaderSpirv.cpp L4824).
+fn recompile_tbuffer_load_format_xyzw_offen_float4(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_TBufferLoadFormatXyzw_Vdata4Vaddr2SvSoffsOffenIdxenFloat4";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.storage_buffers.buffers_num > 0 {
+            if !operand_is_constant(inst.src[2]) {
+                return Err(not_supported(FUNC, "src2 is not a constant"));
+            }
+
+            let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+            let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+            let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
+            let dst_value3 = operand_variable_to_str_shift(inst.dst, 3);
+            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
+            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
+            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+            let src1_value1 = operand_variable_to_str_shift(inst.src[1], 1);
+            let offset = spirv.get_constant(inst.src[2]);
+
+            if dst_value0.type_ != SpirvType::Float
+                || src0_value0.type_ != SpirvType::Float
+                || src0_value1.type_ != SpirvType::Float
+                || src1_value0.type_ != SpirvType::Uint
+                || src1_value1.type_ != SpirvType::Uint
+            {
+                return Err(not_supported(FUNC, "unexpected operand types"));
+            }
+
+            // TODO() check VSKIP
+            // TODO() check EXEC
+
+            const TEXT: &str = r#"
+        %t100_<index> = OpLoad %float %<src0_value0>
+        %t101_<index> = OpBitcast %int %t100_<index>
+       %to100_<index> = OpLoad %float %<src0_value1>
+       %to101_<index> = OpBitcast %int %to100_<index>
+               OpStore %temp_int_1 %t101_<index>
+        %t148_<index> = OpLoad %uint %<src1_value1>
+        %t150_<index> = OpShiftRightLogical %uint %t148_<index> %int_16
+        %t152_<index> = OpBitwiseAnd %uint %t150_<index> %uint_0x00003fff
+        %t153_<index> = OpBitcast %int %t152_<index>
+               OpStore %temp_int_3 %t153_<index>
+        %t155_<index> = OpLoad %uint %<src1_value0>
+        %t156_<index> = OpBitcast %int %t155_<index>
+      %offset_<index> = OpIAdd %int %to101_<index> %<offset>
+               OpStore %temp_int_4 %t156_<index>
+               OpStore %temp_int_2 %offset_<index>
+               OpStore %temp_int_5 %int_119
+        %t110_<index> = OpFunctionCall %void %tbuffer_load_format_xyzw %<p0> %<p1> %<p2> %<p3> %temp_int_1 %temp_int_2 %temp_int_3 %temp_int_4 %temp_int_5
+"#;
+            *dst_source += &TEXT
+                .replace("<index>", &format!("{index}"))
+                .replace("<src0_value0>", &src0_value0.value)
+                .replace("<src0_value1>", &src0_value1.value)
+                .replace("<offset>", &offset)
+                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<src1_value1>", &src1_value1.value)
+                .replace("<p0>", &dst_value0.value)
+                .replace("<p1>", &dst_value1.value)
+                .replace("<p2>", &dst_value2.value)
+                .replace("<p3>", &dst_value3.value);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Kyty: `Recompile_VCmp_XXX_F32_SmaskVsrc0Vsrc1` (ShaderSpirv.cpp L4890).
+/// XXX: F, Eq, Ge, Gt, Le, Lg, Lt, Neq, Nge, Ngt, Nle, Nlg, Nlt, O, Tru, U
+/// (comparison via `param[0]`).
+fn recompile_vcmp_xxx_f32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VCmp_XXX_F32_SmaskVsrc0Vsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+    let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+
+    if dst_value0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+    if operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "exec destination"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_float(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0)? {
+        return Ok(false);
+    }
+    if !operand_load_float(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1)? {
+        return Ok(false);
+    }
+
+    // TODO() check VSKIP
+    // TODO() check EXEC
+
+    const TEXT: &str = r#"
+          <load0>
+          <load1>
+          %t2_<index> = <param> %bool %t0_<index> %t1_<index>
+          %t3_<index> = OpSelect %uint %t2_<index> %uint_1 %uint_0
+          OpStore %<dst0> %t3_<index>
+          OpStore %<dst1> %uint_0
+"#;
+    *dst_source += &TEXT
+        .replace("<dst0>", &dst_value0.value)
+        .replace("<dst1>", &dst_value1.value)
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<param>", param[0].unwrap_or(""))
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_VCmp_XXX_I32_SmaskVsrc0Vsrc1` (ShaderSpirv.cpp L4940).
+/// XXX: Eq, Ne, Gt, Ge, F, Le, Lt, T (comparison via `param[0]`).
+fn recompile_vcmp_xxx_i32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VCmp_XXX_I32_SmaskVsrc0Vsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+    let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+
+    if dst_value0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+    if operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "exec destination"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_int(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0)? {
+        return Ok(false);
+    }
+    if !operand_load_int(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1)? {
+        return Ok(false);
+    }
+
+    // TODO() check VSKIP
+    // TODO() check EXEC
+
+    const TEXT: &str = r#"
+          <load0>
+          <load1>
+          %t2_<index> = <param> %bool %t0_<index> %t1_<index>
+          %t3_<index> = OpSelect %uint %t2_<index> %uint_1 %uint_0
+          OpStore %<dst0> %t3_<index>
+          OpStore %<dst1> %uint_0
+"#;
+    *dst_source += &TEXT
+        .replace("<dst0>", &dst_value0.value)
+        .replace("<dst1>", &dst_value1.value)
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<param>", param[0].unwrap_or(""))
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_VCmp_XXX_U32_SmaskVsrc0Vsrc1` (ShaderSpirv.cpp L4990).
+/// XXX: Le, Ge, F, Gt, Lt, T (comparison via `param[0]`).
+fn recompile_vcmp_xxx_u32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VCmp_XXX_U32_SmaskVsrc0Vsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+    let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+
+    if dst_value0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+    if operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "exec destination"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, -1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1, -1)? {
+        return Ok(false);
+    }
+
+    // TODO() check VSKIP
+    // TODO() check EXEC
+
+    const TEXT: &str = r#"
+          <load0>
+          <load1>
+          %t2_<index> = <param> %bool %t0_<index> %t1_<index>
+          %t3_<index> = OpSelect %uint %t2_<index> %uint_1 %uint_0
+          OpStore %<dst0> %t3_<index>
+          OpStore %<dst1> %uint_0
+"#;
+    *dst_source += &TEXT
+        .replace("<dst0>", &dst_value0.value)
+        .replace("<dst1>", &dst_value1.value)
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<param>", param[0].unwrap_or(""))
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_VCmpx_XXX_I32_SmaskVsrc0Vsrc1` (ShaderSpirv.cpp L5040).
+/// XXX: Eq, Ne (comparison via `param[0]`; also writes EXEC).
+fn recompile_vcmpx_xxx_i32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VCmpx_XXX_I32_SmaskVsrc0Vsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+    let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+
+    if dst_value0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+    if operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "exec destination"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_int(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0)? {
+        return Ok(false);
+    }
+    if !operand_load_int(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1)? {
+        return Ok(false);
+    }
+
+    // TODO() check VSKIP
+    // TODO() check EXEC
+
+    const TEXT: &str = r#"
+          <load0>
+          <load1>
+          %t2_<index> = <param> %bool %t0_<index> %t1_<index>
+          %t3_<index> = OpSelect %uint %t2_<index> %uint_1 %uint_0
+          OpStore %<dst0> %t3_<index>
+          OpStore %<dst1> %uint_0
+          OpStore %exec_lo %t3_<index>
+          OpStore %exec_hi %uint_0
+          <execz>
+"#;
+    *dst_source += &TEXT
+        .replace("<dst0>", &dst_value0.value)
+        .replace("<dst1>", &dst_value1.value)
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<param>", param[0].unwrap_or(""))
+        .replace("<execz>", EXECZ)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_VCmpx_XXX_U32_SmaskVsrc0Vsrc1` (ShaderSpirv.cpp L5094).
+/// XXX: Gt, Ge (comparison via `param[0]`; also writes EXEC).
+fn recompile_vcmpx_xxx_u32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VCmpx_XXX_U32_SmaskVsrc0Vsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+    let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+
+    if dst_value0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+    if operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "exec destination"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, -1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1, -1)? {
+        return Ok(false);
+    }
+
+    // TODO() check VSKIP
+    // TODO() check EXEC
+
+    const TEXT: &str = r#"
+          <load0>
+          <load1>
+          %t2_<index> = <param> %bool %t0_<index> %t1_<index>
+          %t3_<index> = OpSelect %uint %t2_<index> %uint_1 %uint_0
+          OpStore %<dst0> %t3_<index>
+          OpStore %<dst1> %uint_0
+          OpStore %exec_lo %t3_<index>
+          OpStore %exec_hi %uint_0
+          <execz>
+"#;
+    *dst_source += &TEXT
+        .replace("<dst0>", &dst_value0.value)
+        .replace("<dst1>", &dst_value1.value)
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<param>", param[0].unwrap_or(""))
+        .replace("<execz>", EXECZ)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_VCmpx_XXX_F32_SmaskVsrc0Vsrc1` (ShaderSpirv.cpp L5148).
+/// XXX: Neq, Gt, Lt (comparison via `param[0]`; also writes EXEC).
+fn recompile_vcmpx_xxx_f32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VCmpx_XXX_F32_SmaskVsrc0Vsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+    let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+
+    if dst_value0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+    if operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "exec destination"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_float(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0)? {
+        return Ok(false);
+    }
+    if !operand_load_float(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1)? {
+        return Ok(false);
+    }
+
+    // TODO() check VSKIP
+    // TODO() check EXEC
+
+    const TEXT: &str = r#"
+          <load0>
+          <load1>
+          %t2_<index> = <param> %bool %t0_<index> %t1_<index>
+          %t3_<index> = OpSelect %uint %t2_<index> %uint_1 %uint_0
+          OpStore %<dst0> %t3_<index>
+          OpStore %<dst1> %uint_0
+          OpStore %exec_lo %t3_<index>
+          OpStore %exec_hi %uint_0
+          <execz>
+"#;
+    *dst_source += &TEXT
+        .replace("<dst0>", &dst_value0.value)
+        .replace("<dst1>", &dst_value1.value)
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<param>", param[0].unwrap_or(""))
+        .replace("<execz>", EXECZ)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_VCvtPkrtzF16F32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp
+/// L5260).
+fn recompile_vcvt_pkrtz_f16_f32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VCvtPkrtzF16F32_SVdstSVsrc0SVsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    if inst.dst.clamp {
+        return Err(not_supported(FUNC, "clamp"));
+    }
+    if inst.dst.multiplier != 1.0 {
+        return Err(not_supported(FUNC, "multiplier"));
+    }
+
+    let dst_value = operand_variable_to_str(inst.dst);
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_float(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0)? {
+        return Ok(false);
+    }
+    if !operand_load_float(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1)? {
+        return Ok(false);
+    }
+
+    // TODO() check VSKIP
+    // TODO() check DX10_CLAMP
+
+    const TEXT: &str = r#"
+    <load0>
+    <load1>
+    %t0u_<index> = OpBitcast %uint %t0_<index>
+    %t0uu_<index> = OpBitwiseAnd %uint %t0u_<index> %uint_0xffffe000
+    %t0f_<index> = OpBitcast %float %t0uu_<index>
+    %t1u_<index> = OpBitcast %uint %t1_<index>
+    %t1uu_<index> = OpBitwiseAnd %uint %t1u_<index> %uint_0xffffe000
+    %t1f_<index> = OpBitcast %float %t1uu_<index>
+    %t2_<index> = OpCompositeConstruct %v2float %t0f_<index> %t1f_<index>
+    %t3_<index> = OpExtInst %uint %GLSL_std_450 PackHalf2x16 %t2_<index>
+    %t4_<index> = OpBitcast %float %t3_<index>
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_hi_u_<index> = OpLoad %uint %exec_hi ; unused
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+        %tdst_<index> = OpLoad %float %<dst>
+        %tval_<index> = OpSelect %float %exec_lo_b_<index> %t4_<index> %tdst_<index>
+               OpStore %<dst> %tval_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<dst>", &dst_value.value)
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_VMbcntHiU32B32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp
+/// L5455).
+fn recompile_vmbcnt_hi_u32_b32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VMbcntHiU32B32_SVdstSVsrc0SVsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    if inst.dst.clamp {
+        return Err(not_supported(FUNC, "clamp"));
+    }
+    if inst.dst.multiplier != 1.0 {
+        return Err(not_supported(FUNC, "multiplier"));
+    }
+
+    let dst_value = operand_variable_to_str(inst.dst);
+
+    if dst_value.type_ != SpirvType::Float {
+        return Err(not_supported(FUNC, "dst is not float"));
+    }
+
+    let mut load0 = String::new();
+
+    if !operand_load_float(spirv, inst.src[1], "t1_<index>", &index_str, &mut load0)? {
+        return Ok(false);
+    }
+
+    // TODO() check VSKIP
+
+    const TEXT: &str = r#"
+	    <load0>
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_hi_u_<index> = OpLoad %uint %exec_hi ; unused
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+        %tdst_<index> = OpLoad %float %<dst>
+        %tval_<index> = OpSelect %float %exec_lo_b_<index> %t1_<index> %tdst_<index>
+               OpStore %<dst> %tval_<index>
+	"#;
+    *dst_source += &TEXT
+        .replace("<dst>", &dst_value.value)
+        .replace("<load0>", &load0)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_VMbcntLoU32B32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp
+/// L5497).
+fn recompile_vmbcnt_lo_u32_b32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VMbcntLoU32B32_SVdstSVsrc0SVsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value = operand_variable_to_str(inst.dst);
+
+    if dst_value.type_ != SpirvType::Float {
+        return Err(not_supported(FUNC, "dst is not float"));
+    }
+
+    let mut load0 = String::new();
+
+    if !operand_load_float(spirv, inst.src[1], "t1_<index>", &index_str, &mut load0)? {
+        return Ok(false);
+    }
+
+    // TODO() check VSKIP
+
+    const TEXT: &str = r#"
+	    <load0>
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_hi_u_<index> = OpLoad %uint %exec_hi ; unused
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+        %tdst_<index> = OpLoad %float %<dst>
+        %tval_<index> = OpSelect %float %exec_lo_b_<index> %t1_<index> %tdst_<index>
+               OpStore %<dst> %tval_<index>
+	"#;
+    *dst_source += &TEXT
+        .replace("<dst>", &dst_value.value)
+        .replace("<load0>", &load0)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_V_XXX_B32_SVdstSVsrc0` (ShaderSpirv.cpp L5538).
+/// XXX: Bfrev, Not (via `param`).
+fn recompile_v_xxx_b32_svdst_svsrc0(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_V_XXX_B32_SVdstSVsrc0";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value = operand_variable_to_str(inst.dst);
+
+    if dst_value.type_ != SpirvType::Float {
+        return Err(not_supported(FUNC, "dst is not float"));
+    }
+
+    let mut load0 = String::new();
+
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, -1)? {
+        return Ok(false);
+    }
+
+    // TODO() check VSKIP
+
+    const TEXT: &str = r#"
+              <load0>
+              <param0>
+              %tf_<index> = OpBitcast %float %t_<index>
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_hi_u_<index> = OpLoad %uint %exec_hi ; unused
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+        %tdst_<index> = OpLoad %float %<dst>
+        %tval_<index> = OpSelect %float %exec_lo_b_<index> %tf_<index> %tdst_<index>
+               OpStore %<dst> %tval_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<dst>", &dst_value.value)
+        .replace("<load0>", &load0)
+        .replace("<param0>", param[0].unwrap_or(""))
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp L5740).
+/// XXX: And, Or, Xor, Bcnt, Bfm, Lshr, Lshl, Lshlrev, Lshrrev, MulU32U24,
+/// MulLoU32, MulHiU32 (via `param`).
+fn recompile_v_xxx_b32_svdst_svsrc01(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    if inst.dst.clamp {
+        return Err(not_supported(FUNC, "clamp"));
+    }
+    if inst.dst.multiplier != 1.0 {
+        return Err(not_supported(FUNC, "multiplier"));
+    }
+
+    let dst_value = operand_variable_to_str(inst.dst);
+
+    if dst_value.type_ != SpirvType::Float {
+        return Err(not_supported(FUNC, "dst is not float"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, -1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1, -1)? {
+        return Ok(false);
+    }
+
+    // TODO() check VSKIP
+
+    const TEXT: &str = r#"
+              <load0>
+              <load1>
+              <param0>
+              <param1>
+              <param2>
+              %tf_<index> = OpBitcast %float %t_<index>
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_hi_u_<index> = OpLoad %uint %exec_hi ; unused
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+        %tdst_<index> = OpLoad %float %<dst>
+        %tval_<index> = OpSelect %float %exec_lo_b_<index> %tf_<index> %tdst_<index>
+               OpStore %<dst> %tval_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<dst>", &dst_value.value)
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<param0>", param[0].unwrap_or(""))
+        .replace("<param1>", param[1].unwrap_or(""))
+        .replace("<param2>", param[2].unwrap_or(""))
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_V_XXX_I32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp L5795).
+/// XXX: Ashr, Ashrrev, MulLo (via `param`).
+fn recompile_v_xxx_i32_svdst_svsrc01(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_V_XXX_I32_SVdstSVsrc0SVsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    if inst.dst.clamp {
+        return Err(not_supported(FUNC, "clamp"));
+    }
+    if inst.dst.multiplier != 1.0 {
+        return Err(not_supported(FUNC, "multiplier"));
+    }
+
+    let dst_value = operand_variable_to_str(inst.dst);
+
+    if dst_value.type_ != SpirvType::Float {
+        return Err(not_supported(FUNC, "dst is not float"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_int(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0)? {
+        return Ok(false);
+    }
+    if !operand_load_int(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1)? {
+        return Ok(false);
+    }
+
+    // TODO() check VSKIP
+
+    const TEXT: &str = r#"
+              <load0>
+              <load1>
+              <param0>
+              <param1>
+              %tf_<index> = OpBitcast %float %t_<index>
+              OpStore %<dst> %tf_<index>
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_hi_u_<index> = OpLoad %uint %exec_hi ; unused
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+        %tdst_<index> = OpLoad %float %<dst>
+        %tval_<index> = OpSelect %float %exec_lo_b_<index> %tf_<index> %tdst_<index>
+               OpStore %<dst> %tval_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<dst>", &dst_value.value)
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<param0>", param[0].unwrap_or(""))
+        .replace("<param1>", param[1].unwrap_or(""))
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_V_XXX_U32_VdstVsrc0Vsrc1Vsrc2` (ShaderSpirv.cpp L5940).
+/// XXX: Sad, Bfe, MadU32U24 (via `param`).
+fn recompile_v_xxx_u32_vdst_vsrc012(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_V_XXX_U32_VdstVsrc0Vsrc1Vsrc2";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    if inst.dst.clamp {
+        return Err(not_supported(FUNC, "clamp"));
+    }
+    if inst.dst.multiplier != 1.0 {
+        return Err(not_supported(FUNC, "multiplier"));
+    }
+
+    let dst_value = operand_variable_to_str(inst.dst);
+
+    if dst_value.type_ != SpirvType::Float {
+        return Err(not_supported(FUNC, "dst is not float"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+    let mut load2 = String::new();
+
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, -1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1, -1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[2], "t2_<index>", &index_str, &mut load2, -1)? {
+        return Ok(false);
+    }
+
+    // TODO() check VSKIP
+    // TODO() Sad: use only lower 16 bits of Vaccum
+
+    const TEXT: &str = r#"
+               <load0>
+               <load1>
+               <load2>
+               <param0>
+               <param1>
+               <param2>
+               <param3>
+         %tf_<index> = OpBitcast %float %t_<index>
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_hi_u_<index> = OpLoad %uint %exec_hi ; unused
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+        %tdst_<index> = OpLoad %float %<dst>
+        %tval_<index> = OpSelect %float %exec_lo_b_<index> %tf_<index> %tdst_<index>
+               OpStore %<dst> %tval_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<dst>", &dst_value.value)
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<load2>", &load2)
+        .replace("<param0>", param[0].unwrap_or(""))
+        .replace("<param1>", param[1].unwrap_or(""))
+        .replace("<param2>", param[2].unwrap_or(""))
+        .replace("<param3>", param[3].unwrap_or(""))
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_V_XXX_U32_VdstSdst2Vsrc0Vsrc1` (ShaderSpirv.cpp L6005).
+/// XXX: Add, Sub, Subrev (via `param`; carry-out goes to `dst2`).
+fn recompile_v_xxx_u32_vdst_sdst2_vsrc01(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_V_XXX_U32_VdstSdst2Vsrc0Vsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    if !operand_is_variable(inst.dst2) {
+        return Err(not_supported(FUNC, "dst2 is not a variable"));
+    }
+
+    let dst_value = operand_variable_to_str(inst.dst);
+    let dst2_value0 = operand_variable_to_str_shift(inst.dst2, 0);
+    let dst2_value1 = operand_variable_to_str_shift(inst.dst2, 1);
+
+    if operand_is_exec(inst.dst2) {
+        return Err(not_supported(FUNC, "exec dst2"));
+    }
+
+    if dst_value.type_ != SpirvType::Float || dst2_value0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "unexpected operand types"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, -1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1, -1)? {
+        return Ok(false);
+    }
+
+    // TODO() check VSKIP
+    // TODO() check EXEC
+
+    const TEXT: &str = r#"
+              <load0>
+              <load1>
+        <param>
+        %t208_<index> = OpCompositeExtract %uint %t_<index> 1
+        %t209_<index> = OpCompositeExtract %uint %t_<index> 0
+        %t210_<index> = OpBitcast %float %t209_<index>
+               OpStore %<dst> %t210_<index>
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_hi_u_<index> = OpLoad %uint %exec_hi ; unused
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+        %t213_<index> = OpSelect %uint %exec_lo_b_<index> %t208_<index> %uint_0
+               OpStore %<dst2_0> %t213_<index>
+               OpStore %<dst2_1> %uint_0
+"#;
+    *dst_source += &TEXT
+        .replace("<dst>", &dst_value.value)
+        .replace("<dst2_0>", &dst2_value0.value)
+        .replace("<dst2_1>", &dst2_value1.value)
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<param>", param[0].unwrap_or(""))
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Kyty: `Recompile_Inject_Debug` (ShaderSpirv.cpp L6131) — not a table row;
+/// called from `Spirv::WriteInstructions` (L7834) after each recompiled
+/// instruction when debug printf is enabled.
+pub(crate) fn recompile_inject_debug(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    use crate::shader::types::ShaderDebugPrintfType;
+
+    const FUNC: &str = "Recompile_Inject_Debug";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    let mut injected = false;
+    for (str_id, c) in code.get_debug_printfs().iter().enumerate() {
+        if c.pc == inst.pc {
+            if c.args.len() != c.types.len() {
+                return Err(not_supported(FUNC, "args/types size mismatch"));
+            }
+            let mut loads: Vec<String> = Vec::new();
+            let mut params_ids: Vec<String> = Vec::new();
+            for (arg_id, a) in c.args.iter().enumerate() {
+                let type_ = c.types[arg_id];
+                let result_id = format!("t_{arg_id}_<index>");
+                let mut load = String::new();
+                let ok = match type_ {
+                    ShaderDebugPrintfType::Uint => {
+                        operand_load_uint(spirv, *a, &result_id, &index_str, &mut load, -1)?
+                    }
+                    ShaderDebugPrintfType::Int => {
+                        operand_load_int(spirv, *a, &result_id, &index_str, &mut load)?
+                    }
+                    ShaderDebugPrintfType::Float => {
+                        operand_load_float(spirv, *a, &result_id, &index_str, &mut load)?
+                    }
+                };
+                if !ok {
+                    return Err(not_supported(FUNC, "can't load printf argument"));
+                }
+                loads.push(load);
+                params_ids.push(format!("%{result_id}"));
+            }
+
+            const TEXT: &str = r#"
+                <loads>
+     %tt_<index> = OpExtInst %void %NonSemantic_DebugPrintf 1 %printf_str_<str_id> <params>
+		"#;
+            *dst_source += &TEXT
+                .replace("<loads>", &loads.join("\n"))
+                .replace("<str_id>", &format!("{str_id}"))
+                .replace("<params>", &params_ids.join(" "))
+                .replace("<index>", &index_str);
+            injected = true;
+        }
+    }
+
+    Ok(injected)
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch table (Kyty: g_recomp_func, ShaderSpirv.cpp L6184-6446)
 // ---------------------------------------------------------------------------
