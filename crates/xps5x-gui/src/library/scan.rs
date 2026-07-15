@@ -20,7 +20,7 @@ use super::{
 };
 use egui::Color32;
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The on-disk shape of `xps5x-title.toml`. All fields except `title` are
 /// optional and default sensibly when absent.
@@ -148,13 +148,10 @@ fn parse_hex_color(s: &str) -> Option<Color32> {
 /// metadata rather than skipping the game.
 pub fn item_from_folder(
     name: &str,
-    path: &Path,
-    has_eboot: bool,
+    eboot: Option<PathBuf>,
     title_toml: Option<&str>,
 ) -> Option<LibraryItem> {
-    if !has_eboot {
-        return None;
-    }
+    let eboot = eboot?;
     if name.trim().is_empty() {
         return None;
     }
@@ -180,10 +177,47 @@ pub fn item_from_folder(
         art,
         meta,
         cover_path: None,
-        launch: LaunchTarget::Game {
-            path: path.join("eboot.bin"),
-        },
+        launch: LaunchTarget::Game { path: eboot },
     })
+}
+
+/// Locate a game folder's `eboot.bin`.
+///
+/// Two layouts are supported, because both occur in practice:
+/// * `<game>/eboot.bin` — the flat layout this project's fixtures use.
+/// * `<game>/<TITLEID>-app/eboot.bin` — how a **real PS5 title installs**
+///   (e.g. `Minecraft/PPSA17221-app/eboot.bin`). Without this, every real game
+///   folder scans as "no eboot" and never appears in the library.
+///
+/// The nested search is one level deep and prefers a conventional `*-app`
+/// directory, falling back to any single subdirectory that holds an
+/// `eboot.bin`, so it stays predictable rather than walking the whole tree.
+fn find_eboot(dir: &Path) -> Option<PathBuf> {
+    let flat = dir.join("eboot.bin");
+    if flat.is_file() {
+        return Some(flat);
+    }
+
+    let mut fallback = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let sub = entry.path();
+        if !sub.is_dir() {
+            continue;
+        }
+        let candidate = sub.join("eboot.bin");
+        if !candidate.is_file() {
+            continue;
+        }
+        let is_app_dir = sub
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with("-app"));
+        if is_app_dir {
+            return Some(candidate);
+        }
+        fallback.get_or_insert(candidate);
+    }
+    fallback
 }
 
 /// Conventional cover-image file names looked for inside a game folder, in
@@ -238,9 +272,9 @@ pub fn scan_dir(root: &Path) -> Vec<LibraryItem> {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let has_eboot = path.join("eboot.bin").is_file();
+        let eboot = find_eboot(&path);
         let title_toml = std::fs::read_to_string(path.join("xps5x-title.toml")).ok();
-        if let Some(mut item) = item_from_folder(name, &path, has_eboot, title_toml.as_deref()) {
+        if let Some(mut item) = item_from_folder(name, eboot, title_toml.as_deref()) {
             item.cover_path = find_cover(&path);
             items.push(item);
         }
@@ -362,8 +396,12 @@ mod tests {
     #[test]
     fn folder_with_eboot_and_valid_metadata_uses_it() {
         let path = PathBuf::from("Games/nova-requiem");
-        let item = item_from_folder("nova-requiem", &path, true, Some(VALID_TOML))
-            .expect("should classify");
+        let item = item_from_folder(
+            "nova-requiem",
+            Some(path.join("eboot.bin")),
+            Some(VALID_TOML),
+        )
+        .expect("should classify");
         assert_eq!(item.title, "Nova Requiem");
         assert_eq!(item.kind, ItemKind::Game);
         let meta = item.meta.expect("metadata should be attached");
@@ -379,7 +417,8 @@ mod tests {
     #[test]
     fn folder_with_eboot_and_no_metadata_still_becomes_a_game() {
         let path = PathBuf::from("Games/nova-requiem");
-        let item = item_from_folder("nova-requiem", &path, true, None).expect("should classify");
+        let item = item_from_folder("nova-requiem", Some(path.join("eboot.bin")), None)
+            .expect("should classify");
         assert_eq!(item.title, "Nova Requiem");
         assert_eq!(item.kind, ItemKind::Game);
         assert!(item.meta.is_none());
@@ -388,23 +427,26 @@ mod tests {
     #[test]
     fn folder_with_eboot_and_malformed_metadata_still_becomes_a_game() {
         let path = PathBuf::from("Games/nova-requiem");
-        let item = item_from_folder("nova-requiem", &path, true, Some("not valid toml [[["))
-            .expect("should classify");
+        let item = item_from_folder(
+            "nova-requiem",
+            Some(path.join("eboot.bin")),
+            Some("not valid toml [[["),
+        )
+        .expect("should classify");
         assert_eq!(item.title, "Nova Requiem"); // falls back to folder-derived title
         assert!(item.meta.is_none());
     }
 
     #[test]
     fn folder_without_eboot_is_skipped() {
-        let path = PathBuf::from("Games/not-a-game");
-        assert!(item_from_folder("not-a-game", &path, false, None).is_none());
+        assert!(item_from_folder("not-a-game", None, None).is_none());
     }
 
     #[test]
     fn empty_name_is_skipped_even_with_eboot() {
         let path = PathBuf::from("Games/");
-        assert!(item_from_folder("", &path, true, None).is_none());
-        assert!(item_from_folder("   ", &path, true, None).is_none());
+        assert!(item_from_folder("", Some(path.join("eboot.bin")), None).is_none());
+        assert!(item_from_folder("   ", Some(path.join("eboot.bin")), None).is_none());
     }
 
     #[test]
@@ -428,6 +470,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A **real PS5 title** installs as `<game>/<TITLEID>-app/eboot.bin`, not
+    /// `<game>/eboot.bin`. The scanner used to look only at the flat path, so
+    /// every real game folder classified as "no eboot" and never appeared in
+    /// the library at all. Both layouts must work, and the launch target must
+    /// point at the eboot that was actually found.
+    #[test]
+    fn scan_dir_finds_a_real_ps5_titles_nested_eboot() {
+        let root = std::env::temp_dir().join(format!("xps5x-scan-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let app = root.join("Minecraft").join("PPSA17221-app");
+        std::fs::create_dir_all(&app).expect("create nested app dir");
+        std::fs::write(app.join("eboot.bin"), b"\x54\x14\xf5\xee").expect("write eboot");
+
+        let items = scan_dir(&root);
+        assert_eq!(items.len(), 1, "the nested real-PS5 layout must be found");
+        match &items[0].launch {
+            LaunchTarget::Game { path } => assert_eq!(
+                path,
+                &app.join("eboot.bin"),
+                "must launch the eboot actually found, not <game>/eboot.bin"
+            ),
+            other => panic!("expected a Game launch target, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
