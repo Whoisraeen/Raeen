@@ -199,6 +199,28 @@ impl NidDatabase {
         Self { by_nid }
     }
 
+    /// Build the database from a live [`xps5x_hle::HleRegistry`]: every
+    /// name-hashed NID, **plus** every explicit NID binding.
+    ///
+    /// Prefer this over [`Self::from_hle_names`] anywhere a real registry is
+    /// available. Name hashing alone cannot express a function whose real name
+    /// is unknown — the RE'd-by-NID case — and silently leaves it unreachable
+    /// (see [`xps5x_hle::HleRegistry::register_nid`]).
+    pub fn from_hle(hle: &xps5x_hle::HleRegistry) -> Self {
+        let mut db = Self::from_hle_names(hle.registered_names());
+        for (nid, key) in hle.registered_nid_overrides() {
+            // An explicit NID is a stronger statement than a hashed name: it
+            // was read out of a real module's symbol table, not guessed from a
+            // label. It wins.
+            if let Some(existing) = db.by_nid.insert(nid, key.clone())
+                && existing != key
+            {
+                debug!("explicit NID {nid:#018x} -> {key:?} overrides name-hashed {existing:?}");
+            }
+        }
+        db
+    }
+
     /// Resolve an import NID to its `"library::function"` name, if known.
     pub fn resolve(&self, nid: u64) -> Option<&str> {
         self.by_nid.get(&nid).map(String::as_str)

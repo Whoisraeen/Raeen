@@ -209,7 +209,17 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcDcbDrawIndexOffset",
         hle_dcb_draw_index_offset,
     );
-    registry.register("libSceAgc", "sceAgcUnknownQj7QZpgr9Uw", hle_unknown_filler);
+    // Known ONLY by its NID: `qj7QZpgr9Uw`. The real name is unrecovered, so
+    // the NID must be given explicitly — hashing this placeholder label yields
+    // a different NID entirely, which left this implementation registered and
+    // permanently unreachable while the measured retail title imported exactly
+    // this NID and reported it missing.
+    registry.register_nid(
+        "libSceAgc",
+        "sceAgcUnknownQj7QZpgr9Uw",
+        0xaa3e_d066_982b_f54c,
+        hle_unknown_filler,
+    );
     registry.register("libSceAgc", "sceAgcDcbPushMarker", hle_dcb_push_marker);
     registry.register(
         "libSceAgc",

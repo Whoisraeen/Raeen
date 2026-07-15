@@ -156,7 +156,7 @@ mod tests {
 
     fn build_hle_and_db() -> (HleRegistry, NidDatabase) {
         let hle = HleRegistry::new();
-        let db = NidDatabase::from_hle_names(hle.registered_names());
+        let db = NidDatabase::from_hle(&hle);
         (hle, db)
     }
 

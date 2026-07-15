@@ -128,6 +128,47 @@ fn the_real_nid_database_is_identical_however_the_names_are_ordered() {
     }
 }
 
+/// A function known ONLY by its NID must actually be reachable.
+///
+/// `libSceAgc`'s `qj7QZpgr9Uw` has no recovered name; the convention is to label
+/// it `sceAgcUnknownQj7QZpgr9Uw`. Resolution normally hashes the *name*, so that
+/// placeholder hashes to something else entirely and the implementation — which
+/// exists, and is registered — could never be reached, while the measured retail
+/// title imports exactly this NID and reported it missing. `register_nid` binds
+/// the NID explicitly; `NidDatabase::from_hle` is what applies those bindings.
+#[test]
+fn a_function_known_only_by_nid_is_reachable() {
+    const AGC_UNKNOWN_NID: u64 = 0xaa3e_d066_982b_f54c; // qj7QZpgr9Uw
+
+    let hle = HleRegistry::new();
+    let db = NidDatabase::from_hle(&hle);
+    let registry = ModuleRegistry::new(db);
+
+    match registry.resolve(&hle, "eboot.bin", AGC_UNKNOWN_NID) {
+        xps5x_firmware::Resolver::Hle { library, .. } => assert_eq!(library, "libSceAgc"),
+        other => panic!(
+            "a NID-only function must resolve; got {other:?}. Hashing the placeholder name \
+             cannot produce {}: the implementation would be unreachable.",
+            encode_nid(AGC_UNKNOWN_NID)
+        ),
+    }
+
+    // And the placeholder label really does hash to something else — i.e. this
+    // test is not passing by accident.
+    assert_ne!(
+        nid_of("sceAgcUnknownQj7QZpgr9Uw"),
+        AGC_UNKNOWN_NID,
+        "if the label ever hashed to the right NID, register_nid would be unnecessary"
+    );
+
+    // The name-only path cannot reach it — the exact bug this guards.
+    let names_only = NidDatabase::from_hle_names(hle.registered_names());
+    assert!(
+        names_only.resolve(AGC_UNKNOWN_NID).is_none(),
+        "from_hle_names cannot express a NID-only function; use NidDatabase::from_hle"
+    );
+}
+
 /// End to end through the real resolver: the exact NID the title requested must
 /// come back as an HLE hit, not `Unresolved`.
 #[test]

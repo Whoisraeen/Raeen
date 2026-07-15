@@ -147,6 +147,9 @@ pub type HleFunction = fn(&HleContext, &[u64]) -> u64;
 pub struct HleRegistry {
     /// Map of "library::function" → implementation.
     functions: DashMap<String, HleFunction>,
+    /// Explicit NID → `"library::function"` bindings for functions whose real
+    /// name is unknown — see [`HleRegistry::register_nid`].
+    nid_overrides: DashMap<u64, String>,
 }
 
 impl HleRegistry {
@@ -155,6 +158,7 @@ impl HleRegistry {
         info!("Initializing HLE registry");
         let registry = Self {
             functions: DashMap::new(),
+            nid_overrides: DashMap::new(),
         };
 
         // Register all implemented HLE functions.
@@ -227,6 +231,48 @@ impl HleRegistry {
         let key = format!("{}::{}", library, function);
         debug!("HLE register: {}", key);
         self.functions.insert(key, implementation);
+    }
+
+    /// Register a function whose real name is **unknown**, binding it to an
+    /// explicit NID.
+    ///
+    /// # Why this is needed
+    ///
+    /// Resolution normally derives a NID by hashing the function *name*, which
+    /// only works when the name is known. Plenty of RE'd functions are known
+    /// only by the NID string in a title's symbol table, and the convention
+    /// (from SharpEmu) is to name them `<lib>Unknown<NIDSTRING>`. Hashing THAT
+    /// placeholder produces a completely different NID, so the implementation
+    /// is **unreachable by construction** — it exists, it is registered, and no
+    /// import can ever resolve to it.
+    ///
+    /// That is not hypothetical: `sceAgcUnknownQj7QZpgr9Uw` was implemented and
+    /// dead, while the measured retail title imports exactly that NID
+    /// (`qj7QZpgr9Uw` = `0xaa3e_d066_982b_f54c`) and reported it missing.
+    ///
+    /// `function` is still recorded as the human label (logs, diagnostics); the
+    /// **NID is the identity**.
+    pub fn register_nid(
+        &self,
+        library: &str,
+        function: &str,
+        nid: u64,
+        implementation: HleFunction,
+    ) {
+        let key = format!("{}::{}", library, function);
+        debug!("HLE register by NID {nid:#018x}: {key}");
+        self.nid_overrides.insert(nid, key.clone());
+        self.functions.insert(key, implementation);
+    }
+
+    /// Explicit `NID -> "library::function"` bindings (see
+    /// [`Self::register_nid`]). The NID database must apply these *in addition*
+    /// to the name-hashed ones, or these functions stay unreachable.
+    pub fn registered_nid_overrides(&self) -> Vec<(u64, String)> {
+        self.nid_overrides
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect()
     }
 
     /// Look up and call an HLE function, giving it `ctx` (the kernel +
@@ -495,6 +541,7 @@ mod tests {
     fn registered_names_reflects_manual_registration() {
         let registry = HleRegistry {
             functions: DashMap::new(),
+            nid_overrides: DashMap::new(),
         };
         fn stub(_ctx: &HleContext, _args: &[u64]) -> u64 {
             0
@@ -547,6 +594,7 @@ mod tests {
         }
         let registry = HleRegistry {
             functions: DashMap::new(),
+            nid_overrides: DashMap::new(),
         };
         // Same name, two libraries, SAME impl -> not a conflict.
         registry.register("libOne", "shared", a);

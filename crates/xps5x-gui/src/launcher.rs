@@ -256,8 +256,7 @@ pub struct FirmwareLauncher {
 impl FirmwareLauncher {
     pub fn new() -> Self {
         let hle = xps5x_hle::HleRegistry::new();
-        let nid_db =
-            xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
+        let nid_db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
         Self {
             hle,
             kernel: xps5x_kernel::OrbisKernel::new(),
@@ -999,8 +998,7 @@ mod firmware_launcher_tests {
             let sentinel_nid = xps5x_firmware::dynlib::nid::nid_of("sceTestSentinel");
             let exit_nid = xps5x_firmware::dynlib::nid::nid_of("exit");
 
-            let nid_db =
-                xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
+            let nid_db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
             let launcher = FirmwareLauncher {
                 hle,
                 kernel: xps5x_kernel::OrbisKernel::new(),
@@ -1111,8 +1109,7 @@ mod firmware_launcher_tests {
             let bogus_nid =
                 xps5x_firmware::dynlib::nid::nid_of("totallyUnknownFunctionNobodyRegistered");
 
-            let nid_db =
-                xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
+            let nid_db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
             let launcher = FirmwareLauncher {
                 hle,
                 kernel: xps5x_kernel::OrbisKernel::new(),

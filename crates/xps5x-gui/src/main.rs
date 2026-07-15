@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
             )?,
         };
         let hle = xps5x_hle::HleRegistry::new();
-        let db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
+        let db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
         let mut registry = xps5x_firmware::ModuleRegistry::new(db);
         registry.register_module_exports(&module.name, &dynlib_data.exports);
         let linked = xps5x_firmware::link_module(&module, &dynlib_data, &registry, &hle, 0)?;
@@ -186,7 +186,7 @@ fn main() -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("--missing-nids requires a path to an eboot.bin"))?;
         let bytes = std::fs::read(path)?;
         let hle = xps5x_hle::HleRegistry::new();
-        let db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
+        let db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
         let mut registry = xps5x_firmware::ModuleRegistry::new(db);
         let dir = std::path::Path::new(path)
             .parent()
@@ -250,7 +250,7 @@ fn main() -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("--run-eboot requires a path to an eboot.bin"))?;
         let bytes = std::fs::read(path)?;
         let hle = xps5x_hle::HleRegistry::new();
-        let db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
+        let db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
         let mut registry = xps5x_firmware::ModuleRegistry::new(db);
         let kernel = xps5x_kernel::OrbisKernel::new();
         // Load as a whole process: the eboot plus every DT_NEEDED .prx that
