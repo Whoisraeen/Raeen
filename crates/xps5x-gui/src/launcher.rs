@@ -391,7 +391,7 @@ impl FirmwareLauncher {
                     SessionOutcome::Faulted(format!(
                         "Unimplemented import: {} ({library}) — the game called a function \
                          XPS5X does not provide yet",
-                        xps5x_firmware::dynlib::nid::encode_nid(nid)
+                        xps5x_firmware::dynlib::nid_names::describe(nid)
                     ))
                 }
                 Err(xps5x_runtime::RuntimeError::UnresolvedTrampoline(a)) => {
@@ -1021,8 +1021,8 @@ mod firmware_launcher_tests {
 
             let nid_db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
             let launcher = FirmwareLauncher {
-                hle,
-                kernel: xps5x_kernel::OrbisKernel::new(),
+                hle: hle.into(),
+                kernel: xps5x_kernel::OrbisKernel::new().into(),
                 registry: Mutex::new(xps5x_firmware::ModuleRegistry::new(nid_db)),
                 sessions: Mutex::new(HashMap::new()),
                 next_id: Mutex::new(0),
@@ -1132,8 +1132,8 @@ mod firmware_launcher_tests {
 
             let nid_db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
             let launcher = FirmwareLauncher {
-                hle,
-                kernel: xps5x_kernel::OrbisKernel::new(),
+                hle: hle.into(),
+                kernel: xps5x_kernel::OrbisKernel::new().into(),
                 registry: Mutex::new(xps5x_firmware::ModuleRegistry::new(nid_db)),
                 sessions: Mutex::new(HashMap::new()),
                 next_id: Mutex::new(0),

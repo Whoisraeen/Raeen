@@ -13,7 +13,7 @@
 //! bounds-checking every offset/size against the buffer — malformed or
 //! truncated input returns a [`FirmwareError`], never panics.
 
-use goblin::elf::program_header::{PT_DYNAMIC, PT_LOAD, PT_TLS, ProgramHeader};
+use goblin::elf::program_header::{PT_DYNAMIC, PT_GNU_EH_FRAME, PT_LOAD, PT_TLS, ProgramHeader};
 use tracing::{debug, info, warn};
 use xps5x_core::error::FirmwareError;
 
@@ -61,6 +61,30 @@ pub struct TlsTemplate {
     pub mem_size: u64,
     /// Required alignment (`p_align`).
     pub align: u64,
+}
+
+/// ELF unwind metadata retained from one guest module.
+///
+/// These are module-relative virtual addresses. The process composer and
+/// runtime rebase them exactly like `PT_LOAD`; keeping them in the loader
+/// avoids title-specific address tables and lets the guest C++ runtime find
+/// exception tables for every loaded executable or PRX.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnwindInfo {
+    /// `PT_GNU_EH_FRAME` (`.eh_frame_hdr`) virtual address, or zero.
+    pub eh_frame_hdr_vaddr: u64,
+    /// `.eh_frame` virtual address, decoded from the section table or header.
+    pub eh_frame_vaddr: u64,
+    /// `.eh_frame` byte size. For stripped images this is conservatively
+    /// inferred as the distance to the following `.eh_frame_hdr`.
+    pub eh_frame_size: u64,
+    /// First `PT_LOAD` virtual address and in-memory size, exposed by the
+    /// Orbis module-info ABI.
+    pub seg0_vaddr: u64,
+    pub seg0_size: u64,
+    /// Full loadable module range used to resolve a PC to its owner.
+    pub image_vaddr: u64,
+    pub image_size: u64,
 }
 
 impl TlsTemplate {
@@ -113,6 +137,8 @@ pub struct SprxModule {
     /// so the runtime can expose its guest address instead of dropping it;
     /// [`proc_param_sdk_version`] pulls the SDK version out of it.
     pub procparam: Option<SprxSegment>,
+    /// Loadable range and exception-unwind tables for this ELF.
+    pub unwind: Option<UnwindInfo>,
 }
 
 /// Parse a plaintext inner ELF into an [`SprxModule`].
@@ -149,10 +175,19 @@ pub fn parse_sprx(elf: &[u8]) -> Result<SprxModule, FirmwareError> {
     let mut dynamic = None;
     let mut tls = None;
     let mut procparam = None;
+    let mut eh_frame_hdr = None;
     let mut has_module_param = false;
 
     for phdr in &parsed.program_headers {
         match phdr.p_type {
+            PT_GNU_EH_FRAME => {
+                let data = slice_phdr(elf, phdr, "PT_GNU_EH_FRAME")?;
+                debug!(
+                    "  PT_GNU_EH_FRAME: vaddr={:#x} filesz={:#x}",
+                    phdr.p_vaddr, phdr.p_filesz
+                );
+                eh_frame_hdr = Some((phdr.p_vaddr, data));
+            }
             PT_TLS => {
                 debug!(
                     "  PT_TLS: vaddr={:#x} filesz={:#x} memsz={:#x} align={:#x}",
@@ -239,6 +274,8 @@ pub fn parse_sprx(elf: &[u8]) -> Result<SprxModule, FirmwareError> {
         warn!("Parsed .sprx module has no PT_LOAD segments");
     }
 
+    let unwind = build_unwind_info(&parsed, &segments, eh_frame_hdr.as_ref());
+
     Ok(SprxModule {
         name: "module".to_string(),
         e_type,
@@ -249,7 +286,83 @@ pub fn parse_sprx(elf: &[u8]) -> Result<SprxModule, FirmwareError> {
         entry: parsed.header.e_entry,
         tls,
         procparam,
+        unwind,
     })
+}
+
+fn build_unwind_info(
+    elf: &goblin::elf::Elf<'_>,
+    segments: &[SprxSegment],
+    eh_frame_hdr: Option<&(u64, Vec<u8>)>,
+) -> Option<UnwindInfo> {
+    let first = segments.first()?;
+    let image_vaddr = segments.iter().map(|s| s.vaddr).min()?;
+    let image_end = segments
+        .iter()
+        .filter_map(|s| s.vaddr.checked_add(s.mem_size))
+        .max()?;
+
+    let section = elf
+        .section_headers
+        .iter()
+        .find(|section| elf.shdr_strtab.get_at(section.sh_name) == Some(".eh_frame"));
+    let eh_frame_hdr_vaddr = eh_frame_hdr.map_or(0, |(vaddr, _)| *vaddr);
+    let decoded_vaddr =
+        eh_frame_hdr.and_then(|(vaddr, bytes)| decode_eh_frame_pointer(bytes, *vaddr));
+    let eh_frame_vaddr =
+        section.map_or_else(|| decoded_vaddr.unwrap_or(0), |section| section.sh_addr);
+    let eh_frame_size = section.map_or_else(
+        || {
+            eh_frame_hdr_vaddr
+                .checked_sub(eh_frame_vaddr)
+                .filter(|_| eh_frame_vaddr != 0)
+                .unwrap_or(0)
+        },
+        |section| section.sh_size,
+    );
+
+    Some(UnwindInfo {
+        eh_frame_hdr_vaddr,
+        eh_frame_vaddr,
+        eh_frame_size,
+        seg0_vaddr: first.vaddr,
+        seg0_size: first.mem_size,
+        image_vaddr,
+        image_size: image_end.saturating_sub(image_vaddr),
+    })
+}
+
+/// Decode the first pointer in a GNU `.eh_frame_hdr`. PS5 executables use
+/// the standard version-1 header and commonly encode this as
+/// `DW_EH_PE_pcrel | DW_EH_PE_sdata4` (`0x1b`). Support the fixed-width forms
+/// too; unsupported variable-length encodings degrade to an absent pointer.
+fn decode_eh_frame_pointer(header: &[u8], header_vaddr: u64) -> Option<u64> {
+    if header.len() < 5 || header[0] != 1 || header[1] == 0xff {
+        return None;
+    }
+    let encoding = header[1];
+    let field_vaddr = header_vaddr.checked_add(4)?;
+    let raw = match encoding & 0x0f {
+        0x00 => i64::from_le_bytes(header.get(4..12)?.try_into().ok()?),
+        0x03 => u32::from_le_bytes(header.get(4..8)?.try_into().ok()?) as i64,
+        0x04 => {
+            let value = u64::from_le_bytes(header.get(4..12)?.try_into().ok()?);
+            i64::try_from(value).ok()?
+        }
+        0x0b => i32::from_le_bytes(header.get(4..8)?.try_into().ok()?) as i64,
+        0x0c => i64::from_le_bytes(header.get(4..12)?.try_into().ok()?),
+        _ => return None,
+    };
+    let base = match encoding & 0x70 {
+        0x00 => 0,
+        0x10 => field_vaddr,
+        _ => return None,
+    };
+    if raw >= 0 {
+        base.checked_add(raw as u64)
+    } else {
+        base.checked_sub(raw.unsigned_abs())
+    }
 }
 
 /// Extract the SDK version from a `PT_SCE_PROCPARAM` block, if present and
@@ -374,6 +487,44 @@ mod tests {
         assert_eq!(module.dynlib_data, Some(dynlib_blob));
         assert_eq!(module.relro, None);
         assert_eq!(module.dynamic, None);
+    }
+
+    #[test]
+    fn gnu_eh_frame_header_recovers_stripped_unwind_range() {
+        let header_vaddr = 0x4000u64;
+        let frame_vaddr = 0x3000u64;
+        let relative = (frame_vaddr as i64 - (header_vaddr + 4) as i64) as i32;
+        let mut eh_frame_hdr = vec![1, 0x1b, 0x03, 0x3b];
+        eh_frame_hdr.extend_from_slice(&relative.to_le_bytes());
+        eh_frame_hdr.extend_from_slice(&0u32.to_le_bytes());
+
+        let elf = build_elf(
+            ET_SCE_DYNAMIC,
+            &[
+                PhdrSpec {
+                    p_type: PT_LOAD,
+                    p_flags: 5,
+                    p_vaddr: 0x1000,
+                    data: vec![0; 0x20],
+                },
+                PhdrSpec {
+                    p_type: PT_GNU_EH_FRAME,
+                    p_flags: 4,
+                    p_vaddr: header_vaddr,
+                    data: eh_frame_hdr,
+                },
+            ],
+        );
+
+        let module = parse_sprx(&elf).expect("synthetic unwind ELF parses");
+        let unwind = module.unwind.expect("PT_LOAD creates module metadata");
+        assert_eq!(unwind.eh_frame_hdr_vaddr, header_vaddr);
+        assert_eq!(unwind.eh_frame_vaddr, frame_vaddr);
+        assert_eq!(unwind.eh_frame_size, header_vaddr - frame_vaddr);
+        assert_eq!(unwind.seg0_vaddr, 0x1000);
+        assert_eq!(unwind.seg0_size, 0x20);
+        assert_eq!(unwind.image_vaddr, 0x1000);
+        assert_eq!(unwind.image_size, 0x20);
     }
 
     #[test]

@@ -30,7 +30,9 @@ pub use pup::Firmware;
 pub use registry::{ModulePolicy, ModuleRegistry, Resolver};
 pub use report::summarize;
 pub use slb2::{Slb2Entry, parse_slb2};
-pub use sprx::{SprxModule, SprxSegment, TlsTemplate, parse_sprx, proc_param_sdk_version};
+pub use sprx::{
+    SprxModule, SprxSegment, TlsTemplate, UnwindInfo, parse_sprx, proc_param_sdk_version,
+};
 
 use xps5x_core::error::FirmwareError;
 
@@ -125,6 +127,26 @@ pub struct LoadedProcess {
     pub dependencies: Vec<LoadedDependency>,
 }
 
+fn append_main_initializer(
+    inits: &mut Vec<dynlib::linker::ModuleInit>,
+    module_name: &str,
+    init_vaddr: Option<u64>,
+) {
+    let Some(init_vaddr) = init_vaddr else {
+        return;
+    };
+    let name = if module_name.is_empty() {
+        "main executable".to_string()
+    } else {
+        module_name.to_string()
+    };
+    tracing::info!("{name}: main module_start (DT_INIT) at +{init_vaddr:#x} before process entry");
+    inits.push(dynlib::linker::ModuleInit {
+        name,
+        image_offset: init_vaddr,
+    });
+}
+
 /// Round `v` up to the next 16 KiB boundary — dependencies are placed on a
 /// generous alignment so no module's image can bleed into the next.
 fn align_up_16k(v: u64) -> u64 {
@@ -149,6 +171,9 @@ struct DecodedModule {
 /// A dependency decoded and placed in pass 1, awaiting linking in pass 2.
 struct PendingDep {
     name: String,
+    /// Main-module `DT_NEEDED` dependencies initialize before `_start`;
+    /// optional app plugins are merely placed and await LoadStartModule.
+    eager_init: bool,
     /// Image offset within the composed process image.
     offset: u64,
     /// Absolute guest base (`process base + offset`).
@@ -365,6 +390,7 @@ pub fn load_process(
     let mut next_offset = align_up_16k(dynlib::linker::image_size(&module)? as u64);
     let mut dependencies = Vec::new();
     let mut dep_images: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut dep_unwind_modules = Vec::new();
     // Decoded and placed in pass 1, linked in pass 2 (see "Two passes" above).
     let mut pending: Vec<PendingDep> = Vec::new();
 
@@ -376,6 +402,39 @@ pub fn load_process(
     // the MAIN module's #k at runtime: wrong function, no diagnostic.
     let mut tables = dynlib::linker::ProcessTables::new();
 
+    let mut module_requests: Vec<(String, bool)> = dynlib_data
+        .needed_modules
+        .iter()
+        .cloned()
+        .map(|name| (name, true))
+        .collect();
+    // App-owned PRX plugins may be loaded later through
+    // `sceKernelLoadStartModule`/`Dlsym` and therefore do not appear in the
+    // eboot's DT_NEEDED list. Place every root-level PRX in the process image
+    // now, without running its initializer, so runtime loading can resolve
+    // real exports without mutating executable layout mid-flight.
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut optional: Vec<String> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                path.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("prx"))
+                    .then(|| entry.file_name().to_string_lossy().into_owned())
+            })
+            .collect();
+        optional.sort_by_key(|name| name.to_ascii_lowercase());
+        for name in optional {
+            if !module_requests
+                .iter()
+                .any(|(loaded, _)| loaded.eq_ignore_ascii_case(&name))
+            {
+                tracing::info!("optional app PRX {name}: preplacing for runtime LoadStartModule");
+                module_requests.push((name, false));
+            }
+        }
+    }
+
     // Reserve the HLE data page FIRST: its symbols must be registered before
     // any module links, and its address must be known before it is filled.
     let hle_data_offset = next_offset;
@@ -385,7 +444,7 @@ pub fn load_process(
         dep_images.push((hle_data_offset, hle_data));
     }
 
-    for needed in &dynlib_data.needed_modules {
+    for (needed, eager_init) in &module_requests {
         let stem = needed.trim_end_matches(".sprx").trim_end_matches(".prx");
         let Some(path) = find_dependency_file(dir, needed) else {
             if hle_libs.contains(stem) {
@@ -451,6 +510,7 @@ pub fn load_process(
 
         pending.push(PendingDep {
             name: needed.clone(),
+            eager_init: *eager_init,
             offset: next_offset,
             base: dep_base,
             decoded: dep,
@@ -486,6 +546,11 @@ pub fn load_process(
             exports: p.decoded.dynlib.exports.len(),
             unresolved: linked.unresolved.len(),
         });
+        dep_unwind_modules.extend(linked.unwind_modules.into_iter().map(|mut unwind| {
+            unwind.name = p.name.clone();
+            unwind.image_offset = p.offset.wrapping_add(unwind.image_offset);
+            unwind
+        }));
         dep_images.push((p.offset, linked.image));
     }
 
@@ -519,6 +584,7 @@ pub fn load_process(
     // dependency's call would land on the wrong table row.
     linked.hle_trampolines = tables.hle_trampolines().to_vec();
     linked.unresolved_stubs = tables.unresolved_stubs().to_vec();
+    linked.unwind_modules.extend(dep_unwind_modules);
 
     // Each dependency's `module_start` (DT_INIT), in load order — dependencies
     // before the main module, which is what a real loader does and what the
@@ -526,6 +592,9 @@ pub fn load_process(
     // constructors were supposed to create. `module_inits` runs before the
     // process entry; see `dynlib::DT_INIT`.
     for p in &pending {
+        if !p.eager_init {
+            continue;
+        }
         let Some(init_vaddr) = p.decoded.dynlib.init else {
             tracing::debug!("{}: no DT_INIT — nothing to initialize", p.name);
             continue;
@@ -540,6 +609,12 @@ pub fn load_process(
             image_offset,
         });
     }
+
+    // The dynamic loader owns the executable's DT_INIT too. `_start` is
+    // entered only after dependencies and the main ELF have run their static
+    // constructors; relying on the executable entry to invoke its own init
+    // function leaves C++ service registries zeroed in real titles.
+    append_main_initializer(&mut linked.module_inits, &module.name, dynlib_data.init);
 
     // Count honestly: `linked.unresolved` is the MAIN module's relocations
     // only, while the stub table is process-wide. Reporting one against the
@@ -562,8 +637,11 @@ pub fn load_process(
     // One line per distinct NID turns "313 missing" into an actionable
     // implement-me list without waiting to fault on each one at runtime.
     for stub in &linked.unresolved_stubs {
+        // Prefer the hash-verified name: "missing sceKernelGetGPI" is an
+        // implement-me list, "missing 4oXYe9Xmk0Q" is a research project.
         tracing::info!(
-            "  missing NID {:#018x} ({}) wanted from library '{}'",
+            "  missing {} — NID {:#018x} ({}) wanted from library '{}'",
+            dynlib::nid_names::describe(stub.nid),
             stub.nid,
             dynlib::nid::encode_nid(stub.nid),
             stub.library.as_deref().unwrap_or("<unknown>"),
@@ -608,5 +686,23 @@ mod tests {
         let mut expected = [0u8; 16];
         expected[15] = 1;
         assert_eq!(&page[loopback_offset..loopback_offset + 16], &expected);
+    }
+
+    #[test]
+    fn main_dt_init_is_scheduled_after_dependency_initializers() {
+        let mut inits = vec![crate::dynlib::linker::ModuleInit {
+            name: "dependency.prx".to_string(),
+            image_offset: 0x2000,
+        }];
+
+        super::append_main_initializer(&mut inits, "game", Some(0x10));
+
+        assert_eq!(inits.len(), 2);
+        assert_eq!(inits[0].name, "dependency.prx");
+        assert_eq!(inits[1].name, "game");
+        assert_eq!(inits[1].image_offset, 0x10);
+
+        super::append_main_initializer(&mut inits, "game", None);
+        assert_eq!(inits.len(), 2, "an ELF without DT_INIT adds no call");
     }
 }

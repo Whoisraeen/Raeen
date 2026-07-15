@@ -178,6 +178,7 @@ impl GuestThreadScheduler for GuestProcessHandle {
         let host = std::thread::Builder::new()
             .name(format!("xps5x-guest-{handle}"))
             .spawn(move || {
+                tracing::info!(guest_thread = handle, entry, "guest pthread started");
                 // SAFETY: all process resources are Arc-owned by this worker;
                 // entry and stack were validated in the live identity-mapped
                 // arena, and dispatch installs this OS thread's TLS context
@@ -288,6 +289,12 @@ impl GuestThreadScheduler for GuestProcessHandle {
         SCE_OK
     }
 
+    // The two calls below are per-thread questions, and the process cannot
+    // answer them: HLE always holds the running thread's `ActiveContext`
+    // (`dispatch.rs`, `guest_threads: ctx`), which answers both from its own
+    // per-run state and never delegates them here. These exist only to satisfy
+    // the trait. Do not "fix" them into real-looking answers — a process-wide
+    // exit flag or a hardcoded handle would be wrong for every worker.
     fn request_exit(&self, _retval: u64) -> bool {
         false
     }

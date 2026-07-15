@@ -137,6 +137,7 @@ fn build_synthetic_module(
         entry: entry_off as u64,
         tls: None,
         procparam: None,
+        unwind: None,
     };
 
     let dynlib = DynlibData {
@@ -234,6 +235,7 @@ fn pthread_once_runs_its_guest_initializer_before_returning() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -252,6 +254,122 @@ fn emit_indirect_call(image: &mut [u8], off: &mut usize, slot: usize) {
     image[*off..*off + 2].copy_from_slice(&[0xFF, 0x15]);
     image[*off + 2..*off + 6].copy_from_slice(&disp.to_le_bytes());
     *off += 6;
+}
+
+/// M1-E: a worker that ends via `scePthreadExit(v)` — rather than returning —
+/// unwinds its guest context and hands `v` to the joiner. The poison tail
+/// (`mov eax, POISON; ret`) sits immediately after the exit call, so an exit
+/// that merely returned to its caller would surface as `POISON` instead of
+/// `MAGIC`. That is what makes this falsifiable rather than decorative.
+#[test]
+fn pthread_exit_unwinds_the_worker_and_delivers_its_value_to_join() {
+    const WORKER: usize = 0x100;
+    const THREAD_OUT: usize = 0x180;
+    const RETVAL_OUT: usize = 0x188;
+    const CREATE_SLOT: usize = 0x1C0;
+    const JOIN_SLOT: usize = 0x1C8;
+    const EXIT_SLOT: usize = 0x1D0;
+    const PTHREAD_EXIT_SLOT: usize = 0x1D8;
+    const MAGIC: u32 = 0x5A;
+    const POISON: u32 = 0xBAD;
+
+    let hle = std::sync::Arc::new(HleRegistry::new());
+    let kernel = std::sync::Arc::new(OrbisKernel::new());
+    let mut image = vec![0u8; 0x300];
+
+    let thread_out = GUEST_ARENA_BASE + THREAD_OUT as u64;
+    let retval_out = GUEST_ARENA_BASE + RETVAL_OUT as u64;
+    let worker = GUEST_ARENA_BASE + WORKER as u64;
+
+    // main: create(worker) -> join(thread, &retval) -> exit(retval)
+    let mut off = 0;
+    image[off..off + 2].copy_from_slice(&[0x48, 0xBF]); // mov rdi, thread_out
+    image[off + 2..off + 10].copy_from_slice(&thread_out.to_le_bytes());
+    off += 10;
+    image[off..off + 2].copy_from_slice(&[0x31, 0xF6]); // xor esi, esi (attr = 0)
+    off += 2;
+    image[off..off + 2].copy_from_slice(&[0x48, 0xBA]); // mov rdx, worker
+    image[off + 2..off + 10].copy_from_slice(&worker.to_le_bytes());
+    off += 10;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x31, 0xC9]); // xor rcx, rcx (arg = 0)
+    off += 3;
+    emit_indirect_call(&mut image, &mut off, CREATE_SLOT);
+    image[off..off + 2].copy_from_slice(&[0x48, 0xA1]); // mov rax, [thread_out]
+    image[off + 2..off + 10].copy_from_slice(&thread_out.to_le_bytes());
+    off += 10;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
+    off += 3;
+    image[off..off + 2].copy_from_slice(&[0x48, 0xBE]); // mov rsi, retval_out
+    image[off + 2..off + 10].copy_from_slice(&retval_out.to_le_bytes());
+    off += 10;
+    emit_indirect_call(&mut image, &mut off, JOIN_SLOT);
+    image[off..off + 2].copy_from_slice(&[0x48, 0xA1]); // mov rax, [retval_out]
+    image[off + 2..off + 10].copy_from_slice(&retval_out.to_le_bytes());
+    off += 10;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
+    off += 3;
+    emit_indirect_call(&mut image, &mut off, EXIT_SLOT);
+
+    // worker: scePthreadExit(MAGIC), then unreachable poison.
+    off = WORKER;
+    image[off] = 0xBF; // mov edi, MAGIC
+    image[off + 1..off + 5].copy_from_slice(&MAGIC.to_le_bytes());
+    off += 5;
+    emit_indirect_call(&mut image, &mut off, PTHREAD_EXIT_SLOT);
+    image[off] = 0xB8; // mov eax, POISON  (must never execute)
+    image[off + 1..off + 5].copy_from_slice(&POISON.to_le_bytes());
+    off += 5;
+    image[off] = 0xC3; // ret
+
+    for (slot, index) in [
+        (CREATE_SLOT, 0u64),
+        (JOIN_SLOT, 1),
+        (EXIT_SLOT, 2),
+        (PTHREAD_EXIT_SLOT, 3),
+    ] {
+        image[slot..slot + 8].copy_from_slice(&(HLE_TRAMPOLINE_BASE + index * 8).to_le_bytes());
+    }
+    let linked = std::sync::Arc::new(LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: vec![
+            HleTrampoline {
+                library: "libkernel".into(),
+                function: "scePthreadCreate".into(),
+                addr: HLE_TRAMPOLINE_BASE,
+            },
+            HleTrampoline {
+                library: "libkernel".into(),
+                function: "scePthreadJoin".into(),
+                addr: HLE_TRAMPOLINE_BASE + 8,
+            },
+            HleTrampoline {
+                library: "libc".into(),
+                function: "exit".into(),
+                addr: HLE_TRAMPOLINE_BASE + 16,
+            },
+            HleTrampoline {
+                library: "libkernel".into(),
+                function: "scePthreadExit".into(),
+                addr: HLE_TRAMPOLINE_BASE + 24,
+            },
+        ],
+        entry: 0,
+        tls: None,
+        procparam_offset: None,
+        unwind_modules: Vec::new(),
+    });
+
+    let outcome = execute_process_shared(linked, hle, kernel, &["/app0/eboot.bin"], &[])
+        .expect("a worker ending via scePthreadExit must still be joinable");
+    assert_eq!(
+        outcome,
+        RunOutcome::Exited(MAGIC as u64),
+        "join must observe the scePthreadExit value, not the poison tail"
+    );
 }
 
 /// M1-E runtime scaffold: `scePthreadCreate` launches a genuinely
@@ -359,6 +477,7 @@ fn pthread_create_join_runs_a_real_guest_worker_with_tls() {
         entry: 0,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     });
 
     let outcome = execute_process_shared(linked, hle, kernel, &["/app0/eboot.bin"], &[])
@@ -448,6 +567,7 @@ fn detached_worker_is_reaped_before_the_fixed_guest_arena_is_reused() {
         entry: 0,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     });
 
     for run in 0..2 {
@@ -518,6 +638,7 @@ fn call_to_unresolved_stub_reports_which_import_the_guest_wanted() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -567,6 +688,7 @@ fn wild_fault_past_the_stub_table_is_still_an_anonymous_fault() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -608,6 +730,7 @@ fn call_to_unmapped_trampoline_index_returns_unresolved() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -631,6 +754,7 @@ fn more_than_six_args_is_rejected() {
         entry: 0,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -671,6 +795,7 @@ fn genuine_wild_fault_recovers_as_faulted_then_process_keeps_running() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -826,6 +951,7 @@ fn memcpy_hle_call_moves_real_bytes_through_the_runtime() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam: None,
+        unwind: None,
     };
 
     let dynlib = DynlibData {
@@ -934,6 +1060,7 @@ fn malloc_hle_call_returns_a_pointer_inside_the_heap_region() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam: None,
+        unwind: None,
     };
 
     let dynlib = DynlibData {
@@ -1115,6 +1242,7 @@ fn malloc_then_memset_then_readback_proves_real_guest_heap_memory() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam: None,
+        unwind: None,
     };
 
     let dynlib = DynlibData {
@@ -1333,6 +1461,7 @@ fn mmap_then_memset_then_readback_proves_real_arena_memory_and_records_vmm_metad
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam: None,
+        unwind: None,
     };
 
     let dynlib = DynlibData {
@@ -1492,6 +1621,7 @@ fn guest_call_runs_on_dedicated_guest_stack_region() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam: None,
+        unwind: None,
     };
 
     let dynlib = DynlibData {
@@ -1576,6 +1706,7 @@ fn guest_stub_uses_real_guest_stack_memory_and_returns_correct_value() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -1633,6 +1764,7 @@ fn guest_clobbering_r15_does_not_corrupt_host_rsp() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -1681,6 +1813,7 @@ fn guest_return_recovers_host_context_through_trampoline() {
         entry: 0,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
     let kernel = OrbisKernel::new();
 
@@ -1749,6 +1882,7 @@ fn trivial_ret_module() -> LinkedModule {
         entry: 0,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     }
 }
 
@@ -1793,6 +1927,7 @@ fn guest_fs_zero_load_reads_the_installed_tcb() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -1870,6 +2005,7 @@ fn guest_tls_survives_preemption_via_fsbase_rearm() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     // Saturate every core so the guest thread is genuinely preempted rather
@@ -1978,6 +2114,7 @@ fn genuine_wild_fault_after_preemption_recovers_instead_of_looping_the_veh() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     // Saturate every core so the guest is genuinely descheduled during the spin.
@@ -2071,6 +2208,7 @@ fn guest_fs_offset_round_trip_writes_and_reads_back() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -2175,6 +2313,7 @@ fn host_fsbase_is_restored_after_a_recovered_genuine_fault() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -2267,6 +2406,7 @@ fn start_stub_observes_argc_via_rdi_per_the_orbis_entry_abi() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -2303,6 +2443,7 @@ fn process_entry_has_orbis_called_function_stack_alignment() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -2337,6 +2478,7 @@ fn start_stub_observes_argc_equal_to_one_via_the_process_stack() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -2375,6 +2517,7 @@ fn start_stub_observes_argv0_first_byte_via_the_process_stack() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -2443,6 +2586,7 @@ fn start_stub_calling_exit_returns_exited_with_the_given_code() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -2500,6 +2644,7 @@ fn start_stub_wild_fault_still_recovers_as_faulted_through_execute_process() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -2557,6 +2702,7 @@ fn execute_process_restores_host_fsbase_after_an_exit_longjmp() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -2651,6 +2797,7 @@ fn tls_variable_read_through_linker_computed_tpoff64_round_trips_tdata() {
             align: 0x10,
         }),
         procparam: None,
+        unwind: None,
     };
 
     let dynlib = DynlibData {
@@ -2747,6 +2894,7 @@ fn stack_chk_guard_canary_at_fs_0x28_is_nonzero_with_terminator_byte() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam_offset: None,
+        unwind_modules: Vec::new(),
     };
 
     let kernel = OrbisKernel::new();
@@ -2833,6 +2981,7 @@ fn printf_with_guest_format_string_lands_in_the_kernel_console() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam: None,
+        unwind: None,
     };
     let dynlib = DynlibData {
         symbols: vec![
@@ -2945,6 +3094,7 @@ fn load_start_module_from_guest_returns_a_usable_handle() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam: None,
+        unwind: None,
     };
     let dynlib = DynlibData {
         symbols: vec![
@@ -3057,6 +3207,7 @@ fn new_libc_strchr_resolves_and_dispatches_through_the_linker() {
         entry: ENTRY_OFF as u64,
         tls: None,
         procparam: None,
+        unwind: None,
     };
     let dynlib = DynlibData {
         symbols: vec![

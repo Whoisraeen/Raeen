@@ -139,6 +139,33 @@ pub trait GuestAllocator {
     /// Reserve a `length`-byte region aligned to `align`, returning its
     /// guest address, or `None` if the request cannot be satisfied.
     fn mmap(&self, length: u64, align: u64) -> Option<u64>;
+    /// Reserve address space without making it readable or writable. The
+    /// default keeps small test allocators source-compatible; native runtimes
+    /// override this so large sparse ranges do not consume the committed mmap
+    /// pool.
+    fn reserve(&self, length: u64, align: u64) -> Option<u64> {
+        self.mmap(length, align)
+    }
+    /// Commit a mapping at a caller-selected address inside a prior virtual
+    /// reservation. Test allocators reject fixed mappings by default.
+    fn map_at(&self, addr: u64, length: u64, align: u64) -> Option<u64> {
+        if addr == 0 {
+            self.mmap(length, align)
+        } else {
+            None
+        }
+    }
+    /// Back `addr` with memory if it falls in a range the guest reserved but
+    /// that carries no memory yet, returning whether the faulting access should
+    /// be retried. Real titles reserve far more address space than they touch
+    /// (Until Dawn opens with a 512 GiB reservation) and then use it directly,
+    /// so reservations must be committed lazily, page by page, on first touch.
+    /// The default declines: an allocator without a sparse reservation model
+    /// has nothing to commit, and a `false` here simply leaves the access to be
+    /// reported as a genuine fault exactly as before.
+    fn commit_on_demand(&self, _addr: u64) -> bool {
+        false
+    }
     /// Release a `length`-byte region previously returned by `mmap` starting
     /// at `addr`. An unrecognized `addr` is simply ignored.
     fn munmap(&self, addr: u64, length: u64);

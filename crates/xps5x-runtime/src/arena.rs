@@ -1,8 +1,8 @@
 //! [`GuestArena`]: the fixed-base, identity-mapped guest address space
-//! (design doc §2/§3/§5). Reserves one contiguous 4 GiB host region at
+//! (design doc §2/§3/§5). Reserves one contiguous 68 GiB host range at
 //! [`crate::GUEST_ARENA_BASE`], commits its four fixed sub-regions (image,
-//! heap, stack, mmap) with the layout's protections, copies the module image
-//! in, and frees the whole reservation on `Drop`.
+//! heap, stack, mmap) in its first 4 GiB, leaves a 64 GiB sparse reservation
+//! tail, copies the module image in, and frees the whole range on `Drop`.
 //!
 //! Guest address `A` *is* host address `A` here (identity mapping): a guest
 //! pointer returned by `alloc`/`mmap`, or baked into the image by the
@@ -19,6 +19,7 @@
 use core::ffi::c_void;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READWRITE,
@@ -59,6 +60,35 @@ const MMAP_SIZE: u64 = 0x6000_0000; // 1.5 GiB
 /// i.e. the four sub-regions exactly tile `[base, base + ARENA_SPAN)` with
 /// no gaps (design doc §3's layout table).
 const ARENA_SPAN: u64 = 0x1_0000_0000; // 4 GiB
+
+/// Sparse address-space tail reserved after the 4 GiB committed core. Games
+/// commonly reserve several multi-gigabyte heaps up front and map only small
+/// pieces later. The tail consumes host virtual addresses, not RAM.
+///
+/// Sized from a **measured** retail request, not a guess: Until Dawn opens with
+/// `sceKernelReserveVirtualRange(len = 0x80_0000_0000)` — 512 GiB in a single
+/// call — and treats failure as fatal (it goes straight to its crash reporter).
+/// A 68 GiB tail could not answer that. 2 TiB leaves ~1.5 TiB of headroom after
+/// such a reservation for [`GuestAllocator::alloc`]'s and `mmap`'s sparse
+/// growth, which share `reserve_bump` with it.
+///
+/// This costs address space, not memory: `new` only `MEM_RESERVE`s the span
+/// (pages are committed on demand), the arena base is 16 TiB, and Windows gives
+/// a user process 128 TiB — verified by reserving 512 GiB/1 TiB/2 TiB at
+/// `GUEST_ARENA_BASE` before choosing this value.
+const RESERVED_SPAN: u64 = 0x200_0000_0000; // 2 TiB: 4 GiB core + sparse tail
+
+/// Pages backed lazily by [`GuestArena::commit_on_demand`] since process start.
+static DEMAND_COMMITS: AtomicU64 = AtomicU64::new(0);
+
+/// How many reserved pages have been demand-committed. Monotonic; never reset.
+/// Zero means no title has touched an unbacked reservation — the pre-existing
+/// behaviour — so this doubles as the regression signal for that path.
+// Diagnostic counter for the lazy-commit path; read by tooling, not the crate.
+#[allow(dead_code)]
+pub fn demand_commit_count() -> u64 {
+    DEMAND_COMMITS.load(Ordering::Relaxed)
+}
 
 /// Size of the main-thread TCB [`GuestArena::setup_main_tcb`] carves from
 /// the heap region (design doc §3, RT2c-b/M1-B). Large enough for the
@@ -158,6 +188,19 @@ struct AllocState {
     /// Next never-yet-used mmap address; only ever moves forward. RT2a has
     /// no mmap free list — `munmap` is best-effort (design doc §5/§7).
     mmap_bump: u64,
+    /// Next never-used address in the sparse, uncommitted reservation tail.
+    reserve_bump: u64,
+    /// Committed subranges within the sparse reservation tail.
+    sparse_mappings: Vec<(u64, u64)>,
+    /// Ranges the guest reserved via [`GuestAllocator::reserve`] but that carry
+    /// no memory yet. A touch inside one is a demand-commit request, not a
+    /// fault — see [`GuestArena::commit_on_demand`].
+    reservations: Vec<(u64, u64)>,
+    /// Avoid repeating the heap-growth notice for every allocation after the
+    /// fixed 1 GiB fast path fills.
+    sparse_heap_announced: bool,
+    /// Avoid repeating the demand-commit notice for every committed page.
+    demand_commit_announced: bool,
 }
 
 impl AllocState {
@@ -167,13 +210,19 @@ impl AllocState {
             heap_free: Vec::new(),
             heap_sizes: HashMap::new(),
             mmap_bump: base + MMAP_OFFSET,
+            reserve_bump: base + ARENA_SPAN,
+            sparse_mappings: Vec::new(),
+            reservations: Vec::new(),
+            sparse_heap_announced: false,
+            demand_commit_announced: false,
         }
     }
 }
 
 /// The fixed-base, identity-mapped guest address space (design doc §2/§5).
-/// Owns the entire `[GUEST_ARENA_BASE, GUEST_ARENA_BASE + ARENA_SPAN)` host
-/// reservation; frees it via `VirtualFree` on `Drop`.
+/// Owns `[GUEST_ARENA_BASE, GUEST_ARENA_BASE + RESERVED_SPAN)`; only the
+/// leading [`ARENA_SPAN`] is committed host memory. Frees the whole range via
+/// `VirtualFree` on `Drop`.
 ///
 /// Only one `GuestArena` may exist at a time (fixed base + the runtime's
 /// single-active-execution invariant, `dispatch::CALL_LOCK` — design doc
@@ -194,8 +243,8 @@ pub(crate) struct GuestArena {
 }
 
 impl GuestArena {
-    /// Reserve the fixed-base 4 GiB arena, commit its four sub-regions with
-    /// their layout protections, and copy `image` into the image region.
+    /// Reserve the fixed-base 68 GiB range, commit its 4 GiB core with the
+    /// four sub-region protections, and copy `image` into the image region.
     /// `image.len() > IMAGE_SIZE` fails with `MapFailed` before anything is
     /// reserved.
     pub(crate) fn new(image: &[u8]) -> Result<Self, RuntimeError> {
@@ -220,7 +269,7 @@ impl GuestArena {
         let raw = unsafe {
             VirtualAlloc(
                 base as *const c_void,
-                ARENA_SPAN as usize,
+                RESERVED_SPAN as usize,
                 MEM_RESERVE,
                 PAGE_NOACCESS,
             )
@@ -309,6 +358,96 @@ impl GuestArena {
         address >= self.base && address < self.base.saturating_add(self.image_len)
     }
 
+    /// Back `addr` with memory if it lies in a range the guest reserved but
+    /// that was never committed. Returns whether the caller should retry the
+    /// faulting access.
+    ///
+    /// **Why this exists (demand paging).** `sceKernelReserveVirtualRange` hands
+    /// out address space, not memory, and real titles reserve far more than
+    /// they touch — Until Dawn opens with a **512 GiB** reservation. Committing
+    /// a reservation eagerly is therefore impossible (it would demand 512 GiB of
+    /// RAM), yet the same titles then *use* their reservation directly: Until
+    /// Dawn indexes a free-page bitmap 33.6 MB into a 64 MiB reservation
+    /// (`mov rdi, [rdx + rcx*8]` at `eboot+0x84352`, rdx = the reservation base)
+    /// having explicitly mapped only 16 KiB of it. Dragon Ball — also Unreal
+    /// Engine 5 — faults on the identical address, so this is one engine
+    /// pattern, not one title's quirk.
+    ///
+    /// So the reservation must be lazily backed: reserve the span, commit each
+    /// page the first time it is touched. This is what a real VMM does, and it
+    /// is the "lazy commit" RT2's design doc §7 deferred.
+    ///
+    /// Called only from the VEH, on the faulting thread, for an address that is
+    /// otherwise about to be reported as a genuine fault — so a `false` return
+    /// costs nothing and preserves the existing diagnostics exactly.
+    pub fn commit_on_demand(&self, addr: u64) -> bool {
+        // Only the sparse tail is ever uncommitted; the 4 GiB core is mapped at
+        // construction, so a fault there is real and must stay a fault.
+        if addr < self.base + ARENA_SPAN || addr >= self.base + RESERVED_SPAN {
+            return false;
+        }
+        let mut state = self.lock_state();
+        let page = addr & !(PAGE_SIZE - 1);
+        let page_end = page + PAGE_SIZE;
+
+        // Inside a range the guest actually reserved? A touch anywhere else in
+        // the tail is a wild pointer and must remain a fault.
+        if !state
+            .reservations
+            .iter()
+            .any(|&(start, end)| page >= start && page_end <= end)
+        {
+            return false;
+        }
+        // Already backed (e.g. two threads raced into the same page): let the
+        // retry proceed rather than double-commit.
+        if state
+            .sparse_mappings
+            .iter()
+            .any(|&(start, end)| page >= start && page_end <= end)
+        {
+            return true;
+        }
+
+        // SAFETY: `[page, page_end)` is page aligned and lies inside this
+        // arena's prior sparse `MEM_RESERVE` (checked against `reservations`,
+        // which `reserve` only fills with sub-ranges of that reservation). The
+        // reservation outlives the arena's guest run. `MEM_COMMIT` on an
+        // already-committed page is a documented no-op, so the race above is
+        // benign either way.
+        let raw = unsafe {
+            VirtualAlloc(
+                page as *const c_void,
+                PAGE_SIZE as usize,
+                MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        if raw.is_null() || raw as u64 != page {
+            return false;
+        }
+        state.sparse_mappings.push((page, page_end));
+        if !state.demand_commit_announced {
+            tracing::info!(
+                address = page,
+                "guest touched a reserved-but-uncommitted range; backing it on demand"
+            );
+            state.demand_commit_announced = true;
+        }
+        DEMAND_COMMITS.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    fn range_is_committed(&self, start: u64, end: u64) -> bool {
+        if start >= self.base && end <= self.base + ARENA_SPAN {
+            return true;
+        }
+        self.lock_state()
+            .sparse_mappings
+            .iter()
+            .any(|&(mapped_start, mapped_end)| mapped_start <= start && end <= mapped_end)
+    }
+
     /// Set up the main-thread TCB and, if the module has a `PT_TLS`
     /// template, its static TLS block (design doc §3, RT2c-b/M1-B):
     ///
@@ -391,7 +530,7 @@ impl GuestMemory for GuestArena {
         let Some(end) = guest_addr.checked_add(len) else {
             return false;
         };
-        if end > self.base + ARENA_SPAN {
+        if !self.range_is_committed(guest_addr, end) {
             return false;
         }
         // SAFETY: `[guest_addr, guest_addr + out.len())` lies within
@@ -418,7 +557,7 @@ impl GuestMemory for GuestArena {
         let Some(end) = guest_addr.checked_add(len) else {
             return false;
         };
-        if end > self.base + ARENA_SPAN {
+        if !self.range_is_committed(guest_addr, end) {
             return false;
         }
         // SAFETY: same bounds argument as `read` above. Every sub-region is
@@ -434,8 +573,7 @@ impl GuestMemory for GuestArena {
 
     fn atomic_load_u32(&self, guest_addr: u64) -> Option<u32> {
         let end = guest_addr.checked_add(4)?;
-        if guest_addr < self.base
-            || end > self.base + ARENA_SPAN
+        if !self.range_is_committed(guest_addr, end)
             || guest_addr % core::mem::align_of::<std::sync::atomic::AtomicU32>() as u64 != 0
         {
             return None;
@@ -451,8 +589,7 @@ impl GuestMemory for GuestArena {
 
     fn atomic_compare_exchange_u32(&self, guest_addr: u64, current: u32, new: u32) -> Option<u32> {
         let end = guest_addr.checked_add(4)?;
-        if guest_addr < self.base
-            || end > self.base + ARENA_SPAN
+        if !self.range_is_committed(guest_addr, end)
             || guest_addr % core::mem::align_of::<std::sync::atomic::AtomicU32>() as u64 != 0
         {
             return None;
@@ -476,8 +613,7 @@ impl GuestMemory for GuestArena {
             Some(end) => end,
             None => return false,
         };
-        if guest_addr < self.base
-            || end > self.base + ARENA_SPAN
+        if !self.range_is_committed(guest_addr, end)
             || guest_addr % core::mem::align_of::<std::sync::atomic::AtomicU32>() as u64 != 0
         {
             return false;
@@ -511,16 +647,51 @@ impl GuestAllocator for GuestArena {
             return Some(addr);
         }
 
-        // No reusable block: bump within the heap region.
+        // No reusable block: bump within the committed heap fast path.
         let addr = align_up(state.heap_bump, align)?;
         let end = addr.checked_add(size)?;
-        if end > self.base + STACK_OFFSET {
-            // Heap region is [base + HEAP_OFFSET, base + STACK_OFFSET).
+        if end <= self.base + STACK_OFFSET {
+            state.heap_bump = end;
+            state.heap_sizes.insert(addr, size);
+            return Some(addr);
+        }
+
+        // Large games can legitimately consume more than the fixed 1 GiB
+        // heap. Commit only the required pages in the already-reserved sparse
+        // tail instead of imposing an emulator-specific memory ceiling.
+        let sparse_align = align.max(PAGE_SIZE);
+        let sparse_addr = align_up(state.reserve_bump, sparse_align)?;
+        let committed_len = align_up(size, PAGE_SIZE)?;
+        let sparse_end = sparse_addr.checked_add(committed_len)?;
+        if sparse_end > self.base + RESERVED_SPAN {
             return None;
         }
-        state.heap_bump = end;
-        state.heap_sizes.insert(addr, size);
-        Some(addr)
+        // SAFETY: `[sparse_addr, sparse_end)` lies within this arena's prior
+        // sparse `MEM_RESERVE`, is page aligned, and cannot overlap an older
+        // sparse allocation because `reserve_bump` is shared by reservations
+        // and heap growth. The reservation outlives this allocation.
+        let raw = unsafe {
+            VirtualAlloc(
+                sparse_addr as *const c_void,
+                committed_len as usize,
+                MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        if raw.is_null() || raw as u64 != sparse_addr {
+            return None;
+        }
+        state.reserve_bump = sparse_end;
+        state.sparse_mappings.push((sparse_addr, sparse_end));
+        state.heap_sizes.insert(sparse_addr, size);
+        if !state.sparse_heap_announced {
+            tracing::info!(
+                address = sparse_addr,
+                "guest heap exceeded 1 GiB; growing on demand in sparse address space"
+            );
+            state.sparse_heap_announced = true;
+        }
+        Some(sparse_addr)
     }
 
     fn free(&self, addr: u64) {
@@ -577,12 +748,112 @@ impl GuestAllocator for GuestArena {
         let length = align_up(length.max(1), align)?;
         let mut state = self.lock_state();
 
+        // Fast path: the pre-committed 1.5 GiB mmap region.
         let addr = align_up(state.mmap_bump, align)?;
-        let end = addr.checked_add(length)?;
-        if end > self.base + ARENA_SPAN {
+        if let Some(end) = addr.checked_add(length)
+            && end <= self.base + ARENA_SPAN
+        {
+            state.mmap_bump = end;
+            return Some(addr);
+        }
+
+        // The committed region is only 1.5 GiB, but a retail title's first
+        // request can exceed it outright: ASTRO.BOT opens with
+        // `sceKernelAllocateDirectMemory(len = 0x7980_0000)` (1.94 GiB), which
+        // routes here. Capping at ARENA_SPAN failed that call, the title then
+        // built its heap over a garbage base and died. `alloc` already solves
+        // this by growing into the sparse tail; `mmap` lacking the same
+        // fallback was an asymmetry, not a deliberate ceiling.
+        let sparse_align = align.max(PAGE_SIZE);
+        let sparse_addr = align_up(state.reserve_bump, sparse_align)?;
+        let committed_len = align_up(length, PAGE_SIZE)?;
+        let sparse_end = sparse_addr.checked_add(committed_len)?;
+        if sparse_end > self.base + RESERVED_SPAN {
             return None;
         }
-        state.mmap_bump = end;
+        // SAFETY: identical to `alloc`'s sparse growth — `[sparse_addr,
+        // sparse_end)` lies inside this arena's prior sparse `MEM_RESERVE`, is
+        // page aligned, and cannot overlap an older sparse allocation because
+        // `reserve_bump` is the single bump shared by reservations, heap
+        // growth, and now mmap. The reservation outlives this mapping.
+        let raw = unsafe {
+            VirtualAlloc(
+                sparse_addr as *const c_void,
+                committed_len as usize,
+                MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        if raw.is_null() || raw as u64 != sparse_addr {
+            return None;
+        }
+        state.reserve_bump = sparse_end;
+        state.sparse_mappings.push((sparse_addr, sparse_end));
+        Some(sparse_addr)
+    }
+
+    fn reserve(&self, length: u64, align: u64) -> Option<u64> {
+        let align = normalize_align(align.max(PAGE_SIZE))?;
+        let length = align_up(length.max(1), align)?;
+        let mut state = self.lock_state();
+        let addr = align_up(state.reserve_bump, align)?;
+        let end = addr.checked_add(length)?;
+        if end > self.base + RESERVED_SPAN {
+            return None;
+        }
+        state.reserve_bump = end;
+        // Remember the span so a later touch inside it can be answered with
+        // memory instead of a fault (`commit_on_demand`).
+        state.reservations.push((addr, end));
+        Some(addr)
+    }
+
+    fn commit_on_demand(&self, addr: u64) -> bool {
+        GuestArena::commit_on_demand(self, addr)
+    }
+
+    fn map_at(&self, addr: u64, length: u64, align: u64) -> Option<u64> {
+        let align = normalize_align(align.max(PAGE_SIZE))?;
+        if addr % align != 0 {
+            return None;
+        }
+        let length = align_up(length.max(1), PAGE_SIZE)?;
+        let end = addr.checked_add(length)?;
+        if addr < self.base + ARENA_SPAN || end > self.base + RESERVED_SPAN {
+            return None;
+        }
+
+        let mut state = self.lock_state();
+        if state
+            .sparse_mappings
+            .iter()
+            .any(|&(start, mapped_end)| start <= addr && end <= mapped_end)
+        {
+            return Some(addr);
+        }
+        if state
+            .sparse_mappings
+            .iter()
+            .any(|&(start, mapped_end)| addr < mapped_end && start < end)
+        {
+            return None;
+        }
+        // SAFETY: the entire sparse tail belongs to this arena's prior
+        // `MEM_RESERVE`; the validated page-aligned subrange can therefore be
+        // committed in place. An explicit address either succeeds there or
+        // returns null.
+        let raw = unsafe {
+            VirtualAlloc(
+                addr as *const c_void,
+                length as usize,
+                MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        if raw.is_null() || raw as u64 != addr {
+            return None;
+        }
+        state.sparse_mappings.push((addr, end));
         Some(addr)
     }
 
@@ -636,6 +907,31 @@ mod tests {
         assert!(a + 64 <= b || b + 64 <= a, "allocations must not overlap");
     }
 
+    #[test]
+    fn heap_grows_into_sparse_tail_after_committed_fast_path_fills() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+
+        let core = arena
+            .alloc(HEAP_SIZE, 16)
+            .expect("the full committed heap fast path");
+        assert_eq!(core, GUEST_ARENA_BASE + HEAP_OFFSET);
+
+        let grown = arena
+            .alloc(0x2000, 16)
+            .expect("heap must grow into sparse address space");
+        assert!(grown >= GUEST_ARENA_BASE + ARENA_SPAN);
+        assert!(arena.write(grown + 0x1fff, &[0xAB]));
+        let mut byte = [0u8; 1];
+        assert!(arena.read(grown + 0x1fff, &mut byte));
+        assert_eq!(byte, [0xAB]);
+
+        let reservation = arena
+            .reserve(0x4000, PAGE_SIZE)
+            .expect("reservation after sparse heap growth");
+        assert!(reservation >= grown + 0x2000, "ranges must not overlap");
+    }
+
     /// (c) `free` then `alloc` of the same size reuses the freed block.
     #[test]
     fn free_then_alloc_same_size_reuses_freed_block() {
@@ -664,6 +960,162 @@ mod tests {
         let mmap_start = GUEST_ARENA_BASE + MMAP_OFFSET;
         let arena_end = GUEST_ARENA_BASE + ARENA_SPAN;
         assert!(addr >= mmap_start && addr + 0x2000 <= arena_end);
+    }
+
+    /// ASTRO.BOT's opening `sceKernelAllocateDirectMemory(0x7980_0000)` — 1.94
+    /// GiB — routes to `mmap`, whose committed region is only 1.5 GiB. Before
+    /// `mmap` grew a sparse-tail fallback this failed outright on the title's
+    /// FIRST allocation; the game then built its heap over a garbage base.
+    /// The returned memory must be genuinely usable, not merely a live address.
+    #[test]
+    fn mmap_request_larger_than_the_committed_region_grows_into_the_sparse_tail() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let astro_bot_request = 0x7980_0000u64; // measured from the retail title
+
+        assert!(
+            astro_bot_request > MMAP_SIZE,
+            "this test is only meaningful while the request exceeds the committed \
+             mmap region ({MMAP_SIZE:#x}); it is the whole point of the fallback"
+        );
+
+        let addr = arena
+            .mmap(astro_bot_request, xps5x_core::PS5_PAGE_SIZE as u64)
+            .expect("a 1.94 GiB mmap must succeed via the sparse tail");
+        assert!(
+            addr >= GUEST_ARENA_BASE + ARENA_SPAN,
+            "oversized mmap must land in the sparse tail, got {addr:#x}"
+        );
+
+        // Committed, not just reserved: read/write both ends of the mapping.
+        let mut byte = [0u8; 1];
+        assert!(arena.write(addr, &[0xAB]));
+        assert!(arena.read(addr, &mut byte));
+        assert_eq!(byte, [0xAB]);
+        let last = addr + astro_bot_request - 1;
+        assert!(
+            arena.write(last, &[0xCD]),
+            "tail page must be committed too"
+        );
+        assert!(arena.read(last, &mut byte));
+        assert_eq!(byte, [0xCD]);
+    }
+
+    /// Until Dawn opens with `sceKernelReserveVirtualRange(0x80_0000_0000)` —
+    /// 512 GiB in one call — and treats failure as fatal. The old 68 GiB
+    /// RESERVED_SPAN could not answer it, which is why the title died in its
+    /// own crash reporter before spawning a single thread.
+    #[test]
+    fn a_single_five_hundred_twelve_gib_reservation_fits_the_sparse_tail() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let until_dawn_request = 0x80_0000_0000u64; // measured from the retail title
+
+        let addr = arena
+            .reserve(until_dawn_request, xps5x_core::PS5_PAGE_SIZE as u64)
+            .expect("a 512 GiB reservation must succeed");
+        assert_eq!(addr, GUEST_ARENA_BASE + ARENA_SPAN);
+        assert!(addr + until_dawn_request <= GUEST_ARENA_BASE + RESERVED_SPAN);
+
+        // Reserved only — untouched pages must still be unreadable...
+        let mut byte = [0u8; 1];
+        assert!(!arena.read(addr, &mut byte));
+        // ...and the tail must retain room for heap/mmap growth afterwards,
+        // since all three share `reserve_bump`.
+        let after = arena
+            .alloc(0x1000, 16)
+            .expect("heap must still grow after a 512 GiB reservation");
+        assert!(after != 0);
+    }
+
+    /// Demand paging: a reserved page carries no memory until touched, and
+    /// `commit_on_demand` backs exactly the touched page. This is what lets a
+    /// title reserve 512 GiB and then use a bitmap 33.6 MB into it (Until Dawn,
+    /// Dragon Ball) without the emulator committing 512 GiB of RAM.
+    #[test]
+    fn touching_a_reserved_page_commits_it_on_demand() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let len = 0x400_0000u64; // 64 MiB, Until Dawn's second reservation
+        let base = arena
+            .reserve(len, xps5x_core::PS5_PAGE_SIZE as u64)
+            .expect("reservation");
+
+        // Reserved != usable: nothing is backed yet.
+        let deep = base + 0x200_1860; // ~33.6 MB in, Until Dawn's bitmap offset
+        let mut byte = [0u8; 1];
+        assert!(
+            !arena.read(deep, &mut byte),
+            "reservation must start unbacked"
+        );
+
+        // The fault handler's question. It must say yes, and only once per page.
+        assert!(arena.commit_on_demand(deep), "a touch inside a reservation");
+        assert!(
+            arena.write(deep, &[0xAB]),
+            "page must be usable after commit"
+        );
+        assert!(arena.read(deep, &mut byte));
+        assert_eq!(byte, [0xAB]);
+
+        // Idempotent: a second touch of a now-backed page still says "retry".
+        assert!(arena.commit_on_demand(deep));
+
+        // Committing one page must not silently back its neighbours — that
+        // would turn a 512 GiB reservation into a 512 GiB commit.
+        assert!(!arena.read(deep + PAGE_SIZE, &mut byte));
+    }
+
+    /// The safety boundary: demand commit answers ONLY for reserved ranges. A
+    /// wild pointer must stay a fault, or every guest bug becomes silent memory.
+    #[test]
+    fn commit_on_demand_declines_addresses_outside_any_reservation() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+
+        // In the sparse tail but never reserved by anyone.
+        assert!(!arena.commit_on_demand(GUEST_ARENA_BASE + ARENA_SPAN + 0x5000_0000));
+        // Inside the committed core: a fault there is real (already mapped).
+        assert!(!arena.commit_on_demand(GUEST_ARENA_BASE + 0x1000));
+        // Past the reservation entirely, and a wild low address.
+        assert!(!arena.commit_on_demand(GUEST_ARENA_BASE + RESERVED_SPAN + 0x1000));
+        assert!(!arena.commit_on_demand(0x1000));
+
+        // A reservation must not bless addresses past its own end.
+        let base = arena
+            .reserve(0x1_0000, xps5x_core::PS5_PAGE_SIZE as u64)
+            .expect("reservation");
+        assert!(arena.commit_on_demand(base));
+        assert!(!arena.commit_on_demand(base + 0x1_0000));
+    }
+
+    #[test]
+    fn sparse_tail_accepts_two_eight_gib_reservations_without_mapping_them() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let eight_gib = 0x2_0000_0000;
+        let first = arena
+            .reserve(eight_gib, xps5x_core::PS5_PAGE_SIZE as u64)
+            .expect("first sparse reservation");
+        let second = arena
+            .reserve(eight_gib, xps5x_core::PS5_PAGE_SIZE as u64)
+            .expect("second sparse reservation");
+
+        assert_eq!(first, GUEST_ARENA_BASE + ARENA_SPAN);
+        assert_eq!(second, first + eight_gib);
+        assert!(second + eight_gib <= GUEST_ARENA_BASE + RESERVED_SPAN);
+        let mut byte = [0u8; 1];
+        assert!(!arena.read(first, &mut byte));
+        assert!(!arena.write(first, &[1]));
+
+        let mapped = arena
+            .map_at(first, 0x2_0000, xps5x_core::PS5_PAGE_SIZE as u64)
+            .expect("commit inside prior sparse reservation");
+        assert_eq!(mapped, first);
+        assert!(arena.write(first + 0x10, &[0xAB]));
+        assert!(arena.read(first + 0x10, &mut byte));
+        assert_eq!(byte, [0xAB]);
+        assert!(!arena.write(first + 0x2_0000, &[1]));
     }
 
     /// (e) `GuestMemory` write-then-read roundtrip inside an alloc'd block

@@ -257,9 +257,54 @@ impl VirtualFileSystem {
             ));
         }
 
-        let host_path = self
-            .resolve_path(path)
-            .unwrap_or_else(|| PathBuf::from(path));
+        if path == "/" {
+            if writable {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "virtual root opened for writing",
+                ));
+            }
+            let mut entries: Vec<DirectoryEntry> = self
+                .mounts
+                .read()
+                .iter()
+                .filter_map(|mount| {
+                    mount
+                        .ps5_prefix
+                        .strip_prefix('/')
+                        .filter(|name| !name.is_empty())
+                        .map(|name| DirectoryEntry {
+                            name: name.to_string(),
+                            is_directory: true,
+                        })
+                })
+                .collect();
+            entries.sort_by_key(|entry| entry.name.to_ascii_lowercase());
+            entries.dedup_by(|a, b| a.name.eq_ignore_ascii_case(&b.name));
+            let mut next = self.next_fd.write();
+            let fd = *next;
+            *next += 1;
+            self.open_files.write().insert(
+                fd,
+                OpenFile {
+                    fd,
+                    host_path: PathBuf::new(),
+                    ps5_path: path.to_string(),
+                    position: 0,
+                    data: None,
+                    writable: false,
+                    dirty: false,
+                    flags,
+                    directory_entries: Some(entries),
+                    directory_index: 0,
+                },
+            );
+            return Ok(fd);
+        }
+
+        let host_path = self.resolve_path(path).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "path is not mounted")
+        })?;
 
         let exists = host_path.exists();
         let is_directory = host_path.is_dir();
@@ -463,9 +508,12 @@ impl VirtualFileSystem {
         Ok(())
     }
 
-    /// Encode as many fixed-size PS5 directory entries as fit in `requested`.
-    /// Each record is the 512-byte Gen5 layout used by `getdents`:
-    /// inode:u32, reclen:u16, type:u8, namelen:u8, name[...].
+    /// Return one fixed-size Gen5 dirent per call.
+    ///
+    /// PS5's kernel-facing directory ABI uses a 512-byte record even when the
+    /// caller supplies a larger buffer. Advancing one entry at a time is
+    /// important: retail code commonly treats every successful call as one
+    /// complete record rather than walking packed BSD-style variable records.
     pub fn getdents(&self, fd: Fd, requested: usize) -> Result<(Vec<u8>, usize), std::io::Error> {
         const DIRENT_SIZE: usize = 512;
         if requested < DIRENT_SIZE {
@@ -487,24 +535,21 @@ impl VirtualFileSystem {
                 "fd is not a directory",
             ));
         };
-        let capacity = requested / DIRENT_SIZE;
-        let end = file
-            .directory_index
-            .saturating_add(capacity)
-            .min(entries.len());
-        let mut payload = vec![0u8; (end - file.directory_index) * DIRENT_SIZE];
-        for (slot, entry) in entries[file.directory_index..end].iter().enumerate() {
-            let record = &mut payload[slot * DIRENT_SIZE..(slot + 1) * DIRENT_SIZE];
-            let name = entry.name.as_bytes();
-            let name_len = name.len().min(255);
-            record[0..4].copy_from_slice(&fnv1a32(&name[..name_len]).to_le_bytes());
-            record[4..6].copy_from_slice(&(DIRENT_SIZE as u16).to_le_bytes());
-            record[6] = if entry.is_directory { 4 } else { 8 };
-            record[7] = name_len as u8;
-            record[8..8 + name_len].copy_from_slice(&name[..name_len]);
-        }
-        file.directory_index = end;
-        Ok((payload, end))
+        let base = file.directory_index;
+        let Some(entry) = entries.get(file.directory_index) else {
+            return Ok((Vec::new(), base));
+        };
+        let name = entry.name.as_bytes();
+        let name_len = name.len().min(255);
+        let mut record = vec![0u8; DIRENT_SIZE];
+        record[0..4].copy_from_slice(&fnv1a32(&name[..name_len]).to_le_bytes());
+        record[4..6].copy_from_slice(&(DIRENT_SIZE as u16).to_le_bytes());
+        record[6] = if entry.is_directory { 4 } else { 8 };
+        record[7] = name_len as u8;
+        record[8..8 + name_len].copy_from_slice(&name[..name_len]);
+        file.directory_index += 1;
+        file.position = file.directory_index as u64;
+        Ok((record, base))
     }
 
     /// Persist an open descriptor's dirty write-back buffer without closing
@@ -696,23 +741,56 @@ mod tests {
 
         let fd = vfs.open("/app0", O_RDONLY, 0).unwrap();
         assert_eq!(vfs.flags(fd), Some(O_RDONLY));
-        let (bytes, base) = vfs.getdents(fd, 1024).unwrap();
-        assert_eq!(bytes.len(), 1024);
+        let mut kinds_and_names = Vec::new();
+        for expected_base in 0..2 {
+            let (bytes, base) = vfs.getdents(fd, 1024).unwrap();
+            assert_eq!(bytes.len(), 512);
+            assert_eq!(base, expected_base);
+            assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 512);
+            let name_len = bytes[7] as usize;
+            kinds_and_names.push((
+                bytes[6],
+                std::str::from_utf8(&bytes[8..8 + name_len])
+                    .unwrap()
+                    .to_string(),
+            ));
+        }
+        kinds_and_names.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            kinds_and_names,
+            [(4, "packs".to_string()), (8, "stone.txt".to_string())]
+        );
+        let (eof, base) = vfs.getdents(fd, 512).unwrap();
+        assert!(eof.is_empty());
         assert_eq!(base, 2);
-        let mut kinds_and_names = bytes
-            .chunks_exact(512)
-            .map(|entry| {
-                let len = entry[7] as usize;
-                (entry[6], std::str::from_utf8(&entry[8..8 + len]).unwrap())
-            })
-            .collect::<Vec<_>>();
-        kinds_and_names.sort_by_key(|(_, name)| *name);
-        assert_eq!(kinds_and_names, [(4, "packs"), (8, "stone.txt")]);
-        assert!(vfs.getdents(fd, 512).unwrap().0.is_empty());
         vfs.set_status_flags(fd, O_APPEND).unwrap();
         assert_eq!(vfs.flags(fd), Some(O_APPEND | O_RDONLY));
         vfs.close(fd).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn virtual_root_enumerates_guest_mounts_without_exposing_host_root() {
+        let vfs = VirtualFileSystem::new();
+        let fd = vfs.open("/", open_flags::O_RDONLY, 0).unwrap();
+        let mut bytes = Vec::new();
+        loop {
+            let (record, _) = vfs.getdents(fd, 1024).unwrap();
+            if record.is_empty() {
+                break;
+            }
+            bytes.extend_from_slice(&record);
+        }
+        let names = ["app0", "savedata0", "download0", "temp0", "system"];
+        for name in names {
+            assert!(
+                bytes
+                    .windows(name.len())
+                    .any(|window| window == name.as_bytes()),
+                "virtual root must contain {name}"
+            );
+        }
+        assert!(!bytes.windows(7).any(|window| window == b"Windows"));
     }
 
     #[test]

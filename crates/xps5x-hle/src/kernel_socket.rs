@@ -32,6 +32,12 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register("libkernel", "bzero", hle_bzero);
     registry.register("libkernel", "inet_pton", hle_inet_pton);
+    registry.register_nid(
+        "libScePosix",
+        "inet_ntop",
+        0xe634_42b3_66b1_b6be,
+        hle_inet_ntop,
+    );
     registry.register("libkernel", "htons", hle_htons);
 }
 
@@ -52,7 +58,10 @@ fn parse_sockaddr_in(ctx: &HleContext, addr: u64, addrlen: i64) -> Option<([u8; 
     if !ctx.mem.read(addr, &mut buf) {
         return None;
     }
-    if buf[1] != AF_INET as u8 {
+    // Orbis uses the BSD `sin_len, sin_family` prefix. Some compiler/runtime
+    // code still constructs the POSIX `sa_family_t` form (`02 00`) directly,
+    // so accept both representations of AF_INET.
+    if buf[1] != AF_INET as u8 && u16::from_le_bytes([buf[0], buf[1]]) != AF_INET as u16 {
         return None;
     }
     let port = u16::from_be_bytes([buf[2], buf[3]]);
@@ -195,6 +204,27 @@ fn hle_inet_pton(ctx: &HleContext, args: &[u64]) -> u64 {
     1
 }
 
+/// `inet_ntop(AF_INET, src, dst, size)`: format four guest IPv4 bytes into a
+/// bounded NUL-terminated dotted quad and return `dst` on success.
+fn hle_inet_ntop(ctx: &HleContext, args: &[u64]) -> u64 {
+    let af = args.first().copied().unwrap_or(0);
+    let src = args.get(1).copied().unwrap_or(0);
+    let dst = args.get(2).copied().unwrap_or(0);
+    let size = args.get(3).copied().unwrap_or(0);
+    if af != AF_INET || src == 0 || dst == 0 {
+        return 0;
+    }
+    let mut ip = [0u8; 4];
+    if !ctx.mem.read(src, &mut ip) {
+        return 0;
+    }
+    let text = format!("{}.{}.{}.{}\0", ip[0], ip[1], ip[2], ip[3]);
+    if size < text.len() as u64 || !ctx.mem.write(dst, text.as_bytes()) {
+        return 0;
+    }
+    dst
+}
+
 /// `htons(value)`: host→network byte order for a 16-bit value.
 fn hle_htons(_ctx: &HleContext, args: &[u64]) -> u64 {
     let v = args.first().copied().unwrap_or(0) as u16;
@@ -242,6 +272,28 @@ mod tests {
     }
 
     #[test]
+    fn inet_ntop_formats_ipv4_and_checks_capacity() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert!(ctx.mem.write(0x40, &[192, 168, 1, 10]));
+        assert_eq!(hle_inet_ntop(&ctx, &[AF_INET, 0x40, 0x80, 16]), 0x80);
+        let mut text = [0u8; 13];
+        assert!(ctx.mem.read(0x80, &mut text));
+        assert_eq!(&text, b"192.168.1.10\0");
+        assert_eq!(hle_inet_ntop(&ctx, &[AF_INET, 0x40, 0x90, 4]), 0);
+
+        let registry = HleRegistry::new();
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| {
+                    *nid == 0xe634_42b3_66b1_b6be && key == "libScePosix::inet_ntop"
+                })
+        );
+    }
+
+    #[test]
     fn bzero_clears_memory() {
         let (kernel, mem, alloc) = ctx_env();
         let ctx = test_ctx(&kernel, &mem, &alloc);
@@ -277,13 +329,24 @@ mod tests {
         assert_eq!(&out[4..8], &[10, 0, 0, 5]);
         // Operations on an unknown fd → -1.
         assert_eq!(hle_bind(&ctx, &[0x999, 0x100, 8]), MINUS_ONE);
+
+        // POSIX `sa_family_t` prefix is also accepted.
+        let mut posix_sa = sa;
+        posix_sa[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+        assert!(ctx.mem.write(0x100, &posix_sa));
+        assert_eq!(hle_bind(&ctx, &[fd, 0x100, 8]), OK);
         assert!(ctx.mem.write(0x240, &1u32.to_le_bytes()));
         assert_eq!(hle_setsockopt(&ctx, &[fd, 0xffff, 1, 0x240, 4]), OK);
         assert_eq!(hle_setsockopt(&ctx, &[0x999, 0, 0, 0, 0]), MINUS_ONE);
 
         let registry = HleRegistry::new();
-        assert!(registry.registered_nid_overrides().iter().any(|(nid, key)| {
-            *nid == 0x7c5c_4693_1176_6d5a && key == "libScePosix::setsockopt"
-        }));
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| {
+                    *nid == 0x7c5c_4693_1176_6d5a && key == "libScePosix::setsockopt"
+                })
+        );
     }
 }

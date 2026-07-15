@@ -70,6 +70,37 @@ re-implementations are license-compatible; this notice preserves attribution.
 
 ---
 
+## shadPS4 — PS4 emulator (reference source; NID→name data incorporated)
+
+- **Upstream:** https://github.com/shadps4-emu/shadPS4
+- **License:** GPL-2.0-or-later (`SPDX-License-Identifier: GPL-2.0-or-later`;
+  the repository's `LICENSE` is the GNU GPL **Version 2, June 1991** text)
+- **Copyright:** © 2024 shadPS4 Emulator Project and contributors
+- **How XPS5X uses it:** Primarily an Orbis HLE reference (memory, libkernel,
+  linker, Vulkan), re-implemented in Rust rather than transliterated.
+
+  **Data incorporated in-tree:** `crates/xps5x-firmware/src/dynlib/nid_names.txt`
+  is derived from shadPS4's `src/core/aerolib/aerolib.inl` — a generated table
+  of public SCE symbol names and their NIDs. XPS5X uses it strictly as a
+  **candidate dictionary**: an entry is admitted only if XPS5X's own
+  `dynlib::nid::nid_of()` reproduces the NID from the name, so every retained
+  name is a verified SHA-1 preimage rather than a trusted assertion (94,247 of
+  aerolib's 94,276 entries pass; 29 are rejected). The test
+  `nid_names::tests::all_names_hash_to_their_nid` re-proves the entire table on
+  every run. Regenerate with the adjacent `gen_nid_names.py`.
+
+  These are **public symbol names, not Sony code** — no SDK headers, firmware,
+  keys, or binaries are involved, consistent with `.claude/skills/clean-room`
+  ("NID names from community databases OK"). shadPS4's tree itself is cloned
+  only into the git-ignored `reference/` directory and is never compiled or
+  committed.
+
+GPL-2.0-or-later may be exercised under GPL-2.0 terms, so the incorporated data
+is license-compatible with XPS5X's GPL-2.0-only; this notice preserves
+attribution as that license requires.
+
+---
+
 ## Compiled Rust crate dependencies
 
 Unlike the clean-room reference sources above (studied but never linked),

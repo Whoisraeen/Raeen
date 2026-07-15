@@ -10,18 +10,26 @@
 //!   instruction parsers, and the top-level `shader_parse` walker.
 //! - [`resources`]: `Shader.h` L532-1028 — sharps (V#/T#/S#), bind
 //!   resources, per-stage input infos, PS5 shader-file header.
-//! - [`hw_regs`]: minimal `HardwareContext.h` slice consumed by analysis.
+//! - [`hw_regs`]: re-export of [`crate::hw_regs`]. `HardwareContext.h` is
+//!   generation-agnostic and is also read by the PM4 command processor
+//!   ([`crate::run`]), so the register model lives at crate level; this alias
+//!   keeps the historical `shader::hw_regs::` paths resolving.
 //! - [`analysis`]: `Shader.cpp` — binary info, usage slots, resource
 //!   extraction, fetch recovery, input infos, cache ids, parse wrappers.
 
 pub mod analysis;
-pub mod hw_regs;
 pub mod parse;
 pub mod recompile;
 pub mod resources;
 pub mod spirv;
 pub mod types;
 
+pub use crate::hw_regs;
+pub use crate::hw_regs::{
+    ComputeShaderInfo, CsStageRegisters, DepthShaderControl, EsStageRegisters, GsShaderResource2,
+    GsStageRegisters, PixelShaderInfo, PsShaderResource2, PsStageRegisters, ShaderRegisters,
+    UserSgprInfo, UserSgprType, VertexShaderInfo, VsShaderResource2, VsStageRegisters,
+};
 pub use analysis::{
     ShaderAnalysisError, ShaderBinaryInfo, ShaderMap, ShaderMemory, ShaderParsedUsage,
     ShaderUsageInfo, ShaderUsageSlot, get_binary_info, get_usage_slots,
@@ -29,10 +37,6 @@ pub use analysis::{
     shader_get_id_vs, shader_get_input_info_cs, shader_get_input_info_ps, shader_get_input_info_vs,
     shader_parse_attrib, shader_parse_cs, shader_parse_fetch, shader_parse_ps, shader_parse_usage,
     shader_parse_usage2, shader_parse_vs,
-};
-pub use hw_regs::{
-    ComputeShaderInfo, PixelShaderInfo, ShaderRegisters, UserSgprInfo, UserSgprType,
-    VertexShaderInfo,
 };
 pub use parse::{ShaderParseError, operand_parse, shader_parse};
 pub use recompile::{

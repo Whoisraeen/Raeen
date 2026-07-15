@@ -229,6 +229,17 @@ impl VirtualMemoryManager {
             .map(|(_, region)| region.clone())
     }
 
+    /// Find the first mapped region whose base is at or after `addr`.
+    /// This backs `sceKernelVirtualQuery(..., FIND_NEXT, ...)` without
+    /// exposing the VMM's internal map.
+    pub fn region_at_or_after(&self, addr: VAddr) -> Option<MemoryRegion> {
+        self.regions
+            .read()
+            .range(addr..)
+            .next()
+            .map(|(_, region)| region.clone())
+    }
+
     /// Whether `addr` falls within any mapped region.
     pub fn is_mapped(&self, addr: VAddr) -> bool {
         self.region_containing(addr).is_some()
@@ -375,5 +386,14 @@ mod tests {
 
         vmm.remove_mapping(addr);
         assert!(!vmm.is_mapped(addr));
+    }
+
+    #[test]
+    fn region_at_or_after_finds_the_next_mapping() {
+        let vmm = VirtualMemoryManager::new();
+        vmm.record_mapping(0x2000, 0x1000, 0x3);
+        vmm.record_mapping(0x5000, 0x1000, 0x3);
+        assert_eq!(vmm.region_at_or_after(0x3000).unwrap().vaddr, 0x5000);
+        assert!(vmm.region_at_or_after(0x6000).is_none());
     }
 }

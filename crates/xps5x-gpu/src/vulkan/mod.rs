@@ -1,34 +1,32 @@
 //! Vulkan backend — host GPU interface.
 //!
 //! Owns the Vulkan instance, physical/logical device, queue, and command pool,
-//! and executes translated GNM commands against them.
+//! and executes translated GNM/AGC commands against them.
 //!
 //! ## Status
 //!
-//! - [`instance`] — real Vulkan 1.3 bring-up (instance, device selection with
-//!   `dynamicRendering`, queue, command pool, optional validation layer).
-//! - [`offscreen`] — a real offscreen draw: pipeline from SPIR-V, one triangle
-//!   rasterized into an `R8G8B8A8_UNORM` image, copied back to host memory.
-//!   Verified by pixel readback in `tests/vulkan_triangle.rs`.
-//! - [`shaders`] — hand-built SPIR-V for that triangle. The GCN→SPIR-V
-//!   translation in [`crate::shader`] is **not** wired in here yet; see the
-//!   module docs there for what remains.
+//! - [`instance`] — real Vulkan 1.3 bring-up.
+//! - [`offscreen`] — offscreen draw + pixel readback.
+//! - [`shaders`] — hand-built SPIR-V for the backend smoke test.
+//! - M2 path — AGC PM4 → [`crate::agc_exec`] → [`VulkanBackend::render_m2_triangle`]
+//!   using `kyty-graphics` SPIR-V (see [`crate::shader_bridge`]).
 //!
-//! Still missing for a full M2 claim: PM4 command streams driving this draw
-//! (rather than a hardcoded triangle), and swapchain presentation via
-//! `libSceVideoOut`. See `docs/reference-port-ledger.md`.
+//! Swapchain presentation via `libSceVideoOut` remains M3.
 
 pub mod instance;
 pub mod offscreen;
 pub mod shaders;
 
 use crate::backend::{BackendKind, GpuBackend};
+use crate::shader_bridge;
 use instance::VulkanDevice;
 use tracing::info;
 use xps5x_core::error::GpuError;
 
 pub use instance::validation_error_count;
-pub use offscreen::{CLEAR_COLOR, RenderedImage, render_triangle, unorm8};
+pub use offscreen::{
+    CLEAR_COLOR, RenderedImage, render_triangle, render_triangle_with_spirv, unorm8,
+};
 pub use shaders::TRIANGLE_COLOR;
 
 /// Vulkan 1.3 backend.
@@ -57,7 +55,7 @@ impl VulkanBackend {
         self.device.as_ref()
     }
 
-    /// Render one triangle offscreen and read the pixels back.
+    /// Render one triangle offscreen and read the pixels back (hand SPIR-V).
     ///
     /// # Errors
     ///
@@ -68,6 +66,15 @@ impl VulkanBackend {
             GpuError::VulkanInitFailed("backend not initialized — call init() first".to_owned())
         })?;
         render_triangle(device, width, height)
+    }
+
+    /// M2 draw: offscreen triangle using `kyty-graphics` SPIR-V.
+    pub fn render_m2_triangle(&self, width: u32, height: u32) -> Result<RenderedImage, GpuError> {
+        let device = self.device.as_ref().ok_or_else(|| {
+            GpuError::VulkanInitFailed("backend not initialized — call init() first".to_owned())
+        })?;
+        let (vs, fs) = shader_bridge::m2_triangle_spirv()?;
+        render_triangle_with_spirv(device, width, height, &vs, &fs)
     }
 }
 

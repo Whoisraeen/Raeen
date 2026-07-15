@@ -12,7 +12,7 @@
 //! follow-up (behind `xps5x-gpu`).
 
 use crate::{HleContext, HleRegistry};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use tracing::debug;
 
 /// `SCE_OK`.
@@ -28,13 +28,6 @@ const DISPLAY_WIDTH: u32 = 1920;
 const DISPLAY_HEIGHT: u32 = 1080;
 /// Nominal refresh rate reported by `GetOutputStatus`.
 const DISPLAY_REFRESH_HZ: u64 = 60;
-
-/// Total flips submitted (== completed, since XPS5X never leaves one
-/// pending). `GetFlipStatus` reports this so a waiting render loop advances.
-static FLIP_COUNT: AtomicU64 = AtomicU64::new(0);
-/// The `flipArg` from the most recent `SubmitFlip` (a title correlates the
-/// completion it's waiting for by this value).
-static LAST_FLIP_ARG: AtomicI64 = AtomicI64::new(0);
 
 /// Register libSceVideoOut HLE functions.
 pub fn register(registry: &HleRegistry) {
@@ -63,7 +56,17 @@ pub fn register(registry: &HleRegistry) {
         "sceVideoOutGetVblankStatus",
         hle_get_vblank_status,
     );
-    registry.register("libSceVideoOut", "sceVideoOutAddFlipEvent", hle_ok);
+    registry.register_nid(
+        "libSceVideoOut",
+        "sceVideoOutWaitVblank",
+        0x8fa4_5a01_495a_2efd,
+        hle_wait_vblank,
+    );
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutAddFlipEvent",
+        hle_add_flip_event,
+    );
     registry.register("libSceVideoOut", "sceVideoOutSetBufferAttribute", hle_ok);
     registry.register_nid(
         "libSceVideoOut",
@@ -101,16 +104,78 @@ fn hle_close(_ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
+/// `sceVideoOutAddFlipEvent(equeue, handle, udata)`: register a VideoOut
+/// event that is edge-triggered whenever a direct or AGC-embedded flip
+/// completes.
+fn hle_add_flip_event(ctx: &HleContext, args: &[u64]) -> u64 {
+    const VIDEO_OUT_EVENT_FLIP: u64 = 6;
+    const KERNEL_EVENT_FILTER_VIDEO_OUT: i16 = -13;
+    let equeue = args.first().copied().unwrap_or(0);
+    let handle = args.get(1).copied().unwrap_or(0) as i32;
+    let udata = args.get(2).copied().unwrap_or(0);
+    if handle != 1 {
+        return VIDEO_OUT_ERROR_INVALID_HANDLE;
+    }
+    if !ctx.kernel.kernel_equeues.contains_key(&equeue) {
+        return VIDEO_OUT_ERROR_INVALID_OPTION;
+    }
+    ctx.kernel.kernel_equeue_events.insert(
+        (equeue, VIDEO_OUT_EVENT_FLIP),
+        xps5x_kernel::EqueueUserEvent {
+            udata,
+            filter: KERNEL_EVENT_FILTER_VIDEO_OUT,
+            ..Default::default()
+        },
+    );
+    debug!(equeue, handle, udata, "registered VideoOut flip event");
+    SCE_OK
+}
+
 /// `sceVideoOutSubmitFlip(handle, bufferIndex, flipMode, flipArg)`: records
-/// the flip as completed (bumps [`FLIP_COUNT`], stores `flipArg`) so a
+/// the flip as completed (bumps process-local state and stores `flipArg`) so a
 /// subsequent `GetFlipStatus` shows the render loop it can proceed.
-fn hle_submit_flip(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_submit_flip(ctx: &HleContext, args: &[u64]) -> u64 {
     let buffer_index = args.get(1).copied().unwrap_or(0);
     let flip_arg = args.get(3).copied().unwrap_or(0) as i64;
     debug!("sceVideoOutSubmitFlip(bufferIndex={buffer_index}, flipArg={flip_arg})");
-    LAST_FLIP_ARG.store(flip_arg, Ordering::Relaxed);
-    FLIP_COUNT.fetch_add(1, Ordering::Relaxed);
+    ctx.kernel
+        .video_out_last_flip_arg
+        .store(flip_arg, Ordering::Relaxed);
+    ctx.kernel
+        .video_out_current_buffer
+        .store(buffer_index as i32, Ordering::Relaxed);
+    ctx.kernel
+        .video_out_flip_count
+        .fetch_add(1, Ordering::Relaxed);
+    let event_hint = 6 | ((flip_arg as u64 & 0x0000_ffff_ffff_ffff) << 16);
+    for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {
+        if event.key().1 == 6 && event.filter == -13 {
+            event.triggered = true;
+            event.fflags = event.fflags.saturating_add(1);
+            event.data = event_hint as i64;
+        }
+    }
     SCE_OK
+}
+
+/// Complete a flip encoded inside an AGC submission. Gen5 games commonly use
+/// this packet path instead of calling `sceVideoOutSubmitFlip` directly.
+pub(crate) fn submit_flip_from_agc(
+    ctx: &HleContext,
+    handle: u32,
+    buffer_index: u32,
+    flip_mode: u32,
+    flip_arg: u64,
+) -> u64 {
+    hle_submit_flip(
+        ctx,
+        &[
+            u64::from(handle),
+            u64::from(buffer_index),
+            u64::from(flip_mode),
+            flip_arg,
+        ],
+    )
 }
 
 /// `sceVideoOutGetFlipStatus(handle, SceVideoOutFlipStatus *status)`: reports
@@ -125,10 +190,21 @@ fn hle_get_flip_status(ctx: &HleContext, args: &[u64]) -> u64 {
     // flipArg@24, submitTsc@32, reserved@40, gcQueueNum@48,
     // flipPendingNum@52, currentBuffer@56, reserved@60.
     let mut buf = [0u8; 64];
-    let count = FLIP_COUNT.load(Ordering::Relaxed);
+    let count = ctx.kernel.video_out_flip_count.load(Ordering::Relaxed);
     buf[0..8].copy_from_slice(&count.to_le_bytes());
-    buf[24..32].copy_from_slice(&LAST_FLIP_ARG.load(Ordering::Relaxed).to_le_bytes());
-    // flipPendingNum@52 stays 0 (nothing pending) and currentBuffer@56 stays 0.
+    buf[24..32].copy_from_slice(
+        &ctx.kernel
+            .video_out_last_flip_arg
+            .load(Ordering::Relaxed)
+            .to_le_bytes(),
+    );
+    // flipPendingNum@52 stays 0 (nothing pending).
+    buf[56..60].copy_from_slice(
+        &ctx.kernel
+            .video_out_current_buffer
+            .load(Ordering::Relaxed)
+            .to_le_bytes(),
+    );
     if !ctx.mem.write(status_ptr, &buf) {
         debug!("sceVideoOutGetFlipStatus: status out-ptr {status_ptr:#x} not writable");
     }
@@ -241,8 +317,7 @@ fn hle_register_buffers2(ctx: &HleContext, args: &[u64]) -> u64 {
         return VIDEO_OUT_ERROR_INVALID_OPTION;
     }
     if start_index < 0
-        || buffer_count < 1
-        || buffer_count > 16
+        || !(1..=16).contains(&buffer_count)
         || start_index.saturating_add(buffer_count) > 16
     {
         return VIDEO_OUT_ERROR_INVALID_VALUE;
@@ -299,10 +374,29 @@ fn hle_get_vblank_status(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_OK;
     }
     let mut buf = [0u8; 32];
-    buf[0..8].copy_from_slice(&FLIP_COUNT.load(Ordering::Relaxed).to_le_bytes()); // count@0
+    buf[0..8].copy_from_slice(
+        &ctx.kernel
+            .video_out_vblank_count
+            .load(Ordering::Relaxed)
+            .to_le_bytes(),
+    ); // count@0
     if !ctx.mem.write(status_ptr, &buf) {
         debug!("sceVideoOutGetVblankStatus: status out-ptr {status_ptr:#x} not writable");
     }
+    SCE_OK
+}
+
+/// `sceVideoOutWaitVblank(handle)`: pace the native guest thread to the next
+/// nominal 60 Hz display edge, then advance the process-local vblank sequence.
+fn hle_wait_vblank(ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0) as i32;
+    if handle != 1 {
+        return VIDEO_OUT_ERROR_INVALID_HANDLE;
+    }
+    std::thread::sleep(std::time::Duration::from_micros(16_667));
+    ctx.kernel
+        .video_out_vblank_count
+        .fetch_add(1, Ordering::Relaxed);
     SCE_OK
 }
 
@@ -339,6 +433,45 @@ mod tests {
         assert!(count > before, "flip count must advance after SubmitFlip");
         assert_eq!(flip_arg, 0xABCD, "the submitted flipArg is reported back");
         assert_eq!(pending, 0, "no flip pending → render loop proceeds");
+    }
+
+    #[test]
+    fn wait_vblank_advances_a_separate_frame_sequence() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(hle_wait_vblank(&ctx, &[1]), SCE_OK);
+        assert_eq!(kernel.video_out_vblank_count.load(Ordering::Relaxed), 1);
+        assert_eq!(kernel.video_out_flip_count.load(Ordering::Relaxed), 0);
+        assert_eq!(hle_wait_vblank(&ctx, &[99]), VIDEO_OUT_ERROR_INVALID_HANDLE);
+
+        let registry = HleRegistry::new();
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| {
+                    *nid == 0x8fa4_5a01_495a_2efd && key == "libSceVideoOut::sceVideoOutWaitVblank"
+                })
+        );
+    }
+
+    #[test]
+    fn agc_flip_triggers_registered_video_out_event() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let eq = kernel.create_equeue(0);
+        assert_eq!(hle_add_flip_event(&ctx, &[eq, 1, 0xCAFE]), SCE_OK);
+        assert_eq!(submit_flip_from_agc(&ctx, 1, 2, 1, 0x1234), SCE_OK);
+        let event = kernel.kernel_equeue_events.get(&(eq, 6)).unwrap();
+        assert!(event.triggered);
+        assert_eq!(event.filter, -13);
+        assert_eq!(event.udata, 0xCAFE);
+        assert_eq!(event.data as u64, 6 | (0x1234 << 16));
     }
 
     #[test]

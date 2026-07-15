@@ -96,28 +96,47 @@ fn posix_fcntl(ctx: &HleContext, args: &[u64]) -> u64 {
     let command = args.get(1).copied().unwrap_or(0) as i32;
     let argument = args.get(2).copied().unwrap_or(0) as i32;
     match command {
-        // Close-on-exec is process launch metadata; XPS5X does not exec a
-        // second guest image, so accepting it has the correct observable effect.
-        F_GETFD => ctx
-            .kernel
-            .filesystem
-            .flags(fd)
-            .map_or((-1i64) as u64, |_| 0),
-        F_SETFD => ctx
-            .kernel
-            .filesystem
-            .flags(fd)
-            .map_or((-1i64) as u64, |_| 0),
-        F_GETFL => ctx
-            .kernel
-            .filesystem
-            .flags(fd)
-            .map_or((-1i64) as u64, |flags| flags as u64),
-        F_SETFL => ctx
-            .kernel
-            .filesystem
-            .set_status_flags(fd, argument)
-            .map_or((-1i64) as u64, |_| 0),
+        F_GETFD => {
+            if ctx.kernel.filesystem.flags(fd).is_some() {
+                0
+            } else {
+                ctx.kernel
+                    .kernel_sockets
+                    .get(&fd)
+                    .map_or((-1i64) as u64, |socket| socket.descriptor_flags as u64)
+            }
+        }
+        F_SETFD => {
+            if ctx.kernel.filesystem.flags(fd).is_some() {
+                // XPS5X does not replace a guest process image yet, so the
+                // close-on-exec bit has no effect for VFS descriptors.
+                0
+            } else if let Some(mut socket) = ctx.kernel.kernel_sockets.get_mut(&fd) {
+                socket.descriptor_flags = argument;
+                0
+            } else {
+                (-1i64) as u64
+            }
+        }
+        F_GETFL => ctx.kernel.filesystem.flags(fd).map_or_else(
+            || {
+                ctx.kernel
+                    .kernel_sockets
+                    .get(&fd)
+                    .map_or((-1i64) as u64, |socket| socket.status_flags as u64)
+            },
+            |flags| flags as u64,
+        ),
+        F_SETFL => {
+            if ctx.kernel.filesystem.set_status_flags(fd, argument).is_ok() {
+                0
+            } else if let Some(mut socket) = ctx.kernel.kernel_sockets.get_mut(&fd) {
+                socket.status_flags = argument;
+                0
+            } else {
+                (-1i64) as u64
+            }
+        }
         _ => (-1i64) as u64,
     }
 }
@@ -165,6 +184,13 @@ mod tests {
         assert_eq!(posix_fcntl(&ctx, &[fd as u64, 4, O_APPEND as u64]), 0);
         assert_eq!(posix_fcntl(&ctx, &[fd as u64, 3]), O_APPEND as u64);
         assert_eq!(posix_fcntl(&ctx, &[0x7fff, 3]), (-1i64) as u64);
+
+        let socket = kernel.create_socket();
+        assert_eq!(posix_fcntl(&ctx, &[socket as u32 as u64, 3]), 0);
+        assert_eq!(posix_fcntl(&ctx, &[socket as u32 as u64, 4, 0x800]), 0);
+        assert_eq!(posix_fcntl(&ctx, &[socket as u32 as u64, 3]), 0x800);
+        assert_eq!(posix_fcntl(&ctx, &[socket as u32 as u64, 2, 1]), 0);
+        assert_eq!(posix_fcntl(&ctx, &[socket as u32 as u64, 1]), 1);
 
         let registry = HleRegistry::new();
         assert!(

@@ -11,7 +11,7 @@
 //! handles per thread) arrives with the M1-E scheduler.
 
 use crate::{HleContext, HleRegistry};
-use tracing::debug;
+use tracing::info;
 
 /// `SCE_OK`.
 const OK: u64 = 0;
@@ -59,8 +59,8 @@ fn hle_getthreadid(ctx: &HleContext, _args: &[u64]) -> u64 {
     ctx.guest_threads.current_thread()
 }
 
-/// `scePthreadYield()`: hint a reschedule. With one guest thread there is
-/// nothing to switch to, so this succeeds immediately.
+/// `scePthreadYield()`: hint a reschedule. Native guest threads are already
+/// host-scheduled, so no additional scheduler action is required.
 fn hle_yield(_ctx: &HleContext, _args: &[u64]) -> u64 {
     OK
 }
@@ -75,7 +75,7 @@ fn hle_rename(ctx: &HleContext, args: &[u64]) -> u64 {
         if ctx.mem.read(name_ptr, &mut buf) {
             let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
             if let Ok(name) = std::str::from_utf8(&buf[..end]) {
-                debug!("scePthreadRename(thread={thread:#x}, name={name:?})");
+                info!(thread, name, "guest pthread named");
             }
         }
     }

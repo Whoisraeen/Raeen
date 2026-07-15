@@ -22,6 +22,7 @@
 
 pub mod linker;
 pub mod nid;
+pub mod nid_names;
 
 use tracing::{debug, info, warn};
 use xps5x_core::error::FirmwareError;

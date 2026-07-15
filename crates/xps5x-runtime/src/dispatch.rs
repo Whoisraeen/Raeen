@@ -159,7 +159,7 @@ pub(crate) fn call_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// How many recent HLE calls [`CallTrace`] remembers.
-const CALL_TRACE_LEN: usize = 64;
+const CALL_TRACE_LEN: usize = 256;
 
 /// A bounded ring of the most recent HLE calls, for explaining a fault.
 ///
@@ -188,8 +188,12 @@ struct CallTrace {
     head: Cell<usize>,
     /// Whether the ring has wrapped (so all slots are live).
     wrapped: Cell<bool>,
-    /// `(trampoline index, return value)`.
-    entries: [Cell<(u32, u64)>; CALL_TRACE_LEN],
+    /// `(trampoline index, return value, first three arguments)`.
+    ///
+    /// Keeping arg0 lets the post-fault reporter recover the PCs passed to
+    /// `sceKernelGetModuleInfoForUnwind`. That produces a useful guest
+    /// backtrace without allocating or logging in the VEH.
+    entries: [Cell<(u32, u64, [u64; 3])>; CALL_TRACE_LEN],
 }
 
 impl CallTrace {
@@ -197,14 +201,14 @@ impl CallTrace {
         Self {
             head: Cell::new(0),
             wrapped: Cell::new(false),
-            entries: [const { Cell::new((0u32, 0u64)) }; CALL_TRACE_LEN],
+            entries: [const { Cell::new((0u32, 0u64, [0u64; 3])) }; CALL_TRACE_LEN],
         }
     }
 
     /// Record one serviced HLE call. Called from the VEH — allocation-free.
-    fn push(&self, trampoline_idx: u32, ret: u64) {
+    fn push(&self, trampoline_idx: u32, ret: u64, args: [u64; 3]) {
         let h = self.head.get();
-        self.entries[h].set((trampoline_idx, ret));
+        self.entries[h].set((trampoline_idx, ret, args));
         let next = h + 1;
         if next == CALL_TRACE_LEN {
             self.head.set(0);
@@ -215,7 +219,7 @@ impl CallTrace {
     }
 
     /// The recorded calls, oldest first.
-    fn entries_oldest_first(&self) -> Vec<(u32, u64)> {
+    fn entries_oldest_first(&self) -> Vec<(u32, u64, [u64; 3])> {
         let h = self.head.get();
         let mut out = Vec::with_capacity(CALL_TRACE_LEN);
         if self.wrapped.get() {
@@ -810,6 +814,31 @@ pub(crate) unsafe fn run(
 /// Deliberately reports the **return value** of each call alongside its name: a
 /// `-> 0x0` a few lines above a `Faulted { access: 0 }` is very often the whole
 /// story.
+fn read_fault_cstr(mem: &dyn GuestMemory, address: u64) -> Option<String> {
+    if address == 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(128);
+    for offset in 0..128u64 {
+        let mut byte = [0u8; 1];
+        if !mem.read(address.wrapping_add(offset), &mut byte) {
+            return None;
+        }
+        if byte[0] == 0 {
+            break;
+        }
+        if !(byte[0].is_ascii_graphic() || byte[0] == b' ' || byte[0] == b'\t') {
+            return None;
+        }
+        bytes.push(byte[0]);
+    }
+    if bytes.is_empty() {
+        None
+    } else {
+        String::from_utf8(bytes).ok()
+    }
+}
+
 fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &RuntimeError) {
     if let Some(snapshot) = ctx.fault_snapshot.get() {
         let instruction = if snapshot.bytes_read {
@@ -846,6 +875,19 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
         // this diagnostic runs synchronously before that runner drops it and
         // after the VEH has stopped consulting the active context.
         let mem = unsafe { &*ctx.mem };
+        let fault_window_start = snapshot.rip.saturating_sub(32);
+        let mut fault_window = [0u8; 64];
+        if mem.read(fault_window_start, &mut fault_window) {
+            let bytes = fault_window
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::warn!(
+                "guest fault-site bytes: {fault_window_start:#x}..{:#x} (RIP +0x20): {bytes}",
+                fault_window_start + fault_window.len() as u64
+            );
+        }
         let mut stack_words = Vec::new();
         for index in 0..16u64 {
             let address = snapshot.rsp.wrapping_add(index * 8);
@@ -893,7 +935,52 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
          0x0 here is the usual cause of a null dereference in guest code:",
         entries.len()
     );
-    for (idx, ret) in entries {
+    let mut unwind_pcs = Vec::new();
+    for &(idx, _ret, args) in &entries {
+        let is_unwind = trampolines
+            .get(idx as usize)
+            .is_some_and(|t| t.function == "sceKernelGetModuleInfoForUnwind");
+        if is_unwind && unwind_pcs.last().copied() != Some(args[0]) {
+            unwind_pcs.push(args[0]);
+        }
+    }
+    if !unwind_pcs.is_empty() {
+        let pcs = unwind_pcs
+            .iter()
+            .map(|pc| format!("{pc:#x}"))
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        tracing::warn!("guest unwind PC lookups (most recent exception): {pcs}");
+    }
+    let mem = unsafe { &*ctx.mem };
+    let mut recent_strings = Vec::new();
+    for &(idx, _ret, args) in &entries {
+        let Some(t) = trampolines.get(idx as usize) else {
+            continue;
+        };
+        let pointers: &[u64] = match t.function.as_str() {
+            "strlen" => &args[..1],
+            "strcpy" | "strncpy" => &args[1..2],
+            "strcmp" => &args[..2],
+            _ => continue,
+        };
+        for &pointer in pointers {
+            if let Some(value) = read_fault_cstr(mem, pointer) {
+                let item = format!("{}({pointer:#x})={value:?}", t.function);
+                if !recent_strings.contains(&item) {
+                    recent_strings.push(item);
+                }
+            }
+        }
+    }
+    if !recent_strings.is_empty() {
+        let start = recent_strings.len().saturating_sub(24);
+        tracing::warn!(
+            "recent guest strings observed by libc:\n    {}",
+            recent_strings[start..].join("\n    ")
+        );
+    }
+    for (idx, ret, _args) in entries {
         match trampolines.get(idx as usize) {
             Some(t) => tracing::warn!("    {}::{} -> {ret:#x}", t.library, t.function),
             None => tracing::warn!("    <trampoline #{idx}> -> {ret:#x}"),
@@ -1031,6 +1118,31 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 FSBASE_REARMS.fetch_add(1, Ordering::Relaxed);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
+        }
+
+        // Second chance, same shape as the FS re-arm above: is the guest simply
+        // touching a range it RESERVED but that carries no memory yet?
+        //
+        // `sceKernelReserveVirtualRange` hands out address space, not memory,
+        // and titles reserve far more than they touch (Until Dawn: 512 GiB) —
+        // so a reservation cannot be committed eagerly. But those titles then
+        // use the reservation directly, and this fault is the only notification
+        // that they have. Back the page and retry the instruction.
+        //
+        // Cannot loop: the retry runs against committed memory, and if the
+        // access still faults, `commit_on_demand` returns `false` the second
+        // time (the page is now in `sparse_mappings`), so the genuine-fault path
+        // below runs — at most one extra trap per genuinely-faulting access,
+        // exactly the FS-re-arm bargain. A wild pointer that happens to land in
+        // the sparse tail but outside every reservation is declined here and
+        // still reported as the fault it is.
+        //
+        // SAFETY: `ctx.alloc` is the live allocator stored by `run` for this
+        // guarded call; vectored exceptions are delivered synchronously on the
+        // faulting thread, so it cannot be torn down underneath us.
+        let access_addr = record.ExceptionInformation.get(1).copied().unwrap_or(0) as u64;
+        if unsafe { &*ctx.alloc }.commit_on_demand(access_addr) {
+            return EXCEPTION_CONTINUE_EXECUTION;
         }
 
         // Outside our guarded trampoline region: a genuine guest fault.
@@ -1223,7 +1335,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             // this history is the only thing that names the culprit (see
             // `CallTrace`). Index, not name — no allocation in the VEH.
             let idx = (fault_addr.wrapping_sub(ctx.region_base) / 8) as u32;
-            ctx.trace.push(idx, ret);
+            ctx.trace.push(idx, ret, [args[0], args[1], args[2]]);
             ret
         }
         None => {

@@ -25,8 +25,6 @@ const SCE_KERNEL_ERROR_ESRCH: u64 = 0x8002_0003;
 const SCE_KERNEL_ERROR_EFAULT: u64 = 0x8002_000E;
 const SCE_KERNEL_ERROR_ETIMEDOUT: u64 = 0x8002_003C;
 
-/// `EVFILT_USER`, the filter reported for user events.
-const KERNEL_EVENT_FILTER_USER: i16 = -11;
 /// Size of a `SceKernelEvent` struct.
 const KERNEL_EVENT_SIZE: u64 = 0x20;
 
@@ -36,6 +34,18 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "sceKernelDeleteEqueue", hle_delete);
     registry.register("libkernel", "sceKernelAddUserEvent", hle_add_user_event);
     registry.register("libkernel", "sceKernelAddUserEventEdge", hle_add_user_event);
+    registry.register_nid(
+        "libkernel",
+        "sceKernelAddReadEvent",
+        0x5470_92de_b09d_d0f3,
+        hle_add_read_event,
+    );
+    registry.register_nid(
+        "libkernel",
+        "sceKernelDeleteReadEvent",
+        0x2712_78b5_f80a_9570,
+        hle_delete_read_event,
+    );
     registry.register(
         "libkernel",
         "sceKernelDeleteUserEvent",
@@ -93,6 +103,49 @@ fn hle_add_user_event(ctx: &HleContext, args: &[u64]) -> u64 {
     ctx.kernel
         .kernel_equeue_events
         .insert((eq, id), xps5x_kernel::EqueueUserEvent::default());
+    debug!(eq, id, "registered kernel user event");
+    OK
+}
+
+/// `sceKernelAddReadEvent(eq, fd, udata)`: attach an offline socket read
+/// interest to an event queue. It remains untriggered until a socket backend
+/// receives data; XPS5X deliberately has no host-network backend.
+fn hle_add_read_event(ctx: &HleContext, args: &[u64]) -> u64 {
+    let eq = args.first().copied().unwrap_or(0);
+    let fd = args.get(1).copied().unwrap_or(0) as i32;
+    let udata = args.get(2).copied().unwrap_or(0);
+    if !ctx.kernel.kernel_equeues.contains_key(&eq) || !ctx.kernel.kernel_sockets.contains_key(&fd)
+    {
+        return SCE_KERNEL_ERROR_ESRCH;
+    }
+    ctx.kernel.kernel_equeue_events.insert(
+        (eq, fd as u32 as u64),
+        xps5x_kernel::EqueueUserEvent {
+            udata,
+            ..Default::default()
+        },
+    );
+    debug!(eq, fd, udata, "registered offline socket read event");
+    OK
+}
+
+/// `sceKernelDeleteReadEvent(eq, fd)`: remove a socket read interest from an
+/// event queue. The event identity is the socket descriptor, matching the
+/// registration performed by [`hle_add_read_event`].
+fn hle_delete_read_event(ctx: &HleContext, args: &[u64]) -> u64 {
+    let eq = args.first().copied().unwrap_or(0);
+    let fd = args.get(1).copied().unwrap_or(0) as i32;
+    if !ctx.kernel.kernel_equeues.contains_key(&eq) {
+        return SCE_KERNEL_ERROR_ESRCH;
+    }
+    if ctx
+        .kernel
+        .kernel_equeue_events
+        .remove(&(eq, fd as u32 as u64))
+        .is_none()
+    {
+        return SCE_KERNEL_ERROR_ESRCH;
+    }
     OK
 }
 
@@ -136,12 +189,12 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_EINVAL;
     }
 
-    // Collect pending (ident, udata, fflags) for this queue, then edge-clear.
-    let mut pending: Vec<(u64, u64, u32)> = Vec::new();
+    // Collect pending event fields for this queue, then edge-clear.
+    let mut pending: Vec<(u64, u64, u32, i16, i64)> = Vec::new();
     for entry in ctx.kernel.kernel_equeue_events.iter() {
         let (q, id) = *entry.key();
         if q == eq && entry.triggered && (pending.len() as u64) < num {
-            pending.push((id, entry.udata, entry.fflags));
+            pending.push((id, entry.udata, entry.fflags, entry.filter, entry.data));
         }
     }
 
@@ -150,12 +203,13 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
         if out_count != 0 {
             let _ = ctx.mem.write(out_count, &0u32.to_le_bytes());
         }
+        debug!(eq, num, "kernel event wait timed out");
         return SCE_KERNEL_ERROR_ETIMEDOUT;
     }
 
-    for (i, &(id, udata, fflags)) in pending.iter().enumerate() {
+    for (i, &(id, udata, fflags, filter, data)) in pending.iter().enumerate() {
         let addr = events_ptr + i as u64 * KERNEL_EVENT_SIZE;
-        if !write_kernel_event(ctx, addr, id, udata, fflags) {
+        if !write_kernel_event(ctx, addr, id, udata, fflags, filter, data) {
             return SCE_KERNEL_ERROR_EFAULT;
         }
         // Edge-triggered: clear the pending flag now that it's delivered.
@@ -170,17 +224,26 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
     {
         return SCE_KERNEL_ERROR_EFAULT;
     }
+    debug!(eq, delivered = pending.len(), "delivered kernel events");
     OK
 }
 
 /// Write a `SceKernelEvent` (32 bytes) for a delivered user event.
-fn write_kernel_event(ctx: &HleContext, addr: u64, ident: u64, udata: u64, fflags: u32) -> bool {
+fn write_kernel_event(
+    ctx: &HleContext,
+    addr: u64,
+    ident: u64,
+    udata: u64,
+    fflags: u32,
+    filter: i16,
+    data: i64,
+) -> bool {
     let mut b = [0u8; KERNEL_EVENT_SIZE as usize];
     b[0x00..0x08].copy_from_slice(&ident.to_le_bytes());
-    b[0x08..0x0A].copy_from_slice(&KERNEL_EVENT_FILTER_USER.to_le_bytes());
+    b[0x08..0x0A].copy_from_slice(&filter.to_le_bytes());
     // flags (0x0A) left 0.
     b[0x0C..0x10].copy_from_slice(&fflags.to_le_bytes());
-    // data (0x10) left 0.
+    b[0x10..0x18].copy_from_slice(&data.to_le_bytes());
     b[0x18..0x20].copy_from_slice(&udata.to_le_bytes());
     ctx.mem.write(addr, &b)
 }
@@ -282,6 +345,50 @@ mod tests {
         let mut cnt = [0u8; 4];
         assert!(mem.read(0x1F0, &mut cnt));
         assert_eq!(u32::from_le_bytes(cnt), 0);
+    }
+
+    #[test]
+    fn offline_socket_read_event_registers_without_becoming_ready() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let eq = create(&ctx);
+        let fd = kernel.create_socket();
+        assert_eq!(hle_add_read_event(&ctx, &[eq, fd as u64, 0xCAFE]), OK);
+        let event = kernel
+            .kernel_equeue_events
+            .get(&(eq, fd as u32 as u64))
+            .unwrap();
+        assert_eq!(event.udata, 0xCAFE);
+        assert!(!event.triggered);
+        drop(event);
+        assert_eq!(hle_delete_read_event(&ctx, &[eq, fd as u64]), OK);
+        assert!(
+            !kernel
+                .kernel_equeue_events
+                .contains_key(&(eq, fd as u32 as u64))
+        );
+        assert_eq!(
+            hle_delete_read_event(&ctx, &[eq, fd as u64]),
+            SCE_KERNEL_ERROR_ESRCH
+        );
+
+        let registry = HleRegistry::new();
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| {
+                    *nid == 0x5470_92de_b09d_d0f3 && key == "libkernel::sceKernelAddReadEvent"
+                })
+        );
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| {
+                    *nid == 0x2712_78b5_f80a_9570 && key == "libkernel::sceKernelDeleteReadEvent"
+                })
+        );
     }
 
     #[test]

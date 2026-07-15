@@ -20,3 +20,4 @@ memchr = "2"
 # OS-backed CSPRNG for libSceRandom; never exposes host identifiers or a
 # deterministic emulator-global seed to titles.
 getrandom = "0.3"
+sha1 = { workspace = true }

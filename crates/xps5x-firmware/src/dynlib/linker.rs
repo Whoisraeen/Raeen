@@ -140,6 +140,20 @@ pub struct ModuleInit {
     pub image_offset: u64,
 }
 
+/// One ELF's load range and exception tables within a composed process image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedUnwindModule {
+    pub name: String,
+    /// Placement of this ELF in [`LinkedModule::image`].
+    pub image_offset: u64,
+    pub unwind: crate::sprx::UnwindInfo,
+    /// Module-relative LLE exports, retained for handle-scoped `dlsym`.
+    pub exports: Vec<crate::dynlib::SymbolExport>,
+    /// Module-relative `DT_INIT`, if present. Optional plugins run this when
+    /// `sceKernelLoadStartModule` activates their preplaced image.
+    pub init_vaddr: Option<u64>,
+}
+
 /// The result of [`link_module`]: a flat, relocated image plus a record of
 /// what each symbol relocation resolved to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,9 +181,10 @@ pub struct LinkedModule {
     /// the eboot's own constructors then called a virtual method through a null
     /// vtable. See `dynlib::DT_INIT`.
     ///
-    /// Populated by `load_process` (which knows the dependency order); a
-    /// single-module `link_module` leaves it empty, since a lone module's entry
-    /// runs its own initializers.
+    /// Populated by `load_process` (which knows the dependency order), with
+    /// dependency initializers first and the main executable's initializer
+    /// last. A single-module `link_module` leaves it empty because it has no
+    /// process-loader context to schedule calls.
     pub module_inits: Vec<ModuleInit>,
     /// Distinct HLE imports resolved, in first-encountered order, deduped
     /// by NID (a NID referenced by more than one relocation reuses the same
@@ -190,6 +205,9 @@ pub struct LinkedModule {
     /// exposes `base + procparam_offset` as the guest address
     /// `sceKernelGetProcParam` returns.
     pub procparam_offset: Option<u64>,
+    /// Every executable/PRX in this process, used by the guest unwinder to
+    /// resolve an instruction address to its `.eh_frame` tables.
+    pub unwind_modules: Vec<LinkedUnwindModule>,
 }
 
 /// The marker-address tables shared by every module in one process.
@@ -476,6 +494,18 @@ fn link_inner(
         entry: module.entry,
         tls: module.tls.clone(),
         procparam_offset: module.procparam.as_ref().map(|p| p.vaddr),
+        unwind_modules: module
+            .unwind
+            .clone()
+            .map(|unwind| LinkedUnwindModule {
+                name: module.name.clone(),
+                image_offset: 0,
+                unwind,
+                exports: dynlib.exports.clone(),
+                init_vaddr: dynlib.init,
+            })
+            .into_iter()
+            .collect(),
     })
 }
 
@@ -575,6 +605,7 @@ mod tests {
             entry: 0,
             tls: None,
             procparam: None,
+            unwind: None,
         }
     }
 

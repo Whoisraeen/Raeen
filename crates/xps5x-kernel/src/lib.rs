@@ -38,6 +38,7 @@ pub use xps5x_core::types::ModuleInfo;
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Captured guest console output (M1-C): everything the guest writes via
@@ -124,6 +125,8 @@ pub struct OrbisKernel {
     pub filesystem: Arc<filesystem::VirtualFileSystem>,
     /// Loaded modules (.sprx / .elf).
     pub modules: DashMap<u32, ModuleInfo>,
+    /// Handle-scoped NID -> absolute guest addresses for real LLE modules.
+    lle_module_exports: DashMap<u32, HashMap<u64, u64>>,
     /// Next module ID to assign.
     next_module_id: RwLock<u32>,
     /// Syscall statistics (for debugging).
@@ -133,6 +136,9 @@ pub struct OrbisKernel {
     /// this so a title reads its real process-parameter block (SDK version,
     /// etc.) instead of a stub pointer.
     proc_param_addr: std::sync::atomic::AtomicU64,
+    /// Real ELF ranges and exception tables for the currently executing
+    /// process. The runtime replaces this atomically before entering `_start`.
+    unwind_modules: RwLock<Vec<UnwindModuleInfo>>,
     /// The current controller snapshot as a 12-byte Orbis `ScePadData` input
     /// prefix (buttons + sticks + triggers), or `None` when the host has not
     /// pushed live input — in which case `scePadReadState` reports a neutral
@@ -196,6 +202,14 @@ pub struct OrbisKernel {
     pub agc_last_dcb_dwords: std::sync::atomic::AtomicU32,
     /// Display buffers registered by VideoOut, keyed by `(port, slot)`.
     pub video_out_buffers: DashMap<(i32, i32), VideoOutBuffer>,
+    /// Completed VideoOut flips for this process.
+    pub video_out_flip_count: std::sync::atomic::AtomicU64,
+    /// Process-local vertical-blank sequence used by frame pacing APIs.
+    pub video_out_vblank_count: std::sync::atomic::AtomicU64,
+    /// Guest correlation value from the most recently completed flip.
+    pub video_out_last_flip_arg: std::sync::atomic::AtomicI64,
+    /// Buffer slot selected by the most recently completed flip.
+    pub video_out_current_buffer: std::sync::atomic::AtomicI32,
     /// libc fixed-capacity heaps keyed by their guest mspace handle.
     pub libc_mspaces: DashMap<u64, LibcMspace>,
     /// Active allocations carved from libc mspaces, keyed by guest address.
@@ -272,13 +286,19 @@ pub struct GuestSocket {
     pub bound_port: u16,
     /// Whether `bind` has been called.
     pub bound: bool,
+    /// Per-descriptor flags returned by `fcntl(F_GETFD)` (for example
+    /// close-on-exec). XPS5X does not currently replace a guest process image,
+    /// but retaining the value is observable through a later `F_GETFD`.
+    pub descriptor_flags: i32,
+    /// File-status flags returned by `fcntl(F_GETFL)`, including nonblocking.
+    pub status_flags: i32,
 }
 
 /// A user event registered on a kernel event queue (`EVFILT_USER`). Ported
 /// from SharpEmu's event-queue registration (GPL-2.0). `Trigger` marks it
 /// pending with `udata`; `WaitEqueue` delivers pending events and (edge)
 /// clears them.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct EqueueUserEvent {
     /// User data delivered with the event.
     pub udata: u64,
@@ -286,6 +306,22 @@ pub struct EqueueUserEvent {
     pub triggered: bool,
     /// Trigger count (delivered as the event's `fflags`).
     pub fflags: u32,
+    /// Kernel event filter (`EVFILT_USER`, VideoOut, graphics, ...).
+    pub filter: i16,
+    /// Filter-specific signed event payload.
+    pub data: i64,
+}
+
+impl Default for EqueueUserEvent {
+    fn default() -> Self {
+        Self {
+            udata: 0,
+            triggered: false,
+            fflags: 0,
+            filter: -11,
+            data: 0,
+        }
+    }
 }
 
 /// Metadata supplied through `sceAgcDriverRegisterResource`.
@@ -429,6 +465,19 @@ pub struct PthreadCond {
     pub changed: parking_lot::Condvar,
 }
 
+/// Runtime-rebased ELF metadata used by `sceKernelGetModuleInfoForUnwind`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnwindModuleInfo {
+    pub name: String,
+    pub start: u64,
+    pub end: u64,
+    pub eh_frame_hdr_addr: u64,
+    pub eh_frame_addr: u64,
+    pub eh_frame_size: u64,
+    pub seg0_addr: u64,
+    pub seg0_size: u64,
+}
+
 impl OrbisKernel {
     /// Create a new kernel instance with default configuration.
     pub fn new() -> Self {
@@ -439,9 +488,11 @@ impl OrbisKernel {
             threads: Arc::new(threading::ThreadManager::new()),
             filesystem: Arc::new(filesystem::VirtualFileSystem::new()),
             modules: DashMap::new(),
+            lle_module_exports: DashMap::new(),
             next_module_id: RwLock::new(1),
             syscall_stats: DashMap::new(),
             proc_param_addr: std::sync::atomic::AtomicU64::new(0),
+            unwind_modules: RwLock::new(Vec::new()),
             pad_state: parking_lot::Mutex::new(None),
             pthread_mutexes: DashMap::new(),
             pthread_mutex_attrs: DashMap::new(),
@@ -469,6 +520,10 @@ impl OrbisKernel {
             agc_last_dcb_address: std::sync::atomic::AtomicU64::new(0),
             agc_last_dcb_dwords: std::sync::atomic::AtomicU32::new(0),
             video_out_buffers: DashMap::new(),
+            video_out_flip_count: std::sync::atomic::AtomicU64::new(0),
+            video_out_vblank_count: std::sync::atomic::AtomicU64::new(0),
+            video_out_last_flip_arg: std::sync::atomic::AtomicI64::new(0),
+            video_out_current_buffer: std::sync::atomic::AtomicI32::new(0),
             libc_mspaces: DashMap::new(),
             libc_mspace_allocations: DashMap::new(),
             ampr_write_offsets: DashMap::new(),
@@ -499,6 +554,25 @@ impl OrbisKernel {
             ssl_contexts: DashMap::new(),
             ssl_next_context: std::sync::atomic::AtomicI32::new(0),
         }
+    }
+
+    /// Replace the loaded-process unwind table. Entries with empty or
+    /// inverted ranges are discarded so address lookup remains unambiguous.
+    pub fn set_unwind_modules(&self, modules: Vec<UnwindModuleInfo>) {
+        let mut table = self.unwind_modules.write();
+        *table = modules
+            .into_iter()
+            .filter(|module| module.start < module.end)
+            .collect();
+    }
+
+    /// Find the ELF owning `addr`, using half-open load ranges.
+    pub fn unwind_module_for_addr(&self, addr: u64) -> Option<UnwindModuleInfo> {
+        self.unwind_modules
+            .read()
+            .iter()
+            .find(|module| module.start <= addr && addr < module.end)
+            .cloned()
     }
 
     /// Create an event flag with `attributes` and `initial_bits`, returning its
@@ -613,6 +687,49 @@ impl OrbisKernel {
             .iter()
             .find(|entry| entry.value().name == name)
             .map(|entry| entry.value().clone())
+    }
+
+    /// Register or update a preplaced real module and its callable exports.
+    pub fn register_lle_module(
+        &self,
+        name: String,
+        base_address: u64,
+        size: u64,
+        entry_point: Option<u64>,
+        initialized: bool,
+        exports: impl IntoIterator<Item = (u64, u64)>,
+    ) -> u32 {
+        let id = self.find_module(&name).map_or_else(
+            || {
+                self.register_module(ModuleInfo {
+                    id: 0,
+                    name,
+                    base_address,
+                    size,
+                    entry_point,
+                    initialized,
+                })
+            },
+            |module| module.id,
+        );
+        self.lle_module_exports
+            .insert(id, exports.into_iter().collect());
+        id
+    }
+
+    /// Mark a loaded module initialized after its `DT_INIT` callback has been
+    /// accepted for execution.
+    pub fn mark_module_initialized(&self, id: u32) {
+        if let Some(mut module) = self.modules.get_mut(&id) {
+            module.initialized = true;
+        }
+    }
+
+    /// Resolve one export from a real module handle.
+    pub fn resolve_lle_export(&self, handle: u32, nid: u64) -> Option<u64> {
+        self.lle_module_exports
+            .get(&handle)
+            .and_then(|exports| exports.get(&nid).copied())
     }
 
     /// Dispatch a syscall.

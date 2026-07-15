@@ -515,10 +515,10 @@ fn hle_driver_add_eq_event(ctx: &HleContext, args: &[u64]) -> u64 {
         (equeue, event_id),
         xps5x_kernel::EqueueUserEvent {
             udata: user_data,
-            triggered: false,
-            fflags: 0,
+            ..Default::default()
         },
     );
+    debug!(equeue, event_id, user_data, "registered AGC event");
     0
 }
 
@@ -561,9 +561,9 @@ fn hle_dcb_set_base_indirect_args(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 /// `sceAgcDriverSubmitDcb(packet)` / `sceAgcDriverSubmitAcb(owner, packet)`:
-/// capture and structurally decode the submitted Gen5 PM4 command buffer, then
-/// succeed. (No real GPU submission yet — that arrives with the Vulkan backend;
-/// SharpEmu likewise only validates here.)
+/// capture and structurally decode the submitted Gen5 PM4 command buffer, apply
+/// sync/flip side effects, and (when the DCB contains draw packets) drive the
+/// M2 Vulkan offscreen path via [`xps5x_gpu::AgcGpuSession`].
 fn hle_driver_submit_dcb(ctx: &HleContext, args: &[u64]) -> u64 {
     submit_validate(ctx, args.first().copied().unwrap_or(0))
 }
@@ -646,6 +646,36 @@ fn submit_validate(ctx: &HleContext, packet: u64) -> u64 {
         return SCE_ERROR_INVALID_ARGUMENT;
     };
 
+    for write in &decoded.memory_writes {
+        if !ctx.mem.write(write.address, &write.data) {
+            tracing::warn!(
+                address = write.address,
+                bytes = write.data.len(),
+                packet_offset = write.packet_offset,
+                "AGC synchronization write targeted unreadable guest memory"
+            );
+            return SCE_ERROR_INVALID_ARGUMENT;
+        }
+    }
+    for event_id in &decoded.events {
+        for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {
+            if event.key().1 == u64::from(*event_id) {
+                event.triggered = true;
+                event.fflags = event.fflags.saturating_add(1);
+                event.data = i64::from(*event_id);
+            }
+        }
+    }
+    for flip in &decoded.flips {
+        let _ = crate::libsce_video_out::submit_flip_from_agc(
+            ctx,
+            flip.video_out_handle,
+            flip.display_buffer_index,
+            flip.flip_mode,
+            flip.flip_arg,
+        );
+    }
+
     use std::sync::atomic::Ordering;
     ctx.kernel
         .agc_last_dcb_address
@@ -682,9 +712,29 @@ fn submit_validate(ctx: &HleContext, packet: u64) -> u64 {
             flips = decoded.flips.len(),
             packet_layout = ?decoded.packets,
             flip_layout = ?decoded.flips,
+            memory_writes = ?decoded.memory_writes,
+            waits32 = ?decoded.waits32,
+            events = ?decoded.events,
             "captured AGC DCB submission"
         );
+    } else if (prior_submissions + 1).is_power_of_two() {
+        tracing::info!(
+            submissions = prior_submissions + 1,
+            total_draws = ctx.kernel.agc_draw_packet_count.load(Ordering::Relaxed),
+            total_dispatches = ctx.kernel.agc_dispatch_packet_count.load(Ordering::Relaxed),
+            total_flips = ctx.kernel.agc_flip_packet_count.load(Ordering::Relaxed),
+            "AGC submission progress"
+        );
     }
+
+    // M2: draw-bearing DCBs drive the Vulkan offscreen path. Soft-fail when
+    // no usable Vulkan device is present so title boot / CI without a GPU
+    // still return success after decode + sync bookkeeping.
+    // Deprecated on purpose: this is the M2 fixture/regression path, kept
+    // until the CP path (try_execute_dcb_cp) subsumes it.
+    #[allow(deprecated)]
+    xps5x_gpu::AgcGpuSession::global().try_execute_decoded(&decoded);
+
     0
 }
 
@@ -2480,8 +2530,32 @@ mod tests {
                 .write(0x900, &pm4(2, IT_NOP, R_DRAW_INDEX_AUTO).to_le_bytes())
         );
         assert!(ctx.mem.write(0x904, &3u32.to_le_bytes()));
+        assert!(
+            ctx.mem
+                .write(0x908, &pm4(8, IT_NOP, R_RELEASE_MEM).to_le_bytes())
+        );
+        assert!(ctx.mem.write(0x90C, &0u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x910, &(2u32 << 16).to_le_bytes()));
+        assert!(ctx.mem.write(0x914, &0x980u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x918, &0u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x91C, &0x7654_3210u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x920, &0xfedc_ba98u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x924, &0u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x928, &pm4(6, IT_NOP, R_FLIP).to_le_bytes()));
+        assert!(ctx.mem.write(0x92C, &1u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x930, &1u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x934, &1u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x938, &0x89ab_cdefu32.to_le_bytes()));
+        assert!(ctx.mem.write(0x93C, &0x0123_4567u32.to_le_bytes()));
+        assert!(
+            ctx.mem
+                .write(0x940, &pm4(2, IT_EVENT_WRITE, R_ZERO).to_le_bytes())
+        );
+        assert!(ctx.mem.write(0x944, &0x2au32.to_le_bytes()));
+        let eq = kernel.create_equeue(0);
+        assert_eq!(hle_driver_add_eq_event(&ctx, &[eq, 0x2a, 0xCAFE]), 0);
         assert!(ctx.mem.write(0x180, &0x900u64.to_le_bytes()));
-        assert!(ctx.mem.write(0x188, &2u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x188, &18u32.to_le_bytes()));
         assert_eq!(hle_driver_submit_dcb(&ctx, &[0x180]), 0);
         assert_eq!(hle_driver_submit_acb(&ctx, &[7, 0x180]), 0);
         assert_eq!(
@@ -2506,7 +2580,27 @@ mod tests {
             kernel
                 .agc_last_dcb_dwords
                 .load(std::sync::atomic::Ordering::Relaxed),
+            18
+        );
+        assert_eq!(read_u64(&ctx, 0x980), 0xfedc_ba98_7654_3210);
+        assert!(
+            kernel
+                .kernel_equeue_events
+                .get(&(eq, 0x2a))
+                .unwrap()
+                .triggered
+        );
+        assert_eq!(
+            kernel
+                .video_out_flip_count
+                .load(std::sync::atomic::Ordering::Relaxed),
             2
+        );
+        assert_eq!(
+            kernel
+                .video_out_last_flip_arg
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0x0123_4567_89ab_cdef
         );
         assert_eq!(
             hle_driver_submit_dcb(&ctx, &[0]),
@@ -2525,6 +2619,46 @@ mod tests {
         // Query: required = resourceCount*0x118 + ownerCount*0x1E0.
         assert_eq!(hle_driver_query_resource_memory(&ctx, &[0x1E0, 2, 3]), 0);
         assert_eq!(read_u64(&ctx, 0x1E0), 2 * 0x118 + 3 * 0x1E0);
+    }
+
+    /// M2 HLE seam: `SubmitDcb` with a DRAW packet must call into
+    /// `AgcGpuSession`. When Vulkan is available the draw count rises and
+    /// pixels are non-empty; without Vulkan the submit still returns 0.
+    #[test]
+    fn submit_dcb_with_draw_drives_m2_gpu_session() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let words = xps5x_gpu::build_m2_draw_dcb();
+        let byte_len = words.len() * 4;
+        let mut bytes = Vec::with_capacity(byte_len);
+        for w in &words {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        assert!(ctx.mem.write(0xB00, &bytes));
+        assert!(ctx.mem.write(0x280, &0xB00u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x288, &(words.len() as u32).to_le_bytes()));
+
+        let before = xps5x_gpu::AgcGpuSession::global().draw_count();
+        assert_eq!(hle_driver_submit_dcb(&ctx, &[0x280]), 0);
+        assert_eq!(
+            kernel
+                .agc_draw_packet_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        let after = xps5x_gpu::AgcGpuSession::global().draw_count();
+        if after > before {
+            let image = xps5x_gpu::AgcGpuSession::global()
+                .last_image()
+                .expect("successful M2 draw must stash a readback");
+            assert_eq!(image.width, 64);
+            assert_eq!(image.height, 64);
+            assert!(!image.pixels.is_empty());
+        } else if std::env::var_os("XPS5X_REQUIRE_VULKAN").is_some() {
+            panic!("XPS5X_REQUIRE_VULKAN set but SubmitDcb did not drive a Vulkan draw");
+        }
     }
 
     #[test]

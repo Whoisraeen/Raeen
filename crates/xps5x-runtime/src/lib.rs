@@ -14,6 +14,8 @@
 //! platform-independent so a POSIX `sigaction`/`SIGSEGV` backend can slot in
 //! at a later milestone without callers changing.
 #![forbid(unsafe_op_in_unsafe_fn)]
+// Conflicts with our MSRV: `is_multiple_of` is stable since 1.87, we target 1.85.
+#![allow(clippy::manual_is_multiple_of)]
 
 #[cfg(target_os = "windows")]
 mod arena;
@@ -391,6 +393,60 @@ fn execute_process_mapped(
     argv: &[&str],
     envp: &[&str],
 ) -> Result<RunOutcome, RuntimeError> {
+    let unwind_modules = module
+        .unwind_modules
+        .iter()
+        .filter_map(|loaded| {
+            let module_base = GUEST_ARENA_BASE.checked_add(loaded.image_offset)?;
+            let rebase = |vaddr: u64| {
+                if vaddr == 0 {
+                    Some(0)
+                } else {
+                    module_base.checked_add(vaddr)
+                }
+            };
+            let start = module_base.checked_add(loaded.unwind.image_vaddr)?;
+            Some(xps5x_kernel::UnwindModuleInfo {
+                name: loaded.name.clone(),
+                start,
+                end: start.checked_add(loaded.unwind.image_size)?,
+                eh_frame_hdr_addr: rebase(loaded.unwind.eh_frame_hdr_vaddr)?,
+                eh_frame_addr: rebase(loaded.unwind.eh_frame_vaddr)?,
+                eh_frame_size: loaded.unwind.eh_frame_size,
+                seg0_addr: module_base.checked_add(loaded.unwind.seg0_vaddr)?,
+                seg0_size: loaded.unwind.seg0_size,
+            })
+        })
+        .collect();
+    kernel.set_unwind_modules(unwind_modules);
+    for loaded in &module.unwind_modules {
+        let Some(module_base) = GUEST_ARENA_BASE.checked_add(loaded.image_offset) else {
+            continue;
+        };
+        let Some(load_start) = module_base.checked_add(loaded.unwind.image_vaddr) else {
+            continue;
+        };
+        let exports = loaded.exports.iter().filter_map(|export| {
+            module_base
+                .checked_add(export.value)
+                .map(|addr| (export.nid, addr))
+        });
+        let initialized = loaded.image_offset == 0
+            || module
+                .module_inits
+                .iter()
+                .any(|init| init.name == loaded.name);
+        kernel.register_lle_module(
+            loaded.name.clone(),
+            load_start,
+            loaded.unwind.image_size,
+            loaded
+                .init_vaddr
+                .and_then(|init| module_base.checked_add(init)),
+            initialized,
+            exports,
+        );
+    }
     kernel.set_proc_param_addr(
         module
             .procparam_offset

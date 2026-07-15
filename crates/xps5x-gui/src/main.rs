@@ -216,16 +216,23 @@ fn main() -> anyhow::Result<()> {
             process.linked.unresolved_stubs.len(),
             ranked.len()
         );
-        println!("# encoded_nid  nid  library");
+        // `name` is hash-verified when known (see dynlib::nid_names), else it
+        // repeats the encoded NID — an anonymous import nothing can name yet.
+        println!("# encoded_nid  nid  library  name");
         for (lib, stubs) in ranked {
-            println!("\n## {lib}  ({} missing)", stubs.len());
+            let named = stubs
+                .iter()
+                .filter(|s| xps5x_firmware::dynlib::nid_names::name_of(s.nid).is_some())
+                .count();
+            println!("\n## {lib}  ({} missing, {named} named)", stubs.len());
             let mut rows: Vec<String> = stubs
                 .iter()
                 .map(|s| {
                     format!(
-                        "{}  {:#018x}  {lib}",
+                        "{}  {:#018x}  {lib}  {}",
                         xps5x_firmware::dynlib::nid::encode_nid(s.nid),
-                        s.nid
+                        s.nid,
+                        xps5x_firmware::dynlib::nid_names::describe(s.nid),
                     )
                 })
                 .collect();
@@ -316,8 +323,9 @@ fn main() -> anyhow::Result<()> {
                 // `addr` is the faulting instruction's Rip — where the guest
                 // was, NOT the stub. Naming it "stub" was wrong and confusing.
                 info!(
-                    "RESULT: guest needs an UNIMPLEMENTED import — nid {nid:#018x} \
-                     (encoded {}) from library '{library}'",
+                    "RESULT: guest needs an UNIMPLEMENTED import — {} \
+                     — nid {nid:#018x} (encoded {}) from library '{library}'",
+                    xps5x_firmware::dynlib::nid_names::describe(*nid),
                     xps5x_firmware::dynlib::nid::encode_nid(*nid)
                 );
                 info!(

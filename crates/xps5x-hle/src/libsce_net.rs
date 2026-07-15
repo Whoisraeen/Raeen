@@ -16,6 +16,10 @@ use tracing::debug;
 const SCE_OK: u64 = 0;
 /// `SCE_NET_ERROR_EINVAL`.
 const NET_ERROR_INVALID_ARGUMENT: u64 = 0x8041_0116;
+/// `SCE_NET_CTL_ERROR_INVALID_ADDR`.
+const NET_CTL_ERROR_INVALID_ADDRESS: u64 = 0x8041_2107;
+/// `SCE_NET_CTL_ERROR_NOT_CONNECTED`.
+const NET_CTL_ERROR_NOT_CONNECTED: u64 = 0x8041_2108;
 /// `SCE_NET_CTL_STATE_DISCONNECTED` (0). (`CONNECTING = 1`, ...,
 /// `IPOBTAINED = 3`.)
 const NET_CTL_STATE_DISCONNECTED: u32 = 0;
@@ -42,6 +46,12 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceNetCtl", "sceNetCtlGetState", hle_ctl_get_state);
     registry.register("libSceNetCtl", "sceNetCtlCheckCallback", hle_ok);
     registry.register("libSceNetCtl", "sceNetCtlRegisterCallback", hle_ok);
+    registry.register_nid(
+        "libSceNetCtl",
+        "sceNetCtlGetInfo",
+        0xa1bb_b175_38b0_905f,
+        hle_ctl_get_info,
+    );
 }
 
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
@@ -118,6 +128,43 @@ fn hle_ctl_get_state(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
+/// `sceNetCtlGetInfo(code, info)`: report a deterministic offline interface.
+/// The tagged union's active field is selected by `code`; fixed-size string
+/// members are cleared before their loopback/offline value is copied.
+fn hle_ctl_get_info(ctx: &HleContext, args: &[u64]) -> u64 {
+    let code = args.first().copied().unwrap_or(0) as i32;
+    let info = args.get(1).copied().unwrap_or(0);
+    if info == 0 {
+        return NET_CTL_ERROR_INVALID_ADDRESS;
+    }
+
+    let result = match code {
+        1 | 4 | 11 | 19 => ctx.mem.write(info, &0u32.to_le_bytes()),
+        2 => ctx.mem.write(info, &[0u8; 6]),
+        3 => ctx.mem.write(info, &1500u32.to_le_bytes()),
+        12 => write_fixed_string(ctx, info, 256, ""),
+        13 => write_fixed_string(ctx, info, 128, ""),
+        14 | 16 => write_fixed_string(ctx, info, 16, "127.0.0.1"),
+        15 => write_fixed_string(ctx, info, 16, "255.0.0.0"),
+        17 | 18 => write_fixed_string(ctx, info, 16, "1.1.1.1"),
+        20 => write_fixed_string(ctx, info, 256, ""),
+        21 => ctx.mem.write(info, &0u16.to_le_bytes()),
+        _ => return NET_CTL_ERROR_NOT_CONNECTED,
+    };
+    if result {
+        SCE_OK
+    } else {
+        NET_CTL_ERROR_INVALID_ADDRESS
+    }
+}
+
+fn write_fixed_string(ctx: &HleContext, address: u64, size: usize, value: &str) -> bool {
+    let mut bytes = vec![0u8; size];
+    let count = value.len().min(size.saturating_sub(1));
+    bytes[..count].copy_from_slice(&value.as_bytes()[..count]);
+    ctx.mem.write(address, &bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +197,44 @@ mod tests {
         assert_eq!(u32::from_le_bytes(s), NET_CTL_STATE_DISCONNECTED);
 
         assert!(hle_new_id(&ctx, &[]) > 0);
+    }
+
+    #[test]
+    fn netctl_get_info_reports_deterministic_offline_values() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x400);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(hle_ctl_get_info(&ctx, &[3, 0x40]), SCE_OK);
+        let mut mtu = [0u8; 4];
+        assert!(mem.read(0x40, &mut mtu));
+        assert_eq!(u32::from_le_bytes(mtu), 1500);
+
+        assert_eq!(hle_ctl_get_info(&ctx, &[14, 0x80]), SCE_OK);
+        let mut address = [0xffu8; 16];
+        assert!(mem.read(0x80, &mut address));
+        assert_eq!(&address[..10], b"127.0.0.1\0");
+        assert!(address[10..].iter().all(|byte| *byte == 0));
+
+        assert_eq!(
+            hle_ctl_get_info(&ctx, &[999, 0x40]),
+            NET_CTL_ERROR_NOT_CONNECTED
+        );
+        assert_eq!(
+            hle_ctl_get_info(&ctx, &[3, 0]),
+            NET_CTL_ERROR_INVALID_ADDRESS
+        );
+
+        let registry = HleRegistry::new();
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| {
+                    *nid == 0xa1bb_b175_38b0_905f && key == "libSceNetCtl::sceNetCtlGetInfo"
+                })
+        );
     }
 
     #[test]

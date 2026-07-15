@@ -240,11 +240,22 @@ fn read_slot(image: &[u8], offset: u64) -> u64 {
 #[test]
 fn homebrew_sprx_links_import_against_hle_trampoline() {
     let hle = HleRegistry::new();
-    let (lib, func) = hle
-        .registered_names()
-        .into_iter()
-        .next()
-        .expect("HLE registers at least one fn");
+    // A NID hashes the function name alone, so a name registered under several
+    // libraries (libSceSaveData / libSceSaveData.native / ...) resolves to one
+    // canonical library that need not be the one paired with it here. Pick a
+    // name unique to a single library, and pick it deterministically: taking an
+    // arbitrary entry made this test fail ~15% of runs.
+    let names = hle.registered_names();
+    let mut unique: Vec<&(String, String)> = names
+        .iter()
+        .filter(|(_, func)| names.iter().filter(|(_, other)| other == func).count() == 1)
+        .collect();
+    unique.sort();
+    let (lib, func) = unique
+        .first()
+        .copied()
+        .cloned()
+        .expect("HLE registers at least one fn under exactly one library");
     let import_nid = nid_of(&func);
 
     let sprx = build_homebrew_sprx(import_nid);

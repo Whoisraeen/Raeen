@@ -17,9 +17,13 @@ const R_DRAW_INDEX_AUTO: u32 = 0x04;
 const R_DRAW_INDEX: u32 = 0x03;
 const R_FLIP: u32 = 0x17;
 const R_DISPATCH_DIRECT: u32 = 0x08;
+const R_WRITE_DATA: u32 = 0x15;
+const R_RELEASE_MEM: u32 = 0x18;
+const R_WAIT_MEM_32: u32 = 0x0a;
 const IT_DRAW_INDEX_MULTI_AUTO: u32 = 0x30;
 const IT_DRAW_INDEX_INDIRECT_MULTI: u32 = 0x38;
 const IT_DISPATCH_DRAW: u32 = 0x8d;
+const IT_EVENT_WRITE: u32 = 0x46;
 
 /// One decoded Gen5 PM4 packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +47,25 @@ pub struct AgcFlip {
     pub flip_arg: u64,
 }
 
+/// One guest-memory write requested by a synchronization/data packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgcMemoryWrite {
+    /// DWORD offset of the packet that produced this write.
+    pub packet_offset: u32,
+    pub address: u64,
+    pub data: Vec<u8>,
+}
+
+/// One Gen5 32-bit memory comparison that gates later command execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgcWait32 {
+    pub packet_offset: u32,
+    pub address: u64,
+    pub mask: u32,
+    pub function: u32,
+    pub reference: u32,
+}
+
 /// Structural facts extracted from a complete DCB submission.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AgcSubmission {
@@ -50,6 +73,10 @@ pub struct AgcSubmission {
     pub draw_packets: u32,
     pub dispatch_packets: u32,
     pub flips: Vec<AgcFlip>,
+    pub memory_writes: Vec<AgcMemoryWrite>,
+    pub waits32: Vec<AgcWait32>,
+    /// Event ids signaled by standard `EVENT_WRITE` packets.
+    pub events: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -133,6 +160,53 @@ pub fn decode_submission(words: &[u32]) -> Result<AgcSubmission, AgcDecodeError>
                 flip_arg: u64::from(body[3]) | (u64::from(body[4]) << 32),
             });
         }
+        if opcode == IT_EVENT_WRITE && dwords >= 2 {
+            result.events.push(words[offset + 1] & 0x3f);
+        }
+        if opcode == IT_NOP && register == R_RELEASE_MEM && dwords >= 7 {
+            let body = &words[offset + 1..offset + dwords as usize];
+            let data_selection = (body[1] >> 16) & 0xff;
+            let address = u64::from(body[2]) | (u64::from(body[3]) << 32);
+            let value = u64::from(body[4]) | (u64::from(body[5]) << 32);
+            let data = match data_selection {
+                1 => body[4].to_le_bytes().to_vec(),
+                2 | 3 => value.to_le_bytes().to_vec(),
+                _ => Vec::new(),
+            };
+            if address != 0 && !data.is_empty() {
+                result.memory_writes.push(AgcMemoryWrite {
+                    packet_offset: offset as u32,
+                    address,
+                    data,
+                });
+            }
+        }
+        if opcode == IT_NOP && register == R_WRITE_DATA && dwords >= 4 {
+            let body = &words[offset + 1..offset + dwords as usize];
+            let control = body[0];
+            let destination = control & 0xff;
+            let increment = ((control >> 16) & 0xff) == 0;
+            let address = u64::from(body[1]) | (u64::from(body[2]) << 32);
+            if matches!(destination, 1 | 2 | 4 | 5) && address != 0 {
+                for (index, value) in body[3..].iter().enumerate() {
+                    result.memory_writes.push(AgcMemoryWrite {
+                        packet_offset: offset as u32,
+                        address: address + if increment { index as u64 * 4 } else { 0 },
+                        data: value.to_le_bytes().to_vec(),
+                    });
+                }
+            }
+        }
+        if opcode == IT_NOP && register == R_WAIT_MEM_32 && dwords >= 6 {
+            let body = &words[offset + 1..offset + dwords as usize];
+            result.waits32.push(AgcWait32 {
+                packet_offset: offset as u32,
+                address: u64::from(body[0]) | (u64::from(body[1]) << 32),
+                mask: body[2],
+                function: body[3],
+                reference: body[4],
+            });
+        }
         offset += dwords as usize;
     }
     Ok(result)
@@ -164,12 +238,15 @@ mod tests {
             1,
             0x89ab_cdef,
             0x0123_4567,
+            header(2, IT_EVENT_WRITE, 0),
+            0x2a,
             0x8000_0000,
         ];
         let decoded = decode_submission(&words).expect("valid AGC DCB");
-        assert_eq!(decoded.packets.len(), 5);
+        assert_eq!(decoded.packets.len(), 6);
         assert_eq!(decoded.draw_packets, 2);
         assert_eq!(decoded.dispatch_packets, 1);
+        assert_eq!(decoded.events, [0x2a]);
         assert_eq!(
             decoded.flips,
             [AgcFlip {
@@ -197,6 +274,63 @@ mod tests {
                 offset: 0,
                 packet_type: 0,
             })
+        );
+    }
+
+    #[test]
+    fn decodes_release_mem_and_write_data_side_effects() {
+        let words = [
+            header(8, IT_NOP, R_RELEASE_MEM),
+            0,
+            2 << 16,
+            0x1000,
+            0,
+            0x89ab_cdef,
+            0x0123_4567,
+            0,
+            header(6, IT_NOP, R_WRITE_DATA),
+            1,
+            0x2000,
+            0,
+            0xaabb_ccdd,
+            0x1122_3344,
+            header(6, IT_NOP, R_WAIT_MEM_32),
+            0x2000,
+            0,
+            0xffff_ffff,
+            3,
+            0xaabb_ccdd,
+        ];
+        let decoded = decode_submission(&words).unwrap();
+        assert_eq!(
+            decoded.memory_writes,
+            [
+                AgcMemoryWrite {
+                    packet_offset: 0,
+                    address: 0x1000,
+                    data: 0x0123_4567_89ab_cdefu64.to_le_bytes().to_vec(),
+                },
+                AgcMemoryWrite {
+                    packet_offset: 8,
+                    address: 0x2000,
+                    data: 0xaabb_ccddu32.to_le_bytes().to_vec(),
+                },
+                AgcMemoryWrite {
+                    packet_offset: 8,
+                    address: 0x2004,
+                    data: 0x1122_3344u32.to_le_bytes().to_vec(),
+                },
+            ]
+        );
+        assert_eq!(
+            decoded.waits32,
+            [AgcWait32 {
+                packet_offset: 14,
+                address: 0x2000,
+                mask: 0xffff_ffff,
+                function: 3,
+                reference: 0xaabb_ccdd,
+            }]
         );
     }
 }

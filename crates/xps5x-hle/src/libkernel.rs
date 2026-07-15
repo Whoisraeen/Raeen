@@ -101,6 +101,96 @@ const FILE_EINVAL: u64 = (-22i64) as u64;
 /// Cap on a single `read` transfer into guest memory (bounds host staging).
 const READ_MAX_BYTES: u64 = 16 << 20; // 16 MiB
 
+/// Store a POSIX errno value in the calling guest thread's `__error()` slot.
+fn set_guest_errno(ctx: &HleContext, errno: i32) {
+    let slot = hle_error_addr(ctx, &[]);
+    if slot != 0 && !ctx.mem.write(slot, &errno.to_le_bytes()) {
+        warn!("failed to write errno={errno} to guest slot {slot:#x}");
+    }
+}
+
+/// Adapt this module's internal `-errno` file result to POSIX `-1` + errno.
+fn file_result_posix(ctx: &HleContext, result: u64) -> u64 {
+    let signed = result as i64;
+    if (-4095..0).contains(&signed) {
+        set_guest_errno(ctx, (-signed) as i32);
+        (-1i64) as u64
+    } else {
+        result
+    }
+}
+
+/// Adapt this module's internal `-errno` file result to an SCE kernel error.
+fn file_result_sce(result: u64) -> u64 {
+    let signed = result as i64;
+    if (-4095..0).contains(&signed) {
+        0x8002_0000 | (-signed as u64)
+    } else {
+        result
+    }
+}
+
+fn sce_result_posix(ctx: &HleContext, result: u64) -> u64 {
+    if result & 0xffff_0000 == 0x8002_0000 {
+        set_guest_errno(ctx, (result & 0xffff) as i32);
+        (-1i64) as u64
+    } else {
+        result
+    }
+}
+
+fn hle_posix_open(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_posix(ctx, hle_open(ctx, args))
+}
+
+fn hle_sce_open(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_sce(hle_open(ctx, args))
+}
+
+fn hle_posix_read(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_posix(ctx, hle_read(ctx, args))
+}
+
+fn hle_sce_read(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_sce(hle_read(ctx, args))
+}
+
+fn hle_posix_write(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_posix(ctx, hle_write(ctx, args))
+}
+
+fn hle_sce_write(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_sce(hle_write(ctx, args))
+}
+
+fn hle_posix_close(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_posix(ctx, hle_close(ctx, args))
+}
+
+fn hle_sce_close(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_sce(hle_close(ctx, args))
+}
+
+fn hle_posix_lseek(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_posix(ctx, hle_lseek(ctx, args))
+}
+
+fn hle_sce_lseek(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_sce(hle_lseek(ctx, args))
+}
+
+fn hle_posix_getdents(ctx: &HleContext, args: &[u64]) -> u64 {
+    sce_result_posix(ctx, hle_getdents(ctx, args))
+}
+
+fn hle_sce_getdents(ctx: &HleContext, args: &[u64]) -> u64 {
+    hle_getdents(ctx, args)
+}
+
+fn hle_sce_fsync(ctx: &HleContext, args: &[u64]) -> u64 {
+    hle_fsync(ctx, args)
+}
+
 /// Real `open(path, flags, mode)` / `sceKernelOpen` (VFS-backed): resolves
 /// the guest path through the kernel VFS (`/app0/…` → the game directory,
 /// etc.), opens it, and returns a file descriptor (>= 3). A path that
@@ -132,6 +222,7 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
             );
             return FILE_ENOENT;
         }
+        None if path == "/" && !creating => {}
         None => {
             warn!("open: '{path}' matches no VFS mount — ENOENT");
             return FILE_ENOENT;
@@ -259,9 +350,8 @@ const SCE_KERNEL_ERROR_ENOENT: u64 = 0x8002_0002;
 /// Real-enough `sceKernelLoadStartModule(path, argc, argv, flags, opt,
 /// pRes)` (M1-D, wall #4): reads the guest path, then
 ///
-/// 1. If a module with that name (or filename) is already registered with
-///    the kernel, returns its existing handle — repeated loads of the same
-///    module hand back the same handle, like the real call.
+/// 1. If a preplaced real module matches, schedules its `DT_INIT` once and
+///    returns its existing handle. Repeated loads keep the same handle.
 /// 2. Otherwise registers a *synthetic* module entry and returns its fresh
 ///    handle. This is honest for system `.prx`s (`libSceLibcInternal`,
 ///    `libSceFios2`, ...) because their functionality is HLE: every import
@@ -272,8 +362,8 @@ const SCE_KERNEL_ERROR_ENOENT: u64 = 0x8002_0002;
 ///    this path yet — that needs file-backed loading through the firmware
 ///    pipeline, logged loudly below as future work.
 ///
-/// `pRes` (the module-local `module_start` result out-param), when non-null,
-/// is written `0` — no real `module_start` runs for an HLE-backed module.
+/// `pRes` is initialized to zero; deferred guest callbacks currently do not
+/// copy the eventual initializer return value back into it.
 fn hle_load_start_module(ctx: &HleContext, args: &[u64]) -> u64 {
     let path_ptr = args.first().copied().unwrap_or(0);
     let res_ptr = args.get(5).copied().unwrap_or(0);
@@ -299,6 +389,32 @@ fn hle_load_start_module(ctx: &HleContext, args: &[u64]) -> u64 {
 
     for candidate in [path.as_str(), file_name.as_str(), stem.as_str()] {
         if let Some(info) = ctx.kernel.find_module(candidate) {
+            if !info.initialized {
+                if let Some(entry) = info.entry_point {
+                    let requested = ctx.guest_calls.request(GuestCallRequest {
+                        entry,
+                        args: [
+                            args.get(1).copied().unwrap_or(0),
+                            args.get(2).copied().unwrap_or(0),
+                            0,
+                            0,
+                            0,
+                            0,
+                        ],
+                        completion: None,
+                    });
+                    if !requested {
+                        return 0x8002_000B; // SCE_KERNEL_ERROR_EAGAIN
+                    }
+                    tracing::info!(
+                        "sceKernelLoadStartModule: scheduling '{}' DT_INIT at {entry:#x}",
+                        info.name
+                    );
+                } else {
+                    tracing::info!("sceKernelLoadStartModule: '{}' has no DT_INIT", info.name);
+                }
+                ctx.kernel.mark_module_initialized(info.id);
+            }
             debug!(
                 "sceKernelLoadStartModule: '{path}' already loaded as handle {}",
                 info.id
@@ -343,23 +459,43 @@ fn hle_stop_unload_module(ctx: &HleContext, args: &[u64]) -> u64 {
     }
 }
 
-/// `sceKernelDlsym(handle, symbol, addrOut)`: honestly unimplemented. The
-/// HLE trampoline table is minted at link time (LM1) from the module's
-/// declared imports; handing out a *new* callable guest address at runtime
-/// needs dynamically-minted trampolines the dispatcher doesn't support yet.
-/// Logs the requested symbol loudly and returns `ENOENT` — a title that
-/// needs dlsym will show exactly what it asked for.
+/// `sceKernelDlsym(handle, symbol, addrOut)`: resolve exports from a real,
+/// preplaced LLE module. Such exports are already directly executable guest
+/// addresses and do not need a newly minted HLE trampoline.
 fn hle_dlsym(ctx: &HleContext, args: &[u64]) -> u64 {
     let handle = args.first().copied().unwrap_or(0);
     let sym_ptr = args.get(1).copied().unwrap_or(0);
-    let symbol = crate::fmt::read_cstr(ctx.mem, sym_ptr)
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_else(|| format!("<unreadable {sym_ptr:#x}>"));
-    warn!(
-        "sceKernelDlsym(handle={handle}, symbol='{symbol}'): runtime symbol lookup needs \
-         dynamically-minted trampolines (not implemented) — ENOENT"
-    );
-    SCE_KERNEL_ERROR_ENOENT
+    let addr_out = args.get(2).copied().unwrap_or(0);
+    let Some(symbol_bytes) = crate::fmt::read_cstr(ctx.mem, sym_ptr) else {
+        return SCE_KERNEL_ERROR_EFAULT;
+    };
+    if addr_out == 0 {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    let Ok(handle) = u32::try_from(handle) else {
+        return SCE_KERNEL_ERROR_ESRCH;
+    };
+
+    use sha1::{Digest, Sha1};
+    const SCE_NID_SALT: [u8; 16] = [
+        0x51, 0x8D, 0x64, 0xA6, 0x35, 0xDE, 0xD8, 0xC1, 0xE6, 0xB0, 0x39, 0xB1, 0xC3, 0xE5, 0x52,
+        0x30,
+    ];
+    let mut hasher = Sha1::new();
+    hasher.update(&symbol_bytes);
+    hasher.update(SCE_NID_SALT);
+    let digest = hasher.finalize();
+    let nid = u64::from_le_bytes(digest[..8].try_into().expect("SHA-1 has 20 bytes"));
+    let symbol = String::from_utf8_lossy(&symbol_bytes);
+    let Some(addr) = ctx.kernel.resolve_lle_export(handle, nid) else {
+        warn!("sceKernelDlsym(handle={handle}, symbol='{symbol}'): export not found — ENOENT");
+        return SCE_KERNEL_ERROR_ENOENT;
+    };
+    if !ctx.mem.write(addr_out, &addr.to_le_bytes()) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    debug!("sceKernelDlsym(handle={handle}, symbol='{symbol}') -> {addr:#x}");
+    SCE_OK
 }
 
 /// Register libkernel HLE functions.
@@ -404,28 +540,28 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "sceKernelMmap", hle_mmap);
 
     // -- File descriptors / console I/O (M1-C) --
-    registry.register("libkernel", "write", hle_write);
-    registry.register("libkernel", "sceKernelWrite", hle_write);
+    registry.register("libkernel", "write", hle_posix_write);
+    registry.register("libkernel", "sceKernelWrite", hle_sce_write);
 
     // -- File I/O (real, VFS-backed) --
-    registry.register("libkernel", "open", hle_open);
-    registry.register("libkernel", "sceKernelOpen", hle_open);
-    registry.register("libkernel", "read", hle_read);
-    registry.register("libkernel", "sceKernelRead", hle_read);
-    registry.register("libkernel", "close", hle_close);
-    registry.register("libkernel", "sceKernelClose", hle_close);
+    registry.register("libkernel", "open", hle_posix_open);
+    registry.register("libkernel", "sceKernelOpen", hle_sce_open);
+    registry.register("libkernel", "read", hle_posix_read);
+    registry.register("libkernel", "sceKernelRead", hle_sce_read);
+    registry.register("libkernel", "close", hle_posix_close);
+    registry.register("libkernel", "sceKernelClose", hle_sce_close);
     registry.register_nid(
         "libkernel",
         "sceKernelFsync",
         0x7d3c_7aea_5e62_5880,
-        hle_fsync,
+        hle_sce_fsync,
     );
-    registry.register("libkernel", "sceKernelGetdents", hle_getdents);
-    registry.register("libkernel", "sceKernelGetdirentries", hle_getdents);
-    registry.register("libkernel", "getdirentries", hle_getdents);
-    registry.register("libScePosix", "getdents", hle_getdents);
-    registry.register("libkernel", "lseek", hle_lseek);
-    registry.register("libkernel", "sceKernelLseek", hle_lseek);
+    registry.register("libkernel", "sceKernelGetdents", hle_sce_getdents);
+    registry.register("libkernel", "sceKernelGetdirentries", hle_sce_getdents);
+    registry.register("libkernel", "getdirentries", hle_posix_getdents);
+    registry.register("libScePosix", "getdents", hle_posix_getdents);
+    registry.register("libkernel", "lseek", hle_posix_lseek);
+    registry.register("libkernel", "sceKernelLseek", hle_sce_lseek);
 
     // -- Module loading (M1-D) --
     registry.register(
@@ -514,10 +650,10 @@ pub fn register(registry: &HleRegistry) {
     // each verified by NID hash against the title's import table; semantics
     // cross-checked with SharpEmu + Kyty). The `_`-prefixed file/exit names
     // are libkernel's real exports of the plain POSIX calls.
-    registry.register("libkernel", "_open", hle_open);
-    registry.register("libkernel", "_read", hle_read);
-    registry.register("libkernel", "_write", hle_write);
-    registry.register("libkernel", "_close", hle_close);
+    registry.register("libkernel", "_open", hle_posix_open);
+    registry.register("libkernel", "_read", hle_posix_read);
+    registry.register("libkernel", "_write", hle_posix_write);
+    registry.register("libkernel", "_close", hle_posix_close);
     // `_exit` terminates the process: the runtime's exit family intercepts it
     // before dispatch (see xps5x_runtime::dispatch::TERMINATING_FUNCTIONS);
     // this registration exists so the import resolves to a trampoline.
@@ -568,14 +704,14 @@ pub fn register(registry: &HleRegistry) {
     registry.register(
         "libkernel",
         "sceKernelGetModuleInfoForUnwind",
-        hle_module_info_unavailable,
+        hle_get_module_info_for_unwind,
     );
     registry.register(
         "libkernel",
         "sceKernelGetModuleInfoFromAddr",
         hle_module_info_unavailable,
     );
-    registry.register("libkernel", "sceKernelVirtualQuery", hle_virtual_query_stub);
+    registry.register("libkernel", "sceKernelVirtualQuery", hle_virtual_query);
     registry.register(
         "libkernel",
         "sceKernelReserveVirtualRange",
@@ -603,6 +739,11 @@ pub fn register(registry: &HleRegistry) {
         "sceKernelDebugRaiseExceptionOnReleaseMode",
         hle_debug_raise_exception,
     );
+    registry.register(
+        "libkernel",
+        "sceKernelDebugWriteCppExceptionInfo",
+        hle_debug_write_cpp_exception_info,
+    );
     // Filesystem metadata. Path-based operations resolve through the same VFS
     // mounts as open/read/write; no title-specific path handling lives here.
     registry.register("libkernel", "sceKernelMkdir", hle_mkdir);
@@ -610,7 +751,6 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "sceKernelRmdir", hle_fs_enoent);
     registry.register("libkernel", "sceKernelStat", hle_stat);
     registry.register("libkernel", "sceKernelFstat", hle_fstat);
-    registry.register("libkernel", "sceKernelGetdents", hle_fs_enoent);
     // pthread surface libc/fmod touch during init — attr/priority/affinity
     // bookkeeping has no scheduler to talk to yet, so recording nothing and
     // returning success is faithful enough for a single-thread world.
@@ -662,6 +802,23 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register("libkernel", "getpid", hle_getpid);
     registry.register("libkernel", "sceKernelGetProcessId", hle_getpid);
+    registry.register("libkernel", "sceKernelGetGPI", hle_get_gpi);
+}
+
+/// `sceKernelGetGPI()`: read the General Purpose **Input** lines.
+///
+/// These are physical DIP switches that exist only on development kits; on a
+/// retail console there is nothing wired to them and the read is defined to
+/// come back zero. Returning 0 is therefore the **real retail behavior**, not a
+/// placeholder — cross-checked against shadPS4 (GPL-2.0-or-later), whose
+/// `sceKernelGetGPI` is likewise `return ORBIS_OK` under the comment "stubbed
+/// on non-devkit consoles" (`core/libraries/kernel/kernel.cpp:231`).
+///
+/// Measured: this is ASTRO.BOT's first hard stop (NID `0xe285d87bd5e69344`,
+/// encoded `4oXYe9Xmk0Q`), reached from its allocator-init path.
+fn hle_get_gpi(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    debug!("sceKernelGetGPI() -> 0 (no devkit GPI switches on retail)");
+    SCE_OK
 }
 
 /// The PS5 (Gen5) compiled-SDK version XPS5X reports: `0x09000000` == SDK
@@ -820,10 +977,48 @@ fn hle_map_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     if request_end > region_end {
         return SCE_KERNEL_ERROR_EINVAL;
     }
-    ctx.kernel
-        .memory
-        .record_mapping(direct_memory_start, len, prot);
-    if !ctx.mem.write(addr_out, &direct_memory_start.to_le_bytes()) {
+    let mut requested_bytes = [0u8; 8];
+    if !ctx.mem.read(addr_out, &mut requested_bytes) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    let requested = u64::from_le_bytes(requested_bytes);
+    let page_size = xps5x_core::PS5_PAGE_SIZE as u64;
+    if alignment != 0 && !alignment.is_power_of_two() {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let alignment = if alignment == 0 {
+        page_size
+    } else {
+        alignment.max(page_size)
+    };
+    // `direct_memory_start` is not an opaque physical token here:
+    // `sceKernelAllocateDirectMemory` hands the guest an address that
+    // `ctx.alloc.mmap` already committed, so the direct memory IS live arena
+    // memory at that address. Mapping it therefore means publishing that same
+    // address — allocating a fresh region instead would give the guest a view
+    // whose writes never reach the direct memory it allocated, and would leak
+    // when `sceKernelReleaseDirectMemory` released the physical range.
+    //
+    // Aliasing one physical range at a second, guest-chosen VA would need
+    // file-backed sections; plain reservations cannot do it. The API allows
+    // this: `addr` is a hint, and only `SCE_KERNEL_MAP_FIXED` demands it be
+    // honored, so a hint we cannot satisfy is declined rather than faked.
+    let mapped = direct_memory_start;
+    if mapped % alignment != 0 {
+        warn!(
+            "sceKernelMapDirectMemory: phys {mapped:#x} does not satisfy alignment {alignment:#x}"
+        );
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    if requested != 0 && requested != mapped {
+        warn!(
+            "sceKernelMapDirectMemory: ignoring address hint {requested:#x}; direct memory is \
+             published at its own address {mapped:#x} (hint is advisory without MAP_FIXED)"
+        );
+    }
+    ctx.kernel.memory.record_mapping(mapped, len, prot);
+    if !ctx.mem.write(addr_out, &mapped.to_le_bytes()) {
+        ctx.kernel.memory.remove_mapping(mapped);
         return SCE_KERNEL_ERROR_EFAULT;
     }
     SCE_OK
@@ -1293,9 +1488,8 @@ fn hle_convert_time_identity(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
-/// `sceKernelGetModuleInfoForUnwind` / `GetModuleInfoFromAddr`: no module
-/// metadata table is exposed to the guest yet. An honest ESRCH beats a
-/// half-filled info struct the unwinder would chase into the weeds.
+/// Module-info calls without an implemented ABI return ESRCH rather than
+/// exposing a half-filled structure the guest would chase into invalid memory.
 fn hle_module_info_unavailable(_ctx: &HleContext, args: &[u64]) -> u64 {
     warn!(
         "sceKernelGetModuleInfo*(addr={:#x}): module info not implemented — returning ESRCH",
@@ -1304,14 +1498,109 @@ fn hle_module_info_unavailable(_ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_KERNEL_ERROR_ESRCH
 }
 
+/// `sceKernelGetModuleInfoForUnwind(addr, flags, info)`.
+///
+/// The 304-byte Orbis ABI is `size`, a 256-byte name, then the exception
+/// header/table and first load-segment address/size. The caller initializes
+/// `size`; matching the kernel contract prevents writes into older, shorter
+/// structure revisions.
+fn hle_get_module_info_for_unwind(ctx: &HleContext, args: &[u64]) -> u64 {
+    const INFO_SIZE: usize = 304;
+    const NAME_OFFSET: usize = 8;
+    const NAME_SIZE: usize = 256;
+
+    let addr = args.first().copied().unwrap_or(0);
+    let flags = args.get(1).copied().unwrap_or(0);
+    let info_addr = args.get(2).copied().unwrap_or(0);
+    if flags >= 3 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    if info_addr == 0 {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    let mut caller_size = [0u8; 8];
+    if !ctx.mem.read(info_addr, &mut caller_size) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    if u64::from_le_bytes(caller_size) < INFO_SIZE as u64 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let Some(module) = ctx.kernel.unwind_module_for_addr(addr) else {
+        warn!("sceKernelGetModuleInfoForUnwind(addr={addr:#x}): no loaded ELF owns address");
+        return SCE_KERNEL_ERROR_ESRCH;
+    };
+
+    let mut info = [0u8; INFO_SIZE];
+    info[0..8].copy_from_slice(&(INFO_SIZE as u64).to_le_bytes());
+    let name = module.name.as_bytes();
+    let name_len = name.len().min(NAME_SIZE - 1);
+    info[NAME_OFFSET..NAME_OFFSET + name_len].copy_from_slice(&name[..name_len]);
+    info[264..272].copy_from_slice(&module.eh_frame_hdr_addr.to_le_bytes());
+    info[272..280].copy_from_slice(&module.eh_frame_addr.to_le_bytes());
+    info[280..288].copy_from_slice(&module.eh_frame_size.to_le_bytes());
+    info[288..296].copy_from_slice(&module.seg0_addr.to_le_bytes());
+    info[296..304].copy_from_slice(&module.seg0_size.to_le_bytes());
+    if !ctx.mem.write(info_addr, &info) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    debug!(
+        "sceKernelGetModuleInfoForUnwind({addr:#x}) -> {} [{:#x}, {:#x}) eh_frame={:#x}+{:#x}",
+        module.name, module.start, module.end, module.eh_frame_addr, module.eh_frame_size
+    );
+    SCE_OK
+}
+
 /// `sceKernelVirtualQuery(addr, flags, info, infoSize)`: no query surface
 /// yet; an honest EFAULT tells the caller nothing was written.
+#[allow(dead_code)]
 fn hle_virtual_query_stub(_ctx: &HleContext, args: &[u64]) -> u64 {
     warn!(
         "sceKernelVirtualQuery(addr={:#x}): not implemented — returning EFAULT",
         args.first().copied().unwrap_or(0)
     );
     SCE_KERNEL_ERROR_EFAULT
+}
+
+/// Return the mapped or reserved region containing `addr` (or the next
+/// region for flag bit 0) using the 72-byte Gen4/Gen5 query-info ABI.
+fn hle_virtual_query(ctx: &HleContext, args: &[u64]) -> u64 {
+    const INFO_SIZE: usize = 72;
+    const FIND_NEXT: i32 = 1;
+    const SCE_KERNEL_ERROR_EACCES: u64 = 0x8002_000D;
+
+    let address = args.first().copied().unwrap_or(0);
+    let flags = args.get(1).copied().unwrap_or(0) as i32;
+    let info = args.get(2).copied().unwrap_or(0);
+    let info_size = args.get(3).copied().unwrap_or(0);
+    if info == 0 || info_size < INFO_SIZE as u64 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let region = ctx.kernel.memory.region_containing(address).or_else(|| {
+        (flags & FIND_NEXT != 0)
+            .then(|| ctx.kernel.memory.region_at_or_after(address))
+            .flatten()
+    });
+    let Some(region) = region else {
+        return SCE_KERNEL_ERROR_EACCES;
+    };
+    let Some(end) = region.vaddr.checked_add(region.size) else {
+        return SCE_KERNEL_ERROR_EFAULT;
+    };
+
+    let mut payload = [0u8; INFO_SIZE];
+    payload[0..8].copy_from_slice(&region.vaddr.to_le_bytes());
+    payload[8..16].copy_from_slice(&end.to_le_bytes());
+    payload[24..28].copy_from_slice(&region.protection.bits().to_le_bytes());
+    if !region.protection.is_empty() {
+        payload[32] |= 0x10; // is_committed
+    }
+    let name = region.name.as_deref().unwrap_or("mapped").as_bytes();
+    let name_len = name.len().min(31);
+    payload[33..33 + name_len].copy_from_slice(&name[..name_len]);
+    if !ctx.mem.write(info, &payload) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    SCE_OK
 }
 
 /// `sceKernelCheckReachability(addr, ...)`: verify that the leading byte of
@@ -1348,12 +1637,14 @@ fn hle_reserve_virtual_range(ctx: &HleContext, args: &[u64]) -> u64 {
     if addr_inout == 0 || len == 0 {
         return SCE_KERNEL_ERROR_EINVAL;
     }
-    let Some(addr) = ctx.alloc.mmap(len, align) else {
-        warn!("sceKernelReserveVirtualRange: arena mmap failed (len={len:#x})");
+    let Some(addr) = ctx.alloc.reserve(len, align) else {
+        warn!("sceKernelReserveVirtualRange: address-space reservation failed (len={len:#x})");
         return HLE_ERROR;
     };
+    ctx.kernel.memory.record_mapping(addr, len, 0);
     if !ctx.mem.write(addr_inout, &addr.to_le_bytes()) {
         ctx.alloc.munmap(addr, len);
+        ctx.kernel.memory.remove_mapping(addr);
         return SCE_KERNEL_ERROR_EFAULT;
     }
     debug!("sceKernelReserveVirtualRange(len={len:#x}, align={align:#x}) -> {addr:#x}");
@@ -1368,6 +1659,23 @@ fn hle_debug_raise_exception(_ctx: &HleContext, args: &[u64]) -> u64 {
         "sceKernelDebugRaiseException(code={:#x}, arg={:#x}) — guest reported a fatal condition",
         args.first().copied().unwrap_or(0),
         args.get(1).copied().unwrap_or(0),
+    );
+    SCE_OK
+}
+
+/// `sceKernelDebugWriteCppExceptionInfo`: record C++ exception diagnostics.
+///
+/// This is a reporting sink used after the language runtime has already
+/// gathered its unwind state. The structure ABI is not public enough to
+/// inspect safely here, so keep the guest pointer opaque and log only the
+/// bounded register arguments supplied by the HLE dispatcher.
+fn hle_debug_write_cpp_exception_info(_ctx: &HleContext, args: &[u64]) -> u64 {
+    warn!(
+        "sceKernelDebugWriteCppExceptionInfo(info={:#x}, arg1={:#x}, arg2={:#x}, arg3={:#x})",
+        args.first().copied().unwrap_or(0),
+        args.get(1).copied().unwrap_or(0),
+        args.get(2).copied().unwrap_or(0),
+        args.get(3).copied().unwrap_or(0),
     );
     SCE_OK
 }
@@ -1749,6 +2057,123 @@ mod tests {
     use super::*;
     use crate::{GuestMemory, test_ctx};
 
+    #[test]
+    fn unwind_module_info_writes_the_complete_orbis_structure() {
+        let registry = HleRegistry::new();
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        kernel.set_unwind_modules(vec![xps5x_kernel::UnwindModuleInfo {
+            name: "libc.prx".to_string(),
+            start: 0x1000_0000,
+            end: 0x1010_0000,
+            eh_frame_hdr_addr: 0x100f_0000,
+            eh_frame_addr: 0x100d_0000,
+            eh_frame_size: 0x20_000,
+            seg0_addr: 0x1000_0000,
+            seg0_size: 0x90_000,
+        }]);
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert!(mem.write(0x100, &304u64.to_le_bytes()));
+
+        assert_eq!(
+            registry.call(
+                &ctx,
+                "libkernel",
+                "sceKernelGetModuleInfoForUnwind",
+                &[0x1000_1234, 0, 0x100]
+            ),
+            Some(SCE_OK)
+        );
+        let mut info = [0u8; 304];
+        assert!(mem.read(0x100, &mut info));
+        assert_eq!(u64::from_le_bytes(info[0..8].try_into().unwrap()), 304);
+        assert_eq!(&info[8..17], b"libc.prx\0");
+        assert_eq!(
+            u64::from_le_bytes(info[264..272].try_into().unwrap()),
+            0x100f_0000
+        );
+        assert_eq!(
+            u64::from_le_bytes(info[272..280].try_into().unwrap()),
+            0x100d_0000
+        );
+        assert_eq!(
+            u64::from_le_bytes(info[280..288].try_into().unwrap()),
+            0x20_000
+        );
+        assert_eq!(
+            u64::from_le_bytes(info[288..296].try_into().unwrap()),
+            0x1000_0000
+        );
+        assert_eq!(
+            u64::from_le_bytes(info[296..304].try_into().unwrap()),
+            0x90_000
+        );
+
+        assert!(mem.write(0x100, &303u64.to_le_bytes()));
+        assert_eq!(
+            registry.call(
+                &ctx,
+                "libkernel",
+                "sceKernelGetModuleInfoForUnwind",
+                &[0x1000_1234, 0, 0x100]
+            ),
+            Some(SCE_KERNEL_ERROR_EINVAL)
+        );
+        assert_eq!(
+            registry.call(
+                &ctx,
+                "libkernel",
+                "sceKernelGetModuleInfoForUnwind",
+                &[0x2000_0000, 0, 0x100]
+            ),
+            Some(SCE_KERNEL_ERROR_EINVAL),
+            "caller size validation happens before address lookup"
+        );
+    }
+
+    #[test]
+    fn dlsym_resolves_a_real_module_export_by_symbol_name() {
+        use sha1::{Digest, Sha1};
+        const SALT: [u8; 16] = [
+            0x51, 0x8D, 0x64, 0xA6, 0x35, 0xDE, 0xD8, 0xC1, 0xE6, 0xB0, 0x39, 0xB1, 0xC3, 0xE5,
+            0x52, 0x30,
+        ];
+        let mut hash = Sha1::new();
+        hash.update(b"CreateDecoder");
+        hash.update(SALT);
+        let digest = hash.finalize();
+        let nid = u64::from_le_bytes(digest[..8].try_into().unwrap());
+
+        let registry = HleRegistry::new();
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let handle = kernel.register_lle_module(
+            "plugin.prx".to_string(),
+            0x1000_0000,
+            0x10000,
+            None,
+            true,
+            [(nid, 0x1000_4321)],
+        );
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert!(mem.write(0x100, b"CreateDecoder\0"));
+
+        assert_eq!(
+            registry.call(
+                &ctx,
+                "libkernel",
+                "sceKernelDlsym",
+                &[handle as u64, 0x100, 0x200]
+            ),
+            Some(SCE_OK)
+        );
+        let mut out = [0u8; 8];
+        assert!(mem.read(0x200, &mut out));
+        assert_eq!(u64::from_le_bytes(out), 0x1000_4321);
+    }
+
     /// libc.prx's `module_start` registers its per-thread destructor hooks
     /// with the rtld before doing anything else — a missing
     /// `_sceKernelSetThreadDtors` was the exact wall a real title (Minecraft)
@@ -1877,6 +2302,7 @@ mod tests {
             ("libkernel", "sceKernelMapNamedDirectMemory"),
             ("libkernel", "sceKernelDebugRaiseException"),
             ("libkernel", "sceKernelDebugRaiseExceptionOnReleaseMode"),
+            ("libkernel", "sceKernelDebugWriteCppExceptionInfo"),
             ("libkernel", "sceKernelMkdir"),
             ("libkernel", "sceKernelUnlink"),
             ("libkernel", "sceKernelRmdir"),
@@ -1907,6 +2333,17 @@ mod tests {
                 "{lib}::{name} must be registered"
             );
         }
+
+        assert_eq!(
+            registry.call(
+                &ctx,
+                "libkernel",
+                "sceKernelDebugWriteCppExceptionInfo",
+                &[0x1234, 1, 2, 3]
+            ),
+            Some(SCE_OK),
+            "exception diagnostics must not replace the guest's unwind result"
+        );
 
         // __error hands out one stable guest errno slot the guest can write.
         let errno_addr = hle_error_addr(&ctx, &[]);
@@ -1973,7 +2410,26 @@ mod tests {
         );
         let mut reserved = [0u8; 8];
         assert!(mem.read(0x500, &mut reserved));
-        assert_ne!(u64::from_le_bytes(reserved), 0);
+        let reserved = u64::from_le_bytes(reserved);
+        assert_ne!(reserved, 0);
+
+        // The reservation is immediately visible through the real 72-byte
+        // VirtualQuery ABI, but is not committed until mapped.
+        assert_eq!(
+            hle_virtual_query(&ctx, &[reserved + 0x100, 0, 0x700, 72]),
+            SCE_OK
+        );
+        let mut query = [0u8; 72];
+        assert!(mem.read(0x700, &mut query));
+        assert_eq!(
+            u64::from_le_bytes(query[0..8].try_into().unwrap()),
+            reserved
+        );
+        assert_eq!(
+            u64::from_le_bytes(query[8..16].try_into().unwrap()),
+            reserved + 0x4000
+        );
+        assert_eq!(query[32] & 0x10, 0, "reservation is not committed");
 
         // The heap-API table pointer is recorded.
         assert_eq!(
@@ -2186,7 +2642,7 @@ mod tests {
     fn file_io_open_read_seek_close_against_a_real_host_file() {
         let kernel = xps5x_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
-        let alloc = crate::TestAllocator::new(0);
+        let alloc = crate::TestAllocator::new(0x800);
         let ctx = test_ctx(&kernel, &mem, &alloc);
 
         // Mount a temp dir at /app0/ and drop a real file in it.
@@ -2236,6 +2692,15 @@ mod tests {
         assert!(mem.write(0x300, b"/app0/nope.bin\0"));
         assert_eq!(hle_open(&ctx, &[0x300, 0, 0]) as i64, -2);
 
+        // Plain/POSIX open returns -1 and sets per-thread errno, whereas the
+        // sceKernel spelling returns the kernel error encoding directly.
+        assert_eq!(hle_posix_open(&ctx, &[0x300, 0, 0]) as i64, -1);
+        let errno = hle_error_addr(&ctx, &[]);
+        let mut errno_bytes = [0u8; 4];
+        assert!(mem.read(errno, &mut errno_bytes));
+        assert_eq!(i32::from_le_bytes(errno_bytes), 2);
+        assert_eq!(hle_sce_open(&ctx, &[0x300, 0, 0]), 0x8002_0002);
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -2252,12 +2717,24 @@ mod tests {
         assert!(mem.write(0x100, b"/app0\0"));
         let fd = hle_open(&ctx, &[0x100, 0, 0]);
         assert!((fd as i64) >= 3);
-        assert_eq!(hle_getdents(&ctx, &[fd, 0x400, 1024, 0x200]), 1024);
+        let registry = HleRegistry::new();
+        assert_eq!(
+            registry.call(
+                &ctx,
+                "libkernel",
+                "sceKernelGetdents",
+                &[fd, 0x400, 1024, 0x200]
+            ),
+            Some(512),
+            "the registry must retain the VFS handler rather than a later stub"
+        );
         let mut first = [0u8; 512];
         assert!(mem.read(0x400, &mut first));
-        assert_eq!(u16::from_le_bytes(first[4..6].try_into().unwrap()), 512);
+        let first_len = u16::from_le_bytes(first[4..6].try_into().unwrap()) as usize;
+        assert_eq!(first_len, 512);
         assert!(matches!(first[6], 4 | 8));
         assert_ne!(first[7], 0);
+        assert_eq!(hle_getdents(&ctx, &[fd, 0x400, 1024]), 512);
         assert_eq!(hle_getdents(&ctx, &[fd, 0x400, 1024]), 0);
         assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2584,6 +3061,54 @@ mod tests {
             Some(SCE_OK)
         );
         assert!(!kernel.memory.is_mapped(physical));
+    }
+
+    /// A mapped direct-memory range must stay the *same storage* the guest
+    /// allocated, so a write through the returned address is visible at the
+    /// physical address and vice versa. Publishing a freshly allocated region
+    /// instead would pass a naive "addr is non-zero" check while silently
+    /// giving the guest a view disconnected from its own direct memory.
+    #[test]
+    fn mapping_direct_memory_publishes_the_storage_that_was_allocated_not_a_fresh_region() {
+        let registry = HleRegistry::new();
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x10_0000);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(
+            registry.call(
+                &ctx,
+                "libkernel",
+                "sceKernelAllocateMainDirectMemory",
+                &[0x8000, 0x2000, 0, 0x100]
+            ),
+            Some(SCE_OK)
+        );
+        let mut bytes = [0u8; 8];
+        assert!(mem.read(0x100, &mut bytes));
+        let physical = u64::from_le_bytes(bytes);
+
+        // A non-zero hint is advisory without MAP_FIXED: it must not detach the
+        // mapping from the allocated direct memory.
+        let hint = physical + 0x4000;
+        assert!(mem.write(0x108, &hint.to_le_bytes()));
+        assert_eq!(
+            registry.call(
+                &ctx,
+                "libkernel",
+                "sceKernelMapNamedDirectMemory",
+                &[0x108, 0x8000, 0x32, 0, physical, 0x2000, 0]
+            ),
+            Some(SCE_OK)
+        );
+        assert!(mem.read(0x108, &mut bytes));
+        let mapped = u64::from_le_bytes(bytes);
+        assert_eq!(
+            mapped, physical,
+            "the mapping must publish the allocated direct memory itself"
+        );
+        assert!(kernel.memory.is_mapped(mapped));
     }
 
     #[test]

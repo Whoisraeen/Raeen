@@ -66,6 +66,107 @@ pub fn unorm8(color: [f32; 4]) -> [u8; 4] {
     color.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
+/// Everything one offscreen draw needs, with nothing hardcoded.
+///
+/// This is the parameter object [`render_draw`] takes so a caller can drive a
+/// draw from decoded PM4 register state instead of the fixture constants.
+/// `render_triangle_with_spirv` is now just a preset of this.
+#[derive(Debug, Clone)]
+pub struct DrawState<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub format: vk::Format,
+    pub clear_color: [f32; 4],
+    /// `[left, top, right, bottom]` in pixels.
+    pub scissor: [i32; 4],
+    /// `[x, y, width, height]` in pixels.
+    pub viewport: [f32; 4],
+    pub topology: vk::PrimitiveTopology,
+    pub cull_mode: vk::CullModeFlags,
+    /// Host vertex data, or `None` for a shader that synthesizes its own
+    /// geometry from `gl_VertexIndex` (Kyty's embedded VS does exactly this and
+    /// declares no input attributes, so binding one would be invalid).
+    pub vertices: Option<&'a [[f32; 4]]>,
+    pub vertex_count: u32,
+    pub vs_spirv: &'a [u32],
+    pub fs_spirv: &'a [u32],
+}
+
+impl<'a> DrawState<'a> {
+    /// A full-target viewport/scissor at `width` x `height`, no vertex buffer.
+    #[must_use]
+    pub fn new(width: u32, height: u32, vs_spirv: &'a [u32], fs_spirv: &'a [u32]) -> Self {
+        Self {
+            width,
+            height,
+            format: vk::Format::R8G8B8A8_UNORM,
+            clear_color: CLEAR_COLOR,
+            scissor: [0, 0, width as i32, height as i32],
+            viewport: [0.0, 0.0, width as f32, height as f32],
+            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+            cull_mode: vk::CullModeFlags::NONE,
+            vertices: None,
+            vertex_count: 0,
+            vs_spirv,
+            fs_spirv,
+        }
+    }
+}
+
+/// `RenderedImage` indexes pixels assuming 4 bytes each, so a format of any
+/// other size would silently corrupt the readback rather than fail.
+fn require_32bpp(format: vk::Format) -> Result<(), GpuError> {
+    match format {
+        vk::Format::R8G8B8A8_UNORM
+        | vk::Format::R8G8B8A8_SRGB
+        | vk::Format::B8G8R8A8_UNORM
+        | vk::Format::B8G8R8A8_SRGB => Ok(()),
+        other => Err(GpuError::VulkanInitFailed(format!(
+            "render target format {other:?} is not 32bpp; readback assumes {BYTES_PER_PIXEL} bytes per pixel"
+        ))),
+    }
+}
+
+/// Draw once offscreen from an explicit [`DrawState`] and read back the pixels.
+///
+/// # Errors
+///
+/// [`GpuError::VulkanInitFailed`] on a zero-sized or non-32bpp target or any
+/// resource/submission failure, [`GpuError::ShaderCompilationFailed`] on empty
+/// SPIR-V, [`GpuError::PipelineCreationFailed`] if the pipeline is rejected.
+pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<RenderedImage, GpuError> {
+    if state.width == 0 || state.height == 0 {
+        return Err(GpuError::VulkanInitFailed(format!(
+            "invalid render target size {}x{}",
+            state.width, state.height
+        )));
+    }
+    if state.vs_spirv.is_empty() || state.fs_spirv.is_empty() {
+        return Err(GpuError::ShaderCompilationFailed(
+            "vertex and fragment SPIR-V must be non-empty".to_owned(),
+        ));
+    }
+    require_32bpp(state.format)?;
+
+    let mut res = Resources::new(dev);
+    res.build(state)?;
+    res.record_and_submit(state)?;
+    let pixels = res.read_back(state.width, state.height)?;
+
+    info!(
+        width = state.width,
+        height = state.height,
+        vertices = state.vertex_count,
+        "offscreen draw rendered on {}",
+        dev.device_name()
+    );
+    Ok(RenderedImage {
+        width: state.width,
+        height: state.height,
+        pixels,
+    })
+}
+
 /// Draw one triangle offscreen at `width` x `height` and read back the pixels.
 ///
 /// # Errors
@@ -77,26 +178,34 @@ pub fn render_triangle(
     width: u32,
     height: u32,
 ) -> Result<RenderedImage, GpuError> {
-    if width == 0 || height == 0 {
-        return Err(GpuError::VulkanInitFailed(format!(
-            "invalid render target size {width}x{height}"
-        )));
-    }
-
-    let mut res = Resources::new(dev);
-    res.build(width, height)?;
-    res.record_and_submit(width, height)?;
-    let pixels = res.read_back(width, height)?;
-
-    info!(
-        "offscreen triangle rendered at {width}x{height} on {}",
-        dev.device_name()
-    );
-    Ok(RenderedImage {
+    render_triangle_with_spirv(
+        dev,
         width,
         height,
-        pixels,
-    })
+        &triangle_vertex_spirv(),
+        &triangle_fragment_spirv(),
+    )
+}
+
+/// Draw one triangle offscreen using caller-supplied SPIR-V modules.
+///
+/// Used by the M2 path (`kyty-graphics` SPIR-V) and by the hand-built smoke
+/// path via [`render_triangle`].
+pub fn render_triangle_with_spirv(
+    dev: &VulkanDevice,
+    width: u32,
+    height: u32,
+    vs_spirv: &[u32],
+    fs_spirv: &[u32],
+) -> Result<RenderedImage, GpuError> {
+    render_draw(
+        dev,
+        &DrawState {
+            vertices: Some(&TRIANGLE_VERTICES),
+            vertex_count: TRIANGLE_VERTICES.len() as u32,
+            ..DrawState::new(width, height, vs_spirv, fs_spirv)
+        },
+    )
 }
 
 /// Owns every Vulkan handle the draw needs.
@@ -145,19 +254,26 @@ impl<'a> Resources<'a> {
         self.dev.device()
     }
 
-    fn build(&mut self, width: u32, height: u32) -> Result<(), GpuError> {
-        self.create_render_target(width, height)?;
-        self.create_vertex_buffer()?;
-        self.create_readback_buffer(width, height)?;
-        self.create_pipeline()?;
+    fn build(&mut self, state: &DrawState) -> Result<(), GpuError> {
+        self.create_render_target(state.width, state.height, state.format)?;
+        if let Some(vertices) = state.vertices {
+            self.create_vertex_buffer(vertices)?;
+        }
+        self.create_readback_buffer(state.width, state.height)?;
+        self.create_pipeline(state)?;
         self.create_command_resources()?;
         Ok(())
     }
 
-    fn create_render_target(&mut self, width: u32, height: u32) -> Result<(), GpuError> {
+    fn create_render_target(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+    ) -> Result<(), GpuError> {
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_UNORM)
+            .format(format)
             .extent(vk::Extent3D {
                 width,
                 height,
@@ -201,7 +317,7 @@ impl<'a> Resources<'a> {
         let view_info = vk::ImageViewCreateInfo::default()
             .image(self.image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_UNORM)
+            .format(format)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
@@ -276,8 +392,13 @@ impl<'a> Resources<'a> {
         Ok((buffer, memory))
     }
 
-    fn create_vertex_buffer(&mut self) -> Result<(), GpuError> {
-        let size = mem::size_of_val(&TRIANGLE_VERTICES) as vk::DeviceSize;
+    fn create_vertex_buffer(&mut self, vertices: &[[f32; 4]]) -> Result<(), GpuError> {
+        let size = mem::size_of_val(vertices) as vk::DeviceSize;
+        if size == 0 {
+            return Err(GpuError::VulkanInitFailed(
+                "vertex buffer requested with no vertices".to_owned(),
+            ));
+        }
         let (buffer, memory) = self.create_buffer(
             size,
             vk::BufferUsageFlags::VERTEX_BUFFER,
@@ -303,7 +424,7 @@ impl<'a> Resources<'a> {
         // Vulkan guarantees.
         unsafe {
             let mut align = Align::new(ptr, mem::align_of::<[f32; 4]>() as u64, size);
-            align.copy_from_slice(&TRIANGLE_VERTICES);
+            align.copy_from_slice(vertices);
             self.device().unmap_memory(memory);
         }
         Ok(())
@@ -332,9 +453,9 @@ impl<'a> Resources<'a> {
             .map_err(|e| GpuError::ShaderCompilationFailed(format!("vkCreateShaderModule: {e}")))
     }
 
-    fn create_pipeline(&mut self) -> Result<(), GpuError> {
-        self.vertex_module = self.create_shader_module(&triangle_vertex_spirv())?;
-        self.fragment_module = self.create_shader_module(&triangle_fragment_spirv())?;
+    fn create_pipeline(&mut self, state: &DrawState) -> Result<(), GpuError> {
+        self.vertex_module = self.create_shader_module(state.vs_spirv)?;
+        self.fragment_module = self.create_shader_module(state.fs_spirv)?;
 
         let layout_info = vk::PipelineLayoutCreateInfo::default();
         // SAFETY: an empty layout — no descriptor sets or push constants.
@@ -354,7 +475,10 @@ impl<'a> Resources<'a> {
                 .name(c"main"),
         ];
 
-        // One vec4 attribute at location 0, matching the vertex shader.
+        // One vec4 attribute at location 0, matching the vertex shader — but
+        // only when the caller supplies vertices. A shader that builds its
+        // geometry from `gl_VertexIndex` declares no inputs, and binding an
+        // attribute it never consumes is invalid.
         let bindings = [vk::VertexInputBindingDescription::default()
             .binding(0)
             .stride(mem::size_of::<[f32; 4]>() as u32)
@@ -364,12 +488,16 @@ impl<'a> Resources<'a> {
             .binding(0)
             .format(vk::Format::R32G32B32A32_SFLOAT)
             .offset(0)];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-            .vertex_binding_descriptions(&bindings)
-            .vertex_attribute_descriptions(&attributes);
+        let vertex_input = if state.vertices.is_some() {
+            vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(&bindings)
+                .vertex_attribute_descriptions(&attributes)
+        } else {
+            vk::PipelineVertexInputStateCreateInfo::default()
+        };
 
-        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let input_assembly =
+            vk::PipelineInputAssemblyStateCreateInfo::default().topology(state.topology);
 
         // Viewport and scissor are dynamic, set during recording.
         let viewport_state = vk::PipelineViewportStateCreateInfo::default()
@@ -378,9 +506,7 @@ impl<'a> Resources<'a> {
 
         let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
-            // No culling: the test asserts on coverage, not winding order, and
-            // this keeps the result independent of vertex order.
-            .cull_mode(vk::CullModeFlags::NONE)
+            .cull_mode(state.cull_mode)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .line_width(1.0);
 
@@ -399,7 +525,7 @@ impl<'a> Resources<'a> {
 
         // Vulkan 1.3 dynamic rendering: the pipeline declares the attachment
         // formats directly instead of referencing a VkRenderPass.
-        let color_formats = [vk::Format::R8G8B8A8_UNORM];
+        let color_formats = [state.format];
         let mut rendering_info =
             vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
 
@@ -499,7 +625,8 @@ impl<'a> Resources<'a> {
         }
     }
 
-    fn record_and_submit(&mut self, width: u32, height: u32) -> Result<(), GpuError> {
+    fn record_and_submit(&mut self, state: &DrawState) -> Result<(), GpuError> {
+        let (width, height) = (state.width, state.height);
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
@@ -524,7 +651,7 @@ impl<'a> Resources<'a> {
 
         let clear = vk::ClearValue {
             color: vk::ClearColorValue {
-                float32: CLEAR_COLOR,
+                float32: state.clear_color,
             },
         };
         let color_attachment = vk::RenderingAttachmentInfo::default()
@@ -545,20 +672,36 @@ impl<'a> Resources<'a> {
             .color_attachments(&color_attachments);
 
         let viewports = [vk::Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: width as f32,
-            height: height as f32,
+            x: state.viewport[0],
+            y: state.viewport[1],
+            width: state.viewport[2],
+            height: state.viewport[3],
             min_depth: 0.0,
             max_depth: 1.0,
         }];
-        let scissors = [render_area];
+
+        // Clamp the register-supplied scissor into the attachment: Vulkan
+        // rejects a scissor that leaves the render area, and a guest is free to
+        // program one that does.
+        let [sl, st, sr, sb] = state.scissor;
+        let sl = sl.clamp(0, width as i32);
+        let st = st.clamp(0, height as i32);
+        let sr = sr.clamp(sl, width as i32);
+        let sb = sb.clamp(st, height as i32);
+        let scissors = [vk::Rect2D {
+            offset: vk::Offset2D { x: sl, y: st },
+            extent: vk::Extent2D {
+                width: (sr - sl) as u32,
+                height: (sb - st) as u32,
+            },
+        }];
 
         // SAFETY: all handles below belong to this device and are live; the
-        // command buffer is recording; the vertex buffer holds 3 vertices,
-        // matching the `draw(3, ...)` call; the pipeline's attachment format
-        // matches the image view's. `cmd_begin_rendering` is core in Vulkan
-        // 1.3 and `dynamicRendering` was required at device selection.
+        // command buffer is recording; the vertex buffer (when bound) holds
+        // exactly `state.vertex_count` vertices, matching the draw; the
+        // pipeline's attachment format matches the image view's.
+        // `cmd_begin_rendering` is core in Vulkan 1.3 and `dynamicRendering`
+        // was required at device selection.
         unsafe {
             let d = self.device();
             d.cmd_begin_rendering(self.command_buffer, &rendering_info);
@@ -569,8 +712,10 @@ impl<'a> Resources<'a> {
             );
             d.cmd_set_viewport(self.command_buffer, 0, &viewports);
             d.cmd_set_scissor(self.command_buffer, 0, &scissors);
-            d.cmd_bind_vertex_buffers(self.command_buffer, 0, &[self.vertex_buffer], &[0]);
-            d.cmd_draw(self.command_buffer, TRIANGLE_VERTICES.len() as u32, 1, 0, 0);
+            if state.vertices.is_some() {
+                d.cmd_bind_vertex_buffers(self.command_buffer, 0, &[self.vertex_buffer], &[0]);
+            }
+            d.cmd_draw(self.command_buffer, state.vertex_count, 1, 0, 0);
             d.cmd_end_rendering(self.command_buffer);
         }
 

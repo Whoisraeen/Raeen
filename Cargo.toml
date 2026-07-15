@@ -111,6 +111,7 @@ xps5x-hle = { path = "crates/xps5x-hle" }
 xps5x-gui = { path = "crates/xps5x-gui" }
 xps5x-firmware = { path = "crates/xps5x-firmware" }
 xps5x-runtime = { path = "crates/xps5x-runtime" }
+kyty-graphics = { path = "crates/kyty-graphics" }
 
 [profile.release]
 lto = "thin"
