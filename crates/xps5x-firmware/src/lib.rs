@@ -146,6 +146,16 @@ struct DecodedModule {
     dynlib: dynlib::DynlibData,
 }
 
+/// A dependency decoded and placed in pass 1, awaiting linking in pass 2.
+struct PendingDep {
+    name: String,
+    /// Image offset within the composed process image.
+    offset: u64,
+    /// Absolute guest base (`process base + offset`).
+    base: u64,
+    decoded: DecodedModule,
+}
+
 /// A per-process stack-protector canary: derived from
 /// [`std::collections::hash_map::RandomState`]'s per-process random keys (no
 /// new dependency), low byte forced to zero (glibc's "terminator canary"
@@ -298,8 +308,21 @@ fn find_dependency_file(dir: &std::path::Path, needed: &str) -> Option<std::path
 /// single image) needs no changes: the main module sits at offset 0 and each
 /// dependency at a 16 KiB-aligned offset above it. `link_module` already takes
 /// a base, so each module is relocated for `base + its offset`, and its exports
-/// are registered at their **absolute** address. Dependencies are linked first
-/// so their exports exist before the main module resolves against them.
+/// are registered at their **absolute** address.
+///
+/// # Two passes, and why it must be two
+///
+/// **Every** module's exports are registered (pass 1) before **any** module is
+/// linked (pass 2). A linker can only resolve what is already registered, so a
+/// single interleaved pass silently makes resolution depend on `DT_NEEDED`
+/// order — and the dependency graph is not a list. Measured on the retail
+/// title, whose order is `libcohtml, libRenoirCore, libfmod, libc`: libcohtml
+/// is linked first but imports heavily from libc, which is loaded last, so its
+/// imports were stubbed for no reason but ordering. Re-linking once every
+/// export exists drops libcohtml 886 -> 47 unresolved, libRenoirCore 108 -> 2,
+/// libfmod 85 -> 49 — roughly 980 slots that held an unresolved-stub address
+/// where a real export belonged. Those are live wrong pointers in guest memory,
+/// not a reporting artifact.
 ///
 /// A `DT_NEEDED` that is HLE-covered is deliberately **not** file-loaded (the
 /// HLE implementation is preferred and is what `libc`/`libkernel`/`libSce*`
@@ -336,6 +359,8 @@ pub fn load_process(
     let mut next_offset = align_up_16k(dynlib::linker::image_size(&module)? as u64);
     let mut dependencies = Vec::new();
     let mut dep_images: Vec<(u64, Vec<u8>)> = Vec::new();
+    // Decoded and placed in pass 1, linked in pass 2 (see "Two passes" above).
+    let mut pending: Vec<PendingDep> = Vec::new();
 
     // ONE set of marker tables for the whole process. Every module's HLE
     // trampolines and unresolved stubs are allocated from these, so an index
@@ -396,10 +421,9 @@ pub fn load_process(
                 continue;
             }
         };
-        let dep_base = base.wrapping_add(next_offset);
-
-        // Parse once, register the exports at their ABSOLUTE address, then link
-        // with the process-wide `tables`. (This deliberately does not go through
+        // Parse once, register the exports at their ABSOLUTE address. Linking
+        // happens in a SECOND pass, once EVERY module's exports exist — see the
+        // "Two passes" section above. (This deliberately does not go through
         // `load_module`: that allocates private marker tables — the aliasing bug
         // above — and registers exports module-relative, which is only correct
         // for a module based at 0, forcing a second parse to fix up.)
@@ -410,38 +434,53 @@ pub fn load_process(
                 continue;
             }
         };
-        registry.register_module_exports_at(needed, &dep.dynlib.exports, dep_base);
 
+        let dep_base = base.wrapping_add(next_offset);
+        let image_len = dynlib::linker::image_size(&dep.module)? as u64;
+        registry.register_module_exports_at(needed, &dep.dynlib.exports, dep_base);
+        tracing::info!(
+            "NEEDED {needed}: at +{next_offset:#x} ({image_len:#x} bytes), {} export(s) registered",
+            dep.dynlib.exports.len()
+        );
+
+        pending.push(PendingDep {
+            name: needed.clone(),
+            offset: next_offset,
+            base: dep_base,
+            decoded: dep,
+        });
+        next_offset = align_up_16k(next_offset + image_len);
+    }
+
+    // PASS 2: every export in the process is now registered, so each module can
+    // resolve against all the others regardless of DT_NEEDED order.
+    for p in &pending {
         let linked = match dynlib::linker::link_module_into(
-            &dep.module,
-            &dep.dynlib,
+            &p.decoded.module,
+            &p.decoded.dynlib,
             registry,
             hle,
-            dep_base,
+            p.base,
             &mut tables,
         ) {
             Ok(l) => l,
             Err(e) => {
-                tracing::warn!("NEEDED {needed}: failed to link ({e}) — skipping");
+                tracing::warn!("NEEDED {}: failed to link ({e}) — skipping", p.name);
                 continue;
             }
         };
-
-        let len = linked.image.len() as u64;
         tracing::info!(
-            "NEEDED {needed}: loaded at +{next_offset:#x} ({len:#x} bytes), {} export(s), \
-             {} of its own import(s) unresolved",
-            dep.dynlib.exports.len(),
+            "NEEDED {}: linked, {} of its own import(s) unresolved",
+            p.name,
             linked.unresolved.len()
         );
         dependencies.push(LoadedDependency {
-            name: needed.clone(),
-            image_offset: next_offset,
-            exports: dep.dynlib.exports.len(),
+            name: p.name.clone(),
+            image_offset: p.offset,
+            exports: p.decoded.dynlib.exports.len(),
             unresolved: linked.unresolved.len(),
         });
-        dep_images.push((next_offset, linked.image));
-        next_offset = align_up_16k(next_offset + len);
+        dep_images.push((p.offset, linked.image));
     }
 
     // Now the main module, with every dependency's exports already registered —
