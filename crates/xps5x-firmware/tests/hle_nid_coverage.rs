@@ -73,6 +73,61 @@ fn libsce_posix_names_resolve_the_nids_the_real_title_asked_for() {
     }
 }
 
+/// Building the NID database from the **real** HLE registry must give the same
+/// answer every time, however the names arrive.
+///
+/// This is the end-to-end version of the determinism fix.
+/// `HleRegistry::registered_names()` walks a `DashMap`, so its order is not
+/// stable between runs — and with the old "first-inserted wins" the winner for
+/// a name registered under two libraries flipped. Measured on the real title
+/// before the fix: 10 of the 11 duplicated names resolved *both ways* across
+/// two runs minutes apart, silently changing which implementation a guest
+/// import dispatched to.
+///
+/// Shuffling here stands in for that instability deterministically, so the test
+/// cannot pass by luck of the map's ordering.
+#[test]
+fn the_real_nid_database_is_identical_however_the_names_are_ordered() {
+    let hle = HleRegistry::new();
+    let names = hle.registered_names();
+    assert!(
+        names.len() > 100,
+        "expected a substantial HLE surface, got {}",
+        names.len()
+    );
+
+    let baseline = NidDatabase::from_hle_names(names.clone());
+
+    // A few deterministic permutations: reversed, rotated, and sorted.
+    let mut permutations: Vec<Vec<(String, String)>> = Vec::new();
+    permutations.push(names.iter().cloned().rev().collect());
+    let mut rotated = names.clone();
+    rotated.rotate_left(names.len() / 3);
+    permutations.push(rotated);
+    let mut sorted = names.clone();
+    sorted.sort();
+    permutations.push(sorted);
+
+    for (i, perm) in permutations.into_iter().enumerate() {
+        let db = NidDatabase::from_hle_names(perm);
+        assert_eq!(
+            db.len(),
+            baseline.len(),
+            "permutation {i} changed the database size"
+        );
+        // Every name in the set must resolve to the same winner.
+        for (_, function) in &names {
+            let nid = nid_of(function);
+            assert_eq!(
+                db.resolve(nid),
+                baseline.resolve(nid),
+                "permutation {i} changed the winner for {function:?} — resolution is \
+                 order-dependent again"
+            );
+        }
+    }
+}
+
 /// End to end through the real resolver: the exact NID the title requested must
 /// come back as an HLE hit, not `Unresolved`.
 #[test]

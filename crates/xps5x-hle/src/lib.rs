@@ -267,6 +267,52 @@ impl HleRegistry {
             })
             .collect()
     }
+
+    /// Function names registered under more than one library whose
+    /// registrations do **not** all share the same implementation.
+    ///
+    /// # Why this matters
+    ///
+    /// A NID hashes the function **name** alone, so `libSceJson::X` and
+    /// `libSceJson2::X` are indistinguishable to `NidDatabase`/`ModuleRegistry`
+    /// — one of them wins and the other is unreachable. That is harmless only
+    /// while both register the *same* implementation, which is true today
+    /// (measured: 11 duplicated names, all sharing an implementation).
+    ///
+    /// The day someone gives two same-named functions different bodies, a guest
+    /// importing from one library will silently run the other's code. This
+    /// surfaces that as data instead of leaving it to be discovered by a
+    /// mis-executing game — see the `duplicate_names_share_one_implementation`
+    /// test, and `xps5x_firmware`'s `NidDatabase::from_hle_names` docs for the
+    /// fix if it ever fires (resolution must then key on the library too).
+    pub fn duplicate_name_conflicts(&self) -> Vec<String> {
+        let mut by_function: std::collections::HashMap<String, Vec<(String, usize)>> =
+            std::collections::HashMap::new();
+        for entry in self.functions.iter() {
+            let Some((library, function)) = entry.key().split_once("::") else {
+                continue;
+            };
+            by_function
+                .entry(function.to_string())
+                .or_default()
+                .push((library.to_string(), *entry.value() as usize));
+        }
+
+        let mut conflicts: Vec<String> = by_function
+            .into_iter()
+            .filter_map(|(function, regs)| {
+                let first = regs.first()?.1;
+                if regs.iter().all(|(_, addr)| *addr == first) {
+                    return None;
+                }
+                let mut libs: Vec<&str> = regs.iter().map(|(l, _)| l.as_str()).collect();
+                libs.sort_unstable();
+                Some(format!("{function} (in {})", libs.join(", ")))
+            })
+            .collect();
+        conflicts.sort();
+        conflicts
+    }
 }
 
 impl Default for HleRegistry {
@@ -457,5 +503,57 @@ mod tests {
             names,
             vec![("libFoo".to_string(), "someFunction".to_string())]
         );
+    }
+
+    /// **A NID cannot tell two libraries apart.** It hashes the function name
+    /// alone, so if the same name is registered under several libraries they
+    /// share one NID and exactly one of them is reachable — whichever
+    /// `NidDatabase` picks.
+    ///
+    /// That is safe only while every such registration runs the same code, and
+    /// today it does (`libSceJson`/`libSceJson2` register from one loop; both
+    /// `sceNpGameIntentInitialize` registrations are `hle_ok`;
+    /// `libkernel`/`libScePosix` `getpid` share `hle_getpid`).
+    ///
+    /// If this test fails, someone gave two same-named functions different
+    /// bodies, and a guest importing from one library is now silently running
+    /// the other's. Do NOT "fix" it by renaming: make resolution key on the
+    /// library too — the import symbol carries a `library_index`, and
+    /// `xps5x_firmware`'s `NidDatabase::from_hle_names` documents the change.
+    #[test]
+    fn duplicate_names_share_one_implementation() {
+        let registry = HleRegistry::new();
+        let conflicts = registry.duplicate_name_conflicts();
+        assert!(
+            conflicts.is_empty(),
+            "these function names are registered under multiple libraries with DIFFERENT \
+             implementations, but resolution is by NID (= the name alone), so one of each pair \
+             is unreachable and guests will silently run the wrong one: {conflicts:#?}"
+        );
+    }
+
+    /// The detector must actually detect — otherwise the test above passes
+    /// vacuously and pins nothing.
+    #[test]
+    fn duplicate_name_conflicts_flags_a_genuine_divergence() {
+        fn a(_ctx: &HleContext, _args: &[u64]) -> u64 {
+            1
+        }
+        fn b(_ctx: &HleContext, _args: &[u64]) -> u64 {
+            2
+        }
+        let registry = HleRegistry {
+            functions: DashMap::new(),
+        };
+        // Same name, two libraries, SAME impl -> not a conflict.
+        registry.register("libOne", "shared", a);
+        registry.register("libTwo", "shared", a);
+        // Same name, two libraries, DIFFERENT impls -> a conflict.
+        registry.register("libOne", "diverged", a);
+        registry.register("libTwo", "diverged", b);
+
+        let conflicts = registry.duplicate_name_conflicts();
+        assert_eq!(conflicts.len(), 1, "got {conflicts:#?}");
+        assert!(conflicts[0].starts_with("diverged (in libOne, libTwo)"));
     }
 }
