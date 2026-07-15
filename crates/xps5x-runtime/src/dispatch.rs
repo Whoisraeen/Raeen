@@ -44,7 +44,6 @@
 //! unchanged.
 
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, Ordering};
 use std::cell::Cell;
 use std::sync::Mutex;
 
@@ -188,10 +187,25 @@ struct ActiveContext {
     exited: Cell<bool>,
 }
 
-/// `AtomicPtr<T>` is `Send + Sync` regardless of `T` — see `CALL_LOCK`'s doc
-/// comment for why non-concurrent, single-thread-only access to the pointee
-/// is guaranteed here despite that.
-static ACTIVE_CONTEXT: AtomicPtr<ActiveContext> = AtomicPtr::new(ptr::null_mut());
+thread_local! {
+    /// The active-call context [`veh_callback`] consults, held **per OS
+    /// thread** (M1-E step 1, spec §6): the VEH is process-wide but runs
+    /// synchronously on the faulting thread, so each thread's fault must find
+    /// *its own* in-flight `run` call's context. `run` sets this to its
+    /// stack-local `&ctx` before entering the guest and clears it to null
+    /// after — a thread that faults with no guest call in flight (null slot)
+    /// falls through with `EXCEPTION_CONTINUE_SEARCH`.
+    ///
+    /// `const`-initialized to a null `Cell` (spec §6 I4): no lazy `Once`, no
+    /// `Drop`, so even a first touch inside the VEH (an unrelated access
+    /// violation on a thread that never ran guest code, hitting the
+    /// process-wide handler) is a cheap, non-allocating pointer read. Today
+    /// exactly one guest call is ever in flight (`CALL_LOCK` still serializes
+    /// all execution); this per-thread form is the substrate a real second
+    /// guest thread will use — the pointee is only ever touched synchronously
+    /// on the owning thread, so a plain `Cell` (not an atomic) is correct.
+    static ACTIVE_CONTEXT: Cell<*mut ActiveContext> = const { Cell::new(ptr::null_mut()) };
+}
 
 /// Call the guest — via `call_guest`, invoked exactly once — servicing any
 /// HLE trampoline calls it makes via a VEH for the duration of the call
@@ -310,10 +324,7 @@ pub(crate) unsafe fn run(
 
     // `ctx` is a local; its address is stable for the rest of this function
     // (never moved), which is exactly the lifetime the VEH needs it for.
-    ACTIVE_CONTEXT.store(
-        &ctx as *const ActiveContext as *mut ActiveContext,
-        Ordering::Release,
-    );
+    ACTIVE_CONTEXT.with(|slot| slot.set(&ctx as *const ActiveContext as *mut ActiveContext));
 
     // RT2c-b (design doc §3): if a guest TCB was set up and FSGSBASE is
     // available, capture the current FS base into `ctx.orig_fsbase` —
@@ -429,7 +440,7 @@ pub(crate) unsafe fn run(
         }
     }
 
-    ACTIVE_CONTEXT.store(ptr::null_mut(), Ordering::Release);
+    ACTIVE_CONTEXT.with(|slot| slot.set(ptr::null_mut()));
     // SAFETY: `handle` is exactly the handle `AddVectoredExceptionHandler`
     // returned above, removed exactly once.
     unsafe {
@@ -475,7 +486,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    let ctx_ptr = ACTIVE_CONTEXT.load(Ordering::Acquire);
+    let ctx_ptr = ACTIVE_CONTEXT.with(|slot| slot.get());
     if ctx_ptr.is_null() {
         // No execute_linked call is in flight (or we're outside its guarded
         // window) — not ours to handle.
