@@ -69,6 +69,65 @@ pub fn register(registry: &HleRegistry) {
         "scePthreadRwlockattrDestroy",
         hle_rwlockattr_ok,
     );
+
+    register_posix(registry);
+}
+
+/// Register the **POSIX** spellings of the same functions, under `libScePosix`.
+///
+/// # Why both spellings are needed
+///
+/// A NID hashes the function **name** alone, so `pthread_mutex_lock` and
+/// `scePthreadMutexLock` are entirely different symbols with different NIDs.
+/// Implementing only the Sony spelling leaves the POSIX one unresolved — and a
+/// real title imports the POSIX ones: the measured retail eboot imports
+/// `pthread_mutex_lock` and friends from `libScePosix`, and does **not** import
+/// `scePthreadMutexLock` at all.
+///
+/// # Why aliasing is honest here (and not everywhere)
+///
+/// These implementations already use the POSIX convention — `0` on success, a
+/// **positive** `errno` on failure (`EPERM`/`EDEADLK`/`EBUSY`/`EINVAL` above) —
+/// which is exactly what `pthread_*` returns. So the same function pointer is
+/// correct for both names with no conversion.
+///
+/// Deliberately **not** aliased, because no honest mapping exists yet:
+///
+/// * `pthread_create` / `pthread_join` / `pthread_detach` — XPS5X has no second
+///   guest execution context (M1-E). The existing `hle_pthread_create` returns
+///   `1`, which under this ABI reads as `EPERM`, and never writes the out-param.
+///   Wiring the POSIX name to it would swap a loud, self-identifying fault for a
+///   guest that silently believes thread creation failed — or livelocks waiting
+///   on a worker that never runs. An unresolved import names itself; a wrong
+///   return value does not.
+/// * `pthread_cond_*` / `pthread_condattr_*` — no implementation exists.
+/// * `sem_*` — POSIX semaphores are address-based; `kernel_semaphore`'s are
+///   handle-based. Different objects, not a rename.
+fn register_posix(registry: &HleRegistry) {
+    registry.register("libScePosix", "pthread_mutex_init", hle_mutex_init);
+    registry.register("libScePosix", "pthread_mutex_destroy", hle_mutex_destroy);
+    registry.register("libScePosix", "pthread_mutex_lock", hle_mutex_lock);
+    registry.register("libScePosix", "pthread_mutex_trylock", hle_mutex_trylock);
+    registry.register("libScePosix", "pthread_mutex_unlock", hle_mutex_unlock);
+    registry.register("libScePosix", "pthread_mutexattr_init", hle_mutexattr_init);
+    registry.register(
+        "libScePosix",
+        "pthread_mutexattr_destroy",
+        hle_mutexattr_destroy,
+    );
+    registry.register(
+        "libScePosix",
+        "pthread_mutexattr_settype",
+        hle_mutexattr_settype,
+    );
+
+    registry.register("libScePosix", "pthread_rwlock_init", hle_rwlock_init);
+    registry.register("libScePosix", "pthread_rwlock_destroy", hle_rwlock_destroy);
+    registry.register("libScePosix", "pthread_rwlock_rdlock", hle_rwlock_rdlock);
+    registry.register("libScePosix", "pthread_rwlock_tryrdlock", hle_rwlock_rdlock);
+    registry.register("libScePosix", "pthread_rwlock_wrlock", hle_rwlock_wrlock);
+    registry.register("libScePosix", "pthread_rwlock_trywrlock", hle_rwlock_wrlock);
+    registry.register("libScePosix", "pthread_rwlock_unlock", hle_rwlock_unlock);
 }
 
 /// Normalize a caller-supplied mutex type to a known value (default: normal,

@@ -25,6 +25,18 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadKeyDelete", hle_key_delete);
     registry.register("libkernel", "scePthreadSetspecific", hle_setspecific);
     registry.register("libkernel", "scePthreadGetspecific", hle_getspecific);
+
+    // The POSIX spellings are DIFFERENT symbols (a NID hashes the name alone)
+    // and are what a real title imports — the measured eboot imports
+    // `pthread_key_create`/`pthread_getspecific` from `libScePosix` and never
+    // mentions the `scePthread*` forms. The signatures match exactly:
+    // `pthread_getspecific(key)` returns the value (see `hle_getspecific`'s
+    // "the value is the return value, per the ABI"), and the others return 0 or
+    // a positive errno like POSIX.
+    registry.register("libScePosix", "pthread_key_create", hle_key_create);
+    registry.register("libScePosix", "pthread_key_delete", hle_key_delete);
+    registry.register("libScePosix", "pthread_setspecific", hle_setspecific);
+    registry.register("libScePosix", "pthread_getspecific", hle_getspecific);
 }
 
 /// `scePthreadKeyCreate(pthread_key_t *key, destructor)`: allocate a key and

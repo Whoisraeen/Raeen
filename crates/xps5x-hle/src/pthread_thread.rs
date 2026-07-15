@@ -26,6 +26,19 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadGetthreadid", hle_getthreadid);
     registry.register("libkernel", "scePthreadYield", hle_yield);
     registry.register("libkernel", "scePthreadRename", hle_rename);
+
+    // POSIX spellings — different NIDs, same semantics, and these are the ones
+    // a real title imports (from `libScePosix`). `pthread_self` returns the
+    // thread handle and `pthread_equal` a boolean, exactly as the `sce*` forms
+    // do; `sched_yield` returns 0 like `scePthreadYield`.
+    //
+    // `pthread_create`/`pthread_join` are deliberately NOT registered — there
+    // is no second guest execution context yet, and answering them with a fake
+    // success would turn a loud, self-naming fault into a silent livelock. See
+    // `pthread_sync::register_posix` for the full reasoning.
+    registry.register("libScePosix", "pthread_self", hle_self);
+    registry.register("libScePosix", "pthread_equal", hle_equal);
+    registry.register("libScePosix", "sched_yield", hle_yield);
 }
 
 /// `scePthreadSelf()`: the calling thread's handle (the one guest thread).

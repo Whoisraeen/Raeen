@@ -21,6 +21,8 @@ const ATTR_OBJECT_SIZE: u64 = 0x40;
 
 /// Register the pthread thread-attribute HLE functions.
 pub fn register(registry: &HleRegistry) {
+    register_posix(registry);
+
     registry.register("libkernel", "scePthreadAttrInit", hle_attr_init);
     registry.register("libkernel", "scePthreadAttrDestroy", hle_attr_destroy);
     registry.register(
@@ -41,6 +43,47 @@ pub fn register(registry: &HleRegistry) {
         "libkernel",
         "scePthreadAttrSetschedpolicy",
         hle_set_schedpolicy,
+    );
+}
+
+/// The POSIX spellings, under `libScePosix`.
+///
+/// Different NIDs from the `scePthread*` forms (a NID hashes the name alone),
+/// and these are the ones a real title imports. Same signatures and the same
+/// POSIX return convention (0 / positive errno), so the implementations alias
+/// directly.
+fn register_posix(registry: &HleRegistry) {
+    registry.register("libScePosix", "pthread_attr_init", hle_attr_init);
+    registry.register("libScePosix", "pthread_attr_destroy", hle_attr_destroy);
+    registry.register(
+        "libScePosix",
+        "pthread_attr_setdetachstate",
+        hle_set_detachstate,
+    );
+    registry.register(
+        "libScePosix",
+        "pthread_attr_getdetachstate",
+        hle_get_detachstate,
+    );
+    registry.register(
+        "libScePosix",
+        "pthread_attr_setstacksize",
+        hle_set_stacksize,
+    );
+    registry.register(
+        "libScePosix",
+        "pthread_attr_getstacksize",
+        hle_get_stacksize,
+    );
+    registry.register(
+        "libScePosix",
+        "pthread_attr_setguardsize",
+        hle_set_guardsize,
+    );
+    registry.register(
+        "libScePosix",
+        "pthread_attr_getguardsize",
+        hle_get_guardsize,
     );
 }
 

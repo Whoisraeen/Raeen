@@ -171,6 +171,72 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Diagnostic: `xps5x --missing-nids <eboot.bin>` loads a title exactly as
+    // `--run-eboot` does but stops before executing, and prints every DISTINCT
+    // import nothing resolves — encoded NID, raw NID, and library — grouped by
+    // library and ranked.
+    //
+    // This exists because a NID is a one-way hash: "352 unresolved" is a number
+    // nobody can act on, while `n88vx3C5nW8 (libScePosix)` can be brute-forced
+    // back to `gettimeofday` and implemented. It is the input to sizing the
+    // remaining HLE work at all.
+    if let Some(pos) = args.iter().position(|a| a == "--missing-nids") {
+        let path = args
+            .get(pos + 1)
+            .ok_or_else(|| anyhow::anyhow!("--missing-nids requires a path to an eboot.bin"))?;
+        let bytes = std::fs::read(path)?;
+        let hle = xps5x_hle::HleRegistry::new();
+        let db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
+        let mut registry = xps5x_firmware::ModuleRegistry::new(db);
+        let dir = std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let process = xps5x_firmware::load_process(
+            &bytes,
+            dir,
+            &xps5x_firmware::NoKeysProvider,
+            &mut registry,
+            &hle,
+            xps5x_runtime::GUEST_ARENA_BASE,
+        )?;
+
+        use std::collections::BTreeMap;
+        let mut by_lib: BTreeMap<&str, Vec<&xps5x_firmware::UnresolvedStub>> = BTreeMap::new();
+        for s in &process.linked.unresolved_stubs {
+            by_lib
+                .entry(s.library.as_deref().unwrap_or("<unknown library>"))
+                .or_default()
+                .push(s);
+        }
+        let mut ranked: Vec<_> = by_lib.into_iter().collect();
+        ranked.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+
+        println!(
+            "# {} distinct unresolved import NID(s) across {} librar(ies)",
+            process.linked.unresolved_stubs.len(),
+            ranked.len()
+        );
+        println!("# encoded_nid  nid  library");
+        for (lib, stubs) in ranked {
+            println!("\n## {lib}  ({} missing)", stubs.len());
+            let mut rows: Vec<String> = stubs
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{}  {:#018x}  {lib}",
+                        xps5x_firmware::dynlib::nid::encode_nid(s.nid),
+                        s.nid
+                    )
+                })
+                .collect();
+            rows.sort();
+            for r in rows {
+                println!("{r}");
+            }
+        }
+        return Ok(());
+    }
+
     // Diagnostic: `xps5x --run-eboot <eboot.bin>` drives the **real** launch
     // path headlessly — exactly what the Shell does (`load_module` at
     // `GUEST_ARENA_BASE`, then `execute_process` into the module's `_start` on a
