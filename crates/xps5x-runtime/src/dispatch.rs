@@ -46,6 +46,7 @@
 use core::ptr;
 use std::cell::Cell;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -96,6 +97,29 @@ fn is_terminating(library: &str, function: &str) -> bool {
 /// "inside" a guarded call at a time, and the VEH only ever runs
 /// synchronously on that same thread.
 static CALL_LOCK: Mutex<()> = Mutex::new(());
+
+/// Process-wide count of FS-base re-arms performed by [`veh_callback`] (see
+/// [`ActiveContext::guest_fsbase`]).
+///
+/// Every increment is one guest `fs:`-relative access that trapped because
+/// Windows had discarded our FS base at a context switch, and was transparently
+/// re-armed and retried. In steady state this ticks roughly once per scheduler
+/// quantum in which the guest touches TLS or its `fs:0x28` stack canary, so it
+/// is a cheap, honest health/perf signal: a plausible rate is ~tens/second per
+/// guest thread, while a runaway rate would mean the re-arm is not sticking.
+///
+/// It is also what lets the re-arm's tests assert the mechanism **actually
+/// fired**, rather than passing because the guest happened never to be
+/// preempted (in which case the base still matches and the re-arm arm is
+/// skipped entirely) — see `guest_tls_survives_preemption_via_fsbase_rearm` and
+/// `genuine_wild_fault_after_preemption_recovers_instead_of_looping_the_veh`.
+static FSBASE_REARMS: AtomicU64 = AtomicU64::new(0);
+
+/// The number of FS-base re-arms performed since process start — see
+/// [`FSBASE_REARMS`]. Monotonic; never reset.
+pub fn fsbase_rearm_count() -> u64 {
+    FSBASE_REARMS.load(Ordering::Relaxed)
+}
 
 /// Acquire [`CALL_LOCK`] for the entire [`crate::execute_linked`] pipeline.
 /// Called once, at the very top of `execute_linked`; the returned guard is
@@ -168,6 +192,22 @@ struct ActiveContext {
     /// (which runs on both arrivals). Same "must live in `ctx`, not a local
     /// carried across `RtlCaptureContext`" reasoning as `orig_fsbase` above.
     tls_active: Cell<bool>,
+    /// The guest TCB address this call's FS base must point at whenever guest
+    /// code runs — i.e. the value `run` wrote with `WRFSBASE` before entering
+    /// the guest. Meaningful only while `tls_active` is `true`.
+    ///
+    /// Read by `veh_callback` to **re-arm** the FS base after Windows discards
+    /// it. `tls.rs`'s `fsbase_does_not_survive_preemption_on_windows` pins the
+    /// platform behaviour: a user-set FS base is cleared to 0 by the first
+    /// context switch (a bare timer-interrupt preemption suffices — no syscall
+    /// needed), because Windows restores the base from its own notion of the
+    /// thread's base (0 for native x64 threads). There is no notification we
+    /// could hook to re-set it — but the resulting fault *is* the notification:
+    /// the guest's next `fs:`-relative access reads a near-null address and
+    /// traps, and `veh_callback` re-arms and retries the instruction. Same
+    /// "must live in `ctx`, not a local carried across `RtlCaptureContext`"
+    /// reasoning as `orig_fsbase`.
+    guest_fsbase: Cell<u64>,
     /// Set by `veh_callback` (design doc §4, wall #1 W1b) when a resolved
     /// trampoline call targets a [`TERMINATING_FUNCTIONS`] entry, alongside
     /// `exited`, just before it performs the same `recovery_ctx` longjmp the
@@ -185,7 +225,37 @@ struct ActiveContext {
     /// call — but checking `exited` first matches the design doc's
     /// documented arrival order exactly.
     exited: Cell<bool>,
+    /// Whether `recovery_ctx` has been populated and is safe to long-jump to.
+    ///
+    /// Set to `true` **immediately after** `RtlCaptureContext` returns and
+    /// before the guest is entered; `veh_callback` returns
+    /// `EXCEPTION_CONTINUE_SEARCH` while it is `false`. This closes the window
+    /// between `ACTIVE_CONTEXT` being installed and `recovery_ctx` being
+    /// captured: a fault in that window (e.g. inside `RtlCaptureContext`
+    /// itself, or the fsbase capture just before it) must NOT be hijacked as a
+    /// genuine fault, because doing `*context = *ctx.recovery_ctx` from the
+    /// still-zeroed buffer would set `Rip = 0` and spin the VEH in an infinite
+    /// fault loop until the host stack overflows. Defense in depth: with the
+    /// `AlignedContext` fix the `movaps` `#GP` that used to open this window is
+    /// gone, but any other pre-capture fault is now handled safely too.
+    armed: Cell<bool>,
 }
+
+/// A `CONTEXT` forced to the SDK's mandated 16-byte alignment.
+///
+/// windows-sys 0.59 declares x86-64 `CONTEXT` as plain `#[repr(C)]`, whose
+/// largest field (`M128A`) is only 8-aligned, so `align_of::<CONTEXT>() == 8`.
+/// But the Windows SDK declares it `DECLSPEC_ALIGN(16)`, and
+/// `RtlCaptureContext` stores the XMM registers with `movaps`, which raises
+/// `#GP` on a 16-misaligned destination (surfaced on Windows as an
+/// `EXCEPTION_ACCESS_VIOLATION` at address `-1`). A bare `CONTEXT` stack local
+/// lands at a 16-aligned slot only by chance of the current frame layout; any
+/// change to `run`'s frame (e.g. adding `ActiveContext` fields) can silently
+/// flip it to 8-mod-16 and detonate the fault loop described on `armed`.
+/// Wrapping in an `align(16)` newtype makes the alignment guaranteed rather
+/// than incidental.
+#[repr(C, align(16))]
+struct AlignedContext(CONTEXT);
 
 thread_local! {
     /// The active-call context [`veh_callback`] consults, held **per OS
@@ -260,8 +330,14 @@ pub(crate) unsafe fn run(
     // `repr(C)` struct of integers/arrays with no pointer/validity
     // invariants — and `RtlCaptureContext` fully populates it below before
     // it is ever read (by `veh_callback`, on a genuine fault; `run` itself
-    // never reads it).
-    let mut recovery_ctx: CONTEXT = unsafe { core::mem::zeroed() };
+    // never reads it). Wrapped in `AlignedContext` so `RtlCaptureContext`'s
+    // `movaps` XMM stores hit a 16-aligned buffer (see `AlignedContext`).
+    let mut recovery = AlignedContext(unsafe { core::mem::zeroed::<CONTEXT>() });
+    debug_assert_eq!(
+        (&recovery as *const AlignedContext as usize) % 16,
+        0,
+        "recovery CONTEXT must be 16-aligned for RtlCaptureContext's movaps stores"
+    );
 
     // `dyn GuestMemory` written bare (as `ActiveContext.mem`'s field type is)
     // carries an implicit `'static` bound, unlike `&dyn GuestMemory`, whose
@@ -304,11 +380,13 @@ pub(crate) unsafe fn run(
         region_len: guard.len(),
         error: Cell::new(None),
         resumed: Cell::new(false),
-        recovery_ctx: &recovery_ctx as *const CONTEXT,
+        recovery_ctx: &recovery.0 as *const CONTEXT,
         orig_fsbase: Cell::new(0),
         tls_active: Cell::new(false),
+        guest_fsbase: Cell::new(0),
         exit_code: Cell::new(0),
         exited: Cell::new(false),
+        armed: Cell::new(false),
     };
 
     // SAFETY: `veh_callback` has the `unsafe extern "system" fn(*mut
@@ -336,21 +414,32 @@ pub(crate) unsafe fn run(
     // `RtlCaptureContext`. If FSGSBASE is unavailable or no TCB was set up,
     // `ctx.tls_active` stays `false` and no fsbase instruction is ever
     // executed for this call (honest degradation).
-    if tcb.is_some() && crate::tls::fsgsbase_available() {
+    if let Some(tcb_addr) = tcb.filter(|_| crate::tls::fsgsbase_available()) {
         ctx.tls_active.set(true);
+        // The address `veh_callback` re-arms the FS base to after Windows
+        // discards it at a context switch (see `guest_fsbase`'s doc comment).
+        ctx.guest_fsbase.set(tcb_addr);
         // SAFETY: `fsgsbase_available()` just returned `true`, so `RDFSBASE`
         // is permitted on this CPU. This only reads the current FS base; it
         // does not modify any CPU state.
         ctx.orig_fsbase.set(unsafe { crate::tls::read_fsbase() });
     }
 
-    // SAFETY: `RtlCaptureContext` only requires a valid, writable `CONTEXT`
-    // out-pointer, which `&mut recovery_ctx` is. It captures the calling
-    // thread's complete register state as of right now: `Rip` becomes the
-    // address right after this call returns, and `Rsp`/`Rbp`/every GPR
-    // reflect exactly this point in `run`'s frame. This is RT1a's recovery
-    // point — see this module's doc comment and `veh_callback`.
-    unsafe { RtlCaptureContext(&mut recovery_ctx) };
+    // SAFETY: `RtlCaptureContext` only requires a valid, writable, 16-aligned
+    // `CONTEXT` out-pointer, which `&mut recovery.0` (an `AlignedContext`
+    // field) is. It captures the calling thread's complete register state as
+    // of right now: `Rip` becomes the address right after this call returns,
+    // and `Rsp`/`Rbp`/every GPR reflect exactly this point in `run`'s frame.
+    // This is RT1a's recovery point — see this module's doc comment and
+    // `veh_callback`.
+    unsafe { RtlCaptureContext(&mut recovery.0) };
+
+    // `recovery` is now populated — from here a genuine-fault longjmp to it is
+    // safe. Arm the VEH gate (idempotent across the resumed-arrival re-run of
+    // this point). Any fault *before* here (incl. inside `RtlCaptureContext`)
+    // sees `armed == false` and is passed through, never hijacked to a
+    // zeroed context. See `ActiveContext::armed`.
+    ctx.armed.set(true);
 
     // Execution reaches this exact point in two different ways (see this
     // module's doc comment for the full mechanism):
@@ -500,12 +589,63 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     // originate) is on this thread's stack below us.
     let ctx = unsafe { &*ctx_ptr };
 
+    if !ctx.armed.get() {
+        // A fault in the window between `ACTIVE_CONTEXT` being installed and
+        // `recovery_ctx` being captured (e.g. inside `RtlCaptureContext`, or
+        // the fsbase read just before it). `recovery_ctx` is still zeroed, so
+        // hijacking this would longjmp to `Rip = 0` and spin the VEH into an
+        // infinite fault loop. Pass it through instead. See
+        // `ActiveContext::armed`.
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
     // SAFETY: `info.ContextRecord` is valid per the VEH contract; mutable
     // access is required to redirect execution (Rip/Rsp/Rax) below.
     let context = unsafe { &mut *info.ContextRecord };
     let fault_addr = context.Rip;
 
     if fault_addr < ctx.region_base || fault_addr >= ctx.region_base + ctx.region_len {
+        // Before treating this as a genuine fault: is it just Windows having
+        // discarded our FS base at the last context switch?
+        //
+        // `tls.rs`'s `fsbase_does_not_survive_preemption_on_windows` pins the
+        // platform behaviour — a user-set FS base is cleared to 0 by the first
+        // preemption (no syscall needed). Guest code compiled with TLS or a
+        // stack protector then reads `fs:[...]`, which with a zeroed base
+        // resolves to a near-null address and traps here. Windows gives us no
+        // notification we could hook to re-set the base, but this fault *is*
+        // the notification: re-arm and retry the faulting instruction.
+        //
+        // Retrying is safe and cannot loop: the retry runs with the FS base
+        // restored, so if the access still faults, the base now matches
+        // `guest_fsbase`, this arm is skipped, and the genuine-fault path below
+        // runs — i.e. at most one extra trap per genuinely-faulting access. The
+        // steady-state cost is one trap per preemption that precedes an `fs:`
+        // access (~one per scheduler quantum), which is negligible.
+        //
+        // Nothing here disturbs the RT1a recovery contract: we resume the
+        // *faulting* instruction with the delivered context untouched, and the
+        // x64 `CONTEXT` has no FS-base field, so the re-armed base survives the
+        // `EXCEPTION_CONTINUE_EXECUTION` return (the property the original
+        // RT2c-b spike did verify).
+        if ctx.tls_active.get() {
+            let want = ctx.guest_fsbase.get();
+            // SAFETY: `tls_active` is only ever `true` when
+            // `fsgsbase_available()` returned `true` (checked in `run` before
+            // `RtlCaptureContext`), so `RDFSBASE`/`WRFSBASE` are permitted on
+            // this CPU. We are on the faulting thread (vectored exceptions are
+            // delivered synchronously), which is exactly the thread whose FS
+            // base must be re-armed.
+            if unsafe { crate::tls::read_fsbase() } != want {
+                // SAFETY: as above. `want` is the guest TCB address `run` set
+                // up via `GuestArena::setup_main_tcb`, still mapped for the
+                // duration of this call.
+                unsafe { crate::tls::write_fsbase(want) };
+                FSBASE_REARMS.fetch_add(1, Ordering::Relaxed);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+
         // Outside our guarded trampoline region: a genuine guest fault.
         // Recover rather than crash (RT1a): record the error, then
         // overwrite the delivered context with the pre-call snapshot `run`

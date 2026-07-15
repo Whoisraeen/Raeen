@@ -171,21 +171,54 @@ mod tests {
         // host runtime; it is restored below before any assertion can unwind.
         let orig = unsafe { read_fsbase() };
 
-        // Saturate the scheduler so this thread is genuinely preempted rather
-        // than running to completion on an idle core.
+        // Confine this thread + one spinner to a single CPU (two runnable
+        // threads, one core → the scheduler must preempt this one), leaving
+        // every other core free so the parallel test suite is not starved.
+        // Stops+joins the spinner and restores affinity on drop, so an
+        // assertion panic below cannot leak the busy-loop.
+        struct Spinners {
+            stop: Arc<AtomicBool>,
+            handle: Option<std::thread::JoinHandle<()>>,
+            prev_affinity: usize,
+        }
+        impl Drop for Spinners {
+            fn drop(&mut self) {
+                use windows_sys::Win32::System::Threading::{
+                    GetCurrentThread, SetThreadAffinityMask,
+                };
+                self.stop.store(true, Ordering::Relaxed);
+                if let Some(h) = self.handle.take() {
+                    let _ = h.join();
+                }
+                if self.prev_affinity != 0 {
+                    // SAFETY: restore the caller's original affinity; Drop runs
+                    // on the same thread that constructed this.
+                    unsafe { SetThreadAffinityMask(GetCurrentThread(), self.prev_affinity) };
+                }
+            }
+        }
         let stop = Arc::new(AtomicBool::new(false));
-        let spinners: Vec<_> = (0..std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4))
-            .map(|_| {
+        let _spinners = {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
+            // SAFETY: pin the current thread to CPU 0; returns the previous
+            // mask (0 on failure), restored on Drop.
+            let prev_affinity = unsafe { SetThreadAffinityMask(GetCurrentThread(), 1) };
+            let handle = {
                 let stop = Arc::clone(&stop);
                 std::thread::spawn(move || {
+                    // SAFETY: pin this spinner to CPU 0 too.
+                    unsafe { SetThreadAffinityMask(GetCurrentThread(), 1) };
                     while !stop.load(Ordering::Relaxed) {
                         std::hint::spin_loop();
                     }
                 })
-            })
-            .collect();
+            };
+            Spinners {
+                stop: Arc::clone(&stop),
+                handle: Some(handle),
+                prev_affinity,
+            }
+        };
 
         // SAFETY: as above — available, and restored before returning.
         unsafe { write_fsbase(MAGIC) };
@@ -214,13 +247,9 @@ mod tests {
         let after_pure_spin = unsafe { read_fsbase() };
 
         // Restore *before* asserting so a failure can't leave this test thread
-        // with a bogus FS base.
+        // with a bogus FS base. `_spinners` stops+joins on drop at end of scope.
         // SAFETY: as above.
         unsafe { write_fsbase(orig) };
-        stop.store(true, Ordering::Relaxed);
-        for s in spinners {
-            let _ = s.join();
-        }
 
         // The write itself works, and survives while we stay scheduled...
         assert_eq!(

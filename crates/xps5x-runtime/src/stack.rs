@@ -132,6 +132,15 @@ pub(crate) unsafe fn call_on_guest_stack(
             // addressed RIP-relative (no GP register), since rsp is about to
             // change and no callee-saved register can be trusted to survive
             // the guest call.
+            // Preserve rbp and rbx on the *host* stack before anything
+            // switches. The guest may clobber them like any other register, but
+            // LLVM reserves both internally, so neither can be declared as a
+            // clobber operand the way r12-r15 are below — they are saved and
+            // restored by hand instead. Pushing before the `mov` below means
+            // the recorded host RSP already accounts for them, so the `pop`s
+            // after the restore are balanced.
+            "push rbp",
+            "push rbx",
             "mov qword ptr [rip + {slot}], rsp",
             // Switch to the guest stack. `guest_rsp_top` is 16-aligned (see
             // this function's `debug_assert!` and doc comment); the `call`
@@ -143,6 +152,8 @@ pub(crate) unsafe fn call_on_guest_stack(
             // RIP-relative — this is the key line: it does not depend on any
             // general-purpose register having survived the guest call.
             "mov rsp, qword ptr [rip + {slot}]",
+            "pop rbx",
+            "pop rbp",
             slot = sym HOST_RSP_SLOT,
             guest_rsp = in(reg) guest_rsp_top,
             entry_reg = in(reg) entry_addr,
@@ -153,6 +164,25 @@ pub(crate) unsafe fn call_on_guest_stack(
             in("r8") args[4],
             in("r9") args[5],
             lateout("rax") result,
+            // `clobber_abi("sysv64")` only covers the *caller-saved* set — it
+            // models a conforming `call`, whose callee is obliged to preserve
+            // rbx/rbp/r12-r15. A guest is NOT a conforming callee: it is
+            // arbitrary code that may destroy any register (the
+            // `guest_clobbering_r15_does_not_corrupt_host_rsp` test does
+            // exactly that on purpose). Without these, the compiler is free to
+            // keep host values live in callee-saved registers across the guest
+            // call — including the pointer through which `dispatch::run` reads
+            // its `ActiveContext` — and the guest silently corrupts them. That
+            // is not a hypothetical: it produced an infinite VEH fault loop
+            // (host deref of the guest's `0xFFFFFFFFDEADBEEF` r15, whose
+            // recovery re-read a clobbered `resumed` flag and re-entered the
+            // guest forever). It only ever "worked" by the accident of the
+            // compiler not happening to allocate anything there.
+            // (rbp/rbx are LLVM-reserved and handled by the push/pop above.)
+            out("r12") _,
+            out("r13") _,
+            out("r14") _,
+            out("r15") _,
             clobber_abi("sysv64"),
         );
     }

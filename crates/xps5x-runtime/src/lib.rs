@@ -28,6 +28,12 @@ mod tls;
 #[cfg(target_os = "windows")]
 mod trampoline;
 
+/// Diagnostic: how many times the VEH has re-armed a guest FS base that
+/// Windows discarded at a context switch (see `dispatch::fsbase_rearm_count`).
+/// Windows-only, like the rest of the execution core.
+#[cfg(target_os = "windows")]
+pub use dispatch::fsbase_rearm_count;
+
 use thiserror::Error;
 use xps5x_firmware::LinkedModule;
 use xps5x_hle::HleRegistry;

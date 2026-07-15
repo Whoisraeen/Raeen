@@ -175,3 +175,80 @@ The §3 test is an honest gate **only if** it also (a) forces a preemption in th
 worker (exercises I3 — e.g. contended yield/sleep before the canary check) and
 (b) uses a genuinely **detached**-thread variant (exercises C2/C3). Without both,
 it is a synthetic best-case that passes over the exact traps above.
+
+---
+
+## 7. Decisions after audit (implementation)
+
+### I3 spike RESULT — FS base does NOT survive Windows preemption (fixed)
+
+The I3 spike **failed** and exposed a **live bug**, not just an M1-E blocker.
+Measured (`tls::tests::fsbase_does_not_survive_preemption_on_windows`): a user
+`WRFSBASE` value reads back correctly immediately and across `yield_now`, but is
+`0` after a `sleep` **and** after a pure user-mode busy-wait (no syscall). So a
+bare timer-interrupt context switch clears it — Windows restores the FS base
+from its own notion (0 for native x64 threads). `CR4.FSGSBASE` only makes the
+instruction legal; it does not make the value survive scheduling. The original
+RT2c-b spike only tested the VEH/`RtlCaptureContext` round trip, never
+preemption.
+
+**Consequence (was already breaking the single-threaded path):** a raw
+`WRFSBASE` guest TCB is valid only until the next quantum (~15 ms); the guest's
+next `fs:`-relative access (TLS or the `fs:0x28` canary) then reads a near-null
+address → outside the guard region → VEH calls it a genuine wild fault → title
+reports `Faulted`. M1's test passes only because that guest finishes in µs.
+
+**Fix (landed):** trap-and-re-arm in `veh_callback`. The fault *is* the
+notification Windows won't give us: an out-of-region AV whose thread has
+`tls_active` and whose current FS base ≠ the guest TCB is re-armed with
+`WRFSBASE` and the instruction retried (`EXCEPTION_CONTINUE_EXECUTION`).
+Terminating: the retry runs with the correct base, so a genuine fault falls
+through on the next pass. `ActiveContext` gained `guest_fsbase`. Guarded by
+`execute.rs::guest_tls_survives_preemption_via_fsbase_rearm` (falsified: with
+the re-arm disabled it faults at `GUEST_ARENA_BASE + 15`, the exact `fs:[0]`
+instruction offset).
+
+### C1 decision — DELETE `HOST_RSP_SLOT` (return-trampoline recovery)
+
+Adversarial judge panel (5 independent designs × 3 refutation lenses →
+synthesis) chose the `open` approach with **0 fatal attacks**; 3 of 5 proposers
+independently converged on it. Do **not** make the slot per-thread — **delete
+it**. Recover the host RSP wholesale from `run`'s `recovery_ctx` snapshot via the
+return-trampoline longjmp `dispatch.rs` already performs for `exit`/RT1a.
+
+- **stack.rs:** replace `call_on_guest_stack` + `enter_guest_at_start` with one
+  diverging `enter_guest(entry, guest_rsp, args) -> !` (`mov rsp; jmp entry`,
+  `options(noreturn)`). No save slot, no `unsafe impl Sync`, no restore line,
+  nothing to race. Function/process/thread mode differ only in what the *caller*
+  puts on the guest stack.
+- **trampoline.rs:** reserve one more guarded slot; `return_tramp()` = index
+  `count+1` (past the `UnresolvedTrampoline` sentinel at `count`, so it can't
+  shadow that diagnostic — the one serious attack found). `logical_len` grows to
+  `count*8 + 16`.
+- **dispatch.rs:** `ActiveContext` gains `return_tramp: u64`, `returned:
+  Cell<bool>`, `retval: Cell<u64>`; `veh_callback` gets an arm for `fault_addr
+  == ctx.return_tramp` (capture `rax`, longjmp like exit/RT1a); `run`'s
+  `call_guest` becomes `-> !` and the tail reads `retval` from ctx. Precedence:
+  **exited → error → returned** (preserves `UnresolvedTrampoline` outranking a
+  return).
+- **Property:** the *restore* is STRENGTHENED (whole register file recovered, not
+  just RSP — the r15 test passes for a stronger reason). The *reachability* is
+  narrowly weakened (the guest `ret` must fault, needing OS frame room at guest
+  RSP) but that dependency already exists for every HLE call / exit / RT1a fault;
+  on the hot path RSP = `stack_top` with GiB of room. Optional closure: a 64 KiB
+  `PAGE_NOACCESS` red-zone below `GUEST_ARENA_BASE`.
+- **Grafts:** `#[repr(C, align(16))]` wrapper for `recovery_ctx` (VERIFY
+  `align_of::<CONTEXT>()` first — `RtlCaptureContext` uses `movaps`, `#GP` on
+  misalignment; now load-bearing as the sole recovery path); a `recovery_armed`
+  gate so a fault in the `AddVEH → RtlCaptureContext` window can't longjmp to a
+  half-built context.
+- **Spikes before relying:** `align_of::<CONTEXT>()`; `noreturn` + SysV `in(reg)`
+  operands compile on 1.97; return-tramp *fetch* AV delivers to the VEH like the
+  existing `call [import_slot]` fetch fault. **I2 (register VEH once per process)
+  becomes MANDATORY at step 3/6** — routing clean returns through the VEH means
+  it must be live for the whole run, and N concurrent workers must not stack N
+  handlers.
+- **New tests:** `guest_return_recovers_host_context_through_trampoline` (clobber
+  full callee-saved set + stack, `ret` a sentinel, then a second run on the same
+  thread succeeds); `concurrent_guest_returns_recover_independent_host_contexts`
+  (N threads, thread-distinct values, no cross-corruption) — gated at step 6.

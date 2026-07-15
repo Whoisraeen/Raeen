@@ -23,9 +23,73 @@ use xps5x_firmware::{
 };
 use xps5x_hle::{HleContext, HleRegistry};
 use xps5x_kernel::OrbisKernel;
-use xps5x_runtime::{GUEST_ARENA_BASE, RunOutcome, RuntimeError, execute_linked, execute_process};
+use xps5x_runtime::{
+    GUEST_ARENA_BASE, RunOutcome, RuntimeError, execute_linked, execute_process, fsbase_rearm_count,
+};
 
 const R_X86_64_JUMP_SLOT: u64 = 7;
+
+/// Forces real scheduler preemption of the guest thread by confining **both**
+/// the current (guest-running) thread and one busy-spinner to a *single*
+/// logical CPU via thread affinity — two runnable threads on one core, so the
+/// scheduler must time-slice them (preemption guaranteed), while every other
+/// core stays free.
+///
+/// This is deliberately NOT whole-machine saturation: the runtime test suite
+/// runs in parallel, and a test that pegs every core stalls all the others
+/// (and, if it then panics, leaks the spinners, wedging the whole binary and
+/// even locking its `.exe` against relinking). Confining to one core keeps the
+/// test a good citizen and makes preemption *more* reliable, not less. On
+/// `Drop` (including on an assertion panic) it stops+joins the spinner and
+/// restores the caller's original affinity.
+struct Spinners {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    prev_affinity: usize,
+}
+
+impl Spinners {
+    /// Pin the calling thread + one spinner to CPU 0.
+    fn contend_one_core() -> Self {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
+        // SAFETY: `GetCurrentThread` is a pseudo-handle; `SetThreadAffinityMask`
+        // with mask 1 (CPU 0) is a benign scheduling hint that returns the
+        // previous mask (0 on failure). Restored on Drop.
+        let prev_affinity = unsafe { SetThreadAffinityMask(GetCurrentThread(), 1) };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                // SAFETY: pin *this* spinner to CPU 0 too, so it shares a core
+                // with the guest thread.
+                unsafe { SetThreadAffinityMask(GetCurrentThread(), 1) };
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+            })
+        };
+        Self {
+            stop,
+            handle: Some(handle),
+            prev_affinity,
+        }
+    }
+}
+
+impl Drop for Spinners {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        if self.prev_affinity != 0 {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
+            // SAFETY: restore the caller's original affinity mask. Drop runs on
+            // the same thread that constructed this (the test/guest thread).
+            unsafe { SetThreadAffinityMask(GetCurrentThread(), self.prev_affinity) };
+        }
+    }
+}
 
 /// Sentinel HLE function RT0's acceptance test dispatches to.
 fn sentinel(_ctx: &HleContext, _args: &[u64]) -> u64 {
@@ -1285,6 +1349,207 @@ fn guest_fs_zero_load_reads_the_installed_tcb() {
     assert_eq!(
         result, expected_tcb,
         "guest `mov rax, fs:[0]` must read the TCB self-pointer `setup_main_tcb` installed"
+    );
+}
+
+/// M1-E I3 acceptance: guest TLS keeps working **across a preemption**.
+///
+/// `tls.rs`'s `fsbase_does_not_survive_preemption_on_windows` pins the platform
+/// reality: Windows discards a user-set FS base at the first context switch (a
+/// bare timer-interrupt preemption suffices — no syscall). Without the
+/// `veh_callback` re-arm, this guest's `mov rax, fs:[0]` after a long spin reads
+/// a near-null address, the VEH sees a genuine wild fault, and the run comes
+/// back `Err(Faulted)` — i.e. every real (longer-than-a-quantum) title that
+/// touches TLS or its `fs:0x28` stack canary would "crash" within ~15ms.
+///
+/// The guest here spins in pure user mode (no syscall — so this exercises real
+/// timer-interrupt preemption, not a kernel transition) while host spinners
+/// saturate every core to guarantee it is actually descheduled, then reads
+/// `fs:[0]`. Passing proves the fault-driven re-arm restored the FS base and
+/// transparently retried the faulting instruction.
+#[test]
+fn guest_tls_survives_preemption_via_fsbase_rearm() {
+    if !fsgsbase_available() {
+        println!("FSGSBASE not available on this CPU; skipping fsbase re-arm test");
+        return;
+    }
+
+    const ENTRY_OFF: usize = 0x0;
+    const HEAP_OFFSET: u64 = 0x4000_0000;
+    // Must span SEVERAL scheduler quanta, not one — see the identical constant
+    // in `genuine_wild_fault_after_preemption_recovers_instead_of_looping_the_veh`.
+    // At the original 1e8 (~30ms, i.e. about one quantum) this test passed on
+    // roughly half of runs *without the re-arm ever firing*: the guest simply
+    // was not preempted, so its FS base was never cleared and `fs:[0]` resolved
+    // directly. It looked like an acceptance gate while proving nothing. ~2e9
+    // (~600ms) makes preemption certain, and the `rearms_after > rearms_before`
+    // assertion below fails loudly if it ever stops happening.
+    const SPIN_COUNT: u64 = 2_000_000_000;
+
+    let hle = HleRegistry::new();
+    let mut code: Vec<u8> = Vec::new();
+    // mov rcx, SPIN_COUNT
+    code.extend_from_slice(&[0x48, 0xB9]);
+    code.extend_from_slice(&SPIN_COUNT.to_le_bytes());
+    // spin: dec rcx ; jnz spin   (rel8 = -5: back over jnz(2) + dec(3))
+    code.extend_from_slice(&[0x48, 0xFF, 0xC9]);
+    code.extend_from_slice(&[0x75, 0xFB]);
+    // mov rax, fs:[0]   — the TCB self-pointer read that traps if the base was
+    // discarded and never re-armed.
+    code.extend_from_slice(&[0x64, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00]);
+    // ret
+    code.push(0xC3);
+
+    let mut image = vec![0u8; 0x100];
+    image[ENTRY_OFF..ENTRY_OFF + code.len()].copy_from_slice(&code);
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: ENTRY_OFF as u64,
+        tls: None,
+        procparam_offset: None,
+    };
+
+    // Saturate every core so the guest thread is genuinely preempted rather
+    // than running its spin to completion uninterrupted on an idle machine.
+    // `Spinners` stops+joins on drop, so an assertion panic below can never
+    // leak the busy-loops (which would peg every core for the rest of the test
+    // binary's run and even lock its output .exe against relinking).
+    let spinners = Spinners::contend_one_core();
+
+    let kernel = OrbisKernel::new();
+    let rearms_before = fsbase_rearm_count();
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]);
+    let rearms_after = fsbase_rearm_count();
+
+    drop(spinners);
+
+    let expected_tcb = GUEST_ARENA_BASE + HEAP_OFFSET;
+    let rax = result.expect(
+        "guest must not fault after preemption: the VEH must re-arm the FS base \
+         Windows discarded and retry the faulting fs:-relative access",
+    );
+    assert_eq!(
+        rax, expected_tcb,
+        "after a preemption discarded the FS base, the re-armed `mov rax, fs:[0]` \
+         must still read the installed TCB self-pointer"
+    );
+    // Guard against passing for the wrong reason: had no preemption landed
+    // during the spin, the base would still match, the re-arm arm would never
+    // run, and `fs:[0]` would read the TCB without exercising the mechanism.
+    assert!(
+        rearms_after > rearms_before,
+        "the spin must actually have been preempted (and the FS base re-armed) — \
+         otherwise this test passes without exercising the re-arm at all"
+    );
+}
+
+/// M1-E I3, termination guard: a **genuine** wild fault that happens *after* a
+/// preemption discarded the FS base must still recover as `Faulted` — not spin
+/// the VEH forever.
+///
+/// This pins the load-bearing platform property the re-arm's termination
+/// argument rests on. `veh_callback`'s re-arm arm fires on *any* out-of-region
+/// fault whose current FS base differs from the guest TCB, so a post-preemption
+/// wild access takes this path:
+///
+/// 1. trap 1: base was cleared by the preemption, so `base != guest_fsbase` →
+///    re-arm + `EXCEPTION_CONTINUE_EXECUTION` → the faulting instruction retries;
+/// 2. trap 2: it faults again, but now `base == guest_fsbase`, so the arm is
+///    skipped and the genuine-fault (RT1a) recovery runs.
+///
+/// Step 2 only terminates if a `WRFSBASE` issued **inside the handler** survives
+/// the `EXCEPTION_CONTINUE_EXECUTION` return. If it does not, trap 2 re-arms
+/// again, and again, forever: an **infinite VEH loop — a hang, not a crash**.
+/// The existing `genuine_wild_fault_recovers_as_faulted_then_process_keeps_running`
+/// does NOT cover this: its guest faults on its very first instruction, before
+/// any preemption, so the base still matches and the re-arm arm never runs.
+///
+/// (`guest_tls_survives_preemption_via_fsbase_rearm` proves the same platform
+/// property from the success side — the retried `fs:[0]` reads the TCB. This
+/// test proves it from the failure side, where a regression hangs the suite
+/// rather than failing an assert, so it is worth pinning explicitly.)
+#[test]
+fn genuine_wild_fault_after_preemption_recovers_instead_of_looping_the_veh() {
+    if !fsgsbase_available() {
+        println!("FSGSBASE not available on this CPU; skipping fsbase re-arm termination test");
+        return;
+    }
+
+    const ENTRY_OFF: usize = 0x0;
+    // Must span SEVERAL scheduler quanta, not one. A Windows foreground quantum
+    // is ~20-46ms; a fused `dec`/`jnz` retires ~1/cycle, so 1e8 iterations is
+    // only ~30ms — comparable to a single quantum, which made preemption (and
+    // therefore the whole path under test) a coin flip depending on where in its
+    // quantum the guest thread started. Measured: at 1e8 the re-arm fired on
+    // roughly half of runs. ~2e9 is ~600ms = many quanta, so preemption is
+    // certain rather than lucky. The `rearms_after > rearms_before` assertion
+    // below is what turns a regression here into a failure instead of a silent
+    // vacuous pass.
+    const SPIN_COUNT: u64 = 2_000_000_000;
+
+    let hle = HleRegistry::new();
+    let mut code: Vec<u8> = Vec::new();
+    // mov rcx, SPIN_COUNT
+    code.extend_from_slice(&[0x48, 0xB9]);
+    code.extend_from_slice(&SPIN_COUNT.to_le_bytes());
+    // spin: dec rcx ; jnz spin
+    code.extend_from_slice(&[0x48, 0xFF, 0xC9]);
+    code.extend_from_slice(&[0x75, 0xFB]);
+    // The wild dereference of address 0 — a genuine fault, NOT an fs: access,
+    // reached only after the spin above has been preempted.
+    let fault_off = code.len();
+    code.extend_from_slice(&[0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00]);
+    // ret
+    code.push(0xC3);
+
+    let mut image = vec![0u8; 0x100];
+    image[ENTRY_OFF..ENTRY_OFF + code.len()].copy_from_slice(&code);
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: ENTRY_OFF as u64,
+        tls: None,
+        procparam_offset: None,
+    };
+
+    // Saturate every core so the guest is genuinely descheduled during the spin.
+    let spinners = Spinners::contend_one_core();
+
+    let kernel = OrbisKernel::new();
+    let rearms_before = fsbase_rearm_count();
+    let result = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]);
+    let rearms_after = fsbase_rearm_count();
+
+    drop(spinners);
+
+    // Reaching this line at all is most of the point: a non-terminating re-arm
+    // never returns from `execute_linked`.
+    let err = result.expect_err("a wild dereference of address 0 must be reported as a fault");
+    assert_eq!(
+        err,
+        RuntimeError::Faulted {
+            addr: GUEST_ARENA_BASE + fault_off as u64
+        },
+        "the post-preemption genuine fault must be recovered as `Faulted` at the \
+         faulting instruction, i.e. the FS-base re-arm must fall through to the \
+         RT1a path on the retry rather than re-arming forever"
+    );
+    // Without this, the test would pass vacuously on a run where no preemption
+    // landed: the base would still match, the re-arm arm would be skipped, and
+    // the wild fault would reach the RT1a path directly — proving nothing about
+    // whether the re-arm terminates.
+    assert!(
+        rearms_after > rearms_before,
+        "the spin must actually have been preempted (clearing the FS base) so that \
+         the wild fault below it goes through the re-arm-then-retry path — otherwise \
+         this test does not exercise the loop it is meant to guard against"
     );
 }
 
