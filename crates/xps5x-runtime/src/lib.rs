@@ -33,6 +33,10 @@ mod thread;
 mod tls;
 #[cfg(target_os = "windows")]
 mod trampoline;
+// Deliberately not `cfg(windows)`: the address map is pure bookkeeping with no
+// host calls, so it builds and tests everywhere. `pub` because the kernel/HLE
+// memory calls are its consumers.
+pub mod vmm;
 
 /// Diagnostic: how many times the VEH has re-armed a guest FS base that
 /// Windows discarded at a context switch (see `dispatch::fsbase_rearm_count`).

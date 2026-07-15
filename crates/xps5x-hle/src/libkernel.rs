@@ -991,33 +991,48 @@ fn hle_map_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     } else {
         alignment.max(page_size)
     };
-    // `direct_memory_start` is not an opaque physical token here:
-    // `sceKernelAllocateDirectMemory` hands the guest an address that
-    // `ctx.alloc.mmap` already committed, so the direct memory IS live arena
-    // memory at that address. Mapping it therefore means publishing that same
-    // address — allocating a fresh region instead would give the guest a view
-    // whose writes never reach the direct memory it allocated, and would leak
-    // when `sceKernelReleaseDirectMemory` released the physical range.
+    // Two cases, and getting either one wrong silently corrupts a title.
     //
-    // Aliasing one physical range at a second, guest-chosen VA would need
-    // file-backed sections; plain reservations cannot do it. The API allows
-    // this: `addr` is a hint, and only `SCE_KERNEL_MAP_FIXED` demands it be
-    // honored, so a hint we cannot satisfy is declined rather than faked.
-    let mapped = direct_memory_start;
-    if mapped % alignment != 0 {
-        warn!(
-            "sceKernelMapDirectMemory: phys {mapped:#x} does not satisfy alignment {alignment:#x}"
-        );
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    if requested != 0 && requested != mapped {
-        warn!(
-            "sceKernelMapDirectMemory: ignoring address hint {requested:#x}; direct memory is \
-             published at its own address {mapped:#x} (hint is advisory without MAP_FIXED)"
-        );
-    }
+    // A guest-supplied address is NOT advisory in practice. Minecraft asks for
+    // a specific address and then writes to *that* address without ever reading
+    // the out-param back, so publishing somewhere else leaves it scribbling on
+    // unmapped memory. Honor the request.
+    //
+    // With no requested address there is nothing to honor, and the answer is
+    // NOT a fresh region: `sceKernelAllocateDirectMemory` hands out an address
+    // `ctx.alloc.mmap` already committed, so the direct memory is live arena
+    // memory at `direct_memory_start`. Publishing that address keeps the
+    // mapping and the direct memory the same storage; a fresh region would
+    // detach the guest's writes from its own direct memory and leak when
+    // `sceKernelReleaseDirectMemory` freed the physical range.
+    //
+    // GAP: when an address IS requested, the mapping is backed by its own
+    // memory rather than aliasing `direct_memory_start`. True aliasing needs
+    // file-backed sections; reservations cannot do it. Harmless while a title
+    // reaches direct memory only through the mapping it asked for (all four
+    // measured titles do), wrong the day one writes via the mapping and reads
+    // via the physical address.
+    let mapped = if requested == 0 {
+        if direct_memory_start % alignment != 0 {
+            warn!(
+                "sceKernelMapDirectMemory: phys {direct_memory_start:#x} does not satisfy \
+                 alignment {alignment:#x}"
+            );
+            return SCE_KERNEL_ERROR_EINVAL;
+        }
+        Some(direct_memory_start)
+    } else {
+        ctx.alloc.map_at(requested, len, alignment)
+    };
+    let Some(mapped) = mapped else {
+        warn!("sceKernelMapDirectMemory: cannot map len={len:#x} at requested={requested:#x}");
+        return HLE_ERROR;
+    };
     ctx.kernel.memory.record_mapping(mapped, len, prot);
     if !ctx.mem.write(addr_out, &mapped.to_le_bytes()) {
+        if requested != 0 {
+            ctx.alloc.munmap(mapped, len);
+        }
         ctx.kernel.memory.remove_mapping(mapped);
         return SCE_KERNEL_ERROR_EFAULT;
     }
@@ -3063,13 +3078,13 @@ mod tests {
         assert!(!kernel.memory.is_mapped(physical));
     }
 
-    /// A mapped direct-memory range must stay the *same storage* the guest
-    /// allocated, so a write through the returned address is visible at the
-    /// physical address and vice versa. Publishing a freshly allocated region
-    /// instead would pass a naive "addr is non-zero" check while silently
-    /// giving the guest a view disconnected from its own direct memory.
+    /// With no address requested, a mapped direct-memory range must stay the
+    /// *same storage* the guest allocated rather than a freshly allocated
+    /// region, which would pass a naive "addr is non-zero" check while silently
+    /// giving the guest a view disconnected from its own direct memory — and
+    /// would leak once `sceKernelReleaseDirectMemory` freed the physical range.
     #[test]
-    fn mapping_direct_memory_publishes_the_storage_that_was_allocated_not_a_fresh_region() {
+    fn mapping_direct_memory_without_a_requested_address_publishes_the_allocated_storage() {
         let registry = HleRegistry::new();
         let kernel = xps5x_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
@@ -3089,10 +3104,8 @@ mod tests {
         assert!(mem.read(0x100, &mut bytes));
         let physical = u64::from_le_bytes(bytes);
 
-        // A non-zero hint is advisory without MAP_FIXED: it must not detach the
-        // mapping from the allocated direct memory.
-        let hint = physical + 0x4000;
-        assert!(mem.write(0x108, &hint.to_le_bytes()));
+        // No address requested: the out-param starts zeroed.
+        assert!(mem.write(0x108, &0u64.to_le_bytes()));
         assert_eq!(
             registry.call(
                 &ctx,
@@ -3109,6 +3122,51 @@ mod tests {
             "the mapping must publish the allocated direct memory itself"
         );
         assert!(kernel.memory.is_mapped(mapped));
+    }
+
+    /// A guest that supplies an address expects the mapping THERE. Minecraft
+    /// asks for one and then writes to it without ever reading the out-param
+    /// back, so publishing anywhere else leaves it writing to unmapped memory
+    /// (measured: `memset: dst 0x100102000000 out of bounds`).
+    #[test]
+    fn mapping_direct_memory_at_a_requested_address_honors_that_address() {
+        let registry = HleRegistry::new();
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x10_0000);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(
+            registry.call(
+                &ctx,
+                "libkernel",
+                "sceKernelAllocateMainDirectMemory",
+                &[0x8000, 0x2000, 0, 0x100]
+            ),
+            Some(SCE_OK)
+        );
+        let mut bytes = [0u8; 8];
+        assert!(mem.read(0x100, &mut bytes));
+        let physical = u64::from_le_bytes(bytes);
+
+        let requested = 0x20_0000u64;
+        assert!(mem.write(0x108, &requested.to_le_bytes()));
+        assert_eq!(
+            registry.call(
+                &ctx,
+                "libkernel",
+                "sceKernelMapNamedDirectMemory",
+                &[0x108, 0x8000, 0x32, 0, physical, 0x2000, 0]
+            ),
+            Some(SCE_OK)
+        );
+        assert!(mem.read(0x108, &mut bytes));
+        assert_eq!(
+            u64::from_le_bytes(bytes),
+            requested,
+            "a requested address must be honored, not silently relocated"
+        );
+        assert!(kernel.memory.is_mapped(requested));
     }
 
     #[test]

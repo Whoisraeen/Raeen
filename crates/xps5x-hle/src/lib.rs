@@ -562,6 +562,20 @@ impl GuestAllocator for TestAllocator {
         self.bump(length, align)
     }
 
+    /// Model [`GuestArena::map_at`]: an aligned request is satisfied at exactly
+    /// the requested address. The default trait impl declines every non-zero
+    /// address, which would make a caller that honors a guest's requested
+    /// address look like a caller that ignores it.
+    fn map_at(&self, addr: u64, length: u64, align: u64) -> Option<u64> {
+        if addr == 0 {
+            return self.mmap(length, align);
+        }
+        if addr % align.max(1) != 0 {
+            return None;
+        }
+        Some(addr)
+    }
+
     fn munmap(&self, _addr: u64, _length: u64) {}
 }
 
