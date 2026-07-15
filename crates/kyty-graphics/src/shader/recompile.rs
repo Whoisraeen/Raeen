@@ -2355,7 +2355,6 @@ fn ds_append_consume(
 }
 
 /// Kyty: `Recompile_DsAppend_VdstGds` (ShaderSpirv.cpp L2208).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_ds_append(
     index: u32,
     code: &ShaderCode,
@@ -2375,7 +2374,6 @@ fn recompile_ds_append(
 }
 
 /// Kyty: `Recompile_DsConsume_VdstGds` (ShaderSpirv.cpp L2243).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_ds_consume(
     index: u32,
     code: &ShaderCode,
@@ -2761,7 +2759,6 @@ fn recompile_image_sample_lzo_dmask7(
 }
 
 /// Kyty: `Recompile_ImageLoad_Vdata4Vaddr3StDmaskF` (ShaderSpirv.cpp L3038).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_image_load_dmask_f(
     index: u32,
     code: &ShaderCode,
@@ -2837,7 +2834,6 @@ fn recompile_image_load_dmask_f(
 }
 
 /// Kyty: `Recompile_ImageStore_Vdata4Vaddr3StDmaskF` (ShaderSpirv.cpp L3105).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_image_store_dmask_f(
     index: u32,
     code: &ShaderCode,
@@ -3214,7 +3210,6 @@ fn recompile_s_lshr_b64(
 }
 
 /// Kyty: `Recompile_S_Bfe_U64_Sdst2Ssrc02Ssrc1` (ShaderSpirv.cpp L3452).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_s_bfe_u64(
     index: u32,
     code: &ShaderCode,
@@ -3484,7 +3479,6 @@ fn recompile_s_xxx_u32_svdst_svsrc01(
 }
 
 /// Kyty: `Recompile_SAndSaveexecB64_Sdst2Ssrc02` (ShaderSpirv.cpp L3670).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_s_and_saveexec_b64(
     index: u32,
     code: &ShaderCode,
@@ -3634,7 +3628,6 @@ fn recompile_scmp_xxx_u32(
 }
 
 /// Kyty: `Recompile_SMulkI32_SVdstSVsrc0` (ShaderSpirv.cpp L4437).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_smulk_i32(
     index: u32,
     code: &ShaderCode,
@@ -3688,7 +3681,6 @@ fn recompile_smulk_i32(
 }
 
 /// Kyty: `Recompile_SWqmB64_Sdst2Ssrc02` (ShaderSpirv.cpp L4621).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_swqm_b64(
     index: u32,
     code: &ShaderCode,
@@ -5125,8 +5117,8 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_fetch, T::FetchXyz,  F::Vdata3VaddrSvSoffsIdxen, p1("")),
     f(recompile_fetch, T::FetchXyzw, F::Vdata4VaddrSvSoffsIdxen, p1("")),
 
-    ni("Recompile_DsAppend_VdstGds",  2208, T::DsAppend,  F::VdstGds, p1("")),
-    ni("Recompile_DsConsume_VdstGds", 2243, T::DsConsume, F::VdstGds, p1("")),
+    f(recompile_ds_append,  T::DsAppend,  F::VdstGds, p1("")),
+    f(recompile_ds_consume, T::DsConsume, F::VdstGds, p1("")),
 
     f(recompile_exp_mrt0_off_off_compr_vm_done,     T::Exp, F::Mrt0OffOffComprVmDone,          p1("")),
     f(recompile_exp_mrt0_vsrc0_vsrc1_compr_vm_done, T::Exp, F::Mrt0Vsrc0Vsrc1ComprVmDone,      p1("")),
@@ -5139,7 +5131,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_exp_pos0,                           T::Exp, F::Pos0Vsrc0Vsrc1Vsrc2Vsrc3Done,   p1("")),
     f(recompile_exp_prim,                           T::Exp, F::PrimVsrc0OffOffOffDone,         p1("")),
 
-    ni("Recompile_ImageLoad_Vdata4Vaddr3StDmaskF",        3038, T::ImageLoad,      F::Vdata4Vaddr3StDmaskF,   p1("")),
+    f(recompile_image_load_dmask_f,        T::ImageLoad,      F::Vdata4Vaddr3StDmaskF,   p1("")),
     ni("Recompile_ImageSample_Vdata1Vaddr3StSsDmask1",    2471, T::ImageSample,    F::Vdata1Vaddr3StSsDmask1, p1("")),
     ni("Recompile_ImageSample_Vdata1Vaddr3StSsDmask8",    2525, T::ImageSample,    F::Vdata1Vaddr3StSsDmask8, p1("")),
     ni("Recompile_ImageSample_Vdata2Vaddr3StSsDmask3",    2579, T::ImageSample,    F::Vdata2Vaddr3StSsDmask3, p1("")),
@@ -5149,7 +5141,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     ni("Recompile_ImageSample_Vdata4Vaddr3StSsDmaskF",    2968, T::ImageSample,    F::Vdata4Vaddr3StSsDmaskF, p1("")),
     ni("Recompile_ImageSampleLz_Vdata3Vaddr3StSsDmask7",  2821, T::ImageSampleLz,  F::Vdata3Vaddr3StSsDmask7, p1("")),
     ni("Recompile_ImageSampleLzO_Vdata3Vaddr4StSsDmask7", 2887, T::ImageSampleLzO, F::Vdata3Vaddr4StSsDmask7, p1("")),
-    ni("Recompile_ImageStore_Vdata4Vaddr3StDmaskF",       3105, T::ImageStore,     F::Vdata4Vaddr3StDmaskF,   p1("")),
+    f(recompile_image_store_dmask_f,       T::ImageStore,     F::Vdata4Vaddr3StDmaskF,   p1("")),
     ni("Recompile_ImageStoreMip_Vdata4Vaddr4StDmaskF",    3173, T::ImageStoreMip,  F::Vdata4Vaddr4StDmaskF,   p1("")),
 
     f(recompile_sbuffer_load_dword,   T::SBufferLoadDword,   F::SdstSvSoffset,  p1("")),
@@ -5203,7 +5195,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
         "%tb_<index> = OpSelect %uint %tsb_<index> %t0_<index> %t2_<index>",
         "%td_<index> = OpSelect %uint %tsb_<index> %t1_<index> %t3_<index>"), S::None),
 
-    nis("Recompile_S_Bfe_U64_Sdst2Ssrc02Ssrc1",  3452, T::SBfeU64,  F::Sdst2Ssrc02Ssrc1, p2("", ""), S::NonZero),
+    fs(recompile_s_bfe_u64,  T::SBfeU64,  F::Sdst2Ssrc02Ssrc1, p2("", ""), S::NonZero),
     fs(recompile_s_lshl_b64, T::SLshlB64, F::Sdst2Ssrc02Ssrc1, p2("", ""), S::NonZero),
     fs(recompile_s_lshr_b64, T::SLshrB64, F::Sdst2Ssrc02Ssrc1, p2("", ""), S::NonZero),
 
@@ -5249,7 +5241,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
 
     f(recompile_smov_b32, T::SMovB32,  F::SVdstSVsrc0, p1("")),
     f(recompile_smov_b32, T::SMovkI32, F::SVdstSVsrc0, p1("")),
-    ni("Recompile_SMulkI32_SVdstSVsrc0", 4437, T::SMulkI32, F::SVdstSVsrc0, p1("")),
+    f(recompile_smulk_i32, T::SMulkI32, F::SVdstSVsrc0, p1("")),
     ni("Recompile_V_XXX_B32_SVdstSVsrc0", 5538, T::VBfrevB32, F::SVdstSVsrc0, p1("%t_<index> = OpBitReverse %uint %t0_<index>")),
     ni("Recompile_V_XXX_B32_SVdstSVsrc0", 5538, T::VNotB32,   F::SVdstSVsrc0, p1("%t_<index> = OpNot %uint %t0_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc0, T::VCeilF32,  F::SVdstSVsrc0, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Ceil %t0_<index>")),
@@ -5274,10 +5266,10 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_vcvt_f32_xxx, T::VCvtF32Ubyte3, F::SVdstSVsrc0, p2("%tb_<index> = OpBitFieldUExtract %uint %t0_<index> %uint_24 %uint_8", "%t_<index> = OpConvertUToF %float %tb_<index>")),
     f(recompile_vmov_b32, T::VMovB32, F::SVdstSVsrc0, p1("")),
 
-    nis("Recompile_SAndSaveexecB64_Sdst2Ssrc02", 3670, T::SAndSaveexecB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
+    fs(recompile_s_and_saveexec_b64, T::SAndSaveexecB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
     f(recompile_smov_b64,    T::SMovB64,    F::Sdst2Ssrc02, p1("")),
     f(recompile_sswappc_b64, T::SSwappcB64, F::Sdst2Ssrc02, p1("")),
-    nis("Recompile_SWqmB64_Sdst2Ssrc02", 4621, T::SWqmB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
+    fs(recompile_swqm_b64, T::SWqmB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
 
     f(recompile_skip, T::SInstPrefetch, F::Imm, p1("")),
     f(recompile_skip, T::SSendmsg,      F::Imm, p1("")),
@@ -5538,8 +5530,8 @@ mod tests {
             .count();
         assert_eq!(table.len(), 204, "table must mirror Kyty row-for-row");
         assert_eq!(implemented + ni, table.len());
-        assert_eq!(implemented, 79, "C1 implemented subset");
-        assert_eq!(ni, 125, "C2 remainder");
+        assert_eq!(implemented, 87, "C1 implemented subset");
+        assert_eq!(ni, 117, "C2 remainder");
 
         // Kyty EXIT_IF(map->Contains(p)) — (type, format) keys are unique.
         let mut seen = std::collections::HashSet::new();
@@ -5608,6 +5600,111 @@ mod tests {
                  leaves scc never updated"
             );
         }
+    }
+
+    /// Every newly-wired row carries **exactly** the `SccCheck` Kyty's table
+    /// gives it — no more, no less.
+    ///
+    /// The `f`/`fs` split cuts both ways, and each direction is a silent
+    /// wrong-answer bug that compiles and passes an "is it wired?" check:
+    ///
+    /// * `f()` hardcodes `SccCheck::None`. Routing an SCC-bearing row through
+    ///   it makes `get_scc_check` return `""`, so `scc` is **never updated**
+    ///   after e.g. `s_wqm_b64`.
+    /// * `fs()` carries whatever it is handed. Routing a `None` row through it
+    ///   with a made-up check **invents** an `scc` write Kyty does not emit.
+    ///
+    /// The values below were each read out of Kyty's `g_recomp_func` row, not
+    /// guessed: `DsAppend`/`DsConsume`/`ImageLoad`/`ImageStore`/`SMulkI32` omit
+    /// the 5th initializer, so `scc_check` takes the struct's default-member
+    /// initializer (`SccCheck::None`, ShaderSpirv.cpp L1555); the rest spell
+    /// `SccCheck::NonZero` explicitly.
+    #[test]
+    fn newly_wired_rows_carry_kytys_own_scc_check() {
+        // (type, format, expected SccCheck, Kyty g_recomp_func evidence)
+        let cases: &[(T, F, SccCheck, &str)] = &[
+            (
+                T::DsAppend,
+                F::VdstGds,
+                SccCheck::None,
+                "L6197: no 5th initializer",
+            ),
+            (
+                T::DsConsume,
+                F::VdstGds,
+                SccCheck::None,
+                "L6198: no 5th initializer",
+            ),
+            (
+                T::ImageLoad,
+                F::Vdata4Vaddr3StDmaskF,
+                SccCheck::None,
+                "no 5th initializer",
+            ),
+            (
+                T::ImageStore,
+                F::Vdata4Vaddr3StDmaskF,
+                SccCheck::None,
+                "no 5th initializer",
+            ),
+            (
+                T::SMulkI32,
+                F::SVdstSVsrc0,
+                SccCheck::None,
+                "no 5th initializer",
+            ),
+            (
+                T::SBfeU64,
+                F::Sdst2Ssrc02Ssrc1,
+                SccCheck::NonZero,
+                "explicit SccCheck::NonZero",
+            ),
+            (
+                T::SAndSaveexecB64,
+                F::Sdst2Ssrc02,
+                SccCheck::NonZero,
+                "explicit SccCheck::NonZero",
+            ),
+            (
+                T::SWqmB64,
+                F::Sdst2Ssrc02,
+                SccCheck::NonZero,
+                "L6350: explicit SccCheck::NonZero",
+            ),
+        ];
+
+        for (ty, fmt, expected, why) in cases {
+            let e = recomp_func(*ty, *fmt)
+                .unwrap_or_else(|| panic!("{ty:?}/{fmt:?} must have a table row"));
+            assert!(
+                matches!(e.func, RecompileFn::Func(_)),
+                "{ty:?} is staged and verified faithful — it must be wired, not NotImplemented"
+            );
+            assert_eq!(
+                e.scc_check, *expected,
+                "{ty:?} must carry Kyty's own SccCheck ({why}); a mismatch here silently \
+                 drops or invents an scc update"
+            );
+        }
+    }
+
+    /// `DsAppend` and `DsConsume` share one Rust helper (`ds_append_consume`)
+    /// parameterised by the atomic op, so a transposed argument at the two call
+    /// sites would compile, wire, and silently turn every append into a
+    /// decrement. The rows must stay distinct and both wired.
+    #[test]
+    fn ds_append_and_consume_are_distinct_wired_rows() {
+        let a = recomp_func(T::DsAppend, F::VdstGds).expect("DsAppend row");
+        let c = recomp_func(T::DsConsume, F::VdstGds).expect("DsConsume row");
+        assert!(matches!(a.func, RecompileFn::Func(_)));
+        assert!(matches!(c.func, RecompileFn::Func(_)));
+        assert_ne!(
+            a.type_, c.type_,
+            "append and consume must not collapse onto one row"
+        );
+        // Kyty gives both `{\"\"}` — param must survive the ni -> f swap.
+        assert_eq!(a.param, p1(""));
+        assert_eq!(c.param, p1(""));
     }
 
     #[test]
