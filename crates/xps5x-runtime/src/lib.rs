@@ -24,6 +24,8 @@ mod process;
 #[cfg(target_os = "windows")]
 mod stack;
 #[cfg(target_os = "windows")]
+mod stub;
+#[cfg(target_os = "windows")]
 mod tls;
 #[cfg(target_os = "windows")]
 mod trampoline;
@@ -90,6 +92,17 @@ pub enum RuntimeError {
     /// `addr` is the faulting instruction's `Rip`.
     #[error("guest fault at {addr:#x}")]
     Faulted { addr: u64 },
+    /// The guest **called an import nothing implements**: execution reached a
+    /// per-NID unresolved stub (`UNRESOLVED_STUB_BASE + i * 8`), which the
+    /// linker wrote into that symbol's relocation slots.
+    ///
+    /// This is the single most actionable outcome the runtime produces. It
+    /// used to surface as `Faulted { addr: 0x5000_0000_0000 }` — every missing
+    /// import shared one address, so the fault could not say *which* function
+    /// the guest wanted. `nid` names it; map it through
+    /// [`xps5x_firmware::LinkedModule::unresolved_stubs`] for the library.
+    #[error("guest called unimplemented import nid {nid:#018x} (stub {addr:#x})")]
+    UnimplementedImport { nid: u64, addr: u64 },
     /// More than 6 integer/pointer arguments were requested — RT0 only
     /// marshals the SysV integer argument registers (design doc §3).
     #[error("more than 6 arguments requested (RT0 marshals only the SysV integer registers)")]
@@ -198,6 +211,7 @@ pub fn execute_linked(
     let outcome = unsafe {
         dispatch::run(
             &module.hle_trampolines,
+            &module.unresolved_stubs,
             hle,
             kernel,
             &arena,
@@ -307,6 +321,7 @@ pub fn execute_process(
     unsafe {
         dispatch::run(
             &module.hle_trampolines,
+            &module.unresolved_stubs,
             hle,
             kernel,
             &arena,

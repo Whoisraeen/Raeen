@@ -19,7 +19,7 @@ use xps5x_firmware::dynlib::nid::{NidDatabase, nid_of};
 use xps5x_firmware::dynlib::{DynSymbol, DynlibData, SceRela};
 use xps5x_firmware::{
     HLE_TRAMPOLINE_BASE, HleTrampoline, LinkedModule, ModuleRegistry, SprxModule, SprxSegment,
-    TlsTemplate, link_module,
+    TlsTemplate, UNRESOLVED_STUB_BASE, UnresolvedStub, link_module,
 };
 use xps5x_hle::{HleContext, HleRegistry};
 use xps5x_kernel::OrbisKernel;
@@ -189,6 +189,115 @@ fn sentinel_call_through_real_lm1_linker_dispatches_to_hle() {
     );
 }
 
+/// A guest `call` to a per-NID unresolved stub must name **which import** the
+/// guest wanted — not just report an address.
+///
+/// This is the acceptance test for moving the fault off `0x5000_0000_0000`.
+/// Every unresolved symbol used to share that one sentinel, so the runtime
+/// could only say `Faulted { addr: 0x5000_0000_0000 }` — true, recovered, and
+/// useless: it named nothing to go implement. Here the guest calls the stub
+/// belonging to table index 2, and the runtime reports *that entry's* NID.
+///
+/// Measured motivation: on a real title this turns the launch outcome from
+/// `Faulted { addr: 0x5000_0000_0000 }` into "guest called nid
+/// 0x6f3404c72d7cf592 from library 'libc'".
+#[test]
+fn call_to_unresolved_stub_reports_which_import_the_guest_wanted() {
+    const ENTRY_OFF: usize = 0x0;
+    const SLOT_OFF: usize = 0x10;
+    const WANTED_NID: u64 = 0x6F34_04C7_2D7C_F592;
+
+    let hle = HleRegistry::new();
+
+    let mut image = vec![0u8; 0x100];
+    write_entry_stub(&mut image, ENTRY_OFF, SLOT_OFF);
+    // Index 2's stub — deliberately NOT index 0, so a regression that reports
+    // the base address (or always picks slot 0) fails here.
+    let stub_addr = UNRESOLVED_STUB_BASE + 2 * 8;
+    image[SLOT_OFF..SLOT_OFF + 8].copy_from_slice(&stub_addr.to_le_bytes());
+
+    let stubs = vec![
+        UnresolvedStub {
+            nid: 0x1111,
+            library: Some("libkernel".to_string()),
+            addr: UNRESOLVED_STUB_BASE,
+        },
+        UnresolvedStub {
+            nid: 0x2222,
+            library: Some("libSceAgc".to_string()),
+            addr: UNRESOLVED_STUB_BASE + 8,
+        },
+        UnresolvedStub {
+            nid: WANTED_NID,
+            library: Some("libc".to_string()),
+            addr: stub_addr,
+        },
+    ];
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        unresolved_stubs: stubs,
+        hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: ENTRY_OFF as u64,
+        tls: None,
+        procparam_offset: None,
+    };
+
+    let kernel = OrbisKernel::new();
+    let err = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).unwrap_err();
+
+    assert_eq!(
+        err,
+        RuntimeError::UnimplementedImport {
+            nid: WANTED_NID,
+            addr: stub_addr,
+        },
+        "the fault must name the import, not just an address"
+    );
+    // The old behaviour, pinned as gone.
+    assert!(
+        !matches!(err, RuntimeError::Faulted { .. }),
+        "an unresolved-import call must not degrade to an anonymous Faulted"
+    );
+}
+
+/// A guest fault that lands in the unresolved-stub *range* but names no
+/// table entry is an ordinary wild fault, not an import — the reverse map
+/// must not invent a NID for it.
+#[test]
+fn wild_fault_past_the_stub_table_is_still_an_anonymous_fault() {
+    const ENTRY_OFF: usize = 0x0;
+    const SLOT_OFF: usize = 0x10;
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+    write_entry_stub(&mut image, ENTRY_OFF, SLOT_OFF);
+    // Slot 5, but the table below has only one entry.
+    let wild = UNRESOLVED_STUB_BASE + 5 * 8;
+    image[SLOT_OFF..SLOT_OFF + 8].copy_from_slice(&wild.to_le_bytes());
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        unresolved_stubs: vec![UnresolvedStub {
+            nid: 0x1111,
+            library: Some("libc".to_string()),
+            addr: UNRESOLVED_STUB_BASE,
+        }],
+        hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: ENTRY_OFF as u64,
+        tls: None,
+        procparam_offset: None,
+    };
+
+    let kernel = OrbisKernel::new();
+    let err = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).unwrap_err();
+    assert_eq!(err, RuntimeError::Faulted { addr: wild });
+}
+
 /// A guest `call` through a trampoline slot whose index has no
 /// corresponding [`HleTrampoline`] entry (out of range of the module's
 /// table) must surface as `Err(UnresolvedTrampoline(_))`, not hang or
@@ -213,6 +322,7 @@ fn call_to_unmapped_trampoline_index_returns_unresolved() {
         image,
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
@@ -234,6 +344,7 @@ fn more_than_six_args_is_rejected() {
         image: vec![0xC3], // ret
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: Vec::new(),
         entry: 0,
         tls: None,
@@ -272,6 +383,7 @@ fn genuine_wild_fault_recovers_as_faulted_then_process_keeps_running() {
         image,
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
@@ -1170,6 +1282,7 @@ fn guest_stub_uses_real_guest_stack_memory_and_returns_correct_value() {
         image,
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
@@ -1225,6 +1338,7 @@ fn guest_clobbering_r15_does_not_corrupt_host_rsp() {
         image,
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
@@ -1290,6 +1404,7 @@ fn trivial_ret_module() -> LinkedModule {
         image: vec![0xC3], // ret
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: Vec::new(),
         entry: 0,
         tls: None,
@@ -1332,6 +1447,7 @@ fn guest_fs_zero_load_reads_the_installed_tcb() {
         image,
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
@@ -1407,6 +1523,7 @@ fn guest_tls_survives_preemption_via_fsbase_rearm() {
         image,
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
@@ -1513,6 +1630,7 @@ fn genuine_wild_fault_after_preemption_recovers_instead_of_looping_the_veh() {
         image,
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
@@ -1602,6 +1720,7 @@ fn guest_fs_offset_round_trip_writes_and_reads_back() {
         image,
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
@@ -1704,6 +1823,7 @@ fn host_fsbase_is_restored_after_a_recovered_genuine_fault() {
         image,
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
@@ -1794,6 +1914,7 @@ fn start_stub_observes_argc_via_rdi_per_the_orbis_entry_abi() {
         image,
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
@@ -1829,6 +1950,7 @@ fn start_stub_observes_argc_equal_to_one_via_the_process_stack() {
         image,
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
@@ -1865,6 +1987,7 @@ fn start_stub_observes_argv0_first_byte_via_the_process_stack() {
         image,
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
@@ -1927,6 +2050,7 @@ fn start_stub_calling_exit_returns_exited_with_the_given_code() {
         image,
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: vec![HleTrampoline {
             library: "libc".to_string(),
             function: "exit".to_string(),
@@ -1986,6 +2110,7 @@ fn start_stub_wild_fault_still_recovers_as_faulted_through_execute_process() {
         image,
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
@@ -2037,6 +2162,7 @@ fn execute_process_restores_host_fsbase_after_an_exit_longjmp() {
         image,
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: vec![HleTrampoline {
             library: "libc".to_string(),
             function: "exit".to_string(),
@@ -2225,6 +2351,7 @@ fn stack_chk_guard_canary_at_fs_0x28_is_nonzero_with_terminator_byte() {
         image,
         base: GUEST_ARENA_BASE,
         unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
         hle_trampolines: vec![HleTrampoline {
             library: "libc".to_string(),
             function: "exit".to_string(),

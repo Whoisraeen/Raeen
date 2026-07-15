@@ -23,7 +23,8 @@ pub use crypto::{
     DecryptedSelf, KeyProvider, KeyRequest, NoKeysProvider, SegmentKey, decrypt_self, require_key,
 };
 pub use dynlib::linker::{
-    HLE_TRAMPOLINE_BASE, HleTrampoline, LinkedModule, UNRESOLVED_STUB_ADDR, link_module,
+    HLE_TRAMPOLINE_BASE, HleTrampoline, LinkedModule, UNRESOLVED_STUB_BASE, UnresolvedImport,
+    UnresolvedStub, link_module,
 };
 pub use pup::Firmware;
 pub use registry::{ModulePolicy, ModuleRegistry, Resolver};
@@ -135,12 +136,25 @@ fn align_up_16k(v: u64) -> u64 {
 ///
 /// # Why this exists
 ///
-/// A real title's imports are overwhelmingly satisfied by libraries that ship
-/// *inside the game folder*, not by HLE. Measured on a retail PS5 title: 86852
-/// of its 87222 unresolved imports (99.6%) are `libfmod` — a third-party audio
-/// engine whose `libfmod.prx` sits beside the eboot. It can never be HLE'd; it
-/// is the game's own code and must be loaded. Loading it (plus its siblings)
+/// Some of a real title's imports are satisfied by libraries that ship *inside
+/// the game folder* rather than by HLE — a third-party audio engine
+/// (`libfmod.prx`), a UI runtime (`libcohtml.Prospero.prx`). Those are the
+/// game's own code: they can never be HLE'd and must be loaded. Loading them
 /// contributes their exports, which resolve the main module's imports by NID.
+///
+/// # Scale, honestly
+///
+/// This is a real but **small** effect. Measured on a retail PS5 title
+/// (Minecraft, 876 distinct imports / 87414 import relocations): the bundled
+/// `.prx` supply 116 of those relocations — `libfmod` 54 and
+/// `libcohtml.Prospero` 62. The overwhelming majority (86883, 99.4%) are
+/// `libc`, which is HLE territory.
+///
+/// An earlier revision of this comment claimed 86852/87222 (99.6%) were
+/// `libfmod`. That was wrong: it came from indexing a symbol's `#lib#` id into
+/// the *needed-module* table instead of the *import-library* table, which
+/// renamed every library (see `dynlib::DT_SCE_NEEDED_MODULE_1`). Do not
+/// resurrect that number.
 ///
 /// # How
 ///

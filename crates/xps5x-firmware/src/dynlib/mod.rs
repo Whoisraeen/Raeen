@@ -47,12 +47,47 @@ const DT_STRSZ: u64 = 10;
 const DT_SYMENT: u64 = 11;
 const DT_JMPREL: u64 = 23;
 
-/// `DT_SCE_IMPORT_LIB`: one per library this module imports from. The value
-/// packs `(library_id << 48) | (version << 32) | name_strtab_offset` — so it
-/// maps a [`SymbolRef::library_index`] to a human-readable library name.
-/// Verified against a real title (`0x0001_0101_000036d8` => id 1, name at
-/// `0x36d8` = "libcohtml.Prospero.prx").
-const DT_SCE_IMPORT_LIB: u64 = 0x6100_0045;
+/// `DT_SCE_NEEDED_MODULE_1`: one per **module** (`.prx` file) this module
+/// depends on. The value packs
+/// `(module_id << 48) | (version << 32) | name_strtab_offset`.
+///
+/// # This is NOT the import-library tag
+///
+/// `0x6100_0045` was previously named `DT_SCE_IMPORT_LIB` here, and a symbol's
+/// `#lib#` field was looked up in it. That is wrong, and it is why the
+/// `--load-sprx` ranking reported "86852 unresolved imports are libfmod" for a
+/// real title when the true answer is **libc**.
+///
+/// A real PS5 title carries **two parallel, differently-numbered tables**:
+///
+/// | tag | table | ids | contents |
+/// |-----|-------|-----|----------|
+/// | `0x6100_0045` [`DT_SCE_NEEDED_MODULE_1`] | modules | 1..=N | 1:1 with the `DT_NEEDED` `.prx` names |
+/// | `0x6100_0049` [`DT_SCE_IMPORT_LIB_1`] | libraries | 0..=M | the libraries *inside* those modules |
+///
+/// One module exports several libraries (module `libkernel` provides libraries
+/// `libkernel`, `libScePosix`, `libSceCoredump`, ...), so the two tables have
+/// different lengths and different numbering. On the measured title the module
+/// table holds 50 entries numbered 1..=50 and the library table 54 numbered
+/// 0..=53 — an effective off-by-one on the shared prefix. Reading a `#lib#`
+/// id of 3 out of the *module* table yields `libfmod`; out of the *library*
+/// table (correct) it yields `libc`.
+///
+/// Cross-checked against Kyty's tag table (`DT_OS_NEEDED_MODULE_1 =
+/// 0x61000045`, `DT_OS_IMPORT_LIB_1 = 0x61000049`, MIT © InoriRus) and
+/// measured directly against a real title's `PT_DYNAMIC`.
+const DT_SCE_NEEDED_MODULE_1: u64 = 0x6100_0045;
+
+/// `DT_SCE_IMPORT_LIB_1`: one per **library** this module imports from. The
+/// value packs `(library_id << 48) | (version << 32) | name_strtab_offset` —
+/// this is what a symbol's [`SymbolRef::library_index`] (`#lib#`) indexes.
+/// See [`DT_SCE_NEEDED_MODULE_1`] for why the two tables must not be confused.
+const DT_SCE_IMPORT_LIB_1: u64 = 0x6100_0049;
+
+/// The older (PS4-era) spellings of the same two tables. Accepted as
+/// equivalents so a module that carries either generation decodes the same.
+const DT_SCE_NEEDED_MODULE: u64 = 0x6100_000F;
+const DT_SCE_IMPORT_LIB: u64 = 0x6100_0015;
 
 const DT_SCE_HASH: u64 = 0x6100_0025;
 const DT_SCE_PLTRELSZ: u64 = 0x6100_002D;
@@ -127,19 +162,30 @@ pub struct DynlibData {
     /// `DT_SCE_RELA` entries followed by `DT_SCE_JMPREL` entries, in that
     /// order.
     pub relocations: Vec<SceRela>,
-    /// TODO(LM1+): the documented tag set consumed here does not include a
-    /// `DT_SCE_NEEDED_MODULE`-style tag with a confirmed layout, so this is
-    /// always empty until that's verified against a real module.
+    /// Dependency `.prx` file names, from the standard `DT_NEEDED` tags.
     pub needed_modules: Vec<String>,
-    /// `library_index` -> library name, from the [`DT_SCE_IMPORT_LIB`] tags.
+    /// `library_index` -> library name, from [`DT_SCE_IMPORT_LIB_1`] (or its
+    /// PS4-era spelling [`DT_SCE_IMPORT_LIB`]). Indexed by a symbol's
+    /// [`SymbolRef::library_index`] (its `#lib#` field).
     ///
     /// This is what makes an unresolved import *actionable*: a NID is a one-way
     /// hash, so an unresolved one cannot be turned back into a function name —
     /// but every import symbol carries a [`SymbolRef::library_index`], and this
-    /// maps that to a real name ("libSceAgc.prx", ...). Grouping unresolved
-    /// imports by library turns "688 unknown NIDs" into a prioritized list of
-    /// which libraries to implement.
+    /// maps that to a real name ("libc", "libScePosix", ...). Grouping
+    /// unresolved imports by library turns "87k unknown NIDs" into a
+    /// prioritized list of which libraries to implement.
+    ///
+    /// Must be indexed with [`SymbolRef::library_index`] and **never** with
+    /// [`SymbolRef::module_index`] — see [`DT_SCE_NEEDED_MODULE_1`] for the
+    /// misattribution that costs.
     pub import_libs: Vec<(u16, String)>,
+    /// `module_index` -> module name, from [`DT_SCE_NEEDED_MODULE_1`] (or its
+    /// PS4-era spelling [`DT_SCE_NEEDED_MODULE`]). Indexed by a symbol's
+    /// [`SymbolRef::module_index`] (its `#mod#` field).
+    ///
+    /// A module is the `.prx` that *contains* one or more libraries; these
+    /// names run 1:1 with [`Self::needed_modules`] (minus the `.prx` suffix).
+    pub import_modules: Vec<(u16, String)>,
 }
 
 /// Decode the `Elf64_Dyn` `(d_tag: u64, d_val: u64)` array from a raw
@@ -256,7 +302,7 @@ pub fn standard_dynamic_view(
     // plus DT_NEEDED so module names still resolve.
     //
     // Only the tags this function *mapped* above are skipped. Do NOT dedupe by
-    // tag generally: DT_NEEDED and DT_SCE_IMPORT_LIB are inherently REPEATED
+    // tag generally: DT_NEEDED and the id/name tables are inherently REPEATED
     // (one per dependency / imported library — ~50 each on a real title), so a
     // "keep the first of each tag" filter silently drops all but one, leaving
     // exactly one library name and one NEEDED entry.
@@ -357,24 +403,22 @@ pub fn parse_dynlibdata(blob: &[u8], dyn_tags: &[(u64, u64)]) -> Result<DynlibDa
         }
     }
 
-    // `DT_SCE_IMPORT_LIB`: library_index -> name. See `DynlibData::import_libs`
-    // for why this matters (it's what makes an unresolved NID actionable).
-    let mut import_libs = Vec::new();
-    for &(tag, val) in dyn_tags {
-        if tag != DT_SCE_IMPORT_LIB {
-            continue;
-        }
-        let id = (val >> 48) as u16;
-        let off = (val & 0xFFFF_FFFF) as usize;
-        match read_cstr(strtab, off) {
-            Some(name) if !name.is_empty() => import_libs.push((id, name)),
-            _ => tracing::debug!(
-                "DT_SCE_IMPORT_LIB id {id} name offset {off:#x} is out of range (strtab len {}) \
-                 or empty; skipping",
-                strtab.len()
-            ),
-        }
-    }
+    // The two `(id << 48) | (version << 32) | name_off` tables. They are
+    // separate, differently-numbered id spaces and must not be crossed — see
+    // `DT_SCE_NEEDED_MODULE_1`. `import_libs` is indexed by a symbol's `#lib#`
+    // field, `import_modules` by its `#mod#` field.
+    let import_libs = decode_id_name_table(
+        dyn_tags,
+        strtab,
+        &[DT_SCE_IMPORT_LIB_1, DT_SCE_IMPORT_LIB],
+        "import library",
+    );
+    let import_modules = decode_id_name_table(
+        dyn_tags,
+        strtab,
+        &[DT_SCE_NEEDED_MODULE_1, DT_SCE_NEEDED_MODULE],
+        "needed module",
+    );
 
     Ok(DynlibData {
         imports,
@@ -383,7 +427,41 @@ pub fn parse_dynlibdata(blob: &[u8], dyn_tags: &[(u64, u64)]) -> Result<DynlibDa
         relocations,
         needed_modules,
         import_libs,
+        import_modules,
     })
+}
+
+/// Decode every `(id << 48) | (version << 32) | name_strtab_offset` entry for
+/// any of `tags` into `(id, name)` pairs, in file order.
+///
+/// `tags` lists equivalent spellings of the *same* table (the `_1` form and its
+/// PS4-era predecessor); a module carries one generation or the other, so both
+/// are read into one list. Entries whose name offset is out of range or empty
+/// are skipped with a `debug!` rather than failing the parse — a module with a
+/// odd entry is still worth loading.
+fn decode_id_name_table(
+    dyn_tags: &[(u64, u64)],
+    strtab: &[u8],
+    tags: &[u64],
+    label: &str,
+) -> Vec<(u16, String)> {
+    let mut out = Vec::new();
+    for &(tag, val) in dyn_tags {
+        if !tags.contains(&tag) {
+            continue;
+        }
+        let id = (val >> 48) as u16;
+        let off = (val & 0xFFFF_FFFF) as usize;
+        match read_cstr(strtab, off) {
+            Some(name) if !name.is_empty() => out.push((id, name)),
+            _ => tracing::debug!(
+                "{label} id {id} name offset {off:#x} is out of range (strtab len {}) or empty; \
+                 skipping",
+                strtab.len()
+            ),
+        }
+    }
+    out
 }
 
 /// Look up the (first) value for `tag` in `dyn_tags`.
@@ -513,18 +591,20 @@ fn decode_symbols(
         });
 
         if st_shndx == 0 || st_value == 0 {
-            // TODO(LM1+): verify index encoding. `rest` is expected to be
-            // "<lib_id>#<mod_id>" per the documented SCE strtab convention,
-            // but `decode_nid` requires >=8 decoded bytes and single/double
-            // -character indices decode to fewer, so this commonly falls
-            // back to 0 until the real (likely much simpler) index encoding
-            // is confirmed against a real module.
-            let mut parts = rest.unwrap_or("").split('#');
+            // `<nid>#<library>#<module>` — library FIRST, module second (this
+            // order is confirmed against a real title: symbol `...#q#X` decodes
+            // to library `libScePosix` / module `libkernel`, and libScePosix is
+            // one of the libraries the libkernel module provides).
+            //
             // `decode_index`, not `decode_nid`: these are short, variable-length
-            // fields (`<nid>#<lib>#<mod>`, e.g. `rTXw65xmLIA#l#l`), and
-            // `decode_nid` requires >= 8 decoded bytes so it returned None for
-            // every one of them — silently making every import's library index
-            // 0, which matches no DT_SCE_IMPORT_LIB entry (real ids start at 1).
+            // fields (e.g. `rTXw65xmLIA#l#l`), and `decode_nid` requires >= 8
+            // decoded bytes so it returned None for every one of them —
+            // silently making every index 0.
+            //
+            // The two indices address DIFFERENT tables with DIFFERENT numbering
+            // (`DynlibData::import_libs` vs `import_modules`); crossing them
+            // silently renames every library. See `DT_SCE_NEEDED_MODULE_1`.
+            let mut parts = rest.unwrap_or("").split('#');
             let library_index = parts.next().and_then(nid::decode_index).unwrap_or(0);
             let module_index = parts.next().and_then(nid::decode_index).unwrap_or(0);
             imports.push(SymbolRef {
@@ -606,6 +686,161 @@ mod tests {
                 "libSceLibcInternal.sprx".to_string(),
                 "libSceFios2.sprx".to_string()
             ]
+        );
+    }
+
+    /// The libraries and the modules are two DIFFERENT tables with DIFFERENT
+    /// numbering, and a symbol's `#lib#` field indexes the *library* one.
+    ///
+    /// This pins the bug that produced a badly wrong headline for months: a
+    /// real title carries `DT_SCE_NEEDED_MODULE_1` (`0x6100_0045`, modules,
+    /// ids 1..) *and* `DT_SCE_IMPORT_LIB_1` (`0x6100_0049`, libraries, ids
+    /// 0..). `0x6100_0045` was named `DT_SCE_IMPORT_LIB` and a symbol's
+    /// library id was looked up in it, so every library came out shifted by
+    /// one and 86852 `libc` relocations were reported as `libfmod`.
+    ///
+    /// The shape here mirrors the measured title exactly: the same names
+    /// appear in both tables, offset by one, and the library table has an
+    /// extra entry (`libScePosix`) that lives *inside* the `libkernel` module.
+    #[test]
+    fn library_ids_index_the_library_table_not_the_needed_module_table() {
+        let mut strtab = vec![0u8];
+        let add = |s: &[u8], strtab: &mut Vec<u8>| {
+            let off = strtab.len() as u64;
+            strtab.extend_from_slice(s);
+            strtab.push(0);
+            off
+        };
+        let fmod = add(b"libfmod", &mut strtab);
+        let libc = add(b"libc", &mut strtab);
+        let kernel = add(b"libkernel", &mut strtab);
+        let posix = add(b"libScePosix", &mut strtab);
+        let blob = strtab.clone();
+
+        let dyn_tags = vec![
+            (DT_SCE_STRTAB, 0u64),
+            (DT_SCE_STRSZ, strtab.len() as u64),
+            // Modules (ids 1..): libfmod=1, libc=2, libkernel=3.
+            (DT_SCE_NEEDED_MODULE_1, (1u64 << 48) | fmod),
+            (DT_SCE_NEEDED_MODULE_1, (2u64 << 48) | libc),
+            (DT_SCE_NEEDED_MODULE_1, (3u64 << 48) | kernel),
+            // Libraries (ids 0..): libfmod=0, libc=1, libkernel=2,
+            // libScePosix=3 — a library provided by the libkernel *module*.
+            (DT_SCE_IMPORT_LIB_1, fmod),
+            (DT_SCE_IMPORT_LIB_1, (1u64 << 48) | libc),
+            (DT_SCE_IMPORT_LIB_1, (2u64 << 48) | kernel),
+            (DT_SCE_IMPORT_LIB_1, (3u64 << 48) | posix),
+        ];
+
+        let dynlib = parse_dynlibdata(&blob, &dyn_tags).expect("parses");
+
+        assert_eq!(
+            dynlib.import_libs,
+            vec![
+                (0, "libfmod".to_string()),
+                (1, "libc".to_string()),
+                (2, "libkernel".to_string()),
+                (3, "libScePosix".to_string()),
+            ],
+            "import_libs must come from DT_SCE_IMPORT_LIB_1 (0x61000049)"
+        );
+        assert_eq!(
+            dynlib.import_modules,
+            vec![
+                (1, "libfmod".to_string()),
+                (2, "libc".to_string()),
+                (3, "libkernel".to_string()),
+            ],
+            "import_modules must come from DT_SCE_NEEDED_MODULE_1 (0x61000045)"
+        );
+
+        // The bug, precisely: library id 1 is `libc`. Reading id 1 out of the
+        // *module* table gives `libfmod` — the exact misattribution shipped.
+        let by_lib = |id: u16| {
+            dynlib
+                .import_libs
+                .iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, n)| n.as_str())
+        };
+        let by_mod = |id: u16| {
+            dynlib
+                .import_modules
+                .iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, n)| n.as_str())
+        };
+        assert_eq!(by_lib(1), Some("libc"));
+        assert_eq!(by_mod(1), Some("libfmod"));
+        assert_ne!(
+            by_lib(1),
+            by_mod(1),
+            "the two tables disagree for the same id — that is the whole point"
+        );
+    }
+
+    /// The PS4-era spellings of the same two tables decode identically, so a
+    /// module carrying either generation attributes its imports the same.
+    #[test]
+    fn ps4_era_library_and_module_tags_decode_to_the_same_tables() {
+        let mut strtab = vec![0u8];
+        strtab.extend_from_slice(b"libc\0");
+        let blob = strtab.clone();
+
+        let dyn_tags = vec![
+            (DT_SCE_STRTAB, 0u64),
+            (DT_SCE_STRSZ, strtab.len() as u64),
+            (DT_SCE_IMPORT_LIB, (7u64 << 48) | 1),
+            (DT_SCE_NEEDED_MODULE, (9u64 << 48) | 1),
+        ];
+
+        let dynlib = parse_dynlibdata(&blob, &dyn_tags).expect("parses");
+        assert_eq!(dynlib.import_libs, vec![(7, "libc".to_string())]);
+        assert_eq!(dynlib.import_modules, vec![(9, "libc".to_string())]);
+    }
+
+    /// A symbol name is `<nid>#<library>#<module>` — library first. Confirmed
+    /// against a real title, where `...#q#X` is library `libScePosix` (id 42)
+    /// in module `libkernel` (id 23).
+    #[test]
+    fn symbol_name_fields_are_library_then_module() {
+        let nid = nid_of("someImportedFunction");
+        let encoded = encode_nid(nid);
+        // 'q' = 42, 'X' = 23 in the SCE base64 alphabet.
+        let name = format!("{encoded}#q#X");
+
+        let mut strtab = vec![0u8];
+        let name_off = strtab.len() as u32;
+        strtab.extend_from_slice(name.as_bytes());
+        strtab.push(0);
+
+        let mut symtab = Vec::new();
+        symtab.extend_from_slice(&name_off.to_le_bytes());
+        symtab.extend_from_slice(&[0u8; 4]); // st_info, st_other, st_shndx = 0 (undefined)
+        symtab.extend_from_slice(&0u64.to_le_bytes()); // st_value
+        symtab.extend_from_slice(&0u64.to_le_bytes()); // st_size
+
+        let mut blob = strtab.clone();
+        let symtab_off = blob.len() as u64;
+        blob.extend_from_slice(&symtab);
+
+        let dyn_tags = vec![
+            (DT_SCE_STRTAB, 0u64),
+            (DT_SCE_STRSZ, strtab.len() as u64),
+            (DT_SCE_SYMTAB, symtab_off),
+            (DT_SCE_SYMTABSZ, symtab.len() as u64),
+            (DT_SCE_SYMENT, ELF64_SYM_SIZE),
+        ];
+
+        let dynlib = parse_dynlibdata(&blob, &dyn_tags).expect("parses");
+        assert_eq!(dynlib.imports.len(), 1);
+        assert_eq!(
+            dynlib.imports[0].library_index, 42,
+            "the FIRST field after the nid is the library"
+        );
+        assert_eq!(
+            dynlib.imports[0].module_index, 23,
+            "the SECOND field after the nid is the module"
         );
     }
 

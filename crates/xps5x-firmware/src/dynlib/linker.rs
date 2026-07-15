@@ -6,7 +6,7 @@
 //!
 //! # Link-time marker addresses
 //!
-//! [`HLE_TRAMPOLINE_BASE`] and [`UNRESOLVED_STUB_ADDR`] are **not real code
+//! [`HLE_TRAMPOLINE_BASE`] and [`UNRESOLVED_STUB_BASE`] are **not real code
 //! addresses** — they are distinct, obviously-synthetic high sentinel
 //! ranges a later runtime milestone will recognize and trap (dispatching to
 //! the HLE registry, or diagnosing an unresolved import) rather than ever
@@ -38,9 +38,26 @@ use crate::sprx::SprxModule;
 /// Deterministic base address for synthetic HLE-trampoline slots. See the
 /// module docs: this is a link-time marker, not a real code address.
 pub const HLE_TRAMPOLINE_BASE: u64 = 0x0000_4000_0000_0000;
-/// Sentinel written into a relocation slot whose symbol resolved to
-/// neither HLE nor a loaded LLE export. See the module docs.
-pub const UNRESOLVED_STUB_ADDR: u64 = 0x0000_5000_0000_0000;
+/// Base of the per-NID unresolved-stub region. A relocation whose symbol
+/// resolved to neither HLE nor a loaded LLE export gets
+/// `UNRESOLVED_STUB_BASE + i * 8`, where `i` indexes
+/// [`LinkedModule::unresolved_stubs`] — exactly the scheme
+/// [`HLE_TRAMPOLINE_BASE`] uses.
+///
+/// # Why per-NID and not one sentinel
+///
+/// Every unresolved symbol used to share this single address. When the guest
+/// called it the runtime could only report `Faulted { addr: 0x5000_0000_0000 }`
+/// — the one thing it could not say was *which import the guest wanted*, which
+/// is the only thing worth knowing. Giving each NID its own slot makes the
+/// faulting address itself the identity of the missing function, so the fault
+/// reports "guest called `<nid>` from `<library>`, unimplemented" and names the
+/// next thing to implement.
+///
+/// The region is deduped by NID, so it is bounded by the module's distinct
+/// import count (876 on the measured retail title ≈ 7 KB), not by its
+/// relocation count (87k).
+pub const UNRESOLVED_STUB_BASE: u64 = 0x0000_5000_0000_0000;
 
 const R_X86_64_64: u32 = 1;
 const R_X86_64_GLOB_DAT: u32 = 6;
@@ -65,14 +82,67 @@ pub struct HleTrampoline {
     pub addr: u64,
 }
 
+/// One relocation whose symbol resolved to neither HLE nor a loaded LLE
+/// export. Recorded per **relocation**, not per symbol: a single NID
+/// referenced by 48292 relocations appears 48292 times, so a raw count of
+/// [`LinkedModule::unresolved`] measures patched slots, not missing functions.
+///
+/// `r_type` is what makes the count readable, because the two are wildly
+/// different work items:
+///
+/// * `R_X86_64_JUMP_SLOT` — a PLT entry the guest will **call**. One per
+///   distinct imported function. This is the real HLE gap.
+/// * `R_X86_64_64` / `R_X86_64_GLOB_DAT` — a **data pointer** slot. On a big
+///   C++ title these are dominated by RTTI: every polymorphic class's typeinfo
+///   object points at a handful of `__cxxabiv1` vtables, so a few symbols
+///   generate tens of thousands of relocations that are never called.
+///
+///
+/// Measured on a retail title, 87414 import relocations break down as 86592
+/// `R_X86_64_64`, 64 `GLOB_DAT`, and **758** `JUMP_SLOT`. The honest size of
+/// the HLE gap is 758, not 87414.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnresolvedImport {
+    pub nid: u64,
+    /// The ELF relocation type (`R_X86_64_*`) of the slot left unresolved.
+    pub r_type: u32,
+}
+
+/// One **distinct** unresolved NID and the stub address reserved for it.
+/// Deduped: a NID referenced by many relocations owns exactly one slot, and
+/// every one of those relocations is patched with that slot's address.
+///
+/// This is the reverse map the runtime needs: a fault at `addr` names `nid`,
+/// and `library` says which library should have supplied it — turning an
+/// opaque access violation into "implement this function next".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedStub {
+    pub nid: u64,
+    /// The importing library's name (from the module's import-library table),
+    /// if the symbol's `#lib#` id maps to one. `None` when the module carries
+    /// no library table, or the id is not in it.
+    pub library: Option<String>,
+    /// `UNRESOLVED_STUB_BASE + i * 8`.
+    pub addr: u64,
+}
+
 /// The result of [`link_module`]: a flat, relocated image plus a record of
 /// what each symbol relocation resolved to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkedModule {
     pub image: Vec<u8>,
     pub base: u64,
-    /// NIDs that resolved to [`Resolver::Unresolved`] — logged, non-fatal.
-    pub unresolved: Vec<u64>,
+    /// Relocations whose symbol resolved to [`Resolver::Unresolved`] — logged,
+    /// non-fatal. **One entry per relocation**; see [`UnresolvedImport`].
+    ///
+    /// Every entry is a genuine import: [`link_module`] skips defined symbols
+    /// before it ever consults the registry, so nothing here is an artifact of
+    /// misclassifying the module's own symbols.
+    pub unresolved: Vec<UnresolvedImport>,
+    /// The distinct unresolved NIDs, in first-encountered order — index `i`
+    /// owns stub address `UNRESOLVED_STUB_BASE + i * 8`. The runtime inverts
+    /// this to name the import a faulting guest call wanted.
+    pub unresolved_stubs: Vec<UnresolvedStub>,
     /// Distinct HLE imports resolved, in first-encountered order, deduped
     /// by NID (a NID referenced by more than one relocation reuses the same
     /// trampoline address and appears here once).
@@ -136,9 +206,26 @@ pub fn link_module(
         image[start..end].copy_from_slice(&seg.data);
     }
 
-    let mut unresolved = Vec::new();
+    let mut unresolved: Vec<UnresolvedImport> = Vec::new();
+    let mut unresolved_stubs: Vec<UnresolvedStub> = Vec::new();
+    let mut stub_addrs: HashMap<u64, u64> = HashMap::new();
     let mut hle_trampolines: Vec<HleTrampoline> = Vec::new();
     let mut hle_addrs: HashMap<u64, u64> = HashMap::new();
+
+    // nid -> importing library name, so an unresolved stub can say which
+    // library owes the guest this function. `library_index` indexes
+    // `import_libs` (the library table) — never `import_modules`; crossing
+    // them renames every library (see `dynlib::DT_SCE_NEEDED_MODULE_1`).
+    let lib_names: HashMap<u16, &str> = dynlib
+        .import_libs
+        .iter()
+        .map(|(id, n)| (*id, n.as_str()))
+        .collect();
+    let lib_of_nid: HashMap<u64, &str> = dynlib
+        .imports
+        .iter()
+        .filter_map(|s| lib_names.get(&s.library_index).map(|n| (s.nid, *n)))
+        .collect();
 
     for reloc in &dynlib.relocations {
         let r_type = (reloc.info & 0xFFFF_FFFF) as u32;
@@ -198,7 +285,7 @@ pub fn link_module(
                 // used to do unconditionally) is actively destructive on a real
                 // title: its ~717k relocations mostly target its OWN internal
                 // symbols, whose NIDs are naturally absent from the HLE
-                // registry, so every one of them had `UNRESOLVED_STUB_ADDR`
+                // registry, so every one of them had `UNRESOLVED_STUB_BASE`
                 // written into it — corrupting the module's internal pointers
                 // and vtables wholesale, and guaranteeing a fault at the stub
                 // the moment any of them was used. It went unnoticed because
@@ -235,8 +322,21 @@ pub fn link_module(
                     }
                     Resolver::Lle { addr } => addr.wrapping_add(reloc.addend as u64),
                     Resolver::Unresolved => {
-                        unresolved.push(symbol.nid);
-                        UNRESOLVED_STUB_ADDR
+                        let nid = symbol.nid;
+                        unresolved.push(UnresolvedImport { nid, r_type });
+                        // Deliberately NOT `+ addend`, unlike the HLE arm: the
+                        // stub address IS the symbol's identity, and the
+                        // runtime inverts it by exact slot. An addend would
+                        // land mid-slot and lose the NID — the whole point.
+                        *stub_addrs.entry(nid).or_insert_with(|| {
+                            let addr = UNRESOLVED_STUB_BASE + (unresolved_stubs.len() as u64 * 8);
+                            unresolved_stubs.push(UnresolvedStub {
+                                nid,
+                                library: lib_of_nid.get(&nid).map(|s| s.to_string()),
+                                addr,
+                            });
+                            addr
+                        })
                     }
                 }
             }
@@ -250,6 +350,7 @@ pub fn link_module(
         image,
         base,
         unresolved,
+        unresolved_stubs,
         hle_trampolines,
         entry: module.entry,
         tls: module.tls.clone(),
@@ -532,8 +633,14 @@ mod tests {
         let linked = link_module(&module, &dynlib, &registry, &hle, 0)
             .expect("unresolved import is non-fatal");
 
-        assert_eq!(read_slot(&linked.image, 0x20), UNRESOLVED_STUB_ADDR);
-        assert_eq!(linked.unresolved, vec![nid]);
+        assert_eq!(read_slot(&linked.image, 0x20), UNRESOLVED_STUB_BASE);
+        assert_eq!(
+            linked.unresolved,
+            vec![UnresolvedImport {
+                nid,
+                r_type: R_X86_64_GLOB_DAT,
+            }]
+        );
     }
 
     #[test]

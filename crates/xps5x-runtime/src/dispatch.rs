@@ -54,12 +54,13 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     EXCEPTION_POINTERS, RemoveVectoredExceptionHandler, RtlCaptureContext,
 };
 
-use xps5x_firmware::HleTrampoline;
+use xps5x_firmware::{HleTrampoline, UnresolvedStub};
 use xps5x_hle::{GuestAllocator, GuestMemory, HleContext, HleRegistry};
 use xps5x_kernel::OrbisKernel;
 
 use crate::RunOutcome;
 use crate::RuntimeError;
+use crate::stub;
 use crate::trampoline::{self, TrampolineGuard};
 
 /// The `(library, function)` set that ends a process-mode run instead of
@@ -139,6 +140,11 @@ pub(crate) fn call_lock() -> std::sync::MutexGuard<'static, ()> {
 /// own synchronization.
 struct ActiveContext {
     trampolines: *const [HleTrampoline],
+    /// The per-NID unresolved-stub table, so a fault inside
+    /// `[UNRESOLVED_STUB_BASE, +len*8)` can name the import the guest wanted
+    /// instead of reporting a bare address. Raw pointer for the same reason as
+    /// `trampolines` (see `CALL_LOCK`).
+    unresolved_stubs: *const [UnresolvedStub],
     hle: *const HleRegistry,
     /// The live kernel an HLE call's [`HleContext::kernel`] borrows from.
     /// Stored as a raw pointer for the same reason `trampolines`/`hle` are
@@ -310,6 +316,7 @@ thread_local! {
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run(
     trampolines: &[HleTrampoline],
+    unresolved_stubs: &[UnresolvedStub],
     hle: &HleRegistry,
     kernel: &OrbisKernel,
     mem: &dyn GuestMemory,
@@ -372,6 +379,7 @@ pub(crate) unsafe fn run(
 
     let ctx = ActiveContext {
         trampolines: trampolines as *const [HleTrampoline],
+        unresolved_stubs: unresolved_stubs as *const [UnresolvedStub],
         hle: hle as *const HleRegistry,
         kernel: kernel as *const OrbisKernel,
         mem: mem_erased as *const dyn GuestMemory,
@@ -651,8 +659,31 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         // overwrite the delivered context with the pre-call snapshot `run`
         // took via `RtlCaptureContext`, and resume there. See this module's
         // doc comment for the full control-flow argument.
-        ctx.error
-            .set(Some(RuntimeError::Faulted { addr: fault_addr }));
+        //
+        // But first: is this an *unresolved import* the guest just called?
+        // The linker gives every distinct missing NID its own stub slot at
+        // `UNRESOLVED_STUB_BASE + i*8` and patches that symbol's relocations
+        // with it, so the faulting address IS the symbol's identity. That is
+        // the difference between "guest fault at 0x5000_0000_0000" (which
+        // names nothing) and "guest called nid 0x… — implement it next".
+        //
+        // The stub region is deliberately never mapped: reaching it always
+        // traps, and it traps *here*, in the generic arm, because it is
+        // outside the HLE guard window. Recovery is identical either way —
+        // only the reported error differs.
+        //
+        // SAFETY: `ctx.unresolved_stubs` was set by `run` from a live borrow
+        // that outlives the guarded call, and only one thread is inside a
+        // guarded call at a time (see `CALL_LOCK`), so this read is sound.
+        let stubs = unsafe { &*ctx.unresolved_stubs };
+        let err = match stub::resolve(fault_addr, stubs) {
+            Some(s) => RuntimeError::UnimplementedImport {
+                nid: s.nid,
+                addr: fault_addr,
+            },
+            None => RuntimeError::Faulted { addr: fault_addr },
+        };
+        ctx.error.set(Some(err));
 
         // SAFETY: `ctx.recovery_ctx` was populated by `run`'s
         // `RtlCaptureContext` call before it called the guest, and is

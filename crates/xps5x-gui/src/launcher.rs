@@ -356,6 +356,22 @@ impl FirmwareLauncher {
                 Err(xps5x_runtime::RuntimeError::Faulted { addr }) => {
                     SessionOutcome::Faulted(format!("Faulted at {addr:#x} during execution"))
                 }
+                // The guest asked for an import nothing implements. Name it:
+                // this is the one fault the user (or we) can actually act on,
+                // and it used to read as an anonymous address.
+                Err(xps5x_runtime::RuntimeError::UnimplementedImport { nid, .. }) => {
+                    let library = linked
+                        .unresolved_stubs
+                        .iter()
+                        .find(|s| s.nid == nid)
+                        .and_then(|s| s.library.as_deref())
+                        .unwrap_or("unknown library");
+                    SessionOutcome::Faulted(format!(
+                        "Unimplemented import: {} ({library}) — the game called a function \
+                         XPS5X does not provide yet",
+                        xps5x_firmware::dynlib::nid::encode_nid(nid)
+                    ))
+                }
                 Err(xps5x_runtime::RuntimeError::UnresolvedTrampoline(a)) => {
                     SessionOutcome::Faulted(format!(
                         "Called an unresolved import (trampoline {a:#x})"
@@ -1076,12 +1092,17 @@ mod firmware_launcher_tests {
             let _ = std::fs::remove_dir_all(&tmp);
         }
 
-        /// A guest `call` to an import nobody registered resolves (at link
-        /// time) to `UNRESOLVED_STUB_ADDR` — a sentinel address outside RT0's
-        /// trampoline guard region, so *calling* it at runtime is a genuine
-        /// wild access violation there, not a recognized-trampoline dispatch.
-        /// Either way it must surface as a clean `Faulted` detail — not a
-        /// crash and not a silently-successful "Ran".
+        /// A guest `call` to an import nobody registered must tell the user
+        /// **which function is missing**, by name and library — not just that
+        /// something faulted.
+        ///
+        /// The linker gives each distinct unresolved NID its own stub address
+        /// (`UNRESOLVED_STUB_BASE + i*8`); calling one is a genuine access
+        /// violation outside RT0's trampoline guard, which the VEH recovers and
+        /// then maps back through the stub table. Before that per-NID scheme
+        /// every missing import shared one address and this test could only
+        /// assert "Faulted at 0x5000000000000" — a message that named nothing
+        /// and gave nobody a next step.
         #[test]
         fn play_faults_cleanly_when_the_module_calls_an_unresolved_import() {
             let hle = xps5x_hle::HleRegistry::new();
@@ -1113,9 +1134,16 @@ mod firmware_launcher_tests {
             let detail = launcher
                 .session_detail(&handle)
                 .expect("fault carries a message");
+            // The message must NAME the missing import, not just an address.
+            let encoded = xps5x_firmware::dynlib::nid::encode_nid(bogus_nid);
             assert!(
-                detail.starts_with("Faulted at 0x") && detail.contains("during execution"),
-                "unexpected message: {detail}"
+                detail.contains("Unimplemented import") && detail.contains(&encoded),
+                "the fault must name the missing import ({encoded}); got: {detail}"
+            );
+            // Pin the old, useless message as gone.
+            assert!(
+                !detail.starts_with("Faulted at 0x"),
+                "an unresolved-import call must not degrade to a bare address: {detail}"
             );
 
             let _ = std::fs::remove_dir_all(&tmp);

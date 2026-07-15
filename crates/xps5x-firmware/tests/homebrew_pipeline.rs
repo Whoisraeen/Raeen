@@ -9,7 +9,7 @@
 
 use xps5x_firmware::crypto::NoKeysProvider;
 use xps5x_firmware::dynlib::nid::{NidDatabase, encode_nid, nid_of};
-use xps5x_firmware::{HLE_TRAMPOLINE_BASE, ModuleRegistry, UNRESOLVED_STUB_ADDR, load_module};
+use xps5x_firmware::{HLE_TRAMPOLINE_BASE, ModuleRegistry, UNRESOLVED_STUB_BASE, load_module};
 use xps5x_hle::HleRegistry;
 
 const EHDR_SIZE: usize = 64;
@@ -290,9 +290,12 @@ fn homebrew_sprx_with_unknown_import_is_unresolved_not_fatal() {
 
     assert_eq!(
         read_slot(&linked.image, RELOC_SLOT_OFFSET),
-        UNRESOLVED_STUB_ADDR
+        UNRESOLVED_STUB_BASE
     );
-    assert_eq!(linked.unresolved, vec![bogus_nid]);
+    assert_eq!(
+        linked.unresolved.iter().map(|u| u.nid).collect::<Vec<_>>(),
+        vec![bogus_nid]
+    );
     assert!(linked.hle_trampolines.is_empty());
 }
 

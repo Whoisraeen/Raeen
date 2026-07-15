@@ -87,13 +87,25 @@ fn main() -> anyhow::Result<()> {
             linked.unresolved.len()
         );
 
-        // Turn "N unresolved NIDs" into an actionable list. A NID is a one-way
-        // hash, so an unresolved one can't be turned back into a function name
-        // — but each import symbol carries a library_index, and
-        // DT_SCE_IMPORT_LIB maps that to a real library name. Grouping by
-        // library says exactly which libraries to implement next, ranked.
+        // Turn "N unresolved" into an actionable list. A NID is a one-way hash,
+        // so an unresolved one can't be turned back into a function name — but
+        // each import symbol carries a library_index, and DT_SCE_IMPORT_LIB_1
+        // maps that to a real library name.
+        //
+        // Two things this must NOT do, both of which produced a badly wrong
+        // headline before:
+        //  * index library_index into the *needed-module* table (renames every
+        //    library: "libc" became "libfmod"), and
+        //  * report the raw relocation count as if it were a count of missing
+        //    functions. It is one entry PER RELOCATION, and on a real C++ title
+        //    a handful of RTTI symbols generate ~99% of them. The JUMP_SLOT
+        //    subtotal is the number that actually sizes the HLE work.
         if !linked.unresolved.is_empty() {
             use std::collections::HashMap;
+            const R_X86_64_64: u32 = 1;
+            const R_X86_64_GLOB_DAT: u32 = 6;
+            const R_X86_64_JUMP_SLOT: u32 = 7;
+
             let lib_names: HashMap<u16, &str> = dynlib_data
                 .import_libs
                 .iter()
@@ -104,22 +116,56 @@ fn main() -> anyhow::Result<()> {
                 .iter()
                 .map(|s| (s.nid, s.library_index))
                 .collect();
+
+            let mut by_type: HashMap<u32, usize> = HashMap::new();
+            // (relocations, distinct called NIDs) per library.
             let mut per_lib: HashMap<&str, usize> = HashMap::new();
+            let mut called_per_lib: HashMap<&str, std::collections::HashSet<u64>> = HashMap::new();
             let mut unknown = 0usize;
-            for nid in &linked.unresolved {
-                match nid_to_lib.get(nid).and_then(|i| lib_names.get(i)) {
-                    Some(name) => *per_lib.entry(name).or_default() += 1,
+            for u in &linked.unresolved {
+                *by_type.entry(u.r_type).or_default() += 1;
+                match nid_to_lib.get(&u.nid).and_then(|i| lib_names.get(i)) {
+                    Some(name) => {
+                        *per_lib.entry(name).or_default() += 1;
+                        if u.r_type == R_X86_64_JUMP_SLOT {
+                            called_per_lib.entry(name).or_default().insert(u.nid);
+                        }
+                    }
                     None => unknown += 1,
                 }
             }
+
+            println!("\nunresolved relocations by type:");
+            let mut types: Vec<_> = by_type.into_iter().collect();
+            types.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+            for (t, n) in &types {
+                let what = match *t {
+                    R_X86_64_JUMP_SLOT => "JUMP_SLOT  - a function the guest CALLS",
+                    R_X86_64_64 => "R_X86_64_64 - a data pointer slot (RTTI/vtable)",
+                    R_X86_64_GLOB_DAT => "GLOB_DAT   - a data pointer slot",
+                    _ => "other",
+                };
+                println!("  {n:>6}  {what}");
+            }
+
+            let called: usize = linked
+                .unresolved
+                .iter()
+                .filter(|u| u.r_type == R_X86_64_JUMP_SLOT)
+                .count();
+            println!(
+                "\nunresolved imports by library (relocations, then distinct CALLED functions).\n\
+                 The second column is the real work: {called} function(s) are actually called."
+            );
             let mut ranked: Vec<_> = per_lib.into_iter().collect();
             ranked.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
-            println!("\nunresolved imports by library (implement these, most-wanted first):");
+            println!("  {:>8}  {:>8}  library", "relocs", "called");
             for (lib, n) in ranked.iter().take(20) {
-                println!("  {n:>6}  {lib}");
+                let c = called_per_lib.get(lib).map_or(0, |s| s.len());
+                println!("  {n:>8}  {c:>8}  {lib}");
             }
             if unknown > 0 {
-                println!("  {unknown:>6}  <library unknown>");
+                println!("  {unknown:>8}  {:>8}  <library unknown>", "?");
             }
         }
         return Ok(());
@@ -173,6 +219,20 @@ fn main() -> anyhow::Result<()> {
         let outcome = xps5x_runtime::execute_process(&linked, &hle, &kernel, &[path.as_str()], &[]);
         match &outcome {
             Ok(o) => info!("RESULT: {o:?}"),
+            // The whole point of the per-NID unresolved stub: say WHICH import
+            // the guest wanted. Report it as a worklist item, not an address.
+            Err(xps5x_runtime::RuntimeError::UnimplementedImport { nid, addr }) => {
+                let stub = linked.unresolved_stubs.iter().find(|s| s.nid == *nid);
+                let library = stub
+                    .and_then(|s| s.library.as_deref())
+                    .unwrap_or("<unknown library>");
+                info!(
+                    "RESULT: guest called an UNIMPLEMENTED import — nid {nid:#018x} \
+                     (encoded {}) from library '{library}' [stub {addr:#x}]",
+                    xps5x_firmware::dynlib::nid::encode_nid(*nid)
+                );
+                info!("        implement it, or supply the module that exports it, and re-run");
+            }
             Err(e) => info!("RESULT: {e:?}"),
         }
         let console = kernel.console.contents();

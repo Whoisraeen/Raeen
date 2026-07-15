@@ -174,3 +174,105 @@ relocations is **unknown**.
 
 The honest signal remains the fault address (`--run-eboot`): it still stops at
 `0x5000_0000_0000` (`UNRESOLVED_STUB_ADDR`). Move that, and you've made progress.
+
+---
+
+## RESOLVED — measured against the files (all three questions answered)
+
+The suspicion above was correct. Everything below was measured with an
+**independent** Python ELF parser (not our crate — that would be circular) and
+then confirmed by the fixed tool reporting the same numbers.
+
+### 1. The attribution was WRONG. The mechanism
+
+A real PS5 title carries **two parallel `(id << 48) | (version << 32) |
+name_off` tables**, and we indexed the wrong one:
+
+| tag | table | ids | count (measured) |
+|-----|-------|-----|------------------|
+| `0x6100_0045` `DT_SCE_NEEDED_MODULE_1` | **modules** (`.prx` files) | 1..=50 | 50, 1:1 with `DT_NEEDED` |
+| `0x6100_0049` `DT_SCE_IMPORT_LIB_1` | **libraries** | 0..=53 | 54 |
+
+A module contains several libraries — module `libkernel` provides libraries
+`libkernel`, `libScePosix`, `libSceCoredump`, `libkernel_write_throttling` — so
+the tables have different lengths and different numbering (effectively off by
+one across the shared prefix).
+
+`dynlib/mod.rs` named `0x6100_0045` `DT_SCE_IMPORT_LIB` and looked a symbol's
+`#lib#` id up in it. Library id 3 is `libc`; **module** id 3 is `libfmod`.
+Hence "86852 = libfmod". The true answer is **`libc`** — the same 86852
+relocations, a different library. Kyty's tag table
+(`DT_OS_NEEDED_MODULE_1 = 0x61000045`, `DT_OS_IMPORT_LIB_1 = 0x61000049`,
+MIT © InoriRus) independently confirms the naming.
+
+Field order was *not* the bug: `<nid>#<library>#<module>` is correct, matching
+Kyty's `Resolve` (`ids.At(1)` = library, `ids.At(2)` = module). Confirmed on a
+real symbol: `...#q#X` = library `libScePosix` (42) in module `libkernel` (23).
+
+Three independent confirmations, any one of which is decisive:
+
+* **Name recovery.** The top symbol `pZ9WXcClPO8` (48292 refs) brute-forces to
+  `_ZTVN10__cxxabiv120__si_class_type_infoE`; `byV+FWlAnB4` (23330) to
+  `_ZTVN10__cxxabiv117__class_type_infoE`; `zr094EQ39Ww` (13566) to
+  `__cxa_pure_virtual`. C++ RTTI vtables — `libc`, not an audio engine.
+* **Export coverage.** `libfmod.prx` exports **0** of the 347 symbols the old
+  mapping blamed on it. It exports exactly **54** of the eboot's NIDs — exactly
+  what the corrected mapping attributes to `libfmod`.
+* **The chain's own result.** Corrected: `libfmod` 54 + `libcohtml.Prospero` 62
+  = **116** — precisely the 87222 -> 87106 drop `c7a764b` produced.
+
+### 2. What the 87k relocations ARE
+
+All **87414** symbol relocations target genuine `SHN_UNDEF` imports — 0 target
+defined symbols, 0 have a bad NID, 0 are out of range. The "may not be imports
+at all" worry is **refuted**. But `r_type` is everything:
+
+| r_type | count | what it is |
+|--------|-------|-----------|
+| `R_X86_64_64` | 86592 | a **data pointer** slot (RTTI/vtable) — never called |
+| `R_X86_64_JUMP_SLOT` | **758** | a function the guest **calls** |
+| `R_X86_64_GLOB_DAT` | 64 | a data pointer slot |
+
+Six C++ ABI symbols generate **86460** of them (98.9%): four `__cxxabiv1`
+typeinfo vtables, `__cxa_pure_virtual`, and one more. Every polymorphic class
+in a 254 MB C++ binary points its typeinfo at the same few vtables.
+
+**So the real HLE gap is 570 unresolved called functions, not 87222.** The scary
+number was never the work.
+
+### 3. The corrected ranking (`--load-sprx`, post-fix)
+
+```
+   relocs    called  library
+    86852       232  libc
+       62        38  libcohtml.Prospero
+       54        54  libfmod
+       52        52  libScePosix
+       27        26  libkernel
+       21        21  libSceNpWebApi2
+       17        17  libSceAgc
+```
+
+`libc` + `libScePosix` + `libkernel` = **310 of 570** called functions (54%),
+all classic HLE territory. The bundled `.prx` supply 92 (libfmod 54 +
+libcohtml 38). Loading `libfmod` was never the 99.6% lever — it is a 0.06% one.
+
+### What this changes
+
+* Rank HLE work off the **called** column, never the relocation count.
+* `is_import = st_shndx == 0 || st_value == 0` is theoretically sloppy but
+  **harmless here**: the eboot's dynsym is 877 entries, *all* `SHN_UNDEF` with
+  `st_value == 0`, so both predicates agree exactly. Not a bug to chase.
+* Fixed in `dynlib/mod.rs` (both tables decoded, `import_modules` added) and
+  `linker.rs` (`UnresolvedImport { nid, r_type }`), pinned by
+  `library_ids_index_the_library_table_not_the_needed_module_table`.
+
+### Still true: the fault address is the honest signal
+
+`--run-eboot` still stops at `0x5000_0000_0000`. **Every unresolved symbol
+shares that one stub address**, so when the guest faults there we cannot say
+which import it wanted. The next step is a per-NID unresolved stub —
+`UNRESOLVED_STUB_BASE + i * 8`, exactly the pattern `HLE_TRAMPOLINE_BASE`
+already uses — so the fault reports "guest called `<nid>` from `<library>`,
+unimplemented". That turns one opaque address into a worklist drawn from the
+570, in call order.
