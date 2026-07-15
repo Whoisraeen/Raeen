@@ -61,8 +61,16 @@ pub fn load_module(
         Some(d) => dynlib::parse_sce_dynamic(d)?,
         None => Vec::new(),
     };
-    let dynlib_data =
-        dynlib::parse_dynlibdata(module.dynlib_data.as_deref().unwrap_or(&[]), &dyn_tags)?;
+    // Two dynamic models exist in the wild (see `dynlib::standard_dynamic_view`):
+    // homebrew/.sprx put the tables in a `PT_SCE_DYNLIBDATA` blob addressed by
+    // `DT_SCE_*` offsets, while real PS5 titles have no such segment and use the
+    // standard `DT_STRTAB`/`DT_SYMTAB`/... tags holding **virtual addresses**.
+    // Try the standard model first; fall back to the blob.
+    let standard = dynlib::standard_dynamic_view(&module.segments, &dyn_tags);
+    let dynlib_data = match &standard {
+        Some((image, tags)) => dynlib::parse_dynlibdata(image, tags)?,
+        None => dynlib::parse_dynlibdata(module.dynlib_data.as_deref().unwrap_or(&[]), &dyn_tags)?,
+    };
 
     // M1-D (wall #4): surface the NEEDED dependency chain loudly instead of
     // silently dropping it. Imports resolve by NID against the HLE registry
