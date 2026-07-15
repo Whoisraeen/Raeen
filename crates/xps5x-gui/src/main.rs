@@ -13,8 +13,24 @@ mod updater;
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
-    // Initialize logging.
-    xps5x_core::logging::init("info");
+    // Initialize logging to BOTH stderr and `logs/xps5x.log`. `_log` must stay
+    // alive for the whole process — dropping it shuts down the background
+    // writer thread and loses buffered events (see `LogGuard`). Binding it here
+    // in `main` is what makes the log file complete on exit.
+    //
+    // Falls back to stderr-only if the log directory can't be created (e.g. a
+    // read-only working directory) — never a reason to refuse to boot.
+    let _log = match xps5x_core::logging::init_with_file(
+        "info",
+        std::path::Path::new(xps5x_core::logging::DEFAULT_LOG_DIR),
+    ) {
+        Ok(guard) => guard,
+        Err(e) => {
+            let guard = xps5x_core::logging::init("info");
+            tracing::warn!("file logging unavailable ({e}); continuing with stderr only");
+            guard
+        }
+    };
 
     // Diagnostic: `xps5x --firmware-info <PUP>` inspects a firmware package
     // and exits without launching the GUI. It never decrypts anything.
