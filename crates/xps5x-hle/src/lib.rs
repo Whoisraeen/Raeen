@@ -51,6 +51,7 @@ pub mod libsce_np_web_api2;
 pub mod libsce_pad;
 pub mod libsce_peripheral;
 pub mod libsce_playgo;
+pub mod libsce_posix;
 pub mod libsce_rtc;
 pub mod libsce_save_data;
 pub mod libsce_save_data_dialog;
@@ -174,6 +175,10 @@ impl HleRegistry {
         // BSD sockets (offline) + pure net helpers (htons/inet_pton/bzero).
         kernel_socket::register(&registry);
         libc::register(&registry);
+        // The POSIX-named view of the kernel (`gettimeofday`, ...). A real
+        // title's own libc.prx calls these spellings, which are distinct NIDs
+        // from the `sce*` ones — see the module docs.
+        libsce_posix::register(&registry);
         libsce_sysmodule::register(&registry);
         libsce_video_out::register(&registry);
         libsce_pad::register(&registry);

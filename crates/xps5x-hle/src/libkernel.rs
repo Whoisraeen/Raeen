@@ -471,7 +471,7 @@ fn hle_get_compiled_sdk_version(ctx: &HleContext, args: &[u64]) -> u64 {
 
 /// `getpid()` / `sceKernelGetProcessId()`: the single guest process's pid.
 /// A real, stable nonzero value (some homebrew keys temp paths / logs on it).
-fn hle_getpid(_ctx: &HleContext, _args: &[u64]) -> u64 {
+pub(crate) fn hle_getpid(_ctx: &HleContext, _args: &[u64]) -> u64 {
     debug!("getpid() -> {GUEST_PID:#x}");
     GUEST_PID
 }
@@ -751,7 +751,7 @@ fn host_realtime() -> (i64, i64) {
 /// `int64_t`s, `tv_sec` then `tv_usec` — through `tp`. A homebrew that
 /// timestamps or measures elapsed time now reads real, advancing values
 /// instead of zero. Unwritable `tp` is a loud `EFAULT`.
-fn hle_gettimeofday(ctx: &HleContext, args: &[u64]) -> u64 {
+pub(crate) fn hle_gettimeofday(ctx: &HleContext, args: &[u64]) -> u64 {
     let tp = args.first().copied().unwrap_or(0);
     debug!("sceKernelGettimeofday(tp={tp:#x})");
     if tp == 0 {
@@ -776,7 +776,7 @@ const CLOCK_MONOTONIC: u64 = 4;
 /// `tv_sec` then `tv_nsec` — through `tp`. `CLOCK_MONOTONIC` reports time
 /// since a fixed process-start reference (never goes backwards); every
 /// other clock id reports host wall-clock (`CLOCK_REALTIME` semantics).
-fn hle_clock_gettime(ctx: &HleContext, args: &[u64]) -> u64 {
+pub(crate) fn hle_clock_gettime(ctx: &HleContext, args: &[u64]) -> u64 {
     let clock_id = args.first().copied().unwrap_or(0);
     let tp = args.get(1).copied().unwrap_or(0);
     debug!("sceKernelClockGettime(clockId={clock_id}, tp={tp:#x})");
@@ -850,7 +850,7 @@ const USLEEP_MAX: std::time::Duration = std::time::Duration::from_secs(1);
 /// thread for `usec` microseconds (capped by [`USLEEP_MAX`]). A no-op sleep
 /// makes timing-driven homebrew busy-spin and burn 100% CPU; a real sleep
 /// yields, matching what the title expects between frames.
-fn hle_usleep(_ctx: &HleContext, args: &[u64]) -> u64 {
+pub(crate) fn hle_usleep(_ctx: &HleContext, args: &[u64]) -> u64 {
     let usec = args.first().copied().unwrap_or(0);
     debug!("sceKernelUsleep(usec={usec})");
     let requested = std::time::Duration::from_micros(usec);

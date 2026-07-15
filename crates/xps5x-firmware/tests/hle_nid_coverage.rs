@@ -1,0 +1,96 @@
+//! Do the NIDs a **real** PS5 title asks for actually resolve against our HLE?
+//!
+//! A NID is a one-way hash of a function *name*, so an implementation only
+//! resolves if it is registered under the exact spelling the title imports.
+//! That makes "we implemented X" and "the title's import of X resolves" two
+//! different facts, and the gap between them is invisible without a test like
+//! this: `sceKernelGettimeofday` was implemented and working for weeks while
+//! the measured title's own `libc.prx` died calling `gettimeofday` — a
+//! different symbol, a different NID.
+//!
+//! These NIDs were recovered from the retail title by brute-forcing candidate
+//! names against the encoded NID strings in its symbol table, so each one is a
+//! symbol a real title genuinely requested.
+
+use xps5x_firmware::ModuleRegistry;
+use xps5x_firmware::dynlib::nid::{NidDatabase, encode_nid, nid_of};
+use xps5x_hle::HleRegistry;
+
+/// `(name, encoded NID as it appears in the title's symbol table)`.
+const REAL_TITLE_IMPORTS: &[(&str, &str)] = &[
+    // libc.prx blocked on this one during early init.
+    ("gettimeofday", "n88vx3C5nW8"),
+    // Recovered from the same title's import table.
+    ("__stack_chk_guard", "f7uOxY9mM1U"),
+    ("__cxa_pure_virtual", "zr094EQ39Ww"),
+    ("strcmp", "Ovb2dSJOAuE"),
+];
+
+/// The name -> NID hashing must keep producing the exact strings the retail
+/// title carries. If this drifts, every resolution silently stops matching.
+#[test]
+fn recovered_names_still_hash_to_the_nids_the_real_title_carries() {
+    for (name, encoded) in REAL_TITLE_IMPORTS {
+        assert_eq!(
+            &encode_nid(nid_of(name)),
+            encoded,
+            "name->NID hashing drifted for {name:?}"
+        );
+    }
+}
+
+/// The POSIX spelling and the Sony spelling are DIFFERENT symbols. This is why
+/// `libScePosix` has to exist as its own set of registrations rather than being
+/// assumed covered by `libkernel`.
+#[test]
+fn posix_and_sce_spellings_are_distinct_nids() {
+    assert_ne!(nid_of("gettimeofday"), nid_of("sceKernelGettimeofday"));
+    assert_ne!(nid_of("clock_gettime"), nid_of("sceKernelClockGettime"));
+}
+
+/// The NID `libc.prx` actually died on must now resolve to an HLE function.
+///
+/// This is the acceptance test for the `libScePosix` module: it asserts
+/// resolution through the same path the linker uses (NID -> name -> is it
+/// implemented?), not merely that a function was registered somewhere.
+#[test]
+fn libsce_posix_names_resolve_the_nids_the_real_title_asked_for() {
+    let hle = HleRegistry::new();
+    let db = NidDatabase::from_hle_names(hle.registered_names());
+
+    for name in ["gettimeofday", "clock_gettime", "usleep", "getpid"] {
+        let nid = nid_of(name);
+        let resolved = db
+            .resolve(nid)
+            .unwrap_or_else(|| panic!("NID for {name:?} resolves to no registered HLE name"));
+        let (library, function) = resolved
+            .split_once("::")
+            .expect("NidDatabase stores 'library::function'");
+        assert!(
+            hle.is_implemented(library, function),
+            "{name:?} resolves to {library}::{function}, which is not implemented"
+        );
+    }
+}
+
+/// End to end through the real resolver: the exact NID the title requested must
+/// come back as an HLE hit, not `Unresolved`.
+#[test]
+fn the_gettimeofday_nid_resolves_through_the_module_registry() {
+    let hle = HleRegistry::new();
+    let db = NidDatabase::from_hle_names(hle.registered_names());
+    let registry = ModuleRegistry::new(db);
+
+    let nid = nid_of("gettimeofday");
+    match registry.resolve(&hle, "libc.prx", nid) {
+        xps5x_firmware::Resolver::Hle { library, function } => {
+            assert_eq!(function, "gettimeofday");
+            assert_eq!(library, "libScePosix");
+        }
+        other => panic!(
+            "the NID a real title blocked on must resolve to HLE, got {other:?} \
+             (encoded {})",
+            encode_nid(nid)
+        ),
+    }
+}

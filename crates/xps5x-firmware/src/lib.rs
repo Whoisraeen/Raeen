@@ -146,6 +146,90 @@ struct DecodedModule {
     dynlib: dynlib::DynlibData,
 }
 
+/// A per-process stack-protector canary: derived from
+/// [`std::collections::hash_map::RandomState`]'s per-process random keys (no
+/// new dependency), low byte forced to zero (glibc's "terminator canary"
+/// convention, so string functions can't leak it) and guaranteed nonzero — a
+/// zero canary would let stack-protected code "work" against zeroed memory
+/// rather than proving a real install.
+///
+/// Deliberately mirrors `xps5x_runtime`'s `fs:0x28` canary rather than sharing
+/// it: the two are independent ABIs (see [`build_hle_data_page`]), and the
+/// runtime's is private to that crate.
+fn stack_canary() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(0x5A_FE_57_AC_C4_AA_2D_01);
+    let masked = hasher.finish() & !0xFF;
+    if masked == 0 { 0x100 } else { masked }
+}
+
+/// Build the process's **HLE data page** and register its symbols as LLE
+/// exports at their absolute guest addresses.
+///
+/// # Why a page, and why here
+///
+/// Some imports are *data*, not functions. The HLE registry can only say "this
+/// NID is a function" — it hands out a trampoline address, which is a *code*
+/// marker the runtime traps. A data symbol needs the opposite: a real, readable
+/// guest address holding a real value. Resolving one as a trampoline (or
+/// leaving it unresolved) means the guest dereferences a marker address and
+/// faults, which is exactly how the measured title died: `libc.prx`'s
+/// stack-protector prologue read libkernel's `__stack_chk_guard` global, found
+/// the unresolved stub in the slot, and faulted dereferencing it.
+///
+/// So this reserves a page *inside the guest image* — plain guest memory the
+/// arena already maps — writes the values into it, and registers each symbol as
+/// an ordinary LLE export at `page_base + offset`. No new runtime mechanism,
+/// no new mapped region: to the linker these are just exports that happen to
+/// come from us instead of from a `.prx`.
+///
+/// It must run **before any module is linked**, since a linker can only resolve
+/// what is already registered — which is why the page is reserved at a known
+/// offset up front rather than appended afterwards.
+///
+/// `__stack_chk_guard` is independent of the runtime's `fs:0x28` canary: they
+/// are two different stack-protector ABIs (global-variable vs TCB-slot), and
+/// compiled code reads the same one in both prologue and epilogue, so the two
+/// values need not agree.
+fn build_hle_data_page(registry: &mut registry::ModuleRegistry, page_base: u64) -> Vec<u8> {
+    let mut page: Vec<u8> = Vec::new();
+    let mut exports: Vec<dynlib::SymbolExport> = Vec::new();
+
+    let add = |name: &str, bytes: &[u8], page: &mut Vec<u8>, exports: &mut Vec<_>| {
+        // 8-byte align every entry: these are word-sized globals.
+        while !page.len().is_multiple_of(8) {
+            page.push(0);
+        }
+        let offset = page.len() as u64;
+        page.extend_from_slice(bytes);
+        exports.push(dynlib::SymbolExport {
+            nid: dynlib::nid::nid_of(name),
+            value: offset,
+        });
+        tracing::debug!("HLE data export {name} at {:#x}", page_base + offset);
+    };
+
+    add(
+        "__stack_chk_guard",
+        &stack_canary().to_le_bytes(),
+        &mut page,
+        &mut exports,
+    );
+
+    // Registered under "libkernel" purely for the log line; `resolve` is by NID
+    // and ignores the declaring module.
+    registry.register_module_exports_at("libkernel", &exports, page_base);
+    tracing::info!(
+        "HLE data page: {} symbol(s), {:#x} bytes at {page_base:#x}",
+        exports.len(),
+        page.len()
+    );
+    page
+}
+
 /// SELF decrypt-or-passthrough -> `parse_sprx` -> dynamic decode, handling both
 /// dynamic models (a `PT_SCE_DYNLIBDATA` blob, or a real title's standard
 /// vaddr-based tags). Shared by the main module and each dependency.
@@ -260,6 +344,15 @@ pub fn load_process(
     // every module restart at index 0, so a dependency's import #k resolved to
     // the MAIN module's #k at runtime: wrong function, no diagnostic.
     let mut tables = dynlib::linker::ProcessTables::new();
+
+    // Reserve the HLE data page FIRST: its symbols must be registered before
+    // any module links, and its address must be known before it is filled.
+    let hle_data_offset = next_offset;
+    let hle_data = build_hle_data_page(registry, base.wrapping_add(hle_data_offset));
+    if !hle_data.is_empty() {
+        next_offset = align_up_16k(next_offset + hle_data.len() as u64);
+        dep_images.push((hle_data_offset, hle_data));
+    }
 
     for needed in &dynlib_data.needed_modules {
         let stem = needed.trim_end_matches(".sprx").trim_end_matches(".prx");
