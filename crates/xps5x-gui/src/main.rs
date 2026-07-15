@@ -141,13 +141,27 @@ fn main() -> anyhow::Result<()> {
         let db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle_names(hle.registered_names());
         let mut registry = xps5x_firmware::ModuleRegistry::new(db);
         let kernel = xps5x_kernel::OrbisKernel::new();
-        let linked = xps5x_firmware::load_module(
+        // Load as a whole process: the eboot plus every DT_NEEDED .prx that
+        // ships beside it (M1-D). A real title's imports are overwhelmingly
+        // satisfied by those bundled libraries, not by HLE.
+        let dir = std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let process = xps5x_firmware::load_process(
             &bytes,
+            dir,
             &xps5x_firmware::NoKeysProvider,
             &mut registry,
             &hle,
             xps5x_runtime::GUEST_ARENA_BASE,
         )?;
+        for d in &process.dependencies {
+            info!(
+                "  dep {} at +{:#x}: {} exports, {} unresolved",
+                d.name, d.image_offset, d.exports, d.unresolved
+            );
+        }
+        let linked = process.linked;
         info!(
             "loaded: entry={:#x} image={:#x} byte(s) resolved={} unresolved={}",
             linked.entry,

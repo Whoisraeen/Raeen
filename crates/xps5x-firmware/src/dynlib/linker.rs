@@ -282,7 +282,7 @@ fn tls_symbol_offset(dynlib: &DynlibData, r_sym: u64) -> Result<u64, FirmwareErr
 /// `PT_LOAD` segments (also covering each segment's actual file-backed
 /// `data` length, in case it exceeds `mem_size` for malformed input).
 /// Bounds-checked: overflow returns [`FirmwareError::MalformedDynlibData`].
-fn image_size(module: &SprxModule) -> Result<usize, FirmwareError> {
+pub fn image_size(module: &SprxModule) -> Result<usize, FirmwareError> {
     let mut max_end: u64 = 0;
     for seg in &module.segments {
         let mem_end = seg.vaddr.checked_add(seg.mem_size).ok_or_else(|| {

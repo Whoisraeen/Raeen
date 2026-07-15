@@ -76,14 +76,35 @@ impl ModuleRegistry {
     /// Record `exports` as this module's LLE exports, available to satisfy
     /// other modules' imports by NID. `module` is used for diagnostics only
     /// — the export table itself is a single flat NID -> address map.
+    ///
+    /// Exports are registered at their **module-relative** address. Prefer
+    /// [`Self::register_module_exports_at`] for a module loaded at a non-zero
+    /// base: [`Resolver::Lle`]'s address is written into the importer's
+    /// relocation slot verbatim, so it must be the **absolute** guest address.
     pub fn register_module_exports(&mut self, module: &str, exports: &[SymbolExport]) {
+        self.register_module_exports_at(module, exports, 0);
+    }
+
+    /// Record `exports` for a module loaded at `base`, registering each at its
+    /// **absolute** guest address (`base + export.value`).
+    ///
+    /// A dependency `.prx` is mapped at a non-zero base alongside the main
+    /// module, and `link_module` writes a resolved [`Resolver::Lle`] address
+    /// straight into the importing module's slot — so a module-relative value
+    /// would send the importer to the wrong address entirely.
+    pub fn register_module_exports_at(
+        &mut self,
+        module: &str,
+        exports: &[SymbolExport],
+        base: u64,
+    ) {
         for export in exports {
+            let addr = base.wrapping_add(export.value);
             tracing::debug!(
-                "registering LLE export {:#x} -> {:#x} from module {module:?}",
+                "registering LLE export {:#x} -> {addr:#x} from module {module:?} (base {base:#x})",
                 export.nid,
-                export.value
             );
-            self.lle_exports.insert(export.nid, export.value);
+            self.lle_exports.insert(export.nid, addr);
         }
     }
 
