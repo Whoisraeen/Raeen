@@ -117,3 +117,129 @@ pub(crate) unsafe fn write_fsbase(value: u64) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// **Platform reality, pinned (M1-E spec §6 I3 spike — it FAILED):**
+    /// a user-set FS base does **NOT** survive a Windows context switch. It is
+    /// reset to `0` by the first preemption.
+    ///
+    /// The module doc above only ever established that the FS base survives the
+    /// VEH + `RtlCaptureContext` round trip (the x64 `CONTEXT` has no FS-base
+    /// field, so *that* mechanism has no slot to reset it through). That is a
+    /// different question from preemption, and the original RT2c-b spike never
+    /// tested preemption at all.
+    ///
+    /// Measured here (probe output): `write_fsbase(MAGIC)` reads back correctly
+    /// immediately and across a `yield_now`, but comes back `0x0` after a
+    /// `sleep` **and** after a pure user-mode busy-wait with no syscall
+    /// whatsoever. So it is a genuine timer-interrupt context switch — not a
+    /// kernel transition — that clears it: Windows saves/restores the FS base
+    /// from its own notion of the thread's base (`0` for native x64 threads),
+    /// discarding any user-mode `WRFSBASE`. (Linux preserves it; Windows does
+    /// not. `CR4.FSGSBASE` being set only makes the *instruction* legal — it
+    /// does not make the value survive scheduling.)
+    ///
+    /// **Consequence:** a raw `WRFSBASE` guest TCB is only valid until the next
+    /// quantum (~15 ms). Any guest that touches TLS or the `fs:0x28` canary
+    /// after being preempted reads a near-null address, which the VEH sees as a
+    /// genuine wild fault → the title reports `Faulted`. Guest TLS therefore
+    /// cannot rely on `WRFSBASE` alone; it needs the FS base re-armed after
+    /// each preemption (see `dispatch`'s fault path).
+    ///
+    /// This test pins the platform behaviour so the assumption is never quietly
+    /// re-introduced. If it ever starts failing, Windows changed and the
+    /// re-arm machinery may be simplifiable.
+    #[test]
+    fn fsbase_does_not_survive_preemption_on_windows() {
+        if !fsgsbase_available() {
+            // Honest skip: this CPU/OS never executes the RDFSBASE/WRFSBASE
+            // path at all, so there is nothing to pin.
+            return;
+        }
+
+        // Canonical (high bits clear) and obviously not a real base.
+        const MAGIC: u64 = 0x0000_1234_5678_9AB0;
+
+        // SAFETY: `fsgsbase_available()` is true. 64-bit Windows never uses
+        // the FS segment (it uses GS for the TEB) and leaves the FS base at 0,
+        // so temporarily repointing *this* thread's FS base cannot disturb the
+        // host runtime; it is restored below before any assertion can unwind.
+        let orig = unsafe { read_fsbase() };
+
+        // Saturate the scheduler so this thread is genuinely preempted rather
+        // than running to completion on an idle core.
+        let stop = Arc::new(AtomicBool::new(false));
+        let spinners: Vec<_> = (0..std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4))
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                })
+            })
+            .collect();
+
+        // SAFETY: as above — available, and restored before returning.
+        unsafe { write_fsbase(MAGIC) };
+        // Diagnostic: isolate exactly where (if anywhere) the base is lost.
+        // SAFETY: as above.
+        let immediately = unsafe { read_fsbase() };
+        std::thread::yield_now();
+        // SAFETY: as above.
+        let after_yield = unsafe { read_fsbase() };
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        // SAFETY: as above.
+        let after_sleep = unsafe { read_fsbase() };
+        // Distinguish "a kernel transition (syscall) resets it" from "a bare
+        // timer-interrupt preemption resets it". Real guest code makes no
+        // syscalls, so only the latter would threaten a running guest — and it
+        // is the latter.
+        // SAFETY: as above.
+        unsafe { write_fsbase(MAGIC) };
+        let spin_start = std::time::Instant::now();
+        // Pure user-mode busy-wait, no syscall: long enough (with the machine
+        // saturated by spinners) that a timer-interrupt preemption is certain.
+        while spin_start.elapsed() < std::time::Duration::from_millis(120) {
+            std::hint::spin_loop();
+        }
+        // SAFETY: as above.
+        let after_pure_spin = unsafe { read_fsbase() };
+
+        // Restore *before* asserting so a failure can't leave this test thread
+        // with a bogus FS base.
+        // SAFETY: as above.
+        unsafe { write_fsbase(orig) };
+        stop.store(true, Ordering::Relaxed);
+        for s in spinners {
+            let _ = s.join();
+        }
+
+        // The write itself works, and survives while we stay scheduled...
+        assert_eq!(
+            immediately, MAGIC,
+            "WRFSBASE did not take effect at all (probe: yield={after_yield:#x})"
+        );
+        // ...but a real context switch discards it. Both a syscall-driven
+        // deschedule and a bare timer-interrupt preemption clear it to 0,
+        // which is what makes this a scheduling property rather than a
+        // kernel-transition artifact.
+        assert_eq!(
+            after_sleep, 0,
+            "FS base unexpectedly SURVIVED a sleep/deschedule — Windows behaviour \
+             changed; the dispatch re-arm machinery may be simplifiable"
+        );
+        assert_eq!(
+            after_pure_spin, 0,
+            "FS base unexpectedly SURVIVED a pure user-mode preemption — Windows \
+             behaviour changed; the dispatch re-arm machinery may be simplifiable"
+        );
+    }
+}
