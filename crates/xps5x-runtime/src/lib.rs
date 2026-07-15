@@ -70,6 +70,43 @@ pub enum RunOutcome {
 /// only [`arena::GuestArena`]'s reservation mechanism is Windows-specific.
 pub const GUEST_ARENA_BASE: u64 = 0x0000_1000_0000_0000;
 
+/// How a faulting guest instruction was touching the address it faulted on —
+/// decoded from `EXCEPTION_RECORD.ExceptionInformation[0]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultKind {
+    Read,
+    Write,
+    /// A DEP violation: the guest tried to *execute* the address. This is what
+    /// a call through an unresolved import slot looks like.
+    Execute,
+    /// Windows reported a code this doesn't know; the raw value is carried so
+    /// the report stays honest rather than guessing.
+    Other(u64),
+}
+
+impl std::fmt::Display for FaultKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FaultKind::Read => f.write_str("read"),
+            FaultKind::Write => f.write_str("write"),
+            FaultKind::Execute => f.write_str("execute"),
+            FaultKind::Other(v) => write!(f, "access-type-{v}"),
+        }
+    }
+}
+
+impl RuntimeError {
+    /// Decode `EXCEPTION_RECORD.ExceptionInformation[0]` into a [`FaultKind`].
+    pub(crate) fn fault_kind(v: u64) -> FaultKind {
+        match v {
+            0 => FaultKind::Read,
+            1 => FaultKind::Write,
+            8 => FaultKind::Execute,
+            other => FaultKind::Other(other),
+        }
+    }
+}
+
 /// Errors [`execute_linked`] can return (design doc §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum RuntimeError {
@@ -89,9 +126,24 @@ pub enum RuntimeError {
     /// HLE call. Recovered rather than crashing the process (RT1a): the VEH
     /// restores a pre-call register snapshot taken via `RtlCaptureContext`
     /// (see `dispatch.rs`'s module doc comment for the exact mechanism).
-    /// `addr` is the faulting instruction's `Rip`.
-    #[error("guest fault at {addr:#x}")]
-    Faulted { addr: u64 },
+    ///
+    /// `addr` is the faulting instruction's `Rip` — *where the guest was*.
+    /// `access` is what it was **touching** when it faulted, which is usually
+    /// the part that identifies the bug: `Rip` alone says a module is unhappy,
+    /// while the access address says *why* (a null deref, a wild pointer, or —
+    /// very commonly here — a read through a relocation slot left pointing at
+    /// [`xps5x_firmware::UNRESOLVED_STUB_BASE`]). Windows hands both to the VEH
+    /// in `EXCEPTION_RECORD`; this used to discard the access address.
+    #[error("guest fault at {addr:#x} ({kind} {access:#x})")]
+    Faulted {
+        addr: u64,
+        /// The virtual address the faulting instruction tried to touch
+        /// (`ExceptionInformation[1]`).
+        access: u64,
+        /// How it was touching it — "read", "write", or "execute"
+        /// (`ExceptionInformation[0]`: 0, 1, and 8 respectively).
+        kind: FaultKind,
+    },
     /// The guest **called an import nothing implements**: execution reached a
     /// per-NID unresolved stub (`UNRESOLVED_STUB_BASE + i * 8`), which the
     /// linker wrote into that symbol's relocation slots.

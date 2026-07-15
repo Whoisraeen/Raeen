@@ -226,10 +226,19 @@ fn main() -> anyhow::Result<()> {
                 let library = stub
                     .and_then(|s| s.library.as_deref())
                     .unwrap_or("<unknown library>");
+                // `addr` is the faulting instruction's Rip — where the guest
+                // was, NOT the stub. Naming it "stub" was wrong and confusing.
                 info!(
-                    "RESULT: guest called an UNIMPLEMENTED import — nid {nid:#018x} \
-                     (encoded {}) from library '{library}' [stub {addr:#x}]",
+                    "RESULT: guest needs an UNIMPLEMENTED import — nid {nid:#018x} \
+                     (encoded {}) from library '{library}'",
                     xps5x_firmware::dynlib::nid::encode_nid(*nid)
+                );
+                info!(
+                    "        guest rip {addr:#x}{}",
+                    match stub {
+                        Some(s) => format!("; its stub is {:#x}", s.addr),
+                        None => String::new(),
+                    }
                 );
                 info!("        implement it, or supply the module that exports it, and re-run");
             }

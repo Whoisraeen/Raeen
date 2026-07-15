@@ -295,7 +295,11 @@ fn wild_fault_past_the_stub_table_is_still_an_anonymous_fault() {
 
     let kernel = OrbisKernel::new();
     let err = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).unwrap_err();
-    assert_eq!(err, RuntimeError::Faulted { addr: wild });
+    assert!(
+        matches!(err, RuntimeError::Faulted { addr, .. } if addr == wild),
+        "an in-range address with no table entry is an anonymous fault, not an \
+         invented NID; got {err:?}"
+    );
 }
 
 /// A guest `call` through a trampoline slot whose index has no
@@ -393,7 +397,7 @@ fn genuine_wild_fault_recovers_as_faulted_then_process_keeps_running() {
     let kernel = OrbisKernel::new();
     let err = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).unwrap_err();
     match err {
-        RuntimeError::Faulted { addr } => {
+        RuntimeError::Faulted { addr, access, kind } => {
             // `addr` is the *faulting instruction's* Rip (the mapped
             // entry's host address), not the wild pointer (`0`) it
             // dereferenced.
@@ -401,6 +405,11 @@ fn genuine_wild_fault_recovers_as_faulted_then_process_keeps_running() {
                 addr, 0,
                 "Faulted::addr is the faulting Rip, which is a real mapped-image address"
             );
+            // ...and `access` is the wild pointer itself. The two together are
+            // what make a fault diagnosable: Rip says where the guest was,
+            // `access` says what it touched.
+            assert_eq!(access, 0, "the guest dereferenced address 0");
+            assert_eq!(kind, xps5x_runtime::FaultKind::Read);
         }
         other => panic!("expected Err(Faulted {{ .. }}), got {other:?}"),
     }
@@ -1653,7 +1662,9 @@ fn genuine_wild_fault_after_preemption_recovers_instead_of_looping_the_veh() {
     assert_eq!(
         err,
         RuntimeError::Faulted {
-            addr: GUEST_ARENA_BASE + fault_off as u64
+            addr: GUEST_ARENA_BASE + fault_off as u64,
+            access: 0,
+            kind: xps5x_runtime::FaultKind::Read,
         },
         "the post-preemption genuine fault must be recovered as `Faulted` at the \
          faulting instruction, i.e. the FS-base re-arm must fall through to the \
@@ -1924,7 +1935,7 @@ fn start_stub_observes_argc_via_rdi_per_the_orbis_entry_abi() {
     let kernel = OrbisKernel::new();
     let err = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[]).unwrap_err();
     match err {
-        RuntimeError::Faulted { addr } => assert_eq!(
+        RuntimeError::Faulted { addr, .. } => assert_eq!(
             addr, 1,
             "argc read through rdi must equal 1 — the Orbis entry ABI passes the \
              params block in rdi, not (only) on the stack"
@@ -1960,7 +1971,7 @@ fn start_stub_observes_argc_equal_to_one_via_the_process_stack() {
     let kernel = OrbisKernel::new();
     let err = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[]).unwrap_err();
     match err {
-        RuntimeError::Faulted { addr } => {
+        RuntimeError::Faulted { addr, .. } => {
             assert_eq!(
                 addr, 1,
                 "observed argc must equal 1 (a single argv entry was passed)"
@@ -1997,7 +2008,7 @@ fn start_stub_observes_argv0_first_byte_via_the_process_stack() {
     let kernel = OrbisKernel::new();
     let err = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[]).unwrap_err();
     match err {
-        RuntimeError::Faulted { addr } => {
+        RuntimeError::Faulted { addr, .. } => {
             assert_eq!(addr, 0x2F, "observed argv[0][0] must equal '/' (0x2F)");
         }
         other => panic!("expected Err(Faulted {{ .. }}), got {other:?}"),
@@ -2120,7 +2131,7 @@ fn start_stub_wild_fault_still_recovers_as_faulted_through_execute_process() {
     let kernel = OrbisKernel::new();
     let err = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[]).unwrap_err();
     match err {
-        RuntimeError::Faulted { addr } => {
+        RuntimeError::Faulted { addr, .. } => {
             assert_ne!(
                 addr, 0,
                 "Faulted::addr is the faulting Rip, a real mapped-image address"

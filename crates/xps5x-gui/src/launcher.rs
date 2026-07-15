@@ -353,8 +353,10 @@ impl FirmwareLauncher {
                     resolved,
                     unresolved,
                 },
-                Err(xps5x_runtime::RuntimeError::Faulted { addr }) => {
-                    SessionOutcome::Faulted(format!("Faulted at {addr:#x} during execution"))
+                Err(xps5x_runtime::RuntimeError::Faulted { addr, access, kind }) => {
+                    SessionOutcome::Faulted(format!(
+                        "Faulted at {addr:#x} during execution ({kind} of {access:#x})"
+                    ))
                 }
                 // The guest asked for an import nothing implements. Name it:
                 // this is the one fault the user (or we) can actually act on,

@@ -164,10 +164,102 @@ pub struct LinkedModule {
     pub procparam_offset: Option<u64>,
 }
 
+/// The marker-address tables shared by every module in one process.
+///
+/// # Why this must be shared
+///
+/// [`HLE_TRAMPOLINE_BASE`] and [`UNRESOLVED_STUB_BASE`] name **process-global**
+/// address spaces: at runtime a fault at `BASE + i*8` is inverted through a
+/// single table to recover the function it stands for. So `i` must be unique
+/// across the whole process.
+///
+/// Linking each module with its own tables breaks that, silently. Every module
+/// restarts at `i = 0`, so dependency A's import #3 and the main module's
+/// import #3 claim the same address — and since the runtime only ever holds one
+/// table, A's call to *its* #3 dispatches to the main module's #3 instead: the
+/// wrong function, with the wrong signature, and no diagnostic. Threading one
+/// `ProcessTables` through every [`link_module_into`] call in a process is what
+/// makes the indices mean one thing.
+#[derive(Debug, Default)]
+pub struct ProcessTables {
+    hle_trampolines: Vec<HleTrampoline>,
+    hle_addrs: HashMap<u64, u64>,
+    unresolved_stubs: Vec<UnresolvedStub>,
+    stub_addrs: HashMap<u64, u64>,
+}
+
+impl ProcessTables {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every HLE import resolved across the process, deduped by NID; index `i`
+    /// owns `HLE_TRAMPOLINE_BASE + i*8`.
+    pub fn hle_trampolines(&self) -> &[HleTrampoline] {
+        &self.hle_trampolines
+    }
+
+    /// Every distinct unresolved NID across the process; index `i` owns
+    /// `UNRESOLVED_STUB_BASE + i*8`.
+    pub fn unresolved_stubs(&self) -> &[UnresolvedStub] {
+        &self.unresolved_stubs
+    }
+
+    /// The address for `nid`'s HLE trampoline, allocating one if this is the
+    /// first module to import it.
+    fn hle_addr(&mut self, nid: u64, library: String, function: String) -> u64 {
+        let trampolines = &mut self.hle_trampolines;
+        *self.hle_addrs.entry(nid).or_insert_with(|| {
+            let addr = HLE_TRAMPOLINE_BASE + (trampolines.len() as u64 * 8);
+            trampolines.push(HleTrampoline {
+                library,
+                function,
+                addr,
+            });
+            addr
+        })
+    }
+
+    /// The address for `nid`'s unresolved stub, allocating one if this is the
+    /// first module to fail to resolve it.
+    fn stub_addr(&mut self, nid: u64, library: Option<String>) -> u64 {
+        let stubs = &mut self.unresolved_stubs;
+        *self.stub_addrs.entry(nid).or_insert_with(|| {
+            let addr = UNRESOLVED_STUB_BASE + (stubs.len() as u64 * 8);
+            stubs.push(UnresolvedStub { nid, library, addr });
+            addr
+        })
+    }
+}
+
+/// Lay `module`'s `PT_LOAD` segments into a flat image at `base` and apply
+/// every relocation in `dynlib.relocations`, allocating trampoline/stub
+/// addresses from `tables`.
+///
+/// Use this (not [`link_module`]) whenever more than one module is linked into
+/// the same process, so their marker addresses share one index space — see
+/// [`ProcessTables`] for what goes wrong otherwise. The returned
+/// [`LinkedModule`]'s own `hle_trampolines`/`unresolved_stubs` are left empty;
+/// the process-wide tables live in `tables`.
+pub fn link_module_into(
+    module: &SprxModule,
+    dynlib: &DynlibData,
+    registry: &ModuleRegistry,
+    hle: &HleRegistry,
+    base: u64,
+    tables: &mut ProcessTables,
+) -> Result<LinkedModule, FirmwareError> {
+    link_inner(module, dynlib, registry, hle, base, tables)
+}
+
 /// Lay `module`'s `PT_LOAD` segments into a flat image at `base` and apply
 /// every relocation in `dynlib.relocations`. See the module docs for the
 /// image-layout assumption and the meaning of the HLE-trampoline /
 /// unresolved-stub marker addresses.
+///
+/// Single-module convenience: allocates a private [`ProcessTables`] and moves
+/// it into the returned [`LinkedModule`]. For a multi-module process use
+/// [`link_module_into`] with one shared `ProcessTables`.
 ///
 /// Never panics: every offset/index derived from `module`/`dynlib` is
 /// bounds-checked and returns [`FirmwareError::MalformedDynlibData`] on
@@ -180,6 +272,22 @@ pub fn link_module(
     registry: &ModuleRegistry,
     hle: &HleRegistry,
     base: u64,
+) -> Result<LinkedModule, FirmwareError> {
+    let mut tables = ProcessTables::new();
+    let mut linked = link_inner(module, dynlib, registry, hle, base, &mut tables)?;
+    linked.hle_trampolines = tables.hle_trampolines;
+    linked.unresolved_stubs = tables.unresolved_stubs;
+    Ok(linked)
+}
+
+/// The shared body of [`link_module`] / [`link_module_into`].
+fn link_inner(
+    module: &SprxModule,
+    dynlib: &DynlibData,
+    registry: &ModuleRegistry,
+    hle: &HleRegistry,
+    base: u64,
+    tables: &mut ProcessTables,
 ) -> Result<LinkedModule, FirmwareError> {
     let mut image = vec![0u8; image_size(module)?];
 
@@ -207,10 +315,6 @@ pub fn link_module(
     }
 
     let mut unresolved: Vec<UnresolvedImport> = Vec::new();
-    let mut unresolved_stubs: Vec<UnresolvedStub> = Vec::new();
-    let mut stub_addrs: HashMap<u64, u64> = HashMap::new();
-    let mut hle_trampolines: Vec<HleTrampoline> = Vec::new();
-    let mut hle_addrs: HashMap<u64, u64> = HashMap::new();
 
     // nid -> importing library name, so an unresolved stub can say which
     // library owes the guest this function. `library_index` indexes
@@ -304,16 +408,7 @@ pub fn link_module(
 
                 match registry.resolve(hle, &module.name, symbol.nid) {
                     Resolver::Hle { library, function } => {
-                        let nid = symbol.nid;
-                        let addr = *hle_addrs.entry(nid).or_insert_with(|| {
-                            let addr = HLE_TRAMPOLINE_BASE + (hle_trampolines.len() as u64 * 8);
-                            hle_trampolines.push(HleTrampoline {
-                                library,
-                                function,
-                                addr,
-                            });
-                            addr
-                        });
+                        let addr = tables.hle_addr(symbol.nid, library, function);
                         if r_type == R_X86_64_64 {
                             addr.wrapping_add(reloc.addend as u64)
                         } else {
@@ -328,15 +423,7 @@ pub fn link_module(
                         // stub address IS the symbol's identity, and the
                         // runtime inverts it by exact slot. An addend would
                         // land mid-slot and lose the NID — the whole point.
-                        *stub_addrs.entry(nid).or_insert_with(|| {
-                            let addr = UNRESOLVED_STUB_BASE + (unresolved_stubs.len() as u64 * 8);
-                            unresolved_stubs.push(UnresolvedStub {
-                                nid,
-                                library: lib_of_nid.get(&nid).map(|s| s.to_string()),
-                                addr,
-                            });
-                            addr
-                        })
+                        tables.stub_addr(nid, lib_of_nid.get(&nid).map(|s| s.to_string()))
                     }
                 }
             }
@@ -350,8 +437,12 @@ pub fn link_module(
         image,
         base,
         unresolved,
-        unresolved_stubs,
-        hle_trampolines,
+        // Left empty here: the marker tables are process-wide and live in
+        // `tables`. `link_module` (the single-module wrapper) moves them in
+        // afterwards; `load_process` installs the merged tables once, after
+        // every module is linked.
+        unresolved_stubs: Vec::new(),
+        hle_trampolines: Vec::new(),
         entry: module.entry,
         tls: module.tls.clone(),
         procparam_offset: module.procparam.as_ref().map(|p| p.vaddr),
@@ -503,6 +594,109 @@ mod tests {
         assert!(linked.unresolved.is_empty());
         assert!(linked.hle_trampolines.is_empty());
         assert_eq!(linked.base, base);
+    }
+
+    /// Two modules sharing one [`ProcessTables`] must get DISTINCT marker
+    /// addresses for DISTINCT symbols — and the shared table must name both.
+    ///
+    /// This pins the aliasing bug: `HLE_TRAMPOLINE_BASE`/`UNRESOLVED_STUB_BASE`
+    /// are process-global address spaces, but `link_module` numbers from 0. A
+    /// process that linked each module with private tables gave module B's
+    /// import #0 the same address as module A's import #0, and since the
+    /// runtime holds one table, B's call dispatched to A's function — silently.
+    /// Caught for real: the composed title reported its blocking import as
+    /// `libSceNpManager` when it was actually `libkernel`'s `__stack_chk_guard`,
+    /// because a dependency's stub index was read out of the main module's table.
+    #[test]
+    fn two_modules_sharing_process_tables_get_distinct_marker_slots() {
+        let (hle, registry) = empty_registry();
+        let nid_a = nid_of("someUnknownFunctionA");
+        let nid_b = nid_of("someUnknownFunctionB");
+
+        let make = |nid: u64| {
+            (
+                test_module(0x100),
+                DynlibData {
+                    symbols: vec![DynSymbol {
+                        nid,
+                        value: 0,
+                        is_import: true,
+                    }],
+                    relocations: vec![SceRela {
+                        offset: 0x10,
+                        info: R_X86_64_JUMP_SLOT as u64,
+                        addend: 0,
+                    }],
+                    ..Default::default()
+                },
+            )
+        };
+        let (mod_a, dyn_a) = make(nid_a);
+        let (mod_b, dyn_b) = make(nid_b);
+
+        let mut tables = ProcessTables::new();
+        let a = link_module_into(&mod_a, &dyn_a, &registry, &hle, 0, &mut tables).expect("links");
+        let b = link_module_into(&mod_b, &dyn_b, &registry, &hle, 0, &mut tables).expect("links");
+
+        let slot_a = read_slot(&a.image, 0x10);
+        let slot_b = read_slot(&b.image, 0x10);
+        assert_eq!(
+            slot_a, UNRESOLVED_STUB_BASE,
+            "first distinct NID owns slot 0"
+        );
+        assert_eq!(
+            slot_b,
+            UNRESOLVED_STUB_BASE + 8,
+            "the SECOND module's distinct NID must get its OWN slot, not restart at 0"
+        );
+        assert_ne!(
+            slot_a, slot_b,
+            "two symbols must never share a stub address"
+        );
+
+        // The shared table names both, in slot order — this is what the runtime
+        // inverts, so it must cover every module in the process.
+        assert_eq!(tables.unresolved_stubs().len(), 2);
+        assert_eq!(tables.unresolved_stubs()[0].nid, nid_a);
+        assert_eq!(tables.unresolved_stubs()[1].nid, nid_b);
+
+        // Per-module tables are empty: they live in `tables` now.
+        assert!(a.unresolved_stubs.is_empty() && b.unresolved_stubs.is_empty());
+    }
+
+    /// The same NID imported by two modules shares ONE slot — dedup is
+    /// process-wide, not per-module, so the table stays bounded by distinct
+    /// imports rather than growing per module.
+    #[test]
+    fn the_same_nid_in_two_modules_shares_one_stub_slot() {
+        let (hle, registry) = empty_registry();
+        let nid = nid_of("someUnknownFunctionSharedByTwoModules");
+
+        let dynlib = DynlibData {
+            symbols: vec![DynSymbol {
+                nid,
+                value: 0,
+                is_import: true,
+            }],
+            relocations: vec![SceRela {
+                offset: 0x10,
+                info: R_X86_64_JUMP_SLOT as u64,
+                addend: 0,
+            }],
+            ..Default::default()
+        };
+        let module = test_module(0x100);
+
+        let mut tables = ProcessTables::new();
+        let a = link_module_into(&module, &dynlib, &registry, &hle, 0, &mut tables).expect("links");
+        let b = link_module_into(&module, &dynlib, &registry, &hle, 0, &mut tables).expect("links");
+
+        assert_eq!(read_slot(&a.image, 0x10), read_slot(&b.image, 0x10));
+        assert_eq!(
+            tables.unresolved_stubs().len(),
+            1,
+            "one NID, one slot, however many modules import it"
+        );
     }
 
     #[test]

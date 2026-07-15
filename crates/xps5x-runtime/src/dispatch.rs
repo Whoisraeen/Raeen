@@ -672,16 +672,37 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         // outside the HLE guard window. Recovery is identical either way —
         // only the reported error differs.
         //
+        // What was the instruction touching, and how? Windows puts the access
+        // type in ExceptionInformation[0] and the faulting data address in
+        // [1]. `Rip` alone only says *where* the guest was; the access address
+        // is usually what identifies the bug.
+        let access = record.ExceptionInformation.get(1).copied().unwrap_or(0) as u64;
+        let kind = RuntimeError::fault_kind(
+            record.ExceptionInformation.first().copied().unwrap_or(0) as u64,
+        );
+
         // SAFETY: `ctx.unresolved_stubs` was set by `run` from a live borrow
         // that outlives the guarded call, and only one thread is inside a
         // guarded call at a time (see `CALL_LOCK`), so this read is sound.
         let stubs = unsafe { &*ctx.unresolved_stubs };
-        let err = match stub::resolve(fault_addr, stubs) {
+
+        // An unresolved import can be reached two ways, and both must name it:
+        //  * CALLED  — Rip *is* the stub (execution jumped there); or
+        //  * READ    — the guest loaded/dereferenced the slot, so Rip is
+        //              ordinary code and the *access* address is the stub.
+        // Only the first was handled before, which meant a data import left at
+        // a stub reported an anonymous `Faulted` at whatever innocent
+        // instruction happened to read it — hiding the actual missing symbol.
+        let err = match stub::resolve(fault_addr, stubs).or_else(|| stub::resolve(access, stubs)) {
             Some(s) => RuntimeError::UnimplementedImport {
                 nid: s.nid,
                 addr: fault_addr,
             },
-            None => RuntimeError::Faulted { addr: fault_addr },
+            None => RuntimeError::Faulted {
+                addr: fault_addr,
+                access,
+                kind,
+            },
         };
         ctx.error.set(Some(err));
 

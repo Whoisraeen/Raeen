@@ -23,8 +23,8 @@ pub use crypto::{
     DecryptedSelf, KeyProvider, KeyRequest, NoKeysProvider, SegmentKey, decrypt_self, require_key,
 };
 pub use dynlib::linker::{
-    HLE_TRAMPOLINE_BASE, HleTrampoline, LinkedModule, UNRESOLVED_STUB_BASE, UnresolvedImport,
-    UnresolvedStub, link_module,
+    HLE_TRAMPOLINE_BASE, HleTrampoline, LinkedModule, ProcessTables, UNRESOLVED_STUB_BASE,
+    UnresolvedImport, UnresolvedStub, link_module, link_module_into,
 };
 pub use pup::Firmware;
 pub use registry::{ModulePolicy, ModuleRegistry, Resolver};
@@ -140,6 +140,33 @@ fn align_up_16k(v: u64) -> u64 {
 /// alone exports 99.4% of the eboot's import relocations.
 const DEPENDENCY_SUBDIRS: &[&str] = &["sce_module"];
 
+/// A module decoded far enough to link: SELF -> ELF -> `.sprx` -> dynlib data.
+struct DecodedModule {
+    module: sprx::SprxModule,
+    dynlib: dynlib::DynlibData,
+}
+
+/// SELF decrypt-or-passthrough -> `parse_sprx` -> dynamic decode, handling both
+/// dynamic models (a `PT_SCE_DYNLIBDATA` blob, or a real title's standard
+/// vaddr-based tags). Shared by the main module and each dependency.
+fn decrypt_and_decode(
+    bytes: &[u8],
+    provider: &dyn crypto::KeyProvider,
+) -> Result<DecodedModule, FirmwareError> {
+    let decrypted = crypto::self_crypto::decrypt_self(bytes, provider)?;
+    let module = sprx::parse_sprx(&decrypted.elf)?;
+    let dyn_tags = match &module.dynamic {
+        Some(d) => dynlib::parse_sce_dynamic(d)?,
+        None => Vec::new(),
+    };
+    let standard = dynlib::standard_dynamic_view(&module.segments, &dyn_tags);
+    let dynlib = match &standard {
+        Some((image, tags)) => dynlib::parse_dynlibdata(image, tags)?,
+        None => dynlib::parse_dynlibdata(module.dynlib_data.as_deref().unwrap_or(&[]), &dyn_tags)?,
+    };
+    Ok(DecodedModule { module, dynlib })
+}
+
 /// Locate a `DT_NEEDED` module's file: `dir/<needed>` first, then each of
 /// [`DEPENDENCY_SUBDIRS`]. `None` if it ships nowhere we look.
 fn find_dependency_file(dir: &std::path::Path, needed: &str) -> Option<std::path::PathBuf> {
@@ -226,6 +253,14 @@ pub fn load_process(
     let mut dependencies = Vec::new();
     let mut dep_images: Vec<(u64, Vec<u8>)> = Vec::new();
 
+    // ONE set of marker tables for the whole process. Every module's HLE
+    // trampolines and unresolved stubs are allocated from these, so an index
+    // means the same thing everywhere — see `ProcessTables`. Linking each
+    // module with private tables (as this used to, via `load_module`) made
+    // every module restart at index 0, so a dependency's import #k resolved to
+    // the MAIN module's #k at runtime: wrong function, no diagnostic.
+    let mut tables = dynlib::linker::ProcessTables::new();
+
     for needed in &dynlib_data.needed_modules {
         let stem = needed.trim_end_matches(".sprx").trim_end_matches(".prx");
         let Some(path) = find_dependency_file(dir, needed) else {
@@ -269,51 +304,59 @@ pub fn load_process(
             }
         };
         let dep_base = base.wrapping_add(next_offset);
-        match load_module(&dep_bytes, provider, registry, hle, dep_base) {
-            Ok(linked) => {
-                // Re-register this dependency's exports at their ABSOLUTE
-                // address: `load_module` registers them module-relative, which
-                // is only correct for a module based at 0.
-                let dep_module = sprx::parse_sprx(
-                    &crypto::self_crypto::decrypt_self(&dep_bytes, provider)?.elf,
-                )?;
-                let dep_tags = match &dep_module.dynamic {
-                    Some(d) => dynlib::parse_sce_dynamic(d)?,
-                    None => Vec::new(),
-                };
-                let dep_std = dynlib::standard_dynamic_view(&dep_module.segments, &dep_tags);
-                let dep_dyn = match &dep_std {
-                    Some((img, tags)) => dynlib::parse_dynlibdata(img, tags)?,
-                    None => dynlib::parse_dynlibdata(
-                        dep_module.dynlib_data.as_deref().unwrap_or(&[]),
-                        &dep_tags,
-                    )?,
-                };
-                registry.register_module_exports_at(needed, &dep_dyn.exports, dep_base);
 
-                let len = linked.image.len() as u64;
-                tracing::info!(
-                    "NEEDED {needed}: loaded at +{next_offset:#x} ({len:#x} bytes), {} export(s), \
-                     {} of its own import(s) unresolved",
-                    dep_dyn.exports.len(),
-                    linked.unresolved.len()
-                );
-                dependencies.push(LoadedDependency {
-                    name: needed.clone(),
-                    image_offset: next_offset,
-                    exports: dep_dyn.exports.len(),
-                    unresolved: linked.unresolved.len(),
-                });
-                dep_images.push((next_offset, linked.image));
-                next_offset = align_up_16k(next_offset + len);
+        // Parse once, register the exports at their ABSOLUTE address, then link
+        // with the process-wide `tables`. (This deliberately does not go through
+        // `load_module`: that allocates private marker tables — the aliasing bug
+        // above — and registers exports module-relative, which is only correct
+        // for a module based at 0, forcing a second parse to fix up.)
+        let dep = match decrypt_and_decode(&dep_bytes, provider) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("NEEDED {needed}: failed to decode ({e}) — skipping");
+                continue;
             }
-            Err(e) => tracing::warn!("NEEDED {needed}: failed to load ({e}) — skipping"),
-        }
+        };
+        registry.register_module_exports_at(needed, &dep.dynlib.exports, dep_base);
+
+        let linked = match dynlib::linker::link_module_into(
+            &dep.module,
+            &dep.dynlib,
+            registry,
+            hle,
+            dep_base,
+            &mut tables,
+        ) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!("NEEDED {needed}: failed to link ({e}) — skipping");
+                continue;
+            }
+        };
+
+        let len = linked.image.len() as u64;
+        tracing::info!(
+            "NEEDED {needed}: loaded at +{next_offset:#x} ({len:#x} bytes), {} export(s), \
+             {} of its own import(s) unresolved",
+            dep.dynlib.exports.len(),
+            linked.unresolved.len()
+        );
+        dependencies.push(LoadedDependency {
+            name: needed.clone(),
+            image_offset: next_offset,
+            exports: dep.dynlib.exports.len(),
+            unresolved: linked.unresolved.len(),
+        });
+        dep_images.push((next_offset, linked.image));
+        next_offset = align_up_16k(next_offset + len);
     }
 
-    // Now the main module, with every dependency's exports already registered.
+    // Now the main module, with every dependency's exports already registered —
+    // and sharing the same `tables`, so its marker indices continue the
+    // dependencies' rather than colliding with them.
     registry.register_module_exports_at(&module.name, &dynlib_data.exports, base);
-    let mut linked = dynlib::linker::link_module(&module, &dynlib_data, registry, hle, base)?;
+    let mut linked =
+        dynlib::linker::link_module_into(&module, &dynlib_data, registry, hle, base, &mut tables)?;
 
     // Compose: main module already occupies [0, its image len); splice each
     // dependency in at its offset.
@@ -332,12 +375,29 @@ pub fn load_process(
         }
     }
 
+    // Install the process-wide marker tables: they cover every module, so the
+    // runtime can invert a trampoline/stub address from ANY of them. Without
+    // this the composed module would carry only the main module's entries and a
+    // dependency's call would land on the wrong table row.
+    linked.hle_trampolines = tables.hle_trampolines().to_vec();
+    linked.unresolved_stubs = tables.unresolved_stubs().to_vec();
+
+    // Count honestly: `linked.unresolved` is the MAIN module's relocations
+    // only, while the stub table is process-wide. Reporting one against the
+    // other invites exactly the units confusion that produced the
+    // "99.6% is libfmod" figure.
+    let dep_unresolved: usize = dependencies.iter().map(|d| d.unresolved).sum();
     tracing::info!(
-        "process composed: {} dependenc(ies), {:#x}-byte image, {} HLE trampoline(s), {} unresolved",
+        "process composed: {} dependenc(ies), {:#x}-byte image, {} HLE trampoline(s) \
+         (process-wide); unresolved relocations: {} in the main module + {} across its \
+         dependencies = {}, over {} distinct missing NID(s)",
         dependencies.len(),
         linked.image.len(),
         linked.hle_trampolines.len(),
-        linked.unresolved.len()
+        linked.unresolved.len(),
+        dep_unresolved,
+        linked.unresolved.len() + dep_unresolved,
+        linked.unresolved_stubs.len()
     );
 
     Ok(LoadedProcess {
