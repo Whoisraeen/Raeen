@@ -47,6 +47,13 @@ const DT_STRSZ: u64 = 10;
 const DT_SYMENT: u64 = 11;
 const DT_JMPREL: u64 = 23;
 
+/// `DT_SCE_IMPORT_LIB`: one per library this module imports from. The value
+/// packs `(library_id << 48) | (version << 32) | name_strtab_offset` — so it
+/// maps a [`SymbolRef::library_index`] to a human-readable library name.
+/// Verified against a real title (`0x0001_0101_000036d8` => id 1, name at
+/// `0x36d8` = "libcohtml.Prospero.prx").
+const DT_SCE_IMPORT_LIB: u64 = 0x6100_0045;
+
 const DT_SCE_HASH: u64 = 0x6100_0025;
 const DT_SCE_PLTRELSZ: u64 = 0x6100_002D;
 const DT_SCE_JMPREL: u64 = 0x6100_0029;
@@ -124,6 +131,15 @@ pub struct DynlibData {
     /// `DT_SCE_NEEDED_MODULE`-style tag with a confirmed layout, so this is
     /// always empty until that's verified against a real module.
     pub needed_modules: Vec<String>,
+    /// `library_index` -> library name, from the [`DT_SCE_IMPORT_LIB`] tags.
+    ///
+    /// This is what makes an unresolved import *actionable*: a NID is a one-way
+    /// hash, so an unresolved one cannot be turned back into a function name —
+    /// but every import symbol carries a [`SymbolRef::library_index`], and this
+    /// maps that to a real name ("libSceAgc.prx", ...). Grouping unresolved
+    /// imports by library turns "688 unknown NIDs" into a prioritized list of
+    /// which libraries to implement.
+    pub import_libs: Vec<(u16, String)>,
 }
 
 /// Decode the `Elf64_Dyn` `(d_tag: u64, d_val: u64)` array from a raw
@@ -335,12 +351,32 @@ pub fn parse_dynlibdata(blob: &[u8], dyn_tags: &[(u64, u64)]) -> Result<DynlibDa
         }
     }
 
+    // `DT_SCE_IMPORT_LIB`: library_index -> name. See `DynlibData::import_libs`
+    // for why this matters (it's what makes an unresolved NID actionable).
+    let mut import_libs = Vec::new();
+    for &(tag, val) in dyn_tags {
+        if tag != DT_SCE_IMPORT_LIB {
+            continue;
+        }
+        let id = (val >> 48) as u16;
+        let off = (val & 0xFFFF_FFFF) as usize;
+        match read_cstr(strtab, off) {
+            Some(name) if !name.is_empty() => import_libs.push((id, name)),
+            _ => tracing::debug!(
+                "DT_SCE_IMPORT_LIB id {id} name offset {off:#x} is out of range (strtab len {}) \
+                 or empty; skipping",
+                strtab.len()
+            ),
+        }
+    }
+
     Ok(DynlibData {
         imports,
         exports,
         symbols,
         relocations,
         needed_modules,
+        import_libs,
     })
 }
 

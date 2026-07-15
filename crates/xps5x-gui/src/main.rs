@@ -86,6 +86,42 @@ fn main() -> anyhow::Result<()> {
             linked.hle_trampolines.len(),
             linked.unresolved.len()
         );
+
+        // Turn "N unresolved NIDs" into an actionable list. A NID is a one-way
+        // hash, so an unresolved one can't be turned back into a function name
+        // — but each import symbol carries a library_index, and
+        // DT_SCE_IMPORT_LIB maps that to a real library name. Grouping by
+        // library says exactly which libraries to implement next, ranked.
+        if !linked.unresolved.is_empty() {
+            use std::collections::HashMap;
+            let lib_names: HashMap<u16, &str> = dynlib_data
+                .import_libs
+                .iter()
+                .map(|(id, n)| (*id, n.as_str()))
+                .collect();
+            let nid_to_lib: HashMap<u64, u16> = dynlib_data
+                .imports
+                .iter()
+                .map(|s| (s.nid, s.library_index))
+                .collect();
+            let mut per_lib: HashMap<&str, usize> = HashMap::new();
+            let mut unknown = 0usize;
+            for nid in &linked.unresolved {
+                match nid_to_lib.get(nid).and_then(|i| lib_names.get(i)) {
+                    Some(name) => *per_lib.entry(name).or_default() += 1,
+                    None => unknown += 1,
+                }
+            }
+            let mut ranked: Vec<_> = per_lib.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1));
+            println!("\nunresolved imports by library (implement these, most-wanted first):");
+            for (lib, n) in ranked.iter().take(20) {
+                println!("  {n:>6}  {lib}");
+            }
+            if unknown > 0 {
+                println!("  {unknown:>6}  <library unknown>");
+            }
+        }
         return Ok(());
     }
 

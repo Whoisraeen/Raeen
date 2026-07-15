@@ -190,6 +190,31 @@ pub fn link_module(
                     ))
                 })?;
 
+                // A **defined** symbol is not an import: its slot holds the
+                // symbol's own address, and there is nothing to look up. Only
+                // undefined symbols name something another module must supply.
+                //
+                // Resolving defined symbols through the NID registry (as this
+                // used to do unconditionally) is actively destructive on a real
+                // title: its ~717k relocations mostly target its OWN internal
+                // symbols, whose NIDs are naturally absent from the HLE
+                // registry, so every one of them had `UNRESOLVED_STUB_ADDR`
+                // written into it — corrupting the module's internal pointers
+                // and vtables wholesale, and guaranteeing a fault at the stub
+                // the moment any of them was used. It went unnoticed because
+                // in-tree fixtures only ever relocate imports.
+                if !symbol.is_import {
+                    let value =
+                        base.wrapping_add(symbol.value)
+                            .wrapping_add(if r_type == R_X86_64_64 {
+                                reloc.addend as u64
+                            } else {
+                                0
+                            });
+                    write_slot(&mut image, reloc.offset, value)?;
+                    continue;
+                }
+
                 match registry.resolve(hle, &module.name, symbol.nid) {
                     Resolver::Hle { library, function } => {
                         let nid = symbol.nid;
