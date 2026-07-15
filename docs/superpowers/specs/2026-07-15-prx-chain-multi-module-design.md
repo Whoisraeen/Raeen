@@ -54,12 +54,36 @@ reference. The pieces to consume them already exist:
   them with no further work.
 * `link_module(module, dynlib, registry, hle, base)` already takes a **base**.
 
-## The one real gap: a multi-module address space
+## The one real gap — and it is SMALLER than it looks
 
 `GuestArena::new(&module.image)` maps exactly **one** image at
 `GUEST_ARENA_BASE`. A title needs its eboot *and* its dependencies resident
 simultaneously, each at a distinct base, with exports registered at
 `base + vaddr`.
+
+**Do NOT rewrite `GuestArena`.** Measured facts that collapse this:
+
+* The arena's image region is **1 GiB** (`IMAGE_OFFSET = 0x0`,
+  `IMAGE_SIZE = 0x4000_0000`, `arena.rs:39-40`).
+* A real eboot's image spans ~`0xf49b720` (~256 MB) of that.
+* Its four bundled `.prx` are small — `libfmod.prx` reassembles to 1.75 MB;
+  `libcohtml`/`libRenoirCore`/`MediaDecoders` are comparable. Low tens of MB
+  total.
+
+So **every module fits in the existing image region with ~768 MB to spare**, and
+the whole problem reduces to *composing one flat image*:
+
+1. Lay out: eboot at image offset 0; each dependency at a page-aligned offset
+   above it (bump allocator over reassembled image sizes).
+2. `link_module(dep, ..., base = GUEST_ARENA_BASE + dep_offset)` — `link_module`
+   **already takes a base**.
+3. Register each dep's exports at its absolute address.
+4. Concatenate the linked images into one buffer (deps' bytes at their offsets).
+5. `GuestArena::new(&combined)` — **unchanged**, it just sees one bigger image.
+
+`load_module` currently returns a `LinkedModule` (which owns its `image`), so
+composition belongs in a new `load_process`-style entry point above it; the
+existing single-module path stays for fixtures/diagnostics.
 
 ### Sketch
 
