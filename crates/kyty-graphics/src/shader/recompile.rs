@@ -32,8 +32,9 @@ use std::sync::OnceLock;
 pub use super::spirv::ShaderRecompileError;
 use super::spirv::{
     Spirv, SpirvType, not_supported, operand_is_constant, operand_is_exec, operand_is_variable,
-    operand_load_float, operand_load_uint, operand_variable_to_str, operand_variable_to_str_shift,
-    spirv_generate_source, spirv_get_embedded_ps, spirv_get_embedded_vs,
+    operand_load_float, operand_load_int, operand_load_uint, operand_variable_to_str,
+    operand_variable_to_str_shift, spirv_generate_source, spirv_get_embedded_ps,
+    spirv_get_embedded_vs,
 };
 use crate::shader::resources::{
     ShaderComputeInputInfo, ShaderPixelInputInfo, ShaderVertexInputInfo,
@@ -2050,6 +2051,7 @@ fn recompile_fetch(
 
 /// Kyty: `Recompile_BufferStoreDword_Vdata1VaddrSvSoffsIdxen`
 /// (ShaderSpirv.cpp L1999).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_buffer_store_dword_vdata1(
     index: u32,
     code: &ShaderCode,
@@ -2132,6 +2134,7 @@ fn recompile_buffer_store_dword_vdata1(
 
 /// Kyty: `Recompile_BufferStoreFormatX_Vdata1VaddrSvSoffsIdxen`
 /// (ShaderSpirv.cpp L2068).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_buffer_store_format_x_vdata1(
     index: u32,
     code: &ShaderCode,
@@ -2215,6 +2218,7 @@ fn recompile_buffer_store_format_x_vdata1(
 
 /// Kyty: `Recompile_BufferStoreFormatXy_Vdata2VaddrSvSoffsIdxen`
 /// (ShaderSpirv.cpp L2137).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_buffer_store_format_xy_vdata2(
     index: u32,
     code: &ShaderCode,
@@ -2301,6 +2305,7 @@ fn recompile_buffer_store_format_xy_vdata2(
 /// Shared body of `Recompile_DsAppend_VdstGds` / `Recompile_DsConsume_VdstGds`
 /// (ShaderSpirv.cpp L2208/L2243) — the two Kyty functions are identical
 /// except for the atomic opcode.
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn ds_append_consume(
     index: u32,
     code: &ShaderCode,
@@ -2350,6 +2355,7 @@ fn ds_append_consume(
 }
 
 /// Kyty: `Recompile_DsAppend_VdstGds` (ShaderSpirv.cpp L2208).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_ds_append(
     index: u32,
     code: &ShaderCode,
@@ -2369,6 +2375,7 @@ fn recompile_ds_append(
 }
 
 /// Kyty: `Recompile_DsConsume_VdstGds` (ShaderSpirv.cpp L2243).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_ds_consume(
     index: u32,
     code: &ShaderCode,
@@ -2392,6 +2399,7 @@ fn recompile_ds_consume(
 /// duplicates the whole function per dmask; the bodies differ only in which
 /// sampled channels land in which consecutive dst registers, expressed here
 /// as `(temp_id, channel)` pairs matching Kyty's temp numbering exactly.
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn image_sample_channels(
     index: u32,
     code: &ShaderCode,
@@ -2466,6 +2474,7 @@ fn image_sample_channels(
 
 /// Kyty: `Recompile_ImageSample_Vdata1Vaddr3StSsDmask1` (ShaderSpirv.cpp
 /// L2471).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_image_sample_dmask1(
     index: u32,
     code: &ShaderCode,
@@ -2480,6 +2489,7 @@ fn recompile_image_sample_dmask1(
 
 /// Kyty: `Recompile_ImageSample_Vdata1Vaddr3StSsDmask8` (ShaderSpirv.cpp
 /// L2525).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_image_sample_dmask8(
     index: u32,
     code: &ShaderCode,
@@ -2494,6 +2504,7 @@ fn recompile_image_sample_dmask8(
 
 /// Kyty: `Recompile_ImageSample_Vdata2Vaddr3StSsDmask3` (ShaderSpirv.cpp
 /// L2579).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_image_sample_dmask3(
     index: u32,
     code: &ShaderCode,
@@ -2508,6 +2519,7 @@ fn recompile_image_sample_dmask3(
 
 /// Kyty: `Recompile_ImageSample_Vdata2Vaddr3StSsDmask5` (ShaderSpirv.cpp
 /// L2638).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_image_sample_dmask5(
     index: u32,
     code: &ShaderCode,
@@ -2522,6 +2534,7 @@ fn recompile_image_sample_dmask5(
 
 /// Kyty: `Recompile_ImageSample_Vdata2Vaddr3StSsDmask9` (ShaderSpirv.cpp
 /// L2697).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_image_sample_dmask9(
     index: u32,
     code: &ShaderCode,
@@ -2536,6 +2549,7 @@ fn recompile_image_sample_dmask9(
 
 /// Kyty: `Recompile_ImageSample_Vdata3Vaddr3StSsDmask7` (ShaderSpirv.cpp
 /// L2756).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_image_sample_dmask7(
     index: u32,
     code: &ShaderCode,
@@ -2557,6 +2571,7 @@ fn recompile_image_sample_dmask7(
 
 /// Kyty: `Recompile_ImageSample_Vdata4Vaddr3StSsDmaskF` (ShaderSpirv.cpp
 /// L2968).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_image_sample_dmask_f(
     index: u32,
     code: &ShaderCode,
@@ -2578,6 +2593,7 @@ fn recompile_image_sample_dmask_f(
 
 /// Kyty: `Recompile_ImageSampleLz_Vdata3Vaddr3StSsDmask7` (ShaderSpirv.cpp
 /// L2821).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_image_sample_lz_dmask7(
     index: u32,
     code: &ShaderCode,
@@ -2654,6 +2670,7 @@ fn recompile_image_sample_lz_dmask7(
 
 /// Kyty: `Recompile_ImageSampleLzO_Vdata3Vaddr4StSsDmask7` (ShaderSpirv.cpp
 /// L2887).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_image_sample_lzo_dmask7(
     index: u32,
     code: &ShaderCode,
@@ -2744,6 +2761,7 @@ fn recompile_image_sample_lzo_dmask7(
 }
 
 /// Kyty: `Recompile_ImageLoad_Vdata4Vaddr3StDmaskF` (ShaderSpirv.cpp L3038).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_image_load_dmask_f(
     index: u32,
     code: &ShaderCode,
@@ -2819,6 +2837,7 @@ fn recompile_image_load_dmask_f(
 }
 
 /// Kyty: `Recompile_ImageStore_Vdata4Vaddr3StDmaskF` (ShaderSpirv.cpp L3105).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_image_store_dmask_f(
     index: u32,
     code: &ShaderCode,
@@ -2898,6 +2917,7 @@ fn recompile_image_store_dmask_f(
 
 /// Kyty: `Recompile_ImageStoreMip_Vdata4Vaddr4StDmaskF` (ShaderSpirv.cpp
 /// L3173).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_image_store_mip_dmask_f(
     index: u32,
     code: &ShaderCode,
@@ -2983,6 +3003,7 @@ fn recompile_image_store_mip_dmask_f(
 
 /// Kyty: `Recompile_S_XXX_B64_Sdst2Ssrc02Ssrc12` (ShaderSpirv.cpp L3248).
 /// XXX: Andn2, Orn2, And, Nor, Nand, Xnor, Or, Xor, Cselect (via `param`).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_s_xxx_b64_sdst2_ssrc02_ssrc12(
     index: u32,
     code: &ShaderCode,
@@ -3064,6 +3085,11 @@ fn recompile_s_xxx_b64_sdst2_ssrc02_ssrc12(
 /// Shared body of `Recompile_S_Lshl_B64_Sdst2Ssrc02Ssrc1` /
 /// `Recompile_S_Lshr_B64_Sdst2Ssrc02Ssrc1` (ShaderSpirv.cpp L3316/L3384) —
 /// identical upstream except for the `shift_left`/`shift_right` callee.
+#[allow(dead_code)]
+// C2: staged recompiler, not yet wired into G_RECOMP_FUNC
+// The 6-arg recompiler signature plus the two args that parameterise the
+// upstream difference; splitting it would diverge from the Kyty shape.
+#[allow(clippy::too_many_arguments)]
 fn s_shift_b64(
     index: u32,
     code: &ShaderCode,
@@ -3146,6 +3172,7 @@ fn s_shift_b64(
 }
 
 /// Kyty: `Recompile_S_Lshl_B64_Sdst2Ssrc02Ssrc1` (ShaderSpirv.cpp L3316).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_s_lshl_b64(
     index: u32,
     code: &ShaderCode,
@@ -3167,6 +3194,7 @@ fn recompile_s_lshl_b64(
 }
 
 /// Kyty: `Recompile_S_Lshr_B64_Sdst2Ssrc02Ssrc1` (ShaderSpirv.cpp L3384).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_s_lshr_b64(
     index: u32,
     code: &ShaderCode,
@@ -3188,6 +3216,7 @@ fn recompile_s_lshr_b64(
 }
 
 /// Kyty: `Recompile_S_Bfe_U64_Sdst2Ssrc02Ssrc1` (ShaderSpirv.cpp L3452).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_s_bfe_u64(
     index: u32,
     code: &ShaderCode,
@@ -3276,6 +3305,7 @@ fn recompile_s_bfe_u64(
 
 /// Kyty: `Recompile_S_XXX_B32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp L3528).
 /// XXX: And, Bfm, Cselect, Lshl, Lshr, Or (via `param`).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_s_xxx_b32_svdst_svsrc01(
     index: u32,
     code: &ShaderCode,
@@ -3336,6 +3366,7 @@ fn recompile_s_xxx_b32_svdst_svsrc01(
 
 /// Kyty: `Recompile_S_XXX_I32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp L3576).
 /// XXX: Add, Mul, Sub (via `param`).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_s_xxx_i32_svdst_svsrc01(
     index: u32,
     code: &ShaderCode,
@@ -3393,6 +3424,7 @@ fn recompile_s_xxx_i32_svdst_svsrc01(
 
 /// Kyty: `Recompile_S_XXX_U32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp L3621).
 /// XXX: Add, Addc, Bfe, Lshl4Add, MulHi (via `param`).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_s_xxx_u32_svdst_svsrc01(
     index: u32,
     code: &ShaderCode,
@@ -3454,6 +3486,7 @@ fn recompile_s_xxx_u32_svdst_svsrc01(
 }
 
 /// Kyty: `Recompile_SAndSaveexecB64_Sdst2Ssrc02` (ShaderSpirv.cpp L3670).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_s_and_saveexec_b64(
     index: u32,
     code: &ShaderCode,
@@ -3520,6 +3553,7 @@ fn recompile_s_and_saveexec_b64(
 
 /// Kyty: `Recompile_SCmp_XXX_I32_Ssrc0Ssrc1` (ShaderSpirv.cpp L3725).
 /// XXX: Eq, Ge, Gt, Lg, Lt, Le (comparison opcode via `param[0]`).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_scmp_xxx_i32(
     index: u32,
     code: &ShaderCode,
@@ -3561,6 +3595,7 @@ fn recompile_scmp_xxx_i32(
 
 /// Kyty: `Recompile_SCmp_XXX_U32_Ssrc0Ssrc1` (ShaderSpirv.cpp L3760).
 /// XXX: Eq, Ge, Gt, Le, Lt, Lg (comparison opcode via `param[0]`).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_scmp_xxx_u32(
     index: u32,
     code: &ShaderCode,
@@ -3601,6 +3636,7 @@ fn recompile_scmp_xxx_u32(
 }
 
 /// Kyty: `Recompile_SMulkI32_SVdstSVsrc0` (ShaderSpirv.cpp L4437).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_smulk_i32(
     index: u32,
     code: &ShaderCode,
@@ -3654,6 +3690,7 @@ fn recompile_smulk_i32(
 }
 
 /// Kyty: `Recompile_SWqmB64_Sdst2Ssrc02` (ShaderSpirv.cpp L4621).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_swqm_b64(
     index: u32,
     code: &ShaderCode,
@@ -3751,6 +3788,7 @@ fn recompile_swqm_b64(
 
 /// Kyty: `Recompile_SBufferLoadDwordx2_Sdst2SvSoffset` (ShaderSpirv.cpp
 /// L3831).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_sbuffer_load_dwordx2(
     index: u32,
     code: &ShaderCode,
@@ -3805,6 +3843,7 @@ fn recompile_sbuffer_load_dwordx2(
 /// Shared body of `Recompile_SBufferLoadDwordx8/x16_Sdst*SvSoffset`
 /// (ShaderSpirv.cpp L3928/L3976) — identical upstream except for N and the
 /// `sbuffer_load_dword_N` callee.
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn sbuffer_load_dword_n(
     index: u32,
     code: &ShaderCode,
@@ -3862,6 +3901,7 @@ fn sbuffer_load_dword_n(
 
 /// Kyty: `Recompile_SBufferLoadDwordx8_Sdst8SvSoffset` (ShaderSpirv.cpp
 /// L3928).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_sbuffer_load_dwordx8(
     index: u32,
     code: &ShaderCode,
@@ -3883,6 +3923,7 @@ fn recompile_sbuffer_load_dwordx8(
 
 /// Kyty: `Recompile_SBufferLoadDwordx16_Sdst16SvSoffset` (ShaderSpirv.cpp
 /// L3976).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_sbuffer_load_dwordx16(
     index: u32,
     code: &ShaderCode,
@@ -3904,6 +3945,7 @@ fn recompile_sbuffer_load_dwordx16(
 
 /// Kyty: `Recompile_TBufferLoadFormatXyzw_Vdata4Vaddr2SvSoffsOffenIdxenFloat4`
 /// (ShaderSpirv.cpp L4824).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_tbuffer_load_format_xyzw_offen_float4(
     index: u32,
     code: &ShaderCode,
@@ -3984,6 +4026,7 @@ fn recompile_tbuffer_load_format_xyzw_offen_float4(
 /// Kyty: `Recompile_VCmp_XXX_F32_SmaskVsrc0Vsrc1` (ShaderSpirv.cpp L4890).
 /// XXX: F, Eq, Ge, Gt, Le, Lg, Lt, Neq, Nge, Ngt, Nle, Nlg, Nlt, O, Tru, U
 /// (comparison via `param[0]`).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_vcmp_xxx_f32(
     index: u32,
     code: &ShaderCode,
@@ -4045,6 +4088,7 @@ fn recompile_vcmp_xxx_f32(
 
 /// Kyty: `Recompile_VCmp_XXX_I32_SmaskVsrc0Vsrc1` (ShaderSpirv.cpp L4940).
 /// XXX: Eq, Ne, Gt, Ge, F, Le, Lt, T (comparison via `param[0]`).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_vcmp_xxx_i32(
     index: u32,
     code: &ShaderCode,
@@ -4106,6 +4150,7 @@ fn recompile_vcmp_xxx_i32(
 
 /// Kyty: `Recompile_VCmp_XXX_U32_SmaskVsrc0Vsrc1` (ShaderSpirv.cpp L4990).
 /// XXX: Le, Ge, F, Gt, Lt, T (comparison via `param[0]`).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_vcmp_xxx_u32(
     index: u32,
     code: &ShaderCode,
@@ -4167,6 +4212,7 @@ fn recompile_vcmp_xxx_u32(
 
 /// Kyty: `Recompile_VCmpx_XXX_I32_SmaskVsrc0Vsrc1` (ShaderSpirv.cpp L5040).
 /// XXX: Eq, Ne (comparison via `param[0]`; also writes EXEC).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_vcmpx_xxx_i32(
     index: u32,
     code: &ShaderCode,
@@ -4232,6 +4278,7 @@ fn recompile_vcmpx_xxx_i32(
 
 /// Kyty: `Recompile_VCmpx_XXX_U32_SmaskVsrc0Vsrc1` (ShaderSpirv.cpp L5094).
 /// XXX: Gt, Ge (comparison via `param[0]`; also writes EXEC).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_vcmpx_xxx_u32(
     index: u32,
     code: &ShaderCode,
@@ -4297,6 +4344,7 @@ fn recompile_vcmpx_xxx_u32(
 
 /// Kyty: `Recompile_VCmpx_XXX_F32_SmaskVsrc0Vsrc1` (ShaderSpirv.cpp L5148).
 /// XXX: Neq, Gt, Lt (comparison via `param[0]`; also writes EXEC).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_vcmpx_xxx_f32(
     index: u32,
     code: &ShaderCode,
@@ -4362,6 +4410,7 @@ fn recompile_vcmpx_xxx_f32(
 
 /// Kyty: `Recompile_VCvtPkrtzF16F32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp
 /// L5260).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_vcvt_pkrtz_f16_f32(
     index: u32,
     code: &ShaderCode,
@@ -4430,6 +4479,7 @@ fn recompile_vcvt_pkrtz_f16_f32(
 
 /// Kyty: `Recompile_VMbcntHiU32B32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp
 /// L5455).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_vmbcnt_hi_u32_b32(
     index: u32,
     code: &ShaderCode,
@@ -4486,6 +4536,7 @@ fn recompile_vmbcnt_hi_u32_b32(
 
 /// Kyty: `Recompile_VMbcntLoU32B32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp
 /// L5497).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_vmbcnt_lo_u32_b32(
     index: u32,
     code: &ShaderCode,
@@ -4536,6 +4587,7 @@ fn recompile_vmbcnt_lo_u32_b32(
 
 /// Kyty: `Recompile_V_XXX_B32_SVdstSVsrc0` (ShaderSpirv.cpp L5538).
 /// XXX: Bfrev, Not (via `param`).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_v_xxx_b32_svdst_svsrc0(
     index: u32,
     code: &ShaderCode,
@@ -4590,6 +4642,7 @@ fn recompile_v_xxx_b32_svdst_svsrc0(
 /// Kyty: `Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp L5740).
 /// XXX: And, Or, Xor, Bcnt, Bfm, Lshr, Lshl, Lshlrev, Lshrrev, MulU32U24,
 /// MulLoU32, MulHiU32 (via `param`).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_v_xxx_b32_svdst_svsrc01(
     index: u32,
     code: &ShaderCode,
@@ -4659,6 +4712,7 @@ fn recompile_v_xxx_b32_svdst_svsrc01(
 
 /// Kyty: `Recompile_V_XXX_I32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp L5795).
 /// XXX: Ashr, Ashrrev, MulLo (via `param`).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_v_xxx_i32_svdst_svsrc01(
     index: u32,
     code: &ShaderCode,
@@ -4727,6 +4781,7 @@ fn recompile_v_xxx_i32_svdst_svsrc01(
 
 /// Kyty: `Recompile_V_XXX_U32_VdstVsrc0Vsrc1Vsrc2` (ShaderSpirv.cpp L5940).
 /// XXX: Sad, Bfe, MadU32U24 (via `param`).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_v_xxx_u32_vdst_vsrc012(
     index: u32,
     code: &ShaderCode,
@@ -4805,6 +4860,7 @@ fn recompile_v_xxx_u32_vdst_vsrc012(
 
 /// Kyty: `Recompile_V_XXX_U32_VdstSdst2Vsrc0Vsrc1` (ShaderSpirv.cpp L6005).
 /// XXX: Add, Sub, Subrev (via `param`; carry-out goes to `dst2`).
+#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_v_xxx_u32_vdst_sdst2_vsrc01(
     index: u32,
     code: &ShaderCode,
