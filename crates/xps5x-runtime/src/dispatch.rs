@@ -133,6 +133,78 @@ pub(crate) fn call_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// How many recent HLE calls [`CallTrace`] remembers.
+const CALL_TRACE_LEN: usize = 24;
+
+/// A bounded ring of the most recent HLE calls, for explaining a fault.
+///
+/// # Why this exists
+///
+/// A guest that faults reading address 0 is almost never wrong on its own — it
+/// is holding a null we handed it. Once a title gets past its own init, the
+/// most common failure is an HLE stub returning `0` where the guest expects a
+/// real object, and the guest then dereferencing it several calls later. The
+/// faulting instruction is in *guest* code and names nothing; the culprit is in
+/// the call history.
+///
+/// Measured motivation: the retail title's first fault after libc init is
+/// exactly this shape — `Faulted { access: 0, kind: Read }` at `eboot+0x80A288`,
+/// with no import to blame.
+///
+/// # Discipline
+///
+/// Written from the VEH and read by [`run`], so it uses `Cell` like the rest of
+/// [`ActiveContext`]: it must survive the register-only context restore that the
+/// genuine-fault path performs (a `RefCell` borrow held across that jump would
+/// never be released). Nothing here allocates or logs — [`run`] does the
+/// formatting, on the normal path, once the guest is no longer running.
+struct CallTrace {
+    /// Next slot to write; total calls made is not tracked beyond this ring.
+    head: Cell<usize>,
+    /// Whether the ring has wrapped (so all slots are live).
+    wrapped: Cell<bool>,
+    /// `(trampoline index, return value)`.
+    entries: [Cell<(u32, u64)>; CALL_TRACE_LEN],
+}
+
+impl CallTrace {
+    fn new() -> Self {
+        Self {
+            head: Cell::new(0),
+            wrapped: Cell::new(false),
+            entries: [const { Cell::new((0u32, 0u64)) }; CALL_TRACE_LEN],
+        }
+    }
+
+    /// Record one serviced HLE call. Called from the VEH — allocation-free.
+    fn push(&self, trampoline_idx: u32, ret: u64) {
+        let h = self.head.get();
+        self.entries[h].set((trampoline_idx, ret));
+        let next = h + 1;
+        if next == CALL_TRACE_LEN {
+            self.head.set(0);
+            self.wrapped.set(true);
+        } else {
+            self.head.set(next);
+        }
+    }
+
+    /// The recorded calls, oldest first.
+    fn entries_oldest_first(&self) -> Vec<(u32, u64)> {
+        let h = self.head.get();
+        let mut out = Vec::with_capacity(CALL_TRACE_LEN);
+        if self.wrapped.get() {
+            for i in h..CALL_TRACE_LEN {
+                out.push(self.entries[i].get());
+            }
+        }
+        for i in 0..h {
+            out.push(self.entries[i].get());
+        }
+        out
+    }
+}
+
 /// The context [`veh_callback`] consults while a guest call is in flight.
 /// Written by [`run`] before calling the guest, read (and, on an unresolved
 /// trampoline, written back to) by the VEH, cleared by [`run`] after the
@@ -222,6 +294,9 @@ struct ActiveContext {
     /// reason `resumed`/`orig_fsbase` do (see `resumed`'s doc comment):
     /// `veh_callback` writes it *before* the longjmp, and `run` reads it
     /// only after control has already jumped back to the recovery point.
+    /// The most recent serviced HLE calls, for explaining a fault that names
+    /// nothing (see [`CallTrace`]).
+    trace: CallTrace,
     exit_code: Cell<u64>,
     /// Set to `true` by `veh_callback` alongside `exit_code`, immediately
     /// before the exit-longjmp (design doc §4). `run`'s shared continuation
@@ -392,6 +467,7 @@ pub(crate) unsafe fn run(
         orig_fsbase: Cell::new(0),
         tls_active: Cell::new(false),
         guest_fsbase: Cell::new(0),
+        trace: CallTrace::new(),
         exit_code: Cell::new(0),
         exited: Cell::new(false),
         armed: Cell::new(false),
@@ -556,8 +632,44 @@ pub(crate) unsafe fn run(
         return Ok(RunOutcome::Exited(ctx.exit_code.get()));
     }
     match ctx.error.take() {
-        Some(err) => Err(err),
+        Some(err) => {
+            // A fault that names nothing is usually our fault, not the guest's:
+            // an HLE stub handed back a null (or a bogus handle) and the guest
+            // dereferenced it later. The faulting instruction is in guest code
+            // and identifies no symbol, so print the recent HLE history — that
+            // is where the culprit is. Done HERE, not in the VEH: the handler is
+            // removed and the guest is no longer running, so this can safely
+            // allocate and log.
+            if matches!(err, RuntimeError::Faulted { .. }) {
+                log_call_trace(&ctx, trampolines, &err);
+            }
+            Err(err)
+        }
         None => Ok(RunOutcome::Returned(result)),
+    }
+}
+
+/// Print the most recent HLE calls preceding a fault, oldest first.
+///
+/// Deliberately reports the **return value** of each call alongside its name: a
+/// `-> 0x0` a few lines above a `Faulted { access: 0 }` is very often the whole
+/// story.
+fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &RuntimeError) {
+    let entries = ctx.trace.entries_oldest_first();
+    if entries.is_empty() {
+        tracing::warn!("{err} — no HLE calls were serviced before it");
+        return;
+    }
+    tracing::warn!(
+        "{err}\n  the {} most recent HLE call(s) before it (oldest first) — a call returning \
+         0x0 here is the usual cause of a null dereference in guest code:",
+        entries.len()
+    );
+    for (idx, ret) in entries {
+        match trampolines.get(idx as usize) {
+            Some(t) => tracing::warn!("    {}::{} -> {ret:#x}", t.library, t.function),
+            None => tracing::warn!("    <trampoline #{idx}> -> {ret:#x}"),
+        }
     }
 }
 
@@ -783,8 +895,15 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 }
             }
             let hle_ctx = HleContext { kernel, mem, alloc };
-            hle.call(&hle_ctx, &t.library, &t.function, &args)
-                .unwrap_or(0)
+            let ret = hle
+                .call(&hle_ctx, &t.library, &t.function, &args)
+                .unwrap_or(0);
+            // Remember it: if the guest later faults on a null we handed back,
+            // this history is the only thing that names the culprit (see
+            // `CallTrace`). Index, not name — no allocation in the VEH.
+            let idx = (fault_addr.wrapping_sub(ctx.region_base) / 8) as u32;
+            ctx.trace.push(idx, ret);
+            ret
         }
         None => {
             // A call landed in the guarded region but names no known
