@@ -24,7 +24,7 @@ pub fn register(registry: &HleRegistry) {
     }
     registry.register("libkernel", "scePthreadCondInit", hle_cond_init);
     registry.register("libkernel", "scePthreadCondWait", hle_cond_wait);
-    registry.register("libkernel", "scePthreadCondTimedwait", hle_cond_timedwait);
+    registry.register("libkernel", "scePthreadCondTimedwait", hle_sce_cond_timedwait);
     registry.register("libkernel", "scePthreadCondSignal", hle_cond_signal);
     registry.register("libkernel", "scePthreadCondBroadcast", hle_cond_broadcast);
     registry.register("libScePosix", "pthread_condattr_init", hle_condattr_ok);
@@ -110,14 +110,31 @@ fn hle_cond_wait(ctx: &HleContext, args: &[u64]) -> u64 {
     wait_core(ctx, args, None)
 }
 
+/// `SCE_KERNEL_ERROR_ETIMEDOUT` — the SCE-facing timeout code (SharpEmu's
+/// `ORBIS_GEN2_ERROR_TIMED_OUT`, shadPS4's `ORBIS_KERNEL_ERROR_ETIMEDOUT`).
+const SCE_KERNEL_ERROR_ETIMEDOUT: u64 = 0x8002_003C;
+
+/// Orbis `scePthreadCondTimedwait(cond, mutex, SceKernelUseconds usec)`:
+/// the third argument is a RELATIVE microsecond count passed by value, not a
+/// pointer to an absolute timespec (cross-checked against SharpEmu +
+/// shadPS4). On timeout this SCE entry point returns the SCE error code
+/// `0x8002003C`, NOT POSIX `ETIMEDOUT` (60): a PS5 title's own pthread wrapper
+/// recognizes the SCE code as "timed out" (and maps it to a benign cv_status);
+/// handed the POSIX 60 it can't classify it, maps it to EINVAL, and its C++
+/// std::condition_variable throws std::system_error("invalid argument") —
+/// measured as the uncaught exception that killed Minecraft's worker threads.
+fn hle_sce_cond_timedwait(ctx: &HleContext, args: &[u64]) -> u64 {
+    let usec = args.get(2).copied().unwrap_or(0);
+    let timeout = Some(std::time::Duration::from_micros(usec));
+    match wait_core(ctx, args, timeout) {
+        ETIMEDOUT => SCE_KERNEL_ERROR_ETIMEDOUT,
+        other => other,
+    }
+}
+
+/// POSIX `pthread_cond_timedwait` — returns errno directly (`ETIMEDOUT` = 60
+/// on timeout), the errno convention libc's own POSIX wrappers expect.
 fn hle_cond_timedwait(ctx: &HleContext, args: &[u64]) -> u64 {
-    // Orbis `scePthreadCondTimedwait(cond, mutex, SceKernelUseconds usec)`:
-    // the third argument is a RELATIVE microsecond count passed by value, not
-    // a pointer to an absolute timespec (cross-checked against SharpEmu's
-    // PthreadCondTimedwait and shadPS4). Misreading it as a pointer computed a
-    // garbage deadline that timed out immediately every call — which made
-    // libc's C++ condition_variable wrapper throw and killed every worker
-    // thread that does a timed wait (Minecraft's Streaming/Rendering pools).
     let usec = args.get(2).copied().unwrap_or(0);
     let timeout = Some(std::time::Duration::from_micros(usec));
     wait_core(ctx, args, timeout)
