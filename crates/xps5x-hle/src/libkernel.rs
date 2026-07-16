@@ -1939,6 +1939,19 @@ fn hle_debug_raise_exception(ctx: &HleContext, args: &[u64]) -> u64 {
             warn!("  fatal-thread stack code-addrs: {}", chain.join(" "));
         }
     }
+    // A thread killed mid-execution never runs its C++ cleanup, so any mutex
+    // it holds would stay locked forever — and our mutex lock is a spin-loop
+    // that only frees on owner-unlock, so every other thread waiting on that
+    // mutex spins indefinitely (a silent, total deadlock; measured on
+    // Minecraft when its Streaming/REST/Watchdog workers abort while the
+    // render thread waits on a mutex they held). Release this dying thread's
+    // held mutexes so waiters can make progress, mirroring what robust-mutex
+    // owner-death recovery does on real systems (EOWNERDEAD).
+    let released = ctx.kernel.release_mutexes_owned_by(thread);
+    if released > 0 {
+        warn!("  released {released} mutex(es) held by dying thread {thread} ('{name}')");
+    }
+
     // On hardware this never returns — the process is killed. Returning here
     // is measurably worse than stopping the thread: the caller's code ends at
     // the call instruction (noreturn), so a return "executes" whatever bytes

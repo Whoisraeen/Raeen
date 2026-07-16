@@ -510,6 +510,24 @@ pub struct UnwindModuleInfo {
 }
 
 impl OrbisKernel {
+    /// Release every pthread mutex currently owned by `thread`, returning how
+    /// many were freed. Called when a guest thread is torn down mid-execution
+    /// (e.g. `sceKernelDebugRaiseException`) so it does not leave mutexes
+    /// locked forever — waiters on a dead owner would otherwise spin or block
+    /// indefinitely. This is owner-death recovery, not a normal unlock: it
+    /// clears ownership and recursion outright regardless of level.
+    pub fn release_mutexes_owned_by(&self, thread: u64) -> usize {
+        let mut released = 0;
+        for mut entry in self.pthread_mutexes.iter_mut() {
+            if entry.owner == thread {
+                entry.owner = 0;
+                entry.recursion = 0;
+                released += 1;
+            }
+        }
+        released
+    }
+
     /// Create a new kernel instance with default configuration.
     pub fn new() -> Self {
         tracing::info!("Initializing Orbis kernel HLE");
