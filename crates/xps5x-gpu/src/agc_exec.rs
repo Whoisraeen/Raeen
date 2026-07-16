@@ -179,6 +179,18 @@ impl AgcGpuSession {
         let sink_skip_reason = sink.last_shader_skip_reason.clone();
         let image = sink.last.take();
         drop(sink);
+        // Snapshot every accumulated render target while the guard is still
+        // held (re-locking `self.framebuffers` here would deadlock — the guard
+        // lives to end of scope), for the optional all-targets dump below.
+        let all_targets: Option<Vec<(u64, RenderedImage)>> = image.as_ref().and_then(|_| {
+            std::env::var_os("XPS5X_DUMP_ALL_TARGETS").map(|_| {
+                framebuffers
+                    .iter()
+                    .map(|(base, img)| (*base, img.clone()))
+                    .collect()
+            })
+        });
+        drop(framebuffers);
         drop(cache);
         drop(guard);
         if shader_skips > 0 {
@@ -211,6 +223,14 @@ impl AgcGpuSession {
                 *draws
             };
             maybe_dump_frame(&image, count);
+            // A title renders its UI to several render targets and composites
+            // them; the last-drawn one (often the display's black background
+            // this early) is not necessarily where the content is. The
+            // snapshot above (taken under the lock) lets the all-targets dump
+            // surface content in a non-final target instead of discarding it.
+            if let Some(targets) = all_targets {
+                maybe_dump_all_targets(&targets, count);
+            }
             return Ok(Some(image));
         }
         debug!("AGC DCB ran through the command processor without a draw");
@@ -317,6 +337,39 @@ impl kyty_graphics::run::DrawSink for StateOnlySink {
 /// would otherwise write gigabytes and turn the observation into the
 /// bottleneck. A failed write logs and is otherwise ignored: frame dumping
 /// is diagnostics, never a reason to fail a submit.
+/// Dump every accumulated render target once per throttled frame, filename
+/// keyed by the target's guest base address, plus a one-line non-black-pixel
+/// census per target so the interesting one is greppable without opening PPMs.
+fn maybe_dump_all_targets(targets: &[(u64, RenderedImage)], draw_index: u64) {
+    let Ok(dir) = std::env::var("XPS5X_DUMP_FRAMES") else {
+        return;
+    };
+    if dir.is_empty() || (draw_index > 8 && !draw_index.is_power_of_two()) {
+        return;
+    }
+    for (base, image) in targets {
+        let non_black = image
+            .pixels
+            .chunks_exact(4)
+            .filter(|px| px[0] != 0 || px[1] != 0 || px[2] != 0)
+            .count();
+        let path =
+            std::path::Path::new(&dir).join(format!("target_{base:012x}_{draw_index:06}.ppm"));
+        let mut ppm = format!("P6\n{} {}\n255\n", image.width, image.height).into_bytes();
+        ppm.reserve(image.pixels.len() / 4 * 3);
+        for rgba in image.pixels.chunks_exact(4) {
+            ppm.extend_from_slice(&rgba[..3]);
+        }
+        let _ = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &ppm));
+        tracing::info!(
+            base = format_args!("{base:#x}"),
+            non_black_pixels = non_black,
+            total = image.pixels.len() / 4,
+            "render-target census"
+        );
+    }
+}
+
 fn maybe_dump_frame(image: &RenderedImage, draw_index: u64) {
     let Ok(dir) = std::env::var("XPS5X_DUMP_FRAMES") else {
         return;
