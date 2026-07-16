@@ -12,6 +12,56 @@ mod updater;
 
 use tracing::info;
 
+/// Say what the guest was executing when it faulted: which module the faulting
+/// `rip` lands in, its offset within that module, and the bytes there.
+///
+/// A bare `rip` names nothing. In a 250 MB stripped C++ binary one address looks
+/// like any other, and the temptation is to reason from whatever HLE call
+/// happened to be last — which is adjacency, not causation, and has already cost
+/// this project one wrong diagnosis. The module and offset make a fault
+/// comparable across runs and greppable against a disassembly; the bytes make it
+/// decodable on the spot.
+///
+/// Reads the composed process image the loader already holds, so it cannot
+/// perturb the guest or the fault path.
+fn report_fault_site(
+    linked: &xps5x_firmware::LinkedModule,
+    deps: &[xps5x_firmware::LoadedDependency],
+    addr: u64,
+) {
+    let Some(offset) = addr.checked_sub(xps5x_runtime::GUEST_ARENA_BASE) else {
+        info!("        rip is below the guest image — not guest code");
+        return;
+    };
+    let Ok(offset) = usize::try_from(offset) else {
+        return;
+    };
+    if offset >= linked.image.len() {
+        info!(
+            "        rip is past the loaded image ({:#x} byte(s)) — not guest code",
+            linked.image.len()
+        );
+        return;
+    }
+
+    // Dependencies are composed above the eboot at known offsets, so the last
+    // one at or below the rip owns it; below them all, it is the eboot's.
+    match deps
+        .iter()
+        .filter(|d| usize::try_from(d.image_offset).is_ok_and(|off| off <= offset))
+        .max_by_key(|d| d.image_offset)
+    {
+        Some(d) => info!(
+            "        module: {} at +{:#x}",
+            d.name,
+            offset as u64 - d.image_offset
+        ),
+        None => info!("        module: eboot.bin at +{offset:#x}"),
+    }
+    let end = (offset + 16).min(linked.image.len());
+    info!("        bytes at rip: {:02x?}", &linked.image[offset..end]);
+}
+
 fn main() -> anyhow::Result<()> {
     // Initialize logging to BOTH stderr and `logs/xps5x.log`. `_log` must stay
     // alive for the whole process — dropping it shuts down the background
@@ -351,6 +401,17 @@ fn main() -> anyhow::Result<()> {
                     }
                 );
                 info!("        implement it, or supply the module that exports it, and re-run");
+            }
+            // A fault reports where the guest *was*, which on its own names
+            // nothing: 250 MB into a stripped C++ binary, one address looks like
+            // any other. The bytes there are the difference between a lead and a
+            // dead end — they say whether the guest was loading a vtable,
+            // calling through a pointer, or reading a thread-local. The image is
+            // right here in the loader, so this costs nothing and never touches
+            // the fault path itself.
+            Err(xps5x_runtime::RuntimeError::Faulted { addr, access, kind }) => {
+                info!("RESULT: guest fault at {addr:#x} ({kind} {access:#x})");
+                report_fault_site(&linked, &process.dependencies, *addr);
             }
             Err(e) => info!("RESULT: {e:?}"),
         }
