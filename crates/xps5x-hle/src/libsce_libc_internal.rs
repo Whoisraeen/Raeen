@@ -112,10 +112,23 @@ fn hle_mspace_create(ctx: &HleContext, args: &[u64]) -> u64 {
     let base = args.get(1).copied().unwrap_or(0);
     let capacity = args.get(2).copied().unwrap_or(0);
     let flag = args.get(3).copied().unwrap_or(0);
+    // Returning 0 here hands the guest a null heap, and a title does not
+    // necessarily say so: ASTRO.BOT reports "Out of Global Heap Memory" from its
+    // own configured numbers (Current/Max: 0 / 2038431744) and never calls
+    // malloc at all — a failure that reads as an allocator bug when it is
+    // actually a rejected create. Say which guard rejected it.
     if base == 0 || capacity < 0x100 || flag > 1 {
+        warn!(
+            "sceLibcMspaceCreate(base={base:#x}, capacity={capacity:#x}, flag={flag}): rejected \
+             by argument guard — returning a NULL mspace"
+        );
         return 0;
     }
     let Some(name) = read_cstring(ctx, name_address, 256) else {
+        warn!(
+            "sceLibcMspaceCreate(base={base:#x}, capacity={capacity:#x}): name at \
+             {name_address:#x} unreadable — returning a NULL mspace"
+        );
         return 0;
     };
     ctx.kernel.libc_mspaces.insert(
