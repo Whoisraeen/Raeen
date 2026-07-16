@@ -78,6 +78,23 @@ pub enum RunOutcome {
 /// only [`arena::GuestArena`]'s reservation mechanism is Windows-specific.
 pub const GUEST_ARENA_BASE: u64 = 0x0000_1000_0000_0000;
 
+/// The base of the static TLS block sitting immediately below `tcb` (variant-II
+/// x86-64: the block grows downward from the thread pointer), or `None` when
+/// there is no static TLS to speak of.
+///
+/// This is the address the linker's `TPOFF64` offsets resolve against, and
+/// therefore the one `__tls_get_addr` must return for the main module's
+/// thread-locals — the ELF TLS ABI requires a variable reached through the
+/// general-dynamic model to land on the same storage as through initial-exec.
+/// Handing out a second block instead is a measured Minecraft crash: its single
+/// `.tdata` pointer read back as `NULL` from the uninitialized copy.
+fn static_tls_block(tcb: Option<u64>, tls: Option<&xps5x_firmware::TlsTemplate>) -> Option<u64> {
+    match (tcb, tls) {
+        (Some(tcb), Some(tls)) => tcb.checked_sub(tls.block_size()),
+        _ => None,
+    }
+}
+
 /// How a faulting guest instruction was touching the address it faulted on —
 /// decoded from `EXCEPTION_RECORD.ExceptionInformation[0]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +265,7 @@ pub fn execute_linked(
     } else {
         None
     };
+    let static_tls_block = static_tls_block(tcb, module.tls.as_ref());
 
     // SAFETY: `entry_ptr` is a host address inside `arena`'s
     // `PAGE_EXECUTE_READWRITE` image sub-region, at the caller-specified
@@ -284,6 +302,7 @@ pub fn execute_linked(
             &arena,
             &guard,
             tcb,
+            static_tls_block,
             None,
             1,
             // No inner `unsafe {}` here: this closure literal is written
@@ -466,6 +485,7 @@ fn execute_process_mapped(
     } else {
         None
     };
+    let static_tls_block = static_tls_block(tcb, module.tls.as_ref());
 
     // Lay out the process stack in the arena's stack region (design doc §2);
     // `process::build_process_stack` writes only through `&arena` (bounds-
@@ -526,6 +546,7 @@ fn execute_process_mapped(
                 arena,
                 guard,
                 tcb,
+                static_tls_block,
                 guest_threads,
                 1,
                 || crate::stack::enter_guest(ptr as u64, module_rsp, [0; 6]),
@@ -553,6 +574,7 @@ fn execute_process_mapped(
             arena,
             guard,
             tcb,
+            static_tls_block,
             guest_threads,
             1,
             // Same "no inner `unsafe {}`" note as `execute_linked`'s closure

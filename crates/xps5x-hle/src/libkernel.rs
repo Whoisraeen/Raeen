@@ -44,6 +44,17 @@ const WRITE_MAX_BYTES: u64 = 1 << 20; // 1 MiB
 /// a corrupt guest descriptor cannot request an unbounded host allocation.
 const DYNAMIC_TLS_BLOCK_SIZE: u64 = 0x1_0000;
 
+/// The TLS module ID the linker writes into the main module's `DTPMOD64`
+/// relocation slots, and therefore the id a general-dynamic access to the
+/// executable's own thread-locals arrives here with.
+///
+/// Must equal `xps5x_firmware`'s `MAIN_TLS_MODULE_ID`. It is duplicated rather
+/// than imported because the dependency runs the other way — `xps5x-firmware`
+/// depends on this crate to resolve NIDs at link time, so importing it back
+/// would be a cycle. Pinned against the linker's value by
+/// `main_tls_module_id_matches_the_linkers` in `xps5x-firmware`.
+const MAIN_TLS_MODULE_ID: u64 = 1;
+
 /// `EBADF` as the sign-extended negative return `write(2)` produces on a
 /// bad descriptor (the PS5's BSD libc returns `-1` and sets `errno`;
 /// `sceKernelWrite` returns a negative error directly — either way the
@@ -1311,13 +1322,27 @@ fn hle_rtld_thread_atexit_decrement(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 /// `__tls_get_addr(const tls_index*)` resolves a guest descriptor containing
-/// `{ module_id: u64, offset: u64 }` to stable, zero-initialized storage.
+/// `{ module_id: u64, offset: u64 }` to that thread-local's storage.
 ///
-/// This is the dynamic-TLS path used by file-backed modules such as libc.prx;
-/// the main executable's compiler-emitted initial-exec TLS continues to use
-/// the runtime's variant-II static block and `TPOFF64` relocations. The block
-/// lives in the guest arena (never host-only memory), so the returned pointer
-/// is directly dereferenceable by native guest code.
+/// The main module resolves to the **static** block the runtime built from its
+/// `PT_TLS` template; every other module gets bounded, zero-initialized dynamic
+/// storage. The block lives in the guest arena (never host-only memory), so the
+/// returned pointer is directly dereferenceable by native guest code.
+///
+/// # Why the main module is not just another dynamic block
+///
+/// It used to be, and that was a measured Minecraft crash. A PIC-built
+/// executable reaches its *own* thread-locals through the general-dynamic model
+/// — this function — as well as through `TPOFF64`, and the ELF TLS ABI requires
+/// both to land on the same address. Returning fresh storage here gave one
+/// variable two homes, and only the static one was ever initialized from
+/// `.tdata`.
+///
+/// Minecraft's `PT_TLS` is `tdata=0x8 memsz=0x78`: a single initialized pointer
+/// at offset 0. It asked for `{module: 1, offset: 0}`, read the zeroed copy back
+/// as `NULL`, and dereferenced it — surfacing as a guest fault reading address
+/// `0` from its own code, ~250 MB into the image, with nothing to connect it to
+/// TLS at all.
 fn hle_tls_get_addr(ctx: &HleContext, args: &[u64]) -> u64 {
     let descriptor = args.first().copied().unwrap_or(0);
     if descriptor == 0 {
@@ -1330,6 +1355,22 @@ fn hle_tls_get_addr(ctx: &HleContext, args: &[u64]) -> u64 {
     }
     let module_id = u64::from_le_bytes(bytes[..8].try_into().expect("fixed slice"));
     let offset = u64::from_le_bytes(bytes[8..].try_into().expect("fixed slice"));
+
+    // The main module's storage already exists and is already initialized: the
+    // runtime copied `PT_TLS`'s `.tdata` into it and the linker's `TPOFF64`
+    // offsets are computed against it. Alias it rather than allocate beside it.
+    //
+    // `offset` is not bounds-checked against the static block here: it comes
+    // from the linker's own `DTPOFF64`, computed against the same template the
+    // block was sized from, so the two agree by construction — the same
+    // agreement `TPOFF64` already relies on. A `None` block means there is no
+    // static TLS at all, and the dynamic path below is then the honest answer.
+    if module_id == MAIN_TLS_MODULE_ID
+        && let Some(base) = ctx.guest_threads.current_static_tls_block()
+    {
+        return base + offset;
+    }
+
     if offset >= DYNAMIC_TLS_BLOCK_SIZE {
         warn!(
             "__tls_get_addr(module={module_id:#x}, offset={offset:#x}): offset exceeds bounded block"
@@ -2070,7 +2111,101 @@ fn hle_kernel_error(_ctx: &HleContext, _args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GuestMemory, test_ctx};
+    use crate::{GuestMemory, GuestThreadScheduler, test_ctx};
+
+    /// A scheduler that reports a static TLS block, as the real runtime does for
+    /// any module with a `PT_TLS`. `test_ctx`'s double deliberately does not, so
+    /// it exercises the dynamic path instead.
+    struct StaticTlsThreads(u64);
+
+    impl GuestThreadScheduler for StaticTlsThreads {
+        fn create(&self, _thread_out: u64, _attr: u64, _entry: u64, _arg: u64) -> u64 {
+            0x8002_000B
+        }
+        fn join(&self, _thread: u64, _retval_out: u64) -> u64 {
+            0x8002_0003
+        }
+        fn detach(&self, _thread: u64) -> u64 {
+            0x8002_0003
+        }
+        fn request_exit(&self, _retval: u64) -> bool {
+            false
+        }
+        fn current_thread(&self) -> u64 {
+            1
+        }
+        fn request_process_exit(&self, _code: u64) {}
+        fn process_is_terminating(&self) -> bool {
+            false
+        }
+        fn current_static_tls_block(&self) -> Option<u64> {
+            Some(self.0)
+        }
+    }
+
+    /// Write a `tls_index { module_id, offset }` descriptor at `at`.
+    fn write_tls_index(mem: &crate::TestMemory, at: u64, module_id: u64, offset: u64) {
+        assert!(mem.write(at, &module_id.to_le_bytes()));
+        assert!(mem.write(at + 8, &offset.to_le_bytes()));
+    }
+
+    /// The ELF TLS ABI requires that a thread-local reached through the
+    /// general-dynamic model (`__tls_get_addr`) resolve to the *same address* as
+    /// the same variable reached through initial-exec — which the runtime
+    /// resolves against the static block the module's `PT_TLS` was copied into.
+    ///
+    /// This used to hand back a freshly allocated, zero-initialized block
+    /// instead, giving one variable two homes: a write through one model was
+    /// invisible through the other, and only the static copy ever held the
+    /// `.tdata` initializer. A PIC-built executable reaches its own
+    /// thread-locals through *both*, so this is not a hypothetical.
+    #[test]
+    fn tls_get_addr_resolves_the_main_module_against_the_static_block() {
+        const STATIC_BLOCK: u64 = 0x4000;
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x8000);
+        let threads = StaticTlsThreads(STATIC_BLOCK);
+        let mut ctx = test_ctx(&kernel, &mem, &alloc);
+        ctx.guest_threads = &threads;
+
+        write_tls_index(&mem, 0x100, MAIN_TLS_MODULE_ID, 0x18);
+        assert_eq!(
+            hle_tls_get_addr(&ctx, &[0x100]),
+            STATIC_BLOCK + 0x18,
+            "the main module's TLS must alias the static block, not a copy"
+        );
+
+        // Offset 0 is the case that mattered on Minecraft: its whole `.tdata` is
+        // a single 8-byte value there.
+        write_tls_index(&mem, 0x200, MAIN_TLS_MODULE_ID, 0);
+        assert_eq!(hle_tls_get_addr(&ctx, &[0x200]), STATIC_BLOCK);
+    }
+
+    /// Only the main module has a static block. Anything else must still get
+    /// bounded dynamic storage, and must not be handed the main module's.
+    #[test]
+    fn tls_get_addr_still_gives_other_modules_their_own_dynamic_block() {
+        const STATIC_BLOCK: u64 = 0x4000;
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x8000);
+        let threads = StaticTlsThreads(STATIC_BLOCK);
+        let mut ctx = test_ctx(&kernel, &mem, &alloc);
+        ctx.guest_threads = &threads;
+
+        write_tls_index(&mem, 0x100, MAIN_TLS_MODULE_ID + 1, 0);
+        let other = hle_tls_get_addr(&ctx, &[0x100]);
+        assert_ne!(
+            other, STATIC_BLOCK,
+            "a dependency must not land in the executable's TLS block"
+        );
+
+        // And it is stable: the same module resolves to the same storage twice,
+        // or a thread-local would lose its value between reads.
+        write_tls_index(&mem, 0x200, MAIN_TLS_MODULE_ID + 1, 0);
+        assert_eq!(hle_tls_get_addr(&ctx, &[0x200]), other);
+    }
 
     #[test]
     fn unwind_module_info_writes_the_complete_orbis_structure() {

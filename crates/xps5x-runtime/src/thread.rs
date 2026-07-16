@@ -173,6 +173,11 @@ impl GuestThreadScheduler for GuestProcessHandle {
         };
         let tls_block_size = self.module.tls.as_ref().map_or(0, |tls| tls.block_size());
         let tcb_base = tcb - tls_block_size;
+        // Only a module with a `PT_TLS` has a static block; without one,
+        // `tcb_base == tcb` and there is no thread-local storage to alias, so
+        // `__tls_get_addr` must fall back to its dynamic path rather than be
+        // handed the TCB itself.
+        let static_tls_block = self.module.tls.as_ref().map(|_| tcb_base);
         let handle = self.next_thread.fetch_add(1, Ordering::Relaxed);
         let process = self.clone();
         let host = std::thread::Builder::new()
@@ -193,6 +198,7 @@ impl GuestThreadScheduler for GuestProcessHandle {
                         &*process.arena,
                         &process.guard,
                         Some(tcb),
+                        static_tls_block,
                         Some(&process),
                         handle,
                         || crate::stack::enter_guest(entry, stack_rsp, [arg, 0, 0, 0, 0, 0]),

@@ -303,6 +303,21 @@ fn main() -> anyhow::Result<()> {
             linked.hle_trampolines.len(),
             linked.unresolved.len()
         );
+        // The module's thread-local template. `tdata` is the part that must be
+        // *copied* into every thread's block; the rest is `.tbss` and is zero.
+        // A title whose thread-locals silently read as zero is the shape of a
+        // whole class of null-dereference bugs, so say what the template is.
+        match &linked.tls {
+            Some(tls) => info!(
+                "  PT_TLS: vaddr={:#x} tdata={:#x} memsz={:#x} align={:#x} init={:02x?}",
+                tls.vaddr,
+                tls.data.len(),
+                tls.mem_size,
+                tls.align,
+                &tls.data[..tls.data.len().min(32)]
+            ),
+            None => info!("  PT_TLS: none"),
+        }
         info!("entering guest _start via execute_process ...");
         let outcome = xps5x_runtime::execute_process_shared(
             std::sync::Arc::clone(&linked),

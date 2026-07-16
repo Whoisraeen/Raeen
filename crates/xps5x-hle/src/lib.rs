@@ -212,6 +212,23 @@ pub trait GuestThreadScheduler {
     fn request_process_exit(&self, code: u64);
     /// Whether another guest thread has requested process termination.
     fn process_is_terminating(&self) -> bool;
+    /// The base of *this* thread's static TLS block: the storage the main
+    /// module's `PT_TLS` template was copied into, which the linker's `TPOFF64`
+    /// offsets resolve against (variant II — the block sits immediately below
+    /// the TCB).
+    ///
+    /// `__tls_get_addr` needs it because the ELF TLS ABI requires that a
+    /// thread-local reached through the general-dynamic model resolve to the
+    /// *same address* as the same variable reached through initial-exec.
+    /// Handing back separate storage gives one variable two homes, and only one
+    /// of them holds its initialized value.
+    ///
+    /// `None` when the thread has no static block — a module with no `PT_TLS`,
+    /// a CPU without FSGSBASE, or a test double. Callers must then fall back to
+    /// dynamic storage rather than assume an address.
+    fn current_static_tls_block(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Everything an HLE function may touch: the emulated kernel (memory,

@@ -261,6 +261,15 @@ struct ActiveContext {
     alloc: *const dyn GuestAllocator,
     thread_scheduler: *const dyn GuestThreadScheduler,
     current_thread: u64,
+    /// This thread's static TLS block base (`tcb - tls_block_size`), when it
+    /// has one. Served to HLE via
+    /// [`GuestThreadScheduler::current_static_tls_block`] so `__tls_get_addr`
+    /// can resolve the main module's thread-locals to the same storage
+    /// `TPOFF64` accesses use, rather than to a second, zeroed block.
+    ///
+    /// Per-call rather than per-scheduler, exactly like `current_thread`: one
+    /// `ActiveContext` guards one thread's guest execution.
+    static_tls_block: Option<u64>,
     thread_exit: Cell<Option<u64>>,
     region_base: u64,
     region_len: u64,
@@ -416,6 +425,10 @@ impl GuestThreadScheduler for ActiveContext {
         self.current_thread
     }
 
+    fn current_static_tls_block(&self) -> Option<u64> {
+        self.static_tls_block
+    }
+
     fn request_process_exit(&self, code: u64) {
         // SAFETY: same lifetime invariant as `create`.
         unsafe { &*self.thread_scheduler }.request_process_exit(code);
@@ -557,6 +570,10 @@ pub(crate) unsafe fn run(
     alloc: &dyn GuestAllocator,
     guard: &TrampolineGuard,
     tcb: Option<u64>,
+    // This thread's static TLS block base — `tcb - tls_block_size`, which only
+    // the caller can compute since only it knows the module's `PT_TLS` size.
+    // `None` when the module has no `PT_TLS`.
+    static_tls_block: Option<u64>,
     guest_threads: Option<&dyn GuestThreadScheduler>,
     current_thread: u64,
     call_guest: impl FnOnce() -> core::convert::Infallible,
@@ -630,6 +647,7 @@ pub(crate) unsafe fn run(
         alloc: alloc_erased as *const dyn GuestAllocator,
         thread_scheduler: thread_scheduler_erased as *const dyn GuestThreadScheduler,
         current_thread,
+        static_tls_block,
         thread_exit: Cell::new(None),
         region_base: guard.base(),
         region_len: guard.len(),
