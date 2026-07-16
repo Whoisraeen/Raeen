@@ -42,6 +42,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "parsed {} instructions, consumed {consumed} dwords",
                 code.get_instructions().len()
             );
+            for (index, instruction) in code.get_instructions().iter().enumerate() {
+                println!("{index:04}: {instruction:?}");
+            }
             Ok(())
         }
         Err(error) => {

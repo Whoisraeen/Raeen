@@ -22,27 +22,39 @@
 //!   must not hide every other draw.
 
 use crate::shader_fetch::{ShaderTranslateCache, TranslatedShader};
+use crate::vulkan::compute::{ComputeState, dispatch_compute};
 use crate::vulkan::instance::VulkanDevice;
-use crate::vulkan::offscreen::{CLEAR_COLOR, DrawState, RenderedImage, render_draw};
+use crate::vulkan::offscreen::{
+    CLEAR_COLOR, DrawState, RenderedImage, ShaderStageBinding, StorageBufferBinding,
+    VertexAttributeData, VertexBufferData, render_draw,
+};
 use ash::vk;
 use kyty_graphics::hw_regs::{Context, Shader, UserConfig};
 use kyty_graphics::run::{DrawError, DrawSink};
-use kyty_graphics::shader::resources::ShaderVertexInputInfo;
+use kyty_graphics::shader::resources::{
+    ShaderBindResources, ShaderPixelInputInfo, ShaderVertexInputInfo,
+};
 use kyty_graphics::shader::{spirv_get_embedded_ps, spirv_get_embedded_vs};
 use kyty_graphics::spirv_asm;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
 
 /// `VGT_PRIMITIVE_TYPE` values Kyty's Gen5 path emits.
 mod prim {
     pub const TRIANGLE_LIST: u32 = 4;
-    pub const TRIANGLE_STRIP: u32 = 5;
+    pub const TRIANGLE_FAN: u32 = 5;
+    pub const TRIANGLE_STRIP: u32 = 6;
     /// Kyty's clear/blit primitive. Rasterized as a 4-vertex strip quad.
     pub const RECT_LIST: u32 = 17;
 }
 
 fn err(msg: impl Into<String>) -> DrawError {
     DrawError(msg.into())
+}
+
+fn color_output_disabled(ctx: &Context) -> bool {
+    ctx.render_target_mask == 0
 }
 
 /// Map `CB_COLOR0_INFO`'s format/channel_type/channel_order triple to Vulkan.
@@ -82,6 +94,8 @@ fn assemble_embedded(id: u32, stage: &str) -> Result<Vec<u32>, DrawError> {
 struct ResolvedShaders {
     vs: Arc<Vec<u32>>,
     ps: Arc<Vec<u32>>,
+    vs_info: ShaderVertexInputInfo,
+    ps_info: ShaderPixelInputInfo,
 }
 
 /// Resolve the bound VS/PS to SPIR-V through the embedded table or the
@@ -111,16 +125,244 @@ fn resolve_shaders(
         (t.spirv, t.vs_info)
     };
 
-    let ps = if sh.ps.ps_embedded {
-        Arc::new(assemble_embedded(sh.ps.ps_embedded_id, "ps")?)
+    let (ps, ps_info) = if sh.ps.ps_embedded {
+        (
+            Arc::new(assemble_embedded(sh.ps.ps_embedded_id, "ps")?),
+            ShaderPixelInputInfo::default(),
+        )
     } else {
-        cache
+        let translated = cache
             .translate_ps(&sh.ps, &ctx.sh_regs, &vs_info)
-            .map_err(|e| err(e.to_string()))?
-            .spirv
+            .map_err(|e| err(e.to_string()))?;
+        (translated.spirv, translated.ps_info)
     };
 
-    Ok(ResolvedShaders { vs, ps })
+    debug!(
+        vs_resources = vs_info.resources_num,
+        vs_buffers = vs_info.buffers_num,
+        vs_push_bytes = vs_info.bind.push_constant_size,
+        vs_storage_buffers = vs_info.bind.storage_buffers.buffers_num,
+        ps_push_bytes = ps_info.bind.push_constant_size,
+        ps_storage_buffers = ps_info.bind.storage_buffers.buffers_num,
+        ps_textures = ps_info.bind.textures2d.textures_num,
+        ps_samplers = ps_info.bind.samplers.samplers_num,
+        "resolved guest shader resource ABI"
+    );
+
+    Ok(ResolvedShaders {
+        vs,
+        ps,
+        vs_info,
+        ps_info,
+    })
+}
+
+fn read_guest_bytes(addr: u64, size: u64, kind: &str) -> Result<Vec<u8>, DrawError> {
+    if size == 0 || !size.is_multiple_of(4) {
+        return Err(err(format!(
+            "{kind} at {addr:#x} has invalid byte size {size}"
+        )));
+    }
+    let count = u32::try_from(size / 4)
+        .map_err(|_| err(format!("{kind} at {addr:#x} is too large: {size} bytes")))?;
+    let words = crate::guest_mem::read_dwords_checked(addr, count).ok_or_else(|| {
+        err(format!(
+            "{kind} guest range {addr:#x}..{:#x} is not fully readable",
+            addr.saturating_add(size)
+        ))
+    })?;
+    let bytes: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    if let Ok(dir) = std::env::var("XPS5X_DUMP_GPU_RESOURCES")
+        && !dir.is_empty()
+    {
+        let safe_kind = kind.replace(' ', "_");
+        let path = std::path::Path::new(&dir).join(format!("{safe_kind}_{addr:012x}_{size}.bin"));
+        if !path.exists()
+            && let Err(error) =
+                std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &bytes))
+        {
+            debug!(%error, path = %path.display(), "guest GPU resource dump failed");
+        }
+    }
+    Ok(bytes)
+}
+
+fn gen5_vertex_format(format: u8) -> Result<vk::Format, DrawError> {
+    match format {
+        74 => Ok(vk::Format::R32G32B32_SFLOAT),
+        64 => Ok(vk::Format::R32G32_SFLOAT),
+        other => Err(err(format!(
+            "unsupported Gen5 vertex-buffer format {other}"
+        ))),
+    }
+}
+
+fn prepare_vertex_inputs(
+    info: &ShaderVertexInputInfo,
+) -> Result<(Vec<VertexBufferData>, Vec<VertexAttributeData>), DrawError> {
+    let buffers_num = usize::try_from(info.buffers_num)
+        .map_err(|_| err(format!("negative vertex buffer count {}", info.buffers_num)))?;
+    let resources_num = usize::try_from(info.resources_num).map_err(|_| {
+        err(format!(
+            "negative vertex resource count {}",
+            info.resources_num
+        ))
+    })?;
+    if buffers_num > info.buffers.len() || resources_num > info.resources.len() {
+        return Err(err("vertex input metadata exceeds fixed resource arrays"));
+    }
+
+    let mut buffers = Vec::with_capacity(buffers_num);
+    let mut attributes = Vec::with_capacity(resources_num);
+    for (binding, guest) in info.buffers[..buffers_num].iter().enumerate() {
+        let size = u64::from(guest.stride)
+            .checked_mul(u64::from(guest.num_records))
+            .ok_or_else(|| err("vertex buffer size overflow"))?;
+        buffers.push(VertexBufferData {
+            bytes: read_guest_bytes(guest.addr, size, "vertex buffer")?,
+            stride: guest.stride,
+        });
+
+        let attr_num = usize::try_from(guest.attr_num).map_err(|_| {
+            err(format!(
+                "negative vertex attribute count {}",
+                guest.attr_num
+            ))
+        })?;
+        if attr_num > guest.attr_indices.len() {
+            return Err(err("vertex attribute count exceeds fixed array"));
+        }
+        for ai in 0..attr_num {
+            let location = usize::try_from(guest.attr_indices[ai]).map_err(|_| {
+                err(format!(
+                    "negative vertex attribute index {}",
+                    guest.attr_indices[ai]
+                ))
+            })?;
+            if location >= resources_num {
+                return Err(err(format!(
+                    "vertex attribute {location} exceeds resource count {resources_num}"
+                )));
+            }
+            attributes.push(VertexAttributeData {
+                location: location as u32,
+                binding: binding as u32,
+                format: gen5_vertex_format(info.resources[location].format())?,
+                offset: guest.attr_offsets[ai],
+            });
+        }
+    }
+    if attributes.len() != resources_num {
+        return Err(err(format!(
+            "vertex metadata describes {} resources but {} bound attributes",
+            resources_num,
+            attributes.len()
+        )));
+    }
+    Ok((buffers, attributes))
+}
+
+fn prepare_stage_binding(
+    bind: &ShaderBindResources,
+    stage: vk::ShaderStageFlags,
+) -> Result<ShaderStageBinding, DrawError> {
+    if bind.textures2d.textures_num != 0 {
+        return Err(err(format!(
+            "translated {stage:?} shader needs {} texture descriptors",
+            bind.textures2d.textures_num
+        )));
+    }
+    if bind.samplers.samplers_num != 0 {
+        return Err(err(format!(
+            "translated {stage:?} shader needs {} sampler descriptors",
+            bind.samplers.samplers_num
+        )));
+    }
+    if bind.gds_pointers.pointers_num != 0 || bind.extended.used {
+        return Err(err(format!(
+            "translated {stage:?} shader needs unsupported GDS/EUD resources"
+        )));
+    }
+
+    let storage_num = usize::try_from(bind.storage_buffers.buffers_num).map_err(|_| {
+        err(format!(
+            "negative storage-buffer count {}",
+            bind.storage_buffers.buffers_num
+        ))
+    })?;
+    if storage_num > bind.storage_buffers.buffers.len() {
+        return Err(err("storage-buffer count exceeds fixed array"));
+    }
+
+    let mut push_constants = Vec::with_capacity(bind.push_constant_size as usize);
+    let mut storage_bytes = Vec::with_capacity(storage_num);
+    for (index, resource) in bind.storage_buffers.buffers[..storage_num]
+        .iter()
+        .enumerate()
+    {
+        if resource.add_tid() || resource.swizzle_enabled() || resource.out_of_bounds() != 0 {
+            return Err(err(format!(
+                "storage buffer {index} uses unsupported add-tid/swizzle/out-of-bounds mode"
+            )));
+        }
+        let size = u64::from(resource.stride())
+            .checked_mul(u64::from(resource.num_records()))
+            .ok_or_else(|| err("storage buffer size overflow"))?;
+        let bytes = read_guest_bytes(resource.base48(), size, "storage buffer")?;
+        debug!(
+            stage = ?stage,
+            index,
+            addr = format_args!("{:#x}", resource.base48()),
+            len = bytes.len(),
+            head = format_args!("{:02x?}", &bytes[..bytes.len().min(16)]),
+            "stage storage buffer read"
+        );
+        storage_bytes.push(bytes);
+
+        // Kyty rewrites the descriptor's guest base to the Vulkan descriptor
+        // array index before exposing the four dwords as push constants.
+        let mut rewritten = *resource;
+        rewritten.update_address48(index as u64);
+        for field in rewritten.fields {
+            push_constants.extend_from_slice(&field.to_le_bytes());
+        }
+    }
+
+    let direct_num = usize::try_from(bind.direct_sgprs.sgprs_num).map_err(|_| {
+        err(format!(
+            "negative direct-SGPR count {}",
+            bind.direct_sgprs.sgprs_num
+        ))
+    })?;
+    if direct_num > bind.direct_sgprs.sgprs.len() {
+        return Err(err("direct-SGPR count exceeds fixed array"));
+    }
+    for sgpr in &bind.direct_sgprs.sgprs[..direct_num] {
+        push_constants.extend_from_slice(&sgpr.field.to_le_bytes());
+    }
+    if direct_num != 0 {
+        let padded = push_constants.len().next_multiple_of(16);
+        push_constants.resize(padded, 0);
+    }
+
+    if push_constants.len() != bind.push_constant_size as usize {
+        return Err(err(format!(
+            "translated {stage:?} push-constant ABI says {} bytes but preparation produced {}",
+            bind.push_constant_size,
+            push_constants.len()
+        )));
+    }
+
+    Ok(ShaderStageBinding {
+        stage,
+        descriptor_set_slot: bind.descriptor_set_slot,
+        push_constant_offset: bind.push_constant_offset,
+        push_constants,
+        storage_buffers: (storage_num != 0).then_some(StorageBufferBinding {
+            binding: bind.storage_buffers.binding_index as u32,
+            buffers: storage_bytes,
+        }),
+    })
 }
 
 /// Build a [`DrawState`] from decoded register state.
@@ -217,11 +459,12 @@ pub fn draw_state_from_regs<'a>(
     let (topology, vertex_count) = match ucfg.prim_type {
         prim::RECT_LIST => (vk::PrimitiveTopology::TRIANGLE_STRIP, 4),
         prim::TRIANGLE_LIST => (vk::PrimitiveTopology::TRIANGLE_LIST, index_count),
+        prim::TRIANGLE_FAN => (vk::PrimitiveTopology::TRIANGLE_FAN, index_count),
         prim::TRIANGLE_STRIP => (vk::PrimitiveTopology::TRIANGLE_STRIP, index_count),
         other => {
             return Err(err(format!(
                 "unsupported VGT_PRIMITIVE_TYPE {other} (supported: 4 TriList, \
-                 5 TriStrip, 17 RectList)"
+                 5 TriFan, 6 TriStrip, 17 RectList)"
             )));
         }
     };
@@ -245,9 +488,13 @@ pub fn draw_state_from_regs<'a>(
         cull_mode,
         // The embedded VS declares no input attributes and builds its own quad.
         vertices: None,
+        vertex_buffers: Vec::new(),
+        vertex_attributes: Vec::new(),
+        stage_bindings: Vec::new(),
         vertex_count,
         vs_spirv,
         fs_spirv,
+        initial: None,
     })
 }
 
@@ -265,12 +512,19 @@ pub fn draw_state_from_regs<'a>(
 pub struct OffscreenDrawSink<'a> {
     dev: &'a VulkanDevice,
     cache: &'a mut ShaderTranslateCache,
+    /// Persistent per-render-target contents, keyed by `CB_COLOR0_BASE`.
+    /// Each draw seeds its attachment with the target's prior pixels and
+    /// stores the result back, so draws compose into a frame instead of each
+    /// one starting from a cleared target.
+    framebuffers: &'a mut HashMap<u64, RenderedImage>,
     pub last: Option<RenderedImage>,
     pub draws: u64,
     /// Draws skipped because a bound guest shader failed translation. The
     /// named reason was warned once by the cache; each skip here is quiet
     /// (debug) so 1600 re-binds of one bad shader stay one loud line.
     pub shader_skips: u64,
+    /// Compute dispatches completed and written back to guest storage.
+    pub dispatches: u64,
     /// Most recent named skip reason, surfaced by the session with a
     /// process-wide rate limit. Null binds are not cacheable, so the cache
     /// itself cannot provide that telemetry.
@@ -279,13 +533,19 @@ pub struct OffscreenDrawSink<'a> {
 
 impl<'a> OffscreenDrawSink<'a> {
     #[must_use]
-    pub fn new(dev: &'a VulkanDevice, cache: &'a mut ShaderTranslateCache) -> Self {
+    pub fn new(
+        dev: &'a VulkanDevice,
+        cache: &'a mut ShaderTranslateCache,
+        framebuffers: &'a mut HashMap<u64, RenderedImage>,
+    ) -> Self {
         Self {
             dev,
             cache,
+            framebuffers,
             last: None,
             draws: 0,
             shader_skips: 0,
+            dispatches: 0,
             last_shader_skip_reason: None,
         }
     }
@@ -300,6 +560,13 @@ impl DrawSink for OffscreenDrawSink<'_> {
         index_count: u32,
         _flags: u32,
     ) -> Result<(), DrawError> {
+        // A zero colour mask is a legitimate depth-only/no-colour draw, not a
+        // malformed DCB. Until the depth backend is wired, consume it without
+        // aborting later colour draws in the same submission.
+        if color_output_disabled(ctx) {
+            debug!("draw consumed without colour output (depth path pending)");
+            return Ok(());
+        }
         let shaders = if sh.vs.vs_embedded && sh.ps.ps_embedded {
             // The embedded pair is the Phase 1 / M2 invariant: a failure here
             // is a broken fixture and must abort loudly.
@@ -317,12 +584,131 @@ impl DrawSink for OffscreenDrawSink<'_> {
             }
         };
 
-        let state = draw_state_from_regs(ctx, ucfg, index_count, &shaders.vs, &shaders.ps)?;
-        let image = render_draw(self.dev, &state)
-            .map_err(|e| err(format!("offscreen draw failed: {e}")))?;
+        let mut state = draw_state_from_regs(ctx, ucfg, index_count, &shaders.vs, &shaders.ps)?;
+        let (vertex_buffers, vertex_attributes) = prepare_vertex_inputs(&shaders.vs_info)?;
+        state.vertex_buffers = vertex_buffers;
+        state.vertex_attributes = vertex_attributes;
+        for (bind, stage) in [
+            (&shaders.vs_info.bind, vk::ShaderStageFlags::VERTEX),
+            (&shaders.ps_info.bind, vk::ShaderStageFlags::FRAGMENT),
+        ] {
+            if bind.push_constant_size != 0
+                || bind.storage_buffers.buffers_num != 0
+                || bind.textures2d.textures_num != 0
+                || bind.samplers.samplers_num != 0
+                || bind.gds_pointers.pointers_num != 0
+                || bind.direct_sgprs.sgprs_num != 0
+                || bind.extended.used
+            {
+                state
+                    .stage_bindings
+                    .push(prepare_stage_binding(bind, stage)?);
+            }
+        }
 
+        // Compose into the guest render target: seed with its prior pixels
+        // (taken from the framebuffer map) so this draw adds to the frame
+        // instead of starting over on a cleared attachment.
+        let rt_base = ctx.render_targets[0].base.addr;
+        let prior = self
+            .framebuffers
+            .remove(&rt_base)
+            .filter(|p| p.width == state.width && p.height == state.height);
+        let image = {
+            if let Some(p) = &prior {
+                state.initial = Some(&p.pixels);
+            }
+            render_draw(self.dev, &state)
+                .map_err(|e| err(format!("offscreen draw failed: {e}")))?
+        };
+
+        self.framebuffers.insert(rt_base, image.clone());
         self.last = Some(image);
         self.draws += 1;
+        Ok(())
+    }
+
+    fn dispatch_direct(
+        &mut self,
+        ctx: &Context,
+        _ucfg: &UserConfig,
+        sh: &Shader,
+        groups: [u32; 3],
+        mode: u32,
+    ) -> Result<(), DrawError> {
+        // The legacy Kyty AGC wrapper emits 0. Retail RDNA2 command streams
+        // also carry COMPUTE_SHADER_EN (bit 0) and CS_W32_EN (bit 6), yielding
+        // the measured 0x41. Both flags describe execution already represented
+        // by the translated Vulkan compute stage; other initiator bits need
+        // explicit semantics before they can be accepted.
+        if mode & !0x41 != 0 {
+            return Err(err(format!(
+                "unsupported compute dispatch initiator {mode:#x}"
+            )));
+        }
+        let translated = match self.cache.translate_cs(&sh.cs, &ctx.sh_regs) {
+            Ok(shader) => shader,
+            Err(error) => {
+                self.shader_skips += 1;
+                self.last_shader_skip_reason = Some(error.to_string());
+                debug!(reason = %error, "compute dispatch skipped: bound shader is untranslatable");
+                return Ok(());
+            }
+        };
+        let bind = &translated.cs_info.bind;
+        let has_binding = bind.push_constant_size != 0
+            || bind.storage_buffers.buffers_num != 0
+            || bind.textures2d.textures_num != 0
+            || bind.samplers.samplers_num != 0
+            || bind.gds_pointers.pointers_num != 0
+            || bind.direct_sgprs.sgprs_num != 0
+            || bind.extended.used;
+        let prepared = has_binding
+            .then(|| prepare_stage_binding(bind, vk::ShaderStageFlags::COMPUTE))
+            .transpose()?;
+        let storage_num = usize::try_from(bind.storage_buffers.buffers_num)
+            .map_err(|_| err("negative compute storage-buffer count"))?;
+        if storage_num > bind.storage_buffers.buffers.len() {
+            return Err(err("compute storage-buffer count exceeds fixed array"));
+        }
+        let guest_outputs: Vec<_> = bind.storage_buffers.buffers[..storage_num]
+            .iter()
+            .map(|resource| resource.base48())
+            .collect();
+        let outputs = dispatch_compute(
+            self.dev,
+            &ComputeState {
+                groups,
+                spirv: &translated.spirv,
+                binding: prepared.as_ref(),
+            },
+        )
+        .map_err(|error| err(format!("Vulkan compute dispatch failed: {error}")))?;
+        if outputs.len() != guest_outputs.len() {
+            return Err(err(format!(
+                "compute writeback returned {} buffers for {} guest outputs",
+                outputs.len(),
+                guest_outputs.len()
+            )));
+        }
+        for (addr, bytes) in guest_outputs.into_iter().zip(outputs) {
+            debug!(
+                addr = format_args!("{addr:#x}"),
+                len = bytes.len(),
+                head = format_args!(
+                    "{:02x?}",
+                    &bytes[..bytes.len().min(16)]
+                ),
+                "compute storage writeback"
+            );
+            if !crate::guest_mem::write_bytes_checked(addr, &bytes) {
+                return Err(err(format!(
+                    "compute storage writeback range {addr:#x}..{:#x} is not writable guest memory",
+                    addr.saturating_add(bytes.len() as u64)
+                )));
+            }
+        }
+        self.dispatches += 1;
         Ok(())
     }
 }
@@ -410,6 +796,17 @@ mod tests {
         assert!(e.0.contains("CB_TARGET_MASK"), "got {e}");
     }
 
+    #[test]
+    fn zero_target_mask_is_a_colorless_draw_policy_not_a_broken_dcb() {
+        let mut ctx = ctx_96x48();
+        ctx.render_target_mask = 0;
+        assert!(color_output_disabled(&ctx));
+        assert!(
+            draw_state_from_regs(&ctx, &ucfg_rect(), 3, SPIRV, SPIRV).is_err(),
+            "the colour renderer must still reject it if called directly"
+        );
+    }
+
     /// A zero viewport rasterizes nothing and reports no error anywhere in
     /// Vulkan — the likeliest way a structurally-correct CP yields a blank
     /// image. It must be a fault, not an empty frame.
@@ -472,6 +869,23 @@ mod tests {
         assert_eq!(state.vertex_count, 3);
     }
 
+    #[test]
+    fn gen5_triangle_fan_and_strip_match_kytys_vulkan_topologies() {
+        for (prim_type, expected) in [
+            (5, vk::PrimitiveTopology::TRIANGLE_FAN),
+            (6, vk::PrimitiveTopology::TRIANGLE_STRIP),
+        ] {
+            let ucfg = UserConfig {
+                prim_type,
+                ..UserConfig::default()
+            };
+            let state = draw_state_from_regs(&ctx_96x48(), &ucfg, 6, SPIRV, SPIRV)
+                .unwrap_or_else(|e| panic!("Gen5 primitive {prim_type}: {e}"));
+            assert_eq!(state.topology, expected, "Gen5 primitive {prim_type}");
+            assert_eq!(state.vertex_count, 6);
+        }
+    }
+
     /// A non-embedded bind with no readable code behind it must resolve to a
     /// **named** error (which `draw_index_auto` degrades to a skipped draw,
     /// never a crash and never a silently wrong image).
@@ -508,5 +922,73 @@ mod tests {
             vk::Format::B8G8R8A8_UNORM
         );
         assert!(vulkan_format(0xb, 0, 0).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn measured_gen5_vertex_and_storage_resources_become_vulkan_bindings() {
+        let vertex_words: Vec<u32> = vec![
+            0xbf19_999a,
+            0xbf19_999a,
+            0, // -0.6, -0.6, 0
+            0x3f19_999a,
+            0xbf19_999a,
+            0, //  0.6, -0.6, 0
+            0xbf19_999a,
+            0x3f19_999a,
+            0, // -0.6,  0.6, 0
+            0x3f19_999a,
+            0x3f19_999a,
+            0, //  0.6,  0.6, 0
+        ];
+        let storage_words: Vec<u32> = (0..32).collect();
+
+        let mut vs = ShaderVertexInputInfo::default();
+        vs.resources_num = 1;
+        vs.buffers_num = 1;
+        vs.resources[0].fields[3] = 74 << 12; // Gen5 float3
+        vs.buffers[0].addr = vertex_words.as_ptr() as u64;
+        vs.buffers[0].stride = 12;
+        vs.buffers[0].num_records = 4;
+        vs.buffers[0].attr_num = 1;
+        vs.buffers[0].attr_indices[0] = 0;
+
+        let (buffers, attributes) = prepare_vertex_inputs(&vs).expect("measured vertex ABI");
+        assert_eq!(buffers.len(), 1);
+        assert_eq!(buffers[0].bytes.len(), 48);
+        assert_eq!(buffers[0].stride, 12);
+        assert_eq!(attributes.len(), 1);
+        assert_eq!(attributes[0].format, vk::Format::R32G32B32_SFLOAT);
+
+        let mut ps = ShaderPixelInputInfo::default();
+        ps.bind.push_constant_size = 16;
+        ps.bind.storage_buffers.buffers_num = 1;
+        ps.bind.storage_buffers.binding_index = 0;
+        let resource = &mut ps.bind.storage_buffers.buffers[0];
+        resource.update_address48(storage_words.as_ptr() as u64);
+        resource.fields[1] |= 16 << 16;
+        resource.fields[2] = 8;
+        resource.fields[3] = 77 << 12;
+
+        let binding = prepare_stage_binding(&ps.bind, vk::ShaderStageFlags::FRAGMENT)
+            .expect("measured storage ABI");
+        let storage = binding.storage_buffers.expect("descriptor set");
+        assert_eq!(storage.binding, 0);
+        assert_eq!(
+            storage.buffers,
+            vec![
+                storage_words
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect::<Vec<_>>()
+            ]
+        );
+        assert_eq!(binding.push_constants.len(), 16);
+        assert_eq!(&binding.push_constants[0..4], &[0, 0, 0, 0]);
+        assert_eq!(
+            u32::from_le_bytes(binding.push_constants[4..8].try_into().unwrap()) >> 16,
+            16,
+            "rewritten descriptor must preserve the guest stride"
+        );
     }
 }

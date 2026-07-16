@@ -42,4 +42,5 @@ pub use agc_exec::{AgcGpuSession, ScissorHalf, build_cp_draw_dcb};
 pub use backend::{BackendKind, GpuBackend, ShaderFormat, create_backend, default_backend_kind};
 pub use draw_translate::{OffscreenDrawSink, draw_state_from_regs};
 pub use guest_mem::IdentityGuestMemory;
+pub use kyty_graphics::shader::{ShaderMappedData, ShaderSemantic, ShaderSharp, ShaderUserData};
 pub use shader_fetch::{ShaderCacheStats, ShaderTranslateCache, TranslatedShader};

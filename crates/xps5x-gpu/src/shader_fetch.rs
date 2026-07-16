@@ -31,14 +31,22 @@
 //! `<stage>_<guestaddr>_<len>.bin` — succeeding **even when translation
 //! fails**; the dumps are how the GCN→RDNA2 gap gets studied.
 
-use kyty_graphics::hw_regs::{PixelShaderInfo, ShaderRegisters, VertexShaderInfo};
+use kyty_graphics::hw_regs::{
+    ComputeShaderInfo, PixelShaderInfo, ShaderRegisters, VertexShaderInfo,
+};
 use kyty_graphics::shader::analysis::{
     SHADER_BINARY_INFO_SENTINEL, ShaderAnalysisError, ShaderMap, ShaderMemory,
-    shader_get_input_info_ps, shader_get_input_info_vs, shader_parse_ps, shader_parse_vs,
+    shader_get_input_info_cs, shader_get_input_info_ps, shader_get_input_info_vs, shader_parse_cs,
+    shader_parse_ps, shader_parse_vs,
 };
 use kyty_graphics::shader::parse::ShaderParseError;
-use kyty_graphics::shader::recompile::{shader_recompile_ps, shader_recompile_vs};
-use kyty_graphics::shader::resources::{ShaderPixelInputInfo, ShaderVertexInputInfo};
+use kyty_graphics::shader::recompile::{
+    shader_recompile_cs, shader_recompile_ps, shader_recompile_vs,
+};
+use kyty_graphics::shader::resources::{
+    ShaderComputeInputInfo, ShaderMappedData, ShaderPixelInputInfo, ShaderVertexInputInfo,
+};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,6 +64,7 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 pub enum Stage {
     Vs,
     Ps,
+    Cs,
 }
 
 impl Stage {
@@ -63,6 +72,7 @@ impl Stage {
         match self {
             Stage::Vs => "vs",
             Stage::Ps => "ps",
+            Stage::Cs => "cs",
         }
     }
 }
@@ -77,12 +87,18 @@ struct CacheKey {
     head: [u32; 4],
 }
 
-/// A translated shader (VS entries also carry the vertex input info the PS
-/// translation downstream depends on).
+/// A translated shader plus the stage resource ABI recovered during analysis.
+///
+/// Both fields are retained because Vulkan pipeline creation and descriptor
+/// binding need the same metadata that shaped the generated SPIR-V. The
+/// irrelevant stage field remains `Default`, which keeps cache entries a
+/// single concrete type without erasing either ABI.
 #[derive(Clone, Debug)]
 pub struct TranslatedShader {
     pub spirv: Arc<Vec<u32>>,
     pub vs_info: ShaderVertexInputInfo,
+    pub ps_info: ShaderPixelInputInfo,
+    pub cs_info: ShaderComputeInputInfo,
 }
 
 /// Counters for the measurement report.
@@ -101,6 +117,7 @@ pub struct ShaderCacheStats {
 /// Fetch + translate + cache for guest shader code.
 pub struct ShaderTranslateCache {
     entries: HashMap<CacheKey, Result<TranslatedShader, Arc<str>>>,
+    shader_map: ShaderMap,
     dump_dir: Option<PathBuf>,
     stats: ShaderCacheStats,
 }
@@ -127,6 +144,7 @@ impl ShaderTranslateCache {
     pub fn with_dump_dir(dump_dir: Option<PathBuf>) -> Self {
         Self {
             entries: HashMap::new(),
+            shader_map: ShaderMap::new(),
             dump_dir,
             stats: ShaderCacheStats::default(),
         }
@@ -135,6 +153,15 @@ impl ShaderTranslateCache {
     #[must_use]
     pub fn stats(&self) -> ShaderCacheStats {
         self.stats
+    }
+
+    /// Register metadata relocated by `sceAgcCreateShader` for later
+    /// next-generation resource analysis.
+    pub fn map_shader_metadata(&mut self, addr: u64, data: ShaderMappedData) {
+        self.shader_map.map_user_data(addr, data);
+        // A shader may have been observed before its create call completed.
+        // Do not let that transient missing-metadata failure stay negative-cached.
+        self.entries.retain(|key, _| key.addr != addr);
     }
 
     /// Fetch + translate the bound vertex-stage shader.
@@ -159,6 +186,7 @@ impl ShaderTranslateCache {
         } else {
             vs.vs_regs.data_addr
         };
+        let shader_map = self.shader_map.clone();
         let vs = *vs;
         let sh_regs = *sh_regs;
         self.translate(Stage::Vs, addr, move |mem| {
@@ -166,20 +194,15 @@ impl ShaderTranslateCache {
                 let code = shader_parse_vs(&vs, &sh_regs, mem, next_gen)
                     .map_err(|e| AttemptError::from_analysis("shader_parse_vs", &e))?;
                 let mut vs_info = ShaderVertexInputInfo::default();
-                shader_get_input_info_vs(
-                    &vs,
-                    &sh_regs,
-                    mem,
-                    &ShaderMap::new(),
-                    next_gen,
-                    &mut vs_info,
-                )
-                .map_err(|e| AttemptError::from_analysis("shader_get_input_info_vs", &e))?;
+                shader_get_input_info_vs(&vs, &sh_regs, mem, &shader_map, next_gen, &mut vs_info)
+                    .map_err(|e| AttemptError::from_analysis("shader_get_input_info_vs", &e))?;
                 let spirv = shader_recompile_vs(&code, &vs_info)
                     .map_err(|e| AttemptError::named(format!("shader_recompile_vs: {e}")))?;
                 Ok(TranslatedShader {
                     spirv: Arc::new(spirv),
                     vs_info,
+                    ps_info: ShaderPixelInputInfo::default(),
+                    cs_info: ShaderComputeInputInfo::default(),
                 })
             })
         })
@@ -198,6 +221,7 @@ impl ShaderTranslateCache {
         vs_info: &ShaderVertexInputInfo,
     ) -> Result<TranslatedShader, Arc<str>> {
         let addr = ps.ps_regs.data_addr;
+        let shader_map = self.shader_map.clone();
         let ps = *ps;
         let sh_regs = *sh_regs;
         let vs_info = *vs_info;
@@ -211,7 +235,7 @@ impl ShaderTranslateCache {
                     &sh_regs,
                     &vs_info,
                     mem,
-                    &ShaderMap::new(),
+                    &shader_map,
                     next_gen,
                     &mut ps_info,
                 )
@@ -221,6 +245,44 @@ impl ShaderTranslateCache {
                 Ok(TranslatedShader {
                     spirv: Arc::new(spirv),
                     vs_info,
+                    ps_info,
+                    cs_info: ShaderComputeInputInfo::default(),
+                })
+            })
+        })
+    }
+
+    /// Fetch + translate the bound compute shader.
+    pub fn translate_cs(
+        &mut self,
+        cs: &ComputeShaderInfo,
+        sh_regs: &ShaderRegisters,
+    ) -> Result<TranslatedShader, Arc<str>> {
+        let addr = cs.cs_regs.data_addr;
+        let shader_map = self.shader_map.clone();
+        let cs = *cs;
+        let sh_regs = *sh_regs;
+        self.translate(Stage::Cs, addr, move |mem| {
+            attempt_generations(|next_gen| {
+                let code = shader_parse_cs(&cs, &sh_regs, mem, next_gen)
+                    .map_err(|e| AttemptError::from_analysis("shader_parse_cs", &e))?;
+                let mut cs_info = ShaderComputeInputInfo::default();
+                shader_get_input_info_cs(
+                    &cs,
+                    &sh_regs,
+                    mem,
+                    &shader_map,
+                    next_gen,
+                    &mut cs_info,
+                )
+                    .map_err(|e| AttemptError::from_analysis("shader_get_input_info_cs", &e))?;
+                let spirv = shader_recompile_cs(&code, &cs_info)
+                    .map_err(|e| AttemptError::named(format!("shader_recompile_cs: {e}")))?;
+                Ok(TranslatedShader {
+                    spirv: Arc::new(spirv),
+                    vs_info: ShaderVertexInputInfo::default(),
+                    ps_info: ShaderPixelInputInfo::default(),
+                    cs_info,
                 })
             })
         })
@@ -380,12 +442,14 @@ impl WindowMem {
 }
 
 impl ShaderMemory for WindowMem {
-    fn dwords_at(&self, addr: u64) -> Option<&[u32]> {
+    fn dwords_at(&self, addr: u64) -> Option<Cow<'_, [u32]>> {
         let end = self.base + self.data.len() as u64 * 4;
-        if addr < self.base || addr >= end || !(addr - self.base).is_multiple_of(4) {
-            return None;
+        if addr >= self.base && addr < end && (addr - self.base).is_multiple_of(4) {
+            return Some(Cow::Borrowed(
+                &self.data[((addr - self.base) / 4) as usize..],
+            ));
         }
-        Some(&self.data[((addr - self.base) / 4) as usize..])
+        crate::guest_mem::read_dwords_checked(addr, CHUNK_DWORDS as u32).map(Cow::Owned)
     }
 }
 
@@ -456,6 +520,20 @@ mod tests {
         S_ENDPGM,
     ];
 
+    #[test]
+    fn window_mem_reads_validated_out_of_band_guest_data() {
+        let external = vec![0xAABB_CCDD, 1, 2, 3];
+        let mem = WindowMem {
+            base: 0x1000,
+            data: vec![S_ENDPGM],
+        };
+        let got = mem
+            .dwords_at(external.as_ptr() as u64)
+            .expect("committed host allocation is identity-readable");
+        assert!(matches!(got, Cow::Owned(_)));
+        assert_eq!(&got[..4], external.as_slice());
+    }
+
     /// Solid-green GCN pixel shader (the `shader_bridge` fixture body).
     const PS_BODY: &[u32] = &[
         0x7E00_0280,
@@ -510,6 +588,19 @@ mod tests {
         }
     }
 
+    fn cs_regs_at(addr: u64) -> kyty_graphics::hw_regs::ComputeShaderInfo {
+        kyty_graphics::hw_regs::ComputeShaderInfo {
+            cs_regs: kyty_graphics::hw_regs::CsStageRegisters {
+                data_addr: addr,
+                num_thread_x: 8,
+                num_thread_y: 4,
+                num_thread_z: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     /// A synthetic in-memory VS round-trips through fetch → parse →
     /// recompile → SPIR-V, and a per-frame re-bind is a cache hit, not a
     /// re-translation.
@@ -550,6 +641,23 @@ mod tests {
             )
             .expect("fixture PS must translate");
         assert_eq!(t.spirv[0], 0x0723_0203, "SPIR-V magic");
+    }
+
+    #[test]
+    fn guest_cs_round_trips_to_spirv_and_retains_workgroup_abi() {
+        let blob = build_blob(
+            &[0xBF80_0000, 0xBF80_0000, S_ENDPGM],
+            0xAAAA_00C5,
+            0xBBBB_00C5,
+        );
+        let addr = blob.as_ptr() as u64;
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+
+        let t = cache
+            .translate_cs(&cs_regs_at(addr), &ShaderRegisters::default())
+            .expect("fixture CS must translate");
+        assert_eq!(t.spirv[0], 0x0723_0203, "SPIR-V magic");
+        assert_eq!(t.cs_info.threads_num, [8, 4, 1]);
     }
 
     /// Garbage bytes fail with a named reason, are negative-cached (one

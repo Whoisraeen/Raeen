@@ -207,6 +207,9 @@ pub const SPI_PS_IN_CONTROL: u32 = 0x1B6;
 pub const SPI_SHADER_COL_FORMAT: u32 = 0x1C5;
 pub const DB_SHADER_CONTROL: u32 = 0x203;
 pub const PA_SC_GENERIC_SCISSOR_TL: u32 = 0x90;
+pub const PA_SC_GENERIC_SCISSOR_BR: u32 = 0x91;
+pub const PA_SC_VPORT_SCISSOR_0_TL: u32 = 0x94;
+pub const PA_SC_VPORT_SCISSOR_0_BR: u32 = 0x95;
 pub const PA_SC_VPORT_ZMIN_0: u32 = 0xB4;
 pub const PA_CL_VPORT_XSCALE: u32 = 0x10F;
 pub const CB_BLEND0_CONTROL: u32 = 0x1E0;
@@ -255,6 +258,39 @@ pub const SPI_SHADER_PGM_RSRC2_GS: u32 = 0x8B;
 pub const SPI_SHADER_USER_DATA_GS_0: u32 = 0x8C;
 pub const SPI_SHADER_PGM_LO_ES: u32 = 0xC8;
 pub const SPI_SHADER_PGM_HI_ES: u32 = 0xC9;
+
+/// Gen5 compute register indices (Kyty Pm4.h L887-929).
+pub const COMPUTE_START_X: u32 = 0x204;
+pub const COMPUTE_START_Y: u32 = 0x205;
+pub const COMPUTE_START_Z: u32 = 0x206;
+pub const COMPUTE_NUM_THREAD_X: u32 = 0x207;
+pub const COMPUTE_NUM_THREAD_Y: u32 = 0x208;
+pub const COMPUTE_NUM_THREAD_Z: u32 = 0x209;
+pub const COMPUTE_PGM_LO: u32 = 0x20C;
+pub const COMPUTE_PGM_HI: u32 = 0x20D;
+pub const COMPUTE_PGM_RSRC1: u32 = 0x212;
+pub const COMPUTE_PGM_RSRC2: u32 = 0x213;
+pub const COMPUTE_PGM_RSRC3: u32 = 0x228;
+pub const COMPUTE_SHADER_CHKSUM: u32 = 0x22A;
+pub const COMPUTE_USER_DATA_0: u32 = 0x240;
+pub const COMPUTE_USER_DATA_15: u32 = 0x24F;
+
+pub mod compute_pgm_rsrc1 {
+    pub const VGPRS: (u32, u32) = (0, 0x3F);
+    pub const SGPRS: (u32, u32) = (6, 0xF);
+    pub const BULKY: (u32, u32) = (24, 0x1);
+}
+
+pub mod compute_pgm_rsrc2 {
+    pub const SCRATCH_EN: (u32, u32) = (0, 0x1);
+    pub const USER_SGPR: (u32, u32) = (1, 0x1F);
+    pub const TGID_X_EN: (u32, u32) = (7, 0x1);
+    pub const TGID_Y_EN: (u32, u32) = (8, 0x1);
+    pub const TGID_Z_EN: (u32, u32) = (9, 0x1);
+    pub const TG_SIZE_EN: (u32, u32) = (10, 0x1);
+    pub const TIDIG_COMP_CNT: (u32, u32) = (11, 0x3);
+    pub const LDS_SIZE: (u32, u32) = (15, 0x1FF);
+}
 
 // ---- User-config (UC) register indices ----------------------------------
 
@@ -321,6 +357,17 @@ pub mod pa_sc_screen_scissor {
     field!(BR_Y, 16, 0xFFFF);
 }
 
+/// `PA_SC_GENERIC_SCISSOR_*` and `PA_SC_VPORT_SCISSOR_*` fields
+/// (Pm4.h L268-294). Unlike the screen scissor, coordinates use 15 bits and
+/// TL bit 31 disables the window offset.
+pub mod pa_sc_offset_scissor {
+    field!(TL_X, 0, 0x7FFF);
+    field!(TL_Y, 16, 0x7FFF);
+    field!(WINDOW_OFFSET_DISABLE, 31, 0x1);
+    field!(BR_X, 0, 0x7FFF);
+    field!(BR_Y, 16, 0x7FFF);
+}
+
 /// Read a `(shift, mask)` field pair out of a register value.
 #[must_use]
 pub const fn field(value: u32, f: (u32, u32)) -> u32 {
@@ -341,6 +388,8 @@ mod tests {
         assert_eq!(header(40, IT_NOP, R_PS_EMBEDDED), 0xC026_1038);
         assert_eq!(header(7, IT_NOP, R_DRAW_INDEX_AUTO), 0xC005_1010);
         assert_eq!(header(4, IT_NOP, R_CX_REGS_INDIRECT), 0xC002_1048);
+        assert_eq!(header(25, IT_NOP, R_CS), 0xC017_101C);
+        assert_eq!(header(9, IT_NOP, R_DISPATCH_DIRECT), 0xC007_1020);
         // Kyty: cp_op_set_context_reg's own EXIT_NOT_IMPLEMENTED constant.
         assert_eq!(header(3, IT_SET_CONTEXT_REG, R_ZERO), 0xC001_6900);
     }

@@ -2050,8 +2050,7 @@ fn recompile_fetch(
 }
 
 /// Kyty: `Recompile_BufferStoreDword_Vdata1VaddrSvSoffsIdxen`
-/// (ShaderSpirv.cpp L1999).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
+/// (ShaderSpirv.cpp L1999). Wired for the Minecraft menu CS's output store.
 fn recompile_buffer_store_dword_vdata1(
     index: u32,
     code: &ShaderCode,
@@ -2999,7 +2998,6 @@ fn recompile_image_store_mip_dmask_f(
 
 /// Kyty: `Recompile_S_XXX_B64_Sdst2Ssrc02Ssrc12` (ShaderSpirv.cpp L3248).
 /// XXX: Andn2, Orn2, And, Nor, Nand, Xnor, Or, Xor, Cselect (via `param`).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_s_xxx_b64_sdst2_ssrc02_ssrc12(
     index: u32,
     code: &ShaderCode,
@@ -3298,7 +3296,6 @@ fn recompile_s_bfe_u64(
 
 /// Kyty: `Recompile_S_XXX_B32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp L3528).
 /// XXX: And, Bfm, Cselect, Lshl, Lshr, Or (via `param`).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_s_xxx_b32_svdst_svsrc01(
     index: u32,
     code: &ShaderCode,
@@ -3544,7 +3541,6 @@ fn recompile_s_and_saveexec_b64(
 
 /// Kyty: `Recompile_SCmp_XXX_I32_Ssrc0Ssrc1` (ShaderSpirv.cpp L3725).
 /// XXX: Eq, Ge, Gt, Lg, Lt, Le (comparison opcode via `param[0]`).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_scmp_xxx_i32(
     index: u32,
     code: &ShaderCode,
@@ -3586,7 +3582,6 @@ fn recompile_scmp_xxx_i32(
 
 /// Kyty: `Recompile_SCmp_XXX_U32_Ssrc0Ssrc1` (ShaderSpirv.cpp L3760).
 /// XXX: Eq, Ge, Gt, Le, Lt, Lg (comparison opcode via `param[0]`).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_scmp_xxx_u32(
     index: u32,
     code: &ShaderCode,
@@ -4201,7 +4196,6 @@ fn recompile_vcmp_xxx_u32(
 
 /// Kyty: `Recompile_VCmpx_XXX_I32_SmaskVsrc0Vsrc1` (ShaderSpirv.cpp L5040).
 /// XXX: Eq, Ne (comparison via `param[0]`; also writes EXEC).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_vcmpx_xxx_i32(
     index: u32,
     code: &ShaderCode,
@@ -4266,8 +4260,8 @@ fn recompile_vcmpx_xxx_i32(
 }
 
 /// Kyty: `Recompile_VCmpx_XXX_U32_SmaskVsrc0Vsrc1` (ShaderSpirv.cpp L5094).
-/// XXX: Gt, Ge (comparison via `param[0]`; also writes EXEC).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
+/// XXX: Gt, Ge, and the RDNA2-measured Lt (comparison via `param[0]`; also
+/// writes EXEC).
 fn recompile_vcmpx_xxx_u32(
     index: u32,
     code: &ShaderCode,
@@ -4399,7 +4393,6 @@ fn recompile_vcmpx_xxx_f32(
 
 /// Kyty: `Recompile_VCvtPkrtzF16F32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp
 /// L5260).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_vcvt_pkrtz_f16_f32(
     index: u32,
     code: &ShaderCode,
@@ -4630,8 +4623,8 @@ fn recompile_v_xxx_b32_svdst_svsrc0(
 
 /// Kyty: `Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp L5740).
 /// XXX: And, Or, Xor, Bcnt, Bfm, Lshr, Lshl, Lshlrev, Lshrrev, MulU32U24,
-/// MulLoU32, MulHiU32 (via `param`).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
+/// MulLoU32, MulHiU32 (via `param`) — plus the RDNA2-only carry-less
+/// add/sub family, which has no Kyty upstream rows.
 fn recompile_v_xxx_b32_svdst_svsrc01(
     index: u32,
     code: &ShaderCode,
@@ -4769,8 +4762,8 @@ fn recompile_v_xxx_i32_svdst_svsrc01(
 }
 
 /// Kyty: `Recompile_V_XXX_U32_VdstVsrc0Vsrc1Vsrc2` (ShaderSpirv.cpp L5940).
-/// XXX: Sad, Bfe, MadU32U24 (via `param`).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
+/// XXX: Sad, Bfe, MadU32U24 (via `param`) — plus the RDNA2-only LshlAdd,
+/// which has no Kyty upstream row.
 fn recompile_v_xxx_u32_vdst_vsrc012(
     index: u32,
     code: &ShaderCode,
@@ -5107,7 +5100,7 @@ use crate::shader::types::shader_instruction_format::Format as F;
 static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_buffer_load_dword_vdata1,    T::BufferLoadDword,   F::Vdata1VaddrSvSoffsIdxen, p1("")),
     f(recompile_buffer_load_format_x_vdata1, T::BufferLoadFormatX, F::Vdata1VaddrSvSoffsIdxen, p1("")),
-    ni("Recompile_BufferStoreDword_Vdata1VaddrSvSoffsIdxen",    1999, T::BufferStoreDword,    F::Vdata1VaddrSvSoffsIdxen, p1("")),
+    f(recompile_buffer_store_dword_vdata1, T::BufferStoreDword, F::Vdata1VaddrSvSoffsIdxen, p1("")),
     ni("Recompile_BufferStoreFormatX_Vdata1VaddrSvSoffsIdxen",  2068, T::BufferStoreFormatX,  F::Vdata1VaddrSvSoffsIdxen, p1("")),
     ni("Recompile_BufferStoreFormatXy_Vdata2VaddrSvSoffsIdxen", 2137, T::BufferStoreFormatXy, F::Vdata2VaddrSvSoffsIdxen, p1("")),
 
@@ -5163,33 +5156,33 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_sload_dwordx4, T::SLoadDwordx4, F::Sdst4SbaseSoffset, p1("")),
     f(recompile_sload_dwordx8, T::SLoadDwordx8, F::Sdst8SbaseSoffset, p1("")),
 
-    nis("Recompile_S_XXX_B64_Sdst2Ssrc02Ssrc12", 3248, T::SAndn2B64,   F::Sdst2Ssrc02Ssrc12, p4("%ta_<index> = OpNot %uint %t2_<index>",
+    fs(recompile_s_xxx_b64_sdst2_ssrc02_ssrc12, T::SAndn2B64, F::Sdst2Ssrc02Ssrc12, p4("%ta_<index> = OpNot %uint %t2_<index>",
         "%tb_<index> = OpBitwiseAnd %uint %t0_<index> %ta_<index>",
         "%tc_<index> = OpNot %uint %t3_<index>",
         "%td_<index> = OpBitwiseAnd %uint %t1_<index> %tc_<index>"), S::NonZero),
-    nis("Recompile_S_XXX_B64_Sdst2Ssrc02Ssrc12", 3248, T::SOrn2B64,    F::Sdst2Ssrc02Ssrc12, p4("%ta_<index> = OpNot %uint %t2_<index>",
+    fs(recompile_s_xxx_b64_sdst2_ssrc02_ssrc12, T::SOrn2B64, F::Sdst2Ssrc02Ssrc12, p4("%ta_<index> = OpNot %uint %t2_<index>",
         "%tb_<index> = OpBitwiseOr %uint %t0_<index> %ta_<index>",
         "%tc_<index> = OpNot %uint %t3_<index>",
         "%td_<index> = OpBitwiseOr %uint %t1_<index> %tc_<index>"), S::NonZero),
-    nis("Recompile_S_XXX_B64_Sdst2Ssrc02Ssrc12", 3248, T::SAndB64,     F::Sdst2Ssrc02Ssrc12, p2("%tb_<index> = OpBitwiseAnd %uint %t0_<index> %t2_<index>",
+    fs(recompile_s_xxx_b64_sdst2_ssrc02_ssrc12, T::SAndB64, F::Sdst2Ssrc02Ssrc12, p2("%tb_<index> = OpBitwiseAnd %uint %t0_<index> %t2_<index>",
         "%td_<index> = OpBitwiseAnd %uint %t1_<index> %t3_<index>"), S::NonZero),
-    nis("Recompile_S_XXX_B64_Sdst2Ssrc02Ssrc12", 3248, T::SNorB64,     F::Sdst2Ssrc02Ssrc12, p4("%ta_<index> = OpBitwiseOr %uint %t0_<index> %t2_<index>",
+    fs(recompile_s_xxx_b64_sdst2_ssrc02_ssrc12, T::SNorB64, F::Sdst2Ssrc02Ssrc12, p4("%ta_<index> = OpBitwiseOr %uint %t0_<index> %t2_<index>",
         "%tb_<index> = OpNot %uint %ta_<index>",
         "%tc_<index> = OpBitwiseOr %uint %t1_<index> %t3_<index>",
         "%td_<index> = OpNot %uint %tc_<index>"), S::NonZero),
-    nis("Recompile_S_XXX_B64_Sdst2Ssrc02Ssrc12", 3248, T::SNandB64,    F::Sdst2Ssrc02Ssrc12, p4("%ta_<index> = OpBitwiseAnd %uint %t0_<index> %t2_<index>",
+    fs(recompile_s_xxx_b64_sdst2_ssrc02_ssrc12, T::SNandB64, F::Sdst2Ssrc02Ssrc12, p4("%ta_<index> = OpBitwiseAnd %uint %t0_<index> %t2_<index>",
         "%tb_<index> = OpNot %uint %ta_<index>",
         "%tc_<index> = OpBitwiseAnd %uint %t1_<index> %t3_<index>",
         "%td_<index> = OpNot %uint %tc_<index>"), S::NonZero),
-    nis("Recompile_S_XXX_B64_Sdst2Ssrc02Ssrc12", 3248, T::SXnorB64,    F::Sdst2Ssrc02Ssrc12, p4("%ta_<index> = OpBitwiseXor %uint %t0_<index> %t2_<index>",
+    fs(recompile_s_xxx_b64_sdst2_ssrc02_ssrc12, T::SXnorB64, F::Sdst2Ssrc02Ssrc12, p4("%ta_<index> = OpBitwiseXor %uint %t0_<index> %t2_<index>",
         "%tb_<index> = OpNot %uint %ta_<index>",
         "%tc_<index> = OpBitwiseXor %uint %t1_<index> %t3_<index>",
         "%td_<index> = OpNot %uint %tc_<index>"), S::NonZero),
-    nis("Recompile_S_XXX_B64_Sdst2Ssrc02Ssrc12", 3248, T::SOrB64,      F::Sdst2Ssrc02Ssrc12, p2("%tb_<index> = OpBitwiseOr %uint %t0_<index> %t2_<index>",
+    fs(recompile_s_xxx_b64_sdst2_ssrc02_ssrc12, T::SOrB64, F::Sdst2Ssrc02Ssrc12, p2("%tb_<index> = OpBitwiseOr %uint %t0_<index> %t2_<index>",
         "%td_<index> = OpBitwiseOr %uint %t1_<index> %t3_<index>"), S::NonZero),
-    nis("Recompile_S_XXX_B64_Sdst2Ssrc02Ssrc12", 3248, T::SXorB64,     F::Sdst2Ssrc02Ssrc12, p2("%tb_<index> = OpBitwiseXor %uint %t0_<index> %t2_<index>",
+    fs(recompile_s_xxx_b64_sdst2_ssrc02_ssrc12, T::SXorB64, F::Sdst2Ssrc02Ssrc12, p2("%tb_<index> = OpBitwiseXor %uint %t0_<index> %t2_<index>",
         "%td_<index> = OpBitwiseXor %uint %t1_<index> %t3_<index>"), S::NonZero),
-    nis("Recompile_S_XXX_B64_Sdst2Ssrc02Ssrc12", 3248, T::SCselectB64, F::Sdst2Ssrc02Ssrc12, p4("%ts_<index> = OpLoad %uint %scc",
+    fs(recompile_s_xxx_b64_sdst2_ssrc02_ssrc12, T::SCselectB64, F::Sdst2Ssrc02Ssrc12, p4("%ts_<index> = OpLoad %uint %scc",
         "%tsb_<index> = OpINotEqual %bool %ts_<index> %uint_0",
         "%tb_<index> = OpSelect %uint %tsb_<index> %t0_<index> %t2_<index>",
         "%td_<index> = OpSelect %uint %tsb_<index> %t1_<index> %t3_<index>"), S::None),
@@ -5198,21 +5191,21 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     fs(recompile_s_lshl_b64, T::SLshlB64, F::Sdst2Ssrc02Ssrc1, p2("", ""), S::NonZero),
     fs(recompile_s_lshr_b64, T::SLshrB64, F::Sdst2Ssrc02Ssrc1, p2("", ""), S::NonZero),
 
-    nis("Recompile_S_XXX_B32_SVdstSVsrc0SVsrc1", 3528, T::SAndB32,      F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseAnd %uint %t0_<index> %t1_<index>"), S::NonZero),
-    nis("Recompile_S_XXX_B32_SVdstSVsrc0SVsrc1", 3528, T::SBfmB32,      F::SVdstSVsrc0SVsrc1, p3("%tcount_<index> = OpBitwiseAnd %uint %t0_<index> %uint_31", "%toffset_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpBitFieldInsert %uint %uint_0 %uint_0xffffffff %toffset_<index> %tcount_<index>"), S::None),
-    nis("Recompile_S_XXX_B32_SVdstSVsrc0SVsrc1", 3528, T::SCselectB32,  F::SVdstSVsrc0SVsrc1, p3("%t22_<index> = OpLoad %uint %scc", "%t2_<index> = OpINotEqual %bool %t22_<index> %uint_0", "%t_<index> = OpSelect %uint %t2_<index> %t0_<index> %t1_<index>"), S::None),
-    nis("Recompile_S_XXX_B32_SVdstSVsrc0SVsrc1", 3528, T::SLshlB32,     F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpShiftLeftLogical %uint %t0_<index> %ts_<index>"), S::NonZero),
-    nis("Recompile_S_XXX_B32_SVdstSVsrc0SVsrc1", 3528, T::SLshrB32,     F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpShiftRightLogical %uint %t0_<index> %ts_<index>"), S::NonZero),
-    nis("Recompile_S_XXX_B32_SVdstSVsrc0SVsrc1", 3528, T::SOrB32,       F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseOr %uint %t0_<index> %t1_<index>"), S::NonZero),
+    fs(recompile_s_xxx_b32_svdst_svsrc01, T::SAndB32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseAnd %uint %t0_<index> %t1_<index>"), S::NonZero),
+    fs(recompile_s_xxx_b32_svdst_svsrc01, T::SBfmB32, F::SVdstSVsrc0SVsrc1, p3("%tcount_<index> = OpBitwiseAnd %uint %t0_<index> %uint_31", "%toffset_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpBitFieldInsert %uint %uint_0 %uint_0xffffffff %toffset_<index> %tcount_<index>"), S::None),
+    fs(recompile_s_xxx_b32_svdst_svsrc01, T::SCselectB32, F::SVdstSVsrc0SVsrc1, p3("%t22_<index> = OpLoad %uint %scc", "%t2_<index> = OpINotEqual %bool %t22_<index> %uint_0", "%t_<index> = OpSelect %uint %t2_<index> %t0_<index> %t1_<index>"), S::None),
+    fs(recompile_s_xxx_b32_svdst_svsrc01, T::SLshlB32, F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpShiftLeftLogical %uint %t0_<index> %ts_<index>"), S::NonZero),
+    fs(recompile_s_xxx_b32_svdst_svsrc01, T::SLshrB32, F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpShiftRightLogical %uint %t0_<index> %ts_<index>"), S::NonZero),
+    fs(recompile_s_xxx_b32_svdst_svsrc01, T::SOrB32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseOr %uint %t0_<index> %t1_<index>"), S::NonZero),
     nis("Recompile_S_XXX_I32_SVdstSVsrc0SVsrc1", 3576, T::SAddI32,      F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpIAdd %int %t0_<index> %t1_<index>"), S::OverflowAdd),
     nis("Recompile_S_XXX_I32_SVdstSVsrc0SVsrc1", 3576, T::SMulI32,      F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpIMul %int %t0_<index> %t1_<index>"), S::None),
     nis("Recompile_S_XXX_I32_SVdstSVsrc0SVsrc1", 3576, T::SSubI32,      F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpISub %int %t0_<index> %t1_<index>"), S::OverflowSub),
-    nis("Recompile_S_XXX_U32_SVdstSVsrc0SVsrc1", 3621, T::SAddcU32,     F::SVdstSVsrc0SVsrc1, p4("%tscc_<index> = OpLoad %uint %scc", "%ts_<index> = OpFunctionCall %v2uint %addc %t0_<index> %t1_<index> %tscc_<index>", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
-    nis("Recompile_S_XXX_U32_SVdstSVsrc0SVsrc1", 3621, T::SAddU32,      F::SVdstSVsrc0SVsrc1, p3("%ts_<index> = OpIAddCarry %ResTypeU %t0_<index> %t1_<index>", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
+    fs(recompile_s_xxx_u32_svdst_svsrc01, T::SAddcU32, F::SVdstSVsrc0SVsrc1, p4("%tscc_<index> = OpLoad %uint %scc", "%ts_<index> = OpFunctionCall %v2uint %addc %t0_<index> %t1_<index> %tscc_<index>", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
+    fs(recompile_s_xxx_u32_svdst_svsrc01, T::SAddU32, F::SVdstSVsrc0SVsrc1, p3("%ts_<index> = OpIAddCarry %ResTypeU %t0_<index> %t1_<index>", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SSubU32, F::SVdstSVsrc0SVsrc1, p4("%t_<index> = OpISub %uint %t0_<index> %t1_<index>", "%nb_<index> = OpUGreaterThanEqual %bool %t0_<index> %t1_<index>", "%carry_<index> = OpSelect %uint %nb_<index> %uint_1 %uint_0", ""), S::CarryOut),
-    nis("Recompile_S_XXX_U32_SVdstSVsrc0SVsrc1", 3621, T::SBfeU32,      F::SVdstSVsrc0SVsrc1, p3("%to_<index> = OpBitFieldUExtract %uint %t1_<index> %uint_0  %uint_5", "%ts_<index> = OpBitFieldUExtract %uint %t1_<index> %uint_16 %uint_7", "%t_<index> = OpBitFieldUExtract %uint %t0_<index> %to_<index> %ts_<index>"), S::NonZero),
-    nis("Recompile_S_XXX_U32_SVdstSVsrc0SVsrc1", 3621, T::SLshl4AddU32, F::SVdstSVsrc0SVsrc1, p3("%ts_<index> = OpFunctionCall %v2uint %lshl_add %t0_<index> %t1_<index> %uint_4", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
-    nis("Recompile_S_XXX_U32_SVdstSVsrc0SVsrc1", 3621, T::SMulHiU32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %uint %mul_hi_uint %t0_<index> %t1_<index>"), S::None),
+    fs(recompile_s_xxx_u32_svdst_svsrc01, T::SBfeU32, F::SVdstSVsrc0SVsrc1, p3("%to_<index> = OpBitFieldUExtract %uint %t1_<index> %uint_0  %uint_5", "%ts_<index> = OpBitFieldUExtract %uint %t1_<index> %uint_16 %uint_7", "%t_<index> = OpBitFieldUExtract %uint %t0_<index> %to_<index> %ts_<index>"), S::NonZero),
+    fs(recompile_s_xxx_u32_svdst_svsrc01, T::SLshl4AddU32, F::SVdstSVsrc0SVsrc1, p3("%ts_<index> = OpFunctionCall %v2uint %lshl_add %t0_<index> %t1_<index> %uint_4", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
+    fs(recompile_s_xxx_u32_svdst_svsrc01, T::SMulHiU32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %uint %mul_hi_uint %t0_<index> %t1_<index>"), S::None),
     ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VAndB32,     F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseAnd %uint %t0_<index> %t1_<index>")),
     ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VBcntU32B32, F::SVdstSVsrc0SVsrc1, p3("%tb_<index> = OpBitCount %int %t0_<index>", "%tbu_<index> = OpBitcast %uint %tb_<index>", "%t_<index> = OpIAdd %uint %tbu_<index> %t1_<index>")),
     ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VBfmB32,     F::SVdstSVsrc0SVsrc1, p3("%tcount_<index> = OpBitwiseAnd %uint %t0_<index> %uint_31", "%toffset_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpBitFieldInsert %uint %uint_0 %uint_0xffffffff %toffset_<index> %tcount_<index>")),
@@ -5225,6 +5218,11 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VMulU32U24,  F::SVdstSVsrc0SVsrc1, p3("%tu0_<index> = OpBitwiseAnd %uint %t0_<index> %uint_0x00ffffff", "%tu1_<index> = OpBitwiseAnd %uint %t1_<index> %uint_0x00ffffff", "%t_<index> = OpFunctionCall %uint %mul_lo_uint %tu0_<index> %tu1_<index>")),
     ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VOrB32,      F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseOr %uint %t0_<index> %t1_<index>")),
     ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VXorB32,     F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseXor %uint %t0_<index> %t1_<index>")),
+    // RDNA2-only (no Kyty upstream rows): the carry-less VOP2 add/sub family
+    // measured in Minecraft's menu CS.
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VAddNcU32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpIAdd %uint %t0_<index> %t1_<index>")),
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VSubNcU32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpISub %uint %t0_<index> %t1_<index>")),
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VSubrevNcU32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpISub %uint %t1_<index> %t0_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc01, T::VAddF32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFAdd %float %t0_<index> %t1_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc01, T::VMacF32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Fma %t0_<index> %t1_<index> %tdst_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc01, T::VMaxF32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpExtInst %float %GLSL_std_450 FMax %t0_<index> %t1_<index>")),
@@ -5235,7 +5233,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     ni("Recompile_V_XXX_I32_SVdstSVsrc0SVsrc1", 5795, T::VAshrI32,    F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %int %t1_<index> %int_31", "%t_<index> = OpShiftRightArithmetic %int %t0_<index> %ts_<index>")),
     ni("Recompile_V_XXX_I32_SVdstSVsrc0SVsrc1", 5795, T::VAshrrevI32, F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %int %t0_<index> %int_31", "%t_<index> = OpShiftRightArithmetic %int %t1_<index> %ts_<index>")),
     ni("Recompile_V_XXX_I32_SVdstSVsrc0SVsrc1", 5795, T::VMulLoI32,   F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %int %mul_lo_int %t0_<index> %t1_<index>")),
-    ni("Recompile_VCvtPkrtzF16F32_SVdstSVsrc0SVsrc1", 5260, T::VCvtPkrtzF16F32, F::SVdstSVsrc0SVsrc1, p1("")),
+    f(recompile_vcvt_pkrtz_f16_f32, T::VCvtPkrtzF16F32, F::SVdstSVsrc0SVsrc1, p1("")),
     ni("Recompile_VMbcntHiU32B32_SVdstSVsrc0SVsrc1",  5455, T::VMbcntHiU32B32,  F::SVdstSVsrc0SVsrc1, p1("")),
     ni("Recompile_VMbcntLoU32B32_SVdstSVsrc0SVsrc1",  5497, T::VMbcntLoU32B32,  F::SVdstSVsrc0SVsrc1, p1("")),
 
@@ -5319,23 +5317,28 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     ni("Recompile_VCmpx_XXX_F32_SmaskVsrc0Vsrc1", 5148, T::VCmpxNeqF32, F::SmaskVsrc0Vsrc1, p1("OpFUnordNotEqual")),
     ni("Recompile_VCmpx_XXX_F32_SmaskVsrc0Vsrc1", 5148, T::VCmpxGtF32,  F::SmaskVsrc0Vsrc1, p1("OpFOrdGreaterThan")),
     ni("Recompile_VCmpx_XXX_F32_SmaskVsrc0Vsrc1", 5148, T::VCmpxLtF32,  F::SmaskVsrc0Vsrc1, p1("OpFOrdLessThan")),
-    ni("Recompile_VCmpx_XXX_I32_SmaskVsrc0Vsrc1", 5040, T::VCmpxEqU32,  F::SmaskVsrc0Vsrc1, p1("OpIEqual")),
-    ni("Recompile_VCmpx_XXX_I32_SmaskVsrc0Vsrc1", 5040, T::VCmpxNeU32,  F::SmaskVsrc0Vsrc1, p1("OpINotEqual")),
-    ni("Recompile_VCmpx_XXX_U32_SmaskVsrc0Vsrc1", 5094, T::VCmpxGeU32,  F::SmaskVsrc0Vsrc1, p1("OpUGreaterThanEqual")),
-    ni("Recompile_VCmpx_XXX_U32_SmaskVsrc0Vsrc1", 5094, T::VCmpxGtU32,  F::SmaskVsrc0Vsrc1, p1("OpUGreaterThan")),
+    // Wired for the Minecraft menu CS (v_cmpx family; Kyty GCN semantics —
+    // the comparison result lands in both the mask destination and EXEC; on
+    // real RDNA2 cmpx writes EXEC only, the extra mask write is a documented
+    // deviation until a title proves it matters).
+    f(recompile_vcmpx_xxx_i32, T::VCmpxEqU32,  F::SmaskVsrc0Vsrc1, p1("OpIEqual")),
+    f(recompile_vcmpx_xxx_i32, T::VCmpxNeU32,  F::SmaskVsrc0Vsrc1, p1("OpINotEqual")),
+    f(recompile_vcmpx_xxx_u32, T::VCmpxGeU32,  F::SmaskVsrc0Vsrc1, p1("OpUGreaterThanEqual")),
+    f(recompile_vcmpx_xxx_u32, T::VCmpxGtU32,  F::SmaskVsrc0Vsrc1, p1("OpUGreaterThan")),
+    f(recompile_vcmpx_xxx_u32, T::VCmpxLtU32,  F::SmaskVsrc0Vsrc1, p1("OpULessThan")),
 
-    ni("Recompile_SCmp_XXX_I32_Ssrc0Ssrc1", 3725, T::SCmpEqI32, F::Ssrc0Ssrc1, p1("OpIEqual")),
-    ni("Recompile_SCmp_XXX_I32_Ssrc0Ssrc1", 3725, T::SCmpGeI32, F::Ssrc0Ssrc1, p1("OpSGreaterThanEqual")),
-    ni("Recompile_SCmp_XXX_I32_Ssrc0Ssrc1", 3725, T::SCmpGtI32, F::Ssrc0Ssrc1, p1("OpSGreaterThan")),
-    ni("Recompile_SCmp_XXX_I32_Ssrc0Ssrc1", 3725, T::SCmpLgI32, F::Ssrc0Ssrc1, p1("OpINotEqual")),
-    ni("Recompile_SCmp_XXX_I32_Ssrc0Ssrc1", 3725, T::SCmpLtI32, F::Ssrc0Ssrc1, p1("OpSLessThan")),
-    ni("Recompile_SCmp_XXX_I32_Ssrc0Ssrc1", 3725, T::SCmpLeI32, F::Ssrc0Ssrc1, p1("OpSLessThanEqual")),
-    ni("Recompile_SCmp_XXX_U32_Ssrc0Ssrc1", 3760, T::SCmpEqU32, F::Ssrc0Ssrc1, p1("OpIEqual")),
-    ni("Recompile_SCmp_XXX_U32_Ssrc0Ssrc1", 3760, T::SCmpGeU32, F::Ssrc0Ssrc1, p1("OpUGreaterThanEqual")),
-    ni("Recompile_SCmp_XXX_U32_Ssrc0Ssrc1", 3760, T::SCmpGtU32, F::Ssrc0Ssrc1, p1("OpUGreaterThan")),
-    ni("Recompile_SCmp_XXX_U32_Ssrc0Ssrc1", 3760, T::SCmpLeU32, F::Ssrc0Ssrc1, p1("OpULessThanEqual")),
-    ni("Recompile_SCmp_XXX_U32_Ssrc0Ssrc1", 3760, T::SCmpLtU32, F::Ssrc0Ssrc1, p1("OpULessThan")),
-    ni("Recompile_SCmp_XXX_U32_Ssrc0Ssrc1", 3760, T::SCmpLgU32, F::Ssrc0Ssrc1, p1("OpINotEqual")),
+    f(recompile_scmp_xxx_i32, T::SCmpEqI32, F::Ssrc0Ssrc1, p1("OpIEqual")),
+    f(recompile_scmp_xxx_i32, T::SCmpGeI32, F::Ssrc0Ssrc1, p1("OpSGreaterThanEqual")),
+    f(recompile_scmp_xxx_i32, T::SCmpGtI32, F::Ssrc0Ssrc1, p1("OpSGreaterThan")),
+    f(recompile_scmp_xxx_i32, T::SCmpLgI32, F::Ssrc0Ssrc1, p1("OpINotEqual")),
+    f(recompile_scmp_xxx_i32, T::SCmpLtI32, F::Ssrc0Ssrc1, p1("OpSLessThan")),
+    f(recompile_scmp_xxx_i32, T::SCmpLeI32, F::Ssrc0Ssrc1, p1("OpSLessThanEqual")),
+    f(recompile_scmp_xxx_u32, T::SCmpEqU32, F::Ssrc0Ssrc1, p1("OpIEqual")),
+    f(recompile_scmp_xxx_u32, T::SCmpGeU32, F::Ssrc0Ssrc1, p1("OpUGreaterThanEqual")),
+    f(recompile_scmp_xxx_u32, T::SCmpGtU32, F::Ssrc0Ssrc1, p1("OpUGreaterThan")),
+    f(recompile_scmp_xxx_u32, T::SCmpLeU32, F::Ssrc0Ssrc1, p1("OpULessThanEqual")),
+    f(recompile_scmp_xxx_u32, T::SCmpLtU32, F::Ssrc0Ssrc1, p1("OpULessThan")),
+    f(recompile_scmp_xxx_u32, T::SCmpLgU32, F::Ssrc0Ssrc1, p1("OpINotEqual")),
 
     f(recompile_vcndmask_b32, T::VCndmaskB32, F::VdstVsrc0Vsrc1Smask2, p1("")),
 
@@ -5364,6 +5367,11 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
         "%tu1_<index> = OpBitwiseAnd %uint %t1_<index> %uint_0x00ffffff",
         "%tm_<index> = OpFunctionCall %uint %mul_lo_uint %tu0_<index> %tu1_<index>",
         "%t_<index> = OpIAdd %uint %tm_<index> %t2_<index>")),
+    // RDNA2-only (no Kyty upstream row): v_lshl_add_u32 — the first
+    // next-gen instruction Minecraft's menu CS needs.
+    f(recompile_v_xxx_u32_vdst_vsrc012, T::VLshlAddU32, F::VdstVsrc0Vsrc1Vsrc2, p3("%ts_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31",
+        "%tsh_<index> = OpShiftLeftLogical %uint %t0_<index> %ts_<index>",
+        "%t_<index> = OpIAdd %uint %tsh_<index> %t2_<index>")),
 ];
 
 /// Kyty: ShaderSpirv.cpp `RecompFunc` (L6182) — hash-keyed
@@ -5529,13 +5537,18 @@ mod tests {
             .iter()
             .filter(|e| matches!(e.func, RecompileFn::NotImplemented { .. }))
             .count();
-        assert_eq!(table.len(), 206, "204 Kyty rows plus SSubU32 and SNop");
+        assert_eq!(
+            table.len(),
+            211,
+            "204 Kyty rows plus SSubU32, SNop, and the RDNA2-only rows \
+             (VLshlAddU32, VCmpxLtU32, VAddNcU32, VSubNcU32, VSubrevNcU32)"
+        );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 89,
-            "C1 implemented subset plus title extensions"
+            implemented, 132,
+            "C1 implemented subset plus title-driven ports"
         );
-        assert_eq!(ni, 117, "C2 remainder");
+        assert_eq!(ni, 79, "C2 remainder");
 
         // Kyty EXIT_IF(map->Contains(p)) — (type, format) keys are unique.
         let mut seen = std::collections::HashSet::new();
@@ -5619,6 +5632,486 @@ mod tests {
         assert!(source.contains("OpStore %scc %carry_0"));
         let words = spirv_run(&source).expect("assemble measured s_sub_u32");
         naga_parse_and_validate(&words, "s_sub_u32");
+    }
+
+    #[test]
+    fn s_bfe_u32_recompiles_the_measured_literal_extract() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        shader_parse(
+            0,
+            &[
+                // Minecraft PPSA17221: s_bfe_u32 vcc_hi, s3, 0x00080008
+                // (extract eight bits starting at bit eight).
+                0x93EB_FF03,
+                0x0008_0008,
+                0x7E00_02FF,
+                0x3F80_0000,
+                0x7E02_0280,
+                0x1004_0300,
+                0xF800_08CF,
+                0x0302_0100,
+                0xF800_020F,
+                0x0302_0100,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured s_bfe_u32");
+
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SBfeU32);
+        assert_eq!(inst.dst.type_, ShaderOperandType::VccHi);
+        assert_eq!(inst.src[0].register_id, 3);
+        assert_eq!(inst.src[1].constant.u, 0x0008_0008);
+
+        let entry = recomp_func(T::SBfeU32, F::SVdstSVsrc0SVsrc1).expect("SBfeU32 row");
+        assert!(matches!(entry.func, RecompileFn::Func(_)));
+        assert_eq!(entry.scc_check, SccCheck::NonZero);
+
+        let source = spirv_generate_source(
+            &code,
+            Some(&ShaderVertexInputInfo {
+                export_count: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+        )
+        .expect("recompile measured s_bfe_u32");
+        assert!(source.contains("OpBitFieldUExtract %uint"));
+        assert!(source.contains("OpStore %scc"));
+        let words = spirv_run(&source).expect("assemble measured s_bfe_u32");
+        naga_parse_and_validate(&words, "s_bfe_u32");
+    }
+
+    #[test]
+    fn s_and_b32_recompiles_the_measured_literal_mask() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        shader_parse(
+            0,
+            &[
+                // Minecraft PPSA17221: s_and_b32 s0, s3, 255.
+                0x8700_FF03,
+                0x0000_00ff,
+                0x7E00_02FF,
+                0x3F80_0000,
+                0x7E02_0280,
+                0x1004_0300,
+                0xF800_08CF,
+                0x0302_0100,
+                0xF800_020F,
+                0x0302_0100,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured s_and_b32");
+
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SAndB32);
+        assert_eq!(inst.dst.register_id, 0);
+        assert_eq!(inst.src[0].register_id, 3);
+        assert_eq!(inst.src[1].constant.u, 0xff);
+
+        let entry = recomp_func(T::SAndB32, F::SVdstSVsrc0SVsrc1).expect("SAndB32 row");
+        assert!(matches!(entry.func, RecompileFn::Func(_)));
+        assert_eq!(entry.scc_check, SccCheck::NonZero);
+
+        let source = spirv_generate_source(
+            &code,
+            Some(&ShaderVertexInputInfo {
+                export_count: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+        )
+        .expect("recompile measured s_and_b32");
+        assert!(source.contains("OpBitwiseAnd %uint"));
+        assert!(source.contains("OpStore %scc"));
+        let words = spirv_run(&source).expect("assemble measured s_and_b32");
+        naga_parse_and_validate(&words, "s_and_b32");
+    }
+
+    #[test]
+    fn scalar_b32_family_is_wired_with_kyty_scc_semantics() {
+        let cases = [
+            (T::SAndB32, SccCheck::NonZero),
+            (T::SBfmB32, SccCheck::None),
+            (T::SCselectB32, SccCheck::None),
+            (T::SLshlB32, SccCheck::NonZero),
+            (T::SLshrB32, SccCheck::NonZero),
+            (T::SOrB32, SccCheck::NonZero),
+        ];
+
+        for (ty, scc) in cases {
+            let entry =
+                recomp_func(ty, F::SVdstSVsrc0SVsrc1).unwrap_or_else(|| panic!("{ty:?} row"));
+            assert!(matches!(entry.func, RecompileFn::Func(_)), "{ty:?}");
+            assert_eq!(entry.scc_check, scc, "{ty:?}");
+        }
+    }
+
+    #[test]
+    fn s_lshl_b32_recompiles_the_measured_vcc_shift() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        shader_parse(
+            0,
+            &[
+                // Minecraft PPSA17221: s_lshl_b32 vcc_lo, vcc_hi, 12.
+                0x8F6A_8C6B,
+                0x7E00_02FF,
+                0x3F80_0000,
+                0x7E02_0280,
+                0x1004_0300,
+                0xF800_08CF,
+                0x0302_0100,
+                0xF800_020F,
+                0x0302_0100,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured s_lshl_b32");
+
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SLshlB32);
+        assert_eq!(inst.dst.type_, ShaderOperandType::VccLo);
+        assert_eq!(inst.src[0].type_, ShaderOperandType::VccHi);
+        assert_eq!(inst.src[1].constant.u, 12);
+
+        let source = spirv_generate_source(
+            &code,
+            Some(&ShaderVertexInputInfo {
+                export_count: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+        )
+        .expect("recompile measured s_lshl_b32");
+        assert!(source.contains("OpShiftLeftLogical %uint"));
+        assert!(source.contains("OpStore %scc"));
+        let words = spirv_run(&source).expect("assemble measured s_lshl_b32");
+        naga_parse_and_validate(&words, "s_lshl_b32");
+    }
+
+    #[test]
+    fn scalar_compare_family_is_wired() {
+        let signed = [
+            T::SCmpEqI32,
+            T::SCmpGeI32,
+            T::SCmpGtI32,
+            T::SCmpLgI32,
+            T::SCmpLtI32,
+            T::SCmpLeI32,
+        ];
+        let unsigned = [
+            T::SCmpEqU32,
+            T::SCmpGeU32,
+            T::SCmpGtU32,
+            T::SCmpLeU32,
+            T::SCmpLtU32,
+            T::SCmpLgU32,
+        ];
+
+        for ty in signed.into_iter().chain(unsigned) {
+            let entry = recomp_func(ty, F::Ssrc0Ssrc1).unwrap_or_else(|| panic!("{ty:?} row"));
+            assert!(matches!(entry.func, RecompileFn::Func(_)), "{ty:?}");
+            assert_eq!(entry.scc_check, SccCheck::None, "{ty:?}");
+        }
+    }
+
+    #[test]
+    fn s_cmp_eq_i32_recompiles_the_measured_vcc_comparison() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        shader_parse(
+            0,
+            &[
+                // Minecraft PPSA17221: s_cmp_eq_i32 0, vcc_lo.
+                0xBF00_6A80,
+                0x7E00_02FF,
+                0x3F80_0000,
+                0x7E02_0280,
+                0x1004_0300,
+                0xF800_08CF,
+                0x0302_0100,
+                0xF800_020F,
+                0x0302_0100,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured s_cmp_eq_i32");
+
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SCmpEqI32);
+        assert_eq!(inst.src[0].constant.u, 0);
+        assert_eq!(inst.src[1].type_, ShaderOperandType::VccLo);
+
+        let source = spirv_generate_source(
+            &code,
+            Some(&ShaderVertexInputInfo {
+                export_count: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+        )
+        .expect("recompile measured s_cmp_eq_i32");
+        assert!(source.contains("OpIEqual %bool"));
+        assert!(source.contains("OpStore %scc"));
+        let words = spirv_run(&source).expect("assemble measured s_cmp_eq_i32");
+        naga_parse_and_validate(&words, "s_cmp_eq_i32");
+    }
+
+    #[test]
+    fn v_lshl_add_u32_recompiles_the_measured_rdna2_encoding() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        shader_parse(
+            0,
+            &[
+                // Minecraft PPSA17221 menu CS (first RDNA2-only op measured):
+                // v_lshl_add_u32 v0, v1, v2, v3 — VOP3 opcode 0x346.
+                0xD746_0000,
+                0x040E_0501,
+                0x7E00_02FF,
+                0x3F80_0000,
+                0x7E02_0280,
+                0x1004_0300,
+                0xF800_08CF,
+                0x0302_0100,
+                0xF800_020F,
+                0x0302_0100,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured v_lshl_add_u32");
+
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::VLshlAddU32);
+        assert_eq!(inst.format, F::VdstVsrc0Vsrc1Vsrc2);
+        assert_eq!(inst.dst.register_id, 0);
+        assert_eq!(
+            [
+                inst.src[0].register_id,
+                inst.src[1].register_id,
+                inst.src[2].register_id
+            ],
+            [1, 2, 3]
+        );
+
+        let source = spirv_generate_source(
+            &code,
+            Some(&ShaderVertexInputInfo {
+                export_count: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+        )
+        .expect("recompile measured v_lshl_add_u32");
+        assert!(source.contains("OpShiftLeftLogical %uint"));
+        assert!(source.contains("OpIAdd %uint"));
+        let words = spirv_run(&source).expect("assemble measured v_lshl_add_u32");
+        naga_parse_and_validate(&words, "v_lshl_add_u32");
+    }
+
+    #[test]
+    fn scalar_b64_boolean_family_is_wired_with_kyty_scc_semantics() {
+        let nonzero = [
+            T::SAndn2B64,
+            T::SOrn2B64,
+            T::SAndB64,
+            T::SNorB64,
+            T::SNandB64,
+            T::SXnorB64,
+            T::SOrB64,
+            T::SXorB64,
+        ];
+
+        for ty in nonzero {
+            let entry =
+                recomp_func(ty, F::Sdst2Ssrc02Ssrc12).unwrap_or_else(|| panic!("{ty:?} row"));
+            assert!(matches!(entry.func, RecompileFn::Func(_)), "{ty:?}");
+            assert_eq!(entry.scc_check, SccCheck::NonZero, "{ty:?}");
+        }
+
+        let select = recomp_func(T::SCselectB64, F::Sdst2Ssrc02Ssrc12).expect("SCselectB64 row");
+        assert!(matches!(select.func, RecompileFn::Func(_)));
+        assert_eq!(select.scc_check, SccCheck::None);
+    }
+
+    #[test]
+    fn s_cselect_b64_recompiles_the_measured_exec_select() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        shader_parse(
+            0,
+            &[
+                // Minecraft PPSA17221: s_cselect_b64 s[6:7], exec, 0.
+                0x8586_807E,
+                0x7E00_02FF,
+                0x3F80_0000,
+                0x7E02_0280,
+                0x1004_0300,
+                0xF800_08CF,
+                0x0302_0100,
+                0xF800_020F,
+                0x0302_0100,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured s_cselect_b64");
+
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SCselectB64);
+        assert_eq!(inst.dst.register_id, 6);
+        assert_eq!(inst.src[0].type_, ShaderOperandType::ExecLo);
+        assert_eq!(inst.src[1].constant.u, 0);
+
+        let source = spirv_generate_source(
+            &code,
+            Some(&ShaderVertexInputInfo {
+                export_count: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+        )
+        .expect("recompile measured s_cselect_b64");
+        assert!(source.contains("OpSelect %uint"));
+        assert!(source.contains("OpStore %s6"));
+        assert!(source.contains("OpStore %s7"));
+        let words = spirv_run(&source).expect("assemble measured s_cselect_b64");
+        naga_parse_and_validate(&words, "s_cselect_b64");
+    }
+
+    #[test]
+    fn scalar_u32_arithmetic_family_is_wired_with_kyty_scc_semantics() {
+        for ty in [T::SAddcU32, T::SAddU32, T::SSubU32, T::SLshl4AddU32] {
+            let entry =
+                recomp_func(ty, F::SVdstSVsrc0SVsrc1).unwrap_or_else(|| panic!("{ty:?} row"));
+            assert!(matches!(entry.func, RecompileFn::Func(_)), "{ty:?}");
+            assert_eq!(entry.scc_check, SccCheck::CarryOut, "{ty:?}");
+        }
+
+        for (ty, scc) in [
+            (T::SBfeU32, SccCheck::NonZero),
+            (T::SMulHiU32, SccCheck::None),
+        ] {
+            let entry =
+                recomp_func(ty, F::SVdstSVsrc0SVsrc1).unwrap_or_else(|| panic!("{ty:?} row"));
+            assert!(matches!(entry.func, RecompileFn::Func(_)), "{ty:?}");
+            assert_eq!(entry.scc_check, scc, "{ty:?}");
+        }
+    }
+
+    #[test]
+    fn s_lshl4_add_u32_recompiles_the_measured_address_build() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        shader_parse(
+            0,
+            &[
+                // Minecraft PPSA17221:
+                // s_lshl4_add_u32 vcc_hi, vcc_lo, 0x000c0000.
+                0x98EB_FF6A,
+                0x000C_0000,
+                0x7E00_02FF,
+                0x3F80_0000,
+                0x7E02_0280,
+                0x1004_0300,
+                0xF800_08CF,
+                0x0302_0100,
+                0xF800_020F,
+                0x0302_0100,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured s_lshl4_add_u32");
+
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SLshl4AddU32);
+        assert_eq!(inst.dst.type_, ShaderOperandType::VccHi);
+        assert_eq!(inst.src[0].type_, ShaderOperandType::VccLo);
+        assert_eq!(inst.src[1].constant.u, 0x000c_0000);
+
+        let source = spirv_generate_source(
+            &code,
+            Some(&ShaderVertexInputInfo {
+                export_count: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+        )
+        .expect("recompile measured s_lshl4_add_u32");
+        assert!(source.contains("OpFunctionCall %v2uint %lshl_add"));
+        assert!(source.contains("OpStore %scc %carry_0"));
+        let words = spirv_run(&source).expect("assemble measured s_lshl4_add_u32");
+        // `OpIAddCarry` is core SPIR-V and is used by Kyty's faithful
+        // `lshl_add` helper. naga 24 does not parse it, so assembly plus the
+        // real Vulkan title run is the appropriate gate for this row.
+        assert_eq!(words.first().copied(), Some(0x0723_0203));
+    }
+
+    #[test]
+    fn vcvt_pkrtz_f16_f32_recompiles_the_measured_minecraft_pixel_sequence() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        shader_parse(
+            0,
+            &[
+                // Minecraft PPSA17221 pixel shader at guest 0x253c4d00:
+                // v_cvt_pkrtz_f16_f32 v0, s4, s5
+                0xD52F_0000,
+                0x0000_0A04,
+                // v_cvt_pkrtz_f16_f32 v1, s6, s7
+                0xD52F_0001,
+                0x0000_0E06,
+                // exp mrt0 v0, v1 compr vm done
+                0xF800_1C0F,
+                0x0000_0100,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured next-gen pixel sequence");
+
+        let first = &code.get_instructions()[0];
+        assert_eq!(first.type_, T::VCvtPkrtzF16F32);
+        assert_eq!(first.dst.register_id, 0);
+        assert_eq!(first.src[0].register_id, 4);
+        assert_eq!(first.src[1].register_id, 5);
+
+        let mut input_info = ShaderPixelInputInfo::default();
+        input_info.target_output_mode[0] = 4;
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("recompile measured v_cvt_pkrtz_f16_f32 sequence");
+        assert!(source.contains("PackHalf2x16"), "{source}");
+        assert!(
+            source.contains("OpBitwiseAnd %uint %t0u_0 %uint_0xffffe000"),
+            "{source}"
+        );
+        let words = spirv_run(&source).expect("assemble measured v_cvt_pkrtz_f16_f32");
+        naga_parse_and_validate(&words, "measured v_cvt_pkrtz_f16_f32");
     }
 
     /// The two 64-bit scalar shifts are wired, and wired **with their SCC

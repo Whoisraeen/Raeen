@@ -121,6 +121,9 @@ pub enum ShaderInstructionType {
     TBufferLoadFormatXyzw,
     VAddF32,
     VAddI32,
+    /// RDNA2 (`next_gen`) VOP2 0x25: carry-less `vdst = vsrc0 + vsrc1`
+    /// (replaces GCN's carry-writing v_add_i32 in the same encoding slot).
+    VAddNcU32,
     VAndB32,
     VAshrI32,
     VAshrrevI32,
@@ -166,6 +169,7 @@ pub enum ShaderInstructionType {
     VCmpxGtF32,
     VCmpxGtU32,
     VCmpxLtF32,
+    VCmpxLtU32,
     VCmpxNeqF32,
     VCmpxNeU32,
     VCndmaskB32,
@@ -187,6 +191,10 @@ pub enum ShaderInstructionType {
     VInterpP1F32,
     VInterpP2F32,
     VLogF32,
+    /// RDNA2 (`next_gen`) VOP3 0x346: `vdst = (vsrc0 << vsrc1[4:0]) + vsrc2`.
+    /// Not in Kyty's GCN table — first RDNA2-only instruction, added for the
+    /// Minecraft menu CS.
+    VLshlAddU32,
     VLshlB32,
     VLshlrevB32,
     VLshrB32,
@@ -219,8 +227,12 @@ pub enum ShaderInstructionType {
     VSqrtF32,
     VSubF32,
     VSubI32,
+    /// RDNA2 (`next_gen`) VOP2 0x26: carry-less `vdst = vsrc0 - vsrc1`.
+    VSubNcU32,
     VSubrevF32,
     VSubrevI32,
+    /// RDNA2 (`next_gen`) VOP2 0x27: carry-less `vdst = vsrc1 - vsrc0`.
+    VSubrevNcU32,
     VTruncF32,
     VXorB32,
 

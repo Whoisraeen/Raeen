@@ -1189,6 +1189,88 @@ fn relocate_pointer_field(ctx: &HleContext, field: u64) -> bool {
     ctx.mem.write(field, &field.wrapping_add(rel).to_le_bytes())
 }
 
+const MAX_SHADER_METADATA_ENTRIES: usize = 16_384;
+
+fn read_guest_u16(ctx: &HleContext, address: u64) -> Option<u16> {
+    let mut bytes = [0u8; 2];
+    ctx.mem
+        .read(address, &mut bytes)
+        .then(|| u16::from_le_bytes(bytes))
+}
+
+fn read_shader_mapped_data(ctx: &HleContext, header: u64) -> Option<xps5x_gpu::ShaderMappedData> {
+    let user_data_address = read_u64_or_zero(ctx, header + SHADER_USER_DATA_OFFSET);
+    let user_data = if user_data_address == 0 {
+        None
+    } else {
+        let direct_address = read_u64_or_zero(ctx, user_data_address);
+        let sharp_addresses = [
+            read_u64_or_zero(ctx, user_data_address + 0x08),
+            read_u64_or_zero(ctx, user_data_address + 0x10),
+            read_u64_or_zero(ctx, user_data_address + 0x18),
+            read_u64_or_zero(ctx, user_data_address + 0x20),
+        ];
+        let eud_size_dw = read_guest_u16(ctx, user_data_address + 0x28)?;
+        let srt_size_dw = read_guest_u16(ctx, user_data_address + 0x2A)?;
+        let direct_count = usize::from(read_guest_u16(ctx, user_data_address + 0x2C)?);
+        let sharp_counts = [
+            usize::from(read_guest_u16(ctx, user_data_address + 0x2E)?),
+            usize::from(read_guest_u16(ctx, user_data_address + 0x30)?),
+            usize::from(read_guest_u16(ctx, user_data_address + 0x32)?),
+            usize::from(read_guest_u16(ctx, user_data_address + 0x34)?),
+        ];
+        if direct_count > MAX_SHADER_METADATA_ENTRIES
+            || sharp_counts.iter().sum::<usize>() > MAX_SHADER_METADATA_ENTRIES
+            || (direct_count != 0 && direct_address == 0)
+            || sharp_counts
+                .iter()
+                .zip(sharp_addresses)
+                .any(|(&count, address)| count != 0 && address == 0)
+        {
+            return None;
+        }
+
+        let mut direct_resource_offset = Vec::with_capacity(direct_count);
+        for index in 0..direct_count {
+            direct_resource_offset.push(read_guest_u16(ctx, direct_address + index as u64 * 2)?);
+        }
+        let mut sharp_resource_offset: [Vec<xps5x_gpu::ShaderSharp>; 4] =
+            std::array::from_fn(|index| Vec::with_capacity(sharp_counts[index]));
+        for table in 0..4 {
+            for index in 0..sharp_counts[table] {
+                let raw = read_guest_u16(ctx, sharp_addresses[table] + index as u64 * 2)?;
+                sharp_resource_offset[table]
+                    .push(xps5x_gpu::ShaderSharp::new(raw & 0x7fff, raw >> 15));
+            }
+        }
+        Some(xps5x_gpu::ShaderUserData {
+            direct_resource_offset,
+            sharp_resource_offset,
+            eud_size_dw,
+            srt_size_dw,
+        })
+    };
+
+    let semantics_address = read_u64_or_zero(ctx, header + SHADER_INPUT_SEMANTICS_OFFSET);
+    let semantics_count =
+        read_u32_or_zero(ctx, header + SHADER_NUM_INPUT_SEMANTICS_OFFSET) as usize;
+    if semantics_count > MAX_SHADER_METADATA_ENTRIES
+        || (semantics_count != 0 && semantics_address == 0)
+    {
+        return None;
+    }
+    let mut input_semantics = Vec::with_capacity(semantics_count);
+    for index in 0..semantics_count {
+        input_semantics.push(xps5x_gpu::ShaderSemantic {
+            raw: read_u32_or_zero(ctx, semantics_address + index as u64 * 4),
+        });
+    }
+    Some(xps5x_gpu::ShaderMappedData {
+        user_data,
+        input_semantics,
+    })
+}
+
 /// Bind a shader's code allocation into the first two SH-register entries.
 ///
 /// AGC compiler output deliberately stores zero in the program-base values.
@@ -1292,6 +1374,10 @@ fn hle_create_shader(ctx: &HleContext, args: &[u64]) -> u64 {
     if !patch_shader_program_registers(ctx, header, code) {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
+    let Some(mapped_data) = read_shader_mapped_data(ctx, header) else {
+        return SCE_ERROR_MEMORY_FAULT;
+    };
+    xps5x_gpu::AgcGpuSession::global().map_shader_metadata(code, mapped_data);
     // Publish the shader object pointer.
     if !ctx.mem.write(destination, &header.to_le_bytes()) {
         return SCE_ERROR_MEMORY_FAULT;
@@ -3586,6 +3672,50 @@ mod tests {
             hle_create_shader(&ctx, &[dest, header, code]),
             SCE_ERROR_INVALID_ARGUMENT
         );
+    }
+
+    #[test]
+    fn shader_mapped_data_owns_relocated_guest_tables() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let header: u64 = 0x200;
+        let user_data: u64 = 0x300;
+        let direct: u64 = 0x400;
+        let sharp0: u64 = 0x420;
+        let semantics: u64 = 0x440;
+        assert!(
+            ctx.mem
+                .write(header + SHADER_USER_DATA_OFFSET, &user_data.to_le_bytes())
+        );
+        assert!(ctx.mem.write(
+            header + SHADER_INPUT_SEMANTICS_OFFSET,
+            &semantics.to_le_bytes()
+        ));
+        assert!(ctx.mem.write(
+            header + SHADER_NUM_INPUT_SEMANTICS_OFFSET,
+            &2u32.to_le_bytes()
+        ));
+        assert!(ctx.mem.write(user_data, &direct.to_le_bytes()));
+        assert!(ctx.mem.write(user_data + 8, &sharp0.to_le_bytes()));
+        assert!(ctx.mem.write(user_data + 0x28, &3u16.to_le_bytes()));
+        assert!(ctx.mem.write(user_data + 0x2A, &4u16.to_le_bytes()));
+        assert!(ctx.mem.write(user_data + 0x2C, &2u16.to_le_bytes()));
+        assert!(ctx.mem.write(user_data + 0x2E, &1u16.to_le_bytes()));
+        assert!(ctx.mem.write(direct, &7u16.to_le_bytes()));
+        assert!(ctx.mem.write(direct + 2, &0xffffu16.to_le_bytes()));
+        assert!(ctx.mem.write(sharp0, &0x8123u16.to_le_bytes()));
+        assert!(ctx.mem.write(semantics, &0x1234_5678u32.to_le_bytes()));
+        assert!(ctx.mem.write(semantics + 4, &0x89ab_cdefu32.to_le_bytes()));
+
+        let mapped = read_shader_mapped_data(&ctx, header).expect("mapped metadata");
+        let user = mapped.user_data.expect("user data");
+        assert_eq!(user.direct_resource_offset, vec![7, 0xffff]);
+        assert_eq!(user.eud_size_dw, 3);
+        assert_eq!(user.srt_size_dw, 4);
+        assert_eq!(user.sharp_resource_offset[0][0].offset_dw(), 0x123);
+        assert_eq!(user.sharp_resource_offset[0][0].size(), 1);
+        assert_eq!(mapped.input_semantics[0].raw, 0x1234_5678);
+        assert_eq!(mapped.input_semantics[1].raw, 0x89ab_cdef);
     }
 
     #[test]

@@ -112,6 +112,61 @@ pub(crate) fn read_dwords_checked(_addr: u64, _count: u32) -> Option<Vec<u32>> {
     None
 }
 
+/// VirtualQuery-validated write into identity-mapped guest memory. Used for
+/// Vulkan compute storage-buffer writeback after the queue fence signals.
+#[cfg(windows)]
+pub(crate) fn write_bytes_checked(addr: u64, bytes: &[u8]) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_GUARD, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+
+    if addr == 0 || bytes.is_empty() || bytes.len() > MAX_READ_DWORDS as usize * 4 {
+        return false;
+    }
+    let Some(end) = addr.checked_add(bytes.len() as u64) else {
+        return false;
+    };
+    const WRITABLE: u32 =
+        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    let mut cursor = addr;
+    while cursor < end {
+        // SAFETY: zero is a valid initial state for this output-only Win32 struct.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: VirtualQuery inspects the address space and does not
+        // dereference the queried address.
+        let got = unsafe {
+            VirtualQuery(
+                cursor as *const _,
+                &mut info,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if got == 0
+            || info.State != MEM_COMMIT
+            || (info.Protect & WRITABLE) == 0
+            || (info.Protect & PAGE_GUARD) != 0
+        {
+            return false;
+        }
+        let region_end = info.BaseAddress as u64 + info.RegionSize as u64;
+        if region_end <= cursor {
+            return false;
+        }
+        cursor = region_end;
+    }
+
+    // SAFETY: the complete destination range was just verified committed and
+    // writable. `ptr::copy` tolerates accidental overlap with the source.
+    unsafe { std::ptr::copy(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
+    true
+}
+
+#[cfg(not(windows))]
+pub(crate) fn write_bytes_checked(_addr: u64, _bytes: &[u8]) -> bool {
+    false
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -140,6 +195,18 @@ mod tests {
             None,
             "over the cap"
         );
+    }
+
+    #[test]
+    fn writes_committed_host_memory_identity_mapped() {
+        let mut data = vec![0u32; 4];
+        let replacement = [1u32, 2, 3, 4];
+        let bytes: Vec<u8> = replacement
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        assert!(write_bytes_checked(data.as_mut_ptr() as u64, &bytes));
+        assert_eq!(data, replacement);
     }
 
     #[test]

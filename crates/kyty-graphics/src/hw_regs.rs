@@ -79,14 +79,21 @@ pub struct PsStageRegisters {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CsStageRegisters {
     pub data_addr: u64,
+    pub chksum: u64,
     pub num_thread_x: u32,
     pub num_thread_y: u32,
     pub num_thread_z: u32,
+    pub vgprs: u8,
+    pub sgprs: u8,
+    pub bulky: u8,
+    pub scratch_en: u8,
     pub user_sgpr: u8,
     pub tgid_x_en: u8,
     pub tgid_y_en: u8,
     pub tgid_z_en: u8,
+    pub tg_size_en: u8,
     pub tidig_comp_cnt: u8,
+    pub lds_size: u8,
 }
 
 /// Kyty: HardwareContext.h `EsStageRegisters` (L504).
@@ -507,6 +514,11 @@ impl Shader {
         self.ps.ps_embedded = true;
     }
 
+    /// Kyty: `Shader::SetCsShader` (HardwareContext.h L960).
+    pub fn set_cs_shader(&mut self, regs: CsStageRegisters) {
+        self.cs.cs_regs = regs;
+    }
+
     /// Kyty: `Shader::SetEsShaderBase` (L913). Gen5's "gs instead of vs" wave
     /// puts the vertex-stage code behind the ES base; a real bind clears the
     /// embedded flag.
@@ -536,6 +548,13 @@ impl Shader {
 impl PsStageRegisters {
     /// Kyty: `PsStageRegisters` checksum writes **accumulate** into a u64
     /// across two register writes rather than assigning.
+    pub fn push_chksum(&mut self, value: u32) {
+        self.chksum = (self.chksum << 32) | u64::from(value);
+    }
+}
+
+impl CsStageRegisters {
+    /// Gen5 checksum writes accumulate across the low/high dwords.
     pub fn push_chksum(&mut self, value: u32) {
         self.chksum = (self.chksum << 32) | u64::from(value);
     }

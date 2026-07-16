@@ -78,8 +78,8 @@
 //!    the degradation (rate-limited).
 
 use crate::hw_regs::{
-    ColorAttrib2, ColorAttrib3, ColorInfo, Context, DepthShaderControl, Shader, UserConfig,
-    UserSgprType,
+    ColorAttrib2, ColorAttrib3, ColorInfo, Context, CsStageRegisters, DepthShaderControl, Shader,
+    UserConfig, UserSgprType,
 };
 use crate::pm4;
 use std::collections::BTreeSet;
@@ -235,6 +235,20 @@ pub trait DrawSink {
         draw: &IndexedDraw,
     ) -> Result<(), DrawError> {
         self.draw_index_auto(ctx, ucfg, sh, draw.index_count, draw.flags)
+    }
+
+    /// Kyty: `GraphicsRenderDispatchDirect` (GraphicsRender.cpp L4938).
+    fn dispatch_direct(
+        &mut self,
+        _ctx: &Context,
+        _ucfg: &UserConfig,
+        _sh: &Shader,
+        _groups: [u32; 3],
+        _mode: u32,
+    ) -> Result<(), DrawError> {
+        Err(DrawError(
+            "compute dispatch reached a sink without compute support".to_owned(),
+        ))
     }
 }
 
@@ -435,6 +449,7 @@ impl CommandProcessor {
             pm4::IT_SET_SH_REG => self.cp_op_set_shader_reg(cmd_id, body, offset),
             pm4::IT_SET_UCONFIG_REG => self.cp_op_set_uconfig_reg(cmd_id, body, offset),
             pm4::IT_DRAW_INDEX_AUTO => self.cp_op_draw_index_auto(cmd_id, body, offset, sink),
+            pm4::IT_DISPATCH_DIRECT => self.cp_op_dispatch_direct(cmd_id, body, offset, sink),
             // Kyty: cp_op_draw_index (L2757), raw IT form 0xc0042700.
             pm4::IT_DRAW_INDEX_2 => self.cp_op_draw_index(cmd_id, body, offset, sink),
             pm4::IT_NUM_INSTANCES => {
@@ -546,6 +561,34 @@ impl CommandProcessor {
         }
 
         match r {
+            pm4::R_CS => {
+                let rsrc1 = Self::body_at(body, 3, offset)?;
+                let rsrc2 = Self::body_at(body, 4, offset)?;
+                let regs = CsStageRegisters {
+                    data_addr: (u64::from(Self::body_at(body, 1, offset)?) << 8)
+                        | (u64::from(Self::body_at(body, 2, offset)?) << 40),
+                    // Gen5 delivers the checksum via later COMPUTE_SHADER_CHKSUM
+                    // register writes (push_chksum), not in the R_CS packet.
+                    chksum: 0,
+                    vgprs: pm4::field(rsrc1, pm4::compute_pgm_rsrc1::VGPRS) as u8,
+                    sgprs: pm4::field(rsrc1, pm4::compute_pgm_rsrc1::SGPRS) as u8,
+                    bulky: pm4::field(rsrc1, pm4::compute_pgm_rsrc1::BULKY) as u8,
+                    scratch_en: pm4::field(rsrc2, pm4::compute_pgm_rsrc2::SCRATCH_EN) as u8,
+                    user_sgpr: pm4::field(rsrc2, pm4::compute_pgm_rsrc2::USER_SGPR) as u8,
+                    tgid_x_en: pm4::field(rsrc2, pm4::compute_pgm_rsrc2::TGID_X_EN) as u8,
+                    tgid_y_en: pm4::field(rsrc2, pm4::compute_pgm_rsrc2::TGID_Y_EN) as u8,
+                    tgid_z_en: pm4::field(rsrc2, pm4::compute_pgm_rsrc2::TGID_Z_EN) as u8,
+                    tg_size_en: pm4::field(rsrc2, pm4::compute_pgm_rsrc2::TG_SIZE_EN) as u8,
+                    tidig_comp_cnt: pm4::field(rsrc2, pm4::compute_pgm_rsrc2::TIDIG_COMP_CNT) as u8,
+                    lds_size: pm4::field(rsrc2, pm4::compute_pgm_rsrc2::LDS_SIZE) as u8,
+                    num_thread_x: Self::body_at(body, 5, offset)?,
+                    num_thread_y: Self::body_at(body, 6, offset)?,
+                    num_thread_z: Self::body_at(body, 7, offset)?,
+                };
+                self.sh_ctx.set_cs_shader(regs);
+                Ok(pm4::body_dw(cmd_id))
+            }
+            pm4::R_DISPATCH_DIRECT => self.cp_op_dispatch_direct(cmd_id, body, offset, sink),
             pm4::R_VS_EMBEDDED => {
                 // Kyty: hw_sh_set_vs_embedded (L2367). cmd_id 0xc01b1034.
                 let shader_modifier = Self::body_at(body, 0, offset)?;
@@ -597,6 +640,10 @@ impl CommandProcessor {
                 Ok(pm4::body_dw(cmd_id))
             }
             pm4::R_PUSH_MARKER | pm4::R_POP_MARKER => Ok(pm4::body_dw(cmd_id)),
+            pm4::R_DISPATCH_RESET => {
+                self.reset();
+                Ok(pm4::body_dw(cmd_id))
+            }
             // Sync / flip / memory ops: consumed, not honoured. A draw never
             // observes them, and their side effects (flip queues, label
             // waits) are already applied by the HLE submit decode.
@@ -606,8 +653,7 @@ impl CommandProcessor {
             | pm4::R_ACQUIRE_MEM
             | pm4::R_RELEASE_MEM
             | pm4::R_WAIT_FLIP_DONE
-            | pm4::R_FLIP
-            | pm4::R_DISPATCH_RESET => {
+            | pm4::R_FLIP => {
                 if self.first(SkipKey::Custom(r.0)) {
                     warn!(
                         cmd_id = format_args!("{cmd_id:#010x}"),
@@ -631,6 +677,25 @@ impl CommandProcessor {
                 Ok(pm4::body_dw(cmd_id))
             }
         }
+    }
+
+    /// Kyty: `cp_op_dispatch_direct` (GraphicsRun.cpp L2691).
+    fn cp_op_dispatch_direct(
+        &mut self,
+        cmd_id: u32,
+        body: &[u32],
+        offset: u32,
+        sink: &mut dyn DrawSink,
+    ) -> Result<u32, CpError> {
+        let groups = [
+            Self::body_at(body, 0, offset)?,
+            Self::body_at(body, 1, offset)?,
+            Self::body_at(body, 2, offset)?,
+        ];
+        let mode = Self::body_at(body, 3, offset)?;
+        sink.dispatch_direct(&self.ctx, &self.ucfg, &self.sh_ctx, groups, mode)
+            .map_err(|source| CpError::Draw { offset, source })?;
+        Ok(pm4::body_dw(cmd_id))
     }
 
     /// Kyty: `cp_op_marker` — latches the user-data marker type.
@@ -911,12 +976,9 @@ impl CommandProcessor {
 
     /// Kyty: `hw_ctx_set_screen_scissor` (L~2700). TL and BR in one packet.
     fn hw_ctx_set_screen_scissor(&mut self, values: &[u32], _offset: u32) -> Result<u32, CpError> {
-        let sixteen = |v: u32, f: (u32, u32)| i32::from(pm4::field(v, f) as u16 as i16);
-        let vp = &mut self.ctx.screen_viewport;
-        vp.screen_scissor_left = sixteen(values[0], pm4::pa_sc_screen_scissor::TL_X);
-        vp.screen_scissor_top = sixteen(values[0], pm4::pa_sc_screen_scissor::TL_Y);
-        vp.screen_scissor_right = sixteen(values[1], pm4::pa_sc_screen_scissor::BR_X);
-        vp.screen_scissor_bottom = sixteen(values[1], pm4::pa_sc_screen_scissor::BR_Y);
+        // Direct and indirect register packets must share the same semantics.
+        self.set_context_register(pm4::PA_SC_SCREEN_SCISSOR_TL, values[0]);
+        self.set_context_register(pm4::PA_SC_SCREEN_SCISSOR_BR, values[1]);
         Ok(2)
     }
 
@@ -941,6 +1003,56 @@ impl CommandProcessor {
 
         match reg {
             pm4::CB_TARGET_MASK => self.ctx.render_target_mask = value,
+
+            // Kyty's Gen5 primary-register lists program scissors through
+            // R_CX_REGS_INDIRECT. Keep these as individual setters so direct
+            // SET_CONTEXT_REG and indirect `(offset, value)` pairs converge.
+            pm4::PA_SC_SCREEN_SCISSOR_TL => {
+                use pm4::pa_sc_screen_scissor as f;
+                self.ctx.screen_viewport.screen_scissor_left =
+                    i32::from(pm4::field(value, f::TL_X) as u16 as i16);
+                self.ctx.screen_viewport.screen_scissor_top =
+                    i32::from(pm4::field(value, f::TL_Y) as u16 as i16);
+            }
+            pm4::PA_SC_SCREEN_SCISSOR_BR => {
+                use pm4::pa_sc_screen_scissor as f;
+                self.ctx.screen_viewport.screen_scissor_right =
+                    i32::from(pm4::field(value, f::BR_X) as u16 as i16);
+                self.ctx.screen_viewport.screen_scissor_bottom =
+                    i32::from(pm4::field(value, f::BR_Y) as u16 as i16);
+            }
+            pm4::PA_SC_GENERIC_SCISSOR_TL => {
+                use pm4::pa_sc_offset_scissor as f;
+                let sv = &mut self.ctx.screen_viewport;
+                sv.generic_scissor_left = i32::from(pm4::field(value, f::TL_X) as u16 as i16);
+                sv.generic_scissor_top = i32::from(pm4::field(value, f::TL_Y) as u16 as i16);
+                sv.generic_scissor_window_offset_enable =
+                    pm4::field(value, f::WINDOW_OFFSET_DISABLE) == 0;
+            }
+            pm4::PA_SC_GENERIC_SCISSOR_BR => {
+                use pm4::pa_sc_offset_scissor as f;
+                let sv = &mut self.ctx.screen_viewport;
+                sv.generic_scissor_right = i32::from(pm4::field(value, f::BR_X) as u16 as i16);
+                sv.generic_scissor_bottom = i32::from(pm4::field(value, f::BR_Y) as u16 as i16);
+            }
+            r if r >= pm4::PA_SC_VPORT_SCISSOR_0_TL
+                && r < pm4::PA_SC_VPORT_SCISSOR_0_TL
+                    + (crate::hw_regs::ScreenViewport::VIEWPORTS_MAX as u32 * 2) =>
+            {
+                use pm4::pa_sc_offset_scissor as f;
+                let rel = r - pm4::PA_SC_VPORT_SCISSOR_0_TL;
+                let vp = &mut self.ctx.screen_viewport.viewports[(rel / 2) as usize];
+                if rel & 1 == 0 {
+                    vp.viewport_scissor_left = i32::from(pm4::field(value, f::TL_X) as u16 as i16);
+                    vp.viewport_scissor_top = i32::from(pm4::field(value, f::TL_Y) as u16 as i16);
+                    vp.viewport_scissor_window_offset_enable =
+                        pm4::field(value, f::WINDOW_OFFSET_DISABLE) == 0;
+                } else {
+                    vp.viewport_scissor_right = i32::from(pm4::field(value, f::BR_X) as u16 as i16);
+                    vp.viewport_scissor_bottom =
+                        i32::from(pm4::field(value, f::BR_Y) as u16 as i16);
+                }
+            }
 
             // Shader-facing context registers (Kyty: g_hw_ctx_indirect_func,
             // GraphicsRun.cpp L3805-3825). These feed `ctx.sh_regs`, which the
@@ -1126,6 +1238,7 @@ impl CommandProcessor {
                 .contains(&r) =>
             {
                 let id = r - pm4::SPI_SHADER_USER_DATA_PS_0;
+                tracing::debug!(id, value = format_args!("{value:#010x}"), "PS user SGPR write");
                 self.sh_ctx.ps.ps_user_sgpr.set(id, value, marker);
             }
             r if (pm4::SPI_SHADER_USER_DATA_GS_0..pm4::SPI_SHADER_USER_DATA_GS_0 + SGPRS)
@@ -1135,6 +1248,10 @@ impl CommandProcessor {
                 // Gen5 vertex stage runs as GS, so its user data lands here.
                 let id = r - pm4::SPI_SHADER_USER_DATA_GS_0;
                 self.sh_ctx.vs.gs_user_sgpr.set(id, value, marker);
+            }
+            r if (pm4::COMPUTE_USER_DATA_0..=pm4::COMPUTE_USER_DATA_15).contains(&r) => {
+                let id = r - pm4::COMPUTE_USER_DATA_0;
+                self.sh_ctx.cs.cs_user_sgpr.set(id, value, marker);
             }
             // Gen5 shader binds: plain SH-register writes (Kyty's
             // g_hw_sh_indirect_func table, GraphicsRun.cpp L3995-4100).
@@ -1177,6 +1294,46 @@ impl CommandProcessor {
             // RSRC1 carries VGPR/SGPR allocation and float-mode bits nothing
             // on the ported parse path reads; consumed knowingly, not unknown.
             pm4::SPI_SHADER_PGM_RSRC1_PS | pm4::SPI_SHADER_PGM_RSRC1_GS => {}
+            pm4::COMPUTE_PGM_LO => {
+                let base = self.sh_ctx.cs.cs_regs.data_addr;
+                self.sh_ctx.cs.cs_regs.data_addr =
+                    (base & 0xFFFF_FF00_0000_00FF) | (u64::from(value) << 8);
+            }
+            pm4::COMPUTE_PGM_HI => {
+                let base = self.sh_ctx.cs.cs_regs.data_addr;
+                self.sh_ctx.cs.cs_regs.data_addr =
+                    (base & 0xFFFF_00FF_FFFF_FFFF) | (u64::from(value & 0xFF) << 40);
+            }
+            pm4::COMPUTE_PGM_RSRC1 => {
+                self.sh_ctx.cs.cs_regs.vgprs =
+                    pm4::field(value, pm4::compute_pgm_rsrc1::VGPRS) as u8;
+                self.sh_ctx.cs.cs_regs.sgprs =
+                    pm4::field(value, pm4::compute_pgm_rsrc1::SGPRS) as u8;
+                self.sh_ctx.cs.cs_regs.bulky =
+                    pm4::field(value, pm4::compute_pgm_rsrc1::BULKY) as u8;
+            }
+            pm4::COMPUTE_PGM_RSRC2 => {
+                let regs = &mut self.sh_ctx.cs.cs_regs;
+                regs.scratch_en = pm4::field(value, pm4::compute_pgm_rsrc2::SCRATCH_EN) as u8;
+                regs.user_sgpr = pm4::field(value, pm4::compute_pgm_rsrc2::USER_SGPR) as u8;
+                regs.tgid_x_en = pm4::field(value, pm4::compute_pgm_rsrc2::TGID_X_EN) as u8;
+                regs.tgid_y_en = pm4::field(value, pm4::compute_pgm_rsrc2::TGID_Y_EN) as u8;
+                regs.tgid_z_en = pm4::field(value, pm4::compute_pgm_rsrc2::TGID_Z_EN) as u8;
+                regs.tg_size_en = pm4::field(value, pm4::compute_pgm_rsrc2::TG_SIZE_EN) as u8;
+                regs.tidig_comp_cnt =
+                    pm4::field(value, pm4::compute_pgm_rsrc2::TIDIG_COMP_CNT) as u8;
+                regs.lds_size = pm4::field(value, pm4::compute_pgm_rsrc2::LDS_SIZE) as u8;
+            }
+            pm4::COMPUTE_NUM_THREAD_X => self.sh_ctx.cs.cs_regs.num_thread_x = value,
+            pm4::COMPUTE_NUM_THREAD_Y => self.sh_ctx.cs.cs_regs.num_thread_y = value,
+            pm4::COMPUTE_NUM_THREAD_Z => self.sh_ctx.cs.cs_regs.num_thread_z = value,
+            // Start coordinates, checksum, and RSRC3 do not shape the ported
+            // analyzer or Vulkan pipeline yet, but are consumed knowingly.
+            pm4::COMPUTE_START_X
+            | pm4::COMPUTE_START_Y
+            | pm4::COMPUTE_START_Z
+            | pm4::COMPUTE_PGM_RSRC3 => {}
+            pm4::COMPUTE_SHADER_CHKSUM => self.sh_ctx.cs.cs_regs.push_chksum(value),
             _ => {
                 if self.first(SkipKey::Reg(RegFile::Shader, reg)) {
                     warn!(
@@ -1247,6 +1404,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink {
         draws: Vec<(u32, u32, u32, bool, bool)>,
+        dispatches: Vec<([u32; 3], u32, u64, [u32; 3], u8, u32)>,
         fail: Option<String>,
     }
 
@@ -1268,6 +1426,29 @@ mod tests {
                 ucfg.prim_type,
                 sh.vs.vs_embedded,
                 sh.ps.ps_embedded,
+            ));
+            Ok(())
+        }
+
+        fn dispatch_direct(
+            &mut self,
+            _ctx: &Context,
+            _ucfg: &UserConfig,
+            sh: &Shader,
+            groups: [u32; 3],
+            mode: u32,
+        ) -> Result<(), DrawError> {
+            self.dispatches.push((
+                groups,
+                mode,
+                sh.cs.cs_regs.data_addr,
+                [
+                    sh.cs.cs_regs.num_thread_x,
+                    sh.cs.cs_regs.num_thread_y,
+                    sh.cs.cs_regs.num_thread_z,
+                ],
+                sh.cs.cs_regs.user_sgpr,
+                sh.cs.cs_user_sgpr.value[3],
             ));
             Ok(())
         }
@@ -1546,6 +1727,57 @@ mod tests {
         let mut sink = RecordingSink::default();
         cp.run(&state_and_draw(), &mut sink).expect("draw");
         assert_eq!(sink.draws, [(3, 0, 17, false, false)]);
+    }
+
+    #[test]
+    fn r_cs_and_dispatch_direct_deliver_compute_state_to_sink() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+
+        let rsrc1 = 5 | (7 << 6) | (1 << 24);
+        let rsrc2 = (9 << 1) | (1 << 7) | (1 << 9) | (2 << 11) | (3 << 15);
+        let mut dcb = vec![
+            header(25, pm4::IT_NOP, pm4::R_CS),
+            0x1234,
+            0x2345_6789,
+            0x12,
+            rsrc1,
+            rsrc2,
+            8,
+            4,
+            2,
+        ];
+        dcb.extend(pad(16));
+        dcb.extend_from_slice(&[
+            header(3, pm4::IT_SET_SH_REG, pm4::R_ZERO),
+            pm4::COMPUTE_USER_DATA_0 + 3,
+            0xCAFE_BABE,
+            header(9, pm4::IT_NOP, pm4::R_DISPATCH_DIRECT),
+            11,
+            12,
+            13,
+            0,
+        ]);
+        dcb.extend(pad(4));
+
+        cp.run(&dcb, &mut sink).expect("compute dispatch");
+        assert_eq!(
+            sink.dispatches,
+            [(
+                [11, 12, 13],
+                0,
+                0x12_2345_6789_00,
+                [8, 4, 2],
+                9,
+                0xCAFE_BABE,
+            )]
+        );
+        assert_eq!(cp.get_sh_ctx().cs.cs_regs.vgprs, 5);
+        assert_eq!(cp.get_sh_ctx().cs.cs_regs.sgprs, 7);
+        assert_eq!(cp.get_sh_ctx().cs.cs_regs.bulky, 1);
+        assert_eq!(cp.get_sh_ctx().cs.cs_regs.tgid_x_en, 1);
+        assert_eq!(cp.get_sh_ctx().cs.cs_regs.tgid_z_en, 1);
+        assert_eq!(cp.get_sh_ctx().cs.cs_regs.tidig_comp_cnt, 2);
     }
 
     #[test]
@@ -1950,6 +2182,71 @@ mod tests {
         let rt = &cp.get_ctx().render_targets[0];
         assert_eq!((rt.attrib2.width, rt.attrib2.height), (95, 47));
         assert_eq!(cp.get_ctx().render_target_mask, 0xF);
+    }
+
+    #[test]
+    fn cx_regs_indirect_decodes_the_measured_gen5_scissor_defaults() {
+        let mem = BufMem {
+            base: 0x4000,
+            words: vec![
+                // Minecraft PPSA17221 primary-register state, matching the
+                // AGC/Kyty Gen5 defaults carried by the title's indirect list.
+                pm4::PA_SC_SCREEN_SCISSOR_TL,
+                0,
+                pm4::PA_SC_SCREEN_SCISSOR_BR,
+                0x4000_4000,
+                pm4::PA_SC_GENERIC_SCISSOR_TL,
+                0x8000_0000,
+                pm4::PA_SC_GENERIC_SCISSOR_BR,
+                0x4000_4000,
+                pm4::PA_SC_VPORT_SCISSOR_0_TL,
+                0x8000_0000,
+                pm4::PA_SC_VPORT_SCISSOR_0_BR,
+                0x4000_4000,
+            ],
+        };
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            header(4, pm4::IT_NOP, pm4::R_CX_REGS_INDIRECT),
+            6,
+            0x4000,
+            0,
+        ];
+
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("measured indirect scissor defaults");
+        let sv = &cp.get_ctx().screen_viewport;
+        assert_eq!(
+            (
+                sv.screen_scissor_left,
+                sv.screen_scissor_top,
+                sv.screen_scissor_right,
+                sv.screen_scissor_bottom,
+            ),
+            (0, 0, 0x4000, 0x4000)
+        );
+        assert_eq!(
+            (
+                sv.generic_scissor_left,
+                sv.generic_scissor_top,
+                sv.generic_scissor_right,
+                sv.generic_scissor_bottom,
+                sv.generic_scissor_window_offset_enable,
+            ),
+            (0, 0, 0x4000, 0x4000, false)
+        );
+        let vp = &sv.viewports[0];
+        assert_eq!(
+            (
+                vp.viewport_scissor_left,
+                vp.viewport_scissor_top,
+                vp.viewport_scissor_right,
+                vp.viewport_scissor_bottom,
+                vp.viewport_scissor_window_offset_enable,
+            ),
+            (0, 0, 0x4000, 0x4000, false)
+        );
     }
 
     #[test]

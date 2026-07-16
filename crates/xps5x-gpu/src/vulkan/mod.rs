@@ -13,6 +13,7 @@
 //!
 //! Swapchain presentation via `libSceVideoOut` remains M3.
 
+pub mod compute;
 pub mod instance;
 pub mod offscreen;
 pub mod shaders;

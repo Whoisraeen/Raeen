@@ -14,7 +14,7 @@ use super::instance::VulkanDevice;
 use super::shaders::{triangle_fragment_spirv, triangle_vertex_spirv};
 use ash::{Device, util::Align, vk};
 use std::mem;
-use tracing::info;
+use tracing::debug;
 use xps5x_core::error::GpuError;
 
 /// The color the attachment is cleared to before the draw, as linear RGBA.
@@ -66,6 +66,39 @@ pub fn unorm8(color: [f32; 4]) -> [u8; 4] {
     color.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
+/// One guest vertex-buffer binding uploaded for a draw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexBufferData {
+    pub bytes: Vec<u8>,
+    pub stride: u32,
+}
+
+/// Vulkan's interpretation of one analyzed guest vertex attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VertexAttributeData {
+    pub location: u32,
+    pub binding: u32,
+    pub format: vk::Format,
+    pub offset: u32,
+}
+
+/// One descriptor binding containing an array of storage buffers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageBufferBinding {
+    pub binding: u32,
+    pub buffers: Vec<Vec<u8>>,
+}
+
+/// Per-stage resource ABI used by translated SPIR-V.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShaderStageBinding {
+    pub stage: vk::ShaderStageFlags,
+    pub descriptor_set_slot: u32,
+    pub push_constant_offset: u32,
+    pub push_constants: Vec<u8>,
+    pub storage_buffers: Option<StorageBufferBinding>,
+}
+
 /// Everything one offscreen draw needs, with nothing hardcoded.
 ///
 /// This is the parameter object [`render_draw`] takes so a caller can drive a
@@ -87,9 +120,20 @@ pub struct DrawState<'a> {
     /// geometry from `gl_VertexIndex` (Kyty's embedded VS does exactly this and
     /// declares no input attributes, so binding one would be invalid).
     pub vertices: Option<&'a [[f32; 4]]>,
+    /// Guest-backed vertex buffers and translated Vulkan attributes.
+    pub vertex_buffers: Vec<VertexBufferData>,
+    pub vertex_attributes: Vec<VertexAttributeData>,
+    /// Descriptor sets and push constants required by translated stages.
+    pub stage_bindings: Vec<ShaderStageBinding>,
     pub vertex_count: u32,
     pub vs_spirv: &'a [u32],
     pub fs_spirv: &'a [u32],
+    /// Prior contents of the render target (tightly-packed RGBA,
+    /// `width * height * 4` bytes). When present the attachment is seeded
+    /// with these pixels and `load_op` is LOAD instead of CLEAR — this is
+    /// how successive draws into the same guest render target compose into
+    /// one frame across otherwise independent one-shot draw submissions.
+    pub initial: Option<&'a [u8]>,
 }
 
 impl<'a> DrawState<'a> {
@@ -106,9 +150,13 @@ impl<'a> DrawState<'a> {
             topology: vk::PrimitiveTopology::TRIANGLE_LIST,
             cull_mode: vk::CullModeFlags::NONE,
             vertices: None,
+            vertex_buffers: Vec::new(),
+            vertex_attributes: Vec::new(),
+            stage_bindings: Vec::new(),
             vertex_count: 0,
             vs_spirv,
             fs_spirv,
+            initial: None,
         }
     }
 }
@@ -153,7 +201,7 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<RenderedImag
     res.record_and_submit(state)?;
     let pixels = res.read_back(state.width, state.height)?;
 
-    info!(
+    debug!(
         width = state.width,
         height = state.height,
         vertices = state.vertex_count,
@@ -220,8 +268,15 @@ struct Resources<'a> {
     image_view: vk::ImageView,
     vertex_buffer: vk::Buffer,
     vertex_memory: vk::DeviceMemory,
+    guest_vertex_buffers: Vec<(vk::Buffer, vk::DeviceMemory)>,
+    storage_buffers: Vec<(vk::Buffer, vk::DeviceMemory)>,
+    descriptor_set_layouts: Vec<vk::DescriptorSetLayout>,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_sets: Vec<(u32, vk::DescriptorSet)>,
     readback_buffer: vk::Buffer,
     readback_memory: vk::DeviceMemory,
+    upload_buffer: vk::Buffer,
+    upload_memory: vk::DeviceMemory,
     vertex_module: vk::ShaderModule,
     fragment_module: vk::ShaderModule,
     pipeline_layout: vk::PipelineLayout,
@@ -239,8 +294,15 @@ impl<'a> Resources<'a> {
             image_view: vk::ImageView::null(),
             vertex_buffer: vk::Buffer::null(),
             vertex_memory: vk::DeviceMemory::null(),
+            guest_vertex_buffers: Vec::new(),
+            storage_buffers: Vec::new(),
+            descriptor_set_layouts: Vec::new(),
+            descriptor_pool: vk::DescriptorPool::null(),
+            descriptor_sets: Vec::new(),
             readback_buffer: vk::Buffer::null(),
             readback_memory: vk::DeviceMemory::null(),
+            upload_buffer: vk::Buffer::null(),
+            upload_memory: vk::DeviceMemory::null(),
             vertex_module: vk::ShaderModule::null(),
             fragment_module: vk::ShaderModule::null(),
             pipeline_layout: vk::PipelineLayout::null(),
@@ -256,9 +318,26 @@ impl<'a> Resources<'a> {
 
     fn build(&mut self, state: &DrawState) -> Result<(), GpuError> {
         self.create_render_target(state.width, state.height, state.format)?;
+        if let Some(initial) = state.initial {
+            let expected = state.width as usize * state.height as usize * BYTES_PER_PIXEL as usize;
+            if initial.len() != expected {
+                return Err(GpuError::VulkanInitFailed(format!(
+                    "initial render-target contents are {} bytes; {}x{} needs {expected}",
+                    initial.len(),
+                    state.width,
+                    state.height
+                )));
+            }
+            let (buffer, memory) =
+                self.create_buffer_with_bytes(initial, vk::BufferUsageFlags::TRANSFER_SRC)?;
+            self.upload_buffer = buffer;
+            self.upload_memory = memory;
+        }
         if let Some(vertices) = state.vertices {
             self.create_vertex_buffer(vertices)?;
         }
+        self.create_guest_vertex_buffers(state)?;
+        self.create_stage_resources(state)?;
         self.create_readback_buffer(state.width, state.height)?;
         self.create_pipeline(state)?;
         self.create_command_resources()?;
@@ -283,8 +362,13 @@ impl<'a> Resources<'a> {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            // COLOR_ATTACHMENT to draw into it, TRANSFER_SRC to copy it out.
-            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
+            // COLOR_ATTACHMENT to draw into it, TRANSFER_SRC to copy it out,
+            // TRANSFER_DST to seed it with the target's prior contents.
+            .usage(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+            )
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
@@ -430,6 +514,152 @@ impl<'a> Resources<'a> {
         Ok(())
     }
 
+    fn create_buffer_with_bytes(
+        &self,
+        bytes: &[u8],
+        usage: vk::BufferUsageFlags,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory), GpuError> {
+        if bytes.is_empty() {
+            return Err(GpuError::VulkanInitFailed(
+                "buffer upload requested with no bytes".to_owned(),
+            ));
+        }
+        let size = bytes.len() as vk::DeviceSize;
+        let (buffer, memory) = self.create_buffer(
+            size,
+            usage,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        let ptr = unsafe {
+            self.device()
+                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+        }
+        .map_err(|e| GpuError::VulkanInitFailed(format!("vkMapMemory failed: {e}")))?;
+
+        // SAFETY: `memory` is HOST_VISIBLE and mapped for exactly
+        // `bytes.len()` bytes. No GPU submission can reference it yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+            self.device().unmap_memory(memory);
+        }
+        Ok((buffer, memory))
+    }
+
+    fn create_guest_vertex_buffers(&mut self, state: &DrawState) -> Result<(), GpuError> {
+        for vertex in &state.vertex_buffers {
+            if vertex.stride == 0 || vertex.bytes.len() < vertex.stride as usize {
+                return Err(GpuError::VulkanInitFailed(format!(
+                    "invalid guest vertex buffer: {} bytes, stride {}",
+                    vertex.bytes.len(),
+                    vertex.stride
+                )));
+            }
+            let allocation =
+                self.create_buffer_with_bytes(&vertex.bytes, vk::BufferUsageFlags::VERTEX_BUFFER)?;
+            self.guest_vertex_buffers.push(allocation);
+        }
+        Ok(())
+    }
+
+    fn create_stage_resources(&mut self, state: &DrawState) -> Result<(), GpuError> {
+        let descriptor_stages: Vec<_> = state
+            .stage_bindings
+            .iter()
+            .filter(|stage| stage.storage_buffers.is_some())
+            .collect();
+        if descriptor_stages.is_empty() {
+            return Ok(());
+        }
+
+        for stage in &descriptor_stages {
+            if stage.descriptor_set_slot as usize != self.descriptor_set_layouts.len() {
+                return Err(GpuError::PipelineCreationFailed(format!(
+                    "descriptor set slot {} is not contiguous (expected {})",
+                    stage.descriptor_set_slot,
+                    self.descriptor_set_layouts.len()
+                )));
+            }
+            let storage = stage.storage_buffers.as_ref().expect("filtered above");
+            if storage.buffers.is_empty() {
+                return Err(GpuError::PipelineCreationFailed(
+                    "storage-buffer descriptor array is empty".to_owned(),
+                ));
+            }
+            let bindings = [vk::DescriptorSetLayoutBinding::default()
+                .binding(storage.binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(storage.buffers.len() as u32)
+                .stage_flags(stage.stage)];
+            let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+            // SAFETY: `bindings` remains alive for the call; the returned
+            // layout is retained through pipeline and descriptor-set use.
+            let layout = unsafe { self.device().create_descriptor_set_layout(&info, None) }
+                .map_err(|e| {
+                    GpuError::PipelineCreationFailed(format!("vkCreateDescriptorSetLayout: {e}"))
+                })?;
+            self.descriptor_set_layouts.push(layout);
+        }
+
+        let total_storage: u32 = descriptor_stages
+            .iter()
+            .map(|stage| {
+                stage
+                    .storage_buffers
+                    .as_ref()
+                    .map_or(0, |storage| storage.buffers.len() as u32)
+            })
+            .sum();
+        let pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(total_storage)];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(descriptor_stages.len() as u32)
+            .pool_sizes(&pool_sizes);
+        // SAFETY: the pool-size slice is alive for the call. Pool lifetime is
+        // owned by this resource bundle and outlives all allocated sets.
+        self.descriptor_pool = unsafe { self.device().create_descriptor_pool(&pool_info, None) }
+            .map_err(|e| {
+                GpuError::PipelineCreationFailed(format!("vkCreateDescriptorPool: {e}"))
+            })?;
+
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&self.descriptor_set_layouts);
+        // SAFETY: the pool and every layout are live handles from this device.
+        let sets = unsafe { self.device().allocate_descriptor_sets(&alloc_info) }.map_err(|e| {
+            GpuError::PipelineCreationFailed(format!("vkAllocateDescriptorSets: {e}"))
+        })?;
+
+        for (stage, set) in descriptor_stages.into_iter().zip(sets) {
+            let storage = stage.storage_buffers.as_ref().expect("filtered above");
+            let first_buffer = self.storage_buffers.len();
+            for bytes in &storage.buffers {
+                let allocation =
+                    self.create_buffer_with_bytes(bytes, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+                self.storage_buffers.push(allocation);
+            }
+            let infos: Vec<_> = self.storage_buffers[first_buffer..]
+                .iter()
+                .map(|(buffer, _)| {
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(*buffer)
+                        .offset(0)
+                        .range(vk::WHOLE_SIZE)
+                })
+                .collect();
+            let writes = [vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(storage.binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&infos)];
+            // SAFETY: `set` came from our pool/layout and `infos` names live
+            // buffers retained by this resource bundle.
+            unsafe { self.device().update_descriptor_sets(&writes, &[]) };
+            self.descriptor_sets.push((stage.descriptor_set_slot, set));
+        }
+        Ok(())
+    }
+
     fn create_readback_buffer(&mut self, width: u32, height: u32) -> Result<(), GpuError> {
         let size = vk::DeviceSize::from(width)
             * vk::DeviceSize::from(height)
@@ -457,7 +687,20 @@ impl<'a> Resources<'a> {
         self.vertex_module = self.create_shader_module(state.vs_spirv)?;
         self.fragment_module = self.create_shader_module(state.fs_spirv)?;
 
-        let layout_info = vk::PipelineLayoutCreateInfo::default();
+        let push_ranges: Vec<_> = state
+            .stage_bindings
+            .iter()
+            .filter(|stage| !stage.push_constants.is_empty())
+            .map(|stage| {
+                vk::PushConstantRange::default()
+                    .stage_flags(stage.stage)
+                    .offset(stage.push_constant_offset)
+                    .size(stage.push_constants.len() as u32)
+            })
+            .collect();
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&self.descriptor_set_layouts)
+            .push_constant_ranges(&push_ranges);
         // SAFETY: an empty layout — no descriptor sets or push constants.
         self.pipeline_layout = unsafe { self.device().create_pipeline_layout(&layout_info, None) }
             .map_err(|e| {
@@ -479,19 +722,45 @@ impl<'a> Resources<'a> {
         // only when the caller supplies vertices. A shader that builds its
         // geometry from `gl_VertexIndex` declares no inputs, and binding an
         // attribute it never consumes is invalid.
-        let bindings = [vk::VertexInputBindingDescription::default()
+        let fixture_bindings = [vk::VertexInputBindingDescription::default()
             .binding(0)
             .stride(mem::size_of::<[f32; 4]>() as u32)
             .input_rate(vk::VertexInputRate::VERTEX)];
-        let attributes = [vk::VertexInputAttributeDescription::default()
+        let fixture_attributes = [vk::VertexInputAttributeDescription::default()
             .location(0)
             .binding(0)
             .format(vk::Format::R32G32B32A32_SFLOAT)
             .offset(0)];
-        let vertex_input = if state.vertices.is_some() {
+        let guest_bindings: Vec<_> = state
+            .vertex_buffers
+            .iter()
+            .enumerate()
+            .map(|(binding, data)| {
+                vk::VertexInputBindingDescription::default()
+                    .binding(binding as u32)
+                    .stride(data.stride)
+                    .input_rate(vk::VertexInputRate::VERTEX)
+            })
+            .collect();
+        let guest_attributes: Vec<_> = state
+            .vertex_attributes
+            .iter()
+            .map(|attr| {
+                vk::VertexInputAttributeDescription::default()
+                    .location(attr.location)
+                    .binding(attr.binding)
+                    .format(attr.format)
+                    .offset(attr.offset)
+            })
+            .collect();
+        let vertex_input = if !state.vertex_buffers.is_empty() {
             vk::PipelineVertexInputStateCreateInfo::default()
-                .vertex_binding_descriptions(&bindings)
-                .vertex_attribute_descriptions(&attributes)
+                .vertex_binding_descriptions(&guest_bindings)
+                .vertex_attribute_descriptions(&guest_attributes)
+        } else if state.vertices.is_some() {
+            vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(&fixture_bindings)
+                .vertex_attribute_descriptions(&fixture_attributes)
         } else {
             vk::PipelineVertexInputStateCreateInfo::default()
         };
@@ -638,16 +907,65 @@ impl<'a> Resources<'a> {
         }
         .map_err(|e| GpuError::VulkanInitFailed(format!("vkBeginCommandBuffer: {e}")))?;
 
-        // UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL. Discards existing contents,
-        // which is fine: the render pass clears anyway.
-        self.image_barrier(
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::AccessFlags::empty(),
-            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-        );
+        if state.initial.is_some() {
+            // Seed the attachment with the target's prior contents:
+            // UNDEFINED -> TRANSFER_DST, copy in, then hand off to the
+            // attachment stage so LOAD sees the composed frame so far.
+            self.image_barrier(
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+            );
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                });
+            // SAFETY: the upload buffer holds exactly width*height*4 bytes
+            // (validated in build) and the image was created TRANSFER_DST;
+            // both belong to this device and the command buffer is recording.
+            unsafe {
+                self.device().cmd_copy_buffer_to_image(
+                    self.command_buffer,
+                    self.upload_buffer,
+                    self.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+            }
+            self.image_barrier(
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::COLOR_ATTACHMENT_READ,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            );
+        } else {
+            // UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL. Discards existing
+            // contents, which is fine: the render pass clears anyway.
+            self.image_barrier(
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            );
+        }
 
         let clear = vk::ClearValue {
             color: vk::ClearColorValue {
@@ -657,7 +975,11 @@ impl<'a> Resources<'a> {
         let color_attachment = vk::RenderingAttachmentInfo::default()
             .image_view(self.image_view)
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .load_op(if state.initial.is_some() {
+                vk::AttachmentLoadOp::LOAD
+            } else {
+                vk::AttachmentLoadOp::CLEAR
+            })
             .store_op(vk::AttachmentStoreOp::STORE)
             .clear_value(clear);
         let color_attachments = [color_attachment];
@@ -712,8 +1034,41 @@ impl<'a> Resources<'a> {
             );
             d.cmd_set_viewport(self.command_buffer, 0, &viewports);
             d.cmd_set_scissor(self.command_buffer, 0, &scissors);
-            if state.vertices.is_some() {
+            if !self.guest_vertex_buffers.is_empty() {
+                let buffers: Vec<_> = self
+                    .guest_vertex_buffers
+                    .iter()
+                    .map(|(buffer, _)| *buffer)
+                    .collect();
+                let offsets = vec![0; buffers.len()];
+                d.cmd_bind_vertex_buffers(self.command_buffer, 0, &buffers, &offsets);
+            } else if state.vertices.is_some() {
                 d.cmd_bind_vertex_buffers(self.command_buffer, 0, &[self.vertex_buffer], &[0]);
+            }
+            for stage in &state.stage_bindings {
+                if let Some((_, set)) = self
+                    .descriptor_sets
+                    .iter()
+                    .find(|(slot, _)| *slot == stage.descriptor_set_slot)
+                {
+                    d.cmd_bind_descriptor_sets(
+                        self.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.pipeline_layout,
+                        stage.descriptor_set_slot,
+                        &[*set],
+                        &[],
+                    );
+                }
+                if !stage.push_constants.is_empty() {
+                    d.cmd_push_constants(
+                        self.command_buffer,
+                        self.pipeline_layout,
+                        stage.stage,
+                        stage.push_constant_offset,
+                        &stage.push_constants,
+                    );
+                }
             }
             d.cmd_draw(self.command_buffer, state.vertex_count, 1, 0, 0);
             d.cmd_end_rendering(self.command_buffer);
@@ -831,6 +1186,9 @@ impl<'a> Resources<'a> {
 
 impl Drop for Resources<'_> {
     fn drop(&mut self) {
+        let descriptor_set_layouts = mem::take(&mut self.descriptor_set_layouts);
+        let guest_vertex_buffers = mem::take(&mut self.guest_vertex_buffers);
+        let storage_buffers = mem::take(&mut self.storage_buffers);
         // SAFETY: every handle was created from `self.dev`'s device and is
         // destroyed exactly once, children before parents. `device_wait_idle`
         // ensures no submitted work still references them; its error is ignored
@@ -853,6 +1211,12 @@ impl Drop for Resources<'_> {
             if self.pipeline_layout != vk::PipelineLayout::null() {
                 d.destroy_pipeline_layout(self.pipeline_layout, None);
             }
+            if self.descriptor_pool != vk::DescriptorPool::null() {
+                d.destroy_descriptor_pool(self.descriptor_pool, None);
+            }
+            for layout in descriptor_set_layouts {
+                d.destroy_descriptor_set_layout(layout, None);
+            }
             if self.fragment_module != vk::ShaderModule::null() {
                 d.destroy_shader_module(self.fragment_module, None);
             }
@@ -865,11 +1229,25 @@ impl Drop for Resources<'_> {
             if self.readback_memory != vk::DeviceMemory::null() {
                 d.free_memory(self.readback_memory, None);
             }
+            if self.upload_buffer != vk::Buffer::null() {
+                d.destroy_buffer(self.upload_buffer, None);
+            }
+            if self.upload_memory != vk::DeviceMemory::null() {
+                d.free_memory(self.upload_memory, None);
+            }
             if self.vertex_buffer != vk::Buffer::null() {
                 d.destroy_buffer(self.vertex_buffer, None);
             }
             if self.vertex_memory != vk::DeviceMemory::null() {
                 d.free_memory(self.vertex_memory, None);
+            }
+            for (buffer, memory) in guest_vertex_buffers {
+                d.destroy_buffer(buffer, None);
+                d.free_memory(memory, None);
+            }
+            for (buffer, memory) in storage_buffers {
+                d.destroy_buffer(buffer, None);
+                d.free_memory(memory, None);
             }
             if self.image_view != vk::ImageView::null() {
                 d.destroy_image_view(self.image_view, None);

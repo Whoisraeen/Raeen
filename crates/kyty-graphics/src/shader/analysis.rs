@@ -32,6 +32,7 @@
 //! - `ShaderRecompileVS/PS/CS` (SPIR-V generation + spirv-tools) belong to
 //!   the next batch.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::hw_regs::{
@@ -40,10 +41,10 @@ use super::hw_regs::{
 };
 use super::parse::{ShaderParseError, shader_parse};
 use super::resources::{
-    ShaderBindResources, ShaderComputeInputInfo, ShaderDirectSgprsResources, ShaderGdsResources,
-    ShaderId, ShaderMappedData, ShaderPixelInputInfo, ShaderSamplerResources, ShaderSemantic,
-    ShaderStorageResources, ShaderStorageUsage, ShaderTextureResources, ShaderTextureUsage,
-    ShaderUserData, ShaderVertexInputBuffer, ShaderVertexInputInfo,
+    ShaderBindResources, ShaderBufferResource, ShaderComputeInputInfo, ShaderDirectSgprsResources,
+    ShaderGdsResources, ShaderId, ShaderMappedData, ShaderPixelInputInfo, ShaderSamplerResources,
+    ShaderSemantic, ShaderStorageResources, ShaderStorageUsage, ShaderTextureResources,
+    ShaderTextureUsage, ShaderUserData, ShaderVertexInputBuffer, ShaderVertexInputInfo,
 };
 use super::types::{ShaderCode, ShaderInstructionType, ShaderOperandType, ShaderType};
 
@@ -113,7 +114,7 @@ fn bad_addr(addr: u64) -> ShaderAnalysisError {
 /// (including `addr == 0`, which Kyty guards as `EXIT_NOT_IMPLEMENTED(src ==
 /// nullptr)`).
 pub trait ShaderMemory {
-    fn dwords_at(&self, addr: u64) -> Option<&[u32]>;
+    fn dwords_at(&self, addr: u64) -> Option<Cow<'_, [u32]>>;
 }
 
 /// Kyty: Shader.cpp `ShaderBinaryInfo` (L37) — the 28-byte trailer appended
@@ -387,6 +388,15 @@ pub fn shader_get_storage_buffer(
     info.extended[index] = extended_buffer.is_some();
     info.buffers[index].fields = fields;
     info.buffers_num += 1;
+    tracing::debug!(
+        slot,
+        start_index,
+        fields = format_args!(
+            "[{:#010x}, {:#010x}, {:#010x}, {:#010x}]",
+            fields[0], fields[1], fields[2], fields[3]
+        ),
+        "storage-buffer V# read from user SGPRs"
+    );
     Ok(())
 }
 
@@ -617,7 +627,7 @@ pub fn shader_parse_usage(
     info.gds_pointers = 0;
     info.direct_sgprs = 0;
 
-    let mut extended_buffer: Option<&[u32]> = None;
+    let mut extended_buffer: Option<Cow<'_, [u32]>> = None;
 
     let mut direct_sgprs = [false; UserSgprInfo::SGPRS_MAX];
     for (i, flag) in direct_sgprs.iter_mut().enumerate() {
@@ -640,7 +650,7 @@ pub fn shader_parse_usage(
                         slot,
                         ShaderStorageUsage::ReadOnly,
                         user_sgpr,
-                        extended_buffer,
+                        extended_buffer.as_deref(),
                     )?;
                     info.storage_buffers_readonly += 1;
                 } else {
@@ -651,7 +661,7 @@ pub fn shader_parse_usage(
                         slot,
                         ShaderTextureUsage::ReadOnly,
                         user_sgpr,
-                        extended_buffer,
+                        extended_buffer.as_deref(),
                     )?;
                     info.textures2d_readonly += 1;
                     let last = (bind.textures2d.textures_num - 1) as usize;
@@ -671,7 +681,7 @@ pub fn shader_parse_usage(
                     start,
                     slot,
                     user_sgpr,
-                    extended_buffer,
+                    extended_buffer.as_deref(),
                 )?;
                 info.samplers += 1;
             }
@@ -687,7 +697,7 @@ pub fn shader_parse_usage(
                     slot,
                     ShaderStorageUsage::Constant,
                     user_sgpr,
-                    extended_buffer,
+                    extended_buffer.as_deref(),
                 )?;
                 info.storage_buffers_constant += 1;
             }
@@ -704,7 +714,7 @@ pub fn shader_parse_usage(
                         slot,
                         ShaderStorageUsage::ReadWrite,
                         user_sgpr,
-                        extended_buffer,
+                        extended_buffer.as_deref(),
                     )?;
                     info.storage_buffers_readwrite += 1;
                 } else {
@@ -715,7 +725,7 @@ pub fn shader_parse_usage(
                         slot,
                         ShaderTextureUsage::ReadWrite,
                         user_sgpr,
-                        extended_buffer,
+                        extended_buffer.as_deref(),
                     )?;
                     info.textures2d_readwrite += 1;
                     let last = (bind.textures2d.textures_num - 1) as usize;
@@ -735,7 +745,7 @@ pub fn shader_parse_usage(
                     start,
                     slot,
                     user_sgpr,
-                    extended_buffer,
+                    extended_buffer.as_deref(),
                 )?;
                 info.gds_pointers += 1;
             }
@@ -884,7 +894,22 @@ pub fn shader_parse_usage2(
             continue;
         }
         if sharp.size() != 0 {
-            return Err(ni("texture sharp size != 0"));
+            // Beyond Kyty (upstream EXIT_NOT_IMPLEMENTEDs here): measured in
+            // Minecraft's menu CS, a table-0 sharp with size == 1 is a
+            // 4-dword buffer V# (the shader's writable output), not an
+            // 8-dword texture T#. Bind it as a read-write storage buffer —
+            // the compute path writes such buffers back to guest memory.
+            shader_get_storage_buffer(
+                &mut bind.storage_buffers,
+                &mut direct_sgprs,
+                i32::from(sharp.offset_dw()),
+                slot as i32,
+                ShaderStorageUsage::ReadWrite,
+                user_sgpr,
+                extended_buffer,
+            )?;
+            info.storage_buffers_readwrite += 1;
+            continue;
         }
         shader_get_texture_buffer(
             &mut bind.textures2d,
@@ -902,8 +927,27 @@ pub fn shader_parse_usage2(
         }
     }
 
-    if !user_data.sharp_resource_offset[1].is_empty() {
-        return Err(ni("sharp_resource_count[1] != 0"));
+    for (slot, sharp) in user_data.sharp_resource_offset[1].iter().enumerate() {
+        if sharp.offset_dw() == 0x7fff {
+            continue;
+        }
+        // Beyond Kyty (upstream EXIT_NOT_IMPLEMENTEDs on a non-empty table 1):
+        // measured in Minecraft's menu CS. Mirror the table-0 extension — a
+        // size == 1 sharp is a 4-dword buffer V#, bound read-write. Anything
+        // else stays a named failure until a title shows what it means.
+        if sharp.size() != 1 {
+            return Err(ni("sharp table 1 entry with size != 1"));
+        }
+        shader_get_storage_buffer(
+            &mut bind.storage_buffers,
+            &mut direct_sgprs,
+            i32::from(sharp.offset_dw()),
+            slot as i32,
+            ShaderStorageUsage::ReadWrite,
+            user_sgpr,
+            extended_buffer,
+        )?;
+        info.storage_buffers_readwrite += 1;
     }
 
     for (slot, sharp) in user_data.sharp_resource_offset[2].iter().enumerate() {
@@ -1147,16 +1191,6 @@ pub fn shader_parse_attrib(
         let offset = (va >> 14) & 0xfff;
         let fetch_index = (va >> 26) & 0x1;
 
-        if format != 0 {
-            return Err(ni("attrib: format != 0"));
-        }
-        if offset != 0 {
-            return Err(ni("attrib: offset != 0"));
-        }
-        if fetch_index != 0 {
-            return Err(ni("attrib: fetch_index != 0"));
-        }
-
         if index >= ShaderVertexInputInfo::RES_MAX {
             return Err(ni("attrib: V# index >= RES_MAX"));
         }
@@ -1164,6 +1198,43 @@ pub fn shader_parse_attrib(
         let sharp = buffer
             .get(index * 4..index * 4 + 4)
             .ok_or_else(|| trunc("attrib: V# table read out of bounds"))?;
+
+        if offset != 0 || fetch_index != 0 {
+            let resource = ShaderBufferResource {
+                fields: [sharp[0], sharp[1], sharp[2], sharp[3]],
+            };
+            tracing::warn!(
+                semantic = sem.semantic(),
+                hardware_register = reg,
+                elements = size,
+                descriptor = format_args!("0x{va:08x}"),
+                vsharp_index = index,
+                format,
+                offset,
+                fetch_index,
+                vsharp = format_args!(
+                    "{:08x}:{:08x}:{:08x}:{:08x}",
+                    sharp[0], sharp[1], sharp[2], sharp[3]
+                ),
+                vsharp_base = format_args!("0x{:012x}", resource.base48()),
+                vsharp_stride = resource.stride(),
+                vsharp_format = resource.format(),
+                "Gen5 vertex attribute uses descriptor overrides"
+            );
+        }
+
+        // Gen5 AGC metadata carries a 9-bit source-language vertex format
+        // alongside the V# index. The V# itself is the hardware descriptor
+        // and already contains the RDNA2 unified format consumed by shader
+        // recompilation. For example, Minecraft's observed metadata format
+        // 0x12a accompanies V# unified format 74 (32_32_32 float). Preserve
+        // the V# verbatim rather than rejecting this valid redundant field.
+        if offset != 0 {
+            return Err(ni("attrib: offset != 0"));
+        }
+        if fetch_index != 0 {
+            return Err(ni("attrib: fetch_index != 0"));
+        }
 
         if info.resources_num as usize >= ShaderVertexInputInfo::RES_MAX {
             return Err(ni("attrib: too many vertex resources"));
@@ -1267,7 +1338,7 @@ pub fn shader_get_input_info_vs(
             .dwords_at(shader_addr)
             .ok_or_else(|| bad_addr(shader_addr))?;
         shader_parse_usage(
-            code,
+            &code,
             mem,
             &mut usage,
             &mut info.bind,
@@ -1329,7 +1400,7 @@ pub fn shader_get_input_info_vs(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| ni("vs: input_semantics are not mapped"))?;
 
-        shader_parse_attrib(info, semantics, attrib, buffer)?;
+        shader_parse_attrib(info, semantics, &attrib, &buffer)?;
         shader_detect_buffers(info, ps5)?;
     }
 
@@ -1357,7 +1428,7 @@ pub fn shader_get_input_info_vs(
             .dwords_at(buffer_addr)
             .ok_or_else(|| bad_addr(buffer_addr))?;
 
-        shader_parse_fetch(info, fetch, buffer, next_gen)?;
+        shader_parse_fetch(info, &fetch, &buffer, next_gen)?;
         shader_detect_buffers(info, ps5)?;
     }
 
@@ -1428,7 +1499,7 @@ pub fn shader_get_input_info_ps(
             .dwords_at(regs.ps_regs.data_addr)
             .ok_or_else(|| bad_addr(regs.ps_regs.data_addr))?;
         shader_parse_usage(
-            code,
+            &code,
             mem,
             &mut usage,
             &mut ps_info.bind,
@@ -1461,6 +1532,8 @@ pub fn shader_get_input_info_cs(
     regs: &ComputeShaderInfo,
     _sh: &ShaderRegisters,
     mem: &impl ShaderMemory,
+    shader_map: &ShaderMap,
+    next_gen: bool,
     info: &mut ShaderComputeInputInfo,
 ) -> Result<(), ShaderAnalysisError> {
     info.threads_num[0] = regs.cs_regs.num_thread_x;
@@ -1479,17 +1552,31 @@ pub fn shader_get_input_info_cs(
 
     let mut usage = ShaderParsedUsage::default();
 
-    let code = mem
-        .dwords_at(regs.cs_regs.data_addr)
-        .ok_or_else(|| bad_addr(regs.cs_regs.data_addr))?;
-    shader_parse_usage(
-        code,
-        mem,
-        &mut usage,
-        &mut info.bind,
-        &regs.cs_user_sgpr,
-        i32::from(regs.cs_regs.user_sgpr),
-    )?;
+    if next_gen {
+        let user_data = shader_map
+            .find(regs.cs_regs.data_addr)
+            .and_then(|data| data.user_data.as_ref())
+            .ok_or_else(|| ni("cs: user_data is not mapped"))?;
+        shader_parse_usage2(
+            user_data,
+            &mut usage,
+            &mut info.bind,
+            &regs.cs_user_sgpr,
+            i32::from(regs.cs_regs.user_sgpr),
+        )?;
+    } else {
+        let code = mem
+            .dwords_at(regs.cs_regs.data_addr)
+            .ok_or_else(|| bad_addr(regs.cs_regs.data_addr))?;
+        shader_parse_usage(
+            &code,
+            mem,
+            &mut usage,
+            &mut info.bind,
+            &regs.cs_user_sgpr,
+            i32::from(regs.cs_regs.user_sgpr),
+        )?;
+    }
 
     if usage.samplers > 0 {
         return Err(ni("cs: samplers"));
@@ -1596,7 +1683,7 @@ pub fn shader_get_id_vs(
         let src = mem
             .dwords_at(shader_addr)
             .ok_or_else(|| bad_addr(shader_addr))?;
-        let header = get_binary_info(src).ok_or(ShaderAnalysisError::NoBinaryInfo)?;
+        let header = get_binary_info(&src).ok_or(ShaderAnalysisError::NoBinaryInfo)?;
 
         ret.hash0 = header.hash0;
         ret.crc32 = header.crc32;
@@ -1671,7 +1758,7 @@ pub fn shader_get_id_ps(
         let src = mem
             .dwords_at(regs.ps_regs.data_addr)
             .ok_or_else(|| bad_addr(regs.ps_regs.data_addr))?;
-        let header = get_binary_info(src).ok_or(ShaderAnalysisError::NoBinaryInfo)?;
+        let header = get_binary_info(&src).ok_or(ShaderAnalysisError::NoBinaryInfo)?;
 
         ret.hash0 = header.hash0;
         ret.crc32 = header.crc32;
@@ -1704,7 +1791,7 @@ pub fn shader_get_id_cs(
     let src = mem
         .dwords_at(regs.cs_regs.data_addr)
         .ok_or_else(|| bad_addr(regs.cs_regs.data_addr))?;
-    let header = get_binary_info(src).ok_or(ShaderAnalysisError::NoBinaryInfo)?;
+    let header = get_binary_info(&src).ok_or(ShaderAnalysisError::NoBinaryInfo)?;
 
     let mut ret = ShaderId::default();
     ret.ids.reserve(64);
@@ -1779,13 +1866,13 @@ pub fn shader_parse_vs(
             (regs.gs_regs.chksum & 0xffff_ffff) as u32,
         )
     } else {
-        let header = get_binary_info(src).ok_or(ShaderAnalysisError::NoBinaryInfo)?;
+        let header = get_binary_info(&src).ok_or(ShaderAnalysisError::NoBinaryInfo)?;
         (header.hash0, header.crc32)
     };
 
     code.set_crc32(crc32);
     code.set_hash0(hash0);
-    shader_parse(0, src, &mut code, next_gen)?;
+    shader_parse(0, &src, &mut code, next_gen)?;
 
     Ok(code)
 }
@@ -1821,13 +1908,13 @@ pub fn shader_parse_ps(
             (regs.ps_regs.chksum & 0xffff_ffff) as u32,
         )
     } else {
-        let header = get_binary_info(src).ok_or(ShaderAnalysisError::NoBinaryInfo)?;
+        let header = get_binary_info(&src).ok_or(ShaderAnalysisError::NoBinaryInfo)?;
         (header.hash0, header.crc32)
     };
 
     code.set_crc32(crc32);
     code.set_hash0(hash0);
-    shader_parse(0, src, &mut code, next_gen)?;
+    shader_parse(0, &src, &mut code, next_gen)?;
 
     Ok(code)
 }
@@ -1848,14 +1935,18 @@ pub fn shader_parse_cs(
         return Err(ni("cs: user_sgpr > user sgpr count"));
     }
 
-    let header = get_binary_info(src).ok_or(ShaderAnalysisError::NoBinaryInfo)?;
-
     let mut code = ShaderCode::new();
     code.set_type(ShaderType::Compute);
-
-    code.set_crc32(header.crc32);
-    code.set_hash0(header.hash0);
-    shader_parse(0, src, &mut code, next_gen)?;
+    if let Some(header) = get_binary_info(&src) {
+        code.set_crc32(header.crc32);
+        code.set_hash0(header.hash0);
+    } else if next_gen {
+        code.set_crc32((regs.cs_regs.chksum >> 32) as u32);
+        code.set_hash0(regs.cs_regs.chksum as u32);
+    } else {
+        return Err(ShaderAnalysisError::NoBinaryInfo);
+    }
+    shader_parse(0, &src, &mut code, next_gen)?;
 
     Ok(code)
 }
@@ -1879,14 +1970,14 @@ mod tests {
     }
 
     impl ShaderMemory for TestMem {
-        fn dwords_at(&self, addr: u64) -> Option<&[u32]> {
+        fn dwords_at(&self, addr: u64) -> Option<Cow<'_, [u32]>> {
             if addr == 0 {
                 return None;
             }
             for (base, data) in &self.regions {
                 let end = base + data.len() as u64 * 4;
                 if addr >= *base && addr < end && (addr - base) % 4 == 0 {
-                    return Some(&data[((addr - base) / 4) as usize..]);
+                    return Some(Cow::Borrowed(&data[((addr - base) / 4) as usize..]));
                 }
             }
             None
@@ -2083,6 +2174,27 @@ mod tests {
         assert_eq!(info.resources_num, 1);
         assert_eq!(info.resources[0].fields, [1, 2, 3, 4]);
         assert_eq!(info.resources_dst[0].register_start, 4);
+        assert_eq!(info.resources_dst[0].registers_num, 3);
+    }
+
+    #[test]
+    fn parse_attrib_accepts_measured_gen5_metadata_format() {
+        // Minecraft PPSA17221: semantic 0, V# index 0, AGC metadata format
+        // 0x12a. The hardware V# is authoritative and carries RDNA2 unified
+        // format 74 (32_32_32 float), so it must be preserved verbatim.
+        let sem = ShaderSemantic {
+            raw: (9 << 8) | (3 << 16),
+        };
+        let attrib = [0x0000_2540u32];
+        let sharp = [0x2534_12a0, 0x000c_0000, 4, 0x0004_a3ac];
+        let mut info = ShaderVertexInputInfo::default();
+
+        shader_parse_attrib(&mut info, &[sem], &attrib, &sharp).unwrap();
+
+        assert_eq!(info.resources_num, 1);
+        assert_eq!(info.resources[0].fields, sharp);
+        assert_eq!(info.resources[0].format(), 74);
+        assert_eq!(info.resources_dst[0].register_start, 9);
         assert_eq!(info.resources_dst[0].registers_num, 3);
     }
 
@@ -2420,6 +2532,7 @@ mod tests {
                 tgid_y_en: 0,
                 tgid_z_en: 0,
                 tidig_comp_cnt: 1,
+                ..Default::default()
             },
             cs_user_sgpr: UserSgprInfo {
                 value: [0; 16],
@@ -2436,7 +2549,7 @@ mod tests {
         let (regs, mem) = cs_setup();
         let sh = ShaderRegisters::default();
         let mut info = ShaderComputeInputInfo::default();
-        shader_get_input_info_cs(&regs, &sh, &mem, &mut info).unwrap();
+        shader_get_input_info_cs(&regs, &sh, &mem, &ShaderMap::new(), false, &mut info).unwrap();
 
         assert_eq!(info.threads_num, [8, 4, 1]);
         assert_eq!(info.group_id, [true, false, false]);
@@ -2455,7 +2568,7 @@ mod tests {
         let sh = ShaderRegisters::default();
         let mut info = ShaderComputeInputInfo::default();
         assert!(matches!(
-            shader_get_input_info_cs(&regs, &sh, &mem, &mut info),
+            shader_get_input_info_cs(&regs, &sh, &mem, &ShaderMap::new(), false, &mut info),
             Err(ShaderAnalysisError::NotImplemented { .. })
         ));
     }
@@ -2525,7 +2638,15 @@ mod tests {
         let (cs_regs, cs_mem) = cs_setup();
         let sh = ShaderRegisters::default();
         let mut cs_info = ShaderComputeInputInfo::default();
-        shader_get_input_info_cs(&cs_regs, &sh, &cs_mem, &mut cs_info).unwrap();
+        shader_get_input_info_cs(
+            &cs_regs,
+            &sh,
+            &cs_mem,
+            &ShaderMap::new(),
+            false,
+            &mut cs_info,
+        )
+        .unwrap();
         let cs_id = shader_get_id_cs(&cs_regs, &cs_info, &cs_mem).unwrap();
         assert_eq!(cs_id.hash0, 0xFEED_F00D);
         assert_eq!(cs_id.crc32, 0x0BAD_CAFE);
@@ -2623,6 +2744,10 @@ mod tests {
             shader_parse_cs(&regs, &sh, &mem, false),
             Err(ShaderAnalysisError::NoBinaryInfo)
         ));
+        assert!(
+            shader_parse_cs(&regs, &sh, &mem, true).is_ok(),
+            "Gen5 metadata is supplied out-of-band and has no legacy trailer"
+        );
         // Unmapped address -> BadAddress.
         regs.cs_regs.data_addr = 0x9999_0000;
         assert!(matches!(

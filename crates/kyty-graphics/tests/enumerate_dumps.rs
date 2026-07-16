@@ -13,8 +13,10 @@
 //! ```
 //! Without the env var the test is a no-op (CI has no dumps).
 
-use kyty_graphics::hw_regs::{PixelShaderInfo, ShaderRegisters, VertexShaderInfo};
-use kyty_graphics::shader::analysis::{ShaderMemory, shader_parse_ps, shader_parse_vs};
+use kyty_graphics::hw_regs::{ComputeShaderInfo, PixelShaderInfo, ShaderRegisters, VertexShaderInfo};
+use kyty_graphics::shader::analysis::{
+    ShaderMemory, shader_parse_cs, shader_parse_ps, shader_parse_vs,
+};
 use kyty_graphics::shader::recompile::{RecompileFn, recomp_func};
 use kyty_graphics::shader::types::ShaderCode;
 use std::borrow::Cow;
@@ -57,6 +59,11 @@ fn parse_dump(stage: &str, mem: &DumpMem) -> Result<ShaderCode, String> {
                 let mut ps = PixelShaderInfo::default();
                 ps.ps_regs.data_addr = mem.base;
                 shader_parse_ps(&ps, &sh_regs, mem, next_gen).map_err(|e| e.to_string())
+            }
+            "cs" => {
+                let mut cs = ComputeShaderInfo::default();
+                cs.cs_regs.data_addr = mem.base;
+                shader_parse_cs(&cs, &sh_regs, mem, next_gen).map_err(|e| e.to_string())
             }
             other => Err(format!("unknown stage prefix {other:?}")),
         }

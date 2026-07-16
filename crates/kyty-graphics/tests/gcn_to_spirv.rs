@@ -20,6 +20,8 @@
 //! *derived* from hardware registers by `shader_get_input_info_{vs,ps}` rather
 //! than being filled in by hand.
 
+use std::borrow::Cow;
+
 use kyty_graphics::shader::analysis::SHADER_BINARY_INFO_SENTINEL;
 use kyty_graphics::shader::hw_regs::{PsStageRegisters, VsStageRegisters};
 use kyty_graphics::shader::{
@@ -37,14 +39,14 @@ struct TestMem {
 }
 
 impl ShaderMemory for TestMem {
-    fn dwords_at(&self, addr: u64) -> Option<&[u32]> {
+    fn dwords_at(&self, addr: u64) -> Option<Cow<'_, [u32]>> {
         if addr == 0 {
             return None;
         }
         for (base, data) in &self.regions {
             let end = base + data.len() as u64 * 4;
             if addr >= *base && addr < end && (addr - base) % 4 == 0 {
-                return Some(&data[((addr - base) / 4) as usize..]);
+                return Some(Cow::Borrowed(&data[((addr - base) / 4) as usize..]));
             }
         }
         None

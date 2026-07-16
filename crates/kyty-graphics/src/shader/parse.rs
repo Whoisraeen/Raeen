@@ -1035,6 +1035,7 @@ fn shader_parse_vopc(
         0xc5 => inst.type_ = T::VCmpNeU32,
         0xc6 => inst.type_ = T::VCmpGeU32,
         0xc7 => inst.type_ = T::VCmpTU32,
+        0xd1 => inst.type_ = T::VCmpxLtU32,
         0xd2 => inst.type_ = T::VCmpxEqU32,
         0xd4 => inst.type_ = T::VCmpxGtU32,
         0xd5 => inst.type_ = T::VCmpxNeU32,
@@ -1380,30 +1381,34 @@ fn shader_parse_vop2(
         0x24 => inst.type_ = T::VMbcntHiU32B32,
         0x25 => {
             if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
+                // RDNA2 reuses the slot for the carry-less v_add_nc_u32.
+                inst.type_ = T::VAddNcU32;
+            } else {
+                inst.type_ = T::VAddI32;
+                inst.format = F::VdstSdst2Vsrc0Vsrc1;
+                inst.dst2.type_ = O::VccLo;
+                inst.dst2.size = 2;
             }
-            inst.type_ = T::VAddI32;
-            inst.format = F::VdstSdst2Vsrc0Vsrc1;
-            inst.dst2.type_ = O::VccLo;
-            inst.dst2.size = 2;
         }
         0x26 => {
             if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
+                inst.type_ = T::VSubNcU32;
+            } else {
+                inst.type_ = T::VSubI32;
+                inst.format = F::VdstSdst2Vsrc0Vsrc1;
+                inst.dst2.type_ = O::VccLo;
+                inst.dst2.size = 2;
             }
-            inst.type_ = T::VSubI32;
-            inst.format = F::VdstSdst2Vsrc0Vsrc1;
-            inst.dst2.type_ = O::VccLo;
-            inst.dst2.size = 2;
         }
         0x27 => {
             if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
+                inst.type_ = T::VSubrevNcU32;
+            } else {
+                inst.type_ = T::VSubrevI32;
+                inst.format = F::VdstSdst2Vsrc0Vsrc1;
+                inst.dst2.type_ = O::VccLo;
+                inst.dst2.size = 2;
             }
-            inst.type_ = T::VSubrevI32;
-            inst.format = F::VdstSdst2Vsrc0Vsrc1;
-            inst.dst2.type_ = O::VccLo;
-            inst.dst2.size = 2;
         }
         0x28 => {
             if next_gen {
@@ -1621,6 +1626,7 @@ fn shader_parse_vop3(
         0xc5 => inst.type_ = T::VCmpNeU32,
         0xc6 => inst.type_ = T::VCmpGeU32,
         0xc7 => inst.type_ = T::VCmpTU32,
+        0xd1 => inst.type_ = T::VCmpxLtU32,
         0xd2 => inst.type_ = T::VCmpxEqU32,
         0xd4 => inst.type_ = T::VCmpxGtU32,
         0xd5 => inst.type_ = T::VCmpxNeU32,
@@ -1925,7 +1931,9 @@ fn shader_parse_vop3(
             }
             return Err(ni(dst, S, "v_xad_b32", opcode, pc, b0));
         }
-        0x346 => return Err(ni(dst, S, "v_lshl_add_u32", opcode, pc, b0)),
+        // Legacy's 9-bit VOP3 opcode space ends at 0x1ff, so 0x346 is
+        // unambiguously the RDNA2 (`next_gen`) v_lshl_add_u32.
+        0x346 => inst.type_ = T::VLshlAddU32,
         0x347 => return Err(ni(dst, S, "v_add_lshl_u32", opcode, pc, b0)),
         0x34b => return Err(ni(dst, S, "v_fma_f16", opcode, pc, b0)),
         0x351 => return Err(ni(dst, S, "v_min3_f16", opcode, pc, b0)),
@@ -2250,7 +2258,12 @@ fn shader_parse_smem(
         }
         0x03 => return Err(ni(dst, S, "s_load_dwordx8", opcode, pc, b0)),
         0x04 => return Err(ni(dst, S, "s_load_dwordx16", opcode, pc, b0)),
-        0x08 => return Err(ni(dst, S, "s_buffer_load_dword", opcode, pc, b0)),
+        0x08 => {
+            inst.type_ = T::SBufferLoadDword;
+            inst.format = F::SdstSvSoffset;
+            inst.src[0].size = 4;
+            inst.dst.size = 1;
+        }
         0x09 => return Err(ni(dst, S, "s_buffer_load_dwordx2", opcode, pc, b0)),
         0x0a => {
             inst.type_ = T::SBufferLoadDwordx4;
@@ -3923,11 +3936,13 @@ mod tests {
         assert_eq!(inst.format, F::VdstSdst2Vsrc0Vsrc1);
         assert_eq!((inst.dst2.type_, inst.dst2.size), (O::VccLo, 2));
         assert_eq!(inst.dst.register_id, 1);
-        // ...and rejects on next_gen (Kyty L1237: KYTY_UNKNOWN_OP).
-        let (_, result) = parse(&[dw0, S_ENDPGM], ShaderType::Vertex, true);
-        assert!(matches!(
-            result,
-            Err(ShaderParseError::UnknownOpcode { family: "vop2", .. })
-        ));
+        // ...and on next_gen the same slot is RDNA2's carry-less
+        // v_add_nc_u32 (measured in Minecraft's menu CS): no dst2.
+        let (code, result) = parse(&[dw0, S_ENDPGM], ShaderType::Vertex, true);
+        result.expect("v_add_nc_u32 parses on next_gen");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::VAddNcU32);
+        assert_eq!(inst.format, F::SVdstSVsrc0SVsrc1);
+        assert_eq!(inst.dst2.type_, O::Unknown);
     }
 }

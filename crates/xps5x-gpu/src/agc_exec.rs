@@ -58,6 +58,10 @@ pub struct AgcGpuSession {
     shader_cache: Mutex<crate::shader_fetch::ShaderTranslateCache>,
     /// Draws skipped because a bound guest shader failed translation.
     shader_skip_count: Mutex<u64>,
+    /// Persistent per-render-target pixels (keyed by `CB_COLOR0_BASE`), so
+    /// draws compose into a frame across DCBs instead of each starting from
+    /// a cleared attachment.
+    framebuffers: Mutex<std::collections::HashMap<u64, RenderedImage>>,
 }
 
 impl AgcGpuSession {
@@ -69,6 +73,7 @@ impl AgcGpuSession {
             draw_count: Mutex::new(0),
             shader_cache: Mutex::new(crate::shader_fetch::ShaderTranslateCache::new()),
             shader_skip_count: Mutex::new(0),
+            framebuffers: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -91,6 +96,17 @@ impl AgcGpuSession {
     /// Draws skipped because a bound guest shader failed translation.
     pub fn shader_skip_count(&self) -> u64 {
         *self.shader_skip_count.lock()
+    }
+
+    /// Publish the owned shader metadata produced by AGC shader creation.
+    pub fn map_shader_metadata(
+        &self,
+        code_address: u64,
+        data: kyty_graphics::shader::ShaderMappedData,
+    ) {
+        self.shader_cache
+            .lock()
+            .map_shader_metadata(code_address, data);
     }
 
     /// Last image produced by a draw-bearing DCB, if any.
@@ -127,7 +143,7 @@ impl AgcGpuSession {
         // State-only DCBs are still real GPU work. Process them without
         // forcing Vulkan initialization so their register writes are latched
         // for the next submission.
-        if decoded.draw_packets == 0 {
+        if decoded.draw_packets == 0 && decoded.dispatch_packets == 0 {
             let mut sink = StateOnlySink;
             cp.run_with_memory(
                 words,
@@ -147,7 +163,8 @@ impl AgcGpuSession {
         })?;
 
         let mut cache = self.shader_cache.lock();
-        let mut sink = OffscreenDrawSink::new(device, &mut cache);
+        let mut framebuffers = self.framebuffers.lock();
+        let mut sink = OffscreenDrawSink::new(device, &mut cache, &mut framebuffers);
         // Indirect register/draw packets carry guest pointers; the identity
         // map makes them host-readable (VirtualQuery-validated).
         let run = cp.run_with_memory(
