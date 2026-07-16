@@ -460,7 +460,55 @@ fn main() -> anyhow::Result<()> {
                 d.name, d.image_offset, d.exports, d.unresolved
             );
         }
-        let linked = std::sync::Arc::new(process.linked);
+        // Diagnostic: XPS5X_TRAP_CXA_THROW patches the eboot's STATICALLY-LINKED
+        // __cxa_throw (which is not an import, so it can't be redirected by the
+        // linker) so the C++ exception a title's worker threads throw gets
+        // NAMED. The function is found by its relocation-free prologue
+        // fingerprint (matched against libc.prx's copy); each hit's entry is
+        // overwritten with `movabs rax, <trampoline>; jmp rax` into an appended
+        // libc::__cxa_throw HLE trampoline. __cxa_throw is noreturn, so the
+        // trap only reads tinfo and exits the thread — the original prologue is
+        // never needed. Gated so normal runs are untouched.
+        let mut linked = process.linked;
+        if std::env::var_os("XPS5X_TRAP_CXA_THROW").is_some() {
+            // Prologue of __cxa_throw up to its first relative call — the
+            // relocation-free bytes are a reliable fingerprint (see libc.prx
+            // +0x18a30): push rbp; mov rbp,rsp; push r15..rbx; push rax;
+            // mov r14,rdx; mov r15,rsi; mov r12,rdi.
+            const PROLOGUE: &[u8] = &[
+                0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50,
+                0x49, 0x89, 0xd6, 0x49, 0x89, 0xf7, 0x49, 0x89, 0xfc,
+            ];
+            let tramp_addr = xps5x_firmware::dynlib::linker::HLE_TRAMPOLINE_BASE
+                + (linked.hle_trampolines.len() as u64) * 8;
+            linked.hle_trampolines.push(xps5x_firmware::HleTrampoline {
+                library: "libc".to_string(),
+                function: "__cxa_throw".to_string(),
+                addr: tramp_addr,
+            });
+            let mut patch = Vec::with_capacity(12);
+            patch.extend_from_slice(&[0x48, 0xb8]); // movabs rax, imm64
+            patch.extend_from_slice(&tramp_addr.to_le_bytes());
+            patch.extend_from_slice(&[0xff, 0xe0]); // jmp rax
+            let mut patched = 0usize;
+            let mut search = 0usize;
+            while let Some(rel) = linked.image[search..]
+                .windows(PROLOGUE.len())
+                .position(|w| w == PROLOGUE)
+            {
+                let at = search + rel;
+                linked.image[at..at + patch.len()].copy_from_slice(&patch);
+                info!(
+                    "__cxa_throw trap: patched eboot __cxa_throw at guest {:#x} -> trampoline {:#x}",
+                    xps5x_runtime::GUEST_ARENA_BASE + at as u64,
+                    tramp_addr
+                );
+                patched += 1;
+                search = at + patch.len();
+            }
+            info!("__cxa_throw trap: patched {patched} internal copies, trampoline at {tramp_addr:#x}");
+        }
+        let linked = std::sync::Arc::new(linked);
         info!(
             "loaded: entry={:#x} image={:#x} byte(s) resolved={} unresolved={}",
             linked.entry,

@@ -256,6 +256,7 @@ static LAST_HLE_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 static LAST_HLE_RETURN: AtomicU64 = AtomicU64::new(0);
 static TRACE_HLE: OnceLock<bool> = OnceLock::new();
 static TRACE_HLE_INDEX: OnceLock<Option<u64>> = OnceLock::new();
+static TRACE_EINVAL: OnceLock<bool> = OnceLock::new();
 
 /// The number of FS-base re-arms performed since process start — see
 /// [`FSBASE_REARMS`]. Monotonic; never reset.
@@ -1464,6 +1465,15 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 context.Rax = value;
                 context.EFlags &= !1;
                 tracing::debug!("Orbis syscall {number}({args:x?}) -> {value:#x}");
+                if value == 22
+                    && *TRACE_EINVAL
+                        .get_or_init(|| std::env::var_os("XPS5X_TRACE_EINVAL").is_some())
+                {
+                    tracing::warn!(
+                        "EINVAL(22) from syscall {number}({args:x?}) on thread {}",
+                        ctx.current_thread()
+                    );
+                }
             }
             Err(error) => {
                 let errno = match error {
@@ -1881,6 +1891,35 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             let ret = hle
                 .call(&hle_ctx, &t.library, &t.function, &args)
                 .unwrap_or(0);
+            // Diagnostic: surface every EINVAL (22) an HLE call returns, so a
+            // std::system_error("invalid argument") thrown by a guest C++
+            // threading primitive can be traced to the exact HLE function and
+            // arguments that produced it.
+            // Any small non-zero errno, or an SCE 0x8002_xxxx error — a PS5
+            // title's own libc wrappers can map an unexpected one to EINVAL and
+            // throw. `scePthreadGetthreadid`/`scePthreadSelf` legitimately
+            // return small thread ids, so exclude them.
+            let is_error_return = (ret != 0 && ret < 0x100)
+                || (ret >= 0x8002_0000 && ret < 0x8003_0000);
+            let is_thread_id_fn =
+                t.function.contains("Getthreadid") || t.function.contains("PthreadSelf");
+            if is_error_return
+                && !is_thread_id_fn
+                && *TRACE_EINVAL.get_or_init(|| std::env::var_os("XPS5X_TRACE_EINVAL").is_some())
+            {
+                tracing::warn!(
+                    "errno-return ({ret:#x}) from {}::{} args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}] (thread {})",
+                    t.library,
+                    t.function,
+                    args[0],
+                    args[1],
+                    args[2],
+                    args[3],
+                    args[4],
+                    args[5],
+                    ctx.current_thread(),
+                );
+            }
             ctx.active_hle.set(None);
             HLE_EXITS.fetch_add(1, Ordering::Relaxed);
             if ctx.process_is_terminating() {
