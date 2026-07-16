@@ -116,10 +116,9 @@ fn hle_commit(ctx: &HleContext, args: &[u64]) -> u64 {
     // descriptor whose leading u32 is the transaction resource returned by
     // `sceSaveDataCreateTransactionResource`; the mount is implicit in the
     // preceding prepare/mount operation.
-    let direct_mount = request.starts_with(MOUNT_POINT)
-        && request.get(MOUNT_POINT.len()).copied().unwrap_or(1) == 0;
+    let direct_prefix = savedata_prefix(&request);
     let resource = i32::from_le_bytes(request[..4].try_into().expect("fixed slice"));
-    if !direct_mount
+    if direct_prefix.is_none()
         && !ctx
             .kernel
             .save_data_transaction_resources
@@ -136,19 +135,46 @@ fn hle_commit(ctx: &HleContext, args: &[u64]) -> u64 {
         return 0x809F_000B;
     }
 
-    let mount = "/savedata0";
-
-    match ctx.kernel.filesystem.sync_mount(mount) {
-        Ok(flushed) => {
-            ctx.kernel.save_data_transaction_resources.clear();
-            debug!("sceSaveDataCommit('{mount}') -> flushed {flushed} descriptor(s)");
-            SCE_OK
+    // Direct form: flush that one mount. Resource form: the mount is
+    // implicit, so flush every active save-data container — or the boot
+    // `/savedata0` mapping when no slot is mounted (files can be open under
+    // it directly).
+    let mounts = match direct_prefix {
+        Some(prefix) => vec![prefix],
+        None => {
+            let prefixes = ctx.kernel.filesystem.savedata_mount_prefixes();
+            if prefixes.is_empty() {
+                vec!["/savedata0".to_owned()]
+            } else {
+                prefixes
+            }
         }
-        Err(error) => {
-            warn!("sceSaveDataCommit('{mount}') failed: {error}");
-            0x809F_000B
+    };
+    let mut flushed = 0usize;
+    for mount in &mounts {
+        match ctx.kernel.filesystem.sync_mount(mount) {
+            Ok(count) => flushed += count,
+            Err(error) => {
+                warn!("sceSaveDataCommit('{mount}') failed: {error}");
+                return 0x809F_000B;
+            }
         }
     }
+    ctx.kernel.save_data_transaction_resources.clear();
+    debug!("sceSaveDataCommit({mounts:?}) -> flushed {flushed} descriptor(s)");
+    SCE_OK
+}
+
+/// Parse a NUL-terminated `/savedataN` mount-point string from the head of a
+/// 16-byte-or-larger request block. Returns `None` when the bytes are not a
+/// save-data mount point (the native opaque-descriptor form).
+fn savedata_prefix(request: &[u8]) -> Option<String> {
+    let head = &request[..request.len().min(16)];
+    let len = head.iter().position(|byte| *byte == 0)?;
+    let text = std::str::from_utf8(&head[..len]).ok()?;
+    let digits = text.strip_prefix("/savedata")?;
+    (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| text.to_owned())
 }
 
 /// Allocate a process-local transaction resource and retain the requested
@@ -215,14 +241,9 @@ fn hle_set_param(ctx: &HleContext, args: &[u64]) -> u64 {
     if !ctx.mem.read(mount_point, &mut mount_bytes) {
         return 0x8002_000E;
     }
-    let mount_len = mount_bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(mount_bytes.len());
-    let mount = String::from_utf8_lossy(&mount_bytes[..mount_len]).into_owned();
-    if mount != "/savedata0" {
+    let Some(mount) = savedata_prefix(&mount_bytes) else {
         return 0x809F_000B;
-    }
+    };
 
     let expected_size = match parameter_type {
         0 => 0x530,
@@ -265,13 +286,9 @@ fn hle_get_mount_info(ctx: &HleContext, args: &[u64]) -> u64 {
     if !ctx.mem.read(mount_point, &mut mount_bytes) {
         return 0x8002_000E;
     }
-    let mount_len = mount_bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(mount_bytes.len());
-    if &mount_bytes[..mount_len] != MOUNT_POINT
-        || ctx.kernel.filesystem.resolve_path("/savedata0").is_none()
-    {
+    let valid = savedata_prefix(&mount_bytes)
+        .is_some_and(|mount| ctx.kernel.filesystem.resolve_path(&mount).is_some());
+    if !valid {
         return 0x809F_000B;
     }
 
@@ -419,9 +436,39 @@ fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
     SCE_OK
 }
 
-fn hle_unmount(ctx: &HleContext, _args: &[u64]) -> u64 {
-    ctx.kernel.filesystem.unmount_savedata_slot();
-    SCE_OK
+/// `sceSaveDataUmount(const SceSaveDataMountPoint*)`: unmount the specific
+/// point named in the 16-byte argument. Titles hold several containers
+/// mounted concurrently, so unmounting "whatever is mounted" corrupts the
+/// others.
+fn hle_unmount(ctx: &HleContext, args: &[u64]) -> u64 {
+    // Two ABI generations: PS4-compat `Umount(const SceSaveDataMountPoint*)`
+    // passes the pointer first; the measured native PS5 form passes it
+    // second (arg0 is 0). Take the first argument that dereferences to a
+    // `/savedataN` string.
+    let prefix = args.iter().take(2).find_map(|&candidate| {
+        if candidate == 0 {
+            return None;
+        }
+        let mut mount_bytes = [0u8; 16];
+        if !ctx.mem.read(candidate, &mut mount_bytes) {
+            return None;
+        }
+        savedata_prefix(&mount_bytes)
+    });
+    let Some(prefix) = prefix else {
+        warn!(
+            args = ?&args[..args.len().min(4)],
+            "sceSaveDataUmount: no argument dereferences to a /savedataN mount point"
+        );
+        return ERROR_PARAMETER;
+    };
+    if ctx.kernel.filesystem.unmount_savedata_slot(&prefix) {
+        debug!("sceSaveDataUmount('{prefix}') -> OK");
+        SCE_OK
+    } else {
+        warn!("sceSaveDataUmount('{prefix}'): not a mounted save-data point");
+        ERROR_NOT_FOUND
+    }
 }
 
 /// `sceSaveDataMount{,2,3}(const SceSaveDataMount* mount,
@@ -480,23 +527,26 @@ fn hle_mount(ctx: &HleContext, args: &[u64]) -> u64 {
     if !existed && std::fs::create_dir_all(&slot_path).is_err() {
         return ERROR_INTERNAL;
     }
-    if let Err(error) = ctx.kernel.filesystem.mount_savedata_slot(dir_name) {
-        warn!("sceSaveDataMount3('{dir_name}') failed: {error}");
-        return ERROR_INTERNAL;
-    }
+    let prefix = match ctx.kernel.filesystem.mount_savedata_slot(dir_name) {
+        Ok((prefix, _path)) => prefix,
+        Err(error) => {
+            warn!("sceSaveDataMount3('{dir_name}') failed: {error}");
+            return ERROR_INTERNAL;
+        }
+    };
 
     // SceSaveDataMountResult (64 bytes): mountPoint.data[16] at offset 0,
     // then mountStatus/requiredBlocks/... (left zero).
     let mut result = [0u8; MOUNT_RESULT_SIZE];
-    result[..MOUNT_POINT.len()].copy_from_slice(MOUNT_POINT);
+    result[..prefix.len().min(15)].copy_from_slice(&prefix.as_bytes()[..prefix.len().min(15)]);
     result[0x1c..0x20].copy_from_slice(&u32::from(create_if_missing && !existed).to_le_bytes());
-    // result[MOUNT_POINT.len()] stays 0 — the NUL terminator.
+    // The byte after the prefix stays 0 — the NUL terminator.
     if !ctx.mem.write(result_ptr, &result) {
         warn!("sceSaveDataMount: result out-ptr {result_ptr:#x} not writable");
         return ERROR_PARAMETER;
     }
     debug!(
-        "sceSaveDataMount3(user={user_id}, dir='{dir_name}', blocks={blocks}, system_blocks={system_blocks}, mount_mode={mount_mode:#x}, resource={resource}, mode={mode}) -> /savedata0"
+        "sceSaveDataMount3(user={user_id}, dir='{dir_name}', blocks={blocks}, system_blocks={system_blocks}, mount_mode={mount_mode:#x}, resource={resource}, mode={mode}) -> {prefix}"
     );
     SCE_OK
 }
@@ -624,11 +674,16 @@ mod tests {
             Some(root.join("slot00000001@world/level.dat"))
         );
         assert!(root.join("slot00000001@world").is_dir());
-        hle_unmount(&ctx, &[]);
+        // Umount takes the SceSaveDataMountPoint written by mount.
+        assert!(mem.write(0x400, b"/savedata0\0"));
+        assert_eq!(hle_unmount(&ctx, &[0x400]), SCE_OK);
         assert_eq!(
             kernel.filesystem.resolve_path("/savedata0"),
             Some(root.clone())
         );
+        // A second unmount of the same point reports it isn't mounted.
+        assert_eq!(hle_unmount(&ctx, &[0x400]), ERROR_NOT_FOUND);
+        assert_eq!(hle_unmount(&ctx, &[0]), ERROR_PARAMETER);
 
         let _ = std::fs::remove_dir_all(root);
     }

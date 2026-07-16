@@ -76,6 +76,11 @@ pub struct VirtualFileSystem {
     /// this root while a save slot is mounted, so save-slot enumeration must
     /// not derive its root from the current guest mount.
     savedata_root: RwLock<PathBuf>,
+    /// Active save-slot mounts: index `N` holds the slot directory mounted at
+    /// `/savedataN`. The real service hands out up to 16 concurrent mount
+    /// points, and titles (Minecraft) hold several mounted at once from
+    /// different threads — a single rebound `/savedata0` corrupts them all.
+    savedata_mounts: RwLock<[Option<String>; 16]>,
     /// Open file descriptors.
     open_files: RwLock<HashMap<Fd, OpenFile>>,
     /// Next file descriptor to assign.
@@ -95,6 +100,7 @@ impl VirtualFileSystem {
         let vfs = Self {
             mounts: RwLock::new(Vec::new()),
             savedata_root: RwLock::new(PathBuf::from("savedata")),
+            savedata_mounts: RwLock::new(std::array::from_fn(|_| None)),
             open_files: RwLock::new(HashMap::new()),
             next_fd: RwLock::new(3), // 0=stdin, 1=stdout, 2=stderr.
         };
@@ -200,18 +206,70 @@ impl VirtualFileSystem {
         Ok(self.savedata_root().join(slot_name))
     }
 
-    /// Remap `/savedata0` to one validated save slot. Directory creation and
-    /// mount-mode policy remain the save-data service's responsibility.
-    pub fn mount_savedata_slot(&self, slot_name: &str) -> Result<PathBuf, std::io::Error> {
+    /// Mount one validated save slot at the first free `/savedataN` point
+    /// (N in 0..16, matching the real service) and return that prefix plus
+    /// the host path. Mounting an already-mounted slot returns its existing
+    /// point — the real API errors BUSY there, and idempotency is the safer
+    /// HLE degradation. Directory creation and mount-mode policy remain the
+    /// save-data service's responsibility.
+    pub fn mount_savedata_slot(&self, slot_name: &str) -> Result<(String, PathBuf), std::io::Error> {
         let path = self.savedata_slot_path(slot_name)?;
-        self.set_mount_directory("/savedata0", &path);
-        Ok(path)
+        let mut slots = self.savedata_mounts.write();
+        if let Some(index) = slots
+            .iter()
+            .position(|slot| slot.as_deref() == Some(slot_name))
+        {
+            return Ok((format!("/savedata{index}"), path));
+        }
+        let Some(index) = slots.iter().position(Option::is_none) else {
+            return Err(std::io::Error::other(
+                "all 16 save-data mount points are in use",
+            ));
+        };
+        slots[index] = Some(slot_name.to_owned());
+        drop(slots);
+        let prefix = format!("/savedata{index}");
+        self.set_mount_directory(&prefix, &path);
+        Ok((prefix, path))
     }
 
-    /// Drop the active slot mapping while retaining the title-level root.
-    pub fn unmount_savedata_slot(&self) {
-        let root = self.savedata_root();
-        self.set_mount_directory("/savedata0", &root);
+    /// Unmount the save slot at `prefix` (`/savedataN`). Returns whether a
+    /// slot was actually mounted there. `/savedata0` reverts to the
+    /// title-level root (its boot-time mapping); higher points are removed.
+    pub fn unmount_savedata_slot(&self, prefix: &str) -> bool {
+        let prefix = normalize_mount_root(prefix);
+        let Some(index) = prefix
+            .strip_prefix("/savedata")
+            .and_then(|digits| digits.parse::<usize>().ok())
+        else {
+            return false;
+        };
+        let mut slots = self.savedata_mounts.write();
+        if index >= slots.len() || slots[index].is_none() {
+            return false;
+        }
+        slots[index] = None;
+        drop(slots);
+        if index == 0 {
+            let root = self.savedata_root();
+            self.set_mount_directory("/savedata0", &root);
+        } else {
+            let mut mounts = self.mounts.write();
+            mounts.retain(|mount| mount.ps5_prefix != prefix);
+        }
+        true
+    }
+
+    /// Active save-slot mount prefixes, for whole-service operations
+    /// (commit) that flush every mounted container.
+    pub fn savedata_mount_prefixes(&self) -> Vec<String> {
+        self.savedata_mounts
+            .read()
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.is_some())
+            .map(|(index, _)| format!("/savedata{index}"))
+            .collect()
     }
 
     fn set_mount_directory(&self, guest_root: &str, path: &std::path::Path) {
@@ -1052,7 +1110,8 @@ mod tests {
         let vfs = VirtualFileSystem::new();
         vfs.set_savedata_directory(&root);
 
-        let slot_path = vfs.mount_savedata_slot("slot00000001@world").unwrap();
+        let (prefix, slot_path) = vfs.mount_savedata_slot("slot00000001@world").unwrap();
+        assert_eq!(prefix, "/savedata0");
         assert_eq!(slot_path, root.join("slot00000001@world"));
         assert_eq!(vfs.savedata_root(), root);
         assert_eq!(
@@ -1062,8 +1121,47 @@ mod tests {
         assert!(vfs.mount_savedata_slot("../escape").is_err());
         assert!(vfs.mount_savedata_slot("nested/escape").is_err());
 
-        vfs.unmount_savedata_slot();
+        assert!(vfs.unmount_savedata_slot("/savedata0"));
         assert_eq!(vfs.resolve_path("/savedata0"), Some(root.clone()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_savedata_slots_get_distinct_mount_points() {
+        let root = temp_dir("savedata-multi");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_savedata_directory(&root);
+
+        let (settings, _) = vfs.mount_savedata_slot("BedrockUserSettingsStorage").unwrap();
+        let (cache, _) = vfs.mount_savedata_slot("BedrockLevelInfoCache").unwrap();
+        assert_eq!(settings, "/savedata0");
+        assert_eq!(cache, "/savedata1");
+        // Each point resolves into its own container — the second mount must
+        // not have rebound the first.
+        assert_eq!(
+            vfs.resolve_path("/savedata0/options.txt"),
+            Some(root.join("BedrockUserSettingsStorage/options.txt"))
+        );
+        assert_eq!(
+            vfs.resolve_path("/savedata1/cache.bin"),
+            Some(root.join("BedrockLevelInfoCache/cache.bin"))
+        );
+        // Re-mounting a mounted slot is idempotent, not a fresh point.
+        let (again, _) = vfs.mount_savedata_slot("BedrockLevelInfoCache").unwrap();
+        assert_eq!(again, "/savedata1");
+        assert_eq!(
+            vfs.savedata_mount_prefixes(),
+            vec!["/savedata0".to_owned(), "/savedata1".to_owned()]
+        );
+
+        // Unmounting one point leaves the other intact.
+        assert!(vfs.unmount_savedata_slot("/savedata1"));
+        assert!(vfs.resolve_path("/savedata1/cache.bin").is_none());
+        assert_eq!(
+            vfs.resolve_path("/savedata0/options.txt"),
+            Some(root.join("BedrockUserSettingsStorage/options.txt"))
+        );
+        assert!(!vfs.unmount_savedata_slot("/savedata1"));
         let _ = std::fs::remove_dir_all(root);
     }
 }

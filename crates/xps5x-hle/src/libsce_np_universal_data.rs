@@ -49,6 +49,43 @@ pub fn register(registry: &HleRegistry) {
         "sceNpUniversalDataSystemDestroyHandle",
         |_, _| OK,
     );
+    registry.register(
+        "libSceNpUniversalDataSystem",
+        "sceNpUniversalDataSystemCreateEvent",
+        hle_create_event,
+    );
+    registry.register(
+        "libSceNpUniversalDataSystem",
+        "sceNpUniversalDataSystemDestroyEvent",
+        |_, _| OK,
+    );
+    // Telemetry sink: accepting the post is all a title observes.
+    registry.register(
+        "libSceNpUniversalDataSystem",
+        "sceNpUniversalDataSystemPostEvent",
+        |_, _| OK,
+    );
+}
+
+/// `sceNpUniversalDataSystemCreateEvent(param*, _, eventOut*, altOut*)` —
+/// SharpEmu: null param is invalid-argument; the new event id is written to
+/// the first writable of args 2/3. Minecraft's activity thread dies without
+/// this ("activityTerminate" events).
+fn hle_create_event(ctx: &HleContext, args: &[u64]) -> u64 {
+    let param = args.first().copied().unwrap_or(0);
+    if param == 0 {
+        return UDS_ERROR_INVALID_ARGUMENT;
+    }
+    let event = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    for out in [
+        args.get(2).copied().unwrap_or(0),
+        args.get(3).copied().unwrap_or(0),
+    ] {
+        if out != 0 && ctx.mem.write(out, &event.to_le_bytes()) {
+            return OK;
+        }
+    }
+    SCE_ERROR_MEMORY_FAULT
 }
 
 /// `sceNpUniversalDataSystemInitialize(param *)`: a null param is a

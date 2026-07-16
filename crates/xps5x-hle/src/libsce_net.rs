@@ -40,6 +40,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceNet", "sceNetNtohs", hle_htons);
     registry.register("libSceNet", "sceNetGetMacAddress", hle_get_mac_address);
     registry.register("libSceNet", "sceNetEtherNtostr", hle_ether_ntostr);
+    registry.register("libSceNet", "sceNetInetPton", hle_inet_pton);
 
     registry.register("libSceNetCtl", "sceNetCtlInit", hle_ok);
     registry.register("libSceNetCtl", "sceNetCtlTerm", hle_ok);
@@ -61,6 +62,38 @@ fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
 /// Hand back a fresh positive handle (pool / resolver).
 fn hle_new_id(_ctx: &HleContext, _args: &[u64]) -> u64 {
     NEXT_NET_ID.fetch_add(1, Ordering::Relaxed) as u64
+}
+
+/// Real `sceNetInetPton(af, const char* src, void* dst)`: parse a textual
+/// address into network-order bytes. `SCE_NET_AF_INET` = 2 (4 bytes out),
+/// `SCE_NET_AF_INET6` = 28 (16 bytes out). Returns 1 on success, 0 for an
+/// unparseable string (matching POSIX inet_pton), EINVAL for a bad family.
+fn hle_inet_pton(ctx: &HleContext, args: &[u64]) -> u64 {
+    let family = args.first().copied().unwrap_or(0) as u32;
+    let src = args.get(1).copied().unwrap_or(0);
+    let dst = args.get(2).copied().unwrap_or(0);
+    if src == 0 || dst == 0 {
+        return NET_ERROR_INVALID_ARGUMENT;
+    }
+    let Some(text) = crate::fmt::read_cstr(ctx.mem, src) else {
+        return NET_ERROR_INVALID_ARGUMENT;
+    };
+    let Ok(text) = std::str::from_utf8(&text) else {
+        return 0;
+    };
+    match family {
+        2 => match text.parse::<std::net::Ipv4Addr>() {
+            Ok(addr) if ctx.mem.write(dst, &addr.octets()) => 1,
+            Ok(_) => NET_ERROR_INVALID_ARGUMENT,
+            Err(_) => 0,
+        },
+        28 => match text.parse::<std::net::Ipv6Addr>() {
+            Ok(addr) if ctx.mem.write(dst, &addr.octets()) => 1,
+            Ok(_) => NET_ERROR_INVALID_ARGUMENT,
+            Err(_) => 0,
+        },
+        _ => NET_ERROR_INVALID_ARGUMENT,
+    }
 }
 
 /// Real `sceNetHtonl(uint32_t)`: host→network (big-endian) byte order.
@@ -182,6 +215,37 @@ mod tests {
         // htonl ∘ ntohl (same fn) is the identity.
         let round = hle_htonl(&ctx, &[hle_htonl(&ctx, &[0xDEAD_BEEF])]);
         assert_eq!(round, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn inet_pton_parses_v4_and_v6_and_rejects_garbage() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x200);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x40, b"192.168.1.20\0"));
+        assert_eq!(hle_inet_pton(&ctx, &[2, 0x40, 0x80]), 1);
+        let mut v4 = [0u8; 4];
+        assert!(mem.read(0x80, &mut v4));
+        assert_eq!(v4, [192, 168, 1, 20]);
+
+        assert!(mem.write(0x100, b"::1\0"));
+        assert_eq!(hle_inet_pton(&ctx, &[28, 0x100, 0x110]), 1);
+        let mut v6 = [0u8; 16];
+        assert!(mem.read(0x110, &mut v6));
+        assert_eq!(v6, std::net::Ipv6Addr::LOCALHOST.octets());
+
+        assert!(mem.write(0x140, b"not-an-address\0"));
+        assert_eq!(hle_inet_pton(&ctx, &[2, 0x140, 0x80]), 0);
+        assert_eq!(
+            hle_inet_pton(&ctx, &[99, 0x40, 0x80]),
+            NET_ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            hle_inet_pton(&ctx, &[2, 0, 0x80]),
+            NET_ERROR_INVALID_ARGUMENT
+        );
     }
 
     #[test]

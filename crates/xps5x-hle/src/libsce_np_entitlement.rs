@@ -20,6 +20,9 @@ const SCE_ERROR_MEMORY_FAULT: u64 = 0x8002_000E;
 const BOOT_PARAM_CLEAR_SIZE: usize = 0x20;
 /// Bytes of the empty add-on-content info list header.
 const EMPTY_ADDCONT_INFO_LIST_SIZE: usize = 0x10;
+/// `SKU_FLAG_FULL` — the retail (non-trial) SKU, matching AppContent's
+/// long-standing 1=trial / 3=full convention.
+const SKU_FLAG_FULL: u32 = 3;
 
 /// Register the libSceNpEntitlementAccess functions.
 pub fn register(registry: &HleRegistry) {
@@ -32,6 +35,11 @@ pub fn register(registry: &HleRegistry) {
         "libSceNpEntitlementAccess",
         "sceNpEntitlementAccessGetAddcontEntitlementInfoList",
         hle_get_addcont_info_list,
+    );
+    registry.register(
+        "libSceNpEntitlementAccess",
+        "sceNpEntitlementAccessGetSkuFlag",
+        hle_get_sku_flag,
     );
 }
 
@@ -51,6 +59,17 @@ fn hle_initialize(ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_get_addcont_info_list(ctx: &HleContext, args: &[u64]) -> u64 {
     let list = args.get(1).copied().unwrap_or(0);
     if list != 0 && !ctx.mem.write(list, &[0u8; EMPTY_ADDCONT_INFO_LIST_SIZE]) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    OK
+}
+
+/// `sceNpEntitlementAccessGetSkuFlag(SceNpEntitlementAccessSkuFlag* flag)`:
+/// reports the retail SKU. Minecraft's main thread calls this right before
+/// bringing up its menu and treats a missing answer as fatal.
+fn hle_get_sku_flag(ctx: &HleContext, args: &[u64]) -> u64 {
+    let flag = args.first().copied().unwrap_or(0);
+    if flag == 0 || !ctx.mem.write(flag, &SKU_FLAG_FULL.to_le_bytes()) {
         return SCE_ERROR_MEMORY_FAULT;
     }
     OK
@@ -90,6 +109,23 @@ mod tests {
             hle_initialize(&ctx, &[0x10, 0xFFFF_0000]),
             SCE_ERROR_MEMORY_FAULT
         );
+    }
+
+    #[test]
+    fn get_sku_flag_reports_full_sku() {
+        let (kernel, mem, alloc) = env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_get_sku_flag(&ctx, &[0x60]), OK);
+        let mut buf = [0u8; 4];
+        assert!(mem.read(0x60, &mut buf));
+        assert_eq!(u32::from_le_bytes(buf), SKU_FLAG_FULL);
+        assert_eq!(hle_get_sku_flag(&ctx, &[0]), SCE_ERROR_MEMORY_FAULT);
+
+        let registry = HleRegistry::new();
+        register(&registry);
+        assert!(registry.registered_names().iter().any(|(library, name)| {
+            library == "libSceNpEntitlementAccess" && name == "sceNpEntitlementAccessGetSkuFlag"
+        }));
     }
 
     #[test]
