@@ -586,6 +586,12 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "write", hle_posix_write);
     registry.register("libkernel", "sceKernelWrite", hle_sce_write);
 
+    // Diagnostic C++ ABI trap — only used when the linker force-routes this
+    // NID (XPS5X_TRAP_CXA_THROW); otherwise the shipped libc's real
+    // __cxa_throw is used. Registered under "libc" so try_hle resolves the
+    // NID name to "libc::__cxa_throw".
+    registry.register_nid("libc", "__cxa_throw", 0xbe4b_ae2d_f867_4992, hle_cxa_throw);
+
     // -- File I/O (real, VFS-backed) --
     registry.register("libkernel", "open", hle_posix_open);
     registry.register("libkernel", "sceKernelOpen", hle_sce_open);
@@ -1898,6 +1904,47 @@ fn hle_reserve_virtual_range(ctx: &HleContext, args: &[u64]) -> u64 {
     }
     debug!("sceKernelReserveVirtualRange(len={len:#x}, align={align:#x}) -> {addr:#x}");
     SCE_OK
+}
+
+/// Diagnostic trap for the C++ ABI `__cxa_throw(void* obj, std::type_info*
+/// tinfo, void (*dest)(void*))`. Reads the thrown exception's type name
+/// (`tinfo->__type_name`, an offset-8 `const char*` in the Itanium ABI) and
+/// logs it, then terminates the calling thread — the exception these worker
+/// threads throw is uncaught anyway, so the end state (dead thread) is the
+/// same, and this NAMES it instead of leaving it anonymous. Only reachable
+/// when the linker force-routes `__cxa_throw` here (XPS5X_TRAP_CXA_THROW);
+/// normal runs use the shipped libc's real `__cxa_throw`.
+fn hle_cxa_throw(ctx: &HleContext, args: &[u64]) -> u64 {
+    let obj = args.first().copied().unwrap_or(0);
+    let tinfo = args.get(1).copied().unwrap_or(0);
+    let thread = ctx.guest_threads.current_thread();
+    let name = ctx
+        .kernel
+        .thread_names
+        .get(&thread)
+        .map_or_else(|| "<unnamed>".to_owned(), |entry| entry.clone());
+
+    let type_name = (tinfo != 0)
+        .then(|| {
+            let mut buf = [0u8; 8];
+            ctx.mem
+                .read(tinfo.wrapping_add(8), &mut buf)
+                .then(|| u64::from_le_bytes(buf))
+                .filter(|p| *p != 0)
+                .and_then(|name_ptr| crate::fmt::read_cstr(ctx.mem, name_ptr))
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        })
+        .flatten()
+        .unwrap_or_else(|| "<unreadable>".to_owned());
+
+    warn!(
+        "__cxa_throw trap: thread {thread} ('{name}') throws C++ exception \
+         type='{type_name}' (obj={obj:#x}, tinfo={tinfo:#x}, ra={:#x}) — \
+         naming the uncaught exception, then terminating the thread",
+        ctx.caller_return_addr
+    );
+    ctx.guest_threads.request_exit(0xa002_0008);
+    0
 }
 
 /// `sceKernelDebugRaiseException*`: the title is reporting a fatal

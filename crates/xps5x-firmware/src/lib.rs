@@ -520,6 +520,13 @@ pub fn load_process(
         let dep_base = base.wrapping_add(next_offset);
         let image_len = dynlib::linker::image_size(&dep.module)? as u64;
         registry.set_policy(needed, registry::ModulePolicy::PreferLle);
+        // Diagnostic: force-route __cxa_throw to the HLE trap so the C++
+        // exception a title's worker threads throw gets NAMED before they die
+        // (the exception is uncaught anyway). Everything else in libc still
+        // uses its real code.
+        if std::env::var_os("XPS5X_TRAP_CXA_THROW").is_some() {
+            registry.force_hle_nid(0xbe4b_ae2d_f867_4992);
+        }
         registry.register_module_exports_at(needed, &dep.dynlib.exports, dep_base);
         tracing::info!(
             "NEEDED {needed}: at +{next_offset:#x} ({image_len:#x} bytes), {} export(s) registered",

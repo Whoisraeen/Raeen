@@ -54,6 +54,11 @@ pub struct ModuleRegistry {
     policies: HashMap<String, ModulePolicy>,
     /// Loaded LLE exports, keyed by NID -> export address.
     lle_exports: HashMap<u64, u64>,
+    /// NIDs forced to resolve HLE-first regardless of the provider module's
+    /// policy — a per-symbol override used to intercept one function of an
+    /// otherwise-LLE module (e.g. trapping `__cxa_throw` inside the shipped
+    /// libc for diagnostics without redirecting libc's malloc/etc).
+    force_hle: std::collections::HashSet<u64>,
 }
 
 impl ModuleRegistry {
@@ -64,7 +69,14 @@ impl ModuleRegistry {
             nid_db,
             policies: HashMap::new(),
             lle_exports: HashMap::new(),
+            force_hle: std::collections::HashSet::new(),
         }
+    }
+
+    /// Force `nid` to resolve HLE-first even when its provider module is
+    /// `PreferLle`. Used for targeted single-symbol interception.
+    pub fn force_hle_nid(&mut self, nid: u64) {
+        self.force_hle.insert(nid);
     }
 
     /// Set the dispatch policy for `module`. Modules with no explicit policy
@@ -116,6 +128,15 @@ impl ModuleRegistry {
     /// such as `libc.prx` can be split between its own stateful implementation
     /// and unrelated HLE functions according to who called it.
     pub fn resolve(&self, hle: &HleRegistry, provider_module: &str, nid: u64) -> Resolver {
+        // A per-symbol force-HLE override wins over the provider's policy, so
+        // one function of an otherwise-LLE module can be intercepted while the
+        // rest of that module keeps using its real code.
+        if self.force_hle.contains(&nid)
+            && let Some(resolved) = self.try_hle(hle, nid)
+        {
+            return resolved;
+        }
+
         let policy = self
             .policies
             .get(&canonical_module_name(provider_module))
