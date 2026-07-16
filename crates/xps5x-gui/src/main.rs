@@ -131,6 +131,19 @@ fn main() -> anyhow::Result<()> {
             dynlib_data.imports.len(),
             dynlib_data.exports.len()
         );
+        // What a module exports is the whole contract a dependent links against,
+        // and "41 exports" says nothing about whether the three symbols a title
+        // actually wants are among them. Minecraft's boot dies on exactly that
+        // gap: MediaDecoders parses 41 exports and none is CreateMP3Decoder.
+        for export in &dynlib_data.exports {
+            println!(
+                "  export nid={:#018x} ({}) vaddr={:#x}  {}",
+                export.nid,
+                xps5x_firmware::dynlib::nid::encode_nid(export.nid),
+                export.value,
+                xps5x_firmware::dynlib::nid_names::describe(export.nid)
+            );
+        }
         println!(
             "resolved HLE trampolines: {}  unresolved: {}",
             linked.hle_trampolines.len(),
