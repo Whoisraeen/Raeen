@@ -159,7 +159,20 @@ pub(crate) fn call_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// How many recent HLE calls [`CallTrace`] remembers.
-const CALL_TRACE_LEN: usize = 256;
+///
+/// 256 was too few to be useful on a real title, and the way it failed is worth
+/// recording. Minecraft's background worker throws a C++ exception, unwinds it,
+/// and then deliberately aborts (`mov dword ptr [0], 0xDEADC0DE`). By the time
+/// it faults, the whole 256-entry window holds nothing but the mutex/free
+/// teardown *after* the throw — the call that actually failed had long since
+/// scrolled out, which is how a savedata task's failure came to look like a
+/// memory bug. The window has to be wide enough to still contain the cause when
+/// the guest finally admits something went wrong.
+///
+/// Costs one fixed array of 40-byte cells per guarded call (~160 KB), sized once
+/// at construction, never grown. `push` stays allocation-free — only the report
+/// allocates, and only after the guest has already stopped.
+const CALL_TRACE_LEN: usize = 4096;
 
 /// A bounded ring of the most recent HLE calls, for explaining a fault.
 ///
@@ -1027,12 +1040,57 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
             recent_strings[start..].join("\n    ")
         );
     }
+    let mut failures = Vec::new();
     for (idx, ret, _args) in entries {
+        let marker = if is_orbis_error(ret) {
+            "  <-- ERROR"
+        } else {
+            ""
+        };
         match trampolines.get(idx as usize) {
-            Some(t) => tracing::warn!("    {}::{} -> {ret:#x}", t.library, t.function),
-            None => tracing::warn!("    <trampoline #{idx}> -> {ret:#x}"),
+            Some(t) => {
+                tracing::warn!("    {}::{} -> {ret:#x}{marker}", t.library, t.function);
+                if !marker.is_empty() {
+                    let item = format!("{}::{} -> {ret:#x}", t.library, t.function);
+                    if !failures.contains(&item) {
+                        failures.push(item);
+                    }
+                }
+            }
+            None => tracing::warn!("    <trampoline #{idx}> -> {ret:#x}{marker}"),
         }
     }
+    // The list above is thousands of lines and almost all of it succeeded. What
+    // a reader actually wants is the handful that did not: a guest that throws,
+    // asserts, or dereferences a null it was handed is usually reacting to one
+    // of these, and picking them out by eye across 4096 entries is not a thing
+    // anyone should have to do.
+    if failures.is_empty() {
+        tracing::warn!("no HLE call returned an Orbis error before this fault");
+    } else {
+        tracing::warn!(
+            "HLE calls that returned an ERROR before this fault ({} distinct) — \
+             the guest's own failure handling usually starts at one of these:\n    {}",
+            failures.len(),
+            failures.join("\n    ")
+        );
+    }
+}
+
+/// Whether an HLE return value looks like an Orbis error code rather than a
+/// result.
+///
+/// Orbis errors are 32-bit and always have the top bit set (`0x8...`), e.g.
+/// `SCE_KERNEL_ERROR_EINVAL = 0x8002_0016`. A legitimate pointer cannot be
+/// confused with one: the guest arena is based at [`crate::GUEST_ARENA_BASE`]
+/// (16 TiB), so every real guest pointer is far wider than 32 bits. A plain
+/// small integer result (a length, a count, a fd) never has bit 31 set either.
+///
+/// This is a heuristic for a *diagnostic*, not a control-flow decision — a false
+/// positive costs one misleading line in a fault report, never a behaviour
+/// change.
+fn is_orbis_error(ret: u64) -> bool {
+    ret <= u32::MAX as u64 && (ret as u32) & 0x8000_0000 != 0
 }
 
 /// The VEH callback. Services `EXCEPTION_ACCESS_VIOLATION`s whose faulting
