@@ -588,9 +588,11 @@ pub fn register(registry: &HleRegistry) {
 
     // Diagnostic C++ ABI trap — only used when the linker force-routes this
     // NID (XPS5X_TRAP_CXA_THROW); otherwise the shipped libc's real
-    // __cxa_throw is used. Registered under "libc" so try_hle resolves the
-    // NID name to "libc::__cxa_throw".
+    // __cxa_throw is used. Registered by NID (for import redirection) AND by
+    // name (so a runtime-patched jump into an appended trampoline dispatches
+    // here via the VEH's name-based hle.call).
     registry.register_nid("libc", "__cxa_throw", 0xbe4b_ae2d_f867_4992, hle_cxa_throw);
+    registry.register("libc", "__cxa_throw", hle_cxa_throw);
 
     // -- File I/O (real, VFS-backed) --
     registry.register("libkernel", "open", hle_posix_open);
@@ -1028,7 +1030,14 @@ fn hle_release_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     if std::env::var_os("XPS5X_TRACE_DIRECT_MEMORY").is_some() {
         warn!("direct-memory trace: release phys={start:#x} len={len:#x}");
     }
-    if start == 0 || len == 0 {
+    // `start` is a physical-memory OFFSET; 0 is a perfectly valid one (a title
+    // whose direct-memory pool begins at physical 0 releases [0, len)). Only a
+    // zero length is invalid. Rejecting start==0 returned SCE EINVAL, and the
+    // title's C++ direct-memory RAII wrapper turned that into an uncaught
+    // std::system_error("invalid argument") that killed its Streaming Pool /
+    // Rendering Pool workers. Release is best-effort/idempotent: freeing an
+    // untracked range is a no-op that still reports success.
+    if len == 0 {
         return SCE_KERNEL_ERROR_EINVAL;
     }
     ctx.alloc.munmap(start, len);
@@ -1924,24 +1933,63 @@ fn hle_cxa_throw(ctx: &HleContext, args: &[u64]) -> u64 {
         .get(&thread)
         .map_or_else(|| "<unnamed>".to_owned(), |entry| entry.clone());
 
+    let read_u64 = |addr: u64| {
+        let mut b = [0u8; 8];
+        ctx.mem
+            .read(addr, &mut b)
+            .then(|| u64::from_le_bytes(b))
+            .filter(|v| *v != 0)
+    };
     let type_name = (tinfo != 0)
         .then(|| {
-            let mut buf = [0u8; 8];
-            ctx.mem
-                .read(tinfo.wrapping_add(8), &mut buf)
-                .then(|| u64::from_le_bytes(buf))
-                .filter(|p| *p != 0)
+            read_u64(tinfo.wrapping_add(8))
                 .and_then(|name_ptr| crate::fmt::read_cstr(ctx.mem, name_ptr))
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         })
         .flatten()
         .unwrap_or_else(|| "<unreadable>".to_owned());
 
+    // Dump the raw exception object and probe each qword for a string, plus a
+    // small int (the errno) — the libc++ system_error layout varies, so show
+    // the shape rather than guess an offset.
+    let mut object_dump = String::new();
+    if obj != 0 {
+        for i in 0..8u64 {
+            let mut b = [0u8; 8];
+            if !ctx.mem.read(obj.wrapping_add(i * 8), &mut b) {
+                break;
+            }
+            let v = u64::from_le_bytes(b);
+            let s = (v > 0x1000 && v < 0x1_0000_0000_0000)
+                .then(|| crate::fmt::read_cstr(ctx.mem, v))
+                .flatten()
+                .filter(|bytes| bytes.iter().all(|c| c.is_ascii_graphic() || *c == b' '))
+                .map(|bytes| format!(" str={:?}", String::from_utf8_lossy(&bytes)))
+                .unwrap_or_default();
+            object_dump.push_str(&format!(" +{}={:#x}{s}", i * 8, v));
+        }
+    }
+    // Stack code-address chain: the frame above __throw_system_error is the
+    // threading primitive (std::mutex/condition_variable/thread) that failed.
+    let mut chain = Vec::new();
+    if ctx.caller_rsp != 0 {
+        for i in 0..96u64 {
+            let mut b = [0u8; 8];
+            if !ctx.mem.read(ctx.caller_rsp.wrapping_add(i * 8), &mut b) {
+                break;
+            }
+            let v = u64::from_le_bytes(b);
+            if (0x1000_0000_0000..0x1000_2000_0000).contains(&v) {
+                chain.push(format!("{v:#x}"));
+            }
+        }
+    }
+
     warn!(
-        "__cxa_throw trap: thread {thread} ('{name}') throws C++ exception \
-         type='{type_name}' (obj={obj:#x}, tinfo={tinfo:#x}, ra={:#x}) — \
-         naming the uncaught exception, then terminating the thread",
-        ctx.caller_return_addr
+        "__cxa_throw trap: thread {thread} ('{name}') throws '{type_name}' \
+         (obj={obj:#x}, ra={:#x}) object[{object_dump} ] stack=[{}]",
+        ctx.caller_return_addr,
+        chain.join(" ")
     );
     ctx.guest_threads.request_exit(0xa002_0008);
     0
