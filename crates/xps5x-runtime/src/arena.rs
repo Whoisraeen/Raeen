@@ -86,6 +86,22 @@ const SYSTEM_MANAGED_LIMIT: u64 = 0x08_0000_0000; // one past 32 GiB
 const USER_MAPPING_MIN: u64 = 0x10_0000_0000; // 64 GiB
 const USER_MAPPING_LIMIT: u64 = 0x00FB_FFC0_0000;
 
+/// Title reservations (`sceKernelReserveVirtualRange`) are placed ABOVE the two
+/// kernel-mapping windows, not inside them.
+///
+/// Measured on Until Dawn / Dragon Ball: both open with a 512 GiB reservation.
+/// Placed by a low-first scan it landed inside `USER_MAPPING` and shredded it —
+/// the window still had hundreds of GiB free, but its largest *contiguous* block
+/// was 510 MiB, so every later 1 GiB `sceKernelAllocateDirectMemory` had nowhere
+/// to go and the title cascaded down to 128 KiB requests and gave up.
+///
+/// A reservation is address space the title picks up and uses directly; unlike
+/// libc's mspace storage it is not validated against the mapping windows, so it
+/// does not need to live in them. Keeping the two apart means one title's huge
+/// reservation can no longer starve the kernel of placeable mapping space.
+/// `[RESERVE_MIN, GUEST_ARENA_BASE)` is ~15 TiB — dozens of such reservations.
+const RESERVE_MIN: u64 = 0x0100_0000_0000; // 1 TiB — above USER_MAPPING_LIMIT
+
 /// Explicit Windows reservations must start on a 64 KiB boundary.
 const WINDOWS_ALLOCATION_GRANULARITY: u64 = 0x1_0000;
 
@@ -266,6 +282,51 @@ fn reserve_guest_address_space(start: u64, limit: u64, length: u64, align: u64) 
         cursor = next;
     }
     None
+}
+
+/// Diagnostic: walk `[start, limit)` and report `(largest_free_block, total_free)`.
+///
+/// Read-only (`VirtualQuery` only). Explains a console-VA placement failure —
+/// exhaustion (little total free) reads very differently from fragmentation
+/// (lots free, no single block big enough) or a placement bug (plenty of both).
+fn survey_free_space(start: u64, limit: u64) -> (u64, u64) {
+    let mut cursor = start;
+    let mut largest = 0u64;
+    let mut total = 0u64;
+    while cursor < limit {
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `VirtualQuery` only inspects the region containing `cursor`;
+        // `info` is a valid, correctly sized out-buffer.
+        let queried = unsafe {
+            VirtualQuery(
+                cursor as *const c_void,
+                &mut info,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if queried == 0 {
+            break;
+        }
+        let region_base = info.BaseAddress as u64;
+        let Some(region_end) = region_base.checked_add(info.RegionSize as u64) else {
+            break;
+        };
+        if info.State == MEM_FREE {
+            let usable_start = cursor.max(region_base);
+            let usable_end = region_end.min(limit);
+            if usable_end > usable_start {
+                let size = usable_end - usable_start;
+                total = total.saturating_add(size);
+                largest = largest.max(size);
+            }
+        }
+        let next = region_end.max(cursor.saturating_add(1));
+        if next <= cursor {
+            break;
+        }
+        cursor = next;
+    }
+    (largest, total)
 }
 
 /// Commit `len` bytes at `addr` — a sub-range of the `[base, base +
@@ -780,10 +841,33 @@ impl GuestArena {
             reserve_guest_address_space(SYSTEM_MANAGED_MIN, SYSTEM_MANAGED_LIMIT, length, align)
                 .or_else(|| {
                     reserve_guest_address_space(USER_MAPPING_MIN, USER_MAPPING_LIMIT, length, align)
-                })?;
+                });
+        let Some(addr) = addr else {
+            // Both console-VA windows refused. Measured on Until Dawn / Dragon
+            // Ball: a cascade of failures down to 128 KiB. Say WHY — how much
+            // room each window actually has — instead of a bare "mmap failed",
+            // which cannot distinguish exhaustion from a placement bug.
+            let (sm_largest, sm_free) = survey_free_space(SYSTEM_MANAGED_MIN, SYSTEM_MANAGED_LIMIT);
+            let (um_largest, um_free) = survey_free_space(USER_MAPPING_MIN, USER_MAPPING_LIMIT);
+            tracing::warn!(
+                want = format_args!("{length:#x}"),
+                align = format_args!("{align:#x}"),
+                system_managed_largest_free = format_args!("{sm_largest:#x}"),
+                system_managed_total_free = format_args!("{sm_free:#x}"),
+                user_mapping_largest_free = format_args!("{um_largest:#x}"),
+                user_mapping_total_free = format_args!("{um_free:#x}"),
+                "console-VA placement failed — no free block in either window"
+            );
+            return None;
+        };
 
         let end = addr.checked_add(length)?;
         if !range_all(&state.vmm, addr, end, |vma| vma.kind == VmaType::Foreign) {
+            tracing::warn!(
+                addr = format_args!("{addr:#x}"),
+                len = format_args!("{length:#x}"),
+                "console-VA rejected: range is not Foreign in the VMM map"
+            );
             // SAFETY: `addr` is the exact reservation base returned above and
             // has not been published or recorded yet.
             unsafe {
@@ -802,7 +886,43 @@ impl GuestArena {
                 PAGE_READWRITE,
             )
         };
-        if raw.is_null() || raw as u64 != addr {
+        if raw.is_null() {
+            // Committing the WHOLE length up front charges it against the
+            // process commit limit (RAM + pagefile). A title asking for GiB of
+            // direct memory exhausts that (measured: Until Dawn / Dragon Ball
+            // open with a 1 GiB `sceKernelAllocateDirectMemory`, Windows answers
+            // ERROR_COMMITMENT_LIMIT "the paging file is too small"), and every
+            // later request then failed too — a cascade all the way down to
+            // 128 KiB, because each one tried to commit up front as well.
+            //
+            // Failing is the wrong answer: the address space IS reserved (the
+            // `reserve_guest_address_space` above took it with MEM_RESERVE), and
+            // titles touch far less than they allocate. So degrade to the same
+            // demand-commit the arena already runs for `sceKernelReserveVirtualRange`
+            // — record the span as `Reserved` and let `commit_on_demand` back
+            // each page from the fault handler as the guest actually reaches it.
+            // The guest cannot tell the difference; only untouched pages stay
+            // free, which is the whole point.
+            tracing::warn!(
+                addr = format_args!("{addr:#x}"),
+                len = format_args!("{length:#x}"),
+                last_os_error = %std::io::Error::last_os_error(),
+                "console-VA: MEM_COMMIT refused; serving the range demand-committed"
+            );
+            state.os_reservations.push(addr);
+            state.vmm.map_range(
+                addr,
+                length,
+                VmaType::Reserved,
+                prot::NO_ACCESS,
+                None,
+                name,
+                false,
+            );
+            return Some(addr);
+        }
+        if raw as u64 != addr {
+            // Defensive only: explicit VirtualAlloc does not relocate.
             // SAFETY: same exact, unpublished reservation-base proof as above.
             unsafe {
                 VirtualFree(addr as *mut c_void, 0, MEM_RELEASE);
@@ -1236,7 +1356,11 @@ impl GuestAllocator for GuestArena {
         // `MEM_RESERVE` with `PAGE_NOACCESS` takes address space without
         // committing memory, so a 512 GiB reservation costs no RAM. The block
         // is recorded in `os_reservations` and released in `Drop`.
-        let block = reserve_guest_address_space(DEFAULT_MAPPING_BASE, self.base, span, align)?;
+        let block = reserve_guest_address_space(RESERVE_MIN, self.base, span, align)
+            // Fall back to the old low-first search only if the dedicated
+            // reservation window is somehow full: a placed reservation that
+            // fragments a mapping window still beats failing the call outright.
+            .or_else(|| reserve_guest_address_space(DEFAULT_MAPPING_BASE, self.base, span, align))?;
 
         let Some(addr) = align_up(block, align) else {
             return self.release_unusable_block(block);
@@ -1639,11 +1763,21 @@ mod tests {
     /// Kernel-chosen virtual mappings are part of the guest ABI: libc records
     /// the returned address and uses it to choose its allocator layout. They
     /// therefore cannot depend on whichever hole Windows ASLR happens to hand
-    /// `VirtualAlloc(NULL, ...)` in this emulator process. Start at the console
-    /// mapping base and advance deterministically, as the real VMM contract
-    /// requires.
+    /// `VirtualAlloc(NULL, ...)` in this emulator process — reservations must
+    /// come from a fixed base and advance deterministically.
+    ///
+    /// That determinism is what this asserts. The *base* is [`RESERVE_MIN`], not
+    /// the console mapping base it used to be: a reservation placed low lands
+    /// inside the two ABI-validated mapping windows and shreds them. Measured on
+    /// Until Dawn / Dragon Ball, whose opening 512 GiB reservation left
+    /// `USER_MAPPING` with hundreds of GiB free but a largest contiguous block of
+    /// 510 MiB, so every later 1 GiB `sceKernelAllocateDirectMemory` failed to
+    /// place and the title cascaded down to 128 KiB and gave up (15 failures ->
+    /// 0 with the split). Mappings must live in those windows; reservations —
+    /// address space the title reads back and uses directly — need not, so they
+    /// are the ones that move.
     #[test]
-    fn kernel_chosen_reservations_use_the_deterministic_console_mapping_base() {
+    fn kernel_chosen_reservations_are_deterministic_and_outside_the_mapping_windows() {
         let _lock = crate::dispatch::call_lock();
         let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
         let len = 0x0200_0000u64;
@@ -1655,8 +1789,11 @@ mod tests {
             .reserve(len, xps5x_core::PS5_PAGE_SIZE as u64)
             .expect("second reservation");
 
-        assert_eq!(first, 0x2_0000_0000);
+        // Deterministic: a fixed base, then contiguous — never an ASLR hole.
+        assert_eq!(first, RESERVE_MIN);
         assert_eq!(second, first + len);
+        // And clear of both mapping windows, which is the point of the split.
+        assert!(first >= USER_MAPPING_LIMIT);
     }
 
     /// The measured Until Dawn / Dragon Ball failure, reduced to its mechanism.
