@@ -68,6 +68,11 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceLibcInternal", "sceLibcMspaceFree", hle_mspace_free);
     registry.register(
         "libSceLibcInternal",
+        "sceLibcMspaceMalloc",
+        hle_mspace_malloc,
+    );
+    registry.register(
+        "libSceLibcInternal",
         "sceLibcMspaceMemalign",
         hle_mspace_memalign,
     );
@@ -105,6 +110,10 @@ fn read_cstring(ctx: &HleContext, address: u64, max: usize) -> Option<String> {
     }
     None
 }
+
+/// The alignment `sceLibcMspaceMalloc` allocates at: the x86-64 SysV ABI's
+/// `malloc` guarantee, suitable for any type with fundamental alignment.
+const MSPACE_DEFAULT_ALIGN: u64 = 16;
 
 /// Create a fixed-capacity mspace over memory already owned by the guest.
 fn hle_mspace_create(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -154,6 +163,41 @@ fn hle_mspace_destroy(ctx: &HleContext, args: &[u64]) -> u64 {
         .libc_mspace_allocations
         .retain(|_, allocation| allocation.mspace != mspace);
     1
+}
+
+/// `sceLibcMspaceMalloc(msp, size)` — the same storage as
+/// [`hle_mspace_memalign`], at the ABI's default alignment.
+///
+/// # Why its absence broke a whole title
+///
+/// Implementing half of a paired API is worse than implementing none of it. The
+/// resolver picks HLE or LLE **per symbol** (`ModulePolicy::PreferHle`, the
+/// default: try HLE, fall back to the module's own export). So with `Create`
+/// implemented here and `Malloc` not, a title bundling its own `libc.prx` got
+/// its mspace *created* by us — which hands back `base` as an opaque handle and
+/// keeps the bookkeeping in our kernel — and then *allocated* by the real
+/// dlmalloc inside its libc, which reads `base` expecting an initialised
+/// `malloc_state` there, finds uninitialised mapped memory, and reports the heap
+/// exhausted.
+///
+/// Measured on ASTRO.BOT, which prints exactly that and then aborts:
+///
+/// ```text
+/// ASSERT: ...\engine\app\Common\Memory.cpp:69
+/// Out of Global Heap Memory
+/// Allocator Size : 72
+/// Current/Max    : 0 / 2038431744 (0.00%)
+/// ```
+///
+/// A heap 0.00% full cannot be out of memory — those are the game's configured
+/// numbers, printed because it never got a working allocator at all.
+///
+/// The general rule this encodes: whoever owns `Create` must own every operation
+/// on what it returns. A half-HLE'd library is split-brained by construction.
+fn hle_mspace_malloc(ctx: &HleContext, args: &[u64]) -> u64 {
+    let mspace = args.first().copied().unwrap_or(0);
+    let size = args.get(1).copied().unwrap_or(0);
+    hle_mspace_memalign(ctx, &[mspace, MSPACE_DEFAULT_ALIGN, size])
 }
 
 fn hle_mspace_memalign(ctx: &HleContext, args: &[u64]) -> u64 {
