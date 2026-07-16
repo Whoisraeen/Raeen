@@ -28,9 +28,11 @@ pub mod agc_exec;
 pub mod backend;
 pub mod draw_translate;
 pub mod gnm;
+pub mod guest_mem;
 pub mod metal;
 pub mod shader;
 pub mod shader_bridge;
+pub mod shader_fetch;
 pub mod texture;
 pub mod vulkan;
 
@@ -39,3 +41,5 @@ pub use agc_exec::build_m2_draw_dcb;
 pub use agc_exec::{AgcGpuSession, ScissorHalf, build_cp_draw_dcb};
 pub use backend::{BackendKind, GpuBackend, ShaderFormat, create_backend, default_backend_kind};
 pub use draw_translate::{OffscreenDrawSink, draw_state_from_regs};
+pub use guest_mem::IdentityGuestMemory;
+pub use shader_fetch::{ShaderCacheStats, ShaderTranslateCache, TranslatedShader};

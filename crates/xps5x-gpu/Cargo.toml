@@ -19,6 +19,11 @@ parking_lot = { workspace = true }
 dashmap = { workspace = true }
 raw-window-handle = { workspace = true }
 
+# guest_mem: VirtualQuery-validated reads of the identity-mapped guest arena
+# for the PM4 command processor's pointer-carrying packets.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 [dev-dependencies]
 # SPIR-V structural validator for the shader-emitter tests. Used under its MIT
 # license option (GPL-2.0-only compatible). Test-only — not linked into the

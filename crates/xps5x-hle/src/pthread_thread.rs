@@ -40,6 +40,34 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libScePosix", "pthread_self", hle_self);
     registry.register("libScePosix", "pthread_equal", hle_equal);
     registry.register("libScePosix", "sched_yield", hle_yield);
+    registry.register(
+        "libScePosix",
+        "sched_get_priority_max",
+        hle_sched_get_priority_max,
+    );
+    registry.register(
+        "libScePosix",
+        "sched_get_priority_min",
+        hle_sched_get_priority_min,
+    );
+}
+
+/// Orbis thread-priority range: numerically the kernel accepts 256 (highest
+/// urgency) through 767 (lowest, the FreeBSD-derived rtprio span the default
+/// `PthreadAttr` priority of 700 sits inside). POSIX defines "max" as the
+/// numerically largest schedulable value, so `sched_get_priority_max` reports
+/// 767 and `min` 256 — matching shadPS4's POSIX sched shims.
+const ORBIS_SCHED_PRIORITY_MAX: u64 = 767;
+const ORBIS_SCHED_PRIORITY_MIN: u64 = 256;
+
+/// `sched_get_priority_max(policy)`.
+fn hle_sched_get_priority_max(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    ORBIS_SCHED_PRIORITY_MAX
+}
+
+/// `sched_get_priority_min(policy)`.
+fn hle_sched_get_priority_min(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    ORBIS_SCHED_PRIORITY_MIN
 }
 
 /// `scePthreadSelf()`: the calling thread's handle (the one guest thread).
@@ -115,6 +143,22 @@ mod tests {
         // scePthreadSelf() equals itself.
         let me = hle_self(&ctx, &[]);
         assert_eq!(hle_equal(&ctx, &[me, me]), 1);
+    }
+
+    #[test]
+    fn sched_priority_range_is_the_orbis_rtprio_span() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_sched_get_priority_max(&ctx, &[1]), 767);
+        assert_eq!(hle_sched_get_priority_min(&ctx, &[1]), 256);
+        // The default PthreadAttr priority must sit inside the reported range.
+        let default_priority = u64::try_from(xps5x_kernel::PthreadAttr::default().sched_priority)
+            .expect("default priority is positive");
+        assert!((256..=767).contains(&default_priority));
+
+        let registry = HleRegistry::new();
+        assert!(registry.is_implemented("libScePosix", "sched_get_priority_max"));
+        assert!(registry.is_implemented("libScePosix", "sched_get_priority_min"));
     }
 
     #[test]

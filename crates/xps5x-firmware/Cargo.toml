@@ -15,3 +15,4 @@ sha1 = { workspace = true }
 aes = { workspace = true }
 cbc = { workspace = true }
 goblin = { workspace = true }
+iced-x86 = { workspace = true }

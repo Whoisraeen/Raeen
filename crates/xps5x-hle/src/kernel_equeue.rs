@@ -46,6 +46,12 @@ pub fn register(registry: &HleRegistry) {
         0x2712_78b5_f80a_9570,
         hle_delete_read_event,
     );
+    registry.register("libkernel", "sceKernelAddWriteEvent", hle_add_write_event);
+    registry.register(
+        "libkernel",
+        "sceKernelDeleteWriteEvent",
+        hle_delete_read_event,
+    );
     registry.register(
         "libkernel",
         "sceKernelDeleteUserEvent",
@@ -129,9 +135,41 @@ fn hle_add_read_event(ctx: &HleContext, args: &[u64]) -> u64 {
     OK
 }
 
-/// `sceKernelDeleteReadEvent(eq, fd)`: remove a socket read interest from an
-/// event queue. The event identity is the socket descriptor, matching the
-/// registration performed by [`hle_add_read_event`].
+/// `sceKernelAddWriteEvent(eq, fd, udata)`: attach a write-readiness interest
+/// to an event queue. Accepted for offline sockets and VFS descriptors, but
+/// registered **untriggered** and never fired: with no host-network backend a
+/// socket never becomes writable, and no measured title yet waits on file
+/// writability. Delivering a fake "writable" event would make a title write
+/// into a connection that does not exist.
+fn hle_add_write_event(ctx: &HleContext, args: &[u64]) -> u64 {
+    const EVFILT_WRITE: i16 = -2;
+    let eq = args.first().copied().unwrap_or(0);
+    let fd = args.get(1).copied().unwrap_or(0) as i32;
+    let udata = args.get(2).copied().unwrap_or(0);
+    let known_fd =
+        ctx.kernel.kernel_sockets.contains_key(&fd) || ctx.kernel.filesystem.flags(fd).is_some();
+    if !ctx.kernel.kernel_equeues.contains_key(&eq) || !known_fd {
+        return SCE_KERNEL_ERROR_ESRCH;
+    }
+    ctx.kernel.kernel_equeue_events.insert(
+        (eq, fd as u32 as u64),
+        xps5x_kernel::EqueueUserEvent {
+            udata,
+            filter: EVFILT_WRITE,
+            ..Default::default()
+        },
+    );
+    debug!(
+        eq,
+        fd, udata, "registered write event (never fires: offline)"
+    );
+    OK
+}
+
+/// `sceKernelDeleteReadEvent(eq, fd)` / `sceKernelDeleteWriteEvent(eq, fd)`:
+/// remove a descriptor interest from an event queue. The event identity is
+/// the descriptor, matching the registration performed by
+/// [`hle_add_read_event`] / [`hle_add_write_event`].
 fn hle_delete_read_event(ctx: &HleContext, args: &[u64]) -> u64 {
     let eq = args.first().copied().unwrap_or(0);
     let fd = args.get(1).copied().unwrap_or(0) as i32;

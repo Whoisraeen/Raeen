@@ -191,6 +191,48 @@ fn sentinel_call_through_real_lm1_linker_dispatches_to_hle() {
     );
 }
 
+#[test]
+fn native_guest_syscall_is_trapped_and_dispatched_as_orbis_not_windows() {
+    // mov eax, SYS_getpid(20); syscall; ret
+    let image = vec![0xB8, 20, 0, 0, 0, 0x0F, 0x05, 0xC3];
+    let module = SprxModule {
+        name: "orbisSyscallTest".to_string(),
+        e_type: 0xFE18,
+        segments: vec![SprxSegment {
+            vaddr: 0,
+            data: image,
+            flags: 5,
+            mem_size: 8,
+        }],
+        dynlib_data: None,
+        relro: None,
+        dynamic: None,
+        entry: 0,
+        tls: None,
+        procparam: None,
+        unwind: None,
+    };
+    let hle = HleRegistry::new();
+    let registry = ModuleRegistry::new(NidDatabase::from_hle_names(hle.registered_names()));
+    let linked = link_module(
+        &module,
+        &DynlibData::default(),
+        &registry,
+        &hle,
+        GUEST_ARENA_BASE,
+    )
+    .expect("syscall fixture links");
+    assert_eq!(
+        &linked.image[5..7],
+        &xps5x_firmware::dynlib::linker::SYSCALL_TRAP_BYTES,
+        "the Windows SYSCALL instruction must be gone before native execution"
+    );
+
+    let result = execute_linked(&linked, &hle, &OrbisKernel::new(), 0, &[])
+        .expect("the private trap dispatches through the Orbis kernel");
+    assert_eq!(result, 1, "the emulated process has PID 1");
+}
+
 /// A guest callback requested by an HLE function must execute in the active
 /// guest context and return to the instruction after the original import
 /// call. `pthread_once` is the first consumer, but the context-transfer
@@ -234,6 +276,7 @@ fn pthread_once_runs_its_guest_initializer_before_returning() {
         }],
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -359,6 +402,7 @@ fn pthread_exit_unwinds_the_worker_and_delivers_its_value_to_join() {
         ],
         entry: 0,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     });
@@ -476,6 +520,7 @@ fn pthread_create_join_runs_a_real_guest_worker_with_tls() {
         ],
         entry: 0,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     });
@@ -566,6 +611,7 @@ fn detached_worker_is_reaped_before_the_fixed_guest_arena_is_reused() {
         ],
         entry: 0,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     });
@@ -637,6 +683,7 @@ fn call_to_unresolved_stub_reports_which_import_the_guest_wanted() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -687,6 +734,7 @@ fn wild_fault_past_the_stub_table_is_still_an_anonymous_fault() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -729,6 +777,7 @@ fn call_to_unmapped_trampoline_index_returns_unresolved() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -753,6 +802,7 @@ fn more_than_six_args_is_rejected() {
         hle_trampolines: Vec::new(),
         entry: 0,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -794,6 +844,7 @@ fn genuine_wild_fault_recovers_as_faulted_then_process_keeps_running() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -1399,21 +1450,19 @@ fn write_mmap_memset_readback_stub(
 
 /// RT2b acceptance test (design doc §6/§8): a synthetic module's entry calls
 /// the real, HLE-registered `libkernel::sceKernelMapFlexibleMemory` to map a
-/// region from the arena's mmap region, calls the real `libc::memset` to
+/// region from the console's kernel-managed VA window, calls the real `libc::memset` to
 /// fill it with a known byte, and reads byte 0 of that same block straight
 /// back out through the guest's own load instruction — proving
-/// `sceKernelMapFlexibleMemory` now allocates real, dereferenceable arena
+/// `sceKernelMapFlexibleMemory` now allocates real, dereferenceable guest
 /// memory (RT2 Task 5; it no longer returns the old fake-address stub) and
 /// that `memset` actually wrote through it, all via the genuine VEH
 /// trap-and-dispatch path (no test-only accessor into the arena).
 ///
 /// Separately — using the *same* [`OrbisKernel`] instance passed to
 /// `execute_linked` — asserts that `kernel.memory.is_mapped` reflects the
-/// mapping `sceKernelMapFlexibleMemory` recorded, and that the mapped
-/// address falls inside the arena's mmap region (`arena.rs`'s private
-/// `MMAP_OFFSET`/`ARENA_SPAN` constants, mirrored here for the same reason
-/// as the RT2a heap-region test above: this is a black-box integration test
-/// with no access to `xps5x_runtime::arena`'s internals).
+/// mapping `sceKernelMapFlexibleMemory` recorded, and that the mapped address
+/// stays below the title libc limit rather than leaking the emulator's 16 TiB
+/// image-arena address.
 #[test]
 fn mmap_then_memset_then_readback_proves_real_arena_memory_and_records_vmm_metadata() {
     const ENTRY_OFF: usize = 0x0;
@@ -1424,8 +1473,8 @@ fn mmap_then_memset_then_readback_proves_real_arena_memory_and_records_vmm_metad
     const MMAP_PROT: u32 = 0x3; // R+W
     const MEMSET_VALUE: u32 = 0xCD;
 
-    const MMAP_OFFSET: u64 = 0xA000_0000;
-    const ARENA_SPAN: u64 = 0x1_0000_0000;
+    const SYSTEM_MANAGED_MIN: u64 = 0x0040_0000;
+    const NATIVE_LIBC_LIMIT: u64 = 0x00FB_FFC0_0000;
 
     let hle = HleRegistry::new();
     let map_nid = nid_of("sceKernelMapFlexibleMemory");
@@ -1516,9 +1565,8 @@ fn mmap_then_memset_then_readback_proves_real_arena_memory_and_records_vmm_metad
     );
 
     // Separately, using the same `kernel` instance: the VMM must have
-    // recorded the arena mapping's metadata (record_mapping tags it
-    // "arena_mmap"), and the recorded address must fall inside the arena's
-    // mmap region.
+    // recorded the mapping's metadata (record_mapping tags it "arena_mmap"),
+    // and the recorded address must be valid console VA.
     let mapped_region = kernel
         .memory
         .dump_regions()
@@ -1531,11 +1579,9 @@ fn mmap_then_memset_then_readback_proves_real_arena_memory_and_records_vmm_metad
         kernel.memory.is_mapped(mapped_addr),
         "kernel.memory.is_mapped must reflect the arena mapping sceKernelMapFlexibleMemory recorded"
     );
-    let mmap_start = GUEST_ARENA_BASE + MMAP_OFFSET;
-    let mmap_end = GUEST_ARENA_BASE + ARENA_SPAN;
     assert!(
-        mapped_addr >= mmap_start && mapped_addr < mmap_end,
-        "mapped address {mapped_addr:#x} must fall inside the arena's mmap region [{mmap_start:#x}, {mmap_end:#x})"
+        mapped_addr >= SYSTEM_MANAGED_MIN && mapped_addr + MMAP_LEN <= NATIVE_LIBC_LIMIT,
+        "mapped address {mapped_addr:#x} must stay in native-libc-compatible console VA space"
     );
 }
 
@@ -1705,6 +1751,7 @@ fn guest_stub_uses_real_guest_stack_memory_and_returns_correct_value() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -1763,6 +1810,7 @@ fn guest_clobbering_r15_does_not_corrupt_host_rsp() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -1812,6 +1860,7 @@ fn guest_return_recovers_host_context_through_trampoline() {
         hle_trampolines: Vec::new(),
         entry: 0,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -1881,6 +1930,7 @@ fn trivial_ret_module() -> LinkedModule {
         hle_trampolines: Vec::new(),
         entry: 0,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     }
@@ -1926,6 +1976,7 @@ fn guest_fs_zero_load_reads_the_installed_tcb() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -2004,6 +2055,7 @@ fn guest_tls_survives_preemption_via_fsbase_rearm() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -2113,6 +2165,7 @@ fn genuine_wild_fault_after_preemption_recovers_instead_of_looping_the_veh() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -2207,6 +2260,7 @@ fn guest_fs_offset_round_trip_writes_and_reads_back() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -2312,6 +2366,7 @@ fn host_fsbase_is_restored_after_a_recovered_genuine_fault() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -2405,6 +2460,7 @@ fn start_stub_observes_argc_via_rdi_per_the_orbis_entry_abi() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -2419,6 +2475,49 @@ fn start_stub_observes_argc_via_rdi_per_the_orbis_entry_abi() {
         ),
         other => panic!("expected Err(Faulted {{ .. }}), got {other:?}"),
     }
+}
+
+/// The second Orbis `_start` argument is a process-exit callback. Retail crt0
+/// preserves RSI and calls through it on fatal startup paths; passing zero
+/// turns a clean termination into an execute-at-null fault.
+#[test]
+fn process_entry_receives_a_working_exit_callback_in_rsi() {
+    const EXIT_CODE: u32 = 0x2a;
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+    // mov edi, EXIT_CODE; jmp rsi
+    image[..7].copy_from_slice(&[
+        0xBF,
+        EXIT_CODE as u8,
+        (EXIT_CODE >> 8) as u8,
+        (EXIT_CODE >> 16) as u8,
+        (EXIT_CODE >> 24) as u8,
+        0xFF,
+        0xE6,
+    ]);
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: vec![HleTrampoline {
+            library: "libc".to_string(),
+            function: "exit".to_string(),
+            addr: HLE_TRAMPOLINE_BASE,
+        }],
+        entry: 0,
+        tls: None,
+        tls_layout: Vec::new(),
+        procparam_offset: None,
+        unwind_modules: Vec::new(),
+    };
+
+    let kernel = OrbisKernel::new();
+    let outcome = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[])
+        .expect("jumping through the supplied exit callback must terminate cleanly");
+    assert_eq!(outcome, RunOutcome::Exited(u64::from(EXIT_CODE)));
 }
 
 /// Orbis enters `_start` with the alignment of an ordinary called SysV
@@ -2442,6 +2541,7 @@ fn process_entry_has_orbis_called_function_stack_alignment() {
         hle_trampolines: Vec::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -2477,6 +2577,7 @@ fn start_stub_observes_argc_equal_to_one_via_the_process_stack() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -2516,6 +2617,7 @@ fn start_stub_observes_argv0_first_byte_via_the_process_stack() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -2585,6 +2687,7 @@ fn start_stub_calling_exit_returns_exited_with_the_given_code() {
         }],
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -2643,6 +2746,7 @@ fn start_stub_wild_fault_still_recovers_as_faulted_through_execute_process() {
         hle_trampolines: Vec::<HleTrampoline>::new(),
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -2701,6 +2805,7 @@ fn execute_process_restores_host_fsbase_after_an_exit_longjmp() {
         }],
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };
@@ -2850,6 +2955,128 @@ fn tls_variable_read_through_linker_computed_tpoff64_round_trips_tdata() {
     );
 }
 
+/// Multi-module static TLS acceptance: a DEPENDENCY's `.tdata` must be
+/// materialized at ITS assigned slot below the thread pointer, not folded onto
+/// the main module's block.
+///
+/// The guest reads `fs:[0x8 - 0x60]` — the initial-exec address of a variable
+/// at template offset 0x8 in a module assigned `tp_offset = 0x60` — and exits
+/// with it. Before the process-wide layout existed, only the main module's
+/// template was ever copied, so this read returned zero: exactly how libc.prx's
+/// 0x188 bytes of initialized TLS (errno, locale, strtok state) silently read
+/// back as garbage on the measured retail title.
+#[test]
+fn dependency_tdata_is_materialized_at_its_static_tls_slot() {
+    if !fsgsbase_available() {
+        println!(
+            "FSGSBASE not available on this CPU; skipping dependency_tdata_is_materialized_at_its_static_tls_slot"
+        );
+        return;
+    }
+
+    const ENTRY_OFF: usize = 0x0;
+    const SLOT_EXIT_OFF: usize = 0x40;
+    const SLOT_TLS_OFF: usize = 0x48;
+    const DEP_TLS_VALUE: u64 = 0xDE9_0DA7A;
+    const DEP_VAR_OFF: u64 = 0x8;
+    const DEP_TP_OFFSET: u64 = 0x60;
+
+    let mut image = vec![0u8; 0x100];
+    let mut off = ENTRY_OFF;
+    // mov rax, [rip+disp32] -> SLOT_TLS_OFF (holds the fs-relative offset)
+    let disp_tls = (SLOT_TLS_OFF as i64 - (off as i64 + 7)) as i32;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x8B, 0x05]);
+    image[off + 3..off + 7].copy_from_slice(&disp_tls.to_le_bytes());
+    off += 7;
+    // mov rdi, fs:[rax]
+    image[off..off + 4].copy_from_slice(&[0x64, 0x48, 0x8B, 0x38]);
+    off += 4;
+    // call qword ptr [rip+disp32] -> SLOT_EXIT_OFF (never returns)
+    let disp_exit = (SLOT_EXIT_OFF as i64 - (off as i64 + 6)) as i32;
+    image[off] = 0xFF;
+    image[off + 1] = 0x15;
+    image[off + 2..off + 6].copy_from_slice(&disp_exit.to_le_bytes());
+    // The initial-exec offset the linker would have computed against the
+    // dependency's assignment: var - tp_offset. Written as plain data (no
+    // relocation) — this test exercises the runtime's block building, not the
+    // linker (linker.rs pins the TPOFF64 arithmetic separately).
+    let fs_offset = DEP_VAR_OFF.wrapping_sub(DEP_TP_OFFSET);
+    image[SLOT_TLS_OFF..SLOT_TLS_OFF + 8].copy_from_slice(&fs_offset.to_le_bytes());
+
+    // The main module's own template: 8 bytes of .tdata that must ALSO land
+    // correctly (at tp-0x20), proving the two coexist.
+    let main_tdata = vec![0x11u8; 0x8];
+    let module = SprxModule {
+        name: "tlsMainModule".to_string(),
+        e_type: 0xFE18, // ET_SCE_DYNAMIC
+        segments: vec![SprxSegment {
+            vaddr: 0,
+            data: image,
+            flags: 5, // R+X
+            mem_size: 0x100,
+        }],
+        dynlib_data: None,
+        relro: None,
+        dynamic: None,
+        entry: ENTRY_OFF as u64,
+        tls: Some(TlsTemplate {
+            vaddr: 0,
+            data: main_tdata,
+            mem_size: 0x18,
+            align: 0x8,
+        }),
+        procparam: None,
+        unwind: None,
+    };
+
+    let dynlib = DynlibData {
+        symbols: vec![DynSymbol {
+            nid: nid_of("exit"),
+            value: 0,
+            is_import: true,
+        }],
+        relocations: vec![SceRela {
+            offset: SLOT_EXIT_OFF as u64,
+            info: R_X86_64_JUMP_SLOT, // r_sym = 0 -> the exit import
+            addend: 0,
+        }],
+        ..Default::default()
+    };
+
+    let hle = HleRegistry::new();
+    let db = NidDatabase::from_hle_names(hle.registered_names());
+    let registry = ModuleRegistry::new(db);
+    let mut linked = link_module(&module, &dynlib, &registry, &hle, GUEST_ARENA_BASE)
+        .expect("the main module links");
+
+    // The process layout `load_process` would have computed: main at tp-0x20,
+    // the dependency below it at tp-0x60, its `.tdata` holding DEP_TLS_VALUE
+    // at template offset DEP_VAR_OFF.
+    let mut dep_tdata = vec![0u8; 0x10];
+    dep_tdata[DEP_VAR_OFF as usize..DEP_VAR_OFF as usize + 8]
+        .copy_from_slice(&DEP_TLS_VALUE.to_le_bytes());
+    linked.tls_layout.push(xps5x_firmware::StaticTlsModule {
+        name: "libdep.prx".to_string(),
+        module_id: 2,
+        tp_offset: DEP_TP_OFFSET,
+        template: TlsTemplate {
+            vaddr: 0,
+            data: dep_tdata,
+            mem_size: 0x18,
+            align: 0x8,
+        },
+    });
+
+    let kernel = OrbisKernel::new();
+    let outcome = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[])
+        .expect("dependency TLS read must not fault");
+    assert_eq!(
+        outcome,
+        RunOutcome::Exited(DEP_TLS_VALUE),
+        "the dependency's .tdata must be readable at its own fs-relative slot"
+    );
+}
+
 /// M1-B canary acceptance: a `_start` that reads `fs:0x28` — exactly what a
 /// stack-protector prologue does — and exits with it must observe a real,
 /// nonzero canary whose low byte is zero (glibc's terminator convention).
@@ -2893,6 +3120,7 @@ fn stack_chk_guard_canary_at_fs_0x28_is_nonzero_with_terminator_byte() {
         }],
         entry: ENTRY_OFF as u64,
         tls: None,
+        tls_layout: Vec::new(),
         procparam_offset: None,
         unwind_modules: Vec::new(),
     };

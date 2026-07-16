@@ -18,7 +18,7 @@
 //! Agc rows.)
 
 use crate::{HleContext, HleRegistry};
-use tracing::debug;
+use tracing::{debug, error, warn};
 
 // DrawCommandBuffer struct field offsets (bytes).
 const CB_CURSOR_UP: u64 = 0x10; // u64 — current write pointer (advances up)
@@ -39,6 +39,13 @@ const IT_SET_BASE: u32 = 0x11;
 const IT_EVENT_WRITE: u32 = 0x46;
 const IT_WAIT_REG_MEM: u32 = 0x3C;
 const IT_SET_SH_REG: u32 = 0x76;
+// Standard PM4 type-3 opcodes for packets the title emits through the newer
+// Gen5 entry points (the Agc dialect reuses the standard opcode numbering —
+// compare IT_DISPATCH_DIRECT/IT_INDEX_TYPE/IT_SET_BASE above).
+const IT_SET_PREDICATION: u32 = 0x22;
+const IT_DRAW_INDIRECT_MULTI: u32 = 0x2C;
+const IT_DRAW_INDEX_INDIRECT_MULTI: u32 = 0x38;
+const IT_COPY_DATA: u32 = 0x40;
 const R_WAIT_MEM32: u32 = 0x0A;
 const R_WAIT_MEM64: u32 = 0x16;
 const R_RELEASE_MEM: u32 = 0x18;
@@ -79,6 +86,18 @@ const SHADER_INPUT_SEMANTICS_OFFSET: u64 = 0x30;
 const SHADER_OUTPUT_SEMANTICS_OFFSET: u64 = 0x38;
 const SHADER_NUM_INPUT_SEMANTICS_OFFSET: u64 = 0x50;
 const SHADER_NUM_OUTPUT_SEMANTICS_OFFSET: u64 = 0x56;
+const SHADER_TYPE_OFFSET: u64 = 0x5A;
+const SHADER_NUM_SH_REGISTERS_OFFSET: u64 = 0x5C;
+const COMPUTE_PGM_LO: u32 = 0x20C;
+const COMPUTE_PGM_HI: u32 = 0x20D;
+const SPI_SHADER_PGM_LO_PS: u32 = 0x008;
+const SPI_SHADER_PGM_HI_PS: u32 = 0x009;
+const SPI_SHADER_PGM_LO_GS: u32 = 0x08A;
+const SPI_SHADER_PGM_HI_GS: u32 = 0x08B;
+const SPI_SHADER_PGM_LO_ES: u32 = 0x0C8;
+const SPI_SHADER_PGM_HI_ES: u32 = 0x0C9;
+const SPI_SHADER_PGM_LO_LS: u32 = 0x148;
+const SPI_SHADER_PGM_HI_LS: u32 = 0x149;
 /// `SPI_PS_INPUT_CNTL_0` register offset (32 interpolant slots follow).
 const SPI_PS_INPUT_CNTL0: u32 = 0x191;
 // PrimState shader-register layout (byte offsets, from SharpEmu).
@@ -173,6 +192,17 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcCreateInterpolantMapping",
         hle_create_interpolant_mapping,
     );
+    // Minecraft (PPSA17221) imports sceAgcCreateInterpolantMapping under the
+    // NID `HV4j+E0MBHE` (0x1d5e23f84d0c0471) — hashing the recovered name
+    // yields a DIFFERENT NID, so the render thread died calling an
+    // "unimplemented" import while the implementation sat unreachable above.
+    // Bind the measured identity explicitly.
+    registry.register_nid(
+        "libSceAgc",
+        "sceAgcCreateInterpolantMapping",
+        0x1d5e_23f8_4d0c_0471,
+        hle_create_interpolant_mapping,
+    );
     registry.register_nid(
         "libSceAgc",
         "sceAgcGetDataPacketPayloadAddress",
@@ -190,11 +220,15 @@ pub fn register(registry: &HleRegistry) {
         hle_get_resource_max_name_length,
     );
     registry.register("libSceAgc", "sceAgcSuspendPoint", hle_suspend_point);
-    // A Gen5 driver call whose only observable effect is a trace → benign OK.
-    registry.register(
+    // Known ONLY by its NID (`-KRzWekV120`, measured from Minecraft PPSA17221):
+    // its identity is unknown — not present in Kyty or SharpEmu. A loud stub
+    // returning 0; the NID must be explicit because hashing the placeholder
+    // label yields a different NID (see `register_nid`).
+    registry.register_nid(
         "libSceAgc",
-        "sceAgcDriverUnknown_KRzWekV120",
-        hle_suspend_point,
+        "sceAgcUnknownKRzWekV120",
+        0xfca4_7359_e915_d76d,
+        hle_unknown_krz_wek_v120,
     );
     registry.register(
         "libSceAgc",
@@ -321,6 +355,55 @@ pub fn register(registry: &HleRegistry) {
             hle_add_indirect_patch_registers,
         );
     }
+    // Minecraft (PPSA17221) RenderDragon batch — every name below hashes to
+    // the NID the title imports (verified against the measured import table),
+    // so plain name registration resolves them.
+    registry.register(
+        "libSceAgc",
+        "sceAgcGetRegisterDefaults2",
+        hle_get_register_defaults2,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcGetRegisterDefaults2Internal",
+        hle_get_register_defaults2_internal,
+    );
+    registry.register("libSceAgc", "sceAgcDcbCopyData", hle_dcb_copy_data);
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbDrawIndexIndirectMulti",
+        hle_dcb_draw_index_indirect_multi,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbDrawIndirectMulti",
+        hle_dcb_draw_indirect_multi,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetIndexCount",
+        hle_dcb_set_index_count,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetPredication",
+        hle_dcb_set_predication,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcSetRangePredication",
+        hle_set_range_predication,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDebugRaiseException",
+        hle_debug_raise_exception,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcCbSetShRegisterRangeDirectGetSize",
+        hle_cb_set_sh_register_range_get_size,
+    );
 }
 
 /// Resource-registration maximum name length (`sceAgcDriver...`).
@@ -727,13 +810,12 @@ fn submit_validate(ctx: &HleContext, packet: u64) -> u64 {
         );
     }
 
-    // M2: draw-bearing DCBs drive the Vulkan offscreen path. Soft-fail when
-    // no usable Vulkan device is present so title boot / CI without a GPU
-    // still return success after decode + sync bookkeeping.
-    // Deprecated on purpose: this is the M2 fixture/regression path, kept
-    // until the CP path (try_execute_dcb_cp) subsumes it.
-    #[allow(deprecated)]
-    xps5x_gpu::AgcGpuSession::global().try_execute_decoded(&decoded);
+    // Every DCB reaches the persistent command processor, including state-only
+    // setup buffers. Register state is queue state and survives submissions;
+    // dropping setup DCBs leaves later draw-only buffers with null shaders and
+    // no render targets. Vulkan is initialized lazily only when a draw arrives.
+    // The deprecated fixture path survives only behind the M2 regression test.
+    xps5x_gpu::AgcGpuSession::global().try_execute_dcb_cp(&words);
 
     0
 }
@@ -814,7 +896,16 @@ fn hle_write_data_patch_address(ctx: &HleContext, args: &[u64]) -> u64 {
     let address = args.get(1).copied().unwrap_or(0);
     match packet_identity(ctx, command) {
         Some((op, reg)) if op == IT_NOP && reg == R_WRITE_DATA => {}
-        _ => return SCE_ERROR_INVALID_ARGUMENT,
+        identity => {
+            // Diagnose loudly: a mismatch here usually means the WRITE_DATA
+            // packet was never emitted (e.g. an emitter rejected the call) or
+            // the caller handed a payload pointer instead of the header.
+            warn!(
+                "sceAgcWriteDataPatchAddress: command {command:#x} is not a WRITE_DATA \
+                 packet (identity {identity:?}, patch address {address:#x}) — EINVAL"
+            );
+            return SCE_ERROR_INVALID_ARGUMENT;
+        }
     }
     if !ctx.mem.write(command + 8, &address.to_le_bytes()) {
         return SCE_ERROR_MEMORY_FAULT;
@@ -1098,6 +1189,54 @@ fn relocate_pointer_field(ctx: &HleContext, field: u64) -> bool {
     ctx.mem.write(field, &field.wrapping_add(rel).to_le_bytes())
 }
 
+/// Bind a shader's code allocation into the first two SH-register entries.
+///
+/// AGC compiler output deliberately stores zero in the program-base values.
+/// `sceAgcCreateShader` is the relocation boundary that replaces those
+/// placeholders. Later `SET_SH_REGS_INDIRECT` packets only point at this table,
+/// so omitting the patch leaves every real draw bound to address zero.
+fn patch_shader_program_registers(ctx: &HleContext, header: u64, code: u64) -> bool {
+    let mut address = [0u8; 8];
+    let mut shader_type = [0u8; 1];
+    let mut register_count = [0u8; 1];
+    if !ctx
+        .mem
+        .read(header + SHADER_SH_REGISTERS_OFFSET, &mut address)
+        || !ctx.mem.read(header + SHADER_TYPE_OFFSET, &mut shader_type)
+        || !ctx
+            .mem
+            .read(header + SHADER_NUM_SH_REGISTERS_OFFSET, &mut register_count)
+    {
+        return false;
+    }
+    let registers = u64::from_le_bytes(address);
+    if registers == 0 || register_count[0] < 2 {
+        return false;
+    }
+
+    let (expected_lo, expected_hi) = match shader_type[0] {
+        0 => (COMPUTE_PGM_LO, COMPUTE_PGM_HI),
+        1 => (SPI_SHADER_PGM_LO_PS, SPI_SHADER_PGM_HI_PS),
+        2 | 6 => (SPI_SHADER_PGM_LO_ES, SPI_SHADER_PGM_HI_ES),
+        4 => (SPI_SHADER_PGM_LO_GS, SPI_SHADER_PGM_HI_GS),
+        7 => (SPI_SHADER_PGM_LO_LS, SPI_SHADER_PGM_HI_LS),
+        _ => return false,
+    };
+    let mut lo_register = [0u8; 4];
+    let mut hi_register = [0u8; 4];
+    if !ctx.mem.read(registers, &mut lo_register)
+        || !ctx.mem.read(registers + 8, &mut hi_register)
+        || u32::from_le_bytes(lo_register) != expected_lo
+        || u32::from_le_bytes(hi_register) != expected_hi
+    {
+        return false;
+    }
+
+    let lo_value = ((code >> 8) as u32).to_le_bytes();
+    let hi_value = ((code >> 40) as u32 & 0xff).to_le_bytes();
+    ctx.mem.write(registers + 4, &lo_value) && ctx.mem.write(registers + 12, &hi_value)
+}
+
 /// `sceAgcCreateShader(destination, header, code)`: validate the shader header
 /// (magic + version), relocate its self-relative pointer fields to absolute,
 /// bind the code address, relocate the user-data table, and publish the shader
@@ -1137,11 +1276,21 @@ fn hle_create_shader(ctx: &HleContext, args: &[u64]) -> u64 {
     }
     let user_data = u64::from_le_bytes(ud);
     if user_data != 0 {
-        for off in [0x08u64, 0x10, 0x18, 0x20] {
+        // ShaderUserData's pointer fields, per Kyty's `GraphicsCreateShader`
+        // (Graphics.cpp:1460-1464, MIT © InoriRus): `direct_resource_offset`
+        // at +0x00 and `sharp_resource_offset[0..4]` at +0x08..+0x20. Missing
+        // +0x00 was a measured Minecraft crash: the field kept its
+        // self-relative value (0x48) and the title's material system
+        // dereferenced it as a pointer — a fault reading address 0x48 on the
+        // render thread, with nothing connecting it back to shader creation.
+        for off in [0x00u64, 0x08, 0x10, 0x18, 0x20] {
             if !relocate_pointer_field(ctx, user_data + off) {
                 return SCE_ERROR_MEMORY_FAULT;
             }
         }
+    }
+    if !patch_shader_program_registers(ctx, header, code) {
+        return SCE_ERROR_INVALID_ARGUMENT;
     }
     // Publish the shader object pointer.
     if !ctx.mem.write(destination, &header.to_le_bytes()) {
@@ -1193,7 +1342,10 @@ fn hle_create_prim_state(ctx: &HleContext, args: &[u64]) -> u64 {
 
 /// Supported Agc register-defaults versions (see `sceAgcInit`).
 fn is_supported_version(version: u32) -> bool {
-    matches!(version, 7 | 8 | 10 | 13)
+    // Version 12 is used by Minecraft's newer Gen5 AGC runtime. Register
+    // defaults are layout-compatible across the versions served here; the
+    // returned table is immutable and version-independent.
+    matches!(version, 7 | 8 | 10 | 12 | 13)
 }
 
 /// `sceAgcInit(state, version)`: initialize the Agc state for a supported
@@ -1202,6 +1354,12 @@ fn hle_init(_ctx: &HleContext, args: &[u64]) -> u64 {
     let state = args.first().copied().unwrap_or(0);
     let version = args.get(1).copied().unwrap_or(0) as u32;
     if state == 0 || !is_supported_version(version) {
+        warn!(
+            state,
+            version,
+            args = ?args,
+            "sceAgcInit rejected unsupported arguments"
+        );
         return SCE_ERROR_INVALID_ARGUMENT;
     }
     0
@@ -1282,6 +1440,14 @@ fn hle_acb_dispatch_indirect(ctx: &HleContext, args: &[u64]) -> u64 {
 /// arg7 at `[Rsp+8]`, arg8 at `[Rsp+16]`). Mirrors SharpEmu's `DcbWriteData`;
 /// also serves `sceAgcAcbWriteData` (an alias). Returns the command address, or
 /// 0 on failure.
+///
+/// A **null `destinationAddress` is legal**: Minecraft (PPSA17221) builds
+/// WRITE_DATA template packets with a placeholder destination and binds the
+/// real address afterwards via `sceAgcWriteDataPatchAddress` (often after
+/// memcpy'ing the packet into a submission ring). Rejecting the placeholder
+/// meant no packet was ever emitted, and the later patch then failed its
+/// header check with `EINVAL`. A null `dataAddress` zero-fills the payload,
+/// matching the reference's null-values handling in the SH-range writer.
 fn hle_dcb_write_data(ctx: &HleContext, args: &[u64]) -> u64 {
     let cb = args.first().copied().unwrap_or(0);
     let destination = (args.get(1).copied().unwrap_or(0) & 0xFF) as u32;
@@ -1291,7 +1457,7 @@ fn hle_dcb_write_data(ctx: &HleContext, args: &[u64]) -> u64 {
     let dword_count = args.get(5).copied().unwrap_or(0) as u32;
     let increment = (args.get(6).copied().unwrap_or(0) & 0xFF) as u32;
     let write_confirm = (args.get(7).copied().unwrap_or(0) & 0xFF) as u32;
-    if cb == 0 || destination_address == 0 || data_address == 0 || dword_count > 0x3FFD {
+    if cb == 0 || dword_count > 0x3FFD {
         return 0;
     }
     let packet_dwords = dword_count + 4;
@@ -1314,10 +1480,13 @@ fn hle_dcb_write_data(ctx: &HleContext, args: &[u64]) -> u64 {
         return 0;
     }
     for index in 0..u64::from(dword_count) {
+        // A null data pointer zero-fills the payload (the caller will patch
+        // or rewrite it); an unreadable non-null source is a real failure.
         let mut buf = [0u8; 4];
-        if !ctx.mem.read(data_address + index * 4, &mut buf)
-            || !ctx.mem.write(addr + 16 + index * 4, &buf)
-        {
+        if data_address != 0 && !ctx.mem.read(data_address + index * 4, &mut buf) {
+            return 0;
+        }
+        if !ctx.mem.write(addr + 16 + index * 4, &buf) {
             return 0;
         }
     }
@@ -1984,6 +2153,422 @@ fn hle_cb_set_sh_register_range(ctx: &HleContext, args: &[u64]) -> u64 {
     addr
 }
 
+// ---------------------------------------------------------------------------
+// Register defaults (sceAgcGetRegisterDefaults2 / ...2Internal)
+//
+// Ported from Kyty Graphics.cpp (MIT © InoriRus): Gen5's
+// `GraphicsGetRegisterDefaults2[Internal]` return a pointer to a
+// `RegisterDefaults` struct whose tables the GUEST walks itself, so the whole
+// object graph must live in guest memory with guest addresses inside it.
+// ---------------------------------------------------------------------------
+
+use crate::libsce_agc_reg_defaults::{
+    CX_REG_INFO1, CX_REG_INFO2, RegisterDefaultInfo, SH_REG_INFO1, SH_REG_INFO2, UC_REG_INFO1,
+    UC_REG_INFO2,
+};
+
+/// `RegisterDefaults` header size. Layout (Kyty, `offsetof(count) == 0x38`
+/// asserted against the real SDK):
+/// `{ tbl0..tbl3: *[*ShaderRegister] (0x00..0x20), unknown[2]: u64 (0x20),
+///    types: *u32 (0x30), count: u32 (0x38), pad (0x3C) }`.
+const REG_DEFAULTS_HEADER_BYTES: u64 = 0x40;
+/// `offsetof(RegisterDefaults, count)` — pinned by test against 0x38.
+const REG_DEFAULTS_COUNT_OFFSET: u64 = 0x38;
+/// Kyty's `RegisterDefaultInfo` carries a fixed `ShaderRegister reg[16]`.
+const REG_INFO_SLOTS: u64 = 16;
+/// One materialized `RegisterDefaultInfo`: `u32 type` + 16 × `(u32, u32)`.
+const REG_INFO_ENTRY_BYTES: u64 = 4 + REG_INFO_SLOTS * 8;
+
+fn put_u32(image: &mut [u8], off: u64, v: u32) {
+    let off = off as usize;
+    image[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+fn put_u64(image: &mut [u8], off: u64, v: u64) {
+    let off = off as usize;
+    image[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Build both `RegisterDefaults` sets in one guest allocation and return its
+/// base address (set 1 at `base`, set 2 at `base + 0x40`).
+///
+/// Guest layout, all pointers absolute guest addresses:
+///
+/// ```text
+/// base + 0x00   RegisterDefaults #1        (returned by GetRegisterDefaults2)
+/// base + 0x40   RegisterDefaults #2        (returned by ...2Internal)
+/// base + 0x80   RegisterDefaultInfo entries (cx1, sh1, uc1, cx2, sh2, uc2;
+///               132 bytes each: type hash + reg[16], unused slots zeroed)
+/// (8-aligned)   pointer tables — one guest pointer per entry, aimed at the
+///               entry's reg[0] (i.e. entry base + 4, exactly like Kyty's
+///               &g_*_reg_info[i].reg[0])
+/// (then)        index triples (type_hash, id*4 + table, 0) — Kyty's
+///               g_tbl_index1/2, count = number of triples
+/// ```
+fn materialize_register_defaults(ctx: &HleContext) -> Option<u64> {
+    let sets: [[&[RegisterDefaultInfo]; 3]; 2] = [
+        [CX_REG_INFO1, SH_REG_INFO1, UC_REG_INFO1],
+        [CX_REG_INFO2, SH_REG_INFO2, UC_REG_INFO2],
+    ];
+
+    // First pass: compute every region's offset.
+    let mut info_off = [[0u64; 3]; 2];
+    let mut cursor = 2 * REG_DEFAULTS_HEADER_BYTES;
+    for (s, groups) in sets.iter().enumerate() {
+        for (g, table) in groups.iter().enumerate() {
+            info_off[s][g] = cursor;
+            cursor += table.len() as u64 * REG_INFO_ENTRY_BYTES;
+        }
+    }
+    cursor = (cursor + 7) & !7; // pointer tables are 8-byte aligned
+    let mut ptr_off = [[0u64; 3]; 2];
+    for (s, groups) in sets.iter().enumerate() {
+        for (g, table) in groups.iter().enumerate() {
+            ptr_off[s][g] = cursor;
+            cursor += table.len() as u64 * 8;
+        }
+    }
+    let mut idx_off = [0u64; 2];
+    for (s, groups) in sets.iter().enumerate() {
+        idx_off[s] = cursor;
+        cursor += groups.iter().map(|t| t.len() as u64).sum::<u64>() * 12;
+    }
+    let total = cursor;
+
+    let base = ctx.alloc.alloc(total, 8)?;
+    if base == 0 {
+        return None; // 0 doubles as the "not materialized" sentinel
+    }
+
+    // Second pass: render the image host-side, then one guest write.
+    let mut image = vec![0u8; total as usize];
+    for (s, groups) in sets.iter().enumerate() {
+        let header = s as u64 * REG_DEFAULTS_HEADER_BYTES;
+        let mut triples = 0u64;
+        for (g, table) in groups.iter().enumerate() {
+            put_u64(&mut image, header + g as u64 * 8, base + ptr_off[s][g]);
+            for (i, (type_hash, regs)) in table.iter().enumerate() {
+                let entry = info_off[s][g] + i as u64 * REG_INFO_ENTRY_BYTES;
+                put_u32(&mut image, entry, *type_hash);
+                for (slot, (offset, value)) in regs.iter().enumerate() {
+                    put_u32(&mut image, entry + 4 + slot as u64 * 8, *offset);
+                    put_u32(&mut image, entry + 8 + slot as u64 * 8, *value);
+                }
+                put_u64(&mut image, ptr_off[s][g] + i as u64 * 8, base + entry + 4);
+                let t = idx_off[s] + triples * 12;
+                put_u32(&mut image, t, *type_hash);
+                put_u32(&mut image, t + 4, (i * 4 + g) as u32);
+                // third u32 of the triple stays 0, as in Kyty
+                triples += 1;
+            }
+        }
+        // tbl3 (0x18) and unknown[2] (0x20) stay zero.
+        put_u64(&mut image, header + 0x30, base + idx_off[s]);
+        put_u32(
+            &mut image,
+            header + REG_DEFAULTS_COUNT_OFFSET,
+            triples as u32,
+        );
+    }
+    if !ctx.mem.write(base, &image) {
+        ctx.alloc.free(base);
+        return None;
+    }
+    debug!("AGC register defaults materialized at {base:#x} ({total} bytes)");
+    Some(base)
+}
+
+/// Materialize-once, then serve the cached guest address plus `offset`.
+fn register_defaults_base(ctx: &HleContext, args: &[u64], offset: u64) -> u64 {
+    use std::sync::atomic::Ordering;
+
+    let version = args.first().copied().unwrap_or(0) as u32;
+    if version != 8 {
+        warn!(
+            "sceAgcGetRegisterDefaults2: unexpected version {version} (reference \
+             asserts 8) — returning the version-8 tables anyway"
+        );
+    }
+    let mut base = ctx
+        .kernel
+        .agc_register_defaults_addr
+        .load(Ordering::Acquire);
+    if base == 0 {
+        let Some(built) = materialize_register_defaults(ctx) else {
+            warn!("sceAgcGetRegisterDefaults2: guest materialization failed — returning null");
+            return 0;
+        };
+        base = match ctx.kernel.agc_register_defaults_addr.compare_exchange(
+            0,
+            built,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => built,
+            Err(winner) => {
+                // Another thread materialized first; discard ours.
+                ctx.alloc.free(built);
+                winner
+            }
+        };
+    }
+    base + offset
+}
+
+/// `sceAgcGetRegisterDefaults2(version)`: guest pointer to the primary
+/// register-defaults set (Kyty's `g_reg_defaults1`).
+fn hle_get_register_defaults2(ctx: &HleContext, args: &[u64]) -> u64 {
+    register_defaults_base(ctx, args, 0)
+}
+
+/// `sceAgcGetRegisterDefaults2Internal(version)`: guest pointer to the
+/// internal register-defaults set (Kyty's `g_reg_defaults2`).
+fn hle_get_register_defaults2_internal(ctx: &HleContext, args: &[u64]) -> u64 {
+    register_defaults_base(ctx, args, REG_DEFAULTS_HEADER_BYTES)
+}
+
+// ---------------------------------------------------------------------------
+// Minecraft RenderDragon DCB batch
+// ---------------------------------------------------------------------------
+
+/// `true` exactly once per `flag` — gate for warn-once diagnostics.
+fn warn_once(flag: &std::sync::atomic::AtomicBool) -> bool {
+    !flag.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `sceAgcDcbSetIndexCount(dcb, indexCount)`: emit an INDEX_BUFFER_SIZE
+/// packet (2 DWORDs) — the standalone form of the size packet that
+/// `sceAgcDcbSetIndexBuffer` emits after INDEX_BASE.
+fn hle_dcb_set_index_count(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let index_count = args.get(1).copied().unwrap_or(0) as u32;
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 2) else {
+        return 0;
+    };
+    if !ctx
+        .mem
+        .write(addr, &pm4(2, IT_INDEX_BUFFER_SIZE, R_ZERO).to_le_bytes())
+        || !ctx.mem.write(addr + 4, &index_count.to_le_bytes())
+    {
+        return 0;
+    }
+    addr
+}
+
+/// Shared body for `sceAgcDcbDrawIndexIndirectMulti` / `sceAgcDcbDrawIndirectMulti`.
+///
+/// Neither Kyty Gen5 nor SharpEmu implements these, so the argument order
+/// beyond the buffer is a documented guess (loud warn on first use):
+/// `(dcb, dataOffset, drawCount, stride, countAddress, modifier)` emitted in
+/// the standard PM4 `DRAW_*_INDIRECT_MULTI` field order (9 DWORDs):
+/// `[header, dataOffset, baseVtxLoc=0, startInstLoc=0, drawCount,
+///   countAddrLo, countAddrHi, stride, modifier]`.
+fn dcb_draw_indirect_multi(
+    ctx: &HleContext,
+    args: &[u64],
+    op: u32,
+    warned: &std::sync::atomic::AtomicBool,
+    label: &str,
+) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let data_offset = args.get(1).copied().unwrap_or(0) as u32;
+    let draw_count = args.get(2).copied().unwrap_or(0) as u32;
+    let stride = args.get(3).copied().unwrap_or(0) as u32;
+    let count_address = args.get(4).copied().unwrap_or(0);
+    let modifier = args.get(5).copied().unwrap_or(0) as u32;
+    if cb == 0 {
+        return 0;
+    }
+    if warn_once(warned) {
+        warn!(
+            "{label}: no reference implementation — emitting standard PM4 layout \
+             from a GUESSED argument decode (dataOffset={data_offset:#x}, \
+             drawCount={draw_count}, stride={stride}, countAddress={count_address:#x}, \
+             modifier={modifier:#x}); verify against a real dump before trusting draws"
+        );
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 9) else {
+        return 0;
+    };
+    let dwords = [
+        pm4(9, op, R_ZERO),
+        data_offset,
+        0, // base vertex location
+        0, // start instance location
+        draw_count,
+        count_address as u32,
+        (count_address >> 32) as u32,
+        stride,
+        modifier,
+    ];
+    if !dwords
+        .iter()
+        .enumerate()
+        .all(|(index, value)| ctx.mem.write(addr + index as u64 * 4, &value.to_le_bytes()))
+    {
+        return 0;
+    }
+    addr
+}
+
+fn hle_dcb_draw_index_indirect_multi(ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    dcb_draw_indirect_multi(
+        ctx,
+        args,
+        IT_DRAW_INDEX_INDIRECT_MULTI,
+        &WARNED,
+        "sceAgcDcbDrawIndexIndirectMulti",
+    )
+}
+
+fn hle_dcb_draw_indirect_multi(ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    dcb_draw_indirect_multi(
+        ctx,
+        args,
+        IT_DRAW_INDIRECT_MULTI,
+        &WARNED,
+        "sceAgcDcbDrawIndirectMulti",
+    )
+}
+
+/// `sceAgcDcbCopyData(dcb, control, srcAddress, dstAddress)`: emit a standard
+/// PM4 COPY_DATA packet (6 DWORDs). No reference implementation exists
+/// (Kyty Gen5 lacks it), so the argument decode is a documented guess and the
+/// first use warns loudly.
+fn hle_dcb_copy_data(ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let cb = args.first().copied().unwrap_or(0);
+    let control = args.get(1).copied().unwrap_or(0) as u32;
+    let source = args.get(2).copied().unwrap_or(0);
+    let destination = args.get(3).copied().unwrap_or(0);
+    if cb == 0 {
+        return 0;
+    }
+    if warn_once(&WARNED) {
+        warn!(
+            "sceAgcDcbCopyData: no reference implementation — emitting standard PM4 \
+             COPY_DATA from a GUESSED argument decode (control={control:#x}, \
+             src={source:#x}, dst={destination:#x})"
+        );
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 6) else {
+        return 0;
+    };
+    let dwords = [
+        pm4(6, IT_COPY_DATA, R_ZERO),
+        control,
+        source as u32,
+        (source >> 32) as u32,
+        destination as u32,
+        (destination >> 32) as u32,
+    ];
+    if !dwords
+        .iter()
+        .enumerate()
+        .all(|(index, value)| ctx.mem.write(addr + index as u64 * 4, &value.to_le_bytes()))
+    {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcDcbSetPredication(dcb, conditionAddress, control)`: emit a standard
+/// PM4 SET_PREDICATION packet (4 DWORDs: address lo/hi + control). Argument
+/// decode is a documented guess (no reference implementation); warns once.
+fn hle_dcb_set_predication(ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let cb = args.first().copied().unwrap_or(0);
+    let condition_address = args.get(1).copied().unwrap_or(0);
+    let control = args.get(2).copied().unwrap_or(0) as u32;
+    if cb == 0 {
+        return 0;
+    }
+    if warn_once(&WARNED) {
+        warn!(
+            "sceAgcDcbSetPredication: no reference implementation — emitting standard \
+             PM4 SET_PREDICATION from a GUESSED argument decode \
+             (conditionAddress={condition_address:#x}, control={control:#x})"
+        );
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 4) else {
+        return 0;
+    };
+    let dwords = [
+        pm4(4, IT_SET_PREDICATION, R_ZERO),
+        condition_address as u32,
+        (condition_address >> 32) as u32,
+        control,
+    ];
+    if !dwords
+        .iter()
+        .enumerate()
+        .all(|(index, value)| ctx.mem.write(addr + index as u64 * 4, &value.to_le_bytes()))
+    {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcSetRangePredication(...)`: completely unreferenced (no Kyty/SharpEmu
+/// equivalent, and — unlike the `Dcb` family — not obviously an emitter), so
+/// this intentionally touches nothing: warn loudly once and report success.
+fn hle_set_range_predication(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if warn_once(&WARNED) {
+        warn!(
+            "sceAgcSetRangePredication: unimplemented semantics (no reference) — \
+             ignoring call (args={args:x?}) and returning 0"
+        );
+    }
+    0
+}
+
+/// `sceAgcDebugRaiseException(...)`: the guest reports a fatal GPU-debug
+/// condition. Log it loudly with its arguments and return — never abort the
+/// host on the guest's behalf.
+fn hle_debug_raise_exception(_ctx: &HleContext, args: &[u64]) -> u64 {
+    error!("sceAgcDebugRaiseException({args:x?}) — guest raised a GPU debug exception; continuing");
+    0
+}
+
+/// `sceAgcCbSetShRegisterRangeDirectGetSize(numValues)`: DWORDs the direct
+/// SH-range write occupies — the marker packet (2), the SET_SH_REG header and
+/// offset (2), and one DWORD per value (see [`hle_cb_set_sh_register_range`],
+/// whose emission this must always match). The single-`numValues` signature
+/// is inferred from the writer (size depends on nothing else); warns once.
+fn hle_cb_set_sh_register_range_get_size(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let num_values = args.first().copied().unwrap_or(0) as u32;
+    if warn_once(&WARNED) {
+        warn!(
+            "sceAgcCbSetShRegisterRangeDirectGetSize: signature inferred (numValues \
+             in the first argument register) — returning {} DWORDs for numValues={num_values}",
+            u64::from(num_values) + 4
+        );
+    }
+    u64::from(num_values) + 4
+}
+
+/// NID `-KRzWekV120` (`0xfca47359e915d76d`, measured from Minecraft
+/// PPSA17221): identity unknown — not present in Kyty, SharpEmu, or public
+/// NID tables. Warns loudly once and returns 0.
+fn hle_unknown_krz_wek_v120(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if warn_once(&WARNED) {
+        warn!(
+            "libSceAgc NID 0xfca47359e915d76d (-KRzWekV120): UNKNOWN function called \
+             (args={args:x?}) — stub returns 0; identify and implement before trusting \
+             rendering"
+        );
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2262,6 +2847,7 @@ mod tests {
         let ctx = test_ctx(&kernel, &mem, &alloc);
         // Init: supported versions {7,8,10,13} with a non-null state → OK.
         assert_eq!(hle_init(&ctx, &[0x40, 8]), 0);
+        assert_eq!(hle_init(&ctx, &[0x40, 12]), 0);
         assert_eq!(hle_init(&ctx, &[0x40, 13]), 0);
         assert_eq!(
             hle_init(&ctx, &[0x40, 9]),
@@ -2962,6 +3548,20 @@ mod tests {
             ctx.mem
                 .write(header + SHADER_CX_REGISTERS_OFFSET, &0x40u64.to_le_bytes())
         );
+        // The SH table starts with the pixel program-base placeholders emitted
+        // by the compiler. CreateShader must replace their zero values with the
+        // supplied code address before a later indirect bind consumes them.
+        let sh_registers = header + SHADER_SH_REGISTERS_OFFSET + 0x80;
+        assert!(
+            ctx.mem
+                .write(header + SHADER_SH_REGISTERS_OFFSET, &0x80u64.to_le_bytes())
+        );
+        assert!(ctx.mem.write(sh_registers, &0x08u32.to_le_bytes()));
+        assert!(ctx.mem.write(sh_registers + 4, &0u32.to_le_bytes()));
+        assert!(ctx.mem.write(sh_registers + 8, &0x09u32.to_le_bytes()));
+        assert!(ctx.mem.write(sh_registers + 12, &0u32.to_le_bytes()));
+        assert!(ctx.mem.write(header + SHADER_TYPE_OFFSET, &[1]));
+        assert!(ctx.mem.write(header + SHADER_NUM_SH_REGISTERS_OFFSET, &[2]));
         // User-data field left 0 (skips user-data relocation).
         let dest: u64 = 0x100;
         let code: u64 = 0xC0DE_0000;
@@ -2978,6 +3578,8 @@ mod tests {
         assert_eq!(u64::from_le_bytes(b), code);
         assert!(ctx.mem.read(dest, &mut b));
         assert_eq!(u64::from_le_bytes(b), header);
+        assert_eq!(read_u32(&ctx, sh_registers + 4), (code >> 8) as u32);
+        assert_eq!(read_u32(&ctx, sh_registers + 12), (code >> 40) as u32);
         // A bad magic is rejected.
         assert!(ctx.mem.write(header, &0xDEADu32.to_le_bytes()));
         assert_eq!(
@@ -3070,5 +3672,199 @@ mod tests {
             pm4(7, IT_NOP, R_DRAW_INDEX_AUTO),
             0xC000_0000 | (5 << 16) | (0x10 << 8) | (0x04 << 2)
         );
+    }
+
+    #[test]
+    fn register_defaults_materialize_in_guest_memory_with_kyty_layout() {
+        // Needs a bigger arena than ctx_env's: the block is ~23 KiB.
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x10000);
+        let alloc = crate::TestAllocator::new(0x800);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let base = hle_get_register_defaults2(&ctx, &[8]);
+        assert_ne!(base, 0, "defaults must materialize");
+        // Cached: the same guest address on every later call — including a
+        // version the reference would assert on (warn, don't fail).
+        assert_eq!(hle_get_register_defaults2(&ctx, &[8]), base);
+        assert_eq!(hle_get_register_defaults2(&ctx, &[7]), base);
+        assert_eq!(hle_get_register_defaults2(&ctx, &[12]), base);
+        let internal = hle_get_register_defaults2_internal(&ctx, &[8]);
+        assert_eq!(internal, base + REG_DEFAULTS_HEADER_BYTES);
+
+        // offsetof(RegisterDefaults, count) == 0x38 — Kyty asserts this
+        // against the real SDK struct.
+        assert_eq!(REG_DEFAULTS_COUNT_OFFSET, 0x38);
+        assert_eq!(read_u32(&ctx, base + 0x38), 78 + 29 + 20, "set-1 triples");
+        assert_eq!(read_u32(&ctx, internal + 0x38), 4 + 15 + 3, "set-2 triples");
+
+        // tbl0..tbl2 and types are non-null guest pointers; tbl3 and
+        // unknown[2] stay zero.
+        let tbl0 = read_u64(&ctx, base);
+        assert_ne!(tbl0, 0);
+        assert_ne!(read_u64(&ctx, base + 8), 0);
+        assert_ne!(read_u64(&ctx, base + 0x10), 0);
+        assert_eq!(read_u64(&ctx, base + 0x18), 0);
+        assert_eq!(read_u64(&ctx, base + 0x20), 0);
+        assert_eq!(read_u64(&ctx, base + 0x28), 0);
+        let types = read_u64(&ctx, base + 0x30);
+        assert_ne!(types, 0);
+
+        // First cx pointer aims at reg[0] of CB_COLOR_CONTROL (0x202,
+        // 0x00cc0010), with the type hash 4 bytes before it — exactly
+        // Kyty's &g_cx_reg_info1[0].reg[0].
+        let first_cx = read_u64(&ctx, tbl0);
+        assert_ne!(first_cx, 0);
+        assert_eq!(read_u32(&ctx, first_cx), 0x202, "CB_COLOR_CONTROL offset");
+        assert_eq!(read_u32(&ctx, first_cx + 4), 0x00cc_0010);
+        assert_eq!(read_u32(&ctx, first_cx - 4), 0xE24F_806D, "type hash");
+
+        // Index triples are (type_hash, id*4 + table, 0).
+        assert_eq!(read_u32(&ctx, types), 0xE24F_806D);
+        assert_eq!(read_u32(&ctx, types + 4), 0);
+        assert_eq!(read_u32(&ctx, types + 8), 0);
+        assert_eq!(read_u32(&ctx, types + 12), 0xF6C2_8182, "cx entry 1");
+        assert_eq!(read_u32(&ctx, types + 16), 4, "id 1*4 + table 0");
+        // The first sh triple follows all 78 cx triples: id 0*4 + table 1.
+        assert_eq!(read_u32(&ctx, types + 78 * 12 + 4), 1);
+
+        // Internal set: first cx2 entry is DB_DFSM_CONTROL (0x0E).
+        let first_cx2 = read_u64(&ctx, read_u64(&ctx, internal));
+        assert_eq!(read_u32(&ctx, first_cx2), 0x0E, "DB_DFSM_CONTROL offset");
+        assert_eq!(read_u32(&ctx, first_cx2 - 4), 0x8FB4_EDB5, "type hash");
+    }
+
+    #[test]
+    fn set_index_count_emits_an_index_buffer_size_packet() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        assert_eq!(hle_dcb_set_index_count(&ctx, &[cb, 9]), 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(2, IT_INDEX_BUFFER_SIZE, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), 9);
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x408);
+        assert_eq!(hle_dcb_set_index_count(&ctx, &[0, 9]), 0, "null dcb");
+    }
+
+    #[test]
+    fn write_data_accepts_placeholder_null_destination_then_patch_binds_it() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        // Template packet: null destination AND null data, both bound later —
+        // Minecraft's WRITE_DATA-template flow (build, memcpy, patch).
+        let addr = hle_dcb_write_data(&ctx, &[cb, 5, 0, 0, 0, 2, 1, 0]);
+        assert_eq!(addr, 0x400, "placeholder WRITE_DATA must be emitted");
+        assert_eq!(read_u32(&ctx, addr), pm4(6, IT_NOP, R_WRITE_DATA));
+        assert_eq!(read_u64(&ctx, addr + 8), 0, "placeholder destination");
+        assert_eq!(read_u32(&ctx, addr + 16), 0, "zero-filled payload");
+        // The later patch finds a real WRITE_DATA header and binds the
+        // address — this exact flow returned 0x80020016 before placeholder
+        // destinations were legal (no packet was ever emitted).
+        assert_eq!(
+            hle_write_data_patch_address(&ctx, &[addr, 0x00AB_CDEF_1000]),
+            0
+        );
+        assert_eq!(read_u64(&ctx, addr + 8), 0x00AB_CDEF_1000);
+    }
+
+    #[test]
+    fn indirect_multi_predication_and_copy_data_emit_and_advance() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        // DrawIndexIndirectMulti: 9 DWORDs, standard PM4 opcode 0x38.
+        let a = hle_dcb_draw_index_indirect_multi(&ctx, &[cb, 0x20, 3, 16, 0x9000, 0]);
+        assert_eq!(a, 0x400);
+        assert_eq!(
+            read_u32(&ctx, a),
+            pm4(9, IT_DRAW_INDEX_INDIRECT_MULTI, R_ZERO)
+        );
+        assert_eq!(read_u32(&ctx, a + 4), 0x20, "data offset");
+        assert_eq!(read_u32(&ctx, a + 16), 3, "draw count");
+        assert_eq!(read_u32(&ctx, a + 20), 0x9000, "count address low");
+        assert_eq!(read_u32(&ctx, a + 28), 16, "stride");
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x400 + 36);
+        // DrawIndirectMulti: same shape, opcode 0x2C.
+        let b = hle_dcb_draw_indirect_multi(&ctx, &[cb, 0x40, 2, 16, 0, 0]);
+        assert_eq!(b, 0x424);
+        assert_eq!(read_u32(&ctx, b), pm4(9, IT_DRAW_INDIRECT_MULTI, R_ZERO));
+        // SetPredication: 4 DWORDs (address lo/hi + control).
+        let c = hle_dcb_set_predication(&ctx, &[cb, 0x0000_1234_5678, 1]);
+        assert_ne!(c, 0);
+        assert_eq!(read_u32(&ctx, c), pm4(4, IT_SET_PREDICATION, R_ZERO));
+        assert_eq!(read_u32(&ctx, c + 4), 0x1234_5678);
+        assert_eq!(read_u32(&ctx, c + 12), 1);
+        // CopyData: 6 DWORDs (control + src lo/hi + dst lo/hi).
+        let d = hle_dcb_copy_data(&ctx, &[cb, 0x100, 0xAAAA_0000, 0xBBBB_0000]);
+        assert_ne!(d, 0);
+        assert_eq!(read_u32(&ctx, d), pm4(6, IT_COPY_DATA, R_ZERO));
+        assert_eq!(read_u32(&ctx, d + 4), 0x100);
+        assert_eq!(read_u32(&ctx, d + 8), 0xAAAA_0000);
+        assert_eq!(read_u32(&ctx, d + 16), 0xBBBB_0000);
+        // A null buffer is rejected everywhere.
+        assert_eq!(hle_dcb_draw_index_indirect_multi(&ctx, &[0]), 0);
+        assert_eq!(hle_dcb_draw_indirect_multi(&ctx, &[0]), 0);
+        assert_eq!(hle_dcb_set_predication(&ctx, &[0]), 0);
+        assert_eq!(hle_dcb_copy_data(&ctx, &[0]), 0);
+    }
+
+    #[test]
+    fn sh_register_range_get_size_matches_the_writer() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let before = read_u64(&ctx, cb + CB_CURSOR_UP);
+        assert_ne!(hle_cb_set_sh_register_range(&ctx, &[cb, 0x10, 0, 3]), 0);
+        let consumed = (read_u64(&ctx, cb + CB_CURSOR_UP) - before) / 4;
+        assert_eq!(
+            hle_cb_set_sh_register_range_get_size(&ctx, &[3]),
+            consumed,
+            "GetSize must always match what the writer emits"
+        );
+    }
+
+    #[test]
+    fn debug_raise_exception_and_unknown_stubs_log_and_return_ok() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_debug_raise_exception(&ctx, &[0xDEAD, 1, 2]), 0);
+        assert_eq!(hle_set_range_predication(&ctx, &[1, 2, 3]), 0);
+        assert_eq!(hle_unknown_krz_wek_v120(&ctx, &[]), 0);
+    }
+
+    #[test]
+    fn minecraft_renderdragon_batch_is_registered() {
+        let registry = HleRegistry::new();
+        for name in [
+            "sceAgcGetRegisterDefaults2",
+            "sceAgcGetRegisterDefaults2Internal",
+            "sceAgcDcbCopyData",
+            "sceAgcDcbDrawIndexIndirectMulti",
+            "sceAgcDcbDrawIndirectMulti",
+            "sceAgcDcbSetIndexCount",
+            "sceAgcDcbSetPredication",
+            "sceAgcSetRangePredication",
+            "sceAgcDebugRaiseException",
+            "sceAgcCbSetShRegisterRangeDirectGetSize",
+        ] {
+            assert!(
+                registry.is_implemented("libSceAgc", name),
+                "{name} must be registered"
+            );
+        }
+        // The two identities known only by NID resolve via explicit bindings
+        // (their names do not hash to the measured import NIDs).
+        let overrides = registry.registered_nid_overrides();
+        assert!(overrides.iter().any(|(nid, key)| {
+            *nid == 0x1d5e_23f8_4d0c_0471 && key == "libSceAgc::sceAgcCreateInterpolantMapping"
+        }));
+        assert!(overrides.iter().any(|(nid, key)| {
+            *nid == 0xfca4_7359_e915_d76d && key == "libSceAgc::sceAgcUnknownKRzWekV120"
+        }));
     }
 }

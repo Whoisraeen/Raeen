@@ -7,15 +7,33 @@
 //! # Scope
 //!
 //! Gen5/AGC only: the PS5 uses AGC, not GNM, so Kyty's Gen4 block decoders
-//! (pitch/slice/view) are not ported. This slice covers what a minimal draw
-//! needs — `SET_{CONTEXT,SH,UCONFIG}_REG`, the embedded-shader ops, and
-//! `DRAW_INDEX_AUTO`.
+//! (pitch/slice/view) are not ported. This slice covers what a real DCB needs
+//! to reach its draws — `SET_{CONTEXT,SH,UCONFIG}_REG` (direct and indirect),
+//! the embedded-shader ops, index state, `DRAW_INDEX_AUTO`, `DRAW_INDEX`, and
+//! degraded indirect draws.
 //!
 //! # This crate cannot draw
 //!
 //! `kyty-graphics` has no Vulkan dependency, so unlike Kyty (whose
 //! `CommandProcessor` calls straight into `GraphicsRender`) the walk here
 //! terminates at the [`DrawSink`] trait. `xps5x-gpu` implements it.
+//!
+//! # Resilience policy (deliberate deviation from Kyty)
+//!
+//! Kyty `EXIT()`s on any packet it does not recognize. A retail title's
+//! command buffer always contains ops this processor does not know, so that
+//! policy means zero draws forever. Instead:
+//!
+//! - An **unknown opcode, custom op, or register** logs a rate-limited warn
+//!   (once per distinct op per [`CommandProcessor`] instance) naming the op,
+//!   is skipped by its encoded dword length, and the walk continues.
+//! - **Hard errors are reserved for structurally corrupt streams**: a packet
+//!   whose declared length runs past the buffer ([`CpError::Truncated`]) or a
+//!   header that is not type-2/type-3 ([`CpError::NotType3`], a desynced
+//!   walk).
+//! - A draw the sink cannot honour is still a named error
+//!   ([`CpError::Draw`]) — never-silent applies to draws, and the caller
+//!   decides whether to continue the submit.
 //!
 //! # Deviations from Kyty (deliberate; see the ledger)
 //!
@@ -41,17 +59,34 @@
 //!    `R_CX_REGS_INDIRECT`, which derefs an out-of-band guest pointer. Those
 //!    setters take `(offset, value)` and need no memory of their own, so
 //!    [`CommandProcessor::set_context_register`] exposes them to plain
-//!    `IT_SET_CONTEXT_REG` writes as well. This is what lets a draw resolve its
-//!    render target without a guest-memory reader.
+//!    `IT_SET_CONTEXT_REG` writes as well.
+//! 7. **Guest memory behind a trait.** Kyty's indirect handlers
+//!    (`cp_op_indirect_cx_regs` L3018 …) reinterpret guest dwords as host
+//!    pointers and dereference them. Here every out-of-band read goes through
+//!    [`GuestMemory`]; when no reader is supplied the packet is skipped with a
+//!    rate-limited warn instead of a wild deref.
+//! 8. **No trailing-NOP swallowing.** Kyty's raw draw parsers
+//!    (`cp_op_draw_index` L2757, `cp_op_draw_index_auto` L2807) peek past
+//!    their own packet and over-report their length to swallow the marker
+//!    NOPs its emitters append. Our walker parses those NOPs as the `R_ZERO`
+//!    NOPs they are, so every handler returns its header-declared length.
+//! 9. **Indexed/indirect draws degrade, honestly.** Kyty fetches real index
+//!    buffers in `GraphicsRender`; that layer is not ported. The default
+//!    [`DrawSink::draw_index`] degrades to a vertex-count-only
+//!    [`DrawSink::draw_index_auto`], and indirect draws read only the first
+//!    args record ([`DrawIndirectArgs`]) to recover a count. Both paths log
+//!    the degradation (rate-limited).
 
 use crate::hw_regs::{
-    ColorAttrib2, ColorAttrib3, ColorInfo, Context, Shader, UserConfig, UserSgprType,
+    ColorAttrib2, ColorAttrib3, ColorInfo, Context, DepthShaderControl, Shader, UserConfig,
+    UserSgprType,
 };
-use crate::pm4::{self, ItOp, RCode};
+use crate::pm4;
+use std::collections::BTreeSet;
 use tracing::warn;
 
 /// Which register file an unknown offset belonged to.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RegFile {
     Context,
     Shader,
@@ -84,30 +119,12 @@ impl std::error::Error for DrawError {}
 /// A command-stream fault. Every variant names the DWORD offset so a fault can
 /// be pointed at a packet in a capture.
 ///
-/// Typed replacement for Kyty's hard `EXIT(...)`; the crate convention is a
+/// Per the resilience policy only **structural** faults are errors: unknown
+/// ops and registers are logged and skipped, never returned. Typed
+/// replacement for Kyty's hard `EXIT(...)`; the crate convention is a
 /// hand-written `Display` rather than a `thiserror` dependency.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CpError {
-    UnknownOp {
-        offset: u32,
-        cmd_id: u32,
-        op: ItOp,
-    },
-    UnknownCustomOp {
-        offset: u32,
-        cmd_id: u32,
-        r: RCode,
-    },
-    UnknownRegister {
-        offset: u32,
-        file: RegFile,
-        reg: u32,
-    },
-    RegisterOutOfRange {
-        offset: u32,
-        file: RegFile,
-        reg: u32,
-    },
     Truncated {
         offset: u32,
         need: u32,
@@ -116,11 +133,6 @@ pub enum CpError {
     NotType3 {
         offset: u32,
         cmd_id: u32,
-    },
-    Unimplemented {
-        offset: u32,
-        cmd_id: u32,
-        what: &'static str,
     },
     Draw {
         offset: u32,
@@ -131,23 +143,6 @@ pub enum CpError {
 impl std::fmt::Display for CpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnknownOp { offset, cmd_id, op } => write!(
-                f,
-                "unknown PM4 opcode {:#04x} at DWORD {offset} (cmd_id {cmd_id:#010x})",
-                op.0
-            ),
-            Self::UnknownCustomOp { offset, cmd_id, r } => write!(
-                f,
-                "unknown AGC custom op R_{:#04x} at DWORD {offset} (cmd_id {cmd_id:#010x})",
-                r.0
-            ),
-            Self::UnknownRegister { offset, file, reg } => {
-                write!(f, "unknown {file} register {reg:#06x} at DWORD {offset}")
-            }
-            Self::RegisterOutOfRange { offset, file, reg } => write!(
-                f,
-                "register index {reg:#x} out of range for the {file} file at DWORD {offset}"
-            ),
             Self::Truncated {
                 offset,
                 need,
@@ -159,14 +154,6 @@ impl std::fmt::Display for CpError {
             Self::NotType3 { offset, cmd_id } => {
                 write!(f, "non-type-3 PM4 header at DWORD {offset}: {cmd_id:#010x}")
             }
-            Self::Unimplemented {
-                offset,
-                cmd_id,
-                what,
-            } => write!(
-                f,
-                "unimplemented at DWORD {offset} ({what}, cmd_id {cmd_id:#010x})"
-            ),
             Self::Draw { offset, source } => {
                 write!(f, "draw failed at DWORD {offset}: {source}")
             }
@@ -176,10 +163,50 @@ impl std::fmt::Display for CpError {
 
 impl std::error::Error for CpError {}
 
+/// Out-of-band guest-memory access for the packets that carry pointers
+/// (`R_*_REGS_INDIRECT`, indirect draw args).
+///
+/// Kyty dereferences these pointers directly (its CP runs in the guest's
+/// address space). This crate has no such assumption; the embedder supplies a
+/// reader, and without one the pointer-carrying packets are skipped with a
+/// rate-limited warn.
+pub trait GuestMemory {
+    /// Read `count` dwords at guest virtual address `addr`, or `None` if the
+    /// range is not readable.
+    fn read_dwords(&self, addr: u64, count: u32) -> Option<Vec<u32>>;
+}
+
+/// Parameters of an indexed draw, as decoded from `R_DRAW_INDEX` /
+/// `IT_DRAW_INDEX_2` (Kyty `cp_op_draw_index`, GraphicsRun.cpp L2757).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct IndexedDraw {
+    /// Latched `IT_INDEX_TYPE` state (Kyty `m_index_type_and_size`).
+    pub index_type_and_size: u32,
+    pub index_count: u32,
+    /// Guest address of the index buffer (0 when unknown, e.g. a degraded
+    /// indirect draw with no `INDEX_BASE` programmed).
+    pub index_addr: u64,
+    /// The AGC draw-modifier flags dword; 0 for the raw `IT_DRAW_INDEX_2` form.
+    pub flags: u32,
+    /// Kyty's `type` argument to `CommandProcessor::DrawIndex`: the AGC form's
+    /// body[4]; the raw form passes 1; degraded indirect draws pass 0.
+    pub index_type: u32,
+}
+
+/// First record of an indirect-draw argument buffer, AMD's
+/// `VkDrawIndirectCommand`-compatible layout: `{count, instance_count, ...}`.
+/// Only `count` is honoured by the degraded path.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DrawIndirectArgs {
+    pub count: u32,
+    pub instance_count: u32,
+}
+
 /// Where [`CommandProcessor`] sends a translated draw.
 ///
-/// Mirrors Kyty's `GraphicsRenderDrawIndexAuto` signature. The whole register
-/// state is passed by reference; the implementor decides what it needs.
+/// Mirrors Kyty's `GraphicsRenderDrawIndexAuto` / `GraphicsRenderDrawIndex`
+/// signatures. The whole register state is passed by reference; the
+/// implementor decides what it needs.
 pub trait DrawSink {
     /// Kyty: `GraphicsRenderDrawIndexAuto` (GraphicsRender.cpp).
     fn draw_index_auto(
@@ -190,6 +217,39 @@ pub trait DrawSink {
         index_count: u32,
         flags: u32,
     ) -> Result<(), DrawError>;
+
+    /// Kyty: `GraphicsRenderDrawIndex` (GraphicsRender.cpp).
+    ///
+    /// **Default degradation (documented, deliberate):** the index buffer is
+    /// *not* fetched; the draw is forwarded to
+    /// [`DrawSink::draw_index_auto`] with `index_count` as the vertex count.
+    /// For a triangle-list of sequential indices this is exact; for anything
+    /// else it draws the wrong vertices but the right amount of work — enough
+    /// for first light and honest logging. A sink that can fetch guest index
+    /// buffers should override this.
+    fn draw_index(
+        &mut self,
+        ctx: &Context,
+        ucfg: &UserConfig,
+        sh: &Shader,
+        draw: &IndexedDraw,
+    ) -> Result<(), DrawError> {
+        self.draw_index_auto(ctx, ucfg, sh, draw.index_count, draw.flags)
+    }
+}
+
+/// Rate-limit key: which distinct condition has already been warned about.
+/// One warn per key per [`CommandProcessor`] instance.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SkipKey {
+    /// Unknown IT opcode (header bits 15:8).
+    Op(u8),
+    /// Unknown AGC custom op (`IT_NOP` header bits 7:2).
+    Custom(u8),
+    /// Unknown or out-of-range register in a file.
+    Reg(RegFile, u32),
+    /// A named degradation or skipped feature.
+    Note(&'static str),
 }
 
 /// Kyty: `class CommandProcessor` (GraphicsRun.cpp L~100).
@@ -200,8 +260,22 @@ pub struct CommandProcessor {
     sh_ctx: Shader,
     index_type_and_size: u32,
     num_instances: u32,
+    /// `IT_INDEX_BASE`: guest address of the bound index buffer.
+    index_base: u64,
+    /// `IT_INDEX_BUFFER_SIZE`: dword count of the bound index buffer.
+    index_buffer_size: u32,
+    /// `IT_SET_BASE` select 1: base address for indirect-draw argument
+    /// buffers.
+    indirect_draw_base: u64,
     /// Latched by the `R_ZERO` 'hu' marker; types subsequent user-SGPR writes.
     user_data_marker: UserSgprType,
+    /// Which distinct unknown ops/registers have already been warned about.
+    /// Survives [`CommandProcessor::reset`] so a per-frame `R_DRAW_RESET`
+    /// cannot turn the rate limit back into log spam.
+    warned: BTreeSet<SkipKey>,
+    /// Number of shader-bind trace sites visited. This survives queue resets
+    /// and bounds the opt-in diagnostic on frame loops.
+    shader_bind_trace_count: u64,
 }
 
 impl CommandProcessor {
@@ -233,20 +307,76 @@ impl CommandProcessor {
     pub const fn index_type_and_size(&self) -> u32 {
         self.index_type_and_size
     }
+    #[must_use]
+    pub const fn index_base(&self) -> u64 {
+        self.index_base
+    }
+    #[must_use]
+    pub const fn index_buffer_size(&self) -> u32 {
+        self.index_buffer_size
+    }
+    #[must_use]
+    pub const fn indirect_draw_base(&self) -> u64 {
+        self.indirect_draw_base
+    }
 
-    /// Kyty: `CommandProcessor::Reset` (L519).
+    /// How many distinct unknown/skipped conditions this instance has warned
+    /// about. Diagnostics: a growing number across frames means the DCB uses
+    /// ops this processor does not yet honour.
+    #[must_use]
+    pub fn distinct_skips(&self) -> usize {
+        self.warned.len()
+    }
+
+    /// Kyty: `CommandProcessor::Reset` (L519) — clears register and index
+    /// state. The warn rate-limit set deliberately survives (deviation; a
+    /// reset must not re-arm log spam).
     pub fn reset(&mut self) {
+        let warned = std::mem::take(&mut self.warned);
+        let shader_bind_trace_count = self.shader_bind_trace_count;
         *self = Self::new();
+        self.warned = warned;
+        self.shader_bind_trace_count = shader_bind_trace_count;
+    }
+
+    /// True the first time `key` is seen; the caller warns exactly then.
+    fn first(&mut self, key: SkipKey) -> bool {
+        self.warned.insert(key)
+    }
+
+    fn trace_shader_bind(&mut self) -> bool {
+        if std::env::var_os("XPS5X_TRACE_SHADER_BINDS").is_none() {
+            return false;
+        }
+        self.shader_bind_trace_count = self.shader_bind_trace_count.saturating_add(1);
+        self.shader_bind_trace_count <= 128 || self.shader_bind_trace_count.is_power_of_two()
     }
 
     /// Kyty: `CommandProcessor::Run` (L989) — walk a DCB and execute it.
     ///
-    /// Each handler returns the **body** dwords it consumed; the walker adds
-    /// one for the header. That return is authoritative over the header's own
-    /// length field: Kyty's draw parsers deliberately over-report in order to
-    /// swallow trailing marker NOPs, and "fixing" that into header-driven
-    /// advancement desyncs the walk.
+    /// Equivalent to [`Self::run_with_memory`] with no [`GuestMemory`]:
+    /// pointer-carrying packets (indirect registers, indirect draw args) are
+    /// skipped with a rate-limited warn.
     pub fn run(&mut self, data: &[u32], sink: &mut dyn DrawSink) -> Result<(), CpError> {
+        self.run_with_memory(data, sink, None)
+    }
+
+    /// Walk a DCB with out-of-band guest-memory access.
+    ///
+    /// Each handler returns the **body** dwords it consumed; the walker adds
+    /// one for the header.
+    ///
+    /// # Errors
+    ///
+    /// Only structural faults ([`CpError::Truncated`], [`CpError::NotType3`])
+    /// and refused draws ([`CpError::Draw`]) — unknown packets are skipped per
+    /// the module-level resilience policy.
+    pub fn run_with_memory(
+        &mut self,
+        data: &[u32],
+        sink: &mut dyn DrawSink,
+        mem: Option<&dyn GuestMemory>,
+    ) -> Result<(), CpError> {
         let mut pos = 0usize;
         while pos < data.len() {
             let cmd_id = data[pos];
@@ -272,7 +402,7 @@ impl CommandProcessor {
             }
 
             let body = &data[pos + 1..];
-            let consumed = self.dispatch(cmd_id, body, offset, sink)?;
+            let consumed = self.dispatch(cmd_id, body, offset, sink, mem)?;
 
             // Kyty wraps here on an over-long packet and only notices next
             // iteration; bail before the overrun instead.
@@ -296,32 +426,66 @@ impl CommandProcessor {
         body: &[u32],
         offset: u32,
         sink: &mut dyn DrawSink,
+        mem: Option<&dyn GuestMemory>,
     ) -> Result<u32, CpError> {
         let op = pm4::op(cmd_id);
         match op {
-            pm4::IT_NOP => self.cp_op_nop(cmd_id, body, offset, sink),
+            pm4::IT_NOP => self.cp_op_nop(cmd_id, body, offset, sink, mem),
             pm4::IT_SET_CONTEXT_REG => self.cp_op_set_context_reg(cmd_id, body, offset),
             pm4::IT_SET_SH_REG => self.cp_op_set_shader_reg(cmd_id, body, offset),
             pm4::IT_SET_UCONFIG_REG => self.cp_op_set_uconfig_reg(cmd_id, body, offset),
             pm4::IT_DRAW_INDEX_AUTO => self.cp_op_draw_index_auto(cmd_id, body, offset, sink),
+            // Kyty: cp_op_draw_index (L2757), raw IT form 0xc0042700.
+            pm4::IT_DRAW_INDEX_2 => self.cp_op_draw_index(cmd_id, body, offset, sink),
             pm4::IT_NUM_INSTANCES => {
-                self.num_instances = *body.first().ok_or(CpError::Truncated {
-                    offset,
-                    need: 2,
-                    remaining: 1,
-                })?;
-                Ok(1)
+                // Kyty: SetNumInstances (L1036) — 0 means 1.
+                let n = Self::body_at(body, 0, offset)?;
+                self.num_instances = if n == 0 { 1 } else { n };
+                Ok(pm4::body_dw(cmd_id))
             }
+            // Kyty: cp_op_index_type (L2986) → SetIndexType. This is what
+            // Gen5's `GraphicsDcbSetIndexSize` emits (Graphics.cpp L1949).
             pm4::IT_INDEX_TYPE => {
-                self.index_type_and_size = *body.first().ok_or(CpError::Truncated {
-                    offset,
-                    need: 2,
-                    remaining: 1,
-                })?;
-                Ok(1)
+                self.index_type_and_size = Self::body_at(body, 0, offset)?;
+                Ok(pm4::body_dw(cmd_id))
+            }
+            // Index-buffer state for indexed draws (standard PM4; Kyty tracks
+            // the address only inside its draw packets).
+            pm4::IT_INDEX_BASE => {
+                let lo = Self::body_at(body, 0, offset)?;
+                let hi = Self::body_at(body, 1, offset)?;
+                self.index_base = u64::from(lo) | (u64::from(hi) << 32);
+                Ok(pm4::body_dw(cmd_id))
+            }
+            pm4::IT_INDEX_BUFFER_SIZE => {
+                self.index_buffer_size = Self::body_at(body, 0, offset)?;
+                Ok(pm4::body_dw(cmd_id))
+            }
+            // SET_BASE select 1 = indirect-draw argument buffer base.
+            pm4::IT_SET_BASE => {
+                let select = Self::body_at(body, 0, offset)?;
+                let lo = Self::body_at(body, 1, offset)?;
+                let hi = Self::body_at(body, 2, offset)?;
+                if select == 1 {
+                    self.indirect_draw_base = u64::from(lo) | (u64::from(hi) << 32);
+                } else if self.first(SkipKey::Note("set_base_select")) {
+                    warn!(
+                        select,
+                        offset, "IT_SET_BASE with unsupported base select — ignored"
+                    );
+                }
+                Ok(pm4::body_dw(cmd_id))
+            }
+            pm4::IT_DRAW_INDIRECT | pm4::IT_DRAW_INDIRECT_MULTI => {
+                self.cp_op_draw_indirect(cmd_id, body, offset, sink, mem, false)
+            }
+            pm4::IT_DRAW_INDEX_INDIRECT | pm4::IT_DRAW_INDEX_INDIRECT_MULTI => {
+                self.cp_op_draw_indirect(cmd_id, body, offset, sink, mem, true)
             }
             // Kyty ports these with 22 EXIT_NOT_IMPLEMENTED sites between them;
-            // nothing on the minimal draw path observes their effects.
+            // nothing on the minimal draw path observes their effects. Their
+            // side effects (waits, label writes) are handled by the HLE submit
+            // layer where needed.
             pm4::IT_ACQUIRE_MEM
             | pm4::IT_RELEASE_MEM
             | pm4::IT_EVENT_WRITE
@@ -333,15 +497,28 @@ impl CommandProcessor {
             | pm4::IT_CONTEXT_CONTROL
             | pm4::IT_CLEAR_STATE
             | pm4::IT_PFP_SYNC_ME => {
-                warn!(
-                    cmd_id = format_args!("{cmd_id:#010x}"),
-                    op = op.0,
-                    offset,
-                    "PM4 sync/data packet consumed without effect (Phase 1)"
-                );
+                if self.first(SkipKey::Op(op.0)) {
+                    warn!(
+                        cmd_id = format_args!("{cmd_id:#010x}"),
+                        op = op.0,
+                        offset,
+                        "PM4 sync/data packet consumed without effect"
+                    );
+                }
                 Ok(pm4::body_dw(cmd_id))
             }
-            _ => Err(CpError::UnknownOp { offset, cmd_id, op }),
+            _ => {
+                // Resilience policy: skip by encoded length, warn once.
+                if self.first(SkipKey::Op(op.0)) {
+                    warn!(
+                        cmd_id = format_args!("{cmd_id:#010x}"),
+                        op = format_args!("{:#04x}", op.0),
+                        offset,
+                        "unknown PM4 opcode — packet skipped by its encoded length"
+                    );
+                }
+                Ok(pm4::body_dw(cmd_id))
+            }
         }
     }
 
@@ -353,6 +530,7 @@ impl CommandProcessor {
         body: &[u32],
         offset: u32,
         sink: &mut dyn DrawSink,
+        mem: Option<&dyn GuestMemory>,
     ) -> Result<u32, CpError> {
         let r = pm4::r_code(cmd_id);
 
@@ -372,19 +550,56 @@ impl CommandProcessor {
                 // Kyty: hw_sh_set_vs_embedded (L2367). cmd_id 0xc01b1034.
                 let shader_modifier = Self::body_at(body, 0, offset)?;
                 let id = Self::body_at(body, 1, offset)?;
+                if self.trace_shader_bind() {
+                    warn!(
+                        offset,
+                        id, shader_modifier, "shader-bind trace: embedded VS"
+                    );
+                }
                 self.sh_ctx.set_vs_embedded(id, shader_modifier);
                 Ok(pm4::body_dw(cmd_id))
             }
             pm4::R_PS_EMBEDDED => {
                 // Kyty: hw_sh_set_ps_embedded (L2264). cmd_id 0xc0261038.
                 let id = Self::body_at(body, 0, offset)?;
+                if self.trace_shader_bind() {
+                    warn!(offset, id, "shader-bind trace: embedded PS");
+                }
                 self.sh_ctx.set_ps_embedded(id);
                 Ok(pm4::body_dw(cmd_id))
             }
             pm4::R_DRAW_INDEX_AUTO => self.cp_op_draw_index_auto(cmd_id, body, offset, sink),
+            // Kyty: cp_op_draw_index (L2757), AGC form 0xC008100C.
+            pm4::R_DRAW_INDEX => self.cp_op_draw_index(cmd_id, body, offset, sink),
+            // Kyty: cp_op_indirect_{cx,sh,uc}_regs (L3018/L3050/L3082).
+            pm4::R_CX_REGS_INDIRECT => {
+                self.cp_op_indirect_regs(cmd_id, body, offset, RegFile::Context, mem)
+            }
+            pm4::R_SH_REGS_INDIRECT => {
+                self.cp_op_indirect_regs(cmd_id, body, offset, RegFile::Shader, mem)
+            }
+            pm4::R_UC_REGS_INDIRECT => {
+                self.cp_op_indirect_regs(cmd_id, body, offset, RegFile::UserConfig, mem)
+            }
+            // Kyty: cp_op_draw_reset (L2853) → CommandProcessor::Reset. Gen5's
+            // `GraphicsDcbResetQueue` emits this (Graphics.cpp L1806).
+            pm4::R_DRAW_RESET => {
+                if self.trace_shader_bind() {
+                    warn!(
+                        offset,
+                        vs_addr = format_args!("{:#x}", self.sh_ctx.vs.vs_regs.data_addr),
+                        es_addr = format_args!("{:#x}", self.sh_ctx.vs.es_regs.data_addr),
+                        ps_addr = format_args!("{:#x}", self.sh_ctx.ps.ps_regs.data_addr),
+                        "shader-bind trace: draw reset"
+                    );
+                }
+                self.reset();
+                Ok(pm4::body_dw(cmd_id))
+            }
             pm4::R_PUSH_MARKER | pm4::R_POP_MARKER => Ok(pm4::body_dw(cmd_id)),
             // Sync / flip / memory ops: consumed, not honoured. A draw never
-            // observes them, and stubbing beats a wrong transliteration.
+            // observes them, and their side effects (flip queues, label
+            // waits) are already applied by the HLE submit decode.
             pm4::R_WAIT_MEM_32
             | pm4::R_WAIT_MEM_64
             | pm4::R_WRITE_DATA
@@ -392,17 +607,29 @@ impl CommandProcessor {
             | pm4::R_RELEASE_MEM
             | pm4::R_WAIT_FLIP_DONE
             | pm4::R_FLIP
-            | pm4::R_DRAW_RESET
             | pm4::R_DISPATCH_RESET => {
-                warn!(
-                    cmd_id = format_args!("{cmd_id:#010x}"),
-                    r = r.0,
-                    offset,
-                    "AGC sync/flip packet consumed without effect (Phase 1)"
-                );
+                if self.first(SkipKey::Custom(r.0)) {
+                    warn!(
+                        cmd_id = format_args!("{cmd_id:#010x}"),
+                        r = r.0,
+                        offset,
+                        "AGC sync/flip packet consumed without effect"
+                    );
+                }
                 Ok(pm4::body_dw(cmd_id))
             }
-            _ => Err(CpError::UnknownCustomOp { offset, cmd_id, r }),
+            _ => {
+                // Resilience policy: skip by encoded length, warn once.
+                if self.first(SkipKey::Custom(r.0)) {
+                    warn!(
+                        cmd_id = format_args!("{cmd_id:#010x}"),
+                        r = format_args!("{:#04x}", r.0),
+                        offset,
+                        "unknown AGC custom op — packet skipped by its encoded length"
+                    );
+                }
+                Ok(pm4::body_dw(cmd_id))
+            }
         }
     }
 
@@ -418,7 +645,7 @@ impl CommandProcessor {
         Ok(pm4::body_dw(cmd_id))
     }
 
-    /// Kyty: `cp_op_draw_index_auto` (L1071 / L3xxx).
+    /// Kyty: `cp_op_draw_index_auto` (L2807).
     fn cp_op_draw_index_auto(
         &mut self,
         cmd_id: u32,
@@ -441,6 +668,203 @@ impl CommandProcessor {
         Ok(pm4::body_dw(cmd_id))
     }
 
+    /// Kyty: `cp_op_draw_index` (L2757) — both encodings.
+    ///
+    /// - AGC form (`IT_NOP` + `R_DRAW_INDEX`, Kyty cmd 0xC008100C):
+    ///   `[index_count, addr_lo, addr_hi, flags, type]`.
+    /// - Raw form (`IT_DRAW_INDEX_2`, Kyty cmd 0xc0042700):
+    ///   `[index_count, addr_lo, addr_hi, index_count again, 0]`; Kyty passes
+    ///   `flags=0, type=1`. Kyty's duplicate-count/zero asserts are dropped
+    ///   per the resilience policy (a mismatch is the guest's data, not a
+    ///   stream fault).
+    fn cp_op_draw_index(
+        &mut self,
+        cmd_id: u32,
+        body: &[u32],
+        offset: u32,
+        sink: &mut dyn DrawSink,
+    ) -> Result<u32, CpError> {
+        let is_agc = pm4::op(cmd_id) == pm4::IT_NOP;
+        let index_count = Self::body_at(body, 0, offset)?;
+        let lo = Self::body_at(body, 1, offset)?;
+        let hi = Self::body_at(body, 2, offset)?;
+        let index_addr = u64::from(lo) | (u64::from(hi) << 32);
+        let (flags, index_type) = if is_agc {
+            (
+                Self::body_at(body, 3, offset)?,
+                Self::body_at(body, 4, offset)?,
+            )
+        } else {
+            (0, 1)
+        };
+
+        if self.first(SkipKey::Note("indexed_draw_degradation")) {
+            warn!(
+                index_addr = format_args!("{index_addr:#x}"),
+                index_count,
+                "indexed draw issued — default sinks degrade to a vertex-count-only \
+                 auto draw (index buffer not fetched)"
+            );
+        }
+
+        let draw = IndexedDraw {
+            index_type_and_size: self.index_type_and_size,
+            index_count,
+            index_addr,
+            flags,
+            index_type,
+        };
+        sink.draw_index(&self.ctx, &self.ucfg, &self.sh_ctx, &draw)
+            .map_err(|source| CpError::Draw { offset, source })?;
+
+        Ok(pm4::body_dw(cmd_id))
+    }
+
+    /// Degraded indirect draw: recover a count from the first args record.
+    ///
+    /// Kyty has no indirect-draw handler at all (its `g_cp_op_func` leaves
+    /// these opcodes null → `EXIT`). This extension reads only the first
+    /// record at `indirect_draw_base + body[0]` — the AMD layout puts the
+    /// vertex/index count in the first dword — and issues one degraded draw.
+    /// Multi-draw counts/strides are **not** walked; that (and real per-draw
+    /// state) needs `GraphicsRender`.
+    fn cp_op_draw_indirect(
+        &mut self,
+        cmd_id: u32,
+        body: &[u32],
+        offset: u32,
+        sink: &mut dyn DrawSink,
+        mem: Option<&dyn GuestMemory>,
+        indexed: bool,
+    ) -> Result<u32, CpError> {
+        let consumed = pm4::body_dw(cmd_id);
+        let op = pm4::op(cmd_id);
+        let data_offset = u64::from(Self::body_at(body, 0, offset)?);
+
+        if self.indirect_draw_base == 0 {
+            if self.first(SkipKey::Note("indirect_draw_no_base")) {
+                warn!(
+                    op = format_args!("{:#04x}", op.0),
+                    offset, "indirect draw with no IT_SET_BASE(1) programmed — skipped"
+                );
+            }
+            return Ok(consumed);
+        }
+        let Some(mem) = mem else {
+            if self.first(SkipKey::Note("indirect_draw_no_memory")) {
+                warn!(
+                    op = format_args!("{:#04x}", op.0),
+                    offset, "indirect draw needs a GuestMemory reader — skipped"
+                );
+            }
+            return Ok(consumed);
+        };
+        let args_addr = self.indirect_draw_base + data_offset;
+        let Some(args) = mem.read_dwords(args_addr, 2) else {
+            if self.first(SkipKey::Note("indirect_draw_unreadable_args")) {
+                warn!(
+                    args_addr = format_args!("{args_addr:#x}"),
+                    offset, "indirect draw args unreadable — skipped"
+                );
+            }
+            return Ok(consumed);
+        };
+        let args = DrawIndirectArgs {
+            count: args[0],
+            instance_count: args[1],
+        };
+
+        if self.first(SkipKey::Note("indirect_draw_degradation")) {
+            warn!(
+                op = format_args!("{:#04x}", op.0),
+                count = args.count,
+                instance_count = args.instance_count,
+                indexed,
+                "indirect draw degraded: first args record only, count-only draw \
+                 (multi-draw stride/count not walked)"
+            );
+        }
+
+        if args.count == 0 {
+            return Ok(consumed);
+        }
+
+        let result = if indexed {
+            let draw = IndexedDraw {
+                index_type_and_size: self.index_type_and_size,
+                index_count: args.count,
+                index_addr: self.index_base,
+                flags: 0,
+                index_type: 0,
+            };
+            sink.draw_index(&self.ctx, &self.ucfg, &self.sh_ctx, &draw)
+        } else {
+            sink.draw_index_auto(&self.ctx, &self.ucfg, &self.sh_ctx, args.count, 0)
+        };
+        result.map_err(|source| CpError::Draw { offset, source })?;
+
+        Ok(consumed)
+    }
+
+    /// Kyty: `cp_op_indirect_{cx,sh,uc}_regs` (L3018/L3050/L3082) — the body
+    /// is `[num_regs, addr_lo, addr_hi]`; the pointed-to buffer holds
+    /// `(offset, value)` pairs fed to the per-register setters.
+    fn cp_op_indirect_regs(
+        &mut self,
+        cmd_id: u32,
+        body: &[u32],
+        offset: u32,
+        file: RegFile,
+        mem: Option<&dyn GuestMemory>,
+    ) -> Result<u32, CpError> {
+        let consumed = pm4::body_dw(cmd_id);
+        let num_regs = Self::body_at(body, 0, offset)?;
+        let lo = Self::body_at(body, 1, offset)?;
+        let hi = Self::body_at(body, 2, offset)?;
+        let addr = u64::from(lo) | (u64::from(hi) << 32);
+
+        // Kyty EXITs on nullptr/0; a garbage pointer must not kill the DCB.
+        if num_regs == 0 || addr == 0 {
+            if self.first(SkipKey::Note("indirect_regs_null")) {
+                warn!(%file, num_regs, addr = format_args!("{addr:#x}"), offset,
+                    "indirect register packet with null pointer or zero count — skipped");
+            }
+            return Ok(consumed);
+        }
+        // Defensive cap: the largest real register file is UC_NUM (16384).
+        if num_regs as usize > pm4::UC_NUM {
+            if self.first(SkipKey::Note("indirect_regs_count")) {
+                warn!(%file, num_regs, offset,
+                    "indirect register packet count exceeds the register file — skipped");
+            }
+            return Ok(consumed);
+        }
+        let Some(mem) = mem else {
+            if self.first(SkipKey::Note("indirect_regs_no_memory")) {
+                warn!(%file, offset,
+                    "indirect register packet needs a GuestMemory reader — skipped");
+            }
+            return Ok(consumed);
+        };
+        let Some(pairs) = mem.read_dwords(addr, num_regs * 2) else {
+            if self.first(SkipKey::Note("indirect_regs_unreadable")) {
+                warn!(%file, addr = format_args!("{addr:#x}"), offset,
+                    "indirect register buffer unreadable — skipped");
+            }
+            return Ok(consumed);
+        };
+
+        for pair in pairs.chunks_exact(2) {
+            let (reg, value) = (pair[0], pair[1]);
+            match file {
+                RegFile::Context => self.set_context_register(pm4::strip_fake(reg), value),
+                RegFile::Shader => self.set_shader_register(pm4::strip_fake(reg), value),
+                RegFile::UserConfig => self.set_uconfig_register(reg & 0xEFFF_FFFF, value),
+            }
+        }
+        Ok(consumed)
+    }
+
     /// Kyty: `cp_op_set_context_reg` (L3288).
     ///
     /// `body[0]` is a **relative flat dword index** — the driver already
@@ -452,13 +876,6 @@ impl CommandProcessor {
         offset: u32,
     ) -> Result<u32, CpError> {
         let reg = pm4::strip_fake(Self::body_at(body, 0, offset)?);
-        if reg as usize >= pm4::CX_NUM {
-            return Err(CpError::RegisterOutOfRange {
-                offset,
-                file: RegFile::Context,
-                reg,
-            });
-        }
         let values = &body[1..];
 
         // Kyty's only multi-register context block on this path.
@@ -470,7 +887,7 @@ impl CommandProcessor {
 
         let count = Self::reg_count(cmd_id, values, offset)?;
         for (i, &value) in values.iter().enumerate().take(count) {
-            self.set_context_register(reg + i as u32, value, offset)?;
+            self.set_context_register(reg + i as u32, value);
         }
         Ok(count as u32 + 1)
     }
@@ -507,13 +924,51 @@ impl CommandProcessor {
     /// table (`graphics_init_jmp_tables_cx_indirect`, L3482).
     ///
     /// These take `(offset, value)` and touch no memory, so they serve direct
-    /// `SET_CONTEXT_REG` writes as well as the indirect packet. This is the
-    /// only route to the PS5 extent registers.
-    fn set_context_register(&mut self, reg: u32, value: u32, offset: u32) -> Result<(), CpError> {
+    /// `SET_CONTEXT_REG` writes as well as the indirect packet. An unknown or
+    /// out-of-range register is a rate-limited warn and a skip, never a fault
+    /// (resilience policy).
+    fn set_context_register(&mut self, reg: u32, value: u32) {
+        if reg as usize >= pm4::CX_NUM {
+            if self.first(SkipKey::Reg(RegFile::Context, reg)) {
+                warn!(
+                    reg = format_args!("{reg:#06x}"),
+                    "context register index out of range — write skipped"
+                );
+            }
+            return;
+        }
         let slot_of = |base: u32, stride: u32| ((reg - base) / stride) as usize;
 
         match reg {
             pm4::CB_TARGET_MASK => self.ctx.render_target_mask = value,
+
+            // Shader-facing context registers (Kyty: g_hw_ctx_indirect_func,
+            // GraphicsRun.cpp L3805-3825). These feed `ctx.sh_regs`, which the
+            // guest-shader translation (ShaderMemory Phase 2) reads.
+            pm4::SPI_VS_OUT_CONFIG => self.ctx.sh_regs.spi_vs_out_config = value,
+            pm4::SPI_PS_INPUT_ENA => self.ctx.sh_regs.ps_input_ena = value,
+            pm4::SPI_PS_INPUT_ADDR => self.ctx.sh_regs.ps_input_addr = value,
+            pm4::SPI_PS_IN_CONTROL => self.ctx.sh_regs.ps_in_control = value,
+            pm4::SPI_SHADER_COL_FORMAT => {
+                for (i, mode) in self.ctx.sh_regs.target_output_mode.iter_mut().enumerate() {
+                    *mode = ((value >> (i * 4)) & 0xF) as u8;
+                }
+            }
+            r if (pm4::SPI_PS_INPUT_CNTL_0..pm4::SPI_PS_INPUT_CNTL_0 + 32).contains(&r) => {
+                let slot = (r - pm4::SPI_PS_INPUT_CNTL_0) as usize;
+                self.ctx.sh_regs.ps_interpolator_settings[slot] = value;
+            }
+            pm4::DB_SHADER_CONTROL => {
+                // Kyty: DB_SHADER_CONTROL decode (GraphicsRun.cpp L3820).
+                self.ctx.sh_regs.db_shader_control = DepthShaderControl {
+                    other_bits: value & 0xFFFF_9B8E,
+                    conservative_z_export_value: ((value >> 13) & 0x3) as u8,
+                    shader_z_behavior: ((value >> 4) & 0x3) as u8,
+                    shader_kill_enable: (value >> 6) & 0x1 != 0,
+                    shader_z_export_enable: value & 0x1 != 0,
+                    shader_execute_on_noop: (value >> 10) & 0x1 != 0,
+                };
+            }
 
             r if (pm4::CB_COLOR0_BASE..=pm4::CB_COLOR7_BASE).contains(&r)
                 && (r - pm4::CB_COLOR0_BASE) % pm4::CB_COLOR_SLOT_STRIDE == 0 =>
@@ -606,14 +1061,14 @@ impl CommandProcessor {
             }
 
             _ => {
-                return Err(CpError::UnknownRegister {
-                    offset,
-                    file: RegFile::Context,
-                    reg,
-                });
+                if self.first(SkipKey::Reg(RegFile::Context, reg)) {
+                    warn!(
+                        reg = format_args!("{reg:#06x}"),
+                        "unknown context register — write skipped"
+                    );
+                }
             }
         }
-        Ok(())
     }
 
     /// Kyty: `cp_op_set_shader_reg` (L3311).
@@ -624,23 +1079,41 @@ impl CommandProcessor {
         offset: u32,
     ) -> Result<u32, CpError> {
         let reg = pm4::strip_fake(Self::body_at(body, 0, offset)?);
-        if reg as usize >= pm4::SH_NUM {
-            return Err(CpError::RegisterOutOfRange {
-                offset,
-                file: RegFile::Shader,
-                reg,
-            });
-        }
         let values = &body[1..];
         let count = Self::reg_count(cmd_id, values, offset)?;
         for (i, &value) in values.iter().enumerate().take(count) {
-            self.set_shader_register(reg + i as u32, value, offset)?;
+            self.set_shader_register(reg + i as u32, value);
         }
         Ok(count as u32 + 1)
     }
 
-    fn set_shader_register(&mut self, reg: u32, value: u32, offset: u32) -> Result<(), CpError> {
+    fn set_shader_register(&mut self, reg: u32, value: u32) {
         const SGPRS: u32 = 16;
+        if reg as usize >= pm4::SH_NUM {
+            if self.first(SkipKey::Reg(RegFile::Shader, reg)) {
+                warn!(
+                    reg = format_args!("{reg:#06x}"),
+                    "shader register index out of range — write skipped"
+                );
+            }
+            return;
+        }
+        if matches!(
+            reg,
+            pm4::SPI_SHADER_PGM_LO_PS
+                | pm4::SPI_SHADER_PGM_HI_PS
+                | pm4::SPI_SHADER_PGM_CHKSUM_PS
+                | pm4::SPI_SHADER_PGM_LO_ES
+                | pm4::SPI_SHADER_PGM_HI_ES
+                | pm4::SPI_SHADER_PGM_CHKSUM_GS
+        ) && self.trace_shader_bind()
+        {
+            warn!(
+                reg = format_args!("{reg:#06x}"),
+                value = format_args!("{value:#010x}"),
+                "shader-bind trace: SH register write"
+            );
+        }
         let marker = self.user_data_marker;
         match reg {
             r if (pm4::SPI_SHADER_USER_DATA_VS_0..pm4::SPI_SHADER_USER_DATA_VS_0 + SGPRS)
@@ -655,15 +1128,64 @@ impl CommandProcessor {
                 let id = r - pm4::SPI_SHADER_USER_DATA_PS_0;
                 self.sh_ctx.ps.ps_user_sgpr.set(id, value, marker);
             }
+            r if (pm4::SPI_SHADER_USER_DATA_GS_0..pm4::SPI_SHADER_USER_DATA_GS_0 + SGPRS)
+                .contains(&r) =>
+            {
+                // Kyty: hw_sh_set_gs_user_sgpr (GraphicsRun.cpp L2456) — the
+                // Gen5 vertex stage runs as GS, so its user data lands here.
+                let id = r - pm4::SPI_SHADER_USER_DATA_GS_0;
+                self.sh_ctx.vs.gs_user_sgpr.set(id, value, marker);
+            }
+            // Gen5 shader binds: plain SH-register writes (Kyty's
+            // g_hw_sh_indirect_func table, GraphicsRun.cpp L3995-4100).
+            // Address registers merge into the 40-bit code base the same way
+            // Kyty does: LO shifts into bits 8..40, HI's low byte into 40..48.
+            pm4::SPI_SHADER_PGM_LO_PS => {
+                let base = self.sh_ctx.ps.ps_regs.data_addr;
+                self.sh_ctx
+                    .set_ps_shader_base((base & 0xFFFF_FF00_0000_00FF) | (u64::from(value) << 8));
+            }
+            pm4::SPI_SHADER_PGM_HI_PS => {
+                let base = self.sh_ctx.ps.ps_regs.data_addr;
+                self.sh_ctx.set_ps_shader_base(
+                    (base & 0xFFFF_00FF_FFFF_FFFF) | (u64::from(value & 0xFF) << 40),
+                );
+            }
+            pm4::SPI_SHADER_PGM_CHKSUM_PS => self.sh_ctx.ps.ps_regs.push_chksum(value),
+            pm4::SPI_SHADER_PGM_RSRC2_PS => {
+                let user_sgpr = pm4::field(value, pm4::spi_shader_pgm_rsrc2::USER_SGPR)
+                    + (pm4::field(value, pm4::spi_shader_pgm_rsrc2::USER_SGPR_MSB) << 5);
+                self.sh_ctx.set_ps_rsrc2_user_sgpr(user_sgpr as u8);
+            }
+            pm4::SPI_SHADER_PGM_LO_ES => {
+                let base = self.sh_ctx.vs.es_regs.data_addr;
+                self.sh_ctx
+                    .set_es_shader_base((base & 0xFFFF_FF00_0000_00FF) | (u64::from(value) << 8));
+            }
+            pm4::SPI_SHADER_PGM_HI_ES => {
+                let base = self.sh_ctx.vs.es_regs.data_addr;
+                self.sh_ctx.set_es_shader_base(
+                    (base & 0xFFFF_00FF_FFFF_FFFF) | (u64::from(value & 0xFF) << 40),
+                );
+            }
+            pm4::SPI_SHADER_PGM_CHKSUM_GS => self.sh_ctx.push_gs_chksum(value),
+            pm4::SPI_SHADER_PGM_RSRC2_GS => {
+                let user_sgpr = pm4::field(value, pm4::spi_shader_pgm_rsrc2::USER_SGPR)
+                    + (pm4::field(value, pm4::spi_shader_pgm_rsrc2::USER_SGPR_MSB) << 5);
+                self.sh_ctx.set_gs_rsrc2_user_sgpr(user_sgpr as u8);
+            }
+            // RSRC1 carries VGPR/SGPR allocation and float-mode bits nothing
+            // on the ported parse path reads; consumed knowingly, not unknown.
+            pm4::SPI_SHADER_PGM_RSRC1_PS | pm4::SPI_SHADER_PGM_RSRC1_GS => {}
             _ => {
-                return Err(CpError::UnknownRegister {
-                    offset,
-                    file: RegFile::Shader,
-                    reg,
-                });
+                if self.first(SkipKey::Reg(RegFile::Shader, reg)) {
+                    warn!(
+                        reg = format_args!("{reg:#06x}"),
+                        "unknown shader register — write skipped"
+                    );
+                }
             }
         }
-        Ok(())
     }
 
     /// Kyty: `cp_op_set_uconfig_reg` (L3332). Bit 28 is the "neo" flag and is
@@ -675,28 +1197,37 @@ impl CommandProcessor {
         offset: u32,
     ) -> Result<u32, CpError> {
         let reg = Self::body_at(body, 0, offset)? & 0xEFFF_FFFF;
-        if reg as usize >= pm4::UC_NUM {
-            return Err(CpError::RegisterOutOfRange {
-                offset,
-                file: RegFile::UserConfig,
-                reg,
-            });
-        }
         let values = &body[1..];
         let count = Self::reg_count(cmd_id, values, offset)?;
         for (i, &value) in values.iter().enumerate().take(count) {
-            match reg + i as u32 {
-                pm4::VGT_PRIMITIVE_TYPE => self.ucfg.prim_type = value,
-                other => {
-                    return Err(CpError::UnknownRegister {
-                        offset,
-                        file: RegFile::UserConfig,
-                        reg: other,
-                    });
+            self.set_uconfig_register(reg + i as u32, value);
+        }
+        Ok(count as u32 + 1)
+    }
+
+    /// Kyty: `g_hw_uc_func` / `g_hw_uc_indirect_func` — one entry
+    /// (`VGT_PRIMITIVE_TYPE`).
+    fn set_uconfig_register(&mut self, reg: u32, value: u32) {
+        if reg as usize >= pm4::UC_NUM {
+            if self.first(SkipKey::Reg(RegFile::UserConfig, reg)) {
+                warn!(
+                    reg = format_args!("{reg:#06x}"),
+                    "user-config register index out of range — write skipped"
+                );
+            }
+            return;
+        }
+        match reg {
+            pm4::VGT_PRIMITIVE_TYPE => self.ucfg.prim_type = value,
+            _ => {
+                if self.first(SkipKey::Reg(RegFile::UserConfig, reg)) {
+                    warn!(
+                        reg = format_args!("{reg:#06x}"),
+                        "unknown user-config register — write skipped"
+                    );
                 }
             }
         }
-        Ok(count as u32 + 1)
     }
 
     fn body_at(body: &[u32], idx: usize, offset: u32) -> Result<u32, CpError> {
@@ -711,7 +1242,7 @@ impl CommandProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pm4::header;
+    use crate::pm4::{ItOp, RCode, header};
 
     #[derive(Default)]
     struct RecordingSink {
@@ -742,9 +1273,72 @@ mod tests {
         }
     }
 
+    /// A sink that records the full [`IndexedDraw`], overriding the default
+    /// degradation.
+    #[derive(Default)]
+    struct IndexedSink {
+        auto_draws: Vec<u32>,
+        indexed: Vec<IndexedDraw>,
+    }
+
+    impl DrawSink for IndexedSink {
+        fn draw_index_auto(
+            &mut self,
+            _ctx: &Context,
+            _ucfg: &UserConfig,
+            _sh: &Shader,
+            index_count: u32,
+            _flags: u32,
+        ) -> Result<(), DrawError> {
+            self.auto_draws.push(index_count);
+            Ok(())
+        }
+        fn draw_index(
+            &mut self,
+            _ctx: &Context,
+            _ucfg: &UserConfig,
+            _sh: &Shader,
+            draw: &IndexedDraw,
+        ) -> Result<(), DrawError> {
+            self.indexed.push(*draw);
+            Ok(())
+        }
+    }
+
+    /// Guest memory backed by a plain buffer at a fixed base address.
+    struct BufMem {
+        base: u64,
+        words: Vec<u32>,
+    }
+
+    impl GuestMemory for BufMem {
+        fn read_dwords(&self, addr: u64, count: u32) -> Option<Vec<u32>> {
+            let rel = addr.checked_sub(self.base)?;
+            if rel % 4 != 0 {
+                return None;
+            }
+            let start = usize::try_from(rel / 4).ok()?;
+            let end = start.checked_add(count as usize)?;
+            self.words.get(start..end).map(<[u32]>::to_vec)
+        }
+    }
+
     /// Body dwords the AGC embedded/draw packets declare, as padding.
     fn pad(n: usize) -> Vec<u32> {
         vec![0; n]
+    }
+
+    /// The AGC draw packet plus the register state that makes it meaningful:
+    /// prim type 17 then `R_DRAW_INDEX_AUTO` with count 3.
+    fn state_and_draw() -> Vec<u32> {
+        let mut dcb = vec![
+            header(3, pm4::IT_SET_UCONFIG_REG, pm4::R_ZERO),
+            pm4::VGT_PRIMITIVE_TYPE,
+            17,
+        ];
+        dcb.extend_from_slice(&[header(7, pm4::IT_NOP, pm4::R_DRAW_INDEX_AUTO), 3, 0]);
+        dcb.extend(pad(4));
+        dcb
     }
 
     #[test]
@@ -756,6 +1350,79 @@ mod tests {
         cp.run(&dcb, &mut sink).expect("embedded PS packet");
         assert!(cp.get_sh_ctx().ps.ps_embedded);
         assert_eq!(cp.get_sh_ctx().ps.ps_embedded_id, 0);
+    }
+
+    /// One `IT_SET_SH_REG` packet: `reg` then `values`.
+    fn set_sh(reg: u32, values: &[u32]) -> Vec<u32> {
+        let mut dcb = vec![
+            header((values.len() + 2) as u16, pm4::IT_SET_SH_REG, pm4::R_ZERO),
+            reg,
+        ];
+        dcb.extend_from_slice(values);
+        dcb
+    }
+
+    /// Gen5 binds the PS stage by writing `SPI_SHADER_PGM_LO/HI_PS` +
+    /// `CHKSUM_PS` + `RSRC2_PS` as plain SH registers (Kyty's
+    /// `g_hw_sh_indirect_func`). The CP must compose the 40-bit code address,
+    /// accumulate the checksum across both writes, decode `USER_SGPR` with its
+    /// MSB extension, and clear the embedded flag.
+    #[test]
+    fn sh_pgm_ps_registers_bind_a_real_pixel_shader() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let mut dcb = vec![header(40, pm4::IT_NOP, pm4::R_PS_EMBEDDED), 0];
+        dcb.extend(pad(38)); // embedded first, so the bind must *clear* it
+        dcb.extend(set_sh(pm4::SPI_SHADER_PGM_LO_PS, &[0x00C0_FFEE]));
+        dcb.extend(set_sh(pm4::SPI_SHADER_PGM_HI_PS, &[0x12])); // low byte only
+        dcb.extend(set_sh(pm4::SPI_SHADER_PGM_CHKSUM_PS, &[0xAAAA_0001]));
+        dcb.extend(set_sh(pm4::SPI_SHADER_PGM_CHKSUM_PS, &[0xBBBB_0002]));
+        // USER_SGPR = 0x1F at bit 1, MSB at bit 27 -> 0x1F + 0x20 = 0x3F.
+        dcb.extend(set_sh(
+            pm4::SPI_SHADER_PGM_RSRC2_PS,
+            &[(0x1F << 1) | (1 << 27)],
+        ));
+        cp.run(&dcb, &mut sink).expect("SH shader-bind packets");
+
+        let ps = &cp.get_sh_ctx().ps;
+        assert!(!ps.ps_embedded, "a real bind clears the embedded flag");
+        assert_eq!(
+            ps.ps_regs.data_addr,
+            (0x00C0_FFEEu64 << 8) | (0x12u64 << 40)
+        );
+        assert_eq!(ps.ps_regs.chksum, 0xAAAA_0001_BBBB_0002);
+        assert_eq!(ps.ps_regs.rsrc2.user_sgpr, 0x3F);
+    }
+
+    /// The Gen5 vertex stage rides the ES/GS registers: `PGM_LO/HI_ES` set the
+    /// code base, `CHKSUM_GS` carries the identity `shader_parse_vs` reads in
+    /// next-gen mode, `RSRC2_GS` the user-SGPR count, and user data lands in
+    /// the GS slots. Together they form exactly the "gs instead of vs" state.
+    #[test]
+    fn sh_pgm_es_gs_registers_bind_a_real_vertex_stage() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let mut dcb = vec![header(29, pm4::IT_NOP, pm4::R_VS_EMBEDDED), 0, 0];
+        dcb.extend(pad(26));
+        dcb.extend(set_sh(pm4::SPI_SHADER_PGM_LO_ES, &[0x0000_1000]));
+        dcb.extend(set_sh(pm4::SPI_SHADER_PGM_HI_ES, &[0x00]));
+        dcb.extend(set_sh(pm4::SPI_SHADER_PGM_CHKSUM_GS, &[0x1234_5678]));
+        dcb.extend(set_sh(pm4::SPI_SHADER_PGM_CHKSUM_GS, &[0x9ABC_DEF0]));
+        dcb.extend(set_sh(pm4::SPI_SHADER_PGM_RSRC2_GS, &[0x4 << 1]));
+        dcb.extend(set_sh(pm4::SPI_SHADER_USER_DATA_GS_0 + 2, &[0xFEED]));
+        cp.run(&dcb, &mut sink).expect("ES/GS shader-bind packets");
+
+        let vs = &cp.get_sh_ctx().vs;
+        assert!(!vs.vs_embedded, "a real bind clears the embedded flag");
+        assert_eq!(
+            vs.vs_regs.data_addr, 0,
+            "vs base stays 0 (gs-instead-of-vs)"
+        );
+        assert_eq!(vs.es_regs.data_addr, 0x0000_1000u64 << 8);
+        assert_eq!(vs.gs_regs.chksum, 0x1234_5678_9ABC_DEF0);
+        assert_eq!(vs.gs_regs.rsrc2.user_sgpr, 4);
+        assert_eq!(vs.gs_user_sgpr.value[2], 0xFEED);
+        assert_eq!(vs.gs_user_sgpr.count, 3, "high-water mark from slot 2");
     }
 
     #[test]
@@ -877,14 +1544,7 @@ mod tests {
     fn r_draw_index_auto_invokes_sink_with_prim_type_and_count() {
         let mut cp = CommandProcessor::new();
         let mut sink = RecordingSink::default();
-        let mut dcb = vec![
-            header(3, pm4::IT_SET_UCONFIG_REG, pm4::R_ZERO),
-            pm4::VGT_PRIMITIVE_TYPE,
-            17,
-        ];
-        dcb.extend_from_slice(&[header(7, pm4::IT_NOP, pm4::R_DRAW_INDEX_AUTO), 3, 0]);
-        dcb.extend(pad(4));
-        cp.run(&dcb, &mut sink).expect("draw");
+        cp.run(&state_and_draw(), &mut sink).expect("draw");
         assert_eq!(sink.draws, [(3, 0, 17, false, false)]);
     }
 
@@ -913,43 +1573,88 @@ mod tests {
         // COUNT claims 8 total dwords; only 2 are present.
         let dcb = vec![header(8, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO), 0];
         let err = cp.run(&dcb, &mut sink).expect_err("must not overrun");
-        assert!(
-            matches!(
-                err,
-                CpError::Truncated { .. } | CpError::UnknownRegister { .. }
-            ),
-            "got {err:?}"
+        assert!(matches!(err, CpError::Truncated { .. }), "got {err:?}");
+    }
+
+    /// Resilience policy: an unknown register is a rate-limited warn and a
+    /// skipped write — and the rest of the batch still lands.
+    #[test]
+    fn unknown_register_is_skipped_and_the_batch_continues() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        // Two-register batch: 0x8D is unknown, 0x8E is CB_TARGET_MASK.
+        let dcb = vec![
+            header(4, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
+            pm4::CB_TARGET_MASK - 1,
+            0xAAAA,
+            0xF,
+        ];
+        cp.run(&dcb, &mut sink).expect("unknown register must skip");
+        assert_eq!(
+            cp.get_ctx().render_target_mask,
+            0xF,
+            "the known register after the unknown one must still be written"
         );
+        assert_eq!(cp.distinct_skips(), 1);
+    }
+
+    /// The priority-1 resilience test: a DCB of [unknown op, then a valid
+    /// DRAW_INDEX_AUTO with render state] still produces the draw.
+    #[test]
+    fn unknown_opcode_is_skipped_and_the_draw_still_lands() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let mut dcb = vec![header(3, ItOp(0xEE), pm4::R_ZERO), 0, 0];
+        dcb.extend(state_and_draw());
+        cp.run(&dcb, &mut sink)
+            .expect("an unknown op must not kill the DCB");
+        assert_eq!(sink.draws, [(3, 0, 17, false, false)]);
+        assert_eq!(cp.distinct_skips(), 1);
     }
 
     #[test]
-    fn unknown_register_is_a_named_error_not_a_panic() {
+    fn unknown_custom_op_is_skipped_and_the_draw_still_lands() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        // RCode 0x3F is unassigned in Kyty's table.
+        let mut dcb = vec![header(4, pm4::IT_NOP, RCode(0x3F)), 0, 0, 0];
+        dcb.extend(state_and_draw());
+        cp.run(&dcb, &mut sink)
+            .expect("an unknown custom op must not kill the DCB");
+        assert_eq!(sink.draws.len(), 1);
+    }
+
+    /// Once per distinct op per instance: the same unknown op twice warns once
+    /// and both packets are skipped.
+    #[test]
+    fn unknown_op_warns_once_per_distinct_op() {
         let mut cp = CommandProcessor::new();
         let mut sink = RecordingSink::default();
         let dcb = vec![
-            header(3, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
-            0x3FE,
-            0xAAAA,
+            header(2, ItOp(0xEE), pm4::R_ZERO),
+            0,
+            header(2, ItOp(0xEE), pm4::R_ZERO),
+            0,
+            header(2, ItOp(0xEF), pm4::R_ZERO),
+            0,
         ];
-        let err = cp.run(&dcb, &mut sink).expect_err("unknown register");
-        match err {
-            CpError::UnknownRegister { file, reg, .. } => {
-                assert_eq!(file, RegFile::Context);
-                assert_eq!(reg, 0x3FE);
-            }
-            other => panic!("expected UnknownRegister, got {other:?}"),
-        }
+        cp.run(&dcb, &mut sink).expect("skips");
+        assert_eq!(
+            cp.distinct_skips(),
+            2,
+            "two distinct ops => two rate-limit keys, repeats coalesce"
+        );
     }
 
+    /// An unknown op whose declared length runs past the buffer is still a
+    /// hard structural error — skip-by-length must not read past the end.
     #[test]
-    fn unknown_opcode_names_the_op() {
+    fn unknown_op_with_overlong_length_is_still_truncated() {
         let mut cp = CommandProcessor::new();
         let mut sink = RecordingSink::default();
-        let dcb = vec![header(2, ItOp(0xEE), pm4::R_ZERO), 0];
-        match cp.run(&dcb, &mut sink) {
-            Err(CpError::UnknownOp { op, .. }) => assert_eq!(op, ItOp(0xEE)),
-            other => panic!("expected UnknownOp, got {other:?}"),
-        }
+        let dcb = vec![header(16, ItOp(0xEE), pm4::R_ZERO), 0];
+        let err = cp.run(&dcb, &mut sink).expect_err("must not overrun");
+        assert!(matches!(err, CpError::Truncated { .. }), "got {err:?}");
     }
 
     #[test]
@@ -988,5 +1693,331 @@ mod tests {
     #[test]
     fn new_starts_with_one_instance() {
         assert_eq!(CommandProcessor::new().num_instances(), 1);
+    }
+
+    // ---- index state -----------------------------------------------------
+
+    /// Gen5 `GraphicsDcbSetIndexSize` emits `IT_INDEX_TYPE` (Graphics.cpp
+    /// L1949); the CP latches it like Kyty's `SetIndexType`.
+    #[test]
+    fn index_type_base_and_size_are_tracked() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            header(2, pm4::IT_INDEX_TYPE, pm4::R_ZERO),
+            2, // 32-bit indices
+            header(3, pm4::IT_INDEX_BASE, pm4::R_ZERO),
+            0x5000,
+            0x1,
+            header(2, pm4::IT_INDEX_BUFFER_SIZE, pm4::R_ZERO),
+            600,
+        ];
+        cp.run(&dcb, &mut sink).expect("index state");
+        assert_eq!(cp.index_type_and_size(), 2);
+        assert_eq!(cp.index_base(), 0x1_0000_5000);
+        assert_eq!(cp.index_buffer_size(), 600);
+    }
+
+    /// Kyty: `cp_op_draw_reset` → `CommandProcessor::Reset`. Register and
+    /// index state clear; the warn rate-limit survives.
+    #[test]
+    fn r_draw_reset_clears_state_but_keeps_the_rate_limit() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            header(2, pm4::IT_INDEX_TYPE, pm4::R_ZERO),
+            2,
+            header(2, ItOp(0xEE), pm4::R_ZERO), // arm the rate limit
+            0,
+            header(2, pm4::IT_NOP, pm4::R_DRAW_RESET),
+            0,
+        ];
+        cp.run(&dcb, &mut sink).expect("reset packet");
+        assert_eq!(cp.index_type_and_size(), 0, "reset must clear index state");
+        assert_eq!(cp.num_instances(), 1);
+        assert_eq!(
+            cp.distinct_skips(),
+            1,
+            "the rate limit must survive a reset"
+        );
+    }
+
+    // ---- indexed draws ----------------------------------------------------
+
+    /// AGC form (Kyty cmd 0xC008100C): `[count, addr_lo, addr_hi, flags,
+    /// type]`. A sink that implements `draw_index` sees the full parameters.
+    #[test]
+    fn r_draw_index_delivers_the_full_indexed_draw() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = IndexedSink::default();
+        let mut dcb = vec![header(2, pm4::IT_INDEX_TYPE, pm4::R_ZERO), 2];
+        dcb.extend_from_slice(&[
+            header(10, pm4::IT_NOP, pm4::R_DRAW_INDEX),
+            6,      // index_count
+            0x5000, // addr lo
+            0x1,    // addr hi
+            0xA,    // flags
+            0x2,    // type
+        ]);
+        dcb.extend(pad(4));
+        cp.run(&dcb, &mut sink).expect("indexed draw");
+        assert_eq!(
+            sink.indexed,
+            [IndexedDraw {
+                index_type_and_size: 2,
+                index_count: 6,
+                index_addr: 0x1_0000_5000,
+                flags: 0xA,
+                index_type: 0x2,
+            }]
+        );
+    }
+
+    /// The default `draw_index` degrades to a vertex-count-only auto draw —
+    /// this is what `OffscreenDrawSink` inherits.
+    #[test]
+    fn indexed_draw_degrades_to_auto_draw_by_default() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let mut dcb = vec![
+            header(3, pm4::IT_SET_UCONFIG_REG, pm4::R_ZERO),
+            pm4::VGT_PRIMITIVE_TYPE,
+            4,
+        ];
+        dcb.extend_from_slice(&[
+            header(10, pm4::IT_NOP, pm4::R_DRAW_INDEX),
+            6,
+            0x5000,
+            0,
+            0,
+            0,
+        ]);
+        dcb.extend(pad(4));
+        cp.run(&dcb, &mut sink).expect("degraded indexed draw");
+        assert_eq!(
+            sink.draws,
+            [(6, 0, 4, false, false)],
+            "index_count becomes the vertex count"
+        );
+    }
+
+    /// Raw `IT_DRAW_INDEX_2` form (Kyty cmd 0xc0042700): count, addr, dup
+    /// count, zero — Kyty passes flags=0, type=1.
+    #[test]
+    fn it_draw_index_2_is_an_indexed_draw_with_type_1() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = IndexedSink::default();
+        let dcb = vec![
+            header(6, pm4::IT_DRAW_INDEX_2, pm4::R_ZERO),
+            3,      // index_count
+            0x2000, // addr lo
+            0,      // addr hi
+            3,      // Kyty asserts this duplicates the count
+            0,
+        ];
+        cp.run(&dcb, &mut sink).expect("raw indexed draw");
+        assert_eq!(
+            sink.indexed,
+            [IndexedDraw {
+                index_type_and_size: 0,
+                index_count: 3,
+                index_addr: 0x2000,
+                flags: 0,
+                index_type: 1,
+            }]
+        );
+    }
+
+    // ---- indirect draws ---------------------------------------------------
+
+    /// `SET_BASE(1)` + `DRAW_INDIRECT` with a readable args buffer degrades to
+    /// an auto draw whose count comes from guest memory.
+    #[test]
+    fn draw_indirect_reads_count_from_guest_args() {
+        let mem = BufMem {
+            base: 0x9000,
+            // args records: {count, instance_count, first, first_instance}
+            words: vec![12, 1, 0, 0, 24, 1, 0, 0],
+        };
+        let mut cp = CommandProcessor::new();
+        let mut sink = IndexedSink::default();
+        let dcb = vec![
+            header(4, pm4::IT_SET_BASE, pm4::R_ZERO),
+            1, // base select: indirect args
+            0x9000,
+            0,
+            header(5, pm4::IT_DRAW_INDIRECT, pm4::R_ZERO),
+            16, // data offset -> second record
+            0,
+            0,
+            0,
+        ];
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("indirect draw");
+        assert_eq!(cp.indirect_draw_base(), 0x9000);
+        assert_eq!(
+            sink.auto_draws,
+            [24],
+            "count comes from the args record at base+offset"
+        );
+    }
+
+    /// The indexed indirect form routes through `draw_index` with the tracked
+    /// index-buffer state.
+    #[test]
+    fn draw_index_indirect_degrades_to_an_indexed_draw() {
+        let mem = BufMem {
+            base: 0x9000,
+            words: vec![36, 1, 0, 0, 0],
+        };
+        let mut cp = CommandProcessor::new();
+        let mut sink = IndexedSink::default();
+        let dcb = vec![
+            header(3, pm4::IT_INDEX_BASE, pm4::R_ZERO),
+            0x5000,
+            0,
+            header(4, pm4::IT_SET_BASE, pm4::R_ZERO),
+            1,
+            0x9000,
+            0,
+            header(6, pm4::IT_DRAW_INDEX_INDIRECT_MULTI, pm4::R_ZERO),
+            0, // data offset
+            0,
+            0,
+            0,
+            0,
+        ];
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("indexed indirect draw");
+        assert_eq!(sink.indexed.len(), 1);
+        assert_eq!(sink.indexed[0].index_count, 36);
+        assert_eq!(sink.indexed[0].index_addr, 0x5000);
+    }
+
+    /// Without a memory reader (or without SET_BASE) an indirect draw is a
+    /// logged skip, never an error and never a draw.
+    #[test]
+    fn draw_indirect_without_memory_or_base_is_skipped() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = IndexedSink::default();
+        // No SET_BASE.
+        let dcb = vec![header(5, pm4::IT_DRAW_INDIRECT, pm4::R_ZERO), 0, 0, 0, 0];
+        cp.run(&dcb, &mut sink).expect("skip");
+        assert!(sink.auto_draws.is_empty());
+
+        // SET_BASE but no memory reader.
+        let dcb = vec![
+            header(4, pm4::IT_SET_BASE, pm4::R_ZERO),
+            1,
+            0x9000,
+            0,
+            header(5, pm4::IT_DRAW_INDIRECT, pm4::R_ZERO),
+            0,
+            0,
+            0,
+            0,
+        ];
+        cp.run(&dcb, &mut sink).expect("skip without memory");
+        assert!(sink.auto_draws.is_empty());
+        assert!(cp.distinct_skips() >= 2);
+    }
+
+    // ---- indirect registers -----------------------------------------------
+
+    /// Kyty: `cp_op_indirect_cx_regs` — `(offset, value)` pairs fetched from
+    /// guest memory feed the same per-register setters as direct writes.
+    #[test]
+    fn cx_regs_indirect_feeds_the_context_setters() {
+        let mem = BufMem {
+            base: 0x4000,
+            words: vec![
+                pm4::CB_COLOR0_ATTRIB2,
+                (95 << 14) | 47,
+                pm4::CB_TARGET_MASK,
+                0xF,
+            ],
+        };
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            header(4, pm4::IT_NOP, pm4::R_CX_REGS_INDIRECT),
+            2, // num_regs
+            0x4000,
+            0,
+        ];
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("indirect cx regs");
+        let rt = &cp.get_ctx().render_targets[0];
+        assert_eq!((rt.attrib2.width, rt.attrib2.height), (95, 47));
+        assert_eq!(cp.get_ctx().render_target_mask, 0xF);
+    }
+
+    #[test]
+    fn sh_and_uc_regs_indirect_feed_their_setters() {
+        let mem = BufMem {
+            base: 0x4000,
+            words: vec![
+                // sh pairs at 0x4000
+                pm4::SPI_SHADER_USER_DATA_VS_0,
+                0xBEEF,
+                // uc pairs at 0x4008
+                pm4::VGT_PRIMITIVE_TYPE,
+                17,
+            ],
+        };
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            header(4, pm4::IT_NOP, pm4::R_SH_REGS_INDIRECT),
+            1,
+            0x4000,
+            0,
+            header(4, pm4::IT_NOP, pm4::R_UC_REGS_INDIRECT),
+            1,
+            0x4008,
+            0,
+        ];
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("indirect sh/uc regs");
+        assert_eq!(cp.get_sh_ctx().vs.vs_user_sgpr.value[0], 0xBEEF);
+        assert_eq!(cp.get_ucfg().prim_type, 17);
+    }
+
+    /// Without a memory reader the indirect-register packet is skipped (warn
+    /// once), not a fault — and the rest of the DCB still executes.
+    #[test]
+    fn regs_indirect_without_memory_skips_and_continues() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let mut dcb = vec![
+            header(4, pm4::IT_NOP, pm4::R_CX_REGS_INDIRECT),
+            2,
+            0x4000,
+            0,
+        ];
+        dcb.extend(state_and_draw());
+        cp.run(&dcb, &mut sink).expect("skip indirect regs");
+        assert_eq!(sink.draws.len(), 1, "the draw after the skip still lands");
+        assert_eq!(cp.distinct_skips(), 1);
+    }
+
+    /// An unreadable pointer is guest data, not a stream fault: warn + skip.
+    #[test]
+    fn regs_indirect_with_unreadable_pointer_skips() {
+        let mem = BufMem {
+            base: 0x4000,
+            words: vec![0; 2],
+        };
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            header(4, pm4::IT_NOP, pm4::R_CX_REGS_INDIRECT),
+            8, // more pairs than the buffer holds
+            0x4000,
+            0,
+        ];
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("unreadable pointer skips");
+        assert_eq!(cp.distinct_skips(), 1);
     }
 }

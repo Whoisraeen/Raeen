@@ -78,21 +78,42 @@ pub enum RunOutcome {
 /// only [`arena::GuestArena`]'s reservation mechanism is Windows-specific.
 pub const GUEST_ARENA_BASE: u64 = 0x0000_1000_0000_0000;
 
-/// The base of the static TLS block sitting immediately below `tcb` (variant-II
-/// x86-64: the block grows downward from the thread pointer), or `None` when
-/// there is no static TLS to speak of.
+/// The base of the static TLS **area** sitting immediately below `tcb`
+/// (variant-II x86-64: every module's block grows downward from the thread
+/// pointer), or `None` when nothing in the process has static TLS.
 ///
-/// This is the address the linker's `TPOFF64` offsets resolve against, and
-/// therefore the one `__tls_get_addr` must return for the main module's
-/// thread-locals — the ELF TLS ABI requires a variable reached through the
-/// general-dynamic model to land on the same storage as through initial-exec.
-/// Handing out a second block instead is a measured Minecraft crash: its single
-/// `.tdata` pointer read back as `NULL` from the uninitialized copy.
-fn static_tls_block(tcb: Option<u64>, tls: Option<&xps5x_firmware::TlsTemplate>) -> Option<u64> {
-    match (tcb, tls) {
-        (Some(tcb), Some(tls)) => tcb.checked_sub(tls.block_size()),
+/// This is the low end of the storage the linker's `TPOFF64` offsets resolve
+/// into, and the base `__tls_get_addr` resolves static TLS module ids against
+/// (via the kernel's per-module area offsets) — the ELF TLS ABI requires a
+/// thread-local reached through the general-dynamic model to land on the same
+/// storage as through initial-exec. Handing out a second block instead is a
+/// measured Minecraft crash: its single `.tdata` pointer read back as `NULL`
+/// from the uninitialized copy.
+fn static_tls_block(
+    tcb: Option<u64>,
+    tls_layout: &[xps5x_firmware::StaticTlsModule],
+) -> Option<u64> {
+    let total = xps5x_firmware::static_tls_total(tls_layout);
+    match tcb {
+        Some(tcb) if total > 0 => tcb.checked_sub(total),
         _ => None,
     }
+}
+
+/// Publish the process's static TLS layout to the kernel, translating each
+/// module's `tp_offset` (distance below the thread pointer) into its offset
+/// from the area's LOW end — the form `__tls_get_addr` adds to
+/// `current_static_tls_block()`.
+fn register_static_tls_layout(
+    kernel: &OrbisKernel,
+    tls_layout: &[xps5x_firmware::StaticTlsModule],
+) {
+    let total = xps5x_firmware::static_tls_total(tls_layout);
+    kernel.set_static_tls_area_offsets(
+        tls_layout
+            .iter()
+            .map(|m| (m.module_id, total - m.tp_offset)),
+    );
 }
 
 /// How a faulting guest instruction was touching the address it faulted on —
@@ -261,11 +282,12 @@ pub fn execute_linked(
     // module's `PT_TLS` template (if any) is materialized below the TCB
     // (M1-B) so TLS-relocated accesses resolve against real init data.
     let tcb = if tls::fsgsbase_available() {
-        arena.setup_main_tcb(module.tls.as_ref())
+        arena.setup_main_tcb(&module.tls_layout)
     } else {
         None
     };
-    let static_tls_block = static_tls_block(tcb, module.tls.as_ref());
+    let static_tls_block = static_tls_block(tcb, &module.tls_layout);
+    register_static_tls_layout(kernel, &module.tls_layout);
 
     // SAFETY: `entry_ptr` is a host address inside `arena`'s
     // `PAGE_EXECUTE_READWRITE` image sub-region, at the caller-specified
@@ -481,11 +503,12 @@ fn execute_process_mapped(
     // `execute_linked` above, including the module's `PT_TLS` template and
     // the fs:0x28 canary (M1-B).
     let tcb = if tls::fsgsbase_available() {
-        arena.setup_main_tcb(module.tls.as_ref())
+        arena.setup_main_tcb(&module.tls_layout)
     } else {
         None
     };
-    let static_tls_block = static_tls_block(tcb, module.tls.as_ref());
+    let static_tls_block = static_tls_block(tcb, &module.tls_layout);
+    register_static_tls_layout(kernel, &module.tls_layout);
 
     // Lay out the process stack in the arena's stack region (design doc §2);
     // `process::build_process_stack` writes only through `&arena` (bounds-
@@ -511,6 +534,12 @@ fn execute_process_mapped(
     // `execute_linked`. The Orbis `_start(params, exit_fn)` register arguments
     // are supplied explicitly below; see `stack::enter_guest_at_start`'s doc.
     let entry = entry_ptr as u64;
+    let exit_fn = dispatch::process_exit_trampoline(&module.hle_trampolines).unwrap_or_else(|| {
+        tracing::warn!(
+            "process imports no terminating HLE function; Orbis _start exit_fn remains null"
+        );
+        0
+    });
 
     // SAFETY: `entry` is exactly the function pointer
     // `enter_guest_at_start`'s safety contract requires; `process_rsp` is the
@@ -585,12 +614,11 @@ fn execute_process_mapped(
             // `build_process_stack` just wrote (which is exactly what
             // `process_rsp` addresses), NOT at the stack in the Linux sense —
             // a real title does `mov r14d,[rdi]` / `lea r15,[rdi+8]` and would
-            // null-deref with rdi=0. `exit_fn` is passed as 0 for now: a
-            // well-formed entry only calls it to terminate, and it reaches
-            // `exit` through its own import first (which the VEH answers with
-            // the exit-longjmp); a guest that does call it faults, which RT1a
-            // recovers as `Faulted` rather than crashing the host.
-            || crate::stack::enter_guest(entry, process_rsp, [process_rsp, 0, 0, 0, 0, 0]),
+            // null-deref with rdi=0. `exit_fn` is a real terminating HLE
+            // trampoline. Retail crt0 preserves RSI and calls through it when
+            // startup terminates; the VEH turns that call into the normal
+            // process-exit longjmp.
+            || crate::stack::enter_guest(entry, process_rsp, [process_rsp, exit_fn, 0, 0, 0, 0]),
         )
     }
 }

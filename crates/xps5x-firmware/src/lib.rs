@@ -31,7 +31,8 @@ pub use registry::{ModulePolicy, ModuleRegistry, Resolver};
 pub use report::summarize;
 pub use slb2::{Slb2Entry, parse_slb2};
 pub use sprx::{
-    SprxModule, SprxSegment, TlsTemplate, UnwindInfo, parse_sprx, proc_param_sdk_version,
+    SprxModule, SprxSegment, StaticTlsModule, TlsTemplate, UnwindInfo, parse_sprx,
+    proc_param_sdk_version, static_tls_total,
 };
 
 use xps5x_core::error::FirmwareError;
@@ -260,6 +261,22 @@ fn build_hle_data_page(registry: &mut registry::ModuleRegistry, page_base: u64) 
     loopback[15] = 1;
     add("in6addr_loopback", &loopback, &mut page, &mut exports);
 
+    // `__progname` is libkernel's `char *` global naming the running program
+    // (BSD convention; libc uses it in error/abort messages). It is a POINTER
+    // export, so two entries live in the page: the string bytes, then the
+    // exported 8-byte slot holding their absolute guest address.
+    while !page.len().is_multiple_of(8) {
+        page.push(0);
+    }
+    let progname_offset = page.len() as u64;
+    page.extend_from_slice(b"eboot.bin\0");
+    add(
+        "__progname",
+        &(page_base + progname_offset).to_le_bytes(),
+        &mut page,
+        &mut exports,
+    );
+
     // Registered under "libkernel" purely for the log line; `resolve` is by NID
     // and ignores the declaring module.
     registry.register_module_exports_at("libkernel", &exports, page_base);
@@ -459,9 +476,9 @@ pub fn load_process(
             continue;
         };
         // A shipped file is loaded even when an HLE library of the same name
-        // exists. That is not a conflict: `ModuleRegistry::resolve` defaults to
-        // `PreferHle`, so our implementation still wins for every NID we
-        // actually implement, and the real module only supplies the rest.
+        // exists. The shipped module must own every import attributed to it:
+        // stateful APIs cannot safely mix its private runtime state with HLE
+        // state on a symbol-by-symbol basis.
         //
         // This matters enormously and used to be skipped. The measured title
         // ships its own `sce_module/libc.prx`, whose exports cover 86883 of its
@@ -472,7 +489,7 @@ pub fn load_process(
         if hle_libs.contains(stem) {
             tracing::info!(
                 "NEEDED {needed}: HLE library '{stem}' exists AND the title ships the real module \
-                 — loading it; HLE still wins per-NID (PreferHle), the file covers the rest"
+                 — loading it as the preferred provider for its own imports"
             );
         }
 
@@ -502,6 +519,7 @@ pub fn load_process(
 
         let dep_base = base.wrapping_add(next_offset);
         let image_len = dynlib::linker::image_size(&dep.module)? as u64;
+        registry.set_policy(needed, registry::ModulePolicy::PreferLle);
         registry.register_module_exports_at(needed, &dep.dynlib.exports, dep_base);
         tracing::info!(
             "NEEDED {needed}: at +{next_offset:#x} ({image_len:#x} bytes), {} export(s) registered",
@@ -518,9 +536,51 @@ pub fn load_process(
         next_offset = align_up_16k(next_offset + image_len);
     }
 
+    // Between the passes: assign every module with a (non-empty) `PT_TLS` its
+    // slot in the process-wide static TLS area, BEFORE anything links —
+    // `TPOFF64`/`DTPMOD64` values are baked in during pass 2. Variant-II
+    // packing: the main module sits directly below the TCB (preserving the
+    // single-module layout its `TPOFF64`s always had), each dependency below
+    // the previous, aligned to `max(p_align, 16)`. Skipping this assignment is
+    // not a lesser mode, it is the measured retail-title TLS corruption: four
+    // modules' thread-locals folded onto the eboot's block (see
+    // `sprx::StaticTlsModule`).
+    let mut tls_layout: Vec<sprx::StaticTlsModule> = Vec::new();
+    let mut tls_cursor = 0u64;
+    let mut assign_tls = |name: &str, tls: &Option<sprx::TlsTemplate>| {
+        let template = tls.as_ref().filter(|t| t.mem_size > 0)?;
+        let align = template.align.max(16);
+        tls_cursor = (tls_cursor + template.mem_size).div_ceil(align) * align;
+        let module_id = tls_layout.len() as u64 + 1;
+        tls_layout.push(sprx::StaticTlsModule {
+            name: name.to_string(),
+            module_id,
+            tp_offset: tls_cursor,
+            template: template.clone(),
+        });
+        tracing::info!(
+            "static TLS: module {module_id} '{name}' at tp-{tls_cursor:#x} \
+             (memsz {:#x}, tdata {:#x})",
+            template.mem_size,
+            template.data.len()
+        );
+        Some(dynlib::linker::TlsAssignment {
+            module_id,
+            tp_offset: tls_cursor,
+        })
+    };
+    // TLS module ids count the modules that HAVE TLS, in load order — the
+    // main module first, so when it has a `PT_TLS` it keeps the id 1 its
+    // relocations have always resolved to.
+    let main_tls_assignment = assign_tls(&module.name, &module.tls);
+    let dep_tls_assignments: Vec<Option<dynlib::linker::TlsAssignment>> = pending
+        .iter()
+        .map(|p| assign_tls(&p.name, &p.decoded.module.tls))
+        .collect();
+
     // PASS 2: every export in the process is now registered, so each module can
     // resolve against all the others regardless of DT_NEEDED order.
-    for p in &pending {
+    for (p, tls_assignment) in pending.iter().zip(&dep_tls_assignments) {
         let linked = match dynlib::linker::link_module_into(
             &p.decoded.module,
             &p.decoded.dynlib,
@@ -528,6 +588,7 @@ pub fn load_process(
             hle,
             p.base,
             &mut tables,
+            *tls_assignment,
         ) {
             Ok(l) => l,
             Err(e) => {
@@ -558,8 +619,15 @@ pub fn load_process(
     // and sharing the same `tables`, so its marker indices continue the
     // dependencies' rather than colliding with them.
     registry.register_module_exports_at(&module.name, &dynlib_data.exports, base);
-    let mut linked =
-        dynlib::linker::link_module_into(&module, &dynlib_data, registry, hle, base, &mut tables)?;
+    let mut linked = dynlib::linker::link_module_into(
+        &module,
+        &dynlib_data,
+        registry,
+        hle,
+        base,
+        &mut tables,
+        main_tls_assignment,
+    )?;
 
     // Compose: main module already occupies [0, its image len); splice each
     // dependency in at its offset.
@@ -585,6 +653,11 @@ pub fn load_process(
     linked.hle_trampolines = tables.hle_trampolines().to_vec();
     linked.unresolved_stubs = tables.unresolved_stubs().to_vec();
     linked.unwind_modules.extend(dep_unwind_modules);
+    // The composed module carries the PROCESS layout, not just its own slot:
+    // the runtime sizes every thread's static area from this and copies each
+    // module's `.tdata` into place, and `__tls_get_addr` resolves each TLS
+    // module id against it.
+    linked.tls_layout = tls_layout;
 
     // Each dependency's `module_start` (DT_INIT), in load order — dependencies
     // before the main module, which is what a real loader does and what the
@@ -686,6 +759,30 @@ mod tests {
         let mut expected = [0u8; 16];
         expected[15] = 1;
         assert_eq!(&page[loopback_offset..loopback_offset + 16], &expected);
+    }
+
+    #[test]
+    fn hle_data_page_exports_progname_as_a_pointer_to_the_program_name() {
+        let hle = xps5x_hle::HleRegistry::new();
+        let mut registry = ModuleRegistry::new(NidDatabase::from_hle(&hle));
+        let base = 0x1000;
+        let page = super::build_hle_data_page(&mut registry, base);
+
+        // The real title imports __progname by the NID in nid_names.txt;
+        // pin the hash so the export is reachable by that exact identity.
+        assert_eq!(nid_of("__progname"), 0x763c_713a_65ba_fdac);
+
+        let addr = match registry.resolve(&hle, "eboot.bin", nid_of("__progname")) {
+            Resolver::Lle { addr, .. } => addr,
+            other => panic!("__progname must resolve as guest data, got {other:?}"),
+        };
+        // The exported slot holds a pointer into the same page…
+        let slot = usize::try_from(addr - base).expect("page-relative address");
+        let target = u64::from_le_bytes(page[slot..slot + 8].try_into().unwrap());
+        assert!(target > base && target < base + page.len() as u64);
+        // …and that pointer names the program.
+        let str_off = usize::try_from(target - base).expect("page-relative string");
+        assert_eq!(&page[str_off..str_off + 10], b"eboot.bin\0");
     }
 
     #[test]

@@ -28,7 +28,9 @@ pub mod kernel_semaphore;
 pub mod kernel_socket;
 pub mod libc;
 pub mod libkernel;
+pub mod libsce_acm;
 pub mod libsce_agc;
+pub(crate) mod libsce_agc_reg_defaults;
 pub mod libsce_ampr;
 pub mod libsce_app_content;
 pub mod libsce_audio_out;
@@ -64,6 +66,7 @@ pub mod libsce_system_service;
 pub mod libsce_text_to_speech2;
 pub mod libsce_user_service;
 pub mod libsce_video_out;
+pub mod posix_sem;
 pub mod pthread_attr;
 pub mod pthread_cond;
 pub mod pthread_sync;
@@ -297,6 +300,8 @@ impl HleRegistry {
         kernel_eventflag::register(&registry);
         // Kernel counting semaphores (create/signal/wait/poll/cancel/delete).
         kernel_semaphore::register(&registry);
+        // POSIX (address-based) semaphores — sem_init/wait/timedwait/post.
+        posix_sem::register(&registry);
         // Kernel event queues + user events (supersedes libkernel's equeue stubs).
         kernel_equeue::register(&registry);
         // BSD sockets (offline) + pure net helpers (htons/inet_pton/bzero).
@@ -329,6 +334,7 @@ impl HleRegistry {
         libsce_fiber::register(&registry);
         libsce_media::register(&registry);
         libsce_agc::register(&registry);
+        libsce_acm::register(&registry);
         libsce_ampr::register(&registry);
         // SharpEmu-ported service-library handshake stubs (no host backend):
         libsce_np_trophy2::register(&registry);

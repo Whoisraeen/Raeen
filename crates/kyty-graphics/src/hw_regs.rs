@@ -506,6 +506,31 @@ impl Shader {
         self.ps.ps_embedded_id = id;
         self.ps.ps_embedded = true;
     }
+
+    /// Kyty: `Shader::SetEsShaderBase` (L913). Gen5's "gs instead of vs" wave
+    /// puts the vertex-stage code behind the ES base; a real bind clears the
+    /// embedded flag.
+    pub fn set_es_shader_base(&mut self, addr: u64) {
+        self.vs.es_regs.data_addr = addr;
+        self.vs.vs_embedded = false;
+    }
+
+    /// Kyty: `SetGsShaderChksum` (L928) — accumulates across two writes.
+    pub fn push_gs_chksum(&mut self, value: u32) {
+        self.vs.gs_regs.chksum = (self.vs.gs_regs.chksum << 32) | u64::from(value);
+    }
+
+    /// Kyty: `SetGsShaderResource2` (L923). Clears the embedded flag.
+    pub fn set_gs_rsrc2_user_sgpr(&mut self, user_sgpr: u8) {
+        self.vs.gs_regs.rsrc2.user_sgpr = user_sgpr;
+        self.vs.vs_embedded = false;
+    }
+
+    /// Kyty: `SetPsShaderResource2` (L944). Clears the embedded flag.
+    pub fn set_ps_rsrc2_user_sgpr(&mut self, user_sgpr: u8) {
+        self.ps.ps_regs.rsrc2.user_sgpr = user_sgpr;
+        self.ps.ps_embedded = false;
+    }
 }
 
 impl PsStageRegisters {

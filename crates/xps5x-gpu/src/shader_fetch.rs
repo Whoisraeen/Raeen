@@ -1,0 +1,672 @@
+//! ShaderMemory Phase 2: fetch a title's real shader code out of guest
+//! memory, recompile it to SPIR-V through `kyty-graphics`, and cache the
+//! result — with honest, named degradation when translation fails.
+//!
+//! # How the byte length is determined
+//!
+//! There is no length register: Kyty's `shader_parse` walks the instruction
+//! stream until `s_endpgm` and treats running off the end of the buffer as
+//! [`ShaderParseError::Truncated`]. This module mirrors that: it reads the
+//! guest window in bounded 4 KiB chunks (capped at 256 KiB), hands the window
+//! to the parser, and grows the window only when the parser itself says it
+//! ran out of bytes. A window that stops growing because the guest mapping
+//! ends is a named failure, never a fault.
+//!
+//! # Caching (positive and negative)
+//!
+//! Titles re-bind the same shaders every frame. Results are cached keyed by
+//! `(stage, guest_addr, first 16 code bytes)`; failures are cached too, so a
+//! shader the recompiler cannot handle logs **once** — with the failing
+//! instruction/reason — instead of 1600 times per run. The key deliberately
+//! ignores the input-info side (user SGPRs, buffer bindings): Kyty's full
+//! `ShaderId` covers those, and this coarser key is a documented Phase 2
+//! simplification.
+//!
+//! # Forensics
+//!
+//! PS5 titles ship RDNA2 ISA while the ported parser speaks GCN, so most real
+//! shaders are *expected* to fail translation for now. When the environment
+//! variable `XPS5X_DUMP_SHADERS` names a directory, every distinct fetched
+//! shader's raw bytes are written there once —
+//! `<stage>_<guestaddr>_<len>.bin` — succeeding **even when translation
+//! fails**; the dumps are how the GCN→RDNA2 gap gets studied.
+
+use kyty_graphics::hw_regs::{PixelShaderInfo, ShaderRegisters, VertexShaderInfo};
+use kyty_graphics::shader::analysis::{
+    SHADER_BINARY_INFO_SENTINEL, ShaderAnalysisError, ShaderMap, ShaderMemory,
+    shader_get_input_info_ps, shader_get_input_info_vs, shader_parse_ps, shader_parse_vs,
+};
+use kyty_graphics::shader::parse::ShaderParseError;
+use kyty_graphics::shader::recompile::{shader_recompile_ps, shader_recompile_vs};
+use kyty_graphics::shader::resources::{ShaderPixelInputInfo, ShaderVertexInputInfo};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tracing::{debug, info, warn};
+
+/// One fetch step: 4 KiB.
+const CHUNK_DWORDS: usize = 1024;
+/// Fetch cap: 256 KiB. A shader bigger than this is a mis-decode.
+const MAX_WINDOW_DWORDS: usize = 0x1_0000;
+/// `s_endpgm` — identical encoding on GCN and RDNA2 (SOPP op 1).
+const S_ENDPGM: u32 = 0xBF81_0000;
+
+/// Which pipeline stage a fetched shader binds.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Stage {
+    Vs,
+    Ps,
+}
+
+impl Stage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Stage::Vs => "vs",
+            Stage::Ps => "ps",
+        }
+    }
+}
+
+/// Cache key: stage + bind address + the first 16 bytes of code. The head
+/// bytes catch a title re-using an address for different code without
+/// hashing the (unknown-length) whole blob.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CacheKey {
+    stage: Stage,
+    addr: u64,
+    head: [u32; 4],
+}
+
+/// A translated shader (VS entries also carry the vertex input info the PS
+/// translation downstream depends on).
+#[derive(Clone, Debug)]
+pub struct TranslatedShader {
+    pub spirv: Arc<Vec<u32>>,
+    pub vs_info: ShaderVertexInputInfo,
+}
+
+/// Counters for the measurement report.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShaderCacheStats {
+    /// Distinct shaders fetched from guest memory (cache inserts).
+    pub distinct_fetched: u64,
+    /// Distinct shaders that translated to SPIR-V.
+    pub translated_ok: u64,
+    /// Distinct shaders whose translation failed (negative-cached).
+    pub translate_failed: u64,
+    /// Cache hits (either polarity) — re-binds that cost nothing.
+    pub hits: u64,
+}
+
+/// Fetch + translate + cache for guest shader code.
+pub struct ShaderTranslateCache {
+    entries: HashMap<CacheKey, Result<TranslatedShader, Arc<str>>>,
+    dump_dir: Option<PathBuf>,
+    stats: ShaderCacheStats,
+}
+
+impl Default for ShaderTranslateCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ShaderTranslateCache {
+    /// Cache with forensic dumps controlled by `XPS5X_DUMP_SHADERS`.
+    #[must_use]
+    pub fn new() -> Self {
+        let dump_dir = std::env::var("XPS5X_DUMP_SHADERS")
+            .ok()
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from);
+        Self::with_dump_dir(dump_dir)
+    }
+
+    /// Cache with an explicit dump directory (tests; `None` disables dumps).
+    #[must_use]
+    pub fn with_dump_dir(dump_dir: Option<PathBuf>) -> Self {
+        Self {
+            entries: HashMap::new(),
+            dump_dir,
+            stats: ShaderCacheStats::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> ShaderCacheStats {
+        self.stats
+    }
+
+    /// Fetch + translate the bound vertex-stage shader.
+    ///
+    /// # Errors
+    ///
+    /// A named reason (bad address, unreadable memory, parse/recompile
+    /// failure). Failures are negative-cached and warned **once** per
+    /// distinct shader.
+    pub fn translate_vs(
+        &mut self,
+        vs: &VertexShaderInfo,
+        sh_regs: &ShaderRegisters,
+    ) -> Result<TranslatedShader, Arc<str>> {
+        // Mirror shader_parse_vs's address selection (gs-instead-of-vs).
+        let gs_instead_of_vs = vs.vs_regs.data_addr == 0
+            && vs.gs_regs.data_addr == 0
+            && vs.es_regs.data_addr != 0
+            && vs.gs_regs.chksum != 0;
+        let addr = if gs_instead_of_vs {
+            vs.es_regs.data_addr
+        } else {
+            vs.vs_regs.data_addr
+        };
+        let vs = *vs;
+        let sh_regs = *sh_regs;
+        self.translate(Stage::Vs, addr, move |mem| {
+            attempt_generations(|next_gen| {
+                let code = shader_parse_vs(&vs, &sh_regs, mem, next_gen)
+                    .map_err(|e| AttemptError::from_analysis("shader_parse_vs", &e))?;
+                let mut vs_info = ShaderVertexInputInfo::default();
+                shader_get_input_info_vs(
+                    &vs,
+                    &sh_regs,
+                    mem,
+                    &ShaderMap::new(),
+                    next_gen,
+                    &mut vs_info,
+                )
+                .map_err(|e| AttemptError::from_analysis("shader_get_input_info_vs", &e))?;
+                let spirv = shader_recompile_vs(&code, &vs_info)
+                    .map_err(|e| AttemptError::named(format!("shader_recompile_vs: {e}")))?;
+                Ok(TranslatedShader {
+                    spirv: Arc::new(spirv),
+                    vs_info,
+                })
+            })
+        })
+    }
+
+    /// Fetch + translate the bound pixel shader. `vs_info` is the vertex
+    /// stage's input info (defaulted when the VS was embedded).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::translate_vs`].
+    pub fn translate_ps(
+        &mut self,
+        ps: &PixelShaderInfo,
+        sh_regs: &ShaderRegisters,
+        vs_info: &ShaderVertexInputInfo,
+    ) -> Result<TranslatedShader, Arc<str>> {
+        let addr = ps.ps_regs.data_addr;
+        let ps = *ps;
+        let sh_regs = *sh_regs;
+        let vs_info = *vs_info;
+        self.translate(Stage::Ps, addr, move |mem| {
+            attempt_generations(|next_gen| {
+                let code = shader_parse_ps(&ps, &sh_regs, mem, next_gen)
+                    .map_err(|e| AttemptError::from_analysis("shader_parse_ps", &e))?;
+                let mut ps_info = ShaderPixelInputInfo::default();
+                shader_get_input_info_ps(
+                    &ps,
+                    &sh_regs,
+                    &vs_info,
+                    mem,
+                    &ShaderMap::new(),
+                    next_gen,
+                    &mut ps_info,
+                )
+                .map_err(|e| AttemptError::from_analysis("shader_get_input_info_ps", &e))?;
+                let spirv = shader_recompile_ps(&code, &ps_info)
+                    .map_err(|e| AttemptError::named(format!("shader_recompile_ps: {e}")))?;
+                Ok(TranslatedShader {
+                    spirv: Arc::new(spirv),
+                    vs_info,
+                })
+            })
+        })
+    }
+
+    /// Shared fetch → (grow → translate) → cache path.
+    fn translate(
+        &mut self,
+        stage: Stage,
+        addr: u64,
+        run: impl Fn(&WindowMem) -> Result<TranslatedShader, AttemptError>,
+    ) -> Result<TranslatedShader, Arc<str>> {
+        if addr == 0 || !addr.is_multiple_of(4) {
+            // Unkeyable (no head bytes to read) — not cached, but the command
+            // processor's draw path rate-limits per draw batch upstream.
+            return Err(Arc::from(format!(
+                "{} shader bind address {addr:#x} is null or unaligned",
+                stage.as_str()
+            )));
+        }
+        let Some(head) = crate::guest_mem::read_dwords_checked(addr, 4) else {
+            return Err(Arc::from(format!(
+                "{} shader code at {addr:#x} is not readable guest memory",
+                stage.as_str()
+            )));
+        };
+        let key = CacheKey {
+            stage,
+            addr,
+            head: [head[0], head[1], head[2], head[3]],
+        };
+        if let Some(cached) = self.entries.get(&key) {
+            self.stats.hits += 1;
+            return cached.clone();
+        }
+
+        // Distinct shader: fetch the window, dump it, translate it.
+        let mut window = WindowMem {
+            base: addr,
+            data: head,
+        };
+        let mut want = CHUNK_DWORDS;
+        let result = loop {
+            let grew = window.grow_to(want);
+            match run(&window) {
+                Ok(t) => break Ok(t),
+                Err(e) if e.truncated && grew && want < MAX_WINDOW_DWORDS => {
+                    // The parser ran off the end and more guest memory may
+                    // exist — read another bounded slice and retry.
+                    want = (want * 2).min(MAX_WINDOW_DWORDS);
+                }
+                Err(e) => break Err(e),
+            }
+        };
+
+        self.stats.distinct_fetched += 1;
+        self.dump_shader(stage, addr, &window.data);
+
+        match result {
+            Ok(t) => {
+                self.stats.translated_ok += 1;
+                info!(
+                    stage = stage.as_str(),
+                    addr = format_args!("{addr:#x}"),
+                    spirv_words = t.spirv.len(),
+                    "guest shader fetched and translated to SPIR-V"
+                );
+                self.entries.insert(key, Ok(t.clone()));
+                Ok(t)
+            }
+            Err(e) => {
+                self.stats.translate_failed += 1;
+                let reason: Arc<str> = Arc::from(format!(
+                    "{} shader at {addr:#x} ({} bytes fetched): {}",
+                    stage.as_str(),
+                    window.data.len() * 4,
+                    e.msg
+                ));
+                // The one loud line per distinct failing shader. Re-binds hit
+                // the negative cache and stay quiet.
+                warn!(
+                    stage = stage.as_str(),
+                    addr = format_args!("{addr:#x}"),
+                    reason = %reason,
+                    "guest shader translation failed — draws binding it will be skipped"
+                );
+                self.entries.insert(key, Err(reason.clone()));
+                Err(reason)
+            }
+        }
+    }
+
+    /// Forensics: write a distinct shader's raw bytes once. Never a reason to
+    /// fail the draw path — errors are logged and dropped.
+    fn dump_shader(&self, stage: Stage, addr: u64, data: &[u32]) {
+        let Some(dir) = &self.dump_dir else {
+            return;
+        };
+        let len_bytes = dump_len_heuristic(data) * 4;
+        let path = dir.join(format!("{}_{addr:x}_{len_bytes}.bin", stage.as_str()));
+        let bytes: Vec<u8> = data[..len_bytes / 4]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, &bytes)) {
+            Ok(()) => debug!(path = %path.display(), "dumped fetched shader"),
+            Err(e) => warn!(error = %e, path = %path.display(), "shader dump failed"),
+        }
+    }
+}
+
+/// How many leading dwords of the fetched window to dump.
+///
+/// Heuristic, for forensics only (translation never depends on it):
+/// - a PS4-style blob starting with the `0xBEEB03FF` sentinel declares its
+///   own size (body + usage masks + 7-dword `OrbShdr` trailer);
+/// - otherwise, code through the first `s_endpgm` plus a 16-dword margin
+///   (possible trailer) — the encoding is shared by GCN and RDNA2;
+/// - otherwise (no end found — likely not code at all) the first 4 KiB.
+fn dump_len_heuristic(data: &[u32]) -> usize {
+    if data.len() >= 2 && data[0] == SHADER_BINARY_INFO_SENTINEL {
+        let blob = (data[1] as usize + 1) * 2 + 7;
+        if blob <= data.len() {
+            return blob;
+        }
+    }
+    if let Some(pos) = data.iter().position(|&w| w == S_ENDPGM) {
+        return (pos + 1 + 16).min(data.len());
+    }
+    data.len().min(CHUNK_DWORDS)
+}
+
+/// A bounded window of guest memory serving Kyty's [`ShaderMemory`] reads.
+/// Addresses outside the window (e.g. a fetch-shader pointer elsewhere in
+/// guest memory) come back `None` → a named `BadAddress` upstream.
+struct WindowMem {
+    base: u64,
+    data: Vec<u32>,
+}
+
+impl WindowMem {
+    /// Extend the window to `want` dwords in 4 KiB steps. Returns whether any
+    /// growth happened (readable memory may end before `want`).
+    fn grow_to(&mut self, want: usize) -> bool {
+        let mut grew = false;
+        while self.data.len() < want {
+            let at = self.base + (self.data.len() as u64) * 4;
+            let step = CHUNK_DWORDS.min(want - self.data.len()) as u32;
+            let Some(chunk) = crate::guest_mem::read_dwords_checked(at, step) else {
+                break;
+            };
+            self.data.extend(chunk);
+            grew = true;
+        }
+        grew
+    }
+}
+
+impl ShaderMemory for WindowMem {
+    fn dwords_at(&self, addr: u64) -> Option<&[u32]> {
+        let end = self.base + self.data.len() as u64 * 4;
+        if addr < self.base || addr >= end || !(addr - self.base).is_multiple_of(4) {
+            return None;
+        }
+        Some(&self.data[((addr - self.base) / 4) as usize..])
+    }
+}
+
+/// A translation attempt failure, with the bit the grow loop needs: did the
+/// parser run off the end of the window?
+struct AttemptError {
+    truncated: bool,
+    msg: String,
+}
+
+impl AttemptError {
+    fn named(msg: String) -> Self {
+        Self {
+            truncated: false,
+            msg,
+        }
+    }
+
+    fn from_analysis(what: &str, e: &ShaderAnalysisError) -> Self {
+        Self {
+            truncated: matches!(
+                e,
+                ShaderAnalysisError::Parse(ShaderParseError::Truncated { .. })
+            ),
+            msg: format!("{what}: {e}"),
+        }
+    }
+}
+
+/// PS5 titles are next-gen (`chksum` registers, no `OrbShdr` trailer), but
+/// nothing in the DCB says so explicitly; run the **whole** parse → input
+/// info → recompile pipeline as next-gen first and fall back to the legacy
+/// trailer pipeline, reporting **both** named reasons on failure.
+fn attempt_generations<T>(
+    run: impl Fn(bool) -> Result<T, AttemptError>,
+) -> Result<T, AttemptError> {
+    let e_next = match run(true) {
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
+    let e_legacy = match run(false) {
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
+    Err(AttemptError {
+        truncated: e_next.truncated || e_legacy.truncated,
+        msg: format!("next_gen: {}; legacy: {}", e_next.msg, e_legacy.msg),
+    })
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use kyty_graphics::hw_regs::PsStageRegisters;
+
+    /// Minimal GCN vertex shader (the `kyty-graphics` recompile fixture):
+    /// v_mov v0, 1.0; v_mov v1, 0; v_mul v2, v0, v1; exp pos0; exp param0;
+    /// s_endpgm.
+    const VS_BODY: &[u32] = &[
+        0x7E00_02FF,
+        0x3F80_0000,
+        0x7E02_0280,
+        0x1004_0300,
+        0xF800_08CF,
+        0x0302_0100,
+        0xF800_020F,
+        0x0302_0100,
+        S_ENDPGM,
+    ];
+
+    /// Solid-green GCN pixel shader (the `shader_bridge` fixture body).
+    const PS_BODY: &[u32] = &[
+        0x7E00_0280,
+        0x7E02_02FF,
+        0x3F80_0000,
+        0x7E04_0280,
+        0x7E06_02FF,
+        0x3F80_0000,
+        0xF800_180F,
+        0x0302_0100,
+        S_ENDPGM,
+    ];
+
+    /// PS4-style blob with the `0xBEEB03FF` binary-info trailer (mirrors
+    /// `shader_bridge::build_shader_blob`).
+    fn build_blob(body: &[u32], hash0: u32, crc32: u32) -> Vec<u32> {
+        let mut v = vec![SHADER_BINARY_INFO_SENTINEL, 0];
+        v.extend_from_slice(body);
+        if (v.len() + 1) % 2 != 0 {
+            v.push(0);
+        }
+        v.push(0); // usage masks
+        let info_dw = v.len();
+        v[1] = (info_dw / 2 - 1) as u32;
+        v.push(u32::from_le_bytes(*b"OrbS"));
+        v.push(u32::from_le_bytes([b'h', b'd', b'r', 0x42]));
+        v.push((body.len() as u32 * 4) << 8);
+        v.push(1);
+        v.push(hash0);
+        v.push(0x1111_2222);
+        v.push(crc32);
+        v
+    }
+
+    fn vs_regs_at(addr: u64) -> VertexShaderInfo {
+        VertexShaderInfo {
+            vs_regs: kyty_graphics::hw_regs::VsStageRegisters {
+                data_addr: addr,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn ps_regs_at(addr: u64) -> PixelShaderInfo {
+        PixelShaderInfo {
+            ps_regs: PsStageRegisters {
+                data_addr: addr,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// A synthetic in-memory VS round-trips through fetch → parse →
+    /// recompile → SPIR-V, and a per-frame re-bind is a cache hit, not a
+    /// re-translation.
+    #[test]
+    fn guest_vs_round_trips_to_spirv_and_caches() {
+        let blob = build_blob(VS_BODY, 0xAAAA_0001, 0xBBBB_0001);
+        let addr = blob.as_ptr() as u64;
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        let sh_regs = ShaderRegisters::default(); // export_count = 1
+
+        let t = cache
+            .translate_vs(&vs_regs_at(addr), &sh_regs)
+            .expect("fixture VS must translate");
+        assert_eq!(t.spirv[0], 0x0723_0203, "SPIR-V magic");
+
+        let t2 = cache
+            .translate_vs(&vs_regs_at(addr), &sh_regs)
+            .expect("second bind");
+        assert_eq!(t.spirv, t2.spirv);
+        let s = cache.stats();
+        assert_eq!((s.distinct_fetched, s.translated_ok, s.hits), (1, 1, 1));
+    }
+
+    #[test]
+    fn guest_ps_round_trips_to_spirv() {
+        let blob = build_blob(PS_BODY, 0xAAAA_00E2, 0xBBBB_00E2);
+        let addr = blob.as_ptr() as u64;
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        let mut sh_regs = ShaderRegisters::default();
+        // Non-compressed MRT0 export needs output mode 9 (as in shader_bridge).
+        sh_regs.target_output_mode[0] = 9;
+
+        let t = cache
+            .translate_ps(
+                &ps_regs_at(addr),
+                &sh_regs,
+                &ShaderVertexInputInfo::default(),
+            )
+            .expect("fixture PS must translate");
+        assert_eq!(t.spirv[0], 0x0723_0203, "SPIR-V magic");
+    }
+
+    /// Garbage bytes fail with a named reason, are negative-cached (one
+    /// translation attempt, then hits), and never panic.
+    #[test]
+    fn garbage_shader_negative_caches_with_named_reason() {
+        // 0xFFFF_FFFF decodes as an unknown encoding immediately; no endpgm.
+        let garbage: Vec<u32> = vec![0xFFFF_FFFF; 64];
+        let addr = garbage.as_ptr() as u64;
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        let sh_regs = ShaderRegisters::default();
+
+        let e1 = cache
+            .translate_ps(
+                &ps_regs_at(addr),
+                &sh_regs,
+                &ShaderVertexInputInfo::default(),
+            )
+            .expect_err("garbage must not translate");
+        assert!(
+            e1.contains("next_gen:") && e1.contains("legacy:"),
+            "both generation attempts must be named: {e1}"
+        );
+
+        let e2 = cache
+            .translate_ps(
+                &ps_regs_at(addr),
+                &sh_regs,
+                &ShaderVertexInputInfo::default(),
+            )
+            .expect_err("still failing");
+        assert_eq!(e1, e2);
+        let s = cache.stats();
+        assert_eq!(
+            (s.distinct_fetched, s.translate_failed, s.hits),
+            (1, 1, 1),
+            "the second bind must be a negative-cache hit, not a re-translation"
+        );
+    }
+
+    #[test]
+    fn null_and_unaligned_addresses_are_named_errors() {
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        let sh_regs = ShaderRegisters::default();
+        let e = cache
+            .translate_ps(&ps_regs_at(0), &sh_regs, &ShaderVertexInputInfo::default())
+            .expect_err("null");
+        assert!(e.contains("null or unaligned"), "{e}");
+        let e = cache
+            .translate_ps(
+                &ps_regs_at(0x1002),
+                &sh_regs,
+                &ShaderVertexInputInfo::default(),
+            )
+            .expect_err("unaligned");
+        assert!(e.contains("null or unaligned"), "{e}");
+    }
+
+    /// Dumps are written once per distinct shader — and written even when
+    /// translation fails, because failed shaders are exactly the ones the
+    /// GCN→RDNA2 gap study needs.
+    #[test]
+    fn dump_writes_distinct_shaders_even_on_translation_failure() {
+        let dir =
+            std::env::temp_dir().join(format!("xps5x_shader_dump_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let blob = build_blob(PS_BODY, 1, 2);
+        let good_addr = blob.as_ptr() as u64;
+        let garbage: Vec<u32> = vec![0xFFFF_FFFF; 64];
+        let bad_addr = garbage.as_ptr() as u64;
+
+        let mut cache = ShaderTranslateCache::with_dump_dir(Some(dir.clone()));
+        let mut sh_regs = ShaderRegisters::default();
+        sh_regs.target_output_mode[0] = 9;
+        let vs_info = ShaderVertexInputInfo::default();
+
+        cache
+            .translate_ps(&ps_regs_at(good_addr), &sh_regs, &vs_info)
+            .expect("fixture PS");
+        let _ = cache.translate_ps(&ps_regs_at(bad_addr), &sh_regs, &vs_info);
+        // Re-binds must not duplicate dumps.
+        let _ = cache.translate_ps(&ps_regs_at(bad_addr), &sh_regs, &vs_info);
+
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .expect("dump dir exists")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 2, "one dump per distinct shader: {files:?}");
+        assert!(
+            files
+                .iter()
+                .any(|f| f.starts_with(&format!("ps_{good_addr:x}_"))),
+            "{files:?}"
+        );
+        assert!(
+            files
+                .iter()
+                .any(|f| f.starts_with(&format!("ps_{bad_addr:x}_"))),
+            "translation failure must still dump: {files:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The dump-length heuristic: sentinel blobs use their declared size,
+    /// bare code cuts after `s_endpgm` (+margin), garbage caps at 4 KiB.
+    #[test]
+    fn dump_len_heuristic_bounds() {
+        let blob = build_blob(PS_BODY, 1, 2);
+        assert_eq!(dump_len_heuristic(&blob), blob.len());
+
+        let mut bare = PS_BODY.to_vec();
+        bare.extend(std::iter::repeat_n(0u32, 100));
+        assert_eq!(dump_len_heuristic(&bare), PS_BODY.len() + 16);
+
+        let garbage = vec![0u32; 3000];
+        assert_eq!(dump_len_heuristic(&garbage), CHUNK_DWORDS);
+    }
+}

@@ -21,6 +21,43 @@ pub fn register(registry: &HleRegistry) {
         "sceTextToSpeech2Terminate",
         hle_terminate,
     );
+    // The synthesis surface: no speech is produced (no ABI reference and no
+    // audio backend), but every call answers so a title that opens the
+    // narrator on its MAIN thread — Minecraft does, during boot — proceeds
+    // instead of dying on an unresolved import. `Speak` completes instantly;
+    // `GetSpeechStatus` writes nothing, so the caller reads its own
+    // pre-initialized status (all-accepting stubs tolerate either outcome).
+    registry.register("libSceTextToSpeech2", "sceTextToSpeech2Open", hle_open);
+    registry.register("libSceTextToSpeech2", "sceTextToSpeech2Close", |_, _| {
+        SCE_OK
+    });
+    registry.register("libSceTextToSpeech2", "sceTextToSpeech2Speak", |_, _| {
+        SCE_OK
+    });
+    registry.register("libSceTextToSpeech2", "sceTextToSpeech2Cancel", |_, _| {
+        SCE_OK
+    });
+    registry.register(
+        "libSceTextToSpeech2",
+        "sceTextToSpeech2GetSpeechStatus",
+        |_, _| SCE_OK,
+    );
+}
+
+/// `sceTextToSpeech2Open(...)` — exact ABI unknown; succeed so the narrator
+/// "opens" silently. Requires the service to have been initialized, which is
+/// the one piece of state this module tracks honestly.
+fn hle_open(ctx: &HleContext, _args: &[u64]) -> u64 {
+    if !ctx
+        .kernel
+        .text_to_speech2_initialized
+        .load(Ordering::Acquire)
+    {
+        // Not initialized: the real service would refuse; 0x80000000-style
+        // generic failure keeps the caller on its error path.
+        return 0x8055_0001;
+    }
+    SCE_OK
 }
 
 fn hle_initialize(ctx: &HleContext, _args: &[u64]) -> u64 {

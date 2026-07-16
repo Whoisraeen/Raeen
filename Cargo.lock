@@ -1799,6 +1799,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "iced-x86"
+version = "1.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c447cff8c7f384a7d4f741cfcff32f75f3ad02b406432e8d6c878d56b1edf6b"
+dependencies = [
+ "lazy_static",
+]
+
+[[package]]
 name = "icu_collections"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5117,6 +5126,7 @@ dependencies = [
  "aes",
  "cbc",
  "goblin",
+ "iced-x86",
  "memmap2",
  "sha1",
  "tracing",
@@ -5141,6 +5151,7 @@ dependencies = [
  "rspirv",
  "thiserror 2.0.18",
  "tracing",
+ "windows-sys 0.59.0",
  "xps5x-core",
 ]
 
@@ -5248,6 +5259,7 @@ dependencies = [
 name = "xps5x-runtime"
 version = "0.1.0"
 dependencies = [
+ "iced-x86",
  "thiserror 2.0.18",
  "tracing",
  "windows-sys 0.59.0",

@@ -396,7 +396,13 @@ fn shader_parse_sopp(
             inst.src[0].constant.u = simm;
             inst.src_num = 1;
         }
-        0x00 => return Err(ni(dst, S, "s_nop", opcode, pc, b0)),
+        0x00 => {
+            inst.type_ = T::SNop;
+            inst.format = F::Imm;
+            inst.src[0].type_ = O::LiteralConstant;
+            inst.src[0].constant.u = simm;
+            inst.src_num = 1;
+        }
         0x09 => return Err(ni(dst, S, "s_cbranch_execnz", opcode, pc, b0)),
         0x0a => return Err(ni(dst, S, "s_barrier", opcode, pc, b0)),
         0x0b => return Err(ni(dst, S, "s_setkill", opcode, pc, b0)),
@@ -623,7 +629,7 @@ fn shader_parse_sop2(
 
     match opcode {
         0x00 => inst.type_ = T::SAddU32,
-        0x01 => return Err(ni(dst, S, "s_sub_u32", opcode, pc, b0)),
+        0x01 => inst.type_ = T::SSubU32,
         0x02 => inst.type_ = T::SAddI32,
         0x03 => inst.type_ = T::SSubI32,
         0x04 => inst.type_ = T::SAddcU32,
@@ -3379,6 +3385,18 @@ mod tests {
     }
 
     #[test]
+    fn sop2_s_sub_u32_decodes_the_measured_next_gen_encoding() {
+        // Minecraft PPSA17221: s_sub_u32 vcc_lo, 64, vcc_hi.
+        let (code, result) = parse(&[0x80EA_6BC0, S_ENDPGM], ShaderType::Vertex, true);
+        assert_eq!(result.unwrap(), 2);
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SSubU32);
+        assert_eq!(inst.format, F::SVdstSVsrc0SVsrc1);
+        assert_eq!(inst.dst.type_, O::VccLo);
+        assert_eq!(inst.src[1].type_, O::VccHi);
+    }
+
+    #[test]
     fn sopc_s_cmp_eq_i32() {
         // SOP2 opcode7=0x7e -> SOPC.
         let (code, _) = parse_vs(&[0xBF00_0100, S_ENDPGM]);
@@ -3784,19 +3802,13 @@ mod tests {
     }
 
     #[test]
-    fn known_but_unimplemented_opcode_is_typed_error() {
-        // s_nop: Kyty KYTY_NI.
-        let (_, result) = parse(&[0xBF80_0000], ShaderType::Vertex, false);
-        assert_eq!(
-            result,
-            Err(ShaderParseError::NotImplemented {
-                family: "sopp",
-                instruction: "s_nop",
-                opcode: 0,
-                pc: 0,
-                raw: 0xBF80_0000,
-            })
-        );
+    fn s_nop_is_a_decoded_no_op() {
+        let (code, result) = parse(&[0xBF80_0000, S_ENDPGM], ShaderType::Vertex, true);
+        assert_eq!(result.unwrap(), 2);
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SNop);
+        assert_eq!(inst.format, F::Imm);
+        assert_eq!(inst.src[0].constant.u, 0);
     }
 
     #[test]

@@ -120,6 +120,33 @@ fn main() -> anyhow::Result<()> {
                 &dyn_tags,
             )?,
         };
+        if let Ok(value) = std::env::var("XPS5X_RELOC_OFFSET") {
+            let value = value.trim_start_matches("0x");
+            if let Ok(offset) = u64::from_str_radix(value, 16) {
+                for relocation in dynlib_data
+                    .relocations
+                    .iter()
+                    .filter(|relocation| relocation.offset == offset)
+                {
+                    let symbol_index = (relocation.info >> 32) as usize;
+                    let r_type = relocation.info as u32;
+                    match dynlib_data.symbols.get(symbol_index) {
+                        Some(symbol) => println!(
+                            "relocation {offset:#x}: type={r_type} sym={symbol_index} \
+                             nid={:#018x} ({}) value={:#x} import={} {}",
+                            symbol.nid,
+                            xps5x_firmware::dynlib::nid::encode_nid(symbol.nid),
+                            symbol.value,
+                            symbol.is_import,
+                            xps5x_firmware::dynlib::nid_names::describe(symbol.nid),
+                        ),
+                        None => println!(
+                            "relocation {offset:#x}: type={r_type} invalid sym={symbol_index}"
+                        ),
+                    }
+                }
+            }
+        }
         let hle = std::sync::Arc::new(xps5x_hle::HleRegistry::new());
         let db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
         let mut registry = xps5x_firmware::ModuleRegistry::new(db);

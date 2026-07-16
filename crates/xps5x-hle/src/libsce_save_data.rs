@@ -17,7 +17,12 @@ use tracing::{debug, warn};
 /// `SCE_OK`.
 const SCE_OK: u64 = 0;
 /// `SCE_SAVE_DATA_ERROR_PARAMETER`.
-const ERROR_PARAMETER: u64 = 0x809F_0000 | 0x02;
+const ERROR_PARAMETER: u64 = 0x809F_0000;
+const ERROR_EXISTS: u64 = 0x809F_0007;
+const ERROR_NOT_FOUND: u64 = 0x809F_0008;
+const ERROR_INTERNAL: u64 = 0x809F_000B;
+const MOUNT_MODE_CREATE: u32 = 1 << 2;
+const MOUNT_MODE_CREATE2: u32 = 1 << 5;
 /// `SceSaveDataMountResult` size in bytes.
 const MOUNT_RESULT_SIZE: usize = 0x40;
 /// The mount point handed back to a title (matches SharpEmu). Games open
@@ -39,12 +44,13 @@ pub fn register(registry: &HleRegistry) {
         registry.register(library, "sceSaveDataMount", hle_mount);
         registry.register(library, "sceSaveDataMount2", hle_mount);
         registry.register(library, "sceSaveDataMount3", hle_mount);
-        registry.register(library, "sceSaveDataUmount", hle_ok);
-        registry.register(library, "sceSaveDataUmount2", hle_ok);
-        registry.register(library, "sceSaveDataDirNameSearch", hle_ok);
+        registry.register(library, "sceSaveDataUmount", hle_unmount);
+        registry.register(library, "sceSaveDataUmount2", hle_unmount);
+        registry.register(library, "sceSaveDataDirNameSearch", hle_dir_name_search);
         registry.register(library, "sceSaveDataDirNameSearchPs4", hle_dir_name_search);
-        registry.register(library, "sceSaveDataGetMountInfo", hle_ok);
+        registry.register(library, "sceSaveDataGetMountInfo", hle_get_mount_info);
         registry.register(library, "sceSaveDataDelete", hle_delete);
+        registry.register(library, "sceSaveDataCommit", hle_commit);
         registry.register(
             library,
             "sceSaveDataCreateTransactionResource",
@@ -82,6 +88,67 @@ pub fn register(registry: &HleRegistry) {
         0xf39c_ee97_ffde_197b,
         hle_set_param,
     );
+    registry.register_nid(
+        "libSceSaveData_native",
+        "sceSaveDataCommit",
+        0x89ee_ea85_9e17_d027,
+        hle_commit,
+    );
+}
+
+/// Commit all buffered file writes below a mounted save-data point.
+///
+/// The ABI takes a pointer to the 16-byte `SceSaveDataMountPoint` returned by
+/// mount. The VFS normally persists writable files on close; commit is the
+/// stronger durability boundary used while those descriptors are still open.
+fn hle_commit(ctx: &HleContext, args: &[u64]) -> u64 {
+    let mount_point = args.first().copied().unwrap_or(0);
+    if mount_point == 0 {
+        return ERROR_PARAMETER;
+    }
+    let mut request = [0u8; 64];
+    if !ctx.mem.read(mount_point, &mut request) {
+        return 0x8002_000E;
+    }
+
+    // Two ABI generations are in use. The older form passes the 16-byte
+    // mount-point object directly. Native PS5 titles pass an opaque commit
+    // descriptor whose leading u32 is the transaction resource returned by
+    // `sceSaveDataCreateTransactionResource`; the mount is implicit in the
+    // preceding prepare/mount operation.
+    let direct_mount = request.starts_with(MOUNT_POINT)
+        && request.get(MOUNT_POINT.len()).copied().unwrap_or(1) == 0;
+    let resource = i32::from_le_bytes(request[..4].try_into().expect("fixed slice"));
+    if !direct_mount
+        && !ctx
+            .kernel
+            .save_data_transaction_resources
+            .contains_key(&resource)
+    {
+        warn!(
+            commit = mount_point,
+            arg1 = args.get(1).copied().unwrap_or(0),
+            arg2 = args.get(2).copied().unwrap_or(0),
+            resource,
+            bytes = ?request,
+            "sceSaveDataCommit received an unknown request layout"
+        );
+        return 0x809F_000B;
+    }
+
+    let mount = "/savedata0";
+
+    match ctx.kernel.filesystem.sync_mount(mount) {
+        Ok(flushed) => {
+            ctx.kernel.save_data_transaction_resources.clear();
+            debug!("sceSaveDataCommit('{mount}') -> flushed {flushed} descriptor(s)");
+            SCE_OK
+        }
+        Err(error) => {
+            warn!("sceSaveDataCommit('{mount}') failed: {error}");
+            0x809F_000B
+        }
+    }
 }
 
 /// Allocate a process-local transaction resource and retain the requested
@@ -184,6 +251,43 @@ fn hle_set_param(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
+/// Report capacity for a live save-data mount. The 48-byte result is two u64
+/// block counts followed by reserved zeroes; callers commonly consume the
+/// counts immediately after mount, so returning success without initializing
+/// the buffer feeds arbitrary stack data into their storage policy.
+fn hle_get_mount_info(ctx: &HleContext, args: &[u64]) -> u64 {
+    let mount_point = args.first().copied().unwrap_or(0);
+    let info = args.get(1).copied().unwrap_or(0);
+    if mount_point == 0 || info == 0 {
+        return ERROR_PARAMETER;
+    }
+    let mut mount_bytes = [0u8; 16];
+    if !ctx.mem.read(mount_point, &mut mount_bytes) {
+        return 0x8002_000E;
+    }
+    let mount_len = mount_bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(mount_bytes.len());
+    if &mount_bytes[..mount_len] != MOUNT_POINT
+        || ctx.kernel.filesystem.resolve_path("/savedata0").is_none()
+    {
+        return 0x809F_000B;
+    }
+
+    // 1,048,576 32-KiB blocks = 32 GiB. This is a deterministic virtual
+    // quota, not a claim about host free space; actual writes remain bounded
+    // by the host filesystem and surface their real I/O errors.
+    let blocks = 1_048_576u64;
+    let mut result = [0u8; 48];
+    result[..8].copy_from_slice(&blocks.to_le_bytes());
+    result[8..16].copy_from_slice(&blocks.to_le_bytes());
+    if !ctx.mem.write(info, &result) {
+        return 0x8002_000E;
+    }
+    SCE_OK
+}
+
 /// Enumerate immediate save-slot directories. This implements the shared
 /// empty/non-empty result ABI used by the PS4-compat spelling on PS5 as well
 /// as native titles, without manufacturing any title data.
@@ -205,15 +309,34 @@ fn hle_dir_name_search(ctx: &HleContext, args: &[u64]) -> u64 {
     }
     let names_out = u64::from_le_bytes(result_bytes[8..16].try_into().expect("fixed slice"));
     let capacity = u32::from_le_bytes(result_bytes[16..20].try_into().expect("fixed slice"));
-    let Some(root) = ctx.kernel.filesystem.resolve_path("/savedata0") else {
-        return 0x809F_000B;
+    let pattern_ptr = u64::from_le_bytes(cond_bytes[16..24].try_into().expect("fixed slice"));
+    let pattern = if pattern_ptr == 0 {
+        String::new()
+    } else {
+        let mut bytes = [0u8; 32];
+        if !ctx.mem.read(pattern_ptr, &mut bytes) {
+            return 0x8002_000E;
+        }
+        let len = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
+        match std::str::from_utf8(&bytes[..len]) {
+            Ok(value) => value.to_owned(),
+            Err(_) => return ERROR_PARAMETER,
+        }
     };
+    let root = ctx.kernel.filesystem.savedata_root();
     let mut names: Vec<String> = match std::fs::read_dir(root) {
         Ok(entries) => entries
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_ok_and(|ty| ty.is_dir()))
             .filter_map(|entry| entry.file_name().into_string().ok())
-            .filter(|name| !name.starts_with("sce_") && name.len() < 32)
+            .filter(|name| {
+                !name.starts_with("sce_")
+                    && name.len() < 32
+                    && (pattern.is_empty() || save_name_matches_pattern(name, &pattern))
+            })
             .collect(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => {
@@ -271,8 +394,16 @@ fn hle_delete(ctx: &HleContext, args: &[u64]) -> u64 {
         return ERROR_PARAMETER;
     }
     let dir_name = String::from_utf8_lossy(&dir_bytes);
-    let guest_path = format!("/savedata0/{dir_name}");
-    match ctx.kernel.filesystem.remove_dir_all(&guest_path) {
+    let slot_path = match ctx.kernel.filesystem.savedata_slot_path(&dir_name) {
+        Ok(path) => path,
+        Err(_) => return ERROR_PARAMETER,
+    };
+    let removal = if slot_path.exists() {
+        std::fs::remove_dir_all(&slot_path)
+    } else {
+        Ok(())
+    };
+    match removal {
         Ok(()) => {
             debug!("sceSaveDataDelete('{dir_name}') -> OK");
             SCE_OK
@@ -285,6 +416,11 @@ fn hle_delete(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    SCE_OK
+}
+
+fn hle_unmount(ctx: &HleContext, _args: &[u64]) -> u64 {
+    ctx.kernel.filesystem.unmount_savedata_slot();
     SCE_OK
 }
 
@@ -301,16 +437,85 @@ fn hle_mount(ctx: &HleContext, args: &[u64]) -> u64 {
         return ERROR_PARAMETER;
     }
 
+    let mut request = [0u8; 0x2c];
+    if !ctx.mem.read(mount_ptr, &mut request) {
+        return 0x8002_000E;
+    }
+    let user_id = i32::from_le_bytes(request[..4].try_into().expect("fixed slice"));
+    let dir_name_ptr = u64::from_le_bytes(request[0x08..0x10].try_into().expect("fixed slice"));
+    let blocks = u64::from_le_bytes(request[0x10..0x18].try_into().expect("fixed slice"));
+    let system_blocks = u64::from_le_bytes(request[0x18..0x20].try_into().expect("fixed slice"));
+    let mount_mode = u32::from_le_bytes(request[0x20..0x24].try_into().expect("fixed slice"));
+    let resource = u32::from_le_bytes(request[0x24..0x28].try_into().expect("fixed slice"));
+    let mode = u32::from_le_bytes(request[0x28..0x2c].try_into().expect("fixed slice"));
+    if user_id < 0 || dir_name_ptr == 0 {
+        return ERROR_PARAMETER;
+    }
+
+    let mut dir_name_bytes = [0u8; 32];
+    if !ctx.mem.read(dir_name_ptr, &mut dir_name_bytes) {
+        return 0x8002_000E;
+    }
+    let dir_name_len = dir_name_bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(dir_name_bytes.len());
+    let dir_name = match std::str::from_utf8(&dir_name_bytes[..dir_name_len]) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return ERROR_PARAMETER,
+    };
+    let slot_path = match ctx.kernel.filesystem.savedata_slot_path(dir_name) {
+        Ok(path) => path,
+        Err(_) => return ERROR_PARAMETER,
+    };
+    let existed = slot_path.is_dir();
+    let create = mount_mode & MOUNT_MODE_CREATE != 0;
+    let create_if_missing = mount_mode & MOUNT_MODE_CREATE2 != 0;
+    if !existed && !create && !create_if_missing {
+        return ERROR_NOT_FOUND;
+    }
+    if existed && create {
+        return ERROR_EXISTS;
+    }
+    if !existed && std::fs::create_dir_all(&slot_path).is_err() {
+        return ERROR_INTERNAL;
+    }
+    if let Err(error) = ctx.kernel.filesystem.mount_savedata_slot(dir_name) {
+        warn!("sceSaveDataMount3('{dir_name}') failed: {error}");
+        return ERROR_INTERNAL;
+    }
+
     // SceSaveDataMountResult (64 bytes): mountPoint.data[16] at offset 0,
     // then mountStatus/requiredBlocks/... (left zero).
     let mut result = [0u8; MOUNT_RESULT_SIZE];
     result[..MOUNT_POINT.len()].copy_from_slice(MOUNT_POINT);
+    result[0x1c..0x20].copy_from_slice(&u32::from(create_if_missing && !existed).to_le_bytes());
     // result[MOUNT_POINT.len()] stays 0 — the NUL terminator.
     if !ctx.mem.write(result_ptr, &result) {
         warn!("sceSaveDataMount: result out-ptr {result_ptr:#x} not writable");
         return ERROR_PARAMETER;
     }
+    debug!(
+        "sceSaveDataMount3(user={user_id}, dir='{dir_name}', blocks={blocks}, system_blocks={system_blocks}, mount_mode={mount_mode:#x}, resource={resource}, mode={mode}) -> /savedata0"
+    );
     SCE_OK
+}
+
+fn save_name_matches_pattern(value: &str, pattern: &str) -> bool {
+    fn matches(value: &[u8], pattern: &[u8]) -> bool {
+        let Some((&head, tail)) = pattern.split_first() else {
+            return value.is_empty();
+        };
+        if head == b'%' {
+            return (0..=value.len()).any(|index| matches(&value[index..], tail));
+        }
+        let Some((&value_head, value_tail)) = value.split_first() else {
+            return false;
+        };
+        (head == b'_' || head.eq_ignore_ascii_case(&value_head)) && matches(value_tail, tail)
+    }
+
+    matches(value.as_bytes(), pattern.as_bytes())
 }
 
 #[cfg(test)]
@@ -398,13 +603,34 @@ mod tests {
         let mem = crate::TestMemory::new(0x1000);
         let alloc = crate::TestAllocator::new(0);
         let ctx = test_ctx(&kernel, &mem, &alloc);
+        let root =
+            std::env::temp_dir().join(format!("xps5x-save-mount-slot-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        kernel.filesystem.set_savedata_directory(&root);
 
-        // A (mostly irrelevant here) mount request at 0x100, result at 0x200.
+        // Native Mount3: user id, dirName*, block counts and Create2 mode.
+        assert!(mem.write(0x100, &1i32.to_le_bytes()));
+        assert!(mem.write(0x108, &0x300u64.to_le_bytes()));
+        assert!(mem.write(0x120, &MOUNT_MODE_CREATE2.to_le_bytes()));
+        assert!(mem.write(0x300, b"slot00000001@world\0"));
         assert_eq!(hle_mount(&ctx, &[0x100, 0x200]), SCE_OK);
         let mut res = [0u8; MOUNT_RESULT_SIZE];
         assert!(mem.read(0x200, &mut res));
         let nul = res.iter().position(|&b| b == 0).unwrap();
         assert_eq!(&res[..nul], MOUNT_POINT, "mount point must be /savedata0");
+        assert_eq!(u32::from_le_bytes(res[0x1c..0x20].try_into().unwrap()), 1);
+        assert_eq!(
+            kernel.filesystem.resolve_path("/savedata0/level.dat"),
+            Some(root.join("slot00000001@world/level.dat"))
+        );
+        assert!(root.join("slot00000001@world").is_dir());
+        hle_unmount(&ctx, &[]);
+        assert_eq!(
+            kernel.filesystem.resolve_path("/savedata0"),
+            Some(root.clone())
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -415,6 +641,96 @@ mod tests {
         let ctx = test_ctx(&kernel, &mem, &alloc);
         assert_eq!(hle_mount(&ctx, &[0, 0x200]), ERROR_PARAMETER);
         assert_eq!(hle_mount(&ctx, &[0x100, 0]), ERROR_PARAMETER);
+    }
+
+    #[test]
+    fn mount_info_initializes_capacity_and_native_search_is_not_a_noop() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let root =
+            std::env::temp_dir().join(format!("xps5x-save-mount-info-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        kernel.filesystem.set_savedata_directory(&root);
+        assert!(mem.write(0x10, b"/savedata0\0"));
+        assert!(mem.write(0x100, &[0xCC; 48]));
+
+        assert_eq!(hle_get_mount_info(&ctx, &[0x10, 0x100]), SCE_OK);
+        let mut info = [0u8; 48];
+        assert!(mem.read(0x100, &mut info));
+        assert_eq!(u64::from_le_bytes(info[..8].try_into().unwrap()), 1_048_576);
+        assert_eq!(
+            u64::from_le_bytes(info[8..16].try_into().unwrap()),
+            1_048_576
+        );
+        assert_eq!(&info[16..], &[0; 32]);
+
+        let registry = HleRegistry::new();
+        register(&registry);
+        assert!(registry.registered_names().iter().any(|(library, name)| {
+            library == "libSceSaveData" && name == "sceSaveDataDirNameSearch"
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_flushes_open_save_files_and_pins_the_native_nid() {
+        use xps5x_kernel::filesystem::open_flags::{O_CREAT, O_TRUNC, O_WRONLY};
+
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let root = std::env::temp_dir().join(format!("xps5x-save-commit-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        kernel.filesystem.set_savedata_directory(&root);
+        assert!(mem.write(0x10, b"/savedata0\0"));
+
+        let fd = kernel
+            .filesystem
+            .open(
+                "/savedata0/slot/level.dat",
+                O_WRONLY | O_CREAT | O_TRUNC,
+                0o644,
+            )
+            .unwrap();
+        kernel.filesystem.write(fd, b"FRAME").unwrap();
+        assert!(!root.join("slot/level.dat").exists());
+
+        assert_eq!(hle_commit(&ctx, &[0x10]), SCE_OK);
+        assert_eq!(
+            std::fs::read(root.join("slot/level.dat")).unwrap(),
+            b"FRAME"
+        );
+
+        // Native PS5 callers pass an opaque commit descriptor whose leading
+        // field is the transaction-resource id, rather than a mount-point
+        // string. Minecraft uses this form.
+        let resource = hle_create_transaction_resource(&ctx, &[0x0200_0000]);
+        assert!(mem.write(0x30, &(resource as u32).to_le_bytes()));
+        kernel.filesystem.write(fd, b" TWO").unwrap();
+        assert_eq!(hle_commit(&ctx, &[0x30, 0xDEAD_BEEF, 4]), SCE_OK);
+        assert_eq!(
+            std::fs::read(root.join("slot/level.dat")).unwrap(),
+            b"FRAME TWO"
+        );
+        kernel.filesystem.close(fd).unwrap();
+
+        let registry = HleRegistry::new();
+        register(&registry);
+        assert!(
+            registry
+                .registered_nid_overrides()
+                .iter()
+                .any(|(nid, key)| {
+                    *nid == 0x89ee_ea85_9e17_d027
+                        && key == "libSceSaveData_native::sceSaveDataCommit"
+                })
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -461,6 +777,9 @@ mod tests {
         assert_eq!(u32::from_le_bytes(count), 0);
 
         std::fs::create_dir_all(root.join("slotA")).unwrap();
+        std::fs::create_dir_all(root.join("games")).unwrap();
+        assert!(mem.write(0x110, &0x380u64.to_le_bytes()));
+        assert!(mem.write(0x380, b"slot%\0"));
         assert_eq!(hle_dir_name_search(&ctx, &[0x100, 0x200]), SCE_OK);
         assert!(mem.read(0x200, &mut count));
         assert_eq!(u32::from_le_bytes(count), 1);
@@ -469,5 +788,16 @@ mod tests {
         assert_eq!(&name[..5], b"slotA");
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_directory_patterns_support_percent_and_single_character_wildcards() {
+        assert!(save_name_matches_pattern("slot00000001@world", "slot%"));
+        assert!(save_name_matches_pattern("SLOT-A", "slot__"));
+        assert!(save_name_matches_pattern(
+            "000000000001@save",
+            "____________@%"
+        ));
+        assert!(!save_name_matches_pattern("games", "____________@%"));
     }
 }

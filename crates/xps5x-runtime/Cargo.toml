@@ -12,6 +12,7 @@ xps5x-hle = { workspace = true }
 xps5x-kernel = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+iced-x86 = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }

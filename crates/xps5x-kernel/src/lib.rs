@@ -166,6 +166,10 @@ pub struct OrbisKernel {
     kernel_event_flag_next: std::sync::atomic::AtomicU64,
     /// Kernel counting semaphores, keyed by handle.
     pub kernel_semaphores: DashMap<u32, Semaphore>,
+    /// POSIX (`sem_*`) semaphores, keyed by the guest `sem_t` address. These
+    /// are address-based objects distinct from the handle-based
+    /// `sceKernelCreateSema` family — see the `xps5x-hle` `posix_sem` module.
+    pub posix_semaphores: DashMap<u64, Arc<PosixSem>>,
     /// Next semaphore handle to hand out.
     kernel_semaphore_next: std::sync::atomic::AtomicU32,
     /// Kernel event queues (existence), keyed by handle → attributes.
@@ -200,6 +204,11 @@ pub struct OrbisKernel {
     pub agc_last_dcb_address: std::sync::atomic::AtomicU64,
     /// Most recently submitted DCB length in DWORDs.
     pub agc_last_dcb_dwords: std::sync::atomic::AtomicU32,
+    /// Guest address of the process's materialized AGC register-defaults
+    /// block (`sceAgcGetRegisterDefaults2[Internal]`), or 0 before the first
+    /// call. The guest walks pointers inside this block, so it is allocated
+    /// once in guest memory and cached here for every later call.
+    pub agc_register_defaults_addr: std::sync::atomic::AtomicU64,
     /// Display buffers registered by VideoOut, keyed by `(port, slot)`.
     pub video_out_buffers: DashMap<(i32, i32), VideoOutBuffer>,
     /// Completed VideoOut flips for this process.
@@ -230,6 +239,14 @@ pub struct OrbisKernel {
     /// Dynamic TLS blocks allocated by `libkernel::__tls_get_addr`, keyed by
     /// `(guest thread, module identifier)`.
     pub dynamic_tls_blocks: DashMap<(u64, u64), u64>,
+    /// The process's static TLS layout: TLS module id → offset of that
+    /// module's block *within* the per-thread static area (from the area's
+    /// low end; the area spans `[tp - total, tp)`). Registered once at
+    /// launch from the linker's layout so `__tls_get_addr` resolves a
+    /// static module to the SAME storage its `TPOFF64` accesses use —
+    /// per-module, which module 1's block base alone cannot express once a
+    /// process has more than one module with TLS.
+    pub static_tls_area_offsets: DashMap<u64, u64>,
     /// Per-thread guest addresses returned by libkernel `__error()`.
     pub errno_slots: DashMap<u64, u64>,
     /// Save-data transaction resources, keyed by resource id -> memory size.
@@ -456,6 +473,17 @@ pub struct PthreadMutex {
     pub recursion: i32,
 }
 
+/// Host-backed state for one POSIX (`sem_*`) semaphore: the available count
+/// plus a condvar waiters sleep on until `sem_post` raises it. Keyed by the
+/// guest `sem_t` address in [`OrbisKernel::posix_semaphores`].
+#[derive(Debug, Default)]
+pub struct PosixSem {
+    /// Current available count (waiters sleep while it is zero).
+    pub count: parking_lot::Mutex<i64>,
+    /// Waiters sleep here until `sem_post` increments the count.
+    pub posted: parking_lot::Condvar,
+}
+
 /// Host-backed generation wait queue for one guest pthread condition.
 #[derive(Debug, Default)]
 pub struct PthreadCond {
@@ -503,6 +531,7 @@ impl OrbisKernel {
             kernel_event_flag_next: std::sync::atomic::AtomicU64::new(1),
             kernel_semaphores: DashMap::new(),
             kernel_semaphore_next: std::sync::atomic::AtomicU32::new(1),
+            posix_semaphores: DashMap::new(),
             kernel_equeues: DashMap::new(),
             kernel_equeue_events: DashMap::new(),
             kernel_equeue_next: std::sync::atomic::AtomicU64::new(1),
@@ -519,6 +548,7 @@ impl OrbisKernel {
             agc_flip_packet_count: std::sync::atomic::AtomicU64::new(0),
             agc_last_dcb_address: std::sync::atomic::AtomicU64::new(0),
             agc_last_dcb_dwords: std::sync::atomic::AtomicU32::new(0),
+            agc_register_defaults_addr: std::sync::atomic::AtomicU64::new(0),
             video_out_buffers: DashMap::new(),
             video_out_flip_count: std::sync::atomic::AtomicU64::new(0),
             video_out_vblank_count: std::sync::atomic::AtomicU64::new(0),
@@ -533,6 +563,7 @@ impl OrbisKernel {
             pthread_tls_keys: DashMap::new(),
             pthread_tls_values: DashMap::new(),
             dynamic_tls_blocks: DashMap::new(),
+            static_tls_area_offsets: DashMap::new(),
             errno_slots: DashMap::new(),
             save_data_transaction_resources: DashMap::new(),
             save_data_next_transaction_resource: std::sync::atomic::AtomicI32::new(0),
@@ -564,6 +595,17 @@ impl OrbisKernel {
             .into_iter()
             .filter(|module| module.start < module.end)
             .collect();
+    }
+
+    /// Register the process's static TLS layout: for each TLS module id, the
+    /// offset of its block within the per-thread static area (see
+    /// [`Self::static_tls_area_offsets`]). Called once at launch, replacing
+    /// any previous registration.
+    pub fn set_static_tls_area_offsets(&self, offsets: impl IntoIterator<Item = (u64, u64)>) {
+        self.static_tls_area_offsets.clear();
+        for (module_id, offset) in offsets {
+            self.static_tls_area_offsets.insert(module_id, offset);
+        }
     }
 
     /// Find the ELF owning `addr`, using half-open load ranges.

@@ -9,19 +9,29 @@
 //!
 //! Everything here is driven by registers — extent, format, viewport, scissor,
 //! topology, shaders. Nothing is a fixture. In exchange, a draw whose registers
-//! this slice cannot honour is a **named error**, never a fallback: notably a
-//! non-embedded shader bind needs a guest-memory reader (`ShaderMemory`) that
-//! Phase 1 does not have, so such a draw is logged and skipped rather than
-//! quietly rendered as something else.
+//! this slice cannot honour is a **named error**, never a fallback. Shader
+//! binds split two ways:
+//!
+//! - **embedded** (Kyty's clear/blit shaders) — assembled from the embedded
+//!   SPIR-V table, exactly as in Phase 1;
+//! - **non-embedded** — the real title path: the code is fetched from guest
+//!   memory and recompiled through [`crate::shader_fetch`] (ShaderMemory,
+//!   Phase 2). A stage that fails translation warns once (negative-cached,
+//!   named reason) and the **draw is skipped, not the whole DCB** — a title
+//!   frame mixes translatable and untranslatable shaders and one bad shader
+//!   must not hide every other draw.
 
+use crate::shader_fetch::{ShaderTranslateCache, TranslatedShader};
 use crate::vulkan::instance::VulkanDevice;
 use crate::vulkan::offscreen::{CLEAR_COLOR, DrawState, RenderedImage, render_draw};
 use ash::vk;
 use kyty_graphics::hw_regs::{Context, Shader, UserConfig};
 use kyty_graphics::run::{DrawError, DrawSink};
+use kyty_graphics::shader::resources::ShaderVertexInputInfo;
 use kyty_graphics::shader::{spirv_get_embedded_ps, spirv_get_embedded_vs};
 use kyty_graphics::spirv_asm;
-use tracing::warn;
+use std::sync::Arc;
+use tracing::debug;
 
 /// `VGT_PRIMITIVE_TYPE` values Kyty's Gen5 path emits.
 mod prim {
@@ -56,25 +66,8 @@ fn vulkan_format(
     }
 }
 
-/// Assemble the SPIR-V for a stage, or explain why we cannot.
-fn embedded_or_skip(
-    embedded: bool,
-    id: u32,
-    data_addr: u64,
-    stage: &str,
-) -> Result<Vec<u32>, DrawError> {
-    if !embedded {
-        // The real path needs ShaderMemory over the guest arena (Phase 2).
-        warn!(
-            stage,
-            data_addr = format_args!("{data_addr:#x}"),
-            "non-embedded shader bind requires ShaderMemory (Phase 2) — draw skipped"
-        );
-        return Err(err(format!(
-            "{stage} shader at {data_addr:#x} is not embedded; a guest-memory \
-             shader bind requires ShaderMemory (Phase 2)"
-        )));
-    }
+/// Assemble the SPIR-V for an embedded shader stage.
+fn assemble_embedded(id: u32, stage: &str) -> Result<Vec<u32>, DrawError> {
     let source = match stage {
         "vs" => spirv_get_embedded_vs(id),
         _ => spirv_get_embedded_ps(id),
@@ -82,6 +75,52 @@ fn embedded_or_skip(
     .map_err(|e| err(format!("embedded {stage} id {id}: {e}")))?;
 
     spirv_asm::assemble(source).map_err(|e| err(format!("assembling embedded {stage}: {e}")))
+}
+
+/// Both stages' SPIR-V, each either embedded or fetched from guest memory.
+#[derive(Debug)]
+struct ResolvedShaders {
+    vs: Arc<Vec<u32>>,
+    ps: Arc<Vec<u32>>,
+}
+
+/// Resolve the bound VS/PS to SPIR-V through the embedded table or the
+/// guest-memory fetch+translate cache.
+///
+/// The error carries the named reason; for guest shaders the loud warn
+/// already happened (once) inside the cache, so the caller can degrade a
+/// repeat failure quietly.
+fn resolve_shaders(
+    cache: &mut ShaderTranslateCache,
+    ctx: &Context,
+    sh: &Shader,
+) -> Result<ResolvedShaders, DrawError> {
+    let (vs, vs_info) = if sh.vs.vs_embedded {
+        let vs = Arc::new(assemble_embedded(sh.vs.vs_embedded_id, "vs")?);
+        // An embedded VS exports exactly its position+param set; the PS
+        // input-info builder only needs the export count.
+        let vs_info = ShaderVertexInputInfo {
+            export_count: ctx.sh_regs.get_export_count() as i32,
+            ..Default::default()
+        };
+        (vs, vs_info)
+    } else {
+        let t: TranslatedShader = cache
+            .translate_vs(&sh.vs, &ctx.sh_regs)
+            .map_err(|e| err(e.to_string()))?;
+        (t.spirv, t.vs_info)
+    };
+
+    let ps = if sh.ps.ps_embedded {
+        Arc::new(assemble_embedded(sh.ps.ps_embedded_id, "ps")?)
+    } else {
+        cache
+            .translate_ps(&sh.ps, &ctx.sh_regs, &vs_info)
+            .map_err(|e| err(e.to_string()))?
+            .spirv
+    };
+
+    Ok(ResolvedShaders { vs, ps })
 }
 
 /// Build a [`DrawState`] from decoded register state.
@@ -213,19 +252,41 @@ pub fn draw_state_from_regs<'a>(
 }
 
 /// A [`DrawSink`] that renders each draw offscreen and keeps the last image.
+///
+/// # Indexed-draw degradation (documented, deliberate)
+///
+/// This sink does not override [`DrawSink::draw_index`], so an indexed draw
+/// takes the trait's default degradation: the index buffer is **not**
+/// fetched, and the draw runs through the same register-driven path as an
+/// auto draw with `index_count` vertices. Right vertex *count*, wrong vertex
+/// *order* for anything but sequential indices — enough for first light, and
+/// the command processor logs the degradation (rate-limited). A real indexed
+/// path needs the index-buffer fetch from Kyty's `GraphicsRender` (Phase 2).
 pub struct OffscreenDrawSink<'a> {
     dev: &'a VulkanDevice,
+    cache: &'a mut ShaderTranslateCache,
     pub last: Option<RenderedImage>,
     pub draws: u64,
+    /// Draws skipped because a bound guest shader failed translation. The
+    /// named reason was warned once by the cache; each skip here is quiet
+    /// (debug) so 1600 re-binds of one bad shader stay one loud line.
+    pub shader_skips: u64,
+    /// Most recent named skip reason, surfaced by the session with a
+    /// process-wide rate limit. Null binds are not cacheable, so the cache
+    /// itself cannot provide that telemetry.
+    pub last_shader_skip_reason: Option<String>,
 }
 
 impl<'a> OffscreenDrawSink<'a> {
     #[must_use]
-    pub fn new(dev: &'a VulkanDevice) -> Self {
+    pub fn new(dev: &'a VulkanDevice, cache: &'a mut ShaderTranslateCache) -> Self {
         Self {
             dev,
+            cache,
             last: None,
             draws: 0,
+            shader_skips: 0,
+            last_shader_skip_reason: None,
         }
     }
 }
@@ -239,20 +300,24 @@ impl DrawSink for OffscreenDrawSink<'_> {
         index_count: u32,
         _flags: u32,
     ) -> Result<(), DrawError> {
-        let vs = embedded_or_skip(
-            sh.vs.vs_embedded,
-            sh.vs.vs_embedded_id,
-            sh.vs.vs_regs.data_addr,
-            "vs",
-        )?;
-        let fs = embedded_or_skip(
-            sh.ps.ps_embedded,
-            sh.ps.ps_embedded_id,
-            sh.ps.ps_regs.data_addr,
-            "ps",
-        )?;
+        let shaders = if sh.vs.vs_embedded && sh.ps.ps_embedded {
+            // The embedded pair is the Phase 1 / M2 invariant: a failure here
+            // is a broken fixture and must abort loudly.
+            resolve_shaders(self.cache, ctx, sh)?
+        } else {
+            match resolve_shaders(self.cache, ctx, sh) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Named degradation: skip this draw, keep the DCB going.
+                    self.shader_skips += 1;
+                    self.last_shader_skip_reason = Some(e.to_string());
+                    debug!(reason = %e, "draw skipped: bound guest shader is untranslatable");
+                    return Ok(());
+                }
+            }
+        };
 
-        let state = draw_state_from_regs(ctx, ucfg, index_count, &vs, &fs)?;
+        let state = draw_state_from_regs(ctx, ucfg, index_count, &shaders.vs, &shaders.ps)?;
         let image = render_draw(self.dev, &state)
             .map_err(|e| err(format!("offscreen draw failed: {e}")))?;
 
@@ -407,20 +472,28 @@ mod tests {
         assert_eq!(state.vertex_count, 3);
     }
 
+    /// A non-embedded bind with no readable code behind it must resolve to a
+    /// **named** error (which `draw_index_auto` degrades to a skipped draw,
+    /// never a crash and never a silently wrong image).
     #[test]
-    fn non_embedded_shader_is_skipped_with_a_named_error() {
-        let e = embedded_or_skip(false, 0, 0x1000, "vs").expect_err("needs ShaderMemory");
-        assert!(e.0.contains("ShaderMemory"), "got {e}");
+    fn non_embedded_shader_without_code_is_a_named_error() {
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        let sh = Shader::default(); // vs_embedded=false, data_addr=0
+        let e = resolve_shaders(&mut cache, &ctx_96x48(), &sh).expect_err("no code to fetch");
+        assert!(e.0.contains("null or unaligned"), "got {e}");
     }
 
     /// The embedded PS is `outColor = vec4(0)`. Alpha 0 is unreachable from the
     /// fixture, which is what makes the acceptance assertion decisive.
     #[test]
     fn embedded_shaders_assemble_to_real_spirv() {
-        let vs = embedded_or_skip(true, 0, 0, "vs").expect("embedded VS");
-        let ps = embedded_or_skip(true, 0, 0, "ps").expect("embedded PS");
-        assert_eq!(vs[0], 0x0723_0203, "VS SPIR-V magic");
-        assert_eq!(ps[0], 0x0723_0203, "PS SPIR-V magic");
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        let mut sh = Shader::default();
+        sh.set_vs_embedded(0, 0);
+        sh.set_ps_embedded(0);
+        let r = resolve_shaders(&mut cache, &ctx_96x48(), &sh).expect("embedded pair");
+        assert_eq!(r.vs[0], 0x0723_0203, "VS SPIR-V magic");
+        assert_eq!(r.ps[0], 0x0723_0203, "PS SPIR-V magic");
     }
 
     #[test]

@@ -11,6 +11,7 @@ use crate::{HleContext, HleRegistry};
 const OK: u64 = 0;
 const EINVAL: u64 = 22;
 const ETIMEDOUT: u64 = 60;
+const COND_OBJECT_SIZE: u64 = 0x100;
 
 pub fn register(registry: &HleRegistry) {
     for library in ["libScePosix", "libkernel"] {
@@ -31,18 +32,27 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libScePosix", "pthread_condattr_setclock", hle_condattr_ok);
 }
 
-/// `pthread_cond_init(cond, attr)`. A condition variable carries no state we
-/// need while it can have no waiters, so this only validates the pointer.
+/// `pthread_cond_init(cond, attr)`. Orbis condition variables are opaque
+/// pointer handles: initialize `*cond`, and retain the same host state under
+/// both the guest pointer slot and its allocated handle. Guest libc inspects
+/// the slot directly, so leaving it zero after reporting success can make it
+/// mistake its own initialized condition for a static/uninitialized object.
 fn hle_cond_init(ctx: &HleContext, args: &[u64]) -> u64 {
     let cond = args.first().copied().unwrap_or(0);
     debug!("pthread_cond_init(cond={cond:#x})");
     if cond == 0 {
         EINVAL
     } else {
-        ctx.kernel.pthread_conds.insert(
-            cond,
-            std::sync::Arc::new(xps5x_kernel::PthreadCond::default()),
-        );
+        let Some(handle) = ctx.alloc.alloc(COND_OBJECT_SIZE, 0x10) else {
+            return EINVAL;
+        };
+        if !ctx.mem.write(cond, &handle.to_le_bytes()) {
+            ctx.alloc.free(handle);
+            return EINVAL;
+        }
+        let state = std::sync::Arc::new(xps5x_kernel::PthreadCond::default());
+        ctx.kernel.pthread_conds.insert(cond, state.clone());
+        ctx.kernel.pthread_conds.insert(handle, state);
         OK
     }
 }
@@ -54,17 +64,46 @@ fn hle_cond_destroy(ctx: &HleContext, args: &[u64]) -> u64 {
     if cond == 0 {
         EINVAL
     } else {
+        let handle = read_handle(ctx, cond);
         ctx.kernel.pthread_conds.remove(&cond);
+        if let Some(handle) = handle {
+            ctx.kernel.pthread_conds.remove(&handle);
+            ctx.alloc.free(handle);
+        }
+        let _ = ctx.mem.write(cond, &0u64.to_le_bytes());
         OK
     }
 }
 
-fn condition(ctx: &HleContext, cond: u64) -> std::sync::Arc<xps5x_kernel::PthreadCond> {
-    ctx.kernel
-        .pthread_conds
-        .entry(cond)
-        .or_insert_with(|| std::sync::Arc::new(xps5x_kernel::PthreadCond::default()))
-        .clone()
+fn read_handle(ctx: &HleContext, cond: u64) -> Option<u64> {
+    let mut bytes = [0u8; 8];
+    ctx.mem
+        .read(cond, &mut bytes)
+        .then(|| u64::from_le_bytes(bytes))
+        .filter(|handle| *handle != 0)
+}
+
+/// Resolve an initialized condition, lazily materializing a zero-initialized
+/// static object with the same opaque-handle ABI as `pthread_cond_init`.
+fn condition(ctx: &HleContext, cond: u64) -> Option<std::sync::Arc<xps5x_kernel::PthreadCond>> {
+    if let Some(state) = ctx.kernel.pthread_conds.get(&cond) {
+        return Some(state.clone());
+    }
+    if let Some(handle) = read_handle(ctx, cond)
+        && let Some(state) = ctx.kernel.pthread_conds.get(&handle)
+    {
+        return Some(state.clone());
+    }
+
+    let handle = ctx.alloc.alloc(COND_OBJECT_SIZE, 0x10)?;
+    if !ctx.mem.write(cond, &handle.to_le_bytes()) {
+        ctx.alloc.free(handle);
+        return None;
+    }
+    let state = std::sync::Arc::new(xps5x_kernel::PthreadCond::default());
+    ctx.kernel.pthread_conds.insert(cond, state.clone());
+    ctx.kernel.pthread_conds.insert(handle, state.clone());
+    Some(state)
 }
 
 fn hle_cond_wait(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -100,7 +139,9 @@ fn wait_core(ctx: &HleContext, args: &[u64], timeout: Option<std::time::Duration
     if cond == 0 || mutex == 0 {
         return EINVAL;
     }
-    let state = condition(ctx, cond);
+    let Some(state) = condition(ctx, cond) else {
+        return EINVAL;
+    };
     let mut generation = state.generation.lock();
     let observed = *generation;
     let unlock = crate::pthread_sync::mutex_unlock_for_cond(ctx, mutex);
@@ -118,7 +159,14 @@ fn wait_core(ctx: &HleContext, args: &[u64], timeout: Option<std::time::Duration
             timed_out = true;
             break;
         }
-        state.changed.wait_for(&mut generation, slice);
+        let wait = state.changed.wait_for(&mut generation, slice);
+        // POSIX explicitly permits spurious condition-variable wakeups. Treat
+        // the bounded host wait as one so an orphaned/stale guest waiter can
+        // re-check its own predicate, while still polling process termination
+        // without pinning a host thread forever inside the VEH.
+        if timeout.is_none() && wait.timed_out() {
+            break;
+        }
     }
     drop(generation);
     let relock = crate::pthread_sync::mutex_lock_for_cond(ctx, mutex);
@@ -138,7 +186,9 @@ fn hle_cond_signal(ctx: &HleContext, args: &[u64]) -> u64 {
     if cond == 0 {
         return EINVAL;
     }
-    let state = condition(ctx, cond);
+    let Some(state) = condition(ctx, cond) else {
+        return EINVAL;
+    };
     *state.generation.lock() += 1;
     state.changed.notify_one();
     OK
@@ -151,7 +201,9 @@ fn hle_cond_broadcast(ctx: &HleContext, args: &[u64]) -> u64 {
     if cond == 0 {
         return EINVAL;
     }
-    let state = condition(ctx, cond);
+    let Some(state) = condition(ctx, cond) else {
+        return EINVAL;
+    };
     *state.generation.lock() += 1;
     state.changed.notify_all();
     OK
@@ -167,13 +219,13 @@ fn hle_condattr_ok(_ctx: &HleContext, args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{TestAllocator, TestMemory, test_ctx};
+    use crate::{GuestMemory, TestAllocator, TestMemory, test_ctx};
 
     fn fixture() -> (xps5x_kernel::OrbisKernel, TestMemory, TestAllocator) {
         (
             xps5x_kernel::OrbisKernel::new(),
-            TestMemory::new(0x1000),
-            TestAllocator::new(0x8000),
+            TestMemory::new(0x4000),
+            TestAllocator::new(0x2000),
         )
     }
 
@@ -211,5 +263,27 @@ mod tests {
         assert!(registry.is_implemented("libScePosix", "pthread_cond_timedwait"));
         assert!(registry.is_implemented("libScePosix", "pthread_cond_broadcast"));
         assert!(registry.is_implemented("libScePosix", "pthread_cond_signal"));
+    }
+
+    #[test]
+    fn static_wait_materializes_an_opaque_handle_and_can_wake_spuriously() {
+        let (kernel, mem, alloc) = fixture();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cond = 0x100;
+        let mutex = 0x200;
+        assert_eq!(crate::pthread_sync::mutex_lock_for_cond(&ctx, mutex), OK);
+
+        let started = std::time::Instant::now();
+        assert_eq!(hle_cond_wait(&ctx, &[cond, mutex]), OK);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+
+        let mut bytes = [0u8; 8];
+        assert!(mem.read(cond, &mut bytes));
+        let handle = u64::from_le_bytes(bytes);
+        assert_ne!(handle, 0);
+        assert!(kernel.pthread_conds.contains_key(&cond));
+        assert!(kernel.pthread_conds.contains_key(&handle));
+        // POSIX requires the mutex to be reacquired before wait returns.
+        assert_eq!(crate::pthread_sync::mutex_unlock_for_cond(&ctx, mutex), OK);
     }
 }

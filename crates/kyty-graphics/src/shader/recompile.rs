@@ -3416,8 +3416,7 @@ fn recompile_s_xxx_i32_svdst_svsrc01(
 }
 
 /// Kyty: `Recompile_S_XXX_U32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp L3621).
-/// XXX: Add, Addc, Bfe, Lshl4Add, MulHi (via `param`).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
+/// XXX: Add, Addc, Bfe, Lshl4Add, MulHi, Sub (via `param`).
 fn recompile_s_xxx_u32_svdst_svsrc01(
     index: u32,
     code: &ShaderCode,
@@ -5210,6 +5209,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     nis("Recompile_S_XXX_I32_SVdstSVsrc0SVsrc1", 3576, T::SSubI32,      F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpISub %int %t0_<index> %t1_<index>"), S::OverflowSub),
     nis("Recompile_S_XXX_U32_SVdstSVsrc0SVsrc1", 3621, T::SAddcU32,     F::SVdstSVsrc0SVsrc1, p4("%tscc_<index> = OpLoad %uint %scc", "%ts_<index> = OpFunctionCall %v2uint %addc %t0_<index> %t1_<index> %tscc_<index>", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
     nis("Recompile_S_XXX_U32_SVdstSVsrc0SVsrc1", 3621, T::SAddU32,      F::SVdstSVsrc0SVsrc1, p3("%ts_<index> = OpIAddCarry %ResTypeU %t0_<index> %t1_<index>", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
+    fs(recompile_s_xxx_u32_svdst_svsrc01, T::SSubU32, F::SVdstSVsrc0SVsrc1, p4("%t_<index> = OpISub %uint %t0_<index> %t1_<index>", "%nb_<index> = OpUGreaterThanEqual %bool %t0_<index> %t1_<index>", "%carry_<index> = OpSelect %uint %nb_<index> %uint_1 %uint_0", ""), S::CarryOut),
     nis("Recompile_S_XXX_U32_SVdstSVsrc0SVsrc1", 3621, T::SBfeU32,      F::SVdstSVsrc0SVsrc1, p3("%to_<index> = OpBitFieldUExtract %uint %t1_<index> %uint_0  %uint_5", "%ts_<index> = OpBitFieldUExtract %uint %t1_<index> %uint_16 %uint_7", "%t_<index> = OpBitFieldUExtract %uint %t0_<index> %to_<index> %ts_<index>"), S::NonZero),
     nis("Recompile_S_XXX_U32_SVdstSVsrc0SVsrc1", 3621, T::SLshl4AddU32, F::SVdstSVsrc0SVsrc1, p3("%ts_<index> = OpFunctionCall %v2uint %lshl_add %t0_<index> %t1_<index> %uint_4", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
     nis("Recompile_S_XXX_U32_SVdstSVsrc0SVsrc1", 3621, T::SMulHiU32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %uint %mul_hi_uint %t0_<index> %t1_<index>"), S::None),
@@ -5272,6 +5272,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     fs(recompile_swqm_b64, T::SWqmB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
 
     f(recompile_skip, T::SInstPrefetch, F::Imm, p1("")),
+    f(recompile_skip, T::SNop,          F::Imm, p1("")),
     f(recompile_skip, T::SSendmsg,      F::Imm, p1("")),
     f(recompile_skip, T::SWaitcnt,      F::Imm, p1("")),
 
@@ -5528,9 +5529,12 @@ mod tests {
             .iter()
             .filter(|e| matches!(e.func, RecompileFn::NotImplemented { .. }))
             .count();
-        assert_eq!(table.len(), 204, "table must mirror Kyty row-for-row");
+        assert_eq!(table.len(), 206, "204 Kyty rows plus SSubU32 and SNop");
         assert_eq!(implemented + ni, table.len());
-        assert_eq!(implemented, 87, "C1 implemented subset");
+        assert_eq!(
+            implemented, 89,
+            "C1 implemented subset plus title extensions"
+        );
         assert_eq!(ni, 117, "C2 remainder");
 
         // Kyty EXIT_IF(map->Contains(p)) — (type, format) keys are unique.
@@ -5571,6 +5575,50 @@ mod tests {
 
         // Unknown (type, format) pair -> None.
         assert!(recomp_func(T::VMovB32, F::Label).is_none());
+    }
+
+    #[test]
+    fn s_sub_u32_recompiles_with_no_borrow_scc() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        shader_parse(
+            0,
+            &[
+                0x80EA_6BC0,
+                0x7E00_02FF,
+                0x3F80_0000,
+                0x7E02_0280,
+                0x1004_0300,
+                0xF800_08CF,
+                0x0302_0100,
+                0xF800_020F,
+                0x0302_0100,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured s_sub_u32");
+
+        let entry = recomp_func(T::SSubU32, F::SVdstSVsrc0SVsrc1).expect("SSubU32 row");
+        assert!(matches!(entry.func, RecompileFn::Func(_)));
+        assert_eq!(entry.scc_check, SccCheck::CarryOut);
+
+        let source = spirv_generate_source(
+            &code,
+            Some(&ShaderVertexInputInfo {
+                export_count: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+        )
+        .expect("recompile measured s_sub_u32");
+        assert!(source.contains("OpISub %uint"));
+        assert!(source.contains("OpUGreaterThanEqual %bool"));
+        assert!(source.contains("OpStore %scc %carry_0"));
+        let words = spirv_run(&source).expect("assemble measured s_sub_u32");
+        naga_parse_and_validate(&words, "s_sub_u32");
     }
 
     /// The two 64-bit scalar shifts are wired, and wired **with their SCC

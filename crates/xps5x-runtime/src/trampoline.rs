@@ -7,7 +7,8 @@
 use core::ffi::c_void;
 
 use windows_sys::Win32::System::Memory::{
-    MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree,
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, VirtualAlloc,
+    VirtualFree,
 };
 
 use xps5x_firmware::{HLE_TRAMPOLINE_BASE, HleTrampoline};
@@ -16,6 +17,18 @@ use crate::RuntimeError;
 
 /// x86-64 Windows' page size (see `mem.rs`'s equivalent constant).
 const PAGE_SIZE: u64 = 4096;
+
+/// Executable helper kept separate from the no-access HLE guard. Windows can
+/// discard a user-written FS base while returning from a vectored exception;
+/// resuming at this stub makes WRFSBASE the first guest-side instruction.
+const TLS_REARM_TRAMPOLINE_BASE: u64 = HLE_TRAMPOLINE_BASE - 0x1_0000;
+
+// wrfsbase r11; pop r11; ret
+//
+// The VEH stages the original R11 and fault RIP on the guest stack and puts
+// the desired TCB in R11. The stub restores FS, restores R11, and returns to
+// the faulting instruction with every guest register and flag unchanged.
+const TLS_REARM_CODE: [u8; 8] = [0xF3, 0x49, 0x0F, 0xAE, 0xD3, 0x41, 0x5B, 0xC3];
 
 /// A `PAGE_NOACCESS` reservation covering `trampoline_count` HLE trampoline
 /// slots (8 bytes each) starting at [`HLE_TRAMPOLINE_BASE`], plus an invalid
@@ -30,6 +43,7 @@ pub(crate) struct TrampolineGuard {
     /// logical `trampoline_count * 8 + 16` span).
     len: u64,
     return_trampoline: u64,
+    tls_rearm_trampoline: u64,
 }
 
 impl TrampolineGuard {
@@ -70,10 +84,38 @@ impl TrampolineGuard {
             "VirtualAlloc with an explicit lpAddress must return that exact address on success"
         );
 
+        // SAFETY: this fixed page is disjoint from the HLE guard and guest
+        // arena. It is committed executable so the VEH can resume through the
+        // eight-byte register-preserving re-arm stub copied below.
+        let rearm = unsafe {
+            VirtualAlloc(
+                TLS_REARM_TRAMPOLINE_BASE as *const c_void,
+                PAGE_SIZE as usize,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_EXECUTE_READWRITE,
+            )
+        };
+        if rearm.is_null() {
+            // SAFETY: `raw` is the exact successful guard reservation above.
+            unsafe { VirtualFree(raw, 0, MEM_RELEASE) };
+            return Err(RuntimeError::MapFailed);
+        }
+        // SAFETY: `rearm` points to a freshly committed writable page at least
+        // TLS_REARM_CODE.len() bytes long, and the source is a non-overlapping
+        // static byte array.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                TLS_REARM_CODE.as_ptr(),
+                rearm.cast::<u8>(),
+                TLS_REARM_CODE.len(),
+            );
+        }
+
         Ok(Self {
             base: HLE_TRAMPOLINE_BASE,
             len: reserved_len,
             return_trampoline,
+            tls_rearm_trampoline: TLS_REARM_TRAMPOLINE_BASE,
         })
     }
 
@@ -92,6 +134,10 @@ impl TrampolineGuard {
     pub(crate) fn return_trampoline(&self) -> u64 {
         self.return_trampoline
     }
+
+    pub(crate) fn tls_rearm_trampoline(&self) -> u64 {
+        self.tls_rearm_trampoline
+    }
 }
 
 impl Drop for TrampolineGuard {
@@ -101,6 +147,7 @@ impl Drop for TrampolineGuard {
         // `MEM_RELEASE` requires.
         unsafe {
             VirtualFree(self.base as *mut c_void, 0, MEM_RELEASE);
+            VirtualFree(self.tls_rearm_trampoline as *mut c_void, 0, MEM_RELEASE);
         }
     }
 }

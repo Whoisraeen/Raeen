@@ -1,0 +1,192 @@
+//! Identity-mapped guest memory for the PM4 command processor.
+//!
+//! Several Gen5 packets carry guest pointers out-of-band — `R_*_REGS_INDIRECT`
+//! register lists and indirect-draw argument buffers (see
+//! `kyty_graphics::run`). Kyty dereferences those pointers directly because
+//! its command processor runs inside the guest's address space; XPS5X's
+//! `GuestArena` is **identity-mapped**, so the same is true here: a guest
+//! virtual address *is* a host address in this process.
+//!
+//! [`IdentityGuestMemory`] therefore implements
+//! [`kyty_graphics::run::GuestMemory`] with a plain read — but only after
+//! validating the whole range with `VirtualQuery`, because a corrupt DCB (or a
+//! title poking addresses we mis-decoded) must degrade to a skipped packet,
+//! not a host access violation.
+
+use kyty_graphics::run::GuestMemory;
+
+/// Upper bound on a single out-of-band read. The largest legitimate consumer
+/// is an indirect register list (`UC_NUM` pairs = 32 Ki dwords); anything
+/// bigger is a mis-decode.
+const MAX_READ_DWORDS: u32 = 0x1_0000;
+
+/// [`GuestMemory`] over the identity-mapped guest arena.
+///
+/// Reads are refused (returning `None`, which the command processor turns
+/// into a rate-limited warn + packet skip) when the address is null,
+/// unaligned, oversized, or any page in the range is not committed readable
+/// memory in this process.
+pub struct IdentityGuestMemory;
+
+impl GuestMemory for IdentityGuestMemory {
+    fn read_dwords(&self, addr: u64, count: u32) -> Option<Vec<u32>> {
+        read_dwords_checked(addr, count)
+    }
+}
+
+/// VirtualQuery-validated read of guest dwords (identity map). `None` when the
+/// range is null/unaligned/oversized or not fully committed-readable. Shared
+/// by [`IdentityGuestMemory`] and the shader fetch layer.
+#[cfg(windows)]
+pub(crate) fn read_dwords_checked(addr: u64, count: u32) -> Option<Vec<u32>> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+        VirtualQuery,
+    };
+
+    if count == 0 || count > MAX_READ_DWORDS || addr == 0 || !addr.is_multiple_of(4) {
+        return None;
+    }
+    let bytes = count as usize * 4;
+    let end = addr.checked_add(bytes as u64)?;
+    // This process is 64-bit but a guest dword could still wrap usize math on
+    // a hostile value; keep everything in u64 until validated.
+
+    const READABLE: u32 = PAGE_READONLY
+        | PAGE_READWRITE
+        | PAGE_WRITECOPY
+        | PAGE_EXECUTE_READ
+        | PAGE_EXECUTE_READWRITE
+        | PAGE_EXECUTE_WRITECOPY;
+
+    // Walk the regions covering [addr, end); every page must be committed and
+    // readable, and PAGE_GUARD would still fault on touch.
+    let mut cursor = addr;
+    while cursor < end {
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: VirtualQuery inspects the address space only; it never
+        // dereferences `cursor`, so any value is safe to pass.
+        let got = unsafe {
+            VirtualQuery(
+                cursor as *const _,
+                &mut info,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if got == 0
+            || info.State != MEM_COMMIT
+            || (info.Protect & READABLE) == 0
+            || (info.Protect & PAGE_GUARD) != 0
+        {
+            return None;
+        }
+        let region_end = info.BaseAddress as u64 + info.RegionSize as u64;
+        if region_end <= cursor {
+            return None; // defensive: no forward progress means bad info
+        }
+        cursor = region_end;
+    }
+
+    let mut out = vec![0u32; count as usize];
+    // SAFETY: [addr, addr+bytes) was just verified committed + readable in
+    // this process (the guest arena is identity-mapped, so the guest pointer
+    // is a host pointer). The read is unsynchronized with the guest — a
+    // concurrent guest write can tear a value, which for register/args data
+    // yields a stale or mixed *value*, never UB-through-invalid-memory; a
+    // concurrent unmap is the same TOCTOU the whole identity-map runtime
+    // accepts. `ptr::copy` (memmove) rather than `copy_nonoverlapping`: a
+    // wild-but-committed guest range validated only at page granularity can
+    // land arbitrarily in this process — including over the freshly allocated
+    // `out` — and overlap must degrade to garbage *values*, not UB.
+    unsafe {
+        std::ptr::copy(addr as *const u8, out.as_mut_ptr().cast::<u8>(), bytes);
+    }
+    Some(out)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn read_dwords_checked(_addr: u64, _count: u32) -> Option<Vec<u32>> {
+    // The identity-mapped runtime is Windows-only today (see CLAUDE.md);
+    // keep the cfg honest rather than pretend to validate with libc tricks.
+    None
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_committed_host_memory_identity_mapped() {
+        let data: Vec<u32> = vec![0xAABB_CCDD, 1, 2, 3];
+        let addr = data.as_ptr() as u64;
+        let got = IdentityGuestMemory.read_dwords(addr, 4);
+        assert_eq!(got, Some(data.clone()));
+    }
+
+    #[test]
+    fn refuses_null_unaligned_zero_and_oversized() {
+        let data: Vec<u32> = vec![1, 2];
+        let addr = data.as_ptr() as u64;
+        assert_eq!(IdentityGuestMemory.read_dwords(0, 1), None, "null");
+        assert_eq!(
+            IdentityGuestMemory.read_dwords(addr + 2, 1),
+            None,
+            "unaligned"
+        );
+        assert_eq!(IdentityGuestMemory.read_dwords(addr, 0), None, "zero len");
+        assert_eq!(
+            IdentityGuestMemory.read_dwords(addr, MAX_READ_DWORDS + 1),
+            None,
+            "over the cap"
+        );
+    }
+
+    #[test]
+    fn refuses_reserved_but_uncommitted_memory() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: reserving (not committing) fresh pages touches no existing
+        // mapping; released before the test ends.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null(), "VirtualAlloc(MEM_RESERVE) failed");
+        let addr = base as u64;
+        assert_eq!(
+            IdentityGuestMemory.read_dwords(addr, 4),
+            None,
+            "reserved-but-uncommitted pages must be refused, not faulted on"
+        );
+        // SAFETY: releasing the reservation made above.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+    }
+
+    /// A range that starts committed but runs into an uncommitted region must
+    /// be refused as a whole.
+    #[test]
+    fn refuses_range_that_leaves_committed_memory() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        // Reserve two pages, commit only the first.
+        // SAFETY: fresh reservation; released below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        // SAFETY: committing the first page of our own reservation.
+        let commit = unsafe { VirtualAlloc(base, 0x1000, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!commit.is_null());
+        let addr = base as u64 + 0x1000 - 8;
+        assert_eq!(
+            IdentityGuestMemory.read_dwords(addr, 4),
+            None,
+            "a read straddling into an uncommitted page must be refused"
+        );
+        assert!(
+            IdentityGuestMemory.read_dwords(addr, 2).is_some(),
+            "the committed prefix alone is readable"
+        );
+        // SAFETY: releasing the reservation made above.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+    }
+}

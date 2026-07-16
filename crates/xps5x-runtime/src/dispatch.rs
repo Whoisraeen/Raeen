@@ -45,13 +45,20 @@
 
 use core::ptr;
 use std::cell::{Cell, RefCell};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter, Register};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, EXCEPTION_ACCESS_VIOLATION, EXCEPTION_ILLEGAL_INSTRUCTION,
+};
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
-    EXCEPTION_POINTERS, RtlCaptureContext,
+    AddVectoredExceptionHandler, CONTEXT, CONTEXT_ALL_AMD64, EXCEPTION_CONTINUE_EXECUTION,
+    EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS, GetThreadContext, RtlCaptureContext,
+};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentThreadId, OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT,
+    THREAD_SUSPEND_RESUME,
 };
 
 use xps5x_firmware::{HleTrampoline, UnresolvedStub};
@@ -90,6 +97,17 @@ fn is_terminating(library: &str, function: &str) -> bool {
         .any(|&(l, f)| l == library && f == function)
 }
 
+/// Find a process-termination trampoline suitable for the Orbis `_start`
+/// `exit_fn` argument. Retail entries preserve RSI and call through it when
+/// startup terminates; handing them zero turns an orderly shutdown into a
+/// secondary execute-at-null fault.
+pub(crate) fn process_exit_trampoline(trampolines: &[HleTrampoline]) -> Option<u64> {
+    trampolines
+        .iter()
+        .find(|trampoline| is_terminating(&trampoline.library, &trampoline.function))
+        .map(|trampoline| trampoline.addr)
+}
+
 /// Serializes [`crate::execute_linked`] end to end: RT0 supports exactly
 /// one active native guest execution at a time (design doc §4/§6/§9 —
 /// "RT0 is single-threaded-execution"). [`call_lock`] is acquired by
@@ -103,6 +121,98 @@ fn is_terminating(library: &str, function: &str) -> bool {
 /// `ACTIVE_CONTEXT` route itself is thread-local and the VEH only reads the
 /// faulting OS thread's slot, which is the property later workers rely on.
 static CALL_LOCK: Mutex<()> = Mutex::new(());
+
+/// Opt-in native-execution watchdog used by retail-title bring-up. A timeout
+/// must produce the guest RIP/stack/register state before the launcher kills
+/// the process; otherwise a spin loop and a blocked host wait are
+/// indistinguishable from a silent log tail.
+struct RunWatchdog {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for RunWatchdog {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+fn arm_run_watchdog() -> Option<RunWatchdog> {
+    let delay_ms = std::env::var("XPS5X_GUEST_WATCHDOG_MS")
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .filter(|delay| *delay > 0)?;
+    // SAFETY: this only reads the caller's stable OS thread identifier.
+    let thread_id = unsafe { GetCurrentThreadId() };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    std::thread::spawn(move || {
+        for sample in 1..=3 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            if worker_cancelled.load(Ordering::Acquire) {
+                return;
+            }
+
+            // SAFETY: `thread_id` names the still-running thread whose `run`
+            // call owns this watchdog. The requested rights are exactly those
+            // needed to suspend it and read its integer/control context.
+            let thread =
+                unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, thread_id) };
+            if thread.is_null() {
+                return;
+            }
+            // SAFETY: the handle has THREAD_SUSPEND_RESUME rights. A failure is
+            // reported as `u32::MAX`; in that case no matching ResumeThread is
+            // due.
+            let suspend_count = unsafe { SuspendThread(thread) };
+            if suspend_count == u32::MAX {
+                // SAFETY: `thread` is an owned non-null Win32 handle.
+                unsafe { CloseHandle(thread) };
+                return;
+            }
+
+            // SAFETY: a zeroed CONTEXT is valid storage; ContextFlags selects
+            // all AMD64 state before GetThreadContext fills it while the target
+            // is suspended.
+            let mut context = unsafe { core::mem::zeroed::<CONTEXT>() };
+            context.ContextFlags = CONTEXT_ALL_AMD64;
+            let got_context = unsafe { GetThreadContext(thread, &mut context) } != 0;
+
+            // Resume before logging: the target might have been suspended while
+            // holding tracing's internal lock.
+            // SAFETY: this balances the successful SuspendThread above, then
+            // closes the owned handle exactly once.
+            unsafe {
+                ResumeThread(thread);
+                CloseHandle(thread);
+            }
+            if got_context && !worker_cancelled.load(Ordering::Acquire) {
+                tracing::error!(
+                    "guest watchdog sample {sample}/3 after {} ms: rip={:#x} rsp={:#x} \
+                     rbp={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} \
+                     rdi={:#x} fs_rearms={} hle_enter={} hle_exit={} last_hle={} \
+                     last_hle_return={:#x}",
+                    delay_ms * sample,
+                    context.Rip,
+                    context.Rsp,
+                    context.Rbp,
+                    context.Rax,
+                    context.Rbx,
+                    context.Rcx,
+                    context.Rdx,
+                    context.Rsi,
+                    context.Rdi,
+                    FSBASE_REARMS.load(Ordering::Relaxed),
+                    HLE_ENTERS.load(Ordering::Relaxed),
+                    HLE_EXITS.load(Ordering::Relaxed),
+                    LAST_HLE_INDEX.load(Ordering::Relaxed),
+                    LAST_HLE_RETURN.load(Ordering::Relaxed),
+                );
+            }
+        }
+    });
+    Some(RunWatchdog { cancelled })
+}
 
 /// The process-wide VEH installation. The callback itself owns no process
 /// pointer: it consults the const-initialized thread-local `ACTIVE_CONTEXT`,
@@ -140,6 +250,12 @@ fn ensure_veh() -> Result<(), RuntimeError> {
 /// skipped entirely) — see `guest_tls_survives_preemption_via_fsbase_rearm` and
 /// `genuine_wild_fault_after_preemption_recovers_instead_of_looping_the_veh`.
 static FSBASE_REARMS: AtomicU64 = AtomicU64::new(0);
+static HLE_ENTERS: AtomicU64 = AtomicU64::new(0);
+static HLE_EXITS: AtomicU64 = AtomicU64::new(0);
+static LAST_HLE_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
+static LAST_HLE_RETURN: AtomicU64 = AtomicU64::new(0);
+static TRACE_HLE: OnceLock<bool> = OnceLock::new();
+static TRACE_HLE_INDEX: OnceLock<Option<u64>> = OnceLock::new();
 
 /// The number of FS-base re-arms performed since process start — see
 /// [`FSBASE_REARMS`]. Monotonic; never reset.
@@ -290,12 +406,19 @@ struct ActiveContext {
     /// Guest callbacks return here so the VEH can finish the original HLE
     /// call and resume its caller.
     callback_return_addr: u64,
+    tls_rearm_trampoline: u64,
     /// Top-level guest calls return through the same guarded address when no
     /// nested HLE callback frame is active.
     returned: Cell<bool>,
     retval: Cell<u64>,
     /// At most one guest callback can be requested by a single HLE handler.
     pending_guest_call: Cell<Option<GuestCallRequest>>,
+    /// HLE currently executing on this OS thread. A GuestMemory write can
+    /// itself fault (for example, when a bad output pointer names RX code),
+    /// recursively entering the VEH before the call can be added to the
+    /// completed-call trace. Keep attribution in the per-thread active
+    /// context so the recovered fault names the actual writer.
+    active_hle: Cell<Option<(u64, [u64; 6])>>,
     /// Nested guest callbacks are legal (an initializer may call another API
     /// that invokes guest code), so retain their original HLE return frames.
     callback_frames: RefCell<Vec<GuestCallbackFrame>>,
@@ -453,6 +576,37 @@ impl GuestThreadScheduler for ActiveContext {
     }
 }
 
+/// Resume native guest code through the guest-side WRFSBASE stub whenever
+/// this run owns a TCB. A VEH executes with Windows' thread environment, and
+/// returning directly can silently expose the host TEB to the next `fs:`
+/// access when that address happens to be readable. Staging the write after
+/// NtContinue closes that leak at every HLE/callback/syscall safe point.
+fn resume_guest_with_tls(
+    ctx: &ActiveContext,
+    context: &mut CONTEXT,
+    mem: &dyn GuestMemory,
+    target_rip: u64,
+    target_rsp: u64,
+) {
+    context.Rip = target_rip;
+    context.Rsp = target_rsp;
+    if !ctx.tls_active.get() {
+        return;
+    }
+
+    let Some(staged_rsp) = target_rsp.checked_sub(16) else {
+        return;
+    };
+    if mem.write(staged_rsp, &context.R11.to_le_bytes())
+        && mem.write(staged_rsp + 8, &target_rip.to_le_bytes())
+    {
+        context.Rsp = staged_rsp;
+        context.R11 = ctx.guest_fsbase.get();
+        context.Rip = ctx.tls_rearm_trampoline;
+        FSBASE_REARMS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 struct UnsupportedGuestThreads;
 
 impl GuestThreadScheduler for UnsupportedGuestThreads {
@@ -500,6 +654,14 @@ struct FaultSnapshot {
     r9: u64,
     r10: u64,
     r11: u64,
+    // Callee-saved registers: at a deliberate-abort site the argument
+    // registers are already clobbered by the assert handler that just
+    // returned, but the values it was CALLED with (message pointers
+    // especially) were staged from these and usually survive.
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
     bytes: [u8; 16],
     bytes_read: bool,
 }
@@ -591,6 +753,7 @@ pub(crate) unsafe fn run(
     current_thread: u64,
     call_guest: impl FnOnce() -> core::convert::Infallible,
 ) -> Result<RunOutcome, RuntimeError> {
+    let _watchdog = arm_run_watchdog();
     // Serialization (only one native guest execution at a time, RT0) is
     // provided by the caller: `execute_linked` holds `call_lock()` for its
     // entire pipeline, not just this call — see `CALL_LOCK`'s doc comment.
@@ -665,9 +828,11 @@ pub(crate) unsafe fn run(
         region_base: guard.base(),
         region_len: guard.len(),
         callback_return_addr: guard.return_trampoline(),
+        tls_rearm_trampoline: guard.tls_rearm_trampoline(),
         returned: Cell::new(false),
         retval: Cell::new(0),
         pending_guest_call: Cell::new(None),
+        active_hle: Cell::new(None),
         callback_frames: RefCell::new(Vec::new()),
         error: Cell::new(None),
         fault_snapshot: Cell::new(None),
@@ -683,6 +848,15 @@ pub(crate) unsafe fn run(
     };
 
     ensure_veh()?;
+
+    if let Ok(value) = std::env::var("XPS5X_DIAGNOSTIC_CODE_ADDR") {
+        let value = value.trim_start_matches("0x");
+        if let Ok(address) = u64::from_str_radix(value, 16)
+            && let Some(disassembly) = diagnostic_disassembly(mem, address, 0x400)
+        {
+            tracing::info!("diagnostic guest disassembly from {address:#x}:\n{disassembly}");
+        }
+    }
 
     // `ctx` is a local; its address is stable for the rest of this function
     // (never moved), which is exactly the lifetime the VEH needs it for.
@@ -871,6 +1045,21 @@ fn read_fault_cstr(mem: &dyn GuestMemory, address: u64) -> Option<String> {
 }
 
 fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &RuntimeError) {
+    if let Some((idx, args)) = ctx.active_hle.get() {
+        if let Some(t) = trampolines.get(idx as usize) {
+            tracing::warn!(
+                "fault occurred inside HLE #{idx} {}::{} args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
+                t.library,
+                t.function,
+                args[0],
+                args[1],
+                args[2],
+                args[3],
+                args[4],
+                args[5],
+            );
+        }
+    }
     if let Some(snapshot) = ctx.fault_snapshot.get() {
         let instruction = if snapshot.bytes_read {
             snapshot
@@ -948,6 +1137,52 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
                 fault_window_start + fault_window.len() as u64
             );
         }
+        // What each register POINTS AT, previewed as text. When a guest
+        // aborts deliberately, the abort call's arguments (file, function,
+        // and — decisively — the formatted exception/assert MESSAGE) are
+        // still sitting in argument registers, and the message is the one
+        // fact no register dump or stack walk can recover. Bounded reads,
+        // printable-ASCII runs only, and only registers that actually point
+        // at readable guest memory produce a line.
+        for (name, value) in [
+            ("rax", snapshot.rax),
+            ("rcx", snapshot.rcx),
+            ("rdx", snapshot.rdx),
+            ("rsi", snapshot.rsi),
+            ("rdi", snapshot.rdi),
+            ("r8", snapshot.r8),
+            ("r9", snapshot.r9),
+            ("r10", snapshot.r10),
+            ("rbx", snapshot.rbx),
+            ("r12", snapshot.r12),
+            ("r13", snapshot.r13),
+            ("r14", snapshot.r14),
+            ("r15", snapshot.r15),
+        ] {
+            let mut preview = [0u8; 96];
+            if value == 0 || !mem.read(value, &mut preview) {
+                continue;
+            }
+            let printable: String = preview
+                .iter()
+                .take_while(|&&byte| byte != 0)
+                .map(|&byte| {
+                    if (0x20..0x7f).contains(&byte) {
+                        byte as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            // Only worth a line if it plausibly IS text: mostly printable
+            // and at least a few characters long.
+            let text_like = printable.len() >= 4
+                && printable.chars().filter(|c| *c != '.').count() * 4 >= printable.len() * 3;
+            if text_like {
+                tracing::warn!("register text preview: {name} -> {value:#x} \"{printable}\"");
+            }
+        }
+
         let mut stack_words = Vec::new();
         for index in 0..16u64 {
             let address = snapshot.rsp.wrapping_add(index * 8);
@@ -965,23 +1200,37 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
                 .join(" ");
             tracing::warn!("guest stack qwords: {formatted}");
 
-            // The first qword at RSP is normally the return address of the
-            // import call. Capturing a small window around it makes unknown
-            // NIDs diagnosable from the caller's ABI setup without retaining
-            // or dumping the guest image.
-            let return_address = stack_words[0].1;
-            let window_start = return_address.saturating_sub(16);
-            let mut return_window = [0u8; 32];
-            if mem.read(window_start, &mut return_window) {
+            // A wild indirect jump can fault before a normal function
+            // prologue, so RSP[0] is not necessarily the return address. Scan
+            // the bounded stack sample for values that actually fall inside a
+            // loaded module and show their code windows. This turns a jump into
+            // data (as seen in a title-supplied libc) into an actionable caller
+            // without guessing which stack word owns the return slot.
+            let mut shown = 0usize;
+            for (stack_address, candidate) in &stack_words {
+                let Some(module) = kernel.unwind_module_for_addr(*candidate) else {
+                    continue;
+                };
+                let window_start = candidate.saturating_sub(16);
+                let mut return_window = [0u8; 32];
+                if !mem.read(window_start, &mut return_window) {
+                    continue;
+                }
                 let bytes = return_window
                     .iter()
                     .map(|byte| format!("{byte:02x}"))
                     .collect::<Vec<_>>()
                     .join(" ");
                 tracing::warn!(
-                    "guest return-site bytes: {window_start:#x}..{:#x}: {bytes}",
-                    window_start + return_window.len() as u64
+                    "guest stack code candidate at {stack_address:#x}: {}+{:#x} ({candidate:#x}), \
+                     bytes {bytes}",
+                    module.name,
+                    candidate - module.start,
                 );
+                shown += 1;
+                if shown == 6 {
+                    break;
+                }
             }
         }
     }
@@ -1093,6 +1342,32 @@ fn is_orbis_error(ret: u64) -> bool {
     ret <= u32::MAX as u64 && (ret as u32) & 0x8000_0000 != 0
 }
 
+fn instruction_uses_fs(mem: &dyn GuestMemory, rip: u64) -> bool {
+    let mut bytes = [0u8; 15];
+    if !mem.read(rip, &mut bytes) {
+        return false;
+    }
+    let mut decoder = Decoder::with_ip(64, &bytes, rip, DecoderOptions::NONE);
+    decoder.decode().segment_prefix() == Register::FS
+}
+
+fn diagnostic_disassembly(mem: &dyn GuestMemory, start: u64, len: usize) -> Option<String> {
+    let mut bytes = vec![0u8; len];
+    if !mem.read(start, &mut bytes) {
+        return None;
+    }
+    let mut decoder = Decoder::with_ip(64, &bytes, start, DecoderOptions::NONE);
+    let mut formatter = IntelFormatter::new();
+    let mut lines = Vec::new();
+    while decoder.can_decode() && lines.len() < 48 {
+        let instruction = decoder.decode();
+        let mut rendered = String::new();
+        formatter.format(&instruction, &mut rendered);
+        lines.push(format!("{:#x}: {rendered}", instruction.ip()));
+    }
+    Some(lines.join("\n"))
+}
+
 /// The VEH callback. Services `EXCEPTION_ACCESS_VIOLATION`s whose faulting
 /// address falls inside the currently-active `TrampolineGuard` region (an
 /// HLE call) by dispatching to HLE and resuming the guest; genuine faults
@@ -1111,7 +1386,9 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     let info = unsafe { &*info };
     let record = unsafe { &*info.ExceptionRecord };
 
-    if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION {
+    let is_access_violation = record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION;
+    let is_illegal_instruction = record.ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION;
+    if !is_access_violation && !is_illegal_instruction {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
@@ -1155,6 +1432,58 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
+    if is_illegal_instruction {
+        let mem = unsafe { &*ctx.mem };
+        let mut marker = [0u8; 2];
+        if !mem.read(fault_addr, &mut marker)
+            || marker != xps5x_firmware::dynlib::linker::SYSCALL_TRAP_BYTES
+        {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        // FreeBSD/Orbis x86-64 syscall ABI: number in RAX and six arguments
+        // in RDI, RSI, RDX, R10, R8, R9. A successful syscall clears CF and
+        // returns its value in RAX; an error sets CF and returns errno in RAX.
+        // RCX/R11 receive the post-syscall RIP/RFLAGS just as real hardware's
+        // SYSCALL instruction would clobber them.
+        let number = context.Rax;
+        let args = [
+            context.Rdi,
+            context.Rsi,
+            context.Rdx,
+            context.R10,
+            context.R8,
+            context.R9,
+        ];
+        let return_rip = fault_addr.wrapping_add(marker.len() as u64);
+        context.Rcx = return_rip;
+        context.R11 = context.EFlags as u64;
+        let kernel = unsafe { &*ctx.kernel };
+        match kernel.dispatch_syscall(number, &args) {
+            Ok(value) => {
+                context.Rax = value;
+                context.EFlags &= !1;
+                tracing::debug!("Orbis syscall {number}({args:x?}) -> {value:#x}");
+            }
+            Err(error) => {
+                let errno = match error {
+                    xps5x_core::error::KernelError::UnimplementedSyscall { .. } => 78, // ENOSYS
+                    xps5x_core::error::KernelError::MmapFailed { .. } => 12,           // ENOMEM
+                    xps5x_core::error::KernelError::InvalidMemoryAccess(_) => 14,      // EFAULT
+                    xps5x_core::error::KernelError::ThreadCreationFailed(_) => 11,     // EAGAIN
+                    xps5x_core::error::KernelError::FileNotFound(_) => 2,              // ENOENT
+                    xps5x_core::error::KernelError::PermissionDenied(_) => 13,         // EACCES
+                };
+                context.Rax = errno;
+                context.EFlags |= 1;
+                tracing::warn!("Orbis syscall {number}({args:x?}) -> errno {errno} ({error})");
+            }
+        }
+        let return_rsp = context.Rsp;
+        resume_guest_with_tls(ctx, context, mem, return_rip, return_rsp);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
     // A callback requested by an HLE handler returned through the dedicated
     // extra guard slot. Finish its synchronization update and resume exactly
     // where the original import call would have returned.
@@ -1167,8 +1496,8 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             if let Some(completion) = frame.completion {
                 let _ = mem.atomic_store_u32(completion.address, completion.success_u32);
             }
-            context.Rip = frame.original_return;
             context.Rax = frame.hle_result;
+            resume_guest_with_tls(ctx, context, mem, frame.original_return, context.Rsp);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
 
@@ -1209,19 +1538,40 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         // RT2c-b spike did verify).
         if ctx.tls_active.get() {
             let want = ctx.guest_fsbase.get();
+            let access_addr = record.ExceptionInformation.get(1).copied().unwrap_or(0) as u64;
+            let mem = unsafe { &*ctx.mem };
+            // During exception dispatch Windows can temporarily present the
+            // guest FS base to RDFSBASE, then clear it again in NtContinue.
+            // The effective fault address is stronger evidence: an FS-prefixed
+            // access resolving in the low 4 GiB (or the sign-extended top
+            // range produced by a negative TPOFF from base zero) necessarily
+            // executed without the high guest TCB base.
+            let zero_based_fs_fault = instruction_uses_fs(mem, context.Rip)
+                && (access_addr < 0x1_0000_0000 || access_addr >= 0xFFFF_8000_0000_0000);
             // SAFETY: `tls_active` is only ever `true` when
             // `fsgsbase_available()` returned `true` (checked in `run` before
             // `RtlCaptureContext`), so `RDFSBASE`/`WRFSBASE` are permitted on
             // this CPU. We are on the faulting thread (vectored exceptions are
             // delivered synchronously), which is exactly the thread whose FS
             // base must be re-armed.
-            if unsafe { crate::tls::read_fsbase() } != want {
-                // SAFETY: as above. `want` is the guest TCB address `run` set
-                // up via `GuestArena::setup_main_tcb`, still mapped for the
-                // duration of this call.
-                unsafe { crate::tls::write_fsbase(want) };
-                FSBASE_REARMS.fetch_add(1, Ordering::Relaxed);
-                return EXCEPTION_CONTINUE_EXECUTION;
+            if unsafe { crate::tls::read_fsbase() } != want || zero_based_fs_fault {
+                // Returning directly after WRFSBASE is racy: Windows resumes
+                // through NtContinue and may restore FS=0 again before the
+                // faulting instruction executes. Stage a tiny guest-side
+                // trampoline instead, so WRFSBASE is the first instruction
+                // after the OS has completed exception return.
+                let Some(staged_rsp) = context.Rsp.checked_sub(16) else {
+                    return EXCEPTION_CONTINUE_SEARCH;
+                };
+                if mem.write(staged_rsp, &context.R11.to_le_bytes())
+                    && mem.write(staged_rsp + 8, &context.Rip.to_le_bytes())
+                {
+                    context.Rsp = staged_rsp;
+                    context.R11 = want;
+                    context.Rip = ctx.tls_rearm_trampoline;
+                    FSBASE_REARMS.fetch_add(1, Ordering::Relaxed);
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
             }
         }
 
@@ -1331,6 +1681,10 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             r9: context.R9,
             r10: context.R10,
             r11: context.R11,
+            r12: context.R12,
+            r13: context.R13,
+            r14: context.R14,
+            r15: context.R15,
             bytes,
             bytes_read,
         }));
@@ -1364,6 +1718,96 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
 
     let result = match trampoline::resolve(fault_addr, trampolines) {
         Some(t) => {
+            let idx = fault_addr.wrapping_sub(ctx.region_base) / 8;
+            let mut return_bytes = [0u8; 8];
+            if mem.read(context.Rsp, &mut return_bytes) {
+                LAST_HLE_RETURN.store(u64::from_le_bytes(return_bytes), Ordering::Relaxed);
+            }
+            LAST_HLE_INDEX.store(idx, Ordering::Relaxed);
+            HLE_ENTERS.fetch_add(1, Ordering::Relaxed);
+            let trace_index = *TRACE_HLE_INDEX.get_or_init(|| {
+                std::env::var("XPS5X_TRACE_HLE_INDEX")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+            });
+            if *TRACE_HLE.get_or_init(|| std::env::var_os("XPS5X_TRACE_HLE").is_some())
+                || trace_index == Some(idx)
+            {
+                let read_u64 = |addr| {
+                    let mut bytes = [0u8; 8];
+                    mem.read(addr, &mut bytes)
+                        .then(|| u64::from_le_bytes(bytes))
+                        .unwrap_or(0)
+                };
+                tracing::info!(
+                    "HLE enter #{idx}: {}::{} rip={:#x} return={:#x} \
+                     args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}] \
+                     pointees=[{:#x}, {:#x}] r14={:#x} *r14={:#x} frame_return={:#x}",
+                    t.library,
+                    t.function,
+                    context.Rip,
+                    LAST_HLE_RETURN.load(Ordering::Relaxed),
+                    context.Rdi,
+                    context.Rsi,
+                    context.Rdx,
+                    context.Rcx,
+                    context.R8,
+                    context.R9,
+                    read_u64(context.Rdi),
+                    read_u64(context.Rsi),
+                    context.R14,
+                    read_u64(context.R14),
+                    read_u64(context.Rbp.wrapping_add(8)),
+                );
+                if trace_index == Some(idx) {
+                    let mut frame = context.Rbp;
+                    let mut chain = Vec::new();
+                    for _ in 0..12 {
+                        let previous = read_u64(frame);
+                        let return_addr = read_u64(frame.wrapping_add(8));
+                        if return_addr == 0 || previous <= frame {
+                            break;
+                        }
+                        let location = kernel
+                            .unwind_module_for_addr(return_addr)
+                            .map(|module| {
+                                format!("{}+{:#x}", module.name, return_addr - module.start)
+                            })
+                            .unwrap_or_else(|| format!("{return_addr:#x}"));
+                        chain.push(location);
+                        frame = previous;
+                    }
+                    if !chain.is_empty() {
+                        tracing::info!("HLE #{idx} frame chain: {}", chain.join(" -> "));
+                    }
+                    let return_addr = LAST_HLE_RETURN.load(Ordering::Relaxed);
+                    let caller_start = return_addr & !0xff;
+                    if let Some(disassembly) = diagnostic_disassembly(mem, caller_start, 0x100) {
+                        tracing::info!(
+                            "HLE #{idx} caller disassembly from {caller_start:#x}:\n{disassembly}"
+                        );
+                    }
+                    let frame_return = read_u64(context.Rbp.wrapping_add(8));
+                    let frame_caller_start = frame_return & !0xff;
+                    if frame_return != 0
+                        && let Some(disassembly) =
+                            diagnostic_disassembly(mem, frame_caller_start, 0x100)
+                    {
+                        tracing::info!(
+                            "HLE #{idx} frame caller disassembly from {frame_caller_start:#x}:\n\
+                             {disassembly}"
+                        );
+                    }
+                    let callback = context.Rsi;
+                    if t.function.contains("Once")
+                        && let Some(disassembly) = diagnostic_disassembly(mem, callback, 0x100)
+                    {
+                        tracing::info!(
+                            "HLE #{idx} callback disassembly from {callback:#x}:\n{disassembly}"
+                        );
+                    }
+                }
+            }
             if is_terminating(&t.library, &t.function) {
                 // Design doc §4 (wall #1 W1b): `_start` ends the program by
                 // calling `exit`/`exit_group`/`_exit` (or `sceKernelExit`) —
@@ -1419,9 +1863,13 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 guest_calls: ctx,
                 guest_threads: ctx,
             };
+            ctx.active_hle
+                .set(Some((idx, args[..6].try_into().unwrap())));
             let ret = hle
                 .call(&hle_ctx, &t.library, &t.function, &args)
                 .unwrap_or(0);
+            ctx.active_hle.set(None);
+            HLE_EXITS.fetch_add(1, Ordering::Relaxed);
             if ctx.process_is_terminating() {
                 ctx.exited.set(true);
                 *context = unsafe { *ctx.recovery_ctx };
@@ -1439,8 +1887,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             // Remember it: if the guest later faults on a null we handed back,
             // this history is the only thing that names the culprit (see
             // `CallTrace`). Index, not name — no allocation in the VEH.
-            let idx = (fault_addr.wrapping_sub(ctx.region_base) / 8) as u32;
-            ctx.trace.push(idx, ret, [args[0], args[1], args[2]]);
+            ctx.trace.push(idx as u32, ret, [args[0], args[1], args[2]]);
             ret
         }
         None => {
@@ -1469,7 +1916,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 hle_result: result,
                 completion: request.completion,
             });
-            context.Rip = request.entry;
+            let callback_rsp = context.Rsp;
             context.Rdi = request.args[0];
             context.Rsi = request.args[1];
             context.Rdx = request.args[2];
@@ -1477,6 +1924,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             context.R8 = request.args[4];
             context.R9 = request.args[5];
             context.Rax = 0;
+            resume_guest_with_tls(ctx, context, mem, request.entry, callback_rsp);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
 
@@ -1507,8 +1955,8 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     let ret_addr = u64::from_le_bytes(return_bytes);
-    context.Rip = ret_addr;
-    context.Rsp = context.Rsp.wrapping_add(8);
+    let return_rsp = context.Rsp.wrapping_add(8);
+    resume_guest_with_tls(ctx, context, mem, ret_addr, return_rsp);
 
     EXCEPTION_CONTINUE_EXECUTION
 }

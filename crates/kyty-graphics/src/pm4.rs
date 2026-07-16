@@ -197,6 +197,15 @@ pub const DB_RENDER_CONTROL: u32 = 0x0;
 pub const PA_SC_SCREEN_SCISSOR_TL: u32 = 0xC;
 pub const PA_SC_SCREEN_SCISSOR_BR: u32 = 0xD;
 pub const CB_TARGET_MASK: u32 = 0x8E;
+/// PS interpolator settings — 32 consecutive registers.
+pub const SPI_PS_INPUT_CNTL_0: u32 = 0x191;
+pub const SPI_VS_OUT_CONFIG: u32 = 0x1B1;
+pub const SPI_PS_INPUT_ENA: u32 = 0x1B3;
+pub const SPI_PS_INPUT_ADDR: u32 = 0x1B4;
+pub const SPI_PS_IN_CONTROL: u32 = 0x1B6;
+/// Target output modes, 4 bits per MRT (`ShaderRegisters::target_output_mode`).
+pub const SPI_SHADER_COL_FORMAT: u32 = 0x1C5;
+pub const DB_SHADER_CONTROL: u32 = 0x203;
 pub const PA_SC_GENERIC_SCISSOR_TL: u32 = 0x90;
 pub const PA_SC_VPORT_ZMIN_0: u32 = 0xB4;
 pub const PA_CL_VPORT_XSCALE: u32 = 0x10F;
@@ -228,8 +237,24 @@ pub const PA_CL_VPORT_STRIDE: u32 = 6;
 
 // ---- Shader (SH) register indices ---------------------------------------
 
+/// Gen5 shader binds are plain SH-register writes (Kyty registers these in
+/// `g_hw_sh_indirect_func`, GraphicsRun.cpp L3995-4100): the PS stage gets
+/// `PGM_LO/HI_PS` + `PGM_CHKSUM_PS` + `PGM_RSRC2_PS`, and the VS stage rides
+/// the ES/GS registers (`PGM_LO/HI_ES`, `PGM_CHKSUM_GS`, `PGM_RSRC2_GS`) —
+/// the "gs instead of vs" wave layout `shader_parse_vs` detects.
+pub const SPI_SHADER_PGM_CHKSUM_PS: u32 = 0x06;
+pub const SPI_SHADER_PGM_LO_PS: u32 = 0x08;
+pub const SPI_SHADER_PGM_HI_PS: u32 = 0x09;
+pub const SPI_SHADER_PGM_RSRC1_PS: u32 = 0x0A;
+pub const SPI_SHADER_PGM_RSRC2_PS: u32 = 0x0B;
 pub const SPI_SHADER_USER_DATA_PS_0: u32 = 0x0C;
 pub const SPI_SHADER_USER_DATA_VS_0: u32 = 0x4C;
+pub const SPI_SHADER_PGM_CHKSUM_GS: u32 = 0x80;
+pub const SPI_SHADER_PGM_RSRC1_GS: u32 = 0x8A;
+pub const SPI_SHADER_PGM_RSRC2_GS: u32 = 0x8B;
+pub const SPI_SHADER_USER_DATA_GS_0: u32 = 0x8C;
+pub const SPI_SHADER_PGM_LO_ES: u32 = 0xC8;
+pub const SPI_SHADER_PGM_HI_ES: u32 = 0xC9;
 
 // ---- User-config (UC) register indices ----------------------------------
 
@@ -279,6 +304,13 @@ pub mod cb_color_attrib3 {
     field!(RESOURCE_TYPE, 24, 0x3);
     field!(CMASK_PIPE_ALIGNED, 26, 0x1);
     field!(DCC_PIPE_ALIGNED, 30, 0x1);
+}
+
+/// `SPI_SHADER_PGM_RSRC2_*` fields shared by PS/GS (Pm4.h L760-771 / 854-866):
+/// `USER_SGPR` at bit 1 (5 bits) with its MSB extension at bit 27.
+pub mod spi_shader_pgm_rsrc2 {
+    field!(USER_SGPR, 1, 0x1F);
+    field!(USER_SGPR_MSB, 27, 0x1);
 }
 
 /// `PA_SC_SCREEN_SCISSOR_TL` / `_BR` fields (Pm4.h L162-171).

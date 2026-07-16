@@ -70,3 +70,4 @@ Agents.md
 # (override the path with XPS5X_TRIANGLE_PPM). A build artifact, not source.
 triangle.ppm
 *.ppm
+scratch/

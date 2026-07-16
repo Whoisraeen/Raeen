@@ -30,8 +30,40 @@ fn next_handle() -> u64 {
 
 /// Register the media-subsystem HLE functions.
 pub fn register(registry: &HleRegistry) {
-    // libSceAjm — audio decoder context handshake.
+    // libSceAjm — audio decoder context handshake, plus the batch-decode
+    // surface the measured title (Minecraft) imports. Handles are real,
+    // batches complete instantly, and NO samples are decoded — silence, not
+    // a hang. Signatures follow the documented PS4 AJM ABI where one exists;
+    // the PS5-only names (`BatchInitialize`, the `BatchJob*` builders) are
+    // unknown-ABI unblock stubs that log their arguments once.
     registry.register("libSceAjm", "sceAjmInitialize", hle_ajm_initialize);
+    registry.register("libSceAjm", "sceAjmFinalize", hle_ok);
+    registry.register("libSceAjm", "sceAjmModuleRegister", hle_ok);
+    registry.register("libSceAjm", "sceAjmModuleUnregister", hle_ok);
+    registry.register("libSceAjm", "sceAjmInstanceCreate", hle_ajm_instance_create);
+    registry.register("libSceAjm", "sceAjmInstanceDestroy", hle_ok);
+    registry.register("libSceAjm", "sceAjmBatchInitialize", hle_ajm_unknown_abi);
+    registry.register("libSceAjm", "sceAjmBatchJobInitialize", hle_ajm_unknown_abi);
+    registry.register("libSceAjm", "sceAjmBatchJobDecode", hle_ajm_unknown_abi);
+    registry.register(
+        "libSceAjm",
+        "sceAjmBatchJobClearContext",
+        hle_ajm_unknown_abi,
+    );
+    registry.register(
+        "libSceAjm",
+        "sceAjmBatchJobSetGaplessDecode",
+        hle_ajm_unknown_abi,
+    );
+    registry.register(
+        "libSceAjm",
+        "sceAjmBatchJobSetResampleParameters",
+        hle_ajm_unknown_abi,
+    );
+    registry.register("libSceAjm", "sceAjmBatchStart", hle_ajm_batch_start);
+    registry.register("libSceAjm", "sceAjmBatchWait", hle_ok);
+    registry.register("libSceAjm", "sceAjmBatchCancel", hle_ok);
+    registry.register("libSceAjm", "sceAjmBatchErrorDump", hle_ok);
 
     // libSceNgs2 — audio synthesis system/rack/voice management (no output).
     registry.register(
@@ -86,6 +118,55 @@ fn hle_ajm_initialize(ctx: &HleContext, args: &[u64]) -> u64 {
         return AJM_ERROR_INVALID_PARAMETER;
     }
     debug!("sceAjmInitialize -> context {context_id}");
+    OK
+}
+
+/// `sceAjmInstanceCreate(context, codec, flags, out_instance)`: hand out an
+/// instance id (documented PS4 AJM ABI; the PS5 library keeps the name).
+/// No decoder is created — batches against it complete with no output.
+fn hle_ajm_instance_create(ctx: &HleContext, args: &[u64]) -> u64 {
+    let out = args.get(3).copied().unwrap_or(0);
+    if out == 0 {
+        return AJM_ERROR_INVALID_PARAMETER;
+    }
+    let instance = next_handle() as u32;
+    if !ctx.mem.write(out, &instance.to_le_bytes()) {
+        return AJM_ERROR_INVALID_PARAMETER;
+    }
+    debug!("sceAjmInstanceCreate -> instance {instance}");
+    OK
+}
+
+/// `sceAjmBatchStart(context, batch, size, priority, error_out, batchid_out)`
+/// (PS4 `sceAjmBatchStartBuffer` shape): the batch "completes" immediately —
+/// a fresh batch id is written so the paired `sceAjmBatchWait` succeeds, and
+/// no job in the buffer is executed (decode output is silence).
+fn hle_ajm_batch_start(ctx: &HleContext, args: &[u64]) -> u64 {
+    let batch_out = args.get(5).copied().unwrap_or(0);
+    if batch_out != 0 {
+        let batch = next_handle() as u32;
+        if !ctx.mem.write(batch_out, &batch.to_le_bytes()) {
+            return AJM_ERROR_INVALID_PARAMETER;
+        }
+    }
+    OK
+}
+
+/// The PS5-only AJM batch-builder names (`sceAjmBatchInitialize`,
+/// `sceAjmBatchJob*`): no public ABI exists for them, so this succeeds
+/// without touching guest memory and logs its arguments once per process so
+/// a real run records the shape to reverse. See `libsce_acm.rs` for the
+/// same policy and why an unresolved import here was worse (a wild jump on
+/// the title's main thread).
+fn hle_ajm_unknown_abi(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            ?args,
+            "sceAjmBatch* builder: UNKNOWN ABI — succeeding without side effects \
+             (no audio is decoded); record these args to reverse the signature"
+        );
+    }
     OK
 }
 

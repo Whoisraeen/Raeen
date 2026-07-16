@@ -1,5 +1,5 @@
 //! `ModuleRegistry` — dispatches each module import NID to either an HLE
-//! implementation or a loaded LLE (real, linked) export, per a per-module
+//! implementation or a loaded LLE (real, linked) export, per a provider-module
 //! policy.
 //!
 //! This is the LM1 "which implementation answers this import" decision
@@ -70,7 +70,7 @@ impl ModuleRegistry {
     /// Set the dispatch policy for `module`. Modules with no explicit policy
     /// use [`ModulePolicy::PreferHle`].
     pub fn set_policy(&mut self, module: &str, policy: ModulePolicy) {
-        self.policies.insert(module.to_string(), policy);
+        self.policies.insert(canonical_module_name(module), policy);
     }
 
     /// Record `exports` as this module's LLE exports, available to satisfy
@@ -108,12 +108,17 @@ impl ModuleRegistry {
         }
     }
 
-    /// Resolve `nid` for an import belonging to `importing_module`, per that
-    /// module's policy (default [`ModulePolicy::PreferHle`]).
-    pub fn resolve(&self, hle: &HleRegistry, importing_module: &str, nid: u64) -> Resolver {
+    /// Resolve `nid` from `provider_module`, per that provider's policy
+    /// (default [`ModulePolicy::PreferHle`]).
+    ///
+    /// This must be the module named by the import symbol, not the module that
+    /// happens to contain the relocation. Otherwise a title-supplied runtime
+    /// such as `libc.prx` can be split between its own stateful implementation
+    /// and unrelated HLE functions according to who called it.
+    pub fn resolve(&self, hle: &HleRegistry, provider_module: &str, nid: u64) -> Resolver {
         let policy = self
             .policies
-            .get(importing_module)
+            .get(&canonical_module_name(provider_module))
             .copied()
             .unwrap_or_default();
 
@@ -147,6 +152,15 @@ impl ModuleRegistry {
             .get(&nid)
             .map(|&addr| Resolver::Lle { addr })
     }
+}
+
+fn canonical_module_name(module: &str) -> String {
+    let lower = module.to_ascii_lowercase();
+    lower
+        .strip_suffix(".sprx")
+        .or_else(|| lower.strip_suffix(".prx"))
+        .unwrap_or(&lower)
+        .to_string()
 }
 
 #[cfg(test)]
@@ -268,5 +282,21 @@ mod tests {
             Resolver::Lle { addr } => assert_eq!(addr, 0x1234),
             other => panic!("expected Resolver::Lle under PreferLle, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn policy_names_are_case_insensitive_and_ignore_prx_suffixes() {
+        let (hle, db) = build_hle_and_db();
+        let (_, function) = uniquely_named_hle_function(&hle);
+        let nid = nid_of(&function);
+        let mut registry = ModuleRegistry::new(db);
+        registry.register_module_exports("libc", &[SymbolExport { nid, value: 0x5678 }]);
+
+        registry.set_policy("LiBc.PrX", ModulePolicy::PreferLle);
+
+        assert_eq!(
+            registry.resolve(&hle, "libc", nid),
+            Resolver::Lle { addr: 0x5678 }
+        );
     }
 }

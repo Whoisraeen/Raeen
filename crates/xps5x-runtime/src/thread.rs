@@ -167,17 +167,17 @@ impl GuestThreadScheduler for GuestProcessHandle {
             return SCE_KERNEL_ERROR_EAGAIN;
         }
 
-        let Some(tcb) = self.arena.setup_thread_tcb(self.module.tls.as_ref()) else {
+        let Some(tcb) = self.arena.setup_thread_tcb(&self.module.tls_layout) else {
             self.arena.free(stack_base);
             return SCE_KERNEL_ERROR_EAGAIN;
         };
-        let tls_block_size = self.module.tls.as_ref().map_or(0, |tls| tls.block_size());
-        let tcb_base = tcb - tls_block_size;
-        // Only a module with a `PT_TLS` has a static block; without one,
-        // `tcb_base == tcb` and there is no thread-local storage to alias, so
-        // `__tls_get_addr` must fall back to its dynamic path rather than be
-        // handed the TCB itself.
-        let static_tls_block = self.module.tls.as_ref().map(|_| tcb_base);
+        let tls_area = xps5x_firmware::static_tls_total(&self.module.tls_layout);
+        let tcb_base = tcb - tls_area;
+        // Only a process with at least one `PT_TLS` has a static area; without
+        // one, `tcb_base == tcb` and there is no thread-local storage to
+        // alias, so `__tls_get_addr` must fall back to its dynamic path rather
+        // than be handed the TCB itself.
+        let static_tls_block = (tls_area > 0).then_some(tcb_base);
         let handle = self.next_thread.fetch_add(1, Ordering::Relaxed);
         let process = self.clone();
         let host = std::thread::Builder::new()

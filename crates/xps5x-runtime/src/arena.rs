@@ -40,8 +40,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READWRITE,
-    VirtualAlloc, VirtualFree,
+    MEM_COMMIT, MEM_FREE, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ,
+    PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    VirtualProtect, VirtualQuery,
 };
 
 use xps5x_hle::{GuestAllocator, GuestMemory};
@@ -69,6 +70,24 @@ const VMM_MIN: u64 = PAGE_SIZE;
 /// `0x3_0000_0000` — 12 GiB, far below the 16 TiB arena base — then writes to
 /// that literal address). Everything we do not own is [`VmaType::Foreign`].
 const VMM_MAX: u64 = 0x8000_0000_0000;
+
+/// First guest VA considered when the kernel chooses an address for a
+/// non-fixed mapping. This is guest VMM policy, not host ASLR policy.
+const DEFAULT_MAPPING_BASE: u64 = 0x2_0000_0000; // 8 GiB
+
+/// PS5 kernel-selected mappings first use the system-managed virtual-address
+/// window. Native title libc validates mspace storage against these bounds, so
+/// returning memory from the emulator's 16 TiB image arena is not ABI-valid.
+const SYSTEM_MANAGED_MIN: u64 = 0x0040_0000; // 4 MiB
+const SYSTEM_MANAGED_LIMIT: u64 = 0x08_0000_0000; // one past 32 GiB
+
+/// If the system-managed window cannot satisfy a mapping, use the PS5 user
+/// window. Keep the upper limit below native libc's low-user-range guard.
+const USER_MAPPING_MIN: u64 = 0x10_0000_0000; // 64 GiB
+const USER_MAPPING_LIMIT: u64 = 0x00FB_FFC0_0000;
+
+/// Explicit Windows reservations must start on a 64 KiB boundary.
+const WINDOWS_ALLOCATION_GRANULARITY: u64 = 0x1_0000;
 
 /// Diagnostic names for the ranges the arena hands out. Titles read the `name`
 /// of a mapping back through the Named* map calls, and a name also keeps two
@@ -190,6 +209,65 @@ fn align_up(value: u64, align: u64) -> Option<u64> {
     value.checked_add(mask).map(|v| v & !mask)
 }
 
+/// Reserve an uncommitted host range at the first available address in the
+/// guest's deterministic low-VA mapping window.
+fn reserve_guest_address_space(start: u64, limit: u64, length: u64, align: u64) -> Option<u64> {
+    let placement_align = align.max(WINDOWS_ALLOCATION_GRANULARITY);
+    let mut cursor = align_up(start, placement_align)?;
+
+    while cursor < limit {
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `VirtualQuery` only inspects the region containing `cursor`;
+        // `info` is a valid, correctly sized out-buffer.
+        let queried = unsafe {
+            VirtualQuery(
+                cursor as *const c_void,
+                &mut info,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if queried == 0 {
+            return None;
+        }
+
+        let region_base = info.BaseAddress as u64;
+        let region_end = region_base.checked_add(info.RegionSize as u64)?;
+        if info.State == MEM_FREE {
+            let candidate = align_up(cursor.max(region_base), placement_align)?;
+            let end = candidate.checked_add(length)?;
+            if end <= region_end && end <= limit {
+                // SAFETY: Windows just reported `[candidate, end)` free;
+                // `candidate` has allocation-granularity alignment. An
+                // explicit reservation either succeeds there or returns null.
+                let raw = unsafe {
+                    VirtualAlloc(
+                        candidate as *const c_void,
+                        length as usize,
+                        MEM_RESERVE,
+                        PAGE_NOACCESS,
+                    )
+                };
+                if !raw.is_null() {
+                    if raw as u64 == candidate {
+                        return Some(candidate);
+                    }
+                    // Defensive only: explicit VirtualAlloc does not relocate.
+                    unsafe {
+                        VirtualFree(raw, 0, MEM_RELEASE);
+                    }
+                }
+            }
+        }
+
+        let next = align_up(region_end.max(cursor.saturating_add(1)), placement_align)?;
+        if next <= cursor {
+            return None;
+        }
+        cursor = next;
+    }
+    None
+}
+
 /// Commit `len` bytes at `addr` — a sub-range of the `[base, base +
 /// ARENA_SPAN)` region `new` already reserved via `VirtualAlloc(MEM_RESERVE)`
 /// — with protection `protect`. On failure, releases the *entire* `base`
@@ -248,6 +326,9 @@ struct AllocState {
     /// the block base is a legal argument, which is why the base is kept rather
     /// than the aligned address handed to the guest.
     os_reservations: Vec<u64>,
+    /// Fully committed mappings created as independent Windows reservations
+    /// outside the fixed arena, keyed by their exact `MEM_RELEASE` base.
+    external_mappings: HashMap<u64, u64>,
     /// Avoid repeating the heap-growth notice for every allocation after the
     /// fixed 1 GiB fast path fills.
     sparse_heap_announced: bool,
@@ -316,6 +397,7 @@ impl AllocState {
             vmm,
             heap_sizes: HashMap::new(),
             os_reservations: Vec::new(),
+            external_mappings: HashMap::new(),
             sparse_heap_announced: false,
             demand_commit_announced: false,
         }
@@ -437,6 +519,39 @@ impl GuestArena {
         // of `image.len()` bytes stays within both.
         unsafe {
             core::ptr::copy_nonoverlapping(image.as_ptr(), base as *mut u8, image.len());
+        }
+
+        // Opt-in bring-up aid: make one image page RX so the *first writer*
+        // to code faults at its real call site instead of silently corrupting
+        // instructions and failing much later. The normal mapping remains the
+        // current RWX compatibility shortcut until LinkedModule carries every
+        // PT_LOAD permission into this layer.
+        if let Ok(value) = std::env::var("XPS5X_DIAGNOSTIC_RX_PAGE")
+            && let Ok(address) = u64::from_str_radix(value.trim_start_matches("0x"), 16)
+        {
+            let page = address & !(PAGE_SIZE - 1);
+            let image_end = base + image_len;
+            if page >= base && page < image_end {
+                let mut old_protect = 0u32;
+                // SAFETY: `page` is page-aligned and lies in the committed
+                // image range owned by this arena. The protection is restored
+                // implicitly when the whole reservation is released on Drop.
+                let ok = unsafe {
+                    VirtualProtect(
+                        page as *const c_void,
+                        PAGE_SIZE as usize,
+                        PAGE_EXECUTE_READ,
+                        &mut old_protect,
+                    )
+                } != 0;
+                if ok {
+                    tracing::info!(
+                        "diagnostic RX page armed at {page:#x} (old protection {old_protect:#x})"
+                    );
+                } else {
+                    tracing::warn!("failed to arm diagnostic RX page at {page:#x}");
+                }
+            }
         }
 
         Ok(Self {
@@ -650,6 +765,65 @@ impl GuestArena {
         Some((addr, committed_len))
     }
 
+    /// Reserve and commit one kernel-selected mapping in the PS5 virtual
+    /// address windows. The fixed image arena intentionally lives far above
+    /// console VA space; exposing that address to native title libc breaks its
+    /// allocator range checks.
+    fn map_console_va(
+        &self,
+        state: &mut AllocState,
+        length: u64,
+        align: u64,
+        name: &str,
+    ) -> Option<u64> {
+        let addr =
+            reserve_guest_address_space(SYSTEM_MANAGED_MIN, SYSTEM_MANAGED_LIMIT, length, align)
+                .or_else(|| {
+                    reserve_guest_address_space(USER_MAPPING_MIN, USER_MAPPING_LIMIT, length, align)
+                })?;
+
+        let end = addr.checked_add(length)?;
+        if !range_all(&state.vmm, addr, end, |vma| vma.kind == VmaType::Foreign) {
+            // SAFETY: `addr` is the exact reservation base returned above and
+            // has not been published or recorded yet.
+            unsafe {
+                VirtualFree(addr as *mut c_void, 0, MEM_RELEASE);
+            }
+            return None;
+        }
+
+        // SAFETY: `[addr, end)` is the page-aligned reservation just obtained
+        // from Windows. Committing it in place cannot relocate it.
+        let raw = unsafe {
+            VirtualAlloc(
+                addr as *const c_void,
+                length as usize,
+                MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        if raw.is_null() || raw as u64 != addr {
+            // SAFETY: same exact, unpublished reservation-base proof as above.
+            unsafe {
+                VirtualFree(addr as *mut c_void, 0, MEM_RELEASE);
+            }
+            return None;
+        }
+
+        state.os_reservations.push(addr);
+        state.external_mappings.insert(addr, length);
+        state.vmm.map_range(
+            addr,
+            length,
+            VmaType::Flexible,
+            prot::CPU_READ_WRITE,
+            None,
+            name,
+            false,
+        );
+        Some(addr)
+    }
+
     /// Give a just-reserved OS block straight back, and fail the request that
     /// asked for it. Always returns `None`, so callers can `return
     /// self.release_unusable_block(block)` at the point they give up.
@@ -665,38 +839,56 @@ impl GuestArena {
         None
     }
 
-    /// Set up the main-thread TCB and, if the module has a `PT_TLS`
-    /// template, its static TLS block (design doc §3, RT2c-b/M1-B):
+    /// Set up the main-thread TCB and, if any module in the process has a
+    /// `PT_TLS` template, the **combined** static TLS area (design doc §3,
+    /// RT2c-b/M1-B):
     ///
-    /// - Carves `tls.block_size() + TCB_SIZE` bytes from the heap allocator
-    ///   (variant-II x86-64 layout: the TLS block sits immediately *below*
-    ///   the TCB, so a `TPOFF64`-relocated `fs:[-off]` access lands in it).
-    ///   `TlsTemplate::block_size` is the same size the LM1 linker computed
-    ///   `TPOFF64` offsets against — the two must agree exactly.
-    /// - Copies the `.tdata` init image into the block's start; `.tbss` and
-    ///   padding stay zero.
+    /// - Carves `static_tls_total(layout) + TCB_SIZE` bytes from the heap
+    ///   allocator (variant-II x86-64 layout: every module's TLS block sits
+    ///   *below* the TCB, at the `tp_offset` the linker computed its
+    ///   `TPOFF64` offsets against — the two must agree exactly).
+    /// - Copies each module's `.tdata` init image into its block; `.tbss`
+    ///   and padding stay zero. Skipping a module's image is not a lesser
+    ///   mode: libc.prx keeps errno/locale/strtok state in 0x188 bytes of
+    ///   initialized TLS, and a zeroed copy is undefined behavior the guest
+    ///   has no way to see coming.
     /// - Writes the TCB self-pointer at `fs:[0]` (the FreeBSD/Orbis
     ///   "variant II" convention) and a real, nonzero `__stack_chk_guard`
     ///   canary at the ABI-mandated `fs:0x28` ([`CANARY_TCB_OFFSET`]).
     ///
     /// Returns the TCB's guest address (the FS base to install), or `None`
     /// if the heap allocation or the write-back fails.
-    pub(crate) fn setup_main_tcb(&self, tls: Option<&xps5x_firmware::TlsTemplate>) -> Option<u64> {
-        let tls_block = tls.map(|t| t.block_size()).unwrap_or(0);
-        let align = tls.map(|t| t.align.max(16)).unwrap_or(16);
-        let total = tls_block.checked_add(TCB_SIZE)?;
+    pub(crate) fn setup_main_tcb(
+        &self,
+        tls_layout: &[xps5x_firmware::StaticTlsModule],
+    ) -> Option<u64> {
+        let area = xps5x_firmware::static_tls_total(tls_layout);
+        let align = tls_layout
+            .iter()
+            .map(|m| m.template.align.max(16))
+            .max()
+            .unwrap_or(16);
+        let total = area.checked_add(TCB_SIZE)?;
         let base = self.alloc(total, align)?;
-        let tcb = base.checked_add(tls_block)?;
+        let tcb = base.checked_add(area)?;
 
         let mut block = vec![0u8; total as usize];
-        if let Some(t) = tls {
-            // `.tdata` at the block's start; a template whose `data`
-            // somehow exceeds `block_size()` (malformed: filesz > memsz)
-            // is truncated rather than trusted.
-            let n = t.data.len().min(tls_block as usize);
-            block[..n].copy_from_slice(&t.data[..n]);
+        for module in tls_layout {
+            // The module's block starts `tp_offset` below the TCB. Its
+            // `.tdata` goes at the block's start; a template whose `data`
+            // somehow exceeds its slot (malformed: filesz > memsz, or an
+            // offset outside the area) is truncated rather than trusted.
+            let Some(start) = (area as usize).checked_sub(module.tp_offset as usize) else {
+                continue;
+            };
+            let n = module
+                .template
+                .data
+                .len()
+                .min((area as usize).saturating_sub(start));
+            block[start..start + n].copy_from_slice(&module.template.data[..n]);
         }
-        let tcb_off = tls_block as usize;
+        let tcb_off = area as usize;
         block[tcb_off..tcb_off + 8].copy_from_slice(&tcb.to_le_bytes());
         block[tcb_off + CANARY_TCB_OFFSET..tcb_off + CANARY_TCB_OFFSET + 8]
             .copy_from_slice(&stack_canary().to_le_bytes());
@@ -707,14 +899,14 @@ impl GuestArena {
         Some(tcb)
     }
 
-    /// Allocate an independent variant-II TLS block and TCB for a guest
+    /// Allocate an independent variant-II TLS area and TCB for a guest
     /// worker. The layout is identical to the main thread; only ownership and
     /// FS-base installation differ.
     pub(crate) fn setup_thread_tcb(
         &self,
-        tls: Option<&xps5x_firmware::TlsTemplate>,
+        tls_layout: &[xps5x_firmware::StaticTlsModule],
     ) -> Option<u64> {
-        self.setup_main_tcb(tls)
+        self.setup_main_tcb(tls_layout)
     }
 }
 
@@ -755,6 +947,42 @@ impl Drop for GuestArena {
 /// for itself. `range_is_committed` is what makes that safe — it admits only the
 /// committed core, ranges the guest actually mapped, and reservation pages
 /// demand-commit has backed.
+impl GuestArena {
+    /// `range_is_committed`, with the same lazy-commit semantics a native
+    /// guest STORE gets: a range inside a demand-commit reservation that no
+    /// instruction has touched yet is NOT a wild pointer — a guest store
+    /// there would fault into `commit_on_demand` and succeed. An HLE call
+    /// writing there must behave identically (measured: Minecraft hands
+    /// `getdents` a dirent buffer carved from a big lazy reservation; the
+    /// old strict check turned that into EFAULT, which the title escalated
+    /// to a fatal `std::out_of_range`). Commits page-by-page and re-checks;
+    /// pages outside any reservation still fail, so wild pointers stay
+    /// rejected. Bounded: refuses ranges over 16 MiB so a wild length
+    /// cannot turn into a commit storm.
+    ///
+    /// Write-side only, deliberately: HLE READS of untouched reservations
+    /// stay strict, keeping "a 512 GiB reservation is not a 512 GiB commit"
+    /// observable (see the reservation tests) — an HLE read has no data to
+    /// deliver from a page nothing ever wrote.
+    fn ensure_range_backed_for_write(&self, start: u64, end: u64) -> bool {
+        if self.range_is_committed(start, end) {
+            return true;
+        }
+        const MAX_DEMAND_COMMIT_SPAN: u64 = 16 << 20;
+        if end.saturating_sub(start) > MAX_DEMAND_COMMIT_SPAN {
+            return false;
+        }
+        let mut page = start & !0xFFF;
+        while page < end {
+            // Failures are fine (pages outside any reservation); the
+            // re-check below is authoritative.
+            self.commit_on_demand(page);
+            page = page.saturating_add(0x1000);
+        }
+        self.range_is_committed(start, end)
+    }
+}
+
 impl GuestMemory for GuestArena {
     fn read(&self, guest_addr: u64, out: &mut [u8]) -> bool {
         // `out.len()` (a `usize`) never truncates when widened to `u64` on
@@ -791,8 +1019,9 @@ impl GuestMemory for GuestArena {
         let Some(end) = guest_addr.checked_add(len) else {
             return false;
         };
-        // Same bounds argument as `read`: `range_is_committed` is authoritative.
-        if !self.range_is_committed(guest_addr, end) {
+        // Same bounds argument as `read`, except a write demand-commits
+        // reservation pages exactly as a native guest store would.
+        if !self.ensure_range_backed_for_write(guest_addr, end) {
             return false;
         }
         // SAFETY: same bounds argument as `read` above. Every sub-region is
@@ -971,37 +1200,11 @@ impl GuestAllocator for GuestArena {
         let length = align_up(length.max(1), align)?;
         let mut state = self.lock_state();
 
-        // Fast path: the pre-committed 1.5 GiB mmap region. The bound check is
-        // load-bearing, not defensive — the mmap region and the sparse tail are
-        // contiguous free space, so `search_free` will happily answer with a
-        // tail address once the region fills, and the tail's pages are reserved
-        // rather than committed. Below that boundary the memory already exists;
-        // above it, `grow_into_tail` has to commit it first.
-        let arena_end = self.base + ARENA_SPAN;
-        if let Some(addr) = state
-            .vmm
-            .search_free(self.base + MMAP_OFFSET, length, align)
-            && addr.checked_add(length).is_some_and(|end| end <= arena_end)
-        {
-            state.vmm.map_range(
-                addr,
-                length,
-                VmaType::Flexible,
-                prot::CPU_READ_WRITE,
-                None,
-                MMAP_NAME,
-                false,
-            );
-            return Some(addr);
-        }
-
-        // A retail title's first request can exceed the committed region
-        // outright: ASTRO.BOT opens with `sceKernelAllocateDirectMemory(len =
-        // 0x7980_0000)` — 1.94 GiB — which routes here. Capping at `ARENA_SPAN`
-        // failed that call, and the title then built its heap over a garbage
-        // base and died.
-        self.grow_into_tail(&mut state, length, align.max(PAGE_SIZE), MMAP_NAME)
-            .map(|(addr, _)| addr)
+        // Kernel-chosen mappings are guest ABI, not an internal allocator
+        // detail. The image/heap arena is at 16 TiB so it cannot collide with
+        // title-selected VAs, but native PS5 libc rejects an mspace whose base
+        // comes from that range.
+        self.map_console_va(&mut state, length, align, MMAP_NAME)
     }
 
     fn reserve(&self, length: u64, align: u64) -> Option<u64> {
@@ -1028,17 +1231,12 @@ impl GuestAllocator for GuestArena {
         //
         // Over-reserve by `align` and align within the block: `VirtualAlloc`'s
         // own granularity is 64 KiB, which cannot satisfy a larger request.
-        let span = length.checked_add(align)?;
+        let span = length;
         // SAFETY: a null `lpAddress` asks the OS to choose any free range.
         // `MEM_RESERVE` with `PAGE_NOACCESS` takes address space without
         // committing memory, so a 512 GiB reservation costs no RAM. The block
         // is recorded in `os_reservations` and released in `Drop`.
-        let raw =
-            unsafe { VirtualAlloc(core::ptr::null(), span as usize, MEM_RESERVE, PAGE_NOACCESS) };
-        if raw.is_null() {
-            return None;
-        }
-        let block = raw as u64;
+        let block = reserve_guest_address_space(DEFAULT_MAPPING_BASE, self.base, span, align)?;
 
         let Some(addr) = align_up(block, align) else {
             return self.release_unusable_block(block);
@@ -1130,49 +1328,76 @@ impl GuestAllocator for GuestArena {
         // through guest memory, so the guest must receive the address it asked
         // for; a fixed base cannot answer that.
         //
-        // Where it lives decides how it can be backed. Inside the sparse tail,
+        // Each VMA segment decides how it can be backed. Inside the sparse tail,
         // or inside a range the guest already reserved, the address space is
         // ours and only needs committing — and `MEM_RESERVE` over an existing
         // reservation fails with ERROR_INVALID_ADDRESS, so it must *not* be
         // re-reserved. Outside everything, nothing owns it yet and it needs
-        // both. A range that is not uniformly one of the two is refused rather
-        // than half-honoured: the halves need different flags.
-        let in_tail = addr >= self.base + ARENA_SPAN && end <= self.base + RESERVED_SPAN;
-        let already_owned = (in_tail && range_all(&state.vmm, addr, end, |vma| vma.kind.is_free()))
-            || range_all(&state.vmm, addr, end, |vma| {
-                matches!(vma.kind, VmaType::Reserved | VmaType::ReservedBacked)
-            });
-        let unowned = range_all(&state.vmm, addr, end, |vma| vma.kind == VmaType::Foreign);
-        if !already_owned && !unowned {
-            return None;
+        // both. Mixed ranges are handled segment-by-segment so an overlap can
+        // preserve existing pages while extending into an unowned tail.
+        let mut actions = Vec::new();
+        let mut cursor = addr;
+        while cursor < end {
+            let vma = state.vmm.find(cursor)?;
+            let segment_end = vma.end().min(end);
+            let segment_len = segment_end.checked_sub(cursor)?;
+            if vma.kind.is_host_backed() {
+                // Preserve already-backed overlap byte-for-byte.
+            } else if matches!(vma.kind, VmaType::Reserved)
+                || (vma.kind.is_free()
+                    && cursor >= self.base + ARENA_SPAN
+                    && segment_end <= self.base + RESERVED_SPAN)
+            {
+                actions.push((cursor, segment_len, MEM_COMMIT, false));
+            } else if vma.kind == VmaType::Foreign {
+                actions.push((cursor, segment_len, MEM_RESERVE | MEM_COMMIT, true));
+            } else {
+                return None;
+            }
+            cursor = segment_end;
         }
-        let flags = if already_owned {
-            MEM_COMMIT
-        } else {
-            MEM_RESERVE | MEM_COMMIT
-        };
 
-        // SAFETY: `[addr, end)` is page aligned and the map has just shown it to
-        // be uniformly either memory this arena already reserved (its sparse
-        // tail, or a prior `reserve` — committed in place) or wholly unowned
-        // (reserved and committed together). `VirtualAlloc` at an explicit
-        // address succeeds there or returns null; it never silently relocates,
-        // and the `raw != addr` check below rejects a relocation regardless.
-        // Only a newly reserved block is recorded for release, so `Drop` cannot
-        // double-release a block `reserve` already owns.
-        let raw = unsafe {
-            VirtualAlloc(
-                addr as *const c_void,
-                length as usize,
-                flags,
-                PAGE_READWRITE,
-            )
-        };
-        if raw.is_null() || raw as u64 != addr {
-            return None;
+        // Back every uncovered segment before publishing the combined VMA.
+        // Newly reserved blocks are recorded only after every action succeeds,
+        // so `Drop` cannot double-release partial work.
+        let mut newly_reserved = Vec::new();
+        for &(segment_addr, segment_len, flags, owns_reservation) in &actions {
+            // SAFETY: the VMA walk proved this segment either belongs to one of
+            // our reservations (`MEM_COMMIT`) or is wholly unowned
+            // (`MEM_RESERVE | MEM_COMMIT`). The exact-address check rejects any
+            // allocation-granularity relocation.
+            let raw = unsafe {
+                VirtualAlloc(
+                    segment_addr as *const c_void,
+                    segment_len as usize,
+                    flags,
+                    PAGE_READWRITE,
+                )
+            };
+            if raw.is_null() || raw as u64 != segment_addr {
+                if !raw.is_null() && owns_reservation {
+                    // SAFETY: this iteration just created `raw` as a complete
+                    // reservation and ownership has not been published.
+                    unsafe {
+                        VirtualFree(raw, 0, MEM_RELEASE);
+                    }
+                }
+                for &(base, _) in &newly_reserved {
+                    // SAFETY: each entry is a complete reservation created by
+                    // an earlier iteration and not yet stored in arena state.
+                    unsafe {
+                        VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+                    }
+                }
+                return None;
+            }
+            if owns_reservation {
+                newly_reserved.push((segment_addr, segment_len));
+            }
         }
-        if !already_owned {
-            state.os_reservations.push(addr);
+        for (base, size) in newly_reserved {
+            state.os_reservations.push(base);
+            state.external_mappings.insert(base, size);
         }
         state.vmm.map_range(
             addr,
@@ -1194,6 +1419,31 @@ impl GuestAllocator for GuestArena {
             return;
         };
         let mut state = self.lock_state();
+
+        // Independent low-VA mappings are whole Windows reservations. Release
+        // exact whole mappings eagerly; Windows does not permit `MEM_RELEASE`
+        // of only a sub-range.
+        if state.external_mappings.get(&addr).copied() == Some(length) {
+            state.external_mappings.remove(&addr);
+            if let Some(index) = state.os_reservations.iter().position(|&base| base == addr) {
+                state.os_reservations.swap_remove(index);
+            }
+            // SAFETY: `addr` is the exact reservation base and was removed from
+            // both ownership tables above, preventing a repeated release.
+            unsafe {
+                VirtualFree(addr as *mut c_void, 0, MEM_RELEASE);
+            }
+            state.vmm.map_range(
+                addr,
+                length,
+                VmaType::Foreign,
+                prot::NO_ACCESS,
+                None,
+                "host",
+                false,
+            );
+            return;
+        }
 
         // Only ranges the guest itself obtained go back to the pool. This is the
         // guard that keeps `munmap` from declaring the guest's own image, its
@@ -1302,43 +1552,45 @@ mod tests {
         );
     }
 
-    /// (d) `mmap` returns a page-aligned address inside the mmap region.
+    /// Kernel-selected mappings must use the console's low virtual-address
+    /// windows. Minecraft passes an 8 MiB direct-memory mapping straight to
+    /// native `sceLibcMspaceCreate`; the old 16 TiB arena address fails libc's
+    /// range validation and turns into a null mspace.
     #[test]
-    fn mmap_returns_page_aligned_address_in_mmap_region() {
+    fn mmap_returns_page_aligned_address_accepted_by_native_libc() {
         let _lock = crate::dispatch::call_lock();
         let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
 
         let addr = arena.mmap(0x2000, PAGE_SIZE).expect("mmap should succeed");
         assert_eq!(addr % PAGE_SIZE, 0);
-
-        let mmap_start = GUEST_ARENA_BASE + MMAP_OFFSET;
-        let arena_end = GUEST_ARENA_BASE + ARENA_SPAN;
-        assert!(addr >= mmap_start && addr + 0x2000 <= arena_end);
+        assert!(
+            (SYSTEM_MANAGED_MIN..SYSTEM_MANAGED_LIMIT).contains(&addr)
+                || (USER_MAPPING_MIN..USER_MAPPING_LIMIT).contains(&addr),
+            "kernel-selected mapping {addr:#x} is outside PS5 VA windows"
+        );
+        assert!(
+            addr + 0x2000 <= USER_MAPPING_LIMIT,
+            "native libc rejects the mapping end"
+        );
     }
 
     /// ASTRO.BOT's opening `sceKernelAllocateDirectMemory(0x7980_0000)` — 1.94
-    /// GiB — routes to `mmap`, whose committed region is only 1.5 GiB. Before
-    /// `mmap` grew a sparse-tail fallback this failed outright on the title's
-    /// FIRST allocation; the game then built its heap over a garbage base.
+    /// GiB — routes to `mmap`. Before `mmap` could obtain a full console-VA
+    /// mapping this failed outright on the title's FIRST allocation; the game
+    /// then built its heap over a garbage base.
     /// The returned memory must be genuinely usable, not merely a live address.
     #[test]
-    fn mmap_request_larger_than_the_committed_region_grows_into_the_sparse_tail() {
+    fn mmap_handles_astro_bots_opening_direct_memory_request() {
         let _lock = crate::dispatch::call_lock();
         let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
         let astro_bot_request = 0x7980_0000u64; // measured from the retail title
 
-        assert!(
-            astro_bot_request > MMAP_SIZE,
-            "this test is only meaningful while the request exceeds the committed \
-             mmap region ({MMAP_SIZE:#x}); it is the whole point of the fallback"
-        );
-
         let addr = arena
             .mmap(astro_bot_request, xps5x_core::PS5_PAGE_SIZE as u64)
-            .expect("a 1.94 GiB mmap must succeed via the sparse tail");
+            .expect("a 1.94 GiB console-VA mmap must succeed");
         assert!(
-            addr >= GUEST_ARENA_BASE + ARENA_SPAN,
-            "oversized mmap must land in the sparse tail, got {addr:#x}"
+            addr >= SYSTEM_MANAGED_MIN && addr + astro_bot_request <= USER_MAPPING_LIMIT,
+            "oversized mmap must stay in console VA space, got {addr:#x}"
         );
 
         // Committed, not just reserved: read/write both ends of the mapping.
@@ -1382,6 +1634,29 @@ mod tests {
             .alloc(0x1000, 16)
             .expect("heap must still grow after a 512 GiB reservation");
         assert!(after != 0);
+    }
+
+    /// Kernel-chosen virtual mappings are part of the guest ABI: libc records
+    /// the returned address and uses it to choose its allocator layout. They
+    /// therefore cannot depend on whichever hole Windows ASLR happens to hand
+    /// `VirtualAlloc(NULL, ...)` in this emulator process. Start at the console
+    /// mapping base and advance deterministically, as the real VMM contract
+    /// requires.
+    #[test]
+    fn kernel_chosen_reservations_use_the_deterministic_console_mapping_base() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let len = 0x0200_0000u64;
+
+        let first = arena
+            .reserve(len, xps5x_core::PS5_PAGE_SIZE as u64)
+            .expect("first reservation");
+        let second = arena
+            .reserve(len, xps5x_core::PS5_PAGE_SIZE as u64)
+            .expect("second reservation");
+
+        assert_eq!(first, 0x2_0000_0000);
+        assert_eq!(second, first + len);
     }
 
     /// The measured Until Dawn / Dragon Ball failure, reduced to its mechanism.
@@ -1508,8 +1783,19 @@ mod tests {
             "reservations {first:#x} and {second:#x} overlap"
         );
         let mut byte = [0u8; 1];
+        // An HLE READ of an untouched reservation still refuses — there is
+        // no data a never-written page could deliver, and this is what keeps
+        // "reserved" observably different from "committed".
         assert!(!arena.read(first, &mut byte));
-        assert!(!arena.write(first, &[1]));
+        // An HLE WRITE demand-commits the touched page exactly as a native
+        // guest store would (the measured getdents-into-lazy-malloc case) —
+        // one page, not the reservation.
+        assert!(arena.write(first, &[1]));
+        assert!(arena.read(first, &mut byte));
+        assert_eq!(byte, [1]);
+        // A page nothing wrote is still unreadable: the write above committed
+        // its own page only.
+        assert!(!arena.read(first + 0x1000, &mut byte));
 
         let mapped = arena
             .map_at(first, 0x2_0000, xps5x_core::PS5_PAGE_SIZE as u64)
@@ -1518,7 +1804,45 @@ mod tests {
         assert!(arena.write(first + 0x10, &[0xAB]));
         assert!(arena.read(first + 0x10, &mut byte));
         assert_eq!(byte, [0xAB]);
-        assert!(!arena.write(first + 0x2_0000, &[1]));
+        // Past the mapped run but inside the reservation: a write
+        // demand-commits (native-store parity). Outside every reservation:
+        // still a hard reject — wild pointers don't get pages.
+        assert!(arena.write(first + 0x2_0000, &[1]));
+        assert!(!arena.write(0x1000, &[1]));
+    }
+
+    /// Fixed direct-memory mappings may overlap an existing mapping and extend
+    /// into the adjacent unowned range. Minecraft grows one resource window
+    /// this way: the second 1.5 MiB map starts 512 KiB into the first and adds
+    /// another 512 KiB at the end. Rejecting the mixed backed/foreign range
+    /// sends its allocator into an unbounded retry loop.
+    #[test]
+    fn map_at_extends_an_overlapping_external_mapping() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let base = 0x2062_f0000;
+        let len = 0x18_0000;
+
+        assert_eq!(arena.map_at(base, len, PAGE_SIZE), Some(base));
+        assert!(arena.write(base + 0x10, &[0xAB]));
+
+        let overlapping = base + 0x8_0000;
+        assert_eq!(
+            arena.map_at(overlapping, len, PAGE_SIZE),
+            Some(overlapping),
+            "a fixed map must keep the backed overlap and reserve its new tail"
+        );
+
+        let mut byte = [0u8; 1];
+        assert!(arena.read(base + 0x10, &mut byte));
+        assert_eq!(
+            byte,
+            [0xAB],
+            "overlap extension must preserve existing bytes"
+        );
+        assert!(arena.write(base + 0x1f_ffff, &[0xCD]));
+        assert!(arena.read(base + 0x1f_ffff, &mut byte));
+        assert_eq!(byte, [0xCD], "the newly extended tail must be backed");
     }
 
     /// `munmap` must return the range to the free pool. Until the VMA map

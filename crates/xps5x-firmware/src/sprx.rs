@@ -101,6 +101,51 @@ impl TlsTemplate {
     }
 }
 
+/// One module's slot in the **process-wide** static TLS area (variant-II
+/// x86-64: every block sits below the thread pointer, the main module's
+/// nearest to it).
+///
+/// # Why a process has a layout, not a block
+///
+/// Each module with a `PT_TLS` owns its own thread-locals, addressed two
+/// interchangeable ways the ELF TLS ABI requires to alias: initial-exec
+/// (`TPOFF64`, an `fs`-relative offset baked in at link time) and
+/// general-dynamic (`DTPMOD64`/`DTPOFF64` through `__tls_get_addr`). Both are
+/// only coherent if the process assigns every module a *distinct* region and
+/// resolves both models against the same assignment.
+///
+/// This used to collapse to "the main module's block": every `DTPMOD64` in the
+/// process resolved to module 1 and every `TPOFF64` was computed against the
+/// module's own block size, as if each module sat alone below the TCB. On the
+/// measured retail title four modules carry `PT_TLS` (the eboot, `libc.prx`
+/// `memsz=0x478` *with* a `0x188`-byte init image, `libcohtml`,
+/// `libRenoirCore`), so all four aliased the eboot's block: libc's initialized
+/// TLS (errno, locale, strtok state) was never materialized, and a
+/// thread-local written through one model read back zero through the other —
+/// surfacing as a null-pointer crash deep inside the title's UI renderer with
+/// nothing pointing at TLS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticTlsModule {
+    /// Module name, for diagnostics.
+    pub name: String,
+    /// The TLS module ID this module's `DTPMOD64` relocations resolve to
+    /// (1 = the main executable, dependencies count up in load order).
+    pub module_id: u64,
+    /// Distance from the thread pointer **down** to this module's block:
+    /// the block occupies `[tp - tp_offset, tp - tp_offset + mem_size)`,
+    /// and the module's `TPOFF64` values are `template_offset - tp_offset`.
+    pub tp_offset: u64,
+    /// The module's `PT_TLS` template, copied into place per thread.
+    pub template: TlsTemplate,
+}
+
+/// Total bytes of static TLS below the thread pointer for `layout` —
+/// the farthest module's `tp_offset`, which by construction covers every
+/// block. Zero for an empty layout (no module has TLS).
+pub fn static_tls_total(layout: &[StaticTlsModule]) -> u64 {
+    layout.iter().map(|m| m.tp_offset).max().unwrap_or(0)
+}
+
 /// A parsed `.sprx` (SCE dynamic ELF) module: its loadable segments plus
 /// the raw `PT_SCE_DYNLIBDATA` blob for [`crate::dynlib`] to decode.
 #[derive(Debug, Clone, PartialEq, Eq)]

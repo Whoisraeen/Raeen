@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 
+use iced_x86::{Decoder, DecoderOptions, Mnemonic};
 use xps5x_core::error::FirmwareError;
 use xps5x_hle::HleRegistry;
 
@@ -59,6 +60,14 @@ pub const HLE_TRAMPOLINE_BASE: u64 = 0x0000_4000_0000_0000;
 /// relocation count (87k).
 pub const UNRESOLVED_STUB_BASE: u64 = 0x0000_5000_0000_0000;
 
+/// Private two-byte invalid instruction substituted for a decoded guest
+/// `syscall`. Native execution must never let an Orbis syscall number reach
+/// the Windows kernel; the runtime VEH recognizes this exact marker and
+/// dispatches it through the Orbis kernel. `0F 04` is undefined
+/// in x86-64 mode and, unlike the common `UD2` (`0F 0B`), is not emitted as a
+/// normal compiler abort instruction.
+pub const SYSCALL_TRAP_BYTES: [u8; 2] = [0x0F, 0x04];
+
 const R_X86_64_64: u32 = 1;
 const R_X86_64_GLOB_DAT: u32 = 6;
 const R_X86_64_JUMP_SLOT: u32 = 7;
@@ -67,10 +76,29 @@ const R_X86_64_DTPMOD64: u32 = 16;
 const R_X86_64_DTPOFF64: u32 = 17;
 const R_X86_64_TPOFF64: u32 = 18;
 
-/// The TLS module ID this (single, main) module's `DTPMOD64` relocations
-/// resolve to. There is exactly one guest module with TLS today; a general
-/// dynamic-TLS module table comes with `sceKernelLoadStartModule` (M1-D).
+/// The TLS module ID a module's `DTPMOD64` relocations resolve to when no
+/// process-wide assignment says otherwise: the main executable's. A
+/// multi-module process passes each module its real [`TlsAssignment`];
+/// single-module linking (tests, fixtures, `--load-sprx`) keeps this default.
 const MAIN_TLS_MODULE_ID: u64 = 1;
+
+/// A module's slot in the process-wide static TLS layout, as the linker needs
+/// it: which TLS module ID its `DTPMOD64`s name, and how far below the thread
+/// pointer its block sits (the basis of its `TPOFF64` values).
+///
+/// `None` at the [`link_module_into`] boundary means "this module is the whole
+/// TLS world" — id 1, block directly below the TCB — which is exactly the
+/// pre-layout behavior and correct for every single-module caller. Passing
+/// nothing in a *multi*-module process is how four modules ended up sharing
+/// the eboot's TLS block; see [`crate::sprx::StaticTlsModule`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsAssignment {
+    /// Value for this module's `DTPMOD64` relocations.
+    pub module_id: u64,
+    /// Distance from the thread pointer down to this module's block; its
+    /// `TPOFF64` values are `template_offset - tp_offset` (negative, wrapped).
+    pub tp_offset: u64,
+}
 
 /// One HLE import resolved during linking: which `library::function` a
 /// relocation's slot now points at, via its deterministic trampoline
@@ -200,6 +228,13 @@ pub struct LinkedModule {
     /// per-thread TLS block whose layout this module's `TPOFF64`/`DTPOFF64`
     /// relocations were resolved against.
     pub tls: Option<crate::sprx::TlsTemplate>,
+    /// The **process-wide** static TLS layout the runtime must materialize per
+    /// thread: one entry per module with a `PT_TLS`, each at its assigned
+    /// distance below the thread pointer. For a single-module link this is
+    /// just the module's own template at `tp_offset = block_size()`;
+    /// `load_process` replaces it with the layout spanning every loaded
+    /// module. Empty when nothing in the process has TLS.
+    pub tls_layout: Vec<crate::sprx::StaticTlsModule>,
     /// Image offset of the `PT_SCE_PROCPARAM` block (from
     /// [`SprxModule::procparam`]'s vaddr), if the module has one. The runtime
     /// exposes `base + procparam_offset` as the guest address
@@ -294,8 +329,9 @@ pub fn link_module_into(
     hle: &HleRegistry,
     base: u64,
     tables: &mut ProcessTables,
+    tls: Option<TlsAssignment>,
 ) -> Result<LinkedModule, FirmwareError> {
-    link_inner(module, dynlib, registry, hle, base, tables)
+    link_inner(module, dynlib, registry, hle, base, tables, tls)
 }
 
 /// Lay `module`'s `PT_LOAD` segments into a flat image at `base` and apply
@@ -320,7 +356,7 @@ pub fn link_module(
     base: u64,
 ) -> Result<LinkedModule, FirmwareError> {
     let mut tables = ProcessTables::new();
-    let mut linked = link_inner(module, dynlib, registry, hle, base, &mut tables)?;
+    let mut linked = link_inner(module, dynlib, registry, hle, base, &mut tables, None)?;
     linked.hle_trampolines = tables.hle_trampolines;
     linked.unresolved_stubs = tables.unresolved_stubs;
     Ok(linked)
@@ -334,7 +370,17 @@ fn link_inner(
     hle: &HleRegistry,
     base: u64,
     tables: &mut ProcessTables,
+    tls_assignment: Option<TlsAssignment>,
 ) -> Result<LinkedModule, FirmwareError> {
+    // No process-wide assignment means this module is the whole TLS world:
+    // module id 1, block directly below the TCB — the single-module layout
+    // every existing fixture and test was linked against.
+    let tls_assignment = tls_assignment.or_else(|| {
+        module.tls.as_ref().map(|t| TlsAssignment {
+            module_id: MAIN_TLS_MODULE_ID,
+            tp_offset: t.block_size(),
+        })
+    });
     let mut image = vec![0u8; image_size(module)?];
 
     for seg in &module.segments {
@@ -376,6 +422,16 @@ fn link_inner(
         .iter()
         .filter_map(|s| lib_names.get(&s.library_index).map(|n| (s.nid, *n)))
         .collect();
+    let module_names: HashMap<u16, &str> = dynlib
+        .import_modules
+        .iter()
+        .map(|(id, n)| (*id, n.as_str()))
+        .collect();
+    let module_of_nid: HashMap<u64, &str> = dynlib
+        .imports
+        .iter()
+        .filter_map(|s| module_names.get(&s.module_index).map(|n| (s.nid, *n)))
+        .collect();
 
     for reloc in &dynlib.relocations {
         let r_type = (reloc.info & 0xFFFF_FFFF) as u32;
@@ -388,23 +444,28 @@ fn link_inner(
             // carried entirely in the addend; otherwise the symbol's `value`
             // is its offset within the module's `PT_TLS` template.
             R_X86_64_TPOFF64 => {
-                // Variant-II x86-64 static TLS: the block sits immediately
-                // below the TCB the FS base points at, so the fs-relative
-                // offset of template offset `o` is `o - block_size`
-                // (negative, wrapped). `TlsTemplate::block_size` is the
-                // single source of truth both here and in the runtime's
-                // block placement — they must agree exactly.
-                let tls = module.tls.as_ref().ok_or_else(|| {
-                    FirmwareError::MalformedDynlibData(
-                        "TPOFF64 relocation in a module with no PT_TLS segment".to_string(),
-                    )
-                })?;
+                // Variant-II x86-64 static TLS: this module's block sits
+                // `tp_offset` bytes below the TCB the FS base points at, so
+                // the fs-relative offset of template offset `o` is
+                // `o - tp_offset` (negative, wrapped). The assignment's
+                // `tp_offset` is the single source of truth both here and in
+                // the runtime's block placement — they must agree exactly.
+                let assignment =
+                    tls_assignment
+                        .filter(|_| module.tls.is_some())
+                        .ok_or_else(|| {
+                            FirmwareError::MalformedDynlibData(
+                                "TPOFF64 relocation in a module with no PT_TLS segment".to_string(),
+                            )
+                        })?;
                 let sym_off = tls_symbol_offset(dynlib, r_sym)?;
                 sym_off
                     .wrapping_add(reloc.addend as u64)
-                    .wrapping_sub(tls.block_size())
+                    .wrapping_sub(assignment.tp_offset)
             }
-            R_X86_64_DTPMOD64 => MAIN_TLS_MODULE_ID,
+            R_X86_64_DTPMOD64 => tls_assignment
+                .map(|a| a.module_id)
+                .unwrap_or(MAIN_TLS_MODULE_ID),
             R_X86_64_DTPOFF64 => {
                 if module.tls.is_none() {
                     return Err(FirmwareError::MalformedDynlibData(
@@ -452,7 +513,16 @@ fn link_inner(
                     continue;
                 }
 
-                match registry.resolve(hle, &module.name, symbol.nid) {
+                // Dispatch policy belongs to the module that PROVIDES this
+                // import. Using `module.name` (the consumer) split a shipped
+                // libc between LLE and HLE depending on which object called
+                // it, leaving C++ runtime globals owned by different worlds.
+                let provider_module = module_of_nid
+                    .get(&symbol.nid)
+                    .copied()
+                    .or_else(|| lib_of_nid.get(&symbol.nid).copied())
+                    .unwrap_or(&module.name);
+                match registry.resolve(hle, provider_module, symbol.nid) {
                     Resolver::Hle { library, function } => {
                         let addr = tables.hle_addr(symbol.nid, library, function);
                         if r_type == R_X86_64_64 {
@@ -479,6 +549,14 @@ fn link_inner(
         write_slot(&mut image, reloc.offset, value)?;
     }
 
+    let patched_syscalls = patch_guest_syscalls(module, &mut image)?;
+    if patched_syscalls > 0 {
+        tracing::info!(
+            "{}: patched {patched_syscalls} native syscall instruction(s) into Orbis traps",
+            module.name
+        );
+    }
+
     Ok(LinkedModule {
         image,
         base,
@@ -493,6 +571,17 @@ fn link_inner(
         module_inits: Vec::new(),
         entry: module.entry,
         tls: module.tls.clone(),
+        // A single module's layout is itself; `load_process` overwrites this
+        // with the layout spanning every module in the process.
+        tls_layout: match (&module.tls, tls_assignment) {
+            (Some(t), Some(a)) => vec![crate::sprx::StaticTlsModule {
+                name: module.name.clone(),
+                module_id: a.module_id,
+                tp_offset: a.tp_offset,
+                template: t.clone(),
+            }],
+            _ => Vec::new(),
+        },
         procparam_offset: module.procparam.as_ref().map(|p| p.vaddr),
         unwind_modules: module
             .unwind
@@ -507,6 +596,67 @@ fn link_inner(
             .into_iter()
             .collect(),
     })
+}
+
+/// Decode file-backed executable segments and replace only instruction-boundary
+/// `syscall`s. A raw byte search is not safe: `0F 05` can occur inside an
+/// immediate or embedded table, and changing those bytes silently corrupts
+/// otherwise unrelated guest code/data.
+fn patch_guest_syscalls(module: &SprxModule, image: &mut [u8]) -> Result<usize, FirmwareError> {
+    let mut sites = Vec::new();
+    for segment in module
+        .segments
+        .iter()
+        .filter(|segment| segment.flags & 1 != 0)
+    {
+        let start = usize::try_from(segment.vaddr).map_err(|_| {
+            FirmwareError::MalformedDynlibData(format!(
+                "executable segment vaddr {:#x} overflows usize",
+                segment.vaddr
+            ))
+        })?;
+        let end = start.checked_add(segment.data.len()).ok_or_else(|| {
+            FirmwareError::MalformedDynlibData(format!(
+                "executable segment at {:#x} length {:#x} overflows",
+                segment.vaddr,
+                segment.data.len()
+            ))
+        })?;
+        let bytes = image.get(start..end).ok_or_else(|| {
+            FirmwareError::MalformedDynlibData(format!(
+                "executable segment [{start:#x}, {end:#x}) exceeds linked image {:#x}",
+                image.len()
+            ))
+        })?;
+        let mut decoder = Decoder::with_ip(64, bytes, segment.vaddr, DecoderOptions::NONE);
+        while decoder.can_decode() {
+            let instruction = decoder.decode();
+            if instruction.mnemonic() != Mnemonic::Syscall {
+                continue;
+            }
+            if instruction.len() != 2 {
+                return Err(FirmwareError::MalformedDynlibData(format!(
+                    "decoded syscall at {:#x} has impossible length {}",
+                    instruction.ip(),
+                    instruction.len()
+                )));
+            }
+            let offset =
+                usize::try_from(instruction.ip().saturating_sub(segment.vaddr)).map_err(|_| {
+                    FirmwareError::MalformedDynlibData(
+                        "decoded syscall offset overflows usize".to_string(),
+                    )
+                })?;
+            sites.push(start + offset);
+        }
+    }
+
+    sites.sort_unstable();
+    sites.dedup();
+    for site in &sites {
+        image[*site..*site + SYSCALL_TRAP_BYTES.len()].copy_from_slice(&SYSCALL_TRAP_BYTES);
+    }
+    Ok(sites.len())
 }
 
 /// The template-relative offset a TLS relocation's symbol contributes:
@@ -583,7 +733,8 @@ fn write_slot(image: &mut [u8], offset: u64, value: u64) -> Result<(), FirmwareE
 mod tests {
     use super::*;
     use crate::dynlib::nid::{NidDatabase, nid_of};
-    use crate::dynlib::{DynSymbol, SceRela, SymbolExport};
+    use crate::dynlib::{DynSymbol, SceRela, SymbolExport, SymbolRef};
+    use crate::registry::ModulePolicy;
     use crate::sprx::SprxSegment;
 
     /// A single-`PT_LOAD`-segment module big enough (`mem_size` bytes) to
@@ -696,8 +847,10 @@ mod tests {
         let (mod_b, dyn_b) = make(nid_b);
 
         let mut tables = ProcessTables::new();
-        let a = link_module_into(&mod_a, &dyn_a, &registry, &hle, 0, &mut tables).expect("links");
-        let b = link_module_into(&mod_b, &dyn_b, &registry, &hle, 0, &mut tables).expect("links");
+        let a =
+            link_module_into(&mod_a, &dyn_a, &registry, &hle, 0, &mut tables, None).expect("links");
+        let b =
+            link_module_into(&mod_b, &dyn_b, &registry, &hle, 0, &mut tables, None).expect("links");
 
         let slot_a = read_slot(&a.image, 0x10);
         let slot_b = read_slot(&b.image, 0x10);
@@ -749,8 +902,10 @@ mod tests {
         let module = test_module(0x100);
 
         let mut tables = ProcessTables::new();
-        let a = link_module_into(&module, &dynlib, &registry, &hle, 0, &mut tables).expect("links");
-        let b = link_module_into(&module, &dynlib, &registry, &hle, 0, &mut tables).expect("links");
+        let a = link_module_into(&module, &dynlib, &registry, &hle, 0, &mut tables, None)
+            .expect("links");
+        let b = link_module_into(&module, &dynlib, &registry, &hle, 0, &mut tables, None)
+            .expect("links");
 
         assert_eq!(read_slot(&a.image, 0x10), read_slot(&b.image, 0x10));
         assert_eq!(
@@ -862,6 +1017,71 @@ mod tests {
 
         assert_eq!(read_slot(&linked.image, 0x18), 0x9999 + 0x5);
         assert!(linked.unresolved.is_empty());
+        assert!(linked.hle_trampolines.is_empty());
+    }
+
+    #[test]
+    fn decoded_syscall_is_trapped_without_corrupting_the_same_bytes_in_an_immediate() {
+        let (hle, registry) = empty_registry();
+        let mut module = test_module(8);
+        // mov eax, 0x0000050f ; syscall ; ret
+        module.segments[0].data = vec![0xB8, 0x0F, 0x05, 0x00, 0x00, 0x0F, 0x05, 0xC3];
+        let linked =
+            link_module(&module, &DynlibData::default(), &registry, &hle, 0).expect("links");
+
+        assert_eq!(&linked.image[1..3], &[0x0F, 0x05]);
+        assert_eq!(&linked.image[5..7], &SYSCALL_TRAP_BYTES);
+    }
+
+    #[test]
+    fn syscall_bytes_in_a_non_executable_segment_are_not_patched() {
+        let (hle, registry) = empty_registry();
+        let mut module = test_module(2);
+        module.segments[0].flags = 4;
+        module.segments[0].data = vec![0x0F, 0x05];
+        let linked =
+            link_module(&module, &DynlibData::default(), &registry, &hle, 0).expect("links");
+
+        assert_eq!(&linked.image[..2], &[0x0F, 0x05]);
+    }
+
+    #[test]
+    fn shipped_provider_policy_owns_imports_from_an_eboot_consumer() {
+        let (hle, mut registry) = empty_registry();
+        let (_, function) = hle
+            .registered_names()
+            .into_iter()
+            .next()
+            .expect("HleRegistry::new() registers at least one function");
+        let nid = nid_of(&function);
+        registry.register_module_exports("libc.prx", &[SymbolExport { nid, value: 0x7777 }]);
+        registry.set_policy("libc.prx", ModulePolicy::PreferLle);
+
+        let module = test_module(0x100);
+        let dynlib = DynlibData {
+            imports: vec![SymbolRef {
+                nid,
+                module_index: 9,
+                library_index: 7,
+            }],
+            import_libs: vec![(7, "libc".to_string())],
+            import_modules: vec![(9, "libc".to_string())],
+            symbols: vec![DynSymbol {
+                nid,
+                value: 0,
+                is_import: true,
+            }],
+            relocations: vec![SceRela {
+                offset: 0x18,
+                info: R_X86_64_JUMP_SLOT as u64,
+                addend: 0,
+            }],
+            ..Default::default()
+        };
+
+        let linked = link_module(&module, &dynlib, &registry, &hle, 0).expect("links through LLE");
+
+        assert_eq!(read_slot(&linked.image, 0x18), 0x7777);
         assert!(linked.hle_trampolines.is_empty());
     }
 
@@ -998,6 +1218,63 @@ mod tests {
 
         let linked = link_module(&module, &dynlib, &registry, &hle, 0).expect("DTPOFF64 links");
         assert_eq!(read_slot(&linked.image, 0x28), 0xC);
+    }
+
+    /// A module linked with a process-wide [`TlsAssignment`] must resolve its
+    /// TLS relocations against ITS slot: `DTPMOD64` names its real module id
+    /// and `TPOFF64` subtracts its assigned distance below the thread pointer
+    /// — not its own block size, which is only correct for a module sitting
+    /// alone directly below the TCB. Ignoring the assignment folds every
+    /// module's thread-locals onto the main executable's block (the measured
+    /// retail-title TLS corruption; see `sprx::StaticTlsModule`).
+    #[test]
+    fn tls_assignment_overrides_module_id_and_tp_offset() {
+        let (hle, registry) = empty_registry();
+        let module = test_module_with_tls(0x100);
+        let dynlib = DynlibData {
+            relocations: vec![
+                SceRela {
+                    offset: 0x10,
+                    info: R_X86_64_TPOFF64 as u64,
+                    addend: 0x8,
+                },
+                SceRela {
+                    offset: 0x20,
+                    info: R_X86_64_DTPMOD64 as u64,
+                    addend: 0,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut tables = ProcessTables::new();
+        let linked = link_module_into(
+            &module,
+            &dynlib,
+            &registry,
+            &hle,
+            0,
+            &mut tables,
+            Some(TlsAssignment {
+                module_id: 3,
+                tp_offset: 0xA0,
+            }),
+        )
+        .expect("assigned TLS links");
+
+        // fs-relative offset of template offset 0x8 with the block 0xA0 below
+        // the thread pointer: 0x8 - 0xA0 = -0x98 — NOT 0x8 - block_size(0x40).
+        assert_eq!(read_slot(&linked.image, 0x10), (-0x98i64) as u64);
+        assert_eq!(
+            read_slot(&linked.image, 0x20),
+            3,
+            "DTPMOD64 is the assigned id"
+        );
+
+        // The layout entry the runtime will materialize records the same slot.
+        assert_eq!(linked.tls_layout.len(), 1);
+        assert_eq!(linked.tls_layout[0].module_id, 3);
+        assert_eq!(linked.tls_layout[0].tp_offset, 0xA0);
     }
 
     #[test]

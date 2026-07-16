@@ -22,6 +22,7 @@ const EPERM: u64 = 1;
 const EDEADLK: u64 = 11;
 const EBUSY: u64 = 16;
 const EINVAL: u64 = 22;
+const ETIMEDOUT: u64 = 60;
 
 // pthread mutex types.
 const MUTEX_ERRORCHECK: i32 = 1;
@@ -41,6 +42,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadMutexDestroy", hle_mutex_destroy);
     registry.register("libkernel", "scePthreadMutexLock", hle_mutex_lock);
     registry.register("libkernel", "scePthreadMutexTrylock", hle_mutex_trylock);
+    registry.register("libkernel", "scePthreadMutexTimedlock", hle_mutex_timedlock);
     registry.register("libkernel", "scePthreadMutexUnlock", hle_mutex_unlock);
     registry.register("libkernel", "scePthreadMutexattrInit", hle_mutexattr_init);
     registry.register(
@@ -206,45 +208,83 @@ fn hle_mutex_destroy(ctx: &HleContext, args: &[u64]) -> u64 {
     if mutex_addr == 0 {
         return EINVAL;
     }
+    let mut handle_bytes = [0u8; 8];
+    let handle = ctx
+        .mem
+        .read(mutex_addr, &mut handle_bytes)
+        .then(|| u64::from_le_bytes(handle_bytes))
+        .filter(|handle| *handle != 0);
     let Some(key) = resolve_key(ctx, mutex_addr) else {
         return EINVAL;
     };
     ctx.kernel.pthread_mutexes.remove(&key);
-    if key != mutex_addr {
-        ctx.kernel.pthread_mutexes.remove(&mutex_addr);
+    ctx.kernel.pthread_mutexes.remove(&mutex_addr);
+    if let Some(handle) = handle {
+        ctx.kernel.pthread_mutexes.remove(&handle);
+        ctx.alloc.free(handle);
     }
     let _ = ctx.mem.write(mutex_addr, &0u64.to_le_bytes());
     OK
 }
 
 fn hle_mutex_lock(ctx: &HleContext, args: &[u64]) -> u64 {
-    lock_core(ctx, args.first().copied().unwrap_or(0), false)
+    lock_core(ctx, args.first().copied().unwrap_or(0), false, None)
 }
 
 fn hle_mutex_trylock(ctx: &HleContext, args: &[u64]) -> u64 {
-    lock_core(ctx, args.first().copied().unwrap_or(0), true)
+    lock_core(ctx, args.first().copied().unwrap_or(0), true, None)
+}
+
+/// `scePthreadMutexTimedlock(mutex, usec)`: `scePthreadMutexLock` with a
+/// relative microsecond timeout (`SceKernelUseconds`), returning `ETIMEDOUT`
+/// if the mutex could not be acquired before the deadline. A timeout of 0
+/// behaves like `Trylock` (an already-expired deadline).
+fn hle_mutex_timedlock(ctx: &HleContext, args: &[u64]) -> u64 {
+    let mutex = args.first().copied().unwrap_or(0);
+    let usec = args.get(1).copied().unwrap_or(0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_micros(usec);
+    lock_core(ctx, mutex, false, Some(deadline))
 }
 
 /// The lock state machine. With one active guest thread, a mutex either is
 /// free (acquire it) or is already held by this thread (per-type re-lock
 /// behavior). A missing mutex is created implicitly (guest static
-/// initializers never call `Init`).
-fn lock_core(ctx: &HleContext, mutex_addr: u64, try_only: bool) -> u64 {
+/// initializers never call `Init`). A contended lock with a `deadline`
+/// reports `ETIMEDOUT` once the deadline passes.
+fn lock_core(
+    ctx: &HleContext,
+    mutex_addr: u64,
+    try_only: bool,
+    deadline: Option<std::time::Instant>,
+) -> u64 {
     if mutex_addr == 0 {
         return EINVAL;
     }
-    let key = resolve_key(ctx, mutex_addr).unwrap_or_else(|| {
-        // Implicit creation for a statically-initialized mutex.
-        ctx.kernel.pthread_mutexes.insert(
-            mutex_addr,
-            PthreadMutex {
-                ty: MUTEX_NORMAL,
-                owner: 0,
-                recursion: 0,
-            },
-        );
+    let key = if let Some(key) = resolve_key(ctx, mutex_addr) {
+        key
+    } else {
+        // Implicit creation for a statically-initialized mutex. Orbis mutexes
+        // are opaque pointer slots, so success must also materialize *mutex;
+        // guest libc checks that pointer directly between pthread calls.
+        let Some(handle) = ctx.alloc.alloc(MUTEX_OBJECT_SIZE, 0x10) else {
+            return EINVAL;
+        };
+        if !ctx.mem.write(mutex_addr, &handle.to_le_bytes()) {
+            ctx.alloc.free(handle);
+            return EINVAL;
+        }
+        let state = PthreadMutex {
+            ty: MUTEX_NORMAL,
+            owner: 0,
+            recursion: 0,
+        };
+        ctx.kernel.pthread_mutexes.insert(mutex_addr, state);
+        // Keep a fallback alias for callers that pass the opaque handle
+        // itself instead of its slot. Normal Orbis calls pass the slot, which
+        // remains the canonical state key.
+        ctx.kernel.pthread_mutexes.insert(handle, state);
         mutex_addr
-    });
+    };
 
     let current = ctx.guest_threads.current_thread();
     loop {
@@ -281,6 +321,9 @@ fn lock_core(ctx: &HleContext, mutex_addr: u64, try_only: bool) -> u64 {
         }
         if try_only || ctx.guest_threads.process_is_terminating() {
             return EBUSY;
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return ETIMEDOUT;
         }
         drop(entry);
         std::thread::yield_now();
@@ -320,7 +363,7 @@ pub(crate) fn mutex_unlock_for_cond(ctx: &HleContext, mutex: u64) -> u64 {
 /// Condition-wait bridge: reacquire the supplied mutex before returning to
 /// guest code.
 pub(crate) fn mutex_lock_for_cond(ctx: &HleContext, mutex: u64) -> u64 {
-    lock_core(ctx, mutex, false)
+    lock_core(ctx, mutex, false, None)
 }
 
 /// `scePthreadMutexattrInit(attr)`: register a default (normal) attribute.
@@ -574,6 +617,27 @@ mod tests {
         assert_eq!(kernel.pthread_mutexes.get(&key).unwrap().owner, 0);
         // Unlocking an already-free normal mutex is lenient (OK).
         assert_eq!(hle_mutex_unlock(&ctx, &[mutex]), OK);
+    }
+
+    #[test]
+    fn static_mutex_lock_materializes_and_destroy_clears_opaque_handle() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let mutex = 0x300;
+
+        assert_eq!(hle_mutex_lock(&ctx, &[mutex]), OK);
+        let mut bytes = [0u8; 8];
+        assert!(mem.read(mutex, &mut bytes));
+        let handle = u64::from_le_bytes(bytes);
+        assert_ne!(handle, 0);
+        assert!(kernel.pthread_mutexes.contains_key(&mutex));
+        assert!(kernel.pthread_mutexes.contains_key(&handle));
+        assert_eq!(hle_mutex_unlock(&ctx, &[mutex]), OK);
+        assert_eq!(hle_mutex_destroy(&ctx, &[mutex]), OK);
+        assert!(mem.read(mutex, &mut bytes));
+        assert_eq!(u64::from_le_bytes(bytes), 0);
+        assert!(!kernel.pthread_mutexes.contains_key(&mutex));
+        assert!(!kernel.pthread_mutexes.contains_key(&handle));
     }
 
     #[test]

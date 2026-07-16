@@ -113,7 +113,7 @@ const FILE_EINVAL: u64 = (-22i64) as u64;
 const READ_MAX_BYTES: u64 = 16 << 20; // 16 MiB
 
 /// Store a POSIX errno value in the calling guest thread's `__error()` slot.
-fn set_guest_errno(ctx: &HleContext, errno: i32) {
+pub(crate) fn set_guest_errno(ctx: &HleContext, errno: i32) {
     let slot = hle_error_addr(ctx, &[]);
     if slot != 0 && !ctx.mem.write(slot, &errno.to_le_bytes()) {
         warn!("failed to write errno={errno} to guest slot {slot:#x}");
@@ -191,11 +191,19 @@ fn hle_sce_lseek(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 fn hle_posix_getdents(ctx: &HleContext, args: &[u64]) -> u64 {
-    sce_result_posix(ctx, hle_getdents(ctx, args))
+    sce_result_posix(ctx, hle_getdents(ctx, args, false))
+}
+
+fn hle_posix_getdirentries(ctx: &HleContext, args: &[u64]) -> u64 {
+    sce_result_posix(ctx, hle_getdents(ctx, args, true))
 }
 
 fn hle_sce_getdents(ctx: &HleContext, args: &[u64]) -> u64 {
-    hle_getdents(ctx, args)
+    hle_getdents(ctx, args, false)
+}
+
+fn hle_sce_getdirentries(ctx: &HleContext, args: &[u64]) -> u64 {
+    hle_getdents(ctx, args, true)
 }
 
 fn hle_sce_fsync(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -309,11 +317,17 @@ fn hle_fsync(ctx: &HleContext, args: &[u64]) -> u64 {
 
 /// Common Gen5 directory enumeration path. `sceKernelGetdirentries` supplies
 /// an optional fourth `basep` argument; `sceKernelGetdents` does not.
-fn hle_getdents(ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_getdents(ctx: &HleContext, args: &[u64], has_basep: bool) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
     let buffer = args.get(1).copied().unwrap_or(0);
     let requested = args.get(2).copied().unwrap_or(0).min(READ_MAX_BYTES);
-    let basep = args.get(3).copied().unwrap_or(0);
+    // `sceKernelGetdents`/POSIX `getdents` have only three arguments. RCX is
+    // therefore caller-clobbered garbage at the HLE trap and must never be
+    // interpreted as an output pointer. Only the four-argument
+    // `getdirentries` spellings own `basep`.
+    let basep = has_basep
+        .then(|| args.get(3).copied().unwrap_or(0))
+        .unwrap_or(0);
     if buffer == 0 || requested < 512 {
         return 0x8002_0016;
     }
@@ -326,6 +340,10 @@ fn hle_getdents(ctx: &HleContext, args: &[u64]) -> u64 {
         Err(_) => return 0x8002_0016,
     };
     if !payload.is_empty() && !ctx.mem.write(buffer, &payload) {
+        warn!(
+            "getdents: buffer write failed — buffer={buffer:#x} len={} (fd={fd})",
+            payload.len()
+        );
         return SCE_KERNEL_ERROR_EFAULT;
     }
     if basep != 0 && !ctx.mem.write(basep, &(base as u64).to_le_bytes()) {
@@ -582,8 +600,8 @@ pub fn register(registry: &HleRegistry) {
         hle_sce_fsync,
     );
     registry.register("libkernel", "sceKernelGetdents", hle_sce_getdents);
-    registry.register("libkernel", "sceKernelGetdirentries", hle_sce_getdents);
-    registry.register("libkernel", "getdirentries", hle_posix_getdents);
+    registry.register("libkernel", "sceKernelGetdirentries", hle_sce_getdirentries);
+    registry.register("libkernel", "getdirentries", hle_posix_getdirentries);
     registry.register("libScePosix", "getdents", hle_posix_getdents);
     registry.register("libkernel", "lseek", hle_posix_lseek);
     registry.register("libkernel", "sceKernelLseek", hle_sce_lseek);
@@ -684,6 +702,25 @@ pub fn register(registry: &HleRegistry) {
     // this registration exists so the import resolves to a trampoline.
     registry.register("libkernel", "_exit", hle_pthread_exit);
     registry.register("libkernel", "nanosleep", hle_nanosleep);
+    // libkernel's real export of the same call under the underscore spelling
+    // (a distinct NID — a NID hashes the name alone).
+    registry.register("libkernel", "_nanosleep", hle_nanosleep);
+    registry.register("libkernel", "getrusage", hle_getrusage);
+    registry.register("libkernel", "signal", hle_posix_signal);
+    registry.register("libkernel", "sceKernelMlock", hle_mlock);
+    registry.register(
+        "libkernel",
+        "sceKernelMapDirectMemory2",
+        hle_map_direct_memory2,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelInternalMemoryGetModuleSegmentInfo",
+        hle_internal_get_module_segment_info,
+    );
+    // POSIX memory spellings the measured title imports from libScePosix.
+    registry.register("libScePosix", "mprotect", hle_posix_mprotect);
+    registry.register("libScePosix", "munmap", hle_munmap);
     registry.register("libkernel", "_sigprocmask", hle_sigprocmask);
     registry.register("libkernel", "_is_signal_return", hle_is_signal_return);
     registry.register(
@@ -772,8 +809,15 @@ pub fn register(registry: &HleRegistry) {
     // Filesystem metadata. Path-based operations resolve through the same VFS
     // mounts as open/read/write; no title-specific path handling lives here.
     registry.register("libkernel", "sceKernelMkdir", hle_mkdir);
-    registry.register("libkernel", "sceKernelUnlink", hle_fs_enoent);
-    registry.register("libkernel", "sceKernelRmdir", hle_fs_enoent);
+    registry.register("libkernel", "sceKernelUnlink", hle_sce_unlink);
+    registry.register("libkernel", "sceKernelRmdir", hle_sce_rmdir);
+    registry.register("libkernel", "unlink", hle_posix_unlink);
+    registry.register("libkernel", "rmdir", hle_posix_rmdir);
+    registry.register("libkernel", "sceKernelRename", hle_sce_rename);
+    registry.register("libkernel", "sceKernelTruncate", hle_sce_truncate);
+    registry.register("libkernel", "sceKernelSync", hle_sce_sync);
+    registry.register("libkernel", "sceKernelChmod", hle_path_metadata_accept);
+    registry.register("libkernel", "sceKernelUtimes", hle_path_metadata_accept);
     registry.register("libkernel", "sceKernelStat", hle_stat);
     registry.register("libkernel", "sceKernelFstat", hle_fstat);
     // pthread surface libc/fmod touch during init — attr/priority/affinity
@@ -939,6 +983,11 @@ fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
         ctx.kernel.memory.remove_mapping(addr);
         return HLE_ERROR;
     }
+    if std::env::var_os("XPS5X_TRACE_DIRECT_MEMORY").is_some() {
+        warn!(
+            "direct-memory trace: allocate len={len:#x} alignment={alignment:#x} type={memory_type} -> phys={addr:#x}"
+        );
+    }
     SCE_OK
 }
 
@@ -970,6 +1019,9 @@ fn hle_release_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     );
     let start = args.first().copied().unwrap_or(0);
     let len = args.get(1).copied().unwrap_or(0);
+    if std::env::var_os("XPS5X_TRACE_DIRECT_MEMORY").is_some() {
+        warn!("direct-memory trace: release phys={start:#x} len={len:#x}");
+    }
     if start == 0 || len == 0 {
         return SCE_KERNEL_ERROR_EINVAL;
     }
@@ -1060,6 +1112,11 @@ fn hle_map_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
         }
         ctx.kernel.memory.remove_mapping(mapped);
         return SCE_KERNEL_ERROR_EFAULT;
+    }
+    if std::env::var_os("XPS5X_TRACE_DIRECT_MEMORY").is_some() {
+        warn!(
+            "direct-memory trace: map phys={direct_memory_start:#x} len={len:#x} requested={requested:#x} alignment={alignment:#x} -> {mapped:#x}"
+        );
     }
     SCE_OK
 }
@@ -1338,25 +1395,31 @@ fn hle_rtld_thread_atexit_decrement(ctx: &HleContext, args: &[u64]) -> u64 {
 /// `__tls_get_addr(const tls_index*)` resolves a guest descriptor containing
 /// `{ module_id: u64, offset: u64 }` to that thread-local's storage.
 ///
-/// The main module resolves to the **static** block the runtime built from its
-/// `PT_TLS` template; every other module gets bounded, zero-initialized dynamic
-/// storage. The block lives in the guest arena (never host-only memory), so the
-/// returned pointer is directly dereferenceable by native guest code.
+/// Every module in the process's static TLS layout resolves into the
+/// **static** area the runtime built from all the modules' `PT_TLS` templates
+/// (via the kernel's per-module area offsets); only a module loaded outside
+/// that layout gets bounded, zero-initialized dynamic storage. The storage
+/// lives in the guest arena (never host-only memory), so the returned pointer
+/// is directly dereferenceable by native guest code.
 ///
-/// # Why the main module is not just another dynamic block
+/// # Why a static module must not get a dynamic block
 ///
-/// It used to be, and that was a measured Minecraft crash. A PIC-built
-/// executable reaches its *own* thread-locals through the general-dynamic model
-/// — this function — as well as through `TPOFF64`, and the ELF TLS ABI requires
-/// both to land on the same address. Returning fresh storage here gave one
-/// variable two homes, and only the static one was ever initialized from
-/// `.tdata`.
+/// It used to, twice, and both were measured Minecraft crashes. Code reaches
+/// thread-locals through the general-dynamic model — this function — as well
+/// as through `TPOFF64` (`fs`-relative), and the ELF TLS ABI requires both to
+/// land on the same address. Returning fresh storage here gives one variable
+/// two homes, and only the static one is ever initialized from `.tdata`.
 ///
-/// Minecraft's `PT_TLS` is `tdata=0x8 memsz=0x78`: a single initialized pointer
-/// at offset 0. It asked for `{module: 1, offset: 0}`, read the zeroed copy back
-/// as `NULL`, and dereferenced it — surfacing as a guest fault reading address
-/// `0` from its own code, ~250 MB into the image, with nothing to connect it to
-/// TLS at all.
+/// First the *main executable*: its `PT_TLS` is `tdata=0x8 memsz=0x78`, a
+/// single initialized pointer at offset 0. It asked for
+/// `{module: 1, offset: 0}`, read the zeroed copy back as `NULL`, and
+/// dereferenced it. Then the same shape again for *dependencies*:
+/// `libRenoirCore.PS5.prx` (the title's UI renderer) writes a thread context
+/// pointer into its own TLS and reads it back general-dynamically — while
+/// every `DTPMOD64` in the process still resolved to module 1, so four
+/// modules' thread-locals (eboot, libc.prx, libcohtml, libRenoirCore) aliased
+/// the eboot's block and none of the others' `.tdata` was ever materialized.
+/// The fix is the process-wide layout this function now consults first.
 fn hle_tls_get_addr(ctx: &HleContext, args: &[u64]) -> u64 {
     let descriptor = args.first().copied().unwrap_or(0);
     if descriptor == 0 {
@@ -1370,15 +1433,31 @@ fn hle_tls_get_addr(ctx: &HleContext, args: &[u64]) -> u64 {
     let module_id = u64::from_le_bytes(bytes[..8].try_into().expect("fixed slice"));
     let offset = u64::from_le_bytes(bytes[8..].try_into().expect("fixed slice"));
 
-    // The main module's storage already exists and is already initialized: the
-    // runtime copied `PT_TLS`'s `.tdata` into it and the linker's `TPOFF64`
-    // offsets are computed against it. Alias it rather than allocate beside it.
+    // A static TLS module's storage already exists and is already initialized:
+    // the runtime copied every module's `.tdata` into the per-thread static
+    // area, and the linker's `TPOFF64` offsets are computed against the same
+    // layout the kernel's per-module area offsets describe. Alias that storage
+    // rather than allocate beside it — the ELF TLS ABI requires the
+    // general-dynamic and initial-exec models to land on the SAME address.
     //
-    // `offset` is not bounds-checked against the static block here: it comes
+    // `offset` is not bounds-checked against the module's block here: it comes
     // from the linker's own `DTPOFF64`, computed against the same template the
     // block was sized from, so the two agree by construction — the same
-    // agreement `TPOFF64` already relies on. A `None` block means there is no
-    // static TLS at all, and the dynamic path below is then the honest answer.
+    // agreement `TPOFF64` already relies on.
+    if let Some(area_offset) = ctx
+        .kernel
+        .static_tls_area_offsets
+        .get(&module_id)
+        .map(|entry| *entry)
+        && let Some(area_base) = ctx.guest_threads.current_static_tls_block()
+    {
+        return area_base + area_offset + offset;
+    }
+
+    // No registered layout (single-module fixtures, test doubles): the main
+    // module is the whole TLS world and the static block is its block. A
+    // `None` block means there is no static TLS at all, and the dynamic path
+    // below is then the honest answer.
     if module_id == MAIN_TLS_MODULE_ID
         && let Some(base) = ctx.guest_threads.current_static_tls_block()
     {
@@ -1456,7 +1535,7 @@ fn hle_rtld_set_application_heap_api(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 /// `__error()`: address of the calling thread's lazily allocated `errno`.
-fn hle_error_addr(ctx: &HleContext, _args: &[u64]) -> u64 {
+pub(crate) fn hle_error_addr(ctx: &HleContext, _args: &[u64]) -> u64 {
     let thread = ctx.guest_threads.current_thread();
     if let Some(existing) = ctx.kernel.errno_slots.get(&thread) {
         return *existing;
@@ -1503,6 +1582,106 @@ fn hle_nanosleep(ctx: &HleContext, args: &[u64]) -> u64 {
         let _ = ctx.mem.write(rem, &[0u8; 16]);
     }
     SCE_OK
+}
+
+/// Size of FreeBSD's `struct rusage`: two `timeval`s (16 bytes each) plus
+/// fourteen `long` counters — 144 bytes.
+const RUSAGE_SIZE: usize = 144;
+
+/// `getrusage(who, rusage*)`: report zeroed resource usage. XPS5X keeps no
+/// per-process rusage accounting; all-zero counters are well-formed values a
+/// caller can add/subtract safely (unlike an unwritten struct).
+fn hle_getrusage(ctx: &HleContext, args: &[u64]) -> u64 {
+    let who = args.first().copied().unwrap_or(0) as i64;
+    let usage = args.get(1).copied().unwrap_or(0);
+    debug!("getrusage(who={who}, usage={usage:#x}) -> zeroed counters");
+    if usage == 0 || !ctx.mem.write(usage, &[0u8; RUSAGE_SIZE]) {
+        set_guest_errno(ctx, 14); // EFAULT
+        return (-1i64) as u64;
+    }
+    0
+}
+
+/// `signal(sig, handler)`: accept the registration and report the previous
+/// handler as `SIG_DFL` (0). XPS5X never delivers guest signals (see
+/// `_sigprocmask`/`_is_signal_return`), so recording the handler would only
+/// promise a callback that can never arrive.
+fn hle_posix_signal(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        warn!(
+            "signal(sig={}, handler={:#x}): accepted, but guest signals are never delivered \
+             (logged once)",
+            args.first().copied().unwrap_or(0),
+            args.get(1).copied().unwrap_or(0)
+        );
+    });
+    0 // previous handler = SIG_DFL
+}
+
+/// `sceKernelMlock(addr, len)`: guest memory is host-resident by construction
+/// (the arena is committed memory, never paged out by us), so the lock request
+/// is already satisfied.
+fn hle_mlock(_ctx: &HleContext, args: &[u64]) -> u64 {
+    debug!(
+        "sceKernelMlock(addr={:#x}, len={:#x}) -> OK (arena memory is resident)",
+        args.first().copied().unwrap_or(0),
+        args.get(1).copied().unwrap_or(0)
+    );
+    SCE_OK
+}
+
+/// POSIX `mprotect(addr, len, prot)`: page protections are not remapped per
+/// guest request yet (the arena stays RWX for HLE trampolines); accepting the
+/// request is the same shortcut `sceKernelMprotect` takes.
+fn hle_posix_mprotect(_ctx: &HleContext, args: &[u64]) -> u64 {
+    debug!(
+        "mprotect(addr={:#x}, len={:#x}, prot={:#x}) -> OK (protections not remapped)",
+        args.first().copied().unwrap_or(0),
+        args.get(1).copied().unwrap_or(0),
+        args.get(2).copied().unwrap_or(0)
+    );
+    0
+}
+
+/// Real signature: `sceKernelMapDirectMemory2(void **addrOut, size_t len, int
+/// type, int prot, int flags, off_t directMemoryStart, size_t alignment)`.
+///
+/// Identical to `sceKernelMapDirectMemory` except for the extra `type`
+/// argument at position 2 (which shifts `prot`/`flags`/`phys`/`alignment` one
+/// slot right). The type only selects a physical-memory pool on hardware, so
+/// it is logged and otherwise ignored — the arguments are reshuffled into the
+/// existing implementation.
+fn hle_map_direct_memory2(ctx: &HleContext, args: &[u64]) -> u64 {
+    let memory_type = args.get(2).copied().unwrap_or(0);
+    debug!("sceKernelMapDirectMemory2(type={memory_type}) -> sceKernelMapDirectMemory");
+    hle_map_direct_memory(
+        ctx,
+        &[
+            args.first().copied().unwrap_or(0), // addrOut
+            args.get(1).copied().unwrap_or(0),  // len
+            args.get(3).copied().unwrap_or(0),  // prot
+            args.get(4).copied().unwrap_or(0),  // flags
+            args.get(5).copied().unwrap_or(0),  // directMemoryStart
+            args.get(6).copied().unwrap_or(0),  // alignment
+        ],
+    )
+}
+
+/// `sceKernelInternalMemoryGetModuleSegmentInfo(out)`: internal SDK call with
+/// no public ABI contract. Filling a structure of unknown layout would hand
+/// the guest garbage it trusts, so this fails loudly (once) with `EINVAL` and
+/// writes nothing.
+fn hle_internal_get_module_segment_info(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        warn!(
+            "sceKernelInternalMemoryGetModuleSegmentInfo(out={:#x}): ABI unknown — EINVAL \
+             (logged once)",
+            args.first().copied().unwrap_or(0)
+        );
+    });
+    SCE_KERNEL_ERROR_EINVAL
 }
 
 /// `_sigprocmask(how, set, oset)`: no signals are ever delivered to the
@@ -1724,12 +1903,20 @@ fn hle_reserve_virtual_range(ctx: &HleContext, args: &[u64]) -> u64 {
 /// `sceKernelDebugRaiseException*`: the title is reporting a fatal
 /// condition. Log it loudly; returning lets the guest continue into
 /// whatever it does next (usually an exit path).
-fn hle_debug_raise_exception(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_debug_raise_exception(ctx: &HleContext, args: &[u64]) -> u64 {
+    let code = args.first().copied().unwrap_or(0);
     warn!(
-        "sceKernelDebugRaiseException(code={:#x}, arg={:#x}) — guest reported a fatal condition",
-        args.first().copied().unwrap_or(0),
+        "sceKernelDebugRaiseException(code={code:#x}, arg={:#x}) — guest reported a fatal \
+         condition; terminating the calling guest thread",
         args.get(1).copied().unwrap_or(0),
     );
+    // On hardware this never returns — the process is killed. Returning here
+    // is measurably worse than stopping the thread: the caller's code ends at
+    // the call instruction (noreturn), so a return "executes" whatever bytes
+    // follow — on the measured title, a jump through a null slot that then
+    // gets reported as OUR wild-jump bug. Exit the calling thread instead;
+    // other threads keep running so the run stays observable.
+    ctx.guest_threads.request_exit(code);
     SCE_OK
 }
 
@@ -1834,14 +2021,139 @@ fn write_orbis_timespec(out: &mut [u8], value: Option<std::time::SystemTime>) {
     out[8..16].copy_from_slice(&(duration.subsec_nanos() as i64).to_le_bytes());
 }
 
-/// Shared honest-failure stub for path metadata calls with no VFS backing.
-fn hle_fs_enoent(ctx: &HleContext, args: &[u64]) -> u64 {
-    let arg0 = args.first().copied().unwrap_or(0);
-    warn!(
-        "filesystem metadata call ({:?} / {arg0:#x}): no VFS backing — ENOENT",
-        crate::fmt::read_cstr(ctx.mem, arg0).unwrap_or_default()
-    );
-    SCE_KERNEL_ERROR_ENOENT
+/// Map a host I/O error to the POSIX errno the guest expects, as this
+/// module's internal negative-errno convention (see [`file_result_posix`] /
+/// [`file_result_sce`]).
+fn io_error_to_file_result(error: &std::io::Error) -> u64 {
+    use std::io::ErrorKind;
+    let errno: i64 = match error.kind() {
+        ErrorKind::NotFound => 2,           // ENOENT
+        ErrorKind::PermissionDenied => 13,  // EACCES
+        ErrorKind::AlreadyExists => 17,     // EEXIST
+        ErrorKind::DirectoryNotEmpty => 66, // ENOTEMPTY (FreeBSD)
+        ErrorKind::InvalidInput => 22,      // EINVAL
+        _ => 5,                             // EIO
+    };
+    (-errno) as u64
+}
+
+/// Read the guest path argument at `args[index]`, or `None` on a bad pointer.
+fn read_guest_path(ctx: &HleContext, args: &[u64], index: usize) -> Option<String> {
+    let ptr = args.get(index).copied().unwrap_or(0);
+    let bytes = crate::fmt::read_cstr(ctx.mem, ptr)?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// `unlink(path)` / `sceKernelUnlink`: remove a file beneath a mounted VFS
+/// root (internal negative-errno convention; see the wrappers below).
+fn hle_unlink_core(ctx: &HleContext, args: &[u64]) -> u64 {
+    let Some(path) = read_guest_path(ctx, args, 0) else {
+        return FILE_EFAULT;
+    };
+    match ctx.kernel.filesystem.remove_file(&path) {
+        Ok(()) => SCE_OK,
+        Err(e) => {
+            warn!("unlink('{path}') failed: {e}");
+            io_error_to_file_result(&e)
+        }
+    }
+}
+
+/// `rmdir(path)` / `sceKernelRmdir`: remove an empty directory beneath a
+/// mounted VFS root.
+fn hle_rmdir_core(ctx: &HleContext, args: &[u64]) -> u64 {
+    let Some(path) = read_guest_path(ctx, args, 0) else {
+        return FILE_EFAULT;
+    };
+    match ctx.kernel.filesystem.remove_dir(&path) {
+        Ok(()) => SCE_OK,
+        Err(e) => {
+            warn!("rmdir('{path}') failed: {e}");
+            io_error_to_file_result(&e)
+        }
+    }
+}
+
+/// `sceKernelRename(from, to)`: rename between mounted VFS paths.
+fn hle_rename_core(ctx: &HleContext, args: &[u64]) -> u64 {
+    let (Some(from), Some(to)) = (read_guest_path(ctx, args, 0), read_guest_path(ctx, args, 1))
+    else {
+        return FILE_EFAULT;
+    };
+    match ctx.kernel.filesystem.rename(&from, &to) {
+        Ok(()) => SCE_OK,
+        Err(e) => {
+            warn!("rename('{from}' -> '{to}') failed: {e}");
+            io_error_to_file_result(&e)
+        }
+    }
+}
+
+/// `sceKernelTruncate(path, length)`: set the file's length.
+fn hle_truncate_core(ctx: &HleContext, args: &[u64]) -> u64 {
+    let Some(path) = read_guest_path(ctx, args, 0) else {
+        return FILE_EFAULT;
+    };
+    let length = args.get(1).copied().unwrap_or(0);
+    match ctx.kernel.filesystem.truncate(&path, length) {
+        Ok(()) => SCE_OK,
+        Err(e) => {
+            warn!("truncate('{path}', {length}) failed: {e}");
+            io_error_to_file_result(&e)
+        }
+    }
+}
+
+fn hle_sce_unlink(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_sce(hle_unlink_core(ctx, args))
+}
+
+fn hle_posix_unlink(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_posix(ctx, hle_unlink_core(ctx, args))
+}
+
+fn hle_sce_rmdir(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_sce(hle_rmdir_core(ctx, args))
+}
+
+fn hle_posix_rmdir(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_posix(ctx, hle_rmdir_core(ctx, args))
+}
+
+fn hle_sce_rename(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_sce(hle_rename_core(ctx, args))
+}
+
+fn hle_sce_truncate(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_sce(hle_truncate_core(ctx, args))
+}
+
+/// `sceKernelSync()`: flush everything to stable storage. The VFS persists
+/// dirty descriptors on `fsync`/`close`, and host writes are already durable
+/// from the guest's perspective, so a global sync has nothing further to do.
+fn hle_sce_sync(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    debug!("sceKernelSync() -> OK (VFS persists on fsync/close)");
+    SCE_OK
+}
+
+/// `sceKernelChmod(path, mode)` / `sceKernelUtimes(path, times)`: the VFS
+/// stores no guest permission bits or timestamps of its own (host metadata is
+/// authoritative), so a resolvable existing path is accepted with a debug log
+/// and an unresolvable one is a real `ENOENT`.
+fn hle_path_metadata_accept(ctx: &HleContext, args: &[u64]) -> u64 {
+    let Some(path) = read_guest_path(ctx, args, 0) else {
+        return SCE_KERNEL_ERROR_EFAULT;
+    };
+    match ctx.kernel.filesystem.resolve_path(&path) {
+        Some(host) if host.exists() => {
+            debug!("chmod/utimes('{path}') accepted (no guest metadata modeled)");
+            SCE_OK
+        }
+        _ => {
+            warn!("chmod/utimes('{path}'): not a mounted existing path — ENOENT");
+            SCE_KERNEL_ERROR_ENOENT
+        }
+    }
 }
 
 /// `fstat`/`sceKernelFstat(fd, stat_out)`: report regular-file size for VFS
@@ -2219,6 +2531,56 @@ mod tests {
         // or a thread-local would lose its value between reads.
         write_tls_index(&mem, 0x200, MAIN_TLS_MODULE_ID + 1, 0);
         assert_eq!(hle_tls_get_addr(&ctx, &[0x200]), other);
+    }
+
+    /// A dependency in the process's static TLS layout must resolve into the
+    /// static area at ITS slot — not the main module's, and not a dynamic
+    /// block.
+    ///
+    /// This is the measured Minecraft crash the layout exists for: every
+    /// `DTPMOD64` in the process used to resolve to module 1, so
+    /// `libRenoirCore.PS5.prx`'s thread context pointer — written through
+    /// initial-exec against its own slot — read back zero through
+    /// general-dynamic, and the title's UI renderer dereferenced the null on
+    /// every thread that touched it.
+    #[test]
+    fn tls_get_addr_resolves_a_static_layout_dependency_at_its_own_slot() {
+        const AREA_BASE: u64 = 0x4000;
+        // Variant-II layout: main at tp-0x20 (area offset 0x80 of a 0xa0-byte
+        // area), the dependency below it at tp-0xa0 (area offset 0).
+        const MAIN_AREA_OFF: u64 = 0x80;
+        const DEP_AREA_OFF: u64 = 0;
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        kernel.set_static_tls_area_offsets([(1u64, MAIN_AREA_OFF), (2u64, DEP_AREA_OFF)]);
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x8000);
+        let threads = StaticTlsThreads(AREA_BASE);
+        let mut ctx = test_ctx(&kernel, &mem, &alloc);
+        ctx.guest_threads = &threads;
+
+        write_tls_index(&mem, 0x100, 2, 0x8);
+        assert_eq!(
+            hle_tls_get_addr(&ctx, &[0x100]),
+            AREA_BASE + DEP_AREA_OFF + 0x8,
+            "a static-layout dependency must alias its own slot in the static area"
+        );
+
+        // The main module keeps its slot too — registered layout, not the
+        // legacy module-1 fallback.
+        write_tls_index(&mem, 0x200, 1, 0x10);
+        assert_eq!(
+            hle_tls_get_addr(&ctx, &[0x200]),
+            AREA_BASE + MAIN_AREA_OFF + 0x10
+        );
+
+        // A module OUTSIDE the layout (runtime-loaded) still gets dynamic
+        // storage, never a slice of the static area.
+        write_tls_index(&mem, 0x300, 7, 0);
+        let dynamic = hle_tls_get_addr(&ctx, &[0x300]);
+        assert!(
+            !(AREA_BASE..AREA_BASE + 0x100).contains(&dynamic),
+            "a module outside the layout must not land in the static area"
+        );
     }
 
     #[test]
@@ -2803,6 +3165,140 @@ mod tests {
     }
 
     #[test]
+    fn rename_truncate_unlink_and_rmdir_mutate_the_host_through_the_vfs() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        // Nonzero base: the errno slot is arena-allocated, and address 0 would
+        // read as "no errno slot".
+        let alloc = crate::TestAllocator::new(0x800);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let tmp = std::env::temp_dir().join(format!("xps5x-hle-fsmut-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("dir")).unwrap();
+        std::fs::write(tmp.join("old.dat"), b"0123456789").unwrap();
+        kernel.filesystem.set_game_directory(&tmp);
+
+        // sceKernelRename moves the real host file.
+        assert!(mem.write(0x100, b"/app0/old.dat\0"));
+        assert!(mem.write(0x140, b"/app0/new.dat\0"));
+        assert_eq!(hle_sce_rename(&ctx, &[0x100, 0x140]), SCE_OK);
+        assert!(!tmp.join("old.dat").exists());
+        assert_eq!(std::fs::read(tmp.join("new.dat")).unwrap(), b"0123456789");
+        // Renaming the now-missing source is a real SCE ENOENT.
+        assert_eq!(hle_sce_rename(&ctx, &[0x100, 0x140]), 0x8002_0002);
+
+        // sceKernelTruncate shortens it.
+        assert_eq!(hle_sce_truncate(&ctx, &[0x140, 4]), SCE_OK);
+        assert_eq!(std::fs::read(tmp.join("new.dat")).unwrap(), b"0123");
+
+        // unlink (POSIX spelling) removes it; a second unlink is -1 + ENOENT.
+        assert_eq!(hle_posix_unlink(&ctx, &[0x140]), SCE_OK);
+        assert!(!tmp.join("new.dat").exists());
+        assert_eq!(hle_posix_unlink(&ctx, &[0x140]), (-1i64) as u64);
+        let errno_slot = hle_error_addr(&ctx, &[]);
+        let mut errno = [0u8; 4];
+        assert!(mem.read(errno_slot, &mut errno));
+        assert_eq!(i32::from_le_bytes(errno), 2, "errno must hold ENOENT");
+
+        // rmdir removes the empty directory (SCE spelling).
+        assert!(mem.write(0x180, b"/app0/dir\0"));
+        assert_eq!(hle_sce_rmdir(&ctx, &[0x180]), SCE_OK);
+        assert!(!tmp.join("dir").exists());
+        assert_eq!(hle_sce_rmdir(&ctx, &[0x180]), 0x8002_0002);
+
+        // Chmod/Utimes accept an existing path and reject a missing one.
+        assert!(mem.write(0x1c0, b"/app0/\0"));
+        assert_eq!(hle_path_metadata_accept(&ctx, &[0x1c0, 0o755]), SCE_OK);
+        assert_eq!(hle_path_metadata_accept(&ctx, &[0x180, 0o755]), 0x8002_0002);
+
+        // Sync is a global no-op success.
+        assert_eq!(hle_sce_sync(&ctx, &[]), SCE_OK);
+
+        // A traversing path never reaches the host.
+        assert!(mem.write(0x200, b"/app0/../escape\0"));
+        assert_ne!(hle_sce_unlink(&ctx, &[0x200]), SCE_OK);
+
+        let registry = HleRegistry::new();
+        for name in [
+            "sceKernelRename",
+            "sceKernelTruncate",
+            "sceKernelSync",
+            "sceKernelChmod",
+            "sceKernelUtimes",
+            "unlink",
+            "rmdir",
+            "sceKernelUnlink",
+            "sceKernelRmdir",
+            "_nanosleep",
+            "getrusage",
+            "signal",
+            "sceKernelMlock",
+            "sceKernelMapDirectMemory2",
+            "sceKernelInternalMemoryGetModuleSegmentInfo",
+            "sceKernelAddWriteEvent",
+            "sceKernelDeleteWriteEvent",
+            "scePthreadMutexTimedlock",
+        ] {
+            assert!(
+                registry.is_implemented("libkernel", name),
+                "libkernel::{name} must be registered"
+            );
+        }
+        for name in ["mprotect", "munmap", "select", "accept", "listen", "recv"] {
+            assert!(
+                registry.is_implemented("libScePosix", name),
+                "libScePosix::{name} must be registered"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn getrusage_zero_fills_and_map_direct_memory2_reorders_arguments() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100000);
+        let alloc = crate::TestAllocator::new(0x40000);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // getrusage zero-fills the full 144-byte struct.
+        assert!(mem.write(0x400, &[0xAAu8; RUSAGE_SIZE]));
+        assert_eq!(hle_getrusage(&ctx, &[0, 0x400]), 0);
+        let mut usage = [0xAAu8; RUSAGE_SIZE];
+        assert!(mem.read(0x400, &mut usage));
+        assert_eq!(usage, [0u8; RUSAGE_SIZE]);
+        // NULL pointer → -1 (with errno EFAULT).
+        assert_eq!(hle_getrusage(&ctx, &[0, 0]), (-1i64) as u64);
+
+        // MapDirectMemory2: allocate direct memory, then map it with the
+        // extra `type` argument at position 2 — must succeed exactly like
+        // sceKernelMapDirectMemory with the trailing args shifted one right.
+        assert_eq!(
+            hle_allocate_direct_memory(&ctx, &[0, u64::MAX, 0x8000, 0, 0, 0x600]),
+            SCE_OK
+        );
+        let mut phys_bytes = [0u8; 8];
+        assert!(mem.read(0x600, &mut phys_bytes));
+        let phys = u64::from_le_bytes(phys_bytes);
+        assert!(mem.write(0x700, &0u64.to_le_bytes())); // addrOut in/out = 0
+        assert_eq!(
+            hle_map_direct_memory2(&ctx, &[0x700, 0x8000, /*type*/ 3, 0x3, 0, phys, 0]),
+            SCE_OK
+        );
+        let mut mapped = [0u8; 8];
+        assert!(mem.read(0x700, &mut mapped));
+        assert_eq!(u64::from_le_bytes(mapped), phys);
+
+        // signal() reports SIG_DFL and Mlock succeeds.
+        assert_eq!(hle_posix_signal(&ctx, &[11, 0x1234]), 0);
+        assert_eq!(hle_mlock(&ctx, &[0x1000, 0x1000]), SCE_OK);
+        assert_eq!(
+            hle_internal_get_module_segment_info(&ctx, &[0x400]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
+    }
+
+    #[test]
     fn file_io_open_read_seek_close_against_a_real_host_file() {
         let kernel = xps5x_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
@@ -2882,6 +3378,8 @@ mod tests {
         let fd = hle_open(&ctx, &[0x100, 0, 0]);
         assert!((fd as i64) >= 3);
         let registry = HleRegistry::new();
+        let stale_arg4 = [0xA5u8; 8];
+        assert!(mem.write(0x200, &stale_arg4));
         assert_eq!(
             registry.call(
                 &ctx,
@@ -2892,14 +3390,22 @@ mod tests {
             Some(512),
             "the registry must retain the VFS handler rather than a later stub"
         );
+        let mut after = [0u8; 8];
+        assert!(mem.read(0x200, &mut after));
+        assert_eq!(
+            after, stale_arg4,
+            "three-argument sceKernelGetdents must not treat stale RCX as getdirentries basep"
+        );
         let mut first = [0u8; 512];
         assert!(mem.read(0x400, &mut first));
         let first_len = u16::from_le_bytes(first[4..6].try_into().unwrap()) as usize;
         assert_eq!(first_len, 512);
         assert!(matches!(first[6], 4 | 8));
         assert_ne!(first[7], 0);
-        assert_eq!(hle_getdents(&ctx, &[fd, 0x400, 1024]), 512);
-        assert_eq!(hle_getdents(&ctx, &[fd, 0x400, 1024]), 0);
+        assert_eq!(hle_getdents(&ctx, &[fd, 0x400, 1024], false), 512);
+        assert_eq!(hle_getdents(&ctx, &[fd, 0x400, 1024], false), 512);
+        assert_eq!(hle_getdents(&ctx, &[fd, 0x400, 1024], false), 512);
+        assert_eq!(hle_getdents(&ctx, &[fd, 0x400, 1024], false), 0);
         assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
         let _ = std::fs::remove_dir_all(&tmp);
     }

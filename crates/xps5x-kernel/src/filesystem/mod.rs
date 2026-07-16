@@ -11,7 +11,7 @@
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use tracing::{debug, info, warn};
 use xps5x_core::types::Fd;
 
@@ -72,6 +72,10 @@ struct DirectoryEntry {
 pub struct VirtualFileSystem {
     /// Registered mount points.
     mounts: RwLock<Vec<MountPoint>>,
+    /// Stable per-title save root. `/savedata0` is temporarily remapped below
+    /// this root while a save slot is mounted, so save-slot enumeration must
+    /// not derive its root from the current guest mount.
+    savedata_root: RwLock<PathBuf>,
     /// Open file descriptors.
     open_files: RwLock<HashMap<Fd, OpenFile>>,
     /// Next file descriptor to assign.
@@ -90,6 +94,7 @@ impl VirtualFileSystem {
         info!("Initializing virtual filesystem");
         let vfs = Self {
             mounts: RwLock::new(Vec::new()),
+            savedata_root: RwLock::new(PathBuf::from("savedata")),
             open_files: RwLock::new(HashMap::new()),
             next_fd: RwLock::new(3), // 0=stdin, 1=stdout, 2=stderr.
         };
@@ -162,9 +167,51 @@ impl VirtualFileSystem {
         self.set_mount_directory("/download0", path);
     }
 
-    /// Set the process-private save directory exposed at `/savedata0/`.
+    /// Set the process-private title save root and expose it at `/savedata0/`
+    /// until a concrete save slot is mounted.
     pub fn set_savedata_directory(&self, path: &std::path::Path) {
+        *self.savedata_root.write() = path.to_path_buf();
         self.set_mount_directory("/savedata0", path);
+    }
+
+    /// Return the stable per-title save root, independent of the currently
+    /// mounted `/savedata0` slot.
+    pub fn savedata_root(&self) -> PathBuf {
+        self.savedata_root.read().clone()
+    }
+
+    /// Resolve a single save-slot name below the per-title root. Save-data
+    /// directory names are opaque guest strings, but they may never escape
+    /// the title root or introduce nested host paths.
+    pub fn savedata_slot_path(&self, slot_name: &str) -> Result<PathBuf, std::io::Error> {
+        let mut components = Path::new(slot_name).components();
+        let valid = matches!(components.next(), Some(Component::Normal(_)))
+            && components.next().is_none()
+            && !slot_name.is_empty()
+            && !slot_name.contains(['/', '\\'])
+            && slot_name != "."
+            && slot_name != "..";
+        if !valid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "save-data slot must be one path component",
+            ));
+        }
+        Ok(self.savedata_root().join(slot_name))
+    }
+
+    /// Remap `/savedata0` to one validated save slot. Directory creation and
+    /// mount-mode policy remain the save-data service's responsibility.
+    pub fn mount_savedata_slot(&self, slot_name: &str) -> Result<PathBuf, std::io::Error> {
+        let path = self.savedata_slot_path(slot_name)?;
+        self.set_mount_directory("/savedata0", &path);
+        Ok(path)
+    }
+
+    /// Drop the active slot mapping while retaining the title-level root.
+    pub fn unmount_savedata_slot(&self) {
+        let root = self.savedata_root();
+        self.set_mount_directory("/savedata0", &root);
     }
 
     fn set_mount_directory(&self, guest_root: &str, path: &std::path::Path) {
@@ -230,6 +277,51 @@ impl VirtualFileSystem {
         } else {
             Ok(())
         }
+    }
+
+    /// Remove a single file beneath a mounted guest root (`unlink`).
+    pub fn remove_file(&self, ps5_path: &str) -> Result<(), std::io::Error> {
+        let host_path = self.resolve_path(ps5_path).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "path is not mounted")
+        })?;
+        std::fs::remove_file(host_path)
+    }
+
+    /// Remove an empty directory beneath a mounted guest root (`rmdir`).
+    /// A non-empty directory fails, matching POSIX `rmdir` (use
+    /// [`remove_dir_all`](Self::remove_dir_all) for recursive removal).
+    pub fn remove_dir(&self, ps5_path: &str) -> Result<(), std::io::Error> {
+        let host_path = self.resolve_path(ps5_path).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "path is not mounted")
+        })?;
+        std::fs::remove_dir(host_path)
+    }
+
+    /// Rename `from` to `to`, both beneath mounted guest roots. Traversing or
+    /// unmounted paths on either side fail rather than touching the host.
+    pub fn rename(&self, from: &str, to: &str) -> Result<(), std::io::Error> {
+        let host_from = self.resolve_path(from).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "source path is not mounted")
+        })?;
+        let host_to = self.resolve_path(to).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "destination path is not mounted",
+            )
+        })?;
+        std::fs::rename(host_from, host_to)
+    }
+
+    /// Truncate (or zero-extend) the file at a mounted guest path to `len`
+    /// bytes (`truncate`). The file must already exist.
+    pub fn truncate(&self, ps5_path: &str, len: u64) -> Result<(), std::io::Error> {
+        let host_path = self.resolve_path(ps5_path).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "path is not mounted")
+        })?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(host_path)?
+            .set_len(len)
     }
 
     /// Open a file, honoring the `open`-flag subset in [`open_flags`].
@@ -326,7 +418,21 @@ impl VirtualFileSystem {
                 })
                 .collect::<Vec<_>>();
             entries.sort_by_key(|entry| entry.name.to_ascii_lowercase());
-            Some(entries)
+            // Real Orbis `getdents` yields `.` and `..` first; some
+            // directory iterators depend on their presence (or explicitly
+            // skip them and mis-handle a listing that omits them). Prepend
+            // them so the guest sees a POSIX-shaped directory.
+            let mut with_dots = Vec::with_capacity(entries.len() + 2);
+            with_dots.push(DirectoryEntry {
+                is_directory: true,
+                name: ".".to_string(),
+            });
+            with_dots.push(DirectoryEntry {
+                is_directory: true,
+                name: "..".to_string(),
+            });
+            with_dots.extend(entries);
+            Some(with_dots)
         } else {
             None
         };
@@ -541,14 +647,25 @@ impl VirtualFileSystem {
         };
         let name = entry.name.as_bytes();
         let name_len = name.len().min(255);
+        // Orbis `dirent`: d_fileno(u32), d_reclen(u16), d_type(u8),
+        // d_namlen(u8), d_name[]. `d_fileno` must be NON-ZERO — a real
+        // filesystem never hands out inode 0, and code that treats 0 as
+        // "invalid entry" will mis-parse it. fnv1a of the name can be 0 for
+        // some inputs, so force the low bit.
+        let fileno = fnv1a32(&name[..name_len]) | 1;
         let mut record = vec![0u8; DIRENT_SIZE];
-        record[0..4].copy_from_slice(&fnv1a32(&name[..name_len]).to_le_bytes());
+        record[0..4].copy_from_slice(&fileno.to_le_bytes());
         record[4..6].copy_from_slice(&(DIRENT_SIZE as u16).to_le_bytes());
         record[6] = if entry.is_directory { 4 } else { 8 };
         record[7] = name_len as u8;
         record[8..8 + name_len].copy_from_slice(&name[..name_len]);
         file.directory_index += 1;
         file.position = file.directory_index as u64;
+        tracing::debug!(
+            "getdents fd={fd}: entry[{base}] '{}' type={} -> 1 record",
+            String::from_utf8_lossy(&name[..name_len]),
+            if entry.is_directory { "dir" } else { "file" }
+        );
         Ok((record, base))
     }
 
@@ -563,23 +680,47 @@ impl VirtualFileSystem {
                 format!("fd {fd} not open"),
             ));
         };
-        if !file.dirty || !file.writable {
-            return Ok(());
-        }
-        if let Some(ref data) = file.data {
-            std::fs::write(&file.host_path, data)?;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&file.host_path)?
-                .sync_all()?;
-            debug!(
-                "VFS sync: flushed {} bytes -> {}",
-                data.len(),
-                file.host_path.display()
-            );
-        }
-        file.dirty = false;
+        flush_open_file(file)?;
         Ok(())
+    }
+
+    /// Persist every dirty writable descriptor below one guest mount.
+    ///
+    /// Save-data commit APIs operate on a mount point rather than individual
+    /// file descriptors. Keeping this operation in the VFS makes that
+    /// durability boundary real while ensuring a save commit cannot flush or
+    /// otherwise affect descriptors opened below unrelated mounts.
+    pub fn sync_mount(&self, guest_root: &str) -> Result<usize, std::io::Error> {
+        let root = normalize_mount_root(guest_root);
+        if self.resolve_path(&root).is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("mount {root} is not registered"),
+            ));
+        }
+
+        let mut files = self.open_files.write();
+        let mut flushed = 0usize;
+        let mut first_error = None;
+        for file in files.values_mut().filter(|file| {
+            file.ps5_path == root
+                || file
+                    .ps5_path
+                    .strip_prefix(&root)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        }) {
+            match flush_open_file(file) {
+                Ok(true) => flushed += 1,
+                Ok(false) => {}
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(flushed)
+        }
     }
 
     /// Close a file descriptor, flushing a dirty writable fd's buffer back to
@@ -612,6 +753,27 @@ impl VirtualFileSystem {
         }
         Ok(())
     }
+}
+
+/// Flush one open file's write-back buffer and report whether it was dirty.
+fn flush_open_file(file: &mut OpenFile) -> Result<bool, std::io::Error> {
+    if !file.dirty || !file.writable {
+        return Ok(false);
+    }
+    if let Some(ref data) = file.data {
+        std::fs::write(&file.host_path, data)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file.host_path)?
+            .sync_all()?;
+        debug!(
+            "VFS sync: flushed {} bytes -> {}",
+            data.len(),
+            file.host_path.display()
+        );
+    }
+    file.dirty = false;
+    Ok(true)
 }
 
 fn normalize_mount_root(prefix: &str) -> String {
@@ -731,6 +893,45 @@ mod tests {
     }
 
     #[test]
+    fn sync_mount_flushes_only_descriptors_below_that_guest_mount() {
+        use open_flags::*;
+        let save_dir = temp_dir("sync-mount-save");
+        let game_dir = temp_dir("sync-mount-game");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_savedata_directory(&save_dir);
+        vfs.set_game_directory(&game_dir);
+
+        let save_fd = vfs
+            .open(
+                "/savedata0/slot/live.bin",
+                O_WRONLY | O_CREAT | O_TRUNC,
+                0o644,
+            )
+            .unwrap();
+        let game_fd = vfs
+            .open(
+                "/app0/should-stay-buffered.bin",
+                O_WRONLY | O_CREAT | O_TRUNC,
+                0o644,
+            )
+            .unwrap();
+        vfs.write(save_fd, b"SAVE").unwrap();
+        vfs.write(game_fd, b"GAME").unwrap();
+
+        assert_eq!(vfs.sync_mount("/savedata0").unwrap(), 1);
+        assert_eq!(
+            std::fs::read(save_dir.join("slot/live.bin")).unwrap(),
+            b"SAVE"
+        );
+        assert!(!game_dir.join("should-stay-buffered.bin").exists());
+
+        vfs.close(save_fd).unwrap();
+        vfs.close(game_fd).unwrap();
+        let _ = std::fs::remove_dir_all(&save_dir);
+        let _ = std::fs::remove_dir_all(&game_dir);
+    }
+
+    #[test]
     fn directory_open_getdents_and_fcntl_flags_are_stateful() {
         use open_flags::*;
         let dir = temp_dir("getdents");
@@ -741,12 +942,16 @@ mod tests {
 
         let fd = vfs.open("/app0", O_RDONLY, 0).unwrap();
         assert_eq!(vfs.flags(fd), Some(O_RDONLY));
+        // Four entries now: the two synthetic dot-dirs Orbis always yields
+        // first (`.`, `..`), then the real `packs` and `stone.txt`.
         let mut kinds_and_names = Vec::new();
-        for expected_base in 0..2 {
+        for expected_base in 0..4 {
             let (bytes, base) = vfs.getdents(fd, 1024).unwrap();
             assert_eq!(bytes.len(), 512);
             assert_eq!(base, expected_base);
             assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 512);
+            // Every d_fileno must be non-zero.
+            assert_ne!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 0);
             let name_len = bytes[7] as usize;
             kinds_and_names.push((
                 bytes[6],
@@ -758,11 +963,16 @@ mod tests {
         kinds_and_names.sort_by(|a, b| a.1.cmp(&b.1));
         assert_eq!(
             kinds_and_names,
-            [(4, "packs".to_string()), (8, "stone.txt".to_string())]
+            [
+                (4, ".".to_string()),
+                (4, "..".to_string()),
+                (4, "packs".to_string()),
+                (8, "stone.txt".to_string()),
+            ]
         );
         let (eof, base) = vfs.getdents(fd, 512).unwrap();
         assert!(eof.is_empty());
-        assert_eq!(base, 2);
+        assert_eq!(base, 4);
         vfs.set_status_flags(fd, O_APPEND).unwrap();
         assert_eq!(vfs.flags(fd), Some(O_APPEND | O_RDONLY));
         vfs.close(fd).unwrap();
@@ -834,5 +1044,26 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(download);
         let _ = std::fs::remove_dir_all(savedata);
+    }
+
+    #[test]
+    fn savedata_slot_mount_keeps_a_stable_title_root() {
+        let root = temp_dir("savedata-slots");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_savedata_directory(&root);
+
+        let slot_path = vfs.mount_savedata_slot("slot00000001@world").unwrap();
+        assert_eq!(slot_path, root.join("slot00000001@world"));
+        assert_eq!(vfs.savedata_root(), root);
+        assert_eq!(
+            vfs.resolve_path("/savedata0/level.dat"),
+            Some(root.join("slot00000001@world/level.dat"))
+        );
+        assert!(vfs.mount_savedata_slot("../escape").is_err());
+        assert!(vfs.mount_savedata_slot("nested/escape").is_err());
+
+        vfs.unmount_savedata_slot();
+        assert_eq!(vfs.resolve_path("/savedata0"), Some(root.clone()));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -47,16 +47,28 @@ pub enum AgcExecError {
 /// Process-global session: lazy Vulkan bring-up + last rendered image.
 pub struct AgcGpuSession {
     backend: Mutex<Option<VulkanBackend>>,
+    /// GPU register state persists across queue submissions. AGC commonly
+    /// submits state-only DCBs before a later draw-only DCB.
+    command_processor: Mutex<CommandProcessor>,
     last_image: Mutex<Option<RenderedImage>>,
     draw_count: Mutex<u64>,
+    /// ShaderMemory Phase 2: guest shader fetch+translate results, shared
+    /// across DCBs so per-frame re-binds hit the cache instead of
+    /// re-translating (and failures warn once per distinct shader, ever).
+    shader_cache: Mutex<crate::shader_fetch::ShaderTranslateCache>,
+    /// Draws skipped because a bound guest shader failed translation.
+    shader_skip_count: Mutex<u64>,
 }
 
 impl AgcGpuSession {
     fn new() -> Self {
         Self {
             backend: Mutex::new(None),
+            command_processor: Mutex::new(CommandProcessor::new()),
             last_image: Mutex::new(None),
             draw_count: Mutex::new(0),
+            shader_cache: Mutex::new(crate::shader_fetch::ShaderTranslateCache::new()),
+            shader_skip_count: Mutex::new(0),
         }
     }
 
@@ -69,6 +81,16 @@ impl AgcGpuSession {
     /// How many PM4-triggered draws have completed successfully.
     pub fn draw_count(&self) -> u64 {
         *self.draw_count.lock()
+    }
+
+    /// Guest shader fetch/translate counters (ShaderMemory Phase 2).
+    pub fn shader_stats(&self) -> crate::shader_fetch::ShaderCacheStats {
+        self.shader_cache.lock().stats()
+    }
+
+    /// Draws skipped because a bound guest shader failed translation.
+    pub fn shader_skip_count(&self) -> u64 {
+        *self.shader_skip_count.lock()
     }
 
     /// Last image produced by a draw-bearing DCB, if any.
@@ -99,6 +121,22 @@ impl AgcGpuSession {
     /// registers cannot be honoured (the error names the register), or
     /// [`AgcExecError::Gpu`] if Vulkan is unavailable.
     pub fn execute_dcb_cp(&self, words: &[u32]) -> Result<Option<RenderedImage>, AgcExecError> {
+        let decoded = agc::decode_submission(words)?;
+        let mut cp = self.command_processor.lock();
+
+        // State-only DCBs are still real GPU work. Process them without
+        // forcing Vulkan initialization so their register writes are latched
+        // for the next submission.
+        if decoded.draw_packets == 0 {
+            let mut sink = StateOnlySink;
+            cp.run_with_memory(
+                words,
+                &mut sink,
+                Some(&crate::guest_mem::IdentityGuestMemory),
+            )?;
+            return Ok(None);
+        }
+
         self.ensure_backend()?;
         let guard = self.backend.lock();
         let backend = guard
@@ -108,17 +146,54 @@ impl AgcGpuSession {
             GpuError::VulkanInitFailed("backend not initialized — call init() first".to_owned())
         })?;
 
-        let mut sink = OffscreenDrawSink::new(device);
-        let mut cp = CommandProcessor::new();
-        cp.run(words, &mut sink)?;
+        let mut cache = self.shader_cache.lock();
+        let mut sink = OffscreenDrawSink::new(device, &mut cache);
+        // Indirect register/draw packets carry guest pointers; the identity
+        // map makes them host-readable (VirtualQuery-validated).
+        let run = cp.run_with_memory(
+            words,
+            &mut sink,
+            Some(&crate::guest_mem::IdentityGuestMemory),
+        );
+        let shader_state = cp.get_sh_ctx().clone();
 
         let drawn = sink.draws;
-        let image = sink.last;
+        let shader_skips = sink.shader_skips;
+        let sink_skip_reason = sink.last_shader_skip_reason.clone();
+        let image = sink.last.take();
+        drop(sink);
+        drop(cache);
         drop(guard);
+        if shader_skips > 0 {
+            let total = {
+                let mut skips = self.shader_skip_count.lock();
+                *skips += shader_skips;
+                *skips
+            };
+            if total == shader_skips || total.is_power_of_two() {
+                warn!(
+                    total_shader_skips = total,
+                    reason = sink_skip_reason.as_deref().unwrap_or("unknown"),
+                    vs_addr = format_args!("{:#x}", shader_state.vs.vs_regs.data_addr),
+                    es_addr = format_args!("{:#x}", shader_state.vs.es_regs.data_addr),
+                    gs_addr = format_args!("{:#x}", shader_state.vs.gs_regs.data_addr),
+                    gs_checksum = format_args!("{:#x}", shader_state.vs.gs_regs.chksum),
+                    ps_addr = format_args!("{:#x}", shader_state.ps.ps_regs.data_addr),
+                    stats = ?self.shader_stats(),
+                    "AGC draws skipped because bound shader state is not renderable"
+                );
+            }
+        }
+        run?;
 
         if let Some(image) = image {
             *self.last_image.lock() = Some(image.clone());
-            *self.draw_count.lock() += drawn;
+            let count = {
+                let mut draws = self.draw_count.lock();
+                *draws += drawn;
+                *draws
+            };
+            maybe_dump_frame(&image, count);
             return Ok(Some(image));
         }
         debug!("AGC DCB ran through the command processor without a draw");
@@ -194,6 +269,58 @@ impl AgcGpuSession {
             Ok(None) => {}
             Err(e) => warn!(error = %e, "AGC DCB draw skipped — Vulkan unavailable or failed"),
         }
+    }
+}
+
+/// A state-only submission must never reach a draw. The standalone decoder
+/// classified the DCB before this sink is installed; an unexpected draw means
+/// the two walkers disagree and is a named error.
+struct StateOnlySink;
+
+impl kyty_graphics::run::DrawSink for StateOnlySink {
+    fn draw_index_auto(
+        &mut self,
+        _ctx: &kyty_graphics::hw_regs::Context,
+        _ucfg: &kyty_graphics::hw_regs::UserConfig,
+        _sh: &kyty_graphics::hw_regs::Shader,
+        _index_count: u32,
+        _flags: u32,
+    ) -> Result<(), kyty_graphics::run::DrawError> {
+        Err(kyty_graphics::run::DrawError(
+            "AGC decoder classified a draw-bearing DCB as state-only".to_owned(),
+        ))
+    }
+}
+
+/// Write draw output to disk when `XPS5X_DUMP_FRAMES` names a directory —
+/// the only way to *see* what a headless `--run-eboot` title actually
+/// rendered. Binary PPM (P6), alpha dropped.
+///
+/// Throttled: the first 8 draws, then powers of two — a title at 60 fps
+/// would otherwise write gigabytes and turn the observation into the
+/// bottleneck. A failed write logs and is otherwise ignored: frame dumping
+/// is diagnostics, never a reason to fail a submit.
+fn maybe_dump_frame(image: &RenderedImage, draw_index: u64) {
+    let Ok(dir) = std::env::var("XPS5X_DUMP_FRAMES") else {
+        return;
+    };
+    if dir.is_empty() || (draw_index > 8 && !draw_index.is_power_of_two()) {
+        return;
+    }
+    let path = std::path::Path::new(&dir).join(format!("frame_{draw_index:06}.ppm"));
+    let mut ppm = format!("P6\n{} {}\n255\n", image.width, image.height).into_bytes();
+    ppm.reserve(image.pixels.len() / 4 * 3);
+    for rgba in image.pixels.chunks_exact(4) {
+        ppm.extend_from_slice(&rgba[..3]);
+    }
+    match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &ppm)) {
+        Ok(()) => tracing::info!(
+            path = %path.display(),
+            width = image.width,
+            height = image.height,
+            "dumped rendered frame"
+        ),
+        Err(e) => warn!(error = %e, path = %path.display(), "frame dump failed"),
     }
 }
 
@@ -378,6 +505,43 @@ mod tests {
             .expect("mirror DCB");
         let (_, _, left, right, ..) = probe.seen.expect("draw reached the sink");
         assert_eq!((left, right), (48, 96), "one register value flips the half");
+    }
+
+    /// Register state belongs to the GPU queue, not to one submitted DCB.
+    /// Retail AGC emits state-only setup buffers followed by draw-only buffers;
+    /// constructing a fresh command processor per submit loses every shader and
+    /// render-target bind before the draw arrives.
+    #[test]
+    fn gpu_session_preserves_register_state_across_submissions() {
+        let complete = build_cp_draw_dcb(96, 48, ScissorHalf::Left);
+        let draw_dwords = 7;
+        let split = complete.len() - draw_dwords;
+        let state_only = &complete[..split];
+        let draw_only = &complete[split..];
+        assert_eq!(
+            agc::decode_submission(state_only)
+                .expect("state DCB")
+                .draw_packets,
+            0
+        );
+        assert_eq!(
+            agc::decode_submission(draw_only)
+                .expect("draw DCB")
+                .draw_packets,
+            1
+        );
+
+        let session = AgcGpuSession::new();
+        match session.execute_dcb_cp(state_only) {
+            Ok(None) => {}
+            Err(AgcExecError::Gpu(_)) => return, // Vulkan-less CI host.
+            other => panic!("state-only submit should not draw: {other:?}"),
+        }
+        let image = session
+            .execute_dcb_cp(draw_only)
+            .expect("draw-only DCB must inherit the setup DCB")
+            .expect("persistent state reaches a real draw");
+        assert_eq!((image.width, image.height), (96, 48));
     }
 
     /// The M2 fixture DCB must not reach a sink through a real command

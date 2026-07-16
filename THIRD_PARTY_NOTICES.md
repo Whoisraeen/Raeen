@@ -21,6 +21,11 @@ proprietary SDK/headers, using only the community sources credited below.
   into XPS5X. The MIT license permits use, modification, and redistribution of
   such derived work provided the copyright notice below is retained — which
   this file does.
+- **Directly ported data:** the AGC Gen5 register-default tables in
+  `crates/xps5x-hle/src/libsce_agc_reg_defaults.rs` (served by
+  `sceAgcGetRegisterDefaults2[Internal]`) are a faithful port of Kyty's
+  `Graphics.cpp` `g_cx/sh/uc_reg_info1/2` tables with register names resolved
+  against Kyty's `Pm4.h`.
 
 MIT is compatible with GPL-2.0: MIT-derived portions may be combined into this
 GPL-2.0-only work, and this notice preserves the required MIT attribution for
@@ -106,6 +111,11 @@ attribution as that license requires.
 Unlike the clean-room reference sources above (studied but never linked),
 these crates.io dependencies are compiled into XPS5X (or its test binaries).
 Only licenses compatible with GPL-2.0-only are used.
+
+- **iced-x86** — https://github.com/icedland/iced — MIT, used by the module
+  linker to identify real x86-64 `syscall` instructions in executable guest
+  segments. Those instructions are trapped into the Orbis syscall dispatcher
+  so a PS5 syscall number can never be executed against the Windows kernel.
 
 - **rspirv** — https://github.com/gfx-rs/rspirv — dual MIT / Apache-2.0, used
   here under its **MIT** option (Apache-2.0 is *not* GPLv2-linking-compatible;

@@ -39,6 +39,193 @@ pub fn register(registry: &HleRegistry) {
         hle_inet_ntop,
     );
     registry.register("libkernel", "htons", hle_htons);
+
+    // POSIX socket surface the measured title (Minecraft) imports from
+    // libScePosix. All offline: nothing ever connects, arrives, or becomes
+    // readable — see the per-function notes.
+    registry.register("libScePosix", "accept", hle_accept);
+    registry.register("libScePosix", "listen", hle_listen);
+    registry.register("libScePosix", "recv", hle_recv);
+    registry.register("libScePosix", "recvfrom", hle_recv);
+    registry.register("libScePosix", "send", hle_send);
+    registry.register("libScePosix", "sendto", hle_send);
+    registry.register("libScePosix", "shutdown", hle_shutdown);
+    registry.register("libScePosix", "getpeername", hle_getpeername);
+    registry.register("libScePosix", "getsockopt", hle_getsockopt);
+    registry.register("libScePosix", "select", hle_select);
+}
+
+/// `EWOULDBLOCK` on FreeBSD/Orbis (35).
+const EWOULDBLOCK: i32 = 35;
+
+/// `listen(fd, backlog)`: accept the request for an offline socket. Nothing
+/// can ever connect, so a listening socket simply never becomes ready.
+fn hle_listen(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    if !ctx.kernel.kernel_sockets.contains_key(&fd) {
+        return MINUS_ONE;
+    }
+    debug!("listen(fd={fd:#x}) -> OK (offline: no peer can ever connect)");
+    OK
+}
+
+/// `accept(fd, addr, addrlen)`: no host connectivity means no pending
+/// connection, ever — report `EWOULDBLOCK` like a non-blocking listener with
+/// an empty backlog rather than blocking a guest thread forever.
+fn hle_accept(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    if !ctx.kernel.kernel_sockets.contains_key(&fd) {
+        return MINUS_ONE;
+    }
+    debug!("accept(fd={fd:#x}) -> EWOULDBLOCK (offline)");
+    crate::libkernel::set_guest_errno(ctx, EWOULDBLOCK);
+    MINUS_ONE
+}
+
+/// `recv(fd, buf, len, flags)` / `recvfrom(..., addr, addrlen)`: no data can
+/// ever arrive on an offline socket — `EWOULDBLOCK`, never a fake payload and
+/// never a blocking wait that nothing can satisfy.
+fn hle_recv(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    if !ctx.kernel.kernel_sockets.contains_key(&fd) {
+        return MINUS_ONE;
+    }
+    debug!("recv/recvfrom(fd={fd:#x}) -> EWOULDBLOCK (offline)");
+    crate::libkernel::set_guest_errno(ctx, EWOULDBLOCK);
+    MINUS_ONE
+}
+
+/// `send(fd, buf, len, flags)` / `sendto(..., addr, addrlen)`: accept the
+/// bytes and report them "sent" (into the void). The payload is validated as
+/// readable guest memory so a wild pointer still faults loudly here instead
+/// of corrupting later.
+fn hle_send(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    let buf = args.get(1).copied().unwrap_or(0);
+    let len = args.get(2).copied().unwrap_or(0);
+    if !ctx.kernel.kernel_sockets.contains_key(&fd) {
+        return MINUS_ONE;
+    }
+    // Bounded validation read: confirm the payload is real guest memory.
+    let probe = len.min(4096);
+    if probe != 0 {
+        let Ok(probe) = usize::try_from(probe) else {
+            return MINUS_ONE;
+        };
+        let mut bytes = vec![0u8; probe];
+        if buf == 0 || !ctx.mem.read(buf, &mut bytes) {
+            return MINUS_ONE;
+        }
+    }
+    debug!("send/sendto(fd={fd:#x}, len={len:#x}) -> discarded (offline)");
+    len
+}
+
+/// `shutdown(fd, how)`: nothing is connected, so both directions are already
+/// shut; accept the call.
+fn hle_shutdown(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    if !ctx.kernel.kernel_sockets.contains_key(&fd) {
+        return MINUS_ONE;
+    }
+    debug!("shutdown(fd={fd:#x}) -> OK (offline)");
+    OK
+}
+
+/// `getpeername(fd, addr, addrlen)`: an offline socket has no peer; write a
+/// zeroed `sockaddr_in` (family only) and report success — callers that only
+/// log the peer keep working, and the all-zero address is inert.
+fn hle_getpeername(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    let sockaddr = args.get(1).copied().unwrap_or(0);
+    let addrlen_ptr = args.get(2).copied().unwrap_or(0);
+    if !ctx.kernel.kernel_sockets.contains_key(&fd) {
+        return MINUS_ONE;
+    }
+    let mut lenbuf = [0u8; 4];
+    if addrlen_ptr == 0 || !ctx.mem.read(addrlen_ptr, &mut lenbuf) {
+        return MINUS_ONE;
+    }
+    let addrlen = i32::from_le_bytes(lenbuf);
+    if addrlen < 8 || sockaddr == 0 {
+        return MINUS_ONE;
+    }
+    let mut sa = [0u8; 16];
+    sa[0] = 16;
+    sa[1] = AF_INET as u8;
+    let write_len = (addrlen as usize).min(16);
+    if !ctx.mem.write(sockaddr, &sa[..write_len])
+        || !ctx
+            .mem
+            .write(addrlen_ptr, &(write_len as i32).to_le_bytes())
+    {
+        return MINUS_ONE;
+    }
+    OK
+}
+
+/// `getsockopt(fd, level, optname, optval, optlen)`: report a zero-filled
+/// option value (bounded). Zero is the honest answer for the options titles
+/// poll on an offline socket: no error pending (`SO_ERROR`), no bytes ready.
+fn hle_getsockopt(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    let optval = args.get(3).copied().unwrap_or(0);
+    let optlen_ptr = args.get(4).copied().unwrap_or(0);
+    if !ctx.kernel.kernel_sockets.contains_key(&fd) {
+        return MINUS_ONE;
+    }
+    let mut lenbuf = [0u8; 4];
+    if optlen_ptr == 0 || !ctx.mem.read(optlen_ptr, &mut lenbuf) {
+        return MINUS_ONE;
+    }
+    let optlen = i32::from_le_bytes(lenbuf).clamp(0, 128) as usize;
+    if optlen != 0 && (optval == 0 || !ctx.mem.write(optval, &vec![0u8; optlen])) {
+        return MINUS_ONE;
+    }
+    if !ctx.mem.write(optlen_ptr, &(optlen as i32).to_le_bytes()) {
+        return MINUS_ONE;
+    }
+    OK
+}
+
+/// `select(nfds, readfds, writefds, exceptfds, timeout)`: honor the timeout
+/// (bounded like `nanosleep`), then report **zero descriptors ready** with
+/// all supplied fd sets cleared — the honest offline answer (nothing readable,
+/// nothing exceptional; write-readiness is deliberately not faked so a title
+/// polls instead of streaming into a void).
+fn hle_select(ctx: &HleContext, args: &[u64]) -> u64 {
+    let nfds = args.first().copied().unwrap_or(0);
+    let timeout_ptr = args.get(4).copied().unwrap_or(0);
+
+    // Clear the words covering nfds descriptors in each non-null set.
+    let set_bytes = (nfds.min(1024).div_ceil(8) as usize).next_multiple_of(8);
+    for set_ptr in [args.get(1), args.get(2), args.get(3)] {
+        let ptr = set_ptr.copied().unwrap_or(0);
+        if ptr != 0 && set_bytes != 0 && !ctx.mem.write(ptr, &vec![0u8; set_bytes]) {
+            return MINUS_ONE;
+        }
+    }
+
+    // Sleep out (a bounded slice of) the caller's timeout so a select-poll
+    // loop does not become a busy spin.
+    const MAX_SLEEP_MS: u64 = 100;
+    let mut sleep_ms = MAX_SLEEP_MS;
+    if timeout_ptr != 0 {
+        let mut tv = [0u8; 16];
+        if ctx.mem.read(timeout_ptr, &mut tv) {
+            let secs = i64::from_le_bytes(tv[..8].try_into().expect("fixed slice")).max(0) as u64;
+            let usecs = i64::from_le_bytes(tv[8..].try_into().expect("fixed slice")).max(0) as u64;
+            sleep_ms = secs
+                .saturating_mul(1000)
+                .saturating_add(usecs / 1000)
+                .min(MAX_SLEEP_MS);
+        }
+    }
+    if sleep_ms > 0 && !ctx.guest_threads.process_is_terminating() {
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+    }
+    debug!("select(nfds={nfds}) -> 0 ready (offline; slept {sleep_ms}ms)");
+    0
 }
 
 /// `socket(domain, type, protocol)`: hand back a fresh offline socket fd.
@@ -302,6 +489,74 @@ mod tests {
         let mut b = [0xAAu8; 8];
         assert!(ctx.mem.read(0x40, &mut b));
         assert_eq!(b, [0u8; 8]);
+    }
+
+    #[test]
+    fn offline_posix_socket_surface_never_blocks_and_never_connects() {
+        use crate::GuestMemory;
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        // Nonzero base: the errno slot is arena-allocated, and address 0 would
+        // read as "no errno slot".
+        let alloc = crate::TestAllocator::new(0x800);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let fd = hle_socket(&ctx, &[]);
+
+        // listen accepts; accept/recv report EWOULDBLOCK instead of blocking.
+        assert_eq!(hle_listen(&ctx, &[fd, 8]), OK);
+        assert_eq!(hle_accept(&ctx, &[fd, 0, 0]), MINUS_ONE);
+        assert_eq!(hle_recv(&ctx, &[fd, 0x100, 16, 0]), MINUS_ONE);
+        let errno_slot = crate::libkernel::hle_error_addr(&ctx, &[]);
+        let mut errno = [0u8; 4];
+        assert!(mem.read(errno_slot, &mut errno));
+        assert_eq!(i32::from_le_bytes(errno), EWOULDBLOCK);
+
+        // send pretends success for a real buffer, faults a wild one.
+        assert!(mem.write(0x100, b"PING"));
+        assert_eq!(hle_send(&ctx, &[fd, 0x100, 4, 0]), 4);
+        assert_eq!(hle_send(&ctx, &[fd, 0xFFFF_F000, 4, 0]), MINUS_ONE);
+
+        // shutdown succeeds; getpeername writes a zeroed sockaddr.
+        assert_eq!(hle_shutdown(&ctx, &[fd, 2]), OK);
+        assert!(mem.write(0x200, &16i32.to_le_bytes()));
+        assert_eq!(hle_getpeername(&ctx, &[fd, 0x208, 0x200]), OK);
+        let mut sa = [0xFFu8; 8];
+        assert!(mem.read(0x208, &mut sa));
+        assert_eq!(sa[1], AF_INET as u8);
+        assert_eq!(&sa[2..8], &[0u8; 6]);
+
+        // getsockopt zero-fills the option value (e.g. SO_ERROR = no error).
+        assert!(mem.write(0x240, &4i32.to_le_bytes()));
+        assert!(mem.write(0x248, &[0xFFu8; 4]));
+        assert_eq!(
+            hle_getsockopt(&ctx, &[fd, 0xffff, 0x1007, 0x248, 0x240]),
+            OK
+        );
+        let mut opt = [0xFFu8; 4];
+        assert!(mem.read(0x248, &mut opt));
+        assert_eq!(opt, [0u8; 4]);
+
+        // select clears the supplied fd sets and reports zero ready.
+        assert!(mem.write(0x300, &[0xFFu8; 16]));
+        assert!(mem.write(0x310, &0i64.to_le_bytes())); // timeout 0s
+        assert!(mem.write(0x318, &0i64.to_le_bytes())); // + 0us
+        assert_eq!(hle_select(&ctx, &[64, 0x300, 0, 0, 0x310]), 0);
+        let mut set = [0xFFu8; 8];
+        assert!(mem.read(0x300, &mut set));
+        assert_eq!(set, [0u8; 8]);
+
+        // Every call on an unknown fd is -1.
+        for result in [
+            hle_listen(&ctx, &[0x999, 8]),
+            hle_accept(&ctx, &[0x999, 0, 0]),
+            hle_recv(&ctx, &[0x999, 0x100, 4, 0]),
+            hle_send(&ctx, &[0x999, 0x100, 4, 0]),
+            hle_shutdown(&ctx, &[0x999, 2]),
+            hle_getpeername(&ctx, &[0x999, 0x208, 0x200]),
+            hle_getsockopt(&ctx, &[0x999, 0, 0, 0x248, 0x240]),
+        ] {
+            assert_eq!(result, MINUS_ONE);
+        }
     }
 
     #[test]
