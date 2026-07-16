@@ -889,6 +889,35 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
             snapshot.r11,
         );
 
+        // Which module was the guest actually in? A bare rip names nothing in a
+        // multi-module process: eyeballing 0x1000111c640c against the wrong
+        // dependency's base twice put this investigation in the eboot when the
+        // fault was in libRenoirCore.PS5.prx all along. The kernel's unwind table
+        // already carries every loaded module's [start, end) — it is populated
+        // for `sceKernelGetModuleInfoForUnwind` — so the answer costs one lookup.
+        //
+        // SAFETY: `ctx.kernel` is the live kernel installed by `run` for this
+        // guarded call, on the same thread, and this diagnostic runs
+        // synchronously before that runner drops it.
+        let kernel = unsafe { &*ctx.kernel };
+        match kernel.unwind_module_for_addr(snapshot.rip) {
+            Some(module) => tracing::warn!(
+                "fault module: {} at +{:#x} (module {:#x}..{:#x})",
+                module.name,
+                snapshot.rip - module.start,
+                module.start,
+                module.end
+            ),
+            // Not in any loaded module: the guest was executing somewhere it was
+            // never given code — a wild jump, or a call through a slot holding
+            // something that is not a function.
+            None => tracing::warn!(
+                "fault module: rip {:#x} is in NO loaded module — the guest jumped somewhere it \
+                 has no code",
+                snapshot.rip
+            ),
+        }
+
         // The GuestMemory object is owned by the still-live process runner;
         // this diagnostic runs synchronously before that runner drops it and
         // after the VEH has stopped consulting the active context.
