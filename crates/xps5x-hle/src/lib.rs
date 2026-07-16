@@ -266,6 +266,10 @@ pub struct HleContext<'a> {
     /// guest* a call like `sceKernelDebugRaiseException` originated, which
     /// `--dump-vaddr` then turns into the failing assert's code bytes.
     pub caller_return_addr: u64,
+    /// The guest stack pointer at the trap (`rsp`, pointing at the pushed
+    /// return address). Diagnostic only (0 when unavailable): lets a handler
+    /// walk the caller's stack for a return-address chain.
+    pub caller_rsp: u64,
 }
 
 /// HLE function signature: takes a dispatch context and integer arguments,
@@ -657,6 +661,7 @@ pub(crate) fn test_ctx<'a>(
         guest_calls: &NO_GUEST_CALLS,
         guest_threads: &NO_GUEST_THREADS,
         caller_return_addr: 0,
+        caller_rsp: 0,
     }
 }
 

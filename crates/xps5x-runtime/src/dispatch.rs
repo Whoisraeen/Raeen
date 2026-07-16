@@ -1874,6 +1874,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 guest_calls: ctx,
                 guest_threads: ctx,
                 caller_return_addr,
+                caller_rsp: context.Rsp,
             };
             ctx.active_hle
                 .set(Some((idx, args[..6].try_into().unwrap())));

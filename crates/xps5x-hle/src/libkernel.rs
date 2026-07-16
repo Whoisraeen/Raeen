@@ -1918,6 +1918,27 @@ fn hle_debug_raise_exception(ctx: &HleContext, args: &[u64]) -> u64 {
         args.get(1).copied().unwrap_or(0),
         ctx.caller_return_addr,
     );
+    // Walk the caller's stack for return addresses into the loaded image, so
+    // the call chain INTO libc's terminate handler (and thus the throw
+    // origin) is greppable. Diagnostic only; bounded and read-only.
+    if ctx.caller_rsp != 0 {
+        let mut chain = Vec::new();
+        for i in 0..256u64 {
+            let mut buf = [0u8; 8];
+            if !ctx.mem.read(ctx.caller_rsp.wrapping_add(i * 8), &mut buf) {
+                break;
+            }
+            let val = u64::from_le_bytes(buf);
+            // Return addresses land inside the composed guest image
+            // (0x1000_0000_0000 .. +~300 MB); stack data / small ints don't.
+            if (0x1000_0000_0000..0x1000_2000_0000).contains(&val) {
+                chain.push(format!("{val:#x}"));
+            }
+        }
+        if !chain.is_empty() {
+            warn!("  fatal-thread stack code-addrs: {}", chain.join(" "));
+        }
+    }
     // On hardware this never returns — the process is killed. Returning here
     // is measurably worse than stopping the thread: the caller's code ends at
     // the call instruction (noreturn), so a return "executes" whatever bytes
