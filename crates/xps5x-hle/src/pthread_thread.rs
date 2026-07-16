@@ -104,6 +104,12 @@ fn hle_rename(ctx: &HleContext, args: &[u64]) -> u64 {
             let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
             if let Ok(name) = std::str::from_utf8(&buf[..end]) {
                 info!(thread, name, "guest pthread named");
+                // Titles name the pthread HANDLE, but diagnostics look
+                // threads up by the id the caller runs as — for self-renames
+                // (the common case) that is the current thread.
+                ctx.kernel
+                    .thread_names
+                    .insert(ctx.guest_threads.current_thread(), name.to_owned());
             }
         }
     }

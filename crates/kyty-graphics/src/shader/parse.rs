@@ -1093,7 +1093,7 @@ fn shader_parse_vop1(
         0x05 => inst.type_ = T::VCvtF32I32,
         0x06 => inst.type_ = T::VCvtF32U32,
         0x07 => inst.type_ = T::VCvtU32F32,
-        0x08 => return Err(ni(dst, S, "v_cvt_i32_f32", opcode, pc, b0)),
+        0x08 => inst.type_ = T::VCvtI32F32,
         0x09 => return Err(ni(dst, S, "v_mov_fed_b32", opcode, pc, b0)),
         0x0a => return Err(ni(dst, S, "v_cvt_f16_f32", opcode, pc, b0)),
         0x0b => inst.type_ = T::VCvtF32F16,
@@ -1286,10 +1286,10 @@ fn shader_parse_vop2(
 
     match opcode {
         0x00 => {
-            // Kyty L1130: EXIT_NOT_IMPLEMENTED(next_gen).
-            if next_gen {
-                return Err(feature(S, "v_cndmask_b32 (op 0x00) on next_gen", pc));
-            }
+            // Kyty L1130 punts next_gen 0x00, but the measured RDNA2 menu CS
+            // emits v_cndmask_b32 there with the plain VOP2 layout (dst,
+            // vsrc0, vsrc1, implicit VCC) — identical to the legacy form and
+            // to Kyty's own next_gen 0x01 handler below.
             inst.type_ = T::VCndmaskB32;
             inst.format = F::VdstVsrc0Vsrc1Smask2;
             inst.src[2].type_ = O::VccLo;
@@ -2256,7 +2256,12 @@ fn shader_parse_smem(
             inst.src[0].size = 2;
             inst.dst.size = 4;
         }
-        0x03 => return Err(ni(dst, S, "s_load_dwordx8", opcode, pc, b0)),
+        0x03 => {
+            inst.type_ = T::SLoadDwordx8;
+            inst.format = F::Sdst8SbaseSoffset;
+            inst.src[0].size = 2;
+            inst.dst.size = 8;
+        }
         0x04 => return Err(ni(dst, S, "s_load_dwordx16", opcode, pc, b0)),
         0x08 => {
             inst.type_ = T::SBufferLoadDword;
@@ -2264,14 +2269,24 @@ fn shader_parse_smem(
             inst.src[0].size = 4;
             inst.dst.size = 1;
         }
-        0x09 => return Err(ni(dst, S, "s_buffer_load_dwordx2", opcode, pc, b0)),
+        0x09 => {
+            inst.type_ = T::SBufferLoadDwordx2;
+            inst.format = F::Sdst2SvSoffset;
+            inst.src[0].size = 4;
+            inst.dst.size = 2;
+        }
         0x0a => {
             inst.type_ = T::SBufferLoadDwordx4;
             inst.format = F::Sdst4SvSoffset;
             inst.src[0].size = 4;
             inst.dst.size = 4;
         }
-        0x0b => return Err(ni(dst, S, "s_buffer_load_dwordx8", opcode, pc, b0)),
+        0x0b => {
+            inst.type_ = T::SBufferLoadDwordx8;
+            inst.format = F::Sdst8SvSoffset;
+            inst.src[0].size = 4;
+            inst.dst.size = 8;
+        }
         0x0c => {
             inst.type_ = T::SBufferLoadDwordx16;
             inst.format = F::Sdst16SvSoffset;

@@ -181,6 +181,9 @@ pub enum ShaderInstructionType {
     VCvtF32Ubyte1,
     VCvtF32Ubyte2,
     VCvtF32Ubyte3,
+    /// VOP1 0x8: `vdst = (int)vsrc0` (float→signed int). The signed sibling
+    /// of `VCvtU32F32`, measured in Minecraft's menu CS.
+    VCvtI32F32,
     VCvtPkrtzF16F32,
     VCvtU32F32,
     VExpF32,

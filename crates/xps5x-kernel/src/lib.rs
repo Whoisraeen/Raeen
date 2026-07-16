@@ -131,6 +131,9 @@ pub struct OrbisKernel {
     next_module_id: RwLock<u32>,
     /// Syscall statistics (for debugging).
     pub syscall_stats: DashMap<u64, u64>,
+    /// Guest thread names (`scePthreadRename`), keyed by guest thread id —
+    /// purely diagnostic, so a dying thread can be identified by name.
+    pub thread_names: DashMap<u64, String>,
     /// Guest address of the main module's `PT_SCE_PROCPARAM` block, set by
     /// the runtime at load time (0 = none). `sceKernelGetProcParam` returns
     /// this so a title reads its real process-parameter block (SDK version,
@@ -519,6 +522,7 @@ impl OrbisKernel {
             lle_module_exports: DashMap::new(),
             next_module_id: RwLock::new(1),
             syscall_stats: DashMap::new(),
+            thread_names: DashMap::new(),
             proc_param_addr: std::sync::atomic::AtomicU64::new(0),
             unwind_modules: RwLock::new(Vec::new()),
             pad_state: parking_lot::Mutex::new(None),

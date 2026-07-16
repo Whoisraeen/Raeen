@@ -3772,7 +3772,6 @@ fn recompile_swqm_b64(
 
 /// Kyty: `Recompile_SBufferLoadDwordx2_Sdst2SvSoffset` (ShaderSpirv.cpp
 /// L3831).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_sbuffer_load_dwordx2(
     index: u32,
     code: &ShaderCode,
@@ -3827,7 +3826,6 @@ fn recompile_sbuffer_load_dwordx2(
 /// Shared body of `Recompile_SBufferLoadDwordx8/x16_Sdst*SvSoffset`
 /// (ShaderSpirv.cpp L3928/L3976) — identical upstream except for N and the
 /// `sbuffer_load_dword_N` callee.
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn sbuffer_load_dword_n(
     index: u32,
     code: &ShaderCode,
@@ -3885,7 +3883,6 @@ fn sbuffer_load_dword_n(
 
 /// Kyty: `Recompile_SBufferLoadDwordx8_Sdst8SvSoffset` (ShaderSpirv.cpp
 /// L3928).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_sbuffer_load_dwordx8(
     index: u32,
     code: &ShaderCode,
@@ -3907,7 +3904,6 @@ fn recompile_sbuffer_load_dwordx8(
 
 /// Kyty: `Recompile_SBufferLoadDwordx16_Sdst16SvSoffset` (ShaderSpirv.cpp
 /// L3976).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_sbuffer_load_dwordx16(
     index: u32,
     code: &ShaderCode,
@@ -4327,7 +4323,6 @@ fn recompile_vcmpx_xxx_u32(
 
 /// Kyty: `Recompile_VCmpx_XXX_F32_SmaskVsrc0Vsrc1` (ShaderSpirv.cpp L5148).
 /// XXX: Neq, Gt, Lt (comparison via `param[0]`; also writes EXEC).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_vcmpx_xxx_f32(
     index: u32,
     code: &ShaderCode,
@@ -5137,10 +5132,10 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     ni("Recompile_ImageStoreMip_Vdata4Vaddr4StDmaskF",    3173, T::ImageStoreMip,  F::Vdata4Vaddr4StDmaskF,   p1("")),
 
     f(recompile_sbuffer_load_dword,   T::SBufferLoadDword,   F::SdstSvSoffset,  p1("")),
-    ni("Recompile_SBufferLoadDwordx2_Sdst2SvSoffset",   3831, T::SBufferLoadDwordx2,  F::Sdst2SvSoffset,  p1("")),
+    f(recompile_sbuffer_load_dwordx2, T::SBufferLoadDwordx2, F::Sdst2SvSoffset, p1("")),
     f(recompile_sbuffer_load_dwordx4, T::SBufferLoadDwordx4, F::Sdst4SvSoffset, p1("")),
-    ni("Recompile_SBufferLoadDwordx8_Sdst8SvSoffset",   3928, T::SBufferLoadDwordx8,  F::Sdst8SvSoffset,  p1("")),
-    ni("Recompile_SBufferLoadDwordx16_Sdst16SvSoffset", 3976, T::SBufferLoadDwordx16, F::Sdst16SvSoffset, p1("")),
+    f(recompile_sbuffer_load_dwordx8, T::SBufferLoadDwordx8, F::Sdst8SvSoffset, p1("")),
+    f(recompile_sbuffer_load_dwordx16, T::SBufferLoadDwordx16, F::Sdst16SvSoffset, p1("")),
 
     f(recompile_scbranch_xxx_label, T::SCbranchExecz, F::Label, p2("%cc_u_<index> = OpLoad %uint %execz",  "%cc_b_<index> = OpINotEqual %bool %cc_u_<index> %uint_0")),
     f(recompile_scbranch_xxx_label, T::SCbranchScc0,  F::Label, p2("%cc_u_<index> = OpLoad %uint %scc",    "%cc_b_<index> = OpIEqual    %bool %cc_u_<index> %uint_0")),
@@ -5255,6 +5250,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_v_xxx_f32_svdst_svsrc0, T::VSqrtF32,  F::SVdstSVsrc0, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Sqrt %t0_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc0, T::VTruncF32, F::SVdstSVsrc0, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Trunc %t0_<index>")),
     f(recompile_vcvt_xxx_f32, T::VCvtU32F32, F::SVdstSVsrc0, p2("%t1_<index> = OpExtInst %float %GLSL_std_450 Trunc %t0_<index>", "%t2_<index> = OpConvertFToU %uint %t1_<index>")),
+    f(recompile_vcvt_xxx_f32, T::VCvtI32F32, F::SVdstSVsrc0, p2("%t1_<index> = OpExtInst %float %GLSL_std_450 Trunc %t0_<index>", "%t2_<index> = OpConvertFToS %int %t1_<index>")),
     f(recompile_vcvt_f32_xxx, T::VCvtF32F16,    F::SVdstSVsrc0, p2("%ts_<index> = OpExtInst %v2float %GLSL_std_450 UnpackHalf2x16 %t0_<index>", "%t_<index> = OpCompositeExtract %float %ts_<index> 0")),
     f(recompile_vcvt_f32_xxx, T::VCvtF32I32,    F::SVdstSVsrc0, p2("%ti_<index> = OpBitcast %int %t0_<index>", "%t_<index> = OpConvertSToF %float %ti_<index>")),
     f(recompile_vcvt_f32_xxx, T::VCvtF32U32,    F::SVdstSVsrc0, p1("%t_<index> = OpConvertUToF %float %t0_<index>")),
@@ -5314,9 +5310,9 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     ni("Recompile_VCmp_XXX_U32_SmaskVsrc0Vsrc1", 4990, T::VCmpLeU32,  F::SmaskVsrc0Vsrc1, p1("OpULessThanEqual")),
     ni("Recompile_VCmp_XXX_U32_SmaskVsrc0Vsrc1", 4990, T::VCmpLtU32,  F::SmaskVsrc0Vsrc1, p1("OpULessThan")),
     ni("Recompile_VCmp_XXX_U32_SmaskVsrc0Vsrc1", 4990, T::VCmpTU32,   F::SmaskVsrc0Vsrc1, p1("OpIEqual %bool %uint_0 %uint_0 ; ")),
-    ni("Recompile_VCmpx_XXX_F32_SmaskVsrc0Vsrc1", 5148, T::VCmpxNeqF32, F::SmaskVsrc0Vsrc1, p1("OpFUnordNotEqual")),
-    ni("Recompile_VCmpx_XXX_F32_SmaskVsrc0Vsrc1", 5148, T::VCmpxGtF32,  F::SmaskVsrc0Vsrc1, p1("OpFOrdGreaterThan")),
-    ni("Recompile_VCmpx_XXX_F32_SmaskVsrc0Vsrc1", 5148, T::VCmpxLtF32,  F::SmaskVsrc0Vsrc1, p1("OpFOrdLessThan")),
+    f(recompile_vcmpx_xxx_f32, T::VCmpxNeqF32, F::SmaskVsrc0Vsrc1, p1("OpFUnordNotEqual")),
+    f(recompile_vcmpx_xxx_f32, T::VCmpxGtF32,  F::SmaskVsrc0Vsrc1, p1("OpFOrdGreaterThan")),
+    f(recompile_vcmpx_xxx_f32, T::VCmpxLtF32,  F::SmaskVsrc0Vsrc1, p1("OpFOrdLessThan")),
     // Wired for the Minecraft menu CS (v_cmpx family; Kyty GCN semantics —
     // the comparison result lands in both the mask destination and EXEC; on
     // real RDNA2 cmpx writes EXEC only, the extra mask write is a documented
@@ -5539,16 +5535,16 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            211,
+            212,
             "204 Kyty rows plus SSubU32, SNop, and the RDNA2-only rows \
-             (VLshlAddU32, VCmpxLtU32, VAddNcU32, VSubNcU32, VSubrevNcU32)"
+             (VLshlAddU32, VCmpxLtU32, VAddNcU32, VSubNcU32, VSubrevNcU32, VCvtI32F32)"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 132,
+            implemented, 139,
             "C1 implemented subset plus title-driven ports"
         );
-        assert_eq!(ni, 79, "C2 remainder");
+        assert_eq!(ni, 73, "C2 remainder");
 
         // Kyty EXIT_IF(map->Contains(p)) — (type, format) keys are unique.
         let mut seen = std::collections::HashSet::new();

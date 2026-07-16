@@ -1905,9 +1905,15 @@ fn hle_reserve_virtual_range(ctx: &HleContext, args: &[u64]) -> u64 {
 /// whatever it does next (usually an exit path).
 fn hle_debug_raise_exception(ctx: &HleContext, args: &[u64]) -> u64 {
     let code = args.first().copied().unwrap_or(0);
+    let thread = ctx.guest_threads.current_thread();
+    let name = ctx
+        .kernel
+        .thread_names
+        .get(&thread)
+        .map_or_else(|| "<unnamed>".to_owned(), |entry| entry.clone());
     warn!(
-        "sceKernelDebugRaiseException(code={code:#x}, arg={:#x}) — guest reported a fatal \
-         condition; terminating the calling guest thread",
+        "sceKernelDebugRaiseException(code={code:#x}, arg={:#x}) on thread {thread} \
+         ('{name}') — guest reported a fatal condition; terminating the calling guest thread",
         args.get(1).copied().unwrap_or(0),
     );
     // On hardware this never returns — the process is killed. Returning here
