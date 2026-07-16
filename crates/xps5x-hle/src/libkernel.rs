@@ -499,7 +499,21 @@ fn hle_dlsym(ctx: &HleContext, args: &[u64]) -> u64 {
     let nid = u64::from_le_bytes(digest[..8].try_into().expect("SHA-1 has 20 bytes"));
     let symbol = String::from_utf8_lossy(&symbol_bytes);
     let Some(addr) = ctx.kernel.resolve_lle_export(handle, nid) else {
-        warn!("sceKernelDlsym(handle={handle}, symbol='{symbol}'): export not found — ENOENT");
+        // Say which of the two very different bugs this is. A handle with no
+        // exports at all was never wired up; a handle with many means the symbol
+        // genuinely is not in that module's export table — and an ENOENT alone
+        // cannot tell them apart, which is exactly how this failure was misread
+        // as a memory bug for two sessions.
+        match ctx.kernel.lle_export_count(handle) {
+            Some(count) => warn!(
+                "sceKernelDlsym(handle={handle}, symbol='{symbol}', nid={nid:#018x}): not among \
+                 that module's {count} export(s) — ENOENT"
+            ),
+            None => warn!(
+                "sceKernelDlsym(handle={handle}, symbol='{symbol}'): handle names NO registered \
+                 module — ENOENT"
+            ),
+        }
         return SCE_KERNEL_ERROR_ENOENT;
     };
     if !ctx.mem.write(addr_out, &addr.to_le_bytes()) {

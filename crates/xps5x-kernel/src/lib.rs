@@ -732,6 +732,18 @@ impl OrbisKernel {
             .and_then(|exports| exports.get(&nid).copied())
     }
 
+    /// How many exports a module handle carries, or `None` if the handle names
+    /// no registered module at all.
+    ///
+    /// Purely diagnostic, and the distinction is the whole point: a failed
+    /// `sceKernelDlsym` against a handle with *zero* exports means the module
+    /// was never wired up, while the same failure against a handle with *many*
+    /// means the symbol genuinely is not in its export table — two completely
+    /// different bugs that are indistinguishable from an `ENOENT` alone.
+    pub fn lle_export_count(&self, handle: u32) -> Option<usize> {
+        self.lle_module_exports.get(&handle).map(|e| e.len())
+    }
+
     /// Dispatch a syscall.
     pub fn dispatch_syscall(
         &self,
