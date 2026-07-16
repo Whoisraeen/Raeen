@@ -273,6 +273,69 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Diagnostic: `xps5x --dump-vaddr <eboot.bin> <hex-vaddr> [<len>]` prints
+    // hex + ASCII at a module-relative virtual address, straight from the
+    // parsed segments without executing anything.
+    //
+    // This exists because a fault report can only print what was in registers
+    // at the crash; the *static* strings an assert site references (its
+    // expression text, source-file path) live at RIP-relative addresses the
+    // report names but cannot read once the process is gone. This turns those
+    // offsets into the message the game was trying to log.
+    if let Some(pos) = args.iter().position(|a| a == "--dump-vaddr") {
+        let path = args
+            .get(pos + 1)
+            .ok_or_else(|| anyhow::anyhow!("--dump-vaddr requires a path to an eboot.bin"))?;
+        let vaddr = args
+            .get(pos + 2)
+            .ok_or_else(|| anyhow::anyhow!("--dump-vaddr requires a hex vaddr"))
+            .and_then(|s| {
+                u64::from_str_radix(s.trim_start_matches("0x"), 16)
+                    .map_err(|e| anyhow::anyhow!("bad vaddr {s:?}: {e}"))
+            })?;
+        let len = match args.get(pos + 3) {
+            Some(s) => s.parse::<usize>()?,
+            None => 256,
+        };
+        let bytes = std::fs::read(path)?;
+        let decrypted = xps5x_firmware::decrypt_self(&bytes, &xps5x_firmware::NoKeysProvider)?;
+        let module = xps5x_firmware::parse_sprx(&decrypted.elf)?;
+        let segment = module
+            .segments
+            .iter()
+            .find(|s| vaddr >= s.vaddr && vaddr < s.vaddr + s.mem_size)
+            .ok_or_else(|| anyhow::anyhow!("vaddr {vaddr:#x} is not in any PT_LOAD segment"))?;
+        let start = (vaddr - segment.vaddr) as usize;
+        let file_backed = segment.data.len().saturating_sub(start);
+        if file_backed == 0 {
+            println!(
+                "vaddr {vaddr:#x} is in BSS (zero-initialized) of segment {:#x}",
+                segment.vaddr
+            );
+            return Ok(());
+        }
+        let slice = &segment.data[start..start + len.min(file_backed)];
+        for (i, chunk) in slice.chunks(16).enumerate() {
+            let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+            let ascii: String = chunk
+                .iter()
+                .map(|&b| {
+                    if (0x20..0x7f).contains(&b) {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            println!(
+                "{:#014x}  {:<47}  {ascii}",
+                vaddr + (i * 16) as u64,
+                hex.join(" ")
+            );
+        }
+        return Ok(());
+    }
+
     // Diagnostic: `xps5x --missing-nids <eboot.bin>` loads a title exactly as
     // `--run-eboot` does but stops before executing, and prints every DISTINCT
     // import nothing resolves — encoded NID, raw NID, and library — grouped by
