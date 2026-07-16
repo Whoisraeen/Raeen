@@ -358,10 +358,32 @@ fn build_unwind_info(
         section.map_or_else(|| decoded_vaddr.unwrap_or(0), |section| section.sh_addr);
     let eh_frame_size = section.map_or_else(
         || {
-            eh_frame_hdr_vaddr
+            // No `.eh_frame` section header (the usual case for stripped SELF
+            // binaries) — infer the size. `.eh_frame` and `.eh_frame_hdr` sit
+            // in the same read-only segment; whichever comes first ends where
+            // the other begins, and the last one runs to the end of that
+            // segment. A too-large size is safe (the unwinder stops at the
+            // zero-length CIE terminator); a ZERO size is fatal — it registers
+            // no unwind tables, so every C++ exception fails to find its catch
+            // handler and calls std::terminate.
+            if eh_frame_vaddr == 0 {
+                return 0;
+            }
+            // Case 1: `.eh_frame_hdr` follows `.eh_frame` — bounded by it.
+            if let Some(size) = eh_frame_hdr_vaddr
                 .checked_sub(eh_frame_vaddr)
-                .filter(|_| eh_frame_vaddr != 0)
-                .unwrap_or(0)
+                .filter(|size| *size != 0)
+            {
+                return size;
+            }
+            // Case 2: `.eh_frame` follows `.eh_frame_hdr` (or hdr is absent) —
+            // run to the end of the PT_LOAD segment that contains it.
+            segments
+                .iter()
+                .find(|s| {
+                    eh_frame_vaddr >= s.vaddr && eh_frame_vaddr < s.vaddr + s.mem_size
+                })
+                .map_or(0, |s| s.vaddr + s.mem_size - eh_frame_vaddr)
         },
         |section| section.sh_size,
     );
