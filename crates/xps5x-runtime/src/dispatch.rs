@@ -1856,12 +1856,24 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                     args[6 + i] = u64::from_le_bytes(buf);
                 }
             }
+            // `[Rsp]` at the trap is the `call`-pushed return address — the
+            // guest instruction that called this HLE function. Threaded into
+            // the context purely as diagnostic provenance.
+            let caller_return_addr = {
+                let mut buf = [0u8; 8];
+                if mem.read(context.Rsp, &mut buf) {
+                    u64::from_le_bytes(buf)
+                } else {
+                    0
+                }
+            };
             let hle_ctx = HleContext {
                 kernel,
                 mem,
                 alloc,
                 guest_calls: ctx,
                 guest_threads: ctx,
+                caller_return_addr,
             };
             ctx.active_hle
                 .set(Some((idx, args[..6].try_into().unwrap())));

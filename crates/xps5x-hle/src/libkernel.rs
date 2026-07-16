@@ -1913,8 +1913,10 @@ fn hle_debug_raise_exception(ctx: &HleContext, args: &[u64]) -> u64 {
         .map_or_else(|| "<unnamed>".to_owned(), |entry| entry.clone());
     warn!(
         "sceKernelDebugRaiseException(code={code:#x}, arg={:#x}) on thread {thread} \
-         ('{name}') — guest reported a fatal condition; terminating the calling guest thread",
+         ('{name}') from guest ra={:#x} — guest reported a fatal condition; \
+         terminating the calling guest thread",
         args.get(1).copied().unwrap_or(0),
+        ctx.caller_return_addr,
     );
     // On hardware this never returns — the process is killed. Returning here
     // is measurably worse than stopping the thread: the caller's code ends at

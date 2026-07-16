@@ -260,6 +260,12 @@ pub struct HleContext<'a> {
     pub guest_calls: &'a dyn GuestCallScheduler,
     /// Process-scoped guest pthread scheduler supplied by the runtime.
     pub guest_threads: &'a dyn GuestThreadScheduler,
+    /// The guest return address of the current HLE call — `[rsp]` at the
+    /// trap, i.e. the instruction the caller resumes at. Diagnostic only
+    /// (0 when unavailable / in tests): lets a handler report *where in the
+    /// guest* a call like `sceKernelDebugRaiseException` originated, which
+    /// `--dump-vaddr` then turns into the failing assert's code bytes.
+    pub caller_return_addr: u64,
 }
 
 /// HLE function signature: takes a dispatch context and integer arguments,
@@ -650,6 +656,7 @@ pub(crate) fn test_ctx<'a>(
         alloc,
         guest_calls: &NO_GUEST_CALLS,
         guest_threads: &NO_GUEST_THREADS,
+        caller_return_addr: 0,
     }
 }
 

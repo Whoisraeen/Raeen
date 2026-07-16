@@ -111,25 +111,15 @@ fn hle_cond_wait(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 fn hle_cond_timedwait(ctx: &HleContext, args: &[u64]) -> u64 {
-    let timeout = args
-        .get(2)
-        .copied()
-        .filter(|ptr| *ptr != 0)
-        .and_then(|ptr| {
-            let mut raw = [0u8; 16];
-            ctx.mem.read(ptr, &mut raw).then(|| {
-                let secs = i64::from_le_bytes(raw[..8].try_into().expect("fixed slice"));
-                let nanos = i64::from_le_bytes(raw[8..].try_into().expect("fixed slice"));
-                let target = std::time::UNIX_EPOCH
-                    + std::time::Duration::new(
-                        secs.max(0) as u64,
-                        nanos.clamp(0, 999_999_999) as u32,
-                    );
-                target
-                    .duration_since(std::time::SystemTime::now())
-                    .unwrap_or_default()
-            })
-        });
+    // Orbis `scePthreadCondTimedwait(cond, mutex, SceKernelUseconds usec)`:
+    // the third argument is a RELATIVE microsecond count passed by value, not
+    // a pointer to an absolute timespec (cross-checked against SharpEmu's
+    // PthreadCondTimedwait and shadPS4). Misreading it as a pointer computed a
+    // garbage deadline that timed out immediately every call — which made
+    // libc's C++ condition_variable wrapper throw and killed every worker
+    // thread that does a timed wait (Minecraft's Streaming/Rendering pools).
+    let usec = args.get(2).copied().unwrap_or(0);
+    let timeout = Some(std::time::Duration::from_micros(usec));
     wait_core(ctx, args, timeout)
 }
 
