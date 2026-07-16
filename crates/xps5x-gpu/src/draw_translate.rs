@@ -309,6 +309,7 @@ fn prepare_stage_binding(
             .checked_mul(u64::from(resource.num_records()))
             .ok_or_else(|| err("storage buffer size overflow"))?;
         let bytes = read_guest_bytes(resource.base48(), size, "storage buffer")?;
+        let all_zero = bytes.iter().all(|&b| b == 0);
         debug!(
             stage = ?stage,
             index,
@@ -317,6 +318,22 @@ fn prepare_stage_binding(
             head = format_args!("{:02x?}", &bytes[..bytes.len().min(16)]),
             "stage storage buffer read"
         );
+        if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SEEN: AtomicU32 = AtomicU32::new(0);
+            if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
+                tracing::warn!(
+                    stage = ?stage,
+                    addr = format_args!("{:#x}", resource.base48()),
+                    stride = resource.stride(),
+                    records = resource.num_records(),
+                    len = bytes.len(),
+                    all_zero,
+                    head = format_args!("{:02x?}", &bytes[..bytes.len().min(32)]),
+                    "TRACE_DRAWS: storage buffer content"
+                );
+            }
+        }
         storage_bytes.push(bytes);
 
         // Kyty rewrites the descriptor's guest base to the Vulkan descriptor
@@ -519,16 +536,25 @@ pub struct OffscreenDrawSink<'a> {
     framebuffers: &'a mut HashMap<u64, RenderedImage>,
     pub last: Option<RenderedImage>,
     pub draws: u64,
-    /// Draws skipped because a bound guest shader failed translation. The
-    /// named reason was warned once by the cache; each skip here is quiet
-    /// (debug) so 1600 re-binds of one bad shader stay one loud line.
+    /// Draws and compute dispatches skipped because a bound guest shader failed
+    /// translation. The named reason was warned once by the cache; each skip
+    /// here is quiet (debug) so 1600 re-binds of one bad shader stay one loud
+    /// line. This is the SUM of `draw_skips` + `dispatch_skips`.
     pub shader_skips: u64,
+    /// Skips attributable to the graphics-draw path (`draw_index_auto`).
+    pub draw_skips: u64,
+    /// Skips attributable to the compute-dispatch path (`dispatch_direct`).
+    pub dispatch_skips: u64,
     /// Compute dispatches completed and written back to guest storage.
     pub dispatches: u64,
-    /// Most recent named skip reason, surfaced by the session with a
-    /// process-wide rate limit. Null binds are not cacheable, so the cache
-    /// itself cannot provide that telemetry.
-    pub last_shader_skip_reason: Option<String>,
+    /// Most recent named skip reason from the DRAW path, surfaced by the
+    /// session with a process-wide rate limit. Kept separate from the compute
+    /// reason: a title issues far more dispatches than draws, so a single
+    /// shared field almost always reports a compute failure and silently
+    /// masks why a *draw* skipped.
+    pub last_draw_skip_reason: Option<String>,
+    /// Most recent named skip reason from the compute-DISPATCH path.
+    pub last_dispatch_skip_reason: Option<String>,
 }
 
 impl<'a> OffscreenDrawSink<'a> {
@@ -545,8 +571,11 @@ impl<'a> OffscreenDrawSink<'a> {
             last: None,
             draws: 0,
             shader_skips: 0,
+            draw_skips: 0,
+            dispatch_skips: 0,
             dispatches: 0,
-            last_shader_skip_reason: None,
+            last_draw_skip_reason: None,
+            last_dispatch_skip_reason: None,
         }
     }
 }
@@ -577,7 +606,8 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 Err(e) => {
                     // Named degradation: skip this draw, keep the DCB going.
                     self.shader_skips += 1;
-                    self.last_shader_skip_reason = Some(e.to_string());
+                    self.draw_skips += 1;
+                    self.last_draw_skip_reason = Some(e.to_string());
                     debug!(reason = %e, "draw skipped: bound guest shader is untranslatable");
                     return Ok(());
                 }
@@ -603,6 +633,36 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 state
                     .stage_bindings
                     .push(prepare_stage_binding(bind, stage)?);
+            }
+        }
+
+        // One-shot forensic: what does a real Minecraft draw actually bind?
+        // Frames are pure black despite the light-blue CLEAR working (M2 test),
+        // so geometry covers the screen and the PS shades black. This names
+        // whether the PS samples textures (→ texture-upload wall) or computes
+        // black from missing storage/push-constant inputs. Gated to the first
+        // few draws (XPS5X_TRACE_DRAWS) so it never floods a normal run.
+        if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SEEN: AtomicU32 = AtomicU32::new(0);
+            if SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
+                let ps = &shaders.ps_info.bind;
+                let vs = &shaders.vs_info.bind;
+                tracing::warn!(
+                    prim = ucfg.prim_type,
+                    verts = state.vertex_count,
+                    guest_vbufs = state.vertex_buffers.len(),
+                    vattrs = state.vertex_attributes.len(),
+                    ps_tex = ps.textures2d.textures_num,
+                    ps_samp = ps.samplers.samplers_num,
+                    ps_sbuf = ps.storage_buffers.buffers_num,
+                    ps_pushc = ps.push_constant_size,
+                    ps_ext = ps.extended.used,
+                    vs_tex = vs.textures2d.textures_num,
+                    vs_sbuf = vs.storage_buffers.buffers_num,
+                    vs_pushc = vs.push_constant_size,
+                    "TRACE_DRAWS: real draw bind profile"
+                );
             }
         }
 
@@ -650,7 +710,8 @@ impl DrawSink for OffscreenDrawSink<'_> {
             Ok(shader) => shader,
             Err(error) => {
                 self.shader_skips += 1;
-                self.last_shader_skip_reason = Some(error.to_string());
+                self.dispatch_skips += 1;
+                self.last_dispatch_skip_reason = Some(error.to_string());
                 debug!(reason = %error, "compute dispatch skipped: bound shader is untranslatable");
                 return Ok(());
             }
@@ -701,6 +762,15 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 ),
                 "compute storage writeback"
             );
+            if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
+                let nonzero = bytes.iter().any(|&b| b != 0);
+                tracing::warn!(
+                    addr = format_args!("{addr:#x}"),
+                    len = bytes.len(),
+                    nonzero,
+                    "TRACE_DRAWS: compute writeback"
+                );
+            }
             if !crate::guest_mem::write_bytes_checked(addr, &bytes) {
                 return Err(err(format!(
                     "compute storage writeback range {addr:#x}..{:#x} is not writable guest memory",

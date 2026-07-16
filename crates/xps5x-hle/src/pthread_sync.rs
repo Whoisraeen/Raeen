@@ -16,13 +16,41 @@ use crate::{HleContext, HleRegistry};
 use tracing::debug;
 use xps5x_kernel::{PthreadMutex, PthreadRwlock};
 
-// Orbis `scePthreadMutex*` return POSIX errno directly (0 = success).
+// The shared mutex state machine (`lock_core`) works in POSIX errno (0 =
+// success); the `libScePosix` pthread_* entry points return these directly.
 const OK: u64 = 0;
 const EPERM: u64 = 1;
 const EDEADLK: u64 = 11;
 const EBUSY: u64 = 16;
 const EINVAL: u64 = 22;
 const ETIMEDOUT: u64 = 60;
+
+// The `libkernel` `scePthreadMutex*` ABI returns SCE_KERNEL_ERROR_* codes
+// (0x8002_00xx), NOT bare POSIX errno. The title's own libc `_Mtx_trylock`
+// (C11 threads wrapper) maps SCE EBUSY -> _Thrd_busy(3) but treats a bare
+// POSIX 16 as an error, constructing std::system_error(EINVAL) — which was
+// UNCAUGHT and killed Minecraft's "Streaming Pool" asset threads (~22-frame
+// unwind -> sceKernelDebugRaiseExceptionOnReleaseMode), stalling boot before
+// the menu. Mirrors the scePthreadCondTimedwait SCE/POSIX split.
+const SCE_KERNEL_ERROR_EPERM: u64 = 0x8002_0001;
+const SCE_KERNEL_ERROR_EDEADLK: u64 = 0x8002_0023;
+const SCE_KERNEL_ERROR_EBUSY: u64 = 0x8002_0010;
+const SCE_KERNEL_ERROR_EINVAL: u64 = 0x8002_0016;
+const SCE_KERNEL_ERROR_ETIMEDOUT: u64 = 0x8002_003C;
+
+/// Translate a POSIX errno from the shared state machine into the SCE error
+/// code the `scePthreadMutex*` (libkernel) ABI returns. 0 stays 0.
+fn posix_to_sce(err: u64) -> u64 {
+    match err {
+        OK => OK,
+        EPERM => SCE_KERNEL_ERROR_EPERM,
+        EDEADLK => SCE_KERNEL_ERROR_EDEADLK,
+        EBUSY => SCE_KERNEL_ERROR_EBUSY,
+        EINVAL => SCE_KERNEL_ERROR_EINVAL,
+        ETIMEDOUT => SCE_KERNEL_ERROR_ETIMEDOUT,
+        other => other,
+    }
+}
 
 // pthread mutex types.
 const MUTEX_ERRORCHECK: i32 = 1;
@@ -40,10 +68,14 @@ const MUTEX_OBJECT_SIZE: u64 = 0x100;
 pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadMutexInit", hle_mutex_init);
     registry.register("libkernel", "scePthreadMutexDestroy", hle_mutex_destroy);
-    registry.register("libkernel", "scePthreadMutexLock", hle_mutex_lock);
-    registry.register("libkernel", "scePthreadMutexTrylock", hle_mutex_trylock);
-    registry.register("libkernel", "scePthreadMutexTimedlock", hle_mutex_timedlock);
-    registry.register("libkernel", "scePthreadMutexUnlock", hle_mutex_unlock);
+    registry.register("libkernel", "scePthreadMutexLock", hle_sce_mutex_lock);
+    registry.register("libkernel", "scePthreadMutexTrylock", hle_sce_mutex_trylock);
+    registry.register(
+        "libkernel",
+        "scePthreadMutexTimedlock",
+        hle_sce_mutex_timedlock,
+    );
+    registry.register("libkernel", "scePthreadMutexUnlock", hle_sce_mutex_unlock);
     registry.register("libkernel", "scePthreadMutexattrInit", hle_mutexattr_init);
     registry.register(
         "libkernel",
@@ -233,6 +265,29 @@ fn hle_mutex_lock(ctx: &HleContext, args: &[u64]) -> u64 {
 
 fn hle_mutex_trylock(ctx: &HleContext, args: &[u64]) -> u64 {
     lock_core(ctx, args.first().copied().unwrap_or(0), true, None)
+}
+
+/// SCE `scePthreadMutexTrylock` (libkernel): the shared state machine in SCE
+/// error codes. Critically, a contended try returns SCE EBUSY (0x8002_0010),
+/// which the title's libc `_Mtx_trylock` maps to `_Thrd_busy`; a bare POSIX 16
+/// was mis-read as an error and thrown.
+fn hle_sce_mutex_trylock(ctx: &HleContext, args: &[u64]) -> u64 {
+    posix_to_sce(hle_mutex_trylock(ctx, args))
+}
+
+/// SCE `scePthreadMutexLock`/`scePthreadMutexTimedlock` (libkernel): SCE-coded.
+/// The success path is unchanged (0); only error/timeout codes are translated.
+fn hle_sce_mutex_lock(ctx: &HleContext, args: &[u64]) -> u64 {
+    posix_to_sce(hle_mutex_lock(ctx, args))
+}
+
+fn hle_sce_mutex_timedlock(ctx: &HleContext, args: &[u64]) -> u64 {
+    posix_to_sce(hle_mutex_timedlock(ctx, args))
+}
+
+/// SCE `scePthreadMutexUnlock` (libkernel): SCE-coded (success unchanged).
+fn hle_sce_mutex_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
+    posix_to_sce(hle_mutex_unlock(ctx, args))
 }
 
 /// `scePthreadMutexTimedlock(mutex, usec)`: `scePthreadMutexLock` with a

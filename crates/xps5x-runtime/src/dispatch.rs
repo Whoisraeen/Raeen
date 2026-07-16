@@ -1888,6 +1888,20 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             };
             ctx.active_hle
                 .set(Some((idx, args[..6].try_into().unwrap())));
+            // Record this call in the guest thread's recent-call ring so the
+            // __cxa_throw trap can report what led to a throw (host threads are
+            // pooled; the guest thread id is stable). Gated to the trap run.
+            if *TRACE_EINVAL.get_or_init(|| std::env::var_os("XPS5X_TRACE_EINVAL").is_some())
+                || std::env::var_os("XPS5X_TRAP_CXA_THROW").is_some()
+            {
+                let tid = ctx.current_thread();
+                let mut ring = kernel.recent_hle_calls.entry(tid).or_default();
+                let mut q = ring.lock();
+                if q.len() >= 24 {
+                    q.pop_front();
+                }
+                q.push_back(format!("{}::{}", t.library, t.function));
+            }
             let ret = hle
                 .call(&hle_ctx, &t.library, &t.function, &args)
                 .unwrap_or(0);

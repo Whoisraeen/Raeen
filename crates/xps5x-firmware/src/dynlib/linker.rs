@@ -522,6 +522,18 @@ fn link_inner(
                     .copied()
                     .or_else(|| lib_of_nid.get(&symbol.nid).copied())
                     .unwrap_or(&module.name);
+                // Forensic (XPS5X_TRACE_DRAWS): name the import whose PLT stub
+                // (GOT slot module-vaddr 0xE123280) returns EINVAL and kills the
+                // Streaming Pool threads. Logs the NID + provider so the failing
+                // function can be identified and fixed.
+                if reloc.offset == 0xE12_3280 && std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
+                    tracing::warn!(
+                        offset = format_args!("{:#x}", reloc.offset),
+                        nid = format_args!("{:#018x}", symbol.nid),
+                        provider = provider_module,
+                        "TRACE_DRAWS: PLT-0xb5 import (returns EINVAL, kills Streaming Pool)"
+                    );
+                }
                 match registry.resolve(hle, provider_module, symbol.nid) {
                     Resolver::Hle { library, function } => {
                         let addr = tables.hle_addr(symbol.nid, library, function);

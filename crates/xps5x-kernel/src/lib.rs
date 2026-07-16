@@ -134,6 +134,12 @@ pub struct OrbisKernel {
     /// Guest thread names (`scePthreadRename`), keyed by guest thread id —
     /// purely diagnostic, so a dying thread can be identified by name.
     pub thread_names: DashMap<u64, String>,
+    /// Per-guest-thread ring of the most recent HLE `library::function` calls,
+    /// keyed by guest thread id. Populated only when diagnostics ask for it
+    /// (the __cxa_throw trap), so a thread that throws can report the exact
+    /// calls that led there — host threads are pooled, so a host-ThreadId
+    /// correlation is unreliable; the guest thread id is not.
+    pub recent_hle_calls: DashMap<u64, parking_lot::Mutex<std::collections::VecDeque<String>>>,
     /// Guest address of the main module's `PT_SCE_PROCPARAM` block, set by
     /// the runtime at load time (0 = none). `sceKernelGetProcParam` returns
     /// this so a title reads its real process-parameter block (SDK version,
@@ -541,6 +547,7 @@ impl OrbisKernel {
             next_module_id: RwLock::new(1),
             syscall_stats: DashMap::new(),
             thread_names: DashMap::new(),
+            recent_hle_calls: DashMap::new(),
             proc_param_addr: std::sync::atomic::AtomicU64::new(0),
             unwind_modules: RwLock::new(Vec::new()),
             pad_state: parking_lot::Mutex::new(None),

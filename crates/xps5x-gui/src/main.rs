@@ -531,6 +531,35 @@ fn main() -> anyhow::Result<()> {
             ),
             None => info!("  PT_TLS: none"),
         }
+        // Stall diagnosis: with XPS5X_STALL_DUMP set (and XPS5X_TRACE_EINVAL to
+        // populate the ring), periodically log every guest thread's most recent
+        // HLE calls. A thread blocked at a boot gate shows its last call frozen
+        // or a tight spin — naming exactly what the game is waiting on.
+        if std::env::var_os("XPS5X_STALL_DUMP").is_some() {
+            let kmon = std::sync::Arc::clone(&kernel);
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(6));
+                    let mut lines: Vec<String> = kmon
+                        .recent_hle_calls
+                        .iter()
+                        .map(|entry| {
+                            let tid = *entry.key();
+                            let name = kmon
+                                .thread_names
+                                .get(&tid)
+                                .map_or_else(String::new, |n| n.clone());
+                            let ring = entry.value().lock();
+                            let recent: Vec<String> =
+                                ring.iter().rev().take(5).cloned().collect();
+                            format!("t{tid}({name}): {}", recent.join(" <- "))
+                        })
+                        .collect();
+                    lines.sort();
+                    info!("STALL_DUMP ({} threads):\n{}", lines.len(), lines.join("\n"));
+                }
+            });
+        }
         info!("entering guest _start via execute_process ...");
         let outcome = xps5x_runtime::execute_process_shared(
             std::sync::Arc::clone(&linked),

@@ -1985,9 +1985,21 @@ fn hle_cxa_throw(ctx: &HleContext, args: &[u64]) -> u64 {
         }
     }
 
+    // The exact HLE calls this guest thread made before throwing — the most
+    // reliable "what failed" signal (host threads are pooled).
+    let recent = ctx
+        .kernel
+        .recent_hle_calls
+        .get(&thread)
+        .map(|ring| {
+            let q = ring.lock();
+            q.iter().cloned().collect::<Vec<_>>().join(" ")
+        })
+        .unwrap_or_default();
+
     warn!(
         "__cxa_throw trap: thread {thread} ('{name}') throws '{type_name}' \
-         (obj={obj:#x}, ra={:#x}) object[{object_dump} ] stack=[{}]",
+         (obj={obj:#x}, ra={:#x}) object[{object_dump} ] recent=[{recent}] stack=[{}]",
         ctx.caller_return_addr,
         chain.join(" ")
     );
@@ -2013,6 +2025,15 @@ fn hle_debug_raise_exception(ctx: &HleContext, args: &[u64]) -> u64 {
         args.get(1).copied().unwrap_or(0),
         ctx.caller_return_addr,
     );
+    // The exact HLE calls this guest thread made before the fatal condition —
+    // names what it was doing (defeats host-thread pooling). Populated when
+    // XPS5X_TRACE_EINVAL / XPS5X_TRAP_CXA_THROW is set.
+    if let Some(ring) = ctx.kernel.recent_hle_calls.get(&thread) {
+        let recent = ring.lock().iter().cloned().collect::<Vec<_>>().join(" ");
+        if !recent.is_empty() {
+            warn!("  recent HLE calls: {recent}");
+        }
+    }
     // Walk the caller's stack for return addresses into the loaded image, so
     // the call chain INTO libc's terminate handler (and thus the throw
     // origin) is greppable. Diagnostic only; bounded and read-only.

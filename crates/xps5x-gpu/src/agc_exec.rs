@@ -176,7 +176,10 @@ impl AgcGpuSession {
 
         let drawn = sink.draws;
         let shader_skips = sink.shader_skips;
-        let sink_skip_reason = sink.last_shader_skip_reason.clone();
+        let draw_skips = sink.draw_skips;
+        let dispatch_skips = sink.dispatch_skips;
+        let draw_skip_reason = sink.last_draw_skip_reason.clone();
+        let dispatch_skip_reason = sink.last_dispatch_skip_reason.clone();
         let image = sink.last.take();
         drop(sink);
         // Snapshot every accumulated render target while the guard is still
@@ -200,16 +203,24 @@ impl AgcGpuSession {
                 *skips
             };
             if total == shader_skips || total.is_power_of_two() {
+                // Draw and compute skips are reported with SEPARATE reasons: a
+                // title issues far more dispatches than draws, so a single
+                // shared reason almost always shows a compute failure and masks
+                // why a draw skipped. "draw_reason" is empty when no draw has
+                // skipped (its shaders translate) — the wall is then elsewhere.
                 warn!(
                     total_shader_skips = total,
-                    reason = sink_skip_reason.as_deref().unwrap_or("unknown"),
+                    draw_skips,
+                    dispatch_skips,
+                    draw_reason = draw_skip_reason.as_deref().unwrap_or("(none — draw shaders translate)"),
+                    dispatch_reason = dispatch_skip_reason.as_deref().unwrap_or("(none)"),
                     vs_addr = format_args!("{:#x}", shader_state.vs.vs_regs.data_addr),
                     es_addr = format_args!("{:#x}", shader_state.vs.es_regs.data_addr),
                     gs_addr = format_args!("{:#x}", shader_state.vs.gs_regs.data_addr),
                     gs_checksum = format_args!("{:#x}", shader_state.vs.gs_regs.chksum),
                     ps_addr = format_args!("{:#x}", shader_state.ps.ps_regs.data_addr),
                     stats = ?self.shader_stats(),
-                    "AGC draws skipped because bound shader state is not renderable"
+                    "AGC shader skips (draws + compute dispatches) — see per-path reasons"
                 );
             }
         }
