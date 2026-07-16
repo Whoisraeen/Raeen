@@ -1,14 +1,32 @@
 //! [`GuestArena`]: the fixed-base, identity-mapped guest address space
-//! (design doc §2/§3/§5). Reserves one contiguous 68 GiB host range at
-//! [`crate::GUEST_ARENA_BASE`], commits its four fixed sub-regions (image,
-//! heap, stack, mmap) in its first 4 GiB, leaves a 64 GiB sparse reservation
-//! tail, copies the module image in, and frees the whole range on `Drop`.
+//! (design doc §2/§3/§5). Reserves one contiguous [`RESERVED_SPAN`] (2 TiB)
+//! host range at [`crate::GUEST_ARENA_BASE`], commits its four fixed
+//! sub-regions (image, heap, stack, mmap) in its first [`ARENA_SPAN`] (4 GiB),
+//! leaves the rest as a sparse reservation tail committed on demand, copies the
+//! module image in, and frees the whole range on `Drop`.
 //!
 //! Guest address `A` *is* host address `A` here (identity mapping): a guest
 //! pointer returned by `alloc`/`mmap`, or baked into the image by the
 //! linker's relocations, is directly dereferenceable by the native CPU — no
 //! translation layer, unlike the now-retired `mem::MappedImage` this module
 //! replaces.
+//!
+//! # The map is the authority
+//!
+//! Placement and bounds are [`crate::vmm::VmaMap`]'s, not this module's. The
+//! arena owns *host* memory — what is reserved, what is committed — and the map
+//! owns the *address space*: what lives at an address, where there is room, and
+//! whether the guest may touch it. Every method here is that division of labour:
+//! ask the map where to put something, ask Windows to back it, tell the map what
+//! happened.
+//!
+//! It reads as a lot of ceremony for an allocator, and the measurements are why.
+//! The three monotonic bumps this replaced could not free, so Until Dawn's
+//! opening 512 GiB `sceKernelReserveVirtualRange` permanently spent the tail and
+//! every later allocation failed down to 64 KiB; `munmap` was a no-op, so
+//! nothing a title returned ever came back; and the parallel `Vec`s that tracked
+//! reservations and committed ranges were scanned linearly on every single guest
+//! read and write. One interval map answers all of it.
 //!
 //! # RT2 status
 //!
@@ -28,11 +46,36 @@ use windows_sys::Win32::System::Memory::{
 
 use xps5x_hle::{GuestAllocator, GuestMemory};
 
+use crate::vmm::{Vma, VmaMap, VmaType, prot};
 use crate::{GUEST_ARENA_BASE, RuntimeError};
 
 /// x86-64 Windows' page size (see `mem.rs`/`trampoline.rs`'s equivalent
-/// constants); also the default alignment `mmap` bumps to.
+/// constants); also the default alignment `mmap` rounds to.
 const PAGE_SIZE: u64 = 4096;
+
+/// Lowest address the [`VmaMap`] answers for. Page zero is deliberately left
+/// outside it, so a null dereference stays an unanswerable fault rather than an
+/// address the map has an opinion about.
+const VMM_MIN: u64 = PAGE_SIZE;
+
+/// One past the highest address the map answers for: Windows' user-mode ceiling
+/// on x86-64 (`[0, 0x7FFF_FFFF_FFFF]`, 128 TiB).
+///
+/// The map spans the *whole* user address space rather than just the arena
+/// because two things legitimately live outside it, and both must be
+/// answerable. `reserve` lets the OS place huge reservations wherever it likes
+/// (Until Dawn opens with 512 GiB), and `map_at` must honour an address the
+/// guest picked for itself (ASTRO.BOT demands its libc mspace at
+/// `0x3_0000_0000` — 12 GiB, far below the 16 TiB arena base — then writes to
+/// that literal address). Everything we do not own is [`VmaType::Foreign`].
+const VMM_MAX: u64 = 0x8000_0000_0000;
+
+/// Diagnostic names for the ranges the arena hands out. Titles read the `name`
+/// of a mapping back through the Named* map calls, and a name also keeps two
+/// unrelated pools from coalescing into one another in the map.
+const HEAP_NAME: &str = "heap";
+const MMAP_NAME: &str = "mmap";
+const RESERVE_NAME: &str = "reserve";
 
 /// Image region: `[base + IMAGE_OFFSET, base + IMAGE_OFFSET + IMAGE_SIZE)`,
 /// committed `PAGE_EXECUTE_READWRITE` (design doc §3, the documented RT
@@ -173,35 +216,38 @@ fn commit_region(base: u64, addr: u64, len: u64, protect: u32) -> Result<(), Run
     Ok(())
 }
 
-/// The heap/mmap allocator's interior-mutable state, guarded by
-/// [`GuestArena`]'s `Mutex`. `heap_sizes` maps a live (not-yet-freed)
-/// allocation's address to its committed block size, so `free`/`realloc` can
-/// recover how much to release/copy without the caller repeating it.
+/// The allocator's interior-mutable state, guarded by [`GuestArena`]'s `Mutex`.
+///
+/// # Why there is one map and not three bumps
+///
+/// This used to be `heap_bump`/`mmap_bump`/`reserve_bump` plus three parallel
+/// `Vec`s (`heap_free`, `sparse_mappings`, `reservations`). The bumps had no
+/// free path, so nothing ever came back: measured on retail titles, Until Dawn
+/// opens with a single 512 GiB `sceKernelReserveVirtualRange`, a few of those
+/// consumed the whole 2 TiB tail, and every later allocation then failed — down
+/// to 64 KiB — after which the title died in its own crash reporter. Dragon Ball
+/// fails identically.
+///
+/// [`VmaMap`] is that free path, and being one structure rather than four it is
+/// also the single answer to "what is at this address": `range_is_committed`
+/// went from a linear scan of an ever-growing `Vec` to one `BTreeMap` lookup.
 struct AllocState {
-    /// Next never-yet-used heap address; only ever moves forward.
-    heap_bump: u64,
-    /// Blocks released by `free`, available for first-fit reuse: `(addr,
-    /// size)`.
-    heap_free: Vec<(u64, u64)>,
-    /// Live allocations' sizes, keyed by address.
+    /// The guest address space. Every address belongs to exactly one
+    /// [`Vma`], so this alone answers all three questions the bumps and their
+    /// side tables used to answer separately — and sometimes inconsistently:
+    /// what is here, where is there room, and may the guest touch this.
+    vmm: VmaMap,
+    /// Live heap allocations' sizes, keyed by address, so `free`/`realloc` can
+    /// recover how much to release or copy without the caller repeating it.
+    /// The map knows the *ranges*, but adjacent allocations coalesce within it,
+    /// so it cannot recover where one `alloc`'s block ended — only this can.
     heap_sizes: HashMap<u64, u64>,
-    /// Next never-yet-used mmap address; only ever moves forward. RT2a has
-    /// no mmap free list — `munmap` is best-effort (design doc §5/§7).
-    mmap_bump: u64,
-    /// Next never-used address in the sparse, uncommitted reservation tail.
-    reserve_bump: u64,
     /// Base addresses of whole blocks this arena took from the OS outside its
     /// own reservation (`GuestAllocator::reserve`, and `map_at` for a guest
     /// address beyond the arena). Each must be `MEM_RELEASE`d on `Drop`; only
     /// the block base is a legal argument, which is why the base is kept rather
     /// than the aligned address handed to the guest.
     os_reservations: Vec<u64>,
-    /// Committed subranges within the sparse reservation tail.
-    sparse_mappings: Vec<(u64, u64)>,
-    /// Ranges the guest reserved via [`GuestAllocator::reserve`] but that carry
-    /// no memory yet. A touch inside one is a demand-commit request, not a
-    /// fault — see [`GuestArena::commit_on_demand`].
-    reservations: Vec<(u64, u64)>,
     /// Avoid repeating the heap-growth notice for every allocation after the
     /// fixed 1 GiB fast path fills.
     sparse_heap_announced: bool,
@@ -211,19 +257,90 @@ struct AllocState {
 
 impl AllocState {
     fn new(base: u64) -> Self {
+        let mut vmm = VmaMap::new(VMM_MIN, VMM_MAX);
+        let arena_end = base + RESERVED_SPAN;
+
+        // Everything outside our own reservation is the host process's. Marking
+        // it explicitly is what lets the map span the whole address space
+        // without `search_free` ever offering the guest a host DLL.
+        vmm.map_range(
+            VMM_MIN,
+            base - VMM_MIN,
+            VmaType::Foreign,
+            prot::NO_ACCESS,
+            None,
+            "host",
+            false,
+        );
+        vmm.map_range(
+            arena_end,
+            VMM_MAX - arena_end,
+            VmaType::Foreign,
+            prot::NO_ACCESS,
+            None,
+            "host",
+            false,
+        );
+
+        // The image and the stack are described as the furniture they are,
+        // because HLE reads and writes both through `GuestMemory` and so both
+        // must stay host-backed: the linker's relocated pointers and `.rodata`
+        // live in the image, and `process::build_process_stack` writes
+        // argc/argv/envp/auxv onto the stack. Neither is `is_guest_releasable`,
+        // so no `munmap` can pull them out from under the running program.
+        vmm.map_range(
+            base + IMAGE_OFFSET,
+            IMAGE_SIZE,
+            VmaType::Code,
+            prot::CPU_READ_WRITE | prot::CPU_EXEC,
+            None,
+            "image",
+            true,
+        );
+        vmm.map_range(
+            base + STACK_OFFSET,
+            STACK_SIZE,
+            VmaType::Stack,
+            prot::CPU_READ_WRITE,
+            None,
+            "stack",
+            true,
+        );
+
+        // The heap and mmap regions stay `Free`, and so does the sparse tail.
+        // Free here means "unclaimed, and ours to place in" — the difference
+        // between the two is only whether the host pages are committed yet
+        // (`new` commits the core; the tail is committed as it is handed out),
+        // which is `grow_into_tail`'s business rather than the map's.
         Self {
-            heap_bump: base + HEAP_OFFSET,
-            heap_free: Vec::new(),
+            vmm,
             heap_sizes: HashMap::new(),
-            mmap_bump: base + MMAP_OFFSET,
-            reserve_bump: base + ARENA_SPAN,
             os_reservations: Vec::new(),
-            sparse_mappings: Vec::new(),
-            reservations: Vec::new(),
             sparse_heap_announced: false,
             demand_commit_announced: false,
         }
     }
+}
+
+/// Whether every VMA covering `[start, end)` satisfies `pred`, i.e. whether the
+/// range is uniformly one thing. `false` if any part of it falls outside the
+/// map, which is what makes a range straddling the map's edge a refusal rather
+/// than a half-honoured request.
+fn range_all(vmm: &VmaMap, start: u64, end: u64, pred: impl Fn(&Vma) -> bool) -> bool {
+    if end <= start {
+        return false;
+    }
+    let mut cursor = start;
+    while cursor < end {
+        let Some(vma) = vmm.find(cursor) else {
+            return false;
+        };
+        if !pred(vma) {
+            return false;
+        }
+        cursor = vma.end();
+    }
+    true
 }
 
 /// The fixed-base, identity-mapped guest address space (design doc §2/§5).
@@ -388,42 +505,34 @@ impl GuestArena {
     /// otherwise about to be reported as a genuine fault — so a `false` return
     /// costs nothing and preserves the existing diagnostics exactly.
     pub fn commit_on_demand(&self, addr: u64) -> bool {
-        // `reservations` is the authority, and it is the only safe one: since
-        // `reserve` now takes its span from the OS, a reservation can live
-        // anywhere in the host address space, not just the arena's sparse tail.
-        // A range check against the arena would reject exactly the reservations
-        // this exists to back. The core's own pages are committed at
-        // construction and never appear in `reservations`, so a fault there
-        // still falls through to a real fault.
+        // The map is the authority, and it is the only safe one: since `reserve`
+        // takes its span from the OS, a reservation can live anywhere in the
+        // address space, not just the arena's sparse tail. A range check against
+        // the arena would reject exactly the reservations this exists to back.
         let mut state = self.lock_state();
         let page = addr & !(PAGE_SIZE - 1);
-        let page_end = page + PAGE_SIZE;
 
-        // Inside a range the guest actually reserved? A touch anywhere else in
-        // the tail is a wild pointer and must remain a fault.
-        if !state
-            .reservations
-            .iter()
-            .any(|&(start, end)| page >= start && page_end <= end)
-        {
-            return false;
-        }
-        // Already backed (e.g. two threads raced into the same page): let the
-        // retry proceed rather than double-commit.
-        if state
-            .sparse_mappings
-            .iter()
-            .any(|&(start, end)| page >= start && page_end <= end)
-        {
-            return true;
+        match state.vmm.find(page).map(|vma| vma.kind) {
+            // An untouched reservation page: back it, and the retry lands on
+            // memory.
+            Some(VmaType::Reserved) => {}
+            // Already backed, which here can only mean another thread raced us
+            // into this same page. Let its retry proceed rather than
+            // double-commit.
+            Some(VmaType::ReservedBacked) => return true,
+            // Everything else is not a reservation, and declining leaves the
+            // access to be reported as the fault it is: the committed core (a
+            // fault there is real and unfixable — the pages already exist),
+            // unclaimed free space, or the host process's own address space.
+            _ => return false,
         }
 
-        // SAFETY: `[page, page_end)` is page aligned and lies inside this
-        // arena's prior sparse `MEM_RESERVE` (checked against `reservations`,
-        // which `reserve` only fills with sub-ranges of that reservation). The
-        // reservation outlives the arena's guest run. `MEM_COMMIT` on an
-        // already-committed page is a documented no-op, so the race above is
-        // benign either way.
+        // SAFETY: `[page, page + PAGE_SIZE)` is page aligned and lies inside a
+        // `Reserved` VMA. Only `reserve` creates one, and only ever over a range
+        // it has just `MEM_RESERVE`d from the OS and recorded in
+        // `os_reservations` — so the reservation is real and outlives this
+        // arena's guest run. `MEM_COMMIT` over an already-committed page is a
+        // documented no-op, so losing a race here is benign either way.
         let raw = unsafe {
             VirtualAlloc(
                 page as *const c_void,
@@ -435,7 +544,20 @@ impl GuestArena {
         if raw.is_null() || raw as u64 != page {
             return false;
         }
-        state.sparse_mappings.push((page, page_end));
+
+        // Only this page becomes backed. Its neighbours stay `Reserved`, which
+        // is what keeps a 512 GiB reservation costing address space instead of
+        // 512 GiB of RAM. Contiguous backed pages coalesce, so a title walking
+        // its reservation linearly does not shred the map into slivers.
+        state.vmm.map_range(
+            page,
+            PAGE_SIZE,
+            VmaType::ReservedBacked,
+            prot::CPU_READ_WRITE,
+            None,
+            RESERVE_NAME,
+            false,
+        );
         if !state.demand_commit_announced {
             tracing::info!(
                 address = page,
@@ -447,14 +569,100 @@ impl GuestArena {
         true
     }
 
+    /// Whether every byte of `[start, end)` has host memory behind it.
+    ///
+    /// The map is authoritative, which is what lets `read`/`write` drop their
+    /// old `< base` reject: an address below the arena is perfectly legal now
+    /// that `reserve` and `map_at` honour OS-placed and guest-chosen addresses.
+    /// What is *not* legal is anything the guest never obtained — free space,
+    /// an untouched reservation, or the host's own memory — and those are
+    /// exactly the kinds that are not host-backed, so a wild pointer is still
+    /// refused.
     fn range_is_committed(&self, start: u64, end: u64) -> bool {
-        if start >= self.base && end <= self.base + ARENA_SPAN {
-            return true;
+        let state = self.lock_state();
+        if end == start {
+            // A zero-length access touches nothing, but still has to name a
+            // real address to be a legal one.
+            return state
+                .vmm
+                .find(start)
+                .is_some_and(|vma| vma.kind.is_host_backed());
         }
-        self.lock_state()
-            .sparse_mappings
-            .iter()
-            .any(|&(mapped_start, mapped_end)| mapped_start <= start && end <= mapped_end)
+        range_all(&state.vmm, start, end, |vma| vma.kind.is_host_backed())
+    }
+
+    /// Commit `size` bytes in the arena's sparse reservation tail and claim them
+    /// as `name`. Returns the address **and the length actually mapped**, which
+    /// is `size` rounded up to a page: the caller must record that rather than
+    /// its own request, or a later `free` would return less than was taken and
+    /// strand the remainder for the arena's lifetime.
+    ///
+    /// The tail's address space is already `MEM_RESERVE`d by `new`, so this only
+    /// has to commit — and only the pages actually handed out, which is what
+    /// lets a 2 TiB tail cost no RAM until it is used. Both `alloc` and `mmap`
+    /// grow here once their fixed regions fill; `mmap` lacking this fallback
+    /// was an asymmetry rather than a deliberate ceiling, and ASTRO.BOT's
+    /// opening 1.94 GiB `sceKernelAllocateDirectMemory` fell through the gap.
+    fn grow_into_tail(
+        &self,
+        state: &mut AllocState,
+        size: u64,
+        align: u64,
+        name: &str,
+    ) -> Option<(u64, u64)> {
+        let committed_len = align_up(size, PAGE_SIZE)?;
+        let addr = state
+            .vmm
+            .search_free(self.base + ARENA_SPAN, committed_len, align)?;
+        // `search_free` cannot stray past the tail — `Foreign` space is not free
+        // and it will not place there — but the tail's own end is a real limit,
+        // and a request that does not fit must fail rather than run past it.
+        if addr.checked_add(committed_len)? > self.base + RESERVED_SPAN {
+            return None;
+        }
+
+        // SAFETY: `[addr, addr + committed_len)` is page aligned and lies inside
+        // this arena's own sparse `MEM_RESERVE` from `new` — `search_free`
+        // returned it from the tail, and the map hands no range out twice, so it
+        // cannot overlap a live mapping. The reservation outlives the mapping.
+        // `MEM_COMMIT` over pages a previous `munmap` returned to the pool
+        // without decommitting is a documented no-op.
+        let raw = unsafe {
+            VirtualAlloc(
+                addr as *const c_void,
+                committed_len as usize,
+                MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        if raw.is_null() || raw as u64 != addr {
+            return None;
+        }
+        state.vmm.map_range(
+            addr,
+            committed_len,
+            VmaType::Flexible,
+            prot::CPU_READ_WRITE,
+            None,
+            name,
+            false,
+        );
+        Some((addr, committed_len))
+    }
+
+    /// Give a just-reserved OS block straight back, and fail the request that
+    /// asked for it. Always returns `None`, so callers can `return
+    /// self.release_unusable_block(block)` at the point they give up.
+    fn release_unusable_block(&self, block: u64) -> Option<u64> {
+        // SAFETY: `block` is the exact non-null base a `VirtualAlloc(MEM_RESERVE)`
+        // has just returned, and every caller reaches here before recording it in
+        // `os_reservations` — so `Drop` will not release it too, and this single
+        // `MEM_RELEASE` with `dwSize = 0` cannot double-free. Releasing it here is
+        // the only chance to: nothing else knows the block exists.
+        unsafe {
+            VirtualFree(block as *mut c_void, 0, MEM_RELEASE);
+        }
+        None
     }
 
     /// Set up the main-thread TCB and, if the module has a `PT_TLS`
@@ -536,11 +744,17 @@ impl Drop for GuestArena {
 }
 
 /// Identity `GuestMemory`: guest address `A` is host address `A` (design doc
-/// §2). `read`/`write` bounds-check `[guest_addr, guest_addr + len)` against
-/// the whole committed arena span (via `checked_add`, so an overflowing
-/// request returns `false` rather than wrapping) before ever touching host
-/// memory — an HLE function handed a wild guest pointer gets `false`, never
-/// an OOB host access or a panic.
+/// §2). `read`/`write` check `[guest_addr, guest_addr + len)` against the map
+/// (via `checked_add`, so an overflowing request returns `false` rather than
+/// wrapping) before ever touching host memory — an HLE function handed a wild
+/// guest pointer gets `false`, never an OOB host access or a panic.
+///
+/// The bound is "every byte is host-backed", not "inside the arena": the arena
+/// is no longer the only place the guest's memory lives, since `reserve` lets
+/// the OS place a range anywhere and `map_at` honours an address the guest chose
+/// for itself. `range_is_committed` is what makes that safe — it admits only the
+/// committed core, ranges the guest actually mapped, and reservation pages
+/// demand-commit has backed.
 impl GuestMemory for GuestArena {
     fn read(&self, guest_addr: u64, out: &mut [u8]) -> bool {
         // `out.len()` (a `usize`) never truncates when widened to `u64` on
@@ -551,22 +765,21 @@ impl GuestMemory for GuestArena {
         };
         // No `< self.base` reject: a guest address below the arena is legal now
         // that `reserve`/`map_at` honor OS-placed and guest-chosen addresses.
-        // `range_is_committed` is the real gate — it admits only the committed
-        // core and ranges this arena actually mapped, so a wild pointer is still
-        // refused.
+        // `range_is_committed` is the real gate.
         if !self.range_is_committed(guest_addr, end) {
             return false;
         }
-        // SAFETY: `[guest_addr, guest_addr + out.len())` lies within
-        // `[self.base, self.base + ARENA_SPAN)`, which `new` committed in
-        // full as readable memory (the image/heap/stack/mmap sub-regions
-        // exactly tile the span). Guest address == host address here
-        // (identity mapping), so `guest_addr as *const u8` is a valid,
-        // readable host pointer for `out.len()` bytes. No other live
-        // reference writes these bytes through Rust. Native guest threads can
-        // concurrently touch the same VirtualAlloc pages, just as real guest
-        // CPUs can race; these host-side copies are non-atomic and may tear.
-        // Guest synchronization is responsible for conflicting accesses.
+        // SAFETY: every byte of `[guest_addr, guest_addr + out.len())` is backed
+        // by committed host memory — `range_is_committed` just walked the map
+        // and found each VMA covering the range `is_host_backed`, which only the
+        // core's own sub-regions and ranges this arena has itself committed ever
+        // are. Guest address == host address here (identity mapping), so
+        // `guest_addr as *const u8` is a valid, readable host pointer for
+        // `out.len()` bytes. No other live reference writes these bytes through
+        // Rust. Native guest threads can concurrently touch the same
+        // VirtualAlloc pages, just as real guest CPUs can race; these host-side
+        // copies are non-atomic and may tear. Guest synchronization is
+        // responsible for conflicting accesses.
         unsafe {
             core::ptr::copy_nonoverlapping(guest_addr as *const u8, out.as_mut_ptr(), out.len());
         }
@@ -657,69 +870,57 @@ impl GuestAllocator for GuestArena {
         let size = align_up(size.max(1), align)?;
         let mut state = self.lock_state();
 
-        // First-fit reuse: any freed block big enough, whose address
-        // already satisfies the requested alignment.
-        if let Some(idx) = state
-            .heap_free
-            .iter()
-            .position(|&(addr, blk_size)| blk_size >= size && addr % align == 0)
+        // The committed heap region. `search_free` walks free ranges in address
+        // order, so a block a previous `free` returned is reused before the
+        // region grows. That is the reuse the old first-fit `Vec` provided, but
+        // without its linear scan, and without its "only if the freed block's
+        // own address happens to satisfy this alignment" restriction, which
+        // silently skipped blocks that were perfectly usable a few bytes in.
+        let heap_end = self.base + STACK_OFFSET;
+        if let Some(addr) = state.vmm.search_free(self.base + HEAP_OFFSET, size, align)
+            && addr.checked_add(size).is_some_and(|end| end <= heap_end)
         {
-            let (addr, blk_size) = state.heap_free.remove(idx);
-            state.heap_sizes.insert(addr, blk_size);
-            return Some(addr);
-        }
-
-        // No reusable block: bump within the committed heap fast path.
-        let addr = align_up(state.heap_bump, align)?;
-        let end = addr.checked_add(size)?;
-        if end <= self.base + STACK_OFFSET {
-            state.heap_bump = end;
+            state.vmm.map_range(
+                addr,
+                size,
+                VmaType::Flexible,
+                prot::CPU_READ_WRITE,
+                None,
+                HEAP_NAME,
+                false,
+            );
             state.heap_sizes.insert(addr, size);
             return Some(addr);
         }
 
-        // Large games can legitimately consume more than the fixed 1 GiB
-        // heap. Commit only the required pages in the already-reserved sparse
-        // tail instead of imposing an emulator-specific memory ceiling.
-        let sparse_align = align.max(PAGE_SIZE);
-        let sparse_addr = align_up(state.reserve_bump, sparse_align)?;
-        let committed_len = align_up(size, PAGE_SIZE)?;
-        let sparse_end = sparse_addr.checked_add(committed_len)?;
-        if sparse_end > self.base + RESERVED_SPAN {
-            return None;
-        }
-        // SAFETY: `[sparse_addr, sparse_end)` lies within this arena's prior
-        // sparse `MEM_RESERVE`, is page aligned, and cannot overlap an older
-        // sparse allocation because `reserve_bump` is shared by reservations
-        // and heap growth. The reservation outlives this allocation.
-        let raw = unsafe {
-            VirtualAlloc(
-                sparse_addr as *const c_void,
-                committed_len as usize,
-                MEM_COMMIT,
-                PAGE_READWRITE,
-            )
-        };
-        if raw.is_null() || raw as u64 != sparse_addr {
-            return None;
-        }
-        state.reserve_bump = sparse_end;
-        state.sparse_mappings.push((sparse_addr, sparse_end));
-        state.heap_sizes.insert(sparse_addr, size);
+        // Large games legitimately consume more than the fixed 1 GiB heap.
+        // Growing on demand beats imposing an emulator-specific memory ceiling.
+        // Record the length that was mapped, not the length that was asked for:
+        // `free` releases whatever `heap_sizes` says, and the two differ by the
+        // page rounding.
+        let (addr, mapped) =
+            self.grow_into_tail(&mut state, size, align.max(PAGE_SIZE), HEAP_NAME)?;
+        state.heap_sizes.insert(addr, mapped);
         if !state.sparse_heap_announced {
             tracing::info!(
-                address = sparse_addr,
+                address = addr,
                 "guest heap exceeded 1 GiB; growing on demand in sparse address space"
             );
             state.sparse_heap_announced = true;
         }
-        Some(sparse_addr)
+        Some(addr)
     }
 
     fn free(&self, addr: u64) {
         let mut state = self.lock_state();
         if let Some(size) = state.heap_sizes.remove(&addr) {
-            state.heap_free.push((addr, size));
+            // Back to the free pool, coalescing with any free neighbours. The
+            // host pages stay committed — for a core block they were committed
+            // at construction, and for a tail block `grow_into_tail`'s
+            // `MEM_COMMIT` is a no-op if the range is handed out again. What
+            // matters is that the *address space* returns, which under the bump
+            // it never did.
+            state.vmm.unmap_range(addr, size);
         }
         // An unrecognized `addr` is simply ignored (trait contract).
     }
@@ -770,48 +971,37 @@ impl GuestAllocator for GuestArena {
         let length = align_up(length.max(1), align)?;
         let mut state = self.lock_state();
 
-        // Fast path: the pre-committed 1.5 GiB mmap region.
-        let addr = align_up(state.mmap_bump, align)?;
-        if let Some(end) = addr.checked_add(length)
-            && end <= self.base + ARENA_SPAN
+        // Fast path: the pre-committed 1.5 GiB mmap region. The bound check is
+        // load-bearing, not defensive — the mmap region and the sparse tail are
+        // contiguous free space, so `search_free` will happily answer with a
+        // tail address once the region fills, and the tail's pages are reserved
+        // rather than committed. Below that boundary the memory already exists;
+        // above it, `grow_into_tail` has to commit it first.
+        let arena_end = self.base + ARENA_SPAN;
+        if let Some(addr) = state
+            .vmm
+            .search_free(self.base + MMAP_OFFSET, length, align)
+            && addr.checked_add(length).is_some_and(|end| end <= arena_end)
         {
-            state.mmap_bump = end;
+            state.vmm.map_range(
+                addr,
+                length,
+                VmaType::Flexible,
+                prot::CPU_READ_WRITE,
+                None,
+                MMAP_NAME,
+                false,
+            );
             return Some(addr);
         }
 
-        // The committed region is only 1.5 GiB, but a retail title's first
-        // request can exceed it outright: ASTRO.BOT opens with
-        // `sceKernelAllocateDirectMemory(len = 0x7980_0000)` (1.94 GiB), which
-        // routes here. Capping at ARENA_SPAN failed that call, the title then
-        // built its heap over a garbage base and died. `alloc` already solves
-        // this by growing into the sparse tail; `mmap` lacking the same
-        // fallback was an asymmetry, not a deliberate ceiling.
-        let sparse_align = align.max(PAGE_SIZE);
-        let sparse_addr = align_up(state.reserve_bump, sparse_align)?;
-        let committed_len = align_up(length, PAGE_SIZE)?;
-        let sparse_end = sparse_addr.checked_add(committed_len)?;
-        if sparse_end > self.base + RESERVED_SPAN {
-            return None;
-        }
-        // SAFETY: identical to `alloc`'s sparse growth — `[sparse_addr,
-        // sparse_end)` lies inside this arena's prior sparse `MEM_RESERVE`, is
-        // page aligned, and cannot overlap an older sparse allocation because
-        // `reserve_bump` is the single bump shared by reservations, heap
-        // growth, and now mmap. The reservation outlives this mapping.
-        let raw = unsafe {
-            VirtualAlloc(
-                sparse_addr as *const c_void,
-                committed_len as usize,
-                MEM_COMMIT,
-                PAGE_READWRITE,
-            )
-        };
-        if raw.is_null() || raw as u64 != sparse_addr {
-            return None;
-        }
-        state.reserve_bump = sparse_end;
-        state.sparse_mappings.push((sparse_addr, sparse_end));
-        Some(sparse_addr)
+        // A retail title's first request can exceed the committed region
+        // outright: ASTRO.BOT opens with `sceKernelAllocateDirectMemory(len =
+        // 0x7980_0000)` — 1.94 GiB — which routes here. Capping at `ARENA_SPAN`
+        // failed that call, and the title then built its heap over a garbage
+        // base and died.
+        self.grow_into_tail(&mut state, length, align.max(PAGE_SIZE), MMAP_NAME)
+            .map(|(addr, _)| addr)
     }
 
     fn reserve(&self, length: u64, align: u64) -> Option<u64> {
@@ -849,13 +1039,44 @@ impl GuestAllocator for GuestArena {
             return None;
         }
         let block = raw as u64;
-        let addr = align_up(block, align)?;
-        let end = addr.checked_add(length)?;
+
+        let Some(addr) = align_up(block, align) else {
+            return self.release_unusable_block(block);
+        };
+        let Some(end) = addr.checked_add(length) else {
+            return self.release_unusable_block(block);
+        };
+        // A range the map cannot describe is a range we cannot serve: every
+        // later read, write and demand-commit asks the map, so an unrecorded
+        // reservation would hand the guest an address that then behaves as if it
+        // did not exist. Windows keeps user allocations inside `VMM_MAX`, so
+        // this is a guard against the impossible rather than an expected path —
+        // but a silent unusable address is exactly the failure mode that cost
+        // this project a week, so it fails loudly instead.
+        if addr < VMM_MIN || end > VMM_MAX {
+            tracing::error!(
+                block,
+                addr,
+                length,
+                "OS placed a reservation outside the mapped address space"
+            );
+            return self.release_unusable_block(block);
+        }
+
         let mut state = self.lock_state();
         state.os_reservations.push(block);
-        // Remember the span so a later touch inside it can be answered with
-        // memory instead of a fault (`commit_on_demand`).
-        state.reservations.push((addr, end));
+        // Teach the map where the OS put it. Nothing else knows: the range lands
+        // in what was `Foreign` space, and only this record makes a later touch
+        // demand-committable (`commit_on_demand`) rather than a fault.
+        state.vmm.map_range(
+            addr,
+            length,
+            VmaType::Reserved,
+            prot::NO_ACCESS,
+            None,
+            RESERVE_NAME,
+            false,
+        );
         Some(addr)
     }
 
@@ -870,69 +1091,75 @@ impl GuestAllocator for GuestArena {
         }
         let length = align_up(length.max(1), PAGE_SIZE)?;
         let end = addr.checked_add(length)?;
-
-        // Already-committed core: usable as-is, nothing to map.
-        if addr >= self.base && end <= self.base + ARENA_SPAN {
-            return Some(addr);
-        }
-
-        // Where the address lives decides how it can be backed. Inside the
-        // sparse tail the span is already `MEM_RESERVE`d by `new`, so it only
-        // needs committing. Outside the arena entirely, nothing owns it yet and
-        // it must be reserved and committed together.
-        //
-        // Serving out-of-arena addresses at all is the point: a title picks its
-        // own VA and then uses that literal value — ASTRO.BOT puts its libc
-        // mspace at 0x300000000 and faults on the first write when the address
-        // it asked for does not exist. Guest pointers round-trip through guest
-        // memory, so the guest must receive the address it requested; a fixed
-        // base cannot answer that.
-        //
-        // A range straddling the arena boundary is refused rather than
-        // half-honored: the two halves need different flags.
-        let in_tail = addr >= self.base + ARENA_SPAN && end <= self.base + RESERVED_SPAN;
-        let outside = end <= self.base || addr >= self.base + RESERVED_SPAN;
-        if !in_tail && !outside {
+        if addr < VMM_MIN || end > VMM_MAX {
             return None;
         }
 
         let mut state = self.lock_state();
-        if state
-            .sparse_mappings
-            .iter()
-            .any(|&(start, mapped_end)| start <= addr && end <= mapped_end)
-        {
+
+        // Already backed end to end: the memory exists, so hand the address
+        // straight back.
+        if range_all(&state.vmm, addr, end, |vma| vma.kind.is_host_backed()) {
             return Some(addr);
         }
-        if state
-            .sparse_mappings
-            .iter()
-            .any(|&(start, mapped_end)| addr < mapped_end && start < end)
-        {
+
+        // Inside the committed core the host pages already exist; the range only
+        // has to be claimed, so a later `search_free` cannot hand it out twice.
+        if addr >= self.base && end <= self.base + ARENA_SPAN {
+            if !range_all(&state.vmm, addr, end, |vma| {
+                vma.kind.is_free() || vma.kind.is_host_backed()
+            }) {
+                return None;
+            }
+            state.vmm.map_range(
+                addr,
+                length,
+                VmaType::Flexible,
+                prot::CPU_READ_WRITE,
+                None,
+                MMAP_NAME,
+                false,
+            );
+            return Some(addr);
+        }
+
+        // Serving an out-of-arena address at all is the point of this method: a
+        // title picks its own VA and then uses that literal value — ASTRO.BOT
+        // puts its libc mspace at 0x300000000 and faults on the first write when
+        // the address it asked for does not exist. Guest pointers round-trip
+        // through guest memory, so the guest must receive the address it asked
+        // for; a fixed base cannot answer that.
+        //
+        // Where it lives decides how it can be backed. Inside the sparse tail,
+        // or inside a range the guest already reserved, the address space is
+        // ours and only needs committing — and `MEM_RESERVE` over an existing
+        // reservation fails with ERROR_INVALID_ADDRESS, so it must *not* be
+        // re-reserved. Outside everything, nothing owns it yet and it needs
+        // both. A range that is not uniformly one of the two is refused rather
+        // than half-honoured: the halves need different flags.
+        let in_tail = addr >= self.base + ARENA_SPAN && end <= self.base + RESERVED_SPAN;
+        let already_owned = (in_tail && range_all(&state.vmm, addr, end, |vma| vma.kind.is_free()))
+            || range_all(&state.vmm, addr, end, |vma| {
+                matches!(vma.kind, VmaType::Reserved | VmaType::ReservedBacked)
+            });
+        let unowned = range_all(&state.vmm, addr, end, |vma| vma.kind == VmaType::Foreign);
+        if !already_owned && !unowned {
             return None;
         }
-        // Committing a range the guest already reserved is the normal path
-        // (reserve, then map inside it), and `MEM_RESERVE` over an existing
-        // reservation fails with ERROR_INVALID_ADDRESS — so only a range nobody
-        // owns yet may be reserved here.
-        let in_reservation = state
-            .reservations
-            .iter()
-            .any(|&(start, res_end)| addr >= start && end <= res_end);
-        let already_owned = in_tail || in_reservation;
         let flags = if already_owned {
             MEM_COMMIT
         } else {
             MEM_RESERVE | MEM_COMMIT
         };
-        // SAFETY: `[addr, end)` is page aligned and validated above to be either
-        // wholly inside memory this arena already reserved (its sparse tail or a
-        // prior `reserve`, committed in place) or wholly outside the arena and
-        // unowned (reserved and committed together). `VirtualAlloc` at an
-        // explicit address succeeds there or returns null; it never silently
-        // relocates, and the `raw != addr` check below rejects a relocation
-        // regardless. Only a newly reserved block is recorded for release, so
-        // `Drop` cannot double-release one `reserve` already owns.
+
+        // SAFETY: `[addr, end)` is page aligned and the map has just shown it to
+        // be uniformly either memory this arena already reserved (its sparse
+        // tail, or a prior `reserve` — committed in place) or wholly unowned
+        // (reserved and committed together). `VirtualAlloc` at an explicit
+        // address succeeds there or returns null; it never silently relocates,
+        // and the `raw != addr` check below rejects a relocation regardless.
+        // Only a newly reserved block is recorded for release, so `Drop` cannot
+        // double-release a block `reserve` already owns.
         let raw = unsafe {
             VirtualAlloc(
                 addr as *const c_void,
@@ -947,15 +1174,42 @@ impl GuestAllocator for GuestArena {
         if !already_owned {
             state.os_reservations.push(addr);
         }
-        state.sparse_mappings.push((addr, end));
+        state.vmm.map_range(
+            addr,
+            length,
+            VmaType::Flexible,
+            prot::CPU_READ_WRITE,
+            None,
+            MMAP_NAME,
+            false,
+        );
         Some(addr)
     }
 
-    fn munmap(&self, _addr: u64, _length: u64) {
-        // Best-effort no-op reclaim for RT2a (design doc §5/§7): the mmap
-        // region has no free list yet, so there is nothing meaningful to
-        // record here without risking a double-free-shaped bug for a
-        // feature (`munmap` reuse) nothing depends on this task.
+    fn munmap(&self, addr: u64, length: u64) {
+        let Some(length) = align_up(length.max(1), PAGE_SIZE) else {
+            return;
+        };
+        let Some(end) = addr.checked_add(length) else {
+            return;
+        };
+        let mut state = self.lock_state();
+
+        // Only ranges the guest itself obtained go back to the pool. This is the
+        // guard that keeps `munmap` from declaring the guest's own image, its
+        // stack, or the host process's address space free for the next
+        // `search_free` to hand out — an unrecognized range is ignored, per the
+        // trait contract, rather than acted on.
+        if !range_all(&state.vmm, addr, end, |vma| vma.kind.is_guest_releasable()) {
+            return;
+        }
+        state.heap_sizes.remove(&addr);
+        // The host pages are left committed: for a core range they were
+        // committed at construction, and for a tail range the `MEM_COMMIT` that
+        // hands it out again is a documented no-op. Returning the address space
+        // is the part that was missing — under the bump, `munmap` was a no-op
+        // and nothing ever came back.
+        state.vmm.unmap_range(addr, length);
     }
 }
 
@@ -1265,6 +1519,54 @@ mod tests {
         assert!(arena.read(first + 0x10, &mut byte));
         assert_eq!(byte, [0xAB]);
         assert!(!arena.write(first + 0x2_0000, &[1]));
+    }
+
+    /// `munmap` must return the range to the free pool. Until the VMA map
+    /// arrived there was no free path at all — `munmap` was a documented no-op
+    /// and `mmap` only ever bumped forward, so a title that mapped and unmapped
+    /// in a loop (every streaming asset system does) walked the address space
+    /// until it ran out, with every byte it had returned still spent.
+    #[test]
+    fn munmap_returns_the_range_so_a_later_mmap_can_reuse_it() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let len = 0x10_0000u64;
+
+        let first = arena.mmap(len, PAGE_SIZE).expect("first mmap");
+        arena.munmap(first, len);
+        let second = arena.mmap(len, PAGE_SIZE).expect("second mmap");
+
+        assert_eq!(
+            first, second,
+            "an unmapped range must be handed out again, not leaked"
+        );
+    }
+
+    /// Reuse must be stable, not just possible once: every cycle has to land
+    /// back on the same address. A bump drifts forward by `len` each time, so
+    /// this pins that the range genuinely returns to the free pool rather than
+    /// the allocator merely having somewhere else to go.
+    #[test]
+    fn repeated_map_unmap_cycles_reuse_the_same_range() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let len = MMAP_SIZE / 2;
+
+        let first = arena.mmap(len, PAGE_SIZE).expect("first mmap");
+        assert!(arena.write(first, &[0xAB]), "mapped memory must be usable");
+        arena.munmap(first, len);
+
+        for i in 1..8 {
+            let addr = arena
+                .mmap(len, PAGE_SIZE)
+                .unwrap_or_else(|| panic!("mmap cycle {i} must succeed"));
+            assert_eq!(
+                addr, first,
+                "cycle {i} drifted instead of reusing the range"
+            );
+            assert!(arena.write(addr, &[0xAB]), "mapped memory must be usable");
+            arena.munmap(addr, len);
+        }
     }
 
     /// (e) `GuestMemory` write-then-read roundtrip inside an alloc'd block

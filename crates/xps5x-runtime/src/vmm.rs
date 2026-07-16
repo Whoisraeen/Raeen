@@ -2,26 +2,34 @@
 //!
 //! # Why this exists
 //!
-//! [`crate::arena::GuestArena`] hands out addresses from monotonic bumps
+//! [`crate::arena::GuestArena`] used to hand out addresses from monotonic bumps
 //! (`heap_bump`, `mmap_bump`, `reserve_bump`) with no free path. Measured
 //! consequence on retail titles: Until Dawn opens with a single 512 GiB
 //! `sceKernelReserveVirtualRange`, which permanently consumed the shared
 //! `reserve_bump`; every later allocation then failed, all the way down to
 //! 64 KiB (`sceKernelAllocateDirectMemory: arena mmap failed`), and the title
-//! died in its own crash reporter. Dragon Ball fails identically. A bump cannot
+//! died in its own crash reporter. Dragon Ball failed identically. A bump cannot
 //! recover from that, because nothing ever returns.
 //!
-//! This module is the replacement: one interval map covering the whole guest
-//! address space, where *every* address belongs to exactly one
-//! [`Vma`] and freeing coalesces back into large blocks. It is a port of
-//! shadPS4's `MemoryManager::vma_map` design (`reference/shadps4`,
-//! GPL-2.0-or-later, © shadPS4 Emulator Project — see `THIRD_PARTY_NOTICES.md`),
-//! which boots commercial titles with this structure. Notably shadPS4 keeps
-//! reservations in the *same* map as ordinary allocations: the defect was never
-//! that they shared an address space, it was the bump and the missing free path.
+//! This module is the replacement, and [`crate::arena::GuestArena`] is now built
+//! on it: one interval map covering the whole guest address space, where *every*
+//! address belongs to exactly one [`Vma`] and freeing coalesces back into large
+//! blocks. It is a port of shadPS4's `MemoryManager::vma_map` design
+//! (`reference/shadps4`, GPL-2.0-or-later, © shadPS4 Emulator Project — see
+//! `THIRD_PARTY_NOTICES.md`), which boots commercial titles with this structure.
+//! Notably shadPS4 keeps reservations in the *same* map as ordinary allocations:
+//! the defect was never that they shared an address space, it was the bump and
+//! the missing free path.
 //!
 //! Deliberately **not** taken from Kyty, whose `PhysicalMemory::Alloc` is the
-//! same monotonic-bump design that is failing here.
+//! same monotonic-bump design that was failing here.
+//!
+//! # Where this deviates from shadPS4
+//!
+//! Two kinds are ours: [`VmaType::Foreign`] and [`VmaType::ReservedBacked`].
+//! Both exist because shadPS4 reserves its entire guest address range up front
+//! and commits a range when it is mapped, while we share a process with the host
+//! and back reservations one fault at a time. Each carries its own note.
 //!
 //! # Invariant
 //!
@@ -44,6 +52,23 @@ pub enum VmaType {
     /// memory backs them. Carries no host mapping: a touch is answered by
     /// demand-commit, and a later `MAP_FIXED` may take the range over.
     Reserved,
+    /// A page of a [`VmaType::Reserved`] range that demand-commit has since
+    /// backed ([`crate::arena::GuestArena::commit_on_demand`]).
+    ///
+    /// Not in shadPS4, which commits a range when it is mapped and so never has
+    /// a half-backed reservation to describe. We must: titles reserve far more
+    /// than they touch (Until Dawn opens with 512 GiB) and then use the range
+    /// directly, so pages are backed one fault at a time. This is the kind that
+    /// says "backed, and reached through a reservation" — the fault handler
+    /// needs exactly that distinction, because a fault on a *core* page is
+    /// unfixable and must be reported, while a fault on a reservation page
+    /// another thread has already backed just needs a retry. Both are
+    /// host-backed, so [`VmaType::is_host_backed`] alone cannot tell them apart.
+    ///
+    /// Contiguous backed pages coalesce ([`Vma::mergeable_with`]), so a title
+    /// walking a reservation linearly collapses back to one VMA rather than
+    /// shredding the map into 4 KiB slivers.
+    ReservedBacked,
     /// Backed by direct ("physical") memory at [`Vma::phys_base`].
     Direct,
     /// Backed by flexible memory.
@@ -58,6 +83,24 @@ pub enum VmaType {
     Code,
     /// The emulator's own mapping, not the guest's to unmap.
     System,
+    /// Address space belonging to the host process — its DLLs, its heap, its
+    /// thread stacks, and every range we have simply never asked the OS for.
+    /// Not the guest's, and not ours to hand out.
+    ///
+    /// Not in shadPS4 either, and for the same underlying reason: it reserves
+    /// its whole guest address range up front, so within its map "free" and
+    /// "ours to place in" are the same statement. We share a process with the
+    /// host and cannot, because the guest picks absolute addresses we must
+    /// honour wherever they land — ASTRO.BOT demands its libc mspace at
+    /// `0x3_0000_0000`, 12 GiB, far below the 16 TiB arena base, and writes to
+    /// that literal address. So the map spans the whole user address space and
+    /// this kind marks the parts we do not own.
+    ///
+    /// Deliberately neither free nor host-backed: [`VmaMap::search_free`] must
+    /// never place here (the OS would refuse, or worse, we would hand the guest
+    /// a host DLL), a stray guest pointer must still be refused by the arena's
+    /// bounds check, and demand-commit must decline it.
+    Foreign,
 }
 
 impl VmaType {
@@ -69,11 +112,32 @@ impl VmaType {
     /// Whether the range has host memory behind it. `Reserved` deliberately
     /// does not: shadPS4 skips the host mapping for reservations
     /// (`core/memory.cpp:665`), which is what makes a 512 GiB reservation cost
-    /// address space rather than 512 GiB of RAM.
+    /// address space rather than 512 GiB of RAM. `Foreign` does not either —
+    /// the host's own memory is not the guest's to read through this map.
     pub fn is_host_backed(self) -> bool {
         !matches!(
             self,
-            VmaType::Free | VmaType::Reserved | VmaType::PoolReserved
+            VmaType::Free | VmaType::Reserved | VmaType::PoolReserved | VmaType::Foreign
+        )
+    }
+
+    /// Whether the guest may release this range — i.e. whether `munmap` may
+    /// hand it back to the free pool.
+    ///
+    /// An allowlist, not a denylist, and deliberately so: this is the guard that
+    /// stands between a stray `munmap` and the map declaring the guest's own
+    /// image, its stack, or the host process's address space free for reuse.
+    /// Only ranges the guest itself obtained may be given back. A new kind
+    /// therefore has to opt in here rather than inherit permission by default.
+    pub fn is_guest_releasable(self) -> bool {
+        matches!(
+            self,
+            VmaType::Direct
+                | VmaType::Flexible
+                | VmaType::Pooled
+                | VmaType::PoolReserved
+                | VmaType::Reserved
+                | VmaType::ReservedBacked
         )
     }
 }
@@ -779,5 +843,71 @@ mod tests {
         assert!(VmaType::Direct.is_host_backed());
         assert!(VmaType::Flexible.is_host_backed());
         assert!(VmaType::Code.is_host_backed());
+        // A demand-backed reservation page really is backed — that is the whole
+        // difference between it and the `Reserved` range it was carved from.
+        assert!(VmaType::ReservedBacked.is_host_backed());
+    }
+
+    /// `Foreign` is the host's own address space. It must fail every question
+    /// that would let the guest reach it: it is not free (so `search_free` will
+    /// not place there), not host-backed (so the arena's bounds check refuses a
+    /// stray pointer into it), and not releasable (so `munmap` cannot return it
+    /// to the pool).
+    #[test]
+    fn foreign_space_is_neither_free_nor_readable_nor_the_guests_to_release() {
+        assert!(!VmaType::Foreign.is_free());
+        assert!(!VmaType::Foreign.is_host_backed());
+        assert!(!VmaType::Foreign.is_guest_releasable());
+    }
+
+    /// The arena's own furniture is readable but must survive any `munmap` the
+    /// guest aims at it — a freed image or stack would be handed straight back
+    /// out by the next `search_free`, under the running program's feet.
+    #[test]
+    fn the_guest_cannot_release_its_own_image_or_stack() {
+        for kind in [VmaType::Code, VmaType::Stack, VmaType::System] {
+            assert!(kind.is_host_backed(), "{kind:?} must stay readable");
+            assert!(
+                !kind.is_guest_releasable(),
+                "{kind:?} must not be releasable"
+            );
+        }
+        // What the guest did obtain, it may give back.
+        for kind in [VmaType::Flexible, VmaType::Direct, VmaType::Reserved] {
+            assert!(kind.is_guest_releasable(), "{kind:?} must be releasable");
+        }
+    }
+
+    #[test]
+    fn search_free_never_places_in_foreign_space() {
+        let mut m = map();
+        // Only a small window in the middle is ours.
+        m.map_range(
+            MIN,
+            0x10_0000,
+            VmaType::Foreign,
+            prot::NO_ACCESS,
+            None,
+            "",
+            false,
+        );
+        let window_end = MIN + 0x10_0000 + 0x1000;
+        m.map_range(
+            window_end,
+            MAX - window_end,
+            VmaType::Foreign,
+            prot::NO_ACCESS,
+            None,
+            "",
+            false,
+        );
+
+        let addr = m
+            .search_free(MIN, 0x1000, 0x1000)
+            .expect("the one free page");
+        assert_eq!(addr, MIN + 0x10_0000);
+        // Nothing larger can fit, because the rest is not ours to give.
+        assert!(m.search_free(MIN, 0x2000, 0x1000).is_none());
+        assert_tiles(&m);
     }
 }
