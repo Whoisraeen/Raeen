@@ -131,6 +131,18 @@ fn main() -> anyhow::Result<()> {
             dynlib_data.imports.len(),
             dynlib_data.exports.len()
         );
+        // The export *table* and the symbol table are different things, and the
+        // gap between them is where Minecraft's boot dies: a symbol this module
+        // defines but never publishes as an export is invisible to dlsym. If
+        // `defined` here materially exceeds `exports`, the export parse is
+        // dropping symbols the guest can legitimately ask for.
+        let defined = dynlib_data.symbols.iter().filter(|s| !s.is_import).count();
+        println!(
+            "dynsym: {} symbol(s) — {} defined, {} imported",
+            dynlib_data.symbols.len(),
+            defined,
+            dynlib_data.symbols.len() - defined
+        );
         // What a module exports is the whole contract a dependent links against,
         // and "41 exports" says nothing about whether the three symbols a title
         // actually wants are among them. Minecraft's boot dies on exactly that
