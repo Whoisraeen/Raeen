@@ -107,6 +107,18 @@ pub fn decrypt_self(
     data: &[u8],
     provider: &dyn KeyProvider,
 ) -> Result<DecryptedSelf, FirmwareError> {
+    // A plain ELF is the already-decrypted case — dumps commonly ship the inner
+    // ELF directly (Dragon Ball's eboot lives in a folder literally named
+    // `decrypted/`). Demanding a SELF wrapper here rejected exactly the files
+    // that need no work at all: `Invalid SELF magic: got 0x464c457f` IS
+    // "\x7fELF".
+    if data.len() >= 4 && data[0..4] == [0x7f, b'E', b'L', b'F'] {
+        return Ok(DecryptedSelf {
+            elf: data.to_vec(),
+            decrypted_segments: 0,
+            passthrough_segments: 0,
+        });
+    }
     let header = parse_header(data)?;
     let entries = parse_entries(data, &header)?;
 

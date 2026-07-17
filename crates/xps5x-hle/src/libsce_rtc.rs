@@ -80,6 +80,8 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceRtc", "sceRtcGetDaysInMonth", hle_get_days_in_month);
     registry.register("libSceRtc", "sceRtcGetDayOfWeek", hle_get_day_of_week);
     registry.register("libSceRtc", "sceRtcCheckValid", hle_check_valid);
+    registry.register("libSceRtc", "sceRtcGetTick", hle_get_tick);
+    registry.register("libSceRtc", "sceRtcSetTick", hle_set_tick);
     registry.register("libSceRtc", "sceRtcCompareTick", hle_compare_tick);
     registry.register("libSceRtc", "sceRtcTickAddTicks", hle_tick_add::<1>);
     registry.register("libSceRtc", "sceRtcTickAddMicroseconds", hle_tick_add::<1>);
@@ -276,6 +278,80 @@ fn hle_get_day_of_week(_ctx: &HleContext, args: &[u64]) -> u64 {
     day_of_week(year, month, day) as u64
 }
 
+/// Inverse of [`tick_to_datetime`]: a broken-out UTC date-time to an Rtc tick
+/// (µs since 0001-01-01), via Howard Hinnant's `days_from_civil`.
+fn datetime_to_tick(dt: &DateTime) -> u64 {
+    let y = i64::from(dt.year) - i64::from(dt.month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let m = i64::from(dt.month);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(dt.day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146_097 + doe - 719_468; // days since 1970-01-01
+    let unix_micros = days * MICROSECONDS_PER_DAY as i64
+        + i64::from(dt.hour) * MICROSECONDS_PER_HOUR as i64
+        + i64::from(dt.minute) * MICROSECONDS_PER_MINUTE as i64
+        + i64::from(dt.second) * MICROSECONDS_PER_SECOND as i64
+        + i64::from(dt.micro);
+    (unix_micros + UNIX_EPOCH_TICKS as i64).max(0) as u64
+}
+
+/// Read a 16-byte guest `SceRtcDateTime` at `addr` into a [`DateTime`].
+fn read_datetime(ctx: &HleContext, addr: u64) -> Option<DateTime> {
+    let mut b = [0u8; 16];
+    if !ctx.mem.read(addr, &mut b) {
+        return None;
+    }
+    let u16_at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+    Some(DateTime {
+        year: u16_at(0),
+        month: u16_at(2),
+        day: u16_at(4),
+        hour: u16_at(6),
+        minute: u16_at(8),
+        second: u16_at(10),
+        micro: u32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+    })
+}
+
+/// `sceRtcGetTick(const SceRtcDateTime *in, SceRtcTick *out)`: convert a
+/// calendar date-time to a 64-bit tick. Unreal reads it right after
+/// `sceRtcGetCurrentClock` to timestamp its log/frame clock.
+fn hle_get_tick(ctx: &HleContext, args: &[u64]) -> u64 {
+    let in_ptr = args.first().copied().unwrap_or(0);
+    let out_ptr = args.get(1).copied().unwrap_or(0);
+    if in_ptr == 0 || out_ptr == 0 {
+        return ERR_INVALID_POINTER;
+    }
+    let Some(dt) = read_datetime(ctx, in_ptr) else {
+        return ERR_INVALID_POINTER;
+    };
+    let tick = datetime_to_tick(&dt);
+    if !ctx.mem.write(out_ptr, &tick.to_le_bytes()) {
+        return ERR_INVALID_POINTER;
+    }
+    OK
+}
+
+/// `sceRtcSetTick(SceRtcDateTime *out, const SceRtcTick *in)`: the inverse —
+/// break a 64-bit tick back into a calendar date-time.
+fn hle_set_tick(ctx: &HleContext, args: &[u64]) -> u64 {
+    let out_ptr = args.first().copied().unwrap_or(0);
+    let in_ptr = args.get(1).copied().unwrap_or(0);
+    if in_ptr == 0 || out_ptr == 0 {
+        return ERR_INVALID_POINTER;
+    }
+    let mut buf = [0u8; 8];
+    if !ctx.mem.read(in_ptr, &mut buf) {
+        return ERR_INVALID_POINTER;
+    }
+    let dt = tick_to_datetime(u64::from_le_bytes(buf));
+    if !write_datetime(ctx, out_ptr, &dt) {
+        return ERR_INVALID_POINTER;
+    }
+    OK
+}
+
 /// `sceRtcCheckValid(const SceRtcDateTime *)`: validate each field in order,
 /// returning the first field error (or OK). Struct layout: year/month/day/
 /// hour/minute/second are `u16` at 0/2/4/6/8/10; microsecond is `u32` at 12.
@@ -382,6 +458,49 @@ mod tests {
         let mem = crate::TestMemory::new(0x400);
         let alloc = crate::TestAllocator::new(0);
         (kernel, mem, alloc)
+    }
+
+    /// `datetime_to_tick` must be the exact inverse of `tick_to_datetime`, and
+    /// `sceRtcGetTick`/`sceRtcSetTick` round-trip through guest memory.
+    #[test]
+    fn get_tick_and_set_tick_round_trip() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // A known moment: 2026-07-17 20:36:00.123456 UTC. Write the datetime,
+        // GetTick it, SetTick the result back, and require an identical datetime.
+        let dt_in = DateTime {
+            year: 2026,
+            month: 7,
+            day: 17,
+            hour: 20,
+            minute: 36,
+            second: 0,
+            micro: 123_456,
+        };
+        assert!(write_datetime(&ctx, 0x40, &dt_in));
+        assert_eq!(hle_get_tick(&ctx, &[0x40, 0x80]), OK);
+        // Break the tick back out into a fresh datetime slot and compare bytes.
+        assert_eq!(hle_set_tick(&ctx, &[0xC0, 0x80]), OK);
+        let mut orig = [0u8; 16];
+        let mut round = [0u8; 16];
+        assert!(ctx.mem.read(0x40, &mut orig));
+        assert!(ctx.mem.read(0xC0, &mut round));
+        assert_eq!(orig, round, "GetTick->SetTick must round-trip");
+
+        // And the pure inverse holds for an arbitrary tick.
+        for tick in [UNIX_EPOCH_TICKS, UNIX_EPOCH_TICKS + 1, 63_000_000_000_000_000] {
+            let dt = tick_to_datetime(tick);
+            assert_eq!(datetime_to_tick(&dt), tick, "tick {tick} must round-trip");
+        }
+    }
+
+    #[test]
+    fn get_tick_rejects_null_pointers() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_get_tick(&ctx, &[0, 0x80]), ERR_INVALID_POINTER);
+        assert_eq!(hle_get_tick(&ctx, &[0x40, 0]), ERR_INVALID_POINTER);
     }
 
     #[test]

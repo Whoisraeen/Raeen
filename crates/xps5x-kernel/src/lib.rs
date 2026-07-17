@@ -238,6 +238,13 @@ pub struct OrbisKernel {
     /// Display buffers registered by VideoOut, keyed by `(port, slot)`.
     pub video_out_buffers: DashMap<(i32, i32), VideoOutBuffer>,
     /// Completed VideoOut flips for this process.
+    /// Bytes of direct memory currently allocated, against
+    /// [`Self::DIRECT_MEMORY_SIZE`]. A real PS5 exposes a fixed direct-memory
+    /// budget and titles *discover* it by allocating until the kernel refuses —
+    /// Dragon Ball allocates 1 GiB in a loop expecting ENOMEM after ~13 GiB.
+    /// Without a budget that loop consumed ~900 GiB of host address space and
+    /// then fell over on placement instead of ending normally.
+    pub direct_memory_allocated: std::sync::atomic::AtomicU64,
     pub video_out_flip_count: std::sync::atomic::AtomicU64,
     /// Process-local vertical-blank sequence used by frame pacing APIs.
     pub video_out_vblank_count: std::sync::atomic::AtomicU64,
@@ -612,6 +619,7 @@ impl OrbisKernel {
             agc_last_dcb_dwords: std::sync::atomic::AtomicU32::new(0),
             agc_register_defaults_addr: std::sync::atomic::AtomicU64::new(0),
             video_out_buffers: DashMap::new(),
+            direct_memory_allocated: std::sync::atomic::AtomicU64::new(0),
             video_out_flip_count: std::sync::atomic::AtomicU64::new(0),
             video_out_vblank_count: std::sync::atomic::AtomicU64::new(0),
             video_out_last_flip_arg: std::sync::atomic::AtomicI64::new(0),

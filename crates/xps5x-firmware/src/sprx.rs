@@ -197,6 +197,13 @@ pub struct SprxModule {
 /// `elf`; a truncated or otherwise malformed image returns
 /// [`FirmwareError::MalformedDynlibData`], never panics.
 pub fn parse_sprx(elf: &[u8]) -> Result<SprxModule, FirmwareError> {
+    // A real title's section-header table is routinely stripped or stale: its
+    // `e_shoff` points past the file (Dragon Ball: 0x1eead2a0 in a 0xa17f1d8
+    // file). goblin parses sections eagerly and fails ("bad offset ..."), but
+    // loading needs only PROGRAM headers, which are valid. Neutralise the
+    // section table when it's out of range so goblin parses just the phdrs.
+    let sanitized = sanitize_section_table(elf);
+    let elf: &[u8] = &sanitized;
     let parsed = goblin::elf::Elf::parse(elf)
         .map_err(|e| FirmwareError::MalformedDynlibData(format!("ELF parse error: {e}")))?;
 
@@ -447,6 +454,37 @@ pub fn proc_param_sdk_version(module: &SprxModule) -> Option<u32> {
 /// Slice `elf[p_offset .. p_offset + p_filesz]`, bounds-checked. Never
 /// panics; returns [`FirmwareError::MalformedDynlibData`] on overflow or
 /// out-of-bounds ranges.
+/// Zero out `e_shoff`/`e_shnum`/`e_shstrndx` when the section-header table
+/// lies outside the file, so goblin's eager section parse cannot fail on it.
+///
+/// Program headers are what loading actually consumes; sections are debug-info
+/// baggage that dump tools routinely truncate away while leaving the header
+/// fields stale. A valid table is left untouched (borrowed, no copy).
+fn sanitize_section_table(elf: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    // ELF64 little-endian layout: e_shoff at 0x28 (u64), e_shentsize at 0x3a
+    // (u16), e_shnum at 0x3c (u16), e_shstrndx at 0x3e (u16).
+    if elf.len() < 0x40 {
+        return std::borrow::Cow::Borrowed(elf);
+    }
+    let shoff = u64::from_le_bytes(elf[0x28..0x30].try_into().unwrap());
+    let shentsize = u64::from(u16::from_le_bytes(elf[0x3a..0x3c].try_into().unwrap()));
+    let shnum = u64::from(u16::from_le_bytes(elf[0x3c..0x3e].try_into().unwrap()));
+    let table_end = shoff.saturating_add(shentsize.saturating_mul(shnum));
+    if shnum == 0 || table_end <= elf.len() as u64 {
+        return std::borrow::Cow::Borrowed(elf);
+    }
+    info!(
+        "section-header table [{shoff:#x}, {table_end:#x}) exceeds file size {:#x} — \
+         stripping stale sections (program headers are unaffected)",
+        elf.len()
+    );
+    let mut owned = elf.to_vec();
+    owned[0x28..0x30].fill(0); // e_shoff = 0
+    owned[0x3c..0x3e].fill(0); // e_shnum = 0
+    owned[0x3e..0x40].fill(0); // e_shstrndx = SHN_UNDEF
+    std::borrow::Cow::Owned(owned)
+}
+
 fn slice_phdr(elf: &[u8], phdr: &ProgramHeader, label: &str) -> Result<Vec<u8>, FirmwareError> {
     let start = phdr.p_offset as usize;
     let len = phdr.p_filesz as usize;

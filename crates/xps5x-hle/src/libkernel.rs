@@ -581,6 +581,10 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register("libkernel", "sceKernelMunmap", hle_munmap);
     registry.register("libkernel", "sceKernelMmap", hle_mmap);
+    // BatchMap2 is BatchMap plus a trailing flags argument the batch semantics
+    // already imply (fixed-address); one handler serves both.
+    registry.register("libkernel", "sceKernelBatchMap", hle_batch_map);
+    registry.register("libkernel", "sceKernelBatchMap2", hle_batch_map);
 
     // -- File descriptors / console I/O (M1-C) --
     registry.register("libkernel", "write", hle_posix_write);
@@ -956,6 +960,16 @@ pub(crate) fn hle_getpid(_ctx: &HleContext, _args: &[u64]) -> u64 {
 /// `physAddrOut` is out of bounds (bounds-checked, never a panic/OOB) — in
 /// the latter case the just-recorded metadata is rolled back via
 /// `remove_mapping` so no dangling record is left behind.
+/// The direct-memory budget reported to and enforced on titles: ~13.375 GiB,
+/// the commonly-measured game-usable direct memory of a retail PS5. Titles
+/// size their pools by allocating until the kernel refuses, so both the
+/// refusal and the reported size must model the console, not the host.
+pub(crate) const PS5_DIRECT_MEMORY_SIZE: u64 = 0x3_5800_0000;
+
+/// `SCE_KERNEL_ERROR_EAGAIN` — what the real allocator returns when the
+/// direct-memory budget cannot satisfy the request.
+const SCE_KERNEL_ERROR_EAGAIN_ALLOC: u64 = 0x8002_000B;
+
 fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     let search_start = args.first().copied().unwrap_or(0);
     let search_end = args.get(1).copied().unwrap_or(0);
@@ -980,8 +994,40 @@ fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     } else {
         return SCE_KERNEL_ERROR_EINVAL;
     };
+    // Enforce the console's direct-memory budget BEFORE touching the host
+    // arena. A real PS5 refuses once the budget is spent, and titles rely on
+    // that refusal to discover how much memory exists: Dragon Ball allocates
+    // 1 GiB in a loop until ENOMEM and sizes its pools from the total. With no
+    // budget that loop "succeeded" ~900 times, consumed the entire host mapping
+    // window, and then died on placement instead of ending normally.
+    {
+        use std::sync::atomic::Ordering;
+        let mut current = ctx.kernel.direct_memory_allocated.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = current.checked_add(len).filter(|n| *n <= PS5_DIRECT_MEMORY_SIZE)
+            else {
+                debug!(
+                    "sceKernelAllocateDirectMemory: budget exhausted \
+                     (allocated={current:#x} + len={len:#x} > {PS5_DIRECT_MEMORY_SIZE:#x}) — EAGAIN"
+                );
+                return SCE_KERNEL_ERROR_EAGAIN_ALLOC;
+            };
+            match ctx.kernel.direct_memory_allocated.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(seen) => current = seen,
+            }
+        }
+    }
     let Some(addr) = ctx.alloc.mmap(len, alignment) else {
         warn!("sceKernelAllocateDirectMemory: arena mmap failed (len={len:#x})");
+        ctx.kernel
+            .direct_memory_allocated
+            .fetch_sub(len, std::sync::atomic::Ordering::Relaxed);
         return HLE_ERROR;
     };
     ctx.kernel.memory.record_mapping(addr, len, DEFAULT_PROT);
@@ -1042,6 +1088,14 @@ fn hle_release_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     }
     ctx.alloc.munmap(start, len);
     ctx.kernel.memory.remove_mapping(start);
+    // Return the bytes to the direct-memory budget. Saturating: release is
+    // best-effort/idempotent (see above), so an untracked or double release
+    // must not underflow the counter.
+    let _ = ctx.kernel.direct_memory_allocated.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |v| Some(v.saturating_sub(len)),
+    );
     SCE_OK
 }
 
@@ -1136,6 +1190,106 @@ fn hle_map_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
+/// `sceKernelBatchMap(entries, numEntries, numEntriesOut)` /
+/// `sceKernelBatchMap2(..., flags)` — perform a batch of map/unmap/protect
+/// operations in one call.
+///
+/// Both Dragon Ball and Until Dawn fault on exactly this import (nid
+/// 0xd92284c7a6d2abfe) right after sizing their memory pools — Unreal's PS5
+/// allocator carves its reserved VA range into pages with batched fixed-address
+/// direct-memory maps. Entry layout (32 bytes, cross-checked against shadPS4's
+/// `OrbisKernelBatchMapEntry` and the OpenOrbis headers):
+/// `{ start: u64, offset: u64 (phys for MAP_DIRECT), length: u64,
+///    protection: u8, type: u8, pad: u16, operation: u32 }`.
+///
+/// `numEntriesOut` is updated as entries complete, so on error the title knows
+/// how many succeeded (the real kernel does the same).
+fn hle_batch_map(ctx: &HleContext, args: &[u64]) -> u64 {
+    const OP_MAP_DIRECT: u32 = 0;
+    const OP_UNMAP: u32 = 1;
+    const OP_PROTECT: u32 = 2;
+    const OP_MAP_FLEXIBLE: u32 = 3;
+    const OP_TYPE_PROTECT: u32 = 4;
+    const ENTRY_SIZE: u64 = 32;
+
+    let entries = args.first().copied().unwrap_or(0);
+    let num = args.get(1).copied().unwrap_or(0) as u32;
+    let num_out = args.get(2).copied().unwrap_or(0);
+    debug!("sceKernelBatchMap(entries={entries:#x}, num={num}, numOut={num_out:#x})");
+    if entries == 0 || num == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let page = xps5x_core::PS5_PAGE_SIZE as u64;
+    let mut done: u32 = 0;
+    let mut status = SCE_OK;
+    for i in 0..num {
+        let mut e = [0u8; ENTRY_SIZE as usize];
+        if !ctx.mem.read(entries + u64::from(i) * ENTRY_SIZE, &mut e) {
+            status = SCE_KERNEL_ERROR_EFAULT;
+            break;
+        }
+        let start = u64::from_le_bytes(e[0x00..0x08].try_into().unwrap());
+        let offset = u64::from_le_bytes(e[0x08..0x10].try_into().unwrap());
+        let length = u64::from_le_bytes(e[0x10..0x18].try_into().unwrap());
+        let prot = u32::from(e[0x18]);
+        let operation = u32::from_le_bytes(e[0x1c..0x20].try_into().unwrap());
+        if std::env::var_os("XPS5X_TRACE_DIRECT_MEMORY").is_some() {
+            warn!(
+                "batch-map[{i}]: op={operation} start={start:#x} offset={offset:#x} \
+                 len={length:#x} prot={prot:#x}"
+            );
+        }
+        let ok = match operation {
+            OP_MAP_DIRECT | OP_MAP_FLEXIBLE => {
+                if length == 0 {
+                    false
+                } else if start != 0 {
+                    // Batch maps are fixed-address: the title owns the layout
+                    // (typically inside its own reserved range) and will use
+                    // `start` directly.
+                    let mapped = ctx.alloc.map_at(start, length, page).is_some();
+                    if mapped {
+                        ctx.kernel.memory.record_mapping(start, length, prot);
+                    }
+                    mapped
+                } else if operation == OP_MAP_DIRECT && offset != 0 {
+                    // No fixed address: direct memory is live arena storage at
+                    // its physical offset (see hle_map_direct_memory) — the
+                    // mapping IS that storage.
+                    ctx.kernel.memory.record_mapping(offset, length, prot);
+                    true
+                } else {
+                    ctx.alloc.mmap(length, page).is_some_and(|addr| {
+                        ctx.kernel.memory.record_mapping(addr, length, prot);
+                        true
+                    })
+                }
+            }
+            OP_UNMAP => {
+                ctx.alloc.munmap(start, length);
+                ctx.kernel.memory.remove_mapping(start);
+                true
+            }
+            // Protection changes are a no-op today (sceKernelMprotect is an
+            // ok-stub): the arena maps everything R+W+X-as-needed.
+            OP_PROTECT | OP_TYPE_PROTECT => true,
+            other => {
+                warn!("sceKernelBatchMap: unknown operation {other} at entry {i}");
+                false
+            }
+        };
+        if !ok {
+            status = SCE_KERNEL_ERROR_EINVAL;
+            break;
+        }
+        done += 1;
+    }
+    if num_out != 0 && !ctx.mem.write(num_out, &done.to_le_bytes()) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    status
+}
+
 /// Real signature: `sceKernelMapFlexibleMemory(void **addrOut, size_t len,
 /// int prot, int flags)`.
 ///
@@ -1218,7 +1372,10 @@ fn hle_mmap(ctx: &HleContext, args: &[u64]) -> u64 {
 /// pool size.
 fn hle_get_direct_memory_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
     debug!("sceKernelGetDirectMemorySize()");
-    0x4000_0000
+    // Must agree with the allocator's enforced budget: a title that reads this
+    // then allocates it expects the allocations to succeed, and one that
+    // allocates-until-refused expects the total to be about this.
+    PS5_DIRECT_MEMORY_SIZE
 }
 
 /// Plausible amount of "available" flexible memory reported to the guest
