@@ -221,6 +221,29 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<RenderedImag
     require_32bpp(state.format)?;
 
     let mut res = Resources::new(dev);
+    if std::env::var_os("XPS5X_TIME_DRAW").is_some() {
+        use std::time::Instant;
+        let t0 = Instant::now();
+        res.build(state)?;
+        let t_build = t0.elapsed();
+        let t1 = Instant::now();
+        res.record_and_submit(state)?;
+        let t_submit = t1.elapsed();
+        let t2 = Instant::now();
+        let pixels = res.read_back(state.width, state.height)?;
+        let t_readback = t2.elapsed();
+        tracing::warn!(
+            build_us = t_build.as_micros(),
+            submit_us = t_submit.as_micros(),
+            readback_us = t_readback.as_micros(),
+            "TIME_DRAW: per-draw phase timing"
+        );
+        return Ok(RenderedImage {
+            width: state.width,
+            height: state.height,
+            pixels,
+        });
+    }
     res.build(state)?;
     res.record_and_submit(state)?;
     let pixels = res.read_back(state.width, state.height)?;
@@ -699,11 +722,20 @@ impl<'a> Resources<'a> {
         let size = vk::DeviceSize::from(width)
             * vk::DeviceSize::from(height)
             * vk::DeviceSize::from(BYTES_PER_PIXEL);
-        let (buffer, memory) = self.create_buffer(
-            size,
-            vk::BufferUsageFlags::TRANSFER_DST,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
+        // The whole frame is copied out of this buffer on the CPU. Without
+        // HOST_CACHED that copy reads uncached memory, which is ~50x slower:
+        // measured 32 ms to read back one 1080p frame, dwarfing the ~1 ms of
+        // actual GPU work. Prefer a cached+coherent type (fast reads, no manual
+        // invalidate); fall back to coherent-only where the device has no such
+        // type.
+        let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let (buffer, memory) = self
+            .create_buffer(
+                size,
+                vk::BufferUsageFlags::TRANSFER_DST,
+                host | vk::MemoryPropertyFlags::HOST_CACHED,
+            )
+            .or_else(|_| self.create_buffer(size, vk::BufferUsageFlags::TRANSFER_DST, host))?;
         self.readback_buffer = buffer;
         self.readback_memory = memory;
         Ok(())
