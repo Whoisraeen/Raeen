@@ -116,6 +116,12 @@ pub struct DrawState<'a> {
     pub viewport: [f32; 4],
     pub topology: vk::PrimitiveTopology,
     pub cull_mode: vk::CullModeFlags,
+    /// Which colour channels the draw may write, from `CB_TARGET_MASK`.
+    ///
+    /// Vulkan expresses this natively, so a guest mask maps straight through
+    /// rather than being a limitation: a title that writes RGB and leaves alpha
+    /// alone (mask 0x7) is doing something completely ordinary.
+    pub color_write_mask: vk::ColorComponentFlags,
     /// Host vertex data, or `None` for a shader that synthesizes its own
     /// geometry from `gl_VertexIndex` (Kyty's embedded VS does exactly this and
     /// declares no input attributes, so binding one would be invalid).
@@ -147,6 +153,9 @@ impl<'a> DrawState<'a> {
             clear_color: CLEAR_COLOR,
             scissor: [0, 0, width as i32, height as i32],
             viewport: [0.0, 0.0, width as f32, height as f32],
+            // The fixture preset writes every channel; a guest draw overrides
+            // this from CB_TARGET_MASK.
+            color_write_mask: vk::ColorComponentFlags::RGBA,
             topology: vk::PrimitiveTopology::TRIANGLE_LIST,
             cull_mode: vk::CullModeFlags::NONE,
             vertices: None,
@@ -783,7 +792,7 @@ impl<'a> Resources<'a> {
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
         let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .color_write_mask(state.color_write_mask)
             .blend_enable(false)];
         let color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);

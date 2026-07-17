@@ -57,6 +57,33 @@ fn color_output_disabled(ctx: &Context) -> bool {
     ctx.render_target_mask == 0
 }
 
+/// Map `CB_TARGET_MASK`'s MRT0 nibble to Vulkan's colour write mask.
+///
+/// Bit per channel, R in bit 0 through A in bit 3 — the same shape Vulkan uses,
+/// so this is a rename rather than an approximation.
+///
+/// This used to reject anything but `0xF` as "a partial write mask; only 0xF is
+/// supported", inherited from Kyty accepting only all-or-nothing targets. Two
+/// things were wrong with that. Partial masks are ordinary — `0x7` is RGB with
+/// alpha left alone, which Minecraft issues — and the rejection was an `Err` out
+/// of `draw_state_from_regs`, which propagates through `run?` in `execute_dcb_cp`
+/// and **abandons every remaining draw in the command buffer**. One unremarkable
+/// mask killed a whole DCB.
+fn vulkan_color_write_mask(target_mask: u32) -> vk::ColorComponentFlags {
+    let mut flags = vk::ColorComponentFlags::empty();
+    for (bit, flag) in [
+        (0, vk::ColorComponentFlags::R),
+        (1, vk::ColorComponentFlags::G),
+        (2, vk::ColorComponentFlags::B),
+        (3, vk::ColorComponentFlags::A),
+    ] {
+        if target_mask & (1 << bit) != 0 {
+            flags |= flag;
+        }
+    }
+    flags
+}
+
 /// Map `CB_COLOR0_INFO`'s format/channel_type/channel_order triple to Vulkan.
 ///
 /// Only the combinations the Phase 1 path can honour are accepted; anything
@@ -400,16 +427,12 @@ pub fn draw_state_from_regs<'a>(
             "no bound render target: CB_COLOR0_BASE is 0 (NoColorOutput)",
         ));
     }
-    // Kyty accepts only a fully-enabled or fully-disabled colour target.
-    match ctx.render_target_mask {
-        0xF => {}
-        0 => return Err(err("CB_TARGET_MASK is 0 — colour output disabled")),
-        other => {
-            return Err(err(format!(
-                "CB_TARGET_MASK {other:#x} is a partial write mask; only 0xF is supported"
-            )));
-        }
+    // A fully-disabled target is handled by the caller (`color_output_disabled`)
+    // before this point; reaching here with 0 would silently draw nothing.
+    if ctx.render_target_mask == 0 {
+        return Err(err("CB_TARGET_MASK is 0 — colour output disabled"));
     }
+    let color_write_mask = vulkan_color_write_mask(ctx.render_target_mask);
 
     // The PS5 extent lives in ATTRIB2 and stores width/height minus one.
     let width = rt.attrib2.width + 1;
@@ -503,6 +526,7 @@ pub fn draw_state_from_regs<'a>(
         viewport,
         topology,
         cull_mode,
+        color_write_mask,
         // The embedded VS declares no input attributes and builds its own quad.
         vertices: None,
         vertex_buffers: Vec::new(),
@@ -857,13 +881,49 @@ mod tests {
         assert!(e.0.contains("render target"), "got {e}");
     }
 
+    /// A partial `CB_TARGET_MASK` is an ordinary draw, not a broken DCB.
+    ///
+    /// This used to be `partial_render_target_mask_is_a_named_error` and
+    /// asserted the opposite. That rejection was an `Err` out of
+    /// `draw_state_from_regs`, which propagates through `run?` in
+    /// `execute_dcb_cp` and abandons every remaining draw in the command
+    /// buffer — so a mask of 0x7 (RGB, alpha untouched, which Minecraft issues)
+    /// destroyed a whole DCB. Vulkan expresses the mask natively; it maps
+    /// straight through.
     #[test]
-    fn partial_render_target_mask_is_a_named_error() {
+    fn partial_render_target_mask_maps_to_vulkans_write_mask() {
         let mut ctx = ctx_96x48();
-        ctx.render_target_mask = 0x3;
-        let e =
-            draw_state_from_regs(&ctx, &ucfg_rect(), 3, SPIRV, SPIRV).expect_err("partial mask");
-        assert!(e.0.contains("CB_TARGET_MASK"), "got {e}");
+        ctx.render_target_mask = 0x7;
+        let state = draw_state_from_regs(&ctx, &ucfg_rect(), 3, SPIRV, SPIRV)
+            .expect("a partial mask is a normal draw");
+        assert_eq!(
+            state.color_write_mask,
+            vk::ColorComponentFlags::R | vk::ColorComponentFlags::G | vk::ColorComponentFlags::B,
+            "0x7 is RGB with alpha writes disabled"
+        );
+    }
+
+    /// Bit order is R,G,B,A from bit 0 — getting it reversed would silently
+    /// write the wrong channels rather than fail.
+    #[test]
+    fn target_mask_bits_map_to_the_right_channels() {
+        for (mask, expected) in [
+            (0xF, vk::ColorComponentFlags::RGBA),
+            (0x1, vk::ColorComponentFlags::R),
+            (0x2, vk::ColorComponentFlags::G),
+            (0x4, vk::ColorComponentFlags::B),
+            (0x8, vk::ColorComponentFlags::A),
+            (
+                0x9,
+                vk::ColorComponentFlags::R | vk::ColorComponentFlags::A,
+            ),
+        ] {
+            assert_eq!(
+                vulkan_color_write_mask(mask),
+                expected,
+                "CB_TARGET_MASK {mask:#x}"
+            );
+        }
     }
 
     #[test]
