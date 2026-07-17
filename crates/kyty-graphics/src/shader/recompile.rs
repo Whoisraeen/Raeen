@@ -5322,6 +5322,15 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_vcmpx_xxx_u32, T::VCmpxGeU32,  F::SmaskVsrc0Vsrc1, p1("OpUGreaterThanEqual")),
     f(recompile_vcmpx_xxx_u32, T::VCmpxGtU32,  F::SmaskVsrc0Vsrc1, p1("OpUGreaterThan")),
     f(recompile_vcmpx_xxx_u32, T::VCmpxLtU32,  F::SmaskVsrc0Vsrc1, p1("OpULessThan")),
+    // The `v_cmpx_*_i32` block: same lowering as its unsigned twins above, but
+    // through `_i32` — that variant loads its operands with `operand_load_int`,
+    // which is what a signed compare needs (an inline constant must arrive
+    // sign-extended). Eq/Ne are sign-agnostic and match the unsigned rows.
+    f(recompile_vcmpx_xxx_i32, T::VCmpxLtI32,  F::SmaskVsrc0Vsrc1, p1("OpSLessThan")),
+    f(recompile_vcmpx_xxx_i32, T::VCmpxGeI32,  F::SmaskVsrc0Vsrc1, p1("OpSGreaterThanEqual")),
+    f(recompile_vcmpx_xxx_i32, T::VCmpxGtI32,  F::SmaskVsrc0Vsrc1, p1("OpSGreaterThan")),
+    f(recompile_vcmpx_xxx_i32, T::VCmpxEqI32,  F::SmaskVsrc0Vsrc1, p1("OpIEqual")),
+    f(recompile_vcmpx_xxx_i32, T::VCmpxNeI32,  F::SmaskVsrc0Vsrc1, p1("OpINotEqual")),
 
     f(recompile_scmp_xxx_i32, T::SCmpEqI32, F::Ssrc0Ssrc1, p1("OpIEqual")),
     f(recompile_scmp_xxx_i32, T::SCmpGeI32, F::Ssrc0Ssrc1, p1("OpSGreaterThanEqual")),
@@ -5535,13 +5544,14 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            212,
+            217,
             "204 Kyty rows plus SSubU32, SNop, and the RDNA2-only rows \
-             (VLshlAddU32, VCmpxLtU32, VAddNcU32, VSubNcU32, VSubrevNcU32, VCvtI32F32)"
+             (VLshlAddU32, VCmpxLtU32, VAddNcU32, VSubNcU32, VSubrevNcU32, VCvtI32F32, \
+             and the v_cmpx_*_i32 block: VCmpxLtI32/GeI32/GtI32/EqI32/NeI32)"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 139,
+            implemented, 144,
             "C1 implemented subset plus title-driven ports"
         );
         assert_eq!(ni, 73, "C2 remainder");
@@ -5796,6 +5806,50 @@ mod tests {
         assert!(source.contains("OpStore %scc"));
         let words = spirv_run(&source).expect("assemble measured s_lshl_b32");
         naga_parse_and_validate(&words, "s_lshl_b32");
+    }
+
+    #[test]
+    /// `v_cmpx_lt_i32` (VOPC 0x91) is the SIGNED twin of `v_cmpx_lt_u32`
+    /// (0xd1). Minecraft reaches a shader using it once boot gets far enough,
+    /// and the whole 0x9x (`v_cmpx_*_i32`) block was missing from the decoder —
+    /// the instruction read as unknown and every draw binding that shader was
+    /// skipped.
+    ///
+    /// The two share one lowering, so the ONLY thing separating them is the
+    /// SPIR-V op. That is what this pins: swapping them would silently compare
+    /// as the wrong signedness, which no other test would catch.
+    #[test]
+    fn v_cmpx_i32_block_is_wired_and_compares_signed() {
+        // (type, expected SPIR-V op). Ordering ops MUST be signed: these share
+        // one lowering with their unsigned twins, so the op is the only thing
+        // separating them — swap it and the shader silently compares as the
+        // wrong signedness, which no other test would catch.
+        let signed = [
+            (T::VCmpxLtI32, "OpSLessThan"),
+            (T::VCmpxGeI32, "OpSGreaterThanEqual"),
+            (T::VCmpxGtI32, "OpSGreaterThan"),
+            // Equality is sign-agnostic, hence the same ops as the U32 rows.
+            (T::VCmpxEqI32, "OpIEqual"),
+            (T::VCmpxNeI32, "OpINotEqual"),
+        ];
+        for (ty, op) in signed {
+            let entry = recomp_func(ty, F::SmaskVsrc0Vsrc1).unwrap_or_else(|| panic!("{ty:?} row"));
+            assert!(
+                matches!(entry.func, RecompileFn::Func(_)),
+                "{ty:?} must be implemented, not NI"
+            );
+            assert_eq!(entry.param[0], Some(op), "{ty:?} compares with the wrong op");
+        }
+
+        // The unsigned twins must be untouched by the signed block landing.
+        for (ty, op) in [
+            (T::VCmpxLtU32, "OpULessThan"),
+            (T::VCmpxGeU32, "OpUGreaterThanEqual"),
+            (T::VCmpxGtU32, "OpUGreaterThan"),
+        ] {
+            let entry = recomp_func(ty, F::SmaskVsrc0Vsrc1).unwrap_or_else(|| panic!("{ty:?} row"));
+            assert_eq!(entry.param[0], Some(op), "{ty:?} must stay UNSIGNED");
+        }
     }
 
     #[test]

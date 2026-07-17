@@ -1027,6 +1027,18 @@ fn shader_parse_vopc(
         0x85 => inst.type_ = T::VCmpNeI32,
         0x86 => inst.type_ = T::VCmpGeI32,
         0x87 => inst.type_ = T::VCmpTI32,
+        // 0x9x is the `v_cmpx_*_i32` block — the signed twin of the 0xdx
+        // (`v_cmpx_*_u32`) block below. The whole block was missing, so each
+        // instruction decoded as unknown and every draw binding that shader was
+        // skipped. Measured in Minecraft, which reaches shaders using
+        // `v_cmpx_lt_i32` (0x91) and `v_cmpx_ge_i32` (0x96) once boot gets far
+        // enough; the rest of the block is wired at the same time because it is
+        // the same lowering and the title decides one opcode at a time.
+        0x91 => inst.type_ = T::VCmpxLtI32,
+        0x92 => inst.type_ = T::VCmpxEqI32,
+        0x94 => inst.type_ = T::VCmpxGtI32,
+        0x95 => inst.type_ = T::VCmpxNeI32,
+        0x96 => inst.type_ = T::VCmpxGeI32,
         0xc0 => inst.type_ = T::VCmpFU32,
         0xc1 => inst.type_ = T::VCmpLtU32,
         0xc2 => inst.type_ = T::VCmpEqU32,
@@ -1618,6 +1630,18 @@ fn shader_parse_vop3(
         0x85 => inst.type_ = T::VCmpNeI32,
         0x86 => inst.type_ = T::VCmpGeI32,
         0x87 => inst.type_ = T::VCmpTI32,
+        // 0x9x is the `v_cmpx_*_i32` block — the signed twin of the 0xdx
+        // (`v_cmpx_*_u32`) block below. The whole block was missing, so each
+        // instruction decoded as unknown and every draw binding that shader was
+        // skipped. Measured in Minecraft, which reaches shaders using
+        // `v_cmpx_lt_i32` (0x91) and `v_cmpx_ge_i32` (0x96) once boot gets far
+        // enough; the rest of the block is wired at the same time because it is
+        // the same lowering and the title decides one opcode at a time.
+        0x91 => inst.type_ = T::VCmpxLtI32,
+        0x92 => inst.type_ = T::VCmpxEqI32,
+        0x94 => inst.type_ = T::VCmpxGtI32,
+        0x95 => inst.type_ = T::VCmpxNeI32,
+        0x96 => inst.type_ = T::VCmpxGeI32,
         0xc0 => inst.type_ = T::VCmpFU32,
         0xc1 => inst.type_ = T::VCmpLtU32,
         0xc2 => inst.type_ = T::VCmpEqU32,
