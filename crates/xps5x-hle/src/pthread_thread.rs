@@ -103,13 +103,24 @@ fn hle_rename(ctx: &HleContext, args: &[u64]) -> u64 {
         if ctx.mem.read(name_ptr, &mut buf) {
             let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
             if let Ok(name) = std::str::from_utf8(&buf[..end]) {
-                info!(thread, name, "guest pthread named");
-                // Titles name the pthread HANDLE, but diagnostics look
-                // threads up by the id the caller runs as — for self-renames
-                // (the common case) that is the current thread.
-                ctx.kernel
-                    .thread_names
-                    .insert(ctx.guest_threads.current_thread(), name.to_owned());
+                // Name the TARGET thread. `thread` is the handle
+                // `scePthreadCreate` wrote back, and that handle IS the guest
+                // thread id (`GuestThreads::create` writes the same value it
+                // reports as `guest_thread`), so it needs no translation.
+                //
+                // Keying on `current_thread()` instead assumed a self-rename.
+                // Titles name threads from the SPAWNER: Minecraft's main thread
+                // creates "RakThread" and names it, so the old code labelled the
+                // MAIN thread "RakThread" and left the real one unnamed —
+                // misattributing every thread in a fault or stall report. A zero
+                // handle still means "me".
+                let target = if thread == 0 {
+                    ctx.guest_threads.current_thread()
+                } else {
+                    thread
+                };
+                info!(thread = target, name, "guest pthread named");
+                ctx.kernel.thread_names.insert(target, name.to_owned());
             }
         }
     }
