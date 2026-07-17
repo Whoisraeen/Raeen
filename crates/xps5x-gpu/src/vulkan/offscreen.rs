@@ -882,7 +882,7 @@ impl<'a> Resources<'a> {
         // this device. A null pipeline cache is valid.
         let pipelines = unsafe {
             self.device().create_graphics_pipelines(
-                vk::PipelineCache::null(),
+                self.dev.pipeline_cache(),
                 &[pipeline_info],
                 None,
             )

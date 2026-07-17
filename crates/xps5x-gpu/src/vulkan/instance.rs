@@ -56,6 +56,8 @@ pub struct VulkanDevice {
     queue: vk::Queue,
     queue_family_index: u32,
     command_pool: vk::CommandPool,
+    /// Driver-side cache of compiled pipeline binaries, reused across draws.
+    pipeline_cache: vk::PipelineCache,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// Debug messenger, present only when validation is active.
     debug: Option<(debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
@@ -138,6 +140,16 @@ impl VulkanDevice {
             }
         };
 
+        // A process-wide pipeline cache so the driver reuses compiled shader
+        // binaries across draws. A title re-binds the same pipelines thousands
+        // of times a frame; without this each rebind recompiles from SPIR-V.
+        // A failed cache is non-fatal — fall back to no cache.
+        // SAFETY: `device` is valid; the default create-info is inert.
+        let pipeline_cache = unsafe {
+            device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+        }
+        .unwrap_or(vk::PipelineCache::null());
+
         info!(
             "Vulkan device ready: {device_name} (validation={validation_enabled}, graphics queue family {queue_family_index})"
         );
@@ -150,6 +162,7 @@ impl VulkanDevice {
             queue,
             queue_family_index,
             command_pool,
+            pipeline_cache,
             memory_properties,
             debug,
             device_name,
@@ -160,6 +173,13 @@ impl VulkanDevice {
     /// Name of the selected physical device, e.g. `NVIDIA GeForce RTX 4070`.
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    /// Shared pipeline cache; pass to `create_graphics_pipelines` so repeated
+    /// pipelines reuse the driver's compiled binaries. May be null if creation
+    /// failed — that is still a valid argument.
+    pub(crate) fn pipeline_cache(&self) -> vk::PipelineCache {
+        self.pipeline_cache
     }
 
     /// Whether the Khronos validation layer is actually active.
@@ -438,6 +458,9 @@ impl Drop for VulkanDevice {
         // device cannot be recovered here and drop must not panic.
         unsafe {
             let _ = self.device.device_wait_idle();
+            if self.pipeline_cache != vk::PipelineCache::null() {
+                self.device.destroy_pipeline_cache(self.pipeline_cache, None);
+            }
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
             if let Some((loader, messenger)) = self.debug.take() {
