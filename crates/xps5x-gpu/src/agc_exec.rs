@@ -606,6 +606,16 @@ pub fn build_cp_draw_dcb(width: u32, height: u32, half: ScissorHalf) -> Vec<u32>
 mod tests {
     use super::*;
 
+    /// A DCB that only writes registers: no draw and no dispatch, so
+    /// `execute_dcb_cp` takes its state-only path and never brings up Vulkan.
+    fn build_state_only_dcb() -> Vec<u32> {
+        vec![
+            pm4::header(3, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
+            pm4::CB_TARGET_MASK,
+            0xF,
+        ]
+    }
+
     /// `submit_dcb_async` must not lose or deadlock on a DCB, and `wait_idle`
     /// must not return while work is outstanding — everything that reads a
     /// render result depends on that contract.
@@ -616,13 +626,16 @@ mod tests {
     ///
     /// Uses a private session rather than `global()` — the global is shared with
     /// every other test in the process, so its in-flight count is not this
-    /// test's to assert on.
+    /// test's to assert on. That private session is also why the DCBs are
+    /// state-only: a drawing DCB would stand up a SECOND Vulkan device beside
+    /// the global session's, which raced the other tests' device and panicked
+    /// inside ash under a parallel `cargo test --workspace`. The queue contract
+    /// is what is under test here; rendering is covered by the M2 fixture.
     #[test]
     fn async_submit_drains_every_dcb_including_past_the_queue_depth() {
         let session: &'static AgcGpuSession = Box::leak(Box::new(AgcGpuSession::new()));
-        let words = build_cp_draw_dcb(96, 48, ScissorHalf::Left);
-        let submitted = SUBMIT_QUEUE_DEPTH * 3;
-        for _ in 0..submitted {
+        let words = build_state_only_dcb();
+        for _ in 0..SUBMIT_QUEUE_DEPTH * 3 {
             session.submit_dcb_async(words.clone());
         }
         session.wait_idle();
@@ -631,6 +644,15 @@ mod tests {
             0,
             "wait_idle returned with DCBs still in flight"
         );
+    }
+
+    /// The state-only fixture must really be state-only, or the test above
+    /// silently starts standing up Vulkan again.
+    #[test]
+    fn state_only_fixture_has_no_draw_or_dispatch() {
+        let decoded = agc::decode_submission(&build_state_only_dcb()).expect("valid DCB");
+        assert_eq!(decoded.draw_packets, 0);
+        assert_eq!(decoded.dispatch_packets, 0);
     }
 
     /// `wait_idle` on a session that never submitted anything must return, not

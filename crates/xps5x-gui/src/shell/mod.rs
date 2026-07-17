@@ -13,6 +13,7 @@ pub mod home;
 pub mod icons;
 pub mod media;
 pub mod nav;
+pub(crate) mod present;
 pub mod settings;
 
 use crate::launcher::{GameLauncher, SessionHandle, SessionState};
@@ -56,6 +57,9 @@ pub struct Shell {
     screen: Screen,
     launcher: Box<dyn GameLauncher>,
     session: Option<ActiveSession>,
+    /// Shows the running title's rendered frames. Persistent because it owns
+    /// the GPU texture the frame is uploaded into.
+    frame_view: present::GameFrameView,
     gilrs: Option<gilrs::Gilrs>,
     /// Ids of launched titles, most-recent-first, deduplicated and capped —
     /// backs the Control Center's Switcher panel (spec §10).
@@ -170,6 +174,7 @@ impl Shell {
             screen: Screen::Boot(BootSequence::new()),
             launcher,
             session: None,
+            frame_view: present::GameFrameView::default(),
             gilrs,
             recent: Vec::new(),
             config,
@@ -601,6 +606,9 @@ impl Shell {
         if self.launcher.session_state(&session.handle) == SessionState::Exited {
             self.nav.rail_index = session.target_index;
             self.session = None;
+            // Drop the last frame with the session, or the next launch opens on
+            // the previous title's final image before it renders anything.
+            self.frame_view.clear();
         }
     }
 
@@ -666,7 +674,13 @@ impl Shell {
 
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             if let Some(session) = &self.session {
-                draw_session_overlay(ui, &theme, session, self.launcher.as_ref());
+                draw_session_overlay(
+                    ui,
+                    &theme,
+                    session,
+                    self.launcher.as_ref(),
+                    &mut self.frame_view,
+                );
                 return;
             }
 
@@ -775,10 +789,14 @@ fn draw_session_overlay(
     theme: &Theme,
     session: &ActiveSession,
     launcher: &dyn GameLauncher,
+    frame_view: &mut present::GameFrameView,
 ) {
     let screen = ui.max_rect();
-    let painter = ui.painter();
-    painter.rect_filled(screen, 0.0, theme.palette.ground);
+    ui.painter().rect_filled(screen, 0.0, theme.palette.ground);
+
+    // The title's own frames, when it has rendered any. Painted before the
+    // status text so the text stays legible over a bright frame.
+    let presented = frame_view.paint(ui, screen);
 
     let state = launcher.session_state(&session.handle);
     // `session_detail` carries the engine's honest account of what actually
@@ -802,21 +820,38 @@ fn draw_session_overlay(
         SessionState::Exited => (session.title.clone(), "Returning to Shell…".to_string()),
     };
 
-    let center = screen.center();
-    painter.text(
-        egui::pos2(center.x, center.y - 12.0),
-        egui::Align2::CENTER_CENTER,
-        headline,
-        egui::FontId::proportional(32.0),
-        theme.palette.text,
-    );
-    painter.text(
-        egui::pos2(center.x, center.y + 24.0),
-        egui::Align2::CENTER_CENTER,
-        sub,
-        egui::FontId::proportional(15.0),
-        theme.palette.text_dim,
-    );
+    // Once frames are arriving, the big centred title would sit on top of the
+    // game. Step aside: a single dim line in the corner, so the screen is the
+    // title's and the way out is still visible.
+    let painter = ui.painter();
+    match presented {
+        present::Presented::Frame { rect } => {
+            painter.text(
+                egui::pos2(rect.left() + 12.0, rect.top() + 10.0),
+                egui::Align2::LEFT_TOP,
+                format!("{} — Esc to return to the Shell", session.title),
+                egui::FontId::proportional(13.0),
+                theme.palette.text_dim,
+            );
+        }
+        present::Presented::NoFrameYet => {
+            let center = screen.center();
+            painter.text(
+                egui::pos2(center.x, center.y - 12.0),
+                egui::Align2::CENTER_CENTER,
+                headline,
+                egui::FontId::proportional(32.0),
+                theme.palette.text,
+            );
+            painter.text(
+                egui::pos2(center.x, center.y + 24.0),
+                egui::Align2::CENTER_CENTER,
+                sub,
+                egui::FontId::proportional(15.0),
+                theme.palette.text_dim,
+            );
+        }
+    }
 
     ui.ctx().request_repaint();
 }
