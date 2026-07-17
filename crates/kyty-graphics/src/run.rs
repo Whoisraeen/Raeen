@@ -452,6 +452,11 @@ impl CommandProcessor {
             pm4::IT_DISPATCH_DIRECT => self.cp_op_dispatch_direct(cmd_id, body, offset, sink),
             // Kyty: cp_op_draw_index (L2757), raw IT form 0xc0042700.
             pm4::IT_DRAW_INDEX_2 => self.cp_op_draw_index(cmd_id, body, offset, sink),
+            // Not in Kyty's table — and it is what Minecraft draws with. See
+            // cp_op_draw_index_offset_2.
+            pm4::IT_DRAW_INDEX_OFFSET_2 => {
+                self.cp_op_draw_index_offset_2(cmd_id, body, offset, sink)
+            }
             pm4::IT_NUM_INSTANCES => {
                 // Kyty: SetNumInstances (L1036) — 0 means 1.
                 let n = Self::body_at(body, 0, offset)?;
@@ -783,6 +788,67 @@ impl CommandProcessor {
             .map_err(|source| CpError::Draw { offset, source })?;
 
         Ok(pm4::body_dw(cmd_id))
+    }
+
+    /// `IT_DRAW_INDEX_OFFSET_2` (0x35) — an indexed draw from the *bound* index
+    /// buffer, starting `INDEX_OFFSET` elements in.
+    ///
+    /// Kyty's `g_cp_op_func` has no entry for this opcode, so it fell to the
+    /// resilience policy's default arm: warn once, skip by encoded length,
+    /// forever. That is not a small gap — **it is the opcode Minecraft draws
+    /// with**. Measured: 24,224 draw packets decoded in a 120 s run, of which
+    /// ~64 reached Vulkan (~0.4%), every one of the rest dropped here after a
+    /// single warning. The frame was black because almost nothing was drawn.
+    ///
+    /// Unlike [`Self::cp_op_draw_index`] the packet carries no address — the
+    /// indices come from `IT_INDEX_BASE`, which is why a processor that ignores
+    /// this op also silently ignores whatever that buffer holds.
+    ///
+    /// AMD PM4 body: `{ MAX_SIZE, INDEX_OFFSET, INDEX_COUNT, DRAW_INITIATOR }`.
+    fn cp_op_draw_index_offset_2(
+        &mut self,
+        cmd_id: u32,
+        body: &[u32],
+        offset: u32,
+        sink: &mut dyn DrawSink,
+    ) -> Result<u32, CpError> {
+        // MAX_SIZE (body[0]) bounds the index buffer and DRAW_INITIATOR
+        // (body[3]) selects the draw path; neither reaches a degraded sink.
+        let index_offset = Self::body_at(body, 1, offset)?;
+        let index_count = Self::body_at(body, 2, offset)?;
+
+        let index_addr = self
+            .index_base
+            .saturating_add(u64::from(index_offset) * Self::index_element_bytes(
+                self.index_type_and_size,
+            ));
+
+        let draw = IndexedDraw {
+            index_type_and_size: self.index_type_and_size,
+            index_count,
+            index_addr,
+            // The raw (non-AGC) form carries no modifier flags, and passes the
+            // same index_type as IT_DRAW_INDEX_2's raw form.
+            flags: 0,
+            index_type: 1,
+        };
+        sink.draw_index(&self.ctx, &self.ucfg, &self.sh_ctx, &draw)
+            .map_err(|source| CpError::Draw { offset, source })?;
+
+        Ok(pm4::body_dw(cmd_id))
+    }
+
+    /// Bytes per index for a latched `IT_INDEX_TYPE` dword.
+    ///
+    /// AMD `VGT_INDEX_TYPE` in bits 1:0: 0 = 16-bit, 1 = 32-bit, 2 = 8-bit.
+    const fn index_element_bytes(index_type_and_size: u32) -> u64 {
+        match index_type_and_size & 0x3 {
+            0 => 2,
+            2 => 1,
+            // 1 (32-bit) and the reserved 3 both take the widest sane element,
+            // so an offset is never computed short of where the indices are.
+            _ => 4,
+        }
     }
 
     /// Degraded indirect draw: recover a count from the first args record.
@@ -1483,6 +1549,74 @@ mod tests {
         ) -> Result<(), DrawError> {
             self.indexed.push(*draw);
             Ok(())
+        }
+    }
+
+    /// The opcode Minecraft draws with must reach the sink.
+    ///
+    /// It was absent from the dispatch table, so it fell to the default arm —
+    /// warn once, skip by encoded length, forever. Measured on the title: 24,224
+    /// draw packets decoded, ~64 executed. A regression here is not a missing
+    /// feature, it is ~99.6% of a game's draws vanishing after one log line.
+    ///
+    /// `cmd_id` is the exact header captured from Minecraft: `0xc0033500`.
+    #[test]
+    fn draw_index_offset_2_reaches_the_sink_and_is_not_skipped() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = IndexedSink {
+            auto_draws: Vec::new(),
+            indexed: Vec::new(),
+        };
+        // { MAX_SIZE, INDEX_OFFSET, INDEX_COUNT, DRAW_INITIATOR }
+        let dcb = vec![0xc003_3500, 4096, 6, 300, 0];
+        cp.run(&dcb, &mut sink).expect("packet must not fault");
+
+        assert_eq!(
+            sink.indexed.len(),
+            1,
+            "IT_DRAW_INDEX_OFFSET_2 was skipped instead of drawn"
+        );
+        assert_eq!(sink.indexed[0].index_count, 300, "INDEX_COUNT is body[2]");
+        assert_eq!(
+            cp.distinct_skips(),
+            0,
+            "the opcode must be handled, not skipped-with-a-warn"
+        );
+    }
+
+    /// The packet carries no address: indices come from `IT_INDEX_BASE`, offset
+    /// by `INDEX_OFFSET` *elements* — so the element size has to be right or the
+    /// draw reads from the wrong place in the buffer.
+    #[test]
+    fn draw_index_offset_2_offsets_from_the_bound_index_base() {
+        for (index_type, bytes) in [(0u32, 2u64), (1, 4), (2, 1)] {
+            let mut cp = CommandProcessor::new();
+            let mut sink = IndexedSink {
+                auto_draws: Vec::new(),
+                indexed: Vec::new(),
+            };
+            let dcb = vec![
+                // IT_INDEX_BASE { lo, hi } = 0x1_0000_0000
+                pm4::header(3, pm4::IT_INDEX_BASE, pm4::R_ZERO),
+                0x0000_0000,
+                0x0000_0001,
+                // IT_INDEX_TYPE { type }
+                pm4::header(2, pm4::IT_INDEX_TYPE, pm4::R_ZERO),
+                index_type,
+                // DRAW_INDEX_OFFSET_2 { MAX_SIZE, INDEX_OFFSET=10, INDEX_COUNT, INITIATOR }
+                0xc003_3500,
+                4096,
+                10,
+                300,
+                0,
+            ];
+            cp.run(&dcb, &mut sink).expect("packets must not fault");
+            assert_eq!(sink.indexed.len(), 1);
+            assert_eq!(
+                sink.indexed[0].index_addr,
+                0x1_0000_0000 + 10 * bytes,
+                "index_type {index_type} must offset by {bytes} bytes per index"
+            );
         }
     }
 
