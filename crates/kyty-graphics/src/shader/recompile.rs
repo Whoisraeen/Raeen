@@ -3365,7 +3365,6 @@ fn recompile_s_xxx_b32_svdst_svsrc01(
 
 /// Kyty: `Recompile_S_XXX_I32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp L3576).
 /// XXX: Add, Mul, Sub (via `param`).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_s_xxx_i32_svdst_svsrc01(
     index: u32,
     code: &ShaderCode,
@@ -5075,6 +5074,7 @@ const fn ni(
 }
 
 /// Table row whose Kyty function is not ported yet, with an SCC check.
+#[allow(dead_code)] // C2: no staged SCC-bearing rows right now; kept for the next one
 const fn nis(
     kyty_func: &'static str,
     line: u32,
@@ -5199,9 +5199,13 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     fs(recompile_s_xxx_b32_svdst_svsrc01, T::SLshlB32, F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpShiftLeftLogical %uint %t0_<index> %ts_<index>"), S::NonZero),
     fs(recompile_s_xxx_b32_svdst_svsrc01, T::SLshrB32, F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpShiftRightLogical %uint %t0_<index> %ts_<index>"), S::NonZero),
     fs(recompile_s_xxx_b32_svdst_svsrc01, T::SOrB32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseOr %uint %t0_<index> %t1_<index>"), S::NonZero),
-    nis("Recompile_S_XXX_I32_SVdstSVsrc0SVsrc1", 3576, T::SAddI32,      F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpIAdd %int %t0_<index> %t1_<index>"), S::OverflowAdd),
-    nis("Recompile_S_XXX_I32_SVdstSVsrc0SVsrc1", 3576, T::SMulI32,      F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpIMul %int %t0_<index> %t1_<index>"), S::None),
-    nis("Recompile_S_XXX_I32_SVdstSVsrc0SVsrc1", 3576, T::SSubI32,      F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpISub %int %t0_<index> %t1_<index>"), S::OverflowSub),
+    // Wired for Minecraft's menu vertex shaders: all three VS at the analysis
+    // frontier (0x253e6200/0x253e7900/0x253f0400) stop on SSubI32 once their
+    // user-SGPR layout resolves. Kyty had the recompiler staged; the SCC
+    // overflow templates were already in the SCC machinery.
+    fs(recompile_s_xxx_i32_svdst_svsrc01, T::SAddI32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpIAdd %int %t0_<index> %t1_<index>"), S::OverflowAdd),
+    fs(recompile_s_xxx_i32_svdst_svsrc01, T::SMulI32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpIMul %int %t0_<index> %t1_<index>"), S::None),
+    fs(recompile_s_xxx_i32_svdst_svsrc01, T::SSubI32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpISub %int %t0_<index> %t1_<index>"), S::OverflowSub),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SAddcU32, F::SVdstSVsrc0SVsrc1, p4("%tscc_<index> = OpLoad %uint %scc", "%ts_<index> = OpFunctionCall %v2uint %addc %t0_<index> %t1_<index> %tscc_<index>", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SAddU32, F::SVdstSVsrc0SVsrc1, p3("%ts_<index> = OpIAddCarry %ResTypeU %t0_<index> %t1_<index>", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SSubU32, F::SVdstSVsrc0SVsrc1, p4("%t_<index> = OpISub %uint %t0_<index> %t1_<index>", "%nb_<index> = OpUGreaterThanEqual %bool %t0_<index> %t1_<index>", "%carry_<index> = OpSelect %uint %nb_<index> %uint_1 %uint_0", ""), S::CarryOut),
@@ -5621,10 +5625,12 @@ mod tests {
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 165,
-            "C1 implemented subset plus title-driven ports"
+            implemented, 168,
+            "C1 implemented subset plus title-driven ports (now incl. the \
+             S_XXX_I32 trio SAddI32/SMulI32/SSubI32 — Minecraft's menu VS \
+             stops on SSubI32)"
         );
-        assert_eq!(ni, 56, "C2 remainder");
+        assert_eq!(ni, 53, "C2 remainder");
 
         // Kyty EXIT_IF(map->Contains(p)) — (type, format) keys are unique.
         let mut seen = std::collections::HashSet::new();
@@ -5708,6 +5714,64 @@ mod tests {
         assert!(source.contains("OpStore %scc %carry_0"));
         let words = spirv_run(&source).expect("assemble measured s_sub_u32");
         naga_parse_and_validate(&words, "s_sub_u32");
+    }
+
+    /// `s_sub_i32` — the signed twin, and the single instruction all three of
+    /// Minecraft's menu vertex shaders stopped on once their user-SGPR layout
+    /// resolved. Signed subtract sets SCC on signed OVERFLOW (not borrow), so
+    /// the row must carry `SccCheck::OverflowSub` — wiring it through the
+    /// carry-out template would silently compute the wrong SCC.
+    #[test]
+    fn s_sub_i32_is_wired_and_sets_overflow_scc() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        shader_parse(
+            0,
+            &[
+                // s_sub_i32 s10, s3, s4 (SOP2 op 0x03).
+                0x818A_0403,
+                0x7E00_02FF,
+                0x3F80_0000,
+                0x7E02_0280,
+                0x1004_0300,
+                0xF800_08CF,
+                0x0302_0100,
+                0xF800_020F,
+                0x0302_0100,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse s_sub_i32");
+
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SSubI32);
+        assert_eq!(inst.dst.register_id, 10);
+        assert_eq!(inst.src[0].register_id, 3);
+        assert_eq!(inst.src[1].register_id, 4);
+
+        let entry = recomp_func(T::SSubI32, F::SVdstSVsrc0SVsrc1).expect("SSubI32 row");
+        assert!(matches!(entry.func, RecompileFn::Func(_)));
+        assert_eq!(entry.scc_check, SccCheck::OverflowSub);
+
+        let source = spirv_generate_source(
+            &code,
+            Some(&ShaderVertexInputInfo {
+                export_count: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+        )
+        .expect("recompile s_sub_i32");
+        assert!(source.contains("OpISub %int"), "signed subtract:\n{source}");
+        assert!(
+            source.contains("SSign"),
+            "overflow SCC path (sign compare), not carry-out:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble s_sub_i32");
+        naga_parse_and_validate(&words, "s_sub_i32");
     }
 
     #[test]

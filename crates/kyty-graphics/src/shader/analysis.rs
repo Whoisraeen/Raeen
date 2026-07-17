@@ -820,6 +820,67 @@ pub fn shader_parse_usage(
     Ok(())
 }
 
+/// `XPS5X_TRACE_EUD` evidence dump: the full `ShaderUserData` mapping tables,
+/// the captured user SGPRs, and a window of guest memory behind every
+/// SGPR pair that looks like a pointer. The EUD resolver must know which pair
+/// is the extended-user-data base and which table entry names it — this prints
+/// everything needed to decide that from evidence instead of a guess.
+fn trace_eud_evidence(
+    label: &str,
+    shader_addr: u64,
+    user_data: &ShaderUserData,
+    user_sgpr: &UserSgprInfo,
+    declared: i32,
+    mem: &impl ShaderMemory,
+) {
+    if std::env::var_os("XPS5X_TRACE_EUD").is_none() {
+        return;
+    }
+    // One compound line per shader so evidence can never be cross-attributed
+    // between shaders by dedup.
+    let mut out = format!(
+        "TRACE_EUD shader={label}@{shader_addr:#x} eud={} srt={} declared={declared} count={}",
+        user_data.eud_size_dw, user_data.srt_size_dw, user_sgpr.count
+    );
+    for (type_, &offset) in user_data.direct_resource_offset.iter().enumerate() {
+        if offset != 0xffff {
+            out += &format!(" direct[t{type_}]=s{offset}");
+        }
+    }
+    for (table, sharps) in user_data.sharp_resource_offset.iter().enumerate() {
+        for (slot, sharp) in sharps.iter().enumerate() {
+            if sharp.offset_dw() != 0x7fff {
+                out += &format!(
+                    " sharp[{table}.{slot}]=s{}+{}",
+                    sharp.offset_dw(),
+                    sharp.size()
+                );
+            }
+        }
+    }
+    for i in 0..(user_sgpr.count.max(4) as usize).min(16) {
+        if user_sgpr.value[i] != 0 {
+            out += &format!(" s{i}={:#x}", user_sgpr.value[i]);
+        }
+    }
+    tracing::warn!("{out}");
+    for i in 0..(user_sgpr.count.max(4) as usize).min(UserSgprInfo::SGPRS_MAX - 1) {
+        let pair = u64::from(user_sgpr.value[i]) | (u64::from(user_sgpr.value[i + 1]) << 32);
+        // A plausible guest pointer: nonzero, page-ish aligned, below 48 bits.
+        if pair == 0 || pair & 0x3 != 0 || pair >> 48 != 0 {
+            continue;
+        }
+        if let Some(win) = mem.dwords_at(pair) {
+            let take = win.len().min(16);
+            tracing::warn!(
+                "TRACE_EUD shader={label}@{shader_addr:#x} mem[s{i}:s{}]@{pair:#x} = {:08x?}",
+                i + 1,
+                &win[..take]
+            );
+        }
+    }
+}
+
 /// Kyty: Shader.cpp `ShaderParseUsage2` (L1505) — the PS5 path over the
 /// `ShaderUserData` direct/sharp mapping tables (no EUD/SRT yet, exactly as
 /// upstream).
@@ -860,6 +921,19 @@ pub fn shader_parse_usage2(
         *flag = (i as i32) < user_sgpr_num;
     }
 
+    // A pointer-pair entry whose registers the draw never wrote is a null
+    // stream, not a mapping: the shader declares an OPTIONAL second vertex
+    // stream (measured on Minecraft's menu GS: VB pointers at s0/s4, attrib
+    // pointers at s2/s6) and a draw feeding only stream 0 programs only
+    // s0..s3. Binding the null pair would send the vertex fetch to address 0.
+    // Skipping it keeps "last WRITTEN stream wins", so a draw that programs
+    // both streams behaves exactly as before.
+    let pair_is_written = |offset: u16| -> bool {
+        let i = offset as usize;
+        i + 1 < UserSgprInfo::SGPRS_MAX
+            && (user_sgpr.value[i] != 0 || user_sgpr.value[i + 1] != 0)
+    };
+
     for (type_, &offset) in user_data.direct_resource_offset.iter().enumerate() {
         if offset == 0xffff {
             continue;
@@ -869,6 +943,10 @@ pub fn shader_parse_usage2(
 
         match type_ {
             8 => {
+                if !pair_is_written(offset) {
+                    tracing::debug!(reg, "usage2: null vertex-buffer stream skipped");
+                    continue;
+                }
                 info.vertex_buffer = true;
                 info.vertex_buffer_reg = reg;
                 clear_direct(&mut direct_sgprs, offset as usize)?;
@@ -876,6 +954,10 @@ pub fn shader_parse_usage2(
             }
 
             10 => {
+                if !pair_is_written(offset) {
+                    tracing::debug!(reg, "usage2: null vertex-attrib stream skipped");
+                    continue;
+                }
                 info.vertex_attrib = true;
                 info.vertex_attrib_reg = reg;
                 clear_direct(&mut direct_sgprs, offset as usize)?;
@@ -1334,6 +1416,7 @@ pub fn shader_get_input_info_vs(
 
         info.gs_prolog = true;
 
+        trace_eud_evidence("vs(gs)", shader_addr, user_data, user_sgpr, user_sgpr_num, mem);
         shader_parse_usage2(
             user_data,
             &mut usage,
@@ -1571,6 +1654,14 @@ pub fn shader_get_input_info_cs(
             .find(regs.cs_regs.data_addr)
             .and_then(|data| data.user_data.as_ref())
             .ok_or_else(|| ni("cs: user_data is not mapped"))?;
+        trace_eud_evidence(
+            "cs",
+            regs.cs_regs.data_addr,
+            user_data,
+            &regs.cs_user_sgpr,
+            i32::from(regs.cs_regs.user_sgpr),
+            mem,
+        );
         shader_parse_usage2(
             user_data,
             &mut usage,
@@ -1864,25 +1955,19 @@ pub fn shader_parse_vs(
 
     if gs_instead_of_vs {
         if u32::from(regs.gs_regs.rsrc2.user_sgpr) > regs.gs_user_sgpr.count {
-            // Measured on Minecraft: declared 8 vs available 4 — the extra four
-            // come from the extended user-data (EUD) buffer, which needs the
-            // Gen5 scalar evaluator to resolve (task #9), not a local fix here.
-            if std::env::var_os("XPS5X_TRACE_EUD").is_some() {
-                let u = &regs.gs_user_sgpr;
-                for i in 0..8usize {
-                    let pair = u64::from(u.value[i]) | (u64::from(u.value[i + 1]) << 32);
-                    tracing::warn!(
-                        idx = i,
-                        value = format_args!("{:#010x}", u.value[i]),
-                        as_ptr_with_next = format_args!("{pair:#x}"),
-                        type_ = ?u.type_[i],
-                        "TRACE_EUD: gs user_sgpr (declared={}, count={})",
-                        regs.gs_regs.rsrc2.user_sgpr,
-                        u.count,
-                    );
-                }
-            }
-            return Err(ni("vs: gs user_sgpr > user sgpr count"));
+            // Declared > written is a real, measured pattern, not corruption:
+            // Minecraft's menu GS declares 8 user SGPRs — TWO vertex streams
+            // (VB pointers at s0/s4, attrib pointers at s2/s6 in its
+            // ShaderUserData direct table) — but a draw that feeds only the
+            // first stream programs only s0..s3. The unwritten registers stay
+            // zero and `shader_parse_usage2` skips the null second stream, so
+            // this is safe to translate rather than reject.
+            tracing::debug!(
+                declared = regs.gs_regs.rsrc2.user_sgpr,
+                written = regs.gs_user_sgpr.count,
+                "vs(gs): shader declares more user SGPRs than the draw wrote \
+                 (optional vertex stream) — continuing with zeros"
+            );
         }
     } else if u32::from(regs.vs_regs.rsrc2.user_sgpr) > regs.vs_user_sgpr.count {
         return Err(ni("vs: user_sgpr > user sgpr count"));
