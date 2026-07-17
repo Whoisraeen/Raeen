@@ -258,6 +258,11 @@ static TRACE_HLE: OnceLock<bool> = OnceLock::new();
 static TRACE_HLE_INDEX: OnceLock<Option<u64>> = OnceLock::new();
 static TRACE_EINVAL: OnceLock<bool> = OnceLock::new();
 
+/// `XPS5X_TIME_HLE`: accumulate per-(thread, function) time spent inside HLE
+/// calls, so a stalled thread's wall-clock can be attributed to a specific
+/// wait rather than guessed at from the call ring.
+static TIME_HLE: OnceLock<bool> = OnceLock::new();
+
 /// The number of FS-base re-arms performed since process start — see
 /// [`FSBASE_REARMS`]. Monotonic; never reset.
 pub fn fsbase_rearm_count() -> u64 {
@@ -1902,9 +1907,26 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 }
                 q.push_back(format!("{}::{}", t.library, t.function));
             }
+            // Where does a stalled thread's wall-clock actually GO? The call
+            // ring names which calls a thread made but not how long each took,
+            // so a thread parked for minutes inside one wait looks identical to
+            // one cycling through thousands of fast calls. Timing each call and
+            // accumulating per (thread, function) separates those two.
+            let timed =
+                *TIME_HLE.get_or_init(|| std::env::var_os("XPS5X_TIME_HLE").is_some());
+            let started = timed.then(std::time::Instant::now);
             let ret = hle
                 .call(&hle_ctx, &t.library, &t.function, &args)
                 .unwrap_or(0);
+            if let Some(started) = started {
+                let micros = started.elapsed().as_micros();
+                let mut entry = kernel
+                    .hle_call_time
+                    .entry((ctx.current_thread(), format!("{}::{}", t.library, t.function)))
+                    .or_default();
+                entry.0 += 1;
+                entry.1 += micros;
+            }
             // Diagnostic: surface every EINVAL (22) an HLE call returns, so a
             // std::system_error("invalid argument") thrown by a guest C++
             // threading primitive can be traced to the exact HLE function and

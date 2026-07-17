@@ -170,6 +170,12 @@ pub struct OrbisKernel {
     /// Guest pthread read-write lock state, keyed by both the guest
     /// `pthread_rwlock_t` address and its allocated handle.
     pub pthread_rwlocks: DashMap<u64, PthreadRwlock>,
+    /// Diagnostic (`XPS5X_TIME_HLE`): `(guest thread id, "library::function")`
+    /// -> (call count, total microseconds inside that call). Attributes a
+    /// stalled thread's wall-clock to the specific call it is parked in, which
+    /// [`Self::recent_hle_calls`] cannot do — the ring names the calls but not
+    /// their duration, so one long wait and a fast spin look identical.
+    pub hle_call_time: DashMap<(u64, String), (u64, u128)>,
     /// Guest pthread condition-variable wait queues, keyed by object address.
     pub pthread_conds: DashMap<u64, Arc<PthreadCond>>,
     /// Clock id set on a guest `pthread_condattr_t` by
@@ -579,6 +585,7 @@ impl OrbisKernel {
             pthread_mutexes: DashMap::new(),
             pthread_mutex_attrs: DashMap::new(),
             pthread_rwlocks: DashMap::new(),
+            hle_call_time: DashMap::new(),
             pthread_conds: DashMap::new(),
             pthread_condattr_clocks: DashMap::new(),
             pthread_attrs: DashMap::new(),

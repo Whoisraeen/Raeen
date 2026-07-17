@@ -44,8 +44,23 @@ pub enum AgcExecError {
     Cp(#[from] CpError),
 }
 
+/// How many submitted DCBs may be in flight before a submitter blocks.
+///
+/// Backpressure is not optional: a title submits faster than this session
+/// renders, so an unbounded queue would grow without limit (a DCB is up to 4 MiB).
+/// Blocking the submitter when the queue is full is also what real hardware does
+/// when its ring buffer fills.
+const SUBMIT_QUEUE_DEPTH: usize = 8;
+
 /// Process-global session: lazy Vulkan bring-up + last rendered image.
 pub struct AgcGpuSession {
+    /// DCBs handed to the GPU worker. Created on first submit; a single
+    /// consumer keeps DCBs in submission order, which is required — register
+    /// state carries across submissions, so reordering a state-only DCB past
+    /// the draw DCB that depends on it renders with the wrong state.
+    submit_queue: OnceLock<std::sync::mpsc::SyncSender<Vec<u32>>>,
+    /// Submissions accepted but not yet executed, for [`AgcGpuSession::wait_idle`].
+    in_flight: (Mutex<usize>, parking_lot::Condvar),
     backend: Mutex<Option<VulkanBackend>>,
     /// GPU register state persists across queue submissions. AGC commonly
     /// submits state-only DCBs before a later draw-only DCB.
@@ -67,6 +82,8 @@ pub struct AgcGpuSession {
 impl AgcGpuSession {
     fn new() -> Self {
         Self {
+            submit_queue: OnceLock::new(),
+            in_flight: (Mutex::new(0), parking_lot::Condvar::new()),
             backend: Mutex::new(None),
             command_processor: Mutex::new(CommandProcessor::new()),
             last_image: Mutex::new(None),
@@ -250,6 +267,71 @@ impl AgcGpuSession {
 
     /// Best-effort [`Self::execute_dcb_cp`] for the HLE submit path: a GPU
     /// fault must not become a guest-visible submit failure.
+    /// Hand a DCB to the GPU worker and return, the way `sceAgcDriverSubmitDcb`
+    /// behaves on hardware: the command buffer goes to the GPU and the caller
+    /// carries on.
+    ///
+    /// Executing the DCB inline on the calling thread instead is what this
+    /// exists to stop. A title calls submit from its render thread *while
+    /// holding its own mutexes*, so an inline submit holds those locks for as
+    /// long as the whole command buffer takes to render. Measured on Minecraft:
+    /// 150 ms per submit inside `Rendering Pool(0)`, and the main thread lost
+    /// 148.5 s of a 212 s run blocked in `scePthreadMutexLock` on a mutex that
+    /// thread owned — 70% of the main thread, spent waiting for our renderer.
+    /// The two totals tracked each other across every sample.
+    ///
+    /// A full queue still blocks the submitter (see [`SUBMIT_QUEUE_DEPTH`]), so
+    /// this bounds the damage rather than removing it: a session that renders
+    /// slower than the title submits will still stall the submitter, just at
+    /// the ring's edge instead of on every single DCB.
+    pub fn submit_dcb_async(&'static self, words: Vec<u32>) {
+        let tx = self.submit_queue.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u32>>(SUBMIT_QUEUE_DEPTH);
+            let spawned = std::thread::Builder::new()
+                .name("xps5x-gpu".to_owned())
+                .spawn(move || {
+                    while let Ok(words) = rx.recv() {
+                        self.try_execute_dcb_cp(&words);
+                        self.finish_one();
+                    }
+                });
+            if let Err(e) = &spawned {
+                warn!(error = %e, "cannot start the GPU worker — DCBs will run inline");
+            }
+            tx
+        });
+        *self.in_flight.0.lock() += 1;
+        // A worker that never started (spawn failed) leaves the receiver
+        // dropped, so `send` errors rather than blocking forever: fall back to
+        // rendering inline, which is slow but keeps the title drawing.
+        if let Err(std::sync::mpsc::SendError(words)) = tx.send(words) {
+            self.try_execute_dcb_cp(&words);
+            self.finish_one();
+        }
+    }
+
+    fn finish_one(&self) {
+        let (lock, cvar) = &self.in_flight;
+        let mut n = lock.lock();
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            cvar.notify_all();
+        }
+    }
+
+    /// Block until every submitted DCB has been executed.
+    ///
+    /// Submission is asynchronous, so anything reading a result of rendering
+    /// (`last_image`, `draw_count`, a render-target census) must drain first or
+    /// it races the worker and reads the frame before the draws land.
+    pub fn wait_idle(&self) {
+        let (lock, cvar) = &self.in_flight;
+        let mut n = lock.lock();
+        while *n > 0 {
+            cvar.wait(&mut n);
+        }
+    }
+
     pub fn try_execute_dcb_cp(&self, words: &[u32]) {
         match self.execute_dcb_cp(words) {
             Ok(Some(image)) => debug!(
@@ -523,6 +605,41 @@ pub fn build_cp_draw_dcb(width: u32, height: u32, half: ScissorHalf) -> Vec<u32>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `submit_dcb_async` must not lose or deadlock on a DCB, and `wait_idle`
+    /// must not return while work is outstanding — everything that reads a
+    /// render result depends on that contract.
+    ///
+    /// Submits more than [`SUBMIT_QUEUE_DEPTH`] so the queue fills and `send`
+    /// blocks: that is the backpressure path, and it must drain and finish
+    /// rather than wedge the submitter against its own worker.
+    ///
+    /// Uses a private session rather than `global()` — the global is shared with
+    /// every other test in the process, so its in-flight count is not this
+    /// test's to assert on.
+    #[test]
+    fn async_submit_drains_every_dcb_including_past_the_queue_depth() {
+        let session: &'static AgcGpuSession = Box::leak(Box::new(AgcGpuSession::new()));
+        let words = build_cp_draw_dcb(96, 48, ScissorHalf::Left);
+        let submitted = SUBMIT_QUEUE_DEPTH * 3;
+        for _ in 0..submitted {
+            session.submit_dcb_async(words.clone());
+        }
+        session.wait_idle();
+        assert_eq!(
+            *session.in_flight.0.lock(),
+            0,
+            "wait_idle returned with DCBs still in flight"
+        );
+    }
+
+    /// `wait_idle` on a session that never submitted anything must return, not
+    /// block on a worker that was never started.
+    #[test]
+    fn wait_idle_is_a_no_op_when_nothing_was_submitted() {
+        let session = AgcGpuSession::new();
+        session.wait_idle();
+    }
 
     #[test]
     #[allow(deprecated)]

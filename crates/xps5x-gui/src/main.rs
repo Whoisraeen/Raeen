@@ -571,11 +571,55 @@ fn main() -> anyhow::Result<()> {
                         })
                         .collect();
                     rips.sort();
+                    // With XPS5X_TIME_HLE, name where each thread's wall-clock
+                    // actually went. A thread whose top entry accounts for most
+                    // of the run is parked in that one call — that is the thing
+                    // to fix, and it is invisible in the call ring above.
+                    // Per THREAD, not globally: every idle worker parks ~the
+                    // whole run in scePthreadCondWait, so a global top-N is 12
+                    // rows of "idle" and buries the one thread that matters.
+                    // Report each thread's own biggest sink plus its total, so a
+                    // busy thread (many short calls) is distinguishable at a
+                    // glance from a parked one (all its time in a single wait).
+                    let mut per_thread: std::collections::HashMap<u64, (u128, u128, u64, String)> =
+                        std::collections::HashMap::new();
+                    for e in kmon.hle_call_time.iter() {
+                        let ((tid, func), (calls, micros)) = (e.key().clone(), *e.value());
+                        let slot = per_thread.entry(tid).or_insert((0, 0, 0, String::new()));
+                        slot.0 += micros; // total across all calls
+                        if micros > slot.1 {
+                            *slot = (slot.0, micros, calls, func);
+                        }
+                    }
+                    let mut spent: Vec<(u128, String)> = per_thread
+                        .into_iter()
+                        .map(|(tid, (total, top_us, calls, func))| {
+                            let name = kmon
+                                .thread_names
+                                .get(&tid)
+                                .map_or_else(String::new, |n| n.clone());
+                            (
+                                total,
+                                format!(
+                                    "t{tid}({name}) total {:.1}s | top {func}: {:.1}s over {calls}",
+                                    total as f64 / 1e6,
+                                    top_us as f64 / 1e6
+                                ),
+                            )
+                        })
+                        .collect();
+                    spent.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    let top: Vec<String> = spent.into_iter().map(|(_, s)| s).collect();
                     info!(
-                        "STALL_DUMP ({} threads):\n{}\nRIPs: {}",
+                        "STALL_DUMP ({} threads):\n{}\nRIPs: {}{}",
                         lines.len(),
                         lines.join("\n"),
-                        rips.join(" ")
+                        rips.join(" "),
+                        if top.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\nTIME IN HLE (top):\n{}", top.join("\n"))
+                        }
                     );
                 }
             });

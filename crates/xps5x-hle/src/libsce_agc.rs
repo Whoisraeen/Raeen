@@ -815,7 +815,14 @@ fn submit_validate(ctx: &HleContext, packet: u64) -> u64 {
     // dropping setup DCBs leaves later draw-only buffers with null shaders and
     // no render targets. Vulkan is initialized lazily only when a draw arrives.
     // The deprecated fixture path survives only behind the M2 regression test.
-    xps5x_gpu::AgcGpuSession::global().try_execute_dcb_cp(&words);
+    //
+    // Handed to the GPU worker rather than rendered here: hardware's submit
+    // returns as soon as the GPU owns the buffer, and the title calls this from
+    // its render thread while holding its own locks (see `submit_dcb_async`).
+    // Everything above this line is guest-visible side effects the title expects
+    // to have happened when submit returns — the sync writes, the events, the
+    // flips — and they stay on this thread. Only the rendering moves.
+    xps5x_gpu::AgcGpuSession::global().submit_dcb_async(words);
 
     0
 }
@@ -3320,6 +3327,10 @@ mod tests {
             1
         );
 
+        // Submission is asynchronous now, so the draw has not necessarily
+        // landed when submit returns — reading draw_count/last_image here
+        // without draining would race the GPU worker.
+        xps5x_gpu::AgcGpuSession::global().wait_idle();
         let after = xps5x_gpu::AgcGpuSession::global().draw_count();
         if after > before {
             let image = xps5x_gpu::AgcGpuSession::global()
