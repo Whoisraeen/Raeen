@@ -95,13 +95,30 @@ fn condition(ctx: &HleContext, cond: u64) -> Option<std::sync::Arc<xps5x_kernel:
         return Some(state.clone());
     }
 
-    let handle = ctx.alloc.alloc(COND_OBJECT_SIZE, 0x10)?;
-    if !ctx.mem.write(cond, &handle.to_le_bytes()) {
-        ctx.alloc.free(handle);
-        return None;
-    }
-    let state = std::sync::Arc::new(xps5x_kernel::PthreadCond::default());
-    ctx.kernel.pthread_conds.insert(cond, state.clone());
+    // Implicit creation for a statically-initialized cond, and it MUST be
+    // atomic. A waiter and its signaler both land here for the same address, and
+    // a plain check-then-insert lets both miss, both create, and the second
+    // overwrite the first: the waiter then blocks on one object while the signal
+    // goes to another, and it never wakes. That is a silent, permanent lost
+    // wakeup — the exact shape of a title stalling with every worker idle.
+    // `entry` serializes the miss so only one state is ever published.
+    let state = match ctx.kernel.pthread_conds.entry(cond) {
+        dashmap::mapref::entry::Entry::Occupied(existing) => return Some(existing.get().clone()),
+        dashmap::mapref::entry::Entry::Vacant(slot) => {
+            let handle = ctx.alloc.alloc(COND_OBJECT_SIZE, 0x10)?;
+            if !ctx.mem.write(cond, &handle.to_le_bytes()) {
+                ctx.alloc.free(handle);
+                return None;
+            }
+            let state = std::sync::Arc::new(xps5x_kernel::PthreadCond::default());
+            slot.insert(state.clone());
+            // Alias the opaque handle to the SAME state, but only after the
+            // entry guard is dropped: inserting into this map while holding one
+            // of its shard guards deadlocks when both keys hash to that shard.
+            (state, handle)
+        }
+    };
+    let (state, handle) = state;
     ctx.kernel.pthread_conds.insert(handle, state.clone());
     Some(state)
 }
@@ -199,7 +216,29 @@ fn wait_core(ctx: &HleContext, args: &[u64], timeout: Option<std::time::Duration
     }
     let started = std::time::Instant::now();
     let mut timed_out = false;
+    let mut reported = false;
     while *generation == observed && !ctx.guest_threads.process_is_terminating() {
+        // Forensic: a waiter that never sees its generation move is waiting on a
+        // condition nobody signals. Name the cond + the waiter so it can be
+        // matched against XPS5X_TRACE_COND's signal side.
+        if !reported
+            && started.elapsed() >= std::time::Duration::from_secs(3)
+            && std::env::var_os("XPS5X_TRACE_COND").is_some()
+        {
+            reported = true;
+            let name = ctx
+                .kernel
+                .thread_names
+                .get(&ctx.guest_threads.current_thread())
+                .map_or_else(|| "<unnamed>".to_owned(), |n| n.clone());
+            tracing::warn!(
+                cond = format_args!("{cond:#x}"),
+                waiter = ctx.guest_threads.current_thread(),
+                waiter_name = %name,
+                generation = observed,
+                "TRACE_COND: waiting >3s — this cond has not been signalled"
+            );
+        }
         let slice = timeout
             .map(|limit| limit.saturating_sub(started.elapsed()))
             .unwrap_or(std::time::Duration::from_millis(10))
@@ -240,7 +279,32 @@ fn hle_cond_signal(ctx: &HleContext, args: &[u64]) -> u64 {
     };
     *state.generation.lock() += 1;
     state.changed.notify_one();
+    trace_signal(ctx, cond, "signal");
     OK
+}
+
+/// Forensic: record which conds actually get signalled, so a waiter that never
+/// wakes can be matched against the signal side (its cond simply never appears).
+fn trace_signal(ctx: &HleContext, cond: u64, kind: &str) {
+    if std::env::var_os("XPS5X_TRACE_COND").is_none() {
+        return;
+    }
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    if SEEN.fetch_add(1, Ordering::Relaxed) < 4000 {
+        let name = ctx
+            .kernel
+            .thread_names
+            .get(&ctx.guest_threads.current_thread())
+            .map_or_else(|| "<unnamed>".to_owned(), |n| n.clone());
+        tracing::warn!(
+            cond = format_args!("{cond:#x}"),
+            by = ctx.guest_threads.current_thread(),
+            by_name = %name,
+            kind,
+            "TRACE_COND: signalled"
+        );
+    }
 }
 
 /// `pthread_cond_broadcast(cond)` — wake all waiters. Same reasoning as
@@ -255,6 +319,7 @@ fn hle_cond_broadcast(ctx: &HleContext, args: &[u64]) -> u64 {
     };
     *state.generation.lock() += 1;
     state.changed.notify_all();
+    trace_signal(ctx, cond, "broadcast");
     OK
 }
 
