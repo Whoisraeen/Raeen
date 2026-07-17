@@ -1864,6 +1864,9 @@ pub fn shader_parse_vs(
 
     if gs_instead_of_vs {
         if u32::from(regs.gs_regs.rsrc2.user_sgpr) > regs.gs_user_sgpr.count {
+            // Measured on Minecraft: declared 8 vs available 4 — the extra four
+            // come from the extended user-data (EUD) buffer, which needs the
+            // Gen5 scalar evaluator to resolve (task #9), not a local fix here.
             return Err(ni("vs: gs user_sgpr > user sgpr count"));
         }
     } else if u32::from(regs.vs_regs.rsrc2.user_sgpr) > regs.vs_user_sgpr.count {
