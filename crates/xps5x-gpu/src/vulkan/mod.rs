@@ -26,7 +26,7 @@ use xps5x_core::error::GpuError;
 
 pub use instance::validation_error_count;
 pub use offscreen::{
-    CLEAR_COLOR, RenderedImage, render_triangle, render_triangle_with_spirv, unorm8,
+    CLEAR_COLOR, IndexBinding, RenderedImage, render_triangle, render_triangle_with_spirv, unorm8,
 };
 pub use shaders::TRIANGLE_COLOR;
 

@@ -30,7 +30,7 @@ use crate::vulkan::offscreen::{
 };
 use ash::vk;
 use kyty_graphics::hw_regs::{Context, Shader, UserConfig};
-use kyty_graphics::run::{DrawError, DrawSink};
+use kyty_graphics::run::{DrawError, DrawSink, IndexedDraw};
 use kyty_graphics::shader::resources::{
     ShaderBindResources, ShaderPixelInputInfo, ShaderVertexInputInfo,
 };
@@ -182,6 +182,69 @@ fn resolve_shaders(
         vs_info,
         ps_info,
     })
+}
+
+/// Fetch an indexed draw's index buffer from guest memory, in a form Vulkan can
+/// bind directly.
+///
+/// `VGT_INDEX_TYPE` (bits 1:0 of `index_type_and_size`) gives the guest element
+/// size: 0 = 16-bit, 1 = 32-bit, 2 = 8-bit. Vulkan only guarantees UINT16 and
+/// UINT32; UINT8 needs `VK_EXT_index_type_uint8`, which this device does not
+/// enable, so 8-bit indices are widened to 16-bit on the CPU rather than taking
+/// a dependency on an extension for a rare case.
+fn fetch_index_buffer(draw: &IndexedDraw) -> Result<(Vec<u8>, vk::IndexType), DrawError> {
+    if draw.index_addr == 0 || draw.index_count == 0 {
+        return Err(err(format!(
+            "indexed draw with no index buffer: addr={:#x} count={}",
+            draw.index_addr, draw.index_count
+        )));
+    }
+    // An index buffer is `index_base + index_offset * element_bytes`, which
+    // routinely lands off a dword boundary — so this needs a byte-granular
+    // read, not the dword-aligned `read_guest_bytes`.
+    let read = |bytes_per: u64| {
+        read_guest_bytes_unaligned(
+            draw.index_addr,
+            u64::from(draw.index_count) * bytes_per,
+            "index buffer",
+        )
+    };
+    match draw.index_type_and_size & 0x3 {
+        0 => Ok((read(2)?, vk::IndexType::UINT16)),
+        2 => {
+            let widened = read(1)?
+                .iter()
+                .take(draw.index_count as usize)
+                .flat_map(|&b| u16::from(b).to_le_bytes())
+                .collect();
+            Ok((widened, vk::IndexType::UINT16))
+        }
+        // 32-bit (1), and the reserved 3 as the widest sane element.
+        _ => Ok((read(4)?, vk::IndexType::UINT32)),
+    }
+}
+
+/// Read `size` guest bytes starting at an arbitrary (possibly unaligned)
+/// address.
+///
+/// The underlying identity-map reader is dword-granular and rejects a
+/// non-4-aligned address, but an index buffer legitimately starts at any byte
+/// offset (`index_base + index_offset * element_bytes`). Read the aligned dword
+/// window that covers `[addr, addr + size)` and slice out the requested bytes.
+fn read_guest_bytes_unaligned(addr: u64, size: u64, kind: &str) -> Result<Vec<u8>, DrawError> {
+    if size == 0 {
+        return Err(err(format!("{kind} at {addr:#x} has zero size")));
+    }
+    let head = addr & 0x3; // bytes to skip inside the first dword
+    let aligned = addr - head;
+    let span = (head + size).next_multiple_of(4);
+    let window = read_guest_bytes(aligned, span, kind)?;
+    let start = head as usize;
+    let end = start + size as usize;
+    window
+        .get(start..end)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| err(format!("{kind} at {addr:#x}: slice {start}..{end} outside read window")))
 }
 
 fn read_guest_bytes(addr: u64, size: u64, kind: &str) -> Result<Vec<u8>, DrawError> {
@@ -536,6 +599,8 @@ pub fn draw_state_from_regs<'a>(
         vs_spirv,
         fs_spirv,
         initial: None,
+        // The caller (draw_common) fills this in for an indexed draw.
+        index: None,
     })
 }
 
@@ -604,14 +669,20 @@ impl<'a> OffscreenDrawSink<'a> {
     }
 }
 
-impl DrawSink for OffscreenDrawSink<'_> {
-    fn draw_index_auto(
+impl OffscreenDrawSink<'_> {
+    /// The body shared by the auto and indexed draw paths.
+    ///
+    /// `index` is `None` for a vertex-order draw and `Some((bytes, type))` for
+    /// an indexed one — the only difference between the two is whether an index
+    /// buffer is bound. `count` is the vertex count (auto) or index count
+    /// (indexed); either way it is what the draw call is told to draw.
+    fn draw_common(
         &mut self,
         ctx: &Context,
         ucfg: &UserConfig,
         sh: &Shader,
-        index_count: u32,
-        _flags: u32,
+        count: u32,
+        index: Option<(&[u8], vk::IndexType)>,
     ) -> Result<(), DrawError> {
         // A zero colour mask is a legitimate depth-only/no-colour draw, not a
         // malformed DCB. Until the depth backend is wired, consume it without
@@ -638,10 +709,13 @@ impl DrawSink for OffscreenDrawSink<'_> {
             }
         };
 
-        let mut state = draw_state_from_regs(ctx, ucfg, index_count, &shaders.vs, &shaders.ps)?;
+        let mut state = draw_state_from_regs(ctx, ucfg, count, &shaders.vs, &shaders.ps)?;
         let (vertex_buffers, vertex_attributes) = prepare_vertex_inputs(&shaders.vs_info)?;
         state.vertex_buffers = vertex_buffers;
         state.vertex_attributes = vertex_attributes;
+        if let Some((bytes, index_type)) = index {
+            state.index = Some(crate::vulkan::IndexBinding { bytes, index_type });
+        }
         for (bind, stage) in [
             (&shaders.vs_info.bind, vk::ShaderStageFlags::VERTEX),
             (&shaders.ps_info.bind, vk::ShaderStageFlags::FRAGMENT),
@@ -710,6 +784,38 @@ impl DrawSink for OffscreenDrawSink<'_> {
         self.last = Some(image);
         self.draws += 1;
         Ok(())
+    }
+}
+
+impl DrawSink for OffscreenDrawSink<'_> {
+    fn draw_index_auto(
+        &mut self,
+        ctx: &Context,
+        ucfg: &UserConfig,
+        sh: &Shader,
+        index_count: u32,
+        _flags: u32,
+    ) -> Result<(), DrawError> {
+        self.draw_common(ctx, ucfg, sh, index_count, None)
+    }
+
+    /// A real indexed draw — the vertices are pulled through the bound index
+    /// buffer instead of straight from the vertex stream.
+    ///
+    /// Without this the trait default runs, which throws the index buffer away
+    /// and issues a vertex-order auto draw. That is why Minecraft's fullscreen
+    /// tri-strip QUAD (`prim=6 verts=4`, two triangles sharing an edge) rendered
+    /// as one triangle covering exactly half the target: the four vertices came
+    /// out in submission order rather than index order.
+    fn draw_index(
+        &mut self,
+        ctx: &Context,
+        ucfg: &UserConfig,
+        sh: &Shader,
+        draw: &IndexedDraw,
+    ) -> Result<(), DrawError> {
+        let (index_bytes, index_type) = fetch_index_buffer(draw)?;
+        self.draw_common(ctx, ucfg, sh, draw.index_count, Some((&index_bytes, index_type)))
     }
 
     fn dispatch_direct(
@@ -864,6 +970,80 @@ mod tests {
             draw_state_from_regs(&ctx_96x48(), &ucfg_rect(), 3, SPIRV, SPIRV).expect("valid");
         // x = xoffset - xscale, w = xscale * 2
         assert_eq!(state.viewport, [0.0, 0.0, 96.0, 48.0]);
+    }
+
+    /// 16-bit indices — the common case — are read straight from guest memory
+    /// and bound as UINT16.
+    #[test]
+    fn fetch_index_buffer_reads_16bit_indices_verbatim() {
+        // A quad as two triangles. Heap-backed: read_guest_bytes VirtualQuery-
+        // validates the pointer, and a live Vec is committed-readable.
+        let indices: Vec<u16> = vec![0, 1, 2, 2, 1, 3];
+        let draw = IndexedDraw {
+            index_type_and_size: 0,
+            index_count: 6,
+            index_addr: indices.as_ptr() as u64,
+            flags: 0,
+            index_type: 1,
+        };
+        let (bytes, ty) = fetch_index_buffer(&draw).expect("readable index buffer");
+        assert_eq!(ty, vk::IndexType::UINT16);
+        assert_eq!(&bytes[..12], bytemuck_le(&indices).as_slice());
+    }
+
+    /// 8-bit indices are widened to 16-bit — Vulkan has no guaranteed UINT8.
+    #[test]
+    fn fetch_index_buffer_widens_8bit_to_16bit() {
+        let indices: Vec<u8> = vec![0, 1, 2, 3];
+        let draw = IndexedDraw {
+            index_type_and_size: 2,
+            index_count: 4,
+            index_addr: indices.as_ptr() as u64,
+            flags: 0,
+            index_type: 1,
+        };
+        let (bytes, ty) = fetch_index_buffer(&draw).expect("readable index buffer");
+        assert_eq!(ty, vk::IndexType::UINT16);
+        // Each u8 becomes a little-endian u16: 0,1,2,3 -> 00 00 01 00 02 00 03 00.
+        assert_eq!(bytes, vec![0, 0, 1, 0, 2, 0, 3, 0]);
+    }
+
+    /// Index buffers start at `base + offset*element`, which routinely lands
+    /// off a dword boundary — the earlier version rejected that as unreadable
+    /// and Minecraft's draws died on it.
+    #[test]
+    fn fetch_index_buffer_reads_from_an_unaligned_address() {
+        // 8 u16s in a heap buffer; point the draw two bytes in (index 1).
+        let backing: Vec<u16> = vec![99, 10, 11, 12, 13, 14, 15, 16];
+        let unaligned = backing.as_ptr() as u64 + 2;
+        assert_ne!(unaligned & 0x3, 0, "the test address must be unaligned");
+        let draw = IndexedDraw {
+            index_type_and_size: 0,
+            index_count: 4,
+            index_addr: unaligned,
+            flags: 0,
+            index_type: 1,
+        };
+        let (bytes, _) = fetch_index_buffer(&draw).expect("unaligned read must work");
+        assert_eq!(bytes, bytemuck_le(&[10u16, 11, 12, 13]));
+    }
+
+    /// A null address or zero count is a malformed indexed draw, not a hang.
+    #[test]
+    fn fetch_index_buffer_rejects_an_empty_draw() {
+        let draw = IndexedDraw {
+            index_type_and_size: 0,
+            index_count: 0,
+            index_addr: 0x1000,
+            flags: 0,
+            index_type: 1,
+        };
+        assert!(fetch_index_buffer(&draw).is_err());
+    }
+
+    /// Little-endian bytes of a u16 slice, for comparing against fetched data.
+    fn bytemuck_le(indices: &[u16]) -> Vec<u8> {
+        indices.iter().flat_map(|i| i.to_le_bytes()).collect()
     }
 
     #[test]

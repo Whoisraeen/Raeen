@@ -140,6 +140,20 @@ pub struct DrawState<'a> {
     /// how successive draws into the same guest render target compose into
     /// one frame across otherwise independent one-shot draw submissions.
     pub initial: Option<&'a [u8]>,
+    /// The bound index buffer for an indexed draw, or `None` for a
+    /// vertex-order (auto) draw. When present the draw is `vkCmdDrawIndexed`
+    /// and `vertex_count` is the index count; the vertices are pulled through
+    /// this buffer instead of straight from the vertex stream.
+    pub index: Option<IndexBinding<'a>>,
+}
+
+/// A guest index buffer fetched into host memory, ready to upload.
+#[derive(Debug, Clone)]
+pub struct IndexBinding<'a> {
+    /// Tightly-packed index data, `index_count * element_bytes` long.
+    pub bytes: &'a [u8],
+    /// 8-, 16-, or 32-bit indices.
+    pub index_type: vk::IndexType,
 }
 
 impl<'a> DrawState<'a> {
@@ -166,6 +180,7 @@ impl<'a> DrawState<'a> {
             vs_spirv,
             fs_spirv,
             initial: None,
+            index: None,
         }
     }
 }
@@ -277,6 +292,9 @@ struct Resources<'a> {
     image_view: vk::ImageView,
     vertex_buffer: vk::Buffer,
     vertex_memory: vk::DeviceMemory,
+    /// Uploaded index buffer for an indexed draw; null for an auto draw.
+    index_buffer: vk::Buffer,
+    index_memory: vk::DeviceMemory,
     guest_vertex_buffers: Vec<(vk::Buffer, vk::DeviceMemory)>,
     storage_buffers: Vec<(vk::Buffer, vk::DeviceMemory)>,
     descriptor_set_layouts: Vec<vk::DescriptorSetLayout>,
@@ -303,6 +321,8 @@ impl<'a> Resources<'a> {
             image_view: vk::ImageView::null(),
             vertex_buffer: vk::Buffer::null(),
             vertex_memory: vk::DeviceMemory::null(),
+            index_buffer: vk::Buffer::null(),
+            index_memory: vk::DeviceMemory::null(),
             guest_vertex_buffers: Vec::new(),
             storage_buffers: Vec::new(),
             descriptor_set_layouts: Vec::new(),
@@ -344,6 +364,12 @@ impl<'a> Resources<'a> {
         }
         if let Some(vertices) = state.vertices {
             self.create_vertex_buffer(vertices)?;
+        }
+        if let Some(index) = &state.index {
+            let (buffer, memory) =
+                self.create_buffer_with_bytes(index.bytes, vk::BufferUsageFlags::INDEX_BUFFER)?;
+            self.index_buffer = buffer;
+            self.index_memory = memory;
         }
         self.create_guest_vertex_buffers(state)?;
         self.create_stage_resources(state)?;
@@ -1079,7 +1105,14 @@ impl<'a> Resources<'a> {
                     );
                 }
             }
-            d.cmd_draw(self.command_buffer, state.vertex_count, 1, 0, 0);
+            if let Some(index) = &state.index {
+                // vertex_count carries the index count for an indexed draw
+                // (draw_state_from_regs stores the count it was given).
+                d.cmd_bind_index_buffer(self.command_buffer, self.index_buffer, 0, index.index_type);
+                d.cmd_draw_indexed(self.command_buffer, state.vertex_count, 1, 0, 0, 0);
+            } else {
+                d.cmd_draw(self.command_buffer, state.vertex_count, 1, 0, 0);
+            }
             d.cmd_end_rendering(self.command_buffer);
         }
 
@@ -1249,6 +1282,12 @@ impl Drop for Resources<'_> {
             }
             if self.vertex_memory != vk::DeviceMemory::null() {
                 d.free_memory(self.vertex_memory, None);
+            }
+            if self.index_buffer != vk::Buffer::null() {
+                d.destroy_buffer(self.index_buffer, None);
+            }
+            if self.index_memory != vk::DeviceMemory::null() {
+                d.free_memory(self.index_memory, None);
             }
             for (buffer, memory) in guest_vertex_buffers {
                 d.destroy_buffer(buffer, None);
