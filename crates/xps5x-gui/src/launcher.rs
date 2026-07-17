@@ -308,10 +308,24 @@ impl FirmwareLauncher {
         self.kernel.filesystem.set_download_directory(&download_dir);
         self.kernel.filesystem.set_savedata_directory(&savedata_dir);
 
-        let linked = {
+        // Load the whole PROCESS — the eboot plus every DT_NEEDED `.prx` beside
+        // it — not the eboot alone.
+        //
+        // `load_module` links the main module only, so every NEEDED library
+        // falls back to whatever HLE we happen to provide. Our HLE `libc` is
+        // partial, and Minecraft calls `_init_env` from its very first
+        // instructions: the import stayed unresolved, the call landed on the
+        // stub guard page, and the Shell reported "Unimplemented import:
+        // _init_env (libc)" before the title ran at all. The CLI `--run-eboot`
+        // path never hit it because it already loads the process — the title
+        // ships its own libc.prx (2584 exports), which defines `_init_env`.
+        // Loading it makes the Shell and CLI the same launch.
+        let game_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let loaded = {
             let mut registry = self.registry.lock().unwrap();
-            xps5x_firmware::load_module(
+            xps5x_firmware::load_process(
                 &bytes,
+                game_dir,
                 &xps5x_firmware::NoKeysProvider,
                 &mut registry,
                 &self.hle,
@@ -319,7 +333,7 @@ impl FirmwareLauncher {
             )
         };
 
-        let linked = match linked {
+        let linked = match loaded.map(|process| process.linked) {
             Ok(linked) => linked,
             Err(FirmwareError::MissingKey { .. }) => {
                 return SessionOutcome::Faulted(
