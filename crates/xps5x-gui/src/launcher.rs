@@ -217,8 +217,39 @@ enum SessionOutcome {
 }
 
 struct FirmwareSession {
-    outcome: SessionOutcome,
+    /// `None` until the session thread reports — a real title runs for as long
+    /// as the player plays, so the outcome does not exist yet.
+    outcome: Option<SessionOutcome>,
+    /// Delivers the outcome once the guest exits or faults.
+    result: Option<std::sync::mpsc::Receiver<SessionOutcome>>,
     quit_requested: bool,
+}
+
+impl FirmwareSession {
+    /// Take the outcome if the session thread has finished. Non-blocking: the
+    /// UI polls this every frame.
+    fn poll(&mut self) {
+        if self.outcome.is_some() {
+            return;
+        }
+        if let Some(rx) = &self.result {
+            match rx.try_recv() {
+                Ok(outcome) => {
+                    self.outcome = Some(outcome);
+                    self.result = None;
+                }
+                // Sender dropped without sending: the session thread died
+                // (panicked). Report it rather than reading as still-running.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.outcome = Some(SessionOutcome::Faulted(
+                        "The session thread stopped unexpectedly".to_string(),
+                    ));
+                    self.result = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
 }
 
 /// Wires the Shell to the real firmware spine: [`xps5x_firmware::load_module`]
@@ -248,7 +279,9 @@ pub struct FirmwareLauncher {
     /// thread manager, ...) is process-wide, matching a real PS5's single
     /// kernel serving every loaded module.
     kernel: std::sync::Arc<xps5x_kernel::OrbisKernel>,
-    registry: Mutex<xps5x_firmware::ModuleRegistry>,
+    /// Arc'd so a session thread can own a handle: the guest runs for as long as
+    /// the player plays, and it cannot borrow the launcher for that long.
+    registry: std::sync::Arc<Mutex<xps5x_firmware::ModuleRegistry>>,
     sessions: Mutex<HashMap<u64, FirmwareSession>>,
     next_id: Mutex<u64>,
 }
@@ -260,7 +293,7 @@ impl FirmwareLauncher {
         Self {
             hle: std::sync::Arc::new(hle),
             kernel: std::sync::Arc::new(xps5x_kernel::OrbisKernel::new()),
-            registry: Mutex::new(xps5x_firmware::ModuleRegistry::new(nid_db)),
+            registry: std::sync::Arc::new(Mutex::new(xps5x_firmware::ModuleRegistry::new(nid_db))),
             sessions: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
         }
@@ -277,7 +310,12 @@ impl FirmwareLauncher {
     /// itself — execution (which needs `&self.hle`, not the registry) runs
     /// with the lock already released, since `self.hle` lives outside the
     /// `Mutex<ModuleRegistry>` and is borrowed directly.
-    fn load(&self, path: &Path) -> SessionOutcome {
+    fn load_and_run(
+        hle: &std::sync::Arc<xps5x_hle::HleRegistry>,
+        kernel: &std::sync::Arc<xps5x_kernel::OrbisKernel>,
+        registry: &std::sync::Arc<Mutex<xps5x_firmware::ModuleRegistry>>,
+        path: &Path,
+    ) -> SessionOutcome {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -288,7 +326,7 @@ impl FirmwareLauncher {
             }
         };
 
-        self.kernel
+        kernel
             .filesystem
             .set_game_directory(path.parent().unwrap_or_else(|| Path::new(".")));
         let title_dir = path.parent().and_then(Path::file_name).unwrap_or_default();
@@ -304,9 +342,9 @@ impl FirmwareLauncher {
                 ));
             }
         }
-        self.kernel.filesystem.set_temp_directory(&temp_dir);
-        self.kernel.filesystem.set_download_directory(&download_dir);
-        self.kernel.filesystem.set_savedata_directory(&savedata_dir);
+        kernel.filesystem.set_temp_directory(&temp_dir);
+        kernel.filesystem.set_download_directory(&download_dir);
+        kernel.filesystem.set_savedata_directory(&savedata_dir);
 
         // Load the whole PROCESS — the eboot plus every DT_NEEDED `.prx` beside
         // it — not the eboot alone.
@@ -322,13 +360,13 @@ impl FirmwareLauncher {
         // Loading it makes the Shell and CLI the same launch.
         let game_dir = path.parent().unwrap_or_else(|| Path::new("."));
         let loaded = {
-            let mut registry = self.registry.lock().unwrap();
+            let mut registry = registry.lock().unwrap();
             xps5x_firmware::load_process(
                 &bytes,
                 game_dir,
                 &xps5x_firmware::NoKeysProvider,
                 &mut registry,
-                &self.hle,
+                hle,
                 DEFAULT_LOAD_BASE,
             )
         };
@@ -350,7 +388,7 @@ impl FirmwareLauncher {
         // M1-D: the main module joins the kernel's module table, so a guest
         // `sceKernelLoadStartModule` naming it (or a Settings-style module
         // list) can find it by name/handle.
-        self.kernel.register_module(xps5x_kernel::ModuleInfo {
+        kernel.register_module(xps5x_kernel::ModuleInfo {
             id: 0, // assigned by register_module
             name: path
                 .file_stem()
@@ -372,8 +410,8 @@ impl FirmwareLauncher {
             // reported as `Ran` (malformed but tolerated).
             match xps5x_runtime::execute_process_shared(
                 std::sync::Arc::clone(&linked),
-                std::sync::Arc::clone(&self.hle),
-                std::sync::Arc::clone(&self.kernel),
+                std::sync::Arc::clone(hle),
+                std::sync::Arc::clone(&kernel),
                 &[GUEST_ARGV0],
                 &[],
             ) {
@@ -437,51 +475,85 @@ impl Default for FirmwareLauncher {
 
 impl GameLauncher for FirmwareLauncher {
     fn launch(&self, target: &LaunchTarget) -> Result<SessionHandle, LaunchError> {
-        let outcome = match target {
-            LaunchTarget::Game { path } => self.load(path),
+        // Run the title on its own thread and return NOW.
+        //
+        // This used to call `load` inline, which runs the guest to completion —
+        // `execute_process_shared` only returns when the title exits. For the
+        // link-only fixtures this was written against that was instant; a real
+        // title boots for a minute and then plays forever, so the Shell simply
+        // froze the moment you launched Minecraft (measured: window unresponsive
+        // for the whole run). The UI thread must never run the guest.
+        let session = match target {
+            LaunchTarget::Game { path } => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let hle = std::sync::Arc::clone(&self.hle);
+                let kernel = std::sync::Arc::clone(&self.kernel);
+                let registry = std::sync::Arc::clone(&self.registry);
+                let path = path.clone();
+                std::thread::Builder::new()
+                    .name("xps5x-session".to_owned())
+                    .spawn(move || {
+                        // The receiver going away (session closed) is not an
+                        // error worth reporting — nobody is listening.
+                        let _ = tx.send(FirmwareLauncher::load_and_run(&hle, &kernel, &registry, &path));
+                    })
+                    .map_err(|e| LaunchError::Failed(format!("cannot start session: {e}")))?;
+                FirmwareSession {
+                    outcome: None,
+                    result: Some(rx),
+                    quit_requested: false,
+                }
+            }
             // Built-in apps (Store, Game Library, Settings) aren't modules;
             // there's no path to read, so this can't even attempt a load.
-            LaunchTarget::App { id } => {
-                SessionOutcome::Faulted(format!("'{id}' is not a loadable module"))
-            }
+            LaunchTarget::App { id } => FirmwareSession {
+                outcome: Some(SessionOutcome::Faulted(format!(
+                    "'{id}' is not a loadable module"
+                ))),
+                result: None,
+                quit_requested: false,
+            },
         };
 
         let mut next_id = self.next_id.lock().unwrap();
         let id = *next_id;
         *next_id += 1;
 
-        self.sessions.lock().unwrap().insert(
-            id,
-            FirmwareSession {
-                outcome,
-                quit_requested: false,
-            },
-        );
+        self.sessions.lock().unwrap().insert(id, session);
 
         Ok(SessionHandle(id))
     }
 
     fn session_state(&self, handle: &SessionHandle) -> SessionState {
-        let sessions = self.sessions.lock().unwrap();
-        match sessions.get(&handle.0) {
-            None => SessionState::Faulted,
-            Some(session) if session.quit_requested => SessionState::Exited,
-            Some(session) => match &session.outcome {
-                SessionOutcome::Linked { .. } => SessionState::Running,
-                SessionOutcome::Ran { .. } => SessionState::Running,
-                // A run that ended via exit() stays `Running` so the session
-                // overlay shows the outcome until the user quits — the Shell
-                // auto-returns Home the moment it polls `Exited` (see
-                // `shell/mod.rs`), which would flash past the detail text.
-                SessionOutcome::Exited { .. } => SessionState::Running,
-                SessionOutcome::Faulted(_) => SessionState::Faulted,
-            },
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions.get_mut(&handle.0) else {
+            return SessionState::Faulted;
+        };
+        if session.quit_requested {
+            return SessionState::Exited;
+        }
+        session.poll();
+        match &session.outcome {
+            // The title is still running on its own thread — which for a real
+            // game is the normal, long-lived state, not a brief load.
+            None => SessionState::Running,
+            Some(SessionOutcome::Linked { .. } | SessionOutcome::Ran { .. }) => {
+                SessionState::Running
+            }
+            // A run that ended via exit() stays `Running` so the session
+            // overlay shows the outcome until the user quits — the Shell
+            // auto-returns Home the moment it polls `Exited` (see
+            // `shell/mod.rs`), which would flash past the detail text.
+            Some(SessionOutcome::Exited { .. }) => SessionState::Running,
+            Some(SessionOutcome::Faulted(_)) => SessionState::Faulted,
         }
     }
 
     fn session_detail(&self, handle: &SessionHandle) -> Option<String> {
-        let sessions = self.sessions.lock().unwrap();
-        sessions.get(&handle.0).map(|session| match &session.outcome {
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(&handle.0)?;
+        session.poll();
+        Some(match session.outcome.as_ref()? {
             SessionOutcome::Linked { resolved, unresolved, .. } => format!(
                 "Linked — {resolved} imports resolved to HLE, {unresolved} unresolved · execution not yet implemented (Esc to return)"
             ),
@@ -660,6 +732,33 @@ mod firmware_launcher_tests {
         path
     }
 
+    /// Block until the session thread reports, then return its state.
+    ///
+    /// `launch` is asynchronous — it starts the title on its own thread and
+    /// returns immediately, because a real title runs for as long as the player
+    /// plays and the UI thread must stay live. So a test that wants the OUTCOME
+    /// has to wait for it; reading `session_state` straight after `launch`
+    /// races the thread and usually just sees `Running`.
+    ///
+    /// The fixtures here link or fault in milliseconds; the timeout only exists
+    /// so a regression hangs the one test instead of the whole suite.
+    fn settled_state(launcher: &FirmwareLauncher, handle: &SessionHandle) -> SessionState {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let state = launcher.session_state(handle);
+            let settled = launcher
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&handle.0)
+                .is_some_and(|s| s.outcome.is_some());
+            if settled || std::time::Instant::now() >= deadline {
+                return state;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     // --- tests --------------------------------------------------------------
 
     #[test]
@@ -672,7 +771,7 @@ mod firmware_launcher_tests {
         let handle = launcher
             .launch(&target)
             .expect("launch always returns a handle, even on fault");
-        assert_eq!(launcher.session_state(&handle), SessionState::Faulted);
+        assert_eq!(settled_state(&launcher, &handle), SessionState::Faulted);
         let detail = launcher
             .session_detail(&handle)
             .expect("fault carries a message");
@@ -692,7 +791,7 @@ mod firmware_launcher_tests {
         let handle = launcher
             .launch(&target)
             .expect("launch always returns a handle, even on fault");
-        assert_eq!(launcher.session_state(&handle), SessionState::Faulted);
+        assert_eq!(settled_state(&launcher, &handle), SessionState::Faulted);
         let detail = launcher
             .session_detail(&handle)
             .expect("fault carries a message");
@@ -724,7 +823,7 @@ mod firmware_launcher_tests {
         // pipeline stops at `Linked` (see `load`'s `#[cfg]` gate).
         #[cfg(target_os = "windows")]
         {
-            assert_eq!(launcher.session_state(&handle), SessionState::Faulted);
+            assert_eq!(settled_state(&launcher, &handle), SessionState::Faulted);
             let detail = launcher
                 .session_detail(&handle)
                 .expect("a faulted session has detail text");
@@ -735,7 +834,7 @@ mod firmware_launcher_tests {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            assert_eq!(launcher.session_state(&handle), SessionState::Running);
+            assert_eq!(settled_state(&launcher, &handle), SessionState::Running);
             let detail = launcher
                 .session_detail(&handle)
                 .expect("a running session has detail text");
@@ -774,12 +873,12 @@ mod firmware_launcher_tests {
         // stops at `Linked` (`Running`) elsewhere — either way, `quit` must
         // transition the session to `Exited`.
         #[cfg(target_os = "windows")]
-        assert_eq!(launcher.session_state(&handle), SessionState::Faulted);
+        assert_eq!(settled_state(&launcher, &handle), SessionState::Faulted);
         #[cfg(not(target_os = "windows"))]
-        assert_eq!(launcher.session_state(&handle), SessionState::Running);
+        assert_eq!(settled_state(&launcher, &handle), SessionState::Running);
 
         launcher.quit(&handle).expect("quit should succeed");
-        assert_eq!(launcher.session_state(&handle), SessionState::Exited);
+        assert_eq!(settled_state(&launcher, &handle), SessionState::Exited);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1037,7 +1136,7 @@ mod firmware_launcher_tests {
             let launcher = FirmwareLauncher {
                 hle: hle.into(),
                 kernel: xps5x_kernel::OrbisKernel::new().into(),
-                registry: Mutex::new(xps5x_firmware::ModuleRegistry::new(nid_db)),
+                registry: Mutex::new(xps5x_firmware::ModuleRegistry::new(nid_db)).into(),
                 sessions: Mutex::new(HashMap::new()),
                 next_id: Mutex::new(0),
             };
@@ -1107,7 +1206,7 @@ mod firmware_launcher_tests {
                 .launch(&LaunchTarget::Game { path })
                 .expect("launch always returns a handle");
 
-            assert_eq!(launcher.session_state(&handle), SessionState::Running);
+            assert_eq!(settled_state(&launcher, &handle), SessionState::Running);
             let detail = launcher
                 .session_detail(&handle)
                 .expect("a ran session has detail text");
@@ -1148,7 +1247,7 @@ mod firmware_launcher_tests {
             let launcher = FirmwareLauncher {
                 hle: hle.into(),
                 kernel: xps5x_kernel::OrbisKernel::new().into(),
-                registry: Mutex::new(xps5x_firmware::ModuleRegistry::new(nid_db)),
+                registry: Mutex::new(xps5x_firmware::ModuleRegistry::new(nid_db)).into(),
                 sessions: Mutex::new(HashMap::new()),
                 next_id: Mutex::new(0),
             };
@@ -1164,7 +1263,7 @@ mod firmware_launcher_tests {
                 .launch(&LaunchTarget::Game { path })
                 .expect("launch always returns a handle");
 
-            assert_eq!(launcher.session_state(&handle), SessionState::Faulted);
+            assert_eq!(settled_state(&launcher, &handle), SessionState::Faulted);
             let detail = launcher
                 .session_detail(&handle)
                 .expect("fault carries a message");
@@ -1257,7 +1356,7 @@ mod firmware_launcher_tests {
                 .launch(&LaunchTarget::Game { path })
                 .expect("launch always returns a handle");
 
-            assert_eq!(launcher.session_state(&handle), SessionState::Running);
+            assert_eq!(settled_state(&launcher, &handle), SessionState::Running);
             let detail = launcher
                 .session_detail(&handle)
                 .expect("a completed session has detail text");
@@ -1547,7 +1646,7 @@ mod firmware_launcher_tests {
                 .launch(&LaunchTarget::Game { path })
                 .expect("launch always returns a handle");
 
-            assert_eq!(launcher.session_state(&handle), SessionState::Running);
+            assert_eq!(settled_state(&launcher, &handle), SessionState::Running);
             let detail = launcher
                 .session_detail(&handle)
                 .expect("a ran session has detail text");
@@ -1612,7 +1711,7 @@ mod firmware_launcher_tests {
                 .launch(&item.launch)
                 .expect("launch always returns a handle");
 
-            assert_eq!(launcher.session_state(&handle), SessionState::Running);
+            assert_eq!(settled_state(&launcher, &handle), SessionState::Running);
             let detail = launcher
                 .session_detail(&handle)
                 .expect("a ran session has detail text");
@@ -1948,7 +2047,7 @@ pub extern "C" fn rust_eh_personality() {}
                 .session_detail(&handle)
                 .expect("a ran session has detail text");
             assert_eq!(
-                launcher.session_state(&handle),
+                settled_state(&launcher, &handle),
                 SessionState::Running,
                 "detail: {detail}"
             );
