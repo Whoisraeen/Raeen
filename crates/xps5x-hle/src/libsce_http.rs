@@ -23,6 +23,9 @@ const HTTP_ERROR_INVALID_ID: u64 = 0x8043_1100;
 const HTTP_ERROR_INVALID_VALUE: u64 = 0x8043_11FE;
 const HTTP2_ERROR_INVALID_ID: u64 = 0x8043_6004;
 const HTTP2_ERROR_INVALID_ARGUMENT: u64 = 0x8043_6016;
+/// `SCE_HTTP2_ERROR_CANNOT_CONNECT` — no host-network backend exists, so a
+/// request can never be sent. Reported instead of a live request id.
+const HTTP2_ERROR_CANNOT_CONNECT: u64 = 0x8043_6023;
 
 /// Register the libSceHttp and libSceHttp2 functions.
 pub fn register(registry: &HleRegistry) {
@@ -44,6 +47,11 @@ pub fn register(registry: &HleRegistry) {
         "sceHttp2CreateTemplate",
         0xfb00_aded_f0a2_8e09,
         hle_http2_create_template,
+    );
+    registry.register(
+        "libSceHttp2",
+        "sceHttp2CreateRequestWithURL",
+        hle_http2_create_request_with_url,
     );
     registry.register("libSceHttp2", "sceHttp2Term", hle_http2_term);
 }
@@ -134,6 +142,31 @@ fn hle_http2_create_template(ctx: &HleContext, args: &[u64]) -> u64 {
         + 1;
     ctx.kernel.http2_templates.insert(id, context_id);
     id as u32 as u64
+}
+
+/// `sceHttp2CreateRequestWithURL(templateId, method, url, contentLength)`.
+///
+/// Reports "cannot connect": XPS5X has no host-network backend, so a request
+/// that cannot be sent must not be handed back as a live one. A plausible
+/// request id would be worse than an error — the title would then poll a
+/// response that can never arrive.
+///
+/// Registering it AT ALL is the point. It was the one import Minecraft actually
+/// called that had none, and an unresolved import is not a no-op: the call lands
+/// on the unresolved-stub guard page, faults, and KILLS the calling guest thread
+/// (`RuntimeError::UnimplementedImport`). Measured — the fault timestamp is
+/// exactly when the title's activity stops. A named error lets the thread live
+/// and take its own offline path.
+fn hle_http2_create_request_with_url(ctx: &HleContext, args: &[u64]) -> u64 {
+    let template_id = args.first().copied().unwrap_or(0) as i32;
+    if !ctx.kernel.http2_templates.contains_key(&template_id) {
+        return HTTP2_ERROR_INVALID_ID;
+    }
+    tracing::debug!(
+        template_id,
+        "sceHttp2CreateRequestWithURL -> ERROR_CANNOT_CONNECT (offline: no host-network backend)"
+    );
+    HTTP2_ERROR_CANNOT_CONNECT
 }
 
 /// `sceHttp2Term(contextId)`: removes the context, or reports an invalid-id
