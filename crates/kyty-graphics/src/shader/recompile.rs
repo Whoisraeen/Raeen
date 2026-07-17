@@ -495,33 +495,42 @@ fn recompile_exp_param_xxx(
     const FUNC: &str = "Recompile_Exp_Param_XXX_Vsrc0Vsrc1Vsrc2Vsrc3";
     let inst = inst_at(code, index, FUNC)?;
 
-    if inst.src[..4].iter().any(|s| !operand_is_variable(*s)) {
-        return Err(not_supported(FUNC, "sources are not variables"));
-    }
+    // The `en` mask says which of the four channels this export writes. A full
+    // export is 0xf; a vec2 texcoord is 0x3, a vec3 normal 0x7. The disabled
+    // channels' `vsrc` fields are don't-care in the hardware encoding, so only
+    // the enabled ones are required to be variables — the earlier version
+    // demanded all four and rejected every partial export.
+    let en = inst.export_enable;
+    let enabled = |i: usize| en & (1 << i) != 0;
 
-    let src0_value = operand_variable_to_str(inst.src[0]);
-    let src1_value = operand_variable_to_str(inst.src[1]);
-    let src2_value = operand_variable_to_str(inst.src[2]);
-    let src3_value = operand_variable_to_str(inst.src[3]);
+    // `find_constants` always registers 0.0, so `%float_0_000000` is available
+    // to seed the disabled channels; the param slot is then fully defined and
+    // the consuming PS reads only the channels it declared.
+    let mut loads = String::new();
+    let mut channels: [String; 4] = Default::default();
+    for (i, channel) in channels.iter_mut().enumerate() {
+        if enabled(i) {
+            if !operand_is_variable(inst.src[i]) {
+                return Err(not_supported(FUNC, "enabled export source is not a variable"));
+            }
+            let value = operand_variable_to_str(inst.src[i]).value;
+            loads += &format!("         %t{i}_<index> = OpLoad %float %{value}\n");
+            *channel = format!("%t{i}_<index>");
+        } else {
+            *channel = "%float_0_000000".to_owned();
+        }
+    }
 
     // TODO() check VSKIP
     // TODO() check EXEC
 
-    const TEXT: &str = r#"
-         %t0_<index> = OpLoad %float %<src0>
-         %t1_<index> = OpLoad %float %<src1>
-         %t2_<index> = OpLoad %float %<src2>
-         %t3_<index> = OpLoad %float %<src3>
-         %t4_<index> = OpCompositeConstruct %v4float %t0_<index> %t1_<index> %t2_<index> %t3_<index>
-               OpStore %<param> %t4_<index>
-"#;
+    let text = format!(
+        "{loads}         %t4_<index> = OpCompositeConstruct %v4float {} {} {} {}\n               OpStore %<param> %t4_<index>\n",
+        channels[0], channels[1], channels[2], channels[3]
+    );
 
-    *dst_source += &TEXT
+    *dst_source += &text
         .replace("<index>", &format!("{index}"))
-        .replace("<src0>", &src0_value.value)
-        .replace("<src1>", &src1_value.value)
-        .replace("<src2>", &src2_value.value)
-        .replace("<src3>", &src3_value.value)
         .replace("<param>", param[0].unwrap_or(""));
 
     Ok(true)
@@ -6641,5 +6650,75 @@ mod tests {
     fn spirv_run_reports_asm_errors() {
         let err = spirv_run("%x OpNotARealInstruction\n").unwrap_err();
         assert!(matches!(err, ShaderRecompileError::Asm(_)));
+    }
+
+    fn exp_param_vgpr(id: i32) -> ShaderOperand {
+        ShaderOperand {
+            type_: crate::shader::types::ShaderOperandType::Vgpr,
+            register_id: id,
+            size: 1,
+            ..Default::default()
+        }
+    }
+
+    fn recompile_one_param_export(export_enable: u32) -> String {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        let mut inst = ShaderInstruction {
+            type_: T::Exp,
+            format: F::Param0Vsrc0Vsrc1Vsrc2Vsrc3,
+            export_enable,
+            src_num: 4,
+            ..Default::default()
+        };
+        inst.src = [
+            exp_param_vgpr(0),
+            exp_param_vgpr(1),
+            exp_param_vgpr(2),
+            exp_param_vgpr(3),
+        ];
+        code.get_instructions_mut().push(inst);
+
+        let spirv = Spirv::new();
+        let mut out = String::new();
+        recompile_exp_param_xxx(0, &code, &mut out, &spirv, &p1("param0"), SccCheck::None)
+            .expect("param export recompiles");
+        out
+    }
+
+    /// A partial-channel param export (e.g. a `vec2` texcoord, `en=0x3`) writes
+    /// its enabled channels and 0 to the rest.
+    ///
+    /// The earlier recompiler demanded all four sources be variables, so every
+    /// partial export failed and took the whole vertex shader with it — which
+    /// is why Minecraft's content shaders would not translate. `%float_0_000000`
+    /// is always registered by `find_constants`, so the disabled channels get a
+    /// defined zero.
+    #[test]
+    fn exp_param_partial_mask_writes_zero_to_disabled_channels() {
+        let out = recompile_one_param_export(0x3); // channels x, y
+        assert!(out.contains("OpLoad %float %v0"), "channel 0 loads v0:\n{out}");
+        assert!(out.contains("OpLoad %float %v1"), "channel 1 loads v1:\n{out}");
+        assert!(!out.contains("%v2"), "channel 2 disabled — no load:\n{out}");
+        assert!(!out.contains("%v3"), "channel 3 disabled — no load:\n{out}");
+        assert!(
+            out.contains(
+                "OpCompositeConstruct %v4float %t0_0 %t1_0 %float_0_000000 %float_0_000000"
+            ),
+            "disabled channels must be zero:\n{out}"
+        );
+    }
+
+    /// A full export (`en=0xf`) is unchanged: all four channels load their vgpr.
+    #[test]
+    fn exp_param_full_mask_still_writes_all_four_channels() {
+        let out = recompile_one_param_export(0xf);
+        for i in 0..4 {
+            assert!(out.contains(&format!("OpLoad %float %v{i}")), "channel {i}:\n{out}");
+        }
+        assert!(
+            !out.contains("%float_0_000000"),
+            "a full export writes no zeros:\n{out}"
+        );
     }
 }

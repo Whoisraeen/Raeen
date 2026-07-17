@@ -518,6 +518,11 @@ pub struct ShaderInstruction {
     pub src_num: i32,
     pub dst: ShaderOperand,
     pub dst2: ShaderOperand,
+    /// EXP channel-enable mask (`en`): which of the four `vsrc` channels this
+    /// export actually writes. Only meaningful for `type_ == Exp`; a full
+    /// export is `0xf`, a partial one (e.g. a `vec2` texcoord) `0x3`. Set by
+    /// `shader_parse_exp`; the recompiler writes 0 to the disabled channels.
+    pub export_enable: u32,
 }
 
 /// Kyty: Shader.h `ShaderLabel` (L420). `dst = pc + 4 + src[0].constant.i`.

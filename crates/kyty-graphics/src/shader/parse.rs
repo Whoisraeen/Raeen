@@ -2163,6 +2163,7 @@ fn shader_parse_exp(
     inst.src_num = 4;
 
     inst.type_ = T::Exp;
+    inst.export_enable = en;
 
     match target {
         0x00 => {
@@ -2186,7 +2187,12 @@ fn shader_parse_exp(
         _ => {}
     }
 
-    if inst.format == F::Unknown && done == 0 && compr == 0 && vm == 0 && en == 0xf {
+    // Param exports (PARAM0..) carry a channel-enable mask: a full export is
+    // en=0xf, but a vec2 texcoord is 0x3 and a vec3 normal 0x7. The mask is
+    // recorded in `export_enable` and the recompiler writes 0 to the disabled
+    // channels, so any `en` is accepted here — the earlier `en == 0xf` gate
+    // rejected every partial param export and failed the whole vertex shader.
+    if inst.format == F::Unknown && done == 0 && compr == 0 && vm == 0 && en != 0 {
         match target {
             0x20 => inst.format = F::Param0Vsrc0Vsrc1Vsrc2Vsrc3,
             0x21 => inst.format = F::Param1Vsrc0Vsrc1Vsrc2Vsrc3,
@@ -2201,6 +2207,7 @@ fn shader_parse_exp(
         // Kyty L2342-2348: dump + EXIT on unknown exp target.
         tracing::error!(
             "unknown exp target: 0x{target:02x} at addr 0x{pc:08x} \
+             (en=0x{en:x} done={done} compr={compr} vm={vm}) \
              (hash0 = 0x{:08x}, crc32 = 0x{:08x})\n{}",
             dst.get_hash0(),
             dst.get_crc32(),
