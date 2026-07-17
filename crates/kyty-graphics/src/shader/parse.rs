@@ -1036,6 +1036,9 @@ fn shader_parse_vopc(
         // the same lowering and the title decides one opcode at a time.
         0x91 => inst.type_ = T::VCmpxLtI32,
         0x92 => inst.type_ = T::VCmpxEqI32,
+        // 0x93 has no unsigned twin (there is no 0xd3), so it is easy to miss
+        // when mirroring that block — Minecraft emits it.
+        0x93 => inst.type_ = T::VCmpxLeI32,
         0x94 => inst.type_ = T::VCmpxGtI32,
         0x95 => inst.type_ = T::VCmpxNeI32,
         0x96 => inst.type_ = T::VCmpxGeI32,
@@ -1639,6 +1642,9 @@ fn shader_parse_vop3(
         // the same lowering and the title decides one opcode at a time.
         0x91 => inst.type_ = T::VCmpxLtI32,
         0x92 => inst.type_ = T::VCmpxEqI32,
+        // 0x93 has no unsigned twin (there is no 0xd3), so it is easy to miss
+        // when mirroring that block — Minecraft emits it.
+        0x93 => inst.type_ = T::VCmpxLeI32,
         0x94 => inst.type_ = T::VCmpxGtI32,
         0x95 => inst.type_ = T::VCmpxNeI32,
         0x96 => inst.type_ = T::VCmpxGeI32,
@@ -1973,24 +1979,28 @@ fn shader_parse_vop3(
         0x35e => return Err(ni(dst, S, "v_mad_i16", opcode, pc, b0)),
         0x35f => return Err(ni(dst, S, "v_div_fixup_f16", opcode, pc, b0)),
         0x36d => return Err(ni(dst, S, "v_add3_u32", opcode, pc, b0)),
-        0x36f => {
-            if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
-            }
-            return Err(ni(dst, S, "v_lshl_or_u32", opcode, pc, b0));
-        }
-        0x371 => {
-            if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
-            }
-            return Err(ni(dst, S, "v_and_or_u32", opcode, pc, b0));
-        }
-        0x372 => {
-            if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
-            }
-            return Err(ni(dst, S, "v_or3_u32", opcode, pc, b0));
-        }
+        // `v_lshl_or_u32`: dst = (src0 << (src1 & 31)) | src2. Same deliberate
+        // deviation as 0x371 below — Kyty gates this off on next_gen, but
+        // SharpEmu's Gen5 (PS5/RDNA2) decoder maps `0x36F => "VLshlOrU32"` and
+        // lowers it exactly this way, and Minecraft emits it.
+        0x36f => inst.type_ = T::VLshlOrU32,
+        // `v_and_or_b32`: dst = (src0 & src1) | src2.
+        //
+        // DELIBERATE DEVIATION from Kyty, which rejects this as UNKNOWN_OP on
+        // next_gen (ShaderParse.cpp L2122) and leaves it NI on legacy. That gate
+        // is untested conservatism, not an RDNA2 difference — two independent
+        // references agree the opcode is the same on both generations:
+        //   * SharpEmu's Gen5 (PS5/RDNA2) decoder: `0x371 => "VAndOrB32"`
+        //     (Gen5ShaderTranslator.cs L1137), lowered as
+        //     `BitwiseOr(BitwiseAnd(s0, s1), s2)` (Gen5SpirvTranslator.Alu.cs).
+        //   * shadPS4: `V_AND_OR_B32 = 881` (opcodes.h L716) — 881 == 0x371.
+        // Measured: Minecraft emits it (raw 0xd7710001) in a compute shader once
+        // boot reaches the menu stage; rejecting it failed the whole shader and
+        // skipped every draw bound to it.
+        0x371 => inst.type_ = T::VAndOrB32,
+        // `v_or3_u32`: dst = (src0 | src1) | src2. Completes the gated trio
+        // (0x36f/0x371/0x372); SharpEmu Gen5: `0x372 => "VOr3U32"`.
+        0x372 => inst.type_ = T::VOr3U32,
         0x373 => return Err(ni(dst, S, "v_mad_u32_u16", opcode, pc, b0)),
         0x375 => return Err(ni(dst, S, "v_mad_i32_i16", opcode, pc, b0)),
 

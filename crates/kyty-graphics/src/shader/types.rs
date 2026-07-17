@@ -171,6 +171,7 @@ pub enum ShaderInstructionType {
     VCmpxEqI32,
     VCmpxGeI32,
     VCmpxGtI32,
+    VCmpxLeI32,
     VCmpxLtF32,
     VCmpxLtI32,
     VCmpxLtU32,
@@ -202,7 +203,10 @@ pub enum ShaderInstructionType {
     /// RDNA2 (`next_gen`) VOP3 0x346: `vdst = (vsrc0 << vsrc1[4:0]) + vsrc2`.
     /// Not in Kyty's GCN table — first RDNA2-only instruction, added for the
     /// Minecraft menu CS.
+    VAndOrB32,
     VLshlAddU32,
+    VLshlOrU32,
+    VOr3U32,
     VLshlB32,
     VLshlrevB32,
     VLshrB32,

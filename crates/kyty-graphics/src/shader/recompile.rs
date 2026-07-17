@@ -4689,7 +4689,6 @@ fn recompile_v_xxx_b32_svdst_svsrc01(
 
 /// Kyty: `Recompile_V_XXX_I32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp L5795).
 /// XXX: Ashr, Ashrrev, MulLo (via `param`).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_v_xxx_i32_svdst_svsrc01(
     index: u32,
     code: &ShaderCode,
@@ -5225,9 +5224,16 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_v_xxx_f32_svdst_svsrc01, T::VMulF32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFMul %float %t0_<index> %t1_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc01, T::VSubF32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFSub %float %t0_<index> %t1_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc01, T::VSubrevF32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFSub %float %t1_<index> %t0_<index>")),
-    ni("Recompile_V_XXX_I32_SVdstSVsrc0SVsrc1", 5795, T::VAshrI32,    F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %int %t1_<index> %int_31", "%t_<index> = OpShiftRightArithmetic %int %t0_<index> %ts_<index>")),
-    ni("Recompile_V_XXX_I32_SVdstSVsrc0SVsrc1", 5795, T::VAshrrevI32, F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %int %t0_<index> %int_31", "%t_<index> = OpShiftRightArithmetic %int %t1_<index> %ts_<index>")),
-    ni("Recompile_V_XXX_I32_SVdstSVsrc0SVsrc1", 5795, T::VMulLoI32,   F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %int %mul_lo_int %t0_<index> %t1_<index>")),
+    // Wired from the staged set: `recompile_v_xxx_i32_svdst_svsrc01` was already
+    // written (and these rows' SPIR-V already correct) but left unreachable.
+    // Minecraft reaches `v_ashrrev_i32` in a compute shader once boot gets far
+    // enough, and an NI row fails the whole shader, skipping every draw bound to
+    // it. Ashr/Ashrrev differ only in which operand is the shift amount — the
+    // "rev" form takes it from src0 and shifts src1. `%mul_lo_int` is emitted by
+    // the SPIR-V preamble (spirv.rs), so MulLo is safe to wire alongside them.
+    f(recompile_v_xxx_i32_svdst_svsrc01, T::VAshrI32,    F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %int %t1_<index> %int_31", "%t_<index> = OpShiftRightArithmetic %int %t0_<index> %ts_<index>")),
+    f(recompile_v_xxx_i32_svdst_svsrc01, T::VAshrrevI32, F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %int %t0_<index> %int_31", "%t_<index> = OpShiftRightArithmetic %int %t1_<index> %ts_<index>")),
+    f(recompile_v_xxx_i32_svdst_svsrc01, T::VMulLoI32,   F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %int %mul_lo_int %t0_<index> %t1_<index>")),
     f(recompile_vcvt_pkrtz_f16_f32, T::VCvtPkrtzF16F32, F::SVdstSVsrc0SVsrc1, p1("")),
     ni("Recompile_VMbcntHiU32B32_SVdstSVsrc0SVsrc1",  5455, T::VMbcntHiU32B32,  F::SVdstSVsrc0SVsrc1, p1("")),
     ni("Recompile_VMbcntLoU32B32_SVdstSVsrc0SVsrc1",  5497, T::VMbcntLoU32B32,  F::SVdstSVsrc0SVsrc1, p1("")),
@@ -5328,6 +5334,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     // sign-extended). Eq/Ne are sign-agnostic and match the unsigned rows.
     f(recompile_vcmpx_xxx_i32, T::VCmpxLtI32,  F::SmaskVsrc0Vsrc1, p1("OpSLessThan")),
     f(recompile_vcmpx_xxx_i32, T::VCmpxGeI32,  F::SmaskVsrc0Vsrc1, p1("OpSGreaterThanEqual")),
+    f(recompile_vcmpx_xxx_i32, T::VCmpxLeI32,  F::SmaskVsrc0Vsrc1, p1("OpSLessThanEqual")),
     f(recompile_vcmpx_xxx_i32, T::VCmpxGtI32,  F::SmaskVsrc0Vsrc1, p1("OpSGreaterThan")),
     f(recompile_vcmpx_xxx_i32, T::VCmpxEqI32,  F::SmaskVsrc0Vsrc1, p1("OpIEqual")),
     f(recompile_vcmpx_xxx_i32, T::VCmpxNeI32,  F::SmaskVsrc0Vsrc1, p1("OpINotEqual")),
@@ -5377,6 +5384,19 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_v_xxx_u32_vdst_vsrc012, T::VLshlAddU32, F::VdstVsrc0Vsrc1Vsrc2, p3("%ts_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31",
         "%tsh_<index> = OpShiftLeftLogical %uint %t0_<index> %ts_<index>",
         "%t_<index> = OpIAdd %uint %tsh_<index> %t2_<index>")),
+    // `v_and_or_b32`: dst = (src0 & src1) | src2 — matching SharpEmu's Gen5
+    // lowering `BitwiseOr(BitwiseAnd(s0, s1), s2)` exactly.
+    f(recompile_v_xxx_u32_vdst_vsrc012, T::VAndOrB32, F::VdstVsrc0Vsrc1Vsrc2, p2("%ta_<index> = OpBitwiseAnd %uint %t0_<index> %t1_<index>",
+        "%t_<index> = OpBitwiseOr %uint %ta_<index> %t2_<index>")),
+    // `v_lshl_or_u32`: dst = (src0 << (src1 & 31)) | src2. Identical to
+    // VLshlAddU32 above except the fold is OR, not ADD — SharpEmu's Gen5
+    // lowers the two that way, which also cross-checks VLshlAddU32.
+    f(recompile_v_xxx_u32_vdst_vsrc012, T::VLshlOrU32, F::VdstVsrc0Vsrc1Vsrc2, p3("%ts_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31",
+        "%tsh_<index> = OpShiftLeftLogical %uint %t0_<index> %ts_<index>",
+        "%t_<index> = OpBitwiseOr %uint %tsh_<index> %t2_<index>")),
+    // `v_or3_u32`: dst = (src0 | src1) | src2.
+    f(recompile_v_xxx_u32_vdst_vsrc012, T::VOr3U32, F::VdstVsrc0Vsrc1Vsrc2, p2("%to_<index> = OpBitwiseOr %uint %t0_<index> %t1_<index>",
+        "%t_<index> = OpBitwiseOr %uint %to_<index> %t2_<index>")),
 ];
 
 /// Kyty: ShaderSpirv.cpp `RecompFunc` (L6182) — hash-keyed
@@ -5544,17 +5564,18 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            217,
+            221,
             "204 Kyty rows plus SSubU32, SNop, and the RDNA2-only rows \
              (VLshlAddU32, VCmpxLtU32, VAddNcU32, VSubNcU32, VSubrevNcU32, VCvtI32F32, \
-             and the v_cmpx_*_i32 block: VCmpxLtI32/GeI32/GtI32/EqI32/NeI32)"
+             the Kyty-gated trio VAndOrB32/VLshlOrU32/VOr3U32, and the v_cmpx_*_i32 \
+             block: VCmpxLtI32/GeI32/GtI32/LeI32/EqI32/NeI32)"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 144,
+            implemented, 151,
             "C1 implemented subset plus title-driven ports"
         );
-        assert_eq!(ni, 73, "C2 remainder");
+        assert_eq!(ni, 70, "C2 remainder");
 
         // Kyty EXIT_IF(map->Contains(p)) — (type, format) keys are unique.
         let mut seen = std::collections::HashSet::new();
@@ -5818,6 +5839,117 @@ mod tests {
     /// The two share one lowering, so the ONLY thing separating them is the
     /// SPIR-V op. That is what this pins: swapping them would silently compare
     /// as the wrong signedness, which no other test would catch.
+    /// `v_and_or_b32` (VOP3 0x371): dst = (src0 & src1) | src2.
+    ///
+    /// Kyty rejects this opcode as UNKNOWN on next_gen; we deliberately deviate,
+    /// because two independent references show the encoding is the same on RDNA2
+    /// as on GCN — SharpEmu's **Gen5** decoder maps `0x371 => "VAndOrB32"` and
+    /// shadPS4 has `V_AND_OR_B32 = 881` (== 0x371). Minecraft emits it.
+    ///
+    /// This pins the operand ORDER, which is the part that would silently
+    /// compute garbage: the AND takes src0/src1 and the OR folds in src2. A
+    /// transposition still produces valid SPIR-V and a plausible-looking shader.
+    /// The `V_XXX_I32_SVdstSVsrc0SVsrc1` family (Ashr / Ashrrev / MulLo), wired
+    /// from the staged set: `recompile_v_xxx_i32_svdst_svsrc01` was written but
+    /// unreachable, so Minecraft's `v_ashrrev_i32` failed its whole shader.
+    ///
+    /// The pin that matters is Ashr vs Ashrrev: they differ ONLY in which
+    /// operand is the shift amount, so transposing them still emits valid SPIR-V
+    /// and silently shifts by the wrong value.
+    #[test]
+    fn v_xxx_i32_svdst_family_is_wired_and_ashrrev_reverses_operands() {
+        for ty in [T::VAshrI32, T::VAshrrevI32, T::VMulLoI32] {
+            let entry =
+                recomp_func(ty, F::SVdstSVsrc0SVsrc1).unwrap_or_else(|| panic!("{ty:?} row"));
+            assert!(
+                matches!(entry.func, RecompileFn::Func(_)),
+                "{ty:?} must be wired, not NI"
+            );
+        }
+
+        // v_ashr_i32: shift amount is src1; the value shifted is src0.
+        let ashr = recomp_func(T::VAshrI32, F::SVdstSVsrc0SVsrc1).expect("row");
+        assert!(
+            ashr.param[0].expect("mask").contains("%t1_"),
+            "v_ashr_i32 takes its shift amount from src1"
+        );
+        assert!(
+            ashr.param[1].expect("shift").contains("%t0_"),
+            "v_ashr_i32 shifts src0"
+        );
+
+        // v_ashrrev_i32: reversed — shift amount is src0, value is src1.
+        let rev = recomp_func(T::VAshrrevI32, F::SVdstSVsrc0SVsrc1).expect("row");
+        assert!(
+            rev.param[0].expect("mask").contains("%t0_"),
+            "v_ashrrev_i32 takes its shift amount from src0"
+        );
+        let shift = rev.param[1].expect("shift");
+        assert!(
+            shift.contains("OpShiftRightArithmetic") && shift.contains("%t1_"),
+            "v_ashrrev_i32 arithmetic-shifts src1, got: {shift}"
+        );
+    }
+
+    #[test]
+    fn kyty_gated_vop3_trio_is_wired_with_sharpemu_gen5_semantics() {
+        for ty in [T::VAndOrB32, T::VLshlOrU32, T::VOr3U32] {
+            let entry =
+                recomp_func(ty, F::VdstVsrc0Vsrc1Vsrc2).unwrap_or_else(|| panic!("{ty:?} row"));
+            assert!(
+                matches!(entry.func, RecompileFn::Func(_)),
+                "{ty:?} must be implemented, not NI"
+            );
+        }
+
+        // v_and_or_b32: (s0 & s1) | s2
+        let and_or = recomp_func(T::VAndOrB32, F::VdstVsrc0Vsrc1Vsrc2).expect("row");
+        let and = and_or.param[0].expect("and step");
+        let or = and_or.param[1].expect("or step");
+        assert!(
+            and.contains("OpBitwiseAnd") && and.contains("%t0_") && and.contains("%t1_"),
+            "must AND src0 with src1, got: {and}"
+        );
+        assert!(
+            or.contains("OpBitwiseOr") && or.contains("%ta_") && or.contains("%t2_"),
+            "must OR that with src2, got: {or}"
+        );
+
+        // v_lshl_or_u32: (s0 << (s1 & 31)) | s2 — the shift amount MUST be
+        // masked to 31, and the fold MUST be OR (v_lshl_ADD_u32 is the ADD twin;
+        // confusing them silently corrupts the value).
+        let lshl_or = recomp_func(T::VLshlOrU32, F::VdstVsrc0Vsrc1Vsrc2).expect("row");
+        assert!(
+            lshl_or.param[0].expect("mask").contains("%uint_31"),
+            "shift amount must be masked to 31"
+        );
+        assert!(
+            lshl_or.param[1].expect("shift").contains("OpShiftLeftLogical"),
+            "must shift src0 left"
+        );
+        let fold = lshl_or.param[2].expect("fold");
+        assert!(
+            fold.contains("OpBitwiseOr") && fold.contains("%t2_"),
+            "must OR (not ADD) src2, got: {fold}"
+        );
+        assert!(
+            recomp_func(T::VLshlAddU32, F::VdstVsrc0Vsrc1Vsrc2)
+                .expect("row")
+                .param[2]
+                .expect("fold")
+                .contains("OpIAdd"),
+            "the ADD twin must stay ADD"
+        );
+
+        // v_or3_u32: (s0 | s1) | s2
+        let or3 = recomp_func(T::VOr3U32, F::VdstVsrc0Vsrc1Vsrc2).expect("row");
+        assert!(or3.param[0].expect("or0").contains("OpBitwiseOr"));
+        assert!(
+            or3.param[1].expect("or1").contains("%t2_"),
+            "must fold in src2"
+        );
+    }
+
     #[test]
     fn v_cmpx_i32_block_is_wired_and_compares_signed() {
         // (type, expected SPIR-V op). Ordering ops MUST be signed: these share
@@ -5828,6 +5960,7 @@ mod tests {
             (T::VCmpxLtI32, "OpSLessThan"),
             (T::VCmpxGeI32, "OpSGreaterThanEqual"),
             (T::VCmpxGtI32, "OpSGreaterThan"),
+            (T::VCmpxLeI32, "OpSLessThanEqual"),
             // Equality is sign-agnostic, hence the same ops as the U32 rows.
             (T::VCmpxEqI32, "OpIEqual"),
             (T::VCmpxNeI32, "OpINotEqual"),
