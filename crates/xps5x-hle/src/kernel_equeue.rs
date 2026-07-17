@@ -198,7 +198,23 @@ fn hle_delete_user_event(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 /// `sceKernelTriggerUserEvent(eq, id, udata)`: mark the user event pending.
+#[allow(clippy::needless_return)]
 fn hle_trigger_user_event(ctx: &HleContext, args: &[u64]) -> u64 {
+    if std::env::var_os("XPS5X_TRACE_EQUEUE").is_some() {
+        tracing::warn!(
+            eq = format_args!("{:#x}", args.first().copied().unwrap_or(0)),
+            id = format_args!("{:#x}", args.get(1).copied().unwrap_or(0)),
+            known = ctx.kernel.kernel_equeue_events.contains_key(&(
+                args.first().copied().unwrap_or(0),
+                args.get(1).copied().unwrap_or(0)
+            )),
+            "TRACE_EQUEUE: TriggerUserEvent called"
+        );
+    }
+    hle_trigger_user_event_inner(ctx, args)
+}
+
+fn hle_trigger_user_event_inner(ctx: &HleContext, args: &[u64]) -> u64 {
     let eq = args.first().copied().unwrap_or(0);
     let id = args.get(1).copied().unwrap_or(0);
     let udata = args.get(2).copied().unwrap_or(0);
@@ -219,6 +235,7 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
     let events_ptr = args.get(1).copied().unwrap_or(0);
     let num = args.get(2).copied().unwrap_or(0);
     let out_count = args.get(3).copied().unwrap_or(0);
+    let timeout_ptr = args.get(4).copied().unwrap_or(0);
 
     if !ctx.kernel.kernel_equeues.contains_key(&eq) {
         return SCE_KERNEL_ERROR_ESRCH;
@@ -227,24 +244,95 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_EINVAL;
     }
 
-    // Collect pending event fields for this queue, then edge-clear.
-    let mut pending: Vec<(u64, u64, u32, i16, i64)> = Vec::new();
-    for entry in ctx.kernel.kernel_equeue_events.iter() {
-        let (q, id) = *entry.key();
-        if q == eq && entry.triggered && (pending.len() as u64) < num {
-            pending.push((id, entry.udata, entry.fflags, entry.filter, entry.data));
+    // The 5th arg is `SceKernelUseconds*` (NULL = wait forever). Ignoring it and
+    // reporting an instant timeout turned every guest event loop into a hot spin:
+    // measured 2.29 MILLION `sceKernelWaitEqueue` calls in one Minecraft run,
+    // two threads at 100% CPU, starving the threads that had real work — while
+    // the queue's producer was firing events correctly all along (169 triggers).
+    // Waiting for the interval the caller asked for is both the ABI and what
+    // stops the spin.
+    let timeout_us = if timeout_ptr == 0 {
+        None
+    } else {
+        let mut buf = [0u8; 4];
+        ctx.mem
+            .read(timeout_ptr, &mut buf)
+            .then(|| u64::from(u32::from_le_bytes(buf)))
+    };
+
+    // A truly unbounded block is not safe here: this runs on the HLE dispatch
+    // thread, and an infinite wait deadlocks a title whose producer already
+    // exited (and hangs the unit tests, which have no termination signal). Cap
+    // the wait and report a timeout — the guest re-waits, which is exactly what
+    // a spurious wakeup looks like and what it already tolerates.
+    const INFINITE_CAP_US: u64 = 50_000; // 50 ms
+    const POLL_US: u64 = 250;
+    let budget = std::time::Duration::from_micros(timeout_us.unwrap_or(INFINITE_CAP_US));
+    let deadline = std::time::Instant::now() + budget;
+
+    loop {
+        // Collect pending event fields for this queue, then edge-clear.
+        let mut pending: Vec<(u64, u64, u32, i16, i64)> = Vec::new();
+        for entry in ctx.kernel.kernel_equeue_events.iter() {
+            let (q, id) = *entry.key();
+            if q == eq && entry.triggered && (pending.len() as u64) < num {
+                pending.push((id, entry.udata, entry.fflags, entry.filter, entry.data));
+            }
         }
+        if !pending.is_empty() {
+            return deliver_events(ctx, eq, events_ptr, out_count, &pending);
+        }
+        if std::time::Instant::now() >= deadline || ctx.guest_threads.process_is_terminating() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(POLL_US));
     }
 
-    if pending.is_empty() {
-        // Nothing pending; report zero and time out (no other thread can fire).
-        if out_count != 0 {
-            let _ = ctx.mem.write(out_count, &0u32.to_le_bytes());
-        }
-        debug!(eq, num, "kernel event wait timed out");
-        return SCE_KERNEL_ERROR_ETIMEDOUT;
+    // Waited out the caller's interval with nothing pending: report zero.
+    if out_count != 0 {
+        let _ = ctx.mem.write(out_count, &0u32.to_le_bytes());
     }
+    if std::env::var_os("XPS5X_TRACE_EQUEUE").is_some() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEEN: AtomicU32 = AtomicU32::new(0);
+        if SEEN.fetch_add(1, Ordering::Relaxed) < 24 {
+            let registered: Vec<String> = ctx
+                .kernel
+                .kernel_equeue_events
+                .iter()
+                .filter(|e| e.key().0 == eq)
+                .map(|e| {
+                    format!(
+                        "id={:#x},filter={},trig={}",
+                        e.key().1,
+                        e.filter,
+                        e.triggered
+                    )
+                })
+                .collect();
+            tracing::warn!(
+                eq = format_args!("{eq:#x}"),
+                want = num,
+                waited_us = budget.as_micros(),
+                registered_count = registered.len(),
+                registered = ?registered,
+                "TRACE_EQUEUE: wait timed out"
+            );
+        }
+    }
+    debug!(eq, num, "kernel event wait timed out");
+    SCE_KERNEL_ERROR_ETIMEDOUT
+}
 
+/// Write the pending events into the guest's array, edge-clear them, and report
+/// the delivered count.
+fn deliver_events(
+    ctx: &HleContext,
+    eq: u64,
+    events_ptr: u64,
+    out_count: u64,
+    pending: &[(u64, u64, u32, i16, i64)],
+) -> u64 {
     for (i, &(id, udata, fflags, filter, data)) in pending.iter().enumerate() {
         let addr = events_ptr + i as u64 * KERNEL_EVENT_SIZE;
         if !write_kernel_event(ctx, addr, id, udata, fflags, filter, data) {
