@@ -1867,6 +1867,21 @@ pub fn shader_parse_vs(
             // Measured on Minecraft: declared 8 vs available 4 — the extra four
             // come from the extended user-data (EUD) buffer, which needs the
             // Gen5 scalar evaluator to resolve (task #9), not a local fix here.
+            if std::env::var_os("XPS5X_TRACE_EUD").is_some() {
+                let u = &regs.gs_user_sgpr;
+                for i in 0..8usize {
+                    let pair = u64::from(u.value[i]) | (u64::from(u.value[i + 1]) << 32);
+                    tracing::warn!(
+                        idx = i,
+                        value = format_args!("{:#010x}", u.value[i]),
+                        as_ptr_with_next = format_args!("{pair:#x}"),
+                        type_ = ?u.type_[i],
+                        "TRACE_EUD: gs user_sgpr (declared={}, count={})",
+                        regs.gs_regs.rsrc2.user_sgpr,
+                        u.count,
+                    );
+                }
+            }
             return Err(ni("vs: gs user_sgpr > user sgpr count"));
         }
     } else if u32::from(regs.vs_regs.rsrc2.user_sgpr) > regs.vs_user_sgpr.count {
