@@ -1229,8 +1229,22 @@ pub fn shader_parse_attrib(
         // recompilation. For example, Minecraft's observed metadata format
         // 0x12a accompanies V# unified format 74 (32_32_32 float). Preserve
         // the V# verbatim rather than rejecting this valid redundant field.
+
+        // Fold the per-attribute byte offset into the V# base. Interleaved
+        // vertex data gives each attribute its own offset into a shared stride
+        // (Minecraft: offset 16 into a 28-byte vertex), so base + offset is the
+        // attribute's real start. Only fields[0] and the low 16 bits of
+        // fields[1] hold the 48-bit base; stride is in fields[1] bits 16-29 and
+        // is left untouched. The earlier code rejected any non-zero offset,
+        // which failed the whole vertex shader.
+        let mut folded = [sharp[0], sharp[1], sharp[2], sharp[3]];
         if offset != 0 {
-            return Err(ni("attrib: offset != 0"));
+            let base = (ShaderBufferResource { fields: folded }
+                .base48()
+                .wrapping_add(u64::from(offset)))
+                & 0xFFFF_FFFF_FFFF;
+            folded[0] = base as u32;
+            folded[1] = (folded[1] & 0xFFFF_0000) | ((base >> 32) as u32 & 0xFFFF);
         }
         if fetch_index != 0 {
             return Err(ni("attrib: fetch_index != 0"));
@@ -1243,7 +1257,7 @@ pub fn shader_parse_attrib(
         let n = info.resources_num as usize;
         info.resources_dst[n].register_start = reg as i32;
         info.resources_dst[n].registers_num = size as i32;
-        info.resources[n].fields.copy_from_slice(sharp);
+        info.resources[n].fields.copy_from_slice(&folded);
 
         info.resources_num += 1;
     }
@@ -2199,10 +2213,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_attrib_rejects_nonzero_offset() {
-        // Kyty: EXIT_NOT_IMPLEMENTED(offset != 0) (L1119).
+    fn parse_attrib_folds_nonzero_offset_into_the_vsharp_base() {
+        // Interleaved vertex data: this attribute starts 16 bytes into a
+        // shared 28-byte-stride buffer. The offset folds into the V# base so
+        // the fetch reads base + offset; stride is left untouched. Kyty (and
+        // the earlier port) rejected any non-zero offset, failing the whole VS.
         let sem = ShaderSemantic { raw: 4 << 8 };
-        let attrib = [2u32 | (5 << 14)];
+        let attrib = [2u32 | (16 << 14)]; // V# index 2, offset 16
+        let mut buffer = vec![0u32; 12];
+        // V# index 2 -> buffer[8..12]: base 0x1000, stride 28.
+        buffer[8] = 0x0000_1000;
+        buffer[9] = 28 << 16;
+        let mut info = ShaderVertexInputInfo::default();
+        shader_parse_attrib(&mut info, &[sem], &attrib, &buffer).unwrap();
+        assert_eq!(info.resources_num, 1);
+        assert_eq!(info.resources[0].base48(), 0x1010, "base must be 0x1000 + 16");
+        assert_eq!(info.resources[0].stride(), 28, "stride must be preserved");
+    }
+
+    #[test]
+    fn parse_attrib_still_rejects_fetch_index() {
+        // fetch_index changes how the vertex/instance index feeds the fetch and
+        // is not yet modelled; the measured case carried a junk V# anyway.
+        let sem = ShaderSemantic { raw: 4 << 8 };
+        let attrib = [2u32 | (1 << 26)]; // fetch_index = 1
         let buffer = vec![0u32; 12];
         let mut info = ShaderVertexInputInfo::default();
         assert!(matches!(
