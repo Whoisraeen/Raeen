@@ -342,6 +342,8 @@ fn lock_core(
     };
 
     let current = ctx.guest_threads.current_thread();
+    let spin_start = std::time::Instant::now();
+    let mut reported = false;
     loop {
         let mut entry = ctx.kernel.pthread_mutexes.get_mut(&key).unwrap();
         if entry.owner == current {
@@ -379,6 +381,34 @@ fn lock_core(
         }
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return ETIMEDOUT;
+        }
+        // A lock that never lands is a deadlock, and this loop would spin on it
+        // forever in silence. Name it once: which mutex, who holds it, and what
+        // that holder is called. (Measured: Minecraft's MAIN THREAD sits here
+        // for the whole run, which is what stalls boot at the loading screen.)
+        if !reported && spin_start.elapsed() >= std::time::Duration::from_secs(3) {
+            reported = true;
+            let owner = entry.owner;
+            let owner_name = ctx
+                .kernel
+                .thread_names
+                .get(&owner)
+                .map_or_else(|| "<unnamed>".to_owned(), |n| n.clone());
+            let self_name = ctx
+                .kernel
+                .thread_names
+                .get(&current)
+                .map_or_else(|| "<unnamed>".to_owned(), |n| n.clone());
+            tracing::warn!(
+                mutex = format_args!("{key:#x}"),
+                waiter = current,
+                waiter_name = %self_name,
+                owner,
+                owner_name = %owner_name,
+                ty = entry.ty,
+                recursion = entry.recursion,
+                "scePthreadMutexLock stuck >3s — deadlock; naming the holder"
+            );
         }
         drop(entry);
         std::thread::yield_now();
