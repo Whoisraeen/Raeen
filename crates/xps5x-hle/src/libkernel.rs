@@ -2460,7 +2460,7 @@ pub(crate) fn hle_gettimeofday(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 /// The PS5's BSD-derived `CLOCK_MONOTONIC` id. `CLOCK_REALTIME` is 0.
-const CLOCK_MONOTONIC: u64 = 4;
+pub(crate) const CLOCK_MONOTONIC: u64 = 4;
 
 /// Real `sceKernelClockGettime(clockId, struct timespec *tp)` (M1
 /// hardening): writes a PS5 `timespec` — two little-endian `int64_t`s,
@@ -2519,7 +2519,7 @@ fn hle_get_process_time_counter_frequency(_ctx: &HleContext, _args: &[u64]) -> u
 
 /// A fixed monotonic reference captured on first use, so `CLOCK_MONOTONIC`
 /// reports a stable, never-decreasing elapsed time across the process.
-fn process_start() -> std::time::Instant {
+pub(crate) fn process_start() -> std::time::Instant {
     use std::sync::OnceLock;
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     *START.get_or_init(std::time::Instant::now)

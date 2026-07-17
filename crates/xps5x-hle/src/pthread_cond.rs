@@ -27,9 +27,9 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadCondTimedwait", hle_sce_cond_timedwait);
     registry.register("libkernel", "scePthreadCondSignal", hle_cond_signal);
     registry.register("libkernel", "scePthreadCondBroadcast", hle_cond_broadcast);
-    registry.register("libScePosix", "pthread_condattr_init", hle_condattr_ok);
-    registry.register("libScePosix", "pthread_condattr_destroy", hle_condattr_ok);
-    registry.register("libScePosix", "pthread_condattr_setclock", hle_condattr_ok);
+    registry.register("libScePosix", "pthread_condattr_init", hle_condattr_init);
+    registry.register("libScePosix", "pthread_condattr_destroy", hle_condattr_destroy);
+    registry.register("libScePosix", "pthread_condattr_setclock", hle_condattr_setclock);
 }
 
 /// `pthread_cond_init(cond, attr)`. Orbis condition variables are opaque
@@ -39,7 +39,8 @@ pub fn register(registry: &HleRegistry) {
 /// mistake its own initialized condition for a static/uninitialized object.
 fn hle_cond_init(ctx: &HleContext, args: &[u64]) -> u64 {
     let cond = args.first().copied().unwrap_or(0);
-    debug!("pthread_cond_init(cond={cond:#x})");
+    let attr = args.get(1).copied().unwrap_or(0);
+    debug!("pthread_cond_init(cond={cond:#x}, attr={attr:#x})");
     if cond == 0 {
         EINVAL
     } else {
@@ -50,7 +51,19 @@ fn hle_cond_init(ctx: &HleContext, args: &[u64]) -> u64 {
             ctx.alloc.free(handle);
             return EINVAL;
         }
+        // Bake the attr's clock into the condition now. POSIX attrs are inputs
+        // to init, not live links: a later change to the attr must not reach a
+        // cond already built from it, and the attr is usually destroyed
+        // immediately after this call anyway.
+        let monotonic = ctx
+            .kernel
+            .pthread_condattr_clocks
+            .get(&attr)
+            .is_some_and(|clock| *clock == crate::libkernel::CLOCK_MONOTONIC);
         let state = std::sync::Arc::new(xps5x_kernel::PthreadCond::default());
+        state
+            .monotonic
+            .store(monotonic, std::sync::atomic::Ordering::Relaxed);
         ctx.kernel.pthread_conds.insert(cond, state.clone());
         ctx.kernel.pthread_conds.insert(handle, state);
         OK
@@ -165,20 +178,36 @@ fn hle_sce_cond_timedwait(ctx: &HleContext, args: &[u64]) -> u64 {
 /// screen — measured as ~30 threads parked at one host wait with the main
 /// thread's call ring frozen on `pthread_cond_timedwait`.
 fn hle_cond_timedwait(ctx: &HleContext, args: &[u64]) -> u64 {
-    let timeout = abstime_to_relative(ctx, args.get(2).copied().unwrap_or(0));
+    // The deadline is on the clock this cond was initialized with, so it can
+    // only be read against that clock's own origin.
+    let monotonic = condition(ctx, args.first().copied().unwrap_or(0))
+        .is_some_and(|state| state.monotonic.load(std::sync::atomic::Ordering::Relaxed));
+    let timeout = abstime_to_relative(ctx, args.get(2).copied().unwrap_or(0), monotonic);
     wait_core(ctx, args, timeout)
 }
 
 /// Convert a guest POSIX `struct timespec` (16 bytes: `time_t tv_sec`,
-/// `long tv_nsec`; absolute, against the same wall clock `gettimeofday` reports)
-/// into "how long from now".
+/// `long tv_nsec`) into "how long from now".
+///
+/// `monotonic` selects the origin the deadline is measured from, and it is not
+/// optional: `CLOCK_MONOTONIC` counts from process start, `CLOCK_REALTIME` from
+/// the Unix epoch, so the same `tv_sec` means two times ~1.78e9 seconds apart.
+/// Reading a monotonic deadline against the epoch makes it permanently
+/// "expired" — `wait_core` then returns `ETIMEDOUT` without ever waiting, and a
+/// title that re-arms its wait spins as fast as the CPU allows instead of
+/// sleeping. Measured on Minecraft: ~20,000 instant timeouts per second, main
+/// thread never advancing past the boot loop.
 ///
 /// `None` (a null `abstime`) means wait forever, matching POSIX. A deadline that
-/// has already passed yields `ZERO`, which `wait_core` reports as `ETIMEDOUT`
+/// has genuinely passed yields `ZERO`, which `wait_core` reports as `ETIMEDOUT`
 /// immediately — also what POSIX requires. An unreadable pointer is treated as
 /// already-expired rather than as "forever": a bad deadline must not park a
 /// thread for the rest of the run.
-fn abstime_to_relative(ctx: &HleContext, abstime: u64) -> Option<std::time::Duration> {
+fn abstime_to_relative(
+    ctx: &HleContext,
+    abstime: u64,
+    monotonic: bool,
+) -> Option<std::time::Duration> {
     if abstime == 0 {
         return None;
     }
@@ -193,9 +222,17 @@ fn abstime_to_relative(ctx: &HleContext, abstime: u64) -> Option<std::time::Dura
         u64::try_from(tv_sec).unwrap_or(0),
         u32::try_from(tv_nsec.clamp(0, 999_999_999)).unwrap_or(0),
     );
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    // Read "now" on the SAME clock the guest built the deadline on. The
+    // monotonic arm must use `process_start`, the identical origin
+    // `sceKernelClockGettime(CLOCK_MONOTONIC)` reports to the guest — if these
+    // two ever disagree, every deadline is skewed by the difference.
+    let now = if monotonic {
+        crate::libkernel::process_start().elapsed()
+    } else {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+    };
     Some(deadline.saturating_sub(now))
 }
 
@@ -325,9 +362,47 @@ fn hle_cond_broadcast(ctx: &HleContext, args: &[u64]) -> u64 {
 
 /// `pthread_condattr_init/destroy/setclock` — attribute objects carry nothing
 /// that affects behaviour while there are no waiters.
-fn hle_condattr_ok(_ctx: &HleContext, args: &[u64]) -> u64 {
+/// `pthread_condattr_setclock(attr, clock_id)` — records the clock so
+/// [`hle_cond_init`] can fix it on the condition it creates.
+///
+/// Recording it is not optional: the clock decides how that condition's
+/// `pthread_cond_timedwait` deadlines are read (see [`abstime_to_relative`]),
+/// and dropping it silently makes every monotonic deadline expire on arrival.
+fn hle_condattr_setclock(ctx: &HleContext, args: &[u64]) -> u64 {
     let attr = args.first().copied().unwrap_or(0);
-    if attr == 0 { EINVAL } else { OK }
+    let clock_id = args.get(1).copied().unwrap_or(0);
+    if attr == 0 {
+        return EINVAL;
+    }
+    debug!("pthread_condattr_setclock(attr={attr:#x}, clock_id={clock_id})");
+    ctx.kernel.pthread_condattr_clocks.insert(attr, clock_id);
+    OK
+}
+
+/// `pthread_condattr_init(attr)` — a fresh attr carries the POSIX default
+/// clock.
+///
+/// This must clear any recorded clock rather than leave one behind: attrs are
+/// short-lived stack objects, so a later attr at a recycled address would
+/// otherwise inherit the previous one's `CLOCK_MONOTONIC` and mis-read its
+/// realtime deadlines.
+fn hle_condattr_init(ctx: &HleContext, args: &[u64]) -> u64 {
+    let attr = args.first().copied().unwrap_or(0);
+    if attr == 0 {
+        return EINVAL;
+    }
+    ctx.kernel.pthread_condattr_clocks.remove(&attr);
+    OK
+}
+
+/// `pthread_condattr_destroy(attr)` — drops the recorded clock with the attr.
+fn hle_condattr_destroy(ctx: &HleContext, args: &[u64]) -> u64 {
+    let attr = args.first().copied().unwrap_or(0);
+    if attr == 0 {
+        return EINVAL;
+    }
+    ctx.kernel.pthread_condattr_clocks.remove(&attr);
+    OK
 }
 
 #[cfg(test)]
@@ -367,7 +442,118 @@ mod tests {
         assert_eq!(hle_cond_destroy(&ctx, &[0]), EINVAL);
         assert_eq!(hle_cond_signal(&ctx, &[0]), EINVAL);
         assert_eq!(hle_cond_broadcast(&ctx, &[0]), EINVAL);
-        assert_eq!(hle_condattr_ok(&ctx, &[0]), EINVAL);
+        assert_eq!(hle_condattr_init(&ctx, &[0]), EINVAL);
+        assert_eq!(hle_condattr_destroy(&ctx, &[0]), EINVAL);
+        assert_eq!(
+            hle_condattr_setclock(&ctx, &[0, crate::libkernel::CLOCK_MONOTONIC]),
+            EINVAL
+        );
+    }
+
+    /// Write a 16-byte guest `struct timespec` at `addr`.
+    fn write_timespec(mem: &TestMemory, addr: u64, secs: u64, nanos: u32) {
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&i64::try_from(secs).unwrap().to_le_bytes());
+        buf[8..16].copy_from_slice(&i64::from(nanos).to_le_bytes());
+        assert!(mem.write(addr, &buf));
+    }
+
+    /// The bug this whole clock-tracking path exists for.
+    ///
+    /// A `CLOCK_MONOTONIC` deadline a few seconds after process start must read
+    /// as a few seconds *away*, not as expired. Read against the Unix epoch it
+    /// lands ~1.78e9 seconds in the past, `wait_core` returns `ETIMEDOUT`
+    /// without waiting, and a title that re-arms spins at ~20k timeouts/sec —
+    /// measured on Minecraft's boot, which never advanced past it.
+    #[test]
+    fn monotonic_deadline_is_not_read_as_already_expired() {
+        let (kernel, mem, alloc) = fixture();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // Exactly the shape measured from the title: a small tv_sec, which is
+        // only sane on the monotonic clock.
+        let deadline = crate::libkernel::process_start().elapsed().as_secs() + 30;
+        write_timespec(&mem, 0x3000, deadline, 0);
+
+        let as_monotonic = abstime_to_relative(&ctx, 0x3000, true).expect("non-null abstime");
+        assert!(
+            as_monotonic > std::time::Duration::from_secs(25),
+            "a monotonic deadline ~30s out must be ~30s away, got {as_monotonic:?}"
+        );
+
+        let as_realtime = abstime_to_relative(&ctx, 0x3000, false).expect("non-null abstime");
+        assert_eq!(
+            as_realtime,
+            std::time::Duration::ZERO,
+            "the same bytes read against the epoch are the bug: instantly expired"
+        );
+    }
+
+    /// `pthread_condattr_setclock(CLOCK_MONOTONIC)` must reach the cond that
+    /// `pthread_cond_init` builds from that attr — dropping it is what made
+    /// every deadline expire on arrival.
+    #[test]
+    fn condattr_setclock_monotonic_reaches_the_cond() {
+        let (kernel, mem, alloc) = fixture();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_condattr_init(&ctx, &[0x1500]), OK);
+        assert_eq!(
+            hle_condattr_setclock(&ctx, &[0x1500, crate::libkernel::CLOCK_MONOTONIC]),
+            OK
+        );
+        assert_eq!(hle_cond_init(&ctx, &[0x2000, 0x1500]), OK);
+
+        let state = condition(&ctx, 0x2000).expect("cond was just initialized");
+        assert!(
+            state.monotonic.load(std::sync::atomic::Ordering::Relaxed),
+            "cond built from a CLOCK_MONOTONIC attr must wait on the monotonic clock"
+        );
+        // Destroying the attr must not disturb a cond already built from it.
+        assert_eq!(hle_condattr_destroy(&ctx, &[0x1500]), OK);
+        assert!(
+            condition(&ctx, 0x2000)
+                .expect("cond outlives its attr")
+                .monotonic
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    /// The POSIX default, and what a static `PTHREAD_COND_INITIALIZER` gets.
+    #[test]
+    fn cond_without_attr_defaults_to_realtime() {
+        let (kernel, mem, alloc) = fixture();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_cond_init(&ctx, &[0x2000, 0]), OK);
+        assert!(
+            !condition(&ctx, 0x2000)
+                .expect("cond was just initialized")
+                .monotonic
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    /// Attrs are short-lived stack objects, so addresses get recycled. A fresh
+    /// `pthread_condattr_init` at a used address must not inherit the previous
+    /// attr's clock, or an unrelated realtime cond silently waits on the wrong
+    /// one.
+    #[test]
+    fn condattr_init_clears_a_recycled_addresss_clock() {
+        let (kernel, mem, alloc) = fixture();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(
+            hle_condattr_setclock(&ctx, &[0x1500, crate::libkernel::CLOCK_MONOTONIC]),
+            OK
+        );
+        assert_eq!(hle_condattr_destroy(&ctx, &[0x1500]), OK);
+        // Same address, fresh attr, no setclock: the POSIX default applies.
+        assert_eq!(hle_condattr_init(&ctx, &[0x1500]), OK);
+        assert_eq!(hle_cond_init(&ctx, &[0x2000, 0x1500]), OK);
+        assert!(
+            !condition(&ctx, 0x2000)
+                .expect("cond was just initialized")
+                .monotonic
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "a recycled attr address must not leak CLOCK_MONOTONIC into the next cond"
+        );
     }
 
     #[test]

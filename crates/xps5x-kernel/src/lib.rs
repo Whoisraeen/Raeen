@@ -172,6 +172,11 @@ pub struct OrbisKernel {
     pub pthread_rwlocks: DashMap<u64, PthreadRwlock>,
     /// Guest pthread condition-variable wait queues, keyed by object address.
     pub pthread_conds: DashMap<u64, Arc<PthreadCond>>,
+    /// Clock id set on a guest `pthread_condattr_t` by
+    /// `pthread_condattr_setclock`, keyed by the attr's address. Read once by
+    /// `pthread_cond_init` to fix the new cond's clock, then irrelevant —
+    /// POSIX attr objects are inputs to init, not live links.
+    pub pthread_condattr_clocks: DashMap<u64, u64>,
     /// Guest pthread thread-attribute objects, keyed by both the guest
     /// `pthread_attr_t` address and its allocated handle.
     pub pthread_attrs: DashMap<u64, PthreadAttr>,
@@ -506,6 +511,19 @@ pub struct PthreadCond {
     pub generation: parking_lot::Mutex<u64>,
     /// Waiters sleep here until the generation changes.
     pub changed: parking_lot::Condvar,
+    /// Which clock this condition's `pthread_cond_timedwait` deadlines are on,
+    /// as chosen by `pthread_condattr_setclock` before `pthread_cond_init`.
+    ///
+    /// POSIX lets a condition variable pick its clock, and the deadline is
+    /// meaningless without knowing which one: `CLOCK_MONOTONIC` counts from an
+    /// arbitrary origin (here, process start) while the default
+    /// `CLOCK_REALTIME` counts from the Unix epoch. Reading a monotonic
+    /// deadline as a realtime one puts it ~1.78e9 seconds in the past, so every
+    /// wait expires instantly and the caller spins.
+    ///
+    /// `false` (the `Default`) is `CLOCK_REALTIME` — the POSIX default, and the
+    /// right answer for a statically-initialized cond that never saw an attr.
+    pub monotonic: std::sync::atomic::AtomicBool,
 }
 
 /// Runtime-rebased ELF metadata used by `sceKernelGetModuleInfoForUnwind`.
@@ -562,6 +580,7 @@ impl OrbisKernel {
             pthread_mutex_attrs: DashMap::new(),
             pthread_rwlocks: DashMap::new(),
             pthread_conds: DashMap::new(),
+            pthread_condattr_clocks: DashMap::new(),
             pthread_attrs: DashMap::new(),
             kernel_event_flags: DashMap::new(),
             kernel_event_flag_next: std::sync::atomic::AtomicU64::new(1),
