@@ -4564,7 +4564,6 @@ fn recompile_vmbcnt_lo_u32_b32(
 
 /// Kyty: `Recompile_V_XXX_B32_SVdstSVsrc0` (ShaderSpirv.cpp L5538).
 /// XXX: Bfrev, Not (via `param`).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_v_xxx_b32_svdst_svsrc0(
     index: u32,
     code: &ShaderCode,
@@ -5200,18 +5199,18 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SBfeU32, F::SVdstSVsrc0SVsrc1, p3("%to_<index> = OpBitFieldUExtract %uint %t1_<index> %uint_0  %uint_5", "%ts_<index> = OpBitFieldUExtract %uint %t1_<index> %uint_16 %uint_7", "%t_<index> = OpBitFieldUExtract %uint %t0_<index> %to_<index> %ts_<index>"), S::NonZero),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SLshl4AddU32, F::SVdstSVsrc0SVsrc1, p3("%ts_<index> = OpFunctionCall %v2uint %lshl_add %t0_<index> %t1_<index> %uint_4", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SMulHiU32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %uint %mul_hi_uint %t0_<index> %t1_<index>"), S::None),
-    ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VAndB32,     F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseAnd %uint %t0_<index> %t1_<index>")),
-    ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VBcntU32B32, F::SVdstSVsrc0SVsrc1, p3("%tb_<index> = OpBitCount %int %t0_<index>", "%tbu_<index> = OpBitcast %uint %tb_<index>", "%t_<index> = OpIAdd %uint %tbu_<index> %t1_<index>")),
-    ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VBfmB32,     F::SVdstSVsrc0SVsrc1, p3("%tcount_<index> = OpBitwiseAnd %uint %t0_<index> %uint_31", "%toffset_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpBitFieldInsert %uint %uint_0 %uint_0xffffffff %toffset_<index> %tcount_<index>")),
-    ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VLshlB32,    F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpShiftLeftLogical %uint %t0_<index> %ts_<index>")),
-    ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VLshlrevB32, F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %uint %t0_<index> %uint_31", "%t_<index> = OpShiftLeftLogical %uint %t1_<index> %ts_<index>")),
-    ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VLshrB32,    F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpShiftRightLogical %uint %t0_<index> %ts_<index>")),
-    ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VLshrrevB32, F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %uint %t0_<index> %uint_31", "%t_<index> = OpShiftRightLogical %uint %t1_<index> %ts_<index>")),
-    ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VMulHiU32,   F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %uint %mul_hi_uint %t0_<index> %t1_<index>")),
-    ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VMulLoU32,   F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %uint %mul_lo_uint %t0_<index> %t1_<index>")),
-    ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VMulU32U24,  F::SVdstSVsrc0SVsrc1, p3("%tu0_<index> = OpBitwiseAnd %uint %t0_<index> %uint_0x00ffffff", "%tu1_<index> = OpBitwiseAnd %uint %t1_<index> %uint_0x00ffffff", "%t_<index> = OpFunctionCall %uint %mul_lo_uint %tu0_<index> %tu1_<index>")),
-    ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VOrB32,      F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseOr %uint %t0_<index> %t1_<index>")),
-    ni("Recompile_V_XXX_B32_SVdstSVsrc0SVsrc1", 5740, T::VXorB32,     F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseXor %uint %t0_<index> %t1_<index>")),
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VAndB32,     F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseAnd %uint %t0_<index> %t1_<index>")),
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VBcntU32B32, F::SVdstSVsrc0SVsrc1, p3("%tb_<index> = OpBitCount %int %t0_<index>", "%tbu_<index> = OpBitcast %uint %tb_<index>", "%t_<index> = OpIAdd %uint %tbu_<index> %t1_<index>")),
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VBfmB32,     F::SVdstSVsrc0SVsrc1, p3("%tcount_<index> = OpBitwiseAnd %uint %t0_<index> %uint_31", "%toffset_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpBitFieldInsert %uint %uint_0 %uint_0xffffffff %toffset_<index> %tcount_<index>")),
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VLshlB32,    F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpShiftLeftLogical %uint %t0_<index> %ts_<index>")),
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VLshlrevB32, F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %uint %t0_<index> %uint_31", "%t_<index> = OpShiftLeftLogical %uint %t1_<index> %ts_<index>")),
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VLshrB32,    F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpShiftRightLogical %uint %t0_<index> %ts_<index>")),
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VLshrrevB32, F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %uint %t0_<index> %uint_31", "%t_<index> = OpShiftRightLogical %uint %t1_<index> %ts_<index>")),
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VMulHiU32,   F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %uint %mul_hi_uint %t0_<index> %t1_<index>")),
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VMulLoU32,   F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %uint %mul_lo_uint %t0_<index> %t1_<index>")),
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VMulU32U24,  F::SVdstSVsrc0SVsrc1, p3("%tu0_<index> = OpBitwiseAnd %uint %t0_<index> %uint_0x00ffffff", "%tu1_<index> = OpBitwiseAnd %uint %t1_<index> %uint_0x00ffffff", "%t_<index> = OpFunctionCall %uint %mul_lo_uint %tu0_<index> %tu1_<index>")),
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VOrB32,      F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseOr %uint %t0_<index> %t1_<index>")),
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VXorB32,     F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseXor %uint %t0_<index> %t1_<index>")),
     // RDNA2-only (no Kyty upstream rows): the carry-less VOP2 add/sub family
     // measured in Minecraft's menu CS.
     f(recompile_v_xxx_b32_svdst_svsrc01, T::VAddNcU32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpIAdd %uint %t0_<index> %t1_<index>")),
@@ -5241,8 +5240,8 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_smov_b32, T::SMovB32,  F::SVdstSVsrc0, p1("")),
     f(recompile_smov_b32, T::SMovkI32, F::SVdstSVsrc0, p1("")),
     f(recompile_smulk_i32, T::SMulkI32, F::SVdstSVsrc0, p1("")),
-    ni("Recompile_V_XXX_B32_SVdstSVsrc0", 5538, T::VBfrevB32, F::SVdstSVsrc0, p1("%t_<index> = OpBitReverse %uint %t0_<index>")),
-    ni("Recompile_V_XXX_B32_SVdstSVsrc0", 5538, T::VNotB32,   F::SVdstSVsrc0, p1("%t_<index> = OpNot %uint %t0_<index>")),
+    f(recompile_v_xxx_b32_svdst_svsrc0, T::VBfrevB32, F::SVdstSVsrc0, p1("%t_<index> = OpBitReverse %uint %t0_<index>")),
+    f(recompile_v_xxx_b32_svdst_svsrc0, T::VNotB32,   F::SVdstSVsrc0, p1("%t_<index> = OpNot %uint %t0_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc0, T::VCeilF32,  F::SVdstSVsrc0, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Ceil %t0_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc0, T::VCosF32,   F::SVdstSVsrc0, p2("%tr_<index> = OpFMul %float %t0_<index> %float_2pi", "%t_<index> = OpExtInst %float %GLSL_std_450 Cos %tr_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc0, T::VExpF32,   F::SVdstSVsrc0, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Exp2 %t0_<index>")),
@@ -5572,10 +5571,10 @@ mod tests {
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 151,
+            implemented, 165,
             "C1 implemented subset plus title-driven ports"
         );
-        assert_eq!(ni, 70, "C2 remainder");
+        assert_eq!(ni, 56, "C2 remainder");
 
         // Kyty EXIT_IF(map->Contains(p)) — (type, format) keys are unique.
         let mut seen = std::collections::HashSet::new();
