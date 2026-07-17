@@ -5546,6 +5546,47 @@ mod tests {
 
     // ---- 1. dispatch table ------------------------------------------------
 
+    /// Every SPIR-V opcode a wired row can emit must be one the assembler can
+    /// encode.
+    ///
+    /// The two tables are edited independently, so a row can name an opcode
+    /// `spirv_asm::op_info` has no arm for. Nothing catches that until a title
+    /// executes that exact instruction, and then it surfaces a long way from
+    /// the cause: the shader fails to assemble, the whole shader is dropped,
+    /// and draws binding it are silently skipped — a black frame, not an error.
+    /// Minecraft found `OpConvertFToS` (110) this way; the assembler had 109,
+    /// 111 and 112, so the gap was invisible when reading either table alone.
+    ///
+    /// Scoped to `Func` rows because only those can reach the assembler today.
+    /// Wiring a staged row flips it to `Func` and it is covered from then on.
+    #[test]
+    fn every_wired_template_opcode_assembles() {
+        let mut missing: Vec<String> = Vec::new();
+        for row in recomp_func_table()
+            .iter()
+            .filter(|e| matches!(e.func, RecompileFn::Func(_)))
+        {
+            for template in row.param.iter().flatten() {
+                for tok in template.split_whitespace().filter(|tok| {
+                    tok.starts_with("Op")
+                        && tok[2..].starts_with(|c: char| c.is_ascii_uppercase())
+                        && tok.chars().all(|c| c.is_ascii_alphanumeric())
+                }) {
+                    if !crate::spirv_asm::knows_opcode(tok) {
+                        missing.push(format!("{tok} (emitted by {:?})", row.type_));
+                    }
+                }
+            }
+        }
+        missing.sort_unstable();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "wired recompiler rows emit opcodes spirv_asm cannot assemble; \
+             add an arm to op_info for each: {missing:?}"
+        );
+    }
+
     #[test]
     fn dispatch_table_counts() {
         // Kyty: g_recomp_func (ShaderSpirv.cpp L6184) has 204 rows. C1

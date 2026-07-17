@@ -422,6 +422,18 @@ const fn op(code: u16, rt: bool, res: bool, ops: &'static [Kind]) -> OpInfo {
 /// All-id-operand instruction with a result type and result.
 const IDR: &[Kind] = &[Kind::IdRest];
 
+/// Whether [`assemble`] can encode `name`.
+///
+/// Exists so the recompiler's dispatch table can be checked against this
+/// assembler in a test: a row that emits an opcode `op_info` has no row for
+/// only fails when a title happens to hit that instruction, and it fails at
+/// runtime as a skipped draw rather than at build time. See
+/// `every_wired_template_opcode_assembles`.
+#[cfg(test)]
+pub(crate) fn knows_opcode(name: &str) -> bool {
+    op_info(name).is_some()
+}
+
 #[allow(clippy::too_many_lines)]
 fn op_info(name: &str) -> Option<OpInfo> {
     use EKind as E;
@@ -521,6 +533,7 @@ fn op_info(name: &str) -> Option<OpInfo> {
         "OpImageQuerySizeLod" => op(103, true, true, &[Id, Id]),
         // --- Conversions -----------------------------------------------------
         "OpConvertFToU" => op(109, true, true, IDR),
+        "OpConvertFToS" => op(110, true, true, IDR),
         "OpConvertSToF" => op(111, true, true, IDR),
         "OpConvertUToF" => op(112, true, true, IDR),
         "OpBitcast" => op(124, true, true, IDR),
