@@ -134,10 +134,52 @@ fn hle_sce_cond_timedwait(ctx: &HleContext, args: &[u64]) -> u64 {
 
 /// POSIX `pthread_cond_timedwait` — returns errno directly (`ETIMEDOUT` = 60
 /// on timeout), the errno convention libc's own POSIX wrappers expect.
+/// POSIX `pthread_cond_timedwait(cond, mutex, const struct timespec *abstime)`.
+///
+/// The 3rd argument is a POINTER to an ABSOLUTE deadline — NOT a relative
+/// microsecond count. That is the *SCE* spelling's ABI (see
+/// [`hle_sce_cond_timedwait`]), and the two are entirely different calls that
+/// happen to share a state machine.
+///
+/// Reading the pointer as a duration is catastrophic rather than merely wrong:
+/// Minecraft's MAIN THREAD passes `abstime` at e.g. `0x1_0000_4be8_e8`, which as
+/// microseconds is ~12.7 DAYS. The thread never woke to re-check its predicate,
+/// every worker then idled waiting on it, and boot stalled on the black loading
+/// screen — measured as ~30 threads parked at one host wait with the main
+/// thread's call ring frozen on `pthread_cond_timedwait`.
 fn hle_cond_timedwait(ctx: &HleContext, args: &[u64]) -> u64 {
-    let usec = args.get(2).copied().unwrap_or(0);
-    let timeout = Some(std::time::Duration::from_micros(usec));
+    let timeout = abstime_to_relative(ctx, args.get(2).copied().unwrap_or(0));
     wait_core(ctx, args, timeout)
+}
+
+/// Convert a guest POSIX `struct timespec` (16 bytes: `time_t tv_sec`,
+/// `long tv_nsec`; absolute, against the same wall clock `gettimeofday` reports)
+/// into "how long from now".
+///
+/// `None` (a null `abstime`) means wait forever, matching POSIX. A deadline that
+/// has already passed yields `ZERO`, which `wait_core` reports as `ETIMEDOUT`
+/// immediately — also what POSIX requires. An unreadable pointer is treated as
+/// already-expired rather than as "forever": a bad deadline must not park a
+/// thread for the rest of the run.
+fn abstime_to_relative(ctx: &HleContext, abstime: u64) -> Option<std::time::Duration> {
+    if abstime == 0 {
+        return None;
+    }
+    let mut buf = [0u8; 16];
+    if !ctx.mem.read(abstime, &mut buf) {
+        tracing::warn!(abstime = format_args!("{abstime:#x}"), "pthread_cond_timedwait: abstime unreadable — treating as expired");
+        return Some(std::time::Duration::ZERO);
+    }
+    let tv_sec = i64::from_le_bytes(buf[0..8].try_into().unwrap_or_default());
+    let tv_nsec = i64::from_le_bytes(buf[8..16].try_into().unwrap_or_default());
+    let deadline = std::time::Duration::new(
+        u64::try_from(tv_sec).unwrap_or(0),
+        u32::try_from(tv_nsec.clamp(0, 999_999_999)).unwrap_or(0),
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    Some(deadline.saturating_sub(now))
 }
 
 fn wait_core(ctx: &HleContext, args: &[u64], timeout: Option<std::time::Duration>) -> u64 {

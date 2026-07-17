@@ -29,6 +29,10 @@ mod stack;
 mod stub;
 #[cfg(target_os = "windows")]
 mod thread;
+/// Diagnostic: sample every guest thread's RIP (see [`thread::sample_guest_rips`]).
+/// Windows-only, like the rest of the execution core.
+#[cfg(target_os = "windows")]
+pub use thread::sample_guest_rips;
 #[cfg(target_os = "windows")]
 mod tls;
 #[cfg(target_os = "windows")]
@@ -400,6 +404,10 @@ pub fn execute_process_shared(
         module.hle_trampolines.len(),
     )?);
     let process = thread::GuestProcess::create(module, hle, kernel, arena, guard);
+    // The main guest thread is id 1 and runs on THIS host thread — it never goes
+    // through `GuestProcess::create`'s spawn path, so record its handle here or
+    // the RIP sampler would be blind to the one thread that drives boot.
+    thread::record_host_thread_handle(&process.kernel, 1);
     let result = execute_process_mapped(
         &process.module,
         &process.hle,

@@ -556,7 +556,27 @@ fn main() -> anyhow::Result<()> {
                         })
                         .collect();
                     lines.sort();
-                    info!("STALL_DUMP ({} threads):\n{}", lines.len(), lines.join("\n"));
+                    // The call ring goes blank when a thread spins in GUEST code
+                    // (it calls nothing). RIP is the only thing that still says
+                    // where it is — resolve it against the loaded modules so it
+                    // reads as module+offset, which `--dump-vaddr` can decode.
+                    let mut rips: Vec<String> = xps5x_runtime::sample_guest_rips(&kmon)
+                        .into_iter()
+                        .map(|(id, rip)| {
+                            let site = kmon.unwind_module_for_addr(rip).map_or_else(
+                                || format!("{rip:#x}"),
+                                |m| format!("{}+{:#x}", m.name, rip - m.start),
+                            );
+                            format!("t{id}@{site}")
+                        })
+                        .collect();
+                    rips.sort();
+                    info!(
+                        "STALL_DUMP ({} threads):\n{}\nRIPs: {}",
+                        lines.len(),
+                        lines.join("\n"),
+                        rips.join(" ")
+                    );
                 }
             });
         }

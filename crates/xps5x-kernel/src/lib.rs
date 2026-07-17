@@ -134,6 +134,12 @@ pub struct OrbisKernel {
     /// Guest thread names (`scePthreadRename`), keyed by guest thread id —
     /// purely diagnostic, so a dying thread can be identified by name.
     pub thread_names: DashMap<u64, String>,
+    /// Host (OS) thread handle for each guest thread id, recorded as the thread
+    /// starts. Purely diagnostic: it lets a sampler suspend a guest thread and
+    /// read its RIP, which is the ONLY way to see where a title is stuck when it
+    /// spins in its own code and makes no HLE calls (the call ring goes blank).
+    /// On Windows these are duplicated `HANDLE`s owned for the process lifetime.
+    pub host_thread_handles: DashMap<u64, u64>,
     /// Per-guest-thread ring of the most recent HLE `library::function` calls,
     /// keyed by guest thread id. Populated only when diagnostics ask for it
     /// (the __cxa_throw trap), so a thread that throws can report the exact
@@ -547,6 +553,7 @@ impl OrbisKernel {
             next_module_id: RwLock::new(1),
             syscall_stats: DashMap::new(),
             thread_names: DashMap::new(),
+            host_thread_handles: DashMap::new(),
             recent_hle_calls: DashMap::new(),
             proc_param_addr: std::sync::atomic::AtomicU64::new(0),
             unwind_modules: RwLock::new(Vec::new()),

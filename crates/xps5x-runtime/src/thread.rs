@@ -24,6 +24,99 @@ struct GuestThread {
     detached: bool,
 }
 
+/// Record the calling OS thread's handle under `guest_thread`.
+///
+/// Diagnostic only, and the only way to see a title that stops making HLE calls:
+/// when the guest spins inside its own code the per-thread call ring freezes and
+/// says nothing about *where*. With a handle we can suspend the thread and read
+/// its RIP. The duplicate is owned by the map for the process lifetime.
+#[cfg(windows)]
+pub(crate) fn record_host_thread_handle(kernel: &OrbisKernel, guest_thread: u64) {
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
+
+    let mut dup = std::ptr::null_mut();
+    // SAFETY: `GetCurrentProcess`/`GetCurrentThread` return pseudo-handles valid
+    // for this call, and `dup` is a valid out-param. On success the duplicate is
+    // a real handle owned by `host_thread_handles`.
+    let ok = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            GetCurrentThread(),
+            GetCurrentProcess(),
+            &mut dup,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ok != 0 {
+        kernel.host_thread_handles.insert(guest_thread, dup as u64);
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn record_host_thread_handle(_kernel: &OrbisKernel, _guest_thread: u64) {}
+
+/// Suspend each guest thread briefly and read its instruction pointer.
+///
+/// This answers the one question the HLE-call ring cannot: where is a title
+/// stuck when it is spinning in guest code and calling nothing? Returns
+/// `(guest_thread_id, rip)`.
+///
+/// Suspending threads is only safe because of what this does NOT do while one is
+/// stopped: the handle list is copied out first (so no map shard stays locked
+/// across a suspend), and nothing is logged until every thread is resumed —
+/// either would deadlock against a thread suspended inside the same lock.
+#[cfg(windows)]
+#[must_use]
+pub fn sample_guest_rips(kernel: &OrbisKernel) -> Vec<(u64, u64)> {
+    use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, GetThreadContext};
+    use windows_sys::Win32::System::Threading::{ResumeThread, SuspendThread};
+
+    /// `CONTEXT_CONTROL` for AMD64 — RIP/RSP/RFLAGS only, which is all we read.
+    const CONTEXT_CONTROL_AMD64: u32 = 0x0010_0001;
+
+    #[repr(align(16))]
+    struct Aligned(CONTEXT);
+
+    // Copy the handles out BEFORE suspending anything: holding a DashMap shard
+    // guard across a suspend can stop a thread that needs the same shard.
+    let handles: Vec<(u64, u64)> = kernel
+        .host_thread_handles
+        .iter()
+        .map(|e| (*e.key(), *e.value()))
+        .collect();
+
+    let mut out = Vec::with_capacity(handles.len());
+    for (id, raw) in handles {
+        let handle = raw as *mut core::ffi::c_void;
+        // SAFETY: `handle` is a live duplicated thread handle owned by the
+        // kernel map. Suspend/GetThreadContext/Resume are balanced on every
+        // path, and `ctx` is 16-byte aligned as GetThreadContext requires. The
+        // sampler runs on its own host thread, never a guest one, so it cannot
+        // suspend itself.
+        unsafe {
+            if SuspendThread(handle) == u32::MAX {
+                continue;
+            }
+            let mut ctx: Aligned = std::mem::zeroed();
+            ctx.0.ContextFlags = CONTEXT_CONTROL_AMD64;
+            if GetThreadContext(handle, &mut ctx.0) != 0 {
+                out.push((id, ctx.0.Rip));
+            }
+            ResumeThread(handle);
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+#[must_use]
+pub fn sample_guest_rips(_kernel: &OrbisKernel) -> Vec<(u64, u64)> {
+    Vec::new()
+}
+
 /// Every resource a guest worker can outlive its creator with is Arc-owned.
 /// This is the C2 ownership boundary: no worker borrows launcher or
 /// `execute_process` stack state.
@@ -184,6 +277,7 @@ impl GuestThreadScheduler for GuestProcessHandle {
             .name(format!("xps5x-guest-{handle}"))
             .spawn(move || {
                 tracing::info!(guest_thread = handle, entry, "guest pthread started");
+                record_host_thread_handle(&process.kernel, handle);
                 // SAFETY: all process resources are Arc-owned by this worker;
                 // entry and stack were validated in the live identity-mapped
                 // arena, and dispatch installs this OS thread's TLS context
