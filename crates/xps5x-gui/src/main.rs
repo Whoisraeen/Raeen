@@ -520,13 +520,18 @@ fn main() -> anyhow::Result<()> {
                 .iter()
                 .find(|d| d.name.contains("libc"))
             {
-                xps5x_runtime::native_trap::install(
-                    &mut linked.image,
-                    &mut linked.hle_trampolines,
-                    libc.image_offset + 0xbe50,
-                    13,
-                    "sceLibcMspaceCreateImpl",
-                );
+                // (libc.prx offset, whole-prologue bytes, label). Create impl at
+                // 0xbe50 and the sceLibcMspaceFree wrapper at 0xf600 — both start
+                // with relocation-free register pushes + a reg-reg mov.
+                for (off, plen, name) in [(0xbe50u64, 13usize, "MspaceCreate"), (0xf600, 13, "MspaceFree")] {
+                    xps5x_runtime::native_trap::install(
+                        &mut linked.image,
+                        &mut linked.hle_trampolines,
+                        libc.image_offset + off,
+                        plen,
+                        name,
+                    );
+                }
             } else {
                 info!("XPS5X_TRAP_MSPACE: no libc dependency found to trap");
             }
