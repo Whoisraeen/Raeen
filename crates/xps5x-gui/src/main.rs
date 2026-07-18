@@ -614,6 +614,32 @@ fn main() -> anyhow::Result<()> {
             } else {
                 info!("XPS5X_TRAP_MSPACE: no libc dependency found to trap");
             }
+        } else {
+            // Permanent, always-on fix (not gated behind the diagnostic detour):
+            // resolve the title's native `sceLibcMspaceFree` by NID from the
+            // linked libc module and install the null-mspace-free guard on it, so
+            // the title's `sceLibcMspaceFree(0, ptr)` returns 0 instead of the
+            // retail impl faulting on the null. Title-agnostic and zero-overhead —
+            // the common (non-null) free path runs the real function directly.
+            const SCE_LIBC_MSPACE_FREE_NID: u64 = 0x5656_bf67_e797_971a;
+            if let Some(target) = linked
+                .unwind_modules
+                .iter()
+                .find(|m| m.name.contains("libc"))
+                .and_then(|m| {
+                    m.exports
+                        .iter()
+                        .find(|e| e.nid == SCE_LIBC_MSPACE_FREE_NID)
+                        .map(|e| m.image_offset + e.value)
+                })
+            {
+                xps5x_runtime::native_trap::install_null_free_guard(
+                    &mut linked.image,
+                    target,
+                    13,
+                    "sceLibcMspaceFree",
+                );
+            }
         }
         let linked = std::sync::Arc::new(linked);
         info!(

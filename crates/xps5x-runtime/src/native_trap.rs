@@ -125,6 +125,65 @@ pub fn install(
     );
 }
 
+/// Install a **permanent null-mspace-free guard** on the function at
+/// composed-image offset `target_off` (its whole `prologue_len`-byte prologue
+/// must be position-independent, exactly as [`install`] requires). Returns
+/// `true` if patched.
+///
+/// Unlike the diagnostic [`install`] detour this adds NO trampoline and takes
+/// NO VEH trap on any path — it is pure guest code. The retail libc
+/// `sceLibcMspaceFree` dereferences its mspace argument; the title passes
+/// `mspace = 0` on scoped-pool cleanup (`0` = "the mspace that owns this ptr" on
+/// real HW, which our native libc has no default for), faulting on the null.
+/// The patched entry becomes `test rdi,rdi; jnz <real>; xor eax,eax; ret`, so:
+///   * a valid mspace (`rdi != 0` — 52k of 52.5k calls) flows straight into the
+///     real function at native speed, and
+///   * the rare null free returns 0 without dereferencing, leaking that one
+///     scoped temp (harmless; the buffer's pool is freed wholesale later).
+///
+/// This is the load-time, title-agnostic replacement for running the whole boot
+/// under the `XPS5X_TRAP_MSPACE` detour — resolve `sceLibcMspaceFree` by NID and
+/// point this at it.
+pub fn install_null_free_guard(
+    image: &mut Vec<u8>,
+    target_off: u64,
+    prologue_len: usize,
+    name: &str,
+) -> bool {
+    let off = target_off as usize;
+    if prologue_len < 12 || off + prologue_len > image.len() {
+        warn!("null_free_guard: refusing {name} at {target_off:#x} (out of range)");
+        return false;
+    }
+    let target_abs = GUEST_ARENA_BASE + target_off;
+    let cont = target_abs + prologue_len as u64;
+    let orig = image[off..off + prologue_len].to_vec();
+
+    // Guard stub, appended to the image:
+    //   test rdi,rdi; jz .null; <orig prologue>; movabs rax,cont; jmp rax
+    //   .null: xor eax,eax; ret
+    let stub_addr = GUEST_ARENA_BASE + image.len() as u64;
+    let mut stub = vec![0x48, 0x85, 0xff]; // test rdi, rdi
+    // jz over: orig prologue + `movabs rax,imm64` (10) + `jmp rax` (2).
+    let jz_rel = u8::try_from(orig.len() + 12).expect("mspace-free prologue fits an int8 jz");
+    stub.extend_from_slice(&[0x74, jz_rel]); // jz .null
+    stub.extend_from_slice(&orig); // the real prologue
+    stub.extend_from_slice(&[0x48, 0xb8]); // movabs rax, imm64
+    stub.extend_from_slice(&cont.to_le_bytes());
+    stub.extend_from_slice(&[0xff, 0xe0]); // jmp rax
+    stub.extend_from_slice(&[0x31, 0xc0, 0xc3]); // .null: xor eax,eax; ret
+    image.extend_from_slice(&stub);
+
+    // Patch the real prologue with `movabs rax, stub; jmp rax`, NOP-padded.
+    let mut patch = vec![0x48, 0xb8];
+    patch.extend_from_slice(&stub_addr.to_le_bytes());
+    patch.extend_from_slice(&[0xff, 0xe0]);
+    patch.resize(prologue_len, 0x90);
+    image[off..off + prologue_len].copy_from_slice(&patch);
+    warn!("null_free_guard: installed {name} at {target_abs:#x} (stub={stub_addr:#x})");
+    true
+}
+
 /// Handle a native-trap trampoline hit from the VEH dispatch. `context.Rip` is
 /// the trampoline address. Returns `true` if it was one of ours (the caller then
 /// resumes with `EXCEPTION_CONTINUE_EXECUTION`).
