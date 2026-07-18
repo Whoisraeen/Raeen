@@ -40,6 +40,8 @@ pub use thread::sample_guest_rips;
 #[cfg(target_os = "windows")]
 pub use thread::{host_module_for_addr, sample_host_backtraces};
 #[cfg(target_os = "windows")]
+pub use thread::{GuestProcess, GuestProcessHandle, GuestProcessSnapshot};
+#[cfg(target_os = "windows")]
 mod tls;
 #[cfg(target_os = "windows")]
 mod trampoline;
@@ -263,6 +265,7 @@ pub fn execute_linked(
     let _call_lock = dispatch::call_lock();
 
     let arena = arena::GuestArena::new(&module.image)?;
+    let gpu = xps5x_gpu::AgcGpuSession::global();
     // Expose the module's PT_SCE_PROCPARAM block (if any) to the guest via
     // `sceKernelGetProcParam`: its guest address is the arena base plus the
     // segment's image offset (identity-mapped). `0` clears any stale value
@@ -332,6 +335,7 @@ pub fn execute_linked(
             kernel,
             &arena,
             &arena,
+            &gpu,
             &guard,
             tcb,
             static_tls_block,
@@ -389,7 +393,13 @@ pub fn execute_process(
     let _call_lock = dispatch::call_lock();
     let arena = arena::GuestArena::new(&module.image)?;
     let guard = trampoline::TrampolineGuard::reserve(module.hle_trampolines.len())?;
-    execute_process_mapped(module, hle, kernel, &arena, &guard, None, argv, envp)
+    let gpu = xps5x_gpu::AgcGpuSession::new_process();
+    xps5x_gpu::AgcGpuSession::install_process(&gpu);
+    let result = execute_process_mapped(
+        module, hle, kernel, &arena, &guard, &gpu, None, argv, envp,
+    );
+    gpu.shutdown();
+    result
 }
 
 /// Execute a process whose complete runtime state is Arc-owned. This is the
@@ -420,6 +430,7 @@ pub fn execute_process_shared(
         &process.kernel,
         &process.arena,
         &process.guard,
+        &process.gpu,
         Some(&process),
         argv,
         envp,
@@ -448,6 +459,7 @@ fn execute_process_mapped(
     kernel: &OrbisKernel,
     arena: &arena::GuestArena,
     guard: &trampoline::TrampolineGuard,
+    gpu: &dyn xps5x_core::subsystems::GpuSubmissionSubsystem,
     guest_threads: Option<&dyn xps5x_hle::GuestThreadScheduler>,
     argv: &[&str],
     envp: &[&str],
@@ -602,6 +614,7 @@ fn execute_process_mapped(
                 kernel,
                 arena,
                 arena,
+                gpu,
                 guard,
                 tcb,
                 static_tls_block,
@@ -630,6 +643,7 @@ fn execute_process_mapped(
             kernel,
             arena,
             arena,
+            gpu,
             guard,
             tcb,
             static_tls_block,

@@ -92,7 +92,7 @@ fn hle_write(ctx: &HleContext, args: &[u64]) -> u64 {
         ctx.kernel.console.write_bytes(&bytes);
         return capped;
     }
-    match ctx.kernel.filesystem.write(fd as i32, &bytes) {
+    match ctx.services.write(fd as i32, &bytes) {
         Ok(n) => n as u64,
         Err(e) => {
             warn!("write: fd {fd} failed: {e} — EBADF");
@@ -273,7 +273,7 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
                     if let Some(slash) = path.rfind('/') {
                         let fb_path = format!("{}/{fb_name}", &path[..slash]);
                         warn!("open: '{path}' missing — substituting shipped font '{fb_path}'");
-                        return match ctx.kernel.filesystem.open(&fb_path, flags, mode) {
+                        return match ctx.services.open(&fb_path, flags, mode) {
                             Ok(fd) => fd as u64,
                             Err(e) => {
                                 warn!("open: font substitute '{fb_path}' failed: {e} — ENOENT");
@@ -296,7 +296,7 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
         }
     }
 
-    match ctx.kernel.filesystem.open(&path, flags, mode) {
+    match ctx.services.open(&path, flags, mode) {
         Ok(fd) => fd as u64,
         Err(e) => {
             warn!("open: '{path}' failed: {e} — ENOENT");
@@ -318,7 +318,7 @@ fn hle_read(ctx: &HleContext, args: &[u64]) -> u64 {
     let Ok(n) = usize::try_from(count) else {
         return FILE_EINVAL;
     };
-    match ctx.kernel.filesystem.read(fd, n) {
+    match ctx.services.read(fd, n) {
         Ok(bytes) => {
             if bytes.is_empty() {
                 return 0; // EOF (or an empty file) — a valid short read.
@@ -344,7 +344,7 @@ fn hle_read(ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_close(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
     debug!("close(fd={fd})");
-    match ctx.kernel.filesystem.close(fd) {
+    match ctx.services.close(fd) {
         Ok(()) => SCE_OK,
         Err(_) => FILE_EBADF,
     }
@@ -354,7 +354,7 @@ fn hle_close(ctx: &HleContext, args: &[u64]) -> u64 {
 /// descriptor open. The SCE spelling returns the kernel errno encoding.
 fn hle_fsync(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
-    match ctx.kernel.filesystem.sync(fd) {
+    match ctx.services.sync(fd) {
         Ok(()) => SCE_OK,
         Err(e) => {
             warn!("fsync: fd {fd} failed: {e} â€” EBADF");
@@ -2147,7 +2147,8 @@ fn hle_nanosleep(ctx: &HleContext, args: &[u64]) -> u64 {
         .saturating_add(nanos / 1_000_000)
         .min(MAX_SLEEP_MS);
     debug!("nanosleep({secs}s + {nanos}ns) -> sleeping {ms}ms");
-    std::thread::sleep(std::time::Duration::from_millis(ms));
+    ctx.services
+        .sleep(std::time::Duration::from_millis(ms));
     if rem != 0 {
         let _ = ctx.mem.write(rem, &[0u8; 16]);
     }
@@ -2985,8 +2986,12 @@ fn hle_get_current_cpu(_ctx: &HleContext, _args: &[u64]) -> u64 {
 
 /// Host wall-clock time since the Unix epoch as `(seconds, sub-second
 /// nanos)`. Clamps a pre-epoch host clock to zero rather than panicking.
-fn host_realtime() -> (i64, i64) {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+fn host_realtime(ctx: &HleContext) -> (i64, i64) {
+    match ctx
+        .services
+        .wall_clock()
+        .duration_since(std::time::UNIX_EPOCH)
+    {
         Ok(d) => (d.as_secs() as i64, d.subsec_nanos() as i64),
         Err(_) => (0, 0),
     }
@@ -3003,7 +3008,7 @@ pub(crate) fn hle_gettimeofday(ctx: &HleContext, args: &[u64]) -> u64 {
     if tp == 0 {
         return SCE_OK; // NULL tp is a defined no-op in the real API.
     }
-    let (sec, nanos) = host_realtime();
+    let (sec, nanos) = host_realtime(ctx);
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&sec.to_le_bytes());
     buf[8..16].copy_from_slice(&(nanos / 1_000).to_le_bytes()); // tv_usec
@@ -3031,10 +3036,10 @@ pub(crate) fn hle_clock_gettime(ctx: &HleContext, args: &[u64]) -> u64 {
     }
 
     let (sec, nsec) = if clock_id == CLOCK_MONOTONIC {
-        let elapsed = process_start().elapsed();
+        let elapsed = ctx.services.monotonic_elapsed();
         (elapsed.as_secs() as i64, elapsed.subsec_nanos() as i64)
     } else {
-        host_realtime()
+        host_realtime(ctx)
     };
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&sec.to_le_bytes());
@@ -3072,16 +3077,16 @@ const PROCESS_TIME_COUNTER_HZ: u64 = 1_000_000_000;
 /// Real `sceKernelGetProcessTime()`: microseconds elapsed since the process
 /// started (a `u64` return, not an out-param). Titles use this for frame
 /// timing and delta-time.
-fn hle_get_process_time(_ctx: &HleContext, _args: &[u64]) -> u64 {
-    let us = process_start().elapsed().as_micros();
+fn hle_get_process_time(ctx: &HleContext, _args: &[u64]) -> u64 {
+    let us = ctx.services.monotonic_elapsed().as_micros();
     debug!("sceKernelGetProcessTime() -> {us}us");
     u64::try_from(us).unwrap_or(u64::MAX)
 }
 
 /// Real `sceKernelGetProcessTimeCounter()`: elapsed nanoseconds since process
 /// start (paired with [`PROCESS_TIME_COUNTER_HZ`]). Monotonic.
-fn hle_get_process_time_counter(_ctx: &HleContext, _args: &[u64]) -> u64 {
-    u64::try_from(process_start().elapsed().as_nanos()).unwrap_or(u64::MAX)
+fn hle_get_process_time_counter(ctx: &HleContext, _args: &[u64]) -> u64 {
+    u64::try_from(ctx.services.monotonic_elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// `sceKernelGetProcessTimeCounterFrequency()`: the counter's frequency in
@@ -3116,8 +3121,8 @@ fn hle_get_tsc_frequency(_ctx: &HleContext, _args: &[u64]) -> u64 {
 /// elapsed-seconds math; instead derive it from the monotonic process clock at
 /// exactly that rate. A missing ReadTsc left audio/timing threads spinning on
 /// a never-advancing counter.
-fn hle_read_tsc(_ctx: &HleContext, _args: &[u64]) -> u64 {
-    let nanos = process_start().elapsed().as_nanos();
+fn hle_read_tsc(ctx: &HleContext, _args: &[u64]) -> u64 {
+    let nanos = ctx.services.monotonic_elapsed().as_nanos();
     // ticks = nanos * TSC_FREQ_HZ / 1e9; u128 math avoids overflow before the
     // final narrowing.
     u64::try_from(nanos * u128::from(TSC_FREQ_HZ) / 1_000_000_000).unwrap_or(u64::MAX)
@@ -3133,7 +3138,7 @@ const USLEEP_MAX: std::time::Duration = std::time::Duration::from_secs(1);
 /// thread for `usec` microseconds (capped by [`USLEEP_MAX`]). A no-op sleep
 /// makes timing-driven homebrew busy-spin and burn 100% CPU; a real sleep
 /// yields, matching what the title expects between frames.
-pub(crate) fn hle_usleep(_ctx: &HleContext, args: &[u64]) -> u64 {
+pub(crate) fn hle_usleep(ctx: &HleContext, args: &[u64]) -> u64 {
     let usec = args.first().copied().unwrap_or(0);
     debug!("sceKernelUsleep(usec={usec})");
     let requested = std::time::Duration::from_micros(usec);
@@ -3144,7 +3149,7 @@ pub(crate) fn hle_usleep(_ctx: &HleContext, args: &[u64]) -> u64 {
             dur.as_micros()
         );
     }
-    std::thread::sleep(dur);
+    ctx.services.sleep(dur);
     SCE_OK
 }
 

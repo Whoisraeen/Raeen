@@ -109,6 +109,9 @@ pub enum ShaderInstructionType {
     SOrB32,
     SOrB64,
     SOrn2B64,
+    /// SOP1 0x28: `sdst = exec; exec = ssrc0 | ~exec; scc = (exec != 0)`. The
+    /// ORN2 sibling of `SAndSaveexecB64`; measured in ASTRO.BOT scene compute.
+    SOrn2SaveexecB64,
     SSendmsg,
     SSetpcB64,
     SSwappcB64,
@@ -178,6 +181,9 @@ pub enum ShaderInstructionType {
     VCmpxLtU32,
     VCmpxNeI32,
     VCmpxNeqF32,
+    /// VOPC 0x1e: `exec/smask = !(vsrc0 < vsrc1)` (unordered ≥, NaN→true). The
+    /// exec-writing sibling of `VCmpNltF32`; measured in ASTRO.BOT scene CS.
+    VCmpxNltF32,
     VCmpxNeU32,
     VCndmaskB32,
     VCosF32,
@@ -199,6 +205,10 @@ pub enum ShaderInstructionType {
     VCubeTcF32,
     VCubeMaF32,
     VCvtI32F32,
+    /// VOP1 0xd: `vdst = (int)floor(vsrc0)` (float→signed int, rounding toward
+    /// −∞). The floor sibling of `VCvtI32F32` (which truncates toward zero);
+    /// measured in ASTRO.BOT's scene compute shaders.
+    VCvtFlrI32F32,
     VCvtPkrtzF16F32,
     VCvtU32F32,
     VExpF32,
@@ -383,6 +393,7 @@ pub mod shader_instruction_format {
         Ssrc0Ssrc1 = format_define(&[S0, S1]),
         SVdstSVsrc0 = format_define(&[D, S0]),
         SVdstSVsrc0SVsrc1 = format_define(&[D, S0, S1]),
+        Vdata1Vaddr3StDmask1 = format_define(&[D, S0A3, S1A8, DMASK_1]),
         Vdata1Vaddr3StSsDmask1 = format_define(&[D, S0A3, S1A8, S2A4, DMASK_1]),
         Vdata1Vaddr3StSsDmask8 = format_define(&[D, S0A3, S1A8, S2A4, DMASK_8]),
         Vdata1VaddrSvSoffsIdxen = format_define(&[D, S0, S1A4, S2, IDXEN]),
@@ -391,6 +402,7 @@ pub mod shader_instruction_format {
         Vdata2Vaddr3StSsDmask5 = format_define(&[DA2, S0A3, S1A8, S2A4, DMASK_5]),
         Vdata2Vaddr3StSsDmask9 = format_define(&[DA2, S0A3, S1A8, S2A4, DMASK_9]),
         Vdata2VaddrSvSoffsIdxen = format_define(&[DA2, S0, S1A4, S2, IDXEN]),
+        Vdata3Vaddr3StDmask7 = format_define(&[DA3, S0A3, S1A8, DMASK_7]),
         Vdata3Vaddr3StSsDmask7 = format_define(&[DA3, S0A3, S1A8, S2A4, DMASK_7]),
         Vdata3Vaddr4StSsDmask7 = format_define(&[DA3, S0A4, S1A8, S2A4, DMASK_7]),
         Vdata3VaddrSvSoffsIdxen = format_define(&[DA3, S0, S1A4, S2, IDXEN]),

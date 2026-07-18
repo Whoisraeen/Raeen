@@ -40,6 +40,7 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
+use xps5x_core::diagnostics::DiagnosticRecorder;
 
 /// Captured guest console output (M1-C): everything the guest writes via
 /// `printf`/`puts`/`write(1|2, ...)` lands here, byte-for-byte, so the
@@ -123,6 +124,11 @@ pub struct OrbisKernel {
     pub threads: Arc<threading::ThreadManager>,
     /// Virtual filesystem.
     pub filesystem: Arc<filesystem::VirtualFileSystem>,
+    /// Stable, process-scoped HLE/wait/event/task/GPU event stream.
+    pub diagnostics: Arc<DiagnosticRecorder>,
+    /// Monotonic epoch owned by this guest process rather than a host-global
+    /// static, so consecutive title launches do not inherit elapsed time.
+    started_at: std::time::Instant,
     /// Loaded modules (.sprx / .elf).
     pub modules: DashMap<u32, ModuleInfo>,
     /// Handle-scoped NID -> absolute guest addresses for real LLE modules.
@@ -674,6 +680,8 @@ impl OrbisKernel {
             memory: Arc::new(memory::VirtualMemoryManager::new()),
             threads: Arc::new(threading::ThreadManager::new()),
             filesystem: Arc::new(filesystem::VirtualFileSystem::new()),
+            diagnostics: Arc::new(DiagnosticRecorder::from_env()),
+            started_at: std::time::Instant::now(),
             modules: DashMap::new(),
             lle_module_exports: DashMap::new(),
             next_module_id: RwLock::new(1),
@@ -1023,5 +1031,178 @@ impl OrbisKernel {
 impl Default for OrbisKernel {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl xps5x_core::subsystems::TimeSubsystem for OrbisKernel {
+    fn monotonic_elapsed(&self) -> std::time::Duration {
+        self.started_at.elapsed()
+    }
+
+    fn wall_clock(&self) -> std::time::SystemTime {
+        std::time::SystemTime::now()
+    }
+
+    fn sleep(&self, duration: std::time::Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+impl xps5x_core::subsystems::WaitSubsystem for OrbisKernel {
+    fn wait_until(
+        &self,
+        key: xps5x_core::subsystems::WaitKey,
+        timeout: std::time::Duration,
+        terminating: &dyn Fn() -> bool,
+        ready: &mut dyn FnMut() -> bool,
+    ) -> xps5x_core::subsystems::WaitOutcome {
+        use xps5x_core::diagnostics::DiagnosticKind;
+        use xps5x_core::subsystems::WaitOutcome;
+
+        self.diagnostics.record(
+            key.guest_thread,
+            DiagnosticKind::WaitBegin,
+            key.class,
+            key.object,
+            format!("timeout_us={}", timeout.as_micros()),
+        );
+        let deadline = std::time::Instant::now() + timeout;
+        let (lock, cvar) = &self.event_flag_signal;
+        let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let outcome = loop {
+            if ready() {
+                break WaitOutcome::Ready;
+            }
+            if terminating() {
+                break WaitOutcome::Terminating;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break WaitOutcome::TimedOut;
+            }
+            let (next, _) = cvar
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard = next;
+        };
+        self.diagnostics.record(
+            key.guest_thread,
+            DiagnosticKind::WaitEnd,
+            key.class,
+            key.object,
+            format!("{outcome:?}"),
+        );
+        outcome
+    }
+
+    fn wake(
+        &self,
+        key: xps5x_core::subsystems::WaitKey,
+        reason: xps5x_core::subsystems::WakeReason,
+    ) {
+        use xps5x_core::diagnostics::DiagnosticKind;
+        self.diagnostics.record(
+            key.guest_thread,
+            DiagnosticKind::Wake,
+            key.class,
+            key.object,
+            format!("{reason:?}"),
+        );
+        let (lock, cvar) = &self.event_flag_signal;
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        cvar.notify_all();
+    }
+}
+
+impl xps5x_core::subsystems::EventSubsystem for OrbisKernel {
+    fn create_event(&self, attributes: u32, initial: u64) -> u64 {
+        let handle = self.create_event_flag(attributes, initial);
+        self.diagnostics.record(
+            0,
+            xps5x_core::diagnostics::DiagnosticKind::EventTransition,
+            "event-flag",
+            handle,
+            format!("create attributes={attributes:#x} bits={initial:#x}"),
+        );
+        handle
+    }
+
+    fn delete_event(&self, handle: u64) -> bool {
+        let removed = self.kernel_event_flags.remove(&handle).is_some();
+        if removed {
+            self.diagnostics.record(
+                0,
+                xps5x_core::diagnostics::DiagnosticKind::EventTransition,
+                "event-flag",
+                handle,
+                "delete",
+            );
+        }
+        removed
+    }
+
+    fn update_event(
+        &self,
+        handle: u64,
+        update: xps5x_core::subsystems::EventUpdate,
+    ) -> Option<u64> {
+        use xps5x_core::diagnostics::DiagnosticKind;
+        use xps5x_core::subsystems::EventUpdate;
+        let mut event = self.kernel_event_flags.get_mut(&handle)?;
+        event.bits = match update {
+            EventUpdate::Set(pattern) => event.bits | pattern,
+            EventUpdate::Keep(pattern) => event.bits & pattern,
+            EventUpdate::Replace(pattern) => pattern,
+        };
+        let bits = event.bits;
+        drop(event);
+        self.diagnostics.record(
+            0,
+            DiagnosticKind::EventTransition,
+            "event-flag",
+            handle,
+            format!("{update:?} -> {bits:#x}"),
+        );
+        Some(bits)
+    }
+
+    fn event_bits(&self, handle: u64) -> Option<u64> {
+        self.kernel_event_flags.get(&handle).map(|event| event.bits)
+    }
+}
+
+impl xps5x_core::subsystems::VfsSubsystem for OrbisKernel {
+    fn open(&self, path: &str, flags: i32, mode: u32) -> std::io::Result<i32> {
+        self.filesystem.open(path, flags, mode)
+    }
+
+    fn read(&self, fd: i32, count: usize) -> std::io::Result<Vec<u8>> {
+        self.filesystem.read(fd, count)
+    }
+
+    fn write(&self, fd: i32, bytes: &[u8]) -> std::io::Result<usize> {
+        self.filesystem.write(fd, bytes)
+    }
+
+    fn sync(&self, fd: i32) -> std::io::Result<()> {
+        self.filesystem.sync(fd)
+    }
+
+    fn close(&self, fd: i32) -> std::io::Result<()> {
+        self.filesystem.close(fd)
+    }
+}
+
+impl xps5x_core::subsystems::NetworkSubsystem for OrbisKernel {
+    fn mode(&self) -> xps5x_core::subsystems::NetworkMode {
+        xps5x_core::subsystems::NetworkMode::Offline
+    }
+
+    fn create_socket(&self) -> i32 {
+        OrbisKernel::create_socket(self)
+    }
+
+    fn socket_exists(&self, fd: i32) -> bool {
+        self.kernel_sockets.contains_key(&fd)
     }
 }

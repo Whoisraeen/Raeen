@@ -2966,6 +2966,88 @@ fn recompile_image_sample_lz_dmask7(
     Ok(false)
 }
 
+/// Beyond-Kyty: `image_sample_lz` with `dmask == 0xf` (rgba, explicit LOD 0),
+/// measured in ASTRO.BOT's fullscreen composite. Same lowering as
+/// [`recompile_image_sample_lz_dmask7`] plus the fourth channel store.
+fn recompile_image_sample_lz_dmask_f(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSampleLz_Vdata4Vaddr3StSsDmaskF";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
+            let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+            let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+            let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
+            let dst_value3 = operand_variable_to_str_shift(inst.dst, 3);
+            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
+            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
+            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+            let src2_value0 = operand_variable_to_str_shift(inst.src[2], 0);
+
+            if dst_value0.type_ != SpirvType::Float
+                || src0_value0.type_ != SpirvType::Float
+                || src1_value0.type_ != SpirvType::Uint
+                || src2_value0.type_ != SpirvType::Uint
+            {
+                return Err(not_supported(FUNC, "unexpected operand types"));
+            }
+
+            // TODO() check VSKIP
+            // TODO() check LOD_CLAMPED
+
+            const TEXT: &str = r#"
+         %t24_<index> = OpLoad %uint %<src1_value0>
+         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageS %textures2D_S %t24_<index>
+         %t27_<index> = OpLoad %ImageS %t26_<index>
+         %t33_<index> = OpLoad %uint %<src2_value0>
+         %t35_<index> = OpAccessChain %_ptr_UniformConstant_Sampler %samplers %t33_<index>
+         %t36_<index> = OpLoad %Sampler %t35_<index>
+         %t38_<index> = OpSampledImage %SampledImage %t27_<index> %t36_<index>
+
+         %t39_<index> = OpLoad %float %<src0_value0>
+         %t40_<index> = OpLoad %float %<src0_value1>
+         %t42_<index> = OpCompositeConstruct %v2float %t39_<index> %t40_<index>
+
+         %t43_<index> = OpImageSampleExplicitLod %v4float %t38_<index> %t42_<index> Lod %float_0_000000
+               OpStore %temp_v4float %t43_<index>
+         %t46_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_0
+         %t47_<index> = OpLoad %float %t46_<index>
+               OpStore %<dst_value0> %t47_<index>
+         %t50_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_1
+         %t51_<index> = OpLoad %float %t50_<index>
+               OpStore %<dst_value1> %t51_<index>
+         %t54_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_2
+         %t55_<index> = OpLoad %float %t54_<index>
+               OpStore %<dst_value2> %t55_<index>
+         %t57_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_3
+         %t58_<index> = OpLoad %float %t57_<index>
+               OpStore %<dst_value3> %t58_<index>
+"#;
+            *dst_source += &TEXT
+                .replace("<index>", &format!("{index}"))
+                .replace("<src0_value0>", &src0_value0.value)
+                .replace("<src0_value1>", &src0_value1.value)
+                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<src2_value0>", &src2_value0.value)
+                .replace("<dst_value0>", &dst_value0.value)
+                .replace("<dst_value1>", &dst_value1.value)
+                .replace("<dst_value2>", &dst_value2.value)
+                .replace("<dst_value3>", &dst_value3.value);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 /// Kyty: `Recompile_ImageSampleLzO_Vdata3Vaddr4StSsDmask7` (ShaderSpirv.cpp
 /// L2887).
 #[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
@@ -3058,24 +3140,24 @@ fn recompile_image_sample_lzo_dmask7(
     Ok(false)
 }
 
-/// Kyty: `Recompile_ImageLoad_Vdata4Vaddr3StDmaskF` (ShaderSpirv.cpp L3038).
-fn recompile_image_load_dmask_f(
+/// Shared body of the `ImageLoad` dmask family: fetch a texel by integer
+/// coordinate into `temp_v4float`, then store the dmask-selected `channels` —
+/// `(t0, chan)` pairs naming the temp id and the `%uint_<chan>` component —
+/// into consecutive vdata registers. Same channel scheme as
+/// [`image_sample_channels`].
+fn image_load_channels(
     index: u32,
     code: &ShaderCode,
     dst_source: &mut String,
     spirv: &Spirv<'_>,
-    _param: &Params,
-    _scc_check: SccCheck,
+    func: &'static str,
+    channels: &[(u32, u32)],
 ) -> Result<bool, ShaderRecompileError> {
-    const FUNC: &str = "Recompile_ImageLoad_Vdata4Vaddr3StDmaskF";
-    let inst = inst_at(code, index, FUNC)?;
+    let inst = inst_at(code, index, func)?;
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 {
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
-            let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
-            let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
-            let dst_value3 = operand_variable_to_str_shift(inst.dst, 3);
             let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
             let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
             let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
@@ -3084,7 +3166,7 @@ fn recompile_image_load_dmask_f(
                 || src0_value0.type_ != SpirvType::Float
                 || src1_value0.type_ != SpirvType::Uint
             {
-                return Err(not_supported(FUNC, "unexpected operand types"));
+                return Err(not_supported(func, "unexpected operand types"));
             }
 
             // TODO() check VSKIP
@@ -3092,7 +3174,7 @@ fn recompile_image_load_dmask_f(
             // TODO() swizzle channels
             // TODO() convert SRGB -> LINEAR if SRGB format was replaced with UNORM
 
-            const TEXT: &str = r#"
+            const HEAD: &str = r#"
          %t24_<index> = OpLoad %uint %<src1_value0>
          %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageS %textures2D_S %t24_<index>
          %t27_<index> = OpLoad %ImageS %t26_<index>
@@ -3103,34 +3185,88 @@ fn recompile_image_load_dmask_f(
          %t73_<index> = OpCompositeConstruct %v2uint %t69_<index> %t71_<index>
          %t74_<index> = OpImageFetch %v4float %t27_<index> %t73_<index>
                OpStore %temp_v4float %t74_<index>
-         %t46_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_0
-         %t47_<index> = OpLoad %float %t46_<index>
-               OpStore %<dst_value0> %t47_<index>
-         %t50_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_1
-         %t51_<index> = OpLoad %float %t50_<index>
-               OpStore %<dst_value1> %t51_<index>
-         %t54_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_2
-         %t55_<index> = OpLoad %float %t54_<index>
-               OpStore %<dst_value2> %t55_<index>
-         %t57_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_3
-         %t58_<index> = OpLoad %float %t57_<index>
-               OpStore %<dst_value3> %t58_<index>
 "#;
-            *dst_source += &TEXT
+            const TAIL: &str = r#"         %t<t0>_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_<chan>
+         %t<t1>_<index> = OpLoad %float %t<t0>_<index>
+               OpStore %<dst_value> %t<t1>_<index>
+"#;
+
+            let mut text = HEAD.to_string();
+            for (i, (t0, chan)) in channels.iter().enumerate() {
+                let dst_value = operand_variable_to_str_shift(inst.dst, i as i32);
+                text += &TAIL
+                    .replace("<t0>", &format!("{t0}"))
+                    .replace("<t1>", &format!("{}", t0 + 1))
+                    .replace("<chan>", &format!("{chan}"))
+                    .replace("<dst_value>", &dst_value.value);
+            }
+
+            *dst_source += &text
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
                 .replace("<src0_value1>", &src0_value1.value)
-                .replace("<src1_value0>", &src1_value0.value)
-                .replace("<dst_value0>", &dst_value0.value)
-                .replace("<dst_value1>", &dst_value1.value)
-                .replace("<dst_value2>", &dst_value2.value)
-                .replace("<dst_value3>", &dst_value3.value);
+                .replace("<src1_value0>", &src1_value0.value);
 
             return Ok(true);
         }
     }
 
     Ok(false)
+}
+
+/// Kyty: `Recompile_ImageLoad_Vdata4Vaddr3StDmaskF` (ShaderSpirv.cpp L3038).
+fn recompile_image_load_dmask_f(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageLoad_Vdata4Vaddr3StDmaskF";
+    image_load_channels(
+        index,
+        code,
+        dst_source,
+        spirv,
+        FUNC,
+        &[(46, 0), (50, 1), (54, 2), (57, 3)],
+    )
+}
+
+/// Beyond-Kyty: `image_load` with `dmask == 0x1` (single-channel fetch),
+/// measured in ASTRO.BOT scene compute shaders.
+fn recompile_image_load_dmask1(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageLoad_Vdata1Vaddr3StDmask1";
+    image_load_channels(index, code, dst_source, spirv, FUNC, &[(46, 0)])
+}
+
+/// Beyond-Kyty: `image_load` with `dmask == 0x7` (xyz fetch), measured in
+/// ASTRO.BOT scene compute shaders.
+fn recompile_image_load_dmask7(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageLoad_Vdata3Vaddr3StDmask7";
+    image_load_channels(
+        index,
+        code,
+        dst_source,
+        spirv,
+        FUNC,
+        &[(46, 0), (50, 1), (54, 2)],
+    )
 }
 
 /// Kyty: `Recompile_ImageStore_Vdata4Vaddr3StDmaskF` (ShaderSpirv.cpp L3105).
@@ -3822,6 +3958,75 @@ fn recompile_s_and_saveexec_b64(
         %t194_<index> = OpBitwiseAnd %uint %t0_<index> %t190_<index>
                OpStore %exec_lo %t194_<index>
         %t197_<index> = OpBitwiseAnd %uint %t1_<index> %t191_<index>
+               OpStore %exec_hi %t197_<index>
+        <execz>
+        <scc>
+"#;
+
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<execz>", EXECZ)
+        .replace("<scc>", get_scc_check(scc_check, 2))
+        .replace("<dst0>", &dst_value0.value)
+        .replace("<dst1>", &dst_value1.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Beyond-Kyty: `s_orn2_saveexec_b64` — `sdst = exec; exec = ssrc0 | ~exec`.
+/// The ORN2 sibling of [`recompile_s_and_saveexec_b64`]; measured in
+/// ASTRO.BOT scene compute.
+fn recompile_s_orn2_saveexec_b64(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SOrn2SaveexecB64_Sdst2Ssrc02";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+    let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+
+    if dst_value0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+    if operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "exec destination"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, 0)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[0], "t1_<index>", &index_str, &mut load1, 1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load0>
+        <load1>
+        %t190_<index> = OpLoad %uint %exec_lo
+               OpStore %<dst0> %t190_<index>
+        %t191_<index> = OpLoad %uint %exec_hi
+               OpStore %<dst1> %t191_<index>
+        %t192_<index> = OpNot %uint %t190_<index>
+        %t193_<index> = OpNot %uint %t191_<index>
+        %t194_<index> = OpBitwiseOr %uint %t0_<index> %t192_<index>
+               OpStore %exec_lo %t194_<index>
+        %t197_<index> = OpBitwiseOr %uint %t1_<index> %t193_<index>
                OpStore %exec_hi %t197_<index>
         <execz>
         <scc>
@@ -5421,6 +5626,8 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_exp_prim,                           T::Exp, F::PrimVsrc0OffOffOffDone,         p1("")),
 
     f(recompile_image_load_dmask_f,        T::ImageLoad,      F::Vdata4Vaddr3StDmaskF,   p1("")),
+    f(recompile_image_load_dmask1,         T::ImageLoad,      F::Vdata1Vaddr3StDmask1,   p1("")),
+    f(recompile_image_load_dmask7,         T::ImageLoad,      F::Vdata3Vaddr3StDmask7,   p1("")),
     // Wired for the texture chain: Minecraft's content pixel shaders reach
     // ImageSample the moment their vertex partners translate. The nine
     // recompilers were already ported (shared dmask body + Lz/LzO); the
@@ -5433,6 +5640,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_image_sample_dmask7,     T::ImageSample,    F::Vdata3Vaddr3StSsDmask7, p1("")),
     f(recompile_image_sample_dmask_f,    T::ImageSample,    F::Vdata4Vaddr3StSsDmaskF, p1("")),
     f(recompile_image_sample_lz_dmask7,  T::ImageSampleLz,  F::Vdata3Vaddr3StSsDmask7, p1("")),
+    f(recompile_image_sample_lz_dmask_f, T::ImageSampleLz,  F::Vdata4Vaddr3StSsDmaskF, p1("")),
     f(recompile_image_sample_lzo_dmask7, T::ImageSampleLzO, F::Vdata3Vaddr4StSsDmask7, p1("")),
     f(recompile_image_store_dmask_f,       T::ImageStore,     F::Vdata4Vaddr3StDmaskF,   p1("")),
     ni("Recompile_ImageStoreMip_Vdata4Vaddr4StDmaskF",    3173, T::ImageStoreMip,  F::Vdata4Vaddr4StDmaskF,   p1("")),
@@ -5568,6 +5776,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_v_xxx_f32_svdst_svsrc0, T::VTruncF32, F::SVdstSVsrc0, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Trunc %t0_<index>")),
     f(recompile_vcvt_xxx_f32, T::VCvtU32F32, F::SVdstSVsrc0, p2("%t1_<index> = OpExtInst %float %GLSL_std_450 Trunc %t0_<index>", "%t2_<index> = OpConvertFToU %uint %t1_<index>")),
     f(recompile_vcvt_xxx_f32, T::VCvtI32F32, F::SVdstSVsrc0, p2("%t1_<index> = OpExtInst %float %GLSL_std_450 Trunc %t0_<index>", "%t2_<index> = OpConvertFToS %int %t1_<index>")),
+    f(recompile_vcvt_xxx_f32, T::VCvtFlrI32F32, F::SVdstSVsrc0, p2("%t1_<index> = OpExtInst %float %GLSL_std_450 Floor %t0_<index>", "%t2_<index> = OpConvertFToS %int %t1_<index>")),
     f(recompile_vcvt_f32_xxx, T::VCvtF32F16,    F::SVdstSVsrc0, p2("%ts_<index> = OpExtInst %v2float %GLSL_std_450 UnpackHalf2x16 %t0_<index>", "%t_<index> = OpCompositeExtract %float %ts_<index> 0")),
     f(recompile_vcvt_f32_xxx, T::VCvtF32I32,    F::SVdstSVsrc0, p2("%ti_<index> = OpBitcast %int %t0_<index>", "%t_<index> = OpConvertSToF %float %ti_<index>")),
     f(recompile_vcvt_f32_xxx, T::VCvtF32U32,    F::SVdstSVsrc0, p1("%t_<index> = OpConvertUToF %float %t0_<index>")),
@@ -5578,6 +5787,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_vmov_b32, T::VMovB32, F::SVdstSVsrc0, p1("")),
 
     fs(recompile_s_and_saveexec_b64, T::SAndSaveexecB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
+    fs(recompile_s_orn2_saveexec_b64, T::SOrn2SaveexecB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
     f(recompile_smov_b64,    T::SMovB64,    F::Sdst2Ssrc02, p1("")),
     f(recompile_sswappc_b64, T::SSwappcB64, F::Sdst2Ssrc02, p1("")),
     fs(recompile_swqm_b64, T::SWqmB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
@@ -5637,6 +5847,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_vcmpx_xxx_f32, T::VCmpxNeqF32, F::SmaskVsrc0Vsrc1, p1("OpFUnordNotEqual")),
     f(recompile_vcmpx_xxx_f32, T::VCmpxGtF32,  F::SmaskVsrc0Vsrc1, p1("OpFOrdGreaterThan")),
     f(recompile_vcmpx_xxx_f32, T::VCmpxLtF32,  F::SmaskVsrc0Vsrc1, p1("OpFOrdLessThan")),
+    f(recompile_vcmpx_xxx_f32, T::VCmpxNltF32, F::SmaskVsrc0Vsrc1, p1("OpFUnordGreaterThanEqual")),
     // Wired for the Minecraft menu CS (v_cmpx family; Kyty GCN semantics —
     // the comparison result lands in both the mask destination and EXEC; on
     // real RDNA2 cmpx writes EXEC only, the extra mask write is a documented
@@ -5941,9 +6152,11 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            227,
+            233,
             "204 Kyty rows plus SSubU32, SNop, the RDNA2-only rows \
              (VLshlAddU32, VCmpxLtU32, VAddNcU32, VSubNcU32, VSubrevNcU32, VCvtI32F32, \
+             VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad dmask1/7 \
+             and ImageSampleLz dmaskF rows, \
              the Kyty-gated trio VAndOrB32/VLshlOrU32/VOr3U32, and the v_cmpx_*_i32 \
              block: VCmpxLtI32/GeI32/GtI32/LeI32/EqI32/NeI32), the beyond-Kyty \
              BufferLoadDwordX4 (+Offen) rows, and the four cubemap helpers \
@@ -5951,9 +6164,10 @@ mod tests {
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 215,
+            implemented, 221,
             "C1 implemented subset plus title-driven ports (incl. the S_XXX_I32 \
-             trio, the nine ImageSample dmask recompilers, the VCmp \
+             trio, VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad \
+             dmask1/7 + ImageSampleLz dmaskF rows, the nine ImageSample dmask recompilers, the VCmp \
              F32/I32/U32 families, BufferLoadDwordX4 +Offen, and the four \
              VCube*F32 cubemap-coordinate helpers)"
         );
@@ -6712,6 +6926,51 @@ mod tests {
     }
 
     #[test]
+    fn astro_scene_mimg_and_saveexec_rows_are_wired() {
+        // The ASTRO.BOT scene-compute batch: image_load dmask 1/7, the
+        // fullscreen composite's image_sample_lz rgba, and s_orn2_saveexec.
+        // Each row must exist and be implemented (not NI) so the shaders that
+        // lead with these instructions translate instead of skipping.
+        for (ty, fmt) in [
+            (T::ImageLoad, F::Vdata1Vaddr3StDmask1),
+            (T::ImageLoad, F::Vdata3Vaddr3StDmask7),
+            (T::ImageSampleLz, F::Vdata4Vaddr3StSsDmaskF),
+            (T::SOrn2SaveexecB64, F::Sdst2Ssrc02),
+        ] {
+            let entry =
+                recomp_func(ty, fmt).unwrap_or_else(|| panic!("{ty:?} row missing"));
+            assert!(
+                matches!(entry.func, RecompileFn::Func(_)),
+                "{ty:?} must be implemented, not NI"
+            );
+        }
+    }
+
+    #[test]
+    fn v_cmpx_nlt_f32_is_wired_as_exec_writing_unordered_ge() {
+        // VOPC 0x1e: `exec/smask = !(vsrc0 < vsrc1)`. With NaN, "not less than"
+        // is the UNORDERED ≥ (NaN → true), the same lowering as the non-exec
+        // VCmpNltF32. Measured in ASTRO.BOT scene compute (raw 0x7c3c66f9). Must
+        // be implemented (not NI) and lower via the exec-writing vcmpx path.
+        let entry = recomp_func(T::VCmpxNltF32, F::SmaskVsrc0Vsrc1)
+            .unwrap_or_else(|| panic!("VCmpxNltF32 row"));
+        assert!(
+            matches!(entry.func, RecompileFn::Func(_)),
+            "VCmpxNltF32 must be implemented, not NI"
+        );
+        assert_eq!(
+            entry.param[0],
+            Some("OpFUnordGreaterThanEqual"),
+            "v_cmpx_nlt is unordered ≥ (NaN → true), not an ordered compare"
+        );
+        // Its ordered exec-writing twin must stay distinct (OpFOrdLessThan), so
+        // a wrong-op regression on either can't hide behind the other.
+        let lt = recomp_func(T::VCmpxLtF32, F::SmaskVsrc0Vsrc1)
+            .unwrap_or_else(|| panic!("VCmpxLtF32 row"));
+        assert_eq!(lt.param[0], Some("OpFOrdLessThan"), "VCmpxLtF32 must stay ordered <");
+    }
+
+    #[test]
     fn scalar_compare_family_is_wired() {
         let signed = [
             T::SCmpEqI32,
@@ -6908,6 +7167,59 @@ mod tests {
                 spirv_run(&source).unwrap_or_else(|e| panic!("assemble {marker}: {e:?}"));
             naga_parse_and_validate(&words, marker);
         }
+    }
+
+    #[test]
+    fn v_cvt_flr_i32_f32_is_wired_and_validates() {
+        // v_cvt_flr_i32_f32 v0, v1 — VOP1 0xd, floor(float)→signed-int. Measured
+        // in ASTRO.BOT's scene compute shaders (raw 0x7e681b01 = vdst v52); here
+        // vdst=v0 for a compact test. Must parse to VCvtFlrI32F32 and recompile
+        // to a GLSL Floor followed by OpConvertFToS (not Trunc — that is the
+        // truncating VCvtI32F32 sibling).
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        shader_parse(
+            0,
+            &[
+                0x7E00_1B01, // v_cvt_flr_i32_f32 v0, v1
+                0x7E00_02FF,
+                0x3F80_0000, // v_mov_b32 v0, 1.0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x1004_0300,
+                0xF800_08CF,
+                0x0302_0100, // exp
+                0xF800_020F,
+                0x0302_0100, // exp
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .unwrap_or_else(|e| panic!("parse v_cvt_flr_i32_f32: {e:?}"));
+
+        assert_eq!(code.get_instructions()[0].type_, T::VCvtFlrI32F32);
+
+        let source = spirv_generate_source(
+            &code,
+            Some(&ShaderVertexInputInfo {
+                export_count: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("recompile v_cvt_flr_i32_f32: {e:?}"));
+        assert!(
+            source.contains("%GLSL_std_450 Floor"),
+            "v_cvt_flr must floor toward −∞ before the int conversion"
+        );
+        assert!(
+            source.contains("OpConvertFToS %int"),
+            "v_cvt_flr result is a signed int"
+        );
+        let words =
+            spirv_run(&source).unwrap_or_else(|e| panic!("assemble v_cvt_flr_i32_f32: {e:?}"));
+        naga_parse_and_validate(&words, "v_cvt_flr_i32_f32");
     }
 
     #[test]

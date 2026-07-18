@@ -160,7 +160,7 @@ fn guest_memory_pixel_shader_draws_green() {
 
     let session = AgcGpuSession::global();
     let ok_before = session.shader_stats().translated_ok;
-    let image = match session.execute_dcb_cp(&dcb) {
+    let image = match session.execute_dcb_cp(&dcb, false) {
         Ok(Some(image)) => image,
         Ok(None) => panic!("the DCB contains a draw — it must not vanish"),
         Err(e) => {
@@ -196,7 +196,7 @@ fn untranslatable_guest_shader_skips_the_draw_not_the_dcb() {
     let session = AgcGpuSession::global();
     let skips_before = session.shader_skip_count();
     let failed_before = session.shader_stats().translate_failed;
-    match session.execute_dcb_cp(&dcb) {
+    match session.execute_dcb_cp(&dcb, false) {
         // No image: the only draw in the DCB was skipped, honestly.
         Ok(None) => {
             assert!(

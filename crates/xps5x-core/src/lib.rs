@@ -5,8 +5,10 @@
 //! error types, and shared constants used across all crates.
 
 pub mod config;
+pub mod diagnostics;
 pub mod error;
 pub mod logging;
+pub mod subsystems;
 pub mod types;
 
 /// XPS5X version string.

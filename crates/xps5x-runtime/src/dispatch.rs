@@ -67,6 +67,7 @@ use xps5x_hle::{
     GuestThreadScheduler, HleContext, HleRegistry,
 };
 use xps5x_kernel::OrbisKernel;
+use xps5x_core::subsystems::GpuSubmissionSubsystem;
 
 use crate::RunOutcome;
 use crate::RuntimeError;
@@ -394,6 +395,7 @@ struct ActiveContext {
     /// The guest allocator an HLE call's [`HleContext::alloc`] borrows
     /// from — a trait object pointer (fat pointer), same reasoning as `mem`.
     alloc: *const dyn GuestAllocator,
+    gpu: *const dyn GpuSubmissionSubsystem,
     thread_scheduler: *const dyn GuestThreadScheduler,
     current_thread: u64,
     /// This thread's static TLS block base (`tcb - tls_block_size`), when it
@@ -749,6 +751,7 @@ pub(crate) unsafe fn run(
     kernel: &OrbisKernel,
     mem: &dyn GuestMemory,
     alloc: &dyn GuestAllocator,
+    gpu: &dyn GpuSubmissionSubsystem,
     guard: &TrampolineGuard,
     tcb: Option<u64>,
     // This thread's static TLS block base — `tcb - tls_block_size`, which only
@@ -811,6 +814,14 @@ pub(crate) unsafe fn run(
     // `ACTIVE_CONTEXT` is cleared before `run` returns.
     let alloc_erased: &'static dyn GuestAllocator =
         unsafe { core::mem::transmute::<&dyn GuestAllocator, &'static dyn GuestAllocator>(alloc) };
+    // SAFETY: process GPU services are Arc-owned; the function-mode fallback
+    // is a clone of the installed process handle. Both outlive this guarded
+    // call and the pointer is cleared with the rest of `ActiveContext`.
+    let gpu_erased: &'static dyn GpuSubmissionSubsystem = unsafe {
+        core::mem::transmute::<&dyn GpuSubmissionSubsystem, &'static dyn GpuSubmissionSubsystem>(
+            gpu,
+        )
+    };
     let thread_scheduler = guest_threads.unwrap_or(&UNSUPPORTED_GUEST_THREADS);
     // SAFETY: shared schedulers are Arc-owned by the process, while the
     // fallback is static; either way the scheduler outlives this run.
@@ -827,6 +838,7 @@ pub(crate) unsafe fn run(
         kernel: kernel as *const OrbisKernel,
         mem: mem_erased as *const dyn GuestMemory,
         alloc: alloc_erased as *const dyn GuestAllocator,
+        gpu: gpu_erased as *const dyn GpuSubmissionSubsystem,
         thread_scheduler: thread_scheduler_erased as *const dyn GuestThreadScheduler,
         current_thread,
         static_tls_block,
@@ -2030,6 +2042,8 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             };
             let hle_ctx = HleContext {
                 kernel,
+                services: kernel,
+                gpu: unsafe { &*ctx.gpu },
                 mem,
                 alloc,
                 guest_calls: ctx,

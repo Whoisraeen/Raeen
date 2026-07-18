@@ -5267,6 +5267,7 @@ dependencies = [
  "windows-sys 0.59.0",
  "xps5x-core",
  "xps5x-firmware",
+ "xps5x-gpu",
  "xps5x-hle",
  "xps5x-kernel",
 ]

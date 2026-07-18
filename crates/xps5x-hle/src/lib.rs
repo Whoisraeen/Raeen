@@ -77,6 +77,8 @@ pub mod pthread_tls;
 
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
+use xps5x_core::diagnostics::DiagnosticKind;
+use xps5x_core::subsystems::{GpuSubmissionSubsystem, KernelSubsystems};
 
 /// Access to the guest (emulated PS5) address space from an HLE function.
 ///
@@ -94,6 +96,39 @@ pub trait GuestMemory {
     /// Write `data` starting at `guest_addr`. Returns `false` (writing
     /// nothing) if the write would fall outside the guest's mapped memory.
     fn write(&self, guest_addr: u64, data: &[u8]) -> bool;
+
+    /// Validate a whole guest range for the requested access without exposing
+    /// a host pointer. Backends should override this with their authoritative
+    /// map; the default probes one byte per 4 KiB page plus the last byte.
+    fn validate_range(&self, range: GuestRange, _access: GuestAccess) -> bool {
+        if range.is_empty() {
+            return true;
+        }
+        let Some(last) = range.end().and_then(|end| end.checked_sub(1)) else {
+            return false;
+        };
+        let mut probe = [0u8; 1];
+        let mut address = range.start().raw();
+        loop {
+            if !self.read(address, &mut probe) {
+                return false;
+            }
+            if address == last {
+                return true;
+            }
+            address = address.saturating_add(0x1000).min(last);
+        }
+    }
+
+    /// Whether the entire range may be entered as native guest code.
+    fn is_executable_range(&self, _range: GuestRange) -> bool {
+        false
+    }
+
+    /// Whether the GPU command path may consume this guest range.
+    fn is_gpu_visible_range(&self, _range: GuestRange) -> bool {
+        false
+    }
 
     /// Atomic 32-bit load used for guest synchronization words. The default
     /// is suitable for single-threaded test memories; native runtimes must
@@ -117,6 +152,154 @@ pub trait GuestMemory {
     /// Atomic 32-bit store used to complete or roll back guest callbacks.
     fn atomic_store_u32(&self, guest_addr: u64, value: u32) -> bool {
         self.write(guest_addr, &value.to_le_bytes())
+    }
+}
+
+/// An untrusted address received from guest registers or memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GuestAddress(u64);
+
+impl GuestAddress {
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// A checked-for-overflow address/length pair. This is still untrusted until
+/// converted into one of the capability types below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GuestRange {
+    start: GuestAddress,
+    len: u64,
+}
+
+impl GuestRange {
+    #[must_use]
+    pub fn new(start: GuestAddress, len: u64) -> Option<Self> {
+        start.raw().checked_add(len)?;
+        Some(Self { start, len })
+    }
+
+    #[must_use]
+    pub const fn start(self) -> GuestAddress {
+        self.start
+    }
+
+    #[must_use]
+    pub const fn len(self) -> u64 {
+        self.len
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    #[must_use]
+    pub fn end(self) -> Option<u64> {
+        self.start.raw().checked_add(self.len)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestAccess {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+/// Proof that `memory` accepted a complete range for a specific access mode.
+/// Construction is private to the validating API, so downstream code cannot
+/// accidentally relabel a raw integer as mapped guest memory.
+pub struct ValidatedGuestRange<'a> {
+    memory: &'a dyn GuestMemory,
+    range: GuestRange,
+    access: GuestAccess,
+}
+
+impl<'a> ValidatedGuestRange<'a> {
+    #[must_use]
+    pub fn validate(
+        memory: &'a dyn GuestMemory,
+        range: GuestRange,
+        access: GuestAccess,
+    ) -> Option<Self> {
+        memory.validate_range(range, access).then_some(Self {
+            memory,
+            range,
+            access,
+        })
+    }
+
+    #[must_use]
+    pub const fn range(&self) -> GuestRange {
+        self.range
+    }
+
+    #[must_use]
+    pub const fn access(&self) -> GuestAccess {
+        self.access
+    }
+
+    pub fn read(&self, out: &mut [u8]) -> bool {
+        out.len() as u64 == self.range.len()
+            && self.access != GuestAccess::Write
+            && self.memory.read(self.range.start().raw(), out)
+    }
+
+    pub fn write(&self, data: &[u8]) -> bool {
+        data.len() as u64 == self.range.len()
+            && self.access != GuestAccess::Read
+            && self.memory.write(self.range.start().raw(), data)
+    }
+}
+
+/// Validated executable mapping. Used for guest entries/callbacks, not ordinary
+/// data ranges.
+pub struct ExecutableGuestMapping<'a>(ValidatedGuestRange<'a>);
+
+impl<'a> ExecutableGuestMapping<'a> {
+    #[must_use]
+    pub fn validate(memory: &'a dyn GuestMemory, range: GuestRange) -> Option<Self> {
+        memory
+            .is_executable_range(range)
+            .then(|| Self(ValidatedGuestRange {
+                memory,
+                range,
+                access: GuestAccess::Read,
+            }))
+    }
+
+    #[must_use]
+    pub const fn range(&self) -> GuestRange {
+        self.0.range()
+    }
+}
+
+/// Validated guest memory that may be consumed by the GPU submission path.
+pub struct GpuVisibleGuestRange<'a>(ValidatedGuestRange<'a>);
+
+impl<'a> GpuVisibleGuestRange<'a> {
+    #[must_use]
+    pub fn validate(memory: &'a dyn GuestMemory, range: GuestRange) -> Option<Self> {
+        memory
+            .is_gpu_visible_range(range)
+            .then(|| Self(ValidatedGuestRange {
+                memory,
+                range,
+                access: GuestAccess::ReadWrite,
+            }))
+    }
+
+    #[must_use]
+    pub const fn range(&self) -> GuestRange {
+        self.0.range()
     }
 }
 
@@ -249,6 +432,11 @@ pub trait GuestThreadScheduler {
 pub struct HleContext<'a> {
     /// The live emulated kernel (memory manager, thread manager, VFS, ...).
     pub kernel: &'a xps5x_kernel::OrbisKernel,
+    /// XPS5X-owned service contracts. New HLE code should translate the ABI
+    /// and call these interfaces instead of reaching into kernel fields.
+    pub services: &'a dyn KernelSubsystems,
+    /// Process-owned GPU submission boundary. No Kyty type crosses this seam.
+    pub gpu: &'a dyn GpuSubmissionSubsystem,
     /// The guest's address space, as seen from wherever this call
     /// originated (e.g. the runtime's mapped module image).
     pub mem: &'a dyn GuestMemory,
@@ -430,7 +618,31 @@ impl HleRegistry {
         let key = format!("{}::{}", library, function);
         if let Some(func) = self.functions.get(&key) {
             debug!("HLE call: {}({:?})", key, args);
-            Some(func(ctx, args))
+            let thread = ctx.guest_threads.current_thread();
+            if ctx.kernel.diagnostics.is_enabled() {
+                let detail = args
+                    .iter()
+                    .take(14)
+                    .map(|arg| format!("{arg:#x}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                ctx.kernel.diagnostics.record(
+                    thread,
+                    DiagnosticKind::HleEnter,
+                    &key,
+                    ctx.caller_return_addr,
+                    detail,
+                );
+            }
+            let result = func(ctx, args);
+            ctx.kernel.diagnostics.record(
+                thread,
+                DiagnosticKind::HleExit,
+                &key,
+                ctx.caller_return_addr,
+                format!("return={result:#x}"),
+            );
+            Some(result)
         } else {
             warn!("HLE: unimplemented function {}", key);
             None
@@ -556,6 +768,21 @@ impl GuestMemory for TestMemory {
         buf[addr..end].copy_from_slice(data);
         true
     }
+
+    fn validate_range(&self, range: GuestRange, _access: GuestAccess) -> bool {
+        range
+            .end()
+            .and_then(|end| usize::try_from(end).ok())
+            .is_some_and(|end| end <= self.0.borrow().len())
+    }
+
+    fn is_executable_range(&self, range: GuestRange) -> bool {
+        !range.is_empty() && self.validate_range(range, GuestAccess::Read)
+    }
+
+    fn is_gpu_visible_range(&self, range: GuestRange) -> bool {
+        self.validate_range(range, GuestAccess::ReadWrite)
+    }
 }
 
 #[cfg(test)]
@@ -657,9 +884,20 @@ pub(crate) fn test_ctx<'a>(
         }
     }
     static NO_GUEST_THREADS: NoGuestThreads = NoGuestThreads;
+    struct NoGpu;
+    impl GpuSubmissionSubsystem for NoGpu {
+        fn submit(&self, _words: Vec<u32>, _queue: xps5x_core::subsystems::GpuQueue) {}
+        fn wait_idle(&self) {}
+        fn stats(&self) -> xps5x_core::subsystems::GpuSubmissionStats {
+            xps5x_core::subsystems::GpuSubmissionStats::default()
+        }
+    }
+    static NO_GPU: NoGpu = NoGpu;
 
     HleContext {
         kernel,
+        services: kernel,
+        gpu: &NO_GPU,
         mem,
         alloc,
         guest_calls: &NO_GUEST_CALLS,
@@ -672,6 +910,27 @@ pub(crate) fn test_ctx<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_memory_capabilities_reject_overflow_and_out_of_bounds_ranges() {
+        let memory = TestMemory::new(0x100);
+        assert!(GuestRange::new(GuestAddress::new(u64::MAX), 2).is_none());
+
+        let mapped = GuestRange::new(GuestAddress::new(0x20), 4).unwrap();
+        let validated =
+            ValidatedGuestRange::validate(&memory, mapped, GuestAccess::ReadWrite).unwrap();
+        assert!(validated.write(&[1, 2, 3, 4]));
+        let mut bytes = [0u8; 4];
+        assert!(validated.read(&mut bytes));
+        assert_eq!(bytes, [1, 2, 3, 4]);
+        assert!(ExecutableGuestMapping::validate(&memory, mapped).is_some());
+        assert!(GpuVisibleGuestRange::validate(&memory, mapped).is_some());
+
+        let outside = GuestRange::new(GuestAddress::new(0xFF), 2).unwrap();
+        assert!(ValidatedGuestRange::validate(&memory, outside, GuestAccess::Read).is_none());
+        assert!(ExecutableGuestMapping::validate(&memory, outside).is_none());
+        assert!(GpuVisibleGuestRange::validate(&memory, outside).is_none());
+    }
 
     #[test]
     fn registered_names_splits_library_and_function() {

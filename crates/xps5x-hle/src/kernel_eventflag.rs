@@ -15,6 +15,7 @@
 
 use crate::{HleContext, HleRegistry};
 use tracing::debug;
+use xps5x_core::subsystems::{EventUpdate, WaitKey, WaitOutcome, WakeReason};
 
 const OK: u64 = 0;
 // SCE kernel error codes (`0x8002_0000 | errno`).
@@ -89,9 +90,9 @@ fn hle_create(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_EINVAL; // no NUL within 32 bytes → too long
     }
 
-    let handle = ctx.kernel.create_event_flag(attr, initial);
+    let handle = ctx.services.create_event(attr, initial);
     if !ctx.mem.write(out, &handle.to_le_bytes()) {
-        ctx.kernel.kernel_event_flags.remove(&handle);
+        ctx.services.delete_event(handle);
         return SCE_KERNEL_ERROR_EFAULT;
     }
     debug!("sceKernelCreateEventFlag -> handle {handle:#x} attr {attr:#x} bits {initial:#x}");
@@ -101,9 +102,17 @@ fn hle_create(ctx: &HleContext, args: &[u64]) -> u64 {
 /// `sceKernelDeleteEventFlag(handle)`.
 fn hle_delete(ctx: &HleContext, args: &[u64]) -> u64 {
     let handle = args.first().copied().unwrap_or(0);
-    if ctx.kernel.kernel_event_flags.remove(&handle).is_none() {
+    if !ctx.services.delete_event(handle) {
         return SCE_KERNEL_ERROR_ESRCH;
     }
+    ctx.services.wake(
+        WaitKey {
+            class: "event-flag",
+            object: handle,
+            guest_thread: ctx.guest_threads.current_thread(),
+        },
+        WakeReason::Deleted,
+    );
     OK
 }
 
@@ -112,14 +121,17 @@ fn hle_delete(ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_set(ctx: &HleContext, args: &[u64]) -> u64 {
     let handle = args.first().copied().unwrap_or(0);
     let pattern = args.get(1).copied().unwrap_or(0);
-    let Some(mut ef) = ctx.kernel.kernel_event_flags.get_mut(&handle) else {
+    if ctx.services.update_event(handle, EventUpdate::Set(pattern)).is_none() {
         return SCE_KERNEL_ERROR_ESRCH;
-    };
-    ef.bits |= pattern;
-    drop(ef);
-    let (lock, cvar) = &ctx.kernel.event_flag_signal;
-    let _guard = lock.lock().unwrap();
-    cvar.notify_all();
+    }
+    ctx.services.wake(
+        WaitKey {
+            class: "event-flag",
+            object: handle,
+            guest_thread: ctx.guest_threads.current_thread(),
+        },
+        WakeReason::Set,
+    );
     OK
 }
 
@@ -128,14 +140,17 @@ fn hle_set(ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_clear(ctx: &HleContext, args: &[u64]) -> u64 {
     let handle = args.first().copied().unwrap_or(0);
     let pattern = args.get(1).copied().unwrap_or(0);
-    let Some(mut ef) = ctx.kernel.kernel_event_flags.get_mut(&handle) else {
+    if ctx.services.update_event(handle, EventUpdate::Keep(pattern)).is_none() {
         return SCE_KERNEL_ERROR_ESRCH;
-    };
-    ef.bits &= pattern;
-    drop(ef);
-    let (lock, cvar) = &ctx.kernel.event_flag_signal;
-    let _guard = lock.lock().unwrap();
-    cvar.notify_all();
+    }
+    ctx.services.wake(
+        WaitKey {
+            class: "event-flag",
+            object: handle,
+            guest_thread: ctx.guest_threads.current_thread(),
+        },
+        WakeReason::Clear,
+    );
     OK
 }
 
@@ -212,30 +227,45 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
         }
         Some(u64::from_le_bytes(raw))
     };
-    let deadline = std::time::Instant::now()
-        + requested_us.map_or_else(
-            || std::time::Duration::from_millis(50),
-            |us| std::time::Duration::from_micros(us.min(50_000)),
-        );
-
-    let (lock, cvar) = &ctx.kernel.event_flag_signal;
-    let mut guard = lock.lock().unwrap();
-    loop {
-        let mut ef = ctx.kernel.kernel_event_flags.get_mut(&handle).unwrap();
+    let timeout = requested_us.map_or_else(
+        || std::time::Duration::from_millis(50),
+        |us| std::time::Duration::from_micros(us.min(50_000)),
+    );
+    let mut write_failed = false;
+    let mut deleted = false;
+    let mut ready = || {
+        let Some(mut ef) = ctx.kernel.kernel_event_flags.get_mut(&handle) else {
+            deleted = true;
+            return true;
+        };
         if result_ptr != 0 && !ctx.mem.write(result_ptr, &ef.bits.to_le_bytes()) {
-            return SCE_KERNEL_ERROR_EFAULT;
+            write_failed = true;
+            return true;
         }
         if is_satisfied(ef.bits, pattern, mode) {
             apply_clear(&mut ef.bits, pattern, mode);
-            return OK;
+            return true;
         }
-        drop(ef);
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return SCE_KERNEL_ERROR_ETIMEDOUT;
-        }
-        let (g, _timeout) = cvar.wait_timeout(guard, remaining).unwrap();
-        guard = g;
+        false
+    };
+    let outcome = ctx.services.wait_until(
+        WaitKey {
+            class: "event-flag",
+            object: handle,
+            guest_thread: ctx.guest_threads.current_thread(),
+        },
+        timeout,
+        &|| ctx.guest_threads.process_is_terminating(),
+        &mut ready,
+    );
+    if write_failed {
+        SCE_KERNEL_ERROR_EFAULT
+    } else if deleted {
+        SCE_KERNEL_ERROR_ESRCH
+    } else if outcome == WaitOutcome::Ready {
+        OK
+    } else {
+        SCE_KERNEL_ERROR_ETIMEDOUT
     }
 }
 
@@ -245,17 +275,21 @@ fn hle_cancel(ctx: &HleContext, args: &[u64]) -> u64 {
     let handle = args.first().copied().unwrap_or(0);
     let set_pattern = args.get(1).copied().unwrap_or(0);
     let waiter_out = args.get(2).copied().unwrap_or(0);
-    let Some(mut ef) = ctx.kernel.kernel_event_flags.get_mut(&handle) else {
+    if ctx.services.event_bits(handle).is_none() {
         return SCE_KERNEL_ERROR_ESRCH;
-    };
+    }
     if waiter_out != 0 && !ctx.mem.write(waiter_out, &0u32.to_le_bytes()) {
         return SCE_KERNEL_ERROR_EFAULT;
     }
-    ef.bits = set_pattern;
-    drop(ef);
-    let (lock, cvar) = &ctx.kernel.event_flag_signal;
-    let _guard = lock.lock().unwrap();
-    cvar.notify_all();
+    ctx.services.update_event(handle, EventUpdate::Replace(set_pattern));
+    ctx.services.wake(
+        WaitKey {
+            class: "event-flag",
+            object: handle,
+            guest_thread: ctx.guest_threads.current_thread(),
+        },
+        WakeReason::Cancel,
+    );
     OK
 }
 

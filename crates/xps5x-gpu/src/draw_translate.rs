@@ -29,7 +29,7 @@ use crate::vulkan::offscreen::{
     TextureBinding, TextureUpload, VertexAttributeData, VertexBufferData, render_draw,
 };
 use ash::vk;
-use kyty_graphics::hw_regs::{Context, Shader, UserConfig};
+use kyty_graphics::hw_regs::{ComputeShaderInfo, Context, Shader, UserConfig};
 use kyty_graphics::run::{DrawError, DrawSink, IndexedDraw};
 use kyty_graphics::shader::resources::{
     ShaderBindResources, ShaderPixelInputInfo, ShaderVertexInputInfo,
@@ -977,6 +977,17 @@ pub struct OffscreenDrawSink<'a> {
     pub last_draw_skip_reason: Option<String>,
     /// Most recent named skip reason from the compute-DISPATCH path.
     pub last_dispatch_skip_reason: Option<String>,
+    /// True when this sink is draining the ACB (async-compute) queue rather than
+    /// the graphics DCB. Diagnostic only — surfaced in the dispatch skip trace so
+    /// a zeroed-shader dispatch can be attributed to the right queue.
+    pub queue_is_compute: bool,
+    /// The last compute shader bound on EITHER queue, carried across submissions.
+    /// The title binds its compute shader on the graphics DCB and dispatches it
+    /// on the async-compute ACB, whose submissions are dispatch-only (no bind);
+    /// a dispatch that arrives with a null `cs` falls back to this. Seeded from
+    /// the session before a submission runs and read back after, so it persists
+    /// across the per-submission sink lifetime.
+    pub current_compute: Option<ComputeShaderInfo>,
 }
 
 impl<'a> OffscreenDrawSink<'a> {
@@ -998,11 +1009,36 @@ impl<'a> OffscreenDrawSink<'a> {
             dispatches: 0,
             last_draw_skip_reason: None,
             last_dispatch_skip_reason: None,
+            queue_is_compute: false,
+            current_compute: None,
         }
     }
 }
 
 impl OffscreenDrawSink<'_> {
+    /// Choose the compute shader for a dispatch, applying cross-queue seeding.
+    ///
+    /// The title binds its compute shader on the graphics DCB and dispatches it
+    /// on the asynchronous-compute ACB ring, whose command buffers are
+    /// dispatch-only — so an ACB dispatch reaches us with a null `cs`. A dispatch
+    /// that carries a real shader (`data_addr != 0`) is used as-is and recorded
+    /// in `current`; a dispatch with a null shader falls back to `current` (the
+    /// last shader bound on either queue). With nothing recorded yet, the null
+    /// shader passes through unchanged and the dispatch skips as before.
+    fn seed_compute(
+        sh_cs: &ComputeShaderInfo,
+        current: &mut Option<ComputeShaderInfo>,
+    ) -> ComputeShaderInfo {
+        if sh_cs.cs_regs.data_addr != 0 {
+            *current = Some(*sh_cs);
+            *sh_cs
+        } else if let Some(seeded) = *current {
+            seeded
+        } else {
+            *sh_cs
+        }
+    }
+
     /// The body shared by the auto and indexed draw paths.
     ///
     /// `index` is `None` for a vertex-order draw and `Some((bytes, type))` for
@@ -1184,13 +1220,28 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 "unsupported compute dispatch initiator {mode:#x}"
             )));
         }
-        let translated = match self.cache.translate_cs(&sh.cs, &ctx.sh_regs) {
+        // Cross-queue compute-shader seeding (see `seed_compute`): substitute the
+        // last shader bound on either queue when this dispatch carries none, so
+        // dispatch-only ACB buffers translate against the shader the title bound
+        // on the DCB instead of skipping on a null address.
+        let cs = Self::seed_compute(&sh.cs, &mut self.current_compute);
+        let translated = match self.cache.translate_cs(&cs, &ctx.sh_regs) {
             Ok(shader) => shader,
             Err(error) => {
                 self.shader_skips += 1;
                 self.dispatch_skips += 1;
                 self.last_dispatch_skip_reason = Some(error.to_string());
-                debug!(reason = %error, "compute dispatch skipped: bound shader is untranslatable");
+                let r = &cs.cs_regs;
+                debug!(
+                    reason = %error,
+                    queue = if self.queue_is_compute { "ACB" } else { "DCB" },
+                    cs_addr = format_args!("{:#x}", r.data_addr),
+                    groups = format_args!("{}x{}x{}", groups[0], groups[1], groups[2]),
+                    threads = format_args!("{}x{}x{}", r.num_thread_x, r.num_thread_y, r.num_thread_z),
+                    user_sgpr = r.user_sgpr,
+                    mode = format_args!("{mode:#x}"),
+                    "compute dispatch skipped: bound shader is untranslatable"
+                );
                 return Ok(());
             }
         };
@@ -1261,7 +1312,45 @@ impl DrawSink for OffscreenDrawSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kyty_graphics::hw_regs::ColorAttrib2;
+    use kyty_graphics::hw_regs::{ColorAttrib2, ComputeShaderInfo};
+
+    /// Cross-queue compute-shader seeding: a dispatch-only ACB dispatch (null
+    /// shader) must fall back to the last shader bound on either queue, so the
+    /// title's compute work — bound on the DCB, dispatched on the ACB — reaches
+    /// translation instead of skipping on a null address. Recovered ASTRO.BOT's
+    /// zeroed ACB dispatches (measured 516 → 9).
+    #[test]
+    fn cross_queue_compute_seeding_falls_back_to_last_bound() {
+        let mut cs = |addr: u64| {
+            let mut c = ComputeShaderInfo::default();
+            c.cs_regs.data_addr = addr;
+            c
+        };
+        let mut current = None;
+
+        // A bound (non-null) dispatch is used as-is and recorded.
+        let chosen = OffscreenDrawSink::seed_compute(&cs(0x500a00), &mut current);
+        assert_eq!(chosen.cs_regs.data_addr, 0x500a00);
+        assert_eq!(current.unwrap().cs_regs.data_addr, 0x500a00);
+
+        // A null (dispatch-only ACB) dispatch falls back to the recorded shader.
+        let chosen = OffscreenDrawSink::seed_compute(&cs(0), &mut current);
+        assert_eq!(
+            chosen.cs_regs.data_addr, 0x500a00,
+            "null dispatch must reuse the last bound compute shader"
+        );
+
+        // A later bind updates what a subsequent null dispatch falls back to.
+        OffscreenDrawSink::seed_compute(&cs(0x500b00), &mut current);
+        let chosen = OffscreenDrawSink::seed_compute(&cs(0), &mut current);
+        assert_eq!(chosen.cs_regs.data_addr, 0x500b00);
+
+        // With nothing recorded, a null dispatch stays null (skips as before).
+        let mut empty = None;
+        let chosen = OffscreenDrawSink::seed_compute(&cs(0), &mut empty);
+        assert_eq!(chosen.cs_regs.data_addr, 0);
+        assert!(empty.is_none());
+    }
 
     /// Registers describing a valid 96x48 RGBA target, left-half scissor.
     fn ctx_96x48() -> Context {

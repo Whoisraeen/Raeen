@@ -1,5 +1,17 @@
 # XPS5X session progress ledger
 
+- Architectural consolidation (2026-07-18, commit pending): XPS5X-owned
+  time/wait/event/VFS/network/GPU-submission contracts are active on the HLE
+  boot path; deterministic process diagnostics sequence HLE, wait/wake, event,
+  guest-task ownership, and GPU submission; guest memory now exposes validated,
+  executable, and GPU-visible capability types; `GuestProcess` explicitly owns
+  the active GPU session and drains it before unmapping guest memory; public
+  shader metadata no longer re-exports Kyty types; module resolution adds
+  strict `HleOnly`/`LleOnly` beside the existing HLE-first default and
+  title-supplied LLE preference. Tests: core 6/6, kernel 20/20, firmware 99/99
+  + integration 9/9, HLE 271/271, runtime 86/86, GPU 117/117 + Vulkan
+  integration 9/9, GUI 120/120 (GPU teardown test rerun pending).
+
 (Recreated 2026-07-16 — the previous ledger file was absent from the tree;
 per-module authority is `docs/reference-port-ledger.md`.)
 

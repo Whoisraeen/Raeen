@@ -26,6 +26,7 @@
 pub mod agc;
 pub mod agc_exec;
 pub mod backend;
+pub mod contracts;
 pub mod draw_translate;
 pub mod gnm;
 pub mod guest_mem;
@@ -38,9 +39,9 @@ pub mod vulkan;
 
 #[allow(deprecated)]
 pub use agc_exec::build_m2_draw_dcb;
-pub use agc_exec::{AgcGpuSession, ScissorHalf, build_cp_draw_dcb};
+pub use agc_exec::{AgcGpuSession, GpuProcessSession, ScissorHalf, build_cp_draw_dcb};
 pub use backend::{BackendKind, GpuBackend, ShaderFormat, create_backend, default_backend_kind};
 pub use draw_translate::{OffscreenDrawSink, draw_state_from_regs};
 pub use guest_mem::IdentityGuestMemory;
-pub use kyty_graphics::shader::{ShaderMappedData, ShaderSemantic, ShaderSharp, ShaderUserData};
+pub use contracts::{ShaderMappedData, ShaderSemantic, ShaderSharp, ShaderUserData};
 pub use shader_fetch::{ShaderCacheStats, ShaderTranslateCache, TranslatedShader};

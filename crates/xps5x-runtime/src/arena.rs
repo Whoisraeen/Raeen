@@ -45,7 +45,7 @@ use windows_sys::Win32::System::Memory::{
     VirtualProtect, VirtualQuery,
 };
 
-use xps5x_hle::{GuestAllocator, GuestMemory};
+use xps5x_hle::{GuestAccess, GuestAllocator, GuestMemory, GuestRange};
 
 use crate::vmm::{Vma, VmaMap, VmaType, prot};
 use crate::{GUEST_ARENA_BASE, RuntimeError};
@@ -1153,6 +1153,29 @@ impl GuestMemory for GuestArena {
             core::ptr::copy_nonoverlapping(data.as_ptr(), guest_addr as *mut u8, data.len());
         }
         true
+    }
+
+    fn validate_range(&self, range: GuestRange, _access: GuestAccess) -> bool {
+        let Some(end) = range.end() else {
+            return false;
+        };
+        self.range_is_committed(range.start().raw(), end)
+    }
+
+    fn is_executable_range(&self, range: GuestRange) -> bool {
+        let Some(end) = range.end() else {
+            return false;
+        };
+        !range.is_empty()
+            && range.start().raw() >= self.base
+            && end <= self.base.saturating_add(self.image_len)
+    }
+
+    fn is_gpu_visible_range(&self, range: GuestRange) -> bool {
+        let Some(end) = range.end() else {
+            return false;
+        };
+        self.range_is_committed(range.start().raw(), end)
     }
 
     fn atomic_load_u32(&self, guest_addr: u64) -> Option<u32> {

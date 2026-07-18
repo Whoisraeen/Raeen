@@ -21,8 +21,9 @@ use crate::draw_translate::OffscreenDrawSink;
 use crate::vulkan::{RenderedImage, VulkanBackend};
 use kyty_graphics::pm4;
 use kyty_graphics::run::{CommandProcessor, CpError};
-use parking_lot::Mutex;
-use std::sync::OnceLock;
+use parking_lot::{Mutex, RwLock};
+use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use tracing::{debug, warn};
 use xps5x_core::error::GpuError;
@@ -52,19 +53,32 @@ pub enum AgcExecError {
 /// when its ring buffer fills.
 const SUBMIT_QUEUE_DEPTH: usize = 8;
 
+enum GpuWork {
+    Submit(Vec<u32>, bool),
+    Shutdown,
+}
+
 /// Process-global session: lazy Vulkan bring-up + last rendered image.
 pub struct AgcGpuSession {
     /// DCBs handed to the GPU worker. Created on first submit; a single
     /// consumer keeps DCBs in submission order, which is required — register
     /// state carries across submissions, so reordering a state-only DCB past
     /// the draw DCB that depends on it renders with the wrong state.
-    submit_queue: OnceLock<std::sync::mpsc::SyncSender<Vec<u32>>>,
+    submit_queue: OnceLock<std::sync::mpsc::SyncSender<GpuWork>>,
     /// Submissions accepted but not yet executed, for [`AgcGpuSession::wait_idle`].
     in_flight: (Mutex<usize>, parking_lot::Condvar),
     backend: Mutex<Option<VulkanBackend>>,
     /// GPU register state persists across queue submissions. AGC commonly
     /// submits state-only DCBs before a later draw-only DCB.
     command_processor: Mutex<CommandProcessor>,
+    /// Separate command processor for the ACB (asynchronous compute) queue. On
+    /// hardware the ACE compute ring keeps its own register state, independent
+    /// of the graphics DCB. Sharing one CP let an ACB `R_DISPATCH_RESET` (a
+    /// compute-queue reset) zero the compute shader that graphics-DCB dispatches
+    /// depend on — measured on ASTRO.BOT: DCB compute dispatches reaching
+    /// translation collapsed from 1057 to 409 under a shared CP. Isolating the
+    /// queues keeps each one's resets from clobbering the other.
+    compute_command_processor: Mutex<CommandProcessor>,
     last_image: Mutex<Option<RenderedImage>>,
     draw_count: Mutex<u64>,
     /// ShaderMemory Phase 2: guest shader fetch+translate results, shared
@@ -82,6 +96,70 @@ pub struct AgcGpuSession {
     /// target with this base exists, it — not the last-drawn target — is what
     /// the Shell presents. `None` preserves the last-drawn baseline.
     scanout_address: Mutex<Option<u64>>,
+    /// Last compute shader bound on either queue, carried across submissions.
+    /// The title binds it on the graphics DCB and dispatches it on the ACB
+    /// (whose buffers are dispatch-only), so an ACB dispatch that arrives with a
+    /// null shader falls back to this. Seeded into the sink before a submission
+    /// and read back after (see `execute_dcb_cp`).
+    last_compute_shader: Mutex<Option<kyty_graphics::hw_regs::ComputeShaderInfo>>,
+    submission_count: AtomicU64,
+}
+
+/// Cloneable ownership handle for one guest process's GPU state. The Shell
+/// observes the installed handle, while the runtime owns another clone; Kyty's
+/// command processor remains private inside [`AgcGpuSession`].
+#[derive(Clone)]
+pub struct GpuProcessSession(Arc<AgcGpuSession>);
+
+impl std::ops::Deref for GpuProcessSession {
+    type Target = AgcGpuSession;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl GpuProcessSession {
+    #[must_use]
+    fn create() -> Self {
+        Self(Arc::new(AgcGpuSession::new()))
+    }
+
+    /// Asynchronously submit through this process's bounded, ordered queue.
+    pub fn submit_dcb_async(&self, words: Vec<u32>, is_compute: bool) {
+        AgcGpuSession::submit_dcb_async_owned(&self.0, words, is_compute);
+    }
+
+    /// Drain and stop this process's submission worker. The runtime calls this
+    /// before unmapping guest memory, so no queued PM4 work can retain guest
+    /// pointers past process teardown.
+    pub fn shutdown(&self) {
+        self.wait_idle();
+        if let Some(sender) = self.submit_queue.get() {
+            let _ = sender.send(GpuWork::Shutdown);
+        }
+    }
+}
+
+impl xps5x_core::subsystems::GpuSubmissionSubsystem for GpuProcessSession {
+    fn submit(&self, words: Vec<u32>, queue: xps5x_core::subsystems::GpuQueue) {
+        self.submit_dcb_async(
+            words,
+            matches!(queue, xps5x_core::subsystems::GpuQueue::AsyncCompute),
+        );
+    }
+
+    fn wait_idle(&self) {
+        AgcGpuSession::wait_idle(self);
+    }
+
+    fn stats(&self) -> xps5x_core::subsystems::GpuSubmissionStats {
+        xps5x_core::subsystems::GpuSubmissionStats {
+            submitted: self.submission_count.load(Ordering::Relaxed),
+            completed_draws: self.draw_count(),
+            skipped_shaders: self.shader_skip_count(),
+        }
+    }
 }
 
 impl AgcGpuSession {
@@ -91,19 +169,36 @@ impl AgcGpuSession {
             in_flight: (Mutex::new(0), parking_lot::Condvar::new()),
             backend: Mutex::new(None),
             command_processor: Mutex::new(CommandProcessor::new()),
+            compute_command_processor: Mutex::new(CommandProcessor::new()),
             last_image: Mutex::new(None),
             draw_count: Mutex::new(0),
             shader_cache: Mutex::new(crate::shader_fetch::ShaderTranslateCache::new()),
             shader_skip_count: Mutex::new(0),
             framebuffers: Mutex::new(std::collections::HashMap::new()),
             scanout_address: Mutex::new(None),
+            last_compute_shader: Mutex::new(None),
+            submission_count: AtomicU64::new(0),
         }
     }
 
-    /// Shared process-wide session (HLE submit + acceptance tests).
-    pub fn global() -> &'static AgcGpuSession {
-        static SESSION: OnceLock<AgcGpuSession> = OnceLock::new();
-        SESSION.get_or_init(AgcGpuSession::new)
+    /// Create isolated GPU state for a new guest process.
+    #[must_use]
+    pub fn new_process() -> GpuProcessSession {
+        GpuProcessSession::create()
+    }
+
+    /// Make `session` visible to Shell presentation without transferring the
+    /// runtime's ownership. A new launch replaces the observer handle and does
+    /// not inherit prior command-processor/register/framebuffer state.
+    pub fn install_process(session: &GpuProcessSession) {
+        *current_gpu_session().write() = session.clone();
+    }
+
+    /// Currently installed process session. Before the first launch this is a
+    /// clean bootstrap session used by GPU acceptance tests.
+    #[must_use]
+    pub fn global() -> GpuProcessSession {
+        current_gpu_session().read().clone()
     }
 
     /// How many PM4-triggered draws have completed successfully.
@@ -125,11 +220,11 @@ impl AgcGpuSession {
     pub fn map_shader_metadata(
         &self,
         code_address: u64,
-        data: kyty_graphics::shader::ShaderMappedData,
+        data: crate::contracts::ShaderMappedData,
     ) {
         self.shader_cache
             .lock()
-            .map_shader_metadata(code_address, data);
+            .map_shader_metadata(code_address, data.into());
     }
 
     /// Last image produced by a draw-bearing DCB, if any.
@@ -200,9 +295,20 @@ impl AgcGpuSession {
     /// [`AgcExecError::Cp`] if a packet is unknown/truncated or a draw's
     /// registers cannot be honoured (the error names the register), or
     /// [`AgcExecError::Gpu`] if Vulkan is unavailable.
-    pub fn execute_dcb_cp(&self, words: &[u32]) -> Result<Option<RenderedImage>, AgcExecError> {
+    pub fn execute_dcb_cp(
+        &self,
+        words: &[u32],
+        is_compute: bool,
+    ) -> Result<Option<RenderedImage>, AgcExecError> {
         let decoded = agc::decode_submission(words)?;
-        let mut cp = self.command_processor.lock();
+        // Route each queue to its own command processor: the async-compute (ACB)
+        // ring keeps register/shader state independent of the graphics DCB, so a
+        // reset on one queue can't zero the other's bound shader.
+        let mut cp = if is_compute {
+            self.compute_command_processor.lock()
+        } else {
+            self.command_processor.lock()
+        };
 
         // State-only DCBs are still real GPU work. Process them without
         // forcing Vulkan initialization so their register writes are latched
@@ -229,6 +335,11 @@ impl AgcGpuSession {
         let mut cache = self.shader_cache.lock();
         let mut framebuffers = self.framebuffers.lock();
         let mut sink = OffscreenDrawSink::new(device, &mut cache, &mut framebuffers);
+        sink.queue_is_compute = is_compute;
+        // Cross-queue compute-shader seeding: hand the sink the last compute
+        // shader bound on either queue so a dispatch-only ACB buffer can fall
+        // back to it (the title binds on the DCB, dispatches on the ACB).
+        sink.current_compute = *self.last_compute_shader.lock();
         // Indirect register/draw packets carry guest pointers; the identity
         // map makes them host-readable (VirtualQuery-validated).
         let run = cp.run_with_memory(
@@ -236,6 +347,10 @@ impl AgcGpuSession {
             &mut sink,
             Some(&crate::guest_mem::IdentityGuestMemory),
         );
+        // Carry any compute shader this submission observed forward to the next.
+        if let Some(cs) = sink.current_compute {
+            *self.last_compute_shader.lock() = Some(cs);
+        }
         let shader_state = cp.get_sh_ctx().clone();
 
         let drawn = sink.draws;
@@ -369,15 +484,22 @@ impl AgcGpuSession {
     /// this bounds the damage rather than removing it: a session that renders
     /// slower than the title submits will still stall the submitter, just at
     /// the ring's edge instead of on every single DCB.
-    pub fn submit_dcb_async(&'static self, words: Vec<u32>) {
+    fn submit_dcb_async_owned(self: &Arc<Self>, words: Vec<u32>, is_compute: bool) {
+        self.submission_count.fetch_add(1, Ordering::Relaxed);
         let tx = self.submit_queue.get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u32>>(SUBMIT_QUEUE_DEPTH);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<GpuWork>(SUBMIT_QUEUE_DEPTH);
+            let session = Arc::clone(self);
             let spawned = std::thread::Builder::new()
                 .name("xps5x-gpu".to_owned())
                 .spawn(move || {
-                    while let Ok(words) = rx.recv() {
-                        self.try_execute_dcb_cp(&words);
-                        self.finish_one();
+                    while let Ok(work) = rx.recv() {
+                        match work {
+                            GpuWork::Submit(words, is_compute) => {
+                                session.try_execute_dcb_cp(&words, is_compute);
+                                session.finish_one();
+                            }
+                            GpuWork::Shutdown => break,
+                        }
                     }
                 });
             if let Err(e) = &spawned {
@@ -389,8 +511,10 @@ impl AgcGpuSession {
         // A worker that never started (spawn failed) leaves the receiver
         // dropped, so `send` errors rather than blocking forever: fall back to
         // rendering inline, which is slow but keeps the title drawing.
-        if let Err(std::sync::mpsc::SendError(words)) = tx.send(words) {
-            self.try_execute_dcb_cp(&words);
+        if let Err(std::sync::mpsc::SendError(GpuWork::Submit(words, is_compute))) =
+            tx.send(GpuWork::Submit(words, is_compute))
+        {
+            self.try_execute_dcb_cp(&words, is_compute);
             self.finish_one();
         }
     }
@@ -417,8 +541,8 @@ impl AgcGpuSession {
         }
     }
 
-    pub fn try_execute_dcb_cp(&self, words: &[u32]) {
-        match self.execute_dcb_cp(words) {
+    pub fn try_execute_dcb_cp(&self, words: &[u32], is_compute: bool) {
+        match self.execute_dcb_cp(words, is_compute) {
             Ok(Some(image)) => debug!(
                 width = image.width,
                 height = image.height,
@@ -485,6 +609,11 @@ impl AgcGpuSession {
             Err(e) => warn!(error = %e, "AGC DCB draw skipped — Vulkan unavailable or failed"),
         }
     }
+}
+
+fn current_gpu_session() -> &'static RwLock<GpuProcessSession> {
+    static SESSION: OnceLock<RwLock<GpuProcessSession>> = OnceLock::new();
+    SESSION.get_or_init(|| RwLock::new(GpuProcessSession::create()))
 }
 
 /// A state-only submission must never reach a draw. The standalone decoder
@@ -694,6 +823,7 @@ pub fn build_cp_draw_dcb(width: u32, height: u32, half: ScissorHalf) -> Vec<u32>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xps5x_core::subsystems::GpuSubmissionSubsystem;
 
     /// A DCB that only writes registers: no draw and no dispatch, so
     /// `execute_dcb_cp` takes its state-only path and never brings up Vulkan.
@@ -722,10 +852,10 @@ mod tests {
     /// is what is under test here; rendering is covered by the M2 fixture.
     #[test]
     fn async_submit_drains_every_dcb_including_past_the_queue_depth() {
-        let session: &'static AgcGpuSession = Box::leak(Box::new(AgcGpuSession::new()));
+        let session = GpuProcessSession::create();
         let words = build_state_only_dcb();
         for _ in 0..SUBMIT_QUEUE_DEPTH * 3 {
-            session.submit_dcb_async(words.clone());
+            session.submit_dcb_async(words.clone(), false);
         }
         session.wait_idle();
         assert_eq!(
@@ -733,6 +863,21 @@ mod tests {
             0,
             "wait_idle returned with DCBs still in flight"
         );
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_new_process_gets_fresh_gpu_submission_and_register_state() {
+        let first = AgcGpuSession::new_process();
+        first.submit_dcb_async(build_state_only_dcb(), false);
+        first.wait_idle();
+        assert_eq!(first.stats().submitted, 1);
+        first.shutdown();
+
+        let second = AgcGpuSession::new_process();
+        AgcGpuSession::install_process(&second);
+        assert_eq!(second.stats(), xps5x_core::subsystems::GpuSubmissionStats::default());
+        assert_eq!(AgcGpuSession::global().stats().submitted, 0);
     }
 
     /// The present-routing contract: a title composites into several render
@@ -881,13 +1026,13 @@ mod tests {
         );
 
         let session = AgcGpuSession::new();
-        match session.execute_dcb_cp(state_only) {
+        match session.execute_dcb_cp(state_only, false) {
             Ok(None) => {}
             Err(AgcExecError::Gpu(_)) => return, // Vulkan-less CI host.
             other => panic!("state-only submit should not draw: {other:?}"),
         }
         let image = session
-            .execute_dcb_cp(draw_only)
+            .execute_dcb_cp(draw_only, false)
             .expect("draw-only DCB must inherit the setup DCB")
             .expect("persistent state reaches a real draw");
         assert_eq!((image.width, image.height), (96, 48));

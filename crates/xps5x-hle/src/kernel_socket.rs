@@ -62,7 +62,7 @@ const EWOULDBLOCK: i32 = 35;
 /// can ever connect, so a listening socket simply never becomes ready.
 fn hle_listen(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
-    if !ctx.kernel.kernel_sockets.contains_key(&fd) {
+    if !ctx.services.socket_exists(fd) {
         return MINUS_ONE;
     }
     debug!("listen(fd={fd:#x}) -> OK (offline: no peer can ever connect)");
@@ -74,7 +74,7 @@ fn hle_listen(ctx: &HleContext, args: &[u64]) -> u64 {
 /// an empty backlog rather than blocking a guest thread forever.
 fn hle_accept(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
-    if !ctx.kernel.kernel_sockets.contains_key(&fd) {
+    if !ctx.services.socket_exists(fd) {
         return MINUS_ONE;
     }
     debug!("accept(fd={fd:#x}) -> EWOULDBLOCK (offline)");
@@ -87,7 +87,7 @@ fn hle_accept(ctx: &HleContext, args: &[u64]) -> u64 {
 /// never a blocking wait that nothing can satisfy.
 fn hle_recv(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
-    if !ctx.kernel.kernel_sockets.contains_key(&fd) {
+    if !ctx.services.socket_exists(fd) {
         return MINUS_ONE;
     }
     debug!("recv/recvfrom(fd={fd:#x}) -> EWOULDBLOCK (offline)");
@@ -103,7 +103,7 @@ fn hle_send(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
     let buf = args.get(1).copied().unwrap_or(0);
     let len = args.get(2).copied().unwrap_or(0);
-    if !ctx.kernel.kernel_sockets.contains_key(&fd) {
+    if !ctx.services.socket_exists(fd) {
         return MINUS_ONE;
     }
     // Bounded validation read: confirm the payload is real guest memory.
@@ -125,7 +125,7 @@ fn hle_send(ctx: &HleContext, args: &[u64]) -> u64 {
 /// shut; accept the call.
 fn hle_shutdown(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
-    if !ctx.kernel.kernel_sockets.contains_key(&fd) {
+    if !ctx.services.socket_exists(fd) {
         return MINUS_ONE;
     }
     debug!("shutdown(fd={fd:#x}) -> OK (offline)");
@@ -139,7 +139,7 @@ fn hle_getpeername(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
     let sockaddr = args.get(1).copied().unwrap_or(0);
     let addrlen_ptr = args.get(2).copied().unwrap_or(0);
-    if !ctx.kernel.kernel_sockets.contains_key(&fd) {
+    if !ctx.services.socket_exists(fd) {
         return MINUS_ONE;
     }
     let mut lenbuf = [0u8; 4];
@@ -171,7 +171,7 @@ fn hle_getsockopt(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
     let optval = args.get(3).copied().unwrap_or(0);
     let optlen_ptr = args.get(4).copied().unwrap_or(0);
-    if !ctx.kernel.kernel_sockets.contains_key(&fd) {
+    if !ctx.services.socket_exists(fd) {
         return MINUS_ONE;
     }
     let mut lenbuf = [0u8; 4];
@@ -222,7 +222,8 @@ fn hle_select(ctx: &HleContext, args: &[u64]) -> u64 {
         }
     }
     if sleep_ms > 0 && !ctx.guest_threads.process_is_terminating() {
-        std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+        ctx.services
+            .sleep(std::time::Duration::from_millis(sleep_ms));
     }
     debug!("select(nfds={nfds}) -> 0 ready (offline; slept {sleep_ms}ms)");
     0
@@ -230,7 +231,7 @@ fn hle_select(ctx: &HleContext, args: &[u64]) -> u64 {
 
 /// `socket(domain, type, protocol)`: hand back a fresh offline socket fd.
 fn hle_socket(ctx: &HleContext, _args: &[u64]) -> u64 {
-    let fd = ctx.kernel.create_socket();
+    let fd = ctx.services.create_socket();
     debug!("socket() -> offline fd {fd:#x}");
     fd as u32 as u64
 }
@@ -276,7 +277,7 @@ fn hle_bind(ctx: &HleContext, args: &[u64]) -> u64 {
 /// `connect(fd, sockaddr, addrlen)`: always fails — no host connectivity.
 fn hle_connect(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
-    if !ctx.kernel.kernel_sockets.contains_key(&fd) {
+    if !ctx.services.socket_exists(fd) {
         return MINUS_ONE;
     }
     debug!("connect(fd={fd:#x}) -> refused (offline)");
@@ -290,7 +291,7 @@ fn hle_setsockopt(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
     let value = args.get(3).copied().unwrap_or(0);
     let length = args.get(4).copied().unwrap_or(0);
-    if !ctx.kernel.kernel_sockets.contains_key(&fd) || length > 4096 {
+    if !ctx.services.socket_exists(fd) || length > 4096 {
         return MINUS_ONE;
     }
     if length != 0 {

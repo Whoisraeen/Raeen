@@ -538,7 +538,12 @@ fn shader_parse_sop1(
         0x25 => return Err(ni(dst, S, "s_or_saveexec_b64", opcode, pc, b0)),
         0x26 => return Err(ni(dst, S, "s_xor_saveexec_b64", opcode, pc, b0)),
         0x27 => return Err(ni(dst, S, "s_andn2_saveexec_b64", opcode, pc, b0)),
-        0x28 => return Err(ni(dst, S, "s_orn2_saveexec_b64", opcode, pc, b0)),
+        0x28 => {
+            inst.type_ = T::SOrn2SaveexecB64;
+            inst.format = F::Sdst2Ssrc02;
+            inst.dst.size = 2;
+            inst.src[0].size = 2;
+        }
         0x29 => return Err(ni(dst, S, "s_nand_saveexec_b64", opcode, pc, b0)),
         0x2a => return Err(ni(dst, S, "s_nor_saveexec_b64", opcode, pc, b0)),
         0x2b => return Err(ni(dst, S, "s_xnor_saveexec_b64", opcode, pc, b0)),
@@ -1016,6 +1021,7 @@ fn shader_parse_vopc(
         0x11 => inst.type_ = T::VCmpxLtF32,
         0x14 => inst.type_ = T::VCmpxGtF32,
         0x1d => inst.type_ = T::VCmpxNeqF32,
+        0x1e => inst.type_ = T::VCmpxNltF32,
         0x80 => inst.type_ = T::VCmpFI32,
         0x81 => inst.type_ = T::VCmpLtI32,
         0x82 => inst.type_ = T::VCmpEqI32,
@@ -1148,7 +1154,7 @@ fn shader_parse_vop1(
         0x0a => return Err(ni(dst, S, "v_cvt_f16_f32", opcode, pc, b0)),
         0x0b => inst.type_ = T::VCvtF32F16,
         0x0c => return Err(ni(dst, S, "v_cvt_rpi_i32_f32", opcode, pc, b0)),
-        0x0d => return Err(ni(dst, S, "v_cvt_flr_i32_f32", opcode, pc, b0)),
+        0x0d => inst.type_ = T::VCvtFlrI32F32,
         0x0e => return Err(ni(dst, S, "v_cvt_off_f32_i4", opcode, pc, b0)),
         0x0f => return Err(ni(dst, S, "v_cvt_f32_f64", opcode, pc, b0)),
         0x10 => return Err(ni(dst, S, "v_cvt_f64_f32", opcode, pc, b0)),
@@ -1656,6 +1662,7 @@ fn shader_parse_vop3(
         0x0e => inst.type_ = T::VCmpNltF32,
         0x0f => inst.type_ = T::VCmpTruF32,
         0x1d => inst.type_ = T::VCmpxNeqF32,
+        0x1e => inst.type_ = T::VCmpxNltF32,
         0x80 => inst.type_ = T::VCmpFI32,
         0x81 => inst.type_ = T::VCmpLtI32,
         0x82 => inst.type_ = T::VCmpEqI32,
@@ -2897,9 +2904,20 @@ fn shader_parse_mimg(
             inst.src[0].size = 3;
             inst.src[1].size = 8;
             inst.src_num = 2;
-            if dmask == 0xf {
-                inst.format = F::Vdata4Vaddr3StDmaskF;
-                inst.dst.size = 4;
+            match dmask {
+                0x1 => {
+                    inst.format = F::Vdata1Vaddr3StDmask1;
+                    inst.dst.size = 1;
+                }
+                0x7 => {
+                    inst.format = F::Vdata3Vaddr3StDmask7;
+                    inst.dst.size = 3;
+                }
+                0xf => {
+                    inst.format = F::Vdata4Vaddr3StDmaskF;
+                    inst.dst.size = 4;
+                }
+                _ => {}
             }
         }
         0x01 => return Err(ni(dst, S, "image_load_mip", opcode, pc, b0)),
@@ -2995,9 +3013,16 @@ fn shader_parse_mimg(
             inst.src[0].size = 3;
             inst.src[1].size = 8;
             inst.src[2].size = 4;
-            if dmask == 0x7 {
-                inst.format = F::Vdata3Vaddr3StSsDmask7;
-                inst.dst.size = 3;
+            match dmask {
+                0x7 => {
+                    inst.format = F::Vdata3Vaddr3StSsDmask7;
+                    inst.dst.size = 3;
+                }
+                0xf => {
+                    inst.format = F::Vdata4Vaddr3StSsDmaskF;
+                    inst.dst.size = 4;
+                }
+                _ => {}
             }
         }
         0x28 => return Err(ni(dst, S, "image_sample_c", opcode, pc, b0)),
@@ -4002,6 +4027,50 @@ mod tests {
                 pc: 0
             })
         );
+    }
+
+    #[test]
+    fn mimg_image_load_dmask_1_and_7() {
+        // image_load (opcode 0x00) with the partial dmasks ASTRO.BOT's scene
+        // compute shaders use; only dmask 0xf had a format before.
+        let (code, _) = parse_vs(&[0xF000_0100, 0x0061_0800, S_ENDPGM]);
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::ImageLoad);
+        assert_eq!(inst.format, F::Vdata1Vaddr3StDmask1);
+        assert_eq!(inst.dst.size, 1);
+        assert_eq!(inst.src_num, 2);
+        assert_eq!(inst.src[0].size, 3);
+        assert_eq!(inst.src[1].size, 8);
+
+        let (code, _) = parse_vs(&[0xF000_0700, 0x0061_0800, S_ENDPGM]);
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::ImageLoad);
+        assert_eq!(inst.format, F::Vdata3Vaddr3StDmask7);
+        assert_eq!(inst.dst.size, 3);
+    }
+
+    #[test]
+    fn mimg_image_sample_lz_dmask_f() {
+        // image_sample_lz (opcode 0x27) rgba — ASTRO.BOT's fullscreen
+        // composite samples its HDR scene buffers this way.
+        let (code, _) = parse_vs(&[0xF09C_0F00, 0x0061_0800, S_ENDPGM]);
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::ImageSampleLz);
+        assert_eq!(inst.format, F::Vdata4Vaddr3StSsDmaskF);
+        assert_eq!(inst.dst.size, 4);
+        assert_eq!(inst.src[2].size, 4, "S# still present on the lz form");
+    }
+
+    #[test]
+    fn sop1_s_orn2_saveexec_b64() {
+        // Measured ASTRO.BOT encoding 0xBE92287E: sdst=s[18:19], opcode 0x28,
+        // ssrc0=0x7e (exec). `sdst = exec; exec = ssrc0 | ~exec`.
+        let (code, _) = parse_vs(&[0xBE92_287E, S_ENDPGM]);
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SOrn2SaveexecB64);
+        assert_eq!(inst.format, F::Sdst2Ssrc02);
+        assert_eq!(inst.dst.size, 2);
+        assert_eq!(inst.src[0].size, 2);
     }
 
     #[test]

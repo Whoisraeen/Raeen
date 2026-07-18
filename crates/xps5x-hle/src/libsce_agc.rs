@@ -648,11 +648,17 @@ fn hle_dcb_set_base_indirect_args(ctx: &HleContext, args: &[u64]) -> u64 {
 /// sync/flip side effects, and (when the DCB contains draw packets) drive the
 /// M2 Vulkan offscreen path via [`xps5x_gpu::AgcGpuSession`].
 fn hle_driver_submit_dcb(ctx: &HleContext, args: &[u64]) -> u64 {
-    submit_validate(ctx, args.first().copied().unwrap_or(0))
+    submit_validate(ctx, args.first().copied().unwrap_or(0), "DCB")
 }
 
 fn hle_driver_submit_acb(ctx: &HleContext, args: &[u64]) -> u64 {
-    submit_validate(ctx, args.get(1).copied().unwrap_or(0))
+    // ACB = Asynchronous Compute Buffer (the ACE compute ring). On hardware this
+    // is a SEPARATE queue from the graphics DCB, with its own shader state — a
+    // graphics queue reset does not touch it. Diagnostic: count how much compute
+    // work arrives here vs the DCB, to decide whether the shared-CommandProcessor
+    // model (which lets a DCB reset clobber the compute shader) is the cause of
+    // the zeroed-shader dispatches. `owner` is args[0]; the packet is args[1].
+    submit_validate(ctx, args.get(1).copied().unwrap_or(0), "ACB")
 }
 
 /// `sceAgcDriverSubmitMultiDcbs(addressArray, sizeArray, bufferCount)`:
@@ -700,7 +706,11 @@ fn hle_driver_query_resource_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     0
 }
 
-fn submit_validate(ctx: &HleContext, packet: u64) -> u64 {
+/// Count of ACB (async-compute) submissions that carried dispatch packets —
+/// diagnostic for the shared-CommandProcessor question (see `hle_driver_submit_acb`).
+static ACB_DISPATCH_SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn submit_validate(ctx: &HleContext, packet: u64, queue: &'static str) -> u64 {
     if packet == 0 {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
@@ -782,11 +792,28 @@ fn submit_validate(ctx: &HleContext, packet: u64) -> u64 {
         .agc_flip_packet_count
         .fetch_add(decoded.flips.len() as u64, Ordering::Relaxed);
 
+    // Diagnostic: how much compute lands on the ACB (async-compute ring) vs the
+    // DCB. If dispatches arrive on the ACB, the shared-CommandProcessor model is
+    // wrong (a graphics DCB reset clobbers the ACB's compute shader state) and
+    // the fix is a separate CP / shader context per queue.
+    if queue == "ACB" && decoded.dispatch_packets != 0 {
+        let prior_acb = ACB_DISPATCH_SUBMITS.fetch_add(1, Ordering::Relaxed);
+        if prior_acb == 0 || (prior_acb + 1).is_power_of_two() {
+            tracing::warn!(
+                acb_dispatch_submits = prior_acb + 1,
+                dispatches = decoded.dispatch_packets,
+                draws = decoded.draw_packets,
+                "AGC ACB (async-compute) submission carries dispatches"
+            );
+        }
+    }
+
     if prior_submissions == 0
         || (prior_draws == 0 && decoded.draw_packets != 0)
         || (prior_flips == 0 && !decoded.flips.is_empty())
     {
         tracing::info!(
+            queue,
             command_address,
             dword_count,
             packets = decoded.packets.len(),
@@ -798,10 +825,11 @@ fn submit_validate(ctx: &HleContext, packet: u64) -> u64 {
             memory_writes = ?decoded.memory_writes,
             waits32 = ?decoded.waits32,
             events = ?decoded.events,
-            "captured AGC DCB submission"
+            "captured AGC submission"
         );
     } else if (prior_submissions + 1).is_power_of_two() {
         tracing::info!(
+            queue,
             submissions = prior_submissions + 1,
             total_draws = ctx.kernel.agc_draw_packet_count.load(Ordering::Relaxed),
             total_dispatches = ctx.kernel.agc_dispatch_packet_count.load(Ordering::Relaxed),
@@ -822,7 +850,19 @@ fn submit_validate(ctx: &HleContext, packet: u64) -> u64 {
     // Everything above this line is guest-visible side effects the title expects
     // to have happened when submit returns — the sync writes, the events, the
     // flips — and they stay on this thread. Only the rendering moves.
-    xps5x_gpu::AgcGpuSession::global().submit_dcb_async(words);
+    let gpu_queue = if queue == "ACB" {
+        xps5x_core::subsystems::GpuQueue::AsyncCompute
+    } else {
+        xps5x_core::subsystems::GpuQueue::Graphics
+    };
+    ctx.kernel.diagnostics.record(
+        ctx.guest_threads.current_thread(),
+        xps5x_core::diagnostics::DiagnosticKind::GpuSubmit,
+        queue,
+        command_address,
+        format!("dwords={dword_count}"),
+    );
+    ctx.gpu.submit(words, gpu_queue);
 
     0
 }

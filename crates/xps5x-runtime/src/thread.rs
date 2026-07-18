@@ -8,6 +8,9 @@ use std::thread::JoinHandle;
 use xps5x_firmware::LinkedModule;
 use xps5x_hle::{GuestAllocator, GuestMemory, GuestThreadScheduler, HleRegistry};
 use xps5x_kernel::OrbisKernel;
+use xps5x_core::diagnostics::DiagnosticKind;
+use xps5x_gpu::{AgcGpuSession, GpuProcessSession};
+use xps5x_core::subsystems::GpuSubmissionSubsystem;
 
 use crate::arena::GuestArena;
 use crate::dispatch;
@@ -295,12 +298,15 @@ pub fn sample_host_backtraces(_kernel: &OrbisKernel) -> Vec<(u64, String)> {
 /// Every resource a guest worker can outlive its creator with is Arc-owned.
 /// This is the C2 ownership boundary: no worker borrows launcher or
 /// `execute_process` stack state.
-pub(crate) struct GuestProcess {
+pub struct GuestProcess {
     pub(crate) module: Arc<LinkedModule>,
     pub(crate) hle: Arc<HleRegistry>,
     pub(crate) kernel: Arc<OrbisKernel>,
     pub(crate) arena: Arc<GuestArena>,
     pub(crate) guard: Arc<TrampolineGuard>,
+    /// Process-owned GPU register state, shader cache, framebuffers, and
+    /// ordered submission worker. The Shell holds only an observer clone.
+    pub(crate) gpu: GpuProcessSession,
     next_thread: AtomicU64,
     threads: Mutex<HashMap<u64, GuestThread>>,
     lifecycle: Mutex<()>,
@@ -309,7 +315,20 @@ pub(crate) struct GuestProcess {
 }
 
 #[derive(Clone)]
-pub(crate) struct GuestProcessHandle(Arc<GuestProcess>);
+pub struct GuestProcessHandle(Arc<GuestProcess>);
+
+/// Read-only ownership census for diagnostics/UI. It exposes lifecycle facts,
+/// never the unsafe arena/guard internals themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestProcessSnapshot {
+    pub image_bytes: usize,
+    pub loaded_modules: usize,
+    pub static_tls_modules: usize,
+    pub guest_threads: usize,
+    pub kernel_handles: usize,
+    pub gpu: xps5x_core::subsystems::GpuSubmissionStats,
+    pub diagnostic_events: usize,
+}
 
 impl std::ops::Deref for GuestProcessHandle {
     type Target = GuestProcess;
@@ -327,12 +346,22 @@ impl GuestProcess {
         arena: Arc<GuestArena>,
         guard: Arc<TrampolineGuard>,
     ) -> GuestProcessHandle {
+        let gpu = AgcGpuSession::new_process();
+        AgcGpuSession::install_process(&gpu);
+        kernel.diagnostics.record(
+            1,
+            DiagnosticKind::TaskOwned,
+            "guest-main",
+            1,
+            "process owner",
+        );
         GuestProcessHandle(Arc::new(Self {
             module,
             hle,
             kernel,
             arena,
             guard,
+            gpu,
             next_thread: AtomicU64::new(2),
             threads: Mutex::new(HashMap::new()),
             lifecycle: Mutex::new(()),
@@ -359,6 +388,28 @@ impl GuestProcess {
             .is_ok()
         {
             self.exit_code.store(code, Ordering::Release);
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> GuestProcessSnapshot {
+        let guest_threads = self
+            .threads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+            + 1;
+        GuestProcessSnapshot {
+            image_bytes: self.module.image.len(),
+            loaded_modules: self.module.unwind_modules.len().max(1),
+            static_tls_modules: self.module.tls_layout.len(),
+            guest_threads,
+            kernel_handles: self.kernel.modules.len()
+                + self.kernel.kernel_event_flags.len()
+                + self.kernel.kernel_equeues.len()
+                + self.kernel.kernel_sockets.len(),
+            gpu: self.gpu.stats(),
+            diagnostic_events: self.kernel.diagnostics.snapshot().len(),
         }
     }
 }
@@ -390,6 +441,14 @@ impl GuestProcessHandle {
                 );
             }
         }
+        self.gpu.shutdown();
+        self.kernel.diagnostics.record(
+            1,
+            DiagnosticKind::TaskReleased,
+            "guest-main",
+            1,
+            format!("process exit={code}"),
+        );
     }
 
     pub(crate) fn requested_exit_code(&self) -> Option<u64> {
@@ -452,6 +511,13 @@ impl GuestThreadScheduler for GuestProcessHandle {
             .name(format!("xps5x-guest-{handle}"))
             .spawn(move || {
                 tracing::info!(guest_thread = handle, entry, "guest pthread started");
+                process.kernel.diagnostics.record(
+                    handle,
+                    DiagnosticKind::TaskOwned,
+                    "guest-thread",
+                    handle,
+                    format!("entry={entry:#x}"),
+                );
                 record_host_thread_handle(&process.kernel, handle);
                 // SAFETY: all process resources are Arc-owned by this worker;
                 // entry and stack were validated in the live identity-mapped
@@ -465,6 +531,7 @@ impl GuestThreadScheduler for GuestProcessHandle {
                         &process.kernel,
                         &*process.arena,
                         &*process.arena,
+                        &process.gpu,
                         &process.guard,
                         Some(tcb),
                         static_tls_block,
@@ -490,6 +557,13 @@ impl GuestThreadScheduler for GuestProcessHandle {
                     });
                 process.arena.free(tcb_base);
                 process.arena.free(stack_base);
+                process.kernel.diagnostics.record(
+                    handle,
+                    DiagnosticKind::TaskReleased,
+                    "guest-thread",
+                    handle,
+                    "host worker exited",
+                );
                 result
             });
         let Ok(host) = host else {

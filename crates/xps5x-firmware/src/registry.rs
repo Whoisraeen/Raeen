@@ -33,12 +33,16 @@ pub enum Resolver {
 /// both an HLE implementation and an LLE export exist for the same NID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ModulePolicy {
+    /// Resolve only XPS5X HLE implementations.
+    HleOnly,
     /// Try HLE first, fall back to LLE. The default — works without any
     /// module having been linked yet.
     #[default]
     PreferHle,
     /// Try LLE first, fall back to HLE.
     PreferLle,
+    /// Resolve only exports from a user-supplied, decryptable module.
+    LleOnly,
 }
 
 /// Dispatches import NIDs to HLE or LLE implementations, per-module policy.
@@ -83,6 +87,16 @@ impl ModuleRegistry {
     /// use [`ModulePolicy::PreferHle`].
     pub fn set_policy(&mut self, module: &str, policy: ModulePolicy) {
         self.policies.insert(canonical_module_name(module), policy);
+    }
+
+    /// Effective provider policy. Unconfigured modules remain HLE-first, so a
+    /// normal installation never depends on firmware files or keys.
+    #[must_use]
+    pub fn policy_for(&self, module: &str) -> ModulePolicy {
+        self.policies
+            .get(&canonical_module_name(module))
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Record `exports` as this module's LLE exports, available to satisfy
@@ -137,13 +151,10 @@ impl ModuleRegistry {
             return resolved;
         }
 
-        let policy = self
-            .policies
-            .get(&canonical_module_name(provider_module))
-            .copied()
-            .unwrap_or_default();
+        let policy = self.policy_for(provider_module);
 
         match policy {
+            ModulePolicy::HleOnly => self.try_hle(hle, nid).unwrap_or(Resolver::Unresolved),
             ModulePolicy::PreferHle => self
                 .try_hle(hle, nid)
                 .or_else(|| self.try_lle(nid))
@@ -152,6 +163,7 @@ impl ModuleRegistry {
                 .try_lle(nid)
                 .or_else(|| self.try_hle(hle, nid))
                 .unwrap_or(Resolver::Unresolved),
+            ModulePolicy::LleOnly => self.try_lle(nid).unwrap_or(Resolver::Unresolved),
         }
     }
 
@@ -319,5 +331,28 @@ mod tests {
             registry.resolve(&hle, "libc", nid),
             Resolver::Lle { addr: 0x5678 }
         );
+    }
+
+    #[test]
+    fn strict_policies_do_not_cross_the_hle_lle_boundary() {
+        let (hle, db) = build_hle_and_db();
+        let (_, function) = uniquely_named_hle_function(&hle);
+        let nid = nid_of(&function);
+        let mut registry = ModuleRegistry::new(db);
+        registry.register_module_exports("libStrict", &[SymbolExport { nid, value: 0x9876 }]);
+
+        registry.set_policy("libStrict", ModulePolicy::HleOnly);
+        assert!(matches!(
+            registry.resolve(&hle, "libStrict", nid),
+            Resolver::Hle { .. }
+        ));
+
+        registry.set_policy("libStrict", ModulePolicy::LleOnly);
+        assert_eq!(
+            registry.resolve(&hle, "libStrict", nid),
+            Resolver::Lle { addr: 0x9876 }
+        );
+        assert_eq!(registry.policy_for("LIBSTRICT.PRX"), ModulePolicy::LleOnly);
+        assert_eq!(registry.policy_for("unconfigured"), ModulePolicy::PreferHle);
     }
 }
