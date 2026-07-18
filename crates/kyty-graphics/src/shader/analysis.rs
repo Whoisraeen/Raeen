@@ -1004,7 +1004,19 @@ pub fn shader_parse_usage2(
         )?;
         info.textures2d_readonly += 1;
         let last = (bind.textures2d.textures_num - 1) as usize;
-        if bind.textures2d.desc[last].texture.type_() != 9 {
+        let t = &bind.textures2d.desc[last].texture;
+        if t.type_() != 9 {
+            if std::env::var_os("XPS5X_TRACE_EUD").is_some() {
+                tracing::warn!(
+                    tex_type = t.type_(),
+                    base = format_args!("{:#x}", t.base40()),
+                    width = t.width5() + 1,
+                    height = t.height5() + 1,
+                    depth = t.depth() + 1,
+                    format = t.format(),
+                    "TRACE_TEX: non-2D read-only texture (type 11=Cube, 12=1DArray, 13=2DArray, 10=3D)"
+                );
+            }
             return Err(ni("read-only texture type != 9 (Texture2D)"));
         }
     }
