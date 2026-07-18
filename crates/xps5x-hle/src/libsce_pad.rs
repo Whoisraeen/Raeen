@@ -10,6 +10,31 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libScePad", "scePadReadState", hle_pad_read_state);
     registry.register("libScePad", "scePadRead", hle_pad_read_state);
     registry.register("libScePad", "scePadSetVibration", hle_pad_set_vibration);
+    // Motion/tilt/feature setters the title configures at HID init. It asserts
+    // on a non-OK return (ASTRO.BOT PsPadPpr.cpp:108 on scePadSetTiltCorrectionState
+    // returning garbage), so acknowledge them — we model no motion hardware, but
+    // "configured OK" lets the pad setup proceed.
+    for f in [
+        "scePadSetTiltCorrectionState",
+        "scePadSetAngularVelocityDeadbandState",
+        "scePadSetMotionSensorState",
+        "scePadSetVibrationMode",
+        "scePadResetOrientation",
+        "scePadResetLightBar",
+        "scePadSetLightBar",
+        "scePadSetVolumeGain",
+        "scePadSetProcessPrivilege",
+        "scePadDeviceClassParseData",
+        "scePadSetButtonRemappingInfo",
+    ] {
+        registry.register("libScePad", f, hle_pad_ok);
+    }
+}
+
+/// A libScePad configuration setter with no modeled hardware effect that the
+/// title only checks the SCE-OK return of.
+fn hle_pad_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    0
 }
 
 fn hle_pad_init(_ctx: &HleContext, _args: &[u64]) -> u64 {
