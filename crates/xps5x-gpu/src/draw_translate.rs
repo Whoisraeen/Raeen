@@ -578,6 +578,47 @@ fn decode_texture(
     })
 }
 
+thread_local! {
+    /// Raw pointer to the live render-target map for the draw currently being
+    /// translated. `OffscreenDrawSink` sets it to its `framebuffers` immediately
+    /// before `render_draw` and clears it right after, so the texture path can
+    /// source a render-target-as-texture from its actual rendered pixels instead
+    /// of the guest memory it was never written back to (that read black, which
+    /// is why composited scenes stayed black). Null outside a draw.
+    static RENDER_TARGETS: std::cell::Cell<*const HashMap<u64, RenderedImage>> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// Publish the live render-target map for the duration of `f` (one draw's
+/// translation), then restore the previous value. See [`RENDER_TARGETS`].
+pub fn with_render_targets<R>(map: &HashMap<u64, RenderedImage>, f: impl FnOnce() -> R) -> R {
+    let prev = RENDER_TARGETS.with(|c| c.replace(std::ptr::from_ref(map)));
+    let r = f();
+    RENDER_TARGETS.with(|c| c.set(prev));
+    r
+}
+
+/// The rendered pixels of the render target at guest `base` (matching `width` x
+/// `height`), if one is live for the current draw. Used to sample a
+/// render-target-as-texture — its content lives in the framebuffer map, not the
+/// guest memory `decode_texture` reads.
+fn render_target_pixels(base: u64, width: u32, height: u32) -> Option<Vec<u8>> {
+    RENDER_TARGETS.with(|c| {
+        let ptr = c.get();
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: `with_render_targets` sets this to a live `&HashMap` for
+        // exactly the synchronous, same-thread span of `render_draw` (which
+        // drives this translation) and clears it after; the map is not mutated
+        // during that span, and access here is read-only.
+        let map = unsafe { &*ptr };
+        map.get(&base)
+            .filter(|img| img.width == width && img.height == height)
+            .map(|img| img.pixels.clone())
+    })
+}
+
 fn prepare_stage_binding(
     bind: &ShaderBindResources,
     stage: vk::ShaderStageFlags,
@@ -673,7 +714,16 @@ fn prepare_stage_binding(
     // index into the %textures2D_S array.
     let mut textures = Vec::with_capacity(texture_num);
     for (index, desc) in bind.textures2d.desc[..texture_num].iter().enumerate() {
-        let decoded = decode_texture(&desc.texture)?;
+        let mut decoded = decode_texture(&desc.texture)?;
+        // If this T# points at a live render target, sample its actual rendered
+        // pixels — they live in the framebuffer map, not the guest memory
+        // decode_texture reads (render targets are never written back). Without
+        // this, a title's final composite (a fullscreen quad sampling its scene
+        // targets) reads black, so nothing shows on screen.
+        if let Some(px) = render_target_pixels(desc.texture.base40(), decoded.width, decoded.height)
+        {
+            decoded.pixels = px;
+        }
         if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SEEN: AtomicU32 = AtomicU32::new(0);
@@ -1059,7 +1109,15 @@ impl OffscreenDrawSink<'_> {
             if let Some(p) = &prior {
                 state.initial = Some(&p.pixels);
             }
-            render_draw(self.dev, &state).map_err(|e| err(format!("offscreen draw failed: {e}")))?
+            // Publish the other live render targets (this one was `remove`d
+            // above) so this draw's texture path can sample any of them as a
+            // render-target-as-texture — the composite that produces the visible
+            // frame samples its scene targets this way.
+            let dev = self.dev;
+            let fbs: &HashMap<u64, RenderedImage> = self.framebuffers;
+            with_render_targets(fbs, || {
+                render_draw(dev, &state).map_err(|e| err(format!("offscreen draw failed: {e}")))
+            })?
         };
 
         self.framebuffers.insert(rt_base, image.clone());
