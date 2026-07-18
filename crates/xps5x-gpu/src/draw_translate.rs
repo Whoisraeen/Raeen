@@ -1094,10 +1094,12 @@ impl DrawSink for OffscreenDrawSink<'_> {
     ) -> Result<(), DrawError> {
         // The legacy Kyty AGC wrapper emits 0. Retail RDNA2 command streams
         // also carry COMPUTE_SHADER_EN (bit 0) and CS_W32_EN (bit 6), yielding
-        // the measured 0x41. Both flags describe execution already represented
-        // by the translated Vulkan compute stage; other initiator bits need
-        // explicit semantics before they can be accepted.
-        if mode & !0x41 != 0 {
+        // the measured 0x41; ASTRO.BOT additionally sets USE_THREAD_DIMENSIONS
+        // (bit 5, 0x20) for 0x61. All three describe execution already
+        // represented by the translated Vulkan compute stage — the group counts
+        // carry the thread dimensions bit 5 selects — so accept them; other
+        // initiator bits need explicit semantics before they can be accepted.
+        if mode & !0x61 != 0 {
             return Err(err(format!(
                 "unsupported compute dispatch initiator {mode:#x}"
             )));
