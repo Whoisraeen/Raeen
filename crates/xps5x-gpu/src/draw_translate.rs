@@ -479,6 +479,10 @@ fn decode_texture(t: &kyty_graphics::shader::ShaderTextureResource) -> Result<Te
         // coverage/mask texture, tile mode 27). SharpEmu's Gfx10UnifiedFormat
         // maps unified 1 -> (dataFormat 1 = FMT_8, numFormat 0 = UNORM).
         1 => (vk::Format::R8_UNORM, 1),
+        // 36 = 10_11_11 FLOAT (packed 32-bit HDR) — the title samples its HDR
+        // render target as a texture. SharpEmu Gfx10UnifiedFormat maps unified
+        // 36 -> (dataFormat 6 = 10_11_11, numFormat 7 = FLOAT).
+        36 => (vk::Format::B10G11R11_UFLOAT_PACK32, 4),
         // 0x0a = 8_8_8_8; channel type UNORM (measured on Minecraft's UI T#s).
         // NOTE: SharpEmu's table maps unified 10 -> (2,3) = 16_SSCALED, which
         // contradicts this arm. No 0x0a texture has appeared in a measured
