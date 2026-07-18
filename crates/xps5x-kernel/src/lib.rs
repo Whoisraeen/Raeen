@@ -463,6 +463,12 @@ pub struct LibcMspace {
     pub peak_offset: u64,
     pub active_bytes: u64,
     pub name: String,
+    /// Reclaimed blocks `(offset_from_base, size)`, kept sorted by offset and
+    /// coalesced. Malloc reuses a fitting free block before bumping `next_offset`,
+    /// so malloc/free churn does not exhaust a fixed-capacity mspace — native
+    /// dlmalloc reclaims, and a bump-only allocator that doesn't makes a title's
+    /// global heap OOM after enough turnover (measured on ASTRO.BOT).
+    pub free_list: Vec<(u64, u64)>,
 }
 
 /// One allocation carved out of a libc mspace.

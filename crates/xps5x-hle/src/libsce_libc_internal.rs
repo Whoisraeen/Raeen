@@ -158,6 +158,7 @@ fn hle_mspace_create(ctx: &HleContext, args: &[u64]) -> u64 {
             peak_offset: 0x100,
             active_bytes: 0,
             name,
+            free_list: Vec::new(),
         },
     );
     base
@@ -219,6 +220,40 @@ fn hle_mspace_memalign(ctx: &HleContext, args: &[u64]) -> u64 {
     let Some(mut state) = ctx.kernel.libc_mspaces.get_mut(&mspace) else {
         return 0;
     };
+    let base = state.base;
+
+    // First-fit over reclaimed blocks: reuse before bumping so churn can't
+    // exhaust a fixed-capacity mspace (native dlmalloc reclaims; we must too).
+    let mut chosen = None;
+    for (index, &(block_off, block_size)) in state.free_list.iter().enumerate() {
+        // Align the block's start address up (alignment is a power of two).
+        let aligned_off = (((base + block_off) + alignment - 1) & !(alignment - 1)) - base;
+        if aligned_off + size <= block_off + block_size {
+            chosen = Some((index, block_off, block_size, aligned_off));
+            break;
+        }
+    }
+    if let Some((index, block_off, block_size, aligned_off)) = chosen {
+        state.free_list.remove(index);
+        let block_end = block_off + block_size;
+        let alloc_end = aligned_off + size;
+        // Return the alignment gap and any tail to the free list.
+        if aligned_off > block_off {
+            insert_and_coalesce(&mut state.free_list, block_off, aligned_off - block_off);
+        }
+        if block_end > alloc_end {
+            insert_and_coalesce(&mut state.free_list, alloc_end, block_end - alloc_end);
+        }
+        state.active_bytes = state.active_bytes.saturating_add(size);
+        drop(state);
+        let address = base + aligned_off;
+        ctx.kernel
+            .libc_mspace_allocations
+            .insert(address, xps5x_kernel::LibcMspaceAllocation { mspace, size });
+        return address;
+    }
+
+    // No reusable block: bump the high-water mark.
     let Some(aligned) = state
         .next_offset
         .checked_add(alignment - 1)
@@ -232,7 +267,7 @@ fn hle_mspace_memalign(ctx: &HleContext, args: &[u64]) -> u64 {
     if end > state.capacity {
         return 0;
     }
-    let Some(address) = state.base.checked_add(aligned) else {
+    let Some(address) = base.checked_add(aligned) else {
         return 0;
     };
     state.next_offset = end;
@@ -243,6 +278,25 @@ fn hle_mspace_memalign(ctx: &HleContext, args: &[u64]) -> u64 {
         .libc_mspace_allocations
         .insert(address, xps5x_kernel::LibcMspaceAllocation { mspace, size });
     address
+}
+
+/// Insert a `(offset, size)` free block, keeping the list sorted by offset and
+/// merging any block adjacent to its neighbours so churn cannot shred the mspace
+/// into unusable slivers.
+fn insert_and_coalesce(list: &mut Vec<(u64, u64)>, offset: u64, size: u64) {
+    if size == 0 {
+        return;
+    }
+    list.push((offset, size));
+    list.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(list.len());
+    for &(off, sz) in list.iter() {
+        match merged.last_mut() {
+            Some(last) if last.0 + last.1 == off => last.1 += sz,
+            _ => merged.push((off, sz)),
+        }
+    }
+    *list = merged;
 }
 
 fn hle_mspace_free(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -259,6 +313,9 @@ fn hle_mspace_free(ctx: &HleContext, args: &[u64]) -> u64 {
     }
     if let Some(mut state) = ctx.kernel.libc_mspaces.get_mut(&mspace) {
         state.active_bytes = state.active_bytes.saturating_sub(allocation.size);
+        // Reclaim the block so a later malloc can reuse it instead of bumping.
+        let offset = address - state.base;
+        insert_and_coalesce(&mut state.free_list, offset, allocation.size);
     }
     1
 }
@@ -280,21 +337,25 @@ fn hle_mspace_malloc_stats(ctx: &HleContext, args: &[u64]) -> u64 {
     if output == 0 {
         return 0;
     }
-    let values = [
-        state.capacity,
-        state.next_offset,
-        state.peak_offset,
-        state.active_bytes,
+    // `SceLibcMallocManagedSize` has an 8-byte header the CALLER fills — `sz:u16`,
+    // `ver:u16`, `reserved:u32` — followed by four `size_t` fields at 0x08 / 0x10
+    // / 0x18 / 0x20. Writing from offset 0 clobbered the header AND shifted every
+    // field one slot early, so the guest read `maxSystemSize` as our tiny
+    // `next_offset` (0x100). ASTRO.BOT's GpuMemory then saw a ~256-byte "system
+    // size" and reported "Out of graphics memory [Onion]" for a 2 MiB request on
+    // an otherwise-empty 184 MiB pool (`GpuMemory.cpp:155`).
+    let fields = [
+        (0x08u64, state.capacity),     // maxSystemSize: whole fixed region
+        (0x10, state.capacity),        // currentSystemSize: fully committed
+        (0x18, state.peak_offset),     // maxInuseSize: high-water mark
+        (0x20, state.active_bytes),    // currentInuseSize: live bytes now
     ];
-    for (index, value) in values.into_iter().enumerate() {
-        if !ctx
-            .mem
-            .write(output + index as u64 * 8, &value.to_le_bytes())
-        {
-            return 0;
+    for (offset, value) in fields {
+        if !ctx.mem.write(output + offset, &value.to_le_bytes()) {
+            return ERROR_MEMORY_FAULT;
         }
     }
-    1
+    SCE_OK
 }
 
 /// Lazily allocate the persistent zeroed trace storage, returning its guest
@@ -440,11 +501,15 @@ mod tests {
         assert_eq!(allocation & 0xFF, 0);
         assert_eq!(hle_mspace_malloc_usable_size(&ctx, &[allocation]), 0x180);
 
-        assert_eq!(hle_mspace_malloc_stats(&ctx, &[mspace, 0x100]), 1);
+        // SceLibcMallocManagedSize: 8-byte header + size_t fields at 0x08/0x10/
+        // 0x18/0x20. maxSystemSize (0x08) = capacity; currentInuseSize (0x20) =
+        // live bytes. Writing these correctly is what stops ASTRO.BOT reading a
+        // 256-byte "system size" and reporting Out-of-graphics-memory.
+        assert_eq!(hle_mspace_malloc_stats(&ctx, &[mspace, 0x100]), SCE_OK);
         let mut value = [0u8; 8];
-        assert!(mem.read(0x100, &mut value));
+        assert!(mem.read(0x108, &mut value)); // maxSystemSize
         assert_eq!(u64::from_le_bytes(value), 0x1000);
-        assert!(mem.read(0x118, &mut value));
+        assert!(mem.read(0x120, &mut value)); // currentInuseSize
         assert_eq!(u64::from_le_bytes(value), 0x180);
 
         assert_eq!(hle_mspace_free(&ctx, &[mspace, allocation]), 1);
@@ -469,5 +534,28 @@ mod tests {
                 "{function} must be HLE-reachable"
             );
         }
+    }
+
+    /// The free list must let malloc/free churn recycle memory instead of the
+    /// bump pointer marching to capacity — the ASTRO.BOT "Out of Global Heap
+    /// Memory" regression (a fixed-capacity heap OOMing after enough turnover).
+    #[test]
+    fn mspace_free_list_reclaims_so_churn_does_not_exhaust() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert!(mem.write(0x40, b"heap\0"));
+        // 4 KiB mspace; a bump-only allocator exhausts after ~2 of these 0x800
+        // allocations, so 200 alloc/free cycles prove the block is reclaimed.
+        let mspace = hle_mspace_create(&ctx, &[0x40, 0x1000, 0x1000, 0]);
+        assert_eq!(mspace, 0x1000);
+        for _ in 0..200 {
+            let p = hle_mspace_memalign(&ctx, &[mspace, 0x10, 0x800]);
+            assert_ne!(p, 0, "a reclaimed block must be reused, not exhausted");
+            assert_eq!(hle_mspace_free(&ctx, &[mspace, p]), 1);
+        }
+        // After the final free the heap is empty again.
+        assert_eq!(kernel.libc_mspaces.get(&mspace).unwrap().active_bytes, 0);
     }
 }
