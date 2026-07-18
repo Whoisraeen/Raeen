@@ -34,34 +34,38 @@ impl GuestMemory for IdentityGuestMemory {
     }
 }
 
-/// VirtualQuery-validated read of guest dwords (identity map). `None` when the
-/// range is null/unaligned/oversized or not fully committed-readable. Shared
-/// by [`IdentityGuestMemory`] and the shader fetch layer.
+/// Upper bound on a single *resource* fetch (vertex/index/storage buffers,
+/// textures): 256 MiB. Refuses wraparound garbage while covering any real
+/// title resource — measured: Minecraft binds a 4 MiB vertex arena V#.
+pub(crate) const MAX_RESOURCE_READ_DWORDS: u32 = 0x0400_0000;
+
+/// Pages readable by guest-side fetches: everything a committed, non-guard
+/// read may touch.
 #[cfg(windows)]
-pub(crate) fn read_dwords_checked(addr: u64, count: u32) -> Option<Vec<u32>> {
+const READABLE_PAGES: u32 = {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
-        VirtualQuery,
+        PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_READONLY,
+        PAGE_READWRITE, PAGE_WRITECOPY,
     };
-
-    if count == 0 || count > MAX_READ_DWORDS || addr == 0 || !addr.is_multiple_of(4) {
-        return None;
-    }
-    let bytes = count as usize * 4;
-    let end = addr.checked_add(bytes as u64)?;
-    // This process is 64-bit but a guest dword could still wrap usize math on
-    // a hostile value; keep everything in u64 until validated.
-
-    const READABLE: u32 = PAGE_READONLY
+    PAGE_READONLY
         | PAGE_READWRITE
         | PAGE_WRITECOPY
         | PAGE_EXECUTE_READ
         | PAGE_EXECUTE_READWRITE
-        | PAGE_EXECUTE_WRITECOPY;
+        | PAGE_EXECUTE_WRITECOPY
+};
 
-    // Walk the regions covering [addr, end); every page must be committed and
-    // readable, and PAGE_GUARD would still fault on touch.
+/// Length of the committed-readable prefix of `[addr, addr+size)`: 0 when the
+/// very first page is already bad. Shared by the validating read (which needs
+/// prefix == size) and by error paths that must say *where* a guest range
+/// stops being readable — the difference between a wild base and a lazy tail.
+#[cfg(windows)]
+fn committed_prefix_len(addr: u64, size: u64) -> u64 {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualQuery};
+
+    let Some(end) = addr.checked_add(size) else {
+        return 0;
+    };
     let mut cursor = addr;
     while cursor < end {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -76,16 +80,57 @@ pub(crate) fn read_dwords_checked(addr: u64, count: u32) -> Option<Vec<u32>> {
         };
         if got == 0
             || info.State != MEM_COMMIT
-            || (info.Protect & READABLE) == 0
+            || (info.Protect & READABLE_PAGES) == 0
             || (info.Protect & PAGE_GUARD) != 0
         {
-            return None;
+            break;
         }
         let region_end = info.BaseAddress as u64 + info.RegionSize as u64;
         if region_end <= cursor {
-            return None; // defensive: no forward progress means bad info
+            break; // defensive: no forward progress means bad info
         }
         cursor = region_end;
+    }
+    // The containing region usually runs past `size`; cap at the query span.
+    (cursor - addr).min(size)
+}
+
+/// Committed-readable prefix of a guest range, for naming a failed fetch
+/// precisely (wild base ≈ 0; lazy tail ≈ a page-aligned interior cut).
+#[cfg(windows)]
+pub(crate) fn readable_prefix(addr: u64, size: u64) -> u64 {
+    committed_prefix_len(addr, size)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn readable_prefix(_addr: u64, _size: u64) -> u64 {
+    0
+}
+
+/// VirtualQuery-validated read of guest dwords (identity map). `None` when the
+/// range is null/unaligned/oversized or not fully committed-readable. Shared
+/// by [`IdentityGuestMemory`] and the shader fetch layer.
+#[cfg(windows)]
+pub(crate) fn read_dwords_checked(addr: u64, count: u32) -> Option<Vec<u32>> {
+    if count == 0 || count > MAX_READ_DWORDS {
+        return None;
+    }
+    read_dwords_validated(addr, count)
+}
+
+/// The same validated read without the out-of-band cap, for guest *resources*
+/// (vertex/storage buffers, textures) whose legitimate size runs to megabytes.
+/// `MAX_READ_DWORDS` exists only to refuse mis-decoded command-processor
+/// pointer reads; a V# declaring a 4 MiB vertex arena is not a mis-decode
+/// (measured on Minecraft's menu draws).
+#[cfg(windows)]
+pub(crate) fn read_dwords_validated(addr: u64, count: u32) -> Option<Vec<u32>> {
+    if count == 0 || count > MAX_RESOURCE_READ_DWORDS || addr == 0 || !addr.is_multiple_of(4) {
+        return None;
+    }
+    let bytes = count as usize * 4;
+    if committed_prefix_len(addr, bytes as u64) != bytes as u64 {
+        return None;
     }
 
     let mut out = vec![0u32; count as usize];
@@ -112,6 +157,11 @@ pub(crate) fn read_dwords_checked(_addr: u64, _count: u32) -> Option<Vec<u32>> {
     None
 }
 
+#[cfg(not(windows))]
+pub(crate) fn read_dwords_validated(_addr: u64, _count: u32) -> Option<Vec<u32>> {
+    None
+}
+
 /// VirtualQuery-validated write into identity-mapped guest memory. Used for
 /// Vulkan compute storage-buffer writeback after the queue fence signals.
 #[cfg(windows)]
@@ -121,7 +171,7 @@ pub(crate) fn write_bytes_checked(addr: u64, bytes: &[u8]) -> bool {
         PAGE_GUARD, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
     };
 
-    if addr == 0 || bytes.is_empty() || bytes.len() > MAX_READ_DWORDS as usize * 4 {
+    if addr == 0 || bytes.is_empty() || bytes.len() > MAX_RESOURCE_READ_DWORDS as usize * 4 {
         return false;
     }
     let Some(end) = addr.checked_add(bytes.len() as u64) else {

@@ -29,3 +29,6 @@ windows-sys = { workspace = true }
 # license option (GPL-2.0-only compatible). Test-only — not linked into the
 # distributed emulator. See docs/reference-port-ledger.md (SPIR-V body rows).
 rspirv = "0.12"
+# Lets a failing GPU test print the validation messages it counted
+# (XPS5X_TEST_LOG=1); test-only, not linked into the emulator.
+tracing-subscriber = { workspace = true }

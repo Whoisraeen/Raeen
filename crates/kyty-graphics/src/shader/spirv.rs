@@ -1767,6 +1767,28 @@ pub(crate) fn operand_load_uint(
 }
 
 /// Kyty: ShaderSpirv.cpp `operand_load_float` (L1791).
+/// Highest exp param index the shader body writes, from the Param0..4 format
+/// of its Exp instructions. The register-derived `export_count` can under-read
+/// the body (measured: a menu VS writes `%param1` while `spi_vs_out_config`
+/// says 1 export) — the declarations must cover the body's ground truth or
+/// the assembler dies with "id %paramN is used but never defined".
+fn max_exp_param(code: &ShaderCode) -> i32 {
+    use super::shader_instruction_format::Format as F;
+    code.get_instructions()
+        .iter()
+        .filter(|inst| inst.type_ == ShaderInstructionType::Exp)
+        .map(|inst| match inst.format {
+            F::Param0Vsrc0Vsrc1Vsrc2Vsrc3 => 0,
+            F::Param1Vsrc0Vsrc1Vsrc2Vsrc3 => 1,
+            F::Param2Vsrc0Vsrc1Vsrc2Vsrc3 => 2,
+            F::Param3Vsrc0Vsrc1Vsrc2Vsrc3 => 3,
+            F::Param4Vsrc0Vsrc1Vsrc2Vsrc3 => 4,
+            _ => -1,
+        })
+        .max()
+        .unwrap_or(-1)
+}
+
 pub(crate) fn operand_load_float(
     spirv: &Spirv<'_>,
     op: ShaderOperand,
@@ -2225,7 +2247,12 @@ impl<'a> Spirv<'a> {
                     for i in 0..info.resources_num {
                         vars.push(format!("%attr{i}"));
                     }
-                    for i in 0..info.export_count {
+                    // See WriteGlobalVariables: the body's exp formats, not
+                    // just the register count, decide the declared set.
+                    let export_count = info
+                        .export_count
+                        .max(max_exp_param(&self.code) + 1);
+                    for i in 0..export_count {
                         vars.push(format!("%param{i}"));
                     }
                 }
@@ -2336,7 +2363,12 @@ impl<'a> Spirv<'a> {
                     for i in 0..info.resources_num {
                         vars.push(format!("OpDecorate %attr{i} Location {i}"));
                     }
-                    for i in 0..info.export_count {
+                    // See WriteGlobalVariables: the body's exp formats, not
+                    // just the register count, decide the declared set.
+                    let export_count = info
+                        .export_count
+                        .max(max_exp_param(&self.code) + 1);
+                    for i in 0..export_count {
                         vars.push(format!("OpDecorate %param{i} Location {i}"));
                     }
                 }
@@ -2732,7 +2764,15 @@ impl<'a> Spirv<'a> {
                             }
                         }
                     }
-                    for i in 0..info.export_count {
+                    // The register-derived count can under-read the body's
+                    // real exports (measured: menu VS writes param1 with a
+                    // register count of 1). The exp formats in the body are
+                    // the ground truth — declaring a dead export is legal,
+                    // leaving a written one undeclared is not.
+                    let export_count = info
+                        .export_count
+                        .max(max_exp_param(&self.code) + 1);
+                    for i in 0..export_count {
                         vars.push(format!(
                             "%param{i} = OpVariable %_ptr_Output_v4float Output"
                         ));
@@ -3539,6 +3579,7 @@ impl<'a> Spirv<'a> {
 
         if self.code.has_any_of(&[
             T::BufferLoadDword,
+            T::BufferLoadDwordX4,
             T::BufferLoadFormatX,
             T::BufferLoadFormatXy,
             T::BufferLoadFormatXyz,

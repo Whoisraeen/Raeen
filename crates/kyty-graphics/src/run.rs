@@ -1238,6 +1238,30 @@ impl CommandProcessor {
                 self.ctx.color_control.op = ((value >> 16) & 0xff) as u8;
             }
 
+            // Kyty Pm4.h CB_BLEND0_CONTROL_* field layout. Per-slot alpha
+            // blending state — Minecraft's UI writes these.
+            r if (pm4::CB_BLEND0_CONTROL
+                ..pm4::CB_BLEND0_CONTROL + pm4::CB_BLEND_CONTROL_SLOTS)
+                .contains(&r) =>
+            {
+                let slot = (r - pm4::CB_BLEND0_CONTROL) as usize;
+                self.ctx.blend_control[slot] = crate::hw_regs::BlendControl {
+                    color_srcblend: (value & 0x1f) as u8,
+                    color_comb_fcn: ((value >> 5) & 0x7) as u8,
+                    color_destblend: ((value >> 8) & 0x1f) as u8,
+                    alpha_srcblend: ((value >> 16) & 0x1f) as u8,
+                    alpha_comb_fcn: ((value >> 21) & 0x7) as u8,
+                    alpha_destblend: ((value >> 24) & 0x1f) as u8,
+                    separate_alpha_blend: (value >> 29) & 0x1 != 0,
+                    enable: (value >> 30) & 0x1 != 0,
+                };
+            }
+
+            pm4::CB_BLEND_RED => self.ctx.blend_color.red = f32::from_bits(value),
+            pm4::CB_BLEND_GREEN => self.ctx.blend_color.green = f32::from_bits(value),
+            pm4::CB_BLEND_BLUE => self.ctx.blend_color.blue = f32::from_bits(value),
+            pm4::CB_BLEND_ALPHA => self.ctx.blend_color.alpha = f32::from_bits(value),
+
             _ => {
                 if self.first(SkipKey::Reg(RegFile::Context, reg)) {
                     warn!(
@@ -2450,5 +2474,32 @@ mod tests {
         cp.run_with_memory(&dcb, &mut sink, Some(&mem))
             .expect("unreadable pointer skips");
         assert_eq!(cp.distinct_skips(), 1);
+    }
+
+    /// `CB_BLEND0_CONTROL` decodes per-slot with the Kyty field layout (the
+    /// title's UI blending reaches Vulkan through this); the blend-colour
+    /// registers land as floats. Measured on Minecraft: writes to 0x1E0.
+    #[test]
+    fn blend_control_registers_decode_into_context() {
+        let mut cp = CommandProcessor::new();
+        // enable | separate-alpha | color SrcAlpha/ADD/OneMinusSrcAlpha,
+        // alpha One/ADD/Zero.
+        let value = (1 << 30) | (1 << 29) | 0x04 | (0x05 << 8) | (0x01 << 16);
+        cp.set_context_register(pm4::CB_BLEND0_CONTROL, value);
+        let bc = &cp.ctx.blend_control[0];
+        assert!(bc.enable);
+        assert!(bc.separate_alpha_blend);
+        assert_eq!(bc.color_srcblend, 0x04);
+        assert_eq!(bc.color_comb_fcn, 0);
+        assert_eq!(bc.color_destblend, 0x05);
+        assert_eq!(bc.alpha_srcblend, 0x01);
+        assert_eq!(bc.alpha_destblend, 0x00);
+        // Each slot lands in its own entry.
+        cp.set_context_register(pm4::CB_BLEND0_CONTROL + 3, 1 << 30);
+        assert!(cp.ctx.blend_control[3].enable);
+        assert!(!cp.ctx.blend_control[1].enable);
+        // Blend colour arrives as raw float bits.
+        cp.set_context_register(pm4::CB_BLEND_RED, 0x3f80_0000);
+        assert_eq!(cp.ctx.blend_color.red, 1.0);
     }
 }

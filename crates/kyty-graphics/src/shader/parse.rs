@@ -952,30 +952,22 @@ fn shader_parse_vopc(
     let src1_abs = if sdwa { (b1 >> 29) & 0x1 } else { 0 };
     let s1 = if sdwa { (b1 >> 31) & 0x1 } else { 0 };
 
-    // Kyty L622-629: EXIT_NOT_IMPLEMENTED on any SDWA modifier.
+    // Kyty L622-629: EXIT_NOT_IMPLEMENTED on any SDWA modifier. Beyond Kyty:
+    // float abs/neg ride the operand modifiers into `operand_load_float`
+    // (measured: Minecraft's menu VS does `v_cmp_lt_f32 s2, |v2|, c` and the
+    // UI PS does `v_mul_f32 v2, v4, -v3`). sel/sext stay named — sub-dword
+    // selection is a different feature.
     if src0_sel != 6 {
         return Err(feature(S, "sdwa src0_sel != 6", pc));
     }
     if src0_sext != 0 {
         return Err(feature(S, "sdwa src0_sext != 0", pc));
     }
-    if src0_neg != 0 {
-        return Err(feature(S, "sdwa src0_neg != 0", pc));
-    }
-    if src0_abs != 0 {
-        return Err(feature(S, "sdwa src0_abs != 0", pc));
-    }
     if src1_sel != 6 {
         return Err(feature(S, "sdwa src1_sel != 6", pc));
     }
     if src1_sext != 0 {
         return Err(feature(S, "sdwa src1_sext != 0", pc));
-    }
-    if src1_neg != 0 {
-        return Err(feature(S, "sdwa src1_neg != 0", pc));
-    }
-    if src1_abs != 0 {
-        return Err(feature(S, "sdwa src1_abs != 0", pc));
     }
 
     let mut inst = ShaderInstruction {
@@ -985,6 +977,11 @@ fn shader_parse_vopc(
     inst.src[0] = operand_parse(src0 + if s0 == 0 { 256 } else { 0 })?;
     inst.src[1] = operand_parse(vsrc1 + if s1 == 0 { 256 } else { 0 })?;
     inst.src_num = 2;
+
+    inst.src[0].absolute = src0_abs != 0;
+    inst.src[1].absolute = src1_abs != 0;
+    inst.src[0].negate = src0_neg != 0;
+    inst.src[1].negate = src1_neg != 0;
 
     if inst.src[0].type_ == O::LiteralConstant {
         inst.src[0].constant.u = dw(buffer, size, pc)?;
@@ -1257,17 +1254,11 @@ fn shader_parse_vop2(
     if src0_sext != 0 {
         return Err(feature(S, "sdwa src0_sext != 0", pc));
     }
-    if src0_neg != 0 {
-        return Err(feature(S, "sdwa src0_neg != 0", pc));
-    }
     if src1_sel != 6 {
         return Err(feature(S, "sdwa src1_sel != 6", pc));
     }
     if src1_sext != 0 {
         return Err(feature(S, "sdwa src1_sext != 0", pc));
-    }
-    if src1_neg != 0 {
-        return Err(feature(S, "sdwa src1_neg != 0", pc));
     }
 
     let mut inst = ShaderInstruction {
@@ -1294,6 +1285,8 @@ fn shader_parse_vop2(
 
     inst.src[0].absolute = src0_abs != 0;
     inst.src[1].absolute = src1_abs != 0;
+    inst.src[0].negate = src0_neg != 0;
+    inst.src[1].negate = src1_neg != 0;
 
     inst.dst.clamp = clmp != 0;
 
@@ -2463,11 +2456,13 @@ fn shader_parse_mubuf(
     let vdata = (b1 >> 8) & 0xff;
     let vaddr = b1 & 0xff;
 
-    // Kyty L2569-2575: EXIT_NOT_IMPLEMENTED checks.
+    // Kyty L2569-2575: EXIT_NOT_IMPLEMENTED checks. Beyond Kyty: offen rides
+    // as the second vaddr register (the tbuffer xyzw model), but only for the
+    // opcodes with an offen recompiler below — the rest stay named.
     if idxen == 0 {
         return Err(feature(S, "idxen == 0", pc));
     }
-    if offen == 1 {
+    if offen == 1 && opcode != 0x0e {
         return Err(feature(S, "offen == 1", pc));
     }
     if offset != 0 {
@@ -2550,7 +2545,19 @@ fn shader_parse_mubuf(
             inst.src[1].size = 4;
         }
         0x0d => return Err(ni(dst, S, "buffer_load_dwordx2", opcode, pc, b0)),
-        0x0e => return Err(ni(dst, S, "buffer_load_dwordx4", opcode, pc, b0)),
+        0x0e => {
+            // Measured on Minecraft's menu VS: `buffer_load_dwordx4 v[8:11],
+            // v[4:5], s[8:11]` with idxen+offen (vindex=v4, voffset=v5).
+            inst.type_ = T::BufferLoadDwordX4;
+            inst.format = if offen == 1 {
+                F::Vdata4Vaddr2SvSoffsOffenIdxen
+            } else {
+                F::Vdata4VaddrSvSoffsIdxen
+            };
+            inst.src[0].size += offen as i32;
+            inst.src[1].size = 4;
+            inst.dst.size = 4;
+        }
         0x0f => return Err(ni(dst, S, "buffer_load_dwordx3", opcode, pc, b0)),
         0x18 => return Err(ni(dst, S, "buffer_store_byte", opcode, pc, b0)),
         0x1a => return Err(ni(dst, S, "buffer_store_short", opcode, pc, b0)),

@@ -25,8 +25,8 @@ use crate::shader_fetch::{ShaderTranslateCache, TranslatedShader};
 use crate::vulkan::compute::{ComputeState, dispatch_compute};
 use crate::vulkan::instance::VulkanDevice;
 use crate::vulkan::offscreen::{
-    CLEAR_COLOR, DrawState, RenderedImage, ShaderStageBinding, StorageBufferBinding,
-    VertexAttributeData, VertexBufferData, render_draw,
+    BlendState, CLEAR_COLOR, DrawState, RenderedImage, ShaderStageBinding, StorageBufferBinding,
+    TextureBinding, TextureUpload, VertexAttributeData, VertexBufferData, render_draw,
 };
 use ash::vk;
 use kyty_graphics::hw_regs::{Context, Shader, UserConfig};
@@ -82,6 +82,82 @@ fn vulkan_color_write_mask(target_mask: u32) -> vk::ColorComponentFlags {
         }
     }
     flags
+}
+
+/// Map a `CB_BLEND*_CONTROL` 5-bit blend factor to Vulkan.
+///
+/// The encoding is Kyty's `GraphicsRender.cpp` blend switch. Dual-source and
+/// BOTH_SRC_ALPHA factors have no single-source Vulkan equivalent — a named
+/// error, not a silently-wrong ZERO.
+fn gen5_blend_factor(code: u8) -> Result<vk::BlendFactor, DrawError> {
+    match code {
+        0x00 => Ok(vk::BlendFactor::ZERO),
+        0x01 => Ok(vk::BlendFactor::ONE),
+        0x02 => Ok(vk::BlendFactor::SRC_COLOR),
+        0x03 => Ok(vk::BlendFactor::ONE_MINUS_SRC_COLOR),
+        0x04 => Ok(vk::BlendFactor::SRC_ALPHA),
+        0x05 => Ok(vk::BlendFactor::ONE_MINUS_SRC_ALPHA),
+        0x06 => Ok(vk::BlendFactor::DST_ALPHA),
+        0x07 => Ok(vk::BlendFactor::ONE_MINUS_DST_ALPHA),
+        0x08 => Ok(vk::BlendFactor::DST_COLOR),
+        0x09 => Ok(vk::BlendFactor::ONE_MINUS_DST_COLOR),
+        0x0a => Ok(vk::BlendFactor::SRC_ALPHA_SATURATE),
+        0x0d => Ok(vk::BlendFactor::CONSTANT_COLOR),
+        0x0e => Ok(vk::BlendFactor::ONE_MINUS_CONSTANT_COLOR),
+        0x13 => Ok(vk::BlendFactor::CONSTANT_ALPHA),
+        0x14 => Ok(vk::BlendFactor::ONE_MINUS_CONSTANT_ALPHA),
+        other => Err(err(format!(
+            "blend factor {other:#04x} not implemented (dual-source/BOTH_SRC_ALPHA \
+             factors need VK dual-source, which this pipeline does not use)"
+        ))),
+    }
+}
+
+/// Map a `CB_BLEND*_CONTROL` 3-bit combine function to Vulkan.
+fn gen5_blend_op(code: u8) -> Result<vk::BlendOp, DrawError> {
+    match code {
+        0 => Ok(vk::BlendOp::ADD),
+        1 => Ok(vk::BlendOp::SUBTRACT),
+        2 => Ok(vk::BlendOp::MIN),
+        3 => Ok(vk::BlendOp::MAX),
+        4 => Ok(vk::BlendOp::REVERSE_SUBTRACT),
+        other => Err(err(format!("blend combine function {other} not implemented"))),
+    }
+}
+
+/// Build the attachment's blend state from `CB_BLEND0_CONTROL` +
+/// `CB_BLEND_{RED,GREEN,BLUE,ALPHA}`. When the register clears
+/// `separate_alpha_blend`, the alpha channel uses the *colour* factors — that
+/// is what the hardware does, not a shortcut.
+fn blend_state_from_regs(ctx: &Context) -> Result<BlendState, DrawError> {
+    let bc = &ctx.blend_control[0];
+    let color_src = gen5_blend_factor(bc.color_srcblend)?;
+    let color_dst = gen5_blend_factor(bc.color_destblend)?;
+    let color_op = gen5_blend_op(bc.color_comb_fcn)?;
+    let (alpha_src, alpha_dst, alpha_op) = if bc.separate_alpha_blend {
+        (
+            gen5_blend_factor(bc.alpha_srcblend)?,
+            gen5_blend_factor(bc.alpha_destblend)?,
+            gen5_blend_op(bc.alpha_comb_fcn)?,
+        )
+    } else {
+        (color_src, color_dst, color_op)
+    };
+    Ok(BlendState {
+        enable: bc.enable,
+        src_color: color_src,
+        dst_color: color_dst,
+        color_op,
+        src_alpha: alpha_src,
+        dst_alpha: alpha_dst,
+        alpha_op,
+        constants: [
+            ctx.blend_color.red,
+            ctx.blend_color.green,
+            ctx.blend_color.blue,
+            ctx.blend_color.alpha,
+        ],
+    })
 }
 
 /// Map `CB_COLOR0_INFO`'s format/channel_type/channel_order triple to Vulkan.
@@ -255,9 +331,15 @@ fn read_guest_bytes(addr: u64, size: u64, kind: &str) -> Result<Vec<u8>, DrawErr
     }
     let count = u32::try_from(size / 4)
         .map_err(|_| err(format!("{kind} at {addr:#x} is too large: {size} bytes")))?;
-    let words = crate::guest_mem::read_dwords_checked(addr, count).ok_or_else(|| {
+    let words = crate::guest_mem::read_dwords_validated(addr, count).ok_or_else(|| {
+        // A zero-ish prefix means the base itself is wild (mis-decoded
+        // pointer); a page-aligned interior cut means the tail is
+        // reserved-but-uncommitted (lazy guest memory); a prefix equal to the
+        // size means the read was refused by the resource cap, not by memory.
+        let good = crate::guest_mem::readable_prefix(addr, size);
         err(format!(
-            "{kind} guest range {addr:#x}..{:#x} is not fully readable",
+            "{kind} guest range {addr:#x}..{:#x} is not fully readable \
+             (readable prefix {good:#x} of {size:#x})",
             addr.saturating_add(size)
         ))
     })?;
@@ -278,9 +360,15 @@ fn read_guest_bytes(addr: u64, size: u64, kind: &str) -> Result<Vec<u8>, DrawErr
 }
 
 fn gen5_vertex_format(format: u8) -> Result<vk::Format, DrawError> {
+    // Gen5 unified-format code → Vulkan, per SharpEmu's Gfx10UnifiedFormat
+    // table (the RDNA2 authority): 64 → (11,7) = 32_32_FLOAT,
+    // 74 → (13,7) = 32_32_32_FLOAT, 77 → (14,7) = 32_32_32_32_FLOAT,
+    // 56 → (10,0) = 8_8_8_8 UNORM (vertex colour, measured on a UI draw).
     match format {
         74 => Ok(vk::Format::R32G32B32_SFLOAT),
         64 => Ok(vk::Format::R32G32_SFLOAT),
+        77 => Ok(vk::Format::R32G32B32A32_SFLOAT),
+        56 => Ok(vk::Format::R8G8B8A8_UNORM),
         other => Err(err(format!(
             "unsupported Gen5 vertex-buffer format {other}"
         ))),
@@ -352,20 +440,118 @@ fn prepare_vertex_inputs(
     Ok((buffers, attributes))
 }
 
+/// Decode one T# into linear pixels a Vulkan sampled image can hold.
+///
+/// Formats and tile modes are added strictly from measurement: an unhandled
+/// value is a named error carrying every raw field, so a run against the title
+/// states exactly what to implement next — a guessed format number would render
+/// silently-wrong colours, which is worse than an honest skip.
+fn decode_texture(t: &kyty_graphics::shader::ShaderTextureResource) -> Result<TextureUpload, DrawError> {
+    let width = u32::from(t.width5()) + 1;
+    let height = u32::from(t.height5()) + 1;
+    if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) {
+        return Err(err(format!("texture extent {width}x{height} out of range")));
+    }
+    if t.type_() != 9 {
+        return Err(err(format!(
+            "texture type {} is not Texture2D — view-type support pending",
+            t.type_()
+        )));
+    }
+
+    // Gen5 unified T# format -> (Vulkan format, bytes per pixel), decoded via
+    // SharpEmu's Gfx10UnifiedFormat table (the RDNA2 authority). Filled from
+    // measured titles only; an unhandled value names itself rather than
+    // guessing. `bpp` typed because the arms are added incrementally.
+    let (format, bpp): (vk::Format, u32) = match t.format() {
+        // 0x0a = 8_8_8_8; channel type UNORM (measured on Minecraft's UI T#s).
+        // NOTE: SharpEmu's table maps unified 10 -> (2,3) = 16_SSCALED, which
+        // contradicts this arm. No 0x0a texture has appeared in a measured
+        // run since; the first one that does must settle the table.
+        0x0a => (vk::Format::R8G8B8A8_UNORM, 4),
+        // 56 -> (10,0) = 8_8_8_8 UNORM (measured: Minecraft's 1920x1080 UI
+        // texture, tile mode 27).
+        56 => (vk::Format::R8G8B8A8_UNORM, 4),
+        other => {
+            return Err(err(format!(
+                "texture format {other} not implemented \
+                 (base={:#x} {width}x{height} pitch={} tile={} levels={})",
+                t.base40(),
+                t.pitch(),
+                t.tile_mode(),
+                t.last_level()
+            )));
+        }
+    };
+
+    let pixels = match t.tile_mode() {
+        0 => {
+            // Linear: row-major at `pitch`, trimmed to tight rows below.
+            let pitch = u32::from(t.pitch()).max(width);
+            let tiled = read_guest_bytes_unaligned(
+                t.base40(),
+                u64::from(pitch) * u64::from(height) * u64::from(bpp),
+                "texture",
+            )?;
+            let row = (width * bpp) as usize;
+            let src_row = (pitch * bpp) as usize;
+            let mut pixels = vec![0u8; row * height as usize];
+            for y in 0..height as usize {
+                let src = y * src_row;
+                pixels[y * row..(y + 1) * row].copy_from_slice(&tiled[src..src + row]);
+            }
+            pixels
+        }
+        // SW_64KB_R_X: the exact PS5/Oberon macro swizzle (AddrLib equation
+        // via SharpEmu's GnmTiling). Fetch whole 64 KiB blocks — a tiled
+        // surface owns its padding — and deswizzle.
+        27 => {
+            let bpp_log2 = bpp.trailing_zeros();
+            let tiled = read_guest_bytes_unaligned(
+                t.base40(),
+                crate::texture::tiling::tiled_byte_count_64kb(width, height, bpp_log2),
+                "texture",
+            )?;
+            crate::texture::tiling::detile_64kb_r_x(&tiled, width, height, bpp_log2)
+        }
+        other => {
+            return Err(err(format!(
+                "texture tile mode {other} not implemented \
+                 (base={:#x} {width}x{height} format={})",
+                t.base40(),
+                t.format()
+            )));
+        }
+    };
+    Ok(TextureUpload {
+        width,
+        height,
+        format,
+        pixels,
+    })
+}
+
 fn prepare_stage_binding(
     bind: &ShaderBindResources,
     stage: vk::ShaderStageFlags,
 ) -> Result<ShaderStageBinding, DrawError> {
-    if bind.textures2d.textures_num != 0 {
-        return Err(err(format!(
-            "translated {stage:?} shader needs {} texture descriptors",
-            bind.textures2d.textures_num
-        )));
+    // Textures and samplers: decode every bound T#/S# and carry them to the
+    // Vulkan layer. The push constants must carry the REWRITTEN descriptors
+    // (base replaced by the descriptor-array index) in the exact
+    // `shader_calc_binding_indices` order: storage V#s, then T#s (8 dwords),
+    // then S#s (4 dwords), then direct SGPRs.
+    let texture_num = usize::try_from(bind.textures2d.textures_num)
+        .map_err(|_| err("negative texture count"))?;
+    let sampler_num = usize::try_from(bind.samplers.samplers_num)
+        .map_err(|_| err("negative sampler count"))?;
+    if texture_num > bind.textures2d.desc.len() || sampler_num > bind.samplers.samplers.len() {
+        return Err(err("texture/sampler count exceeds fixed array"));
     }
-    if bind.samplers.samplers_num != 0 {
+    if bind.textures2d.textures2d_storage_num != 0 {
         return Err(err(format!(
-            "translated {stage:?} shader needs {} sampler descriptors",
-            bind.samplers.samplers_num
+            "translated {stage:?} shader uses {} STORAGE image(s) — only sampled \
+             textures are implemented",
+            bind.textures2d.textures2d_storage_num
         )));
     }
     if bind.gds_pointers.pointers_num != 0 || bind.extended.used {
@@ -435,6 +621,47 @@ fn prepare_stage_binding(
         }
     }
 
+    // T#s: decode + upload list, and the rewritten 8-dword descriptor in the
+    // push constants — the recompiled shader loads dword 0 at runtime as its
+    // index into the %textures2D_S array.
+    let mut textures = Vec::with_capacity(texture_num);
+    for (index, desc) in bind.textures2d.desc[..texture_num].iter().enumerate() {
+        let decoded = decode_texture(&desc.texture)?;
+        if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SEEN: AtomicU32 = AtomicU32::new(0);
+            if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
+                tracing::warn!(
+                    stage = ?stage,
+                    index,
+                    base = format_args!("{:#x}", desc.texture.base40()),
+                    width = decoded.width,
+                    height = decoded.height,
+                    vk_format = ?decoded.format,
+                    "TRACE_DRAWS: texture decoded"
+                );
+            }
+        }
+        textures.push(decoded);
+        let mut rewritten = desc.texture;
+        rewritten.update_address38(index as u64);
+        for field in rewritten.fields {
+            push_constants.extend_from_slice(&field.to_le_bytes());
+        }
+    }
+
+    // S#s: only the mag-filter bit is honoured today; the rewritten descriptor
+    // carries the sampler-array index in dword 0.
+    let mut linear_filter = Vec::with_capacity(sampler_num);
+    for (index, sampler) in bind.samplers.samplers[..sampler_num].iter().enumerate() {
+        linear_filter.push(sampler.xy_mag_filter() != 0);
+        let mut rewritten = *sampler;
+        rewritten.update_index(index as u32);
+        for field in rewritten.fields {
+            push_constants.extend_from_slice(&field.to_le_bytes());
+        }
+    }
+
     let direct_num = usize::try_from(bind.direct_sgprs.sgprs_num).map_err(|_| {
         err(format!(
             "negative direct-SGPR count {}",
@@ -468,6 +695,12 @@ fn prepare_stage_binding(
         storage_buffers: (storage_num != 0).then_some(StorageBufferBinding {
             binding: bind.storage_buffers.binding_index as u32,
             buffers: storage_bytes,
+        }),
+        textures: (texture_num != 0).then_some(TextureBinding {
+            sampled_binding: bind.textures2d.binding_sampled_index as u32,
+            sampler_binding: bind.samplers.binding_index as u32,
+            textures,
+            linear_filter,
         }),
     })
 }
@@ -580,6 +813,8 @@ pub fn draw_state_from_regs<'a>(
         cull_mode |= vk::CullModeFlags::BACK;
     }
 
+    let blend = blend_state_from_regs(ctx)?;
+
     Ok(DrawState {
         width,
         height,
@@ -590,6 +825,7 @@ pub fn draw_state_from_regs<'a>(
         topology,
         cull_mode,
         color_write_mask,
+        blend,
         // The embedded VS declares no input attributes and builds its own quad.
         vertices: None,
         vertex_buffers: Vec::new(),
@@ -1300,5 +1536,117 @@ mod tests {
             16,
             "rewritten descriptor must preserve the guest stride"
         );
+    }
+
+    /// The classic alpha-over blend: SRC_ALPHA / ONE_MINUS_SRC_ALPHA / ADD.
+    #[test]
+    fn blend_state_maps_alpha_over() {
+        let mut ctx = ctx_96x48();
+        ctx.blend_control[0] = kyty_graphics::hw_regs::BlendControl {
+            color_srcblend: 0x04, // SrcAlpha
+            color_comb_fcn: 0,    // ADD
+            color_destblend: 0x05, // OneMinusSrcAlpha
+            alpha_srcblend: 0x01, // One
+            alpha_comb_fcn: 0,
+            alpha_destblend: 0x00, // Zero
+            separate_alpha_blend: true,
+            enable: true,
+        };
+        ctx.blend_color.red = 0.25;
+        let blend = blend_state_from_regs(&ctx).expect("supported blend state");
+        assert!(blend.enable);
+        assert_eq!(blend.src_color, vk::BlendFactor::SRC_ALPHA);
+        assert_eq!(blend.dst_color, vk::BlendFactor::ONE_MINUS_SRC_ALPHA);
+        assert_eq!(blend.color_op, vk::BlendOp::ADD);
+        assert_eq!(blend.src_alpha, vk::BlendFactor::ONE);
+        assert_eq!(blend.dst_alpha, vk::BlendFactor::ZERO);
+        assert_eq!(blend.constants[0], 0.25);
+    }
+
+    /// Without `separate_alpha_blend` the alpha channel reuses the *colour*
+    /// factors — that is the hardware behaviour, not an approximation.
+    #[test]
+    fn blend_state_without_separate_alpha_reuses_color_factors() {
+        let mut ctx = ctx_96x48();
+        ctx.blend_control[0] = kyty_graphics::hw_regs::BlendControl {
+            color_srcblend: 0x02, // SrcColor
+            color_comb_fcn: 1,    // SUBTRACT
+            color_destblend: 0x08, // DestColor
+            alpha_srcblend: 0x1f, // junk on purpose — must be ignored
+            alpha_comb_fcn: 0x7,
+            alpha_destblend: 0x1f,
+            separate_alpha_blend: false,
+            enable: true,
+        };
+        let blend = blend_state_from_regs(&ctx).expect("supported");
+        assert_eq!(blend.src_alpha, vk::BlendFactor::SRC_COLOR);
+        assert_eq!(blend.dst_alpha, vk::BlendFactor::DST_COLOR);
+        assert_eq!(blend.alpha_op, vk::BlendOp::SUBTRACT);
+    }
+
+    /// Dual-source factors have no single-source Vulkan equivalent — a named
+    /// error, never a silent ZERO.
+    #[test]
+    fn blend_factor_dual_source_is_a_named_error() {
+        for code in [0x0b_u8, 0x0c, 0x0f, 0x10, 0x11, 0x12, 0x15, 0xff] {
+            let e = gen5_blend_factor(code).expect_err("must be named");
+            let msg = format!("{e}");
+            assert!(
+                msg.contains(&format!("{code:#04x}")),
+                "error names the code: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn blend_op_reserved_is_a_named_error() {
+        let e = gen5_blend_op(5).expect_err("must be named");
+        assert!(format!("{e}").contains('5'));
+    }
+
+    /// Gen5 unified vertex formats per SharpEmu's Gfx10UnifiedFormat table:
+    /// 64 → (11,7) 32_32_FLOAT, 74 → (13,7) 32_32_32_FLOAT,
+    /// 77 → (14,7) 32_32_32_32_FLOAT (Minecraft's float4 vertex arena).
+    #[test]
+    fn gen5_vertex_formats_map_per_sharpemu_table() {
+        assert_eq!(gen5_vertex_format(64).unwrap(), vk::Format::R32G32_SFLOAT);
+        assert_eq!(gen5_vertex_format(74).unwrap(), vk::Format::R32G32B32_SFLOAT);
+        assert_eq!(
+            gen5_vertex_format(77).unwrap(),
+            vk::Format::R32G32B32A32_SFLOAT
+        );
+        assert_eq!(gen5_vertex_format(56).unwrap(), vk::Format::R8G8B8A8_UNORM);
+        let e = gen5_vertex_format(0).expect_err("unknown formats stay named");
+        assert!(format!("{e}").contains('0'));
+    }
+
+    /// A tiled T# (SWIZZLE_MODE 27 = SW_64KB_R_X, format 56 = 8_8_8_8 UNORM —
+    /// the pair Minecraft's UI binds) decodes back to the original pixels.
+    #[test]
+    fn decode_texture_detiles_sw_64kb_r_x() {
+        let (w, h, bpp_log2) = (8u32, 8u32, 2u32);
+        let linear: Vec<u8> = (0..(w * h) as usize * 4)
+            .map(|i| ((i * 7 + 3) % 251) as u8)
+            .collect();
+        let tiled = crate::texture::tiling::tile_64kb_r_x(&linear, w, h, bpp_log2);
+        // Fake a 256-aligned guest base (base40 drops the low 8 bits).
+        let mut blob = vec![0u8; tiled.len() + 255];
+        let base = (blob.as_ptr() as u64 + 255) & !255;
+        let off = (base - blob.as_ptr() as u64) as usize;
+        blob[off..off + tiled.len()].copy_from_slice(&tiled);
+
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.update_address40(base >> 8);
+        t.fields[1] |= 56 << 20; // unified format 8_8_8_8 UNORM
+        t.fields[1] |= ((w - 1) & 3) << 30; // width5 low bits
+        t.fields[2] = (w - 1) >> 2; // width5 high bits
+        t.fields[2] |= (h - 1) << 14; // height5
+        t.fields[3] |= 27 << 20; // SWIZZLE_MODE = SW_64KB_R_X
+        t.fields[3] |= 9 << 28; // type = Texture2D
+
+        let tex = decode_texture(&t).expect("mode-27 texture decodes");
+        assert_eq!((tex.width, tex.height), (w, h));
+        assert_eq!(tex.format, vk::Format::R8G8B8A8_UNORM);
+        assert_eq!(tex.pixels, linear, "detiled pixels must match the original");
     }
 }

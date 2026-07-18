@@ -89,6 +89,32 @@ pub struct StorageBufferBinding {
     pub buffers: Vec<Vec<u8>>,
 }
 
+/// A guest texture decoded to linear pixels, ready to upload as a sampled
+/// image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextureUpload {
+    pub width: u32,
+    pub height: u32,
+    pub format: vk::Format,
+    /// Linear (de-tiled) pixel data, tightly packed rows.
+    pub pixels: Vec<u8>,
+}
+
+/// The sampled-image + sampler descriptor arrays one translated stage binds.
+///
+/// The recompiled SPIR-V declares `%textures2D_S` (an array of sampled images)
+/// and `%samplers` (an array of samplers) and indexes them with the values the
+/// push constants carry, so the arrays here must match the analyzer's counts
+/// exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextureBinding {
+    pub sampled_binding: u32,
+    pub sampler_binding: u32,
+    pub textures: Vec<TextureUpload>,
+    /// One entry per S#; only linear-vs-nearest is honoured today.
+    pub linear_filter: Vec<bool>,
+}
+
 /// Per-stage resource ABI used by translated SPIR-V.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShaderStageBinding {
@@ -97,6 +123,40 @@ pub struct ShaderStageBinding {
     pub push_constant_offset: u32,
     pub push_constants: Vec<u8>,
     pub storage_buffers: Option<StorageBufferBinding>,
+    pub textures: Option<TextureBinding>,
+}
+
+/// Register-derived alpha-blend state for the single color attachment.
+///
+/// `Default` is blending off with the conventional ONE/ZERO factors, so a
+/// fixture preset (`DrawState::new`) behaves exactly like the old hardcoded
+/// `blend_enable(false)` pipeline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlendState {
+    pub enable: bool,
+    pub src_color: vk::BlendFactor,
+    pub dst_color: vk::BlendFactor,
+    pub color_op: vk::BlendOp,
+    pub src_alpha: vk::BlendFactor,
+    pub dst_alpha: vk::BlendFactor,
+    pub alpha_op: vk::BlendOp,
+    /// `CB_BLEND_{RED,GREEN,BLUE,ALPHA}` — feeds CONSTANT_* factors.
+    pub constants: [f32; 4],
+}
+
+impl Default for BlendState {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            src_color: vk::BlendFactor::ONE,
+            dst_color: vk::BlendFactor::ZERO,
+            color_op: vk::BlendOp::ADD,
+            src_alpha: vk::BlendFactor::ONE,
+            dst_alpha: vk::BlendFactor::ZERO,
+            alpha_op: vk::BlendOp::ADD,
+            constants: [0.0; 4],
+        }
+    }
 }
 
 /// Everything one offscreen draw needs, with nothing hardcoded.
@@ -122,6 +182,8 @@ pub struct DrawState<'a> {
     /// rather than being a limitation: a title that writes RGB and leaves alpha
     /// alone (mask 0x7) is doing something completely ordinary.
     pub color_write_mask: vk::ColorComponentFlags,
+    /// Alpha blending, from `CB_BLEND0_CONTROL` + `CB_BLEND_*`.
+    pub blend: BlendState,
     /// Host vertex data, or `None` for a shader that synthesizes its own
     /// geometry from `gl_VertexIndex` (Kyty's embedded VS does exactly this and
     /// declares no input attributes, so binding one would be invalid).
@@ -172,6 +234,7 @@ impl<'a> DrawState<'a> {
             color_write_mask: vk::ColorComponentFlags::RGBA,
             topology: vk::PrimitiveTopology::TRIANGLE_LIST,
             cull_mode: vk::CullModeFlags::NONE,
+            blend: BlendState::default(),
             vertices: None,
             vertex_buffers: Vec::new(),
             vertex_attributes: Vec::new(),
@@ -303,6 +366,44 @@ pub fn render_triangle_with_spirv(
     )
 }
 
+/// One guest texture uploaded to the device: the staging source, the
+/// device-local image, and the view the descriptor array names. `stage` picks
+/// the pipeline stage the final read-transition makes the image visible to.
+struct TextureGpu {
+    staging_buffer: vk::Buffer,
+    staging_memory: vk::DeviceMemory,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    width: u32,
+    height: u32,
+    stage: vk::ShaderStageFlags,
+}
+
+/// One image layout transition, bundled so `image_barrier` stays readable.
+struct ImageTransition {
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+    src_access: vk::AccessFlags,
+    dst_access: vk::AccessFlags,
+    src_stage: vk::PipelineStageFlags,
+    dst_stage: vk::PipelineStageFlags,
+}
+
+/// The pipeline stage a sampled image must become visible to, for the shader
+/// stage that samples it.
+fn shader_stage_to_pipeline(stage: vk::ShaderStageFlags) -> vk::PipelineStageFlags {
+    if stage.contains(vk::ShaderStageFlags::VERTEX) {
+        vk::PipelineStageFlags::VERTEX_SHADER
+    } else if stage.contains(vk::ShaderStageFlags::FRAGMENT) {
+        vk::PipelineStageFlags::FRAGMENT_SHADER
+    } else if stage.contains(vk::ShaderStageFlags::COMPUTE) {
+        vk::PipelineStageFlags::COMPUTE_SHADER
+    } else {
+        vk::PipelineStageFlags::ALL_COMMANDS
+    }
+}
+
 /// Owns every Vulkan handle the draw needs.
 ///
 /// Handles start null and are filled in by `build`. `Drop` destroys whatever is
@@ -320,6 +421,9 @@ struct Resources<'a> {
     index_memory: vk::DeviceMemory,
     guest_vertex_buffers: Vec<(vk::Buffer, vk::DeviceMemory)>,
     storage_buffers: Vec<(vk::Buffer, vk::DeviceMemory)>,
+    /// Uploaded guest textures and their samplers, in stage-binding order.
+    texture_uploads: Vec<TextureGpu>,
+    samplers: Vec<vk::Sampler>,
     descriptor_set_layouts: Vec<vk::DescriptorSetLayout>,
     descriptor_pool: vk::DescriptorPool,
     descriptor_sets: Vec<(u32, vk::DescriptorSet)>,
@@ -348,6 +452,8 @@ impl<'a> Resources<'a> {
             index_memory: vk::DeviceMemory::null(),
             guest_vertex_buffers: Vec::new(),
             storage_buffers: Vec::new(),
+            texture_uploads: Vec::new(),
+            samplers: Vec::new(),
             descriptor_set_layouts: Vec::new(),
             descriptor_pool: vk::DescriptorPool::null(),
             descriptor_sets: Vec::new(),
@@ -620,16 +726,19 @@ impl<'a> Resources<'a> {
     }
 
     fn create_stage_resources(&mut self, state: &DrawState) -> Result<(), GpuError> {
-        let descriptor_stages: Vec<_> = state
+        let resource_stages: Vec<_> = state
             .stage_bindings
             .iter()
-            .filter(|stage| stage.storage_buffers.is_some())
+            .filter(|stage| stage.storage_buffers.is_some() || stage.textures.is_some())
             .collect();
-        if descriptor_stages.is_empty() {
+        if resource_stages.is_empty() {
             return Ok(());
         }
 
-        for stage in &descriptor_stages {
+        // One set layout per stage, holding that stage's descriptor arrays —
+        // storage buffers, sampled images, samplers — at the exact bindings
+        // the recompiled SPIR-V declares (`shader_calc_binding_indices`).
+        for stage in &resource_stages {
             if stage.descriptor_set_slot as usize != self.descriptor_set_layouts.len() {
                 return Err(GpuError::PipelineCreationFailed(format!(
                     "descriptor set slot {} is not contiguous (expected {})",
@@ -637,17 +746,44 @@ impl<'a> Resources<'a> {
                     self.descriptor_set_layouts.len()
                 )));
             }
-            let storage = stage.storage_buffers.as_ref().expect("filtered above");
-            if storage.buffers.is_empty() {
-                return Err(GpuError::PipelineCreationFailed(
-                    "storage-buffer descriptor array is empty".to_owned(),
-                ));
+            let mut bindings = Vec::new();
+            if let Some(storage) = &stage.storage_buffers {
+                if storage.buffers.is_empty() {
+                    return Err(GpuError::PipelineCreationFailed(
+                        "storage-buffer descriptor array is empty".to_owned(),
+                    ));
+                }
+                bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(storage.binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(storage.buffers.len() as u32)
+                        .stage_flags(stage.stage),
+                );
             }
-            let bindings = [vk::DescriptorSetLayoutBinding::default()
-                .binding(storage.binding)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(storage.buffers.len() as u32)
-                .stage_flags(stage.stage)];
+            if let Some(textures) = &stage.textures {
+                if textures.textures.is_empty() {
+                    return Err(GpuError::PipelineCreationFailed(
+                        "sampled-image descriptor array is empty".to_owned(),
+                    ));
+                }
+                bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(textures.sampled_binding)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .descriptor_count(textures.textures.len() as u32)
+                        .stage_flags(stage.stage),
+                );
+                if !textures.linear_filter.is_empty() {
+                    bindings.push(
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(textures.sampler_binding)
+                            .descriptor_type(vk::DescriptorType::SAMPLER)
+                            .descriptor_count(textures.linear_filter.len() as u32)
+                            .stage_flags(stage.stage),
+                    );
+                }
+            }
             let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
             // SAFETY: `bindings` remains alive for the call; the returned
             // layout is retained through pipeline and descriptor-set use.
@@ -658,20 +794,48 @@ impl<'a> Resources<'a> {
             self.descriptor_set_layouts.push(layout);
         }
 
-        let total_storage: u32 = descriptor_stages
-            .iter()
-            .map(|stage| {
-                stage
-                    .storage_buffers
-                    .as_ref()
-                    .map_or(0, |storage| storage.buffers.len() as u32)
-            })
-            .sum();
-        let pool_sizes = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(total_storage)];
+        let count_of = |pick: &dyn Fn(&ShaderStageBinding) -> u32| -> u32 {
+            resource_stages.iter().map(|stage| pick(stage)).sum()
+        };
+        let pool_sizes: Vec<_> = [
+            (
+                vk::DescriptorType::STORAGE_BUFFER,
+                count_of(&|stage| {
+                    stage
+                        .storage_buffers
+                        .as_ref()
+                        .map_or(0, |storage| storage.buffers.len() as u32)
+                }),
+            ),
+            (
+                vk::DescriptorType::SAMPLED_IMAGE,
+                count_of(&|stage| {
+                    stage
+                        .textures
+                        .as_ref()
+                        .map_or(0, |textures| textures.textures.len() as u32)
+                }),
+            ),
+            (
+                vk::DescriptorType::SAMPLER,
+                count_of(&|stage| {
+                    stage
+                        .textures
+                        .as_ref()
+                        .map_or(0, |textures| textures.linear_filter.len() as u32)
+                }),
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, count)| *count != 0)
+        .map(|(ty, count)| {
+            vk::DescriptorPoolSize::default()
+                .ty(ty)
+                .descriptor_count(count)
+        })
+        .collect();
         let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(descriptor_stages.len() as u32)
+            .max_sets(self.descriptor_set_layouts.len() as u32)
             .pool_sizes(&pool_sizes);
         // SAFETY: the pool-size slice is alive for the call. Pool lifetime is
         // owned by this resource bundle and outlives all allocated sets.
@@ -688,34 +852,195 @@ impl<'a> Resources<'a> {
             GpuError::PipelineCreationFailed(format!("vkAllocateDescriptorSets: {e}"))
         })?;
 
-        for (stage, set) in descriptor_stages.into_iter().zip(sets) {
-            let storage = stage.storage_buffers.as_ref().expect("filtered above");
-            let first_buffer = self.storage_buffers.len();
-            for bytes in &storage.buffers {
-                let allocation =
-                    self.create_buffer_with_bytes(bytes, vk::BufferUsageFlags::STORAGE_BUFFER)?;
-                self.storage_buffers.push(allocation);
+        for (stage, set) in resource_stages.into_iter().zip(sets) {
+            // Upload resources and collect descriptor infos. The info vectors
+            // must outlive `update_descriptor_sets`, so they live at stage
+            // scope rather than inside each branch.
+            let mut buffer_infos = Vec::new();
+            let mut image_infos = Vec::new();
+            let mut sampler_infos = Vec::new();
+            if let Some(storage) = &stage.storage_buffers {
+                for bytes in &storage.buffers {
+                    let allocation =
+                        self.create_buffer_with_bytes(bytes, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+                    self.storage_buffers.push(allocation);
+                }
+                let first_buffer = self.storage_buffers.len() - storage.buffers.len();
+                buffer_infos = self.storage_buffers[first_buffer..]
+                    .iter()
+                    .map(|(buffer, _)| {
+                        vk::DescriptorBufferInfo::default()
+                            .buffer(*buffer)
+                            .offset(0)
+                            .range(vk::WHOLE_SIZE)
+                    })
+                    .collect();
             }
-            let infos: Vec<_> = self.storage_buffers[first_buffer..]
-                .iter()
-                .map(|(buffer, _)| {
-                    vk::DescriptorBufferInfo::default()
-                        .buffer(*buffer)
-                        .offset(0)
-                        .range(vk::WHOLE_SIZE)
-                })
-                .collect();
-            let writes = [vk::WriteDescriptorSet::default()
-                .dst_set(set)
-                .dst_binding(storage.binding)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&infos)];
-            // SAFETY: `set` came from our pool/layout and `infos` names live
-            // buffers retained by this resource bundle.
+            if let Some(textures) = &stage.textures {
+                for upload in &textures.textures {
+                    self.create_texture_image(upload, stage.stage)?;
+                }
+                let first_texture = self.texture_uploads.len() - textures.textures.len();
+                image_infos = self.texture_uploads[first_texture..]
+                    .iter()
+                    .map(|texture| {
+                        vk::DescriptorImageInfo::default()
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                            .image_view(texture.view)
+                    })
+                    .collect();
+                for &linear in &textures.linear_filter {
+                    self.samplers.push(self.create_sampler(linear)?);
+                }
+                let first_sampler = self.samplers.len() - textures.linear_filter.len();
+                sampler_infos = self.samplers[first_sampler..]
+                    .iter()
+                    .map(|&sampler| vk::DescriptorImageInfo::default().sampler(sampler))
+                    .collect();
+            }
+            let mut writes = Vec::new();
+            if let Some(storage) = &stage.storage_buffers {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(storage.binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&buffer_infos),
+                );
+            }
+            if let Some(textures) = &stage.textures {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(textures.sampled_binding)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(&image_infos),
+                );
+                if !textures.linear_filter.is_empty() {
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(textures.sampler_binding)
+                            .descriptor_type(vk::DescriptorType::SAMPLER)
+                            .image_info(&sampler_infos),
+                    );
+                }
+            }
+            // SAFETY: `set` came from our pool/layout and every info names
+            // live buffers, images, and samplers retained by this bundle.
             unsafe { self.device().update_descriptor_sets(&writes, &[]) };
             self.descriptor_sets.push((stage.descriptor_set_slot, set));
         }
         Ok(())
+    }
+
+    /// Upload one decoded guest texture: staging buffer plus device-local
+    /// image and view. The staging-to-image copy is recorded in
+    /// `record_and_submit`, before any rendering samples the image.
+    fn create_texture_image(
+        &mut self,
+        upload: &TextureUpload,
+        stage: vk::ShaderStageFlags,
+    ) -> Result<(), GpuError> {
+        if upload.pixels.is_empty() {
+            return Err(GpuError::VulkanInitFailed(
+                "texture upload requested with no pixels".to_owned(),
+            ));
+        }
+        let (staging_buffer, staging_memory) =
+            self.create_buffer_with_bytes(&upload.pixels, vk::BufferUsageFlags::TRANSFER_SRC)?;
+        // Pushed with null image handles up front: `Drop` destroys whatever is
+        // non-null, so every error path below cleans up the partial upload.
+        self.texture_uploads.push(TextureGpu {
+            staging_buffer,
+            staging_memory,
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            width: upload.width,
+            height: upload.height,
+            stage,
+        });
+        let slot = self.texture_uploads.len() - 1;
+
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(upload.format)
+            .extent(vk::Extent3D {
+                width: upload.width,
+                height: upload.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        // SAFETY: `info` is fully initialized and borrows nothing beyond this
+        // call; the device is live.
+        let image = unsafe { self.device().create_image(&info, None) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("texture vkCreateImage: {e}")))?;
+        self.texture_uploads[slot].image = image;
+
+        // SAFETY: `image` was just created from this device.
+        let reqs = unsafe { self.device().get_image_memory_requirements(image) };
+        let type_index = self
+            .dev
+            .find_memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(reqs.size)
+            .memory_type_index(type_index);
+        // SAFETY: allocation size/type come from this image's own requirements.
+        let memory = unsafe { self.device().allocate_memory(&alloc, None) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("texture allocation: {e}")))?;
+        self.texture_uploads[slot].memory = memory;
+
+        // SAFETY: memory was allocated for exactly this image; offset 0 is
+        // within it and satisfies the alignment requirement by construction.
+        unsafe { self.device().bind_image_memory(image, memory, 0) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("texture bind memory: {e}")))?;
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(upload.format)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        // SAFETY: the view's image is live and its format/range match the
+        // image's creation parameters.
+        let view = unsafe { self.device().create_image_view(&view_info, None) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("texture view: {e}")))?;
+        self.texture_uploads[slot].view = view;
+        Ok(())
+    }
+
+    /// One sampler per S#. Only linear-vs-nearest is honoured today — the S#
+    /// address-mode and LOD fields are not decoded yet, so the sampler repeats
+    /// and clamps to level 0, matching the single uploaded mip.
+    fn create_sampler(&self, linear: bool) -> Result<vk::Sampler, GpuError> {
+        let filter = if linear {
+            vk::Filter::LINEAR
+        } else {
+            vk::Filter::NEAREST
+        };
+        let info = vk::SamplerCreateInfo::default()
+            .mag_filter(filter)
+            .min_filter(filter)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .max_lod(0.0);
+        // SAFETY: plain sampler on a live device; destroyed in Drop.
+        unsafe { self.device().create_sampler(&info, None) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("vkCreateSampler: {e}")))
     }
 
     fn create_readback_buffer(&mut self, width: u32, height: u32) -> Result<(), GpuError> {
@@ -851,9 +1176,16 @@ impl<'a> Resources<'a> {
 
         let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(state.color_write_mask)
-            .blend_enable(false)];
-        let color_blend =
-            vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+            .blend_enable(state.blend.enable)
+            .src_color_blend_factor(state.blend.src_color)
+            .dst_color_blend_factor(state.blend.dst_color)
+            .color_blend_op(state.blend.color_op)
+            .src_alpha_blend_factor(state.blend.src_alpha)
+            .dst_alpha_blend_factor(state.blend.dst_alpha)
+            .alpha_blend_op(state.blend.alpha_op)];
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .attachments(&blend_attachments)
+            .blend_constants(state.blend.constants);
 
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic_state =
@@ -919,24 +1251,17 @@ impl<'a> Resources<'a> {
         Ok(())
     }
 
-    /// Barrier helper: transition the render target between layouts.
-    fn image_barrier(
-        &self,
-        old_layout: vk::ImageLayout,
-        new_layout: vk::ImageLayout,
-        src_access: vk::AccessFlags,
-        dst_access: vk::AccessFlags,
-        src_stage: vk::PipelineStageFlags,
-        dst_stage: vk::PipelineStageFlags,
-    ) {
+    /// Barrier helper: transition `image` (render target or texture) between
+    /// layouts.
+    fn image_barrier(&self, image: vk::Image, transition: ImageTransition) {
         let barrier = vk::ImageMemoryBarrier::default()
-            .old_layout(old_layout)
-            .new_layout(new_layout)
-            .src_access_mask(src_access)
-            .dst_access_mask(dst_access)
+            .old_layout(transition.old_layout)
+            .new_layout(transition.new_layout)
+            .src_access_mask(transition.src_access)
+            .dst_access_mask(transition.dst_access)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(self.image)
+            .image(image)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
@@ -951,8 +1276,8 @@ impl<'a> Resources<'a> {
         unsafe {
             self.device().cmd_pipeline_barrier(
                 self.command_buffer,
-                src_stage,
-                dst_stage,
+                transition.src_stage,
+                transition.dst_stage,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
@@ -974,17 +1299,76 @@ impl<'a> Resources<'a> {
         }
         .map_err(|e| GpuError::VulkanInitFailed(format!("vkBeginCommandBuffer: {e}")))?;
 
+        // Upload guest textures into their device-local images before any
+        // rendering samples them: UNDEFINED -> TRANSFER_DST, staging copy,
+        // then SHADER_READ_ONLY for the stage that samples.
+        for texture in &self.texture_uploads {
+            self.image_barrier(
+                texture.image,
+                ImageTransition {
+                    old_layout: vk::ImageLayout::UNDEFINED,
+                    new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    src_access: vk::AccessFlags::empty(),
+                    dst_access: vk::AccessFlags::TRANSFER_WRITE,
+                    src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+                    dst_stage: vk::PipelineStageFlags::TRANSFER,
+                },
+            );
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width: texture.width,
+                    height: texture.height,
+                    depth: 1,
+                });
+            // SAFETY: the staging buffer holds exactly the upload's bytes
+            // (create_texture_image sized it) and the image was created with
+            // TRANSFER_DST usage; both belong to this device and the command
+            // buffer is recording.
+            unsafe {
+                self.device().cmd_copy_buffer_to_image(
+                    self.command_buffer,
+                    texture.staging_buffer,
+                    texture.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+            }
+            self.image_barrier(
+                texture.image,
+                ImageTransition {
+                    old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    src_access: vk::AccessFlags::TRANSFER_WRITE,
+                    dst_access: vk::AccessFlags::SHADER_READ,
+                    src_stage: vk::PipelineStageFlags::TRANSFER,
+                    dst_stage: shader_stage_to_pipeline(texture.stage),
+                },
+            );
+        }
+
         if state.initial.is_some() {
             // Seed the attachment with the target's prior contents:
             // UNDEFINED -> TRANSFER_DST, copy in, then hand off to the
             // attachment stage so LOAD sees the composed frame so far.
             self.image_barrier(
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::AccessFlags::empty(),
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
+                self.image,
+                ImageTransition {
+                    old_layout: vk::ImageLayout::UNDEFINED,
+                    new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    src_access: vk::AccessFlags::empty(),
+                    dst_access: vk::AccessFlags::TRANSFER_WRITE,
+                    src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+                    dst_stage: vk::PipelineStageFlags::TRANSFER,
+                },
             );
             let region = vk::BufferImageCopy::default()
                 .buffer_offset(0)
@@ -1014,23 +1398,30 @@ impl<'a> Resources<'a> {
                 );
             }
             self.image_barrier(
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::COLOR_ATTACHMENT_READ,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                self.image,
+                ImageTransition {
+                    old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    src_access: vk::AccessFlags::TRANSFER_WRITE,
+                    dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                        | vk::AccessFlags::COLOR_ATTACHMENT_READ,
+                    src_stage: vk::PipelineStageFlags::TRANSFER,
+                    dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                },
             );
         } else {
             // UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL. Discards existing
             // contents, which is fine: the render pass clears anyway.
             self.image_barrier(
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::AccessFlags::empty(),
-                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                self.image,
+                ImageTransition {
+                    old_layout: vk::ImageLayout::UNDEFINED,
+                    new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    src_access: vk::AccessFlags::empty(),
+                    dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+                    dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                },
             );
         }
 
@@ -1150,12 +1541,15 @@ impl<'a> Resources<'a> {
 
         // COLOR_ATTACHMENT_OPTIMAL -> TRANSFER_SRC_OPTIMAL for the copy out.
         self.image_barrier(
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-            vk::AccessFlags::TRANSFER_READ,
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::PipelineStageFlags::TRANSFER,
+            self.image,
+            ImageTransition {
+                old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                src_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                dst_access: vk::AccessFlags::TRANSFER_READ,
+                src_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                dst_stage: vk::PipelineStageFlags::TRANSFER,
+            },
         );
 
         // buffer_row_length/image_height = 0 means "tightly packed", which is
@@ -1263,6 +1657,8 @@ impl Drop for Resources<'_> {
         let descriptor_set_layouts = mem::take(&mut self.descriptor_set_layouts);
         let guest_vertex_buffers = mem::take(&mut self.guest_vertex_buffers);
         let storage_buffers = mem::take(&mut self.storage_buffers);
+        let texture_uploads = mem::take(&mut self.texture_uploads);
+        let samplers = mem::take(&mut self.samplers);
         // SAFETY: every handle was created from `self.dev`'s device and is
         // destroyed exactly once, children before parents. `device_wait_idle`
         // ensures no submitted work still references them; its error is ignored
@@ -1328,6 +1724,22 @@ impl Drop for Resources<'_> {
             for (buffer, memory) in storage_buffers {
                 d.destroy_buffer(buffer, None);
                 d.free_memory(memory, None);
+            }
+            for sampler in samplers {
+                d.destroy_sampler(sampler, None);
+            }
+            for texture in texture_uploads {
+                if texture.view != vk::ImageView::null() {
+                    d.destroy_image_view(texture.view, None);
+                }
+                if texture.image != vk::Image::null() {
+                    d.destroy_image(texture.image, None);
+                }
+                if texture.memory != vk::DeviceMemory::null() {
+                    d.free_memory(texture.memory, None);
+                }
+                d.destroy_buffer(texture.staging_buffer, None);
+                d.free_memory(texture.staging_memory, None);
             }
             if self.image_view != vk::ImageView::null() {
                 d.destroy_image_view(self.image_view, None);

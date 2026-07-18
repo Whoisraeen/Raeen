@@ -3,6 +3,35 @@
 (Recreated 2026-07-16 — the previous ledger file was absent from the tree;
 per-module authority is `docs/reference-port-ledger.md`.)
 
+- Texture chain completed + two GPU blockers (2026-07-18, commit pending;
+  106/106 xps5x-gpu lib + 225/225 kyty-graphics, clippy clean):
+  * Vulkan consume of `ShaderStageBinding.textures` (the missing half of the
+    in-flight texture work): offscreen.rs now builds SAMPLED_IMAGE + SAMPLER
+    descriptor arrays per stage (bindings from `shader_calc_binding_indices`),
+    uploads guest textures staging→device-local→SHADER_READ_ONLY, one sampler
+    per S# (linear/nearest). Acceptance: tests/texture_upload.rs — recompiler-
+    ABI PS (push-const indices, OpSampledImage/OpImageSampleImplicitLod)
+    samples a magenta texel; center=magenta, corners=clear, 0 validation
+    errors. Gotcha: recompiler lists resource vars in OpEntryPoint interface
+    (spirv-val requires it under Vulkan 1.3).
+  * VB/storage fetch cap bug MEASURED: "vertex buffer guest range not fully
+    readable" (7762×/run, only 3 executed draws) was NOT memory — the
+    committed-prefix probe printed prefix == size. The 64K-dword
+    MAX_READ_DWORDS cap (meant for CP out-of-band mis-decode protection) was
+    misapplied to resource fetches; Minecraft binds a 4 MiB vertex-arena V#.
+    Fix: `read_dwords_validated` (resource path, 256 MiB cap) for
+    draw_translate's read_guest_bytes; the CP out-of-band path keeps the 64K
+    cap. Same root cause as run-1's storage-buffer failure.
+  * Alpha blending: CB_BLEND0_CONTROL..7 + CB_BLEND_{RED..ALPHA} decode in
+    kyty-graphics run.rs (Kyty bit layout; SharpEmu AgcPrimaryRegisterDefaults
+    confirms addresses), `blend_state_from_regs` → Vulkan blend attachment +
+    constants (dual-source/BOTH_SRC_ALPHA = named errors, never silent ZERO;
+    !separate_alpha reuses colour factors = hw behaviour). Acceptance:
+    tests/blend_state.rs — SRC_ALPHA/1-SRC_ALPHA/ADD over seeded red reads
+    back (128,128,0,128), corner stays seeded, 0 validation errors.
+  * Recompiler table tests updated for the ImageSample nine (177 impl/44 NI;
+    NI-error test retargeted to ImageStoreMip — no guessed encodings).
+
 - GraphicsRun CommandProcessor (Kyty Gen5 CP): expanded for retail DCBs
   (commit pending, 194/194 kyty-graphics + 86/86 xps5x-gpu tests).
   Resilience policy: unknown op/register = rate-limited warn + skip-by-length;

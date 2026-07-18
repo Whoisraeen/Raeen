@@ -33,6 +33,7 @@ pub enum ShaderInstructionType {
     Unknown,
 
     BufferLoadDword,
+    BufferLoadDwordX4,
     BufferLoadFormatX,
     BufferLoadFormatXy,
     BufferLoadFormatXyz,
@@ -385,6 +386,8 @@ pub mod shader_instruction_format {
         Vdata3Vaddr3StSsDmask7 = format_define(&[DA3, S0A3, S1A8, S2A4, DMASK_7]),
         Vdata3Vaddr4StSsDmask7 = format_define(&[DA3, S0A4, S1A8, S2A4, DMASK_7]),
         Vdata3VaddrSvSoffsIdxen = format_define(&[DA3, S0, S1A4, S2, IDXEN]),
+        Vdata4Vaddr2SvSoffsOffenIdxen =
+            format_define(&[DA4, S0A2, S1A4, S2, OFFEN, IDXEN]),
         Vdata4Vaddr2SvSoffsOffenIdxenFloat4 =
             format_define(&[DA4, S0A2, S1A4, S2, OFFEN, IDXEN, FLOAT4]),
         Vdata4Vaddr3StDmaskF = format_define(&[DA4, S0A3, S1A8, DMASK_F]),

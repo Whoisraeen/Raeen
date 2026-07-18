@@ -213,6 +213,12 @@ pub const PA_SC_VPORT_SCISSOR_0_BR: u32 = 0x95;
 pub const PA_SC_VPORT_ZMIN_0: u32 = 0xB4;
 pub const PA_CL_VPORT_XSCALE: u32 = 0x10F;
 pub const CB_BLEND0_CONTROL: u32 = 0x1E0;
+/// `CB_BLEND0_CONTROL..CB_BLEND7_CONTROL` occupy eight consecutive dwords.
+pub const CB_BLEND_CONTROL_SLOTS: u32 = 8;
+pub const CB_BLEND_RED: u32 = 0x105;
+pub const CB_BLEND_GREEN: u32 = 0x106;
+pub const CB_BLEND_BLUE: u32 = 0x107;
+pub const CB_BLEND_ALPHA: u32 = 0x108;
 pub const DB_DEPTH_CONTROL: u32 = 0x200;
 pub const CB_COLOR_CONTROL: u32 = 0x202;
 pub const PA_SU_SC_MODE_CNTL: u32 = 0x205;
