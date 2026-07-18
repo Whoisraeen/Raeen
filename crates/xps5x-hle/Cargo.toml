@@ -21,3 +21,7 @@ memchr = "2"
 # deterministic emulator-global seed to titles.
 getrandom = "0.3"
 sha1 = { workspace = true }
+
+# GetTimeZoneInformation for libSceRtc's UTC→local conversion (Windows-only).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

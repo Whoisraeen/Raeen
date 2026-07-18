@@ -161,6 +161,8 @@ fn sampled_texture_pixels_reach_the_readback() {
         height: 2,
         format: ash::vk::Format::R8G8B8A8_UNORM,
         pixels,
+        layers: 1,
+        cube: false,
     };
 
     let vs = triangle_vertex_spirv();

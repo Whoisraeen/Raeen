@@ -1076,23 +1076,61 @@ fn shader_parse_vop1(
     let b0 = buffer[0];
 
     let vdst = (b0 >> 17) & 0xff;
-    let src0 = b0 & 0x1ff;
+    let mut src0 = b0 & 0x1ff;
     let opcode = (b0 >> 9) & 0xff;
+
+    // SDWA (src0 == 249): a second dword carries the real src0 plus sub-dword
+    // select and abs/neg/clamp/omod modifiers. VOP2 and VOPC decode this, but
+    // VOP1 did not — so `operand_parse` was handed the 249 marker directly and
+    // failed the whole shader. Measured: Minecraft's UI PS emits
+    // `v_rcp_f32 v1, |v5|` (SDWA abs) this way. Mirrors the VOP2 SDWA block
+    // (single source: no src1 fields).
+    let sdwa = src0 == 249;
+    let mut size: u32 = if sdwa { 2 } else { 1 };
+    let b1 = if sdwa { dw(buffer, 1, pc)? } else { 0 };
+    src0 = if sdwa { b1 & 0xff } else { src0 };
+    let dst_sel = if sdwa { (b1 >> 8) & 0x7 } else { 6 };
+    let dst_u = if sdwa { (b1 >> 11) & 0x3 } else { 2 };
+    let clmp = if sdwa { (b1 >> 13) & 0x1 } else { 0 };
+    let omod = if sdwa { (b1 >> 14) & 0x3 } else { 0 };
+    let src0_sel = if sdwa { (b1 >> 16) & 0x7 } else { 6 };
+    let src0_sext = if sdwa { (b1 >> 19) & 0x1 } else { 0 };
+    let src0_neg = if sdwa { (b1 >> 20) & 0x1 } else { 0 };
+    let src0_abs = if sdwa { (b1 >> 21) & 0x1 } else { 0 };
+    let s0 = if sdwa { (b1 >> 23) & 0x1 } else { 1 };
+
+    if dst_sel != 6 {
+        return Err(feature(S, "sdwa dst_sel != 6", pc));
+    }
+    if sdwa && dst_sel == 6 && dst_u != 0 {
+        return Err(feature(S, "sdwa dst_u != 0", pc));
+    }
+    if omod != 0 {
+        return Err(feature(S, "sdwa omod != 0", pc));
+    }
+    if src0_sel != 6 {
+        return Err(feature(S, "sdwa src0_sel != 6", pc));
+    }
+    if src0_sext != 0 {
+        return Err(feature(S, "sdwa src0_sext != 0", pc));
+    }
 
     let mut inst = ShaderInstruction {
         pc,
         ..Default::default()
     };
-    inst.src[0] = operand_parse(src0)?;
+    inst.src[0] = operand_parse(src0 + if s0 == 0 { 256 } else { 0 })?;
     inst.dst = operand_parse(vdst + 256)?;
     inst.src_num = 1;
-
-    let mut size: u32 = 1;
 
     if inst.src[0].type_ == O::LiteralConstant {
         inst.src[0].constant.u = dw(buffer, size, pc)?;
         size += 1;
     }
+
+    inst.src[0].absolute = src0_abs != 0;
+    inst.src[0].negate = src0_neg != 0;
+    inst.dst.clamp = clmp != 0;
 
     inst.format = F::SVdstSVsrc0;
 
@@ -1834,10 +1872,10 @@ fn shader_parse_vop3(
         0x141 => inst.type_ = T::VMadF32,
         0x142 => return Err(ni(dst, S, "v_mad_i32_i24", opcode, pc, b0)),
         0x143 => inst.type_ = T::VMadU32U24,
-        0x144 => return Err(ni(dst, S, "v_cubeid_f32", opcode, pc, b0)),
-        0x145 => return Err(ni(dst, S, "v_cubesc_f32", opcode, pc, b0)),
-        0x146 => return Err(ni(dst, S, "v_cubetc_f32", opcode, pc, b0)),
-        0x147 => return Err(ni(dst, S, "v_cubema_f32", opcode, pc, b0)),
+        0x144 => inst.type_ = T::VCubeIdF32,
+        0x145 => inst.type_ = T::VCubeScF32,
+        0x146 => inst.type_ = T::VCubeTcF32,
+        0x147 => inst.type_ = T::VCubeMaF32,
         0x148 => inst.type_ = T::VBfeU32,
         0x149 => return Err(ni(dst, S, "v_bfe_i32", opcode, pc, b0)),
         0x14a => return Err(ni(dst, S, "v_bfi_b32", opcode, pc, b0)),
@@ -3351,6 +3389,23 @@ mod tests {
         let (code, result) = parse(src, ShaderType::Vertex, false);
         let consumed = result.expect("parse failed");
         (code, consumed)
+    }
+
+    #[test]
+    fn vop1_sdwa_decodes_abs_modifier() {
+        // Measured in Minecraft's UI PS (ps_253f0800): `v_rcp_f32 v1, |v5|` —
+        // VOP1 with the SDWA marker (src0 == 249) whose second dword carries
+        // the real src0 (v5) plus the abs modifier. VOP1 previously lacked the
+        // SDWA handling that VOP2/VOPC have, so `operand_parse` was handed the
+        // 249 marker and failed the whole shader with "unknown operand: 249".
+        let (code, _) = parse_vs(&[0x7e02_54f9, 0x0026_0605, S_ENDPGM]);
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::VRcpF32);
+        assert_eq!(inst.format, F::SVdstSVsrc0);
+        assert_eq!((inst.src[0].type_, inst.src[0].register_id), (O::Vgpr, 5));
+        assert!(inst.src[0].absolute, "SDWA abs modifier applied to src0");
+        assert!(!inst.src[0].negate);
+        assert_eq!(inst.dst.register_id, 1);
     }
 
     // ---- 1. operand_parse table (Kyty: ShaderParse.cpp L32) ----

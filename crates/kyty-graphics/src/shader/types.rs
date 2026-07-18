@@ -190,6 +190,14 @@ pub enum ShaderInstructionType {
     VCvtF32Ubyte3,
     /// VOP1 0x8: `vdst = (int)vsrc0` (float→signed int). The signed sibling
     /// of `VCvtU32F32`, measured in Minecraft's menu CS.
+    /// RDNA/GCN cubemap-coordinate helpers (VOP3 0x144-0x147). Together they
+    /// turn a 3D direction (x=src0, y=src1, z=src2) into a cube face id, the
+    /// S/T face coordinates, and the major-axis divisor. Formulas ported from
+    /// shadPS4 (`vector_alu.cpp` V_CUBE*_F32 + `SelectCubeResult`).
+    VCubeIdF32,
+    VCubeScF32,
+    VCubeTcF32,
+    VCubeMaF32,
     VCvtI32F32,
     VCvtPkrtzF16F32,
     VCvtU32F32,

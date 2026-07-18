@@ -76,6 +76,11 @@ pub fn register(registry: &HleRegistry) {
         "sceRtcGetCurrentClockLocalTime",
         hle_get_current_clock,
     );
+    registry.register(
+        "libSceRtc",
+        "sceRtcConvertUtcToLocalTime",
+        hle_convert_utc_to_local_time,
+    );
     registry.register("libSceRtc", "sceRtcIsLeapYear", hle_is_leap_year);
     registry.register("libSceRtc", "sceRtcGetDaysInMonth", hle_get_days_in_month);
     registry.register("libSceRtc", "sceRtcGetDayOfWeek", hle_get_day_of_week);
@@ -350,6 +355,53 @@ fn hle_set_tick(ctx: &HleContext, args: &[u64]) -> u64 {
         return ERR_INVALID_POINTER;
     }
     OK
+}
+
+/// `sceRtcConvertUtcToLocalTime(tickUtc*, tickLocal*)`: read the UTC tick,
+/// shift it by the host's timezone bias, write the local tick. SharpEmu's
+/// `RtcConvertUtcToLocalTime` (TimeZoneInfo.Local); the bias is the Windows
+/// `GetTimeZoneInformation` value (UTC = local + bias ⇒ local = UTC − bias).
+fn hle_convert_utc_to_local_time(ctx: &HleContext, args: &[u64]) -> u64 {
+    let utc_ptr = args.first().copied().unwrap_or(0);
+    let local_ptr = args.get(1).copied().unwrap_or(0);
+    if utc_ptr == 0 || local_ptr == 0 {
+        return ERR_INVALID_POINTER;
+    }
+    let mut buf = [0u8; 8];
+    if !ctx.mem.read(utc_ptr, &mut buf) {
+        return ERR_INVALID_POINTER;
+    }
+    let utc = u64::from_le_bytes(buf) as i64;
+    let local = utc - host_timezone_bias_microseconds();
+    if local < 0 {
+        return ERR_INVALID_VALUE;
+    }
+    if !ctx.mem.write(local_ptr, &(local as u64).to_le_bytes()) {
+        return ERR_INVALID_POINTER;
+    }
+    OK
+}
+
+/// The host's UTC bias in microseconds (positive when local time is BEHIND
+/// UTC, e.g. US timezones). Cached — the bias can only change on a TZ change
+/// the title has no way to trigger.
+fn host_timezone_bias_microseconds() -> i64 {
+    #[cfg(windows)]
+    {
+        use std::sync::OnceLock;
+        static BIAS_US: OnceLock<i64> = OnceLock::new();
+        *BIAS_US.get_or_init(|| {
+            use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+            // SAFETY: plain out-param struct on a live thread; no aliasing.
+            let mut info: TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
+            let _ = unsafe { GetTimeZoneInformation(&mut info) };
+            i64::from(info.Bias) * MICROSECONDS_PER_MINUTE as i64
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        0 // honest offline default: local == UTC until a platform hook lands
+    }
 }
 
 /// `sceRtcCheckValid(const SceRtcDateTime *)`: validate each field in order,

@@ -45,8 +45,14 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceNetCtl", "sceNetCtlInit", hle_ok);
     registry.register("libSceNetCtl", "sceNetCtlTerm", hle_ok);
     registry.register("libSceNetCtl", "sceNetCtlGetState", hle_ctl_get_state);
+    registry.register("libSceNetCtl", "sceNetCtlGetStateV6", hle_ctl_get_state);
     registry.register("libSceNetCtl", "sceNetCtlCheckCallback", hle_ok);
     registry.register("libSceNetCtl", "sceNetCtlRegisterCallback", hle_ok);
+    registry.register("libSceNetCtl", "sceNetCtlRegisterCallbackV6", hle_ok);
+    registry.register("libSceNet", "sceNetEpollCreate", hle_epoll_create);
+    registry.register("libSceNet", "sceNetEpollControl", hle_epoll_control);
+    registry.register("libSceNet", "sceNetEpollWait", hle_epoll_wait);
+    registry.register("libSceNet", "sceNetEpollDestroy", hle_epoll_destroy);
     registry.register_nid(
         "libSceNetCtl",
         "sceNetCtlGetInfo",
@@ -100,6 +106,63 @@ fn hle_inet_pton(ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_htonl(_ctx: &HleContext, args: &[u64]) -> u64 {
     let v = args.first().copied().unwrap_or(0) as u32;
     v.to_be() as u64
+}
+
+/// `sceNetEpollCreate(name, flags)`: a fresh offline epoll id (empty set).
+fn hle_epoll_create(ctx: &HleContext, _args: &[u64]) -> u64 {
+    let id = ctx.kernel.create_epoll();
+    debug!("sceNetEpollCreate() -> {id}");
+    u64::from(id)
+}
+
+/// `sceNetEpollControl(epid, op, fd, event)`: ADD=1 / MOD=2 records
+/// (fd, events, data); DEL=3 drops the fd. Offline sockets only.
+fn hle_epoll_control(ctx: &HleContext, args: &[u64]) -> u64 {
+    const NET_ERROR_ENOENT: u64 = 0x8041_0103;
+    let epid = args.first().copied().unwrap_or(0) as u32;
+    let op = args.get(1).copied().unwrap_or(0);
+    let fd = args.get(2).copied().unwrap_or(0) as i32;
+    let event_ptr = args.get(3).copied().unwrap_or(0);
+    let Some(mut set) = ctx.kernel.kernel_epolls.get_mut(&epid) else {
+        return NET_ERROR_ENOENT;
+    };
+    match op {
+        1 | 2 => {
+            // SceNetEpollEvent: events u32 @0, data u64 @8.
+            let mut raw = [0u8; 16];
+            if event_ptr != 0 && !ctx.mem.read(event_ptr, &mut raw) {
+                return NET_ERROR_INVALID_ARGUMENT;
+            }
+            let events = u32::from_le_bytes(raw[0..4].try_into().expect("fixed slice"));
+            let data = u64::from_le_bytes(raw[8..16].try_into().expect("fixed slice"));
+            set.retain(|(f, _, _)| *f != fd);
+            set.push((fd, events, data));
+        }
+        3 => set.retain(|(f, _, _)| *f != fd),
+        _ => return NET_ERROR_INVALID_ARGUMENT,
+    }
+    SCE_OK
+}
+
+/// `sceNetEpollWait(epid, events, maxevents, timeout)`: offline — no fd ever
+/// becomes ready. Wait a bounded slice of the requested timeout (an unbounded
+/// block would hang the caller; the equeue lesson) and report 0 events.
+fn hle_epoll_wait(ctx: &HleContext, args: &[u64]) -> u64 {
+    let epid = args.first().copied().unwrap_or(0) as u32;
+    let timeout_ms = args.get(3).copied().unwrap_or(0) as i32;
+    if !ctx.kernel.kernel_epolls.contains_key(&epid) {
+        return NET_ERROR_INVALID_ARGUMENT;
+    }
+    let wait = if timeout_ms < 0 { 50 } else { (timeout_ms as u64).min(50) };
+    std::thread::sleep(std::time::Duration::from_millis(wait));
+    0
+}
+
+/// `sceNetEpollDestroy(epid)`: drop the set.
+fn hle_epoll_destroy(ctx: &HleContext, args: &[u64]) -> u64 {
+    let epid = args.first().copied().unwrap_or(0) as u32;
+    ctx.kernel.kernel_epolls.remove(&epid);
+    SCE_OK
 }
 
 /// Real `sceNetHtons(uint16_t)`: host→network byte order (16-bit).

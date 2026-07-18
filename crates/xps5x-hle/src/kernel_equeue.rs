@@ -34,6 +34,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "sceKernelDeleteEqueue", hle_delete);
     registry.register("libkernel", "sceKernelAddUserEvent", hle_add_user_event);
     registry.register("libkernel", "sceKernelAddUserEventEdge", hle_add_user_event);
+    registry.register("libkernel", "sceKernelAddAmprEvent", hle_add_ampr_event);
     registry.register_nid(
         "libkernel",
         "sceKernelAddReadEvent",
@@ -110,6 +111,29 @@ fn hle_add_user_event(ctx: &HleContext, args: &[u64]) -> u64 {
         .kernel_equeue_events
         .insert((eq, id), xps5x_kernel::EqueueUserEvent::default());
     debug!(eq, id, "registered kernel user event");
+    OK
+}
+
+/// `sceKernelAddAmprEvent(eq, id, data)`: register an AMPR event — SharpEmu
+/// `KernelEventQueueCompatExports.KernelAddAmprEvent`. Same queue model as a
+/// user event (the filter distinction is internal to the kernel; a later
+/// trigger fires it either way), with `data` as the event's udata. Measured:
+/// Dragon Ball right after PlayGo init.
+fn hle_add_ampr_event(ctx: &HleContext, args: &[u64]) -> u64 {
+    let eq = args.first().copied().unwrap_or(0);
+    let id = args.get(1).copied().unwrap_or(0);
+    let data = args.get(2).copied().unwrap_or(0);
+    if !ctx.kernel.kernel_equeues.contains_key(&eq) {
+        return SCE_KERNEL_ERROR_ESRCH;
+    }
+    ctx.kernel.kernel_equeue_events.insert(
+        (eq, id),
+        xps5x_kernel::EqueueUserEvent {
+            udata: data,
+            ..Default::default()
+        },
+    );
+    debug!(eq, id, data, "registered kernel AMPR event");
     OK
 }
 

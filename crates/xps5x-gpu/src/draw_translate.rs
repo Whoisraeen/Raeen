@@ -363,12 +363,14 @@ fn gen5_vertex_format(format: u8) -> Result<vk::Format, DrawError> {
     // Gen5 unified-format code → Vulkan, per SharpEmu's Gfx10UnifiedFormat
     // table (the RDNA2 authority): 64 → (11,7) = 32_32_FLOAT,
     // 74 → (13,7) = 32_32_32_FLOAT, 77 → (14,7) = 32_32_32_32_FLOAT,
-    // 56 → (10,0) = 8_8_8_8 UNORM (vertex colour, measured on a UI draw).
+    // 56 → (10,0) = 8_8_8_8 UNORM, 71 → (12,7) = 16_16_16_16_FLOAT.
     match format {
         74 => Ok(vk::Format::R32G32B32_SFLOAT),
         64 => Ok(vk::Format::R32G32_SFLOAT),
         77 => Ok(vk::Format::R32G32B32A32_SFLOAT),
         56 => Ok(vk::Format::R8G8B8A8_UNORM),
+        71 => Ok(vk::Format::R16G16B16A16_SFLOAT),
+        23 => Ok(vk::Format::R16G16_UNORM),
         other => Err(err(format!(
             "unsupported Gen5 vertex-buffer format {other}"
         ))),
@@ -452,12 +454,17 @@ fn decode_texture(t: &kyty_graphics::shader::ShaderTextureResource) -> Result<Te
     if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) {
         return Err(err(format!("texture extent {width}x{height} out of range")));
     }
-    if t.type_() != 9 {
-        return Err(err(format!(
-            "texture type {} is not Texture2D — view-type support pending",
-            t.type_()
-        )));
-    }
+    // 9 = Texture2D, 11 = Cube (measured: Minecraft's 1024x1024x6 skybox).
+    let cube = match t.type_() {
+        9 => false,
+        11 => true,
+        other => {
+            return Err(err(format!(
+                "texture type {other} is not Texture2D (9) or Cube (11)"
+            )));
+        }
+    };
+    let layers = if cube { u32::from(t.depth()) + 1 } else { 1 };
 
     // Gen5 unified T# format -> (Vulkan format, bytes per pixel), decoded via
     // SharpEmu's Gfx10UnifiedFormat table (the RDNA2 authority). Filled from
@@ -485,6 +492,11 @@ fn decode_texture(t: &kyty_graphics::shader::ShaderTextureResource) -> Result<Te
     };
 
     let pixels = match t.tile_mode() {
+        0 if cube => {
+            return Err(err(
+                "cube texture with linear tile mode not implemented (only tiled measured)",
+            ));
+        }
         0 => {
             // Linear: row-major at `pitch`, trimmed to tight rows below.
             let pitch = u32::from(t.pitch()).max(width);
@@ -502,17 +514,29 @@ fn decode_texture(t: &kyty_graphics::shader::ShaderTextureResource) -> Result<Te
             }
             pixels
         }
-        // SW_64KB_R_X: the exact PS5/Oberon macro swizzle (AddrLib equation
-        // via SharpEmu's GnmTiling). Fetch whole 64 KiB blocks — a tiled
-        // surface owns its padding — and deswizzle.
-        27 => {
+        // 64 KiB-block GFX10 swizzles with a ported exact equation
+        // (SW_64KB_S = 9 measured on the 1937x333 atlas; SW_64KB_R_X = 27 on
+        // the 1920x1080 UI texture). Fetch whole 64 KiB blocks — a tiled
+        // surface owns its padding — and deswizzle, per array layer (a cube's
+        // six faces are six block grids back to back).
+        mode if crate::texture::tiling::swizzle_64kb_table(mode).is_some() => {
             let bpp_log2 = bpp.trailing_zeros();
+            let face_tiled =
+                crate::texture::tiling::tiled_byte_count_64kb(width, height, bpp_log2) as usize;
+            let face_linear = (width * height * bpp) as usize;
             let tiled = read_guest_bytes_unaligned(
                 t.base40(),
-                crate::texture::tiling::tiled_byte_count_64kb(width, height, bpp_log2),
+                face_tiled as u64 * u64::from(layers),
                 "texture",
             )?;
-            crate::texture::tiling::detile_64kb_r_x(&tiled, width, height, bpp_log2)
+            let mut pixels = vec![0u8; face_linear * layers as usize];
+            for layer in 0..layers as usize {
+                let src = &tiled[layer * face_tiled..(layer + 1) * face_tiled];
+                let face = crate::texture::tiling::detile_64kb(mode, src, width, height, bpp_log2)
+                    .expect("table-checked above");
+                pixels[layer * face_linear..(layer + 1) * face_linear].copy_from_slice(&face);
+            }
+            pixels
         }
         other => {
             return Err(err(format!(
@@ -528,6 +552,8 @@ fn decode_texture(t: &kyty_graphics::shader::ShaderTextureResource) -> Result<Te
         height,
         format,
         pixels,
+        layers,
+        cube,
     })
 }
 
@@ -1616,6 +1642,11 @@ mod tests {
             vk::Format::R32G32B32A32_SFLOAT
         );
         assert_eq!(gen5_vertex_format(56).unwrap(), vk::Format::R8G8B8A8_UNORM);
+        assert_eq!(
+            gen5_vertex_format(71).unwrap(),
+            vk::Format::R16G16B16A16_SFLOAT
+        );
+        assert_eq!(gen5_vertex_format(23).unwrap(), vk::Format::R16G16_UNORM);
         let e = gen5_vertex_format(0).expect_err("unknown formats stay named");
         assert!(format!("{e}").contains('0'));
     }
@@ -1648,5 +1679,52 @@ mod tests {
         assert_eq!((tex.width, tex.height), (w, h));
         assert_eq!(tex.format, vk::Format::R8G8B8A8_UNORM);
         assert_eq!(tex.pixels, linear, "detiled pixels must match the original");
+    }
+
+    /// A cube T# (type 11, six faces, SWIZZLE_MODE 9 = SW_64KB_S — the
+    /// measured skybox shape) decodes every face and marks the upload CUBE.
+    #[test]
+    fn decode_texture_cube_decodes_all_six_faces() {
+        let (w, h, bpp_log2) = (8u32, 8u32, 2u32);
+        let bpp = 1usize << bpp_log2;
+        // Six faces with distinct first-byte-per-face content.
+        let faces: Vec<Vec<u8>> = (0..6u8)
+            .map(|f| {
+                (0..(w * h) as usize * bpp)
+                    .map(|i| (f * 40 + (i % 37) as u8) % 251)
+                    .collect()
+            })
+            .collect();
+        let tiled: Vec<u8> = faces
+            .iter()
+            .flat_map(|f| crate::texture::tiling::tile_64kb_s(f, w, h, bpp_log2))
+            .collect();
+        let mut blob = vec![0u8; tiled.len() + 255];
+        let base = (blob.as_ptr() as u64 + 255) & !255;
+        let off = (base - blob.as_ptr() as u64) as usize;
+        blob[off..off + tiled.len()].copy_from_slice(&tiled);
+
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.update_address40(base >> 8);
+        t.fields[1] |= 56 << 20;
+        t.fields[1] |= ((w - 1) & 3) << 30;
+        t.fields[2] = (w - 1) >> 2;
+        t.fields[2] |= (h - 1) << 14;
+        t.fields[3] |= 9 << 20; // SWIZZLE_MODE 9 = SW_64KB_S
+        t.fields[3] |= 11 << 28; // type = Cube
+        t.fields[4] = 5; // depth 5 + 1 = 6 faces
+
+        let tex = decode_texture(&t).expect("cube texture decodes");
+        assert!(tex.cube);
+        assert_eq!(tex.layers, 6);
+        assert_eq!((tex.width, tex.height), (w, h));
+        let face_bytes = (w * h) as usize * bpp;
+        for (l, face) in faces.iter().enumerate() {
+            assert_eq!(
+                &tex.pixels[l * face_bytes..(l + 1) * face_bytes],
+                face.as_slice(),
+                "face {l} must detile to its original pixels"
+            );
+        }
     }
 }

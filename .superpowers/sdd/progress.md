@@ -3,6 +3,155 @@
 (Recreated 2026-07-16 — the previous ledger file was absent from the tree;
 per-module authority is `docs/reference-port-ledger.md`.)
 
+  * **Blocking WaitEventFlag** (the hot-spin fix): poll-and-instant-ETIMEDOUT
+    was built for single-active-execution; with real guest threads it made 5
+    threads spin at 100% CPU. Now a shared (Mutex,Condvar)
+    `event_flag_signal` — Set/Clear/Cancel notify_all, WaitEventFlag blocks
+    with a deadline (NULL timeout = 50ms forever-slice, equeue-style; bounded
+    honors requested µs capped at 50ms). Test: cross-thread
+    wait_blocks_until_another_thread_sets_the_flag (263/263 hle).
+    Measured: the 5 spinners now park at a host wait; t1(main) still stalls.
+  * **Dragon Ball stall root-caused to the guest level** (next gate): t1 spins
+    at `eboot+0x2bd2151` — a linked-list walk waiting for every task's
+    state field (+0x48) to hit 0 (a TASK-QUEUE DRAIN WAIT, yielding between
+    polls via call 0x2bbfc80) while all 13 background workers idle in
+    scePthreadCondWait. Tasks never reach the workers: the posting/wake chain
+    (job scheduler / event / audio callback) is the next investigation. Not a
+    sync-primitive bug anymore — the cond waits are correctly blocked.
+
+- Dragon Ball task-drain stall (2026-07-18, measured via XPS5X_STALL_DUMP +
+  --dump-vaddr): the 29 threads are Unreal's TaskGraph (Foreground/Background
+  Workers + ThreadPool). t1(main) spins at `eboot+0x2bd2151`: a linked-list
+  walk waiting for every task's state field (+0x48) to hit 0 (UE
+  WaitUntilTasksComplete), yielding between polls via call 0x2bbfc80 — while
+  all 13 workers idle in scePthreadCondWait (correctly blocked; the
+  blocking-WaitEventFlag fix parked the earlier hot-spinners). **0 AGC calls
+  yet** — the stall is pre-RHI. The task posting/wake chain (or a prerequisite
+  task's own gate) is the open question: workers are never woken to consume,
+  and the main thread's TLS check (scePthreadGetspecific) never flips. The
+  "Project file not found" log is cosmetic — the .uproject is not in
+  package.manifest, so a real PS5 logs identically.
+  Universal-import note: 359 link-time missing NIDs (libSceAgc Cb/Acb/Dcb
+  builders, Audiodec, AudioOut2, AudioIn, NP dialogs) — link-time only, none
+  called yet on the boot path (the fault-at-call diagnostic names them as they
+  become live).
+
+- Dragon Ball boot chain (2026-07-18, commit pending; 262/262 hle, 20/20
+  kernel tests, workspace clippy clean):
+  * sceKernelAioInitializeParam/Impl (synchronous AIO model), scePlayGoGetChunkId
+    (SharpEmu ABI: count-only vs list mode, BAD_POINTER/BAD_SIZE codes),
+    sceKernelAddAmprEvent (equeue registration), pthread_create_name_np
+    (create + thread_names record), sceKernelClockGetres ({0,1}),
+    sceRtcConvertUtcToLocalTime (real host TZ bias via GetTimeZoneInformation;
+    windows-sys added to xps5x-hle + Win32_System_Time feature),
+    sceNetCtlRegisterCallbackV6/GetStateV6 (aliases), sceNetEpoll* (offline
+    create/control/wait(≤50ms, 0 events)/destroy),
+    sceNpWebApi2CreateUserContext (local-user handle).
+  * **Full APR/AMPR subsystem**: sceKernelAprResolveFilepathsToIdsAndFileSizes
+    (path list → deterministic FNV-1a ids + sizes, missing → 0xFFFFFFFF/0 and
+    batch continues; `appr_files` registry in the kernel), AMPR command-buffer
+    record append (ReadFile/KernelEventQueue/WriteAddress per SharpEmu
+    `AmprExports` layouts), sceKernelAprSubmitCommandBuffer[AndGetResult] +
+    WaitCommandBuffer — synchronous completion (real reads via the registry,
+    equeue event triggers, address writes, bytesRead backfill).
+  * Measured result: the title boots deep — 29 guest pthreads, engine
+    allocators up, sysmodules loading (0x10f/0x95/0x96), shader dirs probed.
+  * **Stall (XPS5X_STALL_DUMP, next gate)**: t1(main) spins on
+    scePthreadGetspecific (waits a TLS flag); t18-22 hot-spin on
+    sceKernelWaitEventFlag → instant 0x8002003c (check timeout handling — same
+    class as the f258427 WaitEqueue spin); t2 FAP listener polls WaitEqueue
+    (audio stub, task #12); 13 workers idle in CondWait. Tracer noise: errno
+    heuristic misfires on size-returning sceAmprMeasureCommandSize* (0x30).
+
+- EUD resolver measurements (2026-07-18, XPS5X_TRACE_EUD evidence):
+  cs@0x253a5000 (eud_size_dw=8): direct[t5]=s12 → the Region/EUD base pointer
+  IS a user SGPR pair: s12:s13 = 0x29b9e0e0 (captured at dispatch). The table
+  there holds the SGPR image (dwords match s0..s5 values — s1/s2/s3/s5 exact,
+  s0 differs by 0x100, likely a per-draw offset or a different dispatch's
+  SGPRs). Its sharp resources: s0+0, s8+1, and s32+0 — s32 is a register whose
+  value comes from a scalar load (the two-level chain: EUD table → loaded
+  pointer → descriptor). Existing resolver increments: 1
+  (`find_scalar_load_bases` — s_load_dword* scan) and 2
+  (`scalar_load_target_address` — pair + offset → guest addr). Increment 3
+  (fetch EUD table via Region pointer + evaluate constant-offset loads +
+  feed `read_sharp_fields(Some(ext))`) is the bounded next step; the VS
+  s[14:15] computed-pointer case needs the full evaluator (SharpEmu
+  Gen5ShaderScalarEvaluator.cs, 2,362 lines).
+  PM4 indirect-register mis-decode: intermittent race (table memory cycles
+  between register-pair and descriptor content between submit and CP drain);
+  zero repro in 300s; tolerated by the resilience policy; ledgered.
+
+- Hygiene + indirect investigation (2026-07-18, commit pending):
+  All workspace clippy errors fixed (hle getdents chain + dead MOUNT_POINT,
+  dispatch.rs unused-mut/collapsible-if/range-contains/then-chain,
+  launcher needless-borrow, main sort_unstable_by_key) — workspace now
+  clippy -D warnings clean, 0 failed test suites.
+  "context register index out of range" (vertex data walked as register
+  offsets) investigated with XPS5X_TRACE_INDIRECT: **intermittent,
+  race-dependent** — zero repro in a 300s run. Evidence says the title's
+  indirect-register tables live in its shader user-data memory region (the
+  TRACE_EUD SGPR pointers at 0x29b9d520 name the same buffer), which cycles
+  between register-pair tables and descriptor tables between submit and CP
+  drain. Resilience policy already tolerates it (skip out-of-file writes;
+  next submission rewrites them). No fix without a repro — measured, noted.
+
+- EUD-convergence batch (2026-07-18 late, commit pending; 236/236
+  kyty-graphics, 115/115 xps5x-gpu, clippy clean):
+  * Recompile_Fetch width-mismatch rules, both directions measured (attrib 2
+    as 2ch→vec3 fill z=0.0f; as 4ch→vec3 drop w into %temp_float scratch) —
+    GCN's (0,0,0,1) default semantics, beyond Kyty (it EXITs on mismatch).
+  * Cube textures end-to-end (measured type 11 = 1024x1024x6 skybox, fmt56,
+    tile 9): analysis accepts 9/11; spirv.rs emits OpTypeImage Cube from the
+    measured T# types (mixed = named error); ImageSample emits vec3 coords for
+    cube; decode_texture fetches 6 faces as 6 block grids; offscreen creates
+    CUBE_COMPATIBLE image + CUBE view with layer-aware barriers. Tests: cube
+    SPIR-V emission + 6-face decode round-trip.
+  * input_num = ps_in_control & 0x3f (NUM_INTERP field, AMD layout) — Kyty's
+    whole-register read exploded 0x4004 → 16388 bogus truncation; now 4.
+  * Shader translation failures converged: **3 remaining, ALL EUD-family**
+    (cs eud_size_dw; vs SLoadDwordx2 s14-computed pointer; ps ImageSample
+    declined with 0 mapped textures). Next gate is task #4 (EUD/SRT resolver;
+    SharpEmu Gen5ShaderScalarEvaluator 2,362 lines; the CS's pointers are
+    captured user-SGPRs at dispatch — the tractable first half).
+
+- Shader loop batch (2026-07-18, commit pending; 231/231 kyty-graphics,
+  112/112 xps5x-gpu, workspace green, clippy clean; two pre-existing
+  clippy errors in xps5x-hle left alone — not this session's code):
+  SDWA src abs/neg now PARSE into operand modifiers (beyond Kyty — its vopc
+  path exits on any modifier; operand_load_float already applied FAbs/
+  FNegate; measured encodings `v_cmp_lt_f32 s2,|v2|,c` / `v_mul_f32 v2,v4,-v3`
+  tested). VCmp F32/I32/U32 families wired from staged (Eq/Ne sign-agnostic
+  in the I32 family per Kyty's layout; table 223 rows, 211 impl / 12 NI).
+  SLoadDwordx2 EUD x2 path (x4/x8 machinery with n=2; the menu VS's s[14:15]
+  is a COMPUTED pointer = the real EUD chain — remains open, task #4).
+  `%paramN` declarations now cover the body's exp formats (register
+  export_count=1 under-read a param1-writing VS — "id %param1 is used but
+  never defined" fixed). buffer_load_dwordx4 + offen (beyond Kyty, opcode
+  0x0E; voffset adds into the byte address; measured encoding tested).
+  naga rejects Kyty's `%_arr_BufferObject_uint_N` pattern (array of struct
+  with runtime array) which the driver accepts — that one test asserts on
+  assembly+source instead of naga validation.
+  Gen5 VB formats mapped per SharpEmu Gfx10UnifiedFormat as the title named
+  them: 77 (RGBA32F, 4.5k draws), 71 (RGBA16F, 3.7k), 23 (RG16_UNORM).
+  SW_64KB_S (tile 9, Standard 64KiB — AMD/SharpEmu equation) detiler added
+  beside SW_64KB_R_X; the 1937x333 atlas decodes (1.9k draws unblocked).
+  Non-2D texture measured: type 11 = CUBEMAP 1024x1024x6 fmt56 tile9 (skybox);
+  analysis gates now name type/extent/format/tile (NotImplementedOwned).
+  Recompile_Fetch: GCN default-fill for attr-narrower fetches (attrib 2 = 2
+  channels feeding a vec3 fetch → z = 0.0f; wider stays a named error).
+  Run-to-run failure list went 8 distinct → 3 (cs EUD, ps "unknown operand:
+  249", vs SLoadDwordx2-EUD-chain); texture-type/ImageSample-decline did not
+  reappear in the last two windows.
+  Recompile_Fetch: GCN width-mismatch rules both directions (attr narrower →
+  (0,0,0,1) default fill; attr wider → dropped channels into a scratch), both
+  measured (attrib 2 as 2ch→vec3 and 4ch→vec3 on the menu VS).
+  Cube textures (measured type 11 = 1024x1024x6 skybox, fmt56, tile 9):
+  analysis accepts 9/11 (others still named with raw fields); SPIR-V emits
+  OpTypeImage Cube from the measured T# types (mixed 2D+cube = named error);
+  ImageSample coords go vec3 for cube; decode_texture fetches 6 faces as 6
+  block grids; offscreen creates CUBE_COMPATIBLE images + CUBE views with
+  layer-aware barriers. Tests: cube SPIR-V emission, 6-face decode round-trip.
+
 - Texture chain completed + two GPU blockers (2026-07-18, commit pending;
   106/106 xps5x-gpu lib + 225/225 kyty-graphics, clippy clean):
   * Vulkan consume of `ShaderStageBinding.textures` (the missing half of the

@@ -77,6 +77,11 @@ pub struct AgcGpuSession {
     /// draws compose into a frame across DCBs instead of each starting from
     /// a cleared attachment.
     framebuffers: Mutex<std::collections::HashMap<u64, RenderedImage>>,
+    /// Guest display-buffer address the title last flipped to
+    /// (`sceVideoOutSubmitFlip` → `present_scanout`). When set and a render
+    /// target with this base exists, it — not the last-drawn target — is what
+    /// the Shell presents. `None` preserves the last-drawn baseline.
+    scanout_address: Mutex<Option<u64>>,
 }
 
 impl AgcGpuSession {
@@ -91,6 +96,7 @@ impl AgcGpuSession {
             shader_cache: Mutex::new(crate::shader_fetch::ShaderTranslateCache::new()),
             shader_skip_count: Mutex::new(0),
             framebuffers: Mutex::new(std::collections::HashMap::new()),
+            scanout_address: Mutex::new(None),
         }
     }
 
@@ -129,6 +135,47 @@ impl AgcGpuSession {
     /// Last image produced by a draw-bearing DCB, if any.
     pub fn last_image(&self) -> Option<RenderedImage> {
         self.last_image.lock().clone()
+    }
+
+    /// Select the guest display buffer the title flipped to
+    /// (`sceVideoOutSubmitFlip`) as the presented frame. A title composites its
+    /// UI across several render targets and flips to *one* of them; the
+    /// last-drawn target is often the black background, not that buffer. If a
+    /// render target with this base address has already been drawn, present it
+    /// now; also remember the address so a later draw to it (the async GPU
+    /// worker may not have finished the composite when the flip arrives)
+    /// becomes the presented frame. Never regresses the last-drawn baseline —
+    /// when the buffer has no drawn content, the current image is kept.
+    pub fn present_scanout(&self, address: u64) {
+        if address == 0 {
+            return;
+        }
+        *self.scanout_address.lock() = Some(address);
+        let (image, keys) = {
+            let fb = self.framebuffers.lock();
+            let image = fb.get(&address).cloned();
+            let keys = if std::env::var_os("XPS5X_TRACE_FLIP").is_some() {
+                Some(fb.keys().map(|k| format!("{k:#x}")).collect::<Vec<_>>())
+            } else {
+                None
+            };
+            (image, keys)
+        };
+        // XPS5X_TRACE_FLIP: does the buffer the title flipped to have drawn
+        // content, and what render targets exist? Answers whether black frames
+        // are a routing miss (content is in another target) or a genuinely
+        // empty scanout (the composite that fills it never ran).
+        if let Some(keys) = keys {
+            tracing::info!(
+                scanout = format_args!("{address:#x}"),
+                had_content = image.is_some(),
+                render_targets = ?keys,
+                "present_scanout: title flipped to this buffer"
+            );
+        }
+        if let Some(image) = image {
+            *self.last_image.lock() = Some(image);
+        }
     }
 
     fn ensure_backend(&self) -> Result<(), GpuError> {
@@ -210,6 +257,15 @@ impl AgcGpuSession {
                     .collect()
             })
         });
+        // Prefer the buffer the title flipped to (VideoOut scanout) over the
+        // last-drawn target — captured here while the framebuffers lock is
+        // still held. Composited UIs draw their black background last, so the
+        // last-drawn target is the wrong thing to present; the scanout buffer
+        // is where the composite landed. `None` keeps the last-drawn baseline.
+        let scanout_image = {
+            let addr = *self.scanout_address.lock();
+            addr.and_then(|a| framebuffers.get(&a).cloned())
+        };
         drop(framebuffers);
         drop(cache);
         drop(guard);
@@ -244,7 +300,10 @@ impl AgcGpuSession {
         run?;
 
         if let Some(image) = image {
-            *self.last_image.lock() = Some(image.clone());
+            // Present the VideoOut scanout buffer when the title has flipped to
+            // one that has been drawn; otherwise fall back to the last-drawn
+            // target (the pre-existing baseline).
+            *self.last_image.lock() = Some(scanout_image.unwrap_or_else(|| image.clone()));
             let count = {
                 let mut draws = self.draw_count.lock();
                 *draws += drawn;
@@ -644,6 +703,44 @@ mod tests {
             0,
             "wait_idle returned with DCBs still in flight"
         );
+    }
+
+    /// The present-routing contract: a title composites into several render
+    /// targets and flips to one via `sceVideoOutSubmitFlip`. `present_scanout`
+    /// must present the buffer the title flipped to (looked up in
+    /// `framebuffers` by its guest base address), NOT the last-drawn target
+    /// (often a black background composited over later) — and must never
+    /// regress to a stale/black frame when the flipped buffer has no drawn
+    /// content yet.
+    #[test]
+    fn present_scanout_prefers_the_flipped_buffer_and_never_regresses() {
+        let session = AgcGpuSession::new();
+        let content = RenderedImage {
+            width: 2,
+            height: 1,
+            pixels: vec![10, 20, 30, 255, 40, 50, 60, 255],
+        };
+        let black = RenderedImage {
+            width: 2,
+            height: 1,
+            pixels: vec![0, 0, 0, 255, 0, 0, 0, 255],
+        };
+        // The GPU drew content to the render target at guest base 0x1000; the
+        // last-drawn image happens to be the black background.
+        session.framebuffers.lock().insert(0x1000, content.clone());
+        *session.last_image.lock() = Some(black);
+
+        // Flip to the registered content buffer -> present THAT buffer.
+        session.present_scanout(0x1000);
+        assert_eq!(session.last_image().unwrap().pixels, content.pixels);
+
+        // Flip to a buffer with no drawn content -> keep the current frame.
+        session.present_scanout(0xDEAD_BEEF);
+        assert_eq!(session.last_image().unwrap().pixels, content.pixels);
+
+        // Address 0 is not a flip target and is ignored.
+        session.present_scanout(0);
+        assert_eq!(session.last_image().unwrap().pixels, content.pixels);
     }
 
     /// The state-only fixture must really be state-only, or the test above

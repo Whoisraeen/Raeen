@@ -25,10 +25,6 @@ const MOUNT_MODE_CREATE: u32 = 1 << 2;
 const MOUNT_MODE_CREATE2: u32 = 1 << 5;
 /// `SceSaveDataMountResult` size in bytes.
 const MOUNT_RESULT_SIZE: usize = 0x40;
-/// The mount point handed back to a title (matches SharpEmu). Games open
-/// their save files under this path, which the VFS maps to the host
-/// `savedata` directory.
-const MOUNT_POINT: &[u8] = b"/savedata0";
 
 /// Register libSceSaveData HLE functions.
 pub fn register(registry: &HleRegistry) {
@@ -667,7 +663,7 @@ mod tests {
         let mut res = [0u8; MOUNT_RESULT_SIZE];
         assert!(mem.read(0x200, &mut res));
         let nul = res.iter().position(|&b| b == 0).unwrap();
-        assert_eq!(&res[..nul], MOUNT_POINT, "mount point must be /savedata0");
+        assert_eq!(&res[..nul], b"/savedata0", "mount point must be /savedata0");
         assert_eq!(u32::from_le_bytes(res[0x1c..0x20].try_into().unwrap()), 1);
         assert_eq!(
             kernel.filesystem.resolve_path("/savedata0/level.dat"),

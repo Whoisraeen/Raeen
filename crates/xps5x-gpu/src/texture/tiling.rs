@@ -127,7 +127,7 @@ fn detile_macro(src: &[u8], width: u32, height: u32, bpp: u32) -> Vec<u8> {
 /// `AddressBit`, itself a transcription of AMD AddrLib's
 /// `gfx10SwizzlePattern.h` nibble tables (MIT).
 #[derive(Clone, Copy)]
-struct AddressBit {
+pub struct AddressBit {
     x_mask: u32,
     y_mask: u32,
 }
@@ -261,6 +261,117 @@ const RB_PLUS_64K_RENDER_X: [[AddressBit; 16]; 5] = [
     ],
 ];
 
+/// PS5/Oberon "RB+" `SW_64KB_S` (SWIZZLE_MODE 9) equations — the Standard
+/// (non-XOR) 64 KiB layout. Transcribed from SharpEmu's `RbPlus64KStandard`
+/// (AMD `GFX10_SW_64K_S_RBPLUS_PATINFO`).
+const RB_PLUS_64K_STANDARD: [[AddressBit; 16]; 5] = [
+    // 1 byte/element.
+    [
+        ab_x(0),
+        ab_x(1),
+        ab_x(2),
+        ab_x(3),
+        ab_y(0),
+        ab_y(1),
+        ab_y(2),
+        ab_y(3),
+        ab_y(4),
+        ab_x(4),
+        ab_y(5),
+        ab_x(5),
+        ab_y(6),
+        ab_x(6),
+        ab_y(7),
+        ab_x(7),
+    ],
+    // 2 bytes/element.
+    [
+        AB_ZERO,
+        ab_x(0),
+        ab_x(1),
+        ab_x(2),
+        ab_y(0),
+        ab_y(1),
+        ab_y(2),
+        ab_x(3),
+        ab_y(3),
+        ab_x(4),
+        ab_y(4),
+        ab_x(5),
+        ab_y(5),
+        ab_x(6),
+        ab_y(6),
+        ab_x(7),
+    ],
+    // 4 bytes/element.
+    [
+        AB_ZERO,
+        AB_ZERO,
+        ab_x(0),
+        ab_x(1),
+        ab_y(0),
+        ab_y(1),
+        ab_y(2),
+        ab_x(2),
+        ab_y(3),
+        ab_x(3),
+        ab_y(4),
+        ab_x(4),
+        ab_y(5),
+        ab_x(5),
+        ab_y(6),
+        ab_x(6),
+    ],
+    // 8 bytes/element (also BC1/BC4 blocks).
+    [
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        ab_x(0),
+        ab_y(0),
+        ab_y(1),
+        ab_x(1),
+        ab_x(2),
+        ab_y(2),
+        ab_x(3),
+        ab_y(3),
+        ab_x(4),
+        ab_y(4),
+        ab_x(5),
+        ab_y(5),
+        ab_x(6),
+    ],
+    // 16 bytes/element (also 16-byte BC blocks).
+    [
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        ab_y(0),
+        ab_y(1),
+        ab_x(0),
+        ab_x(1),
+        ab_y(2),
+        ab_x(2),
+        ab_y(3),
+        ab_x(3),
+        ab_y(4),
+        ab_x(4),
+        ab_y(5),
+        ab_x(5),
+    ],
+];
+
+/// The equation table for a supported 64 KiB swizzle mode, or `None` for a
+/// mode with no ported equation yet (named at the call site instead).
+pub const fn swizzle_64kb_table(mode: u8) -> Option<&'static [[AddressBit; 16]; 5]> {
+    match mode {
+        9 => Some(&RB_PLUS_64K_STANDARD),
+        27 => Some(&RB_PLUS_64K_RENDER_X),
+        _ => None,
+    }
+}
+
 /// Byte offset of element (x, y) inside its swizzle block under an exact-XOR
 /// equation. Coordinates are FULL-SURFACE: the bits above the block extent
 /// (x7/y7 for a 128-px block) are the block-column/row parity the pipe/bank
@@ -296,8 +407,27 @@ pub fn tiled_byte_count_64kb(width: u32, height: u32, bpp_log2: u32) -> u64 {
 /// linear rows. `tiled` must cover the whole block grid (see
 /// [`tiled_byte_count_64kb`]); pixels beyond it (never fetched) stay zero.
 pub fn detile_64kb_r_x(tiled: &[u8], width: u32, height: u32, bpp_log2: u32) -> Vec<u8> {
+    detile_64kb_with(tiled, width, height, bpp_log2, &RB_PLUS_64K_RENDER_X)
+}
+
+/// Detile a `SW_64KB_S` (SWIZZLE_MODE 9) surface — the Standard (non-XOR)
+/// 64 KiB layout, measured on Minecraft's 1937x333 atlas texture.
+pub fn detile_64kb_s(tiled: &[u8], width: u32, height: u32, bpp_log2: u32) -> Vec<u8> {
+    detile_64kb_with(tiled, width, height, bpp_log2, &RB_PLUS_64K_STANDARD)
+}
+
+/// Detile a 64 KiB-block swizzled surface into tightly-packed linear rows
+/// under `table`'s exact AddrLib equation. `tiled` must cover the whole
+/// block grid; pixels beyond it (never fetched) stay zero.
+fn detile_64kb_with(
+    tiled: &[u8],
+    width: u32,
+    height: u32,
+    bpp_log2: u32,
+    table: &[[AddressBit; 16]; 5],
+) -> Vec<u8> {
     const BLOCK_BYTES: u64 = 65536;
-    let pattern = &RB_PLUS_64K_RENDER_X[bpp_log2 as usize];
+    let pattern = &table[bpp_log2 as usize];
     let bpp = 1usize << bpp_log2;
     let (bw, bh) = block_dimensions(BLOCK_BYTES as u32, bpp_log2);
     let blocks_per_row = u64::from(width.div_ceil(bw));
@@ -317,12 +447,38 @@ pub fn detile_64kb_r_x(tiled: &[u8], width: u32, height: u32, bpp_log2: u32) -> 
     out
 }
 
-/// Tile a linear surface into `SW_64KB_R_X` — the exact inverse of
-/// [`detile_64kb_r_x`], used by the round-trip consistency test.
+/// Detile a supported 64 KiB-block GFX10 swizzle mode, or `None` for a mode
+/// with no ported equation yet (the caller names it instead of guessing).
+pub fn detile_64kb(mode: u8, tiled: &[u8], width: u32, height: u32, bpp_log2: u32) -> Option<Vec<u8>> {
+    let table = swizzle_64kb_table(mode)?;
+    Some(detile_64kb_with(tiled, width, height, bpp_log2, table))
+}
+
+/// Tile a linear surface into a 64 KiB-block swizzle — the exact inverse of
+/// [`detile_64kb_with`], used by the round-trip consistency tests.
 #[cfg(test)]
 pub fn tile_64kb_r_x(linear: &[u8], width: u32, height: u32, bpp_log2: u32) -> Vec<u8> {
+    tile_64kb_with(linear, width, height, bpp_log2, &RB_PLUS_64K_RENDER_X)
+}
+
+/// `SW_64KB_S` twin of [`tile_64kb_r_x`], for the Standard-layout round-trip.
+#[cfg(test)]
+pub fn tile_64kb_s(linear: &[u8], width: u32, height: u32, bpp_log2: u32) -> Vec<u8> {
+    tile_64kb_with(linear, width, height, bpp_log2, &RB_PLUS_64K_STANDARD)
+}
+
+/// Tile a linear surface into a 64 KiB-block swizzle — the exact inverse of
+/// [`detile_64kb_with`], used by the round-trip consistency tests.
+#[cfg(test)]
+fn tile_64kb_with(
+    linear: &[u8],
+    width: u32,
+    height: u32,
+    bpp_log2: u32,
+    table: &[[AddressBit; 16]; 5],
+) -> Vec<u8> {
     const BLOCK_BYTES: u64 = 65536;
-    let pattern = &RB_PLUS_64K_RENDER_X[bpp_log2 as usize];
+    let pattern = &table[bpp_log2 as usize];
     let bpp = 1usize << bpp_log2;
     let (bw, bh) = block_dimensions(BLOCK_BYTES as u32, bpp_log2);
     let blocks_per_row = u64::from(width.div_ceil(bw));
@@ -444,5 +600,37 @@ mod tests {
             15 * 9 * 65536,
             "1080 rows pad to 9 blocks (measured Minecraft UI texture)"
         );
+    }
+
+    /// The Standard (non-XOR) 64 KiB layout at 4 B/el — a pure interleave,
+    /// measured on Minecraft's 1937x333 atlas texture (SWIZZLE_MODE 9).
+    #[test]
+    fn sw_64kb_s_equation_pins() {
+        let p = &RB_PLUS_64K_STANDARD[2]; // 4 bytes/element
+        let at = |x: u32, y: u32| gfx10_pattern_offset(x, y, p);
+        assert_eq!(at(0, 0), 0);
+        assert_eq!(at(1, 0), 4, "x0 -> bit2");
+        assert_eq!(at(2, 0), 8, "x1 -> bit3");
+        assert_eq!(at(0, 1), 16, "y0 -> bit4");
+        assert_eq!(at(0, 2), 32, "y1 -> bit5");
+        assert_eq!(at(0, 4), 64, "y2 -> bit6");
+        assert_eq!(at(4, 0), 128, "x2 -> bit7");
+        assert_eq!(at(0, 8), 256, "y3 -> bit8");
+        assert_eq!(at(8, 0), 512, "x3 -> bit9");
+        // No XOR terms in the Standard layout: block column 2 is plain.
+        assert_eq!(at(128, 0), 0, "x7 appears nowhere in the equation");
+        assert_eq!(at(0, 128), 0, "y7 appears nowhere in the equation");
+    }
+
+    #[test]
+    fn sw_64kb_s_tile_then_detile_is_identity() {
+        let (w, h, bpp_log2) = (300u32, 100u32, 2u32);
+        let bpp = 1usize << bpp_log2;
+        let linear: Vec<u8> = (0..(w * h) as usize * bpp)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let tiled = tile_64kb_s(&linear, w, h, bpp_log2);
+        let back = detile_64kb_s(&tiled, w, h, bpp_log2);
+        assert_eq!(back, linear, "detile ∘ tile must be the identity");
     }
 }

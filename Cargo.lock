@@ -5196,6 +5196,7 @@ dependencies = [
  "memchr",
  "sha1",
  "tracing",
+ "windows-sys 0.59.0",
  "xps5x-audio",
  "xps5x-core",
  "xps5x-gpu",

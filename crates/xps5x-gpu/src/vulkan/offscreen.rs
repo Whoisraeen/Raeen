@@ -96,8 +96,13 @@ pub struct TextureUpload {
     pub width: u32,
     pub height: u32,
     pub format: vk::Format,
-    /// Linear (de-tiled) pixel data, tightly packed rows.
+    /// Linear (de-tiled) pixel data, tightly packed rows, `layers` images
+    /// back to back.
     pub pixels: Vec<u8>,
+    /// Array layers: 1 for a plain 2D texture, 6 for a cube map.
+    pub layers: u32,
+    /// Create the view as `CUBE` (requires `layers == 6`).
+    pub cube: bool,
 }
 
 /// The sampled-image + sampler descriptor arrays one translated stage binds.
@@ -377,6 +382,7 @@ struct TextureGpu {
     view: vk::ImageView,
     width: u32,
     height: u32,
+    layers: u32,
     stage: vk::ShaderStageFlags,
 }
 
@@ -959,6 +965,7 @@ impl<'a> Resources<'a> {
             view: vk::ImageView::null(),
             width: upload.width,
             height: upload.height,
+            layers: upload.layers,
             stage,
         });
         let slot = self.texture_uploads.len() - 1;
@@ -972,12 +979,18 @@ impl<'a> Resources<'a> {
                 depth: 1,
             })
             .mip_levels(1)
-            .array_layers(1)
+            .array_layers(upload.layers)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            // A cube view requires the CUBE_CREATE flag and exactly 6 layers.
+            .flags(if upload.cube {
+                vk::ImageCreateFlags::CUBE_COMPATIBLE
+            } else {
+                vk::ImageCreateFlags::empty()
+            });
         // SAFETY: `info` is fully initialized and borrows nothing beyond this
         // call; the device is live.
         let image = unsafe { self.device().create_image(&info, None) }
@@ -1004,14 +1017,18 @@ impl<'a> Resources<'a> {
 
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
+            .view_type(if upload.cube {
+                vk::ImageViewType::CUBE
+            } else {
+                vk::ImageViewType::TYPE_2D
+            })
             .format(upload.format)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
-                layer_count: 1,
+                layer_count: upload.layers,
             });
         // SAFETY: the view's image is live and its format/range match the
         // image's creation parameters.
@@ -1252,8 +1269,13 @@ impl<'a> Resources<'a> {
     }
 
     /// Barrier helper: transition `image` (render target or texture) between
-    /// layouts.
-    fn image_barrier(&self, image: vk::Image, transition: ImageTransition) {
+    /// layouts, across `layers` array layers.
+    fn image_barrier_layers(
+        &self,
+        image: vk::Image,
+        layers: u32,
+        transition: ImageTransition,
+    ) {
         let barrier = vk::ImageMemoryBarrier::default()
             .old_layout(transition.old_layout)
             .new_layout(transition.new_layout)
@@ -1267,7 +1289,7 @@ impl<'a> Resources<'a> {
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
-                layer_count: 1,
+                layer_count: layers,
             });
 
         // SAFETY: called only between begin/end of `self.command_buffer`, which
@@ -1303,8 +1325,9 @@ impl<'a> Resources<'a> {
         // rendering samples them: UNDEFINED -> TRANSFER_DST, staging copy,
         // then SHADER_READ_ONLY for the stage that samples.
         for texture in &self.texture_uploads {
-            self.image_barrier(
+            self.image_barrier_layers(
                 texture.image,
+                    texture.layers,
                 ImageTransition {
                     old_layout: vk::ImageLayout::UNDEFINED,
                     new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -1322,7 +1345,7 @@ impl<'a> Resources<'a> {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     mip_level: 0,
                     base_array_layer: 0,
-                    layer_count: 1,
+                    layer_count: texture.layers,
                 })
                 .image_extent(vk::Extent3D {
                     width: texture.width,
@@ -1342,8 +1365,9 @@ impl<'a> Resources<'a> {
                     &[region],
                 );
             }
-            self.image_barrier(
+            self.image_barrier_layers(
                 texture.image,
+                    texture.layers,
                 ImageTransition {
                     old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -1359,8 +1383,9 @@ impl<'a> Resources<'a> {
             // Seed the attachment with the target's prior contents:
             // UNDEFINED -> TRANSFER_DST, copy in, then hand off to the
             // attachment stage so LOAD sees the composed frame so far.
-            self.image_barrier(
+            self.image_barrier_layers(
                 self.image,
+                    1,
                 ImageTransition {
                     old_layout: vk::ImageLayout::UNDEFINED,
                     new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -1397,8 +1422,9 @@ impl<'a> Resources<'a> {
                     &[region],
                 );
             }
-            self.image_barrier(
+            self.image_barrier_layers(
                 self.image,
+                    1,
                 ImageTransition {
                     old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -1412,8 +1438,9 @@ impl<'a> Resources<'a> {
         } else {
             // UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL. Discards existing
             // contents, which is fine: the render pass clears anyway.
-            self.image_barrier(
+            self.image_barrier_layers(
                 self.image,
+                    1,
                 ImageTransition {
                     old_layout: vk::ImageLayout::UNDEFINED,
                     new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -1540,8 +1567,9 @@ impl<'a> Resources<'a> {
         }
 
         // COLOR_ATTACHMENT_OPTIMAL -> TRANSFER_SRC_OPTIMAL for the copy out.
-        self.image_barrier(
+        self.image_barrier_layers(
             self.image,
+                1,
             ImageTransition {
                 old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,

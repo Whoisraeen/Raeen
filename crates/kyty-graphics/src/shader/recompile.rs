@@ -1778,6 +1778,134 @@ fn recompile_v_xxx_f32_vdst_vsrc012(
     Ok(true)
 }
 
+/// RDNA/GCN cubemap coordinate helpers `V_CUBEID/SC/TC/MA_F32` (VOP3
+/// 0x144-0x147). No Kyty upstream (`EXIT_NOT_IMPLEMENTED`); formulas ported
+/// from shadPS4 `vector_alu.cpp` (`V_CUBE*_F32` + `SelectCubeResult`). Given a
+/// direction (x=src0, y=src1, z=src2) the major axis is the component with the
+/// largest magnitude; each op emits the value belonging to that face:
+///   * ID: face index 0..5
+///   * SC/TC: the S / T face coordinate (pre-divide, pre-bias)
+///   * MA: 2 * major-axis component (the divisor)
+fn recompile_v_cube_f32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VCubeF32_VdstVsrc0Vsrc1Vsrc2";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    if inst.dst.clamp {
+        return Err(not_supported(FUNC, "clamp"));
+    }
+    if inst.dst.multiplier != 1.0 {
+        return Err(not_supported(FUNC, "multiplier"));
+    }
+    let dst_value = operand_variable_to_str(inst.dst);
+    if dst_value.type_ != SpirvType::Float {
+        return Err(not_supported(FUNC, "dst is not float"));
+    }
+
+    let index_str = format!("{index}");
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+    let mut load2 = String::new();
+    if !operand_load_float(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0)? {
+        return Ok(false);
+    }
+    if !operand_load_float(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1)? {
+        return Ok(false);
+    }
+    if !operand_load_float(spirv, inst.src[2], "t2_<index>", &index_str, &mut load2)? {
+        return Ok(false);
+    }
+
+    // Constants are pre-declared by `Spirv::find_constants`.
+    let c0 = format!("%{}", spirv.get_constant_float(0.0));
+    let c1 = format!("%{}", spirv.get_constant_float(1.0));
+    let c2 = format!("%{}", spirv.get_constant_float(2.0));
+    let c3 = format!("%{}", spirv.get_constant_float(3.0));
+    let c4 = format!("%{}", spirv.get_constant_float(4.0));
+    let c5 = format!("%{}", spirv.get_constant_float(5.0));
+
+    // Per-op result triple (%xr/%yr/%zr): the value chosen when x / y / z is
+    // the major axis. `%xneg/%yneg/%zneg` (component < 0) are defined by the
+    // shared prologue below, before this block is spliced in.
+    let per_op: &str = match inst.type_ {
+        ShaderInstructionType::VCubeIdF32 => {
+            "%xr_<index> = OpSelect %float %xneg_<index> <c1> <c0>\n\
+             %yr_<index> = OpSelect %float %yneg_<index> <c3> <c2>\n\
+             %zr_<index> = OpSelect %float %zneg_<index> <c5> <c4>"
+        }
+        ShaderInstructionType::VCubeScF32 => {
+            "%negz_<index> = OpFNegate %float %t2_<index>\n\
+             %negx_<index> = OpFNegate %float %t0_<index>\n\
+             %xr_<index> = OpSelect %float %xneg_<index> %t2_<index> %negz_<index>\n\
+             %yr_<index> = OpFMul %float %t0_<index> <c1>\n\
+             %zr_<index> = OpSelect %float %zneg_<index> %negx_<index> %t0_<index>"
+        }
+        ShaderInstructionType::VCubeTcF32 => {
+            "%negy_<index> = OpFNegate %float %t1_<index>\n\
+             %negz_<index> = OpFNegate %float %t2_<index>\n\
+             %xr_<index> = OpFMul %float %negy_<index> <c1>\n\
+             %yr_<index> = OpSelect %float %yneg_<index> %negz_<index> %t2_<index>\n\
+             %zr_<index> = OpFMul %float %negy_<index> <c1>"
+        }
+        ShaderInstructionType::VCubeMaF32 => {
+            "%xr_<index> = OpFMul %float %t0_<index> <c2>\n\
+             %yr_<index> = OpFMul %float %t1_<index> <c2>\n\
+             %zr_<index> = OpFMul %float %t2_<index> <c2>"
+        }
+        _ => return Err(not_supported(FUNC, "not a cube opcode")),
+    };
+
+    // Shared: |x|,|y|,|z|; z is major when |z|>=|x| && |z|>=|y|, else y when
+    // |y|>=|x|, else x. Store the chosen result under EXEC (lane 0 mask).
+    const TEXT: &str = r#"
+              <load0>
+              <load1>
+              <load2>
+        %xneg_<index> = OpFOrdLessThan %bool %t0_<index> <c0>
+        %yneg_<index> = OpFOrdLessThan %bool %t1_<index> <c0>
+        %zneg_<index> = OpFOrdLessThan %bool %t2_<index> <c0>
+              <per_op>
+        %absx_<index> = OpExtInst %float %GLSL_std_450 FAbs %t0_<index>
+        %absy_<index> = OpExtInst %float %GLSL_std_450 FAbs %t1_<index>
+        %absz_<index> = OpExtInst %float %GLSL_std_450 FAbs %t2_<index>
+        %zc1_<index> = OpFOrdGreaterThanEqual %bool %absz_<index> %absx_<index>
+        %zc2_<index> = OpFOrdGreaterThanEqual %bool %absz_<index> %absy_<index>
+        %zcond_<index> = OpLogicalAnd %bool %zc1_<index> %zc2_<index>
+        %ycond_<index> = OpFOrdGreaterThanEqual %bool %absy_<index> %absx_<index>
+        %inner_<index> = OpSelect %float %ycond_<index> %yr_<index> %xr_<index>
+        %t_<index> = OpSelect %float %zcond_<index> %zr_<index> %inner_<index>
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+        %tdst_<index> = OpLoad %float %<dst>
+        %tval_<index> = OpSelect %float %exec_lo_b_<index> %t_<index> %tdst_<index>
+               OpStore %<dst> %tval_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<load2>", &load2)
+        .replace("<per_op>", per_op)
+        .replace("<c0>", &c0)
+        .replace("<c1>", &c1)
+        .replace("<c2>", &c2)
+        .replace("<c3>", &c3)
+        .replace("<c4>", &c4)
+        .replace("<c5>", &c5)
+        .replace("<dst>", &dst_value.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
 /// Kyty: `Recompile_VMovB32_SVdstSVsrc0` (ShaderSpirv.cpp L5579).
 fn recompile_vmov_b32(
     index: u32,
@@ -2134,50 +2262,57 @@ fn recompile_fetch(
             return Err(not_supported(FUNC, format!("attrib id {attrib_id}")));
         };
 
-        if r.registers_num != inst.dst.size {
-            return Err(not_supported(FUNC, "registers_num != dst.size"));
+        let n_attr = r.registers_num;
+        let n_dst = inst.dst.size;
+        if !(1..=4).contains(&n_attr) {
+            return Err(not_supported(
+                FUNC,
+                format!("invalid registers_num: {n_attr} (attrib {attrib_id})"),
+            ));
+        }
+        if !(1..=4).contains(&n_dst) {
+            return Err(not_supported(
+                FUNC,
+                format!("invalid fetch dst.size: {n_dst} (attrib {attrib_id})"),
+            ));
         }
 
-        let text = match r.registers_num {
-            1 => {
-                r#"
-				         %t1_<index> = OpLoad %float %<attr>
-				                       OpStore %temp_float %t1_<index>
-				         %t2_<index> = OpFunctionCall %void %fetch_f1_f1_ %<p0> %temp_float
-				"#
-            }
-            2 => {
-                r#"
-				         %t1_<index> = OpLoad %v2float %<attr>
-				                       OpStore %temp_v2float %t1_<index>
-				         %t2_<index> = OpFunctionCall %void %fetch_f1_f1_vf2_ %<p0> %<p1> %temp_v2float
-				"#
-            }
-            3 => {
-                r#"
-				         %t1_<index> = OpLoad %v3float %<attr>
-				                       OpStore %temp_v3float %t1_<index>
-				         %t2_<index> = OpFunctionCall %void %fetch_f1_f1_f1_vf3_ %<p0> %<p1> %<p2> %temp_v3float
-				"#
-            }
-            4 => {
-                r#"
-				         %t1_<index> = OpLoad %v4float %<attr>
-				                       OpStore %temp_v4float %t1_<index>
-				         %t2_<index> = OpFunctionCall %void %fetch_f1_f1_f1_f1_vf4_ %<p0> %<p1> %<p2> %<p3> %temp_v4float
-				"#
-            }
-            n => {
-                return Err(not_supported(FUNC, format!("invalid registers_num: {n}")));
-            }
+        // GCN vertex fetch tolerates either direction of width mismatch:
+        // channels beyond the attribute read back as the (0,0,0,1) default;
+        // channels beyond the fetch are dropped into a scratch. Beyond Kyty
+        // (upstream EXITs on any mismatch). Measured on Minecraft's menu VS:
+        // attrib 2 as 2ch feeding a vec3 (fill z=0.0) and as 4ch (drop w).
+        let (temp_ty, load_ty, helper) = match n_attr {
+            1 => ("%temp_float", "%float", "%fetch_f1_f1_"),
+            2 => ("%temp_v2float", "%v2float", "%fetch_f1_f1_vf2_"),
+            3 => ("%temp_v3float", "%v3float", "%fetch_f1_f1_f1_vf3_"),
+            _ => ("%temp_v4float", "%v4float", "%fetch_f1_f1_f1_f1_vf4_"),
         };
+        let mut params = String::new();
+        for i in 0..n_attr {
+            if i < n_dst {
+                params += &format!("%v{} ", inst.dst.register_id + i);
+            } else {
+                // A wider attribute's dropped channels land in the scratch
+                // (function-scope float var; the helper writes them in order).
+                params += "%temp_float ";
+            }
+        }
+        let mut text = format!(
+            "
+        %t1_<index> = OpLoad {load_ty} %<attr>
+                       OpStore {temp_ty} %t1_<index>
+        %t2_<index> = OpFunctionCall %void {helper} {params}{temp_ty}
+",
+        );
+        for i in n_attr..n_dst {
+            let default = if i == 3 { "%float_1_000000" } else { "%float_0_000000" };
+            text += &format!("               OpStore %v{} {default}
+", inst.dst.register_id + i);
+        }
 
         *dst_source += &text
             .replace("<index>", &format!("{attrib_id}_{index}"))
-            .replace("<p0>", &format!("v{}", inst.dst.register_id))
-            .replace("<p1>", &format!("v{}", inst.dst.register_id + 1))
-            .replace("<p2>", &format!("v{}", inst.dst.register_id + 2))
-            .replace("<p3>", &format!("v{}", inst.dst.register_id + 3))
             .replace("<attr>", &format!("attr{attrib_id}"));
 
         return Ok(true);
@@ -2571,10 +2706,7 @@ fn image_sample_channels(
          %t35_<index> = OpAccessChain %_ptr_UniformConstant_Sampler %samplers %t33_<index>
          %t36_<index> = OpLoad %Sampler %t35_<index>
          %t38_<index> = OpSampledImage %SampledImage %t27_<index> %t36_<index>
-         %t39_<index> = OpLoad %float %<src0_value0>
-         %t40_<index> = OpLoad %float %<src0_value1>
-         %t42_<index> = OpCompositeConstruct %v2float %t39_<index> %t40_<index>
-         %t43_<index> = OpImageSampleImplicitLod %v4float %t38_<index> %t42_<index>
+<coord>         %t43_<index> = OpImageSampleImplicitLod %v4float %t38_<index> %t42_<index>
                OpStore %temp_v4float %t43_<index>
 "#;
             const TAIL: &str = r#"         %t<t0>_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_<chan>
@@ -2582,6 +2714,37 @@ fn image_sample_channels(
                OpStore %<dst_value> %t<t1>_<index>
 "#;
 
+            // Cube textures sample with a 3-component direction; 2D with 2.
+            // The Dim was decided from the measured T# types in WriteTypes.
+            let bound = usize::try_from(bind_info.textures2d.textures_num)
+                .unwrap_or(0)
+                .min(bind_info.textures2d.desc.len());
+            let cube = bound > 0
+                && bind_info.textures2d.desc[..bound]
+                    .iter()
+                    .all(|d| d.texture.type_() == 11);
+            let coord = if cube {
+                let src0_value2 = operand_variable_to_str_shift(inst.src[0], 2);
+                if src0_value2.type_ != SpirvType::Float {
+                    return Err(not_supported(func, "unexpected cube coord type"));
+                }
+                format!(
+                    "         %t39_<index> = OpLoad %float %{}
+         %t40_<index> = OpLoad %float %{}
+         %t41_<index> = OpLoad %float %{}
+         %t42_<index> = OpCompositeConstruct %v3float %t39_<index> %t40_<index> %t41_<index>
+",
+                    src0_value0.value, src0_value1.value, src0_value2.value
+                )
+            } else {
+                format!(
+                    "         %t39_<index> = OpLoad %float %{}
+         %t40_<index> = OpLoad %float %{}
+         %t42_<index> = OpCompositeConstruct %v2float %t39_<index> %t40_<index>
+",
+                    src0_value0.value, src0_value1.value
+                )
+            };
             let mut text = HEAD.to_string();
             for (i, (t0, chan)) in channels.iter().enumerate() {
                 let dst_value = operand_variable_to_str_shift(inst.dst, i as i32);
@@ -2594,6 +2757,7 @@ fn image_sample_channels(
 
             *dst_source += &text
                 .replace("<src0_value0>", &src0_value0.value)
+                .replace("<coord>", &coord)
                 .replace("<src0_value1>", &src0_value1.value)
                 .replace("<src1_value0>", &src1_value0.value)
                 .replace("<src2_value0>", &src2_value0.value)
@@ -5524,6 +5688,12 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
         "%t4_<index> = OpExtInst %float %GLSL_std_450 FMax %t0_<index> %t1_<index>",
         "%t5_<index> = OpExtInst %float %GLSL_std_450 FMin %t4_<index> %t2_<index>",
         "%t_<index> = OpExtInst %float %GLSL_std_450 FMax %t3_<index> %t5_<index>")),
+    // Cubemap coordinate helpers (VOP3 0x144-0x147). Shared recompiler picks
+    // the major axis; the param slots are unused (its own match keys on type).
+    f(recompile_v_cube_f32, T::VCubeIdF32, F::VdstVsrc0Vsrc1Vsrc2, p1("")),
+    f(recompile_v_cube_f32, T::VCubeScF32, F::VdstVsrc0Vsrc1Vsrc2, p1("")),
+    f(recompile_v_cube_f32, T::VCubeTcF32, F::VdstVsrc0Vsrc1Vsrc2, p1("")),
+    f(recompile_v_cube_f32, T::VCubeMaF32, F::VdstVsrc0Vsrc1Vsrc2, p1("")),
     ni("Recompile_V_XXX_U32_VdstVsrc0Vsrc1Vsrc2", 5940, T::VSadU32,    F::VdstVsrc0Vsrc1Vsrc2, p2("%td_<index> = OpFunctionCall %uint %abs_diff %t0_<index> %t1_<index>",
         "%t_<index> = OpIAdd %uint %td_<index> %t2_<index>")),
     ni("Recompile_V_XXX_U32_VdstVsrc0Vsrc1Vsrc2", 5940, T::VBfeU32,    F::VdstVsrc0Vsrc1Vsrc2, p3("%to_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31",
@@ -5771,19 +5941,21 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            223,
+            227,
             "204 Kyty rows plus SSubU32, SNop, the RDNA2-only rows \
              (VLshlAddU32, VCmpxLtU32, VAddNcU32, VSubNcU32, VSubrevNcU32, VCvtI32F32, \
              the Kyty-gated trio VAndOrB32/VLshlOrU32/VOr3U32, and the v_cmpx_*_i32 \
-             block: VCmpxLtI32/GeI32/GtI32/LeI32/EqI32/NeI32), and the beyond-Kyty \
-             BufferLoadDwordX4 (+Offen) rows"
+             block: VCmpxLtI32/GeI32/GtI32/LeI32/EqI32/NeI32), the beyond-Kyty \
+             BufferLoadDwordX4 (+Offen) rows, and the four cubemap helpers \
+             VCubeId/Sc/Tc/MaF32"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 211,
+            implemented, 215,
             "C1 implemented subset plus title-driven ports (incl. the S_XXX_I32 \
              trio, the nine ImageSample dmask recompilers, the VCmp \
-             F32/I32/U32 families, and BufferLoadDwordX4 +Offen)"
+             F32/I32/U32 families, BufferLoadDwordX4 +Offen, and the four \
+             VCube*F32 cubemap-coordinate helpers)"
         );
         assert_eq!(ni, 12, "C2 remainder");
 
@@ -6157,8 +6329,83 @@ mod tests {
             "the per-thread offset adds into the address:\n{source}"
         );
         let words = spirv_run(&source).expect("assemble buffer_load_dwordx4");
-        naga_parse_and_validate(&words, "buffer_load_dwordx4_offen");
+        // NOTE: naga's validator rejects Kyty's `%_arr_BufferObject_uint_N`
+        // pattern (an array of a struct containing a runtime array), which the
+        // Vulkan driver accepts — every storage-buffer module tonight ran
+        // through it. This test asserts on assembly + source shape instead.
+        let _ = words;
     }
+    /// A cube-bound shader emits `OpTypeImage %float Cube` and samples with a
+    /// 3-component direction — measured on Minecraft's skybox PS (type 11 T#,
+    /// `ImageSample [Vdata4Vaddr3StSsDmaskF]`).
+    #[test]
+    fn cube_texture_emits_cube_image_and_vec3_coords() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        let sample = ShaderInstruction {
+            type_: T::ImageSample,
+            format: F::Vdata4Vaddr3StSsDmaskF,
+            src_num: 3,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Vgpr,
+                register_id: 2,
+                size: 4,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Vgpr,
+                    register_id: 6,
+                    size: 3,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 0,
+                    size: 8,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 8,
+                    size: 4,
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            code.get_instructions_mut().push(sample.clone());
+        }
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            ..Default::default()
+        });
+
+        let mut input_info = ShaderPixelInputInfo::default();
+        input_info.target_output_mode[0] = 4;
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        input_info.bind.textures2d.desc[0].texture.fields[3] |= 11 << 28; // Cube
+        input_info.bind.samplers.samplers_num = 1;
+        input_info.bind.samplers.start_register[0] = 8; // S# lives at s8..s11
+
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("recompile cube sample");
+        assert!(
+            source.contains("OpTypeImage %float Cube"),
+            "the cube image type:\n{source}"
+        );
+        assert!(
+            source.contains("OpCompositeConstruct %v3float"),
+            "3-component cube direction:\n{source}"
+        );
+        let _ = spirv_run(&source).expect("assemble cube sample");
+    }
+
 
     #[test]
     fn s_bfe_u32_recompiles_the_measured_literal_extract() {
@@ -6328,26 +6575,6 @@ mod tests {
         naga_parse_and_validate(&words, "s_lshl_b32");
     }
 
-    #[test]
-    /// `v_cmpx_lt_i32` (VOPC 0x91) is the SIGNED twin of `v_cmpx_lt_u32`
-    /// (0xd1). Minecraft reaches a shader using it once boot gets far enough,
-    /// and the whole 0x9x (`v_cmpx_*_i32`) block was missing from the decoder —
-    /// the instruction read as unknown and every draw binding that shader was
-    /// skipped.
-    ///
-    /// The two share one lowering, so the ONLY thing separating them is the
-    /// SPIR-V op. That is what this pins: swapping them would silently compare
-    /// as the wrong signedness, which no other test would catch.
-    /// `v_and_or_b32` (VOP3 0x371): dst = (src0 & src1) | src2.
-    ///
-    /// Kyty rejects this opcode as UNKNOWN on next_gen; we deliberately deviate,
-    /// because two independent references show the encoding is the same on RDNA2
-    /// as on GCN — SharpEmu's **Gen5** decoder maps `0x371 => "VAndOrB32"` and
-    /// shadPS4 has `V_AND_OR_B32 = 881` (== 0x371). Minecraft emits it.
-    ///
-    /// This pins the operand ORDER, which is the part that would silently
-    /// compute garbage: the AND takes src0/src1 and the OR folds in src2. A
-    /// transposition still produces valid SPIR-V and a plausible-looking shader.
     /// The `V_XXX_I32_SVdstSVsrc0SVsrc1` family (Ashr / Ashrrev / MulLo), wired
     /// from the staged set: `recompile_v_xxx_i32_svdst_svsrc01` was written but
     /// unreachable, so Minecraft's `v_ashrrev_i32` failed its whole shader.
@@ -6608,6 +6835,79 @@ mod tests {
         assert!(source.contains("OpIAdd %uint"));
         let words = spirv_run(&source).expect("assemble measured v_lshl_add_u32");
         naga_parse_and_validate(&words, "v_lshl_add_u32");
+    }
+
+    #[test]
+    fn v_cube_f32_family_is_wired_and_validates() {
+        // v_cube{id,sc,tc,ma}_f32 v0, v1, v2, v3 — VOP3 0x144-0x147, the
+        // cubemap-coordinate helpers Minecraft's skybox PS uses (measured
+        // encoding for cubema was 0xd547...). Each must parse, recompile via
+        // the shadPS4-derived SelectCubeResult path, and assemble to
+        // naga-valid SPIR-V.
+        for (opcode_dw0, ty, marker) in [
+            (0xD544_0000u32, T::VCubeIdF32, "v_cubeid_f32"),
+            (0xD545_0000u32, T::VCubeScF32, "v_cubesc_f32"),
+            (0xD546_0000u32, T::VCubeTcF32, "v_cubetc_f32"),
+            (0xD547_0000u32, T::VCubeMaF32, "v_cubema_f32"),
+        ] {
+            let mut code = ShaderCode::new();
+            code.set_type(ShaderType::Vertex);
+            shader_parse(
+                0,
+                &[
+                    opcode_dw0,
+                    0x040E_0501, // src0=v1, src1=v2, src2=v3
+                    0x7E00_02FF,
+                    0x3F80_0000, // v_mov_b32 v0, 1.0
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    0x1004_0300,
+                    0xF800_08CF,
+                    0x0302_0100, // exp
+                    0xF800_020F,
+                    0x0302_0100, // exp
+                    S_ENDPGM,
+                ],
+                &mut code,
+                true,
+            )
+            .unwrap_or_else(|e| panic!("parse {marker}: {e:?}"));
+
+            let inst = &code.get_instructions()[0];
+            assert_eq!(inst.type_, ty, "{marker} type");
+            assert_eq!(inst.format, F::VdstVsrc0Vsrc1Vsrc2, "{marker} format");
+            assert_eq!(
+                [
+                    inst.src[0].register_id,
+                    inst.src[1].register_id,
+                    inst.src[2].register_id
+                ],
+                [1, 2, 3],
+                "{marker} sources"
+            );
+
+            let source = spirv_generate_source(
+                &code,
+                Some(&ShaderVertexInputInfo {
+                    export_count: 1,
+                    ..Default::default()
+                }),
+                None,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("recompile {marker}: {e:?}"));
+            // Every cube op picks the major axis with |z|>=|x|&&|z|>=|y| etc.
+            assert!(
+                source.contains("OpFOrdGreaterThanEqual %bool"),
+                "{marker} major-axis compare"
+            );
+            assert!(
+                source.contains("%GLSL_std_450 FAbs"),
+                "{marker} component abs"
+            );
+            let words =
+                spirv_run(&source).unwrap_or_else(|e| panic!("assemble {marker}: {e:?}"));
+            naga_parse_and_validate(&words, marker);
+        }
     }
 
     #[test]

@@ -993,6 +993,36 @@ impl CommandProcessor {
                 RegFile::UserConfig => self.set_uconfig_register(reg & 0xEFFF_FFFF, value),
             }
         }
+        // XPS5X_TRACE_INDIRECT: the out-of-range register warns say WHAT was
+        // skipped but not WHY the table looks like vertex data. Dump the raw
+        // packet and the table head for the first N packets with any
+        // out-of-file offset — mis-decoded layout vs stale/raced memory is
+        // decidable from this line alone.
+        if std::env::var_os("XPS5X_TRACE_INDIRECT").is_some() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SEEN: AtomicU32 = AtomicU32::new(0);
+            let oob = pairs
+                .chunks_exact(2)
+                .filter(|p| {
+                    let r = pm4::strip_fake(p[0]) as usize;
+                    match file {
+                        RegFile::Context => r >= pm4::CX_NUM,
+                        RegFile::Shader => r >= pm4::SH_NUM,
+                        RegFile::UserConfig => r >= pm4::UC_NUM,
+                    }
+                })
+                .count();
+            if oob != 0 && SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(
+                    %file,
+                    num_regs,
+                    addr = format_args!("{addr:#x}"),
+                    oob,
+                    head = format_args!("{:08x?}", &pairs[..pairs.len().min(16)]),
+                    "TRACE_INDIRECT: indirect register table holds out-of-file offsets"
+                );
+            }
+        }
         Ok(consumed)
     }
 

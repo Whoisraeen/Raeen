@@ -608,7 +608,7 @@ fn main() -> anyhow::Result<()> {
                             )
                         })
                         .collect();
-                    spent.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    spent.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
                     let top: Vec<String> = spent.into_iter().map(|(_, s)| s).collect();
                     info!(
                         "STALL_DUMP ({} threads):\n{}\nRIPs: {}{}",

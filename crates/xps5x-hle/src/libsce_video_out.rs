@@ -147,6 +147,20 @@ fn hle_submit_flip(ctx: &HleContext, args: &[u64]) -> u64 {
     ctx.kernel
         .video_out_flip_count
         .fetch_add(1, Ordering::Relaxed);
+    // Route the flipped buffer to the GPU present path. A title composites its
+    // UI across several render targets and flips to ONE of them; the GPU
+    // otherwise presents the last-drawn target (often a black background). Look
+    // up the guest address the title registered for this buffer slot and hand
+    // it to the session — it presents that render target when it has content
+    // and falls back to the last-drawn baseline otherwise.
+    let handle = args.first().copied().unwrap_or(1) as i32;
+    if let Some(buffer) = ctx
+        .kernel
+        .video_out_buffers
+        .get(&(handle, buffer_index as i32))
+    {
+        xps5x_gpu::AgcGpuSession::global().present_scanout(buffer.address);
+    }
     let event_hint = 6 | ((flip_arg as u64 & 0x0000_ffff_ffff_ffff) << 16);
     for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {
         if event.key().1 == 6 && event.filter == -13 {

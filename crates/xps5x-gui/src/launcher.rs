@@ -411,7 +411,7 @@ impl FirmwareLauncher {
             match xps5x_runtime::execute_process_shared(
                 std::sync::Arc::clone(&linked),
                 std::sync::Arc::clone(hle),
-                std::sync::Arc::clone(&kernel),
+                std::sync::Arc::clone(kernel),
                 &[GUEST_ARGV0],
                 &[],
             ) {

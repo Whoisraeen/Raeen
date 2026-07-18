@@ -315,6 +315,289 @@ fn hle_fsync(ctx: &HleContext, args: &[u64]) -> u64 {
     }
 }
 
+/// `sceKernelAioInitializeParam(param, size)`: the AIO scheduler parameter
+/// block, done **synchronously** (mission's measured call: Dragon Ball hits
+/// this right after its engine allocator comes up). There is no async AIO
+/// backend yet — the honest model is "the init succeeded; requests complete
+/// immediately when they arrive". Zero the block (a clean, defined default)
+/// rather than leaving guest garbage the title might read back as a schedule.
+fn hle_aio_initialize_param(ctx: &HleContext, args: &[u64]) -> u64 {
+    let param = args.first().copied().unwrap_or(0);
+    let size = usize::try_from(args.get(1).copied().unwrap_or(0)).unwrap_or(0);
+    debug!("sceKernelAioInitializeParam(param={param:#x}, size={size:#x})");
+    if param == 0 || size == 0 || size > 0x10000 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let bytes = vec![0u8; size];
+    if !ctx.mem.write(param, &bytes) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    SCE_OK
+}
+
+/// `sceKernelAioInitializeImpl(...)`: starts the AIO scheduler — in the
+/// synchronous model this is a no-op that must report success so the title
+/// proceeds to submit requests (which complete immediately when they arrive).
+fn hle_aio_initialize_impl(ctx: &HleContext, args: &[u64]) -> u64 {
+    debug!(
+        "sceKernelAioInitializeImpl(args=[{:#x}, {:#x}, {:#x}, {:#x}]) -> 0 (synchronous AIO model)",
+        args.first().copied().unwrap_or(0),
+        args.get(1).copied().unwrap_or(0),
+        args.get(2).copied().unwrap_or(0),
+        args.get(3).copied().unwrap_or(0),
+    );
+    let _ = ctx;
+    SCE_OK
+}
+
+/// Record types inside an AMPR command buffer (SharpEmu `AmprExports`).
+const APR_RECORD_READ_FILE: u32 = 1;
+const APR_RECORD_KERNEL_EVENT_QUEUE: u32 = 2;
+const APR_RECORD_WRITE_ADDRESS: u32 = 3;
+
+/// Complete one AMPR command buffer synchronously: walk its records and do
+/// the work a console does async — read files by APR id, fire completion
+/// events, write completion addresses. SharpEmu `AmprExports.CompleteCommandBuffer`.
+fn apr_complete_command_buffer(ctx: &HleContext, cb: u64) -> u64 {
+    // The visible struct carries data ptr @0x08 / size @0x10; the write
+    // cursor is host-tracked (`ampr_write_offsets`).
+    let mut data = [0u8; 8];
+    let mut size = [0u8; 8];
+    if !ctx.mem.read(cb + 0x08, &mut data) || !ctx.mem.read(cb + 0x10, &mut size) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    let buffer = u64::from_le_bytes(data);
+    let end = ctx
+        .kernel
+        .ampr_write_offsets
+        .get(&cb)
+        .map(|o| *o)
+        .unwrap_or(0)
+        .min(u64::from_le_bytes(size));
+
+    let mut offset = 0;
+    while offset < end {
+        let mut ty = [0u8; 4];
+        if !ctx.mem.read(buffer + offset, &mut ty) {
+            return SCE_KERNEL_ERROR_EFAULT;
+        }
+        let record = buffer + offset;
+        match u32::from_le_bytes(ty) {
+            APR_RECORD_READ_FILE => {
+                // [0x04]=fileId [0x08]=destination [0x10]=size [0x18]=fileOffset [0x20]=bytesRead
+                let mut f = [0u8; 0x28];
+                if !ctx.mem.read(record + 4, &mut f) {
+                    return SCE_KERNEL_ERROR_EFAULT;
+                }
+                let file_id = u32::from_le_bytes(f[0..4].try_into().expect("fixed slice"));
+                let destination = u64::from_le_bytes(f[0x04..0x0c].try_into().expect("fixed slice"));
+                let size = u64::from_le_bytes(f[0x0c..0x14].try_into().expect("fixed slice"));
+                let file_offset = u64::from_le_bytes(f[0x14..0x1c].try_into().expect("fixed slice"));
+                let read = match ctx.kernel.appr_host_path(file_id).and_then(|host| {
+                    let file = std::fs::File::open(&host).ok()?;
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut file = std::io::BufReader::new(file);
+                    file.seek(SeekFrom::Start(file_offset)).ok()?;
+                    let mut buf = vec![0u8; size.min(64 << 20) as usize];
+                    let n = file.read(&mut buf).ok()?;
+                    buf.truncate(n);
+                    Some(buf)
+                }) {
+                    Some(bytes) => {
+                        let n = bytes.len() as u64;
+                        if !ctx.mem.write(destination, &bytes) {
+                            return SCE_KERNEL_ERROR_EFAULT;
+                        }
+                        n
+                    }
+                    None => {
+                        // Missing file: zero-fill (SharpEmu's documented behavior
+                        // — games queue speculative reads and consume on success).
+                        let zeros = [0u8; 4096];
+                        let mut written = 0;
+                        while written < size {
+                            let chunk = (size - written).min(zeros.len() as u64) as usize;
+                            if !ctx.mem.write(destination + written, &zeros[..chunk]) {
+                                break;
+                            }
+                            written += chunk as u64;
+                        }
+                        size
+                    }
+                };
+                if !ctx.mem.write(record + 0x20, &read.to_le_bytes()) {
+                    return SCE_KERNEL_ERROR_EFAULT;
+                }
+                offset += 0x30;
+            }
+            APR_RECORD_KERNEL_EVENT_QUEUE => {
+                // [0x08]=equeue [0x10]=ident [0x18]=userData [0x20]=data
+                let mut f = [0u8; 0x28];
+                if !ctx.mem.read(record + 8, &mut f) {
+                    return SCE_KERNEL_ERROR_EFAULT;
+                }
+                let equeue = u64::from_le_bytes(f[0..8].try_into().expect("fixed slice"));
+                let ident = u64::from_le_bytes(f[8..16].try_into().expect("fixed slice"));
+                let user_data = u64::from_le_bytes(f[16..24].try_into().expect("fixed slice"));
+                let data = u64::from_le_bytes(f[24..32].try_into().expect("fixed slice"));
+                let _ = data;
+                if let Some(mut ev) = ctx.kernel.kernel_equeue_events.get_mut(&(equeue, ident))
+                {
+                    ev.triggered = true;
+                    ev.udata = user_data;
+                    ev.fflags += 1;
+                } else {
+                    ctx.kernel.kernel_equeue_events.insert(
+                        (equeue, ident),
+                        xps5x_kernel::EqueueUserEvent {
+                            triggered: true,
+                            udata: user_data,
+                            fflags: 1,
+                            ..Default::default()
+                        },
+                    );
+                }
+                offset += 0x30;
+            }
+            APR_RECORD_WRITE_ADDRESS => {
+                // [0x08]=address [0x10]=value
+                let mut f = [0u8; 0x10];
+                if !ctx.mem.read(record + 8, &mut f) {
+                    return SCE_KERNEL_ERROR_EFAULT;
+                }
+                let address = u64::from_le_bytes(f[0..8].try_into().expect("fixed slice"));
+                let value = u64::from_le_bytes(f[8..16].try_into().expect("fixed slice"));
+                if !ctx.mem.write(address, &value.to_le_bytes()) {
+                    return SCE_KERNEL_ERROR_EFAULT;
+                }
+                offset += 0x20;
+            }
+            other => {
+                warn!("APR command buffer: unknown record type {other} at +{offset:#x}");
+                return SCE_KERNEL_ERROR_EINVAL;
+            }
+        }
+    }
+    SCE_OK
+}
+
+/// `sceKernelAprSubmitCommandBufferAndGetResult(cb, priority, resultAddress,
+/// outSubmissionId)` — SharpEmu `KernelAprCompatExports`: record the
+/// submission, complete the buffer synchronously, write the id + result.
+fn hle_apr_submit_and_get_result(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let priority = args.get(1).copied().unwrap_or(0);
+    let result_address = args.get(2).copied().unwrap_or(0);
+    let out_submission_id = args.get(3).copied().unwrap_or(0);
+    if cb == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let submission_id = ctx.kernel.appr_add_submission(cb);
+    let result = apr_complete_command_buffer(ctx, cb);
+    if result != SCE_OK {
+        return result;
+    }
+    if out_submission_id != 0 && !ctx.mem.write(out_submission_id, &submission_id.to_le_bytes()) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    if result_address != 0 && !ctx.mem.write(result_address, &0u64.to_le_bytes()) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    debug!("sceKernelAprSubmitCommandBufferAndGetResult(cb={cb:#x}, priority={priority}) -> submission {submission_id}");
+    SCE_OK
+}
+
+/// `sceKernelAprSubmitCommandBuffer(cb, priority)` — submit without a result.
+fn hle_apr_submit(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    if cb == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    ctx.kernel.appr_add_submission(cb);
+    apr_complete_command_buffer(ctx, cb)
+}
+
+/// `sceKernelAprWaitCommandBuffer(submissionId, ..)`: the synchronous model
+/// completed everything at submit time — consume the entry, report OK when
+/// it existed, NOT_FOUND otherwise (SharpEmu).
+fn hle_apr_wait(ctx: &HleContext, args: &[u64]) -> u64 {
+    let submission_id = args.first().copied().unwrap_or(0) as u32;
+    if ctx.kernel.appr_submissions.remove(&submission_id).is_some() {
+        SCE_OK
+    } else {
+        SCE_KERNEL_ERROR_ESRCH
+    }
+}
+
+/// `sceKernelAprResolveFilepathsToIdsAndFileSizes(pathList, count,
+/// idsAddress, sizesAddress)` — SharpEmu `KernelMemoryCompatExports` ABI.
+/// Each entry in `pathList` is a uint64 pointer to a NUL-terminated path;
+/// resolve it through the VFS, write the deterministic FNV-1a id (registered
+/// for later AMPR reads) and the file size. A missing file gets id
+/// `0xFFFF_FFFF` + size 0 and the batch CONTINUES (a patch/DLC path may be
+/// legitimately absent; the caller checks per-file results).
+fn hle_apr_resolve_filepaths_to_ids_and_file_sizes(ctx: &HleContext, args: &[u64]) -> u64 {
+    const MAX_PATHS: u64 = 1024;
+    const PATH_CAP: usize = 1024;
+
+    let path_list = args.first().copied().unwrap_or(0);
+    let count = args.get(1).copied().unwrap_or(0);
+    let ids_address = args.get(2).copied().unwrap_or(0);
+    let sizes_address = args.get(3).copied().unwrap_or(0);
+    if path_list == 0 || count == 0 || sizes_address == 0 || count > MAX_PATHS {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+
+    for i in 0..count {
+        let mut raw = [0u8; 8];
+        if !ctx.mem.read(path_list + i * 8, &mut raw) {
+            return SCE_KERNEL_ERROR_EFAULT;
+        }
+        let text_ptr = u64::from_le_bytes(raw);
+
+        // Bounded cstring read (NUL-terminated, capped).
+        let mut text = Vec::new();
+        let mut chunk = [0u8; 64];
+        let mut cursor = text_ptr;
+        while text.len() < PATH_CAP && text_ptr != 0 {
+            let take = (PATH_CAP - text.len()).min(chunk.len());
+            if !ctx.mem.read(cursor, &mut chunk[..take]) {
+                break;
+            }
+            if let Some(nul) = chunk[..take].iter().position(|&b| b == 0) {
+                text.extend_from_slice(&chunk[..nul]);
+                break;
+            }
+            text.extend_from_slice(&chunk[..take]);
+            cursor += take as u64;
+        }
+        let guest_path = String::from_utf8_lossy(&text).into_owned();
+
+        let (id, size) = match ctx.kernel.filesystem.resolve_path(&guest_path) {
+            Some(host) => match std::fs::metadata(&host) {
+                Ok(meta) => {
+                    let id = ctx
+                        .kernel
+                        .appr_register_file(&guest_path, host.display().to_string());
+                    (id, meta.len())
+                }
+                Err(_) => (u32::MAX, 0),
+            },
+            None => (u32::MAX, 0),
+        };
+
+        if ids_address != 0 && !ctx.mem.write(ids_address + i * 4, &id.to_le_bytes()) {
+            return SCE_KERNEL_ERROR_EFAULT;
+        }
+        if !ctx.mem.write(sizes_address + i * 8, &size.to_le_bytes()) {
+            return SCE_KERNEL_ERROR_EFAULT;
+        }
+    }
+    SCE_OK
+}
+
+
+
 /// Common Gen5 directory enumeration path. `sceKernelGetdirentries` supplies
 /// an optional fourth `basep` argument; `sceKernelGetdents` does not.
 fn hle_getdents(ctx: &HleContext, args: &[u64], has_basep: bool) -> u64 {
@@ -325,9 +608,11 @@ fn hle_getdents(ctx: &HleContext, args: &[u64], has_basep: bool) -> u64 {
     // therefore caller-clobbered garbage at the HLE trap and must never be
     // interpreted as an output pointer. Only the four-argument
     // `getdirentries` spellings own `basep`.
-    let basep = has_basep
-        .then(|| args.get(3).copied().unwrap_or(0))
-        .unwrap_or(0);
+    let basep = if has_basep {
+        args.get(3).copied().unwrap_or(0)
+    } else {
+        0
+    };
     if buffer == 0 || requested < 512 {
         return 0x8002_0016;
     }
@@ -617,6 +902,36 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libScePosix", "getdents", hle_posix_getdents);
     registry.register("libkernel", "lseek", hle_posix_lseek);
     registry.register("libkernel", "sceKernelLseek", hle_sce_lseek);
+    registry.register(
+        "libkernel",
+        "sceKernelAioInitializeParam",
+        hle_aio_initialize_param,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelAioInitializeImpl",
+        hle_aio_initialize_impl,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelAprResolveFilepathsToIdsAndFileSizes",
+        hle_apr_resolve_filepaths_to_ids_and_file_sizes,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelAprSubmitCommandBufferAndGetResult",
+        hle_apr_submit_and_get_result,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelAprSubmitCommandBuffer",
+        hle_apr_submit,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelAprWaitCommandBuffer",
+        hle_apr_wait,
+    );
 
     // -- Module loading (M1-D) --
     registry.register(
@@ -648,6 +963,7 @@ pub fn register(registry: &HleRegistry) {
 
     // -- Thread / sync --
     registry.register("libkernel", "scePthreadCreate", hle_pthread_create);
+    registry.register("libScePosix", "pthread_create_name_np", hle_pthread_create_name_np);
     registry.register("libkernel", "scePthreadJoin", hle_pthread_join);
     registry.register("libkernel", "scePthreadExit", hle_pthread_exit);
     // POSIX spellings have distinct NIDs but the same ABI and scheduler path.
@@ -855,6 +1171,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "sceKernelGetCurrentCpu", hle_get_current_cpu);
     registry.register("libkernel", "sceKernelGettimeofday", hle_gettimeofday);
     registry.register("libkernel", "sceKernelClockGettime", hle_clock_gettime);
+    registry.register("libkernel", "sceKernelClockGetres", hle_clock_getres);
     registry.register(
         "libkernel",
         "sceKernelGetTscFrequency",
@@ -1434,6 +1751,38 @@ fn hle_pthread_create(ctx: &HleContext, args: &[u64]) -> u64 {
     debug!("scePthreadCreate(out={thread_out:#x}, attr={attr:#x}, entry={entry:#x}, arg={arg:#x})");
     ctx.guest_threads.create(thread_out, attr, entry, arg)
 }
+
+/// `pthread_create_name_np(out, attr, entry, arg, name)` — the Posix-named
+/// twin of `scePthreadCreate`: create, then record the diagnostic name
+/// against the id written back (measured: Dragon Ball names every worker
+/// thread at spawn).
+fn hle_pthread_create_name_np(ctx: &HleContext, args: &[u64]) -> u64 {
+    let thread_out = args.first().copied().unwrap_or(0);
+    let attr = args.get(1).copied().unwrap_or(0);
+    let entry = args.get(2).copied().unwrap_or(0);
+    let arg = args.get(3).copied().unwrap_or(0);
+    let name_ptr = args.get(4).copied().unwrap_or(0);
+    debug!("pthread_create_name_np(out={thread_out:#x}, entry={entry:#x}, name={name_ptr:#x})");
+    let rc = ctx.guest_threads.create(thread_out, attr, entry, arg);
+    if rc != SCE_OK || name_ptr == 0 || thread_out == 0 {
+        return rc;
+    }
+    let mut id_bytes = [0u8; 8];
+    if !ctx.mem.read(thread_out, &mut id_bytes) {
+        return rc;
+    }
+    let target = u64::from_le_bytes(id_bytes);
+    let mut buf = [0u8; 32];
+    if !ctx.mem.read(name_ptr, &mut buf) {
+        return rc;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    if let Ok(name) = std::str::from_utf8(&buf[..end]) {
+        ctx.kernel.thread_names.insert(target, name.to_owned());
+    }
+    rc
+}
+
 
 fn hle_pthread_join(ctx: &HleContext, args: &[u64]) -> u64 {
     let thread = args.first().copied().unwrap_or(0);
@@ -2643,6 +2992,24 @@ pub(crate) fn hle_clock_gettime(ctx: &HleContext, args: &[u64]) -> u64 {
     buf[8..16].copy_from_slice(&nsec.to_le_bytes());
     if !ctx.mem.write(tp, &buf) {
         warn!("sceKernelClockGettime: timespec out-pointer {tp:#x} not writable — EFAULT");
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    SCE_OK
+}
+
+/// Real `sceKernelClockGetres(clockId, struct timespec *res)`: the clock's
+/// resolution as a PS5 `timespec`. The nanosecond domain here matches
+/// `sceKernelClockGettime`, so report {0, 1} — 1 ns — for every clock id.
+fn hle_clock_getres(ctx: &HleContext, args: &[u64]) -> u64 {
+    let clock_id = args.first().copied().unwrap_or(0);
+    let res = args.get(1).copied().unwrap_or(0);
+    debug!("sceKernelClockGetres(clockId={clock_id}, res={res:#x})");
+    if res == 0 {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    let mut buf = [0u8; 16];
+    buf[8..16].copy_from_slice(&1i64.to_le_bytes()); // tv_nsec = 1
+    if !ctx.mem.write(res, &buf) {
         return SCE_KERNEL_ERROR_EFAULT;
     }
     SCE_OK

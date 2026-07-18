@@ -204,6 +204,22 @@ pub struct OrbisKernel {
     pub kernel_equeue_events: DashMap<(u64, u64), EqueueUserEvent>,
     /// Next event-queue handle to hand out.
     kernel_equeue_next: std::sync::atomic::AtomicU64,
+    /// APR (`sceKernelAprResolve*`) file registry: the FNV-1a id of a guest
+    /// path → its resolved host path, so a later AMPR read-by-id finds the
+    /// file. SharpEmu's `AmprFileRegistry` model.
+    pub appr_files: DashMap<u32, String>,
+    /// Offline epoll instances (`sceNetEpoll*`): epoll id → registered
+    /// (fd, events, udata) tuples. No host-network backend exists, so a Wait
+    /// always reports no events after its timeout — the honest offline model.
+    pub kernel_epolls: DashMap<u32, Vec<(i32, u32, u64)>>,
+    /// Next epoll id to hand out.
+    kernel_epoll_next: std::sync::atomic::AtomicU32,
+    /// APR command-buffer submissions (synchronous model): submission id →
+    /// command buffer, completed at submit time; `sceKernelAprWaitCommandBuffer`
+    /// just consumes the entry. SharpEmu's `_submittedCommandBuffers` model.
+    pub appr_submissions: DashMap<u32, u64>,
+    /// Next APR submission id to hand out.
+    appr_next_submission: std::sync::atomic::AtomicU32,
     /// The Agc driver's registered default resource owner (`sceAgcDriver*`).
     pub agc_default_owner: std::sync::atomic::AtomicU32,
     /// Whether the per-process Agc resource-registration arena is active.
@@ -256,6 +272,11 @@ pub struct OrbisKernel {
     pub libc_mspaces: DashMap<u64, LibcMspace>,
     /// Active allocations carved from libc mspaces, keyed by guest address.
     pub libc_mspace_allocations: DashMap<u64, LibcMspaceAllocation>,
+    /// One shared (lock, condvar) signalled whenever any event flag's bits
+    /// change (Set/Clear/Cancel). Waiters re-check their own pattern on wake —
+    /// a single condvar is correct under spurious wakeups and avoids per-flag
+    /// registration churn.
+    pub event_flag_signal: (std::sync::Mutex<()>, std::sync::Condvar),
     /// AMPR command-buffer write offsets, keyed by the command-buffer address
     /// (the current write cursor `sceAmprCommandBufferGetCurrentOffset` reads).
     pub ampr_write_offsets: DashMap<u64, u64>,
@@ -604,6 +625,11 @@ impl OrbisKernel {
             kernel_equeues: DashMap::new(),
             kernel_equeue_events: DashMap::new(),
             kernel_equeue_next: std::sync::atomic::AtomicU64::new(1),
+            appr_files: DashMap::new(),
+            appr_submissions: DashMap::new(),
+            appr_next_submission: std::sync::atomic::AtomicU32::new(1),
+            kernel_epolls: DashMap::new(),
+            kernel_epoll_next: std::sync::atomic::AtomicU32::new(1),
             agc_default_owner: std::sync::atomic::AtomicU32::new(1),
             agc_resource_registration_initialized: std::sync::atomic::AtomicBool::new(false),
             agc_resource_registration_max_owners: std::sync::atomic::AtomicU32::new(0),
@@ -626,6 +652,7 @@ impl OrbisKernel {
             video_out_current_buffer: std::sync::atomic::AtomicI32::new(0),
             libc_mspaces: DashMap::new(),
             libc_mspace_allocations: DashMap::new(),
+            event_flag_signal: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
             ampr_write_offsets: DashMap::new(),
             fiber_context_size_check: std::sync::atomic::AtomicU32::new(0),
             kernel_sockets: DashMap::new(),
@@ -729,6 +756,39 @@ impl OrbisKernel {
         handle
     }
 
+    /// FNV-1a id of a guest path — the deterministic APR file id, matching
+    /// SharpEmu's `AmprFileRegistry.ComputeFileId`.
+    pub fn appr_file_id(guest_path: &str) -> u32 {
+        let mut hash: u32 = 2_166_136_261;
+        for &b in guest_path.as_bytes() {
+            hash ^= u32::from(b);
+            hash = hash.wrapping_mul(16_777_619);
+        }
+        hash
+    }
+
+    /// Register a resolved guest→host path pair, returning its deterministic
+    /// id. A later AMPR read-by-id looks the file up here.
+    pub fn appr_register_file(&self, guest_path: &str, host_path: String) -> u32 {
+        let id = Self::appr_file_id(guest_path);
+        self.appr_files.insert(id, host_path);
+        id
+    }
+
+    /// The host path an APR id resolved to, if any.
+    pub fn appr_host_path(&self, id: u32) -> Option<String> {
+        self.appr_files.get(&id).map(|p| p.clone())
+    }
+
+    /// Allocate an APR command-buffer submission id.
+    pub fn appr_add_submission(&self, command_buffer: u64) -> u32 {
+        let id = self
+            .appr_next_submission
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.appr_submissions.insert(id, command_buffer);
+        id
+    }
+
     /// Allocate a fresh (offline) socket fd. See the `xps5x-hle`
     /// `kernel_socket` module.
     pub fn create_socket(&self) -> i32 {
@@ -737,6 +797,15 @@ impl OrbisKernel {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.kernel_sockets.insert(fd, GuestSocket::default());
         fd
+    }
+
+    /// Allocate a fresh (offline) epoll id with an empty registration set.
+    pub fn create_epoll(&self) -> u32 {
+        let id = self
+            .kernel_epoll_next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.kernel_epolls.insert(id, Vec::new());
+        id
     }
 
     /// Allocate a fresh pthread TLS key registered with `destructor` (0 = none),

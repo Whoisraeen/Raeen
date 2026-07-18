@@ -61,6 +61,9 @@ pub enum ShaderAnalysisError {
     Truncated { what: &'static str },
     /// `EXIT_NOT_IMPLEMENTED(...)` condition hit.
     NotImplemented { what: &'static str },
+    /// `EXIT_NOT_IMPLEMENTED` with the raw fields the next session needs to
+    /// implement the gate — a named error, never a guessed format.
+    NotImplementedOwned { what: String },
     /// `EXIT("unknown usage type: ...")` (Shader.cpp L1490/L1564).
     UnknownUsageType { type_: u32 },
     /// A guest address could not be resolved through [`ShaderMemory`]
@@ -75,6 +78,9 @@ impl std::fmt::Display for ShaderAnalysisError {
             Self::NoBinaryInfo => write!(f, "shader binary info (0xBEEB03FF trailer) not found"),
             Self::Truncated { what } => write!(f, "shader analysis out of bounds: {what}"),
             Self::NotImplemented { what } => write!(f, "shader analysis not implemented: {what}"),
+            Self::NotImplementedOwned { what } => {
+                write!(f, "shader analysis not implemented: {what}")
+            }
             Self::UnknownUsageType { type_ } => write!(f, "unknown usage type: 0x{type_:02x}"),
             Self::BadAddress { addr } => write!(f, "bad guest address 0x{addr:016x}"),
         }
@@ -95,10 +101,24 @@ fn ni(what: &'static str) -> ShaderAnalysisError {
     ShaderAnalysisError::NotImplemented { what }
 }
 
+/// `EXIT_NOT_IMPLEMENTED` carrying the raw values a gate must name — the
+/// difference between "something failed" and "implement exactly this next".
+fn ni_owned(what: String) -> ShaderAnalysisError {
+    tracing::error!("shader analysis: not implemented: {what}");
+    ShaderAnalysisError::NotImplementedOwned { what }
+}
+
 /// Bounds violation that Kyty would have read through unchecked.
 fn trunc(what: &'static str) -> ShaderAnalysisError {
     tracing::error!("shader analysis: out of bounds: {what}");
     ShaderAnalysisError::Truncated { what }
+}
+
+/// Out-of-bounds carrying the raw values the fix needs (same treatment as
+/// `ni_owned` — a gate names its evidence, never just itself).
+fn trunc_owned(what: String) -> ShaderAnalysisError {
+    tracing::error!("shader analysis: out of bounds: {what}");
+    ShaderAnalysisError::NotImplementedOwned { what }
 }
 
 fn bad_addr(addr: u64) -> ShaderAnalysisError {
@@ -356,6 +376,74 @@ fn read_sharp_fields(
         }
     }
     Ok(())
+}
+
+/// A scalar memory load's source: the user-SGPR **base pointer** register it
+/// reads through, the byte **offset** applied, and the dword width.
+///
+/// This is the first component of the SRT / scalar-descriptor resolver
+/// (task #9) and attacks its documented keystone: the EUD/SRT buffer pointer is
+/// *not* a field anywhere in `ShaderUserData`; it must be recovered by analysing
+/// the shader. A shader whose descriptors live in a runtime buffer addresses
+/// them as `s_load_dword{,x2,x4,x8} sdst, sbase, offset`, so `sbase` is the
+/// pointer and its runtime value is `user_sgpr.value[sbase]`. Pure analysis:
+/// no guest memory or SPIR-V here — those are the next increments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScalarLoadRef {
+    /// First register of the base-pointer SGPR pair (`sbase`).
+    pub base_register: i32,
+    /// Byte offset added to the base before the load (0 when not a constant).
+    pub byte_offset: u32,
+    /// Number of 32-bit dwords fetched: 1, 2, 4, or 8.
+    pub dwords: u32,
+}
+
+/// Scan a shader for scalar memory loads and report each one's base pointer,
+/// offset and width (see [`ScalarLoadRef`]). The returned bases are the roots
+/// the resolver will read guest memory from to recover spilled descriptors.
+#[must_use]
+pub fn find_scalar_load_bases(code: &ShaderCode) -> Vec<ScalarLoadRef> {
+    code.get_instructions()
+        .iter()
+        .filter_map(|inst| {
+            let dwords = match inst.type_ {
+                ShaderInstructionType::SLoadDword => 1,
+                ShaderInstructionType::SLoadDwordx2 => 2,
+                ShaderInstructionType::SLoadDwordx4 => 4,
+                ShaderInstructionType::SLoadDwordx8 => 8,
+                _ => return None,
+            };
+            // src[0] = base SGPR pair; src[1] = byte offset. The SRT/EUD pattern
+            // uses a constant offset; a register offset is a harder case and is
+            // reported as 0 for now.
+            let byte_offset = match inst.src[1].type_ {
+                ShaderOperandType::LiteralConstant
+                | ShaderOperandType::IntegerInlineConstant => inst.src[1].constant.u,
+                _ => 0,
+            };
+            Some(ScalarLoadRef {
+                base_register: inst.src[0].register_id,
+                byte_offset,
+                dwords,
+            })
+        })
+        .collect()
+}
+
+/// Increment 2 of the SRT/EUD resolver (task #9): the guest address a scalar
+/// load reads from, given the runtime user-SGPR values. The base is a pointer
+/// pair — `value[base]` low dword, `value[base + 1]` high dword — and the load's
+/// byte offset is added. Returns `None` (never panics) if the pair is out of
+/// range. Combined with [`find_scalar_load_bases`] this yields the exact guest
+/// addresses a shader spills its descriptors to — what increment 3 reads from
+/// guest memory to populate the existing `extended_buffer` path.
+#[must_use]
+pub fn scalar_load_target_address(load: &ScalarLoadRef, user_sgpr: &UserSgprInfo) -> Option<u64> {
+    let base = usize::try_from(load.base_register).ok()?;
+    let lo = *user_sgpr.value.get(base)?;
+    let hi = *user_sgpr.value.get(base + 1)?;
+    let ptr = u64::from(lo) | (u64::from(hi) << 32);
+    Some(ptr.wrapping_add(u64::from(load.byte_offset)))
 }
 
 /// Kyty: Shader.cpp `ShaderGetStorageBuffer` (L1141).
@@ -665,8 +753,19 @@ pub fn shader_parse_usage(
                     )?;
                     info.textures2d_readonly += 1;
                     let last = (bind.textures2d.textures_num - 1) as usize;
-                    if bind.textures2d.desc[last].texture.type_() != 9 {
-                        return Err(ni("read-only texture type != 9 (Texture2D)"));
+                    let ty = bind.textures2d.desc[last].texture.type_();
+                    // 9 = Texture2D, 11 = Cube (measured: Minecraft's
+                    // 1024x1024x6 skybox). Everything else stays named.
+                    if ty != 9 && ty != 11 {
+                        return Err(ni_owned(format!(
+                            "read-only texture type {ty} is not Texture2D (9) \
+                             (base={:#x} {}x{} format={} tile={})",
+                            bind.textures2d.desc[last].texture.base40(),
+                            u32::from(bind.textures2d.desc[last].texture.width5()) + 1,
+                            u32::from(bind.textures2d.desc[last].texture.height5()) + 1,
+                            bind.textures2d.desc[last].texture.format(),
+                            bind.textures2d.desc[last].texture.tile_mode(),
+                        )));
                     }
                 }
             }
@@ -993,6 +1092,43 @@ pub fn shader_parse_usage2(
             info.storage_buffers_readwrite += 1;
             continue;
         }
+        // A table-0 sharp with size == 0 occupies an 8-register (8-dword)
+        // slot, but its *content* is either an 8-dword texture T# or a
+        // 4-dword buffer V#. The descriptor's own type field (dword3[28:31])
+        // disambiguates: a value of 0 means it is a *buffer*, not an image.
+        // On RDNA2 the buffer's 2-bit `type` and the image's 4-bit `type`
+        // overlap in that nibble and read 0 for a buffer (confirmed in
+        // shadPS4 video_core/amdgpu/resource.h). Measured on Minecraft's
+        // textured PS: sharp[0.0] resolves to a structured buffer (stride 16,
+        // 8 records) that was being rejected as a "non-2D texture".
+        //
+        // Read the full 8-dword slot so all eight user SGPRs are marked
+        // consumed (the old texture path did this; consuming only the buffer's
+        // four leaves the upper four dangling and fails the direct-SGPR
+        // collection). If it is a buffer, bind the first four dwords as a
+        // read-only storage buffer — mirroring the direct-usage 0x00/flags==0
+        // path above.
+        let mut peek = [0u32; 8];
+        read_sharp_fields(
+            &mut direct_sgprs,
+            i32::from(sharp.offset_dw()),
+            user_sgpr,
+            extended_buffer,
+            &mut peek,
+        )?;
+        if (peek[3] >> 28) & 0xF == 0 {
+            shader_get_storage_buffer(
+                &mut bind.storage_buffers,
+                &mut direct_sgprs,
+                i32::from(sharp.offset_dw()),
+                slot as i32,
+                ShaderStorageUsage::ReadOnly,
+                user_sgpr,
+                extended_buffer,
+            )?;
+            info.storage_buffers_readonly += 1;
+            continue;
+        }
         shader_get_texture_buffer(
             &mut bind.textures2d,
             &mut direct_sgprs,
@@ -1005,19 +1141,19 @@ pub fn shader_parse_usage2(
         info.textures2d_readonly += 1;
         let last = (bind.textures2d.textures_num - 1) as usize;
         let t = &bind.textures2d.desc[last].texture;
-        if t.type_() != 9 {
-            if std::env::var_os("XPS5X_TRACE_EUD").is_some() {
-                tracing::warn!(
-                    tex_type = t.type_(),
-                    base = format_args!("{:#x}", t.base40()),
-                    width = t.width5() + 1,
-                    height = t.height5() + 1,
-                    depth = t.depth() + 1,
-                    format = t.format(),
-                    "TRACE_TEX: non-2D read-only texture (type 11=Cube, 12=1DArray, 13=2DArray, 10=3D)"
-                );
-            }
-            return Err(ni("read-only texture type != 9 (Texture2D)"));
+        // 9 = Texture2D, 11 = Cube (measured: Minecraft's 1024x1024x6 skybox).
+        if t.type_() != 9 && t.type_() != 11 {
+            return Err(ni_owned(format!(
+                "read-only texture type {} is not Texture2D (9) \
+                 (10=3D 11=Cube 12=1DArray 13=2DArray; base={:#x} {}x{} depth={} format={} tile={})",
+                t.type_(),
+                t.base40(),
+                t.width5() + 1,
+                t.height5() + 1,
+                t.depth() + 1,
+                t.format(),
+                t.tile_mode(),
+            )));
         }
     }
 
@@ -1560,15 +1696,24 @@ pub fn shader_get_input_info_ps(
         return Ok(());
     }
 
-    ps_info.input_num = sh.ps_in_control;
+    // Deviation: Kyty copies the whole register (`input_num = ps_in_control`),
+    // which explodes when a title sets flag bits — measured on Minecraft:
+    // ps_in_control = 0x4004 → 16388 "inputs" and a bogus truncation error.
+    // NUM_INTERP is bits 0-5 of SPI_PS_IN_CONTROL (AMD layout); 0x4004 → 4.
+    ps_info.input_num = sh.ps_in_control & 0x3f;
     ps_info.ps_pos_xy = sh.ps_input_ena == 0x0000_0302 && sh.ps_input_addr == 0x0000_0302;
     ps_info.ps_pixel_kill_enable = sh.db_shader_control.shader_kill_enable;
     ps_info.ps_early_z = sh.db_shader_control.shader_z_behavior == 1;
     ps_info.ps_execute_on_noop = sh.db_shader_control.shader_execute_on_noop;
 
     if ps_info.input_num as usize > ps_info.interpolator_settings.len() {
-        // Deviation: Kyty indexes the 32-entry arrays unchecked.
-        return Err(trunc("ps: input_num > 32"));
+        // Deviation: Kyty indexes the 32-entry arrays unchecked. Name the raw
+        // registers: the count may be a FIELD of SPI_PS_IN_CONTROL (bits
+        // 0-5), not the whole register — the run must say which.
+        return Err(trunc_owned(format!(
+            "ps: input_num {} > 32 (ps_in_control={:#x} ps_input_ena={:#x} ps_input_addr={:#x})",
+            ps_info.input_num, sh.ps_in_control, sh.ps_input_ena, sh.ps_input_addr
+        )));
     }
     for i in 0..ps_info.input_num as usize {
         ps_info.interpolator_settings[i] = sh.ps_interpolator_settings[i];
@@ -2969,6 +3114,159 @@ mod tests {
         assert_eq!(info.direct_sgprs, 2);
         assert_eq!(bind.direct_sgprs.sgprs_num, 2);
         assert_eq!(&bind.direct_sgprs.start_register[..2], &[8, 9]);
+    }
+
+    #[test]
+    fn parse_usage2_table0_type0_sharp_is_buffer_not_texture() {
+        // Regression: a table-0 sharp with size == 0 is normally an 8-dword
+        // texture T#, but when its descriptor `type` nibble (dword3[28:31])
+        // reads 0 it is actually a 4-dword buffer V# (RDNA2; confirmed in
+        // shadPS4 video_core/amdgpu/resource.h where the buffer and image
+        // `type` fields overlap in that nibble and read 0 for a buffer).
+        // Measured on Minecraft's textured PS, where sharp[0.0] is a
+        // structured buffer that was wrongly rejected as a "non-2D texture".
+        // It must bind as a read-only storage buffer; a sibling sharp whose
+        // descriptor type is 9 must still bind as a Texture2D.
+        let user_sgpr = UserSgprInfo {
+            value: {
+                let mut v = [0u32; 16];
+                v[3] = 0x0000_0008; // buffer sharp @0: dword3 (v[0+3]) type nibble = 0
+                v[11] = 0x9000_0000; // texture sharp @8: dword3 (v[8+3]) type nibble = 9
+                v
+            },
+            // Each size==0 sharp occupies an 8-register slot: the buffer @0
+            // consumes s0..s8 (binding only the first four dwords) and the
+            // texture @8 consumes s8..s16 -> all 16 registers consumed, no
+            // leftover direct SGPRs.
+            type_: [UserSgprType::Vsharp; 16],
+            count: 16,
+        };
+        let user_data = ShaderUserData {
+            direct_resource_offset: vec![0xffff; 8],
+            sharp_resource_offset: [
+                vec![ShaderSharp::new(0, 0), ShaderSharp::new(8, 0)],
+                vec![],
+                vec![],
+                vec![],
+            ],
+            eud_size_dw: 0,
+            srt_size_dw: 0,
+        };
+        let mut info = ShaderParsedUsage::default();
+        let mut bind = ShaderBindResources::default();
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 16).unwrap();
+        // type-0 sharp -> read-only storage buffer, NOT a texture.
+        assert_eq!(info.storage_buffers_readonly, 1);
+        assert_eq!(bind.storage_buffers.buffers_num, 1);
+        assert_eq!(bind.storage_buffers.start_register[0], 0);
+        // type-9 sharp -> Texture2D, still classified as a texture.
+        assert_eq!(info.textures2d_readonly, 1);
+        assert_eq!(bind.textures2d.textures_num, 1);
+    }
+
+    /// Manual disassembly harness (no-op unless `XPS5X_DISASM_FILE` names a
+    /// dumped `.bin`): parses the shader and prints its instruction types and
+    /// recovered scalar-load bases. Used to read the EUD/SRT CS's descriptor
+    /// pointer-load pattern while building the resolver. Run with
+    /// `XPS5X_DISASM_FILE=... cargo test -p kyty-graphics disasm_shader_from_env -- --nocapture`.
+    #[test]
+    fn disasm_shader_from_env() {
+        let Ok(path) = std::env::var("XPS5X_DISASM_FILE") else {
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read shader dump");
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        let res = shader_parse(0, &words, &mut code, true);
+        eprintln!(
+            "DISASM {path}: parse={res:?}, {} instructions",
+            code.get_instructions().len()
+        );
+        for (i, inst) in code.get_instructions().iter().enumerate() {
+            eprintln!("  [{i:3}] {:?}", inst.type_);
+        }
+        eprintln!("scalar-load bases: {:?}", find_scalar_load_bases(&code));
+    }
+
+    #[test]
+    fn find_scalar_load_bases_recovers_srt_pointer() {
+        use crate::shader::types::ShaderInstruction;
+        // Measured pattern from Minecraft's VS (vs_253e7900): `s_load_dwordx2
+        // s[82:83], s[14:15], 8` — the SRT/EUD descriptor spill. task #9's
+        // keystone is recovering the base pointer (s14) and offset (8) by
+        // analysing the shader, since the pointer is not a field anywhere. A
+        // plain s_load_dword and a wider x4 pin the dword-width mapping.
+        let mut code = ShaderCode::new();
+        for (ty, base, off) in [
+            (ShaderInstructionType::SLoadDwordx2, 14, 8u32),
+            (ShaderInstructionType::SLoadDword, 4, 0),
+            (ShaderInstructionType::SLoadDwordx4, 20, 16),
+        ] {
+            let mut inst = ShaderInstruction::default();
+            inst.type_ = ty;
+            inst.src[0].register_id = base;
+            inst.src[1].type_ = ShaderOperandType::LiteralConstant;
+            inst.src[1].constant.u = off;
+            code.get_instructions_mut().push(inst);
+        }
+        assert_eq!(
+            find_scalar_load_bases(&code),
+            vec![
+                ScalarLoadRef {
+                    base_register: 14,
+                    byte_offset: 8,
+                    dwords: 2,
+                },
+                ScalarLoadRef {
+                    base_register: 4,
+                    byte_offset: 0,
+                    dwords: 1,
+                },
+                ScalarLoadRef {
+                    base_register: 20,
+                    byte_offset: 16,
+                    dwords: 4,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn scalar_load_target_address_forms_the_runtime_pointer() {
+        // s[14:15] holds a 64-bit guest pointer (lo=0x29b98350, hi=0); the
+        // load's byte offset (8) is added — the exact address increment 3 reads
+        // the spilled descriptor from. Measured base from Minecraft's SRT VS.
+        let mut value = [0u32; 16];
+        value[14] = 0x29b9_8350;
+        value[15] = 0x0000_0001; // exercise the high dword too
+        let user_sgpr = UserSgprInfo {
+            value,
+            type_: [UserSgprType::Vsharp; 16],
+            count: 16,
+        };
+        let load = ScalarLoadRef {
+            base_register: 14,
+            byte_offset: 8,
+            dwords: 2,
+        };
+        assert_eq!(
+            scalar_load_target_address(&load, &user_sgpr),
+            Some(0x0000_0001_29b9_8358)
+        );
+        // A base whose high dword falls off the 16-entry file -> None, no panic.
+        let out_of_range = ScalarLoadRef {
+            base_register: 15,
+            byte_offset: 0,
+            dwords: 2,
+        };
+        assert_eq!(
+            scalar_load_target_address(&out_of_range, &user_sgpr),
+            None
+        );
     }
 
     #[test]

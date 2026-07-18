@@ -107,7 +107,8 @@ fn hle_delete(ctx: &HleContext, args: &[u64]) -> u64 {
     OK
 }
 
-/// `sceKernelSetEventFlag(handle, pattern)`: OR `pattern` into the bits.
+/// `sceKernelSetEventFlag(handle, pattern)`: OR `pattern` into the bits, then
+/// wake every flag waiter so a blocked `WaitEventFlag` re-checks.
 fn hle_set(ctx: &HleContext, args: &[u64]) -> u64 {
     let handle = args.first().copied().unwrap_or(0);
     let pattern = args.get(1).copied().unwrap_or(0);
@@ -115,6 +116,10 @@ fn hle_set(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_ESRCH;
     };
     ef.bits |= pattern;
+    drop(ef);
+    let (lock, cvar) = &ctx.kernel.event_flag_signal;
+    let _guard = lock.lock().unwrap();
+    cvar.notify_all();
     OK
 }
 
@@ -127,6 +132,10 @@ fn hle_clear(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_ESRCH;
     };
     ef.bits &= pattern;
+    drop(ef);
+    let (lock, cvar) = &ctx.kernel.event_flag_signal;
+    let _guard = lock.lock().unwrap();
+    cvar.notify_all();
     OK
 }
 
@@ -171,14 +180,67 @@ fn hle_poll(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 /// `sceKernelWaitEventFlag(handle, pattern, waitMode, result, timeout)`:
-/// completes immediately if the pattern is already satisfied; otherwise reports
-/// a timeout (no other thread can satisfy it under single-active-execution).
+/// block on the shared flag-changed condvar until the pattern is satisfied or
+/// the deadline passes. The old poll-and-instant-ETIMEDOUT was built for the
+/// single-active-execution model; with real guest threads a producer CAN set
+/// the bits — returning instantly made five Dragon Ball threads hot-spin at
+/// 100% CPU and starve the producer (measured via XPS5X_STALL_DUMP).
 fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
-    poll_or_wait(ctx, args, SCE_KERNEL_ERROR_ETIMEDOUT)
+    let handle = args.first().copied().unwrap_or(0);
+    let pattern = args.get(1).copied().unwrap_or(0);
+    let mode = args.get(2).copied().unwrap_or(0);
+    let result_ptr = args.get(3).copied().unwrap_or(0);
+    let timeout_ptr = args.get(4).copied().unwrap_or(0);
+
+    if pattern == 0 || !valid_wait_mode(mode) {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    if !ctx.kernel.kernel_event_flags.contains_key(&handle) {
+        return SCE_KERNEL_ERROR_ESRCH;
+    }
+
+    // Timeout is `SceKernelUseconds*` (NULL = wait forever). Forever is capped
+    // like the equeue wait: an unbounded block on the dispatch thread hangs
+    // tests and stalls a title whose producer exited; 50ms slices keep the
+    // wait responsive and still stop the hot spin.
+    let requested_us = if timeout_ptr == 0 {
+        None
+    } else {
+        let mut raw = [0u8; 8];
+        if !ctx.mem.read(timeout_ptr, &mut raw) {
+            return SCE_KERNEL_ERROR_EFAULT;
+        }
+        Some(u64::from_le_bytes(raw))
+    };
+    let deadline = std::time::Instant::now()
+        + requested_us.map_or_else(
+            || std::time::Duration::from_millis(50),
+            |us| std::time::Duration::from_micros(us.min(50_000)),
+        );
+
+    let (lock, cvar) = &ctx.kernel.event_flag_signal;
+    let mut guard = lock.lock().unwrap();
+    loop {
+        let mut ef = ctx.kernel.kernel_event_flags.get_mut(&handle).unwrap();
+        if result_ptr != 0 && !ctx.mem.write(result_ptr, &ef.bits.to_le_bytes()) {
+            return SCE_KERNEL_ERROR_EFAULT;
+        }
+        if is_satisfied(ef.bits, pattern, mode) {
+            apply_clear(&mut ef.bits, pattern, mode);
+            return OK;
+        }
+        drop(ef);
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return SCE_KERNEL_ERROR_ETIMEDOUT;
+        }
+        let (g, _timeout) = cvar.wait_timeout(guard, remaining).unwrap();
+        guard = g;
+    }
 }
 
 /// `sceKernelCancelEventFlag(handle, setPattern, waiterCountOut)`: force the
-/// bits to `setPattern`, report 0 waiters.
+/// bits to `setPattern`, report 0 waiters, and wake every flag waiter.
 fn hle_cancel(ctx: &HleContext, args: &[u64]) -> u64 {
     let handle = args.first().copied().unwrap_or(0);
     let set_pattern = args.get(1).copied().unwrap_or(0);
@@ -190,6 +252,10 @@ fn hle_cancel(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_EFAULT;
     }
     ef.bits = set_pattern;
+    drop(ef);
+    let (lock, cvar) = &ctx.kernel.event_flag_signal;
+    let _guard = lock.lock().unwrap();
+    cvar.notify_all();
     OK
 }
 
@@ -267,6 +333,43 @@ mod tests {
             hle_wait(&ctx, &[h, 0b1000, WAIT_AND, 0, 0]),
             SCE_KERNEL_ERROR_ETIMEDOUT
         );
+    }
+
+    /// The blocking-wait contract: a waiter must sleep until a producer sets
+    /// the bits, not spin-poll — the Dragon Ball hot-spin regression test.
+    #[test]
+    fn wait_blocks_until_another_thread_sets_the_flag() {
+        let kernel = std::sync::Arc::new(xps5x_kernel::OrbisKernel::new());
+        let mem = crate::TestMemory::new(0x400);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(kernel.as_ref(), &mem, &alloc);
+        let h = create(&ctx, 0, 0);
+        let setter = std::thread::spawn({
+            let k2 = std::sync::Arc::clone(&kernel);
+            move || {
+                // Inside the 50 ms forever-slice: a NULL-timeout wait wakes on
+                // the flag change instead of timing out or spinning.
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                // hle_set touches only kernel state (bits + the condvar), so
+                // the producer gets its own memory; the shared kernel is Sync.
+                let mem2 = crate::TestMemory::new(0x100);
+                let alloc2 = crate::TestAllocator::new(0);
+                let ctx2 = test_ctx(k2.as_ref(), &mem2, &alloc2);
+                assert_eq!(hle_set(&ctx2, &[h, 0b0001]), OK);
+            }
+        });
+        let start = std::time::Instant::now();
+        assert_eq!(
+            hle_wait(&ctx, &[h, 0b0001, WAIT_AND, 0, 0]),
+            OK,
+            "the waiter must complete once the producer sets the bit"
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(25),
+            "the wait must have BLOCKED for the producer, not spun (took {elapsed:?})"
+        );
+        setter.join().unwrap();
     }
 
     #[test]

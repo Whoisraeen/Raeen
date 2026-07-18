@@ -1051,20 +1051,20 @@ fn read_fault_cstr(mem: &dyn GuestMemory, address: u64) -> Option<String> {
 }
 
 fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &RuntimeError) {
-    if let Some((idx, args)) = ctx.active_hle.get() {
-        if let Some(t) = trampolines.get(idx as usize) {
-            tracing::warn!(
-                "fault occurred inside HLE #{idx} {}::{} args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
-                t.library,
-                t.function,
-                args[0],
-                args[1],
-                args[2],
-                args[3],
-                args[4],
-                args[5],
-            );
-        }
+    if let Some((idx, args)) = ctx.active_hle.get()
+        && let Some(t) = trampolines.get(idx as usize)
+    {
+        tracing::warn!(
+            "fault occurred inside HLE #{idx} {}::{} args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
+            t.library,
+            t.function,
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+        );
     }
     if let Some(snapshot) = ctx.fault_snapshot.get() {
         let instruction = if snapshot.bytes_read {
@@ -1562,7 +1562,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             // range produced by a negative TPOFF from base zero) necessarily
             // executed without the high guest TCB base.
             let zero_based_fs_fault = instruction_uses_fs(mem, context.Rip)
-                && (access_addr < 0x1_0000_0000 || access_addr >= 0xFFFF_8000_0000_0000);
+                && !(0x1_0000_0000..0xFFFF_8000_0000_0000).contains(&access_addr);
             // SAFETY: `tls_active` is only ever `true` when
             // `fsgsbase_available()` returned `true` (checked in `run` before
             // `RtlCaptureContext`), so `RDFSBASE`/`WRFSBASE` are permitted on
@@ -1750,9 +1750,11 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             {
                 let read_u64 = |addr| {
                     let mut bytes = [0u8; 8];
-                    mem.read(addr, &mut bytes)
-                        .then(|| u64::from_le_bytes(bytes))
-                        .unwrap_or(0)
+                    if mem.read(addr, &mut bytes) {
+                        u64::from_le_bytes(bytes)
+                    } else {
+                        0
+                    }
                 };
                 tracing::info!(
                     "HLE enter #{idx}: {}::{} rip={:#x} return={:#x} \
@@ -1900,7 +1902,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 || std::env::var_os("XPS5X_TRAP_CXA_THROW").is_some()
             {
                 let tid = ctx.current_thread();
-                let mut ring = kernel.recent_hle_calls.entry(tid).or_default();
+                let ring = kernel.recent_hle_calls.entry(tid).or_default();
                 let mut q = ring.lock();
                 if q.len() >= 24 {
                     q.pop_front();
@@ -1936,7 +1938,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             // throw. `scePthreadGetthreadid`/`scePthreadSelf` legitimately
             // return small thread ids, so exclude them.
             let is_error_return = (ret != 0 && ret < 0x100)
-                || (ret >= 0x8002_0000 && ret < 0x8003_0000);
+                || (0x8002_0000..0x8003_0000).contains(&ret);
             let is_thread_id_fn =
                 t.function.contains("Getthreadid") || t.function.contains("PthreadSelf");
             if is_error_return

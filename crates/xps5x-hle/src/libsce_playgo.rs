@@ -30,6 +30,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libScePlayGo", "scePlayGoOpen", hle_open);
     registry.register("libScePlayGo", "scePlayGoClose", hle_ok);
     registry.register("libScePlayGo", "scePlayGoGetLocus", hle_get_locus);
+    registry.register("libScePlayGo", "scePlayGoGetChunkId", hle_get_chunk_id);
     registry.register("libScePlayGo", "scePlayGoGetProgress", hle_get_progress);
     registry.register("libScePlayGo", "scePlayGoGetToDoList", hle_get_todo_list);
     registry.register("libScePlayGo", "scePlayGoGetEta", hle_ok);
@@ -84,6 +85,50 @@ fn hle_get_locus(ctx: &HleContext, args: &[u64]) -> u64 {
     let loci = vec![LOCUS_LOCAL_FAST; n];
     if !ctx.mem.write(out_loci, &loci) {
         warn!("scePlayGoGetLocus: outLoci {out_loci:#x} (+{n}) not writable");
+    }
+    SCE_OK
+}
+
+/// `scePlayGoGetChunkId(handle, outChunkIdList, numberOfEntries, outEntries)`
+/// — SharpEmu's `PlayGoGetChunkId` ABI. Count-only mode when
+/// `outChunkIdList == 0` (write the chunk count to `*outEntries`); otherwise
+/// write `min(numberOfEntries, available)` uint16 chunk ids. XPS5X runs
+/// against fully-present content with no PlayGo metadata parsed yet, so the
+/// honest answer is one present chunk (id 0) — matching SharpEmu's
+/// `availableEntries = 1` fallback when there is no metadata.
+fn hle_get_chunk_id(ctx: &HleContext, args: &[u64]) -> u64 {
+    const PLAYGO_ERROR_BAD_POINTER: u64 = 0x80B2_000A;
+    const PLAYGO_ERROR_BAD_SIZE: u64 = 0x80B2_000B;
+
+    let handle = args.first().copied().unwrap_or(0);
+    let out_chunk_id_list = args.get(1).copied().unwrap_or(0);
+    let number_of_entries = args.get(2).copied().unwrap_or(0);
+    let out_entries = args.get(3).copied().unwrap_or(0);
+    debug!(
+        "scePlayGoGetChunkId(handle={handle}, outChunkIdList={out_chunk_id_list:#x}, numberOfEntries={number_of_entries}, outEntries={out_entries:#x})"
+    );
+    if out_entries == 0 {
+        return PLAYGO_ERROR_BAD_POINTER;
+    }
+    if out_chunk_id_list != 0 && number_of_entries == 0 {
+        return PLAYGO_ERROR_BAD_SIZE;
+    }
+
+    let available: u64 = 1; // no PlayGo metadata parsed yet — one present chunk
+    let write = |value: u64| ctx.mem.write(out_entries, &value.to_le_bytes());
+    if out_chunk_id_list == 0 {
+        if !write(available) {
+            warn!("scePlayGoGetChunkId: outEntries {out_entries:#x} not writable");
+            return PLAYGO_ERROR_BAD_POINTER;
+        }
+        return SCE_OK;
+    }
+    let to_write = number_of_entries.min(available) as usize;
+    let ids = vec![0u16; to_write];
+    let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+    if !ctx.mem.write(out_chunk_id_list, &bytes) || !write(to_write as u64) {
+        warn!("scePlayGoGetChunkId: out buffers not writable");
+        return PLAYGO_ERROR_BAD_POINTER;
     }
     SCE_OK
 }
@@ -164,6 +209,31 @@ mod tests {
         let mut e = [0u8; 4];
         assert!(mem.read(0x300, &mut e));
         assert_eq!(u32::from_le_bytes(e), 0, "nothing left to download");
+    }
+
+    #[test]
+    fn get_chunk_id_count_only_and_list_modes() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // Count-only: outChunkIdList=0 → *outEntries = 1 (the present chunk).
+        assert_eq!(hle_get_chunk_id(&ctx, &[1, 0, 0, 0x400]), SCE_OK);
+        let mut e = [0u8; 4];
+        assert!(mem.read(0x400, &mut e));
+        assert_eq!(u32::from_le_bytes(e), 1);
+
+        // List mode: one uint16 id written, *outEntries = 1.
+        assert_eq!(hle_get_chunk_id(&ctx, &[1, 0x500, 4, 0x400]), SCE_OK);
+        let mut id = [0u8; 2];
+        assert!(mem.read(0x500, &mut id));
+        assert!(mem.read(0x400, &mut e));
+        assert_eq!(u32::from_le_bytes(e), 1);
+
+        // outEntries == 0 → BAD_POINTER; list with 0 entries → BAD_SIZE.
+        assert_eq!(hle_get_chunk_id(&ctx, &[1, 0, 0, 0]), 0x80B2_000A);
+        assert_eq!(hle_get_chunk_id(&ctx, &[1, 0x500, 0, 0x400]), 0x80B2_000B);
     }
 
     #[test]

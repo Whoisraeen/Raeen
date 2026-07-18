@@ -2567,7 +2567,7 @@ impl<'a> Spirv<'a> {
 "#;
 
         const TEXTURES_SAMPLED_TYPES: &str = r#"
-                                             %ImageS = OpTypeImage %float 2D 0 0 0 1 Unknown
+                                             %ImageS = OpTypeImage %float <dim> 0 0 0 1 Unknown
                     %textures2D_S_uint_<buffers_num> = OpConstant %uint <buffers_num>
                      %_arr_ImageS_uint_<buffers_num> = OpTypeArray %ImageS %textures2D_S_uint_<buffers_num>
 %_ptr_UniformConstant__arr_ImageS_uint_<buffers_num> = OpTypePointer UniformConstant %_arr_ImageS_uint_<buffers_num>
@@ -2615,10 +2615,30 @@ impl<'a> Spirv<'a> {
                 );
             }
             if bind.textures2d.textures2d_sampled_num > 0 {
-                self.source += &TEXTURES_SAMPLED_TYPES.replace(
-                    "<buffers_num>",
-                    &format!("{}", bind.textures2d.textures2d_sampled_num),
-                );
+                // The OpTypeImage Dim comes from the measured T# types: 9 =
+                // 2D, 11 = Cube (Minecraft's skybox). A mixed 2D+cube binding
+                // set has no single array type — named, not guessed.
+                let bound = usize::try_from(bind.textures2d.textures_num)
+                    .unwrap_or(0)
+                    .min(bind.textures2d.desc.len());
+                let mut has_2d = false;
+                let mut has_cube = false;
+                for d in &bind.textures2d.desc[..bound] {
+                    match d.texture.type_() {
+                        9 => has_2d = true,
+                        11 => has_cube = true,
+                        _ => {}
+                    }
+                }
+                if has_2d && has_cube {
+                    return Err(not_supported(
+                        "Spirv::WriteTypes",
+                        "mixed 2D and cube sampled textures in one shader".to_owned(),
+                    ));
+                }
+                self.source += &TEXTURES_SAMPLED_TYPES
+                    .replace("<buffers_num>", &format!("{}", bind.textures2d.textures2d_sampled_num))
+                    .replace("<dim>", if has_cube { "Cube" } else { "2D" });
             }
             if bind.textures2d.textures2d_storage_num > 0 {
                 self.source += &TEXTURES_LOADED_TYPES.replace(
@@ -3626,7 +3646,10 @@ impl<'a> Spirv<'a> {
         self.add_constant_float(0.5);
         self.add_constant_float(1.0);
         self.add_constant_float(2.0);
+        // 3.0 and 5.0 are the odd cube-face ids emitted by V_CUBEID_F32.
+        self.add_constant_float(3.0);
         self.add_constant_float(4.0);
+        self.add_constant_float(5.0);
         for i in 0..=32 {
             self.add_constant_int(i);
             self.add_constant_uint(i as u32);

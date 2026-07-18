@@ -56,6 +56,16 @@ pub fn register(registry: &HleRegistry) {
         "sceAmprAprCommandBufferReadFile",
         hle_apr_read_file,
     );
+    registry.register(
+        "libSceAmpr",
+        "sceAmprCommandBufferWriteKernelEventQueue_04_00",
+        hle_write_equeue_record,
+    );
+    registry.register(
+        "libSceAmpr",
+        "sceAmprCommandBufferWriteAddressOnCompletion",
+        hle_write_address_record,
+    );
     // MeasureCommandSize* report a command record's byte size.
     registry.register("libSceAmpr", "sceAmprMeasureCommandSizeReadFile", |_, _| {
         READ_FILE_RECORD_SIZE
@@ -198,6 +208,79 @@ fn hle_get_current_offset(ctx: &HleContext, args: &[u64]) -> u64 {
         .unwrap_or(0)
 }
 
+/// Append one command record to a command buffer's visible buffer at the
+/// host-tracked cursor, advancing the cursor (SharpEmu's
+/// `AppendCommandBufferRecord`).
+fn append_record(ctx: &HleContext, cb: u64, record: &[u8]) -> bool {
+    let mut data = [0u8; 8];
+    let mut size = [0u8; 8];
+    if !ctx.mem.read(cb + CB_DATA_OFFSET, &mut data) || !ctx.mem.read(cb + CB_SIZE_OFFSET, &mut size)
+    {
+        return false;
+    }
+    let (buffer, buf_size) = (u64::from_le_bytes(data), u64::from_le_bytes(size));
+    let offset = ctx
+        .kernel
+        .ampr_write_offsets
+        .get(&cb)
+        .map(|o| *o)
+        .unwrap_or(0);
+    let record_len = record.len() as u64;
+    if buffer == 0 || offset > buf_size || record_len > buf_size - offset {
+        return false;
+    }
+    if !ctx.mem.write(buffer + offset, record) {
+        return false;
+    }
+    ctx.kernel.ampr_write_offsets.insert(cb, offset + record_len);
+    true
+}
+
+/// `sceAmprCommandBufferWriteKernelEventQueue_04_00(cb, equeue, ident, userData)`:
+/// append a completion-event record (type 2, 0x30 bytes) that the kernel
+/// fires when the buffer completes. SharpEmu `AppendKernelEventQueueRecord`.
+fn hle_write_equeue_record(ctx: &HleContext, args: &[u64]) -> u64 {
+    const AMPR_FILTER: i16 = -0x64; // KernelEventFilterAmpr (SharpEmu)
+    let cb = args.first().copied().unwrap_or(0);
+    let equeue = args.get(1).copied().unwrap_or(0);
+    let ident = args.get(2).copied().unwrap_or(0);
+    let user_data = args.get(3).copied().unwrap_or(0);
+    if cb == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    let mut record = [0u8; 0x30];
+    record[0x00..0x04].copy_from_slice(&2u32.to_le_bytes());
+    record[0x04..0x06].copy_from_slice(&AMPR_FILTER.to_le_bytes());
+    record[0x08..0x10].copy_from_slice(&equeue.to_le_bytes());
+    record[0x10..0x18].copy_from_slice(&ident.to_le_bytes());
+    record[0x18..0x20].copy_from_slice(&user_data.to_le_bytes());
+    record[0x20..0x28].copy_from_slice(&user_data.to_le_bytes());
+    if !append_record(ctx, cb, &record) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    OK
+}
+
+/// `sceAmprCommandBufferWriteAddressOnCompletion(cb, address, value)`:
+/// append a write-address record (type 3, 0x20 bytes) the kernel performs at
+/// completion. SharpEmu `AppendWriteAddressRecord`.
+fn hle_write_address_record(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let address = args.get(1).copied().unwrap_or(0);
+    let value = args.get(2).copied().unwrap_or(0);
+    if cb == 0 || address == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    let mut record = [0u8; 0x20];
+    record[0x00..0x04].copy_from_slice(&3u32.to_le_bytes());
+    record[0x08..0x10].copy_from_slice(&address.to_le_bytes());
+    record[0x10..0x18].copy_from_slice(&value.to_le_bytes());
+    if !append_record(ctx, cb, &record) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    OK
+}
+
 /// `sceAmprAprCommandBufferReadFile(cb, _, _, fileId, destination, size,
 /// fileOffset)`: read `size` bytes of PAK file `fileId` at `fileOffset` into
 /// guest `destination`. `fileOffset` is SysV arg7 (`args[6]`, on the stack at
@@ -211,10 +294,26 @@ fn hle_get_current_offset(ctx: &HleContext, args: &[u64]) -> u64 {
 /// registered read would append a command record, which is deferred with it.
 fn hle_apr_read_file(ctx: &HleContext, args: &[u64]) -> u64 {
     let cb = args.first().copied().unwrap_or(0);
+    let file_id = args.get(3).copied().unwrap_or(0) as u32;
     let destination = args.get(4).copied().unwrap_or(0);
     let size = args.get(5).copied().unwrap_or(0);
+    let file_offset = args.get(6).copied().unwrap_or(0);
     if cb == 0 || (destination == 0 && size != 0) {
         return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    // A registered id appends a ReadFile record the kernel completes at
+    // submit (SharpEmu). The id was registered by sceKernelAprResolve*.
+    if ctx.kernel.appr_host_path(file_id).is_some() {
+        let mut record = [0u8; 0x30];
+        record[0x00..0x04].copy_from_slice(&1u32.to_le_bytes());
+        record[0x04..0x08].copy_from_slice(&file_id.to_le_bytes());
+        record[0x08..0x10].copy_from_slice(&destination.to_le_bytes());
+        record[0x10..0x18].copy_from_slice(&size.to_le_bytes());
+        record[0x18..0x20].copy_from_slice(&file_offset.to_le_bytes());
+        if !append_record(ctx, cb, &record) {
+            return SCE_ERROR_MEMORY_FAULT;
+        }
+        return OK;
     }
     // Missing-file path: zero-fill in chunks, stopping if a write faults (a
     // partial fill still returns OK, matching the reference).

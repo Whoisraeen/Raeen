@@ -556,7 +556,22 @@ fn execute_process_mapped(
     // `dispatch::run`'s `call_guest` contract. The remaining arguments carry
     // the same safety argument as `execute_linked`'s call to `dispatch::run`
     // above.
-    for init in &module.module_inits {
+    // Diagnostic: XPS5X_SKIP_MAIN_INIT skips the MAIN module's module_start
+    // call (the LAST entry in `module_inits`, after the dependencies'). A title
+    // whose crt0 `_start` runs the same init array again gets ctors run TWICE —
+    // measured on ASTRO.BOT: a list-adding ctor then builds a cyclic list its
+    // own walk spins on (t1 frozen at a `mov rdx,[rcx]; lea rcx,[rdx+0x10];
+    // jnz` cycle). Skipping the loader's call leaves exactly one run (crt0's).
+    let skip_main_init = std::env::var_os("XPS5X_SKIP_MAIN_INIT").is_some();
+    let init_count = module.module_inits.len();
+    for (i, init) in module.module_inits.iter().enumerate() {
+        if skip_main_init && i + 1 == init_count {
+            tracing::warn!(
+                "{}: XPS5X_SKIP_MAIN_INIT — loader's module_start skipped (crt0 will run it)",
+                init.name
+            );
+            continue;
+        }
         let Ok(ptr) = arena.entry_ptr(init.image_offset) else {
             tracing::warn!(
                 "{}: module_start at +{:#x} is outside the image — skipping",

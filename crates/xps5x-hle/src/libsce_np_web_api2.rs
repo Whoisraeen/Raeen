@@ -27,6 +27,22 @@ pub fn register(registry: &HleRegistry) {
         hle_initialize_for_toolkit,
     );
     registry.register("libSceNpWebApi2", "sceNpWebApi2Terminate", hle_terminate);
+    registry.register(
+        "libSceNpWebApi2",
+        "sceNpWebApi2CreateUserContext",
+        hle_create_user_context,
+    );
+}
+
+/// `sceNpWebApi2CreateUserContext(...)`: hand back a fresh positive user
+/// context id — the "signed-in local user" model (offline; the id carries no
+/// network identity, but a title that gates on having *a* context proceeds).
+static NEXT_USER_CONTEXT: AtomicI32 = AtomicI32::new(1);
+
+fn hle_create_user_context(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let library_context_id = args.first().copied().unwrap_or(0) as i32;
+    tracing::debug!("sceNpWebApi2CreateUserContext(libraryContextId={library_context_id})");
+    NEXT_USER_CONTEXT.fetch_add(1, Ordering::Relaxed) as u64
 }
 
 /// `sceNpWebApi2Initialize(httpContextId, poolSize)`: a non-positive HTTP
