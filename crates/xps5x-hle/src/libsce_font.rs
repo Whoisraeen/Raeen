@@ -27,6 +27,41 @@ const ORBIS_FONT_ERROR_INVALID_PARAMETER: u64 = 0x8046_0002;
 /// `mem_kind` value a live `OrbisFontMem` carries (shadPS4).
 const MEM_KIND_LIVE: u16 = 0x0F00;
 
+/// Size of the zeroed guest buffer each opaque font handle (library, renderer,
+/// font, selection table) points at. Real libSceFont objects are larger, but
+/// nothing in our HLE path dereferences past the header — the handle only has
+/// to be a valid, distinct, non-null guest address the title can store and
+/// hand back to later (also-HLE'd) font calls.
+const HANDLE_BYTES: u64 = 0x100;
+
+/// Allocate a fresh zeroed guest buffer to serve as an opaque font handle, and
+/// return its guest address (0 if the arena is exhausted).
+fn alloc_handle(ctx: &HleContext) -> u64 {
+    let Some(addr) = ctx.alloc.alloc(HANDLE_BYTES, 16) else {
+        return 0;
+    };
+    let _ = ctx.mem.write(addr, &[0u8; HANDLE_BYTES as usize]);
+    addr
+}
+
+/// Write a freshly-allocated handle to the guest `*out_ptr` and return
+/// `ORBIS_OK`. Used by the create/open functions whose last argument is an
+/// `OrbisFont** pOut`. A null `out_ptr` or arena exhaustion is a parameter
+/// error the title can react to rather than a silent success.
+fn return_handle(ctx: &HleContext, out_ptr: u64) -> u64 {
+    if out_ptr == 0 {
+        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
+    }
+    let handle = alloc_handle(ctx);
+    if handle == 0 {
+        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
+    }
+    if !ctx.mem.write(out_ptr, &handle.to_le_bytes()) {
+        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
+    }
+    ORBIS_OK
+}
+
 /// `sceFontMemoryInit(OrbisFontMem* mem, void* region, u32 size,`
 /// `const OrbisFontMemInterface* iface, void* mspace,`
 /// `OrbisFontMemDestroyCb destroy_cb, void* destroy_ctx)`.
@@ -77,9 +112,139 @@ fn hle_font_memory_init(ctx: &HleContext, args: &[u64]) -> u64 {
     ORBIS_OK
 }
 
-/// Register libSceFont HLE functions.
+/// `sceFontSelectLibraryFt(int value)` / `sceFontSelectRendererFt(int value)`:
+/// return a pointer to a driver-selection table (shadPS4 returns a static
+/// table for `value == 0`, else null). The title stores the pointer and hands
+/// it to `sceFontCreate{Library,Renderer}WithEdition` as create params; our
+/// create HLE ignores its contents, so a zeroed handle buffer suffices.
+fn hle_select_ft(ctx: &HleContext, args: &[u64]) -> u64 {
+    if args.first().copied().unwrap_or(0) as u32 != 0 {
+        return 0; // non-zero selector -> unsupported (null), matching shadPS4
+    }
+    alloc_handle(ctx)
+}
+
+/// `sceFontCreate{Library,Renderer}WithEdition(memory, params, edition, pOut)`
+/// — `pOut` is arg 3.
+fn hle_create_with_edition(ctx: &HleContext, args: &[u64]) -> u64 {
+    return_handle(ctx, args.get(3).copied().unwrap_or(0))
+}
+
+/// `sceFontOpen{FontSet,FontMemory}(..., pFontHandle)` — `pFontHandle` is arg 4.
+fn hle_open_font_arg4(ctx: &HleContext, args: &[u64]) -> u64 {
+    return_handle(ctx, args.get(4).copied().unwrap_or(0))
+}
+
+/// `sceFontOpenFontInstance(fontHandle, setupFont, pFontHandle)` — arg 2 out.
+fn hle_open_font_instance(ctx: &HleContext, args: &[u64]) -> u64 {
+    return_handle(ctx, args.get(2).copied().unwrap_or(0))
+}
+
+/// `sceFontGet{Horizontal,Vertical}Layout(fontHandle, layout*)`: zero the
+/// caller's layout struct (arg 1) and report success. Zeroed metrics render
+/// zero-advance glyphs — no visible text, but the title's text layout runs
+/// without reading uninitialized memory or failing.
+fn hle_get_layout(ctx: &HleContext, args: &[u64]) -> u64 {
+    let layout = args.get(1).copied().unwrap_or(0);
+    if layout != 0 {
+        let _ = ctx.mem.write(layout, &[0u8; 0x40]);
+    }
+    ORBIS_OK
+}
+
+/// A libSceFont entry point with no meaningful HLE effect that the title only
+/// checks the SCE-OK return of. Registered for the wide render/writing/query
+/// surface so a UI-text call is a no-op rather than an unresolved jump.
+fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    ORBIS_OK
+}
+
+/// Register libSceFont / libSceFontFt HLE functions.
+///
+/// ASTRO.BOT imports ~54 of these. The create/open/select set returns valid
+/// opaque handles so `initFont()` completes; the render/writing/query set
+/// returns `ORBIS_OK` (a no-op) so later UI-text calls neither crash nor block
+/// — text simply doesn't rasterize yet (full glyph rendering is later work).
+/// Semantics/arg positions are from shadPS4 (GPL-2.0) `font.cpp`/`fontft.cpp`.
 pub fn register(registry: &HleRegistry) {
+    // libSceFontFt driver/renderer selection (returns a table pointer).
+    registry.register("libSceFontFt", "sceFontSelectLibraryFt", hle_select_ft);
+    registry.register("libSceFontFt", "sceFontSelectRendererFt", hle_select_ft);
+
+    // Memory + library/renderer/font lifecycle (return handles).
     registry.register("libSceFont", "sceFontMemoryInit", hle_font_memory_init);
+    registry.register(
+        "libSceFont",
+        "sceFontCreateLibraryWithEdition",
+        hle_create_with_edition,
+    );
+    registry.register(
+        "libSceFont",
+        "sceFontCreateRendererWithEdition",
+        hle_create_with_edition,
+    );
+    registry.register("libSceFont", "sceFontOpenFontSet", hle_open_font_arg4);
+    registry.register("libSceFont", "sceFontOpenFontMemory", hle_open_font_arg4);
+    registry.register(
+        "libSceFont",
+        "sceFontOpenFontInstance",
+        hle_open_font_instance,
+    );
+
+    // Layout queries (zero the out struct).
+    registry.register("libSceFont", "sceFontGetHorizontalLayout", hle_get_layout);
+    registry.register("libSceFont", "sceFontGetVerticalLayout", hle_get_layout);
+
+    // Everything else the title imports: a checked no-op returning ORBIS_OK.
+    // (Setup/effect/bind/render/writing/character/string/support/close/destroy.)
+    for func in [
+        "sceFontAttachDeviceCacheBuffer",
+        "sceFontBindRenderer",
+        "sceFontUnbindRenderer",
+        "sceFontCharacterGetBidiLevel",
+        "sceFontCharacterGetTextFontCode",
+        "sceFontCharacterGetTextOrder",
+        "sceFontCharacterLooksWhiteSpace",
+        "sceFontCharacterRefersTextNext",
+        "sceFontCloseFont",
+        "sceFontCreateString",
+        "sceFontCreateWritingLine",
+        "sceFontDeleteGlyph",
+        "sceFontDestroyRenderer",
+        "sceFontDestroyString",
+        "sceFontDestroyWritingLine",
+        "sceFontGenerateCharGlyph",
+        "sceFontGetRenderCharGlyphMetrics",
+        "sceFontGlyphDefineAttribute",
+        "sceFontRenderCharGlyphImageHorizontal",
+        "sceFontRenderSurfaceInit",
+        "sceFontSetEffectSlant",
+        "sceFontSetEffectWeight",
+        "sceFontSetScalePixel",
+        "sceFontSetupRenderEffectSlant",
+        "sceFontSetupRenderEffectWeight",
+        "sceFontSetupRenderScalePixel",
+        "sceFontStringGetTerminateCode",
+        "sceFontStringGetWritingForm",
+        "sceFontStringRefersRenderCharacters",
+        "sceFontStringRefersTextCharacters",
+        "sceFontSupportExternalFonts",
+        "sceFontSupportSystemFonts",
+        "sceFontTextSourceInit",
+        "sceFontTextSourceSetDefaultFont",
+        "sceFontTextSourceSetWritingForm",
+        "sceFontWritingGetRenderMetrics",
+        "sceFontWritingInit",
+        "sceFontWritingLineClear",
+        "sceFontWritingLineGetOrderingSpace",
+        "sceFontWritingLineGetRenderMetrics",
+        "sceFontWritingLineRefersRenderStep",
+        "sceFontWritingLineWritesOrder",
+        "sceFontWritingRefersRenderStep",
+        "sceFontWritingRefersRenderStepCharacter",
+    ] {
+        registry.register("libSceFont", func, hle_ok);
+    }
 }
 
 #[cfg(test)]

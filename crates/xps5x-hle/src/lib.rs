@@ -36,6 +36,7 @@ pub mod libsce_app_content;
 pub mod libsce_audio_out;
 pub mod libsce_audio_out2;
 pub mod libsce_common_dialog;
+pub mod libsce_content_export;
 pub mod libsce_coredump;
 pub mod libsce_disc_map;
 pub mod libsce_fiber;
@@ -334,6 +335,7 @@ impl HleRegistry {
         libsce_save_data_dialog::register(&registry);
         libsce_common_dialog::register(&registry);
         libsce_font::register(&registry);
+        libsce_content_export::register(&registry);
         libsce_app_content::register(&registry);
         libsce_np::register(&registry);
         libsce_net::register(&registry);

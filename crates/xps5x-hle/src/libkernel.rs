@@ -1177,6 +1177,7 @@ pub fn register(registry: &HleRegistry) {
         "sceKernelGetTscFrequency",
         hle_get_tsc_frequency,
     );
+    registry.register("libkernel", "sceKernelReadTsc", hle_read_tsc);
     registry.register("libkernel", "sceKernelUsleep", hle_usleep);
     registry.register("libkernel", "sceKernelGetProcessTime", hle_get_process_time);
     registry.register(
@@ -3049,10 +3050,29 @@ pub(crate) fn process_start() -> std::time::Instant {
     *START.get_or_init(std::time::Instant::now)
 }
 
+/// Plausible PS5 base-clock TSC frequency (1.6 GHz). Reported by
+/// `sceKernelGetTscFrequency` and used to scale [`hle_read_tsc`] so the two are
+/// self-consistent.
+const TSC_FREQ_HZ: u64 = 1_600_000_000;
+
 /// Stub: plausible PS5 base-clock TSC frequency (1.6 GHz).
 fn hle_get_tsc_frequency(_ctx: &HleContext, _args: &[u64]) -> u64 {
     debug!("sceKernelGetTscFrequency()");
-    1_600_000_000
+    TSC_FREQ_HZ
+}
+
+/// Real `sceKernelReadTsc()`: the CPU timestamp counter, a raw `u64` return.
+/// Titles poll it for fine-grained timing (busy-waits, audio pacing,
+/// profiling). Counting the host TSC directly would drift from the 1.6 GHz we
+/// report via [`hle_get_tsc_frequency`], breaking any `(tsc2 - tsc1) / freq`
+/// elapsed-seconds math; instead derive it from the monotonic process clock at
+/// exactly that rate. A missing ReadTsc left audio/timing threads spinning on
+/// a never-advancing counter.
+fn hle_read_tsc(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    let nanos = process_start().elapsed().as_nanos();
+    // ticks = nanos * TSC_FREQ_HZ / 1e9; u128 math avoids overflow before the
+    // final narrowing.
+    u64::try_from(nanos * u128::from(TSC_FREQ_HZ) / 1_000_000_000).unwrap_or(u64::MAX)
 }
 
 /// Upper bound on how long one `sceKernelUsleep` will actually block the
