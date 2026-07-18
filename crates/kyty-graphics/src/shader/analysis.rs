@@ -1596,6 +1596,14 @@ pub fn shader_get_input_info_ps(
             .and_then(|d| d.user_data.as_ref())
             .ok_or_else(|| ni("ps: user_data is not mapped"))?;
 
+        trace_eud_evidence(
+            "ps",
+            regs.ps_regs.data_addr,
+            user_data,
+            &regs.ps_user_sgpr,
+            i32::from(regs.ps_regs.rsrc2.user_sgpr),
+            mem,
+        );
         shader_parse_usage2(
             user_data,
             &mut usage,
