@@ -265,6 +265,20 @@ impl AgcGpuSession {
         let scanout_image = {
             let addr = *self.scanout_address.lock();
             addr.and_then(|a| framebuffers.get(&a).cloned())
+                .or_else(|| {
+                    // The title fills its VideoOut scanout buffer by a copy/DMA we do
+                    // not yet capture (task #11), so that address is often an empty
+                    // target. Present the drawn target with the MOST content — the
+                    // composited frame — instead of the last-drawn one (usually a
+                    // black background composited last). Single non-zero-byte pass
+                    // per target; only runs when the flip address has no drawn image.
+                    framebuffers
+                        .values()
+                        .map(|img| (img.pixels.iter().filter(|&&b| b != 0).count(), img))
+                        .filter(|(nonzero, _)| *nonzero > 0)
+                        .max_by_key(|(nonzero, _)| *nonzero)
+                        .map(|(_, img)| img.clone())
+                })
         };
         drop(framebuffers);
         drop(cache);
