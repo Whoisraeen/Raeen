@@ -336,6 +336,85 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Diagnostic: `xps5x --resolve-got <eboot.bin> <hex-got-vaddr>...` maps a
+    // PLT/GOT slot vaddr (the `jmp qword [rip+disp]` target of an import thunk)
+    // back to the import symbol it binds — NID, recovered name, and library.
+    // A JMPREL relocation's `offset` *is* the GOT slot vaddr, so a call site's
+    // `ff 25 <disp>` thunk can be turned into "which libc function is this".
+    if let Some(pos) = args.iter().position(|a| a == "--resolve-got") {
+        let path = args
+            .get(pos + 1)
+            .ok_or_else(|| anyhow::anyhow!("--resolve-got requires a path to an eboot.bin"))?;
+        let bytes = std::fs::read(path)?;
+        let decrypted = xps5x_firmware::decrypt_self(&bytes, &xps5x_firmware::NoKeysProvider)?;
+        let module = xps5x_firmware::parse_sprx(&decrypted.elf)?;
+        let dyn_tags = match &module.dynamic {
+            Some(d) => xps5x_firmware::dynlib::parse_sce_dynamic(d)?,
+            None => Vec::new(),
+        };
+        // Real PS5 titles use the standard dynamic model (vaddr-addressed
+        // tables), not the `PT_SCE_DYNLIBDATA` blob — mirror `load_module`.
+        let standard = xps5x_firmware::dynlib::standard_dynamic_view(&module.segments, &dyn_tags);
+        let dynlib = match &standard {
+            Some((image, tags)) => xps5x_firmware::dynlib::parse_dynlibdata(image, tags)?,
+            None => xps5x_firmware::dynlib::parse_dynlibdata(
+                module.dynlib_data.as_deref().unwrap_or(&[]),
+                &dyn_tags,
+            )?,
+        };
+        for gs in &args[pos + 2..] {
+            let Ok(target) = u64::from_str_radix(gs.trim_start_matches("0x"), 16) else {
+                continue;
+            };
+            match dynlib.relocations.iter().find(|r| r.offset == target) {
+                Some(r) => {
+                    let symidx = (r.info >> 32) as usize;
+                    let nid = dynlib.symbols.get(symidx).map_or(0, |s| s.nid);
+                    let lib = dynlib
+                        .imports
+                        .iter()
+                        .find(|i| i.nid == nid)
+                        .and_then(|i| {
+                            dynlib
+                                .import_libs
+                                .iter()
+                                .find(|(idx, _)| *idx == i.library_index)
+                        })
+                        .map_or("?", |(_, n)| n.as_str());
+                    println!(
+                        "GOT {target:#x} -> sym#{symidx} nid={nid:#018x} {} [{lib}] rtype={}",
+                        xps5x_firmware::dynlib::nid_names::describe(nid),
+                        r.info & 0xffff_ffff
+                    );
+                }
+                None => {
+                    println!("GOT {target:#x} -> no exact relocation; nearest by offset:");
+                    let mut near: Vec<&xps5x_firmware::dynlib::SceRela> =
+                        dynlib.relocations.iter().collect();
+                    near.sort_by_key(|r| r.offset.abs_diff(target));
+                    for r in near.iter().take(4) {
+                        let symidx = (r.info >> 32) as usize;
+                        let nid = dynlib.symbols.get(symidx).map_or(0, |s| s.nid);
+                        println!(
+                            "    off={:#x} (Δ{:#x}) sym#{symidx} {} rtype={}",
+                            r.offset,
+                            r.offset.abs_diff(target),
+                            xps5x_firmware::dynlib::nid_names::describe(nid),
+                            r.info & 0xffff_ffff
+                        );
+                    }
+                }
+            }
+        }
+        println!(
+            "[{} relocations total; offset range {:#x}..={:#x}]",
+            dynlib.relocations.len(),
+            dynlib.relocations.iter().map(|r| r.offset).min().unwrap_or(0),
+            dynlib.relocations.iter().map(|r| r.offset).max().unwrap_or(0),
+        );
+        return Ok(());
+    }
+
     // Diagnostic: `xps5x --missing-nids <eboot.bin>` loads a title exactly as
     // `--run-eboot` does but stops before executing, and prints every DISTINCT
     // import nothing resolves — encoded NID, raw NID, and library — grouped by

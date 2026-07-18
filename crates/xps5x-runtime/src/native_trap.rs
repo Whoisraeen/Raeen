@@ -45,6 +45,14 @@ struct Registry {
     entries: HashMap<u64, EntryTrap>, // entry-trampoline addr -> continuation
     returns: HashMap<u64, String>,    // return-trampoline addr -> name
     saved: HashMap<u64, Vec<u64>>,    // guest tid -> stack of real caller returns
+    /// Every `sceLibcMspaceCreate(base,size) -> handle` seen, newest last.
+    /// Used to resolve a null-mspace `Free` back to the mspace that owns the
+    /// pointer (see [`handle`]). Newest-first search finds the innermost region
+    /// when mspaces nest (a sub-mspace carved out of a parent's memory).
+    mspaces: Vec<(u64, u64, u64)>, // (base, end, handle)
+    /// tid -> (base,size) captured at a `Create` ENTER, paired with the handle
+    /// at its RETURN.
+    pending_create: HashMap<u64, (u64, u64)>,
 }
 
 static REG: Mutex<Option<Registry>> = Mutex::new(None);
@@ -140,6 +148,46 @@ pub fn handle(context: &mut CONTEXT, mem: &dyn GuestMemory, tid: u64) -> bool {
         } else {
             0
         };
+
+        // The retail libc `sceLibcMspaceFree` dereferences the mspace it is
+        // handed (reads `mspace+0x370` deep inside). ASTRO.BOT's
+        // `fontMemoryCreateByMalloc` (and other scoped-pool paths) frees a
+        // pointer back to its pool with `mspace = 0` (`xor edi,edi; call
+        // MspaceFree`) — on real HW `0` resolves to "the mspace that owns this
+        // pointer", but our native impl has no default and faults on the null.
+        // Resolve the owning mspace from the pointer using the Create-region
+        // map (newest-first = innermost when pools nest) and free it properly.
+        // The 52k valid frees (real handle in rdi) fall straight through.
+        if context.Rdi == 0 && name.contains("Free") {
+            let ptr = context.Rsi;
+            let owner = r
+                .mspaces
+                .iter()
+                .rev()
+                .find(|(base, end, _)| ptr >= *base && ptr < *end)
+                .map(|(_, _, h)| *h);
+            if let Some(handle) = owner {
+                context.Rdi = handle;
+                warn!(
+                    "NATIVE-TRAP {name} null-mspace: resolved ptr={ptr:#x} -> owner mspace {handle:#x}, freeing natively"
+                );
+                // fall through to the normal native-continue below
+            } else {
+                context.Rsp = context.Rsp.wrapping_add(8);
+                context.Rip = caller_ret;
+                context.Rax = 0;
+                warn!(
+                    "NATIVE-TRAP {name} SKIP null-mspace free (ptr={ptr:#x}, no owning region) -> resume {caller_ret:#x} (leaks)"
+                );
+                return true;
+            }
+        }
+
+        // Capture a Create's (base,size) so the RETURN can record the region.
+        if name.contains("Create") {
+            r.pending_create.insert(tid, (context.Rsi, context.Rdx));
+        }
+
         let _ = mem.write(context.Rsp, &ret_tramp.to_le_bytes());
         r.saved.entry(tid).or_default().push(caller_ret);
         warn!(
@@ -157,6 +205,15 @@ pub fn handle(context: &mut CONTEXT, mem: &dyn GuestMemory, tid: u64) -> bool {
             .get_mut(&tid)
             .and_then(std::vec::Vec::pop)
             .unwrap_or(0);
+        // Record a completed Create so later null-mspace frees can resolve the
+        // owning region. `rax` is the handle; base/size were saved at ENTER.
+        if name.contains("Create") {
+            if let Some((base, size)) = r.pending_create.remove(&tid) {
+                if context.Rax != 0 && size != 0 {
+                    r.mspaces.push((base, base.wrapping_add(size), context.Rax));
+                }
+            }
+        }
         warn!(
             "NATIVE-TRAP {name} RETURN rax={:#x} rdx={:#x} -> resume {resume:#x}",
             context.Rax, context.Rdx

@@ -39,6 +39,7 @@ pub mod libsce_common_dialog;
 pub mod libsce_coredump;
 pub mod libsce_disc_map;
 pub mod libsce_fiber;
+pub mod libsce_font;
 pub mod libsce_gnm_driver;
 pub mod libsce_http;
 pub mod libsce_json;
@@ -332,6 +333,7 @@ impl HleRegistry {
         libsce_save_data::register(&registry);
         libsce_save_data_dialog::register(&registry);
         libsce_common_dialog::register(&registry);
+        libsce_font::register(&registry);
         libsce_app_content::register(&registry);
         libsce_np::register(&registry);
         libsce_net::register(&registry);
