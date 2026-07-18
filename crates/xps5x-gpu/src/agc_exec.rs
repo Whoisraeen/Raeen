@@ -303,13 +303,25 @@ impl AgcGpuSession {
             // Present the VideoOut scanout buffer when the title has flipped to
             // one that has been drawn; otherwise fall back to the last-drawn
             // target (the pre-existing baseline).
-            *self.last_image.lock() = Some(scanout_image.unwrap_or_else(|| image.clone()));
+            let scanout_hit = scanout_image.is_some();
+            let presented = scanout_image.unwrap_or_else(|| image.clone());
+            *self.last_image.lock() = Some(presented.clone());
             let count = {
                 let mut draws = self.draw_count.lock();
                 *draws += drawn;
                 *draws
             };
-            maybe_dump_frame(&image, count);
+            // Dump what is actually PRESENTED (the scanout/composite), not the
+            // last-drawn target (often the black background composited last) —
+            // otherwise the frame dump misrepresents a rendered scene as black.
+            if count <= 8 || count.is_power_of_two() {
+                tracing::info!(
+                    scanout_hit,
+                    scanout = format_args!("{:#x}", self.scanout_address.lock().unwrap_or(0)),
+                    "present: dumping the scanned-out frame"
+                );
+            }
+            maybe_dump_frame(&presented, count);
             // A title renders its UI to several render targets and composites
             // them; the last-drawn one (often the display's black background
             // this early) is not necessarily where the content is. The
