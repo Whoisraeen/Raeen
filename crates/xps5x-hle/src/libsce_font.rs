@@ -140,14 +140,24 @@ fn hle_open_font_instance(ctx: &HleContext, args: &[u64]) -> u64 {
     return_handle(ctx, args.get(2).copied().unwrap_or(0))
 }
 
-/// `sceFontGet{Horizontal,Vertical}Layout(fontHandle, layout*)`: zero the
-/// caller's layout struct (arg 1) and report success. Zeroed metrics render
-/// zero-advance glyphs — no visible text, but the title's text layout runs
-/// without reading uninitialized memory or failing.
+/// `sceFontGet{Horizontal,Vertical}Layout(fontHandle, layout*)`: fill the
+/// caller's layout struct (arg 1) and report success.
+///
+/// `OrbisFont{Horizontal,Vertical}Layout` is **exactly 3 floats (12 bytes)**
+/// (baseline offset, line/column advance, decoration extent) — and titles pass
+/// a *stack-allocated* one. Writing more than 12 bytes overruns it into the
+/// caller's stack canary, so the guest's `__stack_chk_fail` fires and traps
+/// (this is what crashed ASTRO.BOT after font setup). Write exactly the three
+/// fields; use a non-zero advance so text layout that divides by it doesn't
+/// hit a divide-by-zero (glyphs still don't rasterize — a later concern).
 fn hle_get_layout(ctx: &HleContext, args: &[u64]) -> u64 {
     let layout = args.get(1).copied().unwrap_or(0);
     if layout != 0 {
-        let _ = ctx.mem.write(layout, &[0u8; 0x40]);
+        let mut buf = [0u8; 12];
+        buf[0..4].copy_from_slice(&0.0f32.to_le_bytes()); // baseline offset
+        buf[4..8].copy_from_slice(&1.0f32.to_le_bytes()); // line/column advance
+        buf[8..12].copy_from_slice(&0.0f32.to_le_bytes()); // decoration extent
+        let _ = ctx.mem.write(layout, &buf);
     }
     ORBIS_OK
 }
