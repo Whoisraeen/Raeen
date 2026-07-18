@@ -3091,6 +3091,36 @@ pub(crate) fn hle_usleep(_ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_get_proc_param(ctx: &HleContext, _args: &[u64]) -> u64 {
     let addr = ctx.kernel.proc_param_addr();
     debug!("sceKernelGetProcParam() -> {addr:#x}");
+    if std::env::var_os("XPS5X_TRACE_PROCPARAM").is_some() {
+        let r = |a: u64| -> u64 {
+            let mut b = [0u8; 8];
+            if ctx.mem.read(a, &mut b) {
+                u64::from_le_bytes(b)
+            } else {
+                0xDEAD_DEAD_DEAD_DEAD
+            }
+        };
+        // libc's _malloc_init reads SceProcParam[+0x38] -> SceLibcParam, and
+        // fails (heap never inits -> native sceLibcMspaceCreate returns null)
+        // unless SceProcParam size >= 0x40, SceLibcParam ptr != 0, its size
+        // >= 0x40, and version fields (+8 >= 2, +0xc == 1) hold.
+        let libc = r(addr + 0x38);
+        warn!(
+            "PROCPARAM addr={addr:#x} size={:#x} libcParam@0x38={libc:#x}",
+            r(addr)
+        );
+        if libc != 0 && libc >> 48 == 0 {
+            let ver = r(libc + 8);
+            warn!(
+                "  SceLibcParam size={:#x} ver[+8]={:#x} ver[+0xc]={:#x} p[+0x30]={:#x} p[+0x38]={:#x}",
+                r(libc),
+                ver & 0xffff_ffff,
+                ver >> 32,
+                r(libc + 0x30),
+                r(libc + 0x38)
+            );
+        }
+    }
     if addr != 0 {
         addr
     } else {
