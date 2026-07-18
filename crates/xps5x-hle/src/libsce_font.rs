@@ -171,6 +171,96 @@ fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
     ORBIS_OK
 }
 
+/// `sceFontRenderCharGlyphImageHorizontal(fontHandle, code, surf, x, y,
+/// metrics, result)`. The title renders each glyph into a caller-owned
+/// `OrbisFontRenderSurface`, then reads the `OrbisFontRenderOutput` (`result`)
+/// to `memcpy` the rendered pixels into its glyph atlas. With no rasterizer we
+/// produce a **blank** glyph: point `result->SurfaceImage` at a small zeroed
+/// region of the caller's own surface buffer and set a tiny `UpdateRect`, so the
+/// copy reads valid (blank) memory instead of faulting on a null bitmap.
+///
+/// The `float x, y` params sit in XMM registers, so the integer args are
+/// `[fontHandle, code, surf, metrics, result]`. Struct offsets are from shadPS4
+/// (GPL-2.0) `OrbisFontRenderOutput`/`OrbisFontRenderSurface`/`OrbisFontGlyphMetrics`.
+fn hle_render_char_glyph(ctx: &HleContext, args: &[u64]) -> u64 {
+    let surf = args.get(2).copied().unwrap_or(0);
+    let metrics = args.get(3).copied().unwrap_or(0);
+    let result = args.get(4).copied().unwrap_or(0);
+    if surf == 0 || result == 0 {
+        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
+    }
+    let m = ctx.mem;
+    let ru32 = |a: u64| {
+        let mut b = [0u8; 4];
+        if m.read(a, &mut b) {
+            u32::from_le_bytes(b)
+        } else {
+            0
+        }
+    };
+    let ru64 = |a: u64| {
+        let mut b = [0u8; 8];
+        if m.read(a, &mut b) {
+            u64::from_le_bytes(b)
+        } else {
+            0
+        }
+    };
+    let ru8 = |a: u64| {
+        let mut b = [0u8; 1];
+        m.read(a, &mut b);
+        b[0]
+    };
+    // OrbisFontRenderSurface: 0x00 buffer, 0x08 widthByte, 0x0c pixelSizeByte,
+    // 0x10 width, 0x14 height.
+    let surf_buffer = ru64(surf);
+    let surf_width_byte = ru32(surf + 0x08);
+    let surf_pixel_size = u32::from(ru8(surf + 0x0c)).max(1);
+    let surf_w = ru32(surf + 0x10);
+    let surf_h = ru32(surf + 0x14);
+    if surf_buffer == 0 {
+        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
+    }
+    // A tiny blank glyph region, clamped inside the surface.
+    let gw = surf_w.clamp(1, 4);
+    let gh = surf_h.clamp(1, 4);
+    // Zero that region so the copied glyph is blank rather than stale bytes.
+    for row in 0..gh {
+        let row_addr = surf_buffer + u64::from(row) * u64::from(surf_width_byte);
+        let zeros = vec![0u8; (gw * surf_pixel_size) as usize];
+        let _ = m.write(row_addr, &zeros);
+    }
+    // OrbisFontRenderOutput: 0x00 stage, 0x08 SurfaceImage{address, +0x08
+    // widthByte, +0x0c pixelSizeByte, +0x0d pixelFormat}, 0x18 UpdateRect{x,y,w,h},
+    // 0x28 ImageMetrics{bearingX,bearingY,advance,stride,width,height}.
+    let _ = m.write(result, &0u64.to_le_bytes()); // stage = null
+    let _ = m.write(result + 0x08, &surf_buffer.to_le_bytes()); // SurfaceImage.address
+    let _ = m.write(result + 0x10, &surf_width_byte.to_le_bytes());
+    let _ = m.write(result + 0x14, &(surf_pixel_size as u8).to_le_bytes());
+    let _ = m.write(result + 0x15, &0u8.to_le_bytes()); // pixelFormat
+    let _ = m.write(result + 0x16, &0u16.to_le_bytes()); // pad16
+    let _ = m.write(result + 0x18, &0u32.to_le_bytes()); // UpdateRect.x
+    let _ = m.write(result + 0x1c, &0u32.to_le_bytes()); // UpdateRect.y
+    let _ = m.write(result + 0x20, &gw.to_le_bytes()); // UpdateRect.w
+    let _ = m.write(result + 0x24, &gh.to_le_bytes()); // UpdateRect.h
+    let _ = m.write(result + 0x28, &0.0f32.to_le_bytes()); // ImageMetrics.bearingX
+    let _ = m.write(result + 0x2c, &0.0f32.to_le_bytes()); // bearingY
+    let _ = m.write(result + 0x30, &(gw as f32).to_le_bytes()); // advance
+    let _ = m.write(result + 0x34, &(gw as f32).to_le_bytes()); // stride
+    let _ = m.write(result + 0x38, &gw.to_le_bytes()); // width
+    let _ = m.write(result + 0x3c, &gh.to_le_bytes()); // height
+    // Caller's OrbisFontGlyphMetrics out (0x20 bytes): width, height, then the
+    // Horizontal/Vertical {bearingX,bearingY,advance} sub-structs.
+    if metrics != 0 {
+        let mut mb = [0u8; 0x20];
+        mb[0x00..0x04].copy_from_slice(&(gw as f32).to_le_bytes()); // width
+        mb[0x04..0x08].copy_from_slice(&(gh as f32).to_le_bytes()); // height
+        mb[0x10..0x14].copy_from_slice(&(gw as f32).to_le_bytes()); // Horizontal.advance
+        let _ = m.write(metrics, &mb);
+    }
+    ORBIS_OK
+}
+
 /// `sceFontGenerateCharGlyph(handle, codepoint, params, OrbisFontGlyph* out)`:
 /// with no rasterizer we cannot produce a glyph. Initialize the caller's glyph
 /// pointer to null (as shadPS4 does at entry) and report the codepoint as
@@ -225,6 +315,13 @@ pub fn register(registry: &HleRegistry) {
     // Glyph generation: no rasterizer, so report the codepoint unsupported and
     // null the out-glyph so the title skips rendering it.
     registry.register("libSceFont", "sceFontGenerateCharGlyph", hle_generate_glyph);
+    // Glyph rendering: point the render output at a blank region of the
+    // caller's own surface so its atlas-upload memcpy reads valid memory.
+    registry.register(
+        "libSceFont",
+        "sceFontRenderCharGlyphImageHorizontal",
+        hle_render_char_glyph,
+    );
 
     // Everything else the title imports: a checked no-op returning ORBIS_OK.
     // (Setup/effect/bind/render/writing/character/string/support/close/destroy.)
@@ -246,7 +343,6 @@ pub fn register(registry: &HleRegistry) {
         "sceFontDestroyWritingLine",
         "sceFontGetRenderCharGlyphMetrics",
         "sceFontGlyphDefineAttribute",
-        "sceFontRenderCharGlyphImageHorizontal",
         "sceFontRenderSurfaceInit",
         "sceFontSetEffectSlant",
         "sceFontSetEffectWeight",
