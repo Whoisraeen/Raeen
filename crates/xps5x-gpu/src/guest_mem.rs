@@ -61,7 +61,9 @@ const READABLE_PAGES: u32 = {
 /// stops being readable — the difference between a wild base and a lazy tail.
 #[cfg(windows)]
 fn committed_prefix_len(addr: u64, size: u64) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualQuery,
+    };
 
     let Some(end) = addr.checked_add(size) else {
         return 0;

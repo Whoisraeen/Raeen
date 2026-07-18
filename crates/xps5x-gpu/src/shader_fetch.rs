@@ -267,14 +267,7 @@ impl ShaderTranslateCache {
                 let code = shader_parse_cs(&cs, &sh_regs, mem, next_gen)
                     .map_err(|e| AttemptError::from_analysis("shader_parse_cs", &e))?;
                 let mut cs_info = ShaderComputeInputInfo::default();
-                shader_get_input_info_cs(
-                    &cs,
-                    &sh_regs,
-                    mem,
-                    &shader_map,
-                    next_gen,
-                    &mut cs_info,
-                )
+                shader_get_input_info_cs(&cs, &sh_regs, mem, &shader_map, next_gen, &mut cs_info)
                     .map_err(|e| AttemptError::from_analysis("shader_get_input_info_cs", &e))?;
                 let spirv = shader_recompile_cs(&code, &cs_info)
                     .map_err(|e| AttemptError::named(format!("shader_recompile_cs: {e}")))?;

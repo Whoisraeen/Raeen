@@ -145,10 +145,9 @@ impl VulkanDevice {
         // of times a frame; without this each rebind recompiles from SPIR-V.
         // A failed cache is non-fatal — fall back to no cache.
         // SAFETY: `device` is valid; the default create-info is inert.
-        let pipeline_cache = unsafe {
-            device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
-        }
-        .unwrap_or(vk::PipelineCache::null());
+        let pipeline_cache =
+            unsafe { device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) }
+                .unwrap_or(vk::PipelineCache::null());
 
         info!(
             "Vulkan device ready: {device_name} (validation={validation_enabled}, graphics queue family {queue_family_index})"
@@ -459,7 +458,8 @@ impl Drop for VulkanDevice {
         unsafe {
             let _ = self.device.device_wait_idle();
             if self.pipeline_cache != vk::PipelineCache::null() {
-                self.device.destroy_pipeline_cache(self.pipeline_cache, None);
+                self.device
+                    .destroy_pipeline_cache(self.pipeline_cache, None);
             }
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);

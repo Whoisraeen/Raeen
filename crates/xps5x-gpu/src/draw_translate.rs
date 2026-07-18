@@ -121,7 +121,9 @@ fn gen5_blend_op(code: u8) -> Result<vk::BlendOp, DrawError> {
         2 => Ok(vk::BlendOp::MIN),
         3 => Ok(vk::BlendOp::MAX),
         4 => Ok(vk::BlendOp::REVERSE_SUBTRACT),
-        other => Err(err(format!("blend combine function {other} not implemented"))),
+        other => Err(err(format!(
+            "blend combine function {other} not implemented"
+        ))),
     }
 }
 
@@ -178,6 +180,10 @@ fn vulkan_format(
         // intermediate render target ASTRO.BOT draws into. SharpEmu maps both
         // CB formats 6 and 7 with channel_type 7 to B10G11R11_UFLOAT_PACK32.
         (0x6 | 0x7, 7, 0) => Ok(vk::Format::B10G11R11_UFLOAT_PACK32),
+        // 16_16_16_16 FLOAT (CB format 0xc, channel_type 7): the 64bpp HDR main
+        // scene target ASTRO.BOT renders into before tone-mapping. The offscreen
+        // readback is bpp-aware (8 bytes/pixel for this one).
+        (0xc, 7, 0) => Ok(vk::Format::R16G16B16A16_SFLOAT),
         _ => Err(err(format!(
             "unsupported CB_COLOR0_INFO format={format:#x} channel_type={channel_type} \
              channel_order={channel_order} — no Vulkan format mapping"
@@ -321,10 +327,11 @@ fn read_guest_bytes_unaligned(addr: u64, size: u64, kind: &str) -> Result<Vec<u8
     let window = read_guest_bytes(aligned, span, kind)?;
     let start = head as usize;
     let end = start + size as usize;
-    window
-        .get(start..end)
-        .map(<[u8]>::to_vec)
-        .ok_or_else(|| err(format!("{kind} at {addr:#x}: slice {start}..{end} outside read window")))
+    window.get(start..end).map(<[u8]>::to_vec).ok_or_else(|| {
+        err(format!(
+            "{kind} at {addr:#x}: slice {start}..{end} outside read window"
+        ))
+    })
 }
 
 fn read_guest_bytes(addr: u64, size: u64, kind: &str) -> Result<Vec<u8>, DrawError> {
@@ -452,7 +459,9 @@ fn prepare_vertex_inputs(
 /// value is a named error carrying every raw field, so a run against the title
 /// states exactly what to implement next — a guessed format number would render
 /// silently-wrong colours, which is worse than an honest skip.
-fn decode_texture(t: &kyty_graphics::shader::ShaderTextureResource) -> Result<TextureUpload, DrawError> {
+fn decode_texture(
+    t: &kyty_graphics::shader::ShaderTextureResource,
+) -> Result<TextureUpload, DrawError> {
     let width = u32::from(t.width5()) + 1;
     let height = u32::from(t.height5()) + 1;
     if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) {
@@ -578,10 +587,10 @@ fn prepare_stage_binding(
     // (base replaced by the descriptor-array index) in the exact
     // `shader_calc_binding_indices` order: storage V#s, then T#s (8 dwords),
     // then S#s (4 dwords), then direct SGPRs.
-    let texture_num = usize::try_from(bind.textures2d.textures_num)
-        .map_err(|_| err("negative texture count"))?;
-    let sampler_num = usize::try_from(bind.samplers.samplers_num)
-        .map_err(|_| err("negative sampler count"))?;
+    let texture_num =
+        usize::try_from(bind.textures2d.textures_num).map_err(|_| err("negative texture count"))?;
+    let sampler_num =
+        usize::try_from(bind.samplers.samplers_num).map_err(|_| err("negative sampler count"))?;
     if texture_num > bind.textures2d.desc.len() || sampler_num > bind.samplers.samplers.len() {
         return Err(err("texture/sampler count exceeds fixed array"));
     }
@@ -1050,8 +1059,7 @@ impl OffscreenDrawSink<'_> {
             if let Some(p) = &prior {
                 state.initial = Some(&p.pixels);
             }
-            render_draw(self.dev, &state)
-                .map_err(|e| err(format!("offscreen draw failed: {e}")))?
+            render_draw(self.dev, &state).map_err(|e| err(format!("offscreen draw failed: {e}")))?
         };
 
         self.framebuffers.insert(rt_base, image.clone());
@@ -1089,7 +1097,13 @@ impl DrawSink for OffscreenDrawSink<'_> {
         draw: &IndexedDraw,
     ) -> Result<(), DrawError> {
         let (index_bytes, index_type) = fetch_index_buffer(draw)?;
-        self.draw_common(ctx, ucfg, sh, draw.index_count, Some((&index_bytes, index_type)))
+        self.draw_common(
+            ctx,
+            ucfg,
+            sh,
+            draw.index_count,
+            Some((&index_bytes, index_type)),
+        )
     }
 
     fn dispatch_direct(
@@ -1162,10 +1176,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
             debug!(
                 addr = format_args!("{addr:#x}"),
                 len = bytes.len(),
-                head = format_args!(
-                    "{:02x?}",
-                    &bytes[..bytes.len().min(16)]
-                ),
+                head = format_args!("{:02x?}", &bytes[..bytes.len().min(16)]),
                 "compute storage writeback"
             );
             if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
@@ -1369,10 +1380,7 @@ mod tests {
             (0x2, vk::ColorComponentFlags::G),
             (0x4, vk::ColorComponentFlags::B),
             (0x8, vk::ColorComponentFlags::A),
-            (
-                0x9,
-                vk::ColorComponentFlags::R | vk::ColorComponentFlags::A,
-            ),
+            (0x9, vk::ColorComponentFlags::R | vk::ColorComponentFlags::A),
         ] {
             assert_eq!(
                 vulkan_color_write_mask(mask),
@@ -1583,10 +1591,10 @@ mod tests {
     fn blend_state_maps_alpha_over() {
         let mut ctx = ctx_96x48();
         ctx.blend_control[0] = kyty_graphics::hw_regs::BlendControl {
-            color_srcblend: 0x04, // SrcAlpha
-            color_comb_fcn: 0,    // ADD
+            color_srcblend: 0x04,  // SrcAlpha
+            color_comb_fcn: 0,     // ADD
             color_destblend: 0x05, // OneMinusSrcAlpha
-            alpha_srcblend: 0x01, // One
+            alpha_srcblend: 0x01,  // One
             alpha_comb_fcn: 0,
             alpha_destblend: 0x00, // Zero
             separate_alpha_blend: true,
@@ -1609,10 +1617,10 @@ mod tests {
     fn blend_state_without_separate_alpha_reuses_color_factors() {
         let mut ctx = ctx_96x48();
         ctx.blend_control[0] = kyty_graphics::hw_regs::BlendControl {
-            color_srcblend: 0x02, // SrcColor
-            color_comb_fcn: 1,    // SUBTRACT
+            color_srcblend: 0x02,  // SrcColor
+            color_comb_fcn: 1,     // SUBTRACT
             color_destblend: 0x08, // DestColor
-            alpha_srcblend: 0x1f, // junk on purpose — must be ignored
+            alpha_srcblend: 0x1f,  // junk on purpose — must be ignored
             alpha_comb_fcn: 0x7,
             alpha_destblend: 0x1f,
             separate_alpha_blend: false,
@@ -1650,7 +1658,10 @@ mod tests {
     #[test]
     fn gen5_vertex_formats_map_per_sharpemu_table() {
         assert_eq!(gen5_vertex_format(64).unwrap(), vk::Format::R32G32_SFLOAT);
-        assert_eq!(gen5_vertex_format(74).unwrap(), vk::Format::R32G32B32_SFLOAT);
+        assert_eq!(
+            gen5_vertex_format(74).unwrap(),
+            vk::Format::R32G32B32_SFLOAT
+        );
         assert_eq!(
             gen5_vertex_format(77).unwrap(),
             vk::Format::R32G32B32A32_SFLOAT

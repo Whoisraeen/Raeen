@@ -156,7 +156,10 @@ const fn ab_xyy(x_bit: u8, y1: u8, y2: u8) -> AddressBit {
         y_mask: (1 << y1) | (1 << y2),
     }
 }
-const AB_ZERO: AddressBit = AddressBit { x_mask: 0, y_mask: 0 };
+const AB_ZERO: AddressBit = AddressBit {
+    x_mask: 0,
+    y_mask: 0,
+};
 
 /// PS5/Oberon (16-pipe, 8-packer, "RB+") single-sample `SW_64KB_R_X`
 /// (SWIZZLE_MODE 27) equations, one row per bytes-per-element log2
@@ -449,7 +452,13 @@ fn detile_64kb_with(
 
 /// Detile a supported 64 KiB-block GFX10 swizzle mode, or `None` for a mode
 /// with no ported equation yet (the caller names it instead of guessing).
-pub fn detile_64kb(mode: u8, tiled: &[u8], width: u32, height: u32, bpp_log2: u32) -> Option<Vec<u8>> {
+pub fn detile_64kb(
+    mode: u8,
+    tiled: &[u8],
+    width: u32,
+    height: u32,
+    bpp_log2: u32,
+) -> Option<Vec<u8>> {
     let table = swizzle_64kb_table(mode)?;
     Some(detile_64kb_with(tiled, width, height, bpp_log2, table))
 }
@@ -495,7 +504,6 @@ fn tile_64kb_with(
     }
     out
 }
-
 
 #[cfg(test)]
 mod tests {

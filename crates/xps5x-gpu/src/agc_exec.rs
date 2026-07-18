@@ -500,23 +500,27 @@ fn maybe_dump_all_targets(targets: &[(u64, RenderedImage)], draw_index: u64) {
         return;
     }
     for (base, image) in targets {
+        let bpp = image.bytes_per_pixel.max(1) as usize;
         let non_black = image
             .pixels
-            .chunks_exact(4)
-            .filter(|px| px[0] != 0 || px[1] != 0 || px[2] != 0)
+            .chunks_exact(bpp)
+            .filter(|px| px.iter().take(3).any(|&b| b != 0))
             .count();
         let path =
             std::path::Path::new(&dir).join(format!("target_{base:012x}_{draw_index:06}.ppm"));
         let mut ppm = format!("P6\n{} {}\n255\n", image.width, image.height).into_bytes();
-        ppm.reserve(image.pixels.len() / 4 * 3);
-        for rgba in image.pixels.chunks_exact(4) {
-            ppm.extend_from_slice(&rgba[..3]);
+        ppm.reserve(image.pixels.len() / bpp * 3);
+        // First 3 bytes of each pixel as approximate RGB — exact for the 4-byte
+        // RGBA/BGRA formats; a rough low-byte view for packed/HDR targets (this
+        // is a diagnostic dump, the presented frame is the RGBA8 composite).
+        for px in image.pixels.chunks_exact(bpp) {
+            ppm.extend_from_slice(&px[..3]);
         }
         let _ = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &ppm));
         tracing::info!(
             base = format_args!("{base:#x}"),
             non_black_pixels = non_black,
-            total = image.pixels.len() / 4,
+            total = image.pixels.len() / bpp,
             "render-target census"
         );
     }
@@ -719,11 +723,13 @@ mod tests {
             width: 2,
             height: 1,
             pixels: vec![10, 20, 30, 255, 40, 50, 60, 255],
+            bytes_per_pixel: 4,
         };
         let black = RenderedImage {
             width: 2,
             height: 1,
             pixels: vec![0, 0, 0, 255, 0, 0, 0, 255],
+            bytes_per_pixel: 4,
         };
         // The GPU drew content to the render target at guest base 0x1000; the
         // last-drawn image happens to be the black background.

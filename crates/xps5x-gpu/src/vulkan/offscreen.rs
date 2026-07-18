@@ -25,7 +25,6 @@ use xps5x_core::error::GpuError;
 pub const CLEAR_COLOR: [f32; 4] = [0.25, 0.5, 0.75, 1.0];
 
 /// Bytes per pixel of the render target's `R8G8B8A8_UNORM` format.
-const BYTES_PER_PIXEL: u32 = 4;
 
 /// Triangle vertices in Vulkan normalized device coordinates (`x, y, z, w`).
 ///
@@ -38,25 +37,50 @@ const TRIANGLE_VERTICES: [[f32; 4]; 3] = [
     [-0.7, 0.7, 0.0, 1.0], // bottom left
 ];
 
-/// A rendered image read back from the GPU: tightly-packed RGBA8 rows.
+/// A rendered image read back from the GPU: tightly-packed rows.
 #[derive(Debug, Clone)]
 pub struct RenderedImage {
     pub width: u32,
     pub height: u32,
-    /// `width * height * 4` bytes, row-major, no padding.
+    /// `width * height * bytes_per_pixel` bytes, row-major, no padding.
     pub pixels: Vec<u8>,
+    /// Bytes per pixel of the render target: 4 for the 8-bit RGBA/BGRA and
+    /// packed B10G11R11 formats, 8 for R16G16B16A16 (HDR). Everything that
+    /// slices `pixels` per pixel must use this rather than assuming 4.
+    pub bytes_per_pixel: u32,
 }
 
 impl RenderedImage {
-    /// The RGBA bytes at `(x, y)`, or `None` if out of bounds.
+    /// The first-4-bytes-as-RGBA at `(x, y)`, or `None` if out of bounds. Only
+    /// meaningful for the 4-byte display formats; HDR targets are re-sampled as
+    /// textures, not read pixel-by-pixel for display.
     pub fn pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
         if x >= self.width || y >= self.height {
             return None;
         }
-        let offset = ((y * self.width + x) * BYTES_PER_PIXEL) as usize;
+        let offset = ((y * self.width + x) * self.bytes_per_pixel) as usize;
         self.pixels
             .get(offset..offset + 4)
             .map(|p| [p[0], p[1], p[2], p[3]])
+    }
+}
+
+/// Bytes per pixel the offscreen readback must copy for a render-target format,
+/// or an error naming an unsupported one. The readback is a raw byte copy, so
+/// only the size matters here (the format's meaning is handled where it is
+/// sampled). Packed 32-bit HDR (B10G11R11) is 4 bytes like RGBA8; R16G16B16A16
+/// is 8.
+fn readback_bpp(format: vk::Format) -> Result<u32, GpuError> {
+    match format {
+        vk::Format::R8G8B8A8_UNORM
+        | vk::Format::R8G8B8A8_SRGB
+        | vk::Format::B8G8R8A8_UNORM
+        | vk::Format::B8G8R8A8_SRGB
+        | vk::Format::B10G11R11_UFLOAT_PACK32 => Ok(4),
+        vk::Format::R16G16B16A16_SFLOAT => Ok(8),
+        other => Err(GpuError::VulkanInitFailed(format!(
+            "render target format {other:?} has no readback byte size mapping"
+        ))),
     }
 }
 
@@ -253,24 +277,6 @@ impl<'a> DrawState<'a> {
     }
 }
 
-/// `RenderedImage` indexes pixels assuming 4 bytes each, so a format of any
-/// other size would silently corrupt the readback rather than fail.
-fn require_32bpp(format: vk::Format) -> Result<(), GpuError> {
-    match format {
-        vk::Format::R8G8B8A8_UNORM
-        | vk::Format::R8G8B8A8_SRGB
-        | vk::Format::B8G8R8A8_UNORM
-        | vk::Format::B8G8R8A8_SRGB
-        // Packed 32-bit HDR float target (ASTRO.BOT's 10_11_11 intermediate).
-        // The readback is a raw 4-byte-per-pixel copy, so the packed format is
-        // size-compatible and round-trips (readback and re-upload agree on it).
-        | vk::Format::B10G11R11_UFLOAT_PACK32 => Ok(()),
-        other => Err(GpuError::VulkanInitFailed(format!(
-            "render target format {other:?} is not 32bpp; readback assumes {BYTES_PER_PIXEL} bytes per pixel"
-        ))),
-    }
-}
-
 /// Draw once offscreen from an explicit [`DrawState`] and read back the pixels.
 ///
 /// # Errors
@@ -290,7 +296,7 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<RenderedImag
             "vertex and fragment SPIR-V must be non-empty".to_owned(),
         ));
     }
-    require_32bpp(state.format)?;
+    let bpp = readback_bpp(state.format)?;
 
     let mut res = Resources::new(dev);
     if std::env::var_os("XPS5X_TIME_DRAW").is_some() {
@@ -302,7 +308,7 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<RenderedImag
         res.record_and_submit(state)?;
         let t_submit = t1.elapsed();
         let t2 = Instant::now();
-        let pixels = res.read_back(state.width, state.height)?;
+        let pixels = res.read_back(state.width, state.height, bpp)?;
         let t_readback = t2.elapsed();
         tracing::warn!(
             build_us = t_build.as_micros(),
@@ -314,11 +320,12 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<RenderedImag
             width: state.width,
             height: state.height,
             pixels,
+            bytes_per_pixel: bpp,
         });
     }
     res.build(state)?;
     res.record_and_submit(state)?;
-    let pixels = res.read_back(state.width, state.height)?;
+    let pixels = res.read_back(state.width, state.height, bpp)?;
 
     debug!(
         width = state.width,
@@ -331,6 +338,7 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<RenderedImag
         width: state.width,
         height: state.height,
         pixels,
+        bytes_per_pixel: bpp,
     })
 }
 
@@ -485,9 +493,10 @@ impl<'a> Resources<'a> {
     }
 
     fn build(&mut self, state: &DrawState) -> Result<(), GpuError> {
+        let bpp = readback_bpp(state.format)? as usize;
         self.create_render_target(state.width, state.height, state.format)?;
         if let Some(initial) = state.initial {
-            let expected = state.width as usize * state.height as usize * BYTES_PER_PIXEL as usize;
+            let expected = state.width as usize * state.height as usize * bpp;
             if initial.len() != expected {
                 return Err(GpuError::VulkanInitFailed(format!(
                     "initial render-target contents are {} bytes; {}x{} needs {expected}",
@@ -512,7 +521,7 @@ impl<'a> Resources<'a> {
         }
         self.create_guest_vertex_buffers(state)?;
         self.create_stage_resources(state)?;
-        self.create_readback_buffer(state.width, state.height)?;
+        self.create_readback_buffer(state.width, state.height, bpp as u32)?;
         self.create_pipeline(state)?;
         self.create_command_resources()?;
         Ok(())
@@ -1064,10 +1073,14 @@ impl<'a> Resources<'a> {
             .map_err(|e| GpuError::VulkanInitFailed(format!("vkCreateSampler: {e}")))
     }
 
-    fn create_readback_buffer(&mut self, width: u32, height: u32) -> Result<(), GpuError> {
-        let size = vk::DeviceSize::from(width)
-            * vk::DeviceSize::from(height)
-            * vk::DeviceSize::from(BYTES_PER_PIXEL);
+    fn create_readback_buffer(
+        &mut self,
+        width: u32,
+        height: u32,
+        bpp: u32,
+    ) -> Result<(), GpuError> {
+        let size =
+            vk::DeviceSize::from(width) * vk::DeviceSize::from(height) * vk::DeviceSize::from(bpp);
         // The whole frame is copied out of this buffer on the CPU. Without
         // HOST_CACHED that copy reads uncached memory, which is ~50x slower:
         // measured 32 ms to read back one 1080p frame, dwarfing the ~1 ms of
@@ -1274,12 +1287,7 @@ impl<'a> Resources<'a> {
 
     /// Barrier helper: transition `image` (render target or texture) between
     /// layouts, across `layers` array layers.
-    fn image_barrier_layers(
-        &self,
-        image: vk::Image,
-        layers: u32,
-        transition: ImageTransition,
-    ) {
+    fn image_barrier_layers(&self, image: vk::Image, layers: u32, transition: ImageTransition) {
         let barrier = vk::ImageMemoryBarrier::default()
             .old_layout(transition.old_layout)
             .new_layout(transition.new_layout)
@@ -1331,7 +1339,7 @@ impl<'a> Resources<'a> {
         for texture in &self.texture_uploads {
             self.image_barrier_layers(
                 texture.image,
-                    texture.layers,
+                texture.layers,
                 ImageTransition {
                     old_layout: vk::ImageLayout::UNDEFINED,
                     new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -1371,7 +1379,7 @@ impl<'a> Resources<'a> {
             }
             self.image_barrier_layers(
                 texture.image,
-                    texture.layers,
+                texture.layers,
                 ImageTransition {
                     old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -1389,7 +1397,7 @@ impl<'a> Resources<'a> {
             // attachment stage so LOAD sees the composed frame so far.
             self.image_barrier_layers(
                 self.image,
-                    1,
+                1,
                 ImageTransition {
                     old_layout: vk::ImageLayout::UNDEFINED,
                     new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -1428,7 +1436,7 @@ impl<'a> Resources<'a> {
             }
             self.image_barrier_layers(
                 self.image,
-                    1,
+                1,
                 ImageTransition {
                     old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -1444,7 +1452,7 @@ impl<'a> Resources<'a> {
             // contents, which is fine: the render pass clears anyway.
             self.image_barrier_layers(
                 self.image,
-                    1,
+                1,
                 ImageTransition {
                     old_layout: vk::ImageLayout::UNDEFINED,
                     new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -1562,7 +1570,12 @@ impl<'a> Resources<'a> {
             if let Some(index) = &state.index {
                 // vertex_count carries the index count for an indexed draw
                 // (draw_state_from_regs stores the count it was given).
-                d.cmd_bind_index_buffer(self.command_buffer, self.index_buffer, 0, index.index_type);
+                d.cmd_bind_index_buffer(
+                    self.command_buffer,
+                    self.index_buffer,
+                    0,
+                    index.index_type,
+                );
                 d.cmd_draw_indexed(self.command_buffer, state.vertex_count, 1, 0, 0, 0);
             } else {
                 d.cmd_draw(self.command_buffer, state.vertex_count, 1, 0, 0);
@@ -1573,7 +1586,7 @@ impl<'a> Resources<'a> {
         // COLOR_ATTACHMENT_OPTIMAL -> TRANSFER_SRC_OPTIMAL for the copy out.
         self.image_barrier_layers(
             self.image,
-                1,
+            1,
             ImageTransition {
                 old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
@@ -1655,8 +1668,8 @@ impl<'a> Resources<'a> {
         Ok(())
     }
 
-    fn read_back(&self, width: u32, height: u32) -> Result<Vec<u8>, GpuError> {
-        let size = (width as usize) * (height as usize) * (BYTES_PER_PIXEL as usize);
+    fn read_back(&self, width: u32, height: u32, bpp: u32) -> Result<Vec<u8>, GpuError> {
+        let size = (width as usize) * (height as usize) * (bpp as usize);
 
         // SAFETY: the memory is HOST_VISIBLE and not currently mapped. The GPU
         // work that writes it has completed — `record_and_submit` waited on the
@@ -1833,6 +1846,7 @@ mod tests {
                 1, 1, 1, 1, 2, 2, 2, 2, // row 0
                 3, 3, 3, 3, 4, 4, 4, 4, // row 1
             ],
+            bytes_per_pixel: 4,
         };
         assert_eq!(img.pixel(0, 0), Some([1, 1, 1, 1]));
         assert_eq!(img.pixel(1, 0), Some([2, 2, 2, 2]));
