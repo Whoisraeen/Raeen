@@ -344,6 +344,12 @@ fn hle_mspace_malloc_stats(ctx: &HleContext, args: &[u64]) -> u64 {
     // `next_offset` (0x100). ASTRO.BOT's GpuMemory then saw a ~256-byte "system
     // size" and reported "Out of graphics memory [Onion]" for a 2 MiB request on
     // an otherwise-empty 184 MiB pool (`GpuMemory.cpp:155`).
+    if std::env::var_os("XPS5X_TRACE_MSPACE").is_some() {
+        warn!(
+            "MSPACE-STATS mspace={mspace:#x} name={:?} cap={:#x} next={:#x} peak={:#x} active={:#x}",
+            state.name, state.capacity, state.next_offset, state.peak_offset, state.active_bytes
+        );
+    }
     let fields = [
         (0x08u64, state.capacity),     // maxSystemSize: whole fixed region
         (0x10, state.capacity),        // currentSystemSize: fully committed
