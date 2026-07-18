@@ -260,7 +260,11 @@ fn require_32bpp(format: vk::Format) -> Result<(), GpuError> {
         vk::Format::R8G8B8A8_UNORM
         | vk::Format::R8G8B8A8_SRGB
         | vk::Format::B8G8R8A8_UNORM
-        | vk::Format::B8G8R8A8_SRGB => Ok(()),
+        | vk::Format::B8G8R8A8_SRGB
+        // Packed 32-bit HDR float target (ASTRO.BOT's 10_11_11 intermediate).
+        // The readback is a raw 4-byte-per-pixel copy, so the packed format is
+        // size-compatible and round-trips (readback and re-upload agree on it).
+        | vk::Format::B10G11R11_UFLOAT_PACK32 => Ok(()),
         other => Err(GpuError::VulkanInitFailed(format!(
             "render target format {other:?} is not 32bpp; readback assumes {BYTES_PER_PIXEL} bytes per pixel"
         ))),
