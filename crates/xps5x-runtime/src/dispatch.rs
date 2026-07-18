@@ -1444,6 +1444,56 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         if !mem.read(fault_addr, &mut marker)
             || marker != xps5x_firmware::dynlib::linker::SYSCALL_TRAP_BYTES
         {
+            // Not our syscall trap. If the bad instruction is in guest code
+            // (arena range), it is a genuine undefined opcode — a wild jump into
+            // data, a corrupted vtable/function-pointer call landing off-code, a
+            // `ud2`. Passing it through kills the whole process with no report
+            // (the exact "unreported SIGILL" seen bringing up ASTRO.BOT's worker
+            // threads). Record it as an execute-fault and recover through `run`'s
+            // snapshot instead, so it surfaces as "guest fault at <rip>" with the
+            // offending bytes — which names the crash site. Host-code illegal
+            // instructions (below the arena) are still passed through untouched.
+            if fault_addr >= crate::GUEST_ARENA_BASE {
+                ctx.error.set(Some(RuntimeError::Faulted {
+                    addr: fault_addr,
+                    access: fault_addr,
+                    kind: crate::FaultKind::Execute,
+                }));
+                for frame in ctx.callback_frames.borrow_mut().drain(..).rev() {
+                    if let Some(completion) = frame.completion {
+                        let _ = mem.atomic_store_u32(completion.address, completion.failure_u32);
+                    }
+                }
+                let mut bytes = [0u8; 16];
+                let bytes_read = mem.read(fault_addr, &mut bytes);
+                ctx.fault_snapshot.set(Some(FaultSnapshot {
+                    rip: context.Rip,
+                    rsp: context.Rsp,
+                    rbp: context.Rbp,
+                    rax: context.Rax,
+                    rbx: context.Rbx,
+                    rcx: context.Rcx,
+                    rdx: context.Rdx,
+                    rsi: context.Rsi,
+                    rdi: context.Rdi,
+                    r8: context.R8,
+                    r9: context.R9,
+                    r10: context.R10,
+                    r11: context.R11,
+                    r12: context.R12,
+                    r13: context.R13,
+                    r14: context.R14,
+                    r15: context.R15,
+                    bytes,
+                    bytes_read,
+                }));
+                // SAFETY: identical invariant to the genuine-fault recovery
+                // below — `recovery_ctx` points at `run`'s still-live stack
+                // snapshot on this same (synchronously-faulting) thread, and
+                // CONTEXT is Copy.
+                *context = unsafe { *ctx.recovery_ctx };
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
             return EXCEPTION_CONTINUE_SEARCH;
         }
 
