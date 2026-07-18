@@ -1890,6 +1890,19 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
 
+            // Native-function detour (diagnostic, XPS5X_TRAP_*): entry/return
+            // trampolines that log-and-continue a native guest function so its
+            // divergent behavior under native execution can be observed.
+            if t.library == crate::native_trap::TRAP_LIBRARY
+                && crate::native_trap::handle(
+                    context,
+                    mem,
+                    u64::from(unsafe { GetCurrentThreadId() }),
+                )
+            {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+
             // libSceFiber control transfer (sceFiberRun / Switch / ReturnToThread
             // / GetSelf) rewrites the guest CONTEXT to resume a different fiber
             // (or the thread) executing natively on its own stack — handled here,

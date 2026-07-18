@@ -508,6 +508,29 @@ fn main() -> anyhow::Result<()> {
             }
             info!("__cxa_throw trap: patched {patched} internal copies, trampoline at {tramp_addr:#x}");
         }
+        // Diagnostic: XPS5X_TRAP_MSPACE installs a log-and-continue detour on the
+        // title's native libc `sceLibcMspaceCreate` impl (`libc.prx+0xbe50`) so
+        // its args + return value are logged — it returns null over valid memory
+        // under our native execution while succeeding interpreted in SharpEmu.
+        // The impl's prologue is `push rbp; mov rbp,rsp; push r15/r14/r13/r12/rbx`
+        // = 13 relocation-free bytes, safe to relocate into the continuation stub.
+        if std::env::var_os("XPS5X_TRAP_MSPACE").is_some() {
+            if let Some(libc) = process
+                .dependencies
+                .iter()
+                .find(|d| d.name.contains("libc"))
+            {
+                xps5x_runtime::native_trap::install(
+                    &mut linked.image,
+                    &mut linked.hle_trampolines,
+                    libc.image_offset + 0xbe50,
+                    13,
+                    "sceLibcMspaceCreateImpl",
+                );
+            } else {
+                info!("XPS5X_TRAP_MSPACE: no libc dependency found to trap");
+            }
+        }
         let linked = std::sync::Arc::new(linked);
         info!(
             "loaded: entry={:#x} image={:#x} byte(s) resolved={} unresolved={}",

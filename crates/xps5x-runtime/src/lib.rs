@@ -22,6 +22,7 @@ mod arena;
 #[cfg(target_os = "windows")]
 mod dispatch;
 mod fiber;
+pub mod native_trap;
 #[cfg(target_os = "windows")]
 mod process;
 #[cfg(target_os = "windows")]
