@@ -23,6 +23,8 @@ use tracing::debug;
 const ORBIS_OK: u64 = 0;
 /// `ORBIS_FONT_ERROR_INVALID_PARAMETER` (`font_error.h`).
 const ORBIS_FONT_ERROR_INVALID_PARAMETER: u64 = 0x8046_0002;
+/// `ORBIS_FONT_ERROR_NO_SUPPORT_GLYPH` — "this codepoint has no glyph".
+const ORBIS_FONT_ERROR_NO_SUPPORT_GLYPH: u64 = 0x8046_0042;
 
 /// `mem_kind` value a live `OrbisFontMem` carries (shadPS4).
 const MEM_KIND_LIVE: u16 = 0x0F00;
@@ -169,6 +171,21 @@ fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
     ORBIS_OK
 }
 
+/// `sceFontGenerateCharGlyph(handle, codepoint, params, OrbisFontGlyph* out)`:
+/// with no rasterizer we cannot produce a glyph. Initialize the caller's glyph
+/// pointer to null (as shadPS4 does at entry) and report the codepoint as
+/// unsupported, so the title's text renderer skips it instead of `memcpy`-ing a
+/// bitmap out of a never-written (garbage/null) glyph — which faulted on a null
+/// source. Text simply doesn't rasterize yet; the engine keeps running.
+fn hle_generate_glyph(ctx: &HleContext, args: &[u64]) -> u64 {
+    if let Some(&out) = args.get(3) {
+        if out != 0 {
+            let _ = ctx.mem.write(out, &0u64.to_le_bytes());
+        }
+    }
+    ORBIS_FONT_ERROR_NO_SUPPORT_GLYPH
+}
+
 /// Register libSceFont / libSceFontFt HLE functions.
 ///
 /// ASTRO.BOT imports ~54 of these. The create/open/select set returns valid
@@ -205,6 +222,10 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceFont", "sceFontGetHorizontalLayout", hle_get_layout);
     registry.register("libSceFont", "sceFontGetVerticalLayout", hle_get_layout);
 
+    // Glyph generation: no rasterizer, so report the codepoint unsupported and
+    // null the out-glyph so the title skips rendering it.
+    registry.register("libSceFont", "sceFontGenerateCharGlyph", hle_generate_glyph);
+
     // Everything else the title imports: a checked no-op returning ORBIS_OK.
     // (Setup/effect/bind/render/writing/character/string/support/close/destroy.)
     for func in [
@@ -223,7 +244,6 @@ pub fn register(registry: &HleRegistry) {
         "sceFontDestroyRenderer",
         "sceFontDestroyString",
         "sceFontDestroyWritingLine",
-        "sceFontGenerateCharGlyph",
         "sceFontGetRenderCharGlyphMetrics",
         "sceFontGlyphDefineAttribute",
         "sceFontRenderCharGlyphImageHorizontal",
