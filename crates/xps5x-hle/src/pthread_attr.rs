@@ -37,6 +37,7 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register("libkernel", "scePthreadAttrSetstacksize", hle_set_stacksize);
     registry.register("libkernel", "scePthreadAttrGetstacksize", hle_get_stacksize);
+    registry.register("libkernel", "scePthreadAttrSetstack", hle_set_stack);
     registry.register("libkernel", "scePthreadAttrSetguardsize", hle_set_guardsize);
     registry.register("libkernel", "scePthreadAttrGetguardsize", hle_get_guardsize);
     registry.register(
@@ -172,6 +173,18 @@ fn hle_set_detachstate(ctx: &HleContext, args: &[u64]) -> u64 {
 
 fn hle_set_stacksize(ctx: &HleContext, args: &[u64]) -> u64 {
     let size = args.get(1).copied().unwrap_or(0);
+    with_attr(ctx, args.first().copied().unwrap_or(0), |a| {
+        a.stack_size = size
+    })
+}
+
+/// `scePthreadAttrSetstack(attr, stackAddr, stackSize)` — the title supplies its
+/// own stack region (base + size). We do not honor a guest-chosen stack BASE
+/// (the scheduler owns stack allocation), but the call MUST succeed: ASTRO.BOT
+/// asserts (engine `Thread.cpp:120`) and then faults if it returns an error.
+/// Record the size like `scePthreadAttrSetstacksize` and return OK.
+fn hle_set_stack(ctx: &HleContext, args: &[u64]) -> u64 {
+    let size = args.get(2).copied().unwrap_or(0);
     with_attr(ctx, args.first().copied().unwrap_or(0), |a| {
         a.stack_size = size
     })

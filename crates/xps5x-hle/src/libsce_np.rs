@@ -43,6 +43,11 @@ pub fn register(registry: &HleRegistry) {
         "sceNpGetNpReachabilityState",
         hle_get_reachability,
     );
+    registry.register(
+        "libSceNpManager",
+        "sceNpGetAccountCountryA",
+        hle_get_account_country,
+    );
     registry.register("libSceNpManager", "sceNpGameIntentInitialize", hle_ok);
     // libSceNpManagerForToolkit is a sibling library (same offline Np state);
     // its state callback registration behaves like the base one. Ported from
@@ -99,6 +104,29 @@ fn hle_get_online_id(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
+/// `sceNpGetAccountCountryA(SceUserServiceUserId userId, SceNpCountryCode *country)`:
+/// reports a fixed region (`"US"`). A title's Np/WebApi init can *require* a
+/// country and assert on failure — ASTRO.BOT hard-asserts at `NpWebApi.cpp:1587`
+/// when this returns an error. The country is a locale value, independent of the
+/// signed-out connection state the rest of this module reports. `SceNpCountryCode`
+/// is `{ char data[2]; char term; char pad[1]; }` (4 bytes). Ported from
+/// SharpEmu's `NpManagerExports.NpGetAccountCountryA` (GPL-2.0).
+fn hle_get_account_country(ctx: &HleContext, args: &[u64]) -> u64 {
+    let user_id = args.first().copied().unwrap_or(0) as u32;
+    let country_ptr = args.get(1).copied().unwrap_or(0);
+    debug!("sceNpGetAccountCountryA(country={country_ptr:#x}) -> \"US\"");
+    // userId == -1 (invalid user) or a NULL out-ptr is an argument error.
+    if user_id == 0xFFFF_FFFF || country_ptr == 0 {
+        return ERROR_INVALID_ARGUMENT;
+    }
+    // data[2]="US", term=0, pad=0.
+    if !ctx.mem.write(country_ptr, b"US\0\0") {
+        warn!("sceNpGetAccountCountryA: out-ptr {country_ptr:#x} not writable");
+        return ERROR_INVALID_ARGUMENT;
+    }
+    SCE_OK
+}
+
 /// `sceNpGetNpReachabilityState(...)`: PSN is unreachable (offline).
 fn hle_get_reachability(ctx: &HleContext, args: &[u64]) -> u64 {
     let state_ptr = args.get(1).copied().unwrap_or(0);
@@ -139,6 +167,25 @@ mod tests {
             "libSceNpManagerForToolkit",
             "sceNpRegisterStateCallbackForToolkit"
         ));
+    }
+
+    #[test]
+    fn get_account_country_writes_us() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(hle_get_account_country(&ctx, &[1, 0x100]), SCE_OK);
+        let mut c = [0u8; 4];
+        assert!(mem.read(0x100, &mut c));
+        assert_eq!(&c, b"US\0\0");
+        // userId == -1 or a NULL out-ptr is an argument error.
+        assert_eq!(
+            hle_get_account_country(&ctx, &[0xFFFF_FFFF, 0x100]),
+            ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(hle_get_account_country(&ctx, &[1, 0]), ERROR_INVALID_ARGUMENT);
     }
 
     #[test]

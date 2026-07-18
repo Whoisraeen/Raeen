@@ -610,10 +610,33 @@ fn main() -> anyhow::Result<()> {
                         .collect();
                     spent.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
                     let top: Vec<String> = spent.into_iter().map(|(_, s)| s).collect();
+                    // The HLE call each thread is CURRENTLY inside (empty = not in
+                    // one → blocked in guest code or runtime infra). Names exactly
+                    // which blocking call a frozen thread never returns from.
+                    let mut inflight: Vec<String> = kmon
+                        .in_flight_hle
+                        .iter()
+                        .map(|e| format!("t{}={}", e.key(), e.value()))
+                        .collect();
+                    inflight.sort();
+                    // Shallow host backtrace per thread (module+offset), so a
+                    // thread parked in a host wait OUTSIDE any HLE call is shown
+                    // with the call chain through our code that reached it.
+                    let mut bt: Vec<String> = xps5x_runtime::sample_host_backtraces(&kmon)
+                        .into_iter()
+                        .map(|(id, chain)| format!("t{id}: {chain}"))
+                        .collect();
+                    bt.sort();
                     info!(
-                        "STALL_DUMP ({} threads):\n{}\nRIPs: {}{}",
+                        "STALL_DUMP ({} threads):\n{}\nIN-FLIGHT HLE: {}\nHOST BACKTRACES:\n{}\nRIPs: {}{}",
                         lines.len(),
                         lines.join("\n"),
+                        if inflight.is_empty() {
+                            "<none — all threads between calls>".to_owned()
+                        } else {
+                            inflight.join("  ")
+                        },
+                        bt.join("\n"),
                         rips.join(" "),
                         if top.is_empty() {
                             String::new()

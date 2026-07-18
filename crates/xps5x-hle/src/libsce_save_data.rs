@@ -21,6 +21,10 @@ const ERROR_PARAMETER: u64 = 0x809F_0000;
 const ERROR_EXISTS: u64 = 0x809F_0007;
 const ERROR_NOT_FOUND: u64 = 0x809F_0008;
 const ERROR_INTERNAL: u64 = 0x809F_000B;
+/// `SCE_SAVE_DATA_ERROR_MEMORY_NOT_READY` — save-memory used before setup.
+const ERROR_MEMORY_NOT_READY: u64 = 0x809F_0012;
+/// Save-memory blob ceiling (SharpEmu: 64 MiB).
+const SAVE_DATA_MEMORY_MAX: u64 = 64 * 1024 * 1024;
 const MOUNT_MODE_CREATE: u32 = 1 << 2;
 const MOUNT_MODE_CREATE2: u32 = 1 << 5;
 /// `SceSaveDataMountResult` size in bytes.
@@ -59,6 +63,27 @@ pub fn register(registry: &HleRegistry) {
         );
         registry.register(library, "sceSaveDataPrepare", hle_prepare);
         registry.register(library, "sceSaveDataSetParam", hle_set_param);
+        // Mountless per-user "save data memory" blob API.
+        registry.register(
+            library,
+            "sceSaveDataSetupSaveDataMemory2",
+            hle_setup_save_data_memory2,
+        );
+        registry.register(
+            library,
+            "sceSaveDataGetSaveDataMemory2",
+            hle_get_save_data_memory2,
+        );
+        registry.register(
+            library,
+            "sceSaveDataSetSaveDataMemory2",
+            hle_set_save_data_memory2,
+        );
+        registry.register(
+            library,
+            "sceSaveDataSyncSaveDataMemory",
+            hle_sync_save_data_memory,
+        );
     }
     registry.register_nid(
         "libSceSaveData_native",
@@ -90,6 +115,136 @@ pub fn register(registry: &HleRegistry) {
         0x89ee_ea85_9e17_d027,
         hle_commit,
     );
+    // The measured ASTRO.BOT import: Setup2 from libSceSaveData_native carries a
+    // library-private NID the name→NID DB may not cover, so pin it explicitly.
+    registry.register_nid(
+        "libSceSaveData_native",
+        "sceSaveDataSetupSaveDataMemory2",
+        0xa10c_9211_47e0_5d10,
+        hle_setup_save_data_memory2,
+    );
+}
+
+/// Read a little-endian `u32`/`u64` from guest memory (save-memory helpers).
+fn sdm_u32(ctx: &HleContext, addr: u64) -> Option<u32> {
+    let mut b = [0u8; 4];
+    ctx.mem.read(addr, &mut b).then(|| u32::from_le_bytes(b))
+}
+fn sdm_u64(ctx: &HleContext, addr: u64) -> Option<u64> {
+    let mut b = [0u8; 8];
+    ctx.mem.read(addr, &mut b).then(|| u64::from_le_bytes(b))
+}
+
+/// `sceSaveDataSetupSaveDataMemory2(setup*, result*)`: size the per-user save
+/// blob to `setup.memorySize` (zero-filled, grown only), and report the
+/// pre-existing size via `*result`. `SceSaveDataMemorySetup2` = `{ u32 option;
+/// i32 userId; u64 memorySize; ... }`. Ported from SharpEmu
+/// `SaveDataSetupSaveDataMemory2` (GPL-2.0).
+fn hle_setup_save_data_memory2(ctx: &HleContext, args: &[u64]) -> u64 {
+    let param = args.first().copied().unwrap_or(0);
+    let result = args.get(1).copied().unwrap_or(0);
+    if param == 0 {
+        return ERROR_PARAMETER;
+    }
+    let (Some(user_id), Some(size)) = (sdm_u32(ctx, param + 0x04), sdm_u64(ctx, param + 0x08))
+    else {
+        return ERROR_INTERNAL;
+    };
+    let user_id = user_id as i32;
+    if user_id < 0 || size == 0 || size > SAVE_DATA_MEMORY_MAX {
+        return ERROR_PARAMETER;
+    }
+    let existed = ctx
+        .kernel
+        .save_data_memory
+        .get(&user_id)
+        .map_or(0u64, |b| b.len() as u64);
+    // Write the result first: a faulted result pointer must not leave grown
+    // setup state behind (mirrors SharpEmu's ordering).
+    if result != 0 && !ctx.mem.write(result, &existed.to_le_bytes()) {
+        return ERROR_INTERNAL;
+    }
+    let mut blob = ctx.kernel.save_data_memory.entry(user_id).or_default();
+    if (blob.len() as u64) < size {
+        blob.resize(size as usize, 0);
+    }
+    debug!("sceSaveDataSetupSaveDataMemory2 user={user_id} size={size:#x} existed={existed:#x}");
+    SCE_OK
+}
+
+/// Shared body for `Get`/`Set`SaveDataMemory2: transfer between the per-user
+/// blob and a guest buffer. Request = `{ i32 userId; u8 pad[4]; SceSaveDataMemoryData* data }`;
+/// `SceSaveDataMemoryData` = `{ void* buf; u64 bufSize; i64 offset }`.
+fn transfer_save_data_memory(ctx: &HleContext, args: &[u64], write: bool) -> u64 {
+    let request = args.first().copied().unwrap_or(0);
+    if request == 0 {
+        return ERROR_PARAMETER;
+    }
+    let (Some(user_id), Some(data)) = (sdm_u32(ctx, request), sdm_u64(ctx, request + 0x08)) else {
+        return ERROR_INTERNAL;
+    };
+    let user_id = user_id as i32;
+    if user_id < 0 {
+        return ERROR_PARAMETER;
+    }
+    let Some(mut blob) = ctx.kernel.save_data_memory.get_mut(&user_id) else {
+        return ERROR_MEMORY_NOT_READY;
+    };
+    if data == 0 {
+        return SCE_OK; // a NULL data descriptor is a no-op success (SharpEmu)
+    }
+    let (Some(buf), Some(buf_size), Some(offset)) = (
+        sdm_u64(ctx, data),
+        sdm_u64(ctx, data + 0x08),
+        sdm_u64(ctx, data + 0x10),
+    ) else {
+        return ERROR_INTERNAL;
+    };
+    let len = blob.len() as u64;
+    if buf == 0 || buf_size > len || offset > len - buf_size {
+        return ERROR_PARAMETER;
+    }
+    let (start, end) = (offset as usize, (offset + buf_size) as usize);
+    if write {
+        let mut tmp = vec![0u8; buf_size as usize];
+        if !ctx.mem.read(buf, &mut tmp) {
+            return ERROR_INTERNAL;
+        }
+        blob[start..end].copy_from_slice(&tmp);
+    } else if !ctx.mem.write(buf, &blob[start..end]) {
+        return ERROR_INTERNAL;
+    }
+    SCE_OK
+}
+
+/// `sceSaveDataGetSaveDataMemory2(get*)`: copy blob → guest buffer.
+fn hle_get_save_data_memory2(ctx: &HleContext, args: &[u64]) -> u64 {
+    transfer_save_data_memory(ctx, args, false)
+}
+
+/// `sceSaveDataSetSaveDataMemory2(set*)`: copy guest buffer → blob.
+fn hle_set_save_data_memory2(ctx: &HleContext, args: &[u64]) -> u64 {
+    transfer_save_data_memory(ctx, args, true)
+}
+
+/// `sceSaveDataSyncSaveDataMemory(sync*)`: writes go straight to the blob, so a
+/// ready state is all sync confirms. `SceSaveDataMemorySync` starts with `i32 userId`.
+fn hle_sync_save_data_memory(ctx: &HleContext, args: &[u64]) -> u64 {
+    let sync = args.first().copied().unwrap_or(0);
+    if sync == 0 {
+        return ERROR_PARAMETER;
+    }
+    let Some(user_id) = sdm_u32(ctx, sync) else {
+        return ERROR_INTERNAL;
+    };
+    if (user_id as i32) < 0 {
+        return ERROR_PARAMETER;
+    }
+    if ctx.kernel.save_data_memory.contains_key(&(user_id as i32)) {
+        SCE_OK
+    } else {
+        ERROR_MEMORY_NOT_READY
+    }
 }
 
 /// Commit all buffered file writes below a mounted save-data point.

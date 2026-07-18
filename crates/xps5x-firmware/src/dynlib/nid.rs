@@ -438,6 +438,23 @@ mod nid_database_tests {
         );
     }
 
+    /// ASTRO.BOT imports `sceNpGetAccountCountryA` (libSceNpManager) by this
+    /// exact NID — measured 2026-07-18: the eboot link reported it missing and
+    /// the title later hard-asserted at `NpWebApi.cpp:1587` on the resumed
+    /// error. The registration exists (`libsce_np.rs`), so the live-registry
+    /// database must resolve it. Pins both the hash and the registration.
+    #[test]
+    fn real_hle_registry_resolves_np_get_account_country_a_nid() {
+        let hle = xps5x_hle::HleRegistry::new();
+        let db = NidDatabase::from_hle(&hle);
+
+        assert_eq!(nid_of("sceNpGetAccountCountryA"), 0x253f_add3_46b7_4f10);
+        assert_eq!(
+            db.resolve(0x253f_add3_46b7_4f10),
+            Some("libSceNpManager::sceNpGetAccountCountryA"),
+        );
+    }
+
     #[test]
     fn duplicate_name_resolves_deterministically_and_does_not_panic() {
         // Same function name registered under two different libraries maps

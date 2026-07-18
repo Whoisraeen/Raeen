@@ -2,13 +2,15 @@
 //! Cancel/DeleteSema`).
 //!
 //! A faithful Rust port of SharpEmu's `KernelSemaphoreCompatExports` (GPL-2.0).
-//! The count arithmetic (Create/Signal/Poll/Cancel/Delete) is **fully correct**
-//! and lives in the kernel (`OrbisKernel::kernel_semaphores`). `Wait` on an
-//! empty semaphore blocks a real thread until another signals; under XPS5X's
-//! single-active-execution model there is no other thread, so `Wait` decrements
-//! immediately when the count is available (the common same-thread case) and
-//! otherwise reports a timeout rather than hanging. True blocking waits arrive
-//! with the M1-E scheduler.
+//! The count arithmetic (Create/Signal/Poll/Cancel/Delete) lives in the kernel
+//! (`OrbisKernel::kernel_semaphores`). `Wait` **truly blocks** on the shared
+//! `semaphore_signal` condvar until another guest thread signals the count or a
+//! finite timeout expires — with real concurrent guest threads a producer *does*
+//! signal, so the old instant-`ETIMEDOUT` was wrong: a job-system title (e.g.
+//! ASTRO.BOT `Semaphore.cpp:63`) asserts when its worker threads' waits time out
+//! at boot. A NULL timeout waits forever (never synthesizes `ETIMEDOUT`); a
+//! finite one returns `ETIMEDOUT` only when the deadline genuinely passes. This
+//! mirrors the same conversion already done for event flags (`kernel_eventflag`).
 
 use crate::{HleContext, HleRegistry};
 use tracing::debug;
@@ -74,20 +76,27 @@ fn hle_delete(ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_signal(ctx: &HleContext, args: &[u64]) -> u64 {
     let handle = args.first().copied().unwrap_or(0) as u32;
     let signal = args.get(1).copied().unwrap_or(0) as i32;
-    let Some(mut sem) = ctx.kernel.kernel_semaphores.get_mut(&handle) else {
-        return SCE_KERNEL_ERROR_ESRCH;
-    };
-    if signal < 1 || sem.count > sem.max_count - signal {
-        return SCE_KERNEL_ERROR_EINVAL;
+    {
+        let Some(mut sem) = ctx.kernel.kernel_semaphores.get_mut(&handle) else {
+            return SCE_KERNEL_ERROR_ESRCH;
+        };
+        if signal < 1 || sem.count > sem.max_count - signal {
+            return SCE_KERNEL_ERROR_EINVAL;
+        }
+        sem.count += signal;
     }
-    sem.count += signal;
+    // Wake every blocked `WaitSema` so it re-checks the new count. Notifying
+    // under the shared lock closes the check-then-sleep race (see hle_wait).
+    let (lock, cvar) = &ctx.kernel.semaphore_signal;
+    let _guard = lock.lock().unwrap();
+    cvar.notify_all();
     OK
 }
 
-/// Shared body for Poll (never blocks) and Wait (decrements if available).
-fn poll_or_wait(ctx: &HleContext, args: &[u64], unavailable_err: u64) -> u64 {
-    let handle = args.first().copied().unwrap_or(0) as u32;
-    let need = args.get(1).copied().unwrap_or(0) as i32;
+/// Non-blocking consume: `EINVAL` on a bad `need`, `unavailable_err` if the
+/// count is short, else decrement and `OK`. Used by Poll, and by Wait for its
+/// first (fast-path) attempt.
+fn try_consume(ctx: &HleContext, handle: u32, need: i32, unavailable_err: u64) -> u64 {
     let Some(mut sem) = ctx.kernel.kernel_semaphores.get_mut(&handle) else {
         return SCE_KERNEL_ERROR_ESRCH;
     };
@@ -104,14 +113,72 @@ fn poll_or_wait(ctx: &HleContext, args: &[u64], unavailable_err: u64) -> u64 {
 /// `sceKernelPollSema(handle, needCount)`: non-blocking; `EBUSY` if the count
 /// isn't available.
 fn hle_poll(ctx: &HleContext, args: &[u64]) -> u64 {
-    poll_or_wait(ctx, args, SCE_KERNEL_ERROR_EBUSY)
+    let handle = args.first().copied().unwrap_or(0) as u32;
+    let need = args.get(1).copied().unwrap_or(0) as i32;
+    try_consume(ctx, handle, need, SCE_KERNEL_ERROR_EBUSY)
 }
 
-/// `sceKernelWaitSema(handle, needCount, timeout)`: decrements immediately if
-/// the count is available; otherwise reports a timeout (no other thread can
-/// signal it under single-active-execution).
+/// `sceKernelWaitSema(handle, needCount, timeout)`: consume `needCount` from the
+/// semaphore, **blocking** on the shared `semaphore_signal` condvar until a
+/// producer thread signals enough count. `timeout` is `SceKernelUseconds*` (a
+/// u32 of microseconds); NULL waits forever and never synthesizes a timeout — a
+/// finite value returns `ETIMEDOUT` only once its deadline genuinely passes.
 fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
-    poll_or_wait(ctx, args, SCE_KERNEL_ERROR_ETIMEDOUT)
+    let handle = args.first().copied().unwrap_or(0) as u32;
+    let need = args.get(1).copied().unwrap_or(0) as i32;
+    let timeout_ptr = args.get(2).copied().unwrap_or(0);
+
+    // Fast path: if the count is already available (or the args are bad, or the
+    // handle is unknown), settle it without touching the condvar.
+    let fast = try_consume(ctx, handle, need, SCE_KERNEL_ERROR_EBUSY);
+    if fast != SCE_KERNEL_ERROR_EBUSY {
+        return fast; // OK, EINVAL, or ESRCH
+    }
+
+    let deadline = if timeout_ptr == 0 {
+        None
+    } else {
+        let mut raw = [0u8; 4];
+        if !ctx.mem.read(timeout_ptr, &mut raw) {
+            return SCE_KERNEL_ERROR_EFAULT;
+        }
+        Some(std::time::Instant::now() + std::time::Duration::from_micros(u64::from(u32::from_le_bytes(raw))))
+    };
+
+    let (lock, cvar) = &ctx.kernel.semaphore_signal;
+    let mut guard = lock.lock().unwrap();
+    // Cap each host wait so process teardown and any missed notify are noticed
+    // promptly regardless of the guest's (possibly infinite) timeout.
+    let slice = std::time::Duration::from_millis(100);
+    loop {
+        // Honor process teardown: a parked worker MUST wake and unwind, or
+        // `terminate_and_reap`'s join hangs forever waiting for it (the cond and
+        // event-flag waits honor this too — returning here lets the thread reach
+        // a termination checkpoint in dispatch). This is the counterpart to
+        // making the wait truly block: an infinite block must still be escapable.
+        if ctx.guest_threads.process_is_terminating() {
+            return OK;
+        }
+        // Re-check under the condvar lock, serialised against Signal's notify.
+        let attempt = try_consume(ctx, handle, need, SCE_KERNEL_ERROR_EBUSY);
+        if attempt != SCE_KERNEL_ERROR_EBUSY {
+            return attempt; // OK, EINVAL, or ESRCH (deleted while waiting)
+        }
+        // A NULL timeout waits forever (never synthesizes a timeout the guest
+        // asserts on); a finite one returns ETIMEDOUT once the deadline passes.
+        let wait = match deadline {
+            None => slice,
+            Some(dl) => {
+                let remaining = dl.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return SCE_KERNEL_ERROR_ETIMEDOUT;
+                }
+                remaining.min(slice)
+            }
+        };
+        let (g, _) = cvar.wait_timeout(guard, wait).unwrap();
+        guard = g;
+    }
 }
 
 /// `sceKernelCancelSema(handle, setCount, waiterCountOut)`: reset the count
@@ -128,6 +195,11 @@ fn hle_cancel(ctx: &HleContext, args: &[u64]) -> u64 {
     }
     // A negative setCount means "reset to the max"; clamp into range.
     sem.count = set_count.clamp(0, sem.max_count);
+    drop(sem);
+    // Cancel wakes every waiter so they re-evaluate against the reset count.
+    let (lock, cvar) = &ctx.kernel.semaphore_signal;
+    let _guard = lock.lock().unwrap();
+    cvar.notify_all();
     OK
 }
 
@@ -184,17 +256,50 @@ mod tests {
     }
 
     #[test]
-    fn wait_times_out_when_count_unavailable() {
+    fn wait_with_finite_timeout_times_out_when_count_unavailable() {
         let (kernel, mem, alloc) = ctx_env();
         let ctx = test_ctx(&kernel, &mem, &alloc);
         let h = create(&ctx, 0, 2);
-        // count 0, need 1 → nothing else can signal → timeout.
+        // A finite timeout (2000 us) at 0x200: nothing signals → ETIMEDOUT.
+        assert!(mem.write(0x200, &2000u32.to_le_bytes()));
         assert_eq!(
-            hle_wait(&ctx, &[h as u64, 1, 0]),
+            hle_wait(&ctx, &[h as u64, 1, 0x200]),
             SCE_KERNEL_ERROR_ETIMEDOUT
         );
-        // need beyond max → EINVAL.
-        assert_eq!(hle_wait(&ctx, &[h as u64, 5, 0]), SCE_KERNEL_ERROR_EINVAL);
+        // need beyond max → EINVAL on the fast path (never blocks).
+        assert_eq!(hle_wait(&ctx, &[h as u64, 5, 0x200]), SCE_KERNEL_ERROR_EINVAL);
+    }
+
+    /// The blocking-wait contract: a `WaitSema` with a NULL (forever) timeout
+    /// must sleep until another thread signals the count, NOT instantly time out.
+    /// This is the ASTRO.BOT `Semaphore.cpp:63` regression — its worker threads
+    /// wait on an empty job semaphore at boot and asserted on ETIMEDOUT.
+    #[test]
+    fn wait_blocks_forever_until_another_thread_signals() {
+        let kernel = std::sync::Arc::new(xps5x_kernel::OrbisKernel::new());
+        let mem = crate::TestMemory::new(0x400);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(kernel.as_ref(), &mem, &alloc);
+        let h = create(&ctx, 0, 4);
+        let signaller = std::thread::spawn({
+            let k2 = std::sync::Arc::clone(&kernel);
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                let mem2 = crate::TestMemory::new(0x100);
+                let alloc2 = crate::TestAllocator::new(0);
+                let ctx2 = test_ctx(k2.as_ref(), &mem2, &alloc2);
+                assert_eq!(hle_signal(&ctx2, &[u64::from(h), 1]), OK);
+            }
+        });
+        let start = std::time::Instant::now();
+        // timeout ptr 0 = wait forever; must return OK only after the signal.
+        assert_eq!(hle_wait(&ctx, &[u64::from(h), 1, 0]), OK);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(25),
+            "the wait must have BLOCKED for the producer, not spun (took {elapsed:?})"
+        );
+        signaller.join().unwrap();
     }
 
     #[test]

@@ -117,6 +117,181 @@ pub fn sample_guest_rips(_kernel: &OrbisKernel) -> Vec<(u64, u64)> {
     Vec::new()
 }
 
+/// Resolve a HOST (Windows) code address to `module+0xoffset`, or `None` if it
+/// is not inside a loaded module. Diagnostic only — symbolizes where a stalled
+/// guest thread is parked in *our* code / ntdll.
+#[cfg(windows)]
+#[must_use]
+pub fn host_module_for_addr(addr: u64) -> Option<String> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        GetModuleFileNameW, GetModuleHandleExW,
+    };
+    let mut hmod: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: FROM_ADDRESS reinterprets the name pointer as the address to look
+    // up; UNCHANGED_REFCOUNT means the returned handle must not be freed. Both
+    // out-params are valid local storage.
+    let ok = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            addr as *const u16,
+            &mut hmod,
+        )
+    };
+    if ok == 0 || hmod.is_null() {
+        return None;
+    }
+    let mut buf = [0u16; 260];
+    // SAFETY: `buf` holds `buf.len()` u16s; the call writes at most that many.
+    let len = unsafe { GetModuleFileNameW(hmod, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    let path = String::from_utf16_lossy(&buf[..len.min(buf.len())]);
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned();
+    Some(format!("{name}+{:#x}", addr.wrapping_sub(hmod as u64)))
+}
+
+/// Resolve a host address to a `function+disp` name via dbghelp + the process
+/// PDB. `None` if the symbol can't be found (e.g. system DLLs without symbols).
+/// Best-effort and lazily initialized; a 200 MB PDB loads on the first hit.
+#[cfg(windows)]
+#[must_use]
+pub fn symbolize_host_addr(addr: u64) -> Option<String> {
+    use std::sync::Once;
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        SYMBOL_INFO, SymFromAddr, SymInitialize, SymSetOptions,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES.
+    const OPTS: u32 = 0x0000_0002 | 0x0000_0004 | 0x0000_0010;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| unsafe {
+        SymSetOptions(OPTS);
+        SymInitialize(GetCurrentProcess(), core::ptr::null(), 1);
+    });
+    const MAX_SYM_NAME: usize = 1024;
+    // SYMBOL_INFO ends in a variable-length name array; over-allocate as u64s so
+    // the struct stays 8-aligned and there's room for the name past its tail.
+    let words = std::mem::size_of::<SYMBOL_INFO>() / 8 + MAX_SYM_NAME / 8 + 2;
+    let mut buf = vec![0u64; words];
+    let info = buf.as_mut_ptr().cast::<SYMBOL_INFO>();
+    let mut disp = 0u64;
+    // SAFETY: `info` points at `words*8` bytes of zeroed storage — more than
+    // `SizeOfStruct + MaxNameLen`; the required header fields are set first.
+    let ok = unsafe {
+        (*info).SizeOfStruct = std::mem::size_of::<SYMBOL_INFO>() as u32;
+        (*info).MaxNameLen = MAX_SYM_NAME as u32;
+        SymFromAddr(GetCurrentProcess(), addr, &mut disp, info)
+    };
+    if ok == 0 {
+        return None;
+    }
+    // SAFETY: on success dbghelp wrote `NameLen` name bytes into the trailing
+    // `Name` array; read exactly that many, clamped to our allocation.
+    let (name_ptr, name_len) = unsafe {
+        (
+            (*info).Name.as_ptr().cast::<u8>(),
+            ((*info).NameLen as usize).min(MAX_SYM_NAME),
+        )
+    };
+    let bytes = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
+    let name = String::from_utf8_lossy(bytes);
+    if name.is_empty() {
+        None
+    } else if disp == 0 {
+        Some(name.into_owned())
+    } else {
+        Some(format!("{name}+{disp:#x}"))
+    }
+}
+
+/// Suspend each guest host-thread and walk a shallow HOST backtrace: the RIP
+/// plus stack qwords that resolve to a loaded module (return addresses), each
+/// symbolized to `module+offset` (plus `function` when a PDB symbol resolves).
+/// Names exactly where a stalled thread is parked — e.g. an ntdll wait reached
+/// through our dispatch/arena/GPU code. Diagnostic only.
+#[cfg(windows)]
+#[must_use]
+pub fn sample_host_backtraces(kernel: &OrbisKernel) -> Vec<(u64, String)> {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        CONTEXT, GetThreadContext, ReadProcessMemory,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, ResumeThread, SuspendThread};
+    const CONTEXT_CONTROL_AMD64: u32 = 0x0010_0001;
+    #[repr(align(16))]
+    struct Aligned(CONTEXT);
+
+    let proc = unsafe { GetCurrentProcess() };
+    let handles: Vec<(u64, u64)> = kernel
+        .host_thread_handles
+        .iter()
+        .map(|e| (*e.key(), *e.value()))
+        .collect();
+    let mut out = Vec::with_capacity(handles.len());
+    for (id, raw) in handles {
+        let handle = raw as *mut core::ffi::c_void;
+        // SAFETY: `handle` is a live duplicated thread handle owned by the kernel
+        // map; suspend/get-context/resume are balanced; `ctx` is 16-aligned; the
+        // sampler runs on its own host thread so it never suspends itself.
+        let (ok, rip, rsp) = unsafe {
+            if SuspendThread(handle) == u32::MAX {
+                continue;
+            }
+            let mut ctx: Aligned = std::mem::zeroed();
+            ctx.0.ContextFlags = CONTEXT_CONTROL_AMD64;
+            let ok = GetThreadContext(handle, &mut ctx.0);
+            let r = (ok, ctx.0.Rip, ctx.0.Rsp);
+            ResumeThread(handle);
+            r
+        };
+        if ok == 0 {
+            continue;
+        }
+        // A frame label is `module+offset`, plus `(function)` when the PDB has a
+        // symbol — only computed for KEPT frames, so the per-qword scan stays cheap.
+        let label = |a: u64| -> Option<String> {
+            host_module_for_addr(a).map(|m| match symbolize_host_addr(a) {
+                Some(f) => format!("{m}({f})"),
+                None => m,
+            })
+        };
+        let mut frames = vec![label(rip).unwrap_or_else(|| format!("{rip:#x}"))];
+        // Poor-man's backtrace: scan up the stack for qwords that land inside a
+        // loaded module (return addresses); skip non-code data.
+        let mut sp = rsp;
+        let mut scanned = 0u32;
+        while frames.len() < 12 && scanned < 512 {
+            let mut word = [0u8; 8];
+            let mut got = 0usize;
+            // SAFETY: reads this process's own committed stack via
+            // ReadProcessMemory, which reports failure instead of faulting.
+            let read_ok = unsafe {
+                ReadProcessMemory(
+                    proc,
+                    sp as *const core::ffi::c_void,
+                    word.as_mut_ptr().cast(),
+                    8,
+                    &mut got,
+                )
+            };
+            if read_ok == 0 || got != 8 {
+                break;
+            }
+            if let Some(sym) = label(u64::from_le_bytes(word)) {
+                frames.push(sym);
+            }
+            sp = sp.wrapping_add(8);
+            scanned += 1;
+        }
+        out.push((id, frames.join(" <- ")));
+    }
+    out
+}
+
+#[cfg(not(windows))]
+#[must_use]
+pub fn sample_host_backtraces(_kernel: &OrbisKernel) -> Vec<(u64, String)> {
+    Vec::new()
+}
+
 /// Every resource a guest worker can outlive its creator with is Arc-owned.
 /// This is the C2 ownership boundary: no worker borrows launcher or
 /// `execute_process` stack state.

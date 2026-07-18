@@ -43,6 +43,95 @@ pub fn register(registry: &HleRegistry) {
         "sceFiberStopContextSizeCheck",
         hle_stop_context_size_check,
     );
+
+    // Fiber creation/teardown carry real state. The control-transfer calls
+    // (Run/Switch/ReturnToThread/GetSelf) are registered so a trampoline exists,
+    // but they are INTERCEPTED in the runtime VEH dispatch (`fiber.rs`) — they
+    // swap the whole guest CONTEXT to resume another fiber natively, which an
+    // ordinary `-> u64` handler cannot express — so the placeholder below is
+    // never reached. Names match those the linker reports for ASTRO.BOT.
+    registry.register("libSceFiber", "_sceFiberInitializeImpl", hle_fiber_initialize);
+    registry.register("libSceFiber", "sceFiberInitialize", hle_fiber_initialize);
+    registry.register("libSceFiber", "sceFiberFinalize", hle_fiber_finalize);
+    registry.register("libSceFiber", "sceFiberRun", hle_fiber_transfer_placeholder);
+    registry.register("libSceFiber", "sceFiberSwitch", hle_fiber_transfer_placeholder);
+    registry.register(
+        "libSceFiber",
+        "sceFiberReturnToThread",
+        hle_fiber_transfer_placeholder,
+    );
+    registry.register("libSceFiber", "sceFiberGetSelf", hle_fiber_transfer_placeholder);
+}
+
+/// `_sceFiberInitializeImpl(fiber, name, entry, arg_on_initialize, addr_context,
+/// size_context, opt_param, build_ver)` — records the fiber's config into the
+/// guest `SceFiber` struct (offsets from shadPS4 `fiber.h`); first-run register
+/// setup happens later, at `sceFiberRun` time, in `fiber.rs`.
+fn hle_fiber_initialize(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fiber = args.first().copied().unwrap_or(0);
+    if fiber == 0 {
+        return FIBER_ERROR_NULL;
+    }
+    let name = args.get(1).copied().unwrap_or(0);
+    let entry = args.get(2).copied().unwrap_or(0);
+    let arg_on_init = args.get(3).copied().unwrap_or(0);
+    let addr_context = args.get(4).copied().unwrap_or(0);
+    let size_context = args.get(5).copied().unwrap_or(0);
+    let w32 = |off: u64, v: u32| {
+        let _ = ctx.mem.write(fiber + off, &v.to_le_bytes());
+    };
+    let w64 = |off: u64, v: u64| {
+        let _ = ctx.mem.write(fiber + off, &v.to_le_bytes());
+    };
+    w32(0x00, 0xdef1_649c); // magic_start
+    w32(0x04, 2); // state = Idle
+    w64(0x08, entry);
+    w64(0x10, arg_on_init);
+    w64(0x18, addr_context);
+    w64(0x20, size_context);
+    if name != 0 {
+        let mut nb = [0u8; 31];
+        let _ = ctx.mem.read(name, &mut nb);
+        let mut buf = [0u8; 32];
+        buf[..31].copy_from_slice(&nb);
+        let _ = ctx.mem.write(fiber + 0x28, &buf);
+    }
+    w32(0x50, 0); // flags (SetFpuRegs is applied by fiber.rs first-run seed)
+    w32(0x68, 0xb375_92a0); // magic_end
+    // Stamp the stack guard at the base of the context buffer (fiber.cpp:212).
+    if addr_context != 0 {
+        let _ = ctx
+            .mem
+            .write(addr_context, &0x7149_f2ca_7149_f2cau64.to_le_bytes());
+    }
+    OK
+}
+
+/// `sceFiberFinalize(fiber)` — CAS the guest `state` field Idle(2) → Terminated(3)
+/// and drop any suspended snapshot; a non-Idle fiber is a state error.
+fn hle_fiber_finalize(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fiber = args.first().copied().unwrap_or(0);
+    if fiber == 0 {
+        return FIBER_ERROR_NULL;
+    }
+    let mut state = [0u8; 4];
+    if ctx.mem.read(fiber + 0x04, &mut state) && u32::from_le_bytes(state) != 2 {
+        return FIBER_ERROR_STATE;
+    }
+    let _ = ctx.mem.write(fiber + 0x04, &3u32.to_le_bytes());
+    ctx.kernel.fibers.remove(&fiber);
+    OK
+}
+
+/// Registered only so the control-transfer NIDs get a trampoline; the real work
+/// is `fiber::handle` in the runtime VEH dispatch, which intercepts before this
+/// runs. Reaching it means the interception regressed.
+fn hle_fiber_transfer_placeholder(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    tracing::error!(
+        "libSceFiber transfer function reached its HLE handler — it should have been \
+         intercepted in dispatch::fiber; the fiber context-swap did not run"
+    );
+    OK
 }
 
 /// `sceFiberOptParamInitialize(optParam)`: stamp the option-param signature.

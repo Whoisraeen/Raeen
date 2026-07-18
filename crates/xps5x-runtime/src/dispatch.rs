@@ -1654,6 +1654,45 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         // Only the first was handled before, which meant a data import left at
         // a stub reported an anonymous `Faulted` at whatever innocent
         // instruction happened to read it — hiding the actual missing symbol.
+        // Resume-with-error on a CALLED unresolved import (opt-in via
+        // XPS5X_RESUME_ON_MISSING). The guest jumped straight INTO a missing-NID
+        // stub (Rip *is* the stub), i.e. it CALLed a system function we don't
+        // implement. Rather than abort the whole title, return a generic Orbis
+        // error in RAX and continue at the caller's return address — this is how
+        // SharpEmu sails past optional/unstubbed calls to reach a title's
+        // splash/video-out (measured: unblocks ASTRO.BOT past scePngDecDecode).
+        // Only the CALLED case is safe to fake; a data READ of a stub can't be
+        // (no valid value to hand back), so it still faults below.
+        static RESUME_ON_MISSING: OnceLock<bool> = OnceLock::new();
+        static MISSING_IMPORT_CALLS: AtomicU64 = AtomicU64::new(0);
+        if *RESUME_ON_MISSING
+            .get_or_init(|| std::env::var_os("XPS5X_RESUME_ON_MISSING").is_some())
+        {
+            if let Some(s) = stub::resolve(fault_addr, stubs) {
+                // SAFETY: `ctx.mem` is the live guest memory view for this
+                // guarded call (same invariant used elsewhere in this handler).
+                let mem = unsafe { &*ctx.mem };
+                let mut ret = [0u8; 8];
+                if mem.read(context.Rsp, &mut ret) {
+                    let n = MISSING_IMPORT_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 8 || n.is_power_of_two() {
+                        tracing::warn!(
+                            nid = format_args!("{:#018x}", s.nid),
+                            count = n,
+                            "unresolved import CALLED — returning SCE error and resuming \
+                             (XPS5X_RESUME_ON_MISSING)"
+                        );
+                    }
+                    context.Rip = u64::from_le_bytes(ret);
+                    context.Rsp = context.Rsp.wrapping_add(8);
+                    // Generic SCE error (negative i32) — safer than faking
+                    // success, which would hand the caller uninitialized output.
+                    context.Rax = 0x8000_0000;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
+
         let err = match stub::resolve(fault_addr, stubs).or_else(|| stub::resolve(access, stubs)) {
             Some(s) => RuntimeError::UnimplementedImport {
                 nid: s.nid,
@@ -1851,6 +1890,21 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
 
+            // libSceFiber control transfer (sceFiberRun / Switch / ReturnToThread
+            // / GetSelf) rewrites the guest CONTEXT to resume a different fiber
+            // (or the thread) executing natively on its own stack — handled here,
+            // NOT as a normal HLE call, because it swaps Rip/Rsp/all GPRs. Same
+            // "overwrite the delivered CONTEXT + continue" seam as above.
+            if crate::fiber::handle(
+                &t.function,
+                kernel,
+                mem,
+                context,
+                u64::from(unsafe { GetCurrentThreadId() }),
+            ) {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+
             // SysV integer argument registers (args 1-6, design doc §3),
             // followed by the first `STACK_ARGS` on-stack integer arguments
             // (args 7+). At this trap `Rsp` points at the `call`-pushed return
@@ -1917,11 +1971,20 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             let timed =
                 *TIME_HLE.get_or_init(|| std::env::var_os("XPS5X_TIME_HLE").is_some());
             let started = timed.then(std::time::Instant::now);
+            // Name the in-flight call BEFORE dispatching it, so a thread that
+            // blocks in a host wait deep inside the call (and never returns) can
+            // be pinned to the exact function it is parked in.
+            if timed {
+                kernel
+                    .in_flight_hle
+                    .insert(ctx.current_thread(), format!("{}::{}", t.library, t.function));
+            }
             let ret = hle
                 .call(&hle_ctx, &t.library, &t.function, &args)
                 .unwrap_or(0);
-            if let Some(started) = started {
-                let micros = started.elapsed().as_micros();
+            if timed {
+                kernel.in_flight_hle.remove(&ctx.current_thread());
+                let micros = started.map_or(0, |s| s.elapsed().as_micros());
                 let mut entry = kernel
                     .hle_call_time
                     .entry((ctx.current_thread(), format!("{}::{}", t.library, t.function)))

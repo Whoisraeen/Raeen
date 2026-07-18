@@ -30,6 +30,11 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libScePosix", "pthread_condattr_init", hle_condattr_init);
     registry.register("libScePosix", "pthread_condattr_destroy", hle_condattr_destroy);
     registry.register("libScePosix", "pthread_condattr_setclock", hle_condattr_setclock);
+    // The SCE-namespaced twins (measured: ASTRO.BOT calls scePthreadCondattrInit
+    // from libkernel, nid 0x9b9ff66ec35fbfbb).
+    registry.register("libkernel", "scePthreadCondattrInit", hle_condattr_init);
+    registry.register("libkernel", "scePthreadCondattrDestroy", hle_condattr_destroy);
+    registry.register("libkernel", "scePthreadCondattrSetclock", hle_condattr_setclock);
 }
 
 /// `pthread_cond_init(cond, attr)`. Orbis condition variables are opaque

@@ -3,8 +3,9 @@
 //! A faithful Rust port of SharpEmu's `NpWebApi2Exports` (GPL-2.0). WebAPI2 is
 //! the PSN REST client. XPS5X has no PSN backend and issues no requests, so
 //! this is an honest handshake stub: `Initialize` validates its arguments and
-//! records an initialized flag, and `Terminate` clears it. No HTTP request is
-//! ever made (that would need the real `libSceHttp` + network backend).
+//! records an initialized flag, `Terminate` clears it, and `CreateUserContext`
+//! *refuses* (no live session) so a title backs off to offline. No HTTP request
+//! is ever made (that would need the real `libSceHttp` + network backend).
 //!
 //! The invalid-argument code `0x8055_3402` is ported verbatim from SharpEmu,
 //! as a plain zero-extended `u64`.
@@ -34,15 +35,21 @@ pub fn register(registry: &HleRegistry) {
     );
 }
 
-/// `sceNpWebApi2CreateUserContext(...)`: hand back a fresh positive user
-/// context id — the "signed-in local user" model (offline; the id carries no
-/// network identity, but a title that gates on having *a* context proceeds).
-static NEXT_USER_CONTEXT: AtomicI32 = AtomicI32::new(1);
-
+/// `sceNpWebApi2CreateUserContext(...)`: with no PSN backend, **refuse** to
+/// create a user context (return `INVALID_ARGUMENT`). Handing back a positive
+/// handle makes a title believe its online session is live and drive follow-up
+/// WebAPI calls that can never complete — ASTRO.BOT then hard-asserts at
+/// `NpWebApi.cpp:1587` (fatal: its assert handler traps the main thread, which
+/// strands every worker parked on a job semaphore). Failing here makes the
+/// title's online layer back off cleanly to offline. Matches SharpEmu's
+/// `NpWebApi2CreateUserContext` (GPL-2.0).
 fn hle_create_user_context(_ctx: &HleContext, args: &[u64]) -> u64 {
     let library_context_id = args.first().copied().unwrap_or(0) as i32;
-    tracing::debug!("sceNpWebApi2CreateUserContext(libraryContextId={library_context_id})");
-    NEXT_USER_CONTEXT.fetch_add(1, Ordering::Relaxed) as u64
+    tracing::debug!(
+        "sceNpWebApi2CreateUserContext(libraryContextId={library_context_id}) \
+         -> INVALID_ARGUMENT (offline; title backs off)"
+    );
+    NP_WEB_API2_ERROR_INVALID_ARGUMENT
 }
 
 /// `sceNpWebApi2Initialize(httpContextId, poolSize)`: a non-positive HTTP
@@ -111,5 +118,17 @@ mod tests {
         // The Toolkit variant accepts anything.
         assert_eq!(hle_initialize_for_toolkit(&ctx, &[0, 0]), OK);
         assert_eq!(INITIALIZED.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn create_user_context_refuses_offline() {
+        let (kernel, mem, alloc) = env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // No PSN backend: creating a user context must fail so the title backs
+        // off, rather than getting a bogus positive handle it drives online.
+        assert_eq!(
+            hle_create_user_context(&ctx, &[0, 1000]),
+            NP_WEB_API2_ERROR_INVALID_ARGUMENT
+        );
     }
 }

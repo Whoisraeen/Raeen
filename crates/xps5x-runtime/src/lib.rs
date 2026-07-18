@@ -21,6 +21,7 @@
 mod arena;
 #[cfg(target_os = "windows")]
 mod dispatch;
+mod fiber;
 #[cfg(target_os = "windows")]
 mod process;
 #[cfg(target_os = "windows")]
@@ -33,6 +34,10 @@ mod thread;
 /// Windows-only, like the rest of the execution core.
 #[cfg(target_os = "windows")]
 pub use thread::sample_guest_rips;
+/// Diagnostic: shallow HOST backtrace per guest thread, symbolized to
+/// `module+offset` — names where a stalled thread is parked in our code / ntdll.
+#[cfg(target_os = "windows")]
+pub use thread::{host_module_for_addr, sample_host_backtraces};
 #[cfg(target_os = "windows")]
 mod tls;
 #[cfg(target_os = "windows")]

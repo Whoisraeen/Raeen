@@ -146,6 +146,12 @@ pub struct OrbisKernel {
     /// calls that led there — host threads are pooled, so a host-ThreadId
     /// correlation is unreliable; the guest thread id is not.
     pub recent_hle_calls: DashMap<u64, parking_lot::Mutex<std::collections::VecDeque<String>>>,
+    /// The HLE call each guest thread is CURRENTLY inside (set on entry, cleared
+    /// on return), keyed by guest thread id. The recent-call ring records on
+    /// entry too, but a call that never returns (a thread blocked in a host wait
+    /// deep inside an HLE call) is indistinguishable there from one that returned
+    /// — this names the exact in-flight call a stalled thread is parked in.
+    pub in_flight_hle: DashMap<u64, String>,
     /// Guest address of the main module's `PT_SCE_PROCPARAM` block, set by
     /// the runtime at load time (0 = none). `sceKernelGetProcParam` returns
     /// this so a title reads its real process-parameter block (SDK version,
@@ -192,6 +198,12 @@ pub struct OrbisKernel {
     kernel_event_flag_next: std::sync::atomic::AtomicU64,
     /// Kernel counting semaphores, keyed by handle.
     pub kernel_semaphores: DashMap<u32, Semaphore>,
+    /// "Save data memory" blobs, keyed by `SceUserServiceUserId`. This is the
+    /// mountless per-user save blob (`sceSaveDataSetupSaveDataMemory2` sizes it,
+    /// `Get/Set/Sync` transfer it) — distinct from the mounted `/savedata0` VFS.
+    /// In-memory for the session (not persisted across launches), zero-filled at
+    /// setup; see `xps5x-hle`'s `libsce_save_data` save-memory functions.
+    pub save_data_memory: DashMap<i32, Vec<u8>>,
     /// POSIX (`sem_*`) semaphores, keyed by the guest `sem_t` address. These
     /// are address-based objects distinct from the handle-based
     /// `sceKernelCreateSema` family — see the `xps5x-hle` `posix_sem` module.
@@ -277,11 +289,26 @@ pub struct OrbisKernel {
     /// a single condvar is correct under spurious wakeups and avoids per-flag
     /// registration churn.
     pub event_flag_signal: (std::sync::Mutex<()>, std::sync::Condvar),
+    /// One shared (lock, condvar) signalled whenever any counting semaphore's
+    /// count changes (Signal/Cancel). A blocked `WaitSema` re-checks its own
+    /// count on wake. Same rationale as [`event_flag_signal`]: with real guest
+    /// threads a producer thread *can* signal, so a waiter must block until it
+    /// does rather than instantly time out.
+    pub semaphore_signal: (std::sync::Mutex<()>, std::sync::Condvar),
     /// AMPR command-buffer write offsets, keyed by the command-buffer address
     /// (the current write cursor `sceAmprCommandBufferGetCurrentOffset` reads).
     pub ampr_write_offsets: DashMap<u64, u64>,
     /// The libSceFiber context-size-check profiling toggle (0 = off, 1 = on).
     pub fiber_context_size_check: std::sync::atomic::AtomicU32,
+    /// Suspended-fiber snapshots keyed by the guest `SceFiber` address: the
+    /// saved guest registers plus the `*arg_on_run` out-pointer the fiber passed
+    /// when it suspended (poked with the resuming call's arg before it resumes).
+    /// Present iff the fiber has yielded at least once; absent means "never run",
+    /// so `sceFiberRun` builds the first-run entry frame instead.
+    pub fibers: DashMap<u64, (GuestRegs, u64)>,
+    /// Per host-thread fiber state — the `sceFiberRun` return anchor and the
+    /// fiber currently owned — keyed by host (OS) thread id.
+    pub fiber_threads: DashMap<u64, FiberThreadState>,
     /// Guest network sockets (offline — no host connectivity), keyed by fd.
     pub kernel_sockets: DashMap<i32, GuestSocket>,
     /// Next socket fd to hand out (a high range, distinct from VFS fds).
@@ -573,6 +600,47 @@ pub struct UnwindModuleInfo {
     pub seg0_size: u64,
 }
 
+/// A snapshot of the guest integer CPU context — enough to suspend a guest
+/// fiber and later resume it executing NATIVELY on its own stack (SharpEmu's
+/// `GuestCpuContinuation` model). The runtime's fiber module captures this from,
+/// and applies it to, the Windows `CONTEXT` in the VEH handler; `rip`/`rsp` name
+/// where and on which stack the guest resumes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GuestRegs {
+    pub rip: u64,
+    pub rsp: u64,
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rflags: u64,
+    pub mxcsr: u32,
+    pub fpucw: u16,
+}
+
+/// Per host-thread fiber state.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FiberThreadState {
+    /// The thread's resume snapshot — where its `sceFiberRun` call returns to.
+    pub root: GuestRegs,
+    /// The guest `SceFiber` address currently running on this thread (0 = none).
+    pub current_fiber: u64,
+    /// The `*arg_on_return` out-pointer the active `sceFiberRun` passed in `rdx`,
+    /// written with the fiber's return value when it calls `sceFiberReturnToThread`.
+    pub root_arg_slot: u64,
+}
+
 impl OrbisKernel {
     /// Release every pthread mutex currently owned by `thread`, returning how
     /// many were freed. Called when a guest thread is torn down mid-execution
@@ -607,6 +675,7 @@ impl OrbisKernel {
             thread_names: DashMap::new(),
             host_thread_handles: DashMap::new(),
             recent_hle_calls: DashMap::new(),
+            in_flight_hle: DashMap::new(),
             proc_param_addr: std::sync::atomic::AtomicU64::new(0),
             unwind_modules: RwLock::new(Vec::new()),
             pad_state: parking_lot::Mutex::new(None),
@@ -620,6 +689,7 @@ impl OrbisKernel {
             kernel_event_flags: DashMap::new(),
             kernel_event_flag_next: std::sync::atomic::AtomicU64::new(1),
             kernel_semaphores: DashMap::new(),
+            save_data_memory: DashMap::new(),
             kernel_semaphore_next: std::sync::atomic::AtomicU32::new(1),
             posix_semaphores: DashMap::new(),
             kernel_equeues: DashMap::new(),
@@ -653,8 +723,11 @@ impl OrbisKernel {
             libc_mspaces: DashMap::new(),
             libc_mspace_allocations: DashMap::new(),
             event_flag_signal: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
+            semaphore_signal: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
             ampr_write_offsets: DashMap::new(),
             fiber_context_size_check: std::sync::atomic::AtomicU32::new(0),
+            fibers: DashMap::new(),
+            fiber_threads: DashMap::new(),
             kernel_sockets: DashMap::new(),
             kernel_socket_next: std::sync::atomic::AtomicI32::new(0x4000_0000),
             pthread_tls_keys: DashMap::new(),

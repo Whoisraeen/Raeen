@@ -133,12 +133,21 @@ fn hle_mspace_create(ctx: &HleContext, args: &[u64]) -> u64 {
         );
         return 0;
     }
-    let Some(name) = read_cstring(ctx, name_address, 256) else {
-        warn!(
-            "sceLibcMspaceCreate(base={base:#x}, capacity={capacity:#x}): name at \
-             {name_address:#x} unreadable — returning a NULL mspace"
-        );
-        return 0;
+    // A NULL name is VALID — the mspace is simply anonymous, and titles do pass
+    // NULL (ASTRO.BOT does). Only a non-NULL but unreadable pointer is suspect;
+    // treat that as anonymous too rather than failing the create — a rejected
+    // create hands the title a null heap it later dereferences (measured:
+    // ASTRO.BOT's sceLibcMspaceFree faulting on a null mspace).
+    let name = if name_address == 0 {
+        String::new()
+    } else {
+        read_cstring(ctx, name_address, 256).unwrap_or_else(|| {
+            warn!(
+                "sceLibcMspaceCreate(base={base:#x}, capacity={capacity:#x}): name at \
+                 {name_address:#x} unreadable — using an anonymous name"
+            );
+            String::new()
+        })
     };
     ctx.kernel.libc_mspaces.insert(
         base,

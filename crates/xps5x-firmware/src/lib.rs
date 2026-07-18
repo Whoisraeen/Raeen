@@ -527,6 +527,33 @@ pub fn load_process(
         if std::env::var_os("XPS5X_TRAP_CXA_THROW").is_some() {
             registry.force_hle_nid(0xbe4b_ae2d_f867_4992);
         }
+        // ASTRO.BOT's NATIVE libc.prx sceLibcMspaceCreate hands back a NULL
+        // mspace and its native sceLibcMspaceFree then faults dereferencing it
+        // (`test byte [rbx+0x370], 2` with rbx=0). Route the whole mspace
+        // allocator family to our self-consistent HLE (Create returns a handle
+        // that Malloc/Free accept) so the null-deref cannot happen, and so
+        // `hle_mspace_create` NAMES the args native create rejected. NIDs measured
+        // from the title's own libc.prx exports.
+        if std::env::var_os("XPS5X_FORCE_HLE_MSPACE").is_some() {
+            for nid in [
+                0xfe19_f5b5_c547_ab94u64, // sceLibcMspaceCreate
+                0x5ba4_a255_2882_0ed2,    // sceLibcMspaceDestroy
+                0x3898_e6fd_0388_1e52,    // sceLibcMspaceMalloc
+                0x5656_bf67_e797_971a,    // sceLibcMspaceFree
+                0x2d8a_371a_1225_077f,    // sceLibcMspaceCalloc
+                0x885d_6240_7cf1_0495,    // sceLibcMspaceMemalign
+                0xa961_1297_25cc_2371,    // sceLibcMspacePosixMemalign
+                0x8228_2854_766f_54f1,    // sceLibcMspaceRealloc
+                0x9639_2a31_c0b8_fe69,    // sceLibcMspaceAlignedAlloc
+                0xa7a9_6b45_6f3f_30b6,    // sceLibcMspaceReallocalign
+                0x99f1_dd25_322f_86ea,    // sceLibcMspaceMallocStats
+                0x934e_232d_7bb7_f887,    // sceLibcMspaceMallocStatsFast
+                0x7c4a_16e8_126c_3ede,    // sceLibcMspaceMallocUsableSize
+                0xa735_1aec_a128_c9dc,    // sceLibcMspaceIsHeapEmpty
+            ] {
+                registry.force_hle_nid(nid);
+            }
+        }
         registry.register_module_exports_at(needed, &dep.dynlib.exports, dep_base);
         tracing::info!(
             "NEEDED {needed}: at +{next_offset:#x} ({image_len:#x} bytes), {} export(s) registered",
