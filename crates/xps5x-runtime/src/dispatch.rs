@@ -1143,6 +1143,33 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
                 fault_window_start + fault_window.len() as u64
             );
         }
+
+        // Guest stack return-address walk. A fault inside a leaf libc routine
+        // (memcpy/strlen/…) names the routine in the register dump but not WHO
+        // called it with the bad pointer — the return-address chain does. Scan
+        // qwords upward from RSP for values that land in the loaded guest image
+        // (plausible return addresses) and log them module-relative so
+        // `--dump-vaddr` can decode the caller.
+        {
+            let mut stack = [0u8; 512];
+            if mem.read(snapshot.rsp, &mut stack) {
+                let mut chain = Vec::new();
+                for qw in stack.chunks_exact(8) {
+                    let v = u64::from_le_bytes(qw.try_into().unwrap_or([0; 8]));
+                    if (crate::GUEST_ARENA_BASE..crate::GUEST_ARENA_BASE + 0x2000_0000)
+                        .contains(&v)
+                    {
+                        chain.push(format!("+{:#x}", v - crate::GUEST_ARENA_BASE));
+                        if chain.len() >= 12 {
+                            break;
+                        }
+                    }
+                }
+                if !chain.is_empty() {
+                    tracing::warn!("guest stack return-addr chain (module-relative): {}", chain.join(" <- "));
+                }
+            }
+        }
         // What each register POINTS AT, previewed as text. When a guest
         // aborts deliberately, the abort call's arguments (file, function,
         // and — decisively — the formatted exception/assert MESSAGE) are
