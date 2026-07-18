@@ -46,11 +46,14 @@ fn alloc_handle(ctx: &HleContext) -> u64 {
     addr
 }
 
-/// Write a freshly-allocated handle to the guest `*out_ptr` and return
-/// `ORBIS_OK`. Used by the create/open functions whose last argument is an
-/// `OrbisFont** pOut`. A null `out_ptr` or arena exhaustion is a parameter
-/// error the title can react to rather than a silent success.
-fn return_handle(ctx: &HleContext, out_ptr: u64) -> u64 {
+/// Write a freshly-allocated, magic-tagged handle to the guest `*out_ptr` and
+/// return `ORBIS_OK`. Used by the create/open functions whose last argument is
+/// an `OrbisFont** pOut`. The `magic` u16 goes at `[handle+0]`: libSceFont (and
+/// titles) validate it — a font handle must read `0x0F02`, a library `0x0F01`,
+/// a renderer `0x0F07`. A zero-magic handle reads as an *invalid* font and the
+/// glyph pipeline produces a null bitmap (SharpEmu parity — this is what its
+/// `CreateOpaqueHandle` writes).
+fn return_handle(ctx: &HleContext, out_ptr: u64, magic: u16) -> u64 {
     if out_ptr == 0 {
         return ORBIS_FONT_ERROR_INVALID_PARAMETER;
     }
@@ -58,6 +61,7 @@ fn return_handle(ctx: &HleContext, out_ptr: u64) -> u64 {
     if handle == 0 {
         return ORBIS_FONT_ERROR_INVALID_PARAMETER;
     }
+    let _ = ctx.mem.write(handle, &magic.to_le_bytes());
     if !ctx.mem.write(out_ptr, &handle.to_le_bytes()) {
         return ORBIS_FONT_ERROR_INVALID_PARAMETER;
     }
@@ -114,32 +118,52 @@ fn hle_font_memory_init(ctx: &HleContext, args: &[u64]) -> u64 {
     ORBIS_OK
 }
 
-/// `sceFontSelectLibraryFt(int value)` / `sceFontSelectRendererFt(int value)`:
-/// return a pointer to a driver-selection table (shadPS4 returns a static
-/// table for `value == 0`, else null). The title stores the pointer and hands
-/// it to `sceFontCreate{Library,Renderer}WithEdition` as create params; our
-/// create HLE ignores its contents, so a zeroed handle buffer suffices.
-fn hle_select_ft(ctx: &HleContext, args: &[u64]) -> u64 {
+/// Write a small selection table (`sceFontSelect{Library,Renderer}Ft`) and
+/// return its guest address in `rax`. `value != 0` → null (unsupported). The
+/// table is `{u32 tag=0, u32 objectSize}` — SharpEmu's `ReturnSelection` shape;
+/// the title stores the pointer and hands it to the Create functions.
+fn select_ft(ctx: &HleContext, args: &[u64], object_size: u32) -> u64 {
     if args.first().copied().unwrap_or(0) as u32 != 0 {
-        return 0; // non-zero selector -> unsupported (null), matching shadPS4
+        return 0;
     }
-    alloc_handle(ctx)
+    let addr = alloc_handle(ctx);
+    if addr != 0 {
+        let _ = ctx.mem.write(addr, &0u32.to_le_bytes());
+        let _ = ctx.mem.write(addr + 4, &object_size.to_le_bytes());
+    }
+    addr
 }
 
-/// `sceFontCreate{Library,Renderer}WithEdition(memory, params, edition, pOut)`
-/// — `pOut` is arg 3.
-fn hle_create_with_edition(ctx: &HleContext, args: &[u64]) -> u64 {
-    return_handle(ctx, args.get(3).copied().unwrap_or(0))
+fn hle_select_library_ft(ctx: &HleContext, args: &[u64]) -> u64 {
+    select_ft(ctx, args, 0x38)
 }
 
-/// `sceFontOpen{FontSet,FontMemory}(..., pFontHandle)` — `pFontHandle` is arg 4.
+fn hle_select_renderer_ft(ctx: &HleContext, args: &[u64]) -> u64 {
+    select_ft(ctx, args, 0x100)
+}
+
+/// `sceFontCreateLibraryWithEdition(memory, params, edition, pLibrary)` — magic
+/// `0x0F01`, `pLibrary` is arg 3.
+fn hle_create_library(ctx: &HleContext, args: &[u64]) -> u64 {
+    return_handle(ctx, args.get(3).copied().unwrap_or(0), 0x0F01)
+}
+
+/// `sceFontCreateRendererWithEdition(memory, params, edition, pRenderer)` —
+/// magic `0x0F07`, `pRenderer` is arg 3.
+fn hle_create_renderer(ctx: &HleContext, args: &[u64]) -> u64 {
+    return_handle(ctx, args.get(3).copied().unwrap_or(0), 0x0F07)
+}
+
+/// `sceFontOpen{FontSet,FontMemory}(..., pFontHandle)` — a font handle (magic
+/// `0x0F02`); `pFontHandle` is arg 4.
 fn hle_open_font_arg4(ctx: &HleContext, args: &[u64]) -> u64 {
-    return_handle(ctx, args.get(4).copied().unwrap_or(0))
+    return_handle(ctx, args.get(4).copied().unwrap_or(0), 0x0F02)
 }
 
-/// `sceFontOpenFontInstance(fontHandle, setupFont, pFontHandle)` — arg 2 out.
+/// `sceFontOpenFontInstance(fontHandle, setupFont, pFontHandle)` — a font handle
+/// (magic `0x0F02`); output is arg 2.
 fn hle_open_font_instance(ctx: &HleContext, args: &[u64]) -> u64 {
-    return_handle(ctx, args.get(2).copied().unwrap_or(0))
+    return_handle(ctx, args.get(2).copied().unwrap_or(0), 0x0F02)
 }
 
 /// `sceFontGet{Horizontal,Vertical}Layout(fontHandle, layout*)`: fill the
@@ -149,18 +173,66 @@ fn hle_open_font_instance(ctx: &HleContext, args: &[u64]) -> u64 {
 /// (baseline offset, line/column advance, decoration extent) — and titles pass
 /// a *stack-allocated* one. Writing more than 12 bytes overruns it into the
 /// caller's stack canary, so the guest's `__stack_chk_fail` fires and traps
-/// (this is what crashed ASTRO.BOT after font setup). Write exactly the three
-/// fields; use a non-zero advance so text layout that divides by it doesn't
-/// hit a divide-by-zero (glyphs still don't rasterize — a later concern).
+/// (this crashed ASTRO.BOT). Values match SharpEmu's `GetHorizontalLayout`
+/// (`{12, 16, 0}`) so text layout gets sane, non-zero geometry.
 fn hle_get_layout(ctx: &HleContext, args: &[u64]) -> u64 {
     let layout = args.get(1).copied().unwrap_or(0);
     if layout != 0 {
         let mut buf = [0u8; 12];
-        buf[0..4].copy_from_slice(&0.0f32.to_le_bytes()); // baseline offset
-        buf[4..8].copy_from_slice(&1.0f32.to_le_bytes()); // line/column advance
+        buf[0..4].copy_from_slice(&12.0f32.to_le_bytes()); // baseline offset
+        buf[4..8].copy_from_slice(&16.0f32.to_le_bytes()); // line/column advance
         buf[8..12].copy_from_slice(&0.0f32.to_le_bytes()); // decoration extent
         let _ = ctx.mem.write(layout, &buf);
     }
+    ORBIS_OK
+}
+
+/// `sceFontGetRenderCharGlyphMetrics(fontHandle, code, metrics*)`: write the
+/// caller's `OrbisFontGlyphMetrics` (arg 2) — width, height, then the
+/// Horizontal/Vertical `{bearingX,bearingY,advance}` sub-structs. Values match
+/// SharpEmu's invented geometry `{8,16,0,12,8,0,0,16}` so the title's glyph
+/// pipeline gets non-zero, self-consistent metrics instead of stale stack
+/// bytes (a garbage glyph size is what left the rendered bitmap null).
+fn hle_get_render_glyph_metrics(ctx: &HleContext, args: &[u64]) -> u64 {
+    let metrics = args.get(2).copied().unwrap_or(0);
+    if metrics == 0 {
+        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
+    }
+    let vals = [8.0f32, 16.0, 0.0, 12.0, 8.0, 0.0, 0.0, 16.0];
+    let mut buf = [0u8; 32];
+    for (i, v) in vals.iter().enumerate() {
+        buf[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let _ = ctx.mem.write(metrics, &buf);
+    ORBIS_OK
+}
+
+/// `sceFontRenderSurfaceInit(surface, buffer, widthByte, pixelSizeByte,`
+/// `widthPixel, heightPixel)` — initialize the caller's `OrbisFontRenderSurface`
+/// from its args (a `void` return on real HW). The title renders glyphs into
+/// this surface, so it MUST hold the caller's real buffer pointer + geometry; a
+/// no-op left the surface (and thus the render target) garbage. Ported from
+/// SharpEmu's `RenderSurfaceInit`.
+fn hle_render_surface_init(ctx: &HleContext, args: &[u64]) -> u64 {
+    let surface = args.first().copied().unwrap_or(0);
+    if surface == 0 {
+        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
+    }
+    let buffer = args.get(1).copied().unwrap_or(0);
+    let width_byte = args.get(2).copied().unwrap_or(0) as u32;
+    let pixel_size = (args.get(3).copied().unwrap_or(0) & 0xFF) as u32;
+    let width = args.get(4).copied().unwrap_or(0) as u32;
+    let height = args.get(5).copied().unwrap_or(0) as u32;
+    let m = ctx.mem;
+    let _ = m.write(surface, &buffer.to_le_bytes());
+    let _ = m.write(surface + 0x08, &width_byte.to_le_bytes());
+    let _ = m.write(surface + 0x0c, &pixel_size.to_le_bytes());
+    let _ = m.write(surface + 0x10, &width.to_le_bytes());
+    let _ = m.write(surface + 0x14, &height.to_le_bytes());
+    let _ = m.write(surface + 0x18, &0u32.to_le_bytes()); // sc_x0
+    let _ = m.write(surface + 0x1c, &0u32.to_le_bytes()); // sc_y0
+    let _ = m.write(surface + 0x20, &width.to_le_bytes()); // sc_x1
+    let _ = m.write(surface + 0x24, &height.to_le_bytes()); // sc_y1
     ORBIS_OK
 }
 
@@ -285,20 +357,24 @@ fn hle_generate_glyph(ctx: &HleContext, args: &[u64]) -> u64 {
 /// Semantics/arg positions are from shadPS4 (GPL-2.0) `font.cpp`/`fontft.cpp`.
 pub fn register(registry: &HleRegistry) {
     // libSceFontFt driver/renderer selection (returns a table pointer).
-    registry.register("libSceFontFt", "sceFontSelectLibraryFt", hle_select_ft);
-    registry.register("libSceFontFt", "sceFontSelectRendererFt", hle_select_ft);
+    registry.register("libSceFontFt", "sceFontSelectLibraryFt", hle_select_library_ft);
+    registry.register(
+        "libSceFontFt",
+        "sceFontSelectRendererFt",
+        hle_select_renderer_ft,
+    );
 
-    // Memory + library/renderer/font lifecycle (return handles).
+    // Memory + library/renderer/font lifecycle (return magic-tagged handles).
     registry.register("libSceFont", "sceFontMemoryInit", hle_font_memory_init);
     registry.register(
         "libSceFont",
         "sceFontCreateLibraryWithEdition",
-        hle_create_with_edition,
+        hle_create_library,
     );
     registry.register(
         "libSceFont",
         "sceFontCreateRendererWithEdition",
-        hle_create_with_edition,
+        hle_create_renderer,
     );
     registry.register("libSceFont", "sceFontOpenFontSet", hle_open_font_arg4);
     registry.register("libSceFont", "sceFontOpenFontMemory", hle_open_font_arg4);
@@ -308,9 +384,20 @@ pub fn register(registry: &HleRegistry) {
         hle_open_font_instance,
     );
 
-    // Layout queries (zero the out struct).
+    // Layout + glyph-metrics queries (fill the caller's out struct with sane
+    // non-zero geometry; a garbage size leaves the rendered glyph bitmap null).
     registry.register("libSceFont", "sceFontGetHorizontalLayout", hle_get_layout);
     registry.register("libSceFont", "sceFontGetVerticalLayout", hle_get_layout);
+    registry.register(
+        "libSceFont",
+        "sceFontGetRenderCharGlyphMetrics",
+        hle_get_render_glyph_metrics,
+    );
+    registry.register(
+        "libSceFont",
+        "sceFontRenderSurfaceInit",
+        hle_render_surface_init,
+    );
 
     // Glyph generation: no rasterizer, so report the codepoint unsupported and
     // null the out-glyph so the title skips rendering it.
@@ -341,9 +428,7 @@ pub fn register(registry: &HleRegistry) {
         "sceFontDestroyRenderer",
         "sceFontDestroyString",
         "sceFontDestroyWritingLine",
-        "sceFontGetRenderCharGlyphMetrics",
         "sceFontGlyphDefineAttribute",
-        "sceFontRenderSurfaceInit",
         "sceFontSetEffectSlant",
         "sceFontSetEffectWeight",
         "sceFontSetScalePixel",
