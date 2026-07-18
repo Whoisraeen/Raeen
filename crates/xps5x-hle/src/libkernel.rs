@@ -210,6 +210,31 @@ fn hle_sce_fsync(ctx: &HleContext, args: &[u64]) -> u64 {
     hle_fsync(ctx, args)
 }
 
+/// If `missing` is a font file (`.otf`/`.ttf`/`.ttc`) that does not exist,
+/// return the file *name* of a shipped sibling font in the same directory to
+/// substitute for it (alphabetically first, for determinism), or `None` if the
+/// directory ships no other font. Used by [`hle_open`]'s font fallback.
+fn font_fallback_sibling(missing: &std::path::Path) -> Option<String> {
+    let is_font = |p: &std::path::Path| {
+        p.extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| matches!(x.to_ascii_lowercase().as_str(), "otf" | "ttf" | "ttc"))
+    };
+    if !is_font(missing) {
+        return None;
+    }
+    let dir = missing.parent()?;
+    let mut candidates: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && is_font(p))
+        .filter_map(|p| p.file_name()?.to_str().map(String::from))
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
 /// Real `open(path, flags, mode)` / `sceKernelOpen` (VFS-backed): resolves
 /// the guest path through the kernel VFS (`/app0/…` → the game directory,
 /// etc.), opens it, and returns a file descriptor (>= 3). A path that
@@ -235,6 +260,29 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
     match ctx.kernel.filesystem.resolve_path(&path) {
         Some(host) if host.exists() || creating => {}
         Some(host) => {
+            // Font-file fallback. The title reads its fonts with its OWN
+            // OpenType renderer and null-dereferences if an open fails, yet it
+            // references font variants / PS5 system fonts it does not ship
+            // (e.g. FuturaStd-Medium, SIE-ShinGoPr6N, HeiseiMaruGo). Substitute
+            // a shipped sibling font so the renderer parses valid tables
+            // (codepoints the substitute lacks are handled by the title's own
+            // cmap-miss path) instead of faulting on a null font object. Only
+            // triggers on a genuinely-missing font whose directory ships another.
+            if !creating {
+                if let Some(fb_name) = font_fallback_sibling(&host) {
+                    if let Some(slash) = path.rfind('/') {
+                        let fb_path = format!("{}/{fb_name}", &path[..slash]);
+                        warn!("open: '{path}' missing — substituting shipped font '{fb_path}'");
+                        return match ctx.kernel.filesystem.open(&fb_path, flags, mode) {
+                            Ok(fd) => fd as u64,
+                            Err(e) => {
+                                warn!("open: font substitute '{fb_path}' failed: {e} — ENOENT");
+                                FILE_ENOENT
+                            }
+                        };
+                    }
+                }
+            }
             warn!(
                 "open: '{path}' → '{}' does not exist (no O_CREAT) — ENOENT",
                 host.display()
