@@ -174,6 +174,10 @@ fn vulkan_format(
         (0xa, 6, 0) => Ok(vk::Format::R8G8B8A8_SRGB),
         (0xa, 0, 1) => Ok(vk::Format::B8G8R8A8_UNORM),
         (0xa, 6, 1) => Ok(vk::Format::B8G8R8A8_SRGB),
+        // 10_11_11 / 11_11_10 FLOAT (channel_type 7): the packed HDR
+        // intermediate render target ASTRO.BOT draws into. SharpEmu maps both
+        // CB formats 6 and 7 with channel_type 7 to B10G11R11_UFLOAT_PACK32.
+        (0x6 | 0x7, 7, 0) => Ok(vk::Format::B10G11R11_UFLOAT_PACK32),
         _ => Err(err(format!(
             "unsupported CB_COLOR0_INFO format={format:#x} channel_type={channel_type} \
              channel_order={channel_order} — no Vulkan format mapping"
