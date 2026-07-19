@@ -365,9 +365,9 @@ pub struct DrawOutput {
 fn depth_texel_bytes(format: vk::Format) -> Result<u32, GpuError> {
     match format {
         vk::Format::D16_UNORM => Ok(2),
-        vk::Format::D32_SFLOAT
-        | vk::Format::D24_UNORM_S8_UINT
-        | vk::Format::D32_SFLOAT_S8_UINT => Ok(4),
+        vk::Format::D32_SFLOAT | vk::Format::D24_UNORM_S8_UINT | vk::Format::D32_SFLOAT_S8_UINT => {
+            Ok(4)
+        }
         other => Err(GpuError::VulkanInitFailed(format!(
             "depth format {other:?} has no texel byte size mapping"
         ))),
@@ -435,6 +435,33 @@ fn depth_copy_region(
         })
 }
 
+/// One dynamic-rendering depth/stencil attachment referencing `view`: LOAD when
+/// `load` (prior contents were seeded), else CLEAR to the register clear value;
+/// STORE always, so the result is available for readback. Depth and stencil
+/// share the same clear-value struct — the driver applies the plane matching
+/// the attachment slot it is bound to.
+fn depth_stencil_attachment(
+    view: vk::ImageView,
+    load: bool,
+    depth: &DepthState,
+) -> vk::RenderingAttachmentInfo<'static> {
+    vk::RenderingAttachmentInfo::default()
+        .image_view(view)
+        .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+        .load_op(if load {
+            vk::AttachmentLoadOp::LOAD
+        } else {
+            vk::AttachmentLoadOp::CLEAR
+        })
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .clear_value(vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: depth.clear_depth_value,
+                stencil: depth.clear_stencil_value,
+            },
+        })
+}
+
 impl<'a> DrawState<'a> {
     /// A full-target viewport/scissor at `width` x `height`, no vertex buffer.
     #[must_use]
@@ -474,7 +501,17 @@ impl<'a> DrawState<'a> {
 /// [`GpuError::VulkanInitFailed`] on a zero-sized or non-32bpp target or any
 /// resource/submission failure, [`GpuError::ShaderCompilationFailed`] on empty
 /// SPIR-V, [`GpuError::PipelineCreationFailed`] if the pipeline is rejected.
-pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<RenderedImage, GpuError> {
+/// Draw once offscreen from an explicit [`DrawState`] and read back the pixels.
+///
+/// Returns a [`DrawOutput`]: the colour readback when the draw has colour
+/// output, and the depth/stencil readback when a depth attachment was bound.
+///
+/// # Errors
+///
+/// [`GpuError::VulkanInitFailed`] on a zero-sized or non-32bpp target or any
+/// resource/submission failure, [`GpuError::ShaderCompilationFailed`] on empty
+/// SPIR-V, [`GpuError::PipelineCreationFailed`] if the pipeline is rejected.
+pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, GpuError> {
     if state.width == 0 || state.height == 0 {
         return Err(GpuError::VulkanInitFailed(format!(
             "invalid render target size {}x{}",
@@ -486,7 +523,16 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<RenderedImag
             "vertex and fragment SPIR-V must be non-empty".to_owned(),
         ));
     }
-    let bpp = readback_bpp(state.format)?;
+    if !state.color_output && state.depth.is_none() {
+        return Err(GpuError::VulkanInitFailed(
+            "draw with neither colour nor depth output".to_owned(),
+        ));
+    }
+    let bpp = if state.color_output {
+        Some(readback_bpp(state.format)?)
+    } else {
+        None
+    };
 
     let mut res = Resources::new(dev);
     if std::env::var_os("XPS5X_TIME_DRAW").is_some() {
@@ -498,7 +544,8 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<RenderedImag
         res.record_and_submit(state)?;
         let t_submit = t1.elapsed();
         let t2 = Instant::now();
-        let pixels = res.read_back(state.width, state.height, bpp)?;
+        let color = res.read_back_color(state, bpp)?;
+        let depth = res.read_back_depth(state)?;
         let t_readback = t2.elapsed();
         tracing::warn!(
             build_us = t_build.as_micros(),
@@ -506,16 +553,12 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<RenderedImag
             readback_us = t_readback.as_micros(),
             "TIME_DRAW: per-draw phase timing"
         );
-        return Ok(RenderedImage {
-            width: state.width,
-            height: state.height,
-            pixels,
-            bytes_per_pixel: bpp,
-        });
+        return Ok(DrawOutput { color, depth });
     }
     res.build(state)?;
     res.record_and_submit(state)?;
-    let pixels = res.read_back(state.width, state.height, bpp)?;
+    let color = res.read_back_color(state, bpp)?;
+    let depth = res.read_back_depth(state)?;
 
     debug!(
         width = state.width,
@@ -524,12 +567,7 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<RenderedImag
         "offscreen draw rendered on {}",
         dev.device_name()
     );
-    Ok(RenderedImage {
-        width: state.width,
-        height: state.height,
-        pixels,
-        bytes_per_pixel: bpp,
-    })
+    Ok(DrawOutput { color, depth })
 }
 
 /// Draw one triangle offscreen at `width` x `height` and read back the pixels.
@@ -570,7 +608,13 @@ pub fn render_triangle_with_spirv(
             vertex_count: TRIANGLE_VERTICES.len() as u32,
             ..DrawState::new(width, height, vs_spirv, fs_spirv)
         },
-    )
+    )?
+    .color
+    .ok_or_else(|| {
+        GpuError::VulkanInitFailed(
+            "triangle draw produced no colour image (colour output is on by default)".to_owned(),
+        )
+    })
 }
 
 /// One guest texture uploaded to the device: the staging source, the
@@ -639,6 +683,17 @@ struct Resources<'a> {
     readback_memory: vk::DeviceMemory,
     upload_buffer: vk::Buffer,
     upload_memory: vk::DeviceMemory,
+    /// Depth attachment + its view (null when the draw has no depth state).
+    depth_image: vk::Image,
+    depth_memory: vk::DeviceMemory,
+    depth_view: vk::ImageView,
+    /// Prior depth/stencil contents for a LOAD seed (null when both planes
+    /// CLEAR — the attachment then starts undefined by design).
+    depth_upload_buffer: vk::Buffer,
+    depth_upload_memory: vk::DeviceMemory,
+    /// Depth/stencil readback — the result persists into the depth map.
+    depth_readback_buffer: vk::Buffer,
+    depth_readback_memory: vk::DeviceMemory,
     vertex_module: vk::ShaderModule,
     fragment_module: vk::ShaderModule,
     pipeline_layout: vk::PipelineLayout,
@@ -669,6 +724,13 @@ impl<'a> Resources<'a> {
             readback_memory: vk::DeviceMemory::null(),
             upload_buffer: vk::Buffer::null(),
             upload_memory: vk::DeviceMemory::null(),
+            depth_image: vk::Image::null(),
+            depth_memory: vk::DeviceMemory::null(),
+            depth_view: vk::ImageView::null(),
+            depth_upload_buffer: vk::Buffer::null(),
+            depth_upload_memory: vk::DeviceMemory::null(),
+            depth_readback_buffer: vk::Buffer::null(),
+            depth_readback_memory: vk::DeviceMemory::null(),
             vertex_module: vk::ShaderModule::null(),
             fragment_module: vk::ShaderModule::null(),
             pipeline_layout: vk::PipelineLayout::null(),
@@ -683,22 +745,29 @@ impl<'a> Resources<'a> {
     }
 
     fn build(&mut self, state: &DrawState) -> Result<(), GpuError> {
-        let bpp = readback_bpp(state.format)? as usize;
-        self.create_render_target(state.width, state.height, state.format)?;
-        if let Some(initial) = state.initial {
-            let expected = state.width as usize * state.height as usize * bpp;
-            if initial.len() != expected {
-                return Err(GpuError::VulkanInitFailed(format!(
-                    "initial render-target contents are {} bytes; {}x{} needs {expected}",
-                    initial.len(),
-                    state.width,
-                    state.height
-                )));
+        if state.color_output {
+            let bpp = readback_bpp(state.format)? as usize;
+            self.create_render_target(state.width, state.height, state.format)?;
+            if let Some(initial) = state.initial {
+                let expected = state.width as usize * state.height as usize * bpp;
+                if initial.len() != expected {
+                    return Err(GpuError::VulkanInitFailed(format!(
+                        "initial render-target contents are {} bytes; {}x{} needs {expected}",
+                        initial.len(),
+                        state.width,
+                        state.height
+                    )));
+                }
+                let (buffer, memory) =
+                    self.create_buffer_with_bytes(initial, vk::BufferUsageFlags::TRANSFER_SRC)?;
+                self.upload_buffer = buffer;
+                self.upload_memory = memory;
             }
-            let (buffer, memory) =
-                self.create_buffer_with_bytes(initial, vk::BufferUsageFlags::TRANSFER_SRC)?;
-            self.upload_buffer = buffer;
-            self.upload_memory = memory;
+            self.create_readback_buffer(state.width, state.height, bpp as u32)?;
+        }
+        if let Some(depth) = &state.depth {
+            self.create_depth_target(state.width, state.height, depth.format)?;
+            self.create_depth_buffers(state.width, state.height, depth)?;
         }
         if let Some(vertices) = state.vertices {
             self.create_vertex_buffer(vertices)?;
@@ -711,9 +780,161 @@ impl<'a> Resources<'a> {
         }
         self.create_guest_vertex_buffers(state)?;
         self.create_stage_resources(state)?;
-        self.create_readback_buffer(state.width, state.height, bpp as u32)?;
         self.create_pipeline(state)?;
         self.create_command_resources()?;
+        Ok(())
+    }
+
+    /// Create the depth attachment image and its view. Usage covers the draw
+    /// itself, the post-draw readback (TRANSFER_SRC), and seeding prior
+    /// contents (TRANSFER_DST).
+    fn create_depth_target(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+    ) -> Result<(), GpuError> {
+        // Fail cleanly before touching Vulkan: an unsupported depth/stencil
+        // format is device-specific (AMD has no D24_UNORM_S8_UINT), and some
+        // drivers accept the create anyway and then error on every use.
+        if !self.dev.supports_depth_stencil_attachment(format) {
+            return Err(GpuError::VulkanInitFailed(format!(
+                "depth/stencil format {format:?} is not supported for an OPTIMAL-tiling \
+                 attachment on {}",
+                self.dev.device_name()
+            )));
+        }
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        // SAFETY: `info` is fully initialized and borrows nothing beyond this
+        // call; the device is live. The handle is stored and destroyed in Drop.
+        self.depth_image = unsafe { self.device().create_image(&info, None) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("depth vkCreateImage failed: {e}")))?;
+
+        // SAFETY: `self.depth_image` was just created from this device.
+        let reqs = unsafe {
+            self.device()
+                .get_image_memory_requirements(self.depth_image)
+        };
+        let type_index = self
+            .dev
+            .find_memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(reqs.size)
+            .memory_type_index(type_index);
+
+        // SAFETY: allocation size/type come from this image's own requirements.
+        self.depth_memory = unsafe { self.device().allocate_memory(&alloc, None) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("depth allocation failed: {e}")))?;
+
+        // SAFETY: memory was allocated for exactly this image; offset 0 is
+        // within it and satisfies the alignment requirement by construction.
+        unsafe {
+            self.device()
+                .bind_image_memory(self.depth_image, self.depth_memory, 0)
+        }
+        .map_err(|e| GpuError::VulkanInitFailed(format!("depth bind memory failed: {e}")))?;
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(self.depth_image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: depth_aspect_mask(format),
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+
+        // SAFETY: the view's image is live and its format/range match the
+        // image's creation parameters.
+        self.depth_view = unsafe { self.device().create_image_view(&view_info, None) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("depth view failed: {e}")))?;
+        Ok(())
+    }
+
+    /// The depth upload buffer (only when a plane LOADs prior contents) and
+    /// the readback buffer (always — the result persists into the depth map).
+    fn create_depth_buffers(
+        &mut self,
+        width: u32,
+        height: u32,
+        depth: &DepthState,
+    ) -> Result<(), GpuError> {
+        let px = (width * height) as usize;
+        let depth_bytes = px * depth_texel_bytes(depth.format)? as usize;
+        let stencil_bytes = if has_stencil_plane(depth.format) {
+            px
+        } else {
+            0
+        };
+        let total = (depth_bytes + stencil_bytes) as u64;
+
+        let (depth_load, stencil_load) = depth_loads(depth);
+        if depth_load || stencil_load {
+            // Plane layout: depth at 0, stencil right after. A plane that
+            // CLEARs is not copied, so its bytes here stay zero — harmless.
+            let mut bytes = vec![0u8; total as usize];
+            if depth_load {
+                let initial = depth.initial.expect("depth LOAD implies initial");
+                if initial.len() != depth_bytes {
+                    return Err(GpuError::VulkanInitFailed(format!(
+                        "initial depth contents are {} bytes; {}x{} needs {depth_bytes}",
+                        initial.len(),
+                        width,
+                        height
+                    )));
+                }
+                bytes[..depth_bytes].copy_from_slice(initial);
+            }
+            if stencil_load {
+                let initial = depth.initial_stencil.expect("stencil LOAD implies initial");
+                if initial.len() != stencil_bytes {
+                    return Err(GpuError::VulkanInitFailed(format!(
+                        "initial stencil contents are {} bytes; {}x{} needs {stencil_bytes}",
+                        initial.len(),
+                        width,
+                        height
+                    )));
+                }
+                bytes[depth_bytes..].copy_from_slice(initial);
+            }
+            let (buffer, memory) =
+                self.create_buffer_with_bytes(&bytes, vk::BufferUsageFlags::TRANSFER_SRC)?;
+            self.depth_upload_buffer = buffer;
+            self.depth_upload_memory = memory;
+        }
+
+        // Same cached-host preference as the colour readback (`create_readback_buffer`).
+        let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let (buffer, memory) = self
+            .create_buffer(
+                total,
+                vk::BufferUsageFlags::TRANSFER_DST,
+                host | vk::MemoryPropertyFlags::HOST_CACHED,
+            )
+            .or_else(|_| self.create_buffer(total, vk::BufferUsageFlags::TRANSFER_DST, host))?;
+        self.depth_readback_buffer = buffer;
+        self.depth_readback_memory = memory;
         Ok(())
     }
 
@@ -1398,6 +1619,20 @@ impl<'a> Resources<'a> {
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
+        // Depth/stencil state, only when a depth attachment is bound.
+        let depth_stencil = state.depth.as_ref().map(|depth| {
+            vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(depth.test_enable)
+                .depth_write_enable(depth.write_enable)
+                .depth_compare_op(depth.compare_op)
+                .depth_bounds_test_enable(false)
+                .stencil_test_enable(depth.stencil_test_enable)
+                .front(depth.stencil_front)
+                .back(depth.stencil_back)
+                .min_depth_bounds(0.0)
+                .max_depth_bounds(1.0)
+        });
+
         let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(state.color_write_mask)
             .blend_enable(state.blend.enable)
@@ -1407,8 +1642,16 @@ impl<'a> Resources<'a> {
             .src_alpha_blend_factor(state.blend.src_alpha)
             .dst_alpha_blend_factor(state.blend.dst_alpha)
             .alpha_blend_op(state.blend.alpha_op)];
+        // A depth-only draw declares zero colour attachments; the blend
+        // attachment count must match the pipeline's colour attachment count.
+        let color_blend_attachments: &[vk::PipelineColorBlendAttachmentState] =
+            if state.color_output {
+                &blend_attachments
+            } else {
+                &[]
+            };
         let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
-            .attachments(&blend_attachments)
+            .attachments(color_blend_attachments)
             .blend_constants(state.blend.constants);
 
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
@@ -1417,11 +1660,21 @@ impl<'a> Resources<'a> {
 
         // Vulkan 1.3 dynamic rendering: the pipeline declares the attachment
         // formats directly instead of referencing a VkRenderPass.
-        let color_formats = [state.format];
+        let color_formats = if state.color_output {
+            vec![state.format]
+        } else {
+            Vec::new()
+        };
         let mut rendering_info =
             vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
+        if let Some(depth) = &state.depth {
+            rendering_info = rendering_info.depth_attachment_format(depth.format);
+            if has_stencil_plane(depth.format) && depth.stencil_test_enable {
+                rendering_info = rendering_info.stencil_attachment_format(depth.format);
+            }
+        }
 
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        let mut pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&input_assembly)
@@ -1432,6 +1685,9 @@ impl<'a> Resources<'a> {
             .dynamic_state(&dynamic_state)
             .layout(self.pipeline_layout)
             .push_next(&mut rendering_info);
+        if let Some(depth_stencil) = &depth_stencil {
+            pipeline_info = pipeline_info.depth_stencil_state(depth_stencil);
+        }
 
         // SAFETY: every struct chained into `pipeline_info` is a local alive
         // for this call; the shader modules and layout are live handles from
@@ -1475,9 +1731,16 @@ impl<'a> Resources<'a> {
         Ok(())
     }
 
-    /// Barrier helper: transition `image` (render target or texture) between
-    /// layouts, across `layers` array layers.
-    fn image_barrier_layers(&self, image: vk::Image, layers: u32, transition: ImageTransition) {
+    /// Barrier helper: transition `image` (render target, depth target, or
+    /// texture) between layouts, across `layers` array layers and the given
+    /// aspect mask.
+    fn image_barrier_layers(
+        &self,
+        aspect: vk::ImageAspectFlags,
+        image: vk::Image,
+        layers: u32,
+        transition: ImageTransition,
+    ) {
         let barrier = vk::ImageMemoryBarrier::default()
             .old_layout(transition.old_layout)
             .new_layout(transition.new_layout)
@@ -1487,7 +1750,7 @@ impl<'a> Resources<'a> {
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(image)
             .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
+                aspect_mask: aspect,
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
@@ -1528,6 +1791,7 @@ impl<'a> Resources<'a> {
         // then SHADER_READ_ONLY for the stage that samples.
         for texture in &self.texture_uploads {
             self.image_barrier_layers(
+                vk::ImageAspectFlags::COLOR,
                 texture.image,
                 texture.layers,
                 ImageTransition {
@@ -1568,6 +1832,7 @@ impl<'a> Resources<'a> {
                 );
             }
             self.image_barrier_layers(
+                vk::ImageAspectFlags::COLOR,
                 texture.image,
                 texture.layers,
                 ImageTransition {
@@ -1581,77 +1846,169 @@ impl<'a> Resources<'a> {
             );
         }
 
-        if state.initial.is_some() {
-            // Seed the attachment with the target's prior contents:
-            // UNDEFINED -> TRANSFER_DST, copy in, then hand off to the
-            // attachment stage so LOAD sees the composed frame so far.
-            self.image_barrier_layers(
-                self.image,
-                1,
-                ImageTransition {
-                    old_layout: vk::ImageLayout::UNDEFINED,
-                    new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    src_access: vk::AccessFlags::empty(),
-                    dst_access: vk::AccessFlags::TRANSFER_WRITE,
-                    src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
-                    dst_stage: vk::PipelineStageFlags::TRANSFER,
-                },
-            );
-            let region = vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .image_extent(vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                });
-            // SAFETY: the upload buffer holds exactly width*height*4 bytes
-            // (validated in build) and the image was created TRANSFER_DST;
-            // both belong to this device and the command buffer is recording.
-            unsafe {
-                self.device().cmd_copy_buffer_to_image(
-                    self.command_buffer,
-                    self.upload_buffer,
+        // Colour attachment: seed/transition only when this draw writes colour.
+        // A depth-only z-prepass (`color_output == false`) has no colour image.
+        if state.color_output {
+            if state.initial.is_some() {
+                // Seed the attachment with the target's prior contents:
+                // UNDEFINED -> TRANSFER_DST, copy in, then hand off to the
+                // attachment stage so LOAD sees the composed frame so far.
+                self.image_barrier_layers(
+                    vk::ImageAspectFlags::COLOR,
                     self.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[region],
+                    1,
+                    ImageTransition {
+                        old_layout: vk::ImageLayout::UNDEFINED,
+                        new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        src_access: vk::AccessFlags::empty(),
+                        dst_access: vk::AccessFlags::TRANSFER_WRITE,
+                        src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+                        dst_stage: vk::PipelineStageFlags::TRANSFER,
+                    },
+                );
+                let region = vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    });
+                // SAFETY: the upload buffer holds exactly width*height*4 bytes
+                // (validated in build) and the image was created TRANSFER_DST;
+                // both belong to this device and the command buffer is recording.
+                unsafe {
+                    self.device().cmd_copy_buffer_to_image(
+                        self.command_buffer,
+                        self.upload_buffer,
+                        self.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[region],
+                    );
+                }
+                self.image_barrier_layers(
+                    vk::ImageAspectFlags::COLOR,
+                    self.image,
+                    1,
+                    ImageTransition {
+                        old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        src_access: vk::AccessFlags::TRANSFER_WRITE,
+                        dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                            | vk::AccessFlags::COLOR_ATTACHMENT_READ,
+                        src_stage: vk::PipelineStageFlags::TRANSFER,
+                        dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    },
+                );
+            } else {
+                // UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL. Discards existing
+                // contents, which is fine: the render pass clears anyway.
+                self.image_barrier_layers(
+                    vk::ImageAspectFlags::COLOR,
+                    self.image,
+                    1,
+                    ImageTransition {
+                        old_layout: vk::ImageLayout::UNDEFINED,
+                        new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        src_access: vk::AccessFlags::empty(),
+                        dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                        src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+                        dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    },
                 );
             }
-            self.image_barrier_layers(
-                self.image,
-                1,
-                ImageTransition {
-                    old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    src_access: vk::AccessFlags::TRANSFER_WRITE,
-                    dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                        | vk::AccessFlags::COLOR_ATTACHMENT_READ,
-                    src_stage: vk::PipelineStageFlags::TRANSFER,
-                    dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                },
-            );
-        } else {
-            // UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL. Discards existing
-            // contents, which is fine: the render pass clears anyway.
-            self.image_barrier_layers(
-                self.image,
-                1,
-                ImageTransition {
-                    old_layout: vk::ImageLayout::UNDEFINED,
-                    new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    src_access: vk::AccessFlags::empty(),
-                    dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                    src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
-                    dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                },
-            );
+        }
+
+        // Depth/stencil attachment: transition it to the attachment layout,
+        // seeding a plane that LOADs prior contents. A CLEAR plane starts
+        // undefined and is cleared by the render pass, so it needs no seed.
+        if let Some(depth) = &state.depth {
+            let aspect = depth_aspect_mask(depth.format);
+            let (depth_load, stencil_load) = depth_loads(depth);
+            if self.depth_upload_buffer != vk::Buffer::null() {
+                self.image_barrier_layers(
+                    aspect,
+                    self.depth_image,
+                    1,
+                    ImageTransition {
+                        old_layout: vk::ImageLayout::UNDEFINED,
+                        new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        src_access: vk::AccessFlags::empty(),
+                        dst_access: vk::AccessFlags::TRANSFER_WRITE,
+                        src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+                        dst_stage: vk::PipelineStageFlags::TRANSFER,
+                    },
+                );
+                let mut regions = Vec::new();
+                if depth_load {
+                    regions.push(depth_copy_region(
+                        width,
+                        height,
+                        vk::ImageAspectFlags::DEPTH,
+                        0,
+                    ));
+                }
+                if stencil_load {
+                    let offset = depth_plane_bytes(width, height, depth.format)?;
+                    regions.push(depth_copy_region(
+                        width,
+                        height,
+                        vk::ImageAspectFlags::STENCIL,
+                        offset,
+                    ));
+                }
+                // SAFETY: the upload buffer holds the loaded planes' bytes
+                // (`create_depth_buffers` sized and filled it), the depth image
+                // was created TRANSFER_DST, and both belong to this device
+                // while the command buffer records.
+                if !regions.is_empty() {
+                    unsafe {
+                        self.device().cmd_copy_buffer_to_image(
+                            self.command_buffer,
+                            self.depth_upload_buffer,
+                            self.depth_image,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            &regions,
+                        );
+                    }
+                }
+                self.image_barrier_layers(
+                    aspect,
+                    self.depth_image,
+                    1,
+                    ImageTransition {
+                        old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        new_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                        src_access: vk::AccessFlags::TRANSFER_WRITE,
+                        dst_access: vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+                            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
+                        src_stage: vk::PipelineStageFlags::TRANSFER,
+                        dst_stage: vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                    },
+                );
+            } else {
+                self.image_barrier_layers(
+                    aspect,
+                    self.depth_image,
+                    1,
+                    ImageTransition {
+                        old_layout: vk::ImageLayout::UNDEFINED,
+                        new_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                        src_access: vk::AccessFlags::empty(),
+                        dst_access: vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+                            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
+                        src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+                        dst_stage: vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                    },
+                );
+            }
         }
 
         let clear = vk::ClearValue {
@@ -1669,16 +2026,45 @@ impl<'a> Resources<'a> {
             })
             .store_op(vk::AttachmentStoreOp::STORE)
             .clear_value(clear);
-        let color_attachments = [color_attachment];
+        let color_attachment_slice = [color_attachment];
+        // A depth-only draw declares zero colour attachments, matching the
+        // pipeline built with no colour formats (`create_pipeline`).
+        let color_attachments: &[vk::RenderingAttachmentInfo] = if state.color_output {
+            &color_attachment_slice
+        } else {
+            &[]
+        };
+
+        // Vulkan 1.3 dynamic-rendering depth/stencil attachments. `depth_view`
+        // carries both planes (aspect from `depth_aspect_mask`), so depth and
+        // stencil reference the same view.
+        let depth_attachment = state.depth.as_ref().map(|depth| {
+            let (depth_load, _) = depth_loads(depth);
+            depth_stencil_attachment(self.depth_view, depth_load, depth)
+        });
+        let stencil_attachment = state
+            .depth
+            .as_ref()
+            .filter(|depth| has_stencil_plane(depth.format) && depth.stencil_test_enable)
+            .map(|depth| {
+                let (_, stencil_load) = depth_loads(depth);
+                depth_stencil_attachment(self.depth_view, stencil_load, depth)
+            });
 
         let render_area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D { width, height },
         };
-        let rendering_info = vk::RenderingInfo::default()
+        let mut rendering_info = vk::RenderingInfo::default()
             .render_area(render_area)
             .layer_count(1)
-            .color_attachments(&color_attachments);
+            .color_attachments(color_attachments);
+        if let Some(depth_attachment) = &depth_attachment {
+            rendering_info = rendering_info.depth_attachment(depth_attachment);
+        }
+        if let Some(stencil_attachment) = &stencil_attachment {
+            rendering_info = rendering_info.stencil_attachment(stencil_attachment);
+        }
 
         let viewports = [vk::Viewport {
             x: state.viewport[0],
@@ -1774,49 +2160,98 @@ impl<'a> Resources<'a> {
         }
 
         // COLOR_ATTACHMENT_OPTIMAL -> TRANSFER_SRC_OPTIMAL for the copy out.
-        self.image_barrier_layers(
-            self.image,
-            1,
-            ImageTransition {
-                old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                src_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                dst_access: vk::AccessFlags::TRANSFER_READ,
-                src_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                dst_stage: vk::PipelineStageFlags::TRANSFER,
-            },
-        );
+        if state.color_output {
+            self.image_barrier_layers(
+                vk::ImageAspectFlags::COLOR,
+                self.image,
+                1,
+                ImageTransition {
+                    old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    src_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    dst_access: vk::AccessFlags::TRANSFER_READ,
+                    src_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    dst_stage: vk::PipelineStageFlags::TRANSFER,
+                },
+            );
 
-        // buffer_row_length/image_height = 0 means "tightly packed", which is
-        // what `RenderedImage::pixel` assumes.
-        let region = vk::BufferImageCopy::default()
-            .buffer_offset(0)
-            .buffer_row_length(0)
-            .buffer_image_height(0)
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-            .image_extent(vk::Extent3D {
+            // buffer_row_length/image_height = 0 means "tightly packed", which is
+            // what `RenderedImage::pixel` assumes.
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                });
+
+            // SAFETY: the image is in TRANSFER_SRC_OPTIMAL per the barrier above,
+            // and the readback buffer was sized `width * height * 4` — exactly the
+            // region copied.
+            unsafe {
+                self.device().cmd_copy_image_to_buffer(
+                    self.command_buffer,
+                    self.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    self.readback_buffer,
+                    &[region],
+                );
+            }
+        }
+
+        // Depth/stencil copy out: DEPTH_STENCIL_ATTACHMENT_OPTIMAL ->
+        // TRANSFER_SRC, then copy the depth plane (and stencil plane, if any)
+        // into the readback buffer at the layout `read_back_depth` expects.
+        if let Some(depth) = &state.depth {
+            let aspect = depth_aspect_mask(depth.format);
+            self.image_barrier_layers(
+                aspect,
+                self.depth_image,
+                1,
+                ImageTransition {
+                    old_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    src_access: vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    dst_access: vk::AccessFlags::TRANSFER_READ,
+                    src_stage: vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                    dst_stage: vk::PipelineStageFlags::TRANSFER,
+                },
+            );
+            let mut regions = vec![depth_copy_region(
                 width,
                 height,
-                depth: 1,
-            });
-
-        // SAFETY: the image is in TRANSFER_SRC_OPTIMAL per the barrier above,
-        // and the readback buffer was sized `width * height * 4` — exactly the
-        // region copied.
-        unsafe {
-            self.device().cmd_copy_image_to_buffer(
-                self.command_buffer,
-                self.image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                self.readback_buffer,
-                &[region],
-            );
+                vk::ImageAspectFlags::DEPTH,
+                0,
+            )];
+            if has_stencil_plane(depth.format) {
+                let offset = depth_plane_bytes(width, height, depth.format)?;
+                regions.push(depth_copy_region(
+                    width,
+                    height,
+                    vk::ImageAspectFlags::STENCIL,
+                    offset,
+                ));
+            }
+            // SAFETY: the depth image is in TRANSFER_SRC per the barrier above,
+            // and `depth_readback_buffer` was sized for exactly these planes.
+            unsafe {
+                self.device().cmd_copy_image_to_buffer(
+                    self.command_buffer,
+                    self.depth_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    self.depth_readback_buffer,
+                    &regions,
+                );
+            }
         }
 
         // Make the transfer writes visible to host reads of the mapped memory.
@@ -1884,6 +2319,80 @@ impl<'a> Resources<'a> {
         // references into it remain.
         unsafe { self.device().unmap_memory(self.readback_memory) };
         Ok(pixels)
+    }
+
+    /// The colour readback as a [`RenderedImage`], or `None` for a depth-only
+    /// draw. `bpp` is `Some` exactly when `state.color_output` — the caller
+    /// computed it once from the format so a `None` here means "no colour
+    /// attachment", not an error.
+    fn read_back_color(
+        &self,
+        state: &DrawState,
+        bpp: Option<u32>,
+    ) -> Result<Option<RenderedImage>, GpuError> {
+        let Some(bpp) = bpp else {
+            return Ok(None);
+        };
+        let pixels = self.read_back(state.width, state.height, bpp)?;
+        Ok(Some(RenderedImage {
+            width: state.width,
+            height: state.height,
+            pixels,
+            bytes_per_pixel: bpp,
+        }))
+    }
+
+    /// The depth/stencil readback as a [`DepthImage`], or `None` when the draw
+    /// bound no depth attachment. The depth plane occupies the first
+    /// `depth_plane_bytes` of `depth_readback_buffer`; the stencil plane (one
+    /// byte per texel, present only for a stencil-bearing format) follows — the
+    /// exact layout `create_depth_buffers` sized and the copy-out in
+    /// `record_and_submit` wrote.
+    fn read_back_depth(&self, state: &DrawState) -> Result<Option<DepthImage>, GpuError> {
+        let Some(depth) = &state.depth else {
+            return Ok(None);
+        };
+        let (width, height) = (state.width, state.height);
+        let depth_bytes = depth_plane_bytes(width, height, depth.format)? as usize;
+        let stencil_bytes = if has_stencil_plane(depth.format) {
+            (width as usize) * (height as usize)
+        } else {
+            0
+        };
+        let total = depth_bytes + stencil_bytes;
+
+        // SAFETY: `depth_readback_memory` is HOST_VISIBLE|HOST_COHERENT (or the
+        // HOST_CACHED fallback) memory sized `total` by `create_depth_buffers`
+        // and not currently mapped. The copy that filled it completed
+        // (`record_and_submit` waited on the fence) and a host barrier made
+        // those writes visible.
+        let ptr = unsafe {
+            self.device().map_memory(
+                self.depth_readback_memory,
+                0,
+                total as vk::DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )
+        }
+        .map_err(|e| GpuError::VulkanInitFailed(format!("depth readback map failed: {e}")))?;
+
+        // SAFETY: `ptr` maps exactly `total` bytes, initialized by the completed
+        // copy; the bytes are copied into owned Vecs before unmapping, so no
+        // reference outlives the mapping.
+        let all = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), total) };
+        let depth_plane = all[..depth_bytes].to_vec();
+        let stencil = (stencil_bytes > 0).then(|| all[depth_bytes..].to_vec());
+
+        // SAFETY: mapped by the call above; no references into it remain.
+        unsafe { self.device().unmap_memory(self.depth_readback_memory) };
+
+        Ok(Some(DepthImage {
+            width,
+            height,
+            format: depth.format,
+            depth: depth_plane,
+            stencil,
+        }))
     }
 }
 
@@ -1984,6 +2493,27 @@ impl Drop for Resources<'_> {
             }
             if self.image_memory != vk::DeviceMemory::null() {
                 d.free_memory(self.image_memory, None);
+            }
+            if self.depth_view != vk::ImageView::null() {
+                d.destroy_image_view(self.depth_view, None);
+            }
+            if self.depth_image != vk::Image::null() {
+                d.destroy_image(self.depth_image, None);
+            }
+            if self.depth_memory != vk::DeviceMemory::null() {
+                d.free_memory(self.depth_memory, None);
+            }
+            if self.depth_upload_buffer != vk::Buffer::null() {
+                d.destroy_buffer(self.depth_upload_buffer, None);
+            }
+            if self.depth_upload_memory != vk::DeviceMemory::null() {
+                d.free_memory(self.depth_upload_memory, None);
+            }
+            if self.depth_readback_buffer != vk::Buffer::null() {
+                d.destroy_buffer(self.depth_readback_buffer, None);
+            }
+            if self.depth_readback_memory != vk::DeviceMemory::null() {
+                d.free_memory(self.depth_readback_memory, None);
             }
         }
     }

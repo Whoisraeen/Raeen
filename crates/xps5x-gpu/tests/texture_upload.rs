@@ -185,7 +185,10 @@ fn sampled_texture_pixels_reach_the_readback() {
         ..DrawState::new(W, H, &vs, &ps)
     };
 
-    let image = render_draw(dev, &state).expect("textured draw must render");
+    let image = render_draw(dev, &state)
+        .expect("textured draw must render")
+        .color
+        .expect("a colour draw produces a colour image");
 
     // The triangle's center carries the sampled texel; the corners stay on
     // the clear color, so the texture cannot be confused with a full-fill.

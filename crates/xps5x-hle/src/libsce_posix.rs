@@ -41,6 +41,17 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libScePosix", "usleep", posix_usleep);
     registry.register("libScePosix", "getpid", libkernel::hle_getpid);
     registry.register_nid("libScePosix", "fcntl", 0xf276_35f5_b2a8_8999, posix_fcntl);
+
+    // The `libkernel` module exports these POSIX names under BOTH its
+    // `libScePosix` library and its `libkernel` library, and resolution is
+    // provider-aware (`ModuleRegistry::resolve` keys on the importing symbol's
+    // provider library, not the NID alone). The measured ASTRO.BOT title imports
+    // `clock_gettime` (NID 0x94b313f6f240724d) naming provider library
+    // `libkernel`, so the `libScePosix` registration above does not satisfy it —
+    // register the same thin POSIX-ABI adapter under `libkernel` too. See the
+    // `libkernel::register` POSIX-spelling block for the sibling time/memory
+    // aliases done the same way.
+    registry.register("libkernel", "clock_gettime", posix_clock_gettime);
 }
 
 /// Turn an SCE return (`0` on success, negative error code on failure) into the
@@ -156,6 +167,19 @@ mod tests {
         assert!(registry.is_implemented("libScePosix", "clock_gettime"));
         assert!(registry.is_implemented("libScePosix", "usleep"));
         assert!(registry.is_implemented("libScePosix", "getpid"));
+    }
+
+    /// The measured ASTRO.BOT title imports `clock_gettime` naming provider
+    /// library `libkernel`, not `libScePosix`; resolution is provider-aware, so
+    /// it must be registered under `libkernel` too (the NID-level provider check
+    /// lives in `xps5x-firmware`'s `hle_nid_coverage`).
+    #[test]
+    fn clock_gettime_is_also_registered_under_libkernel() {
+        let registry = HleRegistry::new();
+        assert!(
+            registry.is_implemented("libkernel", "clock_gettime"),
+            "the libkernel-library import the title actually issues must resolve"
+        );
     }
 
     #[test]

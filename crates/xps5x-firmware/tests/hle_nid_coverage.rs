@@ -12,8 +12,8 @@
 //! names against the encoded NID strings in its symbol table, so each one is a
 //! symbol a real title genuinely requested.
 
-use xps5x_firmware::ModuleRegistry;
 use xps5x_firmware::dynlib::nid::{NidDatabase, encode_nid, nid_of};
+use xps5x_firmware::{ModuleRegistry, Resolver};
 use xps5x_hle::HleRegistry;
 
 /// `(name, encoded NID as it appears in the title's symbol table)`.
@@ -72,6 +72,32 @@ fn libsce_posix_names_resolve_the_nids_the_real_title_asked_for() {
             hle.is_implemented(library, function),
             "{name:?} resolves to {library}::{function}, which is not implemented"
         );
+    }
+}
+
+/// Provider-aware acceptance for the ASTRO.BOT boot Slice-2 fix. The retail
+/// title imports `clock_gettime` (NID 0x94b313f6f240724d) naming provider
+/// library **`libkernel`**, not `libScePosix`. Resolution is provider-aware, so
+/// a `libScePosix`-only registration does NOT satisfy it — this asserts through
+/// the real `ModuleRegistry::resolve(provider, nid)` path the linker uses, not a
+/// provider-blind `NidDatabase::resolve`, so it would have caught the missing
+/// `libkernel` alias the title actually stopped on.
+#[test]
+fn clock_gettime_resolves_from_the_libkernel_provider_the_title_names() {
+    // The exact NID recovered from the retail symbol table (measured 2026-07-19
+    // as the first blocker after the init-once fix restored boot).
+    const CLOCK_GETTIME_NID: u64 = 0x94b3_13f6_f240_724d;
+    assert_eq!(nid_of("clock_gettime"), CLOCK_GETTIME_NID);
+
+    let hle = HleRegistry::new();
+    let registry = ModuleRegistry::new(NidDatabase::from_hle(&hle));
+
+    match registry.resolve(&hle, "libkernel", CLOCK_GETTIME_NID) {
+        Resolver::Hle { function, .. } => assert_eq!(function, "clock_gettime"),
+        other => panic!(
+            "clock_gettime imported from provider 'libkernel' must resolve to an HLE \
+             function; got {other:?}"
+        ),
     }
 }
 

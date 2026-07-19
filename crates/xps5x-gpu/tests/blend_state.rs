@@ -113,7 +113,10 @@ fn alpha_blend_composites_over_the_seeded_target() {
         ..DrawState::new(W, H, &vs, &ps)
     };
 
-    let image = render_draw(dev, &state).expect("blended draw must render");
+    let image = render_draw(dev, &state)
+        .expect("blended draw must render")
+        .color
+        .expect("a colour draw produces a colour image");
 
     // 0.5 * green + 0.5 * red, alpha = 1 * 0.5 + 0 * 1 = 0.5.
     let center = image

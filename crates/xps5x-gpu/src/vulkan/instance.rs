@@ -109,12 +109,12 @@ impl VulkanDevice {
         let result = Self::pick_and_create_device(&entry, &instance);
         let (physical_device, device, queue_family_index, device_name, depth_range_unrestricted) =
             match result {
-            Ok(v) => v,
-            Err(e) => {
-                Self::destroy_partial(&instance, debug);
-                return Err(e);
-            }
-        };
+                Ok(v) => v,
+                Err(e) => {
+                    Self::destroy_partial(&instance, debug);
+                    return Err(e);
+                }
+            };
 
         // SAFETY: `queue_family_index` came from the queue-family enumeration
         // for `physical_device` and was requested in `device`'s create info
@@ -216,6 +216,24 @@ impl VulkanDevice {
 
     pub(crate) fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Whether `format` can back a depth/stencil attachment with OPTIMAL
+    /// tiling on this device. Depth/stencil support is device-specific: AMD,
+    /// for example, exposes `D32_SFLOAT_S8_UINT` but not `D24_UNORM_S8_UINT`.
+    /// The caller must pick a supported format rather than create an image the
+    /// driver may silently accept but cannot render (a cascade of validation
+    /// errors and a wrong result).
+    pub(crate) fn supports_depth_stencil_attachment(&self, format: vk::Format) -> bool {
+        // SAFETY: `physical_device` came from this `instance`'s enumeration;
+        // the query only fills a properties struct and borrows nothing.
+        let props = unsafe {
+            self.instance
+                .get_physical_device_format_properties(self.physical_device, format)
+        };
+        props
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
     }
 
     pub(crate) fn queue(&self) -> vk::Queue {

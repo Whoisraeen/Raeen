@@ -1,5 +1,72 @@
 # XPS5X session progress ledger
 
+- ASTRO.BOT boot chain advanced — B0 verified + Slice 2 (2026-07-19, working
+  tree; hle 108 + firmware 118 green incl. new provider-aware clock_gettime
+  tests; release GUI rebuilt; measured against the retail title twice):
+  * **B0 VERIFIED on the real title** (Slice 1 init-once): a default release
+    `--run-eboot` (NO `XPS5X_SKIP_MAIN_INIT`) shows deps init once
+    (`libSceNpCppWebApi.prx`/`libc.prx: calling dependency module_start`), the
+    main initializer `deferred to crt0`, and **no `0x7426c00` cycle** — the
+    title advances past init in ~4 s. The Slice 1 exit gate is closed.
+  * **Slice 2 done — `clock_gettime`**: the title imports it (NID
+    0x94b313f6f240724d) naming provider library **`libkernel`**, but it was
+    registered only under `libScePosix`; resolution is provider-aware, so it
+    was unresolved. Registered the existing thin POSIX adapter
+    (`posix_clock_gettime`) under `libkernel` too. Tests: hle
+    `clock_gettime_is_also_registered_under_libkernel` + firmware
+    `clock_gettime_resolves_from_the_libkernel_provider_the_title_names`
+    (through the real provider-aware `ModuleRegistry::resolve`, not a
+    provider-blind NidDatabase lookup).
+  * **Task #7 (ASTRO.BOT "libc allocator mutex spin") does NOT reproduce** on
+    the current build: the title progresses through the libc mutex/allocator
+    traffic (last HLE calls are scePthreadMutexLock/Unlock/Init) in ~5 s and
+    returns cleanly — no spin. That wall (from an older architecture branch) is
+    gone.
+  * **NEW ASTRO.BOT wall = libSceAgc command-buffer builders** (GPU init). The
+    title now reaches AGC and stops on the first unimplemented import, an
+    UNNAMED NID `0x05f0436466ed8bb0` ("BfBDZGbti7A"), with a batch behind it:
+    sceAgcCbSetShRegistersDirect, sceAgcCbDispatchGetSize, sceAgcCbNopGetSize,
+    sceAgcAcb{AcquireMem,CopyData,DmaData,WaitRegMem,Push/PopMarker},
+    sceAgcDcb{DrawIndexIndirect,GetLodStats,StallCommandBufferParser}, +
+    another unnamed (0x7dde41a79b464e0a). Next step is implementing these AGC
+    Cb/Acb/Dcb builders (SharpEmu `AgcExports`/Kyty Gen5) — the ASTRO.BOT plan's
+    M2/AGC territory. `libsce_agc.rs` already carries 25/48; these are new.
+
+
+- GPU depth/stencil attachments in the Vulkan pipeline (2026-07-19, working
+  tree; xps5x-gpu 120 lib + all integration green incl. 3 new depth/stencil
+  tests on real hw (AMD Radeon 760M); gpu clippy --tests + fmt clean; release
+  GUI build green; hle 276 + runtime 48+43 unblocked/green):
+  * Completed a half-finished depth/stencil refactor a prior agent left the
+    tree non-compiling on (broke the whole workspace since hle/runtime depend
+    on xps5x-gpu). `render_draw` now returns `DrawOutput { color, depth }`.
+  * `offscreen.rs`: `read_back_color`/`read_back_depth` (Option results; None
+    for a depth-only z-prepass); `record_and_submit` gained depth image
+    transitions (UNDEFINED→DEPTH_STENCIL_ATTACHMENT_OPTIMAL, seed-on-LOAD via
+    the upload buffer, →TRANSFER_SRC + copy-out), dynamic-rendering depth +
+    stencil attachments, colour-attachment work guarded by `color_output`;
+    `Drop` frees the 7 depth resources.
+  * Correctness fix (helps the title path too): `VulkanDevice::
+    supports_depth_stencil_attachment` queries format features; `create_depth_
+    target` fails cleanly on an unsupported format instead of creating a bogus
+    image the driver accepts then errors on every use. Measured: AMD exposes
+    D32_SFLOAT_S8_UINT but NOT D24_UNORM_S8_UINT — the stencil test tries both.
+  * Tests (`tests/depth_stencil.rs`): depth CLEAR readback, depth LOAD (prior
+    contents), and stencil CLEAR readback — write disabled so the readback is
+    exactly the clear/loaded value, independent of shader z. All pass on hw.
+  * Fixed the two broken `render_draw` callers (blend_state/texture_upload
+    tests → `.color`) and `draw_translate` (colour-only composite passes
+    `color_output: true, depth: None`).
+  * OPEN FOLLOW-UP (noted in code): no `depth_state_from_regs` yet — real PM4
+    draws still pass `depth: None`, so the attachment is wired+tested but
+    DORMANT until the DB_* register decode feeds it (DB_DEPTH_CONTROL / Z_INFO
+    / STENCIL_INFO / RENDER_CONTROL, per the `DepthState` doc's Kyty refs) plus
+    a depth-framebuffer map keyed by DB_Z_WRITE_BASE.
+  * Pre-existing test-clippy debt cleared in-crate while here: `#![allow(
+    deprecated)]` on the m2 fixture gate, `#[allow(field_reassign_with_default)]`
+    on one nested-array test setup, and an unused `mut` on the compute-seed test.
+
+
 - ASTRO.BOT boot Slice 1 — process init runs exactly once (2026-07-18,
   working tree; core 7/7, firmware 106/106 lib, runtime 43/43 execute +
   full suite green; touched-crate clippy --no-deps clean; fmt clean; release

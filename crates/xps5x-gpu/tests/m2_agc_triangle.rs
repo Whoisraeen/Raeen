@@ -10,6 +10,11 @@
 //! XPS5X_REQUIRE_VULKAN=1 cargo test -p xps5x-gpu --test m2_agc_triangle -- --nocapture
 //! ```
 
+// This gate deliberately exercises the deprecated no-register fixture path
+// (`build_m2_draw_dcb`/`execute_dcb`): it is the M2 regression check that the
+// simplest DCB still rasterizes, distinct from the register-driven CP path.
+#![allow(deprecated)]
+
 use xps5x_gpu::agc_exec::{AgcGpuSession, M2_DRAW_HEIGHT, M2_DRAW_WIDTH, build_m2_draw_dcb};
 use xps5x_gpu::vulkan::{CLEAR_COLOR, TRIANGLE_COLOR, unorm8, validation_error_count};
 

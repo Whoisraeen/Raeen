@@ -934,6 +934,11 @@ pub fn draw_state_from_regs<'a>(
         initial: None,
         // The caller (draw_common) fills this in for an indexed draw.
         index: None,
+        // This register-driven composite path is colour-only for now; the
+        // depth/stencil attachment is wired in `render_draw` but not yet fed
+        // from the PM4 DB_* registers (a future `depth_state_from_regs`).
+        color_output: true,
+        depth: None,
     })
 }
 
@@ -1151,9 +1156,15 @@ impl OffscreenDrawSink<'_> {
             // frame samples its scene targets this way.
             let dev = self.dev;
             let fbs: &HashMap<u64, RenderedImage> = self.framebuffers;
-            with_render_targets(fbs, || {
+            let output = with_render_targets(fbs, || {
                 render_draw(dev, &state).map_err(|e| err(format!("offscreen draw failed: {e}")))
-            })?
+            })?;
+            // This path is colour-only (`color_output: true`, `depth: None`),
+            // so the draw always produces a colour image; a depth-only draw
+            // would land here only once the register decode emits one.
+            output
+                .color
+                .ok_or_else(|| err("offscreen draw produced no colour image".to_string()))?
         };
 
         self.framebuffers.insert(rt_base, image.clone());
@@ -1321,7 +1332,7 @@ mod tests {
     /// zeroed ACB dispatches (measured 516 → 9).
     #[test]
     fn cross_queue_compute_seeding_falls_back_to_last_bound() {
-        let mut cs = |addr: u64| {
+        let cs = |addr: u64| {
             let mut c = ComputeShaderInfo::default();
             c.cs_regs.data_addr = addr;
             c
@@ -1688,6 +1699,9 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    // Nested array/struct field setup (`vs.resources[0].fields[3]`, `vs.buffers[0]`)
+    // can't use struct-init syntax, so the default-then-assign form stays.
+    #[allow(clippy::field_reassign_with_default)]
     fn measured_gen5_vertex_and_storage_resources_become_vulkan_bindings() {
         let vertex_words: Vec<u32> = vec![
             0xbf19_999a,
