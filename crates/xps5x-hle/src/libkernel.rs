@@ -268,20 +268,19 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
             // (codepoints the substitute lacks are handled by the title's own
             // cmap-miss path) instead of faulting on a null font object. Only
             // triggers on a genuinely-missing font whose directory ships another.
-            if !creating {
-                if let Some(fb_name) = font_fallback_sibling(&host) {
-                    if let Some(slash) = path.rfind('/') {
-                        let fb_path = format!("{}/{fb_name}", &path[..slash]);
-                        warn!("open: '{path}' missing — substituting shipped font '{fb_path}'");
-                        return match ctx.services.open(&fb_path, flags, mode) {
-                            Ok(fd) => fd as u64,
-                            Err(e) => {
-                                warn!("open: font substitute '{fb_path}' failed: {e} — ENOENT");
-                                FILE_ENOENT
-                            }
-                        };
+            if !creating
+                && let Some(fb_name) = font_fallback_sibling(&host)
+                && let Some(slash) = path.rfind('/')
+            {
+                let fb_path = format!("{}/{fb_name}", &path[..slash]);
+                warn!("open: '{path}' missing — substituting shipped font '{fb_path}'");
+                return match ctx.services.open(&fb_path, flags, mode) {
+                    Ok(fd) => fd as u64,
+                    Err(e) => {
+                        warn!("open: font substitute '{fb_path}' failed: {e} — ENOENT");
+                        FILE_ENOENT
                     }
-                }
+                };
             }
             warn!(
                 "open: '{path}' → '{}' does not exist (no O_CREAT) — ENOENT",

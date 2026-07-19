@@ -1261,6 +1261,225 @@ impl CommandProcessor {
                 c.stencilfunc_bf = ((value >> 20) & 0x7) as u8;
             }
 
+            // ---- Depth/stencil surface registers (Kyty GraphicsRun.cpp) ----
+
+            pm4::DB_RENDER_CONTROL => {
+                // Kyty: hw_ctx_set_render_control (GraphicsRun.cpp L1887).
+                use pm4::db_render_control as f;
+                self.ctx.render_control = crate::hw_regs::RenderControl {
+                    depth_clear_enable: pm4::field(value, f::DEPTH_CLEAR_ENABLE) != 0,
+                    stencil_clear_enable: pm4::field(value, f::STENCIL_CLEAR_ENABLE) != 0,
+                    resummarize_enable: pm4::field(value, f::RESUMMARIZE_ENABLE) != 0,
+                    stencil_compress_disable: pm4::field(value, f::STENCIL_COMPRESS_DISABLE)
+                        != 0,
+                    depth_compress_disable: pm4::field(value, f::DEPTH_COMPRESS_DISABLE) != 0,
+                    copy_centroid: pm4::field(value, f::COPY_CENTROID) != 0,
+                    copy_sample: pm4::field(value, f::COPY_SAMPLE) as u8,
+                };
+            }
+
+            pm4::DB_DEPTH_VIEW => {
+                // Kyty: g_hw_ctx_indirect_func[DB_DEPTH_VIEW] (GraphicsRun.cpp L3944).
+                use pm4::db_depth_view as f;
+                self.ctx.depth_render_target.depth_view = crate::hw_regs::DepthDepthView {
+                    slice_start: pm4::field(value, f::SLICE_START)
+                        + (pm4::field(value, f::SLICE_START_HI) << 11),
+                    slice_max: pm4::field(value, f::SLICE_MAX)
+                        + (pm4::field(value, f::SLICE_MAX_HI) << 11),
+                    depth_write_disable: pm4::field(value, f::Z_READ_ONLY) != 0,
+                    stencil_write_disable: pm4::field(value, f::STENCIL_READ_ONLY) != 0,
+                    current_mip_level: pm4::field(value, f::MIPID) as u8,
+                };
+            }
+
+            pm4::DB_DEPTH_SIZE_XY => {
+                // Kyty: g_hw_ctx_indirect_func[DB_DEPTH_SIZE_XY] (GraphicsRun.cpp L3955).
+                use pm4::db_depth_size_xy as f;
+                self.ctx.depth_render_target.size = crate::hw_regs::DepthDepthSizeXy {
+                    x_max: pm4::field(value, f::X_MAX) as u16,
+                    y_max: pm4::field(value, f::Y_MAX) as u16,
+                };
+            }
+
+            pm4::DB_DEPTH_BOUNDS_MIN => self.ctx.depth_bounds_min = f32::from_bits(value),
+            pm4::DB_DEPTH_BOUNDS_MAX => self.ctx.depth_bounds_max = f32::from_bits(value),
+
+            pm4::DB_STENCIL_CLEAR => {
+                // Kyty: hw_ctx_set_stencil_clear (GraphicsRun.cpp L2101).
+                self.ctx.stencil_clear_value =
+                    pm4::field(value, pm4::db_stencil_clear::CLEAR) as u8;
+            }
+
+            pm4::DB_DEPTH_CLEAR => {
+                // Kyty: hw_ctx_set_depth_clear (GraphicsRun.cpp L1597).
+                self.ctx.depth_clear_value = f32::from_bits(value);
+            }
+
+            pm4::DB_DEPTH_INFO => {
+                // Kyty: hw_ctx_set_depth_render_target's DB_DEPTH_INFO slice
+                // (GraphicsRun.cpp L1713). Tiling metadata — the offscreen path
+                // never reads guest depth memory, so nothing consumes this yet.
+                use pm4::db_depth_info as f;
+                self.ctx.depth_render_target.depth_info =
+                    crate::hw_regs::DepthRenderTargetDepthInfo {
+                        addr5_swizzle_mask: pm4::field(value, f::ADDR5_SWIZZLE_MASK),
+                        array_mode: pm4::field(value, f::ARRAY_MODE),
+                        pipe_config: pm4::field(value, f::PIPE_CONFIG),
+                        bank_width: pm4::field(value, f::BANK_WIDTH),
+                        bank_height: pm4::field(value, f::BANK_HEIGHT),
+                        macro_tile_aspect: pm4::field(value, f::MACRO_TILE_ASPECT),
+                        num_banks: pm4::field(value, f::NUM_BANKS),
+                    };
+            }
+
+            pm4::DB_Z_INFO => {
+                // Kyty: hw_ctx_set_depth_render_target's Z_INFO slice
+                // (GraphicsRun.cpp L1647).
+                use pm4::db_z_info as f;
+                self.ctx.depth_render_target.z_info = crate::hw_regs::DepthZInfo {
+                    format: pm4::field(value, f::FORMAT),
+                    num_samples: pm4::field(value, f::NUM_SAMPLES),
+                    embedded_sample_locations: pm4::field(value, f::ITERATE_FLUSH) != 0,
+                    partially_resident: pm4::field(value, f::PARTIALLY_RESIDENT) != 0,
+                    num_mip_levels: pm4::field(value, f::MAXMIP) as u8,
+                    tile_mode_index: pm4::field(value, f::TILE_MODE_INDEX),
+                    plane_compression: pm4::field(value, f::DECOMPRESS_ON_N_ZPLANES) as u8,
+                    expclear_enabled: pm4::field(value, f::ALLOW_EXPCLEAR) != 0,
+                    tile_surface_enable: pm4::field(value, f::TILE_SURFACE_ENABLE) != 0,
+                    zrange_precision: pm4::field(value, f::ZRANGE_PRECISION),
+                };
+            }
+
+            pm4::DB_STENCIL_INFO => {
+                // Kyty: g_hw_ctx_indirect_func[DB_STENCIL_INFO] (GraphicsRun.cpp
+                // L3849). Kyty's direct-write handler (L2130) reads buffer[1] — a
+                // fused-packet quirk; a standalone write carries the value here.
+                use pm4::db_stencil_info as f;
+                self.ctx.depth_render_target.stencil_info =
+                    crate::hw_regs::DepthStencilInfo {
+                        format: pm4::field(value, f::FORMAT),
+                        texture_compatible_stencil: pm4::field(value, f::ITERATE_FLUSH) != 0,
+                        partially_resident: pm4::field(value, f::PARTIALLY_RESIDENT) != 0,
+                        tile_split: pm4::field(value, f::RESERVED_FIELD_1),
+                        tile_mode_index: pm4::field(value, f::TILE_MODE_INDEX),
+                        expclear_enabled: pm4::field(value, f::ALLOW_EXPCLEAR) != 0,
+                        tile_stencil_disable: pm4::field(value, f::TILE_STENCIL_DISABLE) != 0,
+                    };
+            }
+
+            // Depth/stencil base addresses assemble exactly like Kyty's indirect
+            // handlers (GraphicsRun.cpp L3864-3942): LO shifts into bits 8..40,
+            // HI's low byte into 40..48.
+            pm4::DB_Z_READ_BASE => {
+                let base = &mut self.ctx.depth_render_target.z_read_base_addr;
+                *base &= 0xFFFF_FF00_0000_00FF;
+                *base |= u64::from(value) << 8;
+            }
+            pm4::DB_Z_READ_BASE_HI => {
+                let base = &mut self.ctx.depth_render_target.z_read_base_addr;
+                *base &= 0xFFFF_00FF_FFFF_FFFF;
+                *base |= u64::from(value & 0xFF) << 40;
+            }
+            pm4::DB_STENCIL_READ_BASE => {
+                let base = &mut self.ctx.depth_render_target.stencil_read_base_addr;
+                *base &= 0xFFFF_FF00_0000_00FF;
+                *base |= u64::from(value) << 8;
+            }
+            pm4::DB_STENCIL_READ_BASE_HI => {
+                let base = &mut self.ctx.depth_render_target.stencil_read_base_addr;
+                *base &= 0xFFFF_00FF_FFFF_FFFF;
+                *base |= u64::from(value & 0xFF) << 40;
+            }
+            pm4::DB_Z_WRITE_BASE => {
+                let base = &mut self.ctx.depth_render_target.z_write_base_addr;
+                *base &= 0xFFFF_FF00_0000_00FF;
+                *base |= u64::from(value) << 8;
+            }
+            pm4::DB_Z_WRITE_BASE_HI => {
+                let base = &mut self.ctx.depth_render_target.z_write_base_addr;
+                *base &= 0xFFFF_00FF_FFFF_FFFF;
+                *base |= u64::from(value & 0xFF) << 40;
+            }
+            pm4::DB_STENCIL_WRITE_BASE => {
+                let base = &mut self.ctx.depth_render_target.stencil_write_base_addr;
+                *base &= 0xFFFF_FF00_0000_00FF;
+                *base |= u64::from(value) << 8;
+            }
+            pm4::DB_STENCIL_WRITE_BASE_HI => {
+                let base = &mut self.ctx.depth_render_target.stencil_write_base_addr;
+                *base &= 0xFFFF_00FF_FFFF_FFFF;
+                *base |= u64::from(value & 0xFF) << 40;
+            }
+            pm4::DB_HTILE_DATA_BASE => {
+                let base = &mut self.ctx.depth_render_target.htile_data_base_addr;
+                *base &= 0xFFFF_FF00_0000_00FF;
+                *base |= u64::from(value) << 8;
+            }
+            pm4::DB_HTILE_DATA_BASE_HI => {
+                let base = &mut self.ctx.depth_render_target.htile_data_base_addr;
+                *base &= 0xFFFF_00FF_FFFF_FFFF;
+                *base |= u64::from(value & 0xFF) << 40;
+            }
+
+            pm4::DB_DEPTH_SIZE => {
+                use pm4::db_depth_size as f;
+                let z = &mut self.ctx.depth_render_target;
+                z.pitch_div8_minus1 = pm4::field(value, f::PITCH_TILE_MAX);
+                z.height_div8_minus1 = pm4::field(value, f::HEIGHT_TILE_MAX);
+            }
+            pm4::DB_DEPTH_SLICE => {
+                self.ctx.depth_render_target.slice_div64_minus1 =
+                    pm4::field(value, pm4::db_depth_slice::SLICE_TILE_MAX);
+            }
+
+            pm4::DB_STENCIL_CONTROL => {
+                // Kyty: hw_ctx_set_stencil_control (GraphicsRun.cpp L2111).
+                use pm4::db_stencil_control as f;
+                self.ctx.stencil_control = crate::hw_regs::StencilControl {
+                    stencil_fail: pm4::field(value, f::STENCILFAIL) as u8,
+                    stencil_zpass: pm4::field(value, f::STENCILZPASS) as u8,
+                    stencil_zfail: pm4::field(value, f::STENCILZFAIL) as u8,
+                    stencil_fail_bf: pm4::field(value, f::STENCILFAIL_BF) as u8,
+                    stencil_zpass_bf: pm4::field(value, f::STENCILZPASS_BF) as u8,
+                    stencil_zfail_bf: pm4::field(value, f::STENCILZFAIL_BF) as u8,
+                };
+            }
+
+            pm4::DB_STENCILREFMASK => {
+                // Kyty: hw_ctx_set_stencil_mask's front half (GraphicsRun.cpp L2157).
+                use pm4::db_stencilrefmask as f;
+                let m = &mut self.ctx.stencil_mask;
+                m.stencil_testval = pm4::field(value, f::STENCILTESTVAL) as u8;
+                m.stencil_mask = pm4::field(value, f::STENCILMASK) as u8;
+                m.stencil_writemask = pm4::field(value, f::STENCILWRITEMASK) as u8;
+                m.stencil_opval = pm4::field(value, f::STENCILOPVAL) as u8;
+            }
+            pm4::DB_STENCILREFMASK_BF => {
+                // Same layout, back face (Kyty Pm4.h L338-346).
+                use pm4::db_stencilrefmask as f;
+                let m = &mut self.ctx.stencil_mask;
+                m.stencil_testval_bf = pm4::field(value, f::STENCILTESTVAL) as u8;
+                m.stencil_mask_bf = pm4::field(value, f::STENCILMASK) as u8;
+                m.stencil_writemask_bf = pm4::field(value, f::STENCILWRITEMASK) as u8;
+                m.stencil_opval_bf = pm4::field(value, f::STENCILOPVAL) as u8;
+            }
+
+            pm4::DB_HTILE_SURFACE => {
+                // Kyty: hw_ctx_set_depth_render_target's HTile slice
+                // (GraphicsRun.cpp L1734). Tracked; HTile is not implemented.
+                use pm4::db_htile_surface as f;
+                self.ctx.depth_render_target.htile_surface =
+                    crate::hw_regs::DepthRenderTargetHTileSurface {
+                        linear: pm4::field(value, f::LINEAR),
+                        full_cache: pm4::field(value, f::FULL_CACHE),
+                        htile_uses_preload_win: pm4::field(value, f::HTILE_USES_PRELOAD_WIN),
+                        preload: pm4::field(value, f::PRELOAD),
+                        prefetch_width: pm4::field(value, f::PREFETCH_WIDTH),
+                        prefetch_height: pm4::field(value, f::PREFETCH_HEIGHT),
+                        dst_outside_zero_to_one: pm4::field(value, f::DST_OUTSIDE_ZERO_TO_ONE),
+                    };
+            }
+
             pm4::CB_COLOR_CONTROL => {
                 self.ctx.color_control.mode = ((value >> 4) & 0x7) as u8;
                 self.ctx.color_control.op = ((value >> 16) & 0xff) as u8;
@@ -2532,5 +2751,100 @@ mod tests {
         // Blend colour arrives as raw float bits.
         cp.set_context_register(pm4::CB_BLEND_RED, 0x3f80_0000);
         assert_eq!(cp.ctx.blend_color.red, 1.0);
+    }
+
+    /// Depth register writes decode into the context: surface format, bases,
+    /// extent, and clear values. Field layouts are Kyty's Pm4.h — a title's
+    /// z-prepass reaches the Vulkan depth attachment through these.
+    #[test]
+    fn depth_registers_decode_into_context() {
+        let mut cp = CommandProcessor::new();
+
+        // DB_Z_INFO: format 3 (Z32F) | zrange_precision 1.
+        cp.set_context_register(pm4::DB_Z_INFO, 3 | (1 << 31));
+        cp.set_context_register(pm4::DB_STENCIL_INFO, 0);
+        // Bases assemble LO<<8, HI low byte <<40 (Kyty GraphicsRun.cpp L3896).
+        cp.set_context_register(pm4::DB_Z_WRITE_BASE, 0x200);
+        cp.set_context_register(pm4::DB_Z_WRITE_BASE_HI, 0x1);
+        cp.set_context_register(pm4::DB_Z_READ_BASE, 0x200);
+        // DB_DEPTH_SIZE_XY: x_max | y_max<<16.
+        cp.set_context_register(pm4::DB_DEPTH_SIZE_XY, 63 | (63 << 16));
+        // Clear values: depth is a float, stencil an 8-bit value.
+        cp.set_context_register(pm4::DB_DEPTH_CLEAR, 1.0f32.to_bits());
+        cp.set_context_register(pm4::DB_STENCIL_CLEAR, 0x2A);
+        // DB_RENDER_CONTROL: depth clear enable.
+        cp.set_context_register(pm4::DB_RENDER_CONTROL, 1);
+
+        let z = &cp.ctx.depth_render_target;
+        assert_eq!(z.z_info.format, 3);
+        assert_eq!(z.z_info.zrange_precision, 1);
+        assert_eq!(z.stencil_info.format, 0);
+        assert_eq!(z.z_write_base_addr, (0x1 << 40) | (0x200 << 8));
+        assert_eq!(z.z_read_base_addr, 0x200 << 8);
+        assert_eq!((z.size.x_max, z.size.y_max), (63, 63));
+        assert_eq!(cp.ctx.depth_clear_value, 1.0);
+        assert_eq!(cp.ctx.stencil_clear_value, 0x2A);
+        assert!(cp.ctx.render_control.depth_clear_enable);
+        assert!(!cp.ctx.render_control.stencil_clear_enable);
+    }
+
+    /// `DB_STENCIL_CONTROL`'s six ops and the front/back refmask registers.
+    #[test]
+    fn stencil_registers_decode_into_context() {
+        let mut cp = CommandProcessor::new();
+        // fail=1 (Zero) | zpass=3 (ReplaceTest) | zfail=0 (Keep) | bf fail=8 (AddWrap).
+        cp.set_context_register(pm4::DB_STENCIL_CONTROL, 1 | (3 << 4) | (8 << 12));
+        let sc = &cp.ctx.stencil_control;
+        assert_eq!(sc.stencil_fail, 1);
+        assert_eq!(sc.stencil_zpass, 3);
+        assert_eq!(sc.stencil_zfail, 0);
+        assert_eq!(sc.stencil_fail_bf, 8);
+        assert_eq!(sc.stencil_zpass_bf, 0);
+
+        cp.set_context_register(
+            pm4::DB_STENCILREFMASK,
+            0x11 | (0x22 << 8) | (0x33 << 16) | (0x44 << 24),
+        );
+        cp.set_context_register(
+            pm4::DB_STENCILREFMASK_BF,
+            0x55 | (0x66 << 8) | (0x77 << 16) | (0x88 << 24),
+        );
+        let sm = &cp.ctx.stencil_mask;
+        assert_eq!(sm.stencil_testval, 0x11);
+        assert_eq!(sm.stencil_mask, 0x22);
+        assert_eq!(sm.stencil_writemask, 0x33);
+        assert_eq!(sm.stencil_opval, 0x44);
+        assert_eq!(sm.stencil_testval_bf, 0x55);
+        assert_eq!(sm.stencil_mask_bf, 0x66);
+        assert_eq!(sm.stencil_writemask_bf, 0x77);
+        assert_eq!(sm.stencil_opval_bf, 0x88);
+    }
+
+    /// The batched form a Gen5 driver emits: one SET_CONTEXT_REG packet writes
+    /// DB_Z_INFO through DB_DEPTH_SLICE — every register in the run must land.
+    #[test]
+    fn depth_surface_batch_writes_all_registers() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            header(10, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
+            pm4::DB_Z_INFO,
+            3,              // DB_Z_INFO: Z32F
+            0,              // DB_STENCIL_INFO
+            0x200,          // DB_Z_READ_BASE
+            0,              // DB_STENCIL_READ_BASE
+            0x200,          // DB_Z_WRITE_BASE
+            0,              // DB_STENCIL_WRITE_BASE
+            (63 << 11) | 7, // DB_DEPTH_SIZE: pitch 7, height 63 tile max
+            0x3FF,          // DB_DEPTH_SLICE: slice tile max
+        ];
+        cp.run(&dcb, &mut sink).expect("depth batch");
+        let z = &cp.ctx.depth_render_target;
+        assert_eq!(z.z_info.format, 3);
+        assert_eq!(z.z_read_base_addr, 0x200 << 8);
+        assert_eq!(z.z_write_base_addr, 0x200 << 8);
+        assert_eq!(z.pitch_div8_minus1, 7);
+        assert_eq!(z.height_div8_minus1, 63);
+        assert_eq!(z.slice_div64_minus1, 0x3FF);
     }
 }

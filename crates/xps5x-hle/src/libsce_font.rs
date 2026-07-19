@@ -340,10 +340,10 @@ fn hle_render_char_glyph(ctx: &HleContext, args: &[u64]) -> u64 {
 /// bitmap out of a never-written (garbage/null) glyph — which faulted on a null
 /// source. Text simply doesn't rasterize yet; the engine keeps running.
 fn hle_generate_glyph(ctx: &HleContext, args: &[u64]) -> u64 {
-    if let Some(&out) = args.get(3) {
-        if out != 0 {
-            let _ = ctx.mem.write(out, &0u64.to_le_bytes());
-        }
+    if let Some(&out) = args.get(3)
+        && out != 0
+    {
+        let _ = ctx.mem.write(out, &0u64.to_le_bytes());
     }
     ORBIS_FONT_ERROR_NO_SUPPORT_GLYPH
 }

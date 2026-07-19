@@ -561,26 +561,38 @@ fn link_inner(
                     .and_then(|provider| lib_names.get(&provider.library_index).copied());
                 let provider_module = provider_ref
                     .and_then(|provider| module_names.get(&provider.module_index).copied())
-                    .or(provider_library)
-                    .unwrap_or(&module.name);
-                // Forensic (XPS5X_TRACE_DRAWS): name the import whose PLT stub
-                // (GOT slot module-vaddr 0xE123280) returns EINVAL and kills the
-                // Streaming Pool threads. Logs the NID + provider so the failing
-                // function can be identified and fixed.
-                if reloc.offset == 0xE12_3280 && std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
-                    tracing::warn!(
-                        offset = format_args!("{:#x}", reloc.offset),
-                        nid = format_args!("{:#018x}", symbol.nid),
-                        provider = provider_module,
-                        "TRACE_DRAWS: PLT-0xb5 import (returns EINVAL, kills Streaming Pool)"
-                    );
-                }
-                match registry.resolve_import(
-                    hle,
-                    provider_module,
-                    provider_library.unwrap_or(provider_module),
-                    symbol.nid,
-                ) {
+                    .or(provider_library);
+                let resolver = if let Some(provider_module) = provider_module {
+                    // Forensic (XPS5X_TRACE_DRAWS): name the import whose PLT stub
+                    // (GOT slot module-vaddr 0xE123280) returns EINVAL and kills the
+                    // Streaming Pool threads. Logs the NID + provider so the failing
+                    // function can be identified and fixed.
+                    if reloc.offset == 0xE12_3280 && std::env::var_os("XPS5X_TRACE_DRAWS").is_some()
+                    {
+                        tracing::warn!(
+                            offset = format_args!("{:#x}", reloc.offset),
+                            nid = format_args!("{:#018x}", symbol.nid),
+                            provider = provider_module,
+                            "TRACE_DRAWS: PLT-0xb5 import (returns EINVAL, kills Streaming Pool)"
+                        );
+                    }
+                    registry.resolve_import(
+                        hle,
+                        provider_module,
+                        provider_library.unwrap_or(provider_module),
+                        symbol.nid,
+                    )
+                } else {
+                    // The symbol's provider indices resolve to no name in any
+                    // import table — hand-built fixtures carry `#A#A` indices
+                    // without the tables those indices address, so the import
+                    // has no provider identity to key policy or LLE exports
+                    // on. Falling back to the consumer module's own name here
+                    // would leave every such import unresolved; resolve
+                    // against the provider-free NID view instead.
+                    registry.resolve_unattributed(hle, &module.name, symbol.nid)
+                };
+                match resolver {
                     Resolver::Hle { library, function } => {
                         let addr = tables.hle_addr(library, function);
                         if r_type == R_X86_64_64 {

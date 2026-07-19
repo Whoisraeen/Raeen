@@ -63,6 +63,10 @@ pub struct VulkanDevice {
     debug: Option<(debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
     /// Human-readable name of the selected physical device.
     device_name: String,
+    /// Whether `VK_EXT_depth_range_unrestricted` was enabled on the logical
+    /// device. When false, viewport min/max depth must stay ordered within
+    /// [0, 1] — a guest reverse-Z range cannot be honoured.
+    depth_range_unrestricted: bool,
     /// Whether the validation layer was actually enabled.
     validation_enabled: bool,
 }
@@ -103,7 +107,8 @@ impl VulkanDevice {
         // From here on, any early return must not leak the instance, so each
         // fallible step cleans up explicitly via `destroy_partial`.
         let result = Self::pick_and_create_device(&entry, &instance);
-        let (physical_device, device, queue_family_index, device_name) = match result {
+        let (physical_device, device, queue_family_index, device_name, depth_range_unrestricted) =
+            match result {
             Ok(v) => v,
             Err(e) => {
                 Self::destroy_partial(&instance, debug);
@@ -150,7 +155,7 @@ impl VulkanDevice {
                 .unwrap_or(vk::PipelineCache::null());
 
         info!(
-            "Vulkan device ready: {device_name} (validation={validation_enabled}, graphics queue family {queue_family_index})"
+            "Vulkan device ready: {device_name} (validation={validation_enabled}, depth_range_unrestricted={depth_range_unrestricted}, graphics queue family {queue_family_index})"
         );
 
         Ok(Self {
@@ -165,6 +170,7 @@ impl VulkanDevice {
             memory_properties,
             debug,
             device_name,
+            depth_range_unrestricted,
             validation_enabled,
         })
     }
@@ -172,6 +178,14 @@ impl VulkanDevice {
     /// Name of the selected physical device, e.g. `NVIDIA GeForce RTX 4070`.
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    /// Whether `VK_EXT_depth_range_unrestricted` is active. A PS5 title's
+    /// reverse-Z viewport (`zoffset + zscale < zoffset`, e.g. [1, 0]) is only
+    /// expressible when this is true; the depth path must name the failure
+    /// otherwise instead of silently clamping.
+    pub fn depth_range_unrestricted(&self) -> bool {
+        self.depth_range_unrestricted
     }
 
     /// Shared pipeline cache; pass to `create_graphics_pipelines` so repeated
@@ -332,11 +346,12 @@ impl VulkanDevice {
 
     /// Select a physical device and create the logical device on it.
     ///
-    /// Returns `(physical_device, device, graphics_queue_family, name)`.
+    /// Returns `(physical_device, device, graphics_queue_family, name,
+    /// depth_range_unrestricted)`.
     fn pick_and_create_device(
         _entry: &Entry,
         instance: &Instance,
-    ) -> Result<(vk::PhysicalDevice, Device, u32, String), GpuError> {
+    ) -> Result<(vk::PhysicalDevice, Device, u32, String, bool), GpuError> {
         // SAFETY: `instance` is live; enumeration only fills a Vec of handles.
         let devices = unsafe { instance.enumerate_physical_devices() }
             .map_err(|e| GpuError::VulkanInitFailed(format!("device enumeration failed: {e}")))?;
@@ -355,6 +370,24 @@ impl VulkanDevice {
         let (_, physical_device, queue_family_index, device_name) =
             best.ok_or(GpuError::NoSuitableDevice)?;
 
+        // Optional extension: PS5 titles use reverse-Z viewport depth ranges
+        // ([1, 0], or outside [0,1]), which core Vulkan forbids. Enable it when
+        // the driver offers it; the depth path checks `depth_range_unrestricted`
+        // and names the failure when a range cannot be honoured.
+        let depth_range_unrestricted =
+            unsafe { instance.enumerate_device_extension_properties(physical_device) }
+                .map(|exts| {
+                    exts.iter().any(|e| {
+                        e.extension_name_as_c_str() == Ok(c"VK_EXT_depth_range_unrestricted")
+                    })
+                })
+                .unwrap_or(false);
+        let extension_names: Vec<*const i8> = if depth_range_unrestricted {
+            vec![c"VK_EXT_depth_range_unrestricted".as_ptr()]
+        } else {
+            Vec::new()
+        };
+
         let priorities = [1.0f32];
         let queue_infos = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
@@ -367,6 +400,7 @@ impl VulkanDevice {
         let create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_features(&features)
+            .enabled_extension_names(&extension_names)
             .push_next(&mut features13);
 
         // SAFETY: `physical_device` came from this `instance`'s enumeration and
@@ -376,7 +410,13 @@ impl VulkanDevice {
         let device = unsafe { instance.create_device(physical_device, &create_info, None) }
             .map_err(|e| GpuError::VulkanInitFailed(format!("vkCreateDevice failed: {e}")))?;
 
-        Ok((physical_device, device, queue_family_index, device_name))
+        Ok((
+            physical_device,
+            device,
+            queue_family_index,
+            device_name,
+            depth_range_unrestricted,
+        ))
     }
 
     /// Score a physical device, or `None` if it cannot run our draw path.

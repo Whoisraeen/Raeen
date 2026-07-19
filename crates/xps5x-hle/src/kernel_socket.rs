@@ -353,10 +353,8 @@ fn hle_getsockname(ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_bzero(ctx: &HleContext, args: &[u64]) -> u64 {
     let dst = args.first().copied().unwrap_or(0);
     let len = args.get(1).copied().unwrap_or(0);
-    if len > 0 && dst != 0 {
-        if !crate::zero_guest_range(ctx.mem, dst, len) {
-            return MINUS_ONE;
-        }
+    if len > 0 && dst != 0 && !crate::zero_guest_range(ctx.mem, dst, len) {
+        return MINUS_ONE;
     }
     OK
 }

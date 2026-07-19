@@ -322,7 +322,7 @@ pub(crate) fn zero_guest_range(memory: &dyn GuestMemory, addr: u64, len: u64) ->
         return false;
     }
 
-    const ZEROES: [u8; 64 * 1024] = [0; 64 * 1024];
+    static ZEROES: [u8; 64 * 1024] = [0; 64 * 1024];
     let mut written = 0u64;
     while written < len {
         let chunk = (len - written).min(ZEROES.len() as u64) as usize;

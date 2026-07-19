@@ -1,5 +1,51 @@
 # XPS5X session progress ledger
 
+- ASTRO.BOT boot Slice 1 — process init runs exactly once (2026-07-18,
+  working tree; core 7/7, firmware 106/106 lib, runtime 43/43 execute +
+  full suite green; touched-crate clippy --no-deps clean; fmt clean; release
+  GUI build green; passed a 3-lens adversarial review workflow — 3 confirmed
+  findings, all fixed below, 0 runtime-correctness bugs):
+  * ROOT CAUSE (measured): retail crt0 `_start` walks the executable's own
+    init array itself; the loader ALSO called the main initializer, so
+    constructors ran twice — a list-adding ctor then built a cyclic list its
+    own walk hung on (t1 at `module+0x7426c00`). `XPS5X_SKIP_MAIN_INIT=1`
+    proved the cause; this slice makes the proven path the DEFAULT (no env
+    var).
+  * `ModuleInitRole::{Dependency, Main}` (firmware `linker.rs`) on
+    `ModuleInit`; `load_process` tags dependency initializers Dependency and
+    the appended executable DT_INIT Main.
+  * `EntryPolicy::{CrtOwnsMainInit, LoaderOwnsMainInit}` (runtime). Shared
+    `run_module_initializers` loop: `execute_process` uses CrtOwnsMainInit
+    (dependency initializers run, the main one is WITHHELD for crt0);
+    `execute_linked` uses LoaderOwnsMainInit (no crt0 -> loader runs every
+    initializer, main included; a safe no-op for today's empty-`module_inits`
+    callers). `sceKernelLoadStartModule`-owned PRX init unchanged.
+  * `XPS5X_SKIP_MAIN_INIT` demoted from mechanism to a one-shot deprecation
+    warning; default now takes the proven path.
+  * `DiagnosticKind::ModuleInit`: each initializer transition (run / deferred)
+    recorded with module name, role, ordinal, and the recorder's stable
+    sequence (guest_thread=1) when deterministic diagnostics are enabled.
+  * TDD: 4 new runtime tests (dep-runs-once + main-withheld; main-runs-once-
+    via-crt0; execute_linked loader-owns-main; diagnostic transition record).
+    RED-GREEN PROVEN: temporarily reverting the policy made the two process
+    tests fail with main=1 (was 0) and main=2 (was 1), and the diagnostic
+    test fail on the role detail; restoring it turned them green.
+  * Review fixes: (1) rewrote the now-stale firmware comment that still claimed
+    the loader owns the executable's DT_INIT; (2) extracted
+    `append_dependency_initializer` + a unit test pinning the Dependency role at
+    its single production site (the loop's role assignment was previously
+    asserted nowhere); (3) narrowed `EntryPolicy` to `pub(crate)` (it types no
+    public signature; `ModuleInitRole` stays pub — it types `ModuleInit.role`).
+  * Pre-existing, OUT OF SCOPE: `cargo clippy --workspace -- -D warnings` fails
+    on ~a dozen `collapsible_if` sites (nid.rs, dispatch.rs, native_trap.rs,
+    thread.rs, hle) — a clippy-1.97 toolchain bump on `if let { if }`, NOT this
+    change. Touched-crate `--no-deps` clippy is clean. Flagged as a separate
+    cleanup task.
+  * EXIT GATE STILL OPEN (needs the user's machine): a default release
+    `--run-eboot` of ASTRO.BOT must no longer visit the `0x7426c00` cycle and
+    must reach the next guest import (measured to be POSIX `clock_gettime`,
+    Slice 2). Unit-tested here; not yet re-measured against the title.
+
 - Architectural consolidation (2026-07-18, commit pending): XPS5X-owned
   time/wait/event/VFS/network/GPU-submission contracts are active on the HLE
   boot path; deterministic process diagnostics sequence HLE, wait/wake, event,

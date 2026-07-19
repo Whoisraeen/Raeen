@@ -194,6 +194,28 @@ pub const fn strip_fake(idx: u32) -> u32 {
 // has already subtracted the context base, so a handler does no base math.
 
 pub const DB_RENDER_CONTROL: u32 = 0x0;
+// ---- Depth/stencil surface registers (Pm4.h L123-248) ---------------------
+pub const DB_DEPTH_VIEW: u32 = 0x2;
+pub const DB_HTILE_DATA_BASE: u32 = 0x5;
+pub const DB_DEPTH_SIZE_XY: u32 = 0x7;
+pub const DB_DEPTH_BOUNDS_MIN: u32 = 0x8;
+pub const DB_DEPTH_BOUNDS_MAX: u32 = 0x9;
+pub const DB_STENCIL_CLEAR: u32 = 0xA;
+pub const DB_DEPTH_CLEAR: u32 = 0xB;
+pub const DB_DEPTH_INFO: u32 = 0xF;
+pub const DB_Z_INFO: u32 = 0x10;
+pub const DB_STENCIL_INFO: u32 = 0x11;
+pub const DB_Z_READ_BASE: u32 = 0x12;
+pub const DB_STENCIL_READ_BASE: u32 = 0x13;
+pub const DB_Z_WRITE_BASE: u32 = 0x14;
+pub const DB_STENCIL_WRITE_BASE: u32 = 0x15;
+pub const DB_DEPTH_SIZE: u32 = 0x16;
+pub const DB_DEPTH_SLICE: u32 = 0x17;
+pub const DB_Z_READ_BASE_HI: u32 = 0x1A;
+pub const DB_STENCIL_READ_BASE_HI: u32 = 0x1B;
+pub const DB_Z_WRITE_BASE_HI: u32 = 0x1C;
+pub const DB_STENCIL_WRITE_BASE_HI: u32 = 0x1D;
+pub const DB_HTILE_DATA_BASE_HI: u32 = 0x1E;
 pub const PA_SC_SCREEN_SCISSOR_TL: u32 = 0xC;
 pub const PA_SC_SCREEN_SCISSOR_BR: u32 = 0xD;
 pub const CB_TARGET_MASK: u32 = 0x8E;
@@ -206,6 +228,12 @@ pub const SPI_PS_IN_CONTROL: u32 = 0x1B6;
 /// Target output modes, 4 bits per MRT (`ShaderRegisters::target_output_mode`).
 pub const SPI_SHADER_COL_FORMAT: u32 = 0x1C5;
 pub const DB_SHADER_CONTROL: u32 = 0x203;
+/// Stencil op/mask registers (Pm4.h L314-346).
+pub const DB_STENCIL_CONTROL: u32 = 0x10B;
+pub const DB_STENCILREFMASK: u32 = 0x10C;
+pub const DB_STENCILREFMASK_BF: u32 = 0x10D;
+/// HTile surface control (Pm4.h L543) — tracked, not implemented.
+pub const DB_HTILE_SURFACE: u32 = 0x2AF;
 pub const PA_SC_GENERIC_SCISSOR_TL: u32 = 0x90;
 pub const PA_SC_GENERIC_SCISSOR_BR: u32 = 0x91;
 pub const PA_SC_VPORT_SCISSOR_0_TL: u32 = 0x94;
@@ -346,6 +374,116 @@ pub mod cb_color_attrib3 {
     field!(RESOURCE_TYPE, 24, 0x3);
     field!(CMASK_PIPE_ALIGNED, 26, 0x1);
     field!(DCC_PIPE_ALIGNED, 30, 0x1);
+}
+
+/// `DB_RENDER_CONTROL` fields (Pm4.h L105-119).
+pub mod db_render_control {
+    field!(DEPTH_CLEAR_ENABLE, 0, 0x1);
+    field!(STENCIL_CLEAR_ENABLE, 1, 0x1);
+    field!(RESUMMARIZE_ENABLE, 4, 0x1);
+    field!(STENCIL_COMPRESS_DISABLE, 5, 0x1);
+    field!(DEPTH_COMPRESS_DISABLE, 6, 0x1);
+    field!(COPY_CENTROID, 7, 0x1);
+    field!(COPY_SAMPLE, 8, 0xF);
+}
+
+/// `DB_DEPTH_VIEW` fields (Pm4.h L123-137).
+pub mod db_depth_view {
+    field!(SLICE_START, 0, 0x7FF);
+    field!(SLICE_START_HI, 11, 0x3);
+    field!(SLICE_MAX, 13, 0x7FF);
+    field!(Z_READ_ONLY, 24, 0x1);
+    field!(STENCIL_READ_ONLY, 25, 0x1);
+    field!(MIPID, 26, 0xF);
+    field!(SLICE_MAX_HI, 30, 0x3);
+}
+
+/// `DB_DEPTH_SIZE_XY` fields (Pm4.h L144-148) — the PS5 depth-surface extent.
+pub mod db_depth_size_xy {
+    field!(X_MAX, 0, 0x3FFF);
+    field!(Y_MAX, 16, 0x3FFF);
+}
+
+/// `DB_STENCIL_CLEAR` fields (Pm4.h L153-155).
+pub mod db_stencil_clear {
+    field!(CLEAR, 0, 0xFF);
+}
+
+/// `DB_DEPTH_INFO` fields (Pm4.h L175-189). Tiling metadata only.
+pub mod db_depth_info {
+    field!(ADDR5_SWIZZLE_MASK, 0, 0xF);
+    field!(ARRAY_MODE, 4, 0xF);
+    field!(PIPE_CONFIG, 8, 0x1F);
+    field!(BANK_WIDTH, 13, 0x3);
+    field!(BANK_HEIGHT, 15, 0x3);
+    field!(MACRO_TILE_ASPECT, 17, 0x3);
+    field!(NUM_BANKS, 19, 0x3);
+}
+
+/// `DB_Z_INFO` fields (Pm4.h L191-211).
+pub mod db_z_info {
+    field!(FORMAT, 0, 0x3);
+    field!(NUM_SAMPLES, 2, 0x3);
+    field!(ITERATE_FLUSH, 11, 0x1);
+    field!(PARTIALLY_RESIDENT, 12, 0x1);
+    field!(MAXMIP, 16, 0xF);
+    field!(TILE_MODE_INDEX, 20, 0x7);
+    field!(DECOMPRESS_ON_N_ZPLANES, 23, 0xF);
+    field!(ALLOW_EXPCLEAR, 27, 0x1);
+    field!(TILE_SURFACE_ENABLE, 29, 0x1);
+    field!(ZRANGE_PRECISION, 31, 0x1);
+}
+
+/// `DB_STENCIL_INFO` fields (Pm4.h L213-227).
+pub mod db_stencil_info {
+    field!(FORMAT, 0, 0x1);
+    field!(ITERATE_FLUSH, 11, 0x1);
+    field!(PARTIALLY_RESIDENT, 12, 0x1);
+    field!(RESERVED_FIELD_1, 13, 0x7);
+    field!(TILE_MODE_INDEX, 20, 0x7);
+    field!(ALLOW_EXPCLEAR, 27, 0x1);
+    field!(TILE_STENCIL_DISABLE, 29, 0x1);
+}
+
+/// `DB_DEPTH_SIZE` fields (Pm4.h L234-238).
+pub mod db_depth_size {
+    field!(PITCH_TILE_MAX, 0, 0x7FF);
+    field!(HEIGHT_TILE_MAX, 11, 0x7FF);
+}
+
+/// `DB_DEPTH_SLICE` fields (Pm4.h L240-242).
+pub mod db_depth_slice {
+    field!(SLICE_TILE_MAX, 0, 0x3F_FFFF);
+}
+
+/// `DB_STENCIL_CONTROL` fields (Pm4.h L314-326) — the six stencil ops.
+pub mod db_stencil_control {
+    field!(STENCILFAIL, 0, 0xF);
+    field!(STENCILZPASS, 4, 0xF);
+    field!(STENCILZFAIL, 8, 0xF);
+    field!(STENCILFAIL_BF, 12, 0xF);
+    field!(STENCILZPASS_BF, 16, 0xF);
+    field!(STENCILZFAIL_BF, 20, 0xF);
+}
+
+/// `DB_STENCILREFMASK` / `DB_STENCILREFMASK_BF` fields (Pm4.h L328-346). The
+/// `_BF` register uses the same layout with `_BF` suffixes in Kyty.
+pub mod db_stencilrefmask {
+    field!(STENCILTESTVAL, 0, 0xFF);
+    field!(STENCILMASK, 8, 0xFF);
+    field!(STENCILWRITEMASK, 16, 0xFF);
+    field!(STENCILOPVAL, 24, 0xFF);
+}
+
+/// `DB_HTILE_SURFACE` fields (Pm4.h L543-557). Tracked, not implemented.
+pub mod db_htile_surface {
+    field!(LINEAR, 0, 0x1);
+    field!(FULL_CACHE, 1, 0x1);
+    field!(HTILE_USES_PRELOAD_WIN, 2, 0x1);
+    field!(PRELOAD, 3, 0x1);
+    field!(PREFETCH_WIDTH, 4, 0x3F);
+    field!(PREFETCH_HEIGHT, 10, 0x3F);
+    field!(DST_OUTSIDE_ZERO_TO_ONE, 16, 0x1);
 }
 
 /// `SPI_SHADER_PGM_RSRC2_*` fields shared by PS/GS (Pm4.h L760-771 / 854-866):

@@ -149,6 +149,28 @@ fn append_main_initializer(
     });
 }
 
+/// Schedule a file-backed dependency's `module_start` (DT_INIT) at
+/// `image_offset` into the composed process image.
+///
+/// Tagged [`Dependency`](dynlib::linker::ModuleInitRole::Dependency): a
+/// dependency has no crt0 that re-runs it, so the runtime runs it under **every**
+/// entry policy. Mislabeling it `Main` would make a process entry
+/// (`CrtOwnsMainInit`) silently withhold it and never run the dependency's
+/// constructors — the exact init-ordering regression this role distinction
+/// exists to prevent. Symmetric with [`append_main_initializer`]; the unit test
+/// pins the role at this single production site.
+fn append_dependency_initializer(
+    inits: &mut Vec<dynlib::linker::ModuleInit>,
+    name: &str,
+    image_offset: u64,
+) {
+    inits.push(dynlib::linker::ModuleInit {
+        name: name.to_string(),
+        image_offset,
+        role: dynlib::linker::ModuleInitRole::Dependency,
+    });
+}
+
 /// Round `v` up to the next 16 KiB boundary — dependencies are placed on a
 /// generous alignment so no module's image can bleed into the next.
 fn align_up_16k(v: u64) -> u64 {
@@ -163,6 +185,20 @@ fn align_up_16k(v: u64) -> u64 {
 /// Missing it is expensive: on the measured retail title `sce_module/libc.prx`
 /// alone exports 99.4% of the eboot's import relocations.
 const DEPENDENCY_SUBDIRS: &[&str] = &["sce_module"];
+
+/// Bounds on the transitive `DT_NEEDED` walk (see [`load_process`]).
+///
+/// The walk is a fixpoint over a visit-set, so cycles and diamonds terminate
+/// on their own; these bounds are the safety net for a pathological or
+/// hostile module graph (a NEEDED chain that names a fresh module forever),
+/// not something a real title should ever touch — the measured retail eboot
+/// names 50 direct modules. A module that would cross either bound is cut,
+/// LOUDLY, one warning per module, and its imports stay unresolved — exactly
+/// like a missing file. The total bound only gates *transitively discovered*
+/// modules: direct NEEDEDs and scanned plugins are all queued before the
+/// walk starts and can never be cut by it.
+const MAX_DEPENDENCY_DEPTH: usize = 8;
+const MAX_LOADED_MODULES: usize = 64;
 
 /// A module decoded far enough to link: SELF -> ELF -> `.sprx` -> dynlib data.
 struct DecodedModule {
@@ -181,6 +217,26 @@ struct PendingDep {
     /// Absolute guest base (`process base + offset`).
     base: u64,
     decoded: DecodedModule,
+}
+
+/// One `.prx` the process loader has been asked to file-load: a main-module
+/// `DT_NEEDED`, a root-level plugin from the directory scan, or — discovered
+/// while loading — another dependency's own `DT_NEEDED` (transitive).
+struct ModuleRequest {
+    /// The `DT_NEEDED` / file name, e.g. `libfmod.prx`.
+    name: String,
+    /// Initialize before `_start` (a hard dependency) vs merely pre-place for
+    /// a runtime LoadStartModule (an optional plugin). A transitive request
+    /// inherits its requirer's: a hard dependency's own NEEDEDs are equally
+    /// hard requirements of the process, and a plugin's stay lazy with it.
+    eager_init: bool,
+    /// `DT_NEEDED` hops from the main module (direct dependencies are 1),
+    /// bounded by [`MAX_DEPENDENCY_DEPTH`].
+    depth: usize,
+    /// Who named this module. The missing-file warning must say whose imports
+    /// stay unresolved, and for a transitive miss that is the dependency that
+    /// required it, not the eboot.
+    required_by: String,
 }
 
 /// A per-process stack-protector canary: derived from
@@ -326,6 +382,94 @@ fn find_dependency_file(dir: &std::path::Path, needed: &str) -> Option<std::path
     None
 }
 
+// ---------------------------------------------------------------------------
+// Loader symbol-override policies
+//
+// `ModuleRegistry::force_hle_nid` intercepts ONE symbol of an otherwise-LLE
+// module. Two policies use it, with opposite gating, and both live here
+// rather than inline in the load loop so the loop reads as policy names:
+//
+// * the mspace family below is forced HLE **by default** — it encodes a
+//   measured, current limitation of the LLE path, not a preference;
+// * [`apply_diagnostic_overrides`] is pure diagnostic tooling — every trap
+//   there is env-gated and OFF by default.
+// ---------------------------------------------------------------------------
+
+/// NID of `__cxa_throw` as the measured title's shipped `libc.prx` exports it
+/// (matches `nid_of("__cxa_throw")`).
+const CXA_THROW_NID: u64 = 0xbe4b_ae2d_f867_4992;
+
+/// The `sceLibcMspace*` allocator family, forced HLE by
+/// [`force_hle_mspace_family`]. NIDs measured from the measured title's own
+/// shipped `libc.prx` exports (each matches `nid_of` of its comment name).
+const MSPACE_FORCE_HLE_NIDS: &[u64] = &[
+    0xfe19_f5b5_c547_ab94, // sceLibcMspaceCreate
+    0x5ba4_a255_2882_0ed2, // sceLibcMspaceDestroy
+    0x3898_e6fd_0388_1e52, // sceLibcMspaceMalloc
+    0x5656_bf67_e797_971a, // sceLibcMspaceFree
+    0x2d8a_371a_1225_077f, // sceLibcMspaceCalloc
+    0x885d_6240_7cf1_0495, // sceLibcMspaceMemalign
+    0xa961_1297_25cc_2371, // sceLibcMspacePosixMemalign
+    0x8228_2854_766f_54f1, // sceLibcMspaceRealloc
+    0x9639_2a31_c0b8_fe69, // sceLibcMspaceAlignedAlloc
+    0xa7a9_6b45_6f3f_30b6, // sceLibcMspaceReallocalign
+    0x99f1_dd25_322f_86ea, // sceLibcMspaceMallocStats
+    0x934e_232d_7bb7_f887, // sceLibcMspaceMallocStatsFast
+    0x7c4a_16e8_126c_3ede, // sceLibcMspaceMallocUsableSize
+    0xa735_1aec_a128_c9dc, // sceLibcMspaceIsHeapEmpty
+];
+
+/// Whether the mspace force-HLE policy is active, given the raw value of
+/// `XPS5X_FORCE_HLE_MSPACE` (`None` = unset).
+///
+/// **Default-on, opt-out.** The policy encodes a real, current limitation of
+/// the LLE path: a shipped libc's NATIVE `sceLibcMspaceCreate` hands back a
+/// NULL mspace against our arenas and its native `sceLibcMspaceFree` then
+/// faults dereferencing it (`test byte [rbx+0x370], 2` with rbx=0 — measured
+/// on ASTRO.BOT's own `libc.prx`, whose boot depends on this). Routing the
+/// family to the self-consistent HLE (Create returns a handle Malloc/Free
+/// accept, and `hle_mspace_create` NAMES the args native create rejected)
+/// avoids the null-deref entirely.
+///
+/// The variable used to be an opt-IN gate for this workaround; graduating the
+/// policy to the default inverts the gate's meaning. Set
+/// `XPS5X_FORCE_HLE_MSPACE=0` to DISABLE the policy and leave a shipped
+/// libc's mspace functions LLE — only useful when debugging the LLE arena
+/// path itself. Unset, `=1`, or any other value keeps the policy (so old
+/// invocations that exported `=1` behave exactly as before).
+///
+/// Pure — the env value arrives as an argument — so the decision is testable
+/// without mutating process-global state.
+fn mspace_force_hle_enabled(env_value: Option<&str>) -> bool {
+    !matches!(env_value, Some("0"))
+}
+
+/// Force every [`MSPACE_FORCE_HLE_NIDS`] symbol of `module` to resolve HLE,
+/// even with a shipped module registered `PreferLle`. Applied per loaded
+/// module: a module that exports no mspace symbol simply never matches a key,
+/// so this is a no-op for it. Separated from the env read so the policy
+/// itself is unit-testable.
+fn force_hle_mspace_family(registry: &mut registry::ModuleRegistry, module: &str) {
+    tracing::debug!("mspace force-HLE policy (default-on) applied to {module}");
+    for &nid in MSPACE_FORCE_HLE_NIDS {
+        registry.force_hle_nid(module, nid);
+    }
+}
+
+/// Diagnostic symbol overrides — **every one env-gated and off by default**,
+/// pure troubleshooting tooling with no place in the normal load path:
+///
+/// * `XPS5X_TRAP_CXA_THROW` — force-route `__cxa_throw` ([`CXA_THROW_NID`])
+///   to the HLE trap so the C++ exception a title's worker threads throw gets
+///   NAMED before they die (the exception is uncaught anyway). Everything
+///   else in the shipped libc still runs its real code.
+fn apply_diagnostic_overrides(registry: &mut registry::ModuleRegistry, module: &str) {
+    if std::env::var_os("XPS5X_TRAP_CXA_THROW").is_some() {
+        tracing::info!("diagnostic override: trapping __cxa_throw in {module}");
+        registry.force_hle_nid(module, CXA_THROW_NID);
+    }
+}
+
 /// Load a title as a **process**: the main module plus every `DT_NEEDED`
 /// dependency that exists as a real file next to it (M1-D, wall #4).
 ///
@@ -377,6 +521,34 @@ fn find_dependency_file(dir: &std::path::Path, needed: &str) -> Option<std::path
 /// HLE implementation is preferred and is what `libc`/`libkernel`/`libSce*`
 /// resolve through); one that is neither HLE-covered nor present as a file is
 /// logged loudly and left unresolved, never silently dropped.
+///
+/// # Transitive closure
+///
+/// A direct dependency can import from a module only *it* names: `depA`'s own
+/// `DT_NEEDED` list. Loading only the eboot's direct NEEDEDs leaves those
+/// imports unresolved no matter how well pass 2 works — the exporting module
+/// was never read. So loading is a breadth-first walk over a request queue:
+/// each file-loaded dependency contributes its own `needed_modules` as new
+/// requests, discovered from the same search dirs, until the closure is
+/// reached. The two-pass architecture is unaffected — pass 1 (this walk)
+/// registers every export, pass 2 links.
+///
+/// A visit-set keyed by canonical module name (the same identity the
+/// registry resolves providers by) makes the walk a fixpoint: a diamond (`A`
+/// and `B` both need `C`) loads `C` once, a cycle (`A` needs `A`) terminates.
+/// The set is seeded with the direct NEEDEDs and the scanned root-level
+/// plugins, so a plugin a dependency also names keeps its existing
+/// pre-placed-not-initialized treatment rather than being reclassified as an
+/// eager dependency. The walk is bounded ([`MAX_DEPENDENCY_DEPTH`] hops,
+/// [`MAX_LOADED_MODULES`] modules) with a loud warning per cut module, and a
+/// missing transitive file degrades exactly like a missing direct one: warn,
+/// name the requiring dependency, leave those imports unresolved.
+///
+/// Transitive dependencies initialize in discovery (BFS) order, after their
+/// requirers — the same non-topological order direct dependencies already
+/// initialized in (DT_NEEDED order). If a title is measured to need strict
+/// reverse-topological `module_start` ordering, that is a separate change to
+/// the `module_inits` schedule, not to this walk.
 pub fn load_process(
     bytes: &[u8],
     dir: &std::path::Path,
@@ -420,12 +592,31 @@ pub fn load_process(
     // the MAIN module's #k at runtime: wrong function, no diagnostic.
     let mut tables = dynlib::linker::ProcessTables::new();
 
-    let mut module_requests: Vec<(String, bool)> = dynlib_data
-        .needed_modules
-        .iter()
-        .cloned()
-        .map(|name| (name, true))
-        .collect();
+    // The dependency walk's request queue and visit-set. The set is keyed by
+    // canonical module name — exactly the identity the registry resolves
+    // providers by — and is what makes the transitive walk a fixpoint: a
+    // diamond (`A` and `B` both need `C`) loads `C` once, a cycle (`A` needs
+    // `A`) terminates. It is seeded with every direct NEEDED and scanned
+    // plugin, so a module can never be queued twice regardless of how many
+    // modules name it. (This also dedupes a name repeated in the eboot's own
+    // NEEDED list, which the old linear pass would have loaded twice.)
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue: std::collections::VecDeque<ModuleRequest> = std::collections::VecDeque::new();
+    let main_display_name = if module.name.is_empty() {
+        "main module".to_string()
+    } else {
+        module.name.clone()
+    };
+    for name in &dynlib_data.needed_modules {
+        if visited.insert(registry::canonical_module_name(name)) {
+            queue.push_back(ModuleRequest {
+                name: name.clone(),
+                eager_init: true,
+                depth: 1,
+                required_by: main_display_name.clone(),
+            });
+        }
+    }
     // App-owned PRX plugins may be loaded later through
     // `sceKernelLoadStartModule`/`Dlsym` and therefore do not appear in the
     // eboot's DT_NEEDED list. Place every root-level PRX in the process image
@@ -443,12 +634,14 @@ pub fn load_process(
             .collect();
         optional.sort_by_key(|name| name.to_ascii_lowercase());
         for name in optional {
-            if !module_requests
-                .iter()
-                .any(|(loaded, _)| loaded.eq_ignore_ascii_case(&name))
-            {
+            if visited.insert(registry::canonical_module_name(&name)) {
                 tracing::info!("optional app PRX {name}: preplacing for runtime LoadStartModule");
-                module_requests.push((name, false));
+                queue.push_back(ModuleRequest {
+                    name,
+                    eager_init: false,
+                    depth: 1,
+                    required_by: "root-level plugin scan".to_string(),
+                });
             }
         }
     }
@@ -462,15 +655,21 @@ pub fn load_process(
         dep_images.push((hle_data_offset, hle_data));
     }
 
-    for (needed, eager_init) in &module_requests {
+    // PASS 1 continues as a breadth-first walk: loading one dependency can
+    // discover NEW requests (its own DT_NEEDED list — see "Transitive
+    // closure" above), queued behind everything already pending. Exports are
+    // still all registered here, before ANY module links in pass 2 below.
+    while let Some(request) = queue.pop_front() {
+        let needed = request.name.as_str();
         let stem = needed.trim_end_matches(".sprx").trim_end_matches(".prx");
         let Some(path) = find_dependency_file(dir, needed) else {
             if hle_libs.contains(stem) {
                 tracing::info!("NEEDED {needed}: no file shipped; covered by HLE library '{stem}'");
             } else {
                 tracing::warn!(
-                    "NEEDED {needed}: no HLE library named '{stem}' and no file in {} or its \
-                     sce_module/ — its imports will not resolve",
+                    "NEEDED {needed} (required by {}): no HLE library named '{stem}' and no file \
+                     in {} or its sce_module/ — its imports will not resolve",
+                    request.required_by,
                     dir.display()
                 );
             }
@@ -521,49 +720,56 @@ pub fn load_process(
         let dep_base = base.wrapping_add(next_offset);
         let image_len = dynlib::linker::image_size(&dep.module)? as u64;
         registry.set_policy(needed, registry::ModulePolicy::PreferLle);
-        // Diagnostic: force-route __cxa_throw to the HLE trap so the C++
-        // exception a title's worker threads throw gets NAMED before they die
-        // (the exception is uncaught anyway). Everything else in libc still
-        // uses its real code.
-        if std::env::var_os("XPS5X_TRAP_CXA_THROW").is_some() {
-            registry.force_hle_nid(needed, 0xbe4b_ae2d_f867_4992);
+        // Symbol-level overrides for the shipped module (see the "loader
+        // symbol-override policies" section above `load_process`): the mspace
+        // family is forced HLE by default — the LLE mspace path does not work
+        // with our arenas yet — and any env-gated diagnostics apply on top.
+        if mspace_force_hle_enabled(std::env::var("XPS5X_FORCE_HLE_MSPACE").ok().as_deref()) {
+            force_hle_mspace_family(registry, needed);
         }
-        // ASTRO.BOT's NATIVE libc.prx sceLibcMspaceCreate hands back a NULL
-        // mspace and its native sceLibcMspaceFree then faults dereferencing it
-        // (`test byte [rbx+0x370], 2` with rbx=0). Route the whole mspace
-        // allocator family to our self-consistent HLE (Create returns a handle
-        // that Malloc/Free accept) so the null-deref cannot happen, and so
-        // `hle_mspace_create` NAMES the args native create rejected. NIDs measured
-        // from the title's own libc.prx exports.
-        if std::env::var_os("XPS5X_FORCE_HLE_MSPACE").is_some() {
-            for nid in [
-                0xfe19_f5b5_c547_ab94u64, // sceLibcMspaceCreate
-                0x5ba4_a255_2882_0ed2,    // sceLibcMspaceDestroy
-                0x3898_e6fd_0388_1e52,    // sceLibcMspaceMalloc
-                0x5656_bf67_e797_971a,    // sceLibcMspaceFree
-                0x2d8a_371a_1225_077f,    // sceLibcMspaceCalloc
-                0x885d_6240_7cf1_0495,    // sceLibcMspaceMemalign
-                0xa961_1297_25cc_2371,    // sceLibcMspacePosixMemalign
-                0x8228_2854_766f_54f1,    // sceLibcMspaceRealloc
-                0x9639_2a31_c0b8_fe69,    // sceLibcMspaceAlignedAlloc
-                0xa7a9_6b45_6f3f_30b6,    // sceLibcMspaceReallocalign
-                0x99f1_dd25_322f_86ea,    // sceLibcMspaceMallocStats
-                0x934e_232d_7bb7_f887,    // sceLibcMspaceMallocStatsFast
-                0x7c4a_16e8_126c_3ede,    // sceLibcMspaceMallocUsableSize
-                0xa735_1aec_a128_c9dc,    // sceLibcMspaceIsHeapEmpty
-            ] {
-                registry.force_hle_nid(needed, nid);
-            }
-        }
+        apply_diagnostic_overrides(registry, needed);
         registry.register_module_exports_at(needed, &dep.dynlib.exports, dep_base);
         tracing::info!(
             "NEEDED {needed}: at +{next_offset:#x} ({image_len:#x} bytes), {} export(s) registered",
             dep.dynlib.exports.len()
         );
 
+        // Transitive closure: this dependency's own DT_NEEDED list may name
+        // modules nothing else asked for. Queue each newly discovered one —
+        // the visit-set seeded above makes cycles and diamonds load once, and
+        // the bounds keep a pathological graph from composing forever. A
+        // dependency's NEEDEDs inherit its `eager_init`: a hard dependency's
+        // own requirements are equally hard, a pre-placed plugin's stay lazy.
+        for transitive in &dep.dynlib.needed_modules {
+            if !visited.insert(registry::canonical_module_name(transitive)) {
+                continue;
+            }
+            if request.depth >= MAX_DEPENDENCY_DEPTH {
+                tracing::warn!(
+                    "transitive NEEDED {transitive} (required by {needed}): cut by the dependency \
+                     depth bound ({MAX_DEPENDENCY_DEPTH}) — its imports will not resolve"
+                );
+                continue;
+            }
+            if pending.len() + queue.len() >= MAX_LOADED_MODULES {
+                tracing::warn!(
+                    "transitive NEEDED {transitive} (required by {needed}): cut by the process \
+                     module bound ({MAX_LOADED_MODULES}) — its imports will not resolve"
+                );
+                continue;
+            }
+            tracing::info!("transitive NEEDED {transitive}: required by {needed}");
+            queue.push_back(ModuleRequest {
+                name: transitive.clone(),
+                eager_init: request.eager_init,
+                depth: request.depth + 1,
+                required_by: request.name.clone(),
+            });
+        }
+
         pending.push(PendingDep {
-            name: needed.clone(),
-            eager_init: *eager_init,
+            name: request.name.clone(),
+            eager_init: request.eager_init,
             offset: next_offset,
             base: dep_base,
             decoded: dep,
@@ -712,17 +918,21 @@ pub fn load_process(
             "{}: module_start (DT_INIT) at +{image_offset:#x} (module vaddr {init_vaddr:#x})",
             p.name
         );
-        linked.module_inits.push(dynlib::linker::ModuleInit {
-            name: p.name.clone(),
-            image_offset,
-            role: dynlib::linker::ModuleInitRole::Dependency,
-        });
+        append_dependency_initializer(&mut linked.module_inits, &p.name, image_offset);
     }
 
-    // The dynamic loader owns the executable's DT_INIT too. `_start` is
-    // entered only after dependencies and the main ELF have run their static
-    // constructors; relying on the executable entry to invoke its own init
-    // function leaves C++ service registries zeroed in real titles.
+    // Schedule the executable's own DT_INIT too, but tag it `Main`: the runtime
+    // decides WHO calls it by entry policy (see `xps5x_runtime::EntryPolicy`).
+    // A real process entry (`execute_process`) enters a genuine crt0 `_start`,
+    // which walks the executable's own init array itself — so the runtime
+    // WITHHOLDS this Main initializer and lets crt0 run it exactly once. Running
+    // it here too double-constructs the title's globals (measured on ASTRO.BOT:
+    // a list-adding ctor built a cyclic list `_start`'s later walk hung on at
+    // `module+0x7426c00`). A crt0-less direct execution (`execute_linked`) runs
+    // it, because nothing else would. This bet assumes retail crt0 runs the
+    // init array (the SDK's does); a hypothetical `_start` that does not would
+    // leave main-module globals uninitialized — revisit per-title if one is
+    // measured that behaves that way.
     append_main_initializer(&mut linked.module_inits, &module.name, dynlib_data.init);
 
     // Count honestly: `linked.unresolved` is the MAIN module's relocations
@@ -847,5 +1057,79 @@ mod tests {
 
         super::append_main_initializer(&mut inits, "game", None);
         assert_eq!(inits.len(), 2, "an ELF without DT_INIT adds no call");
+    }
+
+    #[test]
+    fn dependency_initializer_is_tagged_dependency_role() {
+        use crate::dynlib::linker::ModuleInitRole;
+
+        // Pins the single production role assignment `load_process`'s dependency
+        // loop uses (via `append_dependency_initializer`). A regression to `Main`
+        // here would make a process entry silently withhold the dependency's
+        // constructors under `CrtOwnsMainInit` — with no other test catching it.
+        let mut inits = Vec::new();
+        super::append_dependency_initializer(&mut inits, "libfoo.prx", 0x1234);
+
+        assert_eq!(inits.len(), 1);
+        assert_eq!(inits[0].name, "libfoo.prx");
+        assert_eq!(inits[0].image_offset, 0x1234);
+        assert_eq!(
+            inits[0].role,
+            ModuleInitRole::Dependency,
+            "dependency initializers must be tagged Dependency so the runtime runs them \
+             under every entry policy (a mislabel to Main would withhold them from a crt0 entry)"
+        );
+    }
+
+    #[test]
+    fn mspace_family_is_forced_hle_by_default_and_opt_out_restores_lle() {
+        use crate::dynlib::SymbolExport;
+        use crate::registry::ModulePolicy;
+
+        let hle = xps5x_hle::HleRegistry::new();
+        let mut registry = ModuleRegistry::new(NidDatabase::from_hle(&hle));
+
+        // One of the 14 policy NIDs. Pin that the measured literal matches
+        // the name hash, so the policy list can never drift from the symbols
+        // it claims to intercept, and that the HLE side it routes to exists.
+        let nid = nid_of("sceLibcMspaceCreate");
+        assert_eq!(nid, 0xfe19_f5b5_c547_ab94);
+        assert!(super::MSPACE_FORCE_HLE_NIDS.contains(&nid));
+        // Same pin for the diagnostic trap's NID, so it can't drift either.
+        assert_eq!(nid_of("__cxa_throw"), super::CXA_THROW_NID);
+
+        // A title ships its own libc.prx (an LLE export for the same NID) and
+        // `load_process` marks the shipped module PreferLle.
+        registry.register_module_exports("libc.prx", &[SymbolExport { nid, value: 0x1234 }]);
+        registry.set_policy("libc.prx", ModulePolicy::PreferLle);
+        let resolve = |registry: &ModuleRegistry| {
+            registry.resolve_import(&hle, "libc.prx", "libSceLibcInternal", nid)
+        };
+
+        // The gate: default-ON, `=0` opts out for LLE-path debugging, every
+        // other value (including the old opt-in `=1`) keeps the policy.
+        assert!(super::mspace_force_hle_enabled(None), "default-on");
+        assert!(
+            !super::mspace_force_hle_enabled(Some("0")),
+            "XPS5X_FORCE_HLE_MSPACE=0 disables the policy"
+        );
+        assert!(super::mspace_force_hle_enabled(Some("1")));
+
+        // Opted out (policy never applied): the PreferLle module's own export
+        // wins — this is the raw LLE behavior the opt-out restores.
+        assert_eq!(resolve(&registry), Resolver::Lle { addr: 0x1234 });
+
+        // Default policy applied: the NID resolves HLE even though a shipped
+        // module exports it and the module is PreferLle.
+        super::force_hle_mspace_family(&mut registry, "libc.prx");
+        match resolve(&registry) {
+            Resolver::Hle { library, function } => {
+                assert_eq!(library, "libSceLibcInternal");
+                assert_eq!(function, "sceLibcMspaceCreate");
+            }
+            other => {
+                panic!("expected Resolver::Hle under the default-on mspace policy, got {other:?}")
+            }
+        }
     }
 }

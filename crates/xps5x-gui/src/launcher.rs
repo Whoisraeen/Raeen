@@ -225,6 +225,19 @@ enum SessionOutcome {
     Faulted(String),
 }
 
+/// Shared control cell for a running guest process: the worker publishes a
+/// **weak** process handle here the moment execution starts (so `quit` can
+/// request termination). Weak by design — a strong handle would pin the guest
+/// arena's fixed-base mapping past teardown, and only one such mapping can
+/// exist per host process, so the next launch's reservation would race this
+/// cell's release (`MapFailed`). Once the run ends, `upgrade` simply fails.
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct ProcessControl {
+    handle: Option<std::sync::Weak<xps5x_runtime::GuestProcess>>,
+    quit_requested: bool,
+}
+
 struct FirmwareSession {
     /// `None` until the session thread reports — a real title runs for as long
     /// as the player plays, so the outcome does not exist yet.
@@ -233,9 +246,7 @@ struct FirmwareSession {
     result: Option<std::sync::mpsc::Receiver<SessionOutcome>>,
     worker: Option<std::thread::JoinHandle<()>>,
     #[cfg(target_os = "windows")]
-    process_start: Option<std::sync::mpsc::Receiver<xps5x_runtime::GuestProcessHandle>>,
-    #[cfg(target_os = "windows")]
-    process: Option<xps5x_runtime::GuestProcessHandle>,
+    process: std::sync::Arc<std::sync::Mutex<ProcessControl>>,
     /// Process-scoped kernel state retained for diagnostics after the guest
     /// exits. It is never shared with another launched title.
     kernel: Option<std::sync::Arc<xps5x_kernel::OrbisKernel>>,
@@ -246,24 +257,6 @@ impl FirmwareSession {
     /// Take the outcome if the session thread has finished. Non-blocking: the
     /// UI polls this every frame.
     fn poll(&mut self) {
-        #[cfg(target_os = "windows")]
-        if self.process.is_none()
-            && let Some(rx) = &self.process_start
-        {
-            match rx.try_recv() {
-                Ok(process) => {
-                    if self.quit_requested {
-                        process.request_termination(0);
-                    }
-                    self.process = Some(process);
-                    self.process_start = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.process_start = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
-        }
         if self.outcome.is_some() {
             return;
         }
@@ -338,9 +331,7 @@ impl FirmwareLauncher {
         kernel: &std::sync::Arc<xps5x_kernel::OrbisKernel>,
         registry: &mut xps5x_firmware::ModuleRegistry,
         path: &Path,
-        #[cfg(target_os = "windows")] process_started: std::sync::mpsc::Sender<
-            xps5x_runtime::GuestProcessHandle,
-        >,
+        #[cfg(target_os = "windows")] process: std::sync::Arc<std::sync::Mutex<ProcessControl>>,
     ) -> SessionOutcome {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
@@ -437,8 +428,15 @@ impl FirmwareLauncher {
                 std::sync::Arc::clone(kernel),
                 &[GUEST_ARGV0],
                 &[],
-                move |process| {
-                    let _ = process_started.send(process);
+                {
+                    let process = std::sync::Arc::clone(&process);
+                    move |handle| {
+                        let mut control = process.lock().unwrap();
+                        if control.quit_requested {
+                            handle.request_termination(0);
+                        }
+                        control.handle = Some(handle.downgrade());
+                    }
                 },
             ) {
                 Ok(xps5x_runtime::RunOutcome::Exited(code)) => SessionOutcome::Exited {
@@ -508,7 +506,9 @@ impl GameLauncher for FirmwareLauncher {
             LaunchTarget::Game { path } => {
                 let (tx, rx) = std::sync::mpsc::channel();
                 #[cfg(target_os = "windows")]
-                let (process_tx, process_rx) = std::sync::mpsc::channel();
+                let process = std::sync::Arc::new(std::sync::Mutex::new(ProcessControl::default()));
+                #[cfg(target_os = "windows")]
+                let worker_process = std::sync::Arc::clone(&process);
                 let hle = std::sync::Arc::clone(&self.hle);
                 let kernel = std::sync::Arc::new(xps5x_kernel::OrbisKernel::new());
                 let session_kernel = std::sync::Arc::clone(&kernel);
@@ -526,7 +526,7 @@ impl GameLauncher for FirmwareLauncher {
                             &mut registry,
                             &path,
                             #[cfg(target_os = "windows")]
-                            process_tx,
+                            worker_process,
                         ));
                     })
                     .map_err(|e| LaunchError::Failed(format!("cannot start session: {e}")))?;
@@ -535,9 +535,7 @@ impl GameLauncher for FirmwareLauncher {
                     result: Some(rx),
                     worker: Some(worker),
                     #[cfg(target_os = "windows")]
-                    process_start: Some(process_rx),
-                    #[cfg(target_os = "windows")]
-                    process: None,
+                    process,
                     kernel: Some(session_kernel),
                     quit_requested: false,
                 }
@@ -551,9 +549,7 @@ impl GameLauncher for FirmwareLauncher {
                 result: None,
                 worker: None,
                 #[cfg(target_os = "windows")]
-                process_start: None,
-                #[cfg(target_os = "windows")]
-                process: None,
+                process: std::sync::Arc::new(std::sync::Mutex::new(ProcessControl::default())),
                 kernel: None,
                 quit_requested: false,
             },
@@ -653,8 +649,14 @@ impl GameLauncher for FirmwareLauncher {
                 session.poll();
                 session.quit_requested = true;
                 #[cfg(target_os = "windows")]
-                if let Some(process) = &session.process {
-                    process.request_termination(0);
+                {
+                    let mut control = session.process.lock().unwrap();
+                    control.quit_requested = true;
+                    if let Some(process) =
+                        control.handle.as_ref().and_then(std::sync::Weak::upgrade)
+                    {
+                        process.request_termination(0);
+                    }
                 }
                 Ok(())
             }
@@ -1324,7 +1326,12 @@ mod firmware_launcher_tests {
                 .launch(&LaunchTarget::Game { path })
                 .expect("launch always returns a handle");
 
-            assert_eq!(settled_state(&launcher, &handle), SessionState::Running);
+            assert_eq!(
+                settled_state(&launcher, &handle),
+                SessionState::Running,
+                "detail: {:?}",
+                launcher.session_detail(&handle)
+            );
             let detail = launcher
                 .session_detail(&handle)
                 .expect("a ran session has detail text");

@@ -5,8 +5,7 @@
 //! (namespace `HW`). This is a **partial** port: every struct carries its Kyty
 //! anchor and keeps the members that either `Shader.cpp` analysis reads or the
 //! PM4 command processor ([`crate::run`]) writes on the minimal draw path.
-//! Depth/stencil, DCC/CMASK/FMASK, and the Gen4 pitch/slice decode are not
-//! ported yet.
+//! DCC/CMASK/FMASK and the Gen4 pitch/slice decode are not ported yet.
 //!
 //! `HardwareContext.h` is generation-agnostic, so this lives at crate level
 //! rather than under `shader::` — both the recompiler and the command processor
@@ -312,7 +311,7 @@ impl Default for ScanModeControl {
     }
 }
 
-/// Kyty: `DepthControl` (L246). Phase 1 only reads "is depth off?".
+/// Kyty: `DepthControl` (L246) — `DB_DEPTH_CONTROL` decode.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct DepthControl {
     pub stencil_enable: bool,
@@ -325,6 +324,136 @@ pub struct DepthControl {
     pub stencilfunc_bf: u8,
     pub color_writes_on_depth_fail_enable: bool,
     pub color_writes_on_depth_pass_disable: bool,
+}
+
+/// Kyty: `DepthZInfo` (HardwareContext.h L154) — `DB_Z_INFO` decode.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DepthZInfo {
+    pub format: u32,
+    pub tile_mode_index: u32,
+    pub num_samples: u32,
+    pub zrange_precision: u32,
+    pub tile_surface_enable: bool,
+    pub expclear_enabled: bool,
+    pub embedded_sample_locations: bool,
+    pub partially_resident: bool,
+    pub num_mip_levels: u8,
+    pub plane_compression: u8,
+}
+
+/// Kyty: `DepthStencilInfo` (L168) — `DB_STENCIL_INFO` decode.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DepthStencilInfo {
+    pub format: u32,
+    pub tile_mode_index: u32,
+    pub tile_split: u32,
+    pub expclear_enabled: bool,
+    pub tile_stencil_disable: bool,
+    pub texture_compatible_stencil: bool,
+    pub partially_resident: bool,
+}
+
+/// Kyty: `DepthRenderTargetDepthInfo` (L179) — `DB_DEPTH_INFO` decode. Tiling
+/// metadata; the offscreen path never reads guest depth memory, so this is
+/// tracked for completeness only.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DepthRenderTargetDepthInfo {
+    pub addr5_swizzle_mask: u32,
+    pub array_mode: u32,
+    pub pipe_config: u32,
+    pub bank_width: u32,
+    pub bank_height: u32,
+    pub macro_tile_aspect: u32,
+    pub num_banks: u32,
+}
+
+/// Kyty: `DepthDepthView` (L190) — `DB_DEPTH_VIEW` decode.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DepthDepthView {
+    pub slice_start: u32,
+    pub slice_max: u32,
+    pub current_mip_level: u8,
+    pub depth_write_disable: bool,
+    pub stencil_write_disable: bool,
+}
+
+/// Kyty: `DepthDepthSizeXY` (L199) — `DB_DEPTH_SIZE_XY`, the PS5 depth-surface
+/// extent (stores max X/Y, i.e. width/height minus one, like `ColorAttrib2`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DepthDepthSizeXy {
+    pub x_max: u16,
+    pub y_max: u16,
+}
+
+/// Kyty: `DepthRenderTargetHTileSurface` (L205) — `DB_HTILE_SURFACE` decode.
+/// Tracked so the register write is not an "unknown" warn; HTile (depth
+/// compression) itself is not implemented.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DepthRenderTargetHTileSurface {
+    pub linear: u32,
+    pub full_cache: u32,
+    pub htile_uses_preload_win: u32,
+    pub preload: u32,
+    pub prefetch_width: u32,
+    pub prefetch_height: u32,
+    pub dst_outside_zero_to_one: u32,
+}
+
+/// Kyty: `DepthRenderTarget` (L216). The depth/stencil surface: format, base
+/// addresses, and extent. Kyty's `width`/`height` pair (from its fused Gen4
+/// packet) is not ported — the PS5 path sizes the surface from `size`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DepthRenderTarget {
+    pub z_info: DepthZInfo,
+    pub stencil_info: DepthStencilInfo,
+    pub depth_view: DepthDepthView,
+    pub size: DepthDepthSizeXy,
+    pub depth_info: DepthRenderTargetDepthInfo,
+    pub htile_surface: DepthRenderTargetHTileSurface,
+    pub z_read_base_addr: u64,
+    pub stencil_read_base_addr: u64,
+    pub z_write_base_addr: u64,
+    pub stencil_write_base_addr: u64,
+    pub htile_data_base_addr: u64,
+    pub pitch_div8_minus1: u32,
+    pub height_div8_minus1: u32,
+    pub slice_div64_minus1: u32,
+}
+
+/// Kyty: `RenderControl` (L237) — `DB_RENDER_CONTROL` decode.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderControl {
+    pub depth_clear_enable: bool,
+    pub stencil_clear_enable: bool,
+    pub resummarize_enable: bool,
+    pub stencil_compress_disable: bool,
+    pub depth_compress_disable: bool,
+    pub copy_centroid: bool,
+    pub copy_sample: u8,
+}
+
+/// Kyty: `StencilControl` (L278) — `DB_STENCIL_CONTROL` decode.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct StencilControl {
+    pub stencil_fail: u8,
+    pub stencil_zpass: u8,
+    pub stencil_zfail: u8,
+    pub stencil_fail_bf: u8,
+    pub stencil_zpass_bf: u8,
+    pub stencil_zfail_bf: u8,
+}
+
+/// Kyty: `StencilMask` (L288) — `DB_STENCILREFMASK` / `_BF` decode.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct StencilMask {
+    pub stencil_testval: u8,
+    pub stencil_mask: u8,
+    pub stencil_writemask: u8,
+    pub stencil_opval: u8,
+    pub stencil_testval_bf: u8,
+    pub stencil_mask_bf: u8,
+    pub stencil_writemask_bf: u8,
+    pub stencil_opval_bf: u8,
 }
 
 /// Kyty: `Viewport` (L262).
@@ -412,6 +541,17 @@ pub struct Context {
     pub mode_control: ModeControl,
     pub scan_mode_control: ScanModeControl,
     pub depth_control: DepthControl,
+    pub depth_render_target: DepthRenderTarget,
+    pub render_control: RenderControl,
+    pub stencil_control: StencilControl,
+    pub stencil_mask: StencilMask,
+    /// `DB_DEPTH_CLEAR` (Kyty: `m_depth_clear_value`, HardwareContext.h L842).
+    pub depth_clear_value: f32,
+    /// `DB_STENCIL_CLEAR` (Kyty: `m_stencil_clear_value`).
+    pub stencil_clear_value: u8,
+    /// `DB_DEPTH_BOUNDS_MIN/MAX` — tracked; the bounds test is not implemented.
+    pub depth_bounds_min: f32,
+    pub depth_bounds_max: f32,
     pub screen_viewport: ScreenViewport,
     pub line_width: f32,
     pub sh_regs: ShaderRegisters,
@@ -438,6 +578,14 @@ impl Default for Context {
             mode_control: ModeControl::default(),
             scan_mode_control: ScanModeControl::default(),
             depth_control: DepthControl::default(),
+            depth_render_target: DepthRenderTarget::default(),
+            render_control: RenderControl::default(),
+            stencil_control: StencilControl::default(),
+            stencil_mask: StencilMask::default(),
+            depth_clear_value: 0.0,
+            stencil_clear_value: 0,
+            depth_bounds_min: 0.0,
+            depth_bounds_max: 0.0,
             screen_viewport: ScreenViewport::default(),
             line_width: 1.0,
             sh_regs: ShaderRegisters::default(),

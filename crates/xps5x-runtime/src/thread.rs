@@ -56,11 +56,11 @@ pub(crate) fn record_host_thread_handle(kernel: &OrbisKernel, guest_thread: u64)
             DUPLICATE_SAME_ACCESS,
         )
     };
-    if ok != 0 {
-        if let Some(old) = kernel.host_thread_handles.insert(guest_thread, dup as u64) {
-            // SAFETY: `old` was a real duplicated handle owned by this map.
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(old as *mut _) };
-        }
+    if ok != 0
+        && let Some(old) = kernel.host_thread_handles.insert(guest_thread, dup as u64)
+    {
+        // SAFETY: `old` was a real duplicated handle owned by this map.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(old as *mut _) };
     }
 }
 
@@ -366,6 +366,18 @@ pub struct GuestProcess {
 #[derive(Clone)]
 pub struct GuestProcessHandle(Arc<GuestProcess>);
 
+impl GuestProcessHandle {
+    /// A non-owning view of the process for observers (Shell quit/diagnostics)
+    /// that must not keep the guest arena's fixed-base mapping alive past
+    /// teardown. Only one such mapping can exist per host process, so any
+    /// strong handle retained by a session controller races the next launch's
+    /// reservation; a `Weak` simply fails to upgrade once the run is over.
+    #[must_use]
+    pub fn downgrade(&self) -> std::sync::Weak<GuestProcess> {
+        Arc::downgrade(&self.0)
+    }
+}
+
 /// Read-only ownership census for diagnostics/UI. It exposes lifecycle facts,
 /// never the unsafe arena/guard internals themselves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -461,18 +473,20 @@ impl GuestProcess {
             diagnostic_events: self.kernel.diagnostics.snapshot().len(),
         }
     }
-}
 
-impl GuestProcessHandle {
     /// Cooperatively request process termination. Blocking HLE waits observe
     /// this flag and native execution exits at the next runtime/HLE boundary;
-    /// [`terminate_and_reap`](Self::terminate_and_reap) remains the sole owner
-    /// of joining workers and draining GPU work.
+    /// [`GuestProcessHandle::terminate_and_reap`] remains the sole owner of
+    /// joining workers and draining GPU work. Defined on `GuestProcess` (not
+    /// the handle) so a session controller holding only a `Weak<GuestProcess>`
+    /// can upgrade and request termination without owning the arena.
     pub fn request_termination(&self, code: u64) {
         self.begin_termination(code);
         self.kernel.event_flag_signal.1.notify_all();
     }
+}
 
+impl GuestProcessHandle {
     #[must_use]
     pub fn is_terminating(&self) -> bool {
         self.terminating.load(Ordering::Acquire)

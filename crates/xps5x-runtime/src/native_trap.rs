@@ -266,12 +266,12 @@ pub fn handle(context: &mut CONTEXT, mem: &dyn GuestMemory, tid: u64) -> bool {
             .unwrap_or(0);
         // Record a completed Create so later null-mspace frees can resolve the
         // owning region. `rax` is the handle; base/size were saved at ENTER.
-        if name.contains("Create") {
-            if let Some((base, size)) = r.pending_create.remove(&tid) {
-                if context.Rax != 0 && size != 0 {
-                    r.mspaces.push((base, base.wrapping_add(size), context.Rax));
-                }
-            }
+        if name.contains("Create")
+            && let Some((base, size)) = r.pending_create.remove(&tid)
+            && context.Rax != 0
+            && size != 0
+        {
+            r.mspaces.push((base, base.wrapping_add(size), context.Rax));
         }
         warn!(
             "NATIVE-TRAP {name} RETURN rax={:#x} rdx={:#x} -> resume {resume:#x}",

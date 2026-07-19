@@ -143,6 +143,39 @@ impl ModuleRegistry {
         self.resolve_import(hle, provider_module, provider_module, nid)
     }
 
+    /// Resolve an import that carries **no provider identity** at all.
+    ///
+    /// Hand-built fixtures without dynlib import tables land here: there is no
+    /// provider module whose policy could apply, so the strict
+    /// no-cross-provider rule has nothing to bind to. A NID hashes the
+    /// function name alone, so the provider-free view can only ever "borrow"
+    /// an implementation across libraries when two libraries register the
+    /// *same* function (deliberate aliases); genuine name collisions are
+    /// already deduped with a warning when the database is built. Real modules
+    /// always name their provider and never take this path.
+    ///
+    /// LLE exports are keyed by provider module; with no provider known, the
+    /// only key available is the consumer's own module name — which is how
+    /// fixtures register their exports.
+    pub fn resolve_unattributed(
+        &self,
+        hle: &HleRegistry,
+        consumer_module: &str,
+        nid: u64,
+    ) -> Resolver {
+        if let Some(name) = self.nid_db.resolve(nid)
+            && let Some((library, function)) = name.split_once("::")
+            && hle.is_implemented(library, function)
+        {
+            return Resolver::Hle {
+                library: library.to_string(),
+                function: function.to_string(),
+            };
+        }
+        self.try_lle(&canonical_module_name(consumer_module), nid)
+            .unwrap_or(Resolver::Unresolved)
+    }
+
     /// Resolve an import while preserving both parts of its provider identity.
     /// Module policy and LLE exports belong to `provider_module`; HLE exports
     /// are registered under `provider_library` (for example, module
@@ -203,7 +236,11 @@ impl ModuleRegistry {
     }
 }
 
-fn canonical_module_name(module: &str) -> String {
+/// The identity a module has for policy, LLE exports, and the process
+/// loader's visit-set alike: lowercased, `.sprx`/`.prx` suffix stripped.
+/// `pub(crate)` so `load_process`'s dependency walk dedupes by exactly the
+/// identity the registry resolves providers by.
+pub(crate) fn canonical_module_name(module: &str) -> String {
     let lower = module.to_ascii_lowercase();
     lower
         .strip_suffix(".sprx")
@@ -304,6 +341,37 @@ mod tests {
         let nid = nid_of("totallyUnknownFunctionNameNobodyRegistered");
         assert_eq!(
             registry.resolve(&hle, "someModule", nid),
+            Resolver::Unresolved
+        );
+    }
+
+    #[test]
+    fn unattributed_import_resolves_provider_free() {
+        let (hle, db) = build_hle_and_db();
+        let (library, function) = uniquely_named_hle_function(&hle);
+        let registry = ModuleRegistry::new(db);
+        let nid = nid_of(&function);
+
+        // No provider metadata: the provider-free NID view finds the HLE
+        // implementation regardless of which library registered it.
+        match registry.resolve_unattributed(&hle, "someConsumer", nid) {
+            Resolver::Hle {
+                library: got_lib,
+                function: got_fn,
+            } => {
+                assert_eq!(got_lib, library);
+                assert_eq!(got_fn, function);
+            }
+            other => panic!("expected Resolver::Hle, got {other:?}"),
+        }
+
+        // An unknown NID stays unresolved; nothing can be borrowed.
+        assert_eq!(
+            registry.resolve_unattributed(
+                &hle,
+                "someConsumer",
+                nid_of("nobodyRegisteredThisEither")
+            ),
             Resolver::Unresolved
         );
     }

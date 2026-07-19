@@ -85,6 +85,13 @@ const TERMINATING_FUNCTIONS: &[(&str, &str)] = &[
     ("libc", "exit"),
     ("libc", "exit_group"),
     ("libc", "_exit"),
+    // The `libSceLibcInternal` ABI alias of the same libc functions: provider-
+    // free resolution deterministically picks the lexicographically first
+    // registration for a shared name, which is this library — an import of
+    // `exit` resolves here, and must terminate the run just the same.
+    ("libSceLibcInternal", "exit"),
+    ("libSceLibcInternal", "exit_group"),
+    ("libSceLibcInternal", "_exit"),
     ("libkernel", "sceKernelExit"),
     // libkernel's real export of _exit (NID hashed from "_exit") — libc.prx
     // and the eboot both import it directly.
@@ -1756,31 +1763,30 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         static RESUME_ON_MISSING: OnceLock<bool> = OnceLock::new();
         static MISSING_IMPORT_CALLS: AtomicU64 = AtomicU64::new(0);
         if *RESUME_ON_MISSING.get_or_init(|| std::env::var_os("XPS5X_RESUME_ON_MISSING").is_some())
+            && let Some(s) = stub::resolve(fault_addr, stubs)
         {
-            if let Some(s) = stub::resolve(fault_addr, stubs) {
-                // SAFETY: `ctx.mem` is the live guest memory view for this
-                // guarded call (same invariant used elsewhere in this handler).
-                let mem = unsafe { &*ctx.mem };
-                let mut ret = [0u8; 8];
-                if mem.read(context.Rsp, &mut ret) {
-                    let n = MISSING_IMPORT_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n <= 8 || n.is_power_of_two() {
-                        tracing::warn!(
-                            nid = format_args!("{:#018x}", s.nid),
-                            library = s.library.as_deref().unwrap_or("<unknown>"),
-                            function = xps5x_firmware::dynlib::nid_names::describe(s.nid),
-                            count = n,
-                            "unresolved import CALLED — returning SCE error and resuming \
-                             (XPS5X_RESUME_ON_MISSING)"
-                        );
-                    }
-                    context.Rip = u64::from_le_bytes(ret);
-                    context.Rsp = context.Rsp.wrapping_add(8);
-                    // Generic SCE error (negative i32) — safer than faking
-                    // success, which would hand the caller uninitialized output.
-                    context.Rax = 0x8000_0000;
-                    return EXCEPTION_CONTINUE_EXECUTION;
+            // SAFETY: `ctx.mem` is the live guest memory view for this
+            // guarded call (same invariant used elsewhere in this handler).
+            let mem = unsafe { &*ctx.mem };
+            let mut ret = [0u8; 8];
+            if mem.read(context.Rsp, &mut ret) {
+                let n = MISSING_IMPORT_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    tracing::warn!(
+                        nid = format_args!("{:#018x}", s.nid),
+                        library = s.library.as_deref().unwrap_or("<unknown>"),
+                        function = xps5x_firmware::dynlib::nid_names::describe(s.nid),
+                        count = n,
+                        "unresolved import CALLED — returning SCE error and resuming \
+                         (XPS5X_RESUME_ON_MISSING)"
+                    );
                 }
+                context.Rip = u64::from_le_bytes(ret);
+                context.Rsp = context.Rsp.wrapping_add(8);
+                // Generic SCE error (negative i32) — safer than faking
+                // success, which would hand the caller uninitialized output.
+                context.Rax = 0x8000_0000;
+                return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
 

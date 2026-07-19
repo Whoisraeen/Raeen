@@ -215,14 +215,11 @@ impl NidDatabase {
             // table retains every binding; the provider-free diagnostic view
             // chooses the lexicographically first explicit label so it stays
             // deterministic even when equal NIDs exist in several libraries.
-            if explicit_nids.insert(nid) {
-                if let Some(existing) = db.by_nid.insert(nid, key.clone())
-                    && existing != key
-                {
-                    debug!(
-                        "explicit NID {nid:#018x} -> {key:?} overrides name-hashed {existing:?}"
-                    );
-                }
+            if explicit_nids.insert(nid)
+                && let Some(existing) = db.by_nid.insert(nid, key.clone())
+                && existing != key
+            {
+                debug!("explicit NID {nid:#018x} -> {key:?} overrides name-hashed {existing:?}");
             }
             db.by_provider
                 .insert((canonical_provider_name(&library), nid), key);

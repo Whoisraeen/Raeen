@@ -57,9 +57,9 @@ pub mod vmm;
 pub use dispatch::fsbase_rearm_count;
 
 use thiserror::Error;
+use xps5x_firmware::LinkedModule;
 #[cfg(target_os = "windows")]
 use xps5x_firmware::ModuleInitRole;
-use xps5x_firmware::LinkedModule;
 use xps5x_hle::{GuestMemory, HleRegistry};
 use xps5x_kernel::OrbisKernel;
 
@@ -96,9 +96,13 @@ pub enum RunOutcome {
 ///   will run the main initializer; the loader runs **every** initializer,
 ///   main included. Function-mode fixtures carry no initializers, so this is a
 ///   no-op for them, but a directly-run module with constructors gets them.
+///
+/// Internal to the runtime: the two public entry points ([`execute_process`],
+/// [`execute_linked`]) each fix their own policy, so this never appears in a
+/// public signature.
 #[cfg(target_os = "windows")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EntryPolicy {
+pub(crate) enum EntryPolicy {
     /// The guest crt0 `_start` owns the main initializer; the loader withholds it.
     CrtOwnsMainInit,
     /// No crt0 runs; the loader owns every initializer, main included.

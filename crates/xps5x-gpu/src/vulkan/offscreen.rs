@@ -234,6 +234,12 @@ pub struct DrawState<'a> {
     /// and `vertex_count` is the index count; the vertices are pulled through
     /// this buffer instead of straight from the vertex stream.
     pub index: Option<IndexBinding<'a>>,
+    /// Whether the draw produces a colour attachment. False for a depth-only
+    /// draw (`CB_TARGET_MASK == 0` with depth active — a z-prepass); `format`
+    /// and `initial` are then unused.
+    pub color_output: bool,
+    /// Depth/stencil state; `None` = no depth attachment (colour-only draw).
+    pub depth: Option<DepthState<'a>>,
 }
 
 /// A guest index buffer fetched into host memory, ready to upload.
@@ -243,6 +249,190 @@ pub struct IndexBinding<'a> {
     pub bytes: &'a [u8],
     /// 8-, 16-, or 32-bit indices.
     pub index_type: vk::IndexType,
+}
+
+/// Register-derived depth/stencil state for one draw — the depth counterpart
+/// of [`BlendState`]. `draw_translate::depth_state_from_regs` builds it from
+/// the PM4 register model; [`render_draw`] turns it into the depth attachment,
+/// the pipeline's depth-stencil state, and the depth readback.
+#[derive(Debug, Clone)]
+pub struct DepthState<'a> {
+    /// The depth attachment's format, from `DB_Z_INFO.format * 2 +
+    /// DB_STENCIL_INFO.format` (Kyty GraphicsRender.cpp L3829): D16_UNORM (2),
+    /// D24_UNORM_S8_UINT (3), D32_SFLOAT (6), D32_SFLOAT_S8_UINT (7).
+    pub format: vk::Format,
+    /// `DB_DEPTH_CONTROL.z_enable`.
+    pub test_enable: bool,
+    /// `DB_DEPTH_CONTROL.z_write_enable`.
+    pub write_enable: bool,
+    /// `DB_DEPTH_CONTROL.zfunc` — the Gen5 compare codes match `vk::CompareOp`.
+    pub compare_op: vk::CompareOp,
+    /// `DB_DEPTH_CONTROL.stencil_enable` (only reachable with a stencil plane).
+    pub stencil_test_enable: bool,
+    /// Front-face stencil state (`DB_STENCIL_CONTROL` + `DB_STENCILREFMASK`).
+    pub stencil_front: vk::StencilOpState,
+    /// Back-face state — the `_BF` registers when `backface_enable`, else a
+    /// copy of the front (Kyty GraphicsRender.cpp L3916).
+    pub stencil_back: vk::StencilOpState,
+    /// `DB_RENDER_CONTROL.depth_clear_enable`: attachment load-op CLEAR instead
+    /// of LOAD (Kyty GraphicsRender.cpp L1508).
+    pub clear_depth: bool,
+    /// `DB_RENDER_CONTROL.stencil_clear_enable`.
+    pub clear_stencil: bool,
+    /// `DB_DEPTH_CLEAR`.
+    pub clear_depth_value: f32,
+    /// `DB_STENCIL_CLEAR`.
+    pub clear_stencil_value: u32,
+    /// `[min, max]` viewport depth from `PA_CL_VPORT_ZOFFSET`/`_ZSCALE` (Kyty
+    /// GraphicsRender.cpp L2124: min = zoffset, max = zoffset + zscale).
+    pub viewport_depth: [f32; 2],
+    /// Prior depth-plane contents for a LOAD, mirroring [`DrawState::initial`]:
+    /// `width * height * depth_texel_bytes(format)` bytes, tightly packed.
+    pub initial: Option<&'a [u8]>,
+    /// Prior stencil-plane contents (`width * height` bytes) for a LOAD.
+    pub initial_stencil: Option<&'a [u8]>,
+}
+
+/// A depth/stencil attachment read back from the GPU: the depth plane, plus
+/// the stencil plane when the format has one. This is both the persistence
+/// unit across draws (keyed by guest `DB_Z_WRITE_BASE`, mirroring the colour
+/// framebuffer map) and what tests assert on.
+#[derive(Debug, Clone)]
+pub struct DepthImage {
+    pub width: u32,
+    pub height: u32,
+    pub format: vk::Format,
+    /// Depth aspect, tightly packed rows, `width * height *
+    /// depth_texel_bytes(format)` bytes.
+    pub depth: Vec<u8>,
+    /// Stencil aspect, tightly packed rows, `width * height` bytes.
+    pub stencil: Option<Vec<u8>>,
+}
+
+impl DepthImage {
+    /// The depth value at `(x, y)` as a float in [0, 1] (UNORM formats are
+    /// normalized; D24 uses the low 24 bits of each 4-byte texel, matching the
+    /// Vulkan buffer-copy layout of `D24_UNORM_S8_UINT`'s depth aspect).
+    #[must_use]
+    pub fn depth_at(&self, x: u32, y: u32) -> Option<f32> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let texel = depth_texel_bytes(self.format).ok()? as usize;
+        let offset = ((y * self.width + x) as usize) * texel;
+        let bytes = self.depth.get(offset..offset + texel)?;
+        Some(match self.format {
+            vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT => {
+                f32::from_le_bytes(bytes[..4].try_into().expect("4-byte depth texel"))
+            }
+            vk::Format::D16_UNORM => {
+                f32::from(u16::from_le_bytes(
+                    bytes[..2].try_into().expect("2-byte depth texel"),
+                )) / f32::from(u16::MAX)
+            }
+            vk::Format::D24_UNORM_S8_UINT => {
+                let raw =
+                    u32::from(bytes[0]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[2]) << 16);
+                raw as f32 / 16_777_215.0
+            }
+            _ => return None,
+        })
+    }
+
+    /// The stencil value at `(x, y)`, when the format has a stencil plane.
+    #[must_use]
+    pub fn stencil_at(&self, x: u32, y: u32) -> Option<u8> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        self.stencil
+            .as_ref()?
+            .get((y * self.width + x) as usize)
+            .copied()
+    }
+}
+
+/// What one offscreen draw produced. `color` is `None` for a depth-only draw
+/// (`CB_TARGET_MASK == 0` with depth active — a z-prepass); `depth` is `Some`
+/// whenever a depth attachment was bound.
+#[derive(Debug, Clone)]
+pub struct DrawOutput {
+    pub color: Option<RenderedImage>,
+    pub depth: Option<DepthImage>,
+}
+
+/// Bytes per depth-aspect texel in the readback/upload of `format`.
+fn depth_texel_bytes(format: vk::Format) -> Result<u32, GpuError> {
+    match format {
+        vk::Format::D16_UNORM => Ok(2),
+        vk::Format::D32_SFLOAT
+        | vk::Format::D24_UNORM_S8_UINT
+        | vk::Format::D32_SFLOAT_S8_UINT => Ok(4),
+        other => Err(GpuError::VulkanInitFailed(format!(
+            "depth format {other:?} has no texel byte size mapping"
+        ))),
+    }
+}
+
+/// Whether `format` carries a stencil plane.
+fn has_stencil_plane(format: vk::Format) -> bool {
+    matches!(
+        format,
+        vk::Format::D24_UNORM_S8_UINT | vk::Format::D32_SFLOAT_S8_UINT
+    )
+}
+
+/// The image aspect mask for a depth format (DEPTH, plus STENCIL when present).
+fn depth_aspect_mask(format: vk::Format) -> vk::ImageAspectFlags {
+    let mut aspects = vk::ImageAspectFlags::DEPTH;
+    if has_stencil_plane(format) {
+        aspects |= vk::ImageAspectFlags::STENCIL;
+    }
+    aspects
+}
+
+/// Byte size of the depth plane of a `width`x`height` surface, which is also
+/// the offset the stencil plane sits at in the upload/readback buffers. Always
+/// a multiple of 4 for the stencil-bearing formats (their depth texel is 4
+/// bytes), satisfying the D/S copy offset alignment rule.
+fn depth_plane_bytes(width: u32, height: u32, format: vk::Format) -> Result<u64, GpuError> {
+    Ok(u64::from(width) * u64::from(height) * u64::from(depth_texel_bytes(format)?))
+}
+
+/// Which attachment planes LOAD prior contents (vs CLEAR), from the register
+/// clear flags and the availability of prior contents. Mirrors Kyty's
+/// `loadOp = clear_enable ? CLEAR : LOAD` (GraphicsRender.cpp L1508-1511); a
+/// LOAD with no prior contents falls back to CLEAR — the colour path's
+/// no-`initial` behaviour.
+fn depth_loads(depth: &DepthState) -> (bool, bool) {
+    let depth_load = !depth.clear_depth && depth.initial.is_some();
+    let stencil_load =
+        has_stencil_plane(depth.format) && !depth.clear_stencil && depth.initial_stencil.is_some();
+    (depth_load, stencil_load)
+}
+
+/// One depth/stencil plane copy region for the upload/readback transfers.
+fn depth_copy_region(
+    width: u32,
+    height: u32,
+    aspect: vk::ImageAspectFlags,
+    buffer_offset: u64,
+) -> vk::BufferImageCopy {
+    vk::BufferImageCopy::default()
+        .buffer_offset(buffer_offset)
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: aspect,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .image_extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
 }
 
 impl<'a> DrawState<'a> {
@@ -271,6 +461,8 @@ impl<'a> DrawState<'a> {
             fs_spirv,
             initial: None,
             index: None,
+            color_output: true,
+            depth: None,
         }
     }
 }
