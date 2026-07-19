@@ -44,8 +44,12 @@ pub enum ShaderInstructionType {
     DsAppend,
     DsConsume,
     Exp,
+    /// MIMG 0x0e: query texture dimensions/mip information.
+    ImageGetResinfo,
     ImageLoad,
     ImageSample,
+    /// MIMG 0x2f: comparison sample with an explicit zero LOD.
+    ImageSampleCLz,
     ImageSampleLz,
     ImageSampleLzO,
     ImageStore,
@@ -86,6 +90,8 @@ pub enum ShaderInstructionType {
     SCselectB32,
     SCselectB64,
     SEndpgm,
+    /// SOP1 0x1f: write the absolute address of the following instruction.
+    SGetpcB64,
     SInstPrefetch,
     SLoadDword,
     SLoadDwordx2,
@@ -112,6 +118,8 @@ pub enum ShaderInstructionType {
     /// SOP1 0x28: `sdst = exec; exec = ssrc0 | ~exec; scc = (exec != 0)`. The
     /// ORN2 sibling of `SAndSaveexecB64`; measured in ASTRO.BOT scene compute.
     SOrn2SaveexecB64,
+    /// SOP2 0x32: pack the low 16 bits of each source into one dword.
+    SPackLlB32B16,
     SSendmsg,
     SSetpcB64,
     SSwappcB64,
@@ -378,6 +386,7 @@ pub mod shader_instruction_format {
         Pos0Vsrc0Vsrc1Vsrc2Vsrc3Done = format_define(&[POS0, S0, S1, S2, S3, DONE]),
         PrimVsrc0OffOffOffDone = format_define(&[PRIM, S0, OFF, OFF, OFF, DONE]),
         Saddr = format_define(&[S0A2]),
+        Sdst2 = format_define(&[DA2]),
         SdstSbaseSoffset = format_define(&[D, S0A2, S1]),
         Sdst16SvSoffset = format_define(&[DA16, S0A4, S1]),
         Sdst2Ssrc02 = format_define(&[DA2, S0A2]),
@@ -401,13 +410,13 @@ pub mod shader_instruction_format {
         Vdata2Vaddr3StSsDmask3 = format_define(&[DA2, S0A3, S1A8, S2A4, DMASK_3]),
         Vdata2Vaddr3StSsDmask5 = format_define(&[DA2, S0A3, S1A8, S2A4, DMASK_5]),
         Vdata2Vaddr3StSsDmask9 = format_define(&[DA2, S0A3, S1A8, S2A4, DMASK_9]),
+        Vdata2VaddrStDmask3 = format_define(&[DA2, S0, S1A8, DMASK_3]),
         Vdata2VaddrSvSoffsIdxen = format_define(&[DA2, S0, S1A4, S2, IDXEN]),
         Vdata3Vaddr3StDmask7 = format_define(&[DA3, S0A3, S1A8, DMASK_7]),
         Vdata3Vaddr3StSsDmask7 = format_define(&[DA3, S0A3, S1A8, S2A4, DMASK_7]),
         Vdata3Vaddr4StSsDmask7 = format_define(&[DA3, S0A4, S1A8, S2A4, DMASK_7]),
         Vdata3VaddrSvSoffsIdxen = format_define(&[DA3, S0, S1A4, S2, IDXEN]),
-        Vdata4Vaddr2SvSoffsOffenIdxen =
-            format_define(&[DA4, S0A2, S1A4, S2, OFFEN, IDXEN]),
+        Vdata4Vaddr2SvSoffsOffenIdxen = format_define(&[DA4, S0A2, S1A4, S2, OFFEN, IDXEN]),
         Vdata4Vaddr2SvSoffsOffenIdxenFloat4 =
             format_define(&[DA4, S0A2, S1A4, S2, OFFEN, IDXEN, FLOAT4]),
         Vdata4Vaddr3StDmaskF = format_define(&[DA4, S0A3, S1A8, DMASK_F]),
@@ -415,6 +424,8 @@ pub mod shader_instruction_format {
         Vdata4Vaddr4StDmaskF = format_define(&[DA4, S0A4, S1A8, DMASK_F]),
         Vdata4VaddrSvSoffsIdxen = format_define(&[DA4, S0, S1A4, S2, IDXEN]),
         Vdata4VaddrSvSoffsIdxenFloat4 = format_define(&[DA4, S0, S1A4, S2, IDXEN, FLOAT4]),
+        Vdata4SvSoffs = format_define(&[DA4, S1A4, S2]),
+        Vdata4VaddrSvSoffsOffen = format_define(&[DA4, S0, S1A4, S2, OFFEN]),
         VdstGds = format_define(&[D, GDS]),
         VdstSdst2Vsrc0Vsrc1 = format_define(&[D, D2A2, S0, S1]),
         VdstVsrc0Vsrc1Smask2 = format_define(&[D, S0, S1, S2A2]),
@@ -807,6 +818,10 @@ fn is_discard_instruction(code: &[ShaderInstruction], index: usize) -> bool {
 /// Kyty: Shader.h `ShaderCode` (L468).
 #[derive(Clone, Debug)]
 pub struct ShaderCode {
+    /// Absolute guest address of instruction dword zero. Kyty keeps this in the
+    /// raw code pointer; the bounds-checked Rust port records it explicitly so
+    /// PC-relative scalar instructions retain their real 64-bit value.
+    base_address: u64,
     hash0: u32,
     crc32: u32,
     instructions: Vec<ShaderInstruction>,
@@ -831,6 +846,7 @@ impl ShaderCode {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            base_address: 0,
             hash0: 0,
             crc32: 0,
             instructions: Vec::with_capacity(128),
@@ -852,6 +868,15 @@ impl ShaderCode {
 
     pub fn get_instructions_mut(&mut self) -> &mut Vec<ShaderInstruction> {
         &mut self.instructions
+    }
+
+    #[must_use]
+    pub const fn get_base_address(&self) -> u64 {
+        self.base_address
+    }
+
+    pub fn set_base_address(&mut self, address: u64) {
+        self.base_address = address;
     }
 
     #[must_use]

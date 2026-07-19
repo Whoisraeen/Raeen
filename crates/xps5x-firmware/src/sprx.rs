@@ -387,9 +387,7 @@ fn build_unwind_info(
             // run to the end of the PT_LOAD segment that contains it.
             segments
                 .iter()
-                .find(|s| {
-                    eh_frame_vaddr >= s.vaddr && eh_frame_vaddr < s.vaddr + s.mem_size
-                })
+                .find(|s| eh_frame_vaddr >= s.vaddr && eh_frame_vaddr < s.vaddr + s.mem_size)
                 .map_or(0, |s| s.vaddr + s.mem_size - eh_frame_vaddr)
         },
         |section| section.sh_size,

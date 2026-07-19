@@ -1,6 +1,6 @@
 //! SCE NID (Name ID) hashing and base64 encoding.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sha1::{Digest, Sha1};
 use tracing::{debug, warn};
@@ -116,6 +116,7 @@ pub fn decode_nid(s: &str) -> Option<u64> {
 #[derive(Debug, Default, Clone)]
 pub struct NidDatabase {
     by_nid: HashMap<u64, String>,
+    by_provider: HashMap<(String, u64), String>,
 }
 
 impl NidDatabase {
@@ -152,17 +153,9 @@ impl NidDatabase {
     /// "it worked last time" reasoning. Sorting first makes the winner a
     /// function of the name set alone.
     ///
-    /// # Known limitation
-    ///
-    /// A NID maps to exactly one `library::function`, so XPS5X cannot
-    /// distinguish `libSceJson::X` from `libSceJson2::X` — resolution is by
-    /// NID, and their NIDs are equal. Real hardware resolves the richer
-    /// `nid#library#module` tuple. This is only safe while same-named functions
-    /// share an implementation, which
-    /// `xps5x_hle`'s `duplicate_names_share_one_implementation` test pins. If
-    /// that test ever fails, resolution must start keying on the library too
-    /// (the import symbol carries a `library_index`; see
-    /// [`crate::dynlib::SymbolRef`]).
+    /// The generic NID view keeps one deterministic name for diagnostics.
+    /// Provider-aware linking uses a second `(library, NID)` index via
+    /// [`Self::resolve_for_provider`], preserving the richer import identity.
     pub fn from_hle_names(names: impl IntoIterator<Item = (String, String)>) -> Self {
         // Deterministic winner: sort before insertion so the result depends on
         // the name set, not on iteration order.
@@ -170,9 +163,11 @@ impl NidDatabase {
         names.sort();
 
         let mut by_nid: HashMap<u64, String> = HashMap::new();
+        let mut by_provider: HashMap<(String, u64), String> = HashMap::new();
         for (library, function) in names {
             let nid = nid_of(&function);
             let key = format!("{library}::{function}");
+            by_provider.insert((canonical_provider_name(&library), nid), key.clone());
             match by_nid.entry(nid) {
                 std::collections::hash_map::Entry::Occupied(existing) => {
                     let existing_function = existing.get().split_once("::").map(|(_, f)| f);
@@ -196,7 +191,10 @@ impl NidDatabase {
                 }
             }
         }
-        Self { by_nid }
+        Self {
+            by_nid,
+            by_provider,
+        }
     }
 
     /// Build the database from a live [`xps5x_hle::HleRegistry`]: every
@@ -208,15 +206,26 @@ impl NidDatabase {
     /// (see [`xps5x_hle::HleRegistry::register_nid`]).
     pub fn from_hle(hle: &xps5x_hle::HleRegistry) -> Self {
         let mut db = Self::from_hle_names(hle.registered_names());
-        for (nid, key) in hle.registered_nid_overrides() {
+        let mut overrides = hle.registered_provider_nid_overrides();
+        overrides.sort_by(|left, right| (left.1, &left.2).cmp(&(right.1, &right.2)));
+        let mut explicit_nids = HashSet::new();
+        for (library, nid, key) in overrides {
             // An explicit NID is a stronger statement than a hashed name: it
-            // was read out of a real module's symbol table, not guessed from a
-            // label. It wins.
-            if let Some(existing) = db.by_nid.insert(nid, key.clone())
-                && existing != key
-            {
-                debug!("explicit NID {nid:#018x} -> {key:?} overrides name-hashed {existing:?}");
+            // was read out of a real module's symbol table. The provider-aware
+            // table retains every binding; the provider-free diagnostic view
+            // chooses the lexicographically first explicit label so it stays
+            // deterministic even when equal NIDs exist in several libraries.
+            if explicit_nids.insert(nid) {
+                if let Some(existing) = db.by_nid.insert(nid, key.clone())
+                    && existing != key
+                {
+                    debug!(
+                        "explicit NID {nid:#018x} -> {key:?} overrides name-hashed {existing:?}"
+                    );
+                }
             }
+            db.by_provider
+                .insert((canonical_provider_name(&library), nid), key);
         }
         db
     }
@@ -224,6 +233,16 @@ impl NidDatabase {
     /// Resolve an import NID to its `"library::function"` name, if known.
     pub fn resolve(&self, nid: u64) -> Option<&str> {
         self.by_nid.get(&nid).map(String::as_str)
+    }
+
+    /// Resolve only when `provider` actually registered this NID. Unlike
+    /// [`Self::resolve`], this preserves the module/library half of the import
+    /// identity and cannot borrow an implementation from an unrelated HLE
+    /// library that happens to use the same function name.
+    pub fn resolve_for_provider(&self, provider: &str, nid: u64) -> Option<&str> {
+        self.by_provider
+            .get(&(canonical_provider_name(provider), nid))
+            .map(String::as_str)
     }
 
     /// Number of entries in the database.
@@ -235,6 +254,15 @@ impl NidDatabase {
     pub fn is_empty(&self) -> bool {
         self.by_nid.is_empty()
     }
+}
+
+fn canonical_provider_name(provider: &str) -> String {
+    let lower = provider.to_ascii_lowercase();
+    lower
+        .strip_suffix(".sprx")
+        .or_else(|| lower.strip_suffix(".prx"))
+        .unwrap_or(&lower)
+        .to_string()
 }
 
 #[cfg(test)]
@@ -452,6 +480,30 @@ mod nid_database_tests {
         assert_eq!(
             db.resolve(0x253f_add3_46b7_4f10),
             Some("libSceNpManager::sceNpGetAccountCountryA"),
+        );
+    }
+
+    #[test]
+    fn explicit_equal_nids_resolve_by_provider_without_overwrite() {
+        fn first(_ctx: &xps5x_hle::HleContext, _args: &[u64]) -> u64 {
+            1
+        }
+        fn second(_ctx: &xps5x_hle::HleContext, _args: &[u64]) -> u64 {
+            2
+        }
+        let hle = xps5x_hle::HleRegistry::new();
+        let nid = 0x1234_5678_9abc_def0;
+        hle.register_nid("libAlpha", "unknownAlpha", nid, first);
+        hle.register_nid("libBeta", "unknownBeta", nid, second);
+        let db = NidDatabase::from_hle(&hle);
+
+        assert_eq!(
+            db.resolve_for_provider("libAlpha.sprx", nid),
+            Some("libAlpha::unknownAlpha")
+        );
+        assert_eq!(
+            db.resolve_for_provider("LIBBETA", nid),
+            Some("libBeta::unknownBeta")
         );
     }
 

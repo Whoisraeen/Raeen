@@ -159,7 +159,7 @@ fn hle_submit_flip(ctx: &HleContext, args: &[u64]) -> u64 {
         .video_out_buffers
         .get(&(handle, buffer_index as i32))
     {
-        xps5x_gpu::AgcGpuSession::global().present_scanout(buffer.address);
+        ctx.gpu.present_scanout(buffer.address);
     }
     let event_hint = 6 | ((flip_arg as u64 & 0x0000_ffff_ffff_ffff) << 16);
     for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {

@@ -4,80 +4,37 @@
 //! into the port happens inside `xps5x-gpu`, allowing Kyty internals to evolve
 //! without changing the emulator's public contracts.
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct ShaderSharp {
-    pub raw: u16,
+pub use xps5x_core::subsystems::{ShaderMappedData, ShaderSemantic, ShaderSharp, ShaderUserData};
+
+fn sharp_to_kyty(value: ShaderSharp) -> kyty_graphics::shader::ShaderSharp {
+    kyty_graphics::shader::ShaderSharp { raw: value.raw }
 }
 
-impl ShaderSharp {
-    #[must_use]
-    pub const fn new(offset_dw: u16, size: u16) -> Self {
-        Self {
-            raw: (offset_dw & 0x7fff) | ((size & 1) << 15),
-        }
-    }
-
-    #[must_use]
-    pub const fn offset_dw(self) -> u16 {
-        self.raw & 0x7fff
-    }
-
-    #[must_use]
-    pub const fn size(self) -> u16 {
-        self.raw >> 15
+fn user_data_to_kyty(value: ShaderUserData) -> kyty_graphics::shader::ShaderUserData {
+    kyty_graphics::shader::ShaderUserData {
+        direct_resource_offset: value.direct_resource_offset,
+        sharp_resource_offset: value
+            .sharp_resource_offset
+            .map(|table| table.into_iter().map(sharp_to_kyty).collect()),
+        eud_size_dw: value.eud_size_dw,
+        srt_size_dw: value.srt_size_dw,
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ShaderUserData {
-    pub direct_resource_offset: Vec<u16>,
-    pub sharp_resource_offset: [Vec<ShaderSharp>; 4],
-    pub eud_size_dw: u16,
-    pub srt_size_dw: u16,
+fn semantic_to_kyty(value: ShaderSemantic) -> kyty_graphics::shader::ShaderSemantic {
+    kyty_graphics::shader::ShaderSemantic { raw: value.raw }
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct ShaderSemantic {
-    pub raw: u32,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ShaderMappedData {
-    pub user_data: Option<ShaderUserData>,
-    pub input_semantics: Vec<ShaderSemantic>,
-}
-
-impl From<ShaderSharp> for kyty_graphics::shader::ShaderSharp {
-    fn from(value: ShaderSharp) -> Self {
-        Self { raw: value.raw }
-    }
-}
-
-impl From<ShaderUserData> for kyty_graphics::shader::ShaderUserData {
-    fn from(value: ShaderUserData) -> Self {
-        Self {
-            direct_resource_offset: value.direct_resource_offset,
-            sharp_resource_offset: value
-                .sharp_resource_offset
-                .map(|table| table.into_iter().map(Into::into).collect()),
-            eud_size_dw: value.eud_size_dw,
-            srt_size_dw: value.srt_size_dw,
-        }
-    }
-}
-
-impl From<ShaderSemantic> for kyty_graphics::shader::ShaderSemantic {
-    fn from(value: ShaderSemantic) -> Self {
-        Self { raw: value.raw }
-    }
-}
-
-impl From<ShaderMappedData> for kyty_graphics::shader::ShaderMappedData {
-    fn from(value: ShaderMappedData) -> Self {
-        Self {
-            user_data: value.user_data.map(Into::into),
-            input_semantics: value.input_semantics.into_iter().map(Into::into).collect(),
-        }
+pub(crate) fn mapped_data_to_kyty(
+    value: ShaderMappedData,
+) -> kyty_graphics::shader::ShaderMappedData {
+    kyty_graphics::shader::ShaderMappedData {
+        user_data: value.user_data.map(user_data_to_kyty),
+        input_semantics: value
+            .input_semantics
+            .into_iter()
+            .map(semantic_to_kyty)
+            .collect(),
     }
 }
 
@@ -96,7 +53,7 @@ mod tests {
             }),
             input_semantics: vec![ShaderSemantic { raw: 0x1234 }],
         };
-        let kyty: kyty_graphics::shader::ShaderMappedData = data.into();
+        let kyty = mapped_data_to_kyty(data);
         assert_eq!(
             kyty.user_data.unwrap().sharp_resource_offset[0][0].raw,
             0x8007

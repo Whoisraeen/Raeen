@@ -173,6 +173,10 @@ pub struct DynlibData {
     /// Every decoded symtab entry, in table order — `symbols[i]` is the
     /// symbol named by `r_sym == i` in an [`SceRela`]'s `info` field.
     pub symbols: Vec<DynSymbol>,
+    /// Provider identity for each symtab entry, aligned with [`Self::symbols`].
+    /// Imports retain their module/library indices here so two equal NIDs from
+    /// different providers remain distinguishable at relocation time.
+    pub symbol_providers: Vec<Option<SymbolRef>>,
     /// `DT_SCE_RELA` entries followed by `DT_SCE_JMPREL` entries, in that
     /// order.
     pub relocations: Vec<SceRela>,
@@ -358,6 +362,7 @@ pub fn parse_dynlibdata(blob: &[u8], dyn_tags: &[(u64, u64)]) -> Result<DynlibDa
     let mut imports = Vec::new();
     let mut exports = Vec::new();
     let mut symbols = Vec::new();
+    let mut symbol_providers = Vec::new();
     if let (Some(sym_off), Some(sym_sz)) = (
         tag_val(dyn_tags, DT_SCE_SYMTAB),
         tag_val(dyn_tags, DT_SCE_SYMTABSZ),
@@ -371,6 +376,7 @@ pub fn parse_dynlibdata(blob: &[u8], dyn_tags: &[(u64, u64)]) -> Result<DynlibDa
             &mut imports,
             &mut exports,
             &mut symbols,
+            &mut symbol_providers,
         )?;
     }
 
@@ -454,6 +460,7 @@ pub fn parse_dynlibdata(blob: &[u8], dyn_tags: &[(u64, u64)]) -> Result<DynlibDa
         imports,
         exports,
         symbols,
+        symbol_providers,
         relocations,
         needed_modules,
         import_libs,
@@ -560,6 +567,7 @@ fn decode_symbols(
     imports: &mut Vec<SymbolRef>,
     exports: &mut Vec<SymbolExport>,
     symbols: &mut Vec<DynSymbol>,
+    symbol_providers: &mut Vec<Option<SymbolRef>>,
 ) -> Result<(), FirmwareError> {
     let entsize = usize::try_from(entsize).map_err(|_| {
         FirmwareError::MalformedDynlibData("DT_SCE_SYMENT overflows usize".to_string())
@@ -594,6 +602,7 @@ fn decode_symbols(
                 value: st_value,
                 is_import,
             });
+            symbol_providers.push(None);
             continue;
         };
 
@@ -612,14 +621,9 @@ fn decode_symbols(
                 value: st_value,
                 is_import,
             });
+            symbol_providers.push(None);
             continue;
         };
-
-        symbols.push(DynSymbol {
-            nid: symbol_nid,
-            value: st_value,
-            is_import,
-        });
 
         if st_shndx == 0 || st_value == 0 {
             // `<nid>#<library>#<module>` — library FIRST, module second (this
@@ -638,12 +642,25 @@ fn decode_symbols(
             let mut parts = rest.unwrap_or("").split('#');
             let library_index = parts.next().and_then(nid::decode_index).unwrap_or(0);
             let module_index = parts.next().and_then(nid::decode_index).unwrap_or(0);
-            imports.push(SymbolRef {
+            let provider = SymbolRef {
                 nid: symbol_nid,
                 module_index,
                 library_index,
+            };
+            symbols.push(DynSymbol {
+                nid: symbol_nid,
+                value: st_value,
+                is_import,
             });
+            symbol_providers.push(Some(provider));
+            imports.push(provider);
         } else {
+            symbols.push(DynSymbol {
+                nid: symbol_nid,
+                value: st_value,
+                is_import,
+            });
+            symbol_providers.push(None);
             exports.push(SymbolExport {
                 nid: symbol_nid,
                 value: st_value,

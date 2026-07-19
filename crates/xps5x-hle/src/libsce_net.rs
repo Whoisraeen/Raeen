@@ -153,7 +153,11 @@ fn hle_epoll_wait(ctx: &HleContext, args: &[u64]) -> u64 {
     if !ctx.kernel.kernel_epolls.contains_key(&epid) {
         return NET_ERROR_INVALID_ARGUMENT;
     }
-    let wait = if timeout_ms < 0 { 50 } else { (timeout_ms as u64).min(50) };
+    let wait = if timeout_ms < 0 {
+        50
+    } else {
+        (timeout_ms as u64).min(50)
+    };
     std::thread::sleep(std::time::Duration::from_millis(wait));
     0
 }

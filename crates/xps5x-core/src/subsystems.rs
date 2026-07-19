@@ -60,7 +60,10 @@ pub enum EventUpdate {
 }
 
 pub trait EventSubsystem: Send + Sync {
-    fn create_event(&self, attributes: u32, initial: u64) -> u64;
+    /// Create a process-owned event, or report resource exhaustion. The
+    /// fallible return is part of the boundary: guest-controlled handle tables
+    /// must never imply an unbounded host allocation.
+    fn create_event(&self, attributes: u32, initial: u64) -> Option<u64>;
     fn delete_event(&self, handle: u64) -> bool;
     fn update_event(&self, handle: u64, update: EventUpdate) -> Option<u64>;
     fn event_bits(&self, handle: u64) -> Option<u64>;
@@ -82,8 +85,10 @@ pub enum NetworkMode {
 
 pub trait NetworkSubsystem: Send + Sync {
     fn mode(&self) -> NetworkMode;
-    fn create_socket(&self) -> i32;
+    /// Create a process-owned socket, or report descriptor-table exhaustion.
+    fn create_socket(&self) -> Option<i32>;
     fn socket_exists(&self, fd: i32) -> bool;
+    fn close_socket(&self, fd: i32) -> bool;
 }
 
 /// Kernel-backed services carried together through one HLE context.
@@ -110,8 +115,53 @@ pub struct GpuSubmissionStats {
     pub skipped_shaders: u64,
 }
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShaderSharp {
+    pub raw: u16,
+}
+
+impl ShaderSharp {
+    #[must_use]
+    pub const fn new(offset_dw: u16, size: u16) -> Self {
+        Self {
+            raw: (offset_dw & 0x7fff) | ((size & 1) << 15),
+        }
+    }
+
+    #[must_use]
+    pub const fn offset_dw(self) -> u16 {
+        self.raw & 0x7fff
+    }
+
+    #[must_use]
+    pub const fn size(self) -> u16 {
+        self.raw >> 15
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShaderUserData {
+    pub direct_resource_offset: Vec<u16>,
+    pub sharp_resource_offset: [Vec<ShaderSharp>; 4],
+    pub eud_size_dw: u16,
+    pub srt_size_dw: u16,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShaderSemantic {
+    pub raw: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShaderMappedData {
+    pub user_data: Option<ShaderUserData>,
+    pub input_semantics: Vec<ShaderSemantic>,
+}
+
 pub trait GpuSubmissionSubsystem: Send + Sync {
     fn submit(&self, words: Vec<u32>, queue: GpuQueue);
+    fn map_shader_metadata(&self, code_address: u64, data: ShaderMappedData);
+    fn present_scanout(&self, address: u64);
     fn wait_idle(&self);
     fn stats(&self) -> GpuSubmissionStats;
 }

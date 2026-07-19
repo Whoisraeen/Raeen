@@ -1424,7 +1424,7 @@ fn hle_create_shader(ctx: &HleContext, args: &[u64]) -> u64 {
     let Some(mapped_data) = read_shader_mapped_data(ctx, header) else {
         return SCE_ERROR_MEMORY_FAULT;
     };
-    xps5x_gpu::AgcGpuSession::global().map_shader_metadata(code, mapped_data);
+    ctx.gpu.map_shader_metadata(code, mapped_data);
     // Publish the shader object pointer.
     if !ctx.mem.write(destination, &header.to_le_bytes()) {
         return SCE_ERROR_MEMORY_FAULT;
@@ -3340,13 +3340,37 @@ mod tests {
         assert_eq!(read_u64(&ctx, 0x1E0), 2 * 0x118 + 3 * 0x1E0);
     }
 
-    /// M2 HLE seam: `SubmitDcb` with a DRAW packet must call into
-    /// `AgcGpuSession`. When Vulkan is available the draw count rises and
-    /// pixels are non-empty; without Vulkan the submit still returns 0.
+    /// M2 HLE seam: `SubmitDcb` remains a thin ABI adapter and forwards the
+    /// exact command buffer to the process-owned GPU submission interface.
     #[test]
     fn submit_dcb_with_draw_drives_m2_gpu_session() {
+        #[derive(Default)]
+        struct RecordingGpu {
+            submissions: std::sync::Mutex<Vec<(Vec<u32>, xps5x_core::subsystems::GpuQueue)>>,
+        }
+        impl xps5x_core::subsystems::GpuSubmissionSubsystem for RecordingGpu {
+            fn submit(&self, words: Vec<u32>, queue: xps5x_core::subsystems::GpuQueue) {
+                self.submissions.lock().unwrap().push((words, queue));
+            }
+            fn map_shader_metadata(
+                &self,
+                _code_address: u64,
+                _data: xps5x_core::subsystems::ShaderMappedData,
+            ) {
+            }
+            fn present_scanout(&self, _address: u64) {}
+            fn wait_idle(&self) {}
+            fn stats(&self) -> xps5x_core::subsystems::GpuSubmissionStats {
+                xps5x_core::subsystems::GpuSubmissionStats {
+                    submitted: self.submissions.lock().unwrap().len() as u64,
+                    ..Default::default()
+                }
+            }
+        }
+
         let (kernel, mem, alloc) = ctx_env();
-        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let gpu = RecordingGpu::default();
+        let ctx = crate::test_ctx_with_gpu(&kernel, &mem, &alloc, &gpu);
 
         let words = xps5x_gpu::build_m2_draw_dcb();
         let byte_len = words.len() * 4;
@@ -3358,7 +3382,6 @@ mod tests {
         assert!(ctx.mem.write(0x280, &0xB00u64.to_le_bytes()));
         assert!(ctx.mem.write(0x288, &(words.len() as u32).to_le_bytes()));
 
-        let before = xps5x_gpu::AgcGpuSession::global().draw_count();
         assert_eq!(hle_driver_submit_dcb(&ctx, &[0x280]), 0);
         assert_eq!(
             kernel
@@ -3366,22 +3389,10 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
-
-        // Submission is asynchronous now, so the draw has not necessarily
-        // landed when submit returns — reading draw_count/last_image here
-        // without draining would race the GPU worker.
-        xps5x_gpu::AgcGpuSession::global().wait_idle();
-        let after = xps5x_gpu::AgcGpuSession::global().draw_count();
-        if after > before {
-            let image = xps5x_gpu::AgcGpuSession::global()
-                .last_image()
-                .expect("successful M2 draw must stash a readback");
-            assert_eq!(image.width, 64);
-            assert_eq!(image.height, 64);
-            assert!(!image.pixels.is_empty());
-        } else if std::env::var_os("XPS5X_REQUIRE_VULKAN").is_some() {
-            panic!("XPS5X_REQUIRE_VULKAN set but SubmitDcb did not drive a Vulkan draw");
-        }
+        let submissions = gpu.submissions.lock().unwrap();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].0, words);
+        assert_eq!(submissions[0].1, xps5x_core::subsystems::GpuQueue::Graphics);
     }
 
     #[test]

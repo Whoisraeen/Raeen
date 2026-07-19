@@ -9,8 +9,8 @@
   shader metadata no longer re-exports Kyty types; module resolution adds
   strict `HleOnly`/`LleOnly` beside the existing HLE-first default and
   title-supplied LLE preference. Tests: core 6/6, kernel 20/20, firmware 99/99
-  + integration 9/9, HLE 271/271, runtime 86/86, GPU 117/117 + Vulkan
-  integration 9/9, GUI 120/120 (GPU teardown test rerun pending).
+  + integration 9/9, HLE 271/271, runtime 86/86, GPU 118/118 + Vulkan
+  integration 9/9, GUI 120/120.
 
 (Recreated 2026-07-16 — the previous ledger file was absent from the tree;
 per-module authority is `docs/reference-port-ledger.md`.)
@@ -250,3 +250,25 @@ per-module authority is `docs/reference-port-ledger.md`.)
   known std::out_of_range phase-1-unwinding wall above (first failing HLE
   call sceKernelGetdents → 0x8002000e). The GPU-side path is armed and proven;
   re-measure the moment the boot wall falls.
+
+- ASTRO.BOT scene-shader opcode batch (2026-07-18, commit pending; 258/258
+  kyty-graphics, 129/129 xps5x-gpu, 276/276 xps5x-hle tests; 1 diagnostic GPU
+  test ignored; kyty-graphics+xps5x-gpu clippy clean; GUI build green):
+  closed seven title-measured translation blockers with typed decode + SPIR-V
+  acceptance coverage. `S_GETPC_B64` now materializes the absolute address of
+  the following instruction (including guest bases above 4 GiB);
+  `S_PACK_LL_B32_B16` packs the two low halfwords; VOP1 SDWA OMOD preserves
+  x2/x4/x0.5 multipliers; address-only `BUFFER_LOAD_DWORDX4` uses zero index;
+  `IMAGE_GET_RESINFO dmask=xy` emits `OpImageQuerySizeLod`; `DS_APPEND` and
+  `DS_CONSUME` accept their unused non-zero addr field; and
+  `IMAGE_SAMPLE_C_LZ` consumes Gen5 `{reference,x,y}`, samples at LOD zero,
+  performs the manual `reference <= red` comparison used by SharpEmu, then
+  applies all seven supported dmask layouts. The comparison module assembles
+  and validates through Naga. Kyty remains behind the xps5x-gpu contract.
+  Fresh ASTRO.BOT frame measurement is not yet attributable to this batch:
+  two provider-specific ABI aliases (`libSceLibcInternal` C ABI and libkernel
+  POSIX pthread names) fixed earlier link stops, but the current architecture
+  branch then spins after module_start in native libc allocator mutex traffic
+  (443,720 balanced HLE calls/30 s, last HLE scePthreadMutexUnlock), before AGC
+  submission. Artifact: `scratch/astro-opcodes-20260718-201535/`; fix that boot
+  regression before claiming a translated-shader or frame-count improvement.

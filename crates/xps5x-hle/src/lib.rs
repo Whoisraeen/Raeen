@@ -269,7 +269,7 @@ impl<'a> ExecutableGuestMapping<'a> {
     pub fn validate(memory: &'a dyn GuestMemory, range: GuestRange) -> Option<Self> {
         memory
             .is_executable_range(range)
-            .then(|| Self(ValidatedGuestRange {
+            .then_some(Self(ValidatedGuestRange {
                 memory,
                 range,
                 access: GuestAccess::Read,
@@ -290,7 +290,7 @@ impl<'a> GpuVisibleGuestRange<'a> {
     pub fn validate(memory: &'a dyn GuestMemory, range: GuestRange) -> Option<Self> {
         memory
             .is_gpu_visible_range(range)
-            .then(|| Self(ValidatedGuestRange {
+            .then_some(Self(ValidatedGuestRange {
                 memory,
                 range,
                 access: GuestAccess::ReadWrite,
@@ -301,6 +301,37 @@ impl<'a> GpuVisibleGuestRange<'a> {
     pub const fn range(&self) -> GuestRange {
         self.0.range()
     }
+}
+
+/// Host-side staging bound for one bulk HLE memory operation. Large guest
+/// mappings remain valid, but an ABI adapter must not allocate or loop across
+/// attacker-sized lengths in one call.
+pub(crate) const MAX_HLE_BULK_BYTES: u64 = 256 << 20;
+
+pub(crate) fn zero_guest_range(memory: &dyn GuestMemory, addr: u64, len: u64) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if len > MAX_HLE_BULK_BYTES {
+        return false;
+    }
+    let Some(range) = GuestRange::new(GuestAddress::new(addr), len) else {
+        return false;
+    };
+    if ValidatedGuestRange::validate(memory, range, GuestAccess::Write).is_none() {
+        return false;
+    }
+
+    const ZEROES: [u8; 64 * 1024] = [0; 64 * 1024];
+    let mut written = 0u64;
+    while written < len {
+        let chunk = (len - written).min(ZEROES.len() as u64) as usize;
+        if !memory.write(addr + written, &ZEROES[..chunk]) {
+            return false;
+        }
+        written += chunk as u64;
+    }
+    true
 }
 
 /// Allocates and releases guest memory on behalf of an HLE function —
@@ -466,13 +497,22 @@ pub struct HleContext<'a> {
 /// returns a result.
 pub type HleFunction = fn(&HleContext, &[u64]) -> u64;
 
+fn canonical_provider_name(provider: &str) -> String {
+    let lower = provider.to_ascii_lowercase();
+    lower
+        .strip_suffix(".sprx")
+        .or_else(|| lower.strip_suffix(".prx"))
+        .unwrap_or(&lower)
+        .to_string()
+}
+
 /// Registry of all HLE'd library functions.
 pub struct HleRegistry {
     /// Map of "library::function" → implementation.
     functions: DashMap<String, HleFunction>,
     /// Explicit NID → `"library::function"` bindings for functions whose real
     /// name is unknown — see [`HleRegistry::register_nid`].
-    nid_overrides: DashMap<u64, String>,
+    nid_overrides: DashMap<(String, u64), String>,
 }
 
 impl HleRegistry {
@@ -592,7 +632,8 @@ impl HleRegistry {
     ) {
         let key = format!("{}::{}", library, function);
         debug!("HLE register by NID {nid:#018x}: {key}");
-        self.nid_overrides.insert(nid, key.clone());
+        self.nid_overrides
+            .insert((canonical_provider_name(library), nid), key.clone());
         self.functions.insert(key, implementation);
     }
 
@@ -602,7 +643,17 @@ impl HleRegistry {
     pub fn registered_nid_overrides(&self) -> Vec<(u64, String)> {
         self.nid_overrides
             .iter()
-            .map(|e| (*e.key(), e.value().clone()))
+            .map(|entry| (entry.key().1, entry.value().clone()))
+            .collect()
+    }
+
+    /// Provider-aware explicit bindings used by the firmware linker. Unlike
+    /// the legacy diagnostic view above, this preserves the library half of
+    /// the import identity when two providers use the same numeric NID.
+    pub fn registered_provider_nid_overrides(&self) -> Vec<(String, u64, String)> {
+        self.nid_overrides
+            .iter()
+            .map(|entry| (entry.key().0.clone(), entry.key().1, entry.value().clone()))
             .collect()
     }
 
@@ -854,6 +905,32 @@ pub(crate) fn test_ctx<'a>(
     mem: &'a TestMemory,
     alloc: &'a TestAllocator,
 ) -> HleContext<'a> {
+    struct NoGpu;
+    impl GpuSubmissionSubsystem for NoGpu {
+        fn submit(&self, _words: Vec<u32>, _queue: xps5x_core::subsystems::GpuQueue) {}
+        fn map_shader_metadata(
+            &self,
+            _code_address: u64,
+            _data: xps5x_core::subsystems::ShaderMappedData,
+        ) {
+        }
+        fn present_scanout(&self, _address: u64) {}
+        fn wait_idle(&self) {}
+        fn stats(&self) -> xps5x_core::subsystems::GpuSubmissionStats {
+            xps5x_core::subsystems::GpuSubmissionStats::default()
+        }
+    }
+    static NO_GPU: NoGpu = NoGpu;
+    test_ctx_with_gpu(kernel, mem, alloc, &NO_GPU)
+}
+
+#[cfg(test)]
+pub(crate) fn test_ctx_with_gpu<'a>(
+    kernel: &'a xps5x_kernel::OrbisKernel,
+    mem: &'a TestMemory,
+    alloc: &'a TestAllocator,
+    gpu: &'a dyn GpuSubmissionSubsystem,
+) -> HleContext<'a> {
     struct NoGuestCalls;
     impl GuestCallScheduler for NoGuestCalls {
         fn request(&self, _request: GuestCallRequest) -> bool {
@@ -884,20 +961,10 @@ pub(crate) fn test_ctx<'a>(
         }
     }
     static NO_GUEST_THREADS: NoGuestThreads = NoGuestThreads;
-    struct NoGpu;
-    impl GpuSubmissionSubsystem for NoGpu {
-        fn submit(&self, _words: Vec<u32>, _queue: xps5x_core::subsystems::GpuQueue) {}
-        fn wait_idle(&self) {}
-        fn stats(&self) -> xps5x_core::subsystems::GpuSubmissionStats {
-            xps5x_core::subsystems::GpuSubmissionStats::default()
-        }
-    }
-    static NO_GPU: NoGpu = NoGpu;
-
     HleContext {
         kernel,
         services: kernel,
-        gpu: &NO_GPU,
+        gpu,
         mem,
         alloc,
         guest_calls: &NO_GUEST_CALLS,
@@ -1008,6 +1075,37 @@ mod tests {
             names,
             vec![("libFoo".to_string(), "someFunction".to_string())]
         );
+    }
+
+    #[test]
+    fn explicit_equal_nids_remain_distinct_per_provider() {
+        fn first(_ctx: &HleContext, _args: &[u64]) -> u64 {
+            1
+        }
+        fn second(_ctx: &HleContext, _args: &[u64]) -> u64 {
+            2
+        }
+        let registry = HleRegistry {
+            functions: DashMap::new(),
+            nid_overrides: DashMap::new(),
+        };
+        let nid = 0x1234_5678_9abc_def0;
+        registry.register_nid("libAlpha", "unknownAlpha", nid, first);
+        registry.register_nid("libBeta", "unknownBeta", nid, second);
+
+        let mut bindings = registry.registered_provider_nid_overrides();
+        bindings.sort();
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings.contains(&(
+            "libalpha".to_string(),
+            nid,
+            "libAlpha::unknownAlpha".to_string()
+        )));
+        assert!(bindings.contains(&(
+            "libbeta".to_string(),
+            nid,
+            "libBeta::unknownBeta".to_string()
+        )));
     }
 
     /// **A NID cannot tell two libraries apart.** It hashes the function name

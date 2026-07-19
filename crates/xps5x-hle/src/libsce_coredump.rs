@@ -9,13 +9,9 @@
 //! call reports success so a title's crash-reporting init completes.
 
 use crate::{HleContext, HleRegistry};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 const OK: u64 = 0;
-
-// SharpEmu's `_coredumpHandler` / `_coredumpHandlerContext` (0 = unregistered).
-static HANDLER: AtomicU64 = AtomicU64::new(0);
-static HANDLER_CONTEXT: AtomicU64 = AtomicU64::new(0);
 
 /// Register the libSceCoredump functions.
 pub fn register(registry: &HleRegistry) {
@@ -29,9 +25,13 @@ pub fn register(registry: &HleRegistry) {
 /// `sceCoredumpRegisterCoredumpHandler(handler, context, ...)`: records the
 /// handler pointer + user context. The handler is never invoked (no crash-path
 /// callback yet).
-fn hle_register_handler(_ctx: &HleContext, args: &[u64]) -> u64 {
-    HANDLER.store(args.first().copied().unwrap_or(0), Ordering::Relaxed);
-    HANDLER_CONTEXT.store(args.get(1).copied().unwrap_or(0), Ordering::Relaxed);
+fn hle_register_handler(ctx: &HleContext, args: &[u64]) -> u64 {
+    ctx.kernel
+        .coredump_handler
+        .store(args.first().copied().unwrap_or(0), Ordering::Relaxed);
+    ctx.kernel
+        .coredump_handler_context
+        .store(args.get(1).copied().unwrap_or(0), Ordering::Relaxed);
     OK
 }
 
@@ -48,7 +48,10 @@ mod tests {
         let ctx = test_ctx(&kernel, &mem, &alloc);
 
         assert_eq!(hle_register_handler(&ctx, &[0xCAFE, 0xF00D]), OK);
-        assert_eq!(HANDLER.load(Ordering::Relaxed), 0xCAFE);
-        assert_eq!(HANDLER_CONTEXT.load(Ordering::Relaxed), 0xF00D);
+        assert_eq!(kernel.coredump_handler.load(Ordering::Relaxed), 0xCAFE);
+        assert_eq!(
+            kernel.coredump_handler_context.load(Ordering::Relaxed),
+            0xF00D
+        );
     }
 }

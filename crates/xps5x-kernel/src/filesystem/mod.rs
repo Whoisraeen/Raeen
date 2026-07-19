@@ -212,7 +212,10 @@ impl VirtualFileSystem {
     /// point — the real API errors BUSY there, and idempotency is the safer
     /// HLE degradation. Directory creation and mount-mode policy remain the
     /// save-data service's responsibility.
-    pub fn mount_savedata_slot(&self, slot_name: &str) -> Result<(String, PathBuf), std::io::Error> {
+    pub fn mount_savedata_slot(
+        &self,
+        slot_name: &str,
+    ) -> Result<(String, PathBuf), std::io::Error> {
         let path = self.savedata_slot_path(slot_name)?;
         let mut slots = self.savedata_mounts.write();
         if let Some(index) = slots
@@ -1132,7 +1135,9 @@ mod tests {
         let vfs = VirtualFileSystem::new();
         vfs.set_savedata_directory(&root);
 
-        let (settings, _) = vfs.mount_savedata_slot("BedrockUserSettingsStorage").unwrap();
+        let (settings, _) = vfs
+            .mount_savedata_slot("BedrockUserSettingsStorage")
+            .unwrap();
         let (cache, _) = vfs.mount_savedata_slot("BedrockLevelInfoCache").unwrap();
         assert_eq!(settings, "/savedata0");
         assert_eq!(cache, "/savedata1");

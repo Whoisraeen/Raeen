@@ -35,12 +35,12 @@ mod thread;
 /// Windows-only, like the rest of the execution core.
 #[cfg(target_os = "windows")]
 pub use thread::sample_guest_rips;
+#[cfg(target_os = "windows")]
+pub use thread::{GuestProcess, GuestProcessHandle, GuestProcessSnapshot};
 /// Diagnostic: shallow HOST backtrace per guest thread, symbolized to
 /// `module+offset` — names where a stalled thread is parked in our code / ntdll.
 #[cfg(target_os = "windows")]
 pub use thread::{host_module_for_addr, sample_host_backtraces};
-#[cfg(target_os = "windows")]
-pub use thread::{GuestProcess, GuestProcessHandle, GuestProcessSnapshot};
 #[cfg(target_os = "windows")]
 mod tls;
 #[cfg(target_os = "windows")]
@@ -57,6 +57,8 @@ pub mod vmm;
 pub use dispatch::fsbase_rearm_count;
 
 use thiserror::Error;
+#[cfg(target_os = "windows")]
+use xps5x_firmware::ModuleInitRole;
 use xps5x_firmware::LinkedModule;
 use xps5x_hle::{GuestMemory, HleRegistry};
 use xps5x_kernel::OrbisKernel;
@@ -75,6 +77,61 @@ pub enum RunOutcome {
     /// The guest called a terminating function (`exit`-family); the value
     /// is the exit code passed to it (SysV arg 0, i.e. `Rdi`).
     Exited(u64),
+}
+
+/// Who runs the **main executable's** `DT_INIT` initializer — the decision that
+/// makes a real title boot instead of double-constructing its globals.
+///
+/// A retail crt0 `_start` walks the executable's own init array, so a loader
+/// that *also* calls the main initializer runs those constructors twice.
+/// Measured on ASTRO.BOT, a list-building constructor then formed a cyclic list
+/// its own later walk spun on forever (t1 frozen at `module+0x7426c00`). The
+/// two runtime entry points therefore differ:
+///
+/// * [`CrtOwnsMainInit`](EntryPolicy::CrtOwnsMainInit) — [`execute_process`]:
+///   a genuine crt0 `_start` is entered, and it runs the main initializer
+///   itself, so the loader runs **only the dependency** initializers.
+/// * [`LoaderOwnsMainInit`](EntryPolicy::LoaderOwnsMainInit) — [`execute_linked`]
+///   (direct function/module execution): no crt0 is entered, so nothing else
+///   will run the main initializer; the loader runs **every** initializer,
+///   main included. Function-mode fixtures carry no initializers, so this is a
+///   no-op for them, but a directly-run module with constructors gets them.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryPolicy {
+    /// The guest crt0 `_start` owns the main initializer; the loader withholds it.
+    CrtOwnsMainInit,
+    /// No crt0 runs; the loader owns every initializer, main included.
+    LoaderOwnsMainInit,
+}
+
+/// Whether the loader itself invokes an initializer with `role` under `policy`.
+///
+/// The whole truth table: the loader runs every initializer **except** the main
+/// executable's own under [`EntryPolicy::CrtOwnsMainInit`], which the crt0
+/// `_start` runs instead (running it here too is the ASTRO.BOT double-init
+/// hang; see [`EntryPolicy`]).
+#[cfg(target_os = "windows")]
+fn loader_runs_initializer(policy: EntryPolicy, role: ModuleInitRole) -> bool {
+    !matches!(
+        (policy, role),
+        (EntryPolicy::CrtOwnsMainInit, ModuleInitRole::Main)
+    )
+}
+
+/// `XPS5X_SKIP_MAIN_INIT` used to be required to reach the proven boot path;
+/// deferring the main initializer to crt0 is now the default, so the variable
+/// is deprecated. Warn once (per process entry) if it is still set so a stale
+/// launcher configuration is visible rather than silently ignored.
+#[cfg(target_os = "windows")]
+fn warn_if_deprecated_skip_main_init_set() {
+    if std::env::var_os("XPS5X_SKIP_MAIN_INIT").is_some() {
+        tracing::warn!(
+            "XPS5X_SKIP_MAIN_INIT is set but no longer needed — deferring the main \
+             executable's initializer to crt0 is the default (EntryPolicy::CrtOwnsMainInit). \
+             The variable is deprecated and ignored; remove it from your launch environment."
+        );
+    }
 }
 
 /// The guest address space's fixed base (design doc §2/§3): a 4 GiB host
@@ -166,7 +223,7 @@ impl RuntimeError {
 }
 
 /// Errors [`execute_linked`] can return (design doc §5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RuntimeError {
     /// Guest memory (the image mapping or the trampoline guard region)
     /// could not be established, or `entry_offset` did not point within the
@@ -211,8 +268,15 @@ pub enum RuntimeError {
     /// import shared one address, so the fault could not say *which* function
     /// the guest wanted. `nid` names it; map it through
     /// [`xps5x_firmware::LinkedModule::unresolved_stubs`] for the library.
-    #[error("guest called unimplemented import nid {nid:#018x} (stub {addr:#x})")]
-    UnimplementedImport { nid: u64, addr: u64 },
+    #[error(
+        "guest called unimplemented import nid {nid:#018x} from {library:?} (stub {stub_addr:#x}, rip {rip:#x})"
+    )]
+    UnimplementedImport {
+        nid: u64,
+        library: Option<String>,
+        stub_addr: u64,
+        rip: u64,
+    },
     /// More than 6 integer/pointer arguments were requested — RT0 only
     /// marshals the SysV integer argument registers (design doc §3).
     #[error("more than 6 arguments requested (RT0 marshals only the SysV integer registers)")]
@@ -222,6 +286,16 @@ pub enum RuntimeError {
 /// Integer/pointer arguments RT0 marshals: SysV RDI, RSI, RDX, RCX, R8, R9
 /// (design doc §3).
 const MAX_ARGS: usize = 6;
+
+#[cfg(target_os = "windows")]
+struct GpuShutdownGuard(xps5x_gpu::GpuProcessSession);
+
+#[cfg(target_os = "windows")]
+impl Drop for GpuShutdownGuard {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
+}
 
 /// Run `module`'s function at `entry_offset` (an offset into
 /// `module.image`) natively, passing `args` (up to 6 integer/pointer
@@ -255,17 +329,15 @@ pub fn execute_linked(
     let mut padded = [0u64; MAX_ARGS];
     padded[..args.len()].copy_from_slice(args);
 
-    // RT0 supports exactly one active native guest execution at a time
-    // (design doc §4/§6/§9); held for this entire function, not just the
-    // guest call inside `dispatch::run` below — see `dispatch::CALL_LOCK`'s
-    // doc comment for why the trampoline guard reservation just below also
-    // needs this. It also serializes construction of the fixed-base
-    // `GuestArena` below, which only one caller may hold at a time (design
-    // doc §2/§9, `arena::GuestArena`'s doc comment).
+    // Only one top-level process session can own the fixed guest/trampoline
+    // mappings at a time, so the guard covers construction and the whole
+    // launch pipeline. Guest pthread workers inside that process may still
+    // execute concurrently through their thread-local dispatch contexts.
     let _call_lock = dispatch::call_lock();
 
-    let arena = arena::GuestArena::new(&module.image)?;
-    let gpu = xps5x_gpu::AgcGpuSession::global();
+    let arena = std::sync::Arc::new(arena::GuestArena::new(&module.image)?);
+    let gpu = GpuShutdownGuard(xps5x_gpu::AgcGpuSession::new_process(arena.clone()));
+    xps5x_gpu::AgcGpuSession::install_process(&gpu.0);
     // Expose the module's PT_SCE_PROCPARAM block (if any) to the guest via
     // `sceKernelGetProcParam`: its guest address is the arena base plus the
     // segment's image offset (identity-mapped). `0` clears any stale value
@@ -302,6 +374,30 @@ pub fn execute_linked(
     let static_tls_block = static_tls_block(tcb, &module.tls_layout);
     register_static_tls_layout(kernel, &module.tls_layout);
 
+    // Direct function/module execution enters no crt0, so the loader owns every
+    // initializer this module carries, main included (EntryPolicy::
+    // LoaderOwnsMainInit). Function-mode fixtures (`link_module` leaves
+    // `module_inits` empty) run none; a directly executed module that *does*
+    // carry constructors gets them before its entry — and never the double run
+    // that only a crt0-owning process entry could cause. An initializer that
+    // terminates the process surfaces as the run's value, exactly as the entry
+    // point's own `exit` would.
+    if let Some(RunOutcome::Exited(code)) = run_module_initializers(
+        EntryPolicy::LoaderOwnsMainInit,
+        module,
+        hle,
+        kernel,
+        arena.as_ref(),
+        &guard,
+        &gpu.0,
+        tcb,
+        static_tls_block,
+        None,
+        guest_rsp,
+    )? {
+        return Ok(code);
+    }
+
     // SAFETY: `entry_ptr` is a host address inside `arena`'s
     // `PAGE_EXECUTE_READWRITE` image sub-region, at the caller-specified
     // `entry_offset` into `module.image` — code the LM1 pipeline produced,
@@ -333,9 +429,9 @@ pub fn execute_linked(
             &module.unresolved_stubs,
             hle,
             kernel,
-            &arena,
-            &arena,
-            &gpu,
+            arena.as_ref(),
+            arena.as_ref(),
+            &gpu.0,
             &guard,
             tcb,
             static_tls_block,
@@ -391,12 +487,20 @@ pub fn execute_process(
     envp: &[&str],
 ) -> Result<RunOutcome, RuntimeError> {
     let _call_lock = dispatch::call_lock();
-    let arena = arena::GuestArena::new(&module.image)?;
+    let arena = std::sync::Arc::new(arena::GuestArena::new(&module.image)?);
     let guard = trampoline::TrampolineGuard::reserve(module.hle_trampolines.len())?;
-    let gpu = xps5x_gpu::AgcGpuSession::new_process();
+    let gpu = xps5x_gpu::AgcGpuSession::new_process(arena.clone());
     xps5x_gpu::AgcGpuSession::install_process(&gpu);
     let result = execute_process_mapped(
-        module, hle, kernel, &arena, &guard, &gpu, None, argv, envp,
+        module,
+        hle,
+        kernel,
+        arena.as_ref(),
+        &guard,
+        &gpu,
+        None,
+        argv,
+        envp,
     );
     gpu.shutdown();
     result
@@ -414,12 +518,40 @@ pub fn execute_process_shared(
     argv: &[&str],
     envp: &[&str],
 ) -> Result<RunOutcome, RuntimeError> {
+    execute_process_shared_inner(module, hle, kernel, argv, envp, |_| {})
+}
+
+/// Execute a process and publish its ownership handle before entering guest
+/// code. Shell/session controllers use the handle for cooperative termination
+/// and diagnostics; the runtime still owns teardown and joins all workers.
+#[cfg(target_os = "windows")]
+pub fn execute_process_shared_with_control(
+    module: std::sync::Arc<LinkedModule>,
+    hle: std::sync::Arc<HleRegistry>,
+    kernel: std::sync::Arc<OrbisKernel>,
+    argv: &[&str],
+    envp: &[&str],
+    on_start: impl FnOnce(GuestProcessHandle),
+) -> Result<RunOutcome, RuntimeError> {
+    execute_process_shared_inner(module, hle, kernel, argv, envp, on_start)
+}
+
+#[cfg(target_os = "windows")]
+fn execute_process_shared_inner(
+    module: std::sync::Arc<LinkedModule>,
+    hle: std::sync::Arc<HleRegistry>,
+    kernel: std::sync::Arc<OrbisKernel>,
+    argv: &[&str],
+    envp: &[&str],
+    on_start: impl FnOnce(GuestProcessHandle),
+) -> Result<RunOutcome, RuntimeError> {
     let _call_lock = dispatch::call_lock();
     let arena = std::sync::Arc::new(arena::GuestArena::new(&module.image)?);
     let guard = std::sync::Arc::new(trampoline::TrampolineGuard::reserve(
         module.hle_trampolines.len(),
     )?);
     let process = thread::GuestProcess::create(module, hle, kernel, arena, guard);
+    on_start(process.clone());
     // The main guest thread is id 1 and runs on THIS host thread — it never goes
     // through `GuestProcess::create`'s spawn path, so record its handle here or
     // the RIP sampler would be blind to the one thread that drives boot.
@@ -435,6 +567,7 @@ pub fn execute_process_shared(
         argv,
         envp,
     );
+    thread::release_host_thread_handle(&process.kernel, 1);
     let process_exit_was_requested = process.requested_exit_code().is_some();
     let fallback_code = match &result {
         Ok(RunOutcome::Exited(code)) => *code,
@@ -449,6 +582,105 @@ pub fn execute_process_shared(
     } else {
         result
     }
+}
+
+/// Run the module initializers the loader owns under `policy`, in schedule
+/// order (dependencies first, main last), each on `init_rsp` (which must
+/// address a guarded return trampoline).
+///
+/// Returns `Ok(Some(Exited(code)))` if an initializer terminated the whole
+/// process (an `exit`-family call from a constructor), which the caller
+/// propagates instead of continuing to the entry point; `Ok(None)` to continue.
+/// Under [`EntryPolicy::CrtOwnsMainInit`] the main executable's initializer is
+/// withheld here (the crt0 `_start` runs it) — the ASTRO.BOT double-init fix.
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn run_module_initializers(
+    policy: EntryPolicy,
+    module: &LinkedModule,
+    hle: &HleRegistry,
+    kernel: &OrbisKernel,
+    arena: &arena::GuestArena,
+    guard: &trampoline::TrampolineGuard,
+    gpu: &dyn xps5x_core::subsystems::GpuSubmissionSubsystem,
+    tcb: Option<u64>,
+    static_tls_block: Option<u64>,
+    guest_threads: Option<&dyn xps5x_hle::GuestThreadScheduler>,
+    init_rsp: u64,
+) -> Result<Option<RunOutcome>, RuntimeError> {
+    use xps5x_core::diagnostics::DiagnosticKind;
+
+    // A per-entry ordinal in schedule order, stable across runs. The
+    // process-scoped `DiagnosticRecorder` assigns the cross-category sequence
+    // number; this identifies the initializer within the init phase itself.
+    for (index, init) in module.module_inits.iter().enumerate() {
+        let ordinal = index + 1;
+        if !loader_runs_initializer(policy, init.role) {
+            tracing::info!(
+                "{}: {} module_start (+{:#x}) deferred to crt0 (process entry owns it)",
+                init.name,
+                init.role,
+                init.image_offset
+            );
+            kernel.diagnostics.record(
+                1,
+                DiagnosticKind::ModuleInit,
+                init.name.clone(),
+                init.image_offset,
+                format!("role={} ordinal={ordinal} deferred-to-crt0", init.role),
+            );
+            continue;
+        }
+        let Ok(ptr) = arena.entry_ptr(init.image_offset) else {
+            tracing::warn!(
+                "{}: module_start at +{:#x} is outside the image — skipping",
+                init.name,
+                init.image_offset
+            );
+            continue;
+        };
+        tracing::info!(
+            "{}: calling {} module_start (+{:#x})",
+            init.name,
+            init.role,
+            init.image_offset
+        );
+        kernel.diagnostics.record(
+            1,
+            DiagnosticKind::ModuleInit,
+            init.name.clone(),
+            init.image_offset,
+            format!("role={} ordinal={ordinal} run", init.role),
+        );
+        // SAFETY: `ptr` is executable guest code in the live arena; `init_rsp`
+        // points at the guarded return address and dispatch arms recovery
+        // before `enter_guest` transfers control — the same contract the
+        // process-entry and function-entry calls satisfy.
+        let outcome = unsafe {
+            dispatch::run(
+                &module.hle_trampolines,
+                &module.unresolved_stubs,
+                hle,
+                kernel,
+                arena,
+                arena,
+                gpu,
+                guard,
+                tcb,
+                static_tls_block,
+                guest_threads,
+                1,
+                || crate::stack::enter_guest(ptr as u64, init_rsp, [0; 6]),
+            )
+        }?;
+        match outcome {
+            RunOutcome::Returned(rc) => {
+                tracing::info!("{}: module_start returned {rc:#x}", init.name);
+            }
+            RunOutcome::Exited(code) => return Ok(Some(RunOutcome::Exited(code))),
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(target_os = "windows")]
@@ -574,61 +806,29 @@ fn execute_process_mapped(
     // `dispatch::run`'s `call_guest` contract. The remaining arguments carry
     // the same safety argument as `execute_linked`'s call to `dispatch::run`
     // above.
-    // Diagnostic: XPS5X_SKIP_MAIN_INIT skips the MAIN module's module_start
-    // call (the LAST entry in `module_inits`, after the dependencies'). A title
-    // whose crt0 `_start` runs the same init array again gets ctors run TWICE —
-    // measured on ASTRO.BOT: a list-adding ctor then builds a cyclic list its
-    // own walk spins on (t1 frozen at a `mov rdx,[rcx]; lea rcx,[rdx+0x10];
-    // jnz` cycle). Skipping the loader's call leaves exactly one run (crt0's).
-    let skip_main_init = std::env::var_os("XPS5X_SKIP_MAIN_INIT").is_some();
-    let init_count = module.module_inits.len();
-    for (i, init) in module.module_inits.iter().enumerate() {
-        if skip_main_init && i + 1 == init_count {
-            tracing::warn!(
-                "{}: XPS5X_SKIP_MAIN_INIT — loader's module_start skipped (crt0 will run it)",
-                init.name
-            );
-            continue;
-        }
-        let Ok(ptr) = arena.entry_ptr(init.image_offset) else {
-            tracing::warn!(
-                "{}: module_start at +{:#x} is outside the image — skipping",
-                init.name,
-                init.image_offset
-            );
-            continue;
-        };
-        tracing::info!(
-            "{}: calling module_start (+{:#x})",
-            init.name,
-            init.image_offset
-        );
-        // SAFETY: `ptr` is executable guest code in the live arena;
-        // `module_rsp` points at the guarded return address and dispatch arms
-        // recovery before `enter_guest` transfers control.
-        let outcome = unsafe {
-            dispatch::run(
-                &module.hle_trampolines,
-                &module.unresolved_stubs,
-                hle,
-                kernel,
-                arena,
-                arena,
-                gpu,
-                guard,
-                tcb,
-                static_tls_block,
-                guest_threads,
-                1,
-                || crate::stack::enter_guest(ptr as u64, module_rsp, [0; 6]),
-            )
-        }?;
-        match outcome {
-            RunOutcome::Returned(rc) => {
-                tracing::info!("{}: module_start returned {rc:#x}", init.name);
-            }
-            RunOutcome::Exited(code) => return Ok(RunOutcome::Exited(code)),
-        }
+    // Process mode enters a genuine crt0 `_start`, which walks the executable's
+    // own init array itself — so the loader runs only the DEPENDENCY
+    // initializers and withholds the main executable's (EntryPolicy::
+    // CrtOwnsMainInit). Running the main initializer here too double-constructs
+    // the title's globals: measured on ASTRO.BOT, a list-adding ctor then builds
+    // a cyclic list its own walk spins on forever (t1 frozen at a
+    // `mov rdx,[rcx]; lea rcx,[rdx+0x10]; jnz` cycle at `module+0x7426c00`).
+    // This is the default correctness path; no environment variable required.
+    warn_if_deprecated_skip_main_init_set();
+    if let Some(exited) = run_module_initializers(
+        EntryPolicy::CrtOwnsMainInit,
+        module,
+        hle,
+        kernel,
+        arena,
+        guard,
+        gpu,
+        tcb,
+        static_tls_block,
+        guest_threads,
+        module_rsp,
+    )? {
+        return Ok(exited);
     }
 
     // Process mode deliberately keeps the parameter block at RSP for the

@@ -15,7 +15,38 @@
 //! Machines without Vulkan 1.3 skip (unless `XPS5X_REQUIRE_VULKAN=1`).
 
 use kyty_graphics::pm4;
+use std::sync::Arc;
+use xps5x_gpu::GpuGuestMemory;
 use xps5x_gpu::agc_exec::AgcGpuSession;
+
+struct TestGpuMemory {
+    start: u64,
+    len: u64,
+}
+
+impl GpuGuestMemory for TestGpuMemory {
+    fn validate_gpu_range(&self, addr: u64, len: u64, write: bool) -> bool {
+        !write
+            && addr >= self.start
+            && addr
+                .checked_add(len)
+                .is_some_and(|end| end <= self.start + self.len)
+    }
+
+    fn read_gpu(&self, addr: u64, out: &mut [u8]) -> bool {
+        if !self.validate_gpu_range(addr, out.len() as u64, false) {
+            return false;
+        }
+        // SAFETY: `AlignedBlob` owns this exact range and outlives the
+        // synchronous session call in each test.
+        unsafe { std::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len()) };
+        true
+    }
+
+    fn write_gpu(&self, _addr: u64, _data: &[u8]) -> bool {
+        false
+    }
+}
 
 /// `s_endpgm`.
 const S_ENDPGM: u32 = 0xBF81_0000;
@@ -62,8 +93,21 @@ struct AlignedBlob {
     addr: u64,
 }
 
+impl AlignedBlob {
+    fn memory(&self) -> Arc<dyn GpuGuestMemory> {
+        Arc::new(TestGpuMemory {
+            start: self._storage.as_ptr() as u64,
+            len: std::mem::size_of_val(self._storage.as_slice()) as u64,
+        })
+    }
+}
+
 fn place_aligned(blob: &[u32]) -> AlignedBlob {
-    let mut storage = vec![0u32; blob.len() + 64];
+    // ShaderCache fetches one bounded 4 KiB page at a time, matching a real
+    // guest mapping. Keep a full readable page after the alignment slide; a
+    // tiny Vec containing only the fixture blob is not a faithful GPU-visible
+    // mapping and correctly fails the new capability check.
+    let mut storage = vec![0u32; blob.len().max(1024) + 64];
     let base = storage.as_ptr() as u64;
     let aligned = base.next_multiple_of(256);
     let offset = ((aligned - base) / 4) as usize;
@@ -158,7 +202,7 @@ fn guest_memory_pixel_shader_draws_green() {
     let (width, height) = (64u32, 32u32);
     let dcb = build_guest_ps_dcb(width, height, blob.addr);
 
-    let session = AgcGpuSession::global();
+    let session = AgcGpuSession::new_process(blob.memory());
     let ok_before = session.shader_stats().translated_ok;
     let image = match session.execute_dcb_cp(&dcb, false) {
         Ok(Some(image)) => image,
@@ -182,6 +226,7 @@ fn guest_memory_pixel_shader_draws_green() {
         session.shader_stats().translated_ok > ok_before,
         "the draw must have gone through the guest fetch+translate path"
     );
+    session.shutdown();
 }
 
 /// A PS bind pointing at bytes that are not a translatable shader must skip
@@ -193,7 +238,7 @@ fn untranslatable_guest_shader_skips_the_draw_not_the_dcb() {
     let blob = place_aligned(&garbage[..1024]);
     let dcb = build_guest_ps_dcb(48, 48, blob.addr);
 
-    let session = AgcGpuSession::global();
+    let session = AgcGpuSession::new_process(blob.memory());
     let skips_before = session.shader_skip_count();
     let failed_before = session.shader_stats().translate_failed;
     match session.execute_dcb_cp(&dcb, false) {
@@ -211,4 +256,5 @@ fn untranslatable_guest_shader_skips_the_draw_not_the_dcb() {
         Ok(Some(_)) => panic!("garbage cannot translate — nothing may draw"),
         Err(e) => if require_or_skip(&e) {},
     }
+    session.shutdown();
 }

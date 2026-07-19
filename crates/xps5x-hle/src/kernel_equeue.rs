@@ -502,7 +502,7 @@ mod tests {
         let (kernel, mem, alloc) = ctx_env();
         let ctx = test_ctx(&kernel, &mem, &alloc);
         let eq = create(&ctx);
-        let fd = kernel.create_socket();
+        let fd = kernel.create_socket().expect("socket quota available");
         assert_eq!(hle_add_read_event(&ctx, &[eq, fd as u64, 0xCAFE]), OK);
         let event = kernel
             .kernel_equeue_events

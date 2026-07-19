@@ -16,10 +16,10 @@
 #![cfg(target_os = "windows")]
 
 use xps5x_firmware::dynlib::nid::{NidDatabase, nid_of};
-use xps5x_firmware::dynlib::{DynSymbol, DynlibData, SceRela};
+use xps5x_firmware::dynlib::{DynSymbol, DynlibData, SceRela, SymbolRef};
 use xps5x_firmware::{
-    HLE_TRAMPOLINE_BASE, HleTrampoline, LinkedModule, ModuleRegistry, SprxModule, SprxSegment,
-    TlsTemplate, UNRESOLVED_STUB_BASE, UnresolvedStub, link_module,
+    HLE_TRAMPOLINE_BASE, HleTrampoline, LinkedModule, ModuleInit, ModuleInitRole, ModuleRegistry,
+    SprxModule, SprxSegment, TlsTemplate, UNRESOLVED_STUB_BASE, UnresolvedStub, link_module,
 };
 use xps5x_hle::{HleContext, HleRegistry};
 use xps5x_kernel::OrbisKernel;
@@ -110,6 +110,33 @@ fn write_entry_stub(buf: &mut [u8], entry_off: usize, slot_off: usize) {
     buf[entry_off + 6] = 0xC3; // ret
 }
 
+/// Add the provider tables a real SCE symbol carries. Runtime fixtures used
+/// to omit them and relied on provider-free NID lookup, which cannot model two
+/// libraries exporting an equal numeric NID.
+fn bind_import_providers(mut dynlib: DynlibData, providers: &[&str]) -> DynlibData {
+    assert_eq!(dynlib.symbols.len(), providers.len());
+    let refs: Vec<SymbolRef> = dynlib
+        .symbols
+        .iter()
+        .zip(providers)
+        .enumerate()
+        .map(|(index, (symbol, _))| SymbolRef {
+            nid: symbol.nid,
+            library_index: (index + 1) as u16,
+            module_index: (index + 1) as u16,
+        })
+        .collect();
+    dynlib.imports = refs.clone();
+    dynlib.symbol_providers = refs.into_iter().map(Some).collect();
+    dynlib.import_libs = providers
+        .iter()
+        .enumerate()
+        .map(|(index, provider)| ((index + 1) as u16, (*provider).to_string()))
+        .collect();
+    dynlib.import_modules = dynlib.import_libs.clone();
+    dynlib
+}
+
 /// Build the `PT_LOAD` segment bytes (a stub entry function calling one
 /// import through `slot_off`) plus the [`DynlibData`] declaring that import
 /// (NID `import_nid`, symtab index 0, one `R_X86_64_JUMP_SLOT` relocation at
@@ -140,19 +167,22 @@ fn build_synthetic_module(
         unwind: None,
     };
 
-    let dynlib = DynlibData {
-        symbols: vec![DynSymbol {
-            nid: import_nid,
-            value: 0,
-            is_import: true,
-        }],
-        relocations: vec![SceRela {
-            offset: slot_off as u64,
-            info: R_X86_64_JUMP_SLOT, // r_sym = 0 (only symtab entry)
-            addend: 0,
-        }],
-        ..Default::default()
-    };
+    let dynlib = bind_import_providers(
+        DynlibData {
+            symbols: vec![DynSymbol {
+                nid: import_nid,
+                value: 0,
+                is_import: true,
+            }],
+            relocations: vec![SceRela {
+                offset: slot_off as u64,
+                info: R_X86_64_JUMP_SLOT, // r_sym = 0 (only symtab entry)
+                addend: 0,
+            }],
+            ..Default::default()
+        },
+        &["libtest"],
+    );
 
     (module, dynlib)
 }
@@ -695,7 +725,9 @@ fn call_to_unresolved_stub_reports_which_import_the_guest_wanted() {
         err,
         RuntimeError::UnimplementedImport {
             nid: WANTED_NID,
-            addr: stub_addr,
+            library: Some("libc".to_string()),
+            stub_addr,
+            rip: stub_addr,
         },
         "the fault must name the import, not just an address"
     );
@@ -1005,19 +1037,22 @@ fn memcpy_hle_call_moves_real_bytes_through_the_runtime() {
         unwind: None,
     };
 
-    let dynlib = DynlibData {
-        symbols: vec![DynSymbol {
-            nid: memcpy_nid,
-            value: 0,
-            is_import: true,
-        }],
-        relocations: vec![SceRela {
-            offset: SLOT_OFF as u64,
-            info: R_X86_64_JUMP_SLOT, // r_sym = 0 (only symtab entry)
-            addend: 0,
-        }],
-        ..Default::default()
-    };
+    let dynlib = bind_import_providers(
+        DynlibData {
+            symbols: vec![DynSymbol {
+                nid: memcpy_nid,
+                value: 0,
+                is_import: true,
+            }],
+            relocations: vec![SceRela {
+                offset: SLOT_OFF as u64,
+                info: R_X86_64_JUMP_SLOT, // r_sym = 0 (only symtab entry)
+                addend: 0,
+            }],
+            ..Default::default()
+        },
+        &["libc"],
+    );
 
     let db = NidDatabase::from_hle_names(hle.registered_names());
     let registry = ModuleRegistry::new(db);
@@ -1114,19 +1149,22 @@ fn malloc_hle_call_returns_a_pointer_inside_the_heap_region() {
         unwind: None,
     };
 
-    let dynlib = DynlibData {
-        symbols: vec![DynSymbol {
-            nid: malloc_nid,
-            value: 0,
-            is_import: true,
-        }],
-        relocations: vec![SceRela {
-            offset: SLOT_OFF as u64,
-            info: R_X86_64_JUMP_SLOT, // r_sym = 0 (only symtab entry)
-            addend: 0,
-        }],
-        ..Default::default()
-    };
+    let dynlib = bind_import_providers(
+        DynlibData {
+            symbols: vec![DynSymbol {
+                nid: malloc_nid,
+                value: 0,
+                is_import: true,
+            }],
+            relocations: vec![SceRela {
+                offset: SLOT_OFF as u64,
+                info: R_X86_64_JUMP_SLOT, // r_sym = 0 (only symtab entry)
+                addend: 0,
+            }],
+            ..Default::default()
+        },
+        &["libc"],
+    );
 
     let db = NidDatabase::from_hle_names(hle.registered_names());
     let registry = ModuleRegistry::new(db);
@@ -1296,33 +1334,36 @@ fn malloc_then_memset_then_readback_proves_real_guest_heap_memory() {
         unwind: None,
     };
 
-    let dynlib = DynlibData {
-        symbols: vec![
-            DynSymbol {
-                nid: malloc_nid,
-                value: 0,
-                is_import: true,
-            },
-            DynSymbol {
-                nid: memset_nid,
-                value: 0,
-                is_import: true,
-            },
-        ],
-        relocations: vec![
-            SceRela {
-                offset: SLOT_MALLOC_OFF as u64,
-                info: R_X86_64_JUMP_SLOT, // r_sym = 0 -> malloc
-                addend: 0,
-            },
-            SceRela {
-                offset: SLOT_MEMSET_OFF as u64,
-                info: (1u64 << 32) | R_X86_64_JUMP_SLOT, // r_sym = 1 -> memset
-                addend: 0,
-            },
-        ],
-        ..Default::default()
-    };
+    let dynlib = bind_import_providers(
+        DynlibData {
+            symbols: vec![
+                DynSymbol {
+                    nid: malloc_nid,
+                    value: 0,
+                    is_import: true,
+                },
+                DynSymbol {
+                    nid: memset_nid,
+                    value: 0,
+                    is_import: true,
+                },
+            ],
+            relocations: vec![
+                SceRela {
+                    offset: SLOT_MALLOC_OFF as u64,
+                    info: R_X86_64_JUMP_SLOT, // r_sym = 0 -> malloc
+                    addend: 0,
+                },
+                SceRela {
+                    offset: SLOT_MEMSET_OFF as u64,
+                    info: (1u64 << 32) | R_X86_64_JUMP_SLOT, // r_sym = 1 -> memset
+                    addend: 0,
+                },
+            ],
+            ..Default::default()
+        },
+        &["libc", "libc"],
+    );
 
     let db = NidDatabase::from_hle_names(hle.registered_names());
     let registry = ModuleRegistry::new(db);
@@ -1513,33 +1554,36 @@ fn mmap_then_memset_then_readback_proves_real_arena_memory_and_records_vmm_metad
         unwind: None,
     };
 
-    let dynlib = DynlibData {
-        symbols: vec![
-            DynSymbol {
-                nid: map_nid,
-                value: 0,
-                is_import: true,
-            },
-            DynSymbol {
-                nid: memset_nid,
-                value: 0,
-                is_import: true,
-            },
-        ],
-        relocations: vec![
-            SceRela {
-                offset: SLOT_MAP_OFF as u64,
-                info: R_X86_64_JUMP_SLOT, // r_sym = 0 -> sceKernelMapFlexibleMemory
-                addend: 0,
-            },
-            SceRela {
-                offset: SLOT_MEMSET_OFF as u64,
-                info: (1u64 << 32) | R_X86_64_JUMP_SLOT, // r_sym = 1 -> memset
-                addend: 0,
-            },
-        ],
-        ..Default::default()
-    };
+    let dynlib = bind_import_providers(
+        DynlibData {
+            symbols: vec![
+                DynSymbol {
+                    nid: map_nid,
+                    value: 0,
+                    is_import: true,
+                },
+                DynSymbol {
+                    nid: memset_nid,
+                    value: 0,
+                    is_import: true,
+                },
+            ],
+            relocations: vec![
+                SceRela {
+                    offset: SLOT_MAP_OFF as u64,
+                    info: R_X86_64_JUMP_SLOT, // r_sym = 0 -> sceKernelMapFlexibleMemory
+                    addend: 0,
+                },
+                SceRela {
+                    offset: SLOT_MEMSET_OFF as u64,
+                    info: (1u64 << 32) | R_X86_64_JUMP_SLOT, // r_sym = 1 -> memset
+                    addend: 0,
+                },
+            ],
+            ..Default::default()
+        },
+        &["libkernel", "libc"],
+    );
 
     let db = NidDatabase::from_hle_names(hle.registered_names());
     let registry = ModuleRegistry::new(db);
@@ -1670,19 +1714,22 @@ fn guest_call_runs_on_dedicated_guest_stack_region() {
         unwind: None,
     };
 
-    let dynlib = DynlibData {
-        symbols: vec![DynSymbol {
-            nid: import_nid,
-            value: 0,
-            is_import: true,
-        }],
-        relocations: vec![SceRela {
-            offset: SLOT_OFF as u64,
-            info: R_X86_64_JUMP_SLOT, // r_sym = 0 (only symtab entry)
-            addend: 0,
-        }],
-        ..Default::default()
-    };
+    let dynlib = bind_import_providers(
+        DynlibData {
+            symbols: vec![DynSymbol {
+                nid: import_nid,
+                value: 0,
+                is_import: true,
+            }],
+            relocations: vec![SceRela {
+                offset: SLOT_OFF as u64,
+                info: R_X86_64_JUMP_SLOT, // r_sym = 0 (only symtab entry)
+                addend: 0,
+            }],
+            ..Default::default()
+        },
+        &["libtest"],
+    );
 
     let db = NidDatabase::from_hle_names(hle.registered_names());
     let registry = ModuleRegistry::new(db);
@@ -2905,26 +2952,29 @@ fn tls_variable_read_through_linker_computed_tpoff64_round_trips_tdata() {
         unwind: None,
     };
 
-    let dynlib = DynlibData {
-        symbols: vec![DynSymbol {
-            nid: nid_of("exit"),
-            value: 0,
-            is_import: true,
-        }],
-        relocations: vec![
-            SceRela {
-                offset: SLOT_EXIT_OFF as u64,
-                info: R_X86_64_JUMP_SLOT, // r_sym = 0 -> the exit import
-                addend: 0,
-            },
-            SceRela {
-                offset: SLOT_TLS_OFF as u64,
-                info: R_X86_64_TPOFF64, // r_sym = 0: offset entirely in the addend
-                addend: TLS_VAR_OFF as i64,
-            },
-        ],
-        ..Default::default()
-    };
+    let dynlib = bind_import_providers(
+        DynlibData {
+            symbols: vec![DynSymbol {
+                nid: nid_of("exit"),
+                value: 0,
+                is_import: true,
+            }],
+            relocations: vec![
+                SceRela {
+                    offset: SLOT_EXIT_OFF as u64,
+                    info: R_X86_64_JUMP_SLOT, // r_sym = 0 -> the exit import
+                    addend: 0,
+                },
+                SceRela {
+                    offset: SLOT_TLS_OFF as u64,
+                    info: R_X86_64_TPOFF64, // r_sym = 0: offset entirely in the addend
+                    addend: TLS_VAR_OFF as i64,
+                },
+            ],
+            ..Default::default()
+        },
+        &["libc"],
+    );
 
     let hle = HleRegistry::new();
     let db = NidDatabase::from_hle_names(hle.registered_names());
@@ -3029,19 +3079,22 @@ fn dependency_tdata_is_materialized_at_its_static_tls_slot() {
         unwind: None,
     };
 
-    let dynlib = DynlibData {
-        symbols: vec![DynSymbol {
-            nid: nid_of("exit"),
-            value: 0,
-            is_import: true,
-        }],
-        relocations: vec![SceRela {
-            offset: SLOT_EXIT_OFF as u64,
-            info: R_X86_64_JUMP_SLOT, // r_sym = 0 -> the exit import
-            addend: 0,
-        }],
-        ..Default::default()
-    };
+    let dynlib = bind_import_providers(
+        DynlibData {
+            symbols: vec![DynSymbol {
+                nid: nid_of("exit"),
+                value: 0,
+                is_import: true,
+            }],
+            relocations: vec![SceRela {
+                offset: SLOT_EXIT_OFF as u64,
+                info: R_X86_64_JUMP_SLOT, // r_sym = 0 -> the exit import
+                addend: 0,
+            }],
+            ..Default::default()
+        },
+        &["libc"],
+    );
 
     let hle = HleRegistry::new();
     let db = NidDatabase::from_hle_names(hle.registered_names());
@@ -3211,33 +3264,36 @@ fn printf_with_guest_format_string_lands_in_the_kernel_console() {
         procparam: None,
         unwind: None,
     };
-    let dynlib = DynlibData {
-        symbols: vec![
-            DynSymbol {
-                nid: nid_of("printf"),
-                value: 0,
-                is_import: true,
-            },
-            DynSymbol {
-                nid: nid_of("exit"),
-                value: 0,
-                is_import: true,
-            },
-        ],
-        relocations: vec![
-            SceRela {
-                offset: SLOT_PRINTF_OFF as u64,
-                info: R_X86_64_JUMP_SLOT, // r_sym = 0 -> printf
-                addend: 0,
-            },
-            SceRela {
-                offset: SLOT_EXIT_OFF as u64,
-                info: (1u64 << 32) | R_X86_64_JUMP_SLOT, // r_sym = 1 -> exit
-                addend: 0,
-            },
-        ],
-        ..Default::default()
-    };
+    let dynlib = bind_import_providers(
+        DynlibData {
+            symbols: vec![
+                DynSymbol {
+                    nid: nid_of("printf"),
+                    value: 0,
+                    is_import: true,
+                },
+                DynSymbol {
+                    nid: nid_of("exit"),
+                    value: 0,
+                    is_import: true,
+                },
+            ],
+            relocations: vec![
+                SceRela {
+                    offset: SLOT_PRINTF_OFF as u64,
+                    info: R_X86_64_JUMP_SLOT, // r_sym = 0 -> printf
+                    addend: 0,
+                },
+                SceRela {
+                    offset: SLOT_EXIT_OFF as u64,
+                    info: (1u64 << 32) | R_X86_64_JUMP_SLOT, // r_sym = 1 -> exit
+                    addend: 0,
+                },
+            ],
+            ..Default::default()
+        },
+        &["libc", "libc"],
+    );
 
     let hle = HleRegistry::new();
     let db = NidDatabase::from_hle_names(hle.registered_names());
@@ -3324,33 +3380,36 @@ fn load_start_module_from_guest_returns_a_usable_handle() {
         procparam: None,
         unwind: None,
     };
-    let dynlib = DynlibData {
-        symbols: vec![
-            DynSymbol {
-                nid: nid_of("sceKernelLoadStartModule"),
-                value: 0,
-                is_import: true,
-            },
-            DynSymbol {
-                nid: nid_of("exit"),
-                value: 0,
-                is_import: true,
-            },
-        ],
-        relocations: vec![
-            SceRela {
-                offset: SLOT_LSM_OFF as u64,
-                info: R_X86_64_JUMP_SLOT, // r_sym = 0
-                addend: 0,
-            },
-            SceRela {
-                offset: SLOT_EXIT_OFF as u64,
-                info: (1u64 << 32) | R_X86_64_JUMP_SLOT, // r_sym = 1
-                addend: 0,
-            },
-        ],
-        ..Default::default()
-    };
+    let dynlib = bind_import_providers(
+        DynlibData {
+            symbols: vec![
+                DynSymbol {
+                    nid: nid_of("sceKernelLoadStartModule"),
+                    value: 0,
+                    is_import: true,
+                },
+                DynSymbol {
+                    nid: nid_of("exit"),
+                    value: 0,
+                    is_import: true,
+                },
+            ],
+            relocations: vec![
+                SceRela {
+                    offset: SLOT_LSM_OFF as u64,
+                    info: R_X86_64_JUMP_SLOT, // r_sym = 0
+                    addend: 0,
+                },
+                SceRela {
+                    offset: SLOT_EXIT_OFF as u64,
+                    info: (1u64 << 32) | R_X86_64_JUMP_SLOT, // r_sym = 1
+                    addend: 0,
+                },
+            ],
+            ..Default::default()
+        },
+        &["libkernel", "libc"],
+    );
 
     let hle = HleRegistry::new();
     let db = NidDatabase::from_hle_names(hle.registered_names());
@@ -3437,33 +3496,36 @@ fn new_libc_strchr_resolves_and_dispatches_through_the_linker() {
         procparam: None,
         unwind: None,
     };
-    let dynlib = DynlibData {
-        symbols: vec![
-            DynSymbol {
-                nid: nid_of("strchr"),
-                value: 0,
-                is_import: true,
-            },
-            DynSymbol {
-                nid: nid_of("exit"),
-                value: 0,
-                is_import: true,
-            },
-        ],
-        relocations: vec![
-            SceRela {
-                offset: SLOT_STRCHR_OFF as u64,
-                info: R_X86_64_JUMP_SLOT,
-                addend: 0,
-            },
-            SceRela {
-                offset: SLOT_EXIT_OFF as u64,
-                info: (1u64 << 32) | R_X86_64_JUMP_SLOT,
-                addend: 0,
-            },
-        ],
-        ..Default::default()
-    };
+    let dynlib = bind_import_providers(
+        DynlibData {
+            symbols: vec![
+                DynSymbol {
+                    nid: nid_of("strchr"),
+                    value: 0,
+                    is_import: true,
+                },
+                DynSymbol {
+                    nid: nid_of("exit"),
+                    value: 0,
+                    is_import: true,
+                },
+            ],
+            relocations: vec![
+                SceRela {
+                    offset: SLOT_STRCHR_OFF as u64,
+                    info: R_X86_64_JUMP_SLOT,
+                    addend: 0,
+                },
+                SceRela {
+                    offset: SLOT_EXIT_OFF as u64,
+                    info: (1u64 << 32) | R_X86_64_JUMP_SLOT,
+                    addend: 0,
+                },
+            ],
+            ..Default::default()
+        },
+        &["libc", "libc"],
+    );
 
     let hle = HleRegistry::new();
     let db = NidDatabase::from_hle_names(hle.registered_names());
@@ -3481,5 +3543,348 @@ fn new_libc_strchr_resolves_and_dispatches_through_the_linker() {
         outcome,
         RunOutcome::Exited(STR_BASE + 1),
         "strchr must return the guest address of '/' — offset 1 of \"a/b\" at STR_BASE"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slice 1: module initialization runs exactly once.
+//
+// A retail crt0 `_start` walks the executable's own init array itself, so a
+// process loader that ALSO calls the main initializer double-constructs the
+// title's globals. Measured on ASTRO.BOT, a list-building constructor then
+// formed a cyclic list its own later walk hung on forever. These fixtures
+// prove: the process loader runs each DEPENDENCY initializer once and
+// WITHHOLDS the main executable's (crt0 owns it), while a crt0-less direct
+// execution (`execute_linked`) is loader-owned and runs everything.
+//
+// Observability: each synthetic initializer is a guest `call [slot]; ret` into
+// a distinct HLE trampoline that bumps a host-side counter — the same
+// trap-and-dispatch channel every other test here uses. A dedicated lock
+// serializes just these tests so one test's counter reset never races
+// another's read (the runtime's own `call_lock` serializes guest execution but
+// not this bookkeeping).
+// ---------------------------------------------------------------------------
+
+/// Serializes the initializer-counter tests so they can share the host-side
+/// call counters below without one test's reset racing another's assertion.
+static INIT_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static DEP_INIT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MAIN_INIT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// HLE function the synthetic DEPENDENCY initializer calls — bumps a host counter.
+fn record_dep_init(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    DEP_INIT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    0
+}
+
+/// HLE function the synthetic MAIN initializer calls — bumps a host counter.
+fn record_main_init(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    MAIN_INIT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    0
+}
+
+// Image layout shared by the initializer fixtures (image is 0x100 bytes).
+const INIT_START_OFF: usize = 0x00; // `_start` (process-mode entry)
+const INIT_LINKED_ENTRY_OFF: usize = 0x20; // trivial `mov eax,0xAB; ret` (function mode)
+const INIT_DEP_FN_OFF: usize = 0x40; // dependency initializer: call [DEP_SLOT]; ret
+const INIT_MAIN_FN_OFF: usize = 0x50; // main initializer: call [MAIN_SLOT]; ret
+const INIT_DEP_SLOT: usize = 0x60; // -> HLE_TRAMPOLINE_BASE + 0  (depInit)
+const INIT_MAIN_SLOT: usize = 0x68; // -> HLE_TRAMPOLINE_BASE + 8  (mainInit)
+const INIT_EXIT_SLOT: usize = 0x70; // -> HLE_TRAMPOLINE_BASE + 16 (libc::exit)
+const INIT_LINKED_SENTINEL: u32 = 0xAB;
+
+/// `call qword ptr [rip+disp32]` (`FF 15 <disp32>`, 6 bytes) at `at`, targeting
+/// the 8-byte slot at `slot_off`. Returns the offset just past the instruction.
+fn write_call_indirect(buf: &mut [u8], at: usize, slot_off: usize) -> usize {
+    let rip_after = at as i64 + 6;
+    let disp32 = (slot_off as i64 - rip_after) as i32;
+    buf[at] = 0xFF;
+    buf[at + 1] = 0x15;
+    buf[at + 2..at + 6].copy_from_slice(&disp32.to_le_bytes());
+    at + 6
+}
+
+/// `call rel32` (`E8 <rel32>`, 5 bytes) at `at`, targeting `target`. Returns the
+/// offset just past the instruction.
+fn write_call_rel(buf: &mut [u8], at: usize, target: usize) -> usize {
+    let rip_after = at as i64 + 5;
+    let rel32 = (target as i64 - rip_after) as i32;
+    buf[at] = 0xE8;
+    buf[at + 1..at + 5].copy_from_slice(&rel32.to_le_bytes());
+    at + 5
+}
+
+/// `mov edi, imm32` (`BF <imm32>`, 5 bytes) at `at`. Returns the next offset.
+fn write_mov_edi(buf: &mut [u8], at: usize, imm: u32) -> usize {
+    buf[at] = 0xBF;
+    buf[at + 1..at + 5].copy_from_slice(&imm.to_le_bytes());
+    at + 5
+}
+
+/// Build the shared initializer fixture image. `start_runs_main` chooses the
+/// `_start` shape: `true` emulates a crt0 that re-runs the executable's own
+/// initializer (`call INIT_MAIN_FN_OFF`) before exiting; `false` exits without
+/// touching it (proving the loader's own decision in isolation).
+fn build_init_image(start_runs_main: bool, exit_code: u32) -> Vec<u8> {
+    let mut img = vec![0u8; 0x100];
+
+    // Dependency initializer @0x40: call [DEP_SLOT]; ret
+    let past = write_call_indirect(&mut img, INIT_DEP_FN_OFF, INIT_DEP_SLOT);
+    img[past] = 0xC3;
+    // Main initializer @0x50: call [MAIN_SLOT]; ret
+    let past = write_call_indirect(&mut img, INIT_MAIN_FN_OFF, INIT_MAIN_SLOT);
+    img[past] = 0xC3;
+    // Function-mode entry @0x20: mov eax, 0xAB; ret
+    img[INIT_LINKED_ENTRY_OFF] = 0xB8;
+    img[INIT_LINKED_ENTRY_OFF + 1..INIT_LINKED_ENTRY_OFF + 5]
+        .copy_from_slice(&INIT_LINKED_SENTINEL.to_le_bytes());
+    img[INIT_LINKED_ENTRY_OFF + 5] = 0xC3;
+
+    // Trampoline slots (index i -> HLE_TRAMPOLINE_BASE + i*8, per trampoline::resolve).
+    img[INIT_DEP_SLOT..INIT_DEP_SLOT + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+    img[INIT_MAIN_SLOT..INIT_MAIN_SLOT + 8]
+        .copy_from_slice(&(HLE_TRAMPOLINE_BASE + 8).to_le_bytes());
+    img[INIT_EXIT_SLOT..INIT_EXIT_SLOT + 8]
+        .copy_from_slice(&(HLE_TRAMPOLINE_BASE + 16).to_le_bytes());
+
+    // `_start` @0x00.
+    let mut at = INIT_START_OFF;
+    if start_runs_main {
+        at = write_call_rel(&mut img, at, INIT_MAIN_FN_OFF);
+    }
+    at = write_mov_edi(&mut img, at, exit_code);
+    let _ = write_call_indirect(&mut img, at, INIT_EXIT_SLOT);
+
+    img
+}
+
+/// The three trampolines the fixture image addresses, in slot order.
+fn init_trampolines() -> Vec<HleTrampoline> {
+    vec![
+        HleTrampoline {
+            library: "libtest".to_string(),
+            function: "depInit".to_string(),
+            addr: HLE_TRAMPOLINE_BASE,
+        },
+        HleTrampoline {
+            library: "libtest".to_string(),
+            function: "mainInit".to_string(),
+            addr: HLE_TRAMPOLINE_BASE + 8,
+        },
+        HleTrampoline {
+            library: "libc".to_string(),
+            function: "exit".to_string(),
+            addr: HLE_TRAMPOLINE_BASE + 16,
+        },
+    ]
+}
+
+fn register_init_counters(hle: &HleRegistry) {
+    hle.register("libtest", "depInit", record_dep_init);
+    hle.register("libtest", "mainInit", record_main_init);
+}
+
+fn init_linked_module(image: Vec<u8>, entry: u64, module_inits: Vec<ModuleInit>) -> LinkedModule {
+    LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits,
+        hle_trampolines: init_trampolines(),
+        entry,
+        tls: None,
+        tls_layout: Vec::new(),
+        procparam_offset: None,
+        unwind_modules: Vec::new(),
+    }
+}
+
+/// A dependency initializer scheduled before the main executable's, as
+/// `load_process` builds it.
+fn process_module_inits() -> Vec<ModuleInit> {
+    vec![
+        ModuleInit {
+            name: "libdep.prx".to_string(),
+            image_offset: INIT_DEP_FN_OFF as u64,
+            role: ModuleInitRole::Dependency,
+        },
+        ModuleInit {
+            name: "eboot.bin".to_string(),
+            image_offset: INIT_MAIN_FN_OFF as u64,
+            role: ModuleInitRole::Main,
+        },
+    ]
+}
+
+/// The process loader runs each dependency initializer once and must NOT call
+/// the main executable's own initializer — crt0 owns it. Here `_start` never
+/// runs the main initializer, so the main counter isolates the loader's choice:
+/// it must be zero. (Against the pre-Slice-1 loop it was one — the loop called
+/// the last `module_inits` entry unconditionally.)
+#[test]
+fn execute_process_does_not_call_the_main_initializer_itself() {
+    let _serialize = INIT_COUNTER_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    DEP_INIT_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    MAIN_INIT_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    let hle = HleRegistry::new();
+    register_init_counters(&hle);
+    let linked = init_linked_module(
+        build_init_image(false, 7),
+        INIT_START_OFF as u64,
+        process_module_inits(),
+    );
+    let kernel = OrbisKernel::new();
+
+    let outcome = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[])
+        .expect("process must not fault");
+    assert_eq!(outcome, RunOutcome::Exited(7));
+    assert_eq!(
+        DEP_INIT_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the loader runs the dependency initializer exactly once"
+    );
+    assert_eq!(
+        MAIN_INIT_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the process loader must NOT call the main executable's initializer — crt0 owns it"
+    );
+}
+
+/// With a crt0 `_start` that DOES run the executable's initializer (the retail
+/// shape), the main initializer must fire EXACTLY once. The loader withholds
+/// its own call, so crt0's single run is the only one — no double-init, which
+/// is what built ASTRO.BOT's cyclic constructor list. (Against the pre-Slice-1
+/// loop this counter reached two: loader + crt0.)
+#[test]
+fn execute_process_runs_the_main_initializer_exactly_once_via_crt0() {
+    let _serialize = INIT_COUNTER_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    DEP_INIT_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    MAIN_INIT_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    let hle = HleRegistry::new();
+    register_init_counters(&hle);
+    let linked = init_linked_module(
+        build_init_image(true, 9),
+        INIT_START_OFF as u64,
+        process_module_inits(),
+    );
+    let kernel = OrbisKernel::new();
+
+    let outcome = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[])
+        .expect("process must not fault");
+    assert_eq!(outcome, RunOutcome::Exited(9));
+    assert_eq!(
+        DEP_INIT_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the dependency initializer still runs once"
+    );
+    assert_eq!(
+        MAIN_INIT_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the main initializer must run EXACTLY once: crt0 runs it and the loader must not also"
+    );
+}
+
+/// Direct function/module execution enters no crt0, so it is loader-owned: with
+/// nothing else to run the main initializer, `execute_linked` runs it (and
+/// every other initializer) before entering the requested function. Proves the
+/// `LoaderOwnsMainInit` branch and that the requested entry still runs.
+#[test]
+fn execute_linked_runs_loader_owned_initializers_including_main() {
+    let _serialize = INIT_COUNTER_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    DEP_INIT_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    MAIN_INIT_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    let hle = HleRegistry::new();
+    register_init_counters(&hle);
+    let linked = init_linked_module(
+        build_init_image(false, 0),
+        INIT_LINKED_ENTRY_OFF as u64,
+        vec![ModuleInit {
+            name: "eboot.bin".to_string(),
+            image_offset: INIT_MAIN_FN_OFF as u64,
+            role: ModuleInitRole::Main,
+        }],
+    );
+    let kernel = OrbisKernel::new();
+
+    let result = execute_linked(&linked, &hle, &kernel, INIT_LINKED_ENTRY_OFF as u64, &[])
+        .expect("direct execution must not fault");
+    assert_eq!(
+        result, INIT_LINKED_SENTINEL as u64,
+        "the requested entry function ran and returned its sentinel"
+    );
+    assert_eq!(
+        MAIN_INIT_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "direct execution is loader-owned: with no crt0, the loader runs the main initializer"
+    );
+}
+
+/// The deterministic diagnostic stream records each initializer transition —
+/// the dependency's run and the main executable's deferral — with module name,
+/// role, and a stable, monotonic sequence number (Slice 1 point 5).
+#[test]
+fn execute_process_records_initializer_transitions_in_diagnostic_mode() {
+    use xps5x_core::diagnostics::{DiagnosticKind, DiagnosticRecorder};
+
+    let _serialize = INIT_COUNTER_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    DEP_INIT_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    MAIN_INIT_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    let hle = HleRegistry::new();
+    register_init_counters(&hle);
+    let linked = init_linked_module(
+        build_init_image(false, 3),
+        INIT_START_OFF as u64,
+        process_module_inits(),
+    );
+    let mut kernel = OrbisKernel::new();
+    kernel.diagnostics = std::sync::Arc::new(DiagnosticRecorder::new(true, 1024));
+
+    let outcome = execute_process(&linked, &hle, &kernel, &["/app/eboot.bin"], &[])
+        .expect("process must not fault");
+    assert_eq!(outcome, RunOutcome::Exited(3));
+
+    let events: Vec<_> = kernel
+        .diagnostics
+        .snapshot()
+        .into_iter()
+        .filter(|event| event.kind == DiagnosticKind::ModuleInit)
+        .collect();
+    assert_eq!(
+        events.len(),
+        2,
+        "one transition per scheduled initializer: the dependency run and the main deferral"
+    );
+
+    assert_eq!(events[0].subject, "libdep.prx");
+    assert_eq!(events[0].guest_thread, 1);
+    assert!(
+        events[0].detail.contains("role=dependency") && events[0].detail.contains("run"),
+        "dependency initializer recorded as run, got {:?}",
+        events[0].detail
+    );
+
+    assert_eq!(events[1].subject, "eboot.bin");
+    assert!(
+        events[1].detail.contains("role=main") && events[1].detail.contains("deferred-to-crt0"),
+        "main initializer recorded as deferred to crt0, got {:?}",
+        events[1].detail
+    );
+
+    assert!(
+        events[1].sequence > events[0].sequence,
+        "diagnostic sequence numbers are stable and monotonic"
     );
 }

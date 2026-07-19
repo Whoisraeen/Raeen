@@ -417,8 +417,9 @@ pub fn find_scalar_load_bases(code: &ShaderCode) -> Vec<ScalarLoadRef> {
             // uses a constant offset; a register offset is a harder case and is
             // reported as 0 for now.
             let byte_offset = match inst.src[1].type_ {
-                ShaderOperandType::LiteralConstant
-                | ShaderOperandType::IntegerInlineConstant => inst.src[1].constant.u,
+                ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant => {
+                    inst.src[1].constant.u
+                }
                 _ => 0,
             };
             Some(ScalarLoadRef {
@@ -1029,8 +1030,7 @@ pub fn shader_parse_usage2(
     // both streams behaves exactly as before.
     let pair_is_written = |offset: u16| -> bool {
         let i = offset as usize;
-        i + 1 < UserSgprInfo::SGPRS_MAX
-            && (user_sgpr.value[i] != 0 || user_sgpr.value[i + 1] != 0)
+        i + 1 < UserSgprInfo::SGPRS_MAX && (user_sgpr.value[i] != 0 || user_sgpr.value[i + 1] != 0)
     };
 
     for (type_, &offset) in user_data.direct_resource_offset.iter().enumerate() {
@@ -1564,7 +1564,14 @@ pub fn shader_get_input_info_vs(
 
         info.gs_prolog = true;
 
-        trace_eud_evidence("vs(gs)", shader_addr, user_data, user_sgpr, user_sgpr_num, mem);
+        trace_eud_evidence(
+            "vs(gs)",
+            shader_addr,
+            user_data,
+            user_sgpr,
+            user_sgpr_num,
+            mem,
+        );
         shader_parse_usage2(
             user_data,
             &mut usage,
@@ -2154,6 +2161,7 @@ pub fn shader_parse_vs(
 
     code.set_crc32(crc32);
     code.set_hash0(hash0);
+    code.set_base_address(shader_addr);
     shader_parse(0, &src, &mut code, next_gen)?;
 
     Ok(code)
@@ -2196,6 +2204,7 @@ pub fn shader_parse_ps(
 
     code.set_crc32(crc32);
     code.set_hash0(hash0);
+    code.set_base_address(regs.ps_regs.data_addr);
     shader_parse(0, &src, &mut code, next_gen)?;
 
     Ok(code)
@@ -2219,6 +2228,7 @@ pub fn shader_parse_cs(
 
     let mut code = ShaderCode::new();
     code.set_type(ShaderType::Compute);
+    code.set_base_address(regs.cs_regs.data_addr);
     if let Some(header) = get_binary_info(&src) {
         code.set_crc32(header.crc32);
         code.set_hash0(header.hash0);
@@ -2495,7 +2505,11 @@ mod tests {
         let mut info = ShaderVertexInputInfo::default();
         shader_parse_attrib(&mut info, &[sem], &attrib, &buffer).unwrap();
         assert_eq!(info.resources_num, 1);
-        assert_eq!(info.resources[0].base48(), 0x1010, "base must be 0x1000 + 16");
+        assert_eq!(
+            info.resources[0].base48(),
+            0x1010,
+            "base must be 0x1000 + 16"
+        );
         assert_eq!(info.resources[0].stride(), 28, "stride must be preserved");
     }
 
@@ -3263,10 +3277,7 @@ mod tests {
             byte_offset: 0,
             dwords: 2,
         };
-        assert_eq!(
-            scalar_load_target_address(&out_of_range, &user_sgpr),
-            None
-        );
+        assert_eq!(scalar_load_target_address(&out_of_range, &user_sgpr), None);
     }
 
     #[test]

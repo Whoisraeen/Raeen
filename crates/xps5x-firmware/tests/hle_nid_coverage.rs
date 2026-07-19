@@ -146,7 +146,7 @@ fn a_function_known_only_by_nid_is_reachable() {
     let db = NidDatabase::from_hle(&hle);
     let registry = ModuleRegistry::new(db);
 
-    match registry.resolve(&hle, "eboot.bin", AGC_UNKNOWN_NID) {
+    match registry.resolve_import(&hle, "libSceAgc", "libSceAgc", AGC_UNKNOWN_NID) {
         xps5x_firmware::Resolver::Hle { library, .. } => assert_eq!(library, "libSceAgc"),
         other => panic!(
             "a NID-only function must resolve; got {other:?}. Hashing the placeholder name \
@@ -180,7 +180,7 @@ fn the_gettimeofday_nid_resolves_through_the_module_registry() {
     let registry = ModuleRegistry::new(db);
 
     let nid = nid_of("gettimeofday");
-    match registry.resolve(&hle, "libc.prx", nid) {
+    match registry.resolve_import(&hle, "libkernel", "libScePosix", nid) {
         xps5x_firmware::Resolver::Hle { library, function } => {
             assert_eq!(function, "gettimeofday");
             assert_eq!(library, "libScePosix");

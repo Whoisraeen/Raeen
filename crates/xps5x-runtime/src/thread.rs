@@ -5,12 +5,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use xps5x_firmware::LinkedModule;
-use xps5x_hle::{GuestAllocator, GuestMemory, GuestThreadScheduler, HleRegistry};
-use xps5x_kernel::OrbisKernel;
 use xps5x_core::diagnostics::DiagnosticKind;
-use xps5x_gpu::{AgcGpuSession, GpuProcessSession};
 use xps5x_core::subsystems::GpuSubmissionSubsystem;
+use xps5x_firmware::LinkedModule;
+use xps5x_gpu::{AgcGpuSession, GpuProcessSession};
+use xps5x_hle::{
+    ExecutableGuestMapping, GuestAccess, GuestAddress, GuestAllocator, GuestMemory, GuestRange,
+    GuestThreadScheduler, HleRegistry, ValidatedGuestRange,
+};
+use xps5x_kernel::OrbisKernel;
 
 use crate::arena::GuestArena;
 use crate::dispatch;
@@ -54,12 +57,61 @@ pub(crate) fn record_host_thread_handle(kernel: &OrbisKernel, guest_thread: u64)
         )
     };
     if ok != 0 {
-        kernel.host_thread_handles.insert(guest_thread, dup as u64);
+        if let Some(old) = kernel.host_thread_handles.insert(guest_thread, dup as u64) {
+            // SAFETY: `old` was a real duplicated handle owned by this map.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(old as *mut _) };
+        }
     }
 }
 
 #[cfg(not(windows))]
 pub(crate) fn record_host_thread_handle(_kernel: &OrbisKernel, _guest_thread: u64) {}
+
+#[cfg(windows)]
+pub(crate) fn release_host_thread_handle(kernel: &OrbisKernel, guest_thread: u64) {
+    if let Some((_, raw)) = kernel.host_thread_handles.remove(&guest_thread) {
+        // SAFETY: the map owns real handles created by `DuplicateHandle`, and
+        // removal transfers that single ownership here.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(raw as *mut _) };
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn release_host_thread_handle(_kernel: &OrbisKernel, _guest_thread: u64) {}
+
+/// Duplicate every sampled handle while its DashMap entry is still guarded.
+/// The returned handles are privately owned by the sampler, so a concurrent
+/// guest-thread exit may close/remove the process-table handle without making
+/// the sampler operate on a stale or subsequently reused Windows handle value.
+#[cfg(windows)]
+fn duplicate_host_thread_handles(kernel: &OrbisKernel) -> Vec<(u64, u64)> {
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let process = unsafe { GetCurrentProcess() };
+    kernel
+        .host_thread_handles
+        .iter()
+        .filter_map(|entry| {
+            let mut duplicate = std::ptr::null_mut();
+            // SAFETY: the map guard pins ownership of `entry.value()` for this
+            // call; source/target process pseudo-handles are valid, and the
+            // successful duplicate is transferred to the returned vector.
+            let ok = unsafe {
+                DuplicateHandle(
+                    process,
+                    *entry.value() as *mut _,
+                    process,
+                    &mut duplicate,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            };
+            (ok != 0).then_some((*entry.key(), duplicate as u64))
+        })
+        .collect()
+}
 
 /// Suspend each guest thread briefly and read its instruction pointer.
 ///
@@ -83,13 +135,10 @@ pub fn sample_guest_rips(kernel: &OrbisKernel) -> Vec<(u64, u64)> {
     #[repr(align(16))]
     struct Aligned(CONTEXT);
 
-    // Copy the handles out BEFORE suspending anything: holding a DashMap shard
-    // guard across a suspend can stop a thread that needs the same shard.
-    let handles: Vec<(u64, u64)> = kernel
-        .host_thread_handles
-        .iter()
-        .map(|e| (*e.key(), *e.value()))
-        .collect();
+    // Own private duplicates BEFORE suspending anything: no DashMap shard stays
+    // guarded during a suspend, and concurrent thread teardown cannot make a
+    // copied integer stale or retarget it through Windows handle reuse.
+    let handles = duplicate_host_thread_handles(kernel);
 
     let mut out = Vec::with_capacity(handles.len());
     for (id, raw) in handles {
@@ -101,6 +150,7 @@ pub fn sample_guest_rips(kernel: &OrbisKernel) -> Vec<(u64, u64)> {
         // suspend itself.
         unsafe {
             if SuspendThread(handle) == u32::MAX {
+                windows_sys::Win32::Foundation::CloseHandle(handle);
                 continue;
             }
             let mut ctx: Aligned = std::mem::zeroed();
@@ -109,6 +159,7 @@ pub fn sample_guest_rips(kernel: &OrbisKernel) -> Vec<(u64, u64)> {
                 out.push((id, ctx.0.Rip));
             }
             ResumeThread(handle);
+            windows_sys::Win32::Foundation::CloseHandle(handle);
         }
     }
     out
@@ -223,11 +274,7 @@ pub fn sample_host_backtraces(kernel: &OrbisKernel) -> Vec<(u64, String)> {
     struct Aligned(CONTEXT);
 
     let proc = unsafe { GetCurrentProcess() };
-    let handles: Vec<(u64, u64)> = kernel
-        .host_thread_handles
-        .iter()
-        .map(|e| (*e.key(), *e.value()))
-        .collect();
+    let handles = duplicate_host_thread_handles(kernel);
     let mut out = Vec::with_capacity(handles.len());
     for (id, raw) in handles {
         let handle = raw as *mut core::ffi::c_void;
@@ -236,6 +283,7 @@ pub fn sample_host_backtraces(kernel: &OrbisKernel) -> Vec<(u64, String)> {
         // sampler runs on its own host thread so it never suspends itself.
         let (ok, rip, rsp) = unsafe {
             if SuspendThread(handle) == u32::MAX {
+                windows_sys::Win32::Foundation::CloseHandle(handle);
                 continue;
             }
             let mut ctx: Aligned = std::mem::zeroed();
@@ -243,6 +291,7 @@ pub fn sample_host_backtraces(kernel: &OrbisKernel) -> Vec<(u64, String)> {
             let ok = GetThreadContext(handle, &mut ctx.0);
             let r = (ok, ctx.0.Rip, ctx.0.Rsp);
             ResumeThread(handle);
+            windows_sys::Win32::Foundation::CloseHandle(handle);
             r
         };
         if ok == 0 {
@@ -346,7 +395,7 @@ impl GuestProcess {
         arena: Arc<GuestArena>,
         guard: Arc<TrampolineGuard>,
     ) -> GuestProcessHandle {
-        let gpu = AgcGpuSession::new_process();
+        let gpu = AgcGpuSession::new_process(arena.clone());
         AgcGpuSession::install_process(&gpu);
         kernel.diagnostics.record(
             1,
@@ -415,6 +464,20 @@ impl GuestProcess {
 }
 
 impl GuestProcessHandle {
+    /// Cooperatively request process termination. Blocking HLE waits observe
+    /// this flag and native execution exits at the next runtime/HLE boundary;
+    /// [`terminate_and_reap`](Self::terminate_and_reap) remains the sole owner
+    /// of joining workers and draining GPU work.
+    pub fn request_termination(&self, code: u64) {
+        self.begin_termination(code);
+        self.kernel.event_flag_signal.1.notify_all();
+    }
+
+    #[must_use]
+    pub fn is_terminating(&self) -> bool {
+        self.terminating.load(Ordering::Acquire)
+    }
+
     /// Stop accepting new workers and wait until every internally retained
     /// host handle has left guest dispatch. Detached is a guest-visible
     /// joinability state only; it never discards the runtime's safety handle.
@@ -467,9 +530,18 @@ impl GuestThreadScheduler for GuestProcessHandle {
         if self.terminating.load(Ordering::Acquire) {
             return SCE_KERNEL_ERROR_EAGAIN;
         }
+        let executable_entry = GuestRange::new(GuestAddress::new(entry), 1)
+            .and_then(|range| ExecutableGuestMapping::validate(self.arena.as_ref(), range))
+            .is_some();
+        let writable_thread_out = GuestRange::new(GuestAddress::new(thread_out), 8)
+            .and_then(|range| {
+                ValidatedGuestRange::validate(self.arena.as_ref(), range, GuestAccess::Write)
+            })
+            .is_some();
         if thread_out == 0
             || entry < 0x1_0000
-            || !self.arena.is_executable_address(entry)
+            || !executable_entry
+            || !writable_thread_out
             || !self.arena.write(thread_out, &0u64.to_le_bytes())
         {
             return SCE_KERNEL_ERROR_EINVAL;
@@ -557,6 +629,7 @@ impl GuestThreadScheduler for GuestProcessHandle {
                     });
                 process.arena.free(tcb_base);
                 process.arena.free(stack_base);
+                release_host_thread_handle(&process.kernel, handle);
                 process.kernel.diagnostics.record(
                     handle,
                     DiagnosticKind::TaskReleased,

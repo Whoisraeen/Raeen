@@ -185,7 +185,10 @@ mod tests {
             hle_get_account_country(&ctx, &[0xFFFF_FFFF, 0x100]),
             ERROR_INVALID_ARGUMENT
         );
-        assert_eq!(hle_get_account_country(&ctx, &[1, 0]), ERROR_INVALID_ARGUMENT);
+        assert_eq!(
+            hle_get_account_country(&ctx, &[1, 0]),
+            ERROR_INVALID_ARGUMENT
+        );
     }
 
     #[test]

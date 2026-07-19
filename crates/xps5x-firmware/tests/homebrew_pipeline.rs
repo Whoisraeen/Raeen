@@ -28,6 +28,8 @@ const DT_SCE_STRSZ: u64 = 0x6100_0037;
 const DT_SCE_SYMTAB: u64 = 0x6100_0039;
 const DT_SCE_SYMENT: u64 = 0x6100_003B;
 const DT_SCE_SYMTABSZ: u64 = 0x6100_003F;
+const DT_SCE_NEEDED_MODULE_1: u64 = 0x6100_0045;
+const DT_SCE_IMPORT_LIB_1: u64 = 0x6100_0049;
 const DT_NULL: u64 = 0;
 
 const R_X86_64_JUMP_SLOT: u64 = 7;
@@ -131,13 +133,18 @@ fn build_plaintext_self(inner_elf: &[u8]) -> Vec<u8> {
 /// one `Elf64_Rela` JMPREL entry) and the matching `PT_DYNAMIC` bytes (SCE
 /// tags pointing at the strtab/symtab/jmprel offsets+sizes *within the
 /// dynlibdata blob*), for a single import identified by `import_nid`.
-fn build_dynlib_and_dynamic(import_nid: u64) -> (Vec<u8>, Vec<u8>) {
+fn build_dynlib_and_dynamic(import_nid: u64, provider: &str) -> (Vec<u8>, Vec<u8>) {
     // strtab: [0] reserved null byte, then the NUL-terminated encoded-NID
     // name (the "<nid>#<lib_id>#<mod_id>" convention `dynlib::mod` expects).
-    let import_name = format!("{}#A#A", encode_nid(import_nid));
+    // library id 0 = A; module id 1 = B. Both tables below name the provider
+    // explicitly so strict provider-aware linking exercises the real ABI.
+    let import_name = format!("{}#A#B", encode_nid(import_nid));
     let mut strtab = vec![0u8];
     let import_off = strtab.len() as u32;
     strtab.extend_from_slice(import_name.as_bytes());
+    strtab.push(0);
+    let provider_off = strtab.len() as u64;
+    strtab.extend_from_slice(provider.as_bytes());
     strtab.push(0);
 
     // symtab: one undefined (import) Elf64_Sym at index 0.
@@ -180,6 +187,8 @@ fn build_dynlib_and_dynamic(import_nid: u64) -> (Vec<u8>, Vec<u8>) {
     push_tag(DT_SCE_SYMTAB, symtab_off);
     push_tag(DT_SCE_SYMTABSZ, symtab.len() as u64);
     push_tag(DT_SCE_SYMENT, 24);
+    push_tag(DT_SCE_IMPORT_LIB_1, provider_off);
+    push_tag(DT_SCE_NEEDED_MODULE_1, (1u64 << 48) | provider_off);
     push_tag(DT_SCE_JMPREL, jmprel_off);
     push_tag(DT_SCE_PLTRELSZ, jmprel.len() as u64);
     push_tag(DT_NULL, 0);
@@ -190,8 +199,8 @@ fn build_dynlib_and_dynamic(import_nid: u64) -> (Vec<u8>, Vec<u8>) {
 /// Build a fully synthetic homebrew `.sprx` (plaintext SELF wrapping an
 /// `ET_SCE_DYNAMIC` ELF) with one `PT_LOAD`, `PT_SCE_DYNLIBDATA`, and
 /// `PT_DYNAMIC` importing `import_nid` via a single `JUMP_SLOT` relocation.
-fn build_homebrew_sprx(import_nid: u64) -> Vec<u8> {
-    build_homebrew_sprx_with_entry(import_nid, 0)
+fn build_homebrew_sprx(import_nid: u64, provider: &str) -> Vec<u8> {
+    build_homebrew_sprx_with_entry(import_nid, provider, 0)
 }
 
 /// Same as [`build_homebrew_sprx`], but patches `e_entry` to `entry` — used
@@ -199,8 +208,8 @@ fn build_homebrew_sprx(import_nid: u64) -> Vec<u8> {
 /// `LinkedModule::entry`) end to end through the real [`load_module`]
 /// pipeline, not just the unit-level extraction/propagation tests in
 /// `sprx.rs`/`dynlib/linker.rs`.
-fn build_homebrew_sprx_with_entry(import_nid: u64, entry: u64) -> Vec<u8> {
-    let (dynlib_blob, dynamic_bytes) = build_dynlib_and_dynamic(import_nid);
+fn build_homebrew_sprx_with_entry(import_nid: u64, provider: &str, entry: u64) -> Vec<u8> {
+    let (dynlib_blob, dynamic_bytes) = build_dynlib_and_dynamic(import_nid, provider);
 
     let load_bytes = vec![0u8; 0x100];
 
@@ -258,7 +267,7 @@ fn homebrew_sprx_links_import_against_hle_trampoline() {
         .expect("HLE registers at least one fn under exactly one library");
     let import_nid = nid_of(&func);
 
-    let sprx = build_homebrew_sprx(import_nid);
+    let sprx = build_homebrew_sprx(import_nid, &lib);
 
     let db = NidDatabase::from_hle_names(hle.registered_names());
     let mut registry = ModuleRegistry::new(db);
@@ -290,7 +299,7 @@ fn homebrew_sprx_with_unknown_import_is_unresolved_not_fatal() {
     let _ = nid_of(&func);
     let bogus_nid = nid_of("totallyUnknownHomebrewImportNobodyRegistered");
 
-    let sprx = build_homebrew_sprx(bogus_nid);
+    let sprx = build_homebrew_sprx(bogus_nid, "libkernel");
 
     let db = NidDatabase::from_hle_names(hle.registered_names());
     let mut registry = ModuleRegistry::new(db);
@@ -313,14 +322,14 @@ fn homebrew_sprx_with_unknown_import_is_unresolved_not_fatal() {
 #[test]
 fn homebrew_sprx_entry_point_propagates_through_load_module() {
     let hle = HleRegistry::new();
-    let (_, func) = hle
+    let (lib, func) = hle
         .registered_names()
         .into_iter()
         .next()
         .expect("HLE registers at least one fn");
     let import_nid = nid_of(&func);
 
-    let sprx = build_homebrew_sprx_with_entry(import_nid, 0x40);
+    let sprx = build_homebrew_sprx_with_entry(import_nid, &lib, 0x40);
 
     let db = NidDatabase::from_hle_names(hle.registered_names());
     let mut registry = ModuleRegistry::new(db);

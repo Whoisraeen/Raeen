@@ -1420,7 +1420,14 @@ mod tests {
             flags: 0,
             index_type: 1,
         };
-        let (bytes, ty) = fetch_index_buffer(&draw).expect("readable index buffer");
+        let (bytes, ty) = crate::guest_mem::with_test_ranges(
+            &[(
+                indices.as_ptr() as u64,
+                std::mem::size_of_val(indices.as_slice()),
+            )],
+            || fetch_index_buffer(&draw),
+        )
+        .expect("readable index buffer");
         assert_eq!(ty, vk::IndexType::UINT16);
         assert_eq!(&bytes[..12], bytemuck_le(&indices).as_slice());
     }
@@ -1436,7 +1443,14 @@ mod tests {
             flags: 0,
             index_type: 1,
         };
-        let (bytes, ty) = fetch_index_buffer(&draw).expect("readable index buffer");
+        let (bytes, ty) = crate::guest_mem::with_test_ranges(
+            &[(
+                indices.as_ptr() as u64,
+                std::mem::size_of_val(indices.as_slice()),
+            )],
+            || fetch_index_buffer(&draw),
+        )
+        .expect("readable index buffer");
         assert_eq!(ty, vk::IndexType::UINT16);
         // Each u8 becomes a little-endian u16: 0,1,2,3 -> 00 00 01 00 02 00 03 00.
         assert_eq!(bytes, vec![0, 0, 1, 0, 2, 0, 3, 0]);
@@ -1458,7 +1472,14 @@ mod tests {
             flags: 0,
             index_type: 1,
         };
-        let (bytes, _) = fetch_index_buffer(&draw).expect("unaligned read must work");
+        let (bytes, _) = crate::guest_mem::with_test_ranges(
+            &[(
+                backing.as_ptr() as u64,
+                std::mem::size_of_val(backing.as_slice()),
+            )],
+            || fetch_index_buffer(&draw),
+        )
+        .expect("unaligned read must work");
         assert_eq!(bytes, bytemuck_le(&[10u16, 11, 12, 13]));
     }
 
@@ -1694,7 +1715,19 @@ mod tests {
         vs.buffers[0].attr_num = 1;
         vs.buffers[0].attr_indices[0] = 0;
 
-        let (buffers, attributes) = prepare_vertex_inputs(&vs).expect("measured vertex ABI");
+        let ranges = [
+            (
+                vertex_words.as_ptr() as u64,
+                std::mem::size_of_val(vertex_words.as_slice()),
+            ),
+            (
+                storage_words.as_ptr() as u64,
+                std::mem::size_of_val(storage_words.as_slice()),
+            ),
+        ];
+        let (buffers, attributes) =
+            crate::guest_mem::with_test_ranges(&ranges, || prepare_vertex_inputs(&vs))
+                .expect("measured vertex ABI");
         assert_eq!(buffers.len(), 1);
         assert_eq!(buffers[0].bytes.len(), 48);
         assert_eq!(buffers[0].stride, 12);
@@ -1711,8 +1744,10 @@ mod tests {
         resource.fields[2] = 8;
         resource.fields[3] = 77 << 12;
 
-        let binding = prepare_stage_binding(&ps.bind, vk::ShaderStageFlags::FRAGMENT)
-            .expect("measured storage ABI");
+        let binding = crate::guest_mem::with_test_ranges(&ranges, || {
+            prepare_stage_binding(&ps.bind, vk::ShaderStageFlags::FRAGMENT)
+        })
+        .expect("measured storage ABI");
         let storage = binding.storage_buffers.expect("descriptor set");
         assert_eq!(storage.binding, 0);
         assert_eq!(
@@ -1847,7 +1882,10 @@ mod tests {
         t.fields[3] |= 27 << 20; // SWIZZLE_MODE = SW_64KB_R_X
         t.fields[3] |= 9 << 28; // type = Texture2D
 
-        let tex = decode_texture(&t).expect("mode-27 texture decodes");
+        let tex = crate::guest_mem::with_test_ranges(&[(blob.as_ptr() as u64, blob.len())], || {
+            decode_texture(&t)
+        })
+        .expect("mode-27 texture decodes");
         assert_eq!((tex.width, tex.height), (w, h));
         assert_eq!(tex.format, vk::Format::R8G8B8A8_UNORM);
         assert_eq!(tex.pixels, linear, "detiled pixels must match the original");
@@ -1886,7 +1924,10 @@ mod tests {
         t.fields[3] |= 11 << 28; // type = Cube
         t.fields[4] = 5; // depth 5 + 1 = 6 faces
 
-        let tex = decode_texture(&t).expect("cube texture decodes");
+        let tex = crate::guest_mem::with_test_ranges(&[(blob.as_ptr() as u64, blob.len())], || {
+            decode_texture(&t)
+        })
+        .expect("cube texture decodes");
         assert!(tex.cube);
         assert_eq!(tex.layers, 6);
         assert_eq!((tex.width, tex.height), (w, h));

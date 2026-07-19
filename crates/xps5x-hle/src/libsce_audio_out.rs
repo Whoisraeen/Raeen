@@ -10,28 +10,16 @@
 //! title"). Export set cross-checked against SharpEmu.
 
 use crate::{HleContext, HleRegistry};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tracing::debug;
 
 /// `SCE_OK`.
 const SCE_OK: u64 = 0;
+/// The process already owns the maximum number of emulator AudioOut ports.
+const SCE_AUDIO_OUT_ERROR_PORT_FULL: u64 = 0x8026_0004;
 /// Upper bound on how long one `Output` blocks — a wild grain/frequency
 /// can't wedge the audio thread for more than this.
 const OUTPUT_MAX_SLEEP: Duration = Duration::from_millis(100);
-
-/// Per-port `(grain_samples, frequency_hz)`, recorded at `Open` and read by
-/// `Output` to pace itself. Keyed by the port handle we hand back.
-fn ports() -> &'static Mutex<HashMap<u32, (u32, u32)>> {
-    static PORTS: OnceLock<Mutex<HashMap<u32, (u32, u32)>>> = OnceLock::new();
-    PORTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Monotonic port-handle counter (handles start at 1; 0 is never a valid
-/// port).
-static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
 
 /// Register libSceAudioOut HLE functions.
 pub fn register(registry: &HleRegistry) {
@@ -49,12 +37,13 @@ fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
 /// `sceAudioOutOpen(userId, type, index, length, freq, param)`: records the
 /// port's grain (`length`, samples per `Output`) and `freq`, returns a new
 /// positive port handle.
-fn hle_open(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
     let grain = args.get(3).copied().unwrap_or(256) as u32;
     let freq = args.get(4).copied().unwrap_or(48_000) as u32;
-    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    let Some(handle) = ctx.kernel.open_audio_out_port(grain, freq) else {
+        return SCE_AUDIO_OUT_ERROR_PORT_FULL;
+    };
     debug!("sceAudioOutOpen(grain={grain}, freq={freq}) -> handle {handle}");
-    ports().lock().unwrap().insert(handle, (grain, freq));
     handle as u64
 }
 
@@ -62,14 +51,9 @@ fn hle_open(_ctx: &HleContext, args: &[u64]) -> u64 {
 /// ~one buffer period (grain ÷ freq, capped) so the audio thread paces
 /// instead of spinning, and return the sample count. No samples are actually
 /// played yet.
-fn hle_output(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_output(ctx: &HleContext, args: &[u64]) -> u64 {
     let handle = args.first().copied().unwrap_or(0) as u32;
-    let (grain, freq) = ports()
-        .lock()
-        .unwrap()
-        .get(&handle)
-        .copied()
-        .unwrap_or((256, 48_000));
+    let (grain, freq) = ctx.kernel.audio_out_port(handle).unwrap_or((256, 48_000));
     if freq > 0 {
         let period = Duration::from_secs_f64(grain as f64 / freq as f64).min(OUTPUT_MAX_SLEEP);
         std::thread::sleep(period);
@@ -78,10 +62,10 @@ fn hle_output(_ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 /// `sceAudioOutClose(handle)`: drop the port's recorded pacing state.
-fn hle_close(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_close(ctx: &HleContext, args: &[u64]) -> u64 {
     let handle = args.first().copied().unwrap_or(0) as u32;
     debug!("sceAudioOutClose(handle={handle})");
-    ports().lock().unwrap().remove(&handle);
+    ctx.kernel.close_audio_out_port(handle);
     SCE_OK
 }
 
@@ -132,5 +116,41 @@ mod tests {
         let ctx = crate::test_ctx(&k, &m, &a);
         // Never opened: falls back to default grain, still returns promptly.
         assert_eq!(hle_output(&ctx, &[9999, 0x1000]), 256);
+    }
+
+    #[test]
+    fn port_table_is_bounded_and_close_releases_capacity() {
+        let (k, m, a) = ctx_bits();
+        let ctx = crate::test_ctx(&k, &m, &a);
+        let mut handles = Vec::new();
+        for _ in 0..xps5x_kernel::OrbisKernel::MAX_AUDIO_OUT_PORTS {
+            let handle = hle_open(&ctx, &[0, 0, 0, 256, 48_000, 0]);
+            assert_ne!(handle, SCE_AUDIO_OUT_ERROR_PORT_FULL);
+            handles.push(handle);
+        }
+        assert_eq!(
+            hle_open(&ctx, &[0, 0, 0, 256, 48_000, 0]),
+            SCE_AUDIO_OUT_ERROR_PORT_FULL
+        );
+        assert_eq!(hle_close(&ctx, &[handles[0]]), SCE_OK);
+        assert_ne!(
+            hle_open(&ctx, &[0, 0, 0, 256, 48_000, 0]),
+            SCE_AUDIO_OUT_ERROR_PORT_FULL
+        );
+    }
+
+    #[test]
+    fn separate_process_kernels_do_not_share_audio_ports() {
+        let (first, first_mem, first_alloc) = ctx_bits();
+        let first_ctx = crate::test_ctx(&first, &first_mem, &first_alloc);
+        let first_handle = hle_open(&first_ctx, &[0, 0, 0, 256, 48_000, 0]);
+
+        let (second, second_mem, second_alloc) = ctx_bits();
+        let second_ctx = crate::test_ctx(&second, &second_mem, &second_alloc);
+        let second_handle = hle_open(&second_ctx, &[0, 0, 0, 256, 48_000, 0]);
+        assert_eq!(first_handle, 1);
+        assert_eq!(second_handle, 1);
+        assert!(first.audio_out_port(first_handle as u32).is_some());
+        assert!(second.audio_out_port(second_handle as u32).is_some());
     }
 }

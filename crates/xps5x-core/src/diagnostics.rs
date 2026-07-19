@@ -21,6 +21,11 @@ pub enum DiagnosticKind {
     TaskOwned,
     TaskReleased,
     GpuSubmit,
+    /// A module initializer (`module_start`/`DT_INIT`) the loader ran or, for
+    /// the main executable under a crt0 entry, deliberately withheld. The
+    /// `subject` is the module name, `object` the image offset, and `detail`
+    /// carries the initializer's role and whether it ran or was deferred.
+    ModuleInit,
 }
 
 /// One stable event in a guest process's diagnostic stream.
@@ -88,6 +93,13 @@ impl DiagnosticRecorder {
         if !self.enabled {
             return None;
         }
+        // Serialize sequence assignment with retention. Assigning the number
+        // before taking this lock lets concurrent callers push 2 before 1,
+        // making a snapshot disagree with the advertised stable order.
+        let mut events = self
+            .events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         let event = DiagnosticEvent {
             sequence,
@@ -107,10 +119,6 @@ impl DiagnosticRecorder {
             detail = %event.detail,
             "guest event"
         );
-        let mut events = self
-            .events
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if events.len() == self.capacity {
             events.pop_front();
         }
@@ -174,5 +182,37 @@ mod tests {
             None
         );
         assert!(recorder.snapshot().is_empty());
+    }
+
+    #[test]
+    fn concurrent_records_are_retained_in_sequence_order() {
+        let recorder = std::sync::Arc::new(DiagnosticRecorder::new(true, 800));
+        let mut workers = Vec::new();
+        for guest_thread in 1..=8 {
+            let recorder = std::sync::Arc::clone(&recorder);
+            workers.push(std::thread::spawn(move || {
+                for object in 0..100 {
+                    recorder.record(
+                        guest_thread,
+                        DiagnosticKind::TaskOwned,
+                        "concurrent",
+                        object,
+                        "",
+                    );
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("diagnostic writer should not panic");
+        }
+
+        let events = recorder.snapshot();
+        assert_eq!(events.len(), 800);
+        assert!(
+            events
+                .iter()
+                .enumerate()
+                .all(|(index, event)| event.sequence == index as u64 + 1)
+        );
     }
 }

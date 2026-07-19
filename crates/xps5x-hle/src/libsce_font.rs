@@ -357,7 +357,11 @@ fn hle_generate_glyph(ctx: &HleContext, args: &[u64]) -> u64 {
 /// Semantics/arg positions are from shadPS4 (GPL-2.0) `font.cpp`/`fontft.cpp`.
 pub fn register(registry: &HleRegistry) {
     // libSceFontFt driver/renderer selection (returns a table pointer).
-    registry.register("libSceFontFt", "sceFontSelectLibraryFt", hle_select_library_ft);
+    registry.register(
+        "libSceFontFt",
+        "sceFontSelectLibraryFt",
+        hle_select_library_ft,
+    );
     registry.register(
         "libSceFontFt",
         "sceFontSelectRendererFt",

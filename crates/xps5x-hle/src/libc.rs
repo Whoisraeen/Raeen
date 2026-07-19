@@ -18,52 +18,60 @@
 //! format handling is future work, not blocked on the dispatch signature
 //! anymore.
 
-use crate::{HleContext, HleRegistry};
+use crate::{HleContext, HleFunction, HleRegistry};
 use tracing::{debug, warn};
 
 /// Register libc HLE functions.
 pub fn register(registry: &HleRegistry) {
-    registry.register("libc", "malloc", hle_malloc);
-    registry.register("libc", "free", hle_free);
-    registry.register("libc", "calloc", hle_calloc);
-    registry.register("libc", "realloc", hle_realloc);
-    registry.register("libc", "memcpy", hle_memcpy);
-    registry.register("libc", "memset", hle_memset);
-    registry.register("libc", "memmove", hle_memmove);
-    registry.register("libc", "strlen", hle_strlen);
-    registry.register("libc", "strcmp", hle_strcmp);
-    registry.register("libc", "strcpy", hle_strcpy);
-    registry.register("libc", "strncpy", hle_strncpy);
+    register_abi(registry, "malloc", hle_malloc);
+    register_abi(registry, "free", hle_free);
+    register_abi(registry, "calloc", hle_calloc);
+    register_abi(registry, "realloc", hle_realloc);
+    register_abi(registry, "memcpy", hle_memcpy);
+    register_abi(registry, "memset", hle_memset);
+    register_abi(registry, "memmove", hle_memmove);
+    register_abi(registry, "strlen", hle_strlen);
+    register_abi(registry, "strcmp", hle_strcmp);
+    register_abi(registry, "strcpy", hle_strcpy);
+    register_abi(registry, "strncpy", hle_strncpy);
     // M1 hardening batch (real guest-memory behavior; ported with reference
     // to SharpEmu's KernelMemoryCompatExports + Kyty libc): the string/buffer
     // functions crt0 and ordinary homebrew hit constantly.
-    registry.register("libc", "memcmp", hle_memcmp);
-    registry.register("libc", "memchr", hle_memchr);
-    registry.register("libc", "strncmp", hle_strncmp);
-    registry.register("libc", "strnlen", hle_strnlen);
-    registry.register("libc", "strchr", hle_strchr);
-    registry.register("libc", "strrchr", hle_strrchr);
-    registry.register("libc", "strcat", hle_strcat);
-    registry.register("libc", "strncat", hle_strncat);
-    registry.register("libc", "strstr", hle_strstr);
+    register_abi(registry, "memcmp", hle_memcmp);
+    register_abi(registry, "memchr", hle_memchr);
+    register_abi(registry, "strncmp", hle_strncmp);
+    register_abi(registry, "strnlen", hle_strnlen);
+    register_abi(registry, "strchr", hle_strchr);
+    register_abi(registry, "strrchr", hle_strrchr);
+    register_abi(registry, "strcat", hle_strcat);
+    register_abi(registry, "strncat", hle_strncat);
+    register_abi(registry, "strstr", hle_strstr);
     // String → integer parsing (real behavior): arg/config parsing.
-    registry.register("libc", "atoi", hle_atoi);
-    registry.register("libc", "atol", hle_atol);
-    registry.register("libc", "strtol", hle_strtol);
-    registry.register("libc", "strtoul", hle_strtoul);
+    register_abi(registry, "atoi", hle_atoi);
+    register_abi(registry, "atol", hle_atol);
+    register_abi(registry, "strtol", hle_strtol);
+    register_abi(registry, "strtoul", hle_strtoul);
     // crt0 / C++ static-init registration: record-and-succeed. Real homebrew
     // registers atexit/global-dtor callbacks during startup; failing these
     // aborts init before `main`.
-    registry.register("libc", "atexit", hle_atexit);
-    registry.register("libc", "__cxa_atexit", hle_cxa_atexit);
-    registry.register("libc", "snprintf", hle_snprintf);
-    registry.register("libc", "printf", hle_printf);
-    registry.register("libc", "puts", hle_puts);
-    registry.register("libc", "abort", hle_abort);
-    registry.register("libc", "exit", hle_exit);
-    registry.register("libc", "__stack_chk_fail", hle_stack_chk_fail);
-    registry.register("libc", "memalign", hle_memalign);
-    registry.register("libc", "posix_memalign", hle_posix_memalign);
+    register_abi(registry, "atexit", hle_atexit);
+    register_abi(registry, "__cxa_atexit", hle_cxa_atexit);
+    register_abi(registry, "snprintf", hle_snprintf);
+    register_abi(registry, "printf", hle_printf);
+    register_abi(registry, "puts", hle_puts);
+    register_abi(registry, "abort", hle_abort);
+    register_abi(registry, "exit", hle_exit);
+    register_abi(registry, "__stack_chk_fail", hle_stack_chk_fail);
+    register_abi(registry, "memalign", hle_memalign);
+    register_abi(registry, "posix_memalign", hle_posix_memalign);
+}
+
+/// The public C ABI is exposed through both the generic libc view used by
+/// homebrew fixtures and the provider name carried by retail PRX imports.
+/// Keeping the alias explicit preserves provider-aware NID collision safety.
+fn register_abi(registry: &HleRegistry, function: &str, implementation: HleFunction) {
+    registry.register("libc", function, implementation);
+    registry.register("libSceLibcInternal", function, implementation);
 }
 
 /// Cap on how far [`hle_strlen`] will scan looking for a NUL terminator, so
@@ -117,13 +125,10 @@ fn hle_calloc(ctx: &HleContext, args: &[u64]) -> u64 {
     let Some(addr) = ctx.alloc.alloc(total, 16) else {
         return 0;
     };
-    let Ok(len) = usize::try_from(total) else {
-        warn!("calloc: total={total:#x} does not fit a host usize");
+    if !crate::zero_guest_range(ctx.mem, addr, total) {
+        warn!("calloc: zeroing block at {addr:#x} (len {total:#x}) failed");
         ctx.alloc.free(addr);
         return 0;
-    };
-    if !ctx.mem.write(addr, &vec![0u8; len]) {
-        warn!("calloc: zeroing block at {addr:#x} (len {total:#x}) failed");
     }
     addr
 }
@@ -352,17 +357,30 @@ fn hle_strncpy(ctx: &HleContext, args: &[u64]) -> u64 {
     let n = args.get(2).copied().unwrap_or(0);
     debug!("strncpy(dst={dst:#x}, src={src:#x}, n={n:#x})");
 
-    let Ok(n_usize) = usize::try_from(n) else {
-        warn!("strncpy: n={n:#x} does not fit a host usize");
+    if n > crate::MAX_HLE_BULK_BYTES {
+        warn!("strncpy: n={n:#x} exceeds the bounded HLE bulk-operation limit");
         return dst;
-    };
-    let Some(mut bytes) = crate::fmt::read_cstr(ctx.mem, src) else {
+    }
+    let Some(bytes) = crate::fmt::read_cstr(ctx.mem, src) else {
         warn!("strncpy: unreadable source string at {src:#x}");
         return dst;
     };
-    bytes.resize(n_usize, 0); // truncate long, zero-fill short — the real semantics
-    if !ctx.mem.write(dst, &bytes) {
-        warn!("strncpy: failed to write {n_usize} bytes to dst={dst:#x}");
+    let Some(range) = crate::GuestRange::new(crate::GuestAddress::new(dst), n) else {
+        warn!("strncpy: destination range overflows");
+        return dst;
+    };
+    if crate::ValidatedGuestRange::validate(ctx.mem, range, crate::GuestAccess::Write).is_none() {
+        warn!("strncpy: destination range is not writable");
+        return dst;
+    }
+    let copy_len = bytes.len().min(n as usize);
+    if copy_len > 0 && !ctx.mem.write(dst, &bytes[..copy_len]) {
+        warn!("strncpy: failed to write source bytes to dst={dst:#x}");
+        return dst;
+    }
+    let zero_len = n - copy_len as u64;
+    if zero_len > 0 && !crate::zero_guest_range(ctx.mem, dst + copy_len as u64, zero_len) {
+        warn!("strncpy: failed to zero-fill destination at dst={dst:#x}");
     }
     dst
 }
@@ -982,6 +1000,22 @@ mod tests {
         assert_eq!(&buf2, b"ab");
     }
 
+    #[test]
+    fn huge_strncpy_and_calloc_lengths_fail_without_host_allocation() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x800);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert!(mem.write(0x100, b"abc\0"));
+        assert!(mem.write(0x200, &[0xAA; 4]));
+
+        assert_eq!(hle_strncpy(&ctx, &[0x200, 0x100, u64::MAX]), 0x200);
+        let mut unchanged = [0u8; 4];
+        assert!(mem.read(0x200, &mut unchanged));
+        assert_eq!(unchanged, [0xAA; 4]);
+        assert_eq!(hle_calloc(&ctx, &[1, crate::MAX_HLE_BULK_BYTES + 1]), 0);
+    }
+
     /// M1 hardening batch: the string/buffer functions do real guest-memory
     /// work — compare, scan, concatenate — not lie.
     #[test]
@@ -1196,6 +1230,10 @@ mod tests {
             assert!(
                 registry.is_implemented("libc", name),
                 "missing libc::{name}"
+            );
+            assert!(
+                registry.is_implemented("libSceLibcInternal", name),
+                "missing libSceLibcInternal::{name} ABI alias"
             );
             registry.call(&ctx, "libc", name, &[1, 2, 3]);
         }

@@ -58,6 +58,15 @@ pub trait GameLauncher {
     fn session_detail(&self, _handle: &SessionHandle) -> Option<String> {
         None
     }
+    /// Stable process-scoped diagnostic events, when the engine provides
+    /// deterministic diagnostics for this session.
+    #[allow(dead_code)] // diagnostics UI panel will consume this contract
+    fn session_diagnostics(
+        &self,
+        _handle: &SessionHandle,
+    ) -> Option<Vec<xps5x_core::diagnostics::DiagnosticEvent>> {
+        None
+    }
     /// Request a running session to quit (returns to Shell).
     fn quit(&self, handle: &SessionHandle) -> Result<(), LaunchError>;
 }
@@ -222,6 +231,14 @@ struct FirmwareSession {
     outcome: Option<SessionOutcome>,
     /// Delivers the outcome once the guest exits or faults.
     result: Option<std::sync::mpsc::Receiver<SessionOutcome>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    #[cfg(target_os = "windows")]
+    process_start: Option<std::sync::mpsc::Receiver<xps5x_runtime::GuestProcessHandle>>,
+    #[cfg(target_os = "windows")]
+    process: Option<xps5x_runtime::GuestProcessHandle>,
+    /// Process-scoped kernel state retained for diagnostics after the guest
+    /// exits. It is never shared with another launched title.
+    kernel: Option<std::sync::Arc<xps5x_kernel::OrbisKernel>>,
     quit_requested: bool,
 }
 
@@ -229,6 +246,24 @@ impl FirmwareSession {
     /// Take the outcome if the session thread has finished. Non-blocking: the
     /// UI polls this every frame.
     fn poll(&mut self) {
+        #[cfg(target_os = "windows")]
+        if self.process.is_none()
+            && let Some(rx) = &self.process_start
+        {
+            match rx.try_recv() {
+                Ok(process) => {
+                    if self.quit_requested {
+                        process.request_termination(0);
+                    }
+                    self.process = Some(process);
+                    self.process_start = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.process_start = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if self.outcome.is_some() {
             return;
         }
@@ -237,6 +272,9 @@ impl FirmwareSession {
                 Ok(outcome) => {
                     self.outcome = Some(outcome);
                     self.result = None;
+                    if let Some(worker) = self.worker.take() {
+                        let _ = worker.join();
+                    }
                 }
                 // Sender dropped without sending: the session thread died
                 // (panicked). Report it rather than reading as still-running.
@@ -245,6 +283,9 @@ impl FirmwareSession {
                         "The session thread stopped unexpectedly".to_string(),
                     ));
                     self.result = None;
+                    if let Some(worker) = self.worker.take() {
+                        let _ = worker.join();
+                    }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
@@ -264,24 +305,11 @@ impl FirmwareSession {
 /// so an encrypted retail module always faults informatively rather than
 /// decrypting anything.
 ///
-/// `load_module` takes `&mut ModuleRegistry`, but [`GameLauncher::launch`]
-/// only gets `&self` (the Shell stores one launcher behind `Box<dyn
-/// GameLauncher>` and never needs `&mut` access to it). `StubLauncher`
-/// solves the same problem with per-field `Mutex`es; `FirmwareLauncher`
-/// follows suit — the registry lives behind a `std::sync::Mutex` and is
-/// locked only for the duration of one `load_module` call.
+/// Each [`GameLauncher::launch`] creates a fresh kernel and module registry.
+/// Loaded exports, handles, mounts, diagnostics, and clocks therefore belong
+/// to exactly one guest process and cannot leak into a later title.
 pub struct FirmwareLauncher {
     hle: std::sync::Arc<xps5x_hle::HleRegistry>,
-    /// The live emulated kernel HLE calls get access to via
-    /// [`xps5x_hle::HleContext::kernel`] (dispatch-context milestone — see
-    /// `xps5x_runtime::execute_linked`'s doc comment). One instance per
-    /// launcher, not per launch: kernel state (the virtual memory manager,
-    /// thread manager, ...) is process-wide, matching a real PS5's single
-    /// kernel serving every loaded module.
-    kernel: std::sync::Arc<xps5x_kernel::OrbisKernel>,
-    /// Arc'd so a session thread can own a handle: the guest runs for as long as
-    /// the player plays, and it cannot borrow the launcher for that long.
-    registry: std::sync::Arc<Mutex<xps5x_firmware::ModuleRegistry>>,
     sessions: Mutex<HashMap<u64, FirmwareSession>>,
     next_id: Mutex<u64>,
 }
@@ -289,11 +317,8 @@ pub struct FirmwareLauncher {
 impl FirmwareLauncher {
     pub fn new() -> Self {
         let hle = xps5x_hle::HleRegistry::new();
-        let nid_db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
         Self {
             hle: std::sync::Arc::new(hle),
-            kernel: std::sync::Arc::new(xps5x_kernel::OrbisKernel::new()),
-            registry: std::sync::Arc::new(Mutex::new(xps5x_firmware::ModuleRegistry::new(nid_db))),
             sessions: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
         }
@@ -306,15 +331,16 @@ impl FirmwareLauncher {
     /// [`SessionOutcome::Faulted`] with a message fit to show the user; this
     /// never panics.
     ///
-    /// `self.registry`'s lock is held only for the `load_module` call
-    /// itself — execution (which needs `&self.hle`, not the registry) runs
-    /// with the lock already released, since `self.hle` lives outside the
-    /// `Mutex<ModuleRegistry>` and is borrowed directly.
+    /// `kernel` and `registry` belong to this one session. The immutable HLE
+    /// export table is shared; mutable HLE/kernel state is process-scoped.
     fn load_and_run(
         hle: &std::sync::Arc<xps5x_hle::HleRegistry>,
         kernel: &std::sync::Arc<xps5x_kernel::OrbisKernel>,
-        registry: &std::sync::Arc<Mutex<xps5x_firmware::ModuleRegistry>>,
+        registry: &mut xps5x_firmware::ModuleRegistry,
         path: &Path,
+        #[cfg(target_os = "windows")] process_started: std::sync::mpsc::Sender<
+            xps5x_runtime::GuestProcessHandle,
+        >,
     ) -> SessionOutcome {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
@@ -359,17 +385,14 @@ impl FirmwareLauncher {
         // ships its own libc.prx (2584 exports), which defines `_init_env`.
         // Loading it makes the Shell and CLI the same launch.
         let game_dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let loaded = {
-            let mut registry = registry.lock().unwrap();
-            xps5x_firmware::load_process(
-                &bytes,
-                game_dir,
-                &xps5x_firmware::NoKeysProvider,
-                &mut registry,
-                hle,
-                DEFAULT_LOAD_BASE,
-            )
-        };
+        let loaded = xps5x_firmware::load_process(
+            &bytes,
+            game_dir,
+            &xps5x_firmware::NoKeysProvider,
+            registry,
+            hle,
+            DEFAULT_LOAD_BASE,
+        );
 
         let linked = match loaded.map(|process| process.linked) {
             Ok(linked) => linked,
@@ -408,12 +431,15 @@ impl FirmwareLauncher {
             // bare 6-register function call. A well-formed run ends via an
             // exit-family call (`Exited`); a `_start` that returns anyway is
             // reported as `Ran` (malformed but tolerated).
-            match xps5x_runtime::execute_process_shared(
+            match xps5x_runtime::execute_process_shared_with_control(
                 std::sync::Arc::clone(&linked),
                 std::sync::Arc::clone(hle),
                 std::sync::Arc::clone(kernel),
                 &[GUEST_ARGV0],
                 &[],
+                move |process| {
+                    let _ = process_started.send(process);
+                },
             ) {
                 Ok(xps5x_runtime::RunOutcome::Exited(code)) => SessionOutcome::Exited {
                     code,
@@ -433,13 +459,8 @@ impl FirmwareLauncher {
                 // The guest asked for an import nothing implements. Name it:
                 // this is the one fault the user (or we) can actually act on,
                 // and it used to read as an anonymous address.
-                Err(xps5x_runtime::RuntimeError::UnimplementedImport { nid, .. }) => {
-                    let library = linked
-                        .unresolved_stubs
-                        .iter()
-                        .find(|s| s.nid == nid)
-                        .and_then(|s| s.library.as_deref())
-                        .unwrap_or("unknown library");
+                Err(xps5x_runtime::RuntimeError::UnimplementedImport { nid, library, .. }) => {
+                    let library = library.as_deref().unwrap_or("unknown library");
                     SessionOutcome::Faulted(format!(
                         "Unimplemented import: {} ({library}) — the game called a function \
                          XPS5X does not provide yet",
@@ -486,21 +507,38 @@ impl GameLauncher for FirmwareLauncher {
         let session = match target {
             LaunchTarget::Game { path } => {
                 let (tx, rx) = std::sync::mpsc::channel();
+                #[cfg(target_os = "windows")]
+                let (process_tx, process_rx) = std::sync::mpsc::channel();
                 let hle = std::sync::Arc::clone(&self.hle);
-                let kernel = std::sync::Arc::clone(&self.kernel);
-                let registry = std::sync::Arc::clone(&self.registry);
+                let kernel = std::sync::Arc::new(xps5x_kernel::OrbisKernel::new());
+                let session_kernel = std::sync::Arc::clone(&kernel);
+                let nid_db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
+                let mut registry = xps5x_firmware::ModuleRegistry::new(nid_db);
                 let path = path.clone();
-                std::thread::Builder::new()
+                let worker = std::thread::Builder::new()
                     .name("xps5x-session".to_owned())
                     .spawn(move || {
                         // The receiver going away (session closed) is not an
                         // error worth reporting — nobody is listening.
-                        let _ = tx.send(FirmwareLauncher::load_and_run(&hle, &kernel, &registry, &path));
+                        let _ = tx.send(FirmwareLauncher::load_and_run(
+                            &hle,
+                            &kernel,
+                            &mut registry,
+                            &path,
+                            #[cfg(target_os = "windows")]
+                            process_tx,
+                        ));
                     })
                     .map_err(|e| LaunchError::Failed(format!("cannot start session: {e}")))?;
                 FirmwareSession {
                     outcome: None,
                     result: Some(rx),
+                    worker: Some(worker),
+                    #[cfg(target_os = "windows")]
+                    process_start: Some(process_rx),
+                    #[cfg(target_os = "windows")]
+                    process: None,
+                    kernel: Some(session_kernel),
                     quit_requested: false,
                 }
             }
@@ -511,6 +549,12 @@ impl GameLauncher for FirmwareLauncher {
                     "'{id}' is not a loadable module"
                 ))),
                 result: None,
+                worker: None,
+                #[cfg(target_os = "windows")]
+                process_start: None,
+                #[cfg(target_os = "windows")]
+                process: None,
+                kernel: None,
                 quit_requested: false,
             },
         };
@@ -529,10 +573,10 @@ impl GameLauncher for FirmwareLauncher {
         let Some(session) = sessions.get_mut(&handle.0) else {
             return SessionState::Faulted;
         };
-        if session.quit_requested {
+        session.poll();
+        if session.quit_requested && session.outcome.is_some() {
             return SessionState::Exited;
         }
-        session.poll();
         match &session.outcome {
             // The title is still running on its own thread — which for a real
             // game is the normal, long-lived state, not a brief load.
@@ -553,27 +597,65 @@ impl GameLauncher for FirmwareLauncher {
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.get_mut(&handle.0)?;
         session.poll();
-        Some(match session.outcome.as_ref()? {
-            SessionOutcome::Linked { resolved, unresolved, .. } => format!(
+        let diagnostic_events = session
+            .kernel
+            .as_ref()
+            .filter(|kernel| kernel.diagnostics.is_enabled())
+            .map(|kernel| kernel.diagnostics.snapshot().len());
+        let mut detail = match session.outcome.as_ref()? {
+            SessionOutcome::Linked {
+                resolved,
+                unresolved,
+                ..
+            } => format!(
                 "Linked — {resolved} imports resolved to HLE, {unresolved} unresolved · execution not yet implemented (Esc to return)"
             ),
-            SessionOutcome::Ran { returned, resolved, unresolved } => format!(
+            SessionOutcome::Ran {
+                returned,
+                resolved,
+                unresolved,
+            } => format!(
                 "Executed — _start returned {returned:#x} (malformed: a process ends via exit) · \
                  {resolved} HLE imports resolved, {unresolved} unresolved"
             ),
-            SessionOutcome::Exited { code, resolved, unresolved } => format!(
+            SessionOutcome::Exited {
+                code,
+                resolved,
+                unresolved,
+            } => format!(
                 "Ran to exit({code:#x}) — {resolved} HLE imports resolved, {unresolved} unresolved \
                  (early runtime — full game execution needs more HLE breadth)"
             ),
             SessionOutcome::Faulted(message) => message.clone(),
-        })
+        };
+        if let Some(count) = diagnostic_events {
+            detail.push_str(&format!(" · {count} deterministic events"));
+        }
+        Some(detail)
+    }
+
+    fn session_diagnostics(
+        &self,
+        handle: &SessionHandle,
+    ) -> Option<Vec<xps5x_core::diagnostics::DiagnosticEvent>> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(&handle.0)
+            .and_then(|session| session.kernel.as_ref())
+            .map(|kernel| kernel.diagnostics.snapshot())
     }
 
     fn quit(&self, handle: &SessionHandle) -> Result<(), LaunchError> {
         let mut sessions = self.sessions.lock().unwrap();
         match sessions.get_mut(&handle.0) {
             Some(session) => {
+                session.poll();
                 session.quit_requested = true;
+                #[cfg(target_os = "windows")]
+                if let Some(process) = &session.process {
+                    process.request_termination(0);
+                }
                 Ok(())
             }
             None => Err(LaunchError::UnknownHandle),
@@ -799,6 +881,45 @@ mod firmware_launcher_tests {
             detail.contains("not a loadable module"),
             "unexpected message: {detail}"
         );
+    }
+
+    #[test]
+    fn each_game_launch_gets_isolated_process_kernel_state() {
+        let launcher = FirmwareLauncher::new();
+        let first = launcher
+            .launch(&LaunchTarget::Game {
+                path: PathBuf::from("missing/first/eboot.bin"),
+            })
+            .expect("first launch");
+        let second = launcher
+            .launch(&LaunchTarget::Game {
+                path: PathBuf::from("missing/second/eboot.bin"),
+            })
+            .expect("second launch");
+        assert_eq!(settled_state(&launcher, &first), SessionState::Faulted);
+        assert_eq!(settled_state(&launcher, &second), SessionState::Faulted);
+
+        let sessions = launcher.sessions.lock().unwrap();
+        let first_kernel = sessions[&first.0]
+            .kernel
+            .as_ref()
+            .expect("game session has a kernel");
+        let second_kernel = sessions[&second.0]
+            .kernel
+            .as_ref()
+            .expect("game session has a kernel");
+        assert!(!std::sync::Arc::ptr_eq(first_kernel, second_kernel));
+
+        first_kernel.register_module(xps5x_kernel::ModuleInfo {
+            id: 0,
+            name: "first-only".to_string(),
+            base_address: 0,
+            size: 1,
+            entry_point: None,
+            initialized: true,
+        });
+        assert_eq!(first_kernel.modules.len(), 1);
+        assert!(second_kernel.modules.is_empty());
     }
 
     #[test]
@@ -1132,11 +1253,8 @@ mod firmware_launcher_tests {
             let sentinel_nid = xps5x_firmware::dynlib::nid::nid_of("sceTestSentinel");
             let exit_nid = xps5x_firmware::dynlib::nid::nid_of("exit");
 
-            let nid_db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
             let launcher = FirmwareLauncher {
                 hle: hle.into(),
-                kernel: xps5x_kernel::OrbisKernel::new().into(),
-                registry: Mutex::new(xps5x_firmware::ModuleRegistry::new(nid_db)).into(),
                 sessions: Mutex::new(HashMap::new()),
                 next_id: Mutex::new(0),
             };
@@ -1243,11 +1361,8 @@ mod firmware_launcher_tests {
             let bogus_nid =
                 xps5x_firmware::dynlib::nid::nid_of("totallyUnknownFunctionNobodyRegistered");
 
-            let nid_db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
             let launcher = FirmwareLauncher {
                 hle: hle.into(),
-                kernel: xps5x_kernel::OrbisKernel::new().into(),
-                registry: Mutex::new(xps5x_firmware::ModuleRegistry::new(nid_db)).into(),
                 sessions: Mutex::new(HashMap::new()),
                 next_id: Mutex::new(0),
             };
@@ -2066,7 +2181,15 @@ pub extern "C" fn rust_eh_personality() {}
             // Byte-exact guest stdout: printf's `argc=1 tls=172\n` (argc == 1
             // from the process stack; tls == 0xAB + buf[0] == 0xAB + argc ==
             // 172) followed by write's `bye\n`.
-            let console = launcher.kernel.console.contents();
+            let console = launcher
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&handle.0)
+                .and_then(|session| session.kernel.as_ref())
+                .expect("game session retains its process kernel")
+                .console
+                .contents();
             assert_eq!(
                 console, "argc=1 tls=172\nbye\n",
                 "unexpected guest console output; detail: {detail}"

@@ -817,11 +817,9 @@ impl CommandProcessor {
         let index_offset = Self::body_at(body, 1, offset)?;
         let index_count = Self::body_at(body, 2, offset)?;
 
-        let index_addr = self
-            .index_base
-            .saturating_add(u64::from(index_offset) * Self::index_element_bytes(
-                self.index_type_and_size,
-            ));
+        let index_addr = self.index_base.saturating_add(
+            u64::from(index_offset) * Self::index_element_bytes(self.index_type_and_size),
+        );
 
         let draw = IndexedDraw {
             index_type_and_size: self.index_type_and_size,
@@ -1270,8 +1268,7 @@ impl CommandProcessor {
 
             // Kyty Pm4.h CB_BLEND0_CONTROL_* field layout. Per-slot alpha
             // blending state — Minecraft's UI writes these.
-            r if (pm4::CB_BLEND0_CONTROL
-                ..pm4::CB_BLEND0_CONTROL + pm4::CB_BLEND_CONTROL_SLOTS)
+            r if (pm4::CB_BLEND0_CONTROL..pm4::CB_BLEND0_CONTROL + pm4::CB_BLEND_CONTROL_SLOTS)
                 .contains(&r) =>
             {
                 let slot = (r - pm4::CB_BLEND0_CONTROL) as usize;
@@ -1358,7 +1355,11 @@ impl CommandProcessor {
                 .contains(&r) =>
             {
                 let id = r - pm4::SPI_SHADER_USER_DATA_PS_0;
-                tracing::debug!(id, value = format_args!("{value:#010x}"), "PS user SGPR write");
+                tracing::debug!(
+                    id,
+                    value = format_args!("{value:#010x}"),
+                    "PS user SGPR write"
+                );
                 self.sh_ctx.ps.ps_user_sgpr.set(id, value, marker);
             }
             r if (pm4::SPI_SHADER_USER_DATA_GS_0..pm4::SPI_SHADER_USER_DATA_GS_0 + SGPRS)

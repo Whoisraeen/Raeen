@@ -409,8 +409,18 @@ fn main() -> anyhow::Result<()> {
         println!(
             "[{} relocations total; offset range {:#x}..={:#x}]",
             dynlib.relocations.len(),
-            dynlib.relocations.iter().map(|r| r.offset).min().unwrap_or(0),
-            dynlib.relocations.iter().map(|r| r.offset).max().unwrap_or(0),
+            dynlib
+                .relocations
+                .iter()
+                .map(|r| r.offset)
+                .min()
+                .unwrap_or(0),
+            dynlib
+                .relocations
+                .iter()
+                .map(|r| r.offset)
+                .max()
+                .unwrap_or(0),
         );
         return Ok(());
     }
@@ -585,7 +595,9 @@ fn main() -> anyhow::Result<()> {
                 patched += 1;
                 search = at + patch.len();
             }
-            info!("__cxa_throw trap: patched {patched} internal copies, trampoline at {tramp_addr:#x}");
+            info!(
+                "__cxa_throw trap: patched {patched} internal copies, trampoline at {tramp_addr:#x}"
+            );
         }
         // Diagnostic: XPS5X_TRAP_MSPACE installs a log-and-continue detour on the
         // title's native libc `sceLibcMspaceCreate` impl (`libc.prx+0xbe50`) so
@@ -602,7 +614,10 @@ fn main() -> anyhow::Result<()> {
                 // (libc.prx offset, whole-prologue bytes, label). Create impl at
                 // 0xbe50 and the sceLibcMspaceFree wrapper at 0xf600 — both start
                 // with relocation-free register pushes + a reg-reg mov.
-                for (off, plen, name) in [(0xbe50u64, 13usize, "MspaceCreate"), (0xf600, 13, "MspaceFree")] {
+                for (off, plen, name) in [
+                    (0xbe50u64, 13usize, "MspaceCreate"),
+                    (0xf600, 13, "MspaceFree"),
+                ] {
                     xps5x_runtime::native_trap::install(
                         &mut linked.image,
                         &mut linked.hle_trampolines,
@@ -683,8 +698,7 @@ fn main() -> anyhow::Result<()> {
                                 .get(&tid)
                                 .map_or_else(String::new, |n| n.clone());
                             let ring = entry.value().lock();
-                            let recent: Vec<String> =
-                                ring.iter().rev().take(5).cloned().collect();
+                            let recent: Vec<String> = ring.iter().rev().take(5).cloned().collect();
                             format!("t{tid}({name}): {}", recent.join(" <- "))
                         })
                         .collect();
@@ -792,26 +806,20 @@ fn main() -> anyhow::Result<()> {
             Ok(o) => info!("RESULT: {o:?}"),
             // The whole point of the per-NID unresolved stub: say WHICH import
             // the guest wanted. Report it as a worklist item, not an address.
-            Err(xps5x_runtime::RuntimeError::UnimplementedImport { nid, addr }) => {
-                let stub = linked.unresolved_stubs.iter().find(|s| s.nid == *nid);
-                let library = stub
-                    .and_then(|s| s.library.as_deref())
-                    .unwrap_or("<unknown library>");
-                // `addr` is the faulting instruction's Rip — where the guest
-                // was, NOT the stub. Naming it "stub" was wrong and confusing.
+            Err(xps5x_runtime::RuntimeError::UnimplementedImport {
+                nid,
+                library,
+                stub_addr,
+                rip,
+            }) => {
+                let library = library.as_deref().unwrap_or("<unknown library>");
                 info!(
                     "RESULT: guest needs an UNIMPLEMENTED import — {} \
                      — nid {nid:#018x} (encoded {}) from library '{library}'",
                     xps5x_firmware::dynlib::nid_names::describe(*nid),
                     xps5x_firmware::dynlib::nid::encode_nid(*nid)
                 );
-                info!(
-                    "        guest rip {addr:#x}{}",
-                    match stub {
-                        Some(s) => format!("; its stub is {:#x}", s.addr),
-                        None => String::new(),
-                    }
-                );
+                info!("        guest rip {rip:#x}; its stub is {stub_addr:#x}");
                 info!("        implement it, or supply the module that exports it, and re-run");
             }
             // A fault reports where the guest *was*, which on its own names

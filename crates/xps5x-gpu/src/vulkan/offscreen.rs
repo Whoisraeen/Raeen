@@ -24,8 +24,6 @@ use xps5x_core::error::GpuError;
 /// correct clear.
 pub const CLEAR_COLOR: [f32; 4] = [0.25, 0.5, 0.75, 1.0];
 
-/// Bytes per pixel of the render target's `R8G8B8A8_UNORM` format.
-
 /// Triangle vertices in Vulkan normalized device coordinates (`x, y, z, w`).
 ///
 /// Vulkan's NDC has +Y pointing **down**, so the `-0.7` vertex is the top one.

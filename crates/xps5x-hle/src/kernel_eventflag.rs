@@ -22,6 +22,7 @@ const OK: u64 = 0;
 const SCE_KERNEL_ERROR_EINVAL: u64 = 0x8002_0016; // 22
 const SCE_KERNEL_ERROR_ESRCH: u64 = 0x8002_0003; // 3 (no such flag)
 const SCE_KERNEL_ERROR_EFAULT: u64 = 0x8002_000E; // 14
+const SCE_KERNEL_ERROR_ENOMEM: u64 = 0x8002_000C; // 12
 const SCE_KERNEL_ERROR_EBUSY: u64 = 0x8002_0010; // 16 (poll not satisfied)
 const SCE_KERNEL_ERROR_ETIMEDOUT: u64 = 0x8002_003C; // 60
 
@@ -90,7 +91,9 @@ fn hle_create(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_EINVAL; // no NUL within 32 bytes → too long
     }
 
-    let handle = ctx.services.create_event(attr, initial);
+    let Some(handle) = ctx.services.create_event(attr, initial) else {
+        return SCE_KERNEL_ERROR_ENOMEM;
+    };
     if !ctx.mem.write(out, &handle.to_le_bytes()) {
         ctx.services.delete_event(handle);
         return SCE_KERNEL_ERROR_EFAULT;
@@ -121,7 +124,11 @@ fn hle_delete(ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_set(ctx: &HleContext, args: &[u64]) -> u64 {
     let handle = args.first().copied().unwrap_or(0);
     let pattern = args.get(1).copied().unwrap_or(0);
-    if ctx.services.update_event(handle, EventUpdate::Set(pattern)).is_none() {
+    if ctx
+        .services
+        .update_event(handle, EventUpdate::Set(pattern))
+        .is_none()
+    {
         return SCE_KERNEL_ERROR_ESRCH;
     }
     ctx.services.wake(
@@ -140,7 +147,11 @@ fn hle_set(ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_clear(ctx: &HleContext, args: &[u64]) -> u64 {
     let handle = args.first().copied().unwrap_or(0);
     let pattern = args.get(1).copied().unwrap_or(0);
-    if ctx.services.update_event(handle, EventUpdate::Keep(pattern)).is_none() {
+    if ctx
+        .services
+        .update_event(handle, EventUpdate::Keep(pattern))
+        .is_none()
+    {
         return SCE_KERNEL_ERROR_ESRCH;
     }
     ctx.services.wake(
@@ -281,7 +292,8 @@ fn hle_cancel(ctx: &HleContext, args: &[u64]) -> u64 {
     if waiter_out != 0 && !ctx.mem.write(waiter_out, &0u32.to_le_bytes()) {
         return SCE_KERNEL_ERROR_EFAULT;
     }
-    ctx.services.update_event(handle, EventUpdate::Replace(set_pattern));
+    ctx.services
+        .update_event(handle, EventUpdate::Replace(set_pattern));
     ctx.services.wake(
         WaitKey {
             class: "event-flag",

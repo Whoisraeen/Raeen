@@ -202,6 +202,8 @@ pub struct OrbisKernel {
     pub kernel_event_flags: DashMap<u64, EventFlag>,
     /// Next event-flag handle to hand out.
     kernel_event_flag_next: std::sync::atomic::AtomicU64,
+    /// Live event slots used for atomic resource-quota admission.
+    kernel_event_flag_live: std::sync::atomic::AtomicU32,
     /// Kernel counting semaphores, keyed by handle.
     pub kernel_semaphores: DashMap<u32, Semaphore>,
     /// "Save data memory" blobs, keyed by `SceUserServiceUserId`. This is the
@@ -319,6 +321,8 @@ pub struct OrbisKernel {
     pub kernel_sockets: DashMap<i32, GuestSocket>,
     /// Next socket fd to hand out (a high range, distinct from VFS fds).
     kernel_socket_next: std::sync::atomic::AtomicI32,
+    /// Live socket slots used for atomic descriptor-quota admission.
+    kernel_socket_live: std::sync::atomic::AtomicU32,
     /// Registered pthread TLS keys → their destructor address (0 = none).
     pub pthread_tls_keys: DashMap<i32, u64>,
     /// Thread-local specific values, keyed by (thread handle, TLS key).
@@ -348,6 +352,15 @@ pub struct OrbisKernel {
     pub thread_atexit_report_callback: std::sync::atomic::AtomicU64,
     /// Guest application heap API table registered with the rtld.
     pub application_heap_api: std::sync::atomic::AtomicU64,
+    /// Process-owned libc trace table and coredump callback pointers. These
+    /// contain guest addresses and must never survive into another launch.
+    pub libc_trace_storage: std::sync::atomic::AtomicU64,
+    pub coredump_handler: std::sync::atomic::AtomicU64,
+    pub coredump_handler_context: std::sync::atomic::AtomicU64,
+    /// Process-owned pacing state for AudioOut ports: `(grain, frequency)`.
+    audio_out_ports: DashMap<u32, (u32, u32)>,
+    audio_out_next_port: std::sync::atomic::AtomicU32,
+    audio_out_live_ports: std::sync::atomic::AtomicU32,
     /// Whether the optional libSceTextToSpeech2 service is initialized for
     /// this guest process. The audio synthesis surface is layered on top of
     /// this lifecycle state rather than using process-global statics.
@@ -654,6 +667,23 @@ pub struct FiberThreadState {
 }
 
 impl OrbisKernel {
+    /// Explicit per-process resource ceilings. These are emulator safeguards,
+    /// not claims about undocumented retail limits: guest-controlled handle
+    /// creation must fail instead of growing host memory without bound.
+    pub const MAX_EVENT_FLAGS: u32 = 4096;
+    pub const MAX_OFFLINE_SOCKETS: u32 = 1024;
+    pub const MAX_AUDIO_OUT_PORTS: u32 = 32;
+
+    fn try_claim_slot(counter: &std::sync::atomic::AtomicU32, limit: u32) -> bool {
+        counter
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |live| (live < limit).then_some(live + 1),
+            )
+            .is_ok()
+    }
+
     /// Release every pthread mutex currently owned by `thread`, returning how
     /// many were freed. Called when a guest thread is torn down mid-execution
     /// (e.g. `sceKernelDebugRaiseException`) so it does not leave mutexes
@@ -702,6 +732,7 @@ impl OrbisKernel {
             pthread_attrs: DashMap::new(),
             kernel_event_flags: DashMap::new(),
             kernel_event_flag_next: std::sync::atomic::AtomicU64::new(1),
+            kernel_event_flag_live: std::sync::atomic::AtomicU32::new(0),
             kernel_semaphores: DashMap::new(),
             save_data_memory: DashMap::new(),
             kernel_semaphore_next: std::sync::atomic::AtomicU32::new(1),
@@ -744,6 +775,7 @@ impl OrbisKernel {
             fiber_threads: DashMap::new(),
             kernel_sockets: DashMap::new(),
             kernel_socket_next: std::sync::atomic::AtomicI32::new(0x4000_0000),
+            kernel_socket_live: std::sync::atomic::AtomicU32::new(0),
             pthread_tls_keys: DashMap::new(),
             pthread_tls_values: DashMap::new(),
             dynamic_tls_blocks: DashMap::new(),
@@ -756,6 +788,12 @@ impl OrbisKernel {
             thread_atexit_count_callback: std::sync::atomic::AtomicU64::new(0),
             thread_atexit_report_callback: std::sync::atomic::AtomicU64::new(0),
             application_heap_api: std::sync::atomic::AtomicU64::new(0),
+            libc_trace_storage: std::sync::atomic::AtomicU64::new(0),
+            coredump_handler: std::sync::atomic::AtomicU64::new(0),
+            coredump_handler_context: std::sync::atomic::AtomicU64::new(0),
+            audio_out_ports: DashMap::new(),
+            audio_out_next_port: std::sync::atomic::AtomicU32::new(1),
+            audio_out_live_ports: std::sync::atomic::AtomicU32::new(0),
             text_to_speech2_initialized: std::sync::atomic::AtomicBool::new(false),
             pthread_tls_next_key: std::sync::atomic::AtomicI32::new(0),
             http_contexts: DashMap::new(),
@@ -803,7 +841,10 @@ impl OrbisKernel {
 
     /// Create an event flag with `attributes` and `initial_bits`, returning its
     /// handle. See the `xps5x-hle` `kernel_eventflag` module.
-    pub fn create_event_flag(&self, attributes: u32, initial_bits: u64) -> u64 {
+    pub fn create_event_flag(&self, attributes: u32, initial_bits: u64) -> Option<u64> {
+        if !Self::try_claim_slot(&self.kernel_event_flag_live, Self::MAX_EVENT_FLAGS) {
+            return None;
+        }
         let handle = self
             .kernel_event_flag_next
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -814,7 +855,7 @@ impl OrbisKernel {
                 attributes,
             },
         );
-        handle
+        Some(handle)
     }
 
     /// Create a counting semaphore with `initial`/`max` count, returning its
@@ -878,12 +919,52 @@ impl OrbisKernel {
 
     /// Allocate a fresh (offline) socket fd. See the `xps5x-hle`
     /// `kernel_socket` module.
-    pub fn create_socket(&self) -> i32 {
+    pub fn create_socket(&self) -> Option<i32> {
+        if !Self::try_claim_slot(&self.kernel_socket_live, Self::MAX_OFFLINE_SOCKETS) {
+            return None;
+        }
         let fd = self
             .kernel_socket_next
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.kernel_sockets.insert(fd, GuestSocket::default());
-        fd
+        Some(fd)
+    }
+
+    /// Close an offline socket and release one descriptor-table slot.
+    pub fn close_socket(&self, fd: i32) -> bool {
+        if self.kernel_sockets.remove(&fd).is_none() {
+            return false;
+        }
+        self.kernel_socket_live
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        true
+    }
+
+    /// Open one process-owned AudioOut pacing port.
+    pub fn open_audio_out_port(&self, grain: u32, frequency: u32) -> Option<u32> {
+        if !Self::try_claim_slot(&self.audio_out_live_ports, Self::MAX_AUDIO_OUT_PORTS) {
+            return None;
+        }
+        let handle = self
+            .audio_out_next_port
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.audio_out_ports.insert(handle, (grain, frequency));
+        Some(handle)
+    }
+
+    /// Return pacing parameters for a live AudioOut port.
+    pub fn audio_out_port(&self, handle: u32) -> Option<(u32, u32)> {
+        self.audio_out_ports.get(&handle).map(|port| *port)
+    }
+
+    /// Close a process-owned AudioOut port and release its quota slot.
+    pub fn close_audio_out_port(&self, handle: u32) -> bool {
+        if self.audio_out_ports.remove(&handle).is_none() {
+            return false;
+        }
+        self.audio_out_live_ports
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        true
     }
 
     /// Allocate a fresh (offline) epoll id with an empty registration set.
@@ -1115,8 +1196,8 @@ impl xps5x_core::subsystems::WaitSubsystem for OrbisKernel {
 }
 
 impl xps5x_core::subsystems::EventSubsystem for OrbisKernel {
-    fn create_event(&self, attributes: u32, initial: u64) -> u64 {
-        let handle = self.create_event_flag(attributes, initial);
+    fn create_event(&self, attributes: u32, initial: u64) -> Option<u64> {
+        let handle = self.create_event_flag(attributes, initial)?;
         self.diagnostics.record(
             0,
             xps5x_core::diagnostics::DiagnosticKind::EventTransition,
@@ -1124,12 +1205,14 @@ impl xps5x_core::subsystems::EventSubsystem for OrbisKernel {
             handle,
             format!("create attributes={attributes:#x} bits={initial:#x}"),
         );
-        handle
+        Some(handle)
     }
 
     fn delete_event(&self, handle: u64) -> bool {
         let removed = self.kernel_event_flags.remove(&handle).is_some();
         if removed {
+            self.kernel_event_flag_live
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             self.diagnostics.record(
                 0,
                 xps5x_core::diagnostics::DiagnosticKind::EventTransition,
@@ -1198,11 +1281,45 @@ impl xps5x_core::subsystems::NetworkSubsystem for OrbisKernel {
         xps5x_core::subsystems::NetworkMode::Offline
     }
 
-    fn create_socket(&self) -> i32 {
+    fn create_socket(&self) -> Option<i32> {
         OrbisKernel::create_socket(self)
     }
 
     fn socket_exists(&self, fd: i32) -> bool {
         self.kernel_sockets.contains_key(&fd)
+    }
+
+    fn close_socket(&self, fd: i32) -> bool {
+        OrbisKernel::close_socket(self, fd)
+    }
+}
+
+#[cfg(test)]
+mod subsystem_resource_tests {
+    use super::OrbisKernel;
+    use xps5x_core::subsystems::{EventSubsystem, NetworkSubsystem};
+
+    #[test]
+    fn event_contract_reports_exhaustion_and_delete_releases_a_slot() {
+        let kernel = OrbisKernel::new();
+        let mut handles = Vec::new();
+        for _ in 0..OrbisKernel::MAX_EVENT_FLAGS {
+            handles.push(kernel.create_event(0, 0).expect("event slot"));
+        }
+        assert_eq!(kernel.create_event(0, 0), None);
+        assert!(kernel.delete_event(handles[0]));
+        assert!(kernel.create_event(0, 0).is_some());
+    }
+
+    #[test]
+    fn network_contract_reports_exhaustion_and_close_releases_a_slot() {
+        let kernel = OrbisKernel::new();
+        let mut fds = Vec::new();
+        for _ in 0..OrbisKernel::MAX_OFFLINE_SOCKETS {
+            fds.push(kernel.create_socket().expect("socket slot"));
+        }
+        assert_eq!(kernel.create_socket(), None);
+        assert!(kernel.close_socket(fds[0]));
+        assert!(kernel.create_socket().is_some());
     }
 }

@@ -12,7 +12,7 @@
 //! wait cooperatively on the host and re-check process termination; they never
 //! transfer ownership from another guest thread.
 
-use crate::{HleContext, HleRegistry};
+use crate::{HleContext, HleFunction, HleRegistry};
 use tracing::debug;
 use xps5x_kernel::{PthreadMutex, PthreadRwlock};
 
@@ -113,7 +113,8 @@ pub fn register(registry: &HleRegistry) {
     register_posix(registry);
 }
 
-/// Register the **POSIX** spellings of the same functions, under `libScePosix`.
+/// Register the **POSIX** spellings of the same functions through the two
+/// provider names used by title and runtime modules.
 ///
 /// # Why both spellings are needed
 ///
@@ -144,30 +145,27 @@ pub fn register(registry: &HleRegistry) {
 /// * `sem_*` — POSIX semaphores are address-based; `kernel_semaphore`'s are
 ///   handle-based. Different objects, not a rename.
 fn register_posix(registry: &HleRegistry) {
-    registry.register("libScePosix", "pthread_mutex_init", hle_mutex_init);
-    registry.register("libScePosix", "pthread_mutex_destroy", hle_mutex_destroy);
-    registry.register("libScePosix", "pthread_mutex_lock", hle_mutex_lock);
-    registry.register("libScePosix", "pthread_mutex_trylock", hle_mutex_trylock);
-    registry.register("libScePosix", "pthread_mutex_unlock", hle_mutex_unlock);
-    registry.register("libScePosix", "pthread_mutexattr_init", hle_mutexattr_init);
-    registry.register(
-        "libScePosix",
-        "pthread_mutexattr_destroy",
-        hle_mutexattr_destroy,
-    );
-    registry.register(
-        "libScePosix",
-        "pthread_mutexattr_settype",
-        hle_mutexattr_settype,
-    );
+    register_posix_abi(registry, "pthread_mutex_init", hle_mutex_init);
+    register_posix_abi(registry, "pthread_mutex_destroy", hle_mutex_destroy);
+    register_posix_abi(registry, "pthread_mutex_lock", hle_mutex_lock);
+    register_posix_abi(registry, "pthread_mutex_trylock", hle_mutex_trylock);
+    register_posix_abi(registry, "pthread_mutex_unlock", hle_mutex_unlock);
+    register_posix_abi(registry, "pthread_mutexattr_init", hle_mutexattr_init);
+    register_posix_abi(registry, "pthread_mutexattr_destroy", hle_mutexattr_destroy);
+    register_posix_abi(registry, "pthread_mutexattr_settype", hle_mutexattr_settype);
 
-    registry.register("libScePosix", "pthread_rwlock_init", hle_rwlock_init);
-    registry.register("libScePosix", "pthread_rwlock_destroy", hle_rwlock_destroy);
-    registry.register("libScePosix", "pthread_rwlock_rdlock", hle_rwlock_rdlock);
-    registry.register("libScePosix", "pthread_rwlock_tryrdlock", hle_rwlock_rdlock);
-    registry.register("libScePosix", "pthread_rwlock_wrlock", hle_rwlock_wrlock);
-    registry.register("libScePosix", "pthread_rwlock_trywrlock", hle_rwlock_wrlock);
-    registry.register("libScePosix", "pthread_rwlock_unlock", hle_rwlock_unlock);
+    register_posix_abi(registry, "pthread_rwlock_init", hle_rwlock_init);
+    register_posix_abi(registry, "pthread_rwlock_destroy", hle_rwlock_destroy);
+    register_posix_abi(registry, "pthread_rwlock_rdlock", hle_rwlock_rdlock);
+    register_posix_abi(registry, "pthread_rwlock_tryrdlock", hle_rwlock_rdlock);
+    register_posix_abi(registry, "pthread_rwlock_wrlock", hle_rwlock_wrlock);
+    register_posix_abi(registry, "pthread_rwlock_trywrlock", hle_rwlock_wrlock);
+    register_posix_abi(registry, "pthread_rwlock_unlock", hle_rwlock_unlock);
+}
+
+fn register_posix_abi(registry: &HleRegistry, function: &str, implementation: HleFunction) {
+    registry.register("libScePosix", function, implementation);
+    registry.register("libkernel", function, implementation);
 }
 
 /// Normalize a caller-supplied mutex type to a known value (default: normal,
@@ -667,6 +665,25 @@ mod tests {
         let mem = crate::TestMemory::new(0x4000);
         let alloc = crate::TestAllocator::new(0x1000); // objects live at 0x1000+
         (kernel, mem, alloc)
+    }
+
+    #[test]
+    fn posix_pthread_names_are_available_through_both_abi_providers() {
+        let registry = HleRegistry::new();
+        for provider in ["libScePosix", "libkernel"] {
+            for name in [
+                "pthread_mutex_lock",
+                "pthread_mutex_unlock",
+                "pthread_rwlock_rdlock",
+                "pthread_rwlock_wrlock",
+                "pthread_rwlock_unlock",
+            ] {
+                assert!(
+                    registry.is_implemented(provider, name),
+                    "missing {provider}::{name}"
+                );
+            }
+        }
     }
 
     #[test]

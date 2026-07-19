@@ -45,7 +45,7 @@ use windows_sys::Win32::System::Memory::{
     VirtualProtect, VirtualQuery,
 };
 
-use xps5x_hle::{GuestAccess, GuestAllocator, GuestMemory, GuestRange};
+use xps5x_hle::{GuestAccess, GuestAddress, GuestAllocator, GuestMemory, GuestRange};
 
 use crate::vmm::{Vma, VmaMap, VmaType, prot};
 use crate::{GUEST_ARENA_BASE, RuntimeError};
@@ -653,11 +653,6 @@ impl GuestArena {
         self.base + STACK_OFFSET + STACK_SIZE
     }
 
-    /// Whether an absolute guest address lies in the loaded executable image.
-    pub(crate) fn is_executable_address(&self, address: u64) -> bool {
-        address >= self.base && address < self.base.saturating_add(self.image_len)
-    }
-
     /// Back `addr` with memory if it lies in a range the guest reserved but
     /// that was never committed. Returns whether the caller should retry the
     /// faulting access.
@@ -756,6 +751,14 @@ impl GuestArena {
     /// refused.
     fn range_is_committed(&self, start: u64, end: u64) -> bool {
         let state = self.lock_state();
+        Self::range_is_committed_locked(&state, start, end)
+    }
+
+    /// Locked form used by host copies and atomics. Keeping `state` borrowed
+    /// across the actual pointer access prevents a concurrent `munmap` from
+    /// releasing an independent Windows reservation after validation but
+    /// before the copy/load/store.
+    fn range_is_committed_locked(state: &AllocState, start: u64, end: u64) -> bool {
         if end == start {
             // A zero-length access touches nothing, but still has to name a
             // real address to be a legal one.
@@ -1114,7 +1117,8 @@ impl GuestMemory for GuestArena {
         // No `< self.base` reject: a guest address below the arena is legal now
         // that `reserve`/`map_at` honor OS-placed and guest-chosen addresses.
         // `range_is_committed` is the real gate.
-        if !self.range_is_committed(guest_addr, end) {
+        let state = self.lock_state();
+        if !Self::range_is_committed_locked(&state, guest_addr, end) {
             return false;
         }
         // SAFETY: every byte of `[guest_addr, guest_addr + out.len())` is backed
@@ -1127,7 +1131,9 @@ impl GuestMemory for GuestArena {
         // Rust. Native guest threads can concurrently touch the same
         // VirtualAlloc pages, just as real guest CPUs can race; these host-side
         // copies are non-atomic and may tear. Guest synchronization is
-        // responsible for conflicting accesses.
+        // responsible for conflicting accesses. The address-space lock stays
+        // held through the copy, so `munmap` cannot release an external
+        // reservation underneath this host pointer.
         unsafe {
             core::ptr::copy_nonoverlapping(guest_addr as *const u8, out.as_mut_ptr(), out.len());
         }
@@ -1142,6 +1148,13 @@ impl GuestMemory for GuestArena {
         // Same bounds argument as `read`, except a write demand-commits
         // reservation pages exactly as a native guest store would.
         if !self.ensure_range_backed_for_write(guest_addr, end) {
+            return false;
+        }
+        // Demand-commit above may take the state lock repeatedly. Reacquire it
+        // once and revalidate before dereferencing; a mapping may have been
+        // removed between the final commit/check and this point.
+        let state = self.lock_state();
+        if !Self::range_is_committed_locked(&state, guest_addr, end) {
             return false;
         }
         // SAFETY: same bounds argument as `read` above. Every sub-region is
@@ -1180,7 +1193,8 @@ impl GuestMemory for GuestArena {
 
     fn atomic_load_u32(&self, guest_addr: u64) -> Option<u32> {
         let end = guest_addr.checked_add(4)?;
-        if !self.range_is_committed(guest_addr, end)
+        let state = self.lock_state();
+        if !Self::range_is_committed_locked(&state, guest_addr, end)
             || guest_addr % core::mem::align_of::<std::sync::atomic::AtomicU32>() as u64 != 0
         {
             return None;
@@ -1196,7 +1210,8 @@ impl GuestMemory for GuestArena {
 
     fn atomic_compare_exchange_u32(&self, guest_addr: u64, current: u32, new: u32) -> Option<u32> {
         let end = guest_addr.checked_add(4)?;
-        if !self.range_is_committed(guest_addr, end)
+        let state = self.lock_state();
+        if !Self::range_is_committed_locked(&state, guest_addr, end)
             || guest_addr % core::mem::align_of::<std::sync::atomic::AtomicU32>() as u64 != 0
         {
             return None;
@@ -1220,7 +1235,8 @@ impl GuestMemory for GuestArena {
             Some(end) => end,
             None => return false,
         };
-        if !self.range_is_committed(guest_addr, end)
+        let state = self.lock_state();
+        if !Self::range_is_committed_locked(&state, guest_addr, end)
             || guest_addr % core::mem::align_of::<std::sync::atomic::AtomicU32>() as u64 != 0
         {
             return false;
@@ -1231,6 +1247,22 @@ impl GuestMemory for GuestArena {
                 .store(value, std::sync::atomic::Ordering::SeqCst);
         }
         true
+    }
+}
+
+impl xps5x_gpu::GpuGuestMemory for GuestArena {
+    fn validate_gpu_range(&self, addr: u64, len: u64, _write: bool) -> bool {
+        GuestRange::new(GuestAddress::new(addr), len)
+            .and_then(|range| xps5x_hle::GpuVisibleGuestRange::validate(self, range))
+            .is_some()
+    }
+
+    fn read_gpu(&self, addr: u64, out: &mut [u8]) -> bool {
+        GuestMemory::read(self, addr, out)
+    }
+
+    fn write_gpu(&self, addr: u64, data: &[u8]) -> bool {
+        GuestMemory::write(self, addr, data)
     }
 }
 
@@ -1383,7 +1415,9 @@ impl GuestAllocator for GuestArena {
             // Fall back to the old low-first search only if the dedicated
             // reservation window is somehow full: a placed reservation that
             // fragments a mapping window still beats failing the call outright.
-            .or_else(|| reserve_guest_address_space(DEFAULT_MAPPING_BASE, self.base, span, align))?;
+            .or_else(|| {
+                reserve_guest_address_space(DEFAULT_MAPPING_BASE, self.base, span, align)
+            })?;
 
         let Some(addr) = align_up(block, align) else {
             return self.release_unusable_block(block);
@@ -2003,6 +2037,48 @@ mod tests {
         assert!(arena.write(base + 0x1f_ffff, &[0xCD]));
         assert!(arena.read(base + 0x1f_ffff, &mut byte));
         assert_eq!(byte, [0xCD], "the newly extended tail must be backed");
+    }
+
+    /// Host-side HLE/GPU copies must not retain an unpinned raw pointer after
+    /// validation. An external mapping is a whole Windows reservation and can
+    /// be released by another guest thread; the arena lock must serialize the
+    /// release with the complete copy, then make every later access fail
+    /// cleanly instead of touching freed host memory.
+    #[test]
+    fn concurrent_external_unmap_cannot_race_guest_memory_copy() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = std::sync::Arc::new(
+            GuestArena::new(&[]).expect("fixed-base reservation should succeed"),
+        );
+        let base = 0x2068_00000;
+        let len = 0x10_0000;
+        assert_eq!(arena.map_at(base, len, PAGE_SIZE), Some(base));
+        assert!(arena.write(base, &[0xAB; 64]));
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let reader_arena = std::sync::Arc::clone(&arena);
+        let reader_barrier = std::sync::Arc::clone(&barrier);
+        let reader = std::thread::spawn(move || {
+            reader_barrier.wait();
+            let mut observed_mapping = false;
+            let mut out = [0u8; 64];
+            for _ in 0..10_000 {
+                if reader_arena.read(base, &mut out) {
+                    observed_mapping = true;
+                    assert_eq!(out, [0xAB; 64]);
+                }
+            }
+            observed_mapping
+        });
+
+        barrier.wait();
+        arena.munmap(base, len);
+        let _ = reader.join().expect("reader thread must not fault");
+        let mut out = [0u8; 64];
+        assert!(
+            !arena.read(base, &mut out),
+            "a released external mapping must fail validation"
+        );
     }
 
     /// `munmap` must return the range to the free pool. Until the VMA map

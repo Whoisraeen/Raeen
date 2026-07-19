@@ -541,7 +541,11 @@ mod tests {
         assert_eq!(orig, round, "GetTick->SetTick must round-trip");
 
         // And the pure inverse holds for an arbitrary tick.
-        for tick in [UNIX_EPOCH_TICKS, UNIX_EPOCH_TICKS + 1, 63_000_000_000_000_000] {
+        for tick in [
+            UNIX_EPOCH_TICKS,
+            UNIX_EPOCH_TICKS + 1,
+            63_000_000_000_000_000,
+        ] {
             let dt = tick_to_datetime(tick);
             assert_eq!(datetime_to_tick(&dt), tick, "tick {tick} must round-trip");
         }

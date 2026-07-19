@@ -47,22 +47,20 @@ pub enum ModulePolicy {
 
 /// Dispatches import NIDs to HLE or LLE implementations, per-module policy.
 ///
-/// LLE exports are tracked globally, keyed by NID (not per-module): the
-/// module name passed to [`ModuleRegistry::register_module_exports`] is used
-/// only for policy lookup and diagnostics/logging, matching the LM1 design
-/// (a single flat NID export space is sufficient for the homebrew pipeline
-/// slice; multiple modules exporting the same NID is out of scope).
+/// LLE exports are keyed by provider module and NID. Two title-supplied
+/// modules may legally export the same NID; the importing symbol's provider
+/// chooses which address is eligible.
 #[derive(Debug, Clone)]
 pub struct ModuleRegistry {
     nid_db: NidDatabase,
     policies: HashMap<String, ModulePolicy>,
-    /// Loaded LLE exports, keyed by NID -> export address.
-    lle_exports: HashMap<u64, u64>,
+    /// Loaded LLE exports, keyed by (canonical provider module, NID).
+    lle_exports: HashMap<(String, u64), u64>,
     /// NIDs forced to resolve HLE-first regardless of the provider module's
     /// policy — a per-symbol override used to intercept one function of an
     /// otherwise-LLE module (e.g. trapping `__cxa_throw` inside the shipped
     /// libc for diagnostics without redirecting libc's malloc/etc).
-    force_hle: std::collections::HashSet<u64>,
+    force_hle: std::collections::HashSet<(String, u64)>,
 }
 
 impl ModuleRegistry {
@@ -79,8 +77,8 @@ impl ModuleRegistry {
 
     /// Force `nid` to resolve HLE-first even when its provider module is
     /// `PreferLle`. Used for targeted single-symbol interception.
-    pub fn force_hle_nid(&mut self, nid: u64) {
-        self.force_hle.insert(nid);
+    pub fn force_hle_nid(&mut self, module: &str, nid: u64) {
+        self.force_hle.insert((canonical_module_name(module), nid));
     }
 
     /// Set the dispatch policy for `module`. Modules with no explicit policy
@@ -100,8 +98,7 @@ impl ModuleRegistry {
     }
 
     /// Record `exports` as this module's LLE exports, available to satisfy
-    /// other modules' imports by NID. `module` is used for diagnostics only
-    /// — the export table itself is a single flat NID -> address map.
+    /// imports that name this provider module and NID.
     ///
     /// Exports are registered at their **module-relative** address. Prefer
     /// [`Self::register_module_exports_at`] for a module loaded at a non-zero
@@ -124,13 +121,14 @@ impl ModuleRegistry {
         exports: &[SymbolExport],
         base: u64,
     ) {
+        let module = canonical_module_name(module);
         for export in exports {
             let addr = base.wrapping_add(export.value);
             tracing::debug!(
                 "registering LLE export {:#x} -> {addr:#x} from module {module:?} (base {base:#x})",
                 export.nid,
             );
-            self.lle_exports.insert(export.nid, addr);
+            self.lle_exports.insert((module.clone(), export.nid), addr);
         }
     }
 
@@ -142,33 +140,51 @@ impl ModuleRegistry {
     /// such as `libc.prx` can be split between its own stateful implementation
     /// and unrelated HLE functions according to who called it.
     pub fn resolve(&self, hle: &HleRegistry, provider_module: &str, nid: u64) -> Resolver {
-        // A per-symbol force-HLE override wins over the provider's policy, so
-        // one function of an otherwise-LLE module can be intercepted while the
-        // rest of that module keeps using its real code.
-        if self.force_hle.contains(&nid)
-            && let Some(resolved) = self.try_hle(hle, nid)
+        self.resolve_import(hle, provider_module, provider_module, nid)
+    }
+
+    /// Resolve an import while preserving both parts of its provider identity.
+    /// Module policy and LLE exports belong to `provider_module`; HLE exports
+    /// are registered under `provider_library` (for example, module
+    /// `libkernel` provides library `libScePosix`).
+    pub fn resolve_import(
+        &self,
+        hle: &HleRegistry,
+        provider_module: &str,
+        provider_library: &str,
+        nid: u64,
+    ) -> Resolver {
+        // A per-symbol force-HLE override can intercept one function of an
+        // HLE-first/LLE-first provider, but never crosses strict `LleOnly`.
+        let provider_module = canonical_module_name(provider_module);
+        let policy = self.policy_for(&provider_module);
+        if policy != ModulePolicy::LleOnly
+            && self.force_hle.contains(&(provider_module.clone(), nid))
+            && let Some(resolved) = self.try_hle(hle, provider_library, nid)
         {
             return resolved;
         }
 
-        let policy = self.policy_for(provider_module);
-
         match policy {
-            ModulePolicy::HleOnly => self.try_hle(hle, nid).unwrap_or(Resolver::Unresolved),
+            ModulePolicy::HleOnly => self
+                .try_hle(hle, provider_library, nid)
+                .unwrap_or(Resolver::Unresolved),
             ModulePolicy::PreferHle => self
-                .try_hle(hle, nid)
-                .or_else(|| self.try_lle(nid))
+                .try_hle(hle, provider_library, nid)
+                .or_else(|| self.try_lle(&provider_module, nid))
                 .unwrap_or(Resolver::Unresolved),
             ModulePolicy::PreferLle => self
-                .try_lle(nid)
-                .or_else(|| self.try_hle(hle, nid))
+                .try_lle(&provider_module, nid)
+                .or_else(|| self.try_hle(hle, provider_library, nid))
                 .unwrap_or(Resolver::Unresolved),
-            ModulePolicy::LleOnly => self.try_lle(nid).unwrap_or(Resolver::Unresolved),
+            ModulePolicy::LleOnly => self
+                .try_lle(&provider_module, nid)
+                .unwrap_or(Resolver::Unresolved),
         }
     }
 
-    fn try_hle(&self, hle: &HleRegistry, nid: u64) -> Option<Resolver> {
-        let name = self.nid_db.resolve(nid)?;
+    fn try_hle(&self, hle: &HleRegistry, provider_module: &str, nid: u64) -> Option<Resolver> {
+        let name = self.nid_db.resolve_for_provider(provider_module, nid)?;
         let (library, function) = name.split_once("::")?;
         if hle.is_implemented(library, function) {
             Some(Resolver::Hle {
@@ -180,9 +196,9 @@ impl ModuleRegistry {
         }
     }
 
-    fn try_lle(&self, nid: u64) -> Option<Resolver> {
+    fn try_lle(&self, provider_module: &str, nid: u64) -> Option<Resolver> {
         self.lle_exports
-            .get(&nid)
+            .get(&(provider_module.to_string(), nid))
             .map(|&addr| Resolver::Lle { addr })
     }
 }
@@ -243,7 +259,7 @@ mod tests {
 
         let registry = ModuleRegistry::new(db);
         let nid = nid_of(&function);
-        match registry.resolve(&hle, "someModule", nid) {
+        match registry.resolve(&hle, &library, nid) {
             Resolver::Hle {
                 library: got_lib,
                 function: got_fn,
@@ -253,6 +269,11 @@ mod tests {
             }
             other => panic!("expected Resolver::Hle, got {other:?}"),
         }
+        assert_eq!(
+            registry.resolve(&hle, "unrelatedProvider", nid),
+            Resolver::Unresolved,
+            "an unrelated provider must not borrow another module's HLE export"
+        );
     }
 
     #[test]
@@ -262,7 +283,7 @@ mod tests {
 
         let nid = nid_of("someFreshLleOnlyExport");
         registry.register_module_exports(
-            "otherModule",
+            "someModule",
             &[SymbolExport {
                 nid,
                 value: 0xDEAD_BEEF,
@@ -295,10 +316,10 @@ mod tests {
 
         let mut registry = ModuleRegistry::new(db);
         // Also register an LLE export for the exact same NID.
-        registry.register_module_exports("otherModule", &[SymbolExport { nid, value: 0x1234 }]);
+        registry.register_module_exports(&library, &[SymbolExport { nid, value: 0x1234 }]);
 
         // Default policy (PreferHle): HLE wins.
-        match registry.resolve(&hle, "someModule", nid) {
+        match registry.resolve(&hle, &library, nid) {
             Resolver::Hle {
                 library: got_lib,
                 function: got_fn,
@@ -310,8 +331,8 @@ mod tests {
         }
 
         // Flip to PreferLle: LLE wins for the same NID.
-        registry.set_policy("someModule", ModulePolicy::PreferLle);
-        match registry.resolve(&hle, "someModule", nid) {
+        registry.set_policy(&library, ModulePolicy::PreferLle);
+        match registry.resolve(&hle, &library, nid) {
             Resolver::Lle { addr } => assert_eq!(addr, 0x1234),
             other => panic!("expected Resolver::Lle under PreferLle, got {other:?}"),
         }
@@ -336,23 +357,69 @@ mod tests {
     #[test]
     fn strict_policies_do_not_cross_the_hle_lle_boundary() {
         let (hle, db) = build_hle_and_db();
-        let (_, function) = uniquely_named_hle_function(&hle);
+        let (library, function) = uniquely_named_hle_function(&hle);
         let nid = nid_of(&function);
         let mut registry = ModuleRegistry::new(db);
-        registry.register_module_exports("libStrict", &[SymbolExport { nid, value: 0x9876 }]);
+        registry.register_module_exports(&library, &[SymbolExport { nid, value: 0x9876 }]);
 
-        registry.set_policy("libStrict", ModulePolicy::HleOnly);
+        registry.set_policy(&library, ModulePolicy::HleOnly);
         assert!(matches!(
-            registry.resolve(&hle, "libStrict", nid),
+            registry.resolve(&hle, &library, nid),
             Resolver::Hle { .. }
         ));
 
-        registry.set_policy("libStrict", ModulePolicy::LleOnly);
+        registry.set_policy(&library, ModulePolicy::LleOnly);
+        registry.force_hle_nid(&library, nid);
         assert_eq!(
-            registry.resolve(&hle, "libStrict", nid),
+            registry.resolve(&hle, &library, nid),
             Resolver::Lle { addr: 0x9876 }
         );
-        assert_eq!(registry.policy_for("LIBSTRICT.PRX"), ModulePolicy::LleOnly);
+        assert_eq!(
+            registry.policy_for(&format!("{library}.PRX")),
+            ModulePolicy::LleOnly
+        );
         assert_eq!(registry.policy_for("unconfigured"), ModulePolicy::PreferHle);
+    }
+
+    #[test]
+    fn same_nid_in_two_lle_modules_resolves_by_provider() {
+        let (hle, db) = build_hle_and_db();
+        let mut registry = ModuleRegistry::new(db);
+        let nid = nid_of("sharedLleExport");
+        registry.register_module_exports("libAlpha.prx", &[SymbolExport { nid, value: 0x1111 }]);
+        registry.register_module_exports("libBeta.sprx", &[SymbolExport { nid, value: 0x2222 }]);
+
+        assert_eq!(
+            registry.resolve(&hle, "LIBALPHA", nid),
+            Resolver::Lle { addr: 0x1111 }
+        );
+        assert_eq!(
+            registry.resolve(&hle, "libBeta.prx", nid),
+            Resolver::Lle { addr: 0x2222 }
+        );
+        assert_eq!(
+            registry.resolve(&hle, "libGamma", nid),
+            Resolver::Unresolved
+        );
+    }
+
+    #[test]
+    fn hle_uses_library_identity_when_module_and_library_differ() {
+        let (hle, db) = build_hle_and_db();
+        let (_, function) = hle
+            .registered_names()
+            .into_iter()
+            .find(|(library, _)| library == "libScePosix")
+            .expect("libScePosix has registered HLE exports");
+        let nid = nid_of(&function);
+        let registry = ModuleRegistry::new(db);
+
+        assert_eq!(
+            registry.resolve_import(&hle, "libkernel", "libScePosix", nid),
+            Resolver::Hle {
+                library: "libScePosix".to_string(),
+                function,
+            }
+        );
     }
 }

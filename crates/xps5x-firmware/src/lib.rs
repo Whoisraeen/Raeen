@@ -23,8 +23,8 @@ pub use crypto::{
     DecryptedSelf, KeyProvider, KeyRequest, NoKeysProvider, SegmentKey, decrypt_self, require_key,
 };
 pub use dynlib::linker::{
-    HLE_TRAMPOLINE_BASE, HleTrampoline, LinkedModule, ProcessTables, UNRESOLVED_STUB_BASE,
-    UnresolvedImport, UnresolvedStub, link_module, link_module_into,
+    HLE_TRAMPOLINE_BASE, HleTrampoline, LinkedModule, ModuleInit, ModuleInitRole, ProcessTables,
+    UNRESOLVED_STUB_BASE, UnresolvedImport, UnresolvedStub, link_module, link_module_into,
 };
 pub use pup::Firmware;
 pub use registry::{ModulePolicy, ModuleRegistry, Resolver};
@@ -145,6 +145,7 @@ fn append_main_initializer(
     inits.push(dynlib::linker::ModuleInit {
         name,
         image_offset: init_vaddr,
+        role: dynlib::linker::ModuleInitRole::Main,
     });
 }
 
@@ -525,7 +526,7 @@ pub fn load_process(
         // (the exception is uncaught anyway). Everything else in libc still
         // uses its real code.
         if std::env::var_os("XPS5X_TRAP_CXA_THROW").is_some() {
-            registry.force_hle_nid(0xbe4b_ae2d_f867_4992);
+            registry.force_hle_nid(needed, 0xbe4b_ae2d_f867_4992);
         }
         // ASTRO.BOT's NATIVE libc.prx sceLibcMspaceCreate hands back a NULL
         // mspace and its native sceLibcMspaceFree then faults dereferencing it
@@ -551,7 +552,7 @@ pub fn load_process(
                 0x7c4a_16e8_126c_3ede,    // sceLibcMspaceMallocUsableSize
                 0xa735_1aec_a128_c9dc,    // sceLibcMspaceIsHeapEmpty
             ] {
-                registry.force_hle_nid(nid);
+                registry.force_hle_nid(needed, nid);
             }
         }
         registry.register_module_exports_at(needed, &dep.dynlib.exports, dep_base);
@@ -714,6 +715,7 @@ pub fn load_process(
         linked.module_inits.push(dynlib::linker::ModuleInit {
             name: p.name.clone(),
             image_offset,
+            role: dynlib::linker::ModuleInitRole::Dependency,
         });
     }
 
@@ -778,14 +780,14 @@ mod tests {
         let base = 0x1000;
         let page = super::build_hle_data_page(&mut registry, base);
 
-        let addr = match registry.resolve(&hle, "eboot.bin", nid_of("in6addr_any")) {
+        let addr = match registry.resolve(&hle, "libkernel", nid_of("in6addr_any")) {
             Resolver::Lle { addr, .. } => addr,
             other => panic!("in6addr_any must resolve as guest data, got {other:?}"),
         };
         let offset = usize::try_from(addr - base).expect("page-relative address");
         assert_eq!(&page[offset..offset + 16], &[0u8; 16]);
 
-        let loopback_addr = match registry.resolve(&hle, "eboot.bin", nid_of("in6addr_loopback")) {
+        let loopback_addr = match registry.resolve(&hle, "libkernel", nid_of("in6addr_loopback")) {
             Resolver::Lle { addr, .. } => addr,
             other => panic!("in6addr_loopback must resolve as guest data, got {other:?}"),
         };
@@ -806,7 +808,7 @@ mod tests {
         // pin the hash so the export is reachable by that exact identity.
         assert_eq!(nid_of("__progname"), 0x763c_713a_65ba_fdac);
 
-        let addr = match registry.resolve(&hle, "eboot.bin", nid_of("__progname")) {
+        let addr = match registry.resolve(&hle, "libkernel", nid_of("__progname")) {
             Resolver::Lle { addr, .. } => addr,
             other => panic!("__progname must resolve as guest data, got {other:?}"),
         };
@@ -821,17 +823,27 @@ mod tests {
 
     #[test]
     fn main_dt_init_is_scheduled_after_dependency_initializers() {
+        use crate::dynlib::linker::ModuleInitRole;
+
         let mut inits = vec![crate::dynlib::linker::ModuleInit {
             name: "dependency.prx".to_string(),
             image_offset: 0x2000,
+            role: ModuleInitRole::Dependency,
         }];
 
         super::append_main_initializer(&mut inits, "game", Some(0x10));
 
         assert_eq!(inits.len(), 2);
         assert_eq!(inits[0].name, "dependency.prx");
+        assert_eq!(inits[0].role, ModuleInitRole::Dependency);
         assert_eq!(inits[1].name, "game");
         assert_eq!(inits[1].image_offset, 0x10);
+        assert_eq!(
+            inits[1].role,
+            ModuleInitRole::Main,
+            "the appended executable initializer must carry the Main role so a \
+             process entry withholds it for crt0"
+        );
 
         super::append_main_initializer(&mut inits, "game", None);
         assert_eq!(inits.len(), 2, "an ELF without DT_INIT adds no call");

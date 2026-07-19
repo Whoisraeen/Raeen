@@ -50,17 +50,29 @@ pub fn register(registry: &HleRegistry) {
     // swap the whole guest CONTEXT to resume another fiber natively, which an
     // ordinary `-> u64` handler cannot express — so the placeholder below is
     // never reached. Names match those the linker reports for ASTRO.BOT.
-    registry.register("libSceFiber", "_sceFiberInitializeImpl", hle_fiber_initialize);
+    registry.register(
+        "libSceFiber",
+        "_sceFiberInitializeImpl",
+        hle_fiber_initialize,
+    );
     registry.register("libSceFiber", "sceFiberInitialize", hle_fiber_initialize);
     registry.register("libSceFiber", "sceFiberFinalize", hle_fiber_finalize);
     registry.register("libSceFiber", "sceFiberRun", hle_fiber_transfer_placeholder);
-    registry.register("libSceFiber", "sceFiberSwitch", hle_fiber_transfer_placeholder);
+    registry.register(
+        "libSceFiber",
+        "sceFiberSwitch",
+        hle_fiber_transfer_placeholder,
+    );
     registry.register(
         "libSceFiber",
         "sceFiberReturnToThread",
         hle_fiber_transfer_placeholder,
     );
-    registry.register("libSceFiber", "sceFiberGetSelf", hle_fiber_transfer_placeholder);
+    registry.register(
+        "libSceFiber",
+        "sceFiberGetSelf",
+        hle_fiber_transfer_placeholder,
+    );
 }
 
 /// `_sceFiberInitializeImpl(fiber, name, entry, arg_on_initialize, addr_context,

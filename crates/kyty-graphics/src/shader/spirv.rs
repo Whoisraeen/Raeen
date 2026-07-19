@@ -2249,9 +2249,7 @@ impl<'a> Spirv<'a> {
                     }
                     // See WriteGlobalVariables: the body's exp formats, not
                     // just the register count, decide the declared set.
-                    let export_count = info
-                        .export_count
-                        .max(max_exp_param(&self.code) + 1);
+                    let export_count = info.export_count.max(max_exp_param(&self.code) + 1);
                     for i in 0..export_count {
                         vars.push(format!("%param{i}"));
                     }
@@ -2365,9 +2363,7 @@ impl<'a> Spirv<'a> {
                     }
                     // See WriteGlobalVariables: the body's exp formats, not
                     // just the register count, decide the declared set.
-                    let export_count = info
-                        .export_count
-                        .max(max_exp_param(&self.code) + 1);
+                    let export_count = info.export_count.max(max_exp_param(&self.code) + 1);
                     for i in 0..export_count {
                         vars.push(format!("OpDecorate %param{i} Location {i}"));
                     }
@@ -2637,7 +2633,10 @@ impl<'a> Spirv<'a> {
                     ));
                 }
                 self.source += &TEXTURES_SAMPLED_TYPES
-                    .replace("<buffers_num>", &format!("{}", bind.textures2d.textures2d_sampled_num))
+                    .replace(
+                        "<buffers_num>",
+                        &format!("{}", bind.textures2d.textures2d_sampled_num),
+                    )
                     .replace("<dim>", if has_cube { "Cube" } else { "2D" });
             }
             if bind.textures2d.textures2d_storage_num > 0 {
@@ -2789,9 +2788,7 @@ impl<'a> Spirv<'a> {
                     // register count of 1). The exp formats in the body are
                     // the ground truth — declaring a dead export is legal,
                     // leaving a written one undeclared is not.
-                    let export_count = info
-                        .export_count
-                        .max(max_exp_param(&self.code) + 1);
+                    let export_count = info.export_count.max(max_exp_param(&self.code) + 1);
                     for i in 0..export_count {
                         vars.push(format!(
                             "%param{i} = OpVariable %_ptr_Output_v4float Output"
@@ -3684,6 +3681,7 @@ impl<'a> Spirv<'a> {
             self.add_constant_uint(72);
             self.add_constant_uint(127);
             self.add_constant_uint(0x3fff);
+            self.add_constant_uint(0x0000_ffff);
             self.add_constant_uint(0x00ff_ffff);
             self.add_constant_uint(0xffff_e000);
             self.add_constant_uint(0xffff_ffff);

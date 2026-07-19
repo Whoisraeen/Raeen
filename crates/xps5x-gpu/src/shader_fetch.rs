@@ -515,16 +515,25 @@ mod tests {
 
     #[test]
     fn window_mem_reads_validated_out_of_band_guest_data() {
-        let external = vec![0xAABB_CCDD, 1, 2, 3];
+        let mut external = vec![0u32; CHUNK_DWORDS];
+        external[..4].copy_from_slice(&[0xAABB_CCDD, 1, 2, 3]);
         let mem = WindowMem {
             base: 0x1000,
             data: vec![S_ENDPGM],
         };
-        let got = mem
-            .dwords_at(external.as_ptr() as u64)
-            .expect("committed host allocation is identity-readable");
-        assert!(matches!(got, Cow::Owned(_)));
-        assert_eq!(&got[..4], external.as_slice());
+        crate::guest_mem::with_test_ranges(
+            &[(
+                external.as_ptr() as u64,
+                std::mem::size_of_val(external.as_slice()),
+            )],
+            || {
+                let got = mem
+                    .dwords_at(external.as_ptr() as u64)
+                    .expect("authorized test allocation is identity-readable");
+                assert!(matches!(got, Cow::Owned(_)));
+                assert_eq!(&got[..4], &external[..4]);
+            },
+        );
     }
 
     /// Solid-green GCN pixel shader (the `shader_bridge` fixture body).
@@ -558,6 +567,11 @@ mod tests {
         v.push(hash0);
         v.push(0x1111_2222);
         v.push(crc32);
+        // Production shader addresses live in page-backed guest mappings, so
+        // the bounded fetcher can safely read its first 4 KiB window. Model
+        // that ownership honestly in the test instead of granting authority
+        // beyond a short Vec allocation.
+        v.resize(CHUNK_DWORDS, 0);
         v
     }
 
@@ -604,17 +618,22 @@ mod tests {
         let mut cache = ShaderTranslateCache::with_dump_dir(None);
         let sh_regs = ShaderRegisters::default(); // export_count = 1
 
-        let t = cache
-            .translate_vs(&vs_regs_at(addr), &sh_regs)
-            .expect("fixture VS must translate");
-        assert_eq!(t.spirv[0], 0x0723_0203, "SPIR-V magic");
+        crate::guest_mem::with_test_ranges(
+            &[(addr, std::mem::size_of_val(blob.as_slice()))],
+            || {
+                let t = cache
+                    .translate_vs(&vs_regs_at(addr), &sh_regs)
+                    .expect("fixture VS must translate");
+                assert_eq!(t.spirv[0], 0x0723_0203, "SPIR-V magic");
 
-        let t2 = cache
-            .translate_vs(&vs_regs_at(addr), &sh_regs)
-            .expect("second bind");
-        assert_eq!(t.spirv, t2.spirv);
-        let s = cache.stats();
-        assert_eq!((s.distinct_fetched, s.translated_ok, s.hits), (1, 1, 1));
+                let t2 = cache
+                    .translate_vs(&vs_regs_at(addr), &sh_regs)
+                    .expect("second bind");
+                assert_eq!(t.spirv, t2.spirv);
+                let s = cache.stats();
+                assert_eq!((s.distinct_fetched, s.translated_ok, s.hits), (1, 1, 1));
+            },
+        );
     }
 
     #[test]
@@ -626,14 +645,19 @@ mod tests {
         // Non-compressed MRT0 export needs output mode 9 (as in shader_bridge).
         sh_regs.target_output_mode[0] = 9;
 
-        let t = cache
-            .translate_ps(
-                &ps_regs_at(addr),
-                &sh_regs,
-                &ShaderVertexInputInfo::default(),
-            )
-            .expect("fixture PS must translate");
-        assert_eq!(t.spirv[0], 0x0723_0203, "SPIR-V magic");
+        crate::guest_mem::with_test_ranges(
+            &[(addr, std::mem::size_of_val(blob.as_slice()))],
+            || {
+                let t = cache
+                    .translate_ps(
+                        &ps_regs_at(addr),
+                        &sh_regs,
+                        &ShaderVertexInputInfo::default(),
+                    )
+                    .expect("fixture PS must translate");
+                assert_eq!(t.spirv[0], 0x0723_0203, "SPIR-V magic");
+            },
+        );
     }
 
     #[test]
@@ -646,11 +670,16 @@ mod tests {
         let addr = blob.as_ptr() as u64;
         let mut cache = ShaderTranslateCache::with_dump_dir(None);
 
-        let t = cache
-            .translate_cs(&cs_regs_at(addr), &ShaderRegisters::default())
-            .expect("fixture CS must translate");
-        assert_eq!(t.spirv[0], 0x0723_0203, "SPIR-V magic");
-        assert_eq!(t.cs_info.threads_num, [8, 4, 1]);
+        crate::guest_mem::with_test_ranges(
+            &[(addr, std::mem::size_of_val(blob.as_slice()))],
+            || {
+                let t = cache
+                    .translate_cs(&cs_regs_at(addr), &ShaderRegisters::default())
+                    .expect("fixture CS must translate");
+                assert_eq!(t.spirv[0], 0x0723_0203, "SPIR-V magic");
+                assert_eq!(t.cs_info.threads_num, [8, 4, 1]);
+            },
+        );
     }
 
     /// Garbage bytes fail with a named reason, are negative-cached (one
@@ -663,31 +692,36 @@ mod tests {
         let mut cache = ShaderTranslateCache::with_dump_dir(None);
         let sh_regs = ShaderRegisters::default();
 
-        let e1 = cache
-            .translate_ps(
-                &ps_regs_at(addr),
-                &sh_regs,
-                &ShaderVertexInputInfo::default(),
-            )
-            .expect_err("garbage must not translate");
-        assert!(
-            e1.contains("next_gen:") && e1.contains("legacy:"),
-            "both generation attempts must be named: {e1}"
-        );
+        crate::guest_mem::with_test_ranges(
+            &[(addr, std::mem::size_of_val(garbage.as_slice()))],
+            || {
+                let e1 = cache
+                    .translate_ps(
+                        &ps_regs_at(addr),
+                        &sh_regs,
+                        &ShaderVertexInputInfo::default(),
+                    )
+                    .expect_err("garbage must not translate");
+                assert!(
+                    e1.contains("next_gen:") && e1.contains("legacy:"),
+                    "both generation attempts must be named: {e1}"
+                );
 
-        let e2 = cache
-            .translate_ps(
-                &ps_regs_at(addr),
-                &sh_regs,
-                &ShaderVertexInputInfo::default(),
-            )
-            .expect_err("still failing");
-        assert_eq!(e1, e2);
-        let s = cache.stats();
-        assert_eq!(
-            (s.distinct_fetched, s.translate_failed, s.hits),
-            (1, 1, 1),
-            "the second bind must be a negative-cache hit, not a re-translation"
+                let e2 = cache
+                    .translate_ps(
+                        &ps_regs_at(addr),
+                        &sh_regs,
+                        &ShaderVertexInputInfo::default(),
+                    )
+                    .expect_err("still failing");
+                assert_eq!(e1, e2);
+                let s = cache.stats();
+                assert_eq!(
+                    (s.distinct_fetched, s.translate_failed, s.hits),
+                    (1, 1, 1),
+                    "the second bind must be a negative-cache hit, not a re-translation"
+                );
+            },
         );
     }
 
@@ -728,12 +762,20 @@ mod tests {
         sh_regs.target_output_mode[0] = 9;
         let vs_info = ShaderVertexInputInfo::default();
 
-        cache
-            .translate_ps(&ps_regs_at(good_addr), &sh_regs, &vs_info)
-            .expect("fixture PS");
-        let _ = cache.translate_ps(&ps_regs_at(bad_addr), &sh_regs, &vs_info);
-        // Re-binds must not duplicate dumps.
-        let _ = cache.translate_ps(&ps_regs_at(bad_addr), &sh_regs, &vs_info);
+        crate::guest_mem::with_test_ranges(
+            &[
+                (good_addr, std::mem::size_of_val(blob.as_slice())),
+                (bad_addr, std::mem::size_of_val(garbage.as_slice())),
+            ],
+            || {
+                cache
+                    .translate_ps(&ps_regs_at(good_addr), &sh_regs, &vs_info)
+                    .expect("fixture PS");
+                let _ = cache.translate_ps(&ps_regs_at(bad_addr), &sh_regs, &vs_info);
+                // Re-binds must not duplicate dumps.
+                let _ = cache.translate_ps(&ps_regs_at(bad_addr), &sh_regs, &vs_info);
+            },
+        );
 
         let files: Vec<_> = std::fs::read_dir(&dir)
             .expect("dump dir exists")
@@ -761,7 +803,8 @@ mod tests {
     #[test]
     fn dump_len_heuristic_bounds() {
         let blob = build_blob(PS_BODY, 1, 2);
-        assert_eq!(dump_len_heuristic(&blob), blob.len());
+        let declared = (blob[1] as usize + 1) * 2 + 7;
+        assert_eq!(dump_len_heuristic(&blob), declared);
 
         let mut bare = PS_BODY.to_vec();
         bare.extend(std::iter::repeat_n(0u32, 100));

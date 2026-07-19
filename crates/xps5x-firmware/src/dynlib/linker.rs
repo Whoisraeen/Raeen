@@ -154,6 +154,37 @@ pub struct UnresolvedStub {
     pub addr: u64,
 }
 
+/// Whether an initializer belongs to a file-backed dependency or to the main
+/// executable itself.
+///
+/// The distinction decides *ownership of the call*, which is what makes a real
+/// title boot: a retail crt0 `_start` walks the executable's own init array,
+/// so a process loader that *also* calls the main initializer runs those
+/// constructors twice. Measured on ASTRO.BOT, a list-building constructor then
+/// formed a cyclic list its own later walk spun on forever (t1 frozen at a
+/// `mov rdx,[rcx]; lea rcx,[rdx+0x10]; jnz` cycle at `module+0x7426c00`). A
+/// `.prx` dependency has no crt0 that re-enters, so its initializer is the
+/// loader's to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleInitRole {
+    /// A file-backed `DT_NEEDED` dependency's `module_start`. The loader owns
+    /// this call in every entry mode — nothing else runs it.
+    Dependency,
+    /// The main executable's own `DT_INIT`. Its crt0 `_start` re-runs it, so a
+    /// process entry must withhold it (see [`ModuleInitRole`]); a direct,
+    /// crt0-less entry runs it because nothing else will.
+    Main,
+}
+
+impl std::fmt::Display for ModuleInitRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ModuleInitRole::Dependency => "dependency",
+            ModuleInitRole::Main => "main",
+        })
+    }
+}
+
 /// One module's `module_start`, to be called before the process entry.
 ///
 /// The Orbis ABI (confirmed against Kyty's `RuntimeLinker::StartModule` ->
@@ -166,6 +197,10 @@ pub struct ModuleInit {
     pub name: String,
     /// Offset of `module_start` within the composed process image.
     pub image_offset: u64,
+    /// Whether this is a dependency's initializer or the main executable's own
+    /// (which its crt0 re-runs). Decides whether a process entry calls it; see
+    /// [`ModuleInitRole`].
+    pub role: ModuleInitRole,
 }
 
 /// One ELF's load range and exception tables within a composed process image.
@@ -264,9 +299,9 @@ pub struct LinkedModule {
 #[derive(Debug, Default)]
 pub struct ProcessTables {
     hle_trampolines: Vec<HleTrampoline>,
-    hle_addrs: HashMap<u64, u64>,
+    hle_addrs: HashMap<(String, String), u64>,
     unresolved_stubs: Vec<UnresolvedStub>,
-    stub_addrs: HashMap<u64, u64>,
+    stub_addrs: HashMap<(Option<String>, u64), u64>,
 }
 
 impl ProcessTables {
@@ -274,23 +309,24 @@ impl ProcessTables {
         Self::default()
     }
 
-    /// Every HLE import resolved across the process, deduped by NID; index `i`
-    /// owns `HLE_TRAMPOLINE_BASE + i*8`.
+    /// Every HLE import resolved across the process, deduped by resolved
+    /// library/function identity; index `i` owns `HLE_TRAMPOLINE_BASE + i*8`.
     pub fn hle_trampolines(&self) -> &[HleTrampoline] {
         &self.hle_trampolines
     }
 
-    /// Every distinct unresolved NID across the process; index `i` owns
-    /// `UNRESOLVED_STUB_BASE + i*8`.
+    /// Every distinct unresolved provider/NID across the process; index `i`
+    /// owns `UNRESOLVED_STUB_BASE + i*8`.
     pub fn unresolved_stubs(&self) -> &[UnresolvedStub] {
         &self.unresolved_stubs
     }
 
     /// The address for `nid`'s HLE trampoline, allocating one if this is the
     /// first module to import it.
-    fn hle_addr(&mut self, nid: u64, library: String, function: String) -> u64 {
+    fn hle_addr(&mut self, library: String, function: String) -> u64 {
         let trampolines = &mut self.hle_trampolines;
-        *self.hle_addrs.entry(nid).or_insert_with(|| {
+        let key = (library.clone(), function.clone());
+        *self.hle_addrs.entry(key).or_insert_with(|| {
             let addr = HLE_TRAMPOLINE_BASE + (trampolines.len() as u64 * 8);
             trampolines.push(HleTrampoline {
                 library,
@@ -305,7 +341,8 @@ impl ProcessTables {
     /// first module to fail to resolve it.
     fn stub_addr(&mut self, nid: u64, library: Option<String>) -> u64 {
         let stubs = &mut self.unresolved_stubs;
-        *self.stub_addrs.entry(nid).or_insert_with(|| {
+        let key = (library.clone(), nid);
+        *self.stub_addrs.entry(key).or_insert_with(|| {
             let addr = UNRESOLVED_STUB_BASE + (stubs.len() as u64 * 8);
             stubs.push(UnresolvedStub { nid, library, addr });
             addr
@@ -408,29 +445,17 @@ fn link_inner(
 
     let mut unresolved: Vec<UnresolvedImport> = Vec::new();
 
-    // nid -> importing library name, so an unresolved stub can say which
-    // library owes the guest this function. `library_index` indexes
-    // `import_libs` (the library table) — never `import_modules`; crossing
-    // them renames every library (see `dynlib::DT_SCE_NEEDED_MODULE_1`).
+    // Provider names are resolved per symtab entry (`r_sym`), not per NID:
+    // the same NID can be imported from two modules in one consumer.
     let lib_names: HashMap<u16, &str> = dynlib
         .import_libs
         .iter()
         .map(|(id, n)| (*id, n.as_str()))
         .collect();
-    let lib_of_nid: HashMap<u64, &str> = dynlib
-        .imports
-        .iter()
-        .filter_map(|s| lib_names.get(&s.library_index).map(|n| (s.nid, *n)))
-        .collect();
     let module_names: HashMap<u16, &str> = dynlib
         .import_modules
         .iter()
         .map(|(id, n)| (*id, n.as_str()))
-        .collect();
-    let module_of_nid: HashMap<u64, &str> = dynlib
-        .imports
-        .iter()
-        .filter_map(|s| module_names.get(&s.module_index).map(|n| (s.nid, *n)))
         .collect();
 
     for reloc in &dynlib.relocations {
@@ -517,10 +542,26 @@ fn link_inner(
                 // import. Using `module.name` (the consumer) split a shipped
                 // libc between LLE and HLE depending on which object called
                 // it, leaving C++ runtime globals owned by different worlds.
-                let provider_module = module_of_nid
-                    .get(&symbol.nid)
-                    .copied()
-                    .or_else(|| lib_of_nid.get(&symbol.nid).copied())
+                let provider_ref = dynlib
+                    .symbol_providers
+                    .get(r_sym as usize)
+                    .and_then(Option::as_ref)
+                    .or_else(|| {
+                        // Compatibility for hand-built fixtures predating the
+                        // aligned provider table. A unique NID is unambiguous;
+                        // duplicate-NID imports must carry per-symbol data.
+                        let mut matching = dynlib
+                            .imports
+                            .iter()
+                            .filter(|provider| provider.nid == symbol.nid);
+                        let provider = matching.next()?;
+                        matching.next().is_none().then_some(provider)
+                    });
+                let provider_library = provider_ref
+                    .and_then(|provider| lib_names.get(&provider.library_index).copied());
+                let provider_module = provider_ref
+                    .and_then(|provider| module_names.get(&provider.module_index).copied())
+                    .or(provider_library)
                     .unwrap_or(&module.name);
                 // Forensic (XPS5X_TRACE_DRAWS): name the import whose PLT stub
                 // (GOT slot module-vaddr 0xE123280) returns EINVAL and kills the
@@ -534,9 +575,14 @@ fn link_inner(
                         "TRACE_DRAWS: PLT-0xb5 import (returns EINVAL, kills Streaming Pool)"
                     );
                 }
-                match registry.resolve(hle, provider_module, symbol.nid) {
+                match registry.resolve_import(
+                    hle,
+                    provider_module,
+                    provider_library.unwrap_or(provider_module),
+                    symbol.nid,
+                ) {
                     Resolver::Hle { library, function } => {
-                        let addr = tables.hle_addr(symbol.nid, library, function);
+                        let addr = tables.hle_addr(library, function);
                         if r_type == R_X86_64_64 {
                             addr.wrapping_add(reloc.addend as u64)
                         } else {
@@ -551,7 +597,7 @@ fn link_inner(
                         // stub address IS the symbol's identity, and the
                         // runtime inverts it by exact slot. An addend would
                         // land mid-slot and lose the NID — the whole point.
-                        tables.stub_addr(nid, lib_of_nid.get(&nid).map(|s| s.to_string()))
+                        tables.stub_addr(nid, provider_library.map(str::to_string))
                     }
                 }
             }
@@ -792,6 +838,41 @@ mod tests {
         (hle, ModuleRegistry::new(db))
     }
 
+    fn uniquely_named_hle_function(hle: &HleRegistry) -> (String, String) {
+        let mut names = hle.registered_names();
+        names.sort();
+        let mut counts = HashMap::<&str, usize>::new();
+        for (_, function) in &names {
+            *counts.entry(function).or_default() += 1;
+        }
+        names
+            .iter()
+            .find(|(_, function)| counts[function.as_str()] == 1)
+            .cloned()
+            .expect("HLE has a uniquely named function")
+    }
+
+    fn import_dynlib(library: &str, nid: u64, relocations: Vec<SceRela>) -> DynlibData {
+        let provider = SymbolRef {
+            nid,
+            module_index: 1,
+            library_index: 1,
+        };
+        DynlibData {
+            imports: vec![provider],
+            symbols: vec![DynSymbol {
+                nid,
+                value: 0,
+                is_import: true,
+            }],
+            symbol_providers: vec![Some(provider)],
+            import_modules: vec![(1, library.to_string())],
+            import_libs: vec![(1, library.to_string())],
+            relocations,
+            ..Default::default()
+        }
+    }
+
     fn read_slot(image: &[u8], offset: u64) -> u64 {
         let start = offset as usize;
         u64::from_le_bytes(image[start..start + 8].try_into().unwrap())
@@ -890,9 +971,7 @@ mod tests {
         assert!(a.unresolved_stubs.is_empty() && b.unresolved_stubs.is_empty());
     }
 
-    /// The same NID imported by two modules shares ONE slot — dedup is
-    /// process-wide, not per-module, so the table stays bounded by distinct
-    /// imports rather than growing per module.
+    /// The same provider/NID imported twice shares one process-wide slot.
     #[test]
     fn the_same_nid_in_two_modules_shares_one_stub_slot() {
         let (hle, registry) = empty_registry();
@@ -928,29 +1007,165 @@ mod tests {
     }
 
     #[test]
+    fn same_unresolved_nid_from_two_libraries_keeps_distinct_diagnostics() {
+        let (hle, registry) = empty_registry();
+        let nid = nid_of("unknownSharedName");
+        let module = test_module(0x100);
+        let dynlib = DynlibData {
+            imports: vec![
+                SymbolRef {
+                    nid,
+                    module_index: 1,
+                    library_index: 1,
+                },
+                SymbolRef {
+                    nid,
+                    module_index: 2,
+                    library_index: 2,
+                },
+            ],
+            symbols: vec![
+                DynSymbol {
+                    nid,
+                    value: 0,
+                    is_import: true,
+                },
+                DynSymbol {
+                    nid,
+                    value: 0,
+                    is_import: true,
+                },
+            ],
+            symbol_providers: vec![
+                Some(SymbolRef {
+                    nid,
+                    module_index: 1,
+                    library_index: 1,
+                }),
+                Some(SymbolRef {
+                    nid,
+                    module_index: 2,
+                    library_index: 2,
+                }),
+            ],
+            import_modules: vec![(1, "modAlpha".to_string()), (2, "modBeta".to_string())],
+            import_libs: vec![(1, "libAlpha".to_string()), (2, "libBeta".to_string())],
+            relocations: vec![
+                SceRela {
+                    offset: 0x18,
+                    info: R_X86_64_JUMP_SLOT as u64,
+                    addend: 0,
+                },
+                SceRela {
+                    offset: 0x20,
+                    info: (1u64 << 32) | R_X86_64_JUMP_SLOT as u64,
+                    addend: 0,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let linked = link_module(&module, &dynlib, &registry, &hle, 0).expect("links");
+        assert_ne!(
+            read_slot(&linked.image, 0x18),
+            read_slot(&linked.image, 0x20)
+        );
+        assert_eq!(linked.unresolved_stubs.len(), 2);
+        assert_eq!(
+            linked.unresolved_stubs[0].library.as_deref(),
+            Some("libAlpha")
+        );
+        assert_eq!(
+            linked.unresolved_stubs[1].library.as_deref(),
+            Some("libBeta")
+        );
+    }
+
+    #[test]
+    fn same_hle_nid_from_two_libraries_keeps_distinct_trampolines() {
+        let (hle, registry) = empty_registry();
+        let nid = nid_of("getpid");
+        let module = test_module(0x100);
+        let dynlib = DynlibData {
+            imports: vec![
+                SymbolRef {
+                    nid,
+                    module_index: 1,
+                    library_index: 1,
+                },
+                SymbolRef {
+                    nid,
+                    module_index: 1,
+                    library_index: 2,
+                },
+            ],
+            symbols: vec![
+                DynSymbol {
+                    nid,
+                    value: 0,
+                    is_import: true,
+                },
+                DynSymbol {
+                    nid,
+                    value: 0,
+                    is_import: true,
+                },
+            ],
+            symbol_providers: vec![
+                Some(SymbolRef {
+                    nid,
+                    module_index: 1,
+                    library_index: 1,
+                }),
+                Some(SymbolRef {
+                    nid,
+                    module_index: 1,
+                    library_index: 2,
+                }),
+            ],
+            import_modules: vec![(1, "libkernel".to_string())],
+            import_libs: vec![(1, "libkernel".to_string()), (2, "libScePosix".to_string())],
+            relocations: vec![
+                SceRela {
+                    offset: 0x18,
+                    info: R_X86_64_JUMP_SLOT as u64,
+                    addend: 0,
+                },
+                SceRela {
+                    offset: 0x20,
+                    info: (1u64 << 32) | R_X86_64_JUMP_SLOT as u64,
+                    addend: 0,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let linked = link_module(&module, &dynlib, &registry, &hle, 0).expect("links");
+        assert_ne!(
+            read_slot(&linked.image, 0x18),
+            read_slot(&linked.image, 0x20)
+        );
+        assert_eq!(linked.hle_trampolines.len(), 2);
+        assert_eq!(linked.hle_trampolines[0].library, "libkernel");
+        assert_eq!(linked.hle_trampolines[1].library, "libScePosix");
+    }
+
+    #[test]
     fn jump_slot_import_resolves_to_hle_trampoline() {
         let (hle, registry) = empty_registry();
-        let (library, function) = hle
-            .registered_names()
-            .into_iter()
-            .next()
-            .expect("HleRegistry::new() registers at least one function");
+        let (library, function) = uniquely_named_hle_function(&hle);
         let nid = nid_of(&function);
 
         let module = test_module(0x100);
-        let dynlib = DynlibData {
-            symbols: vec![DynSymbol {
-                nid,
-                value: 0,
-                is_import: true,
-            }],
-            relocations: vec![SceRela {
+        let dynlib = import_dynlib(
+            &library,
+            nid,
+            vec![SceRela {
                 offset: 0x10,
                 info: R_X86_64_JUMP_SLOT as u64, // r_sym = 0
                 addend: 0,
             }],
-            ..Default::default()
-        };
+        );
 
         let linked =
             link_module(&module, &dynlib, &registry, &hle, 0).expect("HLE-resolved reloc links");
@@ -966,21 +1181,14 @@ mod tests {
     #[test]
     fn repeated_hle_import_reuses_same_trampoline_address() {
         let (hle, registry) = empty_registry();
-        let (_, function) = hle
-            .registered_names()
-            .into_iter()
-            .next()
-            .expect("HleRegistry::new() registers at least one function");
+        let (library, function) = uniquely_named_hle_function(&hle);
         let nid = nid_of(&function);
 
         let module = test_module(0x100);
-        let dynlib = DynlibData {
-            symbols: vec![DynSymbol {
-                nid,
-                value: 0,
-                is_import: true,
-            }],
-            relocations: vec![
+        let dynlib = import_dynlib(
+            &library,
+            nid,
+            vec![
                 SceRela {
                     offset: 0x10,
                     info: R_X86_64_JUMP_SLOT as u64,
@@ -992,8 +1200,7 @@ mod tests {
                     addend: 0,
                 },
             ],
-            ..Default::default()
-        };
+        );
 
         let linked = link_module(&module, &dynlib, &registry, &hle, 0).expect("links");
 
@@ -1007,7 +1214,7 @@ mod tests {
     fn import_resolves_to_lle_export_plus_addend() {
         let (hle, mut registry) = empty_registry();
         let nid = nid_of("someUniqueLleOnlyExport");
-        registry.register_module_exports("otherModule", &[SymbolExport { nid, value: 0x9999 }]);
+        registry.register_module_exports("someModule", &[SymbolExport { nid, value: 0x9999 }]);
 
         let module = test_module(0x100);
         let dynlib = DynlibData {
@@ -1030,6 +1237,73 @@ mod tests {
         assert_eq!(read_slot(&linked.image, 0x18), 0x9999 + 0x5);
         assert!(linked.unresolved.is_empty());
         assert!(linked.hle_trampolines.is_empty());
+    }
+
+    #[test]
+    fn equal_nids_from_two_providers_resolve_per_symbol_index() {
+        let (hle, mut registry) = empty_registry();
+        let nid = nid_of("sameNamedExport");
+        registry.register_module_exports("libAlpha", &[SymbolExport { nid, value: 0x1111 }]);
+        registry.register_module_exports("libBeta", &[SymbolExport { nid, value: 0x2222 }]);
+
+        let module = test_module(0x100);
+        let dynlib = DynlibData {
+            imports: vec![
+                SymbolRef {
+                    nid,
+                    module_index: 1,
+                    library_index: 1,
+                },
+                SymbolRef {
+                    nid,
+                    module_index: 2,
+                    library_index: 2,
+                },
+            ],
+            import_modules: vec![(1, "libAlpha".to_string()), (2, "libBeta".to_string())],
+            import_libs: vec![(1, "libAlpha".to_string()), (2, "libBeta".to_string())],
+            symbols: vec![
+                DynSymbol {
+                    nid,
+                    value: 0,
+                    is_import: true,
+                },
+                DynSymbol {
+                    nid,
+                    value: 0,
+                    is_import: true,
+                },
+            ],
+            symbol_providers: vec![
+                Some(SymbolRef {
+                    nid,
+                    module_index: 1,
+                    library_index: 1,
+                }),
+                Some(SymbolRef {
+                    nid,
+                    module_index: 2,
+                    library_index: 2,
+                }),
+            ],
+            relocations: vec![
+                SceRela {
+                    offset: 0x18,
+                    info: R_X86_64_JUMP_SLOT as u64,
+                    addend: 0,
+                },
+                SceRela {
+                    offset: 0x20,
+                    info: (1u64 << 32) | R_X86_64_JUMP_SLOT as u64,
+                    addend: 0,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let linked = link_module(&module, &dynlib, &registry, &hle, 0).expect("links");
+        assert_eq!(read_slot(&linked.image, 0x18), 0x1111);
+        assert_eq!(read_slot(&linked.image, 0x20), 0x2222);
     }
 
     #[test]

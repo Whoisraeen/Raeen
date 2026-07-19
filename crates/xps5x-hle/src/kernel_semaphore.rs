@@ -142,7 +142,10 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
         if !ctx.mem.read(timeout_ptr, &mut raw) {
             return SCE_KERNEL_ERROR_EFAULT;
         }
-        Some(std::time::Instant::now() + std::time::Duration::from_micros(u64::from(u32::from_le_bytes(raw))))
+        Some(
+            std::time::Instant::now()
+                + std::time::Duration::from_micros(u64::from(u32::from_le_bytes(raw))),
+        )
     };
 
     let (lock, cvar) = &ctx.kernel.semaphore_signal;
@@ -267,7 +270,10 @@ mod tests {
             SCE_KERNEL_ERROR_ETIMEDOUT
         );
         // need beyond max → EINVAL on the fast path (never blocks).
-        assert_eq!(hle_wait(&ctx, &[h as u64, 5, 0x200]), SCE_KERNEL_ERROR_EINVAL);
+        assert_eq!(
+            hle_wait(&ctx, &[h as u64, 5, 0x200]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
     }
 
     /// The blocking-wait contract: a `WaitSema` with a NULL (forever) timeout

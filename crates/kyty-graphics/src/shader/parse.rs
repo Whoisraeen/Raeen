@@ -12,8 +12,8 @@
 //! - The instruction walk is bounded by the buffer length.
 
 use super::types::{
-    ShaderCode, ShaderInstruction, ShaderInstructionType as T, ShaderLabel, ShaderOperand,
-    ShaderOperandType as O, ShaderType, shader_instruction_format::Format as F,
+    ShaderCode, ShaderConstant, ShaderInstruction, ShaderInstructionType as T, ShaderLabel,
+    ShaderOperand, ShaderOperandType as O, ShaderType, shader_instruction_format::Format as F,
 };
 
 /// Typed replacement for Kyty's hard exits (ShaderParse.cpp macros L21-28).
@@ -516,7 +516,32 @@ fn shader_parse_sop1(
         0x1c => return Err(ni(dst, S, "s_bitset0_b64", opcode, pc, b0)),
         0x1d => return Err(ni(dst, S, "s_bitset1_b32", opcode, pc, b0)),
         0x1e => return Err(ni(dst, S, "s_bitset1_b64", opcode, pc, b0)),
-        0x1f => return Err(ni(dst, S, "s_getpc_b64", opcode, pc, b0)),
+        0x1f => {
+            // The hardware returns the absolute address of the instruction
+            // following S_GETPC_B64. The C++ path implicitly retained this in
+            // its raw code pointer; the Rust model carries the guest base on
+            // ShaderCode so high address bits are not lost.
+            let following = dst
+                .get_base_address()
+                .wrapping_add(u64::from(pc))
+                .wrapping_add(4);
+            inst.type_ = T::SGetpcB64;
+            inst.format = F::Sdst2;
+            inst.dst.size = 2;
+            inst.src[0] = ShaderOperand {
+                type_: O::LiteralConstant,
+                constant: ShaderConstant::from_u(following as u32),
+                size: 1,
+                ..Default::default()
+            };
+            inst.src[1] = ShaderOperand {
+                type_: O::LiteralConstant,
+                constant: ShaderConstant::from_u((following >> 32) as u32),
+                size: 1,
+                ..Default::default()
+            };
+            inst.src_num = 2;
+        }
         0x20 => {
             inst.type_ = T::SSetpcB64;
             inst.format = F::Saddr;
@@ -683,7 +708,7 @@ fn shader_parse_sop2(
             }
             inst.type_ = T::SLshl4AddU32;
         }
-        0x32 => return Err(ni(dst, S, "s_pack_ll_b32_b16", opcode, pc, b0)),
+        0x32 => inst.type_ = T::SPackLlB32B16,
         0x33 => return Err(ni(dst, S, "s_pack_lh_b32_b16", opcode, pc, b0)),
         0x34 => return Err(ni(dst, S, "s_pack_hh_b32_b16", opcode, pc, b0)),
         0x35 => inst.type_ = T::SMulHiU32,
@@ -1111,9 +1136,6 @@ fn shader_parse_vop1(
     if sdwa && dst_sel == 6 && dst_u != 0 {
         return Err(feature(S, "sdwa dst_u != 0", pc));
     }
-    if omod != 0 {
-        return Err(feature(S, "sdwa omod != 0", pc));
-    }
     if src0_sel != 6 {
         return Err(feature(S, "sdwa src0_sel != 6", pc));
     }
@@ -1137,6 +1159,13 @@ fn shader_parse_vop1(
     inst.src[0].absolute = src0_abs != 0;
     inst.src[0].negate = src0_neg != 0;
     inst.dst.clamp = clmp != 0;
+    inst.dst.multiplier = match omod {
+        0 => 1.0,
+        1 => 2.0,
+        2 => 4.0,
+        3 => 0.5,
+        _ => unreachable!(),
+    };
 
     inst.format = F::SVdstSVsrc0;
 
@@ -2504,7 +2533,7 @@ fn shader_parse_mubuf(
     // Kyty L2569-2575: EXIT_NOT_IMPLEMENTED checks. Beyond Kyty: offen rides
     // as the second vaddr register (the tbuffer xyzw model), but only for the
     // opcodes with an offen recompiler below — the rest stay named.
-    if idxen == 0 {
+    if idxen == 0 && opcode != 0x0e {
         return Err(feature(S, "idxen == 0", pc));
     }
     if offen == 1 && opcode != 0x0e {
@@ -2594,12 +2623,14 @@ fn shader_parse_mubuf(
             // Measured on Minecraft's menu VS: `buffer_load_dwordx4 v[8:11],
             // v[4:5], s[8:11]` with idxen+offen (vindex=v4, voffset=v5).
             inst.type_ = T::BufferLoadDwordX4;
-            inst.format = if offen == 1 {
-                F::Vdata4Vaddr2SvSoffsOffenIdxen
-            } else {
-                F::Vdata4VaddrSvSoffsIdxen
+            inst.format = match (idxen, offen) {
+                (1, 1) => F::Vdata4Vaddr2SvSoffsOffenIdxen,
+                (1, 0) => F::Vdata4VaddrSvSoffsIdxen,
+                (0, 1) => F::Vdata4VaddrSvSoffsOffen,
+                (0, 0) => F::Vdata4SvSoffs,
+                _ => unreachable!(),
             };
-            inst.src[0].size += offen as i32;
+            inst.src[0].size = (idxen + offen).max(1) as i32;
             inst.src[1].size = 4;
             inst.dst.size = 4;
         }
@@ -2651,7 +2682,10 @@ fn shader_parse_ds(
     let addr = b1 & 0xff;
 
     // Kyty L2740-2745: EXIT_NOT_IMPLEMENTED checks.
-    if addr != 0 {
+    // DS_APPEND/DS_CONSUME select the GDS counter through M0 and do not read
+    // the encoded address VGPR. Real Gen5 shaders leave this don't-care field
+    // non-zero, so retain Kyty's strict check for every other DS operation.
+    if addr != 0 && !matches!(opcode, 0x3d | 0x3e) {
         return Err(feature(S, "addr != 0", pc));
     }
     if data0 != 0 {
@@ -2947,7 +2981,16 @@ fn shader_parse_mimg(
         }
         0x0a => return Err(ni(dst, S, "image_store_pck", opcode, pc, b0)),
         0x0b => return Err(ni(dst, S, "image_store_mip_pck", opcode, pc, b0)),
-        0x0e => return Err(ni(dst, S, "image_get_resinfo", opcode, pc, b0)),
+        0x0e => {
+            inst.type_ = T::ImageGetResinfo;
+            inst.src[0].size = 1; // mip level
+            inst.src[1].size = 8; // T#
+            inst.src_num = 2;
+            if dmask == 0x3 {
+                inst.format = F::Vdata2VaddrStDmask3;
+                inst.dst.size = 2;
+            }
+        }
         0x0f => return Err(ni(dst, S, "image_atomic_swap", opcode, pc, b0)),
         0x10 => return Err(ni(dst, S, "image_atomic_cmpswap", opcode, pc, b0)),
         0x11 => return Err(ni(dst, S, "image_atomic_add", opcode, pc, b0)),
@@ -3032,7 +3075,45 @@ fn shader_parse_mimg(
         0x2c => return Err(ni(dst, S, "image_sample_c_l", opcode, pc, b0)),
         0x2d => return Err(ni(dst, S, "image_sample_c_b", opcode, pc, b0)),
         0x2e => return Err(ni(dst, S, "image_sample_c_b_cl", opcode, pc, b0)),
-        0x2f => return Err(ni(dst, S, "image_sample_c_lz", opcode, pc, b0)),
+        0x2f => {
+            inst.type_ = T::ImageSampleCLz;
+            // Gen5 comparison samples place the full-width depth reference
+            // before the ordinary 2D coordinates: {reference, x, y}.
+            inst.src[0].size = 3;
+            inst.src[1].size = 8;
+            inst.src[2].size = 4;
+            match dmask {
+                0x1 => {
+                    inst.format = F::Vdata1Vaddr3StSsDmask1;
+                    inst.dst.size = 1;
+                }
+                0x3 => {
+                    inst.format = F::Vdata2Vaddr3StSsDmask3;
+                    inst.dst.size = 2;
+                }
+                0x5 => {
+                    inst.format = F::Vdata2Vaddr3StSsDmask5;
+                    inst.dst.size = 2;
+                }
+                0x7 => {
+                    inst.format = F::Vdata3Vaddr3StSsDmask7;
+                    inst.dst.size = 3;
+                }
+                0x8 => {
+                    inst.format = F::Vdata1Vaddr3StSsDmask8;
+                    inst.dst.size = 1;
+                }
+                0x9 => {
+                    inst.format = F::Vdata2Vaddr3StSsDmask9;
+                    inst.dst.size = 2;
+                }
+                0xf => {
+                    inst.format = F::Vdata4Vaddr3StSsDmaskF;
+                    inst.dst.size = 4;
+                }
+                _ => {}
+            }
+        }
         0x30 => return Err(ni(dst, S, "image_sample_o", opcode, pc, b0)),
         0x31 => return Err(ni(dst, S, "image_sample_cl_o", opcode, pc, b0)),
         0x32 => return Err(ni(dst, S, "image_sample_d_o", opcode, pc, b0)),
@@ -3834,6 +3915,23 @@ mod tests {
     }
 
     #[test]
+    fn astro_ds_append_accepts_nonzero_dont_care_addr() {
+        // DS_APPEND/CONSUME select the GDS counter from M0. The encoded addr
+        // VGPR is not consumed by these two opcodes (shadPS4 Gen5 agrees), and
+        // ASTRO.BOT leaves it non-zero.
+        let (code, result) = parse(
+            &[0xD8FA_0000, 0x0700_0009, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse DS_APPEND with non-zero don't-care addr");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::DsAppend);
+        assert_eq!(inst.format, F::VdstGds);
+        assert_eq!(inst.src_num, 0);
+    }
+
+    #[test]
     fn vintrp_v_interp_p1_f32() {
         let (code, _) = parse_vs(&[0xC814_0D02, S_ENDPGM]);
         let inst = &code.get_instructions()[0];
@@ -4062,6 +4160,25 @@ mod tests {
     }
 
     #[test]
+    fn astro_image_sample_c_lz_dmask1_decodes_reference_and_xy() {
+        // image_sample_c_lz (opcode 0x2f), dmask=x. Its three address VGPRs
+        // are depth-reference, x, y in that order.
+        let (code, result) = parse(
+            &[0xF0BC_0100, 0x0061_0800, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse image_sample_c_lz");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::ImageSampleCLz);
+        assert_eq!(inst.format, F::Vdata1Vaddr3StSsDmask1);
+        assert_eq!((inst.dst.register_id, inst.dst.size), (8, 1));
+        assert_eq!(inst.src[0].size, 3);
+        assert_eq!(inst.src[1].size, 8);
+        assert_eq!(inst.src[2].size, 4);
+    }
+
+    #[test]
     fn sop1_s_orn2_saveexec_b64() {
         // Measured ASTRO.BOT encoding 0xBE92287E: sdst=s[18:19], opcode 0x28,
         // ssrc0=0x7e (exec). `sdst = exec; exec = ssrc0 | ~exec`.
@@ -4071,6 +4188,80 @@ mod tests {
         assert_eq!(inst.format, F::Sdst2Ssrc02);
         assert_eq!(inst.dst.size, 2);
         assert_eq!(inst.src[0].size, 2);
+    }
+
+    #[test]
+    fn astro_s_getpc_b64_captures_the_absolute_following_pc() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        code.set_base_address(0x0000_0005_0074_e000);
+        shader_parse(0, &[0xBE80_1F00, S_ENDPGM], &mut code, true).expect("parse s_getpc_b64");
+
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SGetpcB64);
+        assert_eq!(inst.format, F::Sdst2);
+        assert_eq!((inst.dst.register_id, inst.dst.size), (0, 2));
+        assert_eq!(inst.src_num, 2);
+        assert_eq!(inst.src[0].constant.u, 0x0074_e004);
+        assert_eq!(inst.src[1].constant.u, 0x0000_0005);
+    }
+
+    #[test]
+    fn astro_s_pack_ll_b32_b16_decodes() {
+        // Measured ASTRO.BOT scene-compute encoding.
+        let (code, result) = parse(&[0x9935_806B, S_ENDPGM], ShaderType::Compute, true);
+        result.expect("parse s_pack_ll_b32_b16");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SPackLlB32B16);
+        assert_eq!(inst.format, F::SVdstSVsrc0SVsrc1);
+    }
+
+    #[test]
+    fn astro_vop1_sdwa_omod_is_preserved() {
+        // v_rcp_f32 v1, v5 with SDWA omod=2 (multiply result by 2.0).
+        let (code, result) = parse(
+            &[0x7E02_54F9, 0x0026_4605, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse VOP1 SDWA omod");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::VRcpF32);
+        assert_eq!(inst.dst.multiplier, 2.0);
+    }
+
+    #[test]
+    fn astro_buffer_load_dwordx4_accepts_address_only_mode() {
+        // idxen=0/offen=0: the buffer descriptor/soffset form has no VGPR
+        // index contribution. This is emitted by ASTRO.BOT compute shaders.
+        let (code, result) = parse(
+            &[0xE038_0000, 0x8001_0400, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse address-only buffer_load_dwordx4");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::BufferLoadDwordX4);
+        assert_eq!(inst.format, F::Vdata4SvSoffs);
+        assert_eq!(inst.dst.size, 4);
+    }
+
+    #[test]
+    fn astro_image_get_resinfo_dmask3_decodes() {
+        // Raw first dword measured in ASTRO.BOT scene compute; dmask=xy.
+        let (code, result) = parse(
+            &[0xF038_0308, 0x0001_0400, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse image_get_resinfo");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::ImageGetResinfo);
+        assert_eq!(inst.format, F::Vdata2VaddrStDmask3);
+        assert_eq!((inst.dst.register_id, inst.dst.size), (4, 2));
+        assert_eq!(inst.src_num, 2);
+        assert_eq!(inst.src[0].size, 1);
+        assert_eq!(inst.src[1].size, 8);
     }
 
     #[test]

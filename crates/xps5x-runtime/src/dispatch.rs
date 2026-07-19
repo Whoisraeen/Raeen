@@ -61,13 +61,13 @@ use windows_sys::Win32::System::Threading::{
     THREAD_SUSPEND_RESUME,
 };
 
+use xps5x_core::subsystems::GpuSubmissionSubsystem;
 use xps5x_firmware::{HleTrampoline, UnresolvedStub};
 use xps5x_hle::{
     GuestAllocator, GuestCallCompletion, GuestCallRequest, GuestCallScheduler, GuestMemory,
     GuestThreadScheduler, HleContext, HleRegistry,
 };
 use xps5x_kernel::OrbisKernel;
-use xps5x_core::subsystems::GpuSubmissionSubsystem;
 
 use crate::RunOutcome;
 use crate::RuntimeError;
@@ -109,18 +109,16 @@ pub(crate) fn process_exit_trampoline(trampolines: &[HleTrampoline]) -> Option<u
         .map(|trampoline| trampoline.addr)
 }
 
-/// Serializes [`crate::execute_linked`] end to end: RT0 supports exactly
-/// one active native guest execution at a time (design doc §4/§6/§9 —
-/// "RT0 is single-threaded-execution"). [`call_lock`] is acquired by
-/// `execute_linked` itself (not just around the guest call in [`run`]),
-/// because `TrampolineGuard::reserve`'s fixed-address `VirtualAlloc` (in
-/// `trampoline.rs`) is process-global state just as much as `run`'s guest
-/// call is — two concurrent `execute_linked` calls racing to reserve the
-/// same fixed `HLE_TRAMPOLINE_BASE` region would spuriously fail with
-/// `MapFailed`, lock or no lock inside `run` alone. Holding it for the
-/// whole pipeline still enforces RT0's single guest execution. The
-/// `ACTIVE_CONTEXT` route itself is thread-local and the VEH only reads the
-/// faulting OS thread's slot, which is the property later workers rely on.
+/// Serializes top-level [`crate::execute_linked`] sessions end to end.
+/// [`call_lock`] is acquired by `execute_linked` itself (not just around the
+/// initial guest call in [`run`]), because `TrampolineGuard::reserve`'s
+/// fixed-address `VirtualAlloc` (in `trampoline.rs`) is process-global state:
+/// two concurrent process launches racing to reserve the same fixed
+/// `HLE_TRAMPOLINE_BASE` region would spuriously fail with `MapFailed`.
+///
+/// This does **not** serialize guest pthread workers belonging to that process.
+/// Those workers may execute [`run`] concurrently and rely on thread-local
+/// [`ACTIVE_CONTEXT`] slots; the VEH only reads the faulting OS thread's slot.
 static CALL_LOCK: Mutex<()> = Mutex::new(());
 
 /// Opt-in native-execution watchdog used by retail-title bring-up. A timeout
@@ -272,9 +270,9 @@ pub fn fsbase_rearm_count() -> u64 {
 
 /// Acquire [`CALL_LOCK`] for the entire [`crate::execute_linked`] pipeline.
 /// Called once, at the very top of `execute_linked`; the returned guard is
-/// held (as a local binding) until that function returns. `run` no longer
-/// acquires `CALL_LOCK` itself — it's not reentrant, and the lock must
-/// already be held by the time `run` is called.
+/// held (as a local binding) until that function returns. `run` does not
+/// acquire `CALL_LOCK` itself: process-owned pthread workers also call `run`
+/// and are intentionally concurrent within the already-active session.
 pub(crate) fn call_lock() -> std::sync::MutexGuard<'static, ()> {
     CALL_LOCK
         .lock()
@@ -373,21 +371,22 @@ impl CallTrace {
 /// The context [`veh_callback`] consults while a guest call is in flight.
 /// Written by [`run`] before calling the guest, read (and, on an unresolved
 /// trampoline, written back to) by the VEH, cleared by [`run`] after the
-/// call returns. See `CALL_LOCK`'s doc comment for why this never needs its
-/// own synchronization.
+/// call returns. The slot containing this value is thread-local, and the VEH
+/// consults it synchronously on that same OS thread, so the fields need no
+/// cross-thread synchronization.
 struct ActiveContext {
     trampolines: *const [HleTrampoline],
     /// The per-NID unresolved-stub table, so a fault inside
     /// `[UNRESOLVED_STUB_BASE, +len*8)` can name the import the guest wanted
-    /// instead of reporting a bare address. Raw pointer for the same reason as
-    /// `trampolines` (see `CALL_LOCK`).
+    /// instead of reporting a bare address. The process-owned backing data
+    /// outlives every worker `run` call and this thread-local context is cleared
+    /// before that call returns.
     unresolved_stubs: *const [UnresolvedStub],
     hle: *const HleRegistry,
     /// The live kernel an HLE call's [`HleContext::kernel`] borrows from.
-    /// Stored as a raw pointer for the same reason `trampolines`/`hle` are
-    /// (see `CALL_LOCK`'s doc comment): only one OS thread is ever "inside"
-    /// a guarded call at a time, and the VEH only ever runs synchronously
-    /// on that same thread, so a non-atomic raw pointer read here is sound.
+    /// Stored as a raw pointer because the process-owned kernel outlives each
+    /// worker `run` call, and the VEH only accesses it synchronously on the
+    /// same OS thread before that thread's context slot is cleared.
     kernel: *const OrbisKernel,
     /// The guest memory view an HLE call's [`HleContext::mem`] borrows
     /// from — a trait object pointer (fat pointer) for the same reason.
@@ -706,11 +705,11 @@ thread_local! {
     /// `const`-initialized to a null `Cell` (spec §6 I4): no lazy `Once`, no
     /// `Drop`, so even a first touch inside the VEH (an unrelated access
     /// violation on a thread that never ran guest code, hitting the
-    /// process-wide handler) is a cheap, non-allocating pointer read. Today
-    /// exactly one guest call is ever in flight (`CALL_LOCK` still serializes
-    /// all execution); this per-thread form is the substrate a real second
-    /// guest thread will use — the pointee is only ever touched synchronously
-    /// on the owning thread, so a plain `Cell` (not an atomic) is correct.
+    /// process-wide handler) is a cheap, non-allocating pointer read. At most
+    /// one `run` call is active on a given OS thread, while multiple process
+    /// workers may run concurrently on different threads. The pointee is only
+    /// touched synchronously on its owning thread, so a plain `Cell` (not an
+    /// atomic) is correct.
     static ACTIVE_CONTEXT: Cell<*mut ActiveContext> = const { Cell::new(ptr::null_mut()) };
 }
 
@@ -763,9 +762,9 @@ pub(crate) unsafe fn run(
     call_guest: impl FnOnce() -> core::convert::Infallible,
 ) -> Result<RunOutcome, RuntimeError> {
     let _watchdog = arm_run_watchdog();
-    // Serialization (only one native guest execution at a time, RT0) is
-    // provided by the caller: `execute_linked` holds `call_lock()` for its
-    // entire pipeline, not just this call — see `CALL_LOCK`'s doc comment.
+    // The top-level caller holds `call_lock()` to protect the process-wide
+    // fixed mappings. Process-owned pthread workers may call `run` concurrently;
+    // their dispatch state is isolated by thread-local `ACTIVE_CONTEXT` slots.
 
     // The RT1a recovery point's storage. A stack local here (not inside
     // `ctx`) so its address is stable for exactly this call's duration,
@@ -792,9 +791,8 @@ pub(crate) unsafe fn run(
     // for `trampolines`/`hle`/`kernel` (those aren't trait objects, so they
     // don't hit this). Sound for the same reason those are: `run`'s safety
     // contract requires `mem` to outlive this call, it is only ever
-    // dereferenced synchronously on this thread while `ctx` is alive (see
-    // `CALL_LOCK`'s doc comment), and `ACTIVE_CONTEXT` is cleared before
-    // `run` returns.
+    // dereferenced synchronously on this thread while `ctx` is alive, and
+    // this thread's `ACTIVE_CONTEXT` slot is cleared before `run` returns.
     //
     // SAFETY: `&dyn GuestMemory` and `&'static dyn GuestMemory` have
     // identical layout (data pointer + vtable pointer); this only widens the
@@ -1168,8 +1166,7 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
                 let mut chain = Vec::new();
                 for qw in stack.chunks_exact(8) {
                     let v = u64::from_le_bytes(qw.try_into().unwrap_or([0; 8]));
-                    if (crate::GUEST_ARENA_BASE..crate::GUEST_ARENA_BASE + 0x2000_0000)
-                        .contains(&v)
+                    if (crate::GUEST_ARENA_BASE..crate::GUEST_ARENA_BASE + 0x2000_0000).contains(&v)
                     {
                         chain.push(format!("+{:#x}", v - crate::GUEST_ARENA_BASE));
                         if chain.len() >= 12 {
@@ -1178,7 +1175,10 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
                     }
                 }
                 if !chain.is_empty() {
-                    tracing::warn!("guest stack return-addr chain (module-relative): {}", chain.join(" <- "));
+                    tracing::warn!(
+                        "guest stack return-addr chain (module-relative): {}",
+                        chain.join(" <- ")
+                    );
                 }
             }
         }
@@ -1731,9 +1731,10 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             record.ExceptionInformation.first().copied().unwrap_or(0) as u64,
         );
 
-        // SAFETY: `ctx.unresolved_stubs` was set by `run` from a live borrow
-        // that outlives the guarded call, and only one thread is inside a
-        // guarded call at a time (see `CALL_LOCK`), so this read is sound.
+        // SAFETY: `ctx.unresolved_stubs` was set by `run` from process-owned
+        // storage that outlives this worker call. The VEH runs synchronously on
+        // the same OS thread, and that thread's context slot is cleared before
+        // `run` returns, so this read is sound.
         let stubs = unsafe { &*ctx.unresolved_stubs };
 
         // An unresolved import can be reached two ways, and both must name it:
@@ -1754,8 +1755,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         // (no valid value to hand back), so it still faults below.
         static RESUME_ON_MISSING: OnceLock<bool> = OnceLock::new();
         static MISSING_IMPORT_CALLS: AtomicU64 = AtomicU64::new(0);
-        if *RESUME_ON_MISSING
-            .get_or_init(|| std::env::var_os("XPS5X_RESUME_ON_MISSING").is_some())
+        if *RESUME_ON_MISSING.get_or_init(|| std::env::var_os("XPS5X_RESUME_ON_MISSING").is_some())
         {
             if let Some(s) = stub::resolve(fault_addr, stubs) {
                 // SAFETY: `ctx.mem` is the live guest memory view for this
@@ -1767,6 +1767,8 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                     if n <= 8 || n.is_power_of_two() {
                         tracing::warn!(
                             nid = format_args!("{:#018x}", s.nid),
+                            library = s.library.as_deref().unwrap_or("<unknown>"),
+                            function = xps5x_firmware::dynlib::nid_names::describe(s.nid),
                             count = n,
                             "unresolved import CALLED — returning SCE error and resuming \
                              (XPS5X_RESUME_ON_MISSING)"
@@ -1785,7 +1787,9 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         let err = match stub::resolve(fault_addr, stubs).or_else(|| stub::resolve(access, stubs)) {
             Some(s) => RuntimeError::UnimplementedImport {
                 nid: s.nid,
-                addr: fault_addr,
+                library: s.library.clone(),
+                stub_addr: s.addr,
+                rip: fault_addr,
             },
             None => RuntimeError::Faulted {
                 addr: fault_addr,
@@ -2072,16 +2076,16 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             // so a thread parked for minutes inside one wait looks identical to
             // one cycling through thousands of fast calls. Timing each call and
             // accumulating per (thread, function) separates those two.
-            let timed =
-                *TIME_HLE.get_or_init(|| std::env::var_os("XPS5X_TIME_HLE").is_some());
+            let timed = *TIME_HLE.get_or_init(|| std::env::var_os("XPS5X_TIME_HLE").is_some());
             let started = timed.then(std::time::Instant::now);
             // Name the in-flight call BEFORE dispatching it, so a thread that
             // blocks in a host wait deep inside the call (and never returns) can
             // be pinned to the exact function it is parked in.
             if timed {
-                kernel
-                    .in_flight_hle
-                    .insert(ctx.current_thread(), format!("{}::{}", t.library, t.function));
+                kernel.in_flight_hle.insert(
+                    ctx.current_thread(),
+                    format!("{}::{}", t.library, t.function),
+                );
             }
             let ret = hle
                 .call(&hle_ctx, &t.library, &t.function, &args)
@@ -2091,7 +2095,10 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 let micros = started.map_or(0, |s| s.elapsed().as_micros());
                 let mut entry = kernel
                     .hle_call_time
-                    .entry((ctx.current_thread(), format!("{}::{}", t.library, t.function)))
+                    .entry((
+                        ctx.current_thread(),
+                        format!("{}::{}", t.library, t.function),
+                    ))
                     .or_default();
                 entry.0 += 1;
                 entry.1 += micros;
@@ -2104,8 +2111,8 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             // title's own libc wrappers can map an unexpected one to EINVAL and
             // throw. `scePthreadGetthreadid`/`scePthreadSelf` legitimately
             // return small thread ids, so exclude them.
-            let is_error_return = (ret != 0 && ret < 0x100)
-                || (0x8002_0000..0x8003_0000).contains(&ret);
+            let is_error_return =
+                (ret != 0 && ret < 0x100) || (0x8002_0000..0x8003_0000).contains(&ret);
             let is_thread_id_fn =
                 t.function.contains("Getthreadid") || t.function.contains("PthreadSelf");
             if is_error_return

@@ -214,7 +214,8 @@ fn hle_get_current_offset(ctx: &HleContext, args: &[u64]) -> u64 {
 fn append_record(ctx: &HleContext, cb: u64, record: &[u8]) -> bool {
     let mut data = [0u8; 8];
     let mut size = [0u8; 8];
-    if !ctx.mem.read(cb + CB_DATA_OFFSET, &mut data) || !ctx.mem.read(cb + CB_SIZE_OFFSET, &mut size)
+    if !ctx.mem.read(cb + CB_DATA_OFFSET, &mut data)
+        || !ctx.mem.read(cb + CB_SIZE_OFFSET, &mut size)
     {
         return false;
     }
@@ -232,7 +233,9 @@ fn append_record(ctx: &HleContext, cb: u64, record: &[u8]) -> bool {
     if !ctx.mem.write(buffer + offset, record) {
         return false;
     }
-    ctx.kernel.ampr_write_offsets.insert(cb, offset + record_len);
+    ctx.kernel
+        .ampr_write_offsets
+        .insert(cb, offset + record_len);
     true
 }
 

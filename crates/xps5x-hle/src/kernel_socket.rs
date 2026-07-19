@@ -57,6 +57,8 @@ pub fn register(registry: &HleRegistry) {
 
 /// `EWOULDBLOCK` on FreeBSD/Orbis (35).
 const EWOULDBLOCK: i32 = 35;
+/// Process descriptor table full.
+const EMFILE: i32 = 24;
 
 /// `listen(fd, backlog)`: accept the request for an offline socket. Nothing
 /// can ever connect, so a listening socket simply never becomes ready.
@@ -231,7 +233,10 @@ fn hle_select(ctx: &HleContext, args: &[u64]) -> u64 {
 
 /// `socket(domain, type, protocol)`: hand back a fresh offline socket fd.
 fn hle_socket(ctx: &HleContext, _args: &[u64]) -> u64 {
-    let fd = ctx.services.create_socket();
+    let Some(fd) = ctx.services.create_socket() else {
+        crate::libkernel::set_guest_errno(ctx, EMFILE);
+        return MINUS_ONE;
+    };
     debug!("socket() -> offline fd {fd:#x}");
     fd as u32 as u64
 }
@@ -347,10 +352,9 @@ fn hle_getsockname(ctx: &HleContext, args: &[u64]) -> u64 {
 /// `bzero(dst, len)`: zero `len` bytes of guest memory.
 fn hle_bzero(ctx: &HleContext, args: &[u64]) -> u64 {
     let dst = args.first().copied().unwrap_or(0);
-    let len = args.get(1).copied().unwrap_or(0) as usize;
+    let len = args.get(1).copied().unwrap_or(0);
     if len > 0 && dst != 0 {
-        let zeros = vec![0u8; len];
-        if !ctx.mem.write(dst, &zeros) {
+        if !crate::zero_guest_range(ctx.mem, dst, len) {
             return MINUS_ONE;
         }
     }
@@ -490,6 +494,7 @@ mod tests {
         let mut b = [0xAAu8; 8];
         assert!(ctx.mem.read(0x40, &mut b));
         assert_eq!(b, [0u8; 8]);
+        assert_eq!(hle_bzero(&ctx, &[0x40, u64::MAX]), MINUS_ONE);
     }
 
     #[test]

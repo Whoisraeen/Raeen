@@ -22,7 +22,7 @@
 //! lazily carved from the guest arena on first request.
 
 use crate::{HleContext, HleRegistry};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use tracing::{debug, warn};
 
 const SCE_OK: u64 = 0;
@@ -34,9 +34,6 @@ const TRACE_INFO_SIZE: u64 = 32;
 /// 8-byte mspace atomic-id mask, then a 64-entry (`u64`) mstate table.
 const TRACE_TABLE_ENTRIES: u64 = 64;
 const TRACE_STORAGE_BYTES: u64 = 8 + TRACE_TABLE_ENTRIES * 8;
-
-/// Guest address of the persistent trace storage (0 = not yet allocated).
-static TRACE_STORAGE: AtomicU64 = AtomicU64::new(0);
 
 /// Register the libSceLibcInternal(-Ext) functions.
 pub fn register(registry: &HleRegistry) {
@@ -351,10 +348,10 @@ fn hle_mspace_malloc_stats(ctx: &HleContext, args: &[u64]) -> u64 {
         );
     }
     let fields = [
-        (0x08u64, state.capacity),     // maxSystemSize: whole fixed region
-        (0x10, state.capacity),        // currentSystemSize: fully committed
-        (0x18, state.peak_offset),     // maxInuseSize: high-water mark
-        (0x20, state.active_bytes),    // currentInuseSize: live bytes now
+        (0x08u64, state.capacity),  // maxSystemSize: whole fixed region
+        (0x10, state.capacity),     // currentSystemSize: fully committed
+        (0x18, state.peak_offset),  // maxInuseSize: high-water mark
+        (0x20, state.active_bytes), // currentInuseSize: live bytes now
     ];
     for (offset, value) in fields {
         if !ctx.mem.write(output + offset, &value.to_le_bytes()) {
@@ -367,15 +364,23 @@ fn hle_mspace_malloc_stats(ctx: &HleContext, args: &[u64]) -> u64 {
 /// Lazily allocate the persistent zeroed trace storage, returning its guest
 /// address (0 if the arena is exhausted).
 fn trace_storage(ctx: &HleContext) -> u64 {
-    let existing = TRACE_STORAGE.load(Ordering::Acquire);
+    let existing = ctx.kernel.libc_trace_storage.load(Ordering::Acquire);
     if existing != 0 {
         return existing;
     }
     let Some(storage) = ctx.alloc.alloc(TRACE_STORAGE_BYTES, 8) else {
         return 0;
     };
-    let _ = ctx.mem.write(storage, &[0u8; TRACE_STORAGE_BYTES as usize]);
-    match TRACE_STORAGE.compare_exchange(0, storage, Ordering::AcqRel, Ordering::Acquire) {
+    if !crate::zero_guest_range(ctx.mem, storage, TRACE_STORAGE_BYTES) {
+        ctx.alloc.free(storage);
+        return 0;
+    }
+    match ctx.kernel.libc_trace_storage.compare_exchange(
+        0,
+        storage,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
         Ok(_) => storage,
         Err(winner) => {
             ctx.alloc.free(storage);

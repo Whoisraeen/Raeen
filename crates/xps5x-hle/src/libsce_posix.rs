@@ -185,7 +185,7 @@ mod tests {
         assert_eq!(posix_fcntl(&ctx, &[fd as u64, 3]), O_APPEND as u64);
         assert_eq!(posix_fcntl(&ctx, &[0x7fff, 3]), (-1i64) as u64);
 
-        let socket = kernel.create_socket();
+        let socket = kernel.create_socket().expect("socket quota available");
         assert_eq!(posix_fcntl(&ctx, &[socket as u32 as u64, 3]), 0);
         assert_eq!(posix_fcntl(&ctx, &[socket as u32 as u64, 4, 0x800]), 0);
         assert_eq!(posix_fcntl(&ctx, &[socket as u32 as u64, 3]), 0x800);

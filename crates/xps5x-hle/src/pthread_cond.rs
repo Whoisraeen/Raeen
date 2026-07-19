@@ -24,17 +24,37 @@ pub fn register(registry: &HleRegistry) {
     }
     registry.register("libkernel", "scePthreadCondInit", hle_cond_init);
     registry.register("libkernel", "scePthreadCondWait", hle_cond_wait);
-    registry.register("libkernel", "scePthreadCondTimedwait", hle_sce_cond_timedwait);
+    registry.register(
+        "libkernel",
+        "scePthreadCondTimedwait",
+        hle_sce_cond_timedwait,
+    );
     registry.register("libkernel", "scePthreadCondSignal", hle_cond_signal);
     registry.register("libkernel", "scePthreadCondBroadcast", hle_cond_broadcast);
     registry.register("libScePosix", "pthread_condattr_init", hle_condattr_init);
-    registry.register("libScePosix", "pthread_condattr_destroy", hle_condattr_destroy);
-    registry.register("libScePosix", "pthread_condattr_setclock", hle_condattr_setclock);
+    registry.register(
+        "libScePosix",
+        "pthread_condattr_destroy",
+        hle_condattr_destroy,
+    );
+    registry.register(
+        "libScePosix",
+        "pthread_condattr_setclock",
+        hle_condattr_setclock,
+    );
     // The SCE-namespaced twins (measured: ASTRO.BOT calls scePthreadCondattrInit
     // from libkernel, nid 0x9b9ff66ec35fbfbb).
     registry.register("libkernel", "scePthreadCondattrInit", hle_condattr_init);
-    registry.register("libkernel", "scePthreadCondattrDestroy", hle_condattr_destroy);
-    registry.register("libkernel", "scePthreadCondattrSetclock", hle_condattr_setclock);
+    registry.register(
+        "libkernel",
+        "scePthreadCondattrDestroy",
+        hle_condattr_destroy,
+    );
+    registry.register(
+        "libkernel",
+        "scePthreadCondattrSetclock",
+        hle_condattr_setclock,
+    );
 }
 
 /// `pthread_cond_init(cond, attr)`. Orbis condition variables are opaque
@@ -218,7 +238,10 @@ fn abstime_to_relative(
     }
     let mut buf = [0u8; 16];
     if !ctx.mem.read(abstime, &mut buf) {
-        tracing::warn!(abstime = format_args!("{abstime:#x}"), "pthread_cond_timedwait: abstime unreadable — treating as expired");
+        tracing::warn!(
+            abstime = format_args!("{abstime:#x}"),
+            "pthread_cond_timedwait: abstime unreadable — treating as expired"
+        );
         return Some(std::time::Duration::ZERO);
     }
     let tv_sec = i64::from_le_bytes(buf[0..8].try_into().unwrap_or_default());

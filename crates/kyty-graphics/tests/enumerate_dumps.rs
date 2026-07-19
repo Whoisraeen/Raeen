@@ -13,7 +13,9 @@
 //! ```
 //! Without the env var the test is a no-op (CI has no dumps).
 
-use kyty_graphics::hw_regs::{ComputeShaderInfo, PixelShaderInfo, ShaderRegisters, VertexShaderInfo};
+use kyty_graphics::hw_regs::{
+    ComputeShaderInfo, PixelShaderInfo, ShaderRegisters, VertexShaderInfo,
+};
 use kyty_graphics::shader::analysis::{
     ShaderMemory, shader_parse_cs, shader_parse_ps, shader_parse_vs,
 };

@@ -344,6 +344,13 @@ fn hle_read(ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_close(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
     debug!("close(fd={fd})");
+    if ctx.services.socket_exists(fd) {
+        return if ctx.services.close_socket(fd) {
+            SCE_OK
+        } else {
+            FILE_EBADF
+        };
+    }
     match ctx.services.close(fd) {
         Ok(()) => SCE_OK,
         Err(_) => FILE_EBADF,
@@ -438,9 +445,11 @@ fn apr_complete_command_buffer(ctx: &HleContext, cb: u64) -> u64 {
                     return SCE_KERNEL_ERROR_EFAULT;
                 }
                 let file_id = u32::from_le_bytes(f[0..4].try_into().expect("fixed slice"));
-                let destination = u64::from_le_bytes(f[0x04..0x0c].try_into().expect("fixed slice"));
+                let destination =
+                    u64::from_le_bytes(f[0x04..0x0c].try_into().expect("fixed slice"));
                 let size = u64::from_le_bytes(f[0x0c..0x14].try_into().expect("fixed slice"));
-                let file_offset = u64::from_le_bytes(f[0x14..0x1c].try_into().expect("fixed slice"));
+                let file_offset =
+                    u64::from_le_bytes(f[0x14..0x1c].try_into().expect("fixed slice"));
                 let read = match ctx.kernel.appr_host_path(file_id).and_then(|host| {
                     let file = std::fs::File::open(&host).ok()?;
                     use std::io::{Read, Seek, SeekFrom};
@@ -489,8 +498,7 @@ fn apr_complete_command_buffer(ctx: &HleContext, cb: u64) -> u64 {
                 let user_data = u64::from_le_bytes(f[16..24].try_into().expect("fixed slice"));
                 let data = u64::from_le_bytes(f[24..32].try_into().expect("fixed slice"));
                 let _ = data;
-                if let Some(mut ev) = ctx.kernel.kernel_equeue_events.get_mut(&(equeue, ident))
-                {
+                if let Some(mut ev) = ctx.kernel.kernel_equeue_events.get_mut(&(equeue, ident)) {
                     ev.triggered = true;
                     ev.udata = user_data;
                     ev.fflags += 1;
@@ -545,13 +553,19 @@ fn hle_apr_submit_and_get_result(ctx: &HleContext, args: &[u64]) -> u64 {
     if result != SCE_OK {
         return result;
     }
-    if out_submission_id != 0 && !ctx.mem.write(out_submission_id, &submission_id.to_le_bytes()) {
+    if out_submission_id != 0
+        && !ctx
+            .mem
+            .write(out_submission_id, &submission_id.to_le_bytes())
+    {
         return SCE_KERNEL_ERROR_EFAULT;
     }
     if result_address != 0 && !ctx.mem.write(result_address, &0u64.to_le_bytes()) {
         return SCE_KERNEL_ERROR_EFAULT;
     }
-    debug!("sceKernelAprSubmitCommandBufferAndGetResult(cb={cb:#x}, priority={priority}) -> submission {submission_id}");
+    debug!(
+        "sceKernelAprSubmitCommandBufferAndGetResult(cb={cb:#x}, priority={priority}) -> submission {submission_id}"
+    );
     SCE_OK
 }
 
@@ -643,8 +657,6 @@ fn hle_apr_resolve_filepaths_to_ids_and_file_sizes(ctx: &HleContext, args: &[u64
     }
     SCE_OK
 }
-
-
 
 /// Common Gen5 directory enumeration path. `sceKernelGetdirentries` supplies
 /// an optional fourth `basep` argument; `sceKernelGetdents` does not.
@@ -975,11 +987,7 @@ pub fn register(registry: &HleRegistry) {
         "sceKernelAprSubmitCommandBuffer",
         hle_apr_submit,
     );
-    registry.register(
-        "libkernel",
-        "sceKernelAprWaitCommandBuffer",
-        hle_apr_wait,
-    );
+    registry.register("libkernel", "sceKernelAprWaitCommandBuffer", hle_apr_wait);
 
     // -- Module loading (M1-D) --
     registry.register(
@@ -1011,7 +1019,11 @@ pub fn register(registry: &HleRegistry) {
 
     // -- Thread / sync --
     registry.register("libkernel", "scePthreadCreate", hle_pthread_create);
-    registry.register("libScePosix", "pthread_create_name_np", hle_pthread_create_name_np);
+    registry.register(
+        "libScePosix",
+        "pthread_create_name_np",
+        hle_pthread_create_name_np,
+    );
     registry.register("libkernel", "scePthreadJoin", hle_pthread_join);
     registry.register("libkernel", "scePthreadExit", hle_pthread_exit);
     // POSIX spellings have distinct NIDs but the same ABI and scheduler path.
@@ -1370,7 +1382,9 @@ fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
         use std::sync::atomic::Ordering;
         let mut current = ctx.kernel.direct_memory_allocated.load(Ordering::Relaxed);
         loop {
-            let Some(next) = current.checked_add(len).filter(|n| *n <= PS5_DIRECT_MEMORY_SIZE)
+            let Some(next) = current
+                .checked_add(len)
+                .filter(|n| *n <= PS5_DIRECT_MEMORY_SIZE)
             else {
                 debug!(
                     "sceKernelAllocateDirectMemory: budget exhausted \
@@ -1832,7 +1846,6 @@ fn hle_pthread_create_name_np(ctx: &HleContext, args: &[u64]) -> u64 {
     rc
 }
 
-
 fn hle_pthread_join(ctx: &HleContext, args: &[u64]) -> u64 {
     let thread = args.first().copied().unwrap_or(0);
     let retval_out = args.get(1).copied().unwrap_or(0);
@@ -2147,8 +2160,7 @@ fn hle_nanosleep(ctx: &HleContext, args: &[u64]) -> u64 {
         .saturating_add(nanos / 1_000_000)
         .min(MAX_SLEEP_MS);
     debug!("nanosleep({secs}s + {nanos}ns) -> sleeping {ms}ms");
-    ctx.services
-        .sleep(std::time::Duration::from_millis(ms));
+    ctx.services.sleep(std::time::Duration::from_millis(ms));
     if rem != 0 {
         let _ = ctx.mem.write(rem, &[0u8; 16]);
     }
