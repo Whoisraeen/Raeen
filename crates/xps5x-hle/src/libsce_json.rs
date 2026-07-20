@@ -247,7 +247,10 @@ const VALUE_METHODS: &[(&str, crate::HleFunction)] = &[
     // Value <- String bridge.
     ("_ZN3sce4Json5ValueC1ERKNS0_6StringE", hle_value_from_string), // Value(const String&)
     ("_ZN3sce4Json5ValueC2ERKNS0_6StringE", hle_value_from_string),
-    ("_ZN3sce4Json5Value3setERKNS0_6StringE", hle_value_from_string), // set(const String&)
+    (
+        "_ZN3sce4Json5Value3setERKNS0_6StringE",
+        hle_value_from_string,
+    ), // set(const String&)
     // Value(ValueType) / set(ValueType).
     ("_ZN3sce4Json5ValueC1ENS0_9ValueTypeE", hle_value_set_type),
     ("_ZN3sce4Json5ValueC2ENS0_9ValueTypeE", hle_value_set_type),

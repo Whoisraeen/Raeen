@@ -31,6 +31,11 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register("libkernel", "scePthreadCondSignal", hle_cond_signal);
     registry.register("libkernel", "scePthreadCondBroadcast", hle_cond_broadcast);
+    // The SCE spelling of destroy belongs with the rest of the real state
+    // machine. `libkernel` previously bound it to a no-op that shared its
+    // handler with `CondInit`, so destroying a condition left its state (and any
+    // waiters' generation) behind.
+    registry.register("libkernel", "scePthreadCondDestroy", hle_cond_destroy);
     registry.register("libScePosix", "pthread_condattr_init", hle_condattr_init);
     registry.register(
         "libScePosix",
@@ -321,12 +326,69 @@ fn wait_core(ctx: &HleContext, args: &[u64], timeout: Option<std::time::Duration
             break;
         }
     }
+    let woken = *generation != observed;
     drop(generation);
+    note_wait_outcome(ctx, cond, woken);
     let relock = crate::pthread_sync::mutex_lock_for_cond(ctx, mutex);
     if relock != OK {
         return relock;
     }
     if timed_out { ETIMEDOUT } else { OK }
+}
+
+/// How long a waiter must go without its generation ever moving before it is
+/// reported as starved.
+const COND_STARVED_AFTER: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Per-`(cond, thread)` start of the current starvation streak: when this waiter
+/// last began waiting *without* having been genuinely woken since.
+type CondStreaks = std::collections::HashMap<(u64, u64), (std::time::Instant, u64, bool)>;
+static COND_STREAKS: std::sync::LazyLock<std::sync::Mutex<CondStreaks>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Forensic: report a condition variable a thread keeps re-waiting on but is
+/// **never genuinely woken from**.
+///
+/// The single-call check in [`wait_core`] cannot see this: an infinite wait
+/// deliberately returns after a 10 ms slice as a permitted spurious wakeup, so
+/// no individual call ever looks long. A starved waiter is therefore a *streak*
+/// of calls that never observe a generation change — which is exactly the shape
+/// of a stalled engine task graph (every worker parked, producer waiting on a
+/// completion nobody posts). Reported once per (cond, thread).
+fn note_wait_outcome(ctx: &HleContext, cond: u64, woken: bool) {
+    if std::env::var_os("XPS5X_TRACE_COND").is_none() {
+        return;
+    }
+    let thread = ctx.guest_threads.current_thread();
+    let mut streaks = COND_STREAKS.lock().unwrap_or_else(|p| p.into_inner());
+    if woken {
+        // A real wake ends the streak.
+        streaks.remove(&(cond, thread));
+        return;
+    }
+    let now = std::time::Instant::now();
+    let entry = streaks.entry((cond, thread)).or_insert((now, 0, false));
+    entry.1 += 1;
+    if !entry.2 && now.duration_since(entry.0) >= COND_STARVED_AFTER {
+        entry.2 = true;
+        let name = ctx
+            .kernel
+            .thread_names
+            .get(&thread)
+            .map_or_else(|| "<unnamed>".to_owned(), |n| n.clone());
+        tracing::warn!(
+            cond = format_args!("{cond:#x}"),
+            waiter = thread,
+            waiter_name = %name,
+            waits = entry.1,
+            secs = now.duration_since(entry.0).as_secs(),
+            // The guest instruction that called wait: `--dump-vaddr` turns this
+            // into the code around the handshake, which is what identifies
+            // *what* the thread is waiting to be told.
+            caller = format_args!("{:#x}", ctx.caller_return_addr),
+            "TRACE_COND: STARVED — re-waited this cond with no genuine wake"
+        );
+    }
 }
 
 /// `pthread_cond_signal(cond)` — wake one waiter.

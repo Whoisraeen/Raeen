@@ -1067,15 +1067,17 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "__tls_get_addr", hle_tls_get_addr);
     // scePthreadMutex* are registered by the `pthread_sync` module (real state
     // machine) — see xps5x_hle::pthread_sync.
-    registry.register("libkernel", "scePthreadCondInit", hle_pthread_cond_init);
-    registry.register("libkernel", "scePthreadCondWait", hle_pthread_cond_wait);
-    registry.register("libkernel", "scePthreadCondSignal", hle_pthread_cond_signal);
-    registry.register(
-        "libkernel",
-        "scePthreadCondBroadcast",
-        hle_pthread_cond_signal,
-    );
-    registry.register("libkernel", "scePthreadCondDestroy", hle_pthread_cond_init);
+    // scePthreadCond* are registered by the `pthread_cond` module (real state
+    // machine: the wait releases and reacquires the guest mutex around a
+    // generation-counted sleep) — see xps5x_hle::pthread_cond.
+    //
+    // They used to ALSO be registered here as no-op stubs that returned success
+    // without waiting or releasing the mutex. Those only ever lost the race
+    // because `pthread_cond::register` runs after this function and
+    // `HleRegistry::register` is last-write-wins — reordering the two calls
+    // would have silently given every title a `cond_wait` that never releases
+    // its mutex, deadlocking any guest thread pool. Removed rather than left as
+    // shadowed dead code.
     // pthread_cond_wait/timedwait and pthread_create/join are deliberately
     // NOT aliased under libScePosix, and scePthreadCondTimedwait is not
     // registered: with one guest thread every possible return value lies,
@@ -1833,7 +1835,21 @@ fn hle_available_direct_memory_size(ctx: &HleContext, args: &[u64]) -> u64 {
     let end = search_end.min(PS5_DIRECT_MEMORY_SIZE);
     // Align the base up, then floor the length to the same granularity.
     let start = search_start.div_ceil(align).saturating_mul(align);
-    let size = (end.saturating_sub(start) / align).saturating_mul(align);
+    let window = end.saturating_sub(start);
+
+    // Report what is actually still FREE, not the size of the window. A title
+    // uses this to size its pools, so over-reporting makes it commit to an
+    // allocation it can never get: the measured UE titles probe with
+    // `sceKernelAllocateDirectMemory` until ENOMEM (which is the deliberate
+    // discovery mechanism — see `hle_allocate_direct_memory`), and answering
+    // "the whole pool is free" after 13.8 GiB is already handed out contradicts
+    // that probe.
+    let used = ctx
+        .kernel
+        .direct_memory_allocated
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let free = PS5_DIRECT_MEMORY_SIZE.saturating_sub(used);
+    let size = (window.min(free) / align).saturating_mul(align);
     if size == 0 {
         return SCE_KERNEL_ERROR_ENOMEM;
     }
@@ -1944,30 +1960,6 @@ fn hle_pthread_detach(ctx: &HleContext, args: &[u64]) -> u64 {
     let thread = args.first().copied().unwrap_or(0);
     debug!("scePthreadDetach(thread={thread:#x})");
     ctx.guest_threads.detach(thread)
-}
-
-fn hle_pthread_cond_init(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!(
-        "scePthreadCondInit(cond={:#x})",
-        args.first().copied().unwrap_or(0)
-    );
-    0
-}
-
-fn hle_pthread_cond_wait(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!(
-        "scePthreadCondWait(cond={:#x})",
-        args.first().copied().unwrap_or(0)
-    );
-    0
-}
-
-fn hle_pthread_cond_signal(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!(
-        "scePthreadCondSignal(cond={:#x})",
-        args.first().copied().unwrap_or(0)
-    );
-    0
 }
 
 // ---------------------------------------------------------------------
@@ -3234,9 +3226,8 @@ pub(crate) fn hle_usleep(ctx: &HleContext, args: &[u64]) -> u64 {
     // the loop's condition. Report each distinct caller once so a stalled title
     // names its own spin site without flooding the log.
     if std::env::var_os("XPS5X_TRACE_SPIN").is_some() && ctx.caller_return_addr != 0 {
-        static SEEN: std::sync::LazyLock<
-            std::sync::Mutex<std::collections::HashSet<u64>>,
-        > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+            std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
         let first = SEEN
             .lock()
             .unwrap_or_else(|p| p.into_inner())

@@ -28,6 +28,41 @@
     trace the guest job-post path from `module+0xdefa40`, and check whether a
     worker is blocked in a wait we satisfy incorrectly rather than never.
 
+- STALL CLASS NARROWED — new cross-call condvar-starvation diagnostic names the
+  blocked threads for the first time (2026-07-19; hle 280 green, clippy+fmt clean).
+  * NEW DIAGNOSTIC (`pthread_cond::note_wait_outcome`, `XPS5X_TRACE_COND`): the
+    pre-existing >3s check could never fire, because an infinite `cond_wait`
+    deliberately returns after a 10 ms slice as a permitted spurious wakeup — so
+    no single call is ever long. Starvation is a *streak* of calls that never
+    observe a generation change. Now tracked per `(cond, thread)` and reported
+    once, with the guest thread's NAME.
+  * UNTIL DAWN (UE5) — the sharpest picture yet. 31 named guest threads incl. the
+    full RHI set (`AgcSubmissionThread`, `AgcCleanupThread`, `AgcInterruptThread`),
+    `IoDispatcher`, `IoService`, IOThreadPool, Foreground/Background workers.
+    STARVED (~650 re-waits each, ZERO genuine wakes): main(t1) on 0x10081375a58,
+    `AgcSubmissionThread` on 0x1008137a978, `AgcCleanupThread` on 0x1008137b488,
+    `IoDispatcher`, `SystemEventGatherThreadSony`, `OutputDeviceRedirector`.
+    Main's event is in the SAME allocation block as the two AGC events.
+    **NO `RenderThread`/`RHIThread` exists, and ZERO libSceAgc/VideoOut calls are
+    ever made** — UE5 starts the render thread during engine init, so init never
+    completes. The engine created its RHI threads and then stopped before using
+    the GPU API at all.
+  * RULED OUT this round (all verified correct, not the bug): `cond_wait` DOES
+    release the guest mutex (`mutex_unlock_for_cond`) and reacquire; `WaitEqueue`
+    caps unbounded waits and returns a timeout so the guest re-waits;
+    `sceKernelStat` ENOENTs are ~15/709 (normal UE optional-file probing); the
+    missing `.uproject` is cosmetic (cooked UE titles don't ship it).
+  * LATENT HAZARD FOUND: `libkernel.rs` still defines no-op `hle_pthread_cond_wait`
+    /`_signal` stubs that are silently shadowed only because `pthread_cond::register`
+    runs AFTER `libkernel::register` and `HleRegistry::register` is last-write-wins.
+    Reordering registration would deadlock every title. Delete the dead stubs.
+  * ASTRO.BOT equivalent: stalls in `Setup MaterialPackedShaderBinaries`, main
+    spins at module+0xdd8e40 polling internal dispatcher module+0xdefa40
+    (id space 0x1100xxxx, error 0x8a84006e — in no reference catalogue).
+  * NEXT: find what signals main's event. For Until Dawn that means tracing UE5's
+    PS5 RHI init handshake — which thread is expected to post to
+    cond 0x10081375a58 before `StartRenderingThread`.
+
 # XPS5X session progress ledger
 
 - MILESTONE: **all 5 installed titles load and execute with ZERO unresolved
