@@ -661,6 +661,28 @@ fn decode_texture(
             )));
         }
     };
+    // Content probe (XPS5X_TRACE_DRAWS): is the texture the PS samples
+    // actually EMPTY? Thousands of title draws rasterize fine in-tree, and
+    // most title draws alpha-blend (SRC_ALPHA/ONE_MINUS_SRC_ALPHA) — a PS
+    // sampling an all-zero texture emits alpha 0, which is byte-identical to
+    // "no coverage" in every frame probe. If these log all-zero, the GPU is
+    // correctly rendering an EMPTY UI and the blocker is upstream (Gameface
+    // never paints the menu), not in the GPU at all.
+    if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static TEX_SEEN: AtomicU32 = AtomicU32::new(0);
+        if TEX_SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
+            let nz = pixels.iter().filter(|&&b| b != 0).count();
+            tracing::warn!(
+                base = format_args!("{:#x}", t.base40()),
+                extent = format_args!("{width}x{height}"),
+                format = ?format,
+                bytes = pixels.len(),
+                non_zero = nz,
+                "TRACE_DRAWS: sampled texture content"
+            );
+        }
+    }
     Ok(TextureUpload {
         width,
         height,
@@ -1002,6 +1024,16 @@ pub fn draw_state_from_regs<'a>(
     if ctx.mode_control.cull_back {
         cull_mode |= vk::CullModeFlags::BACK;
     }
+    // Diagnostic (XPS5X_NO_CULL=1): disable culling entirely. Measured on
+    // Minecraft: its draws run cull=FRONT face=CLOCKWISE, and under our
+    // Y-flipped viewport the measured quad rasterizes clockwise — a FRONT
+    // face — so every primitive is culled. The full title VS+PS replayed
+    // in-tree with cull NONE covers 4096/4096 (tests/coverage_bisect.rs), so
+    // culling is the LAST field separating the in-tree render from the
+    // title's black frame. This switch is the yes/no for that mechanism.
+    if std::env::var_os("XPS5X_NO_CULL").is_some() {
+        cull_mode = vk::CullModeFlags::NONE;
+    }
     // PA_SU_SC_MODE_CNTL.FACE: 0 = counter-clockwise is the front face,
     // 1 = clockwise is. Must travel with cull_mode — culling against the wrong
     // winding removes exactly the geometry it should keep.
@@ -1034,6 +1066,14 @@ pub fn draw_state_from_regs<'a>(
                 color_write_mask = format_args!("{color_write_mask:?}"),
                 blend = format_args!("{blend:?}"),
                 topology = format_args!("{topology:?}"),
+                // Cull was NEVER logged here, and the in-tree replay (which
+                // covers 4096/4096 with the title's own VS+PS and both zero
+                // and non-zero resources) uses CullModeFlags::NONE. With the
+                // Y-flipped viewport the effective winding inverts, so a
+                // decoded cull_back + wrong FACE culls EVERY primitive —
+                // silently and validation-clean. The last unreplicated field.
+                cull = format_args!("{cull_mode:?}"),
+                face = format_args!("{front_face:?}"),
                 vertex_count,
                 "draw state (black-frame diagnostic)"
             );

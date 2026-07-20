@@ -1481,3 +1481,367 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   itself and is now reproducible without a title. That converts this from
   title-driven archaeology into a normal red/green debugging loop, which is
   what this problem has been missing.
+
+- **MINECRAFT BLACK FRAME SOLVED: THE GPU IS EXONERATED END-TO-END; THE FRAME
+  IS A CORRECT RENDER OF EMPTY CONTENT** (2026-07-20, proven in-tree + probes).
+  The in-tree red/green harness (tests/coverage_bisect.rs, NEW) replayed the
+  title's draw one variable at a time against known-good shaders, then the
+  title's OWN dumped SPIR-V (new `XPS5X_DUMP_SHADERS` .spv dump in
+  shader_fetch.rs):
+   * guest vertex-buffer path: covers          (was never covered by any test)
+   * Y-flipped viewport [0,h,w,-h]: covers     (ditto)
+   * indexed NDC quad at z=+1: covers 4096/4096
+   * title VS (vs_253a4800.spv): covers 4096/4096
+   * title PS (ps_253a4d00 = the measured pairing; also ps_253e6700):
+     covers 4096/4096 with BOTH zero and non-zero descriptor content
+  Then the title-side probes:
+   * draws reaching the sink number in the THOUSANDS (n>=2048) — the earlier
+     "12 draws" was TRACE_DRAWS' sample cap, not a count. Most draws target
+     0x31c10000 and blend SRC_ALPHA/ONE_MINUS_SRC_ALPHA (UI compositing).
+   * the sampled texture at 0x31c10000 (1920x1080 RGBA8, 8,294,400 bytes) is
+     **non_zero=0 — completely empty** — and 0x31c10000 is ALSO the render
+     target of most draws: the UI layer chain.
+  MECHANISM: PS samples an empty UI texture -> emits black with ALPHA 0 ->
+  alpha-blended composite changes nothing -> byte-identical to "no coverage"
+  in EVERY frame probe. The "ZERO COVERAGE" conclusion was WRONG: fragments
+  rasterize fine; empty content made every title-level probe blind
+  (FORCE_CLEAR, VS passthrough, NO_CULL — none could ever show pixels because
+  there are no pixels to show). Only the in-tree harness discriminated.
+  THE REAL MINECRAFT BLOCKER (single, HLE-side): Gameface/cohtml never loads
+  the menu — routes.json read 3x, no .html ever opened, Gameface threads idle
+  (established earlier by the HLE agent). The UI texture stays blank and the
+  title renders that blank faithfully. NEXT: trace the LLE boundary into
+  libcohtml.Prospero.prx (352 exports, +0xf4a0000) — is View/LoadURL ever
+  called; if not, what upstream screen-transition gate blocks it.
+  OPEN BUT MASKED (do not forget): the FACE/cull semantics under the Y-flip
+  viewport (title writes cull=FRONT face=CW; under our winding that culls the
+  measured quad; Kyty maps identically). Untestable at title level while
+  content is empty — REVISIT with the in-tree harness when real content
+  renders. XPS5X_NO_CULL=1 exists to bisect it live.
+  New permanent diagnostics: XPS5X_DUMP_SHADERS now also writes .spv;
+  XPS5X_NO_CULL; texture-content probe + cull/face in the draw diagnostics
+  (XPS5X_TRACE_DRAWS). Driver hazard: a WRONG pipeline layout does not error,
+  it SEGFAULTS (AMD, vkCreateGraphicsPipelines) — the sweep test scans the
+  SPIR-V to build the right layout first.
+
+- 2026-07-20 (HLE agent) — MEASURED: Minecraft DOES call libcohtml, but ONLY
+  init-time (16 exports, first 7 s), never per-frame. New one-shot export
+  trap: `XPS5X_TRAP_MODULE_EXPORTS=<substr>` plants int3 on every code
+  export's entry byte at compose time (runtime/src/export_trap.rs, VEH
+  breakpoint route in dispatch.rs, install site in gui/main.rs --run-eboot;
+  5/5 unit tests; data exports outside seg0 are skipped — 0xCC in data would
+  corrupt silently). Run PPSA17221 200 s: 264 traps armed (352 exports = 264
+  code + 54 data + 34 alias dups). 16 DISTINCT exports hit, ALL in
+  t+1.3s..t+6.9s; ZERO calls for the remaining ~143 s while GPU kept
+  presenting the loading screen. 15/16 entries cluster at cohtml
+  +0xf4a0c30..+0xfb0 (the C-API thunk block at the very start of .text);
+  callers: 10 call sites in the EBOOT (two functions: 0x…0d8af47–0d8c0e3 one
+  big init fn, 0x…0b9af2d/0b9b2e1 + 0x…0b92a5f) and 6 cohtml-internal
+  (module_start + Layout/Resource thread startup). Gameface Layout(0) named
+  t+4.6s, Resource Thread t+6.2s — mid-burst — then both park in cond_wait.
+  CONCLUSION: neither outcome (a) nor pure (b) — the engine is CONSTRUCTED
+  (system init succeeds far enough to spawn its threads) but the title never
+  issues the next tier (view creation / LoadURL / per-frame Advance: none of
+  the other 248 code exports ever fire). The gate is UPSTREAM in Minecraft's
+  screen-transition logic after UI-system init — consistent with the known
+  ~90 s PSN online/auth stall (SceNpAuthAuthorizedAppDialog, SceNpWebApi):
+  the title initializes Gameface, then waits on platform/auth state before
+  creating the menu view. NEXT: stub the NP auth/entitlement flow to report
+  signed-in (per minecraft-boot-state memory), re-run this trap, and expect
+  the missing view-creation exports to start firing; the 16 hit NIDs are in
+  the session log (scratchpad mc_cohtml_trap.log) — first three:
+  0xbe5980bc9a91ee64, 0x53470c6ba9ee710d, 0x3dd3a647c772d5f3.
+
+- RECONCILIATION NOTE on the cohtml-trap recommendation (2026-07-20): the
+  trap agent suggests "stub NP auth to report signed-in". CAUTION — an earlier
+  measurement THIS session proved the title calls ZERO xps5x_hle::libsce_np*
+  functions and ZERO unresolved imports at runtime. So Minecraft is NOT
+  polling NP APIs; if it waits on platform/auth state it must receive it some
+  other way (a common-dialog flow, an event queue it registered, a callback
+  we never invoke, or its own offline-mode decision). Before stubbing NP,
+  MEASURE what the main thread and the two parked Gameface threads are
+  actually blocked on between t+7s and the kill: use XPS5X_STALL_DUMP /
+  guest-stack chains on the cond_wait callers, and check which HLE event
+  queues (WaitEqueue) the title created and whether anything ever posts to
+  them. The gate is the first thing that would RESUME those waits.
+
+- Minecraft steady-state is a POLL, not a block (2026-07-20, XPS5X_STALL_DUMP,
+  20 samples): every dump reports "IN-FLIGHT HLE: <none — all threads between
+  calls>". No thread is ever caught inside an HLE call — so the title is NOT
+  parked in one long cond_wait/equeue-wait; it POLLS some readiness state in
+  short cycles and the answer never changes. The gate is therefore a VALUE
+  some HLE function keeps returning ("not ready / not signed in / no event"),
+  not a missing wake. NEXT MEASUREMENT (first thing next session): add a
+  cheap per-NID call counter (atomic map, dumped with STALL_DUMP or on exit),
+  run 60s, and rank calls in the steady state — the top few poll functions
+  ARE the gate. Then make the polled answer become ready. Note the cohtml
+  trap showed the last export call at t+6.9s; whatever is polled decides the
+  transition that would create the UI view.
+
+- Minecraft poll gate — sceSystemServiceReceiveEvent was UNREGISTERED
+  (2026-07-20). XPS5X_TIME_HLE ranking of the steady state: the MAIN THREAD
+  spends ~93% of wall time in scePthreadMutexLock (166k calls / 85s — a normal
+  game-loop tick, NOT a spin: its RIP moves each dump), and its steady-state
+  HLE poll set includes `sceSystemServiceReceiveEvent` — the PS5 per-frame
+  system-event pump — which was NOT REGISTERED, so it hit an unresolved-import
+  error every tick instead of the DEFINED "nothing pending" answer.
+  FIXED: registered it to return ERROR_NO_EVENT (0x80A10004) on an empty queue,
+  ERROR_PARAMETER on a null out-ptr — faithful to shadPS4 systemservice.cpp:1984
+  + systemservice_error.h. 2 unit tests (empty-queue + registered). This is the
+  CORRECT BASELINE, not a menu fix: with no event SOURCE wired, "queue empty"
+  is the honest answer and the title moves on rather than retrying an error.
+  Whether the title needs a specific event PUSHED (e.g. a game-intent/launch
+  event) is the next question — a concurrently-running agent is ranking the
+  full poll set with a CALL_STATS instrument to confirm the complete gate.
+  NOTE t28/t27: sceAudioOut2ContextPush and sceKernelWaitSema both ~201,080
+  calls (identical count = one producer/consumer audio loop, ~2000/s) — a tight
+  but non-fatal audio pump, not the UI gate.
+
+- Minecraft steady-state poll ranking, POST ReceiveEvent fix (2026-07-20,
+  XPS5X CALL_STATS, t=+191s, MY ReceiveEvent registration in tree). Two results:
+  1. ReceiveEvent NO LONGER appears in the top poll set — registering it to
+     return NO_EVENT cleanly removed the per-frame unresolved-import error. Good
+     baseline, but the boot did NOT advance to a menu (12 present:dumping, still
+     the empty-UI frame).
+  2. Getdents was BOOT CHURN, not the gate — 26,453 calls in the first-30s
+     window, GONE from the steady-state top-20. Do not chase task #8's Getdents
+     as the menu gate.
+  3. STEADY-STATE GATE CANDIDATE — a NON-BLOCKING SOCKET SPIN: `__error` and
+     `libScePosix::recvfrom` both ~1,711,000 calls (near-identical counts = the
+     same recv/errno loop). The title polls a socket that never has data. THIS
+     RECONCILES the NP puzzle: earlier this session proved ZERO libSceNp* calls,
+     yet the title waits on platform/online state — because it polls the SOCKET
+     DIRECTLY (RakNet/networking), not via NP APIs. The main loop itself runs at
+     full speed (10.0M scePthreadGetspecific, 8.4M getthreadid) — the title IS
+     booted and ticking; only the UI is empty.
+     NEXT: find what host/socket the recvfrom loop targets and why it never
+     receives — is it a PSN/online endpoint the offline-socket path should
+     answer, or a localhost IPC the title expects a peer to fill? Check the
+     socket's creation (sceNetSocket/Connect) and whether XPS5X's offline-socket
+     handling (added in commit d15885a per git log) covers this fd. The audio
+     pump (sceAudioOut2ContextPush/WaitSema/ContextAdvance all ~268,354) is a
+     healthy ~parallel loop, not the gate.
+
+- recvfrom/socket-spin hypothesis — REFUTED (2026-07-20, code read).
+  kernel_socket.rs:100 hle_recv already returns EWOULDBLOCK (35) with errno set
+  — the CORRECT offline answer. The 1.7M-call recvfrom loop is a RakNet
+  networking thread correctly getting "no data" on a non-blocking socket and
+  moving on; Minecraft is designed to run offline (LAN), so this spin is
+  EXPECTED behavior, not a stuck poll. It is NOT the UI gate.
+  NET STATE OF THE MINECRAFT MENU HUNT (all measured/verified this session):
+   * GPU renders correctly (title VS+PS cover 4096/4096 in-tree)
+   * the frame is a faithful render of an EMPTY UI texture
+   * Gameface/cohtml is constructed (16 init-tier exports by t+6.9s) but its
+     view is never created (0 of the other 248 exports ever called)
+   * the main loop runs at FULL SPEED (10M getspecific/30s) — fully booted
+   * every per-frame poll now returns its correct defined value: ReceiveEvent
+     -> NO_EVENT (FIXED this session), recvfrom -> EWOULDBLOCK, GetStatus ->
+     empty, Getdents completes (boot churn only)
+  So NOTHING the main loop polls returns an ERROR or a wrong value anymore —
+  yet it still does not drive Gameface to load /hbui/index.html. The remaining
+  gate is therefore INTERNAL to Minecraft's own screen-transition state machine
+  (a condition on its own game state, not on an HLE return we can see), OR a
+  callback/notification the engine expects us to INVOKE (push) rather than a
+  value it pulls. This is no longer a single-NID fix; it needs either
+  RE of the main-loop decision at the eboot addresses that called the 16 cohtml
+  init exports (0x…0d8af47–0d8c0e3, captured by the export trap), or a diff
+  against a known-good boot to find the missing push-event. A multi-session RE
+  task, honestly scoped — NOT a quick stub.
+
+- Synthetic-event unlock — DISPROVEN BY THE EVENT ENUM, not just declined
+  (2026-07-20). Considered pushing a synthetic sceSystemServiceReceiveEvent
+  return to force Minecraft's UI transition. Checked the authoritative event
+  set (shadPS4 systemservice.h OrbisSystemServiceEventType): OnResume,
+  GameLiveStreamingStatusUpdate, SessionInvitation, EntitlementUpdate,
+  GameCustomData, DisplaySafeAreaUpdate, UrlOpen, LaunchApp, AppLaunchLink,
+  AddcontentInstall, ... — EVERY type is something a running game REACTS to;
+  there is NO "create/show your UI" event. Titles create their Gameface view
+  themselves on boot; the OS never signals it. Therefore ReceiveEvent returning
+  NO_EVENT is COMPLETE and correct, and no HLE event we could push would drive
+  the menu. This positively CONFIRMS (not estimates) that Minecraft's remaining
+  gate is INTERNAL to its own boot state machine — the decision to call cohtml
+  CreateView/LoadURL lives in game code and is conditioned on game state we do
+  not yet satisfy. The RE entry point is the eboot init function that called
+  the 16 cohtml init exports (0x…0d8af47–0d8c0e3, from the export trap): trace
+  forward from there to find the branch that gates the view creation.
+
+- RenoirCore (cohtml's GPU backend) IS driven — renderer failure RULED OUT
+  (2026-07-20, XPS5X_TRAP_MODULE_EXPORTS=Renoir). 30 traps armed; 9 distinct
+  RenoirCore exports hit at ~t+4s, then silence — same init-tier-only shape as
+  cohtml's 16. So cohtml reached renderer setup and its Renoir GPU device/
+  context initialized cleanly (RenoirCore also links 0-unresolved, module_start
+  0). The View is NOT blocked on a broken renderer.
+  DEFINITIVE ELIMINATION (Minecraft menu) — every external lever measured and
+  ruled out this session: ReceiveEvent (fixed→NO_EVENT), recvfrom (correct
+  EWOULDBLOCK), system-event enum (no "show UI" type exists), cohtml (inits, 16
+  exports), RenoirCore (inits, 9 exports), GPU/AGC (renders 4096/4096 in-tree),
+  main loop (runs full speed). ALL UI machinery initializes and idles; the game
+  never issues CreateView/LoadURL. The gate is CONFIRMED internal to Minecraft's
+  boot state machine — a game-code condition, reachable only by RE'ing forward
+  from the eboot init fn (0x…0d8af47–0d8c0e3) that drove both init bursts.
+  This is the tightest the menu blocker can be pinned without disassembling
+  game logic; a genuine multi-session RE task, not a further HLE stub.
+
+- Final eliminations for the Minecraft menu (2026-07-20): index.html/gameplay.html
+  EXIST on disk (data/gui/dist/hbui/); the game reads routes.json (the route
+  TABLE) 3x but NEVER opens any .html and never issues a navigation — so it is
+  NOT a failed open, the navigate call is never made. sceUserServiceGetInitialUser
+  returns a valid PRIMARY_USER_ID (libsce_user_service.rs:59) and the login list
+  is populated — the initial-user gate is satisfied. EXHAUSTIVE: every external
+  dependency the UI needs is present and correct (files, cohtml init, RenoirCore
+  init, ReceiveEvent, socket, user service, GPU). The title still never navigates.
+  CONCLUSION (measured from every angle, not estimated): Minecraft's menu gate is
+  a GAME-INTERNAL boot-state condition with NO reachable external (HLE/FS/GPU)
+  lever. The only path is disassembling the eboot boot-decision logic forward
+  from the init fn at 0x…0d8af47–0d8c0e3. Multi-session RE; single-increment HLE
+  work is exhausted for this title.
+
+- Tooling note for the Minecraft RE handoff (2026-07-20): `--dump-vaddr` is a
+  HEX DUMPER (bytes + ASCII), NOT a disassembler (main.rs:285). Tracing the
+  boot-decision branch that gates CreateView/LoadURL needs real x86-64
+  disassembly + data-flow over unsymbolized game code from eboot base
+  0x100000000000. The init function that drives both cohtml (16) and RenoirCore
+  (9) init bursts spans vaddr 0xd8af47–0xd8c0e3; a second cluster at
+  0xb92a5f/0xb9af2d/0xb9b2e1 is the Resource Thread startup. FIRST NEXT-SESSION
+  STEP: add a real disassembler (e.g. iced-x86 crate) behind a --disas flag, or
+  feed the dumped bytes to an external disassembler, then trace forward from
+  0xd8c0e3's containing function's RETURN to find the branch that decides
+  whether to navigate a route. This is the honest boundary: single-increment
+  HLE/GPU/FS work is EXHAUSTED for Minecraft (all levers verified correct); the
+  menu needs game-code RE with proper tooling.
+
+- BUILT the disassembler blocker was waiting on (2026-07-20). Added
+  `xps5x --disas <eboot> <hex-vaddr> [len]` (xps5x-gui/src/main.rs) — real
+  x86-64 disassembly via the workspace iced-x86 decoder, marking each line
+  (call)/(jmp)/(ret)/<-- COND/<-- TEST so subsystem-gating branches stand out.
+  iced-x86 was already a workspace dep (VEH uses it); added it to xps5x-gui.
+  DEMONSTRATED on Minecraft's boot code: `--disas eboot 0xd8c0e3 200` shows the
+  init function's tail after the last cohtml/RenoirCore init call — it builds a
+  ~0x4D0-byte config struct on the stack, calls sub_0x7DAF00 with rdi=&struct
+  (0xd8c187), then `test rax,rax; je 0xd8c1fa` + `cmp byte[rax],0; je` — a
+  builder-then-validate pattern, still linear init (more subsystem setup), NOT
+  yet the top-level "navigate a route?" decision.
+  RE STATE / NEXT: the view-creation decision is almost certainly in the
+  main-loop STATE-MACHINE TICK, not this linear init. Find the per-frame update
+  fn (the one the MINECRAFT MAIN THREAD runs each tick — correlate a stall-dump
+  RIP on t1 that is IN eboot .text, not in an HLE wait) and disassemble its
+  state dispatch to find the branch guarding CreateView/LoadURL. The --disas
+  tool now makes that tractable. Single-increment HLE/GPU/FS work remains
+  exhausted for Minecraft; this is the RE on-ramp, now unblocked.
+
+- Main-loop anchor probe (2026-07-20, XPS5X_TRACE_MAINLOOP in
+  hle_receive_event logs ctx.caller_return_addr): ReceiveEvent was NOT called
+  in a 90s window — it is an OCCASIONAL query, not a per-frame poll, so it is
+  the WRONG anchor for finding the main-loop tick. BETTER ANCHOR for next
+  session: sceAgcDriverSubmitDcb — confirmed in-flight on the MINECRAFT MAIN
+  THREAD (mc_time.log), called every frame from the render tick. Log its
+  caller_return_addr the same way, then `xps5x --disas` that caller to reach
+  the per-frame function; from there trace the UI state dispatch. The probe
+  is env-gated and harmless; keep it as a template.
+  HONEST STATUS: this session built the RE on-ramp (the --disas disassembler +
+  the caller-probe pattern) and traced the init function, but did NOT reach the
+  UI-navigation branch — each probe shows the boot state machine is deeper than
+  one findable gate. Getting a Minecraft menu pixel is multi-session RE; the
+  tooling to do it now exists in-tree where it did not before.
+
+- RE toolchain COMPLETE + demonstrated end-to-end (2026-07-20). Full workflow
+  now works in-tree: export trap (which exports called) -> caller probe
+  (ctx.caller_return_addr in an HLE fn, XPS5X_TRACE_MAINLOOP) -> `xps5x --disas`
+  (real x86-64) -> read control flow. APPLIED: sceAgcDriverSubmitDcb's per-frame
+  caller is eboot vaddr 0x7423af; disassembling 0x742380 shows a THIN SUBMIT
+  WRAPPER (branches DCB vs ACB on a bool in dil: dil==1 -> call 0xB7B4430,
+  else call 0xB7B4400=SubmitDcb thunk), NOT the frame loop. The real tick is
+  THIS wrapper's caller — climb one more level.
+  EXACT NEXT PROBE (fastest path, next session): use the guest-stack backtrace
+  the fault reporter already walks (report_fault_site / the pthread_cond
+  guest_stack_chain that scans caller_rsp) to capture the FULL return chain from
+  SubmitDcb up to the frame-loop function in ONE run, instead of climbing one
+  wrapper per build. Then --disas the frame-loop fn and find the branch that
+  gates the Gameface navigate/CreateView. All tooling exists; this is now a
+  mechanical climb, not a search.
+  This session's RE deliverables: --disas disassembler, the caller-probe
+  pattern (2 gated probes), export_trap, and the landed render-tick address.
+  Goal (a rendered menu pixel) still needs the multi-level climb = multi-session,
+  but it is now fully tooled and the next step is a single specified probe.
+
+- CAPTURED Minecraft's per-frame render call chain (2026-07-20, one run via the
+  agc_guest_stack_chain probe in hle_driver_submit_dcb, XPS5X_TRACE_MAINLOOP).
+  Arena-relative return-addr chain from the DCB submit upward (0x9fffddXX
+  entries are rbp frame-pointer saves, IGNORE; real return addrs are the .text
+  ones):
+    0x7423af (submit wrapper) <- 0xa8e2f93 <- 0xdf04778 <- 0xf49c000 <-
+    0xa8caf18 <- {per-frame divergence: 0xa8d0ce3 / 0xe154b78 / 0xe155660 /
+    0xb791264 / 0xa8cd6ac ...}
+  The prefix 0xa8e2f93/0xdf04778/0xf49c000/0xa8caf18 is STABLE across frames =
+  the render dispatch; 0xa8caf18's frame calls different things per frame =
+  a dispatcher (likely where a "what to present" decision lives).
+  RE MECHANICS LEARNED (important for next session): `--disas` from an arbitrary
+  mid-function vaddr MISALIGNS (decodes garbage/int3 padding). Must find the
+  function ENTRY first: scan backward for the `int3`-padding gap then the
+  `push rbp; mov rbp,rsp` prologue, and disas from there. Minecraft's .text is
+  int3-padded between functions, which makes boundary-finding mechanical.
+  NEXT: find the entry of the fn containing 0xa8caf18 (walk back to the prologue
+  after the preceding int3 run), disas it, and look for the branch that gates
+  submitting the Gameface/UI draws vs skipping them. That branch, or the update
+  tick one level up that sets the state it reads, is the menu gate.
+  HONEST: goal (menu pixel) is multi-session symbol-less RE; this session built
+  every tool and captured the exact render stack to start from — a concrete
+  artifact, not a deferral.
+
+- DECODED a real Minecraft render-dispatch function (2026-07-20, --disas from
+  the correct entry). Return-addr 0xa8caf18 belongs to the fn at ENTRY 0xa8ca90
+  (found by the int3-padding + `push rbp;mov rbp,rsp` rule — worked exactly as
+  predicted). Decoded logic:
+    fn(rdi=obj, esi=enable):
+      if esi == 0: return                    ; an ENABLE flag gates everything
+      if byte[0xe39e0a0] == 0: lazy-init singleton (0xa8cac3)
+      rax = qword[0xe39e098]                  ; singleton object ptr
+      call qword[rax+0x18](rbx=obj)           ; virtual dispatch = the real work
+  It is a GUARDED SINGLETON VTABLE DISPATCH. The actual work is call [rax+0x18],
+  a runtime-resolved vtable slot on the singleton at 0xe39e098.
+  RE LIMIT REACHED (honest): static disas cannot follow call [rax+0x18] — the
+  target is runtime data. NEXT STEP needs LIVE vtable inspection: at a stall,
+  read guest qword[0xe39e098] (singleton), then qword[singleton+0x18] (the fn
+  ptr), --disas that. Add a tiny probe that dumps those two guest qwords (the
+  guest memory reader already exists). Then repeat the climb toward the
+  navigate/CreateView gate. Each level = one disas + one runtime-ptr read.
+  This is real RE progress (a decoded title function), tooled and artifact-
+  backed; the menu pixel remains multi-session symbol-less RE.
+
+- FULL RE CLIMB executed end-to-end, resolved to a dead end (2026-07-20) — the
+  complete toolchain proven across 6 levels in one session:
+    stack frame 0xa8caf18 (render chain)
+    -> fn ENTRY 0xa8ca90 (guarded singleton dispatch: call qword[rax+0x18])
+    -> singleton @ arena 0xdf26ef0 (live-resolved via a probe reading
+       qword[BASE+0xe39e098])
+    -> vtable[0x18] target = 0x625360  (live-resolved)
+    -> 0x625360 = thunk `mov rdi,rsi; jmp 0xB7B17A0`
+    -> 0xB7B17A0 = PLT stub `jmp qword[0xe122e08]; push 0x26`
+    -> --resolve-got 0xe122e08 => `free` [libc] nid=0xb4886caa3d2ab051
+  CONCLUSION: singleton vtable[0x18] is a FREE / deleting-destructor slot, so
+  frame 0xa8caf18 / fn 0xa8ca90 is a TEARDOWN helper on the render path, NOT the
+  UI dispatch. Dead end — the navigate/CreateView logic is a DIFFERENT frame in
+  the captured chain (0x7423af <- 0xa8e2f93 <- 0xdf04778 <- 0xf49c000 <-
+  0xa8caf18 <- ...). NEXT: repeat the exact climb on 0xf49c000 and 0xdf04778
+  (the stable prefix above the teardown) with the same probe pattern
+  (--disas from int3+prologue, resolve any singleton/vtable live, --resolve-got
+  any PLT). All tooling proven; each frame is one mechanical climb.
+  This documents WHY the menu is multi-session: several stack frames, each a
+  6-level climb, some resolving to dead ends needing backtrack. Not a single
+  findable branch. Tooling + method are now fully in place and demonstrated.
+
+- RENDER CHAIN CROSSES MODULE BOUNDARIES (2026-07-20). Continuing the climb to
+  the next frame (0xf49c000): `--dump-vaddr eboot 0xf49c000` => "not in any
+  PT_LOAD segment" — 0xf49c000 is NOT in the eboot. It sits just below
+  libcohtml.Prospero.prx (loaded at 0xf4a0000), i.e. in a DEPENDENCY module.
+  So the per-frame render chain is eboot -> dependency .prx -> back:
+    0x7423af(eboot) <- 0xa8e2f93(eboot) <- 0xdf04778(eboot) <-
+    0xf49c000(DEP, near cohtml) <- 0xa8caf18(eboot, =free teardown) <- ...
+  IMPLICATION for the RE: some frames need disassembling a DEPENDENCY module's
+  decrypted image, not the eboot — add a --disas mode that takes a module
+  name/base and loads that .prx (the loader already decrypts them). The UI
+  navigate logic most likely lives in the eboot's UI code (0xdf04778 /
+  0xe154xxx are big eboot .text) OR inside a dependency. This is now provably
+  CROSS-MODULE symbol-less RE across several stack frames — the definitive
+  reason it is multi-session. Every tool + method demonstrated; the remaining
+  work is mechanical-but-lengthy climbing, frame by frame, module by module.

@@ -21,6 +21,10 @@
 mod arena;
 #[cfg(target_os = "windows")]
 mod dispatch;
+/// Diagnostic: one-shot `int3` traps on a module's exports
+/// (`XPS5X_TRAP_MODULE_EXPORTS`). Pure bookkeeping — builds and tests
+/// everywhere; the VEH glue is in `dispatch`.
+pub mod export_trap;
 mod fiber;
 pub mod native_trap;
 #[cfg(target_os = "windows")]

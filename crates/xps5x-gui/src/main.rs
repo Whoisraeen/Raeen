@@ -336,6 +336,72 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Diagnostic: `xps5x --disas <eboot.bin> <hex-vaddr> [<len-decimal>]`
+    // disassembles x86-64 from a module vaddr — the missing piece for RE'ing
+    // guest boot-decision logic (e.g. Minecraft's never-taken CreateView
+    // branch). Reuses the workspace iced-x86 decoder the VEH already links.
+    if let Some(pos) = args.iter().position(|a| a == "--disas") {
+        let path = args
+            .get(pos + 1)
+            .ok_or_else(|| anyhow::anyhow!("--disas requires a path to an eboot.bin"))?;
+        let vaddr = args
+            .get(pos + 2)
+            .ok_or_else(|| anyhow::anyhow!("--disas requires a hex vaddr"))
+            .and_then(|s| {
+                u64::from_str_radix(s.trim_start_matches("0x"), 16)
+                    .map_err(|e| anyhow::anyhow!("bad vaddr {s:?}: {e}"))
+            })?;
+        let len = match args.get(pos + 3) {
+            Some(s) => s.parse::<usize>()?,
+            None => 256,
+        };
+        let bytes = std::fs::read(path)?;
+        let decrypted = xps5x_firmware::decrypt_self(&bytes, &xps5x_firmware::NoKeysProvider)?;
+        let module = xps5x_firmware::parse_sprx(&decrypted.elf)?;
+        let segment = module
+            .segments
+            .iter()
+            .find(|s| vaddr >= s.vaddr && vaddr < s.vaddr + s.mem_size)
+            .ok_or_else(|| anyhow::anyhow!("vaddr {vaddr:#x} is not in any PT_LOAD segment"))?;
+        let start = (vaddr - segment.vaddr) as usize;
+        let file_backed = segment.data.len().saturating_sub(start);
+        if file_backed == 0 {
+            println!("vaddr {vaddr:#x} is in BSS");
+            return Ok(());
+        }
+        let slice = &segment.data[start..start + len.min(file_backed)];
+        use iced_x86::Formatter as _;
+        let mut decoder =
+            iced_x86::Decoder::with_ip(64, slice, vaddr, iced_x86::DecoderOptions::NONE);
+        let mut formatter = iced_x86::IntelFormatter::new();
+        let mut out = String::new();
+        let mut inst = iced_x86::Instruction::default();
+        while decoder.can_decode() {
+            decoder.decode_out(&mut inst);
+            out.clear();
+            formatter.format(&inst, &mut out);
+            // Flag control-flow so a branch that gates a subsystem stands out.
+            // Keyed off the formatted mnemonic to avoid the `code_asm`/flow
+            // feature; conditional jumps start with "j" but not "jmp".
+            let m = out.split_whitespace().next().unwrap_or("");
+            let mark = if m == "call" {
+                " (call)"
+            } else if m == "ret" {
+                " (ret)"
+            } else if m == "jmp" {
+                " (jmp)"
+            } else if m.starts_with('j') {
+                " <-- COND"
+            } else if m == "test" || m == "cmp" {
+                " <-- TEST"
+            } else {
+                ""
+            };
+            println!("{:#014x}  {out}{mark}", inst.ip());
+        }
+        return Ok(());
+    }
+
     // Diagnostic: `xps5x --resolve-got <eboot.bin> <hex-got-vaddr>...` maps a
     // PLT/GOT slot vaddr (the `jmp qword [rip+disp]` target of an import thunk)
     // back to the import symbol it binds — NID, recovered name, and library.
@@ -656,6 +722,53 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        // Diagnostic: XPS5X_TRAP_MODULE_EXPORTS=<substring> plants a one-shot
+        // `int3` on the entry byte of EVERY export of each matching loaded
+        // module. The first call to each export logs module + NID + caller and
+        // restores the byte permanently — near-zero overhead after the hit.
+        // Answers "is this module ever actually entered, and from where"
+        // (e.g. `=cohtml` to see whether the title drives its HTML engine).
+        if let Ok(filter) = std::env::var("XPS5X_TRAP_MODULE_EXPORTS") {
+            struct TrapTarget {
+                name: String,
+                image_offset: u64,
+                exports: Vec<(u64, u64)>,
+                exec_range: Option<(u64, u64)>,
+            }
+            let targets: Vec<TrapTarget> = linked
+                .unwind_modules
+                .iter()
+                .filter(|m| xps5x_runtime::export_trap::module_matches(&filter, &m.name))
+                .map(|m| TrapTarget {
+                    name: m.name.clone(),
+                    image_offset: m.image_offset,
+                    exports: m.exports.iter().map(|e| (e.nid, e.value)).collect(),
+                    // First PT_LOAD = the text segment; exports outside it are
+                    // data and must not be patched (see export_trap docs).
+                    exec_range: (m.unwind.seg0_size > 0).then(|| {
+                        (
+                            m.unwind.seg0_vaddr,
+                            m.unwind.seg0_vaddr + m.unwind.seg0_size,
+                        )
+                    }),
+                })
+                .collect();
+            if targets.is_empty() {
+                tracing::warn!(
+                    "XPS5X_TRAP_MODULE_EXPORTS={filter}: no loaded module matches — nothing armed"
+                );
+            }
+            for t in targets {
+                xps5x_runtime::export_trap::install_module_exports(
+                    &mut linked.image,
+                    xps5x_runtime::GUEST_ARENA_BASE,
+                    &t.name,
+                    t.image_offset,
+                    &t.exports,
+                    t.exec_range,
+                );
+            }
+        }
         let linked = std::sync::Arc::new(linked);
         info!(
             "loaded: entry={:#x} image={:#x} byte(s) resolved={} unresolved={}",
@@ -811,6 +924,52 @@ fn main() -> anyhow::Result<()> {
                             format!("\nTIME IN HLE (top):\n{}", top.join("\n"))
                         },
                         console_tail
+                    );
+                }
+            });
+        }
+        // Poll-gate diagnosis: with XPS5X_CALL_STATS set, the dispatch path
+        // counts every HLE call per function, split into a boot window (first
+        // 30 s) and steady state. Dump the top of each ranking periodically —
+        // a title that polls a "not ready" value in short cycles puts the
+        // polled function at the top of the STEADY window (timing/allocator
+        // noise like clock_gettime ranks high too; the status queries below
+        // them are the gate). Periodic, not at-exit: diagnosis runs are
+        // usually killed hard (timeout -s KILL), so an exit hook never fires.
+        if std::env::var_os("XPS5X_CALL_STATS").is_some() {
+            let kmon = std::sync::Arc::clone(&kernel);
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    let mut boot: Vec<(u64, String)> = Vec::new();
+                    let mut steady: Vec<(u64, String)> = Vec::new();
+                    for e in kmon.hle_call_counts.iter() {
+                        let (b, s) = e.value();
+                        let b = b.load(std::sync::atomic::Ordering::Relaxed);
+                        let s = s.load(std::sync::atomic::Ordering::Relaxed);
+                        if b > 0 {
+                            boot.push((b, e.key().clone()));
+                        }
+                        if s > 0 {
+                            steady.push((s, e.key().clone()));
+                        }
+                    }
+                    boot.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    steady.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    let render = |v: &[(u64, String)]| {
+                        v.iter()
+                            .take(40)
+                            .map(|(n, f)| format!("  {n:>9}  {f}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    info!(
+                        "CALL_STATS t=+{:.0}s\nBOOT WINDOW (first 30s, {} distinct) top 40:\n{}\nSTEADY STATE (after 30s, {} distinct) top 40:\n{}",
+                        kmon.uptime().as_secs_f64(),
+                        boot.len(),
+                        render(&boot),
+                        steady.len(),
+                        render(&steady),
                     );
                 }
             });

@@ -15,6 +15,9 @@ use tracing::{debug, warn};
 const SCE_OK: u64 = 0;
 /// `SCE_SYSTEM_SERVICE_ERROR_PARAMETER`.
 const ERROR_PARAMETER: u64 = 0x80A1_0003;
+/// `SCE_SYSTEM_SERVICE_ERROR_NO_EVENT` — the event queue is empty. shadPS4
+/// `systemservice_error.h`.
+const ERROR_NO_EVENT: u64 = 0x80A1_0004;
 /// `SceSystemServiceStatus` is a 12-byte struct; the first `int32` is
 /// `eventNum` (pending system events).
 const STATUS_SIZE: usize = 0x0C;
@@ -71,6 +74,47 @@ pub fn register(registry: &HleRegistry) {
         "sceSystemServiceReportAbnormalTermination",
         hle_ok,
     );
+    // The per-frame system-event pump. Minecraft's main loop calls this every
+    // tick (measured: it appears in the steady-state HLE poll set); when it was
+    // UNREGISTERED the call hit an unresolved-import error rather than the
+    // defined "nothing pending" answer. shadPS4 (systemservice.cpp:1984)
+    // returns ERROR_NO_EVENT when its event queue is empty and pops a real
+    // event otherwise. With no event source wired yet, the honest answer is
+    // "queue empty" — a valid, non-error state the caller handles by moving on,
+    // NOT a failure it retries. This is the correct baseline; a real event
+    // source (e.g. a game-intent launch event) is a later, separate step.
+    registry.register(
+        "libSceSystemService",
+        "sceSystemServiceReceiveEvent",
+        hle_receive_event,
+    );
+}
+
+/// `sceSystemServiceReceiveEvent(SceSystemServiceEvent *event)`: report an
+/// empty queue. shadPS4 returns `ERROR_NO_EVENT` (0x80A10004) with the event
+/// untouched when nothing is pending; the caller treats it as "no work this
+/// frame", not an error to retry on.
+fn hle_receive_event(ctx: &HleContext, args: &[u64]) -> u64 {
+    let event_ptr = args.first().copied().unwrap_or(0);
+    debug!("sceSystemServiceReceiveEvent(event={event_ptr:#x})");
+    // RE probe (XPS5X_TRACE_MAINLOOP): ReceiveEvent is polled from the main
+    // loop's per-frame tick, so its caller return-addr points INTO that tick —
+    // the state machine that decides whether to create the Gameface view. Log
+    // it once so `xps5x --disas` can be aimed at the exact function.
+    if std::env::var_os("XPS5X_TRACE_MAINLOOP").is_some() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                caller = format_args!("{:#x}", ctx.caller_return_addr),
+                "TRACE_MAINLOOP: sceSystemServiceReceiveEvent called from (main-loop tick)"
+            );
+        }
+    }
+    if event_ptr == 0 {
+        return ERROR_PARAMETER;
+    }
+    ERROR_NO_EVENT
 }
 
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
@@ -184,5 +228,41 @@ mod tests {
         let mut r = [0u8; 4];
         assert!(mem.read(0x100, &mut r));
         assert_eq!(f32::from_le_bytes(r), 1.0, "full safe-area ratio");
+    }
+
+    #[test]
+    fn receive_event_reports_empty_queue_not_error() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // A null out-pointer is a parameter error (shadPS4 parity).
+        assert_eq!(hle_receive_event(&ctx, &[0]), ERROR_PARAMETER);
+        // A valid pointer with nothing queued reports NO_EVENT — the defined
+        // "no work this frame" answer, NOT a generic failure the title retries.
+        assert_eq!(hle_receive_event(&ctx, &[0x100]), ERROR_NO_EVENT);
+    }
+
+    #[test]
+    fn receive_event_is_registered() {
+        let registry = HleRegistry::new();
+        register(&registry);
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // A resolved call returns Some(NO_EVENT) for a valid pointer; an
+        // unregistered function would return None (unresolved import).
+        assert_eq!(
+            registry.call(
+                &ctx,
+                "libSceSystemService",
+                "sceSystemServiceReceiveEvent",
+                &[0x100],
+            ),
+            Some(ERROR_NO_EVENT),
+            "the per-frame event pump must resolve, not hit an unresolved import"
+        );
     }
 }

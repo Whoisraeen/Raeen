@@ -188,6 +188,20 @@ pub struct OrbisKernel {
     /// [`Self::recent_hle_calls`] cannot do — the ring names the calls but not
     /// their duration, so one long wait and a fast spin look identical.
     pub hle_call_time: DashMap<(u64, String), (u64, u128)>,
+    /// Diagnostic (`XPS5X_CALL_STATS`): `"library::function"` -> (calls during
+    /// the first 30 s of the run, calls after). A title that POLLS a readiness
+    /// value in its steady state ranks the polled function at the top of the
+    /// second window — [`Self::hle_call_time`] cannot show this because it is
+    /// per-thread and only populated under `XPS5X_TIME_HLE`'s timing overhead.
+    /// Relaxed atomics; incremented in the dispatch path only when the env var
+    /// is set.
+    pub hle_call_counts: DashMap<
+        String,
+        (
+            std::sync::atomic::AtomicU64,
+            std::sync::atomic::AtomicU64,
+        ),
+    >,
     /// Guest pthread condition-variable wait queues, keyed by object address.
     pub pthread_conds: DashMap<u64, Arc<PthreadCond>>,
     /// Clock id set on a guest `pthread_condattr_t` by
@@ -727,6 +741,7 @@ impl OrbisKernel {
             pthread_mutex_attrs: DashMap::new(),
             pthread_rwlocks: DashMap::new(),
             hle_call_time: DashMap::new(),
+            hle_call_counts: DashMap::new(),
             pthread_conds: DashMap::new(),
             pthread_condattr_clocks: DashMap::new(),
             pthread_attrs: DashMap::new(),
@@ -807,6 +822,13 @@ impl OrbisKernel {
             ssl_contexts: DashMap::new(),
             ssl_next_context: std::sync::atomic::AtomicI32::new(0),
         }
+    }
+
+    /// Wall-clock elapsed since this kernel instance was created (= since the
+    /// title launch began). Used by diagnostics that split measurements into a
+    /// boot window and a steady-state window.
+    pub fn uptime(&self) -> std::time::Duration {
+        self.started_at.elapsed()
     }
 
     /// Replace the loaded-process unwind table. Entries with empty or

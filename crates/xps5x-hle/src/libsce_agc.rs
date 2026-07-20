@@ -766,7 +766,76 @@ fn hle_dcb_set_base_indirect_args(ctx: &HleContext, args: &[u64]) -> u64 {
 /// capture and structurally decode the submitted Gen5 PM4 command buffer, apply
 /// sync/flip side effects, and (when the DCB contains draw packets) drive the
 /// M2 Vulkan offscreen path via [`xps5x_gpu::AgcGpuSession`].
+/// Walk the caller's guest stack for a return-address chain (arena-relative),
+/// so one probe captures the full call path from the render submit up to the
+/// frame-loop function — the RE on-ramp to the UI navigate gate. Mirror of the
+/// pthread_cond scanner; kept local to avoid widening that module's API.
+fn agc_guest_stack_chain(ctx: &HleContext, depth: usize) -> String {
+    const BASE: u64 = 0x0000_1000_0000_0000;
+    const SPAN: u64 = 0x1_0000_0000;
+    if ctx.caller_rsp == 0 {
+        return "<no stack>".to_owned();
+    }
+    let mut frames: Vec<String> = Vec::new();
+    let mut word = [0u8; 8];
+    for slot in 0..1024u64 {
+        let Some(addr) = ctx.caller_rsp.checked_add(slot * 8) else {
+            break;
+        };
+        if !ctx.mem.read(addr, &mut word) {
+            break;
+        }
+        let value = u64::from_le_bytes(word);
+        if (BASE..BASE + SPAN).contains(&value) {
+            frames.push(format!("{:#x}", value - BASE));
+            if frames.len() >= depth {
+                break;
+            }
+        }
+    }
+    if frames.is_empty() {
+        "<none>".to_owned()
+    } else {
+        frames.join(" <- ")
+    }
+}
+
 fn hle_driver_submit_dcb(ctx: &HleContext, args: &[u64]) -> u64 {
+    // RE probe (XPS5X_TRACE_MAINLOOP): the DCB submit is the per-frame render
+    // tick, called on the main thread every frame. Its caller return-addr is
+    // inside that tick — the on-ramp to the UI state machine that decides
+    // whether to navigate a Gameface route. Log the first few distinct callers
+    // so `xps5x --disas` can be aimed at the exact per-frame function.
+    if std::env::var_os("XPS5X_TRACE_MAINLOOP").is_some() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEEN: AtomicU32 = AtomicU32::new(0);
+        if SEEN.fetch_add(1, Ordering::Relaxed) < 6 {
+            tracing::warn!(
+                caller = format_args!("{:#x}", ctx.caller_return_addr),
+                chain = %agc_guest_stack_chain(ctx, 16),
+                "TRACE_MAINLOOP: sceAgcDriverSubmitDcb caller + guest-stack chain (per-frame render tick)"
+            );
+            // Resolve the render-dispatch singleton's vtable slot live, so its
+            // runtime-determined target (call [rax+0x18] in fn 0xa8ca90) can be
+            // disassembled: read guest qword[BASE+0xe39e098] (singleton), then
+            // qword[singleton+0x18] (the fn ptr), and report both arena-relative.
+            const BASE: u64 = 0x0000_1000_0000_0000;
+            let mut rd = |a: u64| -> Option<u64> {
+                let mut w = [0u8; 8];
+                ctx.mem.read(a, &mut w).then(|| u64::from_le_bytes(w))
+            };
+            if let Some(singleton) = rd(BASE + 0xe39e098) {
+                let vfn = singleton.checked_add(0x18).and_then(&mut rd).unwrap_or(0);
+                tracing::warn!(
+                    singleton = format_args!("{singleton:#x}"),
+                    singleton_rel = format_args!("{:#x}", singleton.wrapping_sub(BASE)),
+                    vtable_slot_0x18 = format_args!("{vfn:#x}"),
+                    vtable_slot_rel = format_args!("{:#x}", vfn.wrapping_sub(BASE)),
+                    "TRACE_MAINLOOP: render-dispatch singleton + vtable[0x18] target (--disas this)"
+                );
+            }
+        }
+    }
     submit_validate(ctx, args.first().copied().unwrap_or(0), "DCB")
 }
 

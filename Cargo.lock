@@ -5165,6 +5165,7 @@ dependencies = [
  "egui",
  "gilrs",
  "goblin",
+ "iced-x86",
  "image",
  "serde",
  "serde_json",

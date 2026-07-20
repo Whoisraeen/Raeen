@@ -50,7 +50,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter, Register};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, EXCEPTION_ACCESS_VIOLATION, EXCEPTION_ILLEGAL_INSTRUCTION,
+    CloseHandle, EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, CONTEXT, CONTEXT_ALL_AMD64, EXCEPTION_CONTINUE_EXECUTION,
@@ -268,6 +268,16 @@ static TRACE_EINVAL: OnceLock<bool> = OnceLock::new();
 /// calls, so a stalled thread's wall-clock can be attributed to a specific
 /// wait rather than guessed at from the call ring.
 static TIME_HLE: OnceLock<bool> = OnceLock::new();
+
+/// `XPS5X_CALL_STATS`: count every HLE call per `library::function`, split
+/// into a boot window (first 30 s) and steady state after. A title that
+/// POLLS a readiness value in short cycles never shows up in the in-flight
+/// or timing views (each call is fast) — but its poll function dominates the
+/// steady-state call ranking. Relaxed atomics on [`OrbisKernel::hle_call_counts`].
+static CALL_STATS: OnceLock<bool> = OnceLock::new();
+
+/// Boundary between the two [`CALL_STATS`] windows.
+const CALL_STATS_BOOT_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The number of FS-base re-arms performed since process start — see
 /// [`FSBASE_REARMS`]. Monotonic; never reset.
@@ -1440,7 +1450,8 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
 
     let is_access_violation = record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION;
     let is_illegal_instruction = record.ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION;
-    if !is_access_violation && !is_illegal_instruction {
+    let is_breakpoint = record.ExceptionCode == EXCEPTION_BREAKPOINT;
+    if !is_access_violation && !is_illegal_instruction && !is_breakpoint {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
@@ -1482,6 +1493,26 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         ctx.exited.set(true);
         *context = unsafe { *ctx.recovery_ctx };
         return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    if is_breakpoint {
+        // A one-shot export trap (`XPS5X_TRAP_MODULE_EXPORTS`): an `int3`
+        // planted on a module export's entry byte. `ExceptionAddress` is the
+        // `int3` itself for breakpoint exceptions (the kernel rewinds it), so
+        // use the record — not `Rip` — as the authoritative trap address.
+        // `take_hit` logs once and restores the original byte; resume at the
+        // SAME address through the TLS-rearm stub, exactly like the syscall
+        // path, so the next `fs:` access never sees the host TEB. Anything
+        // not in the trap map (debugger int3, guest int3 padding) is passed
+        // on unchanged.
+        // SAFETY: `ctx.mem` outlives the guarded call, per `ActiveContext`.
+        let mem = unsafe { &*ctx.mem };
+        let fault = record.ExceptionAddress as u64;
+        if crate::export_trap::take_hit(fault, mem, context.Rsp) {
+            resume_guest_with_tls(ctx, context, mem, fault, context.Rsp);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
     }
 
     if is_illegal_instruction {
@@ -2106,6 +2137,20 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             // accumulating per (thread, function) separates those two.
             let timed = *TIME_HLE.get_or_init(|| std::env::var_os("XPS5X_TIME_HLE").is_some());
             let started = timed.then(std::time::Instant::now);
+            // `XPS5X_CALL_STATS`: per-function call counter, split into boot
+            // (first 30 s) and steady-state windows. See `CALL_STATS`.
+            if *CALL_STATS.get_or_init(|| std::env::var_os("XPS5X_CALL_STATS").is_some()) {
+                let counters = kernel
+                    .hle_call_counts
+                    .entry(format!("{}::{}", t.library, t.function))
+                    .or_default();
+                let (boot, steady) = counters.value();
+                if kernel.uptime() < CALL_STATS_BOOT_WINDOW {
+                    boot.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    steady.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             // Name the in-flight call BEFORE dispatching it, so a thread that
             // blocks in a host wait deep inside the call (and never returns) can
             // be pinned to the exact function it is parked in.

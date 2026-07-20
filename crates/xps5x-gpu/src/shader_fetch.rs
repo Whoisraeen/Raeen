@@ -343,6 +343,7 @@ impl ShaderTranslateCache {
                     spirv_words = t.spirv.len(),
                     "guest shader fetched and translated to SPIR-V"
                 );
+                self.dump_spirv(stage, addr, &t.spirv);
                 self.entries.insert(key, Ok(t.clone()));
                 Ok(t)
             }
@@ -383,6 +384,24 @@ impl ShaderTranslateCache {
         match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, &bytes)) {
             Ok(()) => debug!(path = %path.display(), "dumped fetched shader"),
             Err(e) => warn!(error = %e, path = %path.display(), "shader dump failed"),
+        }
+    }
+
+    /// Forensics: write a successfully-translated shader's SPIR-V once, next
+    /// to its raw `.bin`. Enables the in-tree coverage-bisect harness
+    /// (`tests/coverage_bisect.rs`) to replay a TITLE's actual translated
+    /// VS+PS against a known-covering draw without a title run — the one
+    /// component that harness cannot fabricate. Same policy as `dump_shader`:
+    /// never a reason to fail the draw path.
+    fn dump_spirv(&self, stage: Stage, addr: u64, spirv: &[u32]) {
+        let Some(dir) = &self.dump_dir else {
+            return;
+        };
+        let path = dir.join(format!("{}_{addr:x}.spv", stage.as_str()));
+        let bytes: Vec<u8> = spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+        match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, &bytes)) {
+            Ok(()) => debug!(path = %path.display(), "dumped translated SPIR-V"),
+            Err(e) => warn!(error = %e, path = %path.display(), "SPIR-V dump failed"),
         }
     }
 }
