@@ -101,6 +101,145 @@ fn clock_gettime_resolves_from_the_libkernel_provider_the_title_names() {
     }
 }
 
+/// The first `libSceAgc` import ASTRO.BOT actually calls once boot reaches GPU
+/// init. The NID was measured from the retail title; the name was recovered from
+/// SharpEmu's `aerolib` catalogue, so this also pins that our NID hash agrees
+/// with the recovered spelling (if it did not, the registration would silently
+/// bind a different identity than the title imports).
+#[test]
+fn sce_agc_get_is_trinity_mode_resolves_from_the_libsceagc_provider() {
+    const GET_IS_TRINITY_MODE_NID: u64 = 0x05f0_4364_66ed_8bb0;
+    assert_eq!(
+        nid_of("sceAgcGetIsTrinityMode"),
+        GET_IS_TRINITY_MODE_NID,
+        "the recovered name must hash to the NID the title imports"
+    );
+    assert_eq!(encode_nid(GET_IS_TRINITY_MODE_NID), "BfBDZGbti7A");
+
+    let hle = HleRegistry::new();
+    let registry = ModuleRegistry::new(NidDatabase::from_hle(&hle));
+
+    match registry.resolve(&hle, "libSceAgc", GET_IS_TRINITY_MODE_NID) {
+        Resolver::Hle { function, .. } => assert_eq!(function, "sceAgcGetIsTrinityMode"),
+        other => panic!(
+            "sceAgcGetIsTrinityMode imported from provider 'libSceAgc' must resolve to an \
+             HLE function; got {other:?}"
+        ),
+    }
+}
+
+/// The exact import each installed retail title stopped its boot on, as
+/// `(provider library, NID, expected function)`. Every one of these is a
+/// **provider-aware** resolution: several were already implemented but
+/// registered under a different library than the title names, which is
+/// invisible to a provider-blind NID lookup and cost each title its boot.
+///
+/// Measured 2026-07-19 by running each title's eboot through `--run-eboot` and
+/// reading the reported unresolved import.
+#[test]
+fn every_measured_title_boot_blocker_resolves_from_its_own_provider() {
+    const TITLE_BLOCKERS: &[(&str, u64, &str, &str)] = &[
+        // Minecraft: POSIX spelling imported from `libkernel`, not `libScePosix`.
+        (
+            "libkernel",
+            0x9fcf_2fc7_70b9_9d6f,
+            "gettimeofday",
+            "Minecraft",
+        ),
+        // Until Dawn: mutex priority-protocol attribute setter.
+        (
+            "libkernel",
+            0xd451_af53_48bd_b1a4,
+            "scePthreadMutexattrSetprotocol",
+            "Until Dawn",
+        ),
+        // Dragon Ball Sparking Zero: Share service under `libSceShare`, while
+        // the implementation was registered only as `libSceShareUtility`.
+        (
+            "libSceShare",
+            0x9c10_c3eb_a922_156f,
+            "sceShareInitialize",
+            "Dragon Ball Sparking Zero",
+        ),
+        // Until Dawn, round 2: the public (non-`Internal`) Named spelling.
+        (
+            "libkernel",
+            0x98bf_0d0c_7f3a_8902,
+            "sceKernelMapNamedFlexibleMemory",
+            "Until Dawn",
+        ),
+        // A Plague Tale Requiem: libc's pre-main environment initialiser, then
+        // C++ function-local static guards, then a direct-memory query.
+        ("libc", 0x6f34_04c7_2d7c_f592, "_init_env", "A Plague Tale"),
+        (
+            "libc",
+            0xdc63_e98d_0740_313c,
+            "__cxa_guard_acquire",
+            "A Plague Tale",
+        ),
+        (
+            "libkernel",
+            0x0b47_fb4c_971b_7da7,
+            "sceKernelAvailableDirectMemorySize",
+            "A Plague Tale",
+        ),
+        // Until Dawn, rounds 3-4: PSN push events, then the PS5-Pro query.
+        (
+            "libSceNpWebApi2",
+            0x595d_46c0_cdf6_3606,
+            "sceNpWebApi2PushEventCreateHandle",
+            "Until Dawn",
+        ),
+        (
+            "libkernel",
+            0xb54e_5edd_ff60_4a25,
+            "sceKernelIsTrinityMode",
+            "Until Dawn",
+        ),
+    ];
+
+    let hle = HleRegistry::new();
+    let registry = ModuleRegistry::new(NidDatabase::from_hle(&hle));
+
+    for (provider, nid, expected, title) in TITLE_BLOCKERS {
+        match registry.resolve(&hle, provider, *nid) {
+            Resolver::Hle { function, .. } => assert_eq!(
+                &function, expected,
+                "{title}: {provider}::{nid:#018x} resolved to the wrong function"
+            ),
+            other => panic!(
+                "{title} stops booting here: {expected} (nid {nid:#018x}) imported from \
+                 provider '{provider}' must resolve to an HLE function; got {other:?}"
+            ),
+        }
+    }
+}
+
+/// Gen5 retail binaries import the AGC *driver* entry points from the
+/// `libSceAgcDriver` library, not `libSceAgc`. Both of these were implemented
+/// but registered only under `libSceAgc`, so provider-aware resolution left them
+/// unreachable and ASTRO.BOT reported them missing at its first GPU submission.
+/// These are the measured retail (provider, NID) identities.
+#[test]
+fn agc_driver_entry_points_resolve_from_the_libsceagcdriver_provider() {
+    let hle = HleRegistry::new();
+    let registry = ModuleRegistry::new(NidDatabase::from_hle(&hle));
+
+    for (nid, expected) in [
+        (0x5209_4921_98c6_b2c3u64, "sceAgcDriverSubmitDcb"),
+        (0x8124_67af_bf45_f2d4, "sceAgcDriverSubmitAcb"),
+        (0xc36a_c986_60fe_76c1, "sceAgcDriverAddEqEvent"),
+    ] {
+        match registry.resolve(&hle, "libSceAgcDriver", nid) {
+            Resolver::Hle { function, .. } => assert_eq!(function, expected),
+            other => panic!(
+                "{expected} (nid {nid:#018x}) imported from provider 'libSceAgcDriver' must \
+                 resolve to an HLE function; got {other:?}"
+            ),
+        }
+    }
+}
+
 /// Building the NID database from the **real** HLE registry must give the same
 /// answer every time, however the names arrive.
 ///

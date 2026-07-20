@@ -1012,6 +1012,14 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register(
         "libkernel",
+        "sceKernelAvailableDirectMemorySize",
+        hle_available_direct_memory_size,
+    );
+    // PS5 Pro ("Trinity") query — the libkernel twin of libSceAgc's
+    // `sceAgcGetIsTrinityMode`. Base PS5, so false.
+    registry.register("libkernel", "sceKernelIsTrinityMode", hle_is_trinity_mode);
+    registry.register(
+        "libkernel",
         "sceKernelSetVirtualRangeName",
         hle_set_virtual_range_name,
     );
@@ -1171,6 +1179,14 @@ pub fn register(registry: &HleRegistry) {
     registry.register(
         "libkernel",
         "sceKernelMapNamedFlexibleMemoryInternal",
+        hle_map_flexible_memory,
+    );
+    // The public (non-`Internal`) spelling was missing: measured, Until Dawn
+    // imports `sceKernelMapNamedFlexibleMemory` (NID 0x98bf0d0c7f3a8902) and
+    // stopped its boot there even though the mapping behaviour was implemented.
+    registry.register(
+        "libkernel",
+        "sceKernelMapNamedFlexibleMemory",
         hle_map_flexible_memory,
     );
     registry.register(
@@ -1346,6 +1362,9 @@ pub(crate) const PS5_DIRECT_MEMORY_SIZE: u64 = 0x3_5800_0000;
 /// `SCE_KERNEL_ERROR_EAGAIN` — what the real allocator returns when the
 /// direct-memory budget cannot satisfy the request.
 const SCE_KERNEL_ERROR_EAGAIN_ALLOC: u64 = 0x8002_000B;
+
+/// `ENOMEM` — no block satisfies the request (`sceKernelAvailableDirectMemorySize`).
+const SCE_KERNEL_ERROR_ENOMEM: u64 = 0x8002_000C;
 
 fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     let search_start = args.first().copied().unwrap_or(0);
@@ -1779,6 +1798,63 @@ fn hle_available_flexible_memory_size(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_EFAULT;
     }
     SCE_OK
+}
+
+/// Real `sceKernelAvailableDirectMemorySize(off_t searchStart, off_t searchEnd,
+/// size_t alignment, off_t *physAddrOut, size_t *sizeOut)`: report the largest
+/// free direct-memory block inside `[searchStart, searchEnd)` honouring
+/// `alignment`, writing its physical base and size through the two out-params
+/// (shadPS4 `memory.cpp:120`, NID `C0f7TJcbfac`).
+///
+/// XPS5X models direct memory as one contiguous pool
+/// ([`PS5_DIRECT_MEMORY_SIZE`]) rather than a fragmenting physical allocator,
+/// so the answer is the caller's own window clamped to that pool and aligned
+/// up. That is honest for its purpose — callers use this to size an allocation
+/// they are about to make — and never over-reports the pool.
+///
+/// A null out-param is `EINVAL`; an empty window is `ENOMEM`, matching shadPS4.
+///
+/// Measured: A Plague Tale Requiem stops its boot on this import.
+fn hle_available_direct_memory_size(ctx: &HleContext, args: &[u64]) -> u64 {
+    let search_start = args.first().copied().unwrap_or(0);
+    let search_end = args.get(1).copied().unwrap_or(0);
+    let alignment = args.get(2).copied().unwrap_or(0);
+    let phys_addr_out = args.get(3).copied().unwrap_or(0);
+    let size_out = args.get(4).copied().unwrap_or(0);
+    debug!(
+        "sceKernelAvailableDirectMemorySize(start={search_start:#x}, end={search_end:#x}, \
+         align={alignment:#x})"
+    );
+    if phys_addr_out == 0 || size_out == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+
+    let align = alignment.max(xps5x_core::PS5_PAGE_SIZE as u64);
+    let end = search_end.min(PS5_DIRECT_MEMORY_SIZE);
+    // Align the base up, then floor the length to the same granularity.
+    let start = search_start.div_ceil(align).saturating_mul(align);
+    let size = (end.saturating_sub(start) / align).saturating_mul(align);
+    if size == 0 {
+        return SCE_KERNEL_ERROR_ENOMEM;
+    }
+
+    if !ctx.mem.write(phys_addr_out, &start.to_le_bytes())
+        || !ctx.mem.write(size_out, &size.to_le_bytes())
+    {
+        warn!("sceKernelAvailableDirectMemorySize: out-param not writable — EFAULT");
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    SCE_OK
+}
+
+/// `sceKernelIsTrinityMode()`: is this console a PS5 **Pro** ("Trinity")? The
+/// libkernel twin of `libSceAgc`'s `sceAgcGetIsTrinityMode`; XPS5X emulates a
+/// base PS5, so both answer false.
+///
+/// Name recovered for NID `0xb54e5eddff604a25` (`tU5e3f9gSiU`) from SharpEmu's
+/// aerolib catalogue. Measured: Until Dawn stops its boot on this import.
+fn hle_is_trinity_mode(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    0
 }
 
 fn hle_set_virtual_range_name(_ctx: &HleContext, args: &[u64]) -> u64 {
@@ -3152,6 +3228,27 @@ const USLEEP_MAX: std::time::Duration = std::time::Duration::from_secs(1);
 pub(crate) fn hle_usleep(ctx: &HleContext, args: &[u64]) -> u64 {
     let usec = args.first().copied().unwrap_or(0);
     debug!("sceKernelUsleep(usec={usec})");
+    // A guest that sleeps in a tight loop is polling for something that never
+    // arrives — the shape of every boot stall seen so far. The sleep itself says
+    // nothing; the CALLER does, because `--dump-vaddr` turns that address into
+    // the loop's condition. Report each distinct caller once so a stalled title
+    // names its own spin site without flooding the log.
+    if std::env::var_os("XPS5X_TRACE_SPIN").is_some() && ctx.caller_return_addr != 0 {
+        static SEEN: std::sync::LazyLock<
+            std::sync::Mutex<std::collections::HashSet<u64>>,
+        > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let first = SEEN
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(ctx.caller_return_addr);
+        if first {
+            tracing::info!(
+                "SPIN: sceKernelUsleep({usec}us) from guest {:#x} (thread {})",
+                ctx.caller_return_addr,
+                ctx.guest_threads.current_thread()
+            );
+        }
+    }
     let requested = std::time::Duration::from_micros(usec);
     let dur = requested.min(USLEEP_MAX);
     if dur < requested {

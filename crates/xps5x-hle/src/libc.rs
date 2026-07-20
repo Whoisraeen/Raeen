@@ -43,6 +43,12 @@ pub fn register(registry: &HleRegistry) {
     register_abi(registry, "strnlen", hle_strnlen);
     register_abi(registry, "strchr", hle_strchr);
     register_abi(registry, "strrchr", hle_strrchr);
+    register_abi(registry, "strcspn", hle_strcspn);
+    register_abi(registry, "wcslen", hle_wcslen);
+    register_abi(registry, "wcscpy", hle_wcscpy);
+    register_abi(registry, "sincosf", hle_sincosf);
+    register_abi(registry, "vsnprintf", hle_vsnprintf);
+    register_abi(registry, "strtok", hle_strtok);
     register_abi(registry, "strcat", hle_strcat);
     register_abi(registry, "strncat", hle_strncat);
     register_abi(registry, "strstr", hle_strstr);
@@ -64,6 +70,117 @@ pub fn register(registry: &HleRegistry) {
     register_abi(registry, "__stack_chk_fail", hle_stack_chk_fail);
     register_abi(registry, "memalign", hle_memalign);
     register_abi(registry, "posix_memalign", hle_posix_memalign);
+    register_abi(registry, "_init_env", hle_init_env);
+    // C++ function-local static guards (Itanium ABI). Measured: A Plague Tale
+    // Requiem imports `__cxa_guard_acquire` from `libc`; release/abort are its
+    // mandatory partners and are registered with it.
+    register_abi(registry, "__cxa_guard_acquire", hle_cxa_guard_acquire);
+    register_abi(registry, "__cxa_guard_release", hle_cxa_guard_release);
+    register_abi(registry, "__cxa_guard_abort", hle_cxa_guard_abort);
+}
+
+/// In-flight `__cxa_guard_acquire` claims, keyed by guest guard address, with a
+/// condvar so a second guest thread waits for the initializer instead of racing
+/// it. Empty and untouched unless a guest actually uses function-local statics.
+static CXA_GUARDS: std::sync::LazyLock<(
+    std::sync::Mutex<std::collections::HashSet<u64>>,
+    std::sync::Condvar,
+)> = std::sync::LazyLock::new(|| {
+    (
+        std::sync::Mutex::new(std::collections::HashSet::new()),
+        std::sync::Condvar::new(),
+    )
+});
+
+/// How long a waiter re-checks the guard flag before giving up and reporting
+/// "already initialized". Only reached if the owning thread never released,
+/// which a well-formed C++ program cannot do (`release`/`abort` always follow).
+const CXA_GUARD_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// `__cxa_guard_acquire(guard) -> int`: the Itanium C++ ABI entry protecting a
+/// function-local `static`. Returns **1** when this caller must run the
+/// initializer (and now owns the guard), **0** when the object is already
+/// constructed.
+///
+/// The guard object's first byte is the "initialized" flag. Guest threads can
+/// reach the same static concurrently, so the read-check-claim is made atomic
+/// under a host mutex: a thread that finds another already initializing waits
+/// for the flag rather than constructing the object a second time — running a
+/// C++ static constructor twice is exactly the corruption this guard exists to
+/// prevent.
+///
+/// Measured: A Plague Tale Requiem stops its boot on this import.
+fn hle_cxa_guard_acquire(ctx: &HleContext, args: &[u64]) -> u64 {
+    let guard = args.first().copied().unwrap_or(0);
+    if guard == 0 {
+        return 0;
+    }
+    let (lock, condvar) = &*CXA_GUARDS;
+    let mut in_progress = lock.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        let mut flag = [0u8; 1];
+        if !ctx.mem.read(guard, &mut flag) {
+            // An unreadable guard cannot be claimed safely; report "done" so the
+            // guest skips construction rather than building into bad memory.
+            return 0;
+        }
+        if flag[0] != 0 {
+            return 0;
+        }
+        if in_progress.insert(guard) {
+            return 1;
+        }
+        // Another guest thread owns this guard: wait for its release/abort.
+        let (guard_set, timeout) = condvar
+            .wait_timeout(in_progress, CXA_GUARD_WAIT_SLICE)
+            .unwrap_or_else(|p| p.into_inner());
+        in_progress = guard_set;
+        if timeout.timed_out() && !in_progress.contains(&guard) {
+            // Owner released while we were not scheduled; loop re-reads the flag.
+            continue;
+        }
+    }
+}
+
+/// `__cxa_guard_release(guard)`: the initializer finished — mark the static
+/// constructed and wake anyone waiting on it.
+fn hle_cxa_guard_release(ctx: &HleContext, args: &[u64]) -> u64 {
+    let guard = args.first().copied().unwrap_or(0);
+    if guard == 0 {
+        return 0;
+    }
+    let (lock, condvar) = &*CXA_GUARDS;
+    let mut in_progress = lock.lock().unwrap_or_else(|p| p.into_inner());
+    let _ = ctx.mem.write(guard, &[1u8]);
+    in_progress.remove(&guard);
+    condvar.notify_all();
+    0
+}
+
+/// `__cxa_guard_abort(guard)`: the initializer threw — release the claim WITHOUT
+/// marking the static constructed, so the next caller retries it.
+fn hle_cxa_guard_abort(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let guard = args.first().copied().unwrap_or(0);
+    if guard == 0 {
+        return 0;
+    }
+    let (lock, condvar) = &*CXA_GUARDS;
+    let mut in_progress = lock.lock().unwrap_or_else(|p| p.into_inner());
+    in_progress.remove(&guard);
+    condvar.notify_all();
+    0
+}
+
+/// `_init_env()`: libc's pre-`main` environment initialiser.
+///
+/// XPS5X builds the process environment itself — `build_process_stack` lays out
+/// `argc`/`argv`/`envp`/`auxv` before `_start` — so there is nothing left for
+/// the guest CRT to set up here. Succeeding with zero matches both references:
+/// SharpEmu returns `rax = 0` / OK, and shadPS4 stubs it.
+///
+/// Measured: A Plague Tale Requiem stops its boot on this import.
+fn hle_init_env(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    0
 }
 
 /// The public C ABI is exposed through both the generic libc view used by
@@ -523,6 +640,312 @@ fn hle_strchr(ctx: &HleContext, args: &[u64]) -> u64 {
     }
 }
 
+/// Saved scan position for [`hle_strtok`] — C's `strtok` is stateful across
+/// calls. Classic `strtok` keeps one global cursor (that is exactly why it is
+/// not re-entrant), and this mirrors it rather than inventing per-thread state
+/// the guest would not expect.
+static STRTOK_SAVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Real `strtok(str, delim)`: return the next token in `str`, writing a NUL over
+/// the delimiter that ends it and remembering where to resume.
+///
+/// `str == NULL` continues the previous string, per the C contract. Returns
+/// `NULL` once the string is exhausted. The token is delimited **in guest
+/// memory** — this function genuinely mutates the caller's buffer, as the real
+/// one does.
+///
+/// Measured: A Plague Tale Requiem stops its boot on this import.
+fn hle_strtok(ctx: &HleContext, args: &[u64]) -> u64 {
+    use std::sync::atomic::Ordering;
+
+    let s = args.first().copied().unwrap_or(0);
+    let delim_ptr = args.get(1).copied().unwrap_or(0);
+    debug!("strtok(str={s:#x}, delim={delim_ptr:#x})");
+
+    let start = if s != 0 {
+        s
+    } else {
+        STRTOK_SAVE.load(Ordering::Relaxed)
+    };
+    if start == 0 {
+        return 0;
+    }
+    let Some(delims) = crate::fmt::read_cstr(ctx.mem, delim_ptr) else {
+        warn!("strtok: unreadable delimiter set at {delim_ptr:#x}");
+        return 0;
+    };
+
+    let read_byte = |addr: u64| -> Option<u8> {
+        let mut b = [0u8; 1];
+        ctx.mem.read(addr, &mut b).then_some(b[0])
+    };
+
+    // Skip leading delimiters.
+    let mut p = start;
+    let mut scanned = 0u64;
+    let token = loop {
+        if scanned >= STRLEN_MAX_SCAN {
+            STRTOK_SAVE.store(0, Ordering::Relaxed);
+            return 0;
+        }
+        match read_byte(p) {
+            None | Some(0) => {
+                STRTOK_SAVE.store(0, Ordering::Relaxed);
+                return 0;
+            }
+            Some(b) if delims.contains(&b) => {
+                p = p.wrapping_add(1);
+                scanned += 1;
+            }
+            Some(_) => break p,
+        }
+    };
+
+    // Run to the delimiter that ends this token (or the string's end).
+    loop {
+        if scanned >= STRLEN_MAX_SCAN {
+            break;
+        }
+        match read_byte(p) {
+            None | Some(0) => {
+                STRTOK_SAVE.store(0, Ordering::Relaxed);
+                return token;
+            }
+            Some(b) if delims.contains(&b) => {
+                // Terminate the token in place and resume after it.
+                let _ = ctx.mem.write(p, &[0u8]);
+                STRTOK_SAVE.store(p.wrapping_add(1), Ordering::Relaxed);
+                return token;
+            }
+            Some(_) => {
+                p = p.wrapping_add(1);
+                scanned += 1;
+            }
+        }
+    }
+    STRTOK_SAVE.store(0, Ordering::Relaxed);
+    token
+}
+
+/// A SysV `va_list` walked out of guest memory, yielding the integer varargs in
+/// call order so it can drive [`crate::fmt::format_c`] exactly like the
+/// register slice a plain `printf` hands it.
+///
+/// The ABI's `va_list` is a 24-byte object: `gp_offset` (u32), `fp_offset`
+/// (u32), `overflow_arg_area` (ptr), `reg_save_area` (ptr). Integer varargs
+/// come from `reg_save_area + gp_offset` while `gp_offset < 48` (the six GP
+/// registers), and from `overflow_arg_area` — the caller's stack — afterwards.
+///
+/// Like the register-slice path, only *integer* varargs are walked; a `%f`
+/// would need the XMM save area, which no caller has required yet.
+struct GuestVaList<'a> {
+    mem: &'a dyn crate::GuestMemory,
+    gp_offset: u32,
+    overflow_arg_area: u64,
+    reg_save_area: u64,
+}
+
+impl<'a> GuestVaList<'a> {
+    /// Read the `va_list` object at guest address `ap`.
+    fn read(mem: &'a dyn crate::GuestMemory, ap: u64) -> Option<Self> {
+        let mut head = [0u8; 24];
+        if ap == 0 || !mem.read(ap, &mut head) {
+            return None;
+        }
+        Some(Self {
+            mem,
+            gp_offset: u32::from_le_bytes(head[0..4].try_into().ok()?),
+            overflow_arg_area: u64::from_le_bytes(head[8..16].try_into().ok()?),
+            reg_save_area: u64::from_le_bytes(head[16..24].try_into().ok()?),
+        })
+    }
+}
+
+impl Iterator for GuestVaList<'_> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<u64> {
+        /// Six 8-byte GP register slots live at the head of the save area.
+        const GP_SAVE_BYTES: u32 = 48;
+
+        let addr = if self.gp_offset < GP_SAVE_BYTES {
+            let addr = self.reg_save_area.checked_add(u64::from(self.gp_offset))?;
+            self.gp_offset += 8;
+            addr
+        } else {
+            let addr = self.overflow_arg_area;
+            self.overflow_arg_area = addr.checked_add(8)?;
+            addr
+        };
+        let mut word = [0u8; 8];
+        if !self.mem.read(addr, &mut word) {
+            return None;
+        }
+        Some(u64::from_le_bytes(word))
+    }
+}
+
+/// Real `vsnprintf(str, size, format, ap)`: [`hle_snprintf`] with the varargs
+/// taken from a guest `va_list` instead of the caller's registers. Truncation
+/// and the "length that *would* have been written" return value follow the same
+/// C contract.
+///
+/// Measured: A Plague Tale Requiem stops its boot on this import.
+fn hle_vsnprintf(ctx: &HleContext, args: &[u64]) -> u64 {
+    let buf = args.first().copied().unwrap_or(0);
+    let size = args.get(1).copied().unwrap_or(0);
+    let fmt_ptr = args.get(2).copied().unwrap_or(0);
+    let ap = args.get(3).copied().unwrap_or(0);
+    debug!("vsnprintf(buf={buf:#x}, size={size:#x}, fmt={fmt_ptr:#x}, ap={ap:#x})");
+
+    let Some(fmt) = crate::fmt::read_cstr(ctx.mem, fmt_ptr) else {
+        warn!("vsnprintf: unreadable format string at {fmt_ptr:#x}");
+        return 0;
+    };
+    let Some(mut varargs) = GuestVaList::read(ctx.mem, ap) else {
+        warn!("vsnprintf: unreadable va_list at {ap:#x}");
+        return 0;
+    };
+    let formatted = crate::fmt::format_c(&fmt, &mut varargs, ctx.mem);
+    let full_len = formatted.len() as u64;
+
+    if size > 0 {
+        let cap = usize::try_from(size - 1).unwrap_or(usize::MAX);
+        let n = formatted.len().min(cap);
+        let mut out = formatted;
+        out.truncate(n);
+        out.push(0);
+        if !ctx.mem.write(buf, &out) {
+            warn!(
+                "vsnprintf: failed to write {} bytes to buf={buf:#x}",
+                out.len()
+            );
+        }
+    }
+    full_len
+}
+
+/// Real `sincosf(float x, float *sinp, float *cosp)`: write `sin(x)` and
+/// `cos(x)` through the two out-pointers.
+///
+/// `x` arrives in **XMM0**, not in an integer register, so it is read from
+/// [`HleContext::float_arg_f32`]; the two pointers are the first two integer
+/// arguments. Computing this without the real `x` would hand the title silently
+/// wrong trigonometry, so the float-argument channel exists precisely for
+/// functions like this one.
+///
+/// Measured: A Plague Tale Requiem stops its boot on this import.
+fn hle_sincosf(ctx: &HleContext, args: &[u64]) -> u64 {
+    let sin_out = args.first().copied().unwrap_or(0);
+    let cos_out = args.get(1).copied().unwrap_or(0);
+    let x = ctx.float_arg_f32(0);
+    debug!("sincosf(x={x}, sinp={sin_out:#x}, cosp={cos_out:#x})");
+
+    if sin_out != 0 && !ctx.mem.write(sin_out, &x.sin().to_le_bytes()) {
+        warn!("sincosf: sin out-ptr {sin_out:#x} not writable");
+    }
+    if cos_out != 0 && !ctx.mem.write(cos_out, &x.cos().to_le_bytes()) {
+        warn!("sincosf: cos out-ptr {cos_out:#x} not writable");
+    }
+    0
+}
+
+/// Real `wcslen(s)`: number of wide characters before the terminating null.
+///
+/// `wchar_t` is **32-bit** on the PS5's BSD/LLVM ABI (not 16-bit as on
+/// Windows), so this counts 4-byte units. The scan is bounded by
+/// [`STRLEN_MAX_SCAN`] characters, like [`hle_strlen`], so a wild or
+/// unterminated guest pointer cannot spin forever; an unreadable unit ends the
+/// scan and returns the count so far.
+///
+/// Measured: A Plague Tale Requiem stops its boot on this import.
+fn hle_wcslen(ctx: &HleContext, args: &[u64]) -> u64 {
+    let s = args.first().copied().unwrap_or(0);
+    debug!("wcslen(s={s:#x})");
+    if s == 0 {
+        return 0;
+    }
+    let mut count = 0u64;
+    let mut unit = [0u8; 4];
+    while count < STRLEN_MAX_SCAN {
+        let Some(addr) = s.checked_add(count.wrapping_mul(4)) else {
+            break;
+        };
+        if !ctx.mem.read(addr, &mut unit) {
+            warn!("wcslen: unreadable wide char at {addr:#x} (after {count})");
+            break;
+        }
+        if u32::from_le_bytes(unit) == 0 {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
+/// Real `wcscpy(dst, src)`: copy the wide string at `src` — including its
+/// 4-byte null terminator — to `dst`, returning `dst`.
+///
+/// Uses [`hle_wcslen`]'s bounded scan to size the copy, so an unterminated
+/// source cannot run away. Mirrors [`hle_strcpy`]: an unreadable source or
+/// unwritable destination is logged and `dst` is still returned, because the
+/// ABI has no way to report failure.
+///
+/// Measured: A Plague Tale Requiem stops its boot on this import.
+fn hle_wcscpy(ctx: &HleContext, args: &[u64]) -> u64 {
+    let dst = args.first().copied().unwrap_or(0);
+    let src = args.get(1).copied().unwrap_or(0);
+    debug!("wcscpy(dst={dst:#x}, src={src:#x})");
+    if dst == 0 || src == 0 {
+        return dst;
+    }
+
+    // Characters, then bytes including the terminator.
+    let chars = hle_wcslen(ctx, &[src]);
+    let Ok(bytes) = usize::try_from((chars + 1).saturating_mul(4)) else {
+        return dst;
+    };
+    let mut buf = vec![0u8; bytes];
+    if !ctx.mem.read(src, &mut buf) {
+        warn!("wcscpy: unreadable source at {src:#x} ({chars} wide chars)");
+        return dst;
+    }
+    // `wcslen` stops at the terminator, so force it rather than trusting the
+    // trailing unit we just read.
+    buf[bytes - 4..].fill(0);
+    if !ctx.mem.write(dst, &buf) {
+        warn!("wcscpy: failed to write {bytes} bytes to dst={dst:#x}");
+    }
+    dst
+}
+
+/// Real `strcspn(s, reject)`: the length of the initial segment of `s` made up
+/// of bytes **not** in `reject` — i.e. the offset of the first rejected byte,
+/// or the whole length if none match.
+///
+/// An unreadable operand yields `0`, the conservative answer: the caller then
+/// behaves as though `s` was rejected immediately rather than scanning past
+/// memory we could not validate.
+///
+/// Measured: A Plague Tale Requiem stops its boot on this import.
+fn hle_strcspn(ctx: &HleContext, args: &[u64]) -> u64 {
+    let s = args.first().copied().unwrap_or(0);
+    let reject = args.get(1).copied().unwrap_or(0);
+    debug!("strcspn(s={s:#x}, reject={reject:#x})");
+
+    let (Some(bytes), Some(set)) = (
+        crate::fmt::read_cstr(ctx.mem, s),
+        crate::fmt::read_cstr(ctx.mem, reject),
+    ) else {
+        warn!("strcspn: unreadable operand (s={s:#x}, reject={reject:#x})");
+        return 0;
+    };
+    bytes
+        .iter()
+        .position(|byte| set.contains(byte))
+        .unwrap_or(bytes.len()) as u64
+}
+
 /// Real `strrchr(s, c)`: guest address of the *last* byte equal to `c`, or
 /// `0`. `c == 0` matches the terminating NUL.
 fn hle_strrchr(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -920,6 +1343,81 @@ mod tests {
         let written = hle_printf(&ctx, &[0x100, 0x200, 2, 3, 5]);
         assert_eq!(kernel.console.contents(), "hello world, 2 + 3 = 5\n");
         assert_eq!(written, "hello world, 2 + 3 = 5\n".len() as u64);
+    }
+
+    /// `sincosf` takes its input in XMM0, which reaches a handler through
+    /// `HleContext::float_args` rather than the integer slice. `test_ctx` zeroes
+    /// that channel, so `x == 0.0` — which makes the expected results exact
+    /// (`sin 0 = 0`, `cos 0 = 1`) and proves both out-params are written through
+    /// the right pointers, in the right order.
+    #[test]
+    fn sincosf_reads_the_float_channel_and_writes_both_out_params() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        const SIN_OUT: u64 = 0x400;
+        const COS_OUT: u64 = 0x410;
+
+        // Poison both slots so a missing write is visible.
+        assert!(mem.write(SIN_OUT, &0xDEAD_BEEFu32.to_le_bytes()));
+        assert!(mem.write(COS_OUT, &0xDEAD_BEEFu32.to_le_bytes()));
+
+        assert_eq!(
+            ctx.float_arg_f32(0),
+            0.0,
+            "test_ctx zeroes the float channel"
+        );
+        hle_sincosf(&ctx, &[SIN_OUT, COS_OUT]);
+
+        let mut buf = [0u8; 4];
+        assert!(mem.read(SIN_OUT, &mut buf));
+        assert_eq!(f32::from_le_bytes(buf), 0.0, "sin(0) written to arg0");
+        assert!(mem.read(COS_OUT, &mut buf));
+        assert_eq!(f32::from_le_bytes(buf), 1.0, "cos(0) written to arg1");
+
+        // Null out-pointers must not fault.
+        hle_sincosf(&ctx, &[0, 0]);
+    }
+
+    /// The Itanium C++ static-guard contract: the first caller is told to run
+    /// the initializer (1), and once it releases, every later caller is told to
+    /// skip it (0). Getting this backwards double-constructs C++ statics.
+    #[test]
+    fn cxa_guard_runs_a_static_initializer_exactly_once() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        const GUARD: u64 = 0x300;
+
+        assert!(mem.write(GUARD, &[0u8; 8]), "guard starts zeroed");
+        assert_eq!(
+            hle_cxa_guard_acquire(&ctx, &[GUARD]),
+            1,
+            "the first caller must run the initializer"
+        );
+        hle_cxa_guard_release(&ctx, &[GUARD]);
+        assert_eq!(
+            hle_cxa_guard_acquire(&ctx, &[GUARD]),
+            0,
+            "after release the static is constructed; later callers must skip"
+        );
+
+        // An aborted initializer leaves the static unconstructed, so the next
+        // caller must be told to retry it.
+        const RETRY: u64 = 0x320;
+        assert!(mem.write(RETRY, &[0u8; 8]));
+        assert_eq!(hle_cxa_guard_acquire(&ctx, &[RETRY]), 1);
+        hle_cxa_guard_abort(&ctx, &[RETRY]);
+        assert_eq!(
+            hle_cxa_guard_acquire(&ctx, &[RETRY]),
+            1,
+            "an aborted construction must be retried, not skipped"
+        );
+
+        // A null guard is not a crash.
+        assert_eq!(hle_cxa_guard_acquire(&ctx, &[0]), 0);
     }
 
     #[test]

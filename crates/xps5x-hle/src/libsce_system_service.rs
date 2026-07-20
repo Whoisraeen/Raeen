@@ -39,6 +39,28 @@ pub fn register(registry: &HleRegistry) {
         "sceSystemServiceGetDisplaySafeAreaInfo",
         hle_get_safe_area,
     );
+    // `sceSystemServiceGetHdrToneMapLuminance()` takes no arguments and simply
+    // reports success: XPS5X presents an SDR display, so there is no HDR
+    // tone-map curve to report. shadPS4 stubs it identically
+    // (`systemservice.cpp:1747`). Measured: Until Dawn stops its boot here.
+    registry.register(
+        "libSceSystemService",
+        "sceSystemServiceGetHdrToneMapLuminance",
+        hle_ok,
+    );
+    // Notice-screen skip flag. Reporting 0 (do not skip) is the neutral answer
+    // and matches shadPS4, which stubs all three of these
+    // (`scripts/aerolib.inl`: 3RQ5aQfnstU / Q3utJvma4Mo / 8Lo6Zv94aho). The
+    // setters are registered alongside the getter because a title that queries
+    // the flag during boot generally sets it a moment later.
+    // Measured: ASTRO.BOT stops its boot on the getter.
+    for f in [
+        "sceSystemServiceGetNoticeScreenSkipFlag",
+        "sceSystemServiceSetNoticeScreenSkipFlag",
+        "sceSystemServiceDisableNoticeScreenSkipFlagAutoSet",
+    ] {
+        registry.register("libSceSystemService", f, hle_ok);
+    }
     registry.register(
         "libSceSystemService",
         "sceSystemServiceHideSplashScreen",

@@ -33,6 +33,22 @@ pub fn register(registry: &HleRegistry) {
         "sceNpWebApi2CreateUserContext",
         hle_create_user_context,
     );
+    registry.register(
+        "libSceNpWebApi2",
+        "sceNpWebApi2PushEventCreateHandle",
+        hle_push_event_create_handle,
+    );
+}
+
+/// `sceNpWebApi2PushEventCreateHandle(...)`: refuse, for exactly the reason
+/// [`hle_create_user_context`] refuses. A positive handle would tell the title a
+/// live PSN push channel exists, and it would then wait on events that can never
+/// arrive; an error makes its online layer back off to offline instead.
+///
+/// Measured: Until Dawn stops its boot on this import.
+fn hle_push_event_create_handle(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    tracing::debug!("sceNpWebApi2PushEventCreateHandle -> INVALID_ARGUMENT (offline)");
+    NP_WEB_API2_ERROR_INVALID_ARGUMENT
 }
 
 /// `sceNpWebApi2CreateUserContext(...)`: with no PSN backend, **refuse** to

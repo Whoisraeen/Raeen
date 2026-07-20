@@ -87,6 +87,11 @@ pub fn register(registry: &HleRegistry) {
         "scePthreadMutexattrSettype",
         hle_mutexattr_settype,
     );
+    registry.register(
+        "libkernel",
+        "scePthreadMutexattrSetprotocol",
+        hle_mutexattr_setprotocol,
+    );
 
     registry.register("libkernel", "scePthreadRwlockInit", hle_rwlock_init);
     registry.register("libkernel", "scePthreadRwlockDestroy", hle_rwlock_destroy);
@@ -481,6 +486,28 @@ fn hle_mutexattr_settype(ctx: &HleContext, args: &[u64]) -> u64 {
     ctx.kernel
         .pthread_mutex_attrs
         .insert(attr_addr, normalize_type(ty));
+    OK
+}
+
+/// `scePthreadMutexattrSetprotocol(attr, protocol)`: select the mutex's
+/// priority protocol — `PTHREAD_PRIO_NONE` (0), `PTHREAD_PRIO_INHERIT` (1), or
+/// `PTHREAD_PRIO_PROTECT` (2).
+///
+/// The protocol is validated and accepted but deliberately **not modelled**:
+/// XPS5X maps guest mutexes onto host mutexes, which expose no priority
+/// inheritance. That choice only affects scheduling latency under contention —
+/// never mutual exclusion — so ignoring it cannot corrupt guest state, unlike
+/// faking a handle would. An out-of-range protocol is still rejected so a guest
+/// that checks the ABI sees POSIX behaviour.
+///
+/// Measured: Until Dawn calls this during early thread setup and stops dead
+/// when it is unresolved.
+fn hle_mutexattr_setprotocol(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let attr_addr = args.first().copied().unwrap_or(0);
+    let protocol = args.get(1).copied().unwrap_or(0) as i32;
+    if attr_addr == 0 || !(0..=2).contains(&protocol) {
+        return EINVAL;
+    }
     OK
 }
 

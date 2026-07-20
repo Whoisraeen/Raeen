@@ -2050,6 +2050,27 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                     0
                 }
             };
+            // SysV passes float/double arguments in XMM0..XMM7, which never
+            // appear in the integer `args` slice. Hand the low half of each to
+            // the handler so a function like `sincosf(float, float*, float*)`
+            // can read its value instead of guessing it.
+            //
+            // SAFETY: `context` is the live trap CONTEXT captured by the VEH.
+            // `Anonymous` is a union of `FltSave` (XSAVE_FORMAT) and the
+            // per-register view; both alias the same bytes, so reading the
+            // `XmmRegisters` array is valid however the OS filled it. The
+            // floating-point state is always present here — CONTEXT_FLOATING_POINT
+            // is part of the CONTEXT_FULL an exception handler receives — and
+            // `zip` bounds the read to the 16-entry array. `Low` is a plain
+            // `u64` field of a `repr(C)` POD.
+            let float_args = {
+                let mut xmm = [0u64; 8];
+                let saved = unsafe { &context.Anonymous.FltSave.XmmRegisters };
+                for (slot, reg) in xmm.iter_mut().zip(saved.iter()) {
+                    *slot = reg.Low;
+                }
+                xmm
+            };
             let hle_ctx = HleContext {
                 kernel,
                 services: kernel,
@@ -2060,6 +2081,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 guest_threads: ctx,
                 caller_return_addr,
                 caller_rsp: context.Rsp,
+                float_args,
             };
             ctx.active_hle
                 .set(Some((idx, args[..6].try_into().unwrap())));

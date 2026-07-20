@@ -491,10 +491,41 @@ pub struct HleContext<'a> {
     /// return address). Diagnostic only (0 when unavailable): lets a handler
     /// walk the caller's stack for a return-address chain.
     pub caller_rsp: u64,
+    /// The **floating-point** arguments: the low 64 bits of `XMM0..XMM7`, in
+    /// SysV order.
+    ///
+    /// The integer arguments a handler receives as `&[u64]` come from
+    /// `RDI/RSI/RDX/RCX/R8/R9`, but the SysV ABI passes `float`/`double`
+    /// arguments in the XMM registers instead — they are *not* in that slice
+    /// and are invisible without this. A handler for a function like
+    /// `sincosf(float x, float *s, float *c)` reads `x` here and its two
+    /// pointers from the integer slice.
+    ///
+    /// Interpret as `f32::from_bits(bits as u32)` for a `float` argument, or
+    /// `f64::from_bits(bits)` for a `double`. Zeroed in tests and on any path
+    /// that has no register context.
+    pub float_args: [u64; 8],
 }
 
-/// HLE function signature: takes a dispatch context and integer arguments,
-/// returns a result.
+impl HleContext<'_> {
+    /// The `n`-th SysV floating-point argument as an `f32` (a `float`), read
+    /// from `XMM{n}`'s low half. Out-of-range indices yield `0.0` rather than
+    /// panicking, matching how the integer-argument slice degrades.
+    #[must_use]
+    pub fn float_arg_f32(&self, n: usize) -> f32 {
+        f32::from_bits(self.float_args.get(n).copied().unwrap_or(0) as u32)
+    }
+
+    /// The `n`-th SysV floating-point argument as an `f64` (a `double`).
+    #[must_use]
+    pub fn float_arg_f64(&self, n: usize) -> f64 {
+        f64::from_bits(self.float_args.get(n).copied().unwrap_or(0))
+    }
+}
+
+/// HLE function signature: takes a dispatch context and **integer** arguments,
+/// returns a result. Floating-point arguments arrive separately, in
+/// [`HleContext::float_args`] — the SysV ABI passes them in XMM registers.
 pub type HleFunction = fn(&HleContext, &[u64]) -> u64;
 
 fn canonical_provider_name(provider: &str) -> String {
@@ -971,6 +1002,7 @@ pub(crate) fn test_ctx_with_gpu<'a>(
         guest_threads: &NO_GUEST_THREADS,
         caller_return_addr: 0,
         caller_rsp: 0,
+        float_args: [0; 8],
     }
 }
 

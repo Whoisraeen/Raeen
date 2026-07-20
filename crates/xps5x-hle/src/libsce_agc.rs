@@ -146,6 +146,29 @@ pub fn register(registry: &HleRegistry) {
         hle_cb_release_mem,
     );
     registry.register("libSceAgc", "sceAgcDcbSetFlip", hle_dcb_set_flip);
+    // Measured ASTRO.BOT: the first libSceAgc import it actually calls. Base-PS5
+    // (non-Trinity) is the branch that goes on to submit a DCB — see
+    // `hle_get_is_trinity_mode`.
+    registry.register(
+        "libSceAgc",
+        "sceAgcGetIsTrinityMode",
+        hle_get_is_trinity_mode,
+    );
+    // Known ONLY by its NID `dolOmWH+huQ` — no catalogue has the name, so bind
+    // the measured identity explicitly (hashing this placeholder label would
+    // yield a different NID and leave the title's import unresolved).
+    registry.register_nid(
+        "libSceAgc",
+        "sceAgcUnknownDolOmWHhuQ",
+        0x7689_4e99_61fe_86e4,
+        hle_unknown_agc_dol_om_wh,
+    );
+    registry.register_nid(
+        "libSceAgc",
+        "sceAgcUnknownFd5Bp5tGTgo",
+        0x7dde_41a7_9b46_4e0a,
+        hle_unknown_agc_fd5_bp5t,
+    );
     registry.register("libSceAgc", "sceAgcAcbResetQueue", hle_acb_reset_queue);
     registry.register(
         "libSceAgc",
@@ -298,6 +321,24 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcDriverAgrSubmitDcb",
         0x0211_afa4_84eb_7f83,
         hle_driver_submit_dcb,
+    );
+    // Same story for async-compute submission and GPU event registration: both
+    // were implemented but registered ONLY under `libSceAgc`, while the measured
+    // ASTRO.BOT title imports them from `libSceAgcDriver`. Resolution is
+    // provider-aware, so the implementations were unreachable — the title
+    // reported them missing at the first GPU submission. NIDs are the measured
+    // retail identities, not derived from these labels.
+    registry.register_nid(
+        "libSceAgcDriver",
+        "sceAgcDriverSubmitAcb",
+        0x8124_67af_bf45_f2d4,
+        hle_driver_submit_acb,
+    );
+    registry.register_nid(
+        "libSceAgcDriver",
+        "sceAgcDriverAddEqEvent",
+        0xc36a_c986_60fe_76c1,
+        hle_driver_add_eq_event,
     );
     registry.register("libSceAgc", "sceAgcDriverSubmitDcb", hle_driver_submit_dcb);
     registry.register("libSceAgc", "sceAgcDriverSubmitAcb", hle_driver_submit_acb);
@@ -454,6 +495,84 @@ fn hle_get_resource_max_name_length(ctx: &HleContext, args: &[u64]) -> u64 {
 
 /// `sceAgcSuspendPoint()`: a no-op suspension marker; succeeds.
 fn hle_suspend_point(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    0
+}
+
+/// `sceAgcGetIsTrinityMode()`: is this console a PS5 **Pro** (codename
+/// "Trinity")? XPS5X emulates a base PS5, so this is always false.
+///
+/// The flag is returned **directly in EAX**, not through an out-parameter —
+/// measured at the retail ASTRO.BOT call site: the return address
+/// `module+0x6f3b3f4` holds `test eax,eax; jnz +0x0e`, so the caller consumes
+/// the return value. On the ZERO (base-PS5) branch it falls through to
+/// `lea rdi,<BSS global>; call sceAgcDriverSubmitDcb` — i.e. the *non*-Trinity
+/// path is the one that submits GPU work, which is exactly the path this
+/// emulator can execute. Answering "true" would route the title down
+/// PS5-Pro-only paths XPS5X does not implement.
+///
+/// The name for the imported NID `0x05f0436466ed8bb0` (`BfBDZGbti7A`) was
+/// recovered from SharpEmu's `aerolib` symbol catalogue; no emulator in the
+/// reference set implements this function.
+fn hle_get_is_trinity_mode(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    0
+}
+
+/// Unidentified `libSceAgc` entry point, known only by its NID `fd5Bp5tGTgo`
+/// (`0x7dde_41a7_9b46_4e0a`). Like its sibling below it appears in no reference
+/// catalogue, so it is bound by NID and answers with plain success.
+///
+/// Measured ABI at the retail ASTRO.BOT call site (`module+0x4695c2`): it is
+/// the fallback the *previous* unknown's NULL branch makes —
+/// `mov [rbx+0x308..0x318], 0; lea rdi,[rbx+0x320]; mov rsi,r15; mov rdx,r12;
+/// call` — so the argument shape is the same `f(ctx_or_out, a, b)`. The caller
+/// consumes the **return value**: `cmp eax, 0x8a6c0008; je +0x0b`. That one
+/// expected error skips zeroing `[rbx+0x328]`; every other value (including
+/// success) takes the branch that zeroes it and continues — no abort on either
+/// side.
+///
+/// Returning `0` therefore lands in the caller's well-handled path and leaves
+/// the object region zeroed, consistent with the "no object" state the
+/// surrounding code already established. Warned once so the gap stays visible.
+fn hle_unknown_agc_fd5_bp5t(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "libSceAgc NID 0x7dde41a79b464e0a (fd5Bp5tGTgo) is unidentified: returning \
+             success, which leaves the caller's object region zeroed. If the title later \
+             misbehaves around AGC setup, identify this alongside dolOmWH+huQ."
+        );
+    }
+    0
+}
+
+/// Unidentified `libSceAgc` entry point, known only by its NID `dolOmWH+huQ`
+/// (`0x7689_4e99_61fe_86e4`). The name is in **no** reference catalogue —
+/// SharpEmu's `aerolib`, Kyty Gen5 and shadPS4 all lack it — so it is bound by
+/// NID and reports "no object" rather than guessing a behaviour.
+///
+/// Measured ABI at the retail ASTRO.BOT call site (`module+0x469538`):
+/// `f(void *out /* rdi */, a /* rsi */, b /* rdx */)`. The caller pre-zeroes the
+/// 16-byte local it passes as `out` (`vmovups [rbp-0x130], xmm0`), **ignores the
+/// return value entirely**, then reads `*out` back and branches on NULL:
+/// `mov r14,[rbp-0x130]; test r14,r14; jz +0x4c`. That NULL branch is graceful —
+/// it zero-fills the owning struct's fields (`[rbx+0x308/0x310/0x318]`) and
+/// continues into the next call, so a missing object is a state the title
+/// already handles.
+///
+/// Therefore: succeed, and leave `*out` exactly as the caller zeroed it. This
+/// deliberately does NOT fabricate a handle — inventing one would hand the guest
+/// a pointer to an object that does not exist, which is the silent-corruption
+/// failure mode this project prefers a loud gap over. Warned once so the gap
+/// stays visible in logs.
+fn hle_unknown_agc_dol_om_wh(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "libSceAgc NID 0x76894e9961fe86e4 (dolOmWH+huQ) is unidentified: reporting \
+             'no object' (out-param left NULL, which the caller handles). If the title \
+             later misbehaves around AGC setup, this is the first thing to identify."
+        );
+    }
     0
 }
 

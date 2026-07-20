@@ -774,8 +774,28 @@ fn main() -> anyhow::Result<()> {
                         .map(|(id, chain)| format!("t{id}: {chain}"))
                         .collect();
                     bt.sort();
+                    // The title's OWN log output (its `write`s to fd 1/2) is the
+                    // single most informative thing during a stall — it says what
+                    // the game thinks it is doing. It is otherwise only printed
+                    // when the run ends normally, which a hung title never does,
+                    // so surface the tail here.
+                    let console = kmon.console.contents();
+                    let console_tail = if console.is_empty() {
+                        "<empty>".to_owned()
+                    } else {
+                        let tail: String = console
+                            .lines()
+                            .rev()
+                            .take(25)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        format!("({} bytes, last 25 lines)\n{tail}", console.len())
+                    };
                     info!(
-                        "STALL_DUMP ({} threads):\n{}\nIN-FLIGHT HLE: {}\nHOST BACKTRACES:\n{}\nRIPs: {}{}",
+                        "STALL_DUMP ({} threads):\n{}\nIN-FLIGHT HLE: {}\nHOST BACKTRACES:\n{}\nRIPs: {}{}\nGUEST CONSOLE: {}",
                         lines.len(),
                         lines.join("\n"),
                         if inflight.is_empty() {
@@ -789,7 +809,8 @@ fn main() -> anyhow::Result<()> {
                             String::new()
                         } else {
                             format!("\nTIME IN HLE (top):\n{}", top.join("\n"))
-                        }
+                        },
+                        console_tail
                     );
                 }
             });

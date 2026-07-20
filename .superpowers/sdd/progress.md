@@ -1,4 +1,147 @@
+- ASTRO.BOT boot stall DIAGNOSED (2026-07-19) — it is NOT a missing symbol and
+  NOT a deadlock in our primitives; it is the title's own job system never being
+  woken. Three reusable diagnostics were added to get here:
+  * `sceKernelCreateEventFlag` now logs the flag's **name**. That immediately
+    identified every flag ASTRO parks on as AUDIO: `sndz_stream_task_notify`
+    (h=2), `SceSndzRenderNotify` (h=4), `SceSndzUpdateNotify`,
+    `SceSndzAudioOutBounce*`. Those waits return ETIMEDOUT (0x8002003c) on the
+    50 ms slice forever — idle audio, NOT the boot blocker.
+  * STALL_DUMP now includes the **guest console tail**. A hung title never
+    reaches the end-of-run console dump, so its own log was invisible. ASTRO's
+    says it is in `Setup MaterialPackedShaderBinaries` / `Material [...] is
+    Replaced` — engine material+shader setup — and the console is **frozen at
+    3086 bytes across 8 dumps over 200 s**, so it is genuinely stuck there, not
+    progressing slowly.
+  * `XPS5X_TRACE_SPIN=1` reports the guest caller of each `sceKernelUsleep`
+    once. ASTRO's main thread spins at **module+0xdd8e40**:
+    `cmp qword [rbp-0x5d8],0; jne exit; call usleep(1ms); call module+0xdefa40;
+    test eax,eax; jns loop` — i.e. *sleep until a worker sets my completion
+    flag*, polling an internal (non-import) helper.
+  * SIGNATURE: 103 `scePthreadCondWait` vs **1** `scePthreadCondSignal` and 0
+    broadcasts — the worker pool parks and is never woken, while the producer
+    (t1) sleeps waiting for it. 44 guest threads live. This is the SAME shape as
+    the open Dragon Ball task-drain (task #6), so it is likely one root cause.
+  * RULED OUT: async IO (no `sceKernelAio*` calls at all; 12 opens/5 reads all
+    synchronous) and VideoOut (only `sceVideoOutOpen` — the title never reaches
+    a flip/vblank, so the display path is not what it waits on).
+  * NEXT: find who is supposed to signal that condvar / set `[rbp-0x5d8]` —
+    trace the guest job-post path from `module+0xdefa40`, and check whether a
+    worker is blocked in a wait we satisfy incorrectly rather than never.
+
 # XPS5X session progress ledger
+
+- MILESTONE: **all 5 installed titles load and execute with ZERO unresolved
+  imports** (2026-07-19). Workspace `cargo test` 0 failures; touched-crate
+  clippy + fmt clean. Every title previously died on a missing symbol.
+  * ASTRO.BOT additionally cleared its whole `sce::Json` boot path. Implemented
+    `libsce_json.rs` properly rather than as stubs: `Value` and `String` payloads
+    live in host-side maps keyed by the guest `this` pointer (the C++ layout is
+    opaque, so a ctor/`set` that only returned `this` would leave the guest
+    reading garbage back out). Covers Value ctors + `set` for
+    bool/long/ulong/double/`const char*`/`const Value&`/`const String&`/
+    `ValueType`, String ctor/dtor, and both Itanium C1/C2 + D1/D2 variants.
+    `set(double)` is the first real consumer of the new float-argument channel.
+    Then: Share content-event callbacks and the notice-screen skip flags.
+  * **HONEST LIMIT — this is "loads and runs", NOT "boots to a menu."** All five
+    survive a 45-50 s bounded run instead of dying, but they then sit: Until Dawn
+    and Dragon Ball park in `sceKernelWaitEqueue`, and STALL_DUMP reports 0
+    registered guest threads at dump time even for titles observed creating 18-20
+    threads earlier in the same run. Nothing here demonstrates a rendered frame or
+    a reached menu. The next frontier is the WAIT/STALL class (tasks #6/#8) —
+    why the event-queue waits never wake — not missing symbols.
+
+
+- ALL-TITLES boot sweep — 4 of 5 installed games now load+execute with **zero
+  unresolved imports** (2026-07-19; hle 279, firmware 108/10/3/3, runtime 48/43
+  green; touched-crate clippy --no-deps + fmt clean; re-measured after every fix):
+  * Method: run every installed eboot headlessly (`--run-eboot`, 45 s bound),
+    read the reported unresolved import, fix, rebuild, re-measure. Twelve rounds.
+  * **PROVIDER-ALIAS BUG CLASS — the dominant finding.** Resolution is
+    provider-aware (`ModuleRegistry::resolve` keys on the importing symbol's
+    library), and several functions were **already implemented** but registered
+    under a library no title names. Each cost a game its boot:
+    - `gettimeofday`/`usleep` — registered `libScePosix`, imported `libkernel`
+      (Minecraft). Joined `clock_gettime`, fixed earlier the same way.
+    - `sceShareInitialize`/`sceShareSetContentParam` — registered
+      `libSceShareUtility`, imported `libSceShare` (Dragon Ball). An earlier pass
+      had DELETED the `libSceShare` spelling as a "wrong name"; it is real.
+    - `in6addr_any`/`in6addr_loopback` — the HLE data page registered ALL its
+      exports under `libkernel`, but Minecraft imports the IPv6 constants from
+      `libSceNet`. Now registered under both. (The stale comment there claimed
+      "resolve is by NID and ignores the declaring module" — it is not.)
+    - `sceAgcDriverSubmitAcb`/`sceAgcDriverAddEqEvent` — `libSceAgc` vs
+      `libSceAgcDriver` (ASTRO.BOT).
+  * New implementations (each measured as a title's live blocker): libc
+    `_init_env`, `__cxa_guard_acquire/release/abort` (Itanium static guards,
+    host-mutex + condvar so two guest threads cannot double-construct a static),
+    `strcspn`, `wcslen`, `wcscpy`, `strtok`, `vsnprintf` (with a real SysV
+    `va_list` walker — `GuestVaList` — reusable for the whole `v*printf`
+    family), `sincosf`; libkernel `scePthreadMutexattrSetprotocol`,
+    `sceKernelMapNamedFlexibleMemory` (the public spelling was missing while
+    `...Internal` existed), `sceKernelAvailableDirectMemorySize`,
+    `sceKernelIsTrinityMode`; `sceSystemServiceGetHdrToneMapLuminance`;
+    `sceNpWebApi2PushEventCreateHandle` (refuses, per this module's documented
+    offline policy); libSceRudp init/event-handler/IO-thread; `sce::Json::Value`
+    ctor/dtor.
+  * **NEW RUNTIME CAPABILITY — floating-point arguments.** HLE handlers only ever
+    saw integer registers, so any function taking a `float`/`double` (SysV passes
+    them in XMM0-7) was unimplementable without guessing. Added
+    `HleContext::float_args` (low 64 bits of XMM0..XMM7, filled from the trap
+    CONTEXT's `FltSave.XmmRegisters`) plus `float_arg_f32/f64` helpers. Two
+    construction sites, no change to the `HleFunction` signature. `sincosf` is
+    the first consumer; the whole libm surface needs it.
+  * **STATE (honest).** Minecraft, Until Dawn, A Plague Tale Requiem and Dragon
+    Ball all now run the full 45 s with no unresolved import — but they are
+    **stalling, not finishing a boot**: Until Dawn and Dragon Ball park in
+    `sceKernelWaitEqueue`, Minecraft's last call is `pthread_mutexattr_destroy`,
+    and none spawn many threads. Clearing the import walls moved them from
+    "dies instantly" to "runs and waits"; the remaining work is the WAIT/stall
+    class (tasks #6/#8), not missing symbols.
+  * **ASTRO.BOT** went furthest: past AGC init, **18 guest threads**, now blocked
+    on the `sce::Json` C++ library — 45 distinct mangled imports (Value ctors for
+    every type, `set*`, `referArray/Object/Value`, `serialize`, Array +
+    iterators, Object, String). That is a library port, not a stub: doing it
+    honestly needs a host-side object model keyed by the guest `this` pointer so
+    values round-trip instead of reading back garbage. Tracked as task #14.
+
+
+- ASTRO.BOT AGC wall — 4 blockers cleared, title now reaches shader creation
+  (2026-07-19, working tree; hle 277 + firmware 108/9/3/3 green, clippy+fmt
+  clean; measured against the retail title after each fix):
+  * **Repeatable technique established** for unknown NIDs: (a) recover the name
+    from SharpEmu's `aerolib.bin` catalogue — format is
+    `[u8 len][encoded-NID][u16 len][name]`, built from `scripts/ps5_names.txt`,
+    so `grep -a -o -P '<encodedNid>.{0,50}'` yields the name; (b) get the caller
+    from the runtime's guest-stack return-addr chain; (c) `--dump-vaddr` the
+    return address to read the ABI off the post-call instructions;
+    (d) `--resolve-got` any PLT thunk to name what the branch calls next.
+  * `sceAgcGetIsTrinityMode` (NID 0x05f0436466ed8bb0, name recovered from
+    aerolib; implemented by NO reference emulator). "Trinity" = PS5 **Pro**;
+    XPS5X emulates a base PS5 → returns 0. ABI proven from the call site:
+    `test eax,eax; jnz` on the return, so the flag comes back **directly in
+    EAX**, no out-param. The ZERO branch is the one that goes on to call
+    `sceAgcDriverSubmitDcb` — i.e. base-PS5 is the GPU-submitting path.
+  * **Two provider-alias bugs** (same class as the clock_gettime fix):
+    `sceAgcDriverSubmitAcb` (0x812467afbf45f2d4) and `sceAgcDriverAddEqEvent`
+    (0xc36ac98660fe76c1) were IMPLEMENTED but registered only under `libSceAgc`,
+    while Gen5 retail imports them from **`libSceAgcDriver`** — provider-aware
+    resolution left them unreachable. Bound both retail identities explicitly
+    (the file already had this precedent for SubmitDcb).
+  * Unnamed `dolOmWH+huQ` (0x76894e9961fe86e4) — in no catalogue. Call-site ABI:
+    `f(void* out, a, b)`; caller pre-zeroes the 16-byte `out`, IGNORES the
+    return, reads `*out` and branches on NULL, and that NULL branch is graceful
+    (zero-fills the owning struct and continues). So it reports "no object":
+    returns 0, leaves `*out` as zeroed, warns once. Deliberately does NOT
+    fabricate a handle. NOTE `hle_unknown_filler` (used for `qj7QZpgr9Uw`) is
+    command-buffer-specific and would have corrupted this caller's local.
+  * Tests: provider-aware `ModuleRegistry::resolve` assertions for the AGC
+    identities (`sce_agc_get_is_trinity_mode_...`,
+    `agc_driver_entry_points_resolve_from_the_libsceagcdriver_provider`).
+  * **Measured trajectory**: first-AGC-import → event-queue registration
+    (AddEqEvent ×many) → **`sceAgcCreateShader`**. NEXT WALL: unnamed
+    `fd5Bp5tGTgo` (0x7dde41a79b464e0a, libSceAgc), then the Cb/Acb/Dcb builder
+    batch (task #13).
+
 
 - ASTRO.BOT boot chain advanced — B0 verified + Slice 2 (2026-07-19, working
   tree; hle 108 + firmware 118 green incl. new provider-aware clock_gettime

@@ -35,6 +35,36 @@ pub fn register(registry: &HleRegistry) {
         "sceShareSetContentParam",
         hle_set_content_param,
     );
+
+    // Retail titles do not agree on the provider library for these symbols, and
+    // resolution is provider-aware: Dragon Ball Sparking Zero imports
+    // `sceShareInitialize` (NID 0x9c10c3eba922156f) naming **`libSceShare`**,
+    // so the `libSceShareUtility` registrations above do not satisfy it and the
+    // title stopped dead on an implementation that was already right here.
+    // Register both observed provider identities rather than picking one — an
+    // earlier pass deleted the `libSceShare` spelling as a "wrong name", which
+    // is what left this title unreachable.
+    registry.register("libSceShare", "sceShareInitialize", hle_initialize);
+    registry.register(
+        "libSceShare",
+        "sceShareSetContentParam",
+        hle_set_content_param,
+    );
+
+    // Accepting a content-event callback registration is honest without a Share
+    // backend: the callback is recorded as installed and simply never fires,
+    // because no broadcast/screenshot event can occur. Refusing would make a
+    // title treat Share setup as failed during boot. Registered under both
+    // provider spellings for the same reason as the pair above.
+    for lib in ["libSceShareUtility", "libSceShare"] {
+        registry.register(lib, "sceShareRegisterContentEventCallback", hle_ok);
+        registry.register(lib, "sceShareUnregisterContentEventCallback", hle_ok);
+    }
+}
+
+/// Accept-and-ignore for registrations that can never produce an event offline.
+fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    OK
 }
 
 /// `sceShareInitialize(memorySize, priority, affinityMask)`: a zero memory size

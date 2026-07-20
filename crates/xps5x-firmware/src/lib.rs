@@ -334,9 +334,27 @@ fn build_hle_data_page(registry: &mut registry::ModuleRegistry, page_base: u64) 
         &mut exports,
     );
 
-    // Registered under "libkernel" purely for the log line; `resolve` is by NID
-    // and ignores the declaring module.
+    // Most of this page is libkernel's, so it is registered there. But
+    // `resolve` is **provider-aware** — it keys on the library the importing
+    // symbol names, not the NID alone — so a constant must be registered under
+    // every provider a title actually imports it from. The IPv6 constants are
+    // libSceNet's (see their `add` above), and the measured Minecraft imports
+    // `in6addr_any` naming `libSceNet`; registering them only under `libkernel`
+    // left that import unresolved and stopped the title's boot.
+    let net_nids = [
+        dynlib::nid::nid_of("in6addr_any"),
+        dynlib::nid::nid_of("in6addr_loopback"),
+    ];
+    let net_exports: Vec<dynlib::SymbolExport> = exports
+        .iter()
+        .filter(|export| net_nids.contains(&export.nid))
+        .map(|export| dynlib::SymbolExport {
+            nid: export.nid,
+            value: export.value,
+        })
+        .collect();
     registry.register_module_exports_at("libkernel", &exports, page_base);
+    registry.register_module_exports_at("libSceNet", &net_exports, page_base);
     tracing::info!(
         "HLE data page: {} symbol(s), {:#x} bytes at {page_base:#x}",
         exports.len(),

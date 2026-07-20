@@ -14,7 +14,6 @@
 //! the M1-E scheduler.
 
 use crate::{HleContext, HleRegistry};
-use tracing::debug;
 use xps5x_core::subsystems::{EventUpdate, WaitKey, WaitOutcome, WakeReason};
 
 const OK: u64 = 0;
@@ -98,7 +97,18 @@ fn hle_create(ctx: &HleContext, args: &[u64]) -> u64 {
         ctx.services.delete_event(handle);
         return SCE_KERNEL_ERROR_EFAULT;
     }
-    debug!("sceKernelCreateEventFlag -> handle {handle:#x} attr {attr:#x} bits {initial:#x}");
+    // Log the NAME, not just the handle. Orbis event flags are named by the
+    // subsystem that owns them, so when a guest thread parks forever on a flag
+    // nothing sets, the name is what identifies which subsystem was supposed to
+    // signal it — the handle alone says nothing.
+    let name = name_buf
+        .split(|&b| b == 0)
+        .next()
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .unwrap_or_default();
+    tracing::info!(
+        "sceKernelCreateEventFlag {name:?} -> handle {handle:#x} attr {attr:#x} bits {initial:#x}"
+    );
     OK
 }
 

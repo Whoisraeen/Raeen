@@ -51,7 +51,15 @@ pub fn register(registry: &HleRegistry) {
     // register the same thin POSIX-ABI adapter under `libkernel` too. See the
     // `libkernel::register` POSIX-spelling block for the sibling time/memory
     // aliases done the same way.
+    //
+    // Measured per title: ASTRO.BOT stopped on `clock_gettime` and Minecraft on
+    // `gettimeofday` (NID 0x9fcf2fc770b99d6f), both naming `libkernel`. `usleep`
+    // is the same family and is aliased with them rather than waiting for a
+    // third title to trip over it. (`getpid` and `nanosleep` already have
+    // `libkernel` registrations in `libkernel::register`.)
     registry.register("libkernel", "clock_gettime", posix_clock_gettime);
+    registry.register("libkernel", "gettimeofday", posix_gettimeofday);
+    registry.register("libkernel", "usleep", posix_usleep);
 }
 
 /// Turn an SCE return (`0` on success, negative error code on failure) into the

@@ -30,6 +30,20 @@ static NEXT_NET_ID: AtomicU32 = AtomicU32::new(1);
 pub fn register(registry: &HleRegistry) {
     registry.register("libSceNet", "sceNetInit", hle_ok);
     registry.register("libSceNet", "sceNetTerm", hle_ok);
+    // libSceRudp (reliable-UDP P2P transport) lives beside the socket layer.
+    // Only the library init is modelled: it succeeds so a title's network stack
+    // finishes coming up, while the actual peer-to-peer calls stay unimplemented
+    // and will name themselves if a title reaches them. shadPS4 stubs
+    // `sceRudpInit` the same way (`rudp.cpp:96`, NID `amuBfI-AQc4`).
+    // Measured: ASTRO.BOT stops its boot here once it clears AGC init.
+    registry.register("libSceRudp", "sceRudpInit", hle_ok);
+    // Accepting the event handler registration keeps the title's network setup
+    // moving; with no peer transport there is simply never an event to deliver
+    // through it, which is the honest offline behaviour.
+    registry.register("libSceRudp", "sceRudpSetEventHandler", hle_ok);
+    // Accepting the internal I/O thread request without starting one is honest:
+    // there is no peer transport for it to service.
+    registry.register("libSceRudp", "sceRudpEnableInternalIOThread", hle_ok);
     registry.register("libSceNet", "sceNetPoolCreate", hle_new_id);
     registry.register("libSceNet", "sceNetPoolDestroy", hle_ok);
     registry.register("libSceNet", "sceNetResolverCreate", hle_new_id);
