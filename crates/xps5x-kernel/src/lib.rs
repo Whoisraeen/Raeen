@@ -195,13 +195,8 @@ pub struct OrbisKernel {
     /// per-thread and only populated under `XPS5X_TIME_HLE`'s timing overhead.
     /// Relaxed atomics; incremented in the dispatch path only when the env var
     /// is set.
-    pub hle_call_counts: DashMap<
-        String,
-        (
-            std::sync::atomic::AtomicU64,
-            std::sync::atomic::AtomicU64,
-        ),
-    >,
+    pub hle_call_counts:
+        DashMap<String, (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64)>,
     /// Guest pthread condition-variable wait queues, keyed by object address.
     pub pthread_conds: DashMap<u64, Arc<PthreadCond>>,
     /// Clock id set on a guest `pthread_condattr_t` by
