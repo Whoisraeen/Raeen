@@ -801,7 +801,14 @@ mod tests {
             .filter_map(Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(files.len(), 2, "one dump per distinct shader: {files:?}");
+        // One raw `.bin` per distinct shader, plus one `.spv` for the shader
+        // that translated (`dump_spirv` — the coverage-bisect harness input).
+        // The failed shader has no SPIR-V to dump.
+        assert_eq!(
+            files.len(),
+            3,
+            "raw dumps per distinct shader + SPIR-V for the translated one: {files:?}"
+        );
         assert!(
             files
                 .iter()
@@ -809,10 +816,18 @@ mod tests {
             "{files:?}"
         );
         assert!(
+            files.contains(&format!("ps_{good_addr:x}.spv")),
+            "translated shader must dump its SPIR-V: {files:?}"
+        );
+        assert!(
             files
                 .iter()
                 .any(|f| f.starts_with(&format!("ps_{bad_addr:x}_"))),
             "translation failure must still dump: {files:?}"
+        );
+        assert!(
+            !files.contains(&format!("ps_{bad_addr:x}.spv")),
+            "a shader that failed translation has no SPIR-V: {files:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

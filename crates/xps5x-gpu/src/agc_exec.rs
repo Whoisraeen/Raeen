@@ -111,6 +111,15 @@ pub struct AgcGpuSession {
     /// queues keeps each one's resets from clobbering the other.
     compute_command_processor: Mutex<CommandProcessor>,
     last_image: Mutex<Option<RenderedImage>>,
+    /// System boot splash: the package's `sce_sys/pic0.png`, decoded at launch.
+    /// While `Some`, [`AgcGpuSession::last_image`] presents it instead of any
+    /// title frame — a real PS5 shows this image from launch until the title
+    /// calls `sceSystemServiceHideSplashScreen`. It also comes down when the
+    /// title flips to a buffer with real drawn content (SharpEmu's behavior),
+    /// but NOT for the most-content present fallback: that path can surface a
+    /// bare cleared render target, which is exactly what the splash exists to
+    /// cover.
+    splash: Mutex<Option<RenderedImage>>,
     draw_count: Mutex<u64>,
     /// ShaderMemory Phase 2: guest shader fetch+translate results, shared
     /// across DCBs so per-frame re-binds hit the cache instead of
@@ -153,7 +162,12 @@ impl std::ops::Deref for GpuProcessSession {
 impl GpuProcessSession {
     #[must_use]
     fn create(memory: Arc<dyn crate::guest_mem::GpuGuestMemory>) -> Self {
-        Self(Arc::new(AgcGpuSession::new(memory)))
+        let session = AgcGpuSession::new(memory);
+        // Seed the boot splash the launcher staged for this launch (cloned,
+        // not taken: an unrelated session created concurrently must not steal
+        // the splash from the launch it was staged for).
+        *session.splash.lock() = pending_splash().lock().clone();
+        Self(Arc::new(session))
     }
 
     /// Asynchronously submit through this process's bounded, ordered queue.
@@ -205,6 +219,10 @@ impl xps5x_core::subsystems::GpuSubmissionSubsystem for GpuProcessSession {
         AgcGpuSession::wait_idle(self);
     }
 
+    fn hide_splash(&self) {
+        AgcGpuSession::hide_splash(self);
+    }
+
     fn stats(&self) -> xps5x_core::subsystems::GpuSubmissionStats {
         xps5x_core::subsystems::GpuSubmissionStats {
             submitted: self.submission_count.load(Ordering::Relaxed),
@@ -225,6 +243,7 @@ impl AgcGpuSession {
             command_processor: Mutex::new(CommandProcessor::new()),
             compute_command_processor: Mutex::new(CommandProcessor::new()),
             last_image: Mutex::new(None),
+            splash: Mutex::new(None),
             draw_count: Mutex::new(0),
             shader_cache: Mutex::new(crate::shader_fetch::ShaderTranslateCache::new()),
             shader_skip_count: Mutex::new(0),
@@ -277,9 +296,27 @@ impl AgcGpuSession {
             .map_shader_metadata(code_address, crate::contracts::mapped_data_to_kyty(data));
     }
 
-    /// Last image produced by a draw-bearing DCB, if any.
+    /// The frame to present: the boot splash while it is up, otherwise the
+    /// last image produced by a draw-bearing DCB, if any. Diagnostics
+    /// (frame dumps) bypass this and always see the title's own output.
     pub fn last_image(&self) -> Option<RenderedImage> {
+        if let Some(splash) = self.splash.lock().clone() {
+            return Some(splash);
+        }
         self.last_image.lock().clone()
+    }
+
+    /// Stage the boot splash for the next launched process (see
+    /// [`pending_splash`]). Call with `None` when the package has no
+    /// `pic0.png`, so the previous launch's splash cannot carry over.
+    pub fn set_pending_splash(image: Option<RenderedImage>) {
+        *pending_splash().lock() = image;
+    }
+
+    /// Take the boot splash down (`sceSystemServiceHideSplashScreen`, or a
+    /// flip to a buffer with real drawn content).
+    pub fn hide_splash(&self) {
+        *self.splash.lock() = None;
     }
 
     /// Select the guest display buffer the title flipped to
@@ -320,6 +357,9 @@ impl AgcGpuSession {
         }
         if let Some(image) = image {
             *self.last_image.lock() = Some(image);
+            // The title flipped to a buffer it really drew into: its own
+            // rendering has replaced the boot splash.
+            self.hide_splash();
         }
     }
 
@@ -449,23 +489,25 @@ impl AgcGpuSession {
         // still held. Composited UIs draw their black background last, so the
         // last-drawn target is the wrong thing to present; the scanout buffer
         // is where the composite landed. `None` keeps the last-drawn baseline.
-        let scanout_image = {
+        let (flip_address_hit, scanout_image) = {
             let addr = *self.scanout_address.lock();
-            addr.and_then(|a| framebuffers.get(&a).cloned())
-                .or_else(|| {
-                    // The title fills its VideoOut scanout buffer by a copy/DMA we do
-                    // not yet capture (task #11), so that address is often an empty
-                    // target. Present the drawn target with the MOST content — the
-                    // composited frame — instead of the last-drawn one (usually a
-                    // black background composited last). Single non-zero-byte pass
-                    // per target; only runs when the flip address has no drawn image.
-                    framebuffers
-                        .values()
-                        .map(|img| (img.pixels.iter().filter(|&&b| b != 0).count(), img))
-                        .filter(|(nonzero, _)| *nonzero > 0)
-                        .max_by_key(|(nonzero, _)| *nonzero)
-                        .map(|(_, img)| img.clone())
-                })
+            let at_flip_address = addr.and_then(|a| framebuffers.get(&a).cloned());
+            let flip_address_hit = at_flip_address.is_some();
+            let image = at_flip_address.or_else(|| {
+                // The title fills its VideoOut scanout buffer by a copy/DMA we do
+                // not yet capture (task #11), so that address is often an empty
+                // target. Present the drawn target with the MOST content — the
+                // composited frame — instead of the last-drawn one (usually a
+                // black background composited last). Single non-zero-byte pass
+                // per target; only runs when the flip address has no drawn image.
+                framebuffers
+                    .values()
+                    .map(|img| (img.pixels.iter().filter(|&&b| b != 0).count(), img))
+                    .filter(|(nonzero, _)| *nonzero > 0)
+                    .max_by_key(|(nonzero, _)| *nonzero)
+                    .map(|(_, img)| img.clone())
+            });
+            (flip_address_hit, image)
         };
         drop(framebuffers);
         drop(cache);
@@ -507,6 +549,12 @@ impl AgcGpuSession {
             let scanout_hit = scanout_image.is_some();
             let presented = scanout_image.unwrap_or_else(|| image.clone());
             *self.last_image.lock() = Some(presented.clone());
+            // Only a frame at the actual flip address takes the boot splash
+            // down. The most-content fallback can surface a bare cleared
+            // target — exactly what the splash exists to cover.
+            if flip_address_hit {
+                self.hide_splash();
+            }
             {
                 let mut draws = self.draw_count.lock();
                 *draws += drawn;
@@ -711,6 +759,16 @@ impl AgcGpuSession {
             Err(e) => warn!(error = %e, "AGC DCB draw skipped — Vulkan unavailable or failed"),
         }
     }
+}
+
+/// Boot splash staged for the NEXT process session. The launcher decodes
+/// `sce_sys/pic0.png` before entering the guest (the GPU session is created
+/// inside `execute_process`, after the launcher's last chance to touch it), and
+/// every launch stages either `Some` or `None` so a previous title's splash can
+/// never leak into the next.
+fn pending_splash() -> &'static Mutex<Option<RenderedImage>> {
+    static PENDING: OnceLock<Mutex<Option<RenderedImage>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(None))
 }
 
 fn current_gpu_session() -> &'static RwLock<GpuProcessSession> {
@@ -1077,6 +1135,69 @@ mod tests {
 
         // Address 0 is not a flip target and is ignored.
         session.present_scanout(0);
+        assert_eq!(session.last_image().unwrap().pixels, content.pixels);
+    }
+
+    /// The staged boot splash rides into the next process session, masks
+    /// fallback-presented frames, and comes down on `hide_splash`
+    /// (`sceSystemServiceHideSplashScreen`).
+    #[test]
+    fn boot_splash_presents_until_hidden() {
+        let splash = RenderedImage {
+            width: 1,
+            height: 1,
+            pixels: vec![9, 9, 9, 255],
+            bytes_per_pixel: 4,
+        };
+        AgcGpuSession::set_pending_splash(Some(splash.clone()));
+        let session = GpuProcessSession::create(deny_memory());
+        AgcGpuSession::set_pending_splash(None);
+
+        assert_eq!(session.last_image().unwrap().pixels, splash.pixels);
+
+        // A frame that reached `last_image` WITHOUT hitting the flip address
+        // (the most-content fallback) must not replace the splash — it can be
+        // a bare cleared render target.
+        let fallback = RenderedImage {
+            width: 1,
+            height: 1,
+            pixels: vec![64, 128, 0, 255],
+            bytes_per_pixel: 4,
+        };
+        *session.last_image.lock() = Some(fallback.clone());
+        assert_eq!(session.last_image().unwrap().pixels, splash.pixels);
+
+        // The title declares itself ready -> present its frames.
+        session.hide_splash();
+        assert_eq!(session.last_image().unwrap().pixels, fallback.pixels);
+        session.shutdown();
+    }
+
+    /// A flip to a buffer the title really drew into is its own "rendering is
+    /// ready" signal and takes the splash down, exactly like SharpEmu.
+    #[test]
+    fn flip_to_drawn_buffer_takes_the_splash_down() {
+        let session = AgcGpuSession::new(deny_memory());
+        *session.splash.lock() = Some(RenderedImage {
+            width: 1,
+            height: 1,
+            pixels: vec![9, 9, 9, 255],
+            bytes_per_pixel: 4,
+        });
+        let content = RenderedImage {
+            width: 1,
+            height: 1,
+            pixels: vec![10, 20, 30, 255],
+            bytes_per_pixel: 4,
+        };
+        session.framebuffers.lock().insert(0x1000, content.clone());
+
+        // Flip to an undrawn buffer: splash stays up.
+        session.present_scanout(0xDEAD_BEEF);
+        assert_eq!(session.last_image().unwrap().pixels, vec![9, 9, 9, 255]);
+
+        // Flip to the drawn buffer: splash comes down, title frame presents.
+        session.present_scanout(0x1000);
         assert_eq!(session.last_image().unwrap().pixels, content.pixels);
     }
 

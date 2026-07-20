@@ -109,6 +109,41 @@
 
 # XPS5X session progress ledger
 
+- BOOT SPLASH — "why does SharpEmu show the ASTRO.BOT splash and we don't"
+  ANSWERED + CLOSED (2026-07-20). SharpEmu's splash is NOT title rendering:
+  its `PngSplashLoader.cs` decodes the package's `sce_sys/pic0.png` and
+  presents it host-side until the title flips a buffer with real drawn content
+  or calls `sceSystemServiceHideSplashScreen` — the same thing a real PS5's
+  system software does. Implemented the equivalent:
+  * `xps5x-gui/src/splash.rs` (NEW): decodes `sce_sys/pic0.png` beside the
+    eboot (`image` workspace dep) and stages it via
+    `AgcGpuSession::set_pending_splash` before entering the guest; wired into
+    BOTH launch paths (Shell `launcher.rs` + CLI `--run-eboot`), staging
+    `Some`/`None` every launch so a previous title's splash cannot leak.
+  * `xps5x-gpu/agc_exec.rs`: `splash` field on the session, cloned from the
+    pending slot in `GpuProcessSession::create` (created inside
+    `execute_process`, after the launcher's last chance to touch it).
+    `last_image()` presents the splash while it is up. It comes down on
+    `hide_splash()` or a flip whose address has real drawn content — but NOT
+    on the most-content present fallback, which can surface a bare cleared
+    target (the CLEAR_COLOR frame the 2026-07-20 correction exposed).
+    Frame dumps bypass the splash, so diagnostics still see title output only.
+  * `sceSystemServiceHideSplashScreen` upgraded from `hle_ok` to a real
+    presentation transition (`ctx.gpu.hide_splash()`; trait default no-op on
+    `GpuSubmissionSubsystem`).
+  * VERIFIED IN THE REAL SHELL (verify skill): launching ASTRO.BOT presents
+    its actual key-art splash letterboxed, replacing the old flat clear-color
+    frame. Tests: gpu 126/126 (incl. 2 new splash tests), hle 290, gui 123 +
+    2 new, core 7; touched-crate clippy `-D warnings` + workspace fmt clean.
+  * Also fixed in passing: stale `shader_fetch` dump test (asserted 2 files,
+    but `dump_spirv` — the coverage-bisect harness input — now writes a third
+    `.spv` for the translated shader; assertions updated to cover it), and two
+    pre-existing clippy `sort_unstable_by` lints in main.rs CALL_STATS.
+  * NOTE: this changes the ASTRO.BOT visual baseline — the presented frame is
+    now the splash, NOT title rendering. Any future "did the title render"
+    check must use frame dumps or the controlled clear-colour test, never the
+    Shell image.
+
 - MILESTONE: **all 5 installed titles load and execute with ZERO unresolved
   imports** (2026-07-19). Workspace `cargo test` 0 failures; touched-crate
   clippy + fmt clean. Every title previously died on a missing symbol.
@@ -1980,3 +2015,87 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   an import is what makes it implementable, and these were unimplementable before
   (anonymous NID). Does NOT unblock Minecraft's menu (game-internal, not NP) —
   it closes import gaps that would gate a title that actually drives these.
+
+- RENDER-RE: found the RIGHT anchor — the UI-manager singleton (2026-07-20).
+  New probe XPS5X_TRACE_UI logs the caller of the routes.json open (libkernel.rs
+  hle_open). MEASURED: routes.json is opened from eboot 0xb5c689d (call open),
+  returning to 0xb5c68a2. Disassembling forward (xps5x --disas):
+    0xb5c68a2  mov r14d,eax; test eax,eax; js <err>   ; check the fd
+    0xb5c68c6  build an SSO string; call 0x7C80E0      ; read the file
+    0xb5c6900  mov rax,[0xE39E098]; call [rax+0x10] esi=0x50  ; hand to the UI mgr
+  DECISIVE: 0xE39E098 is the SAME singleton the render dispatcher called
+  (call [rax+0x18], fn 0xa8ca90) — it is the central UI/Gameface MANAGER, shared
+  by route-loading AND rendering. So the game DOES parse routes.json and register
+  routes with the manager; the never-taken navigate/CreateView is a LATER call
+  into THIS singleton's vtable, gated on game state — NOT on the render chain
+  (which dead-ended at free()). CORRECT NEXT TRACE (was chasing the wrong path
+  before): dump the live vtable of the 0xE39E098 singleton (read guest
+  qword[BASE+0xE39E098] = obj, then its vtable ptr [obj+0], then the slots), map
+  which slot is Navigate/LoadURL/CreateView, and set a one-shot export-trap-style
+  probe on that slot's target to see if it is ever called and with what route.
+  If it is NEVER called, the gate is upstream (a game-state flag the UI mgr waits
+  on); if called with an empty/null route, the gate is what computes the route.
+  The XPS5X_TRACE_UI probe is uncommitted (env-gated, harmless); keep it.
+
+- RENDER-RE CORRECTION: 0xE39E098 is the ALLOCATOR, not the UI manager
+  (2026-07-20). Dumped the singleton's embedded function-pointer table
+  (obj=0xdf26ef0): +0x10=0x49ca1a0, +0x18=0x625360, +0x28=0x625360, +0x50/
+  +0x80=0xe11e978, plus methods at 0xb65xxxx. Resolved +0x10: 0x49ca1a0 is a
+  thunk `mov rdi,rsi; jmp 0xB7B1BC0` -> GOT 0xE123018 -> **malloc [libc]**
+  (the route-loader's `call [obj+0x10] esi=0x50` is malloc(0x50)). +0x18=0x625360
+  resolved earlier to **free**. So 0xE39E098/0xdf26ef0 is the app's
+  ALLOCATOR/resource manager (alloc=+0x10, free=+0x18), used pervasively — NOT
+  the Gameface navigate manager. Both the render dispatcher (call [obj+0x18]=free
+  teardown) and the route-loader (call [obj+0x10]=malloc) just use it to manage
+  memory. CORRECTS the prior "UI manager singleton" claim.
+  NET: every pointer traced from the render chain AND the routes.json loader
+  resolves to a mundane primitive (malloc/free/teardown) — the navigate decision
+  is game-STATE-conditional logic not directly reachable from these data anchors.
+  Real progress this turn: found the route-loader fn (eboot 0xb5c68a2, reads
+  routes.json), mapped the allocator singleton's dispatch table, and corrected a
+  wrong subsystem ID. But a title-rendered pixel remains sustained multi-session
+  RE: the productive continuation is to trace the route-loader (0xb5c68a2)
+  FORWARD past the malloc to whether it navigates or defers, and/or set an
+  export-trap probe on cohtml's actual View/LoadURL exports to catch IF/when the
+  game ever calls them with a route (the export trap already showed 0 view-tier
+  calls, so likely the gate is upstream game state). Tools: --disas, export trap,
+  XPS5X_TRACE_UI (uncommitted, env-gated).
+
+- RENDER-RE: route-loader is container code; NEW LEAD = Xbox Live, not PSN
+  (2026-07-20). Traced the route-loader (0xb5c6900) forward: open routes.json ->
+  malloc buffer (manager+0x10) -> the branch at 0xb5c691e is the ALLOC-FAILURE
+  handler (strings at 0xCF0EE8E/0xCF3F526 = "We failed to allocate %zu bytes",
+  "pointer || size == 0" — asserts, not navigation). So the route-loader is
+  standard C++ container plumbing; the navigate decision is downstream in the
+  parse/state logic. IMPORTANT NEW LEAD: the string "XBOXLIVE" (+ "verbose"
+  "flush") sits at 0xCF3F53B, in .rodata right beside the route code. Minecraft
+  BEDROCK signs in via XBOX LIVE, not PSN — which reframes the auth-gate theory:
+  this session PROVED the game calls ZERO sceNp functions, and the reason may be
+  that its sign-in/entitlement path is Xbox Live (Minecraft's own service),
+  which our HLE does not model. If the menu is gated on an Xbox Live
+  sign-in/entitlement state, that is the upstream game-state condition — and a
+  DIFFERENT, possibly more tractable angle than raw state-machine RE. NEXT: grep
+  the game for its Xbox Live service init (search .rodata for xbl/xboxlive/
+  auth/token strings and the functions that reference them); check whether the
+  game blocks its screen transition on an Xbox Live "signed in" flag we could
+  satisfy. This is the first lead pointing at a nameable subsystem (Xbox Live
+  auth) rather than anonymous state.
+
+- RENDER-RE: Xbox Live lead DID NOT pan out (2026-07-20, checked). Grepped the
+  run for HTTP/DNS activity: ZERO sceHttp* calls, ZERO resolver/host-lookup
+  activity, and the steady-state CALL_STATS poll set has no network calls. So
+  Minecraft is NOT doing Xbox Live network auth in steady state — the "XBOXLIVE"
+  .rodata string was proximity coincidence (likely logging infra), not the gate.
+  Negative result, but a real one (measured, not assumed). This CLOSES the
+  auth-network angle and further confirms: the menu gate has NO external network
+  dependency the game is awaiting.
+  FULL PICTURE now (all measured, multiply-confirmed): GPU exonerated (renders
+  empty content correctly); route-loader is standard container code; the
+  0xE39E098 singleton is the allocator (malloc/free); cohtml view/navigate
+  exports never called (0/248); every external input (NP, socket, events, user,
+  files, HTTP/DNS) returns correct values or is never invoked. The Minecraft
+  menu gate is PURELY internal game state/sequencing — no external lever exists.
+  Reaching a title pixel is sustained internal-state-machine RE with no shortcut:
+  disassemble the game's boot sequence to find the initialization-complete flag
+  or ordering the navigate transition waits on. Every angle reachable by probing
+  external anchors is now exhausted and documented.

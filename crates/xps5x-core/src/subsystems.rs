@@ -164,4 +164,8 @@ pub trait GpuSubmissionSubsystem: Send + Sync {
     fn present_scanout(&self, address: u64);
     fn wait_idle(&self);
     fn stats(&self) -> GpuSubmissionStats;
+    /// `sceSystemServiceHideSplashScreen`: the title says its own rendering is
+    /// ready, so the system boot splash must come down. Default no-op for
+    /// backends with no presentation surface.
+    fn hide_splash(&self) {}
 }

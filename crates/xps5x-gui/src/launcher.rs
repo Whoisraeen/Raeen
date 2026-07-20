@@ -415,6 +415,11 @@ impl FirmwareLauncher {
         });
         let linked = std::sync::Arc::new(linked);
 
+        // Stage the package's boot splash (`sce_sys/pic0.png`) before entering
+        // the guest: the process GPU session that presents it is created
+        // inside `execute_process`, after our last chance to touch it.
+        crate::splash::stage_boot_splash(path);
+
         #[cfg(target_os = "windows")]
         {
             // M1-A: enter the module as a real process — `_start` on a

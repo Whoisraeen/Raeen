@@ -44,3 +44,4 @@ pub use backend::{BackendKind, GpuBackend, ShaderFormat, create_backend, default
 pub use contracts::{ShaderMappedData, ShaderSemantic, ShaderSharp, ShaderUserData};
 pub use guest_mem::GpuGuestMemory;
 pub use shader_fetch::ShaderCacheStats;
+pub use vulkan::offscreen::RenderedImage;

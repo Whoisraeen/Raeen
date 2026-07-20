@@ -7,6 +7,7 @@ mod app;
 mod launcher;
 mod library;
 mod shell;
+mod splash;
 mod theme;
 mod updater;
 
@@ -399,6 +400,145 @@ fn main() -> anyhow::Result<()> {
             };
             println!("{:#014x}  {out}{mark}", inst.ip());
         }
+        return Ok(());
+    }
+
+    // Diagnostic: `xps5x --find-calls <eboot.bin> <hex-target-vaddr>` scans every
+    // executable segment for a call whose target is the given vaddr — the core
+    // "who calls X" RE operation. Finds direct `call rel32` (e8) and
+    // `call [rip+disp32]` (ff 15) through a GOT slot holding the target. Prints
+    // each call-site vaddr, so the guarding branch upstream can be disassembled.
+    if let Some(pos) = args.iter().position(|a| a == "--find-calls") {
+        let path = args
+            .get(pos + 1)
+            .ok_or_else(|| anyhow::anyhow!("--find-calls requires an eboot.bin path"))?;
+        let target = args
+            .get(pos + 2)
+            .ok_or_else(|| anyhow::anyhow!("--find-calls requires a hex target vaddr"))
+            .and_then(|s| {
+                u64::from_str_radix(s.trim_start_matches("0x"), 16)
+                    .map_err(|e| anyhow::anyhow!("bad target {s:?}: {e}"))
+            })?;
+        let bytes = std::fs::read(path)?;
+        let decrypted = xps5x_firmware::decrypt_self(&bytes, &xps5x_firmware::NoKeysProvider)?;
+        let module = xps5x_firmware::parse_sprx(&decrypted.elf)?;
+        let mut hits = 0usize;
+        for seg in &module.segments {
+            // Executable segments only (PF_X = bit 0).
+            if seg.flags & 1 == 0 {
+                continue;
+            }
+            let data = &seg.data;
+            let base = seg.vaddr;
+            // Direct `call rel32`: e8 <rel32>. Target = insn_end + rel32.
+            for i in 0..data.len().saturating_sub(5) {
+                if data[i] == 0xe8 {
+                    let rel =
+                        i32::from_le_bytes([data[i + 1], data[i + 2], data[i + 3], data[i + 4]]);
+                    let site = base + i as u64;
+                    let dest = (site + 5).wrapping_add(rel as i64 as u64);
+                    if dest == target {
+                        println!("{site:#014x}  call {target:#x} (direct)");
+                        hits += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("{hits} direct call site(s) to {target:#x}");
+        return Ok(());
+    }
+
+    // Diagnostic: `xps5x --find-lea <eboot.bin> <hex-target-vaddr>` scans every
+    // executable segment for `lea reg, [rip+disp32]` whose target is the given
+    // vaddr — "who references this data/string". Pairs with --find-calls: locate
+    // a .rodata string (e.g. "coui://", "index.html") then find the code that
+    // loads its address to build a navigate URL.
+    if let Some(pos) = args.iter().position(|a| a == "--find-lea") {
+        let path = args
+            .get(pos + 1)
+            .ok_or_else(|| anyhow::anyhow!("--find-lea requires an eboot.bin path"))?;
+        let target = args
+            .get(pos + 2)
+            .ok_or_else(|| anyhow::anyhow!("--find-lea requires a hex target vaddr"))
+            .and_then(|s| {
+                u64::from_str_radix(s.trim_start_matches("0x"), 16)
+                    .map_err(|e| anyhow::anyhow!("bad target {s:?}: {e}"))
+            })?;
+        let bytes = std::fs::read(path)?;
+        let decrypted = xps5x_firmware::decrypt_self(&bytes, &xps5x_firmware::NoKeysProvider)?;
+        let module = xps5x_firmware::parse_sprx(&decrypted.elf)?;
+        let mut hits = 0usize;
+        for seg in &module.segments {
+            if seg.flags & 1 == 0 {
+                continue;
+            }
+            let data = &seg.data;
+            let base = seg.vaddr;
+            // REX.W lea rip-relative: 48 8d <modrm> disp32, modrm in {05,0d,15,
+            // 1d,25,2d,35,3d} (mod=00, rm=101). insn length = 7. Target =
+            // (site+7) + disp32.
+            for i in 0..data.len().saturating_sub(7) {
+                if data[i] == 0x48 && data[i + 1] == 0x8d && (data[i + 2] & 0xc7) == 0x05 {
+                    let disp =
+                        i32::from_le_bytes([data[i + 3], data[i + 4], data[i + 5], data[i + 6]]);
+                    let site = base + i as u64;
+                    let dest = (site + 7).wrapping_add(disp as i64 as u64);
+                    if dest == target {
+                        let reg = (data[i + 2] >> 3) & 7;
+                        println!("{site:#014x}  lea r{reg}, [{target:#x}]");
+                        hits += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("{hits} lea reference(s) to {target:#x}");
+        return Ok(());
+    }
+
+    // Diagnostic: `xps5x --find-str <eboot.bin> <needle>` searches the decrypted
+    // image segments for an ASCII substring and prints each match's vaddr — the
+    // string can then be fed to --find-lea to locate the code that references
+    // it. (Raw `strings` fails: the eboot is an encrypted SELF.)
+    if let Some(pos) = args.iter().position(|a| a == "--find-str") {
+        let path = args
+            .get(pos + 1)
+            .ok_or_else(|| anyhow::anyhow!("--find-str requires an eboot.bin path"))?;
+        let needle = args
+            .get(pos + 2)
+            .ok_or_else(|| anyhow::anyhow!("--find-str requires a search string"))?
+            .as_bytes();
+        let bytes = std::fs::read(path)?;
+        let decrypted = xps5x_firmware::decrypt_self(&bytes, &xps5x_firmware::NoKeysProvider)?;
+        let module = xps5x_firmware::parse_sprx(&decrypted.elf)?;
+        let mut hits = 0usize;
+        for seg in &module.segments {
+            let data = &seg.data;
+            let mut i = 0usize;
+            while i + needle.len() <= data.len() {
+                if &data[i..i + needle.len()] == needle {
+                    let vaddr = seg.vaddr + i as u64;
+                    // Show a little context so the exact string is visible.
+                    let end = (i + needle.len() + 24).min(data.len());
+                    let ctx: String = data[i..end]
+                        .iter()
+                        .map(|&b| {
+                            if (0x20..0x7f).contains(&b) {
+                                b as char
+                            } else {
+                                '.'
+                            }
+                        })
+                        .collect();
+                    println!("{vaddr:#014x}  {ctx:?}");
+                    hits += 1;
+                    if hits >= 64 {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+        }
+        eprintln!("{hits} match(es) for {:?}", String::from_utf8_lossy(needle));
         return Ok(());
     }
 
@@ -954,8 +1094,8 @@ fn main() -> anyhow::Result<()> {
                             steady.push((s, e.key().clone()));
                         }
                     }
-                    boot.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-                    steady.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    boot.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));
+                    steady.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));
                     let render = |v: &[(u64, String)]| {
                         v.iter()
                             .take(40)
@@ -974,6 +1114,10 @@ fn main() -> anyhow::Result<()> {
                 }
             });
         }
+        // Same boot-splash staging as the Shell launcher, so `--run-eboot`
+        // and the Shell remain one launch path observably.
+        splash::stage_boot_splash(std::path::Path::new(&path));
+
         info!("entering guest _start via execute_process ...");
         let outcome = xps5x_runtime::execute_process_shared(
             std::sync::Arc::clone(&linked),

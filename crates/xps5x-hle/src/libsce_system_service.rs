@@ -67,7 +67,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register(
         "libSceSystemService",
         "sceSystemServiceHideSplashScreen",
-        hle_ok,
+        hle_hide_splash_screen,
     );
     registry.register(
         "libSceSystemService",
@@ -88,6 +88,16 @@ pub fn register(registry: &HleRegistry) {
         "sceSystemServiceReceiveEvent",
         hle_receive_event,
     );
+}
+
+/// `sceSystemServiceHideSplashScreen()`: the title declares its own rendering
+/// ready, so the system boot splash (the package's `sce_sys/pic0.png`, shown
+/// since launch) comes down. This is a real presentation transition, not a
+/// status stub — on hardware the splash persists until exactly this call.
+fn hle_hide_splash_screen(ctx: &HleContext, _args: &[u64]) -> u64 {
+    debug!("sceSystemServiceHideSplashScreen()");
+    ctx.gpu.hide_splash();
+    SCE_OK
 }
 
 /// `sceSystemServiceReceiveEvent(SceSystemServiceEvent *event)`: report an
@@ -127,6 +137,40 @@ fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
 fn hle_get_status(ctx: &HleContext, args: &[u64]) -> u64 {
     let status_ptr = args.first().copied().unwrap_or(0);
     debug!("sceSystemServiceGetStatus(status={status_ptr:#x})");
+    // RE confirmation probe (XPS5X_TRACE_UI): GetStatus is polled every frame,
+    // so it is a stand-in for the per-frame HBUI/router tick. Read the gate a
+    // navigate-gate RE pinned: P = *[0xE15B830] (app shared-state singleton),
+    // flag = byte[P+0x248]. The router tick at eboot 0x1112794 returns BEFORE
+    // any screen registration/navigation while this byte is non-zero. Log it
+    // on change + first few reads to see whether it is stuck non-zero (= the
+    // menu never navigates) or clears (gate is downstream).
+    if std::env::var_os("XPS5X_TRACE_UI").is_some() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        const BASE: u64 = 0x0000_1000_0000_0000;
+        static LAST: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
+        static SEEN: AtomicU32 = AtomicU32::new(0);
+        let rd = |a: u64| -> Option<u64> {
+            let mut w = [0u8; 8];
+            ctx.mem.read(a, &mut w).then(|| u64::from_le_bytes(w))
+        };
+        let p = rd(BASE + 0xE15_B830).unwrap_or(0);
+        let flag = if p != 0 {
+            let mut b = [0u8; 1];
+            ctx.mem.read(p + 0x248, &mut b).then_some(b[0])
+        } else {
+            None
+        };
+        let cur = flag.map_or(0xFFFF_FFFEu32, u32::from);
+        let n = SEEN.fetch_add(1, Ordering::Relaxed);
+        if LAST.swap(cur, Ordering::Relaxed) != cur || n < 4 {
+            warn!(
+                singleton = format_args!("{:#x}", p.wrapping_sub(BASE)),
+                gate_byte_0x248 = ?flag,
+                frame = n,
+                "TRACE_UI: navigate-gate G1 flag (byte[P+0x248]) — non-zero = menu blocked"
+            );
+        }
+    }
     if status_ptr == 0 {
         return ERROR_PARAMETER;
     }
