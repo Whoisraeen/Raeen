@@ -48,6 +48,13 @@ mod prim {
     pub const TRIANGLE_LIST: u32 = 4;
     pub const TRIANGLE_FAN: u32 = 5;
     pub const TRIANGLE_STRIP: u32 = 6;
+    /// AMD `DI_PT_POLYGON`: one convex polygon per draw. Measured: ASTRO.BOT
+    /// issues its early-boot draws with this type (226 skips before support).
+    /// A convex polygon rasterizes exactly as a triangle fan of its vertices
+    /// (identical to a list for the 3-vertex case). SharpEmu ships the same
+    /// draws through its TriangleList catch-all; the fan is the faithful
+    /// mapping.
+    pub const POLYGON: u32 = 7;
     /// Kyty's clear/blit primitive. Rasterized as a 4-vertex strip quad.
     pub const RECT_LIST: u32 = 17;
 }
@@ -1110,12 +1117,12 @@ pub fn draw_state_from_regs<'a>(
     let (topology, vertex_count) = match ucfg.prim_type {
         prim::RECT_LIST => (vk::PrimitiveTopology::TRIANGLE_STRIP, 4),
         prim::TRIANGLE_LIST => (vk::PrimitiveTopology::TRIANGLE_LIST, index_count),
-        prim::TRIANGLE_FAN => (vk::PrimitiveTopology::TRIANGLE_FAN, index_count),
+        prim::TRIANGLE_FAN | prim::POLYGON => (vk::PrimitiveTopology::TRIANGLE_FAN, index_count),
         prim::TRIANGLE_STRIP => (vk::PrimitiveTopology::TRIANGLE_STRIP, index_count),
         other => {
             return Err(err(format!(
                 "unsupported VGT_PRIMITIVE_TYPE {other} (supported: 4 TriList, \
-                 5 TriFan, 6 TriStrip, 17 RectList)"
+                 5 TriFan, 6 TriStrip, 7 Polygon, 17 RectList)"
             )));
         }
     };
