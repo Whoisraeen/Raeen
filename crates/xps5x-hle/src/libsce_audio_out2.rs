@@ -73,6 +73,13 @@ pub fn register(registry: &HleRegistry) {
         "sceAudioOut2PortSetAttributes",
         hle_port_set_attributes,
     );
+    // Resolved at runtime via dlsym by the measured title's FMOD build, so it
+    // never shows in the static import table — register it anyway.
+    registry.register(
+        "libSceAudioOut2",
+        "sceAudioOut2ContextGetQueueLevel",
+        hle_context_get_queue_level,
+    );
     registry.register("libSceAudioOut2", "sceAudioOut2PortCreate", hle_port_create);
     registry.register(
         "libSceAudioOut2",
@@ -184,6 +191,17 @@ fn hle_context_advance(_ctx: &HleContext, args: &[u64]) -> u64 {
 /// attributes are inert without an audio backend — accept (SharpEmu's answer
 /// too) so the mixer thread keeps running.
 fn hle_port_set_attributes(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    OK
+}
+
+/// `sceAudioOut2ContextGetQueueLevel(context, outLevel)`: the push/advance
+/// paths pace synchronously, so the queue is always drained — report level 0
+/// (SharpEmu's answer). A null out-pointer is tolerated, matching SharpEmu.
+fn hle_context_get_queue_level(ctx: &HleContext, args: &[u64]) -> u64 {
+    let level = args.get(1).copied().unwrap_or(0);
+    if level != 0 && !ctx.mem.write(level, &0u64.to_le_bytes()) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
     OK
 }
 
@@ -452,6 +470,14 @@ mod tests {
         // Destroy drops the pacing state; a later push is unpaced again.
         assert_eq!(hle_context_destroy(&ctx, &[handle]), OK);
         assert!(CONTEXTS.get(&handle).is_none());
+
+        // Queue level: always drained (synchronous pacing), null out tolerated.
+        assert!(mem.write(0x190, &u64::MAX.to_le_bytes()));
+        assert_eq!(hle_context_get_queue_level(&ctx, &[handle, 0x190]), OK);
+        let mut lvl = [0u8; 8];
+        assert!(mem.read(0x190, &mut lvl));
+        assert_eq!(u64::from_le_bytes(lvl), 0);
+        assert_eq!(hle_context_get_queue_level(&ctx, &[handle, 0]), OK);
     }
 
     #[test]

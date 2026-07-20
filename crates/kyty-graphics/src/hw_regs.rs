@@ -39,7 +39,15 @@ pub struct UserSgprInfo {
 }
 
 impl UserSgprInfo {
-    pub const SGPRS_MAX: usize = 16;
+    /// Gen5 graphics stages expose 32 user-SGPR registers. Kyty's PS4-era code
+    /// used 16, which silently DROPPED writes to slots 16..31 and capped
+    /// `count` at 16 — so every ASTRO.BOT pixel shader declaring 20/24/30/32
+    /// user SGPRs was rejected by the `user_sgpr > count` gate and no draw
+    /// could translate. The SH register map leaves room for 32 per graphics
+    /// stage (PS 0x0C, VS 0x4C, GS 0x8C, ES 0xC8); SharpEmu's Gen5 scalar
+    /// evaluator likewise carries up to 32. Compute keeps its hardware 16
+    /// (COMPUTE_USER_DATA_0..15) and spills to EUD instead.
+    pub const SGPRS_MAX: usize = 32;
 }
 
 /// Kyty: HardwareContext.h `VsShaderResource2` (L436). Minimal slice:
@@ -725,6 +733,29 @@ impl UserSgprInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gen5 graphics stages have THIRTY-TWO user-SGPR registers, not the 16
+    /// Kyty's PS4-era code assumed. Measured on ASTRO.BOT: pixel shaders
+    /// declare `rsrc2.user_sgpr` = 20/24/30/32 while only 16 were ever
+    /// recorded, so `shader_parse_ps` rejected every one of them. The SH
+    /// register map has room: PS user data starts at 0x0C and the next SH
+    /// register (VS_0) is 0x4C, GS_0 at 0x8C runs to ES at 0xC8. Compute is
+    /// genuinely 16 (COMPUTE_USER_DATA_0..15 = 0x240..0x24F) — its overflow
+    /// goes to EUD instead.
+    #[test]
+    fn user_sgpr_records_gen5_slots_above_sixteen() {
+        let mut info = UserSgprInfo::default();
+        info.set(20, 0xdead_beef, UserSgprType::Region);
+        assert_eq!(
+            info.value[20], 0xdead_beef,
+            "slot 20 must be recorded, not silently dropped"
+        );
+        assert_eq!(info.count, 21, "count is a high-water mark of written slots");
+
+        info.set(31, 0x1234_5678, UserSgprType::Region);
+        assert_eq!(info.value[31], 0x1234_5678, "slot 31 is the last Gen5 slot");
+        assert_eq!(info.count, 32);
+    }
 
     /// A `#[derive(Default)]` would zero these. Kyty does not.
     #[test]

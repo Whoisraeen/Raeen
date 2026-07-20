@@ -328,7 +328,14 @@ impl AgcGpuSession {
         if slot.is_some() {
             return Ok(());
         }
-        let mut backend = VulkanBackend::new(true);
+        // Validation is opt-in on the title path. The Khronos layer costs
+        // ~0.9s per vkCreateGraphicsPipelines on a real title (measured on
+        // ASTRO.BOT: 1028 draws => ~15 minutes of pipeline creation alone),
+        // which is the difference between reaching a presented frame and
+        // never getting there. Set XPS5X_VULKAN_VALIDATION=1 to restore it
+        // when debugging a specific draw.
+        let validation = std::env::var_os("XPS5X_VULKAN_VALIDATION").is_some();
+        let mut backend = VulkanBackend::new(validation);
         backend.init()?;
         *slot = Some(backend);
         Ok(())

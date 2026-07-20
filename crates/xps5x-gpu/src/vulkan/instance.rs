@@ -414,7 +414,12 @@ impl VulkanDevice {
         // Vulkan 1.3 core feature — the whole point of targeting 1.3 here is
         // that the draw needs no render-pass/framebuffer objects.
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
-        let features = vk::PhysicalDeviceFeatures::default().fragment_stores_and_atomics(true);
+        // Gen5 shaders write storage buffers from the vertex stage (UAV
+        // writes/stream-out); without `vertexPipelineStoresAndAtomics` the
+        // driver rejects those pipelines (VUID-RuntimeSpirv-NonWritable-06341).
+        let features = vk::PhysicalDeviceFeatures::default()
+            .fragment_stores_and_atomics(true)
+            .vertex_pipeline_stores_and_atomics(true);
         let create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_features(&features)
@@ -456,12 +461,15 @@ impl VulkanDevice {
         }
 
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default();
-        let fragment_stores_and_atomics = {
+        let (fragment_stores_and_atomics, vertex_pipeline_stores_and_atomics) = {
             let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut features13);
             // SAFETY: `pd` is valid and `features2` chains `features13`; both
             // live for the call, which only writes into them.
             unsafe { instance.get_physical_device_features2(pd, &mut features2) };
-            features2.features.fragment_stores_and_atomics
+            (
+                features2.features.fragment_stores_and_atomics,
+                features2.features.vertex_pipeline_stores_and_atomics,
+            )
         };
         if features13.dynamic_rendering == vk::FALSE {
             debug!("skipping {name}: no dynamicRendering");
@@ -469,6 +477,12 @@ impl VulkanDevice {
         }
         if fragment_stores_and_atomics == vk::FALSE {
             debug!("skipping {name}: no fragmentStoresAndAtomics");
+            return None;
+        }
+        if vertex_pipeline_stores_and_atomics == vk::FALSE {
+            // Gen5 vertex shaders can write storage buffers; without the
+            // feature those pipelines cannot be created (see device creation).
+            debug!("skipping {name}: no vertexPipelineStoresAndAtomics");
             return None;
         }
 

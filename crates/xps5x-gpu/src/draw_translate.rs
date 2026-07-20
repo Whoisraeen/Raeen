@@ -374,7 +374,8 @@ fn gen5_vertex_format(format: u8) -> Result<vk::Format, DrawError> {
     // Gen5 unified-format code → Vulkan, per SharpEmu's Gfx10UnifiedFormat
     // table (the RDNA2 authority): 64 → (11,7) = 32_32_FLOAT,
     // 74 → (13,7) = 32_32_32_FLOAT, 77 → (14,7) = 32_32_32_32_FLOAT,
-    // 56 → (10,0) = 8_8_8_8 UNORM, 71 → (12,7) = 16_16_16_16_FLOAT.
+    // 56 → (10,0) = 8_8_8_8 UNORM, 71 → (12,7) = 16_16_16_16_FLOAT,
+    // 11 → (2,4) = 16 UINT (measured: Minecraft's packed per-vertex value).
     match format {
         74 => Ok(vk::Format::R32G32B32_SFLOAT),
         64 => Ok(vk::Format::R32G32_SFLOAT),
@@ -382,6 +383,7 @@ fn gen5_vertex_format(format: u8) -> Result<vk::Format, DrawError> {
         56 => Ok(vk::Format::R8G8B8A8_UNORM),
         71 => Ok(vk::Format::R16G16B16A16_SFLOAT),
         23 => Ok(vk::Format::R16G16_UNORM),
+        11 => Ok(vk::Format::R16_UINT),
         other => Err(err(format!(
             "unsupported Gen5 vertex-buffer format {other}"
         ))),
@@ -500,6 +502,13 @@ fn decode_texture(
         // 56 -> (10,0) = 8_8_8_8 UNORM (measured: Minecraft's 1920x1080 UI
         // texture, tile mode 27).
         56 => (vk::Format::R8G8B8A8_UNORM, 4),
+        // 71 -> (12,7) = 16_16_16_16 FLOAT (measured: ASTRO.BOT's 2432x1368
+        // HDR scene buffer sampled back as a texture, tile mode 27). SharpEmu's
+        // Gfx10UnifiedFormat maps unified 71 -> (dataFormat 12, numFormat 7);
+        // dataFormat 12 is 16_16_16_16 per its Gen5 layout table, and numFormat
+        // 7 is FLOAT (same numFormat as the 36 arm above). Every draw in the
+        // title's 7966-dword DCB failed on this one format.
+        71 => (vk::Format::R16G16B16A16_SFLOAT, 8),
         other => {
             return Err(err(format!(
                 "texture format {other} not implemented \
@@ -1868,6 +1877,8 @@ mod tests {
             vk::Format::R16G16B16A16_SFLOAT
         );
         assert_eq!(gen5_vertex_format(23).unwrap(), vk::Format::R16G16_UNORM);
+        // 11 → (2,4) = 16 UINT (Minecraft's packed per-vertex value).
+        assert_eq!(gen5_vertex_format(11).unwrap(), vk::Format::R16_UINT);
         let e = gen5_vertex_format(0).expect_err("unknown formats stay named");
         assert!(format!("{e}").contains('0'));
     }

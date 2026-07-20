@@ -2185,7 +2185,10 @@ pub fn shader_parse_ps(
     }
 
     if u32::from(regs.ps_regs.rsrc2.user_sgpr) > regs.ps_user_sgpr.count {
-        return Err(ni("ps: user_sgpr > user sgpr count"));
+        return Err(ni_owned(format!(
+            "ps: user_sgpr > user sgpr count (declared={} written={} addr={:#x})",
+            regs.ps_regs.rsrc2.user_sgpr, regs.ps_user_sgpr.count, regs.ps_regs.data_addr
+        )));
     }
 
     let src = mem
@@ -2677,7 +2680,7 @@ mod tests {
             },
             vs_user_sgpr: UserSgprInfo {
                 value: {
-                    let mut v = [0u32; 16];
+                    let mut v = [0u32; UserSgprInfo::SGPRS_MAX];
                     v[0] = 0x2000; // fetch shader pointer (s[0:1])
                     v[2] = 0x3000; // V# table pointer (s[2:3])
                     v
@@ -2750,7 +2753,7 @@ mod tests {
         let mem = TestMem {
             regions: vec![(0x4000, ps_code)],
         };
-        let mut value = [0u32; 16];
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
         value[7] = 0x9000_0000; // T# dword 3: type = 9
         let regs = PixelShaderInfo {
             ps_regs: crate::shader::hw_regs::PsStageRegisters {
@@ -2760,7 +2763,7 @@ mod tests {
             },
             ps_user_sgpr: UserSgprInfo {
                 value,
-                type_: [UserSgprType::Vsharp; 16],
+                type_: [UserSgprType::Vsharp; UserSgprInfo::SGPRS_MAX],
                 count: 16,
             },
             ..Default::default()
@@ -2835,7 +2838,7 @@ mod tests {
         let mem = TestMem {
             regions: vec![(0x6000, cs_code)],
         };
-        let mut type_ = [UserSgprType::Unknown; 16];
+        let mut type_ = [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX];
         type_[..4].fill(UserSgprType::Vsharp);
         let regs = ComputeShaderInfo {
             cs_regs: crate::shader::hw_regs::CsStageRegisters {
@@ -2851,7 +2854,7 @@ mod tests {
                 ..Default::default()
             },
             cs_user_sgpr: UserSgprInfo {
-                value: [0; 16],
+                value: [0; UserSgprInfo::SGPRS_MAX],
                 type_,
                 count: 4,
             },
@@ -3096,10 +3099,10 @@ mod tests {
         // Kyty: ShaderParseUsage2 (L1505) — PS5 sharp tables: one sampler
         // (table 2) and one constant buffer (table 3), 0x7fff entries
         // skipped; leftover user SGPRs become direct.
-        let mut type_ = [UserSgprType::Unknown; 16];
+        let mut type_ = [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX];
         type_[..8].fill(UserSgprType::Vsharp);
         let user_sgpr = UserSgprInfo {
-            value: [0; 16],
+            value: [0; UserSgprInfo::SGPRS_MAX],
             type_,
             count: 10,
         };
@@ -3143,7 +3146,7 @@ mod tests {
         // descriptor type is 9 must still bind as a Texture2D.
         let user_sgpr = UserSgprInfo {
             value: {
-                let mut v = [0u32; 16];
+                let mut v = [0u32; UserSgprInfo::SGPRS_MAX];
                 v[3] = 0x0000_0008; // buffer sharp @0: dword3 (v[0+3]) type nibble = 0
                 v[11] = 0x9000_0000; // texture sharp @8: dword3 (v[8+3]) type nibble = 9
                 v
@@ -3152,7 +3155,7 @@ mod tests {
             // consumes s0..s8 (binding only the first four dwords) and the
             // texture @8 consumes s8..s16 -> all 16 registers consumed, no
             // leftover direct SGPRs.
-            type_: [UserSgprType::Vsharp; 16],
+            type_: [UserSgprType::Vsharp; UserSgprInfo::SGPRS_MAX],
             count: 16,
         };
         let user_data = ShaderUserData {
@@ -3254,12 +3257,12 @@ mod tests {
         // s[14:15] holds a 64-bit guest pointer (lo=0x29b98350, hi=0); the
         // load's byte offset (8) is added — the exact address increment 3 reads
         // the spilled descriptor from. Measured base from Minecraft's SRT VS.
-        let mut value = [0u32; 16];
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
         value[14] = 0x29b9_8350;
         value[15] = 0x0000_0001; // exercise the high dword too
         let user_sgpr = UserSgprInfo {
             value,
-            type_: [UserSgprType::Vsharp; 16],
+            type_: [UserSgprType::Vsharp; UserSgprInfo::SGPRS_MAX],
             count: 16,
         };
         let load = ScalarLoadRef {
@@ -3271,9 +3274,11 @@ mod tests {
             scalar_load_target_address(&load, &user_sgpr),
             Some(0x0000_0001_29b9_8358)
         );
-        // A base whose high dword falls off the 16-entry file -> None, no panic.
+        // A base whose high dword falls off the register file -> None, no
+        // panic. The boundary is the LAST slot (Gen5 graphics stages have 32,
+        // so s31's pair would need a nonexistent s32).
         let out_of_range = ScalarLoadRef {
-            base_register: 15,
+            base_register: (UserSgprInfo::SGPRS_MAX - 1) as i32,
             byte_offset: 0,
             dwords: 2,
         };

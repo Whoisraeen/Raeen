@@ -1536,7 +1536,14 @@ impl CommandProcessor {
     }
 
     fn set_shader_register(&mut self, reg: u32, value: u32) {
-        const SGPRS: u32 = 16;
+        // 32 user-SGPR registers per GRAPHICS stage on Gen5 (VS/PS/GS below);
+        // compute is handled separately by its own 16-wide
+        // COMPUTE_USER_DATA_0..15 range. Widened from Kyty's PS4-era 16 after
+        // measuring ASTRO.BOT pixel shaders declaring up to 32 — see
+        // `UserSgprInfo::SGPRS_MAX`. No SH-register collision: PS user data
+        // starts at 0x0C with the next SH register (VS_0) at 0x4C, and GS_0
+        // at 0x8C runs to ES_LO at 0xC8.
+        const SGPRS: u32 = 32;
         if reg as usize >= pm4::SH_NUM {
             if self.first(SkipKey::Reg(RegFile::Shader, reg)) {
                 warn!(

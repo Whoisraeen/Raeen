@@ -607,3 +607,45 @@ per-module authority is `docs/reference-port-ledger.md`.)
   (443,720 balanced HLE calls/30 s, last HLE scePthreadMutexUnlock), before AGC
   submission. Artifact: `scratch/astro-opcodes-20260718-201535/`; fix that boot
   regression before claiming a translated-shader or frame-count improvement.
+
+- ASTRO.BOT frame path — texture format 71 + validation-layer perf cliff
+  (2026-07-19, commit pending; xps5x-gpu 133/133 green, clippy clean).
+  DO NOT RE-DERIVE the following; all measured against the retail title with
+  `XPS5X_SKIP_MAIN_INIT=1 XPS5X_RESUME_ON_MISSING=1`:
+  * The title's GPU work is DETERMINISTIC across runs and across commits
+    21483ef/e77ea3f/HEAD: 256 DCB submissions, 1028 draws, 1497 dispatches,
+    36 VideoOut flips. "captured AGC submission" is rate-limited (logs the
+    first few + powers of two) — counting those lines UNDERCOUNTS submissions
+    by ~85x. Read "AGC submission progress" for real totals.
+  * The 21483ef-vs-HEAD "frame dump regression" was NOT a dump-path or
+    submission-routing bug. `ctx.gpu` (e77ea3f moved submits off
+    `AgcGpuSession::global()`) is correctly wired: runtime/thread.rs:410
+    calls `new_process` then `install_process`, so global() is the same
+    session. Queue routing is also correct (only GpuQueue::AsyncCompute maps
+    to is_compute).
+  * Real cause: e77ea3f's buffer/texture reclassification correctly began
+    treating a T# as a texture, exposing unified format 71 as unimplemented.
+    Every draw in the 7966-dword DCB then failed at DWORD 5053 (56 skips).
+    FIXED: unified 71 -> (dataFormat 12 = 16_16_16_16, numFormat 7 = FLOAT)
+    = R16G16B16A16_SFLOAT @ 8 bpp, verified against SharpEmu
+    Gfx10UnifiedFormat.cs:83 and its Gen5 layout table
+    (Gen5SpirvTranslator.cs:2667 "SetLayout(12,0,0,16) // 16_16_16_16").
+    8 bpp is bpp_log2 3, a table row no 1/4-byte format had exercised;
+    tile mode 27 (SW_64KB_R_X) already supported it. Draw skips 56 -> 0.
+  * `agc_exec.rs` hard-coded `VulkanBackend::new(true)`, so the Khronos
+    validation layer was ALWAYS on for titles: ~0.9 s per
+    vkCreateGraphicsPipelines, i.e. ~15 min for 1028 draws — the reason a
+    260 s run reached only one submission and looked like a GPU-worker hang.
+    Now opt-in via `XPS5X_VULKAN_VALIDATION=1`.
+  * STILL NO FRAME, and the remaining wall is now unambiguous: pixel/compute
+    shader translation. 16 shaders translate OK, 16 fail, and a draw needs
+    its PS, so every draw skips and `sink.last` stays None. Both failure
+    reasons share ONE root cause — Extended User Data:
+    `ps: user_sgpr > user sgpr count` (analysis.rs:2188 — the shader declares
+    more user SGPRs than were ever written; `count` is a high-water mark,
+    hw_regs.rs:714) and `ShaderUserData eud_size_dw != 0`. This is backlog
+    task #9 (EUD/SRT scalar resolver), NOT a dump/present/format problem.
+  * The two frames 21483ef produced were the known static green loading
+    composite, never the 3D scene — recovering that dump is not a scene frame.
+  Pre-existing (not from this work): `cargo fmt --all --check` fails on
+  committed `crates/kyty-graphics/src/run.rs:1262`; belongs to task #12.
