@@ -1845,3 +1845,138 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   CROSS-MODULE symbol-less RE across several stack frames — the definitive
   reason it is multi-session. Every tool + method demonstrated; the remaining
   work is mechanical-but-lengthy climbing, frame by frame, module by module.
+
+- SharpEmu HARDENING AUDIT — verified, two wins landed, two rejected as stale
+  (2026-07-20). Fanned out 7 agents to verify an external audit's claims against
+  CURRENT code (several were stale). Outcomes:
+  * DONE — NID CATALOG MERGE (highest-ROI, attacks HLE diagnosis gap). SharpEmu's
+    scripts/ps5_names.txt fed through XPS5X's OWN hash gate (nid_of) via a new
+    Rust tool `crates/xps5x-firmware/examples/merge_nid_catalog.rs`.
+    nid_names.txt 94,247 -> 149,905 (+55,658 hash-verified names; 4,553 .L*/`/`
+    junk dropped; existing wins collisions, __sys_dynlib_unload_prx preserved).
+    all_names_hash_to_their_nid re-proves the whole merged table (junk names are
+    harmless — a wrong name only labels a NID no title imports). PROVEN on a live
+    Minecraft run: the entire sceNpAuthAuthorizedAppDialog* import set (Close/
+    GetResult/GetStatus/Initialize/Open/Terminate/UpdateStatus) + sceAgcGetIs-
+    TrinityMode (0x05f0436466ed8bb0, our known libSceAgc gap) + sceKernelSyncOn-
+    AddressWait/Wake now resolve to NAMES where they printed raw NIDs before.
+    CAVEAT: naming != implementing — this closes the DIAGNOSIS gap so those
+    imports can be targeted, not the HLE gap.
+  * DONE — OPT-IN HEAP POISON (debugging-speed). `XPS5X_POISON_HEAP=1` fills
+    fresh malloc with 0xCD (libc.rs hle_malloc) so an uninitialized read shows
+    as 0xCDCDCDCD in the crash dump, not a silent zero. Off by default (a title
+    that treats malloc as calloc keeps working); calloc still zeroes (regression
+    test added). Poison-on-free (0xAF) deferred — GuestAllocator::free(addr) has
+    no size; needs a size-query on the trait.
+  * REJECTED — Net/NP differential rig (audit option B): STALE. Minecraft calls
+    ZERO NP fns; the audit's Net/NP wall was ASTRO's old log, superseded.
+  * REJECTED — SSE4a EXTRQ/INSERTQ patch: LATENT, not a live gap. Measured our
+    Zen4 host: CPUID SSE4A=1, so EXTRQ/INSERTQ execute NATIVELY with no #UD here;
+    no measured title emits them. Only an Intel/Rosetta concern.
+  Also confirmed (not acted): the memory-protection deficit is real (image RWX,
+  heap/stack/mmap RW, NO inter-region guard pages, guest mprotect ignored) —
+  W^X + guard pages is a valid future hardening, larger than this session.
+  Tests: xps5x-firmware 110+ green (merged table re-proven), xps5x-hle 289 green
+  (+2: heap_poison, calloc_still_zeroes). Attribution added to THIRD_PARTY_NOTICES.
+
+- DONE — INTER-REGION GUARD PAGES (memory hardening, 2026-07-20). The four
+  arena sub-regions (IMAGE/HEAP/STACK/MMAP) tiled with NO gaps, so an overflow
+  ran silently into the next region and surfaced as an anonymous fault millions
+  of ops later. Added always-on PAGE_NOACCESS guard pages at the two safe
+  boundaries (arena.rs GuestArena::new):
+    * IMAGE top [IMAGE_END-PAGE, IMAGE_END) — armed only when image_len fits
+      below it (checked); catches an image-region overrun into the heap.
+    * HEAP top [STACK_OFFSET-PAGE, STACK_OFFSET) — `alloc`'s heap_end lowered
+      to STACK_OFFSET-PAGE_SIZE so the allocator never hands it out; catches a
+      heap overrun upward AND a stack underrun downward.
+  The STACK|MMAP boundary is deliberately NOT guarded (initial RSP sits at the
+  stack top; a guard there would fault live data). A native guest store that
+  hits a guard traps via the existing VEH = "trap at the store", not "anonymous
+  fault later". Test `inter_region_guard_pages_are_noaccess_and_unallocatable`
+  proves NOACCESS via VirtualQuery + that alloc never lands on the guard and
+  ordinary alloc/write/read is unaffected (does NOT write to a guard — that
+  would fault the host copy). Updated heap-fill test: usable committed heap is
+  now HEAP_SIZE-PAGE. MEASURED: Minecraft boots unaffected (64 submissions,
+  draws progressing, zero spurious guard faults). 453 runtime+firmware+hle
+  tests green. NOT done (larger, deferred): W^X the image (blocked — our own
+  export-trap int3 + native_trap prologue patches WRITE guest code, so W^X
+  needs per-patch VirtualProtect toggling) and enforce guest mprotect (risk:
+  a title mprotecting a page our HLE later touches would fault). Both are real
+  future hardening; guard pages are the safe, self-contained, done slice.
+
+- DONE — W^X the code image, per-segment (2026-07-20, opt-in XPS5X_WX_IMAGE).
+  A stray guest DATA store into code no longer corrupts an instruction silently;
+  it faults at the store (caught by the existing VEH). KEY FINDING via
+  measurement: WHOLE-IMAGE W^X is WRONG — the image region holds .text AND
+  .data/.bss, so making it all read-only faults the first global write (Minecraft
+  stored to a .data global at boot immediately, RIP in the image region). Correct
+  W^X is PER-SEGMENT: RX only PF_X segments, .data/.bss stay RW. Implemented:
+    * LinkedModule gains `executable_ranges: Vec<(u64,u64)>` — the main module's
+      PF_X segment spans, collected in link_module (linker.rs, `flags & 1`).
+    * GuestArena::enable_wx_image(exec_ranges) VirtualProtects only those spans
+      to PAGE_EXECUTE_READ, clamped below the image|heap guard page.
+    * New GuestMemory::patch_code (default = write) lets instrumentation write
+      code under W^X; GuestArena overrides it to toggle RWX around the store and
+      restore RX. Routed the ONLY runtime code-write (export_trap one-shot
+      restore) through it; native_trap writes are pre-map (image buffer) or to
+      the stack (RW), so unaffected.
+    * maybe_enable_wx_image gated behind XPS5X_WX_IMAGE, wired at all 3 execute
+      sites.
+  MEASURED: with per-segment W^X on, Minecraft boots IDENTICALLY (64 submissions,
+  753 draws, zero image-region faults) — code protected, data writable. Whole-
+  image faulted immediately; per-segment is clean. Tests: unit
+  `wx_image_is_execute_read_and_patch_code_still_writes` + 454 runtime/firmware/
+  hle green. OPT-IN (not default): only the MAIN module's code is covered
+  (dependencies compose via a different path, stay RWX — documented scope), and
+  a title with self-modifying MAIN code would fault, so default-on needs
+  per-title validation. Mechanism is correct and done; flipping default + dep
+  coverage are future steps.
+  NOT done this turn: enforce guest mprotect (the third hardening item) — same
+  data/code-granularity + broad-risk profile; deferred for its own careful pass.
+
+- DONE — enforce guest mprotect, opt-in (2026-07-20, XPS5X_ENFORCE_MPROTECT).
+  sceKernelMprotect was an ok-stub and POSIX mprotect / BatchMap OP_PROTECT were
+  no-ops (protection bits stored in the VMA but never pushed to host pages), so a
+  title writing to a page it marked read-only succeeded silently. Now, under the
+  gate, the protection is really applied:
+    * New GuestMemory::protect(addr,len,prot) (default no-op returning true — the
+      historical behaviour for test memories and non-enforced runs).
+    * GuestArena overrides it: `orbis_prot_to_win` maps the Orbis CPU bitset
+      (CPU_READ=1/WRITE=2/EXEC=4, NO_ACCESS=0; GPU bits ignored; write implies
+      read) to Windows PAGE_*, then VirtualProtects the committed pages in range
+      page-by-page — skipping uncommitted pages (a reservation mprotect is legal)
+      and the NOACCESS guard pages (never reopened).
+    * Routed all three sites: sceKernelMprotect (new hle_kernel_mprotect,
+      replacing the ok-stub), hle_posix_mprotect, and BatchMap OP_PROTECT.
+  Same opt-in rationale as W^X: a title marking a page RO that our HLE later
+  writes would fault, so it is off by default. Tests: `orbis_prot_maps_to_the_
+  right_windows_page_flags`, `protect_reprotects_a_committed_heap_page_read_only`;
+  runtime 57 + hle 289 green, clippy/fmt clean. MEASURED: Minecraft boots
+  IDENTICALLY with it on (64 submissions, 753 draws, zero faults) — though it
+  issues no mprotect during boot, so the title does not exercise enforcement;
+  the path is proven by unit tests + no-regression. Both remaining hardening
+  items (W^X + enforce mprotect) are now DONE as opt-in, correct mechanisms.
+
+- DONE — implemented the NID-merge-recovered imports (2026-07-20). The catalogue
+  merge named 11 previously-anonymous imports; implemented the ones that close
+  real HLE gaps, all under the LIBRARY the title imports from (provider-aware):
+    * sceAgcGetIsTrinityMode (libSceAgc, 0x05f0436466ed8bb0) -> 0 (base PS5).
+      Registered alongside the existing libkernel twin; the astro-bot memory's
+      "known libSceAgc gap" is closed.
+    * sceKernelSyncOnAddressWait/Wake (libkernel) — address-parking (futex-like).
+      No reference tree has them (shadPS4/SharpEmu both lack SyncOnAddress), so
+      implemented on the codebase's established SPURIOUS-WAKEUP model: Wait
+      sleeps a 10ms slice and returns (caller re-checks its condition), Wake
+      returns success. Safe: never deadlocks, no tight spin.
+    * libSceNpAuthAuthorizedAppDialog Initialize/Open/UpdateStatus/GetStatus/
+      GetResult/Close/Terminate (7 fns) — the PSN authorize popup. Mirrors the
+      sceMsgDialog immediate-finish model: Open -> status FINISHED, GetStatus
+      reports it, GetResult writes a success result. A title polling the dialog
+      proceeds instead of hanging.
+  MEASURED on Minecraft: the 7 AuthorizedAppDialog imports went from MISSING to
+  resolved (0 still missing), total missing imports 126 -> 112, boot unaffected
+  (64 submissions). Tests: auth_dialog_completes_immediately_with_success + 290
+  hle green, clippy/fmt clean. This is the payoff of the catalogue merge: naming
+  an import is what makes it implementable, and these were unimplementable before
+  (anonymous NID). Does NOT unblock Minecraft's menu (game-internal, not NP) —
+  it closes import gaps that would gate a title that actually drives these.
