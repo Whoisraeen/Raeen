@@ -210,10 +210,33 @@ const POSIX_MEMALIGN_ENOMEM: u64 = 12;
 /// here fixed at 16 bytes — the usual `malloc` minimum) from the guest heap.
 /// Honest OOM: an exhausted/overflowing request returns `0` (`NULL`), never
 /// a sentinel or a panic.
+/// Opt-in heap poison (`XPS5X_POISON_HEAP=1`). Ported in spirit from SharpEmu,
+/// which fills fresh allocations so an uninitialized read surfaces as a
+/// recognizable byte pattern (`0xCDCDCDCD…`) in the crash dump instead of a
+/// silent zero that corrupts millions of ops downstream. Off by default: a
+/// title that (buggily) relies on `malloc` returning zeroed memory keeps
+/// working, and the poison is a deliberate debugging choice, not a behaviour
+/// change. Read once — the env var never changes mid-run.
+fn poison_heap_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("XPS5X_POISON_HEAP").is_some())
+}
+
+/// The uninitialized-allocation poison byte (SharpEmu / MSVC debug-CRT `0xCD`).
+const HEAP_ALLOC_POISON: u8 = 0xCD;
+
 fn hle_malloc(ctx: &HleContext, args: &[u64]) -> u64 {
     let size = args.first().copied().unwrap_or(0);
     debug!("malloc(size={size:#x})");
-    ctx.alloc.alloc(size, 16).unwrap_or(0)
+    let addr = ctx.alloc.alloc(size, 16).unwrap_or(0);
+    // Poison the requested span so a read before write is visible. Only the
+    // `size` bytes the caller asked for are touched — exactly what a real
+    // program may read — and never on a failed (0) allocation.
+    if addr != 0 && size != 0 && poison_heap_enabled() {
+        let _ = mem_fill(ctx, addr, HEAP_ALLOC_POISON, size);
+    }
+    addr
 }
 
 /// Real `free` releases a block previously returned by `malloc`/`calloc`/
@@ -1333,6 +1356,49 @@ mod tests {
     /// M1-C: `printf` reads the guest format string and `%s` pointee, formats
     /// against the captured registers, and lands the output in the kernel
     /// console — the observable-stdout contract.
+    /// Heap poison fills exactly the requested span with `0xCD` so an
+    /// uninitialized read is visible. Exercises the fill mechanism directly
+    /// (the `XPS5X_POISON_HEAP` gate is a cached `OnceLock`, unfriendly to a
+    /// per-test env toggle); poisoning is just `mem_fill(_, 0xCD, size)`.
+    #[test]
+    fn heap_poison_fills_the_requested_span_with_cd() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x100);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let size = 0x20u64;
+        let addr = ctx.alloc.alloc(size, 16).expect("test alloc");
+        assert!(mem_fill(&ctx, addr, HEAP_ALLOC_POISON, size));
+
+        let mut buf = vec![0u8; size as usize];
+        assert!(mem.read(addr, &mut buf));
+        assert!(
+            buf.iter().all(|&b| b == 0xCD),
+            "every poisoned byte reads back 0xCD"
+        );
+        // The byte just past the requested span is untouched (fill is exact).
+        let mut tail = [0u8; 1];
+        assert!(mem.read(addr + size, &mut tail));
+        assert_eq!(tail[0], 0, "poison does not spill past `size`");
+    }
+
+    /// `calloc` still zeroes after the poison change — a regression guard that
+    /// the poison path did not leak into the zero-on-allocate contract.
+    #[test]
+    fn calloc_still_zeroes_the_block() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x100);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let addr = hle_calloc(&ctx, &[4, 8]); // 32 bytes
+        assert_ne!(addr, 0);
+        let mut buf = [0xFFu8; 32];
+        assert!(mem.read(addr, &mut buf));
+        assert!(buf.iter().all(|&b| b == 0), "calloc zeroes its block");
+    }
+
     #[test]
     fn printf_formats_guest_strings_into_the_kernel_console() {
         let kernel = xps5x_kernel::OrbisKernel::new();

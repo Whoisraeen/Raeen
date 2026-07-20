@@ -296,6 +296,7 @@ fn pthread_once_runs_its_guest_initializer_before_returning() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -405,6 +406,7 @@ fn pthread_exit_unwinds_the_worker_and_delivers_its_value_to_join() {
     let linked = std::sync::Arc::new(LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -518,6 +520,7 @@ fn pthread_create_join_runs_a_real_guest_worker_with_tls() {
     let linked = std::sync::Arc::new(LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -614,6 +617,7 @@ fn detached_worker_is_reaped_before_the_fixed_guest_arena_is_reused() {
     let linked = std::sync::Arc::new(LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -707,6 +711,7 @@ fn call_to_unresolved_stub_reports_which_import_the_guest_wanted() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: stubs,
         module_inits: Vec::new(),
@@ -756,6 +761,7 @@ fn wild_fault_past_the_stub_table_is_still_an_anonymous_fault() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         module_inits: Vec::new(),
         unresolved_stubs: vec![UnresolvedStub {
@@ -803,6 +809,7 @@ fn call_to_unmapped_trampoline_index_returns_unresolved() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -828,6 +835,7 @@ fn more_than_six_args_is_rejected() {
     let linked = LinkedModule {
         image: vec![0xC3], // ret
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -870,6 +878,7 @@ fn genuine_wild_fault_recovers_as_faulted_then_process_keeps_running() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -1792,6 +1801,7 @@ fn guest_stub_uses_real_guest_stack_memory_and_returns_correct_value() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -1851,6 +1861,7 @@ fn guest_clobbering_r15_does_not_corrupt_host_rsp() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -1901,6 +1912,7 @@ fn guest_return_recovers_host_context_through_trampoline() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -1971,6 +1983,7 @@ fn trivial_ret_module() -> LinkedModule {
     LinkedModule {
         image: vec![0xC3], // ret
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -2017,6 +2030,7 @@ fn guest_fs_zero_load_reads_the_installed_tcb() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -2096,6 +2110,7 @@ fn guest_tls_survives_preemption_via_fsbase_rearm() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -2206,6 +2221,7 @@ fn genuine_wild_fault_after_preemption_recovers_instead_of_looping_the_veh() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -2301,6 +2317,7 @@ fn guest_fs_offset_round_trip_writes_and_reads_back() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -2407,6 +2424,7 @@ fn host_fsbase_is_restored_after_a_recovered_genuine_fault() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -2501,6 +2519,7 @@ fn start_stub_observes_argc_via_rdi_per_the_orbis_entry_abi() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -2546,6 +2565,7 @@ fn process_entry_receives_a_working_exit_callback_in_rsi() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -2582,6 +2602,7 @@ fn process_entry_has_orbis_called_function_stack_alignment() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -2618,6 +2639,7 @@ fn start_stub_observes_argc_equal_to_one_via_the_process_stack() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -2658,6 +2680,7 @@ fn start_stub_observes_argv0_first_byte_via_the_process_stack() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -2724,6 +2747,7 @@ fn start_stub_calling_exit_returns_exited_with_the_given_code() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -2787,6 +2811,7 @@ fn start_stub_wild_fault_still_recovers_as_faulted_through_execute_process() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -2842,6 +2867,7 @@ fn execute_process_restores_host_fsbase_after_an_exit_longjmp() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -3163,6 +3189,7 @@ fn stack_chk_guard_canary_at_fs_0x28_is_nonzero_with_terminator_byte() {
     let linked = LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits: Vec::new(),
@@ -3688,6 +3715,7 @@ fn init_linked_module(image: Vec<u8>, entry: u64, module_inits: Vec<ModuleInit>)
     LinkedModule {
         image,
         base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
         unresolved: Vec::new(),
         unresolved_stubs: Vec::new(),
         module_inits,

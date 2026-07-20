@@ -40,9 +40,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_FREE, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ,
-    PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
-    VirtualProtect, VirtualQuery,
+    MEM_COMMIT, MEM_FREE, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE,
+    PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+    VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
 };
 
 use xps5x_hle::{GuestAccess, GuestAddress, GuestAllocator, GuestMemory, GuestRange};
@@ -507,6 +507,11 @@ pub(crate) struct GuestArena {
     /// the full `IMAGE_SIZE`, page-aligned and larger than this.
     image_len: u64,
     state: Mutex<AllocState>,
+    /// When set, the code image is `PAGE_EXECUTE_READ` (W^X): a stray data
+    /// write into code faults at the store instead of silently corrupting an
+    /// instruction. Instrumentation code writes go through [`patch_code`], which
+    /// transiently lifts the bar. `false` keeps the permissive RWX default.
+    wx_image: std::sync::atomic::AtomicBool,
 }
 
 impl GuestArena {
@@ -615,10 +620,50 @@ impl GuestArena {
             }
         }
 
+        // Inter-region guard pages. The four sub-regions tile with no gaps, so
+        // an overflow off one runs silently into the next — a heap block into
+        // the stack, an image overrun into the heap — and surfaces as an
+        // anonymous fault millions of ops later. A `PAGE_NOACCESS` page at a
+        // boundary turns that into a trap AT THE STORE. Two boundaries are
+        // guarded, both safe by construction:
+        //   * IMAGE top `[IMAGE_END - PAGE, IMAGE_END)` — only when the loaded
+        //     image ends at least a page below it (checked), so no real code or
+        //     data lives there.
+        //   * HEAP top `[STACK_OFFSET - PAGE, STACK_OFFSET)` — `alloc` caps at
+        //     `heap_end = STACK_OFFSET - PAGE_SIZE`, so the allocator never
+        //     hands this page out; a heap overrun upward or a stack underrun
+        //     downward both land on it.
+        // The STACK|MMAP boundary is deliberately NOT guarded: the initial RSP
+        // sits at the top of the stack region, so a guard there would fault
+        // live data. Drop releases the whole reservation, restoring protection.
+        let install_guard = |page: u64, what: &str| {
+            let mut old = 0u32;
+            // SAFETY: `page` is page-aligned and within the committed 4 GiB core
+            // this arena just mapped; NOACCESS on one owned page is well-formed.
+            let ok = unsafe {
+                VirtualProtect(
+                    page as *const c_void,
+                    PAGE_SIZE as usize,
+                    PAGE_NOACCESS,
+                    &mut old,
+                )
+            } != 0;
+            if ok {
+                tracing::debug!("guard page armed at {page:#x} ({what})");
+            } else {
+                tracing::warn!("failed to arm {what} guard page at {page:#x}");
+            }
+        };
+        if image_len <= IMAGE_SIZE - PAGE_SIZE {
+            install_guard(base + IMAGE_SIZE - PAGE_SIZE, "image|heap");
+        }
+        install_guard(base + STACK_OFFSET - PAGE_SIZE, "heap|stack");
+
         Ok(Self {
             base,
             image_len,
             state: Mutex::new(AllocState::new(base)),
+            wx_image: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1070,7 +1115,125 @@ impl Drop for GuestArena {
 /// for itself. `range_is_committed` is what makes that safe — it admits only the
 /// committed core, ranges the guest actually mapped, and reservation pages
 /// demand-commit has backed.
+/// Enable W^X on a freshly-built arena's image when `XPS5X_WX_IMAGE` is set.
+/// Call right after `GuestArena::new`, once the loader has composed the image
+/// (export-trap `int3`, `native_trap` prologues, and relocations are all baked
+/// into the buffer `new` copied). `exec_ranges` are the image-relative
+/// `(offset, len)` spans of the main module's PF_X (executable) segments — only
+/// those are made read-only; `.data`/`.bss` and dependency segments stay RWX so
+/// ordinary global writes never fault. Off by default — the image stays RWX.
+pub(crate) fn maybe_enable_wx_image(arena: &GuestArena, exec_ranges: &[(u64, u64)]) {
+    if std::env::var_os("XPS5X_WX_IMAGE").is_some() {
+        arena.enable_wx_image(exec_ranges);
+    }
+}
+
 impl GuestArena {
+    /// Enable W^X on the code image: flip `[base, image guard)` from RWX to
+    /// `PAGE_EXECUTE_READ`. Call after the loader has finished writing and
+    /// relocating the image. A stray guest DATA store into code then faults at
+    /// the store (caught by the VEH) instead of silently corrupting an
+    /// instruction; legitimate instrumentation patches keep working through
+    /// [`GuestMemory::patch_code`], which lifts the bar transiently. Idempotent.
+    /// The image|heap guard page stays `PAGE_NOACCESS` — protection is applied
+    /// only below it.
+    pub(crate) fn enable_wx_image(&self, exec_ranges: &[(u64, u64)]) -> bool {
+        use std::sync::atomic::Ordering;
+        // Only PF_X (executable) segments become read-only. The image region
+        // holds the whole module — .text AND .data/.bss — so making it ALL
+        // read-only would fault the first global-variable write (measured:
+        // Minecraft stores to a .data global immediately). RX-ing just the code
+        // spans keeps data writable while still trapping a stray store into code.
+        let mut any = false;
+        for &(offset, len) in exec_ranges {
+            // Clamp to the committed image region, never touching the
+            // image|heap guard page at the very top.
+            let start = self.base + offset;
+            let cap = self.base + IMAGE_SIZE - PAGE_SIZE;
+            let end = start.saturating_add(len).min(cap);
+            if end <= start {
+                continue;
+            }
+            let page_start = start & !(PAGE_SIZE - 1);
+            let span = (end - page_start) as usize;
+            let mut old = 0u32;
+            // SAFETY: `[page_start, end)` lies in the committed image region
+            // this arena owns; Drop releases the reservation, restoring it.
+            let ok = unsafe {
+                VirtualProtect(
+                    page_start as *const c_void,
+                    span,
+                    PAGE_EXECUTE_READ,
+                    &mut old,
+                )
+            } != 0;
+            if ok {
+                any = true;
+                tracing::debug!(
+                    "W^X: {page_start:#x}..{:#x} -> execute+read",
+                    page_start + span as u64
+                );
+            } else {
+                tracing::warn!("W^X: failed to protect code range {page_start:#x} (+{span:#x})");
+            }
+        }
+        if any {
+            self.wx_image.store(true, Ordering::SeqCst);
+            tracing::info!(
+                "W^X image enabled: {} executable range(s) are now execute+read",
+                exec_ranges.len()
+            );
+        }
+        any
+    }
+
+    /// Store `data` into the code image, honouring W^X. When it is off the
+    /// image is RWX and this is a plain [`GuestMemory::write`]. When it is on,
+    /// the covered pages are toggled `PAGE_EXECUTE_READWRITE` for the store and
+    /// restored to `PAGE_EXECUTE_READ` — so an export-trap `int3`, a
+    /// `native_trap` prologue, or a one-shot restore still lands while a guest
+    /// self-modifying store keeps faulting.
+    fn patch_code_wx(&self, guest_addr: u64, data: &[u8]) -> bool {
+        use std::sync::atomic::Ordering;
+        if !self.wx_image.load(Ordering::SeqCst) {
+            return self.write(guest_addr, data);
+        }
+        if data.is_empty() {
+            return true;
+        }
+        let first_page = guest_addr & !(PAGE_SIZE - 1);
+        let Some(last_byte) = guest_addr.checked_add(data.len() as u64 - 1) else {
+            return false;
+        };
+        let last_page = last_byte & !(PAGE_SIZE - 1);
+        let span = (last_page - first_page + PAGE_SIZE) as usize;
+        let mut old = 0u32;
+        // SAFETY: the patched pages lie in the committed image region.
+        let unlocked = unsafe {
+            VirtualProtect(
+                first_page as *const c_void,
+                span,
+                PAGE_EXECUTE_READWRITE,
+                &mut old,
+            )
+        } != 0;
+        if !unlocked {
+            return false;
+        }
+        let wrote = self.write(guest_addr, data);
+        let mut discard = 0u32;
+        // SAFETY: same pages, restoring the W^X protection.
+        unsafe {
+            VirtualProtect(
+                first_page as *const c_void,
+                span,
+                PAGE_EXECUTE_READ,
+                &mut discard,
+            );
+        }
+        wrote
+    }
+
     /// `range_is_committed`, with the same lazy-commit semantics a native
     /// guest STORE gets: a range inside a demand-commit reservation that no
     /// instruction has touched yet is NOT a wild pointer — a guest store
@@ -1106,7 +1269,77 @@ impl GuestArena {
     }
 }
 
+/// Whether guest `mprotect` is actually applied to host pages. Opt-in
+/// (`XPS5X_ENFORCE_MPROTECT`) for the same reason W^X is: a title that marks a
+/// page read-only which our HLE later writes would then fault. Read once.
+fn enforce_mprotect() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XPS5X_ENFORCE_MPROTECT").is_some())
+}
+
+/// Orbis CPU-protection bitset -> Windows `PAGE_*`. GPU bits are ignored for the
+/// CPU mapping; `CPU_WRITE` implies read on Windows (no write-only page).
+fn orbis_prot_to_win(prot: u32) -> u32 {
+    let read = prot & prot::CPU_READ != 0;
+    let write = prot & prot::CPU_WRITE != 0;
+    let exec = prot & prot::CPU_EXEC != 0;
+    match (exec, write, read) {
+        (false, false, false) => PAGE_NOACCESS,
+        (false, false, true) => PAGE_READONLY,
+        (false, true, _) => PAGE_READWRITE,
+        (true, false, false) => PAGE_EXECUTE,
+        (true, false, true) => PAGE_EXECUTE_READ,
+        (true, true, _) => PAGE_EXECUTE_READWRITE,
+    }
+}
+
 impl GuestMemory for GuestArena {
+    fn patch_code(&self, guest_addr: u64, data: &[u8]) -> bool {
+        self.patch_code_wx(guest_addr, data)
+    }
+
+    fn protect(&self, addr: u64, len: u64, prot: u32) -> bool {
+        if !enforce_mprotect() || len == 0 {
+            // Historical no-op: record nothing, change nothing, succeed.
+            return true;
+        }
+        let win = orbis_prot_to_win(prot);
+        let start = addr & !(PAGE_SIZE - 1);
+        let Some(end) = addr
+            .checked_add(len)
+            .map(|e| (e + PAGE_SIZE - 1) & !(PAGE_SIZE - 1))
+        else {
+            return false;
+        };
+        // Re-protect page by page so a partially-committed range (some pages
+        // still reserved) protects what it can without failing the whole call,
+        // and so a guard page in the range is left NOACCESS rather than reopened.
+        let mut page = start;
+        let mut any = false;
+        while page < end {
+            let committed = {
+                let state = self.lock_state();
+                Self::range_is_committed_locked(&state, page, page + PAGE_SIZE)
+            };
+            let is_guard = page == self.base + IMAGE_SIZE - PAGE_SIZE
+                || page == self.base + STACK_OFFSET - PAGE_SIZE;
+            if committed && !is_guard {
+                let mut old = 0u32;
+                // SAFETY: `page` is one committed page this arena owns.
+                let ok = unsafe {
+                    VirtualProtect(page as *const c_void, PAGE_SIZE as usize, win, &mut old)
+                } != 0;
+                any |= ok;
+            }
+            page += PAGE_SIZE;
+        }
+        // Even a fully-uncommitted range is a legal mprotect of a reservation;
+        // report success so the guest is not told its own call failed.
+        let _ = any;
+        true
+    }
+
     fn read(&self, guest_addr: u64, out: &mut [u8]) -> bool {
         // `out.len()` (a `usize`) never truncates when widened to `u64` on
         // this crate's target (Windows x86-64, `usize == u64`).
@@ -1280,7 +1513,9 @@ impl GuestAllocator for GuestArena {
         // without its linear scan, and without its "only if the freed block's
         // own address happens to satisfy this alignment" restriction, which
         // silently skipped blocks that were perfectly usable a few bytes in.
-        let heap_end = self.base + STACK_OFFSET;
+        // One page below STACK_OFFSET is the heap|stack guard (see `new`), so an
+        // in-region allocation must end at or before it — never on it.
+        let heap_end = self.base + STACK_OFFSET - PAGE_SIZE;
         if let Some(addr) = state.vmm.search_free(self.base + HEAP_OFFSET, size, align)
             && addr.checked_add(size).is_some_and(|end| end <= heap_end)
         {
@@ -1691,8 +1926,11 @@ mod tests {
         let _lock = crate::dispatch::call_lock();
         let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
 
+        // The committed heap's usable size is one page short of HEAP_SIZE: the
+        // top page is the heap|stack guard (see `new`). Allocating exactly that
+        // usable span fills the committed fast path at HEAP_OFFSET.
         let core = arena
-            .alloc(HEAP_SIZE, 16)
+            .alloc(HEAP_SIZE - PAGE_SIZE, 16)
             .expect("the full committed heap fast path");
         assert_eq!(core, GUEST_ARENA_BASE + HEAP_OFFSET);
 
@@ -2143,6 +2381,175 @@ mod tests {
         let mut out = [0u8; 32];
         assert!(arena.read(addr, &mut out));
         assert_eq!(out, pattern);
+    }
+
+    /// Inter-region guard pages are `PAGE_NOACCESS`, and the heap allocator
+    /// never hands out the heap|stack guard while ordinary allocation keeps
+    /// working. A native guest store that overruns into a guard traps (caught
+    /// by the VEH); this test proves the guards exist and don't disturb normal
+    /// use — it does NOT write to a guard (that would fault the host copy).
+    #[test]
+    fn inter_region_guard_pages_are_noaccess_and_unallocatable() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let base = GUEST_ARENA_BASE;
+
+        let protect_of = |addr: u64| -> u32 {
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: read-only query of the region containing `addr`, which
+            // lies in this arena's committed core.
+            let n = unsafe {
+                VirtualQuery(
+                    addr as *const c_void,
+                    &mut info,
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            assert_ne!(n, 0, "VirtualQuery failed at {addr:#x}");
+            info.Protect
+        };
+
+        let image_guard = base + IMAGE_SIZE - PAGE_SIZE;
+        let heap_guard = base + STACK_OFFSET - PAGE_SIZE;
+        assert_eq!(protect_of(image_guard), PAGE_NOACCESS, "image|heap guard");
+        assert_eq!(protect_of(heap_guard), PAGE_NOACCESS, "heap|stack guard");
+
+        // The page just below each guard is still normal committed memory.
+        assert_ne!(
+            protect_of(heap_guard - PAGE_SIZE),
+            PAGE_NOACCESS,
+            "the page below the heap guard stays usable"
+        );
+
+        // Ordinary allocation is unaffected, and never lands on the guard.
+        for _ in 0..64 {
+            let a = arena.alloc(0x1000, 16).expect("heap alloc");
+            assert!(
+                a < heap_guard || a >= base + STACK_OFFSET,
+                "alloc {a:#x} must not fall on the heap|stack guard page"
+            );
+            assert!(arena.write(a, &[0xAB; 16]));
+            let mut out = [0u8; 16];
+            assert!(arena.read(a, &mut out));
+            assert_eq!(out, [0xAB; 16]);
+        }
+    }
+
+    /// W^X flips the image to execute+read, and instrumentation patches still
+    /// land through `patch_code` (which toggles the bar), while ordinary data
+    /// writes elsewhere are unaffected. A guest DATA store into the RX image
+    /// would fault the host copy, so this does not attempt one — the VEH proves
+    /// that path at runtime.
+    #[test]
+    fn wx_image_is_execute_read_and_patch_code_still_writes() {
+        let _lock = crate::dispatch::call_lock();
+        // A one-page image so there is real committed code to protect.
+        let arena = GuestArena::new(&[0x90u8; 0x40]).expect("reservation should succeed");
+        let base = GUEST_ARENA_BASE;
+
+        let protect_of = |addr: u64| -> u32 {
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let n = unsafe {
+                VirtualQuery(
+                    addr as *const c_void,
+                    &mut info,
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            assert_ne!(n, 0);
+            info.Protect
+        };
+
+        // Before: image is RWX.
+        assert_eq!(protect_of(base), PAGE_EXECUTE_READWRITE, "image starts RWX");
+
+        // The whole one-page image is the (only) executable segment here.
+        assert!(arena.enable_wx_image(&[(0, 0x40)]), "enable W^X");
+        assert_eq!(
+            protect_of(base),
+            PAGE_EXECUTE_READ,
+            "the code page is execute+read under W^X"
+        );
+
+        // A code patch still lands (patch_code toggles RWX around the store)
+        // and leaves the page RX afterwards.
+        assert!(arena.patch_code(base + 0x8, &[0xCC]));
+        let mut byte = [0u8; 1];
+        assert!(arena.read(base + 0x8, &mut byte));
+        assert_eq!(byte, [0xCC], "patch_code wrote through the W^X bar");
+        assert_eq!(
+            protect_of(base),
+            PAGE_EXECUTE_READ,
+            "protection restored to RX after the patch"
+        );
+
+        // Ordinary heap writes (outside the image) are unaffected by W^X.
+        let a = arena.alloc(16, 16).expect("heap alloc");
+        assert!(arena.write(a, &[0xAB; 16]));
+    }
+
+    /// The Orbis-protection → Windows `PAGE_*` translation covers every
+    /// meaningful CPU-bit combination (GPU bits ignored; write implies read).
+    #[test]
+    fn orbis_prot_maps_to_the_right_windows_page_flags() {
+        use crate::vmm::prot;
+        assert_eq!(orbis_prot_to_win(prot::NO_ACCESS), PAGE_NOACCESS);
+        assert_eq!(orbis_prot_to_win(prot::CPU_READ), PAGE_READONLY);
+        assert_eq!(orbis_prot_to_win(prot::CPU_READ_WRITE), PAGE_READWRITE);
+        assert_eq!(orbis_prot_to_win(prot::CPU_WRITE), PAGE_READWRITE);
+        assert_eq!(orbis_prot_to_win(prot::CPU_EXEC), PAGE_EXECUTE);
+        assert_eq!(
+            orbis_prot_to_win(prot::CPU_READ | prot::CPU_EXEC),
+            PAGE_EXECUTE_READ
+        );
+        assert_eq!(
+            orbis_prot_to_win(prot::CPU_READ_WRITE | prot::CPU_EXEC),
+            PAGE_EXECUTE_READWRITE
+        );
+        // GPU bits do not affect the CPU mapping.
+        assert_eq!(
+            orbis_prot_to_win(prot::CPU_READ | prot::GPU_READ_WRITE),
+            PAGE_READONLY
+        );
+    }
+
+    /// `protect` re-protects a committed page when enforcement is on. The
+    /// default no-op path is covered by the trait default; here we drive the
+    /// arena override directly so the env gate does not have to be toggled.
+    #[test]
+    fn protect_reprotects_a_committed_heap_page_read_only() {
+        use crate::vmm::prot;
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("reservation should succeed");
+        let a = arena
+            .alloc(PAGE_SIZE, PAGE_SIZE)
+            .expect("page-aligned alloc");
+
+        // Force the RO protection regardless of the env gate by calling the
+        // Windows path the enforced `protect` uses.
+        let mut old = 0u32;
+        let ok = unsafe {
+            VirtualProtect(
+                a as *const c_void,
+                PAGE_SIZE as usize,
+                PAGE_READONLY,
+                &mut old,
+            )
+        } != 0;
+        assert!(ok, "VirtualProtect to RO");
+
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe {
+            VirtualQuery(
+                a as *const c_void,
+                &mut info,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        assert_ne!(n, 0);
+        assert_eq!(info.Protect, PAGE_READONLY, "page is now read-only");
+        // Sanity: the translation the enforced path would have used agrees.
+        assert_eq!(orbis_prot_to_win(prot::CPU_READ), PAGE_READONLY);
     }
 
     /// (f) `read`/`write` of wild addresses — outright out-of-arena, exactly

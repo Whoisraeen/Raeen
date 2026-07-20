@@ -223,6 +223,11 @@ pub struct LinkedUnwindModule {
 pub struct LinkedModule {
     pub image: Vec<u8>,
     pub base: u64,
+    /// Image-relative `(offset, mem_size)` of the main module's PF_X
+    /// (executable) segments. The runtime uses these to make only code
+    /// read-only under W^X (`XPS5X_WX_IMAGE`) — `.data`/`.bss` must stay
+    /// writable, so protecting the whole image region is wrong.
+    pub executable_ranges: Vec<(u64, u64)>,
     /// Relocations whose symbol resolved to [`Resolver::Unresolved`] — logged,
     /// non-fatal. **One entry per relocation**; see [`UnresolvedImport`].
     ///
@@ -443,6 +448,17 @@ fn link_inner(
         image[start..end].copy_from_slice(&seg.data);
     }
 
+    // Record PF_X segment spans (bit 0 of the ELF segment flags) so the runtime
+    // can W^X only the code, not the whole image. mem_size covers .bss-style
+    // tails; a segment is rarely both writable and executable, but if one is,
+    // W^X on it is the intended, conservative behaviour.
+    let executable_ranges: Vec<(u64, u64)> = module
+        .segments
+        .iter()
+        .filter(|seg| seg.flags & 1 != 0)
+        .map(|seg| (seg.vaddr, seg.mem_size))
+        .collect();
+
     let mut unresolved: Vec<UnresolvedImport> = Vec::new();
 
     // Provider names are resolved per symtab entry (`r_sym`), not per NID:
@@ -630,6 +646,7 @@ fn link_inner(
     Ok(LinkedModule {
         image,
         base,
+        executable_ranges,
         unresolved,
         // Left empty here: the marker tables are process-wide and live in
         // `tables`. `link_module` (the single-module wrapper) moves them in

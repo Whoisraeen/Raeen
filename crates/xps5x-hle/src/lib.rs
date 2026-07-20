@@ -97,6 +97,29 @@ pub trait GuestMemory {
     /// nothing) if the write would fall outside the guest's mapped memory.
     fn write(&self, guest_addr: u64, data: &[u8]) -> bool;
 
+    /// Write into the guest CODE image (instrumentation patches: export-trap
+    /// `int3`, `native_trap` prologues, one-shot restores). Distinct from
+    /// [`write`] because a W^X backend makes the code image read-only, so a
+    /// plain data write there would fault; a code patch must transiently lift
+    /// the write bar. The default is a plain `write` — correct for the
+    /// permissive RWX default and for test memories; a W^X arena overrides it
+    /// to toggle page protection around the store.
+    fn patch_code(&self, guest_addr: u64, data: &[u8]) -> bool {
+        self.write(guest_addr, data)
+    }
+
+    /// Apply a guest `mprotect`: change the host protection of the committed
+    /// pages in `[addr, addr+len)` to the Orbis CPU-protection bitset `prot`
+    /// (`CPU_READ`=1, `CPU_WRITE`=2, `CPU_EXEC`=4, `NO_ACCESS`=0). The default
+    /// is a no-op returning `true` — the historical "protections not remapped"
+    /// behaviour — so a title that only queries or that runs without
+    /// enforcement is unaffected. A real arena overrides it (behind an opt-in
+    /// gate) to actually re-protect the pages, turning a write to a page the
+    /// guest marked read-only into a trap instead of silent success.
+    fn protect(&self, _addr: u64, _len: u64, _prot: u32) -> bool {
+        true
+    }
+
     /// Validate a whole guest range for the requested access without exposing
     /// a host pointer. Backends should override this with their authoritative
     /// map; the default probes one byte per 4 KiB page plus the last byte.

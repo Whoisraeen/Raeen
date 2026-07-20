@@ -344,6 +344,7 @@ pub fn execute_linked(
     let _call_lock = dispatch::call_lock();
 
     let arena = std::sync::Arc::new(arena::GuestArena::new(&module.image)?);
+    arena::maybe_enable_wx_image(&arena, &module.executable_ranges);
     let gpu = GpuShutdownGuard(xps5x_gpu::AgcGpuSession::new_process(arena.clone()));
     xps5x_gpu::AgcGpuSession::install_process(&gpu.0);
     // Expose the module's PT_SCE_PROCPARAM block (if any) to the guest via
@@ -496,6 +497,7 @@ pub fn execute_process(
 ) -> Result<RunOutcome, RuntimeError> {
     let _call_lock = dispatch::call_lock();
     let arena = std::sync::Arc::new(arena::GuestArena::new(&module.image)?);
+    arena::maybe_enable_wx_image(&arena, &module.executable_ranges);
     let guard = trampoline::TrampolineGuard::reserve(module.hle_trampolines.len())?;
     let gpu = xps5x_gpu::AgcGpuSession::new_process(arena.clone());
     xps5x_gpu::AgcGpuSession::install_process(&gpu);
@@ -555,6 +557,7 @@ fn execute_process_shared_inner(
 ) -> Result<RunOutcome, RuntimeError> {
     let _call_lock = dispatch::call_lock();
     let arena = std::sync::Arc::new(arena::GuestArena::new(&module.image)?);
+    arena::maybe_enable_wx_image(&arena, &module.executable_ranges);
     let guard = std::sync::Arc::new(trampoline::TrampolineGuard::reserve(
         module.hle_trampolines.len(),
     )?);

@@ -167,7 +167,10 @@ pub fn take_hit(fault_addr: u64, mem: &dyn GuestMemory, rsp: u64) -> bool {
         // already back; just re-execute it.
         return true;
     }
-    if !mem.write(fault_addr, &[trap.orig]) {
+    // `patch_code`, not `write`: this restores a byte in the CODE image, which
+    // is read-only under W^X. `patch_code` lifts the write bar transiently; it
+    // is a plain write when W^X is off.
+    if !mem.patch_code(fault_addr, &[trap.orig]) {
         warn!(
             "export_trap: {} nid={:#018x} hit at {fault_addr:#x} but the original byte could \
              not be restored — passing the breakpoint on",
