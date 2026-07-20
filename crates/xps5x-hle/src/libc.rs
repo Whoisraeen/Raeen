@@ -1161,8 +1161,10 @@ fn hle_strtol(ctx: &HleContext, args: &[u64]) -> u64 {
     strtol_impl(ctx, nptr, endptr, base, false)
 }
 
-/// Real `strtoul(nptr, endptr, base)`: like `strtol` but unsigned.
-fn hle_strtoul(ctx: &HleContext, args: &[u64]) -> u64 {
+/// Real `strtoul(nptr, endptr, base)`: like `strtol` but unsigned. Shared
+/// with `libSceLibcInternal`'s `_Stoul` (the Dinkumware STL's strtoul core,
+/// same `(nptr, endptr, base)` signature) — see `libsce_libc_internal`.
+pub(crate) fn hle_strtoul(ctx: &HleContext, args: &[u64]) -> u64 {
     let nptr = args.first().copied().unwrap_or(0);
     let endptr = args.get(1).copied().unwrap_or(0);
     let base = args.get(2).copied().unwrap_or(0) as u32;

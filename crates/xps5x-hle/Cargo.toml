@@ -21,6 +21,8 @@ memchr = "2"
 # deterministic emulator-global seed to titles.
 getrandom = "0.3"
 sha1 = { workspace = true }
+# Real JSON parsing for libSceJson2 Parser::parse (host-side value model).
+serde_json = { workspace = true }
 
 # GetTimeZoneInformation for libSceRtc's UTC→local conversion (Windows-only).
 [target.'cfg(windows)'.dependencies]

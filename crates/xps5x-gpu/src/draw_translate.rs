@@ -26,13 +26,14 @@ use crate::vulkan::compute::{ComputeState, dispatch_compute};
 use crate::vulkan::instance::VulkanDevice;
 use crate::vulkan::offscreen::{
     BlendState, CLEAR_COLOR, DrawState, RenderedImage, ShaderStageBinding, StorageBufferBinding,
-    TextureBinding, TextureUpload, VertexAttributeData, VertexBufferData, render_draw,
+    StorageImageBinding, StorageImageUpload, TextureBinding, TextureUpload, VertexAttributeData,
+    VertexBufferData, render_draw,
 };
 use ash::vk;
 use kyty_graphics::hw_regs::{ComputeShaderInfo, Context, Shader, UserConfig};
 use kyty_graphics::run::{DrawError, DrawSink, IndexedDraw};
 use kyty_graphics::shader::resources::{
-    ShaderBindResources, ShaderPixelInputInfo, ShaderVertexInputInfo,
+    ShaderBindResources, ShaderPixelInputInfo, ShaderTextureUsage, ShaderVertexInputInfo,
 };
 use kyty_graphics::shader::{spirv_get_embedded_ps, spirv_get_embedded_vs};
 use kyty_graphics::spirv_asm;
@@ -693,6 +694,65 @@ fn decode_texture(
     })
 }
 
+/// Gen5 unified T# formats that are 32 bits per pixel — the only ones whose
+/// guest bytes can seed an `R8G8B8A8_UNORM` storage image directly (the
+/// recompiled SPIR-V declares every `%textures2D_L` entry as `Rgba8`).
+fn storage_image_format_is_32bpp(format: u16) -> bool {
+    // 0x0a/56 = 8_8_8_8, 22 = 32 FLOAT, 36 = 10_11_11 FLOAT — see
+    // `decode_texture`'s table for the measurements behind each.
+    matches!(format, 0x0a | 22 | 36 | 56)
+}
+
+/// Read one storage-image (UAV) T#'s extent and initial guest content.
+///
+/// The content is a best-effort seed: a UAV is typically fully overwritten by
+/// the dispatch, so a T# whose format is not 32-bpp (RGBA8-sized) or whose
+/// guest range is unreadable zero-fills with a once-per-process warning
+/// instead of failing the dispatch.
+fn read_storage_image(
+    t: &kyty_graphics::shader::ShaderTextureResource,
+) -> Result<StorageImageUpload, DrawError> {
+    let width = u32::from(t.width5()) + 1;
+    let height = u32::from(t.height5()) + 1;
+    if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) {
+        return Err(err(format!(
+            "storage image extent {width}x{height} out of range"
+        )));
+    }
+    let size = u64::from(width) * u64::from(height) * 4;
+    let base = t.base40();
+    let readable = storage_image_format_is_32bpp(t.format());
+    let pixels = if readable {
+        // Linear read: UAV surfaces the title dispatches into are addressed
+        // by the shader itself, so no de-tiling is applied to the seed.
+        read_guest_bytes(base, size, "storage image").ok()
+    } else {
+        None
+    };
+    let pixels = pixels.unwrap_or_else(|| {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                base = format_args!("{base:#x}"),
+                extent = format_args!("{width}x{height}"),
+                format = t.format(),
+                readable_as_32bpp = readable,
+                "storage image initial content unavailable (non-32-bpp format \
+                 or unreadable guest range) — zero-filling; the compute shader \
+                 typically overwrites the whole UAV"
+            );
+        }
+        vec![0u8; size as usize]
+    });
+    Ok(StorageImageUpload {
+        width,
+        height,
+        pixels,
+        guest_base: base,
+    })
+}
+
 thread_local! {
     /// Raw pointer to the live render-target map for the draw currently being
     /// translated. `OffscreenDrawSink` sets it to its `framebuffers` immediately
@@ -750,10 +810,10 @@ fn prepare_stage_binding(
     if texture_num > bind.textures2d.desc.len() || sampler_num > bind.samplers.samplers.len() {
         return Err(err("texture/sampler count exceeds fixed array"));
     }
-    if bind.textures2d.textures2d_storage_num != 0 {
+    if bind.textures2d.textures2d_storage_num != 0 && stage != vk::ShaderStageFlags::COMPUTE {
         return Err(err(format!(
-            "translated {stage:?} shader uses {} STORAGE image(s) — only sampled \
-             textures are implemented",
+            "translated {stage:?} shader uses {} STORAGE image(s) — storage images \
+             are implemented for COMPUTE dispatches only",
             bind.textures2d.textures2d_storage_num
         )));
     }
@@ -824,42 +884,81 @@ fn prepare_stage_binding(
         }
     }
 
-    // T#s: decode + upload list, and the rewritten 8-dword descriptor in the
+    // T#s: decode + upload lists, and the rewritten 8-dword descriptor in the
     // push constants — the recompiled shader loads dword 0 at runtime as its
-    // index into the %textures2D_S array.
+    // index into the %textures2D_S (sampled) or %textures2D_L (storage) array.
+    // The push constants stay in analysis order over ALL T#s, but each
+    // rewritten dword 0 is the index WITHIN its own descriptor array: sampled
+    // T#s count 0..sampled_num and storage (usage == ReadWrite) T#s count
+    // 0..storage_num, because the two SPIR-V arrays are separate bindings.
     let mut textures = Vec::with_capacity(texture_num);
+    let mut storage_images = Vec::new();
     for (index, desc) in bind.textures2d.desc[..texture_num].iter().enumerate() {
-        let mut decoded = decode_texture(&desc.texture)?;
-        // If this T# points at a live render target, sample its actual rendered
-        // pixels — they live in the framebuffer map, not the guest memory
-        // decode_texture reads (render targets are never written back). Without
-        // this, a title's final composite (a fullscreen quad sampling its scene
-        // targets) reads black, so nothing shows on screen.
-        if let Some(px) = render_target_pixels(desc.texture.base40(), decoded.width, decoded.height)
-        {
-            decoded.pixels = px;
-        }
-        if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static SEEN: AtomicU32 = AtomicU32::new(0);
-            if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
-                tracing::warn!(
-                    stage = ?stage,
-                    index,
-                    base = format_args!("{:#x}", desc.texture.base40()),
-                    width = decoded.width,
-                    height = decoded.height,
-                    vk_format = ?decoded.format,
-                    "TRACE_DRAWS: texture decoded"
-                );
-            }
-        }
-        textures.push(decoded);
         let mut rewritten = desc.texture;
-        rewritten.update_address38(index as u64);
+        if desc.usage == ShaderTextureUsage::ReadWrite {
+            let upload = read_storage_image(&desc.texture)?;
+            if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static SEEN: AtomicU32 = AtomicU32::new(0);
+                if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
+                    tracing::warn!(
+                        stage = ?stage,
+                        index,
+                        base = format_args!("{:#x}", upload.guest_base),
+                        width = upload.width,
+                        height = upload.height,
+                        "TRACE_DRAWS: storage image bound"
+                    );
+                }
+            }
+            rewritten.update_address38(storage_images.len() as u64);
+            storage_images.push(upload);
+        } else {
+            let mut decoded = decode_texture(&desc.texture)?;
+            // If this T# points at a live render target, sample its actual
+            // rendered pixels — they live in the framebuffer map, not the
+            // guest memory decode_texture reads (render targets are never
+            // written back). Without this, a title's final composite (a
+            // fullscreen quad sampling its scene targets) reads black, so
+            // nothing shows on screen.
+            if let Some(px) =
+                render_target_pixels(desc.texture.base40(), decoded.width, decoded.height)
+            {
+                decoded.pixels = px;
+            }
+            if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static SEEN: AtomicU32 = AtomicU32::new(0);
+                if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
+                    tracing::warn!(
+                        stage = ?stage,
+                        index,
+                        base = format_args!("{:#x}", desc.texture.base40()),
+                        width = decoded.width,
+                        height = decoded.height,
+                        vk_format = ?decoded.format,
+                        "TRACE_DRAWS: texture decoded"
+                    );
+                }
+            }
+            rewritten.update_address38(textures.len() as u64);
+            textures.push(decoded);
+        }
         for field in rewritten.fields {
             push_constants.extend_from_slice(&field.to_le_bytes());
         }
+    }
+    if storage_images.len() != bind.textures2d.textures2d_storage_num as usize
+        || textures.len() != bind.textures2d.textures2d_sampled_num as usize
+    {
+        return Err(err(format!(
+            "translated {stage:?} T# usage split gives {} sampled + {} storage but the \
+             analyzer counted {} + {}",
+            textures.len(),
+            storage_images.len(),
+            bind.textures2d.textures2d_sampled_num,
+            bind.textures2d.textures2d_storage_num
+        )));
     }
 
     // S#s: only the mag-filter bit is honoured today; the rewritten descriptor
@@ -908,11 +1007,15 @@ fn prepare_stage_binding(
             binding: bind.storage_buffers.binding_index as u32,
             buffers: storage_bytes,
         }),
-        textures: (texture_num != 0).then_some(TextureBinding {
+        textures: (!textures.is_empty()).then_some(TextureBinding {
             sampled_binding: bind.textures2d.binding_sampled_index as u32,
             sampler_binding: bind.samplers.binding_index as u32,
             textures,
             linear_filter,
+        }),
+        storage_images: (!storage_images.is_empty()).then_some(StorageImageBinding {
+            binding: bind.textures2d.binding_storage_index as u32,
+            images: storage_images,
         }),
     })
 }
@@ -1481,6 +1584,13 @@ impl DrawSink for OffscreenDrawSink<'_> {
             .iter()
             .map(|resource| resource.base48())
             .collect();
+        // Storage-image guest bases, collected pre-dispatch in the same order
+        // `ComputeOutputs::images` returns them.
+        let guest_image_outputs: Vec<u64> = prepared
+            .as_ref()
+            .and_then(|binding| binding.storage_images.as_ref())
+            .map(|images| images.images.iter().map(|img| img.guest_base).collect())
+            .unwrap_or_default();
         let outputs = dispatch_compute(
             self.dev,
             &ComputeState {
@@ -1490,14 +1600,21 @@ impl DrawSink for OffscreenDrawSink<'_> {
             },
         )
         .map_err(|error| err(format!("Vulkan compute dispatch failed: {error}")))?;
-        if outputs.len() != guest_outputs.len() {
+        if outputs.buffers.len() != guest_outputs.len() {
             return Err(err(format!(
                 "compute writeback returned {} buffers for {} guest outputs",
-                outputs.len(),
+                outputs.buffers.len(),
                 guest_outputs.len()
             )));
         }
-        for (addr, bytes) in guest_outputs.into_iter().zip(outputs) {
+        if outputs.images.len() != guest_image_outputs.len() {
+            return Err(err(format!(
+                "compute writeback returned {} images for {} guest image outputs",
+                outputs.images.len(),
+                guest_image_outputs.len()
+            )));
+        }
+        for (addr, bytes) in guest_outputs.into_iter().zip(outputs.buffers) {
             debug!(
                 addr = format_args!("{addr:#x}"),
                 len = bytes.len(),
@@ -1516,6 +1633,30 @@ impl DrawSink for OffscreenDrawSink<'_> {
             if !crate::guest_mem::write_bytes_checked(addr, &bytes) {
                 return Err(err(format!(
                     "compute storage writeback range {addr:#x}..{:#x} is not writable guest memory",
+                    addr.saturating_add(bytes.len() as u64)
+                )));
+            }
+        }
+        for (addr, bytes) in guest_image_outputs.into_iter().zip(outputs.images) {
+            let nonzero = bytes.iter().any(|&b| b != 0);
+            debug!(
+                addr = format_args!("{addr:#x}"),
+                len = bytes.len(),
+                nonzero,
+                "compute storage-image writeback"
+            );
+            if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
+                tracing::warn!(
+                    addr = format_args!("{addr:#x}"),
+                    len = bytes.len(),
+                    nonzero,
+                    "TRACE_DRAWS: compute image writeback"
+                );
+            }
+            if !crate::guest_mem::write_bytes_checked(addr, &bytes) {
+                return Err(err(format!(
+                    "compute storage-image writeback range {addr:#x}..{:#x} is not writable \
+                     guest memory",
                     addr.saturating_add(bytes.len() as u64)
                 )));
             }
@@ -1985,6 +2126,130 @@ mod tests {
             16,
             "rewritten descriptor must preserve the guest stride"
         );
+    }
+
+    /// A linear (tile mode 0) format-56 RGBA8 T# at `base`, `w`x`h`.
+    fn rgba8_linear_tsharp(
+        base: u64,
+        w: u32,
+        h: u32,
+    ) -> kyty_graphics::shader::ShaderTextureResource {
+        assert_eq!(base & 0xff, 0, "base40 drops the low 8 bits");
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.update_address40(base >> 8);
+        t.fields[1] |= 56 << 20; // unified format 8_8_8_8 UNORM
+        t.fields[1] |= ((w - 1) & 3) << 30; // width5 low bits
+        t.fields[2] = (w - 1) >> 2; // width5 high bits
+        t.fields[2] |= (h - 1) << 14; // height5
+        t.fields[3] |= 9 << 28; // type = Texture2D (tile mode stays 0 = linear)
+        t
+    }
+
+    /// The ASTRO.BOT front-#3 shape: a COMPUTE stage whose T#s mix sampled
+    /// textures and storage images (usage == ReadWrite). The push constants
+    /// must keep ALL T#s in analysis order, but each rewritten dword 0 is the
+    /// index WITHIN its own descriptor array — sampled T#s count through
+    /// `%textures2D_S` and storage T#s through `%textures2D_L` — and the
+    /// storage list must carry extent, initial content, and guest base.
+    #[test]
+    // Nested array/struct field setup (`bind.textures2d.desc[0].texture`)
+    // can't use struct-init syntax, so the default-then-assign form stays.
+    #[allow(clippy::field_reassign_with_default)]
+    fn compute_binding_splits_sampled_and_storage_tsharps() {
+        const W: u32 = 4;
+        const H: u32 = 4;
+        const BYTES: usize = (W * H * 4) as usize;
+
+        // One 256-aligned arena: sampled A at +0, storage at +256, sampled B
+        // at +512 (base40 requires 256-aligned bases).
+        let mut arena = vec![0u8; 1024 + 255];
+        let base = (arena.as_ptr() as u64 + 255) & !255;
+        let off = (base - arena.as_ptr() as u64) as usize;
+        for i in 0..BYTES {
+            arena[off + i] = (i % 251) as u8; // sampled A
+            arena[off + 256 + i] = ((i * 3 + 7) % 251) as u8; // storage seed
+            arena[off + 512 + i] = ((i * 5 + 11) % 251) as u8; // sampled B
+        }
+        let content = |o: usize| arena[off + o..off + o + BYTES].to_vec();
+        let (tex_a, uav, tex_b) = (content(0), content(256), content(512));
+
+        let mut bind = ShaderBindResources::default();
+        bind.push_constant_size = 3 * 32; // three 8-dword T#s, nothing else
+        bind.textures2d.textures_num = 3;
+        bind.textures2d.textures2d_sampled_num = 2;
+        bind.textures2d.textures2d_storage_num = 1;
+        bind.textures2d.binding_sampled_index = 0;
+        bind.textures2d.binding_storage_index = 1;
+        bind.textures2d.desc[0].texture = rgba8_linear_tsharp(base, W, H);
+        bind.textures2d.desc[1].texture = rgba8_linear_tsharp(base + 256, W, H);
+        bind.textures2d.desc[1].usage = ShaderTextureUsage::ReadWrite;
+        bind.textures2d.desc[2].texture = rgba8_linear_tsharp(base + 512, W, H);
+
+        let ranges = [(arena.as_ptr() as u64, arena.len())];
+        let binding = crate::guest_mem::with_test_ranges(&ranges, || {
+            prepare_stage_binding(&bind, vk::ShaderStageFlags::COMPUTE)
+        })
+        .expect("mixed sampled + storage compute binding");
+
+        // Sampled array: the two non-ReadWrite T#s, in analysis order.
+        let textures = binding.textures.expect("sampled textures");
+        assert_eq!(textures.sampled_binding, 0);
+        assert_eq!(textures.textures.len(), 2);
+        assert_eq!(textures.textures[0].pixels, tex_a);
+        assert_eq!(textures.textures[1].pixels, tex_b);
+
+        // Storage array: extent, guest seed content, and writeback base.
+        let storage = binding.storage_images.expect("storage images");
+        assert_eq!(storage.binding, 1);
+        assert_eq!(storage.images.len(), 1);
+        assert_eq!(storage.images[0].width, W);
+        assert_eq!(storage.images[0].height, H);
+        assert_eq!(storage.images[0].guest_base, base + 256);
+        assert_eq!(storage.images[0].pixels, uav);
+
+        // Push constants: 3 x 32 bytes in desc[] order; dword 0 of each is
+        // the PER-ARRAY index — sampled 0, storage 0, sampled 1.
+        assert_eq!(binding.push_constants.len(), 96);
+        let dword0 = |group: usize| {
+            u32::from_le_bytes(
+                binding.push_constants[group * 32..group * 32 + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(dword0(0), 0, "first sampled T# indexes %textures2D_S[0]");
+        assert_eq!(dword0(1), 0, "storage T# indexes %textures2D_L[0]");
+        assert_eq!(dword0(2), 1, "second sampled T# indexes %textures2D_S[1]");
+        // The rewrite must not clobber the descriptor's format bits.
+        assert_eq!(
+            (u32::from_le_bytes(binding.push_constants[36..40].try_into().unwrap()) >> 20) & 0x1ff,
+            56,
+            "storage T# dword 1 keeps its unified format"
+        );
+
+        // Graphics stages still reject storage images by name.
+        let e = crate::guest_mem::with_test_ranges(&ranges, || {
+            prepare_stage_binding(&bind, vk::ShaderStageFlags::FRAGMENT)
+        })
+        .expect_err("storage images are compute-only");
+        assert!(e.0.contains("STORAGE"), "names the storage rejection: {e}");
+    }
+
+    /// A storage T# whose format is not 32-bpp must zero-fill its seed (warn
+    /// once) instead of failing the dispatch — the UAV is typically fully
+    /// overwritten by the shader anyway.
+    #[test]
+    fn storage_image_with_non_32bpp_format_zero_fills() {
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.update_address40(0x100); // base 0x10000, unreadable — must not matter
+        t.fields[1] |= 1 << 20; // unified format 1 = R8 UNORM (1 byte per pixel)
+        t.fields[1] |= 3 << 30; // width5 low bits (w-1 = 3)
+        t.fields[2] |= 3 << 14; // height5 (h-1 = 3)
+        t.fields[3] |= 9 << 28;
+        let upload = read_storage_image(&t).expect("zero-filled storage image");
+        assert_eq!((upload.width, upload.height), (4, 4));
+        assert_eq!(upload.guest_base, 0x10000);
+        assert_eq!(upload.pixels, vec![0u8; 64]);
     }
 
     /// The classic alpha-over blend: SRC_ALPHA / ONE_MINUS_SRC_ALPHA / ADD.

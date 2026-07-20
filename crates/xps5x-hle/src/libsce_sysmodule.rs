@@ -29,6 +29,16 @@ pub fn register(registry: &HleRegistry) {
         hle_unload_module,
     );
     registry.register("libSceSysmodule", "sceSysmoduleIsLoaded", hle_is_loaded);
+    // `sceSysmoduleGetModuleInfoForUnwind(addr, flags, info)` is a thin
+    // wrapper over the kernel's `sceKernelGetModuleInfoForUnwind` (shadPS4
+    // `sysmodule.cpp:31` delegates exactly this way, minus a system-module
+    // name-hiding step XPS5X has no need for) — same 304-byte info ABI, same
+    // EINVAL/EFAULT/ESRCH error surface.
+    registry.register(
+        "libSceSysmodule",
+        "sceSysmoduleGetModuleInfoForUnwind",
+        crate::libkernel::hle_get_module_info_for_unwind,
+    );
 }
 
 /// `sceSysmoduleLoadModule(id, ...)`: succeeds — the module's functions are

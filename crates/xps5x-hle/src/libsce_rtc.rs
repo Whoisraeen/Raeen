@@ -87,6 +87,9 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceRtc", "sceRtcCheckValid", hle_check_valid);
     registry.register("libSceRtc", "sceRtcGetTick", hle_get_tick);
     registry.register("libSceRtc", "sceRtcSetTick", hle_set_tick);
+    registry.register("libSceRtc", "sceRtcSetTime_t", hle_set_time_t);
+    registry.register("libSceRtc", "sceRtcFormatRFC3339", hle_format_rfc3339);
+    registry.register("libSceRtc", "sceRtcParseRFC3339", hle_parse_rfc3339);
     registry.register("libSceRtc", "sceRtcCompareTick", hle_compare_tick);
     registry.register("libSceRtc", "sceRtcTickAddTicks", hle_tick_add::<1>);
     registry.register("libSceRtc", "sceRtcTickAddMicroseconds", hle_tick_add::<1>);
@@ -352,6 +355,186 @@ fn hle_set_tick(ctx: &HleContext, args: &[u64]) -> u64 {
     }
     let dt = tick_to_datetime(u64::from_le_bytes(buf));
     if !write_datetime(ctx, out_ptr, &dt) {
+        return ERR_INVALID_POINTER;
+    }
+    OK
+}
+
+/// `sceRtcSetTime_t(SceRtcDateTime *out, time_t seconds)`: break a Unix
+/// `time_t` out into a calendar date-time. shadPS4 `rtc.cpp:982` (NID
+/// `bDEVVP4bTjQ`): tick = seconds * 1e6 + UNIX_EPOCH_TICKS; a negative
+/// `time_t` is INVALID_VALUE on SDK >= 3.00 (XPS5X reports SDK 9.00, see
+/// `libkernel::GEN5_SDK_VERSION`, so the modern branch always applies).
+fn hle_set_time_t(ctx: &HleContext, args: &[u64]) -> u64 {
+    let out_ptr = args.first().copied().unwrap_or(0);
+    let seconds = args.get(1).copied().unwrap_or(0) as i64;
+    if out_ptr == 0 {
+        return ERR_INVALID_POINTER;
+    }
+    if seconds < 0 {
+        return ERR_INVALID_VALUE;
+    }
+    let Some(unix_micros) = (seconds as u64).checked_mul(MICROSECONDS_PER_SECOND) else {
+        return ERR_INVALID_VALUE;
+    };
+    let tick = UNIX_EPOCH_TICKS.saturating_add(unix_micros);
+    let dt = tick_to_datetime(tick);
+    if !write_datetime(ctx, out_ptr, &dt) {
+        return ERR_INVALID_POINTER;
+    }
+    OK
+}
+
+/// `sceRtcFormatRFC3339(char *out, const SceRtcTick *tickUtc, int
+/// timeZoneMinutes)`: render a tick as
+/// `YYYY-MM-DDTHH:MM:SS.ff(Z|±hh:mm)`.
+///
+/// Semantics follow shadPS4 `sceRtcFormatRFC3339Precise` (`rtc.cpp:285`, NID
+/// `WJ3rqFwymew` routes there): a NULL tick formats the CURRENT time; the
+/// timezone offset in minutes is added to the tick before breakdown and then
+/// rendered as the offset suffix (`Z` when 0); the fractional part is two
+/// digits (centiseconds), always present.
+fn hle_format_rfc3339(ctx: &HleContext, args: &[u64]) -> u64 {
+    let out_ptr = args.first().copied().unwrap_or(0);
+    let tick_ptr = args.get(1).copied().unwrap_or(0);
+    let tz_minutes = args.get(2).copied().unwrap_or(0) as i32;
+    if out_ptr == 0 {
+        return ERR_INVALID_POINTER;
+    }
+    let tick = if tick_ptr == 0 {
+        current_tick()
+    } else {
+        let mut buf = [0u8; 8];
+        if !ctx.mem.read(tick_ptr, &mut buf) {
+            return ERR_INVALID_POINTER;
+        }
+        u64::from_le_bytes(buf)
+    };
+    let shifted = if tz_minutes >= 0 {
+        tick.saturating_add(tz_minutes as u64 * MICROSECONDS_PER_MINUTE)
+    } else {
+        tick.saturating_sub(tz_minutes.unsigned_abs() as u64 * MICROSECONDS_PER_MINUTE)
+    };
+    let dt = tick_to_datetime(shifted);
+    let mut text = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:02}",
+        dt.year,
+        dt.month,
+        dt.day,
+        dt.hour,
+        dt.minute,
+        dt.second,
+        dt.micro / 10_000, // two fractional digits (centiseconds), shadPS4
+    );
+    if tz_minutes == 0 {
+        text.push('Z');
+    } else {
+        let sign = if tz_minutes < 0 { '-' } else { '+' };
+        let abs = tz_minutes.unsigned_abs();
+        text.push_str(&format!("{sign}{:02}:{:02}", abs / 60, abs % 60));
+    }
+    text.push('\0');
+    if !ctx.mem.write(out_ptr, text.as_bytes()) {
+        return ERR_INVALID_POINTER;
+    }
+    OK
+}
+
+/// `sceRtcParseRFC3339(SceRtcTick *tickUtc, const char *text)`: parse
+/// `YYYY-MM-DDTHH:MM:SS[.f...](Z|±hh:mm)` into a UTC tick.
+///
+/// Field positions follow shadPS4 `sceRtcParseRFC3339` (`rtc.cpp:796`, NID
+/// `99bMGglFW3I`); fractional digits beyond what is present are 0, and the
+/// numeric UTC-offset suffix is SUBTRACTED from the parsed local time to
+/// reach UTC (RFC 3339 §4.2: local = UTC + offset ⇒ UTC = local − offset;
+/// shadPS4 applies the offset with the opposite sign, which round-trips its
+/// own formatter but inverts real offsets — deliberately not mirrored).
+fn hle_parse_rfc3339(ctx: &HleContext, args: &[u64]) -> u64 {
+    let tick_out = args.first().copied().unwrap_or(0);
+    let text_ptr = args.get(1).copied().unwrap_or(0);
+    if tick_out == 0 || text_ptr == 0 {
+        return ERR_INVALID_POINTER;
+    }
+    let mut raw = Vec::new();
+    // RFC 3339 date-times fit well inside 64 bytes; read until NUL or cap.
+    for offset in 0..64u64 {
+        let mut byte = [0u8; 1];
+        if !ctx.mem.read(text_ptr + offset, &mut byte) {
+            return ERR_INVALID_POINTER;
+        }
+        if byte[0] == 0 {
+            break;
+        }
+        raw.push(byte[0]);
+    }
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let bytes = text.as_bytes();
+    // Minimum: "YYYY-MM-DDTHH:MM:SS" (19 bytes).
+    if bytes.len() < 19 {
+        return ERR_INVALID_VALUE;
+    }
+    let digits = |range: std::ops::Range<usize>| -> Option<u32> {
+        text.get(range).and_then(|s| s.parse::<u32>().ok())
+    };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        digits(0..4),
+        digits(5..7),
+        digits(8..10),
+        digits(11..13),
+        digits(14..16),
+        digits(17..19),
+    ) else {
+        return ERR_INVALID_VALUE;
+    };
+    // Optional fraction: ".d+" — scale whatever digits are present to µs.
+    let mut cursor = 19;
+    let mut micro: u32 = 0;
+    if bytes.get(cursor) == Some(&b'.') {
+        cursor += 1;
+        let mut scale = 100_000u32;
+        while let Some(digit) = bytes.get(cursor).filter(|b| b.is_ascii_digit()) {
+            micro += u32::from(digit - b'0') * scale;
+            scale /= 10;
+            cursor += 1;
+            if scale == 0 {
+                // Skip sub-microsecond digits.
+                while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+                    cursor += 1;
+                }
+                break;
+            }
+        }
+    }
+    let dt = DateTime {
+        year: year as u16,
+        month: month as u16,
+        day: day as u16,
+        hour: hour as u16,
+        minute: minute as u16,
+        second: second as u16,
+        micro,
+    };
+    let mut tick = datetime_to_tick(&dt);
+    // Timezone suffix: Z, or ±hh:mm subtracted to reach UTC.
+    match bytes.get(cursor).copied() {
+        Some(b'Z' | b'z') | None => {}
+        Some(sign @ (b'+' | b'-')) => {
+            let (Some(hh), Some(mm)) = (
+                digits(cursor + 1..cursor + 3),
+                digits(cursor + 4..cursor + 6),
+            ) else {
+                return ERR_INVALID_VALUE;
+            };
+            let offset_us = u64::from(hh * 60 + mm) * MICROSECONDS_PER_MINUTE;
+            tick = if sign == b'+' {
+                tick.saturating_sub(offset_us)
+            } else {
+                tick.saturating_add(offset_us)
+            };
+        }
+        Some(_) => return ERR_INVALID_VALUE,
+    }
+    if !ctx.mem.write(tick_out, &tick.to_le_bytes()) {
         return ERR_INVALID_POINTER;
     }
     OK
@@ -674,6 +857,86 @@ mod tests {
         );
         assert!((1..=12).contains(&month), "valid month (got {month})");
         assert_eq!(hle_get_current_clock(&ctx, &[0, 0]), ERR_INVALID_POINTER);
+    }
+
+    /// `sceRtcSetTime_t` breaks a Unix time into the calendar (shadPS4
+    /// semantics: tick = t*1e6 + epoch base; negative → INVALID_VALUE).
+    #[test]
+    fn set_time_t_converts_unix_seconds() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // 2000-01-01 00:00:00 UTC = 946684800.
+        assert_eq!(hle_set_time_t(&ctx, &[0x40, 946_684_800]), OK);
+        let mut b = [0u8; 16];
+        assert!(ctx.mem.read(0x40, &mut b));
+        let u16_at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+        assert_eq!(
+            (u16_at(0), u16_at(2), u16_at(4), u16_at(6)),
+            (2000, 1, 1, 0)
+        );
+        assert_eq!(
+            hle_set_time_t(&ctx, &[0x40, (-5i64) as u64]),
+            ERR_INVALID_VALUE
+        );
+        assert_eq!(hle_set_time_t(&ctx, &[0, 1]), ERR_INVALID_POINTER);
+    }
+
+    /// Format renders shadPS4's RFC 3339 shape and Parse inverts it; a
+    /// numeric offset moves the tick the RFC-correct direction (UTC = local
+    /// − offset).
+    #[test]
+    fn rfc3339_format_and_parse_round_trip() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // A known tick: 2026-07-17 20:36:00.120000 UTC.
+        let dt = DateTime {
+            year: 2026,
+            month: 7,
+            day: 17,
+            hour: 20,
+            minute: 36,
+            second: 0,
+            micro: 120_000,
+        };
+        let tick = datetime_to_tick(&dt);
+        assert!(ctx.mem.write(0x40, &tick.to_le_bytes()));
+
+        // UTC render.
+        assert_eq!(hle_format_rfc3339(&ctx, &[0x100, 0x40, 0]), OK);
+        let mut buf = [0u8; 32];
+        assert!(ctx.mem.read(0x100, &mut buf));
+        let end = buf.iter().position(|&b| b == 0).unwrap();
+        let text = std::str::from_utf8(&buf[..end]).unwrap();
+        assert_eq!(text, "2026-07-17T20:36:00.12Z");
+
+        // Parse inverts it back to the same tick, modulo the sub-centisecond
+        // truncation the two-digit fraction implies.
+        assert!(ctx.mem.write(0x200, text.as_bytes()));
+        assert!(ctx.mem.write(0x200 + end as u64, &[0u8]));
+        assert_eq!(hle_parse_rfc3339(&ctx, &[0x60, 0x200]), OK);
+        let mut parsed = [0u8; 8];
+        assert!(ctx.mem.read(0x60, &mut parsed));
+        assert_eq!(u64::from_le_bytes(parsed), tick);
+
+        // +02:00 render: the wall-clock text moves forward two hours...
+        assert_eq!(hle_format_rfc3339(&ctx, &[0x100, 0x40, 120]), OK);
+        assert!(ctx.mem.read(0x100, &mut buf));
+        let end = buf.iter().position(|&b| b == 0).unwrap();
+        let text = std::str::from_utf8(&buf[..end]).unwrap();
+        assert_eq!(text, "2026-07-17T22:36:00.12+02:00");
+        // ...and parsing that text lands on the SAME UTC tick (offset is
+        // subtracted — RFC 3339, not shadPS4's inverted sign).
+        assert!(ctx.mem.write(0x200, text.as_bytes()));
+        assert!(ctx.mem.write(0x200 + end as u64, &[0u8]));
+        assert_eq!(hle_parse_rfc3339(&ctx, &[0x60, 0x200]), OK);
+        assert!(ctx.mem.read(0x60, &mut parsed));
+        assert_eq!(u64::from_le_bytes(parsed), tick);
+
+        // Garbage is INVALID_VALUE, not a bogus tick.
+        assert!(ctx.mem.write(0x200, b"not-a-date\0"));
+        assert_eq!(hle_parse_rfc3339(&ctx, &[0x60, 0x200]), ERR_INVALID_VALUE);
+        assert_eq!(hle_parse_rfc3339(&ctx, &[0, 0x200]), ERR_INVALID_POINTER);
     }
 
     #[test]

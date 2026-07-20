@@ -108,6 +108,21 @@ pub fn register(registry: &HleRegistry) {
         hle_rwlock_trywrlock,
     );
     registry.register("libkernel", "scePthreadRwlockUnlock", hle_rwlock_unlock);
+    // Timed variants: `scePthreadRwlockTimed{rd,wr}lock(rwlock, usec)` — like
+    // `scePthreadMutexTimedlock`, the second argument is a RELATIVE
+    // `SceKernelUseconds` count passed by value, and timeout must surface as
+    // the SCE code 0x8002003C (see the Minecraft `_Mtx_trylock` lesson above:
+    // a bare POSIX 60 is unclassifiable by the title's own libc wrappers).
+    registry.register(
+        "libkernel",
+        "scePthreadRwlockTimedrdlock",
+        hle_sce_rwlock_timedrdlock,
+    );
+    registry.register(
+        "libkernel",
+        "scePthreadRwlockTimedwrlock",
+        hle_sce_rwlock_timedwrlock,
+    );
     registry.register("libkernel", "scePthreadRwlockattrInit", hle_rwlockattr_ok);
     registry.register(
         "libkernel",
@@ -587,7 +602,15 @@ fn hle_rwlock_tryrdlock(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 fn rwlock_rdlock_core(ctx: &HleContext, args: &[u64], try_only: bool) -> u64 {
-    let addr = args.first().copied().unwrap_or(0);
+    rwlock_rdlock_deadline(ctx, args.first().copied().unwrap_or(0), try_only, None)
+}
+
+fn rwlock_rdlock_deadline(
+    ctx: &HleContext,
+    addr: u64,
+    try_only: bool,
+    deadline: Option<std::time::Instant>,
+) -> u64 {
     if addr == 0 {
         return EINVAL;
     }
@@ -601,6 +624,9 @@ fn rwlock_rdlock_core(ctx: &HleContext, args: &[u64], try_only: bool) -> u64 {
         }
         if try_only || ctx.guest_threads.process_is_terminating() {
             return EBUSY;
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return ETIMEDOUT;
         }
         drop(entry);
         std::thread::yield_now();
@@ -618,7 +644,15 @@ fn hle_rwlock_trywrlock(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 fn rwlock_wrlock_core(ctx: &HleContext, args: &[u64], try_only: bool) -> u64 {
-    let addr = args.first().copied().unwrap_or(0);
+    rwlock_wrlock_deadline(ctx, args.first().copied().unwrap_or(0), try_only, None)
+}
+
+fn rwlock_wrlock_deadline(
+    ctx: &HleContext,
+    addr: u64,
+    try_only: bool,
+    deadline: Option<std::time::Instant>,
+) -> u64 {
     if addr == 0 {
         return EINVAL;
     }
@@ -638,9 +672,32 @@ fn rwlock_wrlock_core(ctx: &HleContext, args: &[u64], try_only: bool) -> u64 {
         if try_only || ctx.guest_threads.process_is_terminating() {
             return EBUSY;
         }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return ETIMEDOUT;
+        }
         drop(entry);
         std::thread::yield_now();
     }
+}
+
+/// `scePthreadRwlockTimedrdlock(rwlock, SceKernelUseconds usec)`: a read lock
+/// bounded by a relative microsecond timeout. `usec == 0` behaves like an
+/// already-expired deadline (a Tryrdlock whose failure code is ETIMEDOUT, per
+/// the mutex Timedlock convention above). Errors are SCE-coded.
+fn hle_sce_rwlock_timedrdlock(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    let usec = args.get(1).copied().unwrap_or(0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_micros(usec);
+    posix_to_sce(rwlock_rdlock_deadline(ctx, addr, false, Some(deadline)))
+}
+
+/// `scePthreadRwlockTimedwrlock(rwlock, SceKernelUseconds usec)` — the write
+/// twin of [`hle_sce_rwlock_timedrdlock`].
+fn hle_sce_rwlock_timedwrlock(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    let usec = args.get(1).copied().unwrap_or(0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_micros(usec);
+    posix_to_sce(rwlock_wrlock_deadline(ctx, addr, false, Some(deadline)))
 }
 
 /// `scePthreadRwlockUnlock(rwlock)`: release the thread's write hold (recursion
@@ -825,6 +882,49 @@ mod tests {
         assert!(!kernel.pthread_mutexes.contains_key(&mutex));
         // Destroying an unknown mutex → EINVAL.
         assert_eq!(hle_mutex_destroy(&ctx, &[0x999]), EINVAL);
+    }
+
+    /// The timed rwlock variants honor their relative-microsecond timeout:
+    /// free → immediate acquire; held by another thread → SCE ETIMEDOUT
+    /// (0x8002003C) once the deadline passes, never a bare POSIX 60.
+    #[test]
+    fn rwlock_timed_variants_acquire_or_time_out_with_sce_codes() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let rw = 0x300u64;
+        assert_eq!(hle_rwlock_init(&ctx, &[rw, 0]), OK);
+
+        // Uncontended: both timed locks succeed immediately, even with usec=0.
+        assert_eq!(hle_sce_rwlock_timedrdlock(&ctx, &[rw, 0]), OK);
+        assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), OK);
+        assert_eq!(hle_sce_rwlock_timedwrlock(&ctx, &[rw, 1000]), OK);
+        assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), OK);
+
+        // Contended by ANOTHER thread (id 99 ≠ the test's current thread 1):
+        // the wait expires and reports the SCE timeout code.
+        let key = resolve_rwlock_key(&ctx, rw).unwrap();
+        {
+            let mut entry = kernel.pthread_rwlocks.get_mut(&key).unwrap();
+            entry.writer = 99;
+            entry.writer_recursion = 1;
+        }
+        let started = std::time::Instant::now();
+        assert_eq!(
+            hle_sce_rwlock_timedrdlock(&ctx, &[rw, 2000]),
+            SCE_KERNEL_ERROR_ETIMEDOUT
+        );
+        assert_eq!(
+            hle_sce_rwlock_timedwrlock(&ctx, &[rw, 2000]),
+            SCE_KERNEL_ERROR_ETIMEDOUT
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a timed lock must not spin unbounded"
+        );
+
+        let registry = HleRegistry::new();
+        assert!(registry.is_implemented("libkernel", "scePthreadRwlockTimedrdlock"));
+        assert!(registry.is_implemented("libkernel", "scePthreadRwlockTimedwrlock"));
     }
 
     #[test]

@@ -909,6 +909,21 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        // Diagnostic: XPS5X_TRAP_ADDR=<hex>[,<hex>...] plants a one-shot int3 at
+        // each eboot-relative address — an RE probe for "does this code ever
+        // execute", logging the caller when hit. Used to confirm whether a code
+        // path (e.g. Minecraft's per-screen view-create loop) ever runs.
+        if let Ok(list) = std::env::var("XPS5X_TRAP_ADDR") {
+            let addrs: Vec<u64> = list
+                .split(',')
+                .filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                .collect();
+            xps5x_runtime::export_trap::install_addr_traps(
+                &mut linked.image,
+                xps5x_runtime::GUEST_ARENA_BASE,
+                &addrs,
+            );
+        }
         let linked = std::sync::Arc::new(linked);
         info!(
             "loaded: entry={:#x} image={:#x} byte(s) resolved={} unresolved={}",

@@ -42,16 +42,33 @@ pub fn register(registry: &HleRegistry) {
         "sceLibcHeapGetTraceInfo",
         hle_heap_get_trace_info,
     );
+    // Resolution is provider-aware: the measured ASTRO.BOT imports these two
+    // naming `libSceLibcInternalExt`, so both provider spellings must be
+    // registered (same implementations).
+    for library in ["libSceLibcInternal", "libSceLibcInternalExt"] {
+        registry.register(
+            library,
+            "sceLibcInternalHeapErrorReportForGame",
+            hle_heap_error_report,
+        );
+        registry.register(
+            library,
+            "sceLibcInternalBacktraceForGame",
+            hle_backtrace_for_game,
+        );
+    }
+    // C++ ABI plumbing libc.prx re-exports through libSceLibcInternal.
+    registry.register("libSceLibcInternal", "__cxa_finalize", hle_cxa_finalize);
     registry.register(
         "libSceLibcInternal",
-        "sceLibcInternalHeapErrorReportForGame",
-        hle_heap_error_report,
+        "__cxa_pure_virtual",
+        hle_cxa_pure_virtual,
     );
-    registry.register(
-        "libSceLibcInternal",
-        "sceLibcInternalBacktraceForGame",
-        hle_backtrace_for_game,
-    );
+    registry.register("libSceLibcInternal", "_ZdlPv", hle_operator_delete);
+    // `_Stoul` is the Dinkumware STL's strtoul core — identical
+    // `(nptr, endptr, base)` ABI to POSIX strtoul, so the real libc parser
+    // serves it.
+    registry.register("libSceLibcInternal", "_Stoul", crate::libc::hle_strtoul);
     registry.register(
         "libSceLibcInternal",
         "sceLibcMspaceCreate",
@@ -88,6 +105,102 @@ pub fn register(registry: &HleRegistry) {
         "sceLibcMspaceMallocStatsFast",
         hle_mspace_malloc_stats,
     );
+    registry.register(
+        "libSceLibcInternal",
+        "sceLibcMspaceRealloc",
+        hle_mspace_realloc,
+    );
+}
+
+/// `__cxa_finalize(void *dso)`: run the atexit/destructor chain registered
+/// for one DSO. XPS5X records `__cxa_atexit` callbacks but never dispatches
+/// them (see `libc::hle_cxa_atexit` — process teardown is host-driven), so
+/// finalize has nothing to run and succeeds. Itanium C++ ABI; NULL means
+/// "all DSOs" and is equally a no-op here.
+fn hle_cxa_finalize(_ctx: &HleContext, args: &[u64]) -> u64 {
+    debug!(
+        "__cxa_finalize(dso={:#x}) -> no registered destructors dispatched",
+        args.first().copied().unwrap_or(0)
+    );
+    SCE_OK
+}
+
+/// `__cxa_pure_virtual()`: the Itanium C++ ABI's trap for calling a pure
+/// virtual through a partially-constructed/destroyed object. Reaching it is
+/// a GUEST BUG (the real one aborts the process) — surface it loudly with
+/// the caller address so `--dump-vaddr` can find the broken vtable call,
+/// then return 0 to give diagnostics a chance to keep flowing rather than
+/// tearing the process down inside an HLE trap.
+fn hle_cxa_pure_virtual(ctx: &HleContext, _args: &[u64]) -> u64 {
+    warn!(
+        caller = format_args!("{:#x}", ctx.caller_return_addr),
+        "__cxa_pure_virtual called — GUEST BUG: pure virtual call through a \
+         partially-constructed or destroyed object (real libc aborts here)"
+    );
+    0
+}
+
+/// `_ZdlPv` — `operator delete(void*)`: releases storage that came from the
+/// allocator behind `malloc`/`operator new` (this HLE's `ctx.alloc`, the
+/// same model `libc::hle_free` frees into). `delete nullptr` is defined as a
+/// no-op.
+fn hle_operator_delete(ctx: &HleContext, args: &[u64]) -> u64 {
+    let ptr = args.first().copied().unwrap_or(0);
+    debug!("operator delete(_ZdlPv)(ptr={ptr:#x})");
+    if ptr != 0 {
+        ctx.alloc.free(ptr);
+    }
+    0
+}
+
+/// `sceLibcMspaceRealloc(msp, ptr, size)`: resize an mspace allocation.
+/// dlmalloc semantics (the engine behind Sony's mspaces): NULL ptr acts as
+/// malloc, size 0 acts as free, otherwise allocate-copy-free within the SAME
+/// mspace — the copy moves `min(old, new)` bytes through guest memory, and a
+/// failed allocation leaves the original block untouched and returns 0.
+fn hle_mspace_realloc(ctx: &HleContext, args: &[u64]) -> u64 {
+    let mspace = args.first().copied().unwrap_or(0);
+    let ptr = args.get(1).copied().unwrap_or(0);
+    let size = args.get(2).copied().unwrap_or(0);
+    if ptr == 0 {
+        return hle_mspace_malloc(ctx, &[mspace, size]);
+    }
+    if size == 0 {
+        let _ = hle_mspace_free(ctx, &[mspace, ptr]);
+        return 0;
+    }
+    let Some(old_size) = ctx
+        .kernel
+        .libc_mspace_allocations
+        .get(&ptr)
+        .filter(|allocation| allocation.mspace == mspace)
+        .map(|allocation| allocation.size)
+    else {
+        warn!("sceLibcMspaceRealloc(msp={mspace:#x}, ptr={ptr:#x}): unknown allocation");
+        return 0;
+    };
+    let new_ptr = hle_mspace_malloc(ctx, &[mspace, size]);
+    if new_ptr == 0 {
+        return 0; // old block untouched, dlmalloc contract
+    }
+    // Chunked guest-to-guest copy of the surviving bytes.
+    let mut remaining = old_size.min(size);
+    let mut offset = 0u64;
+    let mut chunk = [0u8; 4096];
+    while remaining > 0 {
+        let take = remaining.min(chunk.len() as u64) as usize;
+        if !ctx.mem.read(ptr + offset, &mut chunk[..take])
+            || !ctx.mem.write(new_ptr + offset, &chunk[..take])
+        {
+            warn!("sceLibcMspaceRealloc: copy fault at +{offset:#x} — abandoning the resize");
+            let _ = hle_mspace_free(ctx, &[mspace, new_ptr]);
+            return 0;
+        }
+        offset += take as u64;
+        remaining -= take as u64;
+    }
+    let _ = hle_mspace_free(ctx, &[mspace, ptr]);
+    new_ptr
 }
 
 fn read_cstring(ctx: &HleContext, address: u64, max: usize) -> Option<String> {
@@ -545,6 +658,57 @@ mod tests {
                 "{function} must be HLE-reachable"
             );
         }
+    }
+
+    /// `sceLibcMspaceRealloc` follows dlmalloc: NULL→malloc, 0→free,
+    /// otherwise the bytes survive the move and the old block is reclaimed.
+    #[test]
+    fn mspace_realloc_moves_bytes_and_reclaims() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x3000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let mspace = hle_mspace_create(&ctx, &[0, 0x1000, 0x1000, 0]);
+        assert_eq!(mspace, 0x1000);
+
+        // NULL ptr acts as malloc.
+        let a = hle_mspace_realloc(&ctx, &[mspace, 0, 0x40]);
+        assert_ne!(a, 0);
+        assert!(mem.write(a, b"payload!"));
+
+        // Growing preserves the payload and retires the old block.
+        let b = hle_mspace_realloc(&ctx, &[mspace, a, 0x80]);
+        assert_ne!(b, 0);
+        let mut copied = [0u8; 8];
+        assert!(mem.read(b, &mut copied));
+        assert_eq!(&copied, b"payload!");
+        assert_eq!(
+            hle_mspace_malloc_usable_size(&ctx, &[a]),
+            0,
+            "old block was freed"
+        );
+        assert_eq!(hle_mspace_malloc_usable_size(&ctx, &[b]), 0x80);
+
+        // Size 0 acts as free.
+        assert_eq!(hle_mspace_realloc(&ctx, &[mspace, b, 0]), 0);
+        assert_eq!(hle_mspace_malloc_usable_size(&ctx, &[b]), 0);
+
+        // Foreign pointer: refused, nothing freed.
+        assert_eq!(hle_mspace_realloc(&ctx, &[mspace, 0xDEAD, 0x10]), 0);
+
+        let registry = HleRegistry::new();
+        assert!(registry.is_implemented("libSceLibcInternal", "sceLibcMspaceRealloc"));
+        assert!(registry.is_implemented("libSceLibcInternal", "_ZdlPv"));
+        assert!(registry.is_implemented("libSceLibcInternal", "_Stoul"));
+        assert!(registry.is_implemented("libSceLibcInternal", "__cxa_finalize"));
+        assert!(registry.is_implemented("libSceLibcInternal", "__cxa_pure_virtual"));
+        assert!(
+            registry.is_implemented("libSceLibcInternalExt", "sceLibcInternalBacktraceForGame")
+        );
+        assert!(registry.is_implemented(
+            "libSceLibcInternalExt",
+            "sceLibcInternalHeapErrorReportForGame"
+        ));
     }
 
     /// The free list must let malloc/free churn recycle memory instead of the

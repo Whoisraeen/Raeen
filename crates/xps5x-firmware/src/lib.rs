@@ -334,6 +334,19 @@ fn build_hle_data_page(registry: &mut registry::ModuleRegistry, page_base: u64) 
         &mut exports,
     );
 
+    // `Need_sceLibcInternal` is libSceLibcInternal's exported `int` flag: a
+    // nonzero value tells the title's own libc/CRT glue that the internal
+    // libc is present and should be used. It is DATA — the guest reads it,
+    // never calls it — so resolving it as an HLE trampoline would hand the
+    // reader code-marker bytes; a page slot holding 1 is the honest value
+    // (measured: ASTRO.BOT imports it from libSceLibcInternal).
+    add(
+        "Need_sceLibcInternal",
+        &1u32.to_le_bytes(),
+        &mut page,
+        &mut exports,
+    );
+
     // Most of this page is libkernel's, so it is registered there. But
     // `resolve` is **provider-aware** — it keys on the library the importing
     // symbol names, not the NID alone — so a constant must be registered under
@@ -353,8 +366,18 @@ fn build_hle_data_page(registry: &mut registry::ModuleRegistry, page_base: u64) 
             value: export.value,
         })
         .collect();
+    let libc_internal_nids = [dynlib::nid::nid_of("Need_sceLibcInternal")];
+    let libc_internal_exports: Vec<dynlib::SymbolExport> = exports
+        .iter()
+        .filter(|export| libc_internal_nids.contains(&export.nid))
+        .map(|export| dynlib::SymbolExport {
+            nid: export.nid,
+            value: export.value,
+        })
+        .collect();
     registry.register_module_exports_at("libkernel", &exports, page_base);
     registry.register_module_exports_at("libSceNet", &net_exports, page_base);
+    registry.register_module_exports_at("libSceLibcInternal", &libc_internal_exports, page_base);
     tracing::info!(
         "HLE data page: {} symbol(s), {:#x} bytes at {page_base:#x}",
         exports.len(),

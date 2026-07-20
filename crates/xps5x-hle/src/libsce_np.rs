@@ -48,6 +48,11 @@ pub fn register(registry: &HleRegistry) {
         "sceNpGetAccountCountryA",
         hle_get_account_country,
     );
+    registry.register(
+        "libSceNpManager",
+        "sceNpGetAccountIdA",
+        hle_get_account_id_a,
+    );
     registry.register("libSceNpManager", "sceNpGameIntentInitialize", hle_ok);
     // libSceNpManagerForToolkit is a sibling library (same offline Np state);
     // its state callback registration behaves like the base one. Ported from
@@ -199,6 +204,35 @@ fn hle_get_account_country(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
+/// The stable fake PSN account id (ASCII "XPS5X" padded into a u64 — clearly
+/// synthetic in logs, never zero, identical across runs).
+const FAKE_ACCOUNT_ID: u64 = 0x5850_5335_5800_0001; // "XPS5X" tag + 1
+
+/// `sceNpGetAccountIdA(SceUserServiceUserId userId, uint64_t *accountId)`:
+/// report a stable, nonzero account id for the local user.
+///
+/// shadPS4 (`np_manager.cpp:579`, NID `rbknaUjpqWo`) validates
+/// `accountId != NULL` and `userId != INVALID` then writes the account id;
+/// signed-out it writes 0 and returns SIGNED_OUT. XPS5X instead answers with
+/// a fixed synthetic id and success — like the `sceNpGetAccountCountryA`
+/// stub above, the id is identity/locale data a title keys saves and
+/// telemetry buckets on, independent of the SIGNED_OUT connection state the
+/// rest of this module reports, and an error here is a measured hard-assert
+/// path (the NpWebApi init family).
+fn hle_get_account_id_a(ctx: &HleContext, args: &[u64]) -> u64 {
+    let user_id = args.first().copied().unwrap_or(0) as u32;
+    let id_ptr = args.get(1).copied().unwrap_or(0);
+    debug!("sceNpGetAccountIdA(userId={user_id}, accountId={id_ptr:#x}) -> {FAKE_ACCOUNT_ID:#x}");
+    if user_id == 0xFFFF_FFFF || id_ptr == 0 {
+        return ERROR_INVALID_ARGUMENT;
+    }
+    if !ctx.mem.write(id_ptr, &FAKE_ACCOUNT_ID.to_le_bytes()) {
+        warn!("sceNpGetAccountIdA: accountId out-ptr {id_ptr:#x} not writable");
+        return ERROR_INVALID_ARGUMENT;
+    }
+    SCE_OK
+}
+
 /// `sceNpGetNpReachabilityState(...)`: PSN is unreachable (offline).
 fn hle_get_reachability(ctx: &HleContext, args: &[u64]) -> u64 {
     let state_ptr = args.get(1).copied().unwrap_or(0);
@@ -289,6 +323,33 @@ mod tests {
         );
         assert_eq!(
             hle_get_account_country(&ctx, &[1, 0]),
+            ERROR_INVALID_ARGUMENT
+        );
+    }
+
+    #[test]
+    fn get_account_id_a_writes_a_stable_nonzero_id() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(hle_get_account_id_a(&ctx, &[1000, 0x100]), SCE_OK);
+        let mut id = [0u8; 8];
+        assert!(mem.read(0x100, &mut id));
+        let first = u64::from_le_bytes(id);
+        assert_ne!(first, 0, "account id must be nonzero");
+        // Stable: a second call reports the identical id.
+        assert_eq!(hle_get_account_id_a(&ctx, &[1000, 0x108]), SCE_OK);
+        assert!(mem.read(0x108, &mut id));
+        assert_eq!(u64::from_le_bytes(id), first);
+        // Invalid user or NULL out-ptr → argument error.
+        assert_eq!(
+            hle_get_account_id_a(&ctx, &[0xFFFF_FFFF, 0x100]),
+            ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            hle_get_account_id_a(&ctx, &[1000, 0]),
             ERROR_INVALID_ARGUMENT
         );
     }

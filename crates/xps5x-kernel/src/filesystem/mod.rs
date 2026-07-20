@@ -610,6 +610,35 @@ impl VirtualFileSystem {
         Ok(bytes.len())
     }
 
+    /// Positional read (`pread`): read up to `count` bytes at absolute
+    /// `offset` WITHOUT moving the descriptor's position — the whole point of
+    /// pread is that concurrent streaming readers never disturb each other's
+    /// cursor. Reads past end-of-file return the short (possibly empty) tail,
+    /// like POSIX.
+    pub fn pread(&self, fd: Fd, count: usize, offset: u64) -> Result<Vec<u8>, std::io::Error> {
+        let files = self.open_files.read();
+        let Some(file) = files.get(&fd) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("fd {fd} not open"),
+            ));
+        };
+        if file.directory_entries.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "fd is a directory",
+            ));
+        }
+        let Some(ref data) = file.data else {
+            return Ok(Vec::new());
+        };
+        let pos = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(data.len());
+        let end = pos.saturating_add(count).min(data.len());
+        Ok(data[pos..end].to_vec())
+    }
+
     /// Reposition an open file descriptor. `whence` follows POSIX:
     /// `SEEK_SET` (0) = absolute, `SEEK_CUR` (1) = relative to current,
     /// `SEEK_END` (2) = relative to end-of-file. Returns the new absolute

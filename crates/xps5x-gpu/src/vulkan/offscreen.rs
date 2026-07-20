@@ -111,6 +111,32 @@ pub struct StorageBufferBinding {
     pub buffers: Vec<Vec<u8>>,
 }
 
+/// One storage image (UAV) a translated compute shader reads and writes.
+///
+/// The pixels are the guest's initial content (RGBA8, tightly packed rows);
+/// `guest_base` is where the caller writes the post-dispatch content back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageImageUpload {
+    pub width: u32,
+    pub height: u32,
+    /// Initial RGBA8 content, `width * height * 4` bytes.
+    pub pixels: Vec<u8>,
+    /// Guest base address for the post-dispatch writeback.
+    pub guest_base: u64,
+}
+
+/// One descriptor binding containing an array of storage images.
+///
+/// The recompiled SPIR-V declares `%textures2D_L` as
+/// `OpTypeImage %float 2D 0 0 0 2 Rgba8` — a STORAGE_IMAGE array in
+/// R8G8B8A8_UNORM — indexed by dword 0 of the rewritten T# it reads from the
+/// push constants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageImageBinding {
+    pub binding: u32,
+    pub images: Vec<StorageImageUpload>,
+}
+
 /// A guest texture decoded to linear pixels, ready to upload as a sampled
 /// image.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +177,9 @@ pub struct ShaderStageBinding {
     pub push_constants: Vec<u8>,
     pub storage_buffers: Option<StorageBufferBinding>,
     pub textures: Option<TextureBinding>,
+    /// Storage images (UAVs). Compute-only today: the graphics draw path
+    /// rejects a stage that carries these rather than silently ignoring them.
+    pub storage_images: Option<StorageImageBinding>,
 }
 
 /// Register-derived alpha-blend state for the single color attachment.
@@ -1163,6 +1192,20 @@ impl<'a> Resources<'a> {
     }
 
     fn create_stage_resources(&mut self, state: &DrawState) -> Result<(), GpuError> {
+        // Storage images are implemented only on the one-shot compute path
+        // (`vulkan::compute`); a graphics stage carrying them would bind
+        // nothing at the shader's STORAGE_IMAGE array and fault on the GPU.
+        if let Some(stage) = state
+            .stage_bindings
+            .iter()
+            .find(|stage| stage.storage_images.is_some())
+        {
+            return Err(GpuError::PipelineCreationFailed(format!(
+                "{:?} stage binds storage image(s) — storage images are implemented \
+                 for COMPUTE dispatches only",
+                stage.stage
+            )));
+        }
         let resource_stages: Vec<_> = state
             .stage_bindings
             .iter()

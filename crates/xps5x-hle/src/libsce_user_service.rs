@@ -42,6 +42,99 @@ pub fn register(registry: &HleRegistry) {
         hle_get_user_name,
     );
     registry.register("libSceUserService", "sceUserServiceGetEvent", hle_get_event);
+    // Per-user accessibility / preset getters (measured ASTRO.BOT imports).
+    // Defaults follow SharpEmu's `UserServiceExports` (GPL-2.0): trigger
+    // effect 0 (no accessibility reduction — full adaptive triggers),
+    // vibration 1 (enabled/normal), and a zeroed 0x28-byte presets block
+    // whose leading u64 is its own size.
+    registry.register(
+        "libSceUserService",
+        "sceUserServiceGetAccessibilityTriggerEffect",
+        hle_get_accessibility_trigger_effect,
+    );
+    registry.register(
+        "libSceUserService",
+        "sceUserServiceGetAccessibilityVibration",
+        hle_get_accessibility_vibration,
+    );
+    registry.register(
+        "libSceUserService",
+        "sceUserServiceGetGamePresets",
+        hle_get_game_presets,
+    );
+    // `sceUserServiceGetPlatformPrivacySetting(parameterId, int32_t *value)`
+    // — SharpEmu `UserServiceExports`: parameterId 1000 (the primary user)
+    // gets value 0 ("no restriction"). SharpEmu's name is a recovered label
+    // for the measured NID `D-CzAxQL0XI` (0x0ff0b303140bd172) — it does NOT
+    // hash to that NID, so the binding must be explicit (`register_nid`).
+    // The measured ASTRO.BOT imports it naming the wrapper library
+    // `libSceUserServicePlatformPrivacyWs1`; resolution is provider-aware,
+    // so both provider spellings are registered.
+    for library in ["libSceUserService", "libSceUserServicePlatformPrivacyWs1"] {
+        registry.register_nid(
+            library,
+            "sceUserServiceGetPlatformPrivacySetting",
+            0x0ff0_b303_140b_d172,
+            hle_get_platform_privacy_setting,
+        );
+    }
+}
+
+/// See the registration comment: privacy setting 0 = unrestricted.
+fn hle_get_platform_privacy_setting(ctx: &HleContext, args: &[u64]) -> u64 {
+    write_user_setting_i32(ctx, args, 0, "sceUserServiceGetPlatformPrivacySetting")
+}
+
+/// Shared body of the `(userId, int32_t *out)` user-setting getters
+/// (SharpEmu `WriteUserSettingInt32`): only the primary user exists.
+fn write_user_setting_i32(ctx: &HleContext, args: &[u64], value: i32, name: &str) -> u64 {
+    let user_id = args.first().copied().unwrap_or(0) as i32;
+    let out_ptr = args.get(1).copied().unwrap_or(0);
+    if user_id != PRIMARY_USER_ID {
+        return ERROR_INVALID_ARGUMENT;
+    }
+    if out_ptr == 0 || !ctx.mem.write(out_ptr, &value.to_le_bytes()) {
+        warn!("{name}: out-ptr {out_ptr:#x} not writable");
+        return ERROR_INVALID_ARGUMENT;
+    }
+    debug!("{name}(userId={user_id}) -> {value}");
+    SCE_OK
+}
+
+/// `sceUserServiceGetAccessibilityTriggerEffect(userId, int32_t *out)`:
+/// 0 = the user has NOT reduced adaptive-trigger effects (default).
+fn hle_get_accessibility_trigger_effect(ctx: &HleContext, args: &[u64]) -> u64 {
+    write_user_setting_i32(ctx, args, 0, "sceUserServiceGetAccessibilityTriggerEffect")
+}
+
+/// `sceUserServiceGetAccessibilityVibration(userId, int32_t *out)`:
+/// 1 = vibration enabled at the normal level (default).
+fn hle_get_accessibility_vibration(ctx: &HleContext, args: &[u64]) -> u64 {
+    write_user_setting_i32(ctx, args, 1, "sceUserServiceGetAccessibilityVibration")
+}
+
+/// `sceUserServiceGetGamePresets(userId, SceUserServiceGamePresets *out)`:
+/// the user's system-level game presets (difficulty / performance-vs-quality
+/// / first-person camera prefs). SharpEmu writes a zeroed 0x28-byte block
+/// with the leading u64 set to the block size — "no preset expressed", which
+/// every field's zero value means — and titles accept it.
+fn hle_get_game_presets(ctx: &HleContext, args: &[u64]) -> u64 {
+    const PRESETS_SIZE: u64 = 0x28;
+    let user_id = args.first().copied().unwrap_or(0) as i32;
+    let out_ptr = args.get(1).copied().unwrap_or(0);
+    if user_id != PRIMARY_USER_ID {
+        return ERROR_INVALID_ARGUMENT;
+    }
+    if out_ptr == 0 {
+        return ERROR_INVALID_ARGUMENT;
+    }
+    let mut presets = [0u8; PRESETS_SIZE as usize];
+    presets[0..8].copy_from_slice(&PRESETS_SIZE.to_le_bytes());
+    if !ctx.mem.write(out_ptr, &presets) {
+        warn!("sceUserServiceGetGamePresets: out-ptr {out_ptr:#x} not writable");
+        return ERROR_INVALID_ARGUMENT;
+    }
+    SCE_OK
 }
 
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
@@ -170,6 +263,45 @@ mod tests {
         );
         // Event loop terminates on NO_EVENT.
         assert_eq!(hle_get_event(&ctx, &[0x200]), ERROR_NO_EVENT);
+    }
+
+    /// Accessibility/preset getters answer the primary user with SharpEmu's
+    /// defaults: trigger effect 0, vibration 1, zeroed self-sized presets.
+    #[test]
+    fn accessibility_and_preset_getters_report_defaults() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let uid = PRIMARY_USER_ID as u64;
+
+        assert_eq!(
+            hle_get_accessibility_trigger_effect(&ctx, &[uid, 0x100]),
+            SCE_OK
+        );
+        let mut v = [0u8; 4];
+        assert!(mem.read(0x100, &mut v));
+        assert_eq!(i32::from_le_bytes(v), 0, "full trigger effects");
+
+        assert_eq!(hle_get_accessibility_vibration(&ctx, &[uid, 0x100]), SCE_OK);
+        assert!(mem.read(0x100, &mut v));
+        assert_eq!(i32::from_le_bytes(v), 1, "vibration enabled");
+
+        assert_eq!(hle_get_game_presets(&ctx, &[uid, 0x200]), SCE_OK);
+        let mut presets = [0xFFu8; 0x28];
+        assert!(mem.read(0x200, &mut presets));
+        assert_eq!(u64::from_le_bytes(presets[0..8].try_into().unwrap()), 0x28);
+        assert!(presets[8..].iter().all(|b| *b == 0), "no preset expressed");
+
+        // Only the primary user exists.
+        assert_eq!(
+            hle_get_game_presets(&ctx, &[42, 0x200]),
+            ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            hle_get_accessibility_vibration(&ctx, &[uid, 0]),
+            ERROR_INVALID_ARGUMENT
+        );
     }
 
     #[test]

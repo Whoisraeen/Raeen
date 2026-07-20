@@ -29,6 +29,125 @@ pub fn register(registry: &HleRegistry) {
     ] {
         registry.register("libScePad", f, hle_pad_ok);
     }
+    registry.register("libScePad", "scePadClose", hle_pad_close);
+    registry.register(
+        "libScePad",
+        "scePadGetControllerInformation",
+        hle_pad_get_controller_information,
+    );
+    registry.register(
+        "libScePad",
+        "scePadSetTriggerEffect",
+        hle_pad_set_trigger_effect,
+    );
+    registry.register(
+        "libScePad",
+        "scePadGetTriggerEffectState",
+        hle_pad_get_trigger_effect_state,
+    );
+}
+
+/// `SCE_PAD_ERROR_INVALID_HANDLE` (SharpEmu `OrbisPadErrorInvalidHandle`).
+const PAD_ERROR_INVALID_HANDLE: u64 = 0x8092_0003;
+/// `SCE_PAD_ERROR_INVALID_ARG`.
+const PAD_ERROR_INVALID_ARG: u64 = 0x8092_0001;
+
+/// The one pad handle `scePadOpen` hands out.
+const PRIMARY_PAD_HANDLE: u64 = 1;
+
+/// `scePadClose(handle)`: release the handle. The handle model is a single
+/// always-open primary pad (`scePadOpen` returns 1 unconditionally), so close
+/// validates the handle and succeeds without tearing anything down — exactly
+/// SharpEmu `PadExports.PadClose` (NID `6ncge5+l5Qs`): primary handle → 0,
+/// anything else → invalid-handle.
+fn hle_pad_close(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0);
+    debug!("scePadClose(handle={handle})");
+    if handle == PRIMARY_PAD_HANDLE {
+        0
+    } else {
+        PAD_ERROR_INVALID_HANDLE
+    }
+}
+
+/// `scePadGetControllerInformation(handle, ScePadControllerInformation
+/// *info)`: report a connected standard (DualSense) controller. The 0x1C-byte
+/// layout and values are SharpEmu `PadExports.PadGetControllerInformation`
+/// (NID `gjP9-KQzoUk`): touchpad density 44.86, 1920x943 touch resolution,
+/// stick deadzones 30/30, port type standard (0), connectedCount 1,
+/// connected 1, deviceClass 0 at +0x10.
+fn hle_pad_get_controller_information(ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0);
+    let info_ptr = args.get(1).copied().unwrap_or(0);
+    debug!("scePadGetControllerInformation(handle={handle}, info={info_ptr:#x})");
+    if handle != PRIMARY_PAD_HANDLE {
+        return PAD_ERROR_INVALID_HANDLE;
+    }
+    if info_ptr == 0 {
+        return PAD_ERROR_INVALID_ARG;
+    }
+    let mut info = [0u8; 0x1C];
+    info[0x00..0x04].copy_from_slice(&44.86f32.to_le_bytes()); // touchpad pixel density
+    info[0x04..0x06].copy_from_slice(&1920u16.to_le_bytes()); // touchpad width
+    info[0x06..0x08].copy_from_slice(&943u16.to_le_bytes()); // touchpad height
+    info[0x08] = 30; // left stick deadzone
+    info[0x09] = 30; // right stick deadzone
+    info[0x0A] = 0; // connection type: standard/local
+    info[0x0B] = 1; // connected count
+    info[0x0C] = 1; // connected
+    info[0x10..0x14].copy_from_slice(&0i32.to_le_bytes()); // deviceClass: standard
+    if !ctx.mem.write(info_ptr, &info) {
+        warn!("scePadGetControllerInformation: info out-ptr {info_ptr:#x} not writable");
+        return PAD_ERROR_INVALID_ARG;
+    }
+    0
+}
+
+/// `scePadSetTriggerEffect(handle, const ScePadTriggerEffectParam *param)`:
+/// accept the adaptive-trigger command. SharpEmu decodes the 120-byte param
+/// (trigger mask + two 56-byte per-trigger commands) into host rumble; XPS5X
+/// has no trigger-rumble backend yet, so the command is validated (handle +
+/// non-NULL, readable param) and acknowledged — the title's haptics loop only
+/// checks the return code.
+fn hle_pad_set_trigger_effect(ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0);
+    let param_ptr = args.get(1).copied().unwrap_or(0);
+    if handle != PRIMARY_PAD_HANDLE {
+        return PAD_ERROR_INVALID_HANDLE;
+    }
+    if param_ptr == 0 {
+        return PAD_ERROR_INVALID_ARG;
+    }
+    let mut mask = [0u8; 1];
+    if !ctx.mem.read(param_ptr, &mut mask) {
+        return PAD_ERROR_INVALID_ARG;
+    }
+    debug!(
+        "scePadSetTriggerEffect(handle={handle}, triggerMask={:#x}) -> accepted",
+        mask[0]
+    );
+    0
+}
+
+/// `scePadGetTriggerEffectState(handle, state)`: report both adaptive
+/// triggers as idle (no effect active). No public reference implements this
+/// (PS5-only; absent from SharpEmu and shadPS4), so the out-buffer is treated
+/// as the minimal per-trigger state pair — 2 bytes, one per trigger, 0 =
+/// off/idle — which is consistent with never having accepted an effect into a
+/// host backend in [`hle_pad_set_trigger_effect`].
+fn hle_pad_get_trigger_effect_state(ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0);
+    let state_ptr = args.get(1).copied().unwrap_or(0);
+    if handle != PRIMARY_PAD_HANDLE {
+        return PAD_ERROR_INVALID_HANDLE;
+    }
+    if state_ptr == 0 {
+        return PAD_ERROR_INVALID_ARG;
+    }
+    if !ctx.mem.write(state_ptr, &[0u8; 2]) {
+        return PAD_ERROR_INVALID_ARG;
+    }
+    0
 }
 
 /// A libScePad configuration setter with no modeled hardware effect that the
@@ -137,6 +256,47 @@ mod tests {
         let mut buf = [0u8; 12];
         assert!(mem.read(0x100, &mut buf));
         assert_eq!(buf, live, "guest must read the host-pushed live pad state");
+    }
+
+    /// The DualSense info/close/trigger family validates the primary handle
+    /// and reports a connected standard controller (SharpEmu PadExports
+    /// layout: connectedCount@0x0B == 1, connected@0x0C == 1).
+    #[test]
+    fn controller_information_close_and_trigger_effects() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(hle_pad_get_controller_information(&ctx, &[1, 0x100]), 0);
+        let mut info = [0u8; 0x1C];
+        assert!(mem.read(0x100, &mut info));
+        assert_eq!(
+            f32::from_le_bytes(info[0..4].try_into().unwrap()),
+            44.86,
+            "touchpad density"
+        );
+        assert_eq!(info[0x0B], 1, "connectedCount");
+        assert_eq!(info[0x0C], 1, "connected");
+        assert_eq!(
+            hle_pad_get_controller_information(&ctx, &[2, 0x100]),
+            PAD_ERROR_INVALID_HANDLE
+        );
+        assert_eq!(
+            hle_pad_get_controller_information(&ctx, &[1, 0]),
+            PAD_ERROR_INVALID_ARG
+        );
+
+        // Trigger effect: accepted on the primary handle, then reported idle.
+        assert!(mem.write(0x200, &[0x03u8]));
+        assert_eq!(hle_pad_set_trigger_effect(&ctx, &[1, 0x200]), 0);
+        assert_eq!(hle_pad_get_trigger_effect_state(&ctx, &[1, 0x300]), 0);
+        let mut state = [0xFFu8; 2];
+        assert!(mem.read(0x300, &mut state));
+        assert_eq!(state, [0, 0], "both triggers idle");
+
+        assert_eq!(hle_pad_close(&ctx, &[1]), 0);
+        assert_eq!(hle_pad_close(&ctx, &[5]), PAD_ERROR_INVALID_HANDLE);
     }
 
     #[test]

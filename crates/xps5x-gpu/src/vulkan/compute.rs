@@ -1,11 +1,13 @@
 //! One-shot Vulkan compute dispatch for translated guest shaders.
 //!
 //! Guest storage buffers are uploaded into host-visible coherent Vulkan
-//! buffers, dispatched, then read back after the queue fence. The caller owns
-//! copying those bytes back into identity-mapped guest memory.
+//! buffers, and guest storage images (UAVs) into device-local
+//! `R8G8B8A8_UNORM` images via staging buffers. After the queue fence both
+//! are read back; the caller owns copying those bytes back into
+//! identity-mapped guest memory.
 
 use super::instance::VulkanDevice;
-use super::offscreen::ShaderStageBinding;
+use super::offscreen::{ShaderStageBinding, StorageImageUpload};
 use ash::vk::Handle;
 use ash::{Device, vk};
 use xps5x_core::error::GpuError;
@@ -16,10 +18,19 @@ pub struct ComputeState<'a> {
     pub binding: Option<&'a ShaderStageBinding>,
 }
 
+/// Post-dispatch device content, in the binding's declaration order.
+pub struct ComputeOutputs {
+    /// One entry per storage buffer (`StorageBufferBinding.buffers` order).
+    pub buffers: Vec<Vec<u8>>,
+    /// One entry per storage image (`StorageImageBinding.images` order),
+    /// RGBA8 tightly packed rows.
+    pub images: Vec<Vec<u8>>,
+}
+
 pub fn dispatch_compute(
     dev: &VulkanDevice,
     state: &ComputeState<'_>,
-) -> Result<Vec<Vec<u8>>, GpuError> {
+) -> Result<ComputeOutputs, GpuError> {
     if state.spirv.is_empty() {
         return Err(GpuError::ShaderCompilationFailed(
             "compute SPIR-V must be non-empty".to_owned(),
@@ -37,7 +48,10 @@ pub fn dispatch_compute(
     let mut resources = ComputeResources::new(dev);
     resources.build(state)?;
     resources.record_and_submit(state)?;
-    resources.read_storage()
+    Ok(ComputeOutputs {
+        buffers: resources.read_storage()?,
+        images: resources.read_images()?,
+    })
 }
 
 struct BufferAllocation {
@@ -46,9 +60,23 @@ struct BufferAllocation {
     size: usize,
 }
 
+/// One storage image plus its upload staging and readback buffers.
+struct ImageAllocation {
+    staging_buffer: vk::Buffer,
+    staging_memory: vk::DeviceMemory,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    readback_buffer: vk::Buffer,
+    readback_memory: vk::DeviceMemory,
+    width: u32,
+    height: u32,
+}
+
 struct ComputeResources<'a> {
     dev: &'a VulkanDevice,
     storage: Vec<BufferAllocation>,
+    images: Vec<ImageAllocation>,
     shader: vk::ShaderModule,
     descriptor_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
@@ -64,6 +92,7 @@ impl<'a> ComputeResources<'a> {
         Self {
             dev,
             storage: Vec::new(),
+            images: Vec::new(),
             shader: vk::ShaderModule::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
@@ -85,30 +114,54 @@ impl<'a> ComputeResources<'a> {
         self.shader = unsafe { self.device().create_shader_module(&shader_info, None) }
             .map_err(|e| GpuError::ShaderCompilationFailed(format!("vkCreateShaderModule: {e}")))?;
 
-        if let Some(binding) = state.binding
-            && let Some(storage) = &binding.storage_buffers
-        {
+        let storage = state.binding.and_then(|b| b.storage_buffers.as_ref());
+        let storage_images = state.binding.and_then(|b| b.storage_images.as_ref());
+        if storage.is_some() || storage_images.is_some() {
+            let binding = state.binding.expect("resource groups come from a binding");
             if binding.descriptor_set_slot != 0 {
                 return Err(GpuError::PipelineCreationFailed(format!(
                     "compute descriptor set slot {} is not supported yet",
                     binding.descriptor_set_slot
                 )));
             }
-            if storage.buffers.is_empty() {
-                return Err(GpuError::PipelineCreationFailed(
-                    "compute storage descriptor array is empty".to_owned(),
-                ));
+            let mut layout_bindings = Vec::new();
+            if let Some(storage) = storage {
+                if storage.buffers.is_empty() {
+                    return Err(GpuError::PipelineCreationFailed(
+                        "compute storage descriptor array is empty".to_owned(),
+                    ));
+                }
+                for bytes in &storage.buffers {
+                    self.storage.push(self.create_storage_buffer(bytes)?);
+                }
+                layout_bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(storage.binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(self.storage.len() as u32)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                );
             }
-            for bytes in &storage.buffers {
-                self.storage.push(self.create_buffer(bytes)?);
+            if let Some(images) = storage_images {
+                if images.images.is_empty() {
+                    return Err(GpuError::PipelineCreationFailed(
+                        "compute storage-image descriptor array is empty".to_owned(),
+                    ));
+                }
+                for upload in &images.images {
+                    self.create_storage_image(upload)?;
+                }
+                layout_bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(images.binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .descriptor_count(self.images.len() as u32)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                );
             }
 
-            let bindings = [vk::DescriptorSetLayoutBinding::default()
-                .binding(storage.binding)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(self.storage.len() as u32)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)];
-            let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+            let layout_info =
+                vk::DescriptorSetLayoutCreateInfo::default().bindings(&layout_bindings);
             // SAFETY: binding slice is live for the call.
             self.descriptor_layout = unsafe {
                 self.device()
@@ -118,9 +171,21 @@ impl<'a> ComputeResources<'a> {
                 GpuError::PipelineCreationFailed(format!("vkCreateDescriptorSetLayout: {e}"))
             })?;
 
-            let pool_sizes = [vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(self.storage.len() as u32)];
+            let pool_sizes: Vec<_> = [
+                (
+                    vk::DescriptorType::STORAGE_BUFFER,
+                    self.storage.len() as u32,
+                ),
+                (vk::DescriptorType::STORAGE_IMAGE, self.images.len() as u32),
+            ]
+            .into_iter()
+            .filter(|&(_, count)| count != 0)
+            .map(|(ty, count)| {
+                vk::DescriptorPoolSize::default()
+                    .ty(ty)
+                    .descriptor_count(count)
+            })
+            .collect();
             let pool_info = vk::DescriptorPoolCreateInfo::default()
                 .max_sets(1)
                 .pool_sizes(&pool_sizes);
@@ -138,7 +203,8 @@ impl<'a> ComputeResources<'a> {
                 .map_err(|e| {
                     GpuError::PipelineCreationFailed(format!("vkAllocateDescriptorSets: {e}"))
                 })?[0];
-            let infos: Vec<_> = self
+
+            let buffer_infos: Vec<_> = self
                 .storage
                 .iter()
                 .map(|allocation| {
@@ -147,12 +213,35 @@ impl<'a> ComputeResources<'a> {
                         .range(allocation.size as u64)
                 })
                 .collect();
-            let writes = [vk::WriteDescriptorSet::default()
-                .dst_set(self.descriptor_set)
-                .dst_binding(storage.binding)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&infos)];
-            // SAFETY: descriptor set and every named buffer are live.
+            let image_infos: Vec<_> = self
+                .images
+                .iter()
+                .map(|allocation| {
+                    vk::DescriptorImageInfo::default()
+                        .image_view(allocation.view)
+                        .image_layout(vk::ImageLayout::GENERAL)
+                })
+                .collect();
+            let mut writes = Vec::new();
+            if let Some(storage) = storage {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.descriptor_set)
+                        .dst_binding(storage.binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&buffer_infos),
+                );
+            }
+            if let Some(images) = storage_images {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.descriptor_set)
+                        .dst_binding(images.binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(&image_infos),
+                );
+            }
+            // SAFETY: descriptor set and every named buffer/view are live.
             unsafe { self.device().update_descriptor_sets(&writes, &[]) };
         }
 
@@ -216,45 +305,89 @@ impl<'a> ComputeResources<'a> {
         Ok(())
     }
 
-    fn create_buffer(&self, bytes: &[u8]) -> Result<BufferAllocation, GpuError> {
-        if bytes.is_empty() {
+    /// Host-visible coherent buffer, optionally filled with `fill`.
+    fn create_host_buffer(
+        &self,
+        size: usize,
+        usage: vk::BufferUsageFlags,
+        fill: Option<&[u8]>,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory), GpuError> {
+        if size == 0 {
             return Err(GpuError::VulkanInitFailed(
-                "zero-sized compute storage buffer".to_owned(),
+                "zero-sized compute host buffer".to_owned(),
             ));
         }
         let info = vk::BufferCreateInfo::default()
-            .size(bytes.len() as u64)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .size(size as u64)
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         // SAFETY: create info is local and the device is live.
         let buffer = unsafe { self.device().create_buffer(&info, None) }
             .map_err(|e| GpuError::VulkanInitFailed(format!("vkCreateBuffer: {e}")))?;
         // SAFETY: buffer is a live handle from this device.
         let req = unsafe { self.device().get_buffer_memory_requirements(buffer) };
-        let memory_type = self.dev.find_memory_type(
+        let memory_type = match self.dev.find_memory_type(
             req.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                // SAFETY: destroying the just-created, never-bound buffer.
+                unsafe { self.device().destroy_buffer(buffer, None) };
+                return Err(e);
+            }
+        };
         let alloc = vk::MemoryAllocateInfo::default()
             .allocation_size(req.size)
             .memory_type_index(memory_type);
         // SAFETY: requirements and memory type belong to this buffer/device.
-        let memory = unsafe { self.device().allocate_memory(&alloc, None) }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("vkAllocateMemory: {e}")))?;
+        let memory = match unsafe { self.device().allocate_memory(&alloc, None) } {
+            Ok(m) => m,
+            Err(e) => {
+                // SAFETY: destroying the just-created, never-bound buffer.
+                unsafe { self.device().destroy_buffer(buffer, None) };
+                return Err(GpuError::VulkanInitFailed(format!("vkAllocateMemory: {e}")));
+            }
+        };
         // SAFETY: buffer and allocation are compatible live handles.
-        unsafe { self.device().bind_buffer_memory(buffer, memory, 0) }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("vkBindBufferMemory: {e}")))?;
-        // SAFETY: host-visible allocation is mapped for the initialized range.
-        let ptr = unsafe {
-            self.device()
-                .map_memory(memory, 0, bytes.len() as u64, vk::MemoryMapFlags::empty())
+        if let Err(e) = unsafe { self.device().bind_buffer_memory(buffer, memory, 0) } {
+            // SAFETY: destroying the just-created buffer and its allocation.
+            unsafe {
+                self.device().destroy_buffer(buffer, None);
+                self.device().free_memory(memory, None);
+            }
+            return Err(GpuError::VulkanInitFailed(format!(
+                "vkBindBufferMemory: {e}"
+            )));
         }
-        .map_err(|e| GpuError::VulkanInitFailed(format!("vkMapMemory: {e}")))?;
-        // SAFETY: mapped range is at least bytes.len(); pointers do not overlap.
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
-            self.device().unmap_memory(memory);
+        if let Some(bytes) = fill {
+            debug_assert_eq!(bytes.len(), size);
+            // SAFETY: host-visible allocation is mapped for the filled range.
+            let ptr = unsafe {
+                self.device()
+                    .map_memory(memory, 0, size as u64, vk::MemoryMapFlags::empty())
+            }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("vkMapMemory: {e}")))?;
+            // SAFETY: mapped range is at least `size`; pointers do not overlap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+                self.device().unmap_memory(memory);
+            }
         }
+        Ok((buffer, memory))
+    }
+
+    fn create_storage_buffer(&self, bytes: &[u8]) -> Result<BufferAllocation, GpuError> {
+        if bytes.is_empty() {
+            return Err(GpuError::VulkanInitFailed(
+                "zero-sized compute storage buffer".to_owned(),
+            ));
+        }
+        let (buffer, memory) = self.create_host_buffer(
+            bytes.len(),
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            Some(bytes),
+        )?;
         Ok(BufferAllocation {
             buffer,
             memory,
@@ -262,7 +395,129 @@ impl<'a> ComputeResources<'a> {
         })
     }
 
+    /// One UAV: staging buffer + device-local RGBA8 image + view + readback
+    /// buffer. Pushed with null handles up front so `Drop` cleans up any
+    /// partially-built entry on the error paths.
+    fn create_storage_image(&mut self, upload: &StorageImageUpload) -> Result<(), GpuError> {
+        let size = (upload.width as usize) * (upload.height as usize) * 4;
+        if size == 0 || upload.pixels.len() != size {
+            return Err(GpuError::VulkanInitFailed(format!(
+                "storage image {}x{} carries {} initial bytes (want {size})",
+                upload.width,
+                upload.height,
+                upload.pixels.len()
+            )));
+        }
+        self.images.push(ImageAllocation {
+            staging_buffer: vk::Buffer::null(),
+            staging_memory: vk::DeviceMemory::null(),
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            readback_buffer: vk::Buffer::null(),
+            readback_memory: vk::DeviceMemory::null(),
+            width: upload.width,
+            height: upload.height,
+        });
+        let slot = self.images.len() - 1;
+
+        let (staging_buffer, staging_memory) = self.create_host_buffer(
+            size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            Some(&upload.pixels),
+        )?;
+        self.images[slot].staging_buffer = staging_buffer;
+        self.images[slot].staging_memory = staging_memory;
+
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .extent(vk::Extent3D {
+                width: upload.width,
+                height: upload.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(
+                vk::ImageUsageFlags::STORAGE
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        // SAFETY: `info` is fully initialized and borrows nothing beyond this
+        // call; the device is live.
+        let image = unsafe { self.device().create_image(&info, None) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("storage vkCreateImage: {e}")))?;
+        self.images[slot].image = image;
+
+        // SAFETY: `image` was just created from this device.
+        let reqs = unsafe { self.device().get_image_memory_requirements(image) };
+        let type_index = self
+            .dev
+            .find_memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(reqs.size)
+            .memory_type_index(type_index);
+        // SAFETY: allocation size/type come from this image's own requirements.
+        let memory = unsafe { self.device().allocate_memory(&alloc, None) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("storage image allocation: {e}")))?;
+        self.images[slot].memory = memory;
+
+        // SAFETY: memory was allocated for exactly this image; offset 0 is
+        // within it and satisfies the alignment requirement by construction.
+        unsafe { self.device().bind_image_memory(image, memory, 0) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("storage image bind memory: {e}")))?;
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        // SAFETY: the view's image is live and its format/range match the
+        // image's creation parameters.
+        let view = unsafe { self.device().create_image_view(&view_info, None) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("storage image view: {e}")))?;
+        self.images[slot].view = view;
+
+        let (readback_buffer, readback_memory) =
+            self.create_host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST, None)?;
+        self.images[slot].readback_buffer = readback_buffer;
+        self.images[slot].readback_memory = readback_memory;
+        Ok(())
+    }
+
     fn record_and_submit(&self, state: &ComputeState<'_>) -> Result<(), GpuError> {
+        let full_color = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let copy_region = |allocation: &ImageAllocation| {
+            vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width: allocation.width,
+                    height: allocation.height,
+                    depth: 1,
+                })
+        };
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         // SAFETY: newly allocated command buffer is not pending.
@@ -271,8 +526,58 @@ impl<'a> ComputeResources<'a> {
                 .begin_command_buffer(self.command_buffer, &begin)
         }
         .map_err(|e| GpuError::VulkanInitFailed(format!("vkBeginCommandBuffer: {e}")))?;
-        // SAFETY: pipeline/layout/sets are live and command buffer is recording.
+        // SAFETY: pipeline/layout/sets/images are live and the command buffer
+        // is recording; barriers and copies name handles this bundle retains
+        // until after the fence wait.
         unsafe {
+            // Upload every UAV's initial content and move it to GENERAL, the
+            // layout the STORAGE_IMAGE descriptor promised.
+            for allocation in &self.images {
+                let to_transfer = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(allocation.image)
+                    .subresource_range(full_color);
+                self.device().cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_transfer],
+                );
+                self.device().cmd_copy_buffer_to_image(
+                    self.command_buffer,
+                    allocation.staging_buffer,
+                    allocation.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[copy_region(allocation)],
+                );
+                let to_general = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(allocation.image)
+                    .subresource_range(full_color);
+                self.device().cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_general],
+                );
+            }
+
             self.device().cmd_bind_pipeline(
                 self.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
@@ -305,6 +610,51 @@ impl<'a> ComputeResources<'a> {
                 state.groups[1],
                 state.groups[2],
             );
+
+            // Copy every UAV back out for the guest-memory writeback.
+            for allocation in &self.images {
+                let to_readback = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(allocation.image)
+                    .subresource_range(full_color);
+                self.device().cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_readback],
+                );
+                self.device().cmd_copy_image_to_buffer(
+                    self.command_buffer,
+                    allocation.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    allocation.readback_buffer,
+                    &[copy_region(allocation)],
+                );
+            }
+            if !self.images.is_empty() {
+                // Make the transfer writes visible to the host map after the
+                // fence wait.
+                let host_read = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ);
+                self.device().cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[host_read],
+                    &[],
+                    &[],
+                );
+            }
             self.device().end_command_buffer(self.command_buffer)
         }
         .map_err(|e| GpuError::VulkanInitFailed(format!("vkEndCommandBuffer: {e}")))?;
@@ -321,33 +671,38 @@ impl<'a> ComputeResources<'a> {
             .map_err(|e| GpuError::VulkanInitFailed(format!("vkWaitForFences: {e}")))
     }
 
+    /// Map one host-coherent allocation and copy `size` bytes out.
+    fn read_host_memory(&self, memory: vk::DeviceMemory, size: usize) -> Result<Vec<u8>, GpuError> {
+        // SAFETY: host-coherent allocation is no longer used by the queue
+        // (fence signaled) and is mapped for its initialized range.
+        let ptr = unsafe {
+            self.device()
+                .map_memory(memory, 0, size as u64, vk::MemoryMapFlags::empty())
+        }
+        .map_err(|e| GpuError::VulkanInitFailed(format!("vkMapMemory: {e}")))?;
+        let mut bytes = vec![0; size];
+        // SAFETY: source mapped range and destination allocation both cover
+        // `size` bytes and cannot overlap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), bytes.as_mut_ptr(), size);
+            self.device().unmap_memory(memory);
+        }
+        Ok(bytes)
+    }
+
     fn read_storage(&self) -> Result<Vec<Vec<u8>>, GpuError> {
         self.storage
             .iter()
+            .map(|allocation| self.read_host_memory(allocation.memory, allocation.size))
+            .collect()
+    }
+
+    fn read_images(&self) -> Result<Vec<Vec<u8>>, GpuError> {
+        self.images
+            .iter()
             .map(|allocation| {
-                // SAFETY: host-coherent allocation is no longer used by the
-                // queue (fence signaled) and is mapped for its initialized range.
-                let ptr = unsafe {
-                    self.device().map_memory(
-                        allocation.memory,
-                        0,
-                        allocation.size as u64,
-                        vk::MemoryMapFlags::empty(),
-                    )
-                }
-                .map_err(|e| GpuError::VulkanInitFailed(format!("vkMapMemory: {e}")))?;
-                let mut bytes = vec![0; allocation.size];
-                // SAFETY: source mapped range and destination allocation both
-                // cover allocation.size bytes and cannot overlap.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        ptr.cast::<u8>(),
-                        bytes.as_mut_ptr(),
-                        allocation.size,
-                    );
-                    self.device().unmap_memory(allocation.memory);
-                }
-                Ok(bytes)
+                let size = (allocation.width as usize) * (allocation.height as usize) * 4;
+                self.read_host_memory(allocation.readback_memory, size)
             })
             .collect()
     }
@@ -386,6 +741,31 @@ impl Drop for ComputeResources<'_> {
             while let Some(allocation) = self.storage.pop() {
                 self.device().destroy_buffer(allocation.buffer, None);
                 self.device().free_memory(allocation.memory, None);
+            }
+            while let Some(allocation) = self.images.pop() {
+                if !allocation.view.is_null() {
+                    self.device().destroy_image_view(allocation.view, None);
+                }
+                if !allocation.image.is_null() {
+                    self.device().destroy_image(allocation.image, None);
+                }
+                if !allocation.memory.is_null() {
+                    self.device().free_memory(allocation.memory, None);
+                }
+                if !allocation.staging_buffer.is_null() {
+                    self.device()
+                        .destroy_buffer(allocation.staging_buffer, None);
+                }
+                if !allocation.staging_memory.is_null() {
+                    self.device().free_memory(allocation.staging_memory, None);
+                }
+                if !allocation.readback_buffer.is_null() {
+                    self.device()
+                        .destroy_buffer(allocation.readback_buffer, None);
+                }
+                if !allocation.readback_memory.is_null() {
+                    self.device().free_memory(allocation.readback_memory, None);
+                }
             }
         }
     }

@@ -30,6 +30,7 @@ pub fn register(registry: &HleRegistry) {
         hle_sce_cond_timedwait,
     );
     registry.register("libkernel", "scePthreadCondSignal", hle_cond_signal);
+    registry.register("libkernel", "scePthreadCondSignalto", hle_cond_signalto);
     registry.register("libkernel", "scePthreadCondBroadcast", hle_cond_broadcast);
     // The SCE spelling of destroy belongs with the rest of the real state
     // machine. `libkernel` previously bound it to a no-op that shared its
@@ -478,6 +479,23 @@ fn trace_signal(ctx: &HleContext, cond: u64, kind: &str) {
             "TRACE_COND: signalled"
         );
     }
+}
+
+/// `scePthreadCondSignalto(cond, thread)` — wake one SPECIFIC waiting thread.
+///
+/// XPS5X's condition state is a shared generation counter, not a per-waiter
+/// parking lot, so it cannot target an individual thread: this signals ONE
+/// waiter (`notify_one`) like `scePthreadCondSignal`. That is safe — every
+/// waiter re-checks its own predicate on wake (POSIX permits spurious
+/// wakeups), so the worst case is an extra loop iteration by the wrong
+/// thread, never a lost wakeup. The approximation is logged at debug.
+fn hle_cond_signalto(ctx: &HleContext, args: &[u64]) -> u64 {
+    debug!(
+        "scePthreadCondSignalto(cond={:#x}, thread={}) -> signal-one approximation",
+        args.first().copied().unwrap_or(0),
+        args.get(1).copied().unwrap_or(0)
+    );
+    hle_cond_signal(ctx, args)
 }
 
 /// `pthread_cond_broadcast(cond)` — wake all waiters. Same reasoning as

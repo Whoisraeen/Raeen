@@ -80,6 +80,27 @@ pub fn register(registry: &HleRegistry) {
         0xaca0_54b6_046b_b5b9,
         hle_register_buffers2,
     );
+    // Color pipeline + flip-state queries (measured ASTRO.BOT imports).
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutColorSettingsSetGamma_",
+        hle_color_settings_set_gamma,
+    );
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutAdjustColor_",
+        hle_adjust_color,
+    );
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutSubmitChangeBufferAttribute2",
+        hle_submit_change_buffer_attribute2,
+    );
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutIsFlipPending",
+        hle_is_flip_pending,
+    );
 }
 
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
@@ -379,6 +400,107 @@ fn hle_register_buffers2(ctx: &HleContext, args: &[u64]) -> u64 {
     set_index as u64
 }
 
+/// `sceVideoOutColorSettingsSetGamma_(SceVideoOutColorSettings *settings,
+/// float gamma)` — SharpEmu `VideoOutExports` (NID `DYhhWbJSeRg`): the gamma
+/// arrives in XMM0; validate it is finite and inside [0.1, 2.0], then store
+/// it as the settings object's leading float. XPS5X's present path applies no
+/// gamma yet, so the stored value is bookkeeping the later `AdjustColor_`
+/// call reads back.
+fn hle_color_settings_set_gamma(ctx: &HleContext, args: &[u64]) -> u64 {
+    let settings = args.first().copied().unwrap_or(0);
+    if settings == 0 {
+        return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+    }
+    let gamma = ctx.float_arg_f32(0);
+    if !gamma.is_finite() || !(0.1..=2.0).contains(&gamma) {
+        return VIDEO_OUT_ERROR_INVALID_VALUE;
+    }
+    if !ctx.mem.write(settings, &gamma.to_bits().to_le_bytes()) {
+        return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+    }
+    debug!("sceVideoOutColorSettingsSetGamma_(settings={settings:#x}, gamma={gamma})");
+    SCE_OK
+}
+
+/// `sceVideoOutAdjustColor_(handle, const SceVideoOutColorSettings
+/// *settings)` — SharpEmu `VideoOutExports` (NID `pv9CI5VC+R0`): accept the
+/// settings built by `ColorSettingsSetGamma_`. The gamma is read (validating
+/// the pointer) and logged; no display color pipeline exists to apply it to,
+/// which only affects final image tint, never guest progress.
+fn hle_adjust_color(ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0) as i32;
+    let settings = args.get(1).copied().unwrap_or(0);
+    if handle != 1 {
+        return VIDEO_OUT_ERROR_INVALID_HANDLE;
+    }
+    if settings == 0 {
+        return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+    }
+    let mut gamma = [0u8; 4];
+    if !ctx.mem.read(settings, &mut gamma) {
+        return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+    }
+    debug!(
+        "sceVideoOutAdjustColor_(handle={handle}, gamma={}) -> accepted (no host color pipeline)",
+        f32::from_bits(u32::from_le_bytes(gamma))
+    );
+    SCE_OK
+}
+
+/// `sceVideoOutSubmitChangeBufferAttribute2(handle, index, const
+/// SceVideoOutBufferAttribute2 *attribute)`: re-describe an already
+/// registered buffer slot (Gen5 titles switch pixel format / DCC state
+/// between scenes). The registered entry's attribute is updated in place so
+/// the present path sees the new layout; the slot's address is unchanged.
+/// Signature mirrors the Gen4 `sceVideoOutSubmitChangeBufferAttribute`
+/// (handle, index, attribute) with the Attribute2 block this file already
+/// decodes for `RegisterBuffers2`.
+fn hle_submit_change_buffer_attribute2(ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0) as i32;
+    let index = args.get(1).copied().unwrap_or(0) as i32;
+    let attribute_address = args.get(2).copied().unwrap_or(0);
+    if handle != 1 {
+        return VIDEO_OUT_ERROR_INVALID_HANDLE;
+    }
+    let Some(attribute) = read_buffer_attribute2(ctx, attribute_address) else {
+        // Accept-and-log rather than fail: the address may be a layout this
+        // decoder does not model yet, and a rejected attribute change would
+        // stop a render loop over a cosmetic re-description.
+        debug!(
+            "sceVideoOutSubmitChangeBufferAttribute2(handle={handle}, index={index}): \
+             attribute at {attribute_address:#x} unreadable — accepted without update"
+        );
+        return SCE_OK;
+    };
+    if let Some(mut buffer) = ctx.kernel.video_out_buffers.get_mut(&(handle, index)) {
+        buffer.attribute = attribute;
+        debug!(
+            "sceVideoOutSubmitChangeBufferAttribute2(handle={handle}, index={index}) -> \
+             {}x{} format={:#x}",
+            attribute.width, attribute.height, attribute.pixel_format
+        );
+    } else {
+        debug!(
+            "sceVideoOutSubmitChangeBufferAttribute2(handle={handle}, index={index}): \
+             slot not registered — accepted"
+        );
+    }
+    SCE_OK
+}
+
+/// `sceVideoOutIsFlipPending(handle)`: how many submitted flips have not yet
+/// completed. XPS5X completes every flip synchronously at submit
+/// (`hle_submit_flip`), so the honest answer is always 0 — matching SharpEmu's
+/// `VideoOutIsFlipPending` (NID `zgXifHT9ErY`), which reports 0 after
+/// validating the handle.
+fn hle_is_flip_pending(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0) as i32;
+    if handle != 1 {
+        return VIDEO_OUT_ERROR_INVALID_HANDLE;
+    }
+    0
+}
+
 /// `sceVideoOutGetVblankStatus(handle, SceVideoOutVblankStatus *status)`:
 /// reports the flip count as the vblank count (a monotonically-advancing
 /// frame counter is enough for a title's frame-timing loop).
@@ -486,6 +608,92 @@ mod tests {
         assert_eq!(event.filter, -13);
         assert_eq!(event.udata, 0xCAFE);
         assert_eq!(event.data as u64, 6 | (0x1234 << 16));
+    }
+
+    #[test]
+    fn color_and_flip_state_calls_validate_and_report() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let mut ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // Gamma arrives in XMM0: 1.25 is stored into the settings object.
+        ctx.float_args[0] = u64::from(1.25f32.to_bits());
+        assert_eq!(hle_color_settings_set_gamma(&ctx, &[0x100]), SCE_OK);
+        let mut g = [0u8; 4];
+        assert!(mem.read(0x100, &mut g));
+        assert_eq!(f32::from_bits(u32::from_le_bytes(g)), 1.25);
+        // Out-of-range gamma is rejected (SharpEmu validates 0.1..=2.0).
+        ctx.float_args[0] = u64::from(5.0f32.to_bits());
+        assert_eq!(
+            hle_color_settings_set_gamma(&ctx, &[0x100]),
+            VIDEO_OUT_ERROR_INVALID_VALUE
+        );
+        assert_eq!(
+            hle_color_settings_set_gamma(&ctx, &[0]),
+            VIDEO_OUT_ERROR_INVALID_ADDRESS
+        );
+
+        // AdjustColor accepts the settings on the open port only.
+        assert_eq!(hle_adjust_color(&ctx, &[1, 0x100]), SCE_OK);
+        assert_eq!(
+            hle_adjust_color(&ctx, &[7, 0x100]),
+            VIDEO_OUT_ERROR_INVALID_HANDLE
+        );
+
+        // No flip is ever left pending (flips complete at submit).
+        assert_eq!(hle_is_flip_pending(&ctx, &[1]), 0);
+        assert_eq!(hle_submit_flip(&ctx, &[1, 0, 1, 7]), SCE_OK);
+        assert_eq!(hle_is_flip_pending(&ctx, &[1]), 0);
+        assert_eq!(
+            hle_is_flip_pending(&ctx, &[9]),
+            VIDEO_OUT_ERROR_INVALID_HANDLE
+        );
+    }
+
+    /// SubmitChangeBufferAttribute2 re-describes a registered slot in place.
+    #[test]
+    fn change_buffer_attribute2_updates_the_registered_slot() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // Register one buffer at slot 0 with a 1920x1080 attribute.
+        assert_eq!(
+            hle_set_buffer_attribute2(
+                &ctx,
+                &[0x100, 0x8100_0000_2200_0000, 0, 1920, 1080, 0, 0, 0]
+            ),
+            SCE_OK
+        );
+        assert!(mem.write(0x200, &0x4000u64.to_le_bytes()));
+        assert!(mem.write(0x208, &0u64.to_le_bytes()));
+        assert_eq!(
+            hle_register_buffers2(&ctx, &[1, 0, 0, 0x200, 1, 0x100, 0, 0]),
+            0
+        );
+
+        // Re-describe it as 1280x720 with a different format.
+        assert_eq!(
+            hle_set_buffer_attribute2(&ctx, &[0x300, 0x1234, 0, 1280, 720, 0, 0, 0]),
+            SCE_OK
+        );
+        assert_eq!(
+            hle_submit_change_buffer_attribute2(&ctx, &[1, 0, 0x300]),
+            SCE_OK
+        );
+        let buffer = kernel.video_out_buffers.get(&(1, 0)).unwrap();
+        assert_eq!(buffer.attribute.width, 1280);
+        assert_eq!(buffer.attribute.height, 720);
+        assert_eq!(buffer.attribute.pixel_format, 0x1234);
+        assert_eq!(buffer.address, 0x4000, "address is unchanged");
+        drop(buffer);
+
+        assert_eq!(
+            hle_submit_change_buffer_attribute2(&ctx, &[3, 0, 0x300]),
+            VIDEO_OUT_ERROR_INVALID_HANDLE
+        );
     }
 
     #[test]

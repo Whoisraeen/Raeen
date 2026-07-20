@@ -138,6 +138,45 @@ pub fn install_module_exports(
     installed
 }
 
+/// Arm a one-shot `int3` at each arbitrary eboot-relative code address (RE
+/// probe: "does this instruction ever execute"). Reuses the export-trap
+/// registry and VEH; the synthetic "nid" is the address itself and the module
+/// is `addr-trap`, so a hit logs the address + caller like any export trap.
+/// `addrs` are module-relative (0-based); `base` is the guest arena base.
+pub fn install_addr_traps(image: &mut [u8], base: u64, addrs: &[u64]) -> usize {
+    let mut reg = REG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let r = reg.get_or_insert_with(Registry::default);
+    let mut installed = 0usize;
+    for &value in addrs {
+        let Some(off) = usize::try_from(value).ok().filter(|&o| o < image.len()) else {
+            continue;
+        };
+        let addr = base.wrapping_add(value);
+        if r.traps.contains_key(&addr) {
+            continue;
+        }
+        let orig = image[off];
+        if orig == INT3 {
+            continue;
+        }
+        image[off] = INT3;
+        r.traps.insert(
+            addr,
+            ExportTrap {
+                module: "addr-trap".to_string(),
+                nid: value,
+                orig,
+                hit: false,
+            },
+        );
+        installed += 1;
+    }
+    warn!("export_trap: armed {installed} arbitrary-address one-shot trap(s)");
+    installed
+}
+
 /// Service a breakpoint at `fault_addr` if it is one of our traps.
 ///
 /// Returns `true` if the address is (or was) a registered export trap — the

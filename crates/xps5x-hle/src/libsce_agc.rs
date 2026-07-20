@@ -30,7 +30,9 @@ const IT_INDEX_TYPE: u32 = 0x2A;
 const IT_NOP: u32 = 0x10;
 const IT_INDEX_BUFFER_SIZE: u32 = 0x13;
 const IT_INDEX_BASE: u32 = 0x26;
+const IT_DRAW_INDEX_INDIRECT: u32 = 0x25;
 const IT_DRAW_INDEX_2: u32 = 0x27;
+const IT_GET_LOD_STATS: u32 = 0x8E;
 const IT_DRAW_INDEX_OFFSET_2: u32 = 0x35;
 const IT_NUM_INSTANCES: u32 = 0x2F;
 const IT_DISPATCH_DIRECT: u32 = 0x15;
@@ -445,6 +447,39 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcCbSetShRegisterRangeDirectGetSize",
         hle_cb_set_sh_register_range_get_size,
     );
+    // ASTRO.BOT (PPSA21564) command-buffer builder batch — every name below
+    // hashes to the NID the title imports (verified with --missing-nids).
+    registry.register("libSceAgc", "sceAgcAcbDmaData", hle_acb_dma_data);
+    registry.register("libSceAgc", "sceAgcAcbCopyData", hle_acb_copy_data);
+    registry.register("libSceAgc", "sceAgcAcbAcquireMem", hle_acb_acquire_mem);
+    registry.register("libSceAgc", "sceAgcAcbWaitRegMem", hle_acb_wait_reg_mem);
+    // SharpEmu aliases the ACB marker entry points to the DCB emitters
+    // (`AcbPushMarker(ctx) => DcbPushMarker(ctx)`, AgcExports.cs L2099-2104 and
+    // L2125-2130) — identical packets on either queue.
+    registry.register("libSceAgc", "sceAgcAcbPushMarker", hle_dcb_push_marker);
+    registry.register("libSceAgc", "sceAgcAcbPopMarker", hle_dcb_pop_marker);
+    registry.register(
+        "libSceAgc",
+        "sceAgcCbSetShRegistersDirect",
+        hle_cb_set_sh_registers_direct,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcCbDispatchGetSize",
+        hle_cb_dispatch_get_size,
+    );
+    registry.register("libSceAgc", "sceAgcCbNopGetSize", hle_cb_nop_get_size);
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbDrawIndexIndirect",
+        hle_dcb_draw_index_indirect,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbStallCommandBufferParser",
+        hle_dcb_stall_command_buffer_parser,
+    );
+    registry.register("libSceAgc", "sceAgcDcbGetLodStats", hle_dcb_get_lod_stats);
 }
 
 /// Resource-registration maximum name length (`sceAgcDriver...`).
@@ -1997,6 +2032,330 @@ fn hle_dcb_acquire_mem(ctx: &HleContext, args: &[u64]) -> u64 {
         && w(20, 0)
         && w(24, poll_cycles / 40)
         && w(28, gcr_control);
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcAcbAcquireMem(acb, gcrControl, baseAddress, sizeBytes, pollCycles)`:
+/// emit the async-compute ACQUIRE_MEM packet (8 DWORDs). Unlike the DCB form
+/// there is no engine/cbDbOp pair — DWORD1 is fixed `0x8000_0000`.
+/// `sizeBytes == u64::MAX` means "no size". Ported from SharpEmu
+/// `AcbAcquireMem` (AgcExports.cs L1095-1131). Returns the command address,
+/// or 0 on failure.
+fn hle_acb_acquire_mem(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let gcr_control = args.get(1).copied().unwrap_or(0) as u32;
+    let base_address = args.get(2).copied().unwrap_or(0);
+    let size_bytes = args.get(3).copied().unwrap_or(0);
+    let poll_cycles = args.get(4).copied().unwrap_or(0) as u32;
+    let no_size = size_bytes == u64::MAX;
+    if cb == 0
+        || (!no_size && size_bytes & 0xFF != 0)
+        || (!no_size && size_bytes >> 40 != 0)
+        || base_address & 0xFF != 0
+        || base_address >> 40 != 0
+    {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 8) else {
+        return 0;
+    };
+    let size_field = if no_size { 0 } else { (size_bytes >> 8) as u32 };
+    let w = |off: u64, v: u32| ctx.mem.write(addr + off, &v.to_le_bytes());
+    let ok = w(0, pm4(8, IT_NOP, R_ACQUIRE_MEM))
+        && w(4, 0x8000_0000)
+        && w(8, size_field)
+        && w(12, 0)
+        && w(16, (base_address >> 8) as u32)
+        && w(20, 0)
+        && w(24, poll_cycles / 40)
+        && w(28, gcr_control);
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcAcbWaitRegMem(acb, size, compareFunction, cachePolicy, address,
+/// reference, mask, pollCycles)`: emit the async-compute wait-memory packet.
+/// `mask` (arg7) and `pollCycles` (arg8) are stack args → `args[6]`/`args[7]`.
+/// Unlike the DCB form there is no `operation` argument (no standard
+/// WAIT_REG_MEM branch): `size == 0` → 6-DWORD 32-bit wait (`R_WAIT_MEM32`),
+/// `size == 1` → 9-DWORD 64-bit wait (`R_WAIT_MEM64`). Ported from SharpEmu
+/// `AcbWaitRegMem` (AgcExports.cs L1133-1186). Returns the command address,
+/// or 0 on failure.
+fn hle_acb_wait_reg_mem(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let size = (args.get(1).copied().unwrap_or(0) & 0xFF) as u32;
+    let compare = (args.get(2).copied().unwrap_or(0) & 0xFF) as u32;
+    let cache_policy = (args.get(3).copied().unwrap_or(0) & 0xFF) as u32;
+    let address = args.get(4).copied().unwrap_or(0);
+    let reference = args.get(5).copied().unwrap_or(0);
+    let mask = args.get(6).copied().unwrap_or(0);
+    let poll_cycles = args.get(7).copied().unwrap_or(0) as u32;
+    if cb == 0 || size > 1 || compare > 7 || cache_policy > 3 {
+        return 0;
+    }
+    let (packet_dwords, packet_register) = if size == 0 {
+        (6, R_WAIT_MEM32)
+    } else {
+        (9, R_WAIT_MEM64)
+    };
+    let Some(addr) = alloc_command_dwords(ctx, cb, packet_dwords) else {
+        return 0;
+    };
+    let w = |off: u64, v: u32| ctx.mem.write(addr + off, &v.to_le_bytes());
+    let head = w(0, pm4(packet_dwords as u32, IT_NOP, packet_register))
+        && w(4, address as u32)
+        && w(8, (address >> 32) as u32)
+        && w(12, mask as u32);
+    let ok = if !head {
+        false
+    } else if size == 0 {
+        w(16, compare) && w(20, reference as u32)
+    } else {
+        w(16, (mask >> 32) as u32)
+            && w(20, reference as u32)
+            && w(24, (reference >> 32) as u32)
+            && w(28, compare)
+            && w(32, poll_cycles / 40)
+    };
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcAcbDmaData(acb, sourceSelector, destinationSelector,
+/// destinationAddress, sourceOrImmediate, byteCount)`: emit the async-compute
+/// DMA_DATA packet (7 DWORDs — the DCB form is 8). `sourceOrImmediate` and
+/// `byteCount` arrive on the stack → `args[6]`/`args[7]` (SharpEmu reads them
+/// at `Rsp+8`/`Rsp+16`). Layout: header, destination u64, source-or-immediate
+/// u64, byteCount, `sourceSelector | destinationSelector << 8`. Ported from
+/// SharpEmu `AcbDmaData` (AgcExports.cs L1966-1997). Returns the command
+/// address, or 0 on failure.
+fn hle_acb_dma_data(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let source_selector = (args.get(1).copied().unwrap_or(0) & 0xFF) as u32;
+    let destination_selector = (args.get(2).copied().unwrap_or(0) & 0xFF) as u32;
+    let destination_address = args.get(3).copied().unwrap_or(0);
+    let source_or_immediate = args.get(6).copied().unwrap_or(0);
+    let byte_count = args.get(7).copied().unwrap_or(0) as u32;
+    if cb == 0 || byte_count == 0 || byte_count > 256 * 1024 * 1024 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 7) else {
+        return 0;
+    };
+    let ok = ctx
+        .mem
+        .write(addr, &pm4(7, IT_NOP, R_DMA_DATA).to_le_bytes())
+        && ctx.mem.write(addr + 4, &destination_address.to_le_bytes())
+        && ctx.mem.write(addr + 12, &source_or_immediate.to_le_bytes())
+        && ctx.mem.write(addr + 20, &byte_count.to_le_bytes())
+        && ctx.mem.write(
+            addr + 24,
+            &(source_selector | (destination_selector << 8)).to_le_bytes(),
+        );
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcAcbCopyData(...)`: NO reference implementation exists — SharpEmu and
+/// Kyty Gen5 both lack it; aerolib only names the NID (`qzMN2XKGA4k`). Mirror
+/// SharpEmu's ACB⇒DCB aliasing pattern for data packets
+/// (`AcbWriteData(ctx) => DcbWriteData(ctx)`, AgcExports.cs L1188-1194) and
+/// emit the same GUESSED standard PM4 COPY_DATA as [`hle_dcb_copy_data`];
+/// warns once.
+fn hle_acb_copy_data(ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if warn_once(&WARNED) {
+        warn!(
+            "sceAgcAcbCopyData: no reference implementation — aliased to the guessed \
+             sceAgcDcbCopyData emission"
+        );
+    }
+    hle_dcb_copy_data(ctx, args)
+}
+
+/// `sceAgcCbSetShRegistersDirect(cb, registers, count)`: read `count`
+/// `(offset u32, value u32)` pairs from the guest `registers` array, sort them
+/// by offset, coalesce runs of consecutive offsets, and emit one SET_SH_REG
+/// packet per run (`header, offset & 0xFFFF, values…`). Returns the address of
+/// the FIRST packet emitted, or 0 on failure. Ported from SharpEmu
+/// `CbSetShRegistersDirect` (AgcExports.cs L970-1040).
+fn hle_cb_set_sh_registers_direct(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let registers_addr = args.get(1).copied().unwrap_or(0);
+    let count = args.get(2).copied().unwrap_or(0) as u32;
+    if count == 0 || cb == 0 || registers_addr == 0 || count > 4096 {
+        return 0;
+    }
+    let mut registers = Vec::with_capacity(count as usize);
+    for index in 0..u64::from(count) {
+        let entry = registers_addr + index * 8;
+        let mut offset = [0u8; 4];
+        let mut value = [0u8; 4];
+        if !ctx.mem.read(entry, &mut offset) || !ctx.mem.read(entry + 4, &mut value) {
+            return 0;
+        }
+        registers.push((u32::from_le_bytes(offset), u32::from_le_bytes(value)));
+    }
+    registers.sort_by_key(|&(offset, _)| offset);
+    let mut first_command = 0u64;
+    let mut start = 0usize;
+    while start < registers.len() {
+        let mut end = start + 1;
+        while end < registers.len() && registers[end].0 == registers[end - 1].0 + 1 {
+            end += 1;
+        }
+        let value_count = (end - start) as u32;
+        let packet_dwords = value_count + 2;
+        let Some(addr) = alloc_command_dwords(ctx, cb, u64::from(packet_dwords)) else {
+            return 0;
+        };
+        if !ctx.mem.write(
+            addr,
+            &pm4(packet_dwords, IT_SET_SH_REG, R_ZERO).to_le_bytes(),
+        ) || !ctx
+            .mem
+            .write(addr + 4, &(registers[start].0 & 0xFFFF).to_le_bytes())
+        {
+            return 0;
+        }
+        for (slot, &(_, value)) in registers[start..end].iter().enumerate() {
+            if !ctx
+                .mem
+                .write(addr + 8 + slot as u64 * 4, &value.to_le_bytes())
+            {
+                return 0;
+            }
+        }
+        if first_command == 0 {
+            first_command = addr;
+        }
+        start = end;
+    }
+    first_command
+}
+
+/// `sceAgcCbDispatchGetSize()`: BYTES a [`hle_cb_dispatch`] packet occupies —
+/// 5 DWORDs = 20. No reference implements this NID (aerolib names it only),
+/// but SharpEmu's GetSize convention returns bytes for a fixed packet
+/// (`DcbDrawIndexIndirectGetSize` returns `5 * sizeof(uint)` for its own
+/// 5-DWORD packet, AgcExports.cs L1566-1575), and the writer this must match
+/// is in this file.
+fn hle_cb_dispatch_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    5 * 4
+}
+
+/// `sceAgcCbNopGetSize(dwordCount)`: BYTES a [`hle_cb_nop`] packet of
+/// `dwordCount` total DWORDs occupies — `dwordCount * 4`. Signature inferred
+/// from the writer (its only size input is the DWORD count); byte units follow
+/// SharpEmu's GetSize convention (e.g. `DcbDmaDataGetSize`, AgcExports.cs
+/// L1955-1964). Warns once about the inference.
+fn hle_cb_nop_get_size(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let dword_count = args.first().copied().unwrap_or(0) as u32;
+    if warn_once(&WARNED) {
+        warn!(
+            "sceAgcCbNopGetSize: signature inferred (dwordCount in the first argument \
+             register) — returning {} bytes for dwordCount={dword_count}",
+            u64::from(dword_count) * 4
+        );
+    }
+    u64::from(dword_count) * 4
+}
+
+/// `sceAgcDcbDrawIndexIndirect(dcb, dataOffset, modifier)`: emit a 5-DWORD
+/// DRAW_INDEX_INDIRECT packet — `header, dataOffset, 0, 0, modifier` — drawing
+/// from the argument buffer set by `sceAgcDcbSetBaseIndirectArgs`. Ported from
+/// SharpEmu `DcbDrawIndexIndirect` (AgcExports.cs L1539-1564). Returns the
+/// command address, or 0 on failure.
+fn hle_dcb_draw_index_indirect(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let data_offset = args.get(1).copied().unwrap_or(0) as u32;
+    let modifier = args.get(2).copied().unwrap_or(0) as u32;
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 5) else {
+        return 0;
+    };
+    let w = |off: u64, v: u32| ctx.mem.write(addr + off, &v.to_le_bytes());
+    let ok = w(0, pm4(5, IT_DRAW_INDEX_INDIRECT, R_ZERO))
+        && w(4, data_offset)
+        && w(8, 0)
+        && w(12, 0)
+        && w(16, modifier);
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcDcbStallCommandBufferParser(dcb, size, address, reference)`: SharpEmu
+/// executes submissions synchronously, so there is no independent command
+/// processor to stall — it emits a well-formed 2-DWORD NOP so packet addresses
+/// and the cursor stay coherent (`DcbStallCommandBufferParser`, AgcExports.cs
+/// L1856-1882). Same story here: our processor consumes the whole buffer per
+/// submit. `size > 1` is rejected. Returns the command address, or 0 on
+/// failure.
+fn hle_dcb_stall_command_buffer_parser(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let size = (args.get(1).copied().unwrap_or(0) & 0xFF) as u32;
+    if cb == 0 || size > 1 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 2) else {
+        return 0;
+    };
+    if !ctx.mem.write(addr, &pm4(2, IT_NOP, R_ZERO).to_le_bytes())
+        || !ctx.mem.write(addr + 4, &0u32.to_le_bytes())
+    {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcDcbGetLodStats(dcb, cachePolicy, destinationAddress, control,
+/// counterMask, resetCounters, enable, counterSelect)`: emit a 5-DWORD
+/// GET_LOD_STATS packet — `header, control, dstLo & ~0x3F, dstHi,
+/// packetControl` where `packetControl = cachePolicy << 28 | enable << 19 |
+/// resetCounters << 18 | counterMask << 10 | counterSelect << 2`. `enable`
+/// (arg7) and `counterSelect` (arg8) are stack args → `args[6]`/`args[7]`.
+/// Ported from SharpEmu `DcbGetLodStats` (AgcExports.cs L1589-1631). Returns
+/// the command address, or 0 on failure.
+fn hle_dcb_get_lod_stats(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let cache_policy = (args.get(1).copied().unwrap_or(0) & 0x3) as u32;
+    let destination_address = args.get(2).copied().unwrap_or(0);
+    let control = args.get(3).copied().unwrap_or(0) as u32;
+    let counter_mask = (args.get(4).copied().unwrap_or(0) & 0xFF) as u32;
+    let reset_counters = (args.get(5).copied().unwrap_or(0) & 0x1) as u32;
+    let enable = (args.get(6).copied().unwrap_or(0) & 0x1) as u32;
+    let counter_select = (args.get(7).copied().unwrap_or(0) & 0xFF) as u32;
+    if cb == 0 {
+        return 0;
+    }
+    let packet_control = (cache_policy << 28)
+        | (enable << 19)
+        | (reset_counters << 18)
+        | (counter_mask << 10)
+        | (counter_select << 2);
+    let Some(addr) = alloc_command_dwords(ctx, cb, 5) else {
+        return 0;
+    };
+    let w = |off: u64, v: u32| ctx.mem.write(addr + off, &v.to_le_bytes());
+    let ok = w(0, pm4(5, IT_GET_LOD_STATS, R_ZERO))
+        && w(4, control)
+        && w(8, (destination_address as u32) & !0x3F)
+        && w(12, (destination_address >> 32) as u32)
+        && w(16, packet_control);
     if !ok {
         return 0;
     }
@@ -4288,5 +4647,251 @@ mod tests {
         assert!(overrides.iter().any(|(nid, key)| {
             *nid == 0xfca4_7359_e915_d76d && key == "libSceAgc::sceAgcUnknownKRzWekV120"
         }));
+    }
+
+    #[test]
+    fn astrobot_builder_batch_is_registered() {
+        let registry = HleRegistry::new();
+        for name in [
+            "sceAgcAcbDmaData",
+            "sceAgcAcbCopyData",
+            "sceAgcAcbAcquireMem",
+            "sceAgcAcbWaitRegMem",
+            "sceAgcAcbPushMarker",
+            "sceAgcAcbPopMarker",
+            "sceAgcCbSetShRegistersDirect",
+            "sceAgcCbDispatchGetSize",
+            "sceAgcCbNopGetSize",
+            "sceAgcDcbDrawIndexIndirect",
+            "sceAgcDcbStallCommandBufferParser",
+            "sceAgcDcbGetLodStats",
+        ] {
+            assert!(
+                registry.is_implemented("libSceAgc", name),
+                "{name} must be registered"
+            );
+        }
+    }
+
+    #[test]
+    fn acb_dma_data_emits_seven_dword_packet() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let dst = 0x0000_00AB_1234_5678u64;
+        let src = 0x0000_00CD_9ABC_DEF0u64;
+        // sourceOrImmediate/byteCount are stack args → args[6]/args[7].
+        let args = [cb, 0x11, 0x22, dst, 0, 0, src, 0x100];
+        assert_eq!(hle_acb_dma_data(&ctx, &args), 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(7, IT_NOP, R_DMA_DATA));
+        assert_eq!(read_u64(&ctx, 0x404), dst, "destination u64 at +4");
+        assert_eq!(read_u64(&ctx, 0x40C), src, "source-or-immediate u64 at +12");
+        assert_eq!(read_u32(&ctx, 0x414), 0x100, "byte count");
+        assert_eq!(
+            read_u32(&ctx, 0x418),
+            0x11 | (0x22 << 8),
+            "sourceSelector | destinationSelector << 8"
+        );
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x400 + 28);
+        // Zero and oversized byte counts are rejected.
+        assert_eq!(hle_acb_dma_data(&ctx, &[cb, 0, 0, 0, 0, 0, 0, 0]), 0);
+        let too_big = 256 * 1024 * 1024 + 1;
+        assert_eq!(hle_acb_dma_data(&ctx, &[cb, 0, 0, 0, 0, 0, 0, too_big]), 0);
+    }
+
+    #[test]
+    fn acb_copy_data_matches_the_dcb_emission() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let src = 0xAAAA_0000_0000_1111u64;
+        let dst = 0xBBBB_0000_0000_2222u64;
+        assert_eq!(hle_acb_copy_data(&ctx, &[cb, 0x205, src, dst]), 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(6, IT_COPY_DATA, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), 0x205, "control");
+        assert_eq!(read_u32(&ctx, 0x408), src as u32);
+        assert_eq!(read_u32(&ctx, 0x40C), (src >> 32) as u32);
+        assert_eq!(read_u32(&ctx, 0x410), dst as u32);
+        assert_eq!(read_u32(&ctx, 0x414), (dst >> 32) as u32);
+        assert_eq!(hle_acb_copy_data(&ctx, &[0]), 0, "null buffer rejected");
+    }
+
+    #[test]
+    fn acb_acquire_mem_emits_eight_dword_packet() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let base = 0x0000_0012_3456_7800u64; // 256-byte aligned, < 2^40
+        assert_eq!(
+            hle_acb_acquire_mem(&ctx, &[cb, 0xC0DE, base, 0x4000, 400]),
+            0x400
+        );
+        assert_eq!(read_u32(&ctx, 0x400), pm4(8, IT_NOP, R_ACQUIRE_MEM));
+        assert_eq!(read_u32(&ctx, 0x404), 0x8000_0000, "fixed DWORD1");
+        assert_eq!(read_u32(&ctx, 0x408), 0x40, "sizeBytes >> 8");
+        assert_eq!(read_u32(&ctx, 0x40C), 0);
+        assert_eq!(read_u32(&ctx, 0x410), (base >> 8) as u32, "base >> 8");
+        assert_eq!(read_u32(&ctx, 0x414), 0);
+        assert_eq!(read_u32(&ctx, 0x418), 10, "pollCycles / 40");
+        assert_eq!(read_u32(&ctx, 0x41C), 0xC0DE, "gcrControl");
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x420);
+        // u64::MAX size means "no size" → size field 0.
+        let a = hle_acb_acquire_mem(&ctx, &[cb, 0, base, u64::MAX, 0]);
+        assert_eq!(read_u32(&ctx, a + 8), 0, "no-size form writes 0");
+        // Misaligned size / base rejected.
+        assert_eq!(hle_acb_acquire_mem(&ctx, &[cb, 0, base, 0x123, 0]), 0);
+        assert_eq!(hle_acb_acquire_mem(&ctx, &[cb, 0, base | 1, 0x100, 0]), 0);
+    }
+
+    #[test]
+    fn acb_wait_reg_mem_emits_32_and_64_bit_forms() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let addr = 0x0000_00AB_CDEF_0120u64;
+        let mask = 0x1111_2222_3333_4444u64;
+        let reference = 0x5555_6666_7777_8888u64;
+        // 32-bit form (size = 0): 6 DWORDs, R_WAIT_MEM32.
+        let args32 = [cb, 0, 3, 1, addr, reference, mask, 400];
+        assert_eq!(hle_acb_wait_reg_mem(&ctx, &args32), 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(6, IT_NOP, R_WAIT_MEM32));
+        assert_eq!(read_u32(&ctx, 0x404), addr as u32);
+        assert_eq!(read_u32(&ctx, 0x408), (addr >> 32) as u32);
+        assert_eq!(read_u32(&ctx, 0x40C), mask as u32);
+        assert_eq!(read_u32(&ctx, 0x410), 3, "compare function");
+        assert_eq!(read_u32(&ctx, 0x414), reference as u32);
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x400 + 24);
+        // 64-bit form (size = 1): 9 DWORDs, R_WAIT_MEM64.
+        let args64 = [cb, 1, 5, 0, addr, reference, mask, 400];
+        assert_eq!(hle_acb_wait_reg_mem(&ctx, &args64), 0x418);
+        assert_eq!(read_u32(&ctx, 0x418), pm4(9, IT_NOP, R_WAIT_MEM64));
+        assert_eq!(read_u32(&ctx, 0x41C), addr as u32);
+        assert_eq!(read_u32(&ctx, 0x420), (addr >> 32) as u32);
+        assert_eq!(read_u32(&ctx, 0x424), mask as u32);
+        assert_eq!(read_u32(&ctx, 0x428), (mask >> 32) as u32);
+        assert_eq!(read_u32(&ctx, 0x42C), reference as u32);
+        assert_eq!(read_u32(&ctx, 0x430), (reference >> 32) as u32);
+        assert_eq!(read_u32(&ctx, 0x434), 5, "compare function");
+        assert_eq!(read_u32(&ctx, 0x438), 10, "pollCycles / 40");
+        // Invalid size / compare / cache policy rejected.
+        assert_eq!(hle_acb_wait_reg_mem(&ctx, &[cb, 2, 0, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(hle_acb_wait_reg_mem(&ctx, &[cb, 0, 8, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(hle_acb_wait_reg_mem(&ctx, &[cb, 0, 0, 4, 0, 0, 0, 0]), 0);
+    }
+
+    #[test]
+    fn cb_set_sh_registers_direct_sorts_and_coalesces_runs() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        // Unsorted (offset, value) pairs: run {0x0C,0x0D,0x0E} + isolated 0x240.
+        let regs = 0x1000u64;
+        for (i, (off, val)) in [(0x0Eu32, 30u32), (0x240, 99), (0x0C, 10), (0x0D, 20)]
+            .iter()
+            .enumerate()
+        {
+            assert!(ctx.mem.write(regs + i as u64 * 8, &off.to_le_bytes()));
+            assert!(ctx.mem.write(regs + i as u64 * 8 + 4, &val.to_le_bytes()));
+        }
+        let first = hle_cb_set_sh_registers_direct(&ctx, &[cb, regs, 4]);
+        assert_eq!(first, 0x400, "returns the FIRST packet address");
+        // Packet 1: 5 DWORDs covering the 0x0C..0x0E run.
+        assert_eq!(read_u32(&ctx, 0x400), pm4(5, IT_SET_SH_REG, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), 0x0C, "run start offset");
+        assert_eq!(read_u32(&ctx, 0x408), 10);
+        assert_eq!(read_u32(&ctx, 0x40C), 20);
+        assert_eq!(read_u32(&ctx, 0x410), 30);
+        // Packet 2: 3 DWORDs for the isolated register.
+        assert_eq!(read_u32(&ctx, 0x414), pm4(3, IT_SET_SH_REG, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x418), 0x240);
+        assert_eq!(read_u32(&ctx, 0x41C), 99);
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x420);
+        // Zero count / null pointers / oversized count rejected.
+        assert_eq!(hle_cb_set_sh_registers_direct(&ctx, &[cb, regs, 0]), 0);
+        assert_eq!(hle_cb_set_sh_registers_direct(&ctx, &[0, regs, 1]), 0);
+        assert_eq!(hle_cb_set_sh_registers_direct(&ctx, &[cb, 0, 1]), 0);
+        assert_eq!(hle_cb_set_sh_registers_direct(&ctx, &[cb, regs, 4097]), 0);
+    }
+
+    #[test]
+    fn cb_get_size_functions_match_their_writers() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        // Dispatch: the writer emits 5 DWORDs; GetSize reports 20 bytes.
+        let before = read_u64(&ctx, cb + CB_CURSOR_UP);
+        assert_ne!(hle_cb_dispatch(&ctx, &[cb, 1, 1, 1, 0]), 0);
+        let dispatch_bytes = read_u64(&ctx, cb + CB_CURSOR_UP) - before;
+        assert_eq!(hle_cb_dispatch_get_size(&ctx, &[]), dispatch_bytes);
+        assert_eq!(hle_cb_dispatch_get_size(&ctx, &[]), 20);
+        // Nop: the writer emits exactly dwordCount DWORDs.
+        let before = read_u64(&ctx, cb + CB_CURSOR_UP);
+        assert_ne!(hle_cb_nop(&ctx, &[cb, 6]), 0);
+        let nop_bytes = read_u64(&ctx, cb + CB_CURSOR_UP) - before;
+        assert_eq!(hle_cb_nop_get_size(&ctx, &[6]), nop_bytes);
+        assert_eq!(hle_cb_nop_get_size(&ctx, &[6]), 24);
+    }
+
+    #[test]
+    fn dcb_draw_index_indirect_emits_five_dword_packet() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        assert_eq!(
+            hle_dcb_draw_index_indirect(&ctx, &[cb, 0x120, 0xABCD]),
+            0x400
+        );
+        assert_eq!(
+            read_u32(&ctx, 0x400),
+            pm4(5, IT_DRAW_INDEX_INDIRECT, R_ZERO)
+        );
+        assert_eq!(read_u32(&ctx, 0x404), 0x120, "indirect-args data offset");
+        assert_eq!(read_u32(&ctx, 0x408), 0);
+        assert_eq!(read_u32(&ctx, 0x40C), 0);
+        assert_eq!(read_u32(&ctx, 0x410), 0xABCD, "modifier");
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x400 + 20);
+        assert_eq!(hle_dcb_draw_index_indirect(&ctx, &[0]), 0);
+    }
+
+    #[test]
+    fn stall_parser_and_lod_stats_emit_correctly() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        // Stall: 2-DWORD NOP keeps the cursor coherent; size > 1 rejected.
+        assert_eq!(
+            hle_dcb_stall_command_buffer_parser(&ctx, &[cb, 0, 0x9000, 7]),
+            0x400
+        );
+        assert_eq!(read_u32(&ctx, 0x400), pm4(2, IT_NOP, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), 0);
+        assert_eq!(hle_dcb_stall_command_buffer_parser(&ctx, &[cb, 2]), 0);
+        // GetLodStats: 5-DWORD packet with the packed control word. enable and
+        // counterSelect are stack args → args[6]/args[7].
+        let dst = 0x0000_00AB_1234_5678u64;
+        let args = [cb, 2, dst, 0xFEED, 0x3C, 1, 1, 0x12];
+        assert_eq!(hle_dcb_get_lod_stats(&ctx, &args), 0x408);
+        assert_eq!(read_u32(&ctx, 0x408), pm4(5, IT_GET_LOD_STATS, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x40C), 0xFEED, "control");
+        assert_eq!(
+            read_u32(&ctx, 0x410),
+            (dst as u32) & !0x3F,
+            "dst lo & ~0x3F"
+        );
+        assert_eq!(read_u32(&ctx, 0x414), (dst >> 32) as u32, "dst hi");
+        assert_eq!(
+            read_u32(&ctx, 0x418),
+            (2 << 28) | (1 << 19) | (1 << 18) | (0x3C << 10) | (0x12 << 2),
+            "cachePolicy<<28 | enable<<19 | reset<<18 | mask<<10 | select<<2"
+        );
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x408 + 20);
     }
 }

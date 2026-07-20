@@ -404,6 +404,52 @@ fn hle_read(ctx: &HleContext, args: &[u64]) -> u64 {
     }
 }
 
+/// Real `pread(fd, buf, nbyte, offset)` / `sceKernelPread` (VFS-backed):
+/// reads up to `nbyte` bytes at absolute `offset` without moving the
+/// descriptor's cursor — streaming loaders issue these concurrently with
+/// sequential reads on the same fd. Measured: ASTRO.BOT's asset streamer
+/// calls it during boot (its import was the first unresolved-NID fault once
+/// boot reached the streaming path).
+fn hle_pread(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    let buf = args.get(1).copied().unwrap_or(0);
+    let count = args.get(2).copied().unwrap_or(0).min(READ_MAX_BYTES);
+    let offset = args.get(3).copied().unwrap_or(0);
+    debug!("pread(fd={fd}, buf={buf:#x}, count={count:#x}, offset={offset:#x})");
+
+    if (offset as i64) < 0 {
+        return FILE_EINVAL;
+    }
+    let Ok(n) = usize::try_from(count) else {
+        return FILE_EINVAL;
+    };
+    match ctx.kernel.filesystem.pread(fd, n, offset) {
+        Ok(bytes) => {
+            if bytes.is_empty() {
+                return 0; // EOF (or a read wholly past it) — a valid short read.
+            }
+            if !ctx.mem.write(buf, &bytes) {
+                warn!(
+                    "pread: guest buffer {buf:#x} (+{}) not writable — EFAULT",
+                    bytes.len()
+                );
+                return FILE_EFAULT;
+            }
+            bytes.len() as u64
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => FILE_EBADF,
+        Err(_) => FILE_EINVAL,
+    }
+}
+
+fn hle_posix_pread(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_posix(ctx, hle_pread(ctx, args))
+}
+
+fn hle_sce_pread(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_sce(hle_pread(ctx, args))
+}
+
 /// Real `close(fd)` / `sceKernelClose`: closes the VFS descriptor. Unknown
 /// fd → `EBADF`.
 fn hle_close(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -664,14 +710,58 @@ fn hle_apr_wait(ctx: &HleContext, args: &[u64]) -> u64 {
 /// `0xFFFF_FFFF` + size 0 and the batch CONTINUES (a patch/DLC path may be
 /// legitimately absent; the caller checks per-file results).
 fn hle_apr_resolve_filepaths_to_ids_and_file_sizes(ctx: &HleContext, args: &[u64]) -> u64 {
-    const MAX_PATHS: u64 = 1024;
-    const PATH_CAP: usize = 1024;
-
     let path_list = args.first().copied().unwrap_or(0);
     let count = args.get(1).copied().unwrap_or(0);
     let ids_address = args.get(2).copied().unwrap_or(0);
     let sizes_address = args.get(3).copied().unwrap_or(0);
-    if path_list == 0 || count == 0 || sizes_address == 0 || count > MAX_PATHS {
+    if sizes_address == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    apr_resolve_batch(
+        ctx,
+        None,
+        path_list,
+        count,
+        ids_address,
+        sizes_address,
+        /* missing_is_error = */ false,
+    )
+}
+
+/// One path entry's resolution: the registered APR id and the file size, or
+/// `None` when the path does not resolve to an existing host file.
+fn apr_resolve_one(ctx: &HleContext, guest_path: &str) -> Option<(u32, u64)> {
+    let host = ctx.kernel.filesystem.resolve_path(guest_path)?;
+    let meta = std::fs::metadata(&host).ok()?;
+    let id = ctx
+        .kernel
+        .appr_register_file(guest_path, host.display().to_string());
+    Some((id, meta.len()))
+}
+
+/// Shared body of the `sceKernelAprResolveFilepaths*` family.
+///
+/// `path_list` is an array of `count` `uint64` pointers to NUL-terminated
+/// guest paths (SharpEmu `KernelMemoryCompatExports` ABI). Each resolves
+/// through the VFS and registers a deterministic FNV-1a id for later AMPR
+/// reads. `prefix` (the `WithPrefix` variants) is prepended verbatim to every
+/// entry before resolution. Out-arrays are optional (0 = skip that output).
+///
+/// A missing file either continues the batch with id `0xFFFF_FFFF` + size 0
+/// (`missing_is_error == false` — the `AndFileSizes` behavior: patch/DLC
+/// files may legitimately be absent and the caller checks per-file results)
+/// or aborts with `ENOENT` (`true` — SharpEmu's `ToIds` behavior).
+fn apr_resolve_batch(
+    ctx: &HleContext,
+    prefix: Option<&str>,
+    path_list: u64,
+    count: u64,
+    ids_address: u64,
+    sizes_address: u64,
+    missing_is_error: bool,
+) -> u64 {
+    const MAX_PATHS: u64 = 1024;
+    if path_list == 0 || count == 0 || count > MAX_PATHS {
         return SCE_KERNEL_ERROR_EINVAL;
     }
 
@@ -681,46 +771,268 @@ fn hle_apr_resolve_filepaths_to_ids_and_file_sizes(ctx: &HleContext, args: &[u64
             return SCE_KERNEL_ERROR_EFAULT;
         }
         let text_ptr = u64::from_le_bytes(raw);
-
-        // Bounded cstring read (NUL-terminated, capped).
-        let mut text = Vec::new();
-        let mut chunk = [0u8; 64];
-        let mut cursor = text_ptr;
-        while text.len() < PATH_CAP && text_ptr != 0 {
-            let take = (PATH_CAP - text.len()).min(chunk.len());
-            if !ctx.mem.read(cursor, &mut chunk[..take]) {
-                break;
-            }
-            if let Some(nul) = chunk[..take].iter().position(|&b| b == 0) {
-                text.extend_from_slice(&chunk[..nul]);
-                break;
-            }
-            text.extend_from_slice(&chunk[..take]);
-            cursor += take as u64;
+        let text = crate::fmt::read_cstr(ctx.mem, text_ptr).unwrap_or_default();
+        let mut guest_path = String::from_utf8_lossy(&text).into_owned();
+        if let Some(prefix) = prefix {
+            guest_path = format!("{prefix}{guest_path}");
         }
-        let guest_path = String::from_utf8_lossy(&text).into_owned();
 
-        let (id, size) = match ctx.kernel.filesystem.resolve_path(&guest_path) {
-            Some(host) => match std::fs::metadata(&host) {
-                Ok(meta) => {
-                    let id = ctx
-                        .kernel
-                        .appr_register_file(&guest_path, host.display().to_string());
-                    (id, meta.len())
-                }
-                Err(_) => (u32::MAX, 0),
-            },
+        let (id, size) = match apr_resolve_one(ctx, &guest_path) {
+            Some(resolved) => resolved,
+            None if missing_is_error => {
+                debug!("AprResolveFilepaths: '{guest_path}' not found — aborting batch (ENOENT)");
+                return SCE_KERNEL_ERROR_ENOENT;
+            }
             None => (u32::MAX, 0),
         };
 
         if ids_address != 0 && !ctx.mem.write(ids_address + i * 4, &id.to_le_bytes()) {
             return SCE_KERNEL_ERROR_EFAULT;
         }
-        if !ctx.mem.write(sizes_address + i * 8, &size.to_le_bytes()) {
+        if sizes_address != 0 && !ctx.mem.write(sizes_address + i * 8, &size.to_le_bytes()) {
             return SCE_KERNEL_ERROR_EFAULT;
         }
     }
     SCE_OK
+}
+
+/// `sceKernelAprResolveFilepathsToIds(pathList, count, ids)` — the ids-only
+/// sibling (SharpEmu `KernelMemoryCompatExports`, NID `WT-5NKy42fw`): a
+/// missing file aborts the batch with `ENOENT` (unlike the `AndFileSizes`
+/// form, which reports per-file misses and continues).
+fn hle_apr_resolve_filepaths_to_ids(ctx: &HleContext, args: &[u64]) -> u64 {
+    let path_list = args.first().copied().unwrap_or(0);
+    let count = args.get(1).copied().unwrap_or(0);
+    let ids_address = args.get(2).copied().unwrap_or(0);
+    if ids_address == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    apr_resolve_batch(ctx, None, path_list, count, ids_address, 0, true)
+}
+
+/// `sceKernelAprResolveFilepathsWithPrefixToIds(prefix, pathList, count,
+/// ids)`: the `ToIds` form with a shared path prefix (arg 0) prepended to
+/// every entry. Neither reference implements the `WithPrefix` variants
+/// (shadPS4 carries only aerolib stubs; SharpEmu omits them), so the
+/// argument order is the natural extension of the verified non-prefix ABI:
+/// the prefix leads and the remaining arguments shift right by one.
+fn hle_apr_resolve_filepaths_with_prefix_to_ids(ctx: &HleContext, args: &[u64]) -> u64 {
+    let prefix_ptr = args.first().copied().unwrap_or(0);
+    let path_list = args.get(1).copied().unwrap_or(0);
+    let count = args.get(2).copied().unwrap_or(0);
+    let ids_address = args.get(3).copied().unwrap_or(0);
+    if prefix_ptr == 0 || ids_address == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let Some(prefix) = crate::fmt::read_cstr(ctx.mem, prefix_ptr) else {
+        return SCE_KERNEL_ERROR_EFAULT;
+    };
+    let prefix = String::from_utf8_lossy(&prefix).into_owned();
+    apr_resolve_batch(ctx, Some(&prefix), path_list, count, ids_address, 0, true)
+}
+
+/// `sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes(prefix, pathList,
+/// count, ids, sizes)` — see [`hle_apr_resolve_filepaths_with_prefix_to_ids`]
+/// for the (inferred) prefix ABI; per-file misses continue the batch like the
+/// verified non-prefix `AndFileSizes` form.
+fn hle_apr_resolve_filepaths_with_prefix_to_ids_and_file_sizes(
+    ctx: &HleContext,
+    args: &[u64],
+) -> u64 {
+    let prefix_ptr = args.first().copied().unwrap_or(0);
+    let path_list = args.get(1).copied().unwrap_or(0);
+    let count = args.get(2).copied().unwrap_or(0);
+    let ids_address = args.get(3).copied().unwrap_or(0);
+    let sizes_address = args.get(4).copied().unwrap_or(0);
+    if prefix_ptr == 0 || sizes_address == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let Some(prefix) = crate::fmt::read_cstr(ctx.mem, prefix_ptr) else {
+        return SCE_KERNEL_ERROR_EFAULT;
+    };
+    let prefix = String::from_utf8_lossy(&prefix).into_owned();
+    apr_resolve_batch(
+        ctx,
+        Some(&prefix),
+        path_list,
+        count,
+        ids_address,
+        sizes_address,
+        false,
+    )
+}
+
+/// The `*ForEach` resolve variants (`ToIdsForEach`,
+/// `ToIdsAndFileSizesForEach`, `WithPrefixToIdsForEach`,
+/// `WithPrefixToIdsAndFileSizesForEach`).
+///
+/// **Honest partial:** no reference implements these (shadPS4 has only
+/// aerolib stubs; SharpEmu omits them), so beyond `pathList`/`count` — which
+/// the non-`ForEach` forms fix — the trailing argument layout is unverified:
+/// `ForEach` strongly suggests a per-file guest callback, and XPS5X must not
+/// call back into the guest here nor write through register slots that may
+/// hold a code pointer. So this resolves and REGISTERS every path in the APR
+/// id table (the durable side effect later `sceAmprApr*ReadFile` calls
+/// depend on), writes nothing, warns loudly once per entry point, and
+/// reports success.
+fn apr_resolve_foreach(
+    ctx: &HleContext,
+    args: &[u64],
+    name: &'static str,
+    with_prefix: bool,
+) -> u64 {
+    let (prefix, path_list, count) = if with_prefix {
+        let prefix_ptr = args.first().copied().unwrap_or(0);
+        let prefix = crate::fmt::read_cstr(ctx.mem, prefix_ptr)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        (
+            prefix,
+            args.get(1).copied().unwrap_or(0),
+            args.get(2).copied().unwrap_or(0),
+        )
+    } else {
+        (
+            None,
+            args.first().copied().unwrap_or(0),
+            args.get(1).copied().unwrap_or(0),
+        )
+    };
+
+    static WARNED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    if let Ok(mut warned) = WARNED.lock()
+        && !warned.contains(&name)
+    {
+        warned.push(name);
+        warn!(
+            "{name}: ForEach ABI unverified (no reference implementation) — registering \
+             {count} path(s) in the APR id table, invoking NO guest callback and writing \
+             NO out-array; later AMPR reads by id still resolve"
+        );
+    }
+
+    if path_list == 0 || count == 0 || count > 1024 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    for i in 0..count {
+        let mut raw = [0u8; 8];
+        if !ctx.mem.read(path_list + i * 8, &mut raw) {
+            return SCE_KERNEL_ERROR_EFAULT;
+        }
+        let text = crate::fmt::read_cstr(ctx.mem, u64::from_le_bytes(raw)).unwrap_or_default();
+        let mut guest_path = String::from_utf8_lossy(&text).into_owned();
+        if let Some(prefix) = &prefix {
+            guest_path = format!("{prefix}{guest_path}");
+        }
+        let _ = apr_resolve_one(ctx, &guest_path);
+    }
+    SCE_OK
+}
+
+fn hle_apr_resolve_filepaths_to_ids_foreach(ctx: &HleContext, args: &[u64]) -> u64 {
+    apr_resolve_foreach(ctx, args, "sceKernelAprResolveFilepathsToIdsForEach", false)
+}
+
+fn hle_apr_resolve_filepaths_to_ids_and_file_sizes_foreach(ctx: &HleContext, args: &[u64]) -> u64 {
+    apr_resolve_foreach(
+        ctx,
+        args,
+        "sceKernelAprResolveFilepathsToIdsAndFileSizesForEach",
+        false,
+    )
+}
+
+fn hle_apr_resolve_filepaths_with_prefix_to_ids_foreach(ctx: &HleContext, args: &[u64]) -> u64 {
+    apr_resolve_foreach(
+        ctx,
+        args,
+        "sceKernelAprResolveFilepathsWithPrefixToIdsForEach",
+        true,
+    )
+}
+
+fn hle_apr_resolve_filepaths_with_prefix_to_ids_and_file_sizes_foreach(
+    ctx: &HleContext,
+    args: &[u64],
+) -> u64 {
+    apr_resolve_foreach(
+        ctx,
+        args,
+        "sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizesForEach",
+        true,
+    )
+}
+
+/// `sceKernelAprSubmitCommandBufferAndGetId(cb, priority, outSubmissionId)` —
+/// SharpEmu `KernelAprCompatExports` (NID `qvMUCyyaCSI`): like
+/// `SubmitCommandBufferAndGetResult` but the third argument is the submission
+/// id out-pointer (required) and there is no result address.
+fn hle_apr_submit_and_get_id(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let out_submission_id = args.get(2).copied().unwrap_or(0);
+    if cb == 0 || out_submission_id == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let submission_id = ctx.kernel.appr_add_submission(cb);
+    let result = apr_complete_command_buffer(ctx, cb);
+    if result != SCE_OK {
+        return result;
+    }
+    if !ctx
+        .mem
+        .write(out_submission_id, &submission_id.to_le_bytes())
+    {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    SCE_OK
+}
+
+/// `sceKernelAprGetFileStat(id, SceKernelStat *stat)` — SharpEmu
+/// `KernelMemoryCompatExports` (NID `ApkYaHb8Sek`): stat an APR file by the
+/// id `AprResolveFilepaths*` registered, writing the standard 120-byte Orbis
+/// stat. An unregistered id or a vanished host file is `ENOENT` (SharpEmu
+/// observed Void Terrarium null-dereferencing when this was missing).
+fn hle_apr_get_file_stat(ctx: &HleContext, args: &[u64]) -> u64 {
+    let file_id = args.first().copied().unwrap_or(0) as u32;
+    let stat_out = args.get(1).copied().unwrap_or(0);
+    if stat_out == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let Some(host) = ctx.kernel.appr_host_path(file_id) else {
+        debug!("sceKernelAprGetFileStat(id={file_id:#x}): id not registered — ENOENT");
+        return SCE_KERNEL_ERROR_ENOENT;
+    };
+    match std::fs::metadata(&host) {
+        Ok(metadata) => write_orbis_stat(ctx, stat_out, &metadata),
+        Err(_) => SCE_KERNEL_ERROR_ENOENT,
+    }
+}
+
+/// `sceKernelAprGetFileSize(id, uint64_t *size)`: report the real VFS file
+/// size for a registered APR id.
+///
+/// The exact signature is not reversed anywhere public — SharpEmu returns a
+/// bare success stub (NID `WvEu7yl3Ivg`, "argument layout is unknown") — so
+/// this takes the layout every sibling APR call uses (id first, out-pointer
+/// second) and fails EINVAL/ENOENT rather than guessing further.
+fn hle_apr_get_file_size(ctx: &HleContext, args: &[u64]) -> u64 {
+    let file_id = args.first().copied().unwrap_or(0) as u32;
+    let size_out = args.get(1).copied().unwrap_or(0);
+    if size_out == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let Some(host) = ctx.kernel.appr_host_path(file_id) else {
+        debug!("sceKernelAprGetFileSize(id={file_id:#x}): id not registered — ENOENT");
+        return SCE_KERNEL_ERROR_ENOENT;
+    };
+    match std::fs::metadata(&host) {
+        Ok(metadata) => {
+            if !ctx.mem.write(size_out, &metadata.len().to_le_bytes()) {
+                return SCE_KERNEL_ERROR_EFAULT;
+            }
+            SCE_OK
+        }
+        Err(_) => SCE_KERNEL_ERROR_ENOENT,
+    }
 }
 
 /// Common Gen5 directory enumeration path. `sceKernelGetdirentries` supplies
@@ -1037,6 +1349,13 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libScePosix", "getdents", hle_posix_getdents);
     registry.register("libkernel", "lseek", hle_posix_lseek);
     registry.register("libkernel", "sceKernelLseek", hle_sce_lseek);
+    // pread: positional read. Registered under both the SCE and POSIX names
+    // and both provider libraries (resolution is provider-aware — see the
+    // clock_gettime lesson: a symbol only registered under one library is
+    // unresolved for a title importing it from the other).
+    registry.register("libkernel", "sceKernelPread", hle_sce_pread);
+    registry.register("libkernel", "pread", hle_posix_pread);
+    registry.register("libScePosix", "pread", hle_posix_pread);
     registry.register(
         "libkernel",
         "sceKernelAioInitializeParam",
@@ -1063,6 +1382,56 @@ pub fn register(registry: &HleRegistry) {
         hle_apr_submit,
     );
     registry.register("libkernel", "sceKernelAprWaitCommandBuffer", hle_apr_wait);
+    registry.register(
+        "libkernel",
+        "sceKernelAprSubmitCommandBufferAndGetId",
+        hle_apr_submit_and_get_id,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelAprResolveFilepathsToIds",
+        hle_apr_resolve_filepaths_to_ids,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelAprResolveFilepathsWithPrefixToIds",
+        hle_apr_resolve_filepaths_with_prefix_to_ids,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes",
+        hle_apr_resolve_filepaths_with_prefix_to_ids_and_file_sizes,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelAprResolveFilepathsToIdsForEach",
+        hle_apr_resolve_filepaths_to_ids_foreach,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelAprResolveFilepathsToIdsAndFileSizesForEach",
+        hle_apr_resolve_filepaths_to_ids_and_file_sizes_foreach,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelAprResolveFilepathsWithPrefixToIdsForEach",
+        hle_apr_resolve_filepaths_with_prefix_to_ids_foreach,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizesForEach",
+        hle_apr_resolve_filepaths_with_prefix_to_ids_and_file_sizes_foreach,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelAprGetFileStat",
+        hle_apr_get_file_stat,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelAprGetFileSize",
+        hle_apr_get_file_size,
+    );
 
     // -- Module loading (M1-D) --
     registry.register(
@@ -1120,6 +1489,26 @@ pub fn register(registry: &HleRegistry) {
         "sceKernelSetVirtualRangeName",
         hle_set_virtual_range_name,
     );
+    registry.register(
+        "libkernel",
+        "sceKernelClearVirtualRangeName",
+        hle_clear_virtual_range_name,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelDirectMemoryQuery",
+        hle_direct_memory_query,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelConfiguredFlexibleMemorySize",
+        hle_configured_flexible_memory_size,
+    );
+    // The console's "open PS id" — a libkernel export the title imports from
+    // the wrapper library `libSceOpenPsId` (provider-aware resolution keys on
+    // the importing library, so both spellings are registered).
+    registry.register("libSceOpenPsId", "sceKernelGetOpenPsId", hle_get_open_ps_id);
+    registry.register("libkernel", "sceKernelGetOpenPsId", hle_get_open_ps_id);
 
     // -- Thread / sync --
     registry.register("libkernel", "scePthreadCreate", hle_pthread_create);
@@ -1197,8 +1586,10 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "_exit", hle_pthread_exit);
     registry.register("libkernel", "nanosleep", hle_nanosleep);
     // libkernel's real export of the same call under the underscore spelling
-    // (a distinct NID — a NID hashes the name alone).
+    // (a distinct NID — a NID hashes the name alone), and the sce spelling
+    // (`sceKernelNanosleep`, same req/rem timespec ABI, measured ASTRO.BOT).
     registry.register("libkernel", "_nanosleep", hle_nanosleep);
+    registry.register("libkernel", "sceKernelNanosleep", hle_nanosleep);
     registry.register("libkernel", "getrusage", hle_getrusage);
     registry.register("libkernel", "signal", hle_posix_signal);
     registry.register("libkernel", "sceKernelMlock", hle_mlock);
@@ -1326,7 +1717,8 @@ pub fn register(registry: &HleRegistry) {
     // bookkeeping has no scheduler to talk to yet, so recording nothing and
     // returning success is faithful enough for a single-thread world.
     registry.register("libkernel", "scePthreadDetach", hle_pthread_detach);
-    registry.register("libkernel", "scePthreadSetprio", hle_ok_stub);
+    // scePthreadSetprio/Getprio are registered by `pthread_thread` (real
+    // priority bookkeeping) — the old hle_ok_stub here dropped the value.
     registry.register("libkernel", "scePthreadSetaffinity", hle_ok_stub);
     registry.register("libkernel", "scePthreadAttrSetaffinity", hle_ok_stub);
     registry.register("libkernel", "scePthreadAttrGetaffinity", hle_ok_stub);
@@ -2006,6 +2398,100 @@ fn hle_set_virtual_range_name(_ctx: &HleContext, args: &[u64]) -> u64 {
     0
 }
 
+/// `sceKernelClearVirtualRangeName(addr, len)`: the inverse of
+/// [`hle_set_virtual_range_name`]. Range names are diagnostic-only in this
+/// model (Set does not record them), so clearing is an accepted no-op.
+fn hle_clear_virtual_range_name(_ctx: &HleContext, args: &[u64]) -> u64 {
+    debug!(
+        "sceKernelClearVirtualRangeName(addr={:#x}, len={:#x})",
+        args.first().copied().unwrap_or(0),
+        args.get(1).copied().unwrap_or(0)
+    );
+    SCE_OK
+}
+
+/// `SCE_KERNEL_ERROR_EACCES` (`0x8002000D`, errno 13): shadPS4's
+/// `DirectMemoryQuery` code for "no allocated direct memory owns this offset".
+const SCE_KERNEL_ERROR_EACCES: u64 = 0x8002_000D;
+
+/// `sceKernelDirectMemoryQuery(offset, flags, SceKernelDirectMemoryQueryInfo
+/// *info, infoSize)` — shadPS4 `memory.cpp` (NID `BHouLQzh0X0`): find the
+/// allocated direct-memory region containing `offset` (`flags == 1` searches
+/// forward to the next allocated region) and report `{ u64 start; u64 end;
+/// s32 memoryType }` (shadPS4's `OrbisQueryInfo`).
+///
+/// XPS5X's direct-memory allocator hands out arena addresses and records each
+/// allocation via `kernel.memory.record_mapping`, so the honest answer is the
+/// recorded region containing (or following) the queried address. Unallocated
+/// offsets are `EACCES`, matching shadPS4.
+fn hle_direct_memory_query(ctx: &HleContext, args: &[u64]) -> u64 {
+    let offset = args.first().copied().unwrap_or(0);
+    let flags = args.get(1).copied().unwrap_or(0) as i32;
+    let info_out = args.get(2).copied().unwrap_or(0);
+    let info_size = args.get(3).copied().unwrap_or(0x14);
+    debug!(
+        "sceKernelDirectMemoryQuery(offset={offset:#x}, flags={flags}, infoSize={info_size:#x})"
+    );
+    if info_out == 0 || info_size < 0x14 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let region = ctx.kernel.memory.region_containing(offset).or_else(|| {
+        if flags == 1 {
+            ctx.kernel.memory.region_at_or_after(offset)
+        } else {
+            None
+        }
+    });
+    let Some(region) = region else {
+        debug!("sceKernelDirectMemoryQuery: no allocated region owns {offset:#x} — EACCES");
+        return SCE_KERNEL_ERROR_EACCES;
+    };
+    let mut info = [0u8; 0x14];
+    info[0..8].copy_from_slice(&region.vaddr.to_le_bytes());
+    info[8..16].copy_from_slice(&(region.vaddr + region.size).to_le_bytes());
+    // Memory type: XPS5X models one CPU-coherent pool (Onion / WB_ONION = 0).
+    info[16..20].copy_from_slice(&0i32.to_le_bytes());
+    if !ctx.mem.write(info_out, &info) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    SCE_OK
+}
+
+/// `sceKernelConfiguredFlexibleMemorySize(size_t *sizeOut)` — shadPS4
+/// `memory.cpp` (NID `n1-v6FgU7MQ`): the total configured flexible-memory
+/// budget. Must agree with what `sceKernelAvailableFlexibleMemorySize`
+/// reports ([`FLEXIBLE_MEMORY_SIZE`]) — a title that reads both expects
+/// configured >= available.
+fn hle_configured_flexible_memory_size(ctx: &HleContext, args: &[u64]) -> u64 {
+    let size_out = args.first().copied().unwrap_or(0);
+    debug!("sceKernelConfiguredFlexibleMemorySize(sizeOut={size_out:#x})");
+    if size_out == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    if !ctx.mem.write(size_out, &FLEXIBLE_MEMORY_SIZE.to_le_bytes()) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    SCE_OK
+}
+
+/// `sceKernelGetOpenPsId(uint8_t id[16])` (library `libSceOpenPsId`): the
+/// console's 16-byte "open PS id". shadPS4 carries only the aerolib stub;
+/// XPS5X reports a deterministic per-install-independent constant — stable
+/// across runs so a title keying caches/telemetry buckets on it never sees
+/// the id change, and obviously synthetic in logs.
+fn hle_get_open_ps_id(ctx: &HleContext, args: &[u64]) -> u64 {
+    const OPEN_PS_ID: [u8; 16] = *b"XPS5X-OpenPsId\x00\x01";
+    let id_out = args.first().copied().unwrap_or(0);
+    debug!("sceKernelGetOpenPsId(id={id_out:#x})");
+    if id_out == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    if !ctx.mem.write(id_out, &OPEN_PS_ID) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    SCE_OK
+}
+
 fn hle_write_throttling_default(_ctx: &HleContext, args: &[u64]) -> u64 {
     debug!(
         "libkernel_write_throttling::YFC3dBBipj8(context={:#x}, policy={:#x}) -> default policy",
@@ -2546,7 +3032,7 @@ fn hle_module_info_unavailable(_ctx: &HleContext, args: &[u64]) -> u64 {
 /// header/table and first load-segment address/size. The caller initializes
 /// `size`; matching the kernel contract prevents writes into older, shorter
 /// structure revisions.
-fn hle_get_module_info_for_unwind(ctx: &HleContext, args: &[u64]) -> u64 {
+pub(crate) fn hle_get_module_info_for_unwind(ctx: &HleContext, args: &[u64]) -> u64 {
     const INFO_SIZE: usize = 304;
     const NAME_OFFSET: usize = 8;
     const NAME_SIZE: usize = 256;
@@ -3502,6 +3988,190 @@ mod tests {
         assert!(mem.write(at + 8, &offset.to_le_bytes()));
     }
 
+    /// DirectMemoryQuery reports the recorded allocation containing (or, with
+    /// flags==1, following) the queried offset — shadPS4's OrbisQueryInfo
+    /// `{start, end, memoryType}` — and EACCES for unallocated space.
+    #[test]
+    fn direct_memory_query_reports_recorded_regions() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        kernel.memory.record_mapping(0x40_0000, 0x8000, 0x3);
+
+        // Inside the region.
+        assert_eq!(
+            hle_direct_memory_query(&ctx, &[0x40_1000, 0, 0x100, 0x18]),
+            SCE_OK
+        );
+        let mut info = [0u8; 0x14];
+        assert!(mem.read(0x100, &mut info));
+        assert_eq!(
+            u64::from_le_bytes(info[0..8].try_into().unwrap()),
+            0x40_0000
+        );
+        assert_eq!(
+            u64::from_le_bytes(info[8..16].try_into().unwrap()),
+            0x40_8000
+        );
+
+        // Below it: flags=0 → EACCES; flags=1 → finds the next region.
+        assert_eq!(
+            hle_direct_memory_query(&ctx, &[0x10_0000, 0, 0x100, 0x18]),
+            SCE_KERNEL_ERROR_EACCES
+        );
+        assert_eq!(
+            hle_direct_memory_query(&ctx, &[0x10_0000, 1, 0x100, 0x18]),
+            SCE_OK
+        );
+        assert!(mem.read(0x100, &mut info));
+        assert_eq!(
+            u64::from_le_bytes(info[0..8].try_into().unwrap()),
+            0x40_0000
+        );
+
+        // NULL / undersized info out-param is EINVAL.
+        assert_eq!(
+            hle_direct_memory_query(&ctx, &[0x40_1000, 0, 0, 0x18]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
+        assert_eq!(
+            hle_direct_memory_query(&ctx, &[0x40_1000, 0, 0x100, 0x8]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
+    }
+
+    /// ConfiguredFlexibleMemorySize agrees with the Available report's model.
+    #[test]
+    fn configured_flexible_memory_size_writes_the_pool_size() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_configured_flexible_memory_size(&ctx, &[0x100]), SCE_OK);
+        let mut size = [0u8; 8];
+        assert!(mem.read(0x100, &mut size));
+        assert_eq!(u64::from_le_bytes(size), FLEXIBLE_MEMORY_SIZE);
+        assert_eq!(
+            hle_configured_flexible_memory_size(&ctx, &[0]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
+    }
+
+    /// GetOpenPsId writes a stable, nonzero 16-byte id.
+    #[test]
+    fn get_open_ps_id_is_deterministic() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_get_open_ps_id(&ctx, &[0x100]), SCE_OK);
+        assert_eq!(hle_get_open_ps_id(&ctx, &[0x200]), SCE_OK);
+        let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+        assert!(mem.read(0x100, &mut a));
+        assert!(mem.read(0x200, &mut b));
+        assert_eq!(a, b, "the id must be stable across calls");
+        assert_ne!(a, [0u8; 16]);
+        assert_eq!(hle_get_open_ps_id(&ctx, &[0]), SCE_KERNEL_ERROR_EINVAL);
+
+        let registry = crate::HleRegistry::new();
+        assert!(registry.is_implemented("libSceOpenPsId", "sceKernelGetOpenPsId"));
+        assert!(registry.is_implemented("libkernel", "sceKernelGetOpenPsId"));
+    }
+
+    /// The APR id table resolves GetFileSize/GetFileStat to real host file
+    /// metadata, and SubmitCommandBufferAndGetId writes its id out-param.
+    #[test]
+    fn apr_get_file_size_and_stat_use_the_registered_id_table() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // A real host file with a known size.
+        let host = std::env::temp_dir().join(format!(
+            "xps5x_apr_test_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&host, [0xAAu8; 1234]).expect("temp file");
+        let id = kernel.appr_register_file("/app0/assets/level.bin", host.display().to_string());
+
+        assert_eq!(hle_apr_get_file_size(&ctx, &[u64::from(id), 0x100]), SCE_OK);
+        let mut size = [0u8; 8];
+        assert!(mem.read(0x100, &mut size));
+        assert_eq!(u64::from_le_bytes(size), 1234);
+
+        assert_eq!(hle_apr_get_file_stat(&ctx, &[u64::from(id), 0x200]), SCE_OK);
+        let mut stat = [0u8; ORBIS_STAT_SIZE];
+        assert!(mem.read(0x200, &mut stat));
+        // st_size at +72 in the 120-byte Orbis stat; regular-file mode at +8.
+        assert_eq!(u64::from_le_bytes(stat[72..80].try_into().unwrap()), 1234);
+        assert_eq!(
+            u16::from_le_bytes(stat[8..10].try_into().unwrap()),
+            ORBIS_MODE_REGULAR
+        );
+
+        // Unregistered id → ENOENT; NULL out-param → EINVAL.
+        assert_eq!(
+            hle_apr_get_file_size(&ctx, &[0xDEAD, 0x100]),
+            SCE_KERNEL_ERROR_ENOENT
+        );
+        assert_eq!(
+            hle_apr_get_file_stat(&ctx, &[0xDEAD, 0x200]),
+            SCE_KERNEL_ERROR_ENOENT
+        );
+        assert_eq!(
+            hle_apr_get_file_size(&ctx, &[u64::from(id), 0]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
+        let _ = std::fs::remove_file(&host);
+
+        // SubmitCommandBufferAndGetId: an empty (zero-length) command buffer
+        // completes and the submission id lands in the third argument.
+        assert!(mem.write(0x508, &0x600u64.to_le_bytes())); // cb data ptr
+        assert!(mem.write(0x510, &0u64.to_le_bytes())); // cb size 0
+        assert_eq!(hle_apr_submit_and_get_id(&ctx, &[0x500, 0, 0x300]), SCE_OK);
+        let mut sub = [0u8; 4];
+        assert!(mem.read(0x300, &mut sub));
+        assert_ne!(u32::from_le_bytes(sub), 0);
+        assert_eq!(
+            hle_apr_submit_and_get_id(&ctx, &[0x500, 0, 0]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
+    }
+
+    /// The ForEach resolve variants register paths in the APR table without
+    /// writing through their unverified trailing arguments.
+    #[test]
+    fn apr_foreach_registers_paths_without_writing_out_arrays() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // One path entry pointing at an unresolvable guest path (no VFS mount
+        // in the test kernel): the call still succeeds and touches nothing.
+        assert!(mem.write(0x100, b"/app0/x.bin\0"));
+        assert!(mem.write(0x200, &0x100u64.to_le_bytes()));
+        let sentinel = 0x300u64;
+        assert!(mem.write(sentinel, &[0xEEu8; 16]));
+        assert_eq!(
+            hle_apr_resolve_filepaths_to_ids_foreach(&ctx, &[0x200, 1, sentinel, sentinel]),
+            SCE_OK
+        );
+        let mut probe = [0u8; 16];
+        assert!(mem.read(sentinel, &mut probe));
+        assert_eq!(probe, [0xEEu8; 16], "unverified out-args must be untouched");
+        assert_eq!(
+            hle_apr_resolve_filepaths_to_ids_foreach(&ctx, &[0, 0]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
+    }
+
     /// The ELF TLS ABI requires that a thread-local reached through the
     /// general-dynamic model (`__tls_get_addr`) resolve to the *same address* as
     /// the same variable reached through initial-exec — which the runtime
@@ -4394,6 +5064,47 @@ mod tests {
         assert_eq!(i32::from_le_bytes(errno_bytes), 2);
         assert_eq!(hle_sce_open(&ctx, &[0x300, 0, 0]), 0x8002_0002);
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `pread` reads at an absolute offset WITHOUT moving the cursor — a
+    /// streaming loader interleaves preads with sequential reads on one fd.
+    /// Measured: ASTRO.BOT's asset streamer imports sceKernelPread.
+    #[test]
+    fn pread_reads_at_offset_without_moving_the_cursor() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x800);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let tmp = std::env::temp_dir().join(format!("xps5x-hle-pread-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("data.bin"), b"HELLO_WORLD").unwrap();
+        kernel.filesystem.set_game_directory(&tmp);
+
+        assert!(mem.write(0x100, b"/app0/data.bin\0"));
+        let fd = hle_open(&ctx, &[0x100, 0, 0]);
+        assert!((fd as i64) >= 3);
+
+        // pread "WORLD" at offset 6, then a sequential read still starts at 0.
+        assert_eq!(hle_pread(&ctx, &[fd, 0x200, 5, 6]), 5);
+        let mut buf = [0u8; 5];
+        assert!(mem.read(0x200, &mut buf));
+        assert_eq!(&buf, b"WORLD");
+        assert_eq!(hle_read(&ctx, &[fd, 0x210, 5]), 5);
+        let mut buf2 = [0u8; 5];
+        assert!(mem.read(0x210, &mut buf2));
+        assert_eq!(&buf2, b"HELLO");
+
+        // Reads at/past EOF are a valid 0-byte short read; a partial tail is
+        // returned short, not padded.
+        assert_eq!(hle_pread(&ctx, &[fd, 0x220, 5, 11]), 0);
+        assert_eq!(hle_pread(&ctx, &[fd, 0x220, 5, 9]), 2);
+        // Negative offset → EINVAL; bad fd → EBADF.
+        assert_eq!(hle_pread(&ctx, &[fd, 0x220, 5, u64::MAX]) as i64, -22);
+        assert_eq!(hle_pread(&ctx, &[999, 0x220, 5, 0]) as i64, -9);
+
+        assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

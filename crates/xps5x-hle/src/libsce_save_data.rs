@@ -84,6 +84,11 @@ pub fn register(registry: &HleRegistry) {
             "sceSaveDataSyncSaveDataMemory",
             hle_sync_save_data_memory,
         );
+        registry.register(
+            library,
+            "sceSaveDataTransferringMount",
+            hle_transferring_mount,
+        );
     }
     registry.register_nid(
         "libSceSaveData_native",
@@ -591,6 +596,26 @@ fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
 /// point named in the 16-byte argument. Titles hold several containers
 /// mounted concurrently, so unmounting "whatever is mounted" corrupts the
 /// others.
+/// `sceSaveDataTransferringMount(const SceSaveDataTransferringMount *mount,
+/// SceSaveDataMountResult *result)`: mount ANOTHER title's save data for a
+/// cross-title transfer (shadPS4 `savedata.cpp:1685` — mount carries a
+/// foreign titleId/dirName/fingerprint). XPS5X's save-data host map is
+/// strictly per-title, so there is never foreign save data to offer: report
+/// `NOT_FOUND` (this module's error family), which titles treat as "nothing
+/// to import" and fall back from. A NULL mount is a parameter error, matching
+/// shadPS4's validation order.
+fn hle_transferring_mount(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let mount_ptr = args.first().copied().unwrap_or(0);
+    if mount_ptr == 0 {
+        return ERROR_PARAMETER;
+    }
+    debug!(
+        "sceSaveDataTransferringMount(mount={mount_ptr:#x}) -> NOT_FOUND (no cross-title save \
+         data modeled)"
+    );
+    ERROR_NOT_FOUND
+}
+
 fn hle_unmount(ctx: &HleContext, args: &[u64]) -> u64 {
     // Two ABI generations: PS4-compat `Umount(const SceSaveDataMountPoint*)`
     // passes the pointer first; the measured native PS5 form passes it

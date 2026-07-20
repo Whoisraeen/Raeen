@@ -391,12 +391,13 @@ fn title_translated_ps_sweep() {
                 } else {
                     None
                 },
+                storage_images: None,
             }]
         } else {
             Vec::new()
         };
 
-        let mut outcome = String::from("not attempted");
+        let outcome;
         {
             let state = DrawState {
                 viewport: [0.0, H as f32, W as f32, -(H as f32)],

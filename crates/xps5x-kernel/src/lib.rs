@@ -140,6 +140,10 @@ pub struct OrbisKernel {
     /// Guest thread names (`scePthreadRename`), keyed by guest thread id —
     /// purely diagnostic, so a dying thread can be identified by name.
     pub thread_names: DashMap<u64, String>,
+    /// Guest thread scheduling priorities (`scePthreadSetprio`), keyed by
+    /// guest thread id. Recorded so `scePthreadGetprio` reads back exactly
+    /// what the title set; XPS5X does not map these onto host scheduling.
+    pub thread_priorities: DashMap<u64, i32>,
     /// Host (OS) thread handle for each guest thread id, recorded as the thread
     /// starts. Purely diagnostic: it lets a sampler suspend a guest thread and
     /// read its RIP, which is the ONLY way to see where a title is stuck when it
@@ -726,6 +730,7 @@ impl OrbisKernel {
             next_module_id: RwLock::new(1),
             syscall_stats: DashMap::new(),
             thread_names: DashMap::new(),
+            thread_priorities: DashMap::new(),
             host_thread_handles: DashMap::new(),
             recent_hle_calls: DashMap::new(),
             in_flight_hle: DashMap::new(),

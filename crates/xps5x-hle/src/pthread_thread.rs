@@ -27,6 +27,12 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadGetthreadid", hle_getthreadid);
     registry.register("libkernel", "scePthreadYield", hle_yield);
     registry.register("libkernel", "scePthreadRename", hle_rename);
+    // Real priority bookkeeping: Setprio records, Getprio reads it back
+    // (default: `PthreadAttr::default().sched_priority`). Supersedes the old
+    // libkernel `hle_ok_stub` for Setprio, which silently dropped the value so
+    // a later Getprio had nothing truthful to report.
+    registry.register("libkernel", "scePthreadSetprio", hle_setprio);
+    registry.register("libkernel", "scePthreadGetprio", hle_getprio);
 
     // POSIX spellings — different NIDs, same semantics, and these are the ones
     // a real title imports (from `libScePosix`). `pthread_self` returns the
@@ -68,6 +74,56 @@ fn hle_sched_get_priority_max(_ctx: &HleContext, _args: &[u64]) -> u64 {
 /// `sched_get_priority_min(policy)`.
 fn hle_sched_get_priority_min(_ctx: &HleContext, _args: &[u64]) -> u64 {
     ORBIS_SCHED_PRIORITY_MIN
+}
+
+/// `SCE_KERNEL_ERROR_EINVAL` — the `scePthread*` (libkernel) ABI's invalid
+/// argument code (`0x8002_0000 | errno`), matching `pthread_sync`'s SCE side.
+const SCE_KERNEL_ERROR_EINVAL: u64 = 0x8002_0016;
+/// `SCE_KERNEL_ERROR_EFAULT`.
+const SCE_KERNEL_ERROR_EFAULT: u64 = 0x8002_000E;
+
+/// Resolve a caller-supplied thread handle: `0` means "the calling thread"
+/// (the same convention `scePthreadRename` honors above).
+fn resolve_thread(ctx: &HleContext, thread: u64) -> u64 {
+    if thread == 0 {
+        ctx.guest_threads.current_thread()
+    } else {
+        thread
+    }
+}
+
+/// `scePthreadSetprio(thread, prio)`: record the requested Orbis priority for
+/// the thread. XPS5X does not map guest priorities onto host scheduling (only
+/// contention order could differ, never correctness), but the value must be
+/// RECORDED so `scePthreadGetprio` reads back what was set — shadPS4's
+/// pthread priority model does the same bookkeeping.
+fn hle_setprio(ctx: &HleContext, args: &[u64]) -> u64 {
+    let thread = resolve_thread(ctx, args.first().copied().unwrap_or(0));
+    let prio = args.get(1).copied().unwrap_or(0) as i32;
+    ctx.kernel.thread_priorities.insert(thread, prio);
+    OK
+}
+
+/// `scePthreadGetprio(thread, int *prio)`: report the priority recorded by
+/// `scePthreadSetprio`, or the default attribute priority
+/// (`PthreadAttr::default().sched_priority`, inside the 256..=767 rtprio span)
+/// when the thread never set one.
+fn hle_getprio(ctx: &HleContext, args: &[u64]) -> u64 {
+    let thread = resolve_thread(ctx, args.first().copied().unwrap_or(0));
+    let prio_out = args.get(1).copied().unwrap_or(0);
+    if prio_out == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let prio = ctx
+        .kernel
+        .thread_priorities
+        .get(&thread)
+        .map(|p| *p)
+        .unwrap_or(xps5x_kernel::PthreadAttr::default().sched_priority);
+    if !ctx.mem.write(prio_out, &prio.to_le_bytes()) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    OK
 }
 
 /// `scePthreadSelf()`: the calling thread's handle (the one guest thread).
@@ -176,6 +232,31 @@ mod tests {
         let registry = HleRegistry::new();
         assert!(registry.is_implemented("libScePosix", "sched_get_priority_max"));
         assert!(registry.is_implemented("libScePosix", "sched_get_priority_min"));
+    }
+
+    #[test]
+    fn getprio_reads_back_what_setprio_stored_with_a_sane_default() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // Unset: the default attribute priority (700) is reported.
+        assert_eq!(hle_getprio(&ctx, &[CURRENT_THREAD, 0x40]), OK);
+        let mut buf = [0u8; 4];
+        assert!(crate::GuestMemory::read(&mem, 0x40, &mut buf));
+        assert_eq!(i32::from_le_bytes(buf), 700);
+        // Setprio records; Getprio reads it back (thread 0 = "me").
+        assert_eq!(hle_setprio(&ctx, &[0, 512]), OK);
+        assert_eq!(hle_getprio(&ctx, &[CURRENT_THREAD, 0x40]), OK);
+        assert!(crate::GuestMemory::read(&mem, 0x40, &mut buf));
+        assert_eq!(i32::from_le_bytes(buf), 512);
+        // NULL out-pointer is EINVAL, not a silent success.
+        assert_eq!(
+            hle_getprio(&ctx, &[CURRENT_THREAD, 0]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
+
+        let registry = HleRegistry::new();
+        assert!(registry.is_implemented("libkernel", "scePthreadSetprio"));
+        assert!(registry.is_implemented("libkernel", "scePthreadGetprio"));
     }
 
     #[test]

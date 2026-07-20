@@ -2099,3 +2099,31 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   disassemble the game's boot sequence to find the initialization-complete flag
   or ordering the navigate transition waits on. Every angle reachable by probing
   external anchors is now exhausted and documented.
+
+- RENDER-RE BREAKTHROUGH: navigate dispatcher + gate PINNED, G1 RULED OUT
+  (2026-07-20, workflow + confirmation probe). A 4-angle disassembly workflow
+  found the REAL navigation dispatcher and a candidate gate; a runtime probe
+  then tested it:
+  * router tick @0x11126f0 is the UNIQUE route->html navigation dispatcher (the
+    only caller of getHtmlPathForRoute @0xbae690). It registers screens, dispatches
+    UI events, renders, and navigates routes — the whole UI transition.
+  * Candidate gate G1 @0x1112794: `mov rax,[rbp-118h]; movzx eax,byte[rax+0x248];
+    test al,al; jne 0x1112C5A` — if byte[P+0x248]!=0 the tick returns BEFORE any
+    screen registration/navigation. P = *[0xE15B830] (app shared-state singleton).
+  * CONFIRMATION PROBE (XPS5X_TRACE_UI in hle_get_status, per-frame): read
+    byte[*[0xE15B830]+0x248] live on Minecraft. RESULT: singleton is a valid heap
+    object (arena-rel 0x100002c2800), and the gate byte = **0 from frame 0
+    onward**. So G1 PASSES — it is NOT the blocker.
+  NARROWED (per the synthesis's predicted alternative): with G1 open, the block
+  is DOWNSTREAM in the same tick — either (a) the SCREEN STACK is empty
+  ([[r14+0x2D0]+0xF0]) so there is nothing to navigate, or (b) the per-screen
+  VIEW-CREATE at 0x4EF9FC0 (invoked by screen-stack updater 0x11570D0, runs
+  unconditionally per screen, BEFORE G1) has its own gate. NEXT: probe whether
+  the screen stack is non-empty (read [[r14+0x2D0]+0xF0] — but r14=this of the
+  tick, not a global, so needs a caller probe OR disas 0x11570D0/0x4EF9FC0 to
+  find the per-screen view-create gate). Disproven gates: G3/G4 (0xbae690 =
+  routes.json hot-reload diff, not boot navigate), angle-B [rbx+0x58] (separate
+  init/registration gate). NEW RE TOOLS built + used: --find-calls, --find-lea,
+  --find-str (xps5x-gui). This is the tightest the gate has ever been located:
+  a named dispatcher, a tested-and-excluded top gate, two concrete downstream
+  targets. Real, measured forward progress toward a menu pixel.
