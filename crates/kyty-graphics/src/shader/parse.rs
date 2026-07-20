@@ -403,6 +403,18 @@ fn shader_parse_sopp(
             inst.src[0].constant.u = simm;
             inst.src_num = 1;
         }
+        0x1f => {
+            // RDNA2 `s_code_end` — the padding terminator compilers emit AFTER
+            // a shader's real code (measured: ASTRO.BOT, raw 0xbf9f0000). A
+            // parser that walks a whole fetched buffer rather than stopping at
+            // s_endpgm runs into it; treat it as an end-of-code marker, which
+            // is what it is. Without this, parsing a full shader buffer fails
+            // and any analysis built on that parse (e.g. the EUD scalar-load
+            // base scan) silently gets nothing.
+            inst.type_ = T::SEndpgm;
+            inst.format = F::Empty;
+            inst.src_num = 0;
+        }
         0x09 => return Err(ni(dst, S, "s_cbranch_execnz", opcode, pc, b0)),
         0x0a => return Err(ni(dst, S, "s_barrier", opcode, pc, b0)),
         0x0b => return Err(ni(dst, S, "s_setkill", opcode, pc, b0)),
@@ -488,7 +500,14 @@ fn shader_parse_sop1(
         0x05 => return Err(ni(dst, S, "s_cmov_b32", opcode, pc, b0)),
         0x06 => return Err(ni(dst, S, "s_cmov_b64", opcode, pc, b0)),
         0x07 => return Err(ni(dst, S, "s_not_b32", opcode, pc, b0)),
-        0x08 => return Err(ni(dst, S, "s_not_b64", opcode, pc, b0)),
+        0x08 => {
+            // GCN: D.u64 = ~S0.u64; SCC = (D != 0). Measured in ASTRO.BOT's
+            // compute shaders (exec-mask manipulation).
+            inst.type_ = T::SNotB64;
+            inst.format = F::Sdst2Ssrc02;
+            inst.dst.size = 2;
+            inst.src[0].size = 2;
+        }
         0x09 => return Err(ni(dst, S, "s_wqm_b32", opcode, pc, b0)),
         0x0a => {
             inst.type_ = T::SWqmB64;
@@ -496,7 +515,12 @@ fn shader_parse_sop1(
             inst.dst.size = 2;
             inst.src[0].size = 2;
         }
-        0x0b => return Err(ni(dst, S, "s_brev_b32", opcode, pc, b0)),
+        0x0b => {
+            // GCN: D.u = bitreverse(S0.u). Does NOT write SCC (unlike the
+            // s_not/s_and family) — see the S::None in its recompile entry.
+            inst.type_ = T::SBrevB32;
+            inst.format = F::SVdstSVsrc0;
+        }
         0x0c => return Err(ni(dst, S, "s_brev_b64", opcode, pc, b0)),
         0x0d => return Err(ni(dst, S, "s_bcnt0_i32_b32", opcode, pc, b0)),
         0x0e => return Err(ni(dst, S, "s_bcnt0_i32_b64", opcode, pc, b0)),
@@ -1044,6 +1068,9 @@ fn shader_parse_vopc(
         0x0e => inst.type_ = T::VCmpNltF32,
         0x0f => inst.type_ = T::VCmpTruF32,
         0x11 => inst.type_ = T::VCmpxLtF32,
+        // VOPC cmpx block mirrors cmp at +0x10, so 0x12 is v_cmpx_eq_f32
+        // (measured: ASTRO.BOT compute).
+        0x12 => inst.type_ = T::VCmpxEqF32,
         0x14 => inst.type_ = T::VCmpxGtF32,
         0x1d => inst.type_ = T::VCmpxNeqF32,
         0x1e => inst.type_ = T::VCmpxNltF32,
@@ -1690,6 +1717,7 @@ fn shader_parse_vop3(
         0x0d => inst.type_ = T::VCmpNeqF32,
         0x0e => inst.type_ = T::VCmpNltF32,
         0x0f => inst.type_ = T::VCmpTruF32,
+        0x12 => inst.type_ = T::VCmpxEqF32,
         0x1d => inst.type_ = T::VCmpxNeqF32,
         0x1e => inst.type_ = T::VCmpxNltF32,
         0x80 => inst.type_ = T::VCmpFI32,
@@ -3466,6 +3494,14 @@ pub fn shader_parse(
                 .iter()
                 .any(|label| label.get_dst() == next_pc))
             || (instruction == 0xBE80_2000 && type_ == ShaderType::Fetch)
+            // RDNA2 `s_code_end` ends the code BLOCK, so unlike s_endpgm it takes
+            // no live-label exception — nothing can branch past it. Measured on
+            // ASTRO.BOT: shaders whose branch targets sit beyond the first
+            // s_endpgm keep parsing (correctly) until they reach this, and
+            // without the break they run on into padding and fail
+            // ("unknown operand: 115"), which killed any analysis built on a
+            // full-buffer parse.
+            || instruction == 0xBF9F_0000
         {
             break;
         }

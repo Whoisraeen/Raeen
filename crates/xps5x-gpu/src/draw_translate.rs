@@ -42,6 +42,8 @@ use tracing::debug;
 
 /// `VGT_PRIMITIVE_TYPE` values Kyty's Gen5 path emits.
 mod prim {
+    /// NONE: a draw issued with no primitive type draws nothing on hardware.
+    pub const NONE: u32 = 0;
     pub const TRIANGLE_LIST: u32 = 4;
     pub const TRIANGLE_FAN: u32 = 5;
     pub const TRIANGLE_STRIP: u32 = 6;
@@ -375,12 +377,14 @@ fn gen5_vertex_format(format: u8) -> Result<vk::Format, DrawError> {
     // table (the RDNA2 authority): 64 → (11,7) = 32_32_FLOAT,
     // 74 → (13,7) = 32_32_32_FLOAT, 77 → (14,7) = 32_32_32_32_FLOAT,
     // 56 → (10,0) = 8_8_8_8 UNORM, 71 → (12,7) = 16_16_16_16_FLOAT,
-    // 11 → (2,4) = 16 UINT (measured: Minecraft's packed per-vertex value).
+    // 11 → (2,4) = 16 UINT (measured: Minecraft's packed per-vertex value),
+    // 57 → (10,1) = 8_8_8_8 SNORM (same UI draw, next attribute).
     match format {
         74 => Ok(vk::Format::R32G32B32_SFLOAT),
         64 => Ok(vk::Format::R32G32_SFLOAT),
         77 => Ok(vk::Format::R32G32B32A32_SFLOAT),
         56 => Ok(vk::Format::R8G8B8A8_UNORM),
+        57 => Ok(vk::Format::R8G8B8A8_SNORM),
         71 => Ok(vk::Format::R16G16B16A16_SFLOAT),
         23 => Ok(vk::Format::R16G16_UNORM),
         11 => Ok(vk::Format::R16_UINT),
@@ -471,6 +475,12 @@ fn decode_texture(
     }
     // 9 = Texture2D, 11 = Cube (measured: Minecraft's 1024x1024x6 skybox).
     let cube = match t.type_() {
+        // 8 = Texture1D. A 1D image is a 2D image one row tall, and the T#
+        // already reports height5 = 0 => height 1, so the existing 2D decode
+        // path handles it unchanged (measured on ASTRO.BOT: a 1x1 format-71
+        // texture, tile mode 27). Kept a distinct arm rather than folding into
+        // 9 so the disagreement is visible if a >1-row "1D" texture ever shows.
+        8 => false,
         9 => false,
         11 => true,
         other => {
@@ -502,6 +512,13 @@ fn decode_texture(
         // 56 -> (10,0) = 8_8_8_8 UNORM (measured: Minecraft's 1920x1080 UI
         // texture, tile mode 27).
         56 => (vk::Format::R8G8B8A8_UNORM, 4),
+        // 22 -> (4,7) = 32 FLOAT (measured: ASTRO.BOT's 1920x1080 R32F buffer
+        // — a linear-depth/scalar target sampled back as a texture). SharpEmu
+        // Gfx10UnifiedFormat.cs:48 maps unified 22 -> (dataFormat 4,
+        // numFormat 7); dataFormat 4 is the single 32-bit channel per its Gen5
+        // layout table ("SetLayout(4, 0, 0, 32); // 32") and numFormat 7 is
+        // FLOAT, the same numFormat as the 36 and 71 arms.
+        22 => (vk::Format::R32_SFLOAT, 4),
         // 71 -> (12,7) = 16_16_16_16 FLOAT (measured: ASTRO.BOT's 2432x1368
         // HDR scene buffer sampled back as a texture, tile mode 27). SharpEmu's
         // Gfx10UnifiedFormat maps unified 71 -> (dataFormat 12, numFormat 7);
@@ -1072,6 +1089,14 @@ impl OffscreenDrawSink<'_> {
         // aborting later colour draws in the same submission.
         if color_output_disabled(ctx) {
             debug!("draw consumed without colour output (depth path pending)");
+            return Ok(());
+        }
+        // VGT_PRIMITIVE_TYPE 0 (NONE) draws nothing on hardware — the packet
+        // is a state carrier, not a malformed draw (measured: Minecraft issues
+        // one per DCB preamble). Consume it quietly rather than failing the
+        // draw pipeline creation.
+        if ucfg.prim_type == prim::NONE {
+            debug!("draw consumed: VGT_PRIMITIVE_TYPE NONE");
             return Ok(());
         }
         let shaders = if sh.vs.vs_embedded && sh.ps.ps_embedded {
@@ -1879,6 +1904,8 @@ mod tests {
         assert_eq!(gen5_vertex_format(23).unwrap(), vk::Format::R16G16_UNORM);
         // 11 → (2,4) = 16 UINT (Minecraft's packed per-vertex value).
         assert_eq!(gen5_vertex_format(11).unwrap(), vk::Format::R16_UINT);
+        // 57 → (10,1) = 8_8_8_8 SNORM (same UI draw, next attribute).
+        assert_eq!(gen5_vertex_format(57).unwrap(), vk::Format::R8G8B8A8_SNORM);
         let e = gen5_vertex_format(0).expect_err("unknown formats stay named");
         assert!(format!("{e}").contains('0'));
     }

@@ -4409,6 +4409,115 @@ fn recompile_smulk_i32(
     Ok(true)
 }
 
+/// `s_not_b64`: D.u64 = ~S0.u64, SCC = (D != 0). No Kyty upstream — added from
+/// measurement (ASTRO.BOT compute shaders manipulating the exec mask). Structure
+/// mirrors [`recompile_swqm_b64`], the other `Sdst2Ssrc02` unary: same
+/// exec-passthrough shortcut, same paired dword load/store, same `<execz>`/
+/// `<scc>` tail.
+fn recompile_snot_b64(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SNotB64_Sdst2Ssrc02";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+    let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+
+    if dst_value0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, 0)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[0], "t1_<index>", &index_str, &mut load1, 1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load0>
+        <load1>
+        %t2_<index> = OpNot %uint %t0_<index>
+        %t3_<index> = OpNot %uint %t1_<index>
+               OpStore %<dst0> %t2_<index>
+               OpStore %<dst1> %t3_<index>
+        <execz>
+        <scc>
+"#;
+
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace(
+            "<execz>",
+            if operand_is_exec(inst.dst) { EXECZ } else { "" },
+        )
+        .replace("<scc>", get_scc_check(scc_check, 2))
+        .replace("<dst0>", &dst_value0.value)
+        .replace("<dst1>", &dst_value1.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// `s_brev_b32`: D.u = bitreverse(S0.u), SCC untouched. No Kyty upstream —
+/// added from measurement (ASTRO.BOT compute). SPIR-V has `OpBitReverse`, so
+/// this is a direct single-op lowering.
+fn recompile_sbrev_b32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SBrevB32_SVdstSVsrc0";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value = operand_variable_to_str(inst.dst);
+    if dst_value.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+
+    let mut load0 = String::new();
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, 0)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load0>
+        %t1_<index> = OpBitReverse %uint %t0_<index>
+               OpStore %<dst> %t1_<index>
+"#;
+
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<dst>", &dst_value.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
 /// Kyty: `Recompile_SWqmB64_Sdst2Ssrc02` (ShaderSpirv.cpp L4621).
 fn recompile_swqm_b64(
     index: u32,
@@ -6034,6 +6143,15 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_smov_b64,    T::SMovB64,    F::Sdst2Ssrc02, p1("")),
     f(recompile_sswappc_b64, T::SSwappcB64, F::Sdst2Ssrc02, p1("")),
     fs(recompile_swqm_b64, T::SWqmB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
+    fs(recompile_snot_b64, T::SNotB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
+    // s_brev_b32 does not write SCC.
+    fs(
+        recompile_sbrev_b32,
+        T::SBrevB32,
+        F::SVdstSVsrc0,
+        p1(""),
+        S::None,
+    ),
 
     f(recompile_skip, T::SInstPrefetch, F::Imm, p1("")),
     f(recompile_skip, T::SNop,          F::Imm, p1("")),
@@ -6087,6 +6205,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_vcmp_xxx_u32, T::VCmpLeU32,  F::SmaskVsrc0Vsrc1, p1("OpULessThanEqual")),
     f(recompile_vcmp_xxx_u32, T::VCmpLtU32,  F::SmaskVsrc0Vsrc1, p1("OpULessThan")),
     f(recompile_vcmp_xxx_u32, T::VCmpTU32,   F::SmaskVsrc0Vsrc1, p1("OpIEqual %bool %uint_0 %uint_0 ; ")),
+    f(recompile_vcmpx_xxx_f32, T::VCmpxEqF32, F::SmaskVsrc0Vsrc1, p1("OpFOrdEqual")),
     f(recompile_vcmpx_xxx_f32, T::VCmpxNeqF32, F::SmaskVsrc0Vsrc1, p1("OpFUnordNotEqual")),
     f(recompile_vcmpx_xxx_f32, T::VCmpxGtF32,  F::SmaskVsrc0Vsrc1, p1("OpFOrdGreaterThan")),
     f(recompile_vcmpx_xxx_f32, T::VCmpxLtF32,  F::SmaskVsrc0Vsrc1, p1("OpFOrdLessThan")),
@@ -6395,7 +6514,7 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            245,
+            248,
             "204 Kyty rows plus SSubU32, SNop, the RDNA2-only rows \
              (VLshlAddU32, VCmpxLtU32, VAddNcU32, VSubNcU32, VSubrevNcU32, VCvtI32F32, \
              VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad dmask1/7 \
@@ -6404,11 +6523,11 @@ mod tests {
              block: VCmpxLtI32/GeI32/GtI32/LeI32/EqI32/NeI32), the beyond-Kyty \
              BufferLoadDwordX4 (+Offen and address-only) rows, ImageGetResinfo, \
              SGetpcB64, SPackLlB32B16, the seven ImageSampleCLz dmask rows, \
-             and the four cubemap helpers VCubeId/Sc/Tc/MaF32"
+             and the four cubemap helpers VCubeId/Sc/Tc/MaF32, plus SNotB64, SBrevB32 and VCmpxEqF32"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 233,
+            implemented, 236,
             "C1 implemented subset plus title-driven ports (incl. the S_XXX_I32 \
              trio, VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad \
              dmask1/7 + ImageSampleLz dmaskF rows, the nine ImageSample dmask recompilers, the VCmp \
@@ -6986,6 +7105,48 @@ mod tests {
             assert!(matches!(entry.func, RecompileFn::Func(_)), "{ty:?}");
             assert_eq!(entry.scc_check, scc, "{ty:?}");
         }
+    }
+
+    /// `s_not_b64` / `s_brev_b32` — both blocked ASTRO.BOT's compute shaders.
+    /// The s_not_b64 word is the MEASURED encoding from the title's failure
+    /// log (`raw 0xbefe087e` = `s_not_b64 exec, exec`, the exec-mask invert);
+    /// s_brev_b32 is built on the same SOP1 base (0xBE80_0000 | sdst<<16 |
+    /// op<<8 | ssrc0).
+    #[test]
+    fn s_not_b64_and_s_brev_b32_are_wired_with_gcn_scc_semantics() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0xBEFE_087E, // s_not_b64 exec, exec  (measured, ASTRO.BOT)
+                0xBE80_0B00, // s_brev_b32 s0, s0
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("both SOP1 opcodes parse");
+
+        let insts = code.get_instructions();
+        assert_eq!(insts[0].type_, T::SNotB64);
+        assert_eq!(insts[0].dst.type_, ShaderOperandType::ExecLo);
+        assert_eq!(insts[0].dst.size, 2, "s_not_b64 is a 64-bit destination");
+        assert_eq!(insts[0].src[0].size, 2);
+        assert_eq!(insts[1].type_, T::SBrevB32);
+
+        // Both must reach a real recompiler, with GCN's SCC semantics.
+        let not64 = recomp_func(T::SNotB64, F::Sdst2Ssrc02).expect("SNotB64 row");
+        assert!(matches!(not64.func, RecompileFn::Func(_)));
+        assert_eq!(not64.scc_check, SccCheck::NonZero, "s_not_b64 sets SCC");
+
+        let brev = recomp_func(T::SBrevB32, F::SVdstSVsrc0).expect("SBrevB32 row");
+        assert!(matches!(brev.func, RecompileFn::Func(_)));
+        assert_eq!(
+            brev.scc_check,
+            SccCheck::None,
+            "s_brev_b32 must NOT write SCC"
+        );
     }
 
     #[test]
@@ -7874,6 +8035,18 @@ mod tests {
                 F::Sdst2Ssrc02,
                 SccCheck::NonZero,
                 "L6350: explicit SccCheck::NonZero",
+            ),
+            (
+                T::SNotB64,
+                F::Sdst2Ssrc02,
+                SccCheck::NonZero,
+                "s_not_b64 sets SCC = (D != 0)",
+            ),
+            (
+                T::SBrevB32,
+                F::SVdstSVsrc0,
+                SccCheck::None,
+                "s_brev_b32 does NOT write SCC",
             ),
         ];
 

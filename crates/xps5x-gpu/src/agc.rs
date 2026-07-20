@@ -24,6 +24,8 @@ const IT_DRAW_INDEX_MULTI_AUTO: u32 = 0x30;
 const IT_DRAW_INDEX_INDIRECT_MULTI: u32 = 0x38;
 const IT_DISPATCH_DRAW: u32 = 0x8d;
 const IT_EVENT_WRITE: u32 = 0x46;
+const IT_WRITE_DATA: u32 = 0x37;
+const IT_DMA_DATA: u32 = 0x50;
 
 /// One decoded Gen5 PM4 packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +58,29 @@ pub struct AgcMemoryWrite {
     pub data: Vec<u8>,
 }
 
+/// One guest-memory copy requested by an `IT_DMA_DATA` packet (Memory →
+/// Memory). The submit layer performs the copy — the decoder is pure and
+/// holds no guest-memory access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgcMemoryCopy {
+    /// DWORD offset of the packet that produced this copy.
+    pub packet_offset: u32,
+    pub src: u64,
+    pub dst: u64,
+    pub num_bytes: u32,
+}
+
+/// One 32-bit-pattern fill requested by an `IT_DMA_DATA` packet
+/// (Data → Memory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgcMemoryFill {
+    /// DWORD offset of the packet that produced this fill.
+    pub packet_offset: u32,
+    pub address: u64,
+    pub value: u32,
+    pub num_bytes: u32,
+}
+
 /// One Gen5 32-bit memory comparison that gates later command execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgcWait32 {
@@ -74,6 +99,8 @@ pub struct AgcSubmission {
     pub dispatch_packets: u32,
     pub flips: Vec<AgcFlip>,
     pub memory_writes: Vec<AgcMemoryWrite>,
+    pub memory_copies: Vec<AgcMemoryCopy>,
+    pub memory_fills: Vec<AgcMemoryFill>,
     pub waits32: Vec<AgcWait32>,
     /// Event ids signaled by standard `EVENT_WRITE` packets.
     pub events: Vec<u32>,
@@ -207,6 +234,73 @@ pub fn decode_submission(words: &[u32]) -> Result<AgcSubmission, AgcDecodeError>
                 reference: body[4],
             });
         }
+        // Standard PM4 `IT_WRITE_DATA` (0x37): control, dst lo/hi, then data
+        // dwords. shadPS4's liverpool asserts dst_sel 2 (TCL2) or 5 (immediate
+        // memory); 1 (Memory) is accepted for robustness — all three mean the
+        // dwords land in guest memory at the destination address.
+        if opcode == IT_WRITE_DATA && dwords >= 5 {
+            let body = &words[offset + 1..offset + dwords as usize];
+            let control = body[0];
+            let dst_sel = (control >> 8) & 0xf;
+            let wr_one_addr = (control >> 16) & 1 != 0;
+            let address = u64::from(body[1]) | (u64::from(body[2]) << 32);
+            if matches!(dst_sel, 1 | 2 | 5) && address != 0 {
+                if wr_one_addr {
+                    // Every dword targets the same address (e.g. register
+                    // programming): one write per dword, no increment.
+                    for value in &body[3..] {
+                        result.memory_writes.push(AgcMemoryWrite {
+                            packet_offset: offset as u32,
+                            address,
+                            data: value.to_le_bytes().to_vec(),
+                        });
+                    }
+                } else {
+                    let mut data = Vec::with_capacity((body.len() - 3) * 4);
+                    for value in &body[3..] {
+                        data.extend_from_slice(&value.to_le_bytes());
+                    }
+                    result.memory_writes.push(AgcMemoryWrite {
+                        packet_offset: offset as u32,
+                        address,
+                        data,
+                    });
+                }
+            }
+        }
+        // Standard PM4 `IT_DMA_DATA` (0x50): control, src lo/hi (or the fill
+        // value for src_sel=Data), dst lo/hi, command (low 21 bits = bytes).
+        // Only the plain guest-memory cases are modeled; GDS transfers have
+        // no model and are consumed silently like the other sync ops.
+        if opcode == IT_DMA_DATA && dwords >= 7 {
+            let body = &words[offset + 1..offset + dwords as usize];
+            let control = body[0];
+            let dst_sel = (control >> 20) & 0x3;
+            let src_sel = (control >> 29) & 0x3;
+            let num_bytes = body[5] & 0x1f_ffff;
+            let src = u64::from(body[1]) | (u64::from(body[2]) << 32);
+            let dst = u64::from(body[3]) | (u64::from(body[4]) << 32);
+            // 0 = Memory, 3 = MemoryUsingL2 — both are guest memory here.
+            match (src_sel, dst_sel) {
+                (0 | 3, 0 | 3) if src != 0 && dst != 0 && num_bytes != 0 => {
+                    result.memory_copies.push(AgcMemoryCopy {
+                        packet_offset: offset as u32,
+                        src,
+                        dst,
+                        num_bytes,
+                    });
+                }
+                (2, 0 | 3) if dst != 0 && num_bytes != 0 => {
+                    result.memory_fills.push(AgcMemoryFill {
+                        packet_offset: offset as u32,
+                        address: dst,
+                        value: body[1],
+                        num_bytes,
+                    });
+                }
+                _ => {}
+            }
+        }
         offset += dwords as usize;
     }
     Ok(result)
@@ -331,6 +425,98 @@ mod tests {
                 function: 3,
                 reference: 0xaabb_ccdd,
             }]
+        );
+    }
+
+    #[test]
+    fn decodes_it_write_data_and_it_dma_data_side_effects() {
+        let words = [
+            // IT_WRITE_DATA: dst_sel=2 (TCL2), incrementing, 2 data dwords.
+            header(6, IT_WRITE_DATA, 0),
+            2 << 8,
+            0x5000,
+            0,
+            0xdead_beef,
+            0xcafe_f00d,
+            // IT_DMA_DATA Memory→Memory: src 0x6000 → dst 0x9000, 256 bytes.
+            header(7, IT_DMA_DATA, 0),
+            0, // src_sel=0 (Memory), dst_sel=0 (Memory)
+            0x6000,
+            0,
+            0x9000,
+            0,
+            256,
+            // IT_DMA_DATA Data→Memory: fill dst 0xa000 with 0x1122_3344, 64 bytes.
+            header(7, IT_DMA_DATA, 0),
+            2 << 29, // src_sel=2 (Data)
+            0x1122_3344,
+            0,
+            0xa000,
+            0,
+            64,
+            // IT_DMA_DATA with a GDS endpoint: no model — no record at all.
+            header(7, IT_DMA_DATA, 0),
+            1 << 20, // dst_sel=1 (Gds)
+            0x6000,
+            0,
+            0x9000,
+            0,
+            256,
+        ];
+        let decoded = decode_submission(&words).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&0xdead_beefu32.to_le_bytes());
+        expected.extend_from_slice(&0xcafe_f00du32.to_le_bytes());
+        assert_eq!(
+            decoded.memory_writes,
+            [AgcMemoryWrite {
+                packet_offset: 0,
+                address: 0x5000,
+                data: expected,
+            }]
+        );
+        assert_eq!(
+            decoded.memory_copies,
+            [AgcMemoryCopy {
+                packet_offset: 6,
+                src: 0x6000,
+                dst: 0x9000,
+                num_bytes: 256,
+            }]
+        );
+        assert_eq!(
+            decoded.memory_fills,
+            [AgcMemoryFill {
+                packet_offset: 13,
+                address: 0xa000,
+                value: 0x1122_3344,
+                num_bytes: 64,
+            }]
+        );
+        // wr_one_addr: same address for every dword.
+        let one_addr = [
+            header(6, IT_WRITE_DATA, 0),
+            (2 << 8) | (1 << 16),
+            0x7000,
+            0,
+            0x1111_1111,
+            0x2222_2222,
+        ];
+        let decoded = decode_submission(&one_addr).unwrap();
+        assert_eq!(
+            decoded.memory_writes,
+            [
+                AgcMemoryWrite {
+                    packet_offset: 0,
+                    address: 0x7000,
+                    data: 0x1111_1111u32.to_le_bytes().to_vec(),
+                },
+                AgcMemoryWrite {
+                    packet_offset: 0,
+                    address: 0x7000,
+                    data: 0x2222_2222u32.to_le_bytes().to_vec(),
+                },
+            ]
         );
     }
 }

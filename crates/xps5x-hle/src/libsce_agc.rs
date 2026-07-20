@@ -869,6 +869,48 @@ fn submit_validate(ctx: &HleContext, packet: u64, queue: &'static str) -> u64 {
             return SCE_ERROR_INVALID_ARGUMENT;
         }
     }
+    // IT_DMA_DATA side effects: real guest-memory copies and pattern fills
+    // (texture/buffer uploads). Applied inline at submit: the guest-visible
+    // result matches hardware ordering closely enough for the titles measured.
+    for copy in &decoded.memory_copies {
+        let mut bytes = vec![0u8; copy.num_bytes as usize];
+        if !ctx.mem.read(copy.src, &mut bytes) {
+            tracing::warn!(
+                src = copy.src,
+                dst = copy.dst,
+                bytes = copy.num_bytes,
+                packet_offset = copy.packet_offset,
+                "AGC DMA copy read from unreadable guest memory"
+            );
+            return SCE_ERROR_INVALID_ARGUMENT;
+        }
+        if !ctx.mem.write(copy.dst, &bytes) {
+            tracing::warn!(
+                src = copy.src,
+                dst = copy.dst,
+                bytes = copy.num_bytes,
+                packet_offset = copy.packet_offset,
+                "AGC DMA copy targeted unreadable guest memory"
+            );
+            return SCE_ERROR_INVALID_ARGUMENT;
+        }
+    }
+    for fill in &decoded.memory_fills {
+        let dwords = fill.num_bytes as usize / 4;
+        let mut bytes = Vec::with_capacity(dwords * 4);
+        for _ in 0..dwords {
+            bytes.extend_from_slice(&fill.value.to_le_bytes());
+        }
+        if !ctx.mem.write(fill.address, &bytes) {
+            tracing::warn!(
+                address = fill.address,
+                bytes = fill.num_bytes,
+                packet_offset = fill.packet_offset,
+                "AGC DMA fill targeted unreadable guest memory"
+            );
+            return SCE_ERROR_INVALID_ARGUMENT;
+        }
+    }
     for event_id in &decoded.events {
         for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {
             if event.key().1 == u64::from(*event_id) {

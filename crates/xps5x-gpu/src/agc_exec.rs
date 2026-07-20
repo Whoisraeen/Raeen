@@ -507,29 +507,37 @@ impl AgcGpuSession {
             let scanout_hit = scanout_image.is_some();
             let presented = scanout_image.unwrap_or_else(|| image.clone());
             *self.last_image.lock() = Some(presented.clone());
-            let count = {
+            {
                 let mut draws = self.draw_count.lock();
                 *draws += drawn;
-                *draws
-            };
+            }
+            // Gate the dump on how many frames have been PRESENTED, not on the
+            // cumulative draw count. A submission contributes its whole draw
+            // total at once (`*draws += drawn`), so the draw counter jumps
+            // 0 -> 21 -> 42 -> 56 and almost never lands on the "<=8 or power
+            // of two" cadence: ASTRO.BOT rendered 56 real draws and every
+            // single dump was skipped. One increment per present restores the
+            // intended first-8-then-doubling sampling.
+            let present_index = PRESENT_INDEX.fetch_add(1, Ordering::Relaxed) + 1;
             // Dump what is actually PRESENTED (the scanout/composite), not the
             // last-drawn target (often the black background composited last) —
             // otherwise the frame dump misrepresents a rendered scene as black.
-            if count <= 8 || count.is_power_of_two() {
+            if present_index <= 8 || present_index.is_power_of_two() {
                 tracing::info!(
                     scanout_hit,
+                    present_index,
                     scanout = format_args!("{:#x}", self.scanout_address.lock().unwrap_or(0)),
                     "present: dumping the scanned-out frame"
                 );
             }
-            maybe_dump_frame(&presented, count);
+            maybe_dump_frame(&presented, present_index);
             // A title renders its UI to several render targets and composites
             // them; the last-drawn one (often the display's black background
             // this early) is not necessarily where the content is. The
             // snapshot above (taken under the lock) lets the all-targets dump
             // surface content in a non-final target instead of discarding it.
             if let Some(targets) = all_targets {
-                maybe_dump_all_targets(&targets, count);
+                maybe_dump_all_targets(&targets, present_index);
             }
             return Ok(Some(image));
         }
@@ -778,6 +786,10 @@ fn maybe_dump_all_targets(targets: &[(u64, RenderedImage)], draw_index: u64) {
         );
     }
 }
+
+/// Number of frames presented since process start — the frame-dump sampling
+/// index (see the call site for why the draw counter cannot serve this role).
+static PRESENT_INDEX: AtomicU64 = AtomicU64::new(0);
 
 fn maybe_dump_frame(image: &RenderedImage, draw_index: u64) {
     let Ok(dir) = std::env::var("XPS5X_DUMP_FRAMES") else {

@@ -161,6 +161,110 @@ const AB_ZERO: AddressBit = AddressBit {
     y_mask: 0,
 };
 
+/// PS5/Oberon (16-pipe, 8-packer, "RB+") single-sample `SW_64KB_Z_X`
+/// (SWIZZLE_MODE 24) equations — the DEPTH layout, which interleaves X and Y
+/// from bit 0 instead of running X first as `_R_X` does. Transcribed from
+/// SharpEmu's `RbPlus64KDepthX` (GnmTiling.cs, GPL-2.0), the same source and
+/// topology as the two tables below. Measured need: ASTRO.BOT samples a
+/// 1920x1080 format-22 (R32_SFLOAT) depth target with tile mode 24.
+const RB_PLUS_64K_DEPTH_X: [[AddressBit; 16]; 5] = [
+    // 1 byte/element: nibble01=8, nibble2=306, nibble3=379.
+    [
+        ab_x(0),
+        ab_y(0),
+        ab_x(1),
+        ab_y(1),
+        ab_x(2),
+        ab_y(2),
+        ab_x(3),
+        ab_y(3),
+        ab_xyy(7, 4, 7),
+        ab_xy(4, 4),
+        ab_xy(6, 5),
+        ab_xy(5, 6),
+        ab_x(6),
+        ab_y(6),
+        ab_xy(7, 8),
+        ab_xy(8, 7),
+    ],
+    // 2 bytes/element: nibble01=9, nibble2=306, nibble3=389.
+    [
+        AB_ZERO,
+        ab_x(0),
+        ab_y(0),
+        ab_x(1),
+        ab_y(1),
+        ab_x(2),
+        ab_y(2),
+        ab_x(3),
+        ab_xyy(7, 4, 7),
+        ab_xy(4, 4),
+        ab_xy(6, 5),
+        ab_xy(5, 6),
+        ab_y(3),
+        ab_x(6),
+        ab_xy(7, 7),
+        ab_xy(8, 6),
+    ],
+    // 4 bytes/element: nibble01=10, nibble2=306, nibble3=381.
+    [
+        AB_ZERO,
+        AB_ZERO,
+        ab_x(0),
+        ab_y(0),
+        ab_x(1),
+        ab_y(1),
+        ab_x(2),
+        ab_y(2),
+        ab_xyy(7, 4, 7),
+        ab_xy(4, 4),
+        ab_xy(6, 5),
+        ab_xy(5, 6),
+        ab_x(3),
+        ab_y(3),
+        ab_xy(6, 7),
+        ab_xy(7, 6),
+    ],
+    // 8 bytes/element: nibble01=11, nibble2=307, nibble3=382.
+    [
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        ab_x(0),
+        ab_y(0),
+        ab_x(1),
+        ab_y(1),
+        ab_x(2),
+        ab_xyy(7, 4, 7),
+        ab_xy(4, 4),
+        ab_xy(6, 5),
+        ab_xy(5, 6),
+        ab_y(2),
+        ab_x(3),
+        ab_xy(7, 3),
+        ab_xy(6, 6),
+    ],
+    // 16 bytes/element is identical to R_X for a 2D single-sample image.
+    [
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        ab_x(0),
+        ab_y(0),
+        ab_x(1),
+        ab_y(1),
+        ab_xyy(7, 4, 7),
+        ab_xy(4, 4),
+        ab_xy(6, 5),
+        ab_xy(5, 6),
+        ab_x(2),
+        ab_y(2),
+        ab_xy(6, 3),
+        ab_xy(3, 6),
+    ],
+];
+
 /// PS5/Oberon (16-pipe, 8-packer, "RB+") single-sample `SW_64KB_R_X`
 /// (SWIZZLE_MODE 27) equations, one row per bytes-per-element log2
 /// (1/2/4/8/16-byte elements). Transcribed from SharpEmu's
@@ -370,6 +474,7 @@ const RB_PLUS_64K_STANDARD: [[AddressBit; 16]; 5] = [
 pub const fn swizzle_64kb_table(mode: u8) -> Option<&'static [[AddressBit; 16]; 5]> {
     match mode {
         9 => Some(&RB_PLUS_64K_STANDARD),
+        24 => Some(&RB_PLUS_64K_DEPTH_X),
         27 => Some(&RB_PLUS_64K_RENDER_X),
         _ => None,
     }
@@ -597,6 +702,36 @@ mod tests {
         let back = detile_64kb_r_x(&tiled, w, h, bpp_log2);
         assert_eq!(back, linear, "detile ∘ tile must be the identity");
         assert_ne!(tiled[..linear.len()], linear[..], "swizzle must reorder");
+    }
+
+    /// SWIZZLE_MODE 24 (`SW_64KB_Z_X`, the depth layout) round-trips and is a
+    /// DIFFERENT permutation from mode 27 — the depth equations interleave X
+    /// and Y from bit 0 where `_R_X` runs X first, so a table transcription
+    /// slip that duplicated `_R_X` would be caught here.
+    #[test]
+    fn sw_64kb_z_x_tile_then_detile_is_identity_and_differs_from_r_x() {
+        let (w, h, bpp_log2) = (300u32, 100u32, 2u32);
+        let bpp = 1usize << bpp_log2;
+        let linear: Vec<u8> = (0..(w * h) as usize * bpp)
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        let table = swizzle_64kb_table(24).expect("mode 24 is supported");
+        let tiled = tile_64kb_with(&linear, w, h, bpp_log2, table);
+        assert_eq!(
+            tiled.len() as u64,
+            tiled_byte_count_64kb(w, h, bpp_log2),
+            "tiled footprint is whole blocks"
+        );
+        let back = detile_64kb(24, &tiled, w, h, bpp_log2).expect("mode 24 detiles");
+        assert_eq!(back, linear, "detile ∘ tile must be the identity");
+        assert_ne!(tiled[..linear.len()], linear[..], "swizzle must reorder");
+
+        let r_x = tile_64kb_r_x(&linear, w, h, bpp_log2);
+        assert_ne!(
+            tiled, r_x,
+            "depth (24) and render (27) swizzles must not be the same permutation"
+        );
     }
 
     #[test]

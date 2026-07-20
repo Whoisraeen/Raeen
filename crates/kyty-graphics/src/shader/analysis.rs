@@ -344,11 +344,24 @@ fn read_sharp_fields(
     out: &mut [u32],
 ) -> Result<(), ShaderAnalysisError> {
     let extended = extended_buffer.is_some();
-    if !extended && start_index >= 16 {
-        return Err(ni("sharp start_register >= 16 without extended buffer"));
+    if !extended && start_index as usize >= UserSgprInfo::SGPRS_MAX {
+        // Kyty treats >=16 as "this sharp lives in the extended buffer", but
+        // Gen5 graphics stages have 32 REAL user SGPRs (see
+        // `UserSgprInfo::SGPRS_MAX`). Measured on ASTRO.BOT: pixel shaders
+        // reference a sharp at start_register=16 while declaring NO extended
+        // buffer — with no EUD there is nowhere else that data could live, so
+        // s16 must be a direct register. The bound is therefore the register
+        // file size, not 16. This stays self-validating: a slot that was never
+        // written keeps type_ Unknown and is rejected by the Vsharp/Region
+        // check below, so relaxing the bound cannot invent descriptors.
+        return Err(ni_owned(format!(
+            "sharp start_register beyond the user SGPR file (start_register={start_index})"
+        )));
     }
-    if extended && start_index < 16 {
-        return Err(ni("sharp start_register < 16 with extended buffer"));
+    if extended && (start_index as usize) < UserSgprInfo::SGPRS_MAX {
+        return Err(ni(
+            "sharp start_register below the user SGPR file with extended buffer",
+        ));
     }
     let start = usize::try_from(start_index).map_err(|_| trunc("negative sharp start register"))?;
 
@@ -368,9 +381,16 @@ fn read_sharp_fields(
             }
         }
         Some(ext) => {
+            // The EUD is addressed as a continuation of the user-SGPR file, so
+            // the rebase is the file SIZE, not a literal 16 (Kyty's 16 was the
+            // PS4 user-SGPR count). Measured on ASTRO.BOT: a shader with
+            // eud_size_dw=8 places a sharp at offset_dw=32 while its other
+            // sharps sit direct at s0/s8 — under a `-16` rebase that reads
+            // ext[16], past the end of an 8-dword EUD; under `-32` it reads
+            // ext[0], the buffer's first descriptor, which fits.
             for (j, dw) in out.iter_mut().enumerate() {
                 *dw = *ext
-                    .get(start - 16 + j)
+                    .get(start - UserSgprInfo::SGPRS_MAX + j)
                     .ok_or_else(|| trunc("extended (EUD) buffer too small"))?;
             }
         }
@@ -990,6 +1010,7 @@ pub fn shader_parse_usage2(
     bind: &mut ShaderBindResources,
     user_sgpr: &UserSgprInfo,
     user_sgpr_num: i32,
+    eud: Option<&[u32]>,
 ) -> Result<(), ShaderAnalysisError> {
     // Same reset list as ShaderParseUsage (vertex_attrib not reset upstream).
     info.fetch = false;
@@ -1006,15 +1027,20 @@ pub fn shader_parse_usage2(
     info.gds_pointers = 0;
     info.direct_sgprs = 0;
 
-    if user_data.eud_size_dw != 0 {
-        return Err(ni("ShaderUserData eud_size_dw != 0"));
+    if user_data.eud_size_dw != 0 && eud.is_none() {
+        // EUD declared but the caller could not recover it (null/unmapped
+        // pointer, or no guest memory). Still an honest refusal — resolving
+        // sharps against a buffer we do not have would invent descriptors.
+        return Err(ni("ShaderUserData eud_size_dw != 0 (EUD unreadable)"));
     }
     if user_data.srt_size_dw != 0 {
         return Err(ni("ShaderUserData srt_size_dw != 0"));
     }
 
-    // Kyty declares extended_buffer here but never assigns it in Usage2.
-    let extended_buffer: Option<&[u32]> = None;
+    // Kyty leaves this None (no EUD support); increment 3 supplies the buffer
+    // the caller read from guest memory, which the extended branch of
+    // `read_sharp_fields` already knows how to index.
+    let extended_buffer: Option<&[u32]> = eud;
 
     let mut direct_sgprs = [false; UserSgprInfo::SGPRS_MAX];
     for (i, flag) in direct_sgprs.iter_mut().enumerate() {
@@ -1495,6 +1521,102 @@ pub fn shader_parse_attrib(
     Ok(())
 }
 
+/// Increment 3 of the SRT/EUD resolver (task #9): read a shader's Extended User
+/// Data out of guest memory so `shader_parse_usage2` can resolve descriptors
+/// that were spilled past the user-SGPR file.
+///
+/// The EUD pointer is the sgpr pair immediately AFTER the shader's declared
+/// user SGPRs (`user_sgpr_num`) — measured on ASTRO.BOT compute, where
+/// `declared=14` and `s14:s15` points at descriptor-shaped data. Returns `None`
+/// when there is no EUD, the pair is out of range, the pointer is null, or
+/// guest memory does not back it; every one of those keeps the caller on the
+/// pre-existing "no extended buffer" path rather than inventing descriptors.
+fn read_extended_user_data(
+    user_data: &ShaderUserData,
+    user_sgpr: &UserSgprInfo,
+    user_sgpr_num: i32,
+    mem: &impl ShaderMemory,
+    shader_addr: u64,
+    next_gen: bool,
+) -> Option<Vec<u32>> {
+    let size = user_data.eud_size_dw as usize;
+    if size == 0 {
+        return None;
+    }
+
+    let read_at = |ptr: u64| -> Option<Vec<u32>> {
+        if ptr == 0 || ptr & 0x3 != 0 {
+            return None;
+        }
+        let src = mem.dwords_at(ptr)?;
+        (src.len() >= size).then(|| src[..size].to_vec())
+    };
+
+    // Strategy 1 — the pair immediately AFTER the declared user SGPRs. Measured
+    // on shaders whose `count` EXCEEDS `declared` (e.g. declared=14 count=16:
+    // s14:s15 hold the pointer).
+    if let Ok(base) = usize::try_from(user_sgpr_num) {
+        if base + 1 < UserSgprInfo::SGPRS_MAX {
+            if let Some(buf) = read_at(user_sgpr_pair(user_sgpr, user_sgpr_num)) {
+                return Some(buf);
+            }
+        }
+    }
+
+    // Strategy 2 — scalar-load analysis (resolver increments 1-2). When
+    // `count == declared` there IS no register past the declared file (measured:
+    // cs@0x50053c700 declared=14 count=14), so the pointer must be one the
+    // shader itself loads through: find its `s_load_dwordx*` base pairs and take
+    // the first that addresses readable guest memory of at least `eud_size_dw`.
+    // CAVEAT: "first readable" is a heuristic — a shader with several scalar
+    // loads could pick the wrong one, which shows up as wrong descriptors rather
+    // than an error. Narrow it (e.g. by preferring the earliest load, or by
+    // validating descriptor shape) if a title renders wrong data.
+    let trace = std::env::var_os("XPS5X_TRACE_EUD").is_some();
+    let Some(src) = mem.dwords_at(shader_addr) else {
+        if trace {
+            tracing::warn!("TRACE_EUD2 {shader_addr:#x}: shader code not mapped");
+        }
+        return None;
+    };
+    let mut code = ShaderCode::new();
+    if let Err(e) = shader_parse(0, &src, &mut code, next_gen) {
+        if trace {
+            tracing::warn!("TRACE_EUD2 {shader_addr:#x}: shader_parse failed: {e}");
+        }
+        return None;
+    }
+    let loads = find_scalar_load_bases(&code);
+    if trace {
+        let detail: Vec<String> = loads
+            .iter()
+            .map(|l| {
+                let addr = scalar_load_target_address(l, user_sgpr);
+                let backed = addr.is_some_and(|a| {
+                    a != 0 && a & 0x3 == 0 && mem.dwords_at(a).is_some_and(|d| d.len() >= size)
+                });
+                format!(
+                    "s{}+{}x{}->{}{}",
+                    l.base_register,
+                    l.byte_offset,
+                    l.dwords,
+                    addr.map_or("none".to_owned(), |a| format!("{a:#x}")),
+                    if backed { "(ok)" } else { "(unbacked)" }
+                )
+            })
+            .collect();
+        tracing::warn!(
+            "TRACE_EUD2 {shader_addr:#x}: need={size}dw loads={} [{}]",
+            loads.len(),
+            detail.join(" ")
+        );
+    }
+    loads
+        .into_iter()
+        .filter_map(|load| scalar_load_target_address(&load, user_sgpr))
+        .find_map(read_at)
+}
+
 /// `user_sgpr.value[reg] | value[reg + 1] << 32` — the 64-bit pointer Kyty
 /// assembles from a user-SGPR pair. Caller has range-checked `reg + 1`.
 fn user_sgpr_pair(user_sgpr: &UserSgprInfo, reg: i32) -> u64 {
@@ -1578,6 +1700,15 @@ pub fn shader_get_input_info_vs(
             &mut info.bind,
             user_sgpr,
             user_sgpr_num,
+            read_extended_user_data(
+                user_data,
+                user_sgpr,
+                user_sgpr_num,
+                mem,
+                shader_addr,
+                next_gen,
+            )
+            .as_deref(),
         )?;
     } else {
         if gs_instead_of_vs {
@@ -1762,6 +1893,15 @@ pub fn shader_get_input_info_ps(
             &mut ps_info.bind,
             &regs.ps_user_sgpr,
             i32::from(regs.ps_regs.rsrc2.user_sgpr),
+            read_extended_user_data(
+                user_data,
+                &regs.ps_user_sgpr,
+                i32::from(regs.ps_regs.rsrc2.user_sgpr),
+                mem,
+                regs.ps_regs.data_addr,
+                next_gen,
+            )
+            .as_deref(),
         )?;
     } else {
         let code = mem
@@ -1840,6 +1980,15 @@ pub fn shader_get_input_info_cs(
             &mut info.bind,
             &regs.cs_user_sgpr,
             i32::from(regs.cs_regs.user_sgpr),
+            read_extended_user_data(
+                user_data,
+                &regs.cs_user_sgpr,
+                i32::from(regs.cs_regs.user_sgpr),
+                mem,
+                regs.cs_regs.data_addr,
+                next_gen,
+            )
+            .as_deref(),
         )?;
     } else {
         let code = mem
@@ -3119,7 +3268,7 @@ mod tests {
         };
         let mut info = ShaderParsedUsage::default();
         let mut bind = ShaderBindResources::default();
-        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 10).unwrap();
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 10, None).unwrap();
         assert_eq!(info.samplers, 1);
         assert_eq!(info.storage_buffers_constant, 1);
         assert_eq!(bind.samplers.samplers_num, 1);
@@ -3171,7 +3320,7 @@ mod tests {
         };
         let mut info = ShaderParsedUsage::default();
         let mut bind = ShaderBindResources::default();
-        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 16).unwrap();
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 16, None).unwrap();
         // type-0 sharp -> read-only storage buffer, NOT a texture.
         assert_eq!(info.storage_buffers_readonly, 1);
         assert_eq!(bind.storage_buffers.buffers_num, 1);
@@ -3285,6 +3434,35 @@ mod tests {
         assert_eq!(scalar_load_target_address(&out_of_range, &user_sgpr), None);
     }
 
+    /// A sharp at s16 with NO extended buffer is a direct read from the Gen5
+    /// 32-slot user SGPR file, not an EUD reference (measured on ASTRO.BOT).
+    /// The slots still have to be real: an unwritten slot keeps type_ Unknown
+    /// and is rejected, so the relaxed bound cannot invent a descriptor.
+    #[test]
+    fn sharp_at_slot_sixteen_reads_direct_when_no_extended_buffer() {
+        let mut user_sgpr = UserSgprInfo::default();
+        for (i, dw) in [0xaaaa_0000u32, 0xbbbb_1111, 0xcccc_2222, 0xdddd_3333]
+            .into_iter()
+            .enumerate()
+        {
+            user_sgpr.set(16 + i as u32, dw, UserSgprType::Vsharp);
+        }
+        let mut direct = [true; UserSgprInfo::SGPRS_MAX];
+        let mut out = [0u32; 4];
+        read_sharp_fields(&mut direct, 16, &user_sgpr, None, &mut out)
+            .expect("s16 is a real Gen5 user SGPR when the shader declares no EUD");
+        assert_eq!(out, [0xaaaa_0000, 0xbbbb_1111, 0xcccc_2222, 0xdddd_3333]);
+
+        // An unwritten slot (type_ Unknown) is still refused.
+        let empty = UserSgprInfo::default();
+        let mut direct2 = [true; UserSgprInfo::SGPRS_MAX];
+        let mut out2 = [0u32; 4];
+        assert!(
+            read_sharp_fields(&mut direct2, 16, &empty, None, &mut out2).is_err(),
+            "an unwritten s16 must not be accepted as a descriptor"
+        );
+    }
+
     #[test]
     fn parse_usage2_nonzero_eud_or_srt_is_error() {
         // Kyty: EXIT_NOT_IMPLEMENTED(eud_size_dw != 0 / srt_size_dw != 0)
@@ -3297,7 +3475,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 0),
+            shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 0, None),
             Err(ShaderAnalysisError::NotImplemented { .. })
         ));
     }

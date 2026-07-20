@@ -1262,7 +1262,6 @@ impl CommandProcessor {
             }
 
             // ---- Depth/stencil surface registers (Kyty GraphicsRun.cpp) ----
-
             pm4::DB_RENDER_CONTROL => {
                 // Kyty: hw_ctx_set_render_control (GraphicsRun.cpp L1887).
                 use pm4::db_render_control as f;
@@ -1270,8 +1269,7 @@ impl CommandProcessor {
                     depth_clear_enable: pm4::field(value, f::DEPTH_CLEAR_ENABLE) != 0,
                     stencil_clear_enable: pm4::field(value, f::STENCIL_CLEAR_ENABLE) != 0,
                     resummarize_enable: pm4::field(value, f::RESUMMARIZE_ENABLE) != 0,
-                    stencil_compress_disable: pm4::field(value, f::STENCIL_COMPRESS_DISABLE)
-                        != 0,
+                    stencil_compress_disable: pm4::field(value, f::STENCIL_COMPRESS_DISABLE) != 0,
                     depth_compress_disable: pm4::field(value, f::DEPTH_COMPRESS_DISABLE) != 0,
                     copy_centroid: pm4::field(value, f::COPY_CENTROID) != 0,
                     copy_sample: pm4::field(value, f::COPY_SAMPLE) as u8,
@@ -1355,16 +1353,15 @@ impl CommandProcessor {
                 // L3849). Kyty's direct-write handler (L2130) reads buffer[1] — a
                 // fused-packet quirk; a standalone write carries the value here.
                 use pm4::db_stencil_info as f;
-                self.ctx.depth_render_target.stencil_info =
-                    crate::hw_regs::DepthStencilInfo {
-                        format: pm4::field(value, f::FORMAT),
-                        texture_compatible_stencil: pm4::field(value, f::ITERATE_FLUSH) != 0,
-                        partially_resident: pm4::field(value, f::PARTIALLY_RESIDENT) != 0,
-                        tile_split: pm4::field(value, f::RESERVED_FIELD_1),
-                        tile_mode_index: pm4::field(value, f::TILE_MODE_INDEX),
-                        expclear_enabled: pm4::field(value, f::ALLOW_EXPCLEAR) != 0,
-                        tile_stencil_disable: pm4::field(value, f::TILE_STENCIL_DISABLE) != 0,
-                    };
+                self.ctx.depth_render_target.stencil_info = crate::hw_regs::DepthStencilInfo {
+                    format: pm4::field(value, f::FORMAT),
+                    texture_compatible_stencil: pm4::field(value, f::ITERATE_FLUSH) != 0,
+                    partially_resident: pm4::field(value, f::PARTIALLY_RESIDENT) != 0,
+                    tile_split: pm4::field(value, f::RESERVED_FIELD_1),
+                    tile_mode_index: pm4::field(value, f::TILE_MODE_INDEX),
+                    expclear_enabled: pm4::field(value, f::ALLOW_EXPCLEAR) != 0,
+                    tile_stencil_disable: pm4::field(value, f::TILE_STENCIL_DISABLE) != 0,
+                };
             }
 
             // Depth/stencil base addresses assemble exactly like Kyty's indirect

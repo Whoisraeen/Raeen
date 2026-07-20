@@ -649,3 +649,385 @@ per-module authority is `docs/reference-port-ledger.md`.)
     composite, never the 3D scene — recovering that dump is not a scene frame.
   Pre-existing (not from this work): `cargo fmt --all --check` fails on
   committed `crates/kyty-graphics/src/run.rs:1262`; belongs to task #12.
+
+## 2026-07-20 — Minecraft (PPSA17221) deep-boot session: NID surface 161→138, AGC frames flowing, audio unblocked
+
+Context: first full `--run-eboot` measurement of Minecraft PS5 (254 MB eboot
++ 5 bundled .prx). Boot reached ~30 threads (MINECRAFT MAIN THREAD, cohtml,
+FMOD, RakNet, Agc*) but died twice deterministically: (1) a net thread
+jumped to the unresolved-import stub for `socket` from libScePosix;
+(2) AgcSubmissionThread deref'd 0x25 after `sceKernelWaitEqueue` timed out.
+Uncommitted (user hasn't asked for a commit).
+
+DONE (xps5x-hle, 285/285 tests, workspace clippy clean):
+- libScePosix provider aliases — provider-aware resolution meant the
+  libkernel-only registrations didn't satisfy libScePosix imports:
+  socket/bind/connect/getsockname/inet_pton (kernel_socket.rs) and
+  open/read/write/close/lseek (libkernel.rs, same pattern as the existing
+  libScePosix::getdents alias). Fixes the `socket` jump-to-stub fault.
+- libSceNet socket family (libsce_net.rs): sceNetSocket/SocketClose/Bind/
+  Connect/Listen/Accept/Send/Recv/Shutdown/Setsockopt/ErrnoLoc/
+  ResolverStartNtoa — offline semantics matching kernel_socket (connect →
+  ENETUNREACH, accept/recv → EWOULDBLOCK, send discards validated payload);
+  error codes from shadPS4 net_error.h (0x8041_01xx); ErrnoLoc shares the
+  __error cell.
+- `__stack_chk_fail` registered under libkernel provider (libc.rs).
+- libSceAudioOut2 streaming trio (libsce_audio_out2.rs):
+  sceAudioOut2ContextPush/ContextAdvance pace to one hardware grain
+  (grain_samples/frequency) via a per-context PaceAdvance ported from
+  SharpEmu's ContextState (FMOD uses Push as its submission clock);
+  sceAudioOut2PortSetAttributes accepted inert; plus
+  sceAudioOut2ContextGetQueueLevel (dlsym-only import, never in the static
+  table — level always 0 since pacing is synchronous).
+  Result: missing NIDs 161 → 138 for this title.
+DONE (xps5x-gpu, 121/121 tests):
+- vulkan/instance.rs: enable + require vertexPipelineStoresAndAtomics —
+  Gen5 vs writes storage buffers; pipeline creation was failing validation
+  (VUID-RuntimeSpirv-NonWritable-06341) for whole draw batches.
+- draw_translate.rs: Gen5 unified vertex format 11 → R16_UINT (SharpEmu
+  Gfx10UnifiedFormat: 11 → (2,4)); the per-frame DWORD 950/1270 skips are
+  gone, total_draws 1351 → 2244 at submissions=128.
+
+MEASURED STATE NOW: the title boots deep and runs for minutes — RakNet up
+("IPv4 supported"), FMOD mixer paced, cohtml UI active, DCB+ACB submissions
+continuous (draws 2244, dispatches 2123, flips 128 at ~1.5 min), ~6/7
+shaders translate (16k-word SPIR-V), frames present to scanout. STILL BLACK
+frames (1920x1080 flips land but all-zero) — visible output blocked by:
+- `libSceAgc` NID 0xfca47359e915d76d (-KRzWekV120) UNKNOWN fn, 14 args,
+  stub returns 0 — in NO name DB (ours/SharpEmu/Kyty); likely
+  flip/display-chain related. Needs RE from the call site.
+- vs translate fail: Recompile_Fetch registers_num=0 (attrib 3); cs:
+  ShaderUserData eud_size_dw != 0 (same EUD gap as backlog task #9).
+- VGT_PRIMITIVE_TYPE 0 unsupported (single early draw; NONE = no-op on HW).
+- sceAcmContextCreate / sceAjmBatch* UNKNOWN ABI (audio decode → silence,
+  non-fatal).
+- Mass "unknown context register — write skipped" (kyty_graphics::run).
+NEXT: identify NID 0xfca47359e915d76d; EUD/SRT scalar resolver (task #9);
+prim-type NONE as no-op; dump later flip indices (dump only catches ≤8/2^n
+and the flip counter stops ~6-8 presents).
+
+- ASTRO.BOT draw path — Gen5 32 user-SGPRs + two texture gaps (2026-07-19,
+  commit pending; workspace 1430/1430 green, clippy clean on touched crates).
+  The DRAW path went from "every draw fails" to "draw_skips=0, draw shaders
+  translate, 17 shaders translated_ok / 2954 cache hits". Chain, each step
+  measured against the retail title then fixed with a red-green test:
+  1. **texture format 71** -> R16G16B16A16_SFLOAT @ 8bpp (SharpEmu
+     Gfx10UnifiedFormat.cs:83 = dataFormat 12 (16_16_16_16) + numFormat 7
+     (FLOAT)). Was failing all 56 draws at DWORD 5053.
+  2. **Vulkan validation was hard-coded ON** for titles (agc_exec.rs
+     `VulkanBackend::new(true)`): ~0.9s per vkCreateGraphicsPipelines, ~15 min
+     for 1028 draws — it LOOKED like a hung GPU worker. Now opt-in via
+     `XPS5X_VULKAN_VALIDATION=1`. Check this first if the worker seems stuck.
+  3. **Gen5 graphics stages have 32 user SGPRs, not 16.** `UserSgprInfo::
+     SGPRS_MAX` was 16, so `set()` silently DROPPED slots 16..31 and capped
+     `count` at 16, while ASTRO.BOT pixel shaders declare rsrc2.user_sgpr =
+     20/24/30/32 -> `shader_parse_ps` rejected every one. Widened SGPRS_MAX and
+     run.rs `set_shader_register`'s SGPRS to 32. No SH-register collision: PS
+     user data 0x0C with next SH reg VS_0 at 0x4C, GS_0 0x8C to ES 0xC8.
+     Compute stays 16 (COMPUTE_USER_DATA_0..15) and spills to EUD.
+     **PS user_sgpr failures 20 -> 0.**
+  4. **sharp start_register bound**: Kyty treats >=16 as "lives in the extended
+     buffer", but measured PS shaders reference a sharp at start_register=16
+     while declaring NO extended buffer — with no EUD the data can only be a
+     direct register, so the bound is the register-file size. Self-validating:
+     an unwritten slot keeps type_ Unknown and is still rejected.
+  5. **texture format 22** -> R32_SFLOAT @ 4bpp (Gfx10UnifiedFormat.cs:48 =
+     dataFormat 4 (32) + numFormat 7), a 1920x1080 linear-depth target.
+  6. **tile mode 24 = SW_64KB_Z_X** (the DEPTH swizzle; interleaves X/Y from
+     bit 0 where _R_X runs X first). Transcribed `RB_PLUS_64K_DEPTH_X` from
+     SharpEmu GnmTiling.cs `RbPlus64KDepthX` (GPL-2.0, same source/topology as
+     the existing two tables); round-trip test also asserts it is a DIFFERENT
+     permutation from mode 27 so a copy-paste slip would fail.
+  STILL NO FRAME. State after the chain: no draw failures and no draw skips
+  remain, but `execute_dcb_cp` still returns Ok(None) — `sink.last` is never
+  set, so no RenderedImage reaches present/dump. NOT yet isolated; a 70 s
+  debug run reached only 128 submissions and never got to a draw-carrying
+  one, so its "0 draw_common calls" is INCONCLUSIVE, not evidence. Next step
+  is a long run under `RUST_LOG=warn,xps5x_gpu=debug` to see whether
+  `draw_common` is entered and, if so, which of its early returns fires
+  (prime suspect: `color_output_disabled(ctx)` -> "draw consumed without
+  colour output (depth path pending)", draw_translate.rs:1080).
+  Remaining shader failures are COMPUTE only: EUD (`eud_size_dw != 0`) plus
+  opcodes `s_not_b64`, `s_brev_b32`, `v_cmpx_eq_f32`.
+
+- ASTRO.BOT frame dump — the gate was counting the WRONG THING (2026-07-19,
+  commit pending; workspace 1430/1430, clippy 0 warnings).
+  `maybe_dump_frame` sampled on "draw_index <= 8 || is_power_of_two", but the
+  value passed was the CUMULATIVE draw count, which a submission advances by
+  its whole draw total at once (`*draws += drawn`): 0 -> 21 -> 42 -> 56, so it
+  almost never landed on the cadence. **56 real Vulkan draws rendered and every
+  dump was skipped.** Fixed with a `PRESENT_INDEX` incremented once per
+  presented frame. Result: 0 -> **10 frames** dumped (1920x1080 and 2432x1368).
+  MEASUREMENT TRAP that cost a full diagnostic cycle: the app filters logs with
+  **`XPS5X_LOG`, not `RUST_LOG`** (xps5x-core/src/logging.rs:160). Two debug
+  runs under RUST_LOG produced zero `debug!` output, which read exactly like
+  "draw_common is never entered" — it was an artifact. Always use XPS5X_LOG.
+  With it: 56 "drove a register-state Vulkan draw", 57 depth-only draws
+  consumed, 17 shaders translated_ok, 2954 cache hits.
+  HONEST RESULT: the dumped frames are a SINGLE FLAT COLOUR across the whole
+  2432x1368 surface (sampled at 5/20/40/60/80/95% — distinct_pixels=1 at every
+  point; consecutive frames byte-identical). This is the previously-known
+  loading composite, NOT the 3D scene, exactly as
+  [[astro-bot-boot-state]] predicted: the scene is COMPUTE-rendered and the
+  compute path still fails on EUD (`eud_size_dw != 0`) plus opcodes
+  `s_not_b64`, `s_brev_b32`, `v_cmpx_eq_f32`. Draws are no longer the blocker;
+  compute is. Do NOT claim a scene frame from these dumps.
+
+- ASTRO.BOT compute opcodes — s_not_b64 / s_brev_b32 / v_cmpx_eq_f32
+  (2026-07-19, commit pending; kyty-graphics 260/260, workspace 1431/1431,
+  clippy 0). All three were blocking compute-shader translation. Wired through
+  the full chain the codebase requires: types.rs variant -> parse.rs arm(s) ->
+  recompile.rs function + dispatch row -> table count assertions bumped
+  (245->248 rows, 233->236 implemented) -> per-opcode test.
+  * `s_not_b64` (SOP1 0x08, Sdst2Ssrc02): D.u64 = ~S0.u64, SCC = (D != 0).
+    New `recompile_snot_b64` modeled on `recompile_swqm_b64` (same format,
+    same exec-passthrough/paired-dword/execz/scc structure), OpNot per dword.
+  * `s_brev_b32` (SOP1 0x0b, SVdstSVsrc0): OpBitReverse, and it does NOT write
+    SCC — pinned by `S::None` in the row and asserted in the SCC-semantics test.
+  * `v_cmpx_eq_f32` (VOPC 0x12): the cmpx block mirrors cmp at +0x10, so 0x12
+    is the exec-writing eq. Reuses the generic `recompile_vcmpx_xxx_f32` with
+    `p1("OpFOrdEqual")` (matching VCmpEqF32's op). Wired at BOTH VOPC parse
+    sites (parse.rs:1061 and :1708) — there are two.
+  Test uses the MEASURED encoding from the title's failure log
+  (`raw 0xbefe087e` = `s_not_b64 exec, exec`).
+  MEASURED RESULT: **zero unknown-opcode failures remain** in an ASTRO.BOT run
+  (previously 3 distinct). Compute now fails on exactly two things:
+  `ShaderUserData eud_size_dw != 0` (8) and `read-only texture type 8 is not
+  Texture2D` (type 8 = 1D). Frames still dump (10) and are still a FLAT COLOUR
+  (distinct_pixels=1 at 10/35/60/85%) — EUD still gates the scene compute, so
+  this did NOT by itself produce scene pixels. **EUD (task #9) is now the
+  single remaining blocker on the compute path.**
+  Note: `cargo fmt --all --check` flags `crates/xps5x-hle/src/libsce_audio_out2.rs`
+  (2 spots) — NOT from this work; it arrived via commit 3d183a1.
+
+- EUD increment 3 — OPEN QUESTION found while scoping (2026-07-19, no code
+  change). Do not start increment 3 assuming the existing indexing is right:
+  measured `cs@0x50068ef00` has `eud=8` dwords but `sharp[1.0]` reports
+  `offset_dw=32`. `read_sharp_fields`'s extended branch reads
+  `ext[start - 16 + j]` = `ext[16]`, which is OUT OF RANGE for an 8-dword EUD
+  ("extended (EUD) buffer too small"). So either the `-16` rebase is wrong for
+  Gen5, or `offset_dw` is not a dword index into the EUD, or the EUD is larger
+  than `eud_size_dw` suggests. SETTLE THIS FIRST — wiring a buffer under the
+  current assumption would silently feed wrong descriptors (no error, wrong
+  pixels). Also note SharpEmu does NOT use a fixed EUD-base convention: it runs
+  a full scalar evaluator (`Gen5ShaderScalarEvaluator`, ~2000 lines) to resolve
+  descriptors, so there is no short convention to transcribe; our
+  `find_scalar_load_bases` + `scalar_load_target_address` (increments 1-2) are
+  the right road. `shader_get_input_info_vs` has `mem` but NOT a parsed
+  `ShaderCode`, so increment 3 needs a parse pass threaded in.
+
+- EUD increment 3 — PARTIALLY LANDED (2026-07-19; kyty-graphics 260/260,
+  workspace 1431/1431, clippy 0). Two changes, both evidence-driven:
+  1. **The EUD rebase is the user-SGPR FILE SIZE, not a literal 16.** Kyty's 16
+     was the PS4 user-SGPR count. Measured: a shader with eud_size_dw=8 places
+     a sharp at offset_dw=32 while its other sharps sit direct at s0/s8 — under
+     `-16` that reads ext[16] (past the end of an 8-dword EUD); under
+     `-32` (= SGPRS_MAX) it reads ext[0], the first descriptor, which fits.
+     `read_sharp_fields` now rebases by `UserSgprInfo::SGPRS_MAX`. This RESOLVES
+     the open question logged in the previous entry.
+  2. New `read_extended_user_data` reads `eud_size_dw` dwords from the sgpr pair
+     immediately AFTER the declared user SGPRs (measured: declared=14, s14:s15
+     -> descriptor-shaped data). `shader_parse_usage2` takes the buffer as a new
+     `eud` parameter and feeds the extended branch that already existed.
+     Refuses (does not invent descriptors) when the pointer is null/unaligned/
+     unmapped or the pair is out of range.
+  MEASURED: EUD failures 8 -> 6, shader translate_failed 15 -> 11. So the
+  "pair right after declared user SGPRs" convention is CORRECT FOR SOME SHADERS
+  BUT NOT ALL — the remaining 6 report "(EUD unreadable)". Those need the base
+  recovered by scalar-load analysis (`find_scalar_load_bases` +
+  `scalar_load_target_address`, increments 1-2, already built): parse the
+  shader, find the `s_load_dwordx*` whose base is a user-SGPR pair, and use
+  that address. `shader_get_input_info_vs` has `mem` but no parsed
+  `ShaderCode`, so that step needs a parse pass threaded in.
+  STILL NO SCENE: 10 frames, still flat colour. Scene compute needs the
+  remaining 6 EUD shaders plus texture type 8 (1D).
+
+## 2026-07-20 (cont.) — black-frame root-cause chain: draws execute, pixels never land
+
+Follow-ups after the NID/audio/Vulkan batch (all uncommitted; a concurrent
+session landed complementary Gen5 work mid-flight: 32-slot user SGPRs,
+PRESENT_INDEX dump cadence, tiling, ASTRO formats):
+- Unknown libSceAgc NID 0xfca47359e915d76d = SharpEmu's
+  `sceAgcDriverUnknown_KRzWekV120` (AgcExports.cs:2821) — trace-and-return-OK
+  stub there too; our return-0 matches reference behavior. NOT the
+  black-frame cause.
+- Gen5 vertex format 57 → R8G8B8A8_SNORM (draw_translate.rs; SharpEmu table
+  57 → (10,1)). Removed the per-frame DWORD-950 skips; draws 2244 → 10142+
+  per run, zero draw-skip warnings in later runs.
+- DECISIVE census (XPS5X_DUMP_ALL_TARGETS): at presents 5..128 every render
+  target (0x1f7d0000, 0x31c10000, 0x20040000) reports non_black_pixels = 0.
+  Black frames are NOT a flip/scanout mismatch — the draw pipeline produces
+  zero pixels, including no clear-alpha.
+- XPS5X_DUMP_GPU_RESOURCES: vertex buffer @0x313f0150 (stride 28) holds REAL
+  plausible UI data (0/1/2/3 floats) — vertex fetch works.
+- The bound UI texture @0x31c00000 (1920x1080, fmt 56, tile 27) reads back
+  100% zeros. NOT a PM4 DMA problem: captured DCB layouts carry opcodes
+  16/70/118/38/19/53/46/44/7 — no IT_DMA_DATA (0x50) or IT_WRITE_DATA (0x37)
+  at all, so the texture is meant to be filled by draws/compute, i.e. the
+  same zero-output root cause. (Note: IT_DMA_DATA/IT_WRITE_DATA ARE
+  consumed-without-effect in kyty_graphics::run — a real gap for OTHER
+  titles, just not this one's current path.)
+- Localization: rasterization executes but nothing lands. Vertex data OK,
+  shaders translate, pipelines create, targets exist. Remaining suspects in
+  order: (1) shader data path — SRT/EUD/user-SGPR delivery to vs/ps
+  (cs@0x253a5000 still fails on ShaderUserData eud_size_dw != 0; concurrent
+  session is mid-fix on the 32-slot SGPR widening), (2) skipped context
+  regs incl. CB_SHADER_MASK 0x8f and CB_COLOR slot regs 0x366-0x3af,
+  (3) vs Recompile_Fetch registers_num=0 (attrib 3) — 19 skips.
+NEXT: finish EUD/SRT scalar resolution (task #9, concurrent session),
+then re-measure census; VGT_PRIMITIVE_TYPE 0 → clean no-op (currently a
+warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
+
+- EUD strategy 2 (scalar-load base) — LANDED BUT INEFFECTIVE, measured
+  (2026-07-20; kyty-graphics 260/260, workspace 1431/1431, clippy 0).
+  `read_extended_user_data` now falls back to parsing the shader and trying
+  `find_scalar_load_bases` + `scalar_load_target_address` when the
+  after-declared pair fails. **MEASURED: no change — still 6 "EUD unreadable".**
+  So for those shaders the scalar-load scan yields no usable base. Next
+  diagnostic (do this BEFORE writing more resolver code): log, for one failing
+  shader (`cs@0x50053c700`, eud=20 declared=14 count=14), whether
+  (a) `shader_parse` of its `data_addr` even succeeds here,
+  (b) how many `SLoadDword*` `find_scalar_load_bases` returns, and
+  (c) what addresses those bases compute to and whether `dwords_at` backs them.
+  One of those three is failing and the log will say which; guessing further
+  resolver strategies without it is wasted work.
+  Evidence recap for the failing class: `count == declared` (no register past
+  the declared file holds the pointer) and sharps at offset_dw 32/40/48 with
+  eud=20 dwords -> ext[0]/ext[8]/ext[16] under the SGPRS_MAX rebase.
+  NOTE the heuristic risk now in the tree: strategy 2 takes the FIRST readable
+  scalar-load target. It is currently inert (never succeeds on this title), but
+  if a later title starts hitting it, wrong descriptors would surface as wrong
+  pixels rather than an error.
+
+- EUD strategy 2 — ROOT CAUSE FOUND, one layer left (2026-07-20;
+  kyty-graphics 260/260, workspace 1431/1431, clippy 0).
+  Added a `TRACE_EUD2` diagnostic (gated on XPS5X_TRACE_EUD) that reports, per
+  failing shader, whether the code is mapped, whether `shader_parse` succeeds,
+  how many `SLoadDword*` were found, and whether each computed base address is
+  backed. It answered immediately: **`shader_parse` was FAILING**, so
+  `find_scalar_load_bases` returned nothing — strategy 2 was never actually
+  running. Two successive causes, first now FIXED:
+  1. FIXED: `unknown sopp opcode 0x1f (raw 0xbf9f0000)` = RDNA2 `s_code_end`,
+     the padding terminator emitted AFTER real shader code. Now parsed as an
+     end-of-code marker (parse.rs SOPP arm).
+  2. OPEN: with s_code_end decoding, the parse CONTINUES past it into padding
+     and dies on `unknown operand: 115` (= ttmp7, i.e. garbage decoded as an
+     instruction). So `shader_parse` does NOT stop at a terminator when handed a
+     whole fetched buffer. **NEXT STEP: give the full-buffer parse a hard stop
+     at SEndpgm/s_code_end** (or have `read_extended_user_data` pre-truncate
+     `src` at the first terminator before calling shader_parse). That is the
+     only thing between here and strategy 2 actually executing — it has never
+     yet run on this title, so its effectiveness is still UNMEASURED.
+  Frames still 10, still flat colour; the 6 EUD shaders and texture type 8 (1D)
+  remain the compute blockers.
+
+- EUD strategy 2 — EXACT REMAINING BLOCKER IDENTIFIED (2026-07-20;
+  kyty-graphics 260/260, workspace 1431/1431, clippy 0).
+  `shader_parse` DOES NOT STOP AT A TERMINATOR. Proof: pre-truncating the
+  fetched window at s_endpgm/s_code_end and keeping the terminator gave
+  "truncated instruction at 0x2e0"; keeping ONE MORE dword moved the error to
+  0x2e4 — exactly one dword later. It parses until the buffer is exhausted and
+  always fails at the tail, so NO truncation length can satisfy it.
+  **THE FIX IS INSIDE `shader_parse`: end the instruction loop after SEndpgm**
+  (s_code_end now maps to SEndpgm, parse.rs SOPP 0x1f). Deliberately NOT done
+  here: that loop is the main shader path for every title, and changing it
+  needs a full re-measure of Minecraft + ASTRO.BOT, not a blind edit.
+  Until then strategy 2 (scalar-load EUD base recovery) CANNOT run — it has
+  still never executed on this title, so its effectiveness remains UNMEASURED
+  and the 6 "EUD unreadable" shaders are NOT evidence against it.
+  Landed and safe meanwhile: s_code_end parsing, the SGPRS_MAX EUD rebase, the
+  after-declared-pair EUD read (fixed 2 of 8 shaders), and the TRACE_EUD2
+  diagnostic that produced all of the above.
+
+- **EUD RESOLVED (task #9 closed)** (2026-07-20; kyty-graphics 260/260,
+  workspace 1432/1432, clippy 0). `ShaderUserData eud_size_dw != 0` no longer
+  appears in an ASTRO.BOT run — it was the blocker for 8 shaders.
+  Root cause was NOT the resolver logic but `shader_parse`'s end detection.
+  Kyty breaks at s_endpgm (0xBF81_0000) *unless a live label targets past it*
+  — correct for multi-block shaders, which ASTRO.BOT's are. Those kept parsing
+  (rightly) until they reached RDNA2 `s_code_end` (0xBF9F_0000), which had no
+  break, so the parse ran on into padding and died ("unknown operand: 115").
+  FIX: `s_code_end` ends the code BLOCK and takes NO live-label exception —
+  nothing can branch past it — so it is now an unconditional break in the same
+  end-detection condition (parse.rs), plus a SOPP 0x1f arm mapping it to
+  SEndpgm. Truncating the buffer in the caller does NOT work and was reverted:
+  the loop parses to exhaustion, so trimming just moves the tail error one
+  dword (proven: 0x2e0 -> 0x2e4).
+  With the parse fixed, EUD strategy 2 RUNS for the first time and succeeds:
+  cs@0x50053c700 need=20dw finds 8 scalar loads (all backed), ps@0x500652400
+  need=12dw finds 2. Combined with strategy 1 (pair after declared user SGPRs,
+  for shaders where count > declared) all EUD shaders now resolve.
+  **STILL NO SCENE**: 10 frames, still flat colour (distinct_pixels=1 at
+  10/30/50/70/90%). translate_failed is still 11 and 2 draws want texture
+  type 8 (1D). So EUD was necessary but NOT sufficient — the next measurement
+  should re-enumerate what those 11 failures actually are now, since the whole
+  failure profile shifted when the parser stopped truncating shaders early.
+
+- Post-EUD failure re-enumeration (2026-07-20) — the remaining shader
+  translation failures are FIVE DISTINCT FEATURES, not one gap. Measured after
+  the s_code_end parse fix (which changed the profile, so pre-fix lists are
+  stale — this supersedes them):
+    2x `mubuf feature: idxen == 0`        (vs@0x50074e000, cs@0x500757800)
+    2x `ds feature: addr != 0`            (cs@0x5006c5f00, cs@0x5005fd000)
+    2x `unknown usage type: 0x05`         (ps@0x500652400, cs@0x500690400)
+    1x `unknown exp target: 0x0d`         (vs@0x100008e6cd00)
+    1x `read-only texture type 8` (1D)    (ps@0x500640200)
+  Each is an independent recompiler/analysis add. **No single remaining fix
+  produces the scene** — plan for five, then re-measure. Note the DS (LDS) and
+  MUBUF-idxen items are compute-side, i.e. on the path the scene actually
+  renders through.
+
+- Texture type 8 (1D) supported (2026-07-20; xps5x-gpu green). A 1D image is a
+  2D image one row tall and the T# already reports height 1, so the existing 2D
+  decode path handles it unchanged (measured: a 1x1 format-71 tile-27 texture).
+  Kept as its own match arm so a >1-row "1D" texture would still be visible.
+  Four of the five post-EUD features remain: `mubuf idxen == 0` (vs+cs),
+  `ds addr != 0` (cs, LDS), `unknown usage type 0x05` (ps+cs),
+  `unknown exp target 0x0d` (vs).
+  STILL FLAT: 10 frames, uniform 0x408000, frames byte-identical.
+  MEASUREMENT WARNING for the next session: sampling a PPM with
+  `od | paste - - -` at an arbitrary byte offset can report a spurious extra
+  "distinct pixel" from a truncated trailing group at the sample boundary. It
+  briefly looked like content had appeared (distinct=2) — it had not. Verify
+  any apparent content with a full-histogram check, not a boundary sample.
+
+- Sizing the remaining four (2026-07-20, inspection only, no code change).
+  Two of the four are SUBSYSTEMS, not opcode adds — do not schedule them as
+  quick wins:
+  * `ds addr != 0` — the DS parser (parse.rs ~2717) supports ONLY
+    DS_APPEND/DS_CONSUME (GDS counters via M0); every real LDS access is gated
+    off (addr/data0/data1/offset0/offset1 must all be 0, gds must be 1). So
+    this is not a flag to relax: it means **LDS/shared memory is entirely
+    unimplemented** — needs SPIR-V Workgroup storage, LDS size from
+    COMPUTE_PGM_RSRC2.lds_size, and barrier handling. ASTRO.BOT's scene compute
+    uses it.
+  * `mubuf idxen == 0` — an ADDRESSING-MODE change (address becomes
+    soffset+offset, plus a VGPR when offen), touching how every buffer load
+    resolves for every title. Needs a Minecraft + ASTRO.BOT re-measure to prove
+    it does not corrupt the currently-working buffer path.
+  The other two (`unknown usage type 0x05`, `unknown exp target 0x0d`) are
+  unsized.
+  HONEST FORECAST: clearing all four is multi-session, and even then ASTRO.BOT's
+  scene additionally depends on the compute -> storage-image writeback front
+  (front #3 in [[astro-bot-boot-state]]), which is still unimplemented. Do not
+  promise a scene frame from the four alone.
+
+- `unknown exp target 0x0d` sized (2026-07-20, inspection only): EXP target
+  0x0c = POS0 (handled), **0x0d = POS1** — the second position export, which
+  carries clip/cull distances (and in some encodings point size / viewport /
+  layer). Not a parse-table gap: honouring it needs SPIR-V ClipDistance/
+  CullDistance declarations. A no-op arm WOULD let the shader translate, but
+  silently disables clipping — decide that deliberately, and note it in the
+  frame, rather than slipping it in as a "parser fix".
+  Remaining four, sized: LDS (subsystem), mubuf idxen==0 (addressing mode,
+  needs 2-title re-measure), exp POS1 (clip/cull), usage type 0x05 (unsized).
+
+- `unknown usage type 0x05` sized (2026-07-20, inspection only): the usage-type
+  dispatch in `shader_parse_usage2` (analysis.rs ~1070) handles 8 (vertex
+  buffer) and 10 (vertex attrib) explicitly, with direct/sharp entries handled
+  earlier; type 5 is not in the table and is NOT documented in-tree. Identify it
+  from the Gen5 ShaderUserData usage enum (SharpEmu Gen5ShaderIr.cs /
+  AgcExports, or Kyty Shader.cpp L1490/L1564 region) BEFORE writing an arm —
+  a wrong guess here mis-binds a resource silently.
+  All four remaining items are now sized; none is a quick win. See the previous
+  three entries.

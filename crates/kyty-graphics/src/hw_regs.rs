@@ -29,8 +29,9 @@ pub enum UserSgprType {
     Vsharp,
 }
 
-/// Kyty: HardwareContext.h `UserSgprInfo` (L586) — the 16 user-SGPR values
+/// Kyty: HardwareContext.h `UserSgprInfo` (L586) — the user-SGPR values
 /// latched from PM4 `SET_SH_REG` writes, plus what kind of data each holds.
+/// Sized by [`Self::SGPRS_MAX`], widened to Gen5's 32 (see there).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct UserSgprInfo {
     pub value: [u32; Self::SGPRS_MAX],
@@ -750,7 +751,10 @@ mod tests {
             info.value[20], 0xdead_beef,
             "slot 20 must be recorded, not silently dropped"
         );
-        assert_eq!(info.count, 21, "count is a high-water mark of written slots");
+        assert_eq!(
+            info.count, 21,
+            "count is a high-water mark of written slots"
+        );
 
         info.set(31, 0x1234_5678, UserSgprType::Region);
         assert_eq!(info.value[31], 0x1234_5678, "slot 31 is the last Gen5 slot");
