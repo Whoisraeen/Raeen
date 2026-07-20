@@ -734,7 +734,13 @@ impl CommandProcessor {
                     | (u64::from(Self::body_at(body, 4, offset)?) << 32);
                 let src = u64::from(Self::body_at(body, 5, offset)?)
                     | (u64::from(Self::body_at(body, 6, offset)?) << 32);
-                (dst, src, byte_count, (control0 >> 16) & 0xff, control0 & 0xff)
+                (
+                    dst,
+                    src,
+                    byte_count,
+                    (control0 >> 16) & 0xff,
+                    control0 & 0xff,
+                )
             }
             6 => {
                 let dst = u64::from(Self::body_at(body, 0, offset)?)
@@ -768,7 +774,10 @@ impl CommandProcessor {
         }
         if byte_count == 0 || u64::from(byte_count) > MAX_DMA_BYTES {
             if self.first(SkipKey::Note("DMA_DATA byte count out of range")) {
-                warn!(byte_count, offset, "DMA_DATA byte count out of range — skipped");
+                warn!(
+                    byte_count,
+                    offset, "DMA_DATA byte count out of range — skipped"
+                );
             }
             return Ok(body_len);
         }

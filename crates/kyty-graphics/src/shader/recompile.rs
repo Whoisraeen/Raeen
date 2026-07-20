@@ -8083,6 +8083,261 @@ mod tests {
     }
 
     #[test]
+    fn astro_buffer_store_format_xyzw_recompiles() {
+        // Measured raw 0xE01C2000: buffer_store_format_xyzw with idxen.
+        // 925 dispatches / 30s failed on this single opcode.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xE01C_2000, 0x8001_0400, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse buffer_store_format_xyzw");
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile buffer_store_format_xyzw");
+        assert!(source.contains("%tbuffer_store_format_xyzw"), "{source}");
+        assert!(source.contains("%buffer_store_float4"), "{source}");
+        // Stores are exec-guarded like the Kyty store bodies.
+        assert!(source.contains("%exec_lo_u_0"), "{source}");
+        let words = spirv_run(&source).expect("assemble buffer_store_format_xyzw");
+        naga_parse_and_validate(&words, "buffer_store_format_xyzw");
+    }
+
+    #[test]
+    fn astro_mubuf_store_dword_without_index_uses_zero_index() {
+        // buffer_store_dword (0x1c) with idxen==0/offen==0 — previously a
+        // parse-level "idxen == 0" rejection.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xE070_0000, 0x8001_0400, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse address-only buffer store");
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile address-only buffer store");
+        assert!(source.contains("OpStore %temp_int_1 %int_0"), "{source}");
+        assert!(source.contains("%buffer_store_float1"), "{source}");
+        let words = spirv_run(&source).expect("assemble address-only buffer store");
+        naga_parse_and_validate(&words, "address-only buffer store");
+    }
+
+    #[test]
+    fn astro_v_add3_u32_recompiles_as_two_adds() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xD76D_0001, 0x040A_0300, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse v_add3_u32");
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source =
+            spirv_generate_source(&code, None, None, Some(&input_info)).expect("recompile v_add3");
+        assert!(source.contains("%ta_0 = OpIAdd %uint"), "{source}");
+        assert!(source.contains("%t_0 = OpIAdd %uint %ta_0"), "{source}");
+        let words = spirv_run(&source).expect("assemble v_add3_u32");
+        naga_parse_and_validate(&words, "v_add3_u32");
+    }
+
+    #[test]
+    fn astro_image_sample_lz_dmask2_selects_channel_y() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF09C_0200, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_sample_lz dmask2");
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 4;
+        input_info.bind.samplers.samplers_num = 1;
+        input_info.bind.samplers.start_register[0] = 12;
+        input_info.bind.samplers.binding_index = 1;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile image_sample_lz dmask2");
+        assert!(
+            source.contains("OpImageSampleExplicitLod %v4float"),
+            "{source}"
+        );
+        assert!(
+            source.contains("OpAccessChain %_ptr_Function_float %temp_v4float %uint_1"),
+            "{source}"
+        );
+        let words = spirv_run(&source).expect("assemble image_sample_lz dmask2");
+        naga_parse_and_validate(&words, "image_sample_lz dmask2");
+    }
+
+    #[test]
+    fn astro_image_load_dmask3_fetches_two_channels() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF000_0300, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_load dmask3");
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 4;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile image_load dmask3");
+        assert!(source.contains("OpImageFetch %v4float"), "{source}");
+        assert!(
+            source.contains("OpAccessChain %_ptr_Function_float %temp_v4float %uint_1"),
+            "{source}"
+        );
+        // Assemble-only: naga's SPIR-V frontend rejects OpImageFetch through
+        // the Kyty sampled-image declaration (`InvalidImage`) — the same
+        // false-negative class its dmask1/7/F siblings ship under; real
+        // Vulkan accepts it. The real-driver gate is the --run-eboot render.
+        let _ = spirv_run(&source).expect("assemble image_load dmask3");
+    }
+
+    #[test]
+    fn astro_image_store_dmask1_writes_single_channel() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF020_0100, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_store dmask1");
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_storage_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 4;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile image_store dmask1");
+        assert!(source.contains("OpImageWrite"), "{source}");
+        assert!(
+            source.contains("%float_0_000000 %float_0_000000 %float_1_000000"),
+            "{source}"
+        );
+        // Assemble-only: naga rejects the format-less storage-image write
+        // (`InvalidImage`) that real Vulkan accepts via
+        // shaderStorageImageWriteWithoutFormat — the ImageStore dmaskF
+        // sibling ships under the same false-negative class.
+        let _ = spirv_run(&source).expect("assemble image_store dmask1");
+    }
+
+    #[test]
+    fn astro_exp_pos1_is_accepted_and_dropped() {
+        // A VS whose pos1 export (clip distance per PA_CL_VS_OUT_CNTL) used
+        // to fail the whole shader — 632 failures / 30s. The export parses,
+        // the recompile row drops it, and gl_Position (pos0) still lands.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        shader_parse(
+            0,
+            &[
+                0x7E00_02FF,
+                0x3F80_0000,
+                0x7E02_0280,
+                0x1004_0300,
+                0xF800_00D4, // exp pos1 en=0x4 (measured shape)
+                0x0302_0100,
+                0xF800_08CF, // exp pos0 done
+                0x0302_0100,
+                0xF800_020F, // exp param0
+                0x0302_0100,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse VS with pos1 export");
+
+        let entry = recomp_func(T::Exp, F::Pos1Vsrc0Vsrc1Vsrc2Vsrc3).expect("pos1 row");
+        assert!(matches!(entry.func, RecompileFn::Func(_)));
+
+        let source = spirv_generate_source(
+            &code,
+            Some(&ShaderVertexInputInfo {
+                export_count: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+        )
+        .expect("recompile VS with pos1 export");
+        assert!(source.contains("%int_per_vertex_0"), "{source}");
+        let words = spirv_run(&source).expect("assemble VS with pos1 export");
+        naga_parse_and_validate(&words, "vs with pos1 export");
+    }
+
+    #[test]
+    fn astro_mubuf_flexible_rows_are_wired() {
+        for ty in [
+            T::BufferLoadDword,
+            T::BufferStoreDword,
+            T::BufferLoadFormatX,
+            T::BufferStoreFormatX,
+        ] {
+            for fmt in [
+                F::Vdata1SvSoffs,
+                F::Vdata1VaddrSvSoffsOffen,
+                F::Vdata1Vaddr2SvSoffsOffenIdxen,
+            ] {
+                let entry =
+                    recomp_func(ty, fmt).unwrap_or_else(|| panic!("{ty:?}/{fmt:?} row missing"));
+                assert!(
+                    matches!(entry.func, RecompileFn::Func(_)),
+                    "{ty:?}/{fmt:?} must be implemented"
+                );
+            }
+        }
+        for fmt in [
+            F::Vdata4VaddrSvSoffsIdxen,
+            F::Vdata4Vaddr2SvSoffsOffenIdxen,
+            F::Vdata4SvSoffs,
+            F::Vdata4VaddrSvSoffsOffen,
+        ] {
+            let entry = recomp_func(T::BufferStoreFormatXyzw, fmt)
+                .unwrap_or_else(|| panic!("store xyzw {fmt:?} row missing"));
+            assert!(matches!(entry.func, RecompileFn::Func(_)));
+        }
+        // The staged (1,0) store-format rows are wired now too.
+        for (ty, fmt) in [
+            (T::BufferStoreFormatX, F::Vdata1VaddrSvSoffsIdxen),
+            (T::BufferStoreFormatXy, F::Vdata2VaddrSvSoffsIdxen),
+        ] {
+            let entry = recomp_func(ty, fmt).expect("row");
+            assert!(matches!(entry.func, RecompileFn::Func(_)));
+        }
+    }
+
+    #[test]
     fn v_cmpx_nlt_f32_is_wired_as_exec_writing_unordered_ge() {
         // VOPC 0x1e: `exec/smask = !(vsrc0 < vsrc1)`. With NaN, "not less than"
         // is the UNORDERED ≥ (NaN → true), the same lowering as the non-exec

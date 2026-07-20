@@ -2909,6 +2909,36 @@ mod tests {
     }
 
     #[test]
+    fn astro_parse_usage_imm_alu_float_const_stays_direct() {
+        // GNM InputUsageSlot 0x05 (IMM_ALU_FLOAT_CONST): float constants the
+        // driver preloads into user SGPRs. Nothing binds — the registers flow
+        // through the direct-SGPR pass unchanged. Previously an
+        // UnknownUsageType refusal (116 ASTRO.BOT CS dispatches / 30s).
+        let code = build_shader_blob(&[S_ENDPGM], &[[0x05, 0, 2, 0]], 0, 0, 0);
+        let mem = TestMem { regions: vec![] };
+        let mut info = ShaderParsedUsage::default();
+        let mut bind = ShaderBindResources::default();
+        let sgpr = UserSgprInfo::default();
+        shader_parse_usage(&code, &mem, &mut info, &mut bind, &sgpr, 4)
+            .expect("usage 0x05 must be accepted");
+        // All four declared user SGPRs (incl. the constant at s2) are direct.
+        assert_eq!(info.direct_sgprs, 4);
+        assert_eq!(bind.direct_sgprs.sgprs_num, 4);
+
+        // Unknown flags stay a named refusal carrying the raw fields.
+        let bad = build_shader_blob(&[S_ENDPGM], &[[0x05, 0, 2, 1]], 0, 0, 0);
+        let mut info2 = ShaderParsedUsage::default();
+        let mut bind2 = ShaderBindResources::default();
+        match shader_parse_usage(&bad, &mem, &mut info2, &mut bind2, &sgpr, 4) {
+            Err(ShaderAnalysisError::NotImplementedOwned { what }) => {
+                assert!(what.contains("usage 0x05"), "{what}");
+                assert!(what.contains("flags = 1"), "{what}");
+            }
+            other => panic!("expected owned flags refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_usage_bad_sgpr_type_is_error() {
         // Kyty: EXIT_NOT_IMPLEMENTED(type != Vsharp && type != Region)
         // (L1165) — constant buffer over Unknown-typed user SGPRs.

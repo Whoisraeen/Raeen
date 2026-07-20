@@ -4005,6 +4005,72 @@ mod tests {
     }
 
     #[test]
+    fn astro_buffer_store_format_xyzw_decodes() {
+        // Measured ASTRO.BOT raw b0 = 0xE01C2000: MUBUF opcode 0x07
+        // (buffer_store_format_xyzw), idxen=1, offen=0 — Kyty leaves the
+        // opcode KYTY_NI (ShaderParse.cpp L2630).
+        let (code, result) = parse(
+            &[0xE01C_2000, 0x8001_0400, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse buffer_store_format_xyzw");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::BufferStoreFormatXyzw);
+        assert_eq!(inst.format, F::Vdata4VaddrSvSoffsIdxen);
+        assert_eq!(
+            (inst.dst.type_, inst.dst.register_id, inst.dst.size),
+            (O::Vgpr, 4, 4)
+        );
+        assert_eq!(
+            (inst.src[1].type_, inst.src[1].register_id, inst.src[1].size),
+            (O::Sgpr, 4, 4)
+        );
+    }
+
+    #[test]
+    fn astro_mubuf_flexible_addressing_formats() {
+        // buffer_load_dword (0x0c) across the four addressing modes. Kyty
+        // EXITs on idxen==0 / offen==1 (ShaderParse.cpp L2569-2570); the port
+        // selects the format instead (the BufferLoadDwordX4 model).
+        // b0 base = MUBUF (0x38 << 26) | opcode 0x0c << 18.
+        const BASE: u32 = 0xE030_0000;
+        for (b0, format, src0_size) in [
+            (BASE | (1 << 13), F::Vdata1VaddrSvSoffsIdxen, 1),
+            (BASE, F::Vdata1SvSoffs, 1),
+            (BASE | (1 << 12), F::Vdata1VaddrSvSoffsOffen, 1),
+            (
+                BASE | (1 << 13) | (1 << 12),
+                F::Vdata1Vaddr2SvSoffsOffenIdxen,
+                2,
+            ),
+        ] {
+            let (code, result) = parse(&[b0, 0x8001_0400, S_ENDPGM], ShaderType::Compute, true);
+            result.unwrap_or_else(|e| panic!("parse mubuf b0={b0:#010x}: {e}"));
+            let inst = &code.get_instructions()[0];
+            assert_eq!(inst.type_, T::BufferLoadDword, "b0={b0:#010x}");
+            assert_eq!(inst.format, format, "b0={b0:#010x}");
+            assert_eq!(inst.src[0].size, src0_size, "b0={b0:#010x}");
+        }
+    }
+
+    #[test]
+    fn astro_mubuf_strict_ops_name_the_addressing_feature() {
+        // buffer_load_format_xy (0x01) keeps Kyty's strict idxen gate, now
+        // applied after opcode decode.
+        let b0: u32 = 0xE004_0000; // opcode 0x01, idxen=0
+        let (_, result) = parse(&[b0, 0x8001_0400, S_ENDPGM], ShaderType::Compute, true);
+        assert_eq!(
+            result,
+            Err(ShaderParseError::NotImplementedFeature {
+                family: "mubuf",
+                feature: "idxen == 0",
+                pc: 0,
+            })
+        );
+    }
+
+    #[test]
     fn mimg_image_sample_dmask_f() {
         let (code, _) = parse_vs(&[0xF080_0F00, 0x0061_0800, S_ENDPGM]);
         let inst = &code.get_instructions()[0];
@@ -4020,6 +4086,103 @@ mod tests {
             (inst.src[2].type_, inst.src[2].register_id, inst.src[2].size),
             (O::Sgpr, 12, 4)
         );
+    }
+
+    #[test]
+    fn astro_mimg_new_dmask_forms_decode() {
+        // The three MIMG operand-format gaps measured on ASTRO.BOT scene
+        // compute: image_sample_lz (0x27) dmask 0x1/0x2, image_load (0x00)
+        // dmask 0x3, image_store (0x08) dmask 0x1.
+        for (b0, ty, format, dst_size) in [
+            (
+                0xF09C_0100u32,
+                T::ImageSampleLz,
+                F::Vdata1Vaddr3StSsDmask1,
+                1,
+            ),
+            (0xF09C_0200, T::ImageSampleLz, F::Vdata1Vaddr3StSsDmask2, 1),
+            (0xF000_0300, T::ImageLoad, F::Vdata2Vaddr3StDmask3, 2),
+            (0xF020_0100, T::ImageStore, F::Vdata1Vaddr3StDmask1, 1),
+        ] {
+            let (code, result) = parse(&[b0, 0x0061_0800, S_ENDPGM], ShaderType::Compute, true);
+            result.unwrap_or_else(|e| panic!("parse mimg b0={b0:#010x}: {e}"));
+            let inst = &code.get_instructions()[0];
+            assert_eq!(inst.type_, ty, "b0={b0:#010x}");
+            assert_eq!(inst.format, format, "b0={b0:#010x}");
+            assert_eq!(inst.dst.size, dst_size, "b0={b0:#010x}");
+        }
+    }
+
+    #[test]
+    fn astro_exp_pos1_partial_export_decodes() {
+        // Measured: exp target 0x0d (pos1) with en=0x4, done=0, compr=0,
+        // vm=0 — an auxiliary position export (clip/cull distance per
+        // PA_CL_VS_OUT_CNTL; shadPS4 ir/position.h). 632 failures / 30s.
+        let (code, result) = parse(
+            &[0xF800_00D4, 0x0302_0100, S_ENDPGM],
+            ShaderType::Vertex,
+            true,
+        );
+        result.expect("parse exp pos1");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::Exp);
+        assert_eq!(inst.format, F::Pos1Vsrc0Vsrc1Vsrc2Vsrc3);
+        assert_eq!(inst.export_enable, 0x4);
+        // pos2/pos3 ride the same path.
+        let (code, result) = parse(
+            &[0xF800_00E4, 0x0302_0100, S_ENDPGM],
+            ShaderType::Vertex,
+            true,
+        );
+        result.expect("parse exp pos2");
+        assert_eq!(
+            code.get_instructions()[0].format,
+            F::Pos2Vsrc0Vsrc1Vsrc2Vsrc3
+        );
+    }
+
+    #[test]
+    fn astro_vop3_v_add3_u32_decodes() {
+        // VOP3 0x36d (shadPS4 V_ADD3_U32 = 877): v1 = v0 + v1 + v2.
+        let (code, result) = parse(
+            &[0xD76D_0001, 0x040A_0300, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse v_add3_u32");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::VAdd3U32);
+        assert_eq!(inst.format, F::VdstVsrc0Vsrc1Vsrc2);
+        assert_eq!(inst.src_num, 3);
+        assert_eq!((inst.dst.type_, inst.dst.register_id), (O::Vgpr, 1));
+        for (i, reg) in [0, 1, 2].into_iter().enumerate() {
+            assert_eq!((inst.src[i].type_, inst.src[i].register_id), (O::Vgpr, reg));
+        }
+    }
+
+    #[test]
+    fn astro_ds_lds_op_reports_instruction_name() {
+        // An LDS op with non-zero addr/offset fields must fail by NAME
+        // (previously the pre-switch `addr != 0` check hid the opcode — 173
+        // anonymous ASTRO.BOT failures). ds_write_b32 = DS opcode 0x0d.
+        let (_, result) = parse(
+            &[0xD834_0000, 0x0000_0005, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        match result {
+            Err(ShaderParseError::NotImplemented {
+                family,
+                instruction,
+                opcode,
+                ..
+            }) => {
+                assert_eq!(family, "ds");
+                assert_eq!(instruction, "ds_write_b32");
+                assert_eq!(opcode, 0x0d);
+            }
+            other => panic!("expected named ds NI, got {other:?}"),
+        }
     }
 
     #[test]
