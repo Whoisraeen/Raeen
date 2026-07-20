@@ -1033,8 +1033,29 @@ pub fn register(registry: &HleRegistry) {
         hle_available_direct_memory_size,
     );
     // PS5 Pro ("Trinity") query — the libkernel twin of libSceAgc's
-    // `sceAgcGetIsTrinityMode`. Base PS5, so false.
+    // `sceAgcGetIsTrinityMode`. Base PS5, so false. Provider-aware resolution
+    // keys on the importing LIBRARY, so the same answer is registered under
+    // `libSceAgc` too (NID 0x05f0436466ed8bb0, name recovered via the SharpEmu
+    // catalogue merge; appeared as an unnamed unresolved import in a real run).
     registry.register("libkernel", "sceKernelIsTrinityMode", hle_is_trinity_mode);
+    registry.register("libSceAgc", "sceAgcGetIsTrinityMode", hle_is_trinity_mode);
+    // Address-parking primitives (futex-like): a thread waits until another
+    // writes the watched word and wakes it. XPS5X has no true parking lot here,
+    // so `Wait` returns after a short slice as a PERMITTED SPURIOUS WAKEUP (the
+    // same model as scePthreadCondWait, pthread_cond.rs) — the caller re-checks
+    // its condition and either proceeds or waits again, so no deadlock and no
+    // tight spin. `Wake` reports success. Names recovered via the catalogue
+    // merge (Wake = 0xab6cbfc032155990); both appeared unnamed in a real run.
+    registry.register(
+        "libkernel",
+        "sceKernelSyncOnAddressWait",
+        hle_sync_on_address_wait,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelSyncOnAddressWake",
+        hle_sync_on_address_wake,
+    );
     registry.register(
         "libkernel",
         "sceKernelSetVirtualRangeName",
@@ -1160,7 +1181,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "__error", hle_error_addr);
     registry.register("libkernel", "__pthread_cxa_finalize", hle_ok_stub);
     registry.register("libkernel", "__elf_phdr_match_addr", hle_zero_stub);
-    registry.register("libkernel", "sceKernelMprotect", hle_ok_stub);
+    registry.register("libkernel", "sceKernelMprotect", hle_kernel_mprotect);
     registry.register(
         "libkernel",
         "sceKernelCheckReachability",
@@ -1687,9 +1708,10 @@ fn hle_batch_map(ctx: &HleContext, args: &[u64]) -> u64 {
                 ctx.kernel.memory.remove_mapping(start);
                 true
             }
-            // Protection changes are a no-op today (sceKernelMprotect is an
-            // ok-stub): the arena maps everything R+W+X-as-needed.
-            OP_PROTECT | OP_TYPE_PROTECT => true,
+            // Apply the protection under XPS5X_ENFORCE_MPROTECT; a no-op
+            // otherwise (the arena default), matching the standalone
+            // sceKernelMprotect path.
+            OP_PROTECT | OP_TYPE_PROTECT => ctx.mem.protect(start, length, prot),
             other => {
                 warn!("sceKernelBatchMap: unknown operation {other} at entry {i}");
                 false
@@ -1888,6 +1910,32 @@ fn hle_available_direct_memory_size(ctx: &HleContext, args: &[u64]) -> u64 {
 /// aerolib catalogue. Measured: Until Dawn stops its boot on this import.
 fn hle_is_trinity_mode(_ctx: &HleContext, _args: &[u64]) -> u64 {
     0
+}
+
+/// `sceKernelSyncOnAddressWait(addr, ...)`: park until the watched address is
+/// woken. No true parking lot yet, so this returns after a short slice as a
+/// permitted spurious wakeup (mirrors `scePthreadCondWait`) — the caller
+/// re-checks its own condition and either proceeds or waits again. Safe: it
+/// never deadlocks and the slice keeps it off a tight spin.
+fn hle_sync_on_address_wait(_ctx: &HleContext, args: &[u64]) -> u64 {
+    debug!(
+        "sceKernelSyncOnAddressWait(addr={:#x}) -> spurious wakeup",
+        args.first().copied().unwrap_or(0)
+    );
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    SCE_OK
+}
+
+/// `sceKernelSyncOnAddressWake(addr, count)`: wake up to `count` parkers on
+/// `addr`. Parkers here self-release on their spurious-wakeup slice, so this is
+/// an accounted no-op that reports success.
+fn hle_sync_on_address_wake(_ctx: &HleContext, args: &[u64]) -> u64 {
+    debug!(
+        "sceKernelSyncOnAddressWake(addr={:#x}, count={})",
+        args.first().copied().unwrap_or(0),
+        args.get(1).copied().unwrap_or(0)
+    );
+    SCE_OK
 }
 
 fn hle_set_virtual_range_name(_ctx: &HleContext, args: &[u64]) -> u64 {
@@ -2301,14 +2349,33 @@ fn hle_mlock(_ctx: &HleContext, args: &[u64]) -> u64 {
 /// POSIX `mprotect(addr, len, prot)`: page protections are not remapped per
 /// guest request yet (the arena stays RWX for HLE trampolines); accepting the
 /// request is the same shortcut `sceKernelMprotect` takes.
-fn hle_posix_mprotect(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!(
-        "mprotect(addr={:#x}, len={:#x}, prot={:#x}) -> OK (protections not remapped)",
-        args.first().copied().unwrap_or(0),
-        args.get(1).copied().unwrap_or(0),
-        args.get(2).copied().unwrap_or(0)
-    );
-    0
+fn hle_posix_mprotect(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    let len = args.get(1).copied().unwrap_or(0);
+    let prot = args.get(2).copied().unwrap_or(0) as u32;
+    debug!("mprotect(addr={addr:#x}, len={len:#x}, prot={prot:#x})");
+    // Apply the protection when enforcement is on; a no-op otherwise (the arena
+    // default). POSIX `mprotect` returns 0 on success.
+    if ctx.mem.protect(addr, len, prot) {
+        0
+    } else {
+        FILE_EINVAL
+    }
+}
+
+/// `sceKernelMprotect(void *addr, size_t len, int prot)`. Same shape as the
+/// POSIX call; applies the protection under `XPS5X_ENFORCE_MPROTECT`, no-op
+/// otherwise.
+fn hle_kernel_mprotect(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    let len = args.get(1).copied().unwrap_or(0);
+    let prot = args.get(2).copied().unwrap_or(0) as u32;
+    debug!("sceKernelMprotect(addr={addr:#x}, len={len:#x}, prot={prot:#x})");
+    if ctx.mem.protect(addr, len, prot) {
+        SCE_OK
+    } else {
+        SCE_KERNEL_ERROR_EINVAL
+    }
 }
 
 /// Real signature: `sceKernelMapDirectMemory2(void **addrOut, size_t len, int

@@ -57,6 +57,78 @@ pub fn register(registry: &HleRegistry) {
         "sceNpRegisterStateCallbackForToolkit",
         hle_register_callback,
     );
+
+    // libSceNpAuthAuthorizedAppDialog — the PSN "authorize this app" popup.
+    // Names recovered via the SharpEmu catalogue merge (the whole set appeared
+    // as unnamed unresolved imports in a real 2026-07-16 run). XPS5X has no host
+    // popup, so the dialog completes IMMEDIATELY with an authorized result —
+    // the same model as `sceMsgDialog` (libsce_common_dialog.rs): Open jumps the
+    // status to FINISHED, GetStatus reports it, GetResult writes success.
+    registry.register(
+        "libSceNpAuthAuthorizedAppDialog",
+        "sceNpAuthAuthorizedAppDialogInitialize",
+        hle_auth_dialog_initialize,
+    );
+    registry.register(
+        "libSceNpAuthAuthorizedAppDialog",
+        "sceNpAuthAuthorizedAppDialogOpen",
+        hle_auth_dialog_open,
+    );
+    for f in [
+        "sceNpAuthAuthorizedAppDialogUpdateStatus",
+        "sceNpAuthAuthorizedAppDialogGetStatus",
+    ] {
+        registry.register("libSceNpAuthAuthorizedAppDialog", f, hle_auth_dialog_status);
+    }
+    registry.register(
+        "libSceNpAuthAuthorizedAppDialog",
+        "sceNpAuthAuthorizedAppDialogGetResult",
+        hle_auth_dialog_get_result,
+    );
+    for f in [
+        "sceNpAuthAuthorizedAppDialogClose",
+        "sceNpAuthAuthorizedAppDialogTerminate",
+    ] {
+        registry.register("libSceNpAuthAuthorizedAppDialog", f, hle_ok);
+    }
+}
+
+/// Shared common-dialog status enum (`NONE`=0, `INITIALIZED`=1, `RUNNING`=2,
+/// `FINISHED`=3). The authorized-app dialog never lingers in `RUNNING`.
+static AUTH_DIALOG_STATUS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+const AUTH_STATUS_INITIALIZED: i32 = 1;
+const AUTH_STATUS_FINISHED: i32 = 3;
+
+fn hle_auth_dialog_initialize(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    AUTH_DIALOG_STATUS.store(
+        AUTH_STATUS_INITIALIZED,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    SCE_OK
+}
+
+/// With no host popup, authorize immediately: status jumps to `FINISHED` so the
+/// title's next poll completes.
+fn hle_auth_dialog_open(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    AUTH_DIALOG_STATUS.store(AUTH_STATUS_FINISHED, std::sync::atomic::Ordering::Relaxed);
+    SCE_OK
+}
+
+/// `UpdateStatus`/`GetStatus`: return the current status (`FINISHED` once open).
+fn hle_auth_dialog_status(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    AUTH_DIALOG_STATUS.load(std::sync::atomic::Ordering::Relaxed) as u32 as u64
+}
+
+/// `GetResult(SceNpAuthAuthorizedAppDialogResult *result)`: report an
+/// authorized (success) result. The exact struct layout is not published, so
+/// only the leading `int32 result` field (offset 0) is written to `0` (success)
+/// — the field a caller checks first; the rest is left as the caller allocated.
+fn hle_auth_dialog_get_result(ctx: &HleContext, args: &[u64]) -> u64 {
+    let result_ptr = args.first().copied().unwrap_or(0);
+    if result_ptr != 0 {
+        let _ = ctx.mem.write(result_ptr, &0i32.to_le_bytes());
+    }
+    SCE_OK
 }
 
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
@@ -145,6 +217,36 @@ fn hle_get_reachability(ctx: &HleContext, args: &[u64]) -> u64 {
 mod tests {
     use super::*;
     use crate::{GuestMemory, test_ctx};
+
+    /// The authorized-app dialog completes immediately: Open moves the status
+    /// to FINISHED, GetStatus/UpdateStatus report it, and GetResult writes a
+    /// success result — a title polling the dialog proceeds instead of hanging.
+    #[test]
+    fn auth_dialog_completes_immediately_with_success() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(hle_auth_dialog_initialize(&ctx, &[]), SCE_OK);
+        assert_eq!(
+            hle_auth_dialog_status(&ctx, &[]) as i32,
+            AUTH_STATUS_INITIALIZED
+        );
+        assert_eq!(hle_auth_dialog_open(&ctx, &[]), SCE_OK);
+        assert_eq!(
+            hle_auth_dialog_status(&ctx, &[]) as i32,
+            AUTH_STATUS_FINISHED,
+            "the dialog finishes as soon as it is opened"
+        );
+
+        assert_eq!(hle_auth_dialog_get_result(&ctx, &[0x200]), SCE_OK);
+        let mut r = [0xFFu8; 4];
+        assert!(mem.read(0x200, &mut r));
+        assert_eq!(i32::from_le_bytes(r), 0, "result field reports success");
+        // A null result pointer is tolerated.
+        assert_eq!(hle_auth_dialog_get_result(&ctx, &[0]), SCE_OK);
+    }
 
     #[test]
     fn get_state_reports_signed_out() {
