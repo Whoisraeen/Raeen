@@ -10,8 +10,13 @@
 //! pixels, which is the only honest proof that the pipeline drew anything.
 //! Presentation to a real swapchain is a separate, later concern.
 
+use super::cache::{
+    BlendKey, DepthPipelineKey, DrawCaches, GraphicsPipelineKey, PersistentTarget, StencilKey,
+    TargetKey,
+};
 use super::instance::VulkanDevice;
 use super::shaders::{triangle_fragment_spirv, triangle_vertex_spirv};
+use ash::vk::Handle;
 use ash::{Device, util::Align, vk};
 use std::mem;
 use tracing::debug;
@@ -290,6 +295,18 @@ pub struct DrawState<'a> {
     /// how successive draws into the same guest render target compose into
     /// one frame across otherwise independent one-shot draw submissions.
     pub initial: Option<&'a [u8]>,
+    /// Guest identity of the render target (`CB_COLOR0_BASE`), enabling the
+    /// persistent-target fast path: the backend keeps one `VkImage` per
+    /// (base, extent, format) alive across draws, and when that image still
+    /// holds exactly the pixels of the last readback the seed upload of
+    /// `initial` is skipped — the attachment LOADs straight from the GPU copy.
+    ///
+    /// Invariant the caller owns: with `target_base` set, `initial` must be
+    /// either `None` or byte-identical to the previous draw's readback of this
+    /// target (which is what `OffscreenDrawSink`'s framebuffer map stores).
+    /// A caller that substitutes other pixels for a target it names here must
+    /// leave `target_base` as `None` or the substituted seed may be ignored.
+    pub target_base: Option<u64>,
     /// The bound index buffer for an indexed draw, or `None` for a
     /// vertex-order (auto) draw. When present the draw is `vkCmdDrawIndexed`
     /// and `vertex_count` is the index count; the vertices are pulled through
@@ -549,6 +566,7 @@ impl<'a> DrawState<'a> {
             vs_spirv,
             fs_spirv,
             initial: None,
+            target_base: None,
             index: None,
             color_output: true,
             depth: None,
@@ -596,31 +614,42 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
         None
     };
 
-    let mut res = Resources::new(dev);
-    if std::env::var_os("XPS5X_TIME_DRAW").is_some() {
-        use std::time::Instant;
-        let t0 = Instant::now();
-        res.build(state)?;
-        let t_build = t0.elapsed();
-        let t1 = Instant::now();
-        res.record_and_submit(state)?;
-        let t_submit = t1.elapsed();
-        let t2 = Instant::now();
-        let color = res.read_back_color(state, bpp)?;
-        let depth = res.read_back_depth(state)?;
-        let t_readback = t2.elapsed();
+    // The cache lock spans the whole draw, including the synchronous fence
+    // wait — that is the contract that makes the cached command buffer,
+    // fence, and descriptor pool reusable (see `super::cache` module docs).
+    let mut caches = dev.draw_caches();
+    let timing = std::env::var_os("XPS5X_TIME_DRAW").is_some();
+    let mut res = Resources::new(dev, &mut caches);
+    let t0 = std::time::Instant::now();
+    res.build(state)?;
+    let t_build = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    res.record_and_submit(state)?;
+    let t_submit = t1.elapsed();
+    let t2 = std::time::Instant::now();
+    let color = res.read_back_color(state, bpp)?;
+    let depth = res.read_back_depth(state)?;
+    // The colour readback landed, so the persistent GPU image and the pixels
+    // handed back to the caller are byte-identical again: the next draw into
+    // this target may LOAD straight from the GPU copy.
+    res.mark_target_synced();
+    let t_readback = t2.elapsed();
+    drop(res);
+    if timing {
+        let stats = caches.stats;
         tracing::warn!(
             build_us = t_build.as_micros(),
             submit_us = t_submit.as_micros(),
             readback_us = t_readback.as_micros(),
-            "TIME_DRAW: per-draw phase timing"
+            pipeline_hits = stats.pipeline_hits,
+            pipeline_misses = stats.pipeline_misses,
+            target_hits = stats.target_hits,
+            target_misses = stats.target_misses,
+            seed_uploads_skipped = stats.seed_uploads_skipped,
+            "TIME_DRAW: per-draw phase timing (cache counters are cumulative)"
         );
         return Ok(DrawOutput { color, depth });
     }
-    res.build(state)?;
-    res.record_and_submit(state)?;
-    let color = res.read_back_color(state, bpp)?;
-    let depth = res.read_back_depth(state)?;
 
     debug!(
         width = state.width,
@@ -720,16 +749,35 @@ fn shader_stage_to_pipeline(stage: vk::ShaderStageFlags) -> vk::PipelineStageFla
     }
 }
 
-/// Owns every Vulkan handle the draw needs.
+/// Every Vulkan handle one draw uses — a mix of per-draw resources this
+/// struct owns and long-lived ones borrowed from [`DrawCaches`].
 ///
-/// Handles start null and are filled in by `build`. `Drop` destroys whatever is
-/// non-null, so an error at any step during `build` cleans up correctly rather
-/// than leaking GPU memory — `?` early-returns are safe here.
+/// Owned (destroyed in `Drop`): guest data buffers (vertex/index/storage/
+/// upload), texture uploads, the whole depth/stencil set, and the colour
+/// target + readback buffer **only when** `owns_target` (no `target_base`,
+/// i.e. fixture/test draws). Everything else — pipeline, layouts, shader
+/// modules, samplers, command buffer, fence, descriptor pool, persistent
+/// colour target — belongs to the cache and must NOT be destroyed here.
+///
+/// Handles start null and are filled in by `build`; `Drop` destroys whatever
+/// owned handle is non-null, so an error at any step during `build` cleans up
+/// correctly rather than leaking GPU memory — `?` early-returns are safe here.
 struct Resources<'a> {
     dev: &'a VulkanDevice,
+    caches: &'a mut DrawCaches,
     image: vk::Image,
     image_memory: vk::DeviceMemory,
     image_view: vk::ImageView,
+    /// True when the colour target/readback pair is per-draw (owned); false
+    /// when they came from (or were donated to) the persistent-target cache.
+    owns_target: bool,
+    /// The persistent-target identity of this draw, when `target_base` named
+    /// one — used to mark the entry synced after a successful readback.
+    target_key: Option<TargetKey>,
+    /// The stage A seed-skip: the persistent image still holds exactly the
+    /// last readback (== `state.initial`), so the attachment LOADs from the
+    /// GPU copy and the upload staging never happens.
+    load_from_gpu: bool,
     vertex_buffer: vk::Buffer,
     vertex_memory: vk::DeviceMemory,
     /// Uploaded index buffer for an indexed draw; null for an auto draw.
@@ -767,12 +815,16 @@ struct Resources<'a> {
 }
 
 impl<'a> Resources<'a> {
-    fn new(dev: &'a VulkanDevice) -> Self {
+    fn new(dev: &'a VulkanDevice, caches: &'a mut DrawCaches) -> Self {
         Self {
             dev,
+            caches,
             image: vk::Image::null(),
             image_memory: vk::DeviceMemory::null(),
             image_view: vk::ImageView::null(),
+            owns_target: false,
+            target_key: None,
+            load_from_gpu: false,
             vertex_buffer: vk::Buffer::null(),
             vertex_memory: vk::DeviceMemory::null(),
             index_buffer: vk::Buffer::null(),
@@ -811,7 +863,6 @@ impl<'a> Resources<'a> {
     fn build(&mut self, state: &DrawState) -> Result<(), GpuError> {
         if state.color_output {
             let bpp = readback_bpp(state.format)? as usize;
-            self.create_render_target(state.width, state.height, state.format)?;
             if let Some(initial) = state.initial {
                 let expected = state.width as usize * state.height as usize * bpp;
                 if initial.len() != expected {
@@ -822,12 +873,16 @@ impl<'a> Resources<'a> {
                         state.height
                     )));
                 }
+            }
+            self.create_render_target(state, bpp as u32)?;
+            if let Some(initial) = state.initial
+                && !self.load_from_gpu
+            {
                 let (buffer, memory) =
                     self.create_buffer_with_bytes(initial, vk::BufferUsageFlags::TRANSFER_SRC)?;
                 self.upload_buffer = buffer;
                 self.upload_memory = memory;
             }
-            self.create_readback_buffer(state.width, state.height, bpp as u32)?;
         }
         if let Some(depth) = &state.depth {
             self.create_depth_target(state.width, state.height, depth.format)?;
@@ -1002,7 +1057,79 @@ impl<'a> Resources<'a> {
         Ok(())
     }
 
-    fn create_render_target(
+    /// The colour target + its readback buffer, persistent when the draw
+    /// names a guest render target (`target_base`), per-draw otherwise.
+    ///
+    /// Persistent path: one `VkImage` per (base, extent, format) lives in the
+    /// cache across draws. On a hit whose entry is still synced with the last
+    /// readback, the seed upload of `state.initial` is skipped entirely and
+    /// the attachment LOADs from the GPU copy (`load_from_gpu`). A miss
+    /// creates the image/readback pair through the owned path, then donates
+    /// them to the cache.
+    fn create_render_target(&mut self, state: &DrawState, bpp: u32) -> Result<(), GpuError> {
+        let (width, height, format) = (state.width, state.height, state.format);
+        if let Some(base) = state.target_base {
+            let key = TargetKey {
+                base,
+                width,
+                height,
+                format: format.as_raw(),
+            };
+            // The guest re-programmed this target's extent/format: the old
+            // image can never be drawn again, so drop it now.
+            self.caches.evict_targets_for_base(self.dev, base, &key);
+            if let Some(entry) = self.caches.acquire_target(&key) {
+                self.image = entry.image;
+                self.image_memory = entry.memory;
+                self.image_view = entry.view;
+                self.readback_buffer = entry.readback_buffer;
+                self.readback_memory = entry.readback_memory;
+                self.owns_target = false;
+                self.target_key = Some(key);
+                // `entry.synced` carries the pre-acquisition value: the GPU
+                // image equals the last readback, which is exactly what the
+                // caller passes as `initial` (contract on `target_base`).
+                self.load_from_gpu = entry.synced && state.initial.is_some();
+                if self.load_from_gpu {
+                    self.caches.stats.seed_uploads_skipped += 1;
+                }
+                return Ok(());
+            }
+            // Own the new image/readback pair until the donation to the cache
+            // below — an error in between must destroy them in Drop, not leak.
+            self.owns_target = true;
+            self.create_color_image(width, height, format)?;
+            self.create_readback_buffer(width, height, bpp)?;
+            self.caches.insert_target(
+                key,
+                PersistentTarget {
+                    image: self.image,
+                    memory: self.image_memory,
+                    view: self.image_view,
+                    readback_buffer: self.readback_buffer,
+                    readback_memory: self.readback_memory,
+                    synced: false,
+                },
+            );
+            self.owns_target = false;
+            self.target_key = Some(key);
+            return Ok(());
+        }
+        self.create_color_image(width, height, format)?;
+        self.create_readback_buffer(width, height, bpp)?;
+        self.owns_target = true;
+        Ok(())
+    }
+
+    /// Mark this draw's persistent target as synced with the CPU-side pixels.
+    /// Called only after the colour readback succeeded.
+    fn mark_target_synced(&mut self) {
+        if let Some(key) = self.target_key {
+            self.caches.mark_target_synced(&key);
+        }
+    }
+
+    fn create_color_image(
         &mut self,
         width: u32,
         height: u32,
@@ -1292,13 +1419,9 @@ impl<'a> Resources<'a> {
                     );
                 }
             }
-            let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-            // SAFETY: `bindings` remains alive for the call; the returned
-            // layout is retained through pipeline and descriptor-set use.
-            let layout = unsafe { self.device().create_descriptor_set_layout(&info, None) }
-                .map_err(|e| {
-                    GpuError::PipelineCreationFailed(format!("vkCreateDescriptorSetLayout: {e}"))
-                })?;
+            // Cached by binding signature: layouts live on the device caches,
+            // not in this per-draw bundle.
+            let layout = self.caches.set_layout(self.dev, &bindings)?;
             self.descriptor_set_layouts.push(layout);
         }
 
@@ -1342,15 +1465,14 @@ impl<'a> Resources<'a> {
                 .descriptor_count(count)
         })
         .collect();
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(self.descriptor_set_layouts.len() as u32)
-            .pool_sizes(&pool_sizes);
-        // SAFETY: the pool-size slice is alive for the call. Pool lifetime is
-        // owned by this resource bundle and outlives all allocated sets.
-        self.descriptor_pool = unsafe { self.device().create_descriptor_pool(&pool_info, None) }
-            .map_err(|e| {
-                GpuError::PipelineCreationFailed(format!("vkCreateDescriptorPool: {e}"))
-            })?;
+        // Persistent pool from the cache, reset for this draw (the previous
+        // draw's sets completed with its fence) and grown when this draw
+        // needs more than it holds.
+        self.descriptor_pool = self.caches.descriptor_pool(
+            self.dev,
+            self.descriptor_set_layouts.len() as u32,
+            &pool_sizes,
+        )?;
 
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
@@ -1398,7 +1520,7 @@ impl<'a> Resources<'a> {
                     })
                     .collect();
                 for &linear in &textures.linear_filter {
-                    self.samplers.push(self.create_sampler(linear)?);
+                    self.samplers.push(self.caches.sampler(self.dev, linear)?);
                 }
                 let first_sampler = self.samplers.len() - textures.linear_filter.len();
                 sampler_infos = self.samplers[first_sampler..]
@@ -1553,28 +1675,6 @@ impl<'a> Resources<'a> {
         Ok(())
     }
 
-    /// One sampler per S#. Only linear-vs-nearest is honoured today — the S#
-    /// address-mode and LOD fields are not decoded yet, so the sampler repeats
-    /// and clamps to level 0, matching the single uploaded mip.
-    fn create_sampler(&self, linear: bool) -> Result<vk::Sampler, GpuError> {
-        let filter = if linear {
-            vk::Filter::LINEAR
-        } else {
-            vk::Filter::NEAREST
-        };
-        let info = vk::SamplerCreateInfo::default()
-            .mag_filter(filter)
-            .min_filter(filter)
-            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-            .address_mode_u(vk::SamplerAddressMode::REPEAT)
-            .address_mode_v(vk::SamplerAddressMode::REPEAT)
-            .address_mode_w(vk::SamplerAddressMode::REPEAT)
-            .max_lod(0.0);
-        // SAFETY: plain sampler on a live device; destroyed in Drop.
-        unsafe { self.device().create_sampler(&info, None) }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("vkCreateSampler: {e}")))
-    }
-
     fn create_readback_buffer(
         &mut self,
         width: u32,
@@ -1602,18 +1702,12 @@ impl<'a> Resources<'a> {
         Ok(())
     }
 
-    fn create_shader_module(&self, code: &[u32]) -> Result<vk::ShaderModule, GpuError> {
-        let info = vk::ShaderModuleCreateInfo::default().code(code);
-        // SAFETY: `code` is a `&[u32]`, so it is 4-byte aligned and its length
-        // is a whole number of words — exactly what vkCreateShaderModule
-        // requires. It stays alive for the call.
-        unsafe { self.device().create_shader_module(&info, None) }
-            .map_err(|e| GpuError::ShaderCompilationFailed(format!("vkCreateShaderModule: {e}")))
-    }
-
     fn create_pipeline(&mut self, state: &DrawState) -> Result<(), GpuError> {
-        self.vertex_module = self.create_shader_module(state.vs_spirv)?;
-        self.fragment_module = self.create_shader_module(state.fs_spirv)?;
+        // Cached by SPIR-V content: the translate cache upstream already
+        // dedups shaders, so repeated binds of one shader resolve to one
+        // canonical VkShaderModule instead of a fresh module per draw.
+        self.vertex_module = self.caches.shader_module(self.dev, state.vs_spirv)?;
+        self.fragment_module = self.caches.shader_module(self.dev, state.fs_spirv)?;
 
         let push_ranges: Vec<_> = state
             .stage_bindings
@@ -1626,14 +1720,111 @@ impl<'a> Resources<'a> {
                     .size(stage.push_constants.len() as u32)
             })
             .collect();
-        let layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&self.descriptor_set_layouts)
-            .push_constant_ranges(&push_ranges);
-        // SAFETY: an empty layout — no descriptor sets or push constants.
-        self.pipeline_layout = unsafe { self.device().create_pipeline_layout(&layout_info, None) }
-            .map_err(|e| {
-                GpuError::PipelineCreationFailed(format!("vkCreatePipelineLayout: {e}"))
-            })?;
+        self.pipeline_layout =
+            self.caches
+                .pipeline_layout(self.dev, &self.descriptor_set_layouts, &push_ranges)?;
+
+        // The effective vertex input layout: guest buffers when present; else
+        // one vec4 attribute at location 0 for the fixture vertex buffer; else
+        // nothing (a shader that builds its geometry from `gl_VertexIndex`
+        // declares no inputs, and binding an attribute it never consumes is
+        // invalid).
+        let (vertex_bindings, vertex_attributes): (
+            Vec<vk::VertexInputBindingDescription>,
+            Vec<vk::VertexInputAttributeDescription>,
+        ) = if !state.vertex_buffers.is_empty() {
+            (
+                state
+                    .vertex_buffers
+                    .iter()
+                    .enumerate()
+                    .map(|(binding, data)| {
+                        vk::VertexInputBindingDescription::default()
+                            .binding(binding as u32)
+                            .stride(data.stride)
+                            .input_rate(vk::VertexInputRate::VERTEX)
+                    })
+                    .collect(),
+                state
+                    .vertex_attributes
+                    .iter()
+                    .map(|attr| {
+                        vk::VertexInputAttributeDescription::default()
+                            .location(attr.location)
+                            .binding(attr.binding)
+                            .format(attr.format)
+                            .offset(attr.offset)
+                    })
+                    .collect(),
+            )
+        } else if state.vertices.is_some() {
+            (
+                vec![
+                    vk::VertexInputBindingDescription::default()
+                        .binding(0)
+                        .stride(mem::size_of::<[f32; 4]>() as u32)
+                        .input_rate(vk::VertexInputRate::VERTEX),
+                ],
+                vec![
+                    vk::VertexInputAttributeDescription::default()
+                        .location(0)
+                        .binding(0)
+                        .format(vk::Format::R32G32B32A32_SFLOAT)
+                        .offset(0),
+                ],
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        // Everything that feeds pipeline creation is in the key; viewport,
+        // scissor, and blend constants are dynamic state and deliberately
+        // absent, so they cannot fragment the cache.
+        let stencil_attachment = state
+            .depth
+            .as_ref()
+            .is_some_and(|depth| has_stencil_plane(depth.format) && depth.stencil_test_enable);
+        let key = GraphicsPipelineKey {
+            vs: self.vertex_module.as_raw(),
+            fs: self.fragment_module.as_raw(),
+            layout: self.pipeline_layout.as_raw(),
+            color_format: state.color_output.then(|| state.format.as_raw()),
+            depth: state.depth.as_ref().map(|depth| DepthPipelineKey {
+                format: depth.format.as_raw(),
+                test: depth.test_enable,
+                write: depth.write_enable,
+                compare: depth.compare_op.as_raw(),
+                stencil_test: depth.stencil_test_enable,
+                front: StencilKey::from_vk(&depth.stencil_front),
+                back: StencilKey::from_vk(&depth.stencil_back),
+                stencil_attachment,
+            }),
+            topology: state.topology.as_raw(),
+            cull: state.cull_mode.as_raw(),
+            front_face: state.front_face.as_raw(),
+            color_write_mask: state.color_write_mask.as_raw(),
+            blend: BlendKey {
+                enable: state.blend.enable,
+                src_color: state.blend.src_color.as_raw(),
+                dst_color: state.blend.dst_color.as_raw(),
+                color_op: state.blend.color_op.as_raw(),
+                src_alpha: state.blend.src_alpha.as_raw(),
+                dst_alpha: state.blend.dst_alpha.as_raw(),
+                alpha_op: state.blend.alpha_op.as_raw(),
+            },
+            vertex_bindings: vertex_bindings
+                .iter()
+                .map(|b| (b.binding, b.stride))
+                .collect(),
+            vertex_attributes: vertex_attributes
+                .iter()
+                .map(|a| (a.location, a.binding, a.format.as_raw(), a.offset))
+                .collect(),
+        };
+        if let Some(pipeline) = self.caches.lookup_graphics_pipeline(&key) {
+            self.pipeline = pipeline;
+            return Ok(());
+        }
 
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
@@ -1646,52 +1837,11 @@ impl<'a> Resources<'a> {
                 .name(c"main"),
         ];
 
-        // One vec4 attribute at location 0, matching the vertex shader — but
-        // only when the caller supplies vertices. A shader that builds its
-        // geometry from `gl_VertexIndex` declares no inputs, and binding an
-        // attribute it never consumes is invalid.
-        let fixture_bindings = [vk::VertexInputBindingDescription::default()
-            .binding(0)
-            .stride(mem::size_of::<[f32; 4]>() as u32)
-            .input_rate(vk::VertexInputRate::VERTEX)];
-        let fixture_attributes = [vk::VertexInputAttributeDescription::default()
-            .location(0)
-            .binding(0)
-            .format(vk::Format::R32G32B32A32_SFLOAT)
-            .offset(0)];
-        let guest_bindings: Vec<_> = state
-            .vertex_buffers
-            .iter()
-            .enumerate()
-            .map(|(binding, data)| {
-                vk::VertexInputBindingDescription::default()
-                    .binding(binding as u32)
-                    .stride(data.stride)
-                    .input_rate(vk::VertexInputRate::VERTEX)
-            })
-            .collect();
-        let guest_attributes: Vec<_> = state
-            .vertex_attributes
-            .iter()
-            .map(|attr| {
-                vk::VertexInputAttributeDescription::default()
-                    .location(attr.location)
-                    .binding(attr.binding)
-                    .format(attr.format)
-                    .offset(attr.offset)
-            })
-            .collect();
-        let vertex_input = if !state.vertex_buffers.is_empty() {
-            vk::PipelineVertexInputStateCreateInfo::default()
-                .vertex_binding_descriptions(&guest_bindings)
-                .vertex_attribute_descriptions(&guest_attributes)
-        } else if state.vertices.is_some() {
-            vk::PipelineVertexInputStateCreateInfo::default()
-                .vertex_binding_descriptions(&fixture_bindings)
-                .vertex_attribute_descriptions(&fixture_attributes)
-        } else {
-            vk::PipelineVertexInputStateCreateInfo::default()
-        };
+        // Empty slices produce zero-count vertex input state, matching the
+        // old no-input default.
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&vertex_bindings)
+            .vertex_attribute_descriptions(&vertex_attributes);
 
         let input_assembly =
             vk::PipelineInputAssemblyStateCreateInfo::default().topology(state.topology);
@@ -1741,11 +1891,16 @@ impl<'a> Resources<'a> {
             } else {
                 &[]
             };
-        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
-            .attachments(color_blend_attachments)
-            .blend_constants(state.blend.constants);
+        let color_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(color_blend_attachments);
 
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        // Blend constants join viewport/scissor as dynamic state so that a
+        // register write to CB_BLEND_* cannot force a new pipeline.
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::BLEND_CONSTANTS,
+        ];
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
@@ -1794,31 +1949,21 @@ impl<'a> Resources<'a> {
             GpuError::PipelineCreationFailed(format!("vkCreateGraphicsPipelines: {e}"))
         })?;
 
-        self.pipeline = *pipelines.first().ok_or_else(|| {
+        let pipeline = *pipelines.first().ok_or_else(|| {
             GpuError::PipelineCreationFailed("driver returned no pipeline".to_owned())
         })?;
+        self.caches.store_graphics_pipeline(key, pipeline);
+        self.pipeline = pipeline;
         Ok(())
     }
 
+    /// The persistent command buffer + fence from the cache (fence reset for
+    /// this submission). The command buffer is implicitly reset by
+    /// `vkBeginCommandBuffer` — the pool was created RESET_COMMAND_BUFFER.
     fn create_command_resources(&mut self) -> Result<(), GpuError> {
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.dev.command_pool())
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-
-        // SAFETY: the pool belongs to this device and is not being used
-        // concurrently — `VulkanDevice` is borrowed immutably and command
-        // buffers are only recorded here, on this thread.
-        let buffers = unsafe { self.device().allocate_command_buffers(&alloc_info) }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("command buffer alloc: {e}")))?;
-        self.command_buffer = *buffers
-            .first()
-            .ok_or_else(|| GpuError::VulkanInitFailed("no command buffer returned".to_owned()))?;
-
-        let fence_info = vk::FenceCreateInfo::default();
-        // SAFETY: plain unsignaled fence on a live device.
-        self.fence = unsafe { self.device().create_fence(&fence_info, None) }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("vkCreateFence failed: {e}")))?;
+        let (command_buffer, fence) = self.caches.submit_resources(self.dev)?;
+        self.command_buffer = command_buffer;
+        self.fence = fence;
         Ok(())
     }
 
@@ -1869,8 +2014,10 @@ impl<'a> Resources<'a> {
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
-        // SAFETY: the command buffer is freshly allocated and not pending, so
-        // beginning it is legal; it is recorded only from this thread.
+        // SAFETY: the command buffer is not pending — the previous submission
+        // through it fence-completed under the cache lock — and the pool was
+        // created RESET_COMMAND_BUFFER, so begin implicitly resets it. It is
+        // recorded only under the cache lock (one recorder at a time).
         unsafe {
             self.device()
                 .begin_command_buffer(self.command_buffer, &begin_info)
@@ -1940,7 +2087,7 @@ impl<'a> Resources<'a> {
         // Colour attachment: seed/transition only when this draw writes colour.
         // A depth-only z-prepass (`color_output == false`) has no colour image.
         if state.color_output {
-            if state.initial.is_some() {
+            if state.initial.is_some() && !self.load_from_gpu {
                 // Seed the attachment with the target's prior contents:
                 // UNDEFINED -> TRANSFER_DST, copy in, then hand off to the
                 // attachment stage so LOAD sees the composed frame so far.
@@ -1999,18 +2146,37 @@ impl<'a> Resources<'a> {
                     },
                 );
             } else {
-                // UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL. Discards existing
-                // contents, which is fine: the render pass clears anyway.
+                // No seed upload. Two cases share this barrier:
+                // - `load_from_gpu`: the persistent image still holds exactly
+                //   the last readback, so transition TRANSFER_SRC_OPTIMAL (its
+                //   layout after that readback copy) -> COLOR_ATTACHMENT,
+                //   PRESERVING contents for the LOAD. The prior submission's
+                //   only access was a transfer read, so no source writes need
+                //   making available.
+                // - otherwise: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL, which
+                //   discards existing contents — fine, the pass clears anyway.
+                let (old_layout, src_stage) = if self.load_from_gpu {
+                    (
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::PipelineStageFlags::TRANSFER,
+                    )
+                } else {
+                    (
+                        vk::ImageLayout::UNDEFINED,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                    )
+                };
                 self.image_barrier_layers(
                     vk::ImageAspectFlags::COLOR,
                     self.image,
                     1,
                     ImageTransition {
-                        old_layout: vk::ImageLayout::UNDEFINED,
+                        old_layout,
                         new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                         src_access: vk::AccessFlags::empty(),
-                        dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                        src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+                        dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                            | vk::AccessFlags::COLOR_ATTACHMENT_READ,
+                        src_stage,
                         dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                     },
                 );
@@ -2210,6 +2376,9 @@ impl<'a> Resources<'a> {
             );
             d.cmd_set_viewport(self.command_buffer, 0, &viewports);
             d.cmd_set_scissor(self.command_buffer, 0, &scissors);
+            // Dynamic since the pipeline cache landed: constants no longer
+            // key (or fragment) the pipeline.
+            d.cmd_set_blend_constants(self.command_buffer, &state.blend.constants);
             if !self.guest_vertex_buffers.is_empty() {
                 let buffers: Vec<_> = self
                     .guest_vertex_buffers
@@ -2501,51 +2670,26 @@ impl<'a> Resources<'a> {
 
 impl Drop for Resources<'_> {
     fn drop(&mut self) {
-        let descriptor_set_layouts = mem::take(&mut self.descriptor_set_layouts);
         let guest_vertex_buffers = mem::take(&mut self.guest_vertex_buffers);
         let storage_buffers = mem::take(&mut self.storage_buffers);
         let texture_uploads = mem::take(&mut self.texture_uploads);
-        let samplers = mem::take(&mut self.samplers);
-        // SAFETY: every handle was created from `self.dev`'s device and is
-        // destroyed exactly once, children before parents. `device_wait_idle`
-        // ensures no submitted work still references them; its error is ignored
-        // because drop must not panic and a lost device cannot be recovered.
-        // Null handles are skipped, so a partially-built `Resources` (an error
-        // during `build`) cleans up correctly.
+        // NOT destroyed here — owned by the device's DrawCaches and reused by
+        // the next draw: pipeline, pipeline layout, descriptor set layouts,
+        // shader modules, samplers, command buffer, fence, descriptor pool,
+        // and (when `owns_target` is false) the colour image + its readback
+        // buffer. `DrawCaches::destroy` releases them with the device.
+        //
+        // SAFETY: every handle destroyed below was created from `self.dev`'s
+        // device for this draw alone and is destroyed exactly once, children
+        // before parents. `device_wait_idle` ensures no submitted work still
+        // references them; its error is ignored because drop must not panic
+        // and a lost device cannot be recovered. Null handles are skipped, so
+        // a partially-built `Resources` (an error during `build`) cleans up
+        // correctly.
         unsafe {
             let d = self.device();
             let _ = d.device_wait_idle();
 
-            if self.fence != vk::Fence::null() {
-                d.destroy_fence(self.fence, None);
-            }
-            if self.command_buffer != vk::CommandBuffer::null() {
-                d.free_command_buffers(self.dev.command_pool(), &[self.command_buffer]);
-            }
-            if self.pipeline != vk::Pipeline::null() {
-                d.destroy_pipeline(self.pipeline, None);
-            }
-            if self.pipeline_layout != vk::PipelineLayout::null() {
-                d.destroy_pipeline_layout(self.pipeline_layout, None);
-            }
-            if self.descriptor_pool != vk::DescriptorPool::null() {
-                d.destroy_descriptor_pool(self.descriptor_pool, None);
-            }
-            for layout in descriptor_set_layouts {
-                d.destroy_descriptor_set_layout(layout, None);
-            }
-            if self.fragment_module != vk::ShaderModule::null() {
-                d.destroy_shader_module(self.fragment_module, None);
-            }
-            if self.vertex_module != vk::ShaderModule::null() {
-                d.destroy_shader_module(self.vertex_module, None);
-            }
-            if self.readback_buffer != vk::Buffer::null() {
-                d.destroy_buffer(self.readback_buffer, None);
-            }
-            if self.readback_memory != vk::DeviceMemory::null() {
-                d.free_memory(self.readback_memory, None);
-            }
             if self.upload_buffer != vk::Buffer::null() {
                 d.destroy_buffer(self.upload_buffer, None);
             }
@@ -2572,9 +2716,6 @@ impl Drop for Resources<'_> {
                 d.destroy_buffer(buffer, None);
                 d.free_memory(memory, None);
             }
-            for sampler in samplers {
-                d.destroy_sampler(sampler, None);
-            }
             for texture in texture_uploads {
                 if texture.view != vk::ImageView::null() {
                     d.destroy_image_view(texture.view, None);
@@ -2588,14 +2729,22 @@ impl Drop for Resources<'_> {
                 d.destroy_buffer(texture.staging_buffer, None);
                 d.free_memory(texture.staging_memory, None);
             }
-            if self.image_view != vk::ImageView::null() {
-                d.destroy_image_view(self.image_view, None);
-            }
-            if self.image != vk::Image::null() {
-                d.destroy_image(self.image, None);
-            }
-            if self.image_memory != vk::DeviceMemory::null() {
-                d.free_memory(self.image_memory, None);
+            if self.owns_target {
+                if self.readback_buffer != vk::Buffer::null() {
+                    d.destroy_buffer(self.readback_buffer, None);
+                }
+                if self.readback_memory != vk::DeviceMemory::null() {
+                    d.free_memory(self.readback_memory, None);
+                }
+                if self.image_view != vk::ImageView::null() {
+                    d.destroy_image_view(self.image_view, None);
+                }
+                if self.image != vk::Image::null() {
+                    d.destroy_image(self.image, None);
+                }
+                if self.image_memory != vk::DeviceMemory::null() {
+                    d.free_memory(self.image_memory, None);
+                }
             }
             if self.depth_view != vk::ImageView::null() {
                 d.destroy_image_view(self.depth_view, None);

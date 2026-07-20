@@ -1287,6 +1287,9 @@ pub fn draw_state_from_regs<'a>(
         vs_spirv,
         fs_spirv,
         initial: None,
+        // The caller (draw_common) names the guest render target so the
+        // backend can keep its VkImage alive across draws.
+        target_base: None,
         // The caller (draw_common) fills this in for an indexed draw.
         index: None,
         // This register-driven composite path is colour-only for now; the
@@ -1541,6 +1544,13 @@ impl OffscreenDrawSink<'_> {
             if let Some(p) = &prior {
                 state.initial = Some(&p.pixels);
             }
+            // Name the guest target so the backend keeps one VkImage per
+            // (base, extent, format) across draws. The `target_base` contract
+            // holds here by construction: `prior` is exactly the previous
+            // draw's readback of this target (this map is only ever written
+            // with that readback, below), so the backend may LOAD the
+            // persistent GPU copy instead of re-uploading these bytes.
+            state.target_base = Some(rt_base);
             // Publish the other live render targets (this one was `remove`d
             // above) so this draw's texture path can sample any of them as a
             // render-target-as-texture — the composite that produces the visible

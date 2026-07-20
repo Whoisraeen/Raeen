@@ -10,7 +10,9 @@
 //! [`super::offscreen`]) so the draw path is testable headlessly. Presentation
 //! is wired later, when `libSceVideoOut` flips reach the backend.
 
+use super::cache::{DrawCacheStats, DrawCaches};
 use ash::{Device, Entry, Instance, ext::debug_utils, vk};
+use parking_lot::{Mutex, MutexGuard};
 use std::ffi::{CStr, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
@@ -58,6 +60,13 @@ pub struct VulkanDevice {
     command_pool: vk::CommandPool,
     /// Driver-side cache of compiled pipeline binaries, reused across draws.
     pipeline_cache: vk::PipelineCache,
+    /// Application-side caches of long-lived draw/dispatch resources
+    /// (pipelines, layouts, shader modules, persistent render targets,
+    /// command buffer/fence, descriptor pool). See [`super::cache`] for the
+    /// inventory and the locking/thread-ownership contract: the mutex is held
+    /// for a whole synchronous draw or dispatch, which serializes every user
+    /// of the cached resources and of the queue.
+    caches: Mutex<DrawCaches>,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// Debug messenger, present only when validation is active.
     debug: Option<(debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
@@ -167,6 +176,7 @@ impl VulkanDevice {
             queue_family_index,
             command_pool,
             pipeline_cache,
+            caches: Mutex::new(DrawCaches::default()),
             memory_properties,
             debug,
             device_name,
@@ -193,6 +203,24 @@ impl VulkanDevice {
     /// failed — that is still a valid argument.
     pub(crate) fn pipeline_cache(&self) -> vk::PipelineCache {
         self.pipeline_cache
+    }
+
+    /// The long-lived draw/dispatch resource caches (stage A).
+    ///
+    /// The returned guard must be held for the entire draw/dispatch that uses
+    /// any cached handle — the synchronous fence wait happens under it, which
+    /// is what makes reusing the command buffer, fence, and descriptor pool
+    /// sound (see [`super::cache`] module docs).
+    pub(crate) fn draw_caches(&self) -> MutexGuard<'_, DrawCaches> {
+        self.caches.lock()
+    }
+
+    /// Cache-effectiveness counters, cumulative since device creation.
+    ///
+    /// This is the stage A instrumentation: a title run (or test) reads it to
+    /// prove that repeated draws stop rebuilding pipelines and render targets.
+    pub fn draw_cache_stats(&self) -> DrawCacheStats {
+        self.caches.lock().stats
     }
 
     /// Whether the Khronos validation layer is actually active.
@@ -529,6 +557,9 @@ impl Drop for VulkanDevice {
         // device cannot be recovered here and drop must not panic.
         unsafe {
             let _ = self.device.device_wait_idle();
+            self.caches
+                .get_mut()
+                .destroy(&self.device, self.command_pool);
             if self.pipeline_cache != vk::PipelineCache::null() {
                 self.device
                     .destroy_pipeline_cache(self.pipeline_cache, None);

@@ -13,6 +13,7 @@
 //!
 //! Swapchain presentation via `libSceVideoOut` remains M3.
 
+pub(crate) mod cache;
 pub mod compute;
 pub mod instance;
 pub mod offscreen;
@@ -24,6 +25,7 @@ use instance::VulkanDevice;
 use tracing::info;
 use xps5x_core::error::GpuError;
 
+pub use cache::DrawCacheStats;
 pub use instance::validation_error_count;
 pub use offscreen::{
     CLEAR_COLOR, IndexBinding, RenderedImage, render_triangle, render_triangle_with_spirv, unorm8,
@@ -67,6 +69,12 @@ impl VulkanBackend {
             GpuError::VulkanInitFailed("backend not initialized — call init() first".to_owned())
         })?;
         render_triangle(device, width, height)
+    }
+
+    /// Cache-effectiveness counters (stage A instrumentation), or `None`
+    /// before `init`. See [`DrawCacheStats`].
+    pub fn draw_cache_stats(&self) -> Option<DrawCacheStats> {
+        self.device.as_ref().map(VulkanDevice::draw_cache_stats)
     }
 
     /// M2 draw: offscreen triangle using `kyty-graphics` SPIR-V.

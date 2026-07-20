@@ -6,6 +6,7 @@
 //! are read back; the caller owns copying those bytes back into
 //! identity-mapped guest memory.
 
+use super::cache::DrawCaches;
 use super::instance::VulkanDevice;
 use super::offscreen::{ShaderStageBinding, StorageImageUpload, TextureUpload};
 use ash::vk::Handle;
@@ -45,7 +46,11 @@ pub fn dispatch_compute(
         )));
     }
 
-    let mut resources = ComputeResources::new(dev);
+    // Same locking contract as `render_draw`: the cache lock spans the whole
+    // synchronous dispatch, including the fence wait, so the cached pipeline,
+    // command buffer, fence, and descriptor pool are reused soundly.
+    let mut caches = dev.draw_caches();
+    let mut resources = ComputeResources::new(dev, &mut caches);
     resources.build(state)?;
     resources.record_and_submit(state)?;
     Ok(ComputeOutputs {
@@ -91,8 +96,13 @@ struct SampledAllocation {
     layers: u32,
 }
 
+/// Per-dispatch resources (owned, destroyed in `Drop`) plus handles borrowed
+/// from [`DrawCaches`] — shader module, descriptor layout, descriptor pool,
+/// pipeline layout, pipeline, samplers, command buffer, and fence are cached
+/// on the device and must NOT be destroyed here.
 struct ComputeResources<'a> {
     dev: &'a VulkanDevice,
+    caches: &'a mut DrawCaches,
     storage: Vec<BufferAllocation>,
     images: Vec<ImageAllocation>,
     sampled: Vec<SampledAllocation>,
@@ -108,9 +118,10 @@ struct ComputeResources<'a> {
 }
 
 impl<'a> ComputeResources<'a> {
-    fn new(dev: &'a VulkanDevice) -> Self {
+    fn new(dev: &'a VulkanDevice, caches: &'a mut DrawCaches) -> Self {
         Self {
             dev,
+            caches,
             storage: Vec::new(),
             images: Vec::new(),
             sampled: Vec::new(),
@@ -131,10 +142,9 @@ impl<'a> ComputeResources<'a> {
     }
 
     fn build(&mut self, state: &ComputeState<'_>) -> Result<(), GpuError> {
-        let shader_info = vk::ShaderModuleCreateInfo::default().code(state.spirv);
-        // SAFETY: SPIR-V is an aligned dword slice alive for the call.
-        self.shader = unsafe { self.device().create_shader_module(&shader_info, None) }
-            .map_err(|e| GpuError::ShaderCompilationFailed(format!("vkCreateShaderModule: {e}")))?;
+        // Cached by SPIR-V content: a title re-dispatches the same compute
+        // shaders thousands of times per frame.
+        self.shader = self.caches.shader_module(self.dev, state.spirv)?;
 
         let storage = state.binding.and_then(|b| b.storage_buffers.as_ref());
         let storage_images = state.binding.and_then(|b| b.storage_images.as_ref());
@@ -195,7 +205,7 @@ impl<'a> ComputeResources<'a> {
                     self.create_sampled_image(upload)?;
                 }
                 for &linear in &textures.linear_filter {
-                    self.samplers.push(self.create_sampler(linear)?);
+                    self.samplers.push(self.caches.sampler(self.dev, linear)?);
                 }
                 layout_bindings.push(
                     vk::DescriptorSetLayoutBinding::default()
@@ -213,16 +223,8 @@ impl<'a> ComputeResources<'a> {
                 );
             }
 
-            let layout_info =
-                vk::DescriptorSetLayoutCreateInfo::default().bindings(&layout_bindings);
-            // SAFETY: binding slice is live for the call.
-            self.descriptor_layout = unsafe {
-                self.device()
-                    .create_descriptor_set_layout(&layout_info, None)
-            }
-            .map_err(|e| {
-                GpuError::PipelineCreationFailed(format!("vkCreateDescriptorSetLayout: {e}"))
-            })?;
+            // Cached by binding signature, shared with the graphics path.
+            self.descriptor_layout = self.caches.set_layout(self.dev, &layout_bindings)?;
 
             let pool_sizes: Vec<_> = [
                 (
@@ -241,14 +243,9 @@ impl<'a> ComputeResources<'a> {
                     .descriptor_count(count)
             })
             .collect();
-            let pool_info = vk::DescriptorPoolCreateInfo::default()
-                .max_sets(1)
-                .pool_sizes(&pool_sizes);
-            // SAFETY: pool-size slice is live for the call.
-            self.descriptor_pool =
-                unsafe { self.device().create_descriptor_pool(&pool_info, None) }.map_err(|e| {
-                    GpuError::PipelineCreationFailed(format!("vkCreateDescriptorPool: {e}"))
-                })?;
+            // The persistent pool, reset for this dispatch (the previous
+            // draw/dispatch that used it fence-completed under the lock).
+            self.descriptor_pool = self.caches.descriptor_pool(self.dev, 1, &pool_sizes)?;
             let layouts = [self.descriptor_layout];
             let alloc_info = vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(self.descriptor_pool)
@@ -345,48 +342,19 @@ impl<'a> ComputeResources<'a> {
             })
             .into_iter()
             .collect();
-        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&set_layouts)
-            .push_constant_ranges(&push_ranges);
-        // SAFETY: layout/range slices and descriptor layout stay live.
-        self.pipeline_layout = unsafe {
-            self.device()
-                .create_pipeline_layout(&pipeline_layout_info, None)
-        }
-        .map_err(|e| GpuError::PipelineCreationFailed(format!("vkCreatePipelineLayout: {e}")))?;
+        self.pipeline_layout = self
+            .caches
+            .pipeline_layout(self.dev, &set_layouts, &push_ranges)?;
 
-        let stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(self.shader)
-            .name(c"main");
-        let pipeline_info = vk::ComputePipelineCreateInfo::default()
-            .stage(stage)
-            .layout(self.pipeline_layout);
-        // SAFETY: shader module and layout are live, and create info is local.
-        self.pipeline = unsafe {
-            self.device().create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[pipeline_info],
-                None,
-            )
-        }
-        .map_err(|(_, e)| {
-            GpuError::PipelineCreationFailed(format!("vkCreateComputePipelines: {e}"))
-        })?[0];
+        // Cached by (canonical module, canonical layout): identical dispatch
+        // programs reuse one VkPipeline instead of recompiling per dispatch.
+        self.pipeline =
+            self.caches
+                .compute_pipeline(self.dev, self.shader, self.pipeline_layout)?;
 
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.dev.command_pool())
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        // SAFETY: command pool belongs to this live device.
-        self.command_buffer = unsafe { self.device().allocate_command_buffers(&alloc_info) }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("command buffer alloc: {e}")))?[0];
-        // SAFETY: plain fence creation on a live device.
-        self.fence = unsafe {
-            self.device()
-                .create_fence(&vk::FenceCreateInfo::default(), None)
-        }
-        .map_err(|e| GpuError::VulkanInitFailed(format!("vkCreateFence: {e}")))?;
+        let (command_buffer, fence) = self.caches.submit_resources(self.dev)?;
+        self.command_buffer = command_buffer;
+        self.fence = fence;
         Ok(())
     }
 
@@ -708,27 +676,6 @@ impl<'a> ComputeResources<'a> {
         Ok(())
     }
 
-    /// One sampler per S#; mirrors the offscreen path — only linear vs
-    /// nearest is honoured today.
-    fn create_sampler(&self, linear: bool) -> Result<vk::Sampler, GpuError> {
-        let filter = if linear {
-            vk::Filter::LINEAR
-        } else {
-            vk::Filter::NEAREST
-        };
-        let info = vk::SamplerCreateInfo::default()
-            .mag_filter(filter)
-            .min_filter(filter)
-            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-            .address_mode_u(vk::SamplerAddressMode::REPEAT)
-            .address_mode_v(vk::SamplerAddressMode::REPEAT)
-            .address_mode_w(vk::SamplerAddressMode::REPEAT)
-            .max_lod(0.0);
-        // SAFETY: plain sampler on a live device; destroyed in Drop.
-        unsafe { self.device().create_sampler(&info, None) }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("compute vkCreateSampler: {e}")))
-    }
-
     fn record_and_submit(&self, state: &ComputeState<'_>) -> Result<(), GpuError> {
         let full_color = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -753,7 +700,9 @@ impl<'a> ComputeResources<'a> {
         };
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // SAFETY: newly allocated command buffer is not pending.
+        // SAFETY: the cached command buffer is not pending — its previous
+        // submission fence-completed under the cache lock — and the pool was
+        // created RESET_COMMAND_BUFFER, so begin implicitly resets it.
         unsafe {
             self.device()
                 .begin_command_buffer(self.command_buffer, &begin)
@@ -1013,43 +962,19 @@ impl<'a> ComputeResources<'a> {
 
 impl Drop for ComputeResources<'_> {
     fn drop(&mut self) {
-        // SAFETY: every non-null handle was created from this device and is
-        // destroyed once, after synchronous fence completion or failed build.
+        // NOT destroyed here — owned by the device's DrawCaches and reused by
+        // the next draw/dispatch: fence, command buffer, pipeline, pipeline
+        // layout, descriptor pool, descriptor layout, shader module, samplers.
+        //
+        // SAFETY: every handle destroyed below was created from this device
+        // for this dispatch alone and is destroyed once, after synchronous
+        // fence completion or a failed build.
         unsafe {
-            if !self.fence.is_null() {
-                self.device().destroy_fence(self.fence, None);
-            }
-            if !self.command_buffer.is_null() {
-                self.device()
-                    .free_command_buffers(self.dev.command_pool(), &[self.command_buffer]);
-            }
-            if !self.pipeline.is_null() {
-                self.device().destroy_pipeline(self.pipeline, None);
-            }
-            if !self.pipeline_layout.is_null() {
-                self.device()
-                    .destroy_pipeline_layout(self.pipeline_layout, None);
-            }
-            if !self.descriptor_pool.is_null() {
-                self.device()
-                    .destroy_descriptor_pool(self.descriptor_pool, None);
-            }
-            if !self.descriptor_layout.is_null() {
-                self.device()
-                    .destroy_descriptor_set_layout(self.descriptor_layout, None);
-            }
-            if !self.shader.is_null() {
-                self.device().destroy_shader_module(self.shader, None);
-            }
             while let Some(allocation) = self.storage.pop() {
                 self.device().destroy_buffer(allocation.buffer, None);
                 self.device().free_memory(allocation.memory, None);
             }
-            while let Some(sampler) = self.samplers.pop() {
-                if !sampler.is_null() {
-                    self.device().destroy_sampler(sampler, None);
-                }
-            }
+            self.samplers.clear();
             while let Some(allocation) = self.sampled.pop() {
                 if !allocation.view.is_null() {
                     self.device().destroy_image_view(allocation.view, None);
