@@ -2970,6 +2970,10 @@ fn recompile_buffer_store_format_xy_vdata2(
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum MubufFlexOp {
     LoadDword,
+    /// Single byte load, zero-extended — the `%buffer_load_ubyte` helper
+    /// extracts the byte from the containing dword (the byte address is not
+    /// pre-divided by 4).
+    LoadUbyte,
     StoreDword,
     LoadFormatX,
     StoreFormatX,
@@ -3172,6 +3176,7 @@ fn mubuf_flexible(
 
     let helper = match op {
         MubufFlexOp::LoadDword => "%buffer_load_float1",
+        MubufFlexOp::LoadUbyte => "%buffer_load_ubyte",
         MubufFlexOp::StoreDword => "%buffer_store_float1",
         MubufFlexOp::LoadFormatX => "%tbuffer_load_format_x",
         MubufFlexOp::StoreFormatX => "%tbuffer_store_format_x",
@@ -3215,6 +3220,28 @@ fn recompile_buffer_load_dword_flexible(
         spirv,
         "Recompile_BufferLoadDword_FlexibleAddr",
         MubufFlexOp::LoadDword,
+    )
+}
+
+/// Beyond Kyty (`buffer_load_ubyte` is `KYTY_NI` upstream): single
+/// zero-extended byte load through the `%buffer_load_ubyte` helper, all four
+/// addressing modes. Measured on ASTRO.BOT scene compute (raw 0xe02020c0,
+/// 58 dispatches/run).
+fn recompile_buffer_load_ubyte(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    mubuf_flexible(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_BufferLoadUbyte_FlexibleAddr",
+        MubufFlexOp::LoadUbyte,
     )
 }
 
@@ -3560,28 +3587,70 @@ fn recompile_ds_read_b128(
     _param: &Params,
     _scc_check: SccCheck,
 ) -> Result<bool, ShaderRecompileError> {
-    const FUNC: &str = "Recompile_DsReadB128_Vdst4Vsrc0Vsrc1";
-    let inst = inst_at(code, index, FUNC)?;
+    ds_read_ndw(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_DsReadB128_Vdst4Vsrc0Vsrc1",
+        4,
+    )
+}
+
+/// Beyond Kyty (`ds_read_b96` is `KYTY_NI` upstream): the three-dword row of
+/// the [`recompile_ds_read_b128`] model. Measured on ASTRO.BOT scene compute
+/// (raw 0xdbf80550, 58 dispatches/run).
+fn recompile_ds_read_b96(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    ds_read_ndw(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_DsReadB96_Vdst3Vsrc0Vsrc1",
+        3,
+    )
+}
+
+/// Shared body of the consecutive multi-dword LDS reads (`ds_read_b96` /
+/// `ds_read_b128`): dword `k` reads `lds[(addr + offset + 4k) >> 2]` (the
+/// derived offsets are materialised as constants in `FindConstants`); each
+/// result keeps its old value when `exec` is off.
+fn ds_read_ndw(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    func: &'static str,
+    n: i32,
+) -> Result<bool, ShaderRecompileError> {
+    let inst = inst_at(code, index, func)?;
 
     if !operand_is_variable(inst.dst) || !operand_is_variable(inst.src[0]) {
-        return Err(not_supported(FUNC, "dst/addr are not variables"));
+        return Err(not_supported(func, "dst/addr are not variables"));
     }
     if !operand_is_constant(inst.src[1]) {
-        return Err(not_supported(FUNC, "offset is not a constant"));
+        return Err(not_supported(func, "offset is not a constant"));
     }
 
     let addr = operand_variable_to_str(inst.src[0]);
     if addr.type_ != SpirvType::Float {
-        return Err(not_supported(FUNC, "unexpected addr operand type"));
+        return Err(not_supported(func, "unexpected addr operand type"));
     }
     let clamp = spirv.get_constant_uint(spirv.lds_size_dw() - 1);
     let base = inst.src[1].constant.u;
 
     let mut text = String::new();
-    for k in 0..4i32 {
+    for k in 0..n {
         let dst_value = operand_variable_to_str_shift(inst.dst, k);
         if dst_value.type_ != SpirvType::Float {
-            return Err(not_supported(FUNC, "unexpected dst operand type"));
+            return Err(not_supported(func, "unexpected dst operand type"));
         }
         let offset = spirv.get_constant_uint(base + 4 * k as u32);
         let i = format!("{index}_{k}");
@@ -7476,6 +7545,12 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_buffer_store_dword_flexible, T::BufferStoreDword, F::Vdata1SvSoffs,                 p1("")),
     f(recompile_buffer_store_dword_flexible, T::BufferStoreDword, F::Vdata1VaddrSvSoffsOffen,       p1("")),
     f(recompile_buffer_store_dword_flexible, T::BufferStoreDword, F::Vdata1Vaddr2SvSoffsOffenIdxen, p1("")),
+    // Beyond Kyty: single zero-extended byte load (ASTRO.BOT scene compute,
+    // raw 0xe02020c0), all four addressing modes through `mubuf_flexible`.
+    f(recompile_buffer_load_ubyte,           T::BufferLoadUbyte,  F::Vdata1VaddrSvSoffsIdxen,       p1("")),
+    f(recompile_buffer_load_ubyte,           T::BufferLoadUbyte,  F::Vdata1SvSoffs,                 p1("")),
+    f(recompile_buffer_load_ubyte,           T::BufferLoadUbyte,  F::Vdata1VaddrSvSoffsOffen,       p1("")),
+    f(recompile_buffer_load_ubyte,           T::BufferLoadUbyte,  F::Vdata1Vaddr2SvSoffsOffenIdxen, p1("")),
     f(recompile_buffer_load_format_x_flexible,  T::BufferLoadFormatX,  F::Vdata1SvSoffs,                 p1("")),
     f(recompile_buffer_load_format_x_flexible,  T::BufferLoadFormatX,  F::Vdata1VaddrSvSoffsOffen,       p1("")),
     f(recompile_buffer_load_format_x_flexible,  T::BufferLoadFormatX,  F::Vdata1Vaddr2SvSoffsOffenIdxen, p1("")),
@@ -7510,6 +7585,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_ds_read_b32,  T::DsReadB32,  F::SVdstSVsrc0SVsrc1,  p1("")),
     f(recompile_ds_read2_b32, T::DsRead2B32, F::Vdst2Vsrc0Vsrc1Vsrc2, p1("")),
     f(recompile_ds_read_b64,  T::DsReadB64,  F::Vdst2Vsrc0Vsrc1Vsrc2, p1("")),
+    f(recompile_ds_read_b96,  T::DsReadB96,  F::Vdst3Vsrc0Vsrc1,      p1("")),
     f(recompile_ds_read_b128, T::DsReadB128, F::Vdst4Vsrc0Vsrc1,      p1("")),
     f(recompile_ds_write_b96, T::DsWriteB96, F::Vsrc0Vsrc13Vsrc2,   p1("")),
     f(recompile_ds_write_b128, T::DsWriteB128, F::Vsrc0Vsrc14Vsrc2, p1("")),
@@ -8106,7 +8182,7 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            301,
+            306,
             "204 Kyty rows plus SSubU32, SNop, the RDNA2-only rows \
              (VLshlAddU32, VCmpxLtU32, VAddNcU32, VSubNcU32, VSubrevNcU32, VCvtI32F32, \
              VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad dmask1/3/7 \
@@ -8125,11 +8201,12 @@ mod tests {
              BufferStoreDwordX4 rows, DsWriteB128, and ImageGather4Lz dmask1, \
              and the convergence batch: the four BufferLoadDwordX3 rows, \
              DsReadB64, and ImageSampleLz dmask3, and the round-7 batch: \
-             VCmpxLeF32, VBfeI32, VBfiB32, and DsReadB128"
+             VCmpxLeF32, VBfeI32, VBfiB32, and DsReadB128, and the round-8 \
+             batch: the four BufferLoadUbyte rows and DsReadB96"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 292,
+            implemented, 297,
             "C1 implemented subset plus title-driven ports (incl. the S_XXX_I32 \
              trio, VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad \
              dmask1/3/7 + ImageSampleLz dmask1/2/F rows, ImageStore dmask1, the \
@@ -8146,7 +8223,8 @@ mod tests {
               four BufferStoreDwordX4 rows, DsWriteB128, ImageGather4Lz dmask1, \
               and the convergence batch: four BufferLoadDwordX3 rows, DsReadB64, \
               ImageSampleLz dmask3, and the round-7 batch: VCmpxLeF32, VBfeI32, \
-              VBfiB32, DsReadB128)"
+              VBfiB32, DsReadB128, and the round-8 batch: four BufferLoadUbyte \
+              rows, DsReadB96)"
         );
         assert_eq!(
             ni, 9,
@@ -10619,6 +10697,54 @@ mod tests {
     }
 
     #[test]
+    fn astro_buffer_load_ubyte_extracts_the_byte_from_the_containing_dword() {
+        // Measured raw 0xE02020C0: buffer_load_ubyte with idxen and an
+        // immediate offset 0xc0 (58 dispatches/run failed on this opcode).
+        // The byte address is offset + index * stride — NOT pre-divided by
+        // 4: the helper divides for the dword index and extracts the byte at
+        // bit offset (byte_addr & 3) * 8.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xE020_20C0, 0x8001_0400, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse buffer_load_ubyte");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::BufferLoadUbyte);
+        assert_eq!(inst.format, F::Vdata1VaddrSvSoffsIdxen);
+        assert_eq!(inst.dst.size, 1);
+        // The 12-bit immediate byte offset is folded into the soffset
+        // constant unscaled.
+        assert_eq!(inst.src[2].constant.u, 0xC0);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile buffer_load_ubyte");
+        assert!(
+            source.contains("OpFunctionCall %void %buffer_load_ubyte"),
+            "ubyte helper call:\n{source}"
+        );
+        // The helper computes the dword index by dividing the BYTE address...
+        assert!(
+            source.contains("%buf_l_ub_49 = OpSDiv %int %buf_l_ub_47 %int_4"),
+            "byte address divided for the dword index:\n{source}"
+        );
+        // ...and zero-extends the byte at (byte_addr & 3) * 8.
+        assert!(
+            source.contains("OpBitFieldUExtract %uint %buf_l_ub_64 %buf_l_ub_51 %int_8"),
+            "byte extraction:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble buffer_load_ubyte");
+        naga_parse_and_validate(&words, "buffer_load_ubyte");
+    }
+
+    #[test]
     fn astro_image_store_dmask3_writes_two_channels() {
         // MIMG 0x08 with dmask 0x3 — the last remaining image_store form
         // (58 dispatches / 5 min).
@@ -11132,6 +11258,56 @@ mod tests {
         }
         let words = spirv_run(&source).expect("assemble ds_read_b128");
         naga_parse_and_validate(&words, "ds_read_b128");
+    }
+
+    #[test]
+    fn astro_ds_read_b96_reads_three_consecutive_lds_dwords() {
+        // ds_read_b96 v[2:4], v0 offset:16 (DS opcode 0xfe, measured on
+        // ASTRO.BOT scene compute as raw 0xdbf80550 — 58 dispatches/run).
+        // The three-dword row of the b128 model.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0x7E00_0280, // v_mov_b32 v0, 0 (addr)
+                0xDBF8_0010, // ds_read_b96 v[2:4], v0, offset 16
+                0x0200_0000,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse ds_read_b96");
+        let inst = &code.get_instructions()[1];
+        assert_eq!(inst.type_, T::DsReadB96);
+        assert_eq!(inst.format, F::Vdst3Vsrc0Vsrc1);
+        assert_eq!(inst.dst.size, 3);
+        assert_eq!(inst.src[1].constant.u, 16);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile ds_read_b96");
+        for k in 0..3 {
+            assert!(
+                source.contains(&format!("OpStore %v{} %ldsr4_s_1_{k}", 2 + k)),
+                "result dword {k}:\n{source}"
+            );
+        }
+        assert!(
+            !source.contains("%ldsr4_s_1_3"),
+            "a b96 read must stop at three dwords:\n{source}"
+        );
+        // Dword k indexes through the derived offset constant 16 + 4k.
+        for off in [16, 20, 24] {
+            assert!(
+                source.contains(&format!("%uint_{off}")),
+                "derived offset constant {off}:\n{source}"
+            );
+        }
+        let words = spirv_run(&source).expect("assemble ds_read_b96");
+        naga_parse_and_validate(&words, "ds_read_b96");
     }
 
     #[test]

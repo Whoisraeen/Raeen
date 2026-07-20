@@ -358,13 +358,20 @@ pub struct EudView<'a> {
 /// descriptor lives (register file vs EUD), require `Vsharp`/`Region`-typed
 /// user SGPRs for the direct case, mark consumed registers, and copy the
 /// descriptor dwords.
+///
+/// Returns whether the descriptor content was read from the EUD (`true`) or
+/// the register file (`false`) — the recorders stamp their per-descriptor
+/// `extended` flag from this, NOT from "the shader has an EUD at all".
+/// Measured on ASTRO.BOT compute (round 8): 404 + 289 emission refusals
+/// ("extended texture at s0 / storage buffer at s8 has no EUD base to rebase
+/// on", eud_base=12) were all direct-resident sharps mislabeled extended.
 fn read_sharp_fields(
     direct_sgprs: &mut [bool; UserSgprInfo::SGPRS_MAX],
     start_index: i32,
     user_sgpr: &UserSgprInfo,
     extended_buffer: Option<EudView<'_>>,
     out: &mut [u32],
-) -> Result<(), ShaderAnalysisError> {
+) -> Result<bool, ShaderAnalysisError> {
     let extended = extended_buffer.is_some();
     if !extended && start_index as usize >= UserSgprInfo::SGPRS_MAX {
         // Kyty treats >=16 as "this sharp lives in the extended buffer", but
@@ -402,6 +409,7 @@ fn read_sharp_fields(
     //   sharp is therefore not AT s12; it is IN the EUD the pair points to,
     //   at `start - base_dw` (= 0 here — the only offset an 8-dword T# fits
     //   in the smallest measured 8-dword EUD).
+    let mut eud_resident = false;
     if start < UserSgprInfo::SGPRS_MAX {
         let fits_typed_run = (0..out.len()).all(|j| {
             user_sgpr
@@ -449,6 +457,7 @@ fn read_sharp_fields(
                 dwords = out.len(),
                 "sharp resolved EUD-resident (run does not fit the typed register file)"
             );
+            eud_resident = true;
         } else {
             // Evidence-rich residual frontier: name the first register that
             // breaks the run, with every measured value a rebase
@@ -483,8 +492,9 @@ fn read_sharp_fields(
                 .get_dw(start - UserSgprInfo::SGPRS_MAX + j)
                 .ok_or_else(|| trunc("extended (EUD) buffer too small"))?;
         }
+        eud_resident = true;
     }
-    Ok(())
+    Ok(eud_resident)
 }
 
 impl EudView<'_> {
@@ -578,7 +588,7 @@ pub fn shader_get_storage_buffer(
     let index = info.buffers_num as usize;
 
     let mut fields = [0u32; 4];
-    read_sharp_fields(
+    let eud_resident = read_sharp_fields(
         direct_sgprs,
         start_index,
         user_sgpr,
@@ -589,7 +599,7 @@ pub fn shader_get_storage_buffer(
     info.start_register[index] = start_index;
     info.slots[index] = slot;
     info.usages[index] = usage;
-    info.extended[index] = extended_buffer.is_some();
+    info.extended[index] = eud_resident;
     info.buffers[index].fields = fields;
     info.buffers_num += 1;
     tracing::debug!(
@@ -623,7 +633,7 @@ pub fn shader_get_texture_buffer(
     let index = info.textures_num as usize;
 
     let mut fields = [0u32; 8];
-    read_sharp_fields(
+    let eud_resident = read_sharp_fields(
         direct_sgprs,
         start_index,
         user_sgpr,
@@ -632,7 +642,7 @@ pub fn shader_get_texture_buffer(
     )?;
 
     info.desc[index].start_register = start_index;
-    info.desc[index].extended = extended_buffer.is_some();
+    info.desc[index].extended = eud_resident;
     info.desc[index].slot = slot;
     info.desc[index].usage = usage;
 
@@ -664,7 +674,7 @@ pub fn shader_get_sampler(
     let index = info.samplers_num as usize;
 
     let mut fields = [0u32; 4];
-    read_sharp_fields(
+    let eud_resident = read_sharp_fields(
         direct_sgprs,
         start_index,
         user_sgpr,
@@ -673,7 +683,7 @@ pub fn shader_get_sampler(
     )?;
 
     info.start_register[index] = start_index;
-    info.extended[index] = extended_buffer.is_some();
+    info.extended[index] = eud_resident;
     info.slots[index] = slot;
     info.samplers[index].fields = fields;
     info.samplers_num += 1;
@@ -736,6 +746,23 @@ pub fn shader_get_gds_pointer(
 /// `SampledDim::TwoArray`, sampled with a (u, v, layer) coordinate). Anything
 /// else is a named, evidence-rich refusal carrying every field the next arm
 /// needs.
+/// Disambiguate an 8-dword sharp slot's content: buffer V# vs image T#, from
+/// the descriptor's own type field in dword3.
+///
+/// RDNA2 layout (confirmed in shadPS4 video_core/amdgpu/resource.h): the
+/// image T# TYPE is the 4-bit field dword3\[28:31\] with values 8..15
+/// (8=1D 9=2D 10=3D 11=Cube 12=1DArray 13=2DArray 14=2DMsaa 15=2DMsaaArray),
+/// so bit 31 is always set for an image. The buffer V# TYPE is the 2-bit
+/// field dword3\[30:31\] and reads 0 for a valid buffer — but dword3\[28:29\]
+/// is the V#'s OOB_SELECT, so the whole nibble reads 0..3 depending on the
+/// out-of-bounds mode. The original `nibble == 0` test misrouted every V#
+/// with a nonzero OOB_SELECT into the texture path, which then refused it as
+/// "read-only texture type 3 ... 65x1 depth=5265 format=0 tile=0" (V# fields
+/// reinterpreted as a T#; 57 measured ASTRO.BOT CS dispatch skips, round 8).
+const fn sharp_dword3_is_buffer(dw3: u32) -> bool {
+    (dw3 >> 28) & 0xF < 8
+}
+
 fn check_read_only_texture_type(
     t: &super::resources::ShaderTextureResource,
 ) -> Result<(), ShaderAnalysisError> {
@@ -1324,7 +1351,7 @@ pub fn shader_parse_usage2(
                     extended_buffer,
                     &mut peek,
                 )?;
-                if (peek[3] >> 28) & 0xF == 0 {
+                if sharp_dword3_is_buffer(peek[3]) {
                     shader_get_storage_buffer(
                         &mut bind.storage_buffers,
                         &mut direct_sgprs,
@@ -1439,7 +1466,7 @@ pub fn shader_parse_usage2(
             extended_buffer,
             &mut peek,
         )?;
-        if (peek[3] >> 28) & 0xF == 0 {
+        if sharp_dword3_is_buffer(peek[3]) {
             shader_get_storage_buffer(
                 &mut bind.storage_buffers,
                 &mut direct_sgprs,
@@ -1501,7 +1528,7 @@ pub fn shader_parse_usage2(
             extended_buffer,
             &mut peek,
         )?;
-        if (peek[3] >> 28) & 0xF == 0 {
+        if sharp_dword3_is_buffer(peek[3]) {
             shader_get_storage_buffer(
                 &mut bind.storage_buffers,
                 &mut direct_sgprs,
@@ -1639,7 +1666,7 @@ pub fn shader_parse_usage2(
                 }
                 continue;
             }
-            if (peek[3] >> 28) & 0xF == 0 {
+            if sharp_dword3_is_buffer(peek[3]) {
                 // ReadWrite: no usage slot declared intent, and the compute
                 // path writes every storage buffer back unconditionally, so
                 // the writable superset is the faithful choice.
@@ -4171,6 +4198,158 @@ mod tests {
             read_sharp_fields(&mut direct2, 16, &empty, None, &mut out2).is_err(),
             "an unwritten s16 must not be accepted as a descriptor"
         );
+    }
+
+    /// A sharp whose typed run fits the register FILE resolves direct even
+    /// when the shader also carries an EUD — and must be recorded as
+    /// `extended = false`, because its descriptor content came from the user
+    /// SGPRs, not the EUD. Measured on ASTRO.BOT compute (rounds 7-8): 404
+    /// "extended texture at s0 has no EUD base to rebase on" + 289 same for
+    /// "storage buffer at s8" refusals, all with eud_base=12 — every one a
+    /// direct-resident sharp mislabeled extended, which `eud_rel_index`
+    /// (spirv.rs) then correctly refused to rebase (0 < 12). The analysis
+    /// itself already refuses `start < eud_base` when the run does NOT fit
+    /// the typed file ("sharp start_register below the EUD base"), so a
+    /// descriptor reaching emission with start below the base has provably
+    /// resolved direct.
+    #[test]
+    fn direct_resident_sharp_in_eud_shader_is_not_marked_extended() {
+        // T# at s0..s7 (typed Vsharp), EUD pointer pair at (s12, s13).
+        let mut user_sgpr = UserSgprInfo::default();
+        for i in 0..8u32 {
+            user_sgpr.set(i, 0x9000_0000 + i, UserSgprType::Vsharp);
+        }
+        // V# at s8..s11 (typed Vsharp).
+        for i in 8..12u32 {
+            user_sgpr.set(i, 0x8000_0000 + i, UserSgprType::Vsharp);
+        }
+        let eud_data = [0xeeee_0000u32; 8];
+        let eud = EudView {
+            data: &eud_data,
+            base_dw: 12,
+        };
+
+        let mut tex = ShaderTextureResources::default();
+        let mut direct = [true; UserSgprInfo::SGPRS_MAX];
+        shader_get_texture_buffer(
+            &mut tex,
+            &mut direct,
+            0,
+            0,
+            ShaderTextureUsage::ReadOnly,
+            &user_sgpr,
+            Some(eud),
+        )
+        .expect("typed run at s0 resolves direct");
+        assert!(
+            !tex.desc[0].extended,
+            "a direct-resident T# must not be marked extended just because \
+             the shader carries an EUD"
+        );
+        assert_eq!(tex.desc[0].texture.fields[0], 0x9000_0000);
+
+        let mut bufs = ShaderStorageResources::default();
+        shader_get_storage_buffer(
+            &mut bufs,
+            &mut direct,
+            8,
+            0,
+            ShaderStorageUsage::ReadWrite,
+            &user_sgpr,
+            Some(eud),
+        )
+        .expect("typed run at s8 resolves direct");
+        assert!(
+            !bufs.extended[0],
+            "a direct-resident V# must not be marked extended just because \
+             the shader carries an EUD"
+        );
+        assert_eq!(bufs.buffers[0].fields[0], 0x8000_0008);
+
+        let mut samplers = ShaderSamplerResources::default();
+        let mut user_sgpr_s = UserSgprInfo::default();
+        for i in 0..4u32 {
+            user_sgpr_s.set(i, 0x5000_0000 + i, UserSgprType::Vsharp);
+        }
+        shader_get_sampler(&mut samplers, &mut direct, 0, 0, &user_sgpr_s, Some(eud))
+            .expect("typed run at s0 resolves direct");
+        assert!(
+            !samplers.extended[0],
+            "a direct-resident S# must not be marked extended just because \
+             the shader carries an EUD"
+        );
+    }
+
+    /// The V#-vs-T# disambiguation must key on the descriptor TYPE, not the
+    /// whole dword3 nibble: a buffer V# with OOB_SELECT=3 reads nibble 3 and
+    /// was misrouted into the texture path ("read-only texture type 3", 57
+    /// measured ASTRO.BOT CS dispatch skips). Image T# types are 8..15.
+    #[test]
+    fn sharp_dword3_buffer_vs_image_keys_on_the_type_field() {
+        // Buffer V#: type bits [30:31] = 0, any OOB_SELECT in [28:29].
+        for oob in 0..=3u32 {
+            assert!(
+                sharp_dword3_is_buffer(oob << 28),
+                "V# with oob_select={oob} must route as a buffer"
+            );
+        }
+        // Image T#: types 8..15 (bit 31 set).
+        for ty in 8..=15u32 {
+            assert!(
+                !sharp_dword3_is_buffer(ty << 28),
+                "T# type {ty} must route as an image"
+            );
+        }
+        // Lower dword3 bits (V# dst_sel/format fields) must not disturb it.
+        assert!(sharp_dword3_is_buffer((3 << 28) | 0x0fff_ffff));
+        assert!(!sharp_dword3_is_buffer((9 << 28) | 0x0fff_ffff));
+    }
+
+    /// The counterpart: a sharp whose run does NOT fit the typed file (the
+    /// measured ASTRO.BOT shape — T# declared at the EUD pointer pair's own
+    /// register) resolves EUD-resident and KEEPS `extended = true`.
+    #[test]
+    fn eud_resident_sharp_keeps_extended_flag() {
+        // Only the pointer pair (s12, s13) is written; s14+ untyped, so an
+        // 8-dword T# at start_register=12 cannot live in the file.
+        let mut user_sgpr = UserSgprInfo::default();
+        user_sgpr.set(12, 0x29b9_8350, UserSgprType::Unknown);
+        user_sgpr.set(13, 0, UserSgprType::Unknown);
+        let eud_data: [u32; 8] = core::array::from_fn(|i| 0xe0d0 + i as u32);
+        let eud = EudView {
+            data: &eud_data,
+            base_dw: 12,
+        };
+
+        let mut tex = ShaderTextureResources::default();
+        let mut direct = [true; UserSgprInfo::SGPRS_MAX];
+        shader_get_texture_buffer(
+            &mut tex,
+            &mut direct,
+            12,
+            0,
+            ShaderTextureUsage::ReadOnly,
+            &user_sgpr,
+            Some(eud),
+        )
+        .expect("run not fitting the typed file resolves from the EUD");
+        assert!(tex.desc[0].extended, "an EUD-resident T# stays extended");
+        assert_eq!(tex.desc[0].texture.fields[0], eud_data[0]);
+
+        // start >= SGPRS_MAX: the file-continuation rebase is EUD-resident too.
+        let mut bufs = ShaderStorageResources::default();
+        shader_get_storage_buffer(
+            &mut bufs,
+            &mut direct,
+            UserSgprInfo::SGPRS_MAX as i32,
+            0,
+            ShaderStorageUsage::ReadOnly,
+            &user_sgpr,
+            Some(eud),
+        )
+        .expect("start >= SGPRS_MAX rebases into the EUD");
+        assert!(bufs.extended[0], "a file-continuation V# stays extended");
+        assert_eq!(bufs.buffers[0].fields[0], eud_data[0]);
     }
 
     #[test]

@@ -41,6 +41,12 @@ pub enum ShaderInstructionType {
     /// nonzero immediate offset). 116 dispatches in the measured window.
     BufferLoadDwordX3,
     BufferLoadDwordX4,
+    /// MUBUF 0x08: single byte load, zero-extended into the VGPR. Kyty
+    /// leaves it `KYTY_NI`; measured on ASTRO.BOT scene compute (raw
+    /// 0xe02020c0, idxen with immediate offset 0xc0; 58 dispatches/run).
+    /// The recompiler loads the containing dword and extracts the byte at
+    /// `(byte_addr & 3) * 8` — the byte address is NOT pre-divided by 4.
+    BufferLoadUbyte,
     BufferLoadFormatX,
     BufferLoadFormatXy,
     BufferLoadFormatXyz,
@@ -80,6 +86,11 @@ pub enum ShaderInstructionType {
     /// Extends the b64 model: dst = 4 consecutive VGPRs, src0 = address,
     /// src1 = the byte offset literal (dword k reads at `offset + 4k`).
     DsReadB128,
+    /// DS 0xfe: three CONSECUTIVE LDS dwords read at the single 16-bit byte
+    /// offset into `vdst..vdst+2` (RDNA2 ISA `DS_READ_B96`). Kyty
+    /// `KYTY_NI`; measured on ASTRO.BOT scene compute (raw 0xdbf80550,
+    /// 58 dispatches/run). Same model as `DsReadB128` with three dwords.
+    DsReadB96,
     /// DS 0x36: LDS (workgroup-shared) dword read. Kyty leaves it `KYTY_NI`
     /// (only the GDS append/consume pair is implemented upstream); lowered to
     /// an `OpLoad` from the `%lds` Workgroup array. Read twin of `DsWriteB32`.
@@ -567,6 +578,10 @@ pub mod shader_instruction_format {
         /// consecutive VGPRs, src0 = address VGPR, src1 = the 16-bit byte
         /// offset as a literal constant (dword k reads at `offset + 4k`).
         Vdst4Vsrc0Vsrc1 = format_define(&[DA4, S0, S1]),
+        /// Beyond Kyty: `ds_read_b96 vdst[3], addr [offset]` — the
+        /// three-dword row of the same model (dword k reads at
+        /// `offset + 4k`).
+        Vdst3Vsrc0Vsrc1 = format_define(&[DA3, S0, S1]),
         /// Beyond Kyty: `ds_write_b32 addr, data0 [offset]` — src0 = address
         /// VGPR, src1 = data VGPR, src2 = the 16-bit instruction byte offset
         /// as a literal constant.

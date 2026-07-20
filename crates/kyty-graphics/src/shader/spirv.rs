@@ -701,6 +701,46 @@ pub(crate) const BUFFER_LOAD_FLOAT1: &str = r#"
                OpFunctionEnd
 "#;
 
+/// Beyond Kyty (`buffer_load_ubyte` is `KYTY_NI` upstream): single byte
+/// load, zero-extended. The address model is the same BYTE address the
+/// float1 helper computes (`offset + index * stride`) — it is NOT
+/// pre-divided by 4: the containing dword is `byte_addr / 4` and the byte
+/// within it is `byte_addr & 3`, extracted with `OpBitFieldUExtract` at bit
+/// offset `(byte_addr & 3) * 8`, width 8. Measured on ASTRO.BOT scene
+/// compute (raw 0xe02020c0, 58 dispatches/run).
+pub(crate) const BUFFER_LOAD_UBYTE: &str = r#"
+             ; void buffer_load_ubyte(out float p1, in int index, in int offset, in int stride, in int buffer_index)
+             ; {
+             ; 	int byte_addr = offset + index * stride;
+             ; 	uint dw = floatBitsToUint(buf[buffer_index].data[byte_addr / 4]);
+             ; 	p1 = uintBitsToFloat(bitfieldExtract(dw, (byte_addr & 3) * 8, 8));
+             ; }
+%buffer_load_ubyte = OpFunction %void None %function_buffer_load_store_float1
+         %buf_l_ub_11 = OpFunctionParameter %_ptr_Function_float
+         %buf_l_ub_12 = OpFunctionParameter %_ptr_Function_int
+         %buf_l_ub_13 = OpFunctionParameter %_ptr_Function_int
+         %buf_l_ub_14 = OpFunctionParameter %_ptr_Function_int
+         %buf_l_ub_15 = OpFunctionParameter %_ptr_Function_int
+         %buf_l_ub_17 = OpLabel
+         %buf_l_ub_43 = OpLoad %int %buf_l_ub_13
+         %buf_l_ub_44 = OpLoad %int %buf_l_ub_12
+         %buf_l_ub_45 = OpLoad %int %buf_l_ub_14
+         %buf_l_ub_46 = OpIMul %int %buf_l_ub_44 %buf_l_ub_45
+         %buf_l_ub_47 = OpIAdd %int %buf_l_ub_43 %buf_l_ub_46
+         %buf_l_ub_49 = OpSDiv %int %buf_l_ub_47 %int_4
+         %buf_l_ub_50 = OpBitwiseAnd %int %buf_l_ub_47 %int_3
+         %buf_l_ub_51 = OpIMul %int %buf_l_ub_50 %int_8
+         %buf_l_ub_57 = OpLoad %int %buf_l_ub_15
+         %buf_l_ub_62 = OpAccessChain %_ptr_StorageBuffer_float %buf %buf_l_ub_57 %int_0 %buf_l_ub_49
+         %buf_l_ub_63 = OpLoad %float %buf_l_ub_62
+         %buf_l_ub_64 = OpBitcast %uint %buf_l_ub_63
+         %buf_l_ub_65 = OpBitFieldUExtract %uint %buf_l_ub_64 %buf_l_ub_51 %int_8
+         %buf_l_ub_66 = OpBitcast %float %buf_l_ub_65
+               OpStore %buf_l_ub_11 %buf_l_ub_66
+               OpReturn
+               OpFunctionEnd
+"#;
+
 /// Kyty: ShaderSpirv.cpp `BUFFER_LOAD_FLOAT4` (L598).
 pub(crate) const BUFFER_LOAD_FLOAT4: &str = r#"
              ; Function buffer_load_float4
@@ -3049,6 +3089,7 @@ impl<'a> Spirv<'a> {
             T::DsWriteB32,
             T::DsRead2B32,
             T::DsReadB64,
+            T::DsReadB96,
             T::DsReadB128,
             T::DsWriteB96,
             T::DsWriteB128,
@@ -4014,6 +4055,10 @@ impl<'a> Spirv<'a> {
             self.source += TBUFFER_LOAD_FORMAT_XYZW;
         }
 
+        if has_buffers && self.code.has_any_of(&[T::BufferLoadUbyte]) {
+            self.source += BUFFER_LOAD_UBYTE;
+        }
+
         if has_buffers
             && self.code.has_any_of(&[
                 T::BufferStoreDword,
@@ -4131,18 +4176,21 @@ impl<'a> Spirv<'a> {
             // The LDS index clamp bound (see recompile_ds_write/read_b32).
             self.add_constant_uint(self.lds_size_dw() - 1);
         }
-        // DS_READ_B128 derives its 2nd..4th dword offsets from the single
-        // encoded byte-offset literal (`offset + 4k`) — materialise them so
-        // the recompiler's `get_constant_uint` lookups resolve.
-        let b128_offsets: Vec<u32> = self
+        // DS_READ_B96/B128 derive their 2nd..Nth dword offsets from the
+        // single encoded byte-offset literal (`offset + 4k`) — materialise
+        // them so the recompiler's `get_constant_uint` lookups resolve.
+        let multi_dw_read_offsets: Vec<(u32, u32)> = self
             .code
             .get_instructions()
             .iter()
-            .filter(|i| i.type_ == ShaderInstructionType::DsReadB128)
-            .map(|i| i.src[1].constant.u)
+            .filter_map(|i| match i.type_ {
+                ShaderInstructionType::DsReadB96 => Some((i.src[1].constant.u, 3)),
+                ShaderInstructionType::DsReadB128 => Some((i.src[1].constant.u, 4)),
+                _ => None,
+            })
             .collect();
-        for off in b128_offsets {
-            for k in 1..4 {
+        for (off, n) in multi_dw_read_offsets {
+            for k in 1..n {
                 self.add_constant_uint(off + 4 * k);
             }
         }

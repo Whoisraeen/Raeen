@@ -2790,7 +2790,17 @@ fn shader_parse_mubuf(
             inst.src[1].size = 4;
             inst.dst.size = 4;
         }
-        0x08 => return Err(ni(dst, S, "buffer_load_ubyte", opcode, pc, b0)),
+        // Beyond Kyty (KYTY_NI upstream): single byte load, zero-extended.
+        // Measured on ASTRO.BOT scene compute (raw 0xe02020c0: idxen with
+        // immediate offset 0xc0; 58 dispatches/run). Same flexible
+        // addressing quartet as buffer_load_dword; the recompiler extracts
+        // the byte from the containing dword.
+        0x08 => {
+            inst.type_ = T::BufferLoadUbyte;
+            inst.format = format1;
+            inst.src[0].size = src0_size;
+            inst.src[1].size = 4;
+        }
         0x09 => return Err(ni(dst, S, "buffer_load_sbyte", opcode, pc, b0)),
         0x0a => return Err(ni(dst, S, "buffer_load_ushort", opcode, pc, b0)),
         0x0b => return Err(ni(dst, S, "buffer_load_sshort", opcode, pc, b0)),
@@ -3203,7 +3213,25 @@ fn shader_parse_ds(
             inst.src_num = 3;
         }
         0xfd => return Err(ni(dst, S, "ds_condxchg32_rtn_b128", opcode, pc, b0)),
-        0xfe => return Err(ni(dst, S, "ds_read_b96", opcode, pc, b0)),
+        // Beyond Kyty (KYTY_NI upstream): three consecutive LDS dwords read
+        // at the single 16-bit byte offset (RDNA2 `DS_READ_B96`) — measured
+        // on ASTRO.BOT scene compute (raw 0xdbf80550, 58 dispatches/run).
+        // The three-dword row of the b128 model below.
+        0xfe => {
+            if gds != 0 {
+                return Err(feature(S, "ds_read_b96 with gds == 1", pc));
+            }
+            if data0 != 0 || data1 != 0 {
+                return Err(feature(S, "ds_read_b96 with data operands", pc));
+            }
+            inst.type_ = T::DsReadB96;
+            inst.format = F::Vdst3Vsrc0Vsrc1;
+            inst.dst.size = 3;
+            inst.src[0] = operand_parse(addr + 256)?;
+            inst.src[1].type_ = O::LiteralConstant;
+            inst.src[1].constant.u = offset0 | (offset1 << 8);
+            inst.src_num = 2;
+        }
         // Beyond Kyty (KYTY_NI upstream): four consecutive LDS dwords read
         // at the single 16-bit BYTE offset (RDNA2 ISA `DS_READ_B128`) —
         // measured on ASTRO.BOT scene compute (58 dispatches/run). Extends
