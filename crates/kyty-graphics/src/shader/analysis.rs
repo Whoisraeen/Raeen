@@ -358,41 +358,52 @@ fn read_sharp_fields(
             "sharp start_register beyond the user SGPR file (start_register={start_index})"
         )));
     }
-    if extended && (start_index as usize) < UserSgprInfo::SGPRS_MAX {
-        return Err(ni(
-            "sharp start_register below the user SGPR file with extended buffer",
-        ));
-    }
     let start = usize::try_from(start_index).map_err(|_| trunc("negative sharp start register"))?;
 
-    match extended_buffer {
-        None => {
-            for (j, dw) in out.iter_mut().enumerate() {
-                let idx = start + j;
-                let type_ = *user_sgpr
-                    .type_
-                    .get(idx)
-                    .ok_or_else(|| trunc("sharp registers beyond SGPRS_MAX"))?;
-                if type_ != UserSgprType::Vsharp && type_ != UserSgprType::Region {
-                    return Err(ni("user sgpr type is not Vsharp/Region"));
-                }
-                direct_sgprs[idx] = false;
-                *dw = user_sgpr.value[idx];
+    // Residence is decided by the register INDEX, not by whether an EUD
+    // exists: a shader with an extended buffer still keeps some sharps
+    // resident in its real user SGPRs. Kyty's legacy walk gets this for free
+    // (usage slots before the 0x1b entry see a null extended_buffer), but
+    // the Gen5 usage2 tables resolve every sharp with the recovered EUD in
+    // hand, so Kyty's "extended && start < file" EXIT refused every
+    // direct-resident sharp of a mixed shader — 346 measured ASTRO.BOT CS
+    // failures. Direct reads stay self-validating through the Vsharp/Region
+    // type check below.
+    if start < UserSgprInfo::SGPRS_MAX {
+        for (j, dw) in out.iter_mut().enumerate() {
+            let idx = start + j;
+            let type_ = *user_sgpr
+                .type_
+                .get(idx)
+                .ok_or_else(|| trunc("sharp registers beyond SGPRS_MAX"))?;
+            if type_ != UserSgprType::Vsharp && type_ != UserSgprType::Region {
+                // Evidence-rich: this is the residual frontier of the mixed
+                // direct/EUD routing above — the measured values (start
+                // register, captured count, EUD length) are what decide any
+                // alternative rebase interpretation.
+                return Err(ni_owned(format!(
+                    "user sgpr type is not Vsharp/Region ({type_:?} at s{idx}; \
+                     sharp start_register={start_index}, captured={}, eud={})",
+                    user_sgpr.count,
+                    extended_buffer.map_or(0, <[u32]>::len),
+                )));
             }
+            direct_sgprs[idx] = false;
+            *dw = user_sgpr.value[idx];
         }
-        Some(ext) => {
-            // The EUD is addressed as a continuation of the user-SGPR file, so
-            // the rebase is the file SIZE, not a literal 16 (Kyty's 16 was the
-            // PS4 user-SGPR count). Measured on ASTRO.BOT: a shader with
-            // eud_size_dw=8 places a sharp at offset_dw=32 while its other
-            // sharps sit direct at s0/s8 — under a `-16` rebase that reads
-            // ext[16], past the end of an 8-dword EUD; under `-32` it reads
-            // ext[0], the buffer's first descriptor, which fits.
-            for (j, dw) in out.iter_mut().enumerate() {
-                *dw = *ext
-                    .get(start - UserSgprInfo::SGPRS_MAX + j)
-                    .ok_or_else(|| trunc("extended (EUD) buffer too small"))?;
-            }
+    } else {
+        // The EUD is addressed as a continuation of the user-SGPR file, so
+        // the rebase is the file SIZE, not a literal 16 (Kyty's 16 was the
+        // PS4 user-SGPR count). Measured on ASTRO.BOT: a shader with
+        // eud_size_dw=8 places a sharp at offset_dw=32 while its other
+        // sharps sit direct at s0/s8 — under a `-16` rebase that reads
+        // ext[16], past the end of an 8-dword EUD; under `-32` it reads
+        // ext[0], the buffer's first descriptor, which fits.
+        let ext = extended_buffer.expect("start >= SGPRS_MAX without EUD is refused above");
+        for (j, dw) in out.iter_mut().enumerate() {
+            *dw = *ext
+                .get(start - UserSgprInfo::SGPRS_MAX + j)
+                .ok_or_else(|| trunc("extended (EUD) buffer too small"))?;
         }
     }
     Ok(())
@@ -645,8 +656,11 @@ pub fn shader_get_direct_sgpr(
     }
     let index = info.sgprs_num as usize;
 
-    if start_index >= 16 {
-        return Err(ni("direct sgpr start_register >= 16"));
+    // Kyty bounds this at 16 (the PS4 user-SGPR file); Gen5 stages have 32
+    // real user SGPRs (see `UserSgprInfo::SGPRS_MAX`), and SRT data can sit
+    // anywhere in the file.
+    if start_index >= UserSgprInfo::SGPRS_MAX as i32 {
+        return Err(ni("direct sgpr start_register beyond the user SGPR file"));
     }
     let start = usize::try_from(start_index).map_err(|_| trunc("negative direct sgpr register"))?;
 
@@ -1067,8 +1081,33 @@ pub fn shader_parse_usage2(
             if sgprs.is_empty() { " (none)" } else { &sgprs }
         )));
     }
-    if user_data.srt_size_dw != 0 {
-        return Err(ni("ShaderUserData srt_size_dw != 0"));
+    // SRT (Shader Resource Table) — beyond Kyty, which EXIT_NOT_IMPLEMENTEDs
+    // on any srt_size_dw (Shader.cpp L1529). The SRT is an app-defined block
+    // of raw dwords that lives INLINE in the user-data registers: the driver
+    // copies `srt_size_dw` dwords into the user SGPRs and the shader indexes
+    // them directly (SharpEmu's Gen5 evaluator likewise reads SRT content
+    // straight out of the captured user data). No table entry names the SRT
+    // registers — they are exactly the declared registers the direct/sharp
+    // mapping tables below do NOT consume, and the direct-SGPR collection at
+    // the end of this function binds every one of those with its captured
+    // runtime value (push-constant seeded), which IS the hardware semantic.
+    // An SRT larger than the declared register file spills to memory we have
+    // no pointer for — keep that case an evidence-rich named refusal.
+    if user_data.srt_size_dw != 0 && i32::from(user_data.srt_size_dw) > user_sgpr_num {
+        let mut sgprs = String::new();
+        for (i, &v) in user_sgpr.value.iter().enumerate() {
+            if v != 0 {
+                let _ = std::fmt::Write::write_fmt(&mut sgprs, format_args!(" s{i}={v:#x}"));
+            }
+        }
+        return Err(ni_owned(format!(
+            "ShaderUserData srt_size_dw ({}) exceeds the declared user-SGPR file \
+             (declared={user_sgpr_num}, captured={}, eud_size_dw={}), nonzero sgprs:{}",
+            user_data.srt_size_dw,
+            user_sgpr.count,
+            user_data.eud_size_dw,
+            if sgprs.is_empty() { " (none)" } else { &sgprs }
+        )));
     }
 
     // Kyty leaves this None (no EUD support); increment 3 supplies the buffer
@@ -1121,6 +1160,41 @@ pub fn shader_parse_usage2(
                 info.vertex_attrib_reg = reg;
                 clear_direct(&mut direct_sgprs, offset as usize)?;
                 clear_direct(&mut direct_sgprs, offset as usize + 1)?;
+            }
+
+            // Direct type 1 — IMM_SAMPLER, beyond Kyty (upstream EXITs on
+            // anything but 8/10). The S# sampler descriptor is preloaded
+            // into 4 user SGPRs at `offset`; route it into
+            // `ShaderSamplerResources` exactly like the legacy usage-0x01
+            // arm does via `ShaderGetSampler` (Kyty Shader.cpp L1421/L1233).
+            // The direct table has one entry per type, so the slot is 0.
+            // 738 measured ASTRO.BOT CS failures (the error site prints
+            // 0x0001, the 4-hex-digit form — same round-1 lesson as type 5
+            // below: the LEGACY table alone is not enough).
+            1 => {
+                shader_get_sampler(
+                    &mut bind.samplers,
+                    &mut direct_sgprs,
+                    reg,
+                    0,
+                    user_sgpr,
+                    extended_buffer,
+                )?;
+                info.samplers += 1;
+            }
+
+            // Direct type 5 — beyond Kyty (upstream EXITs on anything but
+            // 8/10). Round 1 added an IMM_ALU_FLOAT_CONST arm to the LEGACY
+            // `shader_parse_usage` for this number, but the 230 measured
+            // ASTRO.BOT CS failures come through THIS Gen5 table (the error
+            // site prints 0x0005, the 4-hex-digit form). Same treatment as
+            // the legacy arm: the register holds immediate data the driver
+            // preloaded — nothing to bind, leaving it marked direct routes
+            // its captured value through the direct-SGPR pass, which IS the
+            // semantic. SharpEmu's Gen5 path likewise only records the
+            // direct table and reads the register values verbatim.
+            5 => {
+                tracing::debug!(reg, "usage2: direct type 5 (immediate) left as direct sgpr");
             }
 
             t => {
@@ -1628,18 +1702,23 @@ fn read_extended_user_data(
     // than an error. Narrow it (e.g. by preferring the earliest load, or by
     // validating descriptor shape) if a title renders wrong data.
     let trace = std::env::var_os("XPS5X_TRACE_EUD").is_some();
-    let Some(src) = mem.dwords_at(shader_addr) else {
-        if trace {
-            tracing::warn!("TRACE_EUD2 {shader_addr:#x}: shader code not mapped");
-        }
-        return None;
-    };
+    // A shader that is unmapped or unparseable yields no scalar-load bases,
+    // but must NOT abort the resolver — strategy 3 below works from the
+    // captured registers alone.
     let mut code = ShaderCode::new();
-    if let Err(e) = shader_parse(0, &src, &mut code, next_gen) {
-        if trace {
-            tracing::warn!("TRACE_EUD2 {shader_addr:#x}: shader_parse failed: {e}");
+    match mem.dwords_at(shader_addr) {
+        Some(src) => {
+            if let Err(e) = shader_parse(0, &src, &mut code, next_gen) {
+                if trace {
+                    tracing::warn!("TRACE_EUD2 {shader_addr:#x}: shader_parse failed: {e}");
+                }
+            }
         }
-        return None;
+        None => {
+            if trace {
+                tracing::warn!("TRACE_EUD2 {shader_addr:#x}: shader code not mapped");
+            }
+        }
     }
     let loads = find_scalar_load_bases(&code);
     if trace {
@@ -1666,10 +1745,41 @@ fn read_extended_user_data(
             detail.join(" ")
         );
     }
-    loads
+    if let Some(buf) = loads
         .into_iter()
         .filter_map(|load| scalar_load_target_address(&load, user_sgpr))
         .find_map(read_at)
+    {
+        return Some(buf);
+    }
+
+    // Strategy 3 — scan EVERY adjacent SGPR pair (sN lo, sN+1 hi) for a
+    // readable guest pointer. Measured on ASTRO.BOT compute (declared=14
+    // count=14): strategies 1-2 find nothing, but (s12,s13) =
+    // 0x4_00506730 — squarely in the direct-memory guest range
+    // (0x4_00000000..) — backs a descriptor table of eud_size_dw dwords.
+    // False-positive guards: the hi dword must be a small nonzero value
+    // (real guest highs are 0x4..0x5 for direct memory, low tens for GPU
+    // apertures; ALU constants and packed fields read far larger), and the
+    // read itself must succeed with at least eud_size_dw dwords behind it.
+    let count = (user_sgpr.count.max(4) as usize).min(UserSgprInfo::SGPRS_MAX);
+    for i in 0..count.saturating_sub(1) {
+        let hi = user_sgpr.value[i + 1];
+        if hi == 0 || hi >= 0x100 {
+            continue;
+        }
+        let pair = u64::from(user_sgpr.value[i]) | (u64::from(hi) << 32);
+        if let Some(buf) = read_at(pair) {
+            tracing::debug!(
+                shader_addr = format_args!("{shader_addr:#x}"),
+                pair_register = i,
+                pointer = format_args!("{pair:#x}"),
+                "EUD recovered by adjacent-pair scan (strategy 3)"
+            );
+            return Some(buf);
+        }
+    }
+    None
 }
 
 /// `user_sgpr.value[reg] | value[reg + 1] << 32` — the 64-bit pointer Kyty
@@ -2009,6 +2119,8 @@ pub fn shader_get_input_info_cs(
     info.thread_ids_num = i32::from(regs.cs_regs.tidig_comp_cnt) + 1;
 
     info.workgroup_register = i32::from(regs.cs_regs.user_sgpr);
+    // COMPUTE_PGM_RSRC2.LDS_SIZE counts 128-dword granules (GFX10).
+    info.lds_size_dw = u32::from(regs.cs_regs.lds_size) * 128;
 
     info.bind.push_constant_offset = 0;
     info.bind.push_constant_size = 0;
@@ -2059,13 +2171,24 @@ pub fn shader_get_input_info_cs(
         )?;
     }
 
-    if usage.samplers > 0 {
+    // Kyty EXITs on CS samplers (Shader.cpp ShaderGetInputInfoCS L1832) — a
+    // PS4-era invariant. Gen5 CS shaders sample textures (IMM_SAMPLER usage
+    // slots, measured 738/5min on ASTRO.BOT); the sampler binding is
+    // stage-agnostic in both the SPIR-V emission (`%samplers` array) and the
+    // dispatch path (`prepare_stage_binding` with COMPUTE), so on next_gen
+    // they flow through like the other stages.
+    if usage.samplers > 0 && !next_gen {
         return Err(ni("cs: samplers"));
     }
     if usage.fetch || usage.vertex_buffer || usage.vertex_attrib {
         return Err(ni("cs: fetch / vertex buffer / vertex attrib"));
     }
-    if usage.direct_sgprs > 0 {
+    // Kyty EXITs on CS direct SGPRs (Shader.cpp ShaderGetInputInfoCS L1836) —
+    // a PS4-era invariant where CS user data was always fully consumed by the
+    // usage slots. Gen5 CS shaders carry raw data in user SGPRs (SRT blocks,
+    // direct type-5 immediates), so on next_gen they flow through the
+    // push-constant direct-SGPR path exactly like the other stages.
+    if usage.direct_sgprs > 0 && !next_gen {
         return Err(ni("cs: direct sgprs"));
     }
 
@@ -2947,10 +3070,15 @@ mod tests {
         let mut info = ShaderParsedUsage::default();
         let mut bind = ShaderBindResources::default();
         let sgpr = UserSgprInfo::default(); // all Unknown
-        assert!(matches!(
-            shader_parse_usage(&code, &mem, &mut info, &mut bind, &sgpr, 4),
-            Err(ShaderAnalysisError::NotImplemented { .. })
-        ));
+        match shader_parse_usage(&code, &mem, &mut info, &mut bind, &sgpr, 4) {
+            Err(ShaderAnalysisError::NotImplementedOwned { what }) => {
+                // The refusal is instrumented (start register + measured
+                // counts) since the mixed direct/EUD routing landed.
+                assert!(what.contains("not Vsharp/Region"), "{what}");
+                assert!(what.contains("start_register=0"), "{what}");
+            }
+            other => panic!("expected instrumented type refusal, got {other:?}"),
+        }
     }
 
     // ---- 7. Input infos ----
@@ -3632,5 +3760,361 @@ mod tests {
             }
             other => panic!("expected owned EUD diagnostic, got {other:?}"),
         }
+    }
+
+    /// An inline SRT (srt_size_dw <= the declared register file) proceeds:
+    /// the SRT dwords ARE the unconsumed user SGPRs, and the direct-SGPR
+    /// collection binds them with their captured runtime values. This was the
+    /// single biggest ASTRO.BOT bucket (813 refusals / 5 min).
+    #[test]
+    fn parse_usage2_inline_srt_binds_registers_as_direct_sgprs() {
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[0] = 0x1111_1111;
+        value[1] = 0x2222_2222;
+        value[2] = 0x3333_3333;
+        value[3] = 0x4444_4444;
+        let user_sgpr = UserSgprInfo {
+            value,
+            type_: [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX],
+            count: 4,
+        };
+        let user_data = ShaderUserData {
+            direct_resource_offset: vec![0xffff; 8],
+            sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+            eud_size_dw: 0,
+            srt_size_dw: 4,
+        };
+        let mut info = ShaderParsedUsage::default();
+        let mut bind = ShaderBindResources::default();
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 4, None)
+            .expect("an inline SRT must not be refused");
+        assert_eq!(info.direct_sgprs, 4);
+        assert_eq!(bind.direct_sgprs.sgprs_num, 4);
+        assert_eq!(&bind.direct_sgprs.start_register[..4], &[0, 1, 2, 3]);
+        assert_eq!(bind.direct_sgprs.sgprs[0].field, 0x1111_1111);
+        assert_eq!(bind.direct_sgprs.sgprs[3].field, 0x4444_4444);
+    }
+
+    /// An SRT larger than the declared register file spills to memory we have
+    /// no pointer for — that stays an evidence-rich named refusal.
+    #[test]
+    fn parse_usage2_spilled_srt_is_named_refusal() {
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[0] = 0xdead_beef;
+        let user_sgpr = UserSgprInfo {
+            value,
+            type_: [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX],
+            count: 4,
+        };
+        let user_data = ShaderUserData {
+            direct_resource_offset: vec![0xffff; 8],
+            sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+            eud_size_dw: 0,
+            srt_size_dw: 20,
+        };
+        let mut info = ShaderParsedUsage::default();
+        let mut bind = ShaderBindResources::default();
+        match shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 4, None) {
+            Err(ShaderAnalysisError::NotImplementedOwned { what }) => {
+                assert!(what.contains("srt_size_dw (20)"), "{what}");
+                assert!(what.contains("declared=4"), "{what}");
+                assert!(what.contains("s0=0xdeadbeef"), "{what}");
+            }
+            other => panic!("expected owned SRT diagnostic, got {other:?}"),
+        }
+    }
+
+    /// Gen5 direct table type 5 (round 1 wired the LEGACY 0x05 arm, but the
+    /// 230 measured refusals print `0x0005` — this table). The register holds
+    /// immediate data: nothing is bound and it stays direct.
+    #[test]
+    fn parse_usage2_direct_type5_leaves_register_direct() {
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[2] = 0x3f80_0000; // 1.0f — an immediate ALU constant
+        let user_sgpr = UserSgprInfo {
+            value,
+            type_: [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX],
+            count: 3,
+        };
+        let mut direct = vec![0xffff_u16; 8];
+        direct[5] = 2; // type 5 at register s2
+        let user_data = ShaderUserData {
+            direct_resource_offset: direct,
+            sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+            eud_size_dw: 0,
+            srt_size_dw: 0,
+        };
+        let mut info = ShaderParsedUsage::default();
+        let mut bind = ShaderBindResources::default();
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 3, None)
+            .expect("direct type 5 must not be refused");
+        assert_eq!(info.direct_sgprs, 3, "s0..s2 all stay direct");
+        assert_eq!(bind.direct_sgprs.sgprs[2].field, 0x3f80_0000);
+    }
+
+    /// Gen5 direct table type 1 (IMM_SAMPLER) — previously the 4-digit
+    /// `unknown usage type: 0x0001` refusal (738 measured ASTRO.BOT CS
+    /// failures). The S# in 4 user SGPRs routes into
+    /// `ShaderSamplerResources` exactly like the legacy usage-0x01 arm.
+    #[test]
+    fn parse_usage2_direct_type1_binds_imm_sampler() {
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[4] = 0x1111_0000;
+        value[5] = 0x2222_0000;
+        value[6] = 0x3333_0000;
+        value[7] = 0x4444_0000;
+        let mut type_ = [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX];
+        type_[4..8].fill(UserSgprType::Vsharp);
+        let user_sgpr = UserSgprInfo {
+            value,
+            type_,
+            count: 8,
+        };
+        let mut direct = vec![0xffff_u16; 8];
+        direct[1] = 4; // IMM_SAMPLER at s4..s7
+        let user_data = ShaderUserData {
+            direct_resource_offset: direct,
+            sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+            eud_size_dw: 0,
+            srt_size_dw: 0,
+        };
+        let mut info = ShaderParsedUsage::default();
+        let mut bind = ShaderBindResources::default();
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 8, None)
+            .expect("direct type 1 (IMM_SAMPLER) must bind");
+        assert_eq!(info.samplers, 1);
+        assert_eq!(bind.samplers.samplers_num, 1);
+        assert_eq!(bind.samplers.start_register[0], 4);
+        assert_eq!(bind.samplers.slots[0], 0);
+        assert_eq!(
+            bind.samplers.samplers[0].fields,
+            [0x1111_0000, 0x2222_0000, 0x3333_0000, 0x4444_0000]
+        );
+        // s4..s7 consumed; s0..s3 stay direct.
+        assert_eq!(info.direct_sgprs, 4);
+        assert_eq!(&bind.direct_sgprs.start_register[..4], &[0, 1, 2, 3]);
+    }
+
+    /// A sharp resident in the real user SGPRs must read direct even when an
+    /// EUD exists — residence is decided by the register index, not by EUD
+    /// presence (Kyty's legacy walk resolves pre-0x1b slots with a null
+    /// extended_buffer; the Gen5 tables see the EUD for every sharp).
+    /// Previously "sharp start_register below the user SGPR file with
+    /// extended buffer" (346 measured ASTRO.BOT CS failures).
+    #[test]
+    fn sharp_below_the_file_reads_direct_when_eud_present() {
+        let mut user_sgpr = UserSgprInfo::default();
+        for (i, dw) in [0xaaaa_0000u32, 0xbbbb_1111, 0xcccc_2222, 0xdddd_3333]
+            .into_iter()
+            .enumerate()
+        {
+            user_sgpr.set(i as u32, dw, UserSgprType::Vsharp);
+        }
+        let eud = [0x9999_0000u32, 0x9999_0001, 0x9999_0002, 0x9999_0003];
+        let mut direct = [true; UserSgprInfo::SGPRS_MAX];
+        let mut out = [0u32; 4];
+        read_sharp_fields(&mut direct, 0, &user_sgpr, Some(&eud), &mut out)
+            .expect("a direct-resident sharp must not be refused because an EUD exists");
+        assert_eq!(
+            out,
+            [0xaaaa_0000, 0xbbbb_1111, 0xcccc_2222, 0xdddd_3333],
+            "values come from the user SGPRs, not the EUD"
+        );
+
+        // A sharp at the file boundary still reads the EUD (rebase -32).
+        let mut direct2 = [true; UserSgprInfo::SGPRS_MAX];
+        let mut out2 = [0u32; 4];
+        read_sharp_fields(
+            &mut direct2,
+            UserSgprInfo::SGPRS_MAX as i32,
+            &user_sgpr,
+            Some(&eud),
+            &mut out2,
+        )
+        .expect("EUD sharp at the rebased origin");
+        assert_eq!(out2, eud);
+
+        // The residual frontier is instrumented: an unwritten register with
+        // an EUD present names the start register and the measured counts.
+        let mut direct3 = [true; UserSgprInfo::SGPRS_MAX];
+        let mut out3 = [0u32; 4];
+        match read_sharp_fields(&mut direct3, 16, &user_sgpr, Some(&eud), &mut out3) {
+            Err(ShaderAnalysisError::NotImplementedOwned { what }) => {
+                assert!(what.contains("start_register=16"), "{what}");
+                assert!(what.contains("captured=4"), "{what}");
+                assert!(what.contains("eud=4"), "{what}");
+            }
+            other => panic!("expected instrumented type refusal, got {other:?}"),
+        }
+    }
+
+    /// Gen5 CS with a sampler: Kyty's "cs: samplers" EXIT is a PS4-era
+    /// invariant, relaxed on next_gen (738 measured IMM_SAMPLER CS
+    /// dispatches on ASTRO.BOT).
+    #[test]
+    fn cs_next_gen_sampler_is_allowed() {
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[4] = 0x1111_0000;
+        let mut type_ = [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX];
+        type_[4..8].fill(UserSgprType::Vsharp);
+        let regs = ComputeShaderInfo {
+            cs_regs: crate::shader::hw_regs::CsStageRegisters {
+                data_addr: 0x6000,
+                num_thread_x: 8,
+                num_thread_y: 8,
+                num_thread_z: 1,
+                user_sgpr: 8,
+                ..Default::default()
+            },
+            cs_user_sgpr: UserSgprInfo {
+                value,
+                type_,
+                count: 8,
+            },
+        };
+        let mem = TestMem {
+            regions: vec![(0x6000, vec![S_ENDPGM])],
+        };
+        let mut direct = vec![0xffff_u16; 8];
+        direct[1] = 4;
+        let mut map = ShaderMap::new();
+        map.map_user_data(
+            0x6000,
+            ShaderMappedData {
+                user_data: Some(ShaderUserData {
+                    direct_resource_offset: direct,
+                    sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+                    eud_size_dw: 0,
+                    srt_size_dw: 0,
+                }),
+                input_semantics: vec![],
+            },
+        );
+        let sh = ShaderRegisters::default();
+        let mut info = ShaderComputeInputInfo::default();
+        shader_get_input_info_cs(&regs, &sh, &mem, &map, true, &mut info)
+            .expect("next-gen CS with an IMM_SAMPLER must analyse");
+        assert_eq!(info.bind.samplers.samplers_num, 1);
+    }
+
+    /// Gen5 CS end-to-end: an inline-SRT shader analyses to completion, with
+    /// the SRT registers bound as direct SGPRs (Kyty's "cs: direct sgprs"
+    /// EXIT is a PS4-era invariant and is relaxed on next_gen), and
+    /// COMPUTE_PGM_RSRC2.LDS_SIZE lands in `lds_size_dw` (128-dword units).
+    #[test]
+    fn cs_next_gen_inline_srt_analyses_with_direct_sgprs() {
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[0] = 0xAAAA_0001;
+        value[1] = 0xAAAA_0002;
+        let regs = ComputeShaderInfo {
+            cs_regs: crate::shader::hw_regs::CsStageRegisters {
+                data_addr: 0x6000,
+                num_thread_x: 8,
+                num_thread_y: 8,
+                num_thread_z: 1,
+                user_sgpr: 2,
+                lds_size: 2,
+                ..Default::default()
+            },
+            cs_user_sgpr: UserSgprInfo {
+                value,
+                type_: [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX],
+                count: 2,
+            },
+        };
+        let mem = TestMem {
+            regions: vec![(0x6000, vec![S_ENDPGM])],
+        };
+        let mut map = ShaderMap::new();
+        map.map_user_data(
+            0x6000,
+            ShaderMappedData {
+                user_data: Some(ShaderUserData {
+                    direct_resource_offset: vec![0xffff; 8],
+                    sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+                    eud_size_dw: 0,
+                    srt_size_dw: 2,
+                }),
+                input_semantics: vec![],
+            },
+        );
+        let sh = ShaderRegisters::default();
+        let mut info = ShaderComputeInputInfo::default();
+        shader_get_input_info_cs(&regs, &sh, &mem, &map, true, &mut info)
+            .expect("next-gen CS with an inline SRT must analyse");
+        assert_eq!(info.bind.direct_sgprs.sgprs_num, 2);
+        assert_eq!(info.bind.direct_sgprs.sgprs[0].field, 0xAAAA_0001);
+        assert_eq!(info.bind.direct_sgprs.sgprs[1].field, 0xAAAA_0002);
+        assert_eq!(info.lds_size_dw, 256);
+        // Direct SGPRs travel through the push-constant window.
+        assert!(info.bind.push_constant_size >= 16);
+    }
+
+    /// EUD resolver strategy 3: when neither the after-the-file pair nor the
+    /// scalar-load bases find the buffer, scan every adjacent SGPR pair for a
+    /// small-high-dword pointer into readable guest memory. Measured shape:
+    /// (s12, s13) = 0x4_00506730 with declared == captured == 14.
+    #[test]
+    fn eud_adjacent_pair_scan_recovers_measured_pointer() {
+        let eud_base: u64 = 0x4_0050_6730;
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[0] = 0x055e_7e00;
+        value[1] = 0xc410_0000; // hi too large — must be skipped
+        value[12] = 0x0050_6730;
+        value[13] = 0x4;
+        let user_sgpr = UserSgprInfo {
+            value,
+            type_: [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX],
+            count: 14,
+        };
+        let user_data = ShaderUserData {
+            direct_resource_offset: vec![],
+            sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+            eud_size_dw: 4,
+            srt_size_dw: 0,
+        };
+        let shader_addr = 0x1000;
+        let mem = TestMem {
+            regions: vec![
+                (shader_addr, vec![S_ENDPGM]),
+                (
+                    eud_base,
+                    vec![0xAAAA_0001, 0xAAAA_0002, 0xAAAA_0003, 0xAAAA_0004],
+                ),
+            ],
+        };
+        let eud = read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true)
+            .expect("strategy 3 must recover the (s12, s13) pair");
+        assert_eq!(
+            eud,
+            vec![0xAAAA_0001, 0xAAAA_0002, 0xAAAA_0003, 0xAAAA_0004]
+        );
+    }
+
+    /// The pair scan must not invent pointers: no readable pair -> None.
+    #[test]
+    fn eud_adjacent_pair_scan_refuses_unbacked_pairs() {
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[12] = 0x0050_6730;
+        value[13] = 0x4; // plausible shape but nothing mapped there
+        let user_sgpr = UserSgprInfo {
+            value,
+            type_: [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX],
+            count: 14,
+        };
+        let user_data = ShaderUserData {
+            direct_resource_offset: vec![],
+            sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+            eud_size_dw: 4,
+            srt_size_dw: 0,
+        };
+        let shader_addr = 0x1000;
+        let mem = TestMem {
+            regions: vec![(shader_addr, vec![S_ENDPGM])],
+        };
+        assert_eq!(
+            read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true),
+            None
+        );
     }
 }

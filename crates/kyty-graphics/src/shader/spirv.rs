@@ -2339,6 +2339,10 @@ impl<'a> Spirv<'a> {
             }
         }
 
+        if self.uses_lds() {
+            vars.push("%lds".to_string());
+        }
+
         let header_str = match self.code.get_type() {
             ShaderType::Pixel => {
                 vars.push("%outColor".to_string());
@@ -2777,7 +2781,39 @@ impl<'a> Spirv<'a> {
             }
         }
 
+        // Beyond Kyty: LDS (workgroup-shared memory) backing for the
+        // `ds_write_b32`/`ds_read_b32` pair — a fixed uint array in the
+        // Workgroup storage class, sized from COMPUTE_PGM_RSRC2.LDS_SIZE
+        // (64 KiB fallback; see `lds_size_dw`).
+        const LDS_TYPES: &str = r#"
+          %lds_num_uint_<lds_dw> = OpConstant %uint <lds_dw>
+              %_arr_uint_lds_len = OpTypeArray %uint %lds_num_uint_<lds_dw>
+    %_ptr_Workgroup__arr_uint_lds = OpTypePointer Workgroup %_arr_uint_lds_len
+             %_ptr_Workgroup_uint = OpTypePointer Workgroup %uint
+"#;
+        if self.uses_lds() {
+            self.source += &LDS_TYPES.replace("<lds_dw>", &format!("{}", self.lds_size_dw()));
+        }
+
         Ok(())
+    }
+
+    /// Whether the shader touches LDS through the implemented DS opcodes.
+    fn uses_lds(&self) -> bool {
+        use ShaderInstructionType as T;
+        self.code
+            .has_any_of(&[T::DsReadB32, T::DsWriteB32, T::DsRead2B32, T::DsWriteB96])
+    }
+
+    /// LDS allocation in dwords. `COMPUTE_PGM_RSRC2.LDS_SIZE` counts 128-dword
+    /// granules (GFX10); a shader that uses DS ops with a zero (or missing)
+    /// register still needs backing, so fall back to the full 64 KiB LDS.
+    pub(crate) fn lds_size_dw(&self) -> u32 {
+        let dw = self
+            .cs_input_info
+            .map_or(0, |i| i.lds_size_dw)
+            .min(16 * 1024);
+        if dw == 0 { 16 * 1024 } else { dw }
     }
 
     /// Kyty: `Spirv::WriteConstants` (L7133).
@@ -2861,6 +2897,10 @@ impl<'a> Spirv<'a> {
                         .to_string(),
                 );
             }
+        }
+
+        if self.uses_lds() {
+            vars.push("%lds = OpVariable %_ptr_Workgroup__arr_uint_lds Workgroup".to_string());
         }
 
         let sep = format!("\n{}", " ".repeat(15));
@@ -3713,6 +3753,7 @@ impl<'a> Spirv<'a> {
 
         if self.code.has_any_of(&[
             T::BufferLoadDword,
+            T::BufferLoadDwordX2,
             T::BufferLoadDwordX4,
             T::BufferLoadFormatX,
             T::BufferLoadFormatXy,
@@ -3820,6 +3861,15 @@ impl<'a> Spirv<'a> {
             self.add_constant_uint(info.threads_num[0]);
             self.add_constant_uint(info.threads_num[1]);
             self.add_constant_uint(info.threads_num[2]);
+        }
+        if self.code.has_any_of(&[ShaderInstructionType::SBarrier]) {
+            // OpControlBarrier memory semantics: AcquireRelease (0x8) |
+            // WorkgroupMemory (0x100).
+            self.add_constant_uint(0x108);
+        }
+        if self.uses_lds() {
+            // The LDS index clamp bound (see recompile_ds_write/read_b32).
+            self.add_constant_uint(self.lds_size_dw() - 1);
         }
         Ok(())
     }

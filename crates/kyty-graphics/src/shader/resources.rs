@@ -791,7 +791,10 @@ pub struct ShaderDirectSgprsResources {
 }
 
 impl ShaderDirectSgprsResources {
-    pub const SGPRS_MAX: usize = 4;
+    // Kyty caps this at 4 (PS4 stages never left more than a handful of user
+    // SGPRs unconsumed). Gen5 CS shaders keep whole SRT blocks as raw user
+    // data — up to the full 32-register file — so the cap is the file size.
+    pub const SGPRS_MAX: usize = 32;
 }
 
 /// Kyty: Shader.h `ShaderExtendedResources` (L843).
@@ -848,6 +851,10 @@ pub struct ShaderComputeInputInfo {
     pub group_id: [bool; 3],
     pub thread_ids_num: i32,
     pub workgroup_register: i32,
+    /// Beyond Kyty: LDS allocation in dwords, decoded from
+    /// `COMPUTE_PGM_RSRC2.LDS_SIZE` (128-dword granules). Sizes the
+    /// `%lds` Workgroup array backing `ds_write_b32`/`ds_read_b32`.
+    pub lds_size_dw: u32,
     pub bind: ShaderBindResources,
 }
 

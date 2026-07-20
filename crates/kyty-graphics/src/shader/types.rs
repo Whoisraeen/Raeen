@@ -33,6 +33,9 @@ pub enum ShaderInstructionType {
     Unknown,
 
     BufferLoadDword,
+    /// MUBUF 0x0d: two-dword raw load. Kyty leaves it `KYTY_NI`; measured in
+    /// ASTRO.BOT scene compute (raw 0xe0342000, idxen).
+    BufferLoadDwordX2,
     BufferLoadDwordX4,
     BufferLoadFormatX,
     BufferLoadFormatXy,
@@ -50,6 +53,25 @@ pub enum ShaderInstructionType {
     BufferStoreFormatXyzw,
     DsAppend,
     DsConsume,
+    /// DS 0x37: two independent LDS dword reads at `addr + offset0*4` and
+    /// `addr + offset1*4` into `vdst`/`vdst+1` (offsets are in DWORD units
+    /// for the read2/write2 forms, unlike the byte offset of the single
+    /// forms — RDNA2 ISA `DS_READ2_B32`). Kyty leaves the whole DS family
+    /// except append/consume `KYTY_NI`; measured on ASTRO.BOT scene compute
+    /// (raw 0xd8dc0100).
+    DsRead2B32,
+    /// DS 0x36: LDS (workgroup-shared) dword read. Kyty leaves it `KYTY_NI`
+    /// (only the GDS append/consume pair is implemented upstream); lowered to
+    /// an `OpLoad` from the `%lds` Workgroup array. Read twin of `DsWriteB32`.
+    DsReadB32,
+    /// DS 0x0d: LDS (workgroup-shared) dword write — measured in ASTRO.BOT
+    /// scene compute (raw 0xd8340000). Lowered to an `OpStore` into the
+    /// `%lds` Workgroup array at `(addr + offset) >> 2`.
+    DsWriteB32,
+    /// DS 0xde: three consecutive LDS dwords stored from `data0..data0+2` at
+    /// the 16-bit byte offset (RDNA2 ISA `DS_WRITE_B96`). Kyty `KYTY_NI`;
+    /// measured on ASTRO.BOT scene compute.
+    DsWriteB96,
     Exp,
     /// MIMG 0x0e: query texture dimensions/mip information.
     ImageGetResinfo,
@@ -68,6 +90,9 @@ pub enum ShaderInstructionType {
     SAndB64,
     SAndn2B64,
     SAndSaveexecB64,
+    /// SOPP 0x0a: workgroup execution + LDS memory barrier. Kyty leaves it
+    /// `KYTY_NI`; required by the `ds_write_b32`/`ds_read_b32` LDS pairs.
+    SBarrier,
     SBfeU32,
     SBfeU64,
     SBfmB32,
@@ -191,6 +216,9 @@ pub enum ShaderInstructionType {
     VCmpUF32,
     VCmpxEqF32,
     VCmpxEqU32,
+    /// VOPC 0x16: `exec/smask = vsrc0 >= vsrc1` (ordered). Exec-writing
+    /// sibling of `VCmpGeF32`; measured in ASTRO.BOT scene CS.
+    VCmpxGeF32,
     VCmpxGeU32,
     VCmpxGtF32,
     VCmpxGtU32,
@@ -203,6 +231,9 @@ pub enum ShaderInstructionType {
     VCmpxLtU32,
     VCmpxNeI32,
     VCmpxNeqF32,
+    /// VOPC 0x1c: `exec/smask = !(vsrc0 <= vsrc1)` (unordered >, NaN→true).
+    /// Exec-writing sibling of `VCmpNleF32`; measured in ASTRO.BOT scene CS.
+    VCmpxNleF32,
     /// VOPC 0x1e: `exec/smask = !(vsrc0 < vsrc1)` (unordered ≥, NaN→true). The
     /// exec-writing sibling of `VCmpNltF32`; measured in ASTRO.BOT scene CS.
     VCmpxNltF32,
@@ -452,6 +483,12 @@ pub mod shader_instruction_format {
         Vdata2Vaddr3StDmask3 = format_define(&[DA2, S0A3, S1A8, DMASK_3]),
         Vdata2VaddrStDmask3 = format_define(&[DA2, S0, S1A8, DMASK_3]),
         Vdata2VaddrSvSoffsIdxen = format_define(&[DA2, S0, S1A4, S2, IDXEN]),
+        // Beyond Kyty: the two-dword MUBUF addressing variants completing the
+        // flexible quartet for `buffer_load_dwordx2` (measured on ASTRO.BOT
+        // scene compute) — same model as the Vdata1/Vdata4 sets.
+        Vdata2SvSoffs = format_define(&[DA2, S1A4, S2]),
+        Vdata2VaddrSvSoffsOffen = format_define(&[DA2, S0, S1A4, S2, OFFEN]),
+        Vdata2Vaddr2SvSoffsOffenIdxen = format_define(&[DA2, S0A2, S1A4, S2, OFFEN, IDXEN]),
         Vdata3Vaddr3StDmask7 = format_define(&[DA3, S0A3, S1A8, DMASK_7]),
         Vdata3Vaddr3StSsDmask7 = format_define(&[DA3, S0A3, S1A8, S2A4, DMASK_7]),
         Vdata3Vaddr4StSsDmask7 = format_define(&[DA3, S0A4, S1A8, S2A4, DMASK_7]),
@@ -467,6 +504,20 @@ pub mod shader_instruction_format {
         Vdata4SvSoffs = format_define(&[DA4, S1A4, S2]),
         Vdata4VaddrSvSoffsOffen = format_define(&[DA4, S0, S1A4, S2, OFFEN]),
         VdstGds = format_define(&[D, GDS]),
+        /// Beyond Kyty: `ds_read2_b32 vdst[2], addr [offset0] [offset1]` —
+        /// dst = 2 consecutive VGPRs, src0 = address VGPR, src1/src2 = the
+        /// two offsets as literal constants (stored in BYTES, i.e. the
+        /// encoded dword-unit fields scaled by 4, so every DS recompiler
+        /// indexes `%lds` the same way).
+        Vdst2Vsrc0Vsrc1Vsrc2 = format_define(&[DA2, S0, S1, S2]),
+        /// Beyond Kyty: `ds_write_b32 addr, data0 [offset]` — src0 = address
+        /// VGPR, src1 = data VGPR, src2 = the 16-bit instruction byte offset
+        /// as a literal constant.
+        Vsrc0Vsrc1Vsrc2 = format_define(&[S0, S1, S2]),
+        /// Beyond Kyty: `ds_write_b96 addr, data0[3] [offset]` — src0 =
+        /// address VGPR, src1 = first of 3 consecutive data VGPRs, src2 =
+        /// the 16-bit instruction byte offset as a literal constant.
+        Vsrc0Vsrc13Vsrc2 = format_define(&[S0, S1A3, S2]),
         VdstSdst2Vsrc0Vsrc1 = format_define(&[D, D2A2, S0, S1]),
         VdstVsrc0Vsrc1Smask2 = format_define(&[D, S0, S1, S2A2]),
         VdstVsrc0Vsrc1Vsrc2 = format_define(&[D, S0, S1, S2]),

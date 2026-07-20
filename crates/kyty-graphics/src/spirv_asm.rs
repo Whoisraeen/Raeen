@@ -593,6 +593,7 @@ fn op_info(name: &str) -> Option<OpInfo> {
         // --- Barriers / atomics ----------------------------------------------
         // Kyty passes scope/semantics as constant *ids* (`%uint_1 %uint_72`,
         // ShaderSpirv.cpp L2230-L2268), so these are plain id operands.
+        "OpControlBarrier" => op(224, false, false, &[Id, Id, Id]),
         "OpMemoryBarrier" => op(225, false, false, &[Id, Id]),
         "OpAtomicIAdd" => op(234, true, true, IDR),
         "OpAtomicISub" => op(235, true, true, IDR),

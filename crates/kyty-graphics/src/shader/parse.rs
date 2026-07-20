@@ -195,8 +195,23 @@ pub fn operand_parse(code: u32) -> Result<ShaderOperand, ShaderParseError> {
         ret.type_ = O::IntegerInlineConstant;
         ret.constant.u = (192 - code as i32) as u32;
         ret.size = 0;
-    } else if (240..=247).contains(&code) {
-        const FV: [f32; 8] = [0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0];
+    } else if (240..=248).contains(&code) {
+        // 248 = 1/(2*pi), the GCN3+/RDNA2 ninth inline float (SharpEmu
+        // `Gen5InlineConstants` maps 248 => 1/(2*PI); Kyty predates it and
+        // errors). It cannot appear in a legacy SI stream, so accepting it
+        // unconditionally is safe. Measured: 58 ASTRO.BOT CS failures
+        // ("unknown operand: 248").
+        const FV: [f32; 9] = [
+            0.5,
+            -0.5,
+            1.0,
+            -1.0,
+            2.0,
+            -2.0,
+            4.0,
+            -4.0,
+            1.0 / (2.0 * std::f32::consts::PI),
+        ];
         ret.type_ = O::FloatInlineConstant;
         ret.constant.u = FV[(code - 240) as usize].to_bits();
         ret.size = 0;
@@ -416,7 +431,13 @@ fn shader_parse_sopp(
             inst.src_num = 0;
         }
         0x09 => return Err(ni(dst, S, "s_cbranch_execnz", opcode, pc, b0)),
-        0x0a => return Err(ni(dst, S, "s_barrier", opcode, pc, b0)),
+        // Beyond Kyty (KYTY_NI upstream): workgroup barrier — required by the
+        // LDS `ds_write_b32`/`ds_read_b32` pairs (ASTRO.BOT scene compute).
+        0x0a => {
+            inst.type_ = T::SBarrier;
+            inst.format = F::Empty;
+            inst.src_num = 0;
+        }
         0x0b => return Err(ni(dst, S, "s_setkill", opcode, pc, b0)),
         0x0d => return Err(ni(dst, S, "s_sethalt", opcode, pc, b0)),
         0x0e => return Err(ni(dst, S, "s_sleep", opcode, pc, b0)),
@@ -1072,6 +1093,8 @@ fn shader_parse_vopc(
         // (measured: ASTRO.BOT compute).
         0x12 => inst.type_ = T::VCmpxEqF32,
         0x14 => inst.type_ = T::VCmpxGtF32,
+        0x16 => inst.type_ = T::VCmpxGeF32,
+        0x1c => inst.type_ = T::VCmpxNleF32,
         0x1d => inst.type_ = T::VCmpxNeqF32,
         0x1e => inst.type_ = T::VCmpxNltF32,
         0x80 => inst.type_ = T::VCmpFI32,
@@ -1338,15 +1361,17 @@ fn shader_parse_vop2(
     let s1 = if sdwa { (b1 >> 31) & 0x1 } else { 0 };
 
     // Kyty L1088-1096: EXIT_NOT_IMPLEMENTED on unsupported SDWA modifiers
-    // (abs is supported and applied below).
+    // (abs is supported and applied below). Beyond Kyty: omod is NOT refused
+    // — it is a plain output multiply (x2/x4/x0.5) carried in
+    // `dst.multiplier`, exactly as the VOP1 SDWA path already does (see
+    // `astro_vop1_sdwa_omod_recompiles_as_float_multiply`); the float
+    // recompile bodies apply it via the MULTIPLY template. 58 measured
+    // ASTRO.BOT CS failures ("vop2 feature: sdwa omod != 0").
     if dst_sel != 6 {
         return Err(feature(S, "sdwa dst_sel != 6", pc));
     }
     if sdwa && dst_sel == 6 && dst_u != 0 {
         return Err(feature(S, "sdwa dst_u != 0", pc));
-    }
-    if omod != 0 {
-        return Err(feature(S, "sdwa omod != 0", pc));
     }
     if src0_sel != 6 {
         return Err(feature(S, "sdwa src0_sel != 6", pc));
@@ -1718,6 +1743,8 @@ fn shader_parse_vop3(
         0x0e => inst.type_ = T::VCmpNltF32,
         0x0f => inst.type_ = T::VCmpTruF32,
         0x12 => inst.type_ = T::VCmpxEqF32,
+        0x16 => inst.type_ = T::VCmpxGeF32,
+        0x1c => inst.type_ = T::VCmpxNleF32,
         0x1d => inst.type_ = T::VCmpxNeqF32,
         0x1e => inst.type_ = T::VCmpxNltF32,
         0x80 => inst.type_ = T::VCmpFI32,
@@ -2073,6 +2100,23 @@ fn shader_parse_vop3(
         0x35a => return Err(ni(dst, S, "v_interp_p2_f16", opcode, pc, b0)),
         0x35e => return Err(ni(dst, S, "v_mad_i16", opcode, pc, b0)),
         0x35f => return Err(ni(dst, S, "v_div_fixup_f16", opcode, pc, b0)),
+        // RDNA2 (`next_gen`) VOP3 encodings of the mbcnt pair (VOP2-native
+        // 0x23/0x24 on GCN, already wired above). Verified against SharpEmu's
+        // Gen5 decoder: `0x365 => VMbcntLoU32B32`, `0x366 => VMbcntHiU32B32`
+        // (Gen5ShaderTranslator.cs L1144-1145) — NOT v_lshl_add_u32, which is
+        // 0x346. Measured: ASTRO.BOT scene CS emits 0x366 (raw 0xd7660003) in
+        // the canonical lane-index idiom. The legacy 9-bit VOP3 space ends at
+        // 0x1ff, so the numbers are unambiguous.
+        0x365 => {
+            inst.type_ = T::VMbcntLoU32B32;
+            inst.format = F::SVdstSVsrc0SVsrc1;
+            inst.src_num = 2;
+        }
+        0x366 => {
+            inst.type_ = T::VMbcntHiU32B32;
+            inst.format = F::SVdstSVsrc0SVsrc1;
+            inst.src_num = 2;
+        }
         // `v_add3_u32`: dst = src0 + src1 + src2 (carry-less). Kyty leaves it
         // NI (ShaderParse.cpp L2112); shadPS4 `V_ADD3_U32 = 877` (== 0x36d)
         // confirms opcode + semantics. Measured: 175 ASTRO.BOT CS failures.
@@ -2271,7 +2315,13 @@ fn shader_parse_exp(
             } else if done != 0 && compr != 0 && vm != 0 && en == 0xf {
                 inst.format = F::Mrt0Vsrc0Vsrc1ComprVmDone;
                 inst.src_num = 2;
-            } else if done != 0 && compr == 0 && vm != 0 && en == 0xf {
+            } else if done != 0 && compr == 0 && vm != 0 && en != 0 {
+                // Uncompressed MRT0 export. Kyty knows only the full en==0xf
+                // form (ShaderSpirv.cpp L2348); a partial mask selects which
+                // full-float VGPRs are written (measured: ASTRO.BOT PS exports
+                // en=0x3 — rg only, a 32_GR render target). `export_enable`
+                // carries the mask; the recompiler writes the GCN default
+                // (0, 0, 0, 1) to the disabled channels.
                 inst.format = F::Mrt0Vsrc0Vsrc1Vsrc2Vsrc3VmDone;
             }
         }
@@ -2579,9 +2629,13 @@ fn shader_parse_mubuf(
     // opcodes keep Kyty's strict gate, applied per-opcode AFTER the opcode is
     // known so a rejection names the instruction (previously 114 ASTRO.BOT
     // failures said only "idxen == 0").
-    if offset != 0 {
-        return Err(feature(S, "offset != 0", pc));
-    }
+    //
+    // The 12-bit immediate `offset` is one addend of that same documented
+    // address model. Kyty EXITs on it (L2571); here it is folded into the
+    // soffset operand below once src[2] is known — both are plain byte
+    // addends, and every recompile body already routes src[2] into
+    // `temp_int_2` (the instruction-offset slot). 116 measured ASTRO.BOT CS
+    // failures ("offset != 0").
     if glc == 1 {
         return Err(feature(S, "glc == 1", pc));
     }
@@ -2610,6 +2664,18 @@ fn shader_parse_mubuf(
     if inst.src[2].type_ == O::LiteralConstant {
         inst.src[2].constant.u = dw(buffer, size, pc)?;
         size += 1;
+    }
+
+    // Fold the immediate offset into a constant soffset (see the note above
+    // the glc gate). A register soffset would need an extra runtime add no
+    // recompile body models yet — that combination stays a named refusal.
+    if offset != 0 {
+        match inst.src[2].type_ {
+            O::LiteralConstant | O::IntegerInlineConstant => {
+                inst.src[2].constant.u = inst.src[2].constant.u.wrapping_add(offset);
+            }
+            _ => return Err(feature(S, "offset != 0 with register soffset", pc)),
+        }
     }
 
     // Single-dword flexible addressing (the Vdata1 counterpart of the
@@ -2713,7 +2779,21 @@ fn shader_parse_mubuf(
             inst.src[0].size = src0_size;
             inst.src[1].size = 4;
         }
-        0x0d => return Err(ni(dst, S, "buffer_load_dwordx2", opcode, pc, b0)),
+        // Beyond Kyty (KYTY_NI upstream): two-dword raw load, measured on
+        // ASTRO.BOT scene compute (raw 0xe0342000, idxen). Same flexible
+        // addressing quartet as the Vdata1/Vdata4 opcodes.
+        0x0d => {
+            inst.type_ = T::BufferLoadDwordX2;
+            inst.format = match (idxen, offen) {
+                (1, 1) => F::Vdata2Vaddr2SvSoffsOffenIdxen,
+                (1, 0) => F::Vdata2VaddrSvSoffsIdxen,
+                (0, 1) => F::Vdata2VaddrSvSoffsOffen,
+                _ => F::Vdata2SvSoffs,
+            };
+            inst.src[0].size = src0_size;
+            inst.src[1].size = 4;
+            inst.dst.size = 2;
+        }
         0x0e => {
             inst.type_ = T::BufferLoadDwordX4;
             inst.format = format4;
@@ -2767,9 +2847,9 @@ fn shader_parse_ds(
     let vdst = (b1 >> 24) & 0xff;
     let data1 = (b1 >> 16) & 0xff;
     let data0 = (b1 >> 8) & 0xff;
-    // addr (b1 & 0xff) is a don't-care for the implemented append/consume
-    // pair and unimplemented opcodes fail by name before operand checks.
-    let _addr = b1 & 0xff;
+    // addr is a don't-care for the append/consume pair (they select the GDS
+    // counter through M0) but is the LDS address VGPR for ds_write/ds_read.
+    let addr = b1 & 0xff;
 
     // Kyty applies its EXIT_NOT_IMPLEMENTED operand checks (L2740-2745)
     // BEFORE the opcode switch, so an unimplemented LDS op with a non-zero
@@ -2792,17 +2872,29 @@ fn shader_parse_ds(
         // counter through M0 and do not read the encoded address VGPR; real
         // Gen5 shaders leave that don't-care field non-zero, so `addr` is
         // deliberately not checked.
+        //
+        // Beyond Kyty: the 16-bit instruction offset is a BYTE offset added
+        // to the M0 counter base (shadPS4 `DS_APPEND`/`DS_CONSUME`
+        // translate `gds_offset = M0 + inst_offset`,
+        // data_share.cpp L323-L335; resource_tracking_pass.cpp L699-L708
+        // then indexes the GDS buffer at `gds_addr >> 2`). Kyty EXITs on any
+        // nonzero offset — 59 measured ASTRO.BOT CS failures. The offset
+        // rides as a literal src[0] (dword-aligned only; an unaligned
+        // counter address has no defined uint slot).
         if data0 != 0 {
             return Err(feature(S, "data0 != 0", pc));
         }
         if data1 != 0 {
             return Err(feature(S, "data1 != 0", pc));
         }
-        if offset0 != 0 {
-            return Err(feature(S, "offset0 != 0", pc));
+        let counter_offset = offset0 | (offset1 << 8);
+        if counter_offset & 3 != 0 {
+            return Err(feature(S, "append/consume offset not dword-aligned", pc));
         }
-        if offset1 != 0 {
-            return Err(feature(S, "offset1 != 0", pc));
+        if counter_offset != 0 {
+            inst.src[0].type_ = O::LiteralConstant;
+            inst.src[0].constant.u = counter_offset;
+            inst.src_num = 1;
         }
         if gds == 0 {
             return Err(feature(S, "gds == 0", pc));
@@ -2823,7 +2915,22 @@ fn shader_parse_ds(
         0x0a => return Err(ni(dst, S, "ds_or_b32", opcode, pc, b0)),
         0x0b => return Err(ni(dst, S, "ds_xor_b32", opcode, pc, b0)),
         0x0c => return Err(ni(dst, S, "ds_mskor_b32", opcode, pc, b0)),
-        0x0d => return Err(ni(dst, S, "ds_write_b32", opcode, pc, b0)),
+        // Beyond Kyty (KYTY_NI upstream): LDS dword write, measured on
+        // ASTRO.BOT scene compute (raw 0xd8340000). src0 = address VGPR,
+        // src1 = data VGPR, src2 = the 16-bit instruction byte offset.
+        0x0d => {
+            if gds != 0 {
+                return Err(feature(S, "ds_write_b32 with gds == 1", pc));
+            }
+            inst.type_ = T::DsWriteB32;
+            inst.format = F::Vsrc0Vsrc1Vsrc2;
+            inst.dst = ShaderOperand::default();
+            inst.src[0] = operand_parse(addr + 256)?;
+            inst.src[1] = operand_parse(data0 + 256)?;
+            inst.src[2].type_ = O::LiteralConstant;
+            inst.src[2].constant.u = offset0 | (offset1 << 8);
+            inst.src_num = 3;
+        }
         0x0e => return Err(ni(dst, S, "ds_write2_b32", opcode, pc, b0)),
         0x0f => return Err(ni(dst, S, "ds_write2st64_b32", opcode, pc, b0)),
         0x10 => return Err(ni(dst, S, "ds_cmpst_b32", opcode, pc, b0)),
@@ -2861,8 +2968,44 @@ fn shader_parse_ds(
         0x33 => return Err(ni(dst, S, "ds_max_rtn_f32", opcode, pc, b0)),
         0x34 => return Err(ni(dst, S, "ds_wrap_rtn_b32", opcode, pc, b0)),
         0x35 => return Err(ni(dst, S, "ds_swizzle_b32", opcode, pc, b0)),
-        0x36 => return Err(ni(dst, S, "ds_read_b32", opcode, pc, b0)),
-        0x37 => return Err(ni(dst, S, "ds_read2_b32", opcode, pc, b0)),
+        // The read twin of ds_write_b32 above: dst = vdst VGPR (already
+        // parsed), src0 = address VGPR, src1 = the 16-bit byte offset.
+        0x36 => {
+            if gds != 0 {
+                return Err(feature(S, "ds_read_b32 with gds == 1", pc));
+            }
+            if data0 != 0 || data1 != 0 {
+                return Err(feature(S, "ds_read_b32 with data operands", pc));
+            }
+            inst.type_ = T::DsReadB32;
+            inst.format = F::SVdstSVsrc0SVsrc1;
+            inst.src[0] = operand_parse(addr + 256)?;
+            inst.src[1].type_ = O::LiteralConstant;
+            inst.src[1].constant.u = offset0 | (offset1 << 8);
+            inst.src_num = 2;
+        }
+        // Beyond Kyty (KYTY_NI upstream): two independent LDS dword reads.
+        // RDNA2 `DS_READ2_B32`: offsets are in DWORD units (scaled by 4 here
+        // so the stored literals are byte offsets like every other DS form);
+        // results land in vdst and vdst+1. Measured on ASTRO.BOT scene
+        // compute (raw 0xd8dc0100 = offset0 0, offset1 1).
+        0x37 => {
+            if gds != 0 {
+                return Err(feature(S, "ds_read2_b32 with gds == 1", pc));
+            }
+            if data0 != 0 || data1 != 0 {
+                return Err(feature(S, "ds_read2_b32 with data operands", pc));
+            }
+            inst.type_ = T::DsRead2B32;
+            inst.format = F::Vdst2Vsrc0Vsrc1Vsrc2;
+            inst.dst.size = 2;
+            inst.src[0] = operand_parse(addr + 256)?;
+            inst.src[1].type_ = O::LiteralConstant;
+            inst.src[1].constant.u = offset0 * 4;
+            inst.src[2].type_ = O::LiteralConstant;
+            inst.src[2].constant.u = offset1 * 4;
+            inst.src_num = 3;
+        }
         0x38 => return Err(ni(dst, S, "ds_read2st64_b32", opcode, pc, b0)),
         0x39 => return Err(ni(dst, S, "ds_read_i8", opcode, pc, b0)),
         0x3a => return Err(ni(dst, S, "ds_read_u8", opcode, pc, b0)),
@@ -2951,7 +3094,26 @@ fn shader_parse_ds(
         0xcd => return Err(ni(dst, S, "ds_write_src2_b64", opcode, pc, b0)),
         0xd2 => return Err(ni(dst, S, "ds_min_src2_f64", opcode, pc, b0)),
         0xd3 => return Err(ni(dst, S, "ds_max_src2_f64", opcode, pc, b0)),
-        0xde => return Err(ni(dst, S, "ds_write_b96", opcode, pc, b0)),
+        // Beyond Kyty (KYTY_NI upstream): three consecutive LDS dwords
+        // stored from data0..data0+2 at the 16-bit byte offset (RDNA2
+        // `DS_WRITE_B96`). Measured on ASTRO.BOT scene compute.
+        0xde => {
+            if gds != 0 {
+                return Err(feature(S, "ds_write_b96 with gds == 1", pc));
+            }
+            if data1 != 0 {
+                return Err(feature(S, "ds_write_b96 with data1 operand", pc));
+            }
+            inst.type_ = T::DsWriteB96;
+            inst.format = F::Vsrc0Vsrc13Vsrc2;
+            inst.dst = ShaderOperand::default();
+            inst.src[0] = operand_parse(addr + 256)?;
+            inst.src[1] = operand_parse(data0 + 256)?;
+            inst.src[1].size = 3;
+            inst.src[2].type_ = O::LiteralConstant;
+            inst.src[2].constant.u = offset0 | (offset1 << 8);
+            inst.src_num = 3;
+        }
         0xdf => return Err(ni(dst, S, "ds_write_b128", opcode, pc, b0)),
         0xfd => return Err(ni(dst, S, "ds_condxchg32_rtn_b128", opcode, pc, b0)),
         0xfe => return Err(ni(dst, S, "ds_read_b96", opcode, pc, b0)),
@@ -3072,6 +3234,12 @@ fn shader_parse_mimg(
                 0x1 => {
                     inst.format = F::Vdata1Vaddr3StDmask1;
                     inst.dst.size = 1;
+                }
+                // Beyond Kyty: two-channel store (measured on ASTRO.BOT
+                // scene compute, MIMG 0x08 dmask 0x3).
+                0x3 => {
+                    inst.format = F::Vdata2Vaddr3StDmask3;
+                    inst.dst.size = 2;
                 }
                 0xf => {
                     inst.format = F::Vdata4Vaddr3StDmaskF;
@@ -3688,7 +3856,9 @@ mod tests {
 
     #[test]
     fn operand_parse_inline_floats() {
-        let expected = [0.5f32, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0];
+        // 248 = 1/(2*pi), RDNA2's ninth inline float (SharpEmu
+        // Gen5InlineConstants).
+        let expected = [0.5f32, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0, 0.159_154_94];
         for (i, want) in expected.iter().enumerate() {
             let op = operand_parse(240 + i as u32).unwrap();
             assert_eq!(op.type_, O::FloatInlineConstant, "code {}", 240 + i);
@@ -3706,7 +3876,7 @@ mod tests {
         let op = operand_parse(511).unwrap();
         assert_eq!((op.type_, op.register_id), (O::Vgpr, 255));
         assert!(operand_parse(209).is_err());
-        assert!(operand_parse(248).is_err());
+        assert!(operand_parse(249).is_err());
         assert!(operand_parse(254).is_err());
     }
 
@@ -4162,11 +4332,11 @@ mod tests {
 
     #[test]
     fn astro_ds_lds_op_reports_instruction_name() {
-        // An LDS op with non-zero addr/offset fields must fail by NAME
-        // (previously the pre-switch `addr != 0` check hid the opcode — 173
-        // anonymous ASTRO.BOT failures). ds_write_b32 = DS opcode 0x0d.
+        // A still-unimplemented LDS op with non-zero addr/offset fields must
+        // fail by NAME (previously the pre-switch `addr != 0` check hid the
+        // opcode — 173 anonymous ASTRO.BOT failures). ds_write2_b32 = 0x0e.
         let (_, result) = parse(
-            &[0xD834_0000, 0x0000_0005, S_ENDPGM],
+            &[0xD838_0000, 0x0000_0005, S_ENDPGM],
             ShaderType::Compute,
             true,
         );
@@ -4178,11 +4348,192 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(family, "ds");
-                assert_eq!(instruction, "ds_write_b32");
-                assert_eq!(opcode, 0x0d);
+                assert_eq!(instruction, "ds_write2_b32");
+                assert_eq!(opcode, 0x0e);
             }
             other => panic!("expected named ds NI, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn astro_ds_write_b32_parses_addr_data_offset() {
+        // ds_write_b32 (0x0d) — measured raw 0xd8340000 with addr/data VGPRs
+        // in b1 (here addr=v5, data0=v3) plus a 16-bit byte offset in b0.
+        let (code, result) = parse(
+            &[0xD834_0010, 0x0000_0305, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse ds_write_b32");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::DsWriteB32);
+        assert_eq!(inst.format, F::Vsrc0Vsrc1Vsrc2);
+        assert_eq!(inst.src_num, 3);
+        assert_eq!((inst.src[0].type_, inst.src[0].register_id), (O::Vgpr, 5));
+        assert_eq!((inst.src[1].type_, inst.src[1].register_id), (O::Vgpr, 3));
+        assert_eq!(inst.src[2].type_, O::LiteralConstant);
+        assert_eq!(inst.src[2].constant.u, 0x10);
+    }
+
+    #[test]
+    fn astro_ds_read_b32_parses_vdst_addr_offset() {
+        // ds_read_b32 (0x36): vdst=v7, addr=v5, offset 4.
+        let (code, result) = parse(
+            &[0xD8D8_0004, 0x0700_0005, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse ds_read_b32");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::DsReadB32);
+        assert_eq!(inst.format, F::SVdstSVsrc0SVsrc1);
+        assert_eq!((inst.dst.type_, inst.dst.register_id), (O::Vgpr, 7));
+        assert_eq!((inst.src[0].type_, inst.src[0].register_id), (O::Vgpr, 5));
+        assert_eq!(inst.src[1].type_, O::LiteralConstant);
+        assert_eq!(inst.src[1].constant.u, 4);
+    }
+
+    #[test]
+    fn astro_ds_read2_b32_parses_two_dword_offsets() {
+        // ds_read2_b32 (0x37) — measured raw 0xd8dc0100: offset0=0,
+        // offset1=1 (DWORD units → byte literals 0 and 4). vdst=v7 (pair
+        // v7/v8), addr=v5.
+        let (code, result) = parse(
+            &[0xD8DC_0100, 0x0700_0005, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse ds_read2_b32");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::DsRead2B32);
+        assert_eq!(inst.format, F::Vdst2Vsrc0Vsrc1Vsrc2);
+        assert_eq!(
+            (inst.dst.type_, inst.dst.register_id, inst.dst.size),
+            (O::Vgpr, 7, 2)
+        );
+        assert_eq!((inst.src[0].type_, inst.src[0].register_id), (O::Vgpr, 5));
+        assert_eq!(inst.src[1].type_, O::LiteralConstant);
+        assert_eq!(inst.src[1].constant.u, 0, "offset0 in bytes");
+        assert_eq!(inst.src[2].type_, O::LiteralConstant);
+        assert_eq!(inst.src[2].constant.u, 4, "offset1 scaled to bytes");
+    }
+
+    #[test]
+    fn astro_ds_write_b96_parses_three_dword_data() {
+        // ds_write_b96 (0xde): addr=v5, data0=v[3:5], byte offset 8.
+        let (code, result) = parse(
+            &[0xDB78_0008, 0x0000_0305, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse ds_write_b96");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::DsWriteB96);
+        assert_eq!(inst.format, F::Vsrc0Vsrc13Vsrc2);
+        assert_eq!(inst.dst.type_, O::Unknown, "no destination");
+        assert_eq!((inst.src[0].type_, inst.src[0].register_id), (O::Vgpr, 5));
+        assert_eq!(
+            (inst.src[1].type_, inst.src[1].register_id, inst.src[1].size),
+            (O::Vgpr, 3, 3)
+        );
+        assert_eq!(inst.src[2].type_, O::LiteralConstant);
+        assert_eq!(inst.src[2].constant.u, 8);
+    }
+
+    #[test]
+    fn astro_ds_append_carries_byte_offset_as_literal() {
+        // ds_append (0x3e, gds) with instruction offset 4: the counter is one
+        // dword past the M0 base (shadPS4 DS_APPEND: gds_offset = M0 +
+        // inst_offset). Previously "ds feature: offset0 != 0" (59 measured).
+        let (code, result) = parse(
+            &[0xD8FA_0004, 0x0700_0000, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse ds_append with offset");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::DsAppend);
+        assert_eq!(inst.src_num, 1);
+        assert_eq!(inst.src[0].type_, O::LiteralConstant);
+        assert_eq!(inst.src[0].constant.u, 4);
+
+        // Unaligned counter offsets stay a named refusal.
+        let (_, result) = parse(
+            &[0xD8FA_0002, 0x0700_0000, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        assert_eq!(
+            result,
+            Err(ShaderParseError::NotImplementedFeature {
+                family: "ds",
+                feature: "append/consume offset not dword-aligned",
+                pc: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn astro_mubuf_immediate_offset_folds_into_soffset() {
+        // buffer_load_dword (0x0c, idxen) with immediate offset 16 — the
+        // offset is one addend of the documented flexible-address model and
+        // folds into the constant soffset (inline 0 here). Previously
+        // "mubuf feature: offset != 0" (116 measured).
+        let (code, result) = parse(
+            &[0xE030_2010, 0x8001_0400, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse buffer_load_dword with immediate offset");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::BufferLoadDword);
+        assert_eq!(inst.format, F::Vdata1VaddrSvSoffsIdxen);
+        assert_eq!(inst.src[2].type_, O::IntegerInlineConstant);
+        assert_eq!(inst.src[2].constant.u, 16, "0 (inline) + 16 (immediate)");
+
+        // A register soffset cannot absorb the immediate — named refusal.
+        let (_, result) = parse(
+            &[0xE030_2010, 0x0501_0400, S_ENDPGM], // soffset = s5
+            ShaderType::Compute,
+            true,
+        );
+        assert_eq!(
+            result,
+            Err(ShaderParseError::NotImplementedFeature {
+                family: "mubuf",
+                feature: "offset != 0 with register soffset",
+                pc: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn astro_vop2_sdwa_omod_is_preserved() {
+        // v_mul_f32 SDWA with omod=1 (mul:2) — same lowering as the VOP1
+        // SDWA omod path: the multiplier rides `dst.multiplier`. Previously
+        // "vop2 feature: sdwa omod != 0" (58 measured).
+        let (code, result) = parse(
+            &[0x1002_06F9, 0x1606_4604, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse VOP2 SDWA omod");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::VMulF32);
+        assert_eq!(inst.dst.multiplier, 2.0);
+        assert!(inst.src[1].negate, "the other SDWA modifiers still apply");
+    }
+
+    #[test]
+    fn operand_248_is_inv_2pi() {
+        // RDNA2 inline float 248 = 1/(2*pi) (SharpEmu Gen5InlineConstants;
+        // Kyty predates it). v_mul_f32 v1, 1/(2*pi), v3. Previously
+        // "unknown operand: 248" (58 measured).
+        let (code, result) = parse(&[0x1002_06F8, S_ENDPGM], ShaderType::Compute, true);
+        result.expect("parse v_mul_f32 with inline 1/(2*pi)");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.src[0].type_, O::FloatInlineConstant);
+        assert!((inst.src[0].constant.f() - 0.159_154_94).abs() < 1e-9);
     }
 
     #[test]
