@@ -113,24 +113,44 @@ pub struct StorageBufferBinding {
 
 /// One storage image (UAV) a translated compute shader reads and writes.
 ///
-/// The pixels are the guest's initial content (RGBA8, tightly packed rows);
-/// `guest_base` is where the caller writes the post-dispatch content back.
+/// The pixels are the guest's initial content (tightly packed rows, `depth`
+/// slices back to back for a 3D UAV); `guest_base` is where the caller
+/// writes the post-dispatch content back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageImageUpload {
     pub width: u32,
     pub height: u32,
-    /// Initial RGBA8 content, `width * height * 4` bytes.
+    /// Volume depth: 1 for a 2D UAV; > 1 creates a `VK_IMAGE_TYPE_3D`
+    /// storage image (measured: ASTRO.BOT's 240x135x64 UAV volumes).
+    pub depth: u32,
+    /// The Vulkan texel format matching the recompiled SPIR-V's `%ImageL`
+    /// declaration: `R8G8B8A8_UNORM` (Rgba8) or `R16G16B16A16_SFLOAT`
+    /// (Rgba16f, guest T# format 71).
+    pub format: vk::Format,
+    /// Initial content, `width * height * depth * texel_bytes()` bytes.
     pub pixels: Vec<u8>,
     /// Guest base address for the post-dispatch writeback.
     pub guest_base: u64,
 }
 
+impl StorageImageUpload {
+    /// Bytes per texel of [`Self::format`].
+    #[must_use]
+    pub fn texel_bytes(&self) -> u32 {
+        if self.format == vk::Format::R16G16B16A16_SFLOAT {
+            8
+        } else {
+            4
+        }
+    }
+}
+
 /// One descriptor binding containing an array of storage images.
 ///
 /// The recompiled SPIR-V declares `%textures2D_L` as
-/// `OpTypeImage %float 2D 0 0 0 2 Rgba8` — a STORAGE_IMAGE array in
-/// R8G8B8A8_UNORM — indexed by dword 0 of the rewritten T# it reads from the
-/// push constants.
+/// `OpTypeImage %float <dim> 0 0 0 2 <format>` — a STORAGE_IMAGE array in
+/// the upload's format — indexed by dword 0 of the rewritten T# it reads
+/// from the push constants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageImageBinding {
     pub binding: u32,
@@ -147,8 +167,9 @@ pub struct TextureUpload {
     /// Linear (de-tiled) pixel data, tightly packed rows, `layers` images
     /// (or `depth` slices for a volume) back to back.
     pub pixels: Vec<u8>,
-    /// Array layers: 1 for a plain 2D texture, 6 for a cube map. Always 1
-    /// for a 3D volume (`depth > 1`).
+    /// Array layers: 1 for a plain 2D texture, 6 for a cube map, the T#
+    /// depth field + 1 for a 2DArray (type 13). Always 1 for a 3D volume
+    /// (`depth > 1`).
     pub layers: u32,
     /// Create the view as `CUBE` (requires `layers == 6`).
     pub cube: bool,
@@ -1509,6 +1530,10 @@ impl<'a> Resources<'a> {
                 vk::ImageViewType::CUBE
             } else if volume {
                 vk::ImageViewType::TYPE_3D
+            } else if upload.layers > 1 {
+                // 2DArray (T# type 13) — the recompiled SPIR-V samples an
+                // arrayed 2D image (measured: ASTRO.BOT's 1536x1536x3).
+                vk::ImageViewType::TYPE_2D_ARRAY
             } else {
                 vk::ImageViewType::TYPE_2D
             })

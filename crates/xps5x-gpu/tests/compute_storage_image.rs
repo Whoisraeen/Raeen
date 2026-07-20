@@ -125,6 +125,8 @@ fn compute_shader_writes_are_visible_in_storage_image_readback() {
             images: vec![StorageImageUpload {
                 width: 2,
                 height: 2,
+                depth: 1,
+                format: vk::Format::R8G8B8A8_UNORM,
                 pixels: vec![0xEE; 16],
                 guest_base: 0,
             }],

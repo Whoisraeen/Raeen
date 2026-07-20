@@ -1105,6 +1105,7 @@ fn shader_parse_vopc(
         // VOPC cmpx block mirrors cmp at +0x10, so 0x12 is v_cmpx_eq_f32
         // (measured: ASTRO.BOT compute).
         0x12 => inst.type_ = T::VCmpxEqF32,
+        0x13 => inst.type_ = T::VCmpxLeF32,
         0x14 => inst.type_ = T::VCmpxGtF32,
         0x16 => inst.type_ = T::VCmpxGeF32,
         0x1c => inst.type_ = T::VCmpxNleF32,
@@ -1762,6 +1763,7 @@ fn shader_parse_vop3(
         0x0e => inst.type_ = T::VCmpNltF32,
         0x0f => inst.type_ = T::VCmpTruF32,
         0x12 => inst.type_ = T::VCmpxEqF32,
+        0x13 => inst.type_ = T::VCmpxLeF32,
         0x16 => inst.type_ = T::VCmpxGeF32,
         0x1c => inst.type_ = T::VCmpxNleF32,
         0x1d => inst.type_ = T::VCmpxNeqF32,
@@ -1987,8 +1989,8 @@ fn shader_parse_vop3(
         0x146 => inst.type_ = T::VCubeTcF32,
         0x147 => inst.type_ = T::VCubeMaF32,
         0x148 => inst.type_ = T::VBfeU32,
-        0x149 => return Err(ni(dst, S, "v_bfe_i32", opcode, pc, b0)),
-        0x14a => return Err(ni(dst, S, "v_bfi_b32", opcode, pc, b0)),
+        0x149 => inst.type_ = T::VBfeI32,
+        0x14a => inst.type_ = T::VBfiB32,
         0x14b => inst.type_ = T::VFmaF32,
         0x14c => return Err(ni(dst, S, "v_fma_f64", opcode, pc, b0)),
         0x14d => return Err(ni(dst, S, "v_lerp_u8", opcode, pc, b0)),
@@ -3202,7 +3204,25 @@ fn shader_parse_ds(
         }
         0xfd => return Err(ni(dst, S, "ds_condxchg32_rtn_b128", opcode, pc, b0)),
         0xfe => return Err(ni(dst, S, "ds_read_b96", opcode, pc, b0)),
-        0xff => return Err(ni(dst, S, "ds_read_b128", opcode, pc, b0)),
+        // Beyond Kyty (KYTY_NI upstream): four consecutive LDS dwords read
+        // at the single 16-bit BYTE offset (RDNA2 ISA `DS_READ_B128`) —
+        // measured on ASTRO.BOT scene compute (58 dispatches/run). Extends
+        // the b64 model: dword k reads at `offset + 4k` in the recompiler.
+        0xff => {
+            if gds != 0 {
+                return Err(feature(S, "ds_read_b128 with gds == 1", pc));
+            }
+            if data0 != 0 || data1 != 0 {
+                return Err(feature(S, "ds_read_b128 with data operands", pc));
+            }
+            inst.type_ = T::DsReadB128;
+            inst.format = F::Vdst4Vsrc0Vsrc1;
+            inst.dst.size = 4;
+            inst.src[0] = operand_parse(addr + 256)?;
+            inst.src[1].type_ = O::LiteralConstant;
+            inst.src[1].constant.u = offset0 | (offset1 << 8);
+            inst.src_num = 2;
+        }
         _ => return Err(unknown_op(dst, S, opcode, pc, b0)),
     }
 

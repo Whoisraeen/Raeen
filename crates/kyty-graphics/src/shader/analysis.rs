@@ -978,8 +978,11 @@ pub fn shader_parse_usage(
                     )?;
                     info.textures2d_readwrite += 1;
                     let last = (bind.textures2d.textures_num - 1) as usize;
-                    if bind.textures2d.desc[last].texture.type_() != 9 {
-                        return Err(ni("read-write texture type != 9 (Texture2D)"));
+                    let ty = bind.textures2d.desc[last].texture.type_();
+                    // 9 = Texture2D; 10 = 3D volume (same storage-image
+                    // machinery as the table-1 walk — see there).
+                    if ty != 9 && ty != 10 {
+                        return Err(ni("read-write texture type != 9/10 (Texture2D/3D)"));
                     }
                 }
             }
@@ -1230,6 +1233,30 @@ pub fn shader_parse_usage2(
     // `read_sharp_fields` already know how to index.
     let extended_buffer: Option<EudView<'_>> = eud;
 
+    // Record the recovered EUD base in `bind.extended` (Kyty sets this in
+    // the legacy usage-0x1b arm; the Gen5 tables have no such slot — the
+    // pointer pair is recovered by `read_extended_user_data`). The
+    // recompiler needs it twice: `Spirv::WriteLocalVariables` rebases each
+    // extended sharp's push-constant mapping on this register, and the
+    // `s_load_dwordx*` translation recognises loads THROUGH the pair as
+    // descriptor fetches (461 measured ASTRO.BOT CS refusals on "extended
+    // storage buffer mapping" without it). `info.extended_buffer` stays
+    // false deliberately: that flag only feeds the "vs: extended buffer"
+    // gate, and Gen5 VS shaders with an EUD must keep resolving as before.
+    if let Some(e) = extended_buffer {
+        if !bind.extended.used {
+            bind.extended.used = true;
+            bind.extended.slot = 1;
+            bind.extended.start_register = e.base_dw;
+            if let Ok(base) = usize::try_from(e.base_dw) {
+                if base + 1 < UserSgprInfo::SGPRS_MAX {
+                    bind.extended.data.fields[0] = user_sgpr.value[base];
+                    bind.extended.data.fields[1] = user_sgpr.value[base + 1];
+                }
+            }
+        }
+    }
+
     let mut direct_sgprs = [false; UserSgprInfo::SGPRS_MAX];
     for (i, flag) in direct_sgprs.iter_mut().enumerate() {
         *flag = (i as i32) < user_sgpr_num;
@@ -1275,6 +1302,53 @@ pub fn shader_parse_usage2(
                 info.vertex_attrib_reg = reg;
                 clear_direct(&mut direct_sgprs, offset as usize)?;
                 clear_direct(&mut direct_sgprs, offset as usize + 1)?;
+            }
+
+            // Direct type 0 — IMM_RESOURCE, beyond Kyty (upstream EXITs on
+            // anything but 8/10 in this table): a read-only T#/V# descriptor
+            // the driver preloaded into the user SGPRs at `offset`. The
+            // legacy usage-0x00 arm disambiguates V# vs T# with the slot's
+            // `flags`, but the direct table carries no flags — so use the
+            // descriptor's own type nibble exactly like the sharp-table
+            // walks below (dword3[28:31] reads 0 for a buffer, the
+            // shadPS4-confirmed overlap). One entry per type in this table,
+            // so the slot is 0 (same as the type-1 arm). 59 measured
+            // ASTRO.BOT CS dispatches print `unknown usage type: 0x00`
+            // through this Gen5 table.
+            0 => {
+                let mut peek = [0u32; 4];
+                read_sharp_fields(
+                    &mut direct_sgprs,
+                    reg,
+                    user_sgpr,
+                    extended_buffer,
+                    &mut peek,
+                )?;
+                if (peek[3] >> 28) & 0xF == 0 {
+                    shader_get_storage_buffer(
+                        &mut bind.storage_buffers,
+                        &mut direct_sgprs,
+                        reg,
+                        0,
+                        ShaderStorageUsage::ReadOnly,
+                        user_sgpr,
+                        extended_buffer,
+                    )?;
+                    info.storage_buffers_readonly += 1;
+                } else {
+                    shader_get_texture_buffer(
+                        &mut bind.textures2d,
+                        &mut direct_sgprs,
+                        reg,
+                        0,
+                        ShaderTextureUsage::ReadOnly,
+                        user_sgpr,
+                        extended_buffer,
+                    )?;
+                    info.textures2d_readonly += 1;
+                    let last = (bind.textures2d.textures_num - 1) as usize;
+                    check_read_only_texture_type(&bind.textures2d.desc[last].texture)?;
+                }
             }
 
             // Direct type 1 — IMM_SAMPLER, beyond Kyty (upstream EXITs on
@@ -1450,15 +1524,18 @@ pub fn shader_parse_usage2(
             extended_buffer,
         )?;
         info.textures2d_readwrite += 1;
-        // The storage-image (UAV) machinery is 2D-only (RGBA8 `%textures2D_L`
-        // + linear guest writeback); a non-2D RW image stays a named refusal
+        // The storage-image (UAV) machinery covers 2D (type 9) and — round
+        // 7, 58 measured ASTRO.BOT CS dispatches — 3D volumes (type 10,
+        // measured 240x135x64 format 71): `%textures2D_L` is dim- and
+        // format-parametric and the compute path uploads/writes back the
+        // whole volume linearly. Other RW image types stay a named refusal
         // with the full descriptor evidence.
         let last = (bind.textures2d.textures_num - 1) as usize;
         let t = &bind.textures2d.desc[last].texture;
-        if t.type_() != 9 {
+        if t.type_() != 9 && t.type_() != 10 {
             return Err(ni_owned(format!(
-                "read-write (table 1) texture type {} is not Texture2D (9) \
-                 (10=3D 11=Cube 12=1DArray 13=2DArray; base={:#x} {}x{} depth={} format={} tile={})",
+                "read-write (table 1) texture type {} is not Texture2D (9) or 3D (10) \
+                 (11=Cube 12=1DArray 13=2DArray; base={:#x} {}x{} depth={} format={} tile={})",
                 t.type_(),
                 t.base40(),
                 u32::from(t.width5()) + 1,
@@ -4252,6 +4329,131 @@ mod tests {
         // s4..s7 consumed; s0..s3 stay direct.
         assert_eq!(info.direct_sgprs, 4);
         assert_eq!(&bind.direct_sgprs.start_register[..4], &[0, 1, 2, 3]);
+    }
+
+    /// A recovered EUD must land in `bind.extended` (used + the pointer-pair
+    /// register + the pair's captured values) so the recompiler can rebase
+    /// extended sharps and translate `s_load_dwordx*` through the pair —
+    /// while `info.extended_buffer` stays false (it only feeds the
+    /// "vs: extended buffer" gate).
+    #[test]
+    fn parse_usage2_records_recovered_eud_base_in_bind_extended() {
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[12] = 0x0050_6730; // EUD pointer lo
+        value[13] = 0x0000_0004; // EUD pointer hi
+        let user_sgpr = UserSgprInfo {
+            value,
+            type_: [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX],
+            count: 14,
+        };
+        let user_data = ShaderUserData {
+            direct_resource_offset: vec![0xffff; 8],
+            sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+            eud_size_dw: 8,
+            srt_size_dw: 0,
+        };
+        let eud = [0u32; 8];
+        let mut info = ShaderParsedUsage::default();
+        let mut bind = ShaderBindResources::default();
+        shader_parse_usage2(
+            &user_data,
+            &mut info,
+            &mut bind,
+            &user_sgpr,
+            14,
+            Some(EudView {
+                data: &eud,
+                base_dw: 12,
+            }),
+        )
+        .expect("EUD-bearing shader must parse");
+        assert!(bind.extended.used);
+        assert_eq!(bind.extended.start_register, 12);
+        assert_eq!(bind.extended.data.fields[0], 0x0050_6730);
+        assert_eq!(bind.extended.data.fields[1], 0x0000_0004);
+        assert!(
+            !info.extended_buffer,
+            "the VS gate flag must not be raised by a recovered EUD"
+        );
+    }
+
+    /// Gen5 direct table type 0 (IMM_RESOURCE) — previously the
+    /// `unknown usage type: 0x00` refusal (59 measured ASTRO.BOT CS
+    /// failures). A descriptor whose type nibble reads 0 is a V#: it binds
+    /// as a read-only storage buffer.
+    #[test]
+    fn parse_usage2_direct_type0_binds_buffer_by_type_nibble() {
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[4] = 0x0050_0000; // base lo
+        value[5] = 0x0000_0004; // base hi + stride
+        value[6] = 0x0000_0100; // num_records
+        value[7] = 0x0111_0000; // dword3: type nibble (bits 28..31) == 0 => V#
+        let mut type_ = [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX];
+        type_[4..8].fill(UserSgprType::Vsharp);
+        let user_sgpr = UserSgprInfo {
+            value,
+            type_,
+            count: 8,
+        };
+        let mut direct = vec![0xffff_u16; 8];
+        direct[0] = 4; // IMM_RESOURCE at s4..s7
+        let user_data = ShaderUserData {
+            direct_resource_offset: direct,
+            sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+            eud_size_dw: 0,
+            srt_size_dw: 0,
+        };
+        let mut info = ShaderParsedUsage::default();
+        let mut bind = ShaderBindResources::default();
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 8, None)
+            .expect("direct type 0 (IMM_RESOURCE) must bind");
+        assert_eq!(info.storage_buffers_readonly, 1);
+        assert_eq!(bind.storage_buffers.buffers_num, 1);
+        assert_eq!(bind.storage_buffers.start_register[0], 4);
+        assert_eq!(bind.storage_buffers.slots[0], 0);
+        assert_eq!(bind.storage_buffers.usages[0], ShaderStorageUsage::ReadOnly);
+        assert_eq!(
+            bind.storage_buffers.buffers[0].fields,
+            [0x0050_0000, 0x0000_0004, 0x0000_0100, 0x0111_0000]
+        );
+        // s4..s7 consumed; s0..s3 stay direct.
+        assert_eq!(info.direct_sgprs, 4);
+        assert_eq!(&bind.direct_sgprs.start_register[..4], &[0, 1, 2, 3]);
+    }
+
+    /// The T# half of the direct type-0 arm: a nonzero type nibble routes
+    /// into the texture table (type 9 = Texture2D passes the read-only
+    /// check).
+    #[test]
+    fn parse_usage2_direct_type0_binds_texture_by_type_nibble() {
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[0] = 0x0050_0000;
+        value[1] = 0x0000_0004;
+        value[2] = 0x0000_0100;
+        value[3] = 0x9000_0000; // dword3: type nibble == 9 => Texture2D
+        let mut type_ = [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX];
+        type_[0..8].fill(UserSgprType::Vsharp);
+        let user_sgpr = UserSgprInfo {
+            value,
+            type_,
+            count: 8,
+        };
+        let mut direct = vec![0xffff_u16; 8];
+        direct[0] = 0; // IMM_RESOURCE at s0..s7 (8-dword T#)
+        let user_data = ShaderUserData {
+            direct_resource_offset: direct,
+            sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+            eud_size_dw: 0,
+            srt_size_dw: 0,
+        };
+        let mut info = ShaderParsedUsage::default();
+        let mut bind = ShaderBindResources::default();
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 8, None)
+            .expect("direct type 0 (IMM_RESOURCE, T#) must bind");
+        assert_eq!(info.textures2d_readonly, 1);
+        assert_eq!(bind.textures2d.textures_num, 1);
+        assert_eq!(bind.textures2d.desc[0].start_register, 0);
+        assert_eq!(info.direct_sgprs, 0, "all eight registers are consumed");
     }
 
     /// A sharp resident in the real user SGPRs must read direct even when an

@@ -581,6 +581,13 @@ pub fn tile_64kb_s(linear: &[u8], width: u32, height: u32, bpp_log2: u32) -> Vec
     tile_64kb_with(linear, width, height, bpp_log2, &RB_PLUS_64K_STANDARD)
 }
 
+/// `SW_64KB_Z_X` twin of [`tile_64kb_r_x`] (SWIZZLE_MODE 24), for the
+/// 2DArray decode round-trip test.
+#[cfg(test)]
+pub fn tile_64kb_z_x(linear: &[u8], width: u32, height: u32, bpp_log2: u32) -> Vec<u8> {
+    tile_64kb_with(linear, width, height, bpp_log2, &RB_PLUS_64K_DEPTH_X)
+}
+
 /// Tile a linear surface into a 64 KiB-block swizzle — the exact inverse of
 /// [`detile_64kb_with`], used by the round-trip consistency tests.
 #[cfg(test)]

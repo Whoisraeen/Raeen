@@ -74,6 +74,12 @@ pub enum ShaderInstructionType {
     /// Kyty `KYTY_NI`; measured on ASTRO.BOT scene compute (raw 0xd9d80000,
     /// 58 dispatches/run).
     DsReadB64,
+    /// DS 0xff: four CONSECUTIVE LDS dwords read at the single 16-bit byte
+    /// offset into `vdst..vdst+3` (RDNA2 ISA `DS_READ_B128`). Kyty
+    /// `KYTY_NI`; measured on ASTRO.BOT scene compute (58 dispatches/run).
+    /// Extends the b64 model: dst = 4 consecutive VGPRs, src0 = address,
+    /// src1 = the byte offset literal (dword k reads at `offset + 4k`).
+    DsReadB128,
     /// DS 0x36: LDS (workgroup-shared) dword read. Kyty leaves it `KYTY_NI`
     /// (only the GDS append/consume pair is implemented upstream); lowered to
     /// an `OpLoad` from the `%lds` Workgroup array. Read twin of `DsWriteB32`.
@@ -202,7 +208,15 @@ pub enum ShaderInstructionType {
     VAshrI32,
     VAshrrevI32,
     VBcntU32B32,
+    /// VOP3 0x149: signed bitfield extract — `vdst = SignExtend((vsrc0 >>
+    /// vsrc1[4:0])[vsrc2[4:0]-1 : 0])`. Signed twin of `VBfeU32`; measured
+    /// on ASTRO.BOT scene compute (58 dispatches/run).
+    VBfeI32,
     VBfeU32,
+    /// VOP3 0x14a: bitfield insert — `vdst = (vsrc0 & vsrc1) | (~vsrc0 &
+    /// vsrc2)`. Kyty `KYTY_NI`; measured on ASTRO.BOT scene compute
+    /// (58 dispatches/run).
+    VBfiB32,
     VBfmB32,
     VBfrevB32,
     VCeilF32,
@@ -249,6 +263,10 @@ pub enum ShaderInstructionType {
     VCmpxEqI32,
     VCmpxGeI32,
     VCmpxGtI32,
+    /// VOPC 0x13: `exec/smask = vsrc0 <= vsrc1` (ordered). Exec-writing
+    /// sibling of `VCmpLeF32`; measured in ASTRO.BOT scene CS
+    /// (58 dispatches/run).
+    VCmpxLeF32,
     VCmpxLeI32,
     VCmpxLtF32,
     VCmpxLtI32,
@@ -545,6 +563,10 @@ pub mod shader_instruction_format {
         /// encoded dword-unit fields scaled by 4, so every DS recompiler
         /// indexes `%lds` the same way).
         Vdst2Vsrc0Vsrc1Vsrc2 = format_define(&[DA2, S0, S1, S2]),
+        /// Beyond Kyty: `ds_read_b128 vdst[4], addr [offset]` — dst = 4
+        /// consecutive VGPRs, src0 = address VGPR, src1 = the 16-bit byte
+        /// offset as a literal constant (dword k reads at `offset + 4k`).
+        Vdst4Vsrc0Vsrc1 = format_define(&[DA4, S0, S1]),
         /// Beyond Kyty: `ds_write_b32 addr, data0 [offset]` — src0 = address
         /// VGPR, src1 = data VGPR, src2 = the 16-bit instruction byte offset
         /// as a literal constant.

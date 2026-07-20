@@ -33,6 +33,7 @@
 
 use std::fmt;
 
+use crate::hw_regs::UserSgprInfo;
 use crate::shader::resources::{
     ShaderBindResources, ShaderComputeInputInfo, ShaderPixelInputInfo, ShaderVertexInputInfo,
 };
@@ -1764,6 +1765,49 @@ fn lane_sel_snippet(lane_sel: u8, src: &str, dst: &str) -> Option<String> {
     ))
 }
 
+/// The dword offset of an extended (EUD-resident) sharp inside the EUD —
+/// the index the shader's `s_load_dwordx*` byte-offset literal (`>> 2`)
+/// addresses, and therefore the `extended_mapping` slot `GetMappedIndex`
+/// resolves at recompile time.
+///
+/// Kyty hardcodes `start_register - 16` (the PS4 user-SGPR count); this
+/// mirrors `read_sharp_fields`' measured Gen5 residence rules instead:
+///
+/// * `start >= SGPRS_MAX` (32): the EUD is addressed as a continuation of
+///   the register FILE — rebase by the file size.
+/// * otherwise the sharp sits at `start - eud_base`, where `eud_base` is
+///   the pointer-pair register the analysis recorded in
+///   `bind.extended.start_register` (measured on ASTRO.BOT compute: T# at
+///   start_register=12 with the EUD pair at (s12, s13) → EUD dword 0).
+fn eud_rel_index(
+    bind: &ShaderBindResources,
+    start_reg: i32,
+    shift_regs: i32,
+    what: &str,
+) -> Result<i32, ShaderRecompileError> {
+    if shift_regs != 0 {
+        return Err(not_supported(
+            "Spirv::WriteLocalVariables",
+            format!("extended {what} mapping with gs_prolog register shift"),
+        ));
+    }
+    let sgprs_max = UserSgprInfo::SGPRS_MAX as i32;
+    if start_reg >= sgprs_max {
+        return Ok(start_reg - sgprs_max);
+    }
+    if !bind.extended.used || start_reg < bind.extended.start_register {
+        return Err(not_supported(
+            "Spirv::WriteLocalVariables",
+            format!(
+                "extended {what} at s{start_reg} has no EUD base to rebase on \
+                 (extended.used={}, eud_base={})",
+                bind.extended.used, bind.extended.start_register
+            ),
+        ));
+    }
+    Ok(start_reg - bind.extended.start_register)
+}
+
 /// The single `OpTypeImage` Dim of the sampled-texture array
 /// (`%textures2D_S`), decided from the measured T# types: 9 (and the
 /// height-1 "1D" 8) = 2D, 10 = 3D volume, 11 = Cube, 13 = 2DArray
@@ -1841,6 +1885,50 @@ pub(crate) fn sampled_texture_dim(
             ),
         )),
     }
+}
+
+/// The single `OpTypeImage` (Dim, storage format) of the STORAGE
+/// (read-write) image array (`%textures2D_L`), decided from the measured RW
+/// T#s: type 9 = 2D, type 10 = 3D (ASTRO.BOT: 240x135x64 UAV volumes);
+/// guest format 71 (16_16_16_16 FLOAT) = `Rgba16f`, everything else keeps
+/// the legacy `Rgba8` view (the 32-bpp guest formats the upload path reads,
+/// or the zero-filled seed). Mixed dims/formats stay a named refusal — one
+/// SPIR-V array type carries exactly one `OpTypeImage`.
+pub(crate) fn storage_texture_dim_format(
+    bind: &ShaderBindResources,
+) -> Result<(SampledDim, &'static str), ShaderRecompileError> {
+    let bound = usize::try_from(bind.textures2d.textures_num)
+        .unwrap_or(0)
+        .min(bind.textures2d.desc.len());
+    let mut chosen: Option<(SampledDim, &'static str)> = None;
+    for d in &bind.textures2d.desc[..bound] {
+        if !d.textures2d_without_sampler {
+            continue; // sampled — lives in %textures2D_S
+        }
+        let dim = match d.texture.type_() {
+            10 => SampledDim::Three,
+            _ => SampledDim::Two,
+        };
+        let format = if d.texture.format() == 71 {
+            "Rgba16f"
+        } else {
+            "Rgba8"
+        };
+        match chosen {
+            None => chosen = Some((dim, format)),
+            Some(prev) if prev == (dim, format) => {}
+            Some(prev) => {
+                return Err(not_supported(
+                    "storage_texture_dim_format",
+                    format!(
+                        "mixed storage image dims/formats in one shader \
+                         ({prev:?} vs ({dim:?}, {format}))"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(chosen.unwrap_or((SampledDim::Two, "Rgba8")))
 }
 
 /// Kyty: ShaderSpirv.cpp `operand_is_exec` (L1671).
@@ -2182,7 +2270,7 @@ impl<'a> Spirv<'a> {
             cs_input_info: None,
             ps_input_info: None,
             bind: None,
-            extended_mapping: [[0; 2]; 64],
+            extended_mapping: [[-1; 2]; 64],
             debug_printf_enabled: false,
         }
     }
@@ -2237,7 +2325,10 @@ impl<'a> Spirv<'a> {
         self.bind
     }
 
-    /// Kyty: `Spirv::GetMappedIndex` (L1495).
+    /// Kyty: `Spirv::GetMappedIndex` (L1495). Deviation: an unfilled slot
+    /// (the -1 sentinel `WriteLocalVariables` seeds) is a named refusal —
+    /// Kyty's zero default would silently route the load to push constant
+    /// (0, 0), i.e. another resource's descriptor.
     pub fn get_mapped_index(&self, offset: i32) -> Result<(i32, i32), ShaderRecompileError> {
         let Some(m) = usize::try_from(offset)
             .ok()
@@ -2248,6 +2339,12 @@ impl<'a> Spirv<'a> {
                 format!("offset {offset} >= extended mapping size"),
             ));
         };
+        if m[0] < 0 || m[1] < 0 {
+            return Err(not_supported(
+                "Spirv::GetMappedIndex",
+                format!("EUD dword {offset} is not a captured descriptor field"),
+            ));
+        }
         Ok((m[0], m[1]))
     }
 
@@ -2844,8 +2941,10 @@ impl<'a> Spirv<'a> {
                                        %SampledImage = OpTypeSampledImage %ImageS
 "#;
 
+        // Dim and storage format parametric (round 7 — 3D Rgba16f UAVs
+        // measured on ASTRO.BOT); see `storage_texture_dim_format`.
         const TEXTURES_LOADED_TYPES: &str = r#"
-                                             %ImageL = OpTypeImage %float 2D 0 0 0 2 Rgba8
+                                             %ImageL = OpTypeImage %float <dim> 0 <arrayed> 0 2 <format>
                     %textures2D_L_uint_<buffers_num> = OpConstant %uint <buffers_num>
                      %_arr_ImageL_uint_<buffers_num> = OpTypeArray %ImageL %textures2D_L_uint_<buffers_num>
 %_ptr_UniformConstant__arr_ImageL_uint_<buffers_num> = OpTypePointer UniformConstant %_arr_ImageL_uint_<buffers_num>
@@ -2900,10 +2999,15 @@ impl<'a> Spirv<'a> {
                     .replace("<arrayed>", dim.arrayed_str());
             }
             if bind.textures2d.textures2d_storage_num > 0 {
-                self.source += &TEXTURES_LOADED_TYPES.replace(
-                    "<buffers_num>",
-                    &format!("{}", bind.textures2d.textures2d_storage_num),
-                );
+                let (dim, format) = storage_texture_dim_format(bind)?;
+                self.source += &TEXTURES_LOADED_TYPES
+                    .replace(
+                        "<buffers_num>",
+                        &format!("{}", bind.textures2d.textures2d_storage_num),
+                    )
+                    .replace("<dim>", dim.dim_str())
+                    .replace("<arrayed>", dim.arrayed_str())
+                    .replace("<format>", format);
             }
             if bind.samplers.samplers_num > 0 {
                 self.source += &SAMPLERS_TYPES
@@ -2945,6 +3049,7 @@ impl<'a> Spirv<'a> {
             T::DsWriteB32,
             T::DsRead2B32,
             T::DsReadB64,
+            T::DsReadB128,
             T::DsWriteB96,
             T::DsWriteB128,
         ])
@@ -3253,9 +3358,13 @@ impl<'a> Spirv<'a> {
                 0
             };
 
+            // Deviation from Kyty (which resets to 0): unfilled slots keep
+            // the -1 sentinel so `GetMappedIndex` refuses an EUD dword no
+            // captured descriptor covers instead of silently reading push
+            // constant (0, 0).
             for m in &mut self.extended_mapping {
-                m[0] = 0;
-                m[1] = 0;
+                m[0] = -1;
+                m[1] = -1;
             }
 
             let push_slots = bind.push_constant_size as i32 / 16;
@@ -3275,13 +3384,8 @@ impl<'a> Spirv<'a> {
                 let buffer = format!("{}", buffer_index + i);
                 for f in 0..4 {
                     if extended {
-                        if start_reg < 16 || shift_regs != 0 {
-                            return Err(not_supported(
-                                "Spirv::WriteLocalVariables",
-                                "extended storage buffer mapping",
-                            ));
-                        }
-                        let idx = (start_reg - 16 + f) as usize;
+                        let rel = eud_rel_index(bind, start_reg, shift_regs, "storage buffer")?;
+                        let idx = (rel + f) as usize;
                         if idx >= self.extended_mapping.len() {
                             return Err(not_supported(
                                 "Spirv::WriteLocalVariables",
@@ -3318,13 +3422,8 @@ impl<'a> Spirv<'a> {
                     let buffer = format!("{}", buffer_index + i * 2 + ti);
                     for f in 0..4 {
                         if extended {
-                            if start_reg < 16 || shift_regs != 0 {
-                                return Err(not_supported(
-                                    "Spirv::WriteLocalVariables",
-                                    "extended texture mapping",
-                                ));
-                            }
-                            let idx = (start_reg - 16 + 4 * ti + f) as usize;
+                            let rel = eud_rel_index(bind, start_reg, shift_regs, "texture")?;
+                            let idx = (rel + 4 * ti + f) as usize;
                             if idx >= self.extended_mapping.len() {
                                 return Err(not_supported(
                                     "Spirv::WriteLocalVariables",
@@ -3361,13 +3460,8 @@ impl<'a> Spirv<'a> {
                 let buffer = format!("{}", buffer_index + i);
                 for f in 0..4 {
                     if extended {
-                        if start_reg < 16 || shift_regs != 0 {
-                            return Err(not_supported(
-                                "Spirv::WriteLocalVariables",
-                                "extended sampler mapping",
-                            ));
-                        }
-                        let idx = (start_reg - 16 + f) as usize;
+                        let rel = eud_rel_index(bind, start_reg, shift_regs, "sampler")?;
+                        let idx = (rel + f) as usize;
                         if idx >= self.extended_mapping.len() {
                             return Err(not_supported(
                                 "Spirv::WriteLocalVariables",
@@ -3401,13 +3495,8 @@ impl<'a> Spirv<'a> {
                 }
 
                 if extended {
-                    if start_reg < 16 || shift_regs != 0 {
-                        return Err(not_supported(
-                            "Spirv::WriteLocalVariables",
-                            "extended gds mapping",
-                        ));
-                    }
-                    let idx = (start_reg - 16) as usize;
+                    let rel = eud_rel_index(bind, start_reg, shift_regs, "gds pointer")?;
+                    let idx = rel as usize;
                     if idx >= self.extended_mapping.len() {
                         return Err(not_supported(
                             "Spirv::WriteLocalVariables",
@@ -4041,6 +4130,21 @@ impl<'a> Spirv<'a> {
         if self.uses_lds() {
             // The LDS index clamp bound (see recompile_ds_write/read_b32).
             self.add_constant_uint(self.lds_size_dw() - 1);
+        }
+        // DS_READ_B128 derives its 2nd..4th dword offsets from the single
+        // encoded byte-offset literal (`offset + 4k`) — materialise them so
+        // the recompiler's `get_constant_uint` lookups resolve.
+        let b128_offsets: Vec<u32> = self
+            .code
+            .get_instructions()
+            .iter()
+            .filter(|i| i.type_ == ShaderInstructionType::DsReadB128)
+            .map(|i| i.src[1].constant.u)
+            .collect();
+        for off in b128_offsets {
+            for k in 1..4 {
+                self.add_constant_uint(off + 4 * k);
+            }
         }
         Ok(())
     }

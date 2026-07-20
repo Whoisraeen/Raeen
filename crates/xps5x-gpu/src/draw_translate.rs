@@ -549,24 +549,31 @@ fn decode_texture(
         return Err(err(format!("texture extent {width}x{height} out of range")));
     }
     // 9 = Texture2D, 11 = Cube (measured: Minecraft's 1024x1024x6 skybox),
-    // 10 = 3D volume (measured: ASTRO.BOT's 240x135x64 froxel/LUT volumes).
-    let (cube, volume) = match t.type_() {
+    // 10 = 3D volume (measured: ASTRO.BOT's 240x135x64 froxel/LUT volumes),
+    // 13 = 2DArray (measured: ASTRO.BOT's 1536x1536x3 array, tile 24 —
+    // the T# depth field carries the layer count).
+    let (cube, volume, array) = match t.type_() {
         // 8 = Texture1D. A 1D image is a 2D image one row tall, and the T#
         // already reports height5 = 0 => height 1, so the existing 2D decode
         // path handles it unchanged (measured on ASTRO.BOT: a 1x1 format-71
         // texture, tile mode 27). Kept a distinct arm rather than folding into
         // 9 so the disagreement is visible if a >1-row "1D" texture ever shows.
-        8 => (false, false),
-        9 => (false, false),
-        10 => (false, true),
-        11 => (true, false),
+        8 => (false, false, false),
+        9 => (false, false, false),
+        10 => (false, true, false),
+        11 => (true, false, false),
+        13 => (false, false, true),
         other => {
             return Err(err(format!(
-                "texture type {other} is not Texture2D (9), 3D (10) or Cube (11)"
+                "texture type {other} is not Texture2D (9), 3D (10), Cube (11) or 2DArray (13)"
             )));
         }
     };
-    let layers = if cube { u32::from(t.depth()) + 1 } else { 1 };
+    let layers = if cube || array {
+        u32::from(t.depth()) + 1
+    } else {
+        1
+    };
     let depth = if volume { u32::from(t.depth()) + 1 } else { 1 };
     if volume && !(1..=2048).contains(&depth) {
         return Err(err(format!("volume depth {depth} out of range")));
@@ -581,6 +588,11 @@ fn decode_texture(
         // coverage/mask texture, tile mode 27). SharpEmu's Gfx10UnifiedFormat
         // maps unified 1 -> (dataFormat 1 = FMT_8, numFormat 0 = UNORM).
         1 => (vk::Format::R8_UNORM, 1),
+        // 7 -> (2,0) = 16 UNORM: a single 16-bit normalized channel
+        // (measured: ASTRO.BOT's 1536x1536x3 2DArray, tile mode 24).
+        // SharpEmu Gfx10UnifiedFormat maps unified 7 -> (dataFormat 2 = 16,
+        // numFormat 0 = UNORM).
+        7 => (vk::Format::R16_UNORM, 2),
         // 36 = 10_11_11 FLOAT (packed 32-bit HDR) — the title samples its HDR
         // render target as a texture. SharpEmu Gfx10UnifiedFormat maps unified
         // 36 -> (dataFormat 6 = 10_11_11, numFormat 7 = FLOAT).
@@ -620,9 +632,9 @@ fn decode_texture(
     };
 
     let pixels = match t.tile_mode() {
-        0 if cube => {
+        0 if cube || array => {
             return Err(err(
-                "cube texture with linear tile mode not implemented (only tiled measured)",
+                "cube/2DArray texture with linear tile mode not implemented (only tiled measured)",
             ));
         }
         0 => {
@@ -724,9 +736,9 @@ fn decode_texture(
     })
 }
 
-/// Gen5 unified T# formats that are 32 bits per pixel — the only ones whose
-/// guest bytes can seed an `R8G8B8A8_UNORM` storage image directly (the
-/// recompiled SPIR-V declares every `%textures2D_L` entry as `Rgba8`).
+/// Gen5 unified T# formats that are 32 bits per pixel — their guest bytes
+/// seed an `R8G8B8A8_UNORM` storage image directly (the recompiled SPIR-V's
+/// `%textures2D_L` uses `Rgba8` for them).
 fn storage_image_format_is_32bpp(format: u16) -> bool {
     // 0x0a/56 = 8_8_8_8, 22 = 32 FLOAT, 36 = 10_11_11 FLOAT — see
     // `decode_texture`'s table for the measurements behind each.
@@ -735,23 +747,41 @@ fn storage_image_format_is_32bpp(format: u16) -> bool {
 
 /// Read one storage-image (UAV) T#'s extent and initial guest content.
 ///
-/// The content is a best-effort seed: a UAV is typically fully overwritten by
-/// the dispatch, so a T# whose format is not 32-bpp (RGBA8-sized) or whose
-/// guest range is unreadable zero-fills with a once-per-process warning
-/// instead of failing the dispatch.
+/// A type-10 T# is a 3D UAV (`depth` slices back to back — measured:
+/// ASTRO.BOT's 240x135x64 format-71 volumes); format 71 uploads as
+/// `R16G16B16A16_SFLOAT` (8 B/texel) matching the recompiled `Rgba16f`
+/// image, everything else keeps the RGBA8 view. The content is a
+/// best-effort seed: a UAV is typically fully overwritten by the dispatch,
+/// so an unknown format or unreadable guest range zero-fills with a
+/// once-per-process warning instead of failing the dispatch.
 fn read_storage_image(
     t: &kyty_graphics::shader::ShaderTextureResource,
 ) -> Result<StorageImageUpload, DrawError> {
     let width = u32::from(t.width5()) + 1;
     let height = u32::from(t.height5()) + 1;
-    if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) {
+    let depth = if t.type_() == 10 {
+        u32::from(t.depth()) + 1
+    } else {
+        1
+    };
+    if !(1..=16384).contains(&width)
+        || !(1..=16384).contains(&height)
+        || !(1..=2048).contains(&depth)
+    {
         return Err(err(format!(
-            "storage image extent {width}x{height} out of range"
+            "storage image extent {width}x{height}x{depth} out of range"
         )));
     }
-    let size = u64::from(width) * u64::from(height) * 4;
+    // Must agree with `kyty-graphics` `storage_texture_dim_format` (which
+    // declares `%ImageL` as Rgba16f exactly for guest format 71).
+    let (format, texel) = if t.format() == 71 {
+        (vk::Format::R16G16B16A16_SFLOAT, 8u64)
+    } else {
+        (vk::Format::R8G8B8A8_UNORM, 4u64)
+    };
+    let size = u64::from(width) * u64::from(height) * u64::from(depth) * texel;
     let base = t.base40();
-    let readable = storage_image_format_is_32bpp(t.format());
+    let readable = t.format() == 71 || storage_image_format_is_32bpp(t.format());
     let pixels = if readable {
         // Linear read: UAV surfaces the title dispatches into are addressed
         // by the shader itself, so no de-tiling is applied to the seed.
@@ -765,10 +795,10 @@ fn read_storage_image(
         if !WARNED.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 base = format_args!("{base:#x}"),
-                extent = format_args!("{width}x{height}"),
+                extent = format_args!("{width}x{height}x{depth}"),
                 format = t.format(),
-                readable_as_32bpp = readable,
-                "storage image initial content unavailable (non-32-bpp format \
+                readable,
+                "storage image initial content unavailable (unknown format \
                  or unreadable guest range) — zero-filling; the compute shader \
                  typically overwrites the whole UAV"
             );
@@ -778,6 +808,8 @@ fn read_storage_image(
     Ok(StorageImageUpload {
         width,
         height,
+        depth,
+        format,
         pixels,
         guest_base: base,
     })
@@ -824,6 +856,18 @@ fn render_target_pixels(base: u64, width: u32, height: u32) -> Option<Vec<u8>> {
     })
 }
 
+/// The byte size a V# addresses, per GNM/RDNA V# semantics: `stride == 0`
+/// means a RAW buffer whose `num_records` IS the size in bytes; otherwise
+/// the size is records × stride (shadPS4 `video_core/amdgpu/resource.h`
+/// `Buffer::GetSize`, the RDNA2 authority).
+fn buffer_byte_size(resource: &kyty_graphics::shader::ShaderBufferResource) -> Option<u64> {
+    if resource.stride() == 0 {
+        Some(u64::from(resource.num_records()))
+    } else {
+        u64::from(resource.stride()).checked_mul(u64::from(resource.num_records()))
+    }
+}
+
 fn prepare_stage_binding(
     bind: &ShaderBindResources,
     stage: vk::ShaderStageFlags,
@@ -847,9 +891,14 @@ fn prepare_stage_binding(
             bind.textures2d.textures2d_storage_num
         )));
     }
-    if bind.gds_pointers.pointers_num != 0 || bind.extended.used {
+    // `bind.extended.used` (an EUD was recovered) is NOT a refusal: every
+    // extended sharp's descriptor content was captured at analysis time
+    // into the same resource tables as a direct sharp, so the loops below
+    // bind it like any other — the recompiled shader reads it back through
+    // the push-constant table via the `s_load_dwordx*` EUD translation.
+    if bind.gds_pointers.pointers_num != 0 {
         return Err(err(format!(
-            "translated {stage:?} shader needs unsupported GDS/EUD resources"
+            "translated {stage:?} shader needs unsupported GDS resources"
         )));
     }
 
@@ -874,10 +923,14 @@ fn prepare_stage_binding(
                 "storage buffer {index} uses unsupported add-tid/swizzle/out-of-bounds mode"
             )));
         }
-        let size = u64::from(resource.stride())
-            .checked_mul(u64::from(resource.num_records()))
-            .ok_or_else(|| err("storage buffer size overflow"))?;
-        let bytes = read_guest_bytes(resource.base48(), size, "storage buffer")?;
+        let size = buffer_byte_size(resource).ok_or_else(|| err("storage buffer size overflow"))?;
+        let mut bytes = read_guest_bytes(resource.base48(), size, "storage buffer")?;
+        // The SSBO view is an array of 32-bit elements, so pad the upload to
+        // a dword multiple (a V# byte size need not be one — the recompiler
+        // dropped Kyty's alignment EXIT). The writeback truncates back to
+        // `size` so the pad bytes never reach guest memory.
+        let padded = bytes.len().div_ceil(4) * 4;
+        bytes.resize(padded, 0);
         let all_zero = bytes.iter().all(|&b| b == 0);
         debug!(
             stage = ?stage,
@@ -1610,9 +1663,17 @@ impl DrawSink for OffscreenDrawSink<'_> {
         if storage_num > bind.storage_buffers.buffers.len() {
             return Err(err("compute storage-buffer count exceeds fixed array"));
         }
-        let guest_outputs: Vec<_> = bind.storage_buffers.buffers[..storage_num]
+        // (base address, real V# byte size) — the Vulkan buffer may carry up
+        // to 3 pad bytes (dword-aligned upload), which must never be written
+        // back over guest memory beyond the V#.
+        let guest_outputs: Vec<(u64, usize)> = bind.storage_buffers.buffers[..storage_num]
             .iter()
-            .map(|resource| resource.base48())
+            .map(|resource| {
+                (
+                    resource.base48(),
+                    buffer_byte_size(resource).unwrap_or(0) as usize,
+                )
+            })
             .collect();
         // Storage-image guest bases, collected pre-dispatch in the same order
         // `ComputeOutputs::images` returns them.
@@ -1644,7 +1705,9 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 guest_image_outputs.len()
             )));
         }
-        for (addr, bytes) in guest_outputs.into_iter().zip(outputs.buffers) {
+        for ((addr, real_len), bytes) in guest_outputs.into_iter().zip(outputs.buffers) {
+            // Truncate off the dword-alignment pad (see `guest_outputs`).
+            let bytes = &bytes[..bytes.len().min(real_len)];
             debug!(
                 addr = format_args!("{addr:#x}"),
                 len = bytes.len(),
@@ -1660,7 +1723,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
                     "TRACE_DRAWS: compute writeback"
                 );
             }
-            if !crate::guest_mem::write_bytes_checked(addr, &bytes) {
+            if !crate::guest_mem::write_bytes_checked(addr, bytes) {
                 return Err(err(format!(
                     "compute storage writeback range {addr:#x}..{:#x} is not writable guest memory",
                     addr.saturating_add(bytes.len() as u64)
@@ -1700,6 +1763,31 @@ impl DrawSink for OffscreenDrawSink<'_> {
 mod tests {
     use super::*;
     use kyty_graphics::hw_regs::{ColorAttrib2, ComputeShaderInfo};
+
+    /// GNM V# byte-size semantics: `stride == 0` marks a RAW buffer whose
+    /// `num_records` is the size in BYTES (shadPS4 `Buffer::GetSize`); any
+    /// other stride multiplies. An odd total is legitimate — the upload pads
+    /// and the writeback truncates.
+    #[test]
+    fn buffer_byte_size_follows_gnm_v_sharp_semantics() {
+        use kyty_graphics::shader::ShaderBufferResource;
+        // stride 12, 10 records -> 120 bytes.
+        let mut typed = ShaderBufferResource::default();
+        typed.fields[1] = 12 << 16;
+        typed.fields[2] = 10;
+        assert_eq!(buffer_byte_size(&typed), Some(120));
+        // stride 0 = raw buffer: num_records IS the byte size (the old
+        // `stride * num_records` computed 0 here and bound nothing).
+        let mut raw = ShaderBufferResource::default();
+        raw.fields[2] = 123;
+        assert_eq!(buffer_byte_size(&raw), Some(123));
+        // stride 2 with 7 records: 14 bytes — NOT a dword multiple, still a
+        // valid V# (previously refused by the recompiler's alignment gate).
+        let mut odd = ShaderBufferResource::default();
+        odd.fields[1] = 2 << 16;
+        odd.fields[2] = 7;
+        assert_eq!(buffer_byte_size(&odd), Some(14));
+    }
 
     /// Cross-queue compute-shader seeding: a dispatch-only ACB dispatch (null
     /// shader) must fall back to the last shader bound on either queue, so the
@@ -2533,6 +2621,93 @@ mod tests {
                 "face {l} must detile to its original pixels"
             );
         }
+    }
+
+    /// A 2DArray T# (type 13, SWIZZLE_MODE 24 = SW_64KB_Z_X, format 7 =
+    /// R16_UNORM — the measured ASTRO.BOT 1536x1536x3 shape) decodes every
+    /// layer per-layer and reports `layers` so the Vulkan layer builds a
+    /// `TYPE_2D_ARRAY` view.
+    #[test]
+    fn decode_texture_2darray_decodes_all_layers() {
+        let (w, h, bpp_log2) = (8u32, 8u32, 1u32);
+        let bpp = 1usize << bpp_log2;
+        let layers: Vec<Vec<u8>> = (0..3u8)
+            .map(|l| {
+                (0..(w * h) as usize * bpp)
+                    .map(|i| (l * 60 + (i % 41) as u8) % 251)
+                    .collect()
+            })
+            .collect();
+        let tiled: Vec<u8> = layers
+            .iter()
+            .flat_map(|l| crate::texture::tiling::tile_64kb_z_x(l, w, h, bpp_log2))
+            .collect();
+        let mut blob = vec![0u8; tiled.len() + 255];
+        let base = (blob.as_ptr() as u64 + 255) & !255;
+        let off = (base - blob.as_ptr() as u64) as usize;
+        blob[off..off + tiled.len()].copy_from_slice(&tiled);
+
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.update_address40(base >> 8);
+        t.fields[1] |= 7 << 20; // unified format 7 = 16 UNORM
+        t.fields[1] |= ((w - 1) & 3) << 30;
+        t.fields[2] = (w - 1) >> 2;
+        t.fields[2] |= (h - 1) << 14;
+        t.fields[3] |= 24 << 20; // SWIZZLE_MODE 24 = SW_64KB_Z_X
+        t.fields[3] |= 13 << 28; // type = 2DArray
+        t.fields[4] = 2; // depth 2 + 1 = 3 layers
+
+        let tex = crate::guest_mem::with_test_ranges(&[(blob.as_ptr() as u64, blob.len())], || {
+            decode_texture(&t)
+        })
+        .expect("2DArray texture decodes");
+        assert!(!tex.cube);
+        assert_eq!(tex.layers, 3);
+        assert_eq!(tex.depth, 1);
+        assert_eq!((tex.width, tex.height), (w, h));
+        assert_eq!(tex.format, vk::Format::R16_UNORM);
+        let layer_bytes = (w * h) as usize * bpp;
+        for (l, layer) in layers.iter().enumerate() {
+            assert_eq!(
+                &tex.pixels[l * layer_bytes..(l + 1) * layer_bytes],
+                layer.as_slice(),
+                "layer {l} must detile to its original pixels"
+            );
+        }
+    }
+
+    /// A 3D storage-image (UAV) T# — type 10, format 71 (the measured
+    /// ASTRO.BOT 240x135x64 RGBA16F volume shape) — reads its whole volume
+    /// as an `R16G16B16A16_SFLOAT` upload with 8 B/texel.
+    #[test]
+    fn read_storage_image_3d_rgba16f_reads_the_whole_volume() {
+        let (w, h, d) = (4u32, 2u32, 3u32);
+        let bytes: Vec<u8> = (0..(w * h * d) as usize * 8)
+            .map(|i| ((i * 13 + 1) % 251) as u8)
+            .collect();
+        let mut blob = vec![0u8; bytes.len() + 255];
+        let base = (blob.as_ptr() as u64 + 255) & !255;
+        let off = (base - blob.as_ptr() as u64) as usize;
+        blob[off..off + bytes.len()].copy_from_slice(&bytes);
+
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.update_address40(base >> 8);
+        t.fields[1] |= 71 << 20; // unified format 16_16_16_16 FLOAT
+        t.fields[1] |= ((w - 1) & 3) << 30;
+        t.fields[2] = (w - 1) >> 2;
+        t.fields[2] |= (h - 1) << 14;
+        t.fields[3] |= 10 << 28; // type = 3D volume
+        t.fields[4] = (d - 1) & 0x1FFF; // depth
+
+        let upload =
+            crate::guest_mem::with_test_ranges(&[(blob.as_ptr() as u64, blob.len())], || {
+                read_storage_image(&t)
+            })
+            .expect("3D RGBA16F UAV reads");
+        assert_eq!((upload.width, upload.height, upload.depth), (w, h, d));
+        assert_eq!(upload.format, vk::Format::R16G16B16A16_SFLOAT);
+        assert_eq!(upload.texel_bytes(), 8);
+        assert_eq!(upload.pixels, bytes, "the whole volume seeds the upload");
     }
 
     /// A 3D T# (type 10, linear tile 0 — the measured ASTRO.BOT froxel/LUT

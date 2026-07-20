@@ -71,6 +71,10 @@ struct ImageAllocation {
     readback_memory: vk::DeviceMemory,
     width: u32,
     height: u32,
+    /// Volume depth (1 for a 2D UAV).
+    depth: u32,
+    /// Bytes per texel (4 = RGBA8, 8 = RGBA16F).
+    texel: u32,
 }
 
 /// One sampled (read-only) texture: staging buffer + device-local image +
@@ -476,14 +480,22 @@ impl<'a> ComputeResources<'a> {
         })
     }
 
-    /// One UAV: staging buffer + device-local RGBA8 image + view + readback
-    /// buffer. Pushed with null handles up front so `Drop` cleans up any
+    /// One UAV: staging buffer + device-local image + view + readback
+    /// buffer, in the upload's own format; `depth > 1` builds a
+    /// `VK_IMAGE_TYPE_3D` volume (measured: ASTRO.BOT's 240x135x64 RGBA16F
+    /// UAVs). Pushed with null handles up front so `Drop` cleans up any
     /// partially-built entry on the error paths.
     fn create_storage_image(&mut self, upload: &StorageImageUpload) -> Result<(), GpuError> {
-        let size = (upload.width as usize) * (upload.height as usize) * 4;
+        let depth = upload.depth.max(1);
+        let texel = upload.texel_bytes();
+        let size = (upload.width as usize)
+            * (upload.height as usize)
+            * (depth as usize)
+            * (texel as usize);
         if size == 0 || upload.pixels.len() != size {
             return Err(GpuError::VulkanInitFailed(format!(
-                "storage image {}x{} carries {} initial bytes (want {size})",
+                "storage image {}x{}x{depth} ({texel} B/texel) carries {} initial bytes \
+                 (want {size})",
                 upload.width,
                 upload.height,
                 upload.pixels.len()
@@ -499,6 +511,8 @@ impl<'a> ComputeResources<'a> {
             readback_memory: vk::DeviceMemory::null(),
             width: upload.width,
             height: upload.height,
+            depth,
+            texel,
         });
         let slot = self.images.len() - 1;
 
@@ -511,12 +525,16 @@ impl<'a> ComputeResources<'a> {
         self.images[slot].staging_memory = staging_memory;
 
         let info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_UNORM)
+            .image_type(if depth > 1 {
+                vk::ImageType::TYPE_3D
+            } else {
+                vk::ImageType::TYPE_2D
+            })
+            .format(upload.format)
             .extent(vk::Extent3D {
                 width: upload.width,
                 height: upload.height,
-                depth: 1,
+                depth,
             })
             .mip_levels(1)
             .array_layers(1)
@@ -555,8 +573,12 @@ impl<'a> ComputeResources<'a> {
 
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_UNORM)
+            .view_type(if depth > 1 {
+                vk::ImageViewType::TYPE_3D
+            } else {
+                vk::ImageViewType::TYPE_2D
+            })
+            .format(upload.format)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
@@ -663,6 +685,10 @@ impl<'a> ComputeResources<'a> {
                 vk::ImageViewType::CUBE
             } else if volume {
                 vk::ImageViewType::TYPE_3D
+            } else if upload.layers > 1 {
+                // 2DArray (T# type 13) — the recompiled SPIR-V samples an
+                // arrayed 2D image (measured: ASTRO.BOT's 1536x1536x3).
+                vk::ImageViewType::TYPE_2D_ARRAY
             } else {
                 vk::ImageViewType::TYPE_2D
             })
@@ -722,7 +748,7 @@ impl<'a> ComputeResources<'a> {
                 .image_extent(vk::Extent3D {
                     width: allocation.width,
                     height: allocation.height,
-                    depth: 1,
+                    depth: allocation.depth,
                 })
         };
         let begin = vk::CommandBufferBeginInfo::default()
@@ -975,7 +1001,10 @@ impl<'a> ComputeResources<'a> {
         self.images
             .iter()
             .map(|allocation| {
-                let size = (allocation.width as usize) * (allocation.height as usize) * 4;
+                let size = (allocation.width as usize)
+                    * (allocation.height as usize)
+                    * (allocation.depth as usize)
+                    * (allocation.texel as usize);
                 self.read_host_memory(allocation.readback_memory, size)
             })
             .collect()
