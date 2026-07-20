@@ -645,6 +645,29 @@ pub fn shader_get_gds_pointer(
     Ok(())
 }
 
+/// Gate for read-only sampled-texture T# types. Accepted from measurement:
+/// 9 = Texture2D, 11 = Cube (Minecraft's 1024x1024x6 skybox), 10 = 3D volume
+/// (ASTRO.BOT's 240x135x64 froxel/LUT volumes, format 71). Anything else is a
+/// named, evidence-rich refusal carrying every field the next arm needs.
+fn check_read_only_texture_type(
+    t: &super::resources::ShaderTextureResource,
+) -> Result<(), ShaderAnalysisError> {
+    let ty = t.type_();
+    if ty == 9 || ty == 10 || ty == 11 {
+        return Ok(());
+    }
+    Err(ni_owned(format!(
+        "read-only texture type {ty} is not Texture2D (9) \
+         (10=3D 11=Cube 12=1DArray 13=2DArray; base={:#x} {}x{} depth={} format={} tile={})",
+        t.base40(),
+        u32::from(t.width5()) + 1,
+        u32::from(t.height5()) + 1,
+        u32::from(t.depth()) + 1,
+        t.format(),
+        t.tile_mode(),
+    )))
+}
+
 /// Kyty: Shader.cpp `ShaderGetDirectSgpr` (L1301).
 pub fn shader_get_direct_sgpr(
     info: &mut ShaderDirectSgprsResources,
@@ -666,8 +689,18 @@ pub fn shader_get_direct_sgpr(
 
     info.start_register[index] = start_index;
 
-    if user_sgpr.type_[start] != UserSgprType::Unknown {
-        return Err(ni("direct user sgpr type is not Unknown"));
+    if user_sgpr.type_[start] != UserSgprType::Unknown && user_sgpr.value[start] != 0 {
+        // Instrumented refusal: the Gen5 collection loop routes typed
+        // registers into their resource tables before calling here, so a
+        // hit names whichever path (legacy walk, or a routing gap) still
+        // sends typed registers this way. A typed register whose VALUE is
+        // zero carries no descriptor — the marker typed it but the driver
+        // never wrote one — and seeds as plain direct data (measured:
+        // ASTRO.BOT CS dispatches carry `Region at s4, value=0x0`, 810/run).
+        return Err(ni_owned(format!(
+            "direct user sgpr type is not Unknown ({:?} at s{start}, value={:#x})",
+            user_sgpr.type_[start], user_sgpr.value[start],
+        )));
     }
 
     info.sgprs[index].field = user_sgpr.value[start];
@@ -788,20 +821,7 @@ pub fn shader_parse_usage(
                     )?;
                     info.textures2d_readonly += 1;
                     let last = (bind.textures2d.textures_num - 1) as usize;
-                    let ty = bind.textures2d.desc[last].texture.type_();
-                    // 9 = Texture2D, 11 = Cube (measured: Minecraft's
-                    // 1024x1024x6 skybox). Everything else stays named.
-                    if ty != 9 && ty != 11 {
-                        return Err(ni_owned(format!(
-                            "read-only texture type {ty} is not Texture2D (9) \
-                             (base={:#x} {}x{} format={} tile={})",
-                            bind.textures2d.desc[last].texture.base40(),
-                            u32::from(bind.textures2d.desc[last].texture.width5()) + 1,
-                            u32::from(bind.textures2d.desc[last].texture.height5()) + 1,
-                            bind.textures2d.desc[last].texture.format(),
-                            bind.textures2d.desc[last].texture.tile_mode(),
-                        )));
-                    }
+                    check_read_only_texture_type(&bind.textures2d.desc[last].texture)?;
                 }
             }
 
@@ -1274,21 +1294,7 @@ pub fn shader_parse_usage2(
         )?;
         info.textures2d_readonly += 1;
         let last = (bind.textures2d.textures_num - 1) as usize;
-        let t = &bind.textures2d.desc[last].texture;
-        // 9 = Texture2D, 11 = Cube (measured: Minecraft's 1024x1024x6 skybox).
-        if t.type_() != 9 && t.type_() != 11 {
-            return Err(ni_owned(format!(
-                "read-only texture type {} is not Texture2D (9) \
-                 (10=3D 11=Cube 12=1DArray 13=2DArray; base={:#x} {}x{} depth={} format={} tile={})",
-                t.type_(),
-                t.base40(),
-                t.width5() + 1,
-                t.height5() + 1,
-                t.depth() + 1,
-                t.format(),
-                t.tile_mode(),
-            )));
-        }
+        check_read_only_texture_type(&bind.textures2d.desc[last].texture)?;
     }
 
     for (slot, sharp) in user_data.sharp_resource_offset[1].iter().enumerate() {
@@ -1297,21 +1303,76 @@ pub fn shader_parse_usage2(
         }
         // Beyond Kyty (upstream EXIT_NOT_IMPLEMENTEDs on a non-empty table 1):
         // measured in Minecraft's menu CS. Mirror the table-0 extension — a
-        // size == 1 sharp is a 4-dword buffer V#, bound read-write. Anything
-        // else stays a named failure until a title shows what it means.
-        if sharp.size() != 1 {
-            return Err(ni("sharp table 1 entry with size != 1"));
+        // size == 1 sharp is a 4-dword buffer V#, bound read-write.
+        if sharp.size() == 1 {
+            shader_get_storage_buffer(
+                &mut bind.storage_buffers,
+                &mut direct_sgprs,
+                i32::from(sharp.offset_dw()),
+                slot as i32,
+                ShaderStorageUsage::ReadWrite,
+                user_sgpr,
+                extended_buffer,
+            )?;
+            info.storage_buffers_readwrite += 1;
+            continue;
         }
-        shader_get_storage_buffer(
-            &mut bind.storage_buffers,
+        // size == 0 (`ShaderSharp::size` is a single bit): an 8-dword slot,
+        // exactly as in table 0 — its content is either an 8-dword image T#
+        // or a 4-dword buffer V#, disambiguated by the descriptor's own type
+        // nibble (dword3[28:31] reads 0 for a buffer; see the table-0 walk).
+        // Table 1 is the READ-WRITE table, so an image here is a storage
+        // image (UAV) and a buffer is a read-write V#. 347 measured
+        // ASTRO.BOT CS dispatch skips ("sharp table 1 entry with size != 1").
+        let mut peek = [0u32; 8];
+        read_sharp_fields(
+            &mut direct_sgprs,
+            i32::from(sharp.offset_dw()),
+            user_sgpr,
+            extended_buffer,
+            &mut peek,
+        )?;
+        if (peek[3] >> 28) & 0xF == 0 {
+            shader_get_storage_buffer(
+                &mut bind.storage_buffers,
+                &mut direct_sgprs,
+                i32::from(sharp.offset_dw()),
+                slot as i32,
+                ShaderStorageUsage::ReadWrite,
+                user_sgpr,
+                extended_buffer,
+            )?;
+            info.storage_buffers_readwrite += 1;
+            continue;
+        }
+        shader_get_texture_buffer(
+            &mut bind.textures2d,
             &mut direct_sgprs,
             i32::from(sharp.offset_dw()),
             slot as i32,
-            ShaderStorageUsage::ReadWrite,
+            ShaderTextureUsage::ReadWrite,
             user_sgpr,
             extended_buffer,
         )?;
-        info.storage_buffers_readwrite += 1;
+        info.textures2d_readwrite += 1;
+        // The storage-image (UAV) machinery is 2D-only (RGBA8 `%textures2D_L`
+        // + linear guest writeback); a non-2D RW image stays a named refusal
+        // with the full descriptor evidence.
+        let last = (bind.textures2d.textures_num - 1) as usize;
+        let t = &bind.textures2d.desc[last].texture;
+        if t.type_() != 9 {
+            return Err(ni_owned(format!(
+                "read-write (table 1) texture type {} is not Texture2D (9) \
+                 (10=3D 11=Cube 12=1DArray 13=2DArray; base={:#x} {}x{} depth={} format={} tile={})",
+                t.type_(),
+                t.base40(),
+                u32::from(t.width5()) + 1,
+                u32::from(t.height5()) + 1,
+                u32::from(t.depth()) + 1,
+                t.format(),
+                t.tile_mode(),
+            )));
+        }
     }
 
     for (slot, sharp) in user_data.sharp_resource_offset[2].iter().enumerate() {
@@ -1351,11 +1412,95 @@ pub fn shader_parse_usage2(
         info.storage_buffers_constant += 1;
     }
 
-    for (i, &direct) in direct_sgprs.iter().enumerate() {
-        if direct {
-            shader_get_direct_sgpr(&mut bind.direct_sgprs, i as i32, user_sgpr)?;
-            info.direct_sgprs += 1;
+    for i in 0..UserSgprInfo::SGPRS_MAX {
+        // Re-checked each iteration: the typed-register routing below clears
+        // the flags of every register a descriptor consumes.
+        if !direct_sgprs[i] {
+            continue;
         }
+        if user_sgpr.type_[i] != UserSgprType::Unknown {
+            // Beyond Kyty (`ShaderGetDirectSgpr` EXITs on any typed
+            // register): a register still unclaimed at collection time but
+            // TYPED by a PM4 'hu' marker (0x4 = Vsharp, 0xd = Region — the
+            // same pair `read_sharp_fields` accepts as descriptor content)
+            // holds a descriptor the driver preloaded without a usage-table
+            // entry. Route it into its proper resource table exactly as if a
+            // usage slot had declared it at this register: peek the V#-sized
+            // quad and disambiguate buffer vs image via the descriptor's own
+            // type nibble (dword3[28:31] reads 0 for a buffer — the same
+            // shadPS4-confirmed overlap the sharp-table-0 walk uses). The
+            // seeded `%s{i}` locals then feed the shader's own buffer/image
+            // ops exactly like a declared sharp. A run too short or
+            // wrongly-typed fails inside `read_sharp_fields` with the type
+            // and register index. 811 measured ASTRO.BOT CS dispatch skips.
+            let saved_flags = direct_sgprs;
+            let mut peek = [0u32; 4];
+            read_sharp_fields(
+                &mut direct_sgprs,
+                i as i32,
+                user_sgpr,
+                extended_buffer,
+                &mut peek,
+            )?;
+            // A typed run whose descriptor quad is entirely ZERO is not a
+            // resource: the driver typed the registers but never wrote a
+            // descriptor there. Measured on ASTRO.BOT: its 170 working draw
+            // VS/PS carry exactly such a quad, and binding it as a V#
+            // produced "storage buffer at 0x0 has invalid byte size 0",
+            // killing every previously-working draw. Restore the flags the
+            // peek consumed and keep the register direct.
+            if peek == [0; 4] {
+                // Keep the WHOLE verified-zero quad direct, not just s{i}:
+                // leaving s{i+1}..s{i+3} typed-and-flagged makes the next
+                // iteration peek a quad that runs past the typed run
+                // (measured: "user sgpr type is not Vsharp/Region (Unknown
+                // at s8)" ×812 once s4 alone was kept direct).
+                direct_sgprs = saved_flags;
+                #[allow(clippy::needless_range_loop)] // index IS the register number
+                for reg in i..(i + 4).min(UserSgprInfo::SGPRS_MAX) {
+                    if !direct_sgprs[reg] {
+                        continue;
+                    }
+                    shader_get_direct_sgpr(&mut bind.direct_sgprs, reg as i32, user_sgpr)?;
+                    info.direct_sgprs += 1;
+                    direct_sgprs[reg] = false;
+                }
+                continue;
+            }
+            if (peek[3] >> 28) & 0xF == 0 {
+                // ReadWrite: no usage slot declared intent, and the compute
+                // path writes every storage buffer back unconditionally, so
+                // the writable superset is the faithful choice.
+                let slot = bind.storage_buffers.buffers_num;
+                shader_get_storage_buffer(
+                    &mut bind.storage_buffers,
+                    &mut direct_sgprs,
+                    i as i32,
+                    slot,
+                    ShaderStorageUsage::ReadWrite,
+                    user_sgpr,
+                    extended_buffer,
+                )?;
+                info.storage_buffers_readwrite += 1;
+            } else {
+                let slot = bind.textures2d.textures_num;
+                shader_get_texture_buffer(
+                    &mut bind.textures2d,
+                    &mut direct_sgprs,
+                    i as i32,
+                    slot,
+                    ShaderTextureUsage::ReadOnly,
+                    user_sgpr,
+                    extended_buffer,
+                )?;
+                info.textures2d_readonly += 1;
+                let last = (bind.textures2d.textures_num - 1) as usize;
+                check_read_only_texture_type(&bind.textures2d.desc[last].texture)?;
+            }
+            continue;
+        }
+        shader_get_direct_sgpr(&mut bind.direct_sgprs, i as i32, user_sgpr)?;
+        info.direct_sgprs += 1;
     }
 
     Ok(())
@@ -3602,6 +3747,107 @@ mod tests {
         // type-9 sharp -> Texture2D, still classified as a texture.
         assert_eq!(info.textures2d_readonly, 1);
         assert_eq!(bind.textures2d.textures_num, 1);
+    }
+
+    #[test]
+    fn parse_usage2_typed_direct_sgprs_route_into_resource_tables() {
+        // Beyond Kyty (item measured as 811 ASTRO.BOT CS dispatch skips,
+        // "direct user sgpr type is not Unknown"): registers TYPED by a PM4
+        // 'hu' marker but claimed by NO usage-table entry hold preloaded
+        // descriptors. A Vsharp quad whose type nibble reads 0 binds as a
+        // read-write storage buffer; a typed 8-register slot whose nibble
+        // reads 9 binds as a read-only Texture2D. Untyped leftovers stay
+        // direct.
+        let mut type_ = [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX];
+        type_[..12].fill(UserSgprType::Vsharp);
+        let user_sgpr = UserSgprInfo {
+            value: {
+                let mut v = [0u32; UserSgprInfo::SGPRS_MAX];
+                v[3] = 0x0000_0008; // quad @0: dword3 nibble = 0 -> buffer V#
+                v[7] = 0x9000_0000; // slot @4: dword3 nibble = 9 -> texture T#
+                v
+            },
+            type_,
+            count: 14,
+        };
+        let user_data = ShaderUserData {
+            direct_resource_offset: vec![0xffff; 8],
+            sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+            eud_size_dw: 0,
+            srt_size_dw: 0,
+        };
+        let mut info = ShaderParsedUsage::default();
+        let mut bind = ShaderBindResources::default();
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 14, None).unwrap();
+        assert_eq!(info.storage_buffers_readwrite, 1);
+        assert_eq!(bind.storage_buffers.buffers_num, 1);
+        assert_eq!(bind.storage_buffers.start_register[0], 0);
+        assert_eq!(info.textures2d_readonly, 1);
+        assert_eq!(bind.textures2d.textures_num, 1);
+        assert_eq!(bind.textures2d.desc[0].start_register, 4);
+        // s12/s13 are declared but untyped -> plain direct SGPRs.
+        assert_eq!(info.direct_sgprs, 2);
+        assert_eq!(&bind.direct_sgprs.start_register[..2], &[12, 13]);
+    }
+
+    #[test]
+    fn parse_usage2_table1_size0_sharp_disambiguates_buffer_vs_storage_image() {
+        // Beyond Kyty (347 measured ASTRO.BOT CS skips, "sharp table 1 entry
+        // with size != 1"): `ShaderSharp::size` is a single BIT — size == 0
+        // means an 8-dword slot, exactly as in table 0. Table 1 is the
+        // read-write table: a type-nibble-0 slot binds as a RW buffer V#,
+        // a type-9 slot as a storage image (UAV).
+        let user_sgpr = UserSgprInfo {
+            value: {
+                let mut v = [0u32; UserSgprInfo::SGPRS_MAX];
+                v[3] = 0x0000_0008; // slot @0: nibble 0 -> RW buffer
+                v[11] = 0x9000_0000; // slot @8: nibble 9 -> storage image
+                v
+            },
+            type_: [UserSgprType::Vsharp; UserSgprInfo::SGPRS_MAX],
+            count: 16,
+        };
+        let user_data = ShaderUserData {
+            direct_resource_offset: vec![0xffff; 8],
+            sharp_resource_offset: [
+                vec![],
+                vec![ShaderSharp::new(0, 0), ShaderSharp::new(8, 0)],
+                vec![],
+                vec![],
+            ],
+            eud_size_dw: 0,
+            srt_size_dw: 0,
+        };
+        let mut info = ShaderParsedUsage::default();
+        let mut bind = ShaderBindResources::default();
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 16, None).unwrap();
+        assert_eq!(info.storage_buffers_readwrite, 1);
+        assert_eq!(bind.storage_buffers.buffers_num, 1);
+        assert_eq!(info.textures2d_readwrite, 1);
+        assert_eq!(bind.textures2d.textures_num, 1);
+        assert_eq!(bind.textures2d.textures2d_storage_num, 1);
+        assert!(bind.textures2d.desc[0].textures2d_without_sampler);
+    }
+
+    #[test]
+    fn read_only_texture_type_gate_accepts_3d_volumes() {
+        // Item measured as 173 ASTRO.BOT CS skips: type 10 = 3D volume
+        // (240x135x64 froxel/LUT, format 71). The gate now admits 2D (9),
+        // 3D (10) and Cube (11); anything else stays a named, evidence-rich
+        // refusal (here 13 = 2DArray).
+        let mut t = super::super::resources::ShaderTextureResource::default();
+        t.fields[3] = 10 << 28;
+        check_read_only_texture_type(&t).expect("3D volume accepted");
+        t.fields[3] = 9 << 28;
+        check_read_only_texture_type(&t).expect("2D accepted");
+        t.fields[3] = 11 << 28;
+        check_read_only_texture_type(&t).expect("Cube accepted");
+        t.fields[3] = 13 << 28;
+        let err = check_read_only_texture_type(&t).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("read-only texture type 13"),
+            "{err:?}"
+        );
     }
 
     /// Manual disassembly harness (no-op unless `XPS5X_DISASM_FILE` names a

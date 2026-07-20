@@ -299,6 +299,7 @@ fn title_translated_ps_sweep() {
                 pixels: vec![if zero { 0x00 } else { 0xFF }; 4 * 4 * 4],
                 layers: 1,
                 cube: false,
+                depth: 1,
             }],
             linear_filter: vec![false],
         })

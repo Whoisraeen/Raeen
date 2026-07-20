@@ -7,7 +7,7 @@
 //! identity-mapped guest memory.
 
 use super::instance::VulkanDevice;
-use super::offscreen::{ShaderStageBinding, StorageImageUpload};
+use super::offscreen::{ShaderStageBinding, StorageImageUpload, TextureUpload};
 use ash::vk::Handle;
 use ash::{Device, vk};
 use xps5x_core::error::GpuError;
@@ -73,10 +73,26 @@ struct ImageAllocation {
     height: u32,
 }
 
+/// One sampled (read-only) texture: staging buffer + device-local image +
+/// view. Uploaded once before the dispatch; never read back.
+struct SampledAllocation {
+    staging_buffer: vk::Buffer,
+    staging_memory: vk::DeviceMemory,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    width: u32,
+    height: u32,
+    depth: u32,
+    layers: u32,
+}
+
 struct ComputeResources<'a> {
     dev: &'a VulkanDevice,
     storage: Vec<BufferAllocation>,
     images: Vec<ImageAllocation>,
+    sampled: Vec<SampledAllocation>,
+    samplers: Vec<vk::Sampler>,
     shader: vk::ShaderModule,
     descriptor_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
@@ -93,6 +109,8 @@ impl<'a> ComputeResources<'a> {
             dev,
             storage: Vec::new(),
             images: Vec::new(),
+            sampled: Vec::new(),
+            samplers: Vec::new(),
             shader: vk::ShaderModule::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
@@ -116,7 +134,8 @@ impl<'a> ComputeResources<'a> {
 
         let storage = state.binding.and_then(|b| b.storage_buffers.as_ref());
         let storage_images = state.binding.and_then(|b| b.storage_images.as_ref());
-        if storage.is_some() || storage_images.is_some() {
+        let textures = state.binding.and_then(|b| b.textures.as_ref());
+        if storage.is_some() || storage_images.is_some() || textures.is_some() {
             let binding = state.binding.expect("resource groups come from a binding");
             if binding.descriptor_set_slot != 0 {
                 return Err(GpuError::PipelineCreationFailed(format!(
@@ -159,6 +178,36 @@ impl<'a> ComputeResources<'a> {
                         .stage_flags(vk::ShaderStageFlags::COMPUTE),
                 );
             }
+            // Sampled textures + samplers (the recompiled SPIR-V declares
+            // %textures2D_S and %samplers as separate bindings) — first
+            // consumed by ASTRO.BOT's froxel/LUT-volume compute shaders.
+            if let Some(textures) = textures {
+                if textures.textures.is_empty() || textures.linear_filter.is_empty() {
+                    return Err(GpuError::PipelineCreationFailed(
+                        "compute sampled-texture/sampler descriptor array is empty".to_owned(),
+                    ));
+                }
+                for upload in &textures.textures {
+                    self.create_sampled_image(upload)?;
+                }
+                for &linear in &textures.linear_filter {
+                    self.samplers.push(self.create_sampler(linear)?);
+                }
+                layout_bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(textures.sampled_binding)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .descriptor_count(self.sampled.len() as u32)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                );
+                layout_bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(textures.sampler_binding)
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .descriptor_count(self.samplers.len() as u32)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                );
+            }
 
             let layout_info =
                 vk::DescriptorSetLayoutCreateInfo::default().bindings(&layout_bindings);
@@ -177,6 +226,8 @@ impl<'a> ComputeResources<'a> {
                     self.storage.len() as u32,
                 ),
                 (vk::DescriptorType::STORAGE_IMAGE, self.images.len() as u32),
+                (vk::DescriptorType::SAMPLED_IMAGE, self.sampled.len() as u32),
+                (vk::DescriptorType::SAMPLER, self.samplers.len() as u32),
             ]
             .into_iter()
             .filter(|&(_, count)| count != 0)
@@ -239,6 +290,36 @@ impl<'a> ComputeResources<'a> {
                         .dst_binding(images.binding)
                         .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                         .image_info(&image_infos),
+                );
+            }
+            let sampled_infos: Vec<_> = self
+                .sampled
+                .iter()
+                .map(|allocation| {
+                    vk::DescriptorImageInfo::default()
+                        .image_view(allocation.view)
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                })
+                .collect();
+            let sampler_infos: Vec<_> = self
+                .samplers
+                .iter()
+                .map(|&sampler| vk::DescriptorImageInfo::default().sampler(sampler))
+                .collect();
+            if let Some(textures) = textures {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.descriptor_set)
+                        .dst_binding(textures.sampled_binding)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(&sampled_infos),
+                );
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.descriptor_set)
+                        .dst_binding(textures.sampler_binding)
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .image_info(&sampler_infos),
                 );
             }
             // SAFETY: descriptor set and every named buffer/view are live.
@@ -496,6 +577,132 @@ impl<'a> ComputeResources<'a> {
         Ok(())
     }
 
+    /// One sampled texture: staging buffer + device-local image + view, in
+    /// the upload's own decoded format. `depth > 1` builds a
+    /// `VK_IMAGE_TYPE_3D` volume with a `3D` view (measured: ASTRO.BOT's
+    /// 240x135x64 froxel/LUT volumes); `cube` a CUBE view over 6 layers.
+    fn create_sampled_image(&mut self, upload: &TextureUpload) -> Result<(), GpuError> {
+        if upload.pixels.is_empty() {
+            return Err(GpuError::VulkanInitFailed(
+                "compute sampled texture with no pixels".to_owned(),
+            ));
+        }
+        self.sampled.push(SampledAllocation {
+            staging_buffer: vk::Buffer::null(),
+            staging_memory: vk::DeviceMemory::null(),
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            width: upload.width,
+            height: upload.height,
+            depth: upload.depth.max(1),
+            layers: upload.layers,
+        });
+        let slot = self.sampled.len() - 1;
+
+        let (staging_buffer, staging_memory) = self.create_host_buffer(
+            upload.pixels.len(),
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            Some(&upload.pixels),
+        )?;
+        self.sampled[slot].staging_buffer = staging_buffer;
+        self.sampled[slot].staging_memory = staging_memory;
+
+        let volume = upload.depth > 1;
+        let info = vk::ImageCreateInfo::default()
+            .image_type(if volume {
+                vk::ImageType::TYPE_3D
+            } else {
+                vk::ImageType::TYPE_2D
+            })
+            .format(upload.format)
+            .extent(vk::Extent3D {
+                width: upload.width,
+                height: upload.height,
+                depth: upload.depth.max(1),
+            })
+            .mip_levels(1)
+            .array_layers(upload.layers)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .flags(if upload.cube {
+                vk::ImageCreateFlags::CUBE_COMPATIBLE
+            } else {
+                vk::ImageCreateFlags::empty()
+            });
+        // SAFETY: `info` is fully initialized and borrows nothing beyond this
+        // call; the device is live.
+        let image = unsafe { self.device().create_image(&info, None) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("sampled vkCreateImage: {e}")))?;
+        self.sampled[slot].image = image;
+
+        // SAFETY: `image` was just created from this device.
+        let reqs = unsafe { self.device().get_image_memory_requirements(image) };
+        let type_index = self
+            .dev
+            .find_memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(reqs.size)
+            .memory_type_index(type_index);
+        // SAFETY: allocation size/type come from this image's own requirements.
+        let memory = unsafe { self.device().allocate_memory(&alloc, None) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("sampled image allocation: {e}")))?;
+        self.sampled[slot].memory = memory;
+
+        // SAFETY: memory was allocated for exactly this image; offset 0 is
+        // within it and satisfies the alignment requirement by construction.
+        unsafe { self.device().bind_image_memory(image, memory, 0) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("sampled image bind memory: {e}")))?;
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(if upload.cube {
+                vk::ImageViewType::CUBE
+            } else if volume {
+                vk::ImageViewType::TYPE_3D
+            } else {
+                vk::ImageViewType::TYPE_2D
+            })
+            .format(upload.format)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: upload.layers,
+            });
+        // SAFETY: the view's image is live and its format/range match the
+        // image's creation parameters.
+        let view = unsafe { self.device().create_image_view(&view_info, None) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("sampled image view: {e}")))?;
+        self.sampled[slot].view = view;
+        Ok(())
+    }
+
+    /// One sampler per S#; mirrors the offscreen path — only linear vs
+    /// nearest is honoured today.
+    fn create_sampler(&self, linear: bool) -> Result<vk::Sampler, GpuError> {
+        let filter = if linear {
+            vk::Filter::LINEAR
+        } else {
+            vk::Filter::NEAREST
+        };
+        let info = vk::SamplerCreateInfo::default()
+            .mag_filter(filter)
+            .min_filter(filter)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .max_lod(0.0);
+        // SAFETY: plain sampler on a live device; destroyed in Drop.
+        unsafe { self.device().create_sampler(&info, None) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("compute vkCreateSampler: {e}")))
+    }
+
     fn record_and_submit(&self, state: &ComputeState<'_>) -> Result<(), GpuError> {
         let full_color = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -575,6 +782,73 @@ impl<'a> ComputeResources<'a> {
                     &[],
                     &[],
                     &[to_general],
+                );
+            }
+
+            // Upload every sampled texture and move it to SHADER_READ_ONLY,
+            // the layout its SAMPLED_IMAGE descriptor promised.
+            for allocation in &self.sampled {
+                let range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: allocation.layers,
+                };
+                let to_transfer = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(allocation.image)
+                    .subresource_range(range);
+                self.device().cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_transfer],
+                );
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: allocation.layers,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width: allocation.width,
+                        height: allocation.height,
+                        depth: allocation.depth,
+                    });
+                self.device().cmd_copy_buffer_to_image(
+                    self.command_buffer,
+                    allocation.staging_buffer,
+                    allocation.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+                let to_sampled = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(allocation.image)
+                    .subresource_range(range);
+                self.device().cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_sampled],
                 );
             }
 
@@ -741,6 +1015,29 @@ impl Drop for ComputeResources<'_> {
             while let Some(allocation) = self.storage.pop() {
                 self.device().destroy_buffer(allocation.buffer, None);
                 self.device().free_memory(allocation.memory, None);
+            }
+            while let Some(sampler) = self.samplers.pop() {
+                if !sampler.is_null() {
+                    self.device().destroy_sampler(sampler, None);
+                }
+            }
+            while let Some(allocation) = self.sampled.pop() {
+                if !allocation.view.is_null() {
+                    self.device().destroy_image_view(allocation.view, None);
+                }
+                if !allocation.image.is_null() {
+                    self.device().destroy_image(allocation.image, None);
+                }
+                if !allocation.memory.is_null() {
+                    self.device().free_memory(allocation.memory, None);
+                }
+                if !allocation.staging_buffer.is_null() {
+                    self.device()
+                        .destroy_buffer(allocation.staging_buffer, None);
+                }
+                if !allocation.staging_memory.is_null() {
+                    self.device().free_memory(allocation.staging_memory, None);
+                }
             }
             while let Some(allocation) = self.images.pop() {
                 if !allocation.view.is_null() {

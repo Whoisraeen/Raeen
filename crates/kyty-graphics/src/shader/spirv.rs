@@ -1745,6 +1745,88 @@ pub(crate) fn operand_variable_to_str_shift(op: ShaderOperand, shift: i32) -> Sp
     ret
 }
 
+/// SDWA lane extraction (see `ShaderOperand::lane_sel`): the SPIR-V snippet
+/// turning the raw 32-bit register value `%<src>` into the zero-extended
+/// selected lane `%<dst>` — a logical shift right by the lane's bit offset
+/// and a mask to its width. Returns `None` for 6 (DWORD: the whole register,
+/// nothing to do). The shift (`%uint_0/8/16/24`) and mask
+/// (`%uint_255`/`%uint_0x0000ffff`) constants are guaranteed by
+/// `find_constants` whenever any operand carries a lane select.
+fn lane_sel_snippet(lane_sel: u8, src: &str, dst: &str) -> Option<String> {
+    let (shift, mask) = match lane_sel {
+        0..=3 => (u32::from(lane_sel) * 8, "uint_255"),
+        4 | 5 => (u32::from(lane_sel - 4) * 16, "uint_0x0000ffff"),
+        _ => return None,
+    };
+    Some(format!(
+        "%s{dst} = OpShiftRightLogical %uint %{src} %uint_{shift}\n          \
+         %{dst} = OpBitwiseAnd %uint %s{dst} %{mask}\n"
+    ))
+}
+
+/// The single `OpTypeImage` Dim of the sampled-texture array
+/// (`%textures2D_S`), decided from the measured T# types: 9 (and the
+/// height-1 "1D" 8) = 2D, 10 = 3D volume, 11 = Cube. Storage (read-write)
+/// descriptors are excluded — `%textures2D_L` is its own 2D array.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SampledDim {
+    Two,
+    Three,
+    Cube,
+}
+
+impl SampledDim {
+    /// SPIR-V `Dim` token and the sample-coordinate component count.
+    pub(crate) const fn dim_str(self) -> &'static str {
+        match self {
+            Self::Two => "2D",
+            Self::Three => "3D",
+            Self::Cube => "Cube",
+        }
+    }
+
+    pub(crate) const fn coord_components(self) -> u32 {
+        match self {
+            Self::Two => 2,
+            Self::Three | Self::Cube => 3,
+        }
+    }
+}
+
+/// Decide the sampled-texture Dim for a bind set, refusing mixed dims — a
+/// single SPIR-V array type has exactly one `Dim`, so a shader mixing 2D and
+/// 3D/cube sampled textures stays a named refusal until a measured shader
+/// requires split arrays.
+pub(crate) fn sampled_texture_dim(
+    bind: &ShaderBindResources,
+) -> Result<SampledDim, ShaderRecompileError> {
+    let bound = usize::try_from(bind.textures2d.textures_num)
+        .unwrap_or(0)
+        .min(bind.textures2d.desc.len());
+    let (mut has_2d, mut has_3d, mut has_cube) = (false, false, false);
+    for d in &bind.textures2d.desc[..bound] {
+        if d.textures2d_without_sampler {
+            continue;
+        }
+        match d.texture.type_() {
+            10 => has_3d = true,
+            11 => has_cube = true,
+            _ => has_2d = true,
+        }
+    }
+    match (has_2d, has_3d, has_cube) {
+        (_, false, false) => Ok(SampledDim::Two),
+        (false, true, false) => Ok(SampledDim::Three),
+        (false, false, true) => Ok(SampledDim::Cube),
+        _ => Err(not_supported(
+            "sampled_texture_dim",
+            format!(
+                "mixed sampled texture dims in one shader (2d={has_2d} 3d={has_3d} cube={has_cube})"
+            ),
+        )),
+    }
+}
+
 /// Kyty: ShaderSpirv.cpp `operand_is_exec` (L1671).
 #[must_use]
 pub(crate) fn operand_is_exec(op: ShaderOperand) -> bool {
@@ -1772,6 +1854,11 @@ pub(crate) fn operand_load_int(
             "operand_load_int",
             "negate/absolute modifier",
         ));
+    }
+    if op.lane_sel != 6 {
+        // No consumer yet (see the fn doc); wire the uint-style extraction
+        // when one appears.
+        return Err(not_supported("operand_load_int", "sdwa lane select"));
     }
 
     if operand_is_constant(op) {
@@ -1823,6 +1910,12 @@ pub(crate) fn operand_load_uint(
             "negate/absolute modifier",
         ));
     }
+    if op.lane_sel != 6 && operand_is_constant(op) {
+        return Err(not_supported(
+            "operand_load_uint",
+            "sdwa lane select on a constant operand",
+        ));
+    }
 
     if operand_is_constant(op) {
         if op.size == 2 {
@@ -1860,23 +1953,38 @@ pub(crate) fn operand_load_uint(
         } else {
             operand_variable_to_str(op)
         };
-        if value.type_ == SpirvType::Float {
-            *load = concat!(
+        // SDWA lane select: extract the selected byte/word (zero-extended)
+        // before the consumer sees the value. The non-SDWA path keeps Kyty's
+        // exact load text.
+        let l = if let Some(sel) = lane_sel_snippet(op.lane_sel, "r<result_id>", "<result_id>") {
+            let raw = if value.type_ == SpirvType::Float {
+                concat!(
+                    "%t<result_id> = OpLoad %float %<id>\n",
+                    "          ",
+                    "%r<result_id> = OpBitcast %uint %t<result_id>\n"
+                )
+            } else if value.type_ == SpirvType::Uint {
+                "%r<result_id> = OpLoad %uint %<id>\n"
+            } else {
+                return Ok(false);
+            };
+            format!("{raw}          {sel}")
+        } else if value.type_ == SpirvType::Float {
+            concat!(
                 "%t<result_id> = OpLoad %float %<id>\n",
                 "          ",
                 "%<result_id> = OpBitcast %uint %t<result_id>\n"
             )
+            .to_string()
+        } else if value.type_ == SpirvType::Uint {
+            "%<result_id> = OpLoad %uint %<id>".to_string()
+        } else {
+            return Ok(false);
+        };
+        *load = l
             .replace("<index>", index)
             .replace("<id>", &value.value)
             .replace("<result_id>", result_id);
-        } else if value.type_ == SpirvType::Uint {
-            *load = "%<result_id> = OpLoad %uint %<id>"
-                .replace("<index>", index)
-                .replace("<id>", &value.value)
-                .replace("<result_id>", result_id);
-        } else {
-            return Ok(false);
-        }
     } else {
         return Ok(false);
     }
@@ -1915,12 +2023,40 @@ pub(crate) fn operand_load_float(
 ) -> Result<bool, ShaderRecompileError> {
     let mut l: String;
 
+    if op.lane_sel != 6 && operand_is_constant(op) {
+        return Err(not_supported(
+            "operand_load_float",
+            "sdwa lane select on a constant operand",
+        ));
+    }
+
     if operand_is_constant(op) {
         let id = spirv.get_constant(op);
         l = "%<result_id> = OpBitcast %float %<id>".replace("<id>", &id);
     } else if operand_is_variable(op) {
         let value = operand_variable_to_str(op);
-        if value.type_ == SpirvType::Float {
+        // SDWA lane select: the hardware extracts the selected byte/word of
+        // the raw register (zero-extended to 32 bits) and the operation then
+        // consumes that dword as its operand type — so extract in uint space
+        // and bitcast. The non-SDWA path keeps Kyty's exact load text.
+        if let Some(sel) = lane_sel_snippet(op.lane_sel, "r<result_id>", "e<result_id>") {
+            let raw = if value.type_ == SpirvType::Float {
+                concat!(
+                    "%f<result_id> = OpLoad %float %<id>\n",
+                    "          ",
+                    "%r<result_id> = OpBitcast %uint %f<result_id>\n"
+                )
+            } else if value.type_ == SpirvType::Uint {
+                "%r<result_id> = OpLoad %uint %<id>\n"
+            } else {
+                return Ok(false);
+            };
+            l = format!(
+                "{raw}          {sel}          \
+                 %<result_id> = OpBitcast %float %e<result_id>\n"
+            )
+            .replace("<id>", &value.value);
+        } else if value.type_ == SpirvType::Float {
             l = "%<result_id> = OpLoad %float %<id>\n".replace("<id>", &value.value);
         } else if value.type_ == SpirvType::Uint {
             l = concat!(
@@ -2733,32 +2869,16 @@ impl<'a> Spirv<'a> {
             }
             if bind.textures2d.textures2d_sampled_num > 0 {
                 // The OpTypeImage Dim comes from the measured T# types: 9 =
-                // 2D, 11 = Cube (Minecraft's skybox). A mixed 2D+cube binding
-                // set has no single array type — named, not guessed.
-                let bound = usize::try_from(bind.textures2d.textures_num)
-                    .unwrap_or(0)
-                    .min(bind.textures2d.desc.len());
-                let mut has_2d = false;
-                let mut has_cube = false;
-                for d in &bind.textures2d.desc[..bound] {
-                    match d.texture.type_() {
-                        9 => has_2d = true,
-                        11 => has_cube = true,
-                        _ => {}
-                    }
-                }
-                if has_2d && has_cube {
-                    return Err(not_supported(
-                        "Spirv::WriteTypes",
-                        "mixed 2D and cube sampled textures in one shader".to_owned(),
-                    ));
-                }
+                // 2D, 10 = 3D (ASTRO.BOT's froxel/LUT volumes), 11 = Cube
+                // (Minecraft's skybox). A mixed binding set has no single
+                // array type — `sampled_texture_dim` refuses it by name.
+                let dim = sampled_texture_dim(bind)?;
                 self.source += &TEXTURES_SAMPLED_TYPES
                     .replace(
                         "<buffers_num>",
                         &format!("{}", bind.textures2d.textures2d_sampled_num),
                     )
-                    .replace("<dim>", if has_cube { "Cube" } else { "2D" });
+                    .replace("<dim>", dim.dim_str());
             }
             if bind.textures2d.textures2d_storage_num > 0 {
                 self.source += &TEXTURES_LOADED_TYPES.replace(
@@ -2801,8 +2921,13 @@ impl<'a> Spirv<'a> {
     /// Whether the shader touches LDS through the implemented DS opcodes.
     fn uses_lds(&self) -> bool {
         use ShaderInstructionType as T;
-        self.code
-            .has_any_of(&[T::DsReadB32, T::DsWriteB32, T::DsRead2B32, T::DsWriteB96])
+        self.code.has_any_of(&[
+            T::DsReadB32,
+            T::DsWriteB32,
+            T::DsRead2B32,
+            T::DsWriteB96,
+            T::DsWriteB128,
+        ])
     }
 
     /// LDS allocation in dwords. `COMPUTE_PGM_RSRC2.LDS_SIZE` counts 128-dword
@@ -3751,35 +3876,49 @@ impl<'a> Spirv<'a> {
             self.source += FUNC_FETCH_4;
         }
 
-        if self.code.has_any_of(&[
-            T::BufferLoadDword,
-            T::BufferLoadDwordX2,
-            T::BufferLoadDwordX4,
-            T::BufferLoadFormatX,
-            T::BufferLoadFormatXy,
-            T::BufferLoadFormatXyz,
-            T::BufferLoadFormatXyzw,
-            T::TBufferLoadFormatX,
-            T::TBufferLoadFormatXyzw,
-        ]) {
+        // The buffer helper functions all index the %buf descriptor array,
+        // which only exists when at least one storage buffer is bound. A
+        // shader whose only MUBUF ops go through a NULL V# (recompiled as
+        // dropped stores / zero loads — see `mubuf_flexible`) must not emit
+        // them, or assembly fails on the undefined %buf id.
+        let has_buffers = self
+            .bind
+            .is_some_and(|bind| bind.storage_buffers.buffers_num > 0);
+
+        if has_buffers
+            && self.code.has_any_of(&[
+                T::BufferLoadDword,
+                T::BufferLoadDwordX2,
+                T::BufferLoadDwordX4,
+                T::BufferLoadFormatX,
+                T::BufferLoadFormatXy,
+                T::BufferLoadFormatXyz,
+                T::BufferLoadFormatXyzw,
+                T::TBufferLoadFormatX,
+                T::TBufferLoadFormatXyzw,
+            ])
+        {
             self.source += BUFFER_LOAD_FLOAT1;
             self.source += BUFFER_LOAD_FLOAT4;
             self.source += TBUFFER_LOAD_FORMAT_X;
             self.source += TBUFFER_LOAD_FORMAT_XYZW;
         }
 
-        if self.code.has_any_of(&[
-            T::BufferStoreDword,
-            T::BufferStoreFormatX,
-            T::BufferStoreFormatXy,
-        ]) {
+        if has_buffers
+            && self.code.has_any_of(&[
+                T::BufferStoreDword,
+                T::BufferStoreDwordX4,
+                T::BufferStoreFormatX,
+                T::BufferStoreFormatXy,
+            ])
+        {
             self.source += BUFFER_STORE_FLOAT1;
             self.source += BUFFER_STORE_FLOAT2;
             self.source += TBUFFER_STORE_FORMAT_X;
             self.source += TBUFFER_STORE_FORMAT_XY;
         }
 
-        if self.code.has_any_of(&[T::BufferStoreFormatXyzw]) {
+        if has_buffers && self.code.has_any_of(&[T::BufferStoreFormatXyzw]) {
             self.source += BUFFER_STORE_FLOAT4;
             self.source += TBUFFER_STORE_FORMAT_XYZW;
         }
@@ -3861,6 +4000,17 @@ impl<'a> Spirv<'a> {
             self.add_constant_uint(info.threads_num[0]);
             self.add_constant_uint(info.threads_num[1]);
             self.add_constant_uint(info.threads_num[2]);
+        }
+        // SDWA lane selects need the extraction shift/mask constants (the
+        // shifts 0/8/16/24 are already in the unconditional 0..=32 block).
+        if self
+            .code
+            .get_instructions()
+            .iter()
+            .any(|inst| inst.src.iter().any(|op| op.lane_sel != 6))
+        {
+            self.add_constant_uint(0xff);
+            self.add_constant_uint(0xffff);
         }
         if self.code.has_any_of(&[ShaderInstructionType::SBarrier]) {
             // OpControlBarrier memory semantics: AcquireRelease (0x8) |

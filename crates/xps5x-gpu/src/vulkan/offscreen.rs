@@ -145,12 +145,17 @@ pub struct TextureUpload {
     pub height: u32,
     pub format: vk::Format,
     /// Linear (de-tiled) pixel data, tightly packed rows, `layers` images
-    /// back to back.
+    /// (or `depth` slices for a volume) back to back.
     pub pixels: Vec<u8>,
-    /// Array layers: 1 for a plain 2D texture, 6 for a cube map.
+    /// Array layers: 1 for a plain 2D texture, 6 for a cube map. Always 1
+    /// for a 3D volume (`depth > 1`).
     pub layers: u32,
     /// Create the view as `CUBE` (requires `layers == 6`).
     pub cube: bool,
+    /// Volume depth: 1 for 2D/cube; > 1 creates a `VK_IMAGE_TYPE_3D` image
+    /// with a `3D` view (measured: ASTRO.BOT's 240x135x64 froxel/LUT
+    /// volumes, T# type 10).
+    pub depth: u32,
 }
 
 /// The sampled-image + sampler descriptor arrays one translated stage binds.
@@ -665,6 +670,8 @@ struct TextureGpu {
     width: u32,
     height: u32,
     layers: u32,
+    /// Volume depth (1 for 2D/cube) — the staging copy's extent depth.
+    depth: u32,
     stage: vk::ShaderStageFlags,
 }
 
@@ -1440,17 +1447,24 @@ impl<'a> Resources<'a> {
             width: upload.width,
             height: upload.height,
             layers: upload.layers,
+            depth: upload.depth.max(1),
             stage,
         });
         let slot = self.texture_uploads.len() - 1;
 
+        // depth > 1 is a 3D volume (T# type 10): one layer, `depth` slices.
+        let volume = upload.depth > 1;
         let info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
+            .image_type(if volume {
+                vk::ImageType::TYPE_3D
+            } else {
+                vk::ImageType::TYPE_2D
+            })
             .format(upload.format)
             .extent(vk::Extent3D {
                 width: upload.width,
                 height: upload.height,
-                depth: 1,
+                depth: upload.depth.max(1),
             })
             .mip_levels(1)
             .array_layers(upload.layers)
@@ -1493,6 +1507,8 @@ impl<'a> Resources<'a> {
             .image(image)
             .view_type(if upload.cube {
                 vk::ImageViewType::CUBE
+            } else if volume {
+                vk::ImageViewType::TYPE_3D
             } else {
                 vk::ImageViewType::TYPE_2D
             })
@@ -1866,7 +1882,7 @@ impl<'a> Resources<'a> {
                 .image_extent(vk::Extent3D {
                     width: texture.width,
                     height: texture.height,
-                    depth: 1,
+                    depth: texture.depth,
                 });
             // SAFETY: the staging buffer holds exactly the upload's bytes
             // (create_texture_image sized it) and the image was created with

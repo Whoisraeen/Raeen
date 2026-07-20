@@ -163,6 +163,7 @@ fn sampled_texture_pixels_reach_the_readback() {
         pixels,
         layers: 1,
         cube: false,
+        depth: 1,
     };
 
     let vs = triangle_vertex_spirv();

@@ -523,6 +523,14 @@ fn op_info(name: &str) -> Option<OpInfo> {
             op(88, true, true, &[Id, Id, OptMask(E::ImageOperands), IdRest])
         }
         "OpImageFetch" => op(95, true, true, &[Id, Id, OptMask(E::ImageOperands), IdRest]),
+        // Sampled image, coordinate, component, then optional image operands
+        // (needed by the `image_gather4_lz` recompile body).
+        "OpImageGather" => op(
+            96,
+            true,
+            true,
+            &[Id, Id, Id, OptMask(E::ImageOperands), IdRest],
+        ),
         "OpImageWrite" => op(
             99,
             false,

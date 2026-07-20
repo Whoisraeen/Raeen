@@ -42,6 +42,9 @@ pub enum ShaderInstructionType {
     BufferLoadFormatXyz,
     BufferLoadFormatXyzw,
     BufferStoreDword,
+    /// MUBUF 0x1e: four-dword raw store. Kyty leaves it `KYTY_NI`; measured
+    /// in ASTRO.BOT scene compute (raw 0xe0780000).
+    BufferStoreDwordX4,
     BufferStoreFormatX,
     BufferStoreFormatXy,
     /// MUBUF 0x06: formatted 3-channel store. Kyty leaves it `KYTY_NI`
@@ -72,7 +75,17 @@ pub enum ShaderInstructionType {
     /// the 16-bit byte offset (RDNA2 ISA `DS_WRITE_B96`). Kyty `KYTY_NI`;
     /// measured on ASTRO.BOT scene compute.
     DsWriteB96,
+    /// DS 0xdf: four consecutive LDS dwords stored from `data0..data0+3` at
+    /// the 16-bit byte offset (RDNA2 ISA `DS_WRITE_B128`). Kyty `KYTY_NI`;
+    /// measured on ASTRO.BOT scene compute (raw 0xdb7c0000).
+    DsWriteB128,
     Exp,
+    /// MIMG 0x47: four-texel gather of a single channel at an implicit zero
+    /// LOD (RDNA2 ISA `IMAGE_GATHER4_LZ`). Kyty `KYTY_NI`; measured on
+    /// ASTRO.BOT scene compute (raw 0xf11c0108, dmask 1). The uploaded
+    /// images carry exactly one mip, so a plain `OpImageGather` (which
+    /// samples the base level) is the LZ semantic.
+    ImageGather4Lz,
     /// MIMG 0x0e: query texture dimensions/mip information.
     ImageGetResinfo,
     ImageLoad,
@@ -497,6 +510,11 @@ pub mod shader_instruction_format {
         Vdata4Vaddr2SvSoffsOffenIdxenFloat4 =
             format_define(&[DA4, S0A2, S1A4, S2, OFFEN, IDXEN, FLOAT4]),
         Vdata4Vaddr3StDmaskF = format_define(&[DA4, S0A3, S1A8, DMASK_F]),
+        /// Beyond Kyty: four-texel single-channel gather — measured on
+        /// ASTRO.BOT `image_gather4_lz` (MIMG 0x47 dmask 0x1): vdata is 4
+        /// consecutive VGPRs (one per gathered texel) while the dmask names
+        /// the one channel gathered.
+        Vdata4Vaddr3StSsDmask1 = format_define(&[DA4, S0A3, S1A8, S2A4, DMASK_1]),
         Vdata4Vaddr3StSsDmaskF = format_define(&[DA4, S0A3, S1A8, S2A4, DMASK_F]),
         Vdata4Vaddr4StDmaskF = format_define(&[DA4, S0A4, S1A8, DMASK_F]),
         Vdata4VaddrSvSoffsIdxen = format_define(&[DA4, S0, S1A4, S2, IDXEN]),
@@ -518,6 +536,9 @@ pub mod shader_instruction_format {
         /// address VGPR, src1 = first of 3 consecutive data VGPRs, src2 =
         /// the 16-bit instruction byte offset as a literal constant.
         Vsrc0Vsrc13Vsrc2 = format_define(&[S0, S1A3, S2]),
+        /// Beyond Kyty: `ds_write_b128 addr, data0[4] [offset]` — the
+        /// four-dword row of the same model.
+        Vsrc0Vsrc14Vsrc2 = format_define(&[S0, S1A4, S2]),
         VdstSdst2Vsrc0Vsrc1 = format_define(&[D, D2A2, S0, S1]),
         VdstVsrc0Vsrc1Smask2 = format_define(&[D, S0, S1, S2A2]),
         VdstVsrc0Vsrc1Vsrc2 = format_define(&[D, S0, S1, S2]),
@@ -605,6 +626,13 @@ pub struct ShaderOperand {
     pub absolute: bool,
     pub negate: bool,
     pub clamp: bool,
+    /// Beyond Kyty: SDWA sub-dword source select (`src{0,1}_sel`). 6 = DWORD
+    /// (the whole register, the non-SDWA default); 0-3 = BYTE_0..BYTE_3;
+    /// 4-5 = WORD_0..WORD_1. The operand loaders extract the selected lane
+    /// (shift + mask, zero-extended — `sext` stays a named parse refusal)
+    /// before the operation consumes it. Measured on ASTRO.BOT scene compute
+    /// (vopc src1_sel and vop1 src0_sel).
+    pub lane_sel: u8,
 }
 
 impl Default for ShaderOperand {
@@ -618,6 +646,7 @@ impl Default for ShaderOperand {
             absolute: false,
             negate: false,
             clamp: false,
+            lane_sel: 6,
         }
     }
 }

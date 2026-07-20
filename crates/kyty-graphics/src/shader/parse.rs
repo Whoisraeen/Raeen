@@ -1030,16 +1030,17 @@ fn shader_parse_vopc(
     // Kyty L622-629: EXIT_NOT_IMPLEMENTED on any SDWA modifier. Beyond Kyty:
     // float abs/neg ride the operand modifiers into `operand_load_float`
     // (measured: Minecraft's menu VS does `v_cmp_lt_f32 s2, |v2|, c` and the
-    // UI PS does `v_mul_f32 v2, v4, -v3`). sel/sext stay named — sub-dword
-    // selection is a different feature.
-    if src0_sel != 6 {
-        return Err(feature(S, "sdwa src0_sel != 6", pc));
+    // UI PS does `v_mul_f32 v2, v4, -v3`), and sub-dword source selects
+    // (0-3 = BYTE_0..BYTE_3, 4-5 = WORD_0..WORD_1) ride
+    // `ShaderOperand::lane_sel` into the operand loaders, which extract the
+    // lane with shift + mask (measured: ASTRO.BOT scene compute, vopc
+    // src1_sel). Sign extension stays a named refusal — the loaders
+    // zero-extend.
+    if src0_sel > 6 || src1_sel > 6 {
+        return Err(feature(S, "sdwa src_sel == 7 (reserved)", pc));
     }
     if src0_sext != 0 {
         return Err(feature(S, "sdwa src0_sext != 0", pc));
-    }
-    if src1_sel != 6 {
-        return Err(feature(S, "sdwa src1_sel != 6", pc));
     }
     if src1_sext != 0 {
         return Err(feature(S, "sdwa src1_sext != 0", pc));
@@ -1057,6 +1058,8 @@ fn shader_parse_vopc(
     inst.src[1].absolute = src1_abs != 0;
     inst.src[0].negate = src0_neg != 0;
     inst.src[1].negate = src1_neg != 0;
+    inst.src[0].lane_sel = src0_sel as u8;
+    inst.src[1].lane_sel = src1_sel as u8;
 
     if inst.src[0].type_ == O::LiteralConstant {
         inst.src[0].constant.u = dw(buffer, size, pc)?;
@@ -1186,8 +1189,11 @@ fn shader_parse_vop1(
     if sdwa && dst_sel == 6 && dst_u != 0 {
         return Err(feature(S, "sdwa dst_u != 0", pc));
     }
-    if src0_sel != 6 {
-        return Err(feature(S, "sdwa src0_sel != 6", pc));
+    // Beyond Kyty: sub-dword src0 selects ride `ShaderOperand::lane_sel`
+    // into the operand loaders (measured: ASTRO.BOT scene compute, vop1
+    // src0_sel). Sign extension stays named — the loaders zero-extend.
+    if src0_sel > 6 {
+        return Err(feature(S, "sdwa src0_sel == 7 (reserved)", pc));
     }
     if src0_sext != 0 {
         return Err(feature(S, "sdwa src0_sext != 0", pc));
@@ -1208,6 +1214,7 @@ fn shader_parse_vop1(
 
     inst.src[0].absolute = src0_abs != 0;
     inst.src[0].negate = src0_neg != 0;
+    inst.src[0].lane_sel = src0_sel as u8;
     inst.dst.clamp = clmp != 0;
     inst.dst.multiplier = match omod {
         0 => 1.0,
@@ -1373,14 +1380,14 @@ fn shader_parse_vop2(
     if sdwa && dst_sel == 6 && dst_u != 0 {
         return Err(feature(S, "sdwa dst_u != 0", pc));
     }
-    if src0_sel != 6 {
-        return Err(feature(S, "sdwa src0_sel != 6", pc));
+    // Beyond Kyty: sub-dword source selects ride `ShaderOperand::lane_sel`
+    // into the operand loaders (same model as the vopc/vop1 SDWA paths).
+    // Sign extension stays named — the loaders zero-extend.
+    if src0_sel > 6 || src1_sel > 6 {
+        return Err(feature(S, "sdwa src_sel == 7 (reserved)", pc));
     }
     if src0_sext != 0 {
         return Err(feature(S, "sdwa src0_sext != 0", pc));
-    }
-    if src1_sel != 6 {
-        return Err(feature(S, "sdwa src1_sel != 6", pc));
     }
     if src1_sext != 0 {
         return Err(feature(S, "sdwa src1_sext != 0", pc));
@@ -1412,6 +1419,8 @@ fn shader_parse_vop2(
     inst.src[1].absolute = src1_abs != 0;
     inst.src[0].negate = src0_neg != 0;
     inst.src[1].negate = src1_neg != 0;
+    inst.src[0].lane_sel = src0_sel as u8;
+    inst.src[1].lane_sel = src1_sel as u8;
 
     inst.dst.clamp = clmp != 0;
 
@@ -2811,7 +2820,16 @@ fn shader_parse_mubuf(
             inst.src[1].size = 4;
         }
         0x1d => return Err(ni(dst, S, "buffer_store_dwordx2", opcode, pc, b0)),
-        0x1e => return Err(ni(dst, S, "buffer_store_dwordx4", opcode, pc, b0)),
+        // Beyond Kyty (KYTY_NI upstream): four-dword raw store, measured on
+        // ASTRO.BOT scene compute (raw 0xe0780000). Same flexible addressing
+        // quartet as BufferLoadDwordX4.
+        0x1e => {
+            inst.type_ = T::BufferStoreDwordX4;
+            inst.format = format4;
+            inst.src[0].size = src0_size;
+            inst.src[1].size = 4;
+            inst.dst.size = 4;
+        }
         0x1f => return Err(ni(dst, S, "buffer_store_dwordx3", opcode, pc, b0)),
         // Kyty's table continues past the 5-bit opcode range (0x30-0x87
         // atomics/d16, incl. next_gen-gated 0x34/0x71 — ShaderParse.cpp
@@ -3114,7 +3132,27 @@ fn shader_parse_ds(
             inst.src[2].constant.u = offset0 | (offset1 << 8);
             inst.src_num = 3;
         }
-        0xdf => return Err(ni(dst, S, "ds_write_b128", opcode, pc, b0)),
+        // Beyond Kyty (KYTY_NI upstream): four consecutive LDS dwords stored
+        // from data0..data0+3 at the 16-bit byte offset (RDNA2
+        // `DS_WRITE_B128`). Measured on ASTRO.BOT scene compute
+        // (raw 0xdb7c0000). Same model as the b96 arm above.
+        0xdf => {
+            if gds != 0 {
+                return Err(feature(S, "ds_write_b128 with gds == 1", pc));
+            }
+            if data1 != 0 {
+                return Err(feature(S, "ds_write_b128 with data1 operand", pc));
+            }
+            inst.type_ = T::DsWriteB128;
+            inst.format = F::Vsrc0Vsrc14Vsrc2;
+            inst.dst = ShaderOperand::default();
+            inst.src[0] = operand_parse(addr + 256)?;
+            inst.src[1] = operand_parse(data0 + 256)?;
+            inst.src[1].size = 4;
+            inst.src[2].type_ = O::LiteralConstant;
+            inst.src[2].constant.u = offset0 | (offset1 << 8);
+            inst.src_num = 3;
+        }
         0xfd => return Err(ni(dst, S, "ds_condxchg32_rtn_b128", opcode, pc, b0)),
         0xfe => return Err(ni(dst, S, "ds_read_b96", opcode, pc, b0)),
         0xff => return Err(ni(dst, S, "ds_read_b128", opcode, pc, b0)),
@@ -3433,7 +3471,22 @@ fn shader_parse_mimg(
         0x44 => return Err(ni(dst, S, "image_gather4_l", opcode, pc, b0)),
         0x45 => return Err(ni(dst, S, "image_gather4_b", opcode, pc, b0)),
         0x46 => return Err(ni(dst, S, "image_gather4_b_cl", opcode, pc, b0)),
-        0x47 => return Err(ni(dst, S, "image_gather4_lz", opcode, pc, b0)),
+        // Beyond Kyty (KYTY_NI upstream): four-texel single-channel gather at
+        // an implicit zero LOD — measured on ASTRO.BOT scene compute
+        // (raw 0xf11c0108, dmask 0x1). The gather dmask names the ONE channel
+        // gathered (must be a single bit); vdata is always 4 dwords, one per
+        // texel. Only the measured dmask is wired; others stay named with the
+        // dmask evidence via the unset-format failure below.
+        0x47 => {
+            inst.type_ = T::ImageGather4Lz;
+            inst.src[0].size = 3;
+            inst.src[1].size = 8;
+            inst.src[2].size = 4;
+            if dmask == 0x1 {
+                inst.format = F::Vdata4Vaddr3StSsDmask1;
+                inst.dst.size = 4;
+            }
+        }
         0x48 => return Err(ni(dst, S, "image_gather4_c", opcode, pc, b0)),
         0x49 => return Err(ni(dst, S, "image_gather4_c_cl", opcode, pc, b0)),
         0x4c => return Err(ni(dst, S, "image_gather4_c_l", opcode, pc, b0)),

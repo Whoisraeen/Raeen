@@ -548,23 +548,29 @@ fn decode_texture(
     if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) {
         return Err(err(format!("texture extent {width}x{height} out of range")));
     }
-    // 9 = Texture2D, 11 = Cube (measured: Minecraft's 1024x1024x6 skybox).
-    let cube = match t.type_() {
+    // 9 = Texture2D, 11 = Cube (measured: Minecraft's 1024x1024x6 skybox),
+    // 10 = 3D volume (measured: ASTRO.BOT's 240x135x64 froxel/LUT volumes).
+    let (cube, volume) = match t.type_() {
         // 8 = Texture1D. A 1D image is a 2D image one row tall, and the T#
         // already reports height5 = 0 => height 1, so the existing 2D decode
         // path handles it unchanged (measured on ASTRO.BOT: a 1x1 format-71
         // texture, tile mode 27). Kept a distinct arm rather than folding into
         // 9 so the disagreement is visible if a >1-row "1D" texture ever shows.
-        8 => false,
-        9 => false,
-        11 => true,
+        8 => (false, false),
+        9 => (false, false),
+        10 => (false, true),
+        11 => (true, false),
         other => {
             return Err(err(format!(
-                "texture type {other} is not Texture2D (9) or Cube (11)"
+                "texture type {other} is not Texture2D (9), 3D (10) or Cube (11)"
             )));
         }
     };
     let layers = if cube { u32::from(t.depth()) + 1 } else { 1 };
+    let depth = if volume { u32::from(t.depth()) + 1 } else { 1 };
+    if volume && !(1..=2048).contains(&depth) {
+        return Err(err(format!("volume depth {depth} out of range")));
+    }
 
     // Gen5 unified T# format -> (Vulkan format, bytes per pixel), decoded via
     // SharpEmu's Gfx10UnifiedFormat table (the RDNA2 authority). Filled from
@@ -620,21 +626,37 @@ fn decode_texture(
             ));
         }
         0 => {
-            // Linear: row-major at `pitch`, trimmed to tight rows below.
+            // Linear: row-major at `pitch`, trimmed to tight rows below. A
+            // volume is `depth` such slices back to back (slice pitch =
+            // pitch * height for a linear T# — the measured ASTRO.BOT
+            // volumes are tile 0).
             let pitch = u32::from(t.pitch()).max(width);
             let tiled = read_guest_bytes_unaligned(
                 t.base40(),
-                u64::from(pitch) * u64::from(height) * u64::from(bpp),
+                u64::from(pitch) * u64::from(height) * u64::from(depth) * u64::from(bpp),
                 "texture",
             )?;
             let row = (width * bpp) as usize;
             let src_row = (pitch * bpp) as usize;
-            let mut pixels = vec![0u8; row * height as usize];
-            for y in 0..height as usize {
-                let src = y * src_row;
-                pixels[y * row..(y + 1) * row].copy_from_slice(&tiled[src..src + row]);
+            let src_slice = src_row * height as usize;
+            let dst_slice = row * height as usize;
+            let mut pixels = vec![0u8; dst_slice * depth as usize];
+            for z in 0..depth as usize {
+                for y in 0..height as usize {
+                    let src = z * src_slice + y * src_row;
+                    let dst = z * dst_slice + y * row;
+                    pixels[dst..dst + row].copy_from_slice(&tiled[src..src + row]);
+                }
             }
             pixels
+        }
+        other if volume => {
+            return Err(err(format!(
+                "3D texture tile mode {other} not implemented (only linear measured; \
+                 base={:#x} {width}x{height}x{depth} format={})",
+                t.base40(),
+                t.format()
+            )));
         }
         // 64 KiB-block GFX10 swizzles with a ported exact equation
         // (SW_64KB_S = 9 measured on the 1937x333 atlas; SW_64KB_R_X = 27 on
@@ -698,6 +720,7 @@ fn decode_texture(
         pixels,
         layers,
         cube,
+        depth,
     })
 }
 
@@ -2510,5 +2533,39 @@ mod tests {
                 "face {l} must detile to its original pixels"
             );
         }
+    }
+
+    /// A 3D T# (type 10, linear tile 0 — the measured ASTRO.BOT froxel/LUT
+    /// volume shape, format 1 = R8_UNORM) decodes every slice and carries the
+    /// depth so the Vulkan layer builds a `VK_IMAGE_TYPE_3D` image.
+    #[test]
+    fn decode_texture_3d_volume_decodes_all_slices() {
+        let (w, h, d) = (8u32, 4u32, 4u32);
+        let voxels: Vec<u8> = (0..(w * h * d) as usize)
+            .map(|i| ((i * 7 + 3) % 251) as u8)
+            .collect();
+        let mut blob = vec![0u8; voxels.len() + 255];
+        let base = (blob.as_ptr() as u64 + 255) & !255;
+        let off = (base - blob.as_ptr() as u64) as usize;
+        blob[off..off + voxels.len()].copy_from_slice(&voxels);
+
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.update_address40(base >> 8);
+        t.fields[1] |= 1 << 20; // unified format 1 = 8 UNORM
+        t.fields[1] |= ((w - 1) & 3) << 30;
+        t.fields[2] = (w - 1) >> 2;
+        t.fields[2] |= (h - 1) << 14;
+        t.fields[3] |= 10 << 28; // type = 3D volume (tile mode 0 = linear)
+        t.fields[4] = (d - 1) & 0x1FFF; // depth
+
+        let tex = crate::guest_mem::with_test_ranges(&[(blob.as_ptr() as u64, blob.len())], || {
+            decode_texture(&t)
+        })
+        .expect("3D volume decodes");
+        assert!(!tex.cube);
+        assert_eq!(tex.layers, 1);
+        assert_eq!((tex.width, tex.height, tex.depth), (w, h, d));
+        assert_eq!(tex.format, vk::Format::R8_UNORM);
+        assert_eq!(tex.pixels, voxels, "all slices must decode in order");
     }
 }
