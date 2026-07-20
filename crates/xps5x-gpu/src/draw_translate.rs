@@ -186,6 +186,16 @@ fn vulkan_format(
         // scene target ASTRO.BOT renders into before tone-mapping. The offscreen
         // readback is bpp-aware (8 bytes/pixel for this one).
         (0xc, 7, 0) => Ok(vk::Format::R16G16B16A16_SFLOAT),
+        // CB format 0x3 (8_8 UNORM) is NOT accepted, deliberately. ASTRO.BOT
+        // asks for it (16 draws, once the vertex-fetch fix let them reach this
+        // check) and the enum numbering says it is R8G8_UNORM — but MEASURED,
+        // mapping it to R8G8_UNORM makes those draws lose the Vulkan device
+        // (vkQueueSubmit -> VK_ERROR_DEVICE_LOST) and takes the whole run from
+        // 10 presented frames to 0. Something else in the pipeline (attachment
+        // usage, the fragment shader's 4-component export, or blend state)
+        // cannot honour a 2-channel target yet. A named error costs 16 draws;
+        // a device loss costs every frame. Re-enable only together with
+        // whatever makes a 2-channel attachment actually work.
         _ => Err(err(format!(
             "unsupported CB_COLOR0_INFO format={format:#x} channel_type={channel_type} \
              channel_order={channel_order} — no Vulkan format mapping"
@@ -387,7 +397,19 @@ fn gen5_vertex_format(format: u8) -> Result<vk::Format, DrawError> {
         57 => Ok(vk::Format::R8G8B8A8_SNORM),
         71 => Ok(vk::Format::R16G16B16A16_SFLOAT),
         23 => Ok(vk::Format::R16G16_UNORM),
-        11 => Ok(vk::Format::R16_UINT),
+        // MUST be a float-convertible format, NOT an integer one. The SPIR-V
+        // we generate declares EVERY vertex input as float/vecN-float
+        // (`Spirv::WriteGlobalVariables` only ever emits %_ptr_Input_float /
+        // v2float / v3float / v4float), and Vulkan requires the attribute
+        // format's numeric type to match the shader input's. R16_UINT against
+        // a float32 input is an INVALID pipeline — measured on Minecraft, the
+        // validation layer reports "pVertexAttributeDescriptions[1].format
+        // (VK_FORMAT_R16_UINT) at Location 1 does not match [Input variable,
+        // Location 1] type of (float32)" and the draw contributes NO fragment,
+        // which is why every target stayed byte-exactly zero.
+        // R16_USCALED delivers the same integer VALUE converted to float,
+        // which is what a float input expects.
+        11 => Ok(vk::Format::R16_USCALED),
         other => Err(err(format!(
             "unsupported Gen5 vertex-buffer format {other}"
         ))),
@@ -415,8 +437,31 @@ fn prepare_vertex_inputs(
         let size = u64::from(guest.stride)
             .checked_mul(u64::from(guest.num_records))
             .ok_or_else(|| err("vertex buffer size overflow"))?;
+        let bytes = read_guest_bytes(guest.addr, size, "vertex buffer")?;
+        // Coverage probe (XPS5X_TRACE_DRAWS): XPS5X_FORCE_CLEAR proved well-
+        // formed quads rasterize ZERO fragments, so the suspect is the vertex
+        // DATA behind the V#. Report the descriptor and whether the guest bytes
+        // are actually non-zero — an all-zero buffer collapses every vertex to
+        // the origin and would explain zero coverage exactly.
+        if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static VB_SEEN: AtomicU32 = AtomicU32::new(0);
+            if VB_SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
+                let nz = bytes.iter().filter(|&&b| b != 0).count();
+                tracing::warn!(
+                    binding,
+                    addr = format_args!("{:#x}", guest.addr),
+                    stride = guest.stride,
+                    num_records = guest.num_records,
+                    size,
+                    non_zero_bytes = nz,
+                    head = format_args!("{:02x?}", &bytes[..bytes.len().min(32)]),
+                    "TRACE_DRAWS: vertex buffer content"
+                );
+            }
+        }
         buffers.push(VertexBufferData {
-            bytes: read_guest_bytes(guest.addr, size, "vertex buffer")?,
+            bytes,
             stride: guest.stride,
         });
 
@@ -441,12 +486,34 @@ fn prepare_vertex_inputs(
                     "vertex attribute {location} exceeds resource count {resources_num}"
                 )));
             }
-            attributes.push(VertexAttributeData {
+            let attr = VertexAttributeData {
                 location: location as u32,
                 binding: binding as u32,
                 format: gen5_vertex_format(info.resources[location].format())?,
                 offset: guest.attr_offsets[ai],
-            });
+            };
+            // Coverage probe (XPS5X_TRACE_DRAWS). Data + gl_Position + draw
+            // state are all confirmed correct yet coverage is ZERO, so the
+            // remaining link is this binding. `location` must be the SAME index
+            // space the shader declares (`OpDecorate %attr{i} Location {i}` over
+            // 0..resources_num) and the format/offset must match the V#.
+            if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static ATTR_SEEN: AtomicU32 = AtomicU32::new(0);
+                if ATTR_SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
+                    tracing::warn!(
+                        ai,
+                        location = attr.location,
+                        binding = attr.binding,
+                        format = format_args!("{:?}", attr.format),
+                        offset = attr.offset,
+                        gen5_format = info.resources[location].format(),
+                        resources_num,
+                        "TRACE_DRAWS: vertex attribute binding"
+                    );
+                }
+            }
+            attributes.push(attr);
         }
     }
     if attributes.len() != resources_num {
@@ -935,8 +1002,43 @@ pub fn draw_state_from_regs<'a>(
     if ctx.mode_control.cull_back {
         cull_mode |= vk::CullModeFlags::BACK;
     }
+    // PA_SU_SC_MODE_CNTL.FACE: 0 = counter-clockwise is the front face,
+    // 1 = clockwise is. Must travel with cull_mode — culling against the wrong
+    // winding removes exactly the geometry it should keep.
+    let front_face = if ctx.mode_control.face {
+        vk::FrontFace::CLOCKWISE
+    } else {
+        vk::FrontFace::COUNTER_CLOCKWISE
+    };
 
     let blend = blend_state_from_regs(ctx)?;
+
+    // Why-is-it-black diagnostic. Every GEOMETRIC degeneracy above (zero target
+    // mask, degenerate extent, zero-area viewport, empty scissor) is already a
+    // loud error, and titles hit none of them — yet Minecraft's targets stay
+    // byte-exactly zero across ~11,878 draws that reach here. So the cause is
+    // one of: coverage (viewport/scissor vs extent), blend collapsing the
+    // result, or the write mask. Log them together, rate-limited.
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static DRAW_STATE_LOGS: AtomicU64 = AtomicU64::new(0);
+        let n = DRAW_STATE_LOGS.fetch_add(1, Ordering::Relaxed);
+        if n < 8 || n.is_power_of_two() {
+            debug!(
+                n,
+                extent = format_args!("{width}x{height}"),
+                rt_base = format_args!("{:#x}", rt.base.addr),
+                viewport = format_args!("{viewport:?}"),
+                scissor = format_args!("{scissor:?}"),
+                target_mask = format_args!("{:#x}", ctx.render_target_mask),
+                color_write_mask = format_args!("{color_write_mask:?}"),
+                blend = format_args!("{blend:?}"),
+                topology = format_args!("{topology:?}"),
+                vertex_count,
+                "draw state (black-frame diagnostic)"
+            );
+        }
+    }
 
     Ok(DrawState {
         width,
@@ -947,6 +1049,7 @@ pub fn draw_state_from_regs<'a>(
         viewport,
         topology,
         cull_mode,
+        front_face,
         color_write_mask,
         blend,
         // The embedded VS declares no input attributes and builds its own quad.
@@ -1121,6 +1224,29 @@ impl OffscreenDrawSink<'_> {
         let (vertex_buffers, vertex_attributes) = prepare_vertex_inputs(&shaders.vs_info)?;
         state.vertex_buffers = vertex_buffers;
         state.vertex_attributes = vertex_attributes;
+        // Coverage probe (XPS5X_TRACE_DRAWS). Vertex data, attribute bindings,
+        // gl_Position and draw state are all confirmed correct yet coverage is
+        // ZERO. An all-zero index buffer collapses every primitive to a single
+        // vertex — degenerate triangles cover no pixel — and would look exactly
+        // like this. Report whether the draw is indexed and what the indices are.
+        if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static IDX_SEEN: AtomicU32 = AtomicU32::new(0);
+            if IDX_SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
+                match index {
+                    Some((bytes, index_type)) => tracing::warn!(
+                        indexed = true,
+                        index_type = format_args!("{index_type:?}"),
+                        len = bytes.len(),
+                        count,
+                        non_zero = bytes.iter().filter(|&&b| b != 0).count(),
+                        head = format_args!("{:02x?}", &bytes[..bytes.len().min(24)]),
+                        "TRACE_DRAWS: index buffer"
+                    ),
+                    None => tracing::warn!(indexed = false, count, "TRACE_DRAWS: non-indexed draw"),
+                }
+            }
+        }
         if let Some((bytes, index_type)) = index {
             state.index = Some(crate::vulkan::IndexBinding { bytes, index_type });
         }
@@ -1143,11 +1269,16 @@ impl OffscreenDrawSink<'_> {
         }
 
         // One-shot forensic: what does a real Minecraft draw actually bind?
-        // Frames are pure black despite the light-blue CLEAR working (M2 test),
-        // so geometry covers the screen and the PS shades black. This names
-        // whether the PS samples textures (→ texture-upload wall) or computes
-        // black from missing storage/push-constant inputs. Gated to the first
-        // few draws (XPS5X_TRACE_DRAWS) so it never floods a normal run.
+        // CORRECTED 2026-07-20: this used to claim "geometry covers the screen
+        // and the PS shades black". That is REFUTED — with XPS5X_FORCE_CLEAR=1
+        // (see offscreen.rs) Minecraft's final frame is 100% uniform
+        // CLEAR_COLOR, so NOT ONE draw produces a fragment. There is no
+        // coverage, and the PS is therefore never invoked; chasing the PS
+        // inputs from here is the wrong wall. What this trace is still good
+        // for: it shows the draws ARE well-formed (measured: textured/storage
+        // -fed quads, prim=4 verts=6 and prim=6 verts=4, 1 vertex buffer,
+        // 1-2 attributes), which is what pins the failure on VERTEX POSITIONS.
+        // Gated to the first few draws (XPS5X_TRACE_DRAWS) so it never floods.
         if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SEEN: AtomicU32 = AtomicU32::new(0);
@@ -1903,7 +2034,19 @@ mod tests {
         );
         assert_eq!(gen5_vertex_format(23).unwrap(), vk::Format::R16G16_UNORM);
         // 11 → (2,4) = 16 UINT (Minecraft's packed per-vertex value).
-        assert_eq!(gen5_vertex_format(11).unwrap(), vk::Format::R16_UINT);
+        // Format 11 is a 16-bit INTEGER on hardware, but every vertex input we
+        // generate is declared float, and Vulkan requires the numeric types to
+        // match. USCALED delivers the same value as a float; UINT makes the
+        // pipeline invalid and the draw silently contributes no fragment
+        // (measured on Minecraft via the validation layer).
+        assert_eq!(gen5_vertex_format(11).unwrap(), vk::Format::R16_USCALED);
+        for f in [64u8, 74, 77, 56, 57, 71, 23, 11] {
+            let vf = gen5_vertex_format(f).unwrap();
+            assert!(
+                !format!("{vf:?}").contains("UINT") && !format!("{vf:?}").contains("SINT"),
+                "vertex format {f} maps to integer {vf:?}, which cannot feed a float shader input"
+            );
+        }
         // 57 → (10,1) = 8_8_8_8 SNORM (same UI draw, next attribute).
         assert_eq!(gen5_vertex_format(57).unwrap(), vk::Format::R8G8B8A8_SNORM);
         let e = gen5_vertex_format(0).expect_err("unknown formats stay named");
@@ -1941,6 +2084,36 @@ mod tests {
         assert_eq!((tex.width, tex.height), (w, h));
         assert_eq!(tex.format, vk::Format::R8G8B8A8_UNORM);
         assert_eq!(tex.pixels, linear, "detiled pixels must match the original");
+    }
+
+    /// The COLOUR-BUFFER (CB_COLOR_INFO) format table is a different table from
+    /// the texture (T#) one — same data-format numbering, different consumer.
+    /// Every accepted entry must also have a `readback_bpp` size or the
+    /// offscreen readback fails at run time, so they are asserted together.
+    #[test]
+    fn cb_colour_formats_map_and_have_readback_sizes() {
+        for (fmt, ty, order, want, bpp) in [
+            (0xa, 0, 0, vk::Format::R8G8B8A8_UNORM, 4u32),
+            (0x6, 7, 0, vk::Format::B10G11R11_UFLOAT_PACK32, 4),
+            (0xc, 7, 0, vk::Format::R16G16B16A16_SFLOAT, 8),
+        ] {
+            let got = vulkan_format(fmt, ty, order)
+                .unwrap_or_else(|e| panic!("CB format {fmt:#x}/{ty}/{order}: {e}"));
+            assert_eq!(got, want, "CB format {fmt:#x}");
+            assert_eq!(
+                crate::vulkan::offscreen::readback_bpp(got).ok(),
+                Some(bpp),
+                "{want:?} needs a readback size"
+            );
+        }
+        // CB format 0x3 (8_8) must STAY rejected: mapping it to R8G8_UNORM was
+        // measured to lose the Vulkan device and drop ASTRO.BOT from 10 frames
+        // to 0. This asserts the regression cannot be reintroduced without
+        // also making 2-channel attachments work.
+        assert!(
+            vulkan_format(0x3, 0, 0).is_err(),
+            "CB format 0x3 causes VK_ERROR_DEVICE_LOST — see the arm's comment"
+        );
     }
 
     /// Unified format 71 = (dataFormat 12 = 16_16_16_16, numFormat 7 = FLOAT):

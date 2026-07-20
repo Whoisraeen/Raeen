@@ -669,6 +669,38 @@ fn recompile_exp_pos0(
     const FUNC: &str = "Recompile_Exp_Pos0Vsrc0Vsrc1Vsrc2Vsrc3Done";
     let inst = inst_at(code, index, FUNC)?;
 
+    // Coverage probe (XPS5X_TRACE_DRAWS). XPS5X_FORCE_CLEAR proved a correct
+    // full-screen NDC quad rasterizes ZERO fragments, so the suspect is the
+    // position export. If this never fires for a title's VS, the shader never
+    // writes gl_Position at all and nothing can cover a pixel.
+    if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static POS0_SEEN: AtomicU32 = AtomicU32::new(0);
+        let n = POS0_SEEN.fetch_add(1, Ordering::Relaxed);
+        if n < 8 {
+            tracing::warn!(
+                n,
+                srcs_are_variables = inst.src[..4].iter().all(|s| operand_is_variable(*s)),
+                // The VGPRs the export READS. The fetch WRITES to the VGPR named
+                // by sem.hardware_mapping() (measured: 9, 12, 13). If these
+                // disagree the export reads never-written registers (zeros) and
+                // every vertex collapses to the origin — zero coverage.
+                src_regs = format_args!(
+                    "[{}, {}, {}, {}]",
+                    inst.src[0].register_id,
+                    inst.src[1].register_id,
+                    inst.src[2].register_id,
+                    inst.src[3].register_id
+                ),
+                src_types = format_args!(
+                    "[{:?}, {:?}, {:?}, {:?}]",
+                    inst.src[0].type_, inst.src[1].type_, inst.src[2].type_, inst.src[3].type_
+                ),
+                "TRACE_DRAWS: POS0 export recompiled (VS writes gl_Position)"
+            );
+        }
+    }
+
     if inst.src[..4].iter().any(|s| !operand_is_variable(*s)) {
         return Err(not_supported(FUNC, "sources are not variables"));
     }
@@ -680,6 +712,28 @@ fn recompile_exp_pos0(
 
     // TODO() check VSKIP
     // TODO() check EXEC
+
+    // DIAGNOSTIC (XPS5X_VS_PASSTHROUGH=1): bypass the VS arithmetic and export
+    // input attribute 0 directly as the clip position. Every INPUT is verified
+    // correct (the measured vertex buffer is a textbook NDC quad) and Vulkan
+    // reports ZERO validation messages, yet no primitive covers a pixel — so
+    // the suspect is the VALUES the translated VS computes. Pixels under this
+    // flag => the generated VS body is at fault; still black => the fault is
+    // below the shader. Assumes a vec3 attr0 (the measured stride-12 quad);
+    // other shapes will fail to assemble, which is fine for a gated probe.
+    if std::env::var_os("XPS5X_VS_PASSTHROUGH").is_some() {
+        const PASS: &str = r#"
+         %p0_<index> = OpLoad %v3float %attr0
+         %px_<index> = OpCompositeExtract %float %p0_<index> 0
+         %py_<index> = OpCompositeExtract %float %p0_<index> 1
+         %pz_<index> = OpCompositeExtract %float %p0_<index> 2
+         %pv_<index> = OpCompositeConstruct %v4float %px_<index> %py_<index> %pz_<index> %float_1_000000
+         %pa_<index> = OpAccessChain %_ptr_Output_v4float %outPerVertex %int_per_vertex_0
+               OpStore %pa_<index> %pv_<index>
+"#;
+        *dst_source += &PASS.replace("<index>", &format!("{index}"));
+        return Ok(true);
+    }
 
     const TEXT: &str = r#"
          %t0_<index> = OpLoad %float %<src0>
@@ -2308,13 +2362,25 @@ fn recompile_fetch(
     {
         let attrib_id = inst.src[2].constant.i();
 
-        let Some(r) = usize::try_from(attrib_id)
-            .ok()
-            .and_then(|a| info.resources_dst.get(a))
-            .copied()
-        else {
-            return Err(not_supported(FUNC, format!("attrib id {attrib_id}")));
+        // Resolve by SEMANTIC (attrib-table index), not by array position.
+        // `shader_parse_attrib` appends resources in discovery order while
+        // `attrib_id` here is an attrib-table dword index, so the two agree
+        // only when the semantics table is identity-mapped. Minecraft's is not
+        // (measured: positions 0,1,2 carry semantics 0,2,3), and the old
+        // by-position read therefore returned a DIFFERENT attribute's V# for
+        // one id and an unwritten slot (registers_num 0) for another — one
+        // silently wrong binding and one loud failure from the same gap.
+        let resolved = info.resources_dst
+            [..(info.resources_num.max(0) as usize).min(info.resources_dst.len())]
+            .iter()
+            .position(|d| d.semantic == attrib_id);
+        let Some(r) = resolved.map(|p| info.resources_dst[p]) else {
+            return Err(not_supported(
+                FUNC,
+                format!("attrib id {attrib_id} not in the semantics table"),
+            ));
         };
+        let attrib_pos = resolved.expect("resolved is Some in this branch");
 
         let n_attr = r.registers_num;
         let n_dst = inst.dst.size;
@@ -2372,9 +2438,16 @@ fn recompile_fetch(
             );
         }
 
+        // `%attrN` is DECLARED and decorated by array POSITION
+        // (`Spirv::WriteGlobalVariables` emits `%attr{i}` / `OpDecorate
+        // %attr{i} Location {i}` over `0..resources_num`, and the host binds
+        // attributes by position too). So the variable reference must use the
+        // resolved position, not the attrib-table id — they differ exactly
+        // when the semantics table is gapped. `<index>` keeps the id so SSA
+        // temporaries stay unique per fetch.
         *dst_source += &text
             .replace("<index>", &format!("{attrib_id}_{index}"))
-            .replace("<attr>", &format!("attr{attrib_id}"));
+            .replace("<attr>", &format!("attr{attrib_pos}"));
 
         return Ok(true);
     }

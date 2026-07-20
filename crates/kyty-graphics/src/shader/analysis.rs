@@ -1440,7 +1440,24 @@ pub fn shader_parse_attrib(
             .ok_or_else(|| trunc("attrib: attribute table read out of bounds"))?;
 
         // Kyty printf()s this unconditionally; the port logs at debug level.
-        tracing::debug!("reg = {reg}, size = {size}, va[{i}] = 0x{va:08x}");
+        // `semantic` and the position `i` are logged TOGETHER on purpose:
+        // `resources_dst` is written at position `i` here, but `recompile_fetch`
+        // reads it back by ATTRIB-TABLE INDEX (= semantic). The two agree only
+        // while `semantic == i` for every entry. A line where they differ is a
+        // gapped/permuted semantics table — the gapped case surfaces as
+        // "invalid registers_num: 0 (attrib N)", the permuted case is SILENT
+        // and binds the wrong vertex buffer. `size` distinguishes the competing
+        // hypothesis: size == 0 here means the semantic's size_in_elements
+        // decode is wrong, not the indexing.
+        tracing::debug!(
+            pos = i,
+            semantic = sem.semantic(),
+            reg,
+            size,
+            va = format_args!("{va:#010x}"),
+            mismatch = (sem.semantic() as usize != i),
+            "attrib semantic"
+        );
 
         let index = (va & 0x1f) as usize;
         let format = (va >> 5) & 0x1ff;
@@ -1513,6 +1530,10 @@ pub fn shader_parse_attrib(
         let n = info.resources_num as usize;
         info.resources_dst[n].register_start = reg as i32;
         info.resources_dst[n].registers_num = size as i32;
+        // Record which attrib-table entry this slot came from. `recompile_fetch`
+        // resolves by this, NOT by array position — Minecraft's semantics table
+        // is gapped (positions 0,1,2 carry semantics 0,2,3).
+        info.resources_dst[n].semantic = sem.semantic() as i32;
         info.resources[n].fields.copy_from_slice(&folded);
 
         info.resources_num += 1;
@@ -2619,6 +2640,67 @@ mod tests {
         assert_eq!(info.resources[0].fields, [1, 2, 3, 4]);
         assert_eq!(info.resources_dst[0].register_start, 4);
         assert_eq!(info.resources_dst[0].registers_num, 3);
+    }
+
+    /// A GAPPED semantics table — Minecraft's measured shape: array positions
+    /// 0,1,2 carry semantics 0,2,3 (semantic 1 absent). Each slot must record
+    /// the semantic it came from, because `recompile_fetch` resolves by
+    /// attrib-table id, not by position. Before this, position 2 held
+    /// semantic 3's V# (so attrib id 2 silently bound the WRONG buffer) and
+    /// attrib id 3 hit an unwritten slot ("invalid registers_num: 0").
+    #[test]
+    fn parse_attrib_records_semantic_for_a_gapped_table() {
+        let mk = |semantic: u32, reg: u32, size: u32| ShaderSemantic {
+            raw: semantic | (reg << 8) | (size << 16),
+        };
+        // attrib table: entry k selects V# index k, so a wrong resolution
+        // shows up as the wrong V# contents.
+        let attrib = [0u32, 1, 2, 3];
+        let mut buffer = vec![0u32; 16];
+        for v in 0..4usize {
+            buffer[v * 4..v * 4 + 4].copy_from_slice(&[
+                (v as u32) + 100,
+                (v as u32) + 200,
+                (v as u32) + 300,
+                (v as u32) + 400,
+            ]);
+        }
+        let sems = [mk(0, 9, 3), mk(2, 13, 3), mk(3, 16, 2)];
+        let mut info = ShaderVertexInputInfo::default();
+        shader_parse_attrib(&mut info, &sems, &attrib, &buffer).unwrap();
+
+        assert_eq!(info.resources_num, 3);
+        assert_eq!(
+            [
+                info.resources_dst[0].semantic,
+                info.resources_dst[1].semantic,
+                info.resources_dst[2].semantic
+            ],
+            [0, 2, 3],
+            "each slot records the attrib-table index it came from"
+        );
+        // Slot 3 was never written: it must be distinguishable from a real
+        // semantic 0, or a by-position read would silently accept it.
+        assert_eq!(
+            info.resources_dst[3].semantic,
+            crate::shader::resources::ShaderVertexDestination::UNSET_SEMANTIC
+        );
+
+        // Resolving by semantic (what recompile_fetch does) lands on the slot
+        // holding that attribute's V#, not on the same-numbered position.
+        let pos_of = |sem: i32| {
+            info.resources_dst[..info.resources_num as usize]
+                .iter()
+                .position(|d| d.semantic == sem)
+        };
+        assert_eq!(pos_of(2), Some(1), "attrib id 2 lives at position 1");
+        assert_eq!(pos_of(3), Some(2), "attrib id 3 lives at position 2");
+        assert_eq!(pos_of(1), None, "semantic 1 is genuinely absent");
+        assert_eq!(
+            info.resources[pos_of(2).unwrap()].fields,
+            [102, 202, 302, 402],
+            "attrib id 2 must resolve to V# 2, not to position 2's V# 3"
+        );
     }
 
     #[test]

@@ -149,7 +149,10 @@ fn hle_context_create(ctx: &HleContext, args: &[u64]) -> u64 {
     if ctx.mem.read(param, &mut pbuf) {
         let frequency = u32::from_le_bytes(pbuf[0x08..0x0C].try_into().expect("fixed slice"));
         let grain = u32::from_le_bytes(pbuf[0x0C..0x10].try_into().expect("fixed slice"));
-        CONTEXTS.insert(handle, std::sync::Arc::new(ContextPace::new(frequency, grain)));
+        CONTEXTS.insert(
+            handle,
+            std::sync::Arc::new(ContextPace::new(frequency, grain)),
+        );
     }
     if ctx.mem.write(out_context, &handle.to_le_bytes()) {
         OK
@@ -216,7 +219,11 @@ struct ContextPace {
 impl ContextPace {
     fn new(frequency: u32, grain_samples: u32) -> Self {
         let frequency = u64::from(if frequency == 0 { 48000 } else { frequency });
-        let grain_samples = u64::from(if grain_samples == 0 { 256 } else { grain_samples });
+        let grain_samples = u64::from(if grain_samples == 0 {
+            256
+        } else {
+            grain_samples
+        });
         Self {
             grain: std::time::Duration::from_secs_f64(grain_samples as f64 / frequency as f64),
             next: std::sync::Mutex::new(std::time::Instant::now()),

@@ -660,10 +660,35 @@ impl ShaderVertexInputBuffer {
 }
 
 /// Kyty: Shader.h `ShaderVertexDestination` (L754).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ShaderVertexDestination {
     pub register_start: i32,
     pub registers_num: i32,
+    /// Attrib-table index (`ShaderSemantic::semantic()`) this resource came
+    /// from. Beyond Kyty, which stores resources by array POSITION and then
+    /// looks them up by attrib id in `Recompile_Fetch` — the two agree only
+    /// while the semantics table is identity-mapped. Minecraft's is not
+    /// (measured: positions 0,1,2 carry semantics 0,2,3), so the by-position
+    /// read returned another attribute's V# for one id and an unwritten slot
+    /// for another. Recording the semantic lets the lookup resolve by id.
+    /// `-1` marks a slot that was never populated.
+    pub semantic: i32,
+}
+
+impl ShaderVertexDestination {
+    /// Kyty leaves unpopulated slots zeroed, which is indistinguishable from
+    /// "semantic 0". `Default` therefore cannot be derived for `semantic`.
+    pub const UNSET_SEMANTIC: i32 = -1;
+}
+
+impl Default for ShaderVertexDestination {
+    fn default() -> Self {
+        Self {
+            register_start: 0,
+            registers_num: 0,
+            semantic: Self::UNSET_SEMANTIC,
+        }
+    }
 }
 
 /// Kyty: Shader.h `ShaderStorageUsage` (L760).

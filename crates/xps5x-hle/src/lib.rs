@@ -530,10 +530,17 @@ pub type HleFunction = fn(&HleContext, &[u64]) -> u64;
 
 fn canonical_provider_name(provider: &str) -> String {
     let lower = provider.to_ascii_lowercase();
-    lower
+    let lower = lower
         .strip_suffix(".sprx")
         .or_else(|| lower.strip_suffix(".prx"))
-        .unwrap_or(&lower)
+        .unwrap_or(&lower);
+    // Keep in lockstep with `xps5x_firmware::dynlib::nid::canonical_provider_name`
+    // — the two halves of one provider identity. `.native` / `_native` is a
+    // spelling of the same library (retail imports `libSceMsgDialog.native`).
+    lower
+        .strip_suffix(".native")
+        .or_else(|| lower.strip_suffix("_native"))
+        .unwrap_or(lower)
         .to_string()
 }
 

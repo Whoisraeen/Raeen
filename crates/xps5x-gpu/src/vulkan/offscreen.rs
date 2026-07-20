@@ -68,7 +68,7 @@ impl RenderedImage {
 /// only the size matters here (the format's meaning is handled where it is
 /// sampled). Packed 32-bit HDR (B10G11R11) is 4 bytes like RGBA8; R16G16B16A16
 /// is 8.
-fn readback_bpp(format: vk::Format) -> Result<u32, GpuError> {
+pub(crate) fn readback_bpp(format: vk::Format) -> Result<u32, GpuError> {
     match format {
         vk::Format::R8G8B8A8_UNORM
         | vk::Format::R8G8B8A8_SRGB
@@ -203,6 +203,12 @@ pub struct DrawState<'a> {
     pub viewport: [f32; 4],
     pub topology: vk::PrimitiveTopology,
     pub cull_mode: vk::CullModeFlags,
+    /// Winding that counts as FRONT, from `PA_SU_SC_MODE_CNTL.FACE`
+    /// (0 = counter-clockwise is front, 1 = clockwise is front).
+    /// This was hardcoded COUNTER_CLOCKWISE, which was harmless only while
+    /// `cull_mode` was permanently NONE. Decoding PA_SU_SC_MODE_CNTL turned
+    /// culling ON, so an unwired winding would cull exactly the wrong faces.
+    pub front_face: vk::FrontFace,
     /// Which colour channels the draw may write, from `CB_TARGET_MASK`.
     ///
     /// Vulkan expresses this natively, so a guest mask maps straight through
@@ -478,6 +484,7 @@ impl<'a> DrawState<'a> {
             color_write_mask: vk::ColorComponentFlags::RGBA,
             topology: vk::PrimitiveTopology::TRIANGLE_LIST,
             cull_mode: vk::CullModeFlags::NONE,
+            front_face: vk::FrontFace::COUNTER_CLOCKWISE,
             blend: BlendState::default(),
             vertices: None,
             vertex_buffers: Vec::new(),
@@ -1613,7 +1620,7 @@ impl<'a> Resources<'a> {
         let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(state.cull_mode)
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .front_face(state.front_face)
             .line_width(1.0);
 
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
@@ -2019,7 +2026,19 @@ impl<'a> Resources<'a> {
         let color_attachment = vk::RenderingAttachmentInfo::default()
             .image_view(self.image_view)
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(if state.initial.is_some() {
+            // `XPS5X_FORCE_CLEAR=1` is the COVERAGE PROBE: it forces every draw
+            // to CLEAR instead of LOAD, so the target ends as pure CLEAR_COLOR
+            // unless some draw actually produced a fragment. It answers the one
+            // question a black frame cannot — "is nothing being drawn, or is
+            // something being drawn in black?" — without shader surgery.
+            // MEASURED on Minecraft: 12,083 draws, final frame 100% uniform
+            // CLEAR_COLOR (2,073,600/2,073,600 pixels) => ZERO coverage; not a
+            // single fragment from any draw. It also proves the clear reaches
+            // the image and the RGBA8 readback/dump is faithful (blue came back
+            // 0xBF exactly).
+            .load_op(if std::env::var_os("XPS5X_FORCE_CLEAR").is_some() {
+                vk::AttachmentLoadOp::CLEAR
+            } else if state.initial.is_some() {
                 vk::AttachmentLoadOp::LOAD
             } else {
                 vk::AttachmentLoadOp::CLEAR

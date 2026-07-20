@@ -1098,6 +1098,29 @@ impl CommandProcessor {
         match reg {
             pm4::CB_TARGET_MASK => self.ctx.render_target_mask = value,
 
+            // PA_SU_SC_MODE_CNTL was a HALF-WIRED feature: the pm4 constant
+            // (pm4.rs), the full `ModeControl` struct (hw_regs.rs) and the
+            // consumer that turns cull_front/cull_back into a Vulkan cull mode
+            // (xps5x-gpu draw_translate) all existed, but nothing ever decoded
+            // the register — so `ctx.mode_control` stayed at its all-false
+            // default and EVERY draw in EVERY title rasterized with
+            // CullModeFlags::NONE. Field layout is Kyty's
+            // (Pm4.h PA_SU_SC_MODE_CNTL_*_SHIFT/_MASK, L489-510).
+            pm4::PA_SU_SC_MODE_CNTL => {
+                let m = &mut self.ctx.mode_control;
+                m.cull_front = value & 0x1 != 0;
+                m.cull_back = (value >> 1) & 0x1 != 0;
+                m.face = (value >> 2) & 0x1 != 0;
+                m.poly_mode = ((value >> 3) & 0x3) as u8;
+                m.polymode_front_ptype = ((value >> 5) & 0x7) as u8;
+                m.polymode_back_ptype = ((value >> 8) & 0x7) as u8;
+                m.poly_offset_front_enable = (value >> 11) & 0x1 != 0;
+                m.poly_offset_back_enable = (value >> 12) & 0x1 != 0;
+                m.vtx_window_offset_enable = (value >> 16) & 0x1 != 0;
+                m.provoking_vtx_last = (value >> 19) & 0x1 != 0;
+                m.persp_corr_dis = (value >> 20) & 0x1 != 0;
+            }
+
             // Kyty's Gen5 primary-register lists program scissors through
             // R_CX_REGS_INDIRECT. Keep these as individual setters so direct
             // SET_CONTEXT_REG and indirect `(offset, value)` pairs converge.
@@ -2218,6 +2241,48 @@ mod tests {
         let dcb = vec![header(8, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO), 0];
         let err = cp.run(&dcb, &mut sink).expect_err("must not overrun");
         assert!(matches!(err, CpError::Truncated { .. }), "got {err:?}");
+    }
+
+    /// PA_SU_SC_MODE_CNTL decodes into `ctx.mode_control`. This register was
+    /// previously undecoded while its struct and its Vulkan cull-mode consumer
+    /// both existed, so every draw rasterized with culling disabled. Bit
+    /// positions are Kyty's (Pm4.h L489-510); each field is given a DISTINCT
+    /// value so a copy-paste shift error cannot pass.
+    #[test]
+    fn pa_su_sc_mode_cntl_decodes_every_field() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        // cull_front=1, cull_back=0, face=1, poly_mode=2, front_ptype=5,
+        // back_ptype=3, offset_front=1, offset_back=0, vtx_window=1,
+        // provoking_last=1, persp_corr_dis=0.
+        let value = 1
+            | (0 << 1)
+            | (1 << 2)
+            | (2 << 3)
+            | (5 << 5)
+            | (3 << 8)
+            | (1 << 11)
+            | (0 << 12)
+            | (1 << 16)
+            | (1 << 19);
+        let dcb = vec![
+            header(3, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
+            pm4::PA_SU_SC_MODE_CNTL,
+            value,
+        ];
+        cp.run(&dcb, &mut sink).expect("mode cntl decodes");
+        let m = cp.get_ctx().mode_control;
+        assert!(m.cull_front, "cull_front is bit 0");
+        assert!(!m.cull_back, "cull_back is bit 1");
+        assert!(m.face, "face is bit 2");
+        assert_eq!(m.poly_mode, 2, "poly_mode is bits 4:3");
+        assert_eq!(m.polymode_front_ptype, 5, "front ptype is bits 7:5");
+        assert_eq!(m.polymode_back_ptype, 3, "back ptype is bits 10:8");
+        assert!(m.poly_offset_front_enable, "bit 11");
+        assert!(!m.poly_offset_back_enable, "bit 12");
+        assert!(m.vtx_window_offset_enable, "bit 16");
+        assert!(m.provoking_vtx_last, "bit 19");
+        assert!(!m.persp_corr_dis, "bit 20");
     }
 
     /// Resilience policy: an unknown register is a rate-limited warn and a

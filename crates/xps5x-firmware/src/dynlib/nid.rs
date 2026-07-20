@@ -255,16 +255,86 @@ impl NidDatabase {
 
 fn canonical_provider_name(provider: &str) -> String {
     let lower = provider.to_ascii_lowercase();
-    lower
+    let lower = lower
         .strip_suffix(".sprx")
         .or_else(|| lower.strip_suffix(".prx"))
-        .unwrap_or(&lower)
+        .unwrap_or(&lower);
+    // `.native` / `_native` is a SPELLING of the same library, not a different
+    // one. Retail import tables ask for `libSceMsgDialog.native` and
+    // `libSceSaveDataDialog.native` while the HLE registers the bare names, so
+    // without this every such import resolved to `Unresolved` even though the
+    // function was fully implemented — measured on Minecraft (PPSA17221), which
+    // imports 7 `libSceMsgDialog.native` + 7 `libSceSaveDataDialog.native`
+    // symbols that all exist in-tree. Stripping here fixes the whole class at
+    // the one point that already normalizes provider spelling, instead of
+    // making each module hand-maintain an alias list (the idiom
+    // `libsce_save_data.rs` had to use).
+    lower
+        .strip_suffix(".native")
+        .or_else(|| lower.strip_suffix("_native"))
+        .unwrap_or(lower)
         .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `.native` / `_native` import must reach the bare-named registration.
+    ///
+    /// Measured on Minecraft (PPSA17221): the title imports
+    /// `sceMsgDialogInitialize` from `libSceMsgDialog.native` and
+    /// `sceSaveDataDialogOpen` from `libSceSaveDataDialog.native`. Both are
+    /// implemented in-tree under the bare library names, yet the link reported
+    /// all 14 such symbols "missing" purely because the provider spelling did
+    /// not match. Guard the canonicalization, not the individual names.
+    #[test]
+    fn native_suffixed_provider_resolves_to_the_bare_registration() {
+        let db = NidDatabase::from_hle_names(vec![
+            (
+                "libSceMsgDialog".to_string(),
+                "sceMsgDialogInitialize".to_string(),
+            ),
+            (
+                "libSceSaveDataDialog".to_string(),
+                "sceSaveDataDialogOpen".to_string(),
+            ),
+        ]);
+
+        for (import_library, function) in [
+            ("libSceMsgDialog.native", "sceMsgDialogInitialize"),
+            ("libSceMsgDialog_native", "sceMsgDialogInitialize"),
+            ("libSceMsgDialog", "sceMsgDialogInitialize"),
+            ("libSceSaveDataDialog.native", "sceSaveDataDialogOpen"),
+            ("libSceSaveDataDialog_native", "sceSaveDataDialogOpen"),
+        ] {
+            let nid = nid_of(function);
+            let resolved = db.resolve_for_provider(import_library, nid);
+            assert!(
+                resolved.is_some_and(|name| name.ends_with(function)),
+                "import {import_library}::{function} (NID {nid:#018x}) did not reach its \
+                 bare-named registration — got {resolved:?}"
+            );
+        }
+    }
+
+    /// Stripping `.native` must not merge two genuinely different libraries:
+    /// the suffix is only removed from the END of the provider name.
+    #[test]
+    fn native_stripping_does_not_merge_unrelated_libraries() {
+        assert_eq!(
+            canonical_provider_name("libSceNativeThing"),
+            "libscenativething"
+        );
+        assert_eq!(
+            canonical_provider_name("libSceSaveData.native"),
+            "libscesavedata"
+        );
+        assert_eq!(
+            canonical_provider_name("libSceSaveData.prx"),
+            "libscesavedata"
+        );
+    }
 
     /// The same function name under several libraries must resolve to the SAME
     /// winner no matter what order the names arrive in.

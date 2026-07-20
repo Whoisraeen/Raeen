@@ -296,7 +296,14 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
     }
 
     match ctx.services.open(&path, flags, mode) {
-        Ok(fd) => fd as u64,
+        Ok(fd) => {
+            // Name every SUCCESSFUL open too. Only failures were logged before,
+            // which makes "the title never touched this file" and "it opened it
+            // fine" indistinguishable in a boot trace — the exact ambiguity that
+            // hid whether the Ore-UI menu HTML is ever loaded.
+            debug!("open: '{path}' -> fd {fd}");
+            fd as u64
+        }
         Err(e) => {
             warn!("open: '{path}' failed: {e} — ENOENT");
             FILE_ENOENT

@@ -1031,3 +1031,453 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   a wrong guess here mis-binds a resource silently.
   All four remaining items are now sized; none is a quick win. See the previous
   three entries.
+
+- Minecraft graphics push (2026-07-20; kyty-graphics 262/262). TWO REAL GPU BUGS
+  FIXED, and a REFRAME of what actually gates Minecraft's pixels.
+
+  1. **Vertex-fetch attrib MIS-INDEX (was silently binding the wrong buffer).**
+     `shader_parse_attrib` appends resources in DISCOVERY ORDER
+     (`resources_dst[resources_num]`, analysis.rs) while `recompile_fetch` read
+     them back by ATTRIB-TABLE ID (`resources_dst[attrib_id]`, recompile.rs).
+     Those agree only if the semantics table is identity-mapped. MEASURED on
+     Minecraft it is NOT: positions 0,1,2 carry semantics 0,2,3 (semantic 1
+     absent). One gap caused TWO bugs — attrib id 3 hit an unwritten slot
+     ("invalid registers_num: 0", 19 draw skips) and attrib id 2 read position
+     2, i.e. ANOTHER ATTRIBUTE'S V#, with no error at all.
+     FIX: `ShaderVertexDestination` now records `semantic` (Default =
+     UNSET_SEMANTIC = -1, since Kyty's zeroed slots are indistinguishable from
+     a real semantic 0); `recompile_fetch` resolves by semantic. The `%attrN`
+     REFERENCE was also corrected to the resolved POSITION — SPIR-V declares
+     `%attr{i}`/`OpDecorate Location {i}` by position and the host binds by
+     position, so only the V# lookup was id-keyed. MEASURED: draw_skips 19 -> 0.
+     Test `parse_attrib_records_semantic_for_a_gapped_table` pins it.
+     DO NOT "fix" registers_num==0 with a (0,0,0,1) default: that collapses
+     every vertex to the origin, which REPRODUCES the black frame silently and
+     deletes the diagnostic. Kyty upstream has this same defect (Shader.cpp
+     L1126-1137 vs ShaderSpirv.cpp L6076-6078) — porting fidelity is not a
+     defence.
+
+  2. **PA_SU_SC_MODE_CNTL (0x205) was HALF-WIRED.** pm4 constant (pm4.rs:252),
+     the 11-field `ModeControl` struct (hw_regs.rs:291-303) and the Vulkan
+     cull-mode consumer (draw_translate.rs:932-935) all existed, but run.rs
+     NEVER decoded the register — so `ctx.mode_control` stayed all-false and
+     EVERY draw in EVERY title rasterized with CullModeFlags::NONE. Decoded per
+     Kyty Pm4.h L489-510; test gives each field a distinct value.
+
+  **REFRAME — Minecraft's black frame is NOT a rendering bug.** 512 submissions,
+  12083 draws, 256+ flips, shaders translate, draw_skips=0, and the scanout
+  lookup HITS (draws genuinely target the presented buffer, which accumulates).
+  The frame is byte-exactly zero because there is no menu content yet: the title
+  sits in PSN/entitlement traffic (SceNpWebApi2 / SceNpAuthAuthorizedAppDialog /
+  SceNpEntitlementAccess; 126 missing imports, ~46 NP) with Gameface/Ore-UI
+  threads spawned, and settles into a ~10s PERIODIC RETRY loop on
+  "/savedata0/ -> savedata\PPSA17221-app". A 560s run did MORE GPU work but
+  never advanced past that loop. Next lever is HLE (NP/savedata), NOT the GPU.
+
+  Items 1 and 2 of the user's list were ALREADY DONE by the concurrent session
+  and verified present, not assumed: VGT_PRIMITIVE_TYPE 0 -> clean no-op
+  (draw_translate.rs ~1098) and IT_WRITE_DATA/IT_DMA_DATA decode (agc.rs) with
+  a REAL apply (guest-memory writes/copies/fills, libsce_agc.rs 861/875/898).
+
+- ASTRO.BOT regression check after the fetch/cull fixes (2026-07-20): NO
+  REGRESSION — still 10 frames, 16,588,802 non-zero bytes (the known green
+  composite), 16 shaders translated. Enabling culling did not remove geometry.
+  NEW FRONTIER EXPOSED (draws now reach a check they previously never got to):
+  16x "draw failed at DWORD 4706: unsupported CB_COLOR0_INFO format=0x3".
+  That is a colour-BUFFER (CB) format gap, distinct from the texture (T#)
+  format table fixed earlier — do not confuse the two tables.
+
+- CB colour format 0x3 (8_8) — TRIED, MEASURED HARMFUL, REVERTED (2026-07-20).
+  After the vertex-fetch fix, 16 ASTRO.BOT draws reached the CB_COLOR0_INFO
+  check and failed on format=0x3 channel_type=0. The enum numbering says 0x3 =
+  8_8 (consistent with 0xa = 8_8_8_8 and 0xc = 16_16_16_16, both already
+  mapped), so R8G8_UNORM looks right on paper. **It is not usable yet.**
+  MEASURED: mapping it took ASTRO.BOT from 10 presented frames to **0**, with
+  56 draws failing `vkQueueSubmit -> VK_ERROR_DEVICE_LOST` (the logical device
+  is lost, so every subsequent frame dies too). Something else in the pipeline
+  cannot honour a 2-channel attachment — candidates: attachment usage flags,
+  the fragment shader's 4-component colour export vs a 2-component target, or
+  blend state. REVERTED; the arm now carries a comment explaining why it is
+  deliberately absent, and `cb_colour_formats_map_and_have_readback_sizes`
+  ASSERTS 0x3 stays rejected so the regression cannot be reintroduced blind.
+  A named error costs 16 draws; a device loss costs every frame.
+  Kept from the attempt: that test, which also pins the invariant that every
+  accepted CB format has a matching `readback_bpp` entry (they are two tables
+  that must move together — `readback_bpp` is now pub(crate) for it).
+
+- Minecraft menu blocker — NP HYPOTHESIS DEAD, Ore-UI narrowed (2026-07-20;
+  workspace 1437/1437, clippy 0, fmt 0 diffs).
+  **DO NOT re-chase NP/missing imports.** Measured two independent ways:
+  (a) dispatch.rs:1773-1783 logs every unresolved import actually CALLED —
+  ZERO such lines in any run; (b) zero xps5x_hle::libsce_np* calls of any kind,
+  not even sceNpGetState. The 126 "missing" imports are LINK-TIME ONLY and the
+  title never calls one, so `sceNpGetState` returning SIGNED_OUT
+  (libsce_np.rs:68-79) is irrelevant and stubbing NP signed-in changes nothing.
+  Also eliminated: the 705 /app0 ENOENTs are genuine (those paths do not exist;
+  normal Bedrock resource-pack probing), the dump is complete (22,299 files,
+  index.html present), and the ~10s "retry loop" is BENIGN housekeeping
+  (16s treatment_metadata.json flush + 2s offline-socket retry), not a deadlock
+  — XPS5X_STALL_DUMP shows a healthy idle with the Rendering Pool still
+  submitting DCBs.
+  **NARROWED BLOCKER:** the title reads /app0/data/gui/dist/hbui/routes.json
+  (the Ore-UI route table -> /hbui/index.html) THREE times and then never opens
+  ANY .html, while `Gameface Layout(0)` and `Gameface Resource Thread` both sit
+  in scePthreadCondWait. cohtml initializes and idles, never handed a page.
+  FIXED en route (real defect, but did NOT unblock the menu — consistent with
+  those functions never being called): `canonical_provider_name` now strips
+  `.native`/`_native` (nid.rs:256, lib.rs:531). The title imports from
+  `libSceMsgDialog.native` / `libSceSaveDataDialog.native`, both fully
+  implemented under the bare names, so provider-aware resolution reported 14
+  implemented functions as missing. MEASURED 430 -> 444 trampolines,
+  128 -> 114 unresolved. Two regression tests, incl. one asserting the suffix
+  is only stripped from the END (so `libSceNativeThing` is not merged).
+  **OPEN AND IMPORTANT — re-check "the GPU path is healthy":** 12,083 draws
+  across THREE render targets (0x1f7d0000, 0x20040000, 0x31c50000) produce
+  BYTE-EXACTLY ZERO output in all three. Of those draws only 202 are consumed
+  as depth-only and 3 as prim-NONE, and ZERO are skipped as untranslatable —
+  so ~11,878 proceed to real rendering and write nothing. That is not what a
+  title clearing to black looks like. Compute meanwhile IS working (3,193
+  storage writebacks carrying real floats, head=[00,00,80,bf] = -1.0f).
+  Next: either trace the LLE boundary into libcohtml.Prospero.prx (352 exports,
+  loaded at +0xf4a0000) to see whether View/LoadURL is ever called, or find why
+  ~11,878 colour draws write zero pixels. The second question is independent of
+  the menu and may be the more fundamental one.
+
+- **CORRECTION, LOAD-BEARING: NO TITLE HAS EVER RENDERED ITS OWN PIXELS.**
+  (2026-07-20, proven by a controlled experiment, not inference.)
+  ASTRO.BOT's long-claimed "visible frame / green loading composite / 67%
+  non-black / 16.5 MB non-zero bytes" is **the emulator's own CLEAR_COLOR**,
+  not title content. PROOF: `CLEAR_COLOR` is [0.25,0.5,0.75,1.0]
+  (xps5x-gpu/src/vulkan/offscreen.rs:25). The dumped ASTRO frame repeats the
+  pixel `40 80 00` — and 0.25*255 = 0x40, 0.5*255 = 0x80 EXACTLY. Changing
+  CLEAR_COLOR to [1,0,0,1] and re-running made the frame repeat `ff 00 00`
+  (pure red). The "content" tracks our clear constant, so it is ours.
+  Minecraft is the same story one step earlier: its targets are byte-exactly
+  ZERO because every draw takes AttachmentLoadOp::LOAD over zero-filled
+  content (`state.initial.is_some()`, offscreen.rs ~2023) and so never even
+  clears — which is why it is black rather than light blue.
+  **Every prior "ASTRO.BOT shows a frame" claim in this ledger and in
+  [[astro-bot-boot-state]] is WRONG and must not be relied on.** The
+  frame-count metric (10 frames, N non-zero bytes) measures only that the
+  present/dump path runs; it says NOTHING about title rendering. USE A
+  CONTROLLED CLEAR-COLOUR TEST before ever claiming a title rendered.
+  Ruled out by measurement while establishing this (draw state is textbook
+  correct, so these are NOT the cause): extent 1920x1080, full-screen Y-flipped
+  viewport [0,1080,1920,-1080], full scissor [0,0,1920,1080], target_mask=0xf,
+  colour write mask R|G|B|A, sane blend (replace and standard alpha both seen).
+  Every geometric degeneracy is already a LOUD error in draw_state_from_regs
+  (zero mask / degenerate extent / zero-area viewport / empty scissor) and
+  titles hit NONE of them.
+  So the real question for both titles is now narrow: draws execute with
+  correct state and correct attachments yet contribute NO fragment. Remaining
+  candidates: (a) vertex positions never produce coverage, (b) the fragment
+  shader outputs nothing / is discarded. The discriminator is to force a
+  constant colour export in the fragment shader for one draw: if the target
+  changes, it is coverage; if not, it is shading.
+  Also noted: the PPM dump writes 3 of every 4 bytes and ignores
+  RenderedImage::bytes_per_pixel, so an 8bpp (HDR) or packed
+  B10G11R11 target is dumped INCORRECTLY — the ASTRO blue channel reading 0x00
+  instead of 0xBF is consistent with that. Fix the dump before trusting any
+  HDR-target pixel values.
+
+- **THE BLACK FRAME IS ZERO COVERAGE, NOT BLACK SHADING** (2026-07-20, proven).
+  New permanent diagnostic `XPS5X_FORCE_CLEAR=1` (offscreen.rs) forces every
+  draw to CLEAR instead of LOAD, so the target ends as pure CLEAR_COLOR unless
+  a draw actually produced a fragment. MEASURED on Minecraft: after 12,083
+  draws the final 1920x1080 frame is **100% uniform CLEAR_COLOR** — ONE
+  distinct pixel value, 2,073,600/2,073,600 = `40 80 bf` = [0.25,0.5,0.75].
+  **NOT ONE DRAW WROTE A SINGLE FRAGMENT.**
+  This splits the hypothesis space definitively:
+   - RULED OUT: fragment shading (there is nothing to shade), blend, colour
+     write mask, target mask, viewport, scissor, extent, attachment identity,
+     and the readback/dump path (blue returned 0xBF EXACTLY, so RGBA8 readback
+     is faithful — ASTRO's 0x00 blue is specifically an HDR/packed-format DUMP
+     bug, see the dump note in the entry above).
+   - REMAINING: the geometry never covers a pixel. Candidates, in order:
+     (a) the V# (vertex buffer descriptor) base/stride/format resolves to
+         empty or wrong guest memory, so positions are garbage/zero;
+     (b) the VS never writes a usable gl_Position (export/POS0 handling);
+     (c) the index buffer / vertex_count is wrong so no primitive is assembled.
+  NOTE this is AFTER the vertex-fetch mis-index fix (which was real and took
+  draw_skips 19->0), so the fetch INDEXING is right but the fetched DATA or the
+  position export may still be wrong — those are different failures.
+  NEXT MEASUREMENT: log, for one real draw, the resolved V# base/stride/format,
+  the first few bytes of guest memory at that base, vertex_count/index_count,
+  and whether the VS SPIR-V contains a Position builtin store. That separates
+  (a) from (b) from (c) in a single run.
+
+- Minecraft draw bind profiles — geometry IS well-formed (2026-07-20,
+  XPS5X_TRACE_DRAWS=1). The real-draw path IS reached and the draws look
+  exactly like an Ore-UI/Gameface layer:
+    4x  prim=4 verts=6  guest_vbufs=1 vattrs=2  ps_tex=1 ps_samp=1 ps_pushc=48
+    8x  prim=6 verts=4  guest_vbufs=1 vattrs=1  ps_sbuf=1        ps_pushc=16
+  i.e. textured/storage-fed QUADS with a bound vertex buffer and 1-2 attributes.
+  Combined with the XPS5X_FORCE_CLEAR proof of ZERO coverage, the failure is
+  now pinned to VERTEX POSITIONS: well-formed quads are submitted and rasterize
+  nothing, so positions must be off-screen / degenerate / NaN.
+  **CORRECTED ARITHMETIC:** the "12,083 draws" figure is AGC draw PACKETS
+  counted at the HLE submit layer. It is NOT the number of draws reaching the
+  Vulkan sink. Do not subtract early-return counts from it (I did, and wrongly
+  concluded "~11,878 draws proceed"). Count at the sink instead.
+  **STALE COMMENT CORRECTED** in draw_translate.rs (the TRACE_DRAWS block): it
+  asserted "geometry covers the screen and the PS shades black". The
+  force-clear probe REFUTES that — there is no coverage at all, so the PS is
+  never invoked. Anyone reading that comment would chase the wrong wall.
+  ALSO SPOTTED (separate, HLE): the linker annotates
+  `PLT-0xb5 import (returns EINVAL, kills Streaming Pool)
+   offset=0xe123280 nid=0x93aa4634cc09074f provider="libc"` — a known-hostile
+  unresolved libc import. Worth resolving on its own merits.
+  NEXT: dump the resolved V# (base/stride/format) for one of these 12 draws and
+  the guest bytes at that base, plus the first post-VS clip-space positions.
+  The compute path already has an equivalent probe ("storage buffer content ...
+  all_zero=false"), so mirror it for vertex buffers.
+
+- **ROOT CAUSE SPLIT — vertex DATA is fine, POSITION EXPORT is not; and the
+  mesh buffer is empty** (2026-07-20, XPS5X_TRACE_DRAWS vertex-buffer probe).
+  Two distinct problems, both measured:
+  * **Buffer A** addr=0x253a12a0 stride=12 num_records=4 size=48
+    non_zero=24, head decodes as f32: (-1,-1,+1) (+1,-1,+1) (-1,...) —
+    i.e. a TEXTBOOK FULL-SCREEN QUAD IN NDC. The vertex data is CORRECT.
+    A correct fullscreen quad that rasterizes ZERO fragments (proven by
+    XPS5X_FORCE_CLEAR) means the failure is DOWNSTREAM of the data: the VS
+    position export. stride=12 is only xyz — the VS must supply w=1 itself;
+    if w ends up 0/garbage the perspective divide kills every vertex, which
+    matches zero coverage exactly. **CHECK THE POSITION/POS0 EXPORT FIRST.**
+    (Related and already known: EXP target 0x0d = POS1 is unimplemented.)
+  * **Buffer B** addr=0x31400150 stride=28 num_records=149784 size=4,193,952
+    — **only 29 non-zero bytes in the whole 4 MB**. The mesh geometry was
+    never uploaded to guest memory. This is a SEPARATE bug from the position
+    export (an upload/DMA path), and fixing the export alone will still leave
+    this geometry blank. Note IT_DMA_DATA copies/fills ARE applied
+    (libsce_agc.rs 861/875/898), so the upload is going somewhere else —
+    likely a path we do not yet intercept.
+  Order of attack: position export (unblocks the fullscreen quads, i.e. the
+  UI/composite layer, which is what Ore-UI draws), then the mesh upload.
+
+- POS0 export IS emitted — narrowing again (2026-07-20). Probe in
+  `recompile_exp_pos0` (XPS5X_TRACE_DRAWS): Minecraft recompiles **8 POS0
+  exports, all with srcs_are_variables=true**, 19 shaders translated. So the
+  VS DOES write gl_Position. Combined with the earlier results the chain is now:
+    vertex DATA correct (textbook NDC fullscreen quad)        ✓
+    VS writes gl_Position                                     ✓
+    draw state correct (viewport/scissor/mask/blend/extent)   ✓
+    coverage                                                  ✗ ZERO
+  **REMAINING SUSPECT: the Vulkan VERTEX-INPUT ATTRIBUTE BINDING.** The shader
+  declares `%attrN` by ARRAY POSITION (spirv.rs WriteGlobalVariables emits
+  `%attr{i}` / `OpDecorate %attr{i} Location {i}` over 0..resources_num), but
+  `prepare_vertex_inputs` (draw_translate.rs ~443) sets each
+  VertexAttributeData.location from `guest.attr_indices[ai]`. If those two index
+  spaces differ — exactly the class of bug already found and fixed on the FETCH
+  side, where resources were written by discovery order but read by attrib id —
+  the VS reads an unbound location, gets zeros, and every vertex collapses to
+  the origin. That reproduces zero coverage precisely while leaving data,
+  position export and draw state all looking correct, which is what we observe.
+  NEXT: log, per draw, each VertexAttributeData {location, format, offset,
+  binding} next to the shader's declared attribute count/locations, and check
+  they are the same index space. Note vs_pushc=0 / vs_sbuf=0 / vs_tex=0 in the
+  measured profiles — the VS has NO uniforms, so it cannot be a bad transform
+  matrix; the only way its positions go wrong is bad ATTRIBUTE INPUT.
+
+- Vertex attribute bindings are CORRECT — hypothesis refuted (2026-07-20,
+  XPS5X_TRACE_DRAWS attribute probe). Measured on Minecraft:
+    ai=0 location=0 binding=0 R32G32B32_SFLOAT     offset=0  gen5=74 (res=1)
+    ai=0 location=0 binding=0 R32G32B32A32_SFLOAT  offset=0  gen5=77 (res=2)
+    ai=1 location=1 binding=0 R32G32B32_SFLOAT     offset=16 gen5=74 (res=2)
+  Locations are 0/1 — the SAME index space the shader declares — and the
+  formats/offsets tile the buffer strides exactly (12 = 3 floats; 16+12 = 28).
+  So the Vulkan vertex-input binding is NOT the bug. Ruled out.
+- **SELF-INFLICTED GAP CLOSED: front_face was hardcoded.**
+  `offscreen.rs` hardcoded `FrontFace::COUNTER_CLOCKWISE`, which was harmless
+  only while `cull_mode` was permanently NONE. Decoding PA_SU_SC_MODE_CNTL
+  earlier this session turned culling ON without wiring the winding, so any
+  title whose FACE bit says clockwise-is-front would have had exactly the wrong
+  faces culled. `DrawState` now carries `front_face`, set from
+  `mode_control.face` (0 = CCW front, 1 = CW front). Enabling culling and
+  wiring the winding must always travel together.
+  NOTE this did NOT cause the black frame — Minecraft was already black before
+  the culling decode landed (mc_base run predates it) — but it was a live
+  hazard introduced by an incomplete fix.
+  STATE OF THE ZERO-COVERAGE HUNT — all of these are now RULED OUT by
+  measurement: fragment shading, blend, colour/target write masks, viewport,
+  scissor, extent, attachment identity, readback/dump path, vertex DATA
+  (textbook NDC quad), gl_Position emission (8 POS0 exports), and vertex-input
+  attribute binding. Depth is only applied when a depth attachment is bound
+  (state.depth), which the composite path leaves None — CONFIRM that before
+  spending more on depth. Next candidates: the index buffer / primitive
+  assembly for prim=4 verts=6 and prim=6 verts=4, or the VS's own body (does
+  it write the fetched attribute into the POS0 source registers, or overwrite
+  them?). The quad's z = +1.0 (far plane) is worth re-checking IF depth ever
+  becomes bound.
+
+- **INVALID PIPELINE FIXED — vertex attribute format vs shader input type**
+  (2026-07-20; xps5x-gpu 136/136). Found by ENABLING THE VALIDATION LAYER
+  (XPS5X_VULKAN_VALIDATION=1, which this session made opt-in). It named the bug
+  in one run after many turns of manual narrowing:
+    "vkCreateGraphicsPipelines(): pVertexAttributeDescriptions[1].format
+     (VK_FORMAT_R16_UINT) at Location 1 does not match
+     [VK_SHADER_STAGE_VERTEX_BIT] [Input variable, Location 1] type of (float32)"
+  ROOT CAUSE: `Spirv::WriteGlobalVariables` (spirv.rs ~2767) declares EVERY
+  vertex input as float / v2float / v3float / v4float — there is no integer
+  path — but `gen5_vertex_format` mapped Gen5 format 11 to R16_UINT. Vulkan
+  requires the attribute format's numeric type to match the shader input's, so
+  that pipeline was INVALID and its draws contributed nothing.
+  FIX: 11 -> R16_USCALED (same integer value, delivered as float).
+  The test now also asserts the INVARIANT for the whole table: no Gen5 vertex
+  format may map to a UINT/SINT Vulkan format while the shader side is
+  float-only. That prevents the same class of bug for future entries.
+  MEASURED: validation "does not match" messages 10 -> 0. Pipeline is valid.
+  **Frames are STILL byte-zero** — necessary, not sufficient. Whatever remains
+  is no longer a validation-visible error.
+  **PROCESS LESSON (expensive): run with XPS5X_VULKAN_VALIDATION=1 FIRST when a
+  draw silently produces nothing.** I spent many turns hand-checking vertex
+  data, indices, attribute bindings, gl_Position, viewport/scissor/blend/masks —
+  all of which were CORRECT and all of which the validation layer would have
+  skipped past to the actual defect. The layer is opt-in precisely because it
+  costs ~0.9s/pipeline, but a title with ~12 real draws pays only ~11s.
+
+- NEXT HYPOTHESIS (state after the pipeline-validity fix, 2026-07-20).
+  Validation is now CLEAN, so the remaining defect is NOT a malformed pipeline
+  — that whole class is eliminated. Everything upstream is verified correct:
+  vertex data (NDC quad), indices ([0,1,2,0,2,3]), attribute bindings
+  (locations/formats/offsets), gl_Position IS emitted (8 POS0 exports), draw
+  state, and the draw commands are issued (cmd_draw_indexed / cmd_draw,
+  offscreen.rs ~2174). The clear reaches the image (force-clear probe), so the
+  render pass executes. Yet ZERO fragments.
+  Therefore the VS must be producing positions that never land in clip space.
+  Note the measured profiles show the VS has NO uniforms at all
+  (vs_pushc=0, vs_sbuf=0, vs_tex=0), so it cannot be a bad transform matrix —
+  a uniform-less VS should essentially pass the NDC quad through.
+  **SUSPECT: the VGPR hand-off between the fetch and the position export.**
+  The fetch writes its result to the VGPR named by `sem.hardware_mapping()`
+  (measured: reg=9, 12, 13 for the various attributes — see the "attrib
+  semantic" probe in analysis.rs) while `recompile_exp_pos0` reads whatever
+  VGPRs the EXP instruction names. If those disagree the export reads
+  never-written registers (zeros) and every vertex collapses to the origin —
+  which matches zero coverage exactly, and is the SAME index-space class of bug
+  already found twice this session (fetch resources by discovery-order vs
+  attrib-id; and %attrN by position vs id).
+  MEASUREMENT: log the EXP instruction's source VGPR ids in
+  `recompile_exp_pos0` and compare against the fetch destination
+  (`resources_dst[].register_start` / hardware_mapping). If they differ, that is
+  the bug. DEFINITIVE ALTERNATIVE: temporarily replace the generated VS with a
+  hardcoded full-screen-triangle passthrough — if pixels appear, the generated
+  VS body is at fault; if not, look below the shader (command submission).
+
+- VGPR hand-off hypothesis — NOT confirmed (2026-07-20, measured).
+  POS0 exports read a WIDE VARIETY of computed VGPRs across the 8 measured
+  shaders: [0,1,2,3] [0,1,2,6] [0,10,9,11] [0,14,8,13] [0,5,6,8] [12,1,4,10]
+  [19,9,17,16] [9,6,13,12], all type Vgpr. That is a vertex shader doing real
+  arithmetic into scratch registers, which is NORMAL — it is not the simple
+  "export reads the fetch destination directly" shape the hypothesis assumed,
+  so the fetch-dst vs export-src comparison does not apply as stated. Treat the
+  hypothesis as UNRESOLVED rather than refuted: a mismatch could still exist
+  deeper in the dataflow, but it cannot be settled by comparing these two
+  register lists.
+  **THE REMAINING DEFINITIVE TEST (do this first next session):** temporarily
+  replace the generated VS with a hardcoded full-screen-triangle passthrough
+  that writes a constant gl_Position, keeping everything else identical.
+    - pixels appear  => the generated VS BODY is at fault (its arithmetic
+      produces out-of-clip positions); bisect the SPIR-V from there.
+    - still black    => the fault is BELOW the shader, despite validation being
+      clean and cmd_draw being issued.
+  This one experiment splits the entire remaining space, which no amount of
+  further input-checking can — every input is already verified correct
+  (data, indices, bindings, gl_Position emitted, draw state, valid pipeline,
+  render pass executing).
+
+- Vulkan is FULLY SATISFIED — zero validation messages of ANY severity after
+  the vertex-format fix (2026-07-20, XPS5X_VULKAN_VALIDATION=1 on Minecraft).
+  Not just zero "does not match": ZERO total. So the pipeline, descriptors,
+  render pass, attachments and draw calls are all API-correct. Combined with
+  every input being verified correct and the clear demonstrably reaching the
+  image, the only remaining explanation is that the VS produces vertex
+  positions OUTSIDE CLIP SPACE (or degenerate), so the rasterizer discards
+  every primitive. Nothing at the API level will reveal that — it is legal,
+  silent behaviour.
+  This is why the VS-substitution experiment (previous entry) is the correct
+  next move and why more API/input checking is now provably worthless: the
+  inputs are right and the API is happy, so the fault is in the VALUES the
+  translated shader computes. Bisect the SPIR-V, do not re-audit the bindings.
+
+- **VS SUBSTITUTION TEST: STILL BLACK => THE FAULT IS BELOW THE SHADER**
+  (2026-07-20, decisive). New gated probe `XPS5X_VS_PASSTHROUGH=1`
+  (recompile_exp_pos0) makes POS0 export input attribute 0 DIRECTLY as the clip
+  position, bypassing ALL VS arithmetic. The measured attr0 for these draws is
+  a textbook NDC quad, so this should cover the screen unconditionally.
+  MEASURED: frames still byte-zero (non_zero=2 header remnant), only 1 shader
+  translate failure, so the passthrough did assemble.
+  **THE GENERATED VS BODY IS THEREFORE NOT THE CAUSE — ELIMINATED.**
+  Full elimination list (all by measurement): vertex data, indices, attribute
+  bindings/formats, gl_Position emission, VS arithmetic, viewport, scissor,
+  extent, target/colour write masks, blend, attachment identity, pipeline
+  validity (ZERO Vulkan validation messages of any severity), fragment shading
+  (no coverage to shade), and the readback/dump path for RGBA8.
+  **LEADING REMAINING HYPOTHESIS — READBACK/DRAW SYNCHRONIZATION.** The
+  force-clear probe proves the CLEAR reaches the image we read back. The clear
+  executes at render-pass BEGIN; the draw executes AFTER it. Observing the
+  clear but never any draw result is exactly what a readback that does not wait
+  for the draw to complete would look like (missing/incorrect pipeline barrier
+  or fence before the copy-to-host, or reading a different queue's timeline).
+  NEXT: audit the submit -> barrier -> copy-to-buffer -> map sequence in
+  offscreen.rs `record_and_submit` — confirm there is a fence/queue-wait AFTER
+  vkQueueSubmit and BEFORE the readback copy, and that the image layout
+  transition to TRANSFER_SRC happens after COLOR_ATTACHMENT_OUTPUT with the
+  right srcStageMask/srcAccessMask. A draw whose results are never waited on
+  would ALSO explain why compute writebacks (which use a different path) DO
+  show real data while every colour draw appears to vanish.
+
+- Readback/draw synchronization hypothesis — REFUTED (2026-07-20, code audit).
+  `record_and_submit` (offscreen.rs) DOES synchronize correctly:
+  `queue_submit(..., self.fence)` at ~2303 followed by
+  `wait_for_fences(&[self.fence], true, u64::MAX)` at ~2310, with pipeline
+  barriers at ~1771 and ~2282 around the copy_image_to_buffer at ~2220/~2266.
+  The readback waits for the submission to complete. Not the bug.
+  STATE: every candidate raised so far is eliminated by measurement or audit —
+  vertex data, indices, attribute bindings/formats, gl_Position emission, the
+  whole VS body (passthrough test), viewport, scissor, extent, write masks,
+  blend, attachment identity, pipeline validity (zero Vulkan messages),
+  fragment shading, readback path, and now submit/readback synchronization.
+  NEXT PLACE TO LOOK (narrow, structural): confirm the DRAW is recorded INSIDE
+  the dynamic-rendering bracket that the clear belongs to — i.e. that
+  cmd_begin_rendering ... cmd_bind_pipeline/cmd_draw* ... cmd_end_rendering
+  appear in that order in ONE command buffer, and that the buffer submitted at
+  ~2303 is the one the draw was recorded into. The clear is attached to
+  cmd_begin_rendering (AttachmentLoadOp::CLEAR), so a draw recorded outside the
+  bracket — or into a different command buffer — would reproduce EXACTLY what
+  is observed: the clear lands, the draw never does, everything else is valid.
+  That is the only structure consistent with all the eliminations above.
+
+- Command-buffer structure hypothesis — REFUTED (2026-07-20, code audit).
+  offscreen.rs ordering is CORRECT and all in ONE command buffer:
+    2121 cmd_begin_rendering -> 2122 cmd_bind_pipeline ->
+    2174/2176 cmd_draw_indexed / cmd_draw -> 2178 cmd_end_rendering ->
+    2292 end_command_buffer -> 2303 queue_submit(fence) -> 2310 wait_for_fences
+  The draw IS inside the rendering bracket the clear belongs to, and
+  `state.vertex_count` is non-zero for these draws (measured verts=6 and 4).
+
+  **END-OF-SESSION STATE — READ THIS FIRST NEXT TIME.**
+  The zero-coverage bug is NOT in any of the following. Every one was
+  eliminated by direct measurement or code audit this session; do NOT re-audit
+  them, it is wasted effort:
+    vertex data (verified NDC quad) | index buffer ([0,1,2,0,2,3]) |
+    attribute bindings, formats, offsets | gl_Position emission |
+    the entire VS body (XPS5X_VS_PASSTHROUGH still black) | viewport | scissor |
+    render-target extent | CB_TARGET_MASK / colour write mask | blend state |
+    attachment identity | pipeline validity (ZERO Vulkan validation messages of
+    any severity) | fragment shading | RGBA8 readback/dump | submit->fence->
+    readback synchronization | command-buffer recording order and bracket |
+    vertex_count.
+  Two facts that must be reconciled by whatever the answer turns out to be:
+    (a) the CLEAR reaches the read-back image (XPS5X_FORCE_CLEAR proves it), so
+        the image, the render pass and the readback all work;
+    (b) COMPUTE writebacks carry real data in the same runs (3,193 of them),
+        so the device and queue are executing work correctly.
+  Whatever the cause is, it makes colour DRAWS specifically produce no fragment
+  while clears and compute both work. Suggested attack: build a MINIMAL
+  in-tree Vulkan test that drives OffscreenTarget directly with a hand-made
+  NDC-quad DrawState and asserts non-clear pixels come back. If that test
+  PASSES, the defect is in what the title path feeds the sink (state assembled
+  per draw) rather than in the sink; if it FAILS, the defect is in the sink
+  itself and is now reproducible without a title. That converts this from
+  title-driven archaeology into a normal red/green debugging loop, which is
+  what this problem has been missing.
