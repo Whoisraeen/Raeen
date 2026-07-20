@@ -109,6 +109,52 @@
 
 # XPS5X session progress ledger
 
+- ASTRO.BOT REAL-FRAMES PUSH round 1 (2026-07-20, four parallel subagents +
+  main session; all gates green: workspace clippy -D warnings, fmt, hle 320 /
+  kernel 110 / gpu 128+18 / firmware suites):
+  * BOOT REGRESSION FOUND FIRST: the title no longer reached GPU init — it
+    faulted on unresolved `sceKernelPread` ~8s in (boot had progressed into a
+    new asset-streaming path). Implemented real VFS pread (positional read,
+    cursor untouched: filesystem/mod.rs) + HLE under SCE/POSIX names. Next
+    fault: libSceJson2. `--missing-nids` preflight then showed 322 distinct
+    unresolved NIDs / 37 libraries — the milestone "zero unresolved" claim
+    was about the RUN path, not the static import set.
+  * libSceJson2: all 54 NIDs implemented (libsce_json.rs 385→~1540 lines;
+    serde_json-backed Parser::parse, guest-anchored Object/Array/String/
+    iterator model, SharpEmu error codes; sret iterator ABI). hle suite 320.
+  * libkernel + small libs: 45 NIDs — real timed rwlocks, Getprio/Setprio
+    bookkeeping, nanosleep, DirectMemoryQuery over the recorded allocator
+    regions, ConfiguredFlexibleMemorySize, 7 APR resolve variants + GetFileStat/
+    GetFileSize (real VFS), VideoOut gamma/adjust/ChangeBufferAttribute2/
+    IsFlipPending, Pad close/info/trigger, Rtc RFC3339 format+parse (real),
+    UserService accessibility/presets, LibcInternal MspaceRealloc (real
+    dlmalloc semantics)/_ZdlPv/_Stoul/__cxa_*/Need_sceLibcInternal (DATA
+    symbol on the HLE data page), Sysmodule unwind info, NpGetAccountIdA,
+    SaveDataTransferringMount (fallback error), GetOpenPsId. CAVEAT: the four
+    APR *ForEach variants resolve+register but do not write through unverified
+    trailing args (loud warn) — revisit if a title reads their out-params.
+  * libSceAgc: all 12 command-buffer builders ported dword-exact from SharpEmu
+    (AcbAcquireMem/WaitRegMem/DmaData/CopyData/markers, CbSetShRegistersDirect
+    sort+coalesce, CbDispatchGetSize/NopGetSize, DcbDrawIndexIndirect/
+    StallCommandBufferParser/GetLodStats). KEY GAP EXPOSED: run.rs (the CP)
+    does NOT consume R_DMA_DATA (0x19), IT_COPY_DATA (0x40), IT_GET_LOD_STATS
+    (0x8e) — skipped by length. R_DMA_DATA is the likely mechanism by which
+    the title fills its VideoOut scanout buffer (task #11's "copy/DMA we don't
+    capture") — implementing CP-side DMA_DATA/COPY_DATA execution is the top
+    candidate for making the composite reach the screen.
+  * STORAGE-IMAGE (UAV) COMPUTE SUPPORT LANDED (front #3, task #19):
+    prepare_stage_binding now splits sampled vs storage T#s (per-array index
+    rewriting, unit-tested), dispatch_compute creates/binds R8G8B8A8_UNORM
+    STORAGE images (staging upload, GENERAL layout, post-fence readback), and
+    dispatch_direct writes image bytes back to guest at each storage T#'s
+    base40 (linear). Real-Vulkan round-trip test green on the Radeon 760M.
+    Gaps: UAV seed reinterprets 32-bpp formats as RGBA8 (fine while shaders
+    fully overwrite), non-32-bpp seeds zero-fill with one loud warn, no
+    re-tiling on writeback, graphics-stage storage images still a named error.
+  * Remaining top missing libs (fail-soft candidates, only implement on
+    measured fault): libSceAmpr 47, AudioPropagation 22, Http 19, NpWebApi2
+    18, VoiceChat 17, AvPlayer 12, NpUniversalDataSystem 12.
+
 - BOOT SPLASH — "why does SharpEmu show the ASTRO.BOT splash and we don't"
   ANSWERED + CLOSED (2026-07-20). SharpEmu's splash is NOT title rendering:
   its `PngSplashLoader.cs` decodes the package's `sce_sys/pic0.png` and
