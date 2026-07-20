@@ -30,12 +30,23 @@
 //!
 //! ## Provenance
 //!
-//! Candidates: shadPS4's `src/core/aerolib/aerolib.inl` (GPL-2.0-or-later,
-//! © 2024 shadPS4 Emulator Project), usable under this tree's GPL-2.0-only
-//! terms and attributed in `THIRD_PARTY_NOTICES.md`. Permitted by
-//! `.claude/skills/clean-room` ("NID names from community databases OK").
-//! 94,247 of its 94,276 entries pass our hash gate; the other 29 are rejected.
-//! Regenerate with `gen_nid_names.py` (kept beside the data for auditability).
+//! Candidates come from two community sources, both admitted only through the
+//! hash gate above (existing names win every collision, so the first source
+//! stays authoritative where the two overlap):
+//!
+//! - shadPS4's `src/core/aerolib/aerolib.inl` (GPL-2.0-or-later, © 2024 shadPS4
+//!   Emulator Project) — 94,247 of its 94,276 entries pass.
+//! - SharpEmu's `scripts/ps5_names.txt` (GPL-2.0-or-later) — a ~154k candidate
+//!   name list; folding it in through the same gate added 55,658 new
+//!   hash-verified names (149,905 total), recovering symbols the first source
+//!   lacked, notably the whole `libSceNpAuthAuthorizedAppDialog` set and
+//!   `sceAgcGetIsTrinityMode`. `.L*` assembler-locals and `/`-prefixed path
+//!   artifacts are dropped (never cross-module NIDs).
+//!
+//! Both are permitted by `.claude/skills/clean-room` ("NID names from community
+//! databases OK") and attributed in `THIRD_PARTY_NOTICES.md`. Regenerate the
+//! first source with `gen_nid_names.py`; fold in the second with the
+//! `merge_nid_catalog` example (both kept beside the data for auditability).
 //!
 //! These are public symbol names, not Sony code — no SDK headers, blobs, or
 //! keys are involved.

@@ -69,6 +69,11 @@ SOFTWARE.
   no C# is transliterated or vendored. SharpEmu's tree is cloned locally into
   the git-ignored `reference/` directory for study only; it is **never
   vendored, compiled, or committed** into XPS5X.
+- **NID name catalog:** SharpEmu's `scripts/ps5_names.txt` (a public symbol-name
+  list) is used as candidate input to `merge_nid_catalog`, which admits a name
+  only if XPS5X's own SCE-NID hash reproduces the NID from it. The result is
+  factual hash data (public symbol names, no Sony code/keys), folded into
+  `crates/xps5x-firmware/src/dynlib/nid_names.txt`.
 
 GPL-2.0 is the same license as XPS5X (GPL-2.0-only), so derived
 re-implementations are license-compatible; this notice preserves attribution.
