@@ -101,6 +101,22 @@ impl GuestMemory for IdentityGuestMemory {
     fn read_dwords(&self, addr: u64, count: u32) -> Option<Vec<u32>> {
         read_dwords_checked(addr, count)
     }
+
+    /// DMA payload read: dword-granular under the RESOURCE cap (a DMA fill of
+    /// a 1080p scanout buffer is ~8 MiB — far beyond the pointer-read cap but
+    /// a legitimate resource-sized transfer).
+    fn read_bytes(&self, addr: u64, len: u64) -> Option<Vec<u8>> {
+        if len == 0 || !len.is_multiple_of(4) {
+            return None;
+        }
+        let count = u32::try_from(len / 4).ok()?;
+        let dwords = read_dwords_validated(addr, count)?;
+        Some(dwords.iter().flat_map(|w| w.to_le_bytes()).collect())
+    }
+
+    fn write_bytes(&self, addr: u64, bytes: &[u8]) -> bool {
+        write_bytes_checked(addr, bytes)
+    }
 }
 
 /// Upper bound on a single *resource* fetch (vertex/index/storage buffers,

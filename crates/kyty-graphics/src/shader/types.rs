@@ -41,6 +41,13 @@ pub enum ShaderInstructionType {
     BufferStoreDword,
     BufferStoreFormatX,
     BufferStoreFormatXy,
+    /// MUBUF 0x06: formatted 3-channel store. Kyty leaves it `KYTY_NI`
+    /// (ShaderParse.cpp L2629); measured in ASTRO.BOT scene compute.
+    BufferStoreFormatXyz,
+    /// MUBUF 0x07: formatted 4-channel store. Kyty leaves it `KYTY_NI`
+    /// (ShaderParse.cpp L2630); the single most frequent ASTRO.BOT shader
+    /// failure (925 dispatches in the measured 30s window).
+    BufferStoreFormatXyzw,
     DsAppend,
     DsConsume,
     Exp,
@@ -134,6 +141,10 @@ pub enum ShaderInstructionType {
     TBufferLoadFormatX,
     TBufferLoadFormatXyzw,
     VAddF32,
+    /// RDNA2 (`next_gen`) VOP3 0x36d: `vdst = vsrc0 + vsrc1 + vsrc2` (32-bit,
+    /// carry-less). Kyty names it `KYTY_NI` (ShaderParse.cpp L2112); shadPS4:
+    /// `V_ADD3_U32 = 877` (== 0x36d). Measured in ASTRO.BOT scene compute.
+    VAdd3U32,
     VAddI32,
     /// RDNA2 (`next_gen`) VOP2 0x25: carry-less `vdst = vsrc0 + vsrc1`
     /// (replaces GCN's carry-writing v_add_i32 in the same encoding slot).
@@ -355,6 +366,12 @@ pub mod shader_instruction_format {
     pub const DMASK_5: u64 = 49;
     pub const DMASK_9: u64 = 50;
     pub const GDS: u64 = 51;
+    // Beyond Kyty (upstream has no exp targets 0x0d-0x0f and no dmask:0x2
+    // MIMG form) — added for the ASTRO.BOT Gen5 shader batch.
+    pub const POS1: u64 = 52;
+    pub const POS2: u64 = 53;
+    pub const POS3: u64 = 54;
+    pub const DMASK_2: u64 = 55;
 
     /// Kyty: Shader.h `FormatDefine` (L293). Packs FormatByte tokens into a
     /// u64, first token in the highest-used byte.
@@ -387,6 +404,13 @@ pub mod shader_instruction_format {
         Param3Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM3, S0, S1, S2, S3]),
         Param4Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM4, S0, S1, S2, S3]),
         Pos0Vsrc0Vsrc1Vsrc2Vsrc3Done = format_define(&[POS0, S0, S1, S2, S3, DONE]),
+        // Beyond Kyty: auxiliary position exports (exp targets 0x0d-0x0f).
+        // These carry clip/cull distances or point size as configured by
+        // PA_CL_VS_OUT_CNTL (shadPS4 `ir/position.h` `ExportPosition`); the
+        // channel-enable mask rides in `ShaderInstruction::export_enable`.
+        Pos1Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[POS1, S0, S1, S2, S3]),
+        Pos2Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[POS2, S0, S1, S2, S3]),
+        Pos3Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[POS3, S0, S1, S2, S3]),
         PrimVsrc0OffOffOffDone = format_define(&[PRIM, S0, OFF, OFF, OFF, DONE]),
         Saddr = format_define(&[S0A2]),
         Sdst2 = format_define(&[DA2]),
@@ -407,12 +431,25 @@ pub mod shader_instruction_format {
         SVdstSVsrc0SVsrc1 = format_define(&[D, S0, S1]),
         Vdata1Vaddr3StDmask1 = format_define(&[D, S0A3, S1A8, DMASK_1]),
         Vdata1Vaddr3StSsDmask1 = format_define(&[D, S0A3, S1A8, S2A4, DMASK_1]),
+        /// Beyond Kyty: single-channel sample selecting .y (dmask 0x2) —
+        /// measured on ASTRO.BOT `image_sample_lz` (MIMG 0x27 dmask 0x2).
+        Vdata1Vaddr3StSsDmask2 = format_define(&[D, S0A3, S1A8, S2A4, DMASK_2]),
         Vdata1Vaddr3StSsDmask8 = format_define(&[D, S0A3, S1A8, S2A4, DMASK_8]),
         Vdata1VaddrSvSoffsIdxen = format_define(&[D, S0, S1A4, S2, IDXEN]),
+        // Beyond Kyty: MUBUF single-dword addressing variants for idxen==0
+        // and/or offen==1 (upstream EXIT_NOT_IMPLEMENTEDs both flags,
+        // ShaderParse.cpp L2569-2570). Same model as the Vdata4* quartet the
+        // BufferLoadDwordX4 rows already use.
+        Vdata1SvSoffs = format_define(&[D, S1A4, S2]),
+        Vdata1VaddrSvSoffsOffen = format_define(&[D, S0, S1A4, S2, OFFEN]),
+        Vdata1Vaddr2SvSoffsOffenIdxen = format_define(&[D, S0A2, S1A4, S2, OFFEN, IDXEN]),
         Vdata1VaddrSvSoffsIdxenFloat1 = format_define(&[D, S0, S1A4, S2, IDXEN, FLOAT1]),
         Vdata2Vaddr3StSsDmask3 = format_define(&[DA2, S0A3, S1A8, S2A4, DMASK_3]),
         Vdata2Vaddr3StSsDmask5 = format_define(&[DA2, S0A3, S1A8, S2A4, DMASK_5]),
         Vdata2Vaddr3StSsDmask9 = format_define(&[DA2, S0A3, S1A8, S2A4, DMASK_9]),
+        /// Beyond Kyty: two-channel unsampled fetch — measured on ASTRO.BOT
+        /// `image_load` (MIMG 0x00 dmask 0x3).
+        Vdata2Vaddr3StDmask3 = format_define(&[DA2, S0A3, S1A8, DMASK_3]),
         Vdata2VaddrStDmask3 = format_define(&[DA2, S0, S1A8, DMASK_3]),
         Vdata2VaddrSvSoffsIdxen = format_define(&[DA2, S0, S1A4, S2, IDXEN]),
         Vdata3Vaddr3StDmask7 = format_define(&[DA3, S0A3, S1A8, DMASK_7]),
@@ -765,7 +802,11 @@ fn dbg_fmt_print(inst: &ShaderInstruction) -> String {
                     .wrapping_add(4)
                     .wrapping_add(inst.src[0].constant.i() as u32)
             ),
+            sif::POS1 => "pos1".to_string(),
+            sif::POS2 => "pos2".to_string(),
+            sif::POS3 => "pos3".to_string(),
             sif::DMASK_1 => "dmask:0x1".to_string(),
+            sif::DMASK_2 => "dmask:0x2".to_string(),
             sif::DMASK_8 => "dmask:0x8".to_string(),
             sif::DMASK_3 => "dmask:0x3".to_string(),
             sif::DMASK_5 => "dmask:0x5".to_string(),

@@ -125,6 +125,10 @@ pub const R_WRITE_DATA: RCode = RCode(0x15);
 pub const R_WAIT_MEM_64: RCode = RCode(0x16);
 pub const R_FLIP: RCode = RCode(0x17);
 pub const R_RELEASE_MEM: RCode = RCode(0x18);
+/// AGC DMA_DATA payload copy — emitted by `sceAgcDcbDmaData` (8-dw form) and
+/// `sceAgcAcbDmaData` (7-dw form); the two layouts are discriminated by
+/// packet length.
+pub const R_DMA_DATA: RCode = RCode(0x19);
 
 // ---- Header codec (Pm4.h L14-20) ----------------------------------------
 

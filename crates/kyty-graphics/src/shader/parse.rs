@@ -2073,7 +2073,10 @@ fn shader_parse_vop3(
         0x35a => return Err(ni(dst, S, "v_interp_p2_f16", opcode, pc, b0)),
         0x35e => return Err(ni(dst, S, "v_mad_i16", opcode, pc, b0)),
         0x35f => return Err(ni(dst, S, "v_div_fixup_f16", opcode, pc, b0)),
-        0x36d => return Err(ni(dst, S, "v_add3_u32", opcode, pc, b0)),
+        // `v_add3_u32`: dst = src0 + src1 + src2 (carry-less). Kyty leaves it
+        // NI (ShaderParse.cpp L2112); shadPS4 `V_ADD3_U32 = 877` (== 0x36d)
+        // confirms opcode + semantics. Measured: 175 ASTRO.BOT CS failures.
+        0x36d => inst.type_ = T::VAdd3U32,
         // `v_lshl_or_u32`: dst = (src0 << (src1 & 31)) | src2. Same deliberate
         // deviation as 0x371 below — Kyty gates this off on next_gen, but
         // SharpEmu's Gen5 (PS5/RDNA2) decoder maps `0x36F => "VLshlOrU32"` and
@@ -2275,6 +2278,15 @@ fn shader_parse_exp(
         0x0c if done != 0 && en == 0xf => {
             inst.format = F::Pos0Vsrc0Vsrc1Vsrc2Vsrc3Done;
         }
+        // Auxiliary position exports pos1..pos3 — beyond Kyty, which knows
+        // only pos0 (ShaderParse.cpp L2313-2316) and EXITs here. They carry
+        // clip/cull distances or point size selected by PA_CL_VS_OUT_CNTL
+        // (shadPS4 `ir/position.h` `ExportPosition`). Any channel-enable mask
+        // is legal (measured: ASTRO.BOT exports pos1 with en=0x4, done=0);
+        // `export_enable` records it for the recompiler.
+        0x0d => inst.format = F::Pos1Vsrc0Vsrc1Vsrc2Vsrc3,
+        0x0e => inst.format = F::Pos2Vsrc0Vsrc1Vsrc2Vsrc3,
+        0x0f => inst.format = F::Pos3Vsrc0Vsrc1Vsrc2Vsrc3,
         0x14 if done != 0 && en == 0x1 => {
             inst.format = F::PrimVsrc0OffOffOffDone;
             inst.src_num = 1;
@@ -2558,15 +2570,15 @@ fn shader_parse_mubuf(
     let vdata = (b1 >> 8) & 0xff;
     let vaddr = b1 & 0xff;
 
-    // Kyty L2569-2575: EXIT_NOT_IMPLEMENTED checks. Beyond Kyty: offen rides
-    // as the second vaddr register (the tbuffer xyzw model), but only for the
-    // opcodes with an offen recompiler below — the rest stay named.
-    if idxen == 0 && opcode != 0x0e {
-        return Err(feature(S, "idxen == 0", pc));
-    }
-    if offen == 1 && opcode != 0x0e {
-        return Err(feature(S, "offen == 1", pc));
-    }
+    // Kyty L2569-2575: EXIT_NOT_IMPLEMENTED checks. Beyond Kyty: idxen/offen
+    // are no longer a blanket gate — the flexible opcodes below (single-dword
+    // loads/stores, format x, format xyzw, dwordx4) select their format from
+    // the (idxen, offen) addressing mode, the model the BufferLoadDwordX4
+    // rows established: address = base + soffset + offset
+    // + (idxen ? vindex * stride : 0) + (offen ? voffset : 0). The remaining
+    // opcodes keep Kyty's strict gate, applied per-opcode AFTER the opcode is
+    // known so a rejection names the instruction (previously 114 ASTRO.BOT
+    // failures said only "idxen == 0").
     if offset != 0 {
         return Err(feature(S, "offset != 0", pc));
     }
@@ -2600,25 +2612,60 @@ fn shader_parse_mubuf(
         size += 1;
     }
 
+    // Single-dword flexible addressing (the Vdata1 counterpart of the
+    // Vdata4 quartet below).
+    let format1 = match (idxen, offen) {
+        (1, 1) => F::Vdata1Vaddr2SvSoffsOffenIdxen,
+        (1, 0) => F::Vdata1VaddrSvSoffsIdxen,
+        (0, 1) => F::Vdata1VaddrSvSoffsOffen,
+        _ => F::Vdata1SvSoffs,
+    };
+    // Four-dword flexible addressing — measured on Minecraft's menu VS
+    // (`buffer_load_dwordx4 v[8:11], v[4:5], s[8:11]` with idxen+offen:
+    // vindex=v4, voffset=v5) and ASTRO.BOT's `buffer_store_format_xyzw`.
+    let format4 = match (idxen, offen) {
+        (1, 1) => F::Vdata4Vaddr2SvSoffsOffenIdxen,
+        (1, 0) => F::Vdata4VaddrSvSoffsIdxen,
+        (0, 1) => F::Vdata4VaddrSvSoffsOffen,
+        _ => F::Vdata4SvSoffs,
+    };
+    let src0_size = (idxen + offen).max(1) as i32;
+    // Kyty's per-opcode strict gate (upstream applies it globally before the
+    // opcode switch, L2569-2570).
+    let strict = |feat_ok: bool, feat: &'static str| -> Result<(), ShaderParseError> {
+        if feat_ok {
+            Ok(())
+        } else {
+            Err(feature(S, feat, pc))
+        }
+    };
+
     match opcode {
         0x00 => {
             inst.type_ = T::BufferLoadFormatX;
-            inst.format = F::Vdata1VaddrSvSoffsIdxen;
+            inst.format = format1;
+            inst.src[0].size = src0_size;
             inst.src[1].size = 4;
         }
         0x01 => {
+            strict(idxen == 1, "idxen == 0")?;
+            strict(offen == 0, "offen == 1")?;
             inst.type_ = T::BufferLoadFormatXy;
             inst.format = F::Vdata2VaddrSvSoffsIdxen;
             inst.src[1].size = 4;
             inst.dst.size = 2;
         }
         0x02 => {
+            strict(idxen == 1, "idxen == 0")?;
+            strict(offen == 0, "offen == 1")?;
             inst.type_ = T::BufferLoadFormatXyz;
             inst.format = F::Vdata3VaddrSvSoffsIdxen;
             inst.src[1].size = 4;
             inst.dst.size = 3;
         }
         0x03 => {
+            strict(idxen == 1, "idxen == 0")?;
+            strict(offen == 0, "offen == 1")?;
             inst.type_ = T::BufferLoadFormatXyzw;
             inst.format = F::Vdata4VaddrSvSoffsIdxen;
             inst.src[1].size = 4;
@@ -2626,39 +2673,51 @@ fn shader_parse_mubuf(
         }
         0x04 => {
             inst.type_ = T::BufferStoreFormatX;
-            inst.format = F::Vdata1VaddrSvSoffsIdxen;
+            inst.format = format1;
+            inst.src[0].size = src0_size;
             inst.src[1].size = 4;
         }
         0x05 => {
+            strict(idxen == 1, "idxen == 0")?;
+            strict(offen == 0, "offen == 1")?;
             inst.type_ = T::BufferStoreFormatXy;
             inst.format = F::Vdata2VaddrSvSoffsIdxen;
             inst.src[1].size = 4;
             inst.dst.size = 2;
         }
-        0x06 => return Err(ni(dst, S, "buffer_store_format_xyz", opcode, pc, b0)),
-        0x07 => return Err(ni(dst, S, "buffer_store_format_xyzw", opcode, pc, b0)),
+        // 0x06/0x07 are KYTY_NI upstream (ShaderParse.cpp L2629-2630);
+        // measured on ASTRO.BOT scene compute (raw 0xe01c2000 = xyzw store
+        // with idxen).
+        0x06 => {
+            strict(idxen == 1, "idxen == 0")?;
+            strict(offen == 0, "offen == 1")?;
+            inst.type_ = T::BufferStoreFormatXyz;
+            inst.format = F::Vdata3VaddrSvSoffsIdxen;
+            inst.src[1].size = 4;
+            inst.dst.size = 3;
+        }
+        0x07 => {
+            inst.type_ = T::BufferStoreFormatXyzw;
+            inst.format = format4;
+            inst.src[0].size = src0_size;
+            inst.src[1].size = 4;
+            inst.dst.size = 4;
+        }
         0x08 => return Err(ni(dst, S, "buffer_load_ubyte", opcode, pc, b0)),
         0x09 => return Err(ni(dst, S, "buffer_load_sbyte", opcode, pc, b0)),
         0x0a => return Err(ni(dst, S, "buffer_load_ushort", opcode, pc, b0)),
         0x0b => return Err(ni(dst, S, "buffer_load_sshort", opcode, pc, b0)),
         0x0c => {
             inst.type_ = T::BufferLoadDword;
-            inst.format = F::Vdata1VaddrSvSoffsIdxen;
+            inst.format = format1;
+            inst.src[0].size = src0_size;
             inst.src[1].size = 4;
         }
         0x0d => return Err(ni(dst, S, "buffer_load_dwordx2", opcode, pc, b0)),
         0x0e => {
-            // Measured on Minecraft's menu VS: `buffer_load_dwordx4 v[8:11],
-            // v[4:5], s[8:11]` with idxen+offen (vindex=v4, voffset=v5).
             inst.type_ = T::BufferLoadDwordX4;
-            inst.format = match (idxen, offen) {
-                (1, 1) => F::Vdata4Vaddr2SvSoffsOffenIdxen,
-                (1, 0) => F::Vdata4VaddrSvSoffsIdxen,
-                (0, 1) => F::Vdata4VaddrSvSoffsOffen,
-                (0, 0) => F::Vdata4SvSoffs,
-                _ => unreachable!(),
-            };
-            inst.src[0].size = (idxen + offen).max(1) as i32;
+            inst.format = format4;
+            inst.src[0].size = src0_size;
             inst.src[1].size = 4;
             inst.dst.size = 4;
         }
@@ -2667,7 +2726,8 @@ fn shader_parse_mubuf(
         0x1a => return Err(ni(dst, S, "buffer_store_short", opcode, pc, b0)),
         0x1c => {
             inst.type_ = T::BufferStoreDword;
-            inst.format = F::Vdata1VaddrSvSoffsIdxen;
+            inst.format = format1;
+            inst.src[0].size = src0_size;
             inst.src[1].size = 4;
         }
         0x1d => return Err(ni(dst, S, "buffer_store_dwordx2", opcode, pc, b0)),
@@ -2707,31 +2767,17 @@ fn shader_parse_ds(
     let vdst = (b1 >> 24) & 0xff;
     let data1 = (b1 >> 16) & 0xff;
     let data0 = (b1 >> 8) & 0xff;
-    let addr = b1 & 0xff;
+    // addr (b1 & 0xff) is a don't-care for the implemented append/consume
+    // pair and unimplemented opcodes fail by name before operand checks.
+    let _addr = b1 & 0xff;
 
-    // Kyty L2740-2745: EXIT_NOT_IMPLEMENTED checks.
-    // DS_APPEND/DS_CONSUME select the GDS counter through M0 and do not read
-    // the encoded address VGPR. Real Gen5 shaders leave this don't-care field
-    // non-zero, so retain Kyty's strict check for every other DS operation.
-    if addr != 0 && !matches!(opcode, 0x3d | 0x3e) {
-        return Err(feature(S, "addr != 0", pc));
-    }
-    if data0 != 0 {
-        return Err(feature(S, "data0 != 0", pc));
-    }
-    if data1 != 0 {
-        return Err(feature(S, "data1 != 0", pc));
-    }
-    if offset0 != 0 {
-        return Err(feature(S, "offset0 != 0", pc));
-    }
-    if offset1 != 0 {
-        return Err(feature(S, "offset1 != 0", pc));
-    }
-    if gds == 0 {
-        return Err(feature(S, "gds == 0", pc));
-    }
-
+    // Kyty applies its EXIT_NOT_IMPLEMENTED operand checks (L2740-2745)
+    // BEFORE the opcode switch, so an unimplemented LDS op with a non-zero
+    // addr/data/offset field died as "addr != 0" — 173 ASTRO.BOT failures
+    // with no instruction name. Deviation (diagnosis only): the opcode switch
+    // runs first so every unimplemented DS op reports its own name; the
+    // operand checks now guard only the implemented append/consume pair
+    // below, exactly as strictly as upstream.
     let size: u32 = 2;
 
     let mut inst = ShaderInstruction {
@@ -2740,6 +2786,28 @@ fn shader_parse_ds(
     };
     inst.dst = operand_parse(vdst + 256)?;
     inst.src_num = 0;
+
+    if matches!(opcode, 0x3d | 0x3e) {
+        // Kyty L2740-2745 for DS_CONSUME/DS_APPEND. They select the GDS
+        // counter through M0 and do not read the encoded address VGPR; real
+        // Gen5 shaders leave that don't-care field non-zero, so `addr` is
+        // deliberately not checked.
+        if data0 != 0 {
+            return Err(feature(S, "data0 != 0", pc));
+        }
+        if data1 != 0 {
+            return Err(feature(S, "data1 != 0", pc));
+        }
+        if offset0 != 0 {
+            return Err(feature(S, "offset0 != 0", pc));
+        }
+        if offset1 != 0 {
+            return Err(feature(S, "offset1 != 0", pc));
+        }
+        if gds == 0 {
+            return Err(feature(S, "gds == 0", pc));
+        }
+    }
 
     match opcode {
         0x00 => return Err(ni(dst, S, "ds_add_u32", opcode, pc, b0)),
@@ -2971,6 +3039,12 @@ fn shader_parse_mimg(
                     inst.format = F::Vdata1Vaddr3StDmask1;
                     inst.dst.size = 1;
                 }
+                // Beyond Kyty: two-channel fetch (measured on ASTRO.BOT scene
+                // compute, MIMG 0x00 dmask 0x3).
+                0x3 => {
+                    inst.format = F::Vdata2Vaddr3StDmask3;
+                    inst.dst.size = 2;
+                }
                 0x7 => {
                     inst.format = F::Vdata3Vaddr3StDmask7;
                     inst.dst.size = 3;
@@ -2992,9 +3066,18 @@ fn shader_parse_mimg(
             inst.src[0].size = 3;
             inst.src[1].size = 8;
             inst.src_num = 2;
-            if dmask == 0xf {
-                inst.format = F::Vdata4Vaddr3StDmaskF;
-                inst.dst.size = 4;
+            match dmask {
+                // Beyond Kyty: single-channel store (measured on ASTRO.BOT
+                // scene compute, MIMG 0x08 dmask 0x1).
+                0x1 => {
+                    inst.format = F::Vdata1Vaddr3StDmask1;
+                    inst.dst.size = 1;
+                }
+                0xf => {
+                    inst.format = F::Vdata4Vaddr3StDmaskF;
+                    inst.dst.size = 4;
+                }
+                _ => {}
             }
         }
         0x09 => {
@@ -3085,6 +3168,16 @@ fn shader_parse_mimg(
             inst.src[1].size = 8;
             inst.src[2].size = 4;
             match dmask {
+                // Beyond Kyty: single-channel LOD-zero samples (measured on
+                // ASTRO.BOT scene compute, MIMG 0x27 dmask 0x1 and 0x2).
+                0x1 => {
+                    inst.format = F::Vdata1Vaddr3StSsDmask1;
+                    inst.dst.size = 1;
+                }
+                0x2 => {
+                    inst.format = F::Vdata1Vaddr3StSsDmask2;
+                    inst.dst.size = 1;
+                }
                 0x7 => {
                     inst.format = F::Vdata3Vaddr3StSsDmask7;
                     inst.dst.size = 3;

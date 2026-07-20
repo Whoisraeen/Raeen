@@ -820,6 +820,62 @@ pub(crate) const BUFFER_STORE_FLOAT2: &str = r#"
                OpFunctionEnd
 "#;
 
+/// Beyond Kyty: the 4-dword store twin of `BUFFER_LOAD_FLOAT4` (L598) —
+/// upstream has no `buffer_store_float4` because `buffer_store_format_xyzw`
+/// is `KYTY_NI`. Same signature (and thus the same
+/// `%function_buffer_load_float4` type): addr = (offset + index * stride)/4,
+/// then four consecutive dword stores.
+pub(crate) const BUFFER_STORE_FLOAT4: &str = r#"
+             ; void buffer_store_float4(in float p1, in float p2, in float p3, in float p4, in int index,
+             ;                          in int offset, in int stride, in int buffer_index)
+             ; {
+             ; 	int addr = (offset + index * stride)/4;
+             ; 	buf[buffer_index].data[addr+0] = p1;
+             ; 	buf[buffer_index].data[addr+1] = p2;
+             ; 	buf[buffer_index].data[addr+2] = p3;
+             ; 	buf[buffer_index].data[addr+3] = p4;
+             ; }
+%buffer_store_float4 = OpFunction %void None %function_buffer_load_float4
+  %buf_s_f4_21 = OpFunctionParameter %_ptr_Function_float
+  %buf_s_f4_22 = OpFunctionParameter %_ptr_Function_float
+  %buf_s_f4_23 = OpFunctionParameter %_ptr_Function_float
+  %buf_s_f4_24 = OpFunctionParameter %_ptr_Function_float
+  %buf_s_f4_25 = OpFunctionParameter %_ptr_Function_int
+  %buf_s_f4_26 = OpFunctionParameter %_ptr_Function_int
+  %buf_s_f4_27 = OpFunctionParameter %_ptr_Function_int
+  %buf_s_f4_28 = OpFunctionParameter %_ptr_Function_int
+  %buf_s_f4_30 = OpLabel
+  %buf_s_f4_44 = OpVariable %_ptr_Function_int Function
+  %buf_s_f4_45 = OpLoad %int %buf_s_f4_26
+  %buf_s_f4_46 = OpLoad %int %buf_s_f4_25
+  %buf_s_f4_47 = OpLoad %int %buf_s_f4_27
+  %buf_s_f4_48 = OpIMul %int %buf_s_f4_46 %buf_s_f4_47
+  %buf_s_f4_49 = OpIAdd %int %buf_s_f4_45 %buf_s_f4_48
+  %buf_s_f4_51 = OpSDiv %int %buf_s_f4_49 %int_4
+        OpStore %buf_s_f4_44 %buf_s_f4_51
+  %buf_s_f4_58 = OpLoad %int %buf_s_f4_28
+  %buf_s_f4_62 = OpLoad %float %buf_s_f4_21
+  %buf_s_f4_63 = OpAccessChain %_ptr_StorageBuffer_float %buf %buf_s_f4_58 %int_0 %buf_s_f4_51
+        OpStore %buf_s_f4_63 %buf_s_f4_62
+  %buf_s_f4_65 = OpLoad %int %buf_s_f4_28
+  %buf_s_f4_68 = OpIAdd %int %buf_s_f4_51 %int_1
+  %buf_s_f4_69 = OpLoad %float %buf_s_f4_22
+  %buf_s_f4_70 = OpAccessChain %_ptr_StorageBuffer_float %buf %buf_s_f4_65 %int_0 %buf_s_f4_68
+        OpStore %buf_s_f4_70 %buf_s_f4_69
+  %buf_s_f4_71 = OpLoad %int %buf_s_f4_28
+  %buf_s_f4_74 = OpIAdd %int %buf_s_f4_51 %int_2
+  %buf_s_f4_75 = OpLoad %float %buf_s_f4_23
+  %buf_s_f4_76 = OpAccessChain %_ptr_StorageBuffer_float %buf %buf_s_f4_71 %int_0 %buf_s_f4_74
+        OpStore %buf_s_f4_76 %buf_s_f4_75
+  %buf_s_f4_77 = OpLoad %int %buf_s_f4_28
+  %buf_s_f4_80 = OpIAdd %int %buf_s_f4_51 %int_3
+  %buf_s_f4_81 = OpLoad %float %buf_s_f4_24
+  %buf_s_f4_82 = OpAccessChain %_ptr_StorageBuffer_float %buf %buf_s_f4_77 %int_0 %buf_s_f4_80
+        OpStore %buf_s_f4_82 %buf_s_f4_81
+        OpReturn
+        OpFunctionEnd
+"#;
+
 /// Kyty: ShaderSpirv.cpp `TBUFFER_LOAD_FORMAT_XYZW` (L715).
 pub(crate) const TBUFFER_LOAD_FORMAT_XYZW: &str = r#"
              ; Function tbuffer_load_format_xyzw
@@ -1019,6 +1075,67 @@ pub(crate) const TBUFFER_STORE_FORMAT_XY: &str = r#"
         %tbuf_s_f_xy_169 = OpLabel
                OpReturn
                OpFunctionEnd
+"#;
+
+/// Beyond Kyty: the store twin of `TBUFFER_LOAD_FORMAT_XYZW` (L715), for
+/// `buffer_store_format_xyzw` (`KYTY_NI` upstream). dfmt_nfmt 119 = dfmt 14
+/// (32_32_32_32), nfmt 7 (float) — the only combination that stores as four
+/// raw dwords; every other format is left unwritten rather than corrupted.
+/// Signature matches `%function_tbuffer_load_format_xyzw`.
+pub(crate) const TBUFFER_STORE_FORMAT_XYZW: &str = r#"
+             ; void tbuffer_store_format_xyzw(in float p1, in float p2, in float p3, in float p4,
+             ;                                in int index, in int offset, in int stride, in int buffer_index, in int dfmt_nfmt)
+             ; {
+             ; 	if (dfmt_nfmt == 119) // dfmt = 14, nfmt = 7
+             ; 	{
+             ; 		buffer_store_float4(p1, p2, p3, p4, index, offset, stride, buffer_index);
+             ; 	}
+             ; }
+%tbuffer_store_format_xyzw = OpFunction %void None %function_tbuffer_load_format_xyzw
+%tbuf_s_f_xyzw_54 = OpFunctionParameter %_ptr_Function_float
+%tbuf_s_f_xyzw_55 = OpFunctionParameter %_ptr_Function_float
+%tbuf_s_f_xyzw_56 = OpFunctionParameter %_ptr_Function_float
+%tbuf_s_f_xyzw_57 = OpFunctionParameter %_ptr_Function_float
+%tbuf_s_f_xyzw_58 = OpFunctionParameter %_ptr_Function_int
+%tbuf_s_f_xyzw_59 = OpFunctionParameter %_ptr_Function_int
+%tbuf_s_f_xyzw_60 = OpFunctionParameter %_ptr_Function_int
+%tbuf_s_f_xyzw_61 = OpFunctionParameter %_ptr_Function_int
+%tbuf_s_f_xyzw_62 = OpFunctionParameter %_ptr_Function_int
+%tbuf_s_f_xyzw_64 = OpLabel
+%tbuf_s_f_xyzw_166 = OpVariable %_ptr_Function_float Function
+%tbuf_s_f_xyzw_167 = OpVariable %_ptr_Function_float Function
+%tbuf_s_f_xyzw_168 = OpVariable %_ptr_Function_float Function
+%tbuf_s_f_xyzw_169 = OpVariable %_ptr_Function_float Function
+%tbuf_s_f_xyzw_170 = OpVariable %_ptr_Function_int Function
+%tbuf_s_f_xyzw_172 = OpVariable %_ptr_Function_int Function
+%tbuf_s_f_xyzw_174 = OpVariable %_ptr_Function_int Function
+%tbuf_s_f_xyzw_176 = OpVariable %_ptr_Function_int Function
+%tbuf_s_f_xyzw_161 = OpLoad %int %tbuf_s_f_xyzw_62
+%tbuf_s_f_xyzw_163 = OpIEqual %bool %tbuf_s_f_xyzw_161 %int_119
+   OpSelectionMerge %tbuf_s_f_xyzw_165 None
+   OpBranchConditional %tbuf_s_f_xyzw_163 %tbuf_s_f_xyzw_164 %tbuf_s_f_xyzw_165
+%tbuf_s_f_xyzw_164 = OpLabel
+%tbuf_s_f_xyzw_179 = OpLoad %float %tbuf_s_f_xyzw_54
+   OpStore %tbuf_s_f_xyzw_166 %tbuf_s_f_xyzw_179
+%tbuf_s_f_xyzw_180 = OpLoad %float %tbuf_s_f_xyzw_55
+   OpStore %tbuf_s_f_xyzw_167 %tbuf_s_f_xyzw_180
+%tbuf_s_f_xyzw_181 = OpLoad %float %tbuf_s_f_xyzw_56
+   OpStore %tbuf_s_f_xyzw_168 %tbuf_s_f_xyzw_181
+%tbuf_s_f_xyzw_182 = OpLoad %float %tbuf_s_f_xyzw_57
+   OpStore %tbuf_s_f_xyzw_169 %tbuf_s_f_xyzw_182
+%tbuf_s_f_xyzw_171 = OpLoad %int %tbuf_s_f_xyzw_58
+   OpStore %tbuf_s_f_xyzw_170 %tbuf_s_f_xyzw_171
+%tbuf_s_f_xyzw_173 = OpLoad %int %tbuf_s_f_xyzw_59
+   OpStore %tbuf_s_f_xyzw_172 %tbuf_s_f_xyzw_173
+%tbuf_s_f_xyzw_175 = OpLoad %int %tbuf_s_f_xyzw_60
+   OpStore %tbuf_s_f_xyzw_174 %tbuf_s_f_xyzw_175
+%tbuf_s_f_xyzw_177 = OpLoad %int %tbuf_s_f_xyzw_61
+   OpStore %tbuf_s_f_xyzw_176 %tbuf_s_f_xyzw_177
+%tbuf_s_f_xyzw_178 = OpFunctionCall %void %buffer_store_float4 %tbuf_s_f_xyzw_166 %tbuf_s_f_xyzw_167 %tbuf_s_f_xyzw_168 %tbuf_s_f_xyzw_169 %tbuf_s_f_xyzw_170 %tbuf_s_f_xyzw_172 %tbuf_s_f_xyzw_174 %tbuf_s_f_xyzw_176
+   OpBranch %tbuf_s_f_xyzw_165
+%tbuf_s_f_xyzw_165 = OpLabel
+   OpReturn
+   OpFunctionEnd
 "#;
 
 /// Kyty: ShaderSpirv.cpp `SBUFFER_LOAD_DWORD` (L912).
@@ -3619,6 +3736,11 @@ impl<'a> Spirv<'a> {
             self.source += BUFFER_STORE_FLOAT2;
             self.source += TBUFFER_STORE_FORMAT_X;
             self.source += TBUFFER_STORE_FORMAT_XY;
+        }
+
+        if self.code.has_any_of(&[T::BufferStoreFormatXyzw]) {
+            self.source += BUFFER_STORE_FLOAT4;
+            self.source += TBUFFER_STORE_FORMAT_XYZW;
         }
 
         if self.code.has_any_of(&[

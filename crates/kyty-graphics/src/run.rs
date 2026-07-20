@@ -83,7 +83,7 @@ use crate::hw_regs::{
 };
 use crate::pm4;
 use std::collections::BTreeSet;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Which register file an unknown offset belonged to.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -174,6 +174,19 @@ pub trait GuestMemory {
     /// Read `count` dwords at guest virtual address `addr`, or `None` if the
     /// range is not readable.
     fn read_dwords(&self, addr: u64, count: u32) -> Option<Vec<u32>>;
+
+    /// Read `len` bytes at guest virtual address `addr`, for DMA payload
+    /// copies. Default `None`: a read-only embedder skips DMA packets with a
+    /// warn instead of failing the stream.
+    fn read_bytes(&self, _addr: u64, _len: u64) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Write `bytes` at guest virtual address `addr`, for DMA payload copies.
+    /// Default `false` (not writable) for read-only embedders.
+    fn write_bytes(&self, _addr: u64, _bytes: &[u8]) -> bool {
+        false
+    }
 }
 
 /// Parameters of an indexed draw, as decoded from `R_DRAW_INDEX` /
@@ -645,6 +658,7 @@ impl CommandProcessor {
                 Ok(pm4::body_dw(cmd_id))
             }
             pm4::R_PUSH_MARKER | pm4::R_POP_MARKER => Ok(pm4::body_dw(cmd_id)),
+            pm4::R_DMA_DATA => self.cp_op_dma_data(cmd_id, body, offset, mem),
             pm4::R_DISPATCH_RESET => {
                 self.reset();
                 Ok(pm4::body_dw(cmd_id))
@@ -682,6 +696,110 @@ impl CommandProcessor {
                 Ok(pm4::body_dw(cmd_id))
             }
         }
+    }
+
+    /// Execute an AGC `R_DMA_DATA` payload copy — the packet the title uses to
+    /// fill buffers by DMA, including (measured suspicion, task #11) the
+    /// VideoOut scanout buffer its composite lands in. Until this existed the
+    /// packet was skipped by length, so those copies silently never happened.
+    ///
+    /// Two builder layouts share the r-code, discriminated by packet length
+    /// (mirroring our own `sceAgcDcbDmaData` / `sceAgcAcbDmaData` emissions,
+    /// which are dword-exact ports of SharpEmu's — i.e. of what retail libSceAgc
+    /// emits):
+    /// - 8-dw DCB form: body `[control0, control_ext, byte_count, dst_lo,
+    ///   dst_hi, src_lo, src_hi]`, `control0` = dstSel | dstCache<<8 |
+    ///   srcSel<<16 | srcCache<<24.
+    /// - 7-dw ACB form: body `[dst_lo, dst_hi, src_lo, src_hi, byte_count,
+    ///   sel]`, `sel` = srcSel | dstSel<<8.
+    ///
+    /// Only memory→memory (both selectors 0) is honoured; GDS/immediate
+    /// selectors, absent/read-only [`GuestMemory`], or unreadable/unwritable
+    /// ranges skip with one rate-limited warn each — never a stream error.
+    fn cp_op_dma_data(
+        &mut self,
+        cmd_id: u32,
+        body: &[u32],
+        offset: u32,
+        mem: Option<&dyn GuestMemory>,
+    ) -> Result<u32, CpError> {
+        /// Builder-enforced ceiling (`sceAgc*DmaData` reject larger): 256 MiB.
+        const MAX_DMA_BYTES: u64 = 256 * 1024 * 1024;
+        let body_len = pm4::body_dw(cmd_id);
+        let (dst, src, byte_count, src_sel, dst_sel) = match body_len {
+            7 => {
+                let control0 = Self::body_at(body, 0, offset)?;
+                let byte_count = Self::body_at(body, 2, offset)?;
+                let dst = u64::from(Self::body_at(body, 3, offset)?)
+                    | (u64::from(Self::body_at(body, 4, offset)?) << 32);
+                let src = u64::from(Self::body_at(body, 5, offset)?)
+                    | (u64::from(Self::body_at(body, 6, offset)?) << 32);
+                (dst, src, byte_count, (control0 >> 16) & 0xff, control0 & 0xff)
+            }
+            6 => {
+                let dst = u64::from(Self::body_at(body, 0, offset)?)
+                    | (u64::from(Self::body_at(body, 1, offset)?) << 32);
+                let src = u64::from(Self::body_at(body, 2, offset)?)
+                    | (u64::from(Self::body_at(body, 3, offset)?) << 32);
+                let byte_count = Self::body_at(body, 4, offset)?;
+                let sel = Self::body_at(body, 5, offset)?;
+                (dst, src, byte_count, sel & 0xff, (sel >> 8) & 0xff)
+            }
+            other => {
+                if self.first(SkipKey::Note("DMA_DATA unknown length")) {
+                    warn!(
+                        cmd_id = format_args!("{cmd_id:#010x}"),
+                        body_dw = other,
+                        offset,
+                        "R_DMA_DATA with unrecognized packet length — skipped"
+                    );
+                }
+                return Ok(body_len);
+            }
+        };
+        if src_sel != 0 || dst_sel != 0 {
+            if self.first(SkipKey::Note("DMA_DATA non-memory selector")) {
+                warn!(
+                    src_sel,
+                    dst_sel, offset, "DMA_DATA with non-memory selector — skipped"
+                );
+            }
+            return Ok(body_len);
+        }
+        if byte_count == 0 || u64::from(byte_count) > MAX_DMA_BYTES {
+            if self.first(SkipKey::Note("DMA_DATA byte count out of range")) {
+                warn!(byte_count, offset, "DMA_DATA byte count out of range — skipped");
+            }
+            return Ok(body_len);
+        }
+        let Some(mem) = mem else {
+            if self.first(SkipKey::Note("DMA_DATA needs GuestMemory")) {
+                warn!(offset, "DMA_DATA needs a GuestMemory accessor — skipped");
+            }
+            return Ok(body_len);
+        };
+        match mem.read_bytes(src, u64::from(byte_count)) {
+            Some(bytes) if mem.write_bytes(dst, &bytes) => {
+                debug!(
+                    src = format_args!("{src:#x}"),
+                    dst = format_args!("{dst:#x}"),
+                    byte_count,
+                    "DMA_DATA copy executed"
+                );
+            }
+            _ => {
+                if self.first(SkipKey::Note("DMA_DATA range unreadable/unwritable")) {
+                    warn!(
+                        src = format_args!("{src:#x}"),
+                        dst = format_args!("{dst:#x}"),
+                        byte_count,
+                        offset,
+                        "DMA_DATA source/destination not accessible guest memory — skipped"
+                    );
+                }
+            }
+        }
+        Ok(body_len)
     }
 
     /// Kyty: `cp_op_dispatch_direct` (GraphicsRun.cpp L2691).
@@ -2331,6 +2449,117 @@ mod tests {
         cp.run(&dcb, &mut sink)
             .expect("an unknown custom op must not kill the DCB");
         assert_eq!(sink.draws.len(), 1);
+    }
+
+    /// Byte-addressed read/write test memory for DMA_DATA copies.
+    struct DmaMem {
+        base: u64,
+        bytes: std::cell::RefCell<Vec<u8>>,
+    }
+
+    impl DmaMem {
+        fn range(&self, addr: u64, len: u64) -> Option<std::ops::Range<usize>> {
+            let start = usize::try_from(addr.checked_sub(self.base)?).ok()?;
+            let end = start.checked_add(usize::try_from(len).ok()?)?;
+            (end <= self.bytes.borrow().len()).then_some(start..end)
+        }
+    }
+
+    impl GuestMemory for DmaMem {
+        fn read_dwords(&self, _addr: u64, _count: u32) -> Option<Vec<u32>> {
+            None
+        }
+
+        fn read_bytes(&self, addr: u64, len: u64) -> Option<Vec<u8>> {
+            let range = self.range(addr, len)?;
+            Some(self.bytes.borrow()[range].to_vec())
+        }
+
+        fn write_bytes(&self, addr: u64, data: &[u8]) -> bool {
+            match self.range(addr, data.len() as u64) {
+                Some(range) => {
+                    self.bytes.borrow_mut()[range].copy_from_slice(data);
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+
+    /// Both DMA_DATA builder layouts execute a real memory→memory copy, and a
+    /// non-memory selector skips without touching the destination.
+    #[test]
+    fn dma_data_executes_memory_copies_in_both_layouts() {
+        let mem = DmaMem {
+            base: 0x9000,
+            bytes: std::cell::RefCell::new((0u8..192).collect()),
+        };
+        // src = base (bytes 0..16), dst regions initially hold 64.. and 128..
+        let (src, dst_a, dst_b) = (0x9000u64, 0x9040u64, 0x9080u64);
+
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            // 8-dw DCB form: control0 (mem→mem), control_ext, byte_count,
+            // dst lo/hi, src lo/hi.
+            header(8, pm4::IT_NOP, pm4::R_DMA_DATA),
+            0,
+            0,
+            16,
+            dst_a as u32,
+            (dst_a >> 32) as u32,
+            src as u32,
+            (src >> 32) as u32,
+            // 7-dw ACB form: dst lo/hi, src lo/hi, byte_count, sel (mem→mem).
+            header(7, pm4::IT_NOP, pm4::R_DMA_DATA),
+            dst_b as u32,
+            (dst_b >> 32) as u32,
+            src as u32,
+            (src >> 32) as u32,
+            16,
+            0,
+            // ACB form again but srcSel=2 (immediate/GDS): must be skipped.
+            header(7, pm4::IT_NOP, pm4::R_DMA_DATA),
+            0x9060,
+            0,
+            src as u32,
+            (src >> 32) as u32,
+            16,
+            2,
+        ];
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("DMA packets must not kill the DCB");
+
+        let bytes = mem.bytes.borrow();
+        let pattern: Vec<u8> = (0u8..16).collect();
+        assert_eq!(&bytes[0x40..0x50], &pattern[..], "DCB-form copy landed");
+        assert_eq!(&bytes[0x80..0x90], &pattern[..], "ACB-form copy landed");
+        assert_eq!(
+            bytes[0x60..0x70],
+            (96u8..112).collect::<Vec<u8>>()[..],
+            "non-memory selector must not write"
+        );
+    }
+
+    /// Without a GuestMemory accessor a DMA_DATA packet is skipped (one warn),
+    /// never a stream error — read-only embedders keep working.
+    #[test]
+    fn dma_data_without_memory_is_skipped() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let mut dcb = vec![
+            header(7, pm4::IT_NOP, pm4::R_DMA_DATA),
+            0x9040,
+            0,
+            0x9000,
+            0,
+            16,
+            0,
+        ];
+        dcb.extend(state_and_draw());
+        cp.run(&dcb, &mut sink)
+            .expect("DMA without memory must not kill the DCB");
+        assert_eq!(sink.draws.len(), 1, "the stream continues to the draw");
     }
 
     /// Once per distinct op per instance: the same unknown op twice warns once

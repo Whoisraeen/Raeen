@@ -755,6 +755,29 @@ fn recompile_exp_pos0(
     Ok(true)
 }
 
+/// Beyond Kyty: auxiliary position exports pos1..pos3 (exp targets
+/// 0x0d-0x0f), which upstream EXITs on. Per shadPS4 (`ir/position.h`
+/// `ExportPosition`), each enabled channel maps to a clip distance, cull
+/// distance, point size, or viewport/render-target index as configured by
+/// PA_CL_VS_OUT_CNTL. XPS5X does not plumb VS_OUT_CNTL into the recompiler
+/// yet, so the export is accepted and dropped: nothing is written and
+/// gl_Position (pos0) is untouched. Dropping clip/cull distances disables
+/// user clip planes for the draw — visible at worst as missing clipping,
+/// never as corruption. Measured: 632 ASTRO.BOT VS failures on pos1 with
+/// en=0x4.
+fn recompile_exp_pos_aux(
+    index: u32,
+    code: &ShaderCode,
+    _dst_source: &mut String,
+    _spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_Exp_PosAuxVsrc0Vsrc1Vsrc2Vsrc3";
+    let _ = inst_at(code, index, FUNC)?;
+    Ok(true)
+}
+
 /// Kyty: `Recompile_Exp_PrimVsrc0OffOffOffDone` (ShaderSpirv.cpp L2461).
 fn recompile_exp_prim(
     index: u32,
@@ -2539,7 +2562,6 @@ fn recompile_buffer_store_dword_vdata1(
 
 /// Kyty: `Recompile_BufferStoreFormatX_Vdata1VaddrSvSoffsIdxen`
 /// (ShaderSpirv.cpp L2068).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_buffer_store_format_x_vdata1(
     index: u32,
     code: &ShaderCode,
@@ -2623,7 +2645,6 @@ fn recompile_buffer_store_format_x_vdata1(
 
 /// Kyty: `Recompile_BufferStoreFormatXy_Vdata2VaddrSvSoffsIdxen`
 /// (ShaderSpirv.cpp L2137).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_buffer_store_format_xy_vdata2(
     index: u32,
     code: &ShaderCode,
@@ -2705,6 +2726,306 @@ fn recompile_buffer_store_format_xy_vdata2(
     }
 
     Ok(false)
+}
+
+/// Which storage-buffer helper the flexible MUBUF addressing body calls.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum MubufFlexOp {
+    LoadDword,
+    StoreDword,
+    LoadFormatX,
+    StoreFormatX,
+    StoreFormatXyzw,
+}
+
+/// Shared body of the beyond-Kyty flexible-addressing MUBUF recompilers.
+///
+/// Kyty's MUBUF bodies (`Recompile_BufferLoadDword_*` L1877,
+/// `Recompile_BufferStoreDword_*` L1999, `Recompile_Buffer{Load,Store}FormatX_*`
+/// L1937/L2068) hardcode `idxen == 1, offen == 0`. This body derives the
+/// addressing mode from the parsed format instead — the model
+/// [`recompile_buffer_load_dwordx4`] established:
+/// `temp_int_1` = vindex (or 0 without idxen), `temp_int_2` = instruction
+/// offset (+ voffset when offen), `temp_int_3` = stride from V# dword1,
+/// `temp_int_4` = buffer index, `temp_int_5` = dfmt_nfmt from V# dword3
+/// (format ops only) — then calls the same Kyty helper functions.
+/// Stores are wrapped in the exec_lo guard the Kyty store bodies use.
+fn mubuf_flexible(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    func: &'static str,
+    op: MubufFlexOp,
+) -> Result<bool, ShaderRecompileError> {
+    let inst = inst_at(code, index, func)?;
+
+    let Some(bind_info) = spirv.get_bind_info() else {
+        return Ok(false);
+    };
+    if bind_info.storage_buffers.buffers_num == 0 {
+        return Ok(false);
+    }
+    if !operand_is_constant(inst.src[2]) {
+        return Err(not_supported(func, "src2 is not a constant"));
+    }
+
+    let idxen = matches!(
+        inst.format,
+        Format::Vdata1VaddrSvSoffsIdxen
+            | Format::Vdata1Vaddr2SvSoffsOffenIdxen
+            | Format::Vdata4VaddrSvSoffsIdxen
+            | Format::Vdata4Vaddr2SvSoffsOffenIdxen
+    );
+    let offen = matches!(
+        inst.format,
+        Format::Vdata1VaddrSvSoffsOffen
+            | Format::Vdata1Vaddr2SvSoffsOffenIdxen
+            | Format::Vdata4VaddrSvSoffsOffen
+            | Format::Vdata4Vaddr2SvSoffsOffenIdxen
+    );
+
+    let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+    let src1_value1 = operand_variable_to_str_shift(inst.src[1], 1);
+    let offset = spirv.get_constant(inst.src[2]);
+    if src1_value0.type_ != SpirvType::Uint || src1_value1.type_ != SpirvType::Uint {
+        return Err(not_supported(func, "unexpected V# operand types"));
+    }
+
+    let is_store = matches!(
+        op,
+        MubufFlexOp::StoreDword | MubufFlexOp::StoreFormatX | MubufFlexOp::StoreFormatXyzw
+    );
+    let with_dfmt = matches!(
+        op,
+        MubufFlexOp::LoadFormatX | MubufFlexOp::StoreFormatX | MubufFlexOp::StoreFormatXyzw
+    );
+    let vdata_n: i32 = if op == MubufFlexOp::StoreFormatXyzw {
+        4
+    } else {
+        1
+    };
+
+    let mut vdata = Vec::with_capacity(vdata_n as usize);
+    for i in 0..vdata_n {
+        let value = operand_variable_to_str_shift(inst.dst, i);
+        if value.type_ != SpirvType::Float {
+            return Err(not_supported(func, "unexpected vdata type"));
+        }
+        vdata.push(value.value);
+    }
+
+    let i = format!("{index}");
+    let mut text = String::new();
+
+    // TODO() check VSKIP
+
+    if is_store {
+        text += &format!(
+            "
+        %exec_lo_u_{i} = OpLoad %uint %exec_lo
+        %exec_lo_b_{i} = OpINotEqual %bool %exec_lo_u_{i} %uint_0
+               OpSelectionMerge %mbf_end_{i} None
+               OpBranchConditional %exec_lo_b_{i} %mbf_body_{i} %mbf_end_{i}
+        %mbf_body_{i} = OpLabel
+"
+        );
+    }
+
+    // temp_int_1 = vindex (idxen) or 0.
+    if idxen {
+        let vindex = operand_variable_to_str_shift(inst.src[0], 0);
+        if vindex.type_ != SpirvType::Float {
+            return Err(not_supported(func, "unexpected vindex register type"));
+        }
+        text += &format!(
+            "        %mbf_i0_{i} = OpLoad %float %{}
+        %mbf_i1_{i} = OpBitcast %int %mbf_i0_{i}
+               OpStore %temp_int_1 %mbf_i1_{i}
+",
+            vindex.value
+        );
+    } else {
+        text += "               OpStore %temp_int_1 %int_0\n";
+    }
+
+    // temp_int_3 = stride (V# dword1 bits 16..29), temp_int_4 = buffer index,
+    // temp_int_2 = instruction offset.
+    text += &format!(
+        "        %mbf_s0_{i} = OpLoad %uint %{src1_value1}
+        %mbf_s1_{i} = OpShiftRightLogical %uint %mbf_s0_{i} %int_16
+        %mbf_s2_{i} = OpBitwiseAnd %uint %mbf_s1_{i} %uint_0x00003fff
+        %mbf_s3_{i} = OpBitcast %int %mbf_s2_{i}
+               OpStore %temp_int_3 %mbf_s3_{i}
+        %mbf_b0_{i} = OpLoad %uint %{src1_value0}
+        %mbf_b1_{i} = OpBitcast %int %mbf_b0_{i}
+               OpStore %temp_int_4 %mbf_b1_{i}
+               OpStore %temp_int_2 %{offset}
+",
+        src1_value1 = src1_value1.value,
+        src1_value0 = src1_value0.value,
+    );
+
+    // offen: the vaddr register after the (optional) vindex is a per-thread
+    // byte offset folded into temp_int_2.
+    if offen {
+        let voffset = operand_variable_to_str_shift(inst.src[0], i32::from(idxen));
+        if voffset.type_ != SpirvType::Float {
+            return Err(not_supported(func, "unexpected voffset register type"));
+        }
+        text += &format!(
+            "        %mbf_o0_{i} = OpLoad %float %{}
+        %mbf_o1_{i} = OpBitcast %int %mbf_o0_{i}
+        %mbf_o2_{i} = OpLoad %int %temp_int_2
+        %mbf_o3_{i} = OpIAdd %int %mbf_o2_{i} %mbf_o1_{i}
+               OpStore %temp_int_2 %mbf_o3_{i}
+",
+            voffset.value
+        );
+    }
+
+    // temp_int_5 = dfmt_nfmt (V# dword3 bits 12..18) for the format helpers.
+    if with_dfmt {
+        let src1_value3 = operand_variable_to_str_shift(inst.src[1], 3);
+        if src1_value3.type_ != SpirvType::Uint {
+            return Err(not_supported(func, "unexpected V# dword3 type"));
+        }
+        text += &format!(
+            "        %mbf_f0_{i} = OpLoad %uint %{}
+        %mbf_f1_{i} = OpShiftRightLogical %uint %mbf_f0_{i} %int_12
+        %mbf_f2_{i} = OpBitwiseAnd %uint %mbf_f1_{i} %uint_127
+        %mbf_f3_{i} = OpBitcast %int %mbf_f2_{i}
+               OpStore %temp_int_5 %mbf_f3_{i}
+",
+            src1_value3.value
+        );
+    }
+
+    let helper = match op {
+        MubufFlexOp::LoadDword => "%buffer_load_float1",
+        MubufFlexOp::StoreDword => "%buffer_store_float1",
+        MubufFlexOp::LoadFormatX => "%tbuffer_load_format_x",
+        MubufFlexOp::StoreFormatX => "%tbuffer_store_format_x",
+        MubufFlexOp::StoreFormatXyzw => "%tbuffer_store_format_xyzw",
+    };
+    let mut args = String::new();
+    for v in &vdata {
+        args += &format!("%{v} ");
+    }
+    args += "%temp_int_1 %temp_int_2 %temp_int_3 %temp_int_4";
+    if with_dfmt {
+        args += " %temp_int_5";
+    }
+    text += &format!("        %mbf_c_{i} = OpFunctionCall %void {helper} {args}\n");
+
+    if is_store {
+        text += &format!(
+            "               OpBranch %mbf_end_{i}
+        %mbf_end_{i} = OpLabel
+"
+        );
+    }
+
+    *dst_source += &text;
+    Ok(true)
+}
+
+/// Beyond Kyty: `buffer_load_dword` with idxen==0 and/or offen==1.
+fn recompile_buffer_load_dword_flexible(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    mubuf_flexible(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_BufferLoadDword_FlexibleAddr",
+        MubufFlexOp::LoadDword,
+    )
+}
+
+/// Beyond Kyty: `buffer_store_dword` with idxen==0 and/or offen==1.
+fn recompile_buffer_store_dword_flexible(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    mubuf_flexible(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_BufferStoreDword_FlexibleAddr",
+        MubufFlexOp::StoreDword,
+    )
+}
+
+/// Beyond Kyty: `buffer_load_format_x` with idxen==0 and/or offen==1.
+fn recompile_buffer_load_format_x_flexible(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    mubuf_flexible(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_BufferLoadFormatX_FlexibleAddr",
+        MubufFlexOp::LoadFormatX,
+    )
+}
+
+/// Beyond Kyty: `buffer_store_format_x` with idxen==0 and/or offen==1.
+fn recompile_buffer_store_format_x_flexible(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    mubuf_flexible(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_BufferStoreFormatX_FlexibleAddr",
+        MubufFlexOp::StoreFormatX,
+    )
+}
+
+/// Beyond Kyty (`buffer_store_format_xyzw` is `KYTY_NI` upstream,
+/// ShaderParse.cpp L2630): 4-channel formatted store through the
+/// `tbuffer_store_format_xyzw` helper, all four addressing modes. The single
+/// most frequent ASTRO.BOT shader failure (925 dispatches / 30s).
+fn recompile_buffer_store_format_xyzw(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    mubuf_flexible(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_BufferStoreFormatXyzw_Vdata4VaddrSvSoffs",
+        MubufFlexOp::StoreFormatXyzw,
+    )
 }
 
 /// Shared body of `Recompile_DsAppend_VdstGds` / `Recompile_DsConsume_VdstGds`
@@ -3295,6 +3616,100 @@ fn recompile_image_sample_lz_dmask_f(
     Ok(false)
 }
 
+/// Beyond-Kyty shared body: `image_sample_lz` writing a single channel
+/// (dmask 0x1 selects .x, dmask 0x2 selects .y) — measured in ASTRO.BOT scene
+/// compute. Same explicit-LOD-zero 2D lowering as
+/// [`recompile_image_sample_lz_dmask7`], storing only `chan`.
+fn image_sample_lz_single_channel(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    func: &'static str,
+    chan: u32,
+) -> Result<bool, ShaderRecompileError> {
+    let inst = inst_at(code, index, func)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
+            let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
+            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
+            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+            let src2_value0 = operand_variable_to_str_shift(inst.src[2], 0);
+
+            if dst_value0.type_ != SpirvType::Float
+                || src0_value0.type_ != SpirvType::Float
+                || src1_value0.type_ != SpirvType::Uint
+                || src2_value0.type_ != SpirvType::Uint
+            {
+                return Err(not_supported(func, "unexpected operand types"));
+            }
+
+            // TODO() check VSKIP
+            // TODO() check LOD_CLAMPED
+
+            const TEXT: &str = r#"
+         %t24_<index> = OpLoad %uint %<src1_value0>
+         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageS %textures2D_S %t24_<index>
+         %t27_<index> = OpLoad %ImageS %t26_<index>
+         %t33_<index> = OpLoad %uint %<src2_value0>
+         %t35_<index> = OpAccessChain %_ptr_UniformConstant_Sampler %samplers %t33_<index>
+         %t36_<index> = OpLoad %Sampler %t35_<index>
+         %t38_<index> = OpSampledImage %SampledImage %t27_<index> %t36_<index>
+
+         %t39_<index> = OpLoad %float %<src0_value0>
+         %t40_<index> = OpLoad %float %<src0_value1>
+         %t42_<index> = OpCompositeConstruct %v2float %t39_<index> %t40_<index>
+
+         %t43_<index> = OpImageSampleExplicitLod %v4float %t38_<index> %t42_<index> Lod %float_0_000000
+               OpStore %temp_v4float %t43_<index>
+         %t46_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_<chan>
+         %t47_<index> = OpLoad %float %t46_<index>
+               OpStore %<dst_value0> %t47_<index>
+"#;
+            *dst_source += &TEXT
+                .replace("<index>", &format!("{index}"))
+                .replace("<chan>", &format!("{chan}"))
+                .replace("<src0_value0>", &src0_value0.value)
+                .replace("<src0_value1>", &src0_value1.value)
+                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<src2_value0>", &src2_value0.value)
+                .replace("<dst_value0>", &dst_value0.value);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Beyond-Kyty: `image_sample_lz` with `dmask == 0x1` (.x only).
+fn recompile_image_sample_lz_dmask1(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSampleLz_Vdata1Vaddr3StSsDmask1";
+    image_sample_lz_single_channel(index, code, dst_source, spirv, FUNC, 0)
+}
+
+/// Beyond-Kyty: `image_sample_lz` with `dmask == 0x2` (.y only).
+fn recompile_image_sample_lz_dmask2(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSampleLz_Vdata1Vaddr3StSsDmask2";
+    image_sample_lz_single_channel(index, code, dst_source, spirv, FUNC, 1)
+}
+
 /// Kyty: `Recompile_ImageSampleLzO_Vdata3Vaddr4StSsDmask7` (ShaderSpirv.cpp
 /// L2887).
 #[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
@@ -3570,6 +3985,80 @@ fn recompile_image_load_dmask7(
         FUNC,
         &[(46, 0), (50, 1), (54, 2)],
     )
+}
+
+/// Beyond-Kyty: `image_load` with `dmask == 0x3` (xy fetch), measured in
+/// ASTRO.BOT scene compute shaders (MIMG 0x00 dmask 0x3).
+fn recompile_image_load_dmask3(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageLoad_Vdata2Vaddr3StDmask3";
+    image_load_channels(index, code, dst_source, spirv, FUNC, &[(46, 0), (50, 1)])
+}
+
+/// Beyond-Kyty: `image_store` with `dmask == 0x1` (single channel), measured
+/// in ASTRO.BOT scene compute (MIMG 0x08 dmask 0x1). `OpImageWrite` always
+/// takes a 4-component texel; the storage image's own format decides which
+/// components land, so the disabled channels are filled with the GCN default
+/// (0, 0, 0, 1) — harmless for the single-channel formats this dmask implies.
+fn recompile_image_store_dmask1(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageStore_Vdata1Vaddr3StDmask1";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.textures2d.textures2d_storage_num > 0 {
+            let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
+            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
+            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+
+            if dst_value0.type_ != SpirvType::Float
+                || src0_value0.type_ != SpirvType::Float
+                || src1_value0.type_ != SpirvType::Uint
+            {
+                return Err(not_supported(FUNC, "unexpected operand types"));
+            }
+
+            // TODO() check VSKIP
+            // TODO() swizzle channels
+
+            const TEXT: &str = r#"
+         %t24_<index> = OpLoad %uint %<src1_value0>
+         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageL %textures2D_L %t24_<index>
+         %t27_<index> = OpLoad %ImageL %t26_<index>
+         %t67_<index> = OpLoad %float %<src0_value0>
+         %t69_<index> = OpBitcast %uint %t67_<index>
+         %t70_<index> = OpLoad %float %<src0_value1>
+         %t71_<index> = OpBitcast %uint %t70_<index>
+         %t73_<index> = OpCompositeConstruct %v2uint %t69_<index> %t71_<index>
+         %t84_<index> = OpLoad %float %<dst_value0>
+         %t88_<index> = OpCompositeConstruct %v4float %t84_<index> %float_0_000000 %float_0_000000 %float_1_000000
+               OpImageWrite %t27_<index> %t73_<index> %t88_<index>
+"#;
+            *dst_source += &TEXT
+                .replace("<index>", &format!("{index}"))
+                .replace("<src0_value0>", &src0_value0.value)
+                .replace("<src0_value1>", &src0_value1.value)
+                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<dst_value0>", &dst_value0.value);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 /// Kyty: `Recompile_ImageStore_Vdata4Vaddr3StDmaskF` (ShaderSpirv.cpp L3105).
@@ -6017,8 +6506,32 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_buffer_load_dwordx4,         T::BufferLoadDwordX4, F::Vdata4VaddrSvSoffsOffen, p1("")),
     f(recompile_buffer_load_format_x_vdata1, T::BufferLoadFormatX, F::Vdata1VaddrSvSoffsIdxen, p1("")),
     f(recompile_buffer_store_dword_vdata1, T::BufferStoreDword, F::Vdata1VaddrSvSoffsIdxen, p1("")),
-    ni("Recompile_BufferStoreFormatX_Vdata1VaddrSvSoffsIdxen",  2068, T::BufferStoreFormatX,  F::Vdata1VaddrSvSoffsIdxen, p1("")),
-    ni("Recompile_BufferStoreFormatXy_Vdata2VaddrSvSoffsIdxen", 2137, T::BufferStoreFormatXy, F::Vdata2VaddrSvSoffsIdxen, p1("")),
+    // Wired from the staged set for ASTRO.BOT's formatted stores (the parse
+    // gate no longer blanket-rejects MUBUF addressing modes).
+    f(recompile_buffer_store_format_x_vdata1,  T::BufferStoreFormatX,  F::Vdata1VaddrSvSoffsIdxen, p1("")),
+    f(recompile_buffer_store_format_xy_vdata2, T::BufferStoreFormatXy, F::Vdata2VaddrSvSoffsIdxen, p1("")),
+    // Beyond Kyty: flexible MUBUF addressing (idxen==0 and/or offen==1) for
+    // the single-dword loads/stores — the Vdata1 counterpart of the
+    // BufferLoadDwordX4 quartet. Shared body `mubuf_flexible`.
+    f(recompile_buffer_load_dword_flexible,  T::BufferLoadDword,  F::Vdata1SvSoffs,                 p1("")),
+    f(recompile_buffer_load_dword_flexible,  T::BufferLoadDword,  F::Vdata1VaddrSvSoffsOffen,       p1("")),
+    f(recompile_buffer_load_dword_flexible,  T::BufferLoadDword,  F::Vdata1Vaddr2SvSoffsOffenIdxen, p1("")),
+    f(recompile_buffer_store_dword_flexible, T::BufferStoreDword, F::Vdata1SvSoffs,                 p1("")),
+    f(recompile_buffer_store_dword_flexible, T::BufferStoreDword, F::Vdata1VaddrSvSoffsOffen,       p1("")),
+    f(recompile_buffer_store_dword_flexible, T::BufferStoreDword, F::Vdata1Vaddr2SvSoffsOffenIdxen, p1("")),
+    f(recompile_buffer_load_format_x_flexible,  T::BufferLoadFormatX,  F::Vdata1SvSoffs,                 p1("")),
+    f(recompile_buffer_load_format_x_flexible,  T::BufferLoadFormatX,  F::Vdata1VaddrSvSoffsOffen,       p1("")),
+    f(recompile_buffer_load_format_x_flexible,  T::BufferLoadFormatX,  F::Vdata1Vaddr2SvSoffsOffenIdxen, p1("")),
+    f(recompile_buffer_store_format_x_flexible, T::BufferStoreFormatX, F::Vdata1SvSoffs,                 p1("")),
+    f(recompile_buffer_store_format_x_flexible, T::BufferStoreFormatX, F::Vdata1VaddrSvSoffsOffen,       p1("")),
+    f(recompile_buffer_store_format_x_flexible, T::BufferStoreFormatX, F::Vdata1Vaddr2SvSoffsOffenIdxen, p1("")),
+    // Beyond Kyty (`buffer_store_format_xyz(w)` are KYTY_NI upstream):
+    // measured on ASTRO.BOT scene compute — 925 dispatches / 30s on xyzw.
+    f(recompile_buffer_store_format_xyzw, T::BufferStoreFormatXyzw, F::Vdata4VaddrSvSoffsIdxen,       p1("")),
+    f(recompile_buffer_store_format_xyzw, T::BufferStoreFormatXyzw, F::Vdata4Vaddr2SvSoffsOffenIdxen, p1("")),
+    f(recompile_buffer_store_format_xyzw, T::BufferStoreFormatXyzw, F::Vdata4SvSoffs,                 p1("")),
+    f(recompile_buffer_store_format_xyzw, T::BufferStoreFormatXyzw, F::Vdata4VaddrSvSoffsOffen,       p1("")),
+    ni("Recompile_BufferStoreFormatXyz_Vdata3VaddrSvSoffsIdxen (no Kyty upstream; needs a float3 store helper)", 0, T::BufferStoreFormatXyz, F::Vdata3VaddrSvSoffsIdxen, p1("")),
 
     f(recompile_fetch, T::FetchX,    F::Vdata1VaddrSvSoffsIdxen, p1("")),
     f(recompile_fetch, T::FetchXy,   F::Vdata2VaddrSvSoffsIdxen, p1("")),
@@ -6037,11 +6550,18 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_exp_param_xxx,                      T::Exp, F::Param3Vsrc0Vsrc1Vsrc2Vsrc3,     p1("param3")),
     f(recompile_exp_param_xxx,                      T::Exp, F::Param4Vsrc0Vsrc1Vsrc2Vsrc3,     p1("param4")),
     f(recompile_exp_pos0,                           T::Exp, F::Pos0Vsrc0Vsrc1Vsrc2Vsrc3Done,   p1("")),
+    // Auxiliary position exports (clip/cull distances via PA_CL_VS_OUT_CNTL);
+    // accepted and dropped until VS_OUT_CNTL is plumbed — see
+    // recompile_exp_pos_aux.
+    f(recompile_exp_pos_aux,                        T::Exp, F::Pos1Vsrc0Vsrc1Vsrc2Vsrc3,       p1("")),
+    f(recompile_exp_pos_aux,                        T::Exp, F::Pos2Vsrc0Vsrc1Vsrc2Vsrc3,       p1("")),
+    f(recompile_exp_pos_aux,                        T::Exp, F::Pos3Vsrc0Vsrc1Vsrc2Vsrc3,       p1("")),
     f(recompile_exp_prim,                           T::Exp, F::PrimVsrc0OffOffOffDone,         p1("")),
 
     f(recompile_image_get_resinfo_dmask3, T::ImageGetResinfo, F::Vdata2VaddrStDmask3, p1("")),
     f(recompile_image_load_dmask_f,        T::ImageLoad,      F::Vdata4Vaddr3StDmaskF,   p1("")),
     f(recompile_image_load_dmask1,         T::ImageLoad,      F::Vdata1Vaddr3StDmask1,   p1("")),
+    f(recompile_image_load_dmask3,         T::ImageLoad,      F::Vdata2Vaddr3StDmask3,   p1("")),
     f(recompile_image_load_dmask7,         T::ImageLoad,      F::Vdata3Vaddr3StDmask7,   p1("")),
     // Wired for the texture chain: Minecraft's content pixel shaders reach
     // ImageSample the moment their vertex partners translate. The nine
@@ -6061,9 +6581,12 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_image_sample_c_lz,       T::ImageSampleCLz, F::Vdata2Vaddr3StSsDmask9, p1("")),
     f(recompile_image_sample_c_lz,       T::ImageSampleCLz, F::Vdata3Vaddr3StSsDmask7, p1("")),
     f(recompile_image_sample_c_lz,       T::ImageSampleCLz, F::Vdata4Vaddr3StSsDmaskF, p1("")),
+    f(recompile_image_sample_lz_dmask1,  T::ImageSampleLz,  F::Vdata1Vaddr3StSsDmask1, p1("")),
+    f(recompile_image_sample_lz_dmask2,  T::ImageSampleLz,  F::Vdata1Vaddr3StSsDmask2, p1("")),
     f(recompile_image_sample_lz_dmask7,  T::ImageSampleLz,  F::Vdata3Vaddr3StSsDmask7, p1("")),
     f(recompile_image_sample_lz_dmask_f, T::ImageSampleLz,  F::Vdata4Vaddr3StSsDmaskF, p1("")),
     f(recompile_image_sample_lzo_dmask7, T::ImageSampleLzO, F::Vdata3Vaddr4StSsDmask7, p1("")),
+    f(recompile_image_store_dmask1,        T::ImageStore,     F::Vdata1Vaddr3StDmask1,   p1("")),
     f(recompile_image_store_dmask_f,       T::ImageStore,     F::Vdata4Vaddr3StDmaskF,   p1("")),
     ni("Recompile_ImageStoreMip_Vdata4Vaddr4StDmaskF",    3173, T::ImageStoreMip,  F::Vdata4Vaddr4StDmaskF,   p1("")),
 
@@ -6367,6 +6890,10 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     // `v_or3_u32`: dst = (src0 | src1) | src2.
     f(recompile_v_xxx_u32_vdst_vsrc012, T::VOr3U32, F::VdstVsrc0Vsrc1Vsrc2, p2("%to_<index> = OpBitwiseOr %uint %t0_<index> %t1_<index>",
         "%t_<index> = OpBitwiseOr %uint %to_<index> %t2_<index>")),
+    // `v_add3_u32`: dst = src0 + src1 + src2 (carry-less, RDNA2 VOP3 0x36d;
+    // shadPS4 `V_ADD3_U32 = 877`). Measured in ASTRO.BOT scene compute.
+    f(recompile_v_xxx_u32_vdst_vsrc012, T::VAdd3U32, F::VdstVsrc0Vsrc1Vsrc2, p2("%ta_<index> = OpIAdd %uint %t0_<index> %t1_<index>",
+        "%t_<index> = OpIAdd %uint %ta_<index> %t2_<index>")),
 ];
 
 /// Kyty: ShaderSpirv.cpp `RecompFunc` (L6182) — hash-keyed
@@ -6587,29 +7114,38 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            248,
+            273,
             "204 Kyty rows plus SSubU32, SNop, the RDNA2-only rows \
              (VLshlAddU32, VCmpxLtU32, VAddNcU32, VSubNcU32, VSubrevNcU32, VCvtI32F32, \
-             VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad dmask1/7 \
-             and ImageSampleLz dmaskF rows, \
-             the Kyty-gated trio VAndOrB32/VLshlOrU32/VOr3U32, and the v_cmpx_*_i32 \
-             block: VCmpxLtI32/GeI32/GtI32/LeI32/EqI32/NeI32), the beyond-Kyty \
-             BufferLoadDwordX4 (+Offen and address-only) rows, ImageGetResinfo, \
-             SGetpcB64, SPackLlB32B16, the seven ImageSampleCLz dmask rows, \
+             VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad dmask1/3/7 \
+             and ImageSampleLz dmask1/2/F rows, ImageStore dmask1, \
+             the Kyty-gated trio VAndOrB32/VLshlOrU32/VOr3U32, VAdd3U32, and the \
+             v_cmpx_*_i32 block: VCmpxLtI32/GeI32/GtI32/LeI32/EqI32/NeI32), the \
+             beyond-Kyty BufferLoadDwordX4 (+Offen and address-only) rows, the \
+             twelve flexible-addressing MUBUF Vdata1 rows, the four \
+             BufferStoreFormatXyzw rows (+1 staged Xyz), the exp pos1..pos3 \
+             rows, ImageGetResinfo, SGetpcB64, SPackLlB32B16, the seven \
+             ImageSampleCLz dmask rows, \
              and the four cubemap helpers VCubeId/Sc/Tc/MaF32, plus SNotB64, SBrevB32 and VCmpxEqF32"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 236,
+            implemented, 262,
             "C1 implemented subset plus title-driven ports (incl. the S_XXX_I32 \
              trio, VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad \
-             dmask1/7 + ImageSampleLz dmaskF rows, the nine ImageSample dmask recompilers, the VCmp \
-              F32/I32/U32 families, address-only BufferLoadDwordX4, \
-              ImageGetResinfo, SGetpcB64, SPackLlB32B16, the seven \
+             dmask1/3/7 + ImageSampleLz dmask1/2/F rows, ImageStore dmask1, the \
+             nine ImageSample dmask recompilers, the VCmp \
+              F32/I32/U32 families, address-only BufferLoadDwordX4, the wired \
+              BufferStoreFormatX/Xy rows, the twelve flexible-addressing MUBUF \
+              rows, the four BufferStoreFormatXyzw rows, the exp pos1..pos3 \
+              rows, VAdd3U32, ImageGetResinfo, SGetpcB64, SPackLlB32B16, the seven \
               ImageSampleCLz dmask rows, and the four VCube*F32 \
               cubemap-coordinate helpers)"
         );
-        assert_eq!(ni, 12, "C2 remainder");
+        assert_eq!(
+            ni, 11,
+            "C2 remainder (BufferStoreFormatX/Xy wired out; BufferStoreFormatXyz staged in)"
+        );
 
         // Kyty EXIT_IF(map->Contains(p)) — (type, format) keys are unique.
         let mut seen = std::collections::HashSet::new();

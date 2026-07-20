@@ -855,6 +855,22 @@ pub fn shader_parse_usage(
                 }
             }
 
+            // IMM_ALU_FLOAT_CONST (GNM `InputUsageSlot` usage type 0x05,
+            // beyond Kyty which EXITs): float constants the driver preloads
+            // directly into the user SGPRs starting at `start_register`.
+            // There is nothing to bind — leaving the registers marked direct
+            // routes their captured values through the direct-SGPR pass,
+            // which IS the semantic. Measured: 116 ASTRO.BOT CS dispatches.
+            0x05 => {
+                if usage.flags != 0 {
+                    return Err(ni_owned(format!(
+                        "usage 0x05 (imm alu float const): flags = {} (expected 0; \
+                         start_register = {start}, slot = {slot})",
+                        usage.flags
+                    )));
+                }
+            }
+
             0x07 => {
                 if usage.flags != 0 {
                     return Err(ni("usage 0x07: flags != 0"));
@@ -1031,7 +1047,25 @@ pub fn shader_parse_usage2(
         // EUD declared but the caller could not recover it (null/unmapped
         // pointer, or no guest memory). Still an honest refusal — resolving
         // sharps against a buffer we do not have would invent descriptors.
-        return Err(ni("ShaderUserData eud_size_dw != 0 (EUD unreadable)"));
+        // The error names every candidate SGPR value so the next session can
+        // extend `read_extended_user_data`'s location heuristic from evidence
+        // (which register pair actually holds the pointer) instead of a
+        // guess. Both existing strategies (pair after the declared file;
+        // scalar-load base pairs) were tried and found nothing readable.
+        let mut sgprs = String::new();
+        for (i, &v) in user_sgpr.value.iter().enumerate() {
+            if v != 0 {
+                let _ = std::fmt::Write::write_fmt(&mut sgprs, format_args!(" s{i}={v:#x}"));
+            }
+        }
+        return Err(ni_owned(format!(
+            "ShaderUserData eud_size_dw != 0 (EUD unreadable): eud_size_dw={}, \
+             srt_size_dw={}, declared={user_sgpr_num}, captured={}, nonzero sgprs:{}",
+            user_data.eud_size_dw,
+            user_data.srt_size_dw,
+            user_sgpr.count,
+            if sgprs.is_empty() { " (none)" } else { &sgprs }
+        )));
     }
     if user_data.srt_size_dw != 0 {
         return Err(ni("ShaderUserData srt_size_dw != 0"));
@@ -3556,9 +3590,17 @@ mod tests {
             eud_size_dw: 4,
             ..Default::default()
         };
-        assert!(matches!(
-            shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 0, None),
-            Err(ShaderAnalysisError::NotImplemented { .. })
-        ));
+        // The refusal is owned so it can carry the diagnostic payload the
+        // next session needs: the declared/captured SGPR counts and every
+        // nonzero SGPR value (the EUD-pointer candidates).
+        match shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 0, None) {
+            Err(ShaderAnalysisError::NotImplementedOwned { what }) => {
+                assert!(what.contains("EUD unreadable"), "{what}");
+                assert!(what.contains("eud_size_dw=4"), "{what}");
+                assert!(what.contains("declared=0"), "{what}");
+                assert!(what.contains("(none)"), "{what}");
+            }
+            other => panic!("expected owned EUD diagnostic, got {other:?}"),
+        }
     }
 }
