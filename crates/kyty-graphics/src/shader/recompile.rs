@@ -301,6 +301,28 @@ fn recompile_buffer_load_dwordx2(
     )
 }
 
+/// Beyond Kyty (`buffer_load_dwordx3` is `KYTY_NI` upstream): the three-dword
+/// row of the same flexible-addressing model — measured on ASTRO.BOT scene
+/// compute (raws 0xe03c2074/0xe03c2034, idxen with a nonzero immediate
+/// offset; 116 dispatches in the measured window).
+fn recompile_buffer_load_dwordx3(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    buffer_load_dwordxn(
+        index,
+        code,
+        dst_source,
+        spirv,
+        3,
+        "Recompile_BufferLoadDwordX3_Vdata3VaddrSvSoffsIdxen",
+    )
+}
+
 /// Shared body of the n-dword raw MUBUF loads: n consecutive dword loads at
 /// `(offset + vindex*stride)/4 + i` (+ per-thread `voffset` when Offen).
 fn buffer_load_dwordxn(
@@ -335,6 +357,8 @@ fn buffer_load_dwordxn(
         inst.format,
         Format::Vdata4VaddrSvSoffsIdxen
             | Format::Vdata4Vaddr2SvSoffsOffenIdxen
+            | Format::Vdata3VaddrSvSoffsIdxen
+            | Format::Vdata3Vaddr2SvSoffsOffenIdxen
             | Format::Vdata2VaddrSvSoffsIdxen
             | Format::Vdata2Vaddr2SvSoffsOffenIdxen
     );
@@ -342,6 +366,8 @@ fn buffer_load_dwordxn(
         inst.format,
         Format::Vdata4Vaddr2SvSoffsOffenIdxen
             | Format::Vdata4VaddrSvSoffsOffen
+            | Format::Vdata3Vaddr2SvSoffsOffenIdxen
+            | Format::Vdata3VaddrSvSoffsOffen
             | Format::Vdata2Vaddr2SvSoffsOffenIdxen
             | Format::Vdata2VaddrSvSoffsOffen
     );
@@ -2987,7 +3013,11 @@ fn mubuf_flexible(
             MubufFlexOp::StoreDword | MubufFlexOp::StoreFormatX | MubufFlexOp::StoreFormatXyzw
         );
         if !is_store {
-            let n: i32 = if op == MubufFlexOp::StoreFormatXyzw { 4 } else { 1 };
+            let n: i32 = if op == MubufFlexOp::StoreFormatXyzw {
+                4
+            } else {
+                1
+            };
             let i = format!("{index}");
             let mut text = String::new();
             for c in 0..n {
@@ -3485,19 +3515,57 @@ fn recompile_ds_read2_b32(
     _param: &Params,
     _scc_check: SccCheck,
 ) -> Result<bool, ShaderRecompileError> {
-    const FUNC: &str = "Recompile_DsRead2B32_Vdst2Vsrc0Vsrc1Vsrc2";
-    let inst = inst_at(code, index, FUNC)?;
+    ds_read_2dw(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_DsRead2B32_Vdst2Vsrc0Vsrc1Vsrc2",
+    )
+}
+
+/// Beyond Kyty (`ds_read_b64` is `KYTY_NI` upstream): two CONSECUTIVE LDS
+/// dwords at one byte offset — the parser materialises the second offset
+/// literal as `offset + 4`, so this is exactly the [`recompile_ds_read2_b32`]
+/// body. Measured on ASTRO.BOT scene compute (raw 0xd9d80000).
+fn recompile_ds_read_b64(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    ds_read_2dw(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_DsReadB64_Vdst2Vsrc0Vsrc1Vsrc2",
+    )
+}
+
+/// Shared body of the two-dword LDS reads (`ds_read2_b32` / `ds_read_b64`):
+/// `vdst = lds[(addr + src1) >> 2]`, `vdst+1 = lds[(addr + src2) >> 2]`.
+fn ds_read_2dw(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    func: &'static str,
+) -> Result<bool, ShaderRecompileError> {
+    let inst = inst_at(code, index, func)?;
 
     if !operand_is_variable(inst.dst) || !operand_is_variable(inst.src[0]) {
-        return Err(not_supported(FUNC, "dst/addr are not variables"));
+        return Err(not_supported(func, "dst/addr are not variables"));
     }
     if !operand_is_constant(inst.src[1]) || !operand_is_constant(inst.src[2]) {
-        return Err(not_supported(FUNC, "offsets are not constants"));
+        return Err(not_supported(func, "offsets are not constants"));
     }
 
     let addr = operand_variable_to_str(inst.src[0]);
     if addr.type_ != SpirvType::Float {
-        return Err(not_supported(FUNC, "unexpected addr operand type"));
+        return Err(not_supported(func, "unexpected addr operand type"));
     }
     let clamp = spirv.get_constant_uint(spirv.lds_size_dw() - 1);
 
@@ -3505,7 +3573,7 @@ fn recompile_ds_read2_b32(
     for k in 0..2 {
         let dst_value = operand_variable_to_str_shift(inst.dst, k);
         if dst_value.type_ != SpirvType::Float {
-            return Err(not_supported(FUNC, "unexpected dst operand type"));
+            return Err(not_supported(func, "unexpected dst operand type"));
         }
         let offset = spirv.get_constant(inst.src[1 + k as usize]);
         let i = format!("{index}_{k}");
@@ -4252,6 +4320,69 @@ fn image_sample_lz_single_channel(
                 .replace("<src1_value0>", &src1_value0.value)
                 .replace("<src2_value0>", &src2_value0.value)
                 .replace("<dst_value0>", &dst_value0.value);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Beyond-Kyty: `image_sample_lz` with `dmask == 0x3` (.xy, explicit LOD 0)
+/// — measured on ASTRO.BOT scene compute (58 dispatches/run). Same lowering
+/// as [`recompile_image_sample_lz_dmask7`], storing the first two channels.
+fn recompile_image_sample_lz_dmask3(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSampleLz_Vdata2Vaddr3StSsDmask3";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
+            let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+            let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+            let src2_value0 = operand_variable_to_str_shift(inst.src[2], 0);
+
+            if dst_value0.type_ != SpirvType::Float
+                || src1_value0.type_ != SpirvType::Uint
+                || src2_value0.type_ != SpirvType::Uint
+            {
+                return Err(not_supported(FUNC, "unexpected operand types"));
+            }
+
+            const TEXT: &str = r#"
+         %t24_<index> = OpLoad %uint %<src1_value0>
+         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageS %textures2D_S %t24_<index>
+         %t27_<index> = OpLoad %ImageS %t26_<index>
+         %t33_<index> = OpLoad %uint %<src2_value0>
+         %t35_<index> = OpAccessChain %_ptr_UniformConstant_Sampler %samplers %t33_<index>
+         %t36_<index> = OpLoad %Sampler %t35_<index>
+         %t38_<index> = OpSampledImage %SampledImage %t27_<index> %t36_<index>
+
+<coord>
+         %t43_<index> = OpImageSampleExplicitLod %v4float %t38_<index> %t42_<index> Lod %float_0_000000
+               OpStore %temp_v4float %t43_<index>
+         %t46_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_0
+         %t47_<index> = OpLoad %float %t46_<index>
+               OpStore %<dst_value0> %t47_<index>
+         %t50_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_1
+         %t51_<index> = OpLoad %float %t50_<index>
+               OpStore %<dst_value1> %t51_<index>
+"#;
+            let coord = sample_coord_snippet(bind_info, inst.src[0], FUNC)?;
+            *dst_source += &TEXT
+                .replace("<coord>", &coord)
+                .replace("<index>", &format!("{index}"))
+                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<src2_value0>", &src2_value0.value)
+                .replace("<dst_value0>", &dst_value0.value)
+                .replace("<dst_value1>", &dst_value1.value);
 
             return Ok(true);
         }
@@ -7225,6 +7356,11 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_buffer_load_dwordx2,         T::BufferLoadDwordX2, F::Vdata2Vaddr2SvSoffsOffenIdxen, p1("")),
     f(recompile_buffer_load_dwordx2,         T::BufferLoadDwordX2, F::Vdata2SvSoffs, p1("")),
     f(recompile_buffer_load_dwordx2,         T::BufferLoadDwordX2, F::Vdata2VaddrSvSoffsOffen, p1("")),
+
+    f(recompile_buffer_load_dwordx3,         T::BufferLoadDwordX3, F::Vdata3VaddrSvSoffsIdxen, p1("")),
+    f(recompile_buffer_load_dwordx3,         T::BufferLoadDwordX3, F::Vdata3Vaddr2SvSoffsOffenIdxen, p1("")),
+    f(recompile_buffer_load_dwordx3,         T::BufferLoadDwordX3, F::Vdata3SvSoffs, p1("")),
+    f(recompile_buffer_load_dwordx3,         T::BufferLoadDwordX3, F::Vdata3VaddrSvSoffsOffen, p1("")),
     f(recompile_buffer_load_format_x_vdata1, T::BufferLoadFormatX, F::Vdata1VaddrSvSoffsIdxen, p1("")),
     f(recompile_buffer_store_dword_vdata1, T::BufferStoreDword, F::Vdata1VaddrSvSoffsIdxen, p1("")),
     // Wired from the staged set for ASTRO.BOT's formatted stores (the parse
@@ -7273,6 +7409,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_ds_write_b32, T::DsWriteB32, F::Vsrc0Vsrc1Vsrc2,    p1("")),
     f(recompile_ds_read_b32,  T::DsReadB32,  F::SVdstSVsrc0SVsrc1,  p1("")),
     f(recompile_ds_read2_b32, T::DsRead2B32, F::Vdst2Vsrc0Vsrc1Vsrc2, p1("")),
+    f(recompile_ds_read_b64,  T::DsReadB64,  F::Vdst2Vsrc0Vsrc1Vsrc2, p1("")),
     f(recompile_ds_write_b96, T::DsWriteB96, F::Vsrc0Vsrc13Vsrc2,   p1("")),
     f(recompile_ds_write_b128, T::DsWriteB128, F::Vsrc0Vsrc14Vsrc2, p1("")),
     f(recompile_s_barrier,    T::SBarrier,   F::Empty,              p1("")),
@@ -7319,6 +7456,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_image_sample_c_lz,       T::ImageSampleCLz, F::Vdata4Vaddr3StSsDmaskF, p1("")),
     f(recompile_image_sample_lz_dmask1,  T::ImageSampleLz,  F::Vdata1Vaddr3StSsDmask1, p1("")),
     f(recompile_image_sample_lz_dmask2,  T::ImageSampleLz,  F::Vdata1Vaddr3StSsDmask2, p1("")),
+    f(recompile_image_sample_lz_dmask3,  T::ImageSampleLz,  F::Vdata2Vaddr3StSsDmask3, p1("")),
     f(recompile_image_sample_lz_dmask7,  T::ImageSampleLz,  F::Vdata3Vaddr3StSsDmask7, p1("")),
     f(recompile_image_sample_lz_dmask_f, T::ImageSampleLz,  F::Vdata4Vaddr3StSsDmaskF, p1("")),
     f(recompile_image_sample_lzo_dmask7, T::ImageSampleLzO, F::Vdata3Vaddr4StSsDmask7, p1("")),
@@ -7861,7 +7999,7 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            291,
+            297,
             "204 Kyty rows plus SSubU32, SNop, the RDNA2-only rows \
              (VLshlAddU32, VCmpxLtU32, VAddNcU32, VSubNcU32, VSubrevNcU32, VCvtI32F32, \
              VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad dmask1/3/7 \
@@ -7876,12 +8014,14 @@ mod tests {
              and the four cubemap helpers VCubeId/Sc/Tc/MaF32, plus SNotB64, SBrevB32 and \
              VCmpxEqF32, the four BufferLoadDwordX2 rows, ImageStore dmask3, \
              VCmpxGeF32/VCmpxNleF32, the LDS family DsWriteB32/DsReadB32/\
-             DsRead2B32/DsWriteB96/SBarrier, and the round-4 batch: the four \
-             BufferStoreDwordX4 rows, DsWriteB128, and ImageGather4Lz dmask1"
+             DsRead2B32/DsWriteB96/SBarrier, the round-4 batch: the four \
+             BufferStoreDwordX4 rows, DsWriteB128, and ImageGather4Lz dmask1, \
+             and the convergence batch: the four BufferLoadDwordX3 rows, \
+             DsReadB64, and ImageSampleLz dmask3"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 282,
+            implemented, 288,
             "C1 implemented subset plus title-driven ports (incl. the S_XXX_I32 \
              trio, VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad \
              dmask1/3/7 + ImageSampleLz dmask1/2/F rows, ImageStore dmask1, the \
@@ -7894,8 +8034,10 @@ mod tests {
               cubemap-coordinate helpers, the four BufferLoadDwordX2 rows, ImageStore \
               dmask3, VCmpxGeF32/VCmpxNleF32, the LDS family DsWriteB32/DsReadB32/\
               DsRead2B32/DsWriteB96/SBarrier, \
-              the mbcnt pair wired from the staged set, and the round-4 batch: \
-              four BufferStoreDwordX4 rows, DsWriteB128, ImageGather4Lz dmask1)"
+              the mbcnt pair wired from the staged set, the round-4 batch: \
+              four BufferStoreDwordX4 rows, DsWriteB128, ImageGather4Lz dmask1, \
+              and the convergence batch: four BufferLoadDwordX3 rows, DsReadB64, \
+              ImageSampleLz dmask3)"
         );
         assert_eq!(
             ni, 9,
@@ -8423,6 +8565,89 @@ mod tests {
         );
         let words = spirv_run(&source).expect("assemble 3D volume sample");
         naga_parse_and_validate(&words, "3D volume sample");
+    }
+
+    /// A 2DArray-bound CS emits `OpTypeImage %float 2D 0 1 0 1` (arrayed) and
+    /// samples with a 3-component (u, v, layer) coordinate — measured on
+    /// ASTRO.BOT's 1536x1536x3 array (type 13 T#, format 7, tile 24; 57
+    /// dispatches/run). Uses the new `image_sample_lz` dmask 0x3 body, so
+    /// this also covers the two-channel LOD-zero sample (58 dispatches/run).
+    #[test]
+    fn array_texture_emits_arrayed_2d_image_and_vec3_coords() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        let sample = ShaderInstruction {
+            type_: T::ImageSampleLz,
+            format: F::Vdata2Vaddr3StSsDmask3,
+            src_num: 3,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Vgpr,
+                register_id: 2,
+                size: 2,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Vgpr,
+                    register_id: 6,
+                    size: 3,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 0,
+                    size: 8,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 8,
+                    size: 4,
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            code.get_instructions_mut().push(sample.clone());
+        }
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            ..Default::default()
+        });
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        input_info.bind.textures2d.desc[0].texture.fields[3] |= 13 << 28; // 2DArray
+        input_info.bind.textures2d.binding_sampled_index = 0;
+        input_info.bind.textures2d.binding_storage_index = 1;
+        input_info.bind.samplers.samplers_num = 1;
+        input_info.bind.samplers.start_register[0] = 8;
+        input_info.bind.samplers.binding_index = 2;
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile 2DArray sample");
+        assert!(
+            source.contains("OpTypeImage %float 2D 0 1 0 1 Unknown"),
+            "the arrayed 2D image type:\n{source}"
+        );
+        assert!(
+            source.contains("OpCompositeConstruct %v3float"),
+            "3-component (u, v, layer) coordinate:\n{source}"
+        );
+        // The dmask3 body stores exactly channels 0 and 1.
+        assert!(source.contains("%uint_0\n"), "{source}");
+        assert!(
+            !source.contains("%temp_v4float %uint_2"),
+            "a dmask3 sample must stop at two channels:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble 2DArray sample");
+        naga_parse_and_validate(&words, "2DArray sample");
     }
 
     /// A shader mixing 2D and 3D sampled textures has no single array type —
@@ -10198,6 +10423,46 @@ mod tests {
     }
 
     #[test]
+    fn astro_buffer_load_dwordx3_loads_three_consecutive_dwords() {
+        // Measured raw 0xE03C2074: buffer_load_dwordx3 with idxen and an
+        // immediate offset (116 dispatches/run failed on this opcode).
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xE03C_2074, 0x8001_0400, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse buffer_load_dwordx3");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::BufferLoadDwordX3);
+        assert_eq!(inst.format, F::Vdata3VaddrSvSoffsIdxen);
+        assert_eq!(inst.dst.size, 3);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile buffer_load_dwordx3");
+        for k in 0..3 {
+            assert!(
+                source.contains(&format!(
+                    "%t110_0_{k} = OpFunctionCall %void %buffer_load_float1"
+                )),
+                "dword {k}:\n{source}"
+            );
+        }
+        assert!(
+            !source.contains("%t110_0_3"),
+            "an x3 load must stop at three dwords:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble buffer_load_dwordx3");
+        naga_parse_and_validate(&words, "buffer_load_dwordx3");
+    }
+
+    #[test]
     fn astro_image_store_dmask3_writes_two_channels() {
         // MIMG 0x08 with dmask 0x3 — the last remaining image_store form
         // (58 dispatches / 5 min).
@@ -10410,6 +10675,45 @@ mod tests {
         }
         let words = spirv_run(&source).expect("assemble ds_write_b96 + ds_read2_b32");
         naga_parse_and_validate(&words, "ds_write_b96 + ds_read2_b32");
+    }
+
+    #[test]
+    fn astro_ds_read_b64_reads_two_consecutive_lds_dwords() {
+        // ds_read_b64 v[2:3], v0 offset:16 (raw 0xd9d80000 family, measured
+        // on ASTRO.BOT scene compute — 58 dispatches/run). One byte offset,
+        // two consecutive dwords: the parser materialises offset and
+        // offset + 4 so the read2 body serves it.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0x7E00_0280, // v_mov_b32 v0, 0 (addr)
+                0xD9D8_0010, // ds_read_b64 v[2:3], v0, offset 16
+                0x0200_0000,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse ds_read_b64");
+        let inst = &code.get_instructions()[1];
+        assert_eq!(inst.type_, T::DsReadB64);
+        assert_eq!(inst.src[1].constant.u, 16);
+        assert_eq!(inst.src[2].constant.u, 20);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile ds_read_b64");
+        for k in 0..2 {
+            assert!(
+                source.contains(&format!("OpStore %v{} %ldsr2_s_1_{k}", 2 + k)),
+                "result dword {k}:\n{source}"
+            );
+        }
+        let words = spirv_run(&source).expect("assemble ds_read_b64");
+        naga_parse_and_validate(&words, "ds_read_b64");
     }
 
     #[test]

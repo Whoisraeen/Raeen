@@ -331,16 +331,38 @@ fn clear_direct(
     Ok(())
 }
 
+/// A recovered Extended User Data buffer plus the user-data slot index where
+/// the register file logically hands over to it.
+///
+/// `base_dw` is the register holding the EUD pointer pair: the driver stops
+/// preloading user data into real SGPRs at that slot, so a descriptor
+/// declared at register `r >= base_dw` (but below `SGPRS_MAX`) lives
+/// EUD-resident at `data[r - base_dw]`. Measured on ASTRO.BOT compute
+/// (declared=14, captured=14): the pointer pair is (s12, s13) — see
+/// `read_extended_user_data` strategy 3 — and the T# the usage table declares
+/// at start_register=12 is the EUD's first descriptor (`data[0..8]`; the
+/// smallest measured EUD is exactly 8 dwords, which only an offset of 0
+/// fits). Sharps declared at `r >= SGPRS_MAX` keep the separately measured
+/// `-SGPRS_MAX` rebase (see `read_sharp_fields`).
+#[derive(Debug, Clone, Copy)]
+pub struct EudView<'a> {
+    /// The EUD contents, read from guest memory.
+    pub data: &'a [u32],
+    /// User-data slot index at which the EUD logically begins (the register
+    /// holding the pointer pair).
+    pub base_dw: i32,
+}
+
 /// Shared body of `ShaderGetStorageBuffer`/`ShaderGetTextureBuffer`/
-/// `ShaderGetSampler` (Shader.cpp L1141/L1179/L1233): validate
-/// `start_index` against the extended (EUD) mode, require
-/// `Vsharp`/`Region`-typed user SGPRs for the direct case, mark them
-/// consumed, and copy the descriptor dwords.
+/// `ShaderGetSampler` (Shader.cpp L1141/L1179/L1233): decide where the
+/// descriptor lives (register file vs EUD), require `Vsharp`/`Region`-typed
+/// user SGPRs for the direct case, mark consumed registers, and copy the
+/// descriptor dwords.
 fn read_sharp_fields(
     direct_sgprs: &mut [bool; UserSgprInfo::SGPRS_MAX],
     start_index: i32,
     user_sgpr: &UserSgprInfo,
-    extended_buffer: Option<&[u32]>,
+    extended_buffer: Option<EudView<'_>>,
     out: &mut [u32],
 ) -> Result<(), ShaderAnalysisError> {
     let extended = extended_buffer.is_some();
@@ -360,53 +382,115 @@ fn read_sharp_fields(
     }
     let start = usize::try_from(start_index).map_err(|_| trunc("negative sharp start register"))?;
 
-    // Residence is decided by the register INDEX, not by whether an EUD
-    // exists: a shader with an extended buffer still keeps some sharps
-    // resident in its real user SGPRs. Kyty's legacy walk gets this for free
-    // (usage slots before the 0x1b entry see a null extended_buffer), but
-    // the Gen5 usage2 tables resolve every sharp with the recovered EUD in
-    // hand, so Kyty's "extended && start < file" EXIT refused every
-    // direct-resident sharp of a mixed shader — 346 measured ASTRO.BOT CS
-    // failures. Direct reads stay self-validating through the Vsharp/Region
-    // type check below.
+    // Residence is decided by the register INDEX and by whether the WHOLE
+    // sharp fits inside the typed run of the register file:
+    //
+    // * `start >= SGPRS_MAX`: EUD-resident at `start - SGPRS_MAX` (measured:
+    //   a shader with eud_size_dw=8 places a sharp at offset_dw=32 while its
+    //   other sharps sit direct at s0/s8 — only a `-32` rebase reads ext[0],
+    //   which fits).
+    // * `start < SGPRS_MAX` and every register of the run is typed
+    //   Vsharp/Region: direct-resident (a shader with an EUD still keeps
+    //   some sharps in its real user SGPRs — 346 measured ASTRO.BOT CS
+    //   failures under Kyty's "extended => everything is EUD" EXIT).
+    // * `start < SGPRS_MAX` but the run does NOT fit the typed registers: the
+    //   sharp cannot live in the file. Measured on ASTRO.BOT compute (469
+    //   dispatches/run, all one tuple): a T#-sized sharp declared at
+    //   start_register=12 with captured=14 would need s12..s19, but s14+ were
+    //   never written — and (s12, s13) is the recovered EUD POINTER pair
+    //   (strategy 3, `eud_adjacent_pair_scan_recovers_measured_pointer`). The
+    //   sharp is therefore not AT s12; it is IN the EUD the pair points to,
+    //   at `start - base_dw` (= 0 here — the only offset an 8-dword T# fits
+    //   in the smallest measured 8-dword EUD).
     if start < UserSgprInfo::SGPRS_MAX {
-        for (j, dw) in out.iter_mut().enumerate() {
-            let idx = start + j;
-            let type_ = *user_sgpr
+        let fits_typed_run = (0..out.len()).all(|j| {
+            user_sgpr
                 .type_
-                .get(idx)
-                .ok_or_else(|| trunc("sharp registers beyond SGPRS_MAX"))?;
-            if type_ != UserSgprType::Vsharp && type_ != UserSgprType::Region {
-                // Evidence-rich: this is the residual frontier of the mixed
-                // direct/EUD routing above — the measured values (start
-                // register, captured count, EUD length) are what decide any
-                // alternative rebase interpretation.
+                .get(start + j)
+                .is_some_and(|t| *t == UserSgprType::Vsharp || *t == UserSgprType::Region)
+        });
+        if fits_typed_run {
+            for (j, dw) in out.iter_mut().enumerate() {
+                let idx = start + j;
+                direct_sgprs[idx] = false;
+                *dw = user_sgpr.value[idx];
+            }
+        } else if let Some(ext) = extended_buffer {
+            let base =
+                usize::try_from(ext.base_dw).map_err(|_| trunc("negative EUD base register"))?;
+            if start < base {
                 return Err(ni_owned(format!(
-                    "user sgpr type is not Vsharp/Region ({type_:?} at s{idx}; \
-                     sharp start_register={start_index}, captured={}, eud={})",
+                    "sharp start_register below the EUD base \
+                     (start_register={start_index}, eud_base={base}, captured={}, eud={})",
                     user_sgpr.count,
-                    extended_buffer.map_or(0, <[u32]>::len),
+                    ext.data.len(),
                 )));
             }
-            direct_sgprs[idx] = false;
-            *dw = user_sgpr.value[idx];
+            let offset = start - base;
+            for (j, dw) in out.iter_mut().enumerate() {
+                *dw = *ext
+                    .get_dw(offset + j)
+                    .ok_or_else(|| trunc("extended (EUD) buffer too small"))?;
+            }
+            // Consume the run's in-file registers (the pointer pair for the
+            // measured shape) so the direct-SGPR collection does not bind
+            // them a second time.
+            for flag in direct_sgprs
+                .iter_mut()
+                .take((start + out.len()).min(UserSgprInfo::SGPRS_MAX))
+                .skip(start)
+            {
+                *flag = false;
+            }
+            tracing::debug!(
+                start_index,
+                eud_base = base,
+                offset_dw = offset,
+                dwords = out.len(),
+                "sharp resolved EUD-resident (run does not fit the typed register file)"
+            );
+        } else {
+            // Evidence-rich residual frontier: name the first register that
+            // breaks the run, with every measured value a rebase
+            // interpretation needs.
+            let (idx, type_) = (0..out.len())
+                .map(|j| start + j)
+                .map(|idx| {
+                    (
+                        idx,
+                        user_sgpr
+                            .type_
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(UserSgprType::Unknown),
+                    )
+                })
+                .find(|(_, t)| *t != UserSgprType::Vsharp && *t != UserSgprType::Region)
+                .expect("!fits_typed_run implies an offending register");
+            return Err(ni_owned(format!(
+                "user sgpr type is not Vsharp/Region ({type_:?} at s{idx}; \
+                 sharp start_register={start_index}, captured={}, eud=0)",
+                user_sgpr.count,
+            )));
         }
     } else {
         // The EUD is addressed as a continuation of the user-SGPR file, so
         // the rebase is the file SIZE, not a literal 16 (Kyty's 16 was the
-        // PS4 user-SGPR count). Measured on ASTRO.BOT: a shader with
-        // eud_size_dw=8 places a sharp at offset_dw=32 while its other
-        // sharps sit direct at s0/s8 — under a `-16` rebase that reads
-        // ext[16], past the end of an 8-dword EUD; under `-32` it reads
-        // ext[0], the buffer's first descriptor, which fits.
+        // PS4 user-SGPR count). See the residence comment above.
         let ext = extended_buffer.expect("start >= SGPRS_MAX without EUD is refused above");
         for (j, dw) in out.iter_mut().enumerate() {
             *dw = *ext
-                .get(start - UserSgprInfo::SGPRS_MAX + j)
+                .get_dw(start - UserSgprInfo::SGPRS_MAX + j)
                 .ok_or_else(|| trunc("extended (EUD) buffer too small"))?;
         }
     }
     Ok(())
+}
+
+impl EudView<'_> {
+    fn get_dw(&self, index: usize) -> Option<&u32> {
+        self.data.get(index)
+    }
 }
 
 /// A scalar memory load's source: the user-SGPR **base pointer** register it
@@ -486,7 +570,7 @@ pub fn shader_get_storage_buffer(
     slot: i32,
     usage: ShaderStorageUsage,
     user_sgpr: &UserSgprInfo,
-    extended_buffer: Option<&[u32]>,
+    extended_buffer: Option<EudView<'_>>,
 ) -> Result<(), ShaderAnalysisError> {
     if info.buffers_num < 0 || info.buffers_num as usize >= ShaderStorageResources::BUFFERS_MAX {
         return Err(ni("too many storage buffers"));
@@ -528,7 +612,7 @@ pub fn shader_get_texture_buffer(
     slot: i32,
     usage: ShaderTextureUsage,
     user_sgpr: &UserSgprInfo,
-    extended_buffer: Option<&[u32]>,
+    extended_buffer: Option<EudView<'_>>,
 ) -> Result<(), ShaderAnalysisError> {
     if info.textures_num < 0 || info.textures_num as usize >= ShaderTextureResources::RES_MAX {
         return Err(ni("too many textures"));
@@ -572,7 +656,7 @@ pub fn shader_get_sampler(
     start_index: i32,
     slot: i32,
     user_sgpr: &UserSgprInfo,
-    extended_buffer: Option<&[u32]>,
+    extended_buffer: Option<EudView<'_>>,
 ) -> Result<(), ShaderAnalysisError> {
     if info.samplers_num < 0 || info.samplers_num as usize >= ShaderSamplerResources::RES_MAX {
         return Err(ni("too many samplers"));
@@ -604,7 +688,7 @@ pub fn shader_get_gds_pointer(
     start_index: i32,
     slot: i32,
     user_sgpr: &UserSgprInfo,
-    extended_buffer: Option<&[u32]>,
+    extended_buffer: Option<EudView<'_>>,
 ) -> Result<(), ShaderAnalysisError> {
     if info.pointers_num < 0 || info.pointers_num as usize >= ShaderGdsResources::POINTERS_MAX {
         return Err(ni("too many gds pointers"));
@@ -626,7 +710,7 @@ pub fn shader_get_gds_pointer(
 
     info.pointers[index].field = match extended_buffer {
         Some(ext) => *ext
-            .get(start - 16)
+            .get_dw(start - 16)
             .ok_or_else(|| trunc("extended (EUD) buffer too small"))?,
         None => {
             let type_ = *user_sgpr
@@ -647,13 +731,16 @@ pub fn shader_get_gds_pointer(
 
 /// Gate for read-only sampled-texture T# types. Accepted from measurement:
 /// 9 = Texture2D, 11 = Cube (Minecraft's 1024x1024x6 skybox), 10 = 3D volume
-/// (ASTRO.BOT's 240x135x64 froxel/LUT volumes, format 71). Anything else is a
-/// named, evidence-rich refusal carrying every field the next arm needs.
+/// (ASTRO.BOT's 240x135x64 froxel/LUT volumes, format 71), 13 = 2DArray
+/// (ASTRO.BOT's 1536x1536x3 format-7 tile-24 array — declared arrayed via
+/// `SampledDim::TwoArray`, sampled with a (u, v, layer) coordinate). Anything
+/// else is a named, evidence-rich refusal carrying every field the next arm
+/// needs.
 fn check_read_only_texture_type(
     t: &super::resources::ShaderTextureResource,
 ) -> Result<(), ShaderAnalysisError> {
     let ty = t.type_();
-    if ty == 9 || ty == 10 || ty == 11 {
+    if ty == 9 || ty == 10 || ty == 11 || ty == 13 {
         return Ok(());
     }
     Err(ni_owned(format!(
@@ -783,7 +870,15 @@ pub fn shader_parse_usage(
     info.gds_pointers = 0;
     info.direct_sgprs = 0;
 
-    let mut extended_buffer: Option<Cow<'_, [u32]>> = None;
+    // (EUD contents, pointer-pair register) — the pair register is the slot
+    // index where the file hands over to the EUD (see `EudView::base_dw`).
+    let mut extended_buffer: Option<(Cow<'_, [u32]>, i32)> = None;
+    fn ext_view<'a>(e: &'a Option<(Cow<'a, [u32]>, i32)>) -> Option<EudView<'a>> {
+        e.as_ref().map(|(data, base_dw)| EudView {
+            data: data.as_ref(),
+            base_dw: *base_dw,
+        })
+    }
 
     let mut direct_sgprs = [false; UserSgprInfo::SGPRS_MAX];
     for (i, flag) in direct_sgprs.iter_mut().enumerate() {
@@ -806,7 +901,7 @@ pub fn shader_parse_usage(
                         slot,
                         ShaderStorageUsage::ReadOnly,
                         user_sgpr,
-                        extended_buffer.as_deref(),
+                        ext_view(&extended_buffer),
                     )?;
                     info.storage_buffers_readonly += 1;
                 } else {
@@ -817,7 +912,7 @@ pub fn shader_parse_usage(
                         slot,
                         ShaderTextureUsage::ReadOnly,
                         user_sgpr,
-                        extended_buffer.as_deref(),
+                        ext_view(&extended_buffer),
                     )?;
                     info.textures2d_readonly += 1;
                     let last = (bind.textures2d.textures_num - 1) as usize;
@@ -835,7 +930,7 @@ pub fn shader_parse_usage(
                     start,
                     slot,
                     user_sgpr,
-                    extended_buffer.as_deref(),
+                    ext_view(&extended_buffer),
                 )?;
                 info.samplers += 1;
             }
@@ -851,7 +946,7 @@ pub fn shader_parse_usage(
                     slot,
                     ShaderStorageUsage::Constant,
                     user_sgpr,
-                    extended_buffer.as_deref(),
+                    ext_view(&extended_buffer),
                 )?;
                 info.storage_buffers_constant += 1;
             }
@@ -868,7 +963,7 @@ pub fn shader_parse_usage(
                         slot,
                         ShaderStorageUsage::ReadWrite,
                         user_sgpr,
-                        extended_buffer.as_deref(),
+                        ext_view(&extended_buffer),
                     )?;
                     info.storage_buffers_readwrite += 1;
                 } else {
@@ -879,7 +974,7 @@ pub fn shader_parse_usage(
                         slot,
                         ShaderTextureUsage::ReadWrite,
                         user_sgpr,
-                        extended_buffer.as_deref(),
+                        ext_view(&extended_buffer),
                     )?;
                     info.textures2d_readwrite += 1;
                     let last = (bind.textures2d.textures_num - 1) as usize;
@@ -915,7 +1010,7 @@ pub fn shader_parse_usage(
                     start,
                     slot,
                     user_sgpr,
-                    extended_buffer.as_deref(),
+                    ext_view(&extended_buffer),
                 )?;
                 info.gds_pointers += 1;
             }
@@ -965,7 +1060,7 @@ pub fn shader_parse_usage(
                 bind.extended.data.fields[0] = user_sgpr.value[usage.start_register as usize];
                 bind.extended.data.fields[1] = user_sgpr.value[usage.start_register as usize + 1];
                 let base = bind.extended.data.base();
-                extended_buffer = Some(mem.dwords_at(base).ok_or_else(|| bad_addr(base))?);
+                extended_buffer = Some((mem.dwords_at(base).ok_or_else(|| bad_addr(base))?, start));
                 info.extended_buffer = true;
                 direct_sgprs[usage.start_register as usize] = false;
                 direct_sgprs[usage.start_register as usize + 1] = false;
@@ -1060,7 +1155,7 @@ pub fn shader_parse_usage2(
     bind: &mut ShaderBindResources,
     user_sgpr: &UserSgprInfo,
     user_sgpr_num: i32,
-    eud: Option<&[u32]>,
+    eud: Option<EudView<'_>>,
 ) -> Result<(), ShaderAnalysisError> {
     // Same reset list as ShaderParseUsage (vertex_attrib not reset upstream).
     info.fetch = false;
@@ -1131,9 +1226,9 @@ pub fn shader_parse_usage2(
     }
 
     // Kyty leaves this None (no EUD support); increment 3 supplies the buffer
-    // the caller read from guest memory, which the extended branch of
-    // `read_sharp_fields` already knows how to index.
-    let extended_buffer: Option<&[u32]> = eud;
+    // the caller read from guest memory, which the extended branches of
+    // `read_sharp_fields` already know how to index.
+    let extended_buffer: Option<EudView<'_>> = eud;
 
     let mut direct_sgprs = [false; UserSgprInfo::SGPRS_MAX];
     for (i, flag) in direct_sgprs.iter_mut().enumerate() {
@@ -1805,6 +1900,10 @@ pub fn shader_parse_attrib(
 /// when there is no EUD, the pair is out of range, the pointer is null, or
 /// guest memory does not back it; every one of those keeps the caller on the
 /// pre-existing "no extended buffer" path rather than inventing descriptors.
+///
+/// The second element of the returned pair is the register index holding the
+/// EUD pointer pair — the slot where the register file logically hands over
+/// to the EUD (see [`EudView::base_dw`]).
 fn read_extended_user_data(
     user_data: &ShaderUserData,
     user_sgpr: &UserSgprInfo,
@@ -1812,7 +1911,7 @@ fn read_extended_user_data(
     mem: &impl ShaderMemory,
     shader_addr: u64,
     next_gen: bool,
-) -> Option<Vec<u32>> {
+) -> Option<(Vec<u32>, i32)> {
     let size = user_data.eud_size_dw as usize;
     if size == 0 {
         return None;
@@ -1832,7 +1931,7 @@ fn read_extended_user_data(
     if let Ok(base) = usize::try_from(user_sgpr_num) {
         if base + 1 < UserSgprInfo::SGPRS_MAX {
             if let Some(buf) = read_at(user_sgpr_pair(user_sgpr, user_sgpr_num)) {
-                return Some(buf);
+                return Some((buf, user_sgpr_num));
             }
         }
     }
@@ -1890,12 +1989,11 @@ fn read_extended_user_data(
             detail.join(" ")
         );
     }
-    if let Some(buf) = loads
-        .into_iter()
-        .filter_map(|load| scalar_load_target_address(&load, user_sgpr))
-        .find_map(read_at)
-    {
-        return Some(buf);
+    if let Some((buf, base)) = loads.into_iter().find_map(|load| {
+        let addr = scalar_load_target_address(&load, user_sgpr)?;
+        Some((read_at(addr)?, load.base_register))
+    }) {
+        return Some((buf, base));
     }
 
     // Strategy 3 — scan EVERY adjacent SGPR pair (sN lo, sN+1 hi) for a
@@ -1921,7 +2019,7 @@ fn read_extended_user_data(
                 pointer = format_args!("{pair:#x}"),
                 "EUD recovered by adjacent-pair scan (strategy 3)"
             );
-            return Some(buf);
+            return Some((buf, i as i32));
         }
     }
     None
@@ -2018,7 +2116,11 @@ pub fn shader_get_input_info_vs(
                 shader_addr,
                 next_gen,
             )
-            .as_deref(),
+            .as_ref()
+            .map(|(data, base_dw)| EudView {
+                data,
+                base_dw: *base_dw,
+            }),
         )?;
     } else {
         if gs_instead_of_vs {
@@ -2211,7 +2313,11 @@ pub fn shader_get_input_info_ps(
                 regs.ps_regs.data_addr,
                 next_gen,
             )
-            .as_deref(),
+            .as_ref()
+            .map(|(data, base_dw)| EudView {
+                data,
+                base_dw: *base_dw,
+            }),
         )?;
     } else {
         let code = mem
@@ -2300,7 +2406,11 @@ pub fn shader_get_input_info_cs(
                 regs.cs_regs.data_addr,
                 next_gen,
             )
-            .as_deref(),
+            .as_ref()
+            .map(|(data, base_dw)| EudView {
+                data,
+                base_dw: *base_dw,
+            }),
         )?;
     } else {
         let code = mem
@@ -3831,10 +3941,11 @@ mod tests {
 
     #[test]
     fn read_only_texture_type_gate_accepts_3d_volumes() {
-        // Item measured as 173 ASTRO.BOT CS skips: type 10 = 3D volume
-        // (240x135x64 froxel/LUT, format 71). The gate now admits 2D (9),
-        // 3D (10) and Cube (11); anything else stays a named, evidence-rich
-        // refusal (here 13 = 2DArray).
+        // Measured ASTRO.BOT CS skips: type 10 = 3D volume (240x135x64
+        // froxel/LUT, format 71) and type 13 = 2DArray (1536x1536x3 format-7
+        // tile-24 — 57 dispatches/run). The gate now admits 2D (9), 3D (10),
+        // Cube (11) and 2DArray (13); anything else stays a named,
+        // evidence-rich refusal (here 12 = 1DArray).
         let mut t = super::super::resources::ShaderTextureResource::default();
         t.fields[3] = 10 << 28;
         check_read_only_texture_type(&t).expect("3D volume accepted");
@@ -3843,9 +3954,11 @@ mod tests {
         t.fields[3] = 11 << 28;
         check_read_only_texture_type(&t).expect("Cube accepted");
         t.fields[3] = 13 << 28;
+        check_read_only_texture_type(&t).expect("2DArray accepted");
+        t.fields[3] = 12 << 28;
         let err = check_read_only_texture_type(&t).unwrap_err();
         assert!(
-            format!("{err:?}").contains("read-only texture type 13"),
+            format!("{err:?}").contains("read-only texture type 12"),
             "{err:?}"
         );
     }
@@ -4157,9 +4270,13 @@ mod tests {
             user_sgpr.set(i as u32, dw, UserSgprType::Vsharp);
         }
         let eud = [0x9999_0000u32, 0x9999_0001, 0x9999_0002, 0x9999_0003];
+        let eud_at_file_end = EudView {
+            data: &eud,
+            base_dw: UserSgprInfo::SGPRS_MAX as i32,
+        };
         let mut direct = [true; UserSgprInfo::SGPRS_MAX];
         let mut out = [0u32; 4];
-        read_sharp_fields(&mut direct, 0, &user_sgpr, Some(&eud), &mut out)
+        read_sharp_fields(&mut direct, 0, &user_sgpr, Some(eud_at_file_end), &mut out)
             .expect("a direct-resident sharp must not be refused because an EUD exists");
         assert_eq!(
             out,
@@ -4174,24 +4291,108 @@ mod tests {
             &mut direct2,
             UserSgprInfo::SGPRS_MAX as i32,
             &user_sgpr,
-            Some(&eud),
+            Some(eud_at_file_end),
             &mut out2,
         )
         .expect("EUD sharp at the rebased origin");
         assert_eq!(out2, eud);
 
-        // The residual frontier is instrumented: an unwritten register with
-        // an EUD present names the start register and the measured counts.
+        // The residual frontier is instrumented: an unwritten register BELOW
+        // the EUD base names the start register and the measured values.
         let mut direct3 = [true; UserSgprInfo::SGPRS_MAX];
         let mut out3 = [0u32; 4];
-        match read_sharp_fields(&mut direct3, 16, &user_sgpr, Some(&eud), &mut out3) {
+        match read_sharp_fields(
+            &mut direct3,
+            16,
+            &user_sgpr,
+            Some(eud_at_file_end),
+            &mut out3,
+        ) {
             Err(ShaderAnalysisError::NotImplementedOwned { what }) => {
                 assert!(what.contains("start_register=16"), "{what}");
+                assert!(what.contains("eud_base=32"), "{what}");
                 assert!(what.contains("captured=4"), "{what}");
                 assert!(what.contains("eud=4"), "{what}");
             }
-            other => panic!("expected instrumented type refusal, got {other:?}"),
+            other => panic!("expected instrumented below-base refusal, got {other:?}"),
         }
+    }
+
+    /// The measured ASTRO.BOT residence tuple (469 dispatches/run, all
+    /// identical): a T#-sized sharp declared at start_register=12 with only
+    /// 14 captured user SGPRs cannot live in the file (s12..s19 needed, s14+
+    /// unwritten) — and (s12, s13) is the recovered EUD pointer pair, so the
+    /// sharp is the EUD's first descriptor (`data[0..8]`; the smallest
+    /// measured EUD is exactly 8 dwords, which only offset 0 fits).
+    #[test]
+    fn sharp_spilling_past_the_typed_run_reads_whole_sharp_from_eud() {
+        let mut user_sgpr = UserSgprInfo::default();
+        for i in 0..12 {
+            user_sgpr.set(i, 0x1111_0000 + i, UserSgprType::Unknown);
+        }
+        // The pointer pair itself is typed by the PM4 'hu' markers.
+        user_sgpr.set(12, 0x0050_6730, UserSgprType::Vsharp);
+        user_sgpr.set(13, 0x4, UserSgprType::Vsharp);
+        let eud: [u32; 8] = [
+            0xE000_0001,
+            0xE000_0002,
+            0xE000_0003,
+            0xE000_0004,
+            0xE000_0005,
+            0xE000_0006,
+            0xE000_0007,
+            0xE000_0008,
+        ];
+        let view = EudView {
+            data: &eud,
+            base_dw: 12,
+        };
+
+        let mut direct = [true; UserSgprInfo::SGPRS_MAX];
+        let mut out = [0u32; 8];
+        read_sharp_fields(&mut direct, 12, &user_sgpr, Some(view), &mut out)
+            .expect("a sharp that does not fit the typed run must resolve EUD-resident");
+        assert_eq!(out, eud, "the whole T# comes from the EUD at offset 0");
+        assert!(
+            !direct[12] && !direct[13],
+            "the in-file pointer pair is consumed"
+        );
+        assert!(
+            direct[11],
+            "registers before the run stay direct candidates"
+        );
+
+        // A second spilled sharp continues the slot layout: start=16 ->
+        // data[4..8] under the same base.
+        let mut direct2 = [true; UserSgprInfo::SGPRS_MAX];
+        let mut out2 = [0u32; 4];
+        read_sharp_fields(&mut direct2, 16, &user_sgpr, Some(view), &mut out2)
+            .expect("EUD-resident V# at slot base+4");
+        assert_eq!(out2, eud[4..8]);
+
+        // Without an EUD the same shape stays the evidence-rich refusal.
+        let mut direct3 = [true; UserSgprInfo::SGPRS_MAX];
+        let mut out3 = [0u32; 8];
+        match read_sharp_fields(&mut direct3, 12, &user_sgpr, None, &mut out3) {
+            Err(ShaderAnalysisError::NotImplementedOwned { what }) => {
+                assert!(what.contains("not Vsharp/Region"), "{what}");
+                assert!(what.contains("at s14"), "{what}");
+                assert!(what.contains("start_register=12"), "{what}");
+            }
+            other => panic!("expected typed-run refusal, got {other:?}"),
+        }
+
+        // An EUD too small for the sharp is a truncation, not silence.
+        let short = EudView {
+            data: &eud[..4],
+            base_dw: 12,
+        };
+        let mut direct4 = [true; UserSgprInfo::SGPRS_MAX];
+        let mut out4 = [0u32; 8];
+        assert!(matches!(
+            read_sharp_fields(&mut direct4, 12, &user_sgpr, Some(short), &mut out4),
+            Err(ShaderAnalysisError::Truncated { .. })
+        ));
     }
 
     /// Gen5 CS with a sampler: Kyty's "cs: samplers" EXIT is a PS4-era
@@ -4329,11 +4530,16 @@ mod tests {
                 ),
             ],
         };
-        let eud = read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true)
-            .expect("strategy 3 must recover the (s12, s13) pair");
+        let (eud, base_dw) =
+            read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true)
+                .expect("strategy 3 must recover the (s12, s13) pair");
         assert_eq!(
             eud,
             vec![0xAAAA_0001, 0xAAAA_0002, 0xAAAA_0003, 0xAAAA_0004]
+        );
+        assert_eq!(
+            base_dw, 12,
+            "the EUD base slot is the register holding the pointer pair"
         );
     }
 

@@ -31,7 +31,7 @@ pub use crate::hw_regs::{
     UserSgprInfo, UserSgprType, VertexShaderInfo, VsShaderResource2, VsStageRegisters,
 };
 pub use analysis::{
-    ShaderAnalysisError, ShaderBinaryInfo, ShaderMap, ShaderMemory, ShaderParsedUsage,
+    EudView, ShaderAnalysisError, ShaderBinaryInfo, ShaderMap, ShaderMemory, ShaderParsedUsage,
     ShaderUsageInfo, ShaderUsageSlot, get_binary_info, get_usage_slots,
     shader_calc_binding_indices, shader_detect_buffers, shader_get_id_cs, shader_get_id_ps,
     shader_get_id_vs, shader_get_input_info_cs, shader_get_input_info_ps, shader_get_input_info_vs,

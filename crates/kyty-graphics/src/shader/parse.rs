@@ -314,6 +314,16 @@ fn shader_parse_sopk(
     let imm = (b0 & 0xffff) as u16 as i16;
     let sdst = (b0 >> 16) & 0x7f;
 
+    // Beyond Kyty: SOPK opcode 0x17 (23) is `s_version` — RDNA2 ISA: "Do
+    // nothing"; a compiler-emitted code-object version marker carrying the
+    // version in simm16. Measured on ASTRO.BOT scene compute (raw
+    // 0xbbfd0000, 59 dispatches/run). Consumed BEFORE operand parsing: its
+    // sdst field is a fixed encoding constant (0x7d here), not a register,
+    // and would fail `operand_parse`. No instruction is emitted.
+    if opcode == 0x17 {
+        return Ok(1);
+    }
+
     let mut inst = ShaderInstruction {
         pc,
         ..Default::default()
@@ -2810,7 +2820,22 @@ fn shader_parse_mubuf(
             inst.src[1].size = 4;
             inst.dst.size = 4;
         }
-        0x0f => return Err(ni(dst, S, "buffer_load_dwordx3", opcode, pc, b0)),
+        // Beyond Kyty (KYTY_NI upstream): three-dword raw load, measured on
+        // ASTRO.BOT scene compute (raws 0xe03c2074/0xe03c2034, idxen with a
+        // nonzero immediate offset). Same flexible addressing quartet as the
+        // Vdata1/2/4 opcodes.
+        0x0f => {
+            inst.type_ = T::BufferLoadDwordX3;
+            inst.format = match (idxen, offen) {
+                (1, 1) => F::Vdata3Vaddr2SvSoffsOffenIdxen,
+                (1, 0) => F::Vdata3VaddrSvSoffsIdxen,
+                (0, 1) => F::Vdata3VaddrSvSoffsOffen,
+                _ => F::Vdata3SvSoffs,
+            };
+            inst.src[0].size = src0_size;
+            inst.src[1].size = 4;
+            inst.dst.size = 3;
+        }
         0x18 => return Err(ni(dst, S, "buffer_store_byte", opcode, pc, b0)),
         0x1a => return Err(ni(dst, S, "buffer_store_short", opcode, pc, b0)),
         0x1c => {
@@ -3078,7 +3103,29 @@ fn shader_parse_ds(
         0x71 => return Err(ni(dst, S, "ds_cmpst_rtn_f64", opcode, pc, b0)),
         0x72 => return Err(ni(dst, S, "ds_min_rtn_f64", opcode, pc, b0)),
         0x73 => return Err(ni(dst, S, "ds_max_rtn_f64", opcode, pc, b0)),
-        0x76 => return Err(ni(dst, S, "ds_read_b64", opcode, pc, b0)),
+        // Beyond Kyty (KYTY_NI upstream): two consecutive LDS dwords at the
+        // single 16-bit BYTE offset (RDNA2 ISA `DS_READ_B64`) — measured on
+        // ASTRO.BOT scene compute (raw 0xd9d80000). Reuses the `DsRead2B32`
+        // operand shape with the second offset literal at `offset + 4`, so
+        // the existing two-dword recompile body covers it.
+        0x76 => {
+            if gds != 0 {
+                return Err(feature(S, "ds_read_b64 with gds == 1", pc));
+            }
+            if data0 != 0 || data1 != 0 {
+                return Err(feature(S, "ds_read_b64 with data operands", pc));
+            }
+            let offset = offset0 | (offset1 << 8);
+            inst.type_ = T::DsReadB64;
+            inst.format = F::Vdst2Vsrc0Vsrc1Vsrc2;
+            inst.dst.size = 2;
+            inst.src[0] = operand_parse(addr + 256)?;
+            inst.src[1].type_ = O::LiteralConstant;
+            inst.src[1].constant.u = offset;
+            inst.src[2].type_ = O::LiteralConstant;
+            inst.src[2].constant.u = offset + 4;
+            inst.src_num = 3;
+        }
         0x77 => return Err(ni(dst, S, "ds_read2_b64", opcode, pc, b0)),
         0x78 => return Err(ni(dst, S, "ds_read2st64_b64", opcode, pc, b0)),
         0x7e => return Err(ni(dst, S, "ds_condxchg32_rtn_b64", opcode, pc, b0)),
@@ -3383,6 +3430,13 @@ fn shader_parse_mimg(
                 0x2 => {
                     inst.format = F::Vdata1Vaddr3StSsDmask2;
                     inst.dst.size = 1;
+                }
+                // Beyond Kyty: two-channel LOD-zero sample (measured on
+                // ASTRO.BOT scene compute, MIMG 0x27 dmask 0x3 — 58
+                // dispatches/run).
+                0x3 => {
+                    inst.format = F::Vdata2Vaddr3StSsDmask3;
+                    inst.dst.size = 2;
                 }
                 0x7 => {
                     inst.format = F::Vdata3Vaddr3StSsDmask7;
@@ -4853,6 +4907,90 @@ mod tests {
         assert_eq!(inst.format, F::Vdata4Vaddr3StSsDmaskF);
         assert_eq!(inst.dst.size, 4);
         assert_eq!(inst.src[2].size, 4, "S# still present on the lz form");
+    }
+
+    #[test]
+    fn astro_image_sample_lz_dmask3_decodes() {
+        // image_sample_lz (opcode 0x27) .xy — measured on ASTRO.BOT scene
+        // compute (58 dispatches/run said "unknown mimg format for opcode:
+        // 0x27, dmask: 0x3").
+        let (code, result) = parse(
+            &[0xF09C_0300, 0x0061_0800, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse image_sample_lz dmask 0x3");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::ImageSampleLz);
+        assert_eq!(inst.format, F::Vdata2Vaddr3StSsDmask3);
+        assert_eq!(inst.dst.size, 2);
+        assert_eq!(inst.src[2].size, 4, "S# still present on the lz form");
+    }
+
+    #[test]
+    fn astro_buffer_load_dwordx3_decodes() {
+        // Measured raw first dword (0xe03c2074): MUBUF 0x0f, idxen, immediate
+        // offset 0x74 — folded into the soffset constant per the flexible
+        // addressing model.
+        let (code, result) = parse(
+            &[0xE03C_2074, 0x8001_0400, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse buffer_load_dwordx3");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::BufferLoadDwordX3);
+        assert_eq!(inst.format, F::Vdata3VaddrSvSoffsIdxen);
+        assert_eq!(inst.dst.size, 3);
+        assert_eq!(inst.src[1].size, 4, "V# quad");
+        assert_eq!(
+            inst.src[2].constant.u, 0x74,
+            "immediate offset folded into the inline-zero soffset"
+        );
+    }
+
+    #[test]
+    fn sopk_s_version_is_a_consumed_no_op() {
+        // RDNA2 `s_version` (SOPK 0x17), measured raw 0xbbfd0000 — a
+        // compiler-emitted code-object version marker. Its sdst field is a
+        // fixed encoding constant, not a register, so it must be consumed
+        // before operand parsing and emit nothing.
+        let (code, result) = parse(&[0xBBFD_0000, S_ENDPGM], ShaderType::Compute, true);
+        result.expect("s_version must not fail the parse");
+        let insts = code.get_instructions();
+        assert_eq!(insts.len(), 1, "s_version emits no instruction");
+        assert_eq!(insts[0].type_, T::SEndpgm);
+    }
+
+    #[test]
+    fn astro_ds_read_b64_decodes() {
+        // Measured raw first dword (0xd9d80000): DS 0x76, two CONSECUTIVE
+        // dwords at one byte offset — parsed into the DsRead2B32 shape with
+        // the second offset literal at offset + 4.
+        let (code, result) = parse(
+            &[0xD9D8_0000, 0x0500_0002, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse ds_read_b64");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::DsReadB64);
+        assert_eq!(inst.format, F::Vdst2Vsrc0Vsrc1Vsrc2);
+        assert_eq!((inst.dst.register_id, inst.dst.size), (5, 2));
+        assert_eq!(inst.src[0].register_id, 2, "LDS address VGPR");
+        assert_eq!(inst.src[1].constant.u, 0);
+        assert_eq!(inst.src[2].constant.u, 4);
+
+        // A nonzero 16-bit byte offset rides into both literals.
+        let (code2, result2) = parse(
+            &[0xD9D8_0110, 0x0500_0002, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result2.expect("parse ds_read_b64 with offset");
+        let inst2 = &code2.get_instructions()[0];
+        assert_eq!(inst2.src[1].constant.u, 0x110);
+        assert_eq!(inst2.src[2].constant.u, 0x114);
     }
 
     #[test]

@@ -36,6 +36,10 @@ pub enum ShaderInstructionType {
     /// MUBUF 0x0d: two-dword raw load. Kyty leaves it `KYTY_NI`; measured in
     /// ASTRO.BOT scene compute (raw 0xe0342000, idxen).
     BufferLoadDwordX2,
+    /// MUBUF 0x0f: three-dword raw load. Kyty leaves it `KYTY_NI`; measured
+    /// in ASTRO.BOT scene compute (raws 0xe03c2074/0xe03c2034, idxen with a
+    /// nonzero immediate offset). 116 dispatches in the measured window.
+    BufferLoadDwordX3,
     BufferLoadDwordX4,
     BufferLoadFormatX,
     BufferLoadFormatXy,
@@ -63,6 +67,13 @@ pub enum ShaderInstructionType {
     /// except append/consume `KYTY_NI`; measured on ASTRO.BOT scene compute
     /// (raw 0xd8dc0100).
     DsRead2B32,
+    /// DS 0x76: two CONSECUTIVE LDS dwords read at the single 16-bit byte
+    /// offset into `vdst`/`vdst+1` (RDNA2 ISA `DS_READ_B64`). Parsed into the
+    /// same `Vdst2Vsrc0Vsrc1Vsrc2` shape as `DsRead2B32` with the second
+    /// offset literal set to `offset + 4`, so one recompile body serves both.
+    /// Kyty `KYTY_NI`; measured on ASTRO.BOT scene compute (raw 0xd9d80000,
+    /// 58 dispatches/run).
+    DsReadB64,
     /// DS 0x36: LDS (workgroup-shared) dword read. Kyty leaves it `KYTY_NI`
     /// (only the GDS append/consume pair is implemented upstream); lowered to
     /// an `OpLoad` from the `%lds` Workgroup array. Read twin of `DsWriteB32`.
@@ -506,6 +517,12 @@ pub mod shader_instruction_format {
         Vdata3Vaddr3StSsDmask7 = format_define(&[DA3, S0A3, S1A8, S2A4, DMASK_7]),
         Vdata3Vaddr4StSsDmask7 = format_define(&[DA3, S0A4, S1A8, S2A4, DMASK_7]),
         Vdata3VaddrSvSoffsIdxen = format_define(&[DA3, S0, S1A4, S2, IDXEN]),
+        // Beyond Kyty: the three-dword MUBUF addressing variants completing
+        // the flexible quartet for `buffer_load_dwordx3` (measured on
+        // ASTRO.BOT scene compute) — same model as the Vdata1/2/4 sets.
+        Vdata3SvSoffs = format_define(&[DA3, S1A4, S2]),
+        Vdata3VaddrSvSoffsOffen = format_define(&[DA3, S0, S1A4, S2, OFFEN]),
+        Vdata3Vaddr2SvSoffsOffenIdxen = format_define(&[DA3, S0A2, S1A4, S2, OFFEN, IDXEN]),
         Vdata4Vaddr2SvSoffsOffenIdxen = format_define(&[DA4, S0A2, S1A4, S2, OFFEN, IDXEN]),
         Vdata4Vaddr2SvSoffsOffenIdxenFloat4 =
             format_define(&[DA4, S0A2, S1A4, S2, OFFEN, IDXEN, FLOAT4]),

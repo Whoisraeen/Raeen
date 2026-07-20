@@ -1766,11 +1766,14 @@ fn lane_sel_snippet(lane_sel: u8, src: &str, dst: &str) -> Option<String> {
 
 /// The single `OpTypeImage` Dim of the sampled-texture array
 /// (`%textures2D_S`), decided from the measured T# types: 9 (and the
-/// height-1 "1D" 8) = 2D, 10 = 3D volume, 11 = Cube. Storage (read-write)
-/// descriptors are excluded — `%textures2D_L` is its own 2D array.
+/// height-1 "1D" 8) = 2D, 10 = 3D volume, 11 = Cube, 13 = 2DArray
+/// (Dim 2D with `arrayed = 1` — ASTRO.BOT's 1536x1536x3 array). Storage
+/// (read-write) descriptors are excluded — `%textures2D_L` is its own 2D
+/// array.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SampledDim {
     Two,
+    TwoArray,
     Three,
     Cube,
 }
@@ -1779,16 +1782,26 @@ impl SampledDim {
     /// SPIR-V `Dim` token and the sample-coordinate component count.
     pub(crate) const fn dim_str(self) -> &'static str {
         match self {
-            Self::Two => "2D",
+            Self::Two | Self::TwoArray => "2D",
             Self::Three => "3D",
             Self::Cube => "Cube",
+        }
+    }
+
+    /// The `arrayed` field of `OpTypeImage`.
+    pub(crate) const fn arrayed_str(self) -> &'static str {
+        match self {
+            Self::TwoArray => "1",
+            Self::Two | Self::Three | Self::Cube => "0",
         }
     }
 
     pub(crate) const fn coord_components(self) -> u32 {
         match self {
             Self::Two => 2,
-            Self::Three | Self::Cube => 3,
+            // An arrayed 2D sample carries the layer as the third coordinate
+            // component (SPIR-V: coordinate includes the array layer last).
+            Self::TwoArray | Self::Three | Self::Cube => 3,
         }
     }
 }
@@ -1803,7 +1816,7 @@ pub(crate) fn sampled_texture_dim(
     let bound = usize::try_from(bind.textures2d.textures_num)
         .unwrap_or(0)
         .min(bind.textures2d.desc.len());
-    let (mut has_2d, mut has_3d, mut has_cube) = (false, false, false);
+    let (mut has_2d, mut has_3d, mut has_cube, mut has_2darray) = (false, false, false, false);
     for d in &bind.textures2d.desc[..bound] {
         if d.textures2d_without_sampler {
             continue;
@@ -1811,17 +1824,20 @@ pub(crate) fn sampled_texture_dim(
         match d.texture.type_() {
             10 => has_3d = true,
             11 => has_cube = true,
+            13 => has_2darray = true,
             _ => has_2d = true,
         }
     }
-    match (has_2d, has_3d, has_cube) {
-        (_, false, false) => Ok(SampledDim::Two),
-        (false, true, false) => Ok(SampledDim::Three),
-        (false, false, true) => Ok(SampledDim::Cube),
+    match (has_2d, has_3d, has_cube, has_2darray) {
+        (_, false, false, false) => Ok(SampledDim::Two),
+        (false, true, false, false) => Ok(SampledDim::Three),
+        (false, false, true, false) => Ok(SampledDim::Cube),
+        (false, false, false, true) => Ok(SampledDim::TwoArray),
         _ => Err(not_supported(
             "sampled_texture_dim",
             format!(
-                "mixed sampled texture dims in one shader (2d={has_2d} 3d={has_3d} cube={has_cube})"
+                "mixed sampled texture dims in one shader \
+                 (2d={has_2d} 3d={has_3d} cube={has_cube} 2darray={has_2darray})"
             ),
         )),
     }
@@ -2820,7 +2836,7 @@ impl<'a> Spirv<'a> {
 "#;
 
         const TEXTURES_SAMPLED_TYPES: &str = r#"
-                                             %ImageS = OpTypeImage %float <dim> 0 0 0 1 Unknown
+                                             %ImageS = OpTypeImage %float <dim> 0 <arrayed> 0 1 Unknown
                     %textures2D_S_uint_<buffers_num> = OpConstant %uint <buffers_num>
                      %_arr_ImageS_uint_<buffers_num> = OpTypeArray %ImageS %textures2D_S_uint_<buffers_num>
 %_ptr_UniformConstant__arr_ImageS_uint_<buffers_num> = OpTypePointer UniformConstant %_arr_ImageS_uint_<buffers_num>
@@ -2870,15 +2886,18 @@ impl<'a> Spirv<'a> {
             if bind.textures2d.textures2d_sampled_num > 0 {
                 // The OpTypeImage Dim comes from the measured T# types: 9 =
                 // 2D, 10 = 3D (ASTRO.BOT's froxel/LUT volumes), 11 = Cube
-                // (Minecraft's skybox). A mixed binding set has no single
-                // array type — `sampled_texture_dim` refuses it by name.
+                // (Minecraft's skybox), 13 = 2DArray (`arrayed = 1`;
+                // ASTRO.BOT's 1536x1536x3 array). A mixed binding set has no
+                // single array type — `sampled_texture_dim` refuses it by
+                // name.
                 let dim = sampled_texture_dim(bind)?;
                 self.source += &TEXTURES_SAMPLED_TYPES
                     .replace(
                         "<buffers_num>",
                         &format!("{}", bind.textures2d.textures2d_sampled_num),
                     )
-                    .replace("<dim>", dim.dim_str());
+                    .replace("<dim>", dim.dim_str())
+                    .replace("<arrayed>", dim.arrayed_str());
             }
             if bind.textures2d.textures2d_storage_num > 0 {
                 self.source += &TEXTURES_LOADED_TYPES.replace(
@@ -2925,6 +2944,7 @@ impl<'a> Spirv<'a> {
             T::DsReadB32,
             T::DsWriteB32,
             T::DsRead2B32,
+            T::DsReadB64,
             T::DsWriteB96,
             T::DsWriteB128,
         ])
@@ -3889,6 +3909,7 @@ impl<'a> Spirv<'a> {
             && self.code.has_any_of(&[
                 T::BufferLoadDword,
                 T::BufferLoadDwordX2,
+                T::BufferLoadDwordX3,
                 T::BufferLoadDwordX4,
                 T::BufferLoadFormatX,
                 T::BufferLoadFormatXy,
