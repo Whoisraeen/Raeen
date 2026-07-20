@@ -1738,6 +1738,13 @@ mod tests {
             );
             registry.call(&ctx, "libc", name, &[1, 2, 3]);
         }
+
+        // Retail modules import the stack-protector abort naming libkernel —
+        // same name-hash NID, provider-aware resolution.
+        assert!(
+            registry.is_implemented("libkernel", "__stack_chk_fail"),
+            "missing libkernel::__stack_chk_fail provider alias"
+        );
     }
 
     #[test]

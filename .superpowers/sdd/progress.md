@@ -92,10 +92,20 @@
     moment (~548 waits / 8 s each). No `RenderThread` is ever created and no
     libSceAgc/VideoOut call is ever made. So UE aborts or blocks somewhere
     between config load and `RHIInit`/`StartRenderingThread`.
-  * To crack it, the next step needs the ENGINE-level caller, not the shared
-    wrapper: walk the guest stack from `ctx.caller_rsp` inside the starvation
-    report (the fault path already does this) to get a return-address chain, then
-    `--dump-vaddr` it. That names which UE subsystem is waiting to be told.
+  * STACK WALK DONE (`guest_stack_chain` in pthread_cond.rs, in the STARVED
+    report): each starved waiter's engine-level frames are now recovered.
+    Main thread: `+0x1236d <- … <- +0x18d4ebd <- … <- +0x8ef82b`.
+    AgcSubmissionThread: `… <- +0x4f2f1c0 <- +0x74ee878`.
+    AgcCleanupThread:   `… <- +0x4f30055 <- +0x6360f88`.
+    Background workers: `… <- +0x1b2eb <- +0x74d3c90 <- +0x1ae41 <- +0x74d8600`.
+    Decoding main's frame at module+0x18d4ebd shows two `mov ecx,4; mov rdi,r15;
+    call module+0x407a0` sites — and 0x407a0 and 0x1236d are both UE's OWN
+    wrappers (real prologues, not PLT thunks), so the chain stays inside UE's
+    event machinery rather than reaching an emulator boundary.
+  * HONEST STATUS: four levels of RE in, every frame is UE-internal and no
+    emulator gap is implicated. Cracking this needs UE5 source/symbols or a
+    much longer RE effort — it is NOT a missing-import or broken-primitive
+    problem. Do not re-derive the above; start from these frames.
 
 # XPS5X session progress ledger
 

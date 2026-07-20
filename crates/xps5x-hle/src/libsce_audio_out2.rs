@@ -50,7 +50,29 @@ pub fn register(registry: &HleRegistry) {
         "sceAudioOut2ContextCreate",
         hle_context_create,
     );
-    registry.register("libSceAudioOut2", "sceAudioOut2ContextDestroy", |_, _| OK);
+    registry.register(
+        "libSceAudioOut2",
+        "sceAudioOut2ContextDestroy",
+        hle_context_destroy,
+    );
+    // The streaming path the mixer thread drives once audio init completes.
+    // Measured: Minecraft's FMOD output thread died jumping to
+    // `sceAudioOut2PortSetAttributes` (NID 0xf174c0ad23f25879).
+    registry.register(
+        "libSceAudioOut2",
+        "sceAudioOut2ContextPush",
+        hle_context_push,
+    );
+    registry.register(
+        "libSceAudioOut2",
+        "sceAudioOut2ContextAdvance",
+        hle_context_advance,
+    );
+    registry.register(
+        "libSceAudioOut2",
+        "sceAudioOut2PortSetAttributes",
+        hle_port_set_attributes,
+    );
     registry.register("libSceAudioOut2", "sceAudioOut2PortCreate", hle_port_create);
     registry.register(
         "libSceAudioOut2",
@@ -102,7 +124,9 @@ fn hle_context_query_memory(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 /// `sceAudioOut2ContextCreate(param, memory, memorySize, outContext)`: returns
-/// a fresh opaque context handle (u64) in `*outContext`.
+/// a fresh opaque context handle (u64) in `*outContext`, and records the
+/// context's playback cadence (frequency + grain from the param block) so
+/// `ContextPush`/`ContextAdvance` can pace the feeder to real hardware timing.
 fn hle_context_create(ctx: &HleContext, args: &[u64]) -> u64 {
     let param = args.first().copied().unwrap_or(0);
     let memory = args.get(1).copied().unwrap_or(0);
@@ -112,12 +136,98 @@ fn hle_context_create(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
     let handle = (NEXT_CONTEXT_HANDLE.fetch_add(1, Ordering::Relaxed) + 1) as u64;
+    // param layout (CONTEXT_PARAM_SIZE block): +0x04 channels, +0x08
+    // frequency, +0x0C grain samples — same offsets ContextResetParam fills.
+    let mut pbuf = [0u8; CONTEXT_PARAM_SIZE];
+    if ctx.mem.read(param, &mut pbuf) {
+        let frequency = u32::from_le_bytes(pbuf[0x08..0x0C].try_into().expect("fixed slice"));
+        let grain = u32::from_le_bytes(pbuf[0x0C..0x10].try_into().expect("fixed slice"));
+        CONTEXTS.insert(handle, std::sync::Arc::new(ContextPace::new(frequency, grain)));
+    }
     if ctx.mem.write(out_context, &handle.to_le_bytes()) {
         OK
     } else {
         SCE_ERROR_MEMORY_FAULT
     }
 }
+
+/// `sceAudioOut2ContextDestroy(context)`: drop the context's pacing state.
+fn hle_context_destroy(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0);
+    CONTEXTS.remove(&handle);
+    OK
+}
+
+/// `sceAudioOut2ContextPush(context, pcm, frames, format?)`: accept the frames
+/// (discarded — no audio backend) and pace the caller to one hardware grain.
+/// FMOD's PS5 output path uses Push as its submission clock and never calls
+/// Advance; without pacing the feeder outruns playback and starves the game.
+fn hle_context_push(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0);
+    if let Some(pace) = CONTEXTS.get(&handle).map(|p| std::sync::Arc::clone(&p)) {
+        pace.pace();
+    }
+    OK
+}
+
+/// `sceAudioOut2ContextAdvance(context)`: advancing renders one grain of audio
+/// on hardware; pace to the same wall-clock cadence.
+fn hle_context_advance(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0);
+    if let Some(pace) = CONTEXTS.get(&handle).map(|p| std::sync::Arc::clone(&p)) {
+        pace.pace();
+    }
+    OK
+}
+
+/// `sceAudioOut2PortSetAttributes(port, attributes)`: volume/routing
+/// attributes are inert without an audio backend — accept (SharpEmu's answer
+/// too) so the mixer thread keeps running.
+fn hle_port_set_attributes(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    OK
+}
+
+/// Per-context playback cadence, ported from SharpEmu's `ContextState`: one
+/// grain is `grain_samples / frequency` seconds of wall-clock time, and each
+/// paced call blocks until the previous grain's time has fully elapsed.
+struct ContextPace {
+    grain: std::time::Duration,
+    next: std::sync::Mutex<std::time::Instant>,
+}
+
+impl ContextPace {
+    fn new(frequency: u32, grain_samples: u32) -> Self {
+        let frequency = u64::from(if frequency == 0 { 48000 } else { frequency });
+        let grain_samples = u64::from(if grain_samples == 0 { 256 } else { grain_samples });
+        Self {
+            grain: std::time::Duration::from_secs_f64(grain_samples as f64 / frequency as f64),
+            next: std::sync::Mutex::new(std::time::Instant::now()),
+        }
+    }
+
+    /// SharpEmu `PaceAdvance`: the first call after a quiet period starts a
+    /// fresh grain without sleeping; a call inside an open grain sleeps out
+    /// the remainder, so a mixer loop runs at the playback rate, not host speed.
+    fn pace(&self) {
+        let wait = {
+            let mut next = self.next.lock().expect("pace mutex");
+            let now = std::time::Instant::now();
+            if *next <= now {
+                *next = now + self.grain;
+                return;
+            }
+            let wait = *next - now;
+            *next += self.grain;
+            wait
+        };
+        std::thread::sleep(wait);
+    }
+}
+
+/// Per-context pacing state, keyed by the opaque context handle. Mirrors
+/// SharpEmu's module-level `Contexts` dictionary.
+static CONTEXTS: std::sync::LazyLock<dashmap::DashMap<u64, std::sync::Arc<ContextPace>>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
 
 /// `sceAudioOut2PortCreate(type, param, outPort, context)`: returns a fresh
 /// port handle encoding the type + a rolling 8-bit port id.
@@ -295,6 +405,53 @@ mod tests {
         assert!(mem.read(0xD0, &mut buf));
         assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0x01);
         assert_eq!(buf[0x02], 2);
+    }
+
+    #[test]
+    fn streaming_trio_is_registered_and_paces_to_the_grain() {
+        let registry = HleRegistry::new();
+        for name in [
+            "sceAudioOut2ContextPush",
+            "sceAudioOut2ContextAdvance",
+            "sceAudioOut2PortSetAttributes",
+        ] {
+            assert!(
+                registry.is_implemented("libSceAudioOut2", name),
+                "libSceAudioOut2::{name} must be registered"
+            );
+        }
+
+        let (kernel, mem, alloc) = env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // Attributes are accepted unconditionally (inert without a backend).
+        assert_eq!(hle_port_set_attributes(&ctx, &[0x2000_0001, 0x40]), OK);
+        // Unknown context handles are tolerated without sleeping.
+        let t = std::time::Instant::now();
+        assert_eq!(hle_context_push(&ctx, &[0xdead, 0x40, 0x100, 0]), OK);
+        assert_eq!(hle_context_advance(&ctx, &[0xdead]), OK);
+        assert!(t.elapsed() < std::time::Duration::from_millis(50));
+
+        // A real context paces: grain=4800 samples @ 48000 Hz = 100 ms. The
+        // first push starts the grain; the second must wait it out.
+        let mut param = [0u8; CONTEXT_PARAM_SIZE];
+        param[0x08..0x0C].copy_from_slice(&48000u32.to_le_bytes());
+        param[0x0C..0x10].copy_from_slice(&4800u32.to_le_bytes());
+        assert!(mem.write(0x80, &param));
+        assert_eq!(hle_context_create(&ctx, &[0x80, 0x100, 0x1000, 0x180]), OK);
+        let mut hbuf = [0u8; 8];
+        assert!(mem.read(0x180, &mut hbuf));
+        let handle = u64::from_le_bytes(hbuf);
+        assert_eq!(hle_context_push(&ctx, &[handle, 0x40, 0x100, 0]), OK);
+        let t = std::time::Instant::now();
+        assert_eq!(hle_context_push(&ctx, &[handle, 0x40, 0x100, 0]), OK);
+        assert!(
+            t.elapsed() >= std::time::Duration::from_millis(90),
+            "second push inside the same grain must wait it out ({:?})",
+            t.elapsed()
+        );
+        // Destroy drops the pacing state; a later push is unpaced again.
+        assert_eq!(hle_context_destroy(&ctx, &[handle]), OK);
+        assert!(CONTEXTS.get(&handle).is_none());
     }
 
     #[test]

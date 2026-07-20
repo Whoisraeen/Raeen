@@ -3747,6 +3747,12 @@ mod tests {
             ("libkernel", "scePthreadCondDestroy"),
             ("libScePosix", "pthread_setschedparam"),
             ("libScePosix", "fstat"),
+            ("libScePosix", "open"),
+            ("libScePosix", "read"),
+            ("libScePosix", "write"),
+            ("libScePosix", "close"),
+            ("libScePosix", "lseek"),
+            ("libkernel", "__stack_chk_fail"),
         ] {
             assert!(
                 registry.is_implemented(lib, name),

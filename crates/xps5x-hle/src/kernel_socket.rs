@@ -482,7 +482,12 @@ mod tests {
         let fd = registry
             .call(&ctx, "libScePosix", "socket", &[2, 1, 0])
             .expect("libScePosix::socket registered");
-        assert_eq!(fd, registry.call(&ctx, "libkernel", "socket", &[2, 1, 0]).unwrap() - 1);
+        assert!(fd < 0x8000_0000, "socket() must yield a small fd, not -1");
+        assert_eq!(
+            registry.call(&ctx, "libScePosix", "connect", &[fd, 0, 0]),
+            Some(u64::MAX),
+            "offline connect must refuse with -1"
+        );
     }
 
     #[test]

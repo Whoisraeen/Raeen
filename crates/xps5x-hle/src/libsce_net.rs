@@ -239,13 +239,12 @@ fn hle_net_errno_loc(ctx: &HleContext, _args: &[u64]) -> u64 {
 /// `sceNetResolverStartNtoa(rid, hostname, addr, timeout, retry, flags)`:
 /// offline there is no DNS — fail the way a disconnected console does
 /// (`SCE_NET_ERROR_RESOLVER_ENODNS`).
-fn hle_net_resolver_start_ntoa(ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_net_resolver_start_ntoa(_ctx: &HleContext, args: &[u64]) -> u64 {
     let rid = args.first().copied().unwrap_or(0);
     let hostname = args.get(1).copied().unwrap_or(0);
     debug!("sceNetResolverStartNtoa(rid={rid}, hostname={hostname:#x}) -> ENODNS (offline)");
     NET_ERROR_RESOLVER_ENODNS
 }
-
 
 /// Hand back a fresh positive handle (pool / resolver).
 fn hle_new_id(_ctx: &HleContext, _args: &[u64]) -> u64 {
@@ -451,6 +450,78 @@ fn write_fixed_string(ctx: &HleContext, address: u64, size: usize, value: &str) 
 mod tests {
     use super::*;
     use crate::{GuestMemory, test_ctx};
+
+    #[test]
+    fn scenet_socket_family_is_offline_consistent() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x400);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let fd = hle_net_socket(&ctx, &[2, 1, 0]);
+        assert!(fd < 0x8000_0000, "sceNetSocket must yield a small fd");
+        assert_eq!(hle_net_connect(&ctx, &[fd, 0, 0]), NET_ERROR_ENETUNREACH);
+        assert_eq!(hle_net_accept(&ctx, &[fd]), NET_ERROR_EWOULDBLOCK);
+        assert_eq!(hle_net_recv(&ctx, &[fd, 0, 0, 0]), NET_ERROR_EWOULDBLOCK);
+        assert_eq!(hle_net_listen(&ctx, &[fd, 4]), SCE_OK);
+        assert_eq!(hle_net_shutdown(&ctx, &[fd, 2]), SCE_OK);
+
+        // send discards a validated payload and reports it "sent" (offline).
+        assert!(mem.write(0x40, b"ping"));
+        assert_eq!(hle_net_send(&ctx, &[fd, 0x40, 4, 0]), 4);
+
+        assert_eq!(hle_net_socket_close(&ctx, &[fd]), SCE_OK);
+        assert_eq!(hle_net_socket_close(&ctx, &[fd]), NET_ERROR_EBADF);
+        assert_eq!(hle_net_connect(&ctx, &[0x7777]), NET_ERROR_EBADF);
+        assert_eq!(hle_net_send(&ctx, &[0x7777, 0x40, 4, 0]), NET_ERROR_EBADF);
+    }
+
+    #[test]
+    fn scenet_resolver_and_errno_loc_report_offline() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x10000);
+        let alloc = crate::TestAllocator::new(0x8000);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(
+            hle_net_resolver_start_ntoa(&ctx, &[1, 0, 0, 0, 0, 0]),
+            NET_ERROR_RESOLVER_ENODNS
+        );
+        // ErrnoLoc shares the __error cell: stable, nonzero, and it reads back
+        // the EWOULDBLOCK a failed sceNetAccept recorded.
+        let fd = hle_net_socket(&ctx, &[2, 1, 0]);
+        assert_eq!(hle_net_accept(&ctx, &[fd]), NET_ERROR_EWOULDBLOCK);
+        let slot = hle_net_errno_loc(&ctx, &[]);
+        assert_ne!(slot, 0);
+        assert_eq!(hle_net_errno_loc(&ctx, &[]), slot);
+        let mut raw = [0u8; 4];
+        assert!(mem.read(slot, &mut raw));
+        assert_eq!(i32::from_le_bytes(raw), 35);
+    }
+
+    #[test]
+    fn scenet_socket_family_is_registered() {
+        let registry = HleRegistry::new();
+        for name in [
+            "sceNetSocket",
+            "sceNetSocketClose",
+            "sceNetBind",
+            "sceNetConnect",
+            "sceNetListen",
+            "sceNetAccept",
+            "sceNetSend",
+            "sceNetRecv",
+            "sceNetShutdown",
+            "sceNetSetsockopt",
+            "sceNetErrnoLoc",
+            "sceNetResolverStartNtoa",
+        ] {
+            assert!(
+                registry.is_implemented("libSceNet", name),
+                "libSceNet::{name} must be registered"
+            );
+        }
+    }
 
     #[test]
     fn byte_order_helpers_are_real_swaps() {

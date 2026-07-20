@@ -1905,6 +1905,40 @@ mod tests {
         assert_eq!(tex.pixels, linear, "detiled pixels must match the original");
     }
 
+    /// Unified format 71 = (dataFormat 12 = 16_16_16_16, numFormat 7 = FLOAT):
+    /// the 8-byte-per-pixel FP16 HDR surface ASTRO.BOT samples back as a
+    /// texture. Exercises the 8-bpp (`bpp_log2` 3) row of the swizzle table,
+    /// which no 1/4-byte format reaches.
+    #[test]
+    fn decode_texture_accepts_rgba16f_at_eight_bytes_per_pixel() {
+        let (w, h, bpp_log2) = (8u32, 8u32, 3u32);
+        let linear: Vec<u8> = (0..(w * h) as usize * 8)
+            .map(|i| ((i * 11 + 5) % 251) as u8)
+            .collect();
+        let tiled = crate::texture::tiling::tile_64kb_r_x(&linear, w, h, bpp_log2);
+        let mut blob = vec![0u8; tiled.len() + 255];
+        let base = (blob.as_ptr() as u64 + 255) & !255;
+        let off = (base - blob.as_ptr() as u64) as usize;
+        blob[off..off + tiled.len()].copy_from_slice(&tiled);
+
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.update_address40(base >> 8);
+        t.fields[1] |= 71 << 20; // unified format 16_16_16_16 FLOAT
+        t.fields[1] |= ((w - 1) & 3) << 30;
+        t.fields[2] = (w - 1) >> 2;
+        t.fields[2] |= (h - 1) << 14;
+        t.fields[3] |= 27 << 20; // SWIZZLE_MODE = SW_64KB_R_X
+        t.fields[3] |= 9 << 28; // type = Texture2D
+
+        let tex = crate::guest_mem::with_test_ranges(&[(blob.as_ptr() as u64, blob.len())], || {
+            decode_texture(&t)
+        })
+        .expect("format-71 texture decodes");
+        assert_eq!((tex.width, tex.height), (w, h));
+        assert_eq!(tex.format, vk::Format::R16G16B16A16_SFLOAT);
+        assert_eq!(tex.pixels, linear, "detiled FP16 pixels must match");
+    }
+
     /// A cube T# (type 11, six faces, SWIZZLE_MODE 9 = SW_64KB_S — the
     /// measured skybox shape) decodes every face and marks the upload CUBE.
     #[test]
