@@ -253,6 +253,65 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
     };
     let path = String::from_utf8_lossy(&path_bytes).into_owned();
 
+    // RE probe (XPS5X_TRACE_UI): the caller of the routes.json open is the
+    // Ore-UI/Gameface route-table processor — on the UI-INIT path (unlike the
+    // render chain, which is a proven dead-end). Its return-addr + guest-stack
+    // chain point at the code that decides whether to navigate to a route; aim
+    // `xps5x --disas` there to find the never-taken CreateView/LoadURL branch.
+    if std::env::var_os("XPS5X_TRACE_UI").is_some() && path.contains("routes.json") {
+        const BASE: u64 = 0x0000_1000_0000_0000;
+        const SPAN: u64 = 0x1_0000_0000;
+        let mut chain: Vec<String> = Vec::new();
+        let mut word = [0u8; 8];
+        for slot in 0..512u64 {
+            let Some(a) = ctx.caller_rsp.checked_add(slot * 8) else {
+                break;
+            };
+            if !ctx.mem.read(a, &mut word) {
+                break;
+            }
+            let v = u64::from_le_bytes(word);
+            if (BASE..BASE + SPAN).contains(&v) {
+                chain.push(format!("{:#x}", v - BASE));
+                if chain.len() >= 16 {
+                    break;
+                }
+            }
+        }
+        warn!(
+            path = %path,
+            caller = format_args!("{:#x}", ctx.caller_return_addr.wrapping_sub(BASE)),
+            chain = %chain.join(" <- "),
+            "TRACE_UI: routes.json opened by the route-table processor"
+        );
+        // Dump the UI-manager singleton's live vtable so `xps5x --disas` can map
+        // which slot is Navigate/LoadURL/CreateView. Read obj = *[0xE39E098],
+        // vtable = *[obj+0], then slots 0..24 as arena-relative fn pointers.
+        let rd = |a: u64| -> Option<u64> {
+            let mut w = [0u8; 8];
+            ctx.mem.read(a, &mut w).then(|| u64::from_le_bytes(w))
+        };
+        // The manager calls [obj+0x10]/[obj+0x18] DIRECTLY — the function
+        // pointers are embedded in the object (a C-style dispatch table), not
+        // behind a separate C++ vtable. Dump obj+i*8 as fn pointers by byte
+        // OFFSET so a code-pointer slot (Navigate/LoadURL/CreateView) stands out.
+        if let Some(obj) = rd(BASE + 0xE39_E098).filter(|&o| o != 0) {
+            let slots: Vec<String> = (0..24u64)
+                .filter_map(|i| match rd(obj + i * 8) {
+                    Some(f) if (BASE..BASE + SPAN).contains(&f) => {
+                        Some(format!("+{:#x}={:#x}", i * 8, f - BASE))
+                    }
+                    _ => None,
+                })
+                .collect();
+            warn!(
+                obj = format_args!("{:#x}", obj.wrapping_sub(BASE)),
+                "TRACE_UI: UI-manager code-pointer slots (offset=target): {}",
+                slots.join(" ")
+            );
+        }
+    }
+
     // A missing file is ENOENT *unless* the guest passed O_CREAT (then the VFS
     // creates it). O_CREAT is bit 0x200 in the Orbis/BSD flag set.
     const O_CREAT: i32 = 0x200;
