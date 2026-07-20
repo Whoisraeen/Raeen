@@ -24,6 +24,16 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "bind", hle_bind);
     registry.register("libkernel", "connect", hle_connect);
     registry.register("libkernel", "getsockname", hle_getsockname);
+    // The same five under the POSIX provider: a NID hashes the function name
+    // alone, so libScePosix imports carry these same NIDs and only the
+    // provider-aware registration is missing. Measured: the Minecraft title
+    // imports `socket` naming libScePosix and died jumping to the
+    // unresolved-import stub.
+    registry.register("libScePosix", "socket", hle_socket);
+    registry.register("libScePosix", "bind", hle_bind);
+    registry.register("libScePosix", "connect", hle_connect);
+    registry.register("libScePosix", "getsockname", hle_getsockname);
+    registry.register("libScePosix", "inet_pton", hle_inet_pton);
     registry.register_nid(
         "libScePosix",
         "setsockopt",
@@ -311,6 +321,25 @@ fn hle_setsockopt(ctx: &HleContext, args: &[u64]) -> u64 {
     OK
 }
 
+/// sceNet-facing views of the offline socket operations above. The `sceNet*`
+/// spellings in `libsce_net` return Orbis `SCE_NET_ERROR_*` codes instead of
+/// `-1` + errno, so they wrap these rather than the POSIX handlers directly.
+pub(crate) fn bind_offline(ctx: &HleContext, args: &[u64]) -> bool {
+    hle_bind(ctx, args) == OK
+}
+
+/// `Some(bytes_sent)` on success, `None` when the payload was unreadable.
+pub(crate) fn send_offline(ctx: &HleContext, args: &[u64]) -> Option<u64> {
+    match hle_send(ctx, args) {
+        MINUS_ONE => None,
+        sent => Some(sent),
+    }
+}
+
+pub(crate) fn setsockopt_offline(ctx: &HleContext, args: &[u64]) -> bool {
+    hle_setsockopt(ctx, args) == OK
+}
+
 /// `getsockname(fd, sockaddr, addrlen)`: write back the bound `sockaddr_in`.
 fn hle_getsockname(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
@@ -435,6 +464,25 @@ mod tests {
         let mem = crate::TestMemory::new(0x400);
         let alloc = crate::TestAllocator::new(0);
         (kernel, mem, alloc)
+    }
+
+    #[test]
+    fn posix_provider_aliases_resolve_the_same_offline_impls() {
+        // The measured Minecraft title imports socket/bind/connect/
+        // getsockname/inet_pton naming libScePosix, not libkernel.
+        let registry = HleRegistry::new();
+        for name in ["socket", "bind", "connect", "getsockname", "inet_pton"] {
+            assert!(
+                registry.is_implemented("libScePosix", name),
+                "libScePosix::{name} must be registered"
+            );
+        }
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let fd = registry
+            .call(&ctx, "libScePosix", "socket", &[2, 1, 0])
+            .expect("libScePosix::socket registered");
+        assert_eq!(fd, registry.call(&ctx, "libkernel", "socket", &[2, 1, 0]).unwrap() - 1);
     }
 
     #[test]

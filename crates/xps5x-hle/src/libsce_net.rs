@@ -56,6 +56,30 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceNet", "sceNetEtherNtostr", hle_ether_ntostr);
     registry.register("libSceNet", "sceNetInetPton", hle_inet_pton);
 
+    // -- sceNet socket layer (offline) --
+    // The sce-prefixed face of the same offline sockets `kernel_socket` models
+    // for the POSIX spellings, drawing from the same descriptor pool. The
+    // difference is the error convention: SCE_NET range codes (0x8041_01xx)
+    // returned directly, not POSIX -1 + errno. Measured: the Minecraft title's
+    // network threads import the whole family and would otherwise jump to the
+    // unresolved-import stub.
+    registry.register("libSceNet", "sceNetSocket", hle_net_socket);
+    registry.register("libSceNet", "sceNetSocketClose", hle_net_socket_close);
+    registry.register("libSceNet", "sceNetBind", hle_net_bind);
+    registry.register("libSceNet", "sceNetConnect", hle_net_connect);
+    registry.register("libSceNet", "sceNetListen", hle_net_listen);
+    registry.register("libSceNet", "sceNetAccept", hle_net_accept);
+    registry.register("libSceNet", "sceNetSend", hle_net_send);
+    registry.register("libSceNet", "sceNetRecv", hle_net_recv);
+    registry.register("libSceNet", "sceNetShutdown", hle_net_shutdown);
+    registry.register("libSceNet", "sceNetSetsockopt", hle_net_setsockopt);
+    registry.register("libSceNet", "sceNetErrnoLoc", hle_net_errno_loc);
+    registry.register(
+        "libSceNet",
+        "sceNetResolverStartNtoa",
+        hle_net_resolver_start_ntoa,
+    );
+
     registry.register("libSceNetCtl", "sceNetCtlInit", hle_ok);
     registry.register("libSceNetCtl", "sceNetCtlTerm", hle_ok);
     registry.register("libSceNetCtl", "sceNetCtlGetState", hle_ctl_get_state);
@@ -78,6 +102,150 @@ pub fn register(registry: &HleRegistry) {
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
     SCE_OK
 }
+
+/// `SCE_NET_ERROR_EBADF` — unknown socket fd.
+const NET_ERROR_EBADF: u64 = 0x8041_0109;
+/// `SCE_NET_ERROR_EFAULT` — unreadable guest payload/address.
+const NET_ERROR_EFAULT: u64 = 0x8041_010e;
+/// `SCE_NET_ERROR_EMFILE` — descriptor table full.
+const NET_ERROR_EMFILE: u64 = 0x8041_0118;
+/// `SCE_NET_ERROR_EWOULDBLOCK` — empty accept backlog / no data (offline).
+const NET_ERROR_EWOULDBLOCK: u64 = 0x8041_0123;
+/// `SCE_NET_ERROR_ENETUNREACH` — no route: XPS5X models no link at all.
+const NET_ERROR_ENETUNREACH: u64 = 0x8041_0133;
+/// `SCE_NET_ERROR_RESOLVER_ENODNS` — no DNS offline (shadPS4's offline
+/// answer for `sceNetResolverStartNtoa` too).
+const NET_ERROR_RESOLVER_ENODNS: u64 = 0x8041_01e1;
+
+/// `sceNetSocket(domain, type, protocol)`: a fresh offline socket fd from the
+/// same pool the POSIX `socket` spelling uses.
+fn hle_net_socket(ctx: &HleContext, _args: &[u64]) -> u64 {
+    let Some(fd) = ctx.services.create_socket() else {
+        return NET_ERROR_EMFILE;
+    };
+    debug!("sceNetSocket() -> offline fd {fd:#x}");
+    fd as u32 as u64
+}
+
+/// `sceNetSocketClose(fd)`: drop the offline socket.
+fn hle_net_socket_close(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    if ctx.services.close_socket(fd) {
+        SCE_OK
+    } else {
+        NET_ERROR_EBADF
+    }
+}
+
+/// `sceNetBind(fd, addr, addrlen)`: record the bound address (offline) — the
+/// POSIX `bind` behavior with the sce error convention.
+fn hle_net_bind(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    if !ctx.services.socket_exists(fd) {
+        return NET_ERROR_EBADF;
+    }
+    if crate::kernel_socket::bind_offline(ctx, args) {
+        SCE_OK
+    } else {
+        NET_ERROR_INVALID_ARGUMENT
+    }
+}
+
+/// `sceNetConnect(fd, addr, addrlen)`: no host connectivity — the honest
+/// offline answer is ENETUNREACH (NetCtl already reports DISCONNECTED).
+fn hle_net_connect(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    if !ctx.services.socket_exists(fd) {
+        return NET_ERROR_EBADF;
+    }
+    debug!("sceNetConnect(fd={fd:#x}) -> ENETUNREACH (offline)");
+    NET_ERROR_ENETUNREACH
+}
+
+/// `sceNetListen(fd, backlog)`: accepted; an offline listener simply never
+/// becomes ready.
+fn hle_net_listen(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    if ctx.services.socket_exists(fd) {
+        SCE_OK
+    } else {
+        NET_ERROR_EBADF
+    }
+}
+
+/// `sceNetAccept(fd, addr, addrlen)`: no peer can ever connect — report an
+/// empty backlog (`EWOULDBLOCK`) rather than blocking forever.
+fn hle_net_accept(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    if !ctx.services.socket_exists(fd) {
+        return NET_ERROR_EBADF;
+    }
+    crate::libkernel::set_guest_errno(ctx, 35); // EWOULDBLOCK
+    NET_ERROR_EWOULDBLOCK
+}
+
+/// `sceNetSend(fd, buf, len, flags)`: bytes into the void, exactly like the
+/// POSIX `send` spelling — validated as readable guest memory first.
+fn hle_net_send(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    if !ctx.services.socket_exists(fd) {
+        return NET_ERROR_EBADF;
+    }
+    crate::kernel_socket::send_offline(ctx, args).unwrap_or(NET_ERROR_EFAULT)
+}
+
+/// `sceNetRecv(fd, buf, len, flags)`: no data can ever arrive — `EWOULDBLOCK`.
+fn hle_net_recv(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    if !ctx.services.socket_exists(fd) {
+        return NET_ERROR_EBADF;
+    }
+    crate::libkernel::set_guest_errno(ctx, 35); // EWOULDBLOCK
+    NET_ERROR_EWOULDBLOCK
+}
+
+/// `sceNetShutdown(fd, how)`: nothing is connected, so both directions are
+/// already shut; accept the call.
+fn hle_net_shutdown(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    if ctx.services.socket_exists(fd) {
+        SCE_OK
+    } else {
+        NET_ERROR_EBADF
+    }
+}
+
+/// `sceNetSetsockopt(fd, level, optname, optval, optlen)`: validate and accept
+/// — no option can enable host connectivity.
+fn hle_net_setsockopt(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    if !ctx.services.socket_exists(fd) {
+        return NET_ERROR_EBADF;
+    }
+    if crate::kernel_socket::setsockopt_offline(ctx, args) {
+        SCE_OK
+    } else {
+        NET_ERROR_INVALID_ARGUMENT
+    }
+}
+
+/// `sceNetErrnoLoc()`: address of the calling thread's net errno cell. Shared
+/// with `__error()` so `*sceNetErrnoLoc()` reads back whatever the last
+/// failing POSIX/sceNet call recorded.
+fn hle_net_errno_loc(ctx: &HleContext, _args: &[u64]) -> u64 {
+    crate::libkernel::hle_error_addr(ctx, &[])
+}
+
+/// `sceNetResolverStartNtoa(rid, hostname, addr, timeout, retry, flags)`:
+/// offline there is no DNS — fail the way a disconnected console does
+/// (`SCE_NET_ERROR_RESOLVER_ENODNS`).
+fn hle_net_resolver_start_ntoa(ctx: &HleContext, args: &[u64]) -> u64 {
+    let rid = args.first().copied().unwrap_or(0);
+    let hostname = args.get(1).copied().unwrap_or(0);
+    debug!("sceNetResolverStartNtoa(rid={rid}, hostname={hostname:#x}) -> ENODNS (offline)");
+    NET_ERROR_RESOLVER_ENODNS
+}
+
 
 /// Hand back a fresh positive handle (pool / resolver).
 fn hle_new_id(_ctx: &HleContext, _args: &[u64]) -> u64 {

@@ -340,6 +340,49 @@ fn wait_core(ctx: &HleContext, args: &[u64], timeout: Option<std::time::Duration
 /// reported as starved.
 const COND_STARVED_AFTER: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// Scan the waiting thread's stack for plausible guest return addresses and
+/// render them module-relative, newest first.
+///
+/// The immediate caller of a wait is almost always a shared wrapper (every UE
+/// thread enters through the same `FEvent::Wait`), which identifies nothing.
+/// The frames ABOVE it are the engine subsystem that is actually blocked, and
+/// those are what `--dump-vaddr` can turn into readable code. Values are
+/// filtered to the guest arena span, so this is a heuristic chain (stack data
+/// that merely looks like a code pointer can appear) — the same trade-off the
+/// runtime's fault reporter makes.
+fn guest_stack_chain(ctx: &HleContext, depth: usize) -> String {
+    /// Guest arena base; addresses are reported relative to it.
+    const BASE: u64 = 0x0000_1000_0000_0000;
+    /// The arena is a 4 GiB window, so anything outside is not guest code.
+    const SPAN: u64 = 0x1_0000_0000;
+
+    if ctx.caller_rsp == 0 {
+        return "<no stack>".to_owned();
+    }
+    let mut frames: Vec<String> = Vec::new();
+    let mut word = [0u8; 8];
+    for slot in 0..512u64 {
+        let Some(addr) = ctx.caller_rsp.checked_add(slot * 8) else {
+            break;
+        };
+        if !ctx.mem.read(addr, &mut word) {
+            break;
+        }
+        let value = u64::from_le_bytes(word);
+        if (BASE..BASE + SPAN).contains(&value) {
+            frames.push(format!("+{:#x}", value - BASE));
+            if frames.len() >= depth {
+                break;
+            }
+        }
+    }
+    if frames.is_empty() {
+        "<none>".to_owned()
+    } else {
+        frames.join(" <- ")
+    }
+}
+
 /// Per-`(cond, thread)` start of the current starvation streak: when this waiter
 /// last began waiting *without* having been genuinely woken since.
 type CondStreaks = std::collections::HashMap<(u64, u64), (std::time::Instant, u64, bool)>;
@@ -386,6 +429,9 @@ fn note_wait_outcome(ctx: &HleContext, cond: u64, woken: bool) {
             // into the code around the handshake, which is what identifies
             // *what* the thread is waiting to be told.
             caller = format_args!("{:#x}", ctx.caller_return_addr),
+            // The wrapper above is shared by every waiter; these frames are the
+            // engine subsystem that is actually blocked.
+            stack = %guest_stack_chain(ctx, 10),
             "TRACE_COND: STARVED — re-waited this cond with no genuine wake"
         );
     }

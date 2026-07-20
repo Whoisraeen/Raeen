@@ -68,6 +68,9 @@ pub fn register(registry: &HleRegistry) {
     register_abi(registry, "abort", hle_abort);
     register_abi(registry, "exit", hle_exit);
     register_abi(registry, "__stack_chk_fail", hle_stack_chk_fail);
+    // Retail modules also import the stack-protector abort naming libkernel
+    // (same name-hash NID) — the measured Minecraft eboot does.
+    registry.register("libkernel", "__stack_chk_fail", hle_stack_chk_fail);
     register_abi(registry, "memalign", hle_memalign);
     register_abi(registry, "posix_memalign", hle_posix_memalign);
     register_abi(registry, "_init_env", hle_init_env);

@@ -63,6 +63,40 @@
     PS5 RHI init handshake — which thread is expected to post to
     cond 0x10081375a58 before `StartRenderingThread`.
 
+- UNTIL DAWN boot traced deep into UE engine init (2026-07-19; workspace tests
+  17 suites / 0 failures, touched-crate clippy + fmt clean):
+  * It is NOT stuck on content discovery. With `XPS5X_LOG="warn,xps5x_hle::libkernel=debug"`
+    it touches **647 distinct `/app0` paths** — the whole UE config cascade
+    (engine/project/platform `.ini`s, DataDrivenPlatformInfo, plugins, mods,
+    internationalization, localization) — so the VFS, path mapping and file IO
+    are working. The 92 GB install is complete (`bates/content/paks/` holds
+    `global.utoc`, `pakchunk0-ps5.{pak,ucas,utoc}`, …).
+  * The 8 failing opens are all OPTIONAL probes (`bates/saved/paks`,
+    `engine/content/paks`, `bates/intermediate/shaders/tmp`, `deepfiles`,
+    `/app0/..`) — normal UE discovery, not the blocker.
+  * `sceKernelAllocateMainDirectMemory` returns EAGAIN 18× — also NOT a bug:
+    `hle_allocate_direct_memory` documents that titles "allocate in a loop until
+    ENOMEM and size their pools from the total". The shrinking retry ladder
+    (0xd6000000 → 0xd600000 → 0xd60000 → 0xd0000) is that probe. ~13.8 GiB of
+    the 14.3 GiB pool is handed out before the failures start.
+  * FIXED along the way (real defects, neither was the blocker):
+    `sceKernelAvailableDirectMemorySize` reported the whole window and ignored
+    `direct_memory_allocated`, so it over-reported free memory to a title sizing
+    its pools; and `scePthreadCondDestroy` was bound to a no-op sharing
+    `CondInit`'s handler, leaving destroyed conds' state (and waiter generation)
+    behind — now bound to the real `hle_cond_destroy`.
+  * REMAINING BLOCKER (unsolved): after the config cascade every thread parks.
+    Main + `AgcSubmissionThread` + `AgcCleanupThread` + `IoDispatcher` +
+    `SystemEventGatherThreadSony` all starve on distinct conds, all entered
+    through the same wait wrapper at module+0x1236d, all starting at the same
+    moment (~548 waits / 8 s each). No `RenderThread` is ever created and no
+    libSceAgc/VideoOut call is ever made. So UE aborts or blocks somewhere
+    between config load and `RHIInit`/`StartRenderingThread`.
+  * To crack it, the next step needs the ENGINE-level caller, not the shared
+    wrapper: walk the guest stack from `ctx.caller_rsp` inside the starvation
+    report (the fault path already does this) to get a return-address chain, then
+    `--dump-vaddr` it. That names which UE subsystem is waiting to be told.
+
 # XPS5X session progress ledger
 
 - MILESTONE: **all 5 installed titles load and execute with ZERO unresolved

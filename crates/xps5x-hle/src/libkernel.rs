@@ -949,6 +949,16 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "sceKernelRead", hle_sce_read);
     registry.register("libkernel", "close", hle_posix_close);
     registry.register("libkernel", "sceKernelClose", hle_sce_close);
+    // The same POSIX fd calls under the title's other provider — the measured
+    // Minecraft eboot imports open/read/write/close/lseek naming libScePosix
+    // (a NID hashes the name alone, so both providers see identical NIDs and
+    // only the provider-aware registration differs). Same class of alias as
+    // `libScePosix::getdents` below.
+    registry.register("libScePosix", "open", hle_posix_open);
+    registry.register("libScePosix", "read", hle_posix_read);
+    registry.register("libScePosix", "write", hle_posix_write);
+    registry.register("libScePosix", "close", hle_posix_close);
+    registry.register("libScePosix", "lseek", hle_posix_lseek);
     registry.register_nid(
         "libkernel",
         "sceKernelFsync",
