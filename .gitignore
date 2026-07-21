@@ -2,6 +2,13 @@
 /target/
 **/*.rs.bk
 
+# Installer packaging outputs, and the bundled Microsoft VC++ redist
+# (fetched at package time — see installer/redist/README.md, never committed).
+# The generated branding under installer/assets/ IS committed so the .iss
+# opens standalone in the Inno Setup IDE.
+/dist/
+installer/redist/*.exe
+
 # IDE
 .vscode/
 .idea/

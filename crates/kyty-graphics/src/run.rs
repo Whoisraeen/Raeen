@@ -189,6 +189,99 @@ pub trait GuestMemory {
     }
 }
 
+/// The parsed condition of a wait-on-memory packet (`IT_WAIT_REG_MEM`,
+/// `R_WAIT_MEM_32`, `R_WAIT_MEM_64`): suspend the queue until
+/// `(label & mask) <compare> (reference & mask)` holds.
+///
+/// Port of SharpEmu's `GpuWaitRegistry.WaitingDcb` condition fields
+/// (GpuWaitRegistry.cs:19-40) and its masked comparison
+/// (`GpuWaitRegistry.Compare`, GpuWaitRegistry.cs:239-256).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WaitSpec {
+    /// Guest address of the watched completion label.
+    pub address: u64,
+    pub mask: u64,
+    pub reference: u64,
+    /// 3-bit hardware compare function: 0 = always, 1 = `<`, 2 = `<=`,
+    /// 3 = `==`, 4 = `!=`, 5 = `>=`, 6 = `>`, 7 = reserved (fail-open).
+    pub compare: u32,
+    /// 64-bit label (`R_WAIT_MEM_64`) vs 32-bit.
+    pub is_64: bool,
+}
+
+impl WaitSpec {
+    /// Masked comparison — SharpEmu `GpuWaitRegistry.Compare`
+    /// (GpuWaitRegistry.cs:239-256). Functions 0 and 7 never block: 0 is the
+    /// hardware "always" condition and reserved 7 is fail-open so a malformed
+    /// packet cannot suspend a queue forever.
+    #[must_use]
+    pub fn satisfied_by(&self, value: u64) -> bool {
+        let masked = value & self.mask;
+        let reference = self.reference & self.mask;
+        match self.compare {
+            1 => masked < reference,
+            2 => masked <= reference,
+            3 => masked == reference,
+            4 => masked != reference,
+            5 => masked >= reference,
+            6 => masked > reference,
+            _ => true,
+        }
+    }
+
+    /// Read the watched label. `None` when the address is not readable guest
+    /// memory — the caller decides whether that means "keep waiting"
+    /// (re-check path) or "do not stall" (parse path).
+    pub fn read_label(&self, mem: &dyn GuestMemory) -> Option<u64> {
+        let dwords = mem.read_dwords(self.address, if self.is_64 { 2 } else { 1 })?;
+        Some(if self.is_64 {
+            u64::from(dwords[0]) | (u64::from(dwords[1]) << 32)
+        } else {
+            u64::from(dwords[0])
+        })
+    }
+}
+
+/// A walk that stopped at an unmet wait: where to resume and what it waits on.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SuspendedWait {
+    /// Dword index just past the wait packet — pass to
+    /// [`CommandProcessor::run_resumable`] once the label satisfies the spec.
+    pub resume_dword: usize,
+    pub wait: WaitSpec,
+}
+
+/// Outcome of a resumable CP walk ([`CommandProcessor::run_resumable`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RunOutcome {
+    Completed,
+    /// The stream reached a `WAIT_REG_MEM`-family packet whose condition the
+    /// current label value does not satisfy. Nothing past the packet ran.
+    ///
+    /// SharpEmu proves this is THE scene-pixel gate: suspending here and
+    /// resuming when the label is genuinely written (AgcExports.cs:4508-4529,
+    /// `HandleSubmittedWaitRegMem` registering into `GpuWaitRegistry`) is what
+    /// lets cross-queue composites run in dependency order. NEVER
+    /// force-satisfy the label — that publishes incomplete state.
+    Suspended(SuspendedWait),
+}
+
+/// Which wait-packet encoding is being parsed (they differ in body layout).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum WaitForm {
+    /// `IT_WAIT_REG_MEM`, body `[control, addr_lo, addr_hi, ref32, mask32,
+    /// poll]` (SharpEmu `TryParseSubmittedWait` standard arm,
+    /// AgcExports.cs:4550-4566).
+    Standard,
+    /// `IT_NOP`+`R_WAIT_MEM_32`, body `[addr_lo, addr_hi, mask32, control,
+    /// ref32]` (SharpEmu AgcExports.cs:4568-4590; our own
+    /// `sceAgcAcbWaitRegMem` emits the same layout).
+    Mem32,
+    /// `IT_NOP`+`R_WAIT_MEM_64`, body `[addr_lo, addr_hi, mask_lo, mask_hi,
+    /// ref_lo, ref_hi, control, poll]`.
+    Mem64,
+}
+
 /// Parameters of an indexed draw, as decoded from `R_DRAW_INDEX` /
 /// `IT_DRAW_INDEX_2` (Kyty `cp_op_draw_index`, GraphicsRun.cpp L2757).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -303,6 +396,10 @@ pub struct CommandProcessor {
     /// Number of shader-bind trace sites visited. This survives queue resets
     /// and bounds the opt-in diagnostic on frame loops.
     shader_bind_trace_count: u64,
+    /// Set by the wait-packet handlers when the watched label does not satisfy
+    /// the condition; consumed by the walker immediately after the packet, so
+    /// [`CommandProcessor::run_resumable`] can suspend the stream there.
+    pending_wait: Option<WaitSpec>,
 }
 
 impl CommandProcessor {
@@ -405,6 +502,49 @@ impl CommandProcessor {
         mem: Option<&dyn GuestMemory>,
     ) -> Result<(), CpError> {
         let mut pos = 0usize;
+        loop {
+            match self.run_resumable(data, pos, sink, mem)? {
+                RunOutcome::Completed => return Ok(()),
+                RunOutcome::Suspended(suspended) => {
+                    // This entry point has no way to park the buffer and
+                    // re-run it later, so an unmet wait degrades to the
+                    // pre-suspend behaviour: continue past it, loudly. The
+                    // GPU worker uses `run_resumable` and genuinely suspends.
+                    if self.first(SkipKey::Note("wait_unmet_inline_continue")) {
+                        warn!(
+                            label = format_args!("{:#x}", suspended.wait.address),
+                            compare = suspended.wait.compare,
+                            "unmet WAIT_REG_MEM on the non-resumable walk — \
+                             continuing past it (no suspend support at this call site)"
+                        );
+                    }
+                    pos = suspended.resume_dword;
+                }
+            }
+        }
+    }
+
+    /// Walk a DCB from `start_dword`, stopping at the first wait-on-memory
+    /// packet whose condition the current label value does not satisfy.
+    ///
+    /// Port of SharpEmu's suspend design (`HandleSubmittedWaitRegMem`,
+    /// AgcExports.cs:4508-4529 / 4595-4726): an unmet wait suspends the
+    /// command buffer mid-stream — [`RunOutcome::Suspended`] carries the
+    /// resume dword and the [`WaitSpec`] — and the embedder re-runs from the
+    /// resume point once the label memory is genuinely written by a later
+    /// submission's writebacks. The label is never force-satisfied.
+    ///
+    /// # Errors
+    ///
+    /// Same structural faults as [`Self::run_with_memory`].
+    pub fn run_resumable(
+        &mut self,
+        data: &[u32],
+        start_dword: usize,
+        sink: &mut dyn DrawSink,
+        mem: Option<&dyn GuestMemory>,
+    ) -> Result<RunOutcome, CpError> {
+        let mut pos = start_dword.min(data.len());
         while pos < data.len() {
             let cmd_id = data[pos];
             let offset = pos as u32;
@@ -442,8 +582,14 @@ impl CommandProcessor {
                 });
             }
             pos += advance;
+            if let Some(wait) = self.pending_wait.take() {
+                return Ok(RunOutcome::Suspended(SuspendedWait {
+                    resume_dword: pos,
+                    wait,
+                }));
+            }
         }
-        Ok(())
+        Ok(RunOutcome::Completed)
     }
 
     /// Kyty: the `g_cp_op_func[256]` table.
@@ -519,12 +665,16 @@ impl CommandProcessor {
             // nothing on the minimal draw path observes their effects. Their
             // side effects (waits, label writes) are handled by the HLE submit
             // layer where needed.
+            // The wait family is honoured: parse, evaluate against the label,
+            // and suspend the walk when unmet (see cp_op_wait_mem).
+            pm4::IT_WAIT_REG_MEM => {
+                self.cp_op_wait_mem(cmd_id, body, offset, WaitForm::Standard, mem)
+            }
             pm4::IT_ACQUIRE_MEM
             | pm4::IT_RELEASE_MEM
             | pm4::IT_EVENT_WRITE
             | pm4::IT_EVENT_WRITE_EOP
             | pm4::IT_EVENT_WRITE_EOS
-            | pm4::IT_WAIT_REG_MEM
             | pm4::IT_WRITE_DATA
             | pm4::IT_DMA_DATA
             | pm4::IT_CONTEXT_CONTROL
@@ -663,12 +813,13 @@ impl CommandProcessor {
                 self.reset();
                 Ok(pm4::body_dw(cmd_id))
             }
+            // Label waits: honoured — parse, evaluate, suspend when unmet.
+            pm4::R_WAIT_MEM_32 => self.cp_op_wait_mem(cmd_id, body, offset, WaitForm::Mem32, mem),
+            pm4::R_WAIT_MEM_64 => self.cp_op_wait_mem(cmd_id, body, offset, WaitForm::Mem64, mem),
             // Sync / flip / memory ops: consumed, not honoured. A draw never
-            // observes them, and their side effects (flip queues, label
-            // waits) are already applied by the HLE submit decode.
-            pm4::R_WAIT_MEM_32
-            | pm4::R_WAIT_MEM_64
-            | pm4::R_WRITE_DATA
+            // observes them, and their side effects (flip queues) are already
+            // applied by the HLE submit decode.
+            pm4::R_WRITE_DATA
             | pm4::R_ACQUIRE_MEM
             | pm4::R_RELEASE_MEM
             | pm4::R_WAIT_FLIP_DONE
@@ -809,6 +960,104 @@ impl CommandProcessor {
             }
         }
         Ok(body_len)
+    }
+
+    /// Parse and evaluate a wait-on-memory packet; arm a suspend when unmet.
+    ///
+    /// Port of SharpEmu `HandleSubmittedWaitRegMem` + `TryParseSubmittedWait`
+    /// (AgcExports.cs:4508-4529 / 4534-4593 / 4595-4726), including its
+    /// guards, in order:
+    ///
+    /// - compare 0 ("always") and reserved 7 are fail-open — never a waiter;
+    /// - a null address, zero mask, or misaligned label is a malformed packet
+    ///   and must not become a permanent waiter (warn once, continue);
+    /// - no [`GuestMemory`] or an unreadable label → "cannot evaluate the
+    ///   label — do not stall the DCB" (AgcExports.cs:4700-4703);
+    /// - a satisfied condition keeps parsing;
+    /// - an unmet condition arms [`CommandProcessor::pending_wait`]; the
+    ///   walker turns that into [`RunOutcome::Suspended`] right after this
+    ///   packet. The label is NEVER written to force the condition.
+    fn cp_op_wait_mem(
+        &mut self,
+        cmd_id: u32,
+        body: &[u32],
+        offset: u32,
+        form: WaitForm,
+        mem: Option<&dyn GuestMemory>,
+    ) -> Result<u32, CpError> {
+        let consumed = pm4::body_dw(cmd_id);
+        let dword = |i: usize| Self::body_at(body, i, offset);
+        let pair = |lo: u32, hi: u32| u64::from(lo) | (u64::from(hi) << 32);
+        let spec = match form {
+            WaitForm::Standard => WaitSpec {
+                compare: dword(0)? & 0x7,
+                address: pair(dword(1)?, dword(2)?),
+                reference: u64::from(dword(3)?),
+                mask: u64::from(dword(4)?),
+                is_64: false,
+            },
+            WaitForm::Mem32 => WaitSpec {
+                address: pair(dword(0)?, dword(1)?),
+                mask: u64::from(dword(2)?),
+                compare: dword(3)? & 0x7,
+                reference: u64::from(dword(4)?),
+                is_64: false,
+            },
+            WaitForm::Mem64 => WaitSpec {
+                address: pair(dword(0)?, dword(1)?),
+                mask: pair(dword(2)?, dword(3)?),
+                reference: pair(dword(4)?, dword(5)?),
+                compare: dword(6)? & 0x7,
+                is_64: true,
+            },
+        };
+        if spec.compare == 0 || spec.compare == 7 {
+            return Ok(consumed);
+        }
+        let alignment = if spec.is_64 { 8 } else { 4 };
+        if spec.address == 0 || spec.mask == 0 || !spec.address.is_multiple_of(alignment) {
+            if self.first(SkipKey::Note("wait_mem_invalid_address_or_mask")) {
+                warn!(
+                    label = format_args!("{:#x}", spec.address),
+                    mask = format_args!("{:#x}", spec.mask),
+                    offset,
+                    "WAIT_REG_MEM with null/misaligned label or zero mask — not honoured"
+                );
+            }
+            return Ok(consumed);
+        }
+        let Some(mem) = mem else {
+            if self.first(SkipKey::Note("wait_mem_no_memory")) {
+                warn!(
+                    label = format_args!("{:#x}", spec.address),
+                    offset, "WAIT_REG_MEM needs a GuestMemory reader — not honoured"
+                );
+            }
+            return Ok(consumed);
+        };
+        let Some(current) = spec.read_label(mem) else {
+            // SharpEmu: cannot evaluate the label — do not stall the DCB.
+            if self.first(SkipKey::Note("wait_mem_label_unreadable")) {
+                warn!(
+                    label = format_args!("{:#x}", spec.address),
+                    offset, "WAIT_REG_MEM label unreadable — not honoured"
+                );
+            }
+            return Ok(consumed);
+        };
+        if !spec.satisfied_by(current) {
+            debug!(
+                label = format_args!("{:#x}", spec.address),
+                current = format_args!("{current:#x}"),
+                reference = format_args!("{:#x}", spec.reference),
+                mask = format_args!("{:#x}", spec.mask),
+                compare = spec.compare,
+                offset,
+                "WAIT_REG_MEM unmet — suspending the walk after this packet"
+            );
+            self.pending_wait = Some(spec);
+        }
+        Ok(consumed)
     }
 
     /// Kyty: `cp_op_dispatch_direct` (GraphicsRun.cpp L2691).
@@ -3153,5 +3402,224 @@ mod tests {
         assert_eq!(z.pitch_div8_minus1, 7);
         assert_eq!(z.height_div8_minus1, 63);
         assert_eq!(z.slice_div64_minus1, 0x3FF);
+    }
+
+    // ---- WAIT_REG_MEM suspend/resume (SharpEmu AgcExports.cs:4508-4529) ----
+
+    /// Guest memory with a mutable label, so a test can play the producer.
+    struct LabelMem {
+        base: u64,
+        words: std::cell::RefCell<Vec<u32>>,
+    }
+
+    impl GuestMemory for LabelMem {
+        fn read_dwords(&self, addr: u64, count: u32) -> Option<Vec<u32>> {
+            let rel = addr.checked_sub(self.base)?;
+            if rel % 4 != 0 {
+                return None;
+            }
+            let start = usize::try_from(rel / 4).ok()?;
+            let end = start.checked_add(count as usize)?;
+            self.words.borrow().get(start..end).map(<[u32]>::to_vec)
+        }
+    }
+
+    /// `sceAgcAcbWaitRegMem` 32-bit layout: total 6 dwords,
+    /// body `[addr_lo, addr_hi, mask32, compare, ref32]`.
+    fn wait32(addr: u64, mask: u32, compare: u32, reference: u32) -> Vec<u32> {
+        vec![
+            header(6, pm4::IT_NOP, pm4::R_WAIT_MEM_32),
+            addr as u32,
+            (addr >> 32) as u32,
+            mask,
+            compare,
+            reference,
+        ]
+    }
+
+    /// An unmet 32-bit label wait suspends the walk mid-stream: nothing past
+    /// the packet runs, the outcome names the label and the resume dword, and
+    /// re-running from there after the label is genuinely written executes
+    /// the remainder. The label itself is never modified by the CP.
+    #[test]
+    fn wait_mem32_suspends_and_resumes_where_it_stopped() {
+        let mem = LabelMem {
+            base: 0x9000,
+            words: std::cell::RefCell::new(vec![0]),
+        };
+        let mut dcb = wait32(0x9000, 0xFFFF_FFFF, 3, 1); // wait for label == 1
+        // Work "behind" the wait: prim type write + a draw.
+        dcb.extend(state_and_draw());
+        let resume_at = 6usize;
+
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let outcome = cp
+            .run_resumable(&dcb, 0, &mut sink, Some(&mem))
+            .expect("wait packet must not fault");
+        match outcome {
+            RunOutcome::Suspended(s) => {
+                assert_eq!(s.resume_dword, resume_at);
+                assert_eq!(s.wait.address, 0x9000);
+                assert_eq!(s.wait.compare, 3);
+                assert_eq!(s.wait.reference, 1);
+                assert!(!s.wait.is_64);
+            }
+            RunOutcome::Completed => panic!("unmet wait must suspend"),
+        }
+        assert!(sink.draws.is_empty(), "work behind the wait must not run");
+        assert_eq!(mem.words.borrow()[0], 0, "the CP must never write the label");
+
+        // Producer writes the label; the re-check would now pass.
+        mem.words.borrow_mut()[0] = 1;
+        let spec = match outcome {
+            RunOutcome::Suspended(s) => s.wait,
+            RunOutcome::Completed => unreachable!(),
+        };
+        assert_eq!(spec.read_label(&mem), Some(1));
+        assert!(spec.satisfied_by(1));
+
+        let outcome = cp
+            .run_resumable(&dcb, resume_at, &mut sink, Some(&mem))
+            .expect("resumed walk");
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(sink.draws.len(), 1, "the resumed remainder must draw");
+    }
+
+    /// The 64-bit form: total 9 dwords, body `[addr_lo, addr_hi, mask_lo,
+    /// mask_hi, ref_lo, ref_hi, compare, poll]`; masked `>=` comparison.
+    #[test]
+    fn wait_mem64_parses_the_wide_layout_and_compares_masked() {
+        let mem = LabelMem {
+            base: 0x9000,
+            words: std::cell::RefCell::new(vec![0x5, 0x0]), // label = 0x0000_0000_0000_0005
+        };
+        let dcb = vec![
+            header(9, pm4::IT_NOP, pm4::R_WAIT_MEM_64),
+            0x9000,
+            0,
+            0xFFFF_FFFF, // mask lo
+            0xFFFF_FFFF, // mask hi
+            0x10,        // ref lo
+            0,           // ref hi
+            5,           // compare: >=
+            0,           // poll cycles
+        ];
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let outcome = cp.run_resumable(&dcb, 0, &mut sink, Some(&mem)).unwrap();
+        let spec = match outcome {
+            RunOutcome::Suspended(s) => {
+                assert!(s.wait.is_64);
+                assert_eq!(s.wait.reference, 0x10);
+                s.wait
+            }
+            RunOutcome::Completed => panic!("5 >= 0x10 is false — must suspend"),
+        };
+        // Label reaches the reference: satisfied.
+        mem.words.borrow_mut()[0] = 0x10;
+        assert_eq!(spec.read_label(&mem), Some(0x10));
+        assert!(spec.satisfied_by(0x10));
+        // Masked comparison: bits outside the mask are invisible.
+        let masked = WaitSpec {
+            mask: 0xFF,
+            ..spec
+        };
+        assert!(masked.satisfied_by(0xAB00_0010));
+    }
+
+    /// The standard `IT_WAIT_REG_MEM` form: body `[control, addr_lo, addr_hi,
+    /// ref32, mask32, poll]`, compare in control bits 2:0.
+    #[test]
+    fn standard_wait_reg_mem_suspends_on_unmet_equal() {
+        let mem = LabelMem {
+            base: 0x9000,
+            words: std::cell::RefCell::new(vec![7]),
+        };
+        let dcb = vec![
+            header(7, pm4::IT_WAIT_REG_MEM, pm4::R_ZERO),
+            3, // compare ==
+            0x9000,
+            0,
+            1,           // reference
+            0xFFFF_FFFF, // mask
+            2,           // poll
+        ];
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        match cp.run_resumable(&dcb, 0, &mut sink, Some(&mem)).unwrap() {
+            RunOutcome::Suspended(s) => {
+                assert_eq!(s.wait.address, 0x9000);
+                assert_eq!(s.wait.reference, 1);
+                assert_eq!(s.resume_dword, 7);
+            }
+            RunOutcome::Completed => panic!("7 != 1 — must suspend"),
+        }
+    }
+
+    /// Fail-open guards (SharpEmu AgcExports.cs:4620-4644 / 4700-4703): the
+    /// "always" and reserved compare functions, a null/zero-mask packet, a
+    /// missing memory reader, an unreadable label, and an already-satisfied
+    /// condition must all keep parsing — suspension only for a genuine,
+    /// evaluable, unmet wait.
+    #[test]
+    fn wait_mem_fail_open_cases_never_suspend() {
+        let mem = LabelMem {
+            base: 0x9000,
+            words: std::cell::RefCell::new(vec![0]),
+        };
+        let mut sink = RecordingSink::default();
+        let run = |dcb: &[u32], mem: Option<&dyn GuestMemory>, sink: &mut RecordingSink| {
+            CommandProcessor::new()
+                .run_resumable(dcb, 0, sink, mem)
+                .expect("no structural fault")
+        };
+        // compare 0 = always, 7 = reserved.
+        for compare in [0, 7] {
+            let dcb = wait32(0x9000, !0, compare, 1);
+            assert_eq!(
+                run(&dcb, Some(&mem), &mut sink),
+                RunOutcome::Completed,
+                "compare {compare} is fail-open"
+            );
+        }
+        // Null address / zero mask / misaligned label.
+        for dcb in [
+            wait32(0, !0, 3, 1),
+            wait32(0x9000, 0, 3, 1),
+            wait32(0x9002, !0, 3, 1),
+        ] {
+            assert_eq!(run(&dcb, Some(&mem), &mut sink), RunOutcome::Completed);
+        }
+        // No memory reader; unreadable label.
+        let dcb = wait32(0x9000, !0, 3, 1);
+        assert_eq!(run(&dcb, None, &mut sink), RunOutcome::Completed);
+        let unreadable = wait32(0xDEAD_0000, !0, 3, 1);
+        assert_eq!(
+            run(&unreadable, Some(&mem), &mut sink),
+            RunOutcome::Completed
+        );
+        // Already satisfied.
+        mem.words.borrow_mut()[0] = 1;
+        let dcb = wait32(0x9000, !0, 3, 1);
+        assert_eq!(run(&dcb, Some(&mem), &mut sink), RunOutcome::Completed);
+    }
+
+    /// `run_with_memory` (the non-resumable entry) must keep its historical
+    /// contract: an unmet wait cannot wedge it — it warns and continues.
+    #[test]
+    fn non_resumable_walk_continues_past_an_unmet_wait() {
+        let mem = LabelMem {
+            base: 0x9000,
+            words: std::cell::RefCell::new(vec![0]),
+        };
+        let mut dcb = wait32(0x9000, !0, 3, 1);
+        dcb.extend(state_and_draw());
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("legacy walk");
+        assert_eq!(sink.draws.len(), 1, "legacy walk still reaches the draw");
+        assert_eq!(mem.words.borrow()[0], 0, "and never writes the label");
     }
 }

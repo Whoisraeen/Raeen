@@ -402,6 +402,29 @@ pub fn demand_commit_count() -> u64 {
     DEMAND_COMMITS.load(Ordering::Relaxed)
 }
 
+/// Test-only fault injection for [`GuestArena::map_at`]'s commit path. There is
+/// no way to exhaust the real Windows commit limit in a unit test, so a test
+/// arms this counter to make the next N up-front commits behave as refused,
+/// exercising the demand-commit fallback that keeps a fixed-address
+/// direct-memory map alive (the ASTRO.BOT crash in logs/xps5x.txt).
+#[cfg(test)]
+static FORCE_MAP_AT_COMMIT_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// Consume one armed refusal, if any. Compiles to a constant `false` outside
+/// tests, so the production commit path is untouched and branch-free.
+#[cfg(test)]
+fn take_forced_commit_refusal() -> bool {
+    FORCE_MAP_AT_COMMIT_REFUSALS
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+        .is_ok()
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn take_forced_commit_refusal() -> bool {
+    false
+}
+
 /// Size of the main-thread TCB [`GuestArena::setup_main_tcb`] carves from
 /// the heap region (design doc §3, RT2c-b/M1-B). Large enough for the
 /// self-pointer at offset 0, the `__stack_chk_guard` canary at the
@@ -621,8 +644,11 @@ struct AllocState {
     /// the block base is a legal argument, which is why the base is kept rather
     /// than the aligned address handed to the guest.
     os_reservations: Vec<u64>,
-    /// Fully committed mappings created as independent Windows reservations
-    /// outside the fixed arena, keyed by their exact `MEM_RELEASE` base.
+    /// Mappings created as independent Windows reservations outside the fixed
+    /// arena, keyed by their exact `MEM_RELEASE` base. Usually fully committed;
+    /// `map_at`'s demand-commit fallback may enter a reserved-but-lazily-backed
+    /// one, which `munmap`/`Drop` release identically (`MEM_RELEASE` frees a
+    /// reservation whatever its commit state).
     external_mappings: HashMap<u64, u64>,
     /// Ranges this arena committed (or served demand-committed) inside the
     /// process-lifetime title-VA window blocks ([`TITLE_VA_WINDOW`]). The
@@ -986,11 +1012,15 @@ impl GuestArena {
         }
 
         // SAFETY: `[page, page + PAGE_SIZE)` is page aligned and lies inside a
-        // `Reserved` VMA. Only `reserve` creates one, and only ever over a range
-        // it has just `MEM_RESERVE`d from the OS and recorded in
-        // `os_reservations` — so the reservation is real and outlives this
-        // arena's guest run. `MEM_COMMIT` over an already-committed page is a
-        // documented no-op, so losing a race here is benign either way.
+        // `Reserved` VMA. Every producer of one places it over a range that is
+        // really `MEM_RESERVE`d and outlives this arena's guest run: `reserve`
+        // and `map_console_va` over an OS reservation recorded in
+        // `os_reservations`; `map_at`'s demand-commit fallback over either a
+        // newly-reserved Foreign range (also pushed to `os_reservations`) or the
+        // arena master reservation (the free sparse tail, released in `Drop`).
+        // So the reservation is real either way. `MEM_COMMIT` over an
+        // already-committed page is a documented no-op, so losing a race here is
+        // benign too.
         let raw = unsafe {
             VirtualAlloc(
                 page as *const c_void,
@@ -2059,17 +2089,23 @@ impl GuestAllocator for GuestArena {
         // `Reserved` after the combined map so `commit_on_demand` backs them.
         let mut demand_committed = Vec::new();
         for &(segment_addr, segment_len, flags, owns_reservation) in &actions {
-            // SAFETY: the VMA walk proved this segment either belongs to one of
-            // our reservations (`MEM_COMMIT`) or is wholly unowned
-            // (`MEM_RESERVE | MEM_COMMIT`). The exact-address check rejects any
-            // allocation-granularity relocation.
-            let raw = unsafe {
-                VirtualAlloc(
-                    segment_addr as *const c_void,
-                    segment_len as usize,
-                    flags,
-                    PAGE_READWRITE,
-                )
+            let raw = if take_forced_commit_refusal() {
+                // Test-only: behave as if the host refused this up-front commit,
+                // driving the demand-commit fallback below deterministically.
+                std::ptr::null_mut()
+            } else {
+                // SAFETY: the VMA walk proved this segment either belongs to one
+                // of our reservations (`MEM_COMMIT`) or is wholly unowned
+                // (`MEM_RESERVE | MEM_COMMIT`). The exact-address check rejects
+                // any allocation-granularity relocation.
+                unsafe {
+                    VirtualAlloc(
+                        segment_addr as *const c_void,
+                        segment_len as usize,
+                        flags,
+                        PAGE_READWRITE,
+                    )
+                }
             };
             if !raw.is_null() && raw as u64 == segment_addr {
                 if owns_reservation {
@@ -2088,7 +2124,12 @@ impl GuestAllocator for GuestArena {
             // that `map_console_va` and `sceKernelReserveVirtualRange` already
             // run. Reserve the address space (when we do not own it yet), record
             // the span `Reserved`, and let `commit_on_demand` back each page from
-            // the fault handler as the guest reaches it.
+            // the fault handler as the guest reaches it. Caveat (as for every
+            // demand-committed range): only guest CPU access and HLE *writes*
+            // back a page; an HLE/GPU host-side *read* of a never-written page
+            // reads unbacked. Strictly better than the old hard failure — the
+            // whole mapping was `0xffffffff` then — and direct memory is
+            // overwhelmingly written before it is read.
             if owns_reservation {
                 // A combined RESERVE|COMMIT never half-succeeds, but a stray
                 // misplacement must still be released before we retry.
@@ -2674,6 +2715,53 @@ mod tests {
         assert!(arena.write(base + len - 0x10, &[0xCD]));
         assert!(arena.read(base + len - 0x10, &mut byte));
         assert_eq!(byte, [0xCD]);
+    }
+
+    /// The demand-commit fallback itself — forced deterministically, since a
+    /// unit test cannot exhaust the real Windows commit limit. On a refused
+    /// up-front commit `map_at` must still return the requested address, leave
+    /// it reserved-but-unbacked, back a page on first write (the faulting offset
+    /// from logs/xps5x.txt), keep neighbours unbacked, and release the
+    /// reservation exactly once so a later map at the same address succeeds.
+    #[test]
+    fn map_at_demand_commits_when_the_up_front_commit_is_refused() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let base = 0x3_0000_0000u64; // ASTRO.BOT's fixed direct-memory VA
+        let len = 0x20_0000u64; // 2 MiB — a handful of pages
+
+        // Arm one refusal: the range is a single Foreign segment, so its one
+        // up-front RESERVE|COMMIT is forced to fail, taking the reserve-only +
+        // demand-commit path.
+        FORCE_MAP_AT_COMMIT_REFUSALS.store(1, Ordering::Relaxed);
+        assert_eq!(
+            arena.map_at(base, len, PAGE_SIZE),
+            Some(base),
+            "a refused commit must degrade to demand-commit, not fail"
+        );
+        assert_eq!(
+            FORCE_MAP_AT_COMMIT_REFUSALS.load(Ordering::Relaxed),
+            0,
+            "exactly one refusal consumed"
+        );
+
+        // Reserved-but-unbacked: an untouched page reads back nothing — the
+        // observable difference from the eager-commit path.
+        let mut byte = [0u8; 1];
+        assert!(!arena.read(base, &mut byte), "range must start unbacked");
+
+        // A write demand-commits its own page and round-trips.
+        assert!(arena.write(base + 0x20, &[0xAB]));
+        assert!(arena.read(base + 0x20, &mut byte));
+        assert_eq!(byte, [0xAB]);
+        // A page nothing wrote stays unbacked: the reservation costs address
+        // space, not RAM.
+        assert!(!arena.read(base + PAGE_SIZE, &mut byte));
+
+        // The reservation releases cleanly — a later (unforced) map at the same
+        // address proves no Windows reservation leaked.
+        arena.munmap(base, len);
+        assert_eq!(arena.map_at(base, len, PAGE_SIZE), Some(base));
     }
 
     /// The Shell-vs-CLI wall, regression-proofed. Measured 2026-07-21

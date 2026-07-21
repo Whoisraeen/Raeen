@@ -20,7 +20,7 @@ use crate::backend::GpuBackend;
 use crate::draw_translate::OffscreenDrawSink;
 use crate::vulkan::{RenderedImage, VulkanBackend};
 use kyty_graphics::pm4;
-use kyty_graphics::run::{CommandProcessor, CpError};
+use kyty_graphics::run::{CommandProcessor, CpError, RunOutcome, SuspendedWait};
 use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -80,6 +80,74 @@ enum GpuLifecycle {
     Open,
     Closing,
     Closed,
+}
+
+/// A command buffer suspended mid-stream on an unmet `WAIT_REG_MEM` label.
+///
+/// Port of SharpEmu `GpuWaitRegistry.WaitingDcb` (GpuWaitRegistry.cs:19-40):
+/// the buffer, where to resume in it, and the wait condition. The label is
+/// NEVER force-satisfied — the buffer resumes only when a later submission's
+/// writebacks (compute storage writebacks, DMA_DATA copies, WRITE_DATA) or a
+/// direct guest store genuinely satisfy the condition.
+struct SuspendedBuffer {
+    words: Vec<u32>,
+    resume_dword: usize,
+    wait: kyty_graphics::run::WaitSpec,
+    deferred_present: bool,
+    /// How many producer re-check rounds have seen this wait still unmet —
+    /// drives the rate-limited dead-wait warn.
+    recheck_rounds: u64,
+}
+
+/// Per-queue wait state: at most one suspended buffer, plus the submissions
+/// parked behind it. On hardware a wait blocks its own ring; later work on
+/// the SAME queue must queue up behind it, not run ahead (SharpEmu's
+/// `SubmittedDcbState.PendingSubmissions`, AgcExports.cs — validated in
+/// `ValidateSubmittedQueueAndReleaseMemDecoders`).
+#[derive(Default)]
+struct QueueWaitState {
+    suspended: Option<SuspendedBuffer>,
+    /// `(words, deferred_present)` in submission order.
+    pending: std::collections::VecDeque<(Vec<u32>, bool)>,
+}
+
+/// The two hardware rings this session models: graphics (DCB) and async
+/// compute (ACB) — matching the two command processors.
+#[derive(Default)]
+struct WaitStates {
+    graphics: QueueWaitState,
+    compute: QueueWaitState,
+}
+
+impl WaitStates {
+    fn queue_mut(&mut self, is_compute: bool) -> &mut QueueWaitState {
+        if is_compute {
+            &mut self.compute
+        } else {
+            &mut self.graphics
+        }
+    }
+}
+
+/// Fixed-point bound for the resume loop: a resumed buffer's own writebacks
+/// can satisfy the other queue's wait, so re-checks loop — but never forever.
+const MAX_RESUME_PASSES: u32 = 64;
+
+/// After this many producer re-check rounds with the wait still unmet, warn
+/// (then again at each doubling) so dead waits are visible in logs.
+const STALE_WAIT_RECHECK_ROUNDS: u64 = 512;
+
+/// Cumulative wait/suspend counters (diagnostics + tests).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct GpuWaitStats {
+    /// Buffers that suspended on an unmet label wait.
+    pub suspended: u64,
+    /// Suspended buffers resumed after their label was genuinely written.
+    pub resumed: u64,
+    /// Buffers currently suspended (0..=2 — one per queue).
+    pub currently_suspended: usize,
+    /// Submissions currently parked behind a suspended queue.
+    pub parked: usize,
 }
 
 impl From<CpError> for AgcExecError {
@@ -156,6 +224,13 @@ pub struct AgcGpuSession {
     /// and read back after (see `execute_dcb_cp`).
     last_compute_shader: Mutex<Option<kyty_graphics::hw_regs::ComputeShaderInfo>>,
     submission_count: AtomicU64,
+    /// Cross-queue WAIT_REG_MEM suspend/resume state (SharpEmu
+    /// `GpuWaitRegistry` port). See [`SuspendedBuffer`].
+    wait_states: Mutex<WaitStates>,
+    /// Buffers that ever suspended on an unmet label wait.
+    wait_suspended_total: AtomicU64,
+    /// Suspended buffers resumed by a genuine label write.
+    wait_resumed_total: AtomicU64,
     /// The guest base the most-content fallback last presented. Steady state
     /// on a title whose flip address never matches a drawn target (its scanout
     /// is filled by an uncaptured copy/DMA): each flip reads back ONLY
@@ -278,6 +353,9 @@ impl AgcGpuSession {
             framebuffers: Mutex::new(std::collections::HashMap::new()),
             scanout_address: Mutex::new(None),
             last_compute_shader: Mutex::new(None),
+            wait_states: Mutex::new(WaitStates::default()),
+            wait_suspended_total: AtomicU64::new(0),
+            wait_resumed_total: AtomicU64::new(0),
             submission_count: AtomicU64::new(0),
             fallback_present_base: Mutex::new(None),
             flip_miss_count: AtomicU64::new(0),
@@ -637,7 +715,24 @@ impl AgcGpuSession {
         words: &[u32],
         is_compute: bool,
     ) -> Result<Option<RenderedImage>, AgcExecError> {
-        self.execute_dcb_cp_routed(words, is_compute, false)
+        // Synchronous entry (tests, inline fallback): there is no worker to
+        // re-check a suspended buffer, so an unmet wait cannot park it.
+        // Continue past it — the pre-suspend behaviour — rather than dropping
+        // the remainder of the buffer.
+        let mut start = 0usize;
+        let mut image = None;
+        loop {
+            let (segment, suspended) = self.execute_dcb_cp_routed(words, start, is_compute, false)?;
+            image = segment.or(image);
+            let Some(suspended) = suspended else {
+                return Ok(image);
+            };
+            debug!(
+                label = format_args!("{:#x}", suspended.wait.address),
+                "inline DCB execution continuing past an unmet wait (no worker to park it)"
+            );
+            start = suspended.resume_dword;
+        }
     }
 
     /// [`Self::execute_dcb_cp`] with presentation routing (stage C). With
@@ -649,25 +744,27 @@ impl AgcGpuSession {
     fn execute_dcb_cp_routed(
         &self,
         words: &[u32],
+        start_dword: usize,
         is_compute: bool,
         deferred_present: bool,
-    ) -> Result<Option<RenderedImage>, AgcExecError> {
+    ) -> Result<(Option<RenderedImage>, Option<SuspendedWait>), AgcExecError> {
         let memory = self
             .guest_memory
             .lock()
             .clone()
             .ok_or(AgcExecError::AddressSpaceUnavailable)?;
         crate::guest_mem::with_guest_memory(&memory, || {
-            self.execute_dcb_cp_authorized(words, is_compute, deferred_present)
+            self.execute_dcb_cp_authorized(words, start_dword, is_compute, deferred_present)
         })
     }
 
     fn execute_dcb_cp_authorized(
         &self,
         words: &[u32],
+        start_dword: usize,
         is_compute: bool,
         deferred_present: bool,
-    ) -> Result<Option<RenderedImage>, AgcExecError> {
+    ) -> Result<(Option<RenderedImage>, Option<SuspendedWait>), AgcExecError> {
         let decoded = agc::decode_submission(words)?;
         // Route each queue to its own command processor: the async-compute (ACB)
         // ring keeps register/shader state independent of the graphics DCB, so a
@@ -683,12 +780,13 @@ impl AgcGpuSession {
         // for the next submission.
         if decoded.draw_packets == 0 && decoded.dispatch_packets == 0 {
             let mut sink = StateOnlySink;
-            cp.run_with_memory(
+            let outcome = cp.run_resumable(
                 words,
+                start_dword,
                 &mut sink,
                 Some(&crate::guest_mem::IdentityGuestMemory),
             )?;
-            return Ok(None);
+            return Ok((None, suspended_of(outcome)));
         }
 
         self.ensure_backend()?;
@@ -710,8 +808,9 @@ impl AgcGpuSession {
         sink.current_compute = *self.last_compute_shader.lock();
         // Indirect register/draw packets carry guest pointers; the identity
         // map makes them host-readable (VirtualQuery-validated).
-        let run = cp.run_with_memory(
+        let run = cp.run_resumable(
             words,
+            start_dword,
             &mut sink,
             Some(&crate::guest_mem::IdentityGuestMemory),
         );
@@ -747,7 +846,7 @@ impl AgcGpuSession {
                 dispatch_skip_reason.as_deref(),
                 &shader_state,
             );
-            run?;
+            let suspended = suspended_of(run?);
             if drawn > 0 {
                 *self.draw_count.lock() += drawn;
             }
@@ -756,7 +855,7 @@ impl AgcGpuSession {
                 last_target = format_args!("{:#x}", last_target.unwrap_or(0)),
                 "AGC DCB executed with presentation deferred to the next flip"
             );
-            return Ok(image);
+            return Ok((image, suspended));
         }
         // Stage B flush: land every deferred readback in the framebuffer map
         // — at most one readback per touched target per SUBMISSION, instead
@@ -828,7 +927,7 @@ impl AgcGpuSession {
             dispatch_skip_reason.as_deref(),
             &shader_state,
         );
-        run?;
+        let suspended = suspended_of(run?);
 
         if let Some(image) = image {
             // Present the VideoOut scanout buffer when the title has flipped to
@@ -875,10 +974,10 @@ impl AgcGpuSession {
             if let Some(targets) = all_targets {
                 maybe_dump_all_targets(&targets, present_index);
             }
-            return Ok(Some(image));
+            return Ok((Some(image), suspended));
         }
         debug!("AGC DCB ran through the command processor without a draw");
-        Ok(None)
+        Ok((None, suspended))
     }
 
     /// Accumulate this submission's shader skips and warn with a process-wide

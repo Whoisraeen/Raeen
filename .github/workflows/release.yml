@@ -17,24 +17,36 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build (release)
-        run: cargo build --release -p xps5x-gui
-      - name: Package
+
+      - name: Derive version from tag
+        id: ver
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path dist/xps5x | Out-Null
-          Copy-Item target/release/xps5x.exe dist/xps5x/
-          Copy-Item LICENSE, README.md, THIRD_PARTY_NOTICES.md dist/xps5x/
-          Copy-Item -Recurse themes dist/xps5x/themes
-          Compress-Archive -Path dist/xps5x/* -DestinationPath dist/xps5x-windows-x86_64.zip
-          # Bare exe published alongside the zip: the in-app updater downloads
-          # this directly so it never needs to unpack an archive.
-          Copy-Item target/release/xps5x.exe dist/xps5x-windows-x86_64.exe
+          $v = "${{ github.ref_name }}" -replace '^v', ''
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      # build.ps1 does everything: cargo build --release, regenerate branding,
+      # portable ZIP, and compile the Inno installer (ISCC from choco above).
+      - name: Build installer + portable ZIP
+        shell: pwsh
+        run: ./installer/build.ps1 -Version ${{ steps.ver.outputs.version }}
+
+      # Bare exe published alongside the installer: the in-app updater downloads
+      # this asset directly (matched by its "-windows-x86_64.exe" suffix) so it
+      # never has to unpack the installer or the portable archive.
+      - name: Stage updater asset (bare exe)
+        shell: pwsh
+        run: Copy-Item target/release/xps5x.exe dist/xps5x-windows-x86_64.exe
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/xps5x-windows-x86_64.zip
+            dist/XPS5X-${{ steps.ver.outputs.version }}-Setup.exe
+            dist/XPS5X-${{ steps.ver.outputs.version }}-portable-win64.zip
             dist/xps5x-windows-x86_64.exe
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}

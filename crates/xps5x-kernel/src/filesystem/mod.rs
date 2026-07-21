@@ -50,6 +50,13 @@ struct OpenFile {
     position: u64,
     /// File data (cached in memory; the write-back buffer for a writable fd).
     data: Option<Vec<u8>>,
+    /// Lazy read-only backing: the host file handle and its length. Present
+    /// instead of `data` for a read-only fd of an existing file, so a large
+    /// file streams on demand rather than being slurped whole into memory at
+    /// `open`. The eager `std::fs::read` OOMs under host commit pressure —
+    /// measured: ASTRO.BOT's 6.7 MiB `game_text.xml` failed to open, returned a
+    /// null fd, and the game null-dereferenced it (logs/xps5x.txt).
+    reader: Option<(std::fs::File, u64)>,
     /// Whether the fd was opened for writing (`O_WRONLY`/`O_RDWR`).
     writable: bool,
     /// Whether `data` has unflushed writes to persist to `host_path` on close.
@@ -445,6 +452,7 @@ impl VirtualFileSystem {
                     ps5_path: path.to_string(),
                     position: 0,
                     data: None,
+                    reader: None,
                     writable: false,
                     dirty: false,
                     flags,
@@ -497,7 +505,21 @@ impl VirtualFileSystem {
         } else {
             None
         };
+        // Read-only opens of an existing file stream lazily from the host file
+        // instead of buffering the whole thing at open time. Slurping the file
+        // into a `Vec` up front allocates its full size in one shot, which fails
+        // with `OutOfMemory` under host commit pressure (the paging file being
+        // too small) — the open then returns an error a title reads as "the file
+        // does not exist", and titles that skip the null check crash. Writable
+        // opens still load the content: the write-back model rewrites the whole
+        // file on close, so it needs the buffer.
+        let mut reader = None;
         let data = if is_directory {
+            None
+        } else if exists && !truncate && !writable {
+            let handle = std::fs::File::open(&host_path)?;
+            let len = handle.metadata().map(|m| m.len()).unwrap_or(0);
+            reader = Some((handle, len));
             None
         } else if exists && !truncate {
             Some(std::fs::read(&host_path)?)
@@ -537,6 +559,7 @@ impl VirtualFileSystem {
             ps5_path: path.to_string(),
             position,
             data,
+            reader,
             writable,
             dirty,
             flags,
@@ -559,12 +582,26 @@ impl VirtualFileSystem {
                     "fd is a directory",
                 ));
             }
+            let pos = file.position;
             if let Some(ref data) = file.data {
-                let pos = file.position as usize;
-                let end = (pos + count).min(data.len());
-                let result = data[pos..end].to_vec();
+                let start = pos as usize;
+                let end = (start + count).min(data.len());
+                let result = data[start..end].to_vec();
                 file.position = end as u64;
                 Ok(result)
+            } else if let Some((handle, len)) = file.reader.as_mut() {
+                use std::io::{Read, Seek, SeekFrom};
+                // Serve at most the bytes remaining to EOF. `count` is already
+                // capped by the caller (READ_MAX_BYTES), so the transient buffer
+                // is bounded and freed as soon as the guest copies it out —
+                // unlike the whole-file buffer the eager path held for the fd's
+                // whole lifetime.
+                let want = (*len).saturating_sub(pos).min(count as u64);
+                handle.seek(SeekFrom::Start(pos))?;
+                let mut buf = Vec::new();
+                handle.take(want).read_to_end(&mut buf)?;
+                file.position = pos + buf.len() as u64;
+                Ok(buf)
             } else {
                 Ok(Vec::new())
             }
@@ -629,14 +666,26 @@ impl VirtualFileSystem {
                 "fd is a directory",
             ));
         }
-        let Some(ref data) = file.data else {
-            return Ok(Vec::new());
-        };
-        let pos = usize::try_from(offset)
-            .unwrap_or(usize::MAX)
-            .min(data.len());
-        let end = pos.saturating_add(count).min(data.len());
-        Ok(data[pos..end].to_vec())
+        if let Some(ref data) = file.data {
+            let pos = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(data.len());
+            let end = pos.saturating_add(count).min(data.len());
+            Ok(data[pos..end].to_vec())
+        } else if let Some((handle, len)) = file.reader.as_ref() {
+            use std::io::{Read, Seek, SeekFrom};
+            // `pread` holds only a read lock, so it must not move the stored
+            // handle's cursor — clone it for an independent positional read.
+            let start = offset.min(*len);
+            let want = (*len).saturating_sub(start).min(count as u64);
+            let mut clone = handle.try_clone()?;
+            clone.seek(SeekFrom::Start(start))?;
+            let mut buf = Vec::new();
+            clone.take(want).read_to_end(&mut buf)?;
+            Ok(buf)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// Reposition an open file descriptor. `whence` follows POSIX:
@@ -651,7 +700,12 @@ impl VirtualFileSystem {
                 format!("fd {fd} not open"),
             ));
         };
-        let size = file.data.as_ref().map_or(0u64, |d| d.len() as u64);
+        let size = file
+            .data
+            .as_ref()
+            .map(|d| d.len() as u64)
+            .or_else(|| file.reader.as_ref().map(|(_, len)| *len))
+            .unwrap_or(0);
         let base = match whence {
             0 => 0i64,                 // SEEK_SET
             1 => file.position as i64, // SEEK_CUR
@@ -679,10 +733,13 @@ impl VirtualFileSystem {
     /// The size in bytes of an open file's backing data (0 if the host file
     /// was absent at open time). Used by `fstat`/`lseek(SEEK_END)`.
     pub fn file_size(&self, fd: Fd) -> Option<u64> {
-        self.open_files
-            .read()
-            .get(&fd)
-            .map(|f| f.data.as_ref().map_or(0, |d| d.len() as u64))
+        self.open_files.read().get(&fd).map(|f| {
+            f.data
+                .as_ref()
+                .map(|d| d.len() as u64)
+                .or_else(|| f.reader.as_ref().map(|(_, len)| *len))
+                .unwrap_or(0)
+        })
     }
 
     /// Return the descriptor's Orbis open flags.
@@ -912,6 +969,51 @@ mod tests {
         assert_eq!(vfs.read(fd2, 8).unwrap(), b"SAVEDATA");
         vfs.close(fd2).unwrap();
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read-only open must stream a large file lazily instead of buffering it
+    /// whole at open. The regression this guards: ASTRO.BOT's 6.7 MiB
+    /// `game_text.xml` was slurped into a `Vec` at open, which OOMed under host
+    /// commit pressure — the open failed, the title read that as "file absent",
+    /// got a null fd, and crashed. Chunked read, seek, size, and pread must all
+    /// work off the lazy handle and return the exact bytes.
+    #[test]
+    fn readonly_open_streams_a_large_file_lazily() {
+        use open_flags::*;
+        let dir = temp_dir("lazy-read");
+        // Several MiB of deterministic content, larger than one read.
+        let content: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.join("big.bin"), &content).unwrap();
+
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+
+        let fd = vfs.open("/app0/big.bin", O_RDONLY, 0).unwrap();
+
+        // SEEK_END and fstat report the on-disk length without buffering it.
+        assert_eq!(vfs.seek(fd, 0, 2).unwrap(), content.len() as u64);
+        assert_eq!(vfs.file_size(fd), Some(content.len() as u64));
+        assert_eq!(vfs.seek(fd, 0, 0).unwrap(), 0);
+
+        // Sequential chunked reads reassemble the file byte-for-byte and stop
+        // cleanly at EOF.
+        let mut got = Vec::new();
+        loop {
+            let chunk = vfs.read(fd, 100_000).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(got, content, "streamed read must match the file exactly");
+
+        // A positional read reads the right window and does not disturb the
+        // sequential cursor (which is now at EOF).
+        let mid = vfs.pread(fd, 16, 1_000_000).unwrap();
+        assert_eq!(mid, content[1_000_000..1_000_016]);
+
+        vfs.close(fd).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

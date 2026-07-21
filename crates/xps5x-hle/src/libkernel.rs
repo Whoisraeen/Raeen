@@ -109,6 +109,12 @@ const FILE_ENOENT: u64 = (-2i64) as u64;
 const FILE_EFAULT: u64 = (-14i64) as u64;
 /// `EINVAL` (invalid argument) as a sign-extended negative return.
 const FILE_EINVAL: u64 = (-22i64) as u64;
+/// `EIO` (i/o error) as a sign-extended negative return.
+const FILE_EIO: u64 = (-5i64) as u64;
+/// `ENOMEM` (out of memory) as a sign-extended negative return.
+const FILE_ENOMEM: u64 = (-12i64) as u64;
+/// `EACCES` (permission denied) as a sign-extended negative return.
+const FILE_EACCES: u64 = (-13i64) as u64;
 /// Cap on a single `read` transfer into guest memory (bounds host staging).
 const READ_MAX_BYTES: u64 = 16 << 20; // 16 MiB
 
@@ -364,8 +370,20 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
             fd as u64
         }
         Err(e) => {
-            warn!("open: '{path}' failed: {e} — ENOENT");
-            FILE_ENOENT
+            // Map the host error to the matching errno instead of calling every
+            // failure ENOENT. An out-of-memory open — the eager whole-file
+            // buffer failing under host commit pressure — reported as "file not
+            // found" cost a full debugging cycle chasing a missing file that was
+            // right there on disk. A title also branches on errno (retry vs give
+            // up), so the distinction is load-bearing, not cosmetic.
+            let errno = match e.kind() {
+                std::io::ErrorKind::NotFound => FILE_ENOENT,
+                std::io::ErrorKind::PermissionDenied => FILE_EACCES,
+                std::io::ErrorKind::OutOfMemory => FILE_ENOMEM,
+                _ => FILE_EIO,
+            };
+            warn!("open: '{path}' failed: {e} (errno {})", -(errno as i64));
+            errno
         }
     }
 }
