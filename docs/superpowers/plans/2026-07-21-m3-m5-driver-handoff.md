@@ -141,10 +141,20 @@ commit if green; its report is authoritative over this doc for those items.
    interactive evidence.
 
 ### 4.2 Minecraft → M4 (menu) and the 120 FPS proof
-1. Stub NP/auth to "signed in, entitled, offline-OK":
-   `SceNpAuthAuthorizedAppDialog`, `SceNpWebApi*` fail-soft per shadPS4
-   patterns; memory `minecraft-boot-state` has the measured call list.
-2. Gameface/Ore-UI page handoff (`data/gui/dist/hbui`) — HLE class, not GPU.
+⚠️ CORRECTION (minecraft-boot-state memory body, line ~240): the "PSN auth
+stall" is a DISPROVEN misread — the title never CALLS those NIDs (0
+unimplemented-import faults, 0 thread deaths); the `SceNp*` strings are the
+LINKER naming missing imports, not the game invoking PSN. Do NOT stub PSN to
+"reach the menu" — that lead is dead. The real wall (memory body): a LIVE-LOCK
+— after resource-pack enumeration + savedata + RakNet init, every thread parks
+in SHORT polling waits (each <3s, so no starvation detector trips) and no
+predicate ever becomes true. Everyone polls; nothing advances. Main thread
+waits in `pthread_cond_timedwait` on a cond nothing signals to completion.
+1. Find the predicate: correlate the main thread's waited cond with which
+   worker should make it true; dump the guest flag/counter it re-checks. The
+   memory has ~10 eliminated hypotheses — READ THE BODY before diagnosing.
+2. Gameface/Ore-UI page handoff (`data/gui/dist/hbui`) — HLE class, not GPU;
+   only relevant AFTER the live-lock clears (menu HTML never opened yet).
 3. When the menu runs unthrottled: `XPS5X_VBLANK_HZ=120` and measure
    flips/s sustained — this is the 120 FPS goal's test bench. If flip cost
    caps it, next lever is async flip readback (attempted once — deadlocked a
