@@ -2326,3 +2326,14 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   not backed by a captured descriptor (incl. raw-EUD overwrite) refuse as
   named 'dynamic-image-descriptor' skip (SharpEmu evaluator :654-662), never
   a device-loss submit; (iv) storage-image contract validation deferred.
+
+- MILESTONE M3 CLOSED (2026-07-21): interactive 2D homebrew + pad + VideoOut flip.
+  present-from-guest-memory (SharpEmu GuestImageWantsInitialData) makes CPU-drawn
+  2D visible; acceptance test crates/xps5x-runtime/tests/m3_interactive_2d.rs runs
+  a real synthesized guest (scePadReadState -> CPU framebuffer by input -> flip)
+  and asserts output changes with input + flip advanced + last_image reflects it.
+  Pad/audio HLE already tested. NEXT GATE: M4 (commercial 2D title to interactive
+  menu with useful crash/NID/GPU logs) — blockers per per-title memories.
+  CAVEAT: this commit bundled concurrent stage-D GPU texture cache whose FPS is
+  UNVERIFIED (Minecraft after-run flips 43->22, build 969->59us) — re-measure via
+  XPS5X_NO_TEX_CACHE A/B and revert if it regresses.
