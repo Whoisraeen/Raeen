@@ -13,6 +13,16 @@
 //! so the pixels are already sitting in host memory. When render targets move
 //! GPU-side that readback becomes one-per-flip instead of one-per-draw, and this
 //! keeps working — it only ever asked for "the latest frame, as host pixels".
+//!
+//! As of GPU stage C that is where things stand: ONE readback per flip (only
+//! the flipped/presented target crosses to the CPU; other render targets stay
+//! GPU-side). Going below one — true zero-copy presentation — was assessed and
+//! deliberately not built: eframe renders through wgpu on its own device, while
+//! the guest GPU renders through ash on a second `VkDevice`, so a shared image
+//! needs either (a) re-hosting the whole guest renderer on wgpu's raw Vulkan
+//! device, or (b) `VK_KHR_external_memory_win32` export/import plus an
+//! `egui_wgpu` paint-callback path. Both are real integrations (M3 swapchain
+//! territory), not an optimization of this view.
 
 /// Presents the newest rendered guest frame, if there is one.
 #[derive(Default)]

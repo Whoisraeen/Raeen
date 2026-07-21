@@ -72,6 +72,10 @@ pub struct DrawCacheStats {
     pub batch_flushes: u64,
     pub target_readbacks: u64,
     pub sampled_target_binds: u64,
+    /// Upload-ring effectiveness (stage C item 3): a hit recycles a pooled
+    /// host buffer; a miss pays vkCreateBuffer + vkAllocateMemory.
+    pub host_pool_hits: u64,
+    pub host_pool_misses: u64,
 }
 
 /// One descriptor-set-layout binding, reduced to the fields that feed
@@ -272,8 +276,38 @@ pub(crate) struct DrawCaches {
     /// referenced by pending command buffers, so destruction waits for the
     /// flush's fence.
     deferred_target_destroys: Vec<PersistentTarget>,
+    /// Upload ring (stage C item 3): recycled HOST_VISIBLE|HOST_COHERENT
+    /// buffers for per-draw guest data (vertex/index/storage/seed/texture
+    /// staging). Free entries keyed by capacity (a power of two); a draw takes
+    /// the smallest entry that fits and creation only happens on a pool miss.
+    /// Reuse is fence-tracked by construction: buffers return here only after
+    /// the immediate draw's fence wait (`Resources::Drop`) or the batch flush
+    /// fence (`retire_batch`).
+    host_pool_free: std::collections::BTreeMap<u64, Vec<(vk::Buffer, vk::DeviceMemory)>>,
+    /// Capacity registry for every live pooled buffer (in use or free), keyed
+    /// by the raw buffer handle — how `release_host_buffer` distinguishes a
+    /// pooled buffer (recycle) from an ad-hoc one (destroy) and knows which
+    /// size class it returns to.
+    host_pool_capacity: HashMap<u64, u64>,
+    /// Total bytes sitting FREE in the pool, for the recycle cap.
+    host_pool_free_bytes: u64,
     pub stats: DrawCacheStats,
 }
+
+/// Free-pool cap: pooled buffers beyond this many bytes are destroyed on
+/// release instead of recycled, so a burst of huge uploads cannot pin
+/// host memory forever.
+const HOST_POOL_FREE_CAP: u64 = 256 * 1024 * 1024;
+
+/// Usage union for pooled host buffers. One pool serves every per-draw guest
+/// upload, so each buffer carries the union of the usages those uploads need;
+/// extra usage bits on a buffer are free on desktop drivers.
+pub(crate) const HOST_POOL_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+    vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
+        | vk::BufferUsageFlags::VERTEX_BUFFER.as_raw()
+        | vk::BufferUsageFlags::INDEX_BUFFER.as_raw()
+        | vk::BufferUsageFlags::STORAGE_BUFFER.as_raw(),
+);
 
 /// Byte size of the emulated GDS arena — the real chip's Global Data Share is
 /// 64 KiB.
@@ -522,6 +556,86 @@ impl DrawCaches {
         Ok(buffer)
     }
 
+    /// Take a pooled host-visible buffer with capacity >= `size` (smallest
+    /// fitting size class), or create one (capacity = next power of two).
+    /// The returned buffer is registered; hand it back through
+    /// [`Self::release_host_buffer`] once no submitted GPU work references it.
+    pub(crate) fn acquire_host_buffer(
+        &mut self,
+        dev: &VulkanDevice,
+        size: u64,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory), GpuError> {
+        debug_assert!(size > 0, "zero-sized host buffer request");
+        // Smallest free size class that fits. Don't hand a small request a
+        // giant buffer (>= 8x) — that starves the big classes and bloats
+        // descriptor ranges' backing for nothing.
+        let fitting = self
+            .host_pool_free
+            .range(size..)
+            .find(|(cap, list)| **cap < size.saturating_mul(8) && !list.is_empty())
+            .map(|(cap, _)| *cap);
+        if let Some(cap) = fitting {
+            let list = self
+                .host_pool_free
+                .get_mut(&cap)
+                .expect("size class just found");
+            let entry = list.pop().expect("size class was non-empty");
+            if list.is_empty() {
+                self.host_pool_free.remove(&cap);
+            }
+            self.host_pool_free_bytes -= cap;
+            self.stats.host_pool_hits += 1;
+            return Ok(entry);
+        }
+        let capacity = size.next_power_of_two().max(256);
+        let (buffer, memory) = create_host_buffer(dev, capacity)?;
+        self.host_pool_capacity.insert(buffer.as_raw(), capacity);
+        self.stats.host_pool_misses += 1;
+        Ok((buffer, memory))
+    }
+
+    /// Return a buffer to the pool (if it came from [`Self::acquire_host_buffer`])
+    /// or destroy it (ad-hoc buffers — readback/depth buffers — route through
+    /// here too so call sites need not distinguish).
+    ///
+    /// # Safety contract (checked by the caller)
+    ///
+    /// No submitted GPU work may still reference the buffer: immediate draws
+    /// waited their fence, batched draws are released only by
+    /// [`Self::retire_batch`] after the flush fence.
+    pub(crate) fn release_host_buffer(
+        &mut self,
+        dev: &VulkanDevice,
+        buffer: vk::Buffer,
+        memory: vk::DeviceMemory,
+    ) {
+        if buffer == vk::Buffer::null() && memory == vk::DeviceMemory::null() {
+            return;
+        }
+        if let Some(&capacity) = self.host_pool_capacity.get(&buffer.as_raw()) {
+            if self.host_pool_free_bytes + capacity <= HOST_POOL_FREE_CAP {
+                self.host_pool_free
+                    .entry(capacity)
+                    .or_default()
+                    .push((buffer, memory));
+                self.host_pool_free_bytes += capacity;
+                return;
+            }
+            // Over the cap: fall through to destruction.
+            self.host_pool_capacity.remove(&buffer.as_raw());
+        }
+        // SAFETY: caller guarantees no pending GPU work references the pair;
+        // both handles were created from this device and are destroyed once.
+        unsafe {
+            if buffer != vk::Buffer::null() {
+                dev.device().destroy_buffer(buffer, None);
+            }
+            if memory != vk::DeviceMemory::null() {
+                dev.device().free_memory(memory, None);
+            }
+        }
+    }
+
     /// The reusable command buffer + fence, with the fence reset for a new
     /// submission. Legal because every submission through it is synchronous:
     /// the caller waits the fence before the cache lock is released.
@@ -690,9 +804,25 @@ impl DrawCaches {
             .collect()
     }
 
-    /// Whether any deferred draw is awaiting its flush.
+    /// Whether any deferred draw is awaiting its flush, or any touched target
+    /// still holds GPU-side content that was never read back (a scanout-
+    /// filtered flush read only the flipped target and re-queued the rest).
     pub(crate) fn batch_open(&self) -> bool {
-        !self.pending.is_empty()
+        !self.pending.is_empty() || !self.touched.is_empty()
+    }
+
+    /// Put back touched targets a scanout-filtered flush chose NOT to read.
+    /// Their GPU images remain the sole content authority
+    /// ([`TargetContent::GpuNewer`]); a later full flush (flip miss, frame
+    /// dump, feedback fallback, wait_idle) reads them then. Runs under the
+    /// same cache lock as the `take_batch` that emptied the list, so no draw
+    /// can interleave.
+    pub(crate) fn requeue_touched(&mut self, keys: Vec<TargetKey>) {
+        for key in keys {
+            if !self.touched.contains(&key) {
+                self.touched.push(key);
+            }
+        }
     }
 
     /// Whether `base` has deferred (not yet read back) draws pending.
@@ -770,6 +900,12 @@ impl DrawCaches {
             if res.command_buffer != vk::CommandBuffer::null() {
                 self.free_command_buffers.push(res.command_buffer);
             }
+            // Pooled host buffers go back to the upload ring (the flush fence
+            // was waited, so nothing on the GPU references them); ad-hoc
+            // buffers are destroyed inside release_host_buffer.
+            for (buffer, memory) in res.buffers {
+                self.release_host_buffer(dev, buffer, memory);
+            }
             // SAFETY: the flush fence was waited; every handle below was
             // created for the retired draw alone and is destroyed exactly
             // once, children before parents.
@@ -777,10 +913,6 @@ impl DrawCaches {
                 let d = dev.device();
                 if res.descriptor_pool != vk::DescriptorPool::null() {
                     d.destroy_descriptor_pool(res.descriptor_pool, None);
-                }
-                for (buffer, memory) in res.buffers {
-                    d.destroy_buffer(buffer, None);
-                    d.free_memory(memory, None);
                 }
                 for (image, memory, view) in res.images {
                     if view != vk::ImageView::null() {
@@ -906,8 +1038,69 @@ impl DrawCaches {
             for (_, target) in self.targets.drain() {
                 destroy_target(device, &target);
             }
+            // Upload ring: free entries are owned solely by the pool. In-use
+            // pooled buffers were already destroyed above through the pending
+            // list (or by `Resources::Drop` before teardown).
+            for (_, list) in std::mem::take(&mut self.host_pool_free) {
+                for (buffer, memory) in list {
+                    device.destroy_buffer(buffer, None);
+                    device.free_memory(memory, None);
+                }
+            }
+            self.host_pool_capacity.clear();
+            self.host_pool_free_bytes = 0;
         }
     }
+}
+
+/// Create one pooled host-visible|coherent buffer of `capacity` bytes with the
+/// pool's usage union.
+fn create_host_buffer(
+    dev: &VulkanDevice,
+    capacity: u64,
+) -> Result<(vk::Buffer, vk::DeviceMemory), GpuError> {
+    let info = vk::BufferCreateInfo::default()
+        .size(capacity)
+        .usage(HOST_POOL_USAGE)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    // SAFETY: `info` is fully initialized; the device is live. The handle is
+    // registered in the pool and destroyed exactly once (release over cap,
+    // teardown, or its owner's Drop via release_host_buffer).
+    let buffer = unsafe { dev.device().create_buffer(&info, None) }
+        .map_err(|e| GpuError::VulkanInitFailed(format!("pool vkCreateBuffer: {e}")))?;
+    // SAFETY: `buffer` was just created from this device.
+    let reqs = unsafe { dev.device().get_buffer_memory_requirements(buffer) };
+    let cleanup = |e| {
+        // SAFETY: destroying the just-created, never-bound buffer.
+        unsafe { dev.device().destroy_buffer(buffer, None) };
+        e
+    };
+    let type_index = dev
+        .find_memory_type(
+            reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .map_err(cleanup)?;
+    let alloc = vk::MemoryAllocateInfo::default()
+        .allocation_size(reqs.size)
+        .memory_type_index(type_index);
+    // SAFETY: allocation size/type come from this buffer's own requirements.
+    let memory = unsafe { dev.device().allocate_memory(&alloc, None) }
+        .map_err(|e| GpuError::VulkanInitFailed(format!("pool vkAllocateMemory: {e}")))
+        .map_err(cleanup)?;
+    // SAFETY: memory was allocated for exactly this buffer; offset 0 is in
+    // range and aligned by construction.
+    if let Err(e) = unsafe { dev.device().bind_buffer_memory(buffer, memory, 0) } {
+        // SAFETY: unwinding our own two handles, neither yet in use.
+        unsafe {
+            dev.device().free_memory(memory, None);
+            dev.device().destroy_buffer(buffer, None);
+        }
+        return Err(GpuError::VulkanInitFailed(format!(
+            "pool vkBindBufferMemory: {e}"
+        )));
+    }
+    Ok((buffer, memory))
 }
 
 /// Destroy one persistent target's handles.

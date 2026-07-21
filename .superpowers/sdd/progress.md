@@ -2211,3 +2211,49 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
     bind-time draw skips, all three error classes now 0). tests: xps5x-gpu
     134 unit + integration green incl. new tests/compute_gds.rs (GDS
     persistence + tex-no-sampler Vulkan plumbing); clippy -D warnings clean.
+
+## 2026-07-20 gpu-pipeline — perf stage C: flush per flip + flip-limited readback + upload ring (uncommitted)
+- Item 1 flush-per-flip: worker submissions no longer flush/present per
+  submission (execute_dcb_cp_routed deferred_present). Flush consumers only:
+  present_scanout (flip), wait_idle/shutdown, XPS5X_DUMP_FRAMES (keeps old
+  per-submission cadence for dump fidelity), feedback-loop fallback in the
+  sink. Flip flush routed through the ordered GPU work queue as
+  GpuWork::Flush{address,done} — executes on the worker after all queued
+  draws, rendezvous back to the HLE thread; inline fallback when no worker.
+  Direct execute_dcb_cp path byte-identical (all 13 suites green, 135 unit).
+- Item 2 flip-limited readback: flush_deferred_draws_filtered(only_bases)
+  reads back only {flip address, remembered fallback target}; other dirty
+  targets stay GPU-side (requeued touched, GpuNewer). Flip-miss most-content
+  fallback remembers its winner (fallback_present_base), full census
+  re-election every 64 misses. ASTRO.BOT measured before fix: 2 flushes/flip,
+  full 15-target HDR readback 54 ms; after: steady-state 1-target readback.
+- Item 3 upload ring: DrawCaches host-buffer pool (BTreeMap size classes,
+  usage union, 256 MiB free cap), fence-tracked recycle via retire_batch +
+  Resources::Drop; storage descriptors now bind exact ranges (WHOLE_SIZE
+  would expose recycled tails). ASTRO.BOT build_us p50 657 -> 396.
+- Measured (Minecraft 180s, release): peak animation window 40-43 -> 49-50
+  flips/s; p50 flip interval 20.19 ms, min 1.76 ms => ceiling owner is the
+  ~20 ms pacer, NOT the GPU: title imports sceVideoOutWaitVblank and our HLE
+  sleeps 16.667 ms/call (libsce_video_out.rs:637), Windows-quantized to
+  ~20 ms => hard ~50-60 flips/s cap. 120 flips/s needs an HLE vblank change
+  (read-only this session; reported).
+- gui/shell/present.rs: documented why zero-copy egui presentation needs
+  eframe(wgpu)/ash device interop (external memory or one shared device) —
+  out of stage C scope; design stops at 1 readback per flip.
+- Item 4 addendum: flip-miss remembered-target fix measured on ASTRO.BOT:
+  195 flushes / 192 flips (1.02/flip, was 2/flip, stage B ~11.4/present);
+  steady state targets_read=1 mean 7.5 ms (HDR 16 MB copy+map), re-election
+  full flushes rare. Minecraft peak window improved again 49-50 -> 60-63
+  flips/s (p50 interval 15.9 ms = the 60 Hz vblank pacer; min 1.76 ms shows
+  GPU is not the constraint). Fire-and-forget flip flush (true item 4 async)
+  was tried and REVERTED: Minecraft wedged ~10 s in (flips stop, pthread_sync
+  "stuck >3s" main-thread deadlock on a title mutex held by the flipping
+  render-pool thread, 3 threads spinning); ASTRO.BOT ran clean on the same
+  build (188 flips, 1 flush/flip) — wedge is Minecraft-specific, cause not
+  yet understood; rendezvous flip flush kept (comment at present_scanout).
+- Ceiling ownership (measured, read-only on xps5x-hle): 120 flips/s is NOT
+  reachable while sceVideoOutWaitVblank sleeps a fixed 16.667 ms
+  (libsce_video_out.rs:637) — Minecraft imports it and paces its animation
+  window to ~60 Hz (p50 15.9 ms). Next lever is an HLE vblank change
+  (host-timer-resolution aware sleep, event-driven vblank, or a 120 Hz mode),
+  out of this session's allowed scope.

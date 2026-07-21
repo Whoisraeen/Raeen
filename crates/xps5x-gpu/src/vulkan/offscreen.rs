@@ -759,6 +759,28 @@ pub fn render_draw_deferred(
 /// draw seeds from the (stale) CPU pixels rather than trusting an image in an
 /// unknown state.
 pub fn flush_deferred_draws(dev: &VulkanDevice) -> Result<Vec<(u64, RenderedImage)>, GpuError> {
+    flush_deferred_draws_filtered(dev, None)
+}
+
+/// [`flush_deferred_draws`] with the readback optionally restricted to a
+/// small set of guest base addresses (stage C item 2: at a flip, only the
+/// flipped/presented target's pixels are needed on the CPU).
+///
+/// With `only_bases = Some(bases)`, the flush still fences and retires EVERY
+/// pending draw (their command buffers completed under the same fence), but
+/// copies back only the touched targets whose base is in `bases`. The other
+/// touched targets stay GPU-side — content state [`TargetContent::GpuNewer`],
+/// re-queued as touched — until a later flush whose filter (or lack of one)
+/// selects them. `None` reads every touched target back, exactly the old
+/// behaviour.
+///
+/// # Errors
+///
+/// Same as [`flush_deferred_draws`].
+pub fn flush_deferred_draws_filtered(
+    dev: &VulkanDevice,
+    only_bases: Option<&[u64]>,
+) -> Result<Vec<(u64, RenderedImage)>, GpuError> {
     let timing = std::env::var_os("XPS5X_TIME_DRAW").is_some();
     let t0 = std::time::Instant::now();
     let mut caches = dev.draw_caches();
@@ -766,10 +788,22 @@ pub fn flush_deferred_draws(dev: &VulkanDevice) -> Result<Vec<(u64, RenderedImag
         return Ok(Vec::new());
     }
     let (pending, touched, evicted) = caches.take_batch();
+    let (read_now, keep): (Vec<TargetKey>, Vec<TargetKey>) = match only_bases {
+        Some(bases) => touched.into_iter().partition(|k| bases.contains(&k.base)),
+        None => (touched, Vec::new()),
+    };
+    // Nothing pending to fence and the filter selected nothing: put the
+    // unread targets back and do no GPU work at all.
+    if pending.is_empty() && read_now.is_empty() && evicted.is_empty() {
+        caches.requeue_touched(keep);
+        return Ok(Vec::new());
+    }
     let pending_draws = pending.len();
-    match record_and_read_flush(dev, &mut caches, &touched) {
+    match record_and_read_flush(dev, &mut caches, &read_now) {
         Ok(images) => {
             caches.retire_batch(dev, pending, evicted);
+            let kept_gpu_side = keep.len();
+            caches.requeue_touched(keep);
             caches.stats.batch_flushes += 1;
             caches.stats.target_readbacks += images.len() as u64;
             if timing {
@@ -777,7 +811,8 @@ pub fn flush_deferred_draws(dev: &VulkanDevice) -> Result<Vec<(u64, RenderedImag
                     flush_us = t0.elapsed().as_micros(),
                     pending_draws,
                     targets_read = images.len(),
-                    "TIME_DRAW: deferred-batch flush (one fence + one readback per touched target)"
+                    targets_kept_gpu_side = kept_gpu_side,
+                    "TIME_DRAW: deferred-batch flush (one fence + one readback per selected target)"
                 );
             }
             Ok(images)
@@ -788,7 +823,9 @@ pub fn flush_deferred_draws(dev: &VulkanDevice) -> Result<Vec<(u64, RenderedImag
             // their resources cannot free memory the GPU is reading.
             // SAFETY: waiting the device idle takes no handles.
             let _ = unsafe { dev.device().device_wait_idle() };
-            for key in &touched {
+            // Unread (`keep`) targets degrade too: the device just faulted, so
+            // no GPU image is trustworthy enough to LOAD from or defer again.
+            for key in read_now.iter().chain(keep.iter()) {
                 caches.mark_target_unknown(key);
             }
             caches.retire_batch(dev, pending, evicted);
@@ -1149,8 +1186,7 @@ impl<'a> Resources<'a> {
             if let Some(initial) = state.initial
                 && !self.load_from_gpu
             {
-                let (buffer, memory) =
-                    self.create_buffer_with_bytes(initial, vk::BufferUsageFlags::TRANSFER_SRC)?;
+                let (buffer, memory) = self.create_buffer_with_bytes(initial)?;
                 self.upload_buffer = buffer;
                 self.upload_memory = memory;
             }
@@ -1163,8 +1199,7 @@ impl<'a> Resources<'a> {
             self.create_vertex_buffer(vertices)?;
         }
         if let Some(index) = &state.index {
-            let (buffer, memory) =
-                self.create_buffer_with_bytes(index.bytes, vk::BufferUsageFlags::INDEX_BUFFER)?;
+            let (buffer, memory) = self.create_buffer_with_bytes(index.bytes)?;
             self.index_buffer = buffer;
             self.index_memory = memory;
         }
@@ -1308,8 +1343,7 @@ impl<'a> Resources<'a> {
                 }
                 bytes[depth_bytes..].copy_from_slice(initial);
             }
-            let (buffer, memory) =
-                self.create_buffer_with_bytes(&bytes, vk::BufferUsageFlags::TRANSFER_SRC)?;
+            let (buffer, memory) = self.create_buffer_with_bytes(&bytes)?;
             self.depth_upload_buffer = buffer;
             self.depth_upload_memory = memory;
         }
@@ -1583,10 +1617,14 @@ impl<'a> Resources<'a> {
         Ok(())
     }
 
+    /// A host-visible buffer holding `bytes`, taken from the device's upload
+    /// ring (stage C item 3) — recycled fence-tracked buffers instead of a
+    /// vkCreateBuffer + vkAllocateMemory per guest upload. The pool's usage
+    /// union covers every caller (vertex/index/storage/transfer-src), so no
+    /// usage parameter exists any more.
     fn create_buffer_with_bytes(
-        &self,
+        &mut self,
         bytes: &[u8],
-        usage: vk::BufferUsageFlags,
     ) -> Result<(vk::Buffer, vk::DeviceMemory), GpuError> {
         if bytes.is_empty() {
             return Err(GpuError::VulkanInitFailed(
@@ -1594,19 +1632,25 @@ impl<'a> Resources<'a> {
             ));
         }
         let size = bytes.len() as vk::DeviceSize;
-        let (buffer, memory) = self.create_buffer(
-            size,
-            usage,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        let ptr = unsafe {
+        let (buffer, memory) = self.caches.acquire_host_buffer(self.dev, size)?;
+        let map_result = unsafe {
             self.device()
                 .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-        }
-        .map_err(|e| GpuError::VulkanInitFailed(format!("vkMapMemory failed: {e}")))?;
+        };
+        let ptr = match map_result {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                // Never yet referenced by GPU work — return it to the pool.
+                self.caches.release_host_buffer(self.dev, buffer, memory);
+                return Err(GpuError::VulkanInitFailed(format!(
+                    "vkMapMemory failed: {e}"
+                )));
+            }
+        };
 
-        // SAFETY: `memory` is HOST_VISIBLE and mapped for exactly
-        // `bytes.len()` bytes. No GPU submission can reference it yet.
+        // SAFETY: `memory` is HOST_VISIBLE|HOST_COHERENT and mapped for
+        // `bytes.len()` bytes (the pooled allocation is at least that big).
+        // No GPU submission can reference it yet.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
             self.device().unmap_memory(memory);
@@ -1623,8 +1667,7 @@ impl<'a> Resources<'a> {
                     vertex.stride
                 )));
             }
-            let allocation =
-                self.create_buffer_with_bytes(&vertex.bytes, vk::BufferUsageFlags::VERTEX_BUFFER)?;
+            let allocation = self.create_buffer_with_bytes(&vertex.bytes)?;
             self.guest_vertex_buffers.push(allocation);
         }
         Ok(())
@@ -1847,18 +1890,22 @@ impl<'a> Resources<'a> {
             let mut sampler_infos = Vec::new();
             if let Some(storage) = &stage.storage_buffers {
                 for bytes in &storage.buffers {
-                    let allocation =
-                        self.create_buffer_with_bytes(bytes, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+                    let allocation = self.create_buffer_with_bytes(bytes)?;
                     self.storage_buffers.push(allocation);
                 }
                 let first_buffer = self.storage_buffers.len() - storage.buffers.len();
+                // Range = the guest data's exact size, NOT WHOLE_SIZE: pooled
+                // buffers (upload ring) are usually larger than the data, and
+                // WHOLE_SIZE would expose a previous draw's stale tail bytes
+                // to the shader (and change OpArrayLength results).
                 buffer_infos = self.storage_buffers[first_buffer..]
                     .iter()
-                    .map(|(buffer, _)| {
+                    .zip(&storage.buffers)
+                    .map(|((buffer, _), bytes)| {
                         vk::DescriptorBufferInfo::default()
                             .buffer(*buffer)
                             .offset(0)
-                            .range(vk::WHOLE_SIZE)
+                            .range(bytes.len() as vk::DeviceSize)
                     })
                     .collect();
             }
@@ -1971,8 +2018,7 @@ impl<'a> Resources<'a> {
                 "texture upload requested with no pixels".to_owned(),
             ));
         }
-        let (staging_buffer, staging_memory) =
-            self.create_buffer_with_bytes(&upload.pixels, vk::BufferUsageFlags::TRANSFER_SRC)?;
+        let (staging_buffer, staging_memory) = self.create_buffer_with_bytes(&upload.pixels)?;
         // Pushed with null image handles up front: `Drop` destroys whatever is
         // non-null, so every error path below cleans up the partial upload.
         self.texture_uploads.push(TextureGpu {
@@ -3219,6 +3265,34 @@ impl Drop for Resources<'_> {
             self.command_buffer = vk::CommandBuffer::null();
             self.caches.recycle_command_buffer(cb);
         }
+        // Guest-data buffers came from the upload ring: return them (no
+        // submitted GPU work references them — see the safety argument below;
+        // ad-hoc/unpooled pairs are destroyed inside release_host_buffer).
+        {
+            let upload = (
+                mem::replace(&mut self.upload_buffer, vk::Buffer::null()),
+                mem::replace(&mut self.upload_memory, vk::DeviceMemory::null()),
+            );
+            let vertex = (
+                mem::replace(&mut self.vertex_buffer, vk::Buffer::null()),
+                mem::replace(&mut self.vertex_memory, vk::DeviceMemory::null()),
+            );
+            let index = (
+                mem::replace(&mut self.index_buffer, vk::Buffer::null()),
+                mem::replace(&mut self.index_memory, vk::DeviceMemory::null()),
+            );
+            let depth_upload = (
+                mem::replace(&mut self.depth_upload_buffer, vk::Buffer::null()),
+                mem::replace(&mut self.depth_upload_memory, vk::DeviceMemory::null()),
+            );
+            for (buffer, memory) in [upload, vertex, index, depth_upload]
+                .into_iter()
+                .chain(guest_vertex_buffers)
+                .chain(storage_buffers)
+            {
+                self.caches.release_host_buffer(self.dev, buffer, memory);
+            }
+        }
         // SAFETY: every handle destroyed below was created from `self.dev`'s
         // device for this draw alone and is destroyed exactly once, children
         // before parents. No submitted GPU work references them: an immediate
@@ -3230,36 +3304,10 @@ impl Drop for Resources<'_> {
         // are skipped, so a partially-built `Resources` (an error during
         // `build`) cleans up correctly.
         unsafe {
-            let d = self.device();
+            let d = self.dev.device();
 
             if self.owns_descriptor_pool && self.descriptor_pool != vk::DescriptorPool::null() {
                 d.destroy_descriptor_pool(self.descriptor_pool, None);
-            }
-            if self.upload_buffer != vk::Buffer::null() {
-                d.destroy_buffer(self.upload_buffer, None);
-            }
-            if self.upload_memory != vk::DeviceMemory::null() {
-                d.free_memory(self.upload_memory, None);
-            }
-            if self.vertex_buffer != vk::Buffer::null() {
-                d.destroy_buffer(self.vertex_buffer, None);
-            }
-            if self.vertex_memory != vk::DeviceMemory::null() {
-                d.free_memory(self.vertex_memory, None);
-            }
-            if self.index_buffer != vk::Buffer::null() {
-                d.destroy_buffer(self.index_buffer, None);
-            }
-            if self.index_memory != vk::DeviceMemory::null() {
-                d.free_memory(self.index_memory, None);
-            }
-            for (buffer, memory) in guest_vertex_buffers {
-                d.destroy_buffer(buffer, None);
-                d.free_memory(memory, None);
-            }
-            for (buffer, memory) in storage_buffers {
-                d.destroy_buffer(buffer, None);
-                d.free_memory(memory, None);
             }
             for texture in texture_uploads {
                 if texture.view != vk::ImageView::null() {
@@ -3271,8 +3319,11 @@ impl Drop for Resources<'_> {
                 if texture.memory != vk::DeviceMemory::null() {
                     d.free_memory(texture.memory, None);
                 }
-                d.destroy_buffer(texture.staging_buffer, None);
-                d.free_memory(texture.staging_memory, None);
+                self.caches.release_host_buffer(
+                    self.dev,
+                    texture.staging_buffer,
+                    texture.staging_memory,
+                );
             }
             if self.owns_target {
                 if self.readback_buffer != vk::Buffer::null() {

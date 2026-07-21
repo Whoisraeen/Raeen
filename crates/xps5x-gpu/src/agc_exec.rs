@@ -57,6 +57,19 @@ const SUBMIT_QUEUE_DEPTH: usize = 8;
 
 enum GpuWork {
     Submit(Vec<u32>, bool),
+    /// Land pending deferred readbacks and (when `address` is `Some`) present
+    /// the flipped scanout buffer. Queued through the same ordered channel as
+    /// submissions so the flush runs AFTER every draw the title submitted
+    /// before the flip — and on the GPU worker thread, never cross-thread.
+    /// `done` is an optional rendezvous back to the requester: `wait_idle`
+    /// blocks until the flush executed; a flip (`present_scanout`) passes
+    /// `None` and returns immediately (stage C item 4) — the title's flip
+    /// thread never pays for the readback, and presentation is at most one
+    /// flip latent, which is standard swapchain behaviour.
+    Flush {
+        address: Option<u64>,
+        done: Option<std::sync::mpsc::SyncSender<()>>,
+    },
     #[cfg(test)]
     Panic,
     Shutdown,
@@ -143,7 +156,22 @@ pub struct AgcGpuSession {
     /// and read back after (see `execute_dcb_cp`).
     last_compute_shader: Mutex<Option<kyty_graphics::hw_regs::ComputeShaderInfo>>,
     submission_count: AtomicU64,
+    /// The guest base the most-content fallback last presented. Steady state
+    /// on a title whose flip address never matches a drawn target (its scanout
+    /// is filled by an uncaptured copy/DMA): each flip reads back ONLY
+    /// {flip address, this base} instead of every dirty target — measured on
+    /// ASTRO.BOT, the difference between a 15-target 54 ms flush and a
+    /// 1-target one. Re-elected by a full census every
+    /// [`FALLBACK_REELECT_INTERVAL`] flip misses.
+    fallback_present_base: Mutex<Option<u64>>,
+    /// Flips whose address had no drawn content (drives fallback re-election).
+    flip_miss_count: AtomicU64,
 }
+
+/// Every Nth flip miss, the most-content fallback re-runs its full census
+/// (full flush + scan) instead of trusting the remembered target, so content
+/// migrating to a different render target is picked up within N flips.
+const FALLBACK_REELECT_INTERVAL: u64 = 64;
 
 /// Cloneable ownership handle for one guest process's GPU state. The Shell
 /// observes the installed handle, while the runtime owns another clone; Kyty's
@@ -251,6 +279,8 @@ impl AgcGpuSession {
             scanout_address: Mutex::new(None),
             last_compute_shader: Mutex::new(None),
             submission_count: AtomicU64::new(0),
+            fallback_present_base: Mutex::new(None),
+            flip_miss_count: AtomicU64::new(0),
         }
     }
 
@@ -333,16 +363,201 @@ impl AgcGpuSession {
             return;
         }
         *self.scanout_address.lock() = Some(address);
-        let (image, keys) = {
+        // Synchronous by design (item 4 status): the flip waits for its flush
+        // (~1-7.5 ms measured — one fence + at most one target readback). The
+        // fire-and-forget variant (`wait: false`) was tried and REVERTED: on
+        // Minecraft the unthrottled flip stream wedged the title ~10 s into
+        // boot (main thread deadlocked on a title mutex held by the flipping
+        // render pool thread, three threads spinning, flips stopped — a
+        // one-line pthread_sync "stuck >3s" warn names it), while the
+        // rendezvous form ran two clean 180 s runs at the same measured flip
+        // rate (the ~16.7 ms vblank pacer, not this wait, owns the flip
+        // period). Re-attempt only with the wedge understood.
+        self.consume_flush(Some(address), true);
+    }
+
+    /// Run one flush at a consumer point (flip or `wait_idle`), routed through
+    /// the ordered GPU work queue when the worker exists — the flush must
+    /// execute AFTER every already-queued submission (register state and draws
+    /// for this flip may still be in the queue), and Vulkan work stays on the
+    /// single consumer thread. With `wait` the caller blocks until the flush
+    /// has executed (the `wait_idle` contract); without it the flush is queued
+    /// and the caller returns (flip latency, item 4). Falls back to running
+    /// inline when no worker was ever started (nothing is queued) or the
+    /// session is shutting down (the worker may be gone).
+    fn consume_flush(&self, address: Option<u64>, wait: bool) {
+        if let Some(sender) = self.submit_queue.get() {
+            let lifecycle = self.lifecycle.lock();
+            if *lifecycle == GpuLifecycle::Open {
+                let (done_tx, done_rx) = if wait {
+                    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+                    (Some(tx), Some(rx))
+                } else {
+                    (None, None)
+                };
+                let sent = sender
+                    .send(GpuWork::Flush {
+                        address,
+                        done: done_tx,
+                    })
+                    .is_ok();
+                drop(lifecycle);
+                if sent {
+                    match done_rx {
+                        // A dropped worker (spawn failed and the receiver is
+                        // gone) errors recv rather than blocking; fall
+                        // through inline.
+                        Some(rx) => {
+                            if rx.recv().is_ok() {
+                                return;
+                            }
+                        }
+                        None => return,
+                    }
+                }
+            }
+        }
+        self.flush_and_present(address);
+    }
+
+    /// The flush consumer body (stage C): land pending deferred readbacks —
+    /// restricted to the flipped target when one is named (item 2) — then
+    /// present the scanout buffer. Runs on the GPU worker thread via
+    /// [`GpuWork::Flush`], or inline when no worker exists.
+    fn flush_and_present(&self, address: Option<u64>) {
+        {
+            let guard = self.backend.lock();
+            if let Some(device) = guard.as_ref().and_then(|b| b.device()) {
+                let mut framebuffers = self.framebuffers.lock();
+                let insert_all =
+                    |fb: &mut std::collections::HashMap<u64, RenderedImage>,
+                     flushed: Vec<(u64, RenderedImage)>| {
+                        for (base, img) in flushed {
+                            fb.insert(base, img);
+                        }
+                    };
+                // The all-targets dump needs every target's CPU pixels, so it
+                // forces a full readback; otherwise a flip reads back ONLY the
+                // flipped target plus the remembered fallback target — every
+                // other dirty target stays GPU-side.
+                let remembered = *self.fallback_present_base.lock();
+                let filter: Option<Vec<u64>> =
+                    if std::env::var_os("XPS5X_DUMP_ALL_TARGETS").is_some() {
+                        None
+                    } else {
+                        address.map(|a| {
+                            let mut bases = vec![a];
+                            if let Some(r) = remembered
+                                && r != a
+                            {
+                                bases.push(r);
+                            }
+                            bases
+                        })
+                    };
+                match crate::vulkan::offscreen::flush_deferred_draws_filtered(
+                    device,
+                    filter.as_deref(),
+                ) {
+                    Ok(flushed) => insert_all(&mut framebuffers, flushed),
+                    Err(e) => {
+                        warn!(error = %e, "deferred-draw flush failed — presenting the last flushed frame");
+                    }
+                }
+                // Flip miss: the flipped address has no drawn content. The
+                // most-content fallback presents the remembered target when it
+                // still has fresh content; a FULL flush + census re-election
+                // runs on the first miss, whenever the remembered target went
+                // dark, and every FALLBACK_REELECT_INTERVAL misses (content
+                // migrating to another render target is caught within that).
+                if let Some(addr) = address
+                    && !framebuffers.contains_key(&addr)
+                {
+                    let misses = self.flip_miss_count.fetch_add(1, Ordering::Relaxed);
+                    let remembered_has_content = remembered.is_some_and(|r| {
+                        framebuffers
+                            .get(&r)
+                            .is_some_and(|img| img.pixels.iter().step_by(64).any(|&b| b != 0))
+                    });
+                    if !remembered_has_content || misses.is_multiple_of(FALLBACK_REELECT_INTERVAL) {
+                        match crate::vulkan::offscreen::flush_deferred_draws(device) {
+                            Ok(flushed) => insert_all(&mut framebuffers, flushed),
+                            Err(e) => {
+                                warn!(error = %e, "full deferred-draw flush failed at a flip miss");
+                            }
+                        }
+                        // Force `present_flipped` to re-run its census over
+                        // the freshly-landed pixels instead of trusting the
+                        // remembered winner.
+                        *self.fallback_present_base.lock() = None;
+                    }
+                }
+            }
+        }
+        if let Some(address) = address {
+            self.present_flipped(address);
+        }
+    }
+
+    /// Present the buffer the title flipped to, after the flush landed its
+    /// pixels: the frame at the flip address when it has drawn content, else
+    /// the drawn target with the most content (the composite — the title
+    /// fills its scanout buffer by a copy/DMA we do not yet capture, so the
+    /// flip address is often an empty target). Never regresses `last_image`
+    /// when nothing has content, and only a frame at the actual flip address
+    /// takes the boot splash down.
+    fn present_flipped(&self, address: u64) {
+        let remembered = *self.fallback_present_base.lock();
+        let (image, fallback, fallback_base, keys) = {
             let fb = self.framebuffers.lock();
             let image = fb.get(&address).cloned();
+            let (fallback, fallback_base) = if image.is_none() {
+                // Steady state: present the remembered fallback target while
+                // it still has content — no census, no scan of other targets
+                // (whose entries may be deliberately stale, kept GPU-side by
+                // the filtered flush).
+                let kept = remembered
+                    .and_then(|r| fb.get(&r).map(|img| (r, img)))
+                    .filter(|(_, img)| img.pixels.iter().step_by(64).any(|&b| b != 0))
+                    .map(|(r, img)| (Some(r), img.clone()));
+                match kept {
+                    Some((base, img)) => (Some(img), base),
+                    None => {
+                        // Census election, sub-sampled (every 64th byte):
+                        // exact counts cost a full scan of every 8 MB target
+                        // per flip. Which target has the MOST content
+                        // survives sub-sampling.
+                        let elected = fb
+                            .iter()
+                            .map(|(base, img)| {
+                                let nonzero =
+                                    img.pixels.iter().step_by(64).filter(|&&b| b != 0).count();
+                                (nonzero, *base, img)
+                            })
+                            .filter(|(nonzero, _, _)| *nonzero > 0)
+                            .max_by_key(|(nonzero, _, _)| *nonzero)
+                            .map(|(_, base, img)| (base, img.clone()));
+                        match elected {
+                            Some((base, img)) => (Some(img), Some(base)),
+                            None => (None, None),
+                        }
+                    }
+                }
+            } else {
+                (None, None)
+            };
             let keys = if std::env::var_os("XPS5X_TRACE_FLIP").is_some() {
                 Some(fb.keys().map(|k| format!("{k:#x}")).collect::<Vec<_>>())
             } else {
                 None
             };
-            (image, keys)
+            (image, fallback, fallback_base, keys)
         };
+        if image.is_none() {
+            // Remember (or clear) the fallback winner so the next flip's
+            // filtered flush reads it back and this path skips the census.
+            *self.fallback_present_base.lock() = fallback_base;
+        }
         // XPS5X_TRACE_FLIP: does the buffer the title flipped to have drawn
         // content, and what render targets exist? Answers whether black frames
         // are a routing miss (content is in another target) or a genuinely
@@ -355,11 +570,36 @@ impl AgcGpuSession {
                 "present_scanout: title flipped to this buffer"
             );
         }
-        if let Some(image) = image {
-            *self.last_image.lock() = Some(image);
+        let flip_address_hit = image.is_some();
+        let Some(presented) = image.or(fallback) else {
+            return;
+        };
+        *self.last_image.lock() = Some(presented.clone());
+        if flip_address_hit {
             // The title flipped to a buffer it really drew into: its own
-            // rendering has replaced the boot splash.
+            // rendering has replaced the boot splash. The most-content
+            // fallback must NOT take the splash down — it can surface a bare
+            // cleared render target, which the splash exists to cover.
             self.hide_splash();
+        }
+        let present_index = PRESENT_INDEX.fetch_add(1, Ordering::Relaxed) + 1;
+        if present_index <= 8 || present_index.is_power_of_two() {
+            tracing::info!(
+                scanout_hit = flip_address_hit,
+                present_index,
+                scanout = format_args!("{address:#x}"),
+                "present: dumping the scanned-out frame"
+            );
+        }
+        maybe_dump_frame(&presented, present_index);
+        if std::env::var_os("XPS5X_DUMP_ALL_TARGETS").is_some() {
+            let targets: Vec<(u64, RenderedImage)> = self
+                .framebuffers
+                .lock()
+                .iter()
+                .map(|(base, img)| (*base, img.clone()))
+                .collect();
+            maybe_dump_all_targets(&targets, present_index);
         }
     }
 
@@ -397,13 +637,28 @@ impl AgcGpuSession {
         words: &[u32],
         is_compute: bool,
     ) -> Result<Option<RenderedImage>, AgcExecError> {
+        self.execute_dcb_cp_routed(words, is_compute, false)
+    }
+
+    /// [`Self::execute_dcb_cp`] with presentation routing (stage C). With
+    /// `deferred_present = false` this is byte-identical to the historical
+    /// behaviour: flush + presentation logic run at the end of every
+    /// draw-bearing submission. With `true` (the GPU worker's title path) the
+    /// submission only runs the command processor and defers readback AND
+    /// presentation to the next flush consumer — one flush per flip.
+    fn execute_dcb_cp_routed(
+        &self,
+        words: &[u32],
+        is_compute: bool,
+        deferred_present: bool,
+    ) -> Result<Option<RenderedImage>, AgcExecError> {
         let memory = self
             .guest_memory
             .lock()
             .clone()
             .ok_or(AgcExecError::AddressSpaceUnavailable)?;
         crate::guest_mem::with_guest_memory(&memory, || {
-            self.execute_dcb_cp_authorized(words, is_compute)
+            self.execute_dcb_cp_authorized(words, is_compute, deferred_present)
         })
     }
 
@@ -411,6 +666,7 @@ impl AgcGpuSession {
         &self,
         words: &[u32],
         is_compute: bool,
+        deferred_present: bool,
     ) -> Result<Option<RenderedImage>, AgcExecError> {
         let decoded = agc::decode_submission(words)?;
         // Route each queue to its own command processor: the async-compute (ACB)
@@ -474,6 +730,34 @@ impl AgcGpuSession {
         let last_target = sink.last_target;
         let mut image = sink.last.take();
         drop(sink);
+        if deferred_present {
+            // Stage C: no flush and no presentation here. Deferred draws stay
+            // GPU-side until the next flush consumer — a flip
+            // (`present_scanout`), `wait_idle`, a frame dump, or the
+            // feedback-loop fallback inside the sink. This is what turns 125
+            // flushes per 11 presents into ~1 per flip.
+            drop(framebuffers);
+            drop(cache);
+            drop(guard);
+            self.record_shader_skips(
+                shader_skips,
+                draw_skips,
+                dispatch_skips,
+                draw_skip_reason.as_deref(),
+                dispatch_skip_reason.as_deref(),
+                &shader_state,
+            );
+            run?;
+            if drawn > 0 {
+                *self.draw_count.lock() += drawn;
+            }
+            debug!(
+                drawn,
+                last_target = format_args!("{:#x}", last_target.unwrap_or(0)),
+                "AGC DCB executed with presentation deferred to the next flip"
+            );
+            return Ok(image);
+        }
         // Stage B flush: land every deferred readback in the framebuffer map
         // — at most one readback per touched target per SUBMISSION, instead
         // of one per draw. Runs before presentation/dump logic so everything
@@ -536,34 +820,14 @@ impl AgcGpuSession {
         drop(framebuffers);
         drop(cache);
         drop(guard);
-        if shader_skips > 0 {
-            let total = {
-                let mut skips = self.shader_skip_count.lock();
-                *skips += shader_skips;
-                *skips
-            };
-            if total == shader_skips || total.is_power_of_two() {
-                // Draw and compute skips are reported with SEPARATE reasons: a
-                // title issues far more dispatches than draws, so a single
-                // shared reason almost always shows a compute failure and masks
-                // why a draw skipped. "draw_reason" is empty when no draw has
-                // skipped (its shaders translate) — the wall is then elsewhere.
-                warn!(
-                    total_shader_skips = total,
-                    draw_skips,
-                    dispatch_skips,
-                    draw_reason = draw_skip_reason.as_deref().unwrap_or("(none — draw shaders translate)"),
-                    dispatch_reason = dispatch_skip_reason.as_deref().unwrap_or("(none)"),
-                    vs_addr = format_args!("{:#x}", shader_state.vs.vs_regs.data_addr),
-                    es_addr = format_args!("{:#x}", shader_state.vs.es_regs.data_addr),
-                    gs_addr = format_args!("{:#x}", shader_state.vs.gs_regs.data_addr),
-                    gs_checksum = format_args!("{:#x}", shader_state.vs.gs_regs.chksum),
-                    ps_addr = format_args!("{:#x}", shader_state.ps.ps_regs.data_addr),
-                    stats = ?self.shader_stats(),
-                    "AGC shader skips (draws + compute dispatches) — see per-path reasons"
-                );
-            }
-        }
+        self.record_shader_skips(
+            shader_skips,
+            draw_skips,
+            dispatch_skips,
+            draw_skip_reason.as_deref(),
+            dispatch_skip_reason.as_deref(),
+            &shader_state,
+        );
         run?;
 
         if let Some(image) = image {
@@ -617,6 +881,48 @@ impl AgcGpuSession {
         Ok(None)
     }
 
+    /// Accumulate this submission's shader skips and warn with a process-wide
+    /// rate limit (first occurrence, then powers of two).
+    fn record_shader_skips(
+        &self,
+        shader_skips: u64,
+        draw_skips: u64,
+        dispatch_skips: u64,
+        draw_skip_reason: Option<&str>,
+        dispatch_skip_reason: Option<&str>,
+        shader_state: &kyty_graphics::hw_regs::Shader,
+    ) {
+        if shader_skips == 0 {
+            return;
+        }
+        let total = {
+            let mut skips = self.shader_skip_count.lock();
+            *skips += shader_skips;
+            *skips
+        };
+        if total == shader_skips || total.is_power_of_two() {
+            // Draw and compute skips are reported with SEPARATE reasons: a
+            // title issues far more dispatches than draws, so a single
+            // shared reason almost always shows a compute failure and masks
+            // why a draw skipped. "draw_reason" is empty when no draw has
+            // skipped (its shaders translate) — the wall is then elsewhere.
+            warn!(
+                total_shader_skips = total,
+                draw_skips,
+                dispatch_skips,
+                draw_reason = draw_skip_reason.unwrap_or("(none — draw shaders translate)"),
+                dispatch_reason = dispatch_skip_reason.unwrap_or("(none)"),
+                vs_addr = format_args!("{:#x}", shader_state.vs.vs_regs.data_addr),
+                es_addr = format_args!("{:#x}", shader_state.vs.es_regs.data_addr),
+                gs_addr = format_args!("{:#x}", shader_state.vs.gs_regs.data_addr),
+                gs_checksum = format_args!("{:#x}", shader_state.vs.gs_regs.chksum),
+                ps_addr = format_args!("{:#x}", shader_state.ps.ps_regs.data_addr),
+                stats = ?self.shader_stats(),
+                "AGC shader skips (draws + compute dispatches) — see per-path reasons"
+            );
+        }
+    }
+
     /// Best-effort [`Self::execute_dcb_cp`] for the HLE submit path: a GPU
     /// fault must not become a guest-visible submit failure.
     /// Hand a DCB to the GPU worker and return, the way `sceAgcDriverSubmitDcb`
@@ -657,11 +963,39 @@ impl AgcGpuSession {
                             GpuWork::Submit(words, is_compute) => {
                                 let _completion = InFlightCompletion(&session);
                                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    session.try_execute_dcb_cp(&words, is_compute);
+                                    // Stage C: worker submissions defer
+                                    // presentation — the flush (readback +
+                                    // present) runs once per FLIP, not once
+                                    // per submission. XPS5X_DUMP_FRAMES keeps
+                                    // the old flush-per-submission cadence so
+                                    // frame-dump diagnostics stay faithful.
+                                    let deferred_present =
+                                        std::env::var_os("XPS5X_DUMP_FRAMES").is_none();
+                                    session.try_execute_dcb_cp_routed(
+                                        &words,
+                                        is_compute,
+                                        deferred_present,
+                                    );
                                 }))
                                 .is_err()
                                 {
                                     warn!("GPU submission panicked; dropping the DCB and keeping the worker alive");
+                                }
+                            }
+                            GpuWork::Flush { address, done } => {
+                                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    session.flush_and_present(address);
+                                }))
+                                .is_err()
+                                {
+                                    warn!("GPU flush panicked; keeping the worker alive");
+                                }
+                                // The requester may have given up (recv error
+                                // path falls back inline) or not be waiting
+                                // at all (flip fire-and-forget); a dead or
+                                // absent receiver is fine.
+                                if let Some(done) = done {
+                                    let _ = done.send(());
                                 }
                             }
                             #[cfg(test)]
@@ -709,14 +1043,27 @@ impl AgcGpuSession {
     /// it races the worker and reads the frame before the draws land.
     pub fn wait_idle(&self) {
         let (lock, cvar) = &self.in_flight;
-        let mut n = lock.lock();
-        while *n > 0 {
-            cvar.wait(&mut n);
+        {
+            let mut n = lock.lock();
+            while *n > 0 {
+                cvar.wait(&mut n);
+            }
         }
+        // wait_idle is a flush consumer (stage C): anything reading a render
+        // result afterwards (framebuffer census, draw pixels, shutdown) must
+        // see the deferred batch's pixels, not GPU-side-only targets.
+        self.consume_flush(None, true);
     }
 
     pub fn try_execute_dcb_cp(&self, words: &[u32], is_compute: bool) {
-        match self.execute_dcb_cp(words, is_compute) {
+        self.try_execute_dcb_cp_routed(words, is_compute, false);
+    }
+
+    /// [`Self::try_execute_dcb_cp`] with presentation routing: the GPU worker
+    /// passes `deferred_present = true` so the flush/present work runs once
+    /// per flip ([`GpuWork::Flush`]) instead of once per submission.
+    fn try_execute_dcb_cp_routed(&self, words: &[u32], is_compute: bool, deferred_present: bool) {
+        match self.execute_dcb_cp_routed(words, is_compute, deferred_present) {
             Ok(Some(image)) => debug!(
                 width = image.width,
                 height = image.height,
