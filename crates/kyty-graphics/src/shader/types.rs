@@ -64,6 +64,12 @@ pub enum ShaderInstructionType {
     /// (ShaderParse.cpp L2630); the single most frequent ASTRO.BOT shader
     /// failure (925 dispatches in the measured 30s window).
     BufferStoreFormatXyzw,
+    /// DS 0x00: LDS atomic dword add without return (RDNA2 ISA `DS_ADD_U32`).
+    /// Kyty leaves the whole DS family except append/consume `KYTY_NI`;
+    /// measured on ASTRO.BOT scene compute (raw 0xd8000514, 58 skips/run).
+    /// Lowered to an exec-guarded `OpAtomicIAdd` on the `%lds` Workgroup
+    /// array at `(addr + offset) >> 2`.
+    DsAddU32,
     DsAppend,
     DsConsume,
     /// DS 0x37: two independent LDS dword reads at `addr + offset0*4` and
@@ -357,6 +363,11 @@ pub enum ShaderInstructionType {
     VNotB32,
     VOrB32,
     VRcpF32,
+    /// VOP1 0x2b / VOP3 0x1ab `v_rcp_iflag_f32`: reciprocal whose only
+    /// difference from `v_rcp_f32` is raising the integer-division-by-zero
+    /// TRAP flag on 0/denorm inputs. Exceptions are not modelled, so the
+    /// arithmetic lowering is identical (1.0 / x).
+    VRcpIflagF32,
     VRndneF32,
     VRsqF32,
     VSadU32,

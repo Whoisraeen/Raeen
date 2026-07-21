@@ -1276,7 +1276,10 @@ fn shader_parse_vop1(
         0x28 => return Err(ni(dst, S, "v_rcp_clamp_f32", opcode, pc, b0)),
         0x29 => return Err(ni(dst, S, "v_rcp_legacy_f32", opcode, pc, b0)),
         0x2a => inst.type_ = T::VRcpF32,
-        0x2b => return Err(ni(dst, S, "v_rcp_iflag_f32", opcode, pc, b0)),
+        // Beyond Kyty (KYTY_NI upstream): measured on ASTRO.BOT compute
+        // (58 skips/run). Same arithmetic as v_rcp_f32; the iflag TRAP
+        // status it would raise is not modelled (see `VRcpIflagF32`).
+        0x2b => inst.type_ = T::VRcpIflagF32,
         0x2c => return Err(ni(dst, S, "v_rsq_clamp_f32", opcode, pc, b0)),
         0x2d => return Err(ni(dst, S, "v_rsq_legacy_f32", opcode, pc, b0)),
         0x2e => inst.type_ = T::VRsqF32,
@@ -2206,7 +2209,8 @@ fn shader_parse_vop3(
         0x1a8 => return Err(ni(dst, S, "v_rcp_clamp_f32", opcode, pc, b0)),
         0x1a9 => return Err(ni(dst, S, "v_rcp_legacy_f32", opcode, pc, b0)),
         0x1aa => inst.type_ = T::VRcpF32,
-        0x1ab => return Err(ni(dst, S, "v_rcp_iflag_f32", opcode, pc, b0)),
+        // VOP3 encoding of VOP1 0x2b (see the VOP1 arm / `VRcpIflagF32`).
+        0x1ab => inst.type_ = T::VRcpIflagF32,
         0x1ac => return Err(ni(dst, S, "v_rsq_clamp_f32", opcode, pc, b0)),
         0x1ad => return Err(ni(dst, S, "v_rsq_legacy_f32", opcode, pc, b0)),
         0x1ae => inst.type_ = T::VRsqF32,
@@ -2957,7 +2961,23 @@ fn shader_parse_ds(
     }
 
     match opcode {
-        0x00 => return Err(ni(dst, S, "ds_add_u32", opcode, pc, b0)),
+        // Beyond Kyty (KYTY_NI upstream): LDS atomic dword add without
+        // return, measured on ASTRO.BOT scene compute (raw 0xd8000514,
+        // offset 0x514). Same operand shape as ds_write_b32: src0 = address
+        // VGPR, src1 = data VGPR, src2 = the 16-bit instruction byte offset.
+        0x00 => {
+            if gds != 0 {
+                return Err(feature(S, "ds_add_u32 with gds == 1", pc));
+            }
+            inst.type_ = T::DsAddU32;
+            inst.format = F::Vsrc0Vsrc1Vsrc2;
+            inst.dst = ShaderOperand::default();
+            inst.src[0] = operand_parse(addr + 256)?;
+            inst.src[1] = operand_parse(data0 + 256)?;
+            inst.src[2].type_ = O::LiteralConstant;
+            inst.src[2].constant.u = offset0 | (offset1 << 8);
+            inst.src_num = 3;
+        }
         0x01 => return Err(ni(dst, S, "ds_sub_u32", opcode, pc, b0)),
         0x02 => return Err(ni(dst, S, "ds_rsub_u32", opcode, pc, b0)),
         0x03 => return Err(ni(dst, S, "ds_inc_u32", opcode, pc, b0)),

@@ -3085,6 +3085,7 @@ impl<'a> Spirv<'a> {
     fn uses_lds(&self) -> bool {
         use ShaderInstructionType as T;
         self.code.has_any_of(&[
+            T::DsAddU32,
             T::DsReadB32,
             T::DsWriteB32,
             T::DsRead2B32,

@@ -1395,11 +1395,26 @@ fn sload_dword_extended(
         return Ok(false);
     }
 
-    if inst.src[1].type_ != ShaderOperandType::LiteralConstant {
-        return Err(not_supported(func, "src1 is not a literal constant"));
+    // Kyty accepts only `LiteralConstant` here, but this codebase's next-gen
+    // SMEM parser (`shader_parse_smem`) materializes a NULL soffset as the
+    // sign-extended 21-bit immediate in an `IntegerInlineConstant` operand.
+    // Both are compile-time constants. Measured on ASTRO.BOT compute (693
+    // skips/run, the whole round-9 bulk): every refused s_load_dwordx4/x8 is
+    // `s[N..], s[12:13], <inline imm>` — base = the EUD pointer pair, offset
+    // a non-negative inline constant (0x0..0x50) — no register soffset at all.
+    if !matches!(
+        inst.src[1].type_,
+        ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
+    ) {
+        return Err(not_supported(func, "src1 is not a constant offset"));
     }
     if inst.src[0].register_id != bind_info.extended.start_register {
         return Err(not_supported(func, "src0 is not the EUD base register"));
+    }
+    if inst.src[1].constant.i() < 0 {
+        // A sign-extended imm21 can be negative; nothing below the EUD base
+        // is mapped, so refuse by name instead of indexing with a huge u32.
+        return Err(not_supported(func, "negative s_load offset"));
     }
 
     // TODO() check pointer
@@ -3467,6 +3482,66 @@ fn recompile_ds_write_b32(
                OpStore %ldsw_p_{i} %ldsw_du_{i}
                OpBranch %ldsw_end_{i}
         %ldsw_end_{i} = OpLabel
+",
+        addr = addr.value,
+        data = data.value,
+    );
+
+    *dst_source += &text;
+    Ok(true)
+}
+
+/// Beyond Kyty (`ds_add_u32` is `KYTY_NI` upstream): LDS atomic dword add
+/// without return — `OpAtomicIAdd` on `%lds[(addr + offset) >> 2]` at
+/// Workgroup scope (2), Relaxed semantics (0). Address computation, bound
+/// clamp and the `exec_lo` guard mirror [`recompile_ds_write_b32`]; the
+/// atomic's old-value result is discarded (the non-`_rtn` form writes no
+/// VGPR).
+fn recompile_ds_add_u32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_DsAddU32_Vsrc0Vsrc1Vsrc2";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if !operand_is_variable(inst.src[0]) || !operand_is_variable(inst.src[1]) {
+        return Err(not_supported(FUNC, "addr/data are not variables"));
+    }
+    if !operand_is_constant(inst.src[2]) {
+        return Err(not_supported(FUNC, "offset is not a constant"));
+    }
+
+    let addr = operand_variable_to_str(inst.src[0]);
+    let data = operand_variable_to_str(inst.src[1]);
+    if addr.type_ != SpirvType::Float || data.type_ != SpirvType::Float {
+        return Err(not_supported(FUNC, "unexpected operand types"));
+    }
+    let offset = spirv.get_constant(inst.src[2]);
+    let clamp = spirv.get_constant_uint(spirv.lds_size_dw() - 1);
+
+    let i = format!("{index}");
+    let text = format!(
+        "
+        %ldsaa_e0_{i} = OpLoad %uint %exec_lo
+        %ldsaa_e1_{i} = OpINotEqual %bool %ldsaa_e0_{i} %uint_0
+               OpSelectionMerge %ldsaa_end_{i} None
+               OpBranchConditional %ldsaa_e1_{i} %ldsaa_body_{i} %ldsaa_end_{i}
+        %ldsaa_body_{i} = OpLabel
+        %ldsaa_a_{i} = OpLoad %float %{addr}
+        %ldsaa_au_{i} = OpBitcast %uint %ldsaa_a_{i}
+        %ldsaa_ao_{i} = OpIAdd %uint %ldsaa_au_{i} %{offset}
+        %ldsaa_ai_{i} = OpShiftRightLogical %uint %ldsaa_ao_{i} %uint_2
+        %ldsaa_ac_{i} = OpExtInst %uint %GLSL_std_450 UMin %ldsaa_ai_{i} %{clamp}
+        %ldsaa_p_{i} = OpAccessChain %_ptr_Workgroup_uint %lds %ldsaa_ac_{i}
+        %ldsaa_d_{i} = OpLoad %float %{data}
+        %ldsaa_du_{i} = OpBitcast %uint %ldsaa_d_{i}
+        %ldsaa_old_{i} = OpAtomicIAdd %uint %ldsaa_p_{i} %uint_2 %uint_0 %ldsaa_du_{i}
+               OpBranch %ldsaa_end_{i}
+        %ldsaa_end_{i} = OpLabel
 ",
         addr = addr.value,
         data = data.value,
@@ -7581,6 +7656,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_ds_consume, T::DsConsume, F::VdstGds, p1("")),
     // Beyond Kyty: LDS write/read + the workgroup barrier gluing them
     // (ASTRO.BOT scene compute).
+    f(recompile_ds_add_u32,   T::DsAddU32,   F::Vsrc0Vsrc1Vsrc2,    p1("")),
     f(recompile_ds_write_b32, T::DsWriteB32, F::Vsrc0Vsrc1Vsrc2,    p1("")),
     f(recompile_ds_read_b32,  T::DsReadB32,  F::SVdstSVsrc0SVsrc1,  p1("")),
     f(recompile_ds_read2_b32, T::DsRead2B32, F::Vdst2Vsrc0Vsrc1Vsrc2, p1("")),
@@ -7775,6 +7851,9 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_v_xxx_f32_svdst_svsrc0, T::VFractF32, F::SVdstSVsrc0, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Fract %t0_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc0, T::VLogF32,   F::SVdstSVsrc0, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Log2 %t0_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc0, T::VRcpF32,   F::SVdstSVsrc0, p1("%t_<index> = OpFDiv %float %float_1_000000 %t0_<index>")),
+    // v_rcp_iflag_f32: identical arithmetic; the iflag TRAP status is not
+    // modelled (see `VRcpIflagF32` in types.rs).
+    f(recompile_v_xxx_f32_svdst_svsrc0, T::VRcpIflagF32, F::SVdstSVsrc0, p1("%t_<index> = OpFDiv %float %float_1_000000 %t0_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc0, T::VRndneF32, F::SVdstSVsrc0, p1("%t_<index> = OpExtInst %float %GLSL_std_450 RoundEven %t0_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc0, T::VRsqF32,   F::SVdstSVsrc0, p1("%t_<index> = OpExtInst %float %GLSL_std_450 InverseSqrt %t0_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc0, T::VSinF32,   F::SVdstSVsrc0, p2("%tr_<index> = OpFMul %float %t0_<index> %float_2pi", "%t_<index> = OpExtInst %float %GLSL_std_450 Sin %tr_<index>")),
@@ -8182,7 +8261,7 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            306,
+            308,
             "204 Kyty rows plus SSubU32, SNop, the RDNA2-only rows \
              (VLshlAddU32, VCmpxLtU32, VAddNcU32, VSubNcU32, VSubrevNcU32, VCvtI32F32, \
              VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad dmask1/3/7 \
@@ -8202,11 +8281,12 @@ mod tests {
              and the convergence batch: the four BufferLoadDwordX3 rows, \
              DsReadB64, and ImageSampleLz dmask3, and the round-7 batch: \
              VCmpxLeF32, VBfeI32, VBfiB32, and DsReadB128, and the round-8 \
-             batch: the four BufferLoadUbyte rows and DsReadB96"
+             batch: the four BufferLoadUbyte rows and DsReadB96, and the \
+             round-9 batch: VRcpIflagF32 and DsAddU32"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 297,
+            implemented, 299,
             "C1 implemented subset plus title-driven ports (incl. the S_XXX_I32 \
              trio, VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad \
              dmask1/3/7 + ImageSampleLz dmask1/2/F rows, ImageStore dmask1, the \
@@ -8224,7 +8304,7 @@ mod tests {
               and the convergence batch: four BufferLoadDwordX3 rows, DsReadB64, \
               ImageSampleLz dmask3, and the round-7 batch: VCmpxLeF32, VBfeI32, \
               VBfiB32, DsReadB128, and the round-8 batch: four BufferLoadUbyte \
-              rows, DsReadB96)"
+              rows, DsReadB96, and the round-9 batch: VRcpIflagF32, DsAddU32)"
         );
         assert_eq!(
             ni, 9,
@@ -11108,6 +11188,143 @@ mod tests {
         }
         let words = spirv_run(&source).expect("assemble extended CS s_load_dwordx4");
         naga_parse_and_validate(&words, "s_load_dwordx4_extended_cs");
+    }
+
+    /// Round 9: `v_rcp_iflag_f32` (VOP1 0x2b, 58 measured ASTRO.BOT skips)
+    /// lowers exactly like `v_rcp_f32` — 1.0/x; the integer-div-by-zero TRAP
+    /// flag it would raise is not modelled.
+    #[test]
+    fn astro_v_rcp_iflag_f32_lowers_as_reciprocal() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // v_mov_b32 v0, 0; v_rcp_iflag_f32 v1, v0.
+        shader_parse(0, &[0x7E00_0280, 0x7E02_5700, S_ENDPGM], &mut code, true)
+            .expect("parse v_rcp_iflag_f32");
+        assert_eq!(code.get_instructions()[1].type_, T::VRcpIflagF32);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile v_rcp_iflag_f32");
+        assert!(
+            source.contains("OpFDiv %float %float_1_000000"),
+            "reciprocal expected:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble v_rcp_iflag_f32");
+        naga_parse_and_validate(&words, "v_rcp_iflag_f32");
+    }
+
+    /// Round 9: `ds_add_u32` (DS 0x00, 58 measured ASTRO.BOT skips) is an
+    /// exec-guarded `OpAtomicIAdd` on the `%lds` Workgroup array, Workgroup
+    /// scope, Relaxed semantics. Raw shape measured on ASTRO.BOT scene
+    /// compute: 0xd8000514 (byte offset 0x514).
+    #[test]
+    fn astro_ds_add_u32_lowers_as_lds_atomic_add() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0x7E00_0280, // v_mov_b32 v0, 0 (addr)
+                0x7E02_0280, // v_mov_b32 v1, 0 (data)
+                0xD800_0514, // ds_add_u32 addr=v0, data=v1, offset 0x514
+                0x0000_0100,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse ds_add_u32");
+        let inst = &code.get_instructions()[2];
+        assert_eq!(inst.type_, T::DsAddU32);
+        assert_eq!(inst.format, F::Vsrc0Vsrc1Vsrc2);
+        assert_eq!(inst.src[2].constant.u, 0x514);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile ds_add_u32");
+        assert!(
+            source.contains("OpAtomicIAdd %uint %ldsaa_p_2 %uint_2 %uint_0 %ldsaa_du_2"),
+            "LDS atomic add expected:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble ds_add_u32");
+        naga_parse_and_validate(&words, "ds_add_u32");
+    }
+
+    /// Round 9 — the whole measured 693-skip bulk: the next-gen SMEM parser
+    /// materializes a NULL soffset as a sign-extended 21-bit immediate in an
+    /// `IntegerInlineConstant` operand, which the extended s_load path must
+    /// accept exactly like the legacy parser's `LiteralConstant`. Raw dwords
+    /// measured from ASTRO.BOT CS 0x50740a700:
+    /// `s_load_dwordx4 s[16:19], s[12:13], 0x0` = `0xf4080406 0xfa000000`.
+    #[test]
+    fn astro_sload_inline_constant_soffset_recompiles() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xf408_0406, 0xfa00_0000, 0xf408_0406, 0xfa00_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse s_load_dwordx4 with NULL soffset");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SLoadDwordx4);
+        assert_eq!(
+            inst.src[1].type_,
+            ShaderOperandType::IntegerInlineConstant,
+            "NULL soffset parses as the inline-constant immediate"
+        );
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 16;
+        input_info.bind.extended.used = true;
+        input_info.bind.extended.start_register = 12;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        input_info.bind.storage_buffers.start_register[0] = 12;
+        input_info.bind.storage_buffers.extended[0] = true;
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info)).expect(
+            "inline-constant soffset must recompile like a literal (measured ASTRO.BOT shape)",
+        );
+        for reg in 16..20 {
+            assert!(
+                source.contains(&format!("OpStore %s{reg}")),
+                "descriptor dword must land in s{reg}:\n{source}"
+            );
+        }
+        let words = spirv_run(&source).expect("assemble inline-soffset s_load");
+        naga_parse_and_validate(&words, "s_load_dwordx4_inline_soffset");
+    }
+
+    /// A sign-extended imm21 soffset can be negative; nothing below the EUD
+    /// base is mapped, so the refusal is by name (never a huge u32 index).
+    #[test]
+    fn sload_negative_inline_soffset_refuses_by_name() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // s_load_dwordx4 s[16:19], s[12:13], -4 (imm21 = 0x1ffffc).
+        shader_parse(0, &[0xf408_0406, 0xfa1f_fffc, S_ENDPGM], &mut code, true)
+            .expect("parse s_load_dwordx4 with negative imm21");
+        assert_eq!(code.get_instructions()[0].src[1].constant.i(), -4);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 16;
+        input_info.bind.extended.used = true;
+        input_info.bind.extended.start_register = 12;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        input_info.bind.storage_buffers.start_register[0] = 12;
+        input_info.bind.storage_buffers.extended[0] = true;
+
+        let err = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect_err("negative offset has no mapping");
+        assert!(
+            err.to_string().contains("negative s_load offset"),
+            "named refusal expected, got: {err}"
+        );
     }
 
     /// A sharp declared at/above the register-file size rebases by
