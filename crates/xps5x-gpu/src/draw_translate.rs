@@ -3049,6 +3049,92 @@ mod tests {
         assert_eq!(dword0(1), 0, "the 3D T# indexes %textures2D_S_3D[0]");
     }
 
+    /// INTERLEAVED mixed dims — [2D, 3D, 2D] in analysis order — pin the
+    /// per-dim RUNNING index: the second 2D T#'s seeded dword 0 must be its
+    /// position within the 2D array (1), never its global sampled position
+    /// (2), and each group's `view_indices` keep analysis order within the
+    /// dim ([0, 2] for 2D, [1] for 3D). This is the shape where a global
+    /// index would run past the smaller per-dim array (descriptor OOB, the
+    /// measured `VK_ERROR_DEVICE_LOST` class).
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn compute_binding_mixed_dims_use_per_dim_running_indices() {
+        const W: u32 = 4;
+        const H: u32 = 4;
+        const D: u32 = 2;
+        const BYTES2D: usize = (W * H * 4) as usize;
+        const BYTES3D: usize = (W * H * D * 4) as usize;
+
+        // 256-aligned arena: 2D A at +0, 3D volume at +512, 2D B at +1024.
+        let mut arena = vec![0u8; 1536 + 255];
+        let base = (arena.as_ptr() as u64 + 255) & !255;
+        let off = (base - arena.as_ptr() as u64) as usize;
+        for i in 0..BYTES3D {
+            arena[off + 512 + i] = ((i * 5 + 11) % 251) as u8; // 3D volume
+        }
+        for i in 0..BYTES2D {
+            arena[off + i] = (i % 251) as u8; // 2D A
+            arena[off + 1024 + i] = ((i * 3 + 7) % 251) as u8; // 2D B
+        }
+        let content = |o: usize, n: usize| arena[off + o..off + o + n].to_vec();
+
+        let mut vol = rgba8_linear_tsharp(base + 512, W, H);
+        vol.fields[3] &= !(0xF << 28);
+        vol.fields[3] |= 10 << 28; // type = 3D
+        vol.fields[4] = (vol.fields[4] & !0x1FFF) | (D - 1); // depth = D - 1
+
+        let mut bind = ShaderBindResources::default();
+        bind.push_constant_size = 3 * 32;
+        bind.textures2d.textures_num = 3;
+        bind.textures2d.textures2d_sampled_num = 3;
+        bind.textures2d.binding_sampled_index = 0;
+        // Two present dims => storage would sit past both (binding 2).
+        bind.textures2d.binding_storage_index = 2;
+        bind.textures2d.desc[0].texture = rgba8_linear_tsharp(base, W, H); // 2D A
+        bind.textures2d.desc[1].texture = vol; // 3D
+        bind.textures2d.desc[2].texture = rgba8_linear_tsharp(base + 1024, W, H); // 2D B
+
+        let ranges = [(arena.as_ptr() as u64, arena.len())];
+        let binding = crate::guest_mem::with_test_ranges(&ranges, || {
+            prepare_stage_binding(&bind, vk::ShaderStageFlags::COMPUTE)
+        })
+        .expect("interleaved mixed-dim sampled compute binding");
+
+        let textures = binding.textures.expect("sampled textures");
+        assert_eq!(textures.textures.len(), 3, "flat pool keeps analysis order");
+        assert_eq!(textures.textures[0].pixels, content(0, BYTES2D));
+        assert_eq!(textures.textures[1].pixels, content(512, BYTES3D));
+        assert_eq!(textures.textures[2].pixels, content(1024, BYTES2D));
+
+        // Groups in dim-ordinal order; view_indices keep analysis order
+        // WITHIN each dim.
+        assert_eq!(textures.sampled_groups.len(), 2);
+        assert_eq!(textures.sampled_groups[0].binding, 0);
+        assert_eq!(
+            textures.sampled_groups[0].view_indices,
+            vec![0, 2],
+            "the 2D array holds both 2D T#s in analysis order"
+        );
+        assert_eq!(textures.sampled_groups[1].binding, 1);
+        assert_eq!(textures.sampled_groups[1].view_indices, vec![1]);
+
+        // Seeded indices are per-dim running counters.
+        let dword0 = |t: usize| {
+            u32::from_le_bytes(
+                binding.push_constants[t * 32..t * 32 + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(dword0(0), 0, "2D A indexes %textures2D_S_2D[0]");
+        assert_eq!(dword0(1), 0, "the 3D T# indexes %textures2D_S_3D[0]");
+        assert_eq!(
+            dword0(2),
+            1,
+            "2D B indexes %textures2D_S_2D[1] — its dim-local position, not its global 2"
+        );
+    }
+
     /// SharpEmu-parity window sizing (Gen5ShaderScalarEvaluator.cs:1952-1960
     /// and :69): max(need, 256 KiB), page-rounded up, capped at 16 MiB.
     #[test]
