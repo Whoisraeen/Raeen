@@ -115,6 +115,70 @@ const FETCH_NO_SAMPLER_CS: &str = "\
     OpReturn\n\
     OpFunctionEnd\n";
 
+/// `LocalSize 1 1 1`: `out[0] = uint(texture(sampler2D(tex[0], smp[0]),
+/// vec2(0.5)).r * 255 + 0.5)` — the recompiled sample-family shape: SEPARATE
+/// sampled-image and sampler descriptor arrays. With an all-zero synthesized
+/// S# the host binds the cached default nearest/wrap sampler
+/// (`linear_filter = [false]`), the SharpEmu default-sampler port.
+const SAMPLE_DEFAULT_SAMPLER_CS: &str = "\
+    OpCapability Shader\n\
+    OpMemoryModel Logical GLSL450\n\
+    OpEntryPoint GLCompute %main \"main\" %tex %smp %out\n\
+    OpExecutionMode %main LocalSize 1 1 1\n\
+    OpDecorate %tex DescriptorSet 0\n\
+    OpDecorate %tex Binding 1\n\
+    OpDecorate %smp DescriptorSet 0\n\
+    OpDecorate %smp Binding 2\n\
+    OpDecorate %out_arr ArrayStride 4\n\
+    OpMemberDecorate %Out 0 Offset 0\n\
+    OpDecorate %Out Block\n\
+    OpDecorate %out DescriptorSet 0\n\
+    OpDecorate %out Binding 0\n\
+    %void = OpTypeVoid\n\
+    %fnty = OpTypeFunction %void\n\
+    %uint = OpTypeInt 32 0\n\
+    %float = OpTypeFloat 32\n\
+    %v2float = OpTypeVector %float 2\n\
+    %v4float = OpTypeVector %float 4\n\
+    %img = OpTypeImage %float 2D 0 0 0 1 Unknown\n\
+    %simg = OpTypeSampledImage %img\n\
+    %sampler = OpTypeSampler\n\
+    %uint_0 = OpConstant %uint 0\n\
+    %uint_1 = OpConstant %uint 1\n\
+    %f0 = OpConstant %float 0.000000\n\
+    %f05 = OpConstant %float 0.500000\n\
+    %f255 = OpConstant %float 255.000000\n\
+    %arr_img = OpTypeArray %img %uint_1\n\
+    %ptr_arr_img = OpTypePointer UniformConstant %arr_img\n\
+    %ptr_img = OpTypePointer UniformConstant %img\n\
+    %tex = OpVariable %ptr_arr_img UniformConstant\n\
+    %arr_smp = OpTypeArray %sampler %uint_1\n\
+    %ptr_arr_smp = OpTypePointer UniformConstant %arr_smp\n\
+    %ptr_smp = OpTypePointer UniformConstant %sampler\n\
+    %smp = OpVariable %ptr_arr_smp UniformConstant\n\
+    %out_arr = OpTypeRuntimeArray %uint\n\
+    %Out = OpTypeStruct %out_arr\n\
+    %ptr_out = OpTypePointer StorageBuffer %Out\n\
+    %out = OpVariable %ptr_out StorageBuffer\n\
+    %ptr_uint = OpTypePointer StorageBuffer %uint\n\
+    %main = OpFunction %void None %fnty\n\
+    %entry = OpLabel\n\
+    %pimg = OpAccessChain %ptr_img %tex %uint_0\n\
+    %image = OpLoad %img %pimg\n\
+    %psmp = OpAccessChain %ptr_smp %smp %uint_0\n\
+    %samp = OpLoad %sampler %psmp\n\
+    %si = OpSampledImage %simg %image %samp\n\
+    %coord = OpCompositeConstruct %v2float %f05 %f05\n\
+    %texel = OpImageSampleExplicitLod %v4float %si %coord Lod %f0\n\
+    %r = OpCompositeExtract %float %texel 0\n\
+    %scaled = OpFMul %float %r %f255\n\
+    %rounded = OpFAdd %float %scaled %f05\n\
+    %value = OpConvertFToU %uint %rounded\n\
+    %po = OpAccessChain %ptr_uint %out %uint_0 %uint_0\n\
+    OpStore %po %value\n\
+    OpReturn\n\
+    OpFunctionEnd\n";
+
 fn backend_or_skip() -> Option<VulkanBackend> {
     let mut backend = VulkanBackend::new(true);
     match backend.init() {
@@ -163,6 +227,7 @@ fn gds_counter_persists_across_dispatches() {
         textures: None,
         storage_images: None,
         gds_binding: Some(1),
+        eud_raw: None,
     };
     let state = ComputeState {
         groups: [1, 1, 1],
@@ -228,6 +293,7 @@ fn sampled_texture_without_sampler_dispatches() {
         }),
         storage_images: None,
         gds_binding: None,
+        eud_raw: None,
     };
     let outputs = dispatch_compute(
         dev,
@@ -242,6 +308,73 @@ fn sampled_texture_without_sampler_dispatches() {
         outputs.buffers[0],
         0x40u32.to_le_bytes().to_vec(),
         "the fetched red texel must round-trip through the sampled-image array"
+    );
+    assert_eq!(validation_error_count(), 0, "validation must stay clean");
+}
+
+/// Device-loss defusal sub-fix (i), Vulkan side (SharpEmu port —
+/// `reference/sharpemu/src/SharpEmu.Libs/VideoOut/VulkanVideoPresenter.cs`
+/// L6314-6322 binds an on-the-fly sampler when none was captured; L8121-8156
+/// caches one `VkSampler` per S# state, all-zero decoding to nearest/wrap):
+/// a sample-family CS with a synthesized all-zero S# binds the cached
+/// default nearest/wrap sampler (`linear_filter = [false]`). Two dispatches
+/// prove creation AND the per-device cache-hit path, with clean validation.
+#[test]
+fn default_nearest_sampler_binds_and_caches_across_dispatches() {
+    let Some(backend) = backend_or_skip() else {
+        return;
+    };
+    let dev = backend.device().expect("backend is initialized");
+
+    let spirv = kyty_graphics::spirv_asm::assemble(SAMPLE_DEFAULT_SAMPLER_CS)
+        .expect("default-sampler compute shader assembles");
+
+    let binding = ShaderStageBinding {
+        stage: vk::ShaderStageFlags::COMPUTE,
+        descriptor_set_slot: 0,
+        push_constant_offset: 0,
+        push_constants: Vec::new(),
+        storage_buffers: Some(StorageBufferBinding {
+            binding: 0,
+            buffers: vec![vec![0u8; 4]],
+        }),
+        textures: Some(TextureBinding {
+            sampled_binding: 1,
+            sampler_binding: 2,
+            textures: vec![TextureUpload {
+                width: 1,
+                height: 1,
+                format: vk::Format::R8G8B8A8_UNORM,
+                pixels: vec![0x40, 0x00, 0x00, 0xFF],
+                layers: 1,
+                cube: false,
+                depth: 1,
+                render_target: None,
+            }],
+            // The synthesized all-zero S#: xy_mag_filter == 0 -> nearest.
+            linear_filter: vec![false],
+        }),
+        storage_images: None,
+        gds_binding: None,
+        eud_raw: None,
+    };
+    let state = ComputeState {
+        groups: [1, 1, 1],
+        spirv: &spirv,
+        binding: Some(&binding),
+    };
+
+    let first = dispatch_compute(dev, &state).expect("first sampled dispatch (sampler creation)");
+    assert_eq!(
+        first.buffers[0],
+        0x40u32.to_le_bytes().to_vec(),
+        "the sampled red texel must round-trip through the default nearest sampler"
+    );
+    let second = dispatch_compute(dev, &state).expect("second sampled dispatch (cached sampler)");
+    assert_eq!(
+        second.buffers[0],
+        0x40u32.to_le_bytes().to_vec(),
+        "the cached default sampler must serve repeat dispatches identically"
     );
     assert_eq!(validation_error_count(), 0, "validation must stay clean");
 }

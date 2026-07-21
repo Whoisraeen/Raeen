@@ -35,7 +35,8 @@ use std::fmt;
 
 use crate::hw_regs::UserSgprInfo;
 use crate::shader::resources::{
-    ShaderBindResources, ShaderComputeInputInfo, ShaderPixelInputInfo, ShaderVertexInputInfo,
+    ShaderBindResources, ShaderComputeInputInfo, ShaderEudRawResources, ShaderPixelInputInfo,
+    ShaderVertexInputInfo,
 };
 use crate::shader::types::{
     ShaderCode, ShaderConstant, ShaderInstruction, ShaderInstructionType, ShaderOperand,
@@ -1848,6 +1849,156 @@ fn eud_rel_index(
     Ok(start_reg - bind.extended.start_register)
 }
 
+/// Size of the extended (EUD) dword mapping `WriteLocalVariables` builds and
+/// `GetMappedIndex` resolves against.
+pub(crate) const EXTENDED_MAPPING_DWORDS: usize = 64;
+
+/// Beyond Kyty — SharpEmu port (see [`ShaderEudRawResources`]): decide
+/// whether the shader scalar-loads EUD dwords no captured descriptor covers,
+/// and size/place the `%eud_raw` fallback SSBO in `bind.eud_raw`.
+///
+/// SharpEmu never refuses these loads: every scalar load off a pointer pair
+/// is a dispatch-time guest-memory read, recorded as a pooled global-memory
+/// binding when the offset is GPU-side dynamic
+/// (`reference/sharpemu/src/SharpEmu.ShaderCompiler/`
+/// `Gen5ShaderScalarEvaluator.cs:1939-1980`). Here the captured-descriptor
+/// path stays authoritative — a mapped dword still reads the REWRITTEN
+/// descriptor from the push constants — and only the dwords
+/// `GetMappedIndex` would refuse route to the raw window.
+///
+/// Coverage mirrors `WriteLocalVariables`' extended-mapping construction
+/// exactly (storage V#s cover 4 dwords, T#s 8, S#s 4, GDS pointers 1, all
+/// rebased by [`eud_rel_index`]'s residence rules). The scan accepts
+/// `s_load_dwordx2/x4/x8` whose base is the EUD pointer pair with a
+/// non-negative compile-time offset — the same shape
+/// `sload_dword_extended` accepts; loads the recompiler refuses anyway
+/// (register soffset, negative offset, non-EUD base) are ignored so
+/// detection never widens what recompiles.
+///
+/// Which EUD dwords are covered by a CAPTURED descriptor, exactly as
+/// `WriteLocalVariables` maps them (storage V#s cover 4 dwords, T#s 8, S#s 4,
+/// GDS pointers 1, all rebased by [`eud_rel_index`]'s residence rules). A
+/// sharp whose rel index does not resolve is skipped: generation refuses such
+/// a bind by name before any coverage query could matter.
+///
+/// A COVERED dword read through the extended mapping yields the REWRITTEN
+/// push-constant descriptor field (safe: base fields carry descriptor-array
+/// indices); an UNCOVERED dword read through the `%eud_raw` fallback yields
+/// the RAW guest dword (never safe to use as a descriptor-array index).
+pub(crate) fn eud_covered_map(bind: &ShaderBindResources) -> [bool; EXTENDED_MAPPING_DWORDS] {
+    let mut covered = [false; EXTENDED_MAPPING_DWORDS];
+    let b: &ShaderBindResources = bind;
+    let cover = |covered: &mut [bool; EXTENDED_MAPPING_DWORDS], start_reg: i32, dwords: i32| {
+        let Ok(rel) = eud_rel_index(b, start_reg, 0, "eud coverage map") else {
+            return;
+        };
+        for f in 0..dwords {
+            if let Ok(idx) = usize::try_from(rel + f)
+                && idx < covered.len()
+            {
+                covered[idx] = true;
+            }
+        }
+    };
+    for i in 0..b.storage_buffers.buffers_num.max(0) as usize {
+        if b.storage_buffers.extended[i] {
+            cover(&mut covered, b.storage_buffers.start_register[i], 4);
+        }
+    }
+    for i in 0..b.textures2d.textures_num.max(0) as usize {
+        if b.textures2d.desc[i].extended {
+            cover(&mut covered, b.textures2d.desc[i].start_register, 8);
+        }
+    }
+    for i in 0..b.samplers.samplers_num.max(0) as usize {
+        if b.samplers.extended[i] {
+            cover(&mut covered, b.samplers.start_register[i], 4);
+        }
+    }
+    for i in 0..b.gds_pointers.pointers_num.max(0) as usize {
+        if b.gds_pointers.extended[i] {
+            cover(&mut covered, b.gds_pointers.start_register[i], 1);
+        }
+    }
+    covered
+}
+
+/// Call after `shader_get_input_info_*` (binding indices assigned) and
+/// before `shader_recompile_*`. Gs-prolog register shifts are not handled
+/// (the recompiler refuses that combination by name already).
+pub fn shader_detect_eud_raw_window(code: &ShaderCode, bind: &mut ShaderBindResources) {
+    use ShaderInstructionType as T;
+
+    bind.eud_raw = ShaderEudRawResources::default();
+    if !bind.extended.used {
+        return;
+    }
+
+    let covered = eud_covered_map(bind);
+
+    let base_reg = bind.extended.start_register;
+    let mut required: Option<u32> = None;
+    for inst in code.get_instructions() {
+        let n = match inst.type_ {
+            T::SLoadDwordx2 => 2u32,
+            T::SLoadDwordx4 => 4,
+            T::SLoadDwordx8 => 8,
+            _ => continue,
+        };
+        if inst.src[0].type_ != ShaderOperandType::Sgpr
+            || inst.src[0].register_id != base_reg
+            || !matches!(
+                inst.src[1].type_,
+                ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
+            )
+            || inst.src[1].constant.i() < 0
+        {
+            continue;
+        }
+        let base_dw = inst.src[1].constant.u >> 2;
+        for i in 0..n {
+            let idx = base_dw + i;
+            let is_covered = usize::try_from(idx)
+                .ok()
+                .and_then(|x| covered.get(x))
+                .copied()
+                .unwrap_or(false);
+            if !is_covered {
+                required = Some(required.map_or(idx + 1, |m| m.max(idx + 1)));
+            }
+        }
+    }
+
+    if let Some(required_dwords) = required {
+        // Next binding index after every group `shader_calc_binding_indices`
+        // assigned (GDS takes the last index without advancing the counter).
+        let mut binding_index = 0;
+        if bind.storage_buffers.buffers_num > 0 {
+            binding_index += 1;
+        }
+        if bind.textures2d.textures_num > 0 {
+            binding_index += 2;
+        }
+        if bind.samplers.samplers_num > 0 {
+            binding_index += 1;
+        }
+        if bind.gds_pointers.pointers_num > 0 {
+            binding_index += 1;
+        }
+        bind.eud_raw = ShaderEudRawResources {
+            used: true,
+            binding_index,
+            required_dwords,
+        };
+        tracing::debug!(
+            binding_index,
+            required_dwords,
+            eud_base_register = base_reg,
+            "raw EUD-window fallback: s_load(s) address uncaptured EUD dwords"
+        );
+    }
+}
+
 /// The single `OpTypeImage` Dim of the sampled-texture array
 /// (`%textures2D_S`), decided from the measured T# types: 9 (and the
 /// height-1 "1D" 8) = 2D, 10 = 3D volume, 11 = Cube, 13 = 2DArray
@@ -2623,6 +2774,9 @@ impl<'a> Spirv<'a> {
             if bind.gds_pointers.pointers_num > 0 {
                 vars.push("%gds".to_string());
             }
+            if bind.eud_raw.used {
+                vars.push("%eud_raw".to_string());
+            }
             if bind.push_constant_size > 0 {
                 vars.push("%vsharp".to_string());
             }
@@ -2816,6 +2970,16 @@ impl<'a> Spirv<'a> {
                OpDecorate %gds DescriptorSet <DescriptorSet>
                OpDecorate %gds Binding <BindingIndex>
 "#;
+        // SharpEmu port: the raw EUD-window SSBO (see `ShaderEudRawResources`;
+        // SharpEmu binds its pooled window the same way —
+        // Gen5SpirvTranslator.cs:2183-2236 reads it as a uint array).
+        const EUD_RAW_ANNOTATIONS: &str = r#"
+               OpDecorate %eudraw_runtimearr_uint ArrayStride 4
+               OpMemberDecorate %EudRaw 0 Offset 0
+               OpDecorate %EudRaw Block
+               OpDecorate %eud_raw DescriptorSet <DescriptorSet>
+               OpDecorate %eud_raw Binding <BindingIndex>
+"#;
         const VSHARP_ANNOTATIONS: &str = r#"
        OpDecorate %vsharp_arr_uint_uint_4 ArrayStride 4
        OpDecorate %vsharp_arr__arr_uint_uint_4_uint_<buffers_num> ArrayStride 16
@@ -2863,6 +3027,11 @@ impl<'a> Spirv<'a> {
                         "<BindingIndex>",
                         &format!("{}", bind.gds_pointers.binding_index),
                     );
+            }
+            if bind.eud_raw.used {
+                self.source += &EUD_RAW_ANNOTATIONS
+                    .replace("<DescriptorSet>", &format!("{}", bind.descriptor_set_slot))
+                    .replace("<BindingIndex>", &format!("{}", bind.eud_raw.binding_index));
             }
             if bind.push_constant_size > 0 {
                 self.source += &VSHARP_ANNOTATIONS
@@ -3005,6 +3174,15 @@ impl<'a> Spirv<'a> {
             %_ptr_StorageBuffer_GDS = OpTypePointer StorageBuffer %GDS
 "#;
 
+        // SharpEmu port: the raw EUD-window SSBO type (a uint runtime array,
+        // like SharpEmu's pooled global-memory binding —
+        // Gen5SpirvTranslator.cs:2183-2236).
+        const EUD_RAW_TYPES: &str = r#"
+            %eudraw_runtimearr_uint = OpTypeRuntimeArray %uint
+                    %EudRaw = OpTypeStruct %eudraw_runtimearr_uint
+            %_ptr_StorageBuffer_EudRaw = OpTypePointer StorageBuffer %EudRaw
+"#;
+
         const VSHARP_TYPES: &str = r#"
          %vsharp_buffers_num_uint_<buffers_num> = OpConstant %uint <buffers_num>
                              %vsharp_num_uint_4 = OpConstant %uint 4
@@ -3055,6 +3233,9 @@ impl<'a> Spirv<'a> {
             }
             if bind.gds_pointers.pointers_num > 0 {
                 self.source += GDS_TYPES;
+            }
+            if bind.eud_raw.used {
+                self.source += EUD_RAW_TYPES;
             }
             if bind.push_constant_size > 0 {
                 self.source += &VSHARP_TYPES.replace(
@@ -3182,6 +3363,11 @@ impl<'a> Spirv<'a> {
             }
             if bind.gds_pointers.pointers_num > 0 {
                 vars.push("%gds = OpVariable %_ptr_StorageBuffer_GDS StorageBuffer".to_string());
+            }
+            if bind.eud_raw.used {
+                vars.push(
+                    "%eud_raw = OpVariable %_ptr_StorageBuffer_EudRaw StorageBuffer".to_string(),
+                );
             }
             if bind.push_constant_size > 0 {
                 vars.push(
@@ -4193,6 +4379,44 @@ impl<'a> Spirv<'a> {
         for (off, n) in multi_dw_read_offsets {
             for k in 1..n {
                 self.add_constant_uint(off + 4 * k);
+            }
+        }
+        // Raw EUD-window fallback reads (SharpEmu port, see
+        // `shader_detect_eud_raw_window`): each lowered `s_load` dword
+        // references its constant dword index into `%eud_raw`. Registered for
+        // every EUD-base load — the mapped dwords among them simply leave an
+        // unused (legal) constant behind.
+        if let Some(bind) = self.bind
+            && bind.extended.used
+            && bind.eud_raw.used
+        {
+            let base_reg = bind.extended.start_register;
+            let eud_loads: Vec<(u32, u32)> = self
+                .code
+                .get_instructions()
+                .iter()
+                .filter_map(|inst| {
+                    let n = match inst.type_ {
+                        ShaderInstructionType::SLoadDwordx2 => 2u32,
+                        ShaderInstructionType::SLoadDwordx4 => 4,
+                        ShaderInstructionType::SLoadDwordx8 => 8,
+                        _ => return None,
+                    };
+                    (inst.src[0].type_ == ShaderOperandType::Sgpr
+                        && inst.src[0].register_id == base_reg
+                        && matches!(
+                            inst.src[1].type_,
+                            ShaderOperandType::LiteralConstant
+                                | ShaderOperandType::IntegerInlineConstant
+                        )
+                        && inst.src[1].constant.i() >= 0)
+                        .then_some((inst.src[1].constant.u >> 2, n))
+                })
+                .collect();
+            for (base_dw, n) in eud_loads {
+                for i in 0..n {
+                    self.add_constant_uint(base_dw + i);
+                }
             }
         }
         Ok(())

@@ -185,6 +185,7 @@ fn sampled_texture_pixels_reach_the_readback() {
             }),
             storage_images: None,
             gds_binding: None,
+            eud_raw: None,
         }],
         ..DrawState::new(W, H, &vs, &ps)
     };

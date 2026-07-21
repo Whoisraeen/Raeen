@@ -116,6 +116,23 @@ pub struct StorageBufferBinding {
     pub buffers: Vec<Vec<u8>>,
 }
 
+/// The raw EUD-window fallback SSBO (SharpEmu port): a dispatch-time
+/// snapshot of the guest memory behind the shader's EUD base pointer, bound
+/// as the `%eud_raw` uint array the recompiled `s_load` fallback reads
+/// (see `kyty_graphics::shader::ShaderEudRawResources`; SharpEmu binds its
+/// pooled window the same way —
+/// `reference/sharpemu/src/SharpEmu.ShaderCompiler/`
+/// `Gen5ShaderScalarEvaluator.cs:1939-1980`). Read-only: never written by
+/// the shader, never written back to guest memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EudRawBinding {
+    pub binding: u32,
+    /// Snapshot bytes (dword multiple, at least 4). May be shorter than the
+    /// shader's furthest constant offset — the recompiled reads clamp
+    /// against the bound size and yield 0 beyond it.
+    pub bytes: Vec<u8>,
+}
+
 /// One storage image (UAV) a translated compute shader reads and writes.
 ///
 /// The pixels are the guest's initial content (tightly packed rows, `depth`
@@ -225,6 +242,10 @@ pub struct ShaderStageBinding {
     /// counters must persist across dispatches (measured: ASTRO.BOT feeds
     /// indirect-draw args through them). Compute-only today.
     pub gds_binding: Option<u32>,
+    /// Raw EUD-window fallback SSBO (SharpEmu port). Compute-only today —
+    /// detection is wired on the CS translate path; the graphics draw path
+    /// rejects a stage that carries it rather than binding nothing.
+    pub eud_raw: Option<EudRawBinding>,
 }
 
 /// Register-derived alpha-blend state for the single color attachment.
@@ -584,6 +605,33 @@ impl<'a> DrawState<'a> {
             index: None,
             color_output: true,
             depth: None,
+        }
+    }
+
+    /// Internal-resolution scaling (Settings ▸ Video ▸ Resolution Scale):
+    /// supersample by rendering into a target `factor`× larger with a
+    /// proportionally scaled viewport and scissor. Guest vertices are in
+    /// resolution-independent NDC, so this only changes the sample count, not
+    /// the image — the color/depth targets both derive from `width`/`height`,
+    /// so scaling those keeps them matched. `factor` is clamped to a sane range;
+    /// **`1.0` is an exact no-op** (the default, so it changes nothing).
+    pub fn scale_resolution(&mut self, factor: f32) {
+        let factor = if factor.is_finite() {
+            factor.clamp(0.5, 4.0)
+        } else {
+            1.0
+        };
+        if (factor - 1.0).abs() < f32::EPSILON {
+            return;
+        }
+        let scale_u = |v: u32| ((v as f32 * factor).round() as u32).max(1);
+        self.width = scale_u(self.width);
+        self.height = scale_u(self.height);
+        for v in &mut self.viewport {
+            *v *= factor;
+        }
+        for s in &mut self.scissor {
+            *s = (*s as f32 * factor).round() as i32;
         }
     }
 }
@@ -1697,6 +1745,19 @@ impl<'a> Resources<'a> {
         {
             return Err(GpuError::PipelineCreationFailed(format!(
                 "{:?} stage binds GDS — GDS is implemented for COMPUTE dispatches only",
+                stage.stage
+            )));
+        }
+        // Same policy for the raw EUD-window fallback: detection is wired on
+        // the compute translate path only, so a graphics stage carrying it is
+        // a named refusal rather than a shader reading an unbound SSBO.
+        if let Some(stage) = state
+            .stage_bindings
+            .iter()
+            .find(|stage| stage.eud_raw.is_some())
+        {
+            return Err(GpuError::PipelineCreationFailed(format!(
+                "{:?} stage binds a raw EUD window — implemented for COMPUTE dispatches only",
                 stage.stage
             )));
         }
@@ -3376,6 +3437,37 @@ mod tests {
     fn unorm8_maps_endpoints_exactly() {
         assert_eq!(unorm8([0.0, 1.0, 0.0, 1.0]), [0, 255, 0, 255]);
         assert_eq!(unorm8(TRIANGLE_COLOR), [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn scale_resolution_supersamples_target_viewport_and_scissor_together() {
+        let mut state = DrawState::new(96, 48, &[], &[]);
+        state.scale_resolution(2.0);
+        assert_eq!((state.width, state.height), (192, 96));
+        assert_eq!(state.viewport, [0.0, 0.0, 192.0, 96.0]);
+        assert_eq!(state.scissor, [0, 0, 192, 96]);
+    }
+
+    #[test]
+    fn scale_resolution_of_one_is_an_exact_no_op() {
+        let mut state = DrawState::new(96, 48, &[], &[]);
+        let (w, h, vp, sc) = (state.width, state.height, state.viewport, state.scissor);
+        state.scale_resolution(1.0);
+        assert_eq!((state.width, state.height), (w, h));
+        assert_eq!(state.viewport, vp);
+        assert_eq!(state.scissor, sc);
+    }
+
+    #[test]
+    fn scale_resolution_clamps_wild_and_non_finite_factors() {
+        // Above the cap → 4x, not 100x.
+        let mut big = DrawState::new(100, 100, &[], &[]);
+        big.scale_resolution(100.0);
+        assert_eq!((big.width, big.height), (400, 400));
+        // NaN / inf fall back to a no-op rather than producing a zero-sized target.
+        let mut nan = DrawState::new(100, 100, &[], &[]);
+        nan.scale_resolution(f32::NAN);
+        assert_eq!((nan.width, nan.height), (100, 100));
     }
 
     #[test]

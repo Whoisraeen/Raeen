@@ -110,6 +110,9 @@ struct ComputeResources<'a> {
     /// The persistent GDS arena (cache-owned, NOT destroyed here); null when
     /// the dispatch binds no GDS.
     gds: vk::Buffer,
+    /// The raw EUD-window snapshot (SharpEmu port); per-dispatch, owned,
+    /// never read back.
+    eud_raw: Option<BufferAllocation>,
     shader: vk::ShaderModule,
     descriptor_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
@@ -130,6 +133,7 @@ impl<'a> ComputeResources<'a> {
             sampled: Vec::new(),
             samplers: Vec::new(),
             gds: vk::Buffer::null(),
+            eud_raw: None,
             shader: vk::ShaderModule::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
@@ -154,10 +158,12 @@ impl<'a> ComputeResources<'a> {
         let storage_images = state.binding.and_then(|b| b.storage_images.as_ref());
         let textures = state.binding.and_then(|b| b.textures.as_ref());
         let gds_binding = state.binding.and_then(|b| b.gds_binding);
+        let eud_raw = state.binding.and_then(|b| b.eud_raw.as_ref());
         if storage.is_some()
             || storage_images.is_some()
             || textures.is_some()
             || gds_binding.is_some()
+            || eud_raw.is_some()
         {
             let binding = state.binding.expect("resource groups come from a binding");
             if binding.descriptor_set_slot != 0 {
@@ -257,6 +263,26 @@ impl<'a> ComputeResources<'a> {
                         .stage_flags(vk::ShaderStageFlags::COMPUTE),
                 );
             }
+            // The raw EUD-window snapshot (SharpEmu port): one per-dispatch
+            // SSBO at the binding index the recompiled `%eud_raw` declares.
+            // Uploaded once, never read back (the shader only s_loads it).
+            if let Some(window) = eud_raw {
+                if window.bytes.len() < 4 || !window.bytes.len().is_multiple_of(4) {
+                    return Err(GpuError::PipelineCreationFailed(format!(
+                        "raw EUD-window snapshot carries {} bytes — must be a non-zero \
+                         dword multiple",
+                        window.bytes.len()
+                    )));
+                }
+                self.eud_raw = Some(self.create_storage_buffer(&window.bytes)?);
+                layout_bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(window.binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                );
+            }
 
             // Cached by binding signature, shared with the graphics path.
             self.descriptor_layout = self.caches.set_layout(self.dev, &layout_bindings)?;
@@ -264,7 +290,9 @@ impl<'a> ComputeResources<'a> {
             let pool_sizes: Vec<_> = [
                 (
                     vk::DescriptorType::STORAGE_BUFFER,
-                    self.storage.len() as u32 + u32::from(!self.gds.is_null()),
+                    self.storage.len() as u32
+                        + u32::from(!self.gds.is_null())
+                        + u32::from(self.eud_raw.is_some()),
                 ),
                 (vk::DescriptorType::STORAGE_IMAGE, self.images.len() as u32),
                 (vk::DescriptorType::SAMPLED_IMAGE, self.sampled.len() as u32),
@@ -372,6 +400,24 @@ impl<'a> ComputeResources<'a> {
                         .dst_binding(binding)
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                         .buffer_info(&gds_info),
+                );
+            }
+            let eud_raw_info = self
+                .eud_raw
+                .as_ref()
+                .map(|allocation| {
+                    [vk::DescriptorBufferInfo::default()
+                        .buffer(allocation.buffer)
+                        .range(allocation.size as u64)]
+                })
+                .unwrap_or_default();
+            if let Some(window) = eud_raw {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.descriptor_set)
+                        .dst_binding(window.binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&eud_raw_info),
                 );
             }
             // SAFETY: descriptor set and every named buffer/view are live.
@@ -1042,6 +1088,10 @@ impl Drop for ComputeResources<'_> {
         // fence completion or a failed build.
         unsafe {
             while let Some(allocation) = self.storage.pop() {
+                self.device().destroy_buffer(allocation.buffer, None);
+                self.device().free_memory(allocation.memory, None);
+            }
+            if let Some(allocation) = self.eud_raw.take() {
                 self.device().destroy_buffer(allocation.buffer, None);
                 self.device().free_memory(allocation.memory, None);
             }

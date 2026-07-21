@@ -25,9 +25,9 @@ use crate::shader_fetch::{ShaderTranslateCache, TranslatedShader};
 use crate::vulkan::compute::{ComputeState, dispatch_compute};
 use crate::vulkan::instance::VulkanDevice;
 use crate::vulkan::offscreen::{
-    BlendState, CLEAR_COLOR, DrawState, RenderedImage, ShaderStageBinding, StorageBufferBinding,
-    StorageImageBinding, StorageImageUpload, TextureBinding, TextureUpload, VertexAttributeData,
-    VertexBufferData,
+    BlendState, CLEAR_COLOR, DrawState, EudRawBinding, RenderedImage, ShaderStageBinding,
+    StorageBufferBinding, StorageImageBinding, StorageImageUpload, TextureBinding, TextureUpload,
+    VertexAttributeData, VertexBufferData,
 };
 use ash::vk;
 use kyty_graphics::hw_regs::{ComputeShaderInfo, Context, Shader, UserConfig};
@@ -957,6 +957,101 @@ fn buffer_byte_size(resource: &kyty_graphics::shader::ShaderBufferResource) -> O
     }
 }
 
+/// Desired raw EUD-window snapshot size in bytes (SharpEmu port): at least
+/// the shader's required prefix, floored at 256 KiB, page-rounded up, capped
+/// at 16 MiB (`reference/sharpemu/src/SharpEmu.ShaderCompiler/`
+/// `Gen5ShaderScalarEvaluator.cs:1952-1960` — the 256 KiB/page-round window —
+/// and `:69` — `MaxGlobalMemoryBindingBytes` = 16 MiB).
+fn eud_raw_window_want_bytes(required_dwords: u32) -> u64 {
+    const MIN_BYTES: u64 = 256 * 1024;
+    const MAX_BYTES: u64 = 16 * 1024 * 1024;
+    u64::from(required_dwords)
+        .saturating_mul(4)
+        .max(MIN_BYTES)
+        .next_multiple_of(4096)
+        .min(MAX_BYTES)
+}
+
+/// Snapshot the guest window behind the EUD base pointer for the `%eud_raw`
+/// SSBO. Ports SharpEmu's halving probe (`TryReadGlobalMemory`,
+/// `Gen5ShaderScalarEvaluator.cs:997-1005`: try the full window, halve down
+/// to one page) with its degrade-to-zero contract (`:14-35`): an unreadable
+/// pointer yields a zero-filled buffer and `false` — never a refusal. The
+/// returned bytes are a non-zero dword multiple; a snapshot shorter than the
+/// shader's furthest offset is fine — the recompiled reads clamp against the
+/// bound size and yield 0 beyond it.
+///
+/// `read` is injected (addr, byte length → bytes) so the sizing/degrade
+/// logic is testable without live guest memory.
+fn snapshot_eud_raw_window(
+    base: u64,
+    required_dwords: u32,
+    read: impl Fn(u64, u64) -> Option<Vec<u8>>,
+) -> (Vec<u8>, bool) {
+    let required_bytes = usize::try_from(u64::from(required_dwords.max(1)) * 4)
+        .unwrap_or(4)
+        .max(4);
+    if base == 0 || !base.is_multiple_of(4) {
+        return (vec![0u8; required_bytes], false);
+    }
+    let want = eud_raw_window_want_bytes(required_dwords);
+    let mut size = want;
+    while size >= 4096 {
+        if let Some(bytes) = read(base, size) {
+            return (bytes, true);
+        }
+        size /= 2;
+    }
+    // Below one page: try the exact required prefix before degrading —
+    // a tiny readable EUD (a few dwords) is still better than zeros.
+    if let Some(bytes) = read(base, required_bytes as u64) {
+        return (bytes, true);
+    }
+    (vec![0u8; required_bytes], false)
+}
+
+/// Build the [`EudRawBinding`] for a stage whose recompiled shader declares
+/// the raw EUD-window fallback. Unreadable windows degrade to zeros with a
+/// once-per-EUD-base warning (SharpEmu's one-shot trace gate,
+/// `Gen5ShaderScalarEvaluator.cs:36-37`) — never a skipped dispatch.
+fn prepare_eud_raw_binding(bind: &ShaderBindResources) -> EudRawBinding {
+    let base = bind.extended.data.base();
+    let required_dwords = bind.eud_raw.required_dwords;
+    let (bytes, readable) = snapshot_eud_raw_window(base, required_dwords, |addr, len| {
+        debug_assert!(len.is_multiple_of(4));
+        // Validate before reading: a failed probe must not charge the
+        // per-submission guest-byte budget (the halving ladder tries several
+        // sizes per dispatch).
+        if crate::guest_mem::readable_prefix(addr, len) != len {
+            return None;
+        }
+        let count = u32::try_from(len / 4).ok()?;
+        crate::guest_mem::read_dwords_validated(addr, count)
+            .map(|words| words.into_iter().flat_map(u32::to_le_bytes).collect())
+    });
+    if !readable {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        static WARNED: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+        let first = WARNED
+            .lock()
+            .map(|mut set| set.get_or_insert_with(HashSet::new).insert(base))
+            .unwrap_or(false);
+        if first {
+            tracing::warn!(
+                eud_base = format_args!("{base:#x}"),
+                required_dwords,
+                "raw EUD window is unreadable — binding zeros (degrade, not refuse); \
+                 further hits on this base are silent"
+            );
+        }
+    }
+    EudRawBinding {
+        binding: bind.eud_raw.binding_index.max(0) as u32,
+        bytes,
+    }
+}
+
 fn prepare_stage_binding(
     bind: &ShaderBindResources,
     stage: vk::ShaderStageFlags,
@@ -1244,6 +1339,9 @@ fn prepare_stage_binding(
             images: storage_images,
         }),
         gds_binding: (gds_num != 0).then_some(bind.gds_pointers.binding_index as u32),
+        // The raw EUD-window snapshot (SharpEmu port): read at dispatch time
+        // from the captured EUD base pointer; unreadable degrades to zeros.
+        eud_raw: bind.eud_raw.used.then(|| prepare_eud_raw_binding(bind)),
     })
 }
 
@@ -1604,6 +1702,10 @@ impl OffscreenDrawSink<'_> {
         };
 
         let mut state = draw_state_from_regs(ctx, ucfg, count, &shaders.vs, &shaders.ps)?;
+        // Internal-resolution scaling (Settings ▸ Video ▸ Resolution Scale).
+        // Supersamples the whole draw (target + viewport + scissor together);
+        // a factor of 1.0 — the default — is an exact no-op.
+        state.scale_resolution(crate::agc_exec::AgcGpuSession::runtime_config().resolution_scale);
         let (vertex_buffers, vertex_attributes) = prepare_vertex_inputs(&shaders.vs_info)?;
         state.vertex_buffers = vertex_buffers;
         state.vertex_attributes = vertex_attributes;
@@ -1880,33 +1982,19 @@ impl DrawSink for OffscreenDrawSink<'_> {
             }
         };
         let bind = &translated.cs_info.bind;
-        // Device-loss quarantine (round 10, measured): the one CS ASTRO.BOT
-        // dispatches with sampled textures and ZERO samplers (0x5006c5f00, an
-        // LDS-reduction with a runtime-loaded T# index via `s_load_dwordx8`)
-        // reproducibly resets the GPU (VK_ERROR_DEVICE_LOST — bisected with
-        // XPS5X_SKIP_CS: skipping it alone gives a clean 60s run; robustness
-        // features don't help, pointing at descriptor-array OOB indexing,
-        // which robustness does not cover). Until the translated index path
-        // is diagnosed, this category is a named counted skip; the reverse
-        // shape (samplers without textures) is measured safe and stays live.
-        // XPS5X_ALLOW_TEX_NO_SAMPLER=1 lifts the quarantine for debugging.
-        if bind.textures2d.textures2d_sampled_num > 0
-            && bind.samplers.samplers_num == 0
-            && std::env::var_os("XPS5X_ALLOW_TEX_NO_SAMPLER").is_none()
-        {
-            self.dispatch_skips += 1;
-            self.last_dispatch_skip_reason = Some(format!(
-                "quarantined: CS at {:#x} binds {} sampled texture(s) with zero samplers \
-                 (measured device reset; XPS5X_ALLOW_TEX_NO_SAMPLER=1 to run)",
-                cs.cs_regs.data_addr, bind.textures2d.textures2d_sampled_num
-            ));
-            debug!(
-                cs_addr = format_args!("{:#x}", cs.cs_regs.data_addr),
-                sampled = bind.textures2d.textures2d_sampled_num,
-                "compute dispatch skipped: tex-no-sampler quarantine (device-loss bisect)"
-            );
-            return Ok(());
-        }
+        // The round-10 tex-no-sampler quarantine is GONE. The measured
+        // device loss (0x5006c5f00: sampled textures + zero samplers +
+        // runtime-loaded T# via `s_load_dwordx8`) was descriptor-array OOB
+        // indexing, now structurally defused at translate time:
+        // - `mimg_descriptor_guard` (kyty-graphics) refuses any MIMG whose
+        //   T#/S# registers are not a captured descriptor, or are
+        //   overwritten by a raw (uncovered-EUD) `s_load`, with the named
+        //   `dynamic-image-descriptor` skip (SharpEmu parity);
+        // - `shader_synthesize_default_sampler` rescues sample-family
+        //   shaders with zero captured S#s via a cached nearest/wrap
+        //   default sampler instead of a refusal;
+        // - every LDS access is index-clamped in the emitted SPIR-V.
+        // Texel-fetch shaders with zero samplers are legitimate and run.
         let has_binding = bind.push_constant_size != 0
             || bind.storage_buffers.buffers_num != 0
             || bind.textures2d.textures_num != 0
@@ -2671,6 +2759,112 @@ mod tests {
         })
         .expect_err("storage images are compute-only");
         assert!(e.0.contains("STORAGE"), "names the storage rejection: {e}");
+    }
+
+    /// SharpEmu-parity window sizing (Gen5ShaderScalarEvaluator.cs:1952-1960
+    /// and :69): max(need, 256 KiB), page-rounded up, capped at 16 MiB.
+    #[test]
+    fn eud_raw_window_sizing_min_round_cap() {
+        // Tiny requirement floors at the 256 KiB minimum (already page-round).
+        assert_eq!(eud_raw_window_want_bytes(1), 256 * 1024);
+        assert_eq!(eud_raw_window_want_bytes(0), 256 * 1024);
+        // Above the minimum: page-rounded up.
+        assert_eq!(
+            eud_raw_window_want_bytes(100_000), // 400_000 B
+            400_000u64.next_multiple_of(4096)
+        );
+        // Enormous requirement caps at 16 MiB.
+        assert_eq!(eud_raw_window_want_bytes(5_000_000), 16 * 1024 * 1024);
+    }
+
+    /// SharpEmu-parity snapshot probe (Gen5ShaderScalarEvaluator.cs:997-1005):
+    /// halve from the wanted window down to one page, then the exact
+    /// required prefix; an unreadable pointer degrades to zeros, never fails.
+    #[test]
+    fn eud_raw_snapshot_halves_and_degrades_to_zero() {
+        // A "guest" that can serve at most 8 KiB from base 0x1000.
+        let read = |addr: u64, len: u64| {
+            (addr == 0x1000 && len <= 8192).then(|| vec![0xABu8; len as usize])
+        };
+        let (bytes, ok) = snapshot_eud_raw_window(0x1000, 16, read);
+        assert!(ok);
+        assert_eq!(
+            bytes.len(),
+            8192,
+            "halved from 256 KiB to the first readable rung"
+        );
+        assert!(bytes.iter().all(|&b| b == 0xAB));
+
+        // Sub-page readable prefix: the halving floor misses, the exact
+        // required prefix still lands.
+        let read_small =
+            |addr: u64, len: u64| (addr == 0x1000 && len <= 64).then(|| vec![0xCDu8; len as usize]);
+        let (bytes, ok) = snapshot_eud_raw_window(0x1000, 16, read_small);
+        assert!(ok);
+        assert_eq!(bytes.len(), 64, "the 16-dword required prefix");
+
+        // Unreadable pointer: zero-filled required prefix, flagged degraded.
+        let (bytes, ok) = snapshot_eud_raw_window(0x1000, 16, |_, _| None);
+        assert!(!ok);
+        assert_eq!(bytes.len(), 64);
+        assert!(bytes.iter().all(|&b| b == 0));
+
+        // Null / unaligned base short-circuits to the same degrade.
+        let (bytes, ok) = snapshot_eud_raw_window(0, 2, |_, _| Some(vec![1]));
+        assert!(!ok);
+        assert_eq!(bytes.len(), 8);
+        let (_, ok) = snapshot_eud_raw_window(0x1002, 2, |_, _| Some(vec![1]));
+        assert!(!ok);
+    }
+
+    /// End-to-end binding-layer shape: a compute bind whose shader declared
+    /// the raw EUD window snapshots live guest memory into `eud_raw` at the
+    /// detected binding index, alongside the usual groups.
+    #[test]
+    fn compute_binding_carries_eud_raw_snapshot() {
+        // 8 KiB of "EUD" guest memory with a recognizable head.
+        let mut arena = vec![0u8; 8192 + 255];
+        let base = (arena.as_ptr() as u64 + 255) & !255;
+        let off = (base - arena.as_ptr() as u64) as usize;
+        for (i, b) in arena[off..off + 64].iter_mut().enumerate() {
+            *b = i as u8;
+        }
+
+        let mut bind = ShaderBindResources::default();
+        bind.extended.used = true;
+        bind.extended.start_register = 12;
+        bind.extended.data.update_address(base);
+        bind.eud_raw.used = true;
+        bind.eud_raw.binding_index = 0;
+        bind.eud_raw.required_dwords = 8;
+
+        let ranges = [(arena.as_ptr() as u64, arena.len())];
+        let binding = crate::guest_mem::with_test_ranges(&ranges, || {
+            prepare_stage_binding(&bind, vk::ShaderStageFlags::COMPUTE)
+        })
+        .expect("eud_raw-only compute binding");
+        let raw = binding.eud_raw.expect("raw window bound");
+        assert_eq!(raw.binding, 0);
+        assert_eq!(
+            raw.bytes.len(),
+            8192,
+            "snapshot halves from 256 KiB down into the 8 KiB test range"
+        );
+        assert_eq!(
+            &raw.bytes[..64],
+            &(0..64).map(|i| i as u8).collect::<Vec<_>>()[..],
+            "snapshot carries the live guest bytes"
+        );
+
+        // An unreadable EUD base still binds — zero-filled, not refused.
+        bind.extended.data.update_address(0xDEAD_0000);
+        let binding = crate::guest_mem::with_test_ranges(&ranges, || {
+            prepare_stage_binding(&bind, vk::ShaderStageFlags::COMPUTE)
+        })
+        .expect("unreadable EUD window degrades, never refuses");
+        let raw = binding.eud_raw.expect("raw window bound");
+        assert_eq!(raw.bytes.len(), 32, "required 8 dwords of zeros");
+        assert!(raw.bytes.iter().all(|&b| b == 0));
     }
 
     /// A storage T# whose format is not 32-bpp must zero-fill its seed (warn

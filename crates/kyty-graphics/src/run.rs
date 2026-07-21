@@ -1015,7 +1015,7 @@ impl CommandProcessor {
             return Ok(consumed);
         }
         let alignment = if spec.is_64 { 8 } else { 4 };
-        if spec.address == 0 || spec.mask == 0 || !spec.address.is_multiple_of(alignment) {
+        if spec.address == 0 || spec.mask == 0 || spec.address % alignment != 0 {
             if self.first(SkipKey::Note("wait_mem_invalid_address_or_mask")) {
                 warn!(
                     label = format_args!("{:#x}", spec.address),
@@ -3468,7 +3468,11 @@ mod tests {
             RunOutcome::Completed => panic!("unmet wait must suspend"),
         }
         assert!(sink.draws.is_empty(), "work behind the wait must not run");
-        assert_eq!(mem.words.borrow()[0], 0, "the CP must never write the label");
+        assert_eq!(
+            mem.words.borrow()[0],
+            0,
+            "the CP must never write the label"
+        );
 
         // Producer writes the label; the re-check would now pass.
         mem.words.borrow_mut()[0] = 1;
@@ -3521,10 +3525,7 @@ mod tests {
         assert_eq!(spec.read_label(&mem), Some(0x10));
         assert!(spec.satisfied_by(0x10));
         // Masked comparison: bits outside the mask are invisible.
-        let masked = WaitSpec {
-            mask: 0xFF,
-            ..spec
-        };
+        let masked = WaitSpec { mask: 0xFF, ..spec };
         assert!(masked.satisfied_by(0xAB00_0010));
     }
 

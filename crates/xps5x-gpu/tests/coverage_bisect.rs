@@ -395,6 +395,7 @@ fn title_translated_ps_sweep() {
                 },
                 storage_images: None,
                 gds_binding: None,
+                eud_raw: None,
             }]
         } else {
             Vec::new()

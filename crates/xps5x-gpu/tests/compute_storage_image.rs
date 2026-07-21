@@ -132,6 +132,7 @@ fn compute_shader_writes_are_visible_in_storage_image_readback() {
             }],
         }),
         gds_binding: None,
+        eud_raw: None,
     };
 
     let outputs = dispatch_compute(

@@ -36,7 +36,7 @@ pub use analysis::{
     shader_calc_binding_indices, shader_detect_buffers, shader_get_id_cs, shader_get_id_ps,
     shader_get_id_vs, shader_get_input_info_cs, shader_get_input_info_ps, shader_get_input_info_vs,
     shader_parse_attrib, shader_parse_cs, shader_parse_fetch, shader_parse_ps, shader_parse_usage,
-    shader_parse_usage2, shader_parse_vs,
+    shader_parse_usage2, shader_parse_vs, shader_synthesize_default_sampler,
 };
 pub use parse::{ShaderParseError, operand_parse, shader_parse};
 pub use recompile::{
@@ -44,13 +44,14 @@ pub use recompile::{
     recomp_func_table, shader_recompile_cs, shader_recompile_ps, shader_recompile_vs, spirv_run,
 };
 pub use resources::{
-    ShaderBindResources, ShaderBufferResource, ShaderComputeInputInfo, ShaderId, ShaderMappedData,
-    ShaderPixelInputInfo, ShaderSamplerResource, ShaderSemantic, ShaderSharp,
-    ShaderTextureResource, ShaderUserData, ShaderVertexInputBuffer, ShaderVertexInputInfo,
+    ShaderBindResources, ShaderBufferResource, ShaderComputeInputInfo, ShaderEudRawResources,
+    ShaderId, ShaderMappedData, ShaderPixelInputInfo, ShaderSamplerResource, ShaderSemantic,
+    ShaderSharp, ShaderTextureResource, ShaderUserData, ShaderVertexInputBuffer,
+    ShaderVertexInputInfo,
 };
 pub use spirv::{
-    ShaderRecompileError, Spirv, SpirvType, SpirvValue, spirv_generate_source,
-    spirv_get_embedded_ps, spirv_get_embedded_vs,
+    ShaderRecompileError, Spirv, SpirvType, SpirvValue, shader_detect_eud_raw_window,
+    spirv_generate_source, spirv_get_embedded_ps, spirv_get_embedded_vs,
 };
 pub use types::{
     ShaderCode, ShaderConstant, ShaderControlFlowBlock, ShaderDebugPrintf, ShaderInstruction,

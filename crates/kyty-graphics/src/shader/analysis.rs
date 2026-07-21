@@ -862,6 +862,90 @@ pub fn shader_calc_binding_indices(bind: &mut ShaderBindResources) {
     debug_assert_eq!(bind.push_constant_size % 16, 0);
 }
 
+/// Beyond Kyty — SharpEmu port: synthesize a DEFAULT S# for a shader that
+/// SAMPLES textures while analysis captured zero samplers.
+///
+/// SharpEmu never refuses this shape: a texture whose sampler handle was
+/// never created gets one built on the fly from its (possibly all-zero)
+/// captured S# state
+/// (`reference/sharpemu/src/SharpEmu.Libs/VideoOut/VulkanVideoPresenter.cs`
+/// L6314-6322), and `CreateSampler` decodes the all-zero S# to
+/// nearest-filter + wrap addressing, caching one `VkSampler` per distinct S#
+/// state for the device's lifetime (same file, L8121-8156).
+///
+/// The port synthesizes one all-zero S# per distinct MIMG sampler operand
+/// register: the bind-time path then seeds those SGPRs with the rewritten
+/// sampler-array index (0), `prepare_stage_binding` decodes the all-zero S#
+/// as `linear_filter = false`, and the Vulkan layer binds its cached
+/// nearest/wrap sampler (`ShaderCaches::sampler(dev, false)` — created once
+/// per device, destroyed on cleanup) — instead of the sample-family
+/// recompilers refusing the whole shader (`samplers_num == 0` previously
+/// returned "instruction not recompiled").
+///
+/// Texel-fetch-only shaders (`image_load`, no sample instructions) are left
+/// untouched: `OpImageFetch` needs no sampler and the descriptor arrays are
+/// independent.
+///
+/// Call after `shader_get_input_info_*` and before
+/// `shader_detect_eud_raw_window` (both consume the sampler table this may
+/// extend); binding indices and the push-constant size are recomputed here
+/// when a sampler is synthesized.
+pub fn shader_synthesize_default_sampler(code: &ShaderCode, bind: &mut ShaderBindResources) {
+    use ShaderInstructionType as T;
+
+    if bind.textures2d.textures2d_sampled_num <= 0 || bind.samplers.samplers_num != 0 {
+        return;
+    }
+
+    let mut regs: Vec<i32> = Vec::new();
+    for inst in code.get_instructions() {
+        if !matches!(
+            inst.type_,
+            T::ImageSample
+                | T::ImageSampleCLz
+                | T::ImageSampleLz
+                | T::ImageSampleLzO
+                | T::ImageGather4Lz
+        ) {
+            continue;
+        }
+        // MIMG src[2] is the S# operand (ssamp * 4).
+        let op = inst.src[2];
+        if op.type_ == ShaderOperandType::Sgpr && !regs.contains(&op.register_id) {
+            regs.push(op.register_id);
+        }
+    }
+    if regs.is_empty() {
+        return;
+    }
+
+    for reg in regs {
+        let index = bind.samplers.samplers_num;
+        let Ok(i) = usize::try_from(index) else {
+            return;
+        };
+        if i >= ShaderSamplerResources::RES_MAX {
+            // More distinct sampler registers than slots: leave the rest
+            // uncaptured — the recompiler's descriptor guard refuses those
+            // sample instructions by name instead of running them.
+            break;
+        }
+        bind.samplers.start_register[i] = reg;
+        bind.samplers.extended[i] = false;
+        // No usage slot produced this S#; the sentinel keeps the synthesized
+        // entry distinguishable in bind-id dumps.
+        bind.samplers.slots[i] = -1;
+        bind.samplers.samplers[i].fields = [0; 4];
+        bind.samplers.samplers_num += 1;
+        tracing::debug!(
+            start_register = reg,
+            "synthesized default (all-zero) S# for sampler-less sampled texture"
+        );
+    }
+
+    shader_calc_binding_indices(bind);
+}
+
 /// Kyty: Shader.cpp `ShaderParseUsage` (L1364) — the legacy (PS4)
 /// usage-slot walk over the binary-info trailer tables.
 ///

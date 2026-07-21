@@ -806,6 +806,37 @@ pub struct ShaderExtendedResources {
     pub data: ShaderExtendedResource,
 }
 
+/// Beyond Kyty — SharpEmu port: the raw EUD-window fallback binding.
+///
+/// SharpEmu has no captured-descriptor-table concept: every scalar load —
+/// EUD, SRT, anything — is a dispatch-time guest-memory read, and loads the
+/// evaluator cannot resolve statically become a pooled guest-memory window
+/// bound as an SSBO (`reference/sharpemu/src/SharpEmu.ShaderCompiler/`
+/// `Gen5ShaderScalarEvaluator.cs:1939-1980`, consumed by
+/// `Gen5SpirvTranslator.cs:2183-2236`). This is the minimal analogue for the
+/// one measured refusal class: an `s_load_dwordx2/x4/x8` off the EUD base
+/// pair whose dword is NOT a captured descriptor field (195 refused
+/// ASTRO.BOT compute dispatches/run). Captured descriptors keep the
+/// push-constant path — this group is an additive fallback, not a rewrite.
+///
+/// `shader_detect_eud_raw_window` fills it after `shader_get_input_info_*`;
+/// the recompiler lowers uncovered dwords to clamped reads of the `%eud_raw`
+/// SSBO; the dispatch path snapshots the guest window behind the EUD base
+/// pointer into that SSBO (`xps5x-gpu` `prepare_stage_binding`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShaderEudRawResources {
+    /// A raw-window read exists: declare + bind the `%eud_raw` SSBO.
+    pub used: bool,
+    /// Vulkan binding index of `%eud_raw` (next index after every group
+    /// `shader_calc_binding_indices` assigned).
+    pub binding_index: i32,
+    /// Minimum window size in dwords: highest constant dword index any raw
+    /// `s_load` addresses, plus one. The host may bind MORE (SharpEmu's
+    /// 256 KiB minimum) or LESS (unreadable tail) — the recompiled reads
+    /// clamp against the bound size and return 0 beyond it.
+    pub required_dwords: u32,
+}
+
 /// Kyty: Shader.h `ShaderBindResources` (L851). Aggregated per-stage binding
 /// info: push-constant window plus every resource group.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -819,6 +850,9 @@ pub struct ShaderBindResources {
     pub gds_pointers: ShaderGdsResources,
     pub direct_sgprs: ShaderDirectSgprsResources,
     pub extended: ShaderExtendedResources,
+    /// Beyond Kyty (SharpEmu port): raw EUD-window fallback for scalar loads
+    /// of EUD dwords no captured descriptor covers.
+    pub eud_raw: ShaderEudRawResources,
 }
 
 /// Kyty: Shader.h `ShaderVertexInputInfo` (L864).

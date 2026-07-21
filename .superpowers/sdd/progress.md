@@ -2257,3 +2257,44 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   window to ~60 Hz (p50 15.9 ms). Next lever is an HLE vblank change
   (host-timer-resolution aware sleep, event-driven vblank, or a 120 Hz mode),
   out of this session's allowed scope.
+
+## 2026-07-20 — EUD/SRT raw-window s_load fallback (SharpEmu port)
+
+- eud-raw-window: complete (uncommitted, kyty-graphics 357/357 + xps5x-gpu
+  163/163 tests, clippy -D warnings clean). Kills the "EUD dword N is not a
+  captured descriptor field" refusal CLASS (195 refused ASTRO.BOT compute
+  dispatches measured — title-run impact NOT yet re-measured): detection
+  (`shader_detect_eud_raw_window`) records uncaptured EUD s_load dwords as a
+  `bind.eud_raw` raw-memory binding; recompiler lowers them to clamped
+  `%eud_raw` SSBO reads (OpArrayLength + UMin/Select, 0 beyond window);
+  dispatch snapshots the guest window behind the EUD base (SharpEmu sizing:
+  min 256 KiB, page-rounded, cap 16 MiB, halving probe; unreadable → zeros +
+  once-per-base warn, never a skip). Captured descriptors keep the rewritten
+  push-constant path (mixed loads split per dword). CS-wired only; VS/PS
+  detection + graphics-path binding deferred (offscreen refuses by name).
+  Ported from SharpEmu (GPL-2.0) Gen5ShaderScalarEvaluator.cs:1939-1980,
+  :997-1005, :14-35; Gen5SpirvTranslator.cs:2183-2236 — cited in doc comments.
+- wait-reg-mem-suspend-resume: complete (uncommitted, kyty-graphics 358/358 +
+  xps5x-gpu 140/140 lib tests, clippy -D warnings clean). THE scene-pixel gate
+  (SharpEmu-proven): unmet `IT_WAIT_REG_MEM` / `R_WAIT_MEM_32/64` now parse +
+  evaluate against the guest label and SUSPEND the walk (`run_resumable` →
+  `RunOutcome::Suspended{resume_dword, WaitSpec}`) instead of being consumed
+  without effect. The GPU worker parks the buffer per queue (DCB/ACB), queues
+  later same-queue submissions behind it (in-order ring semantics), and
+  re-checks every suspended wait after each submission/flush — the producer
+  events are compute/storage writebacks + DMA_DATA copies. Labels are NEVER
+  force-satisfied; unreadable-at-parse continues (SharpEmu parity), dead waits
+  warn after 512 re-check rounds. Cross-queue test mirrors the ASTRO shape
+  (ACB wait resumed by a DCB writeback; parked backlog drains in order).
+  Ported from SharpEmu (GPL-2.0) AgcExports.cs:4508-4529/4595-4726/4843-4950,
+  GpuWaitRegistry.cs:19-40/239-256 — cited in doc comments.
+- cs-device-loss-defusal: complete (uncommitted, tests green, clippy clean).
+  Quarantine for CS 0x5006c5f00 (ImageLoad+LDS+barrier+runtime-indexed T#)
+  REMOVED, incl. XPS5X_ALLOW_TEX_NO_SAMPLER: (i) sampler-less sample-family
+  shaders synthesize an all-zero S# → cached nearest/wrap sampler (SharpEmu
+  VulkanVideoPresenter.cs:6314-6322/8121-8156); (ii) all 9 DS-op families
+  verified UMin-clamped on %lds (kept clamp over SharpEmu's pow2 mask —
+  lds_size_dw is not always pow2); (iii) MIMG descriptor guard: T#/S# regs
+  not backed by a captured descriptor (incl. raw-EUD overwrite) refuse as
+  named 'dynamic-image-descriptor' skip (SharpEmu evaluator :654-662), never
+  a device-loss submit; (iv) storage-image contract validation deferred.

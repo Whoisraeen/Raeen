@@ -290,6 +290,14 @@ impl GpuProcessSession {
             *lifecycle = GpuLifecycle::Closing;
         }
         self.wait_idle();
+        let waits = self.wait_suspend_stats();
+        if waits.currently_suspended > 0 || waits.parked > 0 {
+            warn!(
+                suspended = waits.currently_suspended,
+                parked = waits.parked,
+                "GPU shutdown with label waits still unmet — their producers never ran"
+            );
+        }
         if let Some(sender) = self.submit_queue.get() {
             let _ = sender.send(GpuWork::Shutdown);
         }
@@ -414,11 +422,52 @@ impl AgcGpuSession {
         self.last_image.lock().clone()
     }
 
+    /// Drop every trace of the previously-presented title and (re)apply
+    /// `splash` as the frame to show. Called when a new title is staged so its
+    /// launch never opens on the prior title's splash or last drawn frame —
+    /// including the case where the new title fails to launch and never
+    /// installs a session of its own (an encrypted retail SELF), leaving this
+    /// already-installed session in place.
+    fn reset_presentation(&self, splash: Option<RenderedImage>) {
+        *self.splash.lock() = splash;
+        *self.last_image.lock() = None;
+        self.framebuffers.lock().clear();
+        *self.scanout_address.lock() = None;
+        *self.draw_count.lock() = 0;
+    }
+
     /// Stage the boot splash for the next launched process (see
     /// [`pending_splash`]). Call with `None` when the package has no
     /// `pic0.png`, so the previous launch's splash cannot carry over.
+    ///
+    /// This also resets the *currently-installed* session's presentation right
+    /// away: a launch that fails before creating its own session (e.g. an
+    /// encrypted retail SELF) would otherwise keep [`global`] pointed at the
+    /// previous title, leaking its splash under the new title's overlay. The
+    /// new process's own session, once created, seeds the same staged splash
+    /// at construction (see [`GpuProcessSession::create`]).
+    ///
+    /// [`global`]: AgcGpuSession::global
     pub fn set_pending_splash(image: Option<RenderedImage>) {
-        *pending_splash().lock() = image;
+        *pending_splash().lock() = image.clone();
+        let current = current_gpu_session().read().clone();
+        current.reset_presentation(image);
+    }
+
+    /// Mirror the user's GPU settings (Settings ▸ Video ▸ Validation Layers /
+    /// Resolution Scale) into the GPU crate. The Shell calls this once at
+    /// startup; the values are read when the Vulkan backend is created
+    /// (validation) and when each guest draw is sized (resolution scale).
+    pub fn set_runtime_config(validation_layers: bool, resolution_scale: f32) {
+        *gpu_runtime_config().write() = GpuRuntimeConfig {
+            validation_layers,
+            resolution_scale,
+        };
+    }
+
+    /// The current process-wide GPU settings (see [`Self::set_runtime_config`]).
+    pub(crate) fn runtime_config() -> GpuRuntimeConfig {
+        *gpu_runtime_config().read()
     }
 
     /// Take the boot splash down (`sceSystemServiceHideSplashScreen`, or a
@@ -692,7 +741,12 @@ impl AgcGpuSession {
         // which is the difference between reaching a presented frame and
         // never getting there. Set XPS5X_VULKAN_VALIDATION=1 to restore it
         // when debugging a specific draw.
-        let validation = std::env::var_os("XPS5X_VULKAN_VALIDATION").is_some();
+        // Validation is on when Settings ▸ Video ▸ Validation Layers is enabled,
+        // or the env override is set (a per-run toggle for debugging one draw
+        // without editing the config). Read at first backend creation, so the
+        // config setting applies from the launch after it was changed.
+        let validation = Self::runtime_config().validation_layers
+            || std::env::var_os("XPS5X_VULKAN_VALIDATION").is_some();
         let mut backend = VulkanBackend::new(validation);
         backend.init()?;
         *slot = Some(backend);
@@ -722,7 +776,8 @@ impl AgcGpuSession {
         let mut start = 0usize;
         let mut image = None;
         loop {
-            let (segment, suspended) = self.execute_dcb_cp_routed(words, start, is_compute, false)?;
+            let (segment, suspended) =
+                self.execute_dcb_cp_routed(words, start, is_compute, false)?;
             image = segment.or(image);
             let Some(suspended) = suspended else {
                 return Ok(image);
@@ -1070,11 +1125,7 @@ impl AgcGpuSession {
                                     // frame-dump diagnostics stay faithful.
                                     let deferred_present =
                                         std::env::var_os("XPS5X_DUMP_FRAMES").is_none();
-                                    session.try_execute_dcb_cp_routed(
-                                        &words,
-                                        is_compute,
-                                        deferred_present,
-                                    );
+                                    session.worker_submit(words, is_compute, deferred_present);
                                 }))
                                 .is_err()
                                 {
@@ -1084,6 +1135,10 @@ impl AgcGpuSession {
                             GpuWork::Flush { address, done } => {
                                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     session.flush_and_present(address);
+                                    // The flush lands deferred readbacks and
+                                    // compute storage writebacks — producer
+                                    // events for suspended label waits.
+                                    session.recheck_suspended_waits();
                                 }))
                                 .is_err()
                                 {
@@ -1155,14 +1210,7 @@ impl AgcGpuSession {
     }
 
     pub fn try_execute_dcb_cp(&self, words: &[u32], is_compute: bool) {
-        self.try_execute_dcb_cp_routed(words, is_compute, false);
-    }
-
-    /// [`Self::try_execute_dcb_cp`] with presentation routing: the GPU worker
-    /// passes `deferred_present = true` so the flush/present work runs once
-    /// per flip ([`GpuWork::Flush`]) instead of once per submission.
-    fn try_execute_dcb_cp_routed(&self, words: &[u32], is_compute: bool, deferred_present: bool) {
-        match self.execute_dcb_cp_routed(words, is_compute, deferred_present) {
+        match self.execute_dcb_cp(words, is_compute) {
             Ok(Some(image)) => debug!(
                 width = image.width,
                 height = image.height,
@@ -1170,6 +1218,195 @@ impl AgcGpuSession {
             ),
             Ok(None) => {}
             Err(e) => warn!(error = %e, "AGC DCB draw skipped"),
+        }
+    }
+
+    /// Worker-thread submission entry (WAIT_REG_MEM suspend/resume; SharpEmu
+    /// AgcExports.cs:4508-4529): a queue with a suspended buffer parks new
+    /// submissions behind it — in-order ring semantics — otherwise the buffer
+    /// runs and may itself suspend. Afterwards every suspended wait is
+    /// re-checked: this submission's writebacks (compute storage writebacks,
+    /// DMA_DATA copies, WRITE_DATA) are exactly the producer events that
+    /// satisfy cross-queue label waits.
+    fn worker_submit(&self, words: Vec<u32>, is_compute: bool, deferred_present: bool) {
+        let to_run = {
+            let mut ws = self.wait_states.lock();
+            let queue = ws.queue_mut(is_compute);
+            if queue.suspended.is_some() {
+                queue.pending.push_back((words, deferred_present));
+                None
+            } else {
+                Some(words)
+            }
+        };
+        if let Some(words) = to_run {
+            self.run_worker_buffer(words, 0, is_compute, deferred_present);
+        }
+        self.recheck_suspended_waits();
+    }
+
+    /// Execute a buffer from `start` on the worker; park it when it suspends
+    /// on an unmet label wait.
+    fn run_worker_buffer(
+        &self,
+        words: Vec<u32>,
+        start: usize,
+        is_compute: bool,
+        deferred_present: bool,
+    ) {
+        match self.execute_dcb_cp_routed(&words, start, is_compute, deferred_present) {
+            Ok((image, None)) => {
+                if let Some(image) = image {
+                    debug!(
+                        width = image.width,
+                        height = image.height,
+                        "AGC DCB drove a register-state Vulkan draw"
+                    );
+                }
+            }
+            Ok((_, Some(suspended))) => {
+                let total = self.wait_suspended_total.fetch_add(1, Ordering::Relaxed) + 1;
+                if total <= 8 || total.is_power_of_two() {
+                    tracing::info!(
+                        queue = if is_compute { "acb" } else { "dcb" },
+                        label = format_args!("{:#x}", suspended.wait.address),
+                        compare = suspended.wait.compare,
+                        reference = format_args!("{:#x}", suspended.wait.reference),
+                        resume_dword = suspended.resume_dword,
+                        total_suspends = total,
+                        "agc.queue_suspended: WAIT_REG_MEM unmet — buffer parked until its label is written"
+                    );
+                }
+                let mut ws = self.wait_states.lock();
+                let queue = ws.queue_mut(is_compute);
+                debug_assert!(
+                    queue.suspended.is_none(),
+                    "a queue holds at most one suspended buffer"
+                );
+                queue.suspended = Some(SuspendedBuffer {
+                    words,
+                    resume_dword: suspended.resume_dword,
+                    wait: suspended.wait,
+                    deferred_present,
+                    recheck_rounds: 0,
+                });
+            }
+            Err(e) => warn!(error = %e, "AGC DCB draw skipped"),
+        }
+    }
+
+    /// Re-evaluate every suspended label wait against current guest memory,
+    /// resume the satisfied ones from their suspend point, and drain the
+    /// submissions parked behind them.
+    ///
+    /// Port of SharpEmu `DrainResumableDcbs` + `ResumeSuspendedDcb`
+    /// (AgcExports.cs:4843-4950): loops to a bounded fixed point because a
+    /// resumed buffer's own writebacks can satisfy the *other* queue's wait —
+    /// measured there, one compute clear's guest writeback resumed 11
+    /// suspended graphics queues (`agc.queue_resumed`) and a real title draw
+    /// followed. Never force-satisfies; an unreadable label keeps its buffer
+    /// suspended (`GpuWaitRegistry.CollectSatisfied` keeps null-reads
+    /// registered), and a wait still unmet after
+    /// [`STALE_WAIT_RECHECK_ROUNDS`] rounds warns (then at each doubling) so
+    /// dead waits are visible.
+    fn recheck_suspended_waits(&self) {
+        let Some(memory) = self.guest_memory.lock().clone() else {
+            return;
+        };
+        for _pass in 0..MAX_RESUME_PASSES {
+            let mut progressed = false;
+            for is_compute in [false, true] {
+                let resumable = {
+                    let mut ws = self.wait_states.lock();
+                    let queue = ws.queue_mut(is_compute);
+                    match queue.suspended.as_mut() {
+                        None => None,
+                        Some(buffer) => {
+                            let satisfied = crate::guest_mem::with_guest_memory(&memory, || {
+                                buffer
+                                    .wait
+                                    .read_label(&crate::guest_mem::IdentityGuestMemory)
+                                    .is_some_and(|value| buffer.wait.satisfied_by(value))
+                            });
+                            if satisfied {
+                                queue.suspended.take()
+                            } else {
+                                buffer.recheck_rounds += 1;
+                                let rounds = buffer.recheck_rounds;
+                                if rounds == STALE_WAIT_RECHECK_ROUNDS
+                                    || (rounds > STALE_WAIT_RECHECK_ROUNDS
+                                        && rounds.is_power_of_two())
+                                {
+                                    warn!(
+                                        queue = if is_compute { "acb" } else { "dcb" },
+                                        label = format_args!("{:#x}", buffer.wait.address),
+                                        reference = format_args!("{:#x}", buffer.wait.reference),
+                                        compare = buffer.wait.compare,
+                                        rounds,
+                                        parked_behind = queue.pending.len(),
+                                        "suspended WAIT_REG_MEM still unmet after many \
+                                         producer re-checks — possible dead wait \
+                                         (its producer never ran)"
+                                    );
+                                }
+                                None
+                            }
+                        }
+                    }
+                };
+                let Some(buffer) = resumable else {
+                    continue;
+                };
+                progressed = true;
+                let resumed = self.wait_resumed_total.fetch_add(1, Ordering::Relaxed) + 1;
+                if resumed <= 8 || resumed.is_power_of_two() {
+                    tracing::info!(
+                        queue = if is_compute { "acb" } else { "dcb" },
+                        label = format_args!("{:#x}", buffer.wait.address),
+                        resume_dword = buffer.resume_dword,
+                        total_resumes = resumed,
+                        "agc.queue_resumed: label satisfied — resuming the parked buffer"
+                    );
+                }
+                self.run_worker_buffer(
+                    buffer.words,
+                    buffer.resume_dword,
+                    is_compute,
+                    buffer.deferred_present,
+                );
+                // Drain submissions parked behind the wait, in order, until
+                // the queue suspends again or the backlog empties.
+                loop {
+                    let next = {
+                        let mut ws = self.wait_states.lock();
+                        let queue = ws.queue_mut(is_compute);
+                        if queue.suspended.is_some() {
+                            None
+                        } else {
+                            queue.pending.pop_front()
+                        }
+                    };
+                    let Some((words, deferred_present)) = next else {
+                        break;
+                    };
+                    self.run_worker_buffer(words, 0, is_compute, deferred_present);
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+    }
+
+    /// Cumulative WAIT_REG_MEM suspend/resume counters.
+    pub fn wait_suspend_stats(&self) -> GpuWaitStats {
+        let ws = self.wait_states.lock();
+        GpuWaitStats {
+            suspended: self.wait_suspended_total.load(Ordering::Relaxed),
+            resumed: self.wait_resumed_total.load(Ordering::Relaxed),
+            currently_suspended: usize::from(ws.graphics.suspended.is_some())
+                + usize::from(ws.compute.suspended.is_some()),
+            parked: ws.graphics.pending.len() + ws.compute.pending.len(),
         }
     }
 
@@ -1231,6 +1468,14 @@ impl AgcGpuSession {
     }
 }
 
+/// [`RunOutcome`] → the suspension payload, if any.
+const fn suspended_of(outcome: RunOutcome) -> Option<SuspendedWait> {
+    match outcome {
+        RunOutcome::Completed => None,
+        RunOutcome::Suspended(suspended) => Some(suspended),
+    }
+}
+
 /// Boot splash staged for the NEXT process session. The launcher decodes
 /// `sce_sys/pic0.png` before entering the guest (the GPU session is created
 /// inside `execute_process`, after the launcher's last chance to touch it), and
@@ -1239,6 +1484,31 @@ impl AgcGpuSession {
 fn pending_splash() -> &'static Mutex<Option<RenderedImage>> {
     static PENDING: OnceLock<Mutex<Option<RenderedImage>>> = OnceLock::new();
     PENDING.get_or_init(|| Mutex::new(None))
+}
+
+/// Process-wide GPU settings, mirrored from `EmulatorConfig.graphics` by the
+/// Shell (see [`AgcGpuSession::set_runtime_config`]). Read where the Vulkan
+/// backend is created (validation) and where each guest draw is sized
+/// (resolution scale) — the two settings the user can drive from Settings ▸
+/// Video that the GPU path can honour today.
+#[derive(Clone, Copy)]
+pub(crate) struct GpuRuntimeConfig {
+    pub validation_layers: bool,
+    pub resolution_scale: f32,
+}
+
+impl Default for GpuRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            validation_layers: false,
+            resolution_scale: 1.0,
+        }
+    }
+}
+
+fn gpu_runtime_config() -> &'static RwLock<GpuRuntimeConfig> {
+    static CFG: OnceLock<RwLock<GpuRuntimeConfig>> = OnceLock::new();
+    CFG.get_or_init(|| RwLock::new(GpuRuntimeConfig::default()))
 }
 
 fn current_gpu_session() -> &'static RwLock<GpuProcessSession> {
@@ -1643,6 +1913,37 @@ mod tests {
         session.shutdown();
     }
 
+    /// Staging a new title resets the session's presentation: the previous
+    /// title's drawn frame is dropped and the new splash (or nothing) shows.
+    /// This is the fix for a new launch opening on the *previous* title's
+    /// splash when the new title fails and never installs a session of its own.
+    #[test]
+    fn reset_presentation_drops_the_old_frame_and_applies_the_new_splash() {
+        let session = AgcGpuSession::new(deny_memory());
+        // Title A rendered a frame (its splash already came down).
+        session.hide_splash();
+        *session.last_image.lock() = Some(RenderedImage {
+            width: 1,
+            height: 1,
+            pixels: vec![7, 7, 7, 255],
+            bytes_per_pixel: 4,
+        });
+        assert_eq!(session.last_image().unwrap().pixels, vec![7, 7, 7, 255]);
+
+        // Title B staged with its own splash: A's frame is gone, B's splash shows.
+        session.reset_presentation(Some(RenderedImage {
+            width: 1,
+            height: 1,
+            pixels: vec![2, 2, 2, 255],
+            bytes_per_pixel: 4,
+        }));
+        assert_eq!(session.last_image().unwrap().pixels, vec![2, 2, 2, 255]);
+
+        // Title B has no pic0: nothing to present — crucially NOT A's old frame.
+        session.reset_presentation(None);
+        assert!(session.last_image().is_none());
+    }
+
     /// A flip to a buffer the title really drew into is its own "rendering is
     /// ready" signal and takes the splash down, exactly like SharpEmu.
     #[test]
@@ -1669,6 +1970,144 @@ mod tests {
         // Flip to the drawn buffer: splash comes down, title frame presents.
         session.present_scanout(0x1000);
         assert_eq!(session.last_image().unwrap().pixels, content.pixels);
+    }
+
+    /// Bounded identity-mapped guest memory over a live allocation, so worker
+    /// tests can model labels and DMA-visible buffers.
+    struct HostRangeMemory {
+        start: u64,
+        len: u64,
+    }
+
+    impl crate::guest_mem::GpuGuestMemory for HostRangeMemory {
+        fn validate_gpu_range(&self, addr: u64, len: u64, _write: bool) -> bool {
+            addr >= self.start
+                && addr
+                    .checked_add(len)
+                    .is_some_and(|end| end <= self.start + self.len)
+        }
+
+        fn read_gpu(&self, addr: u64, out: &mut [u8]) -> bool {
+            if !self.validate_gpu_range(addr, out.len() as u64, false) {
+                return false;
+            }
+            // SAFETY: the validated range lies inside a leaked live allocation
+            // owned by the test for the process lifetime.
+            unsafe {
+                std::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len());
+            }
+            true
+        }
+
+        fn write_gpu(&self, addr: u64, data: &[u8]) -> bool {
+            if !self.validate_gpu_range(addr, data.len() as u64, true) {
+                return false;
+            }
+            // SAFETY: same bounded leaked-allocation proof as `read_gpu`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
+            }
+            true
+        }
+    }
+
+    /// `sceAgcAcbWaitRegMem` 32-bit wait: 6 dwords, body
+    /// `[addr_lo, addr_hi, mask, compare, reference]`.
+    fn wait32_dcb(addr: u64, compare: u32, reference: u32) -> Vec<u32> {
+        vec![
+            pm4::header(6, pm4::IT_NOP, pm4::R_WAIT_MEM_32),
+            addr as u32,
+            (addr >> 32) as u32,
+            0xFFFF_FFFF,
+            compare,
+            reference,
+        ]
+    }
+
+    /// ACB-form `R_DMA_DATA` memory→memory copy: 7 dwords, body
+    /// `[dst_lo, dst_hi, src_lo, src_hi, byte_count, sel]`.
+    fn dma_copy_dcb(dst: u64, src: u64, bytes: u32) -> Vec<u32> {
+        vec![
+            pm4::header(7, pm4::IT_NOP, pm4::R_DMA_DATA),
+            dst as u32,
+            (dst >> 32) as u32,
+            src as u32,
+            (src >> 32) as u32,
+            bytes,
+            0,
+        ]
+    }
+
+    /// The cross-queue producer/consumer shape measured on ASTRO.BOT (and the
+    /// scene-pixel gate SharpEmu closed — AgcExports.cs:4508-4529): an ACB
+    /// buffer waits on a label another queue's writeback writes.
+    ///
+    /// 1. The ACB buffer suspends at its unmet `R_WAIT_MEM_32` — the work
+    ///    behind the wait must NOT run, and the label is never force-written.
+    /// 2. A second ACB submission parks behind the suspended queue (in-order
+    ///    ring semantics).
+    /// 3. A graphics-DCB writeback (here a `R_DMA_DATA` guest-memory copy)
+    ///    writes the label; the worker's post-submission re-check resumes the
+    ///    ACB from its suspend point and then drains the parked backlog in
+    ///    order.
+    #[test]
+    fn acb_wait_resumes_when_a_dcb_writeback_writes_the_label() {
+        let arena: &'static mut [u32] = Box::leak(vec![0u32; 16].into_boxed_slice());
+        let base = arena.as_ptr() as u64;
+        // dword layout: 0 label, 1 producer value (1), 2 consumer src (0xAA),
+        // 3 consumer dst, 4 parked src (0xBB), 5 parked dst.
+        arena[1] = 1;
+        arena[2] = 0xAA;
+        arena[4] = 0xBB;
+        let memory: Arc<dyn crate::guest_mem::GpuGuestMemory> = Arc::new(HostRangeMemory {
+            start: base,
+            len: std::mem::size_of_val(arena) as u64,
+        });
+        let session = AgcGpuSession::new_process(memory);
+
+        // ACB: wait for label == 1, then copy 0xAA into dword 3.
+        let mut acb = wait32_dcb(base, 3, 1);
+        acb.extend(dma_copy_dcb(base + 12, base + 8, 4));
+        session.submit_dcb_async(acb, true);
+        session.wait_idle();
+        assert_eq!(
+            session.wait_suspend_stats(),
+            GpuWaitStats {
+                suspended: 1,
+                resumed: 0,
+                currently_suspended: 1,
+                parked: 0,
+            },
+            "unmet ACB wait must suspend its buffer"
+        );
+        assert_eq!(arena[3], 0, "work behind the wait must not run");
+        assert_eq!(arena[0], 0, "the label must never be force-satisfied");
+
+        // A second ACB submission parks behind the suspended queue.
+        session.submit_dcb_async(dma_copy_dcb(base + 20, base + 16, 4), true);
+        session.wait_idle();
+        assert_eq!(arena[5], 0, "parked work must not run ahead of the wait");
+        assert_eq!(session.wait_suspend_stats().parked, 1);
+
+        // Producer: a graphics-DCB DMA writeback writes the label.
+        session.submit_dcb_async(dma_copy_dcb(base, base + 4, 4), false);
+        session.wait_idle();
+        assert_eq!(arena[0], 1, "the producer's writeback landed");
+        assert_eq!(arena[3], 0xAA, "the resumed ACB ran its post-wait work");
+        assert_eq!(
+            arena[5], 0xBB,
+            "the parked submission drained after the resume"
+        );
+        assert_eq!(
+            session.wait_suspend_stats(),
+            GpuWaitStats {
+                suspended: 1,
+                resumed: 1,
+                currently_suspended: 0,
+                parked: 0,
+            }
+        );
+        session.shutdown();
     }
 
     /// The state-only fixture must really be state-only, or the test above

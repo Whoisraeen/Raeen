@@ -508,6 +508,9 @@ fn op_info(name: &str) -> Option<OpInfo> {
         "OpLoad" => op(61, true, true, &[Id, OptMask(E::MemoryAccess)]),
         "OpStore" => op(62, false, false, &[Id, Id, OptMask(E::MemoryAccess)]),
         "OpAccessChain" => op(65, true, true, &[Id, IdRest]),
+        // Structure (id) + array-member index (literal) — the raw EUD-window
+        // fallback reads its bound size through this (`sload_dword_extended`).
+        "OpArrayLength" => op(68, true, true, &[Id, Lit]),
         // --- Annotations -----------------------------------------------------
         "OpDecorate" => op(71, false, false, &[Id, Enum(E::Decoration), DecoExtra]),
         "OpMemberDecorate" => op(72, false, false, &[Id, Lit, Enum(E::Decoration), DecoExtra]),

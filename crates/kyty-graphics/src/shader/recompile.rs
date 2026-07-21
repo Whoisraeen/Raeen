@@ -1433,18 +1433,56 @@ fn sload_dword_extended(
 		               OpStore %<reg> %vsharp_<index>_value_<reg>
 				"#;
 
+    // SharpEmu port (see `shader_detect_eud_raw_window`): an EUD dword no
+    // captured descriptor covers reads the dispatch-time guest-memory
+    // snapshot bound at `%eud_raw` instead of refusing the shader
+    // (SharpEmu treats every such load as a guest-memory read —
+    // reference/sharpemu/src/SharpEmu.ShaderCompiler/
+    // Gen5ShaderScalarEvaluator.cs:1939-1980; its SPIR-V side reads the
+    // pooled window buffer with in-bounds checks —
+    // Gen5SpirvTranslator.cs:2183-2236). The read clamps against the bound
+    // window's `OpArrayLength` and yields 0 beyond it, so a short (partially
+    // readable) snapshot degrades instead of faulting.
+    const RAW_TEXT: &str = r#"
+		         %eudraw_len_<index>_<i> = OpArrayLength %uint %eud_raw 0
+		         %eudraw_lenm1_<index>_<i> = OpISub %uint %eudraw_len_<index>_<i> %uint_1
+		         %eudraw_idx_<index>_<i> = OpExtInst %uint %GLSL_std_450 UMin %<idxc> %eudraw_lenm1_<index>_<i>
+		         %eudraw_ptr_<index>_<i> = OpAccessChain %_ptr_StorageBuffer_uint %eud_raw %int_0 %eudraw_idx_<index>_<i>
+		         %eudraw_val_<index>_<i> = OpLoad %uint %eudraw_ptr_<index>_<i>
+		         %eudraw_inb_<index>_<i> = OpULessThan %bool %<idxc> %eudraw_len_<index>_<i>
+		         %eudraw_res_<index>_<i> = OpSelect %uint %eudraw_inb_<index>_<i> %eudraw_val_<index>_<i> %uint_0
+		               OpStore %<reg> %eudraw_res_<index>_<i>
+				"#;
+
     for i in 0..n {
         let dst_value = operand_variable_to_str_shift(inst.dst, i);
         if i == 0 && dst_value.type_ != SpirvType::Uint {
             return Err(not_supported(func, "unexpected dst type"));
         }
-        let (buffer, field) = spirv.get_mapped_index(offset + i)?;
-
-        *dst_source += &TEXT
-            .replace("<reg>", &dst_value.value)
-            .replace("<buffer>", &format!("{buffer}"))
-            .replace("<field>", &format!("{field}"))
-            .replace("<index>", &format!("{index}"));
+        match spirv.get_mapped_index(offset + i) {
+            Ok((buffer, field)) => {
+                *dst_source += &TEXT
+                    .replace("<reg>", &dst_value.value)
+                    .replace("<buffer>", &format!("{buffer}"))
+                    .replace("<field>", &format!("{field}"))
+                    .replace("<index>", &format!("{index}"));
+            }
+            Err(refusal) => {
+                if !bind_info.eud_raw.used {
+                    // Detection did not declare a raw window for this
+                    // shader; keep the named refusal rather than reading a
+                    // buffer the dispatch path will not bind.
+                    return Err(refusal);
+                }
+                let idx = u32::try_from(offset + i)
+                    .map_err(|_| not_supported(func, "negative raw EUD dword index"))?;
+                *dst_source += &RAW_TEXT
+                    .replace("<reg>", &dst_value.value)
+                    .replace("<idxc>", &spirv.get_constant_uint(idx))
+                    .replace("<index>", &format!("{index}"))
+                    .replace("<i>", &format!("{i}"));
+            }
+        }
     }
 
     Ok(true)
@@ -3958,6 +3996,177 @@ fn recompile_ds_consume(
     )
 }
 
+/// Which descriptor array an MIMG instruction indexes at runtime.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum MimgDescriptorClass {
+    /// `%textures2D_S` — sampled / texel-fetch T#s.
+    Sampled,
+    /// `%textures2D_L` — read-write (storage) T#s.
+    Storage,
+}
+
+/// SharpEmu-parity translate-time guard against RUNTIME image descriptors.
+///
+/// The recompiled MIMG bodies index `%textures2D_S` / `%textures2D_L` /
+/// `%samplers` with the VALUE of the instruction's T#/S# start SGPR, which is
+/// only safe because `WriteLocalVariables` seeds exactly the CAPTURED
+/// descriptors' start registers with their rewritten dword 0 (the
+/// descriptor-array index, `prepare_stage_binding`). Two shapes break that
+/// contract and produced a measured `VK_ERROR_DEVICE_LOST` on ASTRO.BOT
+/// (CS `0x5006c5f00`, round 10 — descriptor-array OOB indexing, which
+/// robustness features do not cover):
+///
+/// 1. the MIMG's T#/S# registers match NO captured descriptor (the sharp is
+///    resolved at runtime, e.g. loaded through the raw EUD window), so the
+///    index SGPR is undefined or raw guest data;
+/// 2. the registers DO match a captured descriptor, but a raw
+///    (uncovered-EUD) `s_load` overwrites them with raw guest dwords before
+///    use.
+///
+/// Both are refused by name — the error string carries
+/// `dynamic-image-descriptor`, matching SharpEmu, whose scalar evaluator
+/// errors `dynamic-image-descriptor` and SKIPS the dispatch whenever an
+/// image's descriptor cannot be pinned to one translate-time value
+/// (`reference/sharpemu/src/SharpEmu.ShaderCompiler/`
+/// `Gen5ShaderScalarEvaluator.cs` L654-662). The refusal surfaces as a named
+/// counted dispatch/draw skip (`translate_cs` error path), never a submit.
+///
+/// Ordering is deliberately ignored in shape 2 (a raw load AFTER the MIMG
+/// also refuses): linear order is unreliable across branches, and the
+/// conservative refusal is a named skip, not a wrong render.
+fn mimg_descriptor_guard(
+    spirv: &Spirv<'_>,
+    code: &ShaderCode,
+    inst: &ShaderInstruction,
+    func: &'static str,
+    class: MimgDescriptorClass,
+    uses_sampler: bool,
+) -> Result<(), ShaderRecompileError> {
+    let Some(bind) = spirv.get_bind_info() else {
+        return Ok(());
+    };
+    let shift_regs = if spirv.get_vs_input_info().is_some_and(|v| v.gs_prolog) {
+        8
+    } else {
+        0
+    };
+
+    // The T# operand (MIMG srsrc * 4): 8 consecutive SGPRs.
+    let t_op = inst.src[1];
+    if t_op.type_ != ShaderOperandType::Sgpr {
+        return Err(not_supported(
+            func,
+            "dynamic-image-descriptor: T# operand is not an SGPR range",
+        ));
+    }
+    let t_reg = t_op.register_id;
+    let tex_num = usize::try_from(bind.textures2d.textures_num.max(0))
+        .unwrap_or(0)
+        .min(bind.textures2d.desc.len());
+    // `textures2d_without_sampler` is the recompiler-native storage/sampled
+    // discriminator (`sampled_texture_dim` / `storage_texture_dim_format`
+    // split the two SPIR-V arrays on it).
+    let t_matched = bind.textures2d.desc[..tex_num].iter().any(|d| {
+        d.start_register + shift_regs == t_reg
+            && d.textures2d_without_sampler == (class == MimgDescriptorClass::Storage)
+    });
+    if !t_matched {
+        return Err(not_supported(
+            func,
+            format!(
+                "dynamic-image-descriptor: {class:?} T# at s{t_reg} matches no captured descriptor"
+            ),
+        ));
+    }
+
+    // The S# operand (MIMG ssamp * 4): 4 consecutive SGPRs. A sample-family
+    // instruction with zero captured S#s is normally rescued upstream by
+    // `shader_synthesize_default_sampler`; reaching here unmatched means the
+    // sampler is runtime-resolved.
+    let s_range: Option<(i32, i32)> = if uses_sampler {
+        let s_op = inst.src[2];
+        if s_op.type_ != ShaderOperandType::Sgpr {
+            return Err(not_supported(
+                func,
+                "dynamic-image-descriptor: S# operand is not an SGPR range",
+            ));
+        }
+        let s_reg = s_op.register_id;
+        let samp_num = usize::try_from(bind.samplers.samplers_num.max(0))
+            .unwrap_or(0)
+            .min(bind.samplers.start_register.len());
+        let s_matched = bind.samplers.start_register[..samp_num]
+            .iter()
+            .any(|&start| start + shift_regs == s_reg);
+        if !s_matched {
+            return Err(not_supported(
+                func,
+                format!("dynamic-image-descriptor: S# at s{s_reg} matches no captured sampler"),
+            ));
+        }
+        Some((s_reg, 4))
+    } else {
+        None
+    };
+
+    // Shape 2: a raw (uncovered-EUD) s_load re-writing the matched sharp's
+    // registers replaces the seeded descriptor-array index with raw guest
+    // dwords. Per-dword: only an UNCOVERED loaded dword landing INSIDE the
+    // sharp's register range refuses.
+    if bind.eud_raw.used {
+        use ShaderInstructionType as T;
+        let covered = super::spirv::eud_covered_map(bind);
+        let ranges: &[(i32, i32)] = match s_range {
+            Some(s) => &[(t_reg, 8), s],
+            None => &[(t_reg, 8)],
+        };
+        for load in code.get_instructions() {
+            let dwords = match load.type_ {
+                T::SLoadDwordx2 => 2i32,
+                T::SLoadDwordx4 => 4,
+                T::SLoadDwordx8 => 8,
+                _ => continue,
+            };
+            if load.src[0].type_ != ShaderOperandType::Sgpr
+                || load.src[0].register_id != bind.extended.start_register
+                || !matches!(
+                    load.src[1].type_,
+                    ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
+                )
+                || load.src[1].constant.i() < 0
+                || load.dst.type_ != ShaderOperandType::Sgpr
+            {
+                continue;
+            }
+            let base_dw = load.src[1].constant.u >> 2;
+            let dst0 = load.dst.register_id;
+            for k in 0..dwords {
+                let idx = base_dw as i64 + i64::from(k);
+                let is_covered = usize::try_from(idx)
+                    .ok()
+                    .and_then(|x| covered.get(x))
+                    .copied()
+                    .unwrap_or(false);
+                let dst_reg = dst0 + k;
+                let hits = ranges
+                    .iter()
+                    .any(|&(r0, len)| dst_reg >= r0 && dst_reg < r0 + len);
+                if !is_covered && hits {
+                    return Err(not_supported(
+                        func,
+                        format!(
+                            "dynamic-image-descriptor: raw EUD s_load (dword {idx}) overwrites \
+                             descriptor register s{dst_reg}"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Shared body of the seven `Recompile_ImageSample_*` dmask variants
 /// (ShaderSpirv.cpp L2471/L2525/L2579/L2638/L2697/L2756/L2968). Upstream
 /// duplicates the whole function per dmask; the bodies differ only in which
@@ -3976,6 +4185,7 @@ fn image_sample_channels(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
+            mimg_descriptor_guard(spirv, code, &inst, func, MimgDescriptorClass::Sampled, true)?;
             let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
             let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
             let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
@@ -4203,6 +4413,7 @@ fn recompile_image_sample_c_lz(
     if bind_info.textures2d.textures2d_sampled_num == 0 || bind_info.samplers.samplers_num == 0 {
         return Ok(false);
     }
+    mimg_descriptor_guard(spirv, code, &inst, FUNC, MimgDescriptorClass::Sampled, true)?;
 
     if sampled_texture_dim(bind_info)? != SampledDim::Two {
         return Err(not_supported(
@@ -4344,6 +4555,7 @@ fn recompile_image_sample_lz_dmask7(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
+            mimg_descriptor_guard(spirv, code, &inst, FUNC, MimgDescriptorClass::Sampled, true)?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
             let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
@@ -4415,6 +4627,7 @@ fn recompile_image_sample_lz_dmask_f(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
+            mimg_descriptor_guard(spirv, code, &inst, FUNC, MimgDescriptorClass::Sampled, true)?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
             let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
@@ -4491,6 +4704,7 @@ fn image_sample_lz_single_channel(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
+            mimg_descriptor_guard(spirv, code, &inst, func, MimgDescriptorClass::Sampled, true)?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
             let src2_value0 = operand_variable_to_str_shift(inst.src[2], 0);
@@ -4553,6 +4767,7 @@ fn recompile_image_sample_lz_dmask3(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
+            mimg_descriptor_guard(spirv, code, &inst, FUNC, MimgDescriptorClass::Sampled, true)?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
             let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
@@ -4649,6 +4864,7 @@ fn recompile_image_gather4_lz_dmask1(
     if bind_info.textures2d.textures2d_sampled_num == 0 || bind_info.samplers.samplers_num == 0 {
         return Ok(false);
     }
+    mimg_descriptor_guard(spirv, code, &inst, FUNC, MimgDescriptorClass::Sampled, true)?;
     // Gathers are 2D-only in Vulkan (no 3D gather; cube gathers unmeasured).
     if sampled_texture_dim(bind_info)? != SampledDim::Two {
         return Err(not_supported(FUNC, "gather from a non-2D texture"));
@@ -4722,6 +4938,7 @@ fn recompile_image_sample_lzo_dmask7(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
+            mimg_descriptor_guard(spirv, code, &inst, FUNC, MimgDescriptorClass::Sampled, true)?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
             let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
@@ -4830,6 +5047,15 @@ fn recompile_image_get_resinfo_dmask3(
         return Err(not_supported(FUNC, "unexpected operand types"));
     }
 
+    mimg_descriptor_guard(
+        spirv,
+        code,
+        &inst,
+        FUNC,
+        MimgDescriptorClass::Sampled,
+        false,
+    )?;
+
     let index_str = format!("{index}");
     const TEXT: &str = r#"
          %t0_<index> = OpLoad %uint %<texture>
@@ -4871,6 +5097,14 @@ fn image_load_channels(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 {
+            mimg_descriptor_guard(
+                spirv,
+                code,
+                &inst,
+                func,
+                MimgDescriptorClass::Sampled,
+                false,
+            )?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
             let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
@@ -5044,6 +5278,14 @@ fn recompile_image_store_dmask1(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_storage_num > 0 {
+            mimg_descriptor_guard(
+                spirv,
+                code,
+                &inst,
+                FUNC,
+                MimgDescriptorClass::Storage,
+                false,
+            )?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
             let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
@@ -5105,6 +5347,14 @@ fn recompile_image_store_dmask3(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_storage_num > 0 {
+            mimg_descriptor_guard(
+                spirv,
+                code,
+                &inst,
+                FUNC,
+                MimgDescriptorClass::Storage,
+                false,
+            )?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
             let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
@@ -5166,6 +5416,14 @@ fn recompile_image_store_dmask_f(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_storage_num > 0 {
+            mimg_descriptor_guard(
+                spirv,
+                code,
+                &inst,
+                FUNC,
+                MimgDescriptorClass::Storage,
+                false,
+            )?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
             let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
@@ -9399,6 +9657,9 @@ mod tests {
         input_info.bind.push_constant_size = 64;
         input_info.bind.textures2d.textures_num = 1;
         input_info.bind.textures2d.textures2d_sampled_num = 1;
+        // srsrc reg 4 in the encoding — the captured T# must match it or the
+        // descriptor guard refuses (dynamic-image-descriptor).
+        input_info.bind.textures2d.desc[0].start_register = 4;
         let source = spirv_generate_source(&code, None, None, Some(&input_info))
             .expect("recompile image_get_resinfo");
         assert!(source.contains("OpImageQuerySizeLod %v2int"), "{source}");
@@ -9594,6 +9855,7 @@ mod tests {
         input_info.bind.textures2d.textures_num = 1;
         input_info.bind.textures2d.textures2d_storage_num = 1;
         input_info.bind.textures2d.desc[0].start_register = 4;
+        input_info.bind.textures2d.desc[0].textures2d_without_sampler = true;
         let source = spirv_generate_source(&code, None, None, Some(&input_info))
             .expect("recompile image_store dmask1");
         assert!(source.contains("OpImageWrite"), "{source}");
@@ -10847,6 +11109,7 @@ mod tests {
         input_info.bind.textures2d.textures_num = 1;
         input_info.bind.textures2d.textures2d_storage_num = 1;
         input_info.bind.textures2d.desc[0].start_register = 4;
+        input_info.bind.textures2d.desc[0].textures2d_without_sampler = true;
         let source = spirv_generate_source(&code, None, None, Some(&input_info))
             .expect("recompile image_store dmask3");
         assert!(source.contains("OpImageWrite"), "{source}");
@@ -11329,10 +11592,14 @@ mod tests {
 
     /// A sharp declared at/above the register-file size rebases by
     /// SGPRS_MAX (32) — the "EUD continues the file" shape — while an
-    /// s_load of an EUD dword no descriptor covers is a named refusal
-    /// (not Kyty's silent (0, 0) mapping).
+    /// s_load of an EUD dword no descriptor covers takes the raw
+    /// EUD-window fallback (SharpEmu port): detection records the window
+    /// in `bind.eud_raw` and the recompiled load reads the `%eud_raw`
+    /// SSBO instead of refusing (the pre-port behavior this test used to
+    /// pin was the named "not a captured descriptor field" refusal — 195
+    /// ASTRO.BOT compute dispatches/run).
     #[test]
-    fn extended_mapping_rebases_by_file_size_and_refuses_unmapped_dwords() {
+    fn extended_mapping_rebases_by_file_size_and_raw_window_covers_unmapped_dwords() {
         let mut code = ShaderCode::new();
         code.set_type(ShaderType::Compute);
         let mut sload = ShaderInstruction {
@@ -11384,8 +11651,19 @@ mod tests {
         let source = spirv_generate_source(&code, None, None, Some(&input_info))
             .expect("start_register >= 32 rebases by the file size");
         assert!(source.contains("%vsharp"), "{source}");
+        // Detection over the covered load: dwords 4..8 are all captured by
+        // the sharp, so no raw window is declared.
+        let mut bind = input_info.bind;
+        crate::shader::spirv::shader_detect_eud_raw_window(&code, &mut bind);
+        assert!(
+            !bind.eud_raw.used,
+            "a fully-captured s_load needs no raw window: {:?}",
+            bind.eud_raw
+        );
 
-        // An s_load of EUD dword 0 (no descriptor there) must refuse by name.
+        // An s_load of EUD dword 0 (no descriptor there): the pipeline runs
+        // detection first, which declares the raw window; the recompiled
+        // load then reads `%eud_raw` instead of refusing.
         sload.src[1].constant = crate::shader::types::ShaderConstant::from_u(0);
         let mut code2 = ShaderCode::new();
         code2.set_type(ShaderType::Compute);
@@ -11397,12 +11675,205 @@ mod tests {
             format: F::Empty,
             ..Default::default()
         });
+        crate::shader::spirv::shader_detect_eud_raw_window(&code2, &mut input_info.bind);
+        let raw = input_info.bind.eud_raw;
+        assert!(raw.used, "uncaptured EUD dwords declare the raw window");
+        assert_eq!(
+            raw.required_dwords, 4,
+            "x4 load at offset 0 needs dwords 0..4"
+        );
+        assert_eq!(
+            raw.binding_index, 1,
+            "the raw window binds after the storage-buffer array (index 0)"
+        );
+        let source = spirv_generate_source(&code2, None, None, Some(&input_info))
+            .expect("unmapped EUD dword lowers to a raw-window read");
+        assert!(
+            source.contains("%eud_raw = OpVariable %_ptr_StorageBuffer_EudRaw StorageBuffer"),
+            "the raw window SSBO is declared:\n{source}"
+        );
+        assert!(
+            source.contains("OpDecorate %eud_raw Binding 1"),
+            "bound at the detected index:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble raw EUD-window compute shader");
+        naga_parse_and_validate(&words, "eud_raw_window_x4");
+
+        // WITHOUT detection (bind.eud_raw cleared) the named refusal stays:
+        // the dispatch path would not bind a window the SPIR-V reads.
+        input_info.bind.eud_raw = Default::default();
         let err = spirv_generate_source(&code2, None, None, Some(&input_info))
-            .expect_err("unmapped EUD dword must refuse");
+            .expect_err("no declared raw window keeps the named refusal");
         assert!(
             err.to_string().contains("not a captured descriptor field"),
             "{err}"
         );
+    }
+
+    /// Recompiler + binding metadata for an s_load entirely beyond the
+    /// captured descriptors — including offsets past the 64-dword extended
+    /// mapping itself (`get_mapped_index`'s other refusal arm). Every read
+    /// clamps against the bound window size (`OpArrayLength` +
+    /// `OpULessThan`/`OpSelect`) and yields 0 beyond it, so a short
+    /// snapshot degrades instead of faulting — the bounds-clamp contract.
+    #[test]
+    fn sload_beyond_extended_mapping_reads_clamped_raw_window() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // s_load_dwordx8 s[16:23], s[12:13], 0x148 — dwords 82..90, beyond
+        // the 64-dword extended mapping (would refuse "offset >= extended
+        // mapping size" without the raw window).
+        let sload = ShaderInstruction {
+            type_: T::SLoadDwordx8,
+            format: F::Sdst8SbaseSoffset,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 16,
+                size: 8,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 12,
+                    size: 2,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::LiteralConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(0x148),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            code.get_instructions_mut().push(sload);
+        }
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            ..Default::default()
+        });
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 16;
+        input_info.bind.extended.used = true;
+        input_info.bind.extended.start_register = 12;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        input_info.bind.storage_buffers.start_register[0] = 12;
+        input_info.bind.storage_buffers.extended[0] = true;
+
+        crate::shader::spirv::shader_detect_eud_raw_window(&code, &mut input_info.bind);
+        let raw = input_info.bind.eud_raw;
+        assert!(raw.used);
+        assert_eq!(
+            raw.required_dwords,
+            0x148 / 4 + 8,
+            "window covers through the load's last dword"
+        );
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("raw window covers loads beyond the extended mapping");
+        // The bounds clamp: index min'd against len-1, result selected
+        // against in-bounds, out-of-window reads produce %uint_0.
+        for needle in [
+            "OpArrayLength %uint %eud_raw 0",
+            "UMin",
+            "OpULessThan %bool",
+            "OpSelect %uint",
+        ] {
+            assert!(source.contains(needle), "missing {needle}:\n{source}");
+        }
+        // All 8 destination dwords store through the raw path.
+        assert_eq!(
+            source.matches("OpArrayLength %uint %eud_raw 0").count(),
+            8 * 3,
+            "one clamped read per loaded dword per instruction:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble beyond-mapping raw-window shader");
+        naga_parse_and_validate(&words, "eud_raw_window_beyond_mapping");
+    }
+
+    /// A mixed x8 load whose first half is a captured V# and second half is
+    /// uncaptured: the captured dwords MUST keep reading the REWRITTEN
+    /// descriptor from the push constants (guest memory holds the guest
+    /// base, not the descriptor-array index) while only the uncaptured
+    /// dwords read the raw window.
+    #[test]
+    fn mixed_sload_keeps_push_constants_for_captured_dwords() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // s_load_dwordx8 s[16:23], s[12:13], 0 — dwords 0..4 covered by the
+        // sharp below, dwords 4..8 uncaptured.
+        let sload = ShaderInstruction {
+            type_: T::SLoadDwordx8,
+            format: F::Sdst8SbaseSoffset,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 16,
+                size: 8,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 12,
+                    size: 2,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::LiteralConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(0),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            code.get_instructions_mut().push(sload);
+        }
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            ..Default::default()
+        });
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 16;
+        input_info.bind.extended.used = true;
+        input_info.bind.extended.start_register = 12;
+        // V# at the EUD base pair itself: rel 0 → covers EUD dwords 0..4.
+        input_info.bind.storage_buffers.buffers_num = 1;
+        input_info.bind.storage_buffers.start_register[0] = 12;
+        input_info.bind.storage_buffers.extended[0] = true;
+
+        crate::shader::spirv::shader_detect_eud_raw_window(&code, &mut input_info.bind);
+        let raw = input_info.bind.eud_raw;
+        assert!(raw.used);
+        assert_eq!(raw.required_dwords, 8, "uncaptured dwords 4..8");
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("mixed captured + raw s_load recompiles");
+        assert_eq!(
+            source.matches("OpArrayLength %uint %eud_raw 0").count(),
+            4 * 3,
+            "exactly the four uncaptured dwords per instruction read raw:\n{source}"
+        );
+        assert!(
+            source.contains("%_ptr_PushConstant_uint %vsharp"),
+            "captured dwords still read the rewritten push-constant table:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble mixed captured/raw shader");
+        naga_parse_and_validate(&words, "eud_raw_window_mixed");
     }
 
     /// A V# whose `stride * num_records` is not a dword multiple must
@@ -11836,5 +12307,329 @@ mod tests {
         assert!(source.contains("OpFMul %float %m197_0"), "{source}");
         let words = spirv_run(&source).expect("assemble VOP2 SDWA omod");
         naga_parse_and_validate(&words, "VOP2 SDWA omod");
+    }
+
+    /// Every emitted `%lds` access chain must take a `UMin`-clamped index —
+    /// device-loss defusal sub-fix (ii): SharpEmu masks every LDS dword
+    /// address into the array bound
+    /// (`reference/sharpemu/src/SharpEmu.ShaderCompiler.Vulkan/`
+    /// `Gen5SpirvTranslator.cs` L2007-2024, `LdsPointer`); this port clamps
+    /// with `UMin` because `lds_size_dw` (128-dword granules) need not be a
+    /// power of two, so a bitmask would be incorrect without padding the
+    /// array. One fixture per wired DS family.
+    #[test]
+    fn every_ds_family_lds_access_is_umin_clamped() {
+        fn assert_lds_clamped(name: &str, words: &[u32]) {
+            let mut code = ShaderCode::new();
+            code.set_type(ShaderType::Compute);
+            shader_parse(0, words, &mut code, true).unwrap_or_else(|e| panic!("parse {name}: {e}"));
+            let mut input_info = ShaderComputeInputInfo::default();
+            input_info.threads_num = [1, 1, 1];
+            let source = spirv_generate_source(&code, None, None, Some(&input_info))
+                .unwrap_or_else(|e| panic!("recompile {name}: {e}"));
+            let mut accesses = 0usize;
+            for line in source.lines() {
+                let Some(pos) = line.find("OpAccessChain %_ptr_Workgroup_uint %lds ") else {
+                    continue;
+                };
+                accesses += 1;
+                let index_id = line[pos..]
+                    .split_whitespace()
+                    .last()
+                    .unwrap_or_else(|| panic!("{name}: malformed LDS access line: {line}"));
+                let def = format!("{index_id} = OpExtInst %uint %GLSL_std_450 UMin ");
+                assert!(
+                    source.contains(&def),
+                    "{name}: LDS access index {index_id} has no UMin clamp:\n{source}"
+                );
+            }
+            assert!(
+                accesses > 0,
+                "{name}: fixture emitted no LDS access:\n{source}"
+            );
+        }
+
+        // (v_mov preambles seed the address/data VGPRs; every DS word pair is
+        // a measured ASTRO.BOT encoding reused from the per-op tests above.)
+        assert_lds_clamped(
+            "ds_write_b32 + ds_read_b32",
+            &[
+                0x7E00_0280,
+                0x7E02_0280,
+                0xD834_0000,
+                0x0000_0100,
+                0xBF8A_0000,
+                0xD8D8_0000,
+                0x0200_0000,
+                S_ENDPGM,
+            ],
+        );
+        assert_lds_clamped(
+            "ds_add_u32",
+            &[0x7E00_0280, 0x7E02_0280, 0xD800_0514, 0x0000_0100, S_ENDPGM],
+        );
+        assert_lds_clamped(
+            "ds_write_b96 + ds_read2_b32",
+            &[
+                0x7E00_0280,
+                0x7E02_0280,
+                0x7E04_0280,
+                0x7E06_0280,
+                0xDB78_0008,
+                0x0000_0100,
+                0xD8DC_0100,
+                0x0400_0000,
+                S_ENDPGM,
+            ],
+        );
+        assert_lds_clamped(
+            "ds_read_b64",
+            &[0x7E00_0280, 0xD9D8_0010, 0x0200_0000, S_ENDPGM],
+        );
+        assert_lds_clamped(
+            "ds_write_b128",
+            &[
+                0x7E00_0280,
+                0x7E02_0280,
+                0x7E04_0280,
+                0x7E06_0280,
+                0x7E08_0280,
+                0xDB7C_0008,
+                0x0000_0100,
+                S_ENDPGM,
+            ],
+        );
+        assert_lds_clamped(
+            "ds_read_b128",
+            &[0x7E00_0280, 0xDBFC_0010, 0x0200_0000, S_ENDPGM],
+        );
+        assert_lds_clamped(
+            "ds_read_b96",
+            &[0x7E00_0280, 0xDBF8_0010, 0x0200_0000, S_ENDPGM],
+        );
+    }
+
+    /// Device-loss defusal sub-fix (i): a shader that SAMPLES with zero
+    /// captured S#s gets a synthesized all-zero (nearest/wrap) default
+    /// sampler at the sample's S# register instead of a whole-shader
+    /// refusal (SharpEmu VulkanVideoPresenter.cs L6314-6322 + L8121-8156).
+    #[test]
+    fn sampler_less_image_sample_synthesizes_default_nearest_sampler() {
+        use crate::shader::analysis::shader_synthesize_default_sampler;
+
+        // image_sample_c_lz with T# at s[4:11] and S# at s[12:15].
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF0BC_0100, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_sample_c_lz");
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 4;
+        crate::shader::analysis::shader_calc_binding_indices(&mut input_info.bind);
+
+        // Without synthesis: sample-family bodies bail on samplers_num == 0
+        // and the shader refuses; with it, one all-zero S# lands at s12.
+        shader_synthesize_default_sampler(&code, &mut input_info.bind);
+        assert_eq!(input_info.bind.samplers.samplers_num, 1);
+        assert_eq!(input_info.bind.samplers.start_register[0], 12);
+        assert_eq!(input_info.bind.samplers.samplers[0].fields, [0; 4]);
+        assert!(!input_info.bind.samplers.extended[0]);
+        // Binding indices/push constants recomputed: 1 T# (32 B) + 1 S# (16 B).
+        assert_eq!(input_info.bind.push_constant_size, 48);
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("sample-family shader recompiles with the synthesized default S#");
+        assert!(source.contains("%samplers = OpVariable"), "{source}");
+
+        // A texel-fetch-only shader (image_load) must stay untouched:
+        // OpImageFetch needs no sampler.
+        let mut fetch_code = ShaderCode::new();
+        fetch_code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF000_0300, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut fetch_code,
+            true,
+        )
+        .expect("parse image_load");
+        let mut fetch_bind = input_info.bind;
+        fetch_bind.samplers = Default::default();
+        shader_synthesize_default_sampler(&fetch_code, &mut fetch_bind);
+        assert_eq!(
+            fetch_bind.samplers.samplers_num, 0,
+            "image_load must not synthesize a sampler"
+        );
+    }
+
+    /// Device-loss defusal sub-fix (iii): an MIMG whose T# registers match no
+    /// captured descriptor is a runtime-resolved descriptor — refused with
+    /// the named `dynamic-image-descriptor` error (SharpEmu
+    /// Gen5ShaderScalarEvaluator.cs L654-662), which the dispatch path turns
+    /// into a counted skip instead of submitting an OOB descriptor index.
+    #[test]
+    fn unmatched_tsharp_refuses_as_dynamic_image_descriptor() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // image_load dmask3 with T# at s[4:11]...
+        shader_parse(
+            0,
+            &[0xF000_0300, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_load dmask3");
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        // ...but the captured T# lives at s[8:15] — mismatch.
+        input_info.bind.textures2d.desc[0].start_register = 8;
+        let err = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect_err("unmatched T# must refuse");
+        assert!(
+            err.to_string().contains("dynamic-image-descriptor"),
+            "named refusal expected, got: {err}"
+        );
+    }
+
+    /// Device-loss defusal sub-fix (iii), the measured 0x5006c5f00 shape: the
+    /// MIMG's T# registers ARE captured, but a raw (uncovered-EUD)
+    /// `s_load_dwordx8` overwrites them with raw guest dwords — the seeded
+    /// descriptor-array index is destroyed, so the shader refuses by name
+    /// instead of device-lossing on an OOB descriptor index.
+    #[test]
+    fn raw_eud_overwrite_of_tsharp_regs_refuses_as_dynamic_image_descriptor() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // image_load dmask3 with T# at s[4:11].
+        shader_parse(
+            0,
+            &[0xF000_0300, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_load dmask3");
+        // s_load_dwordx8 s[4:11], s[12:13], 0x148 — EUD dwords 82..90, beyond
+        // every captured descriptor (raw-window reads), landing exactly on
+        // the T# registers.
+        let sload = ShaderInstruction {
+            type_: T::SLoadDwordx8,
+            format: F::Sdst8SbaseSoffset,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 4,
+                size: 8,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 12,
+                    size: 2,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::LiteralConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(0x148),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        code.get_instructions_mut().insert(0, sload);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.extended.used = true;
+        input_info.bind.extended.start_register = 12;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 4;
+        crate::shader::spirv::shader_detect_eud_raw_window(&code, &mut input_info.bind);
+        assert!(
+            input_info.bind.eud_raw.used,
+            "the s_load must be detected as a raw-window read"
+        );
+
+        let err = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect_err("raw overwrite of T# registers must refuse");
+        assert!(
+            err.to_string().contains("dynamic-image-descriptor"),
+            "named refusal expected, got: {err}"
+        );
+    }
+
+    /// Device-loss defusal sub-fix (iii), parity case: a register-soffset
+    /// `s_load_dwordx8` (a genuinely dynamic descriptor index) is a NAMED
+    /// refusal — the dispatch path logs and skips; no panic, no submit.
+    #[test]
+    fn register_soffset_sload_dwordx8_is_named_refusal_not_panic() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        let sload = ShaderInstruction {
+            type_: T::SLoadDwordx8,
+            format: F::Sdst8SbaseSoffset,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 16,
+                size: 8,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 12,
+                    size: 2,
+                    ..Default::default()
+                },
+                // The dynamic part: the offset comes from a register, so the
+                // loaded T# cannot be resolved at translate time.
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 20,
+                    size: 1,
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        code.get_instructions_mut().push(sload);
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            ..Default::default()
+        });
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 16;
+        input_info.bind.extended.used = true;
+        input_info.bind.extended.start_register = 12;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        input_info.bind.storage_buffers.start_register[0] = 12;
+        input_info.bind.storage_buffers.extended[0] = true;
+
+        let err = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect_err("register-soffset s_load_dwordx8 must refuse");
+        assert!(
+            err.to_string().contains("src1 is not a constant offset"),
+            "named refusal expected, got: {err}"
+        );
     }
 }

@@ -240,6 +240,9 @@ impl ShaderTranslateCache {
                     &mut ps_info,
                 )
                 .map_err(|e| AttemptError::from_analysis("shader_get_input_info_ps", &e))?;
+                // SharpEmu port (see `translate_cs`): default nearest/wrap S#
+                // for a PS that samples with zero captured samplers.
+                kyty_graphics::shader::shader_synthesize_default_sampler(&code, &mut ps_info.bind);
                 let spirv = shader_recompile_ps(&code, &ps_info)
                     .map_err(|e| AttemptError::named(format!("shader_recompile_ps: {e}")))?;
                 Ok(TranslatedShader {
@@ -269,6 +272,17 @@ impl ShaderTranslateCache {
                 let mut cs_info = ShaderComputeInputInfo::default();
                 shader_get_input_info_cs(&cs, &sh_regs, mem, &shader_map, next_gen, &mut cs_info)
                     .map_err(|e| AttemptError::from_analysis("shader_get_input_info_cs", &e))?;
+                // SharpEmu port: a CS that SAMPLES textures with zero captured
+                // S#s gets one synthesized all-zero (nearest/wrap) S# per
+                // sampler operand register instead of a whole-shader refusal;
+                // the Vulkan layer then binds its cached default sampler.
+                kyty_graphics::shader::shader_synthesize_default_sampler(&code, &mut cs_info.bind);
+                // SharpEmu port: s_loads of EUD dwords no captured descriptor
+                // covers become clamped reads of a dispatch-time guest-memory
+                // window (`%eud_raw`) instead of named refusals. The detected
+                // metadata rides in `cs_info.bind.eud_raw`, which
+                // `prepare_stage_binding` uses to snapshot + bind the window.
+                kyty_graphics::shader::shader_detect_eud_raw_window(&code, &mut cs_info.bind);
                 let spirv = shader_recompile_cs(&code, &cs_info)
                     .map_err(|e| AttemptError::named(format!("shader_recompile_cs: {e}")))?;
                 Ok(TranslatedShader {
