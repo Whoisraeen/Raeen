@@ -2379,17 +2379,41 @@ mod tests {
             "a GPU-drawn target at the flip address takes priority over guest memory"
         );
 
-        // An unsupported (tiled) layout is skipped, never faked — the drawn
-        // frame from the previous flip stays up.
+        // A `tiling_mode = 0` display buffer is read linearly (row-major with
+        // pitch), matching SharpEmu's software presenter — real PS5 titles
+        // (ASTRO.BOT) register their scanout as mode 0. The guest bytes become
+        // the frame just like the mode-1 case above.
+        session.framebuffers.lock().clear();
+        let mode0 = xps5x_core::subsystems::ScanoutDescriptor {
+            tiling_mode: 0,
+            ..desc
+        };
+        session.present_scanout(base, Some(mode0));
+        assert_eq!(
+            session.last_image().unwrap().pixels,
+            backing,
+            "a tiling_mode=0 scanout is read linearly and presented"
+        );
+
+        // A genuinely unsupported tiling mode (>1, an undetiled macro-tile) is
+        // skipped, never faked — the last frame stays up.
+        let drawn_again = RenderedImage {
+            width: 2,
+            height: 1,
+            pixels: vec![7, 8, 9, 255, 11, 12, 13, 255],
+            bytes_per_pixel: 4,
+        };
+        session.framebuffers.lock().insert(base, drawn_again.clone());
+        session.present_scanout(base, Some(desc)); // drawn wins, becomes last frame
         session.framebuffers.lock().clear();
         let tiled = xps5x_core::subsystems::ScanoutDescriptor {
-            tiling_mode: 0,
+            tiling_mode: 2,
             ..desc
         };
         session.present_scanout(base, Some(tiled));
         assert_eq!(
             session.last_image().unwrap().pixels,
-            drawn.pixels,
+            drawn_again.pixels,
             "an unsupported tiling mode must not replace the last frame"
         );
     }

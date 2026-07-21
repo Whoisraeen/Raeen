@@ -11,6 +11,7 @@ pub mod boot;
 pub mod console;
 pub mod control_center;
 pub mod home;
+pub mod ledger;
 pub mod icons;
 pub mod media;
 pub mod nav;
@@ -40,6 +41,13 @@ enum Screen {
 struct ActiveSession {
     handle: SessionHandle,
     title: String,
+    /// Library id, for the session ledger written on exit.
+    item_id: String,
+    /// Wall-clock start of the session, for the ledger's play time.
+    started: std::time::Instant,
+    /// Whether any poll observed this session in the `Faulted` state — the
+    /// ledger remembers it so Home can be honest about the last session.
+    faulted_seen: bool,
     /// Rail index that was focused when Play was pressed, so we return to
     /// the same tile on exit (spec §5).
     target_index: usize,
@@ -98,6 +106,9 @@ pub struct Shell {
     /// The Media tab's rail (spec §10 SM2) — built once, same as `library`.
     library_media: Vec<LibraryItem>,
     meta_cache: MetaCache,
+    /// Real per-title play history (last played, time played, last fault),
+    /// loaded once at startup and refreshed on every session launch/exit.
+    ledgers: HashMap<String, ledger::TitleLedger>,
     nav: NavState,
     screen: Screen,
     launcher: Box<dyn GameLauncher>,
@@ -198,6 +209,11 @@ impl Shell {
             lo: theme.palette.ground,
         });
         let meta_cache = MetaCache::from_items(&library);
+        let ledger_dir = ledger::store_dir(&config_path);
+        let ledgers: HashMap<String, ledger::TitleLedger> = library
+            .iter()
+            .map(|item| (item.id.clone(), ledger::load(&ledger_dir, &item.id)))
+            .collect();
 
         let library_media = media::media_items();
         // Settings is always one of the built-in apps (spec §10 SM2); if a
@@ -238,6 +254,7 @@ impl Shell {
             library,
             library_media,
             meta_cache,
+            ledgers,
             nav,
             screen: Screen::Boot(BootSequence::new()),
             launcher,
@@ -902,10 +919,20 @@ impl Shell {
         match self.launcher.launch(&item.launch) {
             Ok(handle) => {
                 push_recent(&mut self.recent, &item.id, MAX_RECENT_TITLES);
+                // Session ledger: stamp the launch immediately (a crash later
+                // must not lose the "last played" fact).
+                let ledger_dir = self.ledger_dir();
+                let mut title_ledger = ledger::load(&ledger_dir, &item.id);
+                title_ledger.last_played = ledger::now_unix();
+                ledger::store(&ledger_dir, &item.id, &title_ledger);
+                self.ledgers.insert(item.id.clone(), title_ledger);
                 let kernel = self.launcher.session_kernel(&handle);
                 self.session = Some(ActiveSession {
                     handle,
                     title: item.title.clone(),
+                    item_id: item.id.clone(),
+                    started: std::time::Instant::now(),
+                    faulted_seen: false,
                     target_index: index,
                     kernel,
                 });
@@ -917,7 +944,16 @@ impl Shell {
     }
 
     fn poll_session(&mut self) {
-        let Some(session) = &self.session else { return };
+        let state = {
+            let Some(session) = &mut self.session else {
+                return;
+            };
+            let state = self.launcher.session_state(&session.handle);
+            if state == SessionState::Faulted {
+                session.faulted_seen = true;
+            }
+            state
+        };
         // Only `Exited` clears the overlay. `Faulted` used to be lumped in
         // with `Exited` here, but that meant a synchronous fault (e.g. the
         // real firmware launcher's "no module file" case) would vanish
@@ -925,14 +961,27 @@ impl Shell {
         // never see why. A fault now stays on screen, same as `Running`,
         // until the user presses Back (which calls `quit`, landing on
         // `Exited` on the next poll).
-        if self.launcher.session_state(&session.handle) == SessionState::Exited {
+        if state == SessionState::Exited {
+            let session = self.session.take().expect("checked above");
+            // Session ledger: accumulate play time, remember a fault.
+            let ledger_dir = self.ledger_dir();
+            let mut title_ledger = ledger::load(&ledger_dir, &session.item_id);
+            title_ledger.total_play_secs = title_ledger
+                .total_play_secs
+                .saturating_add(session.started.elapsed().as_secs());
+            title_ledger.last_faulted = session.faulted_seen;
+            ledger::store(&ledger_dir, &session.item_id, &title_ledger);
+            self.ledgers.insert(session.item_id.clone(), title_ledger);
             self.nav.rail_index = session.target_index;
-            self.session = None;
             self.session_quit_hold.reset();
             // Drop the last frame with the session, or the next launch opens on
             // the previous title's final image before it renders anything.
             self.frame_view.clear();
         }
+    }
+
+    fn ledger_dir(&self) -> PathBuf {
+        ledger::store_dir(&self.config_path)
     }
 
     fn tick_animations(&mut self, ctx: &egui::Context) {
@@ -1003,6 +1052,7 @@ impl Shell {
         let theme = self.theme.clone();
         let frame = egui::Frame::NONE.fill(theme.palette.ground);
         let mut clicked_home_tile = None;
+        let mut clicked_gear = false;
         let mut clicked_setting = None;
         let mut clicked_game_option = None;
 
@@ -1057,23 +1107,56 @@ impl Shell {
                 focus_pop: self.focus_pop.value,
             };
             let items = self.active_items();
-            clicked_home_tile = home::draw(
+            let home_response = home::draw(
                 ui,
                 &theme,
                 items,
                 &self.nav,
                 &anim,
                 &self.meta_cache,
+                &self.ledgers,
                 self.background_texture.as_ref(),
                 &self.cover_textures,
                 self.hero_bg_from.as_ref(),
                 self.hero_bg_to.as_ref(),
                 self.config.input.controller_icon_style,
             );
+            clicked_home_tile = home_response.clicked_tile;
+            clicked_gear = home_response.gear_clicked;
 
             let recent_titles = self.recent_titles();
-            control_center::draw(ui, &theme, &self.nav, self.cc_open.value, &recent_titles);
+            // Live card values — real config volume and the real connected
+            // pad, computed fresh each frame the overlay is visible.
+            let live = control_center::CcLive {
+                sound: if self.config.audio.enabled {
+                    format!(
+                        "Host output · {}%",
+                        (self.config.audio.volume * 100.0).round() as u32
+                    )
+                } else {
+                    "Muted".to_string()
+                },
+                accessories: self
+                    .gilrs
+                    .as_ref()
+                    .and_then(|g| g.gamepads().next().map(|(_, pad)| pad.name().to_string()))
+                    .unwrap_or_else(|| "No controller connected".to_string()),
+            };
+            control_center::draw(
+                ui,
+                &theme,
+                &self.nav,
+                self.cc_open.value,
+                &recent_titles,
+                &live,
+            );
         });
+        if clicked_gear {
+            self.nav.mode = NavMode::Settings;
+            self.nav.settings_section = 0;
+            self.nav.settings_row = 0;
+            self.enter_settings();
+        }
         if let Some(index) = clicked_home_tile {
             self.nav.mode = NavMode::Home;
             self.nav.rail_index = index;

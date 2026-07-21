@@ -2533,3 +2533,16 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   control-center live data + switcher, topbar interactivity/text-tabs.
   TRAP: release relink fails os error 5 if a screenshot-probe xps5x.exe was
   left alive — Stop-Process before cargo build.
+- UI round 3 (screenshot-verified): SESSION LEDGER (shell/ledger.rs — per-title
+  JSON beside per_game store; launch stamps last_played, exit accumulates
+  total_play_secs + last_faulted via faulted_seen polling) → context line now
+  "PPSA17221 · v01.008.000 · 2h 14m played · Crashed last session — check
+  Console (F10)" (orange status) — honest crash UX, no fiction. Topbar gear
+  CLICKABLE (HomeResponse{clicked_tile, gear_clicked} → enter Settings);
+  search glyph removed until a search surface exists. CONTROL CENTER trimmed
+  to real cards only (Home/Switcher/Sound/Accessories/Power — fictional
+  Notifications/GameBase/Music/Mic/Profile/Network deleted, Fields variant
+  gone); Sound + Accessories get live CcLive values (config volume/muted,
+  gilrs pad name or "No controller connected"). Remaining from critique:
+  hero ambient zoom, bottom-bar auto-fade, switcher option drilling, search
+  overlay, logo-lockup typography (segoeuib bold family).

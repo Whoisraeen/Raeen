@@ -18,14 +18,33 @@ use egui::{Align2, Color32, FontId, Mesh, Pos2, Rect, Shape, Stroke, StrokeKind,
 
 /// What a Control Center card's summary panel renders.
 pub enum CcPanelKind {
-    /// A single status line (`CcItem::sub`).
+    /// A single status line (`CcItem::sub`, or its live override).
     Simple,
-    /// Labeled `(field, value)` rows — e.g. Sound's output device + volume.
-    Fields(&'static [(&'static str, &'static str)]),
     /// Recently-played titles, most-recent-first (Shell-tracked history).
     Switcher,
     /// A selectable option list, confirmed via `NavMode::ControlCenterOption`.
     Power(&'static [&'static str]),
+}
+
+/// Live values the Shell computes per frame for cards whose status is real
+/// data (volume, connected controller) rather than a static string.
+#[derive(Default)]
+pub struct CcLive {
+    /// Sound card status ("Host output · 80%", "Muted").
+    pub sound: String,
+    /// Accessories card status ("Xbox Wireless Controller", "No controller
+    /// connected").
+    pub accessories: String,
+}
+
+/// A card's effective status line: the live override when the card carries
+/// real data, else its static subtitle.
+fn effective_sub<'a>(item: &'a CcItem, live: &'a CcLive) -> &'a str {
+    match item.name {
+        "Sound" if !live.sound.is_empty() => &live.sound,
+        "Accessories" if !live.accessories.is_empty() => &live.accessories,
+        _ => item.sub,
+    }
 }
 
 /// One Control Center entry: name, subtitle, glyph, and panel content.
@@ -64,61 +83,21 @@ pub const ITEMS: &[CcItem] = &[
         glyph: Glyph::Switcher,
         panel: CcPanelKind::Switcher,
     },
-    CcItem {
-        name: "Notifications",
-        sub: "You're all caught up",
-        glyph: Glyph::Bell,
-        panel: CcPanelKind::Fields(&[("Unread", "0"), ("Status", "All caught up")]),
-    },
-    CcItem {
-        name: "Game Base",
-        sub: "3 friends online",
-        glyph: Glyph::Friends,
-        panel: CcPanelKind::Fields(&[("Friends online", "3"), ("Party", "Not in a party")]),
-    },
-    CcItem {
-        name: "Music",
-        sub: "Nothing playing",
-        glyph: Glyph::Music,
-        panel: CcPanelKind::Simple,
-    },
+    // Only cards backed by something real: Sound and Accessories get live
+    // values from the Shell (CcLive); the fictional Notifications / Game
+    // Base / Music / Microphone / Profile / Network cards are gone on the
+    // same principle that removed the dead Store tile.
     CcItem {
         name: "Sound",
-        sub: "Output: TV speakers · 80%",
+        sub: "",
         glyph: Glyph::Sound,
-        panel: CcPanelKind::Fields(&[("Output", "TV Speakers"), ("Volume", "80%")]),
-    },
-    CcItem {
-        name: "Microphone",
-        sub: "Muted",
-        glyph: Glyph::Mic,
         panel: CcPanelKind::Simple,
     },
     CcItem {
         name: "Accessories",
-        sub: "Controller · 92%",
+        sub: "",
         glyph: Glyph::Pad,
         panel: CcPanelKind::Simple,
-    },
-    CcItem {
-        name: "Profile",
-        sub: "Player · Level 214",
-        glyph: Glyph::Profile,
-        panel: CcPanelKind::Fields(&[
-            ("Player", "Player One"),
-            ("Level", "214"),
-            ("Trophies", "1,204"),
-        ]),
-    },
-    CcItem {
-        name: "Network",
-        sub: "Connected · 940 Mbps",
-        glyph: Glyph::Network,
-        panel: CcPanelKind::Fields(&[
-            ("Status", "Connected"),
-            ("Speed", "940 Mbps"),
-            ("Type", "Wi-Fi 6"),
-        ]),
     },
     CcItem {
         name: "Power",
@@ -138,6 +117,7 @@ pub fn draw(
     nav: &NavState,
     open_amount: f32,
     recent_titles: &[String],
+    live: &CcLive,
 ) {
     if open_amount <= 0.0 {
         return;
@@ -196,6 +176,7 @@ pub fn draw(
             open_amount,
             nav,
             recent_titles,
+            live,
         };
         let focused_cx = row_start_x + nav.cc_index as f32 * (item_size + gap) + item_size / 2.0;
         draw_panel_card(
@@ -254,6 +235,7 @@ struct PanelRenderCtx<'a> {
     open_amount: f32,
     nav: &'a NavState,
     recent_titles: &'a [String],
+    live: &'a CcLive,
 }
 
 /// Number of content lines the focused card's panel renders — sizes the
@@ -261,7 +243,6 @@ struct PanelRenderCtx<'a> {
 fn panel_line_count(item: &CcItem, recent_titles: &[String]) -> usize {
     match &item.panel {
         CcPanelKind::Simple => 1,
-        CcPanelKind::Fields(fields) => fields.len(),
         CcPanelKind::Switcher => recent_titles.len().clamp(1, 5),
         CcPanelKind::Power(options) => options.len(),
     }
@@ -347,6 +328,7 @@ fn draw_panel_content(
         open_amount,
         nav,
         recent_titles,
+        live,
     } = *ctx;
     let x = origin.x;
     let mut y = origin.y;
@@ -355,29 +337,10 @@ fn draw_panel_content(
             painter.text(
                 Pos2::new(x, y),
                 Align2::LEFT_TOP,
-                item.sub,
+                effective_sub(item, live),
                 FontId::proportional(14.0),
                 theme.palette.text_dim.gamma_multiply(open_amount),
             );
-        }
-        CcPanelKind::Fields(fields) => {
-            for (label, value) in *fields {
-                painter.text(
-                    Pos2::new(x, y),
-                    Align2::LEFT_TOP,
-                    label.to_uppercase(),
-                    FontId::proportional(11.0),
-                    theme.palette.text_faint.gamma_multiply(open_amount),
-                );
-                painter.text(
-                    Pos2::new(x + 150.0, y - 1.0),
-                    Align2::LEFT_TOP,
-                    *value,
-                    FontId::proportional(14.0),
-                    theme.palette.text.gamma_multiply(open_amount),
-                );
-                y += 22.0;
-            }
         }
         CcPanelKind::Switcher => {
             if recent_titles.is_empty() {

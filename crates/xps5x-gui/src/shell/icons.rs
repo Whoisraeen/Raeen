@@ -9,16 +9,22 @@ use egui::{Color32, Painter, Pos2, Shape, Stroke, StrokeKind, vec2};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Glyph {
+    /// Magnifier — kept for the future search overlay.
+    #[allow(dead_code)]
     Search,
+    #[allow(dead_code)]
     Friends,
+    #[allow(dead_code)]
     Bell,
     Gear,
     Home,
     Switcher,
     Music,
     Sound,
+    #[allow(dead_code)]
     Mic,
     Pad,
+    #[allow(dead_code)]
     Profile,
     Network,
     Power,

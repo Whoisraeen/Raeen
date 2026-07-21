@@ -2534,10 +2534,19 @@ impl DrawSink for OffscreenDrawSink<'_> {
             .collect();
         // Storage-image guest bases, collected pre-dispatch in the same order
         // `ComputeOutputs::images` returns them.
-        let guest_image_outputs: Vec<u64> = prepared
+        // (guest base, width, height, vk format) per output image, in the same
+        // order `ComputeOutputs::images` returns them — carries enough to
+        // register a content-bearing writeback as a presentable census entry.
+        let guest_image_outputs: Vec<(u64, u32, u32, vk::Format)> = prepared
             .as_ref()
             .and_then(|binding| binding.storage_images.as_ref())
-            .map(|images| images.images.iter().map(|img| img.guest_base).collect())
+            .map(|images| {
+                images
+                    .images
+                    .iter()
+                    .map(|img| (img.guest_base, img.width, img.height, img.format))
+                    .collect()
+            })
             .unwrap_or_default();
         // Forensic breadcrumb: device loss surfaces LAZILY (the next
         // vkQueueSubmit reports it), so identifying a lethal dispatch needs
@@ -2625,7 +2634,9 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 )));
             }
         }
-        for (addr, bytes) in guest_image_outputs.into_iter().zip(outputs.images) {
+        for ((addr, img_w, img_h, img_format), bytes) in
+            guest_image_outputs.into_iter().zip(outputs.images)
+        {
             let nonzero = bytes.iter().any(|&b| b != 0);
             debug!(
                 addr = format_args!("{addr:#x}"),
@@ -2642,6 +2653,39 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 );
             }
             crate::guest_mem::trace_scanout_fill(addr, bytes.len(), "compute-image");
+            // Promote a content-bearing 8-bit UAV writeback into the present
+            // census: ASTRO-class titles compose their scene with compute
+            // dispatches into guest memory — never a GPU render pass we capture
+            // — so without this the frame the census elects is always some flat
+            // cleared draw target and the real pixels stay invisible. Only
+            // R8G8B8A8 is promoted (already the Shell's RGBA byte order); HDR
+            // (R16F) intermediates are left to the draw/scanout paths. Keyed by
+            // guest base so a re-dispatch to the same UAV replaces in place.
+            if nonzero {
+                // R8G8B8A8 is already the Shell's RGBA byte order; the HDR
+                // R16G16B16A16_SFLOAT scene/composite buffers are sRGB-encoded to
+                // RGBA8 by `to_presentable` at present time (bytes_per_pixel == 8
+                // is its float-target signal). Other formats are left alone.
+                let bpp = match img_format {
+                    vk::Format::R8G8B8A8_UNORM => 4usize,
+                    vk::Format::R16G16B16A16_SFLOAT => 8usize,
+                    _ => 0,
+                };
+                let want = img_w as usize * img_h as usize * bpp;
+                // Cap at 128 MiB (4K RGBA16F = 66 MiB) so a mis-sized image never
+                // triggers an absurd copy.
+                if bpp != 0 && want > 0 && want <= (128 << 20) && bytes.len() >= want {
+                    self.framebuffers.insert(
+                        addr,
+                        RenderedImage {
+                            width: img_w,
+                            height: img_h,
+                            pixels: bytes[..want].to_vec(),
+                            bytes_per_pixel: bpp as u32,
+                        },
+                    );
+                }
+            }
             if !crate::guest_mem::write_bytes_checked(addr, &bytes) {
                 return Err(err(format!(
                     "compute storage-image writeback range {addr:#x}..{:#x} is not writable \

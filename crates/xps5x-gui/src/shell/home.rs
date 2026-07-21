@@ -18,6 +18,7 @@
 
 use super::anim::lerp_color;
 use super::icons::{self, Glyph};
+use super::ledger;
 use super::nav::{self, NavMode, NavState, RailTab};
 use crate::library::{
     ArtSource, GlyphKind, Gradient, ItemKind, LibraryItem, MetaCache, TileGradient,
@@ -61,6 +62,15 @@ const RAIL_TOP: f32 = 306.0;
 /// the mock's gold trophy marks).
 const GOLD: Color32 = Color32::from_rgb(230, 190, 92);
 
+/// What the user clicked this frame, beyond rail navigation.
+#[derive(Default)]
+pub struct HomeResponse {
+    /// A rail tile was clicked (index into `items`).
+    pub clicked_tile: Option<usize>,
+    /// The top-bar settings gear was clicked.
+    pub gear_clicked: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
     ui: &mut egui::Ui,
@@ -69,12 +79,13 @@ pub fn draw(
     nav: &NavState,
     anim: &HomeAnim,
     meta_cache: &MetaCache,
+    ledgers: &HashMap<String, ledger::TitleLedger>,
     background: Option<&egui::TextureHandle>,
     covers: &HashMap<String, egui::TextureHandle>,
     bg_from: Option<&egui::TextureHandle>,
     bg_to: Option<&egui::TextureHandle>,
     controller_icons: ControllerIconStyle,
-) -> Option<usize> {
+) -> HomeResponse {
     let screen = ui.max_rect();
     let painter = ui.painter().clone();
     let focused = items.get(nav.rail_index);
@@ -95,7 +106,10 @@ pub fn draw(
         anim.hero_fade,
     );
 
-    draw_topbar(&painter, theme, screen);
+    let gear_rect = draw_topbar(&painter, theme, screen);
+    let gear_clicked = ui
+        .interact(gear_rect, ui.id().with("topbar-gear"), egui::Sense::click())
+        .clicked();
 
     // The pills/rail/context band uses fixed 1080p-reference anchors; on a
     // taller window (e.g. a portrait monitor) that top-anchoring leaves a
@@ -122,6 +136,7 @@ pub fn draw(
         rail_rect.top() + focused_size,
         focused,
         meta_cache,
+        ledgers,
     );
     draw_bottom_bar(&painter, theme, screen, controller_icons);
 
@@ -129,7 +144,10 @@ pub fn draw(
     // animating, so keep the screen gently alive.
     ui.ctx()
         .request_repaint_after(std::time::Duration::from_millis(50));
-    clicked_tile
+    HomeResponse {
+        clicked_tile,
+        gear_clicked,
+    }
 }
 
 /// Paint the Home hero. A user theme's background image (spec §6), else the
@@ -279,11 +297,12 @@ fn host_user_name() -> &'static str {
 }
 
 /// Status bar, PS5 proportions: nothing on the left (the tab pills carry
-/// identity below), a right-aligned cluster of search / settings / user
-/// avatar / clock. Every element is real: the glyphs mirror reachable
-/// destinations (Search hints, the Settings tile), the avatar initial is the
-/// host account, the clock is local time. No fabricated profile stats.
-fn draw_topbar(painter: &egui::Painter, theme: &Theme, screen: Rect) {
+/// identity below), a right-aligned cluster of settings / user avatar /
+/// clock. Every element is real: the gear opens Settings (clickable — the
+/// returned rect is the hit target), the avatar initial is the host
+/// account, the clock is local time. No fabricated profile stats, and no
+/// search glyph until a search surface exists.
+fn draw_topbar(painter: &egui::Painter, theme: &Theme, screen: Rect) -> Rect {
     let margin = theme.metrics.topbar_padding_x;
     let av_r = 18.0;
     let center_y = screen.top() + AVATAR_TOP + AVATAR_SIZE / 2.0 - 8.0;
@@ -320,21 +339,10 @@ fn draw_topbar(painter: &egui::Painter, theme: &Theme, screen: Rect) {
         );
     }
 
-    // Settings gear + search, spaced left of the avatar.
-    icons::draw(
-        painter,
-        Glyph::Gear,
-        Pos2::new(av_c.x - av_r - 30.0, center_y),
-        18.0,
-        theme.palette.text_dim,
-    );
-    icons::draw(
-        painter,
-        Glyph::Search,
-        Pos2::new(av_c.x - av_r - 76.0, center_y),
-        18.0,
-        theme.palette.text_dim,
-    );
+    // Settings gear, left of the avatar; its rect is the click target.
+    let gear_c = Pos2::new(av_c.x - av_r - 30.0, center_y);
+    icons::draw(painter, Glyph::Gear, gear_c, 18.0, theme.palette.text_dim);
+    Rect::from_center_size(gear_c, vec2(34.0, 34.0))
 }
 
 /// Pill tab row: an icon pill, then Store / My games / Media / Library /
@@ -627,6 +635,7 @@ fn cover_uv(texture: &egui::TextureHandle, target_aspect: f32) -> Rect {
 /// The focused item's block under the rail: big title, then the
 /// Time played / Progress / Last trophy stat columns (or a plain "Open …"
 /// line for built-in apps).
+#[allow(clippy::too_many_arguments)]
 fn draw_context_block(
     painter: &egui::Painter,
     theme: &Theme,
@@ -634,6 +643,7 @@ fn draw_context_block(
     rail_bottom: f32,
     focused: Option<&LibraryItem>,
     meta_cache: &MetaCache,
+    ledgers: &HashMap<String, ledger::TitleLedger>,
 ) {
     let Some(item) = focused else { return };
     // Home reads a focused item's metadata from the cache rather than the
@@ -656,22 +666,57 @@ fn draw_context_block(
 
     let stats_top = rail_bottom + 52.0 + title_h + 28.0;
     let Some(meta) = meta else {
-        // Real package identity (sce_sys/param.json) for games; plain
-        // "Open …" for built-in apps. No fictional stats without data.
-        let line = match (item.kind, &item.title_id, &item.version) {
-            (ItemKind::Game, Some(id), Some(version)) => {
-                format!("{id}  ·  v{version}  ·  Ready to play")
-            }
-            (ItemKind::Game, Some(id), None) => format!("{id}  ·  Ready to play"),
-            (ItemKind::Game, None, _) => "Ready to play".to_string(),
-            _ => format!("Open {}", item.title),
+        // Real package identity (sce_sys/param.json) + real session history
+        // (the ledger) for games; plain "Open …" for built-in apps. The
+        // status is honest: a title whose last session faulted says so
+        // instead of claiming "Ready to play".
+        if item.kind != ItemKind::Game {
+            painter.text(
+                Pos2::new(left, stats_top),
+                Align2::LEFT_TOP,
+                format!("Open {}", item.title),
+                FontId::proportional(18.0),
+                theme.palette.text_dim,
+            );
+            return;
+        }
+        let title_ledger = ledgers.get(item.id.as_str());
+        let mut identity = Vec::new();
+        if let Some(id) = &item.title_id {
+            identity.push(id.clone());
+        }
+        if let Some(version) = &item.version {
+            identity.push(format!("v{version}"));
+        }
+        if let Some(played) = title_ledger.and_then(|l| l.play_time_text()) {
+            identity.push(played);
+        }
+        let faulted = title_ledger.is_some_and(|l| l.last_faulted);
+        let (status, status_color) = if faulted {
+            (
+                "Crashed last session — check Console (F10)",
+                Color32::from_rgb(255, 168, 100),
+            )
+        } else {
+            ("Ready to play", theme.palette.text_dim)
         };
+        let mut x = left;
+        if !identity.is_empty() {
+            let identity_galley = painter.layout_no_wrap(
+                format!("{}  ·  ", identity.join("  ·  ")),
+                FontId::proportional(18.0),
+                theme.palette.text_dim,
+            );
+            let w = identity_galley.size().x;
+            painter.galley(Pos2::new(x, stats_top), identity_galley, theme.palette.text_dim);
+            x += w;
+        }
         painter.text(
-            Pos2::new(left, stats_top),
+            Pos2::new(x, stats_top),
             Align2::LEFT_TOP,
-            line,
+            status,
             FontId::proportional(18.0),
-            theme.palette.text_dim,
+            status_color,
         );
         return;
     };
