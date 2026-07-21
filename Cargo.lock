@@ -2120,6 +2120,7 @@ version = "0.1.0"
 dependencies = [
  "kyty-core",
  "naga",
+ "spirv-tools",
  "tracing",
 ]
 
@@ -3593,6 +3594,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eda41003dc44290527a59b13432d4a0379379fa074b70174882adfbdfd917844"
 dependencies = [
  "bitflags 2.13.0",
+]
+
+[[package]]
+name = "spirv-tools"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b10991c25e3adc32c018c528be2cdef16c0cdfaf8581fbeabb033b547a599ec"
+dependencies = [
+ "spirv-tools-sys",
+]
+
+[[package]]
+name = "spirv-tools-sys"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c78c1a8af381edef1b7ca7d7caea9d6454dccb4b00a35b7b968b44b8212f487"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -5149,6 +5168,7 @@ dependencies = [
  "parking_lot",
  "raw-window-handle",
  "rspirv",
+ "spirv-tools",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",

@@ -8,6 +8,7 @@
 
 pub mod anim;
 pub mod boot;
+pub mod console;
 pub mod control_center;
 pub mod home;
 pub mod icons;
@@ -165,6 +166,9 @@ pub struct Shell {
     cc_open: Animated,
     last_rail_index: usize,
     last_tab: RailTab,
+
+    /// In-app log console (F10), SharpEmu-style — the terminal is optional.
+    console: console::ConsolePane,
 }
 
 impl Shell {
@@ -271,6 +275,7 @@ impl Shell {
             cc_open: Animated::with_speed(0.0, 11.0),
             last_rail_index: 0,
             last_tab: RailTab::Games,
+            console: console::ConsolePane::default(),
         }
     }
 
@@ -293,6 +298,12 @@ impl Shell {
             }
         }
 
+        // F10 toggles the log console from any screen (including in-game) —
+        // checked before nav routing so nothing can shadow it.
+        if ctx.input(|i| i.key_pressed(Key::F10)) {
+            self.console.open = !self.console.open;
+        }
+
         self.route_input(ctx);
         self.pump_updater_events(ctx);
         self.poll_session();
@@ -300,6 +311,8 @@ impl Shell {
         self.tick_session_quit(ctx);
         self.tick_animations(ctx);
         self.draw(ctx);
+        // Drawn last: the console floats above every screen.
+        self.console.ui(ctx);
     }
 
     /// Kick off the startup update check (called once from `app.rs`, not

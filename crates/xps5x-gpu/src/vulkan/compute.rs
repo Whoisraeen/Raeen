@@ -473,6 +473,20 @@ impl<'a> ComputeResources<'a> {
             .then_some(self.descriptor_layout)
             .into_iter()
             .collect();
+        // Exceeding maxPushConstantsSize is invalid usage — UB without
+        // validation layers (measured: AMD driver access violation). Refuse
+        // the dispatch by name until the SSBO spill path exists; iGPUs
+        // commonly report the 256-byte spec minimum.
+        if let Some(binding) = state.binding {
+            let need = binding.push_constant_offset + binding.push_constants.len() as u32;
+            let cap = self.dev.max_push_constants_size();
+            if need > cap {
+                return Err(GpuError::PipelineCreationFailed(format!(
+                    "push constants {need} B exceed the device maxPushConstantsSize {cap} B \
+                     (SSBO spill not implemented)"
+                )));
+            }
+        }
         let push_ranges: Vec<_> = state
             .binding
             .filter(|binding| !binding.push_constants.is_empty())

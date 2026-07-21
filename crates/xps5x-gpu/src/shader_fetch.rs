@@ -348,6 +348,26 @@ impl ShaderTranslateCache {
         self.stats.distinct_fetched += 1;
         self.dump_shader(stage, addr, &window.data);
 
+        // Validity gate: an invalid module passes vkCreateShaderModule but
+        // dispatching it is UB (measured: AMD driver access violation that
+        // kills the process). Refuse it here so it becomes a named, cached
+        // translate failure instead of ever reaching the driver.
+        let result = match result {
+            Ok(t) if crate::spirv_gate::gate_enabled() => {
+                match crate::spirv_gate::validate_spirv(&t.spirv) {
+                    Ok(()) => Ok(t),
+                    Err(reason) => Err(AttemptError {
+                        msg: format!(
+                            "translated ({} SPIR-V words) but the module is invalid — {reason}",
+                            t.spirv.len()
+                        ),
+                        truncated: false,
+                    }),
+                }
+            }
+            other => other,
+        };
+
         match result {
             Ok(t) => {
                 self.stats.translated_ok += 1;

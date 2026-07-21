@@ -8,6 +8,12 @@ license.workspace = true
 [dependencies]
 xps5x-core = { workspace = true }
 kyty-graphics = { workspace = true }
+# In-process spirv-val (the real Khronos validator, compiled in): the
+# translate-time validity gate. An invalid module reaching the driver is
+# undefined behavior — measured as an AMD driver access violation that kills
+# the process. naga cannot serve here: its SPIR-V front end structurizes and
+# ACCEPTS back-edge modules spirv-val (and the driver) reject.
+spirv-tools = { version = "0.12", default-features = false, features = ["use-compiled-tools"] }
 ash = { workspace = true }
 gpu-allocator = { workspace = true }
 tracing = { workspace = true }

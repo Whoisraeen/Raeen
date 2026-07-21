@@ -161,6 +161,167 @@ fn filter(level: &str) -> EnvFilter {
     EnvFilter::try_from_env("XPS5X_LOG").unwrap_or_else(|_| EnvFilter::new(level))
 }
 
+// ---------------------------------------------------------------------------
+// In-app console buffer
+// ---------------------------------------------------------------------------
+
+/// Default cap on buffered console lines (env-overridable via
+/// [`CONSOLE_LINES_ENV`]). Bounded the same way the file is: an emulator at
+/// `debug` produces millions of lines and the console exists for the recent
+/// past, not the whole run (the file keeps the head).
+pub const DEFAULT_CONSOLE_LINES: usize = 5_000;
+
+/// Environment override for the console line cap.
+pub const CONSOLE_LINES_ENV: &str = "XPS5X_CONSOLE_LINES";
+
+/// One captured log event for the in-app console (Shell log viewer).
+#[derive(Clone, Debug)]
+pub struct ConsoleLine {
+    /// Monotonic sequence number, never reused — lets a reader pull only the
+    /// lines it has not seen and detect eviction.
+    pub seq: u64,
+    /// Milliseconds since logging initialized (the file log carries full
+    /// timestamps; the console favors compactness).
+    pub elapsed_ms: u64,
+    /// Event level.
+    pub level: tracing::Level,
+    /// Event target (module path).
+    pub target: String,
+    /// Rendered message plus any structured fields as `key=value`.
+    pub message: String,
+}
+
+/// Bounded ring of recent log events, fed by a subscriber layer installed in
+/// [`init`] / [`init_with_file`] and read by the Shell's console window.
+pub struct ConsoleBuffer {
+    lines: std::sync::Mutex<std::collections::VecDeque<ConsoleLine>>,
+    next_seq: std::sync::atomic::AtomicU64,
+    cap: usize,
+}
+
+impl ConsoleBuffer {
+    fn new(cap: usize) -> Self {
+        Self {
+            lines: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+                cap.min(1024),
+            )),
+            next_seq: std::sync::atomic::AtomicU64::new(0),
+            cap,
+        }
+    }
+
+    fn push(&self, elapsed_ms: u64, level: tracing::Level, target: String, message: String) {
+        use std::sync::atomic::Ordering;
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let Ok(mut lines) = self.lines.lock() else {
+            return;
+        };
+        if lines.len() >= self.cap {
+            lines.pop_front();
+        }
+        lines.push_back(ConsoleLine {
+            seq,
+            elapsed_ms,
+            level,
+            target,
+            message,
+        });
+    }
+
+    /// Append every buffered line with `seq > after` to `out`, returning the
+    /// highest sequence seen (pass it back on the next call; pass `None` on
+    /// the first call to read everything buffered).
+    pub fn read_since(&self, after: Option<u64>, out: &mut Vec<ConsoleLine>) -> Option<u64> {
+        let lines = self.lines.lock().ok()?;
+        let mut last = after;
+        for line in lines.iter() {
+            if after.is_none_or(|a| line.seq > a) {
+                out.push(line.clone());
+                last = Some(line.seq);
+            }
+        }
+        last
+    }
+
+    /// Drop every buffered line (the file log is unaffected).
+    pub fn clear(&self) {
+        if let Ok(mut lines) = self.lines.lock() {
+            lines.clear();
+        }
+    }
+}
+
+/// The process-wide console buffer. Always present; it only receives events
+/// once [`init`] / [`init_with_file`] install the capture layer.
+pub fn console() -> &'static ConsoleBuffer {
+    static CONSOLE: OnceLock<ConsoleBuffer> = OnceLock::new();
+    CONSOLE.get_or_init(|| {
+        let cap = std::env::var(CONSOLE_LINES_ENV)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_CONSOLE_LINES);
+        ConsoleBuffer::new(cap)
+    })
+}
+
+/// Subscriber layer that mirrors every event into [`console`].
+struct ConsoleLayer {
+    start: std::time::Instant,
+}
+
+impl ConsoleLayer {
+    fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ConsoleLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Visitor {
+            message: String,
+            fields: String,
+        }
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                if field.name() == "message" {
+                    let _ = write!(self.message, "{value:?}");
+                } else {
+                    let _ = write!(self.fields, " {}={value:?}", field.name());
+                }
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                use std::fmt::Write;
+                if field.name() == "message" {
+                    self.message.push_str(value);
+                } else {
+                    let _ = write!(self.fields, " {}={value}", field.name());
+                }
+            }
+        }
+        let mut visitor = Visitor {
+            message: String::new(),
+            fields: String::new(),
+        };
+        event.record(&mut visitor);
+        let mut message = visitor.message;
+        message.push_str(&visitor.fields);
+        console().push(
+            self.start.elapsed().as_millis() as u64,
+            *event.metadata().level(),
+            event.metadata().target().to_owned(),
+            message,
+        );
+    }
+}
+
 /// A boxed closure that swaps the global level filter to a new level string.
 type ReloadFn = Box<dyn Fn(&str) + Send + Sync>;
 
@@ -206,6 +367,7 @@ pub fn init(level: &str) -> LogGuard {
     let _ = tracing_subscriber::registry()
         .with(filter(level))
         .with(stderr_layer)
+        .with(ConsoleLayer::new())
         .try_init();
 
     tracing::info!("XPS5X v{} — PS5 Emulator initialized", crate::VERSION);
@@ -259,6 +421,7 @@ pub fn init_with_file(level: &str, log_dir: &Path) -> anyhow::Result<LogGuard> {
         .with(filter_layer)
         .with(stderr_layer)
         .with(file_layer)
+        .with(ConsoleLayer::new())
         .try_init()
         .is_ok();
     if installed {
@@ -283,6 +446,38 @@ pub fn init_with_file(level: &str, log_dir: &Path) -> anyhow::Result<LogGuard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_buffer_ring_semantics() {
+        let buffer = ConsoleBuffer::new(3);
+        for i in 0..5u64 {
+            buffer.push(i, tracing::Level::INFO, "t".into(), format!("m{i}"));
+        }
+        // Capped at 3: the two oldest evicted, sequence numbers preserved.
+        let mut all = Vec::new();
+        let last = buffer.read_since(None, &mut all);
+        assert_eq!(last, Some(4));
+        assert_eq!(
+            all.iter().map(|l| l.seq).collect::<Vec<_>>(),
+            [2, 3, 4],
+            "oldest lines evicted, seq survives"
+        );
+        // Incremental read returns only unseen lines.
+        buffer.push(5, tracing::Level::WARN, "t".into(), "m5".into());
+        let mut fresh = Vec::new();
+        let last = buffer.read_since(last, &mut fresh);
+        assert_eq!(last, Some(5));
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].message, "m5");
+        // Clear empties the ring but not the sequence counter.
+        buffer.clear();
+        let mut after_clear = Vec::new();
+        assert_eq!(buffer.read_since(None, &mut after_clear), None);
+        assert!(after_clear.is_empty());
+        buffer.push(6, tracing::Level::ERROR, "t".into(), "m6".into());
+        let mut post = Vec::new();
+        assert_eq!(buffer.read_since(None, &mut post), Some(6));
+    }
 
     /// The file sink must actually produce a readable file at the stable path.
     /// This is the regression guard for the original bug: `init_with_file`

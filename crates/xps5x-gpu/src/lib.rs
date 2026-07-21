@@ -34,6 +34,7 @@ pub mod metal;
 pub mod shader;
 pub mod shader_bridge;
 pub(crate) mod shader_fetch;
+pub mod spirv_gate;
 pub mod texture;
 pub mod vulkan;
 

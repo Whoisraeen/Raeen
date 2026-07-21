@@ -2575,6 +2575,14 @@ pub struct Spirv<'a> {
     /// Deviation: Kyty reads the global `Config::SpirvDebugPrintfEnabled()`;
     /// the port threads it as a field (default off).
     pub debug_printf_enabled: bool,
+    /// Deviation from Kyty (which emits raw branches and fails Vulkan's
+    /// structured-control-flow rules): when the shader has any label, the
+    /// body is emitted as a dispatch loop — one outer `OpLoopMerge` loop
+    /// whose body `OpSwitch`es on a block variable; every guest basic block
+    /// is a case and every branch becomes a store + branch-to-continue.
+    /// Maps each guest block-start pc to its case id. `None` = no labels =
+    /// legacy linear emission (byte-identical to Kyty's).
+    reloop_blocks: Option<std::collections::BTreeMap<u32, u32>>,
 }
 
 impl Default for Spirv<'_> {
@@ -2597,7 +2605,89 @@ impl<'a> Spirv<'a> {
             bind: None,
             extended_mapping: [[-1; 2]; 64],
             debug_printf_enabled: false,
+            reloop_blocks: None,
         }
+    }
+
+    /// Dispatch-loop relooper state: `Some(case id)` when `pc` starts a guest
+    /// basic block, `None` when the relooper is inactive or `pc` is not a
+    /// block start. Read by the branch recompilers.
+    #[must_use]
+    pub(crate) fn reloop_case_id(&self, pc: u32) -> Option<u32> {
+        self.reloop_blocks.as_ref()?.get(&pc).copied()
+    }
+
+    /// Whether the dispatch-loop relooper is active for this shader.
+    #[must_use]
+    pub(crate) fn reloop_active(&self) -> bool {
+        self.reloop_blocks.is_some()
+    }
+
+    /// Compute the relooper block map: active when the shader has any branch
+    /// label. Block starts are the first instruction, every (indirect) label
+    /// destination, and the instruction after every terminator. A label that
+    /// resolves to no instruction pc makes the shader refuse by name — an
+    /// `OpSwitch` case must have a real block to land in.
+    fn find_reloop_blocks(&mut self) -> Result<(), ShaderRecompileError> {
+        use ShaderInstructionType as T;
+        self.reloop_blocks = None;
+        let labels_present = self.code.get_labels().iter().any(|l| !l.is_disabled())
+            || self
+                .code
+                .get_indirect_labels()
+                .iter()
+                .any(|l| !l.is_disabled());
+        if !labels_present {
+            return Ok(());
+        }
+        let instructions = self.code.get_instructions();
+        let Some(first) = instructions.first() else {
+            return Ok(());
+        };
+        let pcs: std::collections::BTreeSet<u32> =
+            instructions.iter().map(|inst| inst.pc).collect();
+        let mut starts = std::collections::BTreeSet::new();
+        starts.insert(first.pc);
+        for label in self
+            .code
+            .get_labels()
+            .iter()
+            .chain(self.code.get_indirect_labels())
+            .filter(|l| !l.is_disabled())
+        {
+            if !pcs.contains(&label.get_dst()) {
+                return Err(not_supported(
+                    "Spirv::FindReloopBlocks",
+                    format!(
+                        "branch target {:#x} is not an instruction boundary",
+                        label.get_dst()
+                    ),
+                ));
+            }
+            starts.insert(label.get_dst());
+        }
+        for pair in instructions.windows(2) {
+            if matches!(
+                pair[0].type_,
+                T::SEndpgm
+                    | T::SBranch
+                    | T::SCbranchScc0
+                    | T::SCbranchScc1
+                    | T::SCbranchVccz
+                    | T::SCbranchVccnz
+                    | T::SCbranchExecz
+            ) {
+                starts.insert(pair[1].pc);
+            }
+        }
+        self.reloop_blocks = Some(
+            starts
+                .into_iter()
+                .enumerate()
+                .map(|(id, pc)| (pc, id as u32))
+                .collect(),
+        );
+        Ok(())
     }
 
     #[must_use]
@@ -2848,6 +2938,8 @@ impl<'a> Spirv<'a> {
                 self.detect_fetch()?;
             }
         }
+
+        self.find_reloop_blocks()?;
 
         self.write_header()?;
         self.write_debug();
@@ -3652,6 +3744,12 @@ impl<'a> Spirv<'a> {
 
         self.source += COMMON_VARS;
 
+        // Dispatch-loop relooper: the current-block variable (an OpVariable
+        // must sit with the others at the top of the entry block).
+        if self.reloop_active() {
+            self.source += "           %reloop_bb = OpVariable %_ptr_Function_int Function\n";
+        }
+
         if self.code.get_type() == ShaderType::Vertex {
             const TEXT: &str = r#"
        %vertex_index_int = OpLoad %int %gl_VertexIndex
@@ -4214,16 +4312,81 @@ impl<'a> Spirv<'a> {
 
     /// Kyty: `Spirv::WriteInstructions` (L7797). Kyty `EXIT`s on
     /// unrecompilable instructions; the port returns the typed error.
+    /// Terminators end a relooper case: the case's control transfer is fully
+    /// emitted by the instruction itself (branch stores + continue, or a
+    /// return/kill), so no fallthrough transition is added after them.
+    fn reloop_is_terminator(type_: ShaderInstructionType) -> bool {
+        use ShaderInstructionType as T;
+        matches!(
+            type_,
+            T::SEndpgm
+                | T::SBranch
+                | T::SCbranchScc0
+                | T::SCbranchScc1
+                | T::SCbranchVccz
+                | T::SCbranchVccnz
+                | T::SCbranchExecz
+        )
+    }
+
     fn write_instructions(&mut self) -> Result<(), ShaderRecompileError> {
         use super::recompile::{RecompileFn, SccCheck, recomp_func, recompile_inject_debug};
 
-        self.modify_code();
+        // Legacy linear emission only: the relooper needs no discard-block
+        // duplication (each discard block is one case every branch can
+        // target) and no chained per-branch labels.
+        let reloop = self.reloop_blocks.clone();
+        if reloop.is_none() {
+            self.modify_code();
+        }
+
+        if let Some(blocks) = &reloop {
+            let first_pc = self.code.get_instructions()[0].pc;
+            let entry_id = blocks[&first_pc];
+            let mut cases = String::new();
+            for (pc, id) in blocks {
+                let _ = pc;
+                cases.push_str(&format!(" {id} %reloop_case_{id}"));
+            }
+            self.source += &format!(
+                r#"
+               ; Dispatch loop (structured control flow)
+               OpStore %reloop_bb %int_{entry_id}
+               OpBranch %reloop_head
+%reloop_head = OpLabel
+               OpLoopMerge %reloop_exit %reloop_continue None
+               OpBranch %reloop_body
+%reloop_body = OpLabel
+%reloop_sel  = OpLoad %int %reloop_bb
+               OpSelectionMerge %reloop_merge None
+               OpSwitch %reloop_sel %reloop_merge{cases}
+"#
+            );
+        }
 
         // Kyty: `need_debug` (ShaderSpirv.cpp L7803).
         let need_debug = self.debug_printf_enabled && !self.code.get_debug_printfs().is_empty();
 
         for index in 0..self.code.get_instructions().len() {
-            self.write_label(index);
+            match &reloop {
+                Some(blocks) => {
+                    let inst = self.code.get_instructions()[index];
+                    if let Some(id) = blocks.get(&inst.pc) {
+                        if index > 0 {
+                            let prev = self.code.get_instructions()[index - 1].type_;
+                            if !Self::reloop_is_terminator(prev) {
+                                // Fallthrough into the next block.
+                                self.source += &format!(
+                                    "               OpStore %reloop_bb %int_{id}\n               \
+                                     OpBranch %reloop_continue\n"
+                                );
+                            }
+                        }
+                        self.source += &format!("%reloop_case_{id} = OpLabel\n");
+                    }
+                }
+                None => self.write_label(index),
+            }
 
             let inst = self.code.get_instructions()[index];
             let src = ShaderCode::dbg_instruction_to_str(&inst);
@@ -4289,6 +4452,24 @@ impl<'a> Spirv<'a> {
                     self.source += &format!("{dst_debug}\n");
                 }
             }
+        }
+
+        if reloop.is_some() {
+            if let Some(last) = self.code.get_instructions().last() {
+                if !Self::reloop_is_terminator(last.type_) {
+                    // A guest stream that just ends (no s_endpgm) — close the
+                    // final case defensively.
+                    self.source += "               OpBranch %reloop_exit\n";
+                }
+            }
+            self.source += r#"
+%reloop_merge = OpLabel
+               OpBranch %reloop_exit
+%reloop_continue = OpLabel
+               OpBranch %reloop_head
+%reloop_exit = OpLabel
+               OpReturn
+"#;
         }
 
         Ok(())
@@ -4435,6 +4616,13 @@ impl<'a> Spirv<'a> {
     /// Kyty: `Spirv::FindConstants` (L7940).
     fn find_constants(&mut self) -> Result<(), ShaderRecompileError> {
         self.constants.clear();
+        // Dispatch-loop relooper: every case id is stored/selected as an int
+        // constant (%int_<id>); 0..=32 are seeded below, larger ids dedup.
+        if let Some(blocks) = &self.reloop_blocks {
+            for id in 0..blocks.len() as i32 {
+                self.add_constant_int(id);
+            }
+        }
         self.add_constant_float(0.0);
         self.add_constant_float(0.5);
         self.add_constant_float(1.0);

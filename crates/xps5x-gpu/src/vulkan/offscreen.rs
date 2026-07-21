@@ -2406,6 +2406,19 @@ impl<'a> Resources<'a> {
         self.vertex_module = self.caches.shader_module(self.dev, state.vs_spirv)?;
         self.fragment_module = self.caches.shader_module(self.dev, state.fs_spirv)?;
 
+        // Same guard as the compute path: over-cap push constants are invalid
+        // usage (UB without validation). Refuse the draw by name until the
+        // SSBO spill path exists.
+        for stage in &state.stage_bindings {
+            let need = stage.push_constant_offset + stage.push_constants.len() as u32;
+            let cap = self.dev.max_push_constants_size();
+            if need > cap {
+                return Err(GpuError::PipelineCreationFailed(format!(
+                    "push constants {need} B exceed the device maxPushConstantsSize {cap} B \
+                     (SSBO spill not implemented)"
+                )));
+            }
+        }
         let push_ranges: Vec<_> = state
             .stage_bindings
             .iter()

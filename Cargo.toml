@@ -87,6 +87,8 @@ iced-x86 = { version = "1.21", default-features = false, features = ["decoder", 
 # xps5x-gui's top-bar clock
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    # GUI-subsystem console reattach (AttachConsole) for CLI invocations.
+    "Win32_System_Console",
     "Win32_System_Memory",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",

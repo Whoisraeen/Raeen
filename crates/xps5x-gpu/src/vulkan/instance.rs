@@ -72,6 +72,8 @@ pub struct VulkanDevice {
     debug: Option<(debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
     /// Human-readable name of the selected physical device.
     device_name: String,
+    /// `VkPhysicalDeviceLimits::maxPushConstantsSize` captured at creation.
+    max_push_constants_size: u32,
     /// Whether `VK_EXT_depth_range_unrestricted` was enabled on the logical
     /// device. When false, viewport min/max depth must stay ordered within
     /// [0, 1] — a guest reverse-Z range cannot be honoured.
@@ -135,6 +137,15 @@ impl VulkanDevice {
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
+        // SAFETY: same handle validity as above; the call only fills the
+        // returned struct.
+        let max_push_constants_size = unsafe {
+            instance
+                .get_physical_device_properties(physical_device)
+                .limits
+                .max_push_constants_size
+        };
+
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family_index)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -181,8 +192,18 @@ impl VulkanDevice {
             debug,
             device_name,
             depth_range_unrestricted,
+            max_push_constants_size,
             validation_enabled,
         })
+    }
+
+    /// `VkPhysicalDeviceLimits::maxPushConstantsSize` for the selected
+    /// device. Exceeding it in a pipeline layout or `vkCmdPushConstants` is
+    /// invalid usage — undefined behavior without validation layers (iGPUs
+    /// commonly report the spec minimum of 128/256 bytes).
+    #[must_use]
+    pub fn max_push_constants_size(&self) -> u32 {
+        self.max_push_constants_size
     }
 
     /// Name of the selected physical device, e.g. `NVIDIA GeForce RTX 4070`.

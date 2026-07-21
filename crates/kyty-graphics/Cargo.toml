@@ -19,3 +19,7 @@ tracing.workspace = true
 # Validity gate for spirv_asm tests: parse assembled binaries with a pure-Rust
 # SPIR-V front end (naga 24 is already in the workspace lockfile via eframe).
 naga = { version = "24", features = ["spv-in"] }
+# Real Khronos spirv-val for structurizer tests: naga cannot serve there (its
+# front end structurizes and ACCEPTS back-edge modules spirv-val rejects).
+# Same crate the xps5x-gpu runtime gate uses.
+spirv-tools = { version = "0.12", default-features = false, features = ["use-compiled-tools"] }

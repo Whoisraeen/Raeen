@@ -1180,7 +1180,7 @@ fn recompile_sbranch_label(
     index: u32,
     code: &ShaderCode,
     dst_source: &mut String,
-    _spirv: &Spirv<'_>,
+    spirv: &Spirv<'_>,
     _param: &Params,
     _scc_check: SccCheck,
 ) -> Result<bool, ShaderRecompileError> {
@@ -1192,6 +1192,20 @@ fn recompile_sbranch_label(
     }
 
     let label = ShaderLabel::from_instruction(&inst);
+
+    // Dispatch-loop relooper: a branch is a store of the target case id.
+    // Discard targets need no special casing — the discard block is an
+    // ordinary case.
+    if spirv.reloop_active() {
+        let Some(id) = spirv.reloop_case_id(label.get_dst()) else {
+            return Err(not_supported(FUNC, "branch target has no relooper block"));
+        };
+        *dst_source += &format!(
+            "               OpStore %reloop_bb %int_{id}\n               \
+             OpBranch %reloop_continue\n"
+        );
+        return Ok(true);
+    }
 
     if code.read_block(label.get_dst()).is_discard {
         return Err(not_supported(FUNC, "branch to discard block"));
@@ -1214,7 +1228,7 @@ fn recompile_scbranch_xxx_label(
     index: u32,
     code: &ShaderCode,
     dst_source: &mut String,
-    _spirv: &Spirv<'_>,
+    spirv: &Spirv<'_>,
     param: &Params,
     _scc_check: SccCheck,
 ) -> Result<bool, ShaderRecompileError> {
@@ -1228,6 +1242,33 @@ fn recompile_scbranch_xxx_label(
 
     if !operand_is_constant(inst.src[0]) {
         return Err(not_supported(FUNC, "src0 is not a constant"));
+    }
+
+    // Dispatch-loop relooper: select the next case id by the condition and
+    // hand control to the dispatch loop. Direction (forward/backward) and
+    // discard targets need no analysis — every block is a case.
+    if spirv.reloop_active() {
+        let label = ShaderLabel::from_instruction(&inst);
+        let Some(dst_id) = spirv.reloop_case_id(label.get_dst()) else {
+            return Err(not_supported(FUNC, "branch target has no relooper block"));
+        };
+        let Some(next_id) = spirv.reloop_case_id(next_inst.pc) else {
+            return Err(not_supported(FUNC, "fallthrough has no relooper block"));
+        };
+        const TEXT: &str = r#"
+        <param0>
+        <param1>
+        %reloop_t_<index> = OpSelect %int %cc_b_<index> %int_<dst> %int_<next>
+               OpStore %reloop_bb %reloop_t_<index>
+               OpBranch %reloop_continue
+"#;
+        *dst_source += &TEXT
+            .replace("<param0>", param[0].unwrap_or(""))
+            .replace("<param1>", param[1].unwrap_or(""))
+            .replace("<index>", &format!("{index}"))
+            .replace("<dst>", &dst_id.to_string())
+            .replace("<next>", &next_id.to_string());
+        return Ok(true);
     }
 
     // TODO(): analyze control flow graph
@@ -9254,6 +9295,121 @@ mod tests {
                 "naga validate of {name} failed: {msg}"
             );
         }
+    }
+
+    /// Real spirv-val (the Khronos validator, same invocation as the
+    /// xps5x-gpu runtime gate): the structurizer's acceptance bar. naga
+    /// cannot serve here — its SPIR-V front end structurizes and ACCEPTS
+    /// back-edge modules spirv-val (and drivers) reject.
+    fn spirv_val_ok(words: &[u32], name: &str) {
+        use spirv_tools::val::Validator;
+        let validator = spirv_tools::val::create(Some(spirv_tools::TargetEnv::Vulkan_1_3));
+        let options = spirv_tools::val::ValidatorOptions {
+            relax_block_layout: Some(true),
+            ..Default::default()
+        };
+        if let Err(e) = validator.validate(words, Some(options)) {
+            panic!("spirv-val of {name} failed: {e}");
+        }
+    }
+
+    // ---- 0. control-flow structurization (dispatch-loop relooper) ---------
+
+    /// A backward conditional branch (a guest loop). The measured ASTRO.BOT
+    /// crash class: with no OpLoopMerge anywhere in guest codegen, every loop
+    /// used to emit an illegal back-edge ("Back-edges can only be formed
+    /// between a block and a loop header") — VK_SUCCESS at module creation,
+    /// undefined behavior (AMD driver access violation) at dispatch.
+    #[test]
+    fn backward_loop_translates_to_valid_spirv() {
+        let code = parse(
+            &[
+                0x7E00_0280, // pc 0: v_mov_b32 v0, 0
+                0xBF85_FFFE, // pc 4: s_cbranch_scc1 -2  -> dst pc 0 (back-edge)
+                S_ENDPGM,    // pc 8
+            ],
+            ShaderType::Compute,
+        );
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let words = shader_recompile_cs(&code, &input_info).expect("backward loop must translate");
+        spirv_val_ok(&words, "backward_loop");
+    }
+
+    /// A forward conditional skip (a guest `if`) stays valid.
+    #[test]
+    fn forward_conditional_skip_translates_to_valid_spirv() {
+        let code = parse(
+            &[
+                0xBF88_0001, // pc 0: s_cbranch_execz +1 -> dst pc 8
+                0x7E00_0280, // pc 4: v_mov_b32 v0, 0
+                S_ENDPGM,    // pc 8
+            ],
+            ShaderType::Compute,
+        );
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let words = shader_recompile_cs(&code, &input_info).expect("forward skip must translate");
+        spirv_val_ok(&words, "forward_skip");
+    }
+
+    /// An unconditional forward branch (skipping dead code) stays valid.
+    #[test]
+    fn unconditional_forward_branch_translates_to_valid_spirv() {
+        let code = parse(
+            &[
+                0xBF82_0001, // pc 0: s_branch +1 -> dst pc 8
+                0x7E00_0280, // pc 4: v_mov_b32 v0, 0 (unreachable)
+                S_ENDPGM,    // pc 8
+            ],
+            ShaderType::Compute,
+        );
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let words =
+            shader_recompile_cs(&code, &input_info).expect("forward s_branch must translate");
+        spirv_val_ok(&words, "forward_branch");
+    }
+
+    /// A nested loop: outer loop body contains an inner backward branch.
+    /// The dispatch loop flattens both into one switch — both back-edges
+    /// become stores to the block variable.
+    #[test]
+    fn nested_backward_loops_translate_to_valid_spirv() {
+        let code = parse(
+            &[
+                0x7E00_0280, // pc 0:  v_mov_b32 v0, 0        (outer head)
+                0x7E02_0280, // pc 4:  v_mov_b32 v1, 0        (inner head)
+                0xBF85_FFFE, // pc 8:  s_cbranch_scc1 -2  -> pc 4 (inner latch)
+                0xBF84_FFFC, // pc 12: s_cbranch_scc0 -4  -> pc 0 (outer latch)
+                S_ENDPGM,    // pc 16
+            ],
+            ShaderType::Compute,
+        );
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let words = shader_recompile_cs(&code, &input_info).expect("nested loops must translate");
+        spirv_val_ok(&words, "nested_loops");
+    }
+
+    /// Straight-line shaders (no labels) keep the legacy linear emission —
+    /// no dispatch-loop scaffolding in the source at all.
+    #[test]
+    fn zero_label_shader_keeps_the_linear_fast_path() {
+        let code = parse(
+            &[0x7E00_0280, 0x7E02_0280, S_ENDPGM],
+            ShaderType::Compute,
+        );
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("straight-line CS translates");
+        assert!(
+            !source.contains("reloop"),
+            "zero-label shaders must not pay for the dispatch loop:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assembles");
+        spirv_val_ok(&words, "straight_line");
     }
 
     // ---- 1. dispatch table ------------------------------------------------
