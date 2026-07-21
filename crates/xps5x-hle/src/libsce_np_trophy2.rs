@@ -18,6 +18,9 @@ use std::sync::atomic::{AtomicI32, Ordering};
 const OK: u64 = 0;
 const SCE_ERROR_INVALID_ARGUMENT: u64 = 0x8002_0016;
 const SCE_ERROR_MEMORY_FAULT: u64 = 0x8002_000E;
+/// SharpEmu's `ORBIS_GEN2_ERROR_NOT_FOUND` maps to the real Orbis
+/// `SCE_KERNEL_ERROR_ENOENT` (both `0x8002_0002`).
+const SCE_ERROR_NOT_FOUND: u64 = 0x8002_0002;
 
 // SharpEmu's `_nextContext` / `_nextHandle`, both starting at 1.
 static NEXT_CONTEXT: AtomicI32 = AtomicI32::new(1);
@@ -50,6 +53,17 @@ pub fn register(registry: &HleRegistry) {
         |_, _| OK,
     );
     registry.register("libSceNpTrophy2", "sceNpTrophy2ShowTrophyList", |_, _| OK);
+    // `sceNpTrophy2GetTrophyInfo(context, handle, trophyId, details*, data*)`:
+    // report "no such trophy" rather than succeeding. Succeeding would require
+    // filling both `SceNpTrophy2Details` and `SceNpTrophy2Data`, whose exact
+    // layouts are not confirmed here — a title trusting zeroed details would read
+    // an empty name and grade 0 as real data. NOT_FOUND is a documented outcome
+    // callers already handle, so it degrades along a path the game tests.
+    // SharpEmu `NpTrophy2Exports.cs` (#450, 0c467e8) returns
+    // `ORBIS_GEN2_ERROR_NOT_FOUND`.
+    registry.register("libSceNpTrophy2", "sceNpTrophy2GetTrophyInfo", |_, _| {
+        SCE_ERROR_NOT_FOUND
+    });
 }
 
 /// Write the current `next` id (int32, little-endian) to `out_address`, then —
@@ -125,5 +139,23 @@ mod tests {
         assert_eq!(hle_create_context(&ctx, &[0x40]), OK);
         assert!(mem.read(0x40, &mut id));
         assert_eq!(i32::from_le_bytes(id), 3);
+    }
+
+    #[test]
+    fn get_trophy_info_reports_not_found_without_writing_details() {
+        let registry = HleRegistry::new();
+        assert!(registry.is_implemented("libSceNpTrophy2", "sceNpTrophy2GetTrophyInfo"));
+        let (kernel, mem, alloc) = env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // context, handle, trophyId, details*, data* — always NOT_FOUND.
+        assert_eq!(
+            registry.call(
+                &ctx,
+                "libSceNpTrophy2",
+                "sceNpTrophy2GetTrophyInfo",
+                &[1, 1, 0, 0x10, 0x40],
+            ),
+            Some(SCE_ERROR_NOT_FOUND)
+        );
     }
 }

@@ -392,6 +392,30 @@ mod tests {
     }
 
     #[test]
+    fn num_commands_tracks_appends_and_resets() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb: u64 = 0x100;
+        // Null and untracked buffers follow SharpEmu's error mapping.
+        assert_eq!(hle_get_num_commands(&ctx, &[0]), SCE_ERROR_INVALID_ARGUMENT);
+        assert_eq!(hle_get_num_commands(&ctx, &[cb]), SCE_ERROR_MEMORY_FAULT);
+        // Construct starts the count at zero (buffer inside the 0x400-byte
+        // test memory so the appended records are writable).
+        assert_eq!(hle_ctor(&ctx, &[cb, 0x200, 0x100]), cb);
+        assert_eq!(hle_get_num_commands(&ctx, &[cb]), 0);
+        // Each appended record bumps it (two equeue records here).
+        assert_eq!(hle_write_equeue_record(&ctx, &[cb, 0x9000, 1, 2]), OK);
+        assert_eq!(hle_write_equeue_record(&ctx, &[cb, 0x9000, 3, 4]), OK);
+        assert_eq!(hle_get_num_commands(&ctx, &[cb]), 2);
+        // Reset rewinds the count with the cursor.
+        assert_eq!(hle_reset(&ctx, &[cb]), OK);
+        assert_eq!(hle_get_num_commands(&ctx, &[cb]), 0);
+        // Destructor drops the state entirely.
+        hle_dtor(&ctx, &[cb]);
+        assert_eq!(hle_get_num_commands(&ctx, &[cb]), SCE_ERROR_MEMORY_FAULT);
+    }
+
+    #[test]
     fn construct_get_set_reset_lifecycle() {
         let (kernel, mem, alloc) = ctx_env();
         let ctx = test_ctx(&kernel, &mem, &alloc);

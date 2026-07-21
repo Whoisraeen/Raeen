@@ -65,6 +65,115 @@ pub fn register(registry: &HleRegistry) {
         "sceNpUniversalDataSystemPostEvent",
         |_, _| OK,
     );
+    // EventProperty family — SharpEmu ports (`EventPropertyObjectSetString` /
+    // `SetArray`): the property-object pointer must be non-null and readable,
+    // pointer-valued payloads must be readable when non-null, and the call
+    // otherwise succeeds without recording anything. Measured: ASTRO.BOT's
+    // job-assert telemetry path dies on the unresolved-import stub without
+    // these (`SetString` fault confirmed 2026-07-21, siblings called from the
+    // same path per the boot missing-NID list).
+    registry.register(
+        "libSceNpUniversalDataSystem",
+        "sceNpUniversalDataSystemEventPropertyObjectSetString",
+        hle_property_set_string,
+    );
+    registry.register(
+        "libSceNpUniversalDataSystem",
+        "sceNpUniversalDataSystemEventPropertyObjectSetArray",
+        hle_property_set_array,
+    );
+    registry.register(
+        "libSceNpUniversalDataSystem",
+        "sceNpUniversalDataSystemEventPropertyArraySetObject",
+        hle_property_set_array,
+    );
+    registry.register(
+        "libSceNpUniversalDataSystem",
+        "sceNpUniversalDataSystemEventPropertyArraySetString",
+        hle_property_set_string,
+    );
+    // Scalar variants carry their payload by value, not by pointer, so only
+    // the property-object pointer is validated (SharpEmu has no reference for
+    // these; fail-soft success is all a no-PSN-backend telemetry sink can do).
+    for name in [
+        "sceNpUniversalDataSystemEventPropertyObjectSetInt32",
+        "sceNpUniversalDataSystemEventPropertyObjectSetInt64",
+        "sceNpUniversalDataSystemEventPropertyObjectSetUInt32",
+        "sceNpUniversalDataSystemEventPropertyObjectSetUInt64",
+        "sceNpUniversalDataSystemEventPropertyObjectSetBool",
+    ] {
+        registry.register("libSceNpUniversalDataSystem", name, hle_property_set_scalar);
+    }
+    // Lifecycle bookkeeping a no-backend implementation can simply accept.
+    registry.register(
+        "libSceNpUniversalDataSystem",
+        "sceNpUniversalDataSystemCreateEventPropertyObject",
+        |_, _| OK,
+    );
+    registry.register(
+        "libSceNpUniversalDataSystem",
+        "sceNpUniversalDataSystemDestroyContext",
+        |_, _| OK,
+    );
+    registry.register(
+        "libSceNpUniversalDataSystem",
+        "sceNpUniversalDataSystemTerminate",
+        |_, _| OK,
+    );
+}
+
+/// One readable byte at `addr` — SharpEmu's `TryRead(addr, stackalloc[1])`
+/// probe.
+fn readable(ctx: &HleContext, addr: u64) -> bool {
+    ctx.mem.read(addr, &mut [0u8; 1])
+}
+
+/// `sceNpUniversalDataSystemEventPropertyObjectSetString(event, obj, value)`:
+/// both the property object and the string pointer must be non-null and
+/// readable (SharpEmu `NpUniversalDataSystemEventPropertyObjectSetString`).
+fn hle_property_set_string(ctx: &HleContext, args: &[u64]) -> u64 {
+    let obj = args.get(1).copied().unwrap_or(0);
+    let value = args.get(2).copied().unwrap_or(0);
+    if obj == 0 || value == 0 {
+        return UDS_ERROR_INVALID_ARGUMENT;
+    }
+    if readable(ctx, obj) && readable(ctx, value) {
+        OK
+    } else {
+        SCE_ERROR_MEMORY_FAULT
+    }
+}
+
+/// `sceNpUniversalDataSystemEventPropertyObjectSetArray(event, obj, values)`:
+/// the property object must be non-null and readable; a non-null array pointer
+/// must be readable (SharpEmu `NpUniversalDataSystemEventPropertyObjectSetArray`).
+fn hle_property_set_array(ctx: &HleContext, args: &[u64]) -> u64 {
+    let obj = args.get(1).copied().unwrap_or(0);
+    let values = args.get(2).copied().unwrap_or(0);
+    if obj == 0 {
+        return UDS_ERROR_INVALID_ARGUMENT;
+    }
+    if !readable(ctx, obj) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    if values != 0 && !readable(ctx, values) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    OK
+}
+
+/// Scalar `EventPropertyObjectSet{Int32,Int64,UInt32,UInt64,Bool}`: the value
+/// travels by register, so only the property-object pointer is checked.
+fn hle_property_set_scalar(ctx: &HleContext, args: &[u64]) -> u64 {
+    let obj = args.get(1).copied().unwrap_or(0);
+    if obj == 0 {
+        return UDS_ERROR_INVALID_ARGUMENT;
+    }
+    if readable(ctx, obj) {
+        OK
+    } else {
+        SCE_ERROR_MEMORY_FAULT
+    }
 }
 
 /// `sceNpUniversalDataSystemCreateEvent(param*, _, eventOut*, altOut*)` —
@@ -189,5 +298,84 @@ mod tests {
             hle_create_handle(&ctx, &[0xFFFF_0000, 0]),
             SCE_ERROR_MEMORY_FAULT
         );
+    }
+
+    #[test]
+    fn property_set_string_validates_both_pointers() {
+        let (kernel, mem, alloc) = env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(
+            hle_property_set_string(&ctx, &[1, 0, 0x20]),
+            UDS_ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            hle_property_set_string(&ctx, &[1, 0x10, 0]),
+            UDS_ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(hle_property_set_string(&ctx, &[1, 0x10, 0x20]), OK);
+        assert_eq!(
+            hle_property_set_string(&ctx, &[1, 0xFFFF_0000, 0x20]),
+            SCE_ERROR_MEMORY_FAULT
+        );
+        assert_eq!(
+            hle_property_set_string(&ctx, &[1, 0x10, 0xFFFF_0000]),
+            SCE_ERROR_MEMORY_FAULT
+        );
+    }
+
+    #[test]
+    fn property_set_array_allows_null_payload_but_not_bad_payload() {
+        let (kernel, mem, alloc) = env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(
+            hle_property_set_array(&ctx, &[1, 0, 0x20]),
+            UDS_ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(hle_property_set_array(&ctx, &[1, 0x10, 0]), OK);
+        assert_eq!(hle_property_set_array(&ctx, &[1, 0x10, 0x20]), OK);
+        assert_eq!(
+            hle_property_set_array(&ctx, &[1, 0x10, 0xFFFF_0000]),
+            SCE_ERROR_MEMORY_FAULT
+        );
+    }
+
+    #[test]
+    fn property_set_scalar_checks_only_the_object() {
+        let (kernel, mem, alloc) = env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(
+            hle_property_set_scalar(&ctx, &[1, 0, 42]),
+            UDS_ERROR_INVALID_ARGUMENT
+        );
+        // A by-value payload (42) is not dereferenced.
+        assert_eq!(hle_property_set_scalar(&ctx, &[1, 0x10, 42]), OK);
+        assert_eq!(
+            hle_property_set_scalar(&ctx, &[1, 0xFFFF_0000, 42]),
+            SCE_ERROR_MEMORY_FAULT
+        );
+    }
+
+    #[test]
+    fn event_property_family_is_registered() {
+        let registry = HleRegistry::new();
+        for name in [
+            "sceNpUniversalDataSystemEventPropertyObjectSetString",
+            "sceNpUniversalDataSystemEventPropertyObjectSetArray",
+            "sceNpUniversalDataSystemEventPropertyArraySetObject",
+            "sceNpUniversalDataSystemEventPropertyArraySetString",
+            "sceNpUniversalDataSystemEventPropertyObjectSetInt32",
+            "sceNpUniversalDataSystemEventPropertyObjectSetInt64",
+            "sceNpUniversalDataSystemEventPropertyObjectSetUInt32",
+            "sceNpUniversalDataSystemEventPropertyObjectSetUInt64",
+            "sceNpUniversalDataSystemEventPropertyObjectSetBool",
+            "sceNpUniversalDataSystemCreateEventPropertyObject",
+            "sceNpUniversalDataSystemDestroyContext",
+            "sceNpUniversalDataSystemTerminate",
+        ] {
+            assert!(
+                registry.is_implemented("libSceNpUniversalDataSystem", name),
+                "{name} must be registered"
+            );
+        }
     }
 }

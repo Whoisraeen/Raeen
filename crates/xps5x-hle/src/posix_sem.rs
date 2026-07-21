@@ -42,6 +42,101 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libScePosix", "sem_timedwait", hle_sem_timedwait);
     registry.register("libScePosix", "sem_post", hle_sem_post);
     registry.register("libScePosix", "sem_getvalue", hle_sem_getvalue);
+
+    // scePthreadSem* — Sony's counting-semaphore API. Address-based like the
+    // POSIX sem_* family and SHARING the same kernel state (posix_semaphores),
+    // so a title mixing the two spellings sees one object; they differ only in
+    // the return convention (SCE error codes rather than -1/errno). Ported from
+    // SharpEmu `KernelSemaphoreCompatExports.cs` (#424, a60bfc9), which delegates
+    // each scePthreadSem* to its Posix counterpart, adding the private-flag check
+    // on Init and the BUSY->TRY_AGAIN translation on Trywait.
+    registry.register("libkernel", "scePthreadSemInit", hle_pthread_sem_init);
+    registry.register("libkernel", "scePthreadSemWait", hle_pthread_sem_wait);
+    registry.register("libkernel", "scePthreadSemTrywait", hle_pthread_sem_trywait);
+    registry.register("libkernel", "scePthreadSemPost", hle_pthread_sem_post);
+    registry.register("libkernel", "scePthreadSemDestroy", hle_pthread_sem_destroy);
+}
+
+// SCE return convention for scePthreadSem*: 0 on success, real Orbis
+// `SCE_KERNEL_ERROR_*` codes (`0x8002_0000 | errno`) on failure.
+const SCE_OK: u64 = 0;
+const SCE_EINVAL: u64 = 0x8002_0016;
+/// `SCE_KERNEL_ERROR_EAGAIN` — SharpEmu's `ORBIS_GEN2_ERROR_TRY_AGAIN`.
+const SCE_EAGAIN: u64 = 0x8002_0023;
+/// `SCE_KERNEL_ERROR_EINTR`.
+const SCE_EINTR: u64 = 0x8002_0004;
+
+/// `scePthreadSemInit(sem, flag, value, name)`: only private semaphores are
+/// supported (`flag == 0`); anything else is `EINVAL`. Otherwise fresh state is
+/// registered with `value` counts, replacing any existing object at `sem`.
+fn hle_pthread_sem_init(ctx: &HleContext, args: &[u64]) -> u64 {
+    let sem = args.first().copied().unwrap_or(0);
+    let flag = args.get(1).copied().unwrap_or(0);
+    let value = args.get(2).copied().unwrap_or(0);
+    if flag != 0 || sem == 0 || value > i64::MAX as u64 {
+        return SCE_EINVAL;
+    }
+    let state = Arc::new(PosixSem::default());
+    *state.count.lock() = value as i64;
+    ctx.kernel.posix_semaphores.insert(sem, state);
+    debug!("scePthreadSemInit(sem={sem:#x}, value={value})");
+    SCE_OK
+}
+
+/// `scePthreadSemWait(sem)`: decrement, parking until a post supplies a count
+/// (real blocking, shared with `sem_wait`), reporting SCE codes.
+fn hle_pthread_sem_wait(ctx: &HleContext, args: &[u64]) -> u64 {
+    match acquire(ctx, args.first().copied().unwrap_or(0), None) {
+        Acquire::Ok => SCE_OK,
+        Acquire::Interrupted => SCE_EINTR,
+        // No deadline is supplied, so `TimedOut` cannot occur; treat any
+        // non-acquire outcome other than interruption as an invalid semaphore.
+        Acquire::Invalid | Acquire::TimedOut => SCE_EINVAL,
+    }
+}
+
+/// `scePthreadSemTrywait(sem)`: consume an available count or report
+/// `TRY_AGAIN` (SharpEmu maps the POSIX `BUSY`/`EAGAIN` onto `TRY_AGAIN`).
+fn hle_pthread_sem_trywait(ctx: &HleContext, args: &[u64]) -> u64 {
+    let sem = args.first().copied().unwrap_or(0);
+    if sem == 0 {
+        return SCE_EINVAL;
+    }
+    let state = semaphore(ctx, sem);
+    let mut count = state.count.lock();
+    if *count > 0 {
+        *count -= 1;
+        SCE_OK
+    } else {
+        SCE_EAGAIN
+    }
+}
+
+/// `scePthreadSemPost(sem)`: supply one count and wake a parked waiter.
+fn hle_pthread_sem_post(ctx: &HleContext, args: &[u64]) -> u64 {
+    let sem = args.first().copied().unwrap_or(0);
+    if sem == 0 {
+        return SCE_EINVAL;
+    }
+    let state = semaphore(ctx, sem);
+    let mut count = state.count.lock();
+    if *count == i64::MAX {
+        return SCE_EINVAL; // EOVERFLOW territory; EINVAL is the honest reject
+    }
+    *count += 1;
+    state.posted.notify_one();
+    SCE_OK
+}
+
+/// `scePthreadSemDestroy(sem)`: drop the tracked state. Destroying an unknown
+/// semaphore is `EINVAL` (it names no initialized object).
+fn hle_pthread_sem_destroy(ctx: &HleContext, args: &[u64]) -> u64 {
+    let sem = args.first().copied().unwrap_or(0);
+    if sem == 0 || ctx.kernel.posix_semaphores.remove(&sem).is_none() {
+        return SCE_EINVAL;
+    }
+    debug!("scePthreadSemDestroy(sem={sem:#x})");
+    SCE_OK
 }
 
 fn fail(ctx: &HleContext, errno: i32) -> u64 {
@@ -88,35 +183,55 @@ fn hle_sem_destroy(ctx: &HleContext, args: &[u64]) -> u64 {
     OK
 }
 
-/// Shared wait body. `deadline == None` waits indefinitely (bounded by
-/// process termination); `Some` reports `ETIMEDOUT` once the wall-clock
-/// deadline passes without an available count.
-fn wait_core(ctx: &HleContext, sem: u64, deadline: Option<std::time::SystemTime>) -> u64 {
+/// Outcome of a blocking acquire, shared by the POSIX (`sem_wait`) and SCE
+/// (`scePthreadSemWait`) wrappers so the parking loop — including the
+/// process-termination self-heal — lives in exactly one place.
+enum Acquire {
+    Ok,
+    Interrupted,
+    TimedOut,
+    Invalid,
+}
+
+/// Shared acquire body. `deadline == None` waits indefinitely (bounded by
+/// process termination); `Some` yields [`Acquire::TimedOut`] once the
+/// wall-clock deadline passes without an available count. Returns an outcome so
+/// each ABI wrapper can format its own return convention (POSIX `-1`/errno vs
+/// SCE error code).
+fn acquire(ctx: &HleContext, sem: u64, deadline: Option<std::time::SystemTime>) -> Acquire {
     if sem == 0 {
-        return fail(ctx, EINVAL);
+        return Acquire::Invalid;
     }
     let state = semaphore(ctx, sem);
     let mut count = state.count.lock();
     loop {
         if *count > 0 {
             *count -= 1;
-            return OK;
+            return Acquire::Ok;
         }
         if ctx.guest_threads.process_is_terminating() {
-            // Unblock a parked worker so process teardown can finish; EINTR
-            // is the POSIX shape of "the wait was interrupted".
-            drop(count);
-            return fail(ctx, EINTR);
+            // Unblock a parked worker so process teardown can finish.
+            return Acquire::Interrupted;
         }
         if let Some(deadline) = deadline {
             let Ok(remaining) = deadline.duration_since(std::time::SystemTime::now()) else {
-                drop(count);
-                return fail(ctx, ETIMEDOUT);
+                return Acquire::TimedOut;
             };
             state.posted.wait_for(&mut count, remaining.min(WAIT_SLICE));
         } else {
             state.posted.wait_for(&mut count, WAIT_SLICE);
         }
+    }
+}
+
+/// Shared wait body for the POSIX `sem_*` family: `-1` plus errno on failure,
+/// `0` on success. `EINTR` is the POSIX shape of "the wait was interrupted".
+fn wait_core(ctx: &HleContext, sem: u64, deadline: Option<std::time::SystemTime>) -> u64 {
+    match acquire(ctx, sem, deadline) {
+        Acquire::Ok => OK,
+        Acquire::Interrupted => fail(ctx, EINTR),
+        Acquire::TimedOut => fail(ctx, ETIMEDOUT),
+        Acquire::Invalid => fail(ctx, EINVAL),
     }
 }
 
@@ -349,5 +464,55 @@ mod tests {
                 "libScePosix::{name} must be registered"
             );
         }
+    }
+
+    #[test]
+    fn pthread_sem_family_registered_under_libkernel() {
+        let registry = HleRegistry::new();
+        for name in [
+            "scePthreadSemInit",
+            "scePthreadSemWait",
+            "scePthreadSemTrywait",
+            "scePthreadSemPost",
+            "scePthreadSemDestroy",
+        ] {
+            assert!(
+                registry.is_implemented("libkernel", name),
+                "libkernel::{name} must be registered"
+            );
+        }
+    }
+
+    #[test]
+    fn pthread_sem_uses_sce_return_convention_and_private_flag_check() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let sem = 0x260u64;
+        // Non-private (flag != 0) is rejected with the SCE invalid-argument code.
+        assert_eq!(hle_pthread_sem_init(&ctx, &[sem, 1, 0, 0]), SCE_EINVAL);
+        // Private init, then post/wait share one object and return SCE codes.
+        assert_eq!(hle_pthread_sem_init(&ctx, &[sem, 0, 0, 0]), SCE_OK);
+        assert_eq!(hle_pthread_sem_trywait(&ctx, &[sem]), SCE_EAGAIN);
+        assert_eq!(hle_pthread_sem_post(&ctx, &[sem]), SCE_OK);
+        assert_eq!(hle_pthread_sem_trywait(&ctx, &[sem]), SCE_OK);
+        // Destroy removes state; a second destroy is EINVAL.
+        assert_eq!(hle_pthread_sem_destroy(&ctx, &[sem]), SCE_OK);
+        assert_eq!(hle_pthread_sem_destroy(&ctx, &[sem]), SCE_EINVAL);
+    }
+
+    #[test]
+    fn pthread_sem_and_posix_sem_share_one_object() {
+        // A title that inits with scePthreadSemInit and waits with sem_wait (or
+        // vice versa) must see the same counting semaphore — both key on the
+        // guest address in kernel.posix_semaphores.
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let sem = 0x270u64;
+        assert_eq!(hle_pthread_sem_init(&ctx, &[sem, 0, 1, 0]), SCE_OK);
+        // POSIX sem_wait consumes the count scePthreadSemInit seeded.
+        assert_eq!(hle_sem_wait(&ctx, &[sem]), OK);
+        // POSIX sem_post feeds a scePthreadSemWait.
+        assert_eq!(hle_sem_post(&ctx, &[sem]), OK);
+        assert_eq!(hle_pthread_sem_wait(&ctx, &[sem]), SCE_OK);
     }
 }

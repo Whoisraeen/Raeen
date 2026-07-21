@@ -27,6 +27,14 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadGetthreadid", hle_getthreadid);
     registry.register("libkernel", "scePthreadYield", hle_yield);
     registry.register("libkernel", "scePthreadRename", hle_rename);
+    // POSIX / GNU-extension spellings libKernel also exports under distinct NIDs.
+    // Shipped middleware compiled against POSIX/GNU headers links these, not the
+    // `scePthread*` forms — same one-active-thread semantics. Ported from
+    // SharpEmu `KernelPthreadCompatExports.cs`: `pthread_yield` (#426, 5d7d8e0,
+    // NID B5GmVDKwpn0 → `PthreadYield`) and `pthread_rename_np` (#450, 0c467e8,
+    // NID 9vyP6Z7bqzc → `PthreadRename`), each delegating to the `sce*` body.
+    registry.register("libkernel", "pthread_yield", hle_yield);
+    registry.register("libkernel", "pthread_rename_np", hle_rename);
     // Real priority bookkeeping: Setprio records, Getprio reads it back
     // (default: `PthreadAttr::default().sched_priority`). Supersedes the old
     // libkernel `hle_ok_stub` for Setprio, which silently dropped the value so
@@ -266,5 +274,21 @@ mod tests {
         assert_eq!(hle_yield(&ctx, &[]), OK);
         // Rename with a NULL name pointer is still accepted.
         assert_eq!(hle_rename(&ctx, &[CURRENT_THREAD, 0]), OK);
+    }
+
+    #[test]
+    fn posix_and_gnu_pthread_aliases_are_registered_under_libkernel() {
+        let registry = HleRegistry::new();
+        for name in [
+            "scePthreadYield",
+            "scePthreadRename",
+            "pthread_yield",
+            "pthread_rename_np",
+        ] {
+            assert!(
+                registry.is_implemented("libkernel", name),
+                "libkernel::{name} must be registered"
+            );
+        }
     }
 }

@@ -36,6 +36,17 @@ pub fn register(registry: &HleRegistry) {
         hle_register_callback,
     );
     registry.register("libSceNpManager", "sceNpUnregisterStateCallback", hle_ok);
+    // `sceNpRegisterNpReachabilityStateCallback(callback, userdata)`: accept the
+    // reachability callback and never invoke it. Reachability transitions only
+    // fire on a real PSN connection, which an offline session does not have, so
+    // registering successfully and staying silent is the accurate emulation of a
+    // signed-out console rather than a stub. SharpEmu `NpManagerExports.cs`
+    // (#450, 0c467e8).
+    registry.register(
+        "libSceNpManager",
+        "sceNpRegisterNpReachabilityStateCallback",
+        hle_ok,
+    );
     registry.register("libSceNpManager", "sceNpSetNpTitleId", hle_ok);
     registry.register("libSceNpManager", "sceNpGetOnlineId", hle_get_online_id);
     registry.register(

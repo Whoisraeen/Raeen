@@ -1756,6 +1756,15 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "sceKernelGettimeofday", hle_gettimeofday);
     registry.register("libkernel", "sceKernelClockGettime", hle_clock_gettime);
     registry.register("libkernel", "sceKernelClockGetres", hle_clock_getres);
+    // POSIX `clock_getres(clockId, timespec *res)` — libKernel exports it under a
+    // distinct NID and shipped middleware links the plain name (SharpEmu #450,
+    // 0c467e8, `smIj7eqzZE8`; DOOM's party.prx blocked on it). Same 1 ns domain
+    // as `sceKernelClockGetres`, but a NULL `res` is accepted per POSIX.
+    registry.register("libkernel", "clock_getres", hle_clock_getres_posix);
+    // POSIX `getpagesize()` — reports the 16 KiB Orbis page, not the host 4 KiB
+    // (SharpEmu #450). An allocator rounding to the host value produces sub-page
+    // offsets every mapping call here rejects for misalignment.
+    registry.register("libkernel", "getpagesize", hle_getpagesize);
     registry.register(
         "libkernel",
         "sceKernelGetTscFrequency",
@@ -3795,6 +3804,28 @@ fn hle_clock_getres(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
+/// POSIX `clock_getres(clockId, struct timespec *res)`: the plain-named alias
+/// of [`hle_clock_getres`]. libKernel exports the same routine under two NIDs
+/// (SharpEmu #450, `smIj7eqzZE8`). Identical 1 ns resolution, but POSIX permits
+/// a NULL `res` (the caller only wants to validate the clock id), which is
+/// accepted as a success rather than faulting.
+fn hle_clock_getres_posix(ctx: &HleContext, args: &[u64]) -> u64 {
+    let res = args.get(1).copied().unwrap_or(0);
+    if res == 0 {
+        return SCE_OK;
+    }
+    hle_clock_getres(ctx, args)
+}
+
+/// POSIX `getpagesize()`: the guest page granularity. Reports the PS5's 16 KiB
+/// `OrbisPageSize`, the granularity every mapping call in this HLE aligns
+/// against — NOT the host's 4 KiB (SharpEmu #450). An allocator that rounded to
+/// the host value would produce sub-page offsets that `mmap`/`mprotect` reject
+/// for misalignment.
+fn hle_getpagesize(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    xps5x_core::PS5_PAGE_SIZE as u64
+}
+
 /// Frequency (Hz) of the process-time counter XPS5X exposes: a nanosecond
 /// domain, so `GetProcessTimeCounter` returns elapsed nanoseconds and
 /// `GetProcessTimeCounterFrequency` returns `1_000_000_000`.
@@ -4832,6 +4863,37 @@ mod tests {
             hle_clock_gettime(&ctx, &[0, 0xDEAD_0000]),
             SCE_KERNEL_ERROR_EFAULT
         );
+    }
+
+    /// POSIX `clock_getres` (plain-named alias) tolerates a NULL `res` per POSIX,
+    /// writes the 1 ns resolution otherwise, and `getpagesize` reports the 16 KiB
+    /// Orbis page — both SharpEmu #450 exports registered under libkernel.
+    #[test]
+    fn posix_clock_getres_and_getpagesize() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // NULL res is a POSIX-legal success (unlike the faulting sce* form).
+        assert_eq!(hle_clock_getres_posix(&ctx, &[CLOCK_MONOTONIC, 0]), SCE_OK);
+        // A real out-pointer receives {tv_sec=0, tv_nsec=1}.
+        assert_eq!(
+            hle_clock_getres_posix(&ctx, &[CLOCK_MONOTONIC, 0x100]),
+            SCE_OK
+        );
+        let mut ts = [0u8; 16];
+        assert!(mem.read(0x100, &mut ts));
+        assert_eq!(i64::from_le_bytes(ts[0..8].try_into().unwrap()), 0);
+        assert_eq!(i64::from_le_bytes(ts[8..16].try_into().unwrap()), 1);
+
+        // getpagesize reports the 16 KiB Orbis page, not the host 4 KiB.
+        assert_eq!(hle_getpagesize(&ctx, &[]), xps5x_core::PS5_PAGE_SIZE as u64);
+        assert_eq!(hle_getpagesize(&ctx, &[]), 0x4000);
+
+        let registry = HleRegistry::new();
+        assert!(registry.is_implemented("libkernel", "clock_getres"));
+        assert!(registry.is_implemented("libkernel", "getpagesize"));
     }
 
     /// Real VFS-backed file I/O: a homebrew opens a file under /app0,

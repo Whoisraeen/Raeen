@@ -47,6 +47,11 @@ pub fn register(registry: &HleRegistry) {
         "sceAppContentTemporaryDataGetAvailableSpaceKb",
         hle_temporary_data_available_space,
     );
+    registry.register(
+        "libSceAppContent",
+        "sceAppContentDownloadDataGetAvailableSpaceKb",
+        hle_download_data_available_space,
+    );
 }
 
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
@@ -128,10 +133,58 @@ fn hle_temporary_data_available_space(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
+/// `sceAppContentDownloadDataGetAvailableSpaceKb(mountPoint, uint64_t
+/// *availableSpaceKb)`: download data is not emulated as a real quota, so report
+/// a comfortable fixed 1 GiB of free space and let titles skip the "storage
+/// full" path. SharpEmu `AppContentExports.cs` (#398, 2ced3af) writes the size
+/// through `rsi` (the second argument) and returns OK; a null out-pointer is a
+/// parameter error.
+fn hle_download_data_available_space(ctx: &HleContext, args: &[u64]) -> u64 {
+    const DOWNLOAD_QUOTA_KIB: u64 = 1024 * 1024; // 1 GiB
+
+    let available_out = args.get(1).copied().unwrap_or(0);
+    debug!("sceAppContentDownloadDataGetAvailableSpaceKb(out={available_out:#x})");
+    if available_out == 0 {
+        return ERROR_PARAMETER;
+    }
+    if !ctx
+        .mem
+        .write(available_out, &DOWNLOAD_QUOTA_KIB.to_le_bytes())
+    {
+        return ERROR_PARAMETER;
+    }
+    SCE_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{GuestMemory, test_ctx};
+
+    #[test]
+    fn download_data_reports_a_fixed_gib_and_rejects_null() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // args: rdi=mountPoint (ignored), rsi=out availableSpaceKb.
+        assert_eq!(
+            hle_download_data_available_space(&ctx, &[0x10, 0x40]),
+            SCE_OK
+        );
+        let mut b = [0u8; 8];
+        assert!(mem.read(0x40, &mut b));
+        assert_eq!(u64::from_le_bytes(b), 1024 * 1024);
+        assert_eq!(
+            hle_download_data_available_space(&ctx, &[0x10, 0]),
+            ERROR_PARAMETER
+        );
+        let registry = HleRegistry::new();
+        assert!(registry.is_implemented(
+            "libSceAppContent",
+            "sceAppContentDownloadDataGetAvailableSpaceKb"
+        ));
+    }
 
     #[test]
     fn sku_flag_reports_full_game_and_no_dlc() {

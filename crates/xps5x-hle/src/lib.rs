@@ -35,6 +35,7 @@ pub mod libsce_ampr;
 pub mod libsce_app_content;
 pub mod libsce_audio_out;
 pub mod libsce_audio_out2;
+pub mod libsce_audio_propagation;
 pub mod libsce_common_dialog;
 pub mod libsce_content_export;
 pub mod libsce_coredump;
@@ -648,6 +649,7 @@ impl HleRegistry {
         libsce_http::register(&registry);
         libsce_ssl::register(&registry);
         libsce_audio_out2::register(&registry);
+        libsce_audio_propagation::register(&registry);
         libsce_coredump::register(&registry);
         libsce_share::register(&registry);
 
