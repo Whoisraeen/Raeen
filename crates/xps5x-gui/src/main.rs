@@ -64,6 +64,19 @@ fn report_fault_site(
 }
 
 fn main() -> anyhow::Result<()> {
+    // FIRST, before anything else in the process allocates: claim the guest
+    // title fixed-VA window. Retail titles map direct memory at literal
+    // addresses (ASTRO.BOT: its libc mspace at 0x3_0000_0000) and write to that
+    // address regardless of the call's result. Measured 2026-07-21: launched
+    // from the Shell the map failed and the title faulted at libc.prx+0x103c6,
+    // while the SAME build booted fine via `--run-eboot` — because the GUI
+    // process had seconds of eframe/egui/wgpu/Vulkan allocations squatting the
+    // window before launch, and the CLI process was clean there by luck.
+    // Reserving here — before logging, before eframe, before Vulkan — makes the
+    // window deterministically the guest's in BOTH paths (this `main` is also
+    // the CLI entry). The report is logged below once logging exists.
+    let title_va = xps5x_runtime::reserve_title_va_window();
+
     // Initialize logging to BOTH stderr and `logs/xps5x.log`. `_log` must stay
     // alive for the whole process — dropping it shuts down the background
     // writer thread and loses buffered events (see `LogGuard`). Binding it here
@@ -82,6 +95,23 @@ fn main() -> anyhow::Result<()> {
             guard
         }
     };
+
+    // Now that logging exists, say what the startup reservation achieved. A
+    // squatter here means something allocated before `main` (a static
+    // initializer, the loader) — each one is address space a guest fixed map
+    // can no longer be served at, so it is worth a warning per region.
+    info!(
+        window = format_args!("{:#x}..{:#x}", title_va.window_start, title_va.window_end),
+        blocks = title_va.reserved_blocks,
+        reserved_bytes = format_args!("{:#x}", title_va.reserved_bytes),
+        "guest title-VA window claimed at startup"
+    );
+    for squatter in &title_va.squatters {
+        tracing::warn!(
+            region = %squatter,
+            "host allocation was already inside the guest title-VA window before main()"
+        );
+    }
 
     // Diagnostic: `xps5x --firmware-info <PUP>` inspects a firmware package
     // and exits without launching the GUI. It never decrypts anything.
@@ -690,6 +720,101 @@ fn main() -> anyhow::Result<()> {
                 .map(|s| {
                     format!(
                         "{}  {:#018x}  {lib}  {}",
+                        xps5x_firmware::dynlib::nid::encode_nid(s.nid),
+                        s.nid,
+                        xps5x_firmware::dynlib::nid_names::describe(s.nid),
+                    )
+                })
+                .collect();
+            rows.sort();
+            for r in rows {
+                println!("{r}");
+            }
+        }
+        return Ok(());
+    }
+
+    // Diagnostic: `xps5x --imports <eboot|sprx> [library-substring]` prints the
+    // module's FULL import table grouped by importing library — resolved and
+    // unresolved alike — unlike `--missing-nids`, which shows only what the HLE
+    // registry lacks. The optional filter is a case-insensitive substring match
+    // on the library name (e.g. `agc`, `videoout`). This is what answers "which
+    // graphics API surface does this title actually call?" for a title whose
+    // AGC imports are already implemented and therefore invisible to
+    // --missing-nids.
+    if let Some(pos) = args.iter().position(|a| a == "--imports") {
+        let path = args
+            .get(pos + 1)
+            .ok_or_else(|| anyhow::anyhow!("--imports requires a path to an eboot/.sprx"))?;
+        let filter = args.get(pos + 2).map(|s| s.to_ascii_lowercase());
+        let bytes = std::fs::read(path)?;
+        let decrypted = xps5x_firmware::decrypt_self(&bytes, &xps5x_firmware::NoKeysProvider)?;
+        let module = xps5x_firmware::parse_sprx(&decrypted.elf)?;
+        let dyn_tags = match &module.dynamic {
+            Some(d) => xps5x_firmware::dynlib::parse_sce_dynamic(d)?,
+            None => Vec::new(),
+        };
+        let standard = xps5x_firmware::dynlib::standard_dynamic_view(&module.segments, &dyn_tags);
+        let dynlib_data = match &standard {
+            Some((image, tags)) => xps5x_firmware::dynlib::parse_dynlibdata(image, tags)?,
+            None => xps5x_firmware::dynlib::parse_dynlibdata(
+                module.dynlib_data.as_deref().unwrap_or(&[]),
+                &dyn_tags,
+            )?,
+        };
+        let hle = std::sync::Arc::new(xps5x_hle::HleRegistry::new());
+        let db = xps5x_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
+
+        use std::collections::BTreeMap;
+        let lib_names: std::collections::HashMap<u16, &str> = dynlib_data
+            .import_libs
+            .iter()
+            .map(|(i, n)| (*i, n.as_str()))
+            .collect();
+        let mut by_lib: BTreeMap<&str, Vec<&xps5x_firmware::dynlib::SymbolRef>> = BTreeMap::new();
+        for import in &dynlib_data.imports {
+            let lib = lib_names
+                .get(&import.library_index)
+                .copied()
+                .unwrap_or("<unknown library>");
+            if let Some(f) = &filter
+                && !lib.to_ascii_lowercase().contains(f.as_str())
+            {
+                continue;
+            }
+            by_lib.entry(lib).or_default().push(import);
+        }
+        println!(
+            "# {}: {} import(s) across {} librar(ies){}",
+            module.name,
+            by_lib.values().map(Vec::len).sum::<usize>(),
+            by_lib.len(),
+            filter
+                .as_deref()
+                .map(|f| format!(" (filter: {f})"))
+                .unwrap_or_default(),
+        );
+        for (lib, imports) in by_lib {
+            let hle_count = imports
+                .iter()
+                .filter(|s| db.resolve_for_provider(lib, s.nid).is_some())
+                .count();
+            println!(
+                "\n## {lib}  ({} imports, {hle_count} HLE-resolved)",
+                imports.len()
+            );
+            let mut rows: Vec<String> = imports
+                .iter()
+                .map(|s| {
+                    let status = if db.resolve_for_provider(lib, s.nid).is_some() {
+                        "HLE "
+                    } else if db.resolve(s.nid).is_some() {
+                        "HLE(other-lib) "
+                    } else {
+                        "MISSING "
+                    };
+                    format!(
+                        "{status}{}  {:#018x}  {}",
                         xps5x_firmware::dynlib::nid::encode_nid(s.nid),
                         s.nid,
                         xps5x_firmware::dynlib::nid_names::describe(s.nid),

@@ -155,6 +155,48 @@ fn warn_if_deprecated_skip_main_init_set() {
 /// only [`arena::GuestArena`]'s reservation mechanism is Windows-specific.
 pub const GUEST_ARENA_BASE: u64 = 0x0000_1000_0000_0000;
 
+/// What [`reserve_title_va_window`] claimed at process startup, for the caller
+/// to log once logging exists (the call itself runs *before* logging setup —
+/// even a tracing subscriber allocates, and beating every host allocation is
+/// the whole point).
+#[derive(Debug, Clone, Default)]
+pub struct TitleVaWindowReport {
+    /// Inclusive start of the defended window.
+    pub window_start: u64,
+    /// Exclusive end of the defended window.
+    pub window_end: u64,
+    /// How many disjoint free holes were claimed as `MEM_RESERVE` blocks.
+    pub reserved_blocks: usize,
+    /// Total bytes of address space now reserved for guest fixed-address maps.
+    pub reserved_bytes: u64,
+    /// Human-readable descriptions of host regions that were ALREADY inside
+    /// the window when the reservation ran — each one is address space a guest
+    /// fixed map can no longer be served at. Empty when the call ran early
+    /// enough, which is the invariant the Shell maintains.
+    pub squatters: Vec<String>,
+}
+
+/// Claim the guest title fixed-VA window before the host process can allocate
+/// into it. See `arena::reserve_title_va_window` for the mechanism and the
+/// measured Shell-vs-CLI failure it closes. Idempotent; call it as the first
+/// statement of `main`.
+#[cfg(target_os = "windows")]
+pub use arena::reserve_title_va_window;
+
+/// Non-Windows: no native runtime, nothing to defend. Kept so callers
+/// (`xps5x-gui`'s `main`) stay `cfg`-free.
+#[cfg(not(target_os = "windows"))]
+pub fn reserve_title_va_window() -> &'static TitleVaWindowReport {
+    static EMPTY: TitleVaWindowReport = TitleVaWindowReport {
+        window_start: 0,
+        window_end: 0,
+        reserved_blocks: 0,
+        reserved_bytes: 0,
+        squatters: Vec::new(),
+    };
+    &EMPTY
+}
+
 /// The base of the static TLS **area** sitting immediately below `tcb`
 /// (variant-II x86-64: every module's block grows downward from the thread
 /// pointer), or `None` when nothing in the process has static TLS.

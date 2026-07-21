@@ -40,9 +40,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_FREE, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE,
-    PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
-    VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
+    MEM_COMMIT, MEM_DECOMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEM_RELEASE,
+    MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+    VirtualQuery,
 };
 
 use xps5x_hle::{GuestAccess, GuestAddress, GuestAllocator, GuestMemory, GuestRange};
@@ -104,6 +105,239 @@ const RESERVE_MIN: u64 = 0x0100_0000_0000; // 1 TiB — above USER_MAPPING_LIMIT
 
 /// Explicit Windows reservations must start on a 64 KiB boundary.
 const WINDOWS_ALLOCATION_GRANULARITY: u64 = 0x1_0000;
+
+/// The guest fixed-VA window retail titles map direct memory into by literal
+/// address, defended for the guest by a process-startup reservation.
+///
+/// A guest-requested `sceKernelMapNamedDirectMemory` address is not advisory:
+/// ASTRO.BOT's libc lays its mspace at `0x3_0000_0000` and writes to that
+/// literal address regardless of the call's result. Measured 2026-07-21
+/// (logs/xps5x.txt): launched from the SHELL the map failed —
+/// `cannot map len=0x79800000 at requested=0x300000000` — and the title
+/// faulted at libc.prx+0x103c6 writing `0x300000020`, while the SAME build
+/// booted the SAME title from the CLI (`--run-eboot`) repeatedly. The
+/// difference is who else lives in the process: the GUI had been running
+/// eframe/egui/wgpu/Vulkan for seconds before launch and host allocations had
+/// landed inside the window, so the fixed-address `VirtualAlloc` collided;
+/// the CLI process was clean there by luck, not by design.
+///
+/// [`reserve_title_va_window`] closes that race: called as the first statement
+/// of `main`, it `MEM_RESERVE`s every free hole in the window so no later host
+/// allocation can squat there, and [`GuestAllocator::map_at`] serves guest
+/// fixed maps out of those process-lifetime reservations with `MEM_COMMIT`
+/// alone. The window spans the full direct-memory size a title can map
+/// (`sceKernelGetDirectMemorySize` = `PS5_DIRECT_MEMORY_SIZE` = 0x3_5800_0000
+/// in `xps5x-hle`) from the measured mspace base, so any fixed map of any
+/// direct-memory slice based at `0x3_0000_0000` fits.
+const TITLE_VA_WINDOW_MIN: u64 = 0x3_0000_0000; // 12 GiB — ASTRO.BOT's mspace base
+const TITLE_VA_WINDOW_LIMIT: u64 = TITLE_VA_WINDOW_MIN + 0x3_5800_0000;
+
+/// The process-lifetime claim on [`TITLE_VA_WINDOW_MIN`]`..`[`TITLE_VA_WINDOW_LIMIT`]:
+/// each entry is one whole `MEM_RESERVE` block covering one free hole
+/// (disjoint, address-ordered). Never released — the window must stay claimed
+/// for as long as the process can launch a title. Committed pages inside the
+/// blocks are per-arena and are decommitted by `GuestArena::drop`.
+struct TitleVaWindow {
+    blocks: Vec<(u64, u64)>,
+    report: crate::TitleVaWindowReport,
+}
+
+static TITLE_VA_WINDOW: std::sync::OnceLock<TitleVaWindow> = std::sync::OnceLock::new();
+
+/// Claim every free hole of the title fixed-VA window for the guest. Idempotent
+/// and cheap after the first call. Returns what was claimed and what was
+/// already lost so the caller can log it once logging exists.
+pub fn reserve_title_va_window() -> &'static crate::TitleVaWindowReport {
+    &TITLE_VA_WINDOW.get_or_init(claim_title_va_window).report
+}
+
+/// The blocks claimed at startup, or empty if [`reserve_title_va_window`] has
+/// not run (CLI paths that never claimed the window keep their pre-existing
+/// direct `MEM_RESERVE` behaviour).
+fn title_va_blocks() -> &'static [(u64, u64)] {
+    TITLE_VA_WINDOW
+        .get()
+        .map(|w| w.blocks.as_slice())
+        .unwrap_or(&[])
+}
+
+/// The startup block containing `addr`, if any.
+fn title_va_block_containing(addr: u64) -> Option<(u64, u64)> {
+    title_va_blocks()
+        .iter()
+        .copied()
+        .find(|&(base, len)| addr >= base && addr < base + len)
+}
+
+/// The nearest startup-block edge (a block's start or end) strictly above
+/// `addr`, or `u64::MAX` when none. `map_at`'s segment walk clamps to this so
+/// no single `VirtualAlloc` action ever straddles the boundary between address
+/// space we already reserved (commit-only) and address space we did not.
+fn next_title_va_edge(addr: u64) -> u64 {
+    let mut edge = u64::MAX;
+    for &(base, len) in title_va_blocks() {
+        for e in [base, base + len] {
+            if e > addr && e < edge {
+                edge = e;
+            }
+        }
+    }
+    edge
+}
+
+fn claim_title_va_window() -> TitleVaWindow {
+    let mut blocks = Vec::new();
+    let mut squatters = Vec::new();
+    let mut reserved_bytes = 0u64;
+    let mut cursor = TITLE_VA_WINDOW_MIN;
+    while cursor < TITLE_VA_WINDOW_LIMIT {
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `VirtualQuery` only inspects the region containing `cursor`;
+        // `info` is a valid, correctly sized out-buffer.
+        let queried = unsafe {
+            VirtualQuery(
+                cursor as *const c_void,
+                &mut info,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if queried == 0 {
+            break;
+        }
+        let region_base = info.BaseAddress as u64;
+        let Some(region_end) = region_base.checked_add(info.RegionSize as u64) else {
+            break;
+        };
+        let usable_end = region_end.min(TITLE_VA_WINDOW_LIMIT);
+        if info.State == MEM_FREE {
+            if let Some(candidate) =
+                align_up(cursor.max(region_base), WINDOWS_ALLOCATION_GRANULARITY)
+                && candidate < usable_end
+            {
+                let len = usable_end - candidate;
+                // SAFETY: Windows just reported `[candidate, usable_end)` free
+                // and `candidate` has allocation-granularity alignment; an
+                // explicit `MEM_RESERVE` either lands there or returns null.
+                // The block is process-lifetime by design (never released), so
+                // no ownership record beyond `TITLE_VA_WINDOW` is needed.
+                let raw = unsafe {
+                    VirtualAlloc(
+                        candidate as *const c_void,
+                        len as usize,
+                        MEM_RESERVE,
+                        PAGE_NOACCESS,
+                    )
+                };
+                if !raw.is_null() && raw as u64 == candidate {
+                    blocks.push((candidate, len));
+                    reserved_bytes += len;
+                } else if !raw.is_null() {
+                    // Defensive only: explicit VirtualAlloc does not relocate.
+                    // SAFETY: `raw` is a fresh, unpublished reservation.
+                    unsafe {
+                        VirtualFree(raw, 0, MEM_RELEASE);
+                    }
+                }
+            }
+        } else {
+            squatters.push(describe_host_region(
+                cursor.max(region_base),
+                usable_end,
+                &info,
+            ));
+        }
+        let next = region_end.max(cursor.saturating_add(1));
+        if next <= cursor {
+            break;
+        }
+        cursor = next;
+    }
+    TitleVaWindow {
+        report: crate::TitleVaWindowReport {
+            window_start: TITLE_VA_WINDOW_MIN,
+            window_end: TITLE_VA_WINDOW_LIMIT,
+            reserved_blocks: blocks.len(),
+            reserved_bytes,
+            squatters,
+        },
+        blocks,
+    }
+}
+
+/// One host region as a human-readable line: range, state, backing type, and
+/// the owning module when the loader knows it (DLL/EXE images). Private
+/// allocations cannot be attributed to their allocator, but state+type alone
+/// already separates "a DLL landed here" from "the heap/driver grabbed it".
+fn describe_host_region(start: u64, end: u64, info: &MEMORY_BASIC_INFORMATION) -> String {
+    let state = match info.State {
+        MEM_FREE => "free",
+        MEM_COMMIT => "committed",
+        MEM_RESERVE => "reserved",
+        _ => "unknown-state",
+    };
+    let kind = if info.State == MEM_FREE {
+        ""
+    } else {
+        match info.Type {
+            MEM_IMAGE => " image",
+            MEM_MAPPED => " mapped",
+            MEM_PRIVATE => " private",
+            _ => "",
+        }
+    };
+    let owner = if info.State == MEM_FREE {
+        String::new()
+    } else {
+        crate::thread::host_module_for_addr(info.AllocationBase as u64)
+            .map(|module| format!(" owner={module}"))
+            .unwrap_or_default()
+    };
+    format!("{start:#x}..{end:#x} {state}{kind}{owner}")
+}
+
+/// One-shot diagnostic for a failed guest fixed-address map: survey the
+/// requested range with `VirtualQuery` and log every region with its state,
+/// backing type, and owner where diagnosable. This is the log line that makes
+/// the Shell-vs-CLI collision class self-explaining — a bare "cannot map"
+/// cannot distinguish a host DLL squatting the address from commit exhaustion
+/// or a guest double-map.
+fn diagnose_fixed_map_failure(addr: u64, end: u64, failed_at: u64) {
+    tracing::warn!(
+        requested = format_args!("{addr:#x}..{end:#x}"),
+        failed_at = format_args!("{failed_at:#x}"),
+        title_window_reserved = !title_va_blocks().is_empty(),
+        "guest fixed-address map failed; host regions in the requested range:"
+    );
+    let mut cursor = addr;
+    while cursor < end {
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `VirtualQuery` only inspects the region containing `cursor`;
+        // `info` is a valid, correctly sized out-buffer.
+        let queried = unsafe {
+            VirtualQuery(
+                cursor as *const c_void,
+                &mut info,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if queried == 0 {
+            break;
+        }
+        let region_base = info.BaseAddress as u64;
+        let Some(region_end) = region_base.checked_add(info.RegionSize as u64) else {
+            break;
+        };
+        tracing::warn!(
+            "  {}",
+            describe_host_region(cursor.max(region_base), region_end.min(end), &info)
+        );
+        let next = region_end.max(cursor.saturating_add(1));
+        if next <= cursor {
+            break;
+        }
+        cursor = next;
+    }
+}
 
 /// Diagnostic names for the ranges the arena hands out. Titles read the `name`
 /// of a mapping back through the Named* map calls, and a name also keeps two
@@ -390,6 +624,13 @@ struct AllocState {
     /// Fully committed mappings created as independent Windows reservations
     /// outside the fixed arena, keyed by their exact `MEM_RELEASE` base.
     external_mappings: HashMap<u64, u64>,
+    /// Ranges this arena committed (or served demand-committed) inside the
+    /// process-lifetime title-VA window blocks ([`TITLE_VA_WINDOW`]). The
+    /// blocks themselves are never released, so `Drop` must `MEM_DECOMMIT`
+    /// these explicitly — otherwise a relaunch in the same Shell process would
+    /// read the previous title's bytes where fresh zero pages belong, and the
+    /// RAM would stay charged for the life of the process.
+    window_commits: Vec<(u64, u64)>,
     /// Avoid repeating the heap-growth notice for every allocation after the
     /// fixed 1 GiB fast path fills.
     sparse_heap_announced: bool,
@@ -459,6 +700,7 @@ impl AllocState {
             heap_sizes: HashMap::new(),
             os_reservations: Vec::new(),
             external_mappings: HashMap::new(),
+            window_commits: Vec::new(),
             sparse_heap_announced: false,
             demand_commit_announced: false,
         }
@@ -1080,6 +1322,22 @@ impl GuestArena {
 
 impl Drop for GuestArena {
     fn drop(&mut self) {
+        // Pages this arena committed inside the process-lifetime title-VA
+        // window blocks: the blocks are never released, so this memory is not
+        // covered by any `MEM_RELEASE` below. Decommit it so a relaunch in the
+        // same Shell process starts from fresh zero pages (not the previous
+        // title's bytes) and the RAM goes back to the OS.
+        let window_commits = std::mem::take(&mut self.lock_state().window_commits);
+        for (addr, len) in window_commits {
+            // SAFETY: each range was recorded by `map_at` inside a
+            // `TITLE_VA_WINDOW` block, which lives for the whole process, so
+            // the reservation is still valid; `MEM_DECOMMIT` of a partially
+            // committed range inside one reservation is well-formed and leaves
+            // the reservation itself intact.
+            unsafe {
+                VirtualFree(addr as *mut c_void, len as usize, MEM_DECOMMIT);
+            }
+        }
         // Blocks taken from the OS outside this arena's own reservation are not
         // covered by releasing `base`, so they must go back individually or a
         // title's reservations would outlive every run that made them.
@@ -1752,22 +2010,41 @@ impl GuestAllocator for GuestArena {
         // both. Mixed ranges are handled segment-by-segment so an overlap can
         // preserve existing pages while extending into an unowned tail.
         let mut actions = Vec::new();
+        // Segments served out of the process-lifetime title-VA window blocks:
+        // recorded so `Drop` can decommit them (the blocks are never released,
+        // so releasing `base`/`os_reservations` does not return this memory).
+        let mut window_segments = Vec::new();
         let mut cursor = addr;
         while cursor < end {
             let vma = state.vmm.find(cursor)?;
-            let segment_end = vma.end().min(end);
+            // Never let one segment straddle a title-VA-window block edge:
+            // inside a block the address space is already ours (commit-only),
+            // outside it is not, and one VirtualAlloc action cannot mix the two.
+            let segment_end = vma.end().min(end).min(next_title_va_edge(cursor));
             let segment_len = segment_end.checked_sub(cursor)?;
+            // Startup claimed this address space for exactly this call: the
+            // map still calls it `Foreign` (nothing guest-visible lives there
+            // yet) or `Free` (a previous fixed map here was munmapped), but the
+            // host pages only need committing, and a fixed-address MEM_RESERVE
+            // would fail against our own block.
+            let in_title_window = title_va_block_containing(cursor)
+                .is_some_and(|(base, len)| segment_end <= base + len);
             if vma.kind.is_host_backed() {
                 // Preserve already-backed overlap byte-for-byte.
             } else if matches!(vma.kind, VmaType::Reserved)
+                || (in_title_window && (vma.kind.is_free() || vma.kind == VmaType::Foreign))
                 || (vma.kind.is_free()
                     && cursor >= self.base + ARENA_SPAN
                     && segment_end <= self.base + RESERVED_SPAN)
             {
                 actions.push((cursor, segment_len, MEM_COMMIT, false));
+                if in_title_window {
+                    window_segments.push((cursor, segment_len));
+                }
             } else if vma.kind == VmaType::Foreign {
                 actions.push((cursor, segment_len, MEM_RESERVE | MEM_COMMIT, true));
             } else {
+                diagnose_fixed_map_failure(addr, end, cursor);
                 return None;
             }
             cursor = segment_end;
@@ -1777,6 +2054,10 @@ impl GuestAllocator for GuestArena {
         // Newly reserved blocks are recorded only after every action succeeds,
         // so `Drop` cannot double-release partial work.
         let mut newly_reserved = Vec::new();
+        // Segments whose up-front commit the host refused (commit limit): kept
+        // reserved and served demand-committed instead of failing. Relabeled
+        // `Reserved` after the combined map so `commit_on_demand` backs them.
+        let mut demand_committed = Vec::new();
         for &(segment_addr, segment_len, flags, owns_reservation) in &actions {
             // SAFETY: the VMA walk proved this segment either belongs to one of
             // our reservations (`MEM_COMMIT`) or is wholly unowned
@@ -1790,31 +2071,90 @@ impl GuestAllocator for GuestArena {
                     PAGE_READWRITE,
                 )
             };
-            if raw.is_null() || raw as u64 != segment_addr {
-                if !raw.is_null() && owns_reservation {
-                    // SAFETY: this iteration just created `raw` as a complete
-                    // reservation and ownership has not been published.
+            if !raw.is_null() && raw as u64 == segment_addr {
+                if owns_reservation {
+                    newly_reserved.push((segment_addr, segment_len));
+                }
+                continue;
+            }
+
+            // The up-front commit was refused. Committing the whole segment
+            // charges it against the process commit limit (RAM + pagefile), and
+            // a title mapping GiB of direct memory at a fixed address exhausts it
+            // exactly as the mmap path does — ASTRO.BOT's 1.94 GiB libc mspace at
+            // 0x300000000 faults here the moment the machine is under commit
+            // pressure. Failing is the wrong answer when only *commit*, not the
+            // address space, is unavailable: degrade to the same demand-commit
+            // that `map_console_va` and `sceKernelReserveVirtualRange` already
+            // run. Reserve the address space (when we do not own it yet), record
+            // the span `Reserved`, and let `commit_on_demand` back each page from
+            // the fault handler as the guest reaches it.
+            if owns_reservation {
+                // A combined RESERVE|COMMIT never half-succeeds, but a stray
+                // misplacement must still be released before we retry.
+                if !raw.is_null() {
+                    // SAFETY: this iteration's own fresh, unpublished mapping.
                     unsafe {
                         VirtualFree(raw, 0, MEM_RELEASE);
                     }
                 }
-                for &(base, _) in &newly_reserved {
-                    // SAFETY: each entry is a complete reservation created by
-                    // an earlier iteration and not yet stored in arena state.
-                    unsafe {
-                        VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+                // MEM_RESERVE charges address space, not commit, so it clears the
+                // commit limit that just refused the combined call. If the
+                // address itself is unavailable it fails and nothing can back it.
+                // SAFETY: `segment_addr`/`segment_len` are page aligned and, by
+                // the VMA walk, name wholly unowned space.
+                let reserved = unsafe {
+                    VirtualAlloc(
+                        segment_addr as *const c_void,
+                        segment_len as usize,
+                        MEM_RESERVE,
+                        PAGE_READWRITE,
+                    )
+                };
+                if reserved.is_null() || reserved as u64 != segment_addr {
+                    if !reserved.is_null() {
+                        // SAFETY: fresh, unpublished reservation from just above.
+                        unsafe {
+                            VirtualFree(reserved, 0, MEM_RELEASE);
+                        }
                     }
+                    for &(base, _) in &newly_reserved {
+                        // SAFETY: each entry is a complete reservation created by
+                        // an earlier iteration and not yet stored in arena state.
+                        unsafe {
+                            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+                        }
+                    }
+                    for &(w_addr, w_len) in &window_segments {
+                        // SAFETY: each entry lies inside a process-lifetime
+                        // title-VA-window block; decommitting undoes any pages
+                        // an earlier iteration committed there (a no-op on the
+                        // still-uncommitted ones) without touching the block.
+                        unsafe {
+                            VirtualFree(w_addr as *mut c_void, w_len as usize, MEM_DECOMMIT);
+                        }
+                    }
+                    // Say WHO owns the address: this is the Shell-vs-CLI
+                    // divergence class (a host allocation squatting a guest
+                    // fixed address) making itself legible in the log.
+                    diagnose_fixed_map_failure(addr, end, segment_addr);
+                    return None;
                 }
-                return None;
-            }
-            if owns_reservation {
                 newly_reserved.push((segment_addr, segment_len));
             }
+            // A segment we already own (`!owns_reservation`) needs no OS call:
+            // leaving its existing reservation uncommitted is precisely the
+            // demand-commit state the fault handler expects.
+            demand_committed.push((segment_addr, segment_len));
         }
         for (base, size) in newly_reserved {
             state.os_reservations.push(base);
             state.external_mappings.insert(base, size);
         }
+        // Window segments are not `os_reservations` (the block is process-
+        // lifetime, not this arena's to release); they are remembered so `Drop`
+        // can decommit their pages instead.
+        state.window_commits.extend(window_segments);
         state.vmm.map_range(
             addr,
             length,
@@ -1824,6 +2164,28 @@ impl GuestAllocator for GuestArena {
             MMAP_NAME,
             false,
         );
+        // Relabel any demand-committed segment `Reserved` so `commit_on_demand`
+        // recognises it and backs it per-page; the combined map above already
+        // published the committed and already-backed segments as host memory.
+        if !demand_committed.is_empty() {
+            for &(segment_addr, segment_len) in &demand_committed {
+                state.vmm.map_range(
+                    segment_addr,
+                    segment_len,
+                    VmaType::Reserved,
+                    prot::NO_ACCESS,
+                    None,
+                    MMAP_NAME,
+                    false,
+                );
+            }
+            tracing::warn!(
+                addr = format_args!("{addr:#x}"),
+                len = format_args!("{length:#x}"),
+                segments = demand_committed.len(),
+                "map_at: commit refused; serving the range demand-committed"
+            );
+        }
         Some(addr)
     }
 
@@ -2275,6 +2637,166 @@ mod tests {
         assert!(arena.write(base + 0x1f_ffff, &[0xCD]));
         assert!(arena.read(base + 0x1f_ffff, &mut byte));
         assert_eq!(byte, [0xCD], "the newly extended tail must be backed");
+    }
+
+    /// ASTRO.BOT's opening move is a fixed-address direct-memory map: its libc
+    /// mspace at 0x300000000, 1.94 GiB. Committing that whole span up front
+    /// charges the host commit limit (RAM + pagefile), and under pressure the
+    /// commit is refused — the guest then wrote to 0x300000020 and faulted
+    /// (measured, logs/xps5x.txt). `map_at` must serve the request either way:
+    /// commit up front when the machine has the headroom, or reserve and
+    /// demand-commit when it does not. Both outcomes leave the address the guest
+    /// asked for backed on first touch, so the exact faulting offset round-trips.
+    #[test]
+    fn map_at_serves_astro_bots_fixed_1_94_gib_direct_memory() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let base = 0x3_0000_0000u64; // ASTRO.BOT's libc mspace address
+        let len = 0x7980_0000u64; // 1.94 GiB, the measured opening request
+
+        assert_eq!(
+            arena.map_at(base, len, PAGE_SIZE),
+            Some(base),
+            "a fixed direct-memory map must never fail on commit pressure alone"
+        );
+
+        // The exact byte the guest faulted on in the log.
+        let mut byte = [0u8; 1];
+        assert!(
+            arena.write(base + 0x20, &[0xAB]),
+            "base+0x20 must be usable"
+        );
+        assert!(arena.read(base + 0x20, &mut byte));
+        assert_eq!(byte, [0xAB]);
+
+        // Deep inside the mapping stays reachable too — a lazily backed span
+        // must back any page the guest reaches, not only the first.
+        assert!(arena.write(base + len - 0x10, &[0xCD]));
+        assert!(arena.read(base + len - 0x10, &mut byte));
+        assert_eq!(byte, [0xCD]);
+    }
+
+    /// The Shell-vs-CLI wall, regression-proofed. Measured 2026-07-21
+    /// (logs/xps5x.txt): launched from the Shell, ASTRO.BOT's fixed-address
+    /// `sceKernelMapNamedDirectMemory` at 0x300000000 failed and the title
+    /// faulted, while the SAME build booted the SAME title from the CLI. In the
+    /// GUI process, host allocations (eframe/egui/wgpu/Vulkan, their DLLs) had
+    /// seconds to land inside the window before launch; the CLI process was
+    /// clean there by accident.
+    ///
+    /// The guarantee under test is the ORDER the Shell now enforces — reserve
+    /// the window first (first statement of `main`), let the host allocate
+    /// whatever it likes afterwards, then serve the guest's fixed map:
+    /// reserve → squat → map must succeed, and the window itself must refuse
+    /// the squat.
+    #[test]
+    fn title_va_window_reservation_defends_fixed_maps_from_host_squatters() {
+        let _lock = crate::dispatch::call_lock();
+
+        // 1. Reserve — exactly what `main` runs before anything else.
+        // Idempotent and process-global, like the real thing.
+        let report = reserve_title_va_window();
+        assert!(
+            report.reserved_blocks > 0,
+            "the test process should have free space in the window: {report:?}"
+        );
+
+        let len = 0x20_0000u64; // 2 MiB — a small direct-memory slice
+        // ASTRO.BOT's measured mspace base when the reservation covers it;
+        // otherwise the first claimed block that fits (a hostile test-process
+        // layout must not turn this into a false failure).
+        let target = title_va_block_containing(TITLE_VA_WINDOW_MIN)
+            .filter(|&(base, block_len)| base + block_len >= TITLE_VA_WINDOW_MIN + len)
+            .map(|_| TITLE_VA_WINDOW_MIN)
+            .or_else(|| {
+                title_va_blocks()
+                    .iter()
+                    .find(|&&(_, block_len)| block_len >= len)
+                    .map(|&(base, _)| base)
+            })
+            .expect("at least one claimed block should fit a 2 MiB map");
+
+        // 2. Squat — the host allocation the GUI would have made. OS-chosen,
+        // because after the reservation the window is simply not on offer.
+        // SAFETY: plain anonymous reservation+commit at an OS-chosen address,
+        // released at the end of the test.
+        let squatter = unsafe {
+            VirtualAlloc(
+                core::ptr::null(),
+                0x10_0000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!squatter.is_null(), "host allocation should succeed");
+        let squatter_addr = squatter as u64;
+        assert!(
+            !(TITLE_VA_WINDOW_MIN..TITLE_VA_WINDOW_LIMIT).contains(&squatter_addr),
+            "a post-reservation host allocation must not land in the window \
+             (got {squatter_addr:#x})"
+        );
+        // An explicit grab AT the defended address must be refused outright.
+        // SAFETY: a fixed-address MEM_RESERVE attempt; it must fail, and if it
+        // somehow succeeded the release below would undo it.
+        let steal = unsafe {
+            VirtualAlloc(
+                target as *const c_void,
+                WINDOWS_ALLOCATION_GRANULARITY as usize,
+                MEM_RESERVE,
+                PAGE_NOACCESS,
+            )
+        };
+        if !steal.is_null() {
+            // SAFETY: fresh reservation from just above.
+            unsafe {
+                VirtualFree(steal, 0, MEM_RELEASE);
+            }
+        }
+        assert!(
+            steal.is_null(),
+            "the startup reservation must already own {target:#x}"
+        );
+
+        // 3. The guest's fixed map succeeds and the memory is real.
+        {
+            let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+            assert_eq!(
+                arena.map_at(target, len, PAGE_SIZE),
+                Some(target),
+                "a fixed map inside the defended window must succeed even after \
+                 host allocations"
+            );
+            let mut byte = [0u8; 1];
+            assert!(arena.write(target + 0x20, &[0xAB]));
+            assert!(arena.read(target + 0x20, &mut byte));
+            assert_eq!(byte, [0xAB]);
+
+            // Relaunch-within-one-run pattern: unmap, then map the same
+            // address again — the range is now `Free` inside our block and
+            // must still be commit-only servable.
+            arena.munmap(target, len);
+            assert_eq!(
+                arena.map_at(target, len, PAGE_SIZE),
+                Some(target),
+                "remap after munmap must succeed inside the window"
+            );
+        }
+
+        // 4. Arena drop decommitted the window pages but kept the block
+        // claimed: a second arena (the next launch) maps the same address.
+        {
+            let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+            assert_eq!(
+                arena.map_at(target, len, PAGE_SIZE),
+                Some(target),
+                "the window must survive an arena teardown (next launch)"
+            );
+        }
+
+        // SAFETY: exact base of the squatter reservation made above.
+        unsafe {
+            VirtualFree(squatter, 0, MEM_RELEASE);
+        }
     }
 
     /// Host-side HLE/GPU copies must not retain an unpinned raw pointer after

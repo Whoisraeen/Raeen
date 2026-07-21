@@ -252,8 +252,18 @@ impl Shell {
                     tracing::info!(tag = %tag, staged = %staged.display(), "update staged — restart to apply");
                     self.updater_state = UpdaterState::Staged { tag, staged };
                 }
-                UpdaterEvent::CheckFailed(err) | UpdaterEvent::DownloadFailed(err) => {
-                    tracing::warn!(error = %err, "updater failed");
+                UpdaterEvent::CheckFailed(err) => {
+                    // A background update check that fails is benign: the project
+                    // may have no published release yet (GitHub 404), or the host
+                    // may be offline. The state is surfaced in the UI already, so
+                    // logging it as a WARN on every launch is pure noise.
+                    tracing::debug!(error = %err, "update check failed (non-fatal)");
+                    self.updater_state = UpdaterState::Error(err);
+                }
+                UpdaterEvent::DownloadFailed(err) => {
+                    // A download the user asked for that then failed is worth a
+                    // warning — the intent was explicit.
+                    tracing::warn!(error = %err, "update download failed");
                     self.updater_state = UpdaterState::Error(err);
                 }
             }
