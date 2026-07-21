@@ -6,11 +6,11 @@
 //! the user's master volume / enable from Settings ▸ Audio ([`set_volume`] /
 //! [`set_enabled`]).
 //!
-//! Sample-rate matching is best-effort: the stream is opened at the guest's
-//! 48 kHz when the device supports it (so no resampling is needed), otherwise at
-//! the device default (with a small possible pitch drift, logged once). A
-//! missing output device, or a device that won't do f32, is never fatal — audio
-//! just stays silent.
+//! Sample-rate matching: the stream opens at the guest's 48 kHz when the device
+//! supports it (no resampling needed), otherwise at the device default, and
+//! [`submit`] linearly resamples the guest audio to that rate so playback is
+//! pitch-correct on 44.1 kHz devices. A missing output device, or one that won't
+//! do f32, is never fatal — audio just stays silent.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -27,10 +27,29 @@ static RING: OnceLock<Ring> = OnceLock::new();
 /// inaudible). `0` bits (== `0.0`) until [`init`] or [`set_volume`] sets it.
 static VOLUME_BITS: AtomicU32 = AtomicU32::new(0);
 static ENABLED: AtomicBool = AtomicBool::new(true);
+/// The host device's actual output sample rate, set once when the stream is
+/// built (`0` until then). Guest audio (usually 48 kHz) is resampled to this in
+/// [`submit`] so playback is pitch-correct on 44.1 kHz devices.
+static DEVICE_RATE: AtomicU32 = AtomicU32::new(0);
 
 /// ~250 ms of stereo at 48 kHz. Submissions beyond this drop the oldest
 /// samples, so a slow/stalled consumer can never grow memory without bound.
 const MAX_RING_SAMPLES: usize = 48_000 * 2 / 4;
+
+/// Streaming linear-resampler state (guest rate → device rate), carried across
+/// [`submit`] calls so the read phase is continuous and buffer boundaries stay
+/// click-free. `hist` is the previous buffer's last frame (virtual index −1).
+#[derive(Default)]
+struct Resampler {
+    src_rate: u32,
+    pos: f64,
+    hist: [f32; 2],
+}
+
+fn resampler() -> &'static Mutex<Resampler> {
+    static R: OnceLock<Mutex<Resampler>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(Resampler::default()))
+}
 
 /// Set the master volume, `0.0..=1.0` (clamped). Settings ▸ Audio ▸ Master
 /// Volume — takes effect immediately.
@@ -113,6 +132,7 @@ fn build_stream(ring: Ring) -> anyhow::Result<cpal::Stream> {
         None,
     ) {
         Ok(stream) => {
+            DEVICE_RATE.store(48_000, Ordering::Relaxed);
             info!("host audio output ready (48000 Hz, stereo)");
             Ok(stream)
         }
@@ -128,8 +148,9 @@ fn build_stream(ring: Ring) -> anyhow::Result<cpal::Stream> {
                 ));
             }
             let config: cpal::StreamConfig = supported.config();
+            DEVICE_RATE.store(rate, Ordering::Relaxed);
             info!(
-                "host audio output ready ({rate} Hz, {channels}ch; guest is 48000 Hz — minor pitch drift possible)"
+                "host audio output ready ({rate} Hz, {channels}ch; guest 48000 Hz resampled to match)"
             );
             let stream = device.build_output_stream(
                 &config,
@@ -163,24 +184,88 @@ fn fill(out: &mut [f32], out_channels: usize, ring: &Ring) {
     }
 }
 
-/// Submit interleaved-stereo f32 samples from the guest (already downmixed by
-/// the HLE). Drops the oldest samples if the consumer is behind so memory stays
+/// Submit interleaved-stereo f32 samples from the guest at `src_rate` Hz
+/// (already downmixed by the HLE). Resampled to the device's rate so playback
+/// is pitch-correct (e.g. guest 48 kHz on a 44.1 kHz device), then appended to
+/// the ring — dropping the oldest if the consumer is behind so memory stays
 /// bounded. A no-op until [`init`], or when muted.
-pub fn submit(samples: &[f32]) {
+pub fn submit(src_rate: u32, samples: &[f32]) {
     let Some(ring) = RING.get() else {
         return;
     };
     if !ENABLED.load(Ordering::Relaxed) {
         return;
     }
+    let dst_rate = DEVICE_RATE.load(Ordering::Relaxed);
+
+    // Resample guest→device before touching the ring, so the cpal callback is
+    // never blocked on it. Matching (or unknown) rates pass straight through.
+    let owned;
+    let frames: &[f32] = if src_rate == 0 || dst_rate == 0 || src_rate == dst_rate {
+        samples
+    } else {
+        let mut state = resampler()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        owned = resample_stereo(&mut state, src_rate, dst_rate, samples);
+        &owned
+    };
+
     let mut ring = ring
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    ring.extend(samples.iter().copied());
+    ring.extend(frames.iter().copied());
     if ring.len() > MAX_RING_SAMPLES {
         let excess = ring.len() - MAX_RING_SAMPLES;
         ring.drain(0..excess);
     }
+}
+
+/// Streaming linear resampler (interleaved stereo): convert `input` from
+/// `src_rate` to `dst_rate`, carrying the fractional read position and one frame
+/// of history in `state` so successive buffers join seamlessly (no boundary
+/// clicks). Linear interpolation is ample for the small 48k↔44.1k ratio here.
+fn resample_stereo(state: &mut Resampler, src_rate: u32, dst_rate: u32, input: &[f32]) -> Vec<f32> {
+    let n = input.len() / 2;
+    if n == 0 {
+        return Vec::new();
+    }
+    // A change of source rate (a new port config) restarts the phase.
+    if state.src_rate != src_rate {
+        state.src_rate = src_rate;
+        state.pos = 0.0;
+        state.hist = [0.0, 0.0];
+    }
+    let ratio = f64::from(src_rate) / f64::from(dst_rate); // input frames per output frame
+    let hist = state.hist;
+    // Virtual input frame `i`: −1 → the carried `hist`, 0..n-1 → `input`.
+    let frame = |i: isize| -> (f32, f32) {
+        if i < 0 {
+            (hist[0], hist[1])
+        } else {
+            let i = (i as usize).min(n - 1);
+            (input[i * 2], input[i * 2 + 1])
+        }
+    };
+    let mut out = Vec::with_capacity(((n as f64 / ratio) as usize + 2) * 2);
+    let mut pos = state.pos;
+    // Stop before `pos` would need the next buffer's first frame (index n); that
+    // output is produced next call, where this buffer's last frame is `hist`.
+    let limit = (n - 1) as f64;
+    while pos < limit {
+        let i0 = pos.floor() as isize;
+        let frac = (pos - i0 as f64) as f32;
+        let (l0, r0) = frame(i0);
+        let (l1, r1) = frame(i0 + 1);
+        out.push(l0 + (l1 - l0) * frac);
+        out.push(r0 + (r1 - r0) * frac);
+        pos += ratio;
+    }
+    // Carry this buffer's last frame as index −1 for the next call, and shift
+    // the read position into the next buffer's frame numbering.
+    state.hist = [input[(n - 1) * 2], input[(n - 1) * 2 + 1]];
+    state.pos = pos - n as f64;
+    out
 }
 
 #[cfg(test)]
@@ -190,7 +275,49 @@ mod tests {
     #[test]
     fn submit_before_init_is_a_silent_no_op() {
         // No stream/ring yet — must not panic or block.
-        submit(&[0.1, -0.1, 0.2, -0.2]);
+        submit(48_000, &[0.1, -0.1, 0.2, -0.2]);
+    }
+
+    /// A rising ramp downsampled 2:1 (48k→24k) yields ~half the frames and stays
+    /// non-decreasing — a resampling click would show as a dip.
+    #[test]
+    fn resample_downsample_halves_frames_and_stays_monotonic() {
+        let mut state = Resampler::default();
+        let n = 100;
+        let input: Vec<f32> = (0..n).flat_map(|i| [i as f32, i as f32]).collect();
+        let out = resample_stereo(&mut state, 48_000, 24_000, &input);
+        let out_frames = (out.len() / 2) as i32;
+        assert!(
+            (out_frames - n / 2).abs() <= 2,
+            "expected ~{} frames, got {out_frames}",
+            n / 2
+        );
+        let lefts: Vec<f32> = out.chunks_exact(2).map(|f| f[0]).collect();
+        for w in lefts.windows(2) {
+            assert!(w[1] >= w[0] - 1e-3, "ramp must not dip: {w:?}");
+        }
+    }
+
+    /// Two consecutive ramp buffers resampled with carried state must form one
+    /// continuous rising ramp across the boundary (no gap, no click).
+    #[test]
+    fn resample_two_buffers_join_seamlessly() {
+        let mut state = Resampler::default();
+        let buf = |start: f32| -> Vec<f32> {
+            (0..50)
+                .flat_map(|i| [start + i as f32, start + i as f32])
+                .collect()
+        };
+        let mut all = resample_stereo(&mut state, 48_000, 44_100, &buf(0.0));
+        all.extend(resample_stereo(&mut state, 48_000, 44_100, &buf(50.0)));
+        let lefts: Vec<f32> = all.chunks_exact(2).map(|f| f[0]).collect();
+        assert!(
+            lefts.len() > 80,
+            "two 50-frame buffers should yield many frames"
+        );
+        for w in lefts.windows(2) {
+            assert!(w[1] >= w[0] - 1e-3, "boundary must stay monotonic: {w:?}");
+        }
     }
 
     #[test]

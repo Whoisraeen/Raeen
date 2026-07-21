@@ -143,7 +143,7 @@ fn hle_output(ctx: &HleContext, args: &[u64]) -> u64 {
             let mut buf = vec![0u8; byte_len];
             if ctx.mem.read(ptr, &mut buf) {
                 let stereo = decode_to_stereo(&buf, format);
-                xps5x_audio::output::submit(&stereo);
+                xps5x_audio::output::submit(freq, &stereo);
             }
         }
     }
