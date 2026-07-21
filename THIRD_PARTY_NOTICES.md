@@ -59,9 +59,11 @@ SOFTWARE.
 
 ## SharpEmu — PS5 emulator (reference & porting source)
 
-- **Upstream:** https://github.com/par274/sharpemu
-- **License:** GPL-2.0
+- **Upstream:** https://github.com/sharpemu/sharpemu (formerly par274/sharpemu)
+- **License:** GPL-2.0-or-later (compatible with XPS5X's GPL-2.0-only)
 - **Copyright:** © SharpEmu authors
+- **Reference synced:** 2026-07-21 to upstream `main` @ 6aa78bb (ports cite the
+  originating SharpEmu `file:line` in doc comments).
 - **How XPS5X uses it:** A second-opinion reference alongside Kyty for PS5
   module loading (eboot/PRX/sysmodule chains), kernel-surface structure
   (Fiber, AMPR, PlayGo), and VideoOut/AGC bring-up. Patterns and behavior are

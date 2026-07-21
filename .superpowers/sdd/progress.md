@@ -1,3 +1,49 @@
+- ASTRO.BOT condvar-stall RESOLVED + three fatal-stall classes fixed; title now
+  loads the PAUSE MENU (2026-07-21; hle 344, kernel 23, clippy 0, fmt clean):
+  * RE of the job-post path (old task: trace module+0xdefa40): it is the
+    title's 0x1100xxxx command dispatcher (error base 0x8A8400xx, reentrancy
+    counter at [0xE2C8B58]). Main's spin loop issues cmd 0x11000000
+    ("query status", handler 0xDF02EC → 0xDED4E0) and polls response
+    buf+0x88, which mirrors `[[0xE7F5BE0]+0x288]` — the subsystem completion
+    flag. Progress floats at +0x23C/+0x234 of the same state object.
+  * FRESH TRACE (XPS5X_TRACE_COND/STALL_DUMP, 100s): the material-shader stall
+    from 2026-07-19 is GONE — 4000 cond signals (cap), job system live,
+    workers processing loads. Condvar starvation is no longer the blocker.
+    The run instead DIED on unresolved-import stubs (t27:
+    libSceNpUniversalDataSystem 0x31f0dbfb83659fae; t49: libSceAmpr
+    0x8339dd96d044cd67). t27's r8 held a job-assert string
+    ("m_item->GetStatus() == kRunning || kFini…") — the assert handler calls
+    Np UDS telemetry; the stub, not the assert, killed the thread.
+  * FIX 1 — libSceNpUniversalDataSystem EventProperty family (12 NIDs):
+    SharpEmu-faithful SetString/SetArray (null+readability probe → OK),
+    scalar Set{Int32,Int64,UInt32,UInt64,Bool} (object-only check, payload
+    is by-value), CreateEventPropertyObject/DestroyContext/Terminate = OK.
+  * FIX 2 — sceAmprCommandBufferGetNumCommands: real port of SharpEmu's
+    CommandCount (new `OrbisKernel::ampr_command_counts`; zeroed in
+    write_cb, bumped in append_record, dropped in dtor). cb==0 → EINVAL,
+    untracked → EFAULT.
+  * FIX 3 — NEW libSceAudioPropagation (31 NIDs, libsce_audio_propagation.rs):
+    faithful SharpEmu `AudioPropagationExports` port — QueryMemory writes
+    {1 MiB, 256 B} at rsi, everything else OK. Measured fault: QueryMemory
+    at "GAME: Resident Load end".
+  * BOOT NOW (150s trace, ZERO unresolved-import faults): main() → GpuDevice
+    → all MaterialPackedShaderBinaries passes → PlayGo finished → Resident
+    Load end → Armadillo/Transition loads → haptics →
+    **"LevelDocument Loaded: ui_pause_next [pause_menu]"** with live GPU
+    flips (present_index 18; DCB 559 draws / 785 dispatches; ACB async
+    compute submitting).
+  * NEW BLOCKER (next RE target): main-thread fault eboot+0x33f335
+    `mov r15,[r13+0xd0]` with r13 = [rax+0x70] = 0xffffffffffffff2f (-0xd1)
+    while iterating a loaded-object array ([rbx+0x20]→[r14+r12*8]) right
+    after the pause-menu LevelDocument load. Null check at +0x33f330 passes,
+    so the field is POISONED, not zero. Prime suspect: APR async-load
+    completion — `hle_apr_read_file` appends records the kernel "completes
+    at submit"; if submit never executes ReadFile records into guest memory,
+    async-loaded objects keep poison/uninitialized fields. NEXT: find what
+    writes [obj+0x70] (x-ref the async-load completion callback), and check
+    whether APR submit executes ReadFile/WriteAddress records for real.
+    Run artifacts: scratch/astro-cond-trace{,2,3}-20260721.log.
+
 - M3 GATE MET (2026-07-20) — interactive 2D homebrew: pad + CPU-2D draw + flip +
   present-from-guest-memory, all exercised by a running synthesized guest.
   * present-from-guest-memory (the real feature): a flip whose display buffer has

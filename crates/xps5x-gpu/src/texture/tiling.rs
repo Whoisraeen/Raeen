@@ -484,10 +484,34 @@ pub const fn swizzle_64kb_table(mode: u8) -> Option<&'static [[AddressBit; 16]; 
 /// equation. Coordinates are FULL-SURFACE: the bits above the block extent
 /// (x7/y7 for a 128-px block) are the block-column/row parity the pipe/bank
 /// XOR consumes — do not reduce them mod the block size.
+///
+/// The production detile hoists the two axis terms out of its loops (SharpEmu
+/// #483); this whole-offset form is retained as the reference the round-trip
+/// tiler and the known-answer pins check the factoring against.
+#[cfg(test)]
 fn gfx10_pattern_offset(x: u32, y: u32, pattern: &[AddressBit; 16]) -> u64 {
+    // Each output bit is parity(x & XMask) XOR parity(y & YMask), and parity
+    // distributes over XOR, so the whole offset factors into two independent
+    // axis terms: `x_term(x) ^ y_term(y)`. The direct form is kept for the
+    // known-answer pins; the hot detile loop uses the factored terms below.
+    pattern_axis_term(x, pattern, true) ^ pattern_axis_term(y, pattern, false)
+}
+
+/// One axis's contribution to a GFX10 swizzle offset: for each equation bit,
+/// `parity(coord & mask) << bit`, where `mask` is the X or Y mask. Because
+/// parity distributes over XOR, `offset(x, y) == axis(x, X) ^ axis(y, Y)`, so
+/// the per-column X term can be precomputed once and the per-row Y term hoisted
+/// out of the inner loop — one array load and one XOR per element instead of a
+/// 16-bit interleave with 32 `count_ones` calls.
+///
+/// Ported from SharpEmu `GnmTiling.cs::PatternAxisTerm` (#483, commit 1f3963c,
+/// GPL-2.0-or-later).
+#[inline]
+fn pattern_axis_term(coord: u32, pattern: &[AddressBit; 16], use_x: bool) -> u64 {
     let mut offset = 0u64;
     for (bit, eq) in pattern.iter().enumerate() {
-        let parity = ((x & eq.x_mask).count_ones() + (y & eq.y_mask).count_ones()) & 1;
+        let mask = if use_x { eq.x_mask } else { eq.y_mask };
+        let parity = (coord & mask).count_ones() & 1;
         offset |= u64::from(parity) << bit;
     }
     offset
@@ -540,12 +564,23 @@ fn detile_64kb_with(
     let (bw, bh) = block_dimensions(BLOCK_BYTES as u32, bpp_log2);
     let blocks_per_row = u64::from(width.div_ceil(bw));
     let mut out = vec![0u8; width as usize * height as usize * bpp];
+    // Precompute the per-column X term once (reused across every row): the
+    // offset factors into `x_term ^ y_term`, so the inner loop drops from a
+    // 16-bit interleave with 32 `count_ones` per element to one array load and
+    // one XOR (SharpEmu #483 / 1f3963c). Detiling is per-texel work over
+    // millions of elements, so this is the difference between a texture that
+    // detiles in-frame and one that stalls the frame.
+    let x_term_by_column: Vec<u64> = (0..width)
+        .map(|xx| pattern_axis_term(xx, pattern, true))
+        .collect();
     for yy in 0..height {
         let block_y = u64::from(yy / bh);
         let dest_row = yy as usize * width as usize * bpp;
+        // The Y term is constant across the row; hoist it out of the inner loop.
+        let y_term = pattern_axis_term(yy, pattern, false);
         for xx in 0..width {
             let block_index = block_y * blocks_per_row + u64::from(xx / bw);
-            let src = block_index * BLOCK_BYTES + gfx10_pattern_offset(xx, yy, pattern);
+            let src = block_index * BLOCK_BYTES + (x_term_by_column[xx as usize] ^ y_term);
             let dst = dest_row + xx as usize * bpp;
             if src as usize + bpp <= tiled.len() {
                 out[dst..dst + bpp].copy_from_slice(&tiled[src as usize..src as usize + bpp]);
@@ -690,6 +725,37 @@ mod tests {
         // bit8 AND bit14 (x6^y7).
         assert_eq!(at(128, 0), 256 + 32768, "x7 -> bit8 + bit15");
         assert_eq!(at(0, 128), 256 + 16384, "y7 -> bit8 + bit14");
+    }
+
+    /// The factored `x_term ^ y_term` offset (SharpEmu #483) must stay
+    /// byte-identical to the direct AddrLib address equation
+    /// `parity(x & XMask) XOR parity(y & YMask)` per bit — over full-surface
+    /// coordinates that engage the block-column/row XOR bits, for every ported
+    /// table and every bytes-per-element row.
+    #[test]
+    fn factored_offset_matches_the_direct_address_equation() {
+        fn direct(x: u32, y: u32, pattern: &[AddressBit; 16]) -> u64 {
+            let mut offset = 0u64;
+            for (bit, eq) in pattern.iter().enumerate() {
+                let parity = ((x & eq.x_mask).count_ones() + (y & eq.y_mask).count_ones()) & 1;
+                offset |= u64::from(parity) << bit;
+            }
+            offset
+        }
+        for mode in [9u8, 24, 27] {
+            let table = swizzle_64kb_table(mode).expect("ported mode");
+            for row in table {
+                for y in 0..300u32 {
+                    for x in 0..300u32 {
+                        assert_eq!(
+                            gfx10_pattern_offset(x, y, row),
+                            direct(x, y, row),
+                            "mode {mode} at ({x},{y})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

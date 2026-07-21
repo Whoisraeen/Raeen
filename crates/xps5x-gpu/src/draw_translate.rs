@@ -610,6 +610,19 @@ fn texture_vk_format(
         // layout table ("SetLayout(4, 0, 0, 32); // 32") and numFormat 7 is
         // FLOAT, the same numFormat as the 36 and 71 arms.
         22 => Ok((vk::Format::R32_SFLOAT, 4)),
+        // 29 -> (5,7) = 16_16 FLOAT (user log flagged unified format 29 as
+        // unimplemented). SharpEmu Gfx10UnifiedFormat.cs:55 maps unified 29 ->
+        // (dataFormat 5, numFormat 7); dataFormat 5 is the two-channel 16_16
+        // per the standard GCN IMG_DATA_FORMAT table (the same table that
+        // gives dataFormat 4 = 32, 12 = 16_16_16_16), and numFormat 7 is
+        // FLOAT — so R16G16_SFLOAT at 4 B/texel.
+        29 => Ok((vk::Format::R16G16_SFLOAT, 4)),
+        // 65 -> (12,0) = 16_16_16_16 UNORM (user log flagged unified format 65
+        // as unimplemented). SharpEmu Gfx10UnifiedFormat.cs:77 maps unified 65
+        // -> (dataFormat 12, numFormat 0); dataFormat 12 is 16_16_16_16 (same
+        // channel layout as the FLOAT arm 71 below) and numFormat 0 is UNORM —
+        // so R16G16B16A16_UNORM at 8 B/texel.
+        65 => Ok((vk::Format::R16G16B16A16_UNORM, 8)),
         // 71 -> (12,7) = 16_16_16_16 FLOAT (measured: ASTRO.BOT's 2432x1368
         // HDR scene buffer sampled back as a texture, tile mode 27). SharpEmu's
         // Gfx10UnifiedFormat maps unified 71 -> (dataFormat 12, numFormat 7);
@@ -745,6 +758,33 @@ fn texture_cache_probe(
     (hash, hit)
 }
 
+/// Addresses whose multi-layer array upload once overran its real allocation.
+///
+/// SharpEmu #476 (224a36e): a 2D/1D-array texture whose `Depth * per-slice
+/// stride` runs past its allocation fails a slice read partway through the
+/// upload and, without a memo, re-detiles the whole thing on every draw
+/// (measured 568-879 ms of every second in Demon's Souls). An allocation that
+/// is too short stays too short, so remembering the address and never retrying
+/// the array read costs nothing and repairs the cache key as a side effect:
+/// the fall-back reads a single base layer, which keys under `layers == 1`,
+/// exactly what later draws look it up with.
+static ARRAY_UPLOAD_UNSUPPORTED: std::sync::RwLock<Vec<u64>> = std::sync::RwLock::new(Vec::new());
+
+fn array_upload_unsupported(base: u64) -> bool {
+    ARRAY_UPLOAD_UNSUPPORTED
+        .read()
+        .map(|set| set.contains(&base))
+        .unwrap_or(false)
+}
+
+fn mark_array_upload_unsupported(base: u64) {
+    if let Ok(mut set) = ARRAY_UPLOAD_UNSUPPORTED.write()
+        && !set.contains(&base)
+    {
+        set.push(base);
+    }
+}
+
 /// The canonical Dim ordinal of a sampled T# `type_()`, matching
 /// `kyty_graphics::shader::SampledDim::ordinal`: 2D = 0, 2DArray = 1, 3D = 2,
 /// Cube = 3. A mixed-dim shader assigns per-Dim descriptor bindings in this
@@ -792,7 +832,7 @@ fn decode_texture(
             )));
         }
     };
-    let layers = if cube || array {
+    let mut layers = if cube || array {
         u32::from(t.depth()) + 1
     } else {
         1
@@ -867,21 +907,54 @@ fn decode_texture(
             let face_tiled =
                 crate::texture::tiling::tiled_byte_count_64kb(width, height, bpp_log2) as usize;
             let face_linear = (width * height * bpp) as usize;
-            let src_len = face_tiled as u64 * u64::from(layers);
-            let (hash, hit) = texture_cache_probe(
-                t.base40(),
-                src_len,
-                width,
-                height,
-                layers,
-                depth,
-                cube,
-                format,
-            );
+            // Array-upload OOM guard (SharpEmu #476 / 224a36e): if a previous
+            // draw's multi-layer read of this address overran its allocation,
+            // never retry — drop to a single base layer up front. layers == 1
+            // keys the cache the same way later single-layer draws look it up.
+            if layers > 1 && array_upload_unsupported(t.base40()) {
+                layers = 1;
+            }
+            let probe = |layers: u32| {
+                texture_cache_probe(
+                    t.base40(),
+                    face_tiled as u64 * u64::from(layers),
+                    width,
+                    height,
+                    layers,
+                    depth,
+                    cube,
+                    format,
+                )
+            };
+            let (hash, hit) = probe(layers);
             if let Some(upload) = hit {
                 return Ok(upload);
             }
-            let tiled = read_guest_bytes_unaligned(t.base40(), src_len, "texture")?;
+            let src_len = face_tiled as u64 * u64::from(layers);
+            let tiled = match read_guest_bytes_unaligned(t.base40(), src_len, "texture") {
+                Ok(tiled) => tiled,
+                // The multi-layer array read overran the allocation: remember it
+                // so no draw retries the overrun, fall back to a single base
+                // layer, and re-probe under layers == 1 for a possible hit.
+                Err(_) if layers > 1 => {
+                    mark_array_upload_unsupported(t.base40());
+                    layers = 1;
+                    let (single_hash, single_hit) = probe(layers);
+                    if let Some(upload) = single_hit {
+                        return Ok(upload);
+                    }
+                    let single = read_guest_bytes_unaligned(t.base40(), face_tiled as u64, "texture")?;
+                    let face =
+                        crate::texture::tiling::detile_64kb(mode, &single, width, height, bpp_log2)
+                            .expect("table-checked above");
+                    let mut pixels = alloc_zeroed(face_linear, "texture decode")?;
+                    pixels[..face_linear].copy_from_slice(&face);
+                    return Ok(texture_upload_from(
+                        t, width, height, format, pixels, layers, cube, depth, single_hash,
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
             let mut pixels = alloc_zeroed(face_linear * layers as usize, "texture decode")?;
             for layer in 0..layers as usize {
                 let src = &tiled[layer * face_tiled..(layer + 1) * face_tiled];
@@ -941,6 +1014,40 @@ fn decode_texture(
         sample_hash,
         cached: false,
     })
+}
+
+/// Build a CPU-staged [`TextureUpload`] from already-decoded linear pixels.
+/// Shared by the array-upload OOM fall-back (SharpEmu #476), which returns a
+/// single base layer, and any other path that has finished the guest read and
+/// detile itself. `render_target` is always `None` (this is a staging upload,
+/// not a live-target direct bind) and `cached` is `false` (the backend donates
+/// the image to the persistent-texture cache on draw success when the hash is
+/// non-zero).
+#[allow(clippy::too_many_arguments)]
+fn texture_upload_from(
+    t: &kyty_graphics::shader::ShaderTextureResource,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    pixels: Vec<u8>,
+    layers: u32,
+    cube: bool,
+    depth: u32,
+    sample_hash: u64,
+) -> TextureUpload {
+    TextureUpload {
+        width,
+        height,
+        format,
+        pixels,
+        layers,
+        cube,
+        depth,
+        render_target: None,
+        guest_base: t.base40(),
+        sample_hash,
+        cached: false,
+    }
 }
 
 /// Gen5 unified T# formats that are 32 bits per pixel — their guest bytes
@@ -2474,6 +2581,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
                     "TRACE_DRAWS: compute writeback"
                 );
             }
+            crate::guest_mem::trace_scanout_fill(addr, bytes.len(), "compute-storage");
             if !crate::guest_mem::write_bytes_checked(addr, bytes) {
                 return Err(err(format!(
                     "compute storage writeback range {addr:#x}..{:#x} is not writable guest memory",
@@ -2497,6 +2605,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
                     "TRACE_DRAWS: compute image writeback"
                 );
             }
+            crate::guest_mem::trace_scanout_fill(addr, bytes.len(), "compute-image");
             if !crate::guest_mem::write_bytes_checked(addr, &bytes) {
                 return Err(err(format!(
                     "compute storage-image writeback range {addr:#x}..{:#x} is not writable \
@@ -3670,6 +3779,25 @@ mod tests {
         assert_eq!((tex.width, tex.height), (w, h));
         assert_eq!(tex.format, vk::Format::R16G16B16A16_SFLOAT);
         assert_eq!(tex.pixels, linear, "detiled FP16 pixels must match");
+    }
+
+    /// Unified formats 29 and 65 (user log flagged both as unimplemented) map
+    /// through SharpEmu's Gfx10UnifiedFormat table: 29 -> (5,7) = R16G16_SFLOAT
+    /// at 4 B/texel, 65 -> (12,0) = R16G16B16A16_UNORM at 8 B/texel.
+    #[test]
+    fn texture_vk_format_maps_unified_29_and_65() {
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.fields[1] |= 29 << 20;
+        assert_eq!(
+            texture_vk_format(&t).expect("format 29 maps"),
+            (vk::Format::R16G16_SFLOAT, 4)
+        );
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.fields[1] |= 65 << 20;
+        assert_eq!(
+            texture_vk_format(&t).expect("format 65 maps"),
+            (vk::Format::R16G16B16A16_UNORM, 8)
+        );
     }
 
     /// A cube T# (type 11, six faces, SWIZZLE_MODE 9 = SW_64KB_S — the

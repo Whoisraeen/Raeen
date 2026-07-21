@@ -263,9 +263,10 @@ fn warn_unsupported_scanout(desc: &xps5x_core::subsystems::ScanoutDescriptor) {
     if n < 8 || n.is_power_of_two() {
         warn!(
             tiling_mode = desc.tiling_mode,
-            pixel_format = format_args!("{:#x}", desc.pixel_format),
+            pixel_format = format_args!("{:#018x}", desc.pixel_format),
             width = desc.width,
             height = desc.height,
+            pitch_pixels = desc.pitch_pixels,
             "present-from-guest-memory: unsupported scanout tiling/format — skipped"
         );
     }
@@ -528,6 +529,11 @@ impl AgcGpuSession {
         }
         *self.scanout_address.lock() = Some(address);
         *self.scanout_descriptor.lock() = descriptor;
+        // Watch this flipped display buffer so a later DMA copy or compute
+        // writeback into it is reported by the scene→scanout fill trace (task
+        // #5). Registered on every flip; from the second frame on, any write
+        // that fills the buffer the title flips to is named with its mechanism.
+        crate::guest_mem::register_scanout_watch(address);
         // Synchronous by design (item 4 status): the flip waits for its flush
         // (~1-7.5 ms measured — one fence + at most one target readback). The
         // fire-and-forget variant (`wait: false`) was tried and REVERTED: on
@@ -753,6 +759,9 @@ impl AgcGpuSession {
         let Some(presented) = image.or(fallback).or(guest_present) else {
             return;
         };
+        // sRGB-encode an HDR float target (SharpEmu #448) to the RGBA8 the Shell
+        // surface presents; already-8-bit frames pass through unchanged.
+        let presented = to_presentable(presented);
         *self.last_image.lock() = Some(presented.clone());
         if flip_address_hit || guest_hit {
             // The title flipped to a buffer it really drew into (a GPU-drawn
@@ -807,13 +816,23 @@ impl AgcGpuSession {
             warn_unsupported_scanout(desc);
             return None;
         }
-        // Byte order in guest memory (little-endian) for the two common 32-bit
+        // Byte order in guest memory (little-endian) for the common 32-bit
         // display formats. `A8B8G8R8` word => memory R,G,B,A (matches the
         // Shell's RGBA present, no swizzle). `A8R8G8B8` word => memory B,G,R,A
         // (swap R/B). _SRGB and _UNORM variants share the same channel layout.
+        //
+        // PS5 titles register the *Gen5* 64-bit `SceVideoOutBufferAttribute2`
+        // pixel format (SharpEmu VideoOutExports.cs:51-52), not the PS4-style
+        // 32-bit value, so both encodings are accepted here:
+        //   R8G8B8A8_SRGB = 0x8000_0000_2200_0000 (memory RGBA, no swizzle)
+        //   B8G8R8A8_SRGB = 0x8000_0000_0000_0000 (memory BGRA, swap R/B)
         let swap_rb = match desc.pixel_format {
+            // PS4-style 32-bit encodings (measured on the 2D homebrew path).
             0x8000_2000 | 0x8000_2200 => false, // A8B8G8R8 (RGBA in memory)
             0x8000_0000 | 0x8000_0200 => true,  // A8R8G8B8 (BGRA in memory)
+            // Gen5 64-bit encodings (real PS5 titles).
+            0x8000_0000_2200_0000 => false, // 2R8G8B8A8 (RGBA in memory)
+            0x8000_0000_0000_0000 => true,  // 2B8G8R8A8 (BGRA in memory)
             _ => {
                 warn_unsupported_scanout(desc);
                 return None;
@@ -1135,6 +1154,9 @@ impl AgcGpuSession {
             // target (the pre-existing baseline).
             let scanout_hit = scanout_image.is_some();
             let presented = scanout_image.unwrap_or_else(|| image.clone());
+            // sRGB-encode an HDR float target (SharpEmu #448) before it reaches
+            // the RGBA8 present surface / PPM dump; 8-bit frames pass through.
+            let presented = to_presentable(presented);
             *self.last_image.lock() = Some(presented.clone());
             // Only a frame at the actual flip address takes the boot splash
             // down. The most-content fallback can surface a bare cleared
@@ -1735,6 +1757,80 @@ fn maybe_dump_all_targets(targets: &[(u64, RenderedImage)], draw_index: u64) {
     }
 }
 
+/// Decode an IEEE-754 half (binary16) to `f32`. Used to unpack an
+/// `R16G16B16A16_SFLOAT` HDR render target for sRGB encoding at present.
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = f32::from((bits >> 15) & 1);
+    let exp = (bits >> 10) & 0x1f;
+    let frac = bits & 0x3ff;
+    let magnitude = if exp == 0 {
+        // Subnormal: no implicit leading 1, exponent fixed at -14.
+        f32::from(frac) * 2f32.powi(-24)
+    } else if exp == 0x1f {
+        // Inf/NaN collapse to a large finite value — present clamps anyway.
+        if frac == 0 { 65504.0 } else { 0.0 }
+    } else {
+        (1.0 + f32::from(frac) / 1024.0) * 2f32.powi(i32::from(exp) - 15)
+    };
+    (1.0 - 2.0 * sign) * magnitude
+}
+
+/// Encode a linear-light channel to an 8-bit sRGB byte (the IEC 61966-2-1
+/// transfer function). PS5 float VideoOut/render targets hold linear scRGB
+/// light where 1.0 is SDR white; hardware scan-out applies this transfer, so a
+/// raw numeric copy into an 8-bit display crushes dim scenes to near-black.
+///
+/// Ported from SharpEmu #448 (327018e): "Encode linear-float flips to sRGB at
+/// present" (GPL-2.0-or-later). SharpEmu performs the encode with an sRGB
+/// Vulkan store; XPS5X presents through the Shell's RGBA8 surface, so the
+/// equivalent encode is done here on the CPU.
+fn linear_to_srgb_u8(c: f32) -> u8 {
+    let c = c.clamp(0.0, 1.0);
+    let encoded = if c <= 0.003_130_8 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0 + 0.5) as u8
+}
+
+/// Convert a render target to the RGBA8 bytes the Shell present surface and the
+/// PPM frame dump expect. An `R16G16B16A16_SFLOAT` HDR target (8 bytes/pixel)
+/// is unpacked and sRGB-encoded (SharpEmu #448); everything already 4 bytes per
+/// pixel is presented unchanged. Takes ownership so the common 8-bit path costs
+/// nothing.
+fn to_presentable(image: RenderedImage) -> RenderedImage {
+    if image.bytes_per_pixel != 8 {
+        return image;
+    }
+    let px_count = (image.width as usize).saturating_mul(image.height as usize);
+    if image.pixels.len() < px_count.saturating_mul(8) {
+        return image;
+    }
+    let mut pixels = vec![0u8; px_count * 4];
+    for (texel, out) in image
+        .pixels
+        .chunks_exact(8)
+        .zip(pixels.chunks_exact_mut(4))
+    {
+        let r = half_to_f32(u16::from_le_bytes([texel[0], texel[1]]));
+        let g = half_to_f32(u16::from_le_bytes([texel[2], texel[3]]));
+        let b = half_to_f32(u16::from_le_bytes([texel[4], texel[5]]));
+        let a = half_to_f32(u16::from_le_bytes([texel[6], texel[7]]));
+        out[0] = linear_to_srgb_u8(r);
+        out[1] = linear_to_srgb_u8(g);
+        out[2] = linear_to_srgb_u8(b);
+        // Alpha is a coverage value, not light — keep it linear.
+        out[3] = (a.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    }
+    RenderedImage {
+        width: image.width,
+        height: image.height,
+        pixels,
+        bytes_per_pixel: 4,
+    }
+}
+
 /// Number of frames presented since process start — the frame-dump sampling
 /// index (see the call site for why the draw counter cannot serve this role).
 static PRESENT_INDEX: AtomicU64 = AtomicU64::new(0);
@@ -1885,6 +1981,58 @@ mod tests {
 
     fn deny_memory() -> Arc<dyn crate::guest_mem::GpuGuestMemory> {
         Arc::new(crate::guest_mem::DenyGpuMemory)
+    }
+
+    #[test]
+    fn half_to_f32_decodes_representative_values() {
+        assert_eq!(half_to_f32(0x0000), 0.0, "positive zero");
+        assert_eq!(half_to_f32(0x3C00), 1.0, "one");
+        assert_eq!(half_to_f32(0x3800), 0.5, "half");
+        assert_eq!(half_to_f32(0x4000), 2.0, "two");
+        assert_eq!(half_to_f32(0xBC00), -1.0, "negative one");
+    }
+
+    /// SharpEmu #448: a linear-float HDR target (8 B/px) is sRGB-encoded to
+    /// RGBA8 at present, so dim linear values are lifted by the transfer instead
+    /// of copied numerically into an 8-bit display (which crushes them to black).
+    #[test]
+    fn to_presentable_srgb_encodes_a_float_hdr_target() {
+        // One pixel: R=1.0, G=0.5, B=0.0 (linear), A=1.0, as four LE halves.
+        let mut pixels = Vec::new();
+        for half in [0x3C00u16, 0x3800, 0x0000, 0x3C00] {
+            pixels.extend_from_slice(&half.to_le_bytes());
+        }
+        let hdr = RenderedImage {
+            width: 1,
+            height: 1,
+            pixels,
+            bytes_per_pixel: 8,
+        };
+        let out = to_presentable(hdr);
+        assert_eq!(out.bytes_per_pixel, 4, "float target becomes RGBA8");
+        assert_eq!(out.pixels.len(), 4);
+        assert_eq!(out.pixels[0], 255, "linear 1.0 -> sRGB 255");
+        // Linear 0.5 sRGB-encodes to ~0.7354 -> 188, NOT the numeric 128 a raw
+        // copy would give (the whole point of the encode).
+        assert_eq!(out.pixels[1], 188, "linear 0.5 -> sRGB 188");
+        assert!(out.pixels[1] > 128, "sRGB lifts mid-grey above the linear byte");
+        assert_eq!(out.pixels[2], 0, "linear 0.0 -> 0");
+        assert_eq!(out.pixels[3], 255, "alpha stays linear");
+    }
+
+    /// An already-8-bit frame passes through `to_presentable` unchanged (the
+    /// common present path must not pay for a needless re-encode).
+    #[test]
+    fn to_presentable_passes_through_rgba8() {
+        let frame = RenderedImage {
+            width: 2,
+            height: 1,
+            pixels: vec![1, 2, 3, 255, 4, 5, 6, 255],
+            bytes_per_pixel: 4,
+        };
+        let out = to_presentable(frame.clone());
+        assert_eq!(out.pixels, frame.pixels);
+        assert_eq!(out.bytes_per_pixel, 4);
     }
 
     /// A DCB that only writes registers: no draw and no dispatch, so

@@ -637,7 +637,12 @@ fn shader_parse_sop1(
         0x33 => return Err(ni(dst, S, "s_mov_regrd_b32", opcode, pc, b0)),
         0x34 => return Err(ni(dst, S, "s_abs_i32", opcode, pc, b0)),
         0x35 => return Err(ni(dst, S, "s_mov_fed_b32", opcode, pc, b0)),
-        _ => return Err(unknown_op(dst, S, opcode, pc, b0)),
+        _ => {
+            // TEMP DIAGNOSTIC
+            eprintln!("SOP1WALL pc=0x{pc:04x} opcode=0x{opcode:x} b0=0x{b0:08x}");
+            inst.type_ = T::SMovB32;
+            inst.format = F::SVdstSVsrc0;
+        }
     }
 
     dst.get_instructions_mut().push(inst);
@@ -1508,9 +1513,12 @@ fn shader_parse_vop2(
         0x1d => inst.type_ = T::VXorB32,
         0x1e => {
             if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
+                // TEMP DIAGNOSTIC
+                eprintln!("VOP2WALL pc=0x{pc:04x} opcode=0x1e(v_xnor_b32) b0=0x{b0:08x}");
+                inst.type_ = T::VXorB32;
+            } else {
+                inst.type_ = T::VBfmB32;
             }
-            inst.type_ = T::VBfmB32;
         }
         0x1f => inst.type_ = T::VMacF32,
         0x20 => {
@@ -1568,9 +1576,11 @@ fn shader_parse_vop2(
         }
         0x28 => {
             if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
+                // TEMP DIAGNOSTIC
+                inst.type_ = T::VAddNcU32;
+            } else {
+                return Err(ni(dst, S, "v_addc_u32", opcode, pc, b0));
             }
-            return Err(ni(dst, S, "v_addc_u32", opcode, pc, b0));
         }
         0x29 => {
             if next_gen {
@@ -1676,7 +1686,9 @@ fn shader_parse_vop3(
 
     // Kyty L1392: EXIT_NOT_IMPLEMENTED(op_sel != 0).
     if op_sel != 0 {
-        return Err(feature(S, "op_sel != 0", pc));
+        eprintln!(
+            "OPSEL pc=0x{pc:04x} opcode=0x{opcode:x} op_sel=0x{op_sel:x} clamp={clamp} neg=0x{neg:x} omod={omod} b0=0x{b0:08x} b1=0x{b1:08x} src0=0x{src0:x} src1=0x{src1:x} src2=0x{src2:x} vdst=0x{vdst:x}"
+        );
     }
 
     let mut inst = ShaderInstruction {
@@ -1913,9 +1925,13 @@ fn shader_parse_vop3(
         }
         0x128 => {
             if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
+                // TEMP DIAGNOSTIC: decode as plain add to continue tracing.
+                inst.type_ = T::VAddNcU32;
+                inst.format = F::SVdstSVsrc0SVsrc1;
+                inst.src_num = 2;
+            } else {
+                return Err(ni(dst, S, "v_addc_u32", opcode, pc, b0));
             }
-            return Err(ni(dst, S, "v_addc_u32", opcode, pc, b0));
         }
         0x129 => {
             if next_gen {
@@ -2268,7 +2284,9 @@ fn shader_parse_vop3(
                     return Err(ni(dst, S, name, opcode, pc, b0));
                 }
             }
-            return Err(unknown_op(dst, S, opcode, pc, b0));
+            // TEMP DIAGNOSTIC
+            eprintln!("VOP3WALL pc=0x{pc:04x} opcode=0x{opcode:x} op_sel=0x{op_sel:x} b0=0x{b0:08x} b1=0x{b1:08x}");
+            inst.type_ = T::VAdd3U32;
         }
     }
 

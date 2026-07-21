@@ -13,7 +13,8 @@
 
 use kyty_graphics::run::GuestMemory;
 use std::cell::{Cell, RefCell};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Address-space authority supplied by the owning guest process.
 pub trait GpuGuestMemory: Send + Sync {
@@ -115,6 +116,11 @@ impl GuestMemory for IdentityGuestMemory {
     }
 
     fn write_bytes(&self, addr: u64, bytes: &[u8]) -> bool {
+        // An `IT_DMA_DATA` memory→memory copy runs through here; if it targets a
+        // flipped display buffer this is exactly the scene→scanout fill we are
+        // hunting (SharpEmu run.rs cp_op_dma_data comment: the composite lands
+        // its scanout by DMA).
+        trace_scanout_fill(addr, bytes.len(), "dma_data");
         write_bytes_checked(addr, bytes)
     }
 }
@@ -174,6 +180,71 @@ pub(crate) fn read_dwords_validated(addr: u64, count: u32) -> Option<Vec<u32>> {
         return None;
     }
     Some(out)
+}
+
+/// Scene→scanout fill trace (SharpEmu port task #5). The title composites its
+/// HDR scene into a set of render targets, then flips to a *different* display
+/// buffer (e.g. ASTRO.BOT renders to 0x53a.../0x539... but flips to
+/// 0x507.../0x509...). This registry lets the two guest-write chokepoints —
+/// `IT_DMA_DATA` copies (`IdentityGuestMemory::write_bytes`) and Vulkan compute
+/// storage writeback (`draw_translate`) — report when a write actually lands in
+/// a flipped display buffer, which is the only way that buffer gets filled
+/// short of a GPU render pass we already track. Gated on `XPS5X_TRACE_SCANOUT_FILL`.
+static SCANOUT_WATCH: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Assumed maximum bytes a single scanout buffer spans (4K RGBA10/float ≈ 66
+/// MiB; round up). A write whose start falls within `[base, base + this)` of a
+/// watched buffer is reported as filling it.
+const SCANOUT_WATCH_SPAN: u64 = 128 << 20;
+
+/// Register a flipped display-buffer base so later guest writes into it are
+/// reported by [`trace_scanout_fill`]. Idempotent; cheap no-op unless the trace
+/// env var is set (the caller still records for a later toggle within a run).
+pub(crate) fn register_scanout_watch(addr: u64) {
+    if addr == 0 {
+        return;
+    }
+    if let Ok(mut watch) = SCANOUT_WATCH.lock()
+        && !watch.contains(&addr)
+    {
+        watch.push(addr);
+    }
+}
+
+/// Report a guest write that lands in a watched flipped display buffer, tagged
+/// with the mechanism (`dma_data`, `compute-storage`, `compute-image`). This is
+/// the instrumentation that answers "how is the scanout buffer filled?": if the
+/// scene never reaches the screen, this trace stays silent for the flip address
+/// (nothing writes it) or fires with the mechanism that does. Rate-limited so a
+/// per-frame fill does not flood the log.
+pub(crate) fn trace_scanout_fill(addr: u64, len: usize, source: &str) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if std::env::var_os("XPS5X_TRACE_SCANOUT_FILL").is_none() {
+        return;
+    }
+    let hit = SCANOUT_WATCH
+        .lock()
+        .ok()
+        .map(|watch| {
+            watch
+                .iter()
+                .find(|&&base| addr >= base && addr < base.saturating_add(SCANOUT_WATCH_SPAN))
+                .copied()
+        })
+        .unwrap_or(None);
+    let Some(base) = hit else {
+        return;
+    };
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 64 || n.is_power_of_two() {
+        tracing::info!(
+            scanout_base = format_args!("{base:#x}"),
+            write_addr = format_args!("{addr:#x}"),
+            offset = addr - base,
+            len,
+            source,
+            "TRACE_SCANOUT_FILL: guest write landed in a flipped display buffer"
+        );
+    }
 }
 
 /// Process-authorized write into GPU-visible guest memory. Used for Vulkan
