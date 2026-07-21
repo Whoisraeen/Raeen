@@ -383,7 +383,16 @@ fn read_guest_bytes(addr: u64, size: u64, kind: &str) -> Result<Vec<u8>, DrawErr
             addr.saturating_add(size)
         ))
     })?;
-    let bytes: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    // Fallible: a full-resolution texture is tens of MiB; under host memory
+    // pressure the byte buffer must degrade to a named skip, not abort. The
+    // dword read above (`read_dwords_validated`) already reserves fallibly.
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.try_reserve_exact(size as usize).map_err(|_| {
+        err(format!(
+            "{kind} at {addr:#x}: {size} B host allocation failed (out of memory) — skipping"
+        ))
+    })?;
+    bytes.extend(words.into_iter().flat_map(u32::to_le_bytes));
     if let Ok(dir) = std::env::var("XPS5X_DUMP_GPU_RESOURCES")
         && !dir.is_empty()
     {
@@ -397,6 +406,29 @@ fn read_guest_bytes(addr: u64, size: u64, kind: &str) -> Result<Vec<u8>, DrawErr
         }
     }
     Ok(bytes)
+}
+
+/// Zero-filled host buffer of `len` bytes that returns a named [`DrawError`]
+/// instead of ABORTING the process when the allocation fails.
+///
+/// The final composite decodes several full-resolution scene targets from guest
+/// memory in one pass; under host memory pressure an infallible `vec![0u8; len]`
+/// aborts the whole process (the measured crash: "memory allocation of 26615808
+/// bytes failed" = one 2432x1368 RGBA16F target). A fallible reservation
+/// degrades that into a skipped draw/dispatch, so the process survives and a
+/// later frame — with more headroom — can retry. Paired with the per-stage
+/// decode cap (`stage_texture_byte_cap`), which preemptively refuses a composite
+/// whose cumulative decode is clearly too large.
+fn alloc_zeroed(len: usize, kind: &str) -> Result<Vec<u8>, DrawError> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(len).map_err(|_| {
+        err(format!(
+            "{kind}: {len} B host allocation failed (out of memory) — skipping the draw/dispatch \
+             instead of aborting the process"
+        ))
+    })?;
+    buf.resize(len, 0);
+    Ok(buf)
 }
 
 fn gen5_vertex_format(format: u8) -> Result<vk::Format, DrawError> {
@@ -807,7 +839,7 @@ fn decode_texture(
             let src_row = (pitch * bpp) as usize;
             let src_slice = src_row * height as usize;
             let dst_slice = row * height as usize;
-            let mut pixels = vec![0u8; dst_slice * depth as usize];
+            let mut pixels = alloc_zeroed(dst_slice * depth as usize, "texture decode")?;
             for z in 0..depth as usize {
                 for y in 0..height as usize {
                     let src = z * src_slice + y * src_row;
@@ -850,7 +882,7 @@ fn decode_texture(
                 return Ok(upload);
             }
             let tiled = read_guest_bytes_unaligned(t.base40(), src_len, "texture")?;
-            let mut pixels = vec![0u8; face_linear * layers as usize];
+            let mut pixels = alloc_zeroed(face_linear * layers as usize, "texture decode")?;
             for layer in 0..layers as usize {
                 let src = &tiled[layer * face_tiled..(layer + 1) * face_tiled];
                 let face = crate::texture::tiling::detile_64kb(mode, src, width, height, bpp_log2)
@@ -964,22 +996,27 @@ fn read_storage_image(
     } else {
         None
     };
-    let pixels = pixels.unwrap_or_else(|| {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        if !WARNED.swap(true, Ordering::Relaxed) {
-            tracing::warn!(
-                base = format_args!("{base:#x}"),
-                extent = format_args!("{width}x{height}x{depth}"),
-                format = t.format(),
-                readable,
-                "storage image initial content unavailable (unknown format \
-                 or unreadable guest range) — zero-filling; the compute shader \
-                 typically overwrites the whole UAV"
-            );
+    let pixels = match pixels {
+        Some(p) => p,
+        None => {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    base = format_args!("{base:#x}"),
+                    extent = format_args!("{width}x{height}x{depth}"),
+                    format = t.format(),
+                    readable,
+                    "storage image initial content unavailable (unknown format \
+                     or unreadable guest range) — zero-filling; the compute shader \
+                     typically overwrites the whole UAV"
+                );
+            }
+            // Fallible: the zero seed is full-resolution too; degrade to a named
+            // skip under host memory pressure rather than aborting.
+            alloc_zeroed(size as usize, "storage image seed")?
         }
-        vec![0u8; size as usize]
-    });
+    };
     Ok(StorageImageUpload {
         width,
         height,
@@ -1121,6 +1158,87 @@ fn buffer_byte_size(resource: &kyty_graphics::shader::ShaderBufferResource) -> O
     } else {
         u64::from(resource.stride()).checked_mul(u64::from(resource.num_records()))
     }
+}
+
+/// Cumulative decoded-pixel budget (bytes) for one stage's sampled textures
+/// plus storage-image seeds, before the draw/dispatch is refused as oversized.
+///
+/// A title's final composite samples several full-resolution scene targets in a
+/// SINGLE pass (measured: ASTRO.BOT decodes ~5 render-resolution RGBA16F / RGBA8
+/// / R32F targets in one compute dispatch). Each target is uploaded from guest
+/// memory — the compute path WRITES them as storage images to guest memory and
+/// the composite RE-READS the raw bytes, often at a DIFFERENT extent/format than
+/// they were written (measured: base `0x53a500000` written 1920x1080 R8, sampled
+/// 960x540 R32F — the same bytes reinterpreted), so a single persistent VkImage
+/// cannot alias them and the guest-memory decode is semantically required. Their
+/// decoded buffers plus the matching Vulkan staging copies all coexist as host
+/// allocations; at 2432x1368 the peak reaches a few hundred MiB, and under host
+/// commit pressure a single 26 MiB (2432x1368x8) RGBA16F allocation can fail and
+/// abort the process. Bounding the per-stage decoded total refuses the
+/// pathological composite (a named, counted skip) BEFORE the allocation, instead
+/// of letting the process abort. Composites whose samples fit run unchanged.
+///
+/// Tunable via `XPS5X_MAX_STAGE_TEXTURE_MIB`; default 96 MiB.
+fn stage_texture_byte_cap() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("XPS5X_MAX_STAGE_TEXTURE_MIB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&mib| mib > 0)
+            .unwrap_or(96)
+            .saturating_mul(1024 * 1024)
+    })
+}
+
+/// Process-wide count of draws/dispatches refused by [`stage_texture_byte_cap`],
+/// surfaced in the run summary so a skipped composite is visible, not silent.
+static STAGE_TEXTURE_CAP_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total draws/dispatches skipped for exceeding the per-stage sampled-texture
+/// byte budget (see [`stage_texture_byte_cap`]).
+#[must_use]
+pub fn stage_texture_cap_skips() -> u64 {
+    STAGE_TEXTURE_CAP_SKIPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Expected decoded (linear) byte size of one sampled T#, computed from the
+/// descriptor WITHOUT decoding it: `width * height * bpp`, times the array-layer
+/// count (cube / 2DArray) or the volume depth (3D). Used to bound a stage's
+/// cumulative decode before the allocation happens (matches `decode_texture`'s
+/// output size).
+fn expected_sampled_bytes(t: &kyty_graphics::shader::ShaderTextureResource) -> u64 {
+    let width = u64::from(u32::from(t.width5()) + 1);
+    let height = u64::from(u32::from(t.height5()) + 1);
+    let bpp = texture_vk_format(t).map_or(4, |(_, b)| u64::from(b));
+    // 3D volume (type 10) is `depth` slices; cube (11) / 2DArray (13) is
+    // `depth + 1` layers; everything else is a single 2D image.
+    let extent = match t.type_() {
+        10 | 11 | 13 => u64::from(u32::from(t.depth()) + 1),
+        _ => 1,
+    };
+    width
+        .saturating_mul(height)
+        .saturating_mul(bpp)
+        .saturating_mul(extent)
+}
+
+/// Expected initial-content byte size of one storage-image (UAV) T#: the linear
+/// volume `width * height * depth * texel` (`texel` = 8 for format 71 RGBA16F,
+/// else 4), matching `read_storage_image`.
+fn expected_storage_image_bytes(t: &kyty_graphics::shader::ShaderTextureResource) -> u64 {
+    let width = u64::from(u32::from(t.width5()) + 1);
+    let height = u64::from(u32::from(t.height5()) + 1);
+    let depth = if t.type_() == 10 {
+        u64::from(u32::from(t.depth()) + 1)
+    } else {
+        1
+    };
+    let texel = if t.format() == 71 { 8 } else { 4 };
+    width
+        .saturating_mul(height)
+        .saturating_mul(depth)
+        .saturating_mul(texel)
 }
 
 /// Desired raw EUD-window snapshot size in bytes (SharpEmu port): at least
@@ -1363,9 +1481,30 @@ fn prepare_stage_binding(
     // `shader_calc_binding_indices` use to assign per-Dim bindings.
     let mut sampled_dim_count = [0u64; 4];
     let mut sampled_dim_views: [Vec<usize>; 4] = Default::default();
+    // Per-stage decoded-byte budget (see `stage_texture_byte_cap`): a composite
+    // sampling several full-resolution scene targets decodes them all from guest
+    // memory at once, and the peak host allocation can abort the process. Refuse
+    // (skip) BEFORE the over-budget allocation; targets served by direct
+    // persistent-target binds (`render_target`, empty pixels) cost nothing.
+    let texture_byte_cap = stage_texture_byte_cap();
+    let mut stage_decoded_bytes: u64 = 0;
+    let refuse_over_cap = |bytes: u64, stage: vk::ShaderStageFlags| -> DrawError {
+        STAGE_TEXTURE_CAP_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        err(format!(
+            "translated {stage:?} stage decodes {bytes} B of sampled/storage textures, over the \
+             {texture_byte_cap} B per-stage cap (XPS5X_MAX_STAGE_TEXTURE_MIB) — refusing the \
+             draw/dispatch so the composite's simultaneous full-res uploads cannot exhaust host \
+             memory"
+        ))
+    };
     for (index, desc) in bind.textures2d.desc[..texture_num].iter().enumerate() {
         let mut rewritten = desc.texture;
         if desc.usage == ShaderTextureUsage::ReadWrite {
+            stage_decoded_bytes =
+                stage_decoded_bytes.saturating_add(expected_storage_image_bytes(&desc.texture));
+            if stage_decoded_bytes > texture_byte_cap {
+                return Err(refuse_over_cap(stage_decoded_bytes, stage));
+            }
             let upload = read_storage_image(&desc.texture)?;
             if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
                 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1392,7 +1531,18 @@ fn prepare_stage_binding(
             // nothing shows on screen.
             let mut decoded = match sampled_render_target(&desc.texture) {
                 Some(upload) => upload,
-                None => decode_texture(&desc.texture)?,
+                None => {
+                    // Guest-memory decode: count it against the per-stage budget
+                    // and refuse before allocating if the composite's samples
+                    // would exceed the cap (a direct persistent-target bind
+                    // above costs nothing and never reaches here).
+                    stage_decoded_bytes =
+                        stage_decoded_bytes.saturating_add(expected_sampled_bytes(&desc.texture));
+                    if stage_decoded_bytes > texture_byte_cap {
+                        return Err(refuse_over_cap(stage_decoded_bytes, stage));
+                    }
+                    decode_texture(&desc.texture)?
+                }
             };
             // CPU fallback for what the direct binding cannot serve (the
             // draw's own target — a feedback loop — or an extent/format
@@ -2886,6 +3036,67 @@ mod tests {
         t.fields[2] |= (h - 1) << 14; // height5
         t.fields[3] |= 9 << 28; // type = Texture2D (tile mode stays 0 = linear)
         t
+    }
+
+    /// The pre-decode size estimates must match what `decode_texture` /
+    /// `read_storage_image` actually allocate, so the per-stage budget refuses
+    /// at the right threshold.
+    #[test]
+    fn expected_texture_bytes_match_decoder_output() {
+        // 2D RGBA8 4x4 = 64 B, both as a sampled texture and a storage seed.
+        let t2d = rgba8_linear_tsharp(0x1000, 4, 4);
+        assert_eq!(expected_sampled_bytes(&t2d), 4 * 4 * 4);
+        assert_eq!(expected_storage_image_bytes(&t2d), 4 * 4 * 4);
+        // A larger extent scales linearly: 1024x1024 RGBA8 = 4 MiB.
+        let big = rgba8_linear_tsharp(0x1000, 1024, 1024);
+        assert_eq!(expected_sampled_bytes(&big), 1024 * 1024 * 4);
+    }
+
+    /// A composite whose single sampled T# alone exceeds the per-stage byte cap
+    /// is refused as a named, counted skip BEFORE any guest read or allocation —
+    /// the guard that keeps a full-resolution multi-target composite from
+    /// exhausting host memory and aborting the process.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn stage_texture_byte_cap_refuses_oversized_composite() {
+        // 8192x8192 RGBA8 decodes to 256 MiB, over the 96 MiB default cap.
+        let mut bind = ShaderBindResources::default();
+        bind.push_constant_size = 32;
+        bind.textures2d.textures_num = 1;
+        bind.textures2d.textures2d_sampled_num = 1;
+        bind.textures2d.binding_sampled_index = 0;
+        bind.textures2d.desc[0].texture = rgba8_linear_tsharp(0x1000, 8192, 8192);
+
+        assert!(
+            expected_sampled_bytes(&bind.textures2d.desc[0].texture) > stage_texture_byte_cap(),
+            "test texture must exceed the default cap"
+        );
+        let before = stage_texture_cap_skips();
+        // No guest ranges installed: the refusal must fire before decode_texture
+        // reads guest memory.
+        let e = prepare_stage_binding(&bind, vk::ShaderStageFlags::FRAGMENT)
+            .expect_err("oversized composite is refused");
+        assert!(e.0.contains("per-stage cap"), "names the cap: {e}");
+        assert_eq!(
+            stage_texture_cap_skips(),
+            before + 1,
+            "the refusal is counted"
+        );
+    }
+
+    /// A host allocation failure in the decode path degrades to a named
+    /// `DrawError` (a skip) instead of aborting the process — the safety net
+    /// that turns the measured "memory allocation of N bytes failed" crash into
+    /// a recoverable skipped draw/dispatch.
+    #[test]
+    fn alloc_zeroed_degrades_on_failure_not_abort() {
+        // A normal allocation succeeds and is zero-filled.
+        let ok = alloc_zeroed(64, "test").expect("small alloc succeeds");
+        assert_eq!(ok.len(), 64);
+        assert!(ok.iter().all(|&b| b == 0));
+        // An impossible reservation returns Err (a skip), never aborts.
+        let e = alloc_zeroed(usize::MAX, "test").expect_err("huge alloc is refused");
+        assert!(e.0.contains("out of memory"), "names the failure: {e}");
     }
 
     /// The ASTRO.BOT front-#3 shape: a COMPUTE stage whose T#s mix sampled

@@ -1211,6 +1211,7 @@ impl AgcGpuSession {
                 dispatch_skips,
                 draw_reason = draw_skip_reason.unwrap_or("(none — draw shaders translate)"),
                 dispatch_reason = dispatch_skip_reason.unwrap_or("(none)"),
+                texture_cap_skips = crate::draw_translate::stage_texture_cap_skips(),
                 vs_addr = format_args!("{:#x}", shader_state.vs.vs_regs.data_addr),
                 es_addr = format_args!("{:#x}", shader_state.vs.es_regs.data_addr),
                 gs_addr = format_args!("{:#x}", shader_state.vs.gs_regs.data_addr),
