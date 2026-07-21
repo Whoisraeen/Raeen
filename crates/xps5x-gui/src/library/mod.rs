@@ -129,8 +129,11 @@ pub fn art_from_stops(hi: Color32, lo: Color32) -> ArtSource {
 /// (spec §11).
 pub fn art_from_id(id: &str) -> ArtSource {
     let hue = (fnv1a(id) % 360) as f32;
+    // Analogous two-hue ramp (±28° on the dark stop) reads as designed art;
+    // a single-hue ramp reads as a solid color block.
+    let lo_hue = (hue + if fnv1a(id) & 1 == 0 { 28.0 } else { -28.0 }).rem_euclid(360.0);
     let hi = hsl_to_rgb(hue, 0.68, 0.60);
-    let lo = hsl_to_rgb(hue, 0.55, 0.09);
+    let lo = hsl_to_rgb(lo_hue, 0.58, 0.10);
     art_from_stops(hi, lo)
 }
 

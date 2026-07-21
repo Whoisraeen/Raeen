@@ -26,11 +26,13 @@ pub enum Glyph {
     Grid,
     /// Media tab (spec §10 SM2): a rounded frame with a play triangle.
     Video,
-    /// Top-bar status: circled "i".
+    /// Circled "i" — kept for future toast/notice surfaces.
+    #[allow(dead_code)]
     Info,
     /// Trophy cup — top-bar status and the "Last trophy" stat.
     Trophy,
-    /// Speech bubble (bottom-bar status).
+    /// Speech bubble — kept for a future notifications surface.
+    #[allow(dead_code)]
     Chat,
     /// Cross/X face-button shape (bottom-bar "Play" hint).
     Cross,

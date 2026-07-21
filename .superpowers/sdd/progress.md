@@ -2517,3 +2517,19 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   panel, no DWM scaling) — theme::install_fonts now defaults to system
   Segoe UI + Consolas (theme fonts still outrank; non-Windows keeps
   built-ins), console rows 14px. Console window opaque dark chrome (#0D1017).
+- UI iteration round 2 (critique workflow ps5-ui-critique ranked 8 items; 6
+  landed, all screenshot-verified): band_shift centers pills/rail/context on
+  non-16:9 windows (0.38 of surplus height; 1080p landscape unchanged); PS5
+  white focus ring (2.5px focus-color hugging expand(4), accent halo 0.06,
+  tile_focus_scale 1.42, corner_radius 16, tile_size 224 — theme.toml synced);
+  hero cover-fit UVs via generalized cover_uv(texture, aspect) + scrim
+  0.92/0.55/0.5 -> 0.62/0.30/0.35 (key art now visible, no portrait squash);
+  topbar rework (fake Player One/X5/1,204/center glyphs/wifi DELETED; PS5
+  right cluster = search + gear + avatar with real host username initial +
+  clock); bottom bar honesty (dead Search hint + chat/capture glyphs removed,
+  footer whisper); coverless-tile art (two-initial monogram 0.85 + ghost echo
+  + in-tile title + analogous two-hue gradient). REMAINING from critique:
+  #6 session ledger (last played/time played/crashed-last-session line), #7
+  control-center live data + switcher, topbar interactivity/text-tabs.
+  TRAP: release relink fails os error 5 if a screenshot-probe xps5x.exe was
+  left alive — Stop-Process before cargo build.

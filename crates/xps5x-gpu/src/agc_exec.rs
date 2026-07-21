@@ -741,13 +741,22 @@ impl AgcGpuSession {
         // is filled by an uncaptured copy/DMA while its real pixels live in
         // another render target — keeps presenting that target instead of the
         // (empty) guest scanout bytes.
-        let guest_present = if image.is_none() && fallback.is_none() {
+        let guest_present = if image.is_none() {
             let desc = *self.scanout_descriptor.lock();
             desc.and_then(|desc| self.present_from_guest_memory(address, &desc))
         } else {
             None
         };
-        let guest_hit = guest_present.is_some();
+        // The guest scanout is authoritative when it actually holds pixels:
+        // ASTRO-class titles compose their display buffer by compute/DMA writes
+        // we do not capture as a render target, so the real frame lives at the
+        // flip address in guest memory, not in any drawn target. Prefer it over
+        // the most-content census fallback — but only when it has content, so an
+        // empty scanout never regresses a drawn target to black.
+        let guest_has_content = guest_present
+            .as_ref()
+            .is_some_and(|img| img.pixels.iter().step_by(64).any(|&b| b != 0));
+        let guest_hit = guest_has_content;
         // XPS5X_TRACE_FLIP: does the buffer the title flipped to have drawn
         // content, and what render targets exist? Answers whether black frames
         // are a routing miss (content is in another target) or a genuinely
@@ -761,7 +770,17 @@ impl AgcGpuSession {
             );
         }
         let flip_address_hit = image.is_some();
-        let Some(presented) = image.or(fallback).or(guest_present) else {
+        // Priority: a target drawn at the flip address; then the guest scanout
+        // when it holds real pixels; then the census fallback; then the guest
+        // scanout as a last resort even if empty.
+        let presented = if let Some(img) = image {
+            Some(img)
+        } else if guest_has_content {
+            guest_present
+        } else {
+            fallback.or(guest_present)
+        };
+        let Some(presented) = presented else {
             return;
         };
         // sRGB-encode an HDR float target (SharpEmu #448) to the RGBA8 the Shell
@@ -816,28 +835,49 @@ impl AgcGpuSession {
         if address == 0 || desc.width == 0 || desc.height == 0 {
             return None;
         }
-        // SCE_VIDEO_OUT_TILING_MODE_LINEAR == 1.
-        if desc.tiling_mode != 1 {
+        // The scanout is read linearly (row-major with pitch) for both the
+        // TILE(0) and LINEAR(1) `tiling_mode` values: SharpEmu's software
+        // presenter reads mode-0 display buffers row by row
+        // (AgcExports `TrySoftwarePresent`), and ASTRO.BOT's real scanout is
+        // `tiling_mode=0`. Higher modes are a genuine macro-tile we do not
+        // detile yet — named in a rate-limited warn and skipped, never faked.
+        if desc.tiling_mode > 1 {
             warn_unsupported_scanout(desc);
             return None;
         }
-        // Byte order in guest memory (little-endian) for the common 32-bit
-        // display formats. `A8B8G8R8` word => memory R,G,B,A (matches the
-        // Shell's RGBA present, no swizzle). `A8R8G8B8` word => memory B,G,R,A
-        // (swap R/B). _SRGB and _UNORM variants share the same channel layout.
-        //
-        // PS5 titles register the *Gen5* 64-bit `SceVideoOutBufferAttribute2`
-        // pixel format (SharpEmu VideoOutExports.cs:51-52), not the PS4-style
-        // 32-bit value, so both encodings are accepted here:
-        //   R8G8B8A8_SRGB = 0x8000_0000_2200_0000 (memory RGBA, no swizzle)
-        //   B8G8R8A8_SRGB = 0x8000_0000_0000_0000 (memory BGRA, swap R/B)
-        let swap_rb = match desc.pixel_format {
+        // How to turn each 32-bit guest word into the RGBA8 the Shell presents.
+        // `A8B8G8R8`/`2R8G8B8A8` words are memory R,G,B,A (no swizzle);
+        // `A8R8G8B8`/`2B8G8R8A8` words are memory B,G,R,A (swap R/B). Real PS5
+        // titles register the *Gen5* 64-bit `SceVideoOutBufferAttribute2` pixel
+        // format (SharpEmu VideoOutExports.cs), so both the PS4-style 32-bit and
+        // the Gen5 64-bit encodings are accepted. The packed 10:10:10:2 formats
+        // (ASTRO.BOT's scanout is `2B10G10R10A2_SRGB` = 0x8100_0000_0000_0000)
+        // unpack per SharpEmu `ConvertPacked10ToRgba8Normalized`.
+        #[derive(Clone, Copy)]
+        enum ScanoutConv {
+            /// 8-bit word already in memory R,G,B,A order.
+            Rgba8,
+            /// 8-bit word in memory B,G,R,A order — swap R/B.
+            Bgra8,
+            /// Packed 10:10:10:2; `red_is_least` picks the 2R10.. vs 2B10.. lane.
+            Packed10 { red_is_least: bool },
+        }
+        let conv = match desc.pixel_format {
             // PS4-style 32-bit encodings (measured on the 2D homebrew path).
-            0x8000_2000 | 0x8000_2200 => false, // A8B8G8R8 (RGBA in memory)
-            0x8000_0000 | 0x8000_0200 => true,  // A8R8G8B8 (BGRA in memory)
-            // Gen5 64-bit encodings (real PS5 titles).
-            0x8000_0000_2200_0000 => false, // 2R8G8B8A8 (RGBA in memory)
-            0x8000_0000_0000_0000 => true,  // 2B8G8R8A8 (BGRA in memory)
+            0x8000_2000 | 0x8000_2200 => ScanoutConv::Rgba8, // A8B8G8R8
+            0x8000_0000 | 0x8000_0200 => ScanoutConv::Bgra8, // A8R8G8B8
+            // Gen5 64-bit 8-bit encodings (real PS5 titles).
+            0x8000_0000_2200_0000 => ScanoutConv::Rgba8, // 2R8G8B8A8
+            0x8000_0000_0000_0000 => ScanoutConv::Bgra8, // 2B8G8R8A8
+            // Gen5 64-bit packed 10:10:10:2 (SharpEmu VideoOutExports.cs:159-164).
+            // 2R10G10B10A2 family: red in the least-significant 10 bits.
+            0x8100_0000_2200_0000 | 0x8100_0006_2200_0000 | 0x8100_0704_2200_0000 => {
+                ScanoutConv::Packed10 { red_is_least: true }
+            }
+            // 2B10G10R10A2 family: blue in the least-significant 10 bits.
+            0x8100_0000_0000_0000 | 0x8100_0006_0000_0000 | 0x8100_0704_0000_0000 => {
+                ScanoutConv::Packed10 { red_is_least: false }
+            }
             _ => {
                 warn_unsupported_scanout(desc);
                 return None;
@@ -875,19 +915,41 @@ impl AgcGpuSession {
             .try_reserve_exact(width as usize * height as usize * 4)
             .ok()?;
         pixels.resize(width as usize * height as usize * 4, 0);
+        // 10-bit UNORM -> 8-bit UNORM, round-to-nearest preserving both
+        // endpoints (SharpEmu `ReduceUnorm10To8`; a plain >>2 biases low
+        // because the 10-bit max is 1023, not 1020).
+        let reduce10to8 = |v: u32| ((v * 255 + 511) / 1023) as u8;
         for y in 0..height as usize {
             let src_row = y * row_bytes as usize;
             let dst_row = y * width as usize * 4;
             for x in 0..width as usize {
                 let s = src_row + x * 4;
                 let d = dst_row + x * 4;
-                if swap_rb {
-                    pixels[d] = src[s + 2];
-                    pixels[d + 1] = src[s + 1];
-                    pixels[d + 2] = src[s];
-                    pixels[d + 3] = src[s + 3];
-                } else {
-                    pixels[d..d + 4].copy_from_slice(&src[s..s + 4]);
+                match conv {
+                    ScanoutConv::Rgba8 => pixels[d..d + 4].copy_from_slice(&src[s..s + 4]),
+                    ScanoutConv::Bgra8 => {
+                        pixels[d] = src[s + 2];
+                        pixels[d + 1] = src[s + 1];
+                        pixels[d + 2] = src[s];
+                        pixels[d + 3] = src[s + 3];
+                    }
+                    ScanoutConv::Packed10 { red_is_least } => {
+                        let word =
+                            u32::from_le_bytes([src[s], src[s + 1], src[s + 2], src[s + 3]]);
+                        let least = word & 0x3FF;
+                        let green = (word >> 10) & 0x3FF;
+                        let most = (word >> 20) & 0x3FF;
+                        let (r10, b10) = if red_is_least {
+                            (least, most)
+                        } else {
+                            (most, least)
+                        };
+                        pixels[d] = reduce10to8(r10);
+                        pixels[d + 1] = reduce10to8(green);
+                        pixels[d + 2] = reduce10to8(b10);
+                        // 2-bit alpha -> 8-bit (0,85,170,255).
+                        pixels[d + 3] = ((((word >> 30) & 0x3) * 255 + 1) / 3) as u8;
+                    }
                 }
             }
         }

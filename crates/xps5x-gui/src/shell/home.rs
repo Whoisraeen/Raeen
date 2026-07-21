@@ -96,11 +96,21 @@ pub fn draw(
     );
 
     draw_topbar(&painter, theme, screen);
-    draw_nav_pills(&painter, theme, screen, nav);
+
+    // The pills/rail/context band uses fixed 1080p-reference anchors; on a
+    // taller window (e.g. a portrait monitor) that top-anchoring leaves a
+    // dead band across the middle of the frame. Shift the whole band down by
+    // a share of the surplus height — 0.38 parks the rail slightly above
+    // true center, where the PS5 sits it. Landscape 1080p gets 0 shift, so
+    // the reference layout is untouched. System chrome (topbar, hint bar)
+    // stays glued to the edges.
+    let band_shift = (screen.height() - 1080.0).max(0.0) * 0.38;
+
+    draw_nav_pills(&painter, theme, screen, nav, band_shift);
 
     let focused_size = theme.metrics.tile_size * theme.metrics.tile_focus_scale;
     let rail_rect = Rect::from_min_size(
-        Pos2::new(screen.left(), screen.top() + RAIL_TOP),
+        Pos2::new(screen.left(), screen.top() + RAIL_TOP + band_shift),
         vec2(screen.width(), focused_size + 16.0),
     );
     let clicked_tile = draw_rail(ui, theme, rail_rect, items, nav, anim, covers);
@@ -139,13 +149,15 @@ fn draw_hero(
     bg_to: Option<&egui::TextureHandle>,
     fade: f32,
 ) {
-    let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+    // Cover-fit every background texture to the window aspect: full 0..1 UVs
+    // squashed 16:9 key art 2:1 on a portrait panel.
+    let aspect = rect.width() / rect.height().max(1.0);
 
     // Base layer: a user theme's background image if present, else the
     // (crossfading) 4-corner mesh gradient that approximates key-art glow.
     match theme_bg {
         Some(texture) => {
-            painter.image(texture.id(), rect, uv, Color32::WHITE);
+            painter.image(texture.id(), rect, cover_uv(texture, aspect), Color32::WHITE);
         }
         None => {
             let top_right = g.hi;
@@ -169,18 +181,30 @@ fn draw_hero(
     // dissolves the photo back to the base rather than snapping.
     let fade = fade.clamp(0.0, 1.0);
     if let Some(from) = bg_from {
-        painter.image(from.id(), rect, uv, with_alpha(Color32::WHITE, 1.0 - fade));
+        painter.image(
+            from.id(),
+            rect,
+            cover_uv(from, aspect),
+            with_alpha(Color32::WHITE, 1.0 - fade),
+        );
     }
     if let Some(to) = bg_to {
-        painter.image(to.id(), rect, uv, with_alpha(Color32::WHITE, fade));
+        painter.image(
+            to.id(),
+            rect,
+            cover_uv(to, aspect),
+            with_alpha(Color32::WHITE, fade),
+        );
     }
 
-    // Legibility scrim: darker toward the bottom-left where text sits.
+    // Legibility scrim: darker toward the bottom-left where text sits. Kept
+    // light enough that real key art stays visible (the PS5 shows the art;
+    // the old 0.92 bottom-left swallowed it in near-opaque navy).
     let s = theme.palette.scrim;
-    let scrim_tl = with_alpha(s, 0.55);
+    let scrim_tl = with_alpha(s, 0.30);
     let scrim_tr = with_alpha(s, 0.04);
-    let scrim_bl = with_alpha(s, 0.92);
-    let scrim_br = with_alpha(s, 0.5);
+    let scrim_bl = with_alpha(s, 0.62);
+    let scrim_br = with_alpha(s, 0.35);
     corner_gradient(painter, rect, scrim_tl, scrim_tr, scrim_bl, scrim_br);
 }
 
@@ -243,70 +267,28 @@ fn corner_gradient_rounded(
     clipped.rect_stroke(rect, rounding, Stroke::NONE, StrokeKind::Inside);
 }
 
-/// Status bar: avatar + profile name + trophy count on the left, three
-/// status glyphs in the center, wifi + local-time clock on the right.
+/// The host user's display name (Windows account name). Cached; empty on
+/// exotic hosts, which draw_topbar treats as "no initial".
+fn host_user_name() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::var("USERNAME")
+            .or_else(|_| std::env::var("USER"))
+            .unwrap_or_default()
+    })
+}
+
+/// Status bar, PS5 proportions: nothing on the left (the tab pills carry
+/// identity below), a right-aligned cluster of search / settings / user
+/// avatar / clock. Every element is real: the glyphs mirror reachable
+/// destinations (Search hints, the Settings tile), the avatar initial is the
+/// host account, the clock is local time. No fabricated profile stats.
 fn draw_topbar(painter: &egui::Painter, theme: &Theme, screen: Rect) {
     let margin = theme.metrics.topbar_padding_x;
-    let av_r = AVATAR_SIZE / 2.0;
-    let center_y = screen.top() + AVATAR_TOP + av_r;
+    let av_r = 18.0;
+    let center_y = screen.top() + AVATAR_TOP + AVATAR_SIZE / 2.0 - 8.0;
 
-    // Avatar.
-    let av_c = Pos2::new(screen.left() + margin + av_r, center_y);
-    painter.circle_filled(av_c, av_r, theme.palette.accent);
-    painter.circle_stroke(
-        av_c,
-        av_r,
-        Stroke::new(1.5f32, with_alpha(theme.palette.focus, 0.85)),
-    );
-    painter.text(
-        av_c,
-        Align2::CENTER_CENTER,
-        "X5",
-        FontId::proportional(17.0),
-        theme.palette.text,
-    );
-
-    // Profile name + trophy count.
-    let name_x = av_c.x + av_r + 14.0;
-    painter.text(
-        Pos2::new(name_x, screen.top() + AVATAR_TOP + 6.0),
-        Align2::LEFT_TOP,
-        "Player One",
-        FontId::proportional(16.0),
-        theme.palette.text,
-    );
-    let sub_y = screen.top() + AVATAR_TOP + 39.0;
-    icons::draw(
-        painter,
-        Glyph::Trophy,
-        Pos2::new(name_x + 7.0, sub_y),
-        14.0,
-        GOLD,
-    );
-    painter.text(
-        Pos2::new(name_x + 20.0, sub_y),
-        Align2::LEFT_CENTER,
-        "1,204",
-        FontId::proportional(13.0),
-        theme.palette.text_dim,
-    );
-
-    // Center status glyphs.
-    for (i, glyph) in [Glyph::Info, Glyph::Pad, Glyph::Trophy]
-        .into_iter()
-        .enumerate()
-    {
-        let x = screen.center().x + (i as f32 - 1.0) * 56.0;
-        icons::draw(
-            painter,
-            glyph,
-            Pos2::new(x, center_y),
-            20.0,
-            theme.palette.text_dim,
-        );
-    }
-
-    // Wifi + clock (right-most), local time.
+    // Clock, right-most.
     let time_galley = painter.layout_no_wrap(
         current_clock_string(),
         FontId::proportional(19.0),
@@ -319,11 +301,38 @@ fn draw_topbar(painter: &egui::Painter, theme: &Theme, screen: Rect) {
         time_galley,
         theme.palette.text,
     );
+
+    // Avatar circle with the real host user's initial.
+    let av_c = Pos2::new(time_x - 30.0 - av_r, center_y);
+    painter.circle_filled(av_c, av_r, with_alpha(theme.palette.accent, 0.85));
+    painter.circle_stroke(
+        av_c,
+        av_r,
+        Stroke::new(1.2f32, with_alpha(theme.palette.focus, 0.6)),
+    );
+    if let Some(initial) = host_user_name().chars().next() {
+        painter.text(
+            av_c,
+            Align2::CENTER_CENTER,
+            initial.to_uppercase().to_string(),
+            FontId::proportional(16.0),
+            theme.palette.text,
+        );
+    }
+
+    // Settings gear + search, spaced left of the avatar.
     icons::draw(
         painter,
-        Glyph::Network,
-        Pos2::new(time_x - 26.0, center_y),
-        20.0,
+        Glyph::Gear,
+        Pos2::new(av_c.x - av_r - 30.0, center_y),
+        18.0,
+        theme.palette.text_dim,
+    );
+    icons::draw(
+        painter,
+        Glyph::Search,
+        Pos2::new(av_c.x - av_r - 76.0, center_y),
+        18.0,
         theme.palette.text_dim,
     );
 }
@@ -333,8 +342,14 @@ fn draw_topbar(painter: &egui::Painter, theme: &Theme, screen: Rect) {
 /// pill focus is live (`NavMode::Pills`, entered with Up from the rail),
 /// the focused pill wears an accent ring and a brighter fill; Confirm
 /// activates it (see `nav::apply_pills`).
-fn draw_nav_pills(painter: &egui::Painter, theme: &Theme, screen: Rect, nav: &NavState) {
-    let y = screen.top() + PILLS_TOP;
+fn draw_nav_pills(
+    painter: &egui::Painter,
+    theme: &Theme,
+    screen: Rect,
+    nav: &NavState,
+    band_shift: f32,
+) {
+    let y = screen.top() + PILLS_TOP + band_shift;
     let inactive_bg = Color32::from_rgba_unmultiplied(255, 255, 255, 20);
     let focused_bg = Color32::from_rgba_unmultiplied(255, 255, 255, 44);
     let mut x = screen.left() + theme.metrics.topbar_padding_x;
@@ -458,7 +473,10 @@ fn draw_rail(
         {
             clicked = Some(i);
         }
-        let radius = m.corner_radius * size / m.tile_size;
+        // Optically constant corners: scaling the radius with the focused
+        // tile's growth reads squircle-ish; the PS5 keeps rounding subtle
+        // and stable across the size jump.
+        let radius = m.corner_radius;
 
         // Soft drop shadow so tiles read as raised cards, especially over a
         // busy key-art background. Four low-alpha, downward-offset rounded
@@ -505,36 +523,66 @@ fn draw_rail(
                     // tile and tinted for the passed-tile fade.
                     let shape =
                         RectShape::filled(tile_rect, radius, with_alpha(Color32::WHITE, alpha))
-                            .with_texture(texture.id(), cover_crop_uv(texture));
+                            .with_texture(texture.id(), cover_uv(texture, 1.0));
                     painter.add(Shape::Rect(shape));
                 } else if item.kind == ItemKind::Game {
-                    // Original stand-in key art: a large centered monogram
-                    // over the gradient (spec §11 — never real box art).
-                    let monogram = item
+                    // Original stand-in key art (spec §11 — never real box
+                    // art): a bold two-initial monogram with a ghosted echo
+                    // for depth, plus the title small along the bottom so
+                    // the tile self-identifies like a real cover instead of
+                    // reading as a failed image load.
+                    let monogram: String = item
                         .title
-                        .chars()
-                        .next()
-                        .map(|c| c.to_uppercase().to_string())
-                        .unwrap_or_default();
-                    painter.text(
-                        tile_rect.center(),
+                        .split_whitespace()
+                        .filter(|w| {
+                            !matches!(
+                                w.to_ascii_lowercase().as_str(),
+                                "a" | "an" | "the" | "of" | "to"
+                            )
+                        })
+                        .take(2)
+                        .filter_map(|w| w.chars().next())
+                        .flat_map(|c| c.to_uppercase())
+                        .collect();
+                    let clipped = painter.with_clip_rect(tile_rect);
+                    clipped.text(
+                        tile_rect.center() + vec2(size * 0.06, size * 0.08),
                         Align2::CENTER_CENTER,
-                        monogram,
-                        FontId::proportional(size * 0.4),
-                        with_alpha(Color32::WHITE, 0.45 * alpha),
+                        &monogram,
+                        FontId::proportional(size * 0.52),
+                        with_alpha(Color32::WHITE, 0.10 * alpha),
+                    );
+                    clipped.text(
+                        tile_rect.center() - vec2(0.0, size * 0.04),
+                        Align2::CENTER_CENTER,
+                        &monogram,
+                        FontId::proportional(size * 0.34),
+                        with_alpha(Color32::WHITE, 0.85 * alpha),
+                    );
+                    clipped.text(
+                        Pos2::new(
+                            tile_rect.left() + size * 0.09,
+                            tile_rect.bottom() - size * 0.09,
+                        ),
+                        Align2::LEFT_BOTTOM,
+                        &item.title,
+                        FontId::proportional((size * 0.075).max(11.0)),
+                        with_alpha(Color32::WHITE, 0.75 * alpha),
                     );
                 }
             }
         }
 
         if focused {
-            // Offset accent ring with a small gap to the cover (the mock's
-            // blue selection ring), pulsing gently.
-            let ring_rect = tile_rect.expand(7.0);
-            let ring_radius = radius + 7.0;
+            // PS5 signature focus: a thin white line hugging the tile, with
+            // only a whisper of accent halo behind it (the old thick blue
+            // ring + strong glow vanished into blue art). The white shimmer
+            // pulse is what reads as "alive".
+            let ring_rect = tile_rect.expand(4.0);
+            let ring_radius = radius + 4.0;
             for k in 1..=2 {
                 let spread = k as f32 * 3.0;
-                let a = 0.12 * (1.0 - k as f32 / 3.0) * (0.6 + 0.4 * pulse);
+                let a = 0.06 * (1.0 - k as f32 / 3.0) * (0.6 + 0.4 * pulse);
                 painter.rect_stroke(
                     ring_rect.expand(spread),
                     ring_radius + spread,
@@ -542,11 +590,11 @@ fn draw_rail(
                     StrokeKind::Outside,
                 );
             }
-            let ring_a = (0.82 + 0.18 * pulse) * alpha;
+            let ring_a = (0.75 + 0.25 * pulse) * alpha;
             painter.rect_stroke(
                 ring_rect,
                 ring_radius,
-                Stroke::new(3.5f32, with_alpha(theme.palette.accent, ring_a)),
+                Stroke::new(2.5f32, with_alpha(theme.palette.focus, ring_a)),
                 StrokeKind::Outside,
             );
         }
@@ -554,19 +602,24 @@ fn draw_rail(
     clicked
 }
 
-/// UV rect that center-crops a cover texture to the rail tile's square
-/// aspect — the shorter axis maps 0..1, the longer axis is trimmed equally
-/// on both sides.
-fn cover_crop_uv(texture: &egui::TextureHandle) -> Rect {
+/// UV rect that center-crops `texture` to `target_aspect` (width/height):
+/// whichever texture axis overshoots the target is trimmed equally on both
+/// sides ("cover" fit — never stretch). `1.0` = the square rail tiles; the
+/// hero passes the window aspect so 16:9 key art isn't squashed onto a
+/// portrait screen.
+fn cover_uv(texture: &egui::TextureHandle, target_aspect: f32) -> Rect {
     let size = texture.size_vec2();
-    if size.x <= 0.0 || size.y <= 0.0 {
+    if size.x <= 0.0 || size.y <= 0.0 || target_aspect <= 0.0 {
         return Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
     }
-    if size.x > size.y {
-        let dx = (1.0 - size.y / size.x) / 2.0;
+    let tex_aspect = size.x / size.y;
+    if tex_aspect > target_aspect {
+        let keep = target_aspect / tex_aspect;
+        let dx = (1.0 - keep) / 2.0;
         Rect::from_min_max(Pos2::new(dx, 0.0), Pos2::new(1.0 - dx, 1.0))
     } else {
-        let dy = (1.0 - size.x / size.y) / 2.0;
+        let keep = tex_aspect / target_aspect;
+        let dy = (1.0 - keep) / 2.0;
         Rect::from_min_max(Pos2::new(0.0, dy), Pos2::new(1.0, 1.0 - dy))
     }
 }
@@ -696,12 +749,14 @@ fn draw_bottom_bar(
 ) {
     let margin = theme.metrics.content_padding_x;
     let y = screen.bottom() - theme.metrics.content_padding_bottom;
-    let circle_r = 15.0;
+    let circle_r = 11.0;
     let fill = Color32::from_rgba_unmultiplied(255, 255, 255, 14);
 
+    // Only hints for actions that exist: Play (Confirm) and Options. The
+    // old Search hint had no search overlay behind it, and the decorative
+    // chat/capture glyphs reported nothing.
     let entries = [
         (Some(Glyph::Cross), controller_icons.confirm(), "Play"),
-        (Some(Glyph::Search), "", "Search"),
         (Some(Glyph::Menu), "", "Options"),
     ];
     let mut x = screen.left() + margin + circle_r;
@@ -714,7 +769,7 @@ fn draw_bottom_bar(
                 painter,
                 glyph.expect("entries have glyphs"),
                 c,
-                13.0,
+                10.0,
                 theme.palette.text_dim,
             );
         } else {
@@ -722,39 +777,23 @@ fn draw_bottom_bar(
                 c,
                 Align2::CENTER_CENTER,
                 button_label,
-                FontId::proportional(13.0),
+                FontId::proportional(11.0),
                 theme.palette.text_dim,
             );
         }
         let galley = painter.layout_no_wrap(
             label.to_string(),
-            FontId::proportional(15.0),
-            theme.palette.text_dim,
+            FontId::proportional(13.0),
+            theme.palette.text_faint,
         );
         let galley_size = galley.size();
         painter.galley(
             Pos2::new(x + circle_r + 10.0, y - galley_size.y / 2.0),
             galley,
-            theme.palette.text_dim,
+            theme.palette.text_faint,
         );
         x += circle_r + 10.0 + galley_size.x + 44.0;
     }
-
-    // Right-side status glyphs (chat, capture).
-    let rx = screen.right() - margin;
-    painter.circle_stroke(
-        Pos2::new(rx - 9.0, y),
-        9.0,
-        Stroke::new(1.4f32, theme.palette.text_faint),
-    );
-    painter.circle_filled(Pos2::new(rx - 9.0, y), 3.2, theme.palette.text_faint);
-    icons::draw(
-        painter,
-        Glyph::Chat,
-        Pos2::new(rx - 48.0, y),
-        18.0,
-        theme.palette.text_faint,
-    );
 }
 
 /// Local wall-clock, formatted 12-hour ("4:44 PM"). On Windows this is

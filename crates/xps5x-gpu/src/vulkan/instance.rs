@@ -468,19 +468,33 @@ impl VulkanDevice {
         // ([1, 0], or outside [0,1]), which core Vulkan forbids. Enable it when
         // the driver offers it; the depth path checks `depth_range_unrestricted`
         // and names the failure when a range cannot be honoured.
-        let depth_range_unrestricted =
+        let device_exts =
             unsafe { instance.enumerate_device_extension_properties(physical_device) }
-                .map(|exts| {
-                    exts.iter().any(|e| {
-                        e.extension_name_as_c_str() == Ok(c"VK_EXT_depth_range_unrestricted")
-                    })
-                })
-                .unwrap_or(false);
-        let extension_names: Vec<*const i8> = if depth_range_unrestricted {
-            vec![c"VK_EXT_depth_range_unrestricted".as_ptr()]
-        } else {
-            Vec::new()
+                .unwrap_or_default();
+        let has_device_ext = |name: &std::ffi::CStr| {
+            device_exts
+                .iter()
+                .any(|e| e.extension_name_as_c_str() == Ok(name))
         };
+        let depth_range_unrestricted = has_device_ext(c"VK_EXT_depth_range_unrestricted");
+        // VK_EXT_robustness2 upgrades the RDNA out-of-bounds contract. Base
+        // robustBufferAccess/robustImageAccess only bound-check accesses WITHIN a
+        // bound resource; but a translated shader can decode a T#/V# to a wild
+        // base address, or bind a descriptor whose resource we could not resolve
+        // (null) — neither of which base robustness covers, and either poisons
+        // the whole device (VK_ERROR_DEVICE_LOST cascades to every later draw,
+        // wedging the session ~15 s into a real title). With `nullDescriptor` +
+        // `robustBufferAccess2` + `robustImageAccess2` those accesses become
+        // defined (return 0), so one bad guest dispatch degrades to a wrong
+        // pixel instead of taking the device down.
+        let robustness2 = has_device_ext(c"VK_EXT_robustness2");
+        let mut extension_names: Vec<*const i8> = Vec::new();
+        if depth_range_unrestricted {
+            extension_names.push(c"VK_EXT_depth_range_unrestricted".as_ptr());
+        }
+        if robustness2 {
+            extension_names.push(c"VK_EXT_robustness2".as_ptr());
+        }
 
         let priorities = [1.0f32];
         let queue_infos = [vk::DeviceQueueCreateInfo::default()
@@ -498,13 +512,25 @@ impl VulkanDevice {
         // later draw in the session).
         // SAFETY: `physical_device` is a live handle from this instance and
         // the query structs are local; the calls only write into them.
-        let (supported, robust_image_access) = unsafe {
+        let (supported, robust_image_access, r2_buffer, r2_image, r2_null) = unsafe {
             let mut supported13 = vk::PhysicalDeviceVulkan13Features::default();
-            let mut supported2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut supported13);
-            instance.get_physical_device_features2(physical_device, &mut supported2);
+            let mut supported_r2 = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
+            let feats;
+            {
+                let mut supported2 =
+                    vk::PhysicalDeviceFeatures2::default().push_next(&mut supported13);
+                if robustness2 {
+                    supported2 = supported2.push_next(&mut supported_r2);
+                }
+                instance.get_physical_device_features2(physical_device, &mut supported2);
+                feats = supported2.features;
+            }
             (
-                supported2.features,
+                feats,
                 supported13.robust_image_access == vk::TRUE,
+                supported_r2.robust_buffer_access2 == vk::TRUE,
+                supported_r2.robust_image_access2 == vk::TRUE,
+                supported_r2.null_descriptor == vk::TRUE,
             )
         };
         // Vulkan 1.3 core features — dynamicRendering is the whole point of
@@ -520,11 +546,21 @@ impl VulkanDevice {
             .fragment_stores_and_atomics(true)
             .vertex_pipeline_stores_and_atomics(true)
             .robust_buffer_access(supported.robust_buffer_access == vk::TRUE);
-        let create_info = vk::DeviceCreateInfo::default()
+        // Enable whichever robustness2 features the device actually reports (all
+        // three on the measured Radeon 760M). Only chained when the extension is
+        // present so a device without it still creates.
+        let mut robustness2_features = vk::PhysicalDeviceRobustness2FeaturesEXT::default()
+            .robust_buffer_access2(r2_buffer)
+            .robust_image_access2(r2_image)
+            .null_descriptor(r2_null);
+        let mut create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_features(&features)
             .enabled_extension_names(&extension_names)
             .push_next(&mut features13);
+        if robustness2 {
+            create_info = create_info.push_next(&mut robustness2_features);
+        }
 
         // SAFETY: `physical_device` came from this `instance`'s enumeration and
         // was verified above to expose `queue_family_index` as a graphics queue
