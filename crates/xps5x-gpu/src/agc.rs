@@ -58,6 +58,32 @@ pub struct AgcMemoryWrite {
     pub data: Vec<u8>,
 }
 
+/// One end-of-pipe interrupt requested by a `RELEASE_MEM` packet (`interrupt`
+/// field, body DWORD 1 bits 31:24). Hardware raises the EOP interrupt the
+/// kernel delivers to events registered via `sceAgcDriverAddEqEvent`; the
+/// decoder is pure, so it only reports the request — the submit layer triggers
+/// the registered events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgcEopInterrupt {
+    /// DWORD offset of the packet that requested the interrupt.
+    pub packet_offset: u32,
+    pub interrupt: u32,
+    /// The packet's trailing interrupt-context DWORD.
+    pub context_id: u32,
+}
+
+/// One GPU-timestamp label write requested by a `RELEASE_MEM` packet with
+/// `data_selection` 3. Hardware writes the GPU core clock counter — non-zero
+/// and monotonic; the packet's immediate data field is meaningless for this
+/// selection. The decoder reports the target address and the submit layer
+/// supplies the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgcTimestampWrite {
+    /// DWORD offset of the packet that requested the timestamp.
+    pub packet_offset: u32,
+    pub address: u64,
+}
+
 /// One guest-memory copy requested by an `IT_DMA_DATA` packet (Memory →
 /// Memory). The submit layer performs the copy — the decoder is pure and
 /// holds no guest-memory access.
@@ -104,6 +130,10 @@ pub struct AgcSubmission {
     pub waits32: Vec<AgcWait32>,
     /// Event ids signaled by standard `EVENT_WRITE` packets.
     pub events: Vec<u32>,
+    /// End-of-pipe interrupts requested by `RELEASE_MEM` packets.
+    pub eop_interrupts: Vec<AgcEopInterrupt>,
+    /// GPU-timestamp label writes (`RELEASE_MEM` `data_selection` 3).
+    pub timestamp_writes: Vec<AgcTimestampWrite>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -193,11 +223,12 @@ pub fn decode_submission(words: &[u32]) -> Result<AgcSubmission, AgcDecodeError>
         if opcode == IT_NOP && register == R_RELEASE_MEM && dwords >= 7 {
             let body = &words[offset + 1..offset + dwords as usize];
             let data_selection = (body[1] >> 16) & 0xff;
+            let interrupt = (body[1] >> 24) & 0xff;
             let address = u64::from(body[2]) | (u64::from(body[3]) << 32);
             let value = u64::from(body[4]) | (u64::from(body[5]) << 32);
             let data = match data_selection {
                 1 => body[4].to_le_bytes().to_vec(),
-                2 | 3 => value.to_le_bytes().to_vec(),
+                2 => value.to_le_bytes().to_vec(),
                 _ => Vec::new(),
             };
             if address != 0 && !data.is_empty() {
@@ -205,6 +236,23 @@ pub fn decode_submission(words: &[u32]) -> Result<AgcSubmission, AgcDecodeError>
                     packet_offset: offset as u32,
                     address,
                     data,
+                });
+            }
+            // data_selection 3 asks for the GPU core clock counter; the
+            // packet's immediate is zero in real streams, so it must not be
+            // written verbatim (a title polling the label for non-zero would
+            // wait forever).
+            if data_selection == 3 && address != 0 {
+                result.timestamp_writes.push(AgcTimestampWrite {
+                    packet_offset: offset as u32,
+                    address,
+                });
+            }
+            if interrupt != 0 {
+                result.eop_interrupts.push(AgcEopInterrupt {
+                    packet_offset: offset as u32,
+                    interrupt,
+                    context_id: body.get(6).copied().unwrap_or(0),
                 });
             }
         }
@@ -424,6 +472,82 @@ mod tests {
                 mask: 0xffff_ffff,
                 function: 3,
                 reference: 0xaabb_ccdd,
+            }]
+        );
+    }
+
+    #[test]
+    fn release_mem_timestamp_selection_reports_address_not_zero_immediate() {
+        // data_selection 3 = GPU clock counter. Real streams leave the packet's
+        // immediate zero (hardware supplies the clock), so decoding it as an
+        // immediate write left titles polling a fence stuck at zero.
+        let words = [
+            header(8, IT_NOP, R_RELEASE_MEM),
+            0,
+            3 << 16,
+            0x3000,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let decoded = decode_submission(&words).unwrap();
+        assert!(decoded.memory_writes.is_empty());
+        assert_eq!(
+            decoded.timestamp_writes,
+            [AgcTimestampWrite {
+                packet_offset: 0,
+                address: 0x3000,
+            }]
+        );
+        assert!(decoded.eop_interrupts.is_empty());
+    }
+
+    #[test]
+    fn release_mem_interrupt_forms_report_eop_interrupts() {
+        // Interrupt-only (data_selection 0, no address) previously decoded to
+        // nothing at all; an interrupt riding on a sel=1 write must report
+        // both the write and the interrupt.
+        let words = [
+            header(8, IT_NOP, R_RELEASE_MEM),
+            0,
+            2 << 24,
+            0,
+            0,
+            0,
+            0,
+            0x77,
+            header(8, IT_NOP, R_RELEASE_MEM),
+            0,
+            (1 << 16) | (3 << 24),
+            0x4000,
+            0,
+            0x5555_5555,
+            0,
+            0x88,
+        ];
+        let decoded = decode_submission(&words).unwrap();
+        assert_eq!(
+            decoded.eop_interrupts,
+            [
+                AgcEopInterrupt {
+                    packet_offset: 0,
+                    interrupt: 2,
+                    context_id: 0x77,
+                },
+                AgcEopInterrupt {
+                    packet_offset: 8,
+                    interrupt: 3,
+                    context_id: 0x88,
+                },
+            ]
+        );
+        assert_eq!(
+            decoded.memory_writes,
+            [AgcMemoryWrite {
+                packet_offset: 8,
+                address: 0x4000,
+                data: 0x5555_5555u32.to_le_bytes().to_vec(),
             }]
         );
     }

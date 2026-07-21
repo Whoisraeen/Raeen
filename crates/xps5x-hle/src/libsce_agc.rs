@@ -766,6 +766,11 @@ fn hle_driver_register_resource(ctx: &HleContext, args: &[u64]) -> u64 {
     0
 }
 
+/// Kernel event filter for GPU events registered via `sceAgcDriverAddEqEvent`
+/// (Orbis `SCE_KERNEL_EVFILT_GRAPHICS_CORE`). Distinguishes them from user
+/// events so a RELEASE_MEM end-of-pipe interrupt can find and trigger them.
+const EVFILT_GRAPHICS_CORE: i16 = -14;
+
 /// `sceAgcDriverAddEqEvent(equeue, eventId, userData)`: register an Agc event on
 /// the event queue (reuses the kernel event-queue user-event machinery).
 fn hle_driver_add_eq_event(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -779,6 +784,7 @@ fn hle_driver_add_eq_event(ctx: &HleContext, args: &[u64]) -> u64 {
         (equeue, event_id),
         xps5x_kernel::EqueueUserEvent {
             udata: user_data,
+            filter: EVFILT_GRAPHICS_CORE,
             ..Default::default()
         },
     );
@@ -1033,6 +1039,26 @@ fn submit_validate(ctx: &HleContext, packet: u64, queue: &'static str) -> u64 {
 /// and the multi-buffer array paths (`sceAgcDriverSubmitMulti{Dcbs,Acbs}`)
 /// both land here, so array submissions get the REAL semantics — sync writes,
 /// DMA, events, flips, and `ctx.gpu.submit` — not just validation.
+/// Next value for a RELEASE_MEM GPU-timestamp fence: the session monotonic
+/// clock in nanoseconds, forced strictly increasing across calls (and
+/// therefore never zero) the way the hardware clock counter is. The state
+/// lives on `OrbisKernel` so a relaunched session restarts from its own
+/// clock instead of counting up from a prior session's final value (which
+/// would collapse timestamp deltas to ~1 ns).
+fn next_gpu_timestamp(ctx: &HleContext) -> u64 {
+    use std::sync::atomic::Ordering;
+    let now = u64::try_from(ctx.services.monotonic_elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let mut next = now.max(1);
+    let _ = ctx
+        .kernel
+        .agc_gpu_timestamp
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+            next = now.max(prev.saturating_add(1));
+            Some(next)
+        });
+    next
+}
+
 fn submit_command_buffer(
     ctx: &HleContext,
     command_address: u64,
@@ -1064,6 +1090,21 @@ fn submit_command_buffer(
                 bytes = write.data.len(),
                 packet_offset = write.packet_offset,
                 "AGC synchronization write targeted unreadable guest memory"
+            );
+            return SCE_ERROR_INVALID_ARGUMENT;
+        }
+    }
+    // RELEASE_MEM `data_selection` 3 fences: hardware writes the GPU core
+    // clock counter — non-zero and monotonic. Writing the packet's zero
+    // immediate instead left titles polling a fence stuck at zero (measured:
+    // ASTRO.BOT render thread parked forever holding its context mutex).
+    for ts in &decoded.timestamp_writes {
+        let value = next_gpu_timestamp(ctx);
+        if !ctx.mem.write(ts.address, &value.to_le_bytes()) {
+            tracing::warn!(
+                address = ts.address,
+                packet_offset = ts.packet_offset,
+                "AGC timestamp fence targeted unreadable guest memory"
             );
             return SCE_ERROR_INVALID_ARGUMENT;
         }
@@ -1116,6 +1157,31 @@ fn submit_command_buffer(
                 event.triggered = true;
                 event.fflags = event.fflags.saturating_add(1);
                 event.data = i64::from(*event_id);
+            }
+        }
+    }
+    // RELEASE_MEM end-of-pipe interrupts: hardware raises the EOP interrupt
+    // and the kernel delivers it to every event registered via
+    // sceAgcDriverAddEqEvent. These packets carry no memory write, so without
+    // this bridge an interrupt-only completion is signaled by no component.
+    // Fidelity debt: real delivery is per (equeue, event id) with the
+    // interrupt selector (1-3) distinguishing pipe/type; this broadcasts to
+    // every graphics-core event and folds N interrupts into one trigger.
+    // Over-signaling is safe under the eager-completion model ("done" is
+    // already true when submit returns), but revisit if a title registers
+    // distinct events for graphics vs compute EOP and routes on data/ident.
+    if !decoded.eop_interrupts.is_empty() {
+        let count = decoded.eop_interrupts.len() as u32;
+        let last_context = decoded
+            .eop_interrupts
+            .last()
+            .map(|i| i.context_id)
+            .unwrap_or(0);
+        for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {
+            if event.filter == EVFILT_GRAPHICS_CORE {
+                event.triggered = true;
+                event.fflags = event.fflags.saturating_add(count);
+                event.data = i64::from(last_context);
             }
         }
     }
@@ -3575,6 +3641,80 @@ mod tests {
         let mut b = [0u8; 8];
         assert!(ctx.mem.read(addr, &mut b));
         u64::from_le_bytes(b)
+    }
+
+    #[test]
+    fn submit_signals_timestamp_fences_and_eop_interrupts() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // DCB at 0x900: one data_selection=3 (GPU timestamp) RELEASE_MEM
+        // targeting the fence at 0x980, then one interrupt-only RELEASE_MEM
+        // (data_selection 0, no address, interrupt=2).
+        let words: [u32; 16] = [
+            pm4(8, IT_NOP, R_RELEASE_MEM),
+            0,
+            3 << 16,
+            0x980,
+            0,
+            0,
+            0,
+            0,
+            pm4(8, IT_NOP, R_RELEASE_MEM),
+            0,
+            2 << 24,
+            0,
+            0,
+            0,
+            0,
+            0x55,
+        ];
+        for (index, word) in words.iter().enumerate() {
+            assert!(ctx.mem.write(0x900 + index as u64 * 4, &word.to_le_bytes()));
+        }
+        let eq = kernel.create_equeue(0);
+        assert_eq!(hle_driver_add_eq_event(&ctx, &[eq, 0x84, 0xCAFE]), 0);
+        // Bystanders on the same queue: a plain user event (default filter)
+        // and a VideoOut event (-13). The EOP broadcast must key on the
+        // graphics-core filter and leave both untouched.
+        kernel
+            .kernel_equeue_events
+            .insert((eq, 0x99), xps5x_kernel::EqueueUserEvent::default());
+        kernel.kernel_equeue_events.insert(
+            (eq, 0x9a),
+            xps5x_kernel::EqueueUserEvent {
+                filter: -13,
+                ..Default::default()
+            },
+        );
+        assert!(ctx.mem.write(0x180, &0x900u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x188, &16u32.to_le_bytes()));
+        assert_eq!(hle_driver_submit_dcb(&ctx, &[0x180]), 0);
+        // The timestamp fence is written non-zero (the packet's immediate is
+        // zero — a title polls this label for a non-zero/advancing clock).
+        let first = read_u64(&ctx, 0x980);
+        assert_ne!(first, 0, "timestamp fence must not stay zero");
+        // The EOP interrupt triggered the registered AGC event — and ONLY it:
+        // the user event and the VideoOut event on the same queue stay quiet.
+        {
+            let event = kernel.kernel_equeue_events.get(&(eq, 0x84)).unwrap();
+            assert!(event.triggered, "EOP interrupt must trigger the AGC event");
+            assert_eq!(event.filter, EVFILT_GRAPHICS_CORE);
+            assert_eq!(event.data, 0x55);
+            let user = kernel.kernel_equeue_events.get(&(eq, 0x99)).unwrap();
+            assert!(!user.triggered, "user event must not see the EOP broadcast");
+            let vout = kernel.kernel_equeue_events.get(&(eq, 0x9a)).unwrap();
+            assert!(
+                !vout.triggered,
+                "VideoOut event must not see the EOP broadcast"
+            );
+        }
+        // A second submission advances the fence (monotonic clock counter).
+        assert_eq!(hle_driver_submit_dcb(&ctx, &[0x180]), 0);
+        let second = read_u64(&ctx, 0x980);
+        assert!(
+            second > first,
+            "timestamp fence must advance: {first} -> {second}"
+        );
     }
 
     #[test]

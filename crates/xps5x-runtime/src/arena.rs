@@ -1080,18 +1080,22 @@ impl GuestArena {
         if end == addr {
             return self.range_is_committed(addr, end);
         }
+        // Cap the range this backs so a mis-decoded GPU read of a wild/huge
+        // range cannot spin this loop over billions of pages. A real title
+        // resource fits well under this; anything larger is refused (read
+        // skipped). 256 MiB matches the resource read cap in
+        // `xps5x_gpu::guest_mem`.
+        const MAX_COMMIT_RANGE: u64 = 0x1000_0000;
+        if len > MAX_COMMIT_RANGE {
+            return false;
+        }
         // Back each `Reserved` page via the per-page `commit_on_demand`, which
-        // acquires and RELEASES the state lock per page. Holding the lock across
-        // a whole multi-megabyte range's `MEM_COMMIT` loop (thousands of pages,
-        // each a `VirtualAlloc` that can page-fault under host memory pressure)
-        // would starve any guest thread faulting into its own demand-commit for
-        // seconds — and a guest thread stalled there while holding a guest mutex
-        // deadlocks the title's boot (measured on ASTRO.BOT: a 1080p texture the
-        // format-5/tile-5 fixes newly decode is 8 MiB / ~2k pages). Releasing the
-        // lock per page lets those guest commits interleave. `commit_on_demand`
-        // is a no-op for already-backed and non-reservation pages, so the final
-        // `range_is_committed` is what decides visibility (free/foreign pages
-        // leave the range not fully backed and the read is still refused).
+        // acquires and RELEASES the state lock per page so a guest thread
+        // faulting into its own demand-commit can interleave rather than block on
+        // one long lock hold. `commit_on_demand` is a no-op for already-backed and
+        // non-reservation pages, so the final `range_is_committed` decides
+        // visibility (free/foreign pages leave the range not fully backed and the
+        // read is still refused).
         let mut page = addr & !(PAGE_SIZE - 1);
         while page < end {
             self.commit_on_demand(page);

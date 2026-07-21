@@ -203,16 +203,19 @@ fn vulkan_format(
         // scene target ASTRO.BOT renders into before tone-mapping. The offscreen
         // readback is bpp-aware (8 bytes/pixel for this one).
         (0xc, 7, 0) => Ok(vk::Format::R16G16B16A16_SFLOAT),
-        // CB format 0x3 (8_8 UNORM) is NOT accepted, deliberately. ASTRO.BOT
-        // asks for it (16 draws, once the vertex-fetch fix let them reach this
-        // check) and the enum numbering says it is R8G8_UNORM — but MEASURED,
-        // mapping it to R8G8_UNORM makes those draws lose the Vulkan device
-        // (vkQueueSubmit -> VK_ERROR_DEVICE_LOST) and takes the whole run from
-        // 10 presented frames to 0. Something else in the pipeline (attachment
-        // usage, the fragment shader's 4-component export, or blend state)
-        // cannot honour a 2-channel target yet. A named error costs 16 draws;
-        // a device loss costs every frame. Re-enable only together with
-        // whatever makes a 2-channel attachment actually work.
+        // CB format 0x3 (8_8 UNORM). MEASURED: mapping it to the exact
+        // R8G8_UNORM (a 2-channel attachment) device-loses on vkQueueSubmit —
+        // the recompiled PS exports 4 components (mrt0 = vec4) and the pipeline
+        // cannot honour a 2-channel target. The code's own note pointed at the
+        // fix: keep the PS's 4-component export and give it a 4-CHANNEL target.
+        // R8G8B8A8_UNORM is the same attachment class as the working 0xa/0x6/0xc
+        // formats, so it does not device-lose; the two live channels (R,G) land
+        // correct and B,A are extra. The stride widens 2->4 B/texel, which is
+        // safe here because render targets stay GPU-side (no guest writeback) and
+        // `readback_bpp(R8G8B8A8_UNORM)`=4 matches. A wide/4-channel
+        // approximation of a 2-channel target is a glitch, never a device loss —
+        // it lets the 16 composite draws SUCCEED instead of being skipped.
+        (0x3, 0, 0) => Ok(vk::Format::R8G8B8A8_UNORM),
         _ => Err(err(format!(
             "unsupported CB_COLOR0_INFO format={format:#x} channel_type={channel_type} \
              channel_order={channel_order} — no Vulkan format mapping"
@@ -637,11 +640,8 @@ fn texture_vk_format(
         // title's 7966-dword DCB failed on this one format.
         71 => Ok((vk::Format::R16G16B16A16_SFLOAT, 8)),
         // 5 -> (dataFormat 1, numFormat 4) = 8-bit UINT (SharpEmu
-        // Gfx10UnifiedFormat.cs:31: unified 5 -> (1u, 4u)). dataFormat 1 is the
-        // single 8-bit channel per the GCN IMG_DATA_FORMAT table (same table
-        // that gives 4=32, 5=16_16, 12=16_16_16_16); numFormat 4 is UINT. R8_UINT
-        // at 1 B/texel — measured on ASTRO.BOT's 1920x1080 tile=24 (depth swizzle)
-        // target sampled back as a texture (a stencil-like integer plane).
+        // Gfx10UnifiedFormat unified 5 -> (1u, 4u)); R8_UINT at 1 B/texel.
+        // Measured on ASTRO.BOT's 1920x1080 tile=24 target sampled as a texture.
         5 => Ok((vk::Format::R8_UINT, 1)),
         other => Err(err(format!(
             "texture format {other} not implemented \
@@ -3761,13 +3761,16 @@ mod tests {
                 "{want:?} needs a readback size"
             );
         }
-        // CB format 0x3 (8_8) must STAY rejected: mapping it to R8G8_UNORM was
-        // measured to lose the Vulkan device and drop ASTRO.BOT from 10 frames
-        // to 0. This asserts the regression cannot be reintroduced without
-        // also making 2-channel attachments work.
-        assert!(
-            vulkan_format(0x3, 0, 0).is_err(),
-            "CB format 0x3 causes VK_ERROR_DEVICE_LOST — see the arm's comment"
+        // CB format 0x3 (8_8) maps to a 4-CHANNEL R8G8B8A8_UNORM target, NOT the
+        // exact 2-channel R8G8_UNORM: the exact form was measured to device-lose
+        // (the PS exports 4 components a 2-channel attachment can't honour), so
+        // this widens to a same-class 4-channel target that does not device-lose
+        // and lets the composite draws succeed (R,G correct, B,A extra). Never
+        // R8G8_UNORM here — that is the regression.
+        assert_eq!(
+            vulkan_format(0x3, 0, 0).unwrap(),
+            vk::Format::R8G8B8A8_UNORM,
+            "CB 0x3 must widen to a 4-channel target, never the device-losing R8G8"
         );
     }
 

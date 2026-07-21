@@ -275,6 +275,10 @@ pub struct OrbisKernel {
     pub agc_dispatch_packet_count: std::sync::atomic::AtomicU64,
     /// VideoOut flip packets observed across valid AGC DCB submissions.
     pub agc_flip_packet_count: std::sync::atomic::AtomicU64,
+    /// Last RELEASE_MEM GPU-timestamp fence value written for this session
+    /// (per-session so a relaunch restarts with the session's monotonic clock
+    /// instead of counting up from a prior session's final value).
+    pub agc_gpu_timestamp: std::sync::atomic::AtomicU64,
     /// Most recently submitted DCB address (diagnostic capture metadata).
     pub agc_last_dcb_address: std::sync::atomic::AtomicU64,
     /// Most recently submitted DCB length in DWORDs.
@@ -776,6 +780,7 @@ impl OrbisKernel {
             agc_draw_packet_count: std::sync::atomic::AtomicU64::new(0),
             agc_dispatch_packet_count: std::sync::atomic::AtomicU64::new(0),
             agc_flip_packet_count: std::sync::atomic::AtomicU64::new(0),
+            agc_gpu_timestamp: std::sync::atomic::AtomicU64::new(0),
             agc_last_dcb_address: std::sync::atomic::AtomicU64::new(0),
             agc_last_dcb_dwords: std::sync::atomic::AtomicU32::new(0),
             agc_register_defaults_addr: std::sync::atomic::AtomicU64::new(0),

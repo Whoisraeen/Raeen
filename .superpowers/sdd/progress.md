@@ -2430,3 +2430,37 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   suffixed arrays + per-dim index assignment in prepare_stage_binding +
   per-instruction dim resolution replacing whole-shader
   sampled_texture_dim in the sample bodies).
+
+## 2026-07-21 (session: Shell-log diagnosis + AGC EOP signaling fix)
+
+- 10-agent verified diagnosis of the fresh ASTRO.BOT Shell log (5 tracks, all
+  adversarially re-verified; full reports in the session's w6s0ek438 output;
+  synthesis in memory astro-bot-boot-state 2026-07-21h).
+- agc-eop-signaling: complete (uncommitted; 345 hle + 157 gpu tests, clippy
+  clean). RELEASE_MEM decode: sel=3 → AgcTimestampWrite (was: wrote the
+  packet's ZERO immediate — fences never advanced); interrupt bits 31:24 →
+  AgcEopInterrupt. Submit: monotonic non-zero timestamp writes
+  (next_gpu_timestamp), EOP interrupts trigger kevents with
+  filter=EVFILT_GRAPHICS_CORE(-14); sceAgcDriverAddEqEvent registers -14.
+  Tests: release_mem_timestamp_selection_reports_address_not_zero_immediate,
+  release_mem_interrupt_forms_report_eop_interrupts,
+  submit_signals_timestamp_fences_and_eop_interrupts.
+- ACCEPTANCE: the scePthreadMutexLock >3s Resident-Load deadlock (waiter=main,
+  owner=render thread 21) is GONE — 0 warns in 3 live release runs (was 100%).
+- NEW boot-stopper unlocked by the fix: host segfault (rc=139) ~1s after first
+  submissions, GPU worker inside the invalid-work dispatch (structurally
+  invalid SPIR-V — no structurizer — + 304>256 push constants + R8_UINT/FLOAT
+  descriptor). Reproduces with validation on AND off; no guest-thread activity
+  in the window → not an event-wakeup regression.
+- NEXT (in order, all code-mapped in memory 2026-07-21h): (1) translate-time
+  SPIR-V validity gate (invalid module → named skip, never reaches the
+  driver) + dispatch-loop relooper (OpLoopMerge+OpSwitch over guest blocks);
+  (2) push-constant SSBO spill (interim: named-skip guard when >device max);
+  (3) numeric-class-aware OpTypeImage (uint/sint per T# numFormat).
+- emulator-reviewer pass: no critical findings; applied its two important
+  items — agc_gpu_timestamp moved to OrbisKernel (per-session, relaunch keeps
+  real clock deltas) + negative test pinning EOP broadcast filter isolation
+  (user/-13 VideoOut events on the same queue stay untriggered). Honesty note:
+  deadlock-gone was verified on the CLI path (3 runs); Shell-path confirmation
+  still owed once the SPIR-V-validity segfault is gated (process dies ~1s
+  after submissions on both paths until then).
