@@ -23,6 +23,13 @@ use egui::{Align, Layout, RichText, UiBuilder};
 use std::path::Path;
 use xps5x_core::config::EmulatorConfig;
 
+/// Pointer selection reported to the Shell after the Settings surface draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsClick {
+    Section(usize),
+    Row(usize),
+}
+
 /// Section names, in the order `nav::NavState::settings_section` indexes.
 pub const SETTINGS_SECTION_NAMES: [&str; 8] = [
     "Video",
@@ -150,7 +157,7 @@ pub fn draw(
     new_folder_input: &mut String,
     key_provider_input: &mut String,
     updater: &crate::updater::UpdaterState,
-) {
+) -> Option<SettingsClick> {
     let screen = ui.max_rect();
     ui.painter().rect_filled(screen, 0.0, theme.palette.ground);
 
@@ -216,6 +223,47 @@ pub fn draw(
             );
         });
     });
+
+    // The screen uses fixed explicit anchors. Put transparent interaction
+    // rectangles over those same anchors so pointer users can select a
+    // section or directly activate a setting without changing the painter-
+    // driven visual layout.
+    let section_top = screen.top() + 86.0;
+    for section in 0..SETTINGS_SECTION_NAMES.len() {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(screen.left() + 54.0, section_top + section as f32 * 33.0),
+            egui::vec2(200.0, 30.0),
+        );
+        if ui
+            .interact(
+                rect,
+                ui.id().with(("settings-section", section)),
+                egui::Sense::click(),
+            )
+            .clicked()
+        {
+            return Some(SettingsClick::Section(section));
+        }
+    }
+    let row_count = settings_row_counts(config.paths.game_folders.len())[nav.settings_section];
+    for row_index in 0..row_count {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(screen.left() + 294.0, section_top + row_index as f32 * 28.0),
+            egui::vec2(560.0, 27.0),
+        );
+        if ui
+            .interact(
+                rect,
+                ui.id()
+                    .with(("settings-row", nav.settings_section, row_index)),
+                egui::Sense::click(),
+            )
+            .clicked()
+        {
+            return Some(SettingsClick::Row(row_index));
+        }
+    }
+    None
 }
 
 fn draw_video(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, config: &EmulatorConfig) {

@@ -398,7 +398,9 @@ impl Shell {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
                     self.config.general.fullscreen,
                 ));
-                if !self.config.general.fullscreen {
+                if self.config.general.fullscreen {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+                } else {
                     // Restore all normal-window properties explicitly. Some
                     // Windows compositors retain the borderless fullscreen
                     // geometry after only clearing the fullscreen flag.
@@ -648,9 +650,6 @@ impl Shell {
                 if i.key_pressed(Key::Tab) {
                     inputs.push(NavInput::Tab);
                 }
-                if i.pointer.primary_clicked() {
-                    inputs.push(NavInput::Confirm);
-                }
                 if i.pointer.secondary_clicked() {
                     inputs.push(NavInput::Back);
                 }
@@ -849,6 +848,8 @@ impl Shell {
     fn draw(&mut self, ctx: &egui::Context) {
         let theme = self.theme.clone();
         let frame = egui::Frame::NONE.fill(theme.palette.ground);
+        let mut clicked_home_tile = None;
+        let mut clicked_setting = None;
 
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             if let Some(session) = &self.session {
@@ -863,7 +864,7 @@ impl Shell {
             }
 
             if self.nav.mode == NavMode::Settings {
-                settings::draw(
+                clicked_setting = settings::draw(
                     ui,
                     &theme,
                     &self.nav,
@@ -882,7 +883,7 @@ impl Shell {
                 focus_pop: self.focus_pop.value,
             };
             let items = self.active_items();
-            home::draw(
+            clicked_home_tile = home::draw(
                 ui,
                 &theme,
                 items,
@@ -899,6 +900,32 @@ impl Shell {
             let recent_titles = self.recent_titles();
             control_center::draw(ui, &theme, &self.nav, self.cc_open.value, &recent_titles);
         });
+        if let Some(index) = clicked_home_tile {
+            self.nav.mode = NavMode::Home;
+            self.nav.rail_index = index;
+            match self.nav.apply(NavInput::Confirm) {
+                NavAction::Launch(index) => self.begin_launch(index),
+                NavAction::LaunchMedia(index) => self.confirm_media(index),
+                NavAction::OpenSettings => self.enter_settings(),
+                _ => {}
+            }
+        }
+        if let Some(clicked) = clicked_setting {
+            match clicked {
+                settings::SettingsClick::Section(section) => {
+                    self.nav.settings_section = section;
+                    self.nav.settings_row = 0;
+                }
+                settings::SettingsClick::Row(row) => {
+                    self.nav.settings_row = row;
+                    // Text-entry sections retain native egui widget behavior;
+                    // clicking other rows has the same meaning as Confirm.
+                    if !matches!(self.nav.settings_section, 3 | 4) {
+                        self.apply_setting_activate(ctx, self.nav.settings_section, row);
+                    }
+                }
+            }
+        }
     }
 
     /// Resolve the recent-titles id history to display titles, most-recent-

@@ -319,6 +319,11 @@ pub struct OrbisKernel {
     /// AMPR command-buffer write offsets, keyed by the command-buffer address
     /// (the current write cursor `sceAmprCommandBufferGetCurrentOffset` reads).
     pub ampr_write_offsets: DashMap<u64, u64>,
+    /// AMPR per-command-buffer appended-record counts, keyed by the
+    /// command-buffer address (`sceAmprCommandBufferGetNumCommands` reads;
+    /// SharpEmu's `AmprCommandBufferState.CommandCount` — zeroed on
+    /// construct/reset, incremented per appended record).
+    pub ampr_command_counts: DashMap<u64, u64>,
     /// The libSceFiber context-size-check profiling toggle (0 = off, 1 = on).
     pub fiber_context_size_check: std::sync::atomic::AtomicU32,
     /// Suspended-fiber snapshots keyed by the guest `SceFiber` address: the
@@ -785,6 +790,7 @@ impl OrbisKernel {
             event_flag_signal: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
             semaphore_signal: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
             ampr_write_offsets: DashMap::new(),
+            ampr_command_counts: DashMap::new(),
             fiber_context_size_check: std::sync::atomic::AtomicU32::new(0),
             fibers: DashMap::new(),
             fiber_threads: DashMap::new(),

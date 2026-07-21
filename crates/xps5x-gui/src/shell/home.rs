@@ -74,7 +74,7 @@ pub fn draw(
     bg_from: Option<&egui::TextureHandle>,
     bg_to: Option<&egui::TextureHandle>,
     controller_icons: ControllerIconStyle,
-) {
+) -> Option<usize> {
     let screen = ui.max_rect();
     let painter = ui.painter().clone();
     let focused = items.get(nav.rail_index);
@@ -103,7 +103,7 @@ pub fn draw(
         Pos2::new(screen.left(), screen.top() + RAIL_TOP),
         vec2(screen.width(), focused_size + 16.0),
     );
-    draw_rail(ui, theme, rail_rect, items, nav, anim, covers);
+    let clicked_tile = draw_rail(ui, theme, rail_rect, items, nav, anim, covers);
 
     draw_context_block(
         &painter,
@@ -119,6 +119,7 @@ pub fn draw(
     // animating, so keep the screen gently alive.
     ui.ctx()
         .request_repaint_after(std::time::Duration::from_millis(50));
+    clicked_tile
 }
 
 /// Paint the Home hero. A user theme's background image (spec §6), else the
@@ -402,7 +403,7 @@ fn draw_rail(
     nav: &NavState,
     anim: &HomeAnim,
     covers: &HashMap<String, egui::TextureHandle>,
-) {
+) -> Option<usize> {
     // Slightly expanded clip so the focused tile's offset ring isn't cut off.
     let painter = ui.painter_at(rect.expand(18.0));
     let m = &theme.metrics;
@@ -422,6 +423,7 @@ fn draw_rail(
         order.push(nav.rail_index);
     }
 
+    let mut clicked = None;
     for i in order {
         let item = &items[i];
         let focused = i == nav.rail_index;
@@ -448,6 +450,16 @@ fn draw_rail(
         }
 
         let tile_rect = Rect::from_min_size(Pos2::new(x, center_y - size / 2.0), vec2(size, size));
+        if ui
+            .interact(
+                tile_rect,
+                ui.id().with(("home-tile", i)),
+                egui::Sense::click(),
+            )
+            .clicked()
+        {
+            clicked = Some(i);
+        }
         let radius = m.corner_radius * size / m.tile_size;
 
         // Soft drop shadow so tiles read as raised cards, especially over a
@@ -541,6 +553,7 @@ fn draw_rail(
             );
         }
     }
+    clicked
 }
 
 /// UV rect that center-crops a cover texture to the rail tile's square

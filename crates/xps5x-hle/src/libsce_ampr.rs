@@ -53,6 +53,11 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register(
         "libSceAmpr",
+        "sceAmprCommandBufferGetNumCommands",
+        hle_get_num_commands,
+    );
+    registry.register(
+        "libSceAmpr",
         "sceAmprAprCommandBufferReadFile",
         hle_apr_read_file,
     );
@@ -92,6 +97,10 @@ fn write_cb(ctx: &HleContext, cb: u64, buffer: u64, size: u64, write_offset: u64
         && ctx.mem.write(cb + CB_AUX1_OFFSET, &0u64.to_le_bytes());
     if ok {
         ctx.kernel.ampr_write_offsets.insert(cb, write_offset);
+        // Construct/reset both rewind through here: the appended-record count
+        // starts over with the cursor (SharpEmu zeroes `CommandCount` in its
+        // constructor and reset paths).
+        ctx.kernel.ampr_command_counts.insert(cb, 0);
     }
     ok
 }
@@ -118,8 +127,27 @@ fn hle_dtor(ctx: &HleContext, args: &[u64]) -> u64 {
     let cb = args.first().copied().unwrap_or(0);
     if cb != 0 {
         ctx.kernel.ampr_write_offsets.remove(&cb);
+        ctx.kernel.ampr_command_counts.remove(&cb);
     }
     0
+}
+
+/// `sceAmprCommandBufferGetNumCommands(cb)`: return the number of command
+/// records appended since construct/reset (SharpEmu's
+/// `CommandBufferGetNumCommands`, which reads `state.CommandCount`). A null
+/// `cb` is `SCE_ERROR_INVALID_ARGUMENT`; an untracked one is
+/// `SCE_ERROR_MEMORY_FAULT` — measured: ASTRO.BOT's async .skel loader calls
+/// this on a buffer it just built, and died on the unresolved-import stub
+/// before this existed.
+fn hle_get_num_commands(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    if cb == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    match ctx.kernel.ampr_command_counts.get(&cb) {
+        Some(count) => *count,
+        None => SCE_ERROR_MEMORY_FAULT,
+    }
 }
 
 /// `sceAmprCommandBufferSetBuffer(cb, buffer, size)`: rebind the buffer.
@@ -236,6 +264,13 @@ fn append_record(ctx: &HleContext, cb: u64, record: &[u8]) -> bool {
     ctx.kernel
         .ampr_write_offsets
         .insert(cb, offset + record_len);
+    // SharpEmu `AppendCommandBufferRecord` bumps `state.CommandCount` after a
+    // successful append; `sceAmprCommandBufferGetNumCommands` reports it.
+    ctx.kernel
+        .ampr_command_counts
+        .entry(cb)
+        .and_modify(|count| *count += 1)
+        .or_insert(1);
     true
 }
 
