@@ -162,6 +162,31 @@ commit if green; its report is authoritative over this doc for those items.
 Run it; walk faults with the fault-site reporter + `--resolve-got` +
 `--find-calls`. Its multi-submit path is ready and tested.
 
+### 4.5 120 FPS — MEASURED CEILING IS TITLE-CPU, NOT GRAPHICS (2026-07-21)
+Do not chase the vblank/present path for 120 FPS — it is already fast enough.
+Hard measurements (release, stages A–C + epoch vblank committed):
+- **Present pipeline capability: >120 fps proven.** Min inter-flip interval
+  2.03 ms (~490/s); `sceVideoOutSubmitFlip` has NO pacing sleep (records +
+  returns); Minecraft never calls `sceVideoOutWaitVblank` (0 calls) so
+  `XPS5X_VBLANK_HZ` is IRRELEVANT to it (it applies only to titles that park
+  on vblank). The stage-C "vblank sleep was the ceiling" note was for the
+  WaitVblank path; Minecraft is the SubmitFlip path and was never throttled
+  by us.
+- **ASTRO.BOT: ~4 fps, GPU/compute-bound** (present indices 64→128 spanned
+  15.3 s). Heavy HDR dispatches + per-flush readback. Matches SharpEmu's
+  heavy-3D-title territory. Not a 120 candidate.
+- **Minecraft boot animation: steady ~43 fps, TITLE-guest-CPU-bound.**
+  Inter-flip intervals cluster tightly at 22–23 ms (NOT bursty, NO cluster
+  at 8 ms) = the title's own boot-animation loop costs ~22 ms of guest x86
+  per frame. It never negotiates a 120 mode (`IsOutputSupported`/
+  `ConfigureOutput` = 0 calls). Our GPU/present is not the cap.
+- **CONCLUSION:** 120 FPS on a game is blocked on TITLE PROGRESSION (reaching
+  a light, unthrottled gameplay/menu phase — M4/M5 work), not on graphics
+  perf. The graphics stack is done for this goal. The next real lever is CPU:
+  faster guest execution per frame and getting a title into a real render
+  phase. Do NOT fake a 120 number (acceptance-gate rule); demonstrate it only
+  with a measured per-second flip bucket ≥120 on a title actually rendering.
+
 ## 5. Honesty protocols (non-negotiable)
 
 - **Rendering claim**: dump frames; histogram multiple offsets
