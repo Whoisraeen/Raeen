@@ -21,7 +21,26 @@ const VIDEO_OUT_ERROR_INVALID_VALUE: u64 = 0x8029_0001;
 const VIDEO_OUT_ERROR_INVALID_ADDRESS: u64 = 0x8029_0002;
 const VIDEO_OUT_ERROR_RESOURCE_BUSY: u64 = 0x8029_0009;
 const VIDEO_OUT_ERROR_INVALID_HANDLE: u64 = 0x8029_000B;
+const VIDEO_OUT_ERROR_INVALID_EVENT: u64 = 0x8029_000D;
+const VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE: u64 = 0x8029_0016;
 const VIDEO_OUT_ERROR_INVALID_OPTION: u64 = 0x8029_001A;
+/// SCE "memory fault" (`0x8002_0000 | EFAULT`) — SharpEmu returns this generic
+/// kernel error (not a VideoOut one) when an event/options block is unreadable.
+const SCE_ERROR_MEMORY_FAULT: u64 = 0x8002_000E;
+/// Kernel-event `ident` of a VideoOut **flip** event (SharpEmu
+/// `SceVideoOutInternalEventFlip`).
+const VIDEO_OUT_EVENT_FLIP_ID: u64 = 0x6;
+/// Kernel-event `ident` of a VideoOut **vblank** event (SharpEmu
+/// `SceVideoOutInternalEventVblank`).
+const VIDEO_OUT_EVENT_VBLANK_ID: u64 = 0x40;
+/// `SceKernelEvent.filter` for VideoOut events.
+const KERNEL_EVENT_FILTER_VIDEO_OUT: i16 = -13;
+/// Size of the `SceVideoOutOutputOptions` block (SharpEmu
+/// `VideoOutOutputOptionsSize`).
+const OUTPUT_OPTIONS_SIZE: usize = 0x40;
+/// `SceVideoOutOutputMode` values accepted by `IsOutputSupported` (SharpEmu).
+const OUTPUT_MODE_DEFAULT: u64 = 1;
+const OUTPUT_MODE_119_88_HZ: u64 = 0xF;
 /// Default display width reported by `GetResolutionStatus` (1080p).
 const DISPLAY_WIDTH: u32 = 1920;
 /// Default display height.
@@ -101,6 +120,50 @@ pub fn register(registry: &HleRegistry) {
         "sceVideoOutIsFlipPending",
         hle_is_flip_pending,
     );
+    // UE5 pair (Until Dawn PPSA15421 + Dragon Ball Sparking Zero PPSA15210 —
+    // identical libSceVideoOut gap set) + A Plague Tale Requiem trio. Every
+    // name hashes to the NID the titles import (verified with --imports).
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutIsOutputSupported",
+        hle_is_output_supported,
+    );
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutConfigureOutput",
+        hle_configure_output,
+    );
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutInitializeOutputOptions",
+        hle_initialize_output_options,
+    );
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutSetWindowModeMargins",
+        hle_set_window_mode_margins,
+    );
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutUnregisterBuffers",
+        hle_unregister_buffers,
+    );
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutAddVblankEvent",
+        hle_add_vblank_event,
+    );
+    registry.register("libSceVideoOut", "sceVideoOutGetEventId", hle_get_event_id);
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutVrrPegToFixedRate",
+        hle_vrr_fixed_rate,
+    );
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutVrrUnpegFromFixedRate",
+        hle_vrr_fixed_rate,
+    );
 }
 
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
@@ -129,8 +192,23 @@ fn hle_close(_ctx: &HleContext, args: &[u64]) -> u64 {
 /// event that is edge-triggered whenever a direct or AGC-embedded flip
 /// completes.
 fn hle_add_flip_event(ctx: &HleContext, args: &[u64]) -> u64 {
-    const VIDEO_OUT_EVENT_FLIP: u64 = 6;
-    const KERNEL_EVENT_FILTER_VIDEO_OUT: i16 = -13;
+    add_video_out_event(ctx, args, VIDEO_OUT_EVENT_FLIP_ID, "flip")
+}
+
+/// `sceVideoOutAddVblankEvent(equeue, handle, udata)`: register a VideoOut
+/// event triggered on display vblank. Ported from SharpEmu
+/// `VideoOutAddVblankEvent` (VideoOutExports.cs, NID `Xru92wHJRmg`): same
+/// (equeue, handle, udata) ABI as AddFlipEvent, re-registration replaces the
+/// existing registration for that queue (here: same `(equeue, ident)` key).
+/// SharpEmu starts a 60 Hz vblank thread; XPS5X instead ticks vblank events
+/// from `sceVideoOutWaitVblank` and from every completed flip (a flip implies
+/// a display refresh), which keeps event-driven frame loops advancing without
+/// a host timer thread.
+fn hle_add_vblank_event(ctx: &HleContext, args: &[u64]) -> u64 {
+    add_video_out_event(ctx, args, VIDEO_OUT_EVENT_VBLANK_ID, "vblank")
+}
+
+fn add_video_out_event(ctx: &HleContext, args: &[u64], ident: u64, kind: &str) -> u64 {
     let equeue = args.first().copied().unwrap_or(0);
     let handle = args.get(1).copied().unwrap_or(0) as i32;
     let udata = args.get(2).copied().unwrap_or(0);
@@ -141,15 +219,32 @@ fn hle_add_flip_event(ctx: &HleContext, args: &[u64]) -> u64 {
         return VIDEO_OUT_ERROR_INVALID_OPTION;
     }
     ctx.kernel.kernel_equeue_events.insert(
-        (equeue, VIDEO_OUT_EVENT_FLIP),
+        (equeue, ident),
         xps5x_kernel::EqueueUserEvent {
             udata,
             filter: KERNEL_EVENT_FILTER_VIDEO_OUT,
             ..Default::default()
         },
     );
-    debug!(equeue, handle, udata, "registered VideoOut flip event");
+    debug!(equeue, handle, udata, "registered VideoOut {kind} event");
     SCE_OK
+}
+
+/// Trigger every registered VideoOut vblank event. `data` carries the vblank
+/// sequence in the upper bits over the ident, mirroring the flip-event
+/// encoding this file already uses (SharpEmu `GetEventData` decodes
+/// `data >> 16`).
+fn trigger_vblank_events(ctx: &HleContext, count: u64) {
+    let event_hint = VIDEO_OUT_EVENT_VBLANK_ID | ((count & 0x0000_ffff_ffff_ffff) << 16);
+    for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {
+        if event.key().1 == VIDEO_OUT_EVENT_VBLANK_ID
+            && event.filter == KERNEL_EVENT_FILTER_VIDEO_OUT
+        {
+            event.triggered = true;
+            event.fflags = event.fflags.saturating_add(1);
+            event.data = event_hint as i64;
+        }
+    }
 }
 
 /// `sceVideoOutSubmitFlip(handle, bufferIndex, flipMode, flipArg)`: records
@@ -182,14 +277,24 @@ fn hle_submit_flip(ctx: &HleContext, args: &[u64]) -> u64 {
     {
         ctx.gpu.present_scanout(buffer.address);
     }
-    let event_hint = 6 | ((flip_arg as u64 & 0x0000_ffff_ffff_ffff) << 16);
+    let event_hint = VIDEO_OUT_EVENT_FLIP_ID | ((flip_arg as u64 & 0x0000_ffff_ffff_ffff) << 16);
     for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {
-        if event.key().1 == 6 && event.filter == -13 {
+        if event.key().1 == VIDEO_OUT_EVENT_FLIP_ID && event.filter == KERNEL_EVENT_FILTER_VIDEO_OUT
+        {
             event.triggered = true;
             event.fflags = event.fflags.saturating_add(1);
             event.data = event_hint as i64;
         }
     }
+    // A completed flip implies a display refresh: advance the vblank sequence
+    // and wake any vblank-parked frame loop (XPS5X has no host vblank timer
+    // thread — see `hle_add_vblank_event`).
+    let vblanks = ctx
+        .kernel
+        .video_out_vblank_count
+        .fetch_add(1, Ordering::Relaxed)
+        + 1;
+    trigger_vblank_events(ctx, vblanks);
     SCE_OK
 }
 
@@ -530,9 +635,172 @@ fn hle_wait_vblank(ctx: &HleContext, args: &[u64]) -> u64 {
         return VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
     std::thread::sleep(std::time::Duration::from_micros(16_667));
-    ctx.kernel
+    let vblanks = ctx
+        .kernel
         .video_out_vblank_count
-        .fetch_add(1, Ordering::Relaxed);
+        .fetch_add(1, Ordering::Relaxed)
+        + 1;
+    trigger_vblank_events(ctx, vblanks);
+    SCE_OK
+}
+
+/// `sceVideoOutIsOutputSupported(handle, mode, options, reservedPtr,
+/// reserved)`: is the requested output mode available on this display?
+/// Ported from SharpEmu `VideoOutIsOutputSupported` (VideoOutExports.cs, NID
+/// `Nv8c-Kb+DUM`): reserved args must be zero; a non-null options block must
+/// read as `0x40` zero bytes; the mode must be Default (1) or 119.88 Hz
+/// (0xF). Returns **1 = supported / 0 = unsupported** directly. XPS5X reports
+/// a 60 Hz display, so the 119.88 Hz VRR-class mode is honestly unsupported.
+fn hle_is_output_supported(ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0) as i32;
+    let mode = args.get(1).copied().unwrap_or(0);
+    let options = args.get(2).copied().unwrap_or(0);
+    let reserved_ptr = args.get(3).copied().unwrap_or(0);
+    let reserved = args.get(4).copied().unwrap_or(0);
+    if handle != 1 {
+        return VIDEO_OUT_ERROR_INVALID_HANDLE;
+    }
+    if reserved_ptr != 0 || reserved != 0 {
+        return VIDEO_OUT_ERROR_INVALID_VALUE;
+    }
+    if options != 0 {
+        let mut block = [0u8; OUTPUT_OPTIONS_SIZE];
+        if !ctx.mem.read(options, &mut block) {
+            return SCE_ERROR_MEMORY_FAULT;
+        }
+        if block.iter().any(|byte| *byte != 0) {
+            return VIDEO_OUT_ERROR_INVALID_OPTION;
+        }
+    }
+    if mode != OUTPUT_MODE_DEFAULT && mode != OUTPUT_MODE_119_88_HZ {
+        return VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE;
+    }
+    u64::from(mode == OUTPUT_MODE_DEFAULT || DISPLAY_REFRESH_HZ >= 119)
+}
+
+/// `sceVideoOutConfigureOutput(handle, ...)`: apply an output configuration.
+/// Ported from SharpEmu `VideoOutConfigureOutput` (VideoOutExports.cs, NID
+/// `w0hLuNarQxY`), which validates the handle and returns OK without storing
+/// anything — the port model has no output-mode fields to update yet.
+fn hle_configure_output(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0) as i32;
+    if handle != 1 {
+        return VIDEO_OUT_ERROR_INVALID_HANDLE;
+    }
+    debug!("sceVideoOutConfigureOutput(handle={handle}) -> accepted");
+    SCE_OK
+}
+
+/// `sceVideoOutInitializeOutputOptions(options)`: zero-initialize a
+/// `SceVideoOutOutputOptions` block (0x40 bytes). Ported from SharpEmu
+/// `VideoOutInitializeOutputOptions` (VideoOutExports.cs, NID `+I4K03i3EL0`).
+fn hle_initialize_output_options(ctx: &HleContext, args: &[u64]) -> u64 {
+    let options = args.first().copied().unwrap_or(0);
+    if options == 0 {
+        return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+    }
+    if !ctx.mem.write(options, &[0u8; OUTPUT_OPTIONS_SIZE]) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    SCE_OK
+}
+
+/// `sceVideoOutSetWindowModeMargins(handle, top, bottom)`: window-mode
+/// letterbox margins. Ported from SharpEmu `VideoOutSetWindowModeMargins`
+/// (VideoOutExports.cs, NID `MTxxrOCeSig`): validate the handle, accept the
+/// margins (it discards them too — margins only shift the presented image).
+fn hle_set_window_mode_margins(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0) as i32;
+    if handle != 1 {
+        return VIDEO_OUT_ERROR_INVALID_HANDLE;
+    }
+    debug!(
+        "sceVideoOutSetWindowModeMargins(handle={handle}, top={}, bottom={}) -> accepted",
+        args.get(1).copied().unwrap_or(0) as i32,
+        args.get(2).copied().unwrap_or(0) as i32
+    );
+    SCE_OK
+}
+
+/// `sceVideoOutUnregisterBuffers(handle, setIndex)`: drop every display
+/// buffer registered under attribute-set `setIndex`. Ported from SharpEmu
+/// `VideoOutUnregisterBuffers` (VideoOutExports.cs, NID `N5KDtkIjjJ4`): a
+/// negative or never-registered set index is `INVALID_VALUE`; on success the
+/// group and its buffer slots are cleared (here: the `(handle, slot)` entries
+/// whose `set_index` matches are removed from the port model).
+fn hle_unregister_buffers(ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0) as i32;
+    let set_index = args.get(1).copied().unwrap_or(0) as i32;
+    if handle != 1 {
+        return VIDEO_OUT_ERROR_INVALID_HANDLE;
+    }
+    if set_index < 0 {
+        return VIDEO_OUT_ERROR_INVALID_VALUE;
+    }
+    let slots: Vec<(i32, i32)> = ctx
+        .kernel
+        .video_out_buffers
+        .iter()
+        .filter(|entry| entry.key().0 == handle && entry.set_index == set_index)
+        .map(|entry| *entry.key())
+        .collect();
+    if slots.is_empty() {
+        return VIDEO_OUT_ERROR_INVALID_VALUE;
+    }
+    for slot in &slots {
+        ctx.kernel.video_out_buffers.remove(slot);
+    }
+    debug!(
+        "sceVideoOutUnregisterBuffers(handle={handle}, set={set_index}) -> {} slot(s) cleared",
+        slots.len()
+    );
+    SCE_OK
+}
+
+/// `sceVideoOutGetEventId(const SceKernelEvent *event)`: classify a delivered
+/// VideoOut kernel event — returns **0 = flip, 1 = vblank** (positive return,
+/// not an out-param). Ported from SharpEmu `VideoOutGetEventId`
+/// (VideoOutExports.cs, NID `U2JJtSqNKZI`): reads `ident` (u64 @ +0x00) and
+/// `filter` (i16 @ +0x08) from the guest event struct; a non-VideoOut filter
+/// or unknown ident is `INVALID_EVENT`. The idents match what this module
+/// registers/triggers: flip = 0x6, vblank = 0x40.
+fn hle_get_event_id(ctx: &HleContext, args: &[u64]) -> u64 {
+    let event = args.first().copied().unwrap_or(0);
+    if event == 0 {
+        return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+    }
+    let mut ident = [0u8; 8];
+    let mut filter = [0u8; 2];
+    if !ctx.mem.read(event, &mut ident) || !ctx.mem.read(event + 0x08, &mut filter) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    if i16::from_le_bytes(filter) != KERNEL_EVENT_FILTER_VIDEO_OUT {
+        return VIDEO_OUT_ERROR_INVALID_EVENT;
+    }
+    match u64::from_le_bytes(ident) {
+        VIDEO_OUT_EVENT_FLIP_ID => 0,
+        VIDEO_OUT_EVENT_VBLANK_ID => 1,
+        _ => VIDEO_OUT_ERROR_INVALID_EVENT,
+    }
+}
+
+/// `sceVideoOutVrrPegToFixedRate(handle, ...)` /
+/// `sceVideoOutVrrUnpegFromFixedRate(handle)`: pin/unpin the variable
+/// refresh rate to a fixed rate. No reference implements these Gen5 exports
+/// (absent from SharpEmu/Kyty — SharpEmu has no Vrr entry points at all), and
+/// XPS5X reports a fixed 60 Hz display with no VRR hardware to steer, so both
+/// are accepted as OK no-ops with the arguments recorded for future RE.
+/// Measured Until Dawn + Dragon Ball Sparking Zero imports (NIDs
+/// `5tRaBjtdTzY` / `T4ucGB8CsnM`).
+fn hle_vrr_fixed_rate(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0) as i32;
+    if handle != 1 {
+        return VIDEO_OUT_ERROR_INVALID_HANDLE;
+    }
+    debug!(
+        "sceVideoOutVrr[Peg|Unpeg]FixedRate(handle={handle}, arg1={:#x}) -> accepted (fixed 60 Hz display, no VRR)",
+        args.get(1).copied().unwrap_or(0)
+    );
     SCE_OK
 }
 
@@ -771,5 +1039,221 @@ mod tests {
         assert!(overrides.iter().any(|(nid, key)| {
             *nid == 0x3e34_b9b8_04b0_715f && key == "libSceVideoOut::sceVideoOutSetBufferAttribute2"
         }));
+    }
+
+    /// SharpEmu `VideoOutIsOutputSupported` parity on a 60 Hz display.
+    #[test]
+    fn is_output_supported_reports_default_only_on_a_60_hz_display() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // Default mode: supported (1). 119.88 Hz on a 60 Hz display: not (0).
+        assert_eq!(hle_is_output_supported(&ctx, &[1, 1, 0, 0, 0]), 1);
+        assert_eq!(hle_is_output_supported(&ctx, &[1, 0xF, 0, 0, 0]), 0);
+        // Unknown mode / reserved args / bad handle → the SharpEmu errors.
+        assert_eq!(
+            hle_is_output_supported(&ctx, &[1, 7, 0, 0, 0]),
+            VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE
+        );
+        assert_eq!(
+            hle_is_output_supported(&ctx, &[1, 1, 0, 0x10, 0]),
+            VIDEO_OUT_ERROR_INVALID_VALUE
+        );
+        assert_eq!(
+            hle_is_output_supported(&ctx, &[9, 1, 0, 0, 0]),
+            VIDEO_OUT_ERROR_INVALID_HANDLE
+        );
+        // A non-null options block must be all-zero.
+        assert!(mem.write(0x100, &[0u8; OUTPUT_OPTIONS_SIZE]));
+        assert_eq!(hle_is_output_supported(&ctx, &[1, 1, 0x100, 0, 0]), 1);
+        assert!(mem.write(0x100, &[1u8]));
+        assert_eq!(
+            hle_is_output_supported(&ctx, &[1, 1, 0x100, 0, 0]),
+            VIDEO_OUT_ERROR_INVALID_OPTION
+        );
+    }
+
+    /// InitializeOutputOptions zeroes the 0x40-byte block; ConfigureOutput and
+    /// SetWindowModeMargins accept on the open port only.
+    #[test]
+    fn output_configuration_calls_validate_and_accept() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x100, &[0xAAu8; OUTPUT_OPTIONS_SIZE]));
+        assert_eq!(hle_initialize_output_options(&ctx, &[0x100]), SCE_OK);
+        let mut block = [0u8; OUTPUT_OPTIONS_SIZE];
+        assert!(mem.read(0x100, &mut block));
+        assert!(block.iter().all(|byte| *byte == 0));
+        assert_eq!(
+            hle_initialize_output_options(&ctx, &[0]),
+            VIDEO_OUT_ERROR_INVALID_ADDRESS
+        );
+
+        assert_eq!(hle_configure_output(&ctx, &[1]), SCE_OK);
+        assert_eq!(
+            hle_configure_output(&ctx, &[5]),
+            VIDEO_OUT_ERROR_INVALID_HANDLE
+        );
+        assert_eq!(hle_set_window_mode_margins(&ctx, &[1, 32, 32]), SCE_OK);
+        assert_eq!(
+            hle_set_window_mode_margins(&ctx, &[5, 0, 0]),
+            VIDEO_OUT_ERROR_INVALID_HANDLE
+        );
+        // VRR peg/unpeg accepts on the open port (no VRR hardware modeled).
+        assert_eq!(hle_vrr_fixed_rate(&ctx, &[1, 60]), SCE_OK);
+        assert_eq!(
+            hle_vrr_fixed_rate(&ctx, &[3]),
+            VIDEO_OUT_ERROR_INVALID_HANDLE
+        );
+    }
+
+    /// UnregisterBuffers drops exactly the slots registered under the given
+    /// attribute set, per SharpEmu semantics.
+    #[test]
+    fn unregister_buffers_clears_the_attribute_sets_slots() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(
+            hle_set_buffer_attribute2(
+                &ctx,
+                &[0x100, 0x8100_0000_2200_0000, 0, 1920, 1080, 0, 0, 0]
+            ),
+            SCE_OK
+        );
+        assert!(mem.write(0x200, &0x4000u64.to_le_bytes()));
+        assert!(mem.write(0x208, &0u64.to_le_bytes()));
+        assert!(mem.write(0x220, &0x8000u64.to_le_bytes()));
+        assert!(mem.write(0x228, &0u64.to_le_bytes()));
+        assert_eq!(
+            hle_register_buffers2(&ctx, &[1, 3, 0, 0x200, 2, 0x100, 0, 0]),
+            3
+        );
+        assert!(kernel.video_out_buffers.contains_key(&(1, 0)));
+        assert!(kernel.video_out_buffers.contains_key(&(1, 1)));
+
+        // A set index that was never registered → INVALID_VALUE.
+        assert_eq!(
+            hle_unregister_buffers(&ctx, &[1, 9]),
+            VIDEO_OUT_ERROR_INVALID_VALUE
+        );
+        assert_eq!(hle_unregister_buffers(&ctx, &[1, 3]), SCE_OK);
+        assert!(!kernel.video_out_buffers.contains_key(&(1, 0)));
+        assert!(!kernel.video_out_buffers.contains_key(&(1, 1)));
+        // Second unregister of the same set: nothing left → INVALID_VALUE.
+        assert_eq!(
+            hle_unregister_buffers(&ctx, &[1, 3]),
+            VIDEO_OUT_ERROR_INVALID_VALUE
+        );
+        assert_eq!(
+            hle_unregister_buffers(&ctx, &[7, 3]),
+            VIDEO_OUT_ERROR_INVALID_HANDLE
+        );
+    }
+
+    /// Vblank events registered via AddVblankEvent fire on WaitVblank and on
+    /// flip completion; GetEventId classifies flip (0) vs vblank (1) from the
+    /// delivered SceKernelEvent per SharpEmu.
+    #[test]
+    fn vblank_events_fire_and_get_event_id_classifies() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let eq = kernel.create_equeue(0);
+
+        assert_eq!(hle_add_vblank_event(&ctx, &[eq, 1, 0xBEEF]), SCE_OK);
+        assert_eq!(
+            hle_add_vblank_event(&ctx, &[eq, 9, 0]),
+            VIDEO_OUT_ERROR_INVALID_HANDLE
+        );
+        {
+            let event = kernel
+                .kernel_equeue_events
+                .get(&(eq, VIDEO_OUT_EVENT_VBLANK_ID))
+                .unwrap();
+            assert!(!event.triggered);
+            assert_eq!(event.filter, KERNEL_EVENT_FILTER_VIDEO_OUT);
+            assert_eq!(event.udata, 0xBEEF);
+        }
+        // WaitVblank ticks the sequence and wakes the registration.
+        assert_eq!(hle_wait_vblank(&ctx, &[1]), SCE_OK);
+        {
+            let event = kernel
+                .kernel_equeue_events
+                .get(&(eq, VIDEO_OUT_EVENT_VBLANK_ID))
+                .unwrap();
+            assert!(event.triggered);
+            assert_eq!(event.data as u64, VIDEO_OUT_EVENT_VBLANK_ID | (1 << 16));
+        }
+        // A completed flip also implies a vblank tick.
+        if let Some(mut event) = kernel
+            .kernel_equeue_events
+            .get_mut(&(eq, VIDEO_OUT_EVENT_VBLANK_ID))
+        {
+            event.triggered = false;
+        }
+        assert_eq!(hle_submit_flip(&ctx, &[1, 0, 1, 5]), SCE_OK);
+        assert!(
+            kernel
+                .kernel_equeue_events
+                .get(&(eq, VIDEO_OUT_EVENT_VBLANK_ID))
+                .unwrap()
+                .triggered
+        );
+
+        // GetEventId reads ident@0 + filter@8 from the guest event struct.
+        let mut event_struct = [0u8; 0x20];
+        event_struct[0..8].copy_from_slice(&VIDEO_OUT_EVENT_FLIP_ID.to_le_bytes());
+        event_struct[8..10].copy_from_slice(&KERNEL_EVENT_FILTER_VIDEO_OUT.to_le_bytes());
+        assert!(mem.write(0x300, &event_struct));
+        assert_eq!(hle_get_event_id(&ctx, &[0x300]), 0, "flip event → 0");
+        event_struct[0..8].copy_from_slice(&VIDEO_OUT_EVENT_VBLANK_ID.to_le_bytes());
+        assert!(mem.write(0x300, &event_struct));
+        assert_eq!(hle_get_event_id(&ctx, &[0x300]), 1, "vblank event → 1");
+        // Wrong filter or unknown ident → INVALID_EVENT.
+        event_struct[8..10].copy_from_slice(&(-11i16).to_le_bytes());
+        assert!(mem.write(0x300, &event_struct));
+        assert_eq!(
+            hle_get_event_id(&ctx, &[0x300]),
+            VIDEO_OUT_ERROR_INVALID_EVENT
+        );
+        event_struct[0..8].copy_from_slice(&0x99u64.to_le_bytes());
+        event_struct[8..10].copy_from_slice(&KERNEL_EVENT_FILTER_VIDEO_OUT.to_le_bytes());
+        assert!(mem.write(0x300, &event_struct));
+        assert_eq!(
+            hle_get_event_id(&ctx, &[0x300]),
+            VIDEO_OUT_ERROR_INVALID_EVENT
+        );
+        assert_eq!(
+            hle_get_event_id(&ctx, &[0]),
+            VIDEO_OUT_ERROR_INVALID_ADDRESS
+        );
+
+        // The whole measured UE5-pair + Plague Tale VideoOut set registers.
+        let registry = HleRegistry::new();
+        for name in [
+            "sceVideoOutIsOutputSupported",
+            "sceVideoOutConfigureOutput",
+            "sceVideoOutInitializeOutputOptions",
+            "sceVideoOutSetWindowModeMargins",
+            "sceVideoOutUnregisterBuffers",
+            "sceVideoOutAddVblankEvent",
+            "sceVideoOutGetEventId",
+            "sceVideoOutVrrPegToFixedRate",
+            "sceVideoOutVrrUnpegFromFixedRate",
+        ] {
+            assert!(
+                registry.is_implemented("libSceVideoOut", name),
+                "missing libSceVideoOut::{name}"
+            );
+        }
     }
 }

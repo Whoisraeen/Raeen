@@ -45,7 +45,12 @@ const IT_SET_SH_REG: u32 = 0x76;
 // Gen5 entry points (the Agc dialect reuses the standard opcode numbering —
 // compare IT_DISPATCH_DIRECT/IT_INDEX_TYPE/IT_SET_BASE above).
 const IT_SET_PREDICATION: u32 = 0x22;
+const IT_DRAW_INDIRECT: u32 = 0x24;
 const IT_DRAW_INDIRECT_MULTI: u32 = 0x2C;
+/// Chain execution into another command buffer (`sceAgcDcbJump` /
+/// `sceAgcCbBranch`). Standard PM4 numbering, mirrored by SharpEmu's
+/// `ItIndirectBuffer` and kyty-graphics `pm4::IT_INDIRECT_BUFFER`.
+const IT_INDIRECT_BUFFER: u32 = 0x3F;
 const IT_DRAW_INDEX_INDIRECT_MULTI: u32 = 0x38;
 const IT_COPY_DATA: u32 = 0x40;
 const R_WAIT_MEM32: u32 = 0x0A;
@@ -239,11 +244,6 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcDcbDispatchIndirect",
         hle_dcb_dispatch_indirect,
     );
-    registry.register(
-        "libSceAgc",
-        "sceAgcDriverGetResourceRegistrationMaxNameLength",
-        hle_get_resource_max_name_length,
-    );
     registry.register("libSceAgc", "sceAgcSuspendPoint", hle_suspend_point);
     // Known ONLY by its NID (`-KRzWekV120`, measured from Minecraft PPSA17221):
     // its identity is unknown — not present in Kyty or SharpEmu. A loud stub
@@ -254,11 +254,6 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcUnknownKRzWekV120",
         0xfca4_7359_e915_d76d,
         hle_unknown_krz_wek_v120,
-    );
-    registry.register(
-        "libSceAgc",
-        "sceAgcDriverRegisterDefaultOwner",
-        hle_driver_register_default_owner,
     );
     registry.register_nid(
         "libSceAgcDriver",
@@ -274,18 +269,8 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register(
         "libSceAgc",
-        "sceAgcDriverGetDefaultOwner",
-        hle_driver_get_default_owner,
-    );
-    registry.register(
-        "libSceAgc",
         "sceAgcDriverAddEqEvent",
         hle_driver_add_eq_event,
-    );
-    registry.register(
-        "libSceAgc",
-        "sceAgcDriverDeleteEqEvent",
-        hle_driver_delete_eq_event,
     );
     registry.register(
         "libSceAgc",
@@ -346,16 +331,6 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceAgc", "sceAgcDriverSubmitAcb", hle_driver_submit_acb);
     registry.register(
         "libSceAgc",
-        "sceAgcDriverSubmitMultiDcbs",
-        hle_driver_submit_multi_dcbs,
-    );
-    registry.register(
-        "libSceAgc",
-        "sceAgcDriverQueryResourceRegistrationUserMemoryRequirements",
-        hle_driver_query_resource_memory,
-    );
-    registry.register(
-        "libSceAgc",
         "sceAgcQueueEndOfPipeActionPatchAddress",
         hle_queue_eop_patch_address,
     );
@@ -378,11 +353,6 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcWriteDataPatchAddress",
         0x7cf4_8275_0c60_a52c,
         hle_write_data_patch_address,
-    );
-    registry.register(
-        "libSceAgc",
-        "sceAgcDriverInitResourceRegistration",
-        hle_driver_init_resource_registration,
     );
     // The Cx/Sh/Uc patch-set NIDs are behaviorally identical (the register
     // space only affects tracing), so each family shares one handler.
@@ -480,6 +450,63 @@ pub fn register(registry: &HleRegistry) {
         hle_dcb_stall_command_buffer_parser,
     );
     registry.register("libSceAgc", "sceAgcDcbGetLodStats", hle_dcb_get_lod_stats);
+    // UE5 pair (Until Dawn PPSA15421 + Dragon Ball Sparking Zero PPSA15210 —
+    // identical libSceAgc gap set) + A Plague Tale Requiem batch. Every name
+    // hashes to the NID the titles import (verified with --imports).
+    registry.register("libSceAgc", "sceAgcDcbJump", hle_dcb_jump);
+    registry.register("libSceAgc", "sceAgcCbBranch", hle_cb_branch);
+    registry.register("libSceAgc", "sceAgcDcbDrawIndirect", hle_dcb_draw_indirect);
+    registry.register(
+        "libSceAgc",
+        "sceAgcSetPacketPredication",
+        hle_set_packet_predication,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcSetCxRegIndirectPatchSetNumRegisters",
+        hle_set_indirect_patch_set_num_registers,
+    );
+    registry.register("libSceAgc", "sceAgcDcbSetMarker", hle_dcb_set_marker);
+    // Driver-family functions are exported by BOTH provider names: older
+    // fixtures/titles import them from `libSceAgc`, retail Gen5 binaries from
+    // `libSceAgcDriver` (measured: A Plague Tale Requiem imports
+    // sceAgcDriverSubmitMultiDcbs from libSceAgcDriver while it was registered
+    // only under libSceAgc — provider-aware resolution left it unreachable).
+    // Register every Driver-family implementation under both libraries so this
+    // whole bug class is closed, not just the measured instances.
+    for (name, implementation) in [
+        (
+            "sceAgcDriverSubmitMultiDcbs",
+            hle_driver_submit_multi_dcbs as crate::HleFunction,
+        ),
+        (
+            "sceAgcDriverAgrSubmitMultiDcbs",
+            hle_driver_submit_multi_dcbs,
+        ),
+        ("sceAgcDriverSubmitMultiAcbs", hle_driver_submit_multi_acbs),
+        ("sceAgcDriverTriggerCapture", hle_driver_trigger_capture),
+        (
+            "sceAgcDriverGetResourceRegistrationMaxNameLength",
+            hle_get_resource_max_name_length,
+        ),
+        (
+            "sceAgcDriverRegisterDefaultOwner",
+            hle_driver_register_default_owner,
+        ),
+        ("sceAgcDriverGetDefaultOwner", hle_driver_get_default_owner),
+        ("sceAgcDriverDeleteEqEvent", hle_driver_delete_eq_event),
+        (
+            "sceAgcDriverQueryResourceRegistrationUserMemoryRequirements",
+            hle_driver_query_resource_memory,
+        ),
+        (
+            "sceAgcDriverInitResourceRegistration",
+            hle_driver_init_resource_registration,
+        ),
+    ] {
+        registry.register("libSceAgc", name, implementation);
+        registry.register("libSceAgcDriver", name, implementation);
+    }
 }
 
 /// Resource-registration maximum name length (`sceAgcDriver...`).
@@ -884,10 +911,18 @@ fn hle_driver_submit_acb(ctx: &HleContext, args: &[u64]) -> u64 {
     submit_validate(ctx, args.get(1).copied().unwrap_or(0), "ACB")
 }
 
-/// `sceAgcDriverSubmitMultiDcbs(addressArray, sizeArray, bufferCount)`:
-/// validate each command buffer in the arrays and succeed (no real
-/// submission yet — the Vulkan gate).
-fn hle_driver_submit_multi_dcbs(ctx: &HleContext, args: &[u64]) -> u64 {
+/// Shared loop for the multi-buffer submission entry points: submit each
+/// (address, size) pair through the REAL single-buffer path
+/// ([`submit_command_buffer`] — decode, sync writes, DMA, events, flips,
+/// `ctx.gpu.submit`).
+///
+/// ABI (SharpEmu `DriverSubmitMultiDcbs`, AgcExports.cs, reversed from Quake):
+/// `rdi` = array of command-buffer base addresses (**u64** each, stride 8),
+/// `rsi` = array of sizes in dwords (**u32** each, stride 4), `rdx` = count.
+/// The earlier XPS5X validation stub read the size array with a u64 stride —
+/// wrong per that reference; fixed here. Null/zero entries are skipped, not
+/// fatal, exactly as SharpEmu `continue`s past them.
+fn driver_submit_multi(ctx: &HleContext, args: &[u64], queue: &'static str) -> u64 {
     let address_array = args.first().copied().unwrap_or(0);
     let size_array = args.get(1).copied().unwrap_or(0);
     let buffer_count = args.get(2).copied().unwrap_or(0);
@@ -896,11 +931,56 @@ fn hle_driver_submit_multi_dcbs(ctx: &HleContext, args: &[u64]) -> u64 {
     }
     for i in 0..buffer_count {
         let cmd = read_u64_or_zero(ctx, address_array + i * 8);
-        let dwords = read_u64_or_zero(ctx, size_array + i * 8);
+        let dwords = read_u32_or_zero(ctx, size_array + i * 4);
         if cmd == 0 || dwords == 0 {
-            return SCE_ERROR_INVALID_ARGUMENT;
+            continue;
+        }
+        let rc = submit_command_buffer(ctx, cmd, dwords, queue);
+        if rc != 0 {
+            warn!(
+                index = i,
+                count = buffer_count,
+                command = format_args!("{cmd:#x}"),
+                dwords,
+                queue,
+                "multi-buffer submission entry failed to decode — skipped"
+            );
         }
     }
+    0
+}
+
+/// `sceAgcDriverSubmitMultiDcbs(addressArray, sizeArray, bufferCount)`: submit
+/// every graphics command buffer in the arrays through the real single-DCB
+/// path. Also serves `sceAgcDriverAgrSubmitMultiDcbs` (measured A Plague Tale
+/// Requiem import) — the Agr variant mirrors how `sceAgcDriverAgrSubmitDcb`
+/// aliases `sceAgcDriverSubmitDcb` in this file.
+fn hle_driver_submit_multi_dcbs(ctx: &HleContext, args: &[u64]) -> u64 {
+    driver_submit_multi(ctx, args, "DCB")
+}
+
+/// `sceAgcDriverSubmitMultiAcbs(addressArray, sizeArray, bufferCount)`:
+/// multi-buffer submission onto the **async-compute** ring (routes to
+/// `GpuQueue::AsyncCompute`, see `submit_command_buffer`). No reference
+/// implements this export (absent from SharpEmu/Kyty); the array ABI is
+/// mirrored from `DriverSubmitMultiDcbs` above, the queue from
+/// `sceAgcDriverSubmitAcb`. Measured A Plague Tale Requiem import.
+fn hle_driver_submit_multi_acbs(ctx: &HleContext, args: &[u64]) -> u64 {
+    driver_submit_multi(ctx, args, "ACB")
+}
+
+/// `sceAgcDriverTriggerCapture(...)`: hook for Sony's GPU-capture tooling
+/// (Razor-style frame captures). XPS5X has no host capture pipeline; the call
+/// is accepted as an OK no-op — capture is diagnostics, never rendering
+/// progress. No reference implements it (absent from SharpEmu/Kyty); the
+/// arguments are recorded at debug level for future RE. Measured A Plague
+/// Tale Requiem import (NID `Xq5WmbwPTnQ`).
+fn hle_driver_trigger_capture(_ctx: &HleContext, args: &[u64]) -> u64 {
+    debug!(
+        arg0 = format_args!("{:#x}", args.first().copied().unwrap_or(0)),
+        arg1 = format_args!("{:#x}", args.get(1).copied().unwrap_or(0)),
+        "sceAgcDriverTriggerCapture: accepted (no host GPU-capture pipeline)"
+    );
     0
 }
 
@@ -944,6 +1024,21 @@ fn submit_validate(ctx: &HleContext, packet: u64, queue: &'static str) -> u64 {
     }
     let command_address = u64::from_le_bytes(descriptor[0..8].try_into().unwrap());
     let dword_count = u32::from_le_bytes(descriptor[8..12].try_into().unwrap());
+    submit_command_buffer(ctx, command_address, dword_count, queue)
+}
+
+/// Submit one raw command buffer (`command_address`, `dword_count`) to the
+/// decode + side-effect + GPU-handoff path. This is the shared tail of every
+/// submission entry point: the single-DCB descriptor path (`submit_validate`)
+/// and the multi-buffer array paths (`sceAgcDriverSubmitMulti{Dcbs,Acbs}`)
+/// both land here, so array submissions get the REAL semantics — sync writes,
+/// DMA, events, flips, and `ctx.gpu.submit` — not just validation.
+fn submit_command_buffer(
+    ctx: &HleContext,
+    command_address: u64,
+    dword_count: u32,
+    queue: &'static str,
+) -> u64 {
     if command_address == 0 || dword_count == 0 || dword_count > 1_000_000 {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
@@ -2294,6 +2389,162 @@ fn hle_dcb_draw_index_indirect(ctx: &HleContext, args: &[u64]) -> u64 {
         && w(16, modifier);
     if !ok {
         return 0;
+    }
+    addr
+}
+
+/// `sceAgcDcbDrawIndirect(dcb, dataOffset, modifier)`: emit a 5-DWORD
+/// DRAW_INDIRECT packet — `header, dataOffset, 0, 0, modifier` — the
+/// non-indexed sibling of [`hle_dcb_draw_index_indirect`] (same shape, opcode
+/// `IT_DRAW_INDIRECT` 0x24 instead of 0x25). SharpEmu exports no builder for
+/// it, but its submitted-DCB parser consumes `ItDrawIndirect` (0x24) with the
+/// argument-buffer `dataOffset` at `+4` and packet length >= 5 (AgcExports.cs
+/// L5216-5227), which this emission matches. Draws from the argument buffer
+/// bound by `sceAgcDcbSetBaseIndirectArgs`. Measured Until Dawn + Dragon Ball
+/// Sparking Zero import (NID `1q1titRBL6o`). Returns the command address, or
+/// 0 on failure.
+fn hle_dcb_draw_indirect(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let data_offset = args.get(1).copied().unwrap_or(0) as u32;
+    let modifier = args.get(2).copied().unwrap_or(0) as u32;
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 5) else {
+        return 0;
+    };
+    let w = |off: u64, v: u32| ctx.mem.write(addr + off, &v.to_le_bytes());
+    let ok = w(0, pm4(5, IT_DRAW_INDIRECT, R_ZERO))
+        && w(4, data_offset)
+        && w(8, 0)
+        && w(12, 0)
+        && w(16, modifier);
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcDcbJump(dcb, target, sizeDwords)`: chain execution into another
+/// command buffer — emit a 4-DWORD INDIRECT_BUFFER packet: `header, target
+/// lo32, target hi (16 bits), sizeDwords & 0xFFFFF`. Ported dword-exact from
+/// SharpEmu `DcbJump` (AgcExports.cs, NID `xSAR0LTcRKM`, GPL-2.0).
+///
+/// CONSUMPTION GAP: the packet is emitted faithfully, but neither in-tree
+/// command processor follows INDIRECT_BUFFER chains yet — kyty-graphics
+/// declares `pm4::IT_INDIRECT_BUFFER` (0x3F) with no handler in `run.rs`, and
+/// `xps5x_gpu::agc::decode_submission` records it as an opaque packet. A title
+/// that links its frame through Jump/Branch will submit a head buffer whose
+/// tail work lives in unexecuted chained buffers.
+fn hle_dcb_jump(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let target = args.get(1).copied().unwrap_or(0);
+    let size_dwords = args.get(2).copied().unwrap_or(0) as u32;
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 4) else {
+        return 0;
+    };
+    let w = |off: u64, v: u32| ctx.mem.write(addr + off, &v.to_le_bytes());
+    let ok = w(0, pm4(4, IT_INDIRECT_BUFFER, R_ZERO))
+        && w(4, target as u32)
+        && w(8, ((target >> 32) & 0xFFFF) as u32)
+        && w(12, size_dwords & 0xF_FFFF);
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcCbBranch(cb, target, sizeDwords)`: branch into another command
+/// buffer. SharpEmu implements only `DcbJump`; Branch is modeled on it — the
+/// same 4-DWORD INDIRECT_BUFFER chain packet (both transfer the command
+/// processor to `target` for `sizeDwords`) — so the assumption is that any
+/// Jump/Branch distinction (e.g. a return/chain flag) is not encoded in fields
+/// this emission fills. Measured Until Dawn + Dragon Ball Sparking Zero import
+/// (NID `w1KFAHVqpaU`). Same consumption gap as [`hle_dcb_jump`]: chained
+/// buffers are not yet executed by the in-tree command processors.
+fn hle_cb_branch(ctx: &HleContext, args: &[u64]) -> u64 {
+    hle_dcb_jump(ctx, args)
+}
+
+/// `sceAgcSetPacketPredication(...)`: global predication toggle on a packet.
+/// SharpEmu `SetPacketPredication` (AgcExports.cs, NID `w6Dj1VJt5qY`) is an
+/// explicit OK no-op — "a no-op is safe for rendering" (predication only
+/// culls work; never predicating draws everything). Ported as such.
+fn hle_set_packet_predication(_ctx: &HleContext, args: &[u64]) -> u64 {
+    debug!(
+        packet = format_args!("{:#x}", args.first().copied().unwrap_or(0)),
+        "sceAgcSetPacketPredication: accepted (predication not applied — SharpEmu-parity no-op)"
+    );
+    0
+}
+
+/// `sceAgcSetCxRegIndirectPatchSetNumRegisters(command, numRegisters)`: SET
+/// (overwrite) the register count of an indirect set-registers packet. No
+/// reference implements this export (absent from SharpEmu/Kyty); the field
+/// position is established by this file's own emitter — the indirect packet
+/// is `header, count@+4, addrLo@+8, addrHi@+12` (`dcb_set_registers_indirect`)
+/// — and by the measured siblings `...PatchSetAddress` (writes `+8/+12`) and
+/// `...PatchAddRegisters` (accumulates into `+4`). Set = overwrite of the
+/// same `+4` count field. Measured Until Dawn + Dragon Ball Sparking Zero
+/// import (NID `whb1RL7K4Ss`).
+fn hle_set_indirect_patch_set_num_registers(ctx: &HleContext, args: &[u64]) -> u64 {
+    let command = args.first().copied().unwrap_or(0);
+    let register_count = args.get(1).copied().unwrap_or(0) as u32;
+    if command == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    if !ctx.mem.write(command + 4, &register_count.to_le_bytes()) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
+/// `sceAgcDcbSetMarker(dcb, markerString)`: one-shot debug annotation (the
+/// non-nesting sibling of Push/PopMarker). No reference implements this
+/// export (absent from SharpEmu/Kyty), so the exact discriminator is unknown;
+/// the marker string is preserved in the stream as a plain NOP packet
+/// (`R_ZERO`, which every consumer skips) with the same DWORD-packed payload
+/// encoding as `hle_dcb_push_marker` — deliberately NOT `R_PUSH_MARKER`, so a
+/// future marker-stack consumer never sees an unbalanced push. Measured A
+/// Plague Tale Requiem import (NID `QhCbS4X9Rl8`). Returns the command
+/// address, or 0 on failure.
+fn hle_dcb_set_marker(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let marker_addr = args.get(1).copied().unwrap_or(0);
+    if cb == 0 {
+        return 0;
+    }
+    let Some(marker) = read_guest_cstring(ctx, marker_addr, 4095) else {
+        return 0;
+    };
+    let payload_dwords = (((marker.len() as u32) + 4) / 4).max(1);
+    let packet_dwords = payload_dwords + 1;
+    let Some(addr) = alloc_command_dwords(ctx, cb, u64::from(packet_dwords)) else {
+        return 0;
+    };
+    if !ctx
+        .mem
+        .write(addr, &pm4(packet_dwords, IT_NOP, R_ZERO).to_le_bytes())
+    {
+        return 0;
+    }
+    for i in 0..payload_dwords {
+        let mut value = 0u32;
+        for byte in 0..4u32 {
+            let idx = (i * 4 + byte) as usize;
+            if idx < marker.len() {
+                value |= u32::from(marker[idx]) << (byte * 8);
+            }
+        }
+        if !ctx
+            .mem
+            .write(addr + 4 + u64::from(i) * 4, &value.to_le_bytes())
+        {
+            return 0;
+        }
     }
     addr
 }
@@ -3914,11 +4165,12 @@ mod tests {
             hle_driver_submit_dcb(&ctx, &[0]),
             SCE_ERROR_INVALID_ARGUMENT
         );
-        // SubmitMultiDcbs: two buffers with valid addresses + sizes.
+        // SubmitMultiDcbs: two buffers with valid addresses + sizes. The size
+        // array is u32-per-entry (stride 4) — the SharpEmu ABI.
         assert!(ctx.mem.write(0x1A0, &0x400u64.to_le_bytes()));
         assert!(ctx.mem.write(0x1A8, &0x500u64.to_le_bytes()));
-        assert!(ctx.mem.write(0x1C0, &8u64.to_le_bytes()));
-        assert!(ctx.mem.write(0x1C8, &4u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x1C0, &8u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x1C4, &4u32.to_le_bytes()));
         assert_eq!(hle_driver_submit_multi_dcbs(&ctx, &[0x1A0, 0x1C0, 2]), 0);
         assert_eq!(
             hle_driver_submit_multi_dcbs(&ctx, &[0, 0x1C0, 2]),
@@ -3982,6 +4234,194 @@ mod tests {
         assert_eq!(submissions.len(), 1);
         assert_eq!(submissions[0].0, words);
         assert_eq!(submissions[0].1, xps5x_core::subsystems::GpuQueue::Graphics);
+    }
+
+    /// SharpEmu `DcbJump` parity: 4-DWORD INDIRECT_BUFFER chain packet, with
+    /// `CbBranch` emitting the identical chain (modeled on Jump — see docs).
+    #[test]
+    fn dcb_jump_and_cb_branch_emit_the_chain_packet() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let target = 0x0001_2345_6789_ABC0u64;
+        let ret = hle_dcb_jump(&ctx, &[cb, target, 0x12_3456]);
+        assert_eq!(ret, 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(4, IT_INDIRECT_BUFFER, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), 0x6789_ABC0, "target lo32");
+        assert_eq!(read_u32(&ctx, 0x408), 0x0001_2345 & 0xFFFF, "target hi16");
+        assert_eq!(
+            read_u32(&ctx, 0x40C),
+            0x12_3456 & 0xF_FFFF,
+            "size & 0xFFFFF"
+        );
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x410);
+        // Branch: byte-identical emission at the next cursor position.
+        assert_eq!(hle_cb_branch(&ctx, &[cb, target, 8]), 0x410);
+        assert_eq!(read_u32(&ctx, 0x410), pm4(4, IT_INDIRECT_BUFFER, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x41C), 8);
+        assert_eq!(hle_dcb_jump(&ctx, &[0, target, 8]), 0, "null dcb → 0");
+    }
+
+    /// DRAW_INDIRECT is the non-indexed sibling of DRAW_INDEX_INDIRECT: same
+    /// 5-DWORD shape, opcode 0x24.
+    #[test]
+    fn draw_indirect_emits_the_five_dword_packet() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let ret = hle_dcb_draw_indirect(&ctx, &[cb, 0x120, 0xA038]);
+        assert_eq!(ret, 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(5, IT_DRAW_INDIRECT, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), 0x120, "argument-buffer data offset");
+        assert_eq!(read_u32(&ctx, 0x408), 0);
+        assert_eq!(read_u32(&ctx, 0x40C), 0);
+        assert_eq!(read_u32(&ctx, 0x410), 0xA038, "modifier");
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x400 + 20);
+    }
+
+    /// SetNumRegisters overwrites the indirect packet's `+4` count field that
+    /// AddRegisters accumulates into; predication is a SharpEmu-parity no-op.
+    #[test]
+    fn set_num_registers_overwrites_the_indirect_count_field() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        // Emit an indirect Cx set-registers packet: header, count, addr lo/hi.
+        let cmd = hle_dcb_set_cx_regs_indirect(&ctx, &[cb, 0x9000, 3]);
+        assert_eq!(read_u32(&ctx, cmd + 4), 3);
+        // Add accumulates; SetNum overwrites.
+        assert_eq!(hle_add_indirect_patch_registers(&ctx, &[cmd, 5]), 0);
+        assert_eq!(read_u32(&ctx, cmd + 4), 8);
+        assert_eq!(
+            hle_set_indirect_patch_set_num_registers(&ctx, &[cmd, 21]),
+            0
+        );
+        assert_eq!(read_u32(&ctx, cmd + 4), 21);
+        assert_eq!(
+            hle_set_indirect_patch_set_num_registers(&ctx, &[0, 21]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+        // Predication accepts and changes nothing (SharpEmu OK no-op).
+        assert_eq!(hle_set_packet_predication(&ctx, &[cmd]), 0);
+        assert_eq!(read_u32(&ctx, cmd + 4), 21);
+    }
+
+    /// SetMarker preserves the string as a plain skippable NOP payload (no
+    /// push/pop nesting side effects).
+    #[test]
+    fn set_marker_preserves_the_string_in_a_plain_nop() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        assert!(ctx.mem.write(0x100, b"frame\0"));
+        let ret = hle_dcb_set_marker(&ctx, &[cb, 0x100]);
+        assert_eq!(ret, 0x400);
+        // "frame" = 5 bytes → (5+4)/4 = 2 payload dwords + header = 3 dwords.
+        assert_eq!(read_u32(&ctx, 0x400), pm4(3, IT_NOP, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), u32::from_le_bytes(*b"fram"));
+        assert_eq!(read_u32(&ctx, 0x408), u32::from(b'e'));
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x40C);
+    }
+
+    /// The multi-buffer submissions loop the REAL single-submit path: every
+    /// array entry reaches `ctx.gpu.submit` on the right queue (u64 addresses
+    /// stride 8, u32 dword sizes stride 4 — the SharpEmu ABI).
+    #[test]
+    fn multi_submit_routes_each_buffer_to_the_gpu_queue() {
+        #[derive(Default)]
+        struct RecordingGpu {
+            submissions: std::sync::Mutex<Vec<(Vec<u32>, xps5x_core::subsystems::GpuQueue)>>,
+        }
+        impl xps5x_core::subsystems::GpuSubmissionSubsystem for RecordingGpu {
+            fn submit(&self, words: Vec<u32>, queue: xps5x_core::subsystems::GpuQueue) {
+                self.submissions.lock().unwrap().push((words, queue));
+            }
+            fn map_shader_metadata(
+                &self,
+                _code_address: u64,
+                _data: xps5x_core::subsystems::ShaderMappedData,
+            ) {
+            }
+            fn present_scanout(&self, _address: u64) {}
+            fn wait_idle(&self) {}
+            fn stats(&self) -> xps5x_core::subsystems::GpuSubmissionStats {
+                xps5x_core::subsystems::GpuSubmissionStats::default()
+            }
+        }
+
+        let (kernel, mem, alloc) = ctx_env();
+        let gpu = RecordingGpu::default();
+        let ctx = crate::test_ctx_with_gpu(&kernel, &mem, &alloc, &gpu);
+
+        // Two tiny well-formed DCBs (a 2-dword NOP each).
+        for base in [0x400u64, 0x500] {
+            assert!(ctx.mem.write(base, &pm4(2, IT_NOP, R_ZERO).to_le_bytes()));
+            assert!(ctx.mem.write(base + 4, &0u32.to_le_bytes()));
+        }
+        assert!(ctx.mem.write(0x1A0, &0x400u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x1A8, &0x500u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x1C0, &2u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x1C4, &2u32.to_le_bytes()));
+
+        assert_eq!(hle_driver_submit_multi_dcbs(&ctx, &[0x1A0, 0x1C0, 2]), 0);
+        assert_eq!(hle_driver_submit_multi_acbs(&ctx, &[0x1A0, 0x1C0, 1]), 0);
+        let submissions = gpu.submissions.lock().unwrap();
+        assert_eq!(submissions.len(), 3, "2 DCBs + 1 ACB submitted");
+        let expected = vec![pm4(2, IT_NOP, R_ZERO), 0];
+        assert_eq!(submissions[0].0, expected);
+        assert_eq!(submissions[0].1, xps5x_core::subsystems::GpuQueue::Graphics);
+        assert_eq!(submissions[1].1, xps5x_core::subsystems::GpuQueue::Graphics);
+        assert_eq!(
+            submissions[2].1,
+            xps5x_core::subsystems::GpuQueue::AsyncCompute
+        );
+        drop(submissions);
+
+        // Capture trigger: OK no-op.
+        assert_eq!(hle_driver_trigger_capture(&ctx, &[1, 2]), 0);
+
+        // Provider-aware registration: the whole Driver family resolves from
+        // BOTH import libraries (the measured Plague Tale gap was
+        // SubmitMultiDcbs registered only under libSceAgc).
+        let registry = HleRegistry::new();
+        for name in [
+            "sceAgcDriverSubmitMultiDcbs",
+            "sceAgcDriverAgrSubmitMultiDcbs",
+            "sceAgcDriverSubmitMultiAcbs",
+            "sceAgcDriverTriggerCapture",
+            "sceAgcDriverGetResourceRegistrationMaxNameLength",
+            "sceAgcDriverRegisterDefaultOwner",
+            "sceAgcDriverGetDefaultOwner",
+            "sceAgcDriverDeleteEqEvent",
+            "sceAgcDriverQueryResourceRegistrationUserMemoryRequirements",
+            "sceAgcDriverInitResourceRegistration",
+        ] {
+            assert!(
+                registry.is_implemented("libSceAgc", name),
+                "missing libSceAgc::{name}"
+            );
+            assert!(
+                registry.is_implemented("libSceAgcDriver", name),
+                "missing libSceAgcDriver::{name}"
+            );
+        }
+        for name in [
+            "sceAgcDcbJump",
+            "sceAgcCbBranch",
+            "sceAgcDcbDrawIndirect",
+            "sceAgcSetPacketPredication",
+            "sceAgcSetCxRegIndirectPatchSetNumRegisters",
+            "sceAgcDcbSetMarker",
+        ] {
+            assert!(
+                registry.is_implemented("libSceAgc", name),
+                "missing libSceAgc::{name}"
+            );
+        }
     }
 
     #[test]
