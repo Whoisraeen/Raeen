@@ -1321,6 +1321,23 @@ fn main() -> anyhow::Result<()> {
     let config = xps5x_core::config::EmulatorConfig::load(config_path)?;
     info!("Configuration loaded from {}", config_path.display());
 
+    // Apply the persisted logging settings now that config is loaded (logging
+    // was initialized earlier at the default level, before config existed); the
+    // Shell changes these live afterwards via `logging::set_level`.
+    xps5x_core::logging::set_level(if config.debug.logging {
+        config.debug.log_level.as_str()
+    } else {
+        "off"
+    });
+
+    // Mirror the persisted GPU settings into the GPU crate: Validation Layers
+    // (applied when the Vulkan backend is first created) and Resolution Scale
+    // (applied to each guest draw). Both take effect from this launch onward.
+    xps5x_gpu::AgcGpuSession::set_runtime_config(
+        config.graphics.validation_layers,
+        config.graphics.resolution_scale,
+    );
+
     // Initialize the kernel.
     let _kernel = xps5x_kernel::OrbisKernel::new();
     info!("Orbis kernel HLE initialized");
@@ -1351,6 +1368,8 @@ fn main() -> anyhow::Result<()> {
     };
     let native_options = eframe::NativeOptions {
         viewport,
+        // Honor the Video ▸ VSync setting (present mode). Applied at launch.
+        vsync: config.general.vsync,
         ..Default::default()
     };
 

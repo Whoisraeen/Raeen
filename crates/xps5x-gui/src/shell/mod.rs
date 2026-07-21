@@ -17,7 +17,7 @@ pub(crate) mod present;
 pub mod settings;
 
 use crate::launcher::{GameLauncher, SessionHandle, SessionState};
-use crate::library::{Gradient, LibraryItem, MetaCache};
+use crate::library::{Gradient, LaunchTarget, LibraryItem, MetaCache};
 use crate::theme::{self, Theme};
 use crate::updater::{self, UpdaterEvent, UpdaterState};
 use anim::Animated;
@@ -76,10 +76,22 @@ pub struct Shell {
     /// once per theme (re)load — `home.rs` draws this instead of the mesh
     /// gradient hero when present (spec §6).
     background_texture: Option<egui::TextureHandle>,
-    /// Per-game cover images (user-supplied `cover.png`/`cover.jpg` found by
-    /// the library scan), decoded and uploaded once at construction, keyed
+    /// Per-game cover images (user `cover.png`, else the title's own
+    /// `sce_sys/icon0.png`), decoded and uploaded once at construction, keyed
     /// by `LibraryItem::id`. Games without one keep gradient + monogram art.
     cover_textures: HashMap<String, egui::TextureHandle>,
+    /// Per-game key-art backgrounds (`sce_sys/pic1.png`, else `pic0.png`,
+    /// shipped by the title next to its eboot), decoded once at construction,
+    /// keyed by `LibraryItem::id`. The focused game's entry is drawn full-bleed
+    /// behind the Home rail; anything without one falls back to the mesh
+    /// gradient hero.
+    game_backgrounds: HashMap<String, egui::TextureHandle>,
+    /// The crossfading pair of key-art backgrounds for the Home hero: `to` is
+    /// the focused game's art, `from` is the previously-focused one, dissolved
+    /// by `hero_t`. Cloned handles out of `game_backgrounds` (or `None` for an
+    /// app tile / a game with no key art).
+    hero_bg_from: Option<egui::TextureHandle>,
+    hero_bg_to: Option<egui::TextureHandle>,
     /// Scratch text-entry buffers for Settings' two path fields. Kept on
     /// `Shell` rather than `nav::NavState`, which stays free of raw text
     /// state so it can remain a pure, egui-free state machine.
@@ -164,6 +176,11 @@ impl Shell {
         theme::install_fonts(ctx, &theme);
         let background_texture = background_texture_for(ctx, &theme);
         let cover_textures = cover_textures_for(ctx, &library);
+        let game_backgrounds = background_textures_for(ctx, &library);
+        // Seed the hero background with the initially-focused tile's key art.
+        let hero_bg_to = library
+            .first()
+            .and_then(|i| game_backgrounds.get(i.id.as_str()).cloned());
 
         Self {
             theme,
@@ -182,6 +199,9 @@ impl Shell {
             themes_root,
             background_texture,
             cover_textures,
+            game_backgrounds,
+            hero_bg_from: None,
+            hero_bg_to,
             settings_new_folder_input: String::new(),
             settings_key_provider_input,
             updater_state: UpdaterState::default(),
@@ -377,6 +397,7 @@ impl Shell {
             (0, 3) => {
                 self.config.graphics.validation_layers = !self.config.graphics.validation_layers
             }
+            (0, 4) => self.config.general.vsync = !self.config.general.vsync,
             (1, 0) => self.config.audio.enabled = !self.config.audio.enabled,
             (1, 1) => {
                 self.config.audio.volume =
@@ -389,8 +410,31 @@ impl Shell {
                     settings::adjust_stepped(self.config.input.deadzone, delta, 0.05, 0.0, 1.0)
             }
             (5, 0) => self.cycle_theme(ctx, delta),
+            (7, 0) => {
+                self.config.debug.logging = !self.config.debug.logging;
+                self.apply_log_settings();
+            }
+            (7, 1) => {
+                self.config.debug.log_level =
+                    settings::cycle_log_level(&self.config.debug.log_level, delta);
+                self.apply_log_settings();
+            }
+            (7, 2) => self.config.debug.trace_syscalls = !self.config.debug.trace_syscalls,
+            (7, 3) => self.config.debug.dump_gpu_commands = !self.config.debug.dump_gpu_commands,
+            (7, 4) => self.config.debug.dump_shaders = !self.config.debug.dump_shaders,
             _ => {}
         }
+    }
+
+    /// Push the current Debug logging settings to the live tracing subscriber
+    /// so Log Level / Logging take effect immediately, not just on next launch.
+    /// Logging off silences all output (an `off` filter).
+    fn apply_log_settings(&self) {
+        xps5x_core::logging::set_level(if self.config.debug.logging {
+            self.config.debug.log_level.as_str()
+        } else {
+            "off"
+        });
     }
 
     /// Confirm on the focused Settings row. Video/Audio/Input/Theme all
@@ -400,7 +444,7 @@ impl Shell {
     /// Confirm semantics.
     fn apply_setting_activate(&mut self, ctx: &egui::Context, section: usize, row: usize) {
         match section {
-            0 | 1 | 2 | 5 => self.apply_setting_adjust(ctx, section, row, 1),
+            0 | 1 | 2 | 5 | 7 => self.apply_setting_adjust(ctx, section, row, 1),
             3 => self.activate_game_folder_row(row),
             6 => self.activate_system_row(ctx, row),
             _ => {} // Key Provider (4): pure text-entry, nothing to "confirm".
@@ -632,10 +676,18 @@ impl Shell {
             self.focus_pop.value = 0.0;
             self.focus_pop.set_target(1.0);
 
-            let new_hero = self
-                .active_items()
-                .get(self.nav.rail_index)
-                .map(|i| i.art.hero());
+            // Resolve the newly-focused tile's hero gradient and its key-art
+            // background in one borrow, then start both crossfades off the same
+            // `hero_t` tween.
+            let (new_hero, focused_bg) = {
+                let item = self.active_items().get(self.nav.rail_index);
+                (
+                    item.map(|i| i.art.hero()),
+                    item.and_then(|i| self.game_backgrounds.get(i.id.as_str()).cloned()),
+                )
+            };
+            self.hero_bg_from = self.hero_bg_to.clone();
+            self.hero_bg_to = focused_bg;
             if let Some(new_hero) = new_hero {
                 self.hero_from = Some(self.blended_hero());
                 self.hero_to = new_hero;
@@ -710,6 +762,7 @@ impl Shell {
             let anim = HomeAnim {
                 rail_offset: self.rail_offset.value,
                 hero: self.blended_hero(),
+                hero_fade: anim::ease_out_cubic(self.hero_t.value),
                 focus_pop: self.focus_pop.value,
             };
             let items = self.active_items();
@@ -722,6 +775,8 @@ impl Shell {
                 &self.meta_cache,
                 self.background_texture.as_ref(),
                 &self.cover_textures,
+                self.hero_bg_from.as_ref(),
+                self.hero_bg_to.as_ref(),
             );
 
             let recent_titles = self.recent_titles();
@@ -786,6 +841,37 @@ fn cover_textures_for(
         };
         let texture = ctx.load_texture(
             format!("xps5x-cover-{}", item.id),
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+        textures.insert(item.id.clone(), texture);
+    }
+    textures
+}
+
+/// Decode + upload each scanned game's key-art background — the title's own
+/// `sce_sys/pic1.png` (or `pic0.png`), found next to its eboot — keyed by item
+/// id. Same bounds-checked, skip-on-failure path as covers; a game with no key
+/// art (or an app tile) simply has no entry and the Home hero falls back to its
+/// mesh gradient.
+fn background_textures_for(
+    ctx: &egui::Context,
+    library: &[LibraryItem],
+) -> HashMap<String, egui::TextureHandle> {
+    let mut textures = HashMap::new();
+    for item in library {
+        let LaunchTarget::Game { path } = &item.launch else {
+            continue;
+        };
+        let Some(bg_path) = crate::library::scan::title_background(path) else {
+            continue;
+        };
+        let Some(image) = theme::loader::load_image_file_capped(&bg_path) else {
+            tracing::warn!(path = %bg_path.display(), title = %item.title, "background image failed to load — using gradient hero");
+            continue;
+        };
+        let texture = ctx.load_texture(
+            format!("xps5x-bg-{}", item.id),
             image,
             egui::TextureOptions::LINEAR,
         );

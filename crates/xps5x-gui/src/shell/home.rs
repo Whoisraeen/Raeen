@@ -33,6 +33,10 @@ pub struct HomeAnim {
     pub rail_offset: f32,
     /// Current (possibly crossfading) hero gradient.
     pub hero: Gradient,
+    /// Cross-dissolve progress for the per-game key-art background: 0.0 right
+    /// after a focus change (previous art shown) .. 1.0 settled (new art
+    /// shown). Shares the hero gradient tween's timing.
+    pub hero_fade: f32,
     /// 0.0 (just changed focus) .. 1.0 (settled) — eases the focused tile's
     /// scale in rather than snapping it.
     pub focus_pop: f32,
@@ -66,12 +70,28 @@ pub fn draw(
     meta_cache: &MetaCache,
     background: Option<&egui::TextureHandle>,
     covers: &HashMap<String, egui::TextureHandle>,
+    bg_from: Option<&egui::TextureHandle>,
+    bg_to: Option<&egui::TextureHandle>,
 ) {
     let screen = ui.max_rect();
     let painter = ui.painter().clone();
+    let focused = items.get(nav.rail_index);
 
     painter.rect_filled(screen, 0.0, theme.palette.ground);
-    draw_hero(&painter, screen, theme, &anim.hero, background);
+
+    // The theme background (if any) is the base; the focused game's key art
+    // cross-dissolves on top of it (`bg_from` → `bg_to`), with the mesh
+    // gradient as the ultimate fallback — all resolved inside `draw_hero`.
+    draw_hero(
+        &painter,
+        screen,
+        theme,
+        &anim.hero,
+        background,
+        bg_from,
+        bg_to,
+        anim.hero_fade,
+    );
 
     draw_topbar(&painter, theme, screen);
     draw_nav_pills(&painter, theme, screen, nav);
@@ -83,7 +103,6 @@ pub fn draw(
     );
     draw_rail(ui, theme, rail_rect, items, nav, anim, covers);
 
-    let focused = items.get(nav.rail_index);
     draw_context_block(
         &painter,
         theme,
@@ -100,26 +119,32 @@ pub fn draw(
         .request_repaint_after(std::time::Duration::from_millis(50));
 }
 
-/// Paint the Home hero. When the active theme provides a background image
-/// (spec §6 — a user's own local theme), that image is drawn stretched to
-/// fill `rect` instead of the original mesh-gradient art; either way, the
-/// legibility scrim on top is unconditional so foreground text stays
-/// readable.
+/// Paint the Home hero. A user theme's background image (spec §6), else the
+/// mesh-gradient art, forms the base; the focused game's own key art
+/// (`sce_sys/pic1`/`pic0`) cross-dissolves on top as focus moves between titles
+/// (`bg_from` fades out, `bg_to` fades in, by `fade`). The legibility scrim on
+/// top is unconditional so foreground text stays readable over a photo or a
+/// gradient alike.
+#[allow(clippy::too_many_arguments)]
 fn draw_hero(
     painter: &egui::Painter,
     rect: Rect,
     theme: &Theme,
     g: &Gradient,
-    background: Option<&egui::TextureHandle>,
+    theme_bg: Option<&egui::TextureHandle>,
+    bg_from: Option<&egui::TextureHandle>,
+    bg_to: Option<&egui::TextureHandle>,
+    fade: f32,
 ) {
-    match background {
+    let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+
+    // Base layer: a user theme's background image if present, else the
+    // (crossfading) 4-corner mesh gradient that approximates key-art glow.
+    match theme_bg {
         Some(texture) => {
-            let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
             painter.image(texture.id(), rect, uv, Color32::WHITE);
         }
         None => {
-            // Approximate full-bleed key art's upper-right glow with a
-            // 4-corner mesh.
             let top_right = g.hi;
             let top_left = lerp_color(g.hi, g.mid, 0.55);
             let bottom_right = lerp_color(g.mid, g.lo, 0.4);
@@ -133,6 +158,18 @@ fn draw_hero(
                 bottom_right,
             );
         }
+    }
+
+    // Per-game key art, cross-dissolved on top of the base as focus moves: the
+    // outgoing art fades out while the incoming art fades in. Either side may be
+    // absent (an app tile, or a game with no key art), so a game→app move
+    // dissolves the photo back to the base rather than snapping.
+    let fade = fade.clamp(0.0, 1.0);
+    if let Some(from) = bg_from {
+        painter.image(from.id(), rect, uv, with_alpha(Color32::WHITE, 1.0 - fade));
+    }
+    if let Some(to) = bg_to {
+        painter.image(to.id(), rect, uv, with_alpha(Color32::WHITE, fade));
     }
 
     // Legibility scrim: darker toward the bottom-left where text sits.
@@ -410,6 +447,19 @@ fn draw_rail(
 
         let tile_rect = Rect::from_min_size(Pos2::new(x, center_y - size / 2.0), vec2(size, size));
         let radius = m.corner_radius * size / m.tile_size;
+
+        // Soft drop shadow so tiles read as raised cards, especially over a
+        // busy key-art background. Four low-alpha, downward-offset rounded
+        // rects stack into a cheap penumbra (egui has no blur); the tile itself
+        // is painted on top and hides the core, leaving only the falloff.
+        for k in 0..4 {
+            let spread = k as f32 * (size * 0.02);
+            painter.rect_filled(
+                tile_rect.translate(vec2(0.0, size * 0.03)).expand(spread),
+                radius + spread,
+                with_alpha(Color32::BLACK, 0.06 * alpha),
+            );
+        }
 
         let g = item.art.tile();
         let faded = TileGradient {

@@ -32,11 +32,12 @@
 
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{EnvFilter, fmt, reload};
 
 /// The log file [`init_with_file`] writes, inside the log directory.
 pub const LOG_FILE_NAME: &str = "xps5x.log";
@@ -160,6 +161,25 @@ fn filter(level: &str) -> EnvFilter {
     EnvFilter::try_from_env("XPS5X_LOG").unwrap_or_else(|_| EnvFilter::new(level))
 }
 
+/// A boxed closure that swaps the global level filter to a new level string.
+type ReloadFn = Box<dyn Fn(&str) + Send + Sync>;
+
+/// Live handle to the global level filter, installed by [`init_with_file`].
+/// Boxed so the concrete `reload::Handle<..>` type stays private; `set` only
+/// succeeds once, so the first (real) subscriber wins.
+static RELOAD: OnceLock<ReloadFn> = OnceLock::new();
+
+/// Change the global log level at runtime — the seam behind Settings ▸ Debug ▸
+/// Log Level / Logging. `level` is anything the env-filter accepts
+/// (`error`/`warn`/`info`/`debug`/`trace`, or `off` to silence output). A no-op
+/// until [`init_with_file`] has installed a reloadable subscriber (so `init`,
+/// tests, and already-initialized processes simply ignore it).
+pub fn set_level(level: &str) {
+    if let Some(reload) = RELOAD.get() {
+        reload(level);
+    }
+}
+
 /// Initialize the global tracing subscriber, stderr only.
 ///
 /// Prefer [`init_with_file`] for the emulator proper — this exists for tools
@@ -231,11 +251,21 @@ pub fn init_with_file(level: &str, log_dir: &Path) -> anyhow::Result<LogGuard> {
         .with_thread_ids(true)
         .with_ansi(true);
 
-    let _ = tracing_subscriber::registry()
-        .with(filter(level))
+    // Wrap the level filter in a reload layer so `set_level` (Settings ▸ Debug)
+    // can change verbosity live. Only wire the reload handle up if this call is
+    // the one that actually installs the subscriber.
+    let (filter_layer, reload_handle) = reload::Layer::new(filter(level));
+    let installed = tracing_subscriber::registry()
+        .with(filter_layer)
         .with(stderr_layer)
         .with(file_layer)
-        .try_init();
+        .try_init()
+        .is_ok();
+    if installed {
+        let _ = RELOAD.set(Box::new(move |lvl: &str| {
+            let _ = reload_handle.reload(EnvFilter::new(lvl));
+        }));
+    }
 
     tracing::info!(
         "XPS5X v{} — PS5 Emulator initialized (logging to {}, cap {})",

@@ -175,7 +175,7 @@ pub fn default_theme() -> Theme {
             tile_focus_scale: 1.2,
             tile_focus_lift: 0.0,
             rail_padding_left: 88.0,
-            corner_radius: 16.0,
+            corner_radius: 28.0,
             button_radius: 8.0,
             card_size: egui::vec2(250.0, 140.0),
             card_gap: 16.0,

@@ -1,7 +1,7 @@
 //! Settings screen (spec §3 screen 5, §10 SM2).
 //!
-//! A full-screen surface with six sections — Video, Audio, Input, Game
-//! Folders, Key Provider, Theme — bound to the real
+//! A full-screen surface with sections — Video, Audio, Input, Game Folders,
+//! Key Provider, Theme, System, Debug — bound to the real
 //! [`xps5x_core::config::EmulatorConfig`]. Navigation (which section/row is
 //! focused, Up/Down between rows, Left/Right/Confirm to adjust, Back to
 //! leave) lives in [`super::nav`] as pure state; this module only draws the
@@ -24,7 +24,7 @@ use std::path::Path;
 use xps5x_core::config::EmulatorConfig;
 
 /// Section names, in the order `nav::NavState::settings_section` indexes.
-pub const SETTINGS_SECTION_NAMES: [&str; 7] = [
+pub const SETTINGS_SECTION_NAMES: [&str; 8] = [
     "Video",
     "Audio",
     "Input",
@@ -32,13 +32,26 @@ pub const SETTINGS_SECTION_NAMES: [&str; 7] = [
     "Key Provider",
     "Theme",
     "System",
+    "Debug",
 ];
 
 /// Number of rows in each section, in `SETTINGS_SECTION_NAMES` order. The
 /// Game Folders section grows by one row per configured folder plus a
 /// trailing "Add Folder" row, so this takes the current folder count.
 pub fn settings_row_counts(game_folder_count: usize) -> Vec<usize> {
-    vec![4, 3, 2, game_folder_count + 1, 1, 1, 2]
+    vec![5, 3, 2, game_folder_count + 1, 1, 1, 2, 5]
+}
+
+/// Log-level names the Debug section's "Log Level" row cycles through, in
+/// increasing verbosity — the values `tracing`'s env-filter accepts.
+pub const LOG_LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
+
+/// Cycle `current` through [`LOG_LEVELS`] by `delta` steps (wrapping). An
+/// unrecognized current value restarts from `info`.
+pub fn cycle_log_level(current: &str, delta: i32) -> String {
+    let idx = LOG_LEVELS.iter().position(|l| *l == current).unwrap_or(2);
+    let next = (idx as i32 + delta).rem_euclid(LOG_LEVELS.len() as i32) as usize;
+    LOG_LEVELS[next].to_string()
 }
 
 /// Step `value` by `delta` steps of size `step`, clamped to `[min, max]`.
@@ -155,6 +168,7 @@ pub fn draw(
                     4 => draw_key_provider(ui, theme, nav, key_provider_input),
                     5 => draw_theme(ui, theme, nav, config),
                     6 => draw_system(ui, theme, nav, updater),
+                    7 => draw_debug(ui, theme, nav, config),
                     _ => {}
                 }
             });
@@ -204,6 +218,14 @@ fn draw_video(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, config: &Emulato
         3,
         "Validation Layers",
         on_off(config.graphics.validation_layers).to_string(),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        4,
+        "VSync",
+        on_off(config.general.vsync).to_string(),
     );
 }
 
@@ -371,6 +393,58 @@ fn draw_system(
     );
 }
 
+/// Debug section: developer diagnostics, all persisted to `config.toml`'s
+/// `[debug]` table — logging verbosity plus the GPU/shader/syscall dump
+/// toggles the runtime reads when a session launches.
+fn draw_debug(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, config: &EmulatorConfig) {
+    row(
+        ui,
+        theme,
+        nav,
+        0,
+        "Logging",
+        on_off(config.debug.logging).to_string(),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        1,
+        "Log Level",
+        config.debug.log_level.clone(),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        2,
+        "Trace Syscalls",
+        on_off(config.debug.trace_syscalls).to_string(),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        3,
+        "Dump GPU Commands",
+        on_off(config.debug.dump_gpu_commands).to_string(),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        4,
+        "Dump Shaders",
+        on_off(config.debug.dump_shaders).to_string(),
+    );
+    ui.add_space(10.0);
+    ui.label(
+        RichText::new("Developer diagnostics — logging verbosity and GPU/shader/syscall dumps.")
+            .color(theme.palette.text_faint)
+            .size(12.0),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,12 +463,22 @@ mod tests {
     #[test]
     fn other_sections_row_counts_are_fixed() {
         let counts = settings_row_counts(5);
-        assert_eq!(counts[0], 4); // Video
+        assert_eq!(counts[0], 5); // Video (Resolution, Fullscreen, Shader Cache, Validation, VSync)
         assert_eq!(counts[1], 3); // Audio
         assert_eq!(counts[2], 2); // Input
         assert_eq!(counts[4], 1); // Key Provider
         assert_eq!(counts[5], 1); // Theme
         assert_eq!(counts[6], 2); // System (version + updater action)
+        assert_eq!(counts[7], 5); // Debug (Logging, Log Level, Trace, Dump GPU, Dump Shaders)
+    }
+
+    #[test]
+    fn cycle_log_level_wraps_both_directions() {
+        assert_eq!(cycle_log_level("info", 1), "debug");
+        assert_eq!(cycle_log_level("info", -1), "warn");
+        assert_eq!(cycle_log_level("trace", 1), "error"); // wraps top -> bottom
+        assert_eq!(cycle_log_level("error", -1), "trace"); // wraps bottom -> top
+        assert_eq!(cycle_log_level("nonsense", 1), "debug"); // unknown restarts at info
     }
 
     #[test]

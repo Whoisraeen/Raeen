@@ -225,12 +225,35 @@ fn find_eboot(dir: &Path) -> Option<PathBuf> {
 /// itself never ships cover images (spec §11).
 const COVER_FILE_NAMES: [&str; 3] = ["cover.png", "cover.jpg", "cover.jpeg"];
 
-/// The first conventional cover file that exists inside `folder`, if any.
-fn find_cover(folder: &Path) -> Option<std::path::PathBuf> {
+/// The tile art for a game. A user-supplied `cover.*` in the game's own folder
+/// wins (so anyone can override), otherwise the title's **own** app icon —
+/// `sce_sys/icon0.png`, which every real PS5 title ships next to its eboot.
+/// `None` leaves the tile on its generated gradient + monogram (e.g. a
+/// decrypted dump with no `sce_sys`).
+fn find_cover(folder: &Path, eboot: Option<&Path>) -> Option<std::path::PathBuf> {
     COVER_FILE_NAMES
         .iter()
         .map(|name| folder.join(name))
         .find(|p| p.is_file())
+        .or_else(|| sce_sys_asset(eboot, "icon0.png"))
+}
+
+/// The full-bleed key-art background for a game: the title's own
+/// `sce_sys/pic1.png` (dedicated background art) if present, otherwise
+/// `pic0.png` (the boot splash, which is full-frame key art for most titles).
+/// Both live in `sce_sys/` next to the eboot. `None` leaves the Home hero on
+/// its generated gradient.
+pub fn title_background(eboot: &Path) -> Option<std::path::PathBuf> {
+    sce_sys_asset(Some(eboot), "pic1.png").or_else(|| sce_sys_asset(Some(eboot), "pic0.png"))
+}
+
+/// A file inside the title's `sce_sys/` directory, which sits next to the
+/// eboot. Real titles install as `<game>/<TITLEID>-app/eboot.bin` with art
+/// under `<game>/<TITLEID>-app/sce_sys/`, so the eboot's parent is the correct
+/// anchor for both the flat and nested layouts [`find_eboot`] accepts.
+fn sce_sys_asset(eboot: Option<&Path>, name: &str) -> Option<std::path::PathBuf> {
+    let path = eboot?.parent()?.join("sce_sys").join(name);
+    path.is_file().then_some(path)
 }
 
 /// Turn a folder name like `nova-requiem` or `sable_horizon` into a display
@@ -274,8 +297,8 @@ pub fn scan_dir(root: &Path) -> Vec<LibraryItem> {
         };
         let eboot = find_eboot(&path);
         let title_toml = std::fs::read_to_string(path.join("xps5x-title.toml")).ok();
-        if let Some(mut item) = item_from_folder(name, eboot, title_toml.as_deref()) {
-            item.cover_path = find_cover(&path);
+        if let Some(mut item) = item_from_folder(name, eboot.clone(), title_toml.as_deref()) {
+            item.cover_path = find_cover(&path, eboot.as_deref());
             items.push(item);
         }
     }
@@ -532,6 +555,55 @@ mod tests {
         let root = scratch_dir("cover-priority");
         std::fs::write(root.join("cover.jpg"), b"jpg").unwrap();
         std::fs::write(root.join("cover.png"), b"png").unwrap();
-        assert_eq!(find_cover(&root), Some(root.join("cover.png")));
+        assert_eq!(find_cover(&root, None), Some(root.join("cover.png")));
+    }
+
+    #[test]
+    fn find_cover_falls_back_to_the_titles_sce_sys_icon0() {
+        // No user cover in the folder, but the title ships sce_sys/icon0.png
+        // next to its eboot (the real PS5 layout) — that becomes the tile art.
+        let root = scratch_dir("icon0-fallback");
+        let app = root.join("PPSA00001-app");
+        let sce_sys = app.join("sce_sys");
+        std::fs::create_dir_all(&sce_sys).unwrap();
+        let eboot = app.join("eboot.bin");
+        std::fs::write(&eboot, b"stub").unwrap();
+        let icon0 = sce_sys.join("icon0.png");
+        std::fs::write(&icon0, b"png").unwrap();
+
+        assert_eq!(find_cover(&root, Some(&eboot)), Some(icon0));
+    }
+
+    #[test]
+    fn user_cover_wins_over_the_titles_icon0() {
+        let root = scratch_dir("cover-over-icon0");
+        std::fs::write(root.join("cover.png"), b"png").unwrap();
+        let sce_sys = root.join("sce_sys");
+        std::fs::create_dir_all(&sce_sys).unwrap();
+        let eboot = root.join("eboot.bin");
+        std::fs::write(&eboot, b"stub").unwrap();
+        std::fs::write(sce_sys.join("icon0.png"), b"png").unwrap();
+
+        assert_eq!(
+            find_cover(&root, Some(&eboot)),
+            Some(root.join("cover.png"))
+        );
+    }
+
+    #[test]
+    fn title_background_prefers_pic1_then_pic0() {
+        let root = scratch_dir("bg-pick");
+        let sce_sys = root.join("sce_sys");
+        std::fs::create_dir_all(&sce_sys).unwrap();
+        let eboot = root.join("eboot.bin");
+        std::fs::write(&eboot, b"stub").unwrap();
+
+        // Only pic0 present → pic0 (the boot splash doubles as key art).
+        std::fs::write(sce_sys.join("pic0.png"), b"png").unwrap();
+        assert_eq!(title_background(&eboot), Some(sce_sys.join("pic0.png")));
+
+        // Dedicated pic1 present → it wins.
+        std::fs::write(sce_sys.join("pic1.png"), b"png").unwrap();
+        assert_eq!(title_background(&eboot), Some(sce_sys.join("pic1.png")));
     }
 }
