@@ -38,7 +38,7 @@ use super::spirv::{
     storage_texture_dim_format,
 };
 use crate::shader::resources::{
-    ShaderComputeInputInfo, ShaderPixelInputInfo, ShaderVertexInputInfo,
+    ShaderBindResources, ShaderComputeInputInfo, ShaderPixelInputInfo, ShaderVertexInputInfo,
 };
 use crate::shader::types::{
     ShaderCode, ShaderInstruction, ShaderInstructionType, ShaderLabel, ShaderOperandType,
@@ -4005,6 +4005,109 @@ enum MimgDescriptorClass {
     Storage,
 }
 
+/// The EUD dword offset a COVERED scalar load off the EUD base pair fills the
+/// SGPR range starting at `reg` from, or `None` if no such load seeds `reg`.
+///
+/// A descriptor delivered through the raw EUD window is read into the register
+/// file by an `s_load_dword{,x2,x4,x8} s[reg..], s[eud_base:eud_base+1],
+/// <const>` (the exact shape `sload_dword_extended` and
+/// `shader_detect_eud_raw_window` accept). The returned dword offset is the
+/// load's byte offset >> 2 — the EUD dword whose captured-descriptor coverage
+/// decides whether `reg`'s dword 0 gets a rewritten descriptor-array index.
+fn eud_load_offset_for_register(code: &ShaderCode, eud_base: i32, reg: i32) -> Option<i32> {
+    use ShaderInstructionType as T;
+    for load in code.get_instructions() {
+        match load.type_ {
+            T::SLoadDword | T::SLoadDwordx2 | T::SLoadDwordx4 | T::SLoadDwordx8 => {}
+            _ => continue,
+        }
+        if load.src[0].type_ != ShaderOperandType::Sgpr
+            || load.src[0].register_id != eud_base
+            || load.dst.type_ != ShaderOperandType::Sgpr
+            || load.dst.register_id != reg
+            || !matches!(
+                load.src[1].type_,
+                ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
+            )
+            || load.src[1].constant.i() < 0
+        {
+            continue;
+        }
+        return Some((load.src[1].constant.u >> 2) as i32);
+    }
+    None
+}
+
+/// SharpEmu-parity EUD-alias resolution for an MIMG descriptor register that
+/// matched no captured descriptor DIRECTLY.
+///
+/// SharpEmu resolves every image descriptor by evaluating the shader's scalar
+/// program — the register file holds the real descriptor at the MIMG, copied
+/// straight out (`reference/sharpemu/src/SharpEmu.ShaderCompiler/`
+/// `Gen5ShaderScalarEvaluator.cs:599-668`, `TryCopyRegisters`). This port's
+/// captured-descriptor table is the equivalent, but a Gen5 CS commonly reads a
+/// T#/S# from a REAL SGPR that a covered `s_load` off the EUD pair fills at
+/// runtime, while the same descriptor is captured at its EUD-*virtual* start
+/// register (`start >= SGPRS_MAX`, or rebased on the EUD base — measured on
+/// ASTRO.BOT scene compute `0x5006c5f00`: `image_store` reads `s0`, but the
+/// storage T# is captured at `s32` = EUD dword 0, loaded into `s0` by
+/// `s_load_dwordx8 s[0:7], s[12:13], 0x0`).
+///
+/// `WriteLocalVariables` maps the descriptor's EUD dwords to push-constant
+/// fields keyed by EUD dword (`eud_rel_index`), and `sload_dword_extended`
+/// lowers the covered load to seed the load's DEST register with the rewritten
+/// dword 0 (`GetMappedIndex`) — so `reg` already holds the descriptor's
+/// array index at the MIMG regardless of `reg != start_register`. The refusal
+/// is therefore spurious whenever: `reg` is filled by such a covered load off
+/// the EUD base at dword `k`, and a captured EUD-resident descriptor of the
+/// requested class has its dword 0 mapped at exactly `k`
+/// (`eud_rel_index(start_register) == k`). This resolves the alias without
+/// inventing a descriptor or binding any uncaptured guest bytes — the bound
+/// descriptor is the already-validated captured one.
+fn mimg_register_is_eud_alias(
+    bind: &ShaderBindResources,
+    code: &ShaderCode,
+    reg: i32,
+    want_storage: bool,
+) -> bool {
+    if !bind.extended.used {
+        return false;
+    }
+    let Some(k) = eud_load_offset_for_register(code, bind.extended.start_register, reg) else {
+        return false;
+    };
+    let tex_num = usize::try_from(bind.textures2d.textures_num.max(0))
+        .unwrap_or(0)
+        .min(bind.textures2d.desc.len());
+    bind.textures2d.desc[..tex_num].iter().any(|d| {
+        d.extended
+            && d.textures2d_without_sampler == want_storage
+            && super::spirv::eud_rel_index(bind, d.start_register, 0, "mimg alias")
+                .is_ok_and(|rel| rel == k)
+    })
+}
+
+/// EUD-alias resolution for a sampler register (see
+/// [`mimg_register_is_eud_alias`]): the S# is captured at its EUD-virtual
+/// start register but read by the MIMG from a real SGPR a covered EUD `s_load`
+/// fills.
+fn sampler_register_is_eud_alias(bind: &ShaderBindResources, code: &ShaderCode, reg: i32) -> bool {
+    if !bind.extended.used {
+        return false;
+    }
+    let Some(k) = eud_load_offset_for_register(code, bind.extended.start_register, reg) else {
+        return false;
+    };
+    let samp_num = usize::try_from(bind.samplers.samplers_num.max(0))
+        .unwrap_or(0)
+        .min(bind.samplers.start_register.len());
+    (0..samp_num).any(|i| {
+        bind.samplers.extended[i]
+            && super::spirv::eud_rel_index(bind, bind.samplers.start_register[i], 0, "mimg alias")
+                .is_ok_and(|rel| rel == k)
+    })
+}
+
 /// SharpEmu-parity translate-time guard against RUNTIME image descriptors.
 ///
 /// The recompiled MIMG bodies index `%textures2D_S` / `%textures2D_L` /
@@ -4070,7 +4173,9 @@ fn mimg_descriptor_guard(
         d.start_register + shift_regs == t_reg
             && d.textures2d_without_sampler == (class == MimgDescriptorClass::Storage)
     });
-    if !t_matched {
+    if !t_matched
+        && !mimg_register_is_eud_alias(bind, code, t_reg, class == MimgDescriptorClass::Storage)
+    {
         return Err(not_supported(
             func,
             format!(
@@ -4098,7 +4203,7 @@ fn mimg_descriptor_guard(
         let s_matched = bind.samplers.start_register[..samp_num]
             .iter()
             .any(|&start| start + shift_regs == s_reg);
-        if !s_matched {
+        if !s_matched && !sampler_register_is_eud_alias(bind, code, s_reg) {
             return Err(not_supported(
                 func,
                 format!("dynamic-image-descriptor: S# at s{s_reg} matches no captured sampler"),
@@ -12566,6 +12671,150 @@ mod tests {
 
         let err = spirv_generate_source(&code, None, None, Some(&input_info))
             .expect_err("raw overwrite of T# registers must refuse");
+        assert!(
+            err.to_string().contains("dynamic-image-descriptor"),
+            "named refusal expected, got: {err}"
+        );
+    }
+
+    /// EUD-alias resolution (the measured 0x5006c5f00 headline): the storage
+    /// T# is captured at its EUD-VIRTUAL start register (`s32` = EUD dword 0),
+    /// but the `image_store` reads its T# from `s0`, which a COVERED
+    /// `s_load_dwordx8 s[0:7], s[12:13], 0x0` fills at runtime. The register's
+    /// dword 0 is the rewritten storage-array index (`sload_dword_extended` +
+    /// `GetMappedIndex`), so the descriptor resolves instead of refusing.
+    #[test]
+    fn eud_alias_storage_tsharp_resolves_via_covered_load() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // image_store dmask1 reading its storage T# from s[0:7] (srsrc = 0).
+        shader_parse(
+            0,
+            &[0xF020_0100, 0x0060_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_store dmask1 (T# at s0)");
+        assert_eq!(code.get_instructions()[0].type_, T::ImageStore);
+        assert_eq!(code.get_instructions()[0].src[1].register_id, 0);
+        let sload = ShaderInstruction {
+            type_: T::SLoadDwordx8,
+            format: F::Sdst8SbaseSoffset,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 0,
+                size: 8,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 12,
+                    size: 2,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::LiteralConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(0),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        code.get_instructions_mut().insert(0, sload);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.extended.used = true;
+        input_info.bind.extended.start_register = 12;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_storage_num = 1;
+        // Captured at the EUD-virtual start register (s32 = EUD dword 0), NOT s0.
+        input_info.bind.textures2d.desc[0].start_register = 32;
+        input_info.bind.textures2d.desc[0].extended = true;
+        input_info.bind.textures2d.desc[0].textures2d_without_sampler = true;
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("EUD-alias storage T# must resolve, not refuse");
+        assert!(source.contains("OpImageWrite"), "{source}");
+        let _ = spirv_run(&source).expect("assemble EUD-alias image_store");
+    }
+
+    /// EUD-alias resolution is offset-exact — the device-loss guard: the
+    /// `image_store` reads its storage T# from `s0`, but the covered load
+    /// fills `s0` from EUD dword 0 (a RAW-window read — no captured descriptor
+    /// covers it), while the only storage descriptor maps at EUD dword 8
+    /// (`s40`). No captured descriptor's rewritten index lands in `s0`, so
+    /// `s0` holds a RAW guest dword; the alias must NOT match and the refusal
+    /// stands rather than submitting an out-of-bounds descriptor index.
+    #[test]
+    fn eud_alias_rejects_offset_mismatch() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // image_store dmask1 reading its storage T# from s[0:7] (srsrc = 0).
+        shader_parse(
+            0,
+            &[0xF020_0100, 0x0060_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_store dmask1 (T# at s0)");
+        // s_load_dwordx8 s[0:7], s[12:13], 0x0 — EUD dword 0, uncovered.
+        let sload = ShaderInstruction {
+            type_: T::SLoadDwordx8,
+            format: F::Sdst8SbaseSoffset,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 0,
+                size: 8,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 12,
+                    size: 2,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::LiteralConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(0),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        code.get_instructions_mut().insert(0, sload);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.extended.used = true;
+        input_info.bind.extended.start_register = 12;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_storage_num = 1;
+        // The only storage descriptor maps at EUD dword 8 (s40), not the
+        // loaded dword 0 — the load reads the raw window into s0 instead.
+        input_info.bind.textures2d.desc[0].start_register = 40;
+        input_info.bind.textures2d.desc[0].extended = true;
+        input_info.bind.textures2d.desc[0].textures2d_without_sampler = true;
+        // Declare the raw window so the uncovered load recompiles (reaching the
+        // MIMG guard) instead of refusing at the load itself.
+        crate::shader::spirv::shader_detect_eud_raw_window(&code, &mut input_info.bind);
+        assert!(
+            input_info.bind.eud_raw.used,
+            "the uncovered load must be detected as a raw-window read"
+        );
+
+        let err = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect_err("offset-mismatched EUD alias must refuse");
         assert!(
             err.to_string().contains("dynamic-image-descriptor"),
             "named refusal expected, got: {err}"

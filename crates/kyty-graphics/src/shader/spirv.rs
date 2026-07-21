@@ -1820,7 +1820,7 @@ fn lane_sel_snippet(lane_sel: u8, src: &str, dst: &str) -> Option<String> {
 ///   the pointer-pair register the analysis recorded in
 ///   `bind.extended.start_register` (measured on ASTRO.BOT compute: T# at
 ///   start_register=12 with the EUD pair at (s12, s13) → EUD dword 0).
-fn eud_rel_index(
+pub(crate) fn eud_rel_index(
     bind: &ShaderBindResources,
     start_reg: i32,
     shift_regs: i32,
