@@ -598,6 +598,121 @@ fn texture_vk_format(
     }
 }
 
+/// Sparse sample-hash of a guest byte range for the persistent-texture cache
+/// (stage D): FNV-1a over the range length plus 64 evenly-strided 64-byte
+/// chunks and the final 64 bytes — ~4 KiB of guest reads regardless of
+/// texture size (a whole-range hash for ranges up to 4 KiB). Never returns 0
+/// (0 is the "no hash / not cacheable" sentinel), and returns `None` when the
+/// guest range is not readable — the caller then decodes uncached and produces
+/// its own named error if the range is truly bad.
+///
+/// ## Staleness window (documented, deliberate)
+///
+/// A CPU guest write that leaves every sampled chunk byte-identical is NOT
+/// detected: the cached image keeps being bound until any sampled byte
+/// changes. The window is bounded by the sample coverage — the hash is
+/// recomputed from guest memory on EVERY bind, so any write that touches a
+/// sampled chunk is picked up at the next draw. Writeback paths we control
+/// (compute storage writeback, DMA copies) do not proactively invalidate the
+/// texture cache — no cheap range index over it exists today — so they are
+/// covered by the same per-bind rehash. `XPS5X_NO_TEX_CACHE=1` restores
+/// per-draw decode + upload wholesale.
+fn guest_sample_hash(base: u64, len: u64) -> Option<u64> {
+    const CHUNKS: u64 = 64;
+    const CHUNK_BYTES: u64 = 64;
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    fn mix(mut h: u64, bytes: &[u8]) -> u64 {
+        for &b in bytes {
+            h = (h ^ u64::from(b)).wrapping_mul(FNV_PRIME);
+        }
+        h
+    }
+    if len == 0 {
+        return None;
+    }
+    let mut h = mix(FNV_OFFSET, &len.to_le_bytes());
+    if len <= CHUNKS * CHUNK_BYTES {
+        let bytes = read_guest_bytes_unaligned(base, len, "texture sample-hash").ok()?;
+        h = mix(h, &bytes);
+    } else {
+        let stride = len / CHUNKS;
+        for i in 0..CHUNKS {
+            let offset = i * stride;
+            let size = CHUNK_BYTES.min(len - offset);
+            let bytes =
+                read_guest_bytes_unaligned(base + offset, size, "texture sample-hash").ok()?;
+            h = mix(h, &bytes);
+        }
+        // The strided chunks can miss the very end of the range; the tail is
+        // where partial updates (e.g. an atlas row append) often land.
+        let tail = read_guest_bytes_unaligned(
+            base + (len - CHUNK_BYTES),
+            CHUNK_BYTES,
+            "texture sample-hash",
+        )
+        .ok()?;
+        h = mix(h, &tail);
+    }
+    Some(h.max(1))
+}
+
+/// Consult the persistent-texture cache before decoding a T# (stage D).
+///
+/// Returns the fresh sample-hash of the guest source range (0 when caching is
+/// disabled, no sampling scope is published — the compute path — or the range
+/// is unreadable) and, when the published cache snapshot holds this exact
+/// texture with an equal hash, the ready [`TextureUpload`] that binds the
+/// cached image (empty pixels, `cached: true`) so the caller skips the guest
+/// read and detile entirely.
+#[allow(clippy::too_many_arguments)]
+fn texture_cache_probe(
+    base: u64,
+    src_len: u64,
+    width: u32,
+    height: u32,
+    layers: u32,
+    depth: u32,
+    cube: bool,
+    format: vk::Format,
+) -> (u64, Option<TextureUpload>) {
+    if std::env::var_os("XPS5X_NO_TEX_CACHE").is_some() {
+        return (0, None);
+    }
+    let Some(hash) = sampling_scope(|_| guest_sample_hash(base, src_len)) else {
+        return (0, None);
+    };
+    let hit = sampling_scope(|scope| {
+        scope
+            .cached_textures
+            .iter()
+            .find(|(k, cached_hash)| {
+                k.base == base
+                    && k.width == width
+                    && k.height == height
+                    && k.layers == layers
+                    && k.depth == depth
+                    && k.cube == cube
+                    && k.format == format.as_raw()
+                    && *cached_hash == hash
+            })
+            .map(|_| TextureUpload {
+                width,
+                height,
+                format,
+                pixels: Vec::new(),
+                layers,
+                cube,
+                depth,
+                render_target: None,
+                guest_base: base,
+                sample_hash: hash,
+                cached: true,
+            })
+    });
+    (hash, hit)
+}
+
 /// Decode one T# into linear pixels a Vulkan sampled image can hold.
 ///
 /// Formats and tile modes are added strictly from measurement: an unhandled
@@ -645,7 +760,11 @@ fn decode_texture(
 
     let (format, bpp) = texture_vk_format(t)?;
 
-    let pixels = match t.tile_mode() {
+    // Persistent-texture cache probe (stage D): hashed against the SOURCE
+    // bytes (pitch-padded / tiled, exactly what each branch would read), so a
+    // cache hit skips the guest read AND the detile AND the upload. Each
+    // decoding branch yields (pixels, source sample-hash).
+    let (pixels, sample_hash) = match t.tile_mode() {
         0 if cube || array => {
             return Err(err(
                 "cube/2DArray texture with linear tile mode not implemented (only tiled measured)",
@@ -657,11 +776,21 @@ fn decode_texture(
             // pitch * height for a linear T# — the measured ASTRO.BOT
             // volumes are tile 0).
             let pitch = u32::from(t.pitch()).max(width);
-            let tiled = read_guest_bytes_unaligned(
+            let src_len = u64::from(pitch) * u64::from(height) * u64::from(depth) * u64::from(bpp);
+            let (hash, hit) = texture_cache_probe(
                 t.base40(),
-                u64::from(pitch) * u64::from(height) * u64::from(depth) * u64::from(bpp),
-                "texture",
-            )?;
+                src_len,
+                width,
+                height,
+                layers,
+                depth,
+                cube,
+                format,
+            );
+            if let Some(upload) = hit {
+                return Ok(upload);
+            }
+            let tiled = read_guest_bytes_unaligned(t.base40(), src_len, "texture")?;
             let row = (width * bpp) as usize;
             let src_row = (pitch * bpp) as usize;
             let src_slice = src_row * height as usize;
@@ -674,7 +803,7 @@ fn decode_texture(
                     pixels[dst..dst + row].copy_from_slice(&tiled[src..src + row]);
                 }
             }
-            pixels
+            (pixels, hash)
         }
         other if volume => {
             return Err(err(format!(
@@ -694,11 +823,21 @@ fn decode_texture(
             let face_tiled =
                 crate::texture::tiling::tiled_byte_count_64kb(width, height, bpp_log2) as usize;
             let face_linear = (width * height * bpp) as usize;
-            let tiled = read_guest_bytes_unaligned(
+            let src_len = face_tiled as u64 * u64::from(layers);
+            let (hash, hit) = texture_cache_probe(
                 t.base40(),
-                face_tiled as u64 * u64::from(layers),
-                "texture",
-            )?;
+                src_len,
+                width,
+                height,
+                layers,
+                depth,
+                cube,
+                format,
+            );
+            if let Some(upload) = hit {
+                return Ok(upload);
+            }
+            let tiled = read_guest_bytes_unaligned(t.base40(), src_len, "texture")?;
             let mut pixels = vec![0u8; face_linear * layers as usize];
             for layer in 0..layers as usize {
                 let src = &tiled[layer * face_tiled..(layer + 1) * face_tiled];
@@ -706,7 +845,7 @@ fn decode_texture(
                     .expect("table-checked above");
                 pixels[layer * face_linear..(layer + 1) * face_linear].copy_from_slice(&face);
             }
-            pixels
+            (pixels, hash)
         }
         other => {
             return Err(err(format!(
@@ -752,6 +891,11 @@ fn decode_texture(
         // persistent target (that would early-return before the detile with
         // `render_target: Some(base)`).
         render_target: None,
+        // Cache identity (stage D): with a non-zero hash the backend donates
+        // the uploaded image to the persistent-texture cache on draw success.
+        guest_base: t.base40(),
+        sample_hash,
+        cached: false,
     })
 }
 
@@ -850,6 +994,11 @@ struct SamplingScope {
     map: *const HashMap<u64, RenderedImage>,
     live: Vec<(u64, u32, u32, i32)>,
     self_base: u64,
+    /// Snapshot of the persistent-texture cache (stage D): every cached
+    /// texture's key and content sample-hash. `decode_texture` consults it to
+    /// skip the guest read + detile + upload for a texture whose fresh
+    /// sample-hash matches; empty when the cache is empty or disabled.
+    cached_textures: Vec<(crate::vulkan::cache::TextureKey, u64)>,
 }
 
 thread_local! {
@@ -924,6 +1073,11 @@ fn sampled_render_target(
                 cube: false,
                 depth: 1,
                 render_target: Some(base),
+                // Render-target binds are served by the persistent-TARGET
+                // machinery; the texture cache plays no part.
+                guest_base: 0,
+                sample_hash: 0,
+                cached: false,
             })
     })
 }
@@ -1760,17 +1914,31 @@ impl OffscreenDrawSink<'_> {
         // targets (bindable directly) and the CPU framebuffer map (feedback /
         // mismatch fallback). The draw's own target is excluded from direct
         // binding — sampling the current attachment is the feedback loop.
+        // ONE lock acquisition for both snapshots: two `draw_caches()`
+        // temporaries in a single expression would deadlock — the first
+        // guard lives to the end of the statement while the second lock()
+        // waits on it.
+        let (live, cached_textures) = {
+            let caches = self.dev.draw_caches();
+            (
+                caches
+                    .live_target_keys()
+                    .into_iter()
+                    .filter(|k| k.base != rt_base)
+                    .map(|k| (k.base, k.width, k.height, k.format))
+                    .collect(),
+                // Persistent-texture cache snapshot (stage D): lets the
+                // texture decode skip the guest read + detile + upload for
+                // any texture whose content sample-hash still matches the
+                // cached image.
+                caches.cached_texture_hashes(),
+            )
+        };
         let scope = SamplingScope {
             map: std::ptr::from_ref(self.framebuffers),
-            live: self
-                .dev
-                .draw_caches()
-                .live_target_keys()
-                .into_iter()
-                .filter(|k| k.base != rt_base)
-                .map(|k| (k.base, k.width, k.height, k.format))
-                .collect(),
+            live,
             self_base: rt_base,
+            cached_textures,
         };
         with_sampling_scope(&scope, || -> Result<(), DrawError> {
             for (bind, stage) in stage_binds {

@@ -217,6 +217,12 @@ pub struct AgcGpuSession {
     /// target with this base exists, it — not the last-drawn target — is what
     /// the Shell presents. `None` preserves the last-drawn baseline.
     scanout_address: Mutex<Option<u64>>,
+    /// Layout of the last-flipped guest display buffer, for
+    /// present-from-guest-memory (M3): when the flip address has no GPU-drawn
+    /// render target, the raw guest bytes at that address are read as pixels
+    /// using this descriptor (CPU-drawn 2D). `None` disables the guest-memory
+    /// path (the flip carried no attribute).
+    scanout_descriptor: Mutex<Option<xps5x_core::subsystems::ScanoutDescriptor>>,
     /// Last compute shader bound on either queue, carried across submissions.
     /// The title binds it on the graphics DCB and dispatches it on the ACB
     /// (whose buffers are dispatch-only), so an ACB dispatch that arrives with a
@@ -247,6 +253,23 @@ pub struct AgcGpuSession {
 /// (full flush + scan) instead of trusting the remembered target, so content
 /// migrating to a different render target is picked up within N flips.
 const FALLBACK_REELECT_INTERVAL: u64 = 64;
+
+/// Rate-limited warn for a flip whose display buffer uses a tiling mode or
+/// pixel format the present-from-guest-memory path does not model. The frame is
+/// skipped (never faked); the last presented frame stays up.
+fn warn_unsupported_scanout(desc: &xps5x_core::subsystems::ScanoutDescriptor) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || n.is_power_of_two() {
+        warn!(
+            tiling_mode = desc.tiling_mode,
+            pixel_format = format_args!("{:#x}", desc.pixel_format),
+            width = desc.width,
+            height = desc.height,
+            "present-from-guest-memory: unsupported scanout tiling/format — skipped"
+        );
+    }
+}
 
 /// Cloneable ownership handle for one guest process's GPU state. The Shell
 /// observes the installed handle, while the runtime owns another clone; Kyty's
@@ -322,8 +345,12 @@ impl xps5x_core::subsystems::GpuSubmissionSubsystem for GpuProcessSession {
         AgcGpuSession::map_shader_metadata(&self.0, code_address, data);
     }
 
-    fn present_scanout(&self, address: u64) {
-        AgcGpuSession::present_scanout(&self.0, address);
+    fn present_scanout(
+        &self,
+        address: u64,
+        descriptor: Option<xps5x_core::subsystems::ScanoutDescriptor>,
+    ) {
+        AgcGpuSession::present_scanout(&self.0, address, descriptor);
     }
 
     fn wait_idle(&self) {
@@ -360,6 +387,7 @@ impl AgcGpuSession {
             shader_skip_count: Mutex::new(0),
             framebuffers: Mutex::new(std::collections::HashMap::new()),
             scanout_address: Mutex::new(None),
+            scanout_descriptor: Mutex::new(None),
             last_compute_shader: Mutex::new(None),
             wait_states: Mutex::new(WaitStates::default()),
             wait_suspended_total: AtomicU64::new(0),
@@ -458,10 +486,15 @@ impl AgcGpuSession {
     /// Resolution Scale) into the GPU crate. The Shell calls this once at
     /// startup; the values are read when the Vulkan backend is created
     /// (validation) and when each guest draw is sized (resolution scale).
-    pub fn set_runtime_config(validation_layers: bool, resolution_scale: f32) {
+    pub fn set_runtime_config(
+        validation_layers: bool,
+        resolution_scale: f32,
+        gpu_device_index: u32,
+    ) {
         *gpu_runtime_config().write() = GpuRuntimeConfig {
             validation_layers,
             resolution_scale,
+            gpu_device_index,
         };
     }
 
@@ -485,11 +518,16 @@ impl AgcGpuSession {
     /// worker may not have finished the composite when the flip arrives)
     /// becomes the presented frame. Never regresses the last-drawn baseline —
     /// when the buffer has no drawn content, the current image is kept.
-    pub fn present_scanout(&self, address: u64) {
+    pub fn present_scanout(
+        &self,
+        address: u64,
+        descriptor: Option<xps5x_core::subsystems::ScanoutDescriptor>,
+    ) {
         if address == 0 {
             return;
         }
         *self.scanout_address.lock() = Some(address);
+        *self.scanout_descriptor.lock() = descriptor;
         // Synchronous by design (item 4 status): the flip waits for its flush
         // (~1-7.5 ms measured — one fence + at most one target readback). The
         // fire-and-forget variant (`wait: false`) was tried and REVERTED: on
@@ -685,6 +723,20 @@ impl AgcGpuSession {
             // filtered flush reads it back and this path skips the census.
             *self.fallback_present_base.lock() = fallback_base;
         }
+        // Present-from-guest-memory (M3): a CPU-drawn 2D buffer never entered
+        // the GPU render-target map, so with no GPU-drawn target at the flip
+        // address AND no drawn fallback anywhere, read the guest bytes at the
+        // flip address as pixels. Ordered last so a GPU title — whose scanout
+        // is filled by an uncaptured copy/DMA while its real pixels live in
+        // another render target — keeps presenting that target instead of the
+        // (empty) guest scanout bytes.
+        let guest_present = if image.is_none() && fallback.is_none() {
+            let desc = *self.scanout_descriptor.lock();
+            desc.and_then(|desc| self.present_from_guest_memory(address, &desc))
+        } else {
+            None
+        };
+        let guest_hit = guest_present.is_some();
         // XPS5X_TRACE_FLIP: does the buffer the title flipped to have drawn
         // content, and what render targets exist? Answers whether black frames
         // are a routing miss (content is in another target) or a genuinely
@@ -698,13 +750,14 @@ impl AgcGpuSession {
             );
         }
         let flip_address_hit = image.is_some();
-        let Some(presented) = image.or(fallback) else {
+        let Some(presented) = image.or(fallback).or(guest_present) else {
             return;
         };
         *self.last_image.lock() = Some(presented.clone());
-        if flip_address_hit {
-            // The title flipped to a buffer it really drew into: its own
-            // rendering has replaced the boot splash. The most-content
+        if flip_address_hit || guest_hit {
+            // The title flipped to a buffer it really drew into (a GPU-drawn
+            // target, or CPU-drawn pixels read straight from the flip address):
+            // its own rendering has replaced the boot splash. The most-content
             // fallback must NOT take the splash down — it can surface a bare
             // cleared render target, which the splash exists to cover.
             self.hide_splash();
@@ -728,6 +781,98 @@ impl AgcGpuSession {
                 .collect();
             maybe_dump_all_targets(&targets, present_index);
         }
+    }
+
+    /// Build a [`RenderedImage`] by reading the guest bytes at a flipped
+    /// display buffer as pixels (present-from-guest-memory, M3). This is how
+    /// CPU-drawn 2D pixels become visible without any GPU draw.
+    ///
+    /// SharpEmu `VulkanVideoPresenter.cs:1643-1660` (`GuestImageWantsInitialData`):
+    /// PS5 render targets alias CPU-visible memory; a first-use image is seeded
+    /// from guest memory. Only LINEAR tiling + 32-bit RGBA/BGRA is supported;
+    /// other tile modes/formats are named in a rate-limited warn and skipped
+    /// (never faked). The produced pixels are RGBA byte order to match the
+    /// Shell's `from_rgba_unmultiplied` present path, swizzling B/R for the
+    /// `A8R8G8B8` (memory order BGRA) formats.
+    fn present_from_guest_memory(
+        &self,
+        address: u64,
+        desc: &xps5x_core::subsystems::ScanoutDescriptor,
+    ) -> Option<RenderedImage> {
+        if address == 0 || desc.width == 0 || desc.height == 0 {
+            return None;
+        }
+        // SCE_VIDEO_OUT_TILING_MODE_LINEAR == 1.
+        if desc.tiling_mode != 1 {
+            warn_unsupported_scanout(desc);
+            return None;
+        }
+        // Byte order in guest memory (little-endian) for the two common 32-bit
+        // display formats. `A8B8G8R8` word => memory R,G,B,A (matches the
+        // Shell's RGBA present, no swizzle). `A8R8G8B8` word => memory B,G,R,A
+        // (swap R/B). _SRGB and _UNORM variants share the same channel layout.
+        let swap_rb = match desc.pixel_format {
+            0x8000_2000 | 0x8000_2200 => false, // A8B8G8R8 (RGBA in memory)
+            0x8000_0000 | 0x8000_0200 => true,  // A8R8G8B8 (BGRA in memory)
+            _ => {
+                warn_unsupported_scanout(desc);
+                return None;
+            }
+        };
+        let width = desc.width;
+        let height = desc.height;
+        let pitch = if desc.pitch_pixels != 0 {
+            desc.pitch_pixels
+        } else {
+            width
+        };
+        if pitch < width {
+            return None;
+        }
+        let row_bytes = pitch as u64 * 4;
+        let total = row_bytes.checked_mul(height as u64)?;
+        // Refuse an absurd read (8K x 8K x 4 = 256 MiB is the ceiling).
+        if total > (256 << 20) {
+            warn_unsupported_scanout(desc);
+            return None;
+        }
+        let memory = self.guest_memory.lock().clone()?;
+        if !memory.validate_gpu_range(address, total, false) {
+            return None;
+        }
+        let mut src = Vec::<u8>::new();
+        src.try_reserve_exact(total as usize).ok()?;
+        src.resize(total as usize, 0);
+        if !memory.read_gpu(address, &mut src) {
+            return None;
+        }
+        let mut pixels = Vec::<u8>::new();
+        pixels
+            .try_reserve_exact(width as usize * height as usize * 4)
+            .ok()?;
+        pixels.resize(width as usize * height as usize * 4, 0);
+        for y in 0..height as usize {
+            let src_row = y * row_bytes as usize;
+            let dst_row = y * width as usize * 4;
+            for x in 0..width as usize {
+                let s = src_row + x * 4;
+                let d = dst_row + x * 4;
+                if swap_rb {
+                    pixels[d] = src[s + 2];
+                    pixels[d + 1] = src[s + 1];
+                    pixels[d + 2] = src[s];
+                    pixels[d + 3] = src[s + 3];
+                } else {
+                    pixels[d..d + 4].copy_from_slice(&src[s..s + 4]);
+                }
+            }
+        }
+        Some(RenderedImage {
+            width,
+            height,
+            pixels,
+            bytes_per_pixel: 4,
+        })
     }
 
     fn ensure_backend(&self) -> Result<(), GpuError> {
@@ -1495,6 +1640,9 @@ fn pending_splash() -> &'static Mutex<Option<RenderedImage>> {
 pub(crate) struct GpuRuntimeConfig {
     pub validation_layers: bool,
     pub resolution_scale: f32,
+    /// Physical-device selection: 0 = auto (best-scored), n ≥ 1 selects the
+    /// n-th usable device (1-based), falling back to auto when out of range.
+    pub gpu_device_index: u32,
 }
 
 impl Default for GpuRuntimeConfig {
@@ -1502,6 +1650,7 @@ impl Default for GpuRuntimeConfig {
         Self {
             validation_layers: false,
             resolution_scale: 1.0,
+            gpu_device_index: 0,
         }
     }
 }
@@ -1866,15 +2015,15 @@ mod tests {
         *session.last_image.lock() = Some(black);
 
         // Flip to the registered content buffer -> present THAT buffer.
-        session.present_scanout(0x1000);
+        session.present_scanout(0x1000, None);
         assert_eq!(session.last_image().unwrap().pixels, content.pixels);
 
         // Flip to a buffer with no drawn content -> keep the current frame.
-        session.present_scanout(0xDEAD_BEEF);
+        session.present_scanout(0xDEAD_BEEF, None);
         assert_eq!(session.last_image().unwrap().pixels, content.pixels);
 
         // Address 0 is not a flip target and is ignored.
-        session.present_scanout(0);
+        session.present_scanout(0, None);
         assert_eq!(session.last_image().unwrap().pixels, content.pixels);
     }
 
@@ -1964,12 +2113,70 @@ mod tests {
         session.framebuffers.lock().insert(0x1000, content.clone());
 
         // Flip to an undrawn buffer: splash stays up.
-        session.present_scanout(0xDEAD_BEEF);
+        session.present_scanout(0xDEAD_BEEF, None);
         assert_eq!(session.last_image().unwrap().pixels, vec![9, 9, 9, 255]);
 
         // Flip to the drawn buffer: splash comes down, title frame presents.
-        session.present_scanout(0x1000);
+        session.present_scanout(0x1000, None);
         assert_eq!(session.last_image().unwrap().pixels, content.pixels);
+    }
+
+    /// Present-from-guest-memory (M3): a CPU-drawn 2D display buffer with no GPU
+    /// render target is presented by reading its guest bytes as pixels, using
+    /// the registered VideoOut attribute — and a GPU-drawn target at the same
+    /// address still wins (never regressed).
+    #[test]
+    fn present_scanout_reads_cpu_drawn_pixels_from_guest_memory() {
+        // A 2x1 RGBA8 (A8B8G8R8, memory order RGBA) linear buffer laid out in a
+        // live host allocation the session can read as guest memory.
+        let backing: Vec<u8> = vec![10, 20, 30, 255, 40, 50, 60, 255];
+        let base = backing.as_ptr() as u64;
+        let session = AgcGpuSession::new(Arc::new(HostRangeMemory {
+            start: base,
+            len: backing.len() as u64,
+        }));
+        let desc = xps5x_core::subsystems::ScanoutDescriptor {
+            width: 2,
+            height: 1,
+            pitch_pixels: 2,
+            pixel_format: 0x8000_2200, // A8B8G8R8 -> RGBA in memory
+            tiling_mode: 1,            // LINEAR
+        };
+
+        // No GPU-drawn target anywhere: the guest bytes are read as the frame.
+        session.present_scanout(base, Some(desc));
+        let img = session.last_image().expect("guest-memory frame presented");
+        assert_eq!(img.width, 2);
+        assert_eq!(img.pixels, backing, "raw guest RGBA bytes become the frame");
+
+        // A GPU-drawn target at the SAME address still wins over guest memory.
+        let drawn = RenderedImage {
+            width: 2,
+            height: 1,
+            pixels: vec![1, 2, 3, 255, 4, 5, 6, 255],
+            bytes_per_pixel: 4,
+        };
+        session.framebuffers.lock().insert(base, drawn.clone());
+        session.present_scanout(base, Some(desc));
+        assert_eq!(
+            session.last_image().unwrap().pixels,
+            drawn.pixels,
+            "a GPU-drawn target at the flip address takes priority over guest memory"
+        );
+
+        // An unsupported (tiled) layout is skipped, never faked — the drawn
+        // frame from the previous flip stays up.
+        session.framebuffers.lock().clear();
+        let tiled = xps5x_core::subsystems::ScanoutDescriptor {
+            tiling_mode: 0,
+            ..desc
+        };
+        session.present_scanout(base, Some(tiled));
+        assert_eq!(
+            session.last_image().unwrap().pixels,
+            drawn.pixels,
+            "an unsupported tiling mode must not replace the last frame"
+        );
     }
 
     /// Bounded identity-mapped guest memory over a live allocation, so worker

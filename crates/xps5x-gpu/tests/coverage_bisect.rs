@@ -301,6 +301,9 @@ fn title_translated_ps_sweep() {
                 cube: false,
                 depth: 1,
                 render_target: None,
+                guest_base: 0,
+                sample_hash: 0,
+                cached: false,
             }],
             linear_filter: vec![false],
         })

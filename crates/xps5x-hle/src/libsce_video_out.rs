@@ -275,7 +275,19 @@ fn hle_submit_flip(ctx: &HleContext, args: &[u64]) -> u64 {
         .video_out_buffers
         .get(&(handle, buffer_index as i32))
     {
-        ctx.gpu.present_scanout(buffer.address);
+        // Thread the buffer's layout to the GPU so a CPU-drawn 2D buffer (no
+        // GPU render target) can be presented straight from guest memory (M3).
+        // The Gen5 attribute carries no separate pitch, so a tightly-packed
+        // linear row (pitch == width) is assumed.
+        let attr = buffer.attribute;
+        let descriptor = xps5x_core::subsystems::ScanoutDescriptor {
+            width: attr.width,
+            height: attr.height,
+            pitch_pixels: attr.width,
+            pixel_format: attr.pixel_format,
+            tiling_mode: attr.tiling_mode,
+        };
+        ctx.gpu.present_scanout(buffer.address, Some(descriptor));
     }
     let event_hint = VIDEO_OUT_EVENT_FLIP_ID | ((flip_arg as u64 & 0x0000_ffff_ffff_ffff) << 16);
     for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {

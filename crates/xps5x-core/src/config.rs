@@ -68,10 +68,14 @@ pub struct GraphicsConfig {
     pub resolution_scale: f32,
     /// Enable shader cache on disk.
     pub shader_cache: bool,
-    /// GPU device index to use (0 = auto/default).
+    /// GPU device index to select (0-based). Out-of-range falls back to the
+    /// best-scored device. Drives Vulkan physical-device selection.
     pub gpu_device_index: u32,
     /// Enable GPU validation layers (debug only).
     pub validation_layers: bool,
+    /// Target frame-pacing rate in Hz — the guest vblank cadence, clamped to
+    /// 24–480 (60 = native PS5). Drives `XPS5X_VBLANK_HZ`.
+    pub frame_limit: u32,
 }
 
 impl Default for GraphicsConfig {
@@ -82,6 +86,7 @@ impl Default for GraphicsConfig {
             shader_cache: true,
             gpu_device_index: 0,
             validation_layers: false,
+            frame_limit: 60,
         }
     }
 }
@@ -144,12 +149,22 @@ pub struct DebugConfig {
     pub logging: bool,
     /// Log level filter (trace, debug, info, warn, error).
     pub log_level: String,
-    /// Enable GPU command stream dumping.
+    /// Dump per-draw GPU resources (vertex/index/resource buffers) to disk.
+    /// Drives `XPS5X_DUMP_GPU_RESOURCES`.
     pub dump_gpu_commands: bool,
-    /// Enable shader disassembly output.
+    /// Dump every distinct fetched guest shader (`.sb`/`.spv`) to disk. Drives
+    /// `XPS5X_DUMP_SHADERS`.
     pub dump_shaders: bool,
-    /// Enable syscall tracing.
+    /// Trace every HLE call (very verbose). Drives `XPS5X_TRACE_HLE`.
     pub trace_syscalls: bool,
+    /// Dump each presented frame to disk (PPM). Drives `XPS5X_DUMP_FRAMES`.
+    pub dump_frames: bool,
+    /// Log per-HLE-function call counts, boot vs steady state. Drives
+    /// `XPS5X_CALL_STATS`.
+    pub call_stats: bool,
+    /// Periodically dump every guest thread's recent calls/backtrace when a
+    /// title stalls. Drives `XPS5X_STALL_DUMP`.
+    pub stall_dump: bool,
 }
 
 impl Default for DebugConfig {
@@ -160,6 +175,9 @@ impl Default for DebugConfig {
             dump_gpu_commands: false,
             dump_shaders: false,
             trace_syscalls: false,
+            dump_frames: false,
+            call_stats: false,
+            stall_dump: false,
         }
     }
 }

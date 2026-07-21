@@ -19,8 +19,10 @@
 //! | compute `VkPipeline` | (canonical module, canonical layout) |
 //! | `VkSampler` | linear-vs-nearest flag |
 //! | render target image + readback buffer | (guest base, width, height, format) |
+//! | guest texture image + view (stage D) | (guest base, extent, layers, depth, cube, format), content-validated per bind by a sparse sample-hash |
 //! | command buffer + fence | singleton, reset per submission |
 //! | descriptor pool | singleton, grown on demand, reset per acquisition |
+//! | batch descriptor pools (stage D) | shared by a whole deferred batch, reset together at retire |
 //!
 //! Viewport, scissor, and blend constants are **dynamic** pipeline state, so
 //! they deliberately do not key the pipeline.
@@ -76,6 +78,19 @@ pub struct DrawCacheStats {
     /// host buffer; a miss pays vkCreateBuffer + vkAllocateMemory.
     pub host_pool_hits: u64,
     pub host_pool_misses: u64,
+    /// Persistent-texture cache (stage D item 1): a hit binds a cached
+    /// device-local image directly — no guest read, no detile, no
+    /// vkCreateImage/vkAllocateMemory, no staging copy. A miss is a cacheable
+    /// upload that created + donated a fresh image. An eviction is a cached
+    /// image destroyed because its content hash changed, its key was
+    /// re-programmed, or the byte cap forced out the least-recently-used.
+    pub texture_cache_hits: u64,
+    pub texture_cache_misses: u64,
+    pub texture_cache_evictions: u64,
+    /// Batch descriptor pools created (stage D item 2): deferred draws
+    /// allocate from shared per-batch pools reset at retire, so this stops
+    /// growing once a steady frame's worth of capacity exists.
+    pub batch_pool_creates: u64,
 }
 
 /// One descriptor-set-layout binding, reduced to the fields that feed
@@ -223,12 +238,75 @@ pub(crate) struct PersistentTarget {
     pub content: TargetContent,
 }
 
+/// A guest texture kept alive on the device across draws (stage D item 1).
+///
+/// The key is the SOURCE identity: the T#'s guest base address plus every
+/// creation parameter of the Vulkan image (extent, layers, volume depth, cube
+/// flag, format). Content freshness is NOT part of the key — it is validated
+/// per bind by comparing [`PersistentTexture::sample_hash`] against a fresh
+/// sparse hash of the guest bytes (see `draw_translate::guest_sample_hash`).
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
+pub(crate) struct TextureKey {
+    pub base: u64,
+    pub width: u32,
+    pub height: u32,
+    pub layers: u32,
+    pub depth: u32,
+    pub cube: bool,
+    pub format: i32,
+}
+
+/// The device half of one cached guest texture. The image rests in
+/// `SHADER_READ_ONLY_OPTIMAL` between draws (the upload's tail barrier put it
+/// there with visibility to both graphics shader stages), so a cache hit
+/// binds the view with **no** barrier at all.
+///
+/// ## Invalidation contract (documented, deliberate)
+///
+/// - Every bind re-hashes a sparse ~4 KiB sample of the guest source bytes;
+///   a mismatch is a miss (the entry is evicted and re-uploaded). CPU guest
+///   writes that leave every sampled chunk byte-identical are therefore NOT
+///   detected until any sampled byte changes — that is the staleness window,
+///   bounded by the sample coverage.
+/// - Writeback paths we control (compute storage writeback, DMA copies,
+///   render-target readbacks) do NOT proactively invalidate: no cheap range
+///   index exists over this cache today, so they too are covered by the
+///   per-bind rehash above.
+/// - `XPS5X_NO_TEX_CACHE=1` is the full-honesty escape hatch: every draw
+///   decodes and uploads its textures per draw, the pre-stage-D behaviour.
+#[derive(Clone, Copy)]
+pub(crate) struct PersistentTexture {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub view: vk::ImageView,
+    /// Sparse sample-hash of the guest source bytes at upload time.
+    pub sample_hash: u64,
+    /// Decoded byte size (cap accounting).
+    pub bytes: u64,
+    /// LRU stamp from [`DrawCaches::texture_entry`] / insertion.
+    pub last_use: u64,
+}
+
 /// The grown-on-demand descriptor pool (see [`DrawCaches::descriptor_pool`]).
 struct PoolState {
     pool: vk::DescriptorPool,
     max_sets: u32,
     /// Capacity per raw `VkDescriptorType`.
     capacity: HashMap<i32, u32>,
+}
+
+/// One shared descriptor pool for deferred-batch draws (stage D item 2).
+/// Sets allocated from it stay live until the batch flush, so the pool is
+/// never reset per draw — capacity is accounted here and every batch pool is
+/// reset together in [`DrawCaches::retire_batch`], after the flush fence.
+struct BatchPoolState {
+    pool: vk::DescriptorPool,
+    total_sets: u32,
+    free_sets: u32,
+    /// Full capacity per raw `VkDescriptorType`.
+    capacity: HashMap<i32, u32>,
+    /// Remaining capacity per raw `VkDescriptorType`.
+    free: HashMap<i32, u32>,
 }
 
 /// Per-draw resources whose destruction is deferred until the batch fence:
@@ -260,6 +338,18 @@ pub(crate) struct DrawCaches {
     /// Keyed by linear-vs-nearest — the only sampler state decoded today.
     samplers: HashMap<bool, vk::Sampler>,
     targets: HashMap<TargetKey, PersistentTarget>,
+    /// Persistent guest textures (stage D item 1) — see [`PersistentTexture`]
+    /// for the invalidation contract.
+    textures: HashMap<TextureKey, PersistentTexture>,
+    /// Total decoded bytes held by `textures`, for the cap.
+    texture_bytes: u64,
+    /// Monotonic LRU clock for `textures`.
+    texture_clock: u64,
+    /// Cached texture images evicted while pending command buffers may still
+    /// reference them; destroyed at the batch retire (post-fence).
+    deferred_image_destroys: Vec<(vk::Image, vk::DeviceMemory, vk::ImageView)>,
+    /// Shared descriptor pools for deferred-batch draws (stage D item 2).
+    batch_pools: Vec<BatchPoolState>,
     /// One command buffer + fence, reused for every synchronous submission.
     submit: Option<(vk::CommandBuffer, vk::Fence)>,
     pool: Option<PoolState>,
@@ -298,6 +388,11 @@ pub(crate) struct DrawCaches {
 /// release instead of recycled, so a burst of huge uploads cannot pin
 /// host memory forever.
 const HOST_POOL_FREE_CAP: u64 = 256 * 1024 * 1024;
+
+/// Persistent-texture cache cap (decoded bytes). Over it, least-recently-used
+/// entries are evicted at insertion, so a title streaming many unique
+/// textures cannot pin device memory without bound.
+const TEXTURE_CACHE_CAP: u64 = 256 * 1024 * 1024;
 
 /// Usage union for pooled host buffers. One pool serves every per-draw guest
 /// upload, so each buffer carries the union of the usages those uploads need;
@@ -764,6 +859,160 @@ impl DrawCaches {
         self.targets.insert(key, target);
     }
 
+    /// The cached texture for `key`, if one is live: its view (bindable with
+    /// no barrier — the image rests in `SHADER_READ_ONLY_OPTIMAL`) and the
+    /// sample-hash its content was uploaded under. Stamps the LRU clock.
+    pub(crate) fn texture_entry(&mut self, key: &TextureKey) -> Option<(vk::ImageView, u64)> {
+        self.texture_clock += 1;
+        let clock = self.texture_clock;
+        let entry = self.textures.get_mut(key)?;
+        entry.last_use = clock;
+        Some((entry.view, entry.sample_hash))
+    }
+
+    /// Snapshot of every cached texture's (key, sample-hash) — published to
+    /// the texture-decode path so it can skip the guest read + detile for a
+    /// texture whose fresh sample-hash matches the cached one.
+    pub(crate) fn cached_texture_hashes(&self) -> Vec<(TextureKey, u64)> {
+        self.textures
+            .iter()
+            .map(|(k, t)| (*k, t.sample_hash))
+            .collect()
+    }
+
+    /// Retain a freshly uploaded texture. Replaces (and destroys, deferred if
+    /// a batch is open) any previous entry at the same key, then enforces the
+    /// byte cap by evicting least-recently-used entries.
+    ///
+    /// Call only after the upload's command buffer was SUBMITTED (batched) or
+    /// fence-completed (immediate): eviction safety here relies on
+    /// [`Self::batch_open`] seeing every command buffer that references a
+    /// cached image, and insert-on-success keeps images whose upload never
+    /// ran out of the cache entirely.
+    pub(crate) fn insert_texture(
+        &mut self,
+        dev: &VulkanDevice,
+        key: TextureKey,
+        mut texture: PersistentTexture,
+    ) {
+        if let Some(old) = self.textures.remove(&key) {
+            self.texture_bytes -= old.bytes;
+            self.destroy_texture_when_safe(dev, old);
+            self.stats.texture_cache_evictions += 1;
+        }
+        while self.texture_bytes.saturating_add(texture.bytes) > TEXTURE_CACHE_CAP {
+            let Some((&lru_key, _)) = self.textures.iter().min_by_key(|(_, t)| t.last_use) else {
+                break;
+            };
+            let old = self
+                .textures
+                .remove(&lru_key)
+                .expect("LRU key was just found in the map");
+            self.texture_bytes -= old.bytes;
+            self.destroy_texture_when_safe(dev, old);
+            self.stats.texture_cache_evictions += 1;
+        }
+        self.texture_clock += 1;
+        texture.last_use = self.texture_clock;
+        self.texture_bytes += texture.bytes;
+        self.textures.insert(key, texture);
+    }
+
+    /// Destroy an evicted texture's handles now if no deferred batch is open
+    /// (every command buffer that referenced them fence-completed), otherwise
+    /// park them for the batch retire.
+    fn destroy_texture_when_safe(&mut self, dev: &VulkanDevice, texture: PersistentTexture) {
+        if self.batch_open() {
+            self.deferred_image_destroys
+                .push((texture.image, texture.memory, texture.view));
+        } else {
+            // SAFETY: no batch is open, so every submitted command buffer that
+            // could reference these handles completed under its own fence;
+            // the entry already left the map, so this is the sole handle set.
+            unsafe {
+                let d = dev.device();
+                d.destroy_image_view(texture.view, None);
+                d.destroy_image(texture.image, None);
+                d.free_memory(texture.memory, None);
+            }
+        }
+    }
+
+    /// A descriptor pool for one deferred draw's sets (stage D item 2): the
+    /// first existing batch pool with enough remaining capacity, or a new
+    /// generously sized pool. Sets stay live until the flush; every batch
+    /// pool is reset together in [`Self::retire_batch`].
+    ///
+    /// A draw that fails after allocating leaks its sets' capacity until the
+    /// next retire reset — conservative (capacity, not memory) and safe.
+    pub(crate) fn batch_descriptor_pool(
+        &mut self,
+        dev: &VulkanDevice,
+        max_sets: u32,
+        sizes: &[vk::DescriptorPoolSize],
+    ) -> Result<vk::DescriptorPool, GpuError> {
+        'pools: for pool in &mut self.batch_pools {
+            if pool.free_sets < max_sets {
+                continue;
+            }
+            for s in sizes {
+                if pool.free.get(&s.ty.as_raw()).copied().unwrap_or(0) < s.descriptor_count {
+                    continue 'pools;
+                }
+            }
+            pool.free_sets -= max_sets;
+            for s in sizes {
+                *pool
+                    .free
+                    .get_mut(&s.ty.as_raw())
+                    .expect("capacity was just checked") -= s.descriptor_count;
+            }
+            return Ok(pool.pool);
+        }
+        // No pool fits: create one sized for a whole batch of draws like this
+        // (32x the request), so a steady frame settles on one pool.
+        let mut capacity: HashMap<i32, u32> = HashMap::new();
+        for s in sizes {
+            let entry = capacity.entry(s.ty.as_raw()).or_insert(0);
+            *entry = entry.saturating_add(s.descriptor_count);
+        }
+        for count in capacity.values_mut() {
+            *count = count.saturating_mul(32).max(64);
+        }
+        let total_sets = max_sets.saturating_mul(32).max(64);
+        let pool_sizes: Vec<_> = capacity
+            .iter()
+            .map(|(&ty, &count)| {
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::from_raw(ty))
+                    .descriptor_count(count)
+            })
+            .collect();
+        let info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(total_sets)
+            .pool_sizes(&pool_sizes);
+        // SAFETY: the pool-size slice is alive for the call; the pool is
+        // retained in `batch_pools` and destroyed exactly once in `destroy`.
+        let pool = unsafe { dev.device().create_descriptor_pool(&info, None) }.map_err(|e| {
+            GpuError::PipelineCreationFailed(format!("batch vkCreateDescriptorPool: {e}"))
+        })?;
+        let mut free = capacity.clone();
+        for s in sizes {
+            *free
+                .get_mut(&s.ty.as_raw())
+                .expect("capacity covers every requested type") -= s.descriptor_count;
+        }
+        self.batch_pools.push(BatchPoolState {
+            pool,
+            total_sets,
+            free_sets: total_sets - max_sets,
+            capacity,
+            free,
+        });
+        self.stats.batch_pool_creates += 1;
+        Ok(pool)
+    }
+
     /// Record that the draw into `key`'s target read its pixels back, so the
     /// GPU image and the CPU-side framebuffer entry are byte-identical again.
     pub(crate) fn mark_target_synced(&mut self, key: &TargetKey) {
@@ -932,6 +1181,35 @@ impl DrawCaches {
             // was evicted, so this is the sole remaining handle set.
             unsafe { destroy_target(dev.device(), &target) };
         }
+        // Evicted cached textures parked while the batch was open: the flush
+        // fence covered every command buffer that referenced them.
+        for (image, memory, view) in std::mem::take(&mut self.deferred_image_destroys) {
+            // SAFETY: fence waited; the entries left the texture map at
+            // eviction, so these are the sole remaining handles.
+            unsafe {
+                let d = dev.device();
+                d.destroy_image_view(view, None);
+                d.destroy_image(image, None);
+                d.free_memory(memory, None);
+            }
+        }
+        // Batch descriptor pools: every set allocated from them belonged to
+        // the just-retired draws, whose fence was waited — reset for the next
+        // batch and restore full capacity.
+        for pool in &mut self.batch_pools {
+            // SAFETY: same fence-waited argument; resetting frees the sets.
+            if let Err(e) = unsafe {
+                dev.device()
+                    .reset_descriptor_pool(pool.pool, vk::DescriptorPoolResetFlags::empty())
+            } {
+                // Reset cannot fail per spec except device loss; keep the
+                // accounting honest (capacity stays consumed) and say so.
+                tracing::warn!("batch vkResetDescriptorPool failed: {e}");
+                continue;
+            }
+            pool.free_sets = pool.total_sets;
+            pool.free = pool.capacity.clone();
+        }
     }
 
     /// Destroy every persistent target at `base` whose extent/format differs
@@ -1037,6 +1315,20 @@ impl DrawCaches {
             }
             for (_, target) in self.targets.drain() {
                 destroy_target(device, &target);
+            }
+            for (_, texture) in self.textures.drain() {
+                device.destroy_image_view(texture.view, None);
+                device.destroy_image(texture.image, None);
+                device.free_memory(texture.memory, None);
+            }
+            self.texture_bytes = 0;
+            for (image, memory, view) in self.deferred_image_destroys.drain(..) {
+                device.destroy_image_view(view, None);
+                device.destroy_image(image, None);
+                device.free_memory(memory, None);
+            }
+            for pool in self.batch_pools.drain(..) {
+                device.destroy_descriptor_pool(pool.pool, None);
             }
             // Upload ring: free entries are owned solely by the pool. In-use
             // pooled buffers were already destroyed above through the pending

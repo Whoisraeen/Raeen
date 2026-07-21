@@ -975,7 +975,12 @@ pub(crate) fn test_ctx<'a>(
             _data: xps5x_core::subsystems::ShaderMappedData,
         ) {
         }
-        fn present_scanout(&self, _address: u64) {}
+        fn present_scanout(
+            &self,
+            _address: u64,
+            _descriptor: Option<xps5x_core::subsystems::ScanoutDescriptor>,
+        ) {
+        }
         fn wait_idle(&self) {}
         fn stats(&self) -> xps5x_core::subsystems::GpuSubmissionStats {
             xps5x_core::subsystems::GpuSubmissionStats::default()

@@ -41,6 +41,11 @@ struct ActiveSession {
     /// Rail index that was focused when Play was pressed, so we return to
     /// the same tile on exit (spec §5).
     target_index: usize,
+    /// The session's kernel, cached at launch so the per-frame controller
+    /// push touches only the cheap `pad_state` mutex instead of re-locking the
+    /// launcher's session map. `None` if the launcher shares no kernel
+    /// (`StubLauncher`).
+    kernel: Option<std::sync::Arc<xps5x_kernel::OrbisKernel>>,
 }
 
 /// Cap on the Switcher's recent-titles history (spec §10).
@@ -240,6 +245,7 @@ impl Shell {
         self.route_input(ctx);
         self.pump_updater_events(ctx);
         self.poll_session();
+        self.push_pad_state();
         self.tick_animations(ctx);
         self.draw(ctx);
     }
@@ -398,10 +404,45 @@ impl Shell {
                 self.config.graphics.validation_layers = !self.config.graphics.validation_layers
             }
             (0, 4) => self.config.general.vsync = !self.config.general.vsync,
-            (1, 0) => self.config.audio.enabled = !self.config.audio.enabled,
+            (0, 5) => {
+                self.config.graphics.frame_limit =
+                    settings::cycle_frame_limit(self.config.graphics.frame_limit, delta)
+            }
+            (0, 6) => {
+                self.config.graphics.gpu_device_index = settings::adjust_stepped_u32(
+                    self.config.graphics.gpu_device_index,
+                    delta,
+                    1,
+                    0,
+                    8,
+                )
+            }
+            (0, 7) => {
+                self.config.general.window_width = settings::adjust_stepped_u32(
+                    self.config.general.window_width,
+                    delta,
+                    160,
+                    640,
+                    7680,
+                )
+            }
+            (0, 8) => {
+                self.config.general.window_height = settings::adjust_stepped_u32(
+                    self.config.general.window_height,
+                    delta,
+                    90,
+                    480,
+                    4320,
+                )
+            }
+            (1, 0) => {
+                self.config.audio.enabled = !self.config.audio.enabled;
+                xps5x_audio::output::set_enabled(self.config.audio.enabled);
+            }
             (1, 1) => {
                 self.config.audio.volume =
-                    settings::adjust_stepped(self.config.audio.volume, delta, 0.05, 0.0, 1.0)
+                    settings::adjust_stepped(self.config.audio.volume, delta, 0.05, 0.0, 1.0);
+                xps5x_audio::output::set_volume(self.config.audio.volume);
             }
             (1, 2) => self.config.audio.spatial_audio = !self.config.audio.spatial_audio,
             (2, 0) => self.config.input.dualsense_features = !self.config.input.dualsense_features,
@@ -422,6 +463,9 @@ impl Shell {
             (7, 2) => self.config.debug.trace_syscalls = !self.config.debug.trace_syscalls,
             (7, 3) => self.config.debug.dump_gpu_commands = !self.config.debug.dump_gpu_commands,
             (7, 4) => self.config.debug.dump_shaders = !self.config.debug.dump_shaders,
+            (7, 5) => self.config.debug.dump_frames = !self.config.debug.dump_frames,
+            (7, 6) => self.config.debug.call_stats = !self.config.debug.call_stats,
+            (7, 7) => self.config.debug.stall_dump = !self.config.debug.stall_dump,
             _ => {}
         }
     }
@@ -589,7 +633,13 @@ impl Shell {
             });
         }
 
-        if let Some(gilrs) = self.gilrs.as_mut() {
+        // The gamepad drives menu navigation only outside a session; while a
+        // title runs, `push_pad_state` owns the gamepad and forwards it to the
+        // guest, so face buttons like Cross/Circle reach the game rather than
+        // the Shell (only the keyboard Esc quits back to the dashboard).
+        if self.session.is_none()
+            && let Some(gilrs) = self.gilrs.as_mut()
+        {
             while let Some(gilrs::Event { event, .. }) = gilrs.next_event() {
                 match event {
                     gilrs::EventType::ButtonPressed(gilrs::Button::DPadLeft, _) => {
@@ -629,6 +679,35 @@ impl Shell {
         inputs
     }
 
+    /// Forward the physical gamepad's live state into the running guest each
+    /// frame — the input producer that makes the guest's `scePadReadState`
+    /// return real input. Analog sticks get Settings ▸ Controller ▸ Deadzone
+    /// applied; the encoded 12-byte `ScePadData` prefix is written into the
+    /// session kernel via `set_pad_state`, which the guest's pad thread reads
+    /// (the two share the same `Arc<OrbisKernel>`). No-op outside a session, or
+    /// when the launcher shares no kernel (`StubLauncher`).
+    fn push_pad_state(&mut self) {
+        let (kernel, deadzone) = match self.session.as_ref() {
+            Some(session) => match &session.kernel {
+                Some(kernel) => (kernel.clone(), self.config.input.deadzone),
+                None => return,
+            },
+            None => return,
+        };
+        let Some(gilrs) = self.gilrs.as_mut() else {
+            return;
+        };
+        // Drain events so gilrs's cached per-pad state is current this frame;
+        // during a session `poll_nav_inputs` leaves the gamepad entirely to us.
+        while gilrs.next_event().is_some() {}
+        let state = match gilrs.gamepads().next() {
+            Some((_, gamepad)) => read_pad(&gamepad, deadzone),
+            // No controller connected -> neutral (centered sticks, no buttons).
+            None => xps5x_input::ControllerState::default(),
+        };
+        kernel.set_pad_state(state.to_orbis_pad_data());
+    }
+
     fn begin_launch(&mut self, index: usize) {
         let Some(item) = self.library.get(index) else {
             return;
@@ -636,10 +715,12 @@ impl Shell {
         match self.launcher.launch(&item.launch) {
             Ok(handle) => {
                 push_recent(&mut self.recent, &item.id, MAX_RECENT_TITLES);
+                let kernel = self.launcher.session_kernel(&handle);
                 self.session = Some(ActiveSession {
                     handle,
                     title: item.title.clone(),
                     target_index: index,
+                    kernel,
                 });
             }
             Err(err) => {
@@ -806,6 +887,48 @@ fn push_recent(recent: &mut Vec<String>, id: &str, cap: usize) {
     recent.retain(|existing| existing != id);
     recent.insert(0, id.to_string());
     recent.truncate(cap);
+}
+
+/// Snapshot a connected gilrs gamepad into an [`xps5x_input::ControllerState`],
+/// applying `deadzone` to the analog sticks. Stick Y is inverted because gilrs
+/// reports up as `+1.0` while the Orbis encoding puts up at the low byte.
+fn read_pad(gamepad: &gilrs::Gamepad, deadzone: f32) -> xps5x_input::ControllerState {
+    use gilrs::{Axis, Button};
+    let axis = |a: Axis| gamepad.axis_data(a).map_or(0.0, |d| d.value());
+    let button_value = |b: Button| gamepad.button_data(b).map_or(0.0, |d| d.value());
+    // Radial deadzone identical to `InputManager::apply_deadzone`, inlined so we
+    // don't build (and log) an `InputManager` every frame.
+    let dz = |v: f32| {
+        if v.abs() < deadzone {
+            0.0
+        } else {
+            v.signum() * (v.abs() - deadzone) / (1.0 - deadzone).max(f32::EPSILON)
+        }
+    };
+    xps5x_input::ControllerState {
+        cross: gamepad.is_pressed(Button::South),
+        circle: gamepad.is_pressed(Button::East),
+        square: gamepad.is_pressed(Button::West),
+        triangle: gamepad.is_pressed(Button::North),
+        l1: gamepad.is_pressed(Button::LeftTrigger),
+        r1: gamepad.is_pressed(Button::RightTrigger),
+        l3: gamepad.is_pressed(Button::LeftThumb),
+        r3: gamepad.is_pressed(Button::RightThumb),
+        options: gamepad.is_pressed(Button::Start),
+        create: gamepad.is_pressed(Button::Select),
+        ps_button: gamepad.is_pressed(Button::Mode),
+        dpad_up: gamepad.is_pressed(Button::DPadUp),
+        dpad_down: gamepad.is_pressed(Button::DPadDown),
+        dpad_left: gamepad.is_pressed(Button::DPadLeft),
+        dpad_right: gamepad.is_pressed(Button::DPadRight),
+        left_stick_x: dz(axis(Axis::LeftStickX)),
+        left_stick_y: dz(-axis(Axis::LeftStickY)),
+        right_stick_x: dz(axis(Axis::RightStickX)),
+        right_stick_y: dz(-axis(Axis::RightStickY)),
+        l2_trigger: button_value(Button::LeftTrigger2).clamp(0.0, 1.0),
+        r2_trigger: button_value(Button::RightTrigger2).clamp(0.0, 1.0),
+        ..Default::default()
+    }
 }
 
 /// Upload `theme`'s background image (if any) to the GPU as a fresh

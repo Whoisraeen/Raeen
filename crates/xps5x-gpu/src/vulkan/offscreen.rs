@@ -12,7 +12,7 @@
 
 use super::cache::{
     BlendKey, DepthPipelineKey, DrawCaches, GraphicsPipelineKey, PendingDrawResources,
-    PersistentTarget, StencilKey, TargetContent, TargetKey,
+    PersistentTarget, PersistentTexture, StencilKey, TargetContent, TargetKey, TextureKey,
 };
 use super::instance::VulkanDevice;
 use super::shaders::{triangle_fragment_spirv, triangle_vertex_spirv};
@@ -207,6 +207,20 @@ pub struct TextureUpload {
     /// (stage B). Must be `None` for the draw's own attachment (feedback
     /// loop) — the CPU-upload path handles that case.
     pub render_target: Option<u64>,
+    /// Guest source identity for the persistent-texture cache (stage D): the
+    /// T#'s 40-bit base address. `0` disables caching for this upload
+    /// (fixture/test uploads, the compute path, `XPS5X_NO_TEX_CACHE=1`) —
+    /// the upload then behaves exactly as before the cache existed.
+    pub guest_base: u64,
+    /// Sparse sample-hash of the guest SOURCE bytes (computed by the decode
+    /// path — see `draw_translate::guest_sample_hash` and the invalidation
+    /// contract on [`super::cache::PersistentTexture`]). `0` = no hash, not
+    /// cacheable.
+    pub sample_hash: u64,
+    /// The decode was skipped because the cache holds this texture with an
+    /// equal sample-hash: `pixels` is empty and the backend binds the cached
+    /// image's view directly.
+    pub cached: bool,
 }
 
 /// The sampled-image + sampler descriptor arrays one translated stage binds.
@@ -687,6 +701,9 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
     let t_build = t0.elapsed();
     let t1 = std::time::Instant::now();
     res.record_and_submit(state)?;
+    // The fence was waited (immediate mode): cache-eligible texture uploads
+    // are complete on the device and can join the persistent-texture cache.
+    res.donate_textures_to_cache();
     let t_submit = t1.elapsed();
     let t2 = std::time::Instant::now();
     let color = res.read_back_color(state, bpp)?;
@@ -783,6 +800,9 @@ pub fn render_draw_deferred(
             submit_us = t_submit.as_micros(),
             deferred_draws = stats.deferred_draws,
             sampled_target_binds = stats.sampled_target_binds,
+            texture_cache_hits = stats.texture_cache_hits,
+            texture_cache_misses = stats.texture_cache_misses,
+            batch_pool_creates = stats.batch_pool_creates,
             "TIME_DRAW: deferred draw (no fence wait, no readback — the flush pays those once)"
         );
     }
@@ -1062,6 +1082,14 @@ struct TextureGpu {
     /// Volume depth (1 for 2D/cube) — the staging copy's extent depth.
     depth: u32,
     stage: vk::ShaderStageFlags,
+    /// When `Some`, this upload is donated to the persistent-texture cache on
+    /// draw success (batched: after the batch join; immediate: after the
+    /// fence wait); the image/memory/view handles then leave this struct.
+    cache_key: Option<TextureKey>,
+    /// The guest-source sample-hash the donated entry is stored under.
+    sample_hash: u64,
+    /// Decoded byte size (cache cap accounting).
+    byte_size: u64,
 }
 
 /// One image layout transition, bundled so `image_barrier` stays readable.
@@ -1138,11 +1166,11 @@ struct Resources<'a> {
     texture_uploads: Vec<TextureGpu>,
     samplers: Vec<vk::Sampler>,
     descriptor_set_layouts: Vec<vk::DescriptorSetLayout>,
+    /// Always borrowed from the cache (never destroyed here): the shared
+    /// resettable pool for immediate draws, or a shared batch pool — reset at
+    /// the batch retire, after the flush fence — for deferred draws
+    /// (stage D item 2).
     descriptor_pool: vk::DescriptorPool,
-    /// True when `descriptor_pool` is this draw's own (batched mode) rather
-    /// than the shared resettable pool: a deferred draw's sets stay live past
-    /// the call, so the shared pool's per-draw reset would be illegal.
-    owns_descriptor_pool: bool,
     descriptor_sets: Vec<(u32, vk::DescriptorSet)>,
     readback_buffer: vk::Buffer,
     readback_memory: vk::DeviceMemory,
@@ -1190,7 +1218,6 @@ impl<'a> Resources<'a> {
             samplers: Vec::new(),
             descriptor_set_layouts: Vec::new(),
             descriptor_pool: vk::DescriptorPool::null(),
-            owns_descriptor_pool: false,
             descriptor_sets: Vec::new(),
             readback_buffer: vk::Buffer::null(),
             readback_memory: vk::DeviceMemory::null(),
@@ -1906,19 +1933,16 @@ impl<'a> Resources<'a> {
         if self.batched {
             // A deferred draw's descriptor sets stay live until the batch
             // fence, so it cannot use the shared resettable pool (whose
-            // per-draw reset would free them). Each deferred draw owns a
-            // small exact-size pool, retired with the batch.
-            let info = vk::DescriptorPoolCreateInfo::default()
-                .max_sets(resource_stages.len() as u32)
-                .pool_sizes(&pool_sizes);
-            // SAFETY: the pool-size slice is alive for the call; the pool is
-            // owned by this draw and destroyed exactly once (batch retirement
-            // on success, Drop on failure).
-            self.descriptor_pool = unsafe { self.device().create_descriptor_pool(&info, None) }
-                .map_err(|e| {
-                    GpuError::PipelineCreationFailed(format!("batched vkCreateDescriptorPool: {e}"))
-                })?;
-            self.owns_descriptor_pool = true;
+            // per-draw reset would free them). Stage D item 2: instead of a
+            // fresh exact-size pool per draw (a vkCreateDescriptorPool +
+            // vkDestroyDescriptorPool per deferred draw), all deferred draws
+            // allocate from shared capacity-accounted batch pools that are
+            // reset together at the batch retire, after the flush fence.
+            self.descriptor_pool = self.caches.batch_descriptor_pool(
+                self.dev,
+                resource_stages.len() as u32,
+                &pool_sizes,
+            )?;
         } else {
             // Persistent pool from the cache, reset for this draw (the
             // previous draw's sets completed with its fence) and grown when
@@ -2001,6 +2025,38 @@ impl<'a> Resources<'a> {
                         }
                         self.caches.stats.sampled_target_binds += 1;
                         views.push(view);
+                    } else if upload.cached {
+                        // Persistent-texture cache hit (stage D): the decode
+                        // path verified the guest content's sample-hash
+                        // matches the cached entry, so bind the cached view
+                        // directly. No barrier: the image rests in
+                        // SHADER_READ_ONLY_OPTIMAL with visibility to both
+                        // graphics shader stages (the upload's tail barrier).
+                        let key = TextureKey {
+                            base: upload.guest_base,
+                            width: upload.width,
+                            height: upload.height,
+                            layers: upload.layers,
+                            depth: upload.depth.max(1),
+                            cube: upload.cube,
+                            format: upload.format.as_raw(),
+                        };
+                        let (view, hash) = self.caches.texture_entry(&key).ok_or_else(|| {
+                            GpuError::PipelineCreationFailed(format!(
+                                "cached texture {:#x} ({}x{}) predicted by the decode \
+                                     snapshot is no longer in the texture cache",
+                                upload.guest_base, upload.width, upload.height
+                            ))
+                        })?;
+                        if hash != upload.sample_hash {
+                            return Err(GpuError::PipelineCreationFailed(format!(
+                                "cached texture {:#x} content hash changed between decode \
+                                 and bind ({hash:#x} != {:#x})",
+                                upload.guest_base, upload.sample_hash
+                            )));
+                        }
+                        self.caches.stats.texture_cache_hits += 1;
+                        views.push(view);
                     } else {
                         self.create_texture_image(upload, stage.stage)?;
                         views.push(
@@ -2080,6 +2136,25 @@ impl<'a> Resources<'a> {
             ));
         }
         let (staging_buffer, staging_memory) = self.create_buffer_with_bytes(&upload.pixels)?;
+        // Persistent-texture cache (stage D): a cacheable upload donates its
+        // image to the cache on draw success, so the next bind of the same
+        // guest texture (same key, same content sample-hash) skips the whole
+        // decode + create + upload. `XPS5X_NO_TEX_CACHE=1` disables donation.
+        let cache_key = (upload.guest_base != 0
+            && upload.sample_hash != 0
+            && std::env::var_os("XPS5X_NO_TEX_CACHE").is_none())
+        .then_some(TextureKey {
+            base: upload.guest_base,
+            width: upload.width,
+            height: upload.height,
+            layers: upload.layers,
+            depth: upload.depth.max(1),
+            cube: upload.cube,
+            format: upload.format.as_raw(),
+        });
+        if cache_key.is_some() {
+            self.caches.stats.texture_cache_misses += 1;
+        }
         // Pushed with null image handles up front: `Drop` destroys whatever is
         // non-null, so every error path below cleans up the partial upload.
         self.texture_uploads.push(TextureGpu {
@@ -2093,6 +2168,9 @@ impl<'a> Resources<'a> {
             layers: upload.layers,
             depth: upload.depth.max(1),
             stage,
+            cache_key,
+            sample_hash: upload.sample_hash,
+            byte_size: upload.pixels.len() as u64,
         });
         let slot = self.texture_uploads.len() - 1;
 
@@ -2589,7 +2667,16 @@ impl<'a> Resources<'a> {
                     src_access: vk::AccessFlags::TRANSFER_WRITE,
                     dst_access: vk::AccessFlags::SHADER_READ,
                     src_stage: vk::PipelineStageFlags::TRANSFER,
-                    dst_stage: shader_stage_to_pipeline(texture.stage),
+                    // A cache-donated texture (stage D) may be sampled by
+                    // EITHER graphics stage in later draws with no further
+                    // barrier, so its writes must be made visible to both
+                    // shader stages here, not just the binding stage.
+                    dst_stage: if texture.cache_key.is_some() {
+                        vk::PipelineStageFlags::VERTEX_SHADER
+                            | vk::PipelineStageFlags::FRAGMENT_SHADER
+                    } else {
+                        shader_stage_to_pipeline(texture.stage)
+                    },
                 },
             );
         }
@@ -3154,12 +3241,9 @@ impl<'a> Resources<'a> {
             .expect("deferred draws always name a persistent target");
         let mut res = PendingDrawResources {
             command_buffer: mem::replace(&mut self.command_buffer, vk::CommandBuffer::null()),
-            descriptor_pool: if self.owns_descriptor_pool {
-                self.owns_descriptor_pool = false;
-                mem::replace(&mut self.descriptor_pool, vk::DescriptorPool::null())
-            } else {
-                vk::DescriptorPool::null()
-            },
+            // The draw's sets live in a shared batch pool (stage D item 2),
+            // reset by the cache at the batch retire — nothing to transfer.
+            descriptor_pool: vk::DescriptorPool::null(),
             buffers: Vec::new(),
             images: Vec::new(),
         };
@@ -3184,11 +3268,33 @@ impl<'a> Resources<'a> {
         for (buffer, memory) in self.storage_buffers.drain(..) {
             res.buffers.push((buffer, memory));
         }
-        for texture in self.texture_uploads.drain(..) {
+        // Cache-eligible textures are donated to the persistent-texture cache
+        // instead of being destroyed with the batch; their staging buffers
+        // still retire with the batch. The donation itself happens AFTER
+        // `commit_deferred_draw` (below) so `batch_open()` is true and any
+        // eviction it triggers defers destruction past the flush fence —
+        // this draw's just-submitted command buffer may reference the
+        // evicted image.
+        let mut donations: Vec<(TextureKey, PersistentTexture)> = Vec::new();
+        for mut texture in self.texture_uploads.drain(..) {
             res.buffers
                 .push((texture.staging_buffer, texture.staging_memory));
-            res.images
-                .push((texture.image, texture.memory, texture.view));
+            if let Some(cache_key) = texture.cache_key.take() {
+                donations.push((
+                    cache_key,
+                    PersistentTexture {
+                        image: texture.image,
+                        memory: texture.memory,
+                        view: texture.view,
+                        sample_hash: texture.sample_hash,
+                        bytes: texture.byte_size,
+                        last_use: 0,
+                    },
+                ));
+            } else {
+                res.images
+                    .push((texture.image, texture.memory, texture.view));
+            }
         }
         if self.depth_image != vk::Image::null() || self.depth_view != vk::ImageView::null() {
             res.images.push((
@@ -3198,6 +3304,32 @@ impl<'a> Resources<'a> {
             ));
         }
         self.caches.commit_deferred_draw(res, key);
+        // Batch is now open: evictions inside insert_texture defer safely.
+        for (cache_key, entry) in donations {
+            self.caches.insert_texture(self.dev, cache_key, entry);
+        }
+    }
+
+    /// Immediate-path counterpart of the donation in [`Self::commit_to_batch`]:
+    /// called after `record_and_submit` fence-waited the upload, so the cached
+    /// image is complete and any eviction can only touch images referenced by
+    /// fence-completed work (or defers, if a deferred batch happens to be
+    /// open). Handles leave this struct so `Drop` no longer destroys them.
+    fn donate_textures_to_cache(&mut self) {
+        for texture in &mut self.texture_uploads {
+            let Some(cache_key) = texture.cache_key.take() else {
+                continue;
+            };
+            let entry = PersistentTexture {
+                image: mem::replace(&mut texture.image, vk::Image::null()),
+                memory: mem::replace(&mut texture.memory, vk::DeviceMemory::null()),
+                view: mem::replace(&mut texture.view, vk::ImageView::null()),
+                sample_hash: texture.sample_hash,
+                bytes: texture.byte_size,
+                last_use: 0,
+            };
+            self.caches.insert_texture(self.dev, cache_key, entry);
+        }
     }
 
     fn read_back(&self, width: u32, height: u32, bpp: u32) -> Result<Vec<u8>, GpuError> {
@@ -3367,9 +3499,8 @@ impl Drop for Resources<'_> {
         unsafe {
             let d = self.dev.device();
 
-            if self.owns_descriptor_pool && self.descriptor_pool != vk::DescriptorPool::null() {
-                d.destroy_descriptor_pool(self.descriptor_pool, None);
-            }
+            // `descriptor_pool` is always cache-owned (shared resettable pool
+            // or a shared batch pool) — never destroyed here.
             for texture in texture_uploads {
                 if texture.view != vk::ImageView::null() {
                     d.destroy_image_view(texture.view, None);

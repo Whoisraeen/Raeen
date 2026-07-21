@@ -1,3 +1,31 @@
+- M3 GATE MET (2026-07-20) — interactive 2D homebrew: pad + CPU-2D draw + flip +
+  present-from-guest-memory, all exercised by a running synthesized guest.
+  * present-from-guest-memory (the real feature): a flip whose display buffer has
+    NO GPU-drawn render target now builds the presented frame by reading the guest
+    bytes at that address as pixels, using the registered VideoOut attribute
+    (width/height/pitch/format). LINEAR + 32-bit RGBA/BGRA (A8B8G8R8 / A8R8G8B8,
+    _SRGB+_UNORM) supported; other tile modes/formats = rate-limited warn + skip
+    (never faked). GPU-drawn target at the flip address still wins; ordered after
+    the most-content census so GPU titles (scanout filled by uncaptured copy/DMA)
+    do not regress. SharpEmu VulkanVideoPresenter.cs:1643-1660
+    (GuestImageWantsInitialData) cited. Files: `xps5x-core::subsystems`
+    (`ScanoutDescriptor` + trait sig), `xps5x-gpu::agc_exec`
+    (`present_from_guest_memory`, `present_flipped` fallback, new field),
+    `xps5x-hle::libsce_video_out` (`hle_submit_flip` builds+threads the descriptor).
+  * acceptance test `crates/xps5x-runtime/tests/m3_interactive_2d.rs`: hand-asm
+    homebrew runs through the REAL LM1 path (`execute_linked`) — calls
+    `scePadReadState(1,&pad)`, loads buttons, CPU-fills a 4x4 linear RGBA8 buffer
+    white/black by input, calls `sceVideoOutSubmitFlip(1,0,..)`, reads pixel0 to
+    RAX. Asserts: guest wrote different pixels A(neutral=black) vs B(Cross=white)
+    via RAX; flip count advanced each run (1 then 2); `session.last_image()`
+    reflects the CPU-drawn content and differs A vs B. Guest actually executes
+    (not the test calling HLE handlers).
+  * Tests: hle 144, gpu unit +1 (`present_scanout_reads_cpu_drawn_pixels_from_guest_memory`),
+    runtime m3 1/1; `-p xps5x-hle -p xps5x-gpu -p xps5x-runtime` all green; clippy
+    clean on touched lines; fmt clean.
+  * NOT regressed: existing present_scanout GPU-drawn/splash tests still green
+    (signature took a new `Option<ScanoutDescriptor>` arg, all 4 impls updated).
+
 - ASTRO.BOT boot stall DIAGNOSED (2026-07-19) — it is NOT a missing symbol and
   NOT a deadlock in our primitives; it is the title's own job system never being
   woken. Three reusable diagnostics were added to get here:

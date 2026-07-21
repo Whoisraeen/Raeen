@@ -165,6 +165,9 @@ fn sampled_texture_pixels_reach_the_readback() {
         cube: false,
         depth: 1,
         render_target: None,
+        guest_base: 0,
+        sample_hash: 0,
+        cached: false,
     };
 
     let vs = triangle_vertex_spirv();

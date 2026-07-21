@@ -67,6 +67,16 @@ pub trait GameLauncher {
     ) -> Option<Vec<xps5x_core::diagnostics::DiagnosticEvent>> {
         None
     }
+    /// The running session's kernel, so the Shell can push live controller
+    /// input into the guest each frame via `OrbisKernel::set_pad_state`. `None`
+    /// when the session is unknown or the launcher has no kernel to share
+    /// (`StubLauncher`).
+    fn session_kernel(
+        &self,
+        _handle: &SessionHandle,
+    ) -> Option<std::sync::Arc<xps5x_kernel::OrbisKernel>> {
+        None
+    }
     /// Request a running session to quit (returns to Shell).
     fn quit(&self, handle: &SessionHandle) -> Result<(), LaunchError>;
 }
@@ -645,6 +655,17 @@ impl GameLauncher for FirmwareLauncher {
             .get(&handle.0)
             .and_then(|session| session.kernel.as_ref())
             .map(|kernel| kernel.diagnostics.snapshot())
+    }
+
+    fn session_kernel(
+        &self,
+        handle: &SessionHandle,
+    ) -> Option<std::sync::Arc<xps5x_kernel::OrbisKernel>> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(&handle.0)
+            .and_then(|session| session.kernel.clone())
     }
 
     fn quit(&self, handle: &SessionHandle) -> Result<(), LaunchError> {

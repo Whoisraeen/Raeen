@@ -27,19 +27,47 @@ use xps5x_core::config::EmulatorConfig;
 pub const SETTINGS_SECTION_NAMES: [&str; 8] = [
     "Video",
     "Audio",
-    "Input",
+    "Controller",
     "Game Folders",
     "Key Provider",
     "Theme",
     "System",
-    "Debug",
+    "Advanced",
 ];
 
 /// Number of rows in each section, in `SETTINGS_SECTION_NAMES` order. The
 /// Game Folders section grows by one row per configured folder plus a
 /// trailing "Add Folder" row, so this takes the current folder count.
 pub fn settings_row_counts(game_folder_count: usize) -> Vec<usize> {
-    vec![5, 3, 2, game_folder_count + 1, 1, 1, 2, 5]
+    vec![9, 3, 2, game_folder_count + 1, 1, 1, 2, 8]
+}
+
+/// Frame-limit presets the Video ▸ Frame Limit row cycles through (guest vblank
+/// cadence in Hz). 60 is native PS5.
+pub const FRAME_LIMITS: [u32; 6] = [30, 60, 90, 120, 144, 240];
+
+/// Cycle `current` through [`FRAME_LIMITS`] by `delta` steps (wrapping). A
+/// non-preset current value snaps to its nearest preset first.
+pub fn cycle_frame_limit(current: u32, delta: i32) -> u32 {
+    let idx = FRAME_LIMITS
+        .iter()
+        .position(|&h| h == current)
+        .unwrap_or_else(|| {
+            FRAME_LIMITS
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, h)| (i64::from(**h) - i64::from(current)).abs())
+                .map_or(1, |(i, _)| i)
+        });
+    let next = (idx as i32 + delta).rem_euclid(FRAME_LIMITS.len() as i32) as usize;
+    FRAME_LIMITS[next]
+}
+
+/// Step an integer setting (window size, GPU device index) by `delta` steps of
+/// `step`, clamped to `[min, max]`. The `u32` counterpart to [`adjust_stepped`].
+pub fn adjust_stepped_u32(value: u32, delta: i32, step: u32, min: u32, max: u32) -> u32 {
+    let stepped = i64::from(value) + i64::from(delta) * i64::from(step);
+    stepped.clamp(i64::from(min), i64::from(max)) as u32
 }
 
 /// Log-level names the Debug section's "Log Level" row cycles through, in
@@ -226,6 +254,50 @@ fn draw_video(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, config: &Emulato
         4,
         "VSync",
         on_off(config.general.vsync).to_string(),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        5,
+        "Frame Limit",
+        format!("{} Hz", config.graphics.frame_limit),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        6,
+        "GPU Device",
+        if config.graphics.gpu_device_index == 0 {
+            "Auto (best)".to_string()
+        } else {
+            format!("Device {}", config.graphics.gpu_device_index)
+        },
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        7,
+        "Window Width",
+        format!("{} px", config.general.window_width),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        8,
+        "Window Height",
+        format!("{} px", config.general.window_height),
+    );
+    ui.add_space(10.0);
+    ui.label(
+        RichText::new(
+            "Window size applies when Fullscreen is Off. Frame Limit and GPU Device apply on the next launch.",
+        )
+        .color(theme.palette.text_faint)
+        .size(12.0),
     );
 }
 
@@ -418,7 +490,7 @@ fn draw_debug(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, config: &Emulato
         theme,
         nav,
         2,
-        "Trace Syscalls",
+        "Trace HLE Calls",
         on_off(config.debug.trace_syscalls).to_string(),
     );
     row(
@@ -426,7 +498,7 @@ fn draw_debug(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, config: &Emulato
         theme,
         nav,
         3,
-        "Dump GPU Commands",
+        "Dump GPU Resources",
         on_off(config.debug.dump_gpu_commands).to_string(),
     );
     row(
@@ -437,11 +509,37 @@ fn draw_debug(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, config: &Emulato
         "Dump Shaders",
         on_off(config.debug.dump_shaders).to_string(),
     );
+    row(
+        ui,
+        theme,
+        nav,
+        5,
+        "Dump Frames",
+        on_off(config.debug.dump_frames).to_string(),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        6,
+        "Call Stats",
+        on_off(config.debug.call_stats).to_string(),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        7,
+        "Stall Dump",
+        on_off(config.debug.stall_dump).to_string(),
+    );
     ui.add_space(10.0);
     ui.label(
-        RichText::new("Developer diagnostics — logging verbosity and GPU/shader/syscall dumps.")
-            .color(theme.palette.text_faint)
-            .size(12.0),
+        RichText::new(
+            "Developer diagnostics. Logging is live; the dumps and traces apply on the next launch.",
+        )
+        .color(theme.palette.text_faint)
+        .size(12.0),
     );
 }
 
@@ -463,13 +561,29 @@ mod tests {
     #[test]
     fn other_sections_row_counts_are_fixed() {
         let counts = settings_row_counts(5);
-        assert_eq!(counts[0], 5); // Video (Resolution, Fullscreen, Shader Cache, Validation, VSync)
+        assert_eq!(counts[0], 9); // Video (+ Frame Limit, GPU Device, Window W/H)
         assert_eq!(counts[1], 3); // Audio
-        assert_eq!(counts[2], 2); // Input
+        assert_eq!(counts[2], 2); // Controller
         assert_eq!(counts[4], 1); // Key Provider
         assert_eq!(counts[5], 1); // Theme
         assert_eq!(counts[6], 2); // System (version + updater action)
-        assert_eq!(counts[7], 5); // Debug (Logging, Log Level, Trace, Dump GPU, Dump Shaders)
+        assert_eq!(counts[7], 8); // Advanced (Logging, Log Level, 3 traces/dumps + 3 more)
+    }
+
+    #[test]
+    fn cycle_frame_limit_wraps_and_snaps_to_nearest_preset() {
+        assert_eq!(cycle_frame_limit(60, 1), 90);
+        assert_eq!(cycle_frame_limit(60, -1), 30);
+        assert_eq!(cycle_frame_limit(30, -1), 240); // wraps bottom -> top
+        assert_eq!(cycle_frame_limit(240, 1), 30); // wraps top -> bottom
+        assert_eq!(cycle_frame_limit(80, 1), 120); // 80 snaps to 90, then +1 -> 120
+    }
+
+    #[test]
+    fn adjust_stepped_u32_steps_and_clamps() {
+        assert_eq!(adjust_stepped_u32(1920, 1, 160, 640, 7680), 2080);
+        assert_eq!(adjust_stepped_u32(640, -1, 160, 640, 7680), 640); // clamped at min
+        assert_eq!(adjust_stepped_u32(7680, 1, 160, 640, 7680), 7680); // clamped at max
     }
 
     #[test]

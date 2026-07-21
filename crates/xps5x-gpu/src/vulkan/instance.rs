@@ -402,19 +402,46 @@ impl VulkanDevice {
         let devices = unsafe { instance.enumerate_physical_devices() }
             .map_err(|e| GpuError::VulkanInitFailed(format!("device enumeration failed: {e}")))?;
 
+        // Physical-device selection honors Settings ▸ Video ▸ GPU Device: 0 =
+        // auto (best-scored, the default — never regressed), n ≥ 1 selects the
+        // n-th usable device (1-based). An out-of-range or unusable index falls
+        // back to the best-scored device with a warning.
+        let requested = crate::agc_exec::AgcGpuSession::runtime_config().gpu_device_index;
+        let explicit = requested.checked_sub(1).map(|i| i as usize);
+
         let mut best: Option<(u32, vk::PhysicalDevice, u32, String)> = None;
-        for pd in devices {
+        let mut chosen: Option<(vk::PhysicalDevice, u32, String)> = None;
+        for (i, pd) in devices.iter().copied().enumerate() {
             let Some((family, name, score)) = Self::rate_device(instance, pd) else {
                 continue;
             };
-            debug!("candidate GPU: {name} (score {score})");
+            debug!("candidate GPU [{i}]: {name} (score {score})");
+            if Some(i) == explicit {
+                chosen = Some((pd, family, name.clone()));
+            }
             if best.as_ref().is_none_or(|(b, ..)| score > *b) {
                 best = Some((score, pd, family, name));
             }
         }
 
-        let (_, physical_device, queue_family_index, device_name) =
-            best.ok_or(GpuError::NoSuitableDevice)?;
+        let (physical_device, queue_family_index, device_name) = match chosen {
+            Some(sel) => {
+                info!(
+                    "using GPU device #{requested} (Settings ▸ Video ▸ GPU Device): {}",
+                    sel.2
+                );
+                sel
+            }
+            None => {
+                if explicit.is_some() {
+                    warn!(
+                        "GPU device #{requested} is out of range or unusable — using best-scored device"
+                    );
+                }
+                let (_, pd, fam, name) = best.ok_or(GpuError::NoSuitableDevice)?;
+                (pd, fam, name)
+            }
+        };
 
         // Optional extension: PS5 titles use reverse-Z viewport depth ranges
         // ([1, 0], or outside [0,1]), which core Vulkan forbids. Enable it when

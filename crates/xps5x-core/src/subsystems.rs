@@ -158,10 +158,40 @@ pub struct ShaderMappedData {
     pub input_semantics: Vec<ShaderSemantic>,
 }
 
+/// Layout of a guest display buffer for present-from-guest-memory (M3).
+///
+/// A 2D title that CPU-draws pixels into its display buffer and flips never
+/// routes those pixels through a GPU draw, so the flipped buffer is absent from
+/// the GPU's render-target map. This descriptor — populated by the HLE from the
+/// VideoOut buffer attribute the title registered
+/// (`sceVideoOutRegisterBuffers2`) — lets the GPU present those bytes directly.
+///
+/// SharpEmu `VulkanVideoPresenter.cs:1643-1660` (`GuestImageWantsInitialData`):
+/// PS5 render targets alias CPU-visible memory; first-use images are seeded
+/// from guest memory, which is how CPU-written pixels become visible without
+/// any GPU draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanoutDescriptor {
+    /// Visible width in pixels.
+    pub width: u32,
+    /// Visible height in pixels.
+    pub height: u32,
+    /// Row stride in pixels (defaults to `width` for a tightly-packed linear
+    /// buffer when the attribute carries no separate pitch).
+    pub pitch_pixels: u32,
+    /// Raw `SceVideoOutPixelFormat`.
+    pub pixel_format: u64,
+    /// Raw `SceVideoOutTilingMode` (0 = tiled, 1 = linear).
+    pub tiling_mode: u32,
+}
+
 pub trait GpuSubmissionSubsystem: Send + Sync {
     fn submit(&self, words: Vec<u32>, queue: GpuQueue);
     fn map_shader_metadata(&self, code_address: u64, data: ShaderMappedData);
-    fn present_scanout(&self, address: u64);
+    /// Present the guest display buffer at `address` the title flipped to. When
+    /// `descriptor` is provided and no GPU-drawn target exists at `address`, the
+    /// backend may read the guest bytes there as pixels (CPU-drawn 2D, M3).
+    fn present_scanout(&self, address: u64, descriptor: Option<ScanoutDescriptor>);
     fn wait_idle(&self);
     fn stats(&self) -> GpuSubmissionStats;
     /// `sceSystemServiceHideSplashScreen`: the title says its own rendering is

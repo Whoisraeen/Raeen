@@ -1331,12 +1331,45 @@ fn main() -> anyhow::Result<()> {
     });
 
     // Mirror the persisted GPU settings into the GPU crate: Validation Layers
-    // (applied when the Vulkan backend is first created) and Resolution Scale
-    // (applied to each guest draw). Both take effect from this launch onward.
+    // (applied when the Vulkan backend is first created), Resolution Scale
+    // (applied to each guest draw), and GPU Device (physical-device selection).
+    // All take effect from this launch onward.
     xps5x_gpu::AgcGpuSession::set_runtime_config(
         config.graphics.validation_layers,
         config.graphics.resolution_scale,
+        config.graphics.gpu_device_index,
     );
+
+    // Bring up host audio output and apply the persisted Audio settings (Master
+    // Volume / Audio Enabled). The guest's sceAudioOutOutput feeds this sink;
+    // the Shell also updates it live when the user changes those settings.
+    xps5x_audio::output::set_volume(config.audio.volume);
+    xps5x_audio::output::set_enabled(config.audio.enabled);
+    xps5x_audio::output::init();
+
+    // Bridge the persisted Advanced diagnostics to the environment variables the
+    // GPU/runtime read, so those settings actually take effect. A manually-set
+    // env var always wins (a dev CLI override is never clobbered).
+    let bridge_flag = |name: &str, on: bool| {
+        if on && std::env::var_os(name).is_none() {
+            // SAFETY: called in `main` before any thread is spawned (before
+            // eframe and the guest session), so no other thread is reading the
+            // environment concurrently — the edition-2024 unsafety is satisfied.
+            unsafe { std::env::set_var(name, "1") };
+        }
+    };
+    bridge_flag("XPS5X_DUMP_SHADERS", config.debug.dump_shaders);
+    bridge_flag("XPS5X_DUMP_GPU_RESOURCES", config.debug.dump_gpu_commands);
+    bridge_flag("XPS5X_TRACE_HLE", config.debug.trace_syscalls);
+    bridge_flag("XPS5X_DUMP_FRAMES", config.debug.dump_frames);
+    bridge_flag("XPS5X_CALL_STATS", config.debug.call_stats);
+    bridge_flag("XPS5X_STALL_DUMP", config.debug.stall_dump);
+    if std::env::var_os("XPS5X_VBLANK_HZ").is_none() {
+        // SAFETY: as above — single-threaded startup, no concurrent env access.
+        unsafe {
+            std::env::set_var("XPS5X_VBLANK_HZ", config.graphics.frame_limit.to_string());
+        }
+    }
 
     // Initialize the kernel.
     let _kernel = xps5x_kernel::OrbisKernel::new();
