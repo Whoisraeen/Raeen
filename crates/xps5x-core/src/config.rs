@@ -130,6 +130,8 @@ pub struct InputConfig {
     pub dualsense_features: bool,
     /// Controller deadzone (0.0 - 1.0).
     pub deadzone: f32,
+    /// Button legend used by the Shell for confirm/back prompts.
+    pub controller_icon_style: ControllerIconStyle,
 }
 
 impl Default for InputConfig {
@@ -137,6 +139,55 @@ impl Default for InputConfig {
         Self {
             dualsense_features: true,
             deadzone: 0.15,
+            controller_icon_style: ControllerIconStyle::PlayStation,
+        }
+    }
+}
+
+/// Controller button-label family shown by the Shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ControllerIconStyle {
+    #[default]
+    PlayStation,
+    Xbox,
+    Generic,
+}
+
+impl ControllerIconStyle {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PlayStation => "PlayStation",
+            Self::Xbox => "Xbox",
+            Self::Generic => "Generic / third-party",
+        }
+    }
+
+    pub const fn cycle(self, delta: i32) -> Self {
+        let index = match self {
+            Self::PlayStation => 0,
+            Self::Xbox => 1,
+            Self::Generic => 2,
+        };
+        match (index + delta).rem_euclid(3) {
+            0 => Self::PlayStation,
+            1 => Self::Xbox,
+            _ => Self::Generic,
+        }
+    }
+
+    pub const fn confirm(self) -> &'static str {
+        match self {
+            Self::PlayStation => "Cross",
+            Self::Xbox => "A",
+            Self::Generic => "1",
+        }
+    }
+
+    pub const fn back(self) -> &'static str {
+        match self {
+            Self::PlayStation => "Circle",
+            Self::Xbox => "B",
+            Self::Generic => "2",
         }
     }
 }
@@ -244,5 +295,39 @@ impl EmulatorConfig {
         }
         std::fs::write(path, contents)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_config_defaults_controller_icon_style() {
+        let config: EmulatorConfig = toml::from_str("[input]\ndeadzone = 0.2\n").unwrap();
+        assert_eq!(
+            config.input.controller_icon_style,
+            ControllerIconStyle::PlayStation
+        );
+    }
+
+    #[test]
+    fn controller_icon_style_round_trips_and_cycles() {
+        let mut config = EmulatorConfig::default();
+        config.input.controller_icon_style = ControllerIconStyle::Xbox;
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: EmulatorConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded.input.controller_icon_style,
+            ControllerIconStyle::Xbox
+        );
+        assert_eq!(
+            ControllerIconStyle::Xbox.cycle(1),
+            ControllerIconStyle::Generic
+        );
+        assert_eq!(
+            ControllerIconStyle::PlayStation.cycle(-1),
+            ControllerIconStyle::Generic
+        );
     }
 }

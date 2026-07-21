@@ -185,6 +185,7 @@ fn sampled_texture_pixels_reach_the_readback() {
                 sampler_binding: 1,
                 textures: vec![texture],
                 linear_filter: vec![false],
+                sampled_groups: Vec::new(),
             }),
             storage_images: None,
             gds_binding: None,

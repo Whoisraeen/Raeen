@@ -152,6 +152,7 @@ fn draw_state<'a>(vs: &'a [u32], ps: &'a [u32], texture: TextureUpload) -> DrawS
                 sampler_binding: 1,
                 textures: vec![texture],
                 linear_filter: vec![false],
+                sampled_groups: Vec::new(),
             }),
             storage_images: None,
             gds_binding: None,

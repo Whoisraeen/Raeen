@@ -25,9 +25,9 @@ use crate::shader_fetch::{ShaderTranslateCache, TranslatedShader};
 use crate::vulkan::compute::{ComputeState, dispatch_compute};
 use crate::vulkan::instance::VulkanDevice;
 use crate::vulkan::offscreen::{
-    BlendState, CLEAR_COLOR, DrawState, EudRawBinding, RenderedImage, ShaderStageBinding,
-    StorageBufferBinding, StorageImageBinding, StorageImageUpload, TextureBinding, TextureUpload,
-    VertexAttributeData, VertexBufferData,
+    BlendState, CLEAR_COLOR, DrawState, EudRawBinding, RenderedImage, SampledGroup,
+    ShaderStageBinding, StorageBufferBinding, StorageImageBinding, StorageImageUpload,
+    TextureBinding, TextureUpload, VertexAttributeData, VertexBufferData,
 };
 use ash::vk;
 use kyty_graphics::hw_regs::{ComputeShaderInfo, Context, Shader, UserConfig};
@@ -713,6 +713,18 @@ fn texture_cache_probe(
     (hash, hit)
 }
 
+/// The canonical Dim ordinal of a sampled T# `type_()`, matching
+/// `kyty_graphics::shader::SampledDim::ordinal`: 2D = 0, 2DArray = 1, 3D = 2,
+/// Cube = 3. A mixed-dim shader assigns per-Dim descriptor bindings in this
+/// order, so the host and the SPIR-V generator agree on which array each Dim
+/// lands at (`binding_sampled_index + position-among-present-Dims`).
+fn sampled_dim_ordinal(texture_type: u8) -> usize {
+    // Delegates to the SPIR-V generator's own classifier so the host and the
+    // shader can never disagree on a T#'s array (classifier drift here would
+    // bind a texture into an array the shader never reads it from).
+    kyty_graphics::shader::SampledDim::from_texture_type(texture_type).ordinal() as usize
+}
+
 /// Decode one T# into linear pixels a Vulkan sampled image can hold.
 ///
 /// Formats and tile modes are added strictly from measurement: an unhandled
@@ -1342,6 +1354,15 @@ fn prepare_stage_binding(
     // 0..storage_num, because the two SPIR-V arrays are separate bindings.
     let mut textures = Vec::with_capacity(texture_num);
     let mut storage_images = Vec::new();
+    // Mixed-dim sampled routing: the recompiled SPIR-V declares one
+    // `%textures2D_S<dim>` array per present sampled Dim, each at its own
+    // binding. Each sampled T#'s seeded index is its position WITHIN its own
+    // Dim's array (0..count-of-that-Dim), and `sampled_dim_views[ord]` records
+    // which `textures` entry fills each slot. Indexed by the canonical Dim
+    // ordinal `sampled_dim_ordinal` — the same order the SPIR-V generator and
+    // `shader_calc_binding_indices` use to assign per-Dim bindings.
+    let mut sampled_dim_count = [0u64; 4];
+    let mut sampled_dim_views: [Vec<usize>; 4] = Default::default();
     for (index, desc) in bind.textures2d.desc[..texture_num].iter().enumerate() {
         let mut rewritten = desc.texture;
         if desc.usage == ShaderTextureUsage::ReadWrite {
@@ -1397,13 +1418,40 @@ fn prepare_stage_binding(
                     );
                 }
             }
-            rewritten.update_address38(textures.len() as u64);
+            let ord = sampled_dim_ordinal(desc.texture.type_());
+            let view_index = textures.len();
+            // Seed the T# index WITHIN its Dim's array (homogeneous shaders
+            // have one Dim, so this counts 0,1,2… exactly as the old
+            // `textures.len()` did).
+            rewritten.update_address38(sampled_dim_count[ord]);
+            sampled_dim_count[ord] += 1;
+            sampled_dim_views[ord].push(view_index);
             textures.push(decoded);
         }
         for field in rewritten.fields {
             push_constants.extend_from_slice(&field.to_le_bytes());
         }
     }
+    // A shader binds more than one sampled Dim => build the per-Dim groups the
+    // host descriptor path uses (one array per Dim). Present Dims are taken in
+    // canonical ordinal order and assigned consecutive bindings starting at
+    // `binding_sampled_index`, matching the SPIR-V generator exactly. A
+    // homogeneous shader leaves `sampled_groups` empty (single-array path).
+    let present_dims: Vec<usize> = (0..4)
+        .filter(|&o| !sampled_dim_views[o].is_empty())
+        .collect();
+    let sampled_groups: Vec<SampledGroup> = if present_dims.len() > 1 {
+        present_dims
+            .iter()
+            .enumerate()
+            .map(|(pos, &ord)| SampledGroup {
+                binding: bind.textures2d.binding_sampled_index as u32 + pos as u32,
+                view_indices: std::mem::take(&mut sampled_dim_views[ord]),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     if storage_images.len() != bind.textures2d.textures2d_storage_num as usize
         || textures.len() != bind.textures2d.textures2d_sampled_num as usize
     {
@@ -1487,6 +1535,7 @@ fn prepare_stage_binding(
             sampler_binding: bind.samplers.binding_index as u32,
             textures,
             linear_filter,
+            sampled_groups,
         }),
         storage_images: (!storage_images.is_empty()).then_some(StorageImageBinding {
             binding: bind.textures2d.binding_storage_index as u32,
@@ -2927,6 +2976,77 @@ mod tests {
         })
         .expect_err("storage images are compute-only");
         assert!(e.0.contains("STORAGE"), "names the storage rejection: {e}");
+    }
+
+    /// The ASTRO.BOT composite/read-pass shape: a stage sampling one 2D
+    /// texture AND one 3D volume. The recompiled SPIR-V declares one image
+    /// array per Dim (2D at `binding_sampled_index`, 3D at the next binding),
+    /// so `prepare_stage_binding` must split the sampled views into per-Dim
+    /// groups and seed each T#'s index WITHIN its own Dim's array (both 0
+    /// here — one texture per Dim).
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn compute_binding_mixed_dims_split_into_per_dim_groups() {
+        const W: u32 = 4;
+        const H: u32 = 4;
+        const D: u32 = 2;
+        const BYTES2D: usize = (W * H * 4) as usize;
+        const BYTES3D: usize = (W * H * D * 4) as usize;
+
+        let mut arena = vec![0u8; 1024 + 255];
+        let base = (arena.as_ptr() as u64 + 255) & !255;
+        let off = (base - arena.as_ptr() as u64) as usize;
+        for i in 0..BYTES3D {
+            arena[off + i] = (i % 251) as u8; // 2D at +0
+            arena[off + 512 + i] = ((i * 5 + 11) % 251) as u8; // 3D volume at +512
+        }
+        let content = |o: usize, n: usize| arena[off + o..off + o + n].to_vec();
+
+        // A 3D volume T# (type 10) with `depth = D` slices, linear tile.
+        let mut vol = rgba8_linear_tsharp(base + 512, W, H);
+        vol.fields[3] &= !(0xF << 28);
+        vol.fields[3] |= 10 << 28; // type = 3D
+        vol.fields[4] = (vol.fields[4] & !0x1FFF) | (D - 1); // depth field = D - 1
+
+        let mut bind = ShaderBindResources::default();
+        bind.push_constant_size = 2 * 32; // two 8-dword T#s
+        bind.textures2d.textures_num = 2;
+        bind.textures2d.textures2d_sampled_num = 2;
+        bind.textures2d.binding_sampled_index = 0;
+        // Two present Dims => two sampled bindings (0, 1); storage at 2.
+        bind.textures2d.binding_storage_index = 2;
+        bind.textures2d.desc[0].texture = rgba8_linear_tsharp(base, W, H); // 2D
+        bind.textures2d.desc[1].texture = vol; // 3D
+
+        let ranges = [(arena.as_ptr() as u64, arena.len())];
+        let binding = crate::guest_mem::with_test_ranges(&ranges, || {
+            prepare_stage_binding(&bind, vk::ShaderStageFlags::COMPUTE)
+        })
+        .expect("mixed-dim sampled compute binding");
+
+        let textures = binding.textures.expect("sampled textures");
+        assert_eq!(textures.textures.len(), 2);
+        assert_eq!(textures.textures[0].pixels, content(0, BYTES2D));
+        assert_eq!(textures.textures[1].pixels, content(512, BYTES3D));
+
+        // Two per-Dim groups: 2D (ordinal 0) at binding 0, 3D (ordinal 2) at
+        // binding 1, each holding its single view.
+        assert_eq!(textures.sampled_groups.len(), 2);
+        assert_eq!(textures.sampled_groups[0].binding, 0);
+        assert_eq!(textures.sampled_groups[0].view_indices, vec![0]);
+        assert_eq!(textures.sampled_groups[1].binding, 1);
+        assert_eq!(textures.sampled_groups[1].view_indices, vec![1]);
+
+        // Each T#'s seeded index is its position within its own Dim's array.
+        let dword0 = |group: usize| {
+            u32::from_le_bytes(
+                binding.push_constants[group * 32..group * 32 + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(dword0(0), 0, "the 2D T# indexes %textures2D_S_2D[0]");
+        assert_eq!(dword0(1), 0, "the 3D T# indexes %textures2D_S_3D[0]");
     }
 
     /// SharpEmu-parity window sizing (Gen5ShaderScalarEvaluator.cs:1952-1960

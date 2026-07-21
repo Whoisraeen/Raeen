@@ -398,6 +398,20 @@ impl Shell {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
                     self.config.general.fullscreen,
                 ));
+                if !self.config.general.fullscreen {
+                    // Restore all normal-window properties explicitly. Some
+                    // Windows compositors retain the borderless fullscreen
+                    // geometry after only clearing the fullscreen flag.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                        self.config.general.window_width as f32,
+                        self.config.general.window_height as f32,
+                    )));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                        40.0, 40.0,
+                    )));
+                }
             }
             (0, 2) => self.config.graphics.shader_cache = !self.config.graphics.shader_cache,
             (0, 3) => {
@@ -449,6 +463,10 @@ impl Shell {
             (2, 1) => {
                 self.config.input.deadzone =
                     settings::adjust_stepped(self.config.input.deadzone, delta, 0.05, 0.0, 1.0)
+            }
+            (2, 2) => {
+                self.config.input.controller_icon_style =
+                    self.config.input.controller_icon_style.cycle(delta)
             }
             (5, 0) => self.cycle_theme(ctx, delta),
             (7, 0) => {
@@ -629,6 +647,23 @@ impl Shell {
                 }
                 if i.key_pressed(Key::Tab) {
                     inputs.push(NavInput::Tab);
+                }
+                if i.pointer.primary_clicked() {
+                    inputs.push(NavInput::Confirm);
+                }
+                if i.pointer.secondary_clicked() {
+                    inputs.push(NavInput::Back);
+                }
+                let scroll = i.smooth_scroll_delta;
+                if scroll.y > 1.0 {
+                    inputs.push(NavInput::Up);
+                } else if scroll.y < -1.0 {
+                    inputs.push(NavInput::Down);
+                }
+                if scroll.x > 1.0 {
+                    inputs.push(NavInput::Left);
+                } else if scroll.x < -1.0 {
+                    inputs.push(NavInput::Right);
                 }
             });
         }
@@ -858,6 +893,7 @@ impl Shell {
                 &self.cover_textures,
                 self.hero_bg_from.as_ref(),
                 self.hero_bg_to.as_ref(),
+                self.config.input.controller_icon_style,
             );
 
             let recent_titles = self.recent_titles();

@@ -228,13 +228,28 @@ impl<'a> ComputeResources<'a> {
                     for upload in &textures.textures {
                         self.create_sampled_image(upload)?;
                     }
-                    layout_bindings.push(
-                        vk::DescriptorSetLayoutBinding::default()
-                            .binding(textures.sampled_binding)
-                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                            .descriptor_count(self.sampled.len() as u32)
-                            .stage_flags(vk::ShaderStageFlags::COMPUTE),
-                    );
+                    if textures.sampled_groups.is_empty() {
+                        // Homogeneous: one array of every sampled view.
+                        layout_bindings.push(
+                            vk::DescriptorSetLayoutBinding::default()
+                                .binding(textures.sampled_binding)
+                                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                .descriptor_count(self.sampled.len() as u32)
+                                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                        );
+                    } else {
+                        // Mixed-dim: one `%textures2D_S<dim>` array per Dim, at
+                        // its own binding — matching the recompiled SPIR-V.
+                        for group in &textures.sampled_groups {
+                            layout_bindings.push(
+                                vk::DescriptorSetLayoutBinding::default()
+                                    .binding(group.binding)
+                                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                    .descriptor_count(group.view_indices.len() as u32)
+                                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                            );
+                        }
+                    }
                 }
                 if !textures.linear_filter.is_empty() {
                     for &linear in &textures.linear_filter {
@@ -370,15 +385,45 @@ impl<'a> ComputeResources<'a> {
                 .iter()
                 .map(|&sampler| vk::DescriptorImageInfo::default().sampler(sampler))
                 .collect();
+            // Mixed-dim: split the sampled-view pool into one descriptor array
+            // per Dim, in SPIR-V array order. `self.sampled[i]` corresponds to
+            // `textures.textures[i]`, so a group's `view_indices` select its
+            // views directly. Kept alive alongside `sampled_infos`.
+            let group_infos: Vec<Vec<vk::DescriptorImageInfo>> = textures
+                .map(|t| {
+                    t.sampled_groups
+                        .iter()
+                        .map(|group| {
+                            group
+                                .view_indices
+                                .iter()
+                                .map(|&i| sampled_infos[i])
+                                .collect()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             if let Some(textures) = textures {
                 if !sampled_infos.is_empty() {
-                    writes.push(
-                        vk::WriteDescriptorSet::default()
-                            .dst_set(self.descriptor_set)
-                            .dst_binding(textures.sampled_binding)
-                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                            .image_info(&sampled_infos),
-                    );
+                    if textures.sampled_groups.is_empty() {
+                        writes.push(
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(self.descriptor_set)
+                                .dst_binding(textures.sampled_binding)
+                                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                .image_info(&sampled_infos),
+                        );
+                    } else {
+                        for (group, infos) in textures.sampled_groups.iter().zip(&group_infos) {
+                            writes.push(
+                                vk::WriteDescriptorSet::default()
+                                    .dst_set(self.descriptor_set)
+                                    .dst_binding(group.binding)
+                                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                    .image_info(infos),
+                            );
+                        }
+                    }
                 }
                 if !sampler_infos.is_empty() {
                     writes.push(

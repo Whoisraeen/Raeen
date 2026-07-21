@@ -50,8 +50,9 @@ pub use resources::{
     ShaderVertexInputInfo,
 };
 pub use spirv::{
-    ShaderRecompileError, Spirv, SpirvType, SpirvValue, shader_detect_eud_raw_window,
-    spirv_generate_source, spirv_get_embedded_ps, spirv_get_embedded_vs,
+    SampledDim, ShaderRecompileError, Spirv, SpirvType, SpirvValue,
+    shader_detect_eud_raw_window, spirv_generate_source, spirv_get_embedded_ps,
+    spirv_get_embedded_vs,
 };
 pub use types::{
     ShaderCode, ShaderConstant, ShaderControlFlowBlock, ShaderDebugPrintf, ShaderInstruction,

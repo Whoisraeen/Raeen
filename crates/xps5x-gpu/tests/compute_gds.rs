@@ -293,6 +293,7 @@ fn sampled_texture_without_sampler_dispatches() {
                 cached: false,
             }],
             linear_filter: Vec::new(),
+            sampled_groups: Vec::new(),
         }),
         storage_images: None,
         gds_binding: None,
@@ -359,6 +360,7 @@ fn default_nearest_sampler_binds_and_caches_across_dispatches() {
             }],
             // The synthesized all-zero S#: xy_mag_filter == 0 -> nearest.
             linear_filter: vec![false],
+            sampled_groups: Vec::new(),
         }),
         storage_images: None,
         gds_binding: None,

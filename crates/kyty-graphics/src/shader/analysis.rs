@@ -876,9 +876,18 @@ pub fn shader_calc_binding_indices(bind: &mut ShaderBindResources) {
     }
 
     if bind.textures2d.textures_num > 0 {
+        // Sampled textures take one Vulkan binding PER PRESENT Dim (a
+        // mixed-dim shader declares one `%textures2D_S<dim>` array each — one
+        // SPIR-V array type carries exactly one image Dim). The storage array
+        // follows all of them. A homogeneous shader has one present Dim, so
+        // this reserves the same two bindings as before (sampled, storage);
+        // a storage-only shader reserves one placeholder sampled binding to
+        // keep the storage index where it has always been.
         bind.textures2d.binding_sampled_index = binding_index;
-        bind.textures2d.binding_storage_index = binding_index + 1;
-        binding_index += 2;
+        let sampled_bindings = super::spirv::sampled_dims_present(bind).len().max(1) as i32;
+        binding_index += sampled_bindings;
+        bind.textures2d.binding_storage_index = binding_index;
+        binding_index += 1;
 
         bind.push_constant_size += bind.textures2d.textures_num as u32 * 32;
     }
@@ -2894,8 +2903,17 @@ pub fn shader_get_input_info_cs(
 /// Kyty: Shader.cpp `ShaderGetBindIds` (L2679). The id keys on the *binding
 /// layout* (counts, slots, start registers, extended/usage flags), NOT on
 /// descriptor contents — upstream deliberately commented out the
-/// per-descriptor fields (L2685-L2694, L2705-L2728, L2739-L2765) and that is
-/// preserved exactly: changing descriptor contents must not change the id.
+/// per-descriptor fields (L2685-L2694, L2705-L2728, L2739-L2765).
+///
+/// DELIBERATE deviation from that contents-blind rule, one T# field pair:
+/// the generated SPIR-V depends on each texture descriptor's `type_()`
+/// nibble (it picks the per-Dim sampled array/coordinate arity and the
+/// storage image Dim) and on the storage `format() == 71` discriminator
+/// (`Rgba16f` vs `Rgba8` storage image format). Two binds identical except
+/// there produce DIFFERENT modules, so they must not share one cache id —
+/// with the upstream id they silently aliased (wrong-Dim sampling from a
+/// cached module). Every other descriptor-content field stays out of the id,
+/// exactly as upstream.
 fn shader_get_bind_ids(ret: &mut ShaderId, bind: &ShaderBindResources) {
     ret.ids.push(bind.storage_buffers.buffers_num as u32);
 
@@ -2913,6 +2931,12 @@ fn shader_get_bind_ids(ret: &mut ShaderId, bind: &ShaderBindResources) {
         ret.ids.push(bind.textures2d.desc[i].start_register as u32);
         ret.ids.push(u32::from(bind.textures2d.desc[i].extended));
         ret.ids.push(bind.textures2d.desc[i].usage as u32);
+        // Codegen inputs (see the fn doc): the Dim-selecting type nibble and
+        // the storage format-71 discriminator.
+        ret.ids
+            .push(u32::from(bind.textures2d.desc[i].texture.type_()));
+        ret.ids
+            .push(u32::from(bind.textures2d.desc[i].texture.format() == 71));
     }
 
     ret.ids.push(bind.samplers.samplers_num as u32);
@@ -3298,6 +3322,47 @@ mod tests {
             }
             None
         }
+    }
+
+    /// The shader-cache id must key on the two T# content fields codegen
+    /// depends on — the Dim-selecting `type_()` nibble and the storage
+    /// format-71 discriminator — or a 2D-bound and a 3D-bound dispatch of the
+    /// same ISA silently share one translated module (wrong-Dim sampling).
+    /// Everything else about the binds below is identical.
+    #[test]
+    fn bind_ids_distinguish_texture_type_and_storage_format() {
+        let ids_of = |bind: &ShaderBindResources| {
+            let mut id = ShaderId::default();
+            shader_get_bind_ids(&mut id, bind);
+            id.ids
+        };
+        let mut base = ShaderBindResources::default();
+        base.textures2d.textures_num = 1;
+        base.textures2d.textures2d_sampled_num = 1;
+        base.textures2d.desc[0].texture.fields[3] |= 9 << 28; // type 9: 2D
+
+        // Same bind, T# type nibble 10 (3D) instead of 9 (2D).
+        let mut volume = base;
+        volume.textures2d.desc[0].texture.fields[3] =
+            (volume.textures2d.desc[0].texture.fields[3] & !(0xF << 28)) | (10 << 28);
+        assert_ne!(
+            ids_of(&base),
+            ids_of(&volume),
+            "T# type nibble (2D vs 3D) must change the bind id"
+        );
+
+        // Same bind, guest format 71 (16_16_16_16 FLOAT, the Rgba16f
+        // storage discriminator) instead of format 0.
+        let mut hdr = base;
+        hdr.textures2d.desc[0].texture.fields[1] |= 71 << 20;
+        assert_ne!(
+            ids_of(&base),
+            ids_of(&hdr),
+            "format-71 discriminator must change the bind id"
+        );
+
+        // Sanity: an untouched copy still shares the id.
+        assert_eq!(ids_of(&base), ids_of(&base.clone()));
     }
 
     /// Build a shader blob with the Kyty trailer layout (GetBinaryInfo

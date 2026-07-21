@@ -33,8 +33,8 @@ pub use super::spirv::ShaderRecompileError;
 use super::spirv::{
     SampledDim, Spirv, SpirvType, not_supported, operand_is_constant, operand_is_exec,
     operand_is_variable, operand_load_float, operand_load_int, operand_load_uint,
-    operand_variable_to_str, operand_variable_to_str_shift, sampled_texture_dim,
-    spirv_generate_source, spirv_get_embedded_ps, spirv_get_embedded_vs,
+    operand_variable_to_str, operand_variable_to_str_shift, sampled_dims_present,
+    sampled_texture_dim, spirv_generate_source, spirv_get_embedded_ps, spirv_get_embedded_vs,
     storage_texture_dim_format,
 };
 use crate::shader::resources::{
@@ -4180,23 +4180,21 @@ fn eud_alias_offset(code: &ShaderCode, eud_base: i32, reg: i32, at: usize) -> Op
 /// (`eud_rel_index(start_register) == k`). This resolves the alias without
 /// inventing a descriptor or binding any uncaptured guest bytes — the bound
 /// descriptor is the already-validated captured one.
-fn mimg_register_is_eud_alias(
+fn mimg_register_eud_alias_index(
     bind: &ShaderBindResources,
     code: &ShaderCode,
     reg: i32,
     at: usize,
     want_storage: bool,
-) -> bool {
+) -> Option<usize> {
     if !bind.extended.used {
-        return false;
+        return None;
     }
-    let Some(k) = eud_alias_offset(code, bind.extended.start_register, reg, at) else {
-        return false;
-    };
+    let k = eud_alias_offset(code, bind.extended.start_register, reg, at)?;
     let tex_num = usize::try_from(bind.textures2d.textures_num.max(0))
         .unwrap_or(0)
         .min(bind.textures2d.desc.len());
-    bind.textures2d.desc[..tex_num].iter().any(|d| {
+    bind.textures2d.desc[..tex_num].iter().position(|d| {
         d.extended
             && d.textures2d_without_sampler == want_storage
             && super::spirv::eud_rel_index(bind, d.start_register, 0, "mimg alias")
@@ -4205,7 +4203,7 @@ fn mimg_register_is_eud_alias(
 }
 
 /// EUD-alias resolution for a sampler register (see
-/// [`mimg_register_is_eud_alias`]): the S# is captured at its EUD-virtual
+/// [`mimg_register_eud_alias_index`]): the S# is captured at its EUD-virtual
 /// start register but read by the MIMG from a real SGPR a covered EUD `s_load`
 /// fills.
 fn sampler_register_is_eud_alias(
@@ -4259,6 +4257,69 @@ fn sampler_register_is_eud_alias(
 /// Ordering is deliberately ignored in shape 2 (a raw load AFTER the MIMG
 /// also refuses): linear order is unreliable across branches, and the
 /// conservative refusal is a named skip, not a wrong render.
+/// The per-descriptor sampled-image route for a MIMG body: the SPIR-V id
+/// suffix that points its `%textures2D_S`/`%ImageS`/`%SampledImage`/pointer
+/// references at the array matching the sampled T#'s own Dim, plus that Dim
+/// (for coordinate-component selection). In a homogeneous shader the suffix is
+/// empty and the Dim is the shader-wide one, so output is byte-identical to
+/// the single-array path.
+///
+/// `matched` is [`mimg_descriptor_guard`]'s resolution of WHICH captured
+/// descriptor the instruction's T# names — through a direct start-register
+/// match or the program-order EUD-alias walk. Routing by that same resolution
+/// (instead of re-matching registers here) is what lets an EUD-aliased T# in
+/// a mixed shader reach its own Dim's array; a bare register re-match would
+/// re-refuse exactly the aliased descriptors the walk was built to accept
+/// (ASTRO.BOT, refusals 642->90).
+fn sampled_site_route(
+    spirv: &Spirv<'_>,
+    matched: Option<usize>,
+    func: &'static str,
+) -> Result<(&'static str, SampledDim), ShaderRecompileError> {
+    let bind = spirv
+        .get_bind_info()
+        .expect("sampled MIMG bodies check textures2d_sampled_num > 0 first");
+    let present = sampled_dims_present(bind);
+    if present.len() <= 1 {
+        return Ok(("", sampled_texture_dim(bind)?));
+    }
+    // `mimg_descriptor_guard` runs before every route call and refuses an
+    // unmatched T#, so a mixed shader reaching here without a resolution is
+    // a defensive named refusal, not a reachable path.
+    let Some(i) = matched else {
+        return Err(not_supported(
+            func,
+            "mixed-dim sample T# matches no captured sampled descriptor",
+        ));
+    };
+    // Bounded: the guard produced `i` from an iterator over
+    // `desc[..tex_num]` with `tex_num` clamped to `desc.len()`.
+    let dim = SampledDim::from_texture_type(bind.textures2d.desc[i].texture.type_());
+    Ok((dim.mixed_suffix(), dim))
+}
+
+/// Rewrite the four sampled-image identifiers in a freshly-built MIMG body to
+/// the per-Dim suffixed names, routing the sample to the array matching the
+/// T#'s Dim in a mixed shader. `suffix == ""` (homogeneous) is a no-op.
+///
+/// Each identifier is always followed by a space in every MIMG body template,
+/// so matching the trailing space keeps the `%_ptr_UniformConstant_ImageS` /
+/// `%ImageS` overlap safe: the pointer's "ImageS" is preceded by `_`, never
+/// `%`, so `%ImageS ` can never match inside `%_ptr_UniformConstant_ImageS `.
+fn route_sampled_ids(body: &mut String, suffix: &str) {
+    if suffix.is_empty() {
+        return;
+    }
+    *body = body
+        .replace(
+            "%_ptr_UniformConstant_ImageS ",
+            &format!("%_ptr_UniformConstant_ImageS{suffix} "),
+        )
+        .replace("%textures2D_S ", &format!("%textures2D_S{suffix} "))
+        .replace("%SampledImage ", &format!("%SampledImage{suffix} "))
+        .replace("%ImageS ", &format!("%ImageS{suffix} "));
+}
+
 fn mimg_descriptor_guard(
     index: u32,
     spirv: &Spirv<'_>,
@@ -4267,9 +4328,9 @@ fn mimg_descriptor_guard(
     func: &'static str,
     class: MimgDescriptorClass,
     uses_sampler: bool,
-) -> Result<(), ShaderRecompileError> {
+) -> Result<Option<usize>, ShaderRecompileError> {
     let Some(bind) = spirv.get_bind_info() else {
-        return Ok(());
+        return Ok(None);
     };
     // The MIMG's own position in program order — descriptor registers are
     // resolved by walking the scalar program BACKWARD from here.
@@ -4294,21 +4355,33 @@ fn mimg_descriptor_guard(
         .min(bind.textures2d.desc.len());
     // `textures2d_without_sampler` is the recompiler-native storage/sampled
     // discriminator (`sampled_texture_dim` / `storage_texture_dim_format`
-    // split the two SPIR-V arrays on it).
-    let t_matched = bind.textures2d.desc[..tex_num].iter().any(|d| {
-        d.start_register + shift_regs == t_reg
-            && d.textures2d_without_sampler == (class == MimgDescriptorClass::Storage)
-    });
-    if !t_matched
-        && !mimg_register_is_eud_alias(bind, code, t_reg, at, class == MimgDescriptorClass::Storage)
-    {
+    // split the two SPIR-V arrays on it). The resolution keeps WHICH
+    // descriptor matched (its `desc` index): `sampled_site_route` routes the
+    // MIMG body to that descriptor's own Dim array in a mixed-dim shader —
+    // for the direct match AND for the EUD-alias walk equally.
+    let t_matched = bind.textures2d.desc[..tex_num]
+        .iter()
+        .position(|d| {
+            d.start_register + shift_regs == t_reg
+                && d.textures2d_without_sampler == (class == MimgDescriptorClass::Storage)
+        })
+        .or_else(|| {
+            mimg_register_eud_alias_index(
+                bind,
+                code,
+                t_reg,
+                at,
+                class == MimgDescriptorClass::Storage,
+            )
+        });
+    let Some(t_index) = t_matched else {
         return Err(not_supported(
             func,
             format!(
                 "dynamic-image-descriptor: {class:?} T# at s{t_reg} matches no captured descriptor"
             ),
         ));
-    }
+    };
 
     // The S# operand (MIMG ssamp * 4): 4 consecutive SGPRs. A sample-family
     // instruction with zero captured S#s is normally rescued upstream by
@@ -4395,7 +4468,7 @@ fn mimg_descriptor_guard(
         }
     }
 
-    Ok(())
+    Ok(Some(t_index))
 }
 
 /// Shared body of the seven `Recompile_ImageSample_*` dmask variants
@@ -4416,7 +4489,7 @@ fn image_sample_channels(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
-            mimg_descriptor_guard(
+            let matched = mimg_descriptor_guard(
                 index,
                 spirv,
                 code,
@@ -4459,9 +4532,9 @@ fn image_sample_channels(
 "#;
 
             // Cube and 3D textures sample with a 3-component coordinate; 2D
-            // with 2. The Dim was decided from the measured T# types in
-            // WriteTypes (`sampled_texture_dim` — mixed dims refused there).
-            let dim = sampled_texture_dim(bind_info)?;
+            // with 2. In a mixed-dim shader the Dim (and the image-array route)
+            // comes from THIS sample's own T#, not a shader-wide decision.
+            let (suffix, dim) = sampled_site_route(spirv, matched, func)?;
             let coord = if dim.coord_components() == 3 {
                 let src0_value2 = operand_variable_to_str_shift(inst.src[0], 2);
                 if src0_value2.type_ != SpirvType::Float {
@@ -4494,13 +4567,15 @@ fn image_sample_channels(
                     .replace("<dst_value>", &dst_value.value);
             }
 
-            *dst_source += &text
+            let mut body = text
                 .replace("<src0_value0>", &src0_value0.value)
                 .replace("<coord>", &coord)
                 .replace("<src0_value1>", &src0_value1.value)
                 .replace("<src1_value0>", &src1_value0.value)
                 .replace("<src2_value0>", &src2_value0.value)
                 .replace("<index>", &format!("{index}"));
+            route_sampled_ids(&mut body, suffix);
+            *dst_source += &body;
 
             return Ok(true);
         }
@@ -4652,7 +4727,7 @@ fn recompile_image_sample_c_lz(
     if bind_info.textures2d.textures2d_sampled_num == 0 || bind_info.samplers.samplers_num == 0 {
         return Ok(false);
     }
-    mimg_descriptor_guard(
+    let matched = mimg_descriptor_guard(
         index,
         spirv,
         code,
@@ -4662,7 +4737,8 @@ fn recompile_image_sample_c_lz(
         true,
     )?;
 
-    if sampled_texture_dim(bind_info)? != SampledDim::Two {
+    let (clz_suffix, clz_dim) = sampled_site_route(spirv, matched, FUNC)?;
+    if clz_dim != SampledDim::Two {
         return Err(not_supported(
             FUNC,
             "comparison sampling of cube/3D textures",
@@ -4703,13 +4779,15 @@ fn recompile_image_sample_c_lz(
          %clz_passes_<index> = OpFOrdLessThanEqual %bool %clz_reference_<index> %clz_texel_<index>
          %clz_result_<index> = OpSelect %float %clz_passes_<index> %float_1_000000 %float_0_000000
 "#;
-    *dst_source += &HEAD
+    let mut head = HEAD
         .replace("<texture_index>", &texture_index.value)
         .replace("<sampler_index>", &sampler_index.value)
         .replace("<reference>", &reference.value)
         .replace("<coord_x>", &coord_x.value)
         .replace("<coord_y>", &coord_y.value)
         .replace("<index>", &format!("{index}"));
+    route_sampled_ids(&mut head, clz_suffix);
+    *dst_source += &head;
 
     let values: &[&str] = match inst.format {
         F::Vdata1Vaddr3StSsDmask1 => &["%clz_result_<index>"],
@@ -4752,11 +4830,10 @@ fn recompile_image_sample_c_lz(
 /// `sampled_texture_dim` decision `Spirv::write_types` declared the image
 /// array with, so coordinates and image type can never disagree.
 fn sample_coord_snippet(
-    bind_info: &crate::shader::resources::ShaderBindResources,
+    dim: SampledDim,
     src0: crate::shader::types::ShaderOperand,
     func: &'static str,
 ) -> Result<String, ShaderRecompileError> {
-    let dim = sampled_texture_dim(bind_info)?;
     let c0 = operand_variable_to_str_shift(src0, 0);
     let c1 = operand_variable_to_str_shift(src0, 1);
     if c0.type_ != SpirvType::Float || c1.type_ != SpirvType::Float {
@@ -4802,7 +4879,7 @@ fn recompile_image_sample_lz_dmask7(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
-            mimg_descriptor_guard(
+            let matched = mimg_descriptor_guard(
                 index,
                 spirv,
                 code,
@@ -4849,8 +4926,9 @@ fn recompile_image_sample_lz_dmask7(
          %t55_<index> = OpLoad %float %t54_<index>
                OpStore %<dst_value2> %t55_<index>
 "#;
-            let coord = sample_coord_snippet(bind_info, inst.src[0], FUNC)?;
-            *dst_source += &TEXT
+            let (suffix, dim) = sampled_site_route(spirv, matched, FUNC)?;
+            let coord = sample_coord_snippet(dim, inst.src[0], FUNC)?;
+            let mut body = TEXT
                 .replace("<coord>", &coord)
                 .replace("<index>", &format!("{index}"))
                 .replace("<src1_value0>", &src1_value0.value)
@@ -4858,6 +4936,8 @@ fn recompile_image_sample_lz_dmask7(
                 .replace("<dst_value0>", &dst_value0.value)
                 .replace("<dst_value1>", &dst_value1.value)
                 .replace("<dst_value2>", &dst_value2.value);
+            route_sampled_ids(&mut body, suffix);
+            *dst_source += &body;
 
             return Ok(true);
         }
@@ -4882,7 +4962,7 @@ fn recompile_image_sample_lz_dmask_f(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
-            mimg_descriptor_guard(
+            let matched = mimg_descriptor_guard(
                 index,
                 spirv,
                 code,
@@ -4933,8 +5013,9 @@ fn recompile_image_sample_lz_dmask_f(
          %t58_<index> = OpLoad %float %t57_<index>
                OpStore %<dst_value3> %t58_<index>
 "#;
-            let coord = sample_coord_snippet(bind_info, inst.src[0], FUNC)?;
-            *dst_source += &TEXT
+            let (suffix, dim) = sampled_site_route(spirv, matched, FUNC)?;
+            let coord = sample_coord_snippet(dim, inst.src[0], FUNC)?;
+            let mut body = TEXT
                 .replace("<coord>", &coord)
                 .replace("<index>", &format!("{index}"))
                 .replace("<src1_value0>", &src1_value0.value)
@@ -4943,6 +5024,8 @@ fn recompile_image_sample_lz_dmask_f(
                 .replace("<dst_value1>", &dst_value1.value)
                 .replace("<dst_value2>", &dst_value2.value)
                 .replace("<dst_value3>", &dst_value3.value);
+            route_sampled_ids(&mut body, suffix);
+            *dst_source += &body;
 
             return Ok(true);
         }
@@ -4967,7 +5050,7 @@ fn image_sample_lz_single_channel(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
-            mimg_descriptor_guard(
+            let matched = mimg_descriptor_guard(
                 index,
                 spirv,
                 code,
@@ -5006,14 +5089,17 @@ fn image_sample_lz_single_channel(
          %t47_<index> = OpLoad %float %t46_<index>
                OpStore %<dst_value0> %t47_<index>
 "#;
-            let coord = sample_coord_snippet(bind_info, inst.src[0], func)?;
-            *dst_source += &TEXT
+            let (suffix, dim) = sampled_site_route(spirv, matched, func)?;
+            let coord = sample_coord_snippet(dim, inst.src[0], func)?;
+            let mut body = TEXT
                 .replace("<coord>", &coord)
                 .replace("<index>", &format!("{index}"))
                 .replace("<chan>", &format!("{chan}"))
                 .replace("<src1_value0>", &src1_value0.value)
                 .replace("<src2_value0>", &src2_value0.value)
                 .replace("<dst_value0>", &dst_value0.value);
+            route_sampled_ids(&mut body, suffix);
+            *dst_source += &body;
 
             return Ok(true);
         }
@@ -5038,7 +5124,7 @@ fn recompile_image_sample_lz_dmask3(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
-            mimg_descriptor_guard(
+            let matched = mimg_descriptor_guard(
                 index,
                 spirv,
                 code,
@@ -5078,14 +5164,17 @@ fn recompile_image_sample_lz_dmask3(
          %t51_<index> = OpLoad %float %t50_<index>
                OpStore %<dst_value1> %t51_<index>
 "#;
-            let coord = sample_coord_snippet(bind_info, inst.src[0], FUNC)?;
-            *dst_source += &TEXT
+            let (suffix, dim) = sampled_site_route(spirv, matched, FUNC)?;
+            let coord = sample_coord_snippet(dim, inst.src[0], FUNC)?;
+            let mut body = TEXT
                 .replace("<coord>", &coord)
                 .replace("<index>", &format!("{index}"))
                 .replace("<src1_value0>", &src1_value0.value)
                 .replace("<src2_value0>", &src2_value0.value)
                 .replace("<dst_value0>", &dst_value0.value)
                 .replace("<dst_value1>", &dst_value1.value);
+            route_sampled_ids(&mut body, suffix);
+            *dst_source += &body;
 
             return Ok(true);
         }
@@ -5143,7 +5232,7 @@ fn recompile_image_gather4_lz_dmask1(
     if bind_info.textures2d.textures2d_sampled_num == 0 || bind_info.samplers.samplers_num == 0 {
         return Ok(false);
     }
-    mimg_descriptor_guard(
+    let matched = mimg_descriptor_guard(
         index,
         spirv,
         code,
@@ -5153,7 +5242,8 @@ fn recompile_image_gather4_lz_dmask1(
         true,
     )?;
     // Gathers are 2D-only in Vulkan (no 3D gather; cube gathers unmeasured).
-    if sampled_texture_dim(bind_info)? != SampledDim::Two {
+    let (g4_suffix, g4_dim) = sampled_site_route(spirv, matched, FUNC)?;
+    if g4_dim != SampledDim::Two {
         return Err(not_supported(FUNC, "gather from a non-2D texture"));
     }
 
@@ -5199,12 +5289,14 @@ fn recompile_image_gather4_lz_dmask1(
             .replace("<dst_value>", &dst_value.value);
     }
 
-    *dst_source += &text
+    let mut body = text
         .replace("<src0_value0>", &src0_value0.value)
         .replace("<src0_value1>", &src0_value1.value)
         .replace("<src1_value0>", &src1_value0.value)
         .replace("<src2_value0>", &src2_value0.value)
         .replace("<index>", &format!("{index}"));
+    route_sampled_ids(&mut body, g4_suffix);
+    *dst_source += &body;
 
     Ok(true)
 }
@@ -5225,7 +5317,7 @@ fn recompile_image_sample_lzo_dmask7(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
-            mimg_descriptor_guard(
+            let matched = mimg_descriptor_guard(
                 index,
                 spirv,
                 code,
@@ -5292,7 +5384,14 @@ fn recompile_image_sample_lzo_dmask7(
          %t55_<index> = OpLoad %float %t54_<index>
                OpStore %<dst_value2> %t55_<index>
 "#;
-            *dst_source += &TEXT
+            // The offset math builds a 2D coordinate and queries a v2int size,
+            // so this body is 2D-only; a mixed shader whose LzO T# is 3D/Cube
+            // is a named refusal rather than a wrong-Dim sample.
+            let (suffix, dim) = sampled_site_route(spirv, matched, FUNC)?;
+            if dim != SampledDim::Two {
+                return Err(not_supported(FUNC, "offset sample of a non-2D texture"));
+            }
+            let mut body = TEXT
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
                 .replace("<src0_value1>", &src0_value1.value)
@@ -5302,6 +5401,8 @@ fn recompile_image_sample_lzo_dmask7(
                 .replace("<dst_value0>", &dst_value0.value)
                 .replace("<dst_value1>", &dst_value1.value)
                 .replace("<dst_value2>", &dst_value2.value);
+            route_sampled_ids(&mut body, suffix);
+            *dst_source += &body;
 
             return Ok(true);
         }
@@ -5342,7 +5443,7 @@ fn recompile_image_get_resinfo_dmask3(
         return Err(not_supported(FUNC, "unexpected operand types"));
     }
 
-    mimg_descriptor_guard(
+    let matched = mimg_descriptor_guard(
         index,
         spirv,
         code,
@@ -5351,6 +5452,13 @@ fn recompile_image_get_resinfo_dmask3(
         MimgDescriptorClass::Sampled,
         false,
     )?;
+
+    // The query extracts a v2int size, so this body is 2D-only; a mixed
+    // shader whose resinfo T# is 3D/Cube is a named refusal.
+    let (resinfo_suffix, resinfo_dim) = sampled_site_route(spirv, matched, FUNC)?;
+    if resinfo_dim != SampledDim::Two {
+        return Err(not_supported(FUNC, "resinfo of a non-2D texture"));
+    }
 
     let index_str = format!("{index}");
     const TEXT: &str = r#"
@@ -5367,12 +5475,14 @@ fn recompile_image_get_resinfo_dmask3(
          %t9_<index> = OpBitcast %float %t8_<index>
                OpStore %<dst_y> %t9_<index>
 "#;
-    *dst_source += &TEXT
+    let mut body = TEXT
         .replace("<index>", &index_str)
         .replace("<texture>", &texture.value)
         .replace("<lod>", &lod.value)
         .replace("<dst_x>", &dst_x.value)
         .replace("<dst_y>", &dst_y.value);
+    route_sampled_ids(&mut body, resinfo_suffix);
+    *dst_source += &body;
     Ok(true)
 }
 
@@ -5393,7 +5503,7 @@ fn image_load_channels(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 {
-            mimg_descriptor_guard(
+            let matched = mimg_descriptor_guard(
                 index,
                 spirv,
                 code,
@@ -5436,6 +5546,12 @@ fn image_load_channels(
                OpStore %<dst_value> %t<t1>_<index>
 "#;
 
+            // ImageFetch builds a 2D integer coordinate, so this body is
+            // 2D-only; a mixed shader whose fetched T# is 3D/Cube is refused.
+            let (suffix, dim) = sampled_site_route(spirv, matched, func)?;
+            if dim != SampledDim::Two {
+                return Err(not_supported(func, "texel fetch of a non-2D texture"));
+            }
             let mut text = HEAD.to_string();
             for (i, (t0, chan)) in channels.iter().enumerate() {
                 let dst_value = operand_variable_to_str_shift(inst.dst, i as i32);
@@ -5446,11 +5562,13 @@ fn image_load_channels(
                     .replace("<dst_value>", &dst_value.value);
             }
 
-            *dst_source += &text
+            let mut body = text
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
                 .replace("<src0_value1>", &src0_value1.value)
                 .replace("<src1_value0>", &src1_value0.value);
+            route_sampled_ids(&mut body, suffix);
+            *dst_source += &body;
 
             return Ok(true);
         }
@@ -9483,30 +9601,241 @@ mod tests {
         naga_parse_and_validate(&words, "2DArray sample");
     }
 
-    /// A shader mixing 2D and 3D sampled textures has no single array type —
-    /// the refusal must be named (`sampled_texture_dim`), not a guess.
+    /// A shader mixing 2D and 3D sampled textures declares one image array per
+    /// Dim (`%textures2D_S_2D` at binding 0, `%textures2D_S_3D` at binding 1)
+    /// and routes each sample to the array matching its own T#'s Dim. Measured
+    /// on ASTRO.BOT's fullscreen composite/read pass, which samples the scene
+    /// HDR 2D targets alongside a 3D LUT/froxel volume — the single-array path
+    /// refused it, gating the presented frame.
     #[test]
-    fn mixed_2d_and_3d_sampled_textures_are_refused_by_name() {
+    fn mixed_2d_and_3d_sampled_textures_emit_two_arrays_and_both_sample() {
         let mut code = ShaderCode::new();
         code.set_type(ShaderType::Compute);
+        // Sample T#0 (2D, s0..s7) and T#1 (3D, s16..s23), both through S#0
+        // (s8..s11) — an `image_sample_lz` dmask 0x3 each, the body that
+        // adapts its coordinate width to the descriptor's Dim.
+        let sample = |t_reg: i32| ShaderInstruction {
+            type_: T::ImageSampleLz,
+            format: F::Vdata2Vaddr3StSsDmask3,
+            src_num: 3,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Vgpr,
+                register_id: 2,
+                size: 2,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Vgpr,
+                    register_id: 6,
+                    size: 3,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: t_reg,
+                    size: 8,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 8,
+                    size: 4,
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        code.get_instructions_mut().push(sample(0));
+        code.get_instructions_mut().push(sample(16));
         code.get_instructions_mut().push(ShaderInstruction {
             type_: T::SEndpgm,
             format: F::Empty,
             ..Default::default()
         });
+
         let mut input_info = ShaderComputeInputInfo::default();
         input_info.threads_num = [1, 1, 1];
         input_info.bind.push_constant_size = 128;
         input_info.bind.textures2d.textures_num = 2;
         input_info.bind.textures2d.textures2d_sampled_num = 2;
         input_info.bind.textures2d.desc[0].texture.fields[3] |= 9 << 28; // 2D
+        input_info.bind.textures2d.desc[0].start_register = 0;
         input_info.bind.textures2d.desc[1].texture.fields[3] |= 10 << 28; // 3D
-        let err = spirv_generate_source(&code, None, None, Some(&input_info))
-            .expect_err("mixed dims must refuse");
+        input_info.bind.textures2d.desc[1].start_register = 16;
+        // Two sampled Dims => two sampled bindings (0, 1); storage 2; sampler 3.
+        input_info.bind.textures2d.binding_sampled_index = 0;
+        input_info.bind.textures2d.binding_storage_index = 2;
+        input_info.bind.samplers.samplers_num = 1;
+        input_info.bind.samplers.start_register[0] = 8;
+        input_info.bind.samplers.binding_index = 3;
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile mixed 2D+3D sample");
+
+        // One image type + array + variable per Dim.
         assert!(
-            format!("{err:?}").contains("mixed sampled texture dims"),
-            "{err:?}"
+            source.contains("%ImageS_2D = OpTypeImage %float 2D 0 0 0 1 Unknown"),
+            "2D image type:\n{source}"
         );
+        assert!(
+            source.contains("%ImageS_3D = OpTypeImage %float 3D 0 0 0 1 Unknown"),
+            "3D image type:\n{source}"
+        );
+        assert!(
+            source.contains("%textures2D_S_2D = OpVariable"),
+            "2D array variable:\n{source}"
+        );
+        assert!(
+            source.contains("%textures2D_S_3D = OpVariable"),
+            "3D array variable:\n{source}"
+        );
+        // Each array lands at its own binding (2D=0, 3D=1).
+        assert!(
+            source.contains("OpDecorate %textures2D_S_2D Binding 0"),
+            "2D binding:\n{source}"
+        );
+        assert!(
+            source.contains("OpDecorate %textures2D_S_3D Binding 1"),
+            "3D binding:\n{source}"
+        );
+        // The 2D sample routes to `%SampledImage_2D` with a 2-component coord,
+        // the 3D sample to `%SampledImage_3D` with a 3-component coord.
+        assert!(
+            source.contains("%SampledImage_2D") && source.contains("%SampledImage_3D"),
+            "both sampled-image types referenced:\n{source}"
+        );
+        assert!(
+            source.contains("OpCompositeConstruct %v2float")
+                && source.contains("OpCompositeConstruct %v3float"),
+            "2D sample uses v2 coords and 3D sample uses v3 coords:\n{source}"
+        );
+
+        let words = spirv_run(&source).expect("assemble mixed 2D+3D sample");
+        naga_parse_and_validate(&words, "mixed 2D+3D sample");
+    }
+
+    /// The full mixed-dim pipeline through the REAL binding allocator: a 2D +
+    /// 3D sampled pair PLUS a storage image, with `shader_calc_binding_indices`
+    /// (not hand-set indices) reserving one binding per present sampled dim
+    /// and shifting storage/samplers past them. RED on the single-array path:
+    /// the allocator gave storage `sampled + 1` (aliasing the 3D array) and
+    /// translation refused "mixed sampled texture dims" outright.
+    #[test]
+    fn mixed_dim_bind_calc_shifts_storage_and_routes_by_descriptor() {
+        use crate::shader::analysis::shader_calc_binding_indices;
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        let sample = |t_reg: i32, dst_reg: i32| ShaderInstruction {
+            type_: T::ImageSampleLz,
+            format: F::Vdata4Vaddr3StSsDmaskF,
+            src_num: 3,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Vgpr,
+                register_id: dst_reg,
+                size: 4,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Vgpr,
+                    register_id: 6,
+                    size: 3,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: t_reg,
+                    size: 8,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 8,
+                    size: 4,
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        code.get_instructions_mut().push(sample(0, 2));
+        code.get_instructions_mut().push(sample(12, 10));
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            ..Default::default()
+        });
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.textures2d.textures_num = 3;
+        input_info.bind.textures2d.textures2d_sampled_num = 2;
+        input_info.bind.textures2d.textures2d_storage_num = 1;
+        // T# 0: 2D (type 9) at s0..s7; T# 1: 3D (type 10) at s12..s19.
+        input_info.bind.textures2d.desc[0].texture.fields[3] |= 9 << 28;
+        input_info.bind.textures2d.desc[0].start_register = 0;
+        input_info.bind.textures2d.desc[1].texture.fields[3] |= 10 << 28;
+        input_info.bind.textures2d.desc[1].start_register = 12;
+        // T# 2: a storage (RW) image — proves the storage binding shifts
+        // past BOTH sampled dims instead of aliasing the second one.
+        input_info.bind.textures2d.desc[2].texture.fields[3] |= 9 << 28;
+        input_info.bind.textures2d.desc[2].start_register = 20;
+        input_info.bind.textures2d.desc[2].textures2d_without_sampler = true;
+        input_info.bind.textures2d.desc[2].usage =
+            crate::shader::resources::ShaderTextureUsage::ReadWrite;
+        input_info.bind.samplers.samplers_num = 1;
+        input_info.bind.samplers.start_register[0] = 8;
+        shader_calc_binding_indices(&mut input_info.bind);
+
+        // One binding per PRESENT sampled dim; storage/samplers shift.
+        assert_eq!(
+            input_info.bind.textures2d.binding_sampled_index, 0,
+            "first sampled dim keeps the base binding"
+        );
+        assert_eq!(
+            input_info.bind.textures2d.binding_storage_index, 2,
+            "storage images shift past BOTH sampled dims"
+        );
+        assert_eq!(
+            input_info.bind.samplers.binding_index, 3,
+            "samplers follow the shifted storage binding"
+        );
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("mixed 2D+3D sampled bind translates (per-dim arrays)");
+
+        // Every array lands at the allocator's binding, no aliasing.
+        assert!(
+            source.contains("OpDecorate %textures2D_S_2D Binding 0"),
+            "2D array binding decoration:\n{source}"
+        );
+        assert!(
+            source.contains("OpDecorate %textures2D_S_3D Binding 1"),
+            "3D array binding decoration:\n{source}"
+        );
+        assert!(
+            source.contains("OpDecorate %textures2D_L Binding 2"),
+            "shifted storage binding decoration:\n{source}"
+        );
+        assert!(
+            source.contains("OpDecorate %samplers Binding 3"),
+            "shifted sampler binding decoration:\n{source}"
+        );
+        // Each sample's OpAccessChain routes into ITS T#'s own array — an
+        // AccessChain match cannot be satisfied by the declaration, the
+        // decorations, or the OpEntryPoint interface list.
+        assert!(
+            source.contains("OpAccessChain %_ptr_UniformConstant_ImageS_2D %textures2D_S_2D"),
+            "a body indexes the 2D array:\n{source}"
+        );
+        assert!(
+            source.contains("OpAccessChain %_ptr_UniformConstant_ImageS_3D %textures2D_S_3D"),
+            "a body indexes the 3D array:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble mixed-dim sample");
+        naga_parse_and_validate(&words, "mixed-dim sample with storage shift");
     }
 
     #[test]
@@ -12937,6 +13266,121 @@ mod tests {
             .expect("EUD-alias storage T# must resolve, not refuse");
         assert!(source.contains("OpImageWrite"), "{source}");
         let _ = spirv_run(&source).expect("assemble EUD-alias image_store");
+    }
+
+    /// MIXED-dim routing through the EUD-alias walk: the 3D T# is captured at
+    /// its EUD-VIRTUAL start register (`s32` = EUD dword 0) while the sample
+    /// reads it from `s16`, filled by a covered `s_load_dwordx8`. The route
+    /// must use the guard's alias resolution — a bare start-register re-match
+    /// would re-refuse exactly the aliased descriptors the walk was built to
+    /// accept (ASTRO.BOT, refusals 642->90) and the mixed-dims failure class
+    /// would survive under a new name. The direct-register 2D sample and the
+    /// aliased 3D sample each land in their own dim's array.
+    #[test]
+    fn eud_alias_sampled_tsharp_routes_to_its_dim_in_mixed_shader() {
+        use crate::shader::analysis::shader_calc_binding_indices;
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // Covered EUD load: s_load_dwordx8 s[16:23], s[12:13], 0x0 — fills
+        // s16.. with EUD dwords 0..7 (the 3D T#'s rewritten descriptor).
+        let sload = ShaderInstruction {
+            type_: T::SLoadDwordx8,
+            format: F::Sdst8SbaseSoffset,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 16,
+                size: 8,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 12,
+                    size: 2,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::LiteralConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(0),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        let sample = |t_reg: i32, dst_reg: i32| ShaderInstruction {
+            type_: T::ImageSampleLz,
+            format: F::Vdata4Vaddr3StSsDmaskF,
+            src_num: 3,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Vgpr,
+                register_id: dst_reg,
+                size: 4,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Vgpr,
+                    register_id: 6,
+                    size: 3,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: t_reg,
+                    size: 8,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 8,
+                    size: 4,
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        code.get_instructions_mut().push(sload);
+        code.get_instructions_mut().push(sample(0, 2)); // 2D, direct T# at s0
+        code.get_instructions_mut().push(sample(16, 10)); // 3D, EUD-aliased
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            ..Default::default()
+        });
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.extended.used = true;
+        input_info.bind.extended.start_register = 12;
+        input_info.bind.textures2d.textures_num = 2;
+        input_info.bind.textures2d.textures2d_sampled_num = 2;
+        // T# 0: 2D (type 9) captured directly at s0..s7.
+        input_info.bind.textures2d.desc[0].texture.fields[3] |= 9 << 28;
+        input_info.bind.textures2d.desc[0].start_register = 0;
+        // T# 1: 3D (type 10) captured at the EUD-virtual s32 (EUD dword 0).
+        input_info.bind.textures2d.desc[1].texture.fields[3] |= 10 << 28;
+        input_info.bind.textures2d.desc[1].start_register = 32;
+        input_info.bind.textures2d.desc[1].extended = true;
+        input_info.bind.samplers.samplers_num = 1;
+        input_info.bind.samplers.start_register[0] = 8;
+        shader_calc_binding_indices(&mut input_info.bind);
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("EUD-aliased 3D T# in a mixed shader must route, not refuse");
+        assert!(
+            source.contains("OpAccessChain %_ptr_UniformConstant_ImageS_2D %textures2D_S_2D"),
+            "the direct 2D sample routes to the 2D array:\n{source}"
+        );
+        assert!(
+            source.contains("OpAccessChain %_ptr_UniformConstant_ImageS_3D %textures2D_S_3D"),
+            "the EUD-aliased 3D sample routes to the 3D array:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble mixed EUD-alias sample");
+        naga_parse_and_validate(&words, "mixed EUD-alias sample");
     }
 
     /// EUD-alias resolution is offset-exact — the device-loss guard: the

@@ -39,7 +39,7 @@ pub const SETTINGS_SECTION_NAMES: [&str; 8] = [
 /// Game Folders section grows by one row per configured folder plus a
 /// trailing "Add Folder" row, so this takes the current folder count.
 pub fn settings_row_counts(game_folder_count: usize) -> Vec<usize> {
-    vec![9, 3, 2, game_folder_count + 1, 1, 1, 2, 8]
+    vec![9, 3, 3, game_folder_count + 1, 1, 1, 2, 8]
 }
 
 /// Frame-limit presets the Video ▸ Frame Limit row cycles through (guest vblank
@@ -206,7 +206,11 @@ pub fn draw(
         ui.horizontal(|ui| {
             ui.add_space(54.0);
             ui.label(
-                RichText::new("\u{2191}\u{2193} Rows    \u{25C0}\u{25B6}/Enter Adjust    Esc Back")
+                RichText::new(format!(
+                    "\u{2191}\u{2193}/Wheel Rows    \u{25C0}\u{25B6}/Enter/{} Adjust    Esc/{}/Right-click Back",
+                    config.input.controller_icon_style.confirm(),
+                    config.input.controller_icon_style.back(),
+                ))
                     .color(theme.palette.text_dim)
                     .size(13.0),
             );
@@ -344,6 +348,14 @@ fn draw_input(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, config: &Emulato
         1,
         "Stick Deadzone",
         format!("{:.2}", config.input.deadzone),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        2,
+        "Button Icon Style",
+        config.input.controller_icon_style.label().to_string(),
     );
 }
 
@@ -563,7 +575,7 @@ mod tests {
         let counts = settings_row_counts(5);
         assert_eq!(counts[0], 9); // Video (+ Frame Limit, GPU Device, Window W/H)
         assert_eq!(counts[1], 3); // Audio
-        assert_eq!(counts[2], 2); // Controller
+        assert_eq!(counts[2], 3); // Controller
         assert_eq!(counts[4], 1); // Key Provider
         assert_eq!(counts[5], 1); // Theme
         assert_eq!(counts[6], 2); // System (version + updater action)

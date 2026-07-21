@@ -271,6 +271,7 @@ fn sampled_render_target_binds_the_gpu_image_within_a_batch() {
                     cached: false,
                 }],
                 linear_filter: vec![false],
+                sampled_groups: Vec::new(),
             }),
             storage_images: None,
             gds_binding: None,

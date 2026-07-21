@@ -306,6 +306,7 @@ fn title_translated_ps_sweep() {
                 cached: false,
             }],
             linear_filter: vec![false],
+            sampled_groups: Vec::new(),
         })
     };
     let vsharp_pushc: Vec<u8> = if zero {

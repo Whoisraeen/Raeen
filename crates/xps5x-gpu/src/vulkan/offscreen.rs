@@ -236,6 +236,24 @@ pub struct TextureBinding {
     pub textures: Vec<TextureUpload>,
     /// One entry per S#; only linear-vs-nearest is honoured today.
     pub linear_filter: Vec<bool>,
+    /// Per-Dim sampled-image descriptor groups for a MIXED-dim shader. The
+    /// recompiled SPIR-V declares one `%textures2D_S<dim>` array per present
+    /// Dim (2D, 3D, Cube, 2DArray), each at its own binding; a group's
+    /// `view_indices` select which `textures` entries (in per-Dim order) fill
+    /// that array. Empty for a homogeneous shader, which binds the whole
+    /// `textures` list as one array at `sampled_binding` (unchanged path).
+    pub sampled_groups: Vec<SampledGroup>,
+}
+
+/// One per-Dim sampled-image descriptor array of a mixed-dim shader:
+/// `binding` is the Vulkan binding of its `%textures2D_S<dim>` array,
+/// `view_indices` name the `TextureBinding::textures` entries that fill it in
+/// SPIR-V array order (the T# index the shader seeds for a descriptor equals
+/// its position in this list).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampledGroup {
+    pub binding: u32,
+    pub view_indices: Vec<usize>,
 }
 
 /// Per-stage resource ABI used by translated SPIR-V.
@@ -1858,13 +1876,28 @@ impl<'a> Resources<'a> {
                     ));
                 }
                 if !textures.textures.is_empty() {
-                    bindings.push(
-                        vk::DescriptorSetLayoutBinding::default()
-                            .binding(textures.sampled_binding)
-                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                            .descriptor_count(textures.textures.len() as u32)
-                            .stage_flags(stage.stage),
-                    );
+                    if textures.sampled_groups.is_empty() {
+                        // Homogeneous: one array of every sampled view.
+                        bindings.push(
+                            vk::DescriptorSetLayoutBinding::default()
+                                .binding(textures.sampled_binding)
+                                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                .descriptor_count(textures.textures.len() as u32)
+                                .stage_flags(stage.stage),
+                        );
+                    } else {
+                        // Mixed-dim: one `%textures2D_S<dim>` array per Dim,
+                        // each at its own binding — matching the SPIR-V.
+                        for group in &textures.sampled_groups {
+                            bindings.push(
+                                vk::DescriptorSetLayoutBinding::default()
+                                    .binding(group.binding)
+                                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                    .descriptor_count(group.view_indices.len() as u32)
+                                    .stage_flags(stage.stage),
+                            );
+                        }
+                    }
                 }
                 if !textures.linear_filter.is_empty() {
                     bindings.push(
@@ -1972,6 +2005,10 @@ impl<'a> Resources<'a> {
             // scope rather than inside each branch.
             let mut buffer_infos = Vec::new();
             let mut image_infos = Vec::new();
+            // Per-Dim group image infos for a mixed-dim shader; each inner Vec
+            // is one `%textures2D_S<dim>` array's descriptors. Kept at stage
+            // scope so it outlives `update_descriptor_sets`.
+            let mut group_infos: Vec<Vec<vk::DescriptorImageInfo>> = Vec::new();
             let mut sampler_infos = Vec::new();
             if let Some(storage) = &stage.storage_buffers {
                 for bytes in &storage.buffers {
@@ -2067,14 +2104,29 @@ impl<'a> Resources<'a> {
                         );
                     }
                 }
-                image_infos = views
-                    .into_iter()
-                    .map(|view| {
-                        vk::DescriptorImageInfo::default()
-                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                            .image_view(view)
-                    })
-                    .collect();
+                let info_of = |view: vk::ImageView| {
+                    vk::DescriptorImageInfo::default()
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .image_view(view)
+                };
+                if textures.sampled_groups.is_empty() {
+                    image_infos = views.iter().map(|&v| info_of(v)).collect();
+                } else {
+                    // Mixed-dim: split the view pool into one descriptor array
+                    // per Dim, in SPIR-V array order (the seeded T# index is
+                    // the position within its group).
+                    group_infos = textures
+                        .sampled_groups
+                        .iter()
+                        .map(|group| {
+                            group
+                                .view_indices
+                                .iter()
+                                .map(|&i| info_of(views[i]))
+                                .collect()
+                        })
+                        .collect();
+                }
                 for &linear in &textures.linear_filter {
                     self.samplers.push(self.caches.sampler(self.dev, linear)?);
                 }
@@ -2096,13 +2148,25 @@ impl<'a> Resources<'a> {
             }
             if let Some(textures) = &stage.textures {
                 if !textures.textures.is_empty() {
-                    writes.push(
-                        vk::WriteDescriptorSet::default()
-                            .dst_set(set)
-                            .dst_binding(textures.sampled_binding)
-                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                            .image_info(&image_infos),
-                    );
+                    if textures.sampled_groups.is_empty() {
+                        writes.push(
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(set)
+                                .dst_binding(textures.sampled_binding)
+                                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                .image_info(&image_infos),
+                        );
+                    } else {
+                        for (group, infos) in textures.sampled_groups.iter().zip(&group_infos) {
+                            writes.push(
+                                vk::WriteDescriptorSet::default()
+                                    .dst_set(set)
+                                    .dst_binding(group.binding)
+                                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                    .image_info(infos),
+                            );
+                        }
+                    }
                 }
                 if !textures.linear_filter.is_empty() {
                     writes.push(

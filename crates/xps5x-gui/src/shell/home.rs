@@ -26,6 +26,7 @@ use crate::theme::Theme;
 use egui::epaint::RectShape;
 use egui::{Align2, Color32, FontId, Mesh, Pos2, Rect, Shape, Stroke, StrokeKind, vec2};
 use std::collections::HashMap;
+use xps5x_core::config::ControllerIconStyle;
 
 /// Animated values resolved once per frame by `shell/mod.rs`.
 pub struct HomeAnim {
@@ -72,6 +73,7 @@ pub fn draw(
     covers: &HashMap<String, egui::TextureHandle>,
     bg_from: Option<&egui::TextureHandle>,
     bg_to: Option<&egui::TextureHandle>,
+    controller_icons: ControllerIconStyle,
 ) {
     let screen = ui.max_rect();
     let painter = ui.painter().clone();
@@ -111,7 +113,7 @@ pub fn draw(
         focused,
         meta_cache,
     );
-    draw_bottom_bar(&painter, theme, screen);
+    draw_bottom_bar(&painter, theme, screen, controller_icons);
 
     // The focus ring pulses and the clock ticks even when nothing else is
     // animating, so keep the screen gently alive.
@@ -665,23 +667,44 @@ fn draw_context_block(
 /// Bottom hint bar: circled button glyphs with labels on the left (Play /
 /// Search / Options, the mock's row), chat + capture status glyphs on the
 /// right.
-fn draw_bottom_bar(painter: &egui::Painter, theme: &Theme, screen: Rect) {
+fn draw_bottom_bar(
+    painter: &egui::Painter,
+    theme: &Theme,
+    screen: Rect,
+    controller_icons: ControllerIconStyle,
+) {
     let margin = theme.metrics.content_padding_x;
     let y = screen.bottom() - theme.metrics.content_padding_bottom;
     let circle_r = 15.0;
     let fill = Color32::from_rgba_unmultiplied(255, 255, 255, 14);
 
     let entries = [
-        (Glyph::Cross, "Play"),
-        (Glyph::Search, "Search"),
-        (Glyph::Menu, "Options"),
+        (Some(Glyph::Cross), controller_icons.confirm(), "Play"),
+        (Some(Glyph::Search), "", "Search"),
+        (Some(Glyph::Menu), "", "Options"),
     ];
     let mut x = screen.left() + margin + circle_r;
-    for (glyph, label) in entries {
+    for (glyph, button_label, label) in entries {
         let c = Pos2::new(x, y);
         painter.circle_filled(c, circle_r, fill);
         painter.circle_stroke(c, circle_r, Stroke::new(1.4f32, theme.palette.line));
-        icons::draw(painter, glyph, c, 13.0, theme.palette.text_dim);
+        if matches!(controller_icons, ControllerIconStyle::PlayStation) || button_label.is_empty() {
+            icons::draw(
+                painter,
+                glyph.expect("entries have glyphs"),
+                c,
+                13.0,
+                theme.palette.text_dim,
+            );
+        } else {
+            painter.text(
+                c,
+                Align2::CENTER_CENTER,
+                button_label,
+                FontId::proportional(13.0),
+                theme.palette.text_dim,
+            );
+        }
         let galley = painter.layout_no_wrap(
             label.to_string(),
             FontId::proportional(15.0),

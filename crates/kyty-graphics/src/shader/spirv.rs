@@ -2006,7 +2006,7 @@ pub fn shader_detect_eud_raw_window(code: &ShaderCode, bind: &mut ShaderBindReso
 /// (read-write) descriptors are excluded — `%textures2D_L` is its own 2D
 /// array.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SampledDim {
+pub enum SampledDim {
     Two,
     TwoArray,
     Three,
@@ -2039,6 +2039,115 @@ impl SampledDim {
             Self::TwoArray | Self::Three | Self::Cube => 3,
         }
     }
+
+    /// Canonical ordering of the four sampled Dims — the single source of
+    /// truth for which per-Dim binding a mixed shader's descriptor array
+    /// lands at. `shader_calc_binding_indices` reserves one binding per
+    /// PRESENT Dim starting at `binding_sampled_index`, in this order; the
+    /// SPIR-V generator and the host descriptor path both derive a Dim's
+    /// binding as `binding_sampled_index + <position in the present set>`.
+    pub const fn ordinal(self) -> u32 {
+        match self {
+            Self::Two => 0,
+            Self::TwoArray => 1,
+            Self::Three => 2,
+            Self::Cube => 3,
+        }
+    }
+
+    /// SPIR-V identifier suffix distinguishing one Dim's sampled-image array
+    /// from another's in a MIXED shader (e.g. `%textures2D_S_3D`). A
+    /// homogeneous shader uses no suffix, so its output stays byte-identical
+    /// to the single-array path.
+    pub(crate) const fn mixed_suffix(self) -> &'static str {
+        match self {
+            Self::Two => "_2D",
+            Self::TwoArray => "_2DArray",
+            Self::Three => "_3D",
+            Self::Cube => "_Cube",
+        }
+    }
+
+    /// The Dim of a single measured T# `type_()` (9/8 = 2D, 10 = 3D,
+    /// 11 = Cube, 13 = 2DArray). The shared classifier used by
+    /// `sampled_dims_present`, the per-descriptor sample-site router, and the
+    /// host so all three agree on which array a T# belongs to.
+    pub const fn from_texture_type(ty: u8) -> Self {
+        match ty {
+            10 => Self::Three,
+            11 => Self::Cube,
+            13 => Self::TwoArray,
+            _ => Self::Two,
+        }
+    }
+}
+
+/// The distinct sampled-texture Dims a shader binds, in canonical
+/// [`SampledDim::ordinal`] order. One entry = a homogeneous shader (the
+/// legacy single `%textures2D_S` array); more than one = a MIXED shader that
+/// declares one array per Dim, each at its own binding.
+///
+/// Measured on ASTRO.BOT's fullscreen composite/read pass: the scene HDR 2D
+/// targets and a 3D LUT/froxel volume are sampled by one shader, which the
+/// single-array path refused (`sampled_texture_dim`). Per-Dim arrays let that
+/// pass translate and sample the scene the compute pass wrote.
+pub(crate) fn sampled_dims_present(bind: &ShaderBindResources) -> Vec<SampledDim> {
+    let bound = usize::try_from(bind.textures2d.textures_num)
+        .unwrap_or(0)
+        .min(bind.textures2d.desc.len());
+    let mut dims: Vec<SampledDim> = Vec::new();
+    for d in &bind.textures2d.desc[..bound] {
+        if d.textures2d_without_sampler {
+            continue; // storage — lives in %textures2D_L
+        }
+        let dim = SampledDim::from_texture_type(d.texture.type_());
+        if !dims.contains(&dim) {
+            dims.push(dim);
+        }
+    }
+    dims.sort_by_key(|d| d.ordinal());
+    dims
+}
+
+/// The number of sampled descriptors of a given Dim (the element count of
+/// that Dim's SPIR-V array in a mixed shader). Each Dim array is packed tight
+/// — descriptors are re-indexed per Dim by the host/`prepare_stage_binding`,
+/// so the seeded T# index never exceeds this count (no OOB, no device loss).
+pub(crate) fn sampled_dim_count(bind: &ShaderBindResources, dim: SampledDim) -> u32 {
+    let bound = usize::try_from(bind.textures2d.textures_num)
+        .unwrap_or(0)
+        .min(bind.textures2d.desc.len());
+    bind.textures2d.desc[..bound]
+        .iter()
+        .filter(|d| !d.textures2d_without_sampler)
+        .filter(|d| SampledDim::from_texture_type(d.texture.type_()) == dim)
+        .count() as u32
+}
+
+/// Per-present-Dim SPIR-V layout: `(dim, suffix, element_count, binding)`.
+/// The single source of truth `write_types` / `write_annotations` /
+/// `write_global_variables` all consume, so the type, the descriptor
+/// decoration, and the variable of each Dim's array can never disagree. For a
+/// homogeneous shader this yields exactly one entry with an empty suffix and
+/// `binding == binding_sampled_index`, i.e. the legacy single array unchanged.
+pub(crate) fn sampled_dim_layout(
+    bind: &ShaderBindResources,
+) -> Vec<(SampledDim, &'static str, u32, i32)> {
+    let present = sampled_dims_present(bind);
+    let mixed = present.len() > 1;
+    present
+        .iter()
+        .enumerate()
+        .map(|(i, &d)| {
+            let suffix = if mixed { d.mixed_suffix() } else { "" };
+            (
+                d,
+                suffix,
+                sampled_dim_count(bind, d),
+                bind.textures2d.binding_sampled_index + i as i32,
+            )
+        })
+        .collect()
 }
 
 /// Decide the sampled-texture Dim for a bind set, refusing mixed dims — a
@@ -2763,7 +2872,11 @@ impl<'a> Spirv<'a> {
                 vars.push("%buf".to_string());
             }
             if bind.textures2d.textures2d_sampled_num > 0 {
-                vars.push("%textures2D_S".to_string());
+                // One interface variable per present sampled Dim; a
+                // homogeneous shader yields exactly `%textures2D_S`.
+                for (_, suffix, _, _) in sampled_dim_layout(bind) {
+                    vars.push(format!("%textures2D_S{suffix}"));
+                }
             }
             if bind.textures2d.textures2d_storage_num > 0 {
                 vars.push("%textures2D_L".to_string());
@@ -2951,8 +3064,8 @@ impl<'a> Spirv<'a> {
        OpDecorate %buf Binding <BindingIndex>
 "#;
         const TEXTURES_ANNOTATIONS_S: &str = r#"
-       OpDecorate %textures2D_S DescriptorSet <DescriptorSet>
-       OpDecorate %textures2D_S Binding <BindingIndex>
+       OpDecorate %textures2D_S<S> DescriptorSet <DescriptorSet>
+       OpDecorate %textures2D_S<S> Binding <BindingIndex>
 "#;
         const TEXTURES_ANNOTATIONS_L: &str = r#"
        OpDecorate %textures2D_L DescriptorSet <DescriptorSet>
@@ -2997,12 +3110,16 @@ impl<'a> Spirv<'a> {
                     );
             }
             if bind.textures2d.textures2d_sampled_num > 0 {
-                self.source += &TEXTURES_ANNOTATIONS_S
-                    .replace("<DescriptorSet>", &format!("{}", bind.descriptor_set_slot))
-                    .replace(
-                        "<BindingIndex>",
-                        &format!("{}", bind.textures2d.binding_sampled_index),
-                    );
+                // One SAMPLED_IMAGE descriptor array per present Dim, each at
+                // its own binding (`binding_sampled_index + position`). A
+                // homogeneous shader emits exactly one, unsuffixed, at
+                // `binding_sampled_index` — byte-identical to the old output.
+                for (_, suffix, _, binding) in sampled_dim_layout(bind) {
+                    self.source += &TEXTURES_ANNOTATIONS_S
+                        .replace("<S>", suffix)
+                        .replace("<DescriptorSet>", &format!("{}", bind.descriptor_set_slot))
+                        .replace("<BindingIndex>", &format!("{binding}"));
+                }
             }
             if bind.textures2d.textures2d_storage_num > 0 {
                 self.source += &TEXTURES_ANNOTATIONS_L
@@ -3142,12 +3259,12 @@ impl<'a> Spirv<'a> {
 "#;
 
         const TEXTURES_SAMPLED_TYPES: &str = r#"
-                                             %ImageS = OpTypeImage %float <dim> 0 <arrayed> 0 1 Unknown
-                    %textures2D_S_uint_<buffers_num> = OpConstant %uint <buffers_num>
-                     %_arr_ImageS_uint_<buffers_num> = OpTypeArray %ImageS %textures2D_S_uint_<buffers_num>
-%_ptr_UniformConstant__arr_ImageS_uint_<buffers_num> = OpTypePointer UniformConstant %_arr_ImageS_uint_<buffers_num>
-                        %_ptr_UniformConstant_ImageS = OpTypePointer UniformConstant %ImageS
-                                       %SampledImage = OpTypeSampledImage %ImageS
+                                             %ImageS<S> = OpTypeImage %float <dim> 0 <arrayed> 0 1 Unknown
+                    %textures2D_S<S>_uint_<buffers_num> = OpConstant %uint <buffers_num>
+                     %_arr_ImageS<S>_uint_<buffers_num> = OpTypeArray %ImageS<S> %textures2D_S<S>_uint_<buffers_num>
+%_ptr_UniformConstant__arr_ImageS<S>_uint_<buffers_num> = OpTypePointer UniformConstant %_arr_ImageS<S>_uint_<buffers_num>
+                        %_ptr_UniformConstant_ImageS<S> = OpTypePointer UniformConstant %ImageS<S>
+                                       %SampledImage<S> = OpTypeSampledImage %ImageS<S>
 "#;
 
         // Dim and storage format parametric (round 7 — 3D Rgba16f UAVs
@@ -3207,14 +3324,18 @@ impl<'a> Spirv<'a> {
                 // ASTRO.BOT's 1536x1536x3 array). A mixed binding set has no
                 // single array type — `sampled_texture_dim` refuses it by
                 // name.
-                let dim = sampled_texture_dim(bind)?;
-                self.source += &TEXTURES_SAMPLED_TYPES
-                    .replace(
-                        "<buffers_num>",
-                        &format!("{}", bind.textures2d.textures2d_sampled_num),
-                    )
-                    .replace("<dim>", dim.dim_str())
-                    .replace("<arrayed>", dim.arrayed_str());
+                // One image array type per present Dim. Each array is sized
+                // to that Dim's own descriptor count (`sampled_dim_layout`),
+                // packed tight, so the seeded T# index stays in range. A
+                // homogeneous shader emits one unsuffixed `%ImageS` array of
+                // `textures2d_sampled_num` — identical to the old single path.
+                for (dim, suffix, count, _) in sampled_dim_layout(bind) {
+                    self.source += &TEXTURES_SAMPLED_TYPES
+                        .replace("<S>", suffix)
+                        .replace("<buffers_num>", &format!("{count}"))
+                        .replace("<dim>", dim.dim_str())
+                        .replace("<arrayed>", dim.arrayed_str());
+                }
             }
             if bind.textures2d.textures2d_storage_num > 0 {
                 let (dim, format) = storage_texture_dim_format(bind)?;
@@ -3344,10 +3465,14 @@ impl<'a> Spirv<'a> {
                 ));
             }
             if bind.textures2d.textures2d_sampled_num > 0 {
-                vars.push(format!(
-                    "%textures2D_S = OpVariable %_ptr_UniformConstant__arr_ImageS_uint_{} UniformConstant",
-                    bind.textures2d.textures2d_sampled_num
-                ));
+                // One array variable per present Dim, each pointing at its own
+                // per-Dim-sized array type. Homogeneous => one unsuffixed
+                // `%textures2D_S` of `textures2d_sampled_num` — unchanged.
+                for (_, suffix, count, _) in sampled_dim_layout(bind) {
+                    vars.push(format!(
+                        "%textures2D_S{suffix} = OpVariable %_ptr_UniformConstant__arr_ImageS{suffix}_uint_{count} UniformConstant"
+                    ));
+                }
             }
             if bind.textures2d.textures2d_storage_num > 0 {
                 vars.push(format!(
