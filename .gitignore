@@ -31,6 +31,10 @@ shader_cache/
 # User configuration (generated at runtime)
 config.toml
 
+# Per-game settings overrides (generated at runtime by the Shell's Game Options
+# overlay; machine-local, keyed by title id — never commit)
+per_game/
+
 # Game data (user-provided) — proprietary titles the user owns; NEVER commit
 # (clean-room boundary). Both cases listed explicitly: the canonical path is
 # `Games/<name>/eboot.bin` (CLAUDE.md), and a bare `games/` matched only by

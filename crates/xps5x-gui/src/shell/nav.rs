@@ -46,6 +46,11 @@ pub enum NavInput {
     /// Switch the Home rail between Games and Media (keyboard `Tab`,
     /// gamepad L1/R1 — spec §10 SM2).
     Tab,
+    /// Options/Triangle (keyboard `O`, gamepad North): on a focused game tile,
+    /// opens that title's per-game settings overlay. Inspired by SharpEmu's
+    /// per-game settings dialog, but reachable straight from the tile you are
+    /// looking at rather than a right-click menu.
+    Options,
 }
 
 /// A side effect the caller must perform in response to a [`NavInput`].
@@ -86,6 +91,24 @@ pub enum NavAction {
     },
     /// The Home rail's active tab changed.
     SwitchTab(RailTab),
+    /// Options was pressed on the game at this Games-rail index — open its
+    /// per-game settings overlay.
+    OpenGameOptions {
+        index: usize,
+    },
+    /// The Game Options overlay was left via Back — the caller should persist
+    /// the edited overrides.
+    CloseGameOptions,
+    /// The focused Game Options row's value should step by `delta` (`-1`/`1`).
+    AdjustGameOption {
+        row: usize,
+        delta: i32,
+    },
+    /// The focused Game Options row was confirmed — toggle its override on/off
+    /// (or, on the Reset row, clear every override).
+    ActivateGameOption {
+        row: usize,
+    },
 }
 
 /// Which Home rail tab is active (spec §10 SM2: Games shows the library,
@@ -130,6 +153,9 @@ pub enum NavMode {
     ControlCenterOption,
     /// Full-screen Settings surface (spec §10 SM2).
     Settings,
+    /// Per-game settings overlay for the focused title (opened with Options
+    /// from Home). Home still renders underneath; only input routing differs.
+    GameOptions,
 }
 
 /// The Shell's full navigation state: which surface is active, and the
@@ -170,6 +196,11 @@ pub struct NavState {
     /// Number of rows in each Settings section, in display order.
     /// `settings_row_counts.len()` is the section count.
     settings_row_counts: Vec<usize>,
+
+    /// Focused row within the per-game Game Options overlay.
+    pub game_options_row: usize,
+    /// Number of rows the Game Options overlay exposes.
+    game_options_row_count: usize,
 }
 
 impl NavState {
@@ -204,6 +235,8 @@ impl NavState {
             settings_section: 0,
             settings_row: 0,
             settings_row_counts: Vec::new(),
+            game_options_row: 0,
+            game_options_row_count: 0,
         }
     }
 
@@ -237,6 +270,26 @@ impl NavState {
         self
     }
 
+    /// Builder: how many rows the per-game Game Options overlay exposes.
+    pub fn with_game_options(mut self, row_count: usize) -> Self {
+        self.game_options_row_count = row_count;
+        self
+    }
+
+    /// Whether the Games-rail tile at `index` is one of the built-in app tiles
+    /// (Store / Library / Settings) rather than a launchable game. Used to gate
+    /// Options: only real games have per-game settings.
+    fn is_app_tile(&self, index: usize) -> bool {
+        [
+            self.store_tile_index,
+            self.library_tile_index,
+            self.settings_tile_index,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|tile| tile == index)
+    }
+
     /// Replace the Settings section/row-count table — e.g. after adding or
     /// removing a game folder changes the Game Folders section's row count
     /// — clamping the current section/row focus back into range.
@@ -266,6 +319,7 @@ impl NavState {
             NavMode::ControlCenter => self.apply_control_center(input),
             NavMode::ControlCenterOption => self.apply_control_center_option(input),
             NavMode::Settings => self.apply_settings(input),
+            NavMode::GameOptions => self.apply_game_options(input),
         }
     }
 
@@ -336,6 +390,22 @@ impl NavState {
                 self.set_tab(self.tab.toggled());
                 NavAction::SwitchTab(self.tab)
             }
+            NavInput::Options => {
+                // Per-game settings only apply to real games, and only the
+                // Games rail carries them.
+                if self.tab == RailTab::Games
+                    && self.rail_len > 0
+                    && !self.is_app_tile(self.rail_index)
+                {
+                    self.mode = NavMode::GameOptions;
+                    self.game_options_row = 0;
+                    NavAction::OpenGameOptions {
+                        index: self.rail_index,
+                    }
+                } else {
+                    NavAction::None
+                }
+            }
         }
     }
 
@@ -385,6 +455,7 @@ impl NavState {
                 self.set_tab(self.tab.toggled());
                 NavAction::SwitchTab(self.tab)
             }
+            NavInput::Options => NavAction::None,
         }
     }
 
@@ -413,7 +484,7 @@ impl NavState {
                 }
                 NavAction::None
             }
-            NavInput::Up | NavInput::Down | NavInput::Tab => NavAction::None,
+            NavInput::Up | NavInput::Down | NavInput::Tab | NavInput::Options => NavAction::None,
             NavInput::Confirm => {
                 if self.focused_option_count() > 0 {
                     self.mode = NavMode::ControlCenterOption;
@@ -441,7 +512,7 @@ impl NavState {
                 }
                 NavAction::None
             }
-            NavInput::Up | NavInput::Down | NavInput::Tab => NavAction::None,
+            NavInput::Up | NavInput::Down | NavInput::Tab | NavInput::Options => NavAction::None,
             NavInput::Confirm => {
                 let action = NavAction::ActivateOption {
                     card: self.cc_index,
@@ -510,7 +581,42 @@ impl NavState {
                 self.mode = NavMode::Home;
                 NavAction::CloseSettings
             }
-            NavInput::Guide | NavInput::Tab => NavAction::None,
+            NavInput::Guide | NavInput::Tab | NavInput::Options => NavAction::None,
+        }
+    }
+
+    /// Navigate the per-game Game Options overlay: Up/Down move the focused row,
+    /// Left/Right adjust its value, Confirm toggles the override, Back closes
+    /// and persists.
+    fn apply_game_options(&mut self, input: NavInput) -> NavAction {
+        let count = self.game_options_row_count;
+        match input {
+            NavInput::Up => {
+                self.game_options_row = self.game_options_row.saturating_sub(1);
+                NavAction::None
+            }
+            NavInput::Down => {
+                if count > 0 {
+                    self.game_options_row = (self.game_options_row + 1).min(count - 1);
+                }
+                NavAction::None
+            }
+            NavInput::Left => NavAction::AdjustGameOption {
+                row: self.game_options_row,
+                delta: -1,
+            },
+            NavInput::Right => NavAction::AdjustGameOption {
+                row: self.game_options_row,
+                delta: 1,
+            },
+            NavInput::Confirm => NavAction::ActivateGameOption {
+                row: self.game_options_row,
+            },
+            NavInput::Back => {
+                self.mode = NavMode::Home;
+                NavAction::CloseGameOptions
+            }
+            NavInput::Guide | NavInput::Tab | NavInput::Options => NavAction::None,
         }
     }
 }
@@ -1197,6 +1303,76 @@ mod tests {
         nav.apply(NavInput::Tab); // -> Media
         nav.rail_index = 1;
         assert_eq!(nav.apply(NavInput::Confirm), NavAction::LaunchMedia(1));
+        assert_eq!(nav.mode, NavMode::Home);
+    }
+
+    #[test]
+    fn options_on_a_game_tile_opens_game_options() {
+        // Games rail of 5; index 0 is the Store app tile, so index 2 is a game.
+        let mut nav = NavState::with_cc_options(5, 11, vec![0; 11])
+            .with_app_tiles(Some(0), Some(1))
+            .with_settings(Some(4), vec![9])
+            .with_game_options(5);
+        nav.rail_index = 2;
+        assert_eq!(
+            nav.apply(NavInput::Options),
+            NavAction::OpenGameOptions { index: 2 }
+        );
+        assert_eq!(nav.mode, NavMode::GameOptions);
+        assert_eq!(nav.game_options_row, 0);
+    }
+
+    #[test]
+    fn options_on_an_app_tile_is_a_no_op() {
+        let mut nav = NavState::with_cc_options(5, 11, vec![0; 11])
+            .with_app_tiles(Some(0), Some(1))
+            .with_settings(Some(4), vec![9])
+            .with_game_options(5);
+        // Focus the Store app tile (index 0) — it has no per-game settings.
+        nav.rail_index = 0;
+        assert_eq!(nav.apply(NavInput::Options), NavAction::None);
+        assert_eq!(nav.mode, NavMode::Home);
+    }
+
+    #[test]
+    fn options_on_media_tab_is_a_no_op() {
+        let mut nav = NavState::with_cc_options(5, 11, vec![0; 11])
+            .with_media_rail_len(3)
+            .with_game_options(5);
+        nav.apply(NavInput::Tab); // -> Media
+        assert_eq!(nav.apply(NavInput::Options), NavAction::None);
+        assert_eq!(nav.mode, NavMode::Home);
+    }
+
+    #[test]
+    fn game_options_navigation_and_adjust() {
+        let mut nav = NavState::with_cc_options(5, 11, vec![0; 11])
+            .with_settings(Some(4), vec![9])
+            .with_game_options(5);
+        nav.rail_index = 2;
+        nav.apply(NavInput::Options);
+        // Down moves the focused row; clamps at the last row.
+        assert_eq!(nav.apply(NavInput::Down), NavAction::None);
+        assert_eq!(nav.game_options_row, 1);
+        // Right/Left/Confirm surface adjust/activate actions for the caller.
+        assert_eq!(
+            nav.apply(NavInput::Right),
+            NavAction::AdjustGameOption { row: 1, delta: 1 }
+        );
+        assert_eq!(
+            nav.apply(NavInput::Confirm),
+            NavAction::ActivateGameOption { row: 1 }
+        );
+    }
+
+    #[test]
+    fn game_options_back_closes_and_signals_persist() {
+        let mut nav = NavState::with_cc_options(5, 11, vec![0; 11])
+            .with_settings(Some(4), vec![9])
+            .with_game_options(5);
+        nav.rail_index = 2;
+        nav.apply(NavInput::Options);
+        assert_eq!(nav.apply(NavInput::Back), NavAction::CloseGameOptions);
         assert_eq!(nav.mode, NavMode::Home);
     }
 }

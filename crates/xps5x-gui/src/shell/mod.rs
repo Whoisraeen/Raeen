@@ -13,6 +13,7 @@ pub mod home;
 pub mod icons;
 pub mod media;
 pub mod nav;
+pub mod per_game;
 pub(crate) mod present;
 pub mod settings;
 
@@ -50,6 +51,44 @@ struct ActiveSession {
 
 /// Cap on the Switcher's recent-titles history (spec §10).
 const MAX_RECENT_TITLES: usize = 6;
+
+/// Seconds the PS/Guide button must be held during a session to quit back to
+/// the Shell. A hold (not a tap) so the button still reaches the guest for its
+/// normal in-game use; only a deliberate press-and-hold exits.
+const SESSION_QUIT_HOLD_SECS: f32 = 0.9;
+
+/// Tracks a press-and-hold on the in-session quit button, firing once when the
+/// hold crosses [`SESSION_QUIT_HOLD_SECS`]. Our pad-driven answer to SharpEmu's
+/// "controller B/O closes the game" (PR #415): where SharpEmu forwards a face
+/// button, we use a PS-button hold so a stray press never yanks the player out
+/// mid-game, and the overlay shows the hold filling before it commits.
+#[derive(Debug, Default)]
+struct QuitHold {
+    held_for: f32,
+}
+
+impl QuitHold {
+    /// Advance by `dt` seconds given whether the quit button is held this frame.
+    /// Returns `true` exactly on the frame the hold crosses the threshold.
+    fn update(&mut self, held: bool, dt: f32) -> bool {
+        if !held {
+            self.held_for = 0.0;
+            return false;
+        }
+        let was = self.held_for;
+        self.held_for += dt;
+        was < SESSION_QUIT_HOLD_SECS && self.held_for >= SESSION_QUIT_HOLD_SECS
+    }
+
+    /// Fraction of the hold completed, `0.0..=1.0` — drives the overlay's fill.
+    fn progress(&self) -> f32 {
+        (self.held_for / SESSION_QUIT_HOLD_SECS).clamp(0.0, 1.0)
+    }
+
+    fn reset(&mut self) {
+        self.held_for = 0.0;
+    }
+}
 
 /// The full Shell: navigation, animation, library, and the launcher seam.
 pub struct Shell {
@@ -102,6 +141,14 @@ pub struct Shell {
     /// state so it can remain a pure, egui-free state machine.
     settings_new_folder_input: String,
     settings_key_provider_input: String,
+
+    /// The per-game overrides currently being edited in the Game Options
+    /// overlay, and the library id they belong to. Loaded from disk when the
+    /// overlay opens and persisted when it closes (see [`per_game`]).
+    game_options_draft: per_game::PerGameSettings,
+    game_options_target_id: Option<String>,
+    /// Press-and-hold state for the in-session pad quit (SharpEmu PR #415).
+    session_quit_hold: QuitHold,
 
     /// Auto-updater state machine (Settings → System). Worker threads
     /// (check/download) report back over the mpsc channel; `update()` pumps
@@ -162,7 +209,8 @@ impl Shell {
         let nav = NavState::with_cc_options(rail_len, cc_len, cc_option_counts)
             .with_settings(settings_tile_index, settings_row_counts)
             .with_media_rail_len(library_media.len())
-            .with_app_tiles(store_tile_index, library_tile_index);
+            .with_app_tiles(store_tile_index, library_tile_index)
+            .with_game_options(per_game::ROW_COUNT);
 
         let gilrs = gilrs::Gilrs::new().ok();
         if gilrs.is_none() {
@@ -209,6 +257,9 @@ impl Shell {
             hero_bg_to,
             settings_new_folder_input: String::new(),
             settings_key_provider_input,
+            game_options_draft: per_game::PerGameSettings::default(),
+            game_options_target_id: None,
+            session_quit_hold: QuitHold::default(),
             updater_state: UpdaterState::default(),
             updater_tx,
             updater_rx,
@@ -246,6 +297,7 @@ impl Shell {
         self.pump_updater_events(ctx);
         self.poll_session();
         self.push_pad_state();
+        self.tick_session_quit(ctx);
         self.tick_animations(ctx);
         self.draw(ctx);
     }
@@ -320,6 +372,14 @@ impl Shell {
                 }
                 NavAction::OpenSettings => self.enter_settings(),
                 NavAction::CloseSettings => self.leave_settings(),
+                NavAction::OpenGameOptions { index } => self.open_game_options(index),
+                NavAction::CloseGameOptions => self.close_game_options(),
+                NavAction::AdjustGameOption { row, delta } => {
+                    self.game_options_draft.adjust(row, delta, &self.config)
+                }
+                NavAction::ActivateGameOption { row } => {
+                    self.game_options_draft.toggle_override(row, &self.config)
+                }
                 NavAction::AdjustSetting {
                     section,
                     row,
@@ -367,6 +427,33 @@ impl Shell {
             // error surface).
             tracing::warn!(error = %err, path = %self.config_path.display(), "failed to save settings");
         }
+    }
+
+    /// Directory this Shell's per-game override files live in
+    /// (`<config_dir>/per_game`).
+    fn per_game_dir(&self) -> PathBuf {
+        per_game::PerGameSettings::store_dir(&self.config_path)
+    }
+
+    /// Open the Game Options overlay for the Games-rail item at `index`,
+    /// loading its persisted overrides into the editable draft.
+    fn open_game_options(&mut self, index: usize) {
+        let Some(item) = self.library.get(index) else {
+            self.nav.mode = nav::NavMode::Home;
+            return;
+        };
+        let id = item.id.clone();
+        self.game_options_draft = per_game::PerGameSettings::load(&self.per_game_dir(), &id);
+        self.game_options_target_id = Some(id);
+    }
+
+    /// Persist the edited per-game overrides (an all-inherit draft deletes the
+    /// file — see [`per_game::PerGameSettings::save`]).
+    fn close_game_options(&mut self) {
+        if let Some(id) = self.game_options_target_id.take() {
+            self.game_options_draft.save(&self.per_game_dir(), &id);
+        }
+        self.game_options_draft = per_game::PerGameSettings::default();
     }
 
     /// Step the config field addressed by `(section, row)` — see
@@ -650,6 +737,9 @@ impl Shell {
                 if i.key_pressed(Key::Tab) {
                     inputs.push(NavInput::Tab);
                 }
+                if i.key_pressed(Key::O) {
+                    inputs.push(NavInput::Options);
+                }
                 if i.pointer.secondary_clicked() {
                     inputs.push(NavInput::Back);
                 }
@@ -697,6 +787,12 @@ impl Shell {
                     gilrs::EventType::ButtonPressed(gilrs::Button::Mode, _) => {
                         inputs.push(NavInput::Guide)
                     }
+                    // Triangle/North (the "Options" affordance on the Home
+                    // button-hint bar) opens the focused game's per-game
+                    // settings overlay.
+                    gilrs::EventType::ButtonPressed(gilrs::Button::North, _) => {
+                        inputs.push(NavInput::Options)
+                    }
                     // Shoulder buttons (L1/R1) both toggle the two-item
                     // Games/Media tab (spec §10 SM2: "L1/R1 if easy").
                     gilrs::EventType::ButtonPressed(gilrs::Button::LeftTrigger, _) => {
@@ -742,10 +838,60 @@ impl Shell {
         kernel.set_pad_state(state.to_orbis_pad_data());
     }
 
+    /// While a title runs, hold the PS/Guide button to quit back to the Shell
+    /// (SharpEmu PR #415, pad-driven). No-op outside a session. `push_pad_state`
+    /// has already drained gilrs this frame, so the cached button state is
+    /// current; the button is still forwarded to the guest meanwhile, so this
+    /// never steals a normal in-game press.
+    fn tick_session_quit(&mut self, ctx: &egui::Context) {
+        if self.session.is_none() {
+            self.session_quit_hold.reset();
+            return;
+        }
+        let held = self
+            .gilrs
+            .as_ref()
+            .and_then(|g| g.gamepads().next())
+            .is_some_and(|(_, gamepad)| gamepad.is_pressed(gilrs::Button::Mode));
+        let dt = ctx.input(|i| i.stable_dt).min(0.1);
+        if self.session_quit_hold.update(held, dt) {
+            if let Some(session) = &self.session {
+                tracing::info!(title = %session.title, "PS-button hold — quitting to Shell");
+                let _ = self.launcher.quit(&session.handle);
+            }
+            self.session_quit_hold.reset();
+        }
+        // Keep repainting while the hold fills so the overlay ring animates
+        // without needing another input event.
+        if held {
+            ctx.request_repaint();
+        }
+    }
+
     fn begin_launch(&mut self, index: usize) {
         let Some(item) = self.library.get(index) else {
             return;
         };
+
+        // Apply this title's per-game overrides on top of the global config,
+        // then push the effective graphics/logging settings into the same
+        // process-wide sinks the Shell uses for global settings. A title with
+        // no overrides yields the global config unchanged — which also cleanly
+        // resets any previous title's overrides back to baseline.
+        let effective =
+            per_game::PerGameSettings::load(&self.per_game_dir(), &item.id).effective(&self.config);
+        xps5x_gpu::AgcGpuSession::set_runtime_config(
+            effective.graphics.validation_layers,
+            effective.graphics.resolution_scale,
+            effective.graphics.gpu_device_index,
+        );
+        xps5x_core::logging::set_level(if effective.debug.logging {
+            effective.debug.log_level.as_str()
+        } else {
+            "off"
+        });
+
+        self.session_quit_hold.reset();
         match self.launcher.launch(&item.launch) {
             Ok(handle) => {
                 push_recent(&mut self.recent, &item.id, MAX_RECENT_TITLES);
@@ -775,6 +921,7 @@ impl Shell {
         if self.launcher.session_state(&session.handle) == SessionState::Exited {
             self.nav.rail_index = session.target_index;
             self.session = None;
+            self.session_quit_hold.reset();
             // Drop the last frame with the session, or the next launch opens on
             // the previous title's final image before it renders anything.
             self.frame_view.clear();
@@ -850,6 +997,7 @@ impl Shell {
         let frame = egui::Frame::NONE.fill(theme.palette.ground);
         let mut clicked_home_tile = None;
         let mut clicked_setting = None;
+        let mut clicked_game_option = None;
 
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             if let Some(session) = &self.session {
@@ -859,6 +1007,25 @@ impl Shell {
                     session,
                     self.launcher.as_ref(),
                     &mut self.frame_view,
+                    self.session_quit_hold.progress(),
+                );
+                return;
+            }
+
+            if self.nav.mode == NavMode::GameOptions {
+                let title = self
+                    .game_options_target_id
+                    .as_ref()
+                    .and_then(|id| self.library.iter().find(|item| &item.id == id))
+                    .map(|item| item.title.clone())
+                    .unwrap_or_default();
+                clicked_game_option = per_game::draw(
+                    ui,
+                    &theme,
+                    &self.nav,
+                    &self.config,
+                    &self.game_options_draft,
+                    &title,
                 );
                 return;
             }
@@ -925,6 +1092,12 @@ impl Shell {
                     }
                 }
             }
+        }
+        if let Some(per_game::GameOptionsClick::Row(row)) = clicked_game_option {
+            // Clicking a row focuses it and toggles its override, matching a
+            // Confirm — the same reach the pad has.
+            self.nav.game_options_row = row;
+            self.game_options_draft.toggle_override(row, &self.config);
         }
     }
 
@@ -999,12 +1172,44 @@ fn read_pad(gamepad: &gilrs::Gamepad, deadzone: f32) -> xps5x_input::ControllerS
 /// back to its mesh-gradient hero in that case (spec §6).
 fn background_texture_for(ctx: &egui::Context, theme: &Theme) -> Option<egui::TextureHandle> {
     theme.assets.background.as_ref().map(|image| {
+        let fitted = fit_texture_source((**image).clone(), ctx.input(|i| i.max_texture_side));
         ctx.load_texture(
             "xps5x-theme-background",
-            (**image).clone(),
+            fitted,
             egui::TextureOptions::LINEAR,
         )
     })
+}
+
+/// Downscale `image` (nearest-neighbour, aspect-preserving) so neither side
+/// exceeds `max_side` — the running renderer's maximum texture dimension.
+///
+/// Titles legitimately ship 4K key art (`sce_sys/pic1.png`), and the image
+/// loader's decode cap ([`theme::loader`]'s `MAX_IMAGE_DIM`) allows up to 4096
+/// px, but an iGPU's egui/wgpu renderer can cap the texture side far lower
+/// (e.g. 2048). Uploading art larger than that side used to panic egui and take
+/// the whole Shell down on boot; here oversized art is shrunk to fit instead —
+/// still shown, never a crash and never silently dropped.
+fn fit_texture_source(image: egui::ColorImage, max_side: usize) -> egui::ColorImage {
+    let [w, h] = image.size;
+    if max_side == 0 || (w <= max_side && h <= max_side) {
+        return image;
+    }
+    let scale = max_side as f32 / w.max(h) as f32;
+    let nw = ((w as f32 * scale).floor() as usize).clamp(1, max_side);
+    let nh = ((h as f32 * scale).floor() as usize).clamp(1, max_side);
+    let mut pixels = Vec::with_capacity(nw * nh);
+    for y in 0..nh {
+        let sy = (y * h / nh).min(h - 1);
+        for x in 0..nw {
+            let sx = (x * w / nw).min(w - 1);
+            pixels.push(image.pixels[sy * w + sx]);
+        }
+    }
+    egui::ColorImage {
+        size: [nw, nh],
+        pixels,
+    }
 }
 
 /// Decode + upload every scanned game's user-supplied cover image, keyed by
@@ -1025,9 +1230,10 @@ fn cover_textures_for(
             tracing::warn!(path = %path.display(), title = %item.title, "cover image failed to load — using gradient art");
             continue;
         };
+        let fitted = fit_texture_source(image, ctx.input(|i| i.max_texture_side));
         let texture = ctx.load_texture(
             format!("xps5x-cover-{}", item.id),
-            image,
+            fitted,
             egui::TextureOptions::LINEAR,
         );
         textures.insert(item.id.clone(), texture);
@@ -1056,9 +1262,10 @@ fn background_textures_for(
             tracing::warn!(path = %bg_path.display(), title = %item.title, "background image failed to load — using gradient hero");
             continue;
         };
+        let fitted = fit_texture_source(image, ctx.input(|i| i.max_texture_side));
         let texture = ctx.load_texture(
             format!("xps5x-bg-{}", item.id),
-            image,
+            fitted,
             egui::TextureOptions::LINEAR,
         );
         textures.insert(item.id.clone(), texture);
@@ -1072,6 +1279,7 @@ fn draw_session_overlay(
     session: &ActiveSession,
     launcher: &dyn GameLauncher,
     frame_view: &mut present::GameFrameView,
+    quit_progress: f32,
 ) {
     let screen = ui.max_rect();
     ui.painter().rect_filled(screen, 0.0, theme.palette.ground);
@@ -1093,7 +1301,7 @@ fn draw_session_overlay(
         ),
         SessionState::Running => (
             session.title.clone(),
-            detail.unwrap_or_else(|| "Running — Esc to return to the Shell".to_string()),
+            detail.unwrap_or_else(|| "Running — Esc or hold PS to return to the Shell".to_string()),
         ),
         SessionState::Faulted => (
             session.title.clone(),
@@ -1111,7 +1319,7 @@ fn draw_session_overlay(
             painter.text(
                 egui::pos2(rect.left() + 12.0, rect.top() + 10.0),
                 egui::Align2::LEFT_TOP,
-                format!("{} — Esc to return to the Shell", session.title),
+                format!("{} — Esc or hold PS to return to the Shell", session.title),
                 egui::FontId::proportional(13.0),
                 theme.palette.text_dim,
             );
@@ -1135,6 +1343,34 @@ fn draw_session_overlay(
         }
     }
 
+    // While the PS-button quit hold is filling, show a bottom-centered progress
+    // bar so the player sees the exit committing before it fires (SharpEmu #415).
+    if quit_progress > 0.0 {
+        let painter = ui.painter();
+        let bar_w = 240.0;
+        let bar_h = 6.0;
+        let bar_x = screen.center().x - bar_w / 2.0;
+        let bar_y = screen.bottom() - 64.0;
+        let track = egui::Rect::from_min_size(egui::pos2(bar_x, bar_y), egui::vec2(bar_w, bar_h));
+        painter.rect_filled(
+            track,
+            3.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
+        );
+        let fill = egui::Rect::from_min_size(
+            track.min,
+            egui::vec2(bar_w * quit_progress.clamp(0.0, 1.0), bar_h),
+        );
+        painter.rect_filled(fill, 3.0, theme.palette.focus);
+        painter.text(
+            egui::pos2(screen.center().x, bar_y - 14.0),
+            egui::Align2::CENTER_BOTTOM,
+            "Release to cancel — keep holding PS to quit",
+            egui::FontId::proportional(13.0),
+            theme.palette.text,
+        );
+    }
+
     ui.ctx().request_repaint();
 }
 
@@ -1148,6 +1384,57 @@ mod tests {
         push_recent(&mut recent, "a", 6);
         push_recent(&mut recent, "b", 6);
         assert_eq!(recent, vec!["b".to_string(), "a".to_string()]);
+    }
+
+    #[test]
+    fn quit_hold_fires_once_when_the_hold_crosses_the_threshold() {
+        let mut hold = QuitHold::default();
+        // A tap (well under the threshold) never fires and leaves no progress.
+        assert!(!hold.update(true, 0.1));
+        assert!(hold.progress() > 0.0 && hold.progress() < 1.0);
+        // Releasing resets the hold.
+        assert!(!hold.update(false, 0.1));
+        assert_eq!(hold.progress(), 0.0);
+        // A sustained hold fires exactly once as it crosses the threshold…
+        assert!(!hold.update(true, SESSION_QUIT_HOLD_SECS - 0.05));
+        assert!(hold.update(true, 0.1));
+        // …and not again on subsequent held frames (edge-triggered).
+        assert!(!hold.update(true, 0.1));
+    }
+
+    #[test]
+    fn quit_hold_progress_is_clamped_and_resettable() {
+        let mut hold = QuitHold::default();
+        hold.update(true, SESSION_QUIT_HOLD_SECS * 4.0);
+        assert_eq!(hold.progress(), 1.0);
+        hold.reset();
+        assert_eq!(hold.progress(), 0.0);
+    }
+
+    #[test]
+    fn fit_texture_source_downscales_oversized_art_preserving_aspect() {
+        // A 3840x2160 key art on a renderer capped at 2048 must shrink to fit
+        // (this is the exact case that used to panic egui on boot).
+        let big = egui::ColorImage {
+            size: [3840, 2160],
+            pixels: vec![egui::Color32::RED; 3840 * 2160],
+        };
+        let fitted = fit_texture_source(big, 2048);
+        assert!(fitted.size[0] <= 2048 && fitted.size[1] <= 2048);
+        // Longer side maps to the cap; aspect roughly preserved (16:9).
+        assert_eq!(fitted.size[0], 2048);
+        assert_eq!(fitted.size[1], 1152);
+        assert_eq!(fitted.pixels.len(), fitted.size[0] * fitted.size[1]);
+    }
+
+    #[test]
+    fn fit_texture_source_leaves_in_bounds_art_untouched() {
+        let small = egui::ColorImage {
+            size: [512, 512],
+            pixels: vec![egui::Color32::BLUE; 512 * 512],
+        };
+        let fitted = fit_texture_source(small, 2048);
+        assert_eq!(fitted.size, [512, 512]);
     }
 
     #[test]
