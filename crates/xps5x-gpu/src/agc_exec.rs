@@ -530,10 +530,15 @@ impl AgcGpuSession {
         *self.scanout_address.lock() = Some(address);
         *self.scanout_descriptor.lock() = descriptor;
         // Watch this flipped display buffer so a later DMA copy or compute
-        // writeback into it is reported by the scene→scanout fill trace (task
-        // #5). Registered on every flip; from the second frame on, any write
-        // that fills the buffer the title flips to is named with its mechanism.
-        crate::guest_mem::register_scanout_watch(address);
+        // writeback into its frame region is reported by the scene→scanout fill
+        // trace (task #5). The span is the descriptor's frame byte size so an
+        // unrelated sub-allocation sitting past the frame is not mis-blamed
+        // (measured: an 88 MiB-offset compute write near a 33 MiB 4K frame).
+        // Assume ≤8 B/px (covers RGBA16F); a smaller true format only overshoots.
+        let watch_span = descriptor
+            .map(|d| u64::from(d.pitch_pixels.max(d.width)) * u64::from(d.height) * 8)
+            .unwrap_or(0);
+        crate::guest_mem::register_scanout_watch(address, watch_span);
         // Synchronous by design (item 4 status): the flip waits for its flush
         // (~1-7.5 ms measured — one fence + at most one target readback). The
         // fire-and-forget variant (`wait: false`) was tried and REVERTED: on
@@ -1808,11 +1813,7 @@ fn to_presentable(image: RenderedImage) -> RenderedImage {
         return image;
     }
     let mut pixels = vec![0u8; px_count * 4];
-    for (texel, out) in image
-        .pixels
-        .chunks_exact(8)
-        .zip(pixels.chunks_exact_mut(4))
-    {
+    for (texel, out) in image.pixels.chunks_exact(8).zip(pixels.chunks_exact_mut(4)) {
         let r = half_to_f32(u16::from_le_bytes([texel[0], texel[1]]));
         let g = half_to_f32(u16::from_le_bytes([texel[2], texel[3]]));
         let b = half_to_f32(u16::from_le_bytes([texel[4], texel[5]]));
@@ -2015,7 +2016,10 @@ mod tests {
         // Linear 0.5 sRGB-encodes to ~0.7354 -> 188, NOT the numeric 128 a raw
         // copy would give (the whole point of the encode).
         assert_eq!(out.pixels[1], 188, "linear 0.5 -> sRGB 188");
-        assert!(out.pixels[1] > 128, "sRGB lifts mid-grey above the linear byte");
+        assert!(
+            out.pixels[1] > 128,
+            "sRGB lifts mid-grey above the linear byte"
+        );
         assert_eq!(out.pixels[2], 0, "linear 0.0 -> 0");
         assert_eq!(out.pixels[3], 255, "alpha stays linear");
     }

@@ -190,23 +190,30 @@ pub(crate) fn read_dwords_validated(addr: u64, count: u32) -> Option<Vec<u32>> {
 /// storage writeback (`draw_translate`) — report when a write actually lands in
 /// a flipped display buffer, which is the only way that buffer gets filled
 /// short of a GPU render pass we already track. Gated on `XPS5X_TRACE_SCANOUT_FILL`.
-static SCANOUT_WATCH: Mutex<Vec<u64>> = Mutex::new(Vec::new());
-/// Assumed maximum bytes a single scanout buffer spans (4K RGBA10/float ≈ 66
-/// MiB; round up). A write whose start falls within `[base, base + this)` of a
-/// watched buffer is reported as filling it.
-const SCANOUT_WATCH_SPAN: u64 = 128 << 20;
+static SCANOUT_WATCH: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+/// Fallback span when a flip carries no descriptor (unknown frame size): a 4K
+/// RGBA/10-bit frame is ~33 MiB, a 4K RGBA16F frame ~66 MiB.
+const SCANOUT_WATCH_DEFAULT_SPAN: u64 = 64 << 20;
 
-/// Register a flipped display-buffer base so later guest writes into it are
-/// reported by [`trace_scanout_fill`]. Idempotent; cheap no-op unless the trace
-/// env var is set (the caller still records for a later toggle within a run).
-pub(crate) fn register_scanout_watch(addr: u64) {
+/// Register a flipped display-buffer `[base, base + byte_len)` so later guest
+/// writes into exactly that frame region are reported by [`trace_scanout_fill`]
+/// — a precise span (from the flip descriptor) keeps the trace from blaming an
+/// unrelated sub-allocation that merely sits nearby. Idempotent per base.
+pub(crate) fn register_scanout_watch(addr: u64, byte_len: u64) {
     if addr == 0 {
         return;
     }
-    if let Ok(mut watch) = SCANOUT_WATCH.lock()
-        && !watch.contains(&addr)
-    {
-        watch.push(addr);
+    let span = if byte_len == 0 {
+        SCANOUT_WATCH_DEFAULT_SPAN
+    } else {
+        byte_len
+    };
+    if let Ok(mut watch) = SCANOUT_WATCH.lock() {
+        if let Some(entry) = watch.iter_mut().find(|(base, _)| *base == addr) {
+            entry.1 = entry.1.max(span);
+        } else {
+            watch.push((addr, span));
+        }
     }
 }
 
@@ -221,16 +228,12 @@ pub(crate) fn trace_scanout_fill(addr: u64, len: usize, source: &str) {
     if std::env::var_os("XPS5X_TRACE_SCANOUT_FILL").is_none() {
         return;
     }
-    let hit = SCANOUT_WATCH
-        .lock()
-        .ok()
-        .map(|watch| {
-            watch
-                .iter()
-                .find(|&&base| addr >= base && addr < base.saturating_add(SCANOUT_WATCH_SPAN))
-                .copied()
-        })
-        .unwrap_or(None);
+    let hit = SCANOUT_WATCH.lock().ok().and_then(|watch| {
+        watch
+            .iter()
+            .find(|&&(base, span)| addr >= base && addr < base.saturating_add(span))
+            .map(|&(base, _)| base)
+    });
     let Some(base) = hit else {
         return;
     };

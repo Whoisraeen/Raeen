@@ -591,6 +591,12 @@ fn texture_vk_format(
         // SharpEmu Gfx10UnifiedFormat maps unified 7 -> (dataFormat 2 = 16,
         // numFormat 0 = UNORM).
         7 => Ok((vk::Format::R16_UNORM, 2)),
+        // 14 -> (3,0) = 8_8 UNORM (measured: ASTRO.BOT samples a 1920x1080
+        // format-14 texture, tile mode 27 — 64 draws/run failed on it). SharpEmu
+        // Gfx10UnifiedFormat.cs:40 maps unified 14 -> (dataFormat 3 = 8_8,
+        // numFormat 0 = UNORM) per the standard GCN table (df1=8, df2=16,
+        // df3=8_8), so R8G8_UNORM at 2 B/texel.
+        14 => Ok((vk::Format::R8G8_UNORM, 2)),
         // 36 = 10_11_11 FLOAT (packed 32-bit HDR) — the title samples its HDR
         // render target as a texture. SharpEmu Gfx10UnifiedFormat maps unified
         // 36 -> (dataFormat 6 = 10_11_11, numFormat 7 = FLOAT).
@@ -943,14 +949,23 @@ fn decode_texture(
                     if let Some(upload) = single_hit {
                         return Ok(upload);
                     }
-                    let single = read_guest_bytes_unaligned(t.base40(), face_tiled as u64, "texture")?;
+                    let single =
+                        read_guest_bytes_unaligned(t.base40(), face_tiled as u64, "texture")?;
                     let face =
                         crate::texture::tiling::detile_64kb(mode, &single, width, height, bpp_log2)
                             .expect("table-checked above");
                     let mut pixels = alloc_zeroed(face_linear, "texture decode")?;
                     pixels[..face_linear].copy_from_slice(&face);
                     return Ok(texture_upload_from(
-                        t, width, height, format, pixels, layers, cube, depth, single_hash,
+                        t,
+                        width,
+                        height,
+                        format,
+                        pixels,
+                        layers,
+                        cube,
+                        depth,
+                        single_hash,
                     ));
                 }
                 Err(e) => return Err(e),
@@ -3781,21 +3796,21 @@ mod tests {
         assert_eq!(tex.pixels, linear, "detiled FP16 pixels must match");
     }
 
-    /// Unified formats 29 and 65 (user log flagged both as unimplemented) map
-    /// through SharpEmu's Gfx10UnifiedFormat table: 29 -> (5,7) = R16G16_SFLOAT
-    /// at 4 B/texel, 65 -> (12,0) = R16G16B16A16_UNORM at 8 B/texel.
+    /// Unified formats 14, 29 and 65 (all flagged unimplemented in ASTRO.BOT
+    /// runs) map through SharpEmu's Gfx10UnifiedFormat table: 14 -> (3,0) =
+    /// R8G8_UNORM (2 B), 29 -> (5,7) = R16G16_SFLOAT (4 B), 65 -> (12,0) =
+    /// R16G16B16A16_UNORM (8 B).
     #[test]
-    fn texture_vk_format_maps_unified_29_and_65() {
-        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
-        t.fields[1] |= 29 << 20;
+    fn texture_vk_format_maps_unified_14_29_and_65() {
+        let case = |unified: u32| {
+            let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+            t.fields[1] |= unified << 20;
+            texture_vk_format(&t)
+        };
+        assert_eq!(case(14).expect("format 14"), (vk::Format::R8G8_UNORM, 2));
+        assert_eq!(case(29).expect("format 29"), (vk::Format::R16G16_SFLOAT, 4));
         assert_eq!(
-            texture_vk_format(&t).expect("format 29 maps"),
-            (vk::Format::R16G16_SFLOAT, 4)
-        );
-        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
-        t.fields[1] |= 65 << 20;
-        assert_eq!(
-            texture_vk_format(&t).expect("format 65 maps"),
+            case(65).expect("format 65"),
             (vk::Format::R16G16B16A16_UNORM, 8)
         );
     }
