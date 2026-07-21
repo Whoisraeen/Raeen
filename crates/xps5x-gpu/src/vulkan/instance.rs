@@ -439,15 +439,39 @@ impl VulkanDevice {
             .queue_family_index(queue_family_index)
             .queue_priorities(&priorities)];
 
-        // Vulkan 1.3 core feature — the whole point of targeting 1.3 here is
-        // that the draw needs no render-pass/framebuffer objects.
-        let mut features13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
+        // Robustness features when the driver has them: RDNA T#/V# semantics
+        // bound-check every buffer and image access in hardware
+        // (out-of-bounds reads return 0, writes are dropped), and translated
+        // shaders lean on that — a null V# is bound as a 4-byte dummy whose
+        // out-of-bounds accesses must be defined, and image/texel-fetch
+        // coordinates are whatever the guest computed. Measured on ASTRO.BOT:
+        // without robustness one such dispatch is undefined behaviour that
+        // takes the whole device down (VK_ERROR_DEVICE_LOST poisons every
+        // later draw in the session).
+        // SAFETY: `physical_device` is a live handle from this instance and
+        // the query structs are local; the calls only write into them.
+        let (supported, robust_image_access) = unsafe {
+            let mut supported13 = vk::PhysicalDeviceVulkan13Features::default();
+            let mut supported2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut supported13);
+            instance.get_physical_device_features2(physical_device, &mut supported2);
+            (
+                supported2.features,
+                supported13.robust_image_access == vk::TRUE,
+            )
+        };
+        // Vulkan 1.3 core features — dynamicRendering is the whole point of
+        // targeting 1.3 (no render-pass/framebuffer objects); robustImageAccess
+        // is the image half of the RDNA out-of-bounds contract above.
+        let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
+            .dynamic_rendering(true)
+            .robust_image_access(robust_image_access);
         // Gen5 shaders write storage buffers from the vertex stage (UAV
         // writes/stream-out); without `vertexPipelineStoresAndAtomics` the
         // driver rejects those pipelines (VUID-RuntimeSpirv-NonWritable-06341).
         let features = vk::PhysicalDeviceFeatures::default()
             .fragment_stores_and_atomics(true)
-            .vertex_pipeline_stores_and_atomics(true);
+            .vertex_pipeline_stores_and_atomics(true)
+            .robust_buffer_access(supported.robust_buffer_access == vk::TRUE);
         let create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_features(&features)

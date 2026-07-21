@@ -211,8 +211,14 @@ pub(crate) struct DrawCaches {
     /// One command buffer + fence, reused for every synchronous submission.
     submit: Option<(vk::CommandBuffer, vk::Fence)>,
     pool: Option<PoolState>,
+    /// The device-persistent GDS arena (see [`DrawCaches::gds_buffer`]).
+    gds: Option<(vk::Buffer, vk::DeviceMemory)>,
     pub stats: DrawCacheStats,
 }
+
+/// Byte size of the emulated GDS arena — the real chip's Global Data Share is
+/// 64 KiB.
+pub(crate) const GDS_SIZE: usize = 64 * 1024;
 
 impl DrawCaches {
     /// Get or create the `VkShaderModule` for exactly these SPIR-V words.
@@ -390,6 +396,73 @@ impl DrawCaches {
         Ok(sampler)
     }
 
+    /// The device-persistent GDS arena: one 64 KiB storage buffer, zeroed at
+    /// creation, whose contents persist across dispatches for the lifetime of
+    /// the device — real GDS counters (`ds_append`/`ds_consume`) accumulate
+    /// across dispatches to feed indirect-draw arguments (measured on
+    /// ASTRO.BOT). GDS is on-chip memory, so nothing is ever written back to
+    /// guest memory.
+    pub(crate) fn gds_buffer(&mut self, dev: &VulkanDevice) -> Result<vk::Buffer, GpuError> {
+        if let Some((buffer, _)) = self.gds {
+            return Ok(buffer);
+        }
+        let info = vk::BufferCreateInfo::default()
+            .size(GDS_SIZE as u64)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: local create info on a live device; the buffer is retained
+        // in this cache and destroyed exactly once in `destroy`.
+        let buffer = unsafe { dev.device().create_buffer(&info, None) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("GDS vkCreateBuffer: {e}")))?;
+        // SAFETY: `buffer` is a live handle from this device.
+        let req = unsafe { dev.device().get_buffer_memory_requirements(buffer) };
+        let cleanup_buffer = |e| {
+            // SAFETY: destroying the just-created, never-bound buffer.
+            unsafe { dev.device().destroy_buffer(buffer, None) };
+            e
+        };
+        let memory_type = dev
+            .find_memory_type(
+                req.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+            .map_err(cleanup_buffer)?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(memory_type);
+        // SAFETY: allocation size/type come from this buffer's requirements.
+        let memory = unsafe { dev.device().allocate_memory(&alloc, None) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("GDS vkAllocateMemory: {e}")))
+            .map_err(cleanup_buffer)?;
+        let cleanup_both = |e| {
+            // SAFETY: destroying the never-bound buffer and its allocation.
+            unsafe {
+                dev.device().destroy_buffer(buffer, None);
+                dev.device().free_memory(memory, None);
+            }
+            e
+        };
+        // SAFETY: buffer and allocation are compatible live handles.
+        unsafe { dev.device().bind_buffer_memory(buffer, memory, 0) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("GDS vkBindBufferMemory: {e}")))
+            .map_err(cleanup_both)?;
+        // Zero the arena once — hardware GDS starts each session cold and the
+        // shaders themselves initialize the counters they use.
+        // SAFETY: host-visible coherent allocation, not in use by the GPU
+        // (never yet bound to a descriptor), mapped for its full size.
+        unsafe {
+            let ptr = dev
+                .device()
+                .map_memory(memory, 0, GDS_SIZE as u64, vk::MemoryMapFlags::empty())
+                .map_err(|e| GpuError::VulkanInitFailed(format!("GDS vkMapMemory: {e}")))
+                .map_err(cleanup_both)?;
+            std::ptr::write_bytes(ptr.cast::<u8>(), 0, GDS_SIZE);
+            dev.device().unmap_memory(memory);
+        }
+        self.gds = Some((buffer, memory));
+        Ok(buffer)
+    }
+
     /// The reusable command buffer + fence, with the fence reset for a new
     /// submission. Legal because every submission through it is synchronous:
     /// the caller waits the fence before the cache lock is released.
@@ -562,6 +635,10 @@ impl DrawCaches {
             }
             if let Some(pool) = self.pool.take() {
                 device.destroy_descriptor_pool(pool.pool, None);
+            }
+            if let Some((buffer, memory)) = self.gds.take() {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
             }
             for (_, pipeline) in self.graphics_pipelines.drain() {
                 device.destroy_pipeline(pipeline, None);

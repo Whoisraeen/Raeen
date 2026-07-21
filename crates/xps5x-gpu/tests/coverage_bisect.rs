@@ -393,6 +393,7 @@ fn title_translated_ps_sweep() {
                     None
                 },
                 storage_images: None,
+                gds_binding: None,
             }]
         } else {
             Vec::new()

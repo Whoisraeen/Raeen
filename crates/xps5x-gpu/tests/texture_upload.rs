@@ -183,6 +183,7 @@ fn sampled_texture_pixels_reach_the_readback() {
                 linear_filter: vec![false],
             }),
             storage_images: None,
+            gds_binding: None,
         }],
         ..DrawState::new(W, H, &vs, &ps)
     };

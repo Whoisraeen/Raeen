@@ -107,6 +107,9 @@ struct ComputeResources<'a> {
     images: Vec<ImageAllocation>,
     sampled: Vec<SampledAllocation>,
     samplers: Vec<vk::Sampler>,
+    /// The persistent GDS arena (cache-owned, NOT destroyed here); null when
+    /// the dispatch binds no GDS.
+    gds: vk::Buffer,
     shader: vk::ShaderModule,
     descriptor_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
@@ -126,6 +129,7 @@ impl<'a> ComputeResources<'a> {
             images: Vec::new(),
             sampled: Vec::new(),
             samplers: Vec::new(),
+            gds: vk::Buffer::null(),
             shader: vk::ShaderModule::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
@@ -149,7 +153,12 @@ impl<'a> ComputeResources<'a> {
         let storage = state.binding.and_then(|b| b.storage_buffers.as_ref());
         let storage_images = state.binding.and_then(|b| b.storage_images.as_ref());
         let textures = state.binding.and_then(|b| b.textures.as_ref());
-        if storage.is_some() || storage_images.is_some() || textures.is_some() {
+        let gds_binding = state.binding.and_then(|b| b.gds_binding);
+        if storage.is_some()
+            || storage_images.is_some()
+            || textures.is_some()
+            || gds_binding.is_some()
+        {
             let binding = state.binding.expect("resource groups come from a binding");
             if binding.descriptor_set_slot != 0 {
                 return Err(GpuError::PipelineCreationFailed(format!(
@@ -195,30 +204,56 @@ impl<'a> ComputeResources<'a> {
             // Sampled textures + samplers (the recompiled SPIR-V declares
             // %textures2D_S and %samplers as separate bindings) — first
             // consumed by ASTRO.BOT's froxel/LUT-volume compute shaders.
+            //
+            // The two arrays are INDEPENDENT: the SPIR-V declares
+            // `%textures2D_S` only when `textures2d_sampled_num > 0` and
+            // `%samplers` only when `samplers_num > 0`, and a CS legitimately
+            // carries one without the other (texel-fetch/image-load shaders
+            // bind textures but zero samplers). Each descriptor array is
+            // created only when non-empty, mirroring the SPIR-V exactly.
             if let Some(textures) = textures {
-                if textures.textures.is_empty() || textures.linear_filter.is_empty() {
+                if textures.textures.is_empty() && textures.linear_filter.is_empty() {
                     return Err(GpuError::PipelineCreationFailed(
-                        "compute sampled-texture/sampler descriptor array is empty".to_owned(),
+                        "compute sampled-texture and sampler descriptor arrays are both empty"
+                            .to_owned(),
                     ));
                 }
-                for upload in &textures.textures {
-                    self.create_sampled_image(upload)?;
+                if !textures.textures.is_empty() {
+                    for upload in &textures.textures {
+                        self.create_sampled_image(upload)?;
+                    }
+                    layout_bindings.push(
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(textures.sampled_binding)
+                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                            .descriptor_count(self.sampled.len() as u32)
+                            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                    );
                 }
-                for &linear in &textures.linear_filter {
-                    self.samplers.push(self.caches.sampler(self.dev, linear)?);
+                if !textures.linear_filter.is_empty() {
+                    for &linear in &textures.linear_filter {
+                        self.samplers.push(self.caches.sampler(self.dev, linear)?);
+                    }
+                    layout_bindings.push(
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(textures.sampler_binding)
+                            .descriptor_type(vk::DescriptorType::SAMPLER)
+                            .descriptor_count(self.samplers.len() as u32)
+                            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                    );
                 }
+            }
+            // The persistent GDS arena: one storage buffer whose contents
+            // persist across dispatches (device lifetime). Bound at the
+            // binding index `shader_calc_binding_indices` assigned to
+            // `%gds`; never read back (GDS is on-chip, not guest memory).
+            if let Some(binding) = gds_binding {
+                self.gds = self.caches.gds_buffer(self.dev)?;
                 layout_bindings.push(
                     vk::DescriptorSetLayoutBinding::default()
-                        .binding(textures.sampled_binding)
-                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .descriptor_count(self.sampled.len() as u32)
-                        .stage_flags(vk::ShaderStageFlags::COMPUTE),
-                );
-                layout_bindings.push(
-                    vk::DescriptorSetLayoutBinding::default()
-                        .binding(textures.sampler_binding)
-                        .descriptor_type(vk::DescriptorType::SAMPLER)
-                        .descriptor_count(self.samplers.len() as u32)
+                        .binding(binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
                         .stage_flags(vk::ShaderStageFlags::COMPUTE),
                 );
             }
@@ -229,7 +264,7 @@ impl<'a> ComputeResources<'a> {
             let pool_sizes: Vec<_> = [
                 (
                     vk::DescriptorType::STORAGE_BUFFER,
-                    self.storage.len() as u32,
+                    self.storage.len() as u32 + u32::from(!self.gds.is_null()),
                 ),
                 (vk::DescriptorType::STORAGE_IMAGE, self.images.len() as u32),
                 (vk::DescriptorType::SAMPLED_IMAGE, self.sampled.len() as u32),
@@ -308,19 +343,35 @@ impl<'a> ComputeResources<'a> {
                 .map(|&sampler| vk::DescriptorImageInfo::default().sampler(sampler))
                 .collect();
             if let Some(textures) = textures {
+                if !sampled_infos.is_empty() {
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(self.descriptor_set)
+                            .dst_binding(textures.sampled_binding)
+                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                            .image_info(&sampled_infos),
+                    );
+                }
+                if !sampler_infos.is_empty() {
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(self.descriptor_set)
+                            .dst_binding(textures.sampler_binding)
+                            .descriptor_type(vk::DescriptorType::SAMPLER)
+                            .image_info(&sampler_infos),
+                    );
+                }
+            }
+            let gds_info = [vk::DescriptorBufferInfo::default()
+                .buffer(self.gds)
+                .range(super::cache::GDS_SIZE as u64)];
+            if let Some(binding) = gds_binding {
                 writes.push(
                     vk::WriteDescriptorSet::default()
                         .dst_set(self.descriptor_set)
-                        .dst_binding(textures.sampled_binding)
-                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .image_info(&sampled_infos),
-                );
-                writes.push(
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(self.descriptor_set)
-                        .dst_binding(textures.sampler_binding)
-                        .descriptor_type(vk::DescriptorType::SAMPLER)
-                        .image_info(&sampler_infos),
+                        .dst_binding(binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&gds_info),
                 );
             }
             // SAFETY: descriptor set and every named buffer/view are live.
@@ -859,6 +910,26 @@ impl<'a> ComputeResources<'a> {
                 state.groups[1],
                 state.groups[2],
             );
+
+            // GDS contents persist across dispatches: make this dispatch's
+            // GDS writes available to LATER dispatches' shader reads/writes
+            // (a pipeline barrier's second scope covers subsequent
+            // submissions on this queue; the fence alone only orders
+            // device-to-host visibility).
+            if !self.gds.is_null() {
+                let gds_flush = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                self.device().cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[gds_flush],
+                    &[],
+                    &[],
+                );
+            }
 
             // Copy every UAV back out for the guest-memory writeback.
             for allocation in &self.images {

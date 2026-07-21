@@ -2173,3 +2173,41 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   --find-str (xps5x-gui). This is the tightest the gate has ever been located:
   a named dispatcher, a tested-and-excluded top gate, two concrete downstream
   targets. Real, measured forward progress toward a menu pixel.
+
+- FPS BASELINE (2026-07-21, stage A build): Minecraft peaks ~10 flips/sec
+  (300 SubmitFlips/174s window, 9-10/s sustained during boot animation, then
+  the known PSN-auth stall). Goal = 120 FPS (/goal hook). Gap = per-draw
+  submit 3.7-4ms + readback 7.6-8.2ms -> stage B (readback per FLIP,
+  persistent-image texture binding, upload ring) then stage C (swapchain).
+
+- ASTRO.BOT compute round 10: BIND-TIME WALLS CLOSED, device-loss bisected +
+  quarantined (2026-07-20, xps5x-gpu only; 120s measured run, 0 device losses).
+  * Wall 1 null V# (39): storage V# with base 0/size 0 now binds a 4-byte zero
+    dummy (RDNA OOB semantics), writeback explicitly skipped — 216 dummy binds
+    + 216 writeback skips in the final run, error string gone.
+  * Wall 2 tex/sampler independence (38): descriptor arrays now created only
+    when non-empty, mirroring the recompiler's %textures2D_S/%samplers
+    conditions. Unblocked the sampler-only CS (0x100008e6aa00, up to 524288x1x1
+    groups, runs clean). THE OTHER HALF IS QUARANTINED: the one tex-no-sampler
+    CS (0x5006c5f00) reproducibly resets the GPU (VK_ERROR_DEVICE_LOST,
+    bisected via new XPS5X_SKIP_CS env; robustness features don't save it →
+    descriptor-array OOB index suspected). Default-on named skip in
+    dispatch_direct (162 skips/120s); XPS5X_ALLOW_TEX_NO_SAMPLER=1 lifts it.
+  * Wall 3 set-slot contiguity (38): offscreen.rs builds set layouts keyed by
+    the actual slot, gap slots get empty layouts; duplicate-slot stays a named
+    error. Error string gone.
+  * Wall 4 GDS: device-persistent 64 KiB GDS SSBO (cache.rs gds_buffer),
+    bound at gds_pointers.binding_index, gds push-constant granules emitted,
+    COMPUTE-only refusal replaced, cross-dispatch persistence proven by new
+    in-tree test (atomicAdd counter observes prior dispatch on real device).
+    Title GDS shaders still skip UPSTREAM: analysis captures no gds_pointers
+    for the ds_append CS (m0-only GDS base, 28 skips) — next round, plus
+    ds_wrxchg_rtn_b32 (28) and buffer_store_dwordx2 (27) parse gaps.
+  * Wall 5 EUD dwords 4/12 not captured: confirmed new-semantics (not length)
+    — named for next round (167+28 skips, the largest remaining class).
+  * New: robustBufferAccess + robustImageAccess enabled at device creation.
+  * Measured 120s final: 0 device losses, 925 dispatch submits, 751
+    untranslatable skips + 162 quarantine (vs r9 50s baseline: 115 warn-level
+    bind-time draw skips, all three error classes now 0). tests: xps5x-gpu
+    134 unit + integration green incl. new tests/compute_gds.rs (GDS
+    persistence + tex-no-sampler Vulkan plumbing); clippy -D warnings clean.

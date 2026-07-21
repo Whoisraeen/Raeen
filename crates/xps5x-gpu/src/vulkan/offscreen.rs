@@ -211,6 +211,12 @@ pub struct ShaderStageBinding {
     /// Storage images (UAVs). Compute-only today: the graphics draw path
     /// rejects a stage that carries these rather than silently ignoring them.
     pub storage_images: Option<StorageImageBinding>,
+    /// Descriptor binding index of the `%gds` SSBO when the recompiled shader
+    /// uses GDS (`ds_append`/`ds_consume` with the gds bit). The buffer itself
+    /// is the device-persistent 64 KiB GDS arena (`DrawCaches::gds_buffer`) —
+    /// counters must persist across dispatches (measured: ASTRO.BOT feeds
+    /// indirect-draw args through them). Compute-only today.
+    pub gds_binding: Option<u32>,
 }
 
 /// Register-derived alpha-blend state for the single color attachment.
@@ -1361,6 +1367,18 @@ impl<'a> Resources<'a> {
                 stage.stage
             )));
         }
+        // Same policy for GDS: the persistent GDS arena is bound only on the
+        // one-shot compute path (`vulkan::compute`).
+        if let Some(stage) = state
+            .stage_bindings
+            .iter()
+            .find(|stage| stage.gds_binding.is_some())
+        {
+            return Err(GpuError::PipelineCreationFailed(format!(
+                "{:?} stage binds GDS — GDS is implemented for COMPUTE dispatches only",
+                stage.stage
+            )));
+        }
         let resource_stages: Vec<_> = state
             .stage_bindings
             .iter()
@@ -1373,12 +1391,33 @@ impl<'a> Resources<'a> {
         // One set layout per stage, holding that stage's descriptor arrays —
         // storage buffers, sampled images, samplers — at the exact bindings
         // the recompiled SPIR-V declares (`shader_calc_binding_indices`).
+        //
+        // Each stage's SPIR-V decorates its resources with `DescriptorSet
+        // <bind.descriptor_set_slot>`, and that slot is honoured as-is: a
+        // translated PS can carry set 1 while no stage claims set 0 (the slot
+        // was assigned against the VS the title bound at analysis time), so
+        // gaps are filled with empty set layouts rather than refused. Two
+        // stages claiming one slot IS refused: per-stage binding indices both
+        // start at 0, so their bindings would collide.
+        let max_slot = resource_stages
+            .iter()
+            .map(|stage| stage.descriptor_set_slot)
+            .max()
+            .expect("resource_stages is non-empty") as usize;
+        // A wild slot value would come from a mis-decoded bind ABI; refuse it
+        // rather than building an absurd pipeline layout.
+        if max_slot >= 8 {
+            return Err(GpuError::PipelineCreationFailed(format!(
+                "descriptor set slot {max_slot} is out of range (max 7)"
+            )));
+        }
+        let mut slot_layouts: Vec<Option<vk::DescriptorSetLayout>> = vec![None; max_slot + 1];
         for stage in &resource_stages {
-            if stage.descriptor_set_slot as usize != self.descriptor_set_layouts.len() {
+            let slot = stage.descriptor_set_slot as usize;
+            if slot_layouts[slot].is_some() {
                 return Err(GpuError::PipelineCreationFailed(format!(
-                    "descriptor set slot {} is not contiguous (expected {})",
-                    stage.descriptor_set_slot,
-                    self.descriptor_set_layouts.len()
+                    "descriptor set slot {slot} is claimed by two shader stages — \
+                     per-stage binding indices both start at 0 and would collide"
                 )));
             }
             let mut bindings = Vec::new();
@@ -1397,18 +1436,27 @@ impl<'a> Resources<'a> {
                 );
             }
             if let Some(textures) = &stage.textures {
-                if textures.textures.is_empty() {
+                // The two arrays are independent: the recompiled SPIR-V
+                // declares `%textures2D_S` only when the stage samples
+                // textures and `%samplers` only when it binds S#s, and a
+                // shader legitimately uses one without the other
+                // (texel-fetch needs no sampler). Each descriptor array is
+                // created only when non-empty, mirroring exactly what the
+                // SPIR-V declared.
+                if textures.textures.is_empty() && textures.linear_filter.is_empty() {
                     return Err(GpuError::PipelineCreationFailed(
-                        "sampled-image descriptor array is empty".to_owned(),
+                        "sampled-image and sampler descriptor arrays are both empty".to_owned(),
                     ));
                 }
-                bindings.push(
-                    vk::DescriptorSetLayoutBinding::default()
-                        .binding(textures.sampled_binding)
-                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .descriptor_count(textures.textures.len() as u32)
-                        .stage_flags(stage.stage),
-                );
+                if !textures.textures.is_empty() {
+                    bindings.push(
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(textures.sampled_binding)
+                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                            .descriptor_count(textures.textures.len() as u32)
+                            .stage_flags(stage.stage),
+                    );
+                }
                 if !textures.linear_filter.is_empty() {
                     bindings.push(
                         vk::DescriptorSetLayoutBinding::default()
@@ -1421,7 +1469,15 @@ impl<'a> Resources<'a> {
             }
             // Cached by binding signature: layouts live on the device caches,
             // not in this per-draw bundle.
-            let layout = self.caches.set_layout(self.dev, &bindings)?;
+            slot_layouts[slot] = Some(self.caches.set_layout(self.dev, &bindings)?);
+        }
+        for layout in slot_layouts {
+            let layout = match layout {
+                Some(layout) => layout,
+                // Gap slot: an empty layout keeps set indices aligned with the
+                // SPIR-V's `DescriptorSet` decorations.
+                None => self.caches.set_layout(self.dev, &[])?,
+            };
             self.descriptor_set_layouts.push(layout);
         }
 
@@ -1468,15 +1524,19 @@ impl<'a> Resources<'a> {
         // Persistent pool from the cache, reset for this draw (the previous
         // draw's sets completed with its fence) and grown when this draw
         // needs more than it holds.
-        self.descriptor_pool = self.caches.descriptor_pool(
-            self.dev,
-            self.descriptor_set_layouts.len() as u32,
-            &pool_sizes,
-        )?;
+        self.descriptor_pool =
+            self.caches
+                .descriptor_pool(self.dev, resource_stages.len() as u32, &pool_sizes)?;
 
+        // Allocate a set per RESOURCE stage (gap slots need no set — nothing
+        // is ever bound at them), each from its own slot's layout.
+        let stage_layouts: Vec<_> = resource_stages
+            .iter()
+            .map(|stage| self.descriptor_set_layouts[stage.descriptor_set_slot as usize])
+            .collect();
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&self.descriptor_set_layouts);
+            .set_layouts(&stage_layouts);
         // SAFETY: the pool and every layout are live handles from this device.
         let sets = unsafe { self.device().allocate_descriptor_sets(&alloc_info) }.map_err(|e| {
             GpuError::PipelineCreationFailed(format!("vkAllocateDescriptorSets: {e}"))
@@ -1539,13 +1599,15 @@ impl<'a> Resources<'a> {
                 );
             }
             if let Some(textures) = &stage.textures {
-                writes.push(
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(textures.sampled_binding)
-                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .image_info(&image_infos),
-                );
+                if !textures.textures.is_empty() {
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(textures.sampled_binding)
+                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                            .image_info(&image_infos),
+                    );
+                }
                 if !textures.linear_filter.is_empty() {
                     writes.push(
                         vk::WriteDescriptorSet::default()

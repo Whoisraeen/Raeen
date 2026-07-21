@@ -896,9 +896,19 @@ fn prepare_stage_binding(
     // into the same resource tables as a direct sharp, so the loops below
     // bind it like any other — the recompiled shader reads it back through
     // the push-constant table via the `s_load_dwordx*` EUD translation.
-    if bind.gds_pointers.pointers_num != 0 {
+    let gds_num = usize::try_from(bind.gds_pointers.pointers_num).map_err(|_| {
+        err(format!(
+            "negative gds pointer count {}",
+            bind.gds_pointers.pointers_num
+        ))
+    })?;
+    if gds_num > bind.gds_pointers.pointers.len() {
+        return Err(err("gds pointer count exceeds fixed array"));
+    }
+    if gds_num != 0 && stage != vk::ShaderStageFlags::COMPUTE {
         return Err(err(format!(
-            "translated {stage:?} shader needs unsupported GDS resources"
+            "translated {stage:?} shader uses GDS — GDS is implemented for \
+             COMPUTE dispatches only"
         )));
     }
 
@@ -924,7 +934,25 @@ fn prepare_stage_binding(
             )));
         }
         let size = buffer_byte_size(resource).ok_or_else(|| err("storage buffer size overflow"))?;
-        let mut bytes = read_guest_bytes(resource.base48(), size, "storage buffer")?;
+        let mut bytes = if resource.base48() == 0 || size == 0 {
+            // A null V# (base 0 or zero byte size): RDNA out-of-bounds
+            // semantics make every read return 0 and drop every write, and
+            // titles legitimately dispatch shaders whose analysis bound such
+            // a V# (measured: ASTRO.BOT compute at capture time). Bind a
+            // 4-byte zero dummy so the recompiled SPIR-V's descriptor array
+            // stays fully populated; the writeback skips it (`dispatch_direct`
+            // checks addr/size, mirroring the dropped-write semantics).
+            debug!(
+                stage = ?stage,
+                index,
+                addr = format_args!("{:#x}", resource.base48()),
+                size,
+                "storage buffer V# is null — binding 4-byte zero dummy (RDNA OOB semantics)"
+            );
+            vec![0u8; 4]
+        } else {
+            read_guest_bytes(resource.base48(), size, "storage buffer")?
+        };
         // The SSBO view is an array of 32-bit elements, so pad the upload to
         // a dword multiple (a V# byte size need not be one — the recompiler
         // dropped Kyty's alignment EXIT). The writeback truncates back to
@@ -1056,6 +1084,21 @@ fn prepare_stage_binding(
         }
     }
 
+    // GDS pointers: one raw dword each (the base/size field the guest loaded
+    // into the pointer SGPR), packed 4 per 16-byte push-constant granule in
+    // the exact `WriteLocalVariables` order — after the S#s, before the
+    // direct SGPRs. The GDS arena itself is the device-persistent buffer the
+    // Vulkan layer binds at `gds_pointers.binding_index`.
+    if gds_num != 0 {
+        let base = push_constants.len();
+        let granules = (gds_num - 1) / 4 + 1;
+        push_constants.resize(base + granules * 16, 0);
+        for (i, pointer) in bind.gds_pointers.pointers[..gds_num].iter().enumerate() {
+            let at = base + i * 4;
+            push_constants[at..at + 4].copy_from_slice(&pointer.field.to_le_bytes());
+        }
+    }
+
     let direct_num = usize::try_from(bind.direct_sgprs.sgprs_num).map_err(|_| {
         err(format!(
             "negative direct-SGPR count {}",
@@ -1090,7 +1133,11 @@ fn prepare_stage_binding(
             binding: bind.storage_buffers.binding_index as u32,
             buffers: storage_bytes,
         }),
-        textures: (!textures.is_empty()).then_some(TextureBinding {
+        // Present when EITHER array is non-empty: a shader legitimately
+        // binds textures without samplers (texel fetch) or samplers without
+        // sampled textures — the Vulkan layer creates each descriptor array
+        // independently, exactly as the SPIR-V declared them.
+        textures: (!textures.is_empty() || !linear_filter.is_empty()).then_some(TextureBinding {
             sampled_binding: bind.textures2d.binding_sampled_index as u32,
             sampler_binding: bind.samplers.binding_index as u32,
             textures,
@@ -1100,6 +1147,7 @@ fn prepare_stage_binding(
             binding: bind.textures2d.binding_storage_index as u32,
             images: storage_images,
         }),
+        gds_binding: (gds_num != 0).then_some(bind.gds_pointers.binding_index as u32),
     })
 }
 
@@ -1637,6 +1685,23 @@ impl DrawSink for OffscreenDrawSink<'_> {
         // dispatch-only ACB buffers translate against the shader the title bound
         // on the DCB instead of skipping on a null address.
         let cs = Self::seed_compute(&sh.cs, &mut self.current_compute);
+        // Forensic kill switch: `XPS5X_SKIP_CS=0xADDR[,0xADDR...]` skips the
+        // named compute programs as a counted, named degradation. Used to
+        // bisect device-loss culprits: a lethal dispatch resets the whole
+        // device and every later draw in the session fails, so isolating one
+        // program by address is the fastest way to pin the killer.
+        if let Ok(list) = std::env::var("XPS5X_SKIP_CS") {
+            let addr = format!("{:#x}", cs.cs_regs.data_addr);
+            if list
+                .split(',')
+                .any(|s| s.trim().eq_ignore_ascii_case(&addr))
+            {
+                self.dispatch_skips += 1;
+                self.last_dispatch_skip_reason = Some(format!("XPS5X_SKIP_CS: {addr}"));
+                debug!(cs_addr = %addr, "compute dispatch skipped by XPS5X_SKIP_CS");
+                return Ok(());
+            }
+        }
         let translated = match self.cache.translate_cs(&cs, &ctx.sh_regs) {
             Ok(shader) => shader,
             Err(error) => {
@@ -1658,6 +1723,33 @@ impl DrawSink for OffscreenDrawSink<'_> {
             }
         };
         let bind = &translated.cs_info.bind;
+        // Device-loss quarantine (round 10, measured): the one CS ASTRO.BOT
+        // dispatches with sampled textures and ZERO samplers (0x5006c5f00, an
+        // LDS-reduction with a runtime-loaded T# index via `s_load_dwordx8`)
+        // reproducibly resets the GPU (VK_ERROR_DEVICE_LOST — bisected with
+        // XPS5X_SKIP_CS: skipping it alone gives a clean 60s run; robustness
+        // features don't help, pointing at descriptor-array OOB indexing,
+        // which robustness does not cover). Until the translated index path
+        // is diagnosed, this category is a named counted skip; the reverse
+        // shape (samplers without textures) is measured safe and stays live.
+        // XPS5X_ALLOW_TEX_NO_SAMPLER=1 lifts the quarantine for debugging.
+        if bind.textures2d.textures2d_sampled_num > 0
+            && bind.samplers.samplers_num == 0
+            && std::env::var_os("XPS5X_ALLOW_TEX_NO_SAMPLER").is_none()
+        {
+            self.dispatch_skips += 1;
+            self.last_dispatch_skip_reason = Some(format!(
+                "quarantined: CS at {:#x} binds {} sampled texture(s) with zero samplers \
+                 (measured device reset; XPS5X_ALLOW_TEX_NO_SAMPLER=1 to run)",
+                cs.cs_regs.data_addr, bind.textures2d.textures2d_sampled_num
+            ));
+            debug!(
+                cs_addr = format_args!("{:#x}", cs.cs_regs.data_addr),
+                sampled = bind.textures2d.textures2d_sampled_num,
+                "compute dispatch skipped: tex-no-sampler quarantine (device-loss bisect)"
+            );
+            return Ok(());
+        }
         let has_binding = bind.push_constant_size != 0
             || bind.storage_buffers.buffers_num != 0
             || bind.textures2d.textures_num != 0
@@ -1692,6 +1784,32 @@ impl DrawSink for OffscreenDrawSink<'_> {
             .and_then(|binding| binding.storage_images.as_ref())
             .map(|images| images.images.iter().map(|img| img.guest_base).collect())
             .unwrap_or_default();
+        // Forensic breadcrumb: device loss surfaces LAZILY (the next
+        // vkQueueSubmit reports it), so identifying a lethal dispatch needs
+        // the pre-submit identity of every dispatch in the log.
+        debug!(
+            cs_addr = format_args!("{:#x}", cs.cs_regs.data_addr),
+            groups = format_args!("{}x{}x{}", groups[0], groups[1], groups[2]),
+            storage_num,
+            null_vsharps = guest_outputs
+                .iter()
+                .filter(|(addr, len)| *addr == 0 || *len == 0)
+                .count(),
+            gds = prepared.as_ref().is_some_and(|p| p.gds_binding.is_some()),
+            textures = prepared
+                .as_ref()
+                .and_then(|p| p.textures.as_ref())
+                .map_or(0, |t| t.textures.len()),
+            samplers = prepared
+                .as_ref()
+                .and_then(|p| p.textures.as_ref())
+                .map_or(0, |t| t.linear_filter.len()),
+            images = prepared
+                .as_ref()
+                .and_then(|p| p.storage_images.as_ref())
+                .map_or(0, |i| i.images.len()),
+            "compute dispatch submitting"
+        );
         let outputs = dispatch_compute(
             self.dev,
             &ComputeState {
@@ -1716,6 +1834,17 @@ impl DrawSink for OffscreenDrawSink<'_> {
             )));
         }
         for ((addr, real_len), bytes) in guest_outputs.into_iter().zip(outputs.buffers) {
+            // A null V# (base 0 or zero size) was bound as a zero dummy;
+            // hardware drops its writes (RDNA OOB semantics), so skip the
+            // writeback explicitly — `write_bytes_checked` would refuse
+            // address 0 anyway and fail the whole dispatch.
+            if addr == 0 || real_len == 0 {
+                debug!(
+                    addr = format_args!("{addr:#x}"),
+                    real_len, "compute storage writeback skipped: null V# (writes dropped)"
+                );
+                continue;
+            }
             // Truncate off the dword-alignment pad (see `guest_outputs`).
             let bytes = &bytes[..bytes.len().min(real_len)];
             debug!(
