@@ -4005,37 +4005,153 @@ enum MimgDescriptorClass {
     Storage,
 }
 
-/// The EUD dword offset a COVERED scalar load off the EUD base pair fills the
-/// SGPR range starting at `reg` from, or `None` if no such load seeds `reg`.
-///
-/// A descriptor delivered through the raw EUD window is read into the register
-/// file by an `s_load_dword{,x2,x4,x8} s[reg..], s[eud_base:eud_base+1],
-/// <const>` (the exact shape `sload_dword_extended` and
-/// `shader_detect_eud_raw_window` accept). The returned dword offset is the
-/// load's byte offset >> 2 — the EUD dword whose captured-descriptor coverage
-/// decides whether `reg`'s dword 0 gets a rewritten descriptor-array index.
-fn eud_load_offset_for_register(code: &ShaderCode, eud_base: i32, reg: i32) -> Option<i32> {
+// `eud_load_offset_for_register` lives in `analysis` (shared with the
+// raw-EUD image-descriptor capture pass there).
+use crate::shader::analysis::eud_load_offset_for_register;
+
+/// Bound on how many `s_mov_b32` register copies the EUD-alias resolver walks
+/// through before giving up. Gen5 descriptor delivery is a covered `s_load`
+/// optionally forwarded through a short mov chain; a deeper chain is treated as
+/// unresolvable (named refusal) rather than chased indefinitely. SharpEmu
+/// evaluates the FULL scalar program (`Gen5ShaderScalarEvaluator.cs:599-668`);
+/// this is a bounded static form.
+const EUD_ALIAS_MOV_DEPTH: u32 = 4;
+
+/// Outcome of resolving a descriptor register's dword-0 provenance by scanning
+/// the scalar program BACKWARD from the MIMG (SharpEmu's `TryCopyRegisters`,
+/// `Gen5ShaderScalarEvaluator.cs:599-668`, does the dynamic version).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum EudResolve {
+    /// The nearest writer is a covered EUD `s_load` (optionally reached through
+    /// `s_mov_b32` copies): the load's EUD dword offset.
+    Offset(i32),
+    /// The nearest writer redefines the register some OTHER way — arithmetic, a
+    /// buffer/SRT load, an immediate move, a partial/mid-descriptor load, or a
+    /// chain deeper than [`EUD_ALIAS_MOV_DEPTH`]. The value is NOT an EUD-load
+    /// alias; refuse. Never chase past a real redefinition to a now-dead load —
+    /// that is the device-loss guard's whole purpose.
+    Blocked,
+    /// No instruction writes the register before the MIMG (a persistent user
+    /// SGPR, or only a textually-later load across a loop back-edge). Program
+    /// order is silent; the caller may fall back to the order-independent scan.
+    NoProducer,
+}
+
+/// The scalar-register dword span an instruction's destination writes, or
+/// `None` when the destination is not the SGPR file (VGPR/EXEC/VCC/M0/…). The
+/// width is the max of the opcode's fixed width and the parser-recorded operand
+/// size, so a wide `s_load`/`s_buffer_load` covering `reg` as a MIDDLE dword is
+/// still detected as a redefinition (never skipped past to a dead earlier load).
+fn sgpr_dst_span(inst: &ShaderInstruction) -> Option<(i32, i32)> {
     use ShaderInstructionType as T;
-    for load in code.get_instructions() {
-        match load.type_ {
-            T::SLoadDword | T::SLoadDwordx2 | T::SLoadDwordx4 | T::SLoadDwordx8 => {}
-            _ => continue,
-        }
-        if load.src[0].type_ != ShaderOperandType::Sgpr
-            || load.src[0].register_id != eud_base
-            || load.dst.type_ != ShaderOperandType::Sgpr
-            || load.dst.register_id != reg
-            || !matches!(
-                load.src[1].type_,
-                ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
-            )
-            || load.src[1].constant.i() < 0
-        {
-            continue;
-        }
-        return Some((load.src[1].constant.u >> 2) as i32);
+    if inst.dst.type_ != ShaderOperandType::Sgpr {
+        return None;
     }
-    None
+    let opcode_width = match inst.type_ {
+        T::SLoadDwordx16 | T::SBufferLoadDwordx16 => 16,
+        T::SLoadDwordx8 | T::SBufferLoadDwordx8 => 8,
+        T::SLoadDwordx4 | T::SBufferLoadDwordx4 => 4,
+        T::SLoadDwordx2 | T::SBufferLoadDwordx2 | T::SMovB64 => 2,
+        _ => 1,
+    };
+    Some((inst.dst.register_id, opcode_width.max(inst.dst.size.max(1))))
+}
+
+/// The EUD dword offset a covered `s_load{,x2,x4,x8} s[reg..], s[eud_base..],
+/// <const>` loads `reg`'s dword 0 from, or `None` when `inst` is not exactly
+/// that shape (the same acceptance as [`sload_dword_extended`]).
+fn eud_load_into_reg_offset(inst: &ShaderInstruction, eud_base: i32, reg: i32) -> Option<i32> {
+    use ShaderInstructionType as T;
+    match inst.type_ {
+        T::SLoadDword | T::SLoadDwordx2 | T::SLoadDwordx4 | T::SLoadDwordx8 => {}
+        _ => return None,
+    }
+    if inst.src[0].type_ == ShaderOperandType::Sgpr
+        && inst.src[0].register_id == eud_base
+        && inst.dst.type_ == ShaderOperandType::Sgpr
+        && inst.dst.register_id == reg
+        && matches!(
+            inst.src[1].type_,
+            ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
+        )
+        && inst.src[1].constant.i() >= 0
+    {
+        Some((inst.src[1].constant.u >> 2) as i32)
+    } else {
+        None
+    }
+}
+
+/// Resolve the EUD dword offset that fills `reg`'s dword 0 as seen at
+/// instruction index `at`, walking the scalar program BACKWARD through a
+/// bounded chain of `s_mov_b32` register copies.
+///
+/// This is the program-order (SharpEmu scalar-evaluation) form of the alias
+/// resolution: it binds `reg` to the descriptor the NEAREST preceding covered
+/// load delivered, which disambiguates a register reused for several
+/// descriptors at different EUD offsets — measured on ASTRO.BOT sampled compute
+/// (e.g. `0x5006fff00`): `s16` is loaded from EUD dwords 0 / 40 / 44 / 52 at
+/// different program points, and the order-independent scan would pick the
+/// wrong one. Only SALU register copies (`s_mov_b32 reg, <sgpr>`) are followed;
+/// an immediate move, arithmetic, or a non-EUD load is an opaque redefinition
+/// that stops the walk with [`EudResolve::Blocked`].
+fn resolve_eud_offset_before(
+    code: &ShaderCode,
+    eud_base: i32,
+    reg: i32,
+    at: usize,
+    depth: u32,
+) -> EudResolve {
+    use ShaderInstructionType as T;
+    let insts = code.get_instructions();
+    let start = at.min(insts.len());
+    for i in (0..start).rev() {
+        let inst = &insts[i];
+        // A covered EUD load into reg's dword 0 — the resolved alias.
+        if let Some(off) = eud_load_into_reg_offset(inst, eud_base, reg) {
+            return EudResolve::Offset(off);
+        }
+        // `s_mov_b32 reg, <sgpr>` forwards another register's dword 0; follow
+        // the source as of BEFORE this move.
+        if inst.type_ == T::SMovB32
+            && inst.dst.type_ == ShaderOperandType::Sgpr
+            && inst.dst.register_id == reg
+            && inst.src[0].type_ == ShaderOperandType::Sgpr
+        {
+            if depth >= EUD_ALIAS_MOV_DEPTH {
+                return EudResolve::Blocked;
+            }
+            return resolve_eud_offset_before(
+                code,
+                eud_base,
+                inst.src[0].register_id,
+                i,
+                depth + 1,
+            );
+        }
+        // Any other write covering reg redefines its value: stop here rather
+        // than chasing past it to a now-dead earlier load.
+        if let Some((base, width)) = sgpr_dst_span(inst) {
+            if reg >= base && reg < base + width {
+                return EudResolve::Blocked;
+            }
+        }
+    }
+    EudResolve::NoProducer
+}
+
+/// Program-order EUD-offset resolution with the order-independent scan as a
+/// fallback only when program order is silent (`NoProducer`). A [`Blocked`]
+/// producer (arithmetic / raw load / immediate move in the chain) never falls
+/// back — the refusal must stand.
+///
+/// [`Blocked`]: EudResolve::Blocked
+fn eud_alias_offset(code: &ShaderCode, eud_base: i32, reg: i32, at: usize) -> Option<i32> {
+    match resolve_eud_offset_before(code, eud_base, reg, at, 0) {
+        EudResolve::Offset(k) => Some(k),
+        EudResolve::Blocked => None,
+        EudResolve::NoProducer => eud_load_offset_for_register(code, eud_base, reg),
+    }
 }
 
 /// SharpEmu-parity EUD-alias resolution for an MIMG descriptor register that
@@ -4068,12 +4184,13 @@ fn mimg_register_is_eud_alias(
     bind: &ShaderBindResources,
     code: &ShaderCode,
     reg: i32,
+    at: usize,
     want_storage: bool,
 ) -> bool {
     if !bind.extended.used {
         return false;
     }
-    let Some(k) = eud_load_offset_for_register(code, bind.extended.start_register, reg) else {
+    let Some(k) = eud_alias_offset(code, bind.extended.start_register, reg, at) else {
         return false;
     };
     let tex_num = usize::try_from(bind.textures2d.textures_num.max(0))
@@ -4091,11 +4208,16 @@ fn mimg_register_is_eud_alias(
 /// [`mimg_register_is_eud_alias`]): the S# is captured at its EUD-virtual
 /// start register but read by the MIMG from a real SGPR a covered EUD `s_load`
 /// fills.
-fn sampler_register_is_eud_alias(bind: &ShaderBindResources, code: &ShaderCode, reg: i32) -> bool {
+fn sampler_register_is_eud_alias(
+    bind: &ShaderBindResources,
+    code: &ShaderCode,
+    reg: i32,
+    at: usize,
+) -> bool {
     if !bind.extended.used {
         return false;
     }
-    let Some(k) = eud_load_offset_for_register(code, bind.extended.start_register, reg) else {
+    let Some(k) = eud_alias_offset(code, bind.extended.start_register, reg, at) else {
         return false;
     };
     let samp_num = usize::try_from(bind.samplers.samplers_num.max(0))
@@ -4138,6 +4260,7 @@ fn sampler_register_is_eud_alias(bind: &ShaderBindResources, code: &ShaderCode, 
 /// also refuses): linear order is unreliable across branches, and the
 /// conservative refusal is a named skip, not a wrong render.
 fn mimg_descriptor_guard(
+    index: u32,
     spirv: &Spirv<'_>,
     code: &ShaderCode,
     inst: &ShaderInstruction,
@@ -4148,6 +4271,9 @@ fn mimg_descriptor_guard(
     let Some(bind) = spirv.get_bind_info() else {
         return Ok(());
     };
+    // The MIMG's own position in program order — descriptor registers are
+    // resolved by walking the scalar program BACKWARD from here.
+    let at = index as usize;
     let shift_regs = if spirv.get_vs_input_info().is_some_and(|v| v.gs_prolog) {
         8
     } else {
@@ -4174,7 +4300,7 @@ fn mimg_descriptor_guard(
             && d.textures2d_without_sampler == (class == MimgDescriptorClass::Storage)
     });
     if !t_matched
-        && !mimg_register_is_eud_alias(bind, code, t_reg, class == MimgDescriptorClass::Storage)
+        && !mimg_register_is_eud_alias(bind, code, t_reg, at, class == MimgDescriptorClass::Storage)
     {
         return Err(not_supported(
             func,
@@ -4203,7 +4329,7 @@ fn mimg_descriptor_guard(
         let s_matched = bind.samplers.start_register[..samp_num]
             .iter()
             .any(|&start| start + shift_regs == s_reg);
-        if !s_matched && !sampler_register_is_eud_alias(bind, code, s_reg) {
+        if !s_matched && !sampler_register_is_eud_alias(bind, code, s_reg, at) {
             return Err(not_supported(
                 func,
                 format!("dynamic-image-descriptor: S# at s{s_reg} matches no captured sampler"),
@@ -4290,7 +4416,15 @@ fn image_sample_channels(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
-            mimg_descriptor_guard(spirv, code, &inst, func, MimgDescriptorClass::Sampled, true)?;
+            mimg_descriptor_guard(
+                index,
+                spirv,
+                code,
+                &inst,
+                func,
+                MimgDescriptorClass::Sampled,
+                true,
+            )?;
             let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
             let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
             let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
@@ -4518,7 +4652,15 @@ fn recompile_image_sample_c_lz(
     if bind_info.textures2d.textures2d_sampled_num == 0 || bind_info.samplers.samplers_num == 0 {
         return Ok(false);
     }
-    mimg_descriptor_guard(spirv, code, &inst, FUNC, MimgDescriptorClass::Sampled, true)?;
+    mimg_descriptor_guard(
+        index,
+        spirv,
+        code,
+        &inst,
+        FUNC,
+        MimgDescriptorClass::Sampled,
+        true,
+    )?;
 
     if sampled_texture_dim(bind_info)? != SampledDim::Two {
         return Err(not_supported(
@@ -4660,7 +4802,15 @@ fn recompile_image_sample_lz_dmask7(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
-            mimg_descriptor_guard(spirv, code, &inst, FUNC, MimgDescriptorClass::Sampled, true)?;
+            mimg_descriptor_guard(
+                index,
+                spirv,
+                code,
+                &inst,
+                FUNC,
+                MimgDescriptorClass::Sampled,
+                true,
+            )?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
             let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
@@ -4732,7 +4882,15 @@ fn recompile_image_sample_lz_dmask_f(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
-            mimg_descriptor_guard(spirv, code, &inst, FUNC, MimgDescriptorClass::Sampled, true)?;
+            mimg_descriptor_guard(
+                index,
+                spirv,
+                code,
+                &inst,
+                FUNC,
+                MimgDescriptorClass::Sampled,
+                true,
+            )?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
             let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
@@ -4809,7 +4967,15 @@ fn image_sample_lz_single_channel(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
-            mimg_descriptor_guard(spirv, code, &inst, func, MimgDescriptorClass::Sampled, true)?;
+            mimg_descriptor_guard(
+                index,
+                spirv,
+                code,
+                &inst,
+                func,
+                MimgDescriptorClass::Sampled,
+                true,
+            )?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
             let src2_value0 = operand_variable_to_str_shift(inst.src[2], 0);
@@ -4872,7 +5038,15 @@ fn recompile_image_sample_lz_dmask3(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
-            mimg_descriptor_guard(spirv, code, &inst, FUNC, MimgDescriptorClass::Sampled, true)?;
+            mimg_descriptor_guard(
+                index,
+                spirv,
+                code,
+                &inst,
+                FUNC,
+                MimgDescriptorClass::Sampled,
+                true,
+            )?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
             let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
@@ -4969,7 +5143,15 @@ fn recompile_image_gather4_lz_dmask1(
     if bind_info.textures2d.textures2d_sampled_num == 0 || bind_info.samplers.samplers_num == 0 {
         return Ok(false);
     }
-    mimg_descriptor_guard(spirv, code, &inst, FUNC, MimgDescriptorClass::Sampled, true)?;
+    mimg_descriptor_guard(
+        index,
+        spirv,
+        code,
+        &inst,
+        FUNC,
+        MimgDescriptorClass::Sampled,
+        true,
+    )?;
     // Gathers are 2D-only in Vulkan (no 3D gather; cube gathers unmeasured).
     if sampled_texture_dim(bind_info)? != SampledDim::Two {
         return Err(not_supported(FUNC, "gather from a non-2D texture"));
@@ -5043,7 +5225,15 @@ fn recompile_image_sample_lzo_dmask7(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
-            mimg_descriptor_guard(spirv, code, &inst, FUNC, MimgDescriptorClass::Sampled, true)?;
+            mimg_descriptor_guard(
+                index,
+                spirv,
+                code,
+                &inst,
+                FUNC,
+                MimgDescriptorClass::Sampled,
+                true,
+            )?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
             let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
@@ -5153,6 +5343,7 @@ fn recompile_image_get_resinfo_dmask3(
     }
 
     mimg_descriptor_guard(
+        index,
         spirv,
         code,
         &inst,
@@ -5203,6 +5394,7 @@ fn image_load_channels(
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 {
             mimg_descriptor_guard(
+                index,
                 spirv,
                 code,
                 &inst,
@@ -5384,6 +5576,7 @@ fn recompile_image_store_dmask1(
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_storage_num > 0 {
             mimg_descriptor_guard(
+                index,
                 spirv,
                 code,
                 &inst,
@@ -5453,6 +5646,7 @@ fn recompile_image_store_dmask3(
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_storage_num > 0 {
             mimg_descriptor_guard(
+                index,
                 spirv,
                 code,
                 &inst,
@@ -5522,6 +5716,7 @@ fn recompile_image_store_dmask_f(
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_storage_num > 0 {
             mimg_descriptor_guard(
+                index,
                 spirv,
                 code,
                 &inst,
@@ -12815,6 +13010,272 @@ mod tests {
 
         let err = spirv_generate_source(&code, None, None, Some(&input_info))
             .expect_err("offset-mismatched EUD alias must refuse");
+        assert!(
+            err.to_string().contains("dynamic-image-descriptor"),
+            "named refusal expected, got: {err}"
+        );
+    }
+
+    /// EUD-alias resolution through a SALU mov chain (the measured sampled shape
+    /// `0x5006fff00`): the MIMG's T# register is NOT the direct `s_load` dest —
+    /// a covered `s_load_dwordx8 s[8:15], s[12:13], 0x0` fills `s8`, then
+    /// `s_mov_b32 s0, s8` forwards its dword 0, and the `image_load` reads its
+    /// sampled T# from `s0`. The mov copies the rewritten descriptor-array index
+    /// (`recompile_smov_b32` is a straight `OpStore`), so the descriptor
+    /// resolves via program-order backtracking instead of refusing.
+    #[test]
+    fn sampled_tsharp_resolves_via_mov_chain() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // image_load dmask3 reading its sampled T# from s[0:7] (srsrc = 0).
+        shader_parse(
+            0,
+            &[0xF000_0300, 0x0060_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_load dmask3 (T# at s0)");
+        assert_eq!(code.get_instructions()[0].type_, T::ImageLoad);
+        assert_eq!(code.get_instructions()[0].src[1].register_id, 0);
+
+        // Insert BEFORE the MIMG (program order): s_mov_b32 s0, s8.
+        let smov = ShaderInstruction {
+            type_: T::SMovB32,
+            format: F::SVdstSVsrc0,
+            src_num: 1,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 0,
+                size: 1,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 8,
+                    size: 1,
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        code.get_instructions_mut().insert(0, smov);
+        // Insert BEFORE the mov: s_load_dwordx8 s[8:15], s[12:13], 0x0.
+        let sload = ShaderInstruction {
+            type_: T::SLoadDwordx8,
+            format: F::Sdst8SbaseSoffset,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 8,
+                size: 8,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 12,
+                    size: 2,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::LiteralConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(0),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        code.get_instructions_mut().insert(0, sload);
+        // Order is now [sload s8, smov s0<-s8, image_load T#=s0].
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.extended.used = true;
+        input_info.bind.extended.start_register = 12;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        // Captured SAMPLED texture at the EUD-virtual start register s32 (rel 0).
+        input_info.bind.textures2d.desc[0].start_register = 32;
+        input_info.bind.textures2d.desc[0].extended = true;
+        input_info.bind.textures2d.desc[0].textures2d_without_sampler = false;
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("mov-chain sampled T# must resolve, not refuse");
+        assert!(source.contains("%textures2D_S"), "{source}");
+        let _ = spirv_run(&source).expect("assemble mov-chain image_load");
+    }
+
+    /// Non-coupled sampler EUD-alias resolution (the measured `0x5006fff00`
+    /// gather shape): the T# is captured directly, but the S# is delivered
+    /// separately — the `image_sample`'s S# register is filled by a covered
+    /// `s_load_dwordx4 s[12:15], s[20:21], 0x10` (EUD dword 4) whose offset
+    /// matches a captured EXTENDED sampler at its EUD-virtual start register
+    /// s36 (rel 4). The sampler resolves via the covered load instead of the
+    /// direct start-register match, so the guard passes rather than refusing.
+    #[test]
+    fn sampler_resolves_via_covered_load() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // image_sample_lz dmask2: T# at s4, S# at s12 (same parse the channel
+        // test uses).
+        shader_parse(
+            0,
+            &[0xF09C_0200, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_sample_lz dmask2");
+        assert_eq!(code.get_instructions()[0].src[2].register_id, 12);
+        // Insert BEFORE the MIMG: s_load_dwordx4 s[12:15], s[20:21], 0x10.
+        let sload = ShaderInstruction {
+            type_: T::SLoadDwordx4,
+            format: F::Sdst4SbaseSoffset,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 12,
+                size: 4,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 20,
+                    size: 2,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::LiteralConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(0x10),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        code.get_instructions_mut().insert(0, sload);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.extended.used = true;
+        input_info.bind.extended.start_register = 20;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        // T# captured directly at s4 (no alias needed for it).
+        input_info.bind.textures2d.desc[0].start_register = 4;
+        input_info.bind.samplers.samplers_num = 1;
+        input_info.bind.samplers.binding_index = 1;
+        // The sampler is captured at its EUD-virtual start register s36 (rel 4),
+        // NOT the s12 the MIMG reads it from — resolved via the covered load.
+        input_info.bind.samplers.start_register[0] = 36;
+        input_info.bind.samplers.extended[0] = true;
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("non-coupled sampler must resolve via covered load, not refuse");
+        assert!(source.contains("%samplers"), "{source}");
+        let _ = spirv_run(&source).expect("assemble non-coupled sampler image_sample");
+    }
+
+    /// Device-loss guard: an EUD-alias chain that runs through a NON-copy
+    /// redefinition (here an immediate `s_mov_b32 s0, 0x1234`, standing in for
+    /// any arithmetic) STILL refuses — even though a covered load into `s8`
+    /// exists earlier, `s0` was redefined with a value that is NOT the rewritten
+    /// descriptor-array index, so binding it would be an out-of-bounds
+    /// descriptor read. The program-order walk stops at the immediate move
+    /// (`Blocked`) and never falls back to the covered load.
+    #[test]
+    fn eud_alias_arithmetic_in_chain_still_refuses() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // image_store dmask1 reading its storage T# from s[0:7] (srsrc = 0).
+        shader_parse(
+            0,
+            &[0xF020_0100, 0x0060_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_store dmask1 (T# at s0)");
+        // Insert BEFORE the MIMG: s_mov_b32 s0, 0x1234 (immediate redefinition).
+        let smov_imm = ShaderInstruction {
+            type_: T::SMovB32,
+            format: F::SVdstSVsrc0,
+            src_num: 1,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 0,
+                size: 1,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::LiteralConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(0x1234),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        code.get_instructions_mut().insert(0, smov_imm);
+        // Insert BEFORE the mov: a COVERED s_load_dwordx8 s[8:15], s[12:13], 0x0
+        // — a valid descriptor load, but into s8, NOT s0. It must NOT rescue the
+        // immediate-redefined s0.
+        let sload = ShaderInstruction {
+            type_: T::SLoadDwordx8,
+            format: F::Sdst8SbaseSoffset,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 8,
+                size: 8,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 12,
+                    size: 2,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::LiteralConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(0),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        code.get_instructions_mut().insert(0, sload);
+        // Order is now [sload s8, smov s0<-imm, image_store T#=s0].
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.extended.used = true;
+        input_info.bind.extended.start_register = 12;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_storage_num = 1;
+        // The storage descriptor maps at EUD dword 0 (s32) — so the covered
+        // s8 load recompiles, but s0's value is the immediate, not this index.
+        input_info.bind.textures2d.desc[0].start_register = 32;
+        input_info.bind.textures2d.desc[0].extended = true;
+        input_info.bind.textures2d.desc[0].textures2d_without_sampler = true;
+
+        let err = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect_err("immediate redefinition in the chain must refuse");
         assert!(
             err.to_string().contains("dynamic-image-descriptor"),
             "named refusal expected, got: {err}"

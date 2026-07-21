@@ -572,6 +572,45 @@ pub fn scalar_load_target_address(load: &ScalarLoadRef, user_sgpr: &UserSgprInfo
     Some(ptr.wrapping_add(u64::from(load.byte_offset)))
 }
 
+/// The EUD dword offset a COVERED scalar load off the EUD base pair fills the
+/// SGPR range starting at `reg` from, or `None` if no such load seeds `reg`.
+///
+/// A descriptor delivered through the raw EUD window is read into the register
+/// file by an `s_load_dword{,x2,x4,x8} s[reg..], s[eud_base:eud_base+1],
+/// <const>` (the exact shape `sload_dword_extended` and
+/// `shader_detect_eud_raw_window` accept). The returned dword offset is the
+/// load's byte offset >> 2 — the EUD dword whose captured-descriptor coverage
+/// decides whether `reg`'s dword 0 gets a rewritten descriptor-array index.
+/// Shared by the recompiler's `mimg_descriptor_guard` alias rule and the
+/// analysis-side raw-EUD image-descriptor capture pass.
+pub(crate) fn eud_load_offset_for_register(
+    code: &ShaderCode,
+    eud_base: i32,
+    reg: i32,
+) -> Option<i32> {
+    use crate::shader::types::ShaderInstructionType as T;
+    for load in code.get_instructions() {
+        match load.type_ {
+            T::SLoadDword | T::SLoadDwordx2 | T::SLoadDwordx4 | T::SLoadDwordx8 => {}
+            _ => continue,
+        }
+        if load.src[0].type_ != ShaderOperandType::Sgpr
+            || load.src[0].register_id != eud_base
+            || load.dst.type_ != ShaderOperandType::Sgpr
+            || load.dst.register_id != reg
+            || !matches!(
+                load.src[1].type_,
+                ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
+            )
+            || load.src[1].constant.i() < 0
+        {
+            continue;
+        }
+        return Some((load.src[1].constant.u >> 2) as i32);
+    }
+    None
+}
+
 /// Kyty: Shader.cpp `ShaderGetStorageBuffer` (L1141).
 pub fn shader_get_storage_buffer(
     info: &mut ShaderStorageResources,
@@ -1258,6 +1297,173 @@ fn trace_eud_evidence(
             );
         }
     }
+}
+
+/// SharpEmu-parity capture of image descriptors delivered RAW through the
+/// EUD — no usage-table slot declares them; the shader loads them itself with
+/// a covered `s_load` off the EUD base pair and feeds the loaded registers
+/// straight to an MIMG. SharpEmu resolves every image descriptor by scalar-
+/// evaluating the program and copying the register file at the MIMG
+/// (`reference/sharpemu/src/SharpEmu.ShaderCompiler/`
+/// `Gen5ShaderScalarEvaluator.cs:599-668`); the equivalent here reads the
+/// descriptor's dwords out of the EUD snapshot at the covered load's offset
+/// and captures it exactly like a declared sharp. The recompiler's
+/// `mimg_descriptor_guard` then accepts the MIMG register through its
+/// covered-load alias rule, and `WriteLocalVariables` / `sload_dword_extended`
+/// seed the rewritten descriptor-array index into the load's destination
+/// registers at runtime — no raw guest dword is ever bound as an array index.
+///
+/// Measured (ASTRO.BOT 2026-07-21, after the EUD snapshot-base fix): 4 CS
+/// shaders (`0x500542c00`/`0x500566b00` sampled s16, `0x500543b00` storage
+/// s68, `0x50740a700` S# s16) refused `dynamic-image-descriptor` on exactly
+/// this shape, ~740 dispatches each per 300 s; their writebacks feed the
+/// WAIT_REG_MEM labels the ACB queues park on, so the refusals also
+/// serialized presents (256 → 8 per run).
+///
+/// Degrade rules (never a refusal HERE — the guard's named skip stands):
+/// no EUD, no covered load for the register, offset outside the snapshot,
+/// all-zero content, or a buffer-typed dword3 (type nibble 0) → no capture.
+/// A captured-but-unsupported texture type still errors by name via the same
+/// checks the declared-sharp walks run. CS-only wiring, like the raw-EUD
+/// window (VS/PS defer until measured).
+pub fn shader_capture_eud_image_descriptors(
+    code: &ShaderCode,
+    bind: &mut ShaderBindResources,
+    user_sgpr: &UserSgprInfo,
+    eud: EudView<'_>,
+) -> Result<(), ShaderAnalysisError> {
+    use crate::shader::types::ShaderInstructionType as T;
+    if !bind.extended.used {
+        return Ok(());
+    }
+    let eud_base = bind.extended.start_register;
+    let sgprs_max = UserSgprInfo::SGPRS_MAX as i32;
+    // `read_sharp_fields` marks consumed registers for DIRECT sharps only;
+    // every synthesized capture is EUD-resident (start >= SGPRS_MAX), so the
+    // flag array is dead weight here.
+    let mut unused_flags = [false; UserSgprInfo::SGPRS_MAX];
+
+    // The two virtual-register conventions `eud_rel_index` resolves
+    // (`start >= SGPRS_MAX` ⇒ `start - SGPRS_MAX`; else rebased on the EUD
+    // base register), reproduced locally so capture-time dedup matches the
+    // guard's acceptance exactly.
+    let rel_of = |start: i32| -> Option<i32> {
+        if start >= sgprs_max {
+            Some(start - sgprs_max)
+        } else if start >= eud_base {
+            Some(start - eud_base)
+        } else {
+            None
+        }
+    };
+
+    for inst in code.get_instructions() {
+        let (want_storage, uses_sampler) = match inst.type_ {
+            T::ImageStore | T::ImageStoreMip => (true, false),
+            T::ImageLoad | T::ImageGetResinfo => (false, false),
+            T::ImageSample
+            | T::ImageSampleLz
+            | T::ImageSampleLzO
+            | T::ImageSampleCLz
+            | T::ImageGather4Lz => (false, true),
+            _ => continue,
+        };
+
+        // T# operand (MIMG srsrc): 8 consecutive SGPRs starting at src[1].
+        let t_op = inst.src[1];
+        if t_op.type_ == ShaderOperandType::Sgpr {
+            let t_reg = t_op.register_id;
+            let tex_num = usize::try_from(bind.textures2d.textures_num.max(0))
+                .unwrap_or(0)
+                .min(bind.textures2d.desc.len());
+            let direct_hit = bind.textures2d.desc[..tex_num]
+                .iter()
+                .any(|d| d.start_register == t_reg && d.textures2d_without_sampler == want_storage);
+            if !direct_hit && let Some(k) = eud_load_offset_for_register(code, eud_base, t_reg) {
+                let alias_hit = bind.textures2d.desc[..tex_num].iter().any(|d| {
+                    d.extended
+                        && d.textures2d_without_sampler == want_storage
+                        && rel_of(d.start_register) == Some(k)
+                });
+                let ku = usize::try_from(k).unwrap_or(usize::MAX);
+                if !alias_hit && let Some(fields) = eud.data.get(ku..ku + 8) {
+                    let type_nibble = (fields[3] >> 28) & 0xf;
+                    if fields.iter().any(|&d| d != 0) && type_nibble != 0 {
+                        let slot = bind.textures2d.textures_num;
+                        shader_get_texture_buffer(
+                            &mut bind.textures2d,
+                            &mut unused_flags,
+                            sgprs_max + k,
+                            slot,
+                            if want_storage {
+                                ShaderTextureUsage::ReadWrite
+                            } else {
+                                ShaderTextureUsage::ReadOnly
+                            },
+                            user_sgpr,
+                            Some(eud),
+                        )?;
+                        let last = (bind.textures2d.textures_num - 1) as usize;
+                        let t = &bind.textures2d.desc[last].texture;
+                        if want_storage {
+                            // Same gate as the declared table-1 walk: the
+                            // storage-image machinery covers 2D + 3D only.
+                            if t.type_() != 9 && t.type_() != 10 {
+                                return Err(ni_owned(format!(
+                                    "read-write (raw-EUD) texture type {} is not Texture2D (9) \
+                                     or 3D (10) (base={:#x} format={} tile={})",
+                                    t.type_(),
+                                    t.base40(),
+                                    t.format(),
+                                    t.tile_mode(),
+                                )));
+                            }
+                        } else {
+                            check_read_only_texture_type(t)?;
+                        }
+                        tracing::debug!(
+                            eud_dword = k,
+                            reg = t_reg,
+                            storage = want_storage,
+                            "captured raw-EUD image descriptor from covered load"
+                        );
+                    }
+                }
+            }
+        }
+
+        // S# operand (MIMG ssamp): 4 consecutive SGPRs starting at src[2].
+        if uses_sampler && inst.src[2].type_ == ShaderOperandType::Sgpr {
+            let s_reg = inst.src[2].register_id;
+            let samp_num = usize::try_from(bind.samplers.samplers_num.max(0))
+                .unwrap_or(0)
+                .min(bind.samplers.start_register.len());
+            let direct_hit = bind.samplers.start_register[..samp_num].contains(&s_reg);
+            if !direct_hit && let Some(k) = eud_load_offset_for_register(code, eud_base, s_reg) {
+                let alias_hit = (0..samp_num).any(|i| {
+                    bind.samplers.extended[i] && rel_of(bind.samplers.start_register[i]) == Some(k)
+                });
+                let ku = usize::try_from(k).unwrap_or(usize::MAX);
+                if !alias_hit && eud.data.get(ku..ku + 4).is_some() {
+                    let slot = bind.samplers.samplers_num;
+                    shader_get_sampler(
+                        &mut bind.samplers,
+                        &mut unused_flags,
+                        sgprs_max + k,
+                        slot,
+                        user_sgpr,
+                        Some(eud),
+                    )?;
+                    tracing::debug!(
+                        eud_dword = k,
+                        reg = s_reg,
+                        "captured raw-EUD sampler descriptor from covered load"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Kyty: Shader.cpp `ShaderParseUsage2` (L1505) — the PS5 path over the
@@ -2110,6 +2316,18 @@ fn read_extended_user_data(
             return None;
         }
         let src = mem.dwords_at(ptr)?;
+        // Prefer the full extended-mapping window: shaders scalar-load
+        // descriptors PAST the declared `eud_size_dw` (measured on ASTRO.BOT
+        // CS 0x500543b00 — storage T# at virtual s68 = EUD dword 36 with
+        // eud_size_dw=28; the metadata size is a driver hint, not a bound —
+        // the load just adds its offset to the same pointer). Cap at the
+        // recompiler's mapping size so capture can never outrun
+        // `WriteLocalVariables`. Fall back to the declared size when the
+        // memory behind the pointer is shorter.
+        let want = size.max(super::spirv::EXTENDED_MAPPING_DWORDS);
+        if src.len() >= want {
+            return Some(src[..want].to_vec());
+        }
         (src.len() >= size).then(|| src[..size].to_vec())
     };
 
@@ -2178,8 +2396,23 @@ fn read_extended_user_data(
         );
     }
     if let Some((buf, base)) = loads.into_iter().find_map(|load| {
-        let addr = scalar_load_target_address(&load, user_sgpr)?;
-        Some((read_at(addr)?, load.base_register))
+        // The EUD pointer is the BASE PAIR's value: a load's byte offset
+        // selects a descriptor WITHIN the buffer, and the virtual-register
+        // mapping (`sharp at s{base+k}` ⇒ EUD dword k) only holds from the
+        // pair value. Snapshotting at base+offset (the old behavior) shifted
+        // the whole view by the scan-order-first load's offset — measured on
+        // ASTRO.BOT composite CS 0x500665c00, whose first load is `+0x60`:
+        // every sharp peek read 24 dwords high, the sampled T# declared at
+        // EUD dword 0 mis-classed, and its `image_sample_lz` refused as
+        // `dynamic-image-descriptor`. The target address still gates WHICH
+        // base is picked in `find_scalar_load_bases` order; the snapshot
+        // itself must start at the pair.
+        let base = usize::try_from(load.base_register).ok()?;
+        if base + 1 >= UserSgprInfo::SGPRS_MAX {
+            return None;
+        }
+        let ptr = user_sgpr_pair(user_sgpr, load.base_register);
+        Some((read_at(ptr)?, load.base_register))
     }) {
         return Some((buf, base));
     }
@@ -2580,26 +2813,44 @@ pub fn shader_get_input_info_cs(
             i32::from(regs.cs_regs.user_sgpr),
             mem,
         );
+        let eud_buf = read_extended_user_data(
+            user_data,
+            &regs.cs_user_sgpr,
+            i32::from(regs.cs_regs.user_sgpr),
+            mem,
+            regs.cs_regs.data_addr,
+            next_gen,
+        );
+        let eud_view = eud_buf.as_ref().map(|(data, base_dw)| EudView {
+            data,
+            base_dw: *base_dw,
+        });
         shader_parse_usage2(
             user_data,
             &mut usage,
             &mut info.bind,
             &regs.cs_user_sgpr,
             i32::from(regs.cs_regs.user_sgpr),
-            read_extended_user_data(
-                user_data,
-                &regs.cs_user_sgpr,
-                i32::from(regs.cs_regs.user_sgpr),
-                mem,
-                regs.cs_regs.data_addr,
-                next_gen,
-            )
-            .as_ref()
-            .map(|(data, base_dw)| EudView {
-                data,
-                base_dw: *base_dw,
-            }),
+            eud_view,
         )?;
+        // Raw-EUD image descriptors: T#/S#s the shader loads itself (no
+        // usage-table slot) get captured from the EUD snapshot at the covered
+        // load's offset — see `shader_capture_eud_image_descriptors`. A body
+        // that does not parse skips the pass; translate fails it by name
+        // later anyway.
+        if let Some(view) = eud_view {
+            let mut code = ShaderCode::new();
+            if let Some(src) = mem.dwords_at(regs.cs_regs.data_addr)
+                && shader_parse(0, &src, &mut code, next_gen).is_ok()
+            {
+                shader_capture_eud_image_descriptors(
+                    &code,
+                    &mut info.bind,
+                    &regs.cs_user_sgpr,
+                    view,
+                )?;
+            }
+        }
     } else {
         let code = mem
             .dwords_at(regs.cs_regs.data_addr)
@@ -5005,6 +5256,239 @@ mod tests {
         assert_eq!(
             base_dw, 12,
             "the EUD base slot is the register holding the pointer pair"
+        );
+    }
+
+    /// EUD resolver strategy 2 must snapshot the EUD at the load's BASE-PAIR
+    /// value, not at base+offset: a load's byte offset selects a descriptor
+    /// WITHIN the buffer, and the virtual-register mapping (sharp at
+    /// s{base+k} ⇒ EUD dword k) only holds from the pair value. Measured on
+    /// ASTRO.BOT composite CS `0x500665c00` (declared=14 count=14, EUD 28 dw
+    /// at (s12,s13)): the scan-order-first load is `s_load_dwordx4 s[16:19],
+    /// s[12:13], 0x60`, and snapshotting at base+0x60 shifted every sharp
+    /// peek 24 dwords high — the sampled T# declared at EUD dword 0 peeked
+    /// garbage, mis-classed, and its `image_sample_lz` refused as
+    /// `dynamic-image-descriptor` (the whole composite/read pass skipped).
+    #[test]
+    fn eud_strategy2_snapshots_at_base_pair_not_first_load_target() {
+        let eud_base: u64 = 0x4_0032_5330;
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[12] = 0x0032_5330;
+        value[13] = 0x4;
+        let user_sgpr = UserSgprInfo {
+            value,
+            type_: [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX],
+            count: 14,
+        };
+        let user_data = ShaderUserData {
+            direct_resource_offset: vec![],
+            sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+            eud_size_dw: 28,
+            srt_size_dw: 0,
+        };
+        let shader_addr = 0x1000;
+        // The measured 0x500665c00 shape: first (scan-order) load at +0x60,
+        // then the T# load at +0x0.
+        let body = vec![
+            0xF408_0406,
+            0xFA00_0060, // s_load_dwordx4 s[16:19], s[12:13], 0x60
+            0xF40C_0806,
+            0xFA00_0000, // s_load_dwordx8 s[32:39], s[12:13], 0x0
+            S_ENDPGM,
+        ];
+        // 64 dwords behind the base so base+0x60 is ALSO readable for 28 dw —
+        // exactly the live shape (guest memory continues past the EUD), which
+        // is what let the buggy target-address read succeed.
+        let mut eud = vec![0u32; 64];
+        eud[0] = 0xAAAA_0001; // EUD dword 0 (the T#'s first dword)
+        eud[24] = 0xBBBB_0018; // content at +0x60 — must NOT become buf[0]
+        let mem = TestMem {
+            regions: vec![(shader_addr, body), (eud_base, eud)],
+        };
+        let (buf, base_dw) =
+            read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true)
+                .expect("strategy 2 must recover the EUD via the load base pair");
+        assert_eq!(base_dw, 12);
+        assert_eq!(
+            buf[0], 0xAAAA_0001,
+            "snapshot must start at the base-pair value, not the first load's target"
+        );
+        assert_eq!(buf[24], 0xBBBB_0018);
+    }
+
+    use crate::shader::types::{ShaderConstant, ShaderInstruction, ShaderOperand};
+
+    fn sgpr_op(register_id: i32, size: i32) -> ShaderOperand {
+        ShaderOperand {
+            type_: ShaderOperandType::Sgpr,
+            register_id,
+            size,
+            ..Default::default()
+        }
+    }
+
+    fn imm_op(byte_offset: u32) -> ShaderOperand {
+        ShaderOperand {
+            type_: ShaderOperandType::IntegerInlineConstant,
+            constant: ShaderConstant::from_u(byte_offset),
+            ..Default::default()
+        }
+    }
+
+    fn covered_load(
+        type_: crate::shader::types::ShaderInstructionType,
+        dst_reg: i32,
+        dst_size: i32,
+        byte_offset: u32,
+    ) -> ShaderInstruction {
+        let mut inst = ShaderInstruction {
+            type_,
+            ..Default::default()
+        };
+        inst.src[0] = sgpr_op(12, 2);
+        inst.src[1] = imm_op(byte_offset);
+        inst.src_num = 2;
+        inst.dst = sgpr_op(dst_reg, dst_size);
+        inst
+    }
+
+    /// The measured ASTRO.BOT composite-CS shape (0x500665c00 family): the
+    /// sampled T# and its S# are delivered RAW through the EUD — no
+    /// usage-table slot declares them; the shader loads both itself with
+    /// covered `s_load`s off the EUD pair and samples. The capture pass must
+    /// synthesize both captures from the EUD snapshot (T# fields are the
+    /// live-traced dwords, type nibble 9 = Texture2D) so the MIMG guard's
+    /// alias rule accepts the registers.
+    #[test]
+    fn raw_eud_image_descriptor_captured_from_covered_load() {
+        use crate::shader::types::ShaderInstructionType as T;
+        let mut bind = ShaderBindResources::default();
+        bind.extended.used = true;
+        bind.extended.start_register = 12;
+
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut()
+            .push(covered_load(T::SLoadDwordx8, 32, 8, 0x0)); // T# from EUD dword 0
+        code.get_instructions_mut()
+            .push(covered_load(T::SLoadDwordx4, 8, 4, 0x20)); // S# from EUD dword 8
+        let mut sample = ShaderInstruction {
+            type_: T::ImageSampleLz,
+            ..Default::default()
+        };
+        sample.src[0] = ShaderOperand {
+            type_: ShaderOperandType::Vgpr,
+            register_id: 5,
+            size: 3,
+            ..Default::default()
+        };
+        sample.src[1] = sgpr_op(32, 8);
+        sample.src[2] = sgpr_op(8, 4);
+        sample.src_num = 3;
+        code.get_instructions_mut().push(sample);
+
+        // Live-traced EUD head from cs@0x500665c00 (mem[s12:s13]): a real 2D
+        // T# (dword3 0x91800924, type nibble 9) followed by an S#.
+        let mut eud = vec![0u32; 64];
+        eud[..4].copy_from_slice(&[0x053a_c400, 0xc160_0000, 0x0043_4077, 0x9180_0924]);
+        eud[8..11].copy_from_slice(&[0x7092, 0x00ff_f000, 0x0500_0000]);
+
+        let user_sgpr = UserSgprInfo {
+            value: [0u32; UserSgprInfo::SGPRS_MAX],
+            type_: [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX],
+            count: 14,
+        };
+        shader_capture_eud_image_descriptors(
+            &code,
+            &mut bind,
+            &user_sgpr,
+            EudView {
+                data: &eud,
+                base_dw: 12,
+            },
+        )
+        .expect("raw-EUD T#/S# must capture");
+
+        assert_eq!(bind.textures2d.textures_num, 1);
+        let d = &bind.textures2d.desc[0];
+        assert_eq!(
+            d.start_register,
+            UserSgprInfo::SGPRS_MAX as i32,
+            "captured at the EUD-virtual register for dword 0"
+        );
+        assert!(d.extended);
+        assert!(!d.textures2d_without_sampler, "a sampled T#, not storage");
+        assert_eq!(d.texture.fields[3], 0x9180_0924);
+        assert_eq!(bind.samplers.samplers_num, 1);
+        assert_eq!(
+            bind.samplers.start_register[0],
+            UserSgprInfo::SGPRS_MAX as i32 + 8
+        );
+        assert!(bind.samplers.extended[0]);
+        assert_eq!(bind.samplers.samplers[0].fields[0], 0x7092);
+
+        // Idempotence: a second pass sees the alias hit and captures nothing
+        // new (several MIMGs commonly read the same descriptor).
+        shader_capture_eud_image_descriptors(
+            &code,
+            &mut bind,
+            &user_sgpr,
+            EudView {
+                data: &eud,
+                base_dw: 12,
+            },
+        )
+        .expect("re-run must be a no-op");
+        assert_eq!(bind.textures2d.textures_num, 1);
+        assert_eq!(bind.samplers.samplers_num, 1);
+    }
+
+    /// Degrade rules: all-zero content and buffer-typed dword3 (type nibble
+    /// 0) must NOT capture — the recompiler's named `dynamic-image-descriptor`
+    /// refusal stands instead of binding garbage.
+    #[test]
+    fn raw_eud_capture_declines_zero_and_buffer_typed_content() {
+        use crate::shader::types::ShaderInstructionType as T;
+        let mut bind = ShaderBindResources::default();
+        bind.extended.used = true;
+        bind.extended.start_register = 12;
+
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut()
+            .push(covered_load(T::SLoadDwordx8, 32, 8, 0x0)); // all-zero dwords
+        code.get_instructions_mut()
+            .push(covered_load(T::SLoadDwordx8, 16, 8, 0x40)); // buffer-typed (nibble 0)
+        for t_reg in [32, 16] {
+            let mut store = ShaderInstruction {
+                type_: T::ImageStore,
+                ..Default::default()
+            };
+            store.src[1] = sgpr_op(t_reg, 8);
+            store.src_num = 2;
+            code.get_instructions_mut().push(store);
+        }
+
+        let mut eud = vec![0u32; 64];
+        // Dwords 16..24 hold a V#-shaped quad: dword3 type nibble 0.
+        eud[16..20].copy_from_slice(&[0x1234_5678, 0x0000_0004, 0xffff_ffff, 0x0002_4fac]);
+
+        let user_sgpr = UserSgprInfo {
+            value: [0u32; UserSgprInfo::SGPRS_MAX],
+            type_: [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX],
+            count: 14,
+        };
+        shader_capture_eud_image_descriptors(
+            &code,
+            &mut bind,
+            &user_sgpr,
+            EudView {
+                data: &eud,
+                base_dw: 12,
+            },
+        )
+        .expect("declines are silent, not errors");
+        assert_eq!(
+            bind.textures2d.textures_num, 0,
+            "neither zero nor buffer-typed content may capture"
         );
     }
 
