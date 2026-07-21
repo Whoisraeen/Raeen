@@ -627,14 +627,66 @@ fn hle_get_vblank_status(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
+/// Nominal display refresh period. Default 60 Hz matches the base-console
+/// display contract; `XPS5X_VBLANK_HZ=120` selects the PS5's 120 Hz output
+/// mode. MEASURED (stage C): the old unconditional 16.667 ms sleep was the
+/// whole-title FPS ceiling — Minecraft's flip loop paced off this wait while
+/// the GPU path had ~8x headroom (min flip interval 2.03 ms vs p50 16.5 ms).
+fn vblank_period() -> std::time::Duration {
+    static PERIOD: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *PERIOD.get_or_init(|| {
+        let hz = std::env::var("XPS5X_VBLANK_HZ")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|hz| (24..=480).contains(hz))
+            .unwrap_or(60);
+        std::time::Duration::from_nanos(1_000_000_000 / hz)
+    })
+}
+
+/// Wait until the next vblank edge on the process-wide schedule.
+///
+/// Edges are anchored to a fixed epoch (`epoch + n·period`), not to "now +
+/// period": per-call relative sleeps drift and quantize. Windows' default
+/// timer resolution (~15.6 ms) rounds ANY shorter `thread::sleep` up to a
+/// full tick — the stage-C measurement saw exactly that signature (20.2 ms
+/// intervals from a 16.7 ms sleep) — so the tail of the wait is a
+/// yield-spin: coarse-sleep only while more than a full timer tick remains,
+/// then yield to the edge. At 120 Hz the whole 8.3 ms wait yields; that
+/// costs scheduler wakeups on the one thread the title parks here, which is
+/// what a vblank wait is for.
+fn wait_next_vblank_edge() {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let epoch = *EPOCH.get_or_init(std::time::Instant::now);
+    let period = vblank_period();
+    let elapsed = epoch.elapsed();
+    let next = (elapsed.as_nanos() / period.as_nanos() + 1) as u64;
+    let deadline = std::time::Duration::from_nanos(next.saturating_mul(period.as_nanos() as u64));
+    const TIMER_TICK: std::time::Duration = std::time::Duration::from_millis(17);
+    loop {
+        let now = epoch.elapsed();
+        if now >= deadline {
+            return;
+        }
+        let remaining = deadline - now;
+        if remaining > TIMER_TICK {
+            std::thread::sleep(remaining - TIMER_TICK);
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
 /// `sceVideoOutWaitVblank(handle)`: pace the native guest thread to the next
-/// nominal 60 Hz display edge, then advance the process-local vblank sequence.
+/// display edge on the process-wide vblank schedule (default 60 Hz;
+/// `XPS5X_VBLANK_HZ` selects other modes), then advance the process-local
+/// vblank sequence.
 fn hle_wait_vblank(ctx: &HleContext, args: &[u64]) -> u64 {
     let handle = args.first().copied().unwrap_or(0) as i32;
     if handle != 1 {
         return VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
-    std::thread::sleep(std::time::Duration::from_micros(16_667));
+    wait_next_vblank_edge();
     let vblanks = ctx
         .kernel
         .video_out_vblank_count
