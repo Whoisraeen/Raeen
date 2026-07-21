@@ -2337,3 +2337,50 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   CAVEAT: this commit bundled concurrent stage-D GPU texture cache whose FPS is
   UNVERIFIED (Minecraft after-run flips 43->22, build 969->59us) — re-measure via
   XPS5X_NO_TEX_CACHE A/B and revert if it regresses.
+
+## 2026-07-21 driver — EUD snapshot base fix + raw-EUD image-descriptor capture
+- (Landed inside commit 5802864, which a CONCURRENT session pushed while this
+  session's re-measure ran; that commit bundles THREE mechanisms and its
+  message describes only the third: (a) this session's strategy-2 EUD
+  snapshot-base fix, (b) this session's raw-EUD T#/S# capture pass,
+  (c) the other session's program-order EUD-alias walk.)
+- (a) read_extended_user_data strategy 2 snapshotted the EUD at
+  base + FIRST-LOAD-OFFSET instead of the base-pair value: ASTRO composite
+  CS 0x500665c00's first scan-order load is +0x60, so every sharp peek read
+  24 dwords high — the sampled T# declared at EUD dword 0 (live-traced
+  dword3=0x91800924, type nibble 9=2D) peeked garbage, mis-classed, and its
+  image_sample_lz refused as dynamic-image-descriptor. Also widened the
+  snapshot to EXTENDED_MAPPING_DWORDS (64) when readable: shaders load
+  descriptors past the declared eud_size_dw (0x500543b00 storage T# at
+  virtual s68 = dword 36, size says 28). Red-green:
+  eud_strategy2_snapshots_at_base_pair_not_first_load_target.
+- (b) shader_capture_eud_image_descriptors (analysis.rs, CS-wired): T#/S#s
+  delivered RAW through the EUD (no usage-table slot) — the shader loads
+  them itself with covered s_loads and feeds the registers to MIMGs — are
+  now captured from the EUD snapshot at the load's offset (8-dw T# / 4-dw
+  S#, start = SGPRS_MAX + dword), then the guard's alias rule accepts them.
+  SharpEmu parity: Gen5ShaderScalarEvaluator.cs:599-668 (register-file copy
+  at the MIMG; ours reads the same bytes at the EUD offset). Degrades: zero
+  or buffer-typed (nibble 0) content, out-of-window, parse failure → no
+  capture, named refusal stands. Tests:
+  raw_eud_image_descriptor_captured_from_covered_load (+ idempotence),
+  raw_eud_capture_declines_zero_and_buffer_typed_content.
+- IMPORTANT sequencing lesson: (a) ALONE regressed the run — correct
+  refusals replaced garbage-descriptor writebacks (596→26; ALL baseline
+  storage-image writebacks were nonzero=false i.e. zeros), the WAIT_REG_MEM
+  labels those dispatches wrote stopped arriving, ACB queues parked
+  (0→14 suspends), presents collapsed 256→8. (b) restored the producers
+  with CORRECT descriptors. Measured 300s release runs (ASTRO.BOT):
+  refusals 497 → 0; writebacks 596 → 2019 (incl. nonzero image writebacks
+  0 → 225 — first real compute image content ever); suspends 0; presents
+  back to 256 (13 frame dumps). Frames: earlier = the 4-flat-colour
+  composite, late = banded blue gradient (10 colours, 0% exact clear) —
+  presentation class unchanged, NO scene claim (§5 censused).
+- kyty-graphics 366 tests, xps5x-gpu 144, workspace clippy -D warnings,
+  fmt clean (verified again on HEAD after the concurrent commit).
+- NEXT GATE (only remaining translate class, 2 shaders): "mixed sampled
+  texture dims in one shader" — 0x500564500 (2d+3d) + one (3d+2darray).
+  Fix = per-dim sampled arrays (%textures2D_S stays for Dim 2D; add
+  suffixed arrays + per-dim index assignment in prepare_stage_binding +
+  per-instruction dim resolution replacing whole-shader
+  sampled_texture_dim in the sample bodies).
