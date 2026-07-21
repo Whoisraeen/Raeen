@@ -798,16 +798,25 @@ fn mark_array_upload_unsupported(base: u64) {
     }
 }
 
-/// The canonical Dim ordinal of a sampled T# `type_()`, matching
-/// `kyty_graphics::shader::SampledDim::ordinal`: 2D = 0, 2DArray = 1, 3D = 2,
-/// Cube = 3. A mixed-dim shader assigns per-Dim descriptor bindings in this
-/// order, so the host and the SPIR-V generator agree on which array each Dim
-/// lands at (`binding_sampled_index + position-among-present-Dims`).
-fn sampled_dim_ordinal(texture_type: u8) -> usize {
-    // Delegates to the SPIR-V generator's own classifier so the host and the
+/// The number of distinct sampled-array keys — 4 Dims x 3 numeric classes
+/// (`kyty_graphics::shader::sampled_key_ordinal` is Dim-major).
+const SAMPLED_KEYS: usize = 12;
+
+/// The canonical (Dim, numeric class) key ordinal of a sampled T#, matching
+/// `kyty_graphics::shader::sampled_key_ordinal`. A mixed shader assigns
+/// per-key descriptor bindings in this order, so the host and the SPIR-V
+/// generator agree on which array each T# lands at
+/// (`binding_sampled_index + position-among-present-keys`).
+fn sampled_key_ordinal(t: &kyty_graphics::shader::ShaderTextureResource) -> usize {
+    // Delegates to the SPIR-V generator's own classifiers so the host and the
     // shader can never disagree on a T#'s array (classifier drift here would
-    // bind a texture into an array the shader never reads it from).
-    kyty_graphics::shader::SampledDim::from_texture_type(texture_type).ordinal() as usize
+    // bind a texture into an array the shader never reads it from — or, for
+    // the class axis, put an R8_UINT view under a `%float` image type:
+    // the measured VUID-vkCmdDispatch-format-07753).
+    kyty_graphics::shader::sampled_key_ordinal(
+        kyty_graphics::shader::SampledDim::from_texture_type(t.type_()),
+        kyty_graphics::shader::SampledClass::from_unified_format(t.format()),
+    ) as usize
 }
 
 /// Decode one T# into linear pixels a Vulkan sampled image can hold.
@@ -1603,15 +1612,17 @@ fn prepare_stage_binding(
     // 0..storage_num, because the two SPIR-V arrays are separate bindings.
     let mut textures = Vec::with_capacity(texture_num);
     let mut storage_images = Vec::new();
-    // Mixed-dim sampled routing: the recompiled SPIR-V declares one
-    // `%textures2D_S<dim>` array per present sampled Dim, each at its own
-    // binding. Each sampled T#'s seeded index is its position WITHIN its own
-    // Dim's array (0..count-of-that-Dim), and `sampled_dim_views[ord]` records
-    // which `textures` entry fills each slot. Indexed by the canonical Dim
-    // ordinal `sampled_dim_ordinal` — the same order the SPIR-V generator and
-    // `shader_calc_binding_indices` use to assign per-Dim bindings.
-    let mut sampled_dim_count = [0u64; 4];
-    let mut sampled_dim_views: [Vec<usize>; 4] = Default::default();
+    // Mixed-key sampled routing: the recompiled SPIR-V declares one
+    // `%textures2D_S<key>` array per present sampled (Dim, numeric class)
+    // key, each at its own binding. Each sampled T#'s seeded index is its
+    // position WITHIN its own key's array (0..count-of-that-key), and
+    // `sampled_key_views[ord]` records which `textures` entry fills each
+    // slot. Indexed by the canonical key ordinal `sampled_key_ordinal` — the
+    // same order the SPIR-V generator and `shader_calc_binding_indices` use
+    // to assign per-key bindings.
+    let mut sampled_key_count = [0u64; SAMPLED_KEYS];
+    let mut sampled_key_views: [Vec<usize>; SAMPLED_KEYS] =
+        std::array::from_fn(|_| Vec::new());
     // Per-stage decoded-byte budget (see `stage_texture_byte_cap`): a composite
     // sampling several full-resolution scene targets decodes them all from guest
     // memory at once, and the peak host allocation can abort the process. Refuse
@@ -1699,35 +1710,36 @@ fn prepare_stage_binding(
                     );
                 }
             }
-            let ord = sampled_dim_ordinal(desc.texture.type_());
+            let ord = sampled_key_ordinal(&desc.texture);
             let view_index = textures.len();
-            // Seed the T# index WITHIN its Dim's array (homogeneous shaders
-            // have one Dim, so this counts 0,1,2… exactly as the old
+            // Seed the T# index WITHIN its key's array (homogeneous shaders
+            // have one key, so this counts 0,1,2… exactly as the old
             // `textures.len()` did).
-            rewritten.update_address38(sampled_dim_count[ord]);
-            sampled_dim_count[ord] += 1;
-            sampled_dim_views[ord].push(view_index);
+            rewritten.update_address38(sampled_key_count[ord]);
+            sampled_key_count[ord] += 1;
+            sampled_key_views[ord].push(view_index);
             textures.push(decoded);
         }
         for field in rewritten.fields {
             push_constants.extend_from_slice(&field.to_le_bytes());
         }
     }
-    // A shader binds more than one sampled Dim => build the per-Dim groups the
-    // host descriptor path uses (one array per Dim). Present Dims are taken in
-    // canonical ordinal order and assigned consecutive bindings starting at
-    // `binding_sampled_index`, matching the SPIR-V generator exactly. A
-    // homogeneous shader leaves `sampled_groups` empty (single-array path).
-    let present_dims: Vec<usize> = (0..4)
-        .filter(|&o| !sampled_dim_views[o].is_empty())
+    // A shader binds more than one sampled (Dim, class) key => build the
+    // per-key groups the host descriptor path uses (one array per key).
+    // Present keys are taken in canonical ordinal order and assigned
+    // consecutive bindings starting at `binding_sampled_index`, matching the
+    // SPIR-V generator exactly. A homogeneous shader leaves `sampled_groups`
+    // empty (single-array path).
+    let present_keys: Vec<usize> = (0..SAMPLED_KEYS)
+        .filter(|&o| !sampled_key_views[o].is_empty())
         .collect();
-    let sampled_groups: Vec<SampledGroup> = if present_dims.len() > 1 {
-        present_dims
+    let sampled_groups: Vec<SampledGroup> = if present_keys.len() > 1 {
+        present_keys
             .iter()
             .enumerate()
             .map(|(pos, &ord)| SampledGroup {
                 binding: bind.textures2d.binding_sampled_index as u32 + pos as u32,
-                view_indices: std::mem::take(&mut sampled_dim_views[ord]),
+                view_indices: std::mem::take(&mut sampled_key_views[ord]),
             })
             .collect()
     } else {
@@ -3477,6 +3489,111 @@ mod tests {
             1,
             "2D B indexes %textures2D_S_2D[1] — its dim-local position, not its global 2"
         );
+    }
+
+    /// The numeric class the SHADER translator declares its sampled image
+    /// type with must agree with the VkFormat the VIEW is created in, for
+    /// every unified format `texture_vk_format` implements — their divergence
+    /// IS the measured VUID-vkCmdDispatch-format-07753 (unified 5 view =
+    /// `R8_UINT`, shader type = `%float`). Sweeps the whole 9-bit unified
+    /// format space so any future `texture_vk_format` arm is covered the day
+    /// it lands.
+    #[test]
+    fn texture_vk_format_numeric_class_matches_shader_sampled_class() {
+        for fmt in 0u16..512 {
+            let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+            t.fields[1] |= u32::from(fmt) << 20;
+            let Ok((vk_format, _)) = texture_vk_format(&t) else {
+                continue; // unimplemented format — named error, nothing bound
+            };
+            let name = format!("{vk_format:?}");
+            let view_class = if name.contains("UINT") {
+                kyty_graphics::shader::SampledClass::Uint
+            } else if name.contains("SINT") {
+                kyty_graphics::shader::SampledClass::Sint
+            } else {
+                kyty_graphics::shader::SampledClass::Float
+            };
+            assert_eq!(
+                kyty_graphics::shader::SampledClass::from_unified_format(fmt),
+                view_class,
+                "unified format {fmt} maps to {name} but the shader would \
+                 declare a different sampled component class"
+            );
+        }
+    }
+
+    /// A stage sampling one FLOAT-class 2D texture AND one UINT-class 2D
+    /// texture (the ASTRO.BOT R8_UINT shape): `prepare_stage_binding` must
+    /// split the views into per-(Dim, class) groups — float at
+    /// `binding_sampled_index`, uint at the next binding — and seed each T#'s
+    /// index WITHIN its own class's array, mirroring the recompiled SPIR-V's
+    /// `%textures2D_S_2D` / `%textures2D_S_2D_U` split.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn compute_binding_mixed_classes_split_into_per_class_groups() {
+        const W: u32 = 4;
+        const H: u32 = 4;
+        const BYTES_RGBA8: usize = (W * H * 4) as usize;
+        const BYTES_R8: usize = (W * H) as usize;
+
+        let mut arena = vec![0u8; 1024 + 255];
+        let base = (arena.as_ptr() as u64 + 255) & !255;
+        let off = (base - arena.as_ptr() as u64) as usize;
+        for i in 0..BYTES_RGBA8 {
+            arena[off + i] = (i % 251) as u8; // RGBA8 float-class at +0
+        }
+        for i in 0..BYTES_R8 {
+            arena[off + 512 + i] = ((i * 7 + 3) % 251) as u8; // R8_UINT at +512
+        }
+        let content = |o: usize, n: usize| arena[off + o..off + o + n].to_vec();
+
+        // An R8_UINT T# (unified format 5), 2D, linear tile.
+        let mut r8 = rgba8_linear_tsharp(base + 512, W, H);
+        r8.fields[1] &= !(0x1FF << 20);
+        r8.fields[1] |= 5 << 20; // unified 5 = R8 UINT
+
+        let mut bind = ShaderBindResources::default();
+        bind.push_constant_size = 2 * 32;
+        bind.textures2d.textures_num = 2;
+        bind.textures2d.textures2d_sampled_num = 2;
+        bind.textures2d.binding_sampled_index = 0;
+        // Two present keys => two sampled bindings (0, 1); storage at 2.
+        bind.textures2d.binding_storage_index = 2;
+        bind.textures2d.desc[0].texture = rgba8_linear_tsharp(base, W, H); // float
+        bind.textures2d.desc[1].texture = r8; // uint
+
+        let ranges = [(arena.as_ptr() as u64, arena.len())];
+        let binding = crate::guest_mem::with_test_ranges(&ranges, || {
+            prepare_stage_binding(&bind, vk::ShaderStageFlags::COMPUTE)
+        })
+        .expect("mixed-class sampled compute binding");
+
+        let textures = binding.textures.expect("sampled textures");
+        assert_eq!(textures.textures.len(), 2);
+        assert_eq!(textures.textures[0].pixels, content(0, BYTES_RGBA8));
+        assert_eq!(textures.textures[0].format, vk::Format::R8G8B8A8_UNORM);
+        assert_eq!(textures.textures[1].pixels, content(512, BYTES_R8));
+        assert_eq!(textures.textures[1].format, vk::Format::R8_UINT);
+
+        // Two per-class groups: (2D, Float) at binding 0, (2D, Uint) at
+        // binding 1, each holding its single view.
+        assert_eq!(textures.sampled_groups.len(), 2);
+        assert_eq!(textures.sampled_groups[0].binding, 0);
+        assert_eq!(textures.sampled_groups[0].view_indices, vec![0]);
+        assert_eq!(textures.sampled_groups[1].binding, 1);
+        assert_eq!(textures.sampled_groups[1].view_indices, vec![1]);
+
+        // Each T#'s seeded index is its position within its own class array.
+        let dword0 = |group: usize| {
+            u32::from_le_bytes(
+                binding.push_constants[group * 32..group * 32 + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(dword0(0), 0, "the float T# indexes %textures2D_S_2D[0]");
+        assert_eq!(dword0(1), 0, "the uint T# indexes %textures2D_S_2D_U[0]");
     }
 
     /// SharpEmu-parity window sizing (Gen5ShaderScalarEvaluator.cs:1952-1960

@@ -351,14 +351,12 @@ fn draw_nav_pills(painter: &egui::Painter, theme: &Theme, screen: Rect, nav: &Na
     );
     x += PILL_H + PILL_GAP;
 
-    // Label order must match the `nav::PILL_*` focus indices.
+    // Label order must match the `nav::PILL_*` focus indices. Only
+    // functional destinations get a pill (no dead Store/Library chrome).
     let labels = [
-        ("Store", false),
         ("My games", nav.tab == RailTab::Games),
         ("Media", nav.tab == RailTab::Media),
-        ("Library", false),
         ("Settings", false),
-        ("\u{2022}\u{2022}\u{2022}", false),
     ];
     debug_assert_eq!(labels.len(), nav::PILL_COUNT);
     for (i, (label, active)) in labels.into_iter().enumerate() {
@@ -605,10 +603,20 @@ fn draw_context_block(
 
     let stats_top = rail_bottom + 52.0 + title_h + 28.0;
     let Some(meta) = meta else {
+        // Real package identity (sce_sys/param.json) for games; plain
+        // "Open …" for built-in apps. No fictional stats without data.
+        let line = match (item.kind, &item.title_id, &item.version) {
+            (ItemKind::Game, Some(id), Some(version)) => {
+                format!("{id}  ·  v{version}  ·  Ready to play")
+            }
+            (ItemKind::Game, Some(id), None) => format!("{id}  ·  Ready to play"),
+            (ItemKind::Game, None, _) => "Ready to play".to_string(),
+            _ => format!("Open {}", item.title),
+        };
         painter.text(
             Pos2::new(left, stats_top),
             Align2::LEFT_TOP,
-            format!("Open {}", item.title),
+            line,
             FontId::proportional(18.0),
             theme.palette.text_dim,
         );

@@ -144,6 +144,39 @@ pub fn install_fonts(ctx: &egui::Context, theme: &Theme) {
             .entry(egui::FontFamily::Monospace)
             .or_default()
             .insert(0, name);
+    } else {
+        // No theme font: prefer the host's native UI fonts over egui's
+        // bundled ones. The bundled proportional face is a LIGHT weight —
+        // thin strokes plus grayscale AA read as blurry at 1:1 DPI (user
+        // report, measured 96-DPI panel). Segoe UI regular and Consolas are
+        // designed for on-screen legibility at Shell sizes. Missing files
+        // (non-Windows hosts, trimmed installs) keep the built-ins; the
+        // built-ins also remain as fallback for uncovered glyphs.
+        #[cfg(windows)]
+        for (file, name, family) in [
+            (
+                "C:/Windows/Fonts/segoeui.ttf",
+                "segoe-ui",
+                egui::FontFamily::Proportional,
+            ),
+            (
+                "C:/Windows/Fonts/consola.ttf",
+                "consolas",
+                egui::FontFamily::Monospace,
+            ),
+        ] {
+            if let Ok(bytes) = std::fs::read(file) {
+                fonts.font_data.insert(
+                    name.to_string(),
+                    Arc::new(egui::FontData::from_owned(bytes)),
+                );
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .insert(0, name.to_string());
+            }
+        }
     }
     ctx.set_fonts(fonts);
 }

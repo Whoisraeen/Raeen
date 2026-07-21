@@ -177,8 +177,35 @@ pub fn item_from_folder(
         art,
         meta,
         cover_path: None,
+        title_id: None,
+        version: None,
         launch: LaunchTarget::Game { path: eboot },
     })
+}
+
+/// Enrich a scanned item with the title's own `sce_sys/param.json` (next to
+/// the eboot): the real title name, title id, and content version every
+/// installed PS5 title ships. The user's `xps5x-title.toml` (explicit
+/// intent) still outranks it for the display title; the folder-derived
+/// fallback does not. Absent or unparsable metadata changes nothing.
+fn enrich_from_param_json(item: &mut LibraryItem, eboot: &Path, had_title_toml: bool) {
+    let Some(dir) = eboot.parent() else { return };
+    let Ok(metadata) = xps5x_loader::pkg::scan_game_directory(dir) else {
+        return;
+    };
+    // A title with no ASCII at all (e.g. a Japanese-only default locale)
+    // would render as tofu boxes — the Shell font ships no CJK glyphs. Keep
+    // the readable folder-derived title in that case.
+    let renderable = metadata.title.chars().any(|c| c.is_ascii_alphanumeric());
+    if !metadata.title.is_empty() && metadata.title != "Unknown" && !had_title_toml && renderable {
+        item.title = metadata.title;
+    }
+    if !metadata.title_id.is_empty() && metadata.title_id != "UNKNOWN00000" {
+        item.title_id = Some(metadata.title_id);
+    }
+    if !metadata.app_version.is_empty() {
+        item.version = Some(metadata.app_version);
+    }
 }
 
 /// Locate a game folder's `eboot.bin`.
@@ -299,6 +326,9 @@ pub fn scan_dir(root: &Path) -> Vec<LibraryItem> {
         let title_toml = std::fs::read_to_string(path.join("xps5x-title.toml")).ok();
         if let Some(mut item) = item_from_folder(name, eboot.clone(), title_toml.as_deref()) {
             item.cover_path = find_cover(&path, eboot.as_deref());
+            if let Some(eboot) = eboot.as_deref() {
+                enrich_from_param_json(&mut item, eboot, title_toml.is_some());
+            }
             items.push(item);
         }
     }

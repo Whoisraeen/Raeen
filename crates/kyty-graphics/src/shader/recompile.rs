@@ -31,10 +31,10 @@ use std::sync::OnceLock;
 
 pub use super::spirv::ShaderRecompileError;
 use super::spirv::{
-    SampledDim, Spirv, SpirvType, not_supported, operand_is_constant, operand_is_exec,
-    operand_is_variable, operand_load_float, operand_load_int, operand_load_uint,
-    operand_variable_to_str, operand_variable_to_str_shift, sampled_dims_present,
-    sampled_texture_dim, spirv_generate_source, spirv_get_embedded_ps, spirv_get_embedded_vs,
+    SampledClass, SampledDim, Spirv, SpirvType, not_supported, operand_is_constant,
+    operand_is_exec, operand_is_variable, operand_load_float, operand_load_int, operand_load_uint,
+    operand_variable_to_str, operand_variable_to_str_shift, sampled_key_of, sampled_key_suffix,
+    sampled_keys_present, spirv_generate_source, spirv_get_embedded_ps, spirv_get_embedded_vs,
     storage_texture_dim_format,
 };
 use crate::shader::resources::{
@@ -4329,29 +4329,36 @@ fn sampler_register_is_eud_alias(
 /// conservative refusal is a named skip, not a wrong render.
 /// The per-descriptor sampled-image route for a MIMG body: the SPIR-V id
 /// suffix that points its `%textures2D_S`/`%ImageS`/`%SampledImage`/pointer
-/// references at the array matching the sampled T#'s own Dim, plus that Dim
-/// (for coordinate-component selection). In a homogeneous shader the suffix is
-/// empty and the Dim is the shader-wide one, so output is byte-identical to
-/// the single-array path.
+/// references at the array matching the sampled T#'s own (Dim, numeric
+/// class) key, plus that Dim (for coordinate-component selection) and class
+/// (for result typing — [`route_sampled_class`]). In a homogeneous shader the
+/// suffix is empty and the key is the shader-wide one, so output is
+/// byte-identical to the single-array path for the Float class.
 ///
 /// `matched` is [`mimg_descriptor_guard`]'s resolution of WHICH captured
 /// descriptor the instruction's T# names — through a direct start-register
 /// match or the program-order EUD-alias walk. Routing by that same resolution
 /// (instead of re-matching registers here) is what lets an EUD-aliased T# in
-/// a mixed shader reach its own Dim's array; a bare register re-match would
+/// a mixed shader reach its own key's array; a bare register re-match would
 /// re-refuse exactly the aliased descriptors the walk was built to accept
 /// (ASTRO.BOT, refusals 642->90).
 fn sampled_site_route(
     spirv: &Spirv<'_>,
     matched: Option<usize>,
     func: &'static str,
-) -> Result<(&'static str, SampledDim), ShaderRecompileError> {
+) -> Result<(&'static str, SampledDim, SampledClass), ShaderRecompileError> {
     let bind = spirv
         .get_bind_info()
         .expect("sampled MIMG bodies check textures2d_sampled_num > 0 first");
-    let present = sampled_dims_present(bind);
+    let present = sampled_keys_present(bind);
     if present.len() <= 1 {
-        return Ok(("", sampled_texture_dim(bind)?));
+        // Homogeneous (or a fixture with no captured T# dwords): the single
+        // present key, defaulting to the legacy 2D-float shape.
+        let (dim, class) = present
+            .first()
+            .copied()
+            .unwrap_or((SampledDim::Two, SampledClass::Float));
+        return Ok(("", dim, class));
     }
     // `mimg_descriptor_guard` runs before every route call and refuses an
     // unmatched T#, so a mixed shader reaching here without a resolution is
@@ -4359,13 +4366,13 @@ fn sampled_site_route(
     let Some(i) = matched else {
         return Err(not_supported(
             func,
-            "mixed-dim sample T# matches no captured sampled descriptor",
+            "mixed-key sample T# matches no captured sampled descriptor",
         ));
     };
     // Bounded: the guard produced `i` from an iterator over
     // `desc[..tex_num]` with `tex_num` clamped to `desc.len()`.
-    let dim = SampledDim::from_texture_type(bind.textures2d.desc[i].texture.type_());
-    Ok((dim.mixed_suffix(), dim))
+    let (dim, class) = sampled_key_of(&bind.textures2d.desc[i].texture);
+    Ok((sampled_key_suffix(dim, class), dim, class))
 }
 
 /// Rewrite the four sampled-image identifiers in a freshly-built MIMG body to
@@ -4388,6 +4395,55 @@ fn route_sampled_ids(body: &mut String, suffix: &str) {
         .replace("%textures2D_S ", &format!("%textures2D_S{suffix} "))
         .replace("%SampledImage ", &format!("%SampledImage{suffix} "))
         .replace("%ImageS ", &format!("%ImageS{suffix} "));
+}
+
+/// Retype a freshly-built MIMG body's texel result for an INTEGER-class
+/// sampled image: SPIR-V requires the sample/gather/fetch result to be a
+/// vec4 of the image's sampled type, so each `... %v4float` result line is
+/// rewritten to sample into `%v4uint`/`%v4int` and `OpBitcast` the whole
+/// vector back into the float-typed register model — RAW BITS, exactly
+/// SharpEmu's Uint handling (Gen5SpirvTranslator keeps Uint sample results
+/// unconverted and bitcasts everything into u32 registers; the recompiler's
+/// registers are float-typed bitcast equivalents), never `OpConvertUToF`.
+/// `Float` (and bodies with no texel result, e.g. resinfo) is a no-op, so
+/// float shaders stay byte-identical.
+fn route_sampled_class(body: &mut String, class: SampledClass) {
+    if class == SampledClass::Float {
+        return;
+    }
+    const RESULT_OPS: [&str; 4] = [
+        "= OpImageSampleImplicitLod %v4float ",
+        "= OpImageSampleExplicitLod %v4float ",
+        "= OpImageGather %v4float ",
+        "= OpImageFetch %v4float ",
+    ];
+    let v4 = class.v4_type_str();
+    let mut out = String::with_capacity(body.len() + 160);
+    for line in body.split_inclusive('\n') {
+        if !RESULT_OPS.iter().any(|op| line.contains(op)) {
+            out.push_str(line);
+            continue;
+        }
+        // "<indent>%id = Op... %v4float <operands>\n" becomes the same
+        // instruction into "%id_raw" with the class's vec4 type, then a
+        // bitcast back to the float vec4 every downstream `%id` use expects.
+        let Some(eq) = line.find('=') else {
+            out.push_str(line);
+            continue;
+        };
+        let (lhs, rhs) = line.split_at(eq);
+        let id = lhs.trim();
+        let indent = &lhs[..lhs.len() - lhs.trim_start().len()];
+        out.push_str(&format!(
+            "{indent}{id}_raw {}",
+            rhs.replacen("%v4float", v4, 1)
+        ));
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!("{indent}{id} = OpBitcast %v4float {id}_raw\n"));
+    }
+    *body = out;
 }
 
 fn mimg_descriptor_guard(
@@ -4424,7 +4480,7 @@ fn mimg_descriptor_guard(
         .unwrap_or(0)
         .min(bind.textures2d.desc.len());
     // `textures2d_without_sampler` is the recompiler-native storage/sampled
-    // discriminator (`sampled_texture_dim` / `storage_texture_dim_format`
+    // discriminator (`sampled_keys_present` / `storage_texture_dim_format`
     // split the two SPIR-V arrays on it). The resolution keeps WHICH
     // descriptor matched (its `desc` index): `sampled_site_route` routes the
     // MIMG body to that descriptor's own Dim array in a mixed-dim shader —
@@ -4602,9 +4658,10 @@ fn image_sample_channels(
 "#;
 
             // Cube and 3D textures sample with a 3-component coordinate; 2D
-            // with 2. In a mixed-dim shader the Dim (and the image-array route)
-            // comes from THIS sample's own T#, not a shader-wide decision.
-            let (suffix, dim) = sampled_site_route(spirv, matched, func)?;
+            // with 2. In a mixed shader the Dim/class (and the image-array
+            // route) come from THIS sample's own T#, not a shader-wide
+            // decision.
+            let (suffix, dim, class) = sampled_site_route(spirv, matched, func)?;
             let coord = if dim.coord_components() == 3 {
                 let src0_value2 = operand_variable_to_str_shift(inst.src[0], 2);
                 if src0_value2.type_ != SpirvType::Float {
@@ -4645,6 +4702,7 @@ fn image_sample_channels(
                 .replace("<src2_value0>", &src2_value0.value)
                 .replace("<index>", &format!("{index}"));
             route_sampled_ids(&mut body, suffix);
+            route_sampled_class(&mut body, class);
             *dst_source += &body;
 
             return Ok(true);
@@ -4807,7 +4865,7 @@ fn recompile_image_sample_c_lz(
         true,
     )?;
 
-    let (clz_suffix, clz_dim) = sampled_site_route(spirv, matched, FUNC)?;
+    let (clz_suffix, clz_dim, clz_class) = sampled_site_route(spirv, matched, FUNC)?;
     // 2D uses a v2 coordinate (s, t). A 2DArray depth texture sampled through a
     // Vaddr3 MIMG carries only {dref, s, t} — there is no fourth address VGPR
     // for the array slice — so the shader is sampling array layer 0; its
@@ -4881,6 +4939,10 @@ fn recompile_image_sample_c_lz(
         .replace("<coord_y>", &coord_y.value)
         .replace("<index>", &format!("{index}"));
     route_sampled_ids(&mut head, clz_suffix);
+    // Integer-class depth-compare: the texel is sampled in its own class and
+    // bitcast to the float register model before the FOrd compare — raw-bits
+    // parity with SharpEmu (a UINT depth source is degenerate either way).
+    route_sampled_class(&mut head, clz_class);
     *dst_source += &head;
 
     let values: &[&str] = match inst.format {
@@ -4921,7 +4983,7 @@ fn recompile_image_sample_c_lz(
 /// Dim-aware sample-coordinate construction shared by the `image_sample_lz`
 /// bodies: loads 2 (2D) or 3 (Cube/3D volume) consecutive coordinate floats
 /// from `src0` and builds `%t42_<index>` — the Dim comes from the same
-/// `sampled_texture_dim` decision `Spirv::write_types` declared the image
+/// `sampled_site_route` decision `Spirv::write_types` declared the image
 /// array with, so coordinates and image type can never disagree.
 fn sample_coord_snippet(
     dim: SampledDim,
@@ -5020,7 +5082,7 @@ fn recompile_image_sample_lz_dmask7(
          %t55_<index> = OpLoad %float %t54_<index>
                OpStore %<dst_value2> %t55_<index>
 "#;
-            let (suffix, dim) = sampled_site_route(spirv, matched, FUNC)?;
+            let (suffix, dim, class) = sampled_site_route(spirv, matched, FUNC)?;
             let coord = sample_coord_snippet(dim, inst.src[0], FUNC)?;
             let mut body = TEXT
                 .replace("<coord>", &coord)
@@ -5031,6 +5093,7 @@ fn recompile_image_sample_lz_dmask7(
                 .replace("<dst_value1>", &dst_value1.value)
                 .replace("<dst_value2>", &dst_value2.value);
             route_sampled_ids(&mut body, suffix);
+            route_sampled_class(&mut body, class);
             *dst_source += &body;
 
             return Ok(true);
@@ -5107,7 +5170,7 @@ fn recompile_image_sample_lz_dmask_f(
          %t58_<index> = OpLoad %float %t57_<index>
                OpStore %<dst_value3> %t58_<index>
 "#;
-            let (suffix, dim) = sampled_site_route(spirv, matched, FUNC)?;
+            let (suffix, dim, class) = sampled_site_route(spirv, matched, FUNC)?;
             let coord = sample_coord_snippet(dim, inst.src[0], FUNC)?;
             let mut body = TEXT
                 .replace("<coord>", &coord)
@@ -5119,6 +5182,7 @@ fn recompile_image_sample_lz_dmask_f(
                 .replace("<dst_value2>", &dst_value2.value)
                 .replace("<dst_value3>", &dst_value3.value);
             route_sampled_ids(&mut body, suffix);
+            route_sampled_class(&mut body, class);
             *dst_source += &body;
 
             return Ok(true);
@@ -5183,7 +5247,7 @@ fn image_sample_lz_single_channel(
          %t47_<index> = OpLoad %float %t46_<index>
                OpStore %<dst_value0> %t47_<index>
 "#;
-            let (suffix, dim) = sampled_site_route(spirv, matched, func)?;
+            let (suffix, dim, class) = sampled_site_route(spirv, matched, func)?;
             let coord = sample_coord_snippet(dim, inst.src[0], func)?;
             let mut body = TEXT
                 .replace("<coord>", &coord)
@@ -5193,6 +5257,7 @@ fn image_sample_lz_single_channel(
                 .replace("<src2_value0>", &src2_value0.value)
                 .replace("<dst_value0>", &dst_value0.value);
             route_sampled_ids(&mut body, suffix);
+            route_sampled_class(&mut body, class);
             *dst_source += &body;
 
             return Ok(true);
@@ -5258,7 +5323,7 @@ fn recompile_image_sample_lz_dmask3(
          %t51_<index> = OpLoad %float %t50_<index>
                OpStore %<dst_value1> %t51_<index>
 "#;
-            let (suffix, dim) = sampled_site_route(spirv, matched, FUNC)?;
+            let (suffix, dim, class) = sampled_site_route(spirv, matched, FUNC)?;
             let coord = sample_coord_snippet(dim, inst.src[0], FUNC)?;
             let mut body = TEXT
                 .replace("<coord>", &coord)
@@ -5268,6 +5333,7 @@ fn recompile_image_sample_lz_dmask3(
                 .replace("<dst_value0>", &dst_value0.value)
                 .replace("<dst_value1>", &dst_value1.value);
             route_sampled_ids(&mut body, suffix);
+            route_sampled_class(&mut body, class);
             *dst_source += &body;
 
             return Ok(true);
@@ -5336,7 +5402,7 @@ fn recompile_image_gather4_lz_dmask1(
         true,
     )?;
     // Gathers are 2D-only in Vulkan (no 3D gather; cube gathers unmeasured).
-    let (g4_suffix, g4_dim) = sampled_site_route(spirv, matched, FUNC)?;
+    let (g4_suffix, g4_dim, g4_class) = sampled_site_route(spirv, matched, FUNC)?;
     if g4_dim != SampledDim::Two {
         return Err(not_supported(FUNC, "gather from a non-2D texture"));
     }
@@ -5390,6 +5456,7 @@ fn recompile_image_gather4_lz_dmask1(
         .replace("<src2_value0>", &src2_value0.value)
         .replace("<index>", &format!("{index}"));
     route_sampled_ids(&mut body, g4_suffix);
+    route_sampled_class(&mut body, g4_class);
     *dst_source += &body;
 
     Ok(true)
@@ -5481,7 +5548,7 @@ fn recompile_image_sample_lzo_dmask7(
             // The offset math builds a 2D coordinate and queries a v2int size,
             // so this body is 2D-only; a mixed shader whose LzO T# is 3D/Cube
             // is a named refusal rather than a wrong-Dim sample.
-            let (suffix, dim) = sampled_site_route(spirv, matched, FUNC)?;
+            let (suffix, dim, class) = sampled_site_route(spirv, matched, FUNC)?;
             if dim != SampledDim::Two {
                 return Err(not_supported(FUNC, "offset sample of a non-2D texture"));
             }
@@ -5496,6 +5563,7 @@ fn recompile_image_sample_lzo_dmask7(
                 .replace("<dst_value1>", &dst_value1.value)
                 .replace("<dst_value2>", &dst_value2.value);
             route_sampled_ids(&mut body, suffix);
+            route_sampled_class(&mut body, class);
             *dst_source += &body;
 
             return Ok(true);
@@ -5548,8 +5616,10 @@ fn recompile_image_get_resinfo_dmask3(
     )?;
 
     // The query extracts a v2int size, so this body is 2D-only; a mixed
-    // shader whose resinfo T# is 3D/Cube is a named refusal.
-    let (resinfo_suffix, resinfo_dim) = sampled_site_route(spirv, matched, FUNC)?;
+    // shader whose resinfo T# is 3D/Cube is a named refusal. The numeric
+    // class routes only the array ids — `OpImageQuerySizeLod` returns
+    // `%v2int` for every sampled component type, so no result retyping.
+    let (resinfo_suffix, resinfo_dim, _) = sampled_site_route(spirv, matched, FUNC)?;
     if resinfo_dim != SampledDim::Two {
         return Err(not_supported(FUNC, "resinfo of a non-2D texture"));
     }
@@ -5648,7 +5718,7 @@ fn image_load_channels(
             // 3D (x, y, z) texture — the third component from the MIMG
             // address's third VGPR. A Cube texture cannot be texel-fetched in
             // SPIR-V (it must be sampled), so that stays a named refusal.
-            let (suffix, dim) = sampled_site_route(spirv, matched, func)?;
+            let (suffix, dim, class) = sampled_site_route(spirv, matched, func)?;
             let coord = match dim {
                 SampledDim::Two => concat!(
                     "         %t73_<index> = ",
@@ -5682,6 +5752,7 @@ fn image_load_channels(
                 .replace("<src0_value1>", &src0_value1.value)
                 .replace("<src1_value0>", &src1_value0.value);
             route_sampled_ids(&mut body, suffix);
+            route_sampled_class(&mut body, class);
             *dst_source += &body;
 
             return Ok(true);
@@ -11219,6 +11290,219 @@ mod tests {
             "the 3D fetch coordinate must carry z:\n{source}"
         );
         let _ = spirv_run(&source).expect("assemble 3D image_load");
+    }
+
+    /// A T# whose unified format is an INTEGER class (5 = R8 UINT — SharpEmu
+    /// Gfx10UnifiedFormat: dataFormat 1, numFormat 4) must be sampled through
+    /// a UINT-typed `OpTypeImage`, with the raw texel bits bitcast into the
+    /// float-typed register model (SharpEmu parity: Gen5SpirvTranslator keeps
+    /// Uint sample results as raw bits, never ConvertUToF). The measured
+    /// failure without this: VUID-vkCmdDispatch-format-07753 on ASTRO.BOT —
+    /// the view is `VK_FORMAT_R8_UINT` (draw_translate, unified 5) while the
+    /// shader declared `OpTypeImage %float`, undefined behavior with
+    /// validation off.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn r8_uint_sampled_texture_samples_raw_bits_via_uint_image() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF09C_0200, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_sample_lz dmask2");
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 4;
+        input_info.bind.textures2d.desc[0].texture.fields[1] |= 5 << 20; // unified 5 = R8 UINT
+        input_info.bind.samplers.samplers_num = 1;
+        input_info.bind.samplers.start_register[0] = 12;
+        input_info.bind.samplers.binding_index = 1;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile R8_UINT image_sample_lz");
+        assert!(
+            source.contains("%ImageS = OpTypeImage %uint 2D 0 0 0 1 Unknown"),
+            "a UINT-class T# needs a UINT sampled image type:\n{source}"
+        );
+        assert!(
+            source.contains("OpImageSampleExplicitLod %v4uint"),
+            "the sample result type must match the image's sampled type:\n{source}"
+        );
+        assert!(
+            source.contains("OpBitcast %v4float"),
+            "raw bits must be bitcast into the float register model:\n{source}"
+        );
+        assert!(
+            !source.contains("OpImageSampleExplicitLod %v4float"),
+            "no float-typed sample of a UINT image may remain:\n{source}"
+        );
+        assert!(
+            !source.contains("OpConvertUToF"),
+            "SharpEmu parity: raw bits, never a numeric conversion:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble R8_UINT image_sample_lz");
+        spirv_val_ok(&words, "R8_UINT image_sample_lz");
+    }
+
+    /// FLOAT-class regression pin: a T# with unified format 71 (16_16_16_16
+    /// FLOAT — numFormat 7) keeps the legacy float-typed image and sample,
+    /// with no bitcast inserted.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn float_class_sampled_texture_still_emits_float_image_type() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF09C_0200, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_sample_lz dmask2");
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 4;
+        input_info.bind.textures2d.desc[0].texture.fields[1] |= 71 << 20; // 16x4 FLOAT
+        input_info.bind.samplers.samplers_num = 1;
+        input_info.bind.samplers.start_register[0] = 12;
+        input_info.bind.samplers.binding_index = 1;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile float image_sample_lz");
+        assert!(
+            source.contains("%ImageS = OpTypeImage %float 2D 0 0 0 1 Unknown"),
+            "{source}"
+        );
+        assert!(
+            source.contains("OpImageSampleExplicitLod %v4float"),
+            "{source}"
+        );
+        assert!(
+            !source.contains("OpBitcast %v4float"),
+            "a float-class sample needs no result bitcast:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble float image_sample_lz");
+        spirv_val_ok(&words, "float image_sample_lz");
+    }
+
+    /// A shader sampling a FLOAT-class 2D texture AND a UINT-class 2D texture
+    /// splits them into per-(Dim, class) arrays — `%textures2D_S_2D` (float)
+    /// and `%textures2D_S_2D_U` (uint) at consecutive bindings — and routes
+    /// each sample to its own T#'s array with the matching result typing.
+    /// Same grouping machinery as the mixed-Dim split, keyed on numeric class.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn mixed_float_and_uint_2d_textures_split_into_per_class_arrays() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // Sample T#0 (2D float, s0..s7) and T#1 (2D uint, s16..s23), both
+        // through S#0 (s8..s11) — an `image_sample_lz` dmask 0x3 each.
+        let sample = |t_reg: i32| ShaderInstruction {
+            type_: T::ImageSampleLz,
+            format: F::Vdata2Vaddr3StSsDmask3,
+            src_num: 3,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Vgpr,
+                register_id: 2,
+                size: 2,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Vgpr,
+                    register_id: 6,
+                    size: 3,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: t_reg,
+                    size: 8,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 8,
+                    size: 4,
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        code.get_instructions_mut().push(sample(0));
+        code.get_instructions_mut().push(sample(16));
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            ..Default::default()
+        });
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 128;
+        input_info.bind.textures2d.textures_num = 2;
+        input_info.bind.textures2d.textures2d_sampled_num = 2;
+        // T#0: 2D float (unified 56 = 8_8_8_8 UNORM); T#1: 2D uint (unified 5).
+        input_info.bind.textures2d.desc[0].texture.fields[3] |= 9 << 28;
+        input_info.bind.textures2d.desc[0].texture.fields[1] |= 56 << 20;
+        input_info.bind.textures2d.desc[0].start_register = 0;
+        input_info.bind.textures2d.desc[1].texture.fields[3] |= 9 << 28;
+        input_info.bind.textures2d.desc[1].texture.fields[1] |= 5 << 20;
+        input_info.bind.textures2d.desc[1].start_register = 16;
+        // Two sampled classes => two sampled bindings (0, 1); storage 2;
+        // sampler 3 — the same reservation rule as mixed Dims.
+        input_info.bind.textures2d.binding_sampled_index = 0;
+        input_info.bind.textures2d.binding_storage_index = 2;
+        input_info.bind.samplers.samplers_num = 1;
+        input_info.bind.samplers.start_register[0] = 8;
+        input_info.bind.samplers.binding_index = 3;
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile mixed float+uint sample");
+
+        assert!(
+            source.contains("%ImageS_2D = OpTypeImage %float 2D 0 0 0 1 Unknown"),
+            "float image type:\n{source}"
+        );
+        assert!(
+            source.contains("%ImageS_2D_U = OpTypeImage %uint 2D 0 0 0 1 Unknown"),
+            "uint image type:\n{source}"
+        );
+        assert!(
+            source.contains("OpDecorate %textures2D_S_2D Binding 0"),
+            "float array binding:\n{source}"
+        );
+        assert!(
+            source.contains("OpDecorate %textures2D_S_2D_U Binding 1"),
+            "uint array binding:\n{source}"
+        );
+        assert!(
+            source.contains("OpAccessChain %_ptr_UniformConstant_ImageS_2D %textures2D_S_2D"),
+            "a body indexes the float array:\n{source}"
+        );
+        assert!(
+            source.contains("OpAccessChain %_ptr_UniformConstant_ImageS_2D_U %textures2D_S_2D_U"),
+            "a body indexes the uint array:\n{source}"
+        );
+        assert!(
+            source.contains("OpImageSampleExplicitLod %v4float"),
+            "the float T#'s sample keeps its float result:\n{source}"
+        );
+        assert!(
+            source.contains("OpImageSampleExplicitLod %v4uint")
+                && source.contains("OpBitcast %v4float"),
+            "the uint T#'s sample retypes and bitcasts:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble mixed float+uint sample");
+        spirv_val_ok(&words, "mixed float+uint sample");
     }
 
     /// `v_min_u32` (VOP2 0x13) must recompile to a GLSL `UMin` and validate —

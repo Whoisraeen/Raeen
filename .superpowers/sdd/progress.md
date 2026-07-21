@@ -2464,3 +2464,56 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   deadlock-gone was verified on the CLI path (3 runs); Shell-path confirmation
   still owed once the SPIR-V-validity segfault is gated (process dies ~1s
   after submissions on both paths until then).
+- structurizer (dispatch-loop relooper): complete in kyty-graphics (uncommitted).
+  All guest branches emit through one OpLoopMerge loop + OpSwitch on %reloop_bb;
+  every basic block is a case; zero-label shaders keep the legacy linear path.
+  5 new tests incl. real-spirv-val acceptance (backward loop, nested loops,
+  forward skip/branch, fast-path guard); 382 kyty-graphics green. Live: ASTRO's
+  4 previously-invalid scene CS (203k/139k/22k/20k words) now translate VALID
+  (gate refusals 8 -> 0).
+- push-constant overflow guard: named skip when offset+size > device
+  maxPushConstantsSize (captured on VulkanDevice at creation) in compute +
+  offscreen pipeline paths. Live: fired once, no more 304>256 UB.
+- REMAINING native crasher: R8_UINT-vs-FLOAT sampled-image mismatch
+  (VUID-07753 UB) — run dies ~29s in with the other walls cleared.
+  Numeric-class-aware OpTypeImage fix in flight (gpu-pipeline agent, SharpEmu
+  Gen5SpirvTranslator parity, bitcast-not-convert).
+- sampled numeric-class fix LANDED (uncommitted): `SampledClass`
+  (Float/Uint/Sint from the T# unified format, SharpEmu Gfx10UnifiedFormat
+  numFormat 4/5 rows) joins `SampledDim` in a (Dim, class)-keyed sampled-array
+  split — spirv.rs `sampled_key_layout` emits per-class `OpTypeImage
+  %float/%uint/%int`, all MIMG sample/gather/fetch bodies retype the texel to
+  the class vec4 and `OpBitcast` raw bits into the float register model
+  (never ConvertUToF); analysis reserves one binding per key;
+  draw_translate groups/reindexes per key (12 ordinals) with a 0..512
+  unified-format sweep pinning shader class == view VkFormat class. Tests:
+  kyty-graphics 385/385 (3 new: r8_uint raw-bits, float pin, mixed
+  float+uint arrays — spirv-val'd), xps5x-gpu 163/163 (2 new); clippy lib
+  clean both. NOT yet verified against the live title (release run owned by
+  another session).
+- in-app log console SHIPPED (shell/console.rs + ConsoleBuffer/ConsoleLayer in
+  xps5x-core logging.rs): F10 toggles a floating console over any screen —
+  level filter, search, autoscroll, copy, clear, colored single-line truncated
+  rows (show_rows virtualization needs uniform height), 5k-line core ring
+  (XPS5X_CONSOLE_LINES). Verified by screenshot over Home AND in-game.
+  xps5x.exe is now GUI-subsystem (no terminal window from Explorer);
+  AttachConsole(ATTACH_PARENT_PROCESS) first thing in main keeps CLI output
+  working from a terminal.
+- COMBINED GPU ACCEPTANCE GREEN (log rotated to xps5x.log.1 during analysis —
+  beware the rotation-on-init trap when a second Shell launches mid-analysis):
+  240s ASTRO run rc=0, 0 segfaults, 0 deadlocks, 0 gate refusals (relooper
+  validates all 4 scene CS), 0 FLOAT-mismatch VUIDs (numeric-class fix), 1
+  named push-constant skip, 27 shaders translated, 73 flips, full render loop.
+  Session chain COMPLETE: EOP signaling -> spirv-val gate -> relooper ->
+  push-constant guard -> descriptor class fix. Next frontier: 548 named draw
+  skips (assorted classes, honest skips not crashes) + push-constant SSBO
+  spill + storage-image numeric classes (unmeasured).
+- UI batch (all screenshot-verified): PS5-authentic Home — real param.json
+  titles/ids/versions via xps5x-loader (en-US titleName preferred; ASCII
+  renderability gate), context line "PPSA17221 · v… · Ready to play", dead
+  Store/Game Library tiles + pills removed (pill row = My games/Media/
+  Settings, nav indices + tests updated); "blurry UI" root-caused as egui's
+  bundled LIGHT-weight font at 1:1 DPI (measured 96-DPI 1080x1920 portrait
+  panel, no DWM scaling) — theme::install_fonts now defaults to system
+  Segoe UI + Consolas (theme fonts still outrank; non-Windows keeps
+  built-ins), console rows 14px. Console window opaque dark chrome (#0D1017).

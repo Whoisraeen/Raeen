@@ -203,11 +203,28 @@ fn parse_param_json(path: &std::path::Path) -> Result<PkgMetadata, LoaderError> 
     // Extract key fields with basic string matching.
     let mut metadata = PkgMetadata::default();
 
+    // `localizedParameters` lists one `titleName` per locale, and the
+    // document-level default may be any language (ASTRO.BOT's is Japanese).
+    // Prefer the `en-US` entry when one exists: the first `titleName` after
+    // an `"en-US"` key wins and locks the title; otherwise the last plain
+    // `titleName` stands.
+    let mut await_en_us_title = false;
+    let mut title_locked = false;
+
     for line in contents.lines() {
         let line = line.trim();
+        if line.contains("\"en-US\"") {
+            await_en_us_title = true;
+        }
         if line.contains("\"titleName\"") || line.contains("\"title\"") {
             if let Some(value) = extract_json_string_value(line) {
-                metadata.title = value;
+                if await_en_us_title {
+                    metadata.title = value;
+                    title_locked = true;
+                    await_en_us_title = false;
+                } else if !title_locked {
+                    metadata.title = value;
+                }
             }
         } else if line.contains("\"titleId\"") {
             if let Some(value) = extract_json_string_value(line) {
@@ -216,6 +233,12 @@ fn parse_param_json(path: &std::path::Path) -> Result<PkgMetadata, LoaderError> 
         } else if line.contains("\"contentId\"") {
             if let Some(value) = extract_json_string_value(line) {
                 metadata.content_id = value;
+            }
+        } else if line.contains("\"contentVersion\"") || line.contains("\"masterVersion\"") {
+            if metadata.app_version.is_empty()
+                && let Some(value) = extract_json_string_value(line)
+            {
+                metadata.app_version = value;
             }
         } else if line.contains("\"applicationCategoryType\"")
             && let Some(value) = extract_json_string_value(line)

@@ -61,18 +61,44 @@ impl ConsolePane {
             return;
         }
 
-        let mut open = self.open;
-        egui::Window::new("Console")
-            .open(&mut open)
+        // Own chrome, always dark and fully opaque (SharpEmu console
+        // palette): the Shell theme may style egui windows light or
+        // translucent, and a log console over bright game art becomes
+        // low-contrast mush ("blurry") if it inherits that.
+        let frame = egui::Frame::window(&ctx.style())
+            .fill(egui::Color32::from_rgb(13, 16, 23))
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                egui::Color32::from_rgb(35, 43, 58),
+            ));
+        egui::Window::new("xps5x_console")
+            .title_bar(false)
+            .frame(frame)
             .default_size([920.0, 460.0])
             .min_size([480.0, 220.0])
             .resizable(true)
             .show(ctx, |ui| self.contents(ui));
-        self.open = open;
     }
 
     fn contents(&mut self, ui: &mut egui::Ui) {
+        // Scoped dark widget style (checkbox/combo/search/window text) so the
+        // console is self-consistent under any Shell theme.
+        *ui.visuals_mut() = egui::Visuals::dark();
+        ui.visuals_mut().override_text_color = Some(egui::Color32::from_rgb(208, 214, 222));
+        // Log rows at 14px: the 12px default is below Consolas' comfortable
+        // floor at 1:1 DPI (reads as blur, not smallness).
+        ui.style_mut().text_styles.insert(
+            egui::TextStyle::Monospace,
+            egui::FontId::monospace(14.0),
+        );
+
         ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Console")
+                    .strong()
+                    .color(egui::Color32::from_rgb(230, 235, 240)),
+            );
+            ui.separator();
             ui.label("Level:");
             egui::ComboBox::from_id_salt("console_level")
                 .selected_text(LEVELS[self.min_level].0)
@@ -90,7 +116,7 @@ impl ConsolePane {
             if ui.button("Copy").clicked() {
                 let text: String = self
                     .filtered()
-                    .map(|line| format_line(line))
+                    .map(format_line)
                     .collect::<Vec<_>>()
                     .join("\n");
                 ui.ctx().copy_text(text);
@@ -100,6 +126,9 @@ impl ConsolePane {
                 self.lines.clear();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("✕").on_hover_text("Close (F10)").clicked() {
+                    self.open = false;
+                }
                 ui.weak(format!("{} lines", self.lines.len()));
             });
         });
@@ -128,7 +157,11 @@ impl ConsolePane {
             .show_rows(ui, row_height, visible.len(), |ui, range| {
                 for &index in &visible[range] {
                     let line = &self.lines[index];
-                    ui.horizontal_wrapped(|ui| {
+                    // Single-line rows (SharpEmu NoWrap parity): `show_rows`
+                    // assumes uniform row height, so a wrapped multi-line
+                    // label would corrupt the scroll math. Long messages
+                    // truncate; Copy yields the full text.
+                    ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         ui.label(
                             egui::RichText::new(format!("{:9.3}", line.elapsed_ms as f64 / 1000.0))
@@ -145,10 +178,13 @@ impl ConsolePane {
                                 .monospace()
                                 .color(egui::Color32::from_rgb(120, 132, 148)),
                         );
-                        ui.label(
-                            egui::RichText::new(&line.message)
-                                .monospace()
-                                .color(message_color(line.level)),
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&line.message)
+                                    .monospace()
+                                    .color(message_color(line.level)),
+                            )
+                            .truncate(),
                         );
                     });
                 }

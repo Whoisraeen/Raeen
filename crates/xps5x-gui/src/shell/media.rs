@@ -39,6 +39,8 @@ pub fn media_items() -> Vec<LibraryItem> {
             },
             meta: None,
             cover_path: None,
+            title_id: None,
+            version: None,
             launch: LaunchTarget::App {
                 id: "media:wavelength".to_string(),
             },
@@ -56,6 +58,8 @@ pub fn media_items() -> Vec<LibraryItem> {
             },
             meta: None,
             cover_path: None,
+            title_id: None,
+            version: None,
             launch: LaunchTarget::App {
                 id: "media:screening-room".to_string(),
             },
@@ -73,6 +77,8 @@ pub fn media_items() -> Vec<LibraryItem> {
             },
             meta: None,
             cover_path: None,
+            title_id: None,
+            version: None,
             launch: LaunchTarget::App {
                 id: "media:wayfinder".to_string(),
             },
@@ -90,6 +96,8 @@ pub fn media_items() -> Vec<LibraryItem> {
             },
             meta: None,
             cover_path: None,
+            title_id: None,
+            version: None,
             launch: LaunchTarget::App {
                 id: "media:snapshots".to_string(),
             },

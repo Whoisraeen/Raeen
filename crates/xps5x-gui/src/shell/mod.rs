@@ -205,15 +205,9 @@ impl Shell {
         // that index simply never matches and nothing opens Settings.
         let settings_tile_index = library.iter().position(|item| item.id == "settings");
         let settings_row_counts = settings::settings_row_counts(config.paths.game_folders.len());
-        // Store / Game Library tiles, so their nav pills can jump the rail
-        // there (same "absent tile → pill no-ops" contract as Settings).
-        let store_tile_index = library.iter().position(|item| item.id == "store");
-        let library_tile_index = library.iter().position(|item| item.id == "library");
-
         let nav = NavState::with_cc_options(rail_len, cc_len, cc_option_counts)
             .with_settings(settings_tile_index, settings_row_counts)
             .with_media_rail_len(library_media.len())
-            .with_app_tiles(store_tile_index, library_tile_index)
             .with_game_options(per_game::ROW_COUNT);
 
         let gilrs = gilrs::Gilrs::new().ok();

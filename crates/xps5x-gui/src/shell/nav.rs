@@ -132,14 +132,12 @@ impl RailTab {
 
 // Pill-row focus indices, in display order (the leading icon-only pill is
 // decorative and not focusable). `home.rs` renders labels in this same
-// order — the two must agree.
-pub const PILL_STORE: usize = 0;
-pub const PILL_MY_GAMES: usize = 1;
-pub const PILL_MEDIA: usize = 2;
-pub const PILL_LIBRARY: usize = 3;
-pub const PILL_SETTINGS: usize = 4;
-pub const PILL_MORE: usize = 5;
-pub const PILL_COUNT: usize = 6;
+// order — the two must agree. Only functional destinations get a pill
+// (PS5-authentic: no dead Store/Library/"…" chrome).
+pub const PILL_MY_GAMES: usize = 0;
+pub const PILL_MEDIA: usize = 1;
+pub const PILL_SETTINGS: usize = 2;
+pub const PILL_COUNT: usize = 3;
 
 /// Which surface currently owns navigation input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,11 +179,6 @@ pub struct NavState {
 
     /// Focused pill while `mode == Pills` (one of the `PILL_*` indices).
     pub pill_index: usize,
-    /// Games-rail indices of the Store / Game Library app tiles, so their
-    /// pills can jump the rail there. `None` when the caller's library has
-    /// no such tile — that pill's Confirm is then a no-op.
-    store_tile_index: Option<usize>,
-    library_tile_index: Option<usize>,
 
     /// Games-rail index that opens Settings on Confirm instead of
     /// launching (the "Settings" app tile). `None` if the caller never
@@ -229,8 +222,6 @@ impl NavState {
             games_rail_len: rail_len,
             media_rail_len: 0,
             pill_index: PILL_MY_GAMES,
-            store_tile_index: None,
-            library_tile_index: None,
             settings_tile_index: None,
             settings_section: 0,
             settings_row: 0,
@@ -258,36 +249,17 @@ impl NavState {
         self
     }
 
-    /// Builder: wire up which Games-rail indices the Store and Library
-    /// pills jump to on Confirm.
-    pub fn with_app_tiles(
-        mut self,
-        store_tile_index: Option<usize>,
-        library_tile_index: Option<usize>,
-    ) -> Self {
-        self.store_tile_index = store_tile_index;
-        self.library_tile_index = library_tile_index;
-        self
-    }
-
     /// Builder: how many rows the per-game Game Options overlay exposes.
     pub fn with_game_options(mut self, row_count: usize) -> Self {
         self.game_options_row_count = row_count;
         self
     }
 
-    /// Whether the Games-rail tile at `index` is one of the built-in app tiles
-    /// (Store / Library / Settings) rather than a launchable game. Used to gate
-    /// Options: only real games have per-game settings.
+    /// Whether the Games-rail tile at `index` is a built-in app tile
+    /// (Settings) rather than a launchable game. Used to gate Options: only
+    /// real games have per-game settings.
     fn is_app_tile(&self, index: usize) -> bool {
-        [
-            self.store_tile_index,
-            self.library_tile_index,
-            self.settings_tile_index,
-        ]
-        .into_iter()
-        .flatten()
-        .any(|tile| tile == index)
+        self.settings_tile_index == Some(index)
     }
 
     /// Replace the Settings section/row-count table — e.g. after adding or
@@ -435,15 +407,12 @@ impl NavState {
                     self.mode = NavMode::Home;
                     NavAction::SwitchTab(RailTab::Media)
                 }
-                PILL_STORE => self.jump_to_games_tile(self.store_tile_index),
-                PILL_LIBRARY => self.jump_to_games_tile(self.library_tile_index),
                 PILL_SETTINGS => {
                     self.mode = NavMode::Settings;
                     self.settings_section = 0;
                     self.settings_row = 0;
                     NavAction::OpenSettings
                 }
-                PILL_MORE => NavAction::None, // "…" — decorative for now
                 _ => NavAction::None,
             },
             NavInput::Guide => {
@@ -457,19 +426,6 @@ impl NavState {
             }
             NavInput::Options => NavAction::None,
         }
-    }
-
-    /// Confirm on the Store/Library pill: return focus to the Games rail on
-    /// that app's tile. A pill with no wired-up tile keeps pill focus and
-    /// does nothing.
-    fn jump_to_games_tile(&mut self, tile_index: Option<usize>) -> NavAction {
-        let Some(index) = tile_index else {
-            return NavAction::None;
-        };
-        self.set_tab(RailTab::Games);
-        self.rail_index = index.min(self.rail_len.saturating_sub(1));
-        self.mode = NavMode::Home;
-        NavAction::None
     }
 
     fn apply_control_center(&mut self, input: NavInput) -> NavAction {
@@ -1173,38 +1129,38 @@ mod tests {
                 expect_mode: NavMode::Pills,
             },
             Case {
-                name: "left clamps at Store",
-                start_pill: PILL_STORE,
+                name: "left clamps at the first pill",
+                start_pill: PILL_MY_GAMES,
                 input: NavInput::Left,
-                expect_pill: PILL_STORE,
+                expect_pill: PILL_MY_GAMES,
                 expect_mode: NavMode::Pills,
             },
             Case {
                 name: "right clamps at the last pill",
-                start_pill: PILL_MORE,
+                start_pill: PILL_SETTINGS,
                 input: NavInput::Right,
-                expect_pill: PILL_MORE,
+                expect_pill: PILL_SETTINGS,
                 expect_mode: NavMode::Pills,
             },
             Case {
                 name: "down returns to the rail",
-                start_pill: PILL_LIBRARY,
+                start_pill: PILL_MEDIA,
                 input: NavInput::Down,
-                expect_pill: PILL_LIBRARY,
+                expect_pill: PILL_MEDIA,
                 expect_mode: NavMode::Home,
             },
             Case {
                 name: "back returns to the rail",
-                start_pill: PILL_LIBRARY,
+                start_pill: PILL_MEDIA,
                 input: NavInput::Back,
-                expect_pill: PILL_LIBRARY,
+                expect_pill: PILL_MEDIA,
                 expect_mode: NavMode::Home,
             },
             Case {
                 name: "up stays put",
-                start_pill: PILL_STORE,
+                start_pill: PILL_MY_GAMES,
                 input: NavInput::Up,
-                expect_pill: PILL_STORE,
+                expect_pill: PILL_MY_GAMES,
                 expect_mode: NavMode::Pills,
             },
         ];
@@ -1257,34 +1213,6 @@ mod tests {
     }
 
     #[test]
-    fn confirming_store_and_library_pills_jumps_the_games_rail_to_their_tiles() {
-        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11])
-            .with_media_rail_len(3)
-            .with_app_tiles(Some(6), Some(7));
-        nav.apply(NavInput::Tab); // -> Media, to prove the jump also switches back
-        nav.apply(NavInput::Up);
-        nav.pill_index = PILL_STORE;
-        assert_eq!(nav.apply(NavInput::Confirm), NavAction::None);
-        assert_eq!(nav.mode, NavMode::Home);
-        assert_eq!(nav.tab, RailTab::Games);
-        assert_eq!(nav.rail_index, 6);
-
-        nav.apply(NavInput::Up);
-        nav.pill_index = PILL_LIBRARY;
-        nav.apply(NavInput::Confirm);
-        assert_eq!(nav.rail_index, 7);
-    }
-
-    #[test]
-    fn store_pill_without_a_wired_tile_is_a_no_op_that_keeps_pill_focus() {
-        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]); // no app tiles wired
-        nav.mode = NavMode::Pills;
-        nav.pill_index = PILL_STORE;
-        assert_eq!(nav.apply(NavInput::Confirm), NavAction::None);
-        assert_eq!(nav.mode, NavMode::Pills);
-    }
-
-    #[test]
     fn guide_from_pills_opens_control_center() {
         let mut nav = NavState::with_cc_options(9, 11, vec![0; 11]);
         nav.mode = NavMode::Pills;
@@ -1308,9 +1236,9 @@ mod tests {
 
     #[test]
     fn options_on_a_game_tile_opens_game_options() {
-        // Games rail of 5; index 0 is the Store app tile, so index 2 is a game.
+        // Games rail of 5; index 4 is the Settings app tile, so index 2 is a
+        // game.
         let mut nav = NavState::with_cc_options(5, 11, vec![0; 11])
-            .with_app_tiles(Some(0), Some(1))
             .with_settings(Some(4), vec![9])
             .with_game_options(5);
         nav.rail_index = 2;
@@ -1325,11 +1253,10 @@ mod tests {
     #[test]
     fn options_on_an_app_tile_is_a_no_op() {
         let mut nav = NavState::with_cc_options(5, 11, vec![0; 11])
-            .with_app_tiles(Some(0), Some(1))
             .with_settings(Some(4), vec![9])
             .with_game_options(5);
-        // Focus the Store app tile (index 0) — it has no per-game settings.
-        nav.rail_index = 0;
+        // Focus the Settings app tile — it has no per-game settings.
+        nav.rail_index = 4;
         assert_eq!(nav.apply(NavInput::Options), NavAction::None);
         assert_eq!(nav.mode, NavMode::Home);
     }

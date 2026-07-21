@@ -48,6 +48,8 @@ pub struct TileGradient {
 /// Original vector glyph drawn for built-in apps (no Sony iconography).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlyphKind {
+    /// Kept for future Store-class tiles; only Settings ships a tile today.
+    #[allow(dead_code)]
     Bag,
     Grid,
     Gear,
@@ -298,6 +300,11 @@ pub struct LibraryItem {
     /// built-in apps and the sample library — the repository ships no image
     /// assets (spec §11); covers are the user's, like theme backgrounds.
     pub cover_path: Option<PathBuf>,
+    /// Real title id from the package's `sce_sys/param.json`
+    /// (e.g. `PPSA21564`). `None` for apps, samples, and dumps without one.
+    pub title_id: Option<String>,
+    /// Real content version from `param.json` (e.g. `01.000.000`).
+    pub version: Option<String>,
     pub launch: LaunchTarget,
 }
 
@@ -308,59 +315,28 @@ pub struct LibraryItem {
 /// prior apps baked in (spec §10 SM2: Settings must be reachable from its
 /// Home rail tile).
 pub fn built_in_apps() -> Vec<LibraryItem> {
-    vec![
-        LibraryItem {
-            id: "store".to_string(),
-            title: "Store".to_string(),
-            kind: ItemKind::App,
-            art: ArtSource::App {
-                tile: TileGradient {
-                    from: rgb(0x1f8fff),
-                    to: rgb(0x0a4bc2),
-                },
-                glyph: GlyphKind::Bag,
+    // Only functional apps earn a tile: a dead Store/Game Library tile is
+    // placeholder chrome, not PS5 authenticity. Settings stays (spec §10
+    // SM2 requires it reachable from its Home rail tile).
+    vec![LibraryItem {
+        id: "settings".to_string(),
+        title: "Settings".to_string(),
+        kind: ItemKind::App,
+        art: ArtSource::App {
+            tile: TileGradient {
+                from: rgb(0x2b3a4e),
+                to: rgb(0x17222f),
             },
-            meta: None,
-            cover_path: None,
-            launch: LaunchTarget::App {
-                id: "store".to_string(),
-            },
+            glyph: GlyphKind::Gear,
         },
-        LibraryItem {
-            id: "library".to_string(),
-            title: "Game Library".to_string(),
-            kind: ItemKind::App,
-            art: ArtSource::App {
-                tile: TileGradient {
-                    from: rgb(0x2b3a4e),
-                    to: rgb(0x17222f),
-                },
-                glyph: GlyphKind::Grid,
-            },
-            meta: None,
-            cover_path: None,
-            launch: LaunchTarget::App {
-                id: "library".to_string(),
-            },
-        },
-        LibraryItem {
+        meta: None,
+        cover_path: None,
+        title_id: None,
+        version: None,
+        launch: LaunchTarget::App {
             id: "settings".to_string(),
-            title: "Settings".to_string(),
-            kind: ItemKind::App,
-            art: ArtSource::App {
-                tile: TileGradient {
-                    from: rgb(0x2b3a4e),
-                    to: rgb(0x17222f),
-                },
-                glyph: GlyphKind::Gear,
-            },
-            meta: None,
-            cover_path: None,
-            launch: LaunchTarget::App {
-                id: "settings".to_string(),
-            },
         },
-    ]
+    }]
 }
 
 /// The mockup's sample library — original invented titles and gradient art,
@@ -411,6 +387,8 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 ],
             }),
             cover_path: None,
+            title_id: None,
+            version: None,
             launch: LaunchTarget::Game {
                 path: PathBuf::from("Games/nova"),
             },
@@ -459,6 +437,8 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 ],
             }),
             cover_path: None,
+            title_id: None,
+            version: None,
             launch: LaunchTarget::Game {
                 path: PathBuf::from("Games/astral"),
             },
@@ -507,6 +487,8 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 ],
             }),
             cover_path: None,
+            title_id: None,
+            version: None,
             launch: LaunchTarget::Game {
                 path: PathBuf::from("Games/sable"),
             },
@@ -555,6 +537,8 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 ],
             }),
             cover_path: None,
+            title_id: None,
+            version: None,
             launch: LaunchTarget::Game {
                 path: PathBuf::from("Games/kingfall"),
             },
@@ -603,6 +587,8 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 ],
             }),
             cover_path: None,
+            title_id: None,
+            version: None,
             launch: LaunchTarget::Game {
                 path: PathBuf::from("Games/neon"),
             },
@@ -651,6 +637,8 @@ pub fn sample_library() -> Vec<LibraryItem> {
                 ],
             }),
             cover_path: None,
+            title_id: None,
+            version: None,
             launch: LaunchTarget::Game {
                 path: PathBuf::from("Games/tide"),
             },
@@ -668,16 +656,16 @@ mod tests {
     #[test]
     fn sample_library_matches_mockup_shape() {
         let items = sample_library();
-        assert_eq!(items.len(), 9);
+        assert_eq!(items.len(), 7);
         assert_eq!(items[0].title, "Nova Requiem");
         assert_eq!(items.iter().filter(|i| i.kind == ItemKind::Game).count(), 6);
-        assert_eq!(items.iter().filter(|i| i.kind == ItemKind::App).count(), 3);
+        assert_eq!(items.iter().filter(|i| i.kind == ItemKind::App).count(), 1);
     }
 
     #[test]
     fn built_in_apps_always_includes_a_settings_tile() {
         let apps = built_in_apps();
-        assert_eq!(apps.len(), 3);
+        assert_eq!(apps.len(), 1);
         assert!(apps.iter().all(|i| i.kind == ItemKind::App));
         assert!(
             apps.iter().any(|i| i.id == "settings"),

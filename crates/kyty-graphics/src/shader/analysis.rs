@@ -881,15 +881,16 @@ pub fn shader_calc_binding_indices(bind: &mut ShaderBindResources) {
     }
 
     if bind.textures2d.textures_num > 0 {
-        // Sampled textures take one Vulkan binding PER PRESENT Dim (a
-        // mixed-dim shader declares one `%textures2D_S<dim>` array each — one
-        // SPIR-V array type carries exactly one image Dim). The storage array
-        // follows all of them. A homogeneous shader has one present Dim, so
-        // this reserves the same two bindings as before (sampled, storage);
-        // a storage-only shader reserves one placeholder sampled binding to
-        // keep the storage index where it has always been.
+        // Sampled textures take one Vulkan binding PER PRESENT (Dim, numeric
+        // class) key (a mixed shader declares one `%textures2D_S<key>` array
+        // each — one SPIR-V array type carries exactly one image Dim and one
+        // sampled component type). The storage array follows all of them. A
+        // homogeneous shader has one present key, so this reserves the same
+        // two bindings as before (sampled, storage); a storage-only shader
+        // reserves one placeholder sampled binding to keep the storage index
+        // where it has always been.
         bind.textures2d.binding_sampled_index = binding_index;
-        let sampled_bindings = super::spirv::sampled_dims_present(bind).len().max(1) as i32;
+        let sampled_bindings = super::spirv::sampled_keys_present(bind).len().max(1) as i32;
         binding_index += sampled_bindings;
         bind.textures2d.binding_storage_index = binding_index;
         binding_index += 1;

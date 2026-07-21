@@ -2,6 +2,10 @@
 //!
 //! Main entry point for the XPS5X desktop application.
 //! Initializes the emulator subsystems and launches the GUI.
+// GUI-subsystem build: launching from Explorer/a shortcut opens no terminal
+// window (logs live in the in-app console [F10] and logs/xps5x.log). CLI
+// invocations still print — `main` reattaches the parent console first thing.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
 mod launcher;
@@ -63,7 +67,25 @@ fn report_fault_site(
     info!("        bytes at rip: {:02x?}", &linked.image[offset..end]);
 }
 
+/// Reattach the parent process's console so CLI invocations (`--run-eboot`,
+/// `--firmware-info`, dev `cargo run`) still print to the terminal they were
+/// launched from despite the GUI subsystem. Launched from Explorer there is
+/// no parent console — the call fails and output goes to the file log and
+/// the in-app console instead, which is the point.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    // SAFETY: plain Win32 call with no pointers; failure is the normal
+    // Explorer-launch case and needs no handling.
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    attach_parent_console();
+
     // FIRST, before anything else in the process allocates: claim the guest
     // title fixed-VA window. Retail titles map direct memory at literal
     // addresses (ASTRO.BOT: its libc mspace at 0x3_0000_0000) and write to that
