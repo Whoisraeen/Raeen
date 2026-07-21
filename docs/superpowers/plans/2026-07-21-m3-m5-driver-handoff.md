@@ -180,12 +180,32 @@ Hard measurements (release, stages A–C + epoch vblank committed):
   at 8 ms) = the title's own boot-animation loop costs ~22 ms of guest x86
   per frame. It never negotiates a 120 mode (`IsOutputSupported`/
   `ConfigureOutput` = 0 calls). Our GPU/present is not the cap.
-- **CONCLUSION:** 120 FPS on a game is blocked on TITLE PROGRESSION (reaching
-  a light, unthrottled gameplay/menu phase — M4/M5 work), not on graphics
-  perf. The graphics stack is done for this goal. The next real lever is CPU:
-  faster guest execution per frame and getting a title into a real render
-  phase. Do NOT fake a 120 number (acceptance-gate rule); demonstrate it only
-  with a measured per-second flip bucket ≥120 on a title actually rendering.
+- **CORRECTION (deeper measurement, XPS5X_TIME_DRAW on Minecraft):** the 22 ms
+  frame is NOT purely title-CPU. Per-draw `build_us` p50 **969 µs** (p90 2.6 ms,
+  max 30 ms) × ~20 draws/frame ≈ **~20 ms of OUR per-draw build throughput** on
+  the GPU worker thread, which the guest render thread blocks behind at the
+  synchronous flip flush (flush_us p50 only 2.2 ms — the flush is cheap; the
+  BUILD is the cost). So a real graphics lever remains after all.
+- **THE LEVER (stage D — top FPS work):** `Resources::build` (offscreen.rs
+  ~1219) still allocates PER DRAW: `create_depth_target` + `create_depth_buffers`
+  (a fresh VkImage + view + device memory every draw — Minecraft uses depth on
+  all ~20 draws/frame), plus guest vertex/index buffer creation. Stage A's own
+  report flagged "depth targets are still per-draw." FIX: make depth targets
+  PERSISTENT keyed by `DB_Z_WRITE_BASE`, mirroring the committed persistent
+  COLOR-target machinery in `vulkan/cache.rs` (loadOp=LOAD, dirty tracking).
+  Then verify guest-buffer uploads actually hit the stage-C upload ring (pool)
+  rather than create/destroy. Estimated: cutting build ~2.5× (≈969→≈400 µs/draw)
+  takes Minecraft's boot animation from ~43 toward ~90 fps; combined with
+  batching all a frame's draw command buffers into ONE vkQueueSubmit, 120 is
+  reachable on the boot-animation phase alone (no gameplay needed).
+  RISK: hot-path + a prior async-flip attempt deadlocked — change carefully,
+  keep XPS5X_NO_DEFER as the A/B, re-test Minecraft + ASTRO each step.
+- **CONCLUSION:** 120 FPS is reachable via stage D (persistent depth targets +
+  submit batching) on Minecraft's boot-animation phase — a graphics-perf lever,
+  measurable now, no title progression required. Secondary path: any title in a
+  light gameplay phase. Do NOT fake the number (acceptance-gate); demonstrate
+  only with a measured per-second flip bucket ≥120 on a title actually
+  rendering.
 
 ## 5. Honesty protocols (non-negotiable)
 
