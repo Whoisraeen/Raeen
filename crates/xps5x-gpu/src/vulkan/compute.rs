@@ -1091,7 +1091,20 @@ impl<'a> ComputeResources<'a> {
                 .map_memory(memory, 0, size as u64, vk::MemoryMapFlags::empty())
         }
         .map_err(|e| GpuError::VulkanInitFailed(format!("vkMapMemory: {e}")))?;
-        let mut bytes = vec![0; size];
+        // Fallible host allocation: a large compute readback under host memory
+        // pressure must DEGRADE (return an error the dispatch path skips on),
+        // never abort the whole process via the infallible allocator. Same
+        // "degrade, not abort" policy as `draw_translate::alloc_zeroed`.
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.try_reserve_exact(size).map_err(|_| {
+            // SAFETY: unmap the mapping we opened above before bailing.
+            unsafe { self.device().unmap_memory(memory) };
+            GpuError::VulkanInitFailed(format!(
+                "compute readback: {size} B host allocation failed (out of memory) — \
+                 skipping the dispatch instead of aborting"
+            ))
+        })?;
+        bytes.resize(size, 0);
         // SAFETY: source mapped range and destination allocation both cover
         // `size` bytes and cannot overlap.
         unsafe {

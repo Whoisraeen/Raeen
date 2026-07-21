@@ -636,6 +636,13 @@ fn texture_vk_format(
         // 7 is FLOAT (same numFormat as the 36 arm above). Every draw in the
         // title's 7966-dword DCB failed on this one format.
         71 => Ok((vk::Format::R16G16B16A16_SFLOAT, 8)),
+        // 5 -> (dataFormat 1, numFormat 4) = 8-bit UINT (SharpEmu
+        // Gfx10UnifiedFormat.cs:31: unified 5 -> (1u, 4u)). dataFormat 1 is the
+        // single 8-bit channel per the GCN IMG_DATA_FORMAT table (same table
+        // that gives 4=32, 5=16_16, 12=16_16_16_16); numFormat 4 is UINT. R8_UINT
+        // at 1 B/texel — measured on ASTRO.BOT's 1920x1080 tile=24 (depth swizzle)
+        // target sampled back as a texture (a stencil-like integer plane).
+        5 => Ok((vk::Format::R8_UINT, 1)),
         other => Err(err(format!(
             "texture format {other} not implemented \
              (base={:#x} {}x{} pitch={} tile={} levels={})",
@@ -908,10 +915,12 @@ fn decode_texture(
         // the 1920x1080 UI texture). Fetch whole 64 KiB blocks — a tiled
         // surface owns its padding — and deswizzle, per array layer (a cube's
         // six faces are six block grids back to back).
-        mode if crate::texture::tiling::swizzle_64kb_table(mode).is_some() => {
+        mode if crate::texture::tiling::swizzle_table(mode).is_some() => {
             let bpp_log2 = bpp.trailing_zeros();
-            let face_tiled =
-                crate::texture::tiling::tiled_byte_count_64kb(width, height, bpp_log2) as usize;
+            let face_tiled = crate::texture::tiling::tiled_byte_count_for_mode(
+                mode, width, height, bpp_log2,
+            )
+            .expect("guarded by swizzle_table above") as usize;
             let face_linear = (width * height * bpp) as usize;
             // Array-upload OOM guard (SharpEmu #476 / 224a36e): if a previous
             // draw's multi-layer read of this address overran its allocation,

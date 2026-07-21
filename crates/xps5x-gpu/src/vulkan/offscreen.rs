@@ -506,6 +506,42 @@ pub struct DrawOutput {
     pub depth: Option<DepthImage>,
 }
 
+/// Copy `size` bytes from a just-mapped host-visible allocation into an owned
+/// `Vec`, FALLIBLY, unmapping `memory` in every case. A large render-target
+/// readback under host memory pressure must DEGRADE (return an error the
+/// draw/flush path skips on) rather than abort the whole process via the
+/// infallible global allocator — the same "degrade, not abort" policy as
+/// `draw_translate::alloc_zeroed` and the compute-readback path. Measured on
+/// ASTRO.BOT: enabling more of the scene composite pushed a 4K render-target
+/// readback past this memory-constrained host's page file.
+///
+/// SAFETY: `ptr` must be a valid, initialized mapping of at least `size` bytes
+/// backed by `memory`, with no other live reference into it.
+unsafe fn readback_to_vec_fallible(
+    device: &Device,
+    memory: vk::DeviceMemory,
+    ptr: *mut std::ffi::c_void,
+    size: usize,
+    what: &str,
+) -> Result<Vec<u8>, GpuError> {
+    let mut pixels: Vec<u8> = Vec::new();
+    if pixels.try_reserve_exact(size).is_err() {
+        // SAFETY: the caller mapped `memory`; unmap it before bailing.
+        unsafe { device.unmap_memory(memory) };
+        return Err(GpuError::VulkanInitFailed(format!(
+            "{what}: {size} B host allocation failed (out of memory) — \
+             skipping instead of aborting"
+        )));
+    }
+    // SAFETY: `ptr` covers `size` initialized bytes (caller's contract); the
+    // reservation above guarantees the copy does not reallocate.
+    unsafe {
+        pixels.extend_from_slice(std::slice::from_raw_parts(ptr.cast::<u8>(), size));
+        device.unmap_memory(memory);
+    }
+    Ok(pixels)
+}
+
 /// Bytes per depth-aspect texel in the readback/upload of `format`.
 fn depth_texel_bytes(format: vk::Format) -> Result<u32, GpuError> {
     match format {
@@ -1011,18 +1047,26 @@ fn record_and_read_flush(
         // not currently mapped, its copy completed (fence waited) and was
         // made host-visible by the barrier above. The bytes are copied into
         // an owned Vec before unmapping.
+        let ptr = unsafe {
+            device.map_memory(
+                target.readback_memory,
+                0,
+                size as vk::DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )
+        }
+        .map_err(|e| GpuError::VulkanInitFailed(format!("flush readback map: {e}")))?;
+        // SAFETY: `ptr` maps exactly `size` initialized host-visible bytes
+        // (readback_memory is sized to `size`, its copy fence-waited above); the
+        // helper copies them into an owned Vec fallibly and unmaps.
         let pixels = unsafe {
-            let ptr = device
-                .map_memory(
-                    target.readback_memory,
-                    0,
-                    size as vk::DeviceSize,
-                    vk::MemoryMapFlags::empty(),
-                )
-                .map_err(|e| GpuError::VulkanInitFailed(format!("flush readback map: {e}")))?;
-            let pixels = std::slice::from_raw_parts(ptr.cast::<u8>(), size).to_vec();
-            device.unmap_memory(target.readback_memory);
-            pixels
+            readback_to_vec_fallible(
+                device,
+                target.readback_memory,
+                ptr,
+                size,
+                "render-target flush readback",
+            )?
         };
         caches.mark_target_synced(key);
         images.push((
@@ -1411,7 +1455,17 @@ impl<'a> Resources<'a> {
         if depth_load || stencil_load {
             // Plane layout: depth at 0, stencil right after. A plane that
             // CLEARs is not copied, so its bytes here stay zero — harmless.
-            let mut bytes = vec![0u8; total as usize];
+            // Fallible: a large depth-target seed under host memory pressure
+            // must DEGRADE (error the draw path skips on) rather than abort the
+            // process — same "degrade, not abort" policy as the readbacks.
+            let mut bytes: Vec<u8> = Vec::new();
+            bytes.try_reserve_exact(total as usize).map_err(|_| {
+                GpuError::VulkanInitFailed(format!(
+                    "depth-target seed: {total} B host allocation failed (out of memory) — \
+                     skipping the draw instead of aborting"
+                ))
+            })?;
+            bytes.resize(total as usize, 0);
             if depth_load {
                 let initial = depth.initial.expect("depth LOAD implies initial");
                 if initial.len() != depth_bytes {
@@ -3412,15 +3466,13 @@ impl<'a> Resources<'a> {
         }
         .map_err(|e| GpuError::VulkanInitFailed(format!("readback map failed: {e}")))?;
 
-        // SAFETY: `ptr` is a valid mapping of `size` bytes (the buffer was
-        // allocated at exactly this size), initialized by the completed copy.
-        // The bytes are read into an owned Vec before unmapping, so no
-        // reference outlives the mapping.
-        let pixels = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), size).to_vec() };
-
-        // SAFETY: the memory is currently mapped by the call above and no
-        // references into it remain.
-        unsafe { self.device().unmap_memory(self.readback_memory) };
+        // SAFETY: `ptr` is a valid mapping of `size` initialized bytes (the
+        // buffer was allocated at exactly this size, its copy completed); the
+        // helper copies them into an owned Vec fallibly (degrade, not abort) and
+        // unmaps.
+        let pixels = unsafe {
+            readback_to_vec_fallible(self.device(), self.readback_memory, ptr, size, "readback")?
+        };
         Ok(pixels)
     }
 

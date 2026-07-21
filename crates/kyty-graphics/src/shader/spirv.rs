@@ -2259,10 +2259,11 @@ pub(crate) fn operand_load_int(
             "negate/absolute modifier",
         ));
     }
-    if op.lane_sel != 6 {
-        // No consumer yet (see the fn doc); wire the uint-style extraction
-        // when one appears.
-        return Err(not_supported("operand_load_int", "sdwa lane select"));
+    if op.lane_sel != 6 && operand_is_constant(op) {
+        return Err(not_supported(
+            "operand_load_int",
+            "sdwa lane select on a constant operand",
+        ));
     }
 
     if operand_is_constant(op) {
@@ -2273,7 +2274,29 @@ pub(crate) fn operand_load_int(
             .replace("<result_id>", result_id);
     } else if operand_is_variable(op) {
         let value = operand_variable_to_str(op);
-        if value.type_ == SpirvType::Float {
+        // SDWA lane select: extract the selected byte/word (zero-extended) in
+        // uint space, then bitcast to int — the same extraction the uint/float
+        // loaders already perform. The non-SDWA path keeps Kyty's exact text.
+        if let Some(sel) = lane_sel_snippet(op.lane_sel, "r<result_id>", "e<result_id>") {
+            let raw = if value.type_ == SpirvType::Float {
+                concat!(
+                    "%f<result_id> = OpLoad %float %<id>\n",
+                    "          ",
+                    "%r<result_id> = OpBitcast %uint %f<result_id>\n"
+                )
+            } else if value.type_ == SpirvType::Uint {
+                "%r<result_id> = OpLoad %uint %<id>\n"
+            } else {
+                return Ok(false);
+            };
+            *load = format!(
+                "{raw}          {sel}          \
+                 %<result_id> = OpBitcast %int %e<result_id>\n"
+            )
+            .replace("<index>", index)
+            .replace("<id>", &value.value)
+            .replace("<result_id>", result_id);
+        } else if value.type_ == SpirvType::Float {
             *load = concat!(
                 "%t<result_id> = OpLoad %float %<id>\n",
                 "          ",
@@ -2291,6 +2314,8 @@ pub(crate) fn operand_load_int(
             .replace("<index>", index)
             .replace("<id>", &value.value)
             .replace("<result_id>", result_id);
+        } else {
+            return Ok(false);
         }
     } else {
         return Ok(false);
@@ -4313,6 +4338,8 @@ impl<'a> Spirv<'a> {
             T::VMadU32U24,
             T::VMulU32U24,
             T::SMulHiU32,
+            // The 32x32->64 product half of `v_mad_u64_u32`.
+            T::VMadU64U32,
         ]) {
             self.source += FUNC_MUL_EXTENDED;
         }
@@ -4847,6 +4874,26 @@ mod tests {
             "{load}"
         );
         assert!(load.contains("%t0_3 = OpFNegate %float %abs_3"), "{load}");
+    }
+
+    #[test]
+    fn operand_load_int_sdwa_lane_select_extracts_byte() {
+        // lane_sel 0 selects byte 0. operand_load_int must now extract the
+        // chosen byte (zero-extended, in uint space) then bitcast to int — the
+        // same path the uint/float loaders take (was an unconditional refusal).
+        // Measured on ASTRO.BOT scene CS 0x555f4f500 / 0x500757800.
+        let spirv = Spirv::new();
+        let mut op = vgpr(1);
+        op.lane_sel = 0;
+        let mut load = String::new();
+        assert!(operand_load_int(&spirv, op, "t0_3", "3", &mut load).unwrap());
+        assert!(load.contains("OpShiftRightLogical %uint"), "{load}");
+        assert!(load.contains("OpBitwiseAnd %uint"), "{load}");
+        assert!(load.contains("%t0_3 = OpBitcast %int %et0_3"), "{load}");
+        // A full-dword operand (lane_sel 6) is unchanged — no extraction.
+        let mut plain = String::new();
+        assert!(operand_load_int(&spirv, vgpr(1), "t1_3", "3", &mut plain).unwrap());
+        assert!(!plain.contains("OpShiftRightLogical"), "{plain}");
     }
 
     #[test]

@@ -1057,6 +1057,52 @@ impl GuestArena {
         true
     }
 
+    /// Back every `Reserved` (demand-commit) page in `[addr, addr + len)` with
+    /// host memory, exactly as [`GuestArena::commit_on_demand`] does for one VEH
+    /// fault — but in a single pass under one lock, for the GPU read path.
+    ///
+    /// The GPU reads guest memory host-side (`read_gpu`), so it never traps the
+    /// guest VEH that lazily backs a reservation on CPU access. On real hardware
+    /// mapped direct memory is always GPU-readable, so our lazy commit must be
+    /// transparent to the GPU rather than a refusal: a title that maps a texture
+    /// pool and has the GPU read it before any CPU write (streamed/DMA-filled
+    /// assets, or a fresh target) would otherwise see every such draw skipped
+    /// (measured on ASTRO.BOT: 47 "texture guest range … readable prefix 0x0"
+    /// draw skips per frame on the Shell path). A page that is neither `Reserved`
+    /// nor already host-backed (free space, foreign, a wild pointer) leaves the
+    /// range not fully backed, so the caller still refuses that read. Under host
+    /// memory pressure a `MEM_COMMIT` here can fail — the range is then reported
+    /// not-backed and the draw degrades (skipped), never a fake.
+    fn commit_range_on_demand(&self, addr: u64, len: u64) -> bool {
+        let Some(end) = addr.checked_add(len) else {
+            return false;
+        };
+        if end == addr {
+            return self.range_is_committed(addr, end);
+        }
+        // Back each `Reserved` page via the per-page `commit_on_demand`, which
+        // acquires and RELEASES the state lock per page. Holding the lock across
+        // a whole multi-megabyte range's `MEM_COMMIT` loop (thousands of pages,
+        // each a `VirtualAlloc` that can page-fault under host memory pressure)
+        // would starve any guest thread faulting into its own demand-commit for
+        // seconds — and a guest thread stalled there while holding a guest mutex
+        // deadlocks the title's boot (measured on ASTRO.BOT: a 1080p texture the
+        // format-5/tile-5 fixes newly decode is 8 MiB / ~2k pages). Releasing the
+        // lock per page lets those guest commits interleave. `commit_on_demand`
+        // is a no-op for already-backed and non-reservation pages, so the final
+        // `range_is_committed` is what decides visibility (free/foreign pages
+        // leave the range not fully backed and the read is still refused).
+        let mut page = addr & !(PAGE_SIZE - 1);
+        while page < end {
+            self.commit_on_demand(page);
+            page = match page.checked_add(PAGE_SIZE) {
+                Some(next) => next,
+                None => break,
+            };
+        }
+        self.range_is_committed(addr, end)
+    }
+
     /// Whether every byte of `[start, end)` has host memory behind it.
     ///
     /// The map is authoritative, which is what lets `read`/`write` drop their
@@ -1709,7 +1755,17 @@ impl GuestMemory for GuestArena {
         let Some(end) = range.end() else {
             return false;
         };
-        self.range_is_committed(range.start().raw(), end)
+        let start = range.start().raw();
+        // Fast path: already fully host-backed (the common case once a texture
+        // has been committed, and for the committed core).
+        if self.range_is_committed(start, end) {
+            return true;
+        }
+        // A demand-commit (`Reserved`) range the GPU is about to read: back it
+        // now, exactly as the guest VEH would on a CPU access. On real hardware
+        // mapped direct memory is always GPU-readable — our lazy commit must be
+        // transparent to the GPU, not a refusal.
+        self.commit_range_on_demand(start, end.saturating_sub(start))
     }
 
     fn atomic_load_u32(&self, guest_addr: u64) -> Option<u32> {
@@ -2762,6 +2818,48 @@ mod tests {
         // address proves no Windows reservation leaked.
         arena.munmap(base, len);
         assert_eq!(arena.map_at(base, len, PAGE_SIZE), Some(base));
+    }
+
+    /// The GPU read path backs a `Reserved` (demand-commit) range the guest
+    /// never touched — real HW keeps mapped direct memory always GPU-readable,
+    /// so our lazy commit must be transparent to the GPU. Regression guard for
+    /// the Shell-path "texture guest range … readable prefix 0x0" draw skips.
+    #[test]
+    fn gpu_read_demand_commits_a_reserved_range_the_guest_never_touched() {
+        use xps5x_gpu::GpuGuestMemory;
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let base = 0x3_0000_0000u64;
+        let len = 0x20_0000u64; // 2 MiB, several pages
+
+        // Force the demand-commit (reserve-only) path, as under host pressure.
+        FORCE_MAP_AT_COMMIT_REFUSALS.store(1, Ordering::Relaxed);
+        assert_eq!(arena.map_at(base, len, PAGE_SIZE), Some(base));
+
+        // The guest never touched it: the host-side CPU read still sees it
+        // unbacked (only the guest VEH lazily backs on a CPU access).
+        let mut byte = [0u8; 1];
+        assert!(
+            !arena.read(base, &mut byte),
+            "range starts unbacked to the CPU read path"
+        );
+
+        // The GPU read path, in contrast, backs the whole range on demand and
+        // reports it visible — the draw that reads this texture proceeds.
+        assert!(
+            GpuGuestMemory::validate_gpu_range(&arena, base, len, false),
+            "GPU read must back a Reserved range on demand, not refuse it"
+        );
+
+        // Having been backed for the GPU, the same pages now read back on the
+        // CPU path too (they are ReservedBacked, i.e. host-backed).
+        assert!(
+            arena.read(base + PAGE_SIZE, &mut byte),
+            "a page the GPU-visible commit backed is now host-backed"
+        );
+        assert_eq!(byte, [0u8], "freshly committed pages read back zero");
+
+        arena.munmap(base, len);
     }
 
     /// The Shell-vs-CLI wall, regression-proofed. Measured 2026-07-21

@@ -471,6 +471,27 @@ fn recompile_buffer_store_dwordx4(
     )
 }
 
+/// Beyond-Kyty: MUBUF 0x1d `buffer_store_dwordx2` — two-dword raw store,
+/// measured in ASTRO.BOT scene compute (0x500757800). Same `buffer_store_dwordxn`
+/// machinery as the X4 store with `n = 2`.
+fn recompile_buffer_store_dwordx2(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    buffer_store_dwordxn(
+        index,
+        code,
+        dst_source,
+        spirv,
+        2,
+        "Recompile_BufferStoreDwordX2_Vdata2VaddrSvSoffsIdxen",
+    )
+}
+
 fn buffer_store_dwordxn(
     index: u32,
     code: &ShaderCode,
@@ -499,13 +520,21 @@ fn buffer_store_dwordxn(
         return Err(not_supported(func, "unexpected operand types"));
     }
 
+    // The helper is width-agnostic (`n` dwords), so it accepts the Vdata2 and
+    // Vdata4 addressing-quartet formats alike.
     let idxen = matches!(
         inst.format,
-        Format::Vdata4VaddrSvSoffsIdxen | Format::Vdata4Vaddr2SvSoffsOffenIdxen
+        Format::Vdata4VaddrSvSoffsIdxen
+            | Format::Vdata4Vaddr2SvSoffsOffenIdxen
+            | Format::Vdata2VaddrSvSoffsIdxen
+            | Format::Vdata2Vaddr2SvSoffsOffenIdxen
     );
     let offen = matches!(
         inst.format,
-        Format::Vdata4Vaddr2SvSoffsOffenIdxen | Format::Vdata4VaddrSvSoffsOffen
+        Format::Vdata4Vaddr2SvSoffsOffenIdxen
+            | Format::Vdata4VaddrSvSoffsOffen
+            | Format::Vdata2Vaddr2SvSoffsOffenIdxen
+            | Format::Vdata2VaddrSvSoffsOffen
     );
     let src0_index = idxen.then(|| operand_variable_to_str(inst.src[0]));
     let src0_off = offen.then(|| operand_variable_to_str_shift(inst.src[0], i32::from(idxen)));
@@ -4738,12 +4767,35 @@ fn recompile_image_sample_c_lz(
     )?;
 
     let (clz_suffix, clz_dim) = sampled_site_route(spirv, matched, FUNC)?;
-    if clz_dim != SampledDim::Two {
-        return Err(not_supported(
-            FUNC,
-            "comparison sampling of cube/3D textures",
-        ));
-    }
+    // 2D uses a v2 coordinate (s, t). A 2DArray depth texture sampled through a
+    // Vaddr3 MIMG carries only {dref, s, t} — there is no fourth address VGPR
+    // for the array slice — so the shader is sampling array layer 0; its
+    // coordinate is v3 (s, t, 0.0), routed (via `clz_suffix`) to the 2DArray
+    // sampled-image array. 3D comparison sampling is invalid in SPIR-V (Dim 3D
+    // forbids Dref), and a Vaddr3 Cube sample cannot carry a 3-component
+    // direction plus dref, so both stay named refusals — with the concrete Dim
+    // and MIMG format so the shape is measurable, not guessed.
+    let clz_coord = match clz_dim {
+        SampledDim::Two => concat!(
+            "         %clz_coord_<index> = ",
+            "OpCompositeConstruct %v2float %clz_x_<index> %clz_y_<index>"
+        )
+        .to_string(),
+        SampledDim::TwoArray => concat!(
+            "         %clz_coord_<index> = OpCompositeConstruct %v3float ",
+            "%clz_x_<index> %clz_y_<index> %float_0_000000"
+        )
+        .to_string(),
+        SampledDim::Three | SampledDim::Cube => {
+            return Err(not_supported(
+                FUNC,
+                format!(
+                    "comparison sampling of a non-2D texture (dim {clz_dim:?}, format {:?})",
+                    inst.format
+                ),
+            ));
+        }
+    };
 
     let reference = operand_variable_to_str_shift(inst.src[0], 0);
     let coord_x = operand_variable_to_str_shift(inst.src[0], 1);
@@ -4773,13 +4825,14 @@ fn recompile_image_sample_c_lz(
          %clz_reference_<index> = OpLoad %float %<reference>
          %clz_x_<index> = OpLoad %float %<coord_x>
          %clz_y_<index> = OpLoad %float %<coord_y>
-         %clz_coord_<index> = OpCompositeConstruct %v2float %clz_x_<index> %clz_y_<index>
+<clz_coord>
          %clz_sample_<index> = OpImageSampleExplicitLod %v4float %clz_sampled_image_<index> %clz_coord_<index> Lod %float_0_000000
          %clz_texel_<index> = OpCompositeExtract %float %clz_sample_<index> 0
          %clz_passes_<index> = OpFOrdLessThanEqual %bool %clz_reference_<index> %clz_texel_<index>
          %clz_result_<index> = OpSelect %float %clz_passes_<index> %float_1_000000 %float_0_000000
 "#;
     let mut head = HEAD
+        .replace("<clz_coord>", &clz_coord)
         .replace("<texture_index>", &texture_index.value)
         .replace("<sampler_index>", &sampler_index.value)
         .replace("<reference>", &reference.value)
@@ -5515,6 +5568,9 @@ fn image_load_channels(
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
             let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
+            // The third address VGPR carries z (3D) or the array layer
+            // (2DArray); only referenced when the fetched T# is non-2D.
+            let src0_value2 = operand_variable_to_str_shift(inst.src[0], 2);
             let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
 
             if dst_value0.type_ != SpirvType::Float
@@ -5537,7 +5593,7 @@ fn image_load_channels(
          %t69_<index> = OpBitcast %uint %t67_<index>
          %t70_<index> = OpLoad %float %<src0_value1>
          %t71_<index> = OpBitcast %uint %t70_<index>
-         %t73_<index> = OpCompositeConstruct %v2uint %t69_<index> %t71_<index>
+<coord>
          %t74_<index> = OpImageFetch %v4float %t27_<index> %t73_<index>
                OpStore %temp_v4float %t74_<index>
 "#;
@@ -5546,13 +5602,30 @@ fn image_load_channels(
                OpStore %<dst_value> %t<t1>_<index>
 "#;
 
-            // ImageFetch builds a 2D integer coordinate, so this body is
-            // 2D-only; a mixed shader whose fetched T# is 3D/Cube is refused.
+            // OpImageFetch takes a 2-component integer coordinate for a 2D
+            // texture, and a 3-component one for a 2DArray (x, y, layer) or a
+            // 3D (x, y, z) texture — the third component from the MIMG
+            // address's third VGPR. A Cube texture cannot be texel-fetched in
+            // SPIR-V (it must be sampled), so that stays a named refusal.
             let (suffix, dim) = sampled_site_route(spirv, matched, func)?;
-            if dim != SampledDim::Two {
-                return Err(not_supported(func, "texel fetch of a non-2D texture"));
-            }
-            let mut text = HEAD.to_string();
+            let coord = match dim {
+                SampledDim::Two => concat!(
+                    "         %t73_<index> = ",
+                    "OpCompositeConstruct %v2uint %t69_<index> %t71_<index>"
+                )
+                .to_string(),
+                SampledDim::TwoArray | SampledDim::Three => format!(
+                    "         %t72_<index> = OpLoad %float %{z}\n         \
+                     %t72u_<index> = OpBitcast %uint %t72_<index>\n         \
+                     %t73_<index> = OpCompositeConstruct %v3uint \
+                     %t69_<index> %t71_<index> %t72u_<index>",
+                    z = src0_value2.value
+                ),
+                SampledDim::Cube => {
+                    return Err(not_supported(func, "texel fetch of a cube texture"));
+                }
+            };
+            let mut text = HEAD.replace("<coord>", &coord);
             for (i, (t0, chan)) in channels.iter().enumerate() {
                 let dst_value = operand_variable_to_str_shift(inst.dst, i as i32);
                 text += &TAIL
@@ -6600,6 +6673,286 @@ fn recompile_s_orn2_saveexec_b64(
         .replace("<scc>", get_scc_check(scc_check, 2))
         .replace("<dst0>", &dst_value0.value)
         .replace("<dst1>", &dst_value1.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Beyond-Kyty: `s_andn1_saveexec_b64` — `sdst = exec; exec = ~ssrc0 & exec`.
+/// The ANDN1 sibling of [`recompile_s_orn2_saveexec_b64`] (negates the first
+/// operand instead of the second, ANDing rather than ORing). Measured in
+/// ASTRO.BOT's scene-composite compute shader.
+fn recompile_s_andn1_saveexec_b64(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SAndn1SaveexecB64_Sdst2Ssrc02";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+
+    let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+    let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+
+    if dst_value0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+    if operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "exec destination"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, 0)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[0], "t1_<index>", &index_str, &mut load1, 1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load0>
+        <load1>
+        %t190_<index> = OpLoad %uint %exec_lo
+               OpStore %<dst0> %t190_<index>
+        %t191_<index> = OpLoad %uint %exec_hi
+               OpStore %<dst1> %t191_<index>
+        %t192_<index> = OpNot %uint %t0_<index>
+        %t193_<index> = OpNot %uint %t1_<index>
+        %t194_<index> = OpBitwiseAnd %uint %t192_<index> %t190_<index>
+               OpStore %exec_lo %t194_<index>
+        %t197_<index> = OpBitwiseAnd %uint %t193_<index> %t191_<index>
+               OpStore %exec_hi %t197_<index>
+        <execz>
+        <scc>
+"#;
+
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<execz>", EXECZ)
+        .replace("<scc>", get_scc_check(scc_check, 2))
+        .replace("<dst0>", &dst_value0.value)
+        .replace("<dst1>", &dst_value1.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Beyond-Kyty: `v_add_co_ci_u32` — add with carry-in and carry-out.
+/// `vdst = src0 + src1 + carry_in; carry_out -> sdst`. Both the plain VOP2 form
+/// (carry in/out via VCC) and the VOP3B form (carry-in = src2, carry-out =
+/// sdst) decode to this one recompiler; the parser wires `dst2`/`src[2]` to VCC
+/// or to the encoded SGPR pair respectively. Follows SharpEmu's `EmitAddWithCarry`
+/// (Gen5SpirvTranslator.Alu.cs L3396): the carry-out is the unsigned overflow of
+/// the two-step add, `(partial <u src0) || (result <u partial)`. In this
+/// single-lane model the carry mask holds the lane bit in bit 0 (matching the
+/// compare recompilers), so carry-in is `src2 & 1` and carry-out is written as
+/// 1/0 to the low mask dword with 0 in the high dword.
+fn recompile_v_add_co_ci_u32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VAddCoCiU32_VdstSdst2Vsrc0Vsrc1Smask2";
+    let inst = inst_at(code, index, FUNC)?;
+
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    if inst.dst.clamp {
+        return Err(not_supported(FUNC, "clamp"));
+    }
+    if inst.dst.multiplier != 1.0 {
+        return Err(not_supported(FUNC, "multiplier"));
+    }
+
+    let dst_value = operand_variable_to_str(inst.dst);
+    if dst_value.type_ != SpirvType::Float {
+        return Err(not_supported(FUNC, "dst is not float"));
+    }
+
+    if !operand_is_variable(inst.dst2) {
+        return Err(not_supported(FUNC, "dst2 (carry-out) is not a variable"));
+    }
+    let carry_out0 = operand_variable_to_str_shift(inst.dst2, 0);
+    let carry_out1 = operand_variable_to_str_shift(inst.dst2, 1);
+    if carry_out0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "carry-out is not uint"));
+    }
+    if operand_is_exec(inst.dst2) {
+        return Err(not_supported(FUNC, "exec carry-out"));
+    }
+
+    if !operand_is_variable(inst.src[2]) {
+        return Err(not_supported(FUNC, "carry-in is not a variable"));
+    }
+    let carry_in = operand_variable_to_str_shift(inst.src[2], 0);
+    if carry_in.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "carry-in is not uint"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, -1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1, -1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load0>
+        <load1>
+        %tci_raw_<index> = OpLoad %uint %<carryin>
+        %tci_bit_<index> = OpBitwiseAnd %uint %tci_raw_<index> %uint_1
+        %tpartial_<index> = OpIAdd %uint %t0_<index> %t1_<index>
+        %tsum_<index> = OpIAdd %uint %tpartial_<index> %tci_bit_<index>
+        %tc0_<index> = OpULessThan %bool %tpartial_<index> %t0_<index>
+        %tc1_<index> = OpULessThan %bool %tsum_<index> %tpartial_<index>
+        %tcarry_<index> = OpLogicalOr %bool %tc0_<index> %tc1_<index>
+        %tcarry_u_<index> = OpSelect %uint %tcarry_<index> %uint_1 %uint_0
+               OpStore %<carryout0> %tcarry_u_<index>
+               OpStore %<carryout1> %uint_0
+        %tsumf_<index> = OpBitcast %float %tsum_<index>
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+        %tdst_<index> = OpLoad %float %<dst>
+        %tval_<index> = OpSelect %float %exec_lo_b_<index> %tsumf_<index> %tdst_<index>
+               OpStore %<dst> %tval_<index>
+"#;
+
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<carryin>", &carry_in.value)
+        .replace("<carryout0>", &carry_out0.value)
+        .replace("<carryout1>", &carry_out1.value)
+        .replace("<dst>", &dst_value.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Beyond-Kyty: `v_mad_u64_u32` — widening multiply-accumulate
+/// `vdst.u64 = src0.u32 * src1.u32 + src2.u64`, carry-out of the 64-bit add ->
+/// sdst. Built from the existing `mul_lo_uint`/`mul_hi_uint` helpers (the 64-bit
+/// product) and two `addc` calls (the 64-bit add with inter-dword carry), the
+/// same primitives `s_addc_u32` uses. The destination and src2 are 32-bit VGPR
+/// pairs (float-typed dwords, so the uint result is bitcast before storing); the
+/// carry-out sdst is written only when it decodes to a real SGPR pair (most
+/// callers leave it unused). Measured in ASTRO.BOT's scene-composite compute
+/// shader (0x555f4f500).
+fn recompile_v_mad_u64_u32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VMadU64U32_VdstSdst2Vsrc0Vsrc1Smask2";
+    let inst = inst_at(code, index, FUNC)?;
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    // The 64-bit result lands in two VGPR dwords, each float-typed in this
+    // model (so the uint sum is bitcast to float before the store).
+    let dst0 = operand_variable_to_str_shift(inst.dst, 0);
+    let dst1 = operand_variable_to_str_shift(inst.dst, 1);
+    if dst0.type_ != SpirvType::Float || dst1.type_ != SpirvType::Float {
+        return Err(not_supported(FUNC, "dst is not a VGPR pair"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+    let mut load2lo = String::new();
+    let mut load2hi = String::new();
+    // src0/src1 are 32-bit (shift -1 = whole operand); src2 is the 64-bit
+    // addend (dword 0 and dword 1).
+    if !operand_load_uint(spirv, inst.src[0], "s0_<index>", &index_str, &mut load0, -1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[1], "s1_<index>", &index_str, &mut load1, -1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[2], "s2lo_<index>", &index_str, &mut load2lo, 0)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[2], "s2hi_<index>", &index_str, &mut load2hi, 1)? {
+        return Ok(false);
+    }
+
+    // Write the carry-out only when sdst is a real, uint-typed SGPR pair. A
+    // v_mad_u64_u32 whose sdst is left off (the common case) simply drops it.
+    let carry_store = if operand_is_variable(inst.dst2) {
+        let co0 = operand_variable_to_str_shift(inst.dst2, 0);
+        let co1 = operand_variable_to_str_shift(inst.dst2, 1);
+        if co0.type_ == SpirvType::Uint && !operand_is_exec(inst.dst2) {
+            format!(
+                "               OpStore %{co0} %tc1_<index>\n               OpStore %{co1} %uint_0",
+                co0 = co0.value,
+                co1 = co1.value,
+            )
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    // The 64-bit add is done dword-by-dword with an explicit unsigned-overflow
+    // carry (`OpULessThan`, as `v_add_co_ci_u32` does) rather than the `%addc`
+    // helper — self-contained and free of `OpIAddCarry`, which the runtime
+    // driver accepts but the test-time validator does not. High-dword overflow
+    // (the carry-out) can come from either the phi+s2hi add or the +carry add.
+    const TEXT: &str = r#"
+        <load0>
+        <load1>
+        <load2lo>
+        <load2hi>
+        %tplo_<index> = OpFunctionCall %uint %mul_lo_uint %s0_<index> %s1_<index>
+        %tphi_<index> = OpFunctionCall %uint %mul_hi_uint %s0_<index> %s1_<index>
+        %trlo_<index> = OpIAdd %uint %tplo_<index> %s2lo_<index>
+        %tc0b_<index> = OpULessThan %bool %trlo_<index> %tplo_<index>
+        %tc0_<index> = OpSelect %uint %tc0b_<index> %uint_1 %uint_0
+        %tmid_<index> = OpIAdd %uint %tphi_<index> %s2hi_<index>
+        %tcmid_<index> = OpULessThan %bool %tmid_<index> %tphi_<index>
+        %trhi_<index> = OpIAdd %uint %tmid_<index> %tc0_<index>
+        %tctop_<index> = OpULessThan %bool %trhi_<index> %tmid_<index>
+        %tc1b_<index> = OpLogicalOr %bool %tcmid_<index> %tctop_<index>
+        %tc1_<index> = OpSelect %uint %tc1b_<index> %uint_1 %uint_0
+        %trlof_<index> = OpBitcast %float %trlo_<index>
+               OpStore %<dst0> %trlof_<index>
+        %trhif_<index> = OpBitcast %float %trhi_<index>
+               OpStore %<dst1> %trhif_<index>
+<carry>
+"#;
+
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<load2lo>", &load2lo)
+        .replace("<load2hi>", &load2hi)
+        .replace("<carry>", &carry_store)
+        .replace("<dst0>", &dst0.value)
+        .replace("<dst1>", &dst1.value)
         .replace("<index>", &index_str);
 
     Ok(true)
@@ -8322,6 +8675,10 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_buffer_store_dwordx4, T::BufferStoreDwordX4, F::Vdata4Vaddr2SvSoffsOffenIdxen, p1("")),
     f(recompile_buffer_store_dwordx4, T::BufferStoreDwordX4, F::Vdata4SvSoffs,                 p1("")),
     f(recompile_buffer_store_dwordx4, T::BufferStoreDwordX4, F::Vdata4VaddrSvSoffsOffen,       p1("")),
+    f(recompile_buffer_store_dwordx2, T::BufferStoreDwordX2, F::Vdata2VaddrSvSoffsIdxen,       p1("")),
+    f(recompile_buffer_store_dwordx2, T::BufferStoreDwordX2, F::Vdata2Vaddr2SvSoffsOffenIdxen, p1("")),
+    f(recompile_buffer_store_dwordx2, T::BufferStoreDwordX2, F::Vdata2SvSoffs,                 p1("")),
+    f(recompile_buffer_store_dwordx2, T::BufferStoreDwordX2, F::Vdata2VaddrSvSoffsOffen,       p1("")),
 
     f(recompile_fetch, T::FetchX,    F::Vdata1VaddrSvSoffsIdxen, p1("")),
     f(recompile_fetch, T::FetchXy,   F::Vdata2VaddrSvSoffsIdxen, p1("")),
@@ -8486,15 +8843,32 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_v_xxx_b32_svdst_svsrc01, T::VMulU32U24,  F::SVdstSVsrc0SVsrc1, p3("%tu0_<index> = OpBitwiseAnd %uint %t0_<index> %uint_0x00ffffff", "%tu1_<index> = OpBitwiseAnd %uint %t1_<index> %uint_0x00ffffff", "%t_<index> = OpFunctionCall %uint %mul_lo_uint %tu0_<index> %tu1_<index>")),
     f(recompile_v_xxx_b32_svdst_svsrc01, T::VOrB32,      F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseOr %uint %t0_<index> %t1_<index>")),
     f(recompile_v_xxx_b32_svdst_svsrc01, T::VXorB32,     F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseXor %uint %t0_<index> %t1_<index>")),
+    // RDNA2 VOP2 0x1e v_xnor_b32 = ~(src0 ^ src1). Measured in ASTRO.BOT scene
+    // composite CS.
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VXnorB32,    F::SVdstSVsrc0SVsrc1, p2("%txor_<index> = OpBitwiseXor %uint %t0_<index> %t1_<index>", "%t_<index> = OpNot %uint %txor_<index>")),
     // RDNA2-only (no Kyty upstream rows): the carry-less VOP2 add/sub family
     // measured in Minecraft's menu CS.
     f(recompile_v_xxx_b32_svdst_svsrc01, T::VAddNcU32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpIAdd %uint %t0_<index> %t1_<index>")),
+    // RDNA2 v_add_co_ci_u32 (VOP2 0x28 + VOP3B 0x128): add with carry in/out.
+    // Measured in ASTRO.BOT scene composite CS.
+    f(recompile_v_add_co_ci_u32, T::VAddCoCiU32, F::VdstSdst2Vsrc0Vsrc1Smask2, p1("")),
+    // RDNA2 v_mad_u64_u32 (VOP3B 0x176): u64 = u32*u32 + u64. Shares the
+    // add-with-carry format key (distinct type). Measured in ASTRO.BOT scene
+    // composite CS 0x555f4f500.
+    f(recompile_v_mad_u64_u32, T::VMadU64U32, F::VdstSdst2Vsrc0Vsrc1Smask2, p1("")),
     f(recompile_v_xxx_b32_svdst_svsrc01, T::VSubNcU32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpISub %uint %t0_<index> %t1_<index>")),
     f(recompile_v_xxx_b32_svdst_svsrc01, T::VSubrevNcU32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpISub %uint %t1_<index> %t0_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc01, T::VAddF32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFAdd %float %t0_<index> %t1_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc01, T::VMacF32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Fma %t0_<index> %t1_<index> %tdst_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc01, T::VMaxF32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpExtInst %float %GLSL_std_450 FMax %t0_<index> %t1_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc01, T::VMinF32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpExtInst %float %GLSL_std_450 FMin %t0_<index> %t1_<index>")),
+    // RDNA2 integer min/max (VOP2 0x11-0x14). Unsigned via the uint family +
+    // GLSL UMin/UMax; signed via the int family + SMin/SMax. v_min_u32 measured
+    // in ASTRO.BOT scene CS 0x555f4f500; the other three are its direct siblings.
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VMinU32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpExtInst %uint %GLSL_std_450 UMin %t0_<index> %t1_<index>")),
+    f(recompile_v_xxx_b32_svdst_svsrc01, T::VMaxU32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpExtInst %uint %GLSL_std_450 UMax %t0_<index> %t1_<index>")),
+    f(recompile_v_xxx_i32_svdst_svsrc01, T::VMinI32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpExtInst %int %GLSL_std_450 SMin %t0_<index> %t1_<index>")),
+    f(recompile_v_xxx_i32_svdst_svsrc01, T::VMaxI32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpExtInst %int %GLSL_std_450 SMax %t0_<index> %t1_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc01, T::VMulF32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFMul %float %t0_<index> %t1_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc01, T::VSubF32,    F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFSub %float %t0_<index> %t1_<index>")),
     f(recompile_v_xxx_f32_svdst_svsrc01, T::VSubrevF32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFSub %float %t1_<index> %t0_<index>")),
@@ -8549,6 +8923,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
 
     fs(recompile_s_and_saveexec_b64, T::SAndSaveexecB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
     fs(recompile_s_orn2_saveexec_b64, T::SOrn2SaveexecB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
+    fs(recompile_s_andn1_saveexec_b64, T::SAndn1SaveexecB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
     f(recompile_smov_b64,    T::SMovB64,    F::Sdst2Ssrc02, p1("")),
     f(recompile_sswappc_b64, T::SSwappcB64, F::Sdst2Ssrc02, p1("")),
     fs(recompile_swqm_b64, T::SWqmB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
@@ -8685,7 +9060,11 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_v_cube_f32, T::VCubeMaF32, F::VdstVsrc0Vsrc1Vsrc2, p1("")),
     ni("Recompile_V_XXX_U32_VdstVsrc0Vsrc1Vsrc2", 5940, T::VSadU32,    F::VdstVsrc0Vsrc1Vsrc2, p2("%td_<index> = OpFunctionCall %uint %abs_diff %t0_<index> %t1_<index>",
         "%t_<index> = OpIAdd %uint %td_<index> %t2_<index>")),
-    ni("Recompile_V_XXX_U32_VdstVsrc0Vsrc1Vsrc2", 5940, T::VBfeU32,    F::VdstVsrc0Vsrc1Vsrc2, p3("%to_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31",
+    // `v_bfe_u32` (VOP3 0x148): unsigned bitfield extract —
+    // dst = (src0 >> src1[4:0]) & ((1 << src2[4:0]) - 1). Offset = src1[4:0],
+    // count = src2[4:0]; OpBitFieldUExtract does the shift+mask. Measured in
+    // ASTRO.BOT scene-composite CS 0x500690400.
+    f(recompile_v_xxx_u32_vdst_vsrc012, T::VBfeU32, F::VdstVsrc0Vsrc1Vsrc2, p3("%to_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31",
         "%ts_<index> = OpBitwiseAnd %uint %t2_<index> %uint_31",
         "%t_<index> = OpBitFieldUExtract %uint %t0_<index> %to_<index> %ts_<index>")),
     // `v_bfe_i32` (VOP3 0x149): signed bitfield extract — mask offset/count
@@ -8937,7 +9316,7 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            308,
+            320,
             "204 Kyty rows plus SSubU32, SNop, the RDNA2-only rows \
              (VLshlAddU32, VCmpxLtU32, VAddNcU32, VSubNcU32, VSubrevNcU32, VCvtI32F32, \
              VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad dmask1/3/7 \
@@ -8958,11 +9337,15 @@ mod tests {
              DsReadB64, and ImageSampleLz dmask3, and the round-7 batch: \
              VCmpxLeF32, VBfeI32, VBfiB32, and DsReadB128, and the round-8 \
              batch: the four BufferLoadUbyte rows and DsReadB96, and the \
-             round-9 batch: VRcpIflagF32 and DsAddU32"
+             round-9 batch: VRcpIflagF32 and DsAddU32, and the RDNA2 \
+             scene-composite batch: VXnorB32, VAddCoCiU32, SAndn1SaveexecB64 \
+             and VMadU64U32, and the composite-frontier batch: the integer \
+             min/max quartet (VMinU32/VMaxU32/VMinI32/VMaxI32), the four \
+             BufferStoreDwordX2 rows, and VBfeU32 wired from staged"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 299,
+            implemented, 312,
             "C1 implemented subset plus title-driven ports (incl. the S_XXX_I32 \
              trio, VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad \
              dmask1/3/7 + ImageSampleLz dmask1/2/F rows, ImageStore dmask1, the \
@@ -8980,12 +9363,17 @@ mod tests {
               and the convergence batch: four BufferLoadDwordX3 rows, DsReadB64, \
               ImageSampleLz dmask3, and the round-7 batch: VCmpxLeF32, VBfeI32, \
               VBfiB32, DsReadB128, and the round-8 batch: four BufferLoadUbyte \
-              rows, DsReadB96, and the round-9 batch: VRcpIflagF32, DsAddU32)"
+              rows, DsReadB96, and the round-9 batch: VRcpIflagF32, DsAddU32, \
+              and the RDNA2 scene-composite batch: VXnorB32, VAddCoCiU32, \
+              SAndn1SaveexecB64, VMadU64U32, and the composite-frontier batch: \
+              the integer min/max quartet, four BufferStoreDwordX2 rows, and \
+              VBfeU32)"
         );
         assert_eq!(
-            ni, 9,
+            ni, 8,
             "C2 remainder (BufferStoreFormatX/Xy wired out; BufferStoreFormatXyz staged in; \
-             the mbcnt pair wired for the RDNA2 VOP3 lane-index idiom)"
+             the mbcnt pair wired for the RDNA2 VOP3 lane-index idiom; VBfeU32 wired out \
+             of the staged VdstVsrc0Vsrc1Vsrc2 U32 set)"
         );
 
         // Kyty EXIT_IF(map->Contains(p)) — (type, format) keys are unique.
@@ -9075,6 +9463,67 @@ mod tests {
         assert!(source.contains("OpStore %scc %carry_0"));
         let words = spirv_run(&source).expect("assemble measured s_sub_u32");
         naga_parse_and_validate(&words, "s_sub_u32");
+    }
+
+    /// ASTRO.BOT's scene-composite compute shader (0x555f4f500) stopped
+    /// translating on what the log reported as `op_sel != 0`, but that was the
+    /// VOP3B `sdst` field (the carry-out SGPR, VCC) of `v_add_co_ci_u32` being
+    /// misread as op_sel. This asserts the real op set that shader carries all
+    /// parse and recompile to valid SPIR-V: the VOP2 (0x28) and VOP3B (0x128)
+    /// carry-adds collapse to one `VAddCoCiU32`, plus `s_andn1_saveexec_b64`
+    /// (SOP1 0x37), `v_xnor_b32` (VOP2 0x1e), and the VOP3-form `v_bcnt_u32_b32`
+    /// (0x364). Each was a hard wall on that title before this change.
+    #[test]
+    fn astro_composite_carry_and_exec_ops_recompile() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0x5000_0302, // v_add_co_ci_u32 v0, vcc, v2, v1, vcc     (VOP2 0x28)
+                0xD528_6A00,
+                0x01AA_0501, // v_add_co_ci_u32 v0, vcc, v1, v2, s? (VOP3B 0x128)
+                0xBE8A_376A, // s_andn1_saveexec_b64 s[10:11], vcc       (SOP1 0x37)
+                0x3C00_0302, // v_xnor_b32 v0, v2, v1                    (VOP2 0x1e)
+                0xD764_0000,
+                0x0002_0501, // v_bcnt_u32_b32 v0, v1, v2   (VOP3 0x364)
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse composite carry/exec ops (no phantom op_sel refusal)");
+
+        // The parser must recognise every op, not refuse on the phantom op_sel.
+        let types: Vec<_> = code.get_instructions().iter().map(|i| i.type_).collect();
+        assert!(types.contains(&T::SAndn1SaveexecB64));
+        assert!(types.contains(&T::VXnorB32));
+        assert!(types.contains(&T::VBcntU32B32));
+        assert_eq!(
+            types.iter().filter(|t| **t == T::VAddCoCiU32).count(),
+            2,
+            "both the VOP2 and VOP3B carry-add encodings resolve to one type"
+        );
+
+        let input_info = ShaderComputeInputInfo {
+            threads_num: [1, 1, 1],
+            ..Default::default()
+        };
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile composite carry/exec ops");
+        // Carry-out is the unsigned overflow of the two-step add; carry-in and
+        // the andn1 exec update both mask/AND. Assert the shapes are present.
+        assert!(
+            source.contains("OpULessThan %bool"),
+            "carry-out overflow test:\n{source}"
+        );
+        assert!(
+            source.contains("OpBitwiseAnd %uint"),
+            "carry-in bit extract / andn1 exec mask:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble composite carry/exec ops");
+        naga_parse_and_validate(&words, "astro composite carry/exec ops");
     }
 
     /// `s_sub_i32` — the signed twin, and the single instruction all three of
@@ -10201,6 +10650,13 @@ mod tests {
             (T::ImageLoad, F::Vdata3Vaddr3StDmask7),
             (T::ImageSampleLz, F::Vdata4Vaddr3StSsDmaskF),
             (T::SOrn2SaveexecB64, F::Sdst2Ssrc02),
+            // The RDNA2 scene-composite batch (measured ASTRO.BOT
+            // 0x555f4f500 / 0x500564500 divergent-flow prologues): XNOR, the
+            // add-with-carry VOP2/VOP3B pair, and the ANDN1 save-exec sibling.
+            (T::VXnorB32, F::SVdstSVsrc0SVsrc1),
+            (T::VAddCoCiU32, F::VdstSdst2Vsrc0Vsrc1Smask2),
+            (T::SAndn1SaveexecB64, F::Sdst2Ssrc02),
+            (T::VMadU64U32, F::VdstSdst2Vsrc0Vsrc1Smask2),
         ] {
             let entry = recomp_func(ty, fmt).unwrap_or_else(|| panic!("{ty:?} row missing"));
             assert!(
@@ -10208,6 +10664,72 @@ mod tests {
                 "{ty:?} must be implemented, not NI"
             );
         }
+    }
+
+    /// Regression guard for the VOP3B `op_sel` misdecode. A VOP3B opcode's
+    /// carry-out SGPR occupies bits [14:8]; whenever that SGPR index is >= 8 it
+    /// sets bit 11, which overlaps the VOP3A `op_sel` field [14:11]. Before the
+    /// `is_vop3b_opcode` gate the decoder read that bit as `op_sel != 0` and
+    /// refused the whole shader (the "VOP3 op_sel != 0" wall). Here
+    /// `v_add_co_ci_u32` (opcode 0x128) with carry-out s8 must parse to
+    /// `VAddCoCiU32`, not error.
+    #[test]
+    fn vop3b_carry_out_sgpr_is_not_misread_as_op_sel() {
+        // VOP3 prefix 0b110101<<26 | opcode 0x128<<16 | sdst s8<<8 | vdst v2.
+        // s8 (=0b0001000) sets bit 11 of b0 -> op_sel would read 1 if ungated.
+        let b0 = (0b110101u32 << 26) | (0x128 << 16) | (8 << 8) | 2;
+        // src0 = v3 (256+3), src1 = v4 (256+4)<<9, src2 (carry-in) = s0.
+        let b1 = 259u32 | (260u32 << 9);
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(0, &[b0, b1, S_ENDPGM], &mut code, true)
+            .expect("VOP3B v_add_co_ci_u32 must parse, not be refused as op_sel != 0");
+        let inst = &code.get_instructions()[0];
+        assert!(
+            matches!(inst.type_, ShaderInstructionType::VAddCoCiU32),
+            "expected VAddCoCiU32, got {:?}",
+            inst.type_
+        );
+        // Carry-out landed in dst2 as the SGPR pair s8, not swallowed by op_sel.
+        assert_eq!(inst.dst2.register_id, 8, "carry-out must decode to s8");
+    }
+
+    /// `v_mad_u64_u32` (VOP3B 0x176) must parse and recompile to the
+    /// mul-hi/lo + add-with-carry idiom, and the emitted SPIR-V must assemble
+    /// and pass naga validation (guards the hand-written 64-bit-add body).
+    #[test]
+    fn v_mad_u64_u32_recompiles_to_mul_add_with_carry() {
+        // VOP3 prefix | opcode 0x176 | sdst s10 (carry-out) | vdst v0.
+        let b0 = (0b110101u32 << 26) | (0x176 << 16) | (10 << 8);
+        // src0 = v2, src1 = v3<<9, src2 = v4<<18 (the 64-bit addend pair).
+        let b1 = 258u32 | (259u32 << 9) | (260u32 << 18);
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // `s_endpgm` must sit at instruction index >= 2, so the mad is followed
+        // by two harmless scalar fillers (reused from the passing scalar test).
+        shader_parse(0, &[b0, b1, 0xBE80_1F00, 0x9935_806B, S_ENDPGM], &mut code, true)
+            .expect("parse v_mad_u64_u32");
+        let inst = &code.get_instructions()[0];
+        assert!(
+            matches!(inst.type_, ShaderInstructionType::VMadU64U32),
+            "expected VMadU64U32, got {:?}",
+            inst.type_
+        );
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile v_mad_u64_u32");
+        assert!(source.contains("%mul_lo_uint"), "{source}");
+        assert!(source.contains("%mul_hi_uint"), "{source}");
+        // The 64-bit accumulate uses explicit unsigned-overflow carries.
+        assert!(source.contains("OpULessThan %bool"), "{source}");
+        // Assemble-validate only: the module goes through the `mul_lo_uint`/
+        // `mul_hi_uint` helpers, whose `OpUMulExtended` the Vulkan driver
+        // accepts (it backs every shipping VMulLo/Hi shader) but the naga
+        // test-validator rejects — so naga is the wrong bar for this opcode,
+        // exactly as for the `%addc` family.
+        let _words = spirv_run(&source).expect("assemble v_mad_u64_u32");
     }
 
     #[test]
@@ -10327,6 +10849,50 @@ mod tests {
         assert!(source.contains("OpSelect %float"), "{source}");
         let words = spirv_run(&source).expect("assemble image_sample_c_lz");
         naga_parse_and_validate(&words, "image_sample_c_lz");
+    }
+
+    /// image_sample_c_lz on a 2DArray depth texture — the Vaddr3 MIMG carries
+    /// only {dref, s, t} (no slice VGPR), so the sample is at array layer 0 and
+    /// the coordinate is v3 (s, t, 0.0). Measured on ASTRO.BOT composite read
+    /// shader 0x500564500 (dim TwoArray, Vdata1Vaddr3StSsDmask1). 2D output is
+    /// unchanged (v2 coord); 3D/Cube stay refused.
+    #[test]
+    fn image_sample_c_lz_2darray_samples_layer_zero_with_v3_coord() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF0BC_0100, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_sample_c_lz");
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 4;
+        input_info.bind.textures2d.desc[0].texture.fields[3] |= 13 << 28; // type = 2DArray
+        input_info.bind.samplers.samplers_num = 1;
+        input_info.bind.samplers.start_register[0] = 12;
+        input_info.bind.samplers.binding_index = 1;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile 2DArray image_sample_c_lz");
+        assert!(
+            source.contains("OpCompositeConstruct %v3float"),
+            "2DArray sample needs a v3 (s, t, layer) coordinate:\n{source}"
+        );
+        assert!(
+            source.contains("%float_0_000000"),
+            "array layer 0:\n{source}"
+        );
+        assert!(
+            source.contains("OpImageSampleExplicitLod %v4float"),
+            "{source}"
+        );
+        let words = spirv_run(&source).expect("assemble 2DArray image_sample_c_lz");
+        naga_parse_and_validate(&words, "2DArray image_sample_c_lz");
     }
 
     #[test]
@@ -10465,6 +11031,119 @@ mod tests {
         // false-negative class its dmask1/7/F siblings ship under; real
         // Vulkan accepts it. The real-driver gate is the --run-eboot render.
         let _ = spirv_run(&source).expect("assemble image_load dmask3");
+    }
+
+    /// image_load of a 3D texture must build a 3-component (x, y, z) integer
+    /// coordinate and OpImageFetch it — the non-2D texel-fetch path measured
+    /// on ASTRO.BOT's composite read shader (0x500566b00). 2D output is
+    /// unchanged; Cube stays a named refusal (SPIR-V forbids cube fetch).
+    #[test]
+    fn image_load_3d_texture_fetches_with_v3uint_coords() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF000_0300, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_load");
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 4;
+        input_info.bind.textures2d.desc[0].texture.fields[3] |= 10 << 28; // type = 3D
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile 3D image_load");
+        assert!(source.contains("OpImageFetch %v4float"), "{source}");
+        assert!(
+            source.contains("OpCompositeConstruct %v3uint"),
+            "the 3D fetch coordinate must carry z:\n{source}"
+        );
+        let _ = spirv_run(&source).expect("assemble 3D image_load");
+    }
+
+    /// `v_min_u32` (VOP2 0x13) must recompile to a GLSL `UMin` and validate —
+    /// the measured wall on ASTRO.BOT scene CS 0x555f4f500 after the v_mad fix.
+    #[test]
+    fn v_min_u32_recompiles_to_umin() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        let min = ShaderInstruction {
+            type_: T::VMinU32,
+            format: F::SVdstSVsrc0SVsrc1,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Vgpr,
+                register_id: 2,
+                size: 1,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Vgpr,
+                    register_id: 0,
+                    size: 1,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::Vgpr,
+                    register_id: 1,
+                    size: 1,
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        // Two ops so s_endpgm lands at instruction index >= 2.
+        for _ in 0..2 {
+            code.get_instructions_mut().push(min.clone());
+        }
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            ..Default::default()
+        });
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile v_min_u32");
+        assert!(
+            source.contains("OpExtInst %uint %GLSL_std_450 UMin"),
+            "{source}"
+        );
+        let words = spirv_run(&source).expect("assemble v_min_u32");
+        naga_parse_and_validate(&words, "v_min_u32");
+    }
+
+    /// The composite-frontier batch rows must all be wired (implemented, not
+    /// NI): the integer min/max quartet, the four flexible-addressing
+    /// `buffer_store_dwordx2` formats, and `v_bfe_u32`. Measured on ASTRO.BOT
+    /// scene shaders 0x555f4f500 / 0x500757800 / 0x500690400.
+    #[test]
+    fn composite_frontier_rows_are_wired() {
+        let rows: &[(T, F)] = &[
+            (T::VMinU32, F::SVdstSVsrc0SVsrc1),
+            (T::VMaxU32, F::SVdstSVsrc0SVsrc1),
+            (T::VMinI32, F::SVdstSVsrc0SVsrc1),
+            (T::VMaxI32, F::SVdstSVsrc0SVsrc1),
+            (T::VBfeU32, F::VdstVsrc0Vsrc1Vsrc2),
+            (T::BufferStoreDwordX2, F::Vdata2VaddrSvSoffsIdxen),
+            (T::BufferStoreDwordX2, F::Vdata2Vaddr2SvSoffsOffenIdxen),
+            (T::BufferStoreDwordX2, F::Vdata2SvSoffs),
+            (T::BufferStoreDwordX2, F::Vdata2VaddrSvSoffsOffen),
+        ];
+        for (ty, fmt) in rows {
+            let entry = recomp_func(*ty, *fmt).unwrap_or_else(|| panic!("{ty:?} row missing"));
+            assert!(
+                matches!(entry.func, RecompileFn::Func(_)),
+                "{ty:?} must be implemented, not NI"
+            );
+        }
     }
 
     #[test]

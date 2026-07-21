@@ -637,12 +637,16 @@ fn shader_parse_sop1(
         0x33 => return Err(ni(dst, S, "s_mov_regrd_b32", opcode, pc, b0)),
         0x34 => return Err(ni(dst, S, "s_abs_i32", opcode, pc, b0)),
         0x35 => return Err(ni(dst, S, "s_mov_fed_b32", opcode, pc, b0)),
-        _ => {
-            // TEMP DIAGNOSTIC
-            eprintln!("SOP1WALL pc=0x{pc:04x} opcode=0x{opcode:x} b0=0x{b0:08x}");
-            inst.type_ = T::SMovB32;
-            inst.format = F::SVdstSVsrc0;
+        // RDNA2 (`next_gen`) SOP1 0x37: s_andn1_saveexec_b64 (SharpEmu Gen5
+        // L710). `sdst = exec; exec = ~ssrc0 & exec`. Same 64-bit save-exec
+        // shape as 0x24/0x28.
+        0x37 => {
+            inst.type_ = T::SAndn1SaveexecB64;
+            inst.format = F::Sdst2Ssrc02;
+            inst.dst.size = 2;
+            inst.src[0].size = 2;
         }
+        _ => return Err(unknown_op(dst, S, opcode, pc, b0)),
     }
 
     dst.get_instructions_mut().push(inst);
@@ -1498,10 +1502,12 @@ fn shader_parse_vop2(
         0x0b => inst.type_ = T::VMulU32U24,
         0x0f => inst.type_ = T::VMinF32,
         0x10 => inst.type_ = T::VMaxF32,
-        0x11 => return Err(ni(dst, S, "v_min_i32", opcode, pc, b0)),
-        0x12 => return Err(ni(dst, S, "v_max_i32", opcode, pc, b0)),
-        0x13 => return Err(ni(dst, S, "v_min_u32", opcode, pc, b0)),
-        0x14 => return Err(ni(dst, S, "v_max_u32", opcode, pc, b0)),
+        // Integer min/max share the VOP2 slot in both GCN and RDNA2 (like the
+        // float 0x0f/0x10 above); carry-less two-source ALU ops.
+        0x11 => inst.type_ = T::VMinI32,
+        0x12 => inst.type_ = T::VMaxI32,
+        0x13 => inst.type_ = T::VMinU32,
+        0x14 => inst.type_ = T::VMaxU32,
         0x15 => inst.type_ = T::VLshrB32,
         0x16 => inst.type_ = T::VLshrrevB32,
         0x17 => inst.type_ = T::VAshrI32,
@@ -1513,9 +1519,8 @@ fn shader_parse_vop2(
         0x1d => inst.type_ = T::VXorB32,
         0x1e => {
             if next_gen {
-                // TEMP DIAGNOSTIC
-                eprintln!("VOP2WALL pc=0x{pc:04x} opcode=0x1e(v_xnor_b32) b0=0x{b0:08x}");
-                inst.type_ = T::VXorB32;
+                // RDNA2 reuses this VOP2 slot for v_xnor_b32 = ~(src0 ^ src1).
+                inst.type_ = T::VXnorB32;
             } else {
                 inst.type_ = T::VBfmB32;
             }
@@ -1576,8 +1581,15 @@ fn shader_parse_vop2(
         }
         0x28 => {
             if next_gen {
-                // TEMP DIAGNOSTIC
-                inst.type_ = T::VAddNcU32;
+                // RDNA2 v_add_co_ci_u32 (VOP2): vdst = src0 + vsrc1 + vcc_in;
+                // carry in and out both flow through VCC.
+                inst.type_ = T::VAddCoCiU32;
+                inst.format = F::VdstSdst2Vsrc0Vsrc1Smask2;
+                inst.src_num = 3;
+                inst.dst2.type_ = O::VccLo;
+                inst.dst2.size = 2;
+                inst.src[2].type_ = O::VccLo;
+                inst.src[2].size = 2;
             } else {
                 return Err(ni(dst, S, "v_addc_u32", opcode, pc, b0));
             }
@@ -1649,6 +1661,21 @@ fn shader_parse_vop2(
     Ok(size)
 }
 
+/// RDNA2 VOP3B opcodes: VOP3 ops that carry a scalar carry/borrow/mask
+/// destination (`sdst`, bits [14:8]) instead of the VOP3A `op_sel`/`abs` fields.
+/// SharpEmu Gen5 keeps the identical set (`IsVop3BOpcode`,
+/// Gen5ShaderTranslator.cs L1163-1164): 0x128 `v_add_co_ci_u32`, 0x16d/0x16e
+/// `v_div_scale_f32/f64`, 0x176/0x177 `v_mad_u64_u32`/`v_mad_i64_i32`, 0x30f
+/// `v_add_co_u32`, 0x310 `v_sub_co_u32`, 0x319 `v_subrev_co_u32`. Only 0x128 is
+/// implemented so far; the rest are named refusals but must still be recognised
+/// here so their sdst is not misread as op_sel.
+const fn is_vop3b_opcode(opcode: u32) -> bool {
+    matches!(
+        opcode,
+        0x128 | 0x16d | 0x16e | 0x176 | 0x177 | 0x30f | 0x310 | 0x319
+    )
+}
+
 /// Kyty: ShaderParse.cpp `shader_parse_vop3` (L1372). Handles the VOP3
 /// encoding, which also carries VOPC (opcode 0x00-0xff), VOP2 (0x100-0x13d)
 /// and VOP1 (0x180-0x1e8) operations. Legacy vs next-gen differ in the
@@ -1674,7 +1701,17 @@ fn shader_parse_vop3(
     } else {
         (b0 >> 11) & 0x1
     };
-    let op_sel = if next_gen { (b0 >> 11) & 0xf } else { 0 };
+    // op_sel (bits [14:11]) is a VOP3A-only field. VOP3B opcodes reuse those
+    // same bits as the top of their sdst field (bits [14:8]), so reading op_sel
+    // there is a misdecode — a carry-out SGPR reads back as a non-zero op_sel
+    // and the shader is wrongly refused. Gate it out for the VOP3B opcodes.
+    // SharpEmu Gen5 does the same (Gen5ShaderTranslator.cs L1916-1923: op_sel is
+    // forced to 0 and sdst is read instead when `IsVop3BOpcode`).
+    let op_sel = if next_gen && !is_vop3b_opcode(opcode) {
+        (b0 >> 11) & 0xf
+    } else {
+        0
+    };
     let abs = (b0 >> 8) & 0x7;
     let vdst = b0 & 0xff;
     let sdst = (b0 >> 8) & 0x7f;
@@ -1684,11 +1721,12 @@ fn shader_parse_vop3(
     let src1 = (b1 >> 9) & 0x1ff;
     let src2 = (b1 >> 18) & 0x1ff;
 
-    // Kyty L1392: EXIT_NOT_IMPLEMENTED(op_sel != 0).
+    // Kyty L1392: EXIT_NOT_IMPLEMENTED(op_sel != 0). Genuine VOP3A op_sel
+    // (packed-16-bit half select on true VOP3A ops) stays a named refusal — no
+    // shader measured to date needs it. The former false positives were all the
+    // VOP3B carry op above, now gated out.
     if op_sel != 0 {
-        eprintln!(
-            "OPSEL pc=0x{pc:04x} opcode=0x{opcode:x} op_sel=0x{op_sel:x} clamp={clamp} neg=0x{neg:x} omod={omod} b0=0x{b0:08x} b1=0x{b1:08x} src0=0x{src0:x} src1=0x{src1:x} src2=0x{src2:x} vdst=0x{vdst:x}"
-        );
+        return Err(feature(S, "op_sel != 0", pc));
     }
 
     let mut inst = ShaderInstruction {
@@ -1925,10 +1963,15 @@ fn shader_parse_vop3(
         }
         0x128 => {
             if next_gen {
-                // TEMP DIAGNOSTIC: decode as plain add to continue tracing.
-                inst.type_ = T::VAddNcU32;
-                inst.format = F::SVdstSVsrc0SVsrc1;
-                inst.src_num = 2;
+                // RDNA2 v_add_co_ci_u32 (VOP3B): vdst = src0 + src1 + carry_in;
+                // carry_out -> sdst. src2 (already parsed) is the carry-in mask;
+                // sdst (bits [14:8]) is the carry-out mask. See is_vop3b_opcode.
+                inst.type_ = T::VAddCoCiU32;
+                inst.format = F::VdstSdst2Vsrc0Vsrc1Smask2;
+                inst.src_num = 3;
+                inst.src[2].size = 2;
+                inst.dst2 = operand_parse(sdst)?;
+                inst.dst2.size = 2;
             } else {
                 return Err(ni(dst, S, "v_addc_u32", opcode, pc, b0));
             }
@@ -2063,7 +2106,23 @@ fn shader_parse_vop3(
         0x171 => return Err(ni(dst, S, "v_msad_u8", opcode, pc, b0)),
         0x174 => return Err(ni(dst, S, "v_trig_preop_f64", opcode, pc, b0)),
         0x175 => return Err(ni(dst, S, "v_mqsad_u32_u8", opcode, pc, b0)),
-        0x176 => return Err(ni(dst, S, "v_mad_u64_u32", opcode, pc, b0)),
+        0x176 => {
+            if !next_gen {
+                return Err(ni(dst, S, "v_mad_u64_u32", opcode, pc, b0));
+            }
+            // RDNA2 v_mad_u64_u32 (VOP3B): vdst.u64 = src0.u32 * src1.u32 +
+            // src2.u64; carry-out of the 64-bit add -> sdst. vdst and src2 are
+            // 64-bit register pairs; src0/src1 stay 32-bit. sdst (bits [14:8])
+            // is the carry-out mask — recognised as VOP3B above so it is not
+            // misread as op_sel. Shares the add-with-carry format.
+            inst.type_ = T::VMadU64U32;
+            inst.format = F::VdstSdst2Vsrc0Vsrc1Smask2;
+            inst.src_num = 3;
+            inst.dst.size = 2;
+            inst.src[2].size = 2;
+            inst.dst2 = operand_parse(sdst)?;
+            inst.dst2.size = 2;
+        }
         0x177 => return Err(ni(dst, S, "v_mad_i64_i32", opcode, pc, b0)),
         0x303 => {
             if next_gen {
@@ -2277,6 +2336,19 @@ fn shader_parse_vop3(
         0x1e4 => return Err(ni(dst, S, "v_cvt_norm_u16_f16", opcode, pc, b0)),
         0x1e5 => return Err(ni(dst, S, "v_swap_b32", opcode, pc, b0)),
 
+        // RDNA2 VOP3-only re-encodings of VOP2 ops that moved out of the VOP2
+        // opcode space (SharpEmu Gen5 L1139-1152). 0x364 v_bcnt_u32_b32 =
+        // `vdst = bitcount(src0) + src1`; reuse the existing VOP2 lowering by
+        // pinning the two-source scalar layout it expects.
+        0x364 => {
+            if !next_gen {
+                return Err(unknown_op(dst, S, opcode, pc, b0));
+            }
+            inst.type_ = T::VBcntU32B32;
+            inst.format = F::SVdstSVsrc0SVsrc1;
+            inst.src_num = 2;
+        }
+
         _ => {
             // VOPC-via-VOP3 not-implemented compares share the VOPC table.
             if opcode <= 0xff {
@@ -2284,9 +2356,7 @@ fn shader_parse_vop3(
                     return Err(ni(dst, S, name, opcode, pc, b0));
                 }
             }
-            // TEMP DIAGNOSTIC
-            eprintln!("VOP3WALL pc=0x{pc:04x} opcode=0x{opcode:x} op_sel=0x{op_sel:x} b0=0x{b0:08x} b1=0x{b1:08x}");
-            inst.type_ = T::VAdd3U32;
+            return Err(unknown_op(dst, S, opcode, pc, b0));
         }
     }
 
@@ -2878,7 +2948,22 @@ fn shader_parse_mubuf(
             inst.src[0].size = src0_size;
             inst.src[1].size = 4;
         }
-        0x1d => return Err(ni(dst, S, "buffer_store_dwordx2", opcode, pc, b0)),
+        // Beyond Kyty (KYTY_NI upstream): two-dword raw store, measured on
+        // ASTRO.BOT scene compute (0x500757800). Same flexible addressing
+        // quartet as BufferLoadDwordX2; the store data is the two-dword vdata
+        // register (`inst.dst`).
+        0x1d => {
+            inst.type_ = T::BufferStoreDwordX2;
+            inst.format = match (idxen, offen) {
+                (1, 1) => F::Vdata2Vaddr2SvSoffsOffenIdxen,
+                (1, 0) => F::Vdata2VaddrSvSoffsIdxen,
+                (0, 1) => F::Vdata2VaddrSvSoffsOffen,
+                _ => F::Vdata2SvSoffs,
+            };
+            inst.src[0].size = src0_size;
+            inst.src[1].size = 4;
+            inst.dst.size = 2;
+        }
         // Beyond Kyty (KYTY_NI upstream): four-dword raw store, measured on
         // ASTRO.BOT scene compute (raw 0xe0780000). Same flexible addressing
         // quartet as BufferLoadDwordX4.

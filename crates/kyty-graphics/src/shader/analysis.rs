@@ -806,12 +806,17 @@ fn check_read_only_texture_type(
     t: &super::resources::ShaderTextureResource,
 ) -> Result<(), ShaderAnalysisError> {
     let ty = t.type_();
-    if ty == 9 || ty == 10 || ty == 11 || ty == 13 {
+    // 8 = 1D. The sample path already classifies it as 2D
+    // (`SampledDim::from_texture_type`'s default), and a 1D texture is a
+    // height-1 2D texture (the single row lives at t=0), so accept it here for
+    // consistency — measured on ASTRO.BOT scene CS 0x500757800 (a 1x1 type-8
+    // read-only texture). 9=2D, 10=3D, 11=Cube, 13=2DArray.
+    if ty == 8 || ty == 9 || ty == 10 || ty == 11 || ty == 13 {
         return Ok(());
     }
     Err(ni_owned(format!(
         "read-only texture type {ty} is not Texture2D (9) \
-         (10=3D 11=Cube 12=1DArray 13=2DArray; base={:#x} {}x{} depth={} format={} tile={})",
+         (8=1D 10=3D 11=Cube 12=1DArray 13=2DArray; base={:#x} {}x{} depth={} format={} tile={})",
         t.base40(),
         u32::from(t.width5()) + 1,
         u32::from(t.height5()) + 1,

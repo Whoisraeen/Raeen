@@ -52,6 +52,11 @@ pub enum ShaderInstructionType {
     BufferLoadFormatXyz,
     BufferLoadFormatXyzw,
     BufferStoreDword,
+    /// MUBUF 0x1d: two-dword raw store. Kyty leaves it `KYTY_NI`; measured in
+    /// ASTRO.BOT scene compute (0x500757800). Same flexible addressing quartet
+    /// as [`BufferStoreDwordX4`]; the shared `buffer_store_dwordxn` helper
+    /// writes `n` consecutive dwords.
+    BufferStoreDwordX2,
     /// MUBUF 0x1e: four-dword raw store. Kyty leaves it `KYTY_NI`; measured
     /// in ASTRO.BOT scene compute (raw 0xe0780000).
     BufferStoreDwordX4,
@@ -135,6 +140,12 @@ pub enum ShaderInstructionType {
     SAddU32,
     SAndB32,
     SAndB64,
+    /// RDNA2 (`next_gen`) SOP1 0x37: `sdst = exec; exec = ~ssrc0 & exec`
+    /// (save-exec, negating the first operand). SharpEmu Gen5 decodes this as
+    /// `SAndn1SaveexecB64` (Gen5ShaderTranslator.cs L710); the `andn2` sibling
+    /// (0x27) negates the second operand instead. Measured in ASTRO.BOT's
+    /// scene-composite compute shader (0x555f4f500, divergent-flow prologue).
+    SAndn1SaveexecB64,
     SAndn2B64,
     SAndSaveexecB64,
     /// SOPP 0x0a: workgroup execution + LDS memory barrier. Kyty leaves it
@@ -218,6 +229,18 @@ pub enum ShaderInstructionType {
     /// `V_ADD3_U32 = 877` (== 0x36d). Measured in ASTRO.BOT scene compute.
     VAdd3U32,
     VAddI32,
+    /// RDNA2 (`next_gen`) v_add_co_ci_u32 — add with carry-in and carry-out:
+    /// `vdst = src0 + src1 + carry_in; carry_out -> sdst`. Two encodings feed
+    /// this one type: the plain VOP2 form (opcode 0x28, carry in/out both via
+    /// VCC) and the VOP3B form (opcode 0x128, carry-in = src2, carry-out =
+    /// sdst). SharpEmu Gen5 names the VOP3B form `VAddCoCiU32`
+    /// (Gen5ShaderTranslator.cs L1094, IsVop3BOpcode L1163) and lowers it in
+    /// `EmitAddWithCarry` (Gen5SpirvTranslator.Alu.cs L3396). The VOP3B sdst
+    /// field (bits [14:8]) overlaps the VOP3A op_sel bits [14:11], so before
+    /// this type existed the decoder misread the carry-out SGPR as `op_sel !=
+    /// 0` and refused the whole shader. Measured in ASTRO.BOT's scene-composite
+    /// compute shader (0x555f4f500).
+    VAddCoCiU32,
     /// RDNA2 (`next_gen`) VOP2 0x25: carry-less `vdst = vsrc0 + vsrc1`
     /// (replaces GCN's carry-writing v_add_i32 in the same encoding slot).
     VAddNcU32,
@@ -347,13 +370,31 @@ pub enum ShaderInstructionType {
     VMadF32,
     VMadmkF32,
     VMadU32U24,
+    /// RDNA2 (`next_gen`) VOP3B 0x176 `v_mad_u64_u32`: widening
+    /// multiply-accumulate `vdst.u64 = src0.u32 * src1.u32 + src2.u64`, with the
+    /// 64-bit add's carry-out written to the `sdst` mask (bits [14:8], the same
+    /// VOP3B field that overlaps VOP3A op_sel — see [`VAddCoCiU32`]). SharpEmu
+    /// Gen5 names it in `IsVop3BOpcode` (Gen5ShaderTranslator.cs L1163) and
+    /// lowers it via the mul-hi/lo + add-with-carry idiom. Measured in
+    /// ASTRO.BOT's scene-composite compute shader (0x555f4f500) — the sole
+    /// remaining parse wall on that shader after the op_sel gate landed.
+    VMadU64U32,
     VMax3F32,
     VMaxF32,
+    /// RDNA2 VOP2 0x12 `v_max_i32` — signed integer max (`GLSL SMax`).
+    VMaxI32,
+    /// RDNA2 VOP2 0x14 `v_max_u32` — unsigned integer max (`GLSL UMax`).
+    VMaxU32,
     VMbcntHiU32B32,
     VMbcntLoU32B32,
     VMed3F32,
     VMin3F32,
     VMinF32,
+    /// RDNA2 VOP2 0x11 `v_min_i32` — signed integer min (`GLSL SMin`).
+    VMinI32,
+    /// RDNA2 VOP2 0x13 `v_min_u32` — unsigned integer min (`GLSL UMin`).
+    /// Measured in ASTRO.BOT scene-composite compute shader 0x555f4f500.
+    VMinU32,
     VMovB32,
     VMulF32,
     VMulHiU32,
@@ -382,6 +423,10 @@ pub enum ShaderInstructionType {
     /// RDNA2 (`next_gen`) VOP2 0x27: carry-less `vdst = vsrc1 - vsrc0`.
     VSubrevNcU32,
     VTruncF32,
+    /// RDNA2 (`next_gen`) VOP2 0x1e: `vdst = ~(vsrc0 ^ vsrc1)` (bitwise XNOR).
+    /// Replaces GCN's v_bfm_b32 in this VOP2 slot; SharpEmu Gen5 lowers it as
+    /// NOT(XOR). Measured in ASTRO.BOT's scene-composite compute shader.
+    VXnorB32,
     VXorB32,
 
     FetchX,
@@ -605,6 +650,12 @@ pub mod shader_instruction_format {
         /// four-dword row of the same model.
         Vsrc0Vsrc14Vsrc2 = format_define(&[S0, S1A4, S2]),
         VdstSdst2Vsrc0Vsrc1 = format_define(&[D, D2A2, S0, S1]),
+        /// Beyond Kyty: `v_add_co_ci_u32 vdst, sdst, src0, src1, ssrc2` — the
+        /// add-with-carry shape. dst = VGPR sum, dst2 = carry-out mask (2
+        /// dwords), src0/src1 = the addends, src2 = carry-in mask (2 dwords).
+        /// The VOP2 form fills dst2 and src2 with VCC; the VOP3B form reads
+        /// them from the sdst / ssrc2 fields.
+        VdstSdst2Vsrc0Vsrc1Smask2 = format_define(&[D, D2A2, S0, S1, S2A2]),
         VdstVsrc0Vsrc1Smask2 = format_define(&[D, S0, S1, S2A2]),
         VdstVsrc0Vsrc1Vsrc2 = format_define(&[D, S0, S1, S2]),
         VdstVsrcAttrChan = format_define(&[D, S0, ATTR]),

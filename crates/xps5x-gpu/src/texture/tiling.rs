@@ -469,6 +469,54 @@ const RB_PLUS_64K_STANDARD: [[AddressBit; 16]; 5] = [
     ],
 ];
 
+/// GFX10 `SW_4KB_S` (SWIZZLE_MODE 5) equations — the Standard (non-XOR) 4 KiB
+/// layout, a SEPARATE 12-bit micro-tile equation from the 64 KiB Standard block
+/// (using the larger equation leaves a regular grid in linearized atlases).
+/// Transcribed from SharpEmu's `Standard4K` (`GnmTiling.cs`, AMD
+/// `GFX10_SW_4K_S_PATINFO`). Each row is a 12-bit within-block byte offset (4
+/// KiB = 2^12); the top 4 entries are `AB_ZERO` so the shared 16-bit
+/// [`pattern_axis_term`] loop keeps the offset inside the 4 KiB block.
+const STANDARD_4K: [[AddressBit; 16]; 5] = [
+    // 1 byte/element.
+    [
+        ab_x(0), ab_x(1), ab_x(2), ab_x(3), ab_y(0), ab_y(1), ab_y(2), ab_y(3), ab_y(4), ab_x(4),
+        ab_y(5), ab_x(5), AB_ZERO, AB_ZERO, AB_ZERO, AB_ZERO,
+    ],
+    // 2 bytes/element.
+    [
+        AB_ZERO, ab_x(0), ab_x(1), ab_x(2), ab_y(0), ab_y(1), ab_y(2), ab_x(3), ab_y(3), ab_x(4),
+        ab_y(4), ab_x(5), AB_ZERO, AB_ZERO, AB_ZERO, AB_ZERO,
+    ],
+    // 4 bytes/element.
+    [
+        AB_ZERO, AB_ZERO, ab_x(0), ab_x(1), ab_y(0), ab_y(1), ab_y(2), ab_x(2), ab_y(3), ab_x(3),
+        ab_y(4), ab_x(4), AB_ZERO, AB_ZERO, AB_ZERO, AB_ZERO,
+    ],
+    // 8 bytes/element (also BC1/BC4 blocks).
+    [
+        AB_ZERO, AB_ZERO, AB_ZERO, ab_x(0), ab_y(0), ab_y(1), ab_x(1), ab_x(2), ab_y(2), ab_x(3),
+        ab_y(3), ab_x(4), AB_ZERO, AB_ZERO, AB_ZERO, AB_ZERO,
+    ],
+    // 16 bytes/element (also 16-byte BC blocks).
+    [
+        AB_ZERO, AB_ZERO, AB_ZERO, AB_ZERO, ab_y(0), ab_y(1), ab_x(0), ab_x(1), ab_y(2), ab_x(2),
+        ab_y(3), ab_x(3), AB_ZERO, AB_ZERO, AB_ZERO, AB_ZERO,
+    ],
+];
+
+/// The equation table + block byte size for a supported GFX10 swizzle mode, or
+/// `None` for a mode with no ported equation yet (named at the call site). Mode
+/// 5 is the 4 KiB Standard block; 9/24/27 are the 64 KiB Oberon RB+ blocks.
+pub const fn swizzle_table(mode: u8) -> Option<(&'static [[AddressBit; 16]; 5], u64)> {
+    match mode {
+        5 => Some((&STANDARD_4K, 4096)),
+        9 => Some((&RB_PLUS_64K_STANDARD, 65536)),
+        24 => Some((&RB_PLUS_64K_DEPTH_X, 65536)),
+        27 => Some((&RB_PLUS_64K_RENDER_X, 65536)),
+        _ => None,
+    }
+}
+
 /// The equation table for a supported 64 KiB swizzle mode, or `None` for a
 /// mode with no ported equation yet (named at the call site instead).
 pub const fn swizzle_64kb_table(mode: u8) -> Option<&'static [[AddressBit; 16]; 5]> {
@@ -539,13 +587,13 @@ pub fn tiled_byte_count_64kb(width: u32, height: u32, bpp_log2: u32) -> u64 {
 /// linear rows. `tiled` must cover the whole block grid (see
 /// [`tiled_byte_count_64kb`]); pixels beyond it (never fetched) stay zero.
 pub fn detile_64kb_r_x(tiled: &[u8], width: u32, height: u32, bpp_log2: u32) -> Vec<u8> {
-    detile_64kb_with(tiled, width, height, bpp_log2, &RB_PLUS_64K_RENDER_X)
+    detile_64kb_with(tiled, width, height, bpp_log2, &RB_PLUS_64K_RENDER_X, 65536)
 }
 
 /// Detile a `SW_64KB_S` (SWIZZLE_MODE 9) surface — the Standard (non-XOR)
 /// 64 KiB layout, measured on Minecraft's 1937x333 atlas texture.
 pub fn detile_64kb_s(tiled: &[u8], width: u32, height: u32, bpp_log2: u32) -> Vec<u8> {
-    detile_64kb_with(tiled, width, height, bpp_log2, &RB_PLUS_64K_STANDARD)
+    detile_64kb_with(tiled, width, height, bpp_log2, &RB_PLUS_64K_STANDARD, 65536)
 }
 
 /// Detile a 64 KiB-block swizzled surface into tightly-packed linear rows
@@ -557,11 +605,11 @@ fn detile_64kb_with(
     height: u32,
     bpp_log2: u32,
     table: &[[AddressBit; 16]; 5],
+    block_bytes: u64,
 ) -> Vec<u8> {
-    const BLOCK_BYTES: u64 = 65536;
     let pattern = &table[bpp_log2 as usize];
     let bpp = 1usize << bpp_log2;
-    let (bw, bh) = block_dimensions(BLOCK_BYTES as u32, bpp_log2);
+    let (bw, bh) = block_dimensions(block_bytes as u32, bpp_log2);
     let blocks_per_row = u64::from(width.div_ceil(bw));
     let mut out = vec![0u8; width as usize * height as usize * bpp];
     // Precompute the per-column X term once (reused across every row): the
@@ -580,7 +628,7 @@ fn detile_64kb_with(
         let y_term = pattern_axis_term(yy, pattern, false);
         for xx in 0..width {
             let block_index = block_y * blocks_per_row + u64::from(xx / bw);
-            let src = block_index * BLOCK_BYTES + (x_term_by_column[xx as usize] ^ y_term);
+            let src = block_index * block_bytes + (x_term_by_column[xx as usize] ^ y_term);
             let dst = dest_row + xx as usize * bpp;
             if src as usize + bpp <= tiled.len() {
                 out[dst..dst + bpp].copy_from_slice(&tiled[src as usize..src as usize + bpp]);
@@ -590,8 +638,10 @@ fn detile_64kb_with(
     out
 }
 
-/// Detile a supported 64 KiB-block GFX10 swizzle mode, or `None` for a mode
-/// with no ported equation yet (the caller names it instead of guessing).
+/// Detile a supported GFX10 swizzle mode (4 KiB Standard 5, or 64 KiB 9/24/27),
+/// or `None` for a mode with no ported equation yet (the caller names it instead
+/// of guessing). The block size comes from [`swizzle_table`], so mode 5's 4 KiB
+/// block and the 64 KiB modes share this one detiler.
 pub fn detile_64kb(
     mode: u8,
     tiled: &[u8],
@@ -599,8 +649,20 @@ pub fn detile_64kb(
     height: u32,
     bpp_log2: u32,
 ) -> Option<Vec<u8>> {
-    let table = swizzle_64kb_table(mode)?;
-    Some(detile_64kb_with(tiled, width, height, bpp_log2, table))
+    let (table, block_bytes) = swizzle_table(mode)?;
+    Some(detile_64kb_with(
+        tiled, width, height, bpp_log2, table, block_bytes,
+    ))
+}
+
+/// Bytes a supported GFX10 tiled surface occupies for `mode` — whole swizzle
+/// blocks in each direction (a surface smaller than a block still owns the whole
+/// block). `None` for an unsupported mode. Block size (4 KiB vs 64 KiB) comes
+/// from [`swizzle_table`].
+pub fn tiled_byte_count_for_mode(mode: u8, width: u32, height: u32, bpp_log2: u32) -> Option<u64> {
+    let (_, block_bytes) = swizzle_table(mode)?;
+    let (bw, bh) = block_dimensions(block_bytes as u32, bpp_log2);
+    Some(u64::from(width.div_ceil(bw)) * u64::from(height.div_ceil(bh)) * block_bytes)
 }
 
 /// Tile a linear surface into a 64 KiB-block swizzle — the exact inverse of
@@ -805,6 +867,50 @@ mod tests {
             tiled, r_x,
             "depth (24) and render (27) swizzles must not be the same permutation"
         );
+    }
+
+    /// The 4 KiB Standard block (SWIZZLE_MODE 5) detiles as the exact inverse of
+    /// its own tiler, and — crucially — is a DIFFERENT permutation from the
+    /// 64 KiB Standard block (a transcription slip that reused the 64 KiB
+    /// equation would be caught). Measured on ASTRO.BOT's 32x32 format-71 (8
+    /// B/texel) tile-mode-5 texture.
+    #[test]
+    fn sw_4kb_s_tile_then_detile_is_identity_and_differs_from_64kb() {
+        let (w, h, bpp_log2) = (32u32, 32u32, 3u32); // 8 B/texel
+        let bpp = 1usize << bpp_log2;
+        let linear: Vec<u8> = (0..(w * h) as usize * bpp)
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        // Tile with the 4 KiB Standard equation (the inverse of the detiler).
+        let pattern = &STANDARD_4K[bpp_log2 as usize];
+        let (bw, bh) = block_dimensions(4096, bpp_log2);
+        let blocks_per_row = u64::from(w.div_ceil(bw));
+        let mut tiled =
+            vec![0u8; tiled_byte_count_for_mode(5, w, h, bpp_log2).expect("mode 5") as usize];
+        for y in 0..h {
+            let block_y = u64::from(y / bh);
+            let src_row = y as usize * w as usize * bpp;
+            for x in 0..w {
+                let block_index = block_y * blocks_per_row + u64::from(x / bw);
+                let dst = (block_index * 4096 + gfx10_pattern_offset(x, y, pattern)) as usize;
+                let src = src_row + x as usize * bpp;
+                tiled[dst..dst + bpp].copy_from_slice(&linear[src..src + bpp]);
+            }
+        }
+
+        let back = detile_64kb(5, &tiled, w, h, bpp_log2).expect("mode 5 detiles");
+        assert_eq!(back, linear, "detile ∘ tile must be the identity for 4 KiB_S");
+        assert_ne!(tiled[..linear.len()], linear[..], "swizzle must reorder");
+
+        // The 32x32x8B surface is two 4 KiB blocks; the 64 KiB Standard equation
+        // would place every texel in one block with a different permutation.
+        let pattern_64k = &RB_PLUS_64K_STANDARD[bpp_log2 as usize];
+        let differs = (0..w * h).any(|i| {
+            let (x, y) = (i % w, i / w);
+            gfx10_pattern_offset(x, y, pattern) != gfx10_pattern_offset(x, y, pattern_64k)
+        });
+        assert!(differs, "4 KiB_S must not be the 64 KiB_S permutation");
     }
 
     #[test]
