@@ -11,8 +11,8 @@
 //! Presentation to a real swapchain is a separate, later concern.
 
 use super::cache::{
-    BlendKey, DepthPipelineKey, DrawCaches, GraphicsPipelineKey, PersistentTarget, StencilKey,
-    TargetKey,
+    BlendKey, DepthPipelineKey, DrawCaches, GraphicsPipelineKey, PendingDrawResources,
+    PersistentTarget, StencilKey, TargetContent, TargetKey,
 };
 use super::instance::VulkanDevice;
 use super::shaders::{triangle_fragment_spirv, triangle_vertex_spirv};
@@ -182,6 +182,14 @@ pub struct TextureUpload {
     /// with a `3D` view (measured: ASTRO.BOT's 240x135x64 froxel/LUT
     /// volumes, T# type 10).
     pub depth: u32,
+    /// When `Some(base)`, this T# names a live persistent render target
+    /// (`CB_COLOR0_BASE == base`, matching extent and format): the draw binds
+    /// that target's `VkImage` directly as the sampled descriptor instead of
+    /// uploading `pixels` (which are then empty and ignored). This is how a
+    /// composite samples its scene targets without a GPU→CPU→GPU round trip
+    /// (stage B). Must be `None` for the draw's own attachment (feedback
+    /// loop) — the CPU-upload path handles that case.
+    pub render_target: Option<u64>,
 }
 
 /// The sampled-image + sampler descriptor arrays one translated stage binds.
@@ -667,6 +675,246 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
     Ok(DrawOutput { color, depth })
 }
 
+/// Deferred-readback (stage B) variant of [`render_draw`] for the title path.
+///
+/// The draw's commands are recorded into a per-draw command buffer and
+/// submitted **without** a fence wait and **without** reading the target back;
+/// the persistent target is marked GPU-newer and the pixels land in one batch
+/// readback at the next [`flush_deferred_draws`]. This is what turns
+/// per-draw fence+readback cost (measured 11–12 ms/draw on ASTRO.BOT) into a
+/// per-flush cost.
+///
+/// Returns `Ok(None)` when the draw was deferred. Returns `Ok(Some(image))`
+/// when the draw fell back to the immediate path — no `target_base`, a depth
+/// attachment (not yet batched), or `XPS5X_NO_DEFER=1` (the A/B switch) — in
+/// which case the readback happened now, exactly as [`render_draw`]. A
+/// depth-only fallback draw returns `Ok(None)` with nothing deferred.
+///
+/// # Errors
+///
+/// Same as [`render_draw`].
+pub fn render_draw_deferred(
+    dev: &VulkanDevice,
+    state: &DrawState,
+) -> Result<Option<RenderedImage>, GpuError> {
+    let force_immediate = std::env::var_os("XPS5X_NO_DEFER").is_some();
+    if force_immediate
+        || state.target_base.is_none()
+        || !state.color_output
+        || state.depth.is_some()
+    {
+        return Ok(render_draw(dev, state)?.color);
+    }
+    if state.width == 0 || state.height == 0 {
+        return Err(GpuError::VulkanInitFailed(format!(
+            "invalid render target size {}x{}",
+            state.width, state.height
+        )));
+    }
+    if state.vs_spirv.is_empty() || state.fs_spirv.is_empty() {
+        return Err(GpuError::ShaderCompilationFailed(
+            "vertex and fragment SPIR-V must be non-empty".to_owned(),
+        ));
+    }
+    let timing = std::env::var_os("XPS5X_TIME_DRAW").is_some();
+    let mut caches = dev.draw_caches();
+    let mut res = Resources::new(dev, &mut caches);
+    res.batched = true;
+    let t0 = std::time::Instant::now();
+    res.build(state)?;
+    let t_build = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    res.record_and_submit(state)?;
+    res.commit_to_batch();
+    let t_submit = t1.elapsed();
+    drop(res);
+    if timing {
+        let stats = caches.stats;
+        tracing::warn!(
+            build_us = t_build.as_micros(),
+            submit_us = t_submit.as_micros(),
+            deferred_draws = stats.deferred_draws,
+            sampled_target_binds = stats.sampled_target_binds,
+            "TIME_DRAW: deferred draw (no fence wait, no readback — the flush pays those once)"
+        );
+    }
+    Ok(None)
+}
+
+/// Flush the pending deferred-draw batch: fence the queue once, read every
+/// touched persistent target back once, retire the batch's per-draw
+/// resources, and return the readbacks in draw order (`(guest base, image)`),
+/// ready to merge into the CPU-side framebuffer map.
+///
+/// No-op (empty vec) when nothing is pending. This is the ONLY readback point
+/// for deferred draws; callers invoke it when the pixels are actually needed
+/// — end of a draw-bearing submission, presentation, frame dumps, or a
+/// feedback-loop CPU fallback.
+///
+/// # Errors
+///
+/// [`GpuError::VulkanInitFailed`] on any submission/wait/map failure. The
+/// batch's resources are still retired safely (best-effort device wait) and
+/// every touched target degrades to [`TargetContent::Unknown`] — the next
+/// draw seeds from the (stale) CPU pixels rather than trusting an image in an
+/// unknown state.
+pub fn flush_deferred_draws(dev: &VulkanDevice) -> Result<Vec<(u64, RenderedImage)>, GpuError> {
+    let timing = std::env::var_os("XPS5X_TIME_DRAW").is_some();
+    let t0 = std::time::Instant::now();
+    let mut caches = dev.draw_caches();
+    if !caches.batch_open() {
+        return Ok(Vec::new());
+    }
+    let (pending, touched, evicted) = caches.take_batch();
+    let pending_draws = pending.len();
+    match record_and_read_flush(dev, &mut caches, &touched) {
+        Ok(images) => {
+            caches.retire_batch(dev, pending, evicted);
+            caches.stats.batch_flushes += 1;
+            caches.stats.target_readbacks += images.len() as u64;
+            if timing {
+                tracing::warn!(
+                    flush_us = t0.elapsed().as_micros(),
+                    pending_draws,
+                    targets_read = images.len(),
+                    "TIME_DRAW: deferred-batch flush (one fence + one readback per touched target)"
+                );
+            }
+            Ok(images)
+        }
+        Err(e) => {
+            // The batch's command buffers may still be executing: wait the
+            // device (best effort — a lost device fails this too) so retiring
+            // their resources cannot free memory the GPU is reading.
+            // SAFETY: waiting the device idle takes no handles.
+            let _ = unsafe { dev.device().device_wait_idle() };
+            for key in &touched {
+                caches.mark_target_unknown(key);
+            }
+            caches.retire_batch(dev, pending, evicted);
+            Err(e)
+        }
+    }
+}
+
+/// The flush's GPU half: record one readback copy per touched live target,
+/// submit with the shared fence, wait, map. Marks each read target
+/// [`TargetContent::Synced`]. Touched keys whose target was evicted mid-batch
+/// are skipped (the guest re-programmed them; their pixels are unreachable
+/// and unwanted).
+fn record_and_read_flush(
+    dev: &VulkanDevice,
+    caches: &mut DrawCaches,
+    touched: &[TargetKey],
+) -> Result<Vec<(u64, RenderedImage)>, GpuError> {
+    let device = dev.device();
+    let live: Vec<(TargetKey, PersistentTarget, u32)> = touched
+        .iter()
+        .filter_map(|key| caches.target_entry(key).map(|t| (*key, t)))
+        .map(|(key, t)| readback_bpp(vk::Format::from_raw(key.format)).map(|bpp| (key, t, bpp)))
+        .collect::<Result<_, _>>()?;
+
+    let (command_buffer, fence) = caches.submit_resources(dev)?;
+    let begin_info =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    // SAFETY: the cached command buffer's previous submission fence-completed
+    // under this same lock (submit_resources contract); begin implicitly
+    // resets it.
+    unsafe { device.begin_command_buffer(command_buffer, &begin_info) }
+        .map_err(|e| GpuError::VulkanInitFailed(format!("flush vkBeginCommandBuffer: {e}")))?;
+    for (key, target, _) in &live {
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_extent(vk::Extent3D {
+                width: key.width,
+                height: key.height,
+                depth: 1,
+            });
+        // SAFETY: every persistent image rests in TRANSFER_SRC_OPTIMAL
+        // between draws (each draw's tail transition guarantees it), and the
+        // readback buffer was sized width*height*bpp at target creation.
+        unsafe {
+            device.cmd_copy_image_to_buffer(
+                command_buffer,
+                target.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                target.readback_buffer,
+                &[region],
+            );
+        }
+    }
+    let host_barrier = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::HOST_READ);
+    // SAFETY: recording; then end/submit/wait with live handles from this
+    // device. The fence wait covers the whole batch: a fence signal
+    // happens-after all queue operations submitted earlier in submission
+    // order, which includes every deferred draw's command buffer.
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[host_barrier],
+            &[],
+            &[],
+        );
+        device
+            .end_command_buffer(command_buffer)
+            .map_err(|e| GpuError::VulkanInitFailed(format!("flush vkEndCommandBuffer: {e}")))?;
+        let command_buffers = [command_buffer];
+        let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
+        device
+            .queue_submit(dev.queue(), &[submit], fence)
+            .map_err(|e| GpuError::VulkanInitFailed(format!("flush vkQueueSubmit: {e}")))?;
+        device
+            .wait_for_fences(&[fence], true, u64::MAX)
+            .map_err(|e| GpuError::VulkanInitFailed(format!("flush vkWaitForFences: {e}")))?;
+    }
+
+    let mut images = Vec::with_capacity(live.len());
+    for (key, target, bpp) in &live {
+        let size = (key.width as usize) * (key.height as usize) * (*bpp as usize);
+        // SAFETY: the readback memory is HOST_VISIBLE, sized exactly `size`,
+        // not currently mapped, its copy completed (fence waited) and was
+        // made host-visible by the barrier above. The bytes are copied into
+        // an owned Vec before unmapping.
+        let pixels = unsafe {
+            let ptr = device
+                .map_memory(
+                    target.readback_memory,
+                    0,
+                    size as vk::DeviceSize,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .map_err(|e| GpuError::VulkanInitFailed(format!("flush readback map: {e}")))?;
+            let pixels = std::slice::from_raw_parts(ptr.cast::<u8>(), size).to_vec();
+            device.unmap_memory(target.readback_memory);
+            pixels
+        };
+        caches.mark_target_synced(key);
+        images.push((
+            key.base,
+            RenderedImage {
+                width: key.width,
+                height: key.height,
+                pixels,
+                bytes_per_pixel: *bpp,
+            },
+        ));
+    }
+    Ok(images)
+}
+
 /// Draw one triangle offscreen at `width` x `height` and read back the pixels.
 ///
 /// # Errors
@@ -771,6 +1019,11 @@ fn shader_stage_to_pipeline(stage: vk::ShaderStageFlags) -> vk::PipelineStageFla
 struct Resources<'a> {
     dev: &'a VulkanDevice,
     caches: &'a mut DrawCaches,
+    /// Stage B deferred mode: the draw's commands are submitted without a
+    /// fence wait or readback; per-draw resources (own command buffer, own
+    /// descriptor pool, buffers, images) transfer to the caches' pending
+    /// batch on success and are destroyed only after the flush fence.
+    batched: bool,
     image: vk::Image,
     image_memory: vk::DeviceMemory,
     image_view: vk::ImageView,
@@ -780,10 +1033,15 @@ struct Resources<'a> {
     /// The persistent-target identity of this draw, when `target_base` named
     /// one — used to mark the entry synced after a successful readback.
     target_key: Option<TargetKey>,
-    /// The stage A seed-skip: the persistent image still holds exactly the
-    /// last readback (== `state.initial`), so the attachment LOADs from the
-    /// GPU copy and the upload staging never happens.
+    /// The stage A seed-skip: the persistent image already holds the
+    /// authoritative frame (last readback, or newer deferred draws), so the
+    /// attachment LOADs from the GPU copy and the upload staging never
+    /// happens.
     load_from_gpu: bool,
+    /// Persistent-target images this draw samples as textures (deduplicated).
+    /// Transitioned TRANSFER_SRC → SHADER_READ_ONLY before rendering and back
+    /// after, preserving the between-draws layout invariant.
+    sampled_targets: Vec<vk::Image>,
     vertex_buffer: vk::Buffer,
     vertex_memory: vk::DeviceMemory,
     /// Uploaded index buffer for an indexed draw; null for an auto draw.
@@ -796,6 +1054,10 @@ struct Resources<'a> {
     samplers: Vec<vk::Sampler>,
     descriptor_set_layouts: Vec<vk::DescriptorSetLayout>,
     descriptor_pool: vk::DescriptorPool,
+    /// True when `descriptor_pool` is this draw's own (batched mode) rather
+    /// than the shared resettable pool: a deferred draw's sets stay live past
+    /// the call, so the shared pool's per-draw reset would be illegal.
+    owns_descriptor_pool: bool,
     descriptor_sets: Vec<(u32, vk::DescriptorSet)>,
     readback_buffer: vk::Buffer,
     readback_memory: vk::DeviceMemory,
@@ -825,12 +1087,14 @@ impl<'a> Resources<'a> {
         Self {
             dev,
             caches,
+            batched: false,
             image: vk::Image::null(),
             image_memory: vk::DeviceMemory::null(),
             image_view: vk::ImageView::null(),
             owns_target: false,
             target_key: None,
             load_from_gpu: false,
+            sampled_targets: Vec::new(),
             vertex_buffer: vk::Buffer::null(),
             vertex_memory: vk::DeviceMemory::null(),
             index_buffer: vk::Buffer::null(),
@@ -841,6 +1105,7 @@ impl<'a> Resources<'a> {
             samplers: Vec::new(),
             descriptor_set_layouts: Vec::new(),
             descriptor_pool: vk::DescriptorPool::null(),
+            owns_descriptor_pool: false,
             descriptor_sets: Vec::new(),
             readback_buffer: vk::Buffer::null(),
             readback_memory: vk::DeviceMemory::null(),
@@ -1092,10 +1357,20 @@ impl<'a> Resources<'a> {
                 self.readback_memory = entry.readback_memory;
                 self.owns_target = false;
                 self.target_key = Some(key);
-                // `entry.synced` carries the pre-acquisition value: the GPU
-                // image equals the last readback, which is exactly what the
-                // caller passes as `initial` (contract on `target_base`).
-                self.load_from_gpu = entry.synced && state.initial.is_some();
+                // `entry.content` carries the pre-acquisition value:
+                // - Synced: the GPU image equals the last readback, which is
+                //   exactly what the caller passes as `initial` (contract on
+                //   `target_base`) — LOAD from the GPU copy when a seed exists.
+                // - GpuNewer: deferred draws made the GPU image the ONLY
+                //   authority; LOAD from it unconditionally and never upload
+                //   the (stale) CPU seed over it.
+                // - Unknown: a prior draw failed mid-flight; fall back to the
+                //   CPU seed (or a clear).
+                self.load_from_gpu = match entry.content {
+                    TargetContent::GpuNewer => true,
+                    TargetContent::Synced => state.initial.is_some(),
+                    TargetContent::Unknown => false,
+                };
                 if self.load_from_gpu {
                     self.caches.stats.seed_uploads_skipped += 1;
                 }
@@ -1114,7 +1389,7 @@ impl<'a> Resources<'a> {
                     view: self.image_view,
                     readback_buffer: self.readback_buffer,
                     readback_memory: self.readback_memory,
-                    synced: false,
+                    content: TargetContent::Unknown,
                 },
             );
             self.owns_target = false;
@@ -1154,11 +1429,14 @@ impl<'a> Resources<'a> {
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
             // COLOR_ATTACHMENT to draw into it, TRANSFER_SRC to copy it out,
-            // TRANSFER_DST to seed it with the target's prior contents.
+            // TRANSFER_DST to seed it with the target's prior contents,
+            // SAMPLED so a later draw can bind it as a texture directly
+            // (render-target-as-texture, stage B).
             .usage(
                 vk::ImageUsageFlags::COLOR_ATTACHMENT
                     | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::TRANSFER_DST,
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::SAMPLED,
             )
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
@@ -1521,12 +1799,30 @@ impl<'a> Resources<'a> {
                 .descriptor_count(count)
         })
         .collect();
-        // Persistent pool from the cache, reset for this draw (the previous
-        // draw's sets completed with its fence) and grown when this draw
-        // needs more than it holds.
-        self.descriptor_pool =
-            self.caches
-                .descriptor_pool(self.dev, resource_stages.len() as u32, &pool_sizes)?;
+        if self.batched {
+            // A deferred draw's descriptor sets stay live until the batch
+            // fence, so it cannot use the shared resettable pool (whose
+            // per-draw reset would free them). Each deferred draw owns a
+            // small exact-size pool, retired with the batch.
+            let info = vk::DescriptorPoolCreateInfo::default()
+                .max_sets(resource_stages.len() as u32)
+                .pool_sizes(&pool_sizes);
+            // SAFETY: the pool-size slice is alive for the call; the pool is
+            // owned by this draw and destroyed exactly once (batch retirement
+            // on success, Drop on failure).
+            self.descriptor_pool = unsafe { self.device().create_descriptor_pool(&info, None) }
+                .map_err(|e| {
+                    GpuError::PipelineCreationFailed(format!("batched vkCreateDescriptorPool: {e}"))
+                })?;
+            self.owns_descriptor_pool = true;
+        } else {
+            // Persistent pool from the cache, reset for this draw (the
+            // previous draw's sets completed with its fence) and grown when
+            // this draw needs more than it holds.
+            self.descriptor_pool =
+                self.caches
+                    .descriptor_pool(self.dev, resource_stages.len() as u32, &pool_sizes)?;
+        }
 
         // Allocate a set per RESOURCE stage (gap slots need no set — nothing
         // is ever bound at them), each from its own slot's layout.
@@ -1567,16 +1863,52 @@ impl<'a> Resources<'a> {
                     .collect();
             }
             if let Some(textures) = &stage.textures {
+                // Each T# resolves to a view in array order: a live persistent
+                // render target binds its GPU image directly (stage B — no
+                // CPU round trip); everything else uploads through staging.
+                let mut views = Vec::with_capacity(textures.textures.len());
                 for upload in &textures.textures {
-                    self.create_texture_image(upload, stage.stage)?;
+                    if let Some(base) = upload.render_target {
+                        let key = TargetKey {
+                            base,
+                            width: upload.width,
+                            height: upload.height,
+                            format: upload.format.as_raw(),
+                        };
+                        let (image, view) = self.caches.target_image(&key).ok_or_else(|| {
+                            GpuError::PipelineCreationFailed(format!(
+                                "sampled render target {base:#x} ({}x{}) is no longer a \
+                                     live persistent target",
+                                upload.width, upload.height
+                            ))
+                        })?;
+                        if image == self.image {
+                            return Err(GpuError::PipelineCreationFailed(format!(
+                                "draw samples its own render target {base:#x} (feedback \
+                                 loop) — the caller must use the CPU-pixels fallback"
+                            )));
+                        }
+                        if !self.sampled_targets.contains(&image) {
+                            self.sampled_targets.push(image);
+                        }
+                        self.caches.stats.sampled_target_binds += 1;
+                        views.push(view);
+                    } else {
+                        self.create_texture_image(upload, stage.stage)?;
+                        views.push(
+                            self.texture_uploads
+                                .last()
+                                .expect("create_texture_image pushed an entry")
+                                .view,
+                        );
+                    }
                 }
-                let first_texture = self.texture_uploads.len() - textures.textures.len();
-                image_infos = self.texture_uploads[first_texture..]
-                    .iter()
-                    .map(|texture| {
+                image_infos = views
+                    .into_iter()
+                    .map(|view| {
                         vk::DescriptorImageInfo::default()
                             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                            .image_view(texture.view)
+                            .image_view(view)
                     })
                     .collect();
                 for &linear in &textures.linear_filter {
@@ -2019,10 +2351,19 @@ impl<'a> Resources<'a> {
         Ok(())
     }
 
-    /// The persistent command buffer + fence from the cache (fence reset for
-    /// this submission). The command buffer is implicitly reset by
-    /// `vkBeginCommandBuffer` — the pool was created RESET_COMMAND_BUFFER.
+    /// Immediate mode: the persistent command buffer + fence from the cache
+    /// (fence reset for this submission); the command buffer is implicitly
+    /// reset by `vkBeginCommandBuffer` (the pool is RESET_COMMAND_BUFFER).
+    ///
+    /// Batched mode: a per-draw command buffer (recycled through the caches'
+    /// free list) and NO fence — the draw is submitted without a wait and the
+    /// flush fences the whole batch once.
     fn create_command_resources(&mut self) -> Result<(), GpuError> {
+        if self.batched {
+            self.command_buffer = self.caches.batch_command_buffer(self.dev)?;
+            self.fence = vk::Fence::null();
+            return Ok(());
+        }
         let (command_buffer, fence) = self.caches.submit_resources(self.dev)?;
         self.command_buffer = command_buffer;
         self.fence = fence;
@@ -2142,6 +2483,30 @@ impl<'a> Resources<'a> {
                     dst_access: vk::AccessFlags::SHADER_READ,
                     src_stage: vk::PipelineStageFlags::TRANSFER,
                     dst_stage: shader_stage_to_pipeline(texture.stage),
+                },
+            );
+        }
+
+        // Persistent render targets this draw samples as textures: between
+        // draws every persistent image sits in TRANSFER_SRC_OPTIMAL (each
+        // draw's tail transition and the flush's copy both preserve that), so
+        // transition to SHADER_READ_ONLY for the shader stages, and back
+        // after rendering (below) to keep the invariant. The layout
+        // transition itself publishes the prior draw's attachment writes
+        // (already made available by that draw's tail barrier).
+        for &image in &self.sampled_targets {
+            self.image_barrier_layers(
+                vk::ImageAspectFlags::COLOR,
+                image,
+                1,
+                ImageTransition {
+                    old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    src_access: vk::AccessFlags::empty(),
+                    dst_access: vk::AccessFlags::SHADER_READ,
+                    src_stage: vk::PipelineStageFlags::TRANSFER,
+                    dst_stage: vk::PipelineStageFlags::VERTEX_SHADER
+                        | vk::PipelineStageFlags::FRAGMENT_SHADER,
                 },
             );
         }
@@ -2350,7 +2715,10 @@ impl<'a> Resources<'a> {
             // 0xBF exactly).
             .load_op(if std::env::var_os("XPS5X_FORCE_CLEAR").is_some() {
                 vk::AttachmentLoadOp::CLEAR
-            } else if state.initial.is_some() {
+            } else if self.load_from_gpu || state.initial.is_some() {
+                // `load_from_gpu` alone must force a LOAD: with deferred
+                // readback the GPU copy can be the only authority
+                // (TargetContent::GpuNewer) with no CPU seed to fall back on.
                 vk::AttachmentLoadOp::LOAD
             } else {
                 vk::AttachmentLoadOp::CLEAR
@@ -2493,7 +2861,32 @@ impl<'a> Resources<'a> {
             d.cmd_end_rendering(self.command_buffer);
         }
 
-        // COLOR_ATTACHMENT_OPTIMAL -> TRANSFER_SRC_OPTIMAL for the copy out.
+        // Return sampled persistent targets to the between-draws layout
+        // invariant (TRANSFER_SRC_OPTIMAL). Reads need no availability
+        // operation; the execution dependency alone orders the transition
+        // after the shader reads.
+        for &image in &self.sampled_targets {
+            self.image_barrier_layers(
+                vk::ImageAspectFlags::COLOR,
+                image,
+                1,
+                ImageTransition {
+                    old_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    src_access: vk::AccessFlags::empty(),
+                    dst_access: vk::AccessFlags::TRANSFER_READ,
+                    src_stage: vk::PipelineStageFlags::VERTEX_SHADER
+                        | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    dst_stage: vk::PipelineStageFlags::TRANSFER,
+                },
+            );
+        }
+
+        // COLOR_ATTACHMENT_OPTIMAL -> TRANSFER_SRC_OPTIMAL. In immediate mode
+        // this feeds the copy out; in batched mode there is no copy, but the
+        // transition still runs so the persistent image always rests in
+        // TRANSFER_SRC between draws (the next draw's LOAD barrier and the
+        // flush's copy both start from that layout).
         if state.color_output {
             self.image_barrier_layers(
                 vk::ImageAspectFlags::COLOR,
@@ -2508,7 +2901,8 @@ impl<'a> Resources<'a> {
                     dst_stage: vk::PipelineStageFlags::TRANSFER,
                 },
             );
-
+        }
+        if state.color_output && !self.batched {
             // buffer_row_length/image_height = 0 means "tightly packed", which is
             // what `RenderedImage::pixel` assumes.
             let region = vk::BufferImageCopy::default()
@@ -2588,21 +2982,28 @@ impl<'a> Resources<'a> {
             }
         }
 
-        // Make the transfer writes visible to host reads of the mapped memory.
-        let host_barrier = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ);
-        // SAFETY: still recording; a global memory barrier names no handles.
+        if !self.batched {
+            // Make the transfer writes visible to host reads of the mapped
+            // memory. Batched draws record no host-read copies, so they skip
+            // this (the flush's own command buffer carries one).
+            let host_barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ);
+            // SAFETY: still recording; a global memory barrier names no handles.
+            unsafe {
+                self.device().cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[host_barrier],
+                    &[],
+                    &[],
+                );
+            }
+        }
+        // SAFETY: the command buffer is in the recording state.
         unsafe {
-            self.device().cmd_pipeline_barrier(
-                self.command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &[host_barrier],
-                &[],
-                &[],
-            );
             self.device()
                 .end_command_buffer(self.command_buffer)
                 .map_err(|e| GpuError::VulkanInitFailed(format!("vkEndCommandBuffer: {e}")))?;
@@ -2612,12 +3013,20 @@ impl<'a> Resources<'a> {
         let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
 
         // SAFETY: the command buffer is recorded and not already pending; the
-        // fence is unsignaled and unused; the queue came from this device.
+        // fence (null in batched mode) is unsignaled and unused; the queue
+        // came from this device.
         unsafe {
             self.device()
                 .queue_submit(self.dev.queue(), &[submit], self.fence)
         }
         .map_err(|e| GpuError::VulkanInitFailed(format!("vkQueueSubmit failed: {e}")))?;
+
+        if self.batched {
+            // Deferred: no fence, no wait. The flush submits one fence after
+            // the whole batch; queue submission order guarantees this draw's
+            // completion when that fence signals.
+            return Ok(());
+        }
 
         // Wait for the GPU. u64::MAX = no timeout; a hang here means a driver
         // fault, which surfaces as a hung test rather than silent bad pixels.
@@ -2625,6 +3034,63 @@ impl<'a> Resources<'a> {
         unsafe { self.device().wait_for_fences(&[self.fence], true, u64::MAX) }
             .map_err(|e| GpuError::VulkanInitFailed(format!("vkWaitForFences failed: {e}")))?;
         Ok(())
+    }
+
+    /// Transfer every per-draw handle into the caches' pending batch after a
+    /// successful deferred submission, and record the target as
+    /// [`TargetContent::GpuNewer`]. After this, `Drop` finds only null
+    /// handles and destroys nothing.
+    fn commit_to_batch(&mut self) {
+        debug_assert!(self.batched, "only batched draws defer their resources");
+        let key = self
+            .target_key
+            .expect("deferred draws always name a persistent target");
+        let mut res = PendingDrawResources {
+            command_buffer: mem::replace(&mut self.command_buffer, vk::CommandBuffer::null()),
+            descriptor_pool: if self.owns_descriptor_pool {
+                self.owns_descriptor_pool = false;
+                mem::replace(&mut self.descriptor_pool, vk::DescriptorPool::null())
+            } else {
+                vk::DescriptorPool::null()
+            },
+            buffers: Vec::new(),
+            images: Vec::new(),
+        };
+        let mut take_buffer = |buffer: &mut vk::Buffer, memory: &mut vk::DeviceMemory| {
+            let buffer = mem::replace(buffer, vk::Buffer::null());
+            let memory = mem::replace(memory, vk::DeviceMemory::null());
+            if buffer != vk::Buffer::null() || memory != vk::DeviceMemory::null() {
+                res.buffers.push((buffer, memory));
+            }
+        };
+        take_buffer(&mut self.upload_buffer, &mut self.upload_memory);
+        take_buffer(&mut self.vertex_buffer, &mut self.vertex_memory);
+        take_buffer(&mut self.index_buffer, &mut self.index_memory);
+        take_buffer(&mut self.depth_upload_buffer, &mut self.depth_upload_memory);
+        take_buffer(
+            &mut self.depth_readback_buffer,
+            &mut self.depth_readback_memory,
+        );
+        for (buffer, memory) in self.guest_vertex_buffers.drain(..) {
+            res.buffers.push((buffer, memory));
+        }
+        for (buffer, memory) in self.storage_buffers.drain(..) {
+            res.buffers.push((buffer, memory));
+        }
+        for texture in self.texture_uploads.drain(..) {
+            res.buffers
+                .push((texture.staging_buffer, texture.staging_memory));
+            res.images
+                .push((texture.image, texture.memory, texture.view));
+        }
+        if self.depth_image != vk::Image::null() || self.depth_view != vk::ImageView::null() {
+            res.images.push((
+                mem::replace(&mut self.depth_image, vk::Image::null()),
+                mem::replace(&mut self.depth_memory, vk::DeviceMemory::null()),
+                mem::replace(&mut self.depth_view, vk::ImageView::null()),
+            ));
+        }
+        self.caches.commit_deferred_draw(res, key);
     }
 
     fn read_back(&self, width: u32, height: u32, bpp: u32) -> Result<Vec<u8>, GpuError> {
@@ -2737,21 +3203,38 @@ impl Drop for Resources<'_> {
         let texture_uploads = mem::take(&mut self.texture_uploads);
         // NOT destroyed here — owned by the device's DrawCaches and reused by
         // the next draw: pipeline, pipeline layout, descriptor set layouts,
-        // shader modules, samplers, command buffer, fence, descriptor pool,
-        // and (when `owns_target` is false) the colour image + its readback
-        // buffer. `DrawCaches::destroy` releases them with the device.
+        // shader modules, samplers, command buffer + fence (immediate mode),
+        // the shared descriptor pool, and (when `owns_target` is false) the
+        // colour image + its readback buffer. `DrawCaches::destroy` releases
+        // them with the device. A successful batched draw reaches this Drop
+        // with every per-draw handle already moved into the pending batch
+        // (`commit_to_batch`), so nothing is destroyed early.
         //
+        // A batched draw that FAILED never submitted its command buffer
+        // (every batched-mode error site is before `vkQueueSubmit`, and a
+        // failed submit leaves nothing pending), so its owned handles can be
+        // destroyed immediately and its command buffer recycled.
+        if self.batched && self.command_buffer != vk::CommandBuffer::null() {
+            let cb = self.command_buffer;
+            self.command_buffer = vk::CommandBuffer::null();
+            self.caches.recycle_command_buffer(cb);
+        }
         // SAFETY: every handle destroyed below was created from `self.dev`'s
         // device for this draw alone and is destroyed exactly once, children
-        // before parents. `device_wait_idle` ensures no submitted work still
-        // references them; its error is ignored because drop must not panic
-        // and a lost device cannot be recovered. Null handles are skipped, so
-        // a partially-built `Resources` (an error during `build`) cleans up
-        // correctly.
+        // before parents. No submitted GPU work references them: an immediate
+        // draw's fence was waited in `record_and_submit` before any success
+        // path, an error before submission leaves nothing pending, and a
+        // failed fence wait means a lost device (destruction is the only
+        // option either way). The old per-draw `device_wait_idle` here was
+        // redundant with the fence wait and is gone (stage B). Null handles
+        // are skipped, so a partially-built `Resources` (an error during
+        // `build`) cleans up correctly.
         unsafe {
             let d = self.device();
-            let _ = d.device_wait_idle();
 
+            if self.owns_descriptor_pool && self.descriptor_pool != vk::DescriptorPool::null() {
+                d.destroy_descriptor_pool(self.descriptor_pool, None);
+            }
             if self.upload_buffer != vk::Buffer::null() {
                 d.destroy_buffer(self.upload_buffer, None);
             }

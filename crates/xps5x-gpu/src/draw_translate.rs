@@ -27,7 +27,7 @@ use crate::vulkan::instance::VulkanDevice;
 use crate::vulkan::offscreen::{
     BlendState, CLEAR_COLOR, DrawState, RenderedImage, ShaderStageBinding, StorageBufferBinding,
     StorageImageBinding, StorageImageUpload, TextureBinding, TextureUpload, VertexAttributeData,
-    VertexBufferData, render_draw,
+    VertexBufferData,
 };
 use ash::vk;
 use kyty_graphics::hw_regs::{ComputeShaderInfo, Context, Shader, UserConfig};
@@ -45,6 +45,15 @@ use tracing::debug;
 mod prim {
     /// NONE: a draw issued with no primitive type draws nothing on hardware.
     pub const NONE: u32 = 0;
+    /// AMD `DI_PT_POINTLIST`: one point per vertex. Measured: ASTRO.BOT issues
+    /// point-list draws in its render loop (78 skips before support). Maps 1:1
+    /// to Vulkan's point-list topology.
+    pub const POINT_LIST: u32 = 1;
+    /// AMD `DI_PT_LINELIST` / `DI_PT_LINESTRIP`: the standard line primitives,
+    /// each a direct Vulkan topology. Included alongside point-list so a debug
+    /// or UI line draw does not skip the way point-list did.
+    pub const LINE_LIST: u32 = 2;
+    pub const LINE_STRIP: u32 = 3;
     pub const TRIANGLE_LIST: u32 = 4;
     pub const TRIANGLE_FAN: u32 = 5;
     pub const TRIANGLE_STRIP: u32 = 6;
@@ -534,6 +543,61 @@ fn prepare_vertex_inputs(
     Ok((buffers, attributes))
 }
 
+/// Gen5 unified T# format -> (Vulkan format, bytes per pixel), decoded via
+/// SharpEmu's Gfx10UnifiedFormat table (the RDNA2 authority). Filled from
+/// measured titles only; an unhandled value names itself rather than guessing.
+fn texture_vk_format(
+    t: &kyty_graphics::shader::ShaderTextureResource,
+) -> Result<(vk::Format, u32), DrawError> {
+    match t.format() {
+        // 1 = single 8-bit channel, UNORM (measured on ASTRO.BOT's 480x270
+        // coverage/mask texture, tile mode 27). SharpEmu's Gfx10UnifiedFormat
+        // maps unified 1 -> (dataFormat 1 = FMT_8, numFormat 0 = UNORM).
+        1 => Ok((vk::Format::R8_UNORM, 1)),
+        // 7 -> (2,0) = 16 UNORM: a single 16-bit normalized channel
+        // (measured: ASTRO.BOT's 1536x1536x3 2DArray, tile mode 24).
+        // SharpEmu Gfx10UnifiedFormat maps unified 7 -> (dataFormat 2 = 16,
+        // numFormat 0 = UNORM).
+        7 => Ok((vk::Format::R16_UNORM, 2)),
+        // 36 = 10_11_11 FLOAT (packed 32-bit HDR) — the title samples its HDR
+        // render target as a texture. SharpEmu Gfx10UnifiedFormat maps unified
+        // 36 -> (dataFormat 6 = 10_11_11, numFormat 7 = FLOAT).
+        36 => Ok((vk::Format::B10G11R11_UFLOAT_PACK32, 4)),
+        // 0x0a = 8_8_8_8; channel type UNORM (measured on Minecraft's UI T#s).
+        // NOTE: SharpEmu's table maps unified 10 -> (2,3) = 16_SSCALED, which
+        // contradicts this arm. No 0x0a texture has appeared in a measured
+        // run since; the first one that does must settle the table.
+        0x0a => Ok((vk::Format::R8G8B8A8_UNORM, 4)),
+        // 56 -> (10,0) = 8_8_8_8 UNORM (measured: Minecraft's 1920x1080 UI
+        // texture, tile mode 27).
+        56 => Ok((vk::Format::R8G8B8A8_UNORM, 4)),
+        // 22 -> (4,7) = 32 FLOAT (measured: ASTRO.BOT's 1920x1080 R32F buffer
+        // — a linear-depth/scalar target sampled back as a texture). SharpEmu
+        // Gfx10UnifiedFormat.cs:48 maps unified 22 -> (dataFormat 4,
+        // numFormat 7); dataFormat 4 is the single 32-bit channel per its Gen5
+        // layout table ("SetLayout(4, 0, 0, 32); // 32") and numFormat 7 is
+        // FLOAT, the same numFormat as the 36 and 71 arms.
+        22 => Ok((vk::Format::R32_SFLOAT, 4)),
+        // 71 -> (12,7) = 16_16_16_16 FLOAT (measured: ASTRO.BOT's 2432x1368
+        // HDR scene buffer sampled back as a texture, tile mode 27). SharpEmu's
+        // Gfx10UnifiedFormat maps unified 71 -> (dataFormat 12, numFormat 7);
+        // dataFormat 12 is 16_16_16_16 per its Gen5 layout table, and numFormat
+        // 7 is FLOAT (same numFormat as the 36 arm above). Every draw in the
+        // title's 7966-dword DCB failed on this one format.
+        71 => Ok((vk::Format::R16G16B16A16_SFLOAT, 8)),
+        other => Err(err(format!(
+            "texture format {other} not implemented \
+             (base={:#x} {}x{} pitch={} tile={} levels={})",
+            t.base40(),
+            u32::from(t.width5()) + 1,
+            u32::from(t.height5()) + 1,
+            t.pitch(),
+            t.tile_mode(),
+            t.last_level()
+        ))),
+    }
+}
+
 /// Decode one T# into linear pixels a Vulkan sampled image can hold.
 ///
 /// Formats and tile modes are added strictly from measurement: an unhandled
@@ -579,57 +643,7 @@ fn decode_texture(
         return Err(err(format!("volume depth {depth} out of range")));
     }
 
-    // Gen5 unified T# format -> (Vulkan format, bytes per pixel), decoded via
-    // SharpEmu's Gfx10UnifiedFormat table (the RDNA2 authority). Filled from
-    // measured titles only; an unhandled value names itself rather than
-    // guessing. `bpp` typed because the arms are added incrementally.
-    let (format, bpp): (vk::Format, u32) = match t.format() {
-        // 1 = single 8-bit channel, UNORM (measured on ASTRO.BOT's 480x270
-        // coverage/mask texture, tile mode 27). SharpEmu's Gfx10UnifiedFormat
-        // maps unified 1 -> (dataFormat 1 = FMT_8, numFormat 0 = UNORM).
-        1 => (vk::Format::R8_UNORM, 1),
-        // 7 -> (2,0) = 16 UNORM: a single 16-bit normalized channel
-        // (measured: ASTRO.BOT's 1536x1536x3 2DArray, tile mode 24).
-        // SharpEmu Gfx10UnifiedFormat maps unified 7 -> (dataFormat 2 = 16,
-        // numFormat 0 = UNORM).
-        7 => (vk::Format::R16_UNORM, 2),
-        // 36 = 10_11_11 FLOAT (packed 32-bit HDR) — the title samples its HDR
-        // render target as a texture. SharpEmu Gfx10UnifiedFormat maps unified
-        // 36 -> (dataFormat 6 = 10_11_11, numFormat 7 = FLOAT).
-        36 => (vk::Format::B10G11R11_UFLOAT_PACK32, 4),
-        // 0x0a = 8_8_8_8; channel type UNORM (measured on Minecraft's UI T#s).
-        // NOTE: SharpEmu's table maps unified 10 -> (2,3) = 16_SSCALED, which
-        // contradicts this arm. No 0x0a texture has appeared in a measured
-        // run since; the first one that does must settle the table.
-        0x0a => (vk::Format::R8G8B8A8_UNORM, 4),
-        // 56 -> (10,0) = 8_8_8_8 UNORM (measured: Minecraft's 1920x1080 UI
-        // texture, tile mode 27).
-        56 => (vk::Format::R8G8B8A8_UNORM, 4),
-        // 22 -> (4,7) = 32 FLOAT (measured: ASTRO.BOT's 1920x1080 R32F buffer
-        // — a linear-depth/scalar target sampled back as a texture). SharpEmu
-        // Gfx10UnifiedFormat.cs:48 maps unified 22 -> (dataFormat 4,
-        // numFormat 7); dataFormat 4 is the single 32-bit channel per its Gen5
-        // layout table ("SetLayout(4, 0, 0, 32); // 32") and numFormat 7 is
-        // FLOAT, the same numFormat as the 36 and 71 arms.
-        22 => (vk::Format::R32_SFLOAT, 4),
-        // 71 -> (12,7) = 16_16_16_16 FLOAT (measured: ASTRO.BOT's 2432x1368
-        // HDR scene buffer sampled back as a texture, tile mode 27). SharpEmu's
-        // Gfx10UnifiedFormat maps unified 71 -> (dataFormat 12, numFormat 7);
-        // dataFormat 12 is 16_16_16_16 per its Gen5 layout table, and numFormat
-        // 7 is FLOAT (same numFormat as the 36 arm above). Every draw in the
-        // title's 7966-dword DCB failed on this one format.
-        71 => (vk::Format::R16G16B16A16_SFLOAT, 8),
-        other => {
-            return Err(err(format!(
-                "texture format {other} not implemented \
-                 (base={:#x} {width}x{height} pitch={} tile={} levels={})",
-                t.base40(),
-                t.pitch(),
-                t.tile_mode(),
-                t.last_level()
-            )));
-        }
-    };
+    let (format, bpp) = texture_vk_format(t)?;
 
     let pixels = match t.tile_mode() {
         0 if cube || array => {
@@ -733,6 +747,11 @@ fn decode_texture(
         layers,
         cube,
         depth,
+        // This path has already read and detiled the guest bytes above, so it is
+        // the CPU-staging upload — not the Stage-B direct-bind of a live
+        // persistent target (that would early-return before the detile with
+        // `render_target: Some(base)`).
+        render_target: None,
     })
 }
 
@@ -815,41 +834,111 @@ fn read_storage_image(
     })
 }
 
+/// What the texture-decode path may consult about live render targets while
+/// one draw's stage bindings are prepared:
+///
+/// - `map`: the CPU-side framebuffer map (per-target pixels of the last
+///   readback) — the fallback for the feedback loop (a draw sampling its own
+///   attachment) and for extent/format mismatches.
+/// - `live`: `(base, width, height, vk format raw)` of every persistent GPU
+///   target whose image content is trustworthy — a matching sampled T# binds
+///   that `VkImage` directly (stage B) instead of round-tripping pixels.
+/// - `self_base`: the draw's own `CB_COLOR0_BASE`. Never GPU-bound (binding
+///   the current attachment as a texture is a feedback loop); takes the CPU
+///   fallback instead.
+struct SamplingScope {
+    map: *const HashMap<u64, RenderedImage>,
+    live: Vec<(u64, u32, u32, i32)>,
+    self_base: u64,
+}
+
 thread_local! {
-    /// Raw pointer to the live render-target map for the draw currently being
-    /// translated. `OffscreenDrawSink` sets it to its `framebuffers` immediately
-    /// before `render_draw` and clears it right after, so the texture path can
-    /// source a render-target-as-texture from its actual rendered pixels instead
-    /// of the guest memory it was never written back to (that read black, which
-    /// is why composited scenes stayed black). Null outside a draw.
-    static RENDER_TARGETS: std::cell::Cell<*const HashMap<u64, RenderedImage>> =
+    /// The scope for the draw currently preparing its stage bindings.
+    /// `OffscreenDrawSink::draw_common` publishes it around the
+    /// `prepare_stage_binding` loop (where textures are decoded — NOT around
+    /// `render_draw`, which decodes nothing) and restores the previous value
+    /// after. Null outside that span.
+    ///
+    /// (Its predecessor, `RENDER_TARGETS`, was published around `render_draw`
+    /// instead — after every texture had already been decoded — so the
+    /// render-target-as-texture substitution it existed for never actually
+    /// fired.)
+    static SAMPLING_SCOPE: std::cell::Cell<*const SamplingScope> =
         const { std::cell::Cell::new(std::ptr::null()) };
 }
 
-/// Publish the live render-target map for the duration of `f` (one draw's
-/// translation), then restore the previous value. See [`RENDER_TARGETS`].
-pub fn with_render_targets<R>(map: &HashMap<u64, RenderedImage>, f: impl FnOnce() -> R) -> R {
-    let prev = RENDER_TARGETS.with(|c| c.replace(std::ptr::from_ref(map)));
+/// Publish `scope` for the duration of `f` (one draw's stage-binding
+/// preparation), then restore the previous value. See [`SAMPLING_SCOPE`].
+fn with_sampling_scope<R>(scope: &SamplingScope, f: impl FnOnce() -> R) -> R {
+    let prev = SAMPLING_SCOPE.with(|c| c.replace(std::ptr::from_ref(scope)));
     let r = f();
-    RENDER_TARGETS.with(|c| c.set(prev));
+    SAMPLING_SCOPE.with(|c| c.set(prev));
     r
 }
 
-/// The rendered pixels of the render target at guest `base` (matching `width` x
-/// `height`), if one is live for the current draw. Used to sample a
-/// render-target-as-texture — its content lives in the framebuffer map, not the
-/// guest memory `decode_texture` reads.
-fn render_target_pixels(base: u64, width: u32, height: u32) -> Option<Vec<u8>> {
-    RENDER_TARGETS.with(|c| {
+/// Run `f` with the current sampling scope, if one is published.
+fn sampling_scope<R>(f: impl FnOnce(&SamplingScope) -> Option<R>) -> Option<R> {
+    SAMPLING_SCOPE.with(|c| {
         let ptr = c.get();
         if ptr.is_null() {
             return None;
         }
-        // SAFETY: `with_render_targets` sets this to a live `&HashMap` for
-        // exactly the synchronous, same-thread span of `render_draw` (which
-        // drives this translation) and clears it after; the map is not mutated
-        // during that span, and access here is read-only.
-        let map = unsafe { &*ptr };
+        // SAFETY: `with_sampling_scope` sets this to a live `&SamplingScope`
+        // for exactly the synchronous, same-thread span of the stage-binding
+        // preparation and restores it after; the scope (and the framebuffer
+        // map it points to) is not mutated during that span, and access here
+        // is read-only.
+        f(unsafe { &*ptr })
+    })
+}
+
+/// A [`TextureUpload`] that binds the persistent GPU image of a live render
+/// target directly, when this T# names one (stage B). `None` falls through to
+/// the guest-memory decode / CPU-pixels fallback.
+fn sampled_render_target(
+    t: &kyty_graphics::shader::ShaderTextureResource,
+) -> Option<TextureUpload> {
+    // Only a plain 2D T# can alias a colour attachment.
+    if !matches!(t.type_(), 8 | 9) {
+        return None;
+    }
+    let width = u32::from(t.width5()) + 1;
+    let height = u32::from(t.height5()) + 1;
+    let base = t.base40();
+    let format = texture_vk_format(t).ok()?.0;
+    sampling_scope(|scope| {
+        if base == scope.self_base {
+            // Feedback loop: the CPU-pixels fallback handles it.
+            return None;
+        }
+        scope
+            .live
+            .iter()
+            .find(|(b, w, h, f)| *b == base && *w == width && *h == height && *f == format.as_raw())
+            .map(|_| TextureUpload {
+                width,
+                height,
+                format,
+                pixels: Vec::new(),
+                layers: 1,
+                cube: false,
+                depth: 1,
+                render_target: Some(base),
+            })
+    })
+}
+
+/// The rendered pixels of the render target at guest `base` (matching `width`
+/// x `height`), from the CPU-side framebuffer map, if one is live for the
+/// current draw. This is the fallback for cases the direct GPU binding cannot
+/// serve: the draw's own target (feedback loop) and extent/format mismatches.
+/// The content lives in the framebuffer map, not the guest memory
+/// `decode_texture` reads (render targets are never written back).
+fn render_target_pixels(base: u64, width: u32, height: u32) -> Option<Vec<u8>> {
+    sampling_scope(|scope| {
+        // SAFETY: `scope.map` points at the sink's framebuffer map, alive and
+        // unmutated for the published span (see `SAMPLING_SCOPE`).
+        let map = unsafe { &*scope.map };
         map.get(&base)
             .filter(|img| img.width == width && img.height == height)
             .map(|img| img.pixels.clone())
@@ -1025,15 +1114,22 @@ fn prepare_stage_binding(
             rewritten.update_address38(storage_images.len() as u64);
             storage_images.push(upload);
         } else {
-            let mut decoded = decode_texture(&desc.texture)?;
-            // If this T# points at a live render target, sample its actual
-            // rendered pixels — they live in the framebuffer map, not the
-            // guest memory decode_texture reads (render targets are never
-            // written back). Without this, a title's final composite (a
+            // A T# naming a live persistent render target binds that target's
+            // GPU image directly (stage B) — its content lives on the device,
+            // not in the guest memory decode_texture reads (render targets are
+            // never written back). Without this, a title's final composite (a
             // fullscreen quad sampling its scene targets) reads black, so
             // nothing shows on screen.
-            if let Some(px) =
-                render_target_pixels(desc.texture.base40(), decoded.width, decoded.height)
+            let mut decoded = match sampled_render_target(&desc.texture) {
+                Some(upload) => upload,
+                None => decode_texture(&desc.texture)?,
+            };
+            // CPU fallback for what the direct binding cannot serve (the
+            // draw's own target — a feedback loop — or an extent/format
+            // mismatch): substitute the framebuffer map's rendered pixels.
+            if decoded.render_target.is_none()
+                && let Some(px) =
+                    render_target_pixels(desc.texture.base40(), decoded.width, decoded.height)
             {
                 decoded.pixels = px;
             }
@@ -1243,10 +1339,14 @@ pub fn draw_state_from_regs<'a>(
         prim::TRIANGLE_LIST => (vk::PrimitiveTopology::TRIANGLE_LIST, index_count),
         prim::TRIANGLE_FAN | prim::POLYGON => (vk::PrimitiveTopology::TRIANGLE_FAN, index_count),
         prim::TRIANGLE_STRIP => (vk::PrimitiveTopology::TRIANGLE_STRIP, index_count),
+        prim::POINT_LIST => (vk::PrimitiveTopology::POINT_LIST, index_count),
+        prim::LINE_LIST => (vk::PrimitiveTopology::LINE_LIST, index_count),
+        prim::LINE_STRIP => (vk::PrimitiveTopology::LINE_STRIP, index_count),
         other => {
             return Err(err(format!(
-                "unsupported VGT_PRIMITIVE_TYPE {other} (supported: 4 TriList, \
-                 5 TriFan, 6 TriStrip, 7 Polygon, 17 RectList)"
+                "unsupported VGT_PRIMITIVE_TYPE {other} (supported: 1 PointList, \
+                 2 LineList, 3 LineStrip, 4 TriList, 5 TriFan, 6 TriStrip, \
+                 7 Polygon, 17 RectList)"
             )));
         }
     };
@@ -1368,6 +1468,11 @@ pub struct OffscreenDrawSink<'a> {
     /// one starting from a cleared target.
     framebuffers: &'a mut HashMap<u64, RenderedImage>,
     pub last: Option<RenderedImage>,
+    /// `CB_COLOR0_BASE` of the last draw's render target. With deferred
+    /// readback (stage B) `last` is only populated by immediate-fallback
+    /// draws; the session resolves the presented frame by looking this base
+    /// up in the framebuffer map AFTER the flush lands the batch's pixels.
+    pub last_target: Option<u64>,
     pub draws: u64,
     /// Draws and compute dispatches skipped because a bound guest shader failed
     /// translation. The named reason was warned once by the cache; each skip
@@ -1413,6 +1518,7 @@ impl<'a> OffscreenDrawSink<'a> {
             cache,
             framebuffers,
             last: None,
+            last_target: None,
             draws: 0,
             shader_skips: 0,
             draw_skips: 0,
@@ -1527,23 +1633,60 @@ impl OffscreenDrawSink<'_> {
         if let Some((bytes, index_type)) = index {
             state.index = Some(crate::vulkan::IndexBinding { bytes, index_type });
         }
-        for (bind, stage) in [
+
+        let rt_base = ctx.render_targets[0].base.addr;
+        let stage_binds = [
             (&shaders.vs_info.bind, vk::ShaderStageFlags::VERTEX),
             (&shaders.ps_info.bind, vk::ShaderStageFlags::FRAGMENT),
-        ] {
-            if bind.push_constant_size != 0
-                || bind.storage_buffers.buffers_num != 0
-                || bind.textures2d.textures_num != 0
-                || bind.samplers.samplers_num != 0
-                || bind.gds_pointers.pointers_num != 0
-                || bind.direct_sgprs.sgprs_num != 0
-                || bind.extended.used
-            {
-                state
-                    .stage_bindings
-                    .push(prepare_stage_binding(bind, stage)?);
-            }
+        ];
+        // Feedback loop: a stage samples the very target this draw renders
+        // into. That T# takes the CPU-pixels fallback, and with deferred
+        // readback (stage B) those pixels can be stale — flush the pending
+        // batch first so the framebuffer map is current. Named, counted via
+        // the flush stats; measured composites sample OTHER targets, so this
+        // stays off the hot path.
+        let samples_own_target = stage_binds.iter().any(|(bind, _)| {
+            let n = usize::try_from(bind.textures2d.textures_num).unwrap_or(0);
+            bind.textures2d.desc[..n.min(bind.textures2d.desc.len())]
+                .iter()
+                .any(|d| d.usage != ShaderTextureUsage::ReadWrite && d.texture.base40() == rt_base)
+        });
+        if samples_own_target && self.dev.draw_caches().base_is_batch_dirty(rt_base) {
+            self.flush_deferred_into_framebuffers()?;
         }
+        // Publish what the texture decode may consult: live persistent GPU
+        // targets (bindable directly) and the CPU framebuffer map (feedback /
+        // mismatch fallback). The draw's own target is excluded from direct
+        // binding — sampling the current attachment is the feedback loop.
+        let scope = SamplingScope {
+            map: std::ptr::from_ref(self.framebuffers),
+            live: self
+                .dev
+                .draw_caches()
+                .live_target_keys()
+                .into_iter()
+                .filter(|k| k.base != rt_base)
+                .map(|k| (k.base, k.width, k.height, k.format))
+                .collect(),
+            self_base: rt_base,
+        };
+        with_sampling_scope(&scope, || -> Result<(), DrawError> {
+            for (bind, stage) in stage_binds {
+                if bind.push_constant_size != 0
+                    || bind.storage_buffers.buffers_num != 0
+                    || bind.textures2d.textures_num != 0
+                    || bind.samplers.samplers_num != 0
+                    || bind.gds_pointers.pointers_num != 0
+                    || bind.direct_sgprs.sgprs_num != 0
+                    || bind.extended.used
+                {
+                    state
+                        .stage_bindings
+                        .push(prepare_stage_binding(bind, stage)?);
+                }
+            }
+            Ok(())
+        })?;
 
         // One-shot forensic: what does a real Minecraft draw actually bind?
         // CORRECTED 2026-07-20: this used to claim "geometry covers the screen
@@ -1583,42 +1726,56 @@ impl OffscreenDrawSink<'_> {
         // Compose into the guest render target: seed with its prior pixels
         // (taken from the framebuffer map) so this draw adds to the frame
         // instead of starting over on a cleared attachment.
-        let rt_base = ctx.render_targets[0].base.addr;
         let prior = self
             .framebuffers
             .remove(&rt_base)
             .filter(|p| p.width == state.width && p.height == state.height);
-        let image = {
-            if let Some(p) = &prior {
-                state.initial = Some(&p.pixels);
+        if let Some(p) = &prior {
+            state.initial = Some(&p.pixels);
+        }
+        // Name the guest target so the backend keeps one VkImage per
+        // (base, extent, format) across draws. The `target_base` contract
+        // holds here by construction: `prior` is exactly the previous
+        // readback of this target (this map is only ever written with
+        // readbacks), so the backend may LOAD the persistent GPU copy
+        // instead of re-uploading these bytes.
+        state.target_base = Some(rt_base);
+        // Stage B: the draw is submitted with its readback DEFERRED —
+        // `Ok(None)` means the pixels land in the framebuffer map at the next
+        // flush (end of submission, presentation, or a feedback fallback).
+        // `Ok(Some(image))` is the immediate-fallback path (readback now),
+        // preserving the old per-draw behaviour.
+        let immediate = crate::vulkan::offscreen::render_draw_deferred(self.dev, &state)
+            .map_err(|e| err(format!("offscreen draw failed: {e}")))?;
+        drop(state);
+        match immediate {
+            Some(image) => {
+                self.framebuffers.insert(rt_base, image.clone());
+                self.last = Some(image);
             }
-            // Name the guest target so the backend keeps one VkImage per
-            // (base, extent, format) across draws. The `target_base` contract
-            // holds here by construction: `prior` is exactly the previous
-            // draw's readback of this target (this map is only ever written
-            // with that readback, below), so the backend may LOAD the
-            // persistent GPU copy instead of re-uploading these bytes.
-            state.target_base = Some(rt_base);
-            // Publish the other live render targets (this one was `remove`d
-            // above) so this draw's texture path can sample any of them as a
-            // render-target-as-texture — the composite that produces the visible
-            // frame samples its scene targets this way.
-            let dev = self.dev;
-            let fbs: &HashMap<u64, RenderedImage> = self.framebuffers;
-            let output = with_render_targets(fbs, || {
-                render_draw(dev, &state).map_err(|e| err(format!("offscreen draw failed: {e}")))
-            })?;
-            // This path is colour-only (`color_output: true`, `depth: None`),
-            // so the draw always produces a colour image; a depth-only draw
-            // would land here only once the register decode emits one.
-            output
-                .color
-                .ok_or_else(|| err("offscreen draw produced no colour image".to_string()))?
-        };
-
-        self.framebuffers.insert(rt_base, image.clone());
-        self.last = Some(image);
+            None => {
+                // Deferred: keep the (now-stale) prior entry so the map's key
+                // census stays complete until the flush replaces it. The
+                // target itself is marked GPU-newer, so no path can mistake
+                // these bytes for the current frame's authority.
+                if let Some(p) = prior {
+                    self.framebuffers.insert(rt_base, p);
+                }
+            }
+        }
+        self.last_target = Some(rt_base);
         self.draws += 1;
+        Ok(())
+    }
+
+    /// Flush the pending deferred-draw batch and land every readback in the
+    /// framebuffer map (the feedback-loop fallback path).
+    fn flush_deferred_into_framebuffers(&mut self) -> Result<(), DrawError> {
+        let flushed = crate::vulkan::offscreen::flush_deferred_draws(self.dev)
+            .map_err(|e| err(format!("deferred-draw flush failed: {e}")))?;
+        for (base, image) in flushed {
+            self.framebuffers.insert(base, image);
+        }
         Ok(())
     }
 }
@@ -2259,6 +2416,30 @@ mod tests {
                 .unwrap_or_else(|e| panic!("Gen5 primitive {prim_type}: {e}"));
             assert_eq!(state.topology, expected, "Gen5 primitive {prim_type}");
             assert_eq!(state.vertex_count, 6);
+        }
+    }
+
+    /// Point and line primitives map 1:1 to their Vulkan topologies and keep the
+    /// guest index count. ASTRO.BOT issues point-list draws in its render loop;
+    /// before support they skipped as "unsupported VGT_PRIMITIVE_TYPE 1".
+    #[test]
+    fn point_and_line_primitives_map_to_vulkan_topologies() {
+        for (prim_type, expected) in [
+            (prim::POINT_LIST, vk::PrimitiveTopology::POINT_LIST),
+            (prim::LINE_LIST, vk::PrimitiveTopology::LINE_LIST),
+            (prim::LINE_STRIP, vk::PrimitiveTopology::LINE_STRIP),
+        ] {
+            let ucfg = UserConfig {
+                prim_type,
+                ..UserConfig::default()
+            };
+            let state = draw_state_from_regs(&ctx_96x48(), &ucfg, 6, SPIRV, SPIRV)
+                .unwrap_or_else(|e| panic!("primitive {prim_type}: {e}"));
+            assert_eq!(state.topology, expected, "primitive {prim_type}");
+            assert_eq!(
+                state.vertex_count, 6,
+                "primitive {prim_type} keeps the guest index count"
+            );
         }
     }
 

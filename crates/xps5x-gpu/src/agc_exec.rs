@@ -471,8 +471,32 @@ impl AgcGpuSession {
         let dispatch_skips = sink.dispatch_skips;
         let draw_skip_reason = sink.last_draw_skip_reason.clone();
         let dispatch_skip_reason = sink.last_dispatch_skip_reason.clone();
-        let image = sink.last.take();
+        let last_target = sink.last_target;
+        let mut image = sink.last.take();
         drop(sink);
+        // Stage B flush: land every deferred readback in the framebuffer map
+        // — at most one readback per touched target per SUBMISSION, instead
+        // of one per draw. Runs before presentation/dump logic so everything
+        // downstream (scanout lookup, most-content fallback, frame dumps)
+        // sees exactly the bytes the old per-draw path produced.
+        match crate::vulkan::offscreen::flush_deferred_draws(device) {
+            Ok(flushed) => {
+                for (base, img) in flushed {
+                    framebuffers.insert(base, img);
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "deferred-draw flush failed — presenting the last flushed frame");
+            }
+        }
+        // The submission's own "last image": the last-drawn target's flushed
+        // pixels (deferred draws populate `last` only via the immediate
+        // fallback).
+        if let Some(base) = last_target
+            && let Some(img) = framebuffers.get(&base)
+        {
+            image = Some(img.clone());
+        }
         // Snapshot every accumulated render target while the guard is still
         // held (re-locking `self.framebuffers` here would deadlock — the guard
         // lives to end of scope), for the optional all-targets dump below.

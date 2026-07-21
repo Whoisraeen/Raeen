@@ -222,6 +222,7 @@ fn sampled_texture_without_sampler_dispatches() {
                 layers: 1,
                 cube: false,
                 depth: 1,
+                render_target: None,
             }],
             linear_filter: Vec::new(),
         }),

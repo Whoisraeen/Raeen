@@ -300,6 +300,7 @@ fn title_translated_ps_sweep() {
                 layers: 1,
                 cube: false,
                 depth: 1,
+                render_target: None,
             }],
             linear_filter: vec![false],
         })

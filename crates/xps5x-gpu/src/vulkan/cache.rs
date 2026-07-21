@@ -48,6 +48,15 @@ use xps5x_core::error::GpuError;
 /// `seed_uploads_skipped` counts draws whose attachment LOAD was satisfied
 /// from the persistent GPU image instead of re-uploading the CPU-side
 /// framebuffer — the stage A fast path for composited frames.
+///
+/// Stage B (deferred readback) adds:
+/// - `deferred_draws`: draws submitted without a fence wait or readback.
+/// - `batch_flushes`: how many times the deferred batch was flushed.
+/// - `target_readbacks`: persistent-target readbacks performed at flushes —
+///   the number stage B exists to shrink (was one per draw, now at most one
+///   per touched target per flush).
+/// - `sampled_target_binds`: sampled T#s satisfied by binding the persistent
+///   `VkImage` directly instead of uploading CPU bytes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DrawCacheStats {
     pub pipeline_hits: u64,
@@ -59,6 +68,10 @@ pub struct DrawCacheStats {
     pub target_hits: u64,
     pub target_misses: u64,
     pub seed_uploads_skipped: u64,
+    pub deferred_draws: u64,
+    pub batch_flushes: u64,
+    pub target_readbacks: u64,
+    pub sampled_target_binds: u64,
 }
 
 /// One descriptor-set-layout binding, reduced to the fields that feed
@@ -169,15 +182,33 @@ pub(crate) struct TargetKey {
     pub format: i32,
 }
 
+/// What the persistent GPU image holds relative to the CPU-side framebuffer
+/// entry for the same guest base. This is stage A's `synced` bit generalized
+/// for deferred readback (stage B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetContent {
+    /// GPU image and the last readback handed to the caller are
+    /// byte-identical: the attachment may LOAD from the GPU copy and the CPU
+    /// pixels are equally authoritative.
+    Synced,
+    /// The GPU image holds newer content than the CPU-side entry — draws were
+    /// submitted whose readback was deferred. The GPU copy is the only
+    /// authority: the attachment must LOAD from it and the stale CPU seed
+    /// must NOT be uploaded over it.
+    GpuNewer,
+    /// Nothing is known (a draw is mid-flight or failed). The image must not
+    /// be LOADed from; the next draw seeds from the CPU pixels or clears.
+    Unknown,
+}
+
 /// The device-side half of one guest render target: the attachment image and
 /// the host-visible buffer its pixels are read back through.
 ///
-/// `synced` is the honesty bit for the seed-skip fast path: it is true exactly
-/// when the GPU image's contents are byte-identical to the last colour
-/// readback handed to the caller (which is what the CPU-side framebuffer map
-/// stores). It is cleared when a draw acquires the target and set again only
-/// after that draw's readback completes, so a failed draw can never leave a
-/// stale image masquerading as the composed frame.
+/// `content` is the honesty state for the seed-skip / deferred-readback fast
+/// paths (see [`TargetContent`]). It is set to `Unknown` when a draw acquires
+/// the target, `GpuNewer` when a deferred draw's commands were submitted, and
+/// `Synced` only after a readback of the image lands, so a failed draw can
+/// never leave a stale image masquerading as the composed frame.
 #[derive(Clone, Copy)]
 pub(crate) struct PersistentTarget {
     pub image: vk::Image,
@@ -185,7 +216,7 @@ pub(crate) struct PersistentTarget {
     pub view: vk::ImageView,
     pub readback_buffer: vk::Buffer,
     pub readback_memory: vk::DeviceMemory,
-    pub synced: bool,
+    pub content: TargetContent,
 }
 
 /// The grown-on-demand descriptor pool (see [`DrawCaches::descriptor_pool`]).
@@ -194,6 +225,23 @@ struct PoolState {
     max_sets: u32,
     /// Capacity per raw `VkDescriptorType`.
     capacity: HashMap<i32, u32>,
+}
+
+/// Per-draw resources whose destruction is deferred until the batch fence:
+/// a deferred draw's GPU work is still pending when the draw call returns, so
+/// everything its command buffer references must stay alive until the flush
+/// waits the fence.
+#[derive(Default)]
+pub(crate) struct PendingDrawResources {
+    /// The draw's own primary command buffer (recycled at flush).
+    pub command_buffer: vk::CommandBuffer,
+    /// The draw's own descriptor pool (deferred draws never touch the shared
+    /// resettable pool — its per-draw reset is illegal while sets are live).
+    pub descriptor_pool: vk::DescriptorPool,
+    /// Buffers: vertex/index/storage/upload/staging.
+    pub buffers: Vec<(vk::Buffer, vk::DeviceMemory)>,
+    /// Images with their view: texture uploads, depth attachments.
+    pub images: Vec<(vk::Image, vk::DeviceMemory, vk::ImageView)>,
 }
 
 /// See the module docs for inventory, keys, and the locking contract.
@@ -213,6 +261,17 @@ pub(crate) struct DrawCaches {
     pool: Option<PoolState>,
     /// The device-persistent GDS arena (see [`DrawCaches::gds_buffer`]).
     gds: Option<(vk::Buffer, vk::DeviceMemory)>,
+    /// Deferred draws whose GPU work is submitted but not yet fence-waited.
+    pending: Vec<PendingDrawResources>,
+    /// Targets drawn by the pending deferred draws, in draw order (last draw
+    /// of a target keeps it at the back). Flush reads each back exactly once.
+    touched: Vec<TargetKey>,
+    /// Recycled primary command buffers for deferred draws.
+    free_command_buffers: Vec<vk::CommandBuffer>,
+    /// Targets evicted while a batch was open: their images may still be
+    /// referenced by pending command buffers, so destruction waits for the
+    /// flush's fence.
+    deferred_target_destroys: Vec<PersistentTarget>,
     pub stats: DrawCacheStats,
 }
 
@@ -572,13 +631,15 @@ impl DrawCaches {
     }
 
     /// Acquire the persistent target for `key`, if one exists. The returned
-    /// copy carries the entry's previous `synced` value; the entry itself is
-    /// marked un-synced until [`Self::mark_target_synced`] confirms the draw's
-    /// readback landed.
+    /// copy carries the entry's previous `content` value; the entry itself is
+    /// marked [`TargetContent::Unknown`] until either
+    /// [`Self::mark_target_synced`] (a readback landed) or
+    /// [`Self::commit_deferred_draw`] (commands submitted, readback deferred)
+    /// records what really happened.
     pub(crate) fn acquire_target(&mut self, key: &TargetKey) -> Option<PersistentTarget> {
         let entry = self.targets.get_mut(key)?;
         let copy = *entry;
-        entry.synced = false;
+        entry.content = TargetContent::Unknown;
         self.stats.target_hits += 1;
         Some(copy)
     }
@@ -593,13 +654,159 @@ impl DrawCaches {
     /// GPU image and the CPU-side framebuffer entry are byte-identical again.
     pub(crate) fn mark_target_synced(&mut self, key: &TargetKey) {
         if let Some(target) = self.targets.get_mut(key) {
-            target.synced = true;
+            target.content = TargetContent::Synced;
+        }
+    }
+
+    /// The persistent image + view for `key`, if one is live — used to bind a
+    /// render target directly as a sampled descriptor (stage B).
+    pub(crate) fn target_image(&self, key: &TargetKey) -> Option<(vk::Image, vk::ImageView)> {
+        self.targets.get(key).map(|t| (t.image, t.view))
+    }
+
+    /// A copy of the whole persistent-target entry for `key` (flush readback).
+    pub(crate) fn target_entry(&self, key: &TargetKey) -> Option<PersistentTarget> {
+        self.targets.get(key).copied()
+    }
+
+    /// Degrade `key`'s content to [`TargetContent::Unknown`] (a flush failed:
+    /// the image may or may not hold the batch's draws).
+    pub(crate) fn mark_target_unknown(&mut self, key: &TargetKey) {
+        if let Some(target) = self.targets.get_mut(key) {
+            target.content = TargetContent::Unknown;
+        }
+    }
+
+    /// Every live persistent-target key whose image content is trustworthy
+    /// (not mid-draw / not post-failure). `draw_translate` snapshots this to
+    /// decide which sampled T#s can bind the GPU image directly — an
+    /// `Unknown` target's image may still be layout-UNDEFINED (its creating
+    /// draw failed), so it must not be bound.
+    pub(crate) fn live_target_keys(&self) -> Vec<TargetKey> {
+        self.targets
+            .iter()
+            .filter(|(_, t)| t.content != TargetContent::Unknown)
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
+    /// Whether any deferred draw is awaiting its flush.
+    pub(crate) fn batch_open(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Whether `base` has deferred (not yet read back) draws pending.
+    pub(crate) fn base_is_batch_dirty(&self, base: u64) -> bool {
+        self.touched.iter().any(|k| k.base == base)
+    }
+
+    /// A primary command buffer for one deferred draw: recycled from the free
+    /// list, or freshly allocated. Not yet in the recording state.
+    pub(crate) fn batch_command_buffer(
+        &mut self,
+        dev: &VulkanDevice,
+    ) -> Result<vk::CommandBuffer, GpuError> {
+        if let Some(cb) = self.free_command_buffers.pop() {
+            return Ok(cb);
+        }
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(dev.command_pool())
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        // SAFETY: the pool belongs to this device and access is serialized by
+        // the cache lock (see module docs).
+        let buffers = unsafe { dev.device().allocate_command_buffers(&alloc_info) }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("batch command buffer alloc: {e}")))?;
+        buffers.first().copied().ok_or_else(|| {
+            GpuError::VulkanInitFailed("no batch command buffer returned".to_owned())
+        })
+    }
+
+    /// Return a command buffer acquired via [`Self::batch_command_buffer`]
+    /// that was never submitted (the draw failed before submission).
+    pub(crate) fn recycle_command_buffer(&mut self, cb: vk::CommandBuffer) {
+        self.free_command_buffers.push(cb);
+    }
+
+    /// Record a successfully submitted deferred draw: its per-draw resources
+    /// join the pending list, the target joins the touched list (moved to the
+    /// back so flush order follows last-draw order), and the target's GPU
+    /// image becomes the sole content authority.
+    pub(crate) fn commit_deferred_draw(&mut self, res: PendingDrawResources, key: TargetKey) {
+        self.pending.push(res);
+        self.touched.retain(|k| *k != key);
+        self.touched.push(key);
+        if let Some(target) = self.targets.get_mut(&key) {
+            target.content = TargetContent::GpuNewer;
+        }
+        self.stats.deferred_draws += 1;
+    }
+
+    /// Take the whole pending batch for a flush: per-draw resources, touched
+    /// targets (draw order), and targets whose destruction was deferred.
+    pub(crate) fn take_batch(
+        &mut self,
+    ) -> (
+        Vec<PendingDrawResources>,
+        Vec<TargetKey>,
+        Vec<PersistentTarget>,
+    ) {
+        (
+            std::mem::take(&mut self.pending),
+            std::mem::take(&mut self.touched),
+            std::mem::take(&mut self.deferred_target_destroys),
+        )
+    }
+
+    /// Destroy (or recycle) one flushed batch's resources. The caller must
+    /// have waited the flush fence — nothing on the GPU references them.
+    pub(crate) fn retire_batch(
+        &mut self,
+        dev: &VulkanDevice,
+        pending: Vec<PendingDrawResources>,
+        evicted: Vec<PersistentTarget>,
+    ) {
+        for res in pending {
+            if res.command_buffer != vk::CommandBuffer::null() {
+                self.free_command_buffers.push(res.command_buffer);
+            }
+            // SAFETY: the flush fence was waited; every handle below was
+            // created for the retired draw alone and is destroyed exactly
+            // once, children before parents.
+            unsafe {
+                let d = dev.device();
+                if res.descriptor_pool != vk::DescriptorPool::null() {
+                    d.destroy_descriptor_pool(res.descriptor_pool, None);
+                }
+                for (buffer, memory) in res.buffers {
+                    d.destroy_buffer(buffer, None);
+                    d.free_memory(memory, None);
+                }
+                for (image, memory, view) in res.images {
+                    if view != vk::ImageView::null() {
+                        d.destroy_image_view(view, None);
+                    }
+                    if image != vk::Image::null() {
+                        d.destroy_image(image, None);
+                    }
+                    if memory != vk::DeviceMemory::null() {
+                        d.free_memory(memory, None);
+                    }
+                }
+            }
+        }
+        for target in evicted {
+            // SAFETY: fence waited (above); the entry left the map when it
+            // was evicted, so this is the sole remaining handle set.
+            unsafe { destroy_target(dev.device(), &target) };
         }
     }
 
     /// Destroy every persistent target at `base` whose extent/format differs
     /// from `keep` — the guest re-programmed the target, so the old-size image
-    /// can never be drawn again.
+    /// can never be drawn again. With a deferred batch open the handles may
+    /// still be referenced by pending command buffers, so their destruction
+    /// waits for the flush.
     pub(crate) fn evict_targets_for_base(
         &mut self,
         dev: &VulkanDevice,
@@ -614,10 +821,14 @@ impl DrawCaches {
             .collect();
         for key in stale {
             if let Some(target) = self.targets.remove(&key) {
-                // SAFETY: every draw that referenced this target completed
-                // synchronously (fence waited) before this call — nothing on
-                // the GPU can still name these handles.
-                unsafe { destroy_target(dev.device(), &target) };
+                if self.batch_open() {
+                    self.deferred_target_destroys.push(target);
+                } else {
+                    // SAFETY: every draw that referenced this target completed
+                    // synchronously (fence waited) before this call — nothing
+                    // on the GPU can still name these handles.
+                    unsafe { destroy_target(dev.device(), &target) };
+                }
             }
         }
     }
@@ -629,6 +840,40 @@ impl DrawCaches {
         // created from `device` and is destroyed exactly once, children before
         // parents.
         unsafe {
+            // A pending deferred batch at device teardown (e.g. a session shut
+            // down mid-submission): device_wait_idle already ran, so the
+            // pending work completed and the handles can go.
+            for res in self.pending.drain(..) {
+                if res.command_buffer != vk::CommandBuffer::null() {
+                    device.free_command_buffers(command_pool, &[res.command_buffer]);
+                }
+                if res.descriptor_pool != vk::DescriptorPool::null() {
+                    device.destroy_descriptor_pool(res.descriptor_pool, None);
+                }
+                for (buffer, memory) in res.buffers {
+                    device.destroy_buffer(buffer, None);
+                    device.free_memory(memory, None);
+                }
+                for (image, memory, view) in res.images {
+                    if view != vk::ImageView::null() {
+                        device.destroy_image_view(view, None);
+                    }
+                    if image != vk::Image::null() {
+                        device.destroy_image(image, None);
+                    }
+                    if memory != vk::DeviceMemory::null() {
+                        device.free_memory(memory, None);
+                    }
+                }
+            }
+            self.touched.clear();
+            for target in self.deferred_target_destroys.drain(..) {
+                destroy_target(device, &target);
+            }
+            if !self.free_command_buffers.is_empty() {
+                device.free_command_buffers(command_pool, &self.free_command_buffers);
+                self.free_command_buffers.clear();
+            }
             if let Some((command_buffer, fence)) = self.submit.take() {
                 device.destroy_fence(fence, None);
                 device.free_command_buffers(command_pool, &[command_buffer]);
