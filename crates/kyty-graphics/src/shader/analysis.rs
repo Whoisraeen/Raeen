@@ -948,13 +948,44 @@ pub fn shader_get_texture_buffer(
     let index = info.textures_num as usize;
 
     let mut fields = [0u32; 8];
-    let eud_resident = read_sharp_fields(
+    let eud_resident = match read_sharp_fields(
         direct_sgprs,
         start_index,
         user_sgpr,
         extended_buffer,
         &mut fields,
-    )?;
+    ) {
+        Ok(eud_resident) => eud_resident,
+        Err(e) => {
+            // The descriptor could not be read from the captured user data /
+            // EUD because it is resolved at RUNTIME (SRT/bindless), not present
+            // in the static capture. Measured on ASTRO.BOT 0x100008e6aa00: a T#
+            // declared at s4 (needs s4..s11) whose s8+ were never captured, no
+            // EUD -> "user sgpr type is not Vsharp/Region (Unknown at s8)".
+            // Install a placeholder T# so the draw/dispatch proceeds untextured
+            // instead of aborting the whole shader (mirrors the type gate and
+            // shader_synthesize_default_sampler). Consume the captured
+            // registers the sharp would have occupied so the direct-SGPR pass
+            // does not also bind them (avoids a duplicate %vsharp binding).
+            if let Ok(start) = usize::try_from(start_index) {
+                let end = (start + fields.len()).min(UserSgprInfo::SGPRS_MAX);
+                for flag in direct_sgprs
+                    .iter_mut()
+                    .take(end)
+                    .skip(start.min(UserSgprInfo::SGPRS_MAX))
+                {
+                    *flag = false;
+                }
+            }
+            tracing::debug!(
+                start_register = start_index,
+                error = %e,
+                "texture descriptor unresolved (runtime/SRT-bound) — placeholder T#"
+            );
+            fields = placeholder_texture_fields();
+            false
+        }
+    };
 
     info.desc[index].start_register = start_index;
     info.desc[index].extended = eud_resident;
@@ -1078,28 +1109,72 @@ const fn sharp_dword3_is_buffer(dw3: u32) -> bool {
     (dw3 >> 28) & 0xF < 8
 }
 
+/// True when a captured T# is the all-ones poison a descriptor the static
+/// capture could not resolve (runtime-/SRT-/bindless-bound) reads back as,
+/// rather than a real texture. Measured on ASTRO.BOT (compute 0x100008e6aa00,
+/// 281+ dispatches/run): type 15, tile 31, 16384², base 0xf0fffffff000 /
+/// 0xffffffffff00 and **format 511 (0x1FF)**. The 9-bit unified FORMAT field is
+/// the reliable marker: real guest formats are small (7/10/37/71/77…), well
+/// under 0x100, so a value with any high bit set never names a bindable
+/// texture. The same static shader alternately failing with this poison and
+/// with "user sgpr type is not Vsharp/Region (s8 Unknown)" — code fixed, input
+/// varying — is what proves the descriptor is resolved at *runtime*, not a
+/// fixed wrong capture offset.
+fn texture_descriptor_is_unresolvable(t: &super::resources::ShaderTextureResource) -> bool {
+    t.format() >= 0x100
+}
+
+/// The stand-in fields of a placeholder T#: a valid 1x1 `Texture2D` (type 9)
+/// at base 0 with an identity `dst_sel`. The binding path (`raeen-gpu`
+/// `decode_texture`) serves base 0 as a 1x1 transparent-black dummy, so a
+/// draw/dispatch whose texture descriptor could not be resolved proceeds
+/// untextured instead of the whole shader being skipped. Mirrors
+/// [`shader_synthesize_default_sampler`]'s all-zero S# and the null-V#-as-zero
+/// storage-buffer dummy.
+const fn placeholder_texture_fields() -> [u32; 8] {
+    // fields[3]: type (bits 28..31) = 9 (Texture2D); dst_sel(X,Y,Z,W) = 0xFAC.
+    // Everything else 0: base 0, format 0, width5 0 / height5 0 (1x1), tile 0.
+    [0, 0, 0, (9u32 << 28) | 0xFAC, 0, 0, 0, 0]
+}
+
+/// Gate for a read-only sampled T#'s type. Non-fatal by construction: a valid
+/// type is admitted, an array/MSAA type is approximated as 2D, and an
+/// unresolvable/garbage descriptor is replaced in place with a placeholder so
+/// the shader is NEVER aborted for a texture-descriptor reason (M5: maximize
+/// geometry on screen, glitches OK).
+///
+/// - 8=1D (a height-1 2D texture; `SampledDim::from_texture_type` classifies it
+///   2D), 9=2D, 10=3D volume, 11=Cube, 13=2DArray: admitted unchanged (the
+///   already-working set — measured on ASTRO.BOT / Minecraft).
+/// - 12=1DArray, 14=2DMsaa, 15=2DMsaaArray with a *plausible* descriptor:
+///   approximated as 2D (the type is rewritten to 9 so the guest-memory decode,
+///   which handles only 8/9/10/11/13, accepts it; downstream
+///   `from_texture_type` already collapses these to 2D). No such VALID
+///   descriptor occurs in ASTRO.BOT — every measured 15 is the poison below —
+///   but the approximation is cheap and keeps a real MSAA/array title moving.
+/// - Anything unresolvable (the all-ones poison, see
+///   [`texture_descriptor_is_unresolvable`]) or otherwise unhandled: replaced
+///   with a [`placeholder_texture_fields`] 1x1 dummy.
 fn check_read_only_texture_type(
-    t: &super::resources::ShaderTextureResource,
+    t: &mut super::resources::ShaderTextureResource,
 ) -> Result<(), ShaderAnalysisError> {
-    let ty = t.type_();
-    // 8 = 1D. The sample path already classifies it as 2D
-    // (`SampledDim::from_texture_type`'s default), and a 1D texture is a
-    // height-1 2D texture (the single row lives at t=0), so accept it here for
-    // consistency — measured on ASTRO.BOT scene CS 0x500757800 (a 1x1 type-8
-    // read-only texture). 9=2D, 10=3D, 11=Cube, 13=2DArray.
-    if ty == 8 || ty == 9 || ty == 10 || ty == 11 || ty == 13 {
+    if texture_descriptor_is_unresolvable(t) {
+        t.fields = placeholder_texture_fields();
         return Ok(());
     }
-    Err(ni_owned(format!(
-        "read-only texture type {ty} is not Texture2D (9) \
-         (8=1D 10=3D 11=Cube 12=1DArray 13=2DArray; base={:#x} {}x{} depth={} format={} tile={})",
-        t.base40(),
-        u32::from(t.width5()) + 1,
-        u32::from(t.height5()) + 1,
-        u32::from(t.depth()) + 1,
-        t.format(),
-        t.tile_mode(),
-    )))
+    let ty = t.type_();
+    if matches!(ty, 8 | 9 | 10 | 11 | 13) {
+        return Ok(());
+    }
+    if matches!(ty, 12 | 14 | 15) {
+        // Approximate as 2D: rewrite the type nibble to 9 in place.
+        t.fields[3] = (t.fields[3] & 0x0FFF_FFFF) | (9 << 28);
+        return Ok(());
+    }
+    // Any other image type reaching here (e.g. a 0..7 forced through a
+    // flags==3 usage slot): stand in the placeholder rather than abort.
+    t.fields = placeholder_texture_fields();
+    Ok(())
 }
 
 /// Gate for read-write storage-image T# types supported end-to-end. Type 8
@@ -1416,7 +1491,7 @@ pub fn shader_parse_usage(
                     )?;
                     info.textures2d_readonly += 1;
                     let last = (bind.textures2d.textures_num - 1) as usize;
-                    check_read_only_texture_type(&bind.textures2d.desc[last].texture)?;
+                    check_read_only_texture_type(&mut bind.textures2d.desc[last].texture)?;
                 }
             }
 
@@ -1752,11 +1827,13 @@ pub fn shader_capture_eud_image_descriptors(
                             Some(eud),
                         )?;
                         let last = (bind.textures2d.textures_num - 1) as usize;
-                        let t = &bind.textures2d.desc[last].texture;
                         if want_storage {
-                            check_read_write_texture_type(t, "raw-EUD")?;
+                            check_read_write_texture_type(
+                                &bind.textures2d.desc[last].texture,
+                                "raw-EUD",
+                            )?;
                         } else {
-                            check_read_only_texture_type(t)?;
+                            check_read_only_texture_type(&mut bind.textures2d.desc[last].texture)?;
                         }
                         tracing::debug!(
                             eud_dword = k,
@@ -2001,7 +2078,7 @@ pub fn shader_parse_usage2(
                     )?;
                     info.textures2d_readonly += 1;
                     let last = (bind.textures2d.textures_num - 1) as usize;
-                    check_read_only_texture_type(&bind.textures2d.desc[last].texture)?;
+                    check_read_only_texture_type(&mut bind.textures2d.desc[last].texture)?;
                 }
             }
 
@@ -2117,7 +2194,7 @@ pub fn shader_parse_usage2(
         )?;
         info.textures2d_readonly += 1;
         let last = (bind.textures2d.textures_num - 1) as usize;
-        check_read_only_texture_type(&bind.textures2d.desc[last].texture)?;
+        check_read_only_texture_type(&mut bind.textures2d.desc[last].texture)?;
     }
 
     for (slot, sharp) in user_data.sharp_resource_offset[1].iter().enumerate() {
@@ -2306,7 +2383,7 @@ pub fn shader_parse_usage2(
                 )?;
                 info.textures2d_readonly += 1;
                 let last = (bind.textures2d.textures_num - 1) as usize;
-                check_read_only_texture_type(&bind.textures2d.desc[last].texture)?;
+                check_read_only_texture_type(&mut bind.textures2d.desc[last].texture)?;
             }
             continue;
         }
@@ -4836,24 +4913,82 @@ mod tests {
     fn read_only_texture_type_gate_accepts_3d_volumes() {
         // Measured ASTRO.BOT CS skips: type 10 = 3D volume (240x135x64
         // froxel/LUT, format 71) and type 13 = 2DArray (1536x1536x3 format-7
-        // tile-24 — 57 dispatches/run). The gate now admits 2D (9), 3D (10),
-        // Cube (11) and 2DArray (13); anything else stays a named,
-        // evidence-rich refusal (here 12 = 1DArray).
+        // tile-24 — 57 dispatches/run). The gate admits 2D (9), 3D (10),
+        // Cube (11) and 2DArray (13) unchanged. Use a plausible format so the
+        // unresolvable-poison guard does not fire.
         let mut t = super::super::resources::ShaderTextureResource::default();
-        t.fields[3] = 10 << 28;
-        check_read_only_texture_type(&t).expect("3D volume accepted");
-        t.fields[3] = 9 << 28;
-        check_read_only_texture_type(&t).expect("2D accepted");
-        t.fields[3] = 11 << 28;
-        check_read_only_texture_type(&t).expect("Cube accepted");
-        t.fields[3] = 13 << 28;
-        check_read_only_texture_type(&t).expect("2DArray accepted");
-        t.fields[3] = 12 << 28;
-        let err = check_read_only_texture_type(&t).unwrap_err();
-        assert!(
-            format!("{err:?}").contains("read-only texture type 12"),
-            "{err:?}"
-        );
+        let with_type = |t: &mut super::super::resources::ShaderTextureResource, ty: u32| {
+            t.fields[1] = 10 << 20; // format 10 (8_8_8_8): plausible
+            t.fields[3] = ty << 28;
+        };
+        for ty in [8u32, 9, 10, 11, 13] {
+            with_type(&mut t, ty);
+            check_read_only_texture_type(&mut t).expect("supported type accepted");
+            assert_eq!(t.type_(), ty as u8, "supported type left unchanged");
+        }
+    }
+
+    #[test]
+    fn read_only_texture_type_gate_approximates_array_and_msaa_as_2d() {
+        // 12=1DArray, 14=2DMsaa, 15=2DMsaaArray with a plausible descriptor are
+        // approximated as 2D (type rewritten to 9) rather than aborting the
+        // shader — downstream `from_texture_type` already collapses them to 2D.
+        for ty in [12u32, 14, 15] {
+            let mut t = super::super::resources::ShaderTextureResource::default();
+            t.fields[0] = 0x1000; // non-zero base (plausible)
+            t.fields[1] = (10 << 20) | 0x0A; // format 10, base_hi bits
+            t.fields[3] = ty << 28;
+            check_read_only_texture_type(&mut t).expect("array/MSAA approximated, not aborted");
+            assert_eq!(t.type_(), 9, "type {ty} rewritten to 2D");
+        }
+    }
+
+    #[test]
+    fn read_only_texture_type_gate_replaces_poison_with_placeholder() {
+        // The exact ASTRO.BOT poison an unresolved/runtime-bound descriptor
+        // reads back as: all-ones fields => type 15, format 511 (0x1FF), tile
+        // 31, 16384², saturated base. The gate must NOT abort — it replaces the
+        // descriptor with a 1x1 placeholder (type 9, base 0) so the draw
+        // proceeds untextured.
+        let mut t = super::super::resources::ShaderTextureResource {
+            fields: [0xFFFF_FFFF; 8],
+        };
+        assert_eq!(t.type_(), 15);
+        assert_eq!(t.format(), 0x1FF);
+        assert!(texture_descriptor_is_unresolvable(&t));
+        check_read_only_texture_type(&mut t).expect("poison descriptor is non-fatal");
+        assert_eq!(t.fields, placeholder_texture_fields());
+        assert_eq!(t.type_(), 9, "placeholder is a 2D texture");
+        assert_eq!(t.base40(), 0, "placeholder base 0 => bind-path 1x1 dummy");
+    }
+
+    #[test]
+    fn texture_buffer_read_failure_installs_placeholder() {
+        // ASTRO.BOT 0x100008e6aa00: a T# declared at s4 (needs s4..s11) whose
+        // s8+ were never captured (Unknown), with no EUD — `read_sharp_fields`
+        // cannot resolve it. `shader_get_texture_buffer` must install a
+        // placeholder T# and succeed rather than aborting the whole shader.
+        let mut user_sgpr = UserSgprInfo::default();
+        for i in 4..8 {
+            user_sgpr.set(i, 0xdead_0000 | i, UserSgprType::Vsharp);
+        }
+        // count = 8; s8..s11 stay Unknown => the 8-dword T# at s4 cannot be read.
+        let mut info = ShaderTextureResources::default();
+        let mut direct = [false; UserSgprInfo::SGPRS_MAX];
+        shader_get_texture_buffer(
+            &mut info,
+            &mut direct,
+            4,
+            0,
+            ShaderTextureUsage::ReadOnly,
+            &user_sgpr,
+            None,
+        )
+        .expect("unresolvable texture descriptor is non-fatal");
+        assert_eq!(info.textures_num, 1);
+        assert_eq!(info.desc[0].texture.fields, placeholder_texture_fields());
+        // And the placeholder passes the type gate.
+        check_read_only_texture_type(&mut info.desc[0].texture).expect("placeholder accepted");
     }
 
     /// Manual disassembly harness (no-op unless `RAEEN_DISASM_FILE` names a

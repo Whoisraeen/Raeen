@@ -872,6 +872,16 @@ fn sampled_key_ordinal(t: &kyty_graphics::shader::ShaderTextureResource) -> usiz
 fn decode_texture(
     t: &kyty_graphics::shader::ShaderTextureResource,
 ) -> Result<TextureUpload, DrawError> {
+    // A placeholder T# (base 0) stands in for a descriptor shader analysis
+    // could not resolve — the all-ones "type 15 / format 511" poison a
+    // runtime-/SRT-bound descriptor reads back as, replaced upstream by
+    // `kyty_graphics` `check_read_only_texture_type`. Serve a 1x1
+    // transparent-black dummy (no guest read) so the draw/dispatch proceeds
+    // untextured instead of the whole shader being skipped. Mirrors the
+    // null-V#-as-4-byte-zero-dummy storage-buffer path.
+    if t.base40() == 0 {
+        return Ok(placeholder_texture_dummy());
+    }
     let width = u32::from(t.width5()) + 1;
     let height = u32::from(t.height5()) + 1;
     if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) {
@@ -1122,6 +1132,27 @@ fn texture_upload_from(
         render_target: None,
         guest_base: t.base40(),
         sample_hash,
+        cached: false,
+    }
+}
+
+/// A 1x1 transparent-black sampled image standing in for a placeholder (base 0)
+/// T# — see the early return in [`decode_texture`]. No guest read; the sample
+/// result is a deterministic transparent black, so a draw/dispatch whose
+/// texture descriptor could not be statically resolved renders untextured
+/// instead of being skipped (M5: maximize geometry on screen, glitches OK).
+fn placeholder_texture_dummy() -> TextureUpload {
+    TextureUpload {
+        width: 1,
+        height: 1,
+        format: vk::Format::R8G8B8A8_UNORM,
+        pixels: vec![0u8; 4],
+        layers: 1,
+        cube: false,
+        depth: 1,
+        render_target: None,
+        guest_base: 0,
+        sample_hash: 0,
         cached: false,
     }
 }
@@ -3986,6 +4017,35 @@ mod tests {
         assert_eq!((tex.width, tex.height), (w, h));
         assert_eq!(tex.format, vk::Format::R8G8B8A8_UNORM);
         assert_eq!(tex.pixels, linear, "detiled pixels must match the original");
+    }
+
+    /// A placeholder T# (base 0) — the stand-in `kyty_graphics`
+    /// `check_read_only_texture_type` installs for an unresolvable descriptor —
+    /// decodes to a 1x1 transparent-black dummy without any guest read, so the
+    /// draw/dispatch proceeds untextured instead of the whole shader being
+    /// skipped.
+    #[test]
+    fn decode_texture_serves_placeholder_base_zero_as_1x1_dummy() {
+        // The placeholder `kyty_graphics` installs for an unresolvable T# is a
+        // base-0 Texture2D (type 9, identity dst_sel); its exact shape is the
+        // gate's concern — here we only assert base 0 => 1x1 dummy.
+        let mut t = kyty_graphics::shader::ShaderTextureResource {
+            fields: [0, 0, 0, (9u32 << 28) | 0xFAC, 0, 0, 0, 0],
+        };
+        assert_eq!(t.base40(), 0, "placeholder is base 0");
+        assert_eq!(t.type_(), 9);
+        // No test guest ranges installed at all: proves the dummy needs no read.
+        let tex = decode_texture(&t).expect("placeholder decodes without a guest read");
+        assert_eq!((tex.width, tex.height), (1, 1));
+        assert_eq!(tex.format, vk::Format::R8G8B8A8_UNORM);
+        assert_eq!(tex.pixels, vec![0u8; 4], "transparent black");
+        assert_eq!(tex.layers, 1);
+        assert_eq!(tex.guest_base, 0, "base 0 disables the persistent-texture cache");
+        // A base-0 T# with a garbage type still yields the dummy (the base-0
+        // check precedes any type/format decode).
+        t.fields[3] = 15 << 28;
+        let tex = decode_texture(&t).expect("base-0 dummy is type-agnostic");
+        assert_eq!((tex.width, tex.height), (1, 1));
     }
 
     /// The COLOUR-BUFFER (CB_COLOR_INFO) format table is a different table from
