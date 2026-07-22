@@ -722,6 +722,49 @@ impl<'a> DrawState<'a> {
 /// resource/submission failure, [`GpuError::ShaderCompilationFailed`] on empty
 /// SPIR-V, [`GpuError::PipelineCreationFailed`] if the pipeline is rejected.
 pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, GpuError> {
+    // Full pre-submit draw identity for device-loss forensics (XPS5X_NO_DEFER=1
+    // makes each draw synchronous, so the LAST line here before a device-lost is
+    // the faulting draw). Gated to keep the hot path quiet.
+    if std::env::var_os("XPS5X_TRACE_DRAW_STATE").is_some() {
+        let tex: Vec<String> = state
+            .stage_bindings
+            .iter()
+            .filter_map(|s| s.textures.as_ref())
+            .flat_map(|t| t.textures.iter())
+            .map(|u| {
+                format!(
+                    "T#{{base:{:#x} {}x{}x{} l{} cube{} rt:{:?} fmt:{:?}}}",
+                    u.guest_base, u.width, u.height, u.depth, u.layers, u.cube, u.render_target, u.format
+                )
+            })
+            .collect();
+        let attrs: Vec<String> = state
+            .vertex_attributes
+            .iter()
+            .map(|a| format!("loc{}@{}:{:?}", a.location, a.offset, a.format))
+            .collect();
+        let vbs: Vec<String> = state
+            .vertex_buffers
+            .iter()
+            .map(|b| format!("stride{} len{}", b.stride, b.bytes.len()))
+            .collect();
+        let pcs: Vec<usize> = state.stage_bindings.iter().map(|s| s.push_constants.len()).collect();
+        tracing::warn!(
+            rt = format_args!("{}x{} {:?} base:{:?}", state.width, state.height, state.format, state.target_base),
+            topo = format_args!("{:?}", state.topology),
+            cull = format_args!("{:?}/{:?}", state.cull_mode, state.front_face),
+            depth = state.depth.is_some(),
+            vcount = state.vertex_count,
+            indexed = state.index.is_some(),
+            vs_words = state.vs_spirv.len(),
+            fs_words = state.fs_spirv.len(),
+            push = format_args!("{pcs:?}"),
+            vbs = format_args!("{vbs:?}"),
+            attrs = format_args!("{attrs:?}"),
+            tex = format_args!("{tex:?}"),
+            "TRACE_DRAW_STATE"
+        );
+    }
     if state.width == 0 || state.height == 0 {
         return Err(GpuError::VulkanInitFailed(format!(
             "invalid render target size {}x{}",
