@@ -184,7 +184,7 @@ pub fn install_fonts(ctx: &egui::Context, theme: &Theme) {
 /// The default, original-asset XPS5X theme (spec §6, §11 — zero Sony assets).
 pub fn default_theme() -> Theme {
     Theme {
-        name: "XPS5X Default".to_string(),
+        name: "Raeen Default".to_string(),
         palette: Palette {
             ground: rgb(0x0a1017),
             raised: rgb(0x141d29),
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn default_theme_exposes_expected_tokens() {
         let theme = default_theme();
-        assert_eq!(theme.name, "XPS5X Default");
+        assert_eq!(theme.name, "Raeen Default");
         assert_eq!(theme.palette.ground, rgb(0x0a1017));
         assert_eq!(theme.palette.text, rgb(0xf3f7fc));
         assert_eq!(theme.palette.accent_hi, rgb(0x57b0ff));

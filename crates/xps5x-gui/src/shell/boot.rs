@@ -82,7 +82,7 @@ pub fn draw(ctx: &egui::Context, theme: &Theme, boot: &BootSequence) {
             painter.text(
                 egui::pos2(center.x, center.y - 20.0),
                 egui::Align2::CENTER_CENTER,
-                "XPS5X",
+                "Raeen",
                 egui::FontId::proportional(34.0),
                 logo_color,
             );

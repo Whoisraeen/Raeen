@@ -8,10 +8,10 @@ description: >
 
 # Verifying XPS5X shell changes
 
-Surface: native eframe window (`xps5x.exe`), fullscreen-borderless, sized from
+Surface: native eframe window (`raeen.exe`), fullscreen-borderless, sized from
 `config.toml` (default 1920x1080, top-left of the primary display).
 
-1. Build: `cargo build -p xps5x-gui` → `target/debug/xps5x.exe`.
+1. Build: `cargo build -p xps5x-gui` → `target/debug/raeen.exe`.
 2. Launch (PowerShell): `Start-Process` the exe with the repo root as the
    working directory — it scans `Games/`, loads `themes/`, and writes a
    default `config.toml` if missing (don't commit that file). Wait ~6s

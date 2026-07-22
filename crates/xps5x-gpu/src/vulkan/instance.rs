@@ -319,9 +319,9 @@ impl VulkanDevice {
 
     fn create_instance(entry: &Entry, validation: bool) -> Result<(Instance, bool), GpuError> {
         let app_info = vk::ApplicationInfo::default()
-            .application_name(c"XPS5X")
+            .application_name(c"Raeen")
             .application_version(vk::make_api_version(0, 0, 1, 0))
-            .engine_name(c"XPS5X")
+            .engine_name(c"Raeen")
             .engine_version(vk::make_api_version(0, 0, 1, 0))
             // Vulkan 1.3: dynamic rendering is core, so no extension dance.
             .api_version(vk::API_VERSION_1_3);

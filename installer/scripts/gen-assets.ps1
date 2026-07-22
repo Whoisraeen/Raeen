@@ -1,5 +1,5 @@
 <#
-    gen-assets.ps1 - generate XPS5X installer branding.
+    gen-assets.ps1 - generate Raeen installer branding.
 
     Produces, under installer/assets/:
       * xps5x.ico          multi-resolution app + setup icon (16..256, PNG frames)
@@ -31,7 +31,7 @@ $Cyan       = [System.Drawing.Color]::FromArgb(255, 64, 224, 255)   # #40E0FF
 $InkBottom  = [System.Drawing.Color]::FromArgb(255,  8,  12,  30)   # #080C1E
 $InkTop     = [System.Drawing.Color]::FromArgb(255, 16,  30,  74)   # #101E4A
 $White      = [System.Drawing.Color]::White
-$GLYPH      = 'X5'   # monogram drawn on the badge
+$GLYPH      = 'R'   # monogram drawn on the badge
 
 # ------------------------------------------------------------- helpers ------
 function New-RoundedPath([System.Drawing.RectangleF]$r, [single]$radius) {
@@ -45,7 +45,7 @@ function New-RoundedPath([System.Drawing.RectangleF]$r, [single]$radius) {
     return $p
 }
 
-# Draw the XPS5X badge (rounded gradient square + monogram + gloss) filling a
+# Draw the Raeen badge (rounded gradient square + monogram + gloss) filling a
 # square region of side $S onto graphics $g at (0,0). Transparent outside the
 # badge so it composites over any background.
 function Draw-Badge([System.Drawing.Graphics]$g, [int]$S) {
@@ -196,7 +196,7 @@ function Write-WizardLarge([string]$path, [int]$W, [int]$H) {
     $fmt = New-Object System.Drawing.StringFormat
     $fmt.Alignment = [System.Drawing.StringAlignment]::Center
     $wordRect = New-Object System.Drawing.RectangleF(0, [single]($badgeY + $badgeSize + $H * 0.03), $W, [single]($H * 0.12))
-    $g.DrawString('XPS5X', $wordFont, (New-Object System.Drawing.SolidBrush($White)), $wordRect, $fmt)
+    $g.DrawString('Raeen', $wordFont, (New-Object System.Drawing.SolidBrush($White)), $wordRect, $fmt)
 
     # Cyan divider.
     $divW = [single]($W * 0.30)

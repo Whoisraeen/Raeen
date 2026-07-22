@@ -290,7 +290,7 @@ cargo build --release -p xps5x-gui
 The local title run must use a user-supplied path and an ignored artifact directory:
 
 ```powershell
-target\release\xps5x.exe --run-eboot <user-eboot> --diagnostic-dir <ignored-run-dir>
+target\release\raeen.exe --run-eboot <user-eboot> --diagnostic-dir <ignored-run-dir>
 ```
 
 Before claiming M5, also run the workspace tests or explicitly record why any

@@ -67,7 +67,7 @@ impl CcItem {
     }
 }
 
-const POWER_OPTIONS: &[&str] = &["Rest Mode", "Restart", "Turn Off XPS5X"];
+const POWER_OPTIONS: &[&str] = &["Rest Mode", "Restart", "Turn Off Raeen"];
 
 /// The fixed Control Center row (spec §3, §10).
 pub const ITEMS: &[CcItem] = &[
@@ -409,7 +409,7 @@ mod tests {
             .expect("Power card must exist");
         match power.panel {
             CcPanelKind::Power(options) => {
-                assert_eq!(options, &["Rest Mode", "Restart", "Turn Off XPS5X"]);
+                assert_eq!(options, &["Rest Mode", "Restart", "Turn Off Raeen"]);
             }
             _ => panic!("expected Power panel kind"),
         }

@@ -465,7 +465,7 @@ fn draw_key_provider(
     ui.text_edit_singleline(key_provider_input);
     ui.add_space(10.0);
     ui.label(
-        RichText::new("Path only — XPS5X never reads or handles key material here.")
+        RichText::new("Path only — Raeen never reads or handles key material here.")
             .color(theme.palette.text_faint)
             .size(12.0),
     );

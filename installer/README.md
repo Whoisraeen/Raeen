@@ -19,7 +19,7 @@ branding art, runs `cargo build --release -p xps5x-gui`, packages the portable
 ZIP, and — if Inno Setup 6 is installed — compiles the installer. Output lands
 in `dist\`.
 
-Useful switches: `-SkipBuild` (reuse `target\release\xps5x.exe`),
+Useful switches: `-SkipBuild` (reuse `target\release\raeen.exe`),
 `-SkipInstaller` (ZIP only), `-SkipPortable`, `-Version 0.2.0`.
 
 ## Prerequisites
@@ -38,7 +38,7 @@ Useful switches: `-SkipBuild` (reuse `target\release\xps5x.exe`),
 2. A custom **"Select your games folder"** page (defaults to
    `Documents\XPS5X\Games`). The folder is created and validated on *Next*.
 3. **Tasks**: desktop icon, *start in a window instead of full-screen*.
-4. Installs `xps5x.exe`, the default theme, docs, and the app icon; creates
+4. Installs `raeen.exe`, the default theme, docs, and the app icon; creates
    `logs\`, `savedata\`, `shader_cache\`, `firmware\`.
 5. If the **VC++ 2015-2022 x64 runtime** is missing and the redist is bundled
    (see below), installs it silently.
@@ -100,11 +100,11 @@ recolor or restyle the badge, wordmark, and wizard images.
 
 ## Follow-ups (not done here)
 
-- **Embed the icon in `xps5x.exe`** (via a `build.rs` + `winres`/`embed-resource`)
+- **Embed the icon in `raeen.exe`** (via a `build.rs` + `winres`/`embed-resource`)
   and set the eframe window icon, so the bare exe and the running taskbar show
   the XPS5X mark. Today the branded icon reaches shortcuts and Add/Remove
   Programs via the shipped `xps5x.ico`.
 - **All-users install support**: redirect user-data to `%LocalAppData%\XPS5X`
   so a Program Files install can write config/logs/saves.
-- **Code signing**: sign `Setup.exe` and `xps5x.exe` to drop the SmartScreen
+- **Code signing**: sign `Setup.exe` and `raeen.exe` to drop the SmartScreen
   warning. `build.ps1` has an obvious spot to add `signtool` if you get a cert.

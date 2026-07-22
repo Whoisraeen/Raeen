@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 /// GitHub repository releases are pulled from.
-pub const REPO: &str = "Whoisraeen/XPS5X";
+pub const REPO: &str = "Whoisraeen/Raeen";
 
 /// The release asset the updater downloads: the bare executable uploaded by
 /// the release workflow alongside the user-facing zip.

@@ -720,7 +720,7 @@ impl Shell {
             0 => tracing::info!("Rest Mode requested (stub — no-op in SM1)"),
             1 => tracing::info!("Restart requested (stub — no-op in SM1)"),
             2 => {
-                tracing::info!("Turn Off requested — closing XPS5X");
+                tracing::info!("Turn Off requested — closing Raeen");
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             _ => {}

@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "xps5x"
+name = "raeen"
 path = "src/main.rs"
 
 [dependencies]

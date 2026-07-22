@@ -39,14 +39,14 @@ jobs:
       # never has to unpack the installer or the portable archive.
       - name: Stage updater asset (bare exe)
         shell: pwsh
-        run: Copy-Item target/release/xps5x.exe dist/xps5x-windows-x86_64.exe
+        run: Copy-Item target/release/raeen.exe dist/raeen-windows-x86_64.exe
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/XPS5X-${{ steps.ver.outputs.version }}-Setup.exe
-            dist/XPS5X-${{ steps.ver.outputs.version }}-portable-win64.zip
-            dist/xps5x-windows-x86_64.exe
+            dist/Raeen-${{ steps.ver.outputs.version }}-Setup.exe
+            dist/Raeen-${{ steps.ver.outputs.version }}-portable-win64.zip
+            dist/raeen-windows-x86_64.exe
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}

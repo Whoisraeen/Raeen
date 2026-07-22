@@ -370,7 +370,7 @@ pub fn init(level: &str) -> LogGuard {
         .with(ConsoleLayer::new())
         .try_init();
 
-    tracing::info!("XPS5X v{} — PS5 Emulator initialized", crate::VERSION);
+    tracing::info!("Raeen v{} — PS5 Emulator initialized", crate::VERSION);
     LogGuard { _file: None }
 }
 
@@ -431,7 +431,7 @@ pub fn init_with_file(level: &str, log_dir: &Path) -> anyhow::Result<LogGuard> {
     }
 
     tracing::info!(
-        "XPS5X v{} — PS5 Emulator initialized (logging to {}, cap {})",
+        "Raeen v{} — PS5 Emulator initialized (logging to {}, cap {})",
         crate::VERSION,
         log_dir.join(LOG_FILE_NAME).display(),
         if cap == 0 {

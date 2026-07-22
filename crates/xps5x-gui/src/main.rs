@@ -1332,7 +1332,7 @@ fn main() -> anyhow::Result<()> {
 
     info!("╔══════════════════════════════════════════════╗");
     info!(
-        "║          XPS5X — PS5 Emulator v{}        ║",
+        "║          Raeen — PS5 Emulator v{}        ║",
         xps5x_core::VERSION
     );
     info!("║        Cross-Platform Compatibility Layer     ║");
@@ -1402,7 +1402,7 @@ fn main() -> anyhow::Result<()> {
     info!("HLE library registry initialized");
 
     // Launch the GUI.
-    info!("Launching XPS5X GUI...");
+    info!("Launching Raeen GUI...");
 
     // The Shell is a full-screen, PS5-style console experience by default
     // (spec §7): borderless fullscreen, sized by the OS to the active
@@ -1411,7 +1411,7 @@ fn main() -> anyhow::Result<()> {
     // window size only applies when `general.fullscreen = false` opts into
     // a normal desktop window.
     let viewport = egui::ViewportBuilder::default()
-        .with_title("XPS5X")
+        .with_title("Raeen")
         .with_min_inner_size([800.0, 600.0]);
     let viewport = if config.general.fullscreen {
         viewport.with_fullscreen(true).with_decorations(false)
@@ -1429,7 +1429,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     eframe::run_native(
-        "XPS5X",
+        "Raeen",
         native_options,
         Box::new(|cc| {
             // Set dark theme.
@@ -1443,6 +1443,6 @@ fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {}", e))?;
 
-    info!("XPS5X shutting down");
+    info!("Raeen shutting down");
     Ok(())
 }

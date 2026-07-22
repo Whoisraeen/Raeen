@@ -81,7 +81,7 @@ commit if green; its report is authoritative over this doc for those items.
 
 1. Bounded release run: `cargo build --release -p xps5x-gui` then
    `XPS5X_LOG="warn,xps5x_gpu=debug" XPS5X_DUMP_FRAMES=<dir> timeout -s KILL 300
-   ./target/release/xps5x.exe --run-eboot "Games/<title>/<app>/eboot.bin" > run.log 2>&1`
+   ./target/release/raeen.exe --run-eboot "Games/<title>/<app>/eboot.bin" > run.log 2>&1`
 2. Classify the FIRST named blocker by count:
    `grep -oE "next_gen: [a-z_0-9]+: [^\"]{0,60}" run.log | sed 's/at addr.*//' | sort | uniq -c | sort -rn | head`
    plus draw skips, dispatch skips, writeback counts, unimplemented imports.

@@ -476,7 +476,7 @@ impl FirmwareLauncher {
                     let library = library.as_deref().unwrap_or("unknown library");
                     SessionOutcome::Faulted(format!(
                         "Unimplemented import: {} ({library}) — the game called a function \
-                         XPS5X does not provide yet",
+                         Raeen does not provide yet",
                         xps5x_firmware::dynlib::nid_names::describe(nid)
                     ))
                 }
