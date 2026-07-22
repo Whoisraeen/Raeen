@@ -2773,11 +2773,31 @@ impl<'a> Spirv<'a> {
             .filter(|l| !l.is_disabled())
         {
             if !pcs.contains(&label.get_dst()) {
+                // A valid GCN branch ALWAYS targets an instruction boundary, so
+                // a target that isn't one means an instruction *before* it was
+                // decoded with the wrong byte length (a mis-sized decode shifts
+                // every later PC). Name the straddling instruction so the
+                // culprit opcode is visible instead of just the symptom.
+                let dst = label.get_dst();
+                let straddling = instructions
+                    .iter()
+                    .filter(|i| i.pc < dst)
+                    .max_by_key(|i| i.pc);
+                let next_boundary = pcs.range(dst..).next().copied();
                 return Err(not_supported(
                     "Spirv::FindReloopBlocks",
                     format!(
-                        "branch target {:#x} is not an instruction boundary",
-                        label.get_dst()
+                        "branch target {dst:#x} (from branch at {src:#x}) is not an instruction \
+                         boundary — it falls inside the instruction at {straddle}; next boundary \
+                         is {next}. That instruction's decoded length is almost certainly wrong \
+                         (mis-sized decode); check its ISA length.",
+                        src = label.get_src(),
+                        straddle = straddling
+                            .map(|i| format!("{:#x} {:?}/{:?}", i.pc, i.type_, i.format))
+                            .unwrap_or_else(|| "<none>".to_string()),
+                        next = next_boundary
+                            .map(|p| format!("{p:#x}"))
+                            .unwrap_or_else(|| "<end>".to_string()),
                     ),
                 ));
             }

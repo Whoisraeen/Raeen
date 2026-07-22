@@ -2598,3 +2598,32 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   gilrs pad name or "No controller connected"). Remaining from critique:
   hero ambient zoom, bottom-bar auto-fade, switcher option drilling, search
   overlay, logo-lockup typography (segoeuib bold family).
+- ASTRO.BOT RDNA2 MUBUF boundary + scalar-resource shader blockers FIXED
+  (2026-07-22; working tree, no commit; kyty-graphics 398/398, raeen-gpu
+  169/169 library tests):
+  * MUBUF is now kept at its public-ISA fixed 64-bit size in BOTH generation
+    attempts when SOFFSET is `0xff`; the all-ones PS5 form is normalized to
+    zero without consuming a SALU-style literal dword. The original next-gen-
+    only fix left the legacy fallback able to reproduce `branch target 0x1150`
+    inside `BufferStoreDword@0x1148` after a different next-gen failure.
+  * The remaining non-EUD `SLoadDwordx8` was not PC-relative: exact dump
+    `cs_500757800_216.bin` starts `SInstPrefetch; VMovB32; VMovB32;
+    SLoadDwordx8 s[16:23], s[12:13], 0`. Root cause was EUD selection order:
+    the positional, readable s14:s15 candidate won before shader analysis even
+    inspected the explicit readable s12:s13 load base. Scalar-load evidence now
+    wins, snapshots the existing guest resource table at s12:s13, and feeds the
+    existing `bind.extended` runtime path; no descriptor bytes are invented.
+  * Pixel shaders now run the same PC-relative embedded-constant capture already
+    used by VS/CS, so `s_getpc_b64` + `s_load_dwordx8` tables do not fall through
+    to the EUD-only path and refuse a valid non-EUD base.
+  * Remaining non-EUD scalar-load refusals now report PC, source register, EUD
+    base, offset, and the nearby producer chain for the next live variant.
+  * TDD regressions cover fixed-width MUBUF in both generation attempts, the
+    two-readable-pointer precedence case, and an end-to-end PS shader-cache
+    translation. The exact CS dump replays next-gen as 27 instructions and
+    recovers three scalar loads, all through s12. Scoped clippy `-D warnings`,
+    touched-package rustfmt, and `git diff --check` are green. Full raeen-gpu
+    integration testing is blocked by an unrelated host Vulkan debug-utils
+    entry-point abort in `compute_gds`; its deterministic 169-test library suite
+    is green. Live ASTRO frame verification is still required before a visual-
+    correctness claim.

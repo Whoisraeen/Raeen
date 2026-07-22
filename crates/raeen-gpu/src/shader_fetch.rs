@@ -260,6 +260,15 @@ impl ShaderTranslateCache {
                     &mut ps_info,
                 )
                 .map_err(|e| AttemptError::from_analysis("shader_get_input_info_ps", &e))?;
+                // PC-relative scalar constant tables are stage-agnostic. VS
+                // and CS already run this capture; omitting it here left PS
+                // `s_load_dwordx8` instructions to the EUD-only fallback,
+                // which correctly refused their non-EUD base register.
+                kyty_graphics::shader::shader_detect_embedded_constant_loads(
+                    &code,
+                    mem,
+                    &mut ps_info.bind,
+                );
                 // SharpEmu port (see `translate_cs`): default nearest/wrap S#
                 // for a PS that samples with zero captured samplers.
                 kyty_graphics::shader::shader_synthesize_default_sampler(&code, &mut ps_info.bind);
@@ -749,6 +758,74 @@ mod tests {
                     )
                     .expect("fixture PS must translate");
                 assert_eq!(t.spirv[0], 0x0723_0203, "SPIR-V magic");
+            },
+        );
+    }
+
+    /// The embedded-constant pass used to run for VS/CS only. A pixel shader
+    /// using the same `s_getpc_b64` + `s_load_dwordx8` idiom consequently fell
+    /// through to the EUD-only recompiler path and was refused even though its
+    /// source bytes were compile-time readable.
+    #[test]
+    fn guest_ps_captures_pc_relative_sload_constants() {
+        let constants = [
+            0xC0DE_0000,
+            0xC0DE_0001,
+            0xC0DE_0002,
+            0xC0DE_0003,
+            0xC0DE_0004,
+            0xC0DE_0005,
+            0xC0DE_0006,
+            0xC0DE_0007,
+        ];
+        let mut shader = vec![
+            0xBE80_1F00, // s_getpc_b64 s[0:1] (base = shader + 4)
+            0xF40C_0200, // s_load_dwordx8 s[8:15], s[0:1], 0x2c
+            0xFA00_002C, // NULL soffset + 44 bytes => constants at shader + 48
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_02FF, // v_mov_b32 v1, 1.0
+            0x3F80_0000,
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_02FF, // v_mov_b32 v3, 1.0
+            0x3F80_0000,
+            0xF800_180F, // exp mrt0 v0..v3
+            0x0302_0100,
+            S_ENDPGM,
+        ];
+        assert_eq!(shader.len() * 4, 48);
+        shader.extend_from_slice(&constants);
+        shader.resize(CHUNK_DWORDS, 0);
+
+        let addr = shader.as_ptr() as u64;
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        cache.map_shader_metadata(
+            addr,
+            ShaderMappedData {
+                user_data: Some(Default::default()),
+                ..Default::default()
+            },
+        );
+        let mut sh_regs = ShaderRegisters::default();
+        sh_regs.target_output_mode[0] = 9;
+
+        crate::guest_mem::with_test_ranges(
+            &[(addr, std::mem::size_of_val(shader.as_slice()))],
+            || {
+                let translated = cache
+                    .translate_ps(
+                        &ps_regs_at(addr),
+                        &sh_regs,
+                        &ShaderVertexInputInfo::default(),
+                    )
+                    .expect("PC-relative PS scalar load must translate");
+                let captured = translated
+                    .ps_info
+                    .bind
+                    .embedded_constant_loads
+                    .find(4)
+                    .expect("PS path records the load at pc 4");
+                assert_eq!(captured.dwords_num, 8);
+                assert_eq!(&captured.values[..8], &constants);
             },
         );
     }

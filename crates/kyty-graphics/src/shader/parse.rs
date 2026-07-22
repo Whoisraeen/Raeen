@@ -2715,7 +2715,7 @@ fn shader_parse_mubuf(
     pc: u32,
     buffer: &[u32],
     dst: &mut ShaderCode,
-    _next_gen: bool,
+    next_gen: bool,
 ) -> Result<u32, ShaderParseError> {
     const S: &str = "mubuf";
     let b0 = buffer[0];
@@ -2764,7 +2764,7 @@ fn shader_parse_mubuf(
         return Err(feature(S, "tfe == 1", pc));
     }
 
-    let mut size: u32 = 2;
+    let size: u32 = 2;
 
     let mut inst = ShaderInstruction {
         pc,
@@ -2776,9 +2776,23 @@ fn shader_parse_mubuf(
     inst.src[1] = operand_parse(srsrc * 4)?;
     inst.src[2] = operand_parse(soffset)?;
 
+    // MUBUF is a fixed 64-bit encoding: it cannot acquire a third SALU-style
+    // literal dword. The measured PS5 stream uses the all-ones SOFFSET encoding
+    // as its zero/no-extra-word form. Keep that console-specific meaning scoped
+    // to the next-gen path; legacy decoding has no evidence for the value and
+    // must refuse it rather than silently consuming the next instruction or
+    // inventing equivalent semantics.
     if inst.src[2].type_ == O::LiteralConstant {
-        inst.src[2].constant.u = dw(buffer, size, pc)?;
-        size += 1;
+        if !next_gen {
+            return Err(feature(
+                S,
+                "legacy literal soffset in fixed-width MUBUF",
+                pc,
+            ));
+        }
+        inst.src[2].type_ = O::IntegerInlineConstant;
+        inst.src[2].constant.u = 0;
+        inst.src[2].size = 0;
     }
 
     // Fold the immediate offset into a constant soffset (see the note above
@@ -4107,6 +4121,49 @@ mod tests {
         assert_eq!(inst.dst.register_id, 1);
     }
 
+    /// Measured ASTRO.BOT tiled-lighting encoding `0x7c32d4f9`: VOPC op 0x19
+    /// (`v_cmpx_nge_f32`) with `src0 == 0xf9` (SDWA), so the instruction is TWO
+    /// dwords (b0 + the SDWA control dword). A one-dword mis-decode of the
+    /// newly-wired 0x19 arm would shift every later PC and make a valid branch
+    /// target look "not on an instruction boundary" (`Spirv::FindReloopBlocks`).
+    /// The SDWA length comes from the shared `src0 == 249` path, independent of
+    /// the opcode arm — this guards that it stays so.
+    #[test]
+    fn v_cmpx_nge_f32_sdwa_is_two_dwords() {
+        let (code, result) = parse(
+            &[0x7c32_d4f9, 0x0686_8081, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse v_cmpx_nge_f32 SDWA");
+        let insts = code.get_instructions();
+        assert_eq!(insts[0].type_, T::VCmpxNgeF32);
+        assert_eq!(
+            insts.len(),
+            2,
+            "SDWA v_cmpx_nge + s_endpgm = 2 instructions (not 3)"
+        );
+        assert_eq!(insts[1].type_, T::SEndpgm);
+        assert_eq!(insts[1].pc, 8, "v_cmpx_nge SDWA spans 8 bytes (2 dwords)");
+    }
+
+    /// `ds_wrxchg_rtn_b32` is a DS (LDS) instruction, and every DS encoding is a
+    /// fixed 2 dwords — the newly-wired 0x2d arm must not perturb that. A wrong
+    /// length here would likewise desync `FindReloopBlocks` boundaries.
+    #[test]
+    fn ds_wrxchg_rtn_b32_is_two_dwords() {
+        let (code, result) = parse(
+            &[0xD8B4_0510, 0x0200_0100, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse ds_wrxchg_rtn_b32");
+        let insts = code.get_instructions();
+        assert_eq!(insts[0].type_, T::DsWrxchgRtnB32);
+        assert_eq!(insts.len(), 2, "ds_wrxchg + s_endpgm = 2 instructions");
+        assert_eq!(insts[1].pc, 8, "ds_wrxchg spans 8 bytes (2 dwords)");
+    }
+
     // ---- 1. operand_parse table (Kyty: ShaderParse.cpp L32) ----
 
     #[test]
@@ -4518,6 +4575,39 @@ mod tests {
             assert_eq!(inst.format, format, "b0={b0:#010x}");
             assert_eq!(inst.src[0].size, src0_size, "b0={b0:#010x}");
         }
+    }
+
+    /// RDNA2 MUBUF is a fixed 64-bit encoding. ASTRO.BOT emits `0xff` in the
+    /// SOFFSET byte of this store; it is the no-extra-word form, not the SALU
+    /// `src_literal` escape understood by the generic operand decoder. The
+    /// following `s_endpgm` is also the branch target, so consuming it as a
+    /// third dword reproduces the live `target is inside BufferStoreDword`
+    /// relooper failure.
+    #[test]
+    fn next_gen_mubuf_ff_soffset_does_not_consume_branch_target() {
+        let words = [
+            0xBF82_0002, // s_branch +2 -> pc 0xc
+            0xE070_2000, // buffer_store_dword, idxen
+            0xFF01_0400, // soffset=0xff, srsrc=s4, vdata=v4, vaddr=v0
+            S_ENDPGM,    // pc 0xc: branch target / next instruction
+        ];
+        let (code, result) = parse(&words, ShaderType::Compute, true);
+        result.expect("parse fixed-width next-gen MUBUF");
+        let insts = code.get_instructions();
+        assert_eq!(insts.len(), 3);
+        assert_eq!(insts[1].type_, T::BufferStoreDword);
+        assert_eq!(insts[1].format, F::Vdata1VaddrSvSoffsIdxen);
+        assert_eq!(insts[2].type_, T::SEndpgm);
+        assert_eq!(insts[2].pc, 0xc, "MUBUF must span exactly two dwords");
+
+        let (_, legacy) = parse(&words, ShaderType::Compute, false);
+        let legacy = legacy.expect_err("legacy mode must not infer the PS5 0xff meaning");
+        assert!(
+            legacy
+                .to_string()
+                .contains("legacy literal soffset in fixed-width MUBUF"),
+            "unexpected legacy refusal: {legacy}"
+        );
     }
 
     #[test]

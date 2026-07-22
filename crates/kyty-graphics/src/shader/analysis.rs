@@ -2614,12 +2614,12 @@ pub fn shader_parse_attrib(
 /// Data out of guest memory so `shader_parse_usage2` can resolve descriptors
 /// that were spilled past the user-SGPR file.
 ///
-/// The EUD pointer is the sgpr pair immediately AFTER the shader's declared
-/// user SGPRs (`user_sgpr_num`) — measured on ASTRO.BOT compute, where
-/// `declared=14` and `s14:s15` points at descriptor-shaped data. Returns `None`
-/// when there is no EUD, the pair is out of range, the pointer is null, or
-/// guest memory does not back it; every one of those keeps the caller on the
-/// pre-existing "no extended buffer" path rather than inventing descriptors.
+/// Prefer a base pair the shader explicitly uses for `s_load_dwordx*`; only
+/// when no such readable load base exists, try the sgpr pair immediately AFTER
+/// the shader's declared user SGPRs (`user_sgpr_num`). Both shapes are measured
+/// on ASTRO.BOT. Returns `None` when no candidate is backed by guest memory;
+/// callers then keep the pre-existing "no extended buffer" path rather than
+/// inventing descriptors.
 ///
 /// The second element of the returned pair is the register index holding the
 /// EUD pointer pair — the slot where the register file logically hands over
@@ -2657,22 +2657,12 @@ fn read_extended_user_data(
         (src.len() >= size).then(|| src[..size].to_vec())
     };
 
-    // Strategy 1 — the pair immediately AFTER the declared user SGPRs. Measured
-    // on shaders whose `count` EXCEEDS `declared` (e.g. declared=14 count=16:
-    // s14:s15 hold the pointer).
-    if let Ok(base) = usize::try_from(user_sgpr_num) {
-        if base + 1 < UserSgprInfo::SGPRS_MAX {
-            if let Some(buf) = read_at(user_sgpr_pair(user_sgpr, user_sgpr_num)) {
-                return Some((buf, user_sgpr_num));
-            }
-        }
-    }
-
-    // Strategy 2 — scalar-load analysis (resolver increments 1-2). When
-    // `count == declared` there IS no register past the declared file (measured:
-    // cs@0x50053c700 declared=14 count=14), so the pointer must be one the
-    // shader itself loads through: find its `s_load_dwordx*` base pairs and take
-    // the first that addresses readable guest memory of at least `eud_size_dw`.
+    // Strategy 1 — scalar-load analysis (resolver increments 1-2). An explicit
+    // `s_load_dwordx*` through a live-in SGPR pair is stronger evidence than
+    // mere position. This ordering matters when BOTH it and the after-file pair
+    // are readable (ASTRO.BOT cs@0x500757800: declared=14, load through s12,
+    // while s14 is also backed). Take the first load base that addresses guest
+    // memory of at least `eud_size_dw`.
     // CAVEAT: "first readable" is a heuristic — a shader with several scalar
     // loads could pick the wrong one, which shows up as wrong descriptors rather
     // than an error. Narrow it (e.g. by preferring the earliest load, or by
@@ -2697,6 +2687,31 @@ fn read_extended_user_data(
         }
     }
     let loads = find_scalar_load_bases(&code);
+    // Only a live-in base pair is evidence for an EUD pointer supplied in the
+    // dispatch user data. A pair written earlier by the shader (for example by
+    // s_getpc_b64 plus address arithmetic) must not outrank the positional EUD
+    // fallback merely because its stale entry-time SGPR value happens to map.
+    let live_in_bases: Vec<i32> = code
+        .get_instructions()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, inst)| {
+            if !matches!(
+                inst.type_,
+                ShaderInstructionType::SLoadDword
+                    | ShaderInstructionType::SLoadDwordx2
+                    | ShaderInstructionType::SLoadDwordx4
+                    | ShaderInstructionType::SLoadDwordx8
+            ) {
+                return None;
+            }
+            let base = inst.src[0].register_id;
+            let written_before = code.get_instructions()[..index]
+                .iter()
+                .any(|prior| writes_sgpr(prior, base) || writes_sgpr(prior, base + 1));
+            (!written_before).then_some(base)
+        })
+        .collect();
     if trace {
         let detail: Vec<String> = loads
             .iter()
@@ -2721,26 +2736,42 @@ fn read_extended_user_data(
             detail.join(" ")
         );
     }
-    if let Some((buf, base)) = loads.into_iter().find_map(|load| {
-        // The EUD pointer is the BASE PAIR's value: a load's byte offset
-        // selects a descriptor WITHIN the buffer, and the virtual-register
-        // mapping (`sharp at s{base+k}` ⇒ EUD dword k) only holds from the
-        // pair value. Snapshotting at base+offset (the old behavior) shifted
-        // the whole view by the scan-order-first load's offset — measured on
-        // ASTRO.BOT composite CS 0x500665c00, whose first load is `+0x60`:
-        // every sharp peek read 24 dwords high, the sampled T# declared at
-        // EUD dword 0 mis-classed, and its `image_sample_lz` refused as
-        // `dynamic-image-descriptor`. The target address still gates WHICH
-        // base is picked in `find_scalar_load_bases` order; the snapshot
-        // itself must start at the pair.
-        let base = usize::try_from(load.base_register).ok()?;
-        if base + 1 >= UserSgprInfo::SGPRS_MAX {
-            return None;
-        }
-        let ptr = user_sgpr_pair(user_sgpr, load.base_register);
-        Some((read_at(ptr)?, load.base_register))
-    }) {
+    if let Some((buf, base)) = loads
+        .into_iter()
+        .filter(|load| live_in_bases.contains(&load.base_register))
+        .find_map(|load| {
+            // The EUD pointer is the BASE PAIR's value: a load's byte offset
+            // selects a descriptor WITHIN the buffer, and the virtual-register
+            // mapping (`sharp at s{base+k}` ⇒ EUD dword k) only holds from the
+            // pair value. Snapshotting at base+offset (the old behavior) shifted
+            // the whole view by the scan-order-first load's offset — measured on
+            // ASTRO.BOT composite CS 0x500665c00, whose first load is `+0x60`:
+            // every sharp peek read 24 dwords high, the sampled T# declared at
+            // EUD dword 0 mis-classed, and its `image_sample_lz` refused as
+            // `dynamic-image-descriptor`. The target address still gates WHICH
+            // base is picked in `find_scalar_load_bases` order; the snapshot
+            // itself must start at the pair.
+            let base = usize::try_from(load.base_register).ok()?;
+            if base + 1 >= UserSgprInfo::SGPRS_MAX {
+                return None;
+            }
+            let ptr = user_sgpr_pair(user_sgpr, load.base_register);
+            Some((read_at(ptr)?, load.base_register))
+        })
+    {
         return Some((buf, base));
+    }
+
+    // Strategy 2 — the pair immediately AFTER the declared user SGPRs. This
+    // remains the fallback for shaders whose `count` EXCEEDS `declared` but
+    // whose code has no readable scalar-load base (e.g. declared=14 count=16:
+    // s14:s15 hold the pointer).
+    if let Ok(base) = usize::try_from(user_sgpr_num) {
+        if base + 1 < UserSgprInfo::SGPRS_MAX {
+            if let Some(buf) = read_at(user_sgpr_pair(user_sgpr, user_sgpr_num)) {
+                return Some((buf, user_sgpr_num));
+            }
+        }
     }
 
     // Strategy 3 — scan EVERY adjacent SGPR pair (sN lo, sN+1 hi) for a
@@ -5696,6 +5727,106 @@ mod tests {
             "snapshot must start at the base-pair value, not the first load's target"
         );
         assert_eq!(buf[24], 0xBBBB_0018);
+    }
+
+    /// An explicit scalar-load base is stronger evidence than the positional
+    /// pair immediately after the declared user-SGPR file. ASTRO.BOT's live CS
+    /// declares 14 user SGPRs, has readable pointers in both s12:s13 and
+    /// s14:s15, and begins with `s_load_dwordx8 ..., s[12:13], 0`. Selecting
+    /// s14 merely because it is positional leaves that real load outside the
+    /// captured EUD and the recompiler correctly refuses it.
+    #[test]
+    fn eud_explicit_scalar_load_base_beats_readable_positional_pair() {
+        let explicit_base: u64 = 0x4_0032_5000;
+        let positional_base: u64 = 0x4_0042_6000;
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[12] = explicit_base as u32;
+        value[13] = (explicit_base >> 32) as u32;
+        value[14] = positional_base as u32;
+        value[15] = (positional_base >> 32) as u32;
+        let user_sgpr = UserSgprInfo {
+            value,
+            type_: [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX],
+            count: 16,
+        };
+        let user_data = ShaderUserData {
+            direct_resource_offset: vec![],
+            sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+            eud_size_dw: 8,
+            srt_size_dw: 0,
+        };
+        let shader_addr = 0x1000;
+        let mem = TestMem {
+            regions: vec![
+                (
+                    shader_addr,
+                    vec![
+                        0xBFA0_0002, // s_inst_prefetch 2
+                        0x7E10_0280, // v_mov_b32 v8, 0
+                        0x7E12_0280, // v_mov_b32 v9, 0
+                        0xF40C_0406, // s_load_dwordx8 s[16:23], s[12:13], 0
+                        0xFA00_0000,
+                        S_ENDPGM,
+                    ],
+                ),
+                (explicit_base, vec![0xAAAA_0001; 8]),
+                (positional_base, vec![0xBBBB_0002; 8]),
+            ],
+        };
+
+        let (buf, base_dw) =
+            read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true)
+                .expect("one of the two readable EUD candidates must be selected");
+        assert_eq!(base_dw, 12, "the explicit s_load base must win");
+        assert_eq!(buf, vec![0xAAAA_0001; 8]);
+    }
+
+    /// A scalar load through a pair constructed by the shader is not evidence
+    /// that the pair's entry-time user-SGPR value is the EUD pointer. Even when
+    /// that stale value happens to be readable, the positional live-in pointer
+    /// must remain the fallback.
+    #[test]
+    fn eud_pc_relative_load_base_does_not_beat_positional_pair() {
+        let stale_entry_value: u64 = 0x4_0032_5000;
+        let positional_base: u64 = 0x4_0042_6000;
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[0] = stale_entry_value as u32;
+        value[1] = (stale_entry_value >> 32) as u32;
+        value[14] = positional_base as u32;
+        value[15] = (positional_base >> 32) as u32;
+        let user_sgpr = UserSgprInfo {
+            value,
+            type_: [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX],
+            count: 16,
+        };
+        let user_data = ShaderUserData {
+            direct_resource_offset: vec![],
+            sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+            eud_size_dw: 8,
+            srt_size_dw: 0,
+        };
+        let shader_addr = 0x1000;
+        let mem = TestMem {
+            regions: vec![
+                (
+                    shader_addr,
+                    vec![
+                        0xBE80_1F00, // s_getpc_b64 s[0:1]
+                        0xF40C_0200, // s_load_dwordx8 s[8:15], s[0:1], 0
+                        0xFA00_0000,
+                        S_ENDPGM,
+                    ],
+                ),
+                (stale_entry_value, vec![0xAAAA_0001; 8]),
+                (positional_base, vec![0xBBBB_0002; 8]),
+            ],
+        };
+
+        let (buf, base_dw) =
+            read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true)
+                .expect("the positional EUD fallback is readable");
+        assert_eq!(base_dw, 14, "the shader overwrites s0:s1 before loading");
+        assert_eq!(buf, vec![0xBBBB_0002; 8]);
     }
 
     use crate::shader::types::{ShaderConstant, ShaderInstruction, ShaderOperand};

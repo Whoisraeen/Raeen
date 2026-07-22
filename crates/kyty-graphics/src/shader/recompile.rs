@@ -1536,13 +1536,14 @@ fn recompile_sload_dwordx2(
         return Err(not_supported(FUNC, "extended path with gs_prolog shift"));
     }
 
-    sload_dword_extended(index, &inst, dst_source, spirv, 2, FUNC)
+    sload_dword_extended(index, code, &inst, dst_source, spirv, 2, FUNC)
 }
 
 /// Common extended (EUD) V#-from-push-constants path of
 /// `Recompile_SLoadDwordx4/x8` (ShaderSpirv.cpp L4325-4369 / L4388-4432).
 fn sload_dword_extended(
     index: u32,
+    code: &ShaderCode,
     inst: &ShaderInstruction,
     dst_source: &mut String,
     spirv: &Spirv<'_>,
@@ -1593,7 +1594,31 @@ fn sload_dword_extended(
         return Err(not_supported(func, "src1 is not a constant offset"));
     }
     if inst.src[0].register_id != bind_info.extended.start_register {
-        return Err(not_supported(func, "src0 is not the EUD base register"));
+        let prior = code
+            .get_instructions()
+            .iter()
+            .filter(|candidate| candidate.pc < inst.pc)
+            .rev()
+            .take(6)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|candidate| format!("{:#x}:{:?}", candidate.pc, candidate.type_))
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        let offset = format!("{:#x}", inst.src[1].constant.u);
+        return Err(not_supported(
+            func,
+            format!(
+                "src0 is not the EUD base register: pc={:#x} src0=s{} eud_base=s{} \
+                 offset={} nearby_producers=[{}]",
+                inst.pc,
+                inst.src[0].register_id,
+                bind_info.extended.start_register,
+                offset,
+                if prior.is_empty() { "<none>" } else { &prior },
+            ),
+        ));
     }
     if inst.src[1].constant.i() < 0 {
         // A sign-extended imm21 can be negative; nothing below the EUD base
@@ -1705,7 +1730,7 @@ fn recompile_sload_dwordx4(
         return Err(not_supported(FUNC, "extended path with gs_prolog shift"));
     }
 
-    sload_dword_extended(index, &inst, dst_source, spirv, 4, FUNC)
+    sload_dword_extended(index, code, &inst, dst_source, spirv, 4, FUNC)
 }
 
 /// Kyty: `Recompile_SLoadDwordx8_Sdst8SbaseSoffset` (ShaderSpirv.cpp L4374).
@@ -1741,7 +1766,7 @@ fn recompile_sload_dwordx8(
         return Err(not_supported(FUNC, "extended path with gs_prolog shift"));
     }
 
-    sload_dword_extended(index, &inst, dst_source, spirv, 8, FUNC)
+    sload_dword_extended(index, code, &inst, dst_source, spirv, 8, FUNC)
 }
 
 /// Kyty: `Recompile_SMovB32_SVdstSVsrc0` (ShaderSpirv.cpp L4480). Also
@@ -10410,6 +10435,16 @@ mod tests {
             msg.contains("src0 is not the EUD base register"),
             "baseline refusal is the EUD-base gate, got: {msg}"
         );
+        for detail in [
+            "pc=0xc",
+            "src0=s0",
+            "eud_base=s16",
+            "offset=0x0",
+            "SGetpcB64",
+            "SAddU32",
+        ] {
+            assert!(msg.contains(detail), "missing {detail} in: {msg}");
+        }
     }
 
     /// Build the measured Astro Bot pattern: `s_getpc_b64 s[0:1];
@@ -14178,6 +14213,44 @@ mod tests {
         );
         let words = spirv_run(&source).expect("assemble ds_wrxchg_rtn_b32");
         naga_parse_and_validate(&words, "ds_wrxchg_rtn_b32");
+    }
+
+    /// A branch whose target lands mid-instruction is the exact symptom a
+    /// MIS-SIZED decode produces (a wrong instruction length shifts every later
+    /// PC, so a valid branch target stops matching a boundary). The relooper's
+    /// boundary error must name the *straddling* instruction — the mis-sized
+    /// opcode — not just the target, so the culprit is actionable. (Live symptom:
+    /// ASTRO.BOT tiled-lighting `branch target 0x1150 is not an instruction
+    /// boundary`.)
+    #[test]
+    fn reloop_nonboundary_branch_target_names_straddling_instruction() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0xBF82_0001, // s_branch +1 -> target 0x8 (mid the next instruction)
+                0x7E00_02FF, // v_mov_b32 v0, lit  (2 dwords, 0x4..0xc)
+                0x3F80_0000, // literal 1.0
+                0x7E02_0280, // v_mov_b32 v1, 0    (0xc)
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse branch-into-instruction");
+
+        let mut cs = ShaderComputeInputInfo::default();
+        cs.threads_num = [1, 1, 1];
+        let err = spirv_generate_source(&code, None, None, Some(&cs))
+            .expect_err("non-boundary branch target must be refused by the relooper");
+        let msg = format!("{err}");
+        assert!(msg.contains("0x8"), "names the target: {msg}");
+        assert!(
+            msg.contains("0x4") && msg.contains("VMovB32"),
+            "names the straddling (mis-sized) instruction at 0x4: {msg}"
+        );
+        assert!(msg.contains("0xc"), "names the next boundary: {msg}");
     }
 
     /// Round 9 — the whole measured 693-skip bulk: the next-gen SMEM parser
