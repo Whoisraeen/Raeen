@@ -1,0 +1,47 @@
+[package]
+name = "raeen-gui"
+description = "Raeen desktop application — game library browser, settings, and debug tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "raeen"
+path = "src/main.rs"
+
+[dependencies]
+raeen-core = { workspace = true }
+raeen-loader = { workspace = true }
+raeen-kernel = { workspace = true }
+raeen-gpu = { workspace = true }
+raeen-audio = { workspace = true }
+raeen-io = { workspace = true }
+raeen-input = { workspace = true }
+raeen-hle = { workspace = true }
+raeen-firmware = { workspace = true }
+raeen-runtime = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+image = { workspace = true }
+gilrs = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+iced-x86 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+ureq = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Local wall-clock for the Shell's top-bar time (Win32 GetLocalTime) — the
+# workspace dep, no new crates (spec §11).
+windows-sys = { workspace = true }
+
+[dev-dependencies]
+# Parse a compiler-produced `guest.so` (a real nightly-rustc cdylib) in the
+# M1 acceptance test so the synthesized SCE eboot faithfully mirrors its
+# segments, dynamic symbols, and relocations. Workspace-pinned (0.9), same as
+# raeen-firmware.
+goblin = { workspace = true }

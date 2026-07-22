@@ -1,0 +1,2150 @@
+//! HLE libc — Standard C library re-implementation.
+//!
+//! Clean-room re-implementation of the PS5 `libc.sprx` exports. Function
+//! *names* below are factual, standard C API identifiers (not copyrightable);
+//! every implementation is original.
+//!
+//! ## Stub status
+//!
+//! Every HLE call now gets an [`crate::HleContext`] with guest-memory *and*
+//! guest-allocator access, so both buffer functions and the heap family do
+//! real work. `memcpy`, `memset`, `memmove`, and `strlen` do the real
+//! operation below, bounds-checked through [`crate::GuestMemory`]. The heap
+//! family (`malloc`/`calloc`/`realloc`/`free`/`memalign`/`posix_memalign`)
+//! routes through [`crate::GuestAllocator`], backed in production by
+//! `raeen-runtime`'s `GuestArena` — so a guest `malloc` returns a real,
+//! dereferenceable guest address, not a sentinel. The rest (`strcpy`/
+//! `printf`/...) still log the call and return a plausible value — string/
+//! format handling is future work, not blocked on the dispatch signature
+//! anymore.
+
+use crate::{HleContext, HleFunction, HleRegistry};
+use tracing::{debug, warn};
+
+/// Register libc HLE functions.
+pub fn register(registry: &HleRegistry) {
+    register_abi(registry, "malloc", hle_malloc);
+    register_abi(registry, "free", hle_free);
+    register_abi(registry, "calloc", hle_calloc);
+    register_abi(registry, "realloc", hle_realloc);
+    register_abi(registry, "memcpy", hle_memcpy);
+    register_abi(registry, "memset", hle_memset);
+    register_abi(registry, "memmove", hle_memmove);
+    register_abi(registry, "strlen", hle_strlen);
+    register_abi(registry, "strcmp", hle_strcmp);
+    register_abi(registry, "strcpy", hle_strcpy);
+    register_abi(registry, "strncpy", hle_strncpy);
+    // M1 hardening batch (real guest-memory behavior; ported with reference
+    // to SharpEmu's KernelMemoryCompatExports + Kyty libc): the string/buffer
+    // functions crt0 and ordinary homebrew hit constantly.
+    register_abi(registry, "memcmp", hle_memcmp);
+    register_abi(registry, "memchr", hle_memchr);
+    register_abi(registry, "strncmp", hle_strncmp);
+    register_abi(registry, "strnlen", hle_strnlen);
+    register_abi(registry, "strchr", hle_strchr);
+    register_abi(registry, "strrchr", hle_strrchr);
+    register_abi(registry, "strcspn", hle_strcspn);
+    register_abi(registry, "wcslen", hle_wcslen);
+    register_abi(registry, "wcscpy", hle_wcscpy);
+    register_abi(registry, "sincosf", hle_sincosf);
+    register_abi(registry, "vsnprintf", hle_vsnprintf);
+    register_abi(registry, "strtok", hle_strtok);
+    register_abi(registry, "strcat", hle_strcat);
+    register_abi(registry, "strncat", hle_strncat);
+    register_abi(registry, "strstr", hle_strstr);
+    // String → integer parsing (real behavior): arg/config parsing.
+    register_abi(registry, "atoi", hle_atoi);
+    register_abi(registry, "atol", hle_atol);
+    register_abi(registry, "strtol", hle_strtol);
+    register_abi(registry, "strtoul", hle_strtoul);
+    // crt0 / C++ static-init registration: record-and-succeed. Real homebrew
+    // registers atexit/global-dtor callbacks during startup; failing these
+    // aborts init before `main`.
+    register_abi(registry, "atexit", hle_atexit);
+    register_abi(registry, "__cxa_atexit", hle_cxa_atexit);
+    register_abi(registry, "snprintf", hle_snprintf);
+    register_abi(registry, "printf", hle_printf);
+    register_abi(registry, "puts", hle_puts);
+    register_abi(registry, "abort", hle_abort);
+    register_abi(registry, "exit", hle_exit);
+    register_abi(registry, "__stack_chk_fail", hle_stack_chk_fail);
+    // Retail modules also import the stack-protector abort naming libkernel
+    // (same name-hash NID) — the measured Minecraft eboot does.
+    registry.register("libkernel", "__stack_chk_fail", hle_stack_chk_fail);
+    register_abi(registry, "memalign", hle_memalign);
+    register_abi(registry, "posix_memalign", hle_posix_memalign);
+    register_abi(registry, "_init_env", hle_init_env);
+    // C++ function-local static guards (Itanium ABI). Measured: A Plague Tale
+    // Requiem imports `__cxa_guard_acquire` from `libc`; release/abort are its
+    // mandatory partners and are registered with it.
+    register_abi(registry, "__cxa_guard_acquire", hle_cxa_guard_acquire);
+    register_abi(registry, "__cxa_guard_release", hle_cxa_guard_release);
+    register_abi(registry, "__cxa_guard_abort", hle_cxa_guard_abort);
+}
+
+/// In-flight `__cxa_guard_acquire` claims, keyed by guest guard address, with a
+/// condvar so a second guest thread waits for the initializer instead of racing
+/// it. Empty and untouched unless a guest actually uses function-local statics.
+static CXA_GUARDS: std::sync::LazyLock<(
+    std::sync::Mutex<std::collections::HashSet<u64>>,
+    std::sync::Condvar,
+)> = std::sync::LazyLock::new(|| {
+    (
+        std::sync::Mutex::new(std::collections::HashSet::new()),
+        std::sync::Condvar::new(),
+    )
+});
+
+/// How long a waiter re-checks the guard flag before giving up and reporting
+/// "already initialized". Only reached if the owning thread never released,
+/// which a well-formed C++ program cannot do (`release`/`abort` always follow).
+const CXA_GUARD_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// `__cxa_guard_acquire(guard) -> int`: the Itanium C++ ABI entry protecting a
+/// function-local `static`. Returns **1** when this caller must run the
+/// initializer (and now owns the guard), **0** when the object is already
+/// constructed.
+///
+/// The guard object's first byte is the "initialized" flag. Guest threads can
+/// reach the same static concurrently, so the read-check-claim is made atomic
+/// under a host mutex: a thread that finds another already initializing waits
+/// for the flag rather than constructing the object a second time — running a
+/// C++ static constructor twice is exactly the corruption this guard exists to
+/// prevent.
+///
+/// Measured: A Plague Tale Requiem stops its boot on this import.
+fn hle_cxa_guard_acquire(ctx: &HleContext, args: &[u64]) -> u64 {
+    let guard = args.first().copied().unwrap_or(0);
+    if guard == 0 {
+        return 0;
+    }
+    let (lock, condvar) = &*CXA_GUARDS;
+    let mut in_progress = lock.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        let mut flag = [0u8; 1];
+        if !ctx.mem.read(guard, &mut flag) {
+            // An unreadable guard cannot be claimed safely; report "done" so the
+            // guest skips construction rather than building into bad memory.
+            return 0;
+        }
+        if flag[0] != 0 {
+            return 0;
+        }
+        if in_progress.insert(guard) {
+            return 1;
+        }
+        // Another guest thread owns this guard: wait for its release/abort.
+        let (guard_set, timeout) = condvar
+            .wait_timeout(in_progress, CXA_GUARD_WAIT_SLICE)
+            .unwrap_or_else(|p| p.into_inner());
+        in_progress = guard_set;
+        if timeout.timed_out() && !in_progress.contains(&guard) {
+            // Owner released while we were not scheduled; loop re-reads the flag.
+            continue;
+        }
+    }
+}
+
+/// `__cxa_guard_release(guard)`: the initializer finished — mark the static
+/// constructed and wake anyone waiting on it.
+fn hle_cxa_guard_release(ctx: &HleContext, args: &[u64]) -> u64 {
+    let guard = args.first().copied().unwrap_or(0);
+    if guard == 0 {
+        return 0;
+    }
+    let (lock, condvar) = &*CXA_GUARDS;
+    let mut in_progress = lock.lock().unwrap_or_else(|p| p.into_inner());
+    let _ = ctx.mem.write(guard, &[1u8]);
+    in_progress.remove(&guard);
+    condvar.notify_all();
+    0
+}
+
+/// `__cxa_guard_abort(guard)`: the initializer threw — release the claim WITHOUT
+/// marking the static constructed, so the next caller retries it.
+fn hle_cxa_guard_abort(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let guard = args.first().copied().unwrap_or(0);
+    if guard == 0 {
+        return 0;
+    }
+    let (lock, condvar) = &*CXA_GUARDS;
+    let mut in_progress = lock.lock().unwrap_or_else(|p| p.into_inner());
+    in_progress.remove(&guard);
+    condvar.notify_all();
+    0
+}
+
+/// `_init_env()`: libc's pre-`main` environment initialiser.
+///
+/// Raeen builds the process environment itself — `build_process_stack` lays out
+/// `argc`/`argv`/`envp`/`auxv` before `_start` — so there is nothing left for
+/// the guest CRT to set up here. Succeeding with zero matches both references:
+/// SharpEmu returns `rax = 0` / OK, and shadPS4 stubs it.
+///
+/// Measured: A Plague Tale Requiem stops its boot on this import.
+fn hle_init_env(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    0
+}
+
+/// The public C ABI is exposed through both the generic libc view used by
+/// homebrew fixtures and the provider name carried by retail PRX imports.
+/// Keeping the alias explicit preserves provider-aware NID collision safety.
+fn register_abi(registry: &HleRegistry, function: &str, implementation: HleFunction) {
+    registry.register("libc", function, implementation);
+    registry.register("libSceLibcInternal", function, implementation);
+}
+
+/// Cap on how far [`hle_strlen`] will scan looking for a NUL terminator, so
+/// a wild/unterminated guest pointer can't spin forever. Arbitrary but
+/// generous.
+const STRLEN_MAX_SCAN: u64 = 1 << 20; // 1 MiB
+
+/// `ENOMEM`-ish errno value [`hle_posix_memalign`] reports on allocation
+/// failure. `posix_memalign` returns an errno value directly (not through
+/// `errno`/`GetLastError`), so any nonzero value the caller can distinguish
+/// from success (`0`) is honest here; `12` is the real `ENOMEM` on both
+/// Linux and the PS5's BSD-derived libc.
+const POSIX_MEMALIGN_ENOMEM: u64 = 12;
+
+/// Real `malloc` allocates `size` bytes (any alignment libc guarantees,
+/// here fixed at 16 bytes — the usual `malloc` minimum) from the guest heap.
+/// Honest OOM: an exhausted/overflowing request returns `0` (`NULL`), never
+/// a sentinel or a panic.
+/// Opt-in heap poison (`RAEEN_POISON_HEAP=1`). Ported in spirit from SharpEmu,
+/// which fills fresh allocations so an uninitialized read surfaces as a
+/// recognizable byte pattern (`0xCDCDCDCD…`) in the crash dump instead of a
+/// silent zero that corrupts millions of ops downstream. Off by default: a
+/// title that (buggily) relies on `malloc` returning zeroed memory keeps
+/// working, and the poison is a deliberate debugging choice, not a behaviour
+/// change. Read once — the env var never changes mid-run.
+fn poison_heap_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RAEEN_POISON_HEAP").is_some())
+}
+
+/// The uninitialized-allocation poison byte (SharpEmu / MSVC debug-CRT `0xCD`).
+const HEAP_ALLOC_POISON: u8 = 0xCD;
+
+fn hle_malloc(ctx: &HleContext, args: &[u64]) -> u64 {
+    let size = args.first().copied().unwrap_or(0);
+    debug!("malloc(size={size:#x})");
+    let addr = ctx.alloc.alloc(size, 16).unwrap_or(0);
+    // Poison the requested span so a read before write is visible. Only the
+    // `size` bytes the caller asked for are touched — exactly what a real
+    // program may read — and never on a failed (0) allocation.
+    if addr != 0 && size != 0 && poison_heap_enabled() {
+        let _ = mem_fill(ctx, addr, HEAP_ALLOC_POISON, size);
+    }
+    addr
+}
+
+/// Real `free` releases a block previously returned by `malloc`/`calloc`/
+/// `realloc`/`memalign`. `free(NULL)` is a defined no-op in the real API, so
+/// a `ptr == 0` is not even forwarded to the allocator.
+fn hle_free(ctx: &HleContext, args: &[u64]) -> u64 {
+    let ptr = args.first().copied().unwrap_or(0);
+    debug!("free(ptr={ptr:#x})");
+    if ptr != 0 {
+        ctx.alloc.free(ptr);
+    }
+    0
+}
+
+/// Real `calloc` allocates `nmemb * size` bytes and zero-fills them. The
+/// multiplication is checked — real `calloc` must report `NULL` on overflow
+/// rather than silently allocating an undersized block — and the block is
+/// zeroed through `ctx.mem` after allocation (the allocator itself makes no
+/// zeroing guarantee).
+fn hle_calloc(ctx: &HleContext, args: &[u64]) -> u64 {
+    let nmemb = args.first().copied().unwrap_or(0);
+    let size = args.get(1).copied().unwrap_or(0);
+    debug!("calloc(nmemb={nmemb}, size={size:#x})");
+
+    let Some(total) = nmemb.checked_mul(size) else {
+        warn!("calloc: nmemb={nmemb} * size={size:#x} overflowed");
+        return 0;
+    };
+    let Some(addr) = ctx.alloc.alloc(total, 16) else {
+        return 0;
+    };
+    if !crate::zero_guest_range(ctx.mem, addr, total) {
+        warn!("calloc: zeroing block at {addr:#x} (len {total:#x}) failed");
+        ctx.alloc.free(addr);
+        return 0;
+    }
+    addr
+}
+
+/// Real `realloc(NULL, size)` behaves exactly like `malloc(size)`; otherwise
+/// resizes the existing block, honest-OOM (`0`) on failure — the original
+/// block is left untouched by [`crate::GuestAllocator::realloc`]'s contract
+/// in that case.
+fn hle_realloc(ctx: &HleContext, args: &[u64]) -> u64 {
+    let ptr = args.first().copied().unwrap_or(0);
+    let size = args.get(1).copied().unwrap_or(0);
+    debug!("realloc(ptr={ptr:#x}, size={size:#x})");
+
+    if ptr == 0 {
+        return ctx.alloc.alloc(size, 16).unwrap_or(0);
+    }
+    ctx.alloc.realloc(ptr, size).unwrap_or(0)
+}
+
+/// Bounded host staging-buffer size for the block memory ops (`memcpy`,
+/// `memmove`, `memset`). They act on a guest-controlled length `n`; staging
+/// the transfer in fixed-size chunks — rather than one `vec![0u8; n]` — keeps
+/// host memory use `O(MEM_OP_CHUNK)` regardless of `n`. Otherwise, since
+/// `usize == u64` on this target, `usize::try_from(n)` always succeeds and a
+/// guest passing e.g. `n = 0x0000_FFFF_FFFF_FFFF` would make the host attempt
+/// a ~256 TiB allocation, aborting the process via `handle_alloc_error`
+/// before any bounds check runs. Bytes still only move where `ctx.mem`
+/// permits; an out-of-bounds chunk stops the transfer (a partial move may
+/// have occurred, as with a bad pointer in C — but never a panic, abort, or
+/// OOB host access).
+const MEM_OP_CHUNK: usize = 16 * 1024;
+
+/// Copy `n` guest bytes `src`→`dst` low-address-first, in [`MEM_OP_CHUNK`]
+/// chunks through `ctx.mem`. Correct for non-overlapping ranges and for
+/// overlaps where `dst <= src`. Returns `false` on the first out-of-bounds or
+/// address-overflowing chunk.
+fn mem_copy_forward(ctx: &HleContext, dst: u64, src: u64, n: u64) -> bool {
+    let mut buf = [0u8; MEM_OP_CHUNK];
+    let mut done: u64 = 0;
+    while done < n {
+        let chunk = (n - done).min(MEM_OP_CHUNK as u64) as usize;
+        let (Some(s), Some(d)) = (src.checked_add(done), dst.checked_add(done)) else {
+            return false;
+        };
+        if !ctx.mem.read(s, &mut buf[..chunk]) || !ctx.mem.write(d, &buf[..chunk]) {
+            return false;
+        }
+        done += chunk as u64;
+    }
+    true
+}
+
+/// Copy `n` guest bytes `src`→`dst` high-address-first, in [`MEM_OP_CHUNK`]
+/// chunks through `ctx.mem` — the overlap-safe direction when `dst > src`.
+/// Returns `false` on the first out-of-bounds or address-overflowing chunk.
+fn mem_copy_backward(ctx: &HleContext, dst: u64, src: u64, n: u64) -> bool {
+    let mut buf = [0u8; MEM_OP_CHUNK];
+    let mut remaining = n;
+    while remaining > 0 {
+        let chunk = remaining.min(MEM_OP_CHUNK as u64);
+        let off = remaining - chunk;
+        let (Some(s), Some(d)) = (src.checked_add(off), dst.checked_add(off)) else {
+            return false;
+        };
+        let chunk = chunk as usize;
+        if !ctx.mem.read(s, &mut buf[..chunk]) || !ctx.mem.write(d, &buf[..chunk]) {
+            return false;
+        }
+        remaining = off;
+    }
+    true
+}
+
+/// Fill `n` guest bytes at `dst` with `value`, in [`MEM_OP_CHUNK`] chunks
+/// through `ctx.mem`. Returns `false` on the first out-of-bounds or
+/// address-overflowing chunk.
+fn mem_fill(ctx: &HleContext, dst: u64, value: u8, n: u64) -> bool {
+    let buf = [value; MEM_OP_CHUNK];
+    let mut done: u64 = 0;
+    while done < n {
+        let chunk = (n - done).min(MEM_OP_CHUNK as u64) as usize;
+        let Some(d) = dst.checked_add(done) else {
+            return false;
+        };
+        if !ctx.mem.write(d, &buf[..chunk]) {
+            return false;
+        }
+        done += chunk as u64;
+    }
+    true
+}
+
+/// Real `memcpy` returns `dst` unchanged. Copies `n` bytes `src`→`dst`
+/// through `ctx.mem` in bounded chunks (see [`MEM_OP_CHUNK`]) — a huge
+/// guest-controlled `n` never triggers a giant host allocation. Out of bounds
+/// on either side stops the copy and returns `dst` (never a panic or OOB host
+/// access).
+fn hle_memcpy(ctx: &HleContext, args: &[u64]) -> u64 {
+    let dst = args.first().copied().unwrap_or(0);
+    let src = args.get(1).copied().unwrap_or(0);
+    let n = args.get(2).copied().unwrap_or(0);
+    debug!("memcpy(dst={dst:#x}, src={src:#x}, n={n:#x})");
+    if !mem_copy_forward(ctx, dst, src, n) {
+        warn!("memcpy: out of bounds (dst={dst:#x}, src={src:#x}, n={n:#x})");
+    }
+    dst
+}
+
+/// Real `memset` returns `dst` unchanged. Fills `n` bytes at `dst` with `c`
+/// through `ctx.mem` in bounded chunks (see [`MEM_OP_CHUNK`]).
+fn hle_memset(ctx: &HleContext, args: &[u64]) -> u64 {
+    let dst = args.first().copied().unwrap_or(0);
+    let value = args.get(1).copied().unwrap_or(0) as u8;
+    let n = args.get(2).copied().unwrap_or(0);
+    debug!("memset(s={dst:#x}, c={value}, n={n:#x})");
+    if !mem_fill(ctx, dst, value, n) {
+        warn!("memset: dst {dst:#x} (len {n:#x}) out of bounds");
+    }
+    dst
+}
+
+/// Real `memmove` returns `dst` unchanged. Moves `n` bytes `src`→`dst`
+/// through `ctx.mem` in bounded chunks, choosing copy direction from the
+/// `dst`/`src` order so overlapping ranges are handled correctly (forward when
+/// `dst <= src`, backward when `dst > src`) — a real `memmove`, not a `memcpy`
+/// alias, and with the same huge-`n` safety (see [`MEM_OP_CHUNK`]) as the
+/// others.
+fn hle_memmove(ctx: &HleContext, args: &[u64]) -> u64 {
+    let dst = args.first().copied().unwrap_or(0);
+    let src = args.get(1).copied().unwrap_or(0);
+    let n = args.get(2).copied().unwrap_or(0);
+    debug!("memmove(dst={dst:#x}, src={src:#x}, n={n:#x})");
+    let ok = if dst <= src {
+        mem_copy_forward(ctx, dst, src, n)
+    } else {
+        mem_copy_backward(ctx, dst, src, n)
+    };
+    if !ok {
+        warn!("memmove: out of bounds (dst={dst:#x}, src={src:#x}, n={n:#x})");
+    }
+    dst
+}
+
+/// Walks `ctx.mem` from `s` counting bytes until a NUL terminator or
+/// [`STRLEN_MAX_SCAN`] bytes have been scanned (guarding against a
+/// wild/unterminated pointer spinning forever). Returns the length found so
+/// far if the scan runs off the end of mapped memory or hits the cap.
+fn hle_strlen(ctx: &HleContext, args: &[u64]) -> u64 {
+    let s = args.first().copied().unwrap_or(0);
+    debug!("strlen(s={s:#x})");
+
+    let mut len: u64 = 0;
+    let mut byte = [0u8; 1];
+    while len < STRLEN_MAX_SCAN {
+        let Some(addr) = s.checked_add(len) else {
+            warn!("strlen: s {s:#x} + len {len} overflowed");
+            break;
+        };
+        if !ctx.mem.read(addr, &mut byte) {
+            warn!("strlen: s {s:#x} out of bounds after {len} bytes");
+            break;
+        }
+        if byte[0] == 0 {
+            break;
+        }
+        len += 1;
+    }
+    len
+}
+
+/// Real `strcmp` (M1-C): reads both (bounded) guest strings and compares
+/// them as unsigned bytes, returning the sign of the first difference as a
+/// sign-extended-to-u64 `int`. An unreadable pointer logs and reports
+/// "equal" — the least-surprising degradation for a comparison with no
+/// error channel (the pre-M1-C stub did the same unconditionally).
+fn hle_strcmp(ctx: &HleContext, args: &[u64]) -> u64 {
+    let s1_ptr = args.first().copied().unwrap_or(0);
+    let s2_ptr = args.get(1).copied().unwrap_or(0);
+    debug!("strcmp(s1={s1_ptr:#x}, s2={s2_ptr:#x})");
+
+    let (Some(s1), Some(s2)) = (
+        crate::fmt::read_cstr(ctx.mem, s1_ptr),
+        crate::fmt::read_cstr(ctx.mem, s2_ptr),
+    ) else {
+        warn!("strcmp: unreadable string pointer (s1={s1_ptr:#x}, s2={s2_ptr:#x})");
+        return 0;
+    };
+    match s1.cmp(&s2) {
+        std::cmp::Ordering::Less => (-1i32) as u32 as u64,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// Real `strcpy`: reads the (bounded, see `fmt::read_cstr`) NUL-terminated
+/// source string from guest memory and writes it — including the NUL — to
+/// `dst`. An unreadable source or a failed destination write logs and
+/// leaves the destination as-is; the return value is `dst` either way (the
+/// real API's return value carries no error channel).
+fn hle_strcpy(ctx: &HleContext, args: &[u64]) -> u64 {
+    let dst = args.first().copied().unwrap_or(0);
+    let src = args.get(1).copied().unwrap_or(0);
+    debug!("strcpy(dst={dst:#x}, src={src:#x})");
+
+    let Some(mut bytes) = crate::fmt::read_cstr(ctx.mem, src) else {
+        warn!("strcpy: unreadable source string at {src:#x}");
+        return dst;
+    };
+    bytes.push(0);
+    if !ctx.mem.write(dst, &bytes) {
+        warn!(
+            "strcpy: failed to write {} bytes to dst={dst:#x}",
+            bytes.len()
+        );
+    }
+    dst
+}
+
+/// Real `strncpy`: copies at most `n` source bytes and, per the (infamous)
+/// real contract, zero-fills the remainder of the `n`-byte destination if
+/// the source is shorter — and does *not* NUL-terminate if the source is
+/// `n` bytes or longer.
+fn hle_strncpy(ctx: &HleContext, args: &[u64]) -> u64 {
+    let dst = args.first().copied().unwrap_or(0);
+    let src = args.get(1).copied().unwrap_or(0);
+    let n = args.get(2).copied().unwrap_or(0);
+    debug!("strncpy(dst={dst:#x}, src={src:#x}, n={n:#x})");
+
+    if n > crate::MAX_HLE_BULK_BYTES {
+        warn!("strncpy: n={n:#x} exceeds the bounded HLE bulk-operation limit");
+        return dst;
+    }
+    let Some(bytes) = crate::fmt::read_cstr(ctx.mem, src) else {
+        warn!("strncpy: unreadable source string at {src:#x}");
+        return dst;
+    };
+    let Some(range) = crate::GuestRange::new(crate::GuestAddress::new(dst), n) else {
+        warn!("strncpy: destination range overflows");
+        return dst;
+    };
+    if crate::ValidatedGuestRange::validate(ctx.mem, range, crate::GuestAccess::Write).is_none() {
+        warn!("strncpy: destination range is not writable");
+        return dst;
+    }
+    let copy_len = bytes.len().min(n as usize);
+    if copy_len > 0 && !ctx.mem.write(dst, &bytes[..copy_len]) {
+        warn!("strncpy: failed to write source bytes to dst={dst:#x}");
+        return dst;
+    }
+    let zero_len = n - copy_len as u64;
+    if zero_len > 0 && !crate::zero_guest_range(ctx.mem, dst + copy_len as u64, zero_len) {
+        warn!("strncpy: failed to zero-fill destination at dst={dst:#x}");
+    }
+    dst
+}
+
+/// Cap on how many bytes a single comparison/scan reads out of guest memory,
+/// so a wild `n` can't balloon a host buffer. Matches `STRLEN_MAX_SCAN`'s
+/// rationale (both are 1 MiB).
+const CMP_MAX_BYTES: u64 = 1 << 20;
+
+/// Read `n` guest bytes at `addr` (capped by [`CMP_MAX_BYTES`]) into an owned
+/// buffer, or `None` if the range isn't fully readable. Used by the compare/
+/// scan functions below, which need a concrete byte window rather than a
+/// NUL-terminated string.
+fn read_guest_bytes(ctx: &HleContext, addr: u64, n: u64) -> Option<Vec<u8>> {
+    let capped = n.min(CMP_MAX_BYTES);
+    if capped < n {
+        // Truncating a comparison/scan over *valid* memory yields a wrong
+        // answer (a false "equal" / "not found" past the cap), so warn —
+        // matching `read_cstr`'s own truncation warning — rather than
+        // silently returning a partial result.
+        warn!("read_guest_bytes: {n:#x} bytes at {addr:#x} capped to {capped:#x} (CMP_MAX_BYTES)");
+    }
+    let len = usize::try_from(capped).ok()?;
+    let mut buf = vec![0u8; len];
+    if len == 0 {
+        return Some(buf);
+    }
+    if ctx.mem.read(addr, &mut buf) {
+        Some(buf)
+    } else {
+        None
+    }
+}
+
+/// Real `memcmp(a, b, n)`: reads `n` bytes from each pointer and returns the
+/// sign of the first differing byte pair (unsigned), `0` if equal. An
+/// unreadable range logs and reports `0` (equal) — the least-surprising
+/// degradation for a comparison with no error channel.
+fn hle_memcmp(ctx: &HleContext, args: &[u64]) -> u64 {
+    let a = args.first().copied().unwrap_or(0);
+    let b = args.get(1).copied().unwrap_or(0);
+    let n = args.get(2).copied().unwrap_or(0);
+    debug!("memcmp(a={a:#x}, b={b:#x}, n={n:#x})");
+
+    let (Some(ba), Some(bb)) = (read_guest_bytes(ctx, a, n), read_guest_bytes(ctx, b, n)) else {
+        warn!("memcmp: unreadable range (a={a:#x}, b={b:#x}, n={n:#x})");
+        return 0;
+    };
+    for (x, y) in ba.iter().zip(bb.iter()) {
+        if x != y {
+            return if x < y { (-1i32) as u32 as u64 } else { 1 };
+        }
+    }
+    0
+}
+
+/// Real `memchr(s, c, n)`: returns the guest address of the first byte equal
+/// to `c` (low 8 bits) within the first `n` bytes of `s`, or `0` (`NULL`) if
+/// not found or the range is unreadable.
+fn hle_memchr(ctx: &HleContext, args: &[u64]) -> u64 {
+    let s = args.first().copied().unwrap_or(0);
+    let c = (args.get(1).copied().unwrap_or(0) & 0xFF) as u8;
+    let n = args.get(2).copied().unwrap_or(0);
+    debug!("memchr(s={s:#x}, c={c:#x}, n={n:#x})");
+
+    let Some(bytes) = read_guest_bytes(ctx, s, n) else {
+        warn!("memchr: unreadable range (s={s:#x}, n={n:#x})");
+        return 0;
+    };
+    match bytes.iter().position(|&b| b == c) {
+        Some(off) => s.wrapping_add(off as u64),
+        None => 0,
+    }
+}
+
+/// Real `strncmp(a, b, n)`: compares up to `n` bytes of the two guest
+/// strings, stopping at the first NUL, unsigned. Unreadable pointer → `0`.
+fn hle_strncmp(ctx: &HleContext, args: &[u64]) -> u64 {
+    let a = args.first().copied().unwrap_or(0);
+    let b = args.get(1).copied().unwrap_or(0);
+    let n = args.get(2).copied().unwrap_or(0);
+    debug!("strncmp(a={a:#x}, b={b:#x}, n={n:#x})");
+
+    let (Some(sa), Some(sb)) = (
+        crate::fmt::read_cstr(ctx.mem, a),
+        crate::fmt::read_cstr(ctx.mem, b),
+    ) else {
+        warn!("strncmp: unreadable string (a={a:#x}, b={b:#x})");
+        return 0;
+    };
+    let limit = usize::try_from(n).unwrap_or(usize::MAX);
+    let ta = &sa[..sa.len().min(limit)];
+    let tb = &sb[..sb.len().min(limit)];
+    match ta.cmp(tb) {
+        std::cmp::Ordering::Less => (-1i32) as u32 as u64,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// Real `strnlen(s, maxlen)`: length of the guest string, capped at `maxlen`
+/// (and at `read_cstr`'s own 1 MiB scan bound). Unreadable → `0`.
+fn hle_strnlen(ctx: &HleContext, args: &[u64]) -> u64 {
+    let s = args.first().copied().unwrap_or(0);
+    let maxlen = args.get(1).copied().unwrap_or(0);
+    debug!("strnlen(s={s:#x}, maxlen={maxlen:#x})");
+
+    // Real `strnlen` examines at most `maxlen` bytes — read exactly that
+    // window (bounded by CMP_MAX_BYTES) rather than scanning the whole
+    // string first, so the read footprint matches the C contract.
+    let window = maxlen.min(CMP_MAX_BYTES);
+    let Some(bytes) = read_guest_bytes(ctx, s, window) else {
+        warn!("strnlen: unreadable window at {s:#x}");
+        return 0;
+    };
+    match bytes.iter().position(|&b| b == 0) {
+        Some(nul) => nul as u64,
+        None => window, // no NUL within maxlen → maxlen (capped)
+    }
+}
+
+/// Real `strchr(s, c)`: guest address of the first byte equal to `c` (low 8
+/// bits) in the string, or `0`. Per the C contract, `c == 0` matches (and
+/// returns the address of) the terminating NUL.
+fn hle_strchr(ctx: &HleContext, args: &[u64]) -> u64 {
+    let s = args.first().copied().unwrap_or(0);
+    let c = (args.get(1).copied().unwrap_or(0) & 0xFF) as u8;
+    debug!("strchr(s={s:#x}, c={c:#x})");
+
+    let Some(bytes) = crate::fmt::read_cstr(ctx.mem, s) else {
+        warn!("strchr: unreadable string at {s:#x}");
+        return 0;
+    };
+    if c == 0 {
+        return s.wrapping_add(bytes.len() as u64); // the NUL terminator
+    }
+    match bytes.iter().position(|&b| b == c) {
+        Some(off) => s.wrapping_add(off as u64),
+        None => 0,
+    }
+}
+
+/// Saved scan position for [`hle_strtok`] — C's `strtok` is stateful across
+/// calls. Classic `strtok` keeps one global cursor (that is exactly why it is
+/// not re-entrant), and this mirrors it rather than inventing per-thread state
+/// the guest would not expect.
+static STRTOK_SAVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Real `strtok(str, delim)`: return the next token in `str`, writing a NUL over
+/// the delimiter that ends it and remembering where to resume.
+///
+/// `str == NULL` continues the previous string, per the C contract. Returns
+/// `NULL` once the string is exhausted. The token is delimited **in guest
+/// memory** — this function genuinely mutates the caller's buffer, as the real
+/// one does.
+///
+/// Measured: A Plague Tale Requiem stops its boot on this import.
+fn hle_strtok(ctx: &HleContext, args: &[u64]) -> u64 {
+    use std::sync::atomic::Ordering;
+
+    let s = args.first().copied().unwrap_or(0);
+    let delim_ptr = args.get(1).copied().unwrap_or(0);
+    debug!("strtok(str={s:#x}, delim={delim_ptr:#x})");
+
+    let start = if s != 0 {
+        s
+    } else {
+        STRTOK_SAVE.load(Ordering::Relaxed)
+    };
+    if start == 0 {
+        return 0;
+    }
+    let Some(delims) = crate::fmt::read_cstr(ctx.mem, delim_ptr) else {
+        warn!("strtok: unreadable delimiter set at {delim_ptr:#x}");
+        return 0;
+    };
+
+    let read_byte = |addr: u64| -> Option<u8> {
+        let mut b = [0u8; 1];
+        ctx.mem.read(addr, &mut b).then_some(b[0])
+    };
+
+    // Skip leading delimiters.
+    let mut p = start;
+    let mut scanned = 0u64;
+    let token = loop {
+        if scanned >= STRLEN_MAX_SCAN {
+            STRTOK_SAVE.store(0, Ordering::Relaxed);
+            return 0;
+        }
+        match read_byte(p) {
+            None | Some(0) => {
+                STRTOK_SAVE.store(0, Ordering::Relaxed);
+                return 0;
+            }
+            Some(b) if delims.contains(&b) => {
+                p = p.wrapping_add(1);
+                scanned += 1;
+            }
+            Some(_) => break p,
+        }
+    };
+
+    // Run to the delimiter that ends this token (or the string's end).
+    loop {
+        if scanned >= STRLEN_MAX_SCAN {
+            break;
+        }
+        match read_byte(p) {
+            None | Some(0) => {
+                STRTOK_SAVE.store(0, Ordering::Relaxed);
+                return token;
+            }
+            Some(b) if delims.contains(&b) => {
+                // Terminate the token in place and resume after it.
+                let _ = ctx.mem.write(p, &[0u8]);
+                STRTOK_SAVE.store(p.wrapping_add(1), Ordering::Relaxed);
+                return token;
+            }
+            Some(_) => {
+                p = p.wrapping_add(1);
+                scanned += 1;
+            }
+        }
+    }
+    STRTOK_SAVE.store(0, Ordering::Relaxed);
+    token
+}
+
+/// A SysV `va_list` walked out of guest memory, yielding the integer varargs in
+/// call order so it can drive [`crate::fmt::format_c`] exactly like the
+/// register slice a plain `printf` hands it.
+///
+/// The ABI's `va_list` is a 24-byte object: `gp_offset` (u32), `fp_offset`
+/// (u32), `overflow_arg_area` (ptr), `reg_save_area` (ptr). Integer varargs
+/// come from `reg_save_area + gp_offset` while `gp_offset < 48` (the six GP
+/// registers), and from `overflow_arg_area` — the caller's stack — afterwards.
+///
+/// Like the register-slice path, only *integer* varargs are walked; a `%f`
+/// would need the XMM save area, which no caller has required yet.
+struct GuestVaList<'a> {
+    mem: &'a dyn crate::GuestMemory,
+    gp_offset: u32,
+    overflow_arg_area: u64,
+    reg_save_area: u64,
+}
+
+impl<'a> GuestVaList<'a> {
+    /// Read the `va_list` object at guest address `ap`.
+    fn read(mem: &'a dyn crate::GuestMemory, ap: u64) -> Option<Self> {
+        let mut head = [0u8; 24];
+        if ap == 0 || !mem.read(ap, &mut head) {
+            return None;
+        }
+        Some(Self {
+            mem,
+            gp_offset: u32::from_le_bytes(head[0..4].try_into().ok()?),
+            overflow_arg_area: u64::from_le_bytes(head[8..16].try_into().ok()?),
+            reg_save_area: u64::from_le_bytes(head[16..24].try_into().ok()?),
+        })
+    }
+}
+
+impl Iterator for GuestVaList<'_> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<u64> {
+        /// Six 8-byte GP register slots live at the head of the save area.
+        const GP_SAVE_BYTES: u32 = 48;
+
+        let addr = if self.gp_offset < GP_SAVE_BYTES {
+            let addr = self.reg_save_area.checked_add(u64::from(self.gp_offset))?;
+            self.gp_offset += 8;
+            addr
+        } else {
+            let addr = self.overflow_arg_area;
+            self.overflow_arg_area = addr.checked_add(8)?;
+            addr
+        };
+        let mut word = [0u8; 8];
+        if !self.mem.read(addr, &mut word) {
+            return None;
+        }
+        Some(u64::from_le_bytes(word))
+    }
+}
+
+/// Real `vsnprintf(str, size, format, ap)`: [`hle_snprintf`] with the varargs
+/// taken from a guest `va_list` instead of the caller's registers. Truncation
+/// and the "length that *would* have been written" return value follow the same
+/// C contract.
+///
+/// Measured: A Plague Tale Requiem stops its boot on this import.
+fn hle_vsnprintf(ctx: &HleContext, args: &[u64]) -> u64 {
+    let buf = args.first().copied().unwrap_or(0);
+    let size = args.get(1).copied().unwrap_or(0);
+    let fmt_ptr = args.get(2).copied().unwrap_or(0);
+    let ap = args.get(3).copied().unwrap_or(0);
+    debug!("vsnprintf(buf={buf:#x}, size={size:#x}, fmt={fmt_ptr:#x}, ap={ap:#x})");
+
+    let Some(fmt) = crate::fmt::read_cstr(ctx.mem, fmt_ptr) else {
+        warn!("vsnprintf: unreadable format string at {fmt_ptr:#x}");
+        return 0;
+    };
+    let Some(mut varargs) = GuestVaList::read(ctx.mem, ap) else {
+        warn!("vsnprintf: unreadable va_list at {ap:#x}");
+        return 0;
+    };
+    let formatted = crate::fmt::format_c(&fmt, &mut varargs, ctx.mem);
+    let full_len = formatted.len() as u64;
+
+    if size > 0 {
+        let cap = usize::try_from(size - 1).unwrap_or(usize::MAX);
+        let n = formatted.len().min(cap);
+        let mut out = formatted;
+        out.truncate(n);
+        out.push(0);
+        if !ctx.mem.write(buf, &out) {
+            warn!(
+                "vsnprintf: failed to write {} bytes to buf={buf:#x}",
+                out.len()
+            );
+        }
+    }
+    full_len
+}
+
+/// Real `sincosf(float x, float *sinp, float *cosp)`: write `sin(x)` and
+/// `cos(x)` through the two out-pointers.
+///
+/// `x` arrives in **XMM0**, not in an integer register, so it is read from
+/// [`HleContext::float_arg_f32`]; the two pointers are the first two integer
+/// arguments. Computing this without the real `x` would hand the title silently
+/// wrong trigonometry, so the float-argument channel exists precisely for
+/// functions like this one.
+///
+/// Measured: A Plague Tale Requiem stops its boot on this import.
+fn hle_sincosf(ctx: &HleContext, args: &[u64]) -> u64 {
+    let sin_out = args.first().copied().unwrap_or(0);
+    let cos_out = args.get(1).copied().unwrap_or(0);
+    let x = ctx.float_arg_f32(0);
+    debug!("sincosf(x={x}, sinp={sin_out:#x}, cosp={cos_out:#x})");
+
+    if sin_out != 0 && !ctx.mem.write(sin_out, &x.sin().to_le_bytes()) {
+        warn!("sincosf: sin out-ptr {sin_out:#x} not writable");
+    }
+    if cos_out != 0 && !ctx.mem.write(cos_out, &x.cos().to_le_bytes()) {
+        warn!("sincosf: cos out-ptr {cos_out:#x} not writable");
+    }
+    0
+}
+
+/// Real `wcslen(s)`: number of wide characters before the terminating null.
+///
+/// `wchar_t` is **32-bit** on the PS5's BSD/LLVM ABI (not 16-bit as on
+/// Windows), so this counts 4-byte units. The scan is bounded by
+/// [`STRLEN_MAX_SCAN`] characters, like [`hle_strlen`], so a wild or
+/// unterminated guest pointer cannot spin forever; an unreadable unit ends the
+/// scan and returns the count so far.
+///
+/// Measured: A Plague Tale Requiem stops its boot on this import.
+fn hle_wcslen(ctx: &HleContext, args: &[u64]) -> u64 {
+    let s = args.first().copied().unwrap_or(0);
+    debug!("wcslen(s={s:#x})");
+    if s == 0 {
+        return 0;
+    }
+    let mut count = 0u64;
+    let mut unit = [0u8; 4];
+    while count < STRLEN_MAX_SCAN {
+        let Some(addr) = s.checked_add(count.wrapping_mul(4)) else {
+            break;
+        };
+        if !ctx.mem.read(addr, &mut unit) {
+            warn!("wcslen: unreadable wide char at {addr:#x} (after {count})");
+            break;
+        }
+        if u32::from_le_bytes(unit) == 0 {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
+/// Real `wcscpy(dst, src)`: copy the wide string at `src` — including its
+/// 4-byte null terminator — to `dst`, returning `dst`.
+///
+/// Uses [`hle_wcslen`]'s bounded scan to size the copy, so an unterminated
+/// source cannot run away. Mirrors [`hle_strcpy`]: an unreadable source or
+/// unwritable destination is logged and `dst` is still returned, because the
+/// ABI has no way to report failure.
+///
+/// Measured: A Plague Tale Requiem stops its boot on this import.
+fn hle_wcscpy(ctx: &HleContext, args: &[u64]) -> u64 {
+    let dst = args.first().copied().unwrap_or(0);
+    let src = args.get(1).copied().unwrap_or(0);
+    debug!("wcscpy(dst={dst:#x}, src={src:#x})");
+    if dst == 0 || src == 0 {
+        return dst;
+    }
+
+    // Characters, then bytes including the terminator.
+    let chars = hle_wcslen(ctx, &[src]);
+    let Ok(bytes) = usize::try_from((chars + 1).saturating_mul(4)) else {
+        return dst;
+    };
+    let mut buf = vec![0u8; bytes];
+    if !ctx.mem.read(src, &mut buf) {
+        warn!("wcscpy: unreadable source at {src:#x} ({chars} wide chars)");
+        return dst;
+    }
+    // `wcslen` stops at the terminator, so force it rather than trusting the
+    // trailing unit we just read.
+    buf[bytes - 4..].fill(0);
+    if !ctx.mem.write(dst, &buf) {
+        warn!("wcscpy: failed to write {bytes} bytes to dst={dst:#x}");
+    }
+    dst
+}
+
+/// Real `strcspn(s, reject)`: the length of the initial segment of `s` made up
+/// of bytes **not** in `reject` — i.e. the offset of the first rejected byte,
+/// or the whole length if none match.
+///
+/// An unreadable operand yields `0`, the conservative answer: the caller then
+/// behaves as though `s` was rejected immediately rather than scanning past
+/// memory we could not validate.
+///
+/// Measured: A Plague Tale Requiem stops its boot on this import.
+fn hle_strcspn(ctx: &HleContext, args: &[u64]) -> u64 {
+    let s = args.first().copied().unwrap_or(0);
+    let reject = args.get(1).copied().unwrap_or(0);
+    debug!("strcspn(s={s:#x}, reject={reject:#x})");
+
+    let (Some(bytes), Some(set)) = (
+        crate::fmt::read_cstr(ctx.mem, s),
+        crate::fmt::read_cstr(ctx.mem, reject),
+    ) else {
+        warn!("strcspn: unreadable operand (s={s:#x}, reject={reject:#x})");
+        return 0;
+    };
+    bytes
+        .iter()
+        .position(|byte| set.contains(byte))
+        .unwrap_or(bytes.len()) as u64
+}
+
+/// Real `strrchr(s, c)`: guest address of the *last* byte equal to `c`, or
+/// `0`. `c == 0` matches the terminating NUL.
+fn hle_strrchr(ctx: &HleContext, args: &[u64]) -> u64 {
+    let s = args.first().copied().unwrap_or(0);
+    let c = (args.get(1).copied().unwrap_or(0) & 0xFF) as u8;
+    debug!("strrchr(s={s:#x}, c={c:#x})");
+
+    let Some(bytes) = crate::fmt::read_cstr(ctx.mem, s) else {
+        warn!("strrchr: unreadable string at {s:#x}");
+        return 0;
+    };
+    if c == 0 {
+        return s.wrapping_add(bytes.len() as u64);
+    }
+    match bytes.iter().rposition(|&b| b == c) {
+        Some(off) => s.wrapping_add(off as u64),
+        None => 0,
+    }
+}
+
+/// Real `strcat(dst, src)`: appends the `src` string to `dst` (writing a new
+/// NUL), returning `dst`. Reads `dst`'s current length, then writes
+/// `src + NUL` at `dst + len`.
+fn hle_strcat(ctx: &HleContext, args: &[u64]) -> u64 {
+    let dst = args.first().copied().unwrap_or(0);
+    let src = args.get(1).copied().unwrap_or(0);
+    debug!("strcat(dst={dst:#x}, src={src:#x})");
+
+    let (Some(dst_bytes), Some(mut src_bytes)) = (
+        crate::fmt::read_cstr(ctx.mem, dst),
+        crate::fmt::read_cstr(ctx.mem, src),
+    ) else {
+        warn!("strcat: unreadable string (dst={dst:#x}, src={src:#x})");
+        return dst;
+    };
+    let append_at = dst.wrapping_add(dst_bytes.len() as u64);
+    src_bytes.push(0);
+    if !ctx.mem.write(append_at, &src_bytes) {
+        warn!(
+            "strcat: failed to append {} bytes at {append_at:#x}",
+            src_bytes.len()
+        );
+    }
+    dst
+}
+
+/// Real `strncat(dst, src, n)`: appends at most `n` bytes of `src` to `dst`,
+/// always writing a terminating NUL after them.
+fn hle_strncat(ctx: &HleContext, args: &[u64]) -> u64 {
+    let dst = args.first().copied().unwrap_or(0);
+    let src = args.get(1).copied().unwrap_or(0);
+    let n = args.get(2).copied().unwrap_or(0);
+    debug!("strncat(dst={dst:#x}, src={src:#x}, n={n:#x})");
+
+    let (Some(dst_bytes), Some(src_bytes)) = (
+        crate::fmt::read_cstr(ctx.mem, dst),
+        crate::fmt::read_cstr(ctx.mem, src),
+    ) else {
+        warn!("strncat: unreadable string (dst={dst:#x}, src={src:#x})");
+        return dst;
+    };
+    let take = usize::try_from(n)
+        .unwrap_or(usize::MAX)
+        .min(src_bytes.len());
+    let mut out = src_bytes[..take].to_vec();
+    out.push(0);
+    let append_at = dst.wrapping_add(dst_bytes.len() as u64);
+    if !ctx.mem.write(append_at, &out) {
+        warn!(
+            "strncat: failed to append {} bytes at {append_at:#x}",
+            out.len()
+        );
+    }
+    dst
+}
+
+/// Real `strstr(haystack, needle)`: guest address of the first occurrence of
+/// `needle` in `haystack`, or `0`. An empty needle returns `haystack` (the C
+/// contract).
+fn hle_strstr(ctx: &HleContext, args: &[u64]) -> u64 {
+    let haystack = args.first().copied().unwrap_or(0);
+    let needle = args.get(1).copied().unwrap_or(0);
+    debug!("strstr(haystack={haystack:#x}, needle={needle:#x})");
+
+    let (Some(hay), Some(ndl)) = (
+        crate::fmt::read_cstr(ctx.mem, haystack),
+        crate::fmt::read_cstr(ctx.mem, needle),
+    ) else {
+        warn!("strstr: unreadable string (haystack={haystack:#x}, needle={needle:#x})");
+        return 0;
+    };
+    if ndl.is_empty() {
+        return haystack;
+    }
+    // `memchr::memmem::find` is linear (Two-Way + SIMD prefilter), so a
+    // hostile "aaaa…" haystack + "aaaa…b" needle can't force the O(n·m)
+    // blowup a naive `windows().position()` scan would (both inputs are
+    // guest-controlled, each up to 1 MiB from `read_cstr`).
+    match memchr::memmem::find(&hay, &ndl) {
+        Some(off) => haystack.wrapping_add(off as u64),
+        None => 0,
+    }
+}
+
+/// Parse a C integer out of a guest string per `strtol`/`strtoul` rules:
+/// skip leading ASCII whitespace, optional `+`/`-` sign, then digits in
+/// `base` (base 0 auto-detects `0x`/`0X` → 16, leading `0` → 8, else 10).
+/// Returns `(value_as_i128, bytes_consumed_from_string_start)`; the caller
+/// clamps/casts the value and computes the `endptr`. Stops at the first
+/// non-convertible character (the real API's behavior). Overflow saturates.
+fn parse_c_integer(s: &[u8], mut base: u32) -> (i128, usize) {
+    let mut i = 0usize;
+    while i < s.len() && s[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let mut negative = false;
+    if i < s.len() && (s[i] == b'+' || s[i] == b'-') {
+        negative = s[i] == b'-';
+        i += 1;
+    }
+    // Base auto-detection / `0x` prefix consumption.
+    if (base == 0 || base == 16)
+        && i + 1 < s.len()
+        && s[i] == b'0'
+        && (s[i + 1] == b'x' || s[i + 1] == b'X')
+        && s.get(i + 2).is_some_and(|c| c.is_ascii_hexdigit())
+    {
+        base = 16;
+        i += 2;
+    } else if base == 0 && i < s.len() && s[i] == b'0' {
+        base = 8;
+    } else if base == 0 {
+        base = 10;
+    }
+
+    let mut value: i128 = 0;
+    let mut any = false;
+    while i < s.len() {
+        let Some(digit) = (s[i] as char).to_digit(base) else {
+            break;
+        };
+        any = true;
+        value = value
+            .saturating_mul(base as i128)
+            .saturating_add(digit as i128);
+        i += 1;
+    }
+    if !any {
+        return (0, i); // no digits converted → 0, endptr at the sign/start
+    }
+    (if negative { -value } else { value }, i)
+}
+
+/// Real `atoi(nptr)`: `strtol(nptr, NULL, 10)` truncated to a 32-bit `int`.
+fn hle_atoi(ctx: &HleContext, args: &[u64]) -> u64 {
+    let nptr = args.first().copied().unwrap_or(0);
+    debug!("atoi(nptr={nptr:#x})");
+    let Some(bytes) = crate::fmt::read_cstr(ctx.mem, nptr) else {
+        warn!("atoi: unreadable string at {nptr:#x}");
+        return 0;
+    };
+    let (v, _) = parse_c_integer(&bytes, 10);
+    (v as i32) as u32 as u64
+}
+
+/// Real `atol(nptr)`: `strtol(nptr, NULL, 10)` as a 64-bit `long`.
+fn hle_atol(ctx: &HleContext, args: &[u64]) -> u64 {
+    let nptr = args.first().copied().unwrap_or(0);
+    debug!("atol(nptr={nptr:#x})");
+    let Some(bytes) = crate::fmt::read_cstr(ctx.mem, nptr) else {
+        warn!("atol: unreadable string at {nptr:#x}");
+        return 0;
+    };
+    let (v, _) = parse_c_integer(&bytes, 10);
+    (v as i64) as u64
+}
+
+/// Real `strtol(nptr, endptr, base)`: parse a `long`, and if `endptr != NULL`
+/// write the guest address of the first unconverted character through it.
+/// Value saturates to the `long` range on overflow (approximating the real
+/// `LONG_MIN`/`LONG_MAX` + `ERANGE` clamp, without the `errno` write).
+fn hle_strtol(ctx: &HleContext, args: &[u64]) -> u64 {
+    let nptr = args.first().copied().unwrap_or(0);
+    let endptr = args.get(1).copied().unwrap_or(0);
+    let base = args.get(2).copied().unwrap_or(0) as u32;
+    debug!("strtol(nptr={nptr:#x}, endptr={endptr:#x}, base={base})");
+    strtol_impl(ctx, nptr, endptr, base, false)
+}
+
+/// Real `strtoul(nptr, endptr, base)`: like `strtol` but unsigned. Shared
+/// with `libSceLibcInternal`'s `_Stoul` (the Dinkumware STL's strtoul core,
+/// same `(nptr, endptr, base)` signature) — see `libsce_libc_internal`.
+pub(crate) fn hle_strtoul(ctx: &HleContext, args: &[u64]) -> u64 {
+    let nptr = args.first().copied().unwrap_or(0);
+    let endptr = args.get(1).copied().unwrap_or(0);
+    let base = args.get(2).copied().unwrap_or(0) as u32;
+    debug!("strtoul(nptr={nptr:#x}, endptr={endptr:#x}, base={base})");
+    strtol_impl(ctx, nptr, endptr, base, true)
+}
+
+/// Shared `strtol`/`strtoul` body: parse, write `endptr`, clamp to the
+/// signed or unsigned 64-bit range.
+fn strtol_impl(ctx: &HleContext, nptr: u64, endptr: u64, base: u32, unsigned: bool) -> u64 {
+    if base != 0 && !(2..=36).contains(&base) {
+        warn!("strtol: invalid base {base}");
+        return 0;
+    }
+    let Some(bytes) = crate::fmt::read_cstr(ctx.mem, nptr) else {
+        warn!("strtol: unreadable string at {nptr:#x}");
+        return 0;
+    };
+    let (v, consumed) = parse_c_integer(&bytes, base);
+    if endptr != 0 {
+        let end_addr = nptr.wrapping_add(consumed as u64);
+        if !ctx.mem.write(endptr, &end_addr.to_le_bytes()) {
+            warn!("strtol: failed to write endptr at {endptr:#x}");
+        }
+    }
+    if unsigned {
+        v.clamp(0, u64::MAX as i128) as u64
+    } else {
+        v.clamp(i64::MIN as i128, i64::MAX as i128) as i64 as u64
+    }
+}
+
+/// `atexit(fn)`: record-and-succeed. A real libc runs registered callbacks at
+/// `exit`; Raeen's `exit` HLE ends the process without running them (honest —
+/// no atexit dispatch yet), but the registration itself must *succeed* (`0`)
+/// or crt0/C++ static init aborts before `main`.
+fn hle_atexit(_ctx: &HleContext, args: &[u64]) -> u64 {
+    debug!(
+        "atexit(fn={:#x}) [registered; not dispatched at exit yet]",
+        args.first().copied().unwrap_or(0)
+    );
+    0
+}
+
+/// `__cxa_atexit(fn, arg, dso)`: the C++ ABI variant of `atexit` for global/
+/// static destructors. Same record-and-succeed contract (`0`).
+fn hle_cxa_atexit(_ctx: &HleContext, args: &[u64]) -> u64 {
+    debug!(
+        "__cxa_atexit(fn={:#x}, arg={:#x}, dso={:#x}) [registered; not dispatched at exit yet]",
+        args.first().copied().unwrap_or(0),
+        args.get(1).copied().unwrap_or(0),
+        args.get(2).copied().unwrap_or(0)
+    );
+    0
+}
+
+/// Placeholder: real `snprintf` returns the number of characters that
+/// would've been written; this stub reports `0` since it does no formatting.
+/// Real `snprintf` (M1-C): reads the guest format string, formats it against
+/// the remaining captured registers (at most 3 variadic values — the
+/// register-only dispatch limit, see `fmt.rs`'s module docs), and writes at
+/// most `size - 1` bytes plus a NUL into the guest buffer. Returns the full
+/// would-be length (the real API's truncation-detection contract). `size ==
+/// 0` writes nothing, per the real API.
+fn hle_snprintf(ctx: &HleContext, args: &[u64]) -> u64 {
+    let buf = args.first().copied().unwrap_or(0);
+    let size = args.get(1).copied().unwrap_or(0);
+    let fmt_ptr = args.get(2).copied().unwrap_or(0);
+    debug!("snprintf(buf={buf:#x}, size={size:#x}, fmt={fmt_ptr:#x})");
+
+    let Some(fmt) = crate::fmt::read_cstr(ctx.mem, fmt_ptr) else {
+        warn!("snprintf: unreadable format string at {fmt_ptr:#x}");
+        return 0;
+    };
+    let mut varargs = args.iter().skip(3).copied();
+    let formatted = crate::fmt::format_c(&fmt, &mut varargs, ctx.mem);
+    let full_len = formatted.len() as u64;
+
+    if size > 0 {
+        let cap = usize::try_from(size - 1).unwrap_or(usize::MAX);
+        let n = formatted.len().min(cap);
+        let mut out = formatted;
+        out.truncate(n);
+        out.push(0);
+        if !ctx.mem.write(buf, &out) {
+            warn!(
+                "snprintf: failed to write {} bytes to buf={buf:#x}",
+                out.len()
+            );
+        }
+    }
+    full_len
+}
+
+/// Real `printf` (M1-C): reads the guest format string, formats it against
+/// the remaining captured registers (at most 5 variadic values — the
+/// register-only dispatch limit, see `fmt.rs`'s module docs), and emits the
+/// result to the kernel [`raeen_kernel::Console`] (captured for the Shell /
+/// tests, mirrored to the host log). Returns the number of bytes written,
+/// per the real API.
+fn hle_printf(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fmt_ptr = args.first().copied().unwrap_or(0);
+    debug!("printf(fmt={fmt_ptr:#x})");
+
+    let Some(fmt) = crate::fmt::read_cstr(ctx.mem, fmt_ptr) else {
+        warn!("printf: unreadable format string at {fmt_ptr:#x}");
+        return u64::MAX; // EOF-ish negative return, the real error signal
+    };
+    let mut varargs = args.iter().skip(1).copied();
+    let formatted = crate::fmt::format_c(&fmt, &mut varargs, ctx.mem);
+    ctx.kernel.console.write_bytes(&formatted);
+    formatted.len() as u64
+}
+
+/// Real `puts` (M1-C): reads the guest string and emits it plus the
+/// API-mandated trailing newline to the kernel console. Returns a
+/// nonnegative value on success, `EOF` (-1) on an unreadable pointer.
+fn hle_puts(ctx: &HleContext, args: &[u64]) -> u64 {
+    let s_ptr = args.first().copied().unwrap_or(0);
+    debug!("puts(s={s_ptr:#x})");
+
+    let Some(mut s) = crate::fmt::read_cstr(ctx.mem, s_ptr) else {
+        warn!("puts: unreadable string at {s_ptr:#x}");
+        return u64::MAX; // EOF
+    };
+    s.push(b'\n');
+    let len = s.len() as u64;
+    ctx.kernel.console.write_bytes(&s);
+    len
+}
+
+fn hle_abort(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    // Real `abort` never returns (raises SIGABRT). The stub cannot terminate
+    // the guest process from here, so it just logs and returns.
+    debug!("abort() [stub: does not actually terminate the process]");
+    0
+}
+
+fn hle_exit(_ctx: &HleContext, args: &[u64]) -> u64 {
+    // Real `exit` never returns. Same limitation as `abort` above.
+    debug!(
+        "exit(code={}) [stub: does not actually terminate the process]",
+        args.first().copied().unwrap_or(0)
+    );
+    0
+}
+
+fn hle_stack_chk_fail(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    // Real `__stack_chk_fail` aborts the process on stack-smash detection.
+    // The stub just logs — it cannot terminate the guest process.
+    debug!("__stack_chk_fail() [stub: does not actually terminate the process]");
+    0
+}
+
+/// Real `memalign(alignment, size)` allocates `size` bytes aligned to
+/// `alignment`, honest-OOM (`0`) on failure.
+fn hle_memalign(ctx: &HleContext, args: &[u64]) -> u64 {
+    let alignment = args.first().copied().unwrap_or(0);
+    let size = args.get(1).copied().unwrap_or(0);
+    debug!("memalign(alignment={alignment:#x}, size={size:#x})");
+    ctx.alloc.alloc(size, alignment).unwrap_or(0)
+}
+
+/// Real `posix_memalign(memptr, alignment, size)` allocates `size` bytes
+/// aligned to `alignment` and writes the resulting guest address through
+/// `*memptr` (via `ctx.mem`), returning `0` on success or a nonzero
+/// errno-ish value ([`POSIX_MEMALIGN_ENOMEM`]) on failure — the real
+/// function's return value is an errno, not a pointer or boolean.
+fn hle_posix_memalign(ctx: &HleContext, args: &[u64]) -> u64 {
+    let memptr = args.first().copied().unwrap_or(0);
+    let alignment = args.get(1).copied().unwrap_or(0);
+    let size = args.get(2).copied().unwrap_or(0);
+    debug!("posix_memalign(memptr={memptr:#x}, alignment={alignment:#x}, size={size:#x})");
+
+    let Some(addr) = ctx.alloc.alloc(size, alignment) else {
+        return POSIX_MEMALIGN_ENOMEM;
+    };
+    if !ctx.mem.write(memptr, &addr.to_le_bytes()) {
+        warn!("posix_memalign: failed to write result pointer to memptr={memptr:#x}");
+        ctx.alloc.free(addr);
+        return POSIX_MEMALIGN_ENOMEM;
+    }
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{GuestMemory, test_ctx};
+
+    /// M1-C: `printf` reads the guest format string and `%s` pointee, formats
+    /// against the captured registers, and lands the output in the kernel
+    /// console — the observable-stdout contract.
+    /// Heap poison fills exactly the requested span with `0xCD` so an
+    /// uninitialized read is visible. Exercises the fill mechanism directly
+    /// (the `RAEEN_POISON_HEAP` gate is a cached `OnceLock`, unfriendly to a
+    /// per-test env toggle); poisoning is just `mem_fill(_, 0xCD, size)`.
+    #[test]
+    fn heap_poison_fills_the_requested_span_with_cd() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x100);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let size = 0x20u64;
+        let addr = ctx.alloc.alloc(size, 16).expect("test alloc");
+        assert!(mem_fill(&ctx, addr, HEAP_ALLOC_POISON, size));
+
+        let mut buf = vec![0u8; size as usize];
+        assert!(mem.read(addr, &mut buf));
+        assert!(
+            buf.iter().all(|&b| b == 0xCD),
+            "every poisoned byte reads back 0xCD"
+        );
+        // The byte just past the requested span is untouched (fill is exact).
+        let mut tail = [0u8; 1];
+        assert!(mem.read(addr + size, &mut tail));
+        assert_eq!(tail[0], 0, "poison does not spill past `size`");
+    }
+
+    /// `calloc` still zeroes after the poison change — a regression guard that
+    /// the poison path did not leak into the zero-on-allocate contract.
+    #[test]
+    fn calloc_still_zeroes_the_block() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x100);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let addr = hle_calloc(&ctx, &[4, 8]); // 32 bytes
+        assert_ne!(addr, 0);
+        let mut buf = [0xFFu8; 32];
+        assert!(mem.read(addr, &mut buf));
+        assert!(buf.iter().all(|&b| b == 0), "calloc zeroes its block");
+    }
+
+    #[test]
+    fn printf_formats_guest_strings_into_the_kernel_console() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x100, b"hello %s, %d + %d = %d\n\0"));
+        assert!(mem.write(0x200, b"world\0"));
+
+        let written = hle_printf(&ctx, &[0x100, 0x200, 2, 3, 5]);
+        assert_eq!(kernel.console.contents(), "hello world, 2 + 3 = 5\n");
+        assert_eq!(written, "hello world, 2 + 3 = 5\n".len() as u64);
+    }
+
+    /// `sincosf` takes its input in XMM0, which reaches a handler through
+    /// `HleContext::float_args` rather than the integer slice. `test_ctx` zeroes
+    /// that channel, so `x == 0.0` — which makes the expected results exact
+    /// (`sin 0 = 0`, `cos 0 = 1`) and proves both out-params are written through
+    /// the right pointers, in the right order.
+    #[test]
+    fn sincosf_reads_the_float_channel_and_writes_both_out_params() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        const SIN_OUT: u64 = 0x400;
+        const COS_OUT: u64 = 0x410;
+
+        // Poison both slots so a missing write is visible.
+        assert!(mem.write(SIN_OUT, &0xDEAD_BEEFu32.to_le_bytes()));
+        assert!(mem.write(COS_OUT, &0xDEAD_BEEFu32.to_le_bytes()));
+
+        assert_eq!(
+            ctx.float_arg_f32(0),
+            0.0,
+            "test_ctx zeroes the float channel"
+        );
+        hle_sincosf(&ctx, &[SIN_OUT, COS_OUT]);
+
+        let mut buf = [0u8; 4];
+        assert!(mem.read(SIN_OUT, &mut buf));
+        assert_eq!(f32::from_le_bytes(buf), 0.0, "sin(0) written to arg0");
+        assert!(mem.read(COS_OUT, &mut buf));
+        assert_eq!(f32::from_le_bytes(buf), 1.0, "cos(0) written to arg1");
+
+        // Null out-pointers must not fault.
+        hle_sincosf(&ctx, &[0, 0]);
+    }
+
+    /// The Itanium C++ static-guard contract: the first caller is told to run
+    /// the initializer (1), and once it releases, every later caller is told to
+    /// skip it (0). Getting this backwards double-constructs C++ statics.
+    #[test]
+    fn cxa_guard_runs_a_static_initializer_exactly_once() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        const GUARD: u64 = 0x300;
+
+        assert!(mem.write(GUARD, &[0u8; 8]), "guard starts zeroed");
+        assert_eq!(
+            hle_cxa_guard_acquire(&ctx, &[GUARD]),
+            1,
+            "the first caller must run the initializer"
+        );
+        hle_cxa_guard_release(&ctx, &[GUARD]);
+        assert_eq!(
+            hle_cxa_guard_acquire(&ctx, &[GUARD]),
+            0,
+            "after release the static is constructed; later callers must skip"
+        );
+
+        // An aborted initializer leaves the static unconstructed, so the next
+        // caller must be told to retry it.
+        const RETRY: u64 = 0x320;
+        assert!(mem.write(RETRY, &[0u8; 8]));
+        assert_eq!(hle_cxa_guard_acquire(&ctx, &[RETRY]), 1);
+        hle_cxa_guard_abort(&ctx, &[RETRY]);
+        assert_eq!(
+            hle_cxa_guard_acquire(&ctx, &[RETRY]),
+            1,
+            "an aborted construction must be retried, not skipped"
+        );
+
+        // A null guard is not a crash.
+        assert_eq!(hle_cxa_guard_acquire(&ctx, &[0]), 0);
+    }
+
+    #[test]
+    fn puts_appends_the_mandated_newline() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x100, b"Hello World\0"));
+        let ret = hle_puts(&ctx, &[0x100]);
+        assert_eq!(kernel.console.contents(), "Hello World\n");
+        assert!(ret as i64 >= 0, "puts must return nonnegative on success");
+    }
+
+    #[test]
+    fn puts_with_unreadable_pointer_returns_eof_and_writes_nothing() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x10);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let ret = hle_puts(&ctx, &[0xDEAD_0000]);
+        assert_eq!(ret as i64, -1, "EOF on unreadable pointer");
+        assert!(kernel.console.is_empty());
+    }
+
+    /// M1-C: `snprintf` writes the (truncated, NUL-terminated) result into
+    /// guest memory and returns the full would-be length.
+    #[test]
+    fn snprintf_truncates_nul_terminates_and_returns_full_length() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x100, b"n=%d!\0"));
+        // Full formatted result is "n=1234!" (7 bytes); size 5 keeps 4 + NUL.
+        let ret = hle_snprintf(&ctx, &[0x300, 5, 0x100, 1234]);
+        assert_eq!(ret, 7, "returns the untruncated length");
+        let mut buf = [0u8; 5];
+        assert!(mem.read(0x300, &mut buf));
+        assert_eq!(&buf, b"n=12\0");
+        assert!(
+            kernel.console.is_empty(),
+            "snprintf must not touch the console"
+        );
+    }
+
+    #[test]
+    fn strcmp_strcpy_strncpy_do_real_string_work() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x100, b"abc\0"));
+        assert!(mem.write(0x110, b"abd\0"));
+        assert_eq!(hle_strcmp(&ctx, &[0x100, 0x110]) as u32 as i32, -1);
+        assert_eq!(hle_strcmp(&ctx, &[0x110, 0x100]) as u32 as i32, 1);
+        assert_eq!(hle_strcmp(&ctx, &[0x100, 0x100]), 0);
+
+        assert_eq!(hle_strcpy(&ctx, &[0x200, 0x100]), 0x200);
+        let mut buf = [0u8; 4];
+        assert!(mem.read(0x200, &mut buf));
+        assert_eq!(&buf, b"abc\0");
+
+        // strncpy zero-fills the remainder of an n-byte destination…
+        assert!(mem.write(0x300, &[0xFFu8; 8]));
+        assert_eq!(hle_strncpy(&ctx, &[0x300, 0x100, 6]), 0x300);
+        let mut buf6 = [0u8; 6];
+        assert!(mem.read(0x300, &mut buf6));
+        assert_eq!(&buf6, b"abc\0\0\0");
+        // …and does NOT NUL-terminate when the source fills all n bytes.
+        assert_eq!(hle_strncpy(&ctx, &[0x400, 0x100, 2]), 0x400);
+        let mut buf2 = [0u8; 2];
+        assert!(mem.read(0x400, &mut buf2));
+        assert_eq!(&buf2, b"ab");
+    }
+
+    #[test]
+    fn huge_strncpy_and_calloc_lengths_fail_without_host_allocation() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x800);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert!(mem.write(0x100, b"abc\0"));
+        assert!(mem.write(0x200, &[0xAA; 4]));
+
+        assert_eq!(hle_strncpy(&ctx, &[0x200, 0x100, u64::MAX]), 0x200);
+        let mut unchanged = [0u8; 4];
+        assert!(mem.read(0x200, &mut unchanged));
+        assert_eq!(unchanged, [0xAA; 4]);
+        assert_eq!(hle_calloc(&ctx, &[1, crate::MAX_HLE_BULK_BYTES + 1]), 0);
+    }
+
+    /// M1 hardening batch: the string/buffer functions do real guest-memory
+    /// work — compare, scan, concatenate — not lie.
+    #[test]
+    fn string_and_buffer_batch_do_real_work() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // memcmp / memchr
+        assert!(mem.write(0x100, b"abcd"));
+        assert!(mem.write(0x110, b"abce"));
+        assert_eq!(hle_memcmp(&ctx, &[0x100, 0x110, 4]) as u32 as i32, -1);
+        assert_eq!(
+            hle_memcmp(&ctx, &[0x100, 0x110, 3]),
+            0,
+            "first 3 bytes equal"
+        );
+        assert_eq!(hle_memchr(&ctx, &[0x100, b'c' as u64, 4]), 0x102);
+        assert_eq!(
+            hle_memchr(&ctx, &[0x100, b'z' as u64, 4]),
+            0,
+            "not found → NULL"
+        );
+
+        // strncmp / strnlen
+        assert!(mem.write(0x200, b"hello\0"));
+        assert!(mem.write(0x210, b"help\0"));
+        assert_eq!(hle_strncmp(&ctx, &[0x200, 0x210, 3]), 0, "first 3 equal");
+        assert_eq!(
+            hle_strncmp(&ctx, &[0x200, 0x210, 4]) as u32 as i32,
+            -1,
+            "'l' < 'p'"
+        );
+        assert_eq!(hle_strnlen(&ctx, &[0x200, 100]), 5);
+        assert_eq!(hle_strnlen(&ctx, &[0x200, 3]), 3, "capped at maxlen");
+
+        // strchr / strrchr
+        assert!(mem.write(0x300, b"a/b/c\0"));
+        assert_eq!(hle_strchr(&ctx, &[0x300, b'/' as u64]), 0x301);
+        assert_eq!(hle_strrchr(&ctx, &[0x300, b'/' as u64]), 0x303);
+        assert_eq!(hle_strchr(&ctx, &[0x300, 0]), 0x305, "c==0 matches the NUL");
+        assert_eq!(hle_strchr(&ctx, &[0x300, b'z' as u64]), 0);
+
+        // strstr
+        assert!(mem.write(0x400, b"foobarbaz\0"));
+        assert!(mem.write(0x420, b"bar\0"));
+        assert_eq!(hle_strstr(&ctx, &[0x400, 0x420]), 0x403);
+        assert!(mem.write(0x430, b"\0"));
+        assert_eq!(
+            hle_strstr(&ctx, &[0x400, 0x430]),
+            0x400,
+            "empty needle → haystack"
+        );
+
+        // strcat / strncat
+        assert!(mem.write(0x500, b"foo\0"));
+        assert!(mem.write(0x520, b"bar\0"));
+        assert_eq!(hle_strcat(&ctx, &[0x500, 0x520]), 0x500);
+        let mut buf = [0u8; 7];
+        assert!(mem.read(0x500, &mut buf));
+        assert_eq!(&buf, b"foobar\0");
+
+        assert!(mem.write(0x600, b"x\0"));
+        assert!(mem.write(0x620, b"yzABC\0"));
+        assert_eq!(hle_strncat(&ctx, &[0x600, 0x620, 2]), 0x600);
+        let mut buf2 = [0u8; 4];
+        assert!(mem.read(0x600, &mut buf2));
+        assert_eq!(&buf2, b"xyz\0", "only 2 src bytes appended + NUL");
+
+        // strncat with n >= src.len() appends the whole source.
+        assert!(mem.write(0x700, b"p\0"));
+        assert!(mem.write(0x720, b"qr\0"));
+        assert_eq!(hle_strncat(&ctx, &[0x700, 0x720, 10]), 0x700);
+        let mut buf3 = [0u8; 4];
+        assert!(mem.read(0x700, &mut buf3));
+        assert_eq!(&buf3, b"pqr\0");
+    }
+
+    /// The comparison functions' positive/Greater branch and the miss/
+    /// degradation contracts the batch documents (reviewer-requested gaps).
+    #[test]
+    fn compare_positive_branches_miss_and_unreadable_degradation() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x100, b"abd"));
+        assert!(mem.write(0x110, b"abc"));
+        assert_eq!(hle_memcmp(&ctx, &[0x100, 0x110, 3]), 1, "'d' > 'c' → +1");
+        assert_eq!(hle_memcmp(&ctx, &[0x100, 0x110, 0]), 0, "n==0 → equal");
+
+        assert!(mem.write(0x200, b"help\0"));
+        assert!(mem.write(0x210, b"hello\0"));
+        assert_eq!(hle_strncmp(&ctx, &[0x200, 0x210, 4]), 1, "'p' > 'l' → +1");
+
+        // strstr not-found → 0
+        assert!(mem.write(0x300, b"foobar\0"));
+        assert!(mem.write(0x320, b"xyz\0"));
+        assert_eq!(hle_strstr(&ctx, &[0x300, 0x320]), 0);
+
+        // Unreadable-pointer degradations (documented): comparisons report
+        // 0 (equal); scans report 0 (NULL); no panic, no host OOB.
+        assert_eq!(hle_memcmp(&ctx, &[0xDEAD_0000, 0x100, 4]), 0);
+        assert_eq!(hle_memchr(&ctx, &[0xDEAD_0000, b'a' as u64, 4]), 0);
+        assert_eq!(hle_strncmp(&ctx, &[0xDEAD_0000, 0x200, 4]), 0);
+        assert_eq!(hle_strchr(&ctx, &[0xDEAD_0000, b'a' as u64]), 0);
+        assert_eq!(hle_strstr(&ctx, &[0xDEAD_0000, 0x320]), 0);
+        assert_eq!(hle_strnlen(&ctx, &[0xDEAD_0000, 8]), 0);
+    }
+
+    /// M1 hardening: string→integer parsing does real conversion with base
+    /// detection, sign, endptr, and saturation.
+    #[test]
+    fn atoi_atol_strtol_parse_real_integers() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x100, b"  -42abc\0"));
+        assert_eq!(
+            hle_atoi(&ctx, &[0x100]) as u32 as i32,
+            -42,
+            "skips ws, sign, stops at 'a'"
+        );
+
+        assert!(mem.write(0x120, b"9000000000\0")); // > i32, fits i64
+        assert_eq!(hle_atol(&ctx, &[0x120]) as i64, 9_000_000_000);
+
+        // strtol base 16 with 0x prefix + endptr.
+        assert!(mem.write(0x140, b"0x1F!\0"));
+        assert_eq!(hle_strtol(&ctx, &[0x140, 0x200, 16]) as i64, 0x1F);
+        let mut ep = [0u8; 8];
+        assert!(mem.read(0x200, &mut ep));
+        assert_eq!(u64::from_le_bytes(ep), 0x140 + 4, "endptr points at '!'");
+
+        // base 0 auto-detect: octal.
+        assert!(mem.write(0x160, b"010\0"));
+        assert_eq!(hle_strtol(&ctx, &[0x160, 0, 0]) as i64, 8);
+
+        // strtoul clamps a negative to a large unsigned, and parses big values.
+        assert!(mem.write(0x180, b"4294967295\0"));
+        assert_eq!(hle_strtoul(&ctx, &[0x180, 0, 10]), 4_294_967_295);
+
+        // No digits → 0, endptr at start.
+        assert!(mem.write(0x1A0, b"xyz\0"));
+        assert_eq!(hle_strtol(&ctx, &[0x1A0, 0x220, 10]), 0);
+        let mut ep2 = [0u8; 8];
+        assert!(mem.read(0x220, &mut ep2));
+        assert_eq!(
+            u64::from_le_bytes(ep2),
+            0x1A0,
+            "endptr == nptr when nothing converts"
+        );
+    }
+
+    #[test]
+    fn atexit_family_registers_and_succeeds() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_atexit(&ctx, &[0x1234]), 0);
+        assert_eq!(hle_cxa_atexit(&ctx, &[0x1234, 0, 0]), 0);
+    }
+
+    #[test]
+    fn register_adds_expected_functions() {
+        let registry = HleRegistry::new();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        for name in [
+            "malloc",
+            "free",
+            "calloc",
+            "realloc",
+            "memcpy",
+            "memset",
+            "memmove",
+            "strlen",
+            "strcmp",
+            "strcpy",
+            "strncpy",
+            "memcmp",
+            "memchr",
+            "strncmp",
+            "strnlen",
+            "strchr",
+            "strrchr",
+            "strcat",
+            "strncat",
+            "strstr",
+            "atoi",
+            "atol",
+            "strtol",
+            "strtoul",
+            "atexit",
+            "__cxa_atexit",
+            "snprintf",
+            "printf",
+            "puts",
+            "abort",
+            "exit",
+            "__stack_chk_fail",
+            "memalign",
+            "posix_memalign",
+        ] {
+            assert!(
+                registry.is_implemented("libc", name),
+                "missing libc::{name}"
+            );
+            assert!(
+                registry.is_implemented("libSceLibcInternal", name),
+                "missing libSceLibcInternal::{name} ABI alias"
+            );
+            registry.call(&ctx, "libc", name, &[1, 2, 3]);
+        }
+
+        // Retail modules import the stack-protector abort naming libkernel —
+        // same name-hash NID, provider-aware resolution.
+        assert!(
+            registry.is_implemented("libkernel", "__stack_chk_fail"),
+            "missing libkernel::__stack_chk_fail provider alias"
+        );
+    }
+
+    #[test]
+    fn memcpy_actually_moves_bytes_in_guest_memory() {
+        let registry = HleRegistry::new();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let src: u64 = 0x10;
+        let dst: u64 = 0x50;
+        let payload = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        assert!(mem.write(src, &payload));
+
+        let result = registry
+            .call(&ctx, "libc", "memcpy", &[dst, src, payload.len() as u64])
+            .unwrap();
+        assert_eq!(result, dst);
+
+        let mut copied = [0u8; 4];
+        assert!(mem.read(dst, &mut copied));
+        assert_eq!(
+            copied, payload,
+            "memcpy must actually move the bytes, not just return dst"
+        );
+    }
+
+    #[test]
+    fn memcpy_out_of_bounds_src_does_not_panic_and_leaves_dst_alone() {
+        let registry = HleRegistry::new();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x20);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // src is entirely outside the 0x20-byte test memory.
+        let result = registry
+            .call(&ctx, "libc", "memcpy", &[0x0, 0xFFFF, 8])
+            .unwrap();
+        assert_eq!(result, 0x0);
+    }
+
+    #[test]
+    fn memset_actually_fills_bytes_in_guest_memory() {
+        let registry = HleRegistry::new();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let dst: u64 = 0x20;
+        let result = registry
+            .call(&ctx, "libc", "memset", &[dst, 0xAB, 6])
+            .unwrap();
+        assert_eq!(result, dst);
+
+        let mut filled = [0u8; 6];
+        assert!(mem.read(dst, &mut filled));
+        assert_eq!(filled, [0xAB; 6]);
+    }
+
+    /// Regression: a huge guest-controlled length must not make the host try
+    /// a gigantic allocation (which would abort the process via
+    /// `handle_alloc_error`). The block ops stage in bounded chunks, so this
+    /// returns `dst` harmlessly instead of dying. If this test process
+    /// survives the call, the fix holds.
+    #[test]
+    fn block_ops_with_huge_guest_length_do_not_abort() {
+        let registry = HleRegistry::new();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // ~256 TiB — would abort if any op did `vec![0u8; n]` up front.
+        let huge = 0x0000_FFFF_FFFF_FFFF;
+        assert_eq!(
+            registry
+                .call(&ctx, "libc", "memcpy", &[0x0, 0x8, huge])
+                .unwrap(),
+            0x0
+        );
+        assert_eq!(
+            registry
+                .call(&ctx, "libc", "memset", &[0x0, 0xAB, huge])
+                .unwrap(),
+            0x0
+        );
+        assert_eq!(
+            registry
+                .call(&ctx, "libc", "memmove", &[0x0, 0x8, huge])
+                .unwrap(),
+            0x0
+        );
+    }
+
+    /// `memmove` with `dst > src` and overlapping ranges must copy
+    /// high-address-first, or it would clobber source bytes it hasn't read.
+    #[test]
+    fn memmove_overlapping_upward_is_correct() {
+        let registry = HleRegistry::new();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x10, &[1, 2, 3, 4, 5]));
+        // Move [0x10..0x14] up by one into [0x11..0x15].
+        let result = registry
+            .call(&ctx, "libc", "memmove", &[0x11, 0x10, 4])
+            .unwrap();
+        assert_eq!(result, 0x11);
+
+        let mut out = [0u8; 5];
+        assert!(mem.read(0x10, &mut out));
+        assert_eq!(
+            out,
+            [1, 1, 2, 3, 4],
+            "upward overlapping memmove must not smear the first byte"
+        );
+    }
+
+    /// `memmove` with `dst < src` and overlapping ranges must copy
+    /// low-address-first (a `memcpy`-style forward copy is already correct
+    /// here); verifies the direction choice doesn't corrupt this case.
+    #[test]
+    fn memmove_overlapping_downward_is_correct() {
+        let registry = HleRegistry::new();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x10, &[1, 2, 3, 4, 5]));
+        // Move [0x11..0x15] down by one into [0x10..0x14].
+        let result = registry
+            .call(&ctx, "libc", "memmove", &[0x10, 0x11, 4])
+            .unwrap();
+        assert_eq!(result, 0x10);
+
+        let mut out = [0u8; 5];
+        assert!(mem.read(0x10, &mut out));
+        assert_eq!(
+            out,
+            [2, 3, 4, 5, 5],
+            "downward overlapping memmove must shift bytes down cleanly"
+        );
+    }
+
+    #[test]
+    fn strlen_measures_a_real_nul_terminated_guest_string() {
+        let registry = HleRegistry::new();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let s: u64 = 0x8;
+        assert!(mem.write(s, b"hello\0garbage"));
+
+        let result = registry.call(&ctx, "libc", "strlen", &[s]).unwrap();
+        assert_eq!(result, 5);
+    }
+
+    #[test]
+    fn strlen_on_unmapped_pointer_stops_without_panicking() {
+        let registry = HleRegistry::new();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x10);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // Pointer entirely outside the 0x10-byte test memory: strlen should
+        // report 0 (nothing readable), not panic or spin.
+        let result = registry.call(&ctx, "libc", "strlen", &[0xFFFF]).unwrap();
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn malloc_returns_nonzero_distinct_addresses() {
+        let registry = HleRegistry::new();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0x10);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let a = registry.call(&ctx, "libc", "malloc", &[16]).unwrap();
+        let b = registry.call(&ctx, "libc", "malloc", &[16]).unwrap();
+        assert_ne!(a, 0, "malloc must not return a null/sentinel address");
+        assert_ne!(b, 0, "malloc must not return a null/sentinel address");
+        assert_ne!(a, b, "two live allocations must not share an address");
+    }
+
+    #[test]
+    fn calloc_zeroes_the_allocated_block_through_guest_memory() {
+        let registry = HleRegistry::new();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0x10);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // Pre-fill the region calloc will hand out with garbage, so a
+        // zero read-back proves calloc actually zeroed it rather than it
+        // merely having started zeroed.
+        assert!(mem.write(0x10, &[0xFFu8; 16]));
+
+        let result = registry.call(&ctx, "libc", "calloc", &[4, 4]).unwrap();
+        assert_ne!(result, 0, "calloc must not return a null/sentinel address");
+
+        let mut block = [0u8; 16];
+        assert!(mem.read(result, &mut block));
+        assert_eq!(
+            block, [0u8; 16],
+            "calloc'd block must read back as all zeros"
+        );
+    }
+
+    #[test]
+    fn calloc_overflowing_nmemb_times_size_returns_zero() {
+        let registry = HleRegistry::new();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let result = registry
+            .call(&ctx, "libc", "calloc", &[u64::MAX, 2])
+            .unwrap();
+        assert_eq!(
+            result, 0,
+            "an overflowing nmemb*size must report NULL, not wrap into an undersized alloc"
+        );
+    }
+
+    #[test]
+    fn realloc_with_null_ptr_behaves_like_malloc() {
+        let registry = HleRegistry::new();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0x10);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let result = registry.call(&ctx, "libc", "realloc", &[0, 32]).unwrap();
+        assert_ne!(
+            result, 0,
+            "realloc(NULL, size) must behave like malloc(size)"
+        );
+    }
+
+    #[test]
+    fn free_of_null_pointer_is_a_harmless_noop() {
+        let registry = HleRegistry::new();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0x10);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let result = registry.call(&ctx, "libc", "free", &[0]).unwrap();
+        assert_eq!(
+            result, 0,
+            "free(NULL) must not panic or forward a null address to the allocator"
+        );
+    }
+
+    #[test]
+    fn malloc_returns_zero_when_the_allocator_is_exhausted() {
+        let registry = HleRegistry::new();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        // A base near `u64::MAX` makes `TestAllocator`'s bump-alignment
+        // arithmetic overflow on the very first request, simulating an
+        // exhausted arena without needing a real `GuestArena`.
+        let alloc = crate::TestAllocator::new(u64::MAX - 4);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let result = registry.call(&ctx, "libc", "malloc", &[16]).unwrap();
+        assert_eq!(
+            result, 0,
+            "an exhausted/overflowing allocator request must report NULL, not panic"
+        );
+    }
+
+    #[test]
+    fn posix_memalign_writes_the_pointer_through_memptr_and_reports_success() {
+        let registry = HleRegistry::new();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0x20);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let memptr: u64 = 0x8;
+        let result = registry
+            .call(&ctx, "libc", "posix_memalign", &[memptr, 16, 64])
+            .unwrap();
+        assert_eq!(
+            result, 0,
+            "posix_memalign must report success (0) on a satisfiable request"
+        );
+
+        let mut written = [0u8; 8];
+        assert!(mem.read(memptr, &mut written));
+        let addr = u64::from_le_bytes(written);
+        assert_ne!(
+            addr, 0,
+            "posix_memalign must write the real allocated address through *memptr"
+        );
+    }
+
+    #[test]
+    fn memmove_actually_moves_bytes_in_guest_memory() {
+        let registry = HleRegistry::new();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let src: u64 = 0x10;
+        let dst: u64 = 0x50;
+        let payload = [0x11u8, 0x22, 0x33, 0x44];
+        assert!(mem.write(src, &payload));
+
+        let result = registry
+            .call(&ctx, "libc", "memmove", &[dst, src, payload.len() as u64])
+            .unwrap();
+        assert_eq!(result, dst);
+
+        let mut moved = [0u8; 4];
+        assert!(mem.read(dst, &mut moved));
+        assert_eq!(
+            moved, payload,
+            "memmove must actually move the bytes, not just return dst"
+        );
+    }
+}

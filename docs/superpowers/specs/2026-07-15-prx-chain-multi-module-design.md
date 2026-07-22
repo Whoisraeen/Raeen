@@ -6,7 +6,7 @@ real retail PS5 title, not assumed.
 
 ## Why this is the single highest-leverage task in the project
 
-Measured on a real title (`xps5x --load-sprx <eboot>`, ranking added in `e871f49`):
+Measured on a real title (`raeen --load-sprx <eboot>`, ranking added in `e871f49`):
 
 ```
 unresolved imports by library (most-wanted first):
@@ -36,7 +36,7 @@ the title cannot finish linking.
 same dynamic model, nothing new needed to read it:
 
 ```
-$ xps5x --load-sprx Games/Minecraft/PPSA17221-app/libfmod.prx
+$ raeen --load-sprx Games/Minecraft/PPSA17221-app/libfmod.prx
 SELF reassembled (real layout): 0 decrypted, 6 passed through, 14 phdr(s), 1752372 ELF byte(s)
 Parsing .sprx module: e_type=0xfe18          <- ET_SCE_DYNAMIC (a shared library)
 module uses the standard vaddr-based dynamic model (51 tag(s) mapped)
@@ -131,7 +131,7 @@ existing single-module path stays for fixtures/diagnostics.
 
 ## Acceptance
 
-`xps5x --run-eboot Games/Minecraft/PPSA17221-app/eboot.bin` reports
+`raeen --run-eboot Games/Minecraft/PPSA17221-app/eboot.bin` reports
 `unresolved` dropping from 87222 to a few hundred (the remaining HLE gap), and
 the guest advances past the `0x5000_0000_0000` (`UNRESOLVED_STUB_ADDR`) fault it
 dies at today. That fault address moving is the honest signal of progress — it is

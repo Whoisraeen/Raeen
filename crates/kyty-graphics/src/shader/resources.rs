@@ -822,7 +822,7 @@ pub struct ShaderExtendedResources {
 /// `shader_detect_eud_raw_window` fills it after `shader_get_input_info_*`;
 /// the recompiler lowers uncovered dwords to clamped reads of the `%eud_raw`
 /// SSBO; the dispatch path snapshots the guest window behind the EUD base
-/// pointer into that SSBO (`xps5x-gpu` `prepare_stage_binding`).
+/// pointer into that SSBO (`raeen-gpu` `prepare_stage_binding`).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShaderEudRawResources {
     /// A raw-window read exists: declare + bind the `%eud_raw` SSBO.

@@ -2,11 +2,11 @@
 
 ## What was just proven
 
-`crates/xps5x-gui/src/launcher.rs` (`firmware_launcher_tests::executes_module`) now has an
+`crates/raeen-gui/src/launcher.rs` (`firmware_launcher_tests::executes_module`) now has an
 end-to-end acceptance test for a hand-built, homebrew-*shaped* module that goes through the
-Shell's real load path — `FirmwareLauncher::launch` → `load` → `xps5x_firmware::load_module`
+Shell's real load path — `FirmwareLauncher::launch` → `load` → `raeen_firmware::load_module`
 (SELF passthrough → `.sprx` parse → `PT_SCE_DYNLIBDATA` decode → NID link) →
-`xps5x_runtime::execute_linked` — both by loading a temp file directly and by having the real
+`raeen_runtime::execute_linked` — both by loading a temp file directly and by having the real
 `scan_dir` discover it as `Games/<name>/eboot.bin` first. The module's entry does real work
 through three real, NID-resolved HLE imports (`malloc`, `memset`, and libkernel's
 `sceKernelMapFlexibleMemory` — the last resolved but not called): it calls `malloc(0x40)`,
@@ -23,7 +23,7 @@ construction.
 ## Entry / crt0
 
 The synthetic module's "entry" is a handful of instructions called directly as a bare
-`sysv64 fn(u64,u64,u64,u64,u64,u64) -> u64` (`xps5x-runtime/src/dispatch.rs`, `run`) with up to
+`sysv64 fn(u64,u64,u64,u64,u64,u64) -> u64` (`raeen-runtime/src/dispatch.rs`, `run`) with up to
 six integer arguments and nothing else set up. A real homebrew binary's ELF entry point is
 `_start`/crt0, and it unconditionally assumes:
 
@@ -47,7 +47,7 @@ freshly committed/zeroed) and immediately misbehave.
 
 ## Relocations
 
-`link_module` (`crates/xps5x-firmware/src/dynlib/linker.rs`) currently handles exactly four
+`link_module` (`crates/raeen-firmware/src/dynlib/linker.rs`) currently handles exactly four
 `R_X86_64_*` types:
 
 | Type | Value | Handling |
@@ -79,7 +79,7 @@ a single instruction runs.
 
 ## HLE breadth
 
-`crates/xps5x-hle` currently registers, across `libc`, `libkernel`, `libSceSysmodule`, and several
+`crates/raeen-hle` currently registers, across `libc`, `libkernel`, `libSceSysmodule`, and several
 `libSce*` device stubs (gnm_driver, audio_out, net, save_data, pad, video_out):
 
 - **Real, working memory semantics**: `malloc`/`calloc`/`realloc`/`free`/`memalign`/
@@ -112,7 +112,7 @@ a single instruction runs.
 
 ## TLS
 
-`xps5x-runtime/src/tls.rs` + `arena.rs`'s `setup_main_tcb` gives the guest a **minimal** TCB: a
+`raeen-runtime/src/tls.rs` + `arena.rs`'s `setup_main_tcb` gives the guest a **minimal** TCB: a
 `fs:[0]` self-pointer (so `mov rax, fs:[0]` round-trips, proven by
 `guest_fs_zero_load_reads_the_installed_tcb`) and general `fs:`-relative offset addressing works
 (proven by `guest_fs_offset_round_trip_writes_and_reads_back`). That is exactly enough for a
@@ -147,7 +147,7 @@ further:
   HLE breadth) — the `ModuleRegistry` here supports multiple modules' exports being registered
   (`register_module_exports`), but nothing drives *discovering and loading* a dependency chain from
   one module's declared imports; the Shell only ever loads the one `eboot.bin` path it's given.
-- **Fat/multi-arch ELF (fatelf) and non-trivial `PT_SCE_*` segments**: `xps5x-firmware`'s `.sprx`
+- **Fat/multi-arch ELF (fatelf) and non-trivial `PT_SCE_*` segments**: `raeen-firmware`'s `.sprx`
   parser handles `PT_LOAD`, `PT_SCE_DYNLIBDATA`, and `PT_DYNAMIC` — real PS4/PS5 SELFs carry
   additional segments (`PT_SCE_PROCPARAM`, `PT_SCE_MODULE_PARAM`, `PT_SCE_RELRO`'s more nuanced
   handling — `SprxModule` has a `relro` field but its consumption elsewhere in the pipeline was not

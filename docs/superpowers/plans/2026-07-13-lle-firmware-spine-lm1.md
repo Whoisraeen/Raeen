@@ -4,31 +4,31 @@
 
 **Goal:** A homebrew / already-decrypted `.sprx` flows through the full spine — SELF → decrypt-or-passthrough → inner ELF → `PT_SCE_DYNLIBDATA` parse → NID link against the HLE registry → relocated module — and reaches a defined, inspectable linked state. **No keys required.**
 
-**Architecture:** Build on the LM0 foundation (`Firmware`, `KeyProvider`/`require_key`, `nid_of`/`encode_nid`/`decode_nid`) in `crates/xps5x-firmware`. Add the SELF decryption machinery (driven by the user `KeyProvider`, with plaintext passthrough for homebrew), an `.sprx` module parser, the `PT_SCE_DYNLIBDATA` decoder, a NID↔name database seeded from HLE function names, a `ModuleRegistry` that dispatches each import to HLE or LLE, and a linker that applies SCE relocations.
+**Architecture:** Build on the LM0 foundation (`Firmware`, `KeyProvider`/`require_key`, `nid_of`/`encode_nid`/`decode_nid`) in `crates/raeen-firmware`. Add the SELF decryption machinery (driven by the user `KeyProvider`, with plaintext passthrough for homebrew), an `.sprx` module parser, the `PT_SCE_DYNLIBDATA` decoder, a NID↔name database seeded from HLE function names, a `ModuleRegistry` that dispatches each import to HLE or LLE, and a linker that applies SCE relocations.
 
-**Tech Stack:** Rust 2024; `aes` + `cbc` (workspace deps) for segment decryption; `sha1` (already used by `nid.rs`); `goblin`/`scroll` for ELF primitives; `xps5x-loader` for SELF/ELF structs; `xps5x-hle::HleRegistry` as the HLE resolution target.
+**Tech Stack:** Rust 2024; `aes` + `cbc` (workspace deps) for segment decryption; `sha1` (already used by `nid.rs`); `goblin`/`scroll` for ELF primitives; `raeen-loader` for SELF/ELF structs; `raeen-hle::HleRegistry` as the HLE resolution target.
 
-**Authority:** `docs/superpowers/specs/2026-07-12-xps5x-lle-firmware-spine-design.md` (§3 components, §5 slice, §6 verification). LM1 = roadmap row LM1.
+**Authority:** `docs/superpowers/specs/2026-07-12-raeen-lle-firmware-spine-design.md` (§3 components, §5 slice, §6 verification). LM1 = roadmap row LM1.
 
 ## Global Constraints
 
-- **Clean-room boundary (non-negotiable, design §2):** XPS5X ships no keys, no firmware, no key-extraction/circumvention tooling. The crypto layer *consumes* a user-supplied key; it never derives, guesses, brute-forces, or extracts one. **No real firmware bytes in any test — synthetic buffers only.**
+- **Clean-room boundary (non-negotiable, design §2):** Raeen ships no keys, no firmware, no key-extraction/circumvention tooling. The crypto layer *consumes* a user-supplied key; it never derives, guesses, brute-forces, or extracts one. **No real firmware bytes in any test — synthetic buffers only.**
 - Missing-key decryption is a **normal, expected, non-fatal** condition: raise `FirmwareError::MissingKey { key_id }`, log at `info`.
 - Rust edition 2024, rust-version ≥ 1.85, GPL-2.0-only. Parsers **never panic** on malformed input — bounds-checked, return `FirmwareError`. Guard every length/offset read from the file against the buffer (the LM0 SLB2 `file_count` over-alloc fix is the standard to follow).
 - `cargo build/test/clippy --workspace` clean after every task. No new crate dependencies beyond the existing workspace set.
-- New public error variants use the existing `FirmwareError` enum (`UnsupportedRelocation(u32)`, `MalformedDynlibData(String)`, `MissingKey`, etc.); extend it only if a genuinely new failure mode appears, and wire through `XPS5XError`.
+- New public error variants use the existing `FirmwareError` enum (`UnsupportedRelocation(u32)`, `MalformedDynlibData(String)`, `MissingKey`, etc.); extend it only if a genuinely new failure mode appears, and wire through `RaeenError`.
 
 ---
 
 ### Task 1: SELF decrypt-or-passthrough (`crypto/self_crypto.rs`)
 
 **Files:**
-- Create: `crates/xps5x-firmware/src/crypto/self_crypto.rs`
-- Modify: `crates/xps5x-firmware/src/crypto/mod.rs` (add `pub mod self_crypto;` + re-export)
+- Create: `crates/raeen-firmware/src/crypto/self_crypto.rs`
+- Modify: `crates/raeen-firmware/src/crypto/mod.rs` (add `pub mod self_crypto;` + re-export)
 - Test: in-module `#[cfg(test)]`
 
 **Interfaces:**
-- Consumes: `KeyProvider`, `KeyRequest`, `SegmentKey`, `require_key` (from `crypto/mod.rs`); `xps5x_loader::self_format::{SelfHeader, SelfEntry, parse_self}`.
+- Consumes: `KeyProvider`, `KeyRequest`, `SegmentKey`, `require_key` (from `crypto/mod.rs`); `raeen_loader::self_format::{SelfHeader, SelfEntry, parse_self}`.
 - Produces:
   ```rust
   /// The plaintext inner ELF image recovered from a SELF, plus which
@@ -47,7 +47,7 @@
       -> Result<DecryptedSelf, FirmwareError>;
   ```
 
-**Approach:** Parse the SELF header/entry table (reuse `xps5x-loader` structs; do not re-hardcode). For each segment: if the entry's flags mark it plaintext (homebrew / already-decrypted — the LM1 path), copy it through; if it marks it encrypted, build a `KeyRequest` from the segment metadata, call `require_key`, and decrypt with AES-128 (CTR or CBC per the segment's mode field) using the `aes`+`cbc` crates. Reassemble the inner ELF. **The decryption is standard AES given a supplied key — no key material, no key derivation.**
+**Approach:** Parse the SELF header/entry table (reuse `raeen-loader` structs; do not re-hardcode). For each segment: if the entry's flags mark it plaintext (homebrew / already-decrypted — the LM1 path), copy it through; if it marks it encrypted, build a `KeyRequest` from the segment metadata, call `require_key`, and decrypt with AES-128 (CTR or CBC per the segment's mode field) using the `aes`+`cbc` crates. Reassemble the inner ELF. **The decryption is standard AES given a supplied key — no key material, no key derivation.**
 
 **Steps:**
 - [ ] Write failing tests: (a) a synthetic **plaintext** SELF (single passthrough segment wrapping a minimal ELF) → `decrypt_self(.., &NoKeysProvider)` returns the ELF, `passthrough_segments == 1`. (b) a synthetic SELF with one segment flagged encrypted, AES-CTR-encrypted under a known test key → a stub `KeyProvider` returning that key recovers the original plaintext ELF. (c) the same encrypted SELF with `NoKeysProvider` → `Err(MissingKey { .. })`, no panic.
@@ -60,12 +60,12 @@
 ### Task 2: `.sprx` module parser (`sprx.rs`)
 
 **Files:**
-- Create: `crates/xps5x-firmware/src/sprx.rs`
-- Modify: `crates/xps5x-firmware/src/lib.rs` (`pub mod sprx;` + re-exports)
+- Create: `crates/raeen-firmware/src/sprx.rs`
+- Modify: `crates/raeen-firmware/src/lib.rs` (`pub mod sprx;` + re-exports)
 - Test: in-module
 
 **Interfaces:**
-- Consumes: `xps5x_loader::elf::parse_elf` / the ELF program headers; the `DecryptedSelf.elf` bytes from Task 1. Recognizes `ET_SCE_DYNAMIC` (0xFE18), `ET_SCE_DYNEXEC` (0xFE10), and program-header types `PT_SCE_DYNLIBDATA` (0x61000000), `PT_SCE_PROCPARAM` (0x61000001), `PT_SCE_MODULE_PARAM` (0x61000002), `PT_SCE_RELRO` (0x61000010) — all already named in `xps5x-loader/src/elf.rs`.
+- Consumes: `raeen_loader::elf::parse_elf` / the ELF program headers; the `DecryptedSelf.elf` bytes from Task 1. Recognizes `ET_SCE_DYNAMIC` (0xFE18), `ET_SCE_DYNEXEC` (0xFE10), and program-header types `PT_SCE_DYNLIBDATA` (0x61000000), `PT_SCE_PROCPARAM` (0x61000001), `PT_SCE_MODULE_PARAM` (0x61000002), `PT_SCE_RELRO` (0x61000010) — all already named in `raeen-loader/src/elf.rs`.
 - Produces:
   ```rust
   pub struct SprxModule {
@@ -88,7 +88,7 @@
 ### Task 3: `PT_SCE_DYNLIBDATA` decoder (`dynlib/mod.rs`)
 
 **Files:**
-- Modify: `crates/xps5x-firmware/src/dynlib/mod.rs` (currently only declares `pub mod nid;`)
+- Modify: `crates/raeen-firmware/src/dynlib/mod.rs` (currently only declares `pub mod nid;`)
 - Test: in-module + hand-built dynlibdata fixtures
 
 **Interfaces:**
@@ -120,14 +120,14 @@
 ### Task 4: NID↔name database (`dynlib/nid.rs` extension)
 
 **Files:**
-- Modify: `crates/xps5x-firmware/src/dynlib/nid.rs` (has `nid_of`/`encode_nid`/`decode_nid` + salt/alphabet)
+- Modify: `crates/raeen-firmware/src/dynlib/nid.rs` (has `nid_of`/`encode_nid`/`decode_nid` + salt/alphabet)
 - Test: in-module
 
 **Interfaces:**
 - Produces:
   ```rust
   /// Maps import NIDs back to the HLE "library::function" names they resolve
-  /// to, precomputed from the names XPS5X's HLE implements.
+  /// to, precomputed from the names Raeen's HLE implements.
   pub struct NidDatabase { by_nid: HashMap<u64, String> }
   impl NidDatabase {
       pub fn from_hle_names(names: impl IntoIterator<Item = (String, String)>) -> Self; // (library, function)
@@ -147,12 +147,12 @@
 ### Task 5: `ModuleRegistry` — HLE/LLE dispatch (`registry.rs`)
 
 **Files:**
-- Create: `crates/xps5x-firmware/src/registry.rs`
-- Modify: `crates/xps5x-firmware/src/lib.rs`
+- Create: `crates/raeen-firmware/src/registry.rs`
+- Modify: `crates/raeen-firmware/src/lib.rs`
 - Test: in-module
 
 **Interfaces:**
-- Consumes: `NidDatabase` (Task 4); `xps5x_hle::HleRegistry` (`is_implemented(lib, fn)`); `DynlibData` exports (Task 3).
+- Consumes: `NidDatabase` (Task 4); `raeen_hle::HleRegistry` (`is_implemented(lib, fn)`); `DynlibData` exports (Task 3).
 - Produces:
   ```rust
   pub enum Resolver { Hle { library: String, function: String }, Lle { addr: u64 }, Unresolved }
@@ -177,8 +177,8 @@
 ### Task 6: SCE relocation applier / linker (`dynlib/linker.rs`)
 
 **Files:**
-- Create: `crates/xps5x-firmware/src/dynlib/linker.rs`
-- Modify: `crates/xps5x-firmware/src/dynlib/mod.rs`
+- Create: `crates/raeen-firmware/src/dynlib/linker.rs`
+- Modify: `crates/raeen-firmware/src/dynlib/mod.rs`
 - Test: in-module
 
 **Interfaces:**
@@ -202,8 +202,8 @@
 ### Task 7: End-to-end pipeline test + `Firmware`/CLI wiring (LM1 acceptance)
 
 **Files:**
-- Create: `crates/xps5x-firmware/tests/homebrew_pipeline.rs`
-- Modify: `crates/xps5x-firmware/src/lib.rs` (a `load_module(elf_or_self, provider, registry, hle)` convenience that chains Tasks 1→6); optionally `crates/xps5x-gui/src/main.rs` (a `--load-sprx <path>` diagnostic mirroring `--firmware-info`).
+- Create: `crates/raeen-firmware/tests/homebrew_pipeline.rs`
+- Modify: `crates/raeen-firmware/src/lib.rs` (a `load_module(elf_or_self, provider, registry, hle)` convenience that chains Tasks 1→6); optionally `crates/raeen-gui/src/main.rs` (a `--load-sprx <path>` diagnostic mirroring `--firmware-info`).
 - Test: integration test
 
 **Interfaces:**

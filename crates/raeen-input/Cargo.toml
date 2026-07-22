@@ -1,0 +1,12 @@
+[package]
+name = "raeen-input"
+description = "DualSense controller emulation with haptic feedback and adaptive triggers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+raeen-core = { workspace = true }
+gilrs = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }

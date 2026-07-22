@@ -5,7 +5,7 @@
 > phase has its own detailed task list appended as it begins.
 
 **Goal:** Faithfully port the Kyty PS4/PS5 emulator (~100k LOC of its own C++,
-`reference/kyty`, MIT © 2021 InoriRus) into XPS5X as idiomatic-but-faithful
+`reference/kyty`, MIT © 2021 InoriRus) into Raeen as idiomatic-but-faithful
 Rust, in dependency order, bottom-up.
 
 **Decision of record (user, 2026-07-13):** *Literal 1:1 transliteration*,
@@ -35,14 +35,14 @@ not byte-identical C++ idioms:
    Linux paths ported as feasible or stubbed behind `#[cfg]`.
 5. **C++ raw pointers / manual memory** become the safe Rust equivalent
    (slices, `Box`, `Arc`, `Vec`) where possible; genuinely pointer-based guest
-   memory keeps `unsafe` with a `SAFETY:` note, matching the rest of XPS5X.
+   memory keeps `unsafe` with a `SAFETY:` note, matching the rest of Raeen.
 
 **Clean-room:** Kyty is community MIT code — porting from it is fine, with
 attribution (`THIRD_PARTY_NOTICES.md`). But anything that looks like a verbatim
 Sony SDK struct layout or NID table is derived from clean sources (OpenOrbis,
 our own analysis), never assumed correct because Kyty has it.
 
-## Target crate layout (mirrors Kyty, integrated into the XPS5X workspace)
+## Target crate layout (mirrors Kyty, integrated into the Raeen workspace)
 
 | Kyty tree | New crate | Maps toward |
 |---|---|---|
@@ -50,15 +50,15 @@ our own analysis), never assumed correct because Kyty has it.
 | `lib/Sys` + `include/Kyty/Sys` | `crates/kyty-sys` | (foundation) |
 | `lib/Math` | `crates/kyty-math` | (foundation) |
 | `lib/Scripts` | `crates/kyty-scripts` | (config/scripts) |
-| `emulator/src/Loader` | `crates/kyty-loader` | ↔ existing `xps5x-loader` |
-| `emulator/src/Kernel` | `crates/kyty-kernel` | ↔ existing `xps5x-kernel` |
-| `emulator/src/Libs` | `crates/kyty-libs` | ↔ existing `xps5x-hle` |
-| `emulator/src/Graphics` | `crates/kyty-graphics` | ↔ existing `xps5x-gpu` |
-| `emulator/src/*` (top) | `crates/kyty-emulator` | ↔ `xps5x-runtime` |
+| `emulator/src/Loader` | `crates/kyty-loader` | ↔ existing `raeen-loader` |
+| `emulator/src/Kernel` | `crates/kyty-kernel` | ↔ existing `raeen-kernel` |
+| `emulator/src/Libs` | `crates/kyty-libs` | ↔ existing `raeen-hle` |
+| `emulator/src/Graphics` | `crates/kyty-graphics` | ↔ existing `raeen-gpu` |
+| `emulator/src/*` (top) | `crates/kyty-emulator` | ↔ `raeen-runtime` |
 
 Kyty ports land in `kyty-*` crates first (keeps the 1:1 mapping crisp and
-un-entangled); integration into the `xps5x-*` runtime happens per-subsystem
-once a `kyty-*` crate is functional. This keeps the existing, tested XPS5X
+un-entangled); integration into the `raeen-*` runtime happens per-subsystem
+once a `kyty-*` crate is functional. This keeps the existing, tested Raeen
 runtime green throughout.
 
 ## Dependency-ordered phases
@@ -69,13 +69,13 @@ runtime green throughout.
   VirtualMemory/Threads/File → String/Vector/Hashmap → the rest), so later
   phases unblock as early as possible.
 - **Phase 2 — Loader.** `kyty-loader` (~2.9k). SELF/PKG/ELF; cross-check
-  against XPS5X's existing loader.
+  against Raeen's existing loader.
 - **Phase 3 — Kernel.** `kyty-kernel` (~5.8k). HLE threads/memory/sceKernel.
 - **Phase 4 — Libs.** `kyty-libs` (~3.9k). HLE library stubs.
 - **Phase 5 — Graphics.** `kyty-graphics` (~38.5k). GNM Pm4 → Vulkan, PSSL
   (`ShaderParse`/`ShaderSpirv`) → SPIR-V, VideoOut, tiling. The crown jewel.
 - **Phase 6 — Emulator top + integration.** `kyty-emulator` (Audio, Controller,
-  Dialog, Network, Config) + wiring the `kyty-*` crates into the XPS5X runtime.
+  Dialog, Network, Config) + wiring the `kyty-*` crates into the Raeen runtime.
 
 ## Ledger
 

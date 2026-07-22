@@ -4,7 +4,7 @@
 //! OS-abstraction layer that `Core::VirtualMemory`
 //! (`include/Kyty/Core/VirtualMemory.h`) sits on top of.
 //!
-//! XPS5X targets Windows first (see the crate-wide porting conventions), so
+//! Raeen targets Windows first (see the crate-wide porting conventions), so
 //! this whole module is `#[cfg(windows)]`-gated and backed by `windows-sys`
 //! FFI where Kyty relies on Windows-specific behavior that `std` does not
 //! expose: `VirtualAlloc`/`VirtualAlloc2`/`VirtualFree`/`VirtualProtect` for

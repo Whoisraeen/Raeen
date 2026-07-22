@@ -21,5 +21,5 @@ tracing.workspace = true
 naga = { version = "24", features = ["spv-in"] }
 # Real Khronos spirv-val for structurizer tests: naga cannot serve there (its
 # front end structurizes and ACCEPTS back-edge modules spirv-val rejects).
-# Same crate the xps5x-gpu runtime gate uses.
+# Same crate the raeen-gpu runtime gate uses.
 spirv-tools = { version = "0.12", default-features = false, features = ["use-compiled-tools"] }

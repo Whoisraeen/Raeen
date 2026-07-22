@@ -1,17 +1,17 @@
 ---
 name: verify
 description: >
-  Build, launch, drive, and screenshot the XPS5X egui Shell on Windows
+  Build, launch, drive, and screenshot the Raeen egui Shell on Windows
   (PostMessage + GetClientRect). Use after Shell/UI/launcher/theme/fullscreen
   changes or when the user asks to verify the GUI.
 ---
 
-# Verifying XPS5X shell changes
+# Verifying Raeen shell changes
 
 Surface: native eframe window (`raeen.exe`), fullscreen-borderless, sized from
 `config.toml` (default 1920x1080, top-left of the primary display).
 
-1. Build: `cargo build -p xps5x-gui` → `target/debug/raeen.exe`.
+1. Build: `cargo build -p raeen-gui` → `target/debug/raeen.exe`.
 2. Launch (PowerShell): `Start-Process` the exe with the repo root as the
    working directory — it scans `Games/`, loads `themes/`, and writes a
    default `config.toml` if missing (don't commit that file). Wait ~6s
@@ -44,4 +44,4 @@ Gotchas:
   scopes: rows land ~120px too low, overflow the window, and the overflow
   grows the parent `Ui`'s rects, which then mis-anchors the Control Center
   drawn after Home. Use painter + explicit rects (see
-  `crates/xps5x-gui/src/shell/home.rs::draw_context_block`).
+  `crates/raeen-gui/src/shell/home.rs::draw_context_block`).

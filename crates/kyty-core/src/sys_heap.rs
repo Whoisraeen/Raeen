@@ -29,7 +29,7 @@
 //! same bookkeeping C allocators do internally, just made explicit. Kyty's
 //! `SysCS` critical section maps to [`std::sync::Mutex`].
 
-// Windows-first: XPS5X's only current target. This whole module is gated so
+// Windows-first: Raeen's only current target. This whole module is gated so
 // the crate keeps building on non-Windows hosts until a Linux counterpart
 // (ported from `Kyty/Sys/Linux/SysLinuxHeap.h`) is added under its own module.
 #![cfg(windows)]

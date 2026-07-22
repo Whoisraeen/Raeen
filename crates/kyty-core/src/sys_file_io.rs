@@ -990,7 +990,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let mut dir = std::env::temp_dir();
-        dir.push(format!("xps5x_kyty_sysfileio_{tag}_{nanos}"));
+        dir.push(format!("raeen_kyty_sysfileio_{tag}_{nanos}"));
         String::from(dir.to_str().unwrap())
     }
 
@@ -1113,7 +1113,7 @@ mod tests {
     fn seeking_on_error_file_is_a_harmless_no_op_returning_true() {
         // Opening a nonexistent file yields the `Error` repr.
         let mut f = sys_file_open_r(
-            &String::from("R:/does/not/exist_xps5x.bin"),
+            &String::from("R:/does/not/exist_raeen.bin"),
             SysFileCacheType::Auto,
         );
         assert!(sys_file_is_error(&f));

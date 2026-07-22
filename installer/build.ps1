@@ -49,7 +49,7 @@ Write-Step "Raeen packaging - version $Version"
 if (-not (Test-Path $DistDir)) { New-Item -ItemType Directory -Path $DistDir | Out-Null }
 
 # ----------------------------------------------------------------- assets ---
-if (-not $SkipAssets -or -not (Test-Path (Join-Path $AssetsDir 'xps5x.ico'))) {
+if (-not $SkipAssets -or -not (Test-Path (Join-Path $AssetsDir 'raeen.ico'))) {
     Write-Step "Generating branding assets"
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $InstallerDir 'scripts\gen-assets.ps1')
     if ($LASTEXITCODE -ne 0) { throw "Asset generation failed." }
@@ -58,10 +58,10 @@ if (-not $SkipAssets -or -not (Test-Path (Join-Path $AssetsDir 'xps5x.ico'))) {
 
 # ------------------------------------------------------------------ build ---
 if (-not $SkipBuild) {
-    Write-Step "cargo build --release -p xps5x-gui"
+    Write-Step "cargo build --release -p raeen-gui"
     Push-Location $RepoRoot
     try {
-        & cargo build --release -p xps5x-gui
+        & cargo build --release -p raeen-gui
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed." }
     } finally {
         Pop-Location
@@ -78,13 +78,13 @@ Write-Ok "binary: $ReleaseExe ($([math]::Round((Get-Item $ReleaseExe).Length/1MB
 # bundled Games\ folder (config.toml points there).
 if (-not $SkipPortable) {
     Write-Step "Building portable ZIP"
-    $stage = Join-Path ([System.IO.Path]::GetTempPath()) ("xps5x-portable-" + [System.Guid]::NewGuid().ToString('N'))
+    $stage = Join-Path ([System.IO.Path]::GetTempPath()) ("raeen-portable-" + [System.Guid]::NewGuid().ToString('N'))
     $root  = Join-Path $stage 'Raeen'
     New-Item -ItemType Directory -Path (Join-Path $root 'themes\default') -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $root 'Games')          -Force | Out-Null
 
     Copy-Item $ReleaseExe                                       (Join-Path $root 'raeen.exe')
-    Copy-Item (Join-Path $AssetsDir 'xps5x.ico')               (Join-Path $root 'xps5x.ico')
+    Copy-Item (Join-Path $AssetsDir 'raeen.ico')               (Join-Path $root 'raeen.ico')
     Copy-Item (Join-Path $RepoRoot 'themes\default\theme.toml') (Join-Path $root 'themes\default\theme.toml')
     Copy-Item (Join-Path $RepoRoot 'LICENSE')                  (Join-Path $root 'LICENSE.txt')
     Copy-Item (Join-Path $RepoRoot 'THIRD_PARTY_NOTICES.md')   (Join-Path $root 'THIRD_PARTY_NOTICES.md')
@@ -195,7 +195,7 @@ if (-not $SkipInstaller) {
         Write-Warn2 "Download:                 https://jrsoftware.org/isdl.php"
     } else {
         Write-Ok "using $iscc"
-        & $iscc "/DMyAppVersion=$Version" (Join-Path $InstallerDir 'xps5x.iss')
+        & $iscc "/DMyAppVersion=$Version" (Join-Path $InstallerDir 'raeen.iss')
         if ($LASTEXITCODE -ne 0) { throw "ISCC failed (exit $LASTEXITCODE)." }
         $setup = Join-Path $DistDir "Raeen-$Version-Setup.exe"
         if (Test-Path $setup) {

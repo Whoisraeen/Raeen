@@ -35,7 +35,7 @@ Two different states must not be confused:
   `DT_INIT`, then the title CRT executes that initializer again. A constructor
   inserts the same node twice, and `_start` loops over the resulting cyclic list at
   `module+0x7426c00`.
-- The existing `XPS5X_SKIP_MAIN_INIT=1` diagnostic proves the cause: with loader-side
+- The existing `RAEEN_SKIP_MAIN_INIT=1` diagnostic proves the cause: with loader-side
   main initialization skipped, the cyclic-list loop disappears and the title moves
   to the next blocker in roughly five seconds.
 - The next blocker is the POSIX `clock_gettime` NID
@@ -55,11 +55,11 @@ The first two fixes are therefore boot correctness, not speculative GPU work.
   scheduling, HLE, or GPU execution with a second implementation.
 - HLE exports remain ABI adapters. Time comes from `TimeSubsystem`, waits from
   `WaitSubsystem`, guest memory through validated capability types, and GPU work
-  through the XPS5X-owned submission interface.
+  through the Raeen-owned submission interface.
 - `GuestProcess` owns module initialization state, address space, threads, TLS,
   handles, HLE state, and its GPU session. New title-specific global state is not
   acceptable.
-- Kyty shader/PM4/Vulkan mechanisms stay behind `xps5x-gpu` contracts. No Kyty type
+- Kyty shader/PM4/Vulkan mechanisms stay behind `raeen-gpu` contracts. No Kyty type
   becomes part of a public runtime or HLE API.
 - HLE is the default per-module policy. LLE is used only for useful, user-supplied,
   decryptable modules. Normal operation must not depend on proprietary firmware.
@@ -72,10 +72,10 @@ The first two fixes are therefore boot correctness, not speculative GPU work.
 
 **Files:**
 
-- `crates/xps5x-firmware/src/dynlib/linker.rs`
-- `crates/xps5x-firmware/src/lib.rs`
-- `crates/xps5x-runtime/src/lib.rs`
-- `crates/xps5x-runtime/tests/execute.rs`
+- `crates/raeen-firmware/src/dynlib/linker.rs`
+- `crates/raeen-firmware/src/lib.rs`
+- `crates/raeen-runtime/src/lib.rs`
+- `crates/raeen-runtime/tests/execute.rs`
 
 **Implementation:**
 
@@ -101,18 +101,18 @@ The first two fixes are therefore boot correctness, not speculative GPU work.
 - Direct module/function execution must retain its explicit loader-owned behavior.
 - Initialization order must be deterministic across repeated runs.
 
-**Exit gate:** a default release launch, with no `XPS5X_SKIP_MAIN_INIT`, does not
+**Exit gate:** a default release launch, with no `RAEEN_SKIP_MAIN_INIT`, does not
 visit the `0x7426c00` cycle and reaches the next guest import.
 
 ### Slice 2 - Resolve `clock_gettime` through the time interface
 
 **Files:**
 
-- `crates/xps5x-hle/src/libsce_posix.rs`
-- `crates/xps5x-hle/src/libkernel.rs`
-- `crates/xps5x-hle/src/lib.rs`
-- `crates/xps5x-firmware/src/dynlib/linker.rs`
-- `crates/xps5x-firmware/tests/hle_nid_coverage.rs`
+- `crates/raeen-hle/src/libsce_posix.rs`
+- `crates/raeen-hle/src/libkernel.rs`
+- `crates/raeen-hle/src/lib.rs`
+- `crates/raeen-firmware/src/dynlib/linker.rs`
+- `crates/raeen-firmware/tests/hle_nid_coverage.rs`
 
 **Implementation:**
 
@@ -167,10 +167,10 @@ unimplemented-import fault, dead wait, or initializer cycle.
 
 **Files:**
 
-- `crates/xps5x-core/src/diagnostics.rs`
-- `crates/xps5x-runtime/src/dispatch.rs`
-- `crates/xps5x-gpu/src/agc_exec.rs`
-- `crates/xps5x-gui/src/main.rs`
+- `crates/raeen-core/src/diagnostics.rs`
+- `crates/raeen-runtime/src/dispatch.rs`
+- `crates/raeen-gpu/src/agc_exec.rs`
+- `crates/raeen-gui/src/main.rs`
 
 Extend the existing deterministic recorder, still around the same runtime, with a
 generic `--diagnostic-dir <path>` output and a final `run-summary.json` containing:
@@ -196,8 +196,8 @@ ownership transitions, and a title run can be compared to the prior
 **Files:**
 
 - `crates/kyty-graphics/src/shader_*`
-- `crates/xps5x-gpu/src/draw_translate.rs`
-- `crates/xps5x-gpu/src/agc_exec.rs`
+- `crates/raeen-gpu/src/draw_translate.rs`
+- `crates/raeen-gpu/src/agc_exec.rs`
 
 1. Rebaseline the title after boot is restored. Group skips into unbound shader,
    parse failure, SPIR-V generation failure, validation failure, and unsupported
@@ -221,15 +221,15 @@ and no scene-critical shader is skipped for an unknown opcode or missing binding
 
 **Files:**
 
-- `crates/xps5x-core/src/subsystems.rs`
-- `crates/xps5x-gpu/src/draw_translate.rs`
-- `crates/xps5x-gpu/src/agc_exec.rs`
-- `crates/xps5x-gpu/src/vulkan/compute.rs`
-- `crates/xps5x-gpu/src/vulkan/offscreen.rs`
+- `crates/raeen-core/src/subsystems.rs`
+- `crates/raeen-gpu/src/draw_translate.rs`
+- `crates/raeen-gpu/src/agc_exec.rs`
+- `crates/raeen-gpu/src/vulkan/compute.rs`
+- `crates/raeen-gpu/src/vulkan/offscreen.rs`
 
 This is the main flat-green fix.
 
-1. Extend the XPS5X-owned shader/resource contract with storage-image descriptors.
+1. Extend the Raeen-owned shader/resource contract with storage-image descriptors.
    The public contract uses guest GPU-visible capabilities, format, dimensions,
    mip/layer range, and access mode; it does not expose Kyty or Vulkan ownership
    types to HLE/runtime callers.
@@ -277,14 +277,14 @@ hashes are no longer all identical and the flat-green image is gone.
 Run scoped checks after each slice, then the dependent set:
 
 ```powershell
-cargo test -p xps5x-runtime
-cargo test -p xps5x-firmware
-cargo test -p xps5x-hle
+cargo test -p raeen-runtime
+cargo test -p raeen-firmware
+cargo test -p raeen-hle
 cargo test -p kyty-graphics
-cargo test -p xps5x-gpu
-cargo clippy -p xps5x-runtime -p xps5x-firmware -p xps5x-hle -p kyty-graphics -p xps5x-gpu -- -D warnings
+cargo test -p raeen-gpu
+cargo clippy -p raeen-runtime -p raeen-firmware -p raeen-hle -p kyty-graphics -p raeen-gpu -- -D warnings
 cargo fmt --all -- --check
-cargo build --release -p xps5x-gui
+cargo build --release -p raeen-gui
 ```
 
 The local title run must use a user-supplied path and an ignored artifact directory:

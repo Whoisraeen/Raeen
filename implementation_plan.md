@@ -1,4 +1,4 @@
-# XPS5X — PlayStation 5 Emulator / Compatibility Layer
+# Raeen — PlayStation 5 Emulator / Compatibility Layer
 
 A cross-platform PS5 emulation environment that loads PS5 firmware and game binaries, translates system calls and GPU commands in real-time, and runs PS5 titles on Windows, Linux, and macOS using the host machine's bare-metal hardware.
 
@@ -6,7 +6,7 @@ A cross-platform PS5 emulation environment that loads PS5 firmware and game bina
 
 ## Background & Feasibility
 
-The PS5 uses an **x86-64 Zen 2 CPU** — the same instruction set as desktop PCs. This means XPS5X does **not** need a CPU interpreter/JIT (unlike PS3's Cell). Instead, it operates as a **compatibility layer** (similar to Wine/Proton or shadPS4 for PS4) that:
+The PS5 uses an **x86-64 Zen 2 CPU** — the same instruction set as desktop PCs. This means Raeen does **not** need a CPU interpreter/JIT (unlike PS3's Cell). Instead, it operates as a **compatibility layer** (similar to Wine/Proton or shadPS4 for PS4) that:
 
 1. **Natively executes** PS5 x86-64 game code on the host CPU
 2. **Translates** Sony's proprietary OS calls (FreeBSD-derived Orbis OS) to host OS equivalents
@@ -46,7 +46,7 @@ The PS5 uses an **x86-64 Zen 2 CPU** — the same instruction set as desktop PCs
 
 1. **Language**: Rust (recommended for safety + modern tooling) or C++ (more emulator precedents)?
 2. **GPU Backend Priority**: Vulkan-first (Windows + Linux) with Metal planned for macOS? Or target all three from day one?
-3. **Firmware Loading**: Should XPS5X attempt to load actual PS5 firmware modules (`.sprx` libraries), or re-implement them from scratch (cleaner legally, harder technically)?
+3. **Firmware Loading**: Should Raeen attempt to load actual PS5 firmware modules (`.sprx` libraries), or re-implement them from scratch (cleaner legally, harder technically)?
 4. **Licensing**: GPLv2 (like shadPS4), GPLv3, MIT, or proprietary?
 5. **Build System**: Cargo (Rust) / CMake (C++) / Meson?
 
@@ -57,7 +57,7 @@ The PS5 uses an **x86-64 Zen 2 CPU** — the same instruction set as desktop PCs
 ```mermaid
 graph TB
     subgraph "User Space"
-        APP["XPS5X Application (GUI)"]
+        APP["Raeen Application (GUI)"]
         LOADER["Binary Loader<br/>(SELF/ELF/PKG Parser)"]
     end
 
@@ -112,7 +112,7 @@ graph TB
 #### [NEW] Project Root Structure
 
 ```
-r:\Projects\XPS5X\
+r:\Projects\Raeen\
 ├── Cargo.toml                  # Workspace manifest
 ├── README.md                   # Project overview
 ├── LICENSE
@@ -122,20 +122,20 @@ r:\Projects\XPS5X\
 │   ├── gpu-translation.md      # GNM→Vulkan design notes
 │   └── syscall-table.md        # Orbis syscall mapping reference
 ├── crates/
-│   ├── xps5x-core/             # Core emulator engine
+│   ├── raeen-core/             # Core emulator engine
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── config.rs       # Runtime configuration
 │   │       └── error.rs        # Error types
-│   ├── xps5x-loader/           # SELF/ELF/PKG binary loader
+│   ├── raeen-loader/           # SELF/ELF/PKG binary loader
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── elf.rs          # ELF parser
 │   │       ├── self_format.rs  # SELF (Signed ELF) parser
 │   │       └── pkg.rs          # PKG container parser
-│   ├── xps5x-kernel/           # Orbis OS kernel HLE
+│   ├── raeen-kernel/           # Orbis OS kernel HLE
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
@@ -159,7 +159,7 @@ r:\Projects\XPS5X\
 │   │       │   ├── mod.rs
 │   │       │   └── vfs.rs
 │   │       └── hypervisor.rs   # HV stub (security passthrough)
-│   ├── xps5x-gpu/              # GPU command translation
+│   ├── raeen-gpu/              # GPU command translation
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
@@ -188,28 +188,28 @@ r:\Projects\XPS5X\
 │   │           ├── mod.rs
 │   │           ├── formats.rs
 │   │           └── tiling.rs   # PS5 tiling modes → linear
-│   ├── xps5x-audio/            # Tempest 3D audio emulation
+│   ├── raeen-audio/            # Tempest 3D audio emulation
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── tempest.rs      # Spatial audio processing
 │   │       ├── hrtf.rs         # Head-Related Transfer Functions
 │   │       └── output.rs       # Host audio output (WASAPI/PulseAudio/CoreAudio)
-│   ├── xps5x-io/               # I/O complex & storage emulation
+│   ├── raeen-io/               # I/O complex & storage emulation
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── ssd.rs          # SSD speed emulation
 │   │       ├── decompression.rs # Kraken/Oodle decompression
 │   │       └── dma.rs          # DMA transfer emulation
-│   ├── xps5x-input/            # Controller / HID
+│   ├── raeen-input/            # Controller / HID
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── dualsense.rs    # DualSense protocol
 │   │       ├── haptics.rs      # Haptic feedback translation
 │   │       └── adaptive_triggers.rs
-│   ├── xps5x-hle/              # High-Level Emulation of system libraries
+│   ├── raeen-hle/              # High-Level Emulation of system libraries
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
@@ -222,7 +222,7 @@ r:\Projects\XPS5X\
 │   │       ├── libSceNet.rs          # Networking
 │   │       ├── libSceSaveData.rs     # Save data management
 │   │       └── libSceSysmodule.rs    # Module loader
-│   └── xps5x-gui/              # Desktop application / GUI
+│   └── raeen-gui/              # Desktop application / GUI
 │       ├── Cargo.toml
 │       └── src/
 │           ├── main.rs         # Entry point
@@ -245,17 +245,17 @@ r:\Projects\XPS5X\
 
 The absolute foundation. Without this, nothing runs.
 
-#### [NEW] [Cargo.toml](file:///r:/Projects/XPS5X/Cargo.toml)
+#### [NEW] [Cargo.toml](file:///r:/Projects/Raeen/Cargo.toml)
 Rust workspace manifest defining all crates and shared dependencies (ash for Vulkan, winit for windowing, etc.).
 
-#### [NEW] `crates/xps5x-loader/` — Binary Loader
+#### [NEW] `crates/raeen-loader/` — Binary Loader
 - Parse PS5 ELF binaries (standard ELF64 with Sony extensions)
 - Parse SELF (Signed ELF) headers — strip Sony signature envelope, extract inner ELF
 - Parse PKG containers — extract game data files, metadata, and executables
 - Load program segments into virtual memory at correct addresses
 - Handle dynamic linking / relocation of `.sprx` modules (PS5's shared libraries)
 
-#### [NEW] `crates/xps5x-kernel/src/memory/` — Memory Manager
+#### [NEW] `crates/raeen-kernel/src/memory/` — Memory Manager
 - Implement virtual address space emulation (PS5 uses a flat 48-bit virtual address space)
 - Map PS5's unified memory model to host memory:
   - **GARLIC** memory (GPU-accessible, cached) → mapped to GPU-visible host memory
@@ -263,7 +263,7 @@ Rust workspace manifest defining all crates and shared dependencies (ash for Vul
 - Support `mmap`, `munmap`, `mprotect` translations
 - Guard page protection and fault handling
 
-#### [NEW] `crates/xps5x-core/` — Core Engine
+#### [NEW] `crates/raeen-core/` — Core Engine
 - Configuration loading (TOML-based config files)
 - Logging infrastructure (tracing crate)
 - Error types and result handling
@@ -274,7 +274,7 @@ Rust workspace manifest defining all crates and shared dependencies (ash for Vul
 
 The PS5's Orbis OS is a modified FreeBSD. Games don't call raw syscalls — they call Sony's userland libraries (`libkernel.sprx`, `libc.sprx`), which internally use FreeBSD-style syscalls with custom extensions.
 
-#### [NEW] `crates/xps5x-kernel/src/syscalls/` — Syscall Dispatch
+#### [NEW] `crates/raeen-kernel/src/syscalls/` — Syscall Dispatch
 
 Implement a syscall dispatcher that intercepts x86-64 `syscall` instructions and routes them:
 
@@ -289,18 +289,18 @@ Implement a syscall dispatcher that intercepts x86-64 `syscall` instructions and
 | `sys_sysctl` | `sysctl(2)` | Stubbed / emulated |
 | `sys_dynlib_*` | Sony custom | Dynamic library loader |
 
-#### [NEW] `crates/xps5x-kernel/src/threading/` — Thread Management
+#### [NEW] `crates/raeen-kernel/src/threading/` — Thread Management
 - Map PS5 threads to host OS threads
 - Emulate PS5's thread priorities and affinity (8-core mapping)
 - Implement synchronization primitives (mutex, semaphore, event flag, read-write lock)
 - Handle `futex`-style operations
 
-#### [NEW] `crates/xps5x-kernel/src/filesystem/` — Virtual File System
+#### [NEW] `crates/raeen-kernel/src/filesystem/` — Virtual File System
 - Mount points: `/app0/` (game data), `/savedata0/` (save files), `/system/` (firmware modules)
-- Map to host directories (e.g., `/app0/` → `C:\XPS5X\games\GAMEID\`)
+- Map to host directories (e.g., `/app0/` → `C:\Raeen\games\GAMEID\`)
 - Handle PS5-specific file I/O quirks
 
-#### [NEW] `crates/xps5x-kernel/src/hypervisor.rs` — Hypervisor Stub
+#### [NEW] `crates/raeen-kernel/src/hypervisor.rs` — Hypervisor Stub
 - PS5 uses a hypervisor for security (not virtualization)
 - Stub out hypervisor calls — games don't directly interact with HV
 - Pass through CPU feature detection (CPUID spoofing to report Zen 2)
@@ -311,12 +311,12 @@ Implement a syscall dispatcher that intercepts x86-64 `syscall` instructions and
 
 This is the **hardest and most important** component. The PS5's GPU uses Sony's proprietary GNM API, which submits work via **PM4 command packets** directly to the AMD GPU's Command Processor.
 
-#### [NEW] `crates/xps5x-gpu/src/gnm/` — GNM Command Processor
+#### [NEW] `crates/raeen-gpu/src/gnm/` — GNM Command Processor
 
 ```mermaid
 graph LR
     A["PS5 Game Code"] -->|"GNM API calls"| B["PM4 Command Buffer"]
-    B -->|"Parse packets"| C["XPS5X PM4 Decoder"]
+    B -->|"Parse packets"| C["Raeen PM4 Decoder"]
     C -->|"Translate"| D["Vulkan Command Buffer"]
     D -->|"Submit"| E["Host GPU (Vulkan 1.3)"]
 ```
@@ -330,9 +330,9 @@ graph LR
 - **Compute Dispatch**: Convert compute dispatch packets → Vulkan `vkCmdDispatch`
 - **Synchronization**: EOP (End of Pipe) events, GPU fences → Vulkan semaphores/fences
 
-#### [NEW] `crates/xps5x-gpu/src/shader/` — Shader Recompiler ⚡⚡ Hardest Part
+#### [NEW] `crates/raeen-gpu/src/shader/` — Shader Recompiler ⚡⚡ Hardest Part
 
-PS5 shaders are precompiled to AMD GCN/RDNA2 ISA (binary machine code). XPS5X must:
+PS5 shaders are precompiled to AMD GCN/RDNA2 ISA (binary machine code). Raeen must:
 
 1. **Decode** the RDNA2 ISA binary (scalar ALU, vector ALU, memory, export instructions)
 2. **Lift** to an intermediate representation (IR)
@@ -342,7 +342,7 @@ PS5 shaders are precompiled to AMD GCN/RDNA2 ISA (binary machine code). XPS5X mu
 ```mermaid
 graph LR
     A["RDNA2 ISA Binary<br/>(from game)"] --> B["ISA Decoder"]
-    B --> C["XPS5X IR"]
+    B --> C["Raeen IR"]
     C --> D["Optimization Passes"]
     D --> E["SPIR-V Emitter"]
     D --> F["MSL Emitter<br/>(macOS)"]
@@ -354,14 +354,14 @@ graph LR
 - Handle PS5-specific shader features: ray tracing BVH traversal, primitive shaders
 - Implement a **shader cache** (compiled shaders saved to disk for instant reuse)
 
-#### [NEW] `crates/xps5x-gpu/src/vulkan/` — Vulkan Backend
+#### [NEW] `crates/raeen-gpu/src/vulkan/` — Vulkan Backend
 - Instance/device creation with required extensions (VK_KHR_swapchain, VK_EXT_descriptor_indexing, etc.)
 - Render pass and pipeline management
 - Descriptor set handling (PS5 uses flat resource tables → Vulkan descriptor indexing)
 - Memory allocator (VMA-style sub-allocation)
 - Swapchain management and present
 
-#### [NEW] `crates/xps5x-gpu/src/texture/` — Texture Translation
+#### [NEW] `crates/raeen-gpu/src/texture/` — Texture Translation
 - Convert PS5 tiling modes (macro-tiled, micro-tiled) to linear for Vulkan
 - Translate texture formats (BCn, ASTC, platform-specific formats)
 - Handle texture swizzle modes
@@ -370,18 +370,18 @@ graph LR
 
 ### Phase 4 — High-Level Emulation Libraries (Weeks 12–24)
 
-PS5 games link against Sony's userland libraries. Rather than loading actual firmware `.sprx` files (which are encrypted), XPS5X **re-implements** these libraries.
+PS5 games link against Sony's userland libraries. Rather than loading actual firmware `.sprx` files (which are encrypted), Raeen **re-implements** these libraries.
 
-#### [NEW] `crates/xps5x-hle/` — HLE System Libraries
+#### [NEW] `crates/raeen-hle/` — HLE System Libraries
 
 | Library | Purpose | Implementation Strategy |
 |:---|:---|:---|
-| `libkernel.sprx` | Core kernel interface | Route to xps5x-kernel syscalls |
+| `libkernel.sprx` | Core kernel interface | Route to raeen-kernel syscalls |
 | `libc.sprx` | Standard C library | Map to Rust std / libc crate |
-| `libSceGnmDriver.sprx` | GPU command submission | Route to xps5x-gpu |
+| `libSceGnmDriver.sprx` | GPU command submission | Route to raeen-gpu |
 | `libSceVideoOut.sprx` | Display output / flip | Vulkan swapchain present |
-| `libSceAudioOut.sprx` | Audio playback | Route to xps5x-audio |
-| `libScePad.sprx` | Controller input | Route to xps5x-input |
+| `libSceAudioOut.sprx` | Audio playback | Route to raeen-audio |
+| `libScePad.sprx` | Controller input | Route to raeen-input |
 | `libSceNet.sprx` | Networking | BSD socket translation |
 | `libSceSaveData.sprx` | Save game management | Host filesystem mapping |
 | `libSceSysmodule.sprx` | Dynamic module loader | Internal module registry |
@@ -393,7 +393,7 @@ Each function in these libraries will be individually stubbed, then progressivel
 
 ### Phase 5 — Audio, I/O, and Input (Weeks 16–28)
 
-#### [NEW] `crates/xps5x-audio/` — Tempest Audio Emulation
+#### [NEW] `crates/raeen-audio/` — Tempest Audio Emulation
 - HRTF-based 3D spatial audio processing
 - Multi-channel mixing (up to 128 audio objects)
 - Host audio output via platform APIs:
@@ -401,12 +401,12 @@ Each function in these libraries will be individually stubbed, then progressivel
   - Linux: PulseAudio / PipeWire
   - macOS: CoreAudio
 
-#### [NEW] `crates/xps5x-io/` — I/O Complex
+#### [NEW] `crates/raeen-io/` — I/O Complex
 - Emulate the PS5's custom SSD decompression pipeline
 - Implement Kraken/Oodle decompression (the PS5 does this in hardware)
 - Simulate streaming bandwidth for games that rely on guaranteed I/O speeds
 
-#### [NEW] `crates/xps5x-input/` — DualSense Controller
+#### [NEW] `crates/raeen-input/` — DualSense Controller
 - USB/Bluetooth HID protocol for DualSense
 - Haptic feedback translation (DualSense → host gamepad rumble)
 - Adaptive trigger resistance emulation (DualSense-specific, passthrough when connected)
@@ -416,7 +416,7 @@ Each function in these libraries will be individually stubbed, then progressivel
 
 ### Phase 6 — GUI Application (Weeks 20–30)
 
-#### [NEW] `crates/xps5x-gui/` — Desktop Application
+#### [NEW] `crates/raeen-gui/` — Desktop Application
 
 A polished desktop application serving as the front-end:
 

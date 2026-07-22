@@ -8,7 +8,7 @@
 //! The faithful Rust equivalent is `panic!`: it prints the same diagnostic
 //! (message + `file!()`/`line!()`), and terminates the failing operation. We
 //! use `panic!` rather than `std::process::exit(321)` because it is
-//! catchable and testable (`#[should_panic]`), and because the XPS5X runtime
+//! catchable and testable (`#[should_panic]`), and because the Raeen runtime
 //! already builds on `panic = unwind` for its fault machinery. The mapping
 //! ported call sites use:
 //!

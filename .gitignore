@@ -52,7 +52,7 @@ PS5 Firmware/
 logs/
 *.log
 
-# User-installed Shell themes (spec `2026-07-13-xps5x-shell-design.md`
+# User-installed Shell themes (spec `2026-07-13-raeen-shell-design.md`
 # §6/§11): the default theme's manifest is original content and ships in
 # the repo, but everything else under themes/ is either a user-installed
 # theme or user-supplied binary assets (fonts, backgrounds, icons) and must
@@ -77,8 +77,8 @@ Claude.md
 .claude/agents
 .codex/
 Agents.md
-# Diagnostic image written by xps5x-gpu's `dump_triangle_image` test
-# (override the path with XPS5X_TRIANGLE_PPM). A build artifact, not source.
+# Diagnostic image written by raeen-gpu's `dump_triangle_image` test
+# (override the path with RAEEN_TRIANGLE_PPM). A build artifact, not source.
 triangle.ppm
 *.ppm
 scratch/

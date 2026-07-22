@@ -6,7 +6,7 @@ identity-mapped `GuestArena` + VEH design.
 
 ## Ownership
 
-`xps5x-runtime::GuestProcess` is the process lifetime boundary. It owns or
+`raeen-runtime::GuestProcess` is the process lifetime boundary. It owns or
 retains ownership handles for:
 
 - the composed main module and file-backed dependencies;
@@ -23,7 +23,7 @@ clone of the active GPU session so presentation does not own emulator state.
 
 ## HLE subsystem contracts
 
-Contracts live in `xps5x-core::subsystems`; concrete state remains in the
+Contracts live in `raeen-core::subsystems`; concrete state remains in the
 kernel/GPU crates. `HleContext` exposes the contracts alongside the legacy
 kernel reference while adapters are migrated incrementally.
 
@@ -43,8 +43,8 @@ express; extend the contract before duplicating subsystem logic in HLE.
 
 ## Deterministic diagnostics
 
-Set `XPS5X_DETERMINISTIC_DIAGNOSTICS=1` to enable the process-owned bounded
-event stream. `XPS5X_DIAGNOSTIC_CAPACITY` changes its retained tail (default
+Set `RAEEN_DETERMINISTIC_DIAGNOSTICS=1` to enable the process-owned bounded
+event stream. `RAEEN_DIAGNOSTIC_CAPACITY` changes its retained tail (default
 65,536 events). Events contain no host timestamp or host-thread identity.
 
 One monotonically increasing sequence covers:
@@ -56,7 +56,7 @@ One monotonically increasing sequence covers:
 - graphics/async-compute submission.
 
 Events are retained by `OrbisKernel::diagnostics` and emitted to the
-`xps5x::deterministic` tracing target with their stable sequence field.
+`raeen::deterministic` tracing target with their stable sequence field.
 
 ## Guest-memory capabilities
 
@@ -72,10 +72,10 @@ relabelled as executable or GPU-visible by downstream code.
 
 ## Kyty boundary
 
-`kyty-graphics` is an internal mechanism of `xps5x-gpu`. HLE/runtime public
-contracts use XPS5X-owned shader metadata and submission types. Conversion to
-Kyty's `ShaderMappedData` happens inside `xps5x-gpu`; application lifecycle,
-process ownership, and presentation remain in `xps5x-*`.
+`kyty-graphics` is an internal mechanism of `raeen-gpu`. HLE/runtime public
+contracts use Raeen-owned shader metadata and submission types. Conversion to
+Kyty's `ShaderMappedData` happens inside `raeen-gpu`; application lifecycle,
+process ownership, and presentation remain in `raeen-*`.
 
 ## HLE/LLE policy and clean-room boundary
 
@@ -87,6 +87,6 @@ process ownership, and presentation remain in `xps5x-*`.
 - `LleOnly`: require a loaded export.
 
 LLE candidates must come from files supplied by the user/title and must pass
-the existing `KeyProvider` decrypt seam. XPS5X ships no firmware, Sony keys,
+the existing `KeyProvider` decrypt seam. Raeen ships no firmware, Sony keys,
 SDK material, or proprietary modules. A normal installation remains fully
 HLE-first and firmware-independent.

@@ -2,7 +2,7 @@
 //! (`reference/kyty/source/lib/Core/src/VirtualMemory.cpp` +
 //! `include/Kyty/Core/VirtualMemory.h`).
 //!
-//! On Windows — XPS5X's target — Kyty's `Core::VirtualMemory` free functions
+//! On Windows — Raeen's target — Kyty's `Core::VirtualMemory` free functions
 //! are 1:1 forwarders to the `Sys` layer (`Alloc` → `sys_virtual_alloc`,
 //! etc.), so this module is a thin faithful re-export over [`crate::sys_virtual`],
 //! preserving Kyty's two-layer shape (a `Sys::sys_virtual_*` primitive and a
@@ -13,13 +13,13 @@
 //!
 //! Kyty's `VirtualMemory::ExceptionHandler` (a Win32 Vectored Exception
 //! Handler that traps guest access violations and dispatches to a handler
-//! callback) is deliberately **not** ported here: XPS5X's runtime already
+//! callback) is deliberately **not** ported here: Raeen's runtime already
 //! owns that responsibility with its own, more capable VEH machinery
-//! (`xps5x-runtime`'s `dispatch.rs` — trampoline-guard dispatch + RT1a
+//! (`raeen-runtime`'s `dispatch.rs` — trampoline-guard dispatch + RT1a
 //! genuine-fault recovery + exit-longjmp). Adding a second, parallel VEH in
 //! `kyty-core` would violate the project's "don't invent parallel
 //! architectures" rule. If a Kyty-Graphics port later needs the exact
-//! `ExceptionInfo` shape, it should adapt `xps5x-runtime`'s handler rather
+//! `ExceptionInfo` shape, it should adapt `raeen-runtime`'s handler rather
 //! than resurrect this one.
 
 pub use crate::sys_virtual::{Mode, SystemInfo};

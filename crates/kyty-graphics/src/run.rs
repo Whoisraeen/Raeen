@@ -16,7 +16,7 @@
 //!
 //! `kyty-graphics` has no Vulkan dependency, so unlike Kyty (whose
 //! `CommandProcessor` calls straight into `GraphicsRender`) the walk here
-//! terminates at the [`DrawSink`] trait. `xps5x-gpu` implements it.
+//! terminates at the [`DrawSink`] trait. `raeen-gpu` implements it.
 //!
 //! # Resilience policy (deliberate deviation from Kyty)
 //!
@@ -469,7 +469,7 @@ impl CommandProcessor {
     }
 
     fn trace_shader_bind(&mut self) -> bool {
-        if std::env::var_os("XPS5X_TRACE_SHADER_BINDS").is_none() {
+        if std::env::var_os("RAEEN_TRACE_SHADER_BINDS").is_none() {
             return false;
         }
         self.shader_bind_trace_count = self.shader_bind_trace_count.saturating_add(1);
@@ -1367,12 +1367,12 @@ impl CommandProcessor {
                 RegFile::UserConfig => self.set_uconfig_register(reg & 0xEFFF_FFFF, value),
             }
         }
-        // XPS5X_TRACE_INDIRECT: the out-of-range register warns say WHAT was
+        // RAEEN_TRACE_INDIRECT: the out-of-range register warns say WHAT was
         // skipped but not WHY the table looks like vertex data. Dump the raw
         // packet and the table head for the first N packets with any
         // out-of-file offset — mis-decoded layout vs stale/raced memory is
         // decidable from this line alone.
-        if std::env::var_os("XPS5X_TRACE_INDIRECT").is_some() {
+        if std::env::var_os("RAEEN_TRACE_INDIRECT").is_some() {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SEEN: AtomicU32 = AtomicU32::new(0);
             let oob = pairs
@@ -1477,7 +1477,7 @@ impl CommandProcessor {
             // PA_SU_SC_MODE_CNTL was a HALF-WIRED feature: the pm4 constant
             // (pm4.rs), the full `ModeControl` struct (hw_regs.rs) and the
             // consumer that turns cull_front/cull_back into a Vulkan cull mode
-            // (xps5x-gpu draw_translate) all existed, but nothing ever decoded
+            // (raeen-gpu draw_translate) all existed, but nothing ever decoded
             // the register — so `ctx.mode_control` stayed at its all-false
             // default and EVERY draw in EVERY title rasterized with
             // CullModeFlags::NONE. Field layout is Kyty's

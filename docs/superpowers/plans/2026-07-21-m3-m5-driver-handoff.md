@@ -13,7 +13,7 @@ hypothesis was measured FALSE — see Queue Coordination below).
 
 ## 0. The prompt (give this to the driving agent verbatim)
 
-> You are driving XPS5X (clean-room PS5 emulator, Rust, Windows) to M3–M5:
+> You are driving Raeen (clean-room PS5 emulator, Rust, Windows) to M3–M5:
 > every installed title rendering real graphics and playing. Work on `main`.
 > Read, in order: `CLAUDE.md`, this file,
 > `~/.claude/.../memory/MEMORY.md` index + the per-title memory bodies
@@ -50,7 +50,7 @@ Per title (fresh measurements, not aspirations):
   Presents an evolving fullscreen gradient (its pre-scene pass) — verified
   title pixels, NOT the emulator clear color. 5 unique untranslatable compute
   shaders remain (named). One CS quarantined for GPU device-loss
-  (`0x5006c5f00`, `XPS5X_SKIP_CS` forensics exist).
+  (`0x5006c5f00`, `RAEEN_SKIP_CS` forensics exist).
 - **Minecraft** — boots deep (LevelDB/Gameface/RakNet), flips at 40–63/s
   after perf stages A–C, stalls ~90s in on PSN auth
   (`SceNpAuthAuthorizedAppDialog`, `SceNpWebApi`). Menu HTML
@@ -67,7 +67,7 @@ Perf (goal: 120 FPS at least one title; `/goal` hook may still be active):
 stage A (pipeline/image caches — build 11 µs/draw), stage B (deferred
 per-flush readback — submit p50 74 µs), stage C (flush-per-flip 1.02/flip,
 flip-limited readback p50 7 ms, upload ring) ALL COMMITTED. Vblank pacing is
-epoch-anchored with `XPS5X_VBLANK_HZ` (default 60). Minecraft boot animation
+epoch-anchored with `RAEEN_VBLANK_HZ` (default 60). Minecraft boot animation
 self-paces ~60; sustained-120 evidence needs an unthrottled phase (= the menu,
 = the PSN stub). True zero-copy swapchain assessed: needs
 `VK_KHR_external_memory_win32` interop or shared device with eframe/wgpu —
@@ -79,8 +79,8 @@ commit if green; its report is authoritative over this doc for those items.
 
 ## 2. THE LOOP (validated over ~10 rounds; do not improvise around it)
 
-1. Bounded release run: `cargo build --release -p xps5x-gui` then
-   `XPS5X_LOG="warn,xps5x_gpu=debug" XPS5X_DUMP_FRAMES=<dir> timeout -s KILL 300
+1. Bounded release run: `cargo build --release -p raeen-gui` then
+   `RAEEN_LOG="warn,raeen_gpu=debug" RAEEN_DUMP_FRAMES=<dir> timeout -s KILL 300
    ./target/release/raeen.exe --run-eboot "Games/<title>/<app>/eboot.bin" > run.log 2>&1`
 2. Classify the FIRST named blocker by count:
    `grep -oE "next_gen: [a-z_0-9]+: [^\"]{0,60}" run.log | sed 's/at addr.*//' | sort | uniq -c | sort -rn | head`
@@ -94,8 +94,8 @@ commit if green; its report is authoritative over this doc for those items.
 
 ## 3. Traps that cost sessions (all learned the hard way)
 
-- Logs filter via `XPS5X_LOG`, **not** RUST_LOG. Frame dumps via
-  `XPS5X_DUMP_FRAMES`. Validation opt-in `XPS5X_VULKAN_VALIDATION=1`
+- Logs filter via `RAEEN_LOG`, **not** RUST_LOG. Frame dumps via
+  `RAEEN_DUMP_FRAMES`. Validation opt-in `RAEEN_VULKAN_VALIDATION=1`
   (~0.9 s/pipeline — looks like a hang).
 - **Shell ≠ CLI** (three recorded divergences). Verify user-facing claims in
   the real Shell (`.claude/skills/verify`); the title-VA window reservation
@@ -114,7 +114,7 @@ commit if green; its report is authoritative over this doc for those items.
 - Windows sleep quantization (~15.6 ms) breaks naive frame pacing — the
   vblank waiter's coarse-sleep+yield-spin pattern is the template.
 - `scratch/` holds captured shader dumps + disasm (`shader_probe` example);
-  `XPS5X_DUMP_SHADERS` + `enumerate_dumps` for fresh captures.
+  `RAEEN_DUMP_SHADERS` + `enumerate_dumps` for fresh captures.
 
 ## 4. Per-title drive plans (highest value first)
 
@@ -155,7 +155,7 @@ waits in `pthread_cond_timedwait` on a cond nothing signals to completion.
    memory has ~10 eliminated hypotheses — READ THE BODY before diagnosing.
 2. Gameface/Ore-UI page handoff (`data/gui/dist/hbui`) — HLE class, not GPU;
    only relevant AFTER the live-lock clears (menu HTML never opened yet).
-3. When the menu runs unthrottled: `XPS5X_VBLANK_HZ=120` and measure
+3. When the menu runs unthrottled: `RAEEN_VBLANK_HZ=120` and measure
    flips/s sustained — this is the 120 FPS goal's test bench. If flip cost
    caps it, next lever is async flip readback (attempted once — deadlocked a
    title mutex; re-attempt condition documented at `present_scanout`).
@@ -163,7 +163,7 @@ waits in `pthread_cond_timedwait` on a cond nothing signals to completion.
 
 ### 4.3 UE5 pair → boot, then graphics
 1. The condvar starvation: trace who should post the RHI-init events
-   (ledger has stack chains, `XPS5X_TRACE_COND`). This is engine-handshake
+   (ledger has stack chains, `RAEEN_TRACE_COND`). This is engine-handshake
    RE, not missing imports (all resolve now).
 2. The moment they submit: implement CP `IT_INDIRECT_BUFFER` chain execution
    (predicted wall, run.rs has no handler; decode counts 0x25 not 0x24).
@@ -178,7 +178,7 @@ Hard measurements (release, stages A–C + epoch vblank committed):
 - **Present pipeline capability: >120 fps proven.** Min inter-flip interval
   2.03 ms (~490/s); `sceVideoOutSubmitFlip` has NO pacing sleep (records +
   returns); Minecraft never calls `sceVideoOutWaitVblank` (0 calls) so
-  `XPS5X_VBLANK_HZ` is IRRELEVANT to it (it applies only to titles that park
+  `RAEEN_VBLANK_HZ` is IRRELEVANT to it (it applies only to titles that park
   on vblank). The stage-C "vblank sleep was the ceiling" note was for the
   WaitVblank path; Minecraft is the SubmitFlip path and was never throttled
   by us.
@@ -190,7 +190,7 @@ Hard measurements (release, stages A–C + epoch vblank committed):
   at 8 ms) = the title's own boot-animation loop costs ~22 ms of guest x86
   per frame. It never negotiates a 120 mode (`IsOutputSupported`/
   `ConfigureOutput` = 0 calls). Our GPU/present is not the cap.
-- **CORRECTION (deeper measurement, XPS5X_TIME_DRAW on Minecraft):** the 22 ms
+- **CORRECTION (deeper measurement, RAEEN_TIME_DRAW on Minecraft):** the 22 ms
   frame is NOT purely title-CPU. Per-draw `build_us` p50 **969 µs** (p90 2.6 ms,
   max 30 ms) × ~20 draws/frame ≈ **~20 ms of OUR per-draw build throughput** on
   the GPU worker thread, which the guest render thread blocks behind at the
@@ -209,7 +209,7 @@ Hard measurements (release, stages A–C + epoch vblank committed):
   batching all a frame's draw command buffers into ONE vkQueueSubmit, 120 is
   reachable on the boot-animation phase alone (no gameplay needed).
   RISK: hot-path + a prior async-flip attempt deadlocked — change carefully,
-  keep XPS5X_NO_DEFER as the A/B, re-test Minecraft + ASTRO each step.
+  keep RAEEN_NO_DEFER as the A/B, re-test Minecraft + ASTRO each step.
 - **CONCLUSION:** 120 FPS is reachable via stage D (persistent depth targets +
   submit batching) on Minecraft's boot-animation phase — a graphics-perf lever,
   measurable now, no title progression required. Secondary path: any title in a
@@ -234,7 +234,7 @@ Hard measurements (release, stages A–C + epoch vblank committed):
 cargo test -p <touched crates>       # then dependents if ABI moved
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
-cargo build --release -p xps5x-gui   # the artifact users run
+cargo build --release -p raeen-gui   # the artifact users run
 ```
 Commit only when all pass. One logical round per commit, measured
 before/after in the message. Never commit `reference/`, `Games/`,
@@ -242,7 +242,7 @@ before/after in the message. Never commit `reference/`, `Games/`,
 
 ## 7. Subagent pattern that worked
 
-Disjoint crate scopes per agent (kyty-graphics vs xps5x-gpu vs xps5x-hle),
+Disjoint crate scopes per agent (kyty-graphics vs raeen-gpu vs raeen-hle),
 explicit "do NOT touch X / do not run fmt --all", evidence-first briefs with
 measured counts and file:line citations, TDD required, report format
 specified. Integrate + measure + commit in the driver loop. 3–4 parallel

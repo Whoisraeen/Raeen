@@ -10,7 +10,7 @@
 //!
 //! This crate deliberately carries **no Vulkan dependency** — Kyty's
 //! `GraphicsRender` layer is not ported here. [`run::CommandProcessor`]
-//! terminates at the [`run::DrawSink`] trait, which `xps5x-gpu` implements.
+//! terminates at the [`run::DrawSink`] trait, which `raeen-gpu` implements.
 
 pub mod hw_regs;
 pub mod pm4;

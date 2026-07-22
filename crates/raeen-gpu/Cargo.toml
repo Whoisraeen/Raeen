@@ -1,0 +1,40 @@
+[package]
+name = "raeen-gpu"
+description = "GPU command translation — GNM/PM4 to Vulkan, shader recompiler, texture translation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+raeen-core = { workspace = true }
+kyty-graphics = { workspace = true }
+# In-process spirv-val (the real Khronos validator, compiled in): the
+# translate-time validity gate. An invalid module reaching the driver is
+# undefined behavior — measured as an AMD driver access violation that kills
+# the process. naga cannot serve here: its SPIR-V front end structurizes and
+# ACCEPTS back-edge modules spirv-val (and the driver) reject.
+spirv-tools = { version = "0.12", default-features = false, features = ["use-compiled-tools"] }
+ash = { workspace = true }
+gpu-allocator = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+bitflags = { workspace = true }
+bytemuck = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+raw-window-handle = { workspace = true }
+
+# guest_mem: VirtualQuery-validated reads of the identity-mapped guest arena
+# for the PM4 command processor's pointer-carrying packets.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[dev-dependencies]
+# SPIR-V structural validator for the shader-emitter tests. Used under its MIT
+# license option (GPL-2.0-only compatible). Test-only — not linked into the
+# distributed emulator. See docs/reference-port-ledger.md (SPIR-V body rows).
+rspirv = "0.12"
+# Lets a failing GPU test print the validation messages it counted
+# (RAEEN_TEST_LOG=1); test-only, not linked into the emulator.
+tracing-subscriber = { workspace = true }

@@ -6,7 +6,7 @@
 //! Windows implementation this module ports; every function is `inline` in
 //! the header itself, there is no separate `.cpp`).
 //!
-//! XPS5X is Windows-first, so only the Windows implementation is ported.
+//! Raeen is Windows-first, so only the Windows implementation is ported.
 //! This whole module is gated `#[cfg(windows)]`.
 //!
 //! std mapping used by this port:

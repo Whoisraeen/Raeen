@@ -1,7 +1,7 @@
 //! Port of Kyty's `Sys::sys_strtoX` family
 //! (`reference/kyty/source/include/Kyty/Sys/SysStdlib.h`, which is just
 //! `#include "Kyty/Sys/Linux/SysLinuxStdlib.h"` +
-//! `#include "Kyty/Sys/Windows/SysWindowsStdlib.h"`; XPS5X targets Windows
+//! `#include "Kyty/Sys/Windows/SysWindowsStdlib.h"`; Raeen targets Windows
 //! only, so this ports `include/Kyty/Sys/Windows/SysWindowsStdlib.h` — six
 //! `inline` one-liners forwarding to the C runtime: `sys_strtof`/`sys_strtod`
 //! -> `strtof`/`strtod`, `sys_strtoi32`/`sys_strtoui32` -> `strtol`/`strtoul`,
@@ -45,7 +45,7 @@
 //! implemented, matching the same documented divergence already accepted for
 //! [`crate::string8::String8::to_double`].
 //!
-//! Gated to `#[cfg(windows)]`: XPS5X's only target is Windows, and this file
+//! Gated to `#[cfg(windows)]`: Raeen's only target is Windows, and this file
 //! is specifically the port of the Windows-side header (the Linux side,
 //! `SysLinuxStdlib.h`, is out of scope).
 

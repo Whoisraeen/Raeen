@@ -1253,7 +1253,7 @@ pub fn shader_parse_usage(
     Ok(())
 }
 
-/// `XPS5X_TRACE_EUD` evidence dump: the full `ShaderUserData` mapping tables,
+/// `RAEEN_TRACE_EUD` evidence dump: the full `ShaderUserData` mapping tables,
 /// the captured user SGPRs, and a window of guest memory behind every
 /// SGPR pair that looks like a pointer. The EUD resolver must know which pair
 /// is the extended-user-data base and which table entry names it — this prints
@@ -1266,7 +1266,7 @@ fn trace_eud_evidence(
     declared: i32,
     mem: &impl ShaderMemory,
 ) {
-    if std::env::var_os("XPS5X_TRACE_EUD").is_none() {
+    if std::env::var_os("RAEEN_TRACE_EUD").is_none() {
         return;
     }
     // One compound line per shader so evidence can never be cross-attributed
@@ -2366,7 +2366,7 @@ fn read_extended_user_data(
     // loads could pick the wrong one, which shows up as wrong descriptors rather
     // than an error. Narrow it (e.g. by preferring the earliest load, or by
     // validating descriptor shape) if a title renders wrong data.
-    let trace = std::env::var_os("XPS5X_TRACE_EUD").is_some();
+    let trace = std::env::var_os("RAEEN_TRACE_EUD").is_some();
     // A shader that is unmapped or unparseable yields no scalar-load bases,
     // but must NOT abort the resolver — strategy 3 below works from the
     // captured registers alone.
@@ -4473,14 +4473,14 @@ mod tests {
         );
     }
 
-    /// Manual disassembly harness (no-op unless `XPS5X_DISASM_FILE` names a
+    /// Manual disassembly harness (no-op unless `RAEEN_DISASM_FILE` names a
     /// dumped `.bin`): parses the shader and prints its instruction types and
     /// recovered scalar-load bases. Used to read the EUD/SRT CS's descriptor
     /// pointer-load pattern while building the resolver. Run with
-    /// `XPS5X_DISASM_FILE=... cargo test -p kyty-graphics disasm_shader_from_env -- --nocapture`.
+    /// `RAEEN_DISASM_FILE=... cargo test -p kyty-graphics disasm_shader_from_env -- --nocapture`.
     #[test]
     fn disasm_shader_from_env() {
-        let Ok(path) = std::env::var("XPS5X_DISASM_FILE") else {
+        let Ok(path) = std::env::var("RAEEN_DISASM_FILE") else {
             return;
         };
         let bytes = std::fs::read(&path).expect("read shader dump");

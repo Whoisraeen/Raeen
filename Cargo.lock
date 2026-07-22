@@ -3098,6 +3098,186 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "raeen-audio"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cpal",
+ "raeen-core",
+ "tracing",
+]
+
+[[package]]
+name = "raeen-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bitflags 2.13.0",
+ "serde",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "raeen-firmware"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "cbc",
+ "goblin",
+ "iced-x86",
+ "memmap2",
+ "raeen-core",
+ "raeen-hle",
+ "raeen-loader",
+ "sha1",
+ "tracing",
+]
+
+[[package]]
+name = "raeen-gpu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "bitflags 2.13.0",
+ "bytemuck",
+ "dashmap",
+ "gpu-allocator",
+ "kyty-graphics",
+ "parking_lot",
+ "raeen-core",
+ "raw-window-handle",
+ "rspirv",
+ "spirv-tools",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "raeen-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "eframe",
+ "egui",
+ "gilrs",
+ "goblin",
+ "iced-x86",
+ "image",
+ "raeen-audio",
+ "raeen-core",
+ "raeen-firmware",
+ "raeen-gpu",
+ "raeen-hle",
+ "raeen-input",
+ "raeen-io",
+ "raeen-kernel",
+ "raeen-loader",
+ "raeen-runtime",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "raeen-hle"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dashmap",
+ "getrandom 0.3.4",
+ "memchr",
+ "raeen-audio",
+ "raeen-core",
+ "raeen-gpu",
+ "raeen-input",
+ "raeen-kernel",
+ "serde_json",
+ "sha1",
+ "tracing",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "raeen-input"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gilrs",
+ "raeen-core",
+ "tracing",
+]
+
+[[package]]
+name = "raeen-io"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lz4_flex",
+ "raeen-core",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
+name = "raeen-kernel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bitflags 2.13.0",
+ "crossbeam",
+ "dashmap",
+ "memmap2",
+ "parking_lot",
+ "raeen-core",
+ "raeen-loader",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "raeen-loader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bitflags 2.13.0",
+ "bytemuck",
+ "goblin",
+ "memmap2",
+ "raeen-core",
+ "scroll",
+ "thiserror 2.0.18",
+ "tracing",
+ "zerocopy",
+]
+
+[[package]]
+name = "raeen-runtime"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
+ "raeen-core",
+ "raeen-firmware",
+ "raeen-gpu",
+ "raeen-hle",
+ "raeen-kernel",
+ "thiserror 2.0.18",
+ "tracing",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "rand"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5113,186 +5293,6 @@ name = "xml-rs"
 version = "0.8.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
-
-[[package]]
-name = "xps5x-audio"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cpal",
- "tracing",
- "xps5x-core",
-]
-
-[[package]]
-name = "xps5x-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bitflags 2.13.0",
- "serde",
- "thiserror 2.0.18",
- "toml",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "xps5x-firmware"
-version = "0.1.0"
-dependencies = [
- "aes",
- "cbc",
- "goblin",
- "iced-x86",
- "memmap2",
- "sha1",
- "tracing",
- "xps5x-core",
- "xps5x-hle",
- "xps5x-loader",
-]
-
-[[package]]
-name = "xps5x-gpu"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ash",
- "bitflags 2.13.0",
- "bytemuck",
- "dashmap",
- "gpu-allocator",
- "kyty-graphics",
- "parking_lot",
- "raw-window-handle",
- "rspirv",
- "spirv-tools",
- "thiserror 2.0.18",
- "tracing",
- "tracing-subscriber",
- "windows-sys 0.59.0",
- "xps5x-core",
-]
-
-[[package]]
-name = "xps5x-gui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "eframe",
- "egui",
- "gilrs",
- "goblin",
- "iced-x86",
- "image",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "toml",
- "tracing",
- "tracing-subscriber",
- "ureq",
- "windows-sys 0.59.0",
- "xps5x-audio",
- "xps5x-core",
- "xps5x-firmware",
- "xps5x-gpu",
- "xps5x-hle",
- "xps5x-input",
- "xps5x-io",
- "xps5x-kernel",
- "xps5x-loader",
- "xps5x-runtime",
-]
-
-[[package]]
-name = "xps5x-hle"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dashmap",
- "getrandom 0.3.4",
- "memchr",
- "serde_json",
- "sha1",
- "tracing",
- "windows-sys 0.59.0",
- "xps5x-audio",
- "xps5x-core",
- "xps5x-gpu",
- "xps5x-input",
- "xps5x-kernel",
-]
-
-[[package]]
-name = "xps5x-input"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gilrs",
- "tracing",
- "xps5x-core",
-]
-
-[[package]]
-name = "xps5x-io"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "lz4_flex",
- "tracing",
- "xps5x-core",
- "zstd",
-]
-
-[[package]]
-name = "xps5x-kernel"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bitflags 2.13.0",
- "crossbeam",
- "dashmap",
- "memmap2",
- "parking_lot",
- "thiserror 2.0.18",
- "tracing",
- "xps5x-core",
- "xps5x-loader",
-]
-
-[[package]]
-name = "xps5x-loader"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bitflags 2.13.0",
- "bytemuck",
- "goblin",
- "memmap2",
- "scroll",
- "thiserror 2.0.18",
- "tracing",
- "xps5x-core",
- "zerocopy",
-]
-
-[[package]]
-name = "xps5x-runtime"
-version = "0.1.0"
-dependencies = [
- "iced-x86",
- "thiserror 2.0.18",
- "tracing",
- "windows-sys 0.59.0",
- "xps5x-core",
- "xps5x-firmware",
- "xps5x-gpu",
- "xps5x-hle",
- "xps5x-kernel",
-]
 
 [[package]]
 name = "yoke"

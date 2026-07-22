@@ -1,6 +1,6 @@
 //! Offline coverage enumerator for real dumped shaders.
 //!
-//! `XPS5X_DUMP_SHADERS` (see `xps5x-gpu::shader_fetch`) writes every distinct
+//! `RAEEN_DUMP_SHADERS` (see `raeen-gpu::shader_fetch`) writes every distinct
 //! shader a title binds to `<stage>_<addr>_<len>.bin`. This test replays those
 //! dumps through parse and then classifies EVERY instruction against the
 //! recompiler table in one pass — instead of discovering missing recompilers
@@ -8,7 +8,7 @@
 //!
 //! Run with:
 //! ```text
-//! XPS5X_SHADER_DUMP_DIR=path/to/dumps cargo test -p kyty-graphics \
+//! RAEEN_SHADER_DUMP_DIR=path/to/dumps cargo test -p kyty-graphics \
 //!     --test enumerate_dumps -- --nocapture
 //! ```
 //! Without the env var the test is a no-op (CI has no dumps).
@@ -43,14 +43,14 @@ impl ShaderMemory for DumpMem {
 }
 
 fn parse_dump(stage: &str, mem: &DumpMem) -> Result<ShaderCode, String> {
-    // Mirror xps5x-gpu's attempt_generations: next-gen first, legacy second,
+    // Mirror raeen-gpu's attempt_generations: next-gen first, legacy second,
     // both reasons on failure.
     let attempt = |next_gen: bool| -> Result<ShaderCode, String> {
         let sh_regs = ShaderRegisters::default();
         match stage {
             "vs" => {
                 // Real PS5 titles bind the VS through the ES slot with a GS
-                // checksum (`gs_instead_of_vs` — see xps5x-gpu translate_vs);
+                // checksum (`gs_instead_of_vs` — see raeen-gpu translate_vs);
                 // replay the dump the same way.
                 let mut vs = VertexShaderInfo::default();
                 vs.es_regs.data_addr = mem.base;
@@ -77,8 +77,8 @@ fn parse_dump(stage: &str, mem: &DumpMem) -> Result<ShaderCode, String> {
 
 #[test]
 fn enumerate_dumped_shader_coverage() {
-    let Ok(dir) = std::env::var("XPS5X_SHADER_DUMP_DIR") else {
-        eprintln!("XPS5X_SHADER_DUMP_DIR not set — nothing to enumerate");
+    let Ok(dir) = std::env::var("RAEEN_SHADER_DUMP_DIR") else {
+        eprintln!("RAEEN_SHADER_DUMP_DIR not set — nothing to enumerate");
         return;
     };
     let mut dumps: Vec<_> = std::fs::read_dir(&dir)

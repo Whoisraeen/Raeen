@@ -2,49 +2,49 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the foundation of the `xps5x-firmware` crate — parse the SLB2/PUP firmware container, expose its entries, install the user-supplied `KeyProvider` decryption seam, provide the SCE NID hashing/encoding library, and ship an `xps5x --firmware-info <PUP>` diagnostic (milestone **LM0**).
+**Goal:** Build the foundation of the `raeen-firmware` crate — parse the SLB2/PUP firmware container, expose its entries, install the user-supplied `KeyProvider` decryption seam, provide the SCE NID hashing/encoding library, and ship an `raeen --firmware-info <PUP>` diagnostic (milestone **LM0**).
 
-**Architecture:** A new `xps5x-firmware` crate depends on `xps5x-core` (errors/types) and `xps5x-loader` (ELF/SELF primitives). It parses the plaintext SLB2 container structure without touching encryption, holds the `KeyProvider` trait behind which real decryption plugs in later, and computes SCE NIDs so a future linker can resolve imports. The GUI binary gains a diagnostic flag that inspects a firmware package and exits.
+**Architecture:** A new `raeen-firmware` crate depends on `raeen-core` (errors/types) and `raeen-loader` (ELF/SELF primitives). It parses the plaintext SLB2 container structure without touching encryption, holds the `KeyProvider` trait behind which real decryption plugs in later, and computes SCE NIDs so a future linker can resolve imports. The GUI binary gains a diagnostic flag that inspects a firmware package and exits.
 
-**Tech Stack:** Rust (edition 2024), `memmap2` (map the ~1.2 GB PUP without reading it into RAM), `sha1` (NID hashing), `tracing` (logging), `thiserror`-based errors from `xps5x-core`.
+**Tech Stack:** Rust (edition 2024), `memmap2` (map the ~1.2 GB PUP without reading it into RAM), `sha1` (NID hashing), `tracing` (logging), `thiserror`-based errors from `raeen-core`.
 
 ## Global Constraints
 
-- **Clean-room boundary (spec §2):** XPS5X ships **no keys, no firmware, no key-extraction/circumvention tooling**. Code consumes keys through a `KeyProvider`; it never derives, guesses, brute-forces, or extracts them.
+- **Clean-room boundary (spec §2):** Raeen ships **no keys, no firmware, no key-extraction/circumvention tooling**. Code consumes keys through a `KeyProvider`; it never derives, guesses, brute-forces, or extracts them.
 - **No real firmware bytes in tests.** All parser tests build synthetic byte buffers the test controls. The real `PS5 Firmware/PS5UPDATE.PUP` is used only in manual verification steps.
 - **`PS5 Firmware/` stays git-ignored** (already in `.gitignore`); never commit firmware or key material.
 - **Missing keys are non-fatal:** decryption without a key logs at `info` and returns `FirmwareError::MissingKey { key_id }`, never a panic or hard error.
 - **Rust edition 2024, `rust-version` 1.85** (inherited from the workspace).
-- **Every task ends clippy-clean:** `cargo clippy -p xps5x-firmware --all-targets` must emit zero warnings before commit.
-- **Errors** come from `xps5x_core::error::FirmwareError` (variants: `InvalidPupMagic(u32)`, `PupEntryOutOfBounds { index: usize }`, `MissingKey { key_id: u64 }`, `UnsupportedRelocation(u32)`, `MalformedDynlibData(String)`, `Loader(#[from] LoaderError)`). `LoaderError` has `Io(#[from] std::io::Error)`, so `io::Error → LoaderError → FirmwareError` chains.
+- **Every task ends clippy-clean:** `cargo clippy -p raeen-firmware --all-targets` must emit zero warnings before commit.
+- **Errors** come from `raeen_core::error::FirmwareError` (variants: `InvalidPupMagic(u32)`, `PupEntryOutOfBounds { index: usize }`, `MissingKey { key_id: u64 }`, `UnsupportedRelocation(u32)`, `MalformedDynlibData(String)`, `Loader(#[from] LoaderError)`). `LoaderError` has `Io(#[from] std::io::Error)`, so `io::Error → LoaderError → FirmwareError` chains.
 
 ---
 
-### Task 1: Scaffold the `xps5x-firmware` crate
+### Task 1: Scaffold the `raeen-firmware` crate
 
 **Files:**
-- Create: `crates/xps5x-firmware/Cargo.toml`
-- Create: `crates/xps5x-firmware/src/lib.rs`
+- Create: `crates/raeen-firmware/Cargo.toml`
+- Create: `crates/raeen-firmware/src/lib.rs`
 - Modify: `Cargo.toml` (workspace root — add crate to `members`, add `sha1` and the crate path to `workspace.dependencies`)
 
 **Interfaces:**
-- Produces: the `xps5x-firmware` crate, buildable as a workspace member; a `xps5x_firmware::CRATE_NAME: &str` constant used only to give Task 1 a trivial passing test.
+- Produces: the `raeen-firmware` crate, buildable as a workspace member; a `raeen_firmware::CRATE_NAME: &str` constant used only to give Task 1 a trivial passing test.
 
 - [ ] **Step 1: Create the crate manifest**
 
-Create `crates/xps5x-firmware/Cargo.toml`:
+Create `crates/raeen-firmware/Cargo.toml`:
 
 ```toml
 [package]
-name = "xps5x-firmware"
+name = "raeen-firmware"
 description = "PS5 firmware ingestion — PUP parsing, user-supplied key decryption seam, SCE module loading and NID linking"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-xps5x-core = { workspace = true }
-xps5x-loader = { workspace = true }
+raeen-core = { workspace = true }
+raeen-loader = { workspace = true }
 tracing = { workspace = true }
 memmap2 = { workspace = true }
 sha1 = { workspace = true }
@@ -52,55 +52,55 @@ sha1 = { workspace = true }
 
 - [ ] **Step 2: Create the crate root with a smoke-test constant**
 
-Create `crates/xps5x-firmware/src/lib.rs`:
+Create `crates/raeen-firmware/src/lib.rs`:
 
 ```rust
-//! # XPS5X Firmware
+//! # Raeen Firmware
 //!
 //! The "firmware spine": ingests PS5 firmware packages (PUP/SLB2),
 //! decrypts SELF/module payloads through a **user-supplied** [`KeyProvider`]
-//! (XPS5X ships no keys), and — in later milestones — parses and links
+//! (Raeen ships no keys), and — in later milestones — parses and links
 //! Sony's real `.sprx` modules by NID against HLE or LLE implementations.
 //!
 //! This crate never contains or extracts Sony keys or firmware. See the
 //! design spec, section 2, for the clean-room boundary.
 
 /// Crate identifier, used in diagnostics.
-pub const CRATE_NAME: &str = "xps5x-firmware";
+pub const CRATE_NAME: &str = "raeen-firmware";
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn crate_name_is_set() {
-        assert_eq!(super::CRATE_NAME, "xps5x-firmware");
+        assert_eq!(super::CRATE_NAME, "raeen-firmware");
     }
 }
 ```
 
 - [ ] **Step 3: Wire the crate into the workspace**
 
-In the root `Cargo.toml`, add `"crates/xps5x-firmware",` to the `members` list (keep it alongside the other `crates/xps5x-*` entries). Then, in `[workspace.dependencies]`, add the external dep near the other hashing/parsing deps:
+In the root `Cargo.toml`, add `"crates/raeen-firmware",` to the `members` list (keep it alongside the other `crates/raeen-*` entries). Then, in `[workspace.dependencies]`, add the external dep near the other hashing/parsing deps:
 
 ```toml
 sha1 = "0.10"
 ```
 
-and add the internal crate path alongside the other `xps5x-*` path entries:
+and add the internal crate path alongside the other `raeen-*` path entries:
 
 ```toml
-xps5x-firmware = { path = "crates/xps5x-firmware" }
+raeen-firmware = { path = "crates/raeen-firmware" }
 ```
 
 - [ ] **Step 4: Build and test**
 
-Run: `cargo test -p xps5x-firmware`
+Run: `cargo test -p raeen-firmware`
 Expected: compiles; `test crate_name_is_set ... ok`; `test result: ok. 1 passed`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/xps5x-firmware/Cargo.toml crates/xps5x-firmware/src/lib.rs Cargo.toml Cargo.lock
-git commit -m "feat(firmware): scaffold xps5x-firmware crate"
+git add crates/raeen-firmware/Cargo.toml crates/raeen-firmware/src/lib.rs Cargo.toml Cargo.lock
+git commit -m "feat(firmware): scaffold raeen-firmware crate"
 ```
 
 ---
@@ -108,25 +108,25 @@ git commit -m "feat(firmware): scaffold xps5x-firmware crate"
 ### Task 2: SLB2 container parser
 
 **Files:**
-- Create: `crates/xps5x-firmware/src/slb2.rs`
-- Modify: `crates/xps5x-firmware/src/lib.rs` (add `pub mod slb2;` and re-export)
+- Create: `crates/raeen-firmware/src/slb2.rs`
+- Modify: `crates/raeen-firmware/src/lib.rs` (add `pub mod slb2;` and re-export)
 
 **Interfaces:**
 - Produces:
   - `pub struct Slb2Entry { pub name: String, pub offset: u64, pub size: u64 }` (derives `Debug, Clone, PartialEq, Eq`)
-  - `pub fn parse_slb2(data: &[u8]) -> Result<Vec<Slb2Entry>, xps5x_core::error::FirmwareError>`
+  - `pub fn parse_slb2(data: &[u8]) -> Result<Vec<Slb2Entry>, raeen_core::error::FirmwareError>`
 
 **Format note:** SLB2 is a `0x20`-byte header (`"SLB2"` magic, `version`, `flags`, `file_count` at `0x0C`, `block_count` at `0x10`, reserved) followed by `file_count` entries of `0x30` bytes each: `block_offset` (u32, in 512-byte blocks), `size` (u32, bytes), 8 reserved bytes, then a `0x20`-byte null-terminated `name`. Payloads live at `block_offset * 512`.
 
 - [ ] **Step 1: Write the failing tests**
 
-Add `pub mod slb2;` to `crates/xps5x-firmware/src/lib.rs` (below the `CRATE_NAME` const), then create `crates/xps5x-firmware/src/slb2.rs` with **only** this test module at the bottom (the implementation comes in Step 3):
+Add `pub mod slb2;` to `crates/raeen-firmware/src/lib.rs` (below the `CRATE_NAME` const), then create `crates/raeen-firmware/src/slb2.rs` with **only** this test module at the bottom (the implementation comes in Step 3):
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xps5x_core::error::FirmwareError;
+    use raeen_core::error::FirmwareError;
 
     /// Build a synthetic SLB2 container with one entry.
     fn synthetic_slb2() -> Vec<u8> {
@@ -174,12 +174,12 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p xps5x-firmware slb2`
+Run: `cargo test -p raeen-firmware slb2`
 Expected: FAIL to compile — `cannot find function parse_slb2`.
 
 - [ ] **Step 3: Write the implementation**
 
-At the **top** of `crates/xps5x-firmware/src/slb2.rs` (above the test module):
+At the **top** of `crates/raeen-firmware/src/slb2.rs` (above the test module):
 
 ```rust
 //! SLB2 firmware container parser.
@@ -190,7 +190,7 @@ At the **top** of `crates/xps5x-firmware/src/slb2.rs` (above the test module):
 //! Entry *contents* may be encrypted; this parser only reads the container
 //! structure and never attempts decryption.
 
-use xps5x_core::error::FirmwareError;
+use raeen_core::error::FirmwareError;
 
 const SLB2_MAGIC: [u8; 4] = *b"SLB2";
 const SLB2_BLOCK_SIZE: u64 = 0x200; // 512 bytes
@@ -255,7 +255,7 @@ pub fn parse_slb2(data: &[u8]) -> Result<Vec<Slb2Entry>, FirmwareError> {
 }
 ```
 
-Then update the re-export in `crates/xps5x-firmware/src/lib.rs` so the module is declared and its type surfaced:
+Then update the re-export in `crates/raeen-firmware/src/lib.rs` so the module is declared and its type surfaced:
 
 ```rust
 pub mod slb2;
@@ -265,14 +265,14 @@ pub use slb2::{parse_slb2, Slb2Entry};
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p xps5x-firmware slb2`
+Run: `cargo test -p raeen-firmware slb2`
 Expected: PASS — `test result: ok. 3 passed`.
 
 - [ ] **Step 5: Lint and commit**
 
 ```bash
-cargo clippy -p xps5x-firmware --all-targets
-git add crates/xps5x-firmware/src/slb2.rs crates/xps5x-firmware/src/lib.rs
+cargo clippy -p raeen-firmware --all-targets
+git add crates/raeen-firmware/src/slb2.rs crates/raeen-firmware/src/lib.rs
 git commit -m "feat(firmware): parse SLB2 firmware container"
 ```
 
@@ -283,8 +283,8 @@ Expected clippy: zero warnings.
 ### Task 3: `Firmware` package API
 
 **Files:**
-- Create: `crates/xps5x-firmware/src/pup.rs`
-- Modify: `crates/xps5x-firmware/src/lib.rs` (add `pub mod pup;` and re-export `Firmware`)
+- Create: `crates/raeen-firmware/src/pup.rs`
+- Modify: `crates/raeen-firmware/src/lib.rs` (add `pub mod pup;` and re-export `Firmware`)
 
 **Interfaces:**
 - Consumes: `slb2::{parse_slb2, Slb2Entry}` from Task 2.
@@ -297,13 +297,13 @@ Expected clippy: zero warnings.
 
 - [ ] **Step 1: Write the failing tests**
 
-Add `pub mod pup;` to `lib.rs`, then create `crates/xps5x-firmware/src/pup.rs` with only this test module (implementation in Step 3):
+Add `pub mod pup;` to `lib.rs`, then create `crates/raeen-firmware/src/pup.rs` with only this test module (implementation in Step 3):
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xps5x_core::error::FirmwareError;
+    use raeen_core::error::FirmwareError;
 
     /// SLB2 with one entry whose 4-byte payload ("DATA") sits at block 2.
     fn synthetic_firmware() -> Vec<u8> {
@@ -344,12 +344,12 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p xps5x-firmware pup`
+Run: `cargo test -p raeen-firmware pup`
 Expected: FAIL to compile — `cannot find type Firmware`.
 
 - [ ] **Step 3: Write the implementation**
 
-At the top of `crates/xps5x-firmware/src/pup.rs`:
+At the top of `crates/raeen-firmware/src/pup.rs`:
 
 ```rust
 //! Firmware package access — opens an SLB2/PUP container and exposes entries.
@@ -360,7 +360,7 @@ At the top of `crates/xps5x-firmware/src/pup.rs`:
 
 use crate::slb2::{parse_slb2, Slb2Entry};
 use std::path::Path;
-use xps5x_core::error::{FirmwareError, LoaderError};
+use raeen_core::error::{FirmwareError, LoaderError};
 
 enum Backing {
     Mmap(memmap2::Mmap),
@@ -437,7 +437,7 @@ impl Firmware {
 }
 ```
 
-Then in `crates/xps5x-firmware/src/lib.rs` add:
+Then in `crates/raeen-firmware/src/lib.rs` add:
 
 ```rust
 pub mod pup;
@@ -447,14 +447,14 @@ pub use pup::Firmware;
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p xps5x-firmware pup`
+Run: `cargo test -p raeen-firmware pup`
 Expected: PASS — `test result: ok. 3 passed`.
 
 - [ ] **Step 5: Lint and commit**
 
 ```bash
-cargo clippy -p xps5x-firmware --all-targets
-git add crates/xps5x-firmware/src/pup.rs crates/xps5x-firmware/src/lib.rs
+cargo clippy -p raeen-firmware --all-targets
+git add crates/raeen-firmware/src/pup.rs crates/raeen-firmware/src/lib.rs
 git commit -m "feat(firmware): add Firmware package open/read API"
 ```
 
@@ -465,8 +465,8 @@ Expected clippy: zero warnings.
 ### Task 4: `KeyProvider` decryption seam
 
 **Files:**
-- Create: `crates/xps5x-firmware/src/crypto/mod.rs`
-- Modify: `crates/xps5x-firmware/src/lib.rs` (add `pub mod crypto;` and re-exports)
+- Create: `crates/raeen-firmware/src/crypto/mod.rs`
+- Modify: `crates/raeen-firmware/src/lib.rs` (add `pub mod crypto;` and re-exports)
 
 **Interfaces:**
 - Produces:
@@ -480,13 +480,13 @@ Expected clippy: zero warnings.
 
 - [ ] **Step 1: Write the failing tests**
 
-Add `pub mod crypto;` to `lib.rs`, then create `crates/xps5x-firmware/src/crypto/mod.rs` with only this test module (implementation in Step 3):
+Add `pub mod crypto;` to `lib.rs`, then create `crates/raeen-firmware/src/crypto/mod.rs` with only this test module (implementation in Step 3):
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xps5x_core::error::FirmwareError;
+    use raeen_core::error::FirmwareError;
 
     #[test]
     fn no_keys_provider_returns_none() {
@@ -519,23 +519,23 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p xps5x-firmware crypto`
+Run: `cargo test -p raeen-firmware crypto`
 Expected: FAIL to compile — `cannot find type KeyRequest`.
 
 - [ ] **Step 3: Write the implementation**
 
-At the top of `crates/xps5x-firmware/src/crypto/mod.rs`:
+At the top of `crates/raeen-firmware/src/crypto/mod.rs`:
 
 ```rust
 //! The decryption boundary.
 //!
-//! XPS5X ships **no keys** and no key-extraction tooling. All decryption is
+//! Raeen ships **no keys** and no key-extraction tooling. All decryption is
 //! driven by a user-supplied [`KeyProvider`]; the default [`NoKeysProvider`]
 //! returns nothing and decryption fails cleanly with
 //! [`FirmwareError::MissingKey`]. This module consumes keys — it never
 //! derives, guesses, brute-forces, or extracts them.
 
-use xps5x_core::error::FirmwareError;
+use raeen_core::error::FirmwareError;
 
 /// Identifies which key a SELF/module segment needs, read from its metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -588,7 +588,7 @@ pub fn require_key(
 }
 ```
 
-Then in `crates/xps5x-firmware/src/lib.rs` add:
+Then in `crates/raeen-firmware/src/lib.rs` add:
 
 ```rust
 pub mod crypto;
@@ -598,14 +598,14 @@ pub use crypto::{require_key, KeyProvider, KeyRequest, NoKeysProvider, SegmentKe
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p xps5x-firmware crypto`
+Run: `cargo test -p raeen-firmware crypto`
 Expected: PASS — `test result: ok. 3 passed`.
 
 - [ ] **Step 5: Lint and commit**
 
 ```bash
-cargo clippy -p xps5x-firmware --all-targets
-git add crates/xps5x-firmware/src/crypto/mod.rs crates/xps5x-firmware/src/lib.rs
+cargo clippy -p raeen-firmware --all-targets
+git add crates/raeen-firmware/src/crypto/mod.rs crates/raeen-firmware/src/lib.rs
 git commit -m "feat(firmware): add user-supplied KeyProvider decryption seam"
 ```
 
@@ -616,9 +616,9 @@ Expected clippy: zero warnings.
 ### Task 5: SCE NID hashing and encoding
 
 **Files:**
-- Create: `crates/xps5x-firmware/src/dynlib/mod.rs`
-- Create: `crates/xps5x-firmware/src/dynlib/nid.rs`
-- Modify: `crates/xps5x-firmware/src/lib.rs` (add `pub mod dynlib;`)
+- Create: `crates/raeen-firmware/src/dynlib/mod.rs`
+- Create: `crates/raeen-firmware/src/dynlib/nid.rs`
+- Modify: `crates/raeen-firmware/src/lib.rs` (add `pub mod dynlib;`)
 
 **Interfaces:**
 - Produces (in `dynlib::nid`):
@@ -630,7 +630,7 @@ Expected clippy: zero warnings.
 
 - [ ] **Step 1: Write the failing tests**
 
-Add `pub mod dynlib;` to `lib.rs`. Create `crates/xps5x-firmware/src/dynlib/mod.rs`:
+Add `pub mod dynlib;` to `lib.rs`. Create `crates/raeen-firmware/src/dynlib/mod.rs`:
 
 ```rust
 //! Sony dynamic-linking data: NID hashing now; import/export/relocation
@@ -639,7 +639,7 @@ Add `pub mod dynlib;` to `lib.rs`. Create `crates/xps5x-firmware/src/dynlib/mod.
 pub mod nid;
 ```
 
-Create `crates/xps5x-firmware/src/dynlib/nid.rs` with only this test module (implementation in Step 3):
+Create `crates/raeen-firmware/src/dynlib/nid.rs` with only this test module (implementation in Step 3):
 
 ```rust
 #[cfg(test)]
@@ -678,12 +678,12 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p xps5x-firmware nid`
+Run: `cargo test -p raeen-firmware nid`
 Expected: FAIL to compile — `cannot find function nid_of`.
 
 - [ ] **Step 3: Write the implementation**
 
-At the top of `crates/xps5x-firmware/src/dynlib/nid.rs`:
+At the top of `crates/raeen-firmware/src/dynlib/nid.rs`:
 
 ```rust
 //! SCE NID (Name ID) hashing and base64 encoding.
@@ -756,11 +756,11 @@ pub fn decode_nid(s: &str) -> Option<u64> {
 }
 ```
 
-Then add `pub mod dynlib;` to `crates/xps5x-firmware/src/lib.rs` (if not already present from Step 1).
+Then add `pub mod dynlib;` to `crates/raeen-firmware/src/lib.rs` (if not already present from Step 1).
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p xps5x-firmware nid`
+Run: `cargo test -p raeen-firmware nid`
 Expected: PASS — `test result: ok. 4 passed`.
 
 - [ ] **Step 5: Verify against a public NID vector (correctness gate)**
@@ -778,8 +778,8 @@ The round-trip tests prove internal consistency but not that our bit order match
 - [ ] **Step 6: Lint and commit**
 
 ```bash
-cargo clippy -p xps5x-firmware --all-targets
-git add crates/xps5x-firmware/src/dynlib/mod.rs crates/xps5x-firmware/src/dynlib/nid.rs crates/xps5x-firmware/src/lib.rs
+cargo clippy -p raeen-firmware --all-targets
+git add crates/raeen-firmware/src/dynlib/mod.rs crates/raeen-firmware/src/dynlib/nid.rs crates/raeen-firmware/src/lib.rs
 git commit -m "feat(firmware): add SCE NID hashing and base64 encoding"
 ```
 
@@ -790,10 +790,10 @@ Expected clippy: zero warnings.
 ### Task 6: `--firmware-info` diagnostic (LM0 acceptance)
 
 **Files:**
-- Create: `crates/xps5x-firmware/src/report.rs`
-- Modify: `crates/xps5x-firmware/src/lib.rs` (add `pub mod report;` and re-export)
-- Modify: `crates/xps5x-gui/Cargo.toml` (add `xps5x-firmware` dependency)
-- Modify: `crates/xps5x-gui/src/main.rs` (handle `--firmware-info <path>` before launching the GUI)
+- Create: `crates/raeen-firmware/src/report.rs`
+- Modify: `crates/raeen-firmware/src/lib.rs` (add `pub mod report;` and re-export)
+- Modify: `crates/raeen-gui/Cargo.toml` (add `raeen-firmware` dependency)
+- Modify: `crates/raeen-gui/src/main.rs` (handle `--firmware-info <path>` before launching the GUI)
 
 **Interfaces:**
 - Consumes: `Firmware` from Task 3.
@@ -801,7 +801,7 @@ Expected clippy: zero warnings.
 
 - [ ] **Step 1: Write the failing test**
 
-Add `pub mod report;` to `crates/xps5x-firmware/src/lib.rs`, then create `crates/xps5x-firmware/src/report.rs` with only this test module (implementation in Step 3):
+Add `pub mod report;` to `crates/raeen-firmware/src/lib.rs`, then create `crates/raeen-firmware/src/report.rs` with only this test module (implementation in Step 3):
 
 ```rust
 #[cfg(test)]
@@ -832,12 +832,12 @@ mod tests {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p xps5x-firmware report`
+Run: `cargo test -p raeen-firmware report`
 Expected: FAIL to compile — `cannot find function summarize`.
 
 - [ ] **Step 3: Write the implementation**
 
-At the top of `crates/xps5x-firmware/src/report.rs`:
+At the top of `crates/raeen-firmware/src/report.rs`:
 
 ```rust
 //! Human-readable firmware inspection report (drives `--firmware-info`).
@@ -862,7 +862,7 @@ pub fn summarize(firmware: &Firmware) -> String {
 }
 ```
 
-Then add to `crates/xps5x-firmware/src/lib.rs`:
+Then add to `crates/raeen-firmware/src/lib.rs`:
 
 ```rust
 pub mod report;
@@ -872,53 +872,53 @@ pub use report::summarize;
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `cargo test -p xps5x-firmware report`
+Run: `cargo test -p raeen-firmware report`
 Expected: PASS — `test result: ok. 1 passed`.
 
 - [ ] **Step 5: Add the firmware dependency to the GUI crate**
 
-In `crates/xps5x-gui/Cargo.toml`, add under `[dependencies]` (alongside the other `xps5x-*` entries):
+In `crates/raeen-gui/Cargo.toml`, add under `[dependencies]` (alongside the other `raeen-*` entries):
 
 ```toml
-xps5x-firmware = { workspace = true }
+raeen-firmware = { workspace = true }
 ```
 
 - [ ] **Step 6: Wire the CLI flag into `main`**
 
-In `crates/xps5x-gui/src/main.rs`, insert this block immediately after `xps5x_core::logging::init("info");` and before the banner `info!` lines:
+In `crates/raeen-gui/src/main.rs`, insert this block immediately after `raeen_core::logging::init("info");` and before the banner `info!` lines:
 
 ```rust
-    // Diagnostic: `xps5x --firmware-info <PUP>` inspects a firmware package
+    // Diagnostic: `raeen --firmware-info <PUP>` inspects a firmware package
     // and exits without launching the GUI. It never decrypts anything.
     let args: Vec<String> = std::env::args().collect();
     if let Some(pos) = args.iter().position(|a| a == "--firmware-info") {
         let path = args
             .get(pos + 1)
             .ok_or_else(|| anyhow::anyhow!("--firmware-info requires a path to a PUP file"))?;
-        let firmware = xps5x_firmware::Firmware::open(path)?;
-        print!("{}", xps5x_firmware::summarize(&firmware));
+        let firmware = raeen_firmware::Firmware::open(path)?;
+        print!("{}", raeen_firmware::summarize(&firmware));
         return Ok(());
     }
 ```
 
 - [ ] **Step 7: Build the workspace and run the diagnostic test suite**
 
-Run: `cargo build -p xps5x-gui`
+Run: `cargo build -p raeen-gui`
 Expected: compiles cleanly.
 
-Run: `cargo test -p xps5x-firmware`
+Run: `cargo test -p raeen-firmware`
 Expected: all tests pass (`slb2`, `pup`, `crypto`, `nid`, `report`, plus the Task 1 smoke test).
 
 - [ ] **Step 8: Manual LM0 acceptance against the real firmware**
 
-Run: `cargo run -p xps5x-gui -- --firmware-info "PS5 Firmware/PS5UPDATE.PUP"`
+Run: `cargo run -p raeen-gui -- --firmware-info "PS5 Firmware/PS5UPDATE.PUP"`
 Expected: prints the SLB2 container summary — at least one entry whose name contains `PS5UPDATE`, with a non-zero offset and size — then exits without launching the GUI and without attempting decryption. If entry names look wrong (garbled/empty), the real SLB2 field offsets differ from the documented layout; adjust `slb2.rs` field positions against the observed bytes and re-run (the synthetic unit tests still guard the parser logic).
 
 - [ ] **Step 9: Lint and commit**
 
 ```bash
-cargo clippy -p xps5x-firmware -p xps5x-gui --all-targets
-git add crates/xps5x-firmware/src/report.rs crates/xps5x-firmware/src/lib.rs crates/xps5x-gui/Cargo.toml crates/xps5x-gui/src/main.rs Cargo.lock
+cargo clippy -p raeen-firmware -p raeen-gui --all-targets
+git add crates/raeen-firmware/src/report.rs crates/raeen-firmware/src/lib.rs crates/raeen-gui/Cargo.toml crates/raeen-gui/src/main.rs Cargo.lock
 git commit -m "feat(firmware): add --firmware-info diagnostic (LM0)"
 ```
 
@@ -928,8 +928,8 @@ Expected clippy: zero warnings.
 
 ## Self-Review
 
-**Spec coverage (against `2026-07-12-xps5x-lle-firmware-spine-design.md`):**
-- §3.1 new `xps5x-firmware` crate → Task 1. ✓
+**Spec coverage (against `2026-07-12-raeen-lle-firmware-spine-design.md`):**
+- §3.1 new `raeen-firmware` crate → Task 1. ✓
 - §3.3.1 `pup.rs` PUP parser + `Firmware::open/entries/read_entry` → Tasks 2–3. (Spec's `read_entry(&PupEntry)` is realized as `read_entry(index)` — cleaner error reporting; documented in interfaces.) ✓
 - §3.3.2 `crypto/` `KeyProvider` + `NoKeysProvider` + missing-key error → Task 4. ✓
 - §3.3.4 `dynlib/nid.rs` NID hashing + name↔NID basis → Task 5. ✓
@@ -938,10 +938,10 @@ Expected clippy: zero warnings.
 
 **Placeholder scan:** No `TBD`/`TODO`/"handle edge cases". The one deliberately-unpinned value is the public NID vector in Task 5 Step 5 — it is a *verification step with explicit instructions*, not a code placeholder, because the correct vector must come from a public database rather than be invented here.
 
-**Type consistency:** `Firmware`, `Slb2Entry`, `KeyRequest`, `SegmentKey`, `KeyProvider`, `NoKeysProvider`, `require_key`, `nid_of`, `encode_nid`, `decode_nid`, `summarize` are named identically across their defining task and every consuming task. `read_entry(index: usize)` is index-based in both its definition (Task 3) and the `FirmwareError::PupEntryOutOfBounds { index }` it returns. Error variants match `xps5x_core::error::FirmwareError` exactly.
+**Type consistency:** `Firmware`, `Slb2Entry`, `KeyRequest`, `SegmentKey`, `KeyProvider`, `NoKeysProvider`, `require_key`, `nid_of`, `encode_nid`, `decode_nid`, `summarize` are named identically across their defining task and every consuming task. `read_entry(index: usize)` is index-based in both its definition (Task 3) and the `FirmwareError::PupEntryOutOfBounds { index }` it returns. Error variants match `raeen_core::error::FirmwareError` exactly.
 
 ---
 
 ## Follow-on: LM1 plan (not included here)
 
-Once LM0 lands, the next plan covers LM1: `self_crypto` SELF decryption driven by the `KeyProvider`, `sprx.rs` (`ET_SCE_DYNLIB`), `dynlib` `PT_SCE_DYNLIBDATA` parsing (imports/exports/relocs), the NID linker, the HLE/LLE `ModuleRegistry` (bridged to `xps5x-hle::HleRegistry` via a resolver trait to keep `xps5x-firmware` free of an upward dependency), and an end-to-end test loading a homebrew/decrypted `.sprx` with imports resolved to HLE stubs.
+Once LM0 lands, the next plan covers LM1: `self_crypto` SELF decryption driven by the `KeyProvider`, `sprx.rs` (`ET_SCE_DYNLIB`), `dynlib` `PT_SCE_DYNLIBDATA` parsing (imports/exports/relocs), the NID linker, the HLE/LLE `ModuleRegistry` (bridged to `raeen-hle::HleRegistry` via a resolver trait to keep `raeen-firmware` free of an upward dependency), and an end-to-end test loading a homebrew/decrypted `.sprx` with imports resolved to HLE stubs.

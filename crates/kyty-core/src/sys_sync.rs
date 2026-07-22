@@ -2,7 +2,7 @@
 //! (`reference/kyty/source/include/Kyty/Sys/SysSync.h` — the cross-platform
 //! interface header re-exported per-OS — implemented here from
 //! `reference/kyty/source/include/Kyty/Sys/Windows/SysWindowsSync.h`, the
-//! Windows implementation, which is XPS5X's only target platform).
+//! Windows implementation, which is Raeen's only target platform).
 //!
 //! `SysCS` is a thin wrapper around a Win32 `CRITICAL_SECTION`: a
 //! recursive, spin-then-block mutex. Unlike `std::sync::Mutex`, Kyty's API

@@ -11,7 +11,7 @@
 //! - **Rand** (`std::mt19937` + uniform distributions) → the [`rand`] crate,
 //!   preserving Kyty's `Rand` API (see [`rand`]).
 //! - **Crypto** (AES / Hash) → **not ported here**: it maps to the RustCrypto
-//!   crates (`aes`/`cbc`/`sha1`), which `xps5x-firmware` already uses for SELF
+//!   crates (`aes`/`cbc`/`sha1`), which `raeen-firmware` already uses for SELF
 //!   decryption. Re-implementing it in `kyty-math` would duplicate that.
 
 pub mod rand;

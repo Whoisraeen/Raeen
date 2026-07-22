@@ -1,8 +1,8 @@
 # Third-Party Notices
 
-XPS5X is licensed under **GPL-2.0-only** (see [`LICENSE`](LICENSE)). It
+Raeen is licensed under **GPL-2.0-only** (see [`LICENSE`](LICENSE)). It
 incorporates ideas and re-implemented code derived from the third-party
-projects listed below. XPS5X ships **no Sony code, keys, or firmware**; every
+projects listed below. Raeen ships **no Sony code, keys, or firmware**; every
 subsystem here is original Rust, written clean-room with respect to Sony's
 proprietary SDK/headers, using only the community sources credited below.
 
@@ -13,16 +13,16 @@ proprietary SDK/headers, using only the community sources credited below.
 - **Upstream:** https://github.com/InoriRus/Kyty
 - **License:** MIT
 - **Copyright:** © 2021 InoriRus
-- **How XPS5X uses it:** Portions of XPS5X's GPU (GNM command-buffer parsing,
+- **How Raeen uses it:** Portions of Raeen's GPU (GNM command-buffer parsing,
   PSSL → SPIR-V shader translation, RDNA/GCN → Vulkan) and HLE kernel/library
   layers are **re-implemented in idiomatic Rust with reference to Kyty's C++
   source.** Kyty's tree is cloned locally into the git-ignored `reference/`
   directory for study only; it is **never vendored, compiled, or committed**
-  into XPS5X. The MIT license permits use, modification, and redistribution of
+  into Raeen. The MIT license permits use, modification, and redistribution of
   such derived work provided the copyright notice below is retained — which
   this file does.
 - **Directly ported data:** the AGC Gen5 register-default tables in
-  `crates/xps5x-hle/src/libsce_agc_reg_defaults.rs` (served by
+  `crates/raeen-hle/src/libsce_agc_reg_defaults.rs` (served by
   `sceAgcGetRegisterDefaults2[Internal]`) are a faithful port of Kyty's
   `Graphics.cpp` `g_cx/sh/uc_reg_info1/2` tables with register names resolved
   against Kyty's `Pm4.h`.
@@ -60,24 +60,24 @@ SOFTWARE.
 ## SharpEmu — PS5 emulator (reference & porting source)
 
 - **Upstream:** https://github.com/sharpemu/sharpemu (formerly par274/sharpemu)
-- **License:** GPL-2.0-or-later (compatible with XPS5X's GPL-2.0-only)
+- **License:** GPL-2.0-or-later (compatible with Raeen's GPL-2.0-only)
 - **Copyright:** © SharpEmu authors
 - **Reference synced:** 2026-07-21 to upstream `main` @ 6aa78bb (ports cite the
   originating SharpEmu `file:line` in doc comments).
-- **How XPS5X uses it:** A second-opinion reference alongside Kyty for PS5
+- **How Raeen uses it:** A second-opinion reference alongside Kyty for PS5
   module loading (eboot/PRX/sysmodule chains), kernel-surface structure
   (Fiber, AMPR, PlayGo), and VideoOut/AGC bring-up. Patterns and behavior are
   **re-implemented in idiomatic Rust with reference to SharpEmu's C# source**;
   no C# is transliterated or vendored. SharpEmu's tree is cloned locally into
   the git-ignored `reference/` directory for study only; it is **never
-  vendored, compiled, or committed** into XPS5X.
+  vendored, compiled, or committed** into Raeen.
 - **NID name catalog:** SharpEmu's `scripts/ps5_names.txt` (a public symbol-name
   list) is used as candidate input to `merge_nid_catalog`, which admits a name
-  only if XPS5X's own SCE-NID hash reproduces the NID from it. The result is
+  only if Raeen's own SCE-NID hash reproduces the NID from it. The result is
   factual hash data (public symbol names, no Sony code/keys), folded into
-  `crates/xps5x-firmware/src/dynlib/nid_names.txt`.
+  `crates/raeen-firmware/src/dynlib/nid_names.txt`.
 
-GPL-2.0 is the same license as XPS5X (GPL-2.0-only), so derived
+GPL-2.0 is the same license as Raeen (GPL-2.0-only), so derived
 re-implementations are license-compatible; this notice preserves attribution.
 
 ---
@@ -88,13 +88,13 @@ re-implementations are license-compatible; this notice preserves attribution.
 - **License:** GPL-2.0-or-later (`SPDX-License-Identifier: GPL-2.0-or-later`;
   the repository's `LICENSE` is the GNU GPL **Version 2, June 1991** text)
 - **Copyright:** © 2024 shadPS4 Emulator Project and contributors
-- **How XPS5X uses it:** Primarily an Orbis HLE reference (memory, libkernel,
+- **How Raeen uses it:** Primarily an Orbis HLE reference (memory, libkernel,
   linker, Vulkan), re-implemented in Rust rather than transliterated.
 
-  **Data incorporated in-tree:** `crates/xps5x-firmware/src/dynlib/nid_names.txt`
+  **Data incorporated in-tree:** `crates/raeen-firmware/src/dynlib/nid_names.txt`
   is derived from shadPS4's `src/core/aerolib/aerolib.inl` — a generated table
-  of public SCE symbol names and their NIDs. XPS5X uses it strictly as a
-  **candidate dictionary**: an entry is admitted only if XPS5X's own
+  of public SCE symbol names and their NIDs. Raeen uses it strictly as a
+  **candidate dictionary**: an entry is admitted only if Raeen's own
   `dynlib::nid::nid_of()` reproduces the NID from the name, so every retained
   name is a verified SHA-1 preimage rather than a trusted assertion (94,247 of
   aerolib's 94,276 entries pass; 29 are rejected). The test
@@ -108,7 +108,7 @@ re-implementations are license-compatible; this notice preserves attribution.
   committed.
 
 GPL-2.0-or-later may be exercised under GPL-2.0 terms, so the incorporated data
-is license-compatible with XPS5X's GPL-2.0-only; this notice preserves
+is license-compatible with Raeen's GPL-2.0-only; this notice preserves
 attribution as that license requires.
 
 ---
@@ -116,7 +116,7 @@ attribution as that license requires.
 ## Compiled Rust crate dependencies
 
 Unlike the clean-room reference sources above (studied but never linked),
-these crates.io dependencies are compiled into XPS5X (or its test binaries).
+these crates.io dependencies are compiled into Raeen (or its test binaries).
 Only licenses compatible with GPL-2.0-only are used.
 
 - **iced-x86** — https://github.com/icedland/iced — MIT, used by the module
@@ -126,7 +126,7 @@ Only licenses compatible with GPL-2.0-only are used.
 
 - **rspirv** — https://github.com/gfx-rs/rspirv — dual MIT / Apache-2.0, used
   here under its **MIT** option (Apache-2.0 is *not* GPLv2-linking-compatible;
-  MIT is). **Test-only** dev-dependency of `xps5x-gpu`: it structurally
+  MIT is). **Test-only** dev-dependency of `raeen-gpu`: it structurally
   validates the shader emitter's SPIR-V output in unit tests and is **not
   linked into the distributed emulator binary**.
 
@@ -142,7 +142,7 @@ Only licenses compatible with GPL-2.0-only are used.
 
 ## Not incorporated (ecosystem references only)
 
-The following projects were evaluated. Their **code is not used** in XPS5X —
+The following projects were evaluated. Their **code is not used** in Raeen —
 they are GPL-3.0, which is incompatible with this project's GPL-2.0-only
 license, and they target real (jailbroken) PS5 hardware rather than emulation.
 They are noted only as ecosystem references (e.g. for the homebrew payload
@@ -151,5 +151,5 @@ format and the set of `sceKernel*` calls real homebrew invokes):
 - **cy33hc/ps5-payload-loader** — GPL-3.0 — on-console homebrew payload loader.
 - **phantomptr/ps5upload** — GPL-3.0 — desktop → console file-transfer tool.
 
-If any of their code were ever to be incorporated, XPS5X would first have to
+If any of their code were ever to be incorporated, Raeen would first have to
 move to GPL-3.0(-or-later); that has not been done.

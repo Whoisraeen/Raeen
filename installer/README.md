@@ -1,11 +1,11 @@
-# XPS5X installer
+# Raeen installer
 
-Builds a sleek Windows setup wizard **and** a portable ZIP for XPS5X.
+Builds a sleek Windows setup wizard **and** a portable ZIP for Raeen.
 
 | Artifact | What it is |
 |----------|-----------|
-| `dist\XPS5X-<version>-Setup.exe` | Inno Setup wizard — per-user, non-elevated install |
-| `dist\XPS5X-<version>-portable-win64.zip` | Extract-and-run; writes everything beside itself |
+| `dist\Raeen-<version>-Setup.exe` | Inno Setup wizard — per-user, non-elevated install |
+| `dist\Raeen-<version>-portable-win64.zip` | Extract-and-run; writes everything beside itself |
 
 ## Quick start
 
@@ -15,7 +15,7 @@ installer\build.ps1
 ```
 
 The script auto-detects the version from `Cargo.toml`, (re)generates the
-branding art, runs `cargo build --release -p xps5x-gui`, packages the portable
+branding art, runs `cargo build --release -p raeen-gui`, packages the portable
 ZIP, and — if Inno Setup 6 is installed — compiles the installer. Output lands
 in `dist\`.
 
@@ -36,7 +36,7 @@ Useful switches: `-SkipBuild` (reuse `target\release\raeen.exe`),
 
 1. **Welcome** → **License** (GPL-2.0, from `LICENSE`) → **install location**.
 2. A custom **"Select your games folder"** page (defaults to
-   `Documents\XPS5X\Games`). The folder is created and validated on *Next*.
+   `Documents\Raeen\Games`). The folder is created and validated on *Next*.
 3. **Tasks**: desktop icon, *start in a window instead of full-screen*.
 4. Installs `raeen.exe`, the default theme, docs, and the app icon; creates
    `logs\`, `savedata\`, `shader_cache\`, `firmware\`.
@@ -46,7 +46,7 @@ Useful switches: `-SkipBuild` (reuse `target\release\raeen.exe`),
    `game_folders = ['<your chosen folder>']` (skipped if a `config.toml`
    already exists, so upgrades keep your settings).
 7. Every shortcut is pinned to **`WorkingDir={app}`** and finish-page options
-   let you launch XPS5X and/or open the games folder.
+   let you launch Raeen and/or open the games folder.
 
 Uninstall removes the app but **keeps `savedata\` and `config.toml`**; only the
 regenerable `shader_cache\` and `logs\` are cleared.
@@ -55,16 +55,16 @@ regenerable `shader_cache\` and `logs\` are cleared.
 
 The app reads and writes everything — `config.toml`, `logs\`, `savedata\`,
 `shader_cache\`, `themes\`, the games scan — **relative to its working
-directory**. Installing per-user into `%LocalAppData%\Programs\XPS5X` (writable,
+directory**. Installing per-user into `%LocalAppData%\Programs\Raeen` (writable,
 no admin) with `WorkingDir={app}` on every shortcut keeps all of that working.
 
 An **all-users / Program Files** install would put those writes in a
 non-writable location. That's a ~10-line app change (redirect user-data to
-`%LocalAppData%\XPS5X`), deliberately left as a follow-up — see below.
+`%LocalAppData%\Raeen`), deliberately left as a follow-up — see below.
 
 ## Bundling the Visual C++ runtime (optional but recommended)
 
-XPS5X is a standard MSVC Rust build, so target PCs need the **Microsoft Visual
+Raeen is a standard MSVC Rust build, so target PCs need the **Microsoft Visual
 C++ 2015-2022 x64 Redistributable**. Most systems already have it. To bundle it
 so the installer can fix machines that don't:
 
@@ -72,7 +72,7 @@ so the installer can fix machines that don't:
    <https://aka.ms/vs/17/release/vc_redist.x64.exe>.
 2. Save it to **`installer\redist\vc_redist.x64.exe`**.
 
-That's it — `xps5x.iss` detects the file at compile time and installs it
+That's it — `raeen.iss` detects the file at compile time and installs it
 silently only when the runtime is actually missing. Without the file, the step
 is compiled out and setup still works (it just assumes the runtime is present).
 
@@ -80,7 +80,7 @@ is compiled out and setup still works (it just assumes the runtime is present).
 
 ```
 installer/
-├── xps5x.iss             Inno Setup script (the wizard)
+├── raeen.iss             Inno Setup script (the wizard)
 ├── build.ps1             build + package both artifacts
 ├── README.md             this file
 ├── assets/               generated branding (ico + wizard bmps)
@@ -102,9 +102,9 @@ recolor or restyle the badge, wordmark, and wizard images.
 
 - **Embed the icon in `raeen.exe`** (via a `build.rs` + `winres`/`embed-resource`)
   and set the eframe window icon, so the bare exe and the running taskbar show
-  the XPS5X mark. Today the branded icon reaches shortcuts and Add/Remove
-  Programs via the shipped `xps5x.ico`.
-- **All-users install support**: redirect user-data to `%LocalAppData%\XPS5X`
+  the Raeen mark. Today the branded icon reaches shortcuts and Add/Remove
+  Programs via the shipped `raeen.ico`.
+- **All-users install support**: redirect user-data to `%LocalAppData%\Raeen`
   so a Program Files install can write config/logs/saves.
 - **Code signing**: sign `Setup.exe` and `raeen.exe` to drop the SmartScreen
   warning. `build.ps1` has an obvious spot to add `signtool` if you get a cert.

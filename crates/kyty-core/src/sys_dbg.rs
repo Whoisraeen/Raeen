@@ -15,7 +15,7 @@
 //! - [`sys_stack_walk`] faithfully ports the 64-bit `WalkStack` helper
 //!   (`RtlCaptureContext` + `RtlLookupFunctionEntry` + `RtlVirtualUnwind`).
 //!   Kyty's legacy 32-bit EBP-chain walker (`#if KYTY_BITNESS == 32`) is not
-//!   ported: XPS5X only targets x86_64.
+//!   ported: Raeen only targets x86_64.
 //! - [`sys_stack_usage`] / [`sys_stack_usage_print`] walk `VirtualQuery`
 //!   regions to find the reserved/guard/committed extents of the calling
 //!   thread's stack, exactly as the C++ does (querying the region containing

@@ -10,7 +10,7 @@
     libc aliases made the default force-HLE mspace override capture that family;
     a 140.6 s run never reached Resident Load. This was deterministic routing,
     not timing or a missing condvar wake.
-  * A/B proof: `XPS5X_FORCE_HLE_MSPACE=0` on the same executable restored
+  * A/B proof: `RAEEN_FORCE_HLE_MSPACE=0` on the same executable restored
     Resident Load + flips. TDD then changed the policy to default LLE with
     explicit `=1` HLE opt-in (`shipped_libc_mspace_prefers_lle_by_default_and_hle_is_opt_in`,
     red then green). This keeps each stateful allocator family coherent.
@@ -19,7 +19,7 @@
     about 5.4 fps, not 120 fps; no performance claim. NEXT remains the prior
     post-pause-menu poisoned-object fault (or the first earlier fault on a
     longer default run), then GPU throughput.
-  * Verification: `cargo test -p xps5x-firmware` (110 unit + 10 coverage +
+  * Verification: `cargo test -p raeen-firmware` (110 unit + 10 coverage +
     3 homebrew + 3 transitive = 126), firmware clippy `-D warnings`, firmware
     fmt check, release GUI build. Artifacts: `scratch/astro-post-audio-sync-trace-20260721.out.log`,
     `scratch/astro-lle-mspace-ab-20260721.out.log`, and
@@ -37,7 +37,7 @@
     realloc(ptr,0) semantics remain unchanged.
   * Fresh release proof: 140.6-second `--run-eboot` run had zero ASSERT/fault/
     RESULT lines and passed the old failure into 47 guest threads plus audio
-    initialization. `XPS5X_TRACE_FLIP` / `XPS5X_DUMP_FRAMES` measured 0 flips
+    initialization. `RAEEN_TRACE_FLIP` / `RAEEN_DUMP_FRAMES` measured 0 flips
     and 0 frames, so no FPS claim is possible yet.
   * NEXT RED GATE: post-audio synchronization stall. Repeated STALL_DUMP
     snapshots show no in-flight HLE while nearly every guest host thread is in
@@ -45,8 +45,8 @@
     Identify the main/worker wait dependency before returning to the prior
     Resident Load / pause-menu poisoned-object fault. Run artifacts:
     `scratch/astro-mspace-zero-{confirm,fixed-120s}-20260721.out.log`.
-  * Verification: focused red->green test; `cargo test -p xps5x-hle` 346/346;
-    `cargo clippy -p xps5x-hle -- -D warnings`; release GUI build. Workspace
+  * Verification: focused red->green test; `cargo test -p raeen-hle` 346/346;
+    `cargo clippy -p raeen-hle -- -D warnings`; release GUI build. Workspace
     fmt check is red on unrelated concurrent formatting drift in graphics,
     core, GUI, and the already-dirty HLE files.
 
@@ -58,7 +58,7 @@
     ("query status", handler 0xDF02EC → 0xDED4E0) and polls response
     buf+0x88, which mirrors `[[0xE7F5BE0]+0x288]` — the subsystem completion
     flag. Progress floats at +0x23C/+0x234 of the same state object.
-  * FRESH TRACE (XPS5X_TRACE_COND/STALL_DUMP, 100s): the material-shader stall
+  * FRESH TRACE (RAEEN_TRACE_COND/STALL_DUMP, 100s): the material-shader stall
     from 2026-07-19 is GONE — 4000 cond signals (cap), job system live,
     workers processing loads. Condvar starvation is no longer the blocker.
     The run instead DIED on unresolved-import stubs (t27:
@@ -106,11 +106,11 @@
     (never faked). GPU-drawn target at the flip address still wins; ordered after
     the most-content census so GPU titles (scanout filled by uncaptured copy/DMA)
     do not regress. SharpEmu VulkanVideoPresenter.cs:1643-1660
-    (GuestImageWantsInitialData) cited. Files: `xps5x-core::subsystems`
-    (`ScanoutDescriptor` + trait sig), `xps5x-gpu::agc_exec`
+    (GuestImageWantsInitialData) cited. Files: `raeen-core::subsystems`
+    (`ScanoutDescriptor` + trait sig), `raeen-gpu::agc_exec`
     (`present_from_guest_memory`, `present_flipped` fallback, new field),
-    `xps5x-hle::libsce_video_out` (`hle_submit_flip` builds+threads the descriptor).
-  * acceptance test `crates/xps5x-runtime/tests/m3_interactive_2d.rs`: hand-asm
+    `raeen-hle::libsce_video_out` (`hle_submit_flip` builds+threads the descriptor).
+  * acceptance test `crates/raeen-runtime/tests/m3_interactive_2d.rs`: hand-asm
     homebrew runs through the REAL LM1 path (`execute_linked`) — calls
     `scePadReadState(1,&pad)`, loads buttons, CPU-fills a 4x4 linear RGBA8 buffer
     white/black by input, calls `sceVideoOutSubmitFlip(1,0,..)`, reads pixel0 to
@@ -119,7 +119,7 @@
     reflects the CPU-drawn content and differs A vs B. Guest actually executes
     (not the test calling HLE handlers).
   * Tests: hle 144, gpu unit +1 (`present_scanout_reads_cpu_drawn_pixels_from_guest_memory`),
-    runtime m3 1/1; `-p xps5x-hle -p xps5x-gpu -p xps5x-runtime` all green; clippy
+    runtime m3 1/1; `-p raeen-hle -p raeen-gpu -p raeen-runtime` all green; clippy
     clean on touched lines; fmt clean.
   * NOT regressed: existing present_scanout GPU-drawn/splash tests still green
     (signature took a new `Option<ScanoutDescriptor>` arg, all 4 impls updated).
@@ -138,7 +138,7 @@
     Replaced` — engine material+shader setup — and the console is **frozen at
     3086 bytes across 8 dumps over 200 s**, so it is genuinely stuck there, not
     progressing slowly.
-  * `XPS5X_TRACE_SPIN=1` reports the guest caller of each `sceKernelUsleep`
+  * `RAEEN_TRACE_SPIN=1` reports the guest caller of each `sceKernelUsleep`
     once. ASTRO's main thread spins at **module+0xdd8e40**:
     `cmp qword [rbp-0x5d8],0; jne exit; call usleep(1ms); call module+0xdefa40;
     test eax,eax; jns loop` — i.e. *sleep until a worker sets my completion
@@ -156,7 +156,7 @@
 
 - STALL CLASS NARROWED — new cross-call condvar-starvation diagnostic names the
   blocked threads for the first time (2026-07-19; hle 280 green, clippy+fmt clean).
-  * NEW DIAGNOSTIC (`pthread_cond::note_wait_outcome`, `XPS5X_TRACE_COND`): the
+  * NEW DIAGNOSTIC (`pthread_cond::note_wait_outcome`, `RAEEN_TRACE_COND`): the
     pre-existing >3s check could never fire, because an infinite `cond_wait`
     deliberately returns after a 10 ms slice as a permitted spurious wakeup — so
     no single call is ever long. Starvation is a *streak* of calls that never
@@ -191,7 +191,7 @@
 
 - UNTIL DAWN boot traced deep into UE engine init (2026-07-19; workspace tests
   17 suites / 0 failures, touched-crate clippy + fmt clean):
-  * It is NOT stuck on content discovery. With `XPS5X_LOG="warn,xps5x_hle::libkernel=debug"`
+  * It is NOT stuck on content discovery. With `RAEEN_LOG="warn,raeen_hle::libkernel=debug"`
     it touches **647 distinct `/app0` paths** — the whole UE config cascade
     (engine/project/platform `.ini`s, DataDrivenPlatformInfo, plugins, mods,
     internationalization, localization) — so the VFS, path mapping and file IO
@@ -233,7 +233,7 @@
     much longer RE effort — it is NOT a missing-import or broken-primitive
     problem. Do not re-derive the above; start from these frames.
 
-# XPS5X session progress ledger
+# Raeen session progress ledger
 
 - ASTRO.BOT REAL-FRAMES PUSH round 1 (2026-07-20, four parallel subagents +
   main session; all gates green: workspace clippy -D warnings, fmt, hle 320 /
@@ -287,12 +287,12 @@
   presents it host-side until the title flips a buffer with real drawn content
   or calls `sceSystemServiceHideSplashScreen` — the same thing a real PS5's
   system software does. Implemented the equivalent:
-  * `xps5x-gui/src/splash.rs` (NEW): decodes `sce_sys/pic0.png` beside the
+  * `raeen-gui/src/splash.rs` (NEW): decodes `sce_sys/pic0.png` beside the
     eboot (`image` workspace dep) and stages it via
     `AgcGpuSession::set_pending_splash` before entering the guest; wired into
     BOTH launch paths (Shell `launcher.rs` + CLI `--run-eboot`), staging
     `Some`/`None` every launch so a previous title's splash cannot leak.
-  * `xps5x-gpu/agc_exec.rs`: `splash` field on the session, cloned from the
+  * `raeen-gpu/agc_exec.rs`: `splash` field on the session, cloned from the
     pending slot in `GpuProcessSession::create` (created inside
     `execute_process`, after the launcher's last chance to touch it).
     `last_image()` presents the splash while it is up. It comes down on
@@ -403,7 +403,7 @@
     (d) `--resolve-got` any PLT thunk to name what the branch calls next.
   * `sceAgcGetIsTrinityMode` (NID 0x05f0436466ed8bb0, name recovered from
     aerolib; implemented by NO reference emulator). "Trinity" = PS5 **Pro**;
-    XPS5X emulates a base PS5 → returns 0. ABI proven from the call site:
+    Raeen emulates a base PS5 → returns 0. ABI proven from the call site:
     `test eax,eax; jnz` on the return, so the flag comes back **directly in
     EAX**, no out-param. The ZERO branch is the one that goes on to call
     `sceAgcDriverSubmitDcb` — i.e. base-PS5 is the GPU-submitting path.
@@ -433,7 +433,7 @@
   tree; hle 108 + firmware 118 green incl. new provider-aware clock_gettime
   tests; release GUI rebuilt; measured against the retail title twice):
   * **B0 VERIFIED on the real title** (Slice 1 init-once): a default release
-    `--run-eboot` (NO `XPS5X_SKIP_MAIN_INIT`) shows deps init once
+    `--run-eboot` (NO `RAEEN_SKIP_MAIN_INIT`) shows deps init once
     (`libSceNpCppWebApi.prx`/`libc.prx: calling dependency module_start`), the
     main initializer `deferred to crt0`, and **no `0x7426c00` cycle** — the
     title advances past init in ~4 s. The Slice 1 exit gate is closed.
@@ -463,12 +463,12 @@
 
 
 - GPU depth/stencil attachments in the Vulkan pipeline (2026-07-19, working
-  tree; xps5x-gpu 120 lib + all integration green incl. 3 new depth/stencil
+  tree; raeen-gpu 120 lib + all integration green incl. 3 new depth/stencil
   tests on real hw (AMD Radeon 760M); gpu clippy --tests + fmt clean; release
   GUI build green; hle 276 + runtime 48+43 unblocked/green):
   * Completed a half-finished depth/stencil refactor a prior agent left the
     tree non-compiling on (broke the whole workspace since hle/runtime depend
-    on xps5x-gpu). `render_draw` now returns `DrawOutput { color, depth }`.
+    on raeen-gpu). `render_draw` now returns `DrawOutput { color, depth }`.
   * `offscreen.rs`: `read_back_color`/`read_back_depth` (Option results; None
     for a depth-only z-prepass); `record_and_submit` gained depth image
     transitions (UNDEFINED→DEPTH_STENCIL_ATTACHMENT_OPTIMAL, seed-on-LOAD via
@@ -504,7 +504,7 @@
   * ROOT CAUSE (measured): retail crt0 `_start` walks the executable's own
     init array itself; the loader ALSO called the main initializer, so
     constructors ran twice — a list-adding ctor then built a cyclic list its
-    own walk hung on (t1 at `module+0x7426c00`). `XPS5X_SKIP_MAIN_INIT=1`
+    own walk hung on (t1 at `module+0x7426c00`). `RAEEN_SKIP_MAIN_INIT=1`
     proved the cause; this slice makes the proven path the DEFAULT (no env
     var).
   * `ModuleInitRole::{Dependency, Main}` (firmware `linker.rs`) on
@@ -516,7 +516,7 @@
     `execute_linked` uses LoaderOwnsMainInit (no crt0 -> loader runs every
     initializer, main included; a safe no-op for today's empty-`module_inits`
     callers). `sceKernelLoadStartModule`-owned PRX init unchanged.
-  * `XPS5X_SKIP_MAIN_INIT` demoted from mechanism to a one-shot deprecation
+  * `RAEEN_SKIP_MAIN_INIT` demoted from mechanism to a one-shot deprecation
     warning; default now takes the proven path.
   * `DiagnosticKind::ModuleInit`: each initializer transition (run / deferred)
     recorded with module name, role, ordinal, and the recorder's stable
@@ -542,7 +542,7 @@
     must reach the next guest import (measured to be POSIX `clock_gettime`,
     Slice 2). Unit-tested here; not yet re-measured against the title.
 
-- Architectural consolidation (2026-07-18, commit pending): XPS5X-owned
+- Architectural consolidation (2026-07-18, commit pending): Raeen-owned
   time/wait/event/VFS/network/GPU-submission contracts are active on the HLE
   boot path; deterministic process diagnostics sequence HLE, wait/wake, event,
   guest-task ownership, and GPU submission; guest memory now exposes validated,
@@ -573,7 +573,7 @@ per-module authority is `docs/reference-port-ledger.md`.)
     (job scheduler / event / audio callback) is the next investigation. Not a
     sync-primitive bug anymore — the cond waits are correctly blocked.
 
-- Dragon Ball task-drain stall (2026-07-18, measured via XPS5X_STALL_DUMP +
+- Dragon Ball task-drain stall (2026-07-18, measured via RAEEN_STALL_DUMP +
   --dump-vaddr): the 29 threads are Unreal's TaskGraph (Foreground/Background
   Workers + ThreadPool). t1(main) spins at `eboot+0x2bd2151`: a linked-list
   walk waiting for every task's state field (+0x48) to hit 0 (UE
@@ -597,7 +597,7 @@ per-module authority is `docs/reference-port-ledger.md`.)
     sceKernelAddAmprEvent (equeue registration), pthread_create_name_np
     (create + thread_names record), sceKernelClockGetres ({0,1}),
     sceRtcConvertUtcToLocalTime (real host TZ bias via GetTimeZoneInformation;
-    windows-sys added to xps5x-hle + Win32_System_Time feature),
+    windows-sys added to raeen-hle + Win32_System_Time feature),
     sceNetCtlRegisterCallbackV6/GetStateV6 (aliases), sceNetEpoll* (offline
     create/control/wait(≤50ms, 0 events)/destroy),
     sceNpWebApi2CreateUserContext (local-user handle).
@@ -610,14 +610,14 @@ per-module authority is `docs/reference-port-ledger.md`.)
     equeue event triggers, address writes, bytesRead backfill).
   * Measured result: the title boots deep — 29 guest pthreads, engine
     allocators up, sysmodules loading (0x10f/0x95/0x96), shader dirs probed.
-  * **Stall (XPS5X_STALL_DUMP, next gate)**: t1(main) spins on
+  * **Stall (RAEEN_STALL_DUMP, next gate)**: t1(main) spins on
     scePthreadGetspecific (waits a TLS flag); t18-22 hot-spin on
     sceKernelWaitEventFlag → instant 0x8002003c (check timeout handling — same
     class as the f258427 WaitEqueue spin); t2 FAP listener polls WaitEqueue
     (audio stub, task #12); 13 workers idle in CondWait. Tracer noise: errno
     heuristic misfires on size-returning sceAmprMeasureCommandSize* (0x30).
 
-- EUD resolver measurements (2026-07-18, XPS5X_TRACE_EUD evidence):
+- EUD resolver measurements (2026-07-18, RAEEN_TRACE_EUD evidence):
   cs@0x253a5000 (eud_size_dw=8): direct[t5]=s12 → the Region/EUD base pointer
   IS a user SGPR pair: s12:s13 = 0x29b9e0e0 (captured at dispatch). The table
   there holds the SGPR image (dwords match s0..s5 values — s1/s2/s3/s5 exact,
@@ -641,7 +641,7 @@ per-module authority is `docs/reference-port-ledger.md`.)
   launcher needless-borrow, main sort_unstable_by_key) — workspace now
   clippy -D warnings clean, 0 failed test suites.
   "context register index out of range" (vertex data walked as register
-  offsets) investigated with XPS5X_TRACE_INDIRECT: **intermittent,
+  offsets) investigated with RAEEN_TRACE_INDIRECT: **intermittent,
   race-dependent** — zero repro in a 300s run. Evidence says the title's
   indirect-register tables live in its shader user-data memory region (the
   TRACE_EUD SGPR pointers at 0x29b9d520 name the same buffer), which cycles
@@ -650,7 +650,7 @@ per-module authority is `docs/reference-port-ledger.md`.)
   next submission rewrites them). No fix without a repro — measured, noted.
 
 - EUD-convergence batch (2026-07-18 late, commit pending; 236/236
-  kyty-graphics, 115/115 xps5x-gpu, clippy clean):
+  kyty-graphics, 115/115 raeen-gpu, clippy clean):
   * Recompile_Fetch width-mismatch rules, both directions measured (attrib 2
     as 2ch→vec3 fill z=0.0f; as 4ch→vec3 drop w into %temp_float scratch) —
     GCN's (0,0,0,1) default semantics, beyond Kyty (it EXITs on mismatch).
@@ -669,8 +669,8 @@ per-module authority is `docs/reference-port-ledger.md`.)
     captured user-SGPRs at dispatch — the tractable first half).
 
 - Shader loop batch (2026-07-18, commit pending; 231/231 kyty-graphics,
-  112/112 xps5x-gpu, workspace green, clippy clean; two pre-existing
-  clippy errors in xps5x-hle left alone — not this session's code):
+  112/112 raeen-gpu, workspace green, clippy clean; two pre-existing
+  clippy errors in raeen-hle left alone — not this session's code):
   SDWA src abs/neg now PARSE into operand modifiers (beyond Kyty — its vopc
   path exits on any modifier; operand_load_float already applied FAbs/
   FNegate; measured encodings `v_cmp_lt_f32 s2,|v2|,c` / `v_mul_f32 v2,v4,-v3`
@@ -707,7 +707,7 @@ per-module authority is `docs/reference-port-ledger.md`.)
   layer-aware barriers. Tests: cube SPIR-V emission, 6-face decode round-trip.
 
 - Texture chain completed + two GPU blockers (2026-07-18, commit pending;
-  106/106 xps5x-gpu lib + 225/225 kyty-graphics, clippy clean):
+  106/106 raeen-gpu lib + 225/225 kyty-graphics, clippy clean):
   * Vulkan consume of `ShaderStageBinding.textures` (the missing half of the
     in-flight texture work): offscreen.rs now builds SAMPLED_IMAGE + SAMPLER
     descriptor arrays per stage (bindings from `shader_calc_binding_indices`),
@@ -736,7 +736,7 @@ per-module authority is `docs/reference-port-ledger.md`.)
     NI-error test retargeted to ImageStoreMip — no guessed encodings).
 
 - GraphicsRun CommandProcessor (Kyty Gen5 CP): expanded for retail DCBs
-  (commit pending, 194/194 kyty-graphics + 86/86 xps5x-gpu tests).
+  (commit pending, 194/194 kyty-graphics + 86/86 raeen-gpu tests).
   Resilience policy: unknown op/register = rate-limited warn + skip-by-length;
   hard errors only for truncated/non-type3 streams and refused draws.
   Ported: R_DRAW_INDEX (AGC + IT_DRAW_INDEX_2 raw form), R_{CX,SH,UC}_REGS_INDIRECT
@@ -744,7 +744,7 @@ per-module authority is `docs/reference-port-ledger.md`.)
   IT_SET_BASE(1) tracking, rate-limited sync/event/write-data skips.
   Indexed/indirect draws degrade to logged vertex-count-only draws
   (DrawSink::draw_index default; indirect count read from first args record).
-  xps5x-gpu: guest_mem::IdentityGuestMemory (VirtualQuery-validated identity
+  raeen-gpu: guest_mem::IdentityGuestMemory (VirtualQuery-validated identity
   reads) wired into AgcGpuSession::execute_dcb_cp.
   Still todo: GraphicsRender (real index fetch, guest shader bind, multi-draw walk).
 
@@ -752,7 +752,7 @@ per-module authority is `docs/reference-port-ledger.md`.)
   in both libraries (was 17 libkernel + 19 libScePosix), measured by re-running
   `--run-eboot`; 144 distinct missing NIDs remain, all in out-of-scope service
   libs (libSceNpWebApi2 21, libSceHttp2 14, libSceNet 13, ...). Implemented in
-  xps5x-hle (commit pending; 247/247 hle, 19/19 kernel, 102/102 firmware,
+  raeen-hle (commit pending; 247/247 hle, 19/19 kernel, 102/102 firmware,
   82/82 runtime tests): real VFS unlink/rmdir/rename/truncate (+ new VFS ops),
   REAL blocking POSIX semaphores (`posix_sem.rs`, address-keyed, condvar +
   termination-aware slices), scePthreadMutexTimedlock (deadline in lock_core),
@@ -760,13 +760,13 @@ per-module authority is `docs/reference-port-ledger.md`.)
   POSIX sockets (accept/listen/recv/send/select/... EWOULDBLOCK semantics,
   errno via __error slot), sched_get_priority_max/min (767/256), getrusage
   zero-fill, signal/Mlock/Sync/Chmod/Utimes accepted, `__progname` as a real
-  data-page pointer export (xps5x-firmware). Title now boots 17 guest pthreads
+  data-page pointer export (raeen-firmware). Title now boots 17 guest pthreads
   and dies downstream on its own `std::out_of_range` ("invalid string
   position") during phase-1 unwinding — next investigation target.
 
 - ShaderMemory Phase 2 (guest shader fetch → GCN parse → SPIR-V → draw):
   **implemented + proven end-to-end in-tree** (commit pending; 196/196
-  kyty-graphics, 87/87 + 2/2 + 2/2 xps5x-gpu tests, clippy clean).
+  kyty-graphics, 87/87 + 2/2 + 2/2 raeen-gpu tests, clippy clean).
   kyty-graphics CP: Gen5 shader-bind SH registers ported from Kyty's
   g_hw_sh_indirect_func — SPI_SHADER_PGM_LO/HI_PS+CHKSUM_PS+RSRC2_PS,
   PGM_LO/HI_ES+CHKSUM_GS+RSRC2_GS (gs-instead-of-vs), USER_DATA_GS slots —
@@ -774,10 +774,10 @@ per-module authority is `docs/reference-port-ledger.md`.)
   IN_CONTROL, SPI_PS_INPUT_CNTL_0..31, SPI_VS_OUT_CONFIG, DB_SHADER_CONTROL).
   These are exactly the registers Minecraft's DCBs write (proven from the
   prior iron log: unknown-reg warns 0xC8/0xC9/0x80/0x8A/0x8B/0x08, cx 0x191+).
-  xps5x-gpu: shader_fetch.rs — bounded fetch (4 KiB chunks, 256 KiB cap,
+  raeen-gpu: shader_fetch.rs — bounded fetch (4 KiB chunks, 256 KiB cap,
   parser-driven growth on Truncated), next-gen→legacy generation fallback with
   both reasons named, positive+negative cache keyed (stage, addr, 16 head
-  bytes) so a failing shader warns ONCE; XPS5X_DUMP_SHADERS forensic dumps
+  bytes) so a failing shader warns ONCE; RAEEN_DUMP_SHADERS forensic dumps
   (work even when translation fails). OffscreenDrawSink: untranslatable
   shader = skipped draw (counted, debug-logged), DCB continues; embedded
   fixture path intact (M2 gate untouched). Acceptance:
@@ -787,15 +787,15 @@ per-module authority is `docs/reference-port-ledger.md`.)
   Also fixed: guest_mem read used copy_nonoverlapping; a wild-but-committed
   guest range can overlap the destination Vec (page-granular validation) —
   intermittent STATUS_STACK_BUFFER_OVERRUN under test; now ptr::copy.
-  Title measurement (PPSA17221, 3×120 s runs, XPS5X_DUMP_SHADERS+FRAMES set):
+  Title measurement (PPSA17221, 3×120 s runs, RAEEN_DUMP_SHADERS+FRAMES set):
   **0 shaders fetched, 0 draws — title dies ~10 s in, pre-graphics**, on the
   known std::out_of_range phase-1-unwinding wall above (first failing HLE
   call sceKernelGetdents → 0x8002000e). The GPU-side path is armed and proven;
   re-measure the moment the boot wall falls.
 
 - ASTRO.BOT scene-shader opcode batch (2026-07-18, commit pending; 258/258
-  kyty-graphics, 129/129 xps5x-gpu, 276/276 xps5x-hle tests; 1 diagnostic GPU
-  test ignored; kyty-graphics+xps5x-gpu clippy clean; GUI build green):
+  kyty-graphics, 129/129 raeen-gpu, 276/276 raeen-hle tests; 1 diagnostic GPU
+  test ignored; kyty-graphics+raeen-gpu clippy clean; GUI build green):
   closed seven title-measured translation blockers with typed decode + SPIR-V
   acceptance coverage. `S_GETPC_B64` now materializes the absolute address of
   the following instruction (including guest bases above 4 GiB);
@@ -806,7 +806,7 @@ per-module authority is `docs/reference-port-ledger.md`.)
   `IMAGE_SAMPLE_C_LZ` consumes Gen5 `{reference,x,y}`, samples at LOD zero,
   performs the manual `reference <= red` comparison used by SharpEmu, then
   applies all seven supported dmask layouts. The comparison module assembles
-  and validates through Naga. Kyty remains behind the xps5x-gpu contract.
+  and validates through Naga. Kyty remains behind the raeen-gpu contract.
   Fresh ASTRO.BOT frame measurement is not yet attributable to this batch:
   two provider-specific ABI aliases (`libSceLibcInternal` C ABI and libkernel
   POSIX pthread names) fixed earlier link stops, but the current architecture
@@ -816,9 +816,9 @@ per-module authority is `docs/reference-port-ledger.md`.)
   regression before claiming a translated-shader or frame-count improvement.
 
 - ASTRO.BOT frame path — texture format 71 + validation-layer perf cliff
-  (2026-07-19, commit pending; xps5x-gpu 133/133 green, clippy clean).
+  (2026-07-19, commit pending; raeen-gpu 133/133 green, clippy clean).
   DO NOT RE-DERIVE the following; all measured against the retail title with
-  `XPS5X_SKIP_MAIN_INIT=1 XPS5X_RESUME_ON_MISSING=1`:
+  `RAEEN_SKIP_MAIN_INIT=1 RAEEN_RESUME_ON_MISSING=1`:
   * The title's GPU work is DETERMINISTIC across runs and across commits
     21483ef/e77ea3f/HEAD: 256 DCB submissions, 1028 draws, 1497 dispatches,
     36 VideoOut flips. "captured AGC submission" is rate-limited (logs the
@@ -843,7 +843,7 @@ per-module authority is `docs/reference-port-ledger.md`.)
     validation layer was ALWAYS on for titles: ~0.9 s per
     vkCreateGraphicsPipelines, i.e. ~15 min for 1028 draws — the reason a
     260 s run reached only one submission and looked like a GPU-worker hang.
-    Now opt-in via `XPS5X_VULKAN_VALIDATION=1`.
+    Now opt-in via `RAEEN_VULKAN_VALIDATION=1`.
   * STILL NO FRAME, and the remaining wall is now unambiguous: pixel/compute
     shader translation. 16 shaders translate OK, 16 fail, and a draw needs
     its PS, so every draw skips and `sink.last` stays None. Both failure
@@ -866,7 +866,7 @@ jumped to the unresolved-import stub for `socket` from libScePosix;
 (2) AgcSubmissionThread deref'd 0x25 after `sceKernelWaitEqueue` timed out.
 Uncommitted (user hasn't asked for a commit).
 
-DONE (xps5x-hle, 285/285 tests, workspace clippy clean):
+DONE (raeen-hle, 285/285 tests, workspace clippy clean):
 - libScePosix provider aliases — provider-aware resolution meant the
   libkernel-only registrations didn't satisfy libScePosix imports:
   socket/bind/connect/getsockname/inet_pton (kernel_socket.rs) and
@@ -887,7 +887,7 @@ DONE (xps5x-hle, 285/285 tests, workspace clippy clean):
   sceAudioOut2ContextGetQueueLevel (dlsym-only import, never in the static
   table — level always 0 since pacing is synchronous).
   Result: missing NIDs 161 → 138 for this title.
-DONE (xps5x-gpu, 121/121 tests):
+DONE (raeen-gpu, 121/121 tests):
 - vulkan/instance.rs: enable + require vertexPipelineStoresAndAtomics —
   Gen5 vs writes storage buffers; pipeline creation was failing validation
   (VUID-RuntimeSpirv-NonWritable-06341) for whole draw batches.
@@ -924,7 +924,7 @@ and the flip counter stops ~6-8 presents).
   2. **Vulkan validation was hard-coded ON** for titles (agc_exec.rs
      `VulkanBackend::new(true)`): ~0.9s per vkCreateGraphicsPipelines, ~15 min
      for 1028 draws — it LOOKED like a hung GPU worker. Now opt-in via
-     `XPS5X_VULKAN_VALIDATION=1`. Check this first if the worker seems stuck.
+     `RAEEN_VULKAN_VALIDATION=1`. Check this first if the worker seems stuck.
   3. **Gen5 graphics stages have 32 user SGPRs, not 16.** `UserSgprInfo::
      SGPRS_MAX` was 16, so `set()` silently DROPPED slots 16..31 and capped
      `count` at 16, while ASTRO.BOT pixel shaders declare rsrc2.user_sgpr =
@@ -950,7 +950,7 @@ and the flip counter stops ~6-8 presents).
   set, so no RenderedImage reaches present/dump. NOT yet isolated; a 70 s
   debug run reached only 128 submissions and never got to a draw-carrying
   one, so its "0 draw_common calls" is INCONCLUSIVE, not evidence. Next step
-  is a long run under `RUST_LOG=warn,xps5x_gpu=debug` to see whether
+  is a long run under `RUST_LOG=warn,raeen_gpu=debug` to see whether
   `draw_common` is entered and, if so, which of its early returns fires
   (prime suspect: `color_output_disabled(ctx)` -> "draw consumed without
   colour output (depth path pending)", draw_translate.rs:1080).
@@ -966,9 +966,9 @@ and the flip counter stops ~6-8 presents).
   dump was skipped.** Fixed with a `PRESENT_INDEX` incremented once per
   presented frame. Result: 0 -> **10 frames** dumped (1920x1080 and 2432x1368).
   MEASUREMENT TRAP that cost a full diagnostic cycle: the app filters logs with
-  **`XPS5X_LOG`, not `RUST_LOG`** (xps5x-core/src/logging.rs:160). Two debug
+  **`RAEEN_LOG`, not `RUST_LOG`** (raeen-core/src/logging.rs:160). Two debug
   runs under RUST_LOG produced zero `debug!` output, which read exactly like
-  "draw_common is never entered" — it was an artifact. Always use XPS5X_LOG.
+  "draw_common is never entered" — it was an artifact. Always use RAEEN_LOG.
   With it: 56 "drove a register-state Vulkan draw", 57 depth-only draws
   consumed, 17 shaders translated_ok, 2954 cache hits.
   HONEST RESULT: the dumped frames are a SINGLE FLAT COLOUR across the whole
@@ -1004,7 +1004,7 @@ and the flip counter stops ~6-8 presents).
   (distinct_pixels=1 at 10/35/60/85%) — EUD still gates the scene compute, so
   this did NOT by itself produce scene pixels. **EUD (task #9) is now the
   single remaining blocker on the compute path.**
-  Note: `cargo fmt --all --check` flags `crates/xps5x-hle/src/libsce_audio_out2.rs`
+  Note: `cargo fmt --all --check` flags `crates/raeen-hle/src/libsce_audio_out2.rs`
   (2 spots) — NOT from this work; it arrived via commit 3d183a1.
 
 - EUD increment 3 — OPEN QUESTION found while scoping (2026-07-19, no code
@@ -1061,11 +1061,11 @@ PRESENT_INDEX dump cadence, tiling, ASTRO formats):
 - Gen5 vertex format 57 → R8G8B8A8_SNORM (draw_translate.rs; SharpEmu table
   57 → (10,1)). Removed the per-frame DWORD-950 skips; draws 2244 → 10142+
   per run, zero draw-skip warnings in later runs.
-- DECISIVE census (XPS5X_DUMP_ALL_TARGETS): at presents 5..128 every render
+- DECISIVE census (RAEEN_DUMP_ALL_TARGETS): at presents 5..128 every render
   target (0x1f7d0000, 0x31c10000, 0x20040000) reports non_black_pixels = 0.
   Black frames are NOT a flip/scanout mismatch — the draw pipeline produces
   zero pixels, including no clear-alpha.
-- XPS5X_DUMP_GPU_RESOURCES: vertex buffer @0x313f0150 (stride 28) holds REAL
+- RAEEN_DUMP_GPU_RESOURCES: vertex buffer @0x313f0150 (stride 28) holds REAL
   plausible UI data (0/1/2/3 floats) — vertex fetch works.
 - The bound UI texture @0x31c00000 (1920x1080, fmt 56, tile 27) reads back
   100% zeros. NOT a PM4 DMA problem: captured DCB layouts carry opcodes
@@ -1108,7 +1108,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
 
 - EUD strategy 2 — ROOT CAUSE FOUND, one layer left (2026-07-20;
   kyty-graphics 260/260, workspace 1431/1431, clippy 0).
-  Added a `TRACE_EUD2` diagnostic (gated on XPS5X_TRACE_EUD) that reports, per
+  Added a `TRACE_EUD2` diagnostic (gated on RAEEN_TRACE_EUD) that reports, per
   failing shader, whether the code is mapped, whether `shader_parse` succeeds,
   how many `SLoadDword*` were found, and whether each computed base address is
   backed. It answered immediately: **`shader_parse` was FAILING**, so
@@ -1184,7 +1184,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   MUBUF-idxen items are compute-side, i.e. on the path the scene actually
   renders through.
 
-- Texture type 8 (1D) supported (2026-07-20; xps5x-gpu green). A 1D image is a
+- Texture type 8 (1D) supported (2026-07-20; raeen-gpu green). A 1D image is a
   2D image one row tall and the T# already reports height 1, so the existing 2D
   decode path handles it unchanged (measured: a 1x1 format-71 tile-27 texture).
   Kept as its own match arm so a >1-row "1D" texture would still be visible.
@@ -1316,7 +1316,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   workspace 1437/1437, clippy 0, fmt 0 diffs).
   **DO NOT re-chase NP/missing imports.** Measured two independent ways:
   (a) dispatch.rs:1773-1783 logs every unresolved import actually CALLED —
-  ZERO such lines in any run; (b) zero xps5x_hle::libsce_np* calls of any kind,
+  ZERO such lines in any run; (b) zero raeen_hle::libsce_np* calls of any kind,
   not even sceNpGetState. The 126 "missing" imports are LINK-TIME ONLY and the
   title never calls one, so `sceNpGetState` returning SIGNED_OUT
   (libsce_np.rs:68-79) is irrelevant and stubbing NP signed-in changes nothing.
@@ -1324,7 +1324,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   normal Bedrock resource-pack probing), the dump is complete (22,299 files,
   index.html present), and the ~10s "retry loop" is BENIGN housekeeping
   (16s treatment_metadata.json flush + 2s offline-socket retry), not a deadlock
-  — XPS5X_STALL_DUMP shows a healthy idle with the Rendering Pool still
+  — RAEEN_STALL_DUMP shows a healthy idle with the Rendering Pool still
   submitting DCBs.
   **NARROWED BLOCKER:** the title reads /app0/data/gui/dist/hbui/routes.json
   (the Ore-UI route table -> /hbui/index.html) THREE times and then never opens
@@ -1355,7 +1355,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   ASTRO.BOT's long-claimed "visible frame / green loading composite / 67%
   non-black / 16.5 MB non-zero bytes" is **the emulator's own CLEAR_COLOR**,
   not title content. PROOF: `CLEAR_COLOR` is [0.25,0.5,0.75,1.0]
-  (xps5x-gpu/src/vulkan/offscreen.rs:25). The dumped ASTRO frame repeats the
+  (raeen-gpu/src/vulkan/offscreen.rs:25). The dumped ASTRO frame repeats the
   pixel `40 80 00` — and 0.25*255 = 0x40, 0.5*255 = 0x80 EXACTLY. Changing
   CLEAR_COLOR to [1,0,0,1] and re-running made the frame repeat `ff 00 00`
   (pure red). The "content" tracks our clear constant, so it is ours.
@@ -1388,7 +1388,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   HDR-target pixel values.
 
 - **THE BLACK FRAME IS ZERO COVERAGE, NOT BLACK SHADING** (2026-07-20, proven).
-  New permanent diagnostic `XPS5X_FORCE_CLEAR=1` (offscreen.rs) forces every
+  New permanent diagnostic `RAEEN_FORCE_CLEAR=1` (offscreen.rs) forces every
   draw to CLEAR instead of LOAD, so the target ends as pure CLEAR_COLOR unless
   a draw actually produced a fragment. MEASURED on Minecraft: after 12,083
   draws the final 1920x1080 frame is **100% uniform CLEAR_COLOR** — ONE
@@ -1414,12 +1414,12 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   (a) from (b) from (c) in a single run.
 
 - Minecraft draw bind profiles — geometry IS well-formed (2026-07-20,
-  XPS5X_TRACE_DRAWS=1). The real-draw path IS reached and the draws look
+  RAEEN_TRACE_DRAWS=1). The real-draw path IS reached and the draws look
   exactly like an Ore-UI/Gameface layer:
     4x  prim=4 verts=6  guest_vbufs=1 vattrs=2  ps_tex=1 ps_samp=1 ps_pushc=48
     8x  prim=6 verts=4  guest_vbufs=1 vattrs=1  ps_sbuf=1        ps_pushc=16
   i.e. textured/storage-fed QUADS with a bound vertex buffer and 1-2 attributes.
-  Combined with the XPS5X_FORCE_CLEAR proof of ZERO coverage, the failure is
+  Combined with the RAEEN_FORCE_CLEAR proof of ZERO coverage, the failure is
   now pinned to VERTEX POSITIONS: well-formed quads are submitted and rasterize
   nothing, so positions must be off-screen / degenerate / NaN.
   **CORRECTED ARITHMETIC:** the "12,083 draws" figure is AGC draw PACKETS
@@ -1440,13 +1440,13 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   all_zero=false"), so mirror it for vertex buffers.
 
 - **ROOT CAUSE SPLIT — vertex DATA is fine, POSITION EXPORT is not; and the
-  mesh buffer is empty** (2026-07-20, XPS5X_TRACE_DRAWS vertex-buffer probe).
+  mesh buffer is empty** (2026-07-20, RAEEN_TRACE_DRAWS vertex-buffer probe).
   Two distinct problems, both measured:
   * **Buffer A** addr=0x253a12a0 stride=12 num_records=4 size=48
     non_zero=24, head decodes as f32: (-1,-1,+1) (+1,-1,+1) (-1,...) —
     i.e. a TEXTBOOK FULL-SCREEN QUAD IN NDC. The vertex data is CORRECT.
     A correct fullscreen quad that rasterizes ZERO fragments (proven by
-    XPS5X_FORCE_CLEAR) means the failure is DOWNSTREAM of the data: the VS
+    RAEEN_FORCE_CLEAR) means the failure is DOWNSTREAM of the data: the VS
     position export. stride=12 is only xyz — the VS must supply w=1 itself;
     if w ends up 0/garbage the perspective divide kills every vertex, which
     matches zero coverage exactly. **CHECK THE POSITION/POS0 EXPORT FIRST.**
@@ -1462,7 +1462,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   UI/composite layer, which is what Ore-UI draws), then the mesh upload.
 
 - POS0 export IS emitted — narrowing again (2026-07-20). Probe in
-  `recompile_exp_pos0` (XPS5X_TRACE_DRAWS): Minecraft recompiles **8 POS0
+  `recompile_exp_pos0` (RAEEN_TRACE_DRAWS): Minecraft recompiles **8 POS0
   exports, all with srcs_are_variables=true**, 19 shaders translated. So the
   VS DOES write gl_Position. Combined with the earlier results the chain is now:
     vertex DATA correct (textbook NDC fullscreen quad)        ✓
@@ -1486,7 +1486,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   matrix; the only way its positions go wrong is bad ATTRIBUTE INPUT.
 
 - Vertex attribute bindings are CORRECT — hypothesis refuted (2026-07-20,
-  XPS5X_TRACE_DRAWS attribute probe). Measured on Minecraft:
+  RAEEN_TRACE_DRAWS attribute probe). Measured on Minecraft:
     ai=0 location=0 binding=0 R32G32B32_SFLOAT     offset=0  gen5=74 (res=1)
     ai=0 location=0 binding=0 R32G32B32A32_SFLOAT  offset=0  gen5=77 (res=2)
     ai=1 location=1 binding=0 R32G32B32_SFLOAT     offset=16 gen5=74 (res=2)
@@ -1517,8 +1517,8 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   becomes bound.
 
 - **INVALID PIPELINE FIXED — vertex attribute format vs shader input type**
-  (2026-07-20; xps5x-gpu 136/136). Found by ENABLING THE VALIDATION LAYER
-  (XPS5X_VULKAN_VALIDATION=1, which this session made opt-in). It named the bug
+  (2026-07-20; raeen-gpu 136/136). Found by ENABLING THE VALIDATION LAYER
+  (RAEEN_VULKAN_VALIDATION=1, which this session made opt-in). It named the bug
   in one run after many turns of manual narrowing:
     "vkCreateGraphicsPipelines(): pVertexAttributeDescriptions[1].format
      (VK_FORMAT_R16_UINT) at Location 1 does not match
@@ -1535,7 +1535,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   MEASURED: validation "does not match" messages 10 -> 0. Pipeline is valid.
   **Frames are STILL byte-zero** — necessary, not sufficient. Whatever remains
   is no longer a validation-visible error.
-  **PROCESS LESSON (expensive): run with XPS5X_VULKAN_VALIDATION=1 FIRST when a
+  **PROCESS LESSON (expensive): run with RAEEN_VULKAN_VALIDATION=1 FIRST when a
   draw silently produces nothing.** I spent many turns hand-checking vertex
   data, indices, attribute bindings, gl_Position, viewport/scissor/blend/masks —
   all of which were CORRECT and all of which the validation layer would have
@@ -1593,7 +1593,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   render pass executing).
 
 - Vulkan is FULLY SATISFIED — zero validation messages of ANY severity after
-  the vertex-format fix (2026-07-20, XPS5X_VULKAN_VALIDATION=1 on Minecraft).
+  the vertex-format fix (2026-07-20, RAEEN_VULKAN_VALIDATION=1 on Minecraft).
   Not just zero "does not match": ZERO total. So the pipeline, descriptors,
   render pass, attachments and draw calls are all API-correct. Combined with
   every input being verified correct and the clear demonstrably reaching the
@@ -1607,7 +1607,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   translated shader computes. Bisect the SPIR-V, do not re-audit the bindings.
 
 - **VS SUBSTITUTION TEST: STILL BLACK => THE FAULT IS BELOW THE SHADER**
-  (2026-07-20, decisive). New gated probe `XPS5X_VS_PASSTHROUGH=1`
+  (2026-07-20, decisive). New gated probe `RAEEN_VS_PASSTHROUGH=1`
   (recompile_exp_pos0) makes POS0 export input attribute 0 DIRECTLY as the clip
   position, bypassing ALL VS arithmetic. The measured attr0 for these draws is
   a textbook NDC quad, so this should cover the screen unconditionally.
@@ -1668,14 +1668,14 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   them, it is wasted effort:
     vertex data (verified NDC quad) | index buffer ([0,1,2,0,2,3]) |
     attribute bindings, formats, offsets | gl_Position emission |
-    the entire VS body (XPS5X_VS_PASSTHROUGH still black) | viewport | scissor |
+    the entire VS body (RAEEN_VS_PASSTHROUGH still black) | viewport | scissor |
     render-target extent | CB_TARGET_MASK / colour write mask | blend state |
     attachment identity | pipeline validity (ZERO Vulkan validation messages of
     any severity) | fragment shading | RGBA8 readback/dump | submit->fence->
     readback synchronization | command-buffer recording order and bracket |
     vertex_count.
   Two facts that must be reconciled by whatever the answer turns out to be:
-    (a) the CLEAR reaches the read-back image (XPS5X_FORCE_CLEAR proves it), so
+    (a) the CLEAR reaches the read-back image (RAEEN_FORCE_CLEAR proves it), so
         the image, the render pass and the readback all work;
     (b) COMPUTE writebacks carry real data in the same runs (3,193 of them),
         so the device and queue are executing work correctly.
@@ -1693,7 +1693,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   IS A CORRECT RENDER OF EMPTY CONTENT** (2026-07-20, proven in-tree + probes).
   The in-tree red/green harness (tests/coverage_bisect.rs, NEW) replayed the
   title's draw one variable at a time against known-good shaders, then the
-  title's OWN dumped SPIR-V (new `XPS5X_DUMP_SHADERS` .spv dump in
+  title's OWN dumped SPIR-V (new `RAEEN_DUMP_SHADERS` .spv dump in
   shader_fetch.rs):
    * guest vertex-buffer path: covers          (was never covered by any test)
    * Y-flipped viewport [0,h,w,-h]: covers     (ditto)
@@ -1724,16 +1724,16 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   viewport (title writes cull=FRONT face=CW; under our winding that culls the
   measured quad; Kyty maps identically). Untestable at title level while
   content is empty — REVISIT with the in-tree harness when real content
-  renders. XPS5X_NO_CULL=1 exists to bisect it live.
-  New permanent diagnostics: XPS5X_DUMP_SHADERS now also writes .spv;
-  XPS5X_NO_CULL; texture-content probe + cull/face in the draw diagnostics
-  (XPS5X_TRACE_DRAWS). Driver hazard: a WRONG pipeline layout does not error,
+  renders. RAEEN_NO_CULL=1 exists to bisect it live.
+  New permanent diagnostics: RAEEN_DUMP_SHADERS now also writes .spv;
+  RAEEN_NO_CULL; texture-content probe + cull/face in the draw diagnostics
+  (RAEEN_TRACE_DRAWS). Driver hazard: a WRONG pipeline layout does not error,
   it SEGFAULTS (AMD, vkCreateGraphicsPipelines) — the sweep test scans the
   SPIR-V to build the right layout first.
 
 - 2026-07-20 (HLE agent) — MEASURED: Minecraft DOES call libcohtml, but ONLY
   init-time (16 exports, first 7 s), never per-frame. New one-shot export
-  trap: `XPS5X_TRAP_MODULE_EXPORTS=<substr>` plants int3 on every code
+  trap: `RAEEN_TRAP_MODULE_EXPORTS=<substr>` plants int3 on every code
   export's entry byte at compose time (runtime/src/export_trap.rs, VEH
   breakpoint route in dispatch.rs, install site in gui/main.rs --run-eboot;
   5/5 unit tests; data exports outside seg0 are skipped — 0xCC in data would
@@ -1761,18 +1761,18 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
 
 - RECONCILIATION NOTE on the cohtml-trap recommendation (2026-07-20): the
   trap agent suggests "stub NP auth to report signed-in". CAUTION — an earlier
-  measurement THIS session proved the title calls ZERO xps5x_hle::libsce_np*
+  measurement THIS session proved the title calls ZERO raeen_hle::libsce_np*
   functions and ZERO unresolved imports at runtime. So Minecraft is NOT
   polling NP APIs; if it waits on platform/auth state it must receive it some
   other way (a common-dialog flow, an event queue it registered, a callback
   we never invoke, or its own offline-mode decision). Before stubbing NP,
   MEASURE what the main thread and the two parked Gameface threads are
-  actually blocked on between t+7s and the kill: use XPS5X_STALL_DUMP /
+  actually blocked on between t+7s and the kill: use RAEEN_STALL_DUMP /
   guest-stack chains on the cond_wait callers, and check which HLE event
   queues (WaitEqueue) the title created and whether anything ever posts to
   them. The gate is the first thing that would RESUME those waits.
 
-- Minecraft steady-state is a POLL, not a block (2026-07-20, XPS5X_STALL_DUMP,
+- Minecraft steady-state is a POLL, not a block (2026-07-20, RAEEN_STALL_DUMP,
   20 samples): every dump reports "IN-FLIGHT HLE: <none — all threads between
   calls>". No thread is ever caught inside an HLE call — so the title is NOT
   parked in one long cond_wait/equeue-wait; it POLLS some readiness state in
@@ -1786,7 +1786,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   transition that would create the UI view.
 
 - Minecraft poll gate — sceSystemServiceReceiveEvent was UNREGISTERED
-  (2026-07-20). XPS5X_TIME_HLE ranking of the steady state: the MAIN THREAD
+  (2026-07-20). RAEEN_TIME_HLE ranking of the steady state: the MAIN THREAD
   spends ~93% of wall time in scePthreadMutexLock (166k calls / 85s — a normal
   game-loop tick, NOT a spin: its RIP moves each dump), and its steady-state
   HLE poll set includes `sceSystemServiceReceiveEvent` — the PS5 per-frame
@@ -1805,7 +1805,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   but non-fatal audio pump, not the UI gate.
 
 - Minecraft steady-state poll ranking, POST ReceiveEvent fix (2026-07-20,
-  XPS5X CALL_STATS, t=+191s, MY ReceiveEvent registration in tree). Two results:
+  Raeen CALL_STATS, t=+191s, MY ReceiveEvent registration in tree). Two results:
   1. ReceiveEvent NO LONGER appears in the top poll set — registering it to
      return NO_EVENT cleanly removed the per-frame unresolved-import error. Good
      baseline, but the boot did NOT advance to a menu (12 present:dumping, still
@@ -1824,7 +1824,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
      NEXT: find what host/socket the recvfrom loop targets and why it never
      receives — is it a PSN/online endpoint the offline-socket path should
      answer, or a localhost IPC the title expects a peer to fill? Check the
-     socket's creation (sceNetSocket/Connect) and whether XPS5X's offline-socket
+     socket's creation (sceNetSocket/Connect) and whether Raeen's offline-socket
      handling (added in commit d15885a per git log) covers this fd. The audio
      pump (sceAudioOut2ContextPush/WaitSema/ContextAdvance all ~268,354) is a
      healthy ~parallel loop, not the gate.
@@ -1873,7 +1873,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   forward from there to find the branch that gates the view creation.
 
 - RenoirCore (cohtml's GPU backend) IS driven — renderer failure RULED OUT
-  (2026-07-20, XPS5X_TRAP_MODULE_EXPORTS=Renoir). 30 traps armed; 9 distinct
+  (2026-07-20, RAEEN_TRAP_MODULE_EXPORTS=Renoir). 30 traps armed; 9 distinct
   RenoirCore exports hit at ~t+4s, then silence — same init-tier-only shape as
   cohtml's 16. So cohtml reached renderer setup and its Renoir GPU device/
   context initialized cleanly (RenoirCore also links 0-unresolved, module_start
@@ -1918,10 +1918,10 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   menu needs game-code RE with proper tooling.
 
 - BUILT the disassembler blocker was waiting on (2026-07-20). Added
-  `xps5x --disas <eboot> <hex-vaddr> [len]` (xps5x-gui/src/main.rs) — real
+  `raeen --disas <eboot> <hex-vaddr> [len]` (raeen-gui/src/main.rs) — real
   x86-64 disassembly via the workspace iced-x86 decoder, marking each line
   (call)/(jmp)/(ret)/<-- COND/<-- TEST so subsystem-gating branches stand out.
-  iced-x86 was already a workspace dep (VEH uses it); added it to xps5x-gui.
+  iced-x86 was already a workspace dep (VEH uses it); added it to raeen-gui.
   DEMONSTRATED on Minecraft's boot code: `--disas eboot 0xd8c0e3 200` shows the
   init function's tail after the last cohtml/RenoirCore init call — it builds a
   ~0x4D0-byte config struct on the stack, calls sub_0x7DAF00 with rdi=&struct
@@ -1936,13 +1936,13 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   tool now makes that tractable. Single-increment HLE/GPU/FS work remains
   exhausted for Minecraft; this is the RE on-ramp, now unblocked.
 
-- Main-loop anchor probe (2026-07-20, XPS5X_TRACE_MAINLOOP in
+- Main-loop anchor probe (2026-07-20, RAEEN_TRACE_MAINLOOP in
   hle_receive_event logs ctx.caller_return_addr): ReceiveEvent was NOT called
   in a 90s window — it is an OCCASIONAL query, not a per-frame poll, so it is
   the WRONG anchor for finding the main-loop tick. BETTER ANCHOR for next
   session: sceAgcDriverSubmitDcb — confirmed in-flight on the MINECRAFT MAIN
   THREAD (mc_time.log), called every frame from the render tick. Log its
-  caller_return_addr the same way, then `xps5x --disas` that caller to reach
+  caller_return_addr the same way, then `raeen --disas` that caller to reach
   the per-frame function; from there trace the UI state dispatch. The probe
   is env-gated and harmless; keep it as a template.
   HONEST STATUS: this session built the RE on-ramp (the --disas disassembler +
@@ -1953,7 +1953,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
 
 - RE toolchain COMPLETE + demonstrated end-to-end (2026-07-20). Full workflow
   now works in-tree: export trap (which exports called) -> caller probe
-  (ctx.caller_return_addr in an HLE fn, XPS5X_TRACE_MAINLOOP) -> `xps5x --disas`
+  (ctx.caller_return_addr in an HLE fn, RAEEN_TRACE_MAINLOOP) -> `raeen --disas`
   (real x86-64) -> read control flow. APPLIED: sceAgcDriverSubmitDcb's per-frame
   caller is eboot vaddr 0x7423af; disassembling 0x742380 shows a THIN SUBMIT
   WRAPPER (branches DCB vs ACB on a bool in dil: dil==1 -> call 0xB7B4430,
@@ -1972,7 +1972,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   but it is now fully tooled and the next step is a single specified probe.
 
 - CAPTURED Minecraft's per-frame render call chain (2026-07-20, one run via the
-  agc_guest_stack_chain probe in hle_driver_submit_dcb, XPS5X_TRACE_MAINLOOP).
+  agc_guest_stack_chain probe in hle_driver_submit_dcb, RAEEN_TRACE_MAINLOOP).
   Arena-relative return-addr chain from the DCB submit upward (0x9fffddXX
   entries are rbp frame-pointer saves, IGNORE; real return addrs are the .text
   ones):
@@ -2057,8 +2057,8 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   (2026-07-20). Fanned out 7 agents to verify an external audit's claims against
   CURRENT code (several were stale). Outcomes:
   * DONE — NID CATALOG MERGE (highest-ROI, attacks HLE diagnosis gap). SharpEmu's
-    scripts/ps5_names.txt fed through XPS5X's OWN hash gate (nid_of) via a new
-    Rust tool `crates/xps5x-firmware/examples/merge_nid_catalog.rs`.
+    scripts/ps5_names.txt fed through Raeen's OWN hash gate (nid_of) via a new
+    Rust tool `crates/raeen-firmware/examples/merge_nid_catalog.rs`.
     nid_names.txt 94,247 -> 149,905 (+55,658 hash-verified names; 4,553 .L*/`/`
     junk dropped; existing wins collisions, __sys_dynlib_unload_prx preserved).
     all_names_hash_to_their_nid re-proves the whole merged table (junk names are
@@ -2069,7 +2069,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
     AddressWait/Wake now resolve to NAMES where they printed raw NIDs before.
     CAVEAT: naming != implementing — this closes the DIAGNOSIS gap so those
     imports can be targeted, not the HLE gap.
-  * DONE — OPT-IN HEAP POISON (debugging-speed). `XPS5X_POISON_HEAP=1` fills
+  * DONE — OPT-IN HEAP POISON (debugging-speed). `RAEEN_POISON_HEAP=1` fills
     fresh malloc with 0xCD (libc.rs hle_malloc) so an uninitialized read shows
     as 0xCDCDCDCD in the crash dump, not a silent zero. Off by default (a title
     that treats malloc as calloc keeps working); calloc still zeroes (regression
@@ -2083,7 +2083,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   Also confirmed (not acted): the memory-protection deficit is real (image RWX,
   heap/stack/mmap RW, NO inter-region guard pages, guest mprotect ignored) —
   W^X + guard pages is a valid future hardening, larger than this session.
-  Tests: xps5x-firmware 110+ green (merged table re-proven), xps5x-hle 289 green
+  Tests: raeen-firmware 110+ green (merged table re-proven), raeen-hle 289 green
   (+2: heap_poison, calloc_still_zeroes). Attribution added to THIRD_PARTY_NOTICES.
 
 - DONE — INTER-REGION GUARD PAGES (memory hardening, 2026-07-20). The four
@@ -2111,7 +2111,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   a title mprotecting a page our HLE later touches would fault). Both are real
   future hardening; guard pages are the safe, self-contained, done slice.
 
-- DONE — W^X the code image, per-segment (2026-07-20, opt-in XPS5X_WX_IMAGE).
+- DONE — W^X the code image, per-segment (2026-07-20, opt-in RAEEN_WX_IMAGE).
   A stray guest DATA store into code no longer corrupts an instruction silently;
   it faults at the store (caught by the existing VEH). KEY FINDING via
   measurement: WHOLE-IMAGE W^X is WRONG — the image region holds .text AND
@@ -2127,7 +2127,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
       restore RX. Routed the ONLY runtime code-write (export_trap one-shot
       restore) through it; native_trap writes are pre-map (image buffer) or to
       the stack (RW), so unaffected.
-    * maybe_enable_wx_image gated behind XPS5X_WX_IMAGE, wired at all 3 execute
+    * maybe_enable_wx_image gated behind RAEEN_WX_IMAGE, wired at all 3 execute
       sites.
   MEASURED: with per-segment W^X on, Minecraft boots IDENTICALLY (64 submissions,
   753 draws, zero image-region faults) — code protected, data writable. Whole-
@@ -2141,7 +2141,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   NOT done this turn: enforce guest mprotect (the third hardening item) — same
   data/code-granularity + broad-risk profile; deferred for its own careful pass.
 
-- DONE — enforce guest mprotect, opt-in (2026-07-20, XPS5X_ENFORCE_MPROTECT).
+- DONE — enforce guest mprotect, opt-in (2026-07-20, RAEEN_ENFORCE_MPROTECT).
   sceKernelMprotect was an ok-stub and POSIX mprotect / BatchMap OP_PROTECT were
   no-ops (protection bits stored in the VMA but never pushed to host pages), so a
   title writing to a page it marked read-only succeeded silently. Now, under the
@@ -2189,9 +2189,9 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   it closes import gaps that would gate a title that actually drives these.
 
 - RENDER-RE: found the RIGHT anchor — the UI-manager singleton (2026-07-20).
-  New probe XPS5X_TRACE_UI logs the caller of the routes.json open (libkernel.rs
+  New probe RAEEN_TRACE_UI logs the caller of the routes.json open (libkernel.rs
   hle_open). MEASURED: routes.json is opened from eboot 0xb5c689d (call open),
-  returning to 0xb5c68a2. Disassembling forward (xps5x --disas):
+  returning to 0xb5c68a2. Disassembling forward (raeen --disas):
     0xb5c68a2  mov r14d,eax; test eax,eax; js <err>   ; check the fd
     0xb5c68c6  build an SSO string; call 0x7C80E0      ; read the file
     0xb5c6900  mov rax,[0xE39E098]; call [rax+0x10] esi=0x50  ; hand to the UI mgr
@@ -2207,7 +2207,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   probe on that slot's target to see if it is ever called and with what route.
   If it is NEVER called, the gate is upstream (a game-state flag the UI mgr waits
   on); if called with an empty/null route, the gate is what computes the route.
-  The XPS5X_TRACE_UI probe is uncommitted (env-gated, harmless); keep it.
+  The RAEEN_TRACE_UI probe is uncommitted (env-gated, harmless); keep it.
 
 - RENDER-RE CORRECTION: 0xE39E098 is the ALLOCATOR, not the UI manager
   (2026-07-20). Dumped the singleton's embedded function-pointer table
@@ -2231,7 +2231,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   export-trap probe on cohtml's actual View/LoadURL exports to catch IF/when the
   game ever calls them with a route (the export trap already showed 0 view-tier
   calls, so likely the gate is upstream game state). Tools: --disas, export trap,
-  XPS5X_TRACE_UI (uncommitted, env-gated).
+  RAEEN_TRACE_UI (uncommitted, env-gated).
 
 - RENDER-RE: route-loader is container code; NEW LEAD = Xbox Live, not PSN
   (2026-07-20). Traced the route-loader (0xb5c6900) forward: open routes.json ->
@@ -2282,7 +2282,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   * Candidate gate G1 @0x1112794: `mov rax,[rbp-118h]; movzx eax,byte[rax+0x248];
     test al,al; jne 0x1112C5A` — if byte[P+0x248]!=0 the tick returns BEFORE any
     screen registration/navigation. P = *[0xE15B830] (app shared-state singleton).
-  * CONFIRMATION PROBE (XPS5X_TRACE_UI in hle_get_status, per-frame): read
+  * CONFIRMATION PROBE (RAEEN_TRACE_UI in hle_get_status, per-frame): read
     byte[*[0xE15B830]+0x248] live on Minecraft. RESULT: singleton is a valid heap
     object (arena-rel 0x100002c2800), and the gate byte = **0 from frame 0
     onward**. So G1 PASSES — it is NOT the blocker.
@@ -2296,7 +2296,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   find the per-screen view-create gate). Disproven gates: G3/G4 (0xbae690 =
   routes.json hot-reload diff, not boot navigate), angle-B [rbx+0x58] (separate
   init/registration gate). NEW RE TOOLS built + used: --find-calls, --find-lea,
-  --find-str (xps5x-gui). This is the tightest the gate has ever been located:
+  --find-str (raeen-gui). This is the tightest the gate has ever been located:
   a named dispatcher, a tested-and-excluded top gate, two concrete downstream
   targets. Real, measured forward progress toward a menu pixel.
 
@@ -2307,7 +2307,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   persistent-image texture binding, upload ring) then stage C (swapchain).
 
 - ASTRO.BOT compute round 10: BIND-TIME WALLS CLOSED, device-loss bisected +
-  quarantined (2026-07-20, xps5x-gpu only; 120s measured run, 0 device losses).
+  quarantined (2026-07-20, raeen-gpu only; 120s measured run, 0 device losses).
   * Wall 1 null V# (39): storage V# with base 0/size 0 now binds a 4-byte zero
     dummy (RDNA OOB semantics), writeback explicitly skipped — 216 dummy binds
     + 216 writeback skips in the final run, error string gone.
@@ -2316,9 +2316,9 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
     conditions. Unblocked the sampler-only CS (0x100008e6aa00, up to 524288x1x1
     groups, runs clean). THE OTHER HALF IS QUARANTINED: the one tex-no-sampler
     CS (0x5006c5f00) reproducibly resets the GPU (VK_ERROR_DEVICE_LOST,
-    bisected via new XPS5X_SKIP_CS env; robustness features don't save it →
+    bisected via new RAEEN_SKIP_CS env; robustness features don't save it →
     descriptor-array OOB index suspected). Default-on named skip in
-    dispatch_direct (162 skips/120s); XPS5X_ALLOW_TEX_NO_SAMPLER=1 lifts it.
+    dispatch_direct (162 skips/120s); RAEEN_ALLOW_TEX_NO_SAMPLER=1 lifts it.
   * Wall 3 set-slot contiguity (38): offscreen.rs builds set layouts keyed by
     the actual slot, gap slots get empty layouts; duplicate-slot stays a named
     error. Error string gone.
@@ -2334,14 +2334,14 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   * New: robustBufferAccess + robustImageAccess enabled at device creation.
   * Measured 120s final: 0 device losses, 925 dispatch submits, 751
     untranslatable skips + 162 quarantine (vs r9 50s baseline: 115 warn-level
-    bind-time draw skips, all three error classes now 0). tests: xps5x-gpu
+    bind-time draw skips, all three error classes now 0). tests: raeen-gpu
     134 unit + integration green incl. new tests/compute_gds.rs (GDS
     persistence + tex-no-sampler Vulkan plumbing); clippy -D warnings clean.
 
 ## 2026-07-20 gpu-pipeline — perf stage C: flush per flip + flip-limited readback + upload ring (uncommitted)
 - Item 1 flush-per-flip: worker submissions no longer flush/present per
   submission (execute_dcb_cp_routed deferred_present). Flush consumers only:
-  present_scanout (flip), wait_idle/shutdown, XPS5X_DUMP_FRAMES (keeps old
+  present_scanout (flip), wait_idle/shutdown, RAEEN_DUMP_FRAMES (keeps old
   per-submission cadence for dump fidelity), feedback-loop fallback in the
   sink. Flip flush routed through the ordered GPU work queue as
   GpuWork::Flush{address,done} — executes on the worker after all queued
@@ -2377,7 +2377,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   render-pool thread, 3 threads spinning); ASTRO.BOT ran clean on the same
   build (188 flips, 1 flush/flip) — wedge is Minecraft-specific, cause not
   yet understood; rendezvous flip flush kept (comment at present_scanout).
-- Ceiling ownership (measured, read-only on xps5x-hle): 120 flips/s is NOT
+- Ceiling ownership (measured, read-only on raeen-hle): 120 flips/s is NOT
   reachable while sceVideoOutWaitVblank sleeps a fixed 16.667 ms
   (libsce_video_out.rs:637) — Minecraft imports it and paces its animation
   window to ~60 Hz (p50 15.9 ms). Next lever is an HLE vblank change
@@ -2386,7 +2386,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
 
 ## 2026-07-20 — EUD/SRT raw-window s_load fallback (SharpEmu port)
 
-- eud-raw-window: complete (uncommitted, kyty-graphics 357/357 + xps5x-gpu
+- eud-raw-window: complete (uncommitted, kyty-graphics 357/357 + raeen-gpu
   163/163 tests, clippy -D warnings clean). Kills the "EUD dword N is not a
   captured descriptor field" refusal CLASS (195 refused ASTRO.BOT compute
   dispatches measured — title-run impact NOT yet re-measured): detection
@@ -2401,7 +2401,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   Ported from SharpEmu (GPL-2.0) Gen5ShaderScalarEvaluator.cs:1939-1980,
   :997-1005, :14-35; Gen5SpirvTranslator.cs:2183-2236 — cited in doc comments.
 - wait-reg-mem-suspend-resume: complete (uncommitted, kyty-graphics 358/358 +
-  xps5x-gpu 140/140 lib tests, clippy -D warnings clean). THE scene-pixel gate
+  raeen-gpu 140/140 lib tests, clippy -D warnings clean). THE scene-pixel gate
   (SharpEmu-proven): unmet `IT_WAIT_REG_MEM` / `R_WAIT_MEM_32/64` now parse +
   evaluate against the guest label and SUSPEND the walk (`run_resumable` →
   `RunOutcome::Suspended{resume_dword, WaitSpec}`) instead of being consumed
@@ -2416,7 +2416,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   GpuWaitRegistry.cs:19-40/239-256 — cited in doc comments.
 - cs-device-loss-defusal: complete (uncommitted, tests green, clippy clean).
   Quarantine for CS 0x5006c5f00 (ImageLoad+LDS+barrier+runtime-indexed T#)
-  REMOVED, incl. XPS5X_ALLOW_TEX_NO_SAMPLER: (i) sampler-less sample-family
+  REMOVED, incl. RAEEN_ALLOW_TEX_NO_SAMPLER: (i) sampler-less sample-family
   shaders synthesize an all-zero S# → cached nearest/wrap sampler (SharpEmu
   VulkanVideoPresenter.cs:6314-6322/8121-8156); (ii) all 9 DS-op families
   verified UMin-clamped on %lds (kept clamp over SharpEmu's pow2 mask —
@@ -2427,14 +2427,14 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
 
 - MILESTONE M3 CLOSED (2026-07-21): interactive 2D homebrew + pad + VideoOut flip.
   present-from-guest-memory (SharpEmu GuestImageWantsInitialData) makes CPU-drawn
-  2D visible; acceptance test crates/xps5x-runtime/tests/m3_interactive_2d.rs runs
+  2D visible; acceptance test crates/raeen-runtime/tests/m3_interactive_2d.rs runs
   a real synthesized guest (scePadReadState -> CPU framebuffer by input -> flip)
   and asserts output changes with input + flip advanced + last_image reflects it.
   Pad/audio HLE already tested. NEXT GATE: M4 (commercial 2D title to interactive
   menu with useful crash/NID/GPU logs) — blockers per per-title memories.
   CAVEAT: this commit bundled concurrent stage-D GPU texture cache whose FPS is
   UNVERIFIED (Minecraft after-run flips 43->22, build 969->59us) — re-measure via
-  XPS5X_NO_TEX_CACHE A/B and revert if it regresses.
+  RAEEN_NO_TEX_CACHE A/B and revert if it regresses.
 
 ## 2026-07-21 driver — EUD snapshot base fix + raw-EUD image-descriptor capture
 - (Landed inside commit 5802864, which a CONCURRENT session pushed while this
@@ -2474,7 +2474,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   back to 256 (13 frame dumps). Frames: earlier = the 4-flat-colour
   composite, late = banded blue gradient (10 colours, 0% exact clear) —
   presentation class unchanged, NO scene claim (§5 censused).
-- kyty-graphics 366 tests, xps5x-gpu 144, workspace clippy -D warnings,
+- kyty-graphics 366 tests, raeen-gpu 144, workspace clippy -D warnings,
   fmt clean (verified again on HEAD after the concurrent commit).
 - NEXT GATE (only remaining translate class, 2 shaders): "mixed sampled
   texture dims in one shader" — 0x500564500 (2d+3d) + one (3d+2darray).
@@ -2540,18 +2540,18 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   draw_translate groups/reindexes per key (12 ordinals) with a 0..512
   unified-format sweep pinning shader class == view VkFormat class. Tests:
   kyty-graphics 385/385 (3 new: r8_uint raw-bits, float pin, mixed
-  float+uint arrays — spirv-val'd), xps5x-gpu 163/163 (2 new); clippy lib
+  float+uint arrays — spirv-val'd), raeen-gpu 163/163 (2 new); clippy lib
   clean both. NOT yet verified against the live title (release run owned by
   another session).
 - in-app log console SHIPPED (shell/console.rs + ConsoleBuffer/ConsoleLayer in
-  xps5x-core logging.rs): F10 toggles a floating console over any screen —
+  raeen-core logging.rs): F10 toggles a floating console over any screen —
   level filter, search, autoscroll, copy, clear, colored single-line truncated
   rows (show_rows virtualization needs uniform height), 5k-line core ring
-  (XPS5X_CONSOLE_LINES). Verified by screenshot over Home AND in-game.
-  xps5x.exe is now GUI-subsystem (no terminal window from Explorer);
+  (RAEEN_CONSOLE_LINES). Verified by screenshot over Home AND in-game.
+  raeen.exe is now GUI-subsystem (no terminal window from Explorer);
   AttachConsole(ATTACH_PARENT_PROCESS) first thing in main keeps CLI output
   working from a terminal.
-- COMBINED GPU ACCEPTANCE GREEN (log rotated to xps5x.log.1 during analysis —
+- COMBINED GPU ACCEPTANCE GREEN (log rotated to raeen.log.1 during analysis —
   beware the rotation-on-init trap when a second Shell launches mid-analysis):
   240s ASTRO run rc=0, 0 segfaults, 0 deadlocks, 0 gate refusals (relooper
   validates all 4 scene CS), 0 FLOAT-mismatch VUIDs (numeric-class fix), 1
@@ -2561,7 +2561,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   skips (assorted classes, honest skips not crashes) + push-constant SSBO
   spill + storage-image numeric classes (unmeasured).
 - UI batch (all screenshot-verified): PS5-authentic Home — real param.json
-  titles/ids/versions via xps5x-loader (en-US titleName preferred; ASCII
+  titles/ids/versions via raeen-loader (en-US titleName preferred; ASCII
   renderability gate), context line "PPSA17221 · v… · Ready to play", dead
   Store/Game Library tiles + pills removed (pill row = My games/Media/
   Settings, nav indices + tests updated); "blurry UI" root-caused as egui's
@@ -2583,7 +2583,7 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   + in-tile title + analogous two-hue gradient). REMAINING from critique:
   #6 session ledger (last played/time played/crashed-last-session line), #7
   control-center live data + switcher, topbar interactivity/text-tabs.
-  TRAP: release relink fails os error 5 if a screenshot-probe xps5x.exe was
+  TRAP: release relink fails os error 5 if a screenshot-probe raeen.exe was
   left alive — Stop-Process before cargo build.
 - UI round 3 (screenshot-verified): SESSION LEDGER (shell/ledger.rs — per-title
   JSON beside per_game store; launch stamps last_played, exit accumulates

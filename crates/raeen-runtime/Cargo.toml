@@ -1,0 +1,19 @@
+[package]
+name = "raeen-runtime"
+description = "RT0 execution runtime — runs a linked PS5 module natively, servicing HLE imports via a Vectored Exception Handler on the trampoline addresses LM1 planted"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+raeen-core = { workspace = true }
+raeen-firmware = { workspace = true }
+raeen-gpu = { workspace = true }
+raeen-hle = { workspace = true }
+raeen-kernel = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+iced-x86 = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

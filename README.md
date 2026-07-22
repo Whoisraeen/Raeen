@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://whoisraeen.github.io/xps5x-website/"><strong>Website</strong></a> ·
+  <a href="https://whoisraeen.github.io/raeen-website/"><strong>Website</strong></a> ·
   <a href="https://github.com/Whoisraeen/Raeen/releases/latest">Download (Windows x64)</a> ·
   <a href="https://github.com/Whoisraeen/Raeen/issues">Issues</a>
 </p>
@@ -88,15 +88,15 @@ cargo run --release
 
 ```
 crates/
-├── xps5x-core/      Core engine, configuration, error handling
-├── xps5x-loader/    SELF/ELF/PKG binary parser and loader
-├── xps5x-kernel/    Orbis OS kernel HLE (syscall translation)
-├── xps5x-gpu/       GPU command translation (GNM→Vulkan)
-├── xps5x-audio/     Tempest 3D audio emulation
-├── xps5x-io/        I/O complex & SSD decompression
-├── xps5x-input/     DualSense & gamepad input
-├── xps5x-hle/       High-level emulation of PS5 system libraries
-└── xps5x-gui/       Desktop application (egui)
+├── raeen-core/      Core engine, configuration, error handling
+├── raeen-loader/    SELF/ELF/PKG binary parser and loader
+├── raeen-kernel/    Orbis OS kernel HLE (syscall translation)
+├── raeen-gpu/       GPU command translation (GNM→Vulkan)
+├── raeen-audio/     Tempest 3D audio emulation
+├── raeen-io/        I/O complex & SSD decompression
+├── raeen-input/     DualSense & gamepad input
+├── raeen-hle/       High-level emulation of PS5 system libraries
+└── raeen-gui/       Desktop application (egui)
 ```
 
 ## Status

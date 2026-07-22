@@ -1,17 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/xps5x-core",
-    "crates/xps5x-loader",
-    "crates/xps5x-kernel",
-    "crates/xps5x-gpu",
-    "crates/xps5x-audio",
-    "crates/xps5x-io",
-    "crates/xps5x-input",
-    "crates/xps5x-hle",
-    "crates/xps5x-gui",
-    "crates/xps5x-firmware",
-    "crates/xps5x-runtime",
+    "crates/raeen-core",
+    "crates/raeen-loader",
+    "crates/raeen-kernel",
+    "crates/raeen-gpu",
+    "crates/raeen-audio",
+    "crates/raeen-io",
+    "crates/raeen-input",
+    "crates/raeen-hle",
+    "crates/raeen-gui",
+    "crates/raeen-firmware",
+    "crates/raeen-runtime",
     # Kyty port (docs/superpowers/plans/2026-07-13-kyty-full-port.md)
     "crates/kyty-core",
     "crates/kyty-math",
@@ -22,7 +22,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "GPL-2.0-only"
-repository = "https://github.com/Whoisraeen/XPS5X"
+repository = "https://github.com/Whoisraeen/Raeen"
 rust-version = "1.85"
 
 [workspace.dependencies]
@@ -83,8 +83,8 @@ sha1 = "0.10"
 base64 = "0.22"
 iced-x86 = { version = "1.21", default-features = false, features = ["decoder", "intel", "std"] }
 
-# Windows OS APIs — VirtualAlloc/VEH for xps5x-runtime, GetLocalTime for
-# xps5x-gui's top-bar clock
+# Windows OS APIs — VirtualAlloc/VEH for raeen-runtime, GetLocalTime for
+# raeen-gui's top-bar clock
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     # GUI-subsystem console reattach (AttachConsole) for CLI invocations.
@@ -104,17 +104,17 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 # Internal crates
-xps5x-core = { path = "crates/xps5x-core" }
-xps5x-loader = { path = "crates/xps5x-loader" }
-xps5x-kernel = { path = "crates/xps5x-kernel" }
-xps5x-gpu = { path = "crates/xps5x-gpu" }
-xps5x-audio = { path = "crates/xps5x-audio" }
-xps5x-io = { path = "crates/xps5x-io" }
-xps5x-input = { path = "crates/xps5x-input" }
-xps5x-hle = { path = "crates/xps5x-hle" }
-xps5x-gui = { path = "crates/xps5x-gui" }
-xps5x-firmware = { path = "crates/xps5x-firmware" }
-xps5x-runtime = { path = "crates/xps5x-runtime" }
+raeen-core = { path = "crates/raeen-core" }
+raeen-loader = { path = "crates/raeen-loader" }
+raeen-kernel = { path = "crates/raeen-kernel" }
+raeen-gpu = { path = "crates/raeen-gpu" }
+raeen-audio = { path = "crates/raeen-audio" }
+raeen-io = { path = "crates/raeen-io" }
+raeen-input = { path = "crates/raeen-input" }
+raeen-hle = { path = "crates/raeen-hle" }
+raeen-gui = { path = "crates/raeen-gui" }
+raeen-firmware = { path = "crates/raeen-firmware" }
+raeen-runtime = { path = "crates/raeen-runtime" }
 kyty-graphics = { path = "crates/kyty-graphics" }
 
 [profile.release]

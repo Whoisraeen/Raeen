@@ -1,8 +1,8 @@
-# XPS5X default theme (spec `2026-07-13-xps5x-shell-design.md` §6, §11).
+# Raeen default theme (spec `2026-07-13-raeen-shell-design.md` §6, §11).
 #
 # Ships with the repository. Original palette/metric values only — no
 # third-party assets. This file's values are required to agree exactly
-# with the in-code fallback at `crates/xps5x-gui/src/theme/mod.rs::
+# with the in-code fallback at `crates/raeen-gui/src/theme/mod.rs::
 # default_theme()`; the two are covered by a test that loads this file and
 # compares it field-by-field against that function.
 #

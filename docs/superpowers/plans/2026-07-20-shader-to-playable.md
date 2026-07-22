@@ -42,7 +42,7 @@ flowchart TD
 3. Fix **only that class** with a regression test.
 4. Re-measure: `translate_failed`, `draw_skips`, frame histogram (`distinct_pixels`), not splash.
 
-Do not delete `crates/xps5x-gpu/src/shader/` unless you want cleanup; it is not on this path. Live path: `shader_fetch.rs` → `kyty-graphics` shader/ → `draw_translate.rs`.
+Do not delete `crates/raeen-gpu/src/shader/` unless you want cleanup; it is not on this path. Live path: `shader_fetch.rs` → `kyty-graphics` shader/ → `draw_translate.rs`.
 
 ---
 
@@ -65,7 +65,7 @@ Work in `crates/kyty-graphics/src/shader/{recompile,parse,analysis,spirv}.rs`:
 ASTRO’s 3D path is **compute → storage/HDR resources → composite draw**. Translation alone still yields flat colour if data never flows.
 
 1. **CP DMA / copy** — implement consumption of `R_DMA_DATA` / `IT_COPY_DATA` in `crates/kyty-graphics/src/run.rs` (builders already exist in HLE; CP still skips by length). This is the top candidate for scanout/composite fill.
-2. **Storage-image / UAV fidelity** — beyond RGBA8 reinterpret: correct formats, graphics-stage storage if measured, **no silent re-tile skip** on writeback (`crates/xps5x-gpu/src/vulkan/compute.rs`, `draw_translate.rs`).
+2. **Storage-image / UAV fidelity** — beyond RGBA8 reinterpret: correct formats, graphics-stage storage if measured, **no silent re-tile skip** on writeback (`crates/raeen-gpu/src/vulkan/compute.rs`, `draw_translate.rs`).
 3. **GDS / LDS persistence** across dispatches (tests exist; prove on title).
 4. **CB colour formats safely** — format `0x3` (8_8) caused `VK_ERROR_DEVICE_LOST`; fix attachment/blend/export mismatch **before** re-enabling the map (keep the reject-assert until then).
 5. **Texture / tile / sampler gaps** — only when dumps name them; keep sampled vs storage T# split.
@@ -99,7 +99,7 @@ Implement NIDs **only on measured call**, not the full static unresolved set.
 1. Document known glitches; keep crash logs NID/GPU-useful (M4/M5 honesty).
 2. Save-data host map; entitlement/dialog stubs only if a title **calls** them.
 3. Broaden second title once ASTRO has a recognizable frame.
-4. Do **not** revive the old `xps5x-gpu` IR emitter for titles — extend Kyty path only.
+4. Do **not** revive the old `raeen-gpu` IR emitter for titles — extend Kyty path only.
 
 ---
 

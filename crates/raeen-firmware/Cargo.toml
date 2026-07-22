@@ -1,0 +1,18 @@
+[package]
+name = "raeen-firmware"
+description = "PS5 firmware ingestion — PUP parsing, user-supplied key decryption seam, SCE module loading and NID linking"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+raeen-core = { workspace = true }
+raeen-loader = { workspace = true }
+raeen-hle = { workspace = true }
+tracing = { workspace = true }
+memmap2 = { workspace = true }
+sha1 = { workspace = true }
+aes = { workspace = true }
+cbc = { workspace = true }
+goblin = { workspace = true }
+iced-x86 = { workspace = true }

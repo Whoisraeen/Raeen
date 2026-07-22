@@ -2,7 +2,7 @@
     gen-assets.ps1 - generate Raeen installer branding.
 
     Produces, under installer/assets/:
-      * xps5x.ico          multi-resolution app + setup icon (16..256, PNG frames)
+      * raeen.ico          multi-resolution app + setup icon (16..256, PNG frames)
       * wizard-large.bmp   Welcome/Finished page sidebar (portrait, full-bleed)
       * wizard-small.bmp   inner-page header logo (square-ish, white background)
 
@@ -231,7 +231,7 @@ function Write-WizardSmall([string]$path, [int]$W, [int]$H) {
 }
 
 # ---------------------------------------------------------------- run -------
-$ico   = Join-Path $AssetsDir 'xps5x.ico'
+$ico   = Join-Path $AssetsDir 'raeen.ico'
 $large = Join-Path $AssetsDir 'wizard-large.bmp'
 $small = Join-Path $AssetsDir 'wizard-small.bmp'
 

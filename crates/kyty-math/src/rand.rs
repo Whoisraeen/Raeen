@@ -5,7 +5,7 @@
 //! Kyty's `Rand` is a `std::mt19937` behind a set of static helpers producing
 //! uniform integers/floats over inclusive/exclusive ranges. The idiomatic
 //! Rust equivalent is the [`rand`] crate (workspace-crate convention). This
-//! is **not** bit-identical to Kyty's stream — XPS5X is a clean-room reimpl,
+//! is **not** bit-identical to Kyty's stream — Raeen is a clean-room reimpl,
 //! not running Kyty's code, so the exact PRNG sequence is not load-bearing;
 //! only the API shape and the distribution semantics (inclusive vs
 //! exclusive bounds) are preserved.

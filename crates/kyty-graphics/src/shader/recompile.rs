@@ -936,11 +936,11 @@ fn recompile_exp_pos0(
     const FUNC: &str = "Recompile_Exp_Pos0Vsrc0Vsrc1Vsrc2Vsrc3Done";
     let inst = inst_at(code, index, FUNC)?;
 
-    // Coverage probe (XPS5X_TRACE_DRAWS). XPS5X_FORCE_CLEAR proved a correct
+    // Coverage probe (RAEEN_TRACE_DRAWS). RAEEN_FORCE_CLEAR proved a correct
     // full-screen NDC quad rasterizes ZERO fragments, so the suspect is the
     // position export. If this never fires for a title's VS, the shader never
     // writes gl_Position at all and nothing can cover a pixel.
-    if std::env::var_os("XPS5X_TRACE_DRAWS").is_some() {
+    if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
         use std::sync::atomic::{AtomicU32, Ordering};
         static POS0_SEEN: AtomicU32 = AtomicU32::new(0);
         let n = POS0_SEEN.fetch_add(1, Ordering::Relaxed);
@@ -980,7 +980,7 @@ fn recompile_exp_pos0(
     // TODO() check VSKIP
     // TODO() check EXEC
 
-    // DIAGNOSTIC (XPS5X_VS_PASSTHROUGH=1): bypass the VS arithmetic and export
+    // DIAGNOSTIC (RAEEN_VS_PASSTHROUGH=1): bypass the VS arithmetic and export
     // input attribute 0 directly as the clip position. Every INPUT is verified
     // correct (the measured vertex buffer is a textbook NDC quad) and Vulkan
     // reports ZERO validation messages, yet no primitive covers a pixel — so
@@ -988,7 +988,7 @@ fn recompile_exp_pos0(
     // flag => the generated VS body is at fault; still black => the fault is
     // below the shader. Assumes a vec3 attr0 (the measured stride-12 quad);
     // other shapes will fail to assemble, which is fine for a gated probe.
-    if std::env::var_os("XPS5X_VS_PASSTHROUGH").is_some() {
+    if std::env::var_os("RAEEN_VS_PASSTHROUGH").is_some() {
         const PASS: &str = r#"
          %p0_<index> = OpLoad %v3float %attr0
          %px_<index> = OpCompositeExtract %float %p0_<index> 0
@@ -1026,7 +1026,7 @@ fn recompile_exp_pos0(
 /// 0x0d-0x0f), which upstream EXITs on. Per shadPS4 (`ir/position.h`
 /// `ExportPosition`), each enabled channel maps to a clip distance, cull
 /// distance, point size, or viewport/render-target index as configured by
-/// PA_CL_VS_OUT_CNTL. XPS5X does not plumb VS_OUT_CNTL into the recompiler
+/// PA_CL_VS_OUT_CNTL. Raeen does not plumb VS_OUT_CNTL into the recompiler
 /// yet, so the export is accepted and dropped: nothing is written and
 /// gl_Position (pos0) is untouched. Dropping clip/cull distances disables
 /// user clip planes for the draw — visible at worst as missing clipping,
@@ -4833,7 +4833,7 @@ fn recompile_image_sample_dmask_f(
 
 /// Lower Gen5 `image_sample_c_lz` through the existing non-depth image type.
 ///
-/// XPS5X currently declares sampled textures with `Depth = 0`, so SPIR-V's
+/// Raeen currently declares sampled textures with `Depth = 0`, so SPIR-V's
 /// depth-reference sampling opcodes are not legal for these descriptors. The
 /// equivalent lowering used by SharpEmu samples red at LOD zero, evaluates
 /// `reference <= texel`, and materializes `(compare, compare, compare, 1)`
@@ -9314,7 +9314,7 @@ pub fn shader_recompile_cs(
     // `byte_offset >> 2`), so a V# whose byte size is not a dword multiple
     // simply has an unaddressable tail. The host upload pads the byte
     // buffer to a dword multiple and the writeback truncates back to the
-    // real size (`xps5x-gpu` `prepare_stage_binding`), which preserves the
+    // real size (`raeen-gpu` `prepare_stage_binding`), which preserves the
     // guest bytes beyond the V# exactly. Measured on ASTRO.BOT scene
     // compute (58 dispatches/run refused on this gate).
     let source = spirv_generate_source(code, None, None, Some(input_info))?;
@@ -9369,7 +9369,7 @@ mod tests {
     }
 
     /// Real spirv-val (the Khronos validator, same invocation as the
-    /// xps5x-gpu runtime gate): the structurizer's acceptance bar. naga
+    /// raeen-gpu runtime gate): the structurizer's acceptance bar. naga
     /// cannot serve here — its SPIR-V front end structurizes and ACCEPTS
     /// back-edge modules spirv-val (and drivers) reject.
     fn spirv_val_ok(words: &[u32], name: &str) {
