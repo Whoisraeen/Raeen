@@ -186,6 +186,14 @@ pub struct OrbisKernel {
     /// Guest pthread read-write lock state, keyed by both the guest
     /// `pthread_rwlock_t` address and its allocated handle.
     pub pthread_rwlocks: DashMap<u64, PthreadRwlock>,
+    /// Per-`(guest thread id, rwlock key)` read-hold recursion depth.
+    /// [`PthreadRwlock::readers`] is a single shared count that cannot say
+    /// *which* thread holds a read; without that, a stray or duplicated
+    /// `scePthreadRwlockUnlock` from a non-holder would decrement (and
+    /// eventually free) another thread's read hold, letting a writer in while a
+    /// reader is still inside the lock. This gates the read-release on the
+    /// caller actually owning one. See `raeen-hle` `pthread_sync`.
+    pub pthread_rwlock_read_holds: DashMap<(u64, u64), u32>,
     /// Diagnostic (`RAEEN_TIME_HLE`): `(guest thread id, "library::function")`
     /// -> (call count, total microseconds inside that call). Attributes a
     /// stalled thread's wall-clock to the specific call it is parked in, which
@@ -749,6 +757,7 @@ impl OrbisKernel {
             pthread_mutexes: DashMap::new(),
             pthread_mutex_attrs: DashMap::new(),
             pthread_rwlocks: DashMap::new(),
+            pthread_rwlock_read_holds: DashMap::new(),
             hle_call_time: DashMap::new(),
             hle_call_counts: DashMap::new(),
             pthread_conds: DashMap::new(),

@@ -336,26 +336,45 @@ fn lock_core(
     let key = if let Some(key) = resolve_key(ctx, mutex_addr) {
         key
     } else {
-        // Implicit creation for a statically-initialized mutex. Orbis mutexes
-        // are opaque pointer slots, so success must also materialize *mutex;
-        // guest libc checks that pointer directly between pthread calls.
-        let Some(handle) = ctx.alloc.alloc(MUTEX_OBJECT_SIZE, 0x10) else {
-            return EINVAL;
-        };
-        if !ctx.mem.write(mutex_addr, &handle.to_le_bytes()) {
-            ctx.alloc.free(handle);
-            return EINVAL;
-        }
+        // Implicit creation for a statically-initialized mutex, and it MUST be
+        // atomic. Two guest threads first-touching the same static mutex both
+        // miss `resolve_key`; a plain check-then-insert lets the second
+        // `insert(mutex_addr, {owner: 0})` clobber the first thread's
+        // freshly-taken ownership back to free, so the loop below then hands the
+        // "mutex" to both threads and there is no mutual exclusion at all —
+        // exactly when a title first spins up its worker pool on a shared static
+        // lock. `entry` serializes the miss so the state is published once.
+        // Mirrors `pthread_cond.rs::condition` (and defers the handle-alias
+        // insert until the shard guard is dropped, so two colliding keys can't
+        // self-deadlock).
         let state = PthreadMutex {
             ty: MUTEX_NORMAL,
             owner: 0,
             recursion: 0,
         };
-        ctx.kernel.pthread_mutexes.insert(mutex_addr, state);
-        // Keep a fallback alias for callers that pass the opaque handle
-        // itself instead of its slot. Normal Orbis calls pass the slot, which
-        // remains the canonical state key.
-        ctx.kernel.pthread_mutexes.insert(handle, state);
+        // Orbis mutexes are opaque pointer slots, so success must also
+        // materialize *mutex; guest libc checks that pointer directly between
+        // pthread calls. Only the thread that wins the vacant entry does this.
+        let new_handle = match ctx.kernel.pthread_mutexes.entry(mutex_addr) {
+            dashmap::mapref::entry::Entry::Occupied(_) => None,
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                let Some(handle) = ctx.alloc.alloc(MUTEX_OBJECT_SIZE, 0x10) else {
+                    return EINVAL;
+                };
+                if !ctx.mem.write(mutex_addr, &handle.to_le_bytes()) {
+                    ctx.alloc.free(handle);
+                    return EINVAL;
+                }
+                slot.insert(state);
+                Some(handle)
+            }
+        };
+        // Keep a fallback alias for callers that pass the opaque handle itself
+        // instead of its slot — inserted only after the entry shard guard above
+        // is dropped. The slot remains the canonical state key.
+        if let Some(handle) = new_handle {
+            ctx.kernel.pthread_mutexes.insert(handle, state);
+        }
         mutex_addr
     };
 
@@ -577,18 +596,32 @@ fn hle_rwlock_destroy(ctx: &HleContext, args: &[u64]) -> u64 {
     if key != addr {
         ctx.kernel.pthread_rwlocks.remove(&addr);
     }
+    // Drop any per-thread read-hold accounting for this rwlock too, so a
+    // destroyed-and-recycled address can't inherit stale read depths.
+    ctx.kernel
+        .pthread_rwlock_read_holds
+        .retain(|(_, k), _| *k != key && *k != addr);
     let _ = ctx.mem.write(addr, &0u64.to_le_bytes());
     OK
 }
 
 /// Resolve (creating implicitly for static initializers) the rwlock state key.
 fn resolve_or_create_rwlock(ctx: &HleContext, addr: u64) -> u64 {
-    resolve_rwlock_key(ctx, addr).unwrap_or_else(|| {
-        ctx.kernel
-            .pthread_rwlocks
-            .insert(addr, PthreadRwlock::default());
-        addr
-    })
+    if let Some(key) = resolve_rwlock_key(ctx, addr) {
+        return key;
+    }
+    // Implicit creation for a statically-initialized rwlock, and it MUST be
+    // atomic. Two guest threads first-touching the same static rwlock (typically
+    // a reader and a writer) both miss `resolve_rwlock_key`; a plain
+    // check-then-insert lets the second `insert(default)` clobber the first
+    // thread's freshly-taken hold (writer/readers reset to 0), so a reader and a
+    // writer both "acquire" and the writer rehashes the guest's container while
+    // the reader is still walking it — the observed simultaneous null/dangling
+    // bucket-walk fault on the reader threads. `entry().or_insert_with` publishes
+    // the state exactly once and never overwrites an existing hold. Mirrors
+    // `pthread_cond.rs::condition`.
+    ctx.kernel.pthread_rwlocks.entry(addr).or_default();
+    addr
 }
 
 /// `scePthreadRwlockRdlock`/`Tryrdlock(rwlock)`: add a read hold. With one
@@ -620,6 +653,14 @@ fn rwlock_rdlock_deadline(
         let mut entry = ctx.kernel.pthread_rwlocks.get_mut(&key).unwrap();
         if entry.writer == 0 || entry.writer == current {
             entry.readers += 1;
+            drop(entry);
+            // Record this thread's read hold so a later unlock can prove the
+            // caller actually owns one before releasing it (see
+            // `hle_rwlock_unlock`).
+            *ctx.kernel
+                .pthread_rwlock_read_holds
+                .entry((current, key))
+                .or_insert(0) += 1;
             return OK;
         }
         if try_only || ctx.guest_threads.process_is_terminating() {
@@ -710,19 +751,39 @@ fn hle_rwlock_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
     let Some(key) = resolve_rwlock_key(ctx, addr) else {
         return EINVAL;
     };
-    let mut entry = ctx.kernel.pthread_rwlocks.get_mut(&key).unwrap();
-    if entry.writer == ctx.guest_threads.current_thread() && entry.writer_recursion > 0 {
-        entry.writer_recursion -= 1;
-        if entry.writer_recursion == 0 {
-            entry.writer = 0;
+    let current = ctx.guest_threads.current_thread();
+    {
+        let mut entry = ctx.kernel.pthread_rwlocks.get_mut(&key).unwrap();
+        if entry.writer == current && entry.writer_recursion > 0 {
+            entry.writer_recursion -= 1;
+            if entry.writer_recursion == 0 {
+                entry.writer = 0;
+            }
+            return OK;
         }
-        OK
-    } else if entry.readers > 0 {
-        entry.readers -= 1;
-        OK
-    } else {
-        EPERM
     }
+    // Release one of THIS thread's read holds — never another thread's. The
+    // shared `readers` count cannot say who holds a read, so a stray or
+    // duplicated unlock from a non-holder must be rejected (EPERM) instead of
+    // silently decrementing a live reader's hold and letting a writer in behind
+    // its back. The per-(thread, rwlock) depth map is the ownership check the
+    // bare count can't provide.
+    let drained = match ctx.kernel.pthread_rwlock_read_holds.get_mut(&(current, key)) {
+        Some(mut depth) => {
+            *depth -= 1;
+            *depth == 0
+        }
+        None => return EPERM,
+    };
+    if drained {
+        ctx.kernel.pthread_rwlock_read_holds.remove(&(current, key));
+    }
+    if let Some(mut entry) = ctx.kernel.pthread_rwlocks.get_mut(&key)
+        && entry.readers > 0
+    {
+        entry.readers -= 1;
+    }
+    OK
 }
 
 /// `scePthreadRwlockattrInit`/`Destroy`: accepted (no attribute state modelled).
@@ -977,5 +1038,39 @@ mod tests {
         assert_eq!(u64::from_le_bytes(buf), 0);
         assert!(!kernel.pthread_rwlocks.contains_key(&rw));
         assert_eq!(hle_rwlock_destroy(&ctx, &[0xABC]), EINVAL);
+    }
+
+    /// A stray or duplicated `scePthreadRwlockUnlock` from a thread that holds
+    /// no read hold must not steal another thread's: it returns EPERM and leaves
+    /// the real reader's hold (and the shared count) intact, so a writer stays
+    /// out while that reader is still inside the lock. Regression for the
+    /// shared-reader-count desync (sync-audit finding #3).
+    #[test]
+    fn rwlock_unlock_from_non_holder_is_rejected_and_preserves_other_readers() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let rw = 0x900u64;
+        assert_eq!(hle_rwlock_init(&ctx, &[rw, 0]), OK);
+        let key = resolve_rwlock_key(&ctx, rw).unwrap();
+
+        // Another thread (99 ≠ the test's CURRENT_THREAD) holds one read hold —
+        // exactly the state its own `Rdlock` would leave: shared count bumped
+        // and a per-thread depth recorded.
+        const OTHER: u64 = 99;
+        kernel.pthread_rwlocks.get_mut(&key).unwrap().readers = 1;
+        kernel.pthread_rwlock_read_holds.insert((OTHER, key), 1);
+
+        // The test thread holds nothing, so its unlock is rejected outright and
+        // touches neither the shared count nor thread 99's per-thread hold.
+        assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), EPERM);
+        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().readers, 1);
+        assert_eq!(
+            *kernel.pthread_rwlock_read_holds.get(&(OTHER, key)).unwrap(),
+            1
+        );
+
+        // And the live reader still keeps writers out (before the fix, the stray
+        // unlock would have zeroed the count and let this Trywrlock succeed).
+        assert_eq!(hle_rwlock_trywrlock(&ctx, &[rw]), EBUSY);
     }
 }

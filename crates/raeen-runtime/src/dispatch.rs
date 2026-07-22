@@ -296,6 +296,87 @@ pub(crate) fn call_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Diagnostic "guest GIL" behind the `RAEEN_SINGLE_THREAD_GUEST` knob.
+///
+/// When enabled, only one guest thread runs guest *native* code at a time. The
+/// token is released whenever a thread traps out into an HLE call — so a
+/// blocking `sceKernelWaitSema`/mutex/cond wait still lets another guest thread
+/// run (a strict "one thread, ever" scheme deadlocks any persistent worker
+/// pool) — and re-acquired before the guest resumes. A guest that spins in
+/// native code on a shared flag without ever calling an HLE function can still
+/// deadlock here; the opt-in `RAEEN_GUEST_WATCHDOG_MS` surfaces that.
+///
+/// Purpose: a bring-up A/B. If a crash that reproduces with parallel guest
+/// threads stops reproducing under this flag, the bug is a guest data race and
+/// the fix belongs in a guest-visible synchronization primitive that is not
+/// actually excluding — not in the faulting guest code. Default off: when the
+/// env var is unset every hook below is a `None` guard and changes nothing.
+static GUEST_GIL_HELD: Mutex<bool> = Mutex::new(false);
+static GUEST_GIL_IDLE: std::sync::Condvar = std::sync::Condvar::new();
+
+fn single_thread_guest() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RAEEN_SINGLE_THREAD_GUEST").is_some())
+}
+
+fn guest_gil_acquire() {
+    let mut held = GUEST_GIL_HELD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while *held {
+        held = GUEST_GIL_IDLE
+            .wait(held)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    *held = true;
+}
+
+fn guest_gil_release() {
+    let mut held = GUEST_GIL_HELD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *held = false;
+    GUEST_GIL_IDLE.notify_one();
+}
+
+/// Holds the guest GIL for one guest-native execution span (the whole of
+/// [`run`]). Drops on every return arm — including the recovery jump, which
+/// restores `run`'s own frame — so a fault or exit releases it too. `None`
+/// (and a no-op) unless [`single_thread_guest`].
+struct GuestGilHold;
+impl GuestGilHold {
+    fn acquire() -> Option<Self> {
+        single_thread_guest().then(|| {
+            guest_gil_acquire();
+            GuestGilHold
+        })
+    }
+}
+impl Drop for GuestGilHold {
+    fn drop(&mut self) {
+        guest_gil_release();
+    }
+}
+
+/// Temporarily yields the guest GIL for the duration of an HLE call, re-
+/// acquiring when dropped — i.e. before the guest resumes. Scoped to the HLE
+/// trampoline arm so it drops on every exit from it (normal, terminating,
+/// pthread-exit). `None` (and a no-op) unless [`single_thread_guest`].
+struct GuestGilYield;
+impl GuestGilYield {
+    fn during_hle() -> Option<Self> {
+        single_thread_guest().then(|| {
+            guest_gil_release();
+            GuestGilYield
+        })
+    }
+}
+impl Drop for GuestGilYield {
+    fn drop(&mut self) {
+        guest_gil_acquire();
+    }
+}
+
 /// How many recent HLE calls [`CallTrace`] remembers.
 ///
 /// 256 was too few to be useful on a real title, and the way it failed is worth
@@ -778,6 +859,12 @@ pub(crate) unsafe fn run(
     current_thread: u64,
     call_guest: impl FnOnce() -> core::convert::Infallible,
 ) -> Result<RunOutcome, RuntimeError> {
+    // Diagnostic single-thread mode (RAEEN_SINGLE_THREAD_GUEST): serialize guest
+    // native execution across all guest threads, yielding around HLE calls (see
+    // `GuestGilHold`). Acquired before the watchdog so a wait for the token is
+    // not mistaken for a guest hang; released on every return arm of `run` (the
+    // recovery jump restores this frame, so faults and exits release it too).
+    let _guest_gil = GuestGilHold::acquire();
     let _watchdog = arm_run_watchdog();
     // The top-level caller holds `call_lock()` to protect the process-wide
     // fixed mappings. Process-owned pthread workers may call `run` concurrently;
@@ -1352,7 +1439,7 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
         );
     }
     let mut failures = Vec::new();
-    for (idx, ret, _args) in entries {
+    for &(idx, ret, _args) in &entries {
         let marker = if is_orbis_error(ret) {
             "  <-- ERROR"
         } else {
@@ -1384,6 +1471,60 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
              the guest's own failure handling usually starts at one of these:\n    {}",
             failures.len(),
             failures.join("\n    ")
+        );
+    }
+
+    // A second, independent lens on the same call ring. The Orbis-error filter
+    // above only catches returns in the 0x8xxx_xxxx range; it is blind to the
+    // more common retail failure — a pointer/handle-returning call that handed
+    // back 0x0. That null is not an error code, so nothing flags it, yet it is
+    // the usual value a guest dereferences a few calls later (the faulting read
+    // of a small offset like 0x10/0x28 is `null->field`).
+    //
+    // The registry carries no return-type metadata, so classify by
+    // self-calibration from the ring itself: a function is "pointer-returning"
+    // if it returned a *readable guest address* on at least one recorded call.
+    // If it ALSO returned 0x0 on another call, those zeros are the candidates. A
+    // function whose 0x0 is a normal success (mutex unlock, etc.) never returns a
+    // readable pointer, so it is excluded automatically; a timestamp/counter
+    // returns large values that are not mapped guest addresses, so it is excluded
+    // too.
+    let readable = |value: u64| value != 0 && mem.read(value, &mut [0u8; 1]);
+    let mut profiles: std::collections::BTreeMap<(&str, &str), (bool, usize)> =
+        std::collections::BTreeMap::new();
+    for &(idx, ret, _args) in &entries {
+        let Some(t) = trampolines.get(idx as usize) else {
+            continue;
+        };
+        let profile = profiles
+            .entry((t.library.as_str(), t.function.as_str()))
+            .or_insert((false, 0));
+        if ret == 0 {
+            profile.1 += 1;
+        } else if readable(ret) {
+            profile.0 = true;
+        }
+    }
+    let mut null_pointer_calls: Vec<(String, usize)> = profiles
+        .into_iter()
+        .filter(|&(_, (returned_pointer, zeros))| returned_pointer && zeros > 0)
+        .map(|((library, function), (_, zeros))| (format!("{library}::{function}"), zeros))
+        .collect();
+    null_pointer_calls.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    if !null_pointer_calls.is_empty() {
+        let rendered = null_pointer_calls
+            .iter()
+            .map(|(name, zeros)| {
+                format!("{name} -> 0x0 (×{zeros}; also returned a live pointer elsewhere in this window)")
+            })
+            .collect::<Vec<_>>()
+            .join("\n    ");
+        tracing::warn!(
+            "pointer-returning HLE calls that handed the guest 0x0 before this fault \
+             ({} distinct) — a null from one of these is the usual thing a guest \
+             dereferences into the fault above:\n    {}",
+            null_pointer_calls.len(),
+            rendered,
         );
     }
 }
@@ -1909,6 +2050,11 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             }
             LAST_HLE_INDEX.store(idx, Ordering::Relaxed);
             HLE_ENTERS.fetch_add(1, Ordering::Relaxed);
+            // Yield the diagnostic guest GIL for the duration of this HLE call so
+            // a blocking wait (semaphore/mutex/cond) lets another guest thread
+            // run; re-acquired when `_hle_yield` drops at the end of this arm,
+            // before the guest resumes.
+            let _hle_yield = GuestGilYield::during_hle();
             let trace_index = *TRACE_HLE_INDEX.get_or_init(|| {
                 std::env::var("RAEEN_TRACE_HLE_INDEX")
                     .ok()
