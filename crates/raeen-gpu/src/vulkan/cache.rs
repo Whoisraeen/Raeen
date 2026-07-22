@@ -42,8 +42,8 @@
 
 use super::instance::VulkanDevice;
 use ash::vk::{self, Handle};
-use std::collections::HashMap;
 use raeen_core::error::GpuError;
+use std::collections::HashMap;
 
 /// Cache-effectiveness counters, cumulative since device creation.
 ///

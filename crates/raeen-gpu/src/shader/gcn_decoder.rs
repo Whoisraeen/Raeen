@@ -10,8 +10,8 @@
 //! - **Export** (EXP) — Write outputs (vertex attributes, pixel colors)
 //! - **Flow Control** (S_BRANCH, S_CBRANCH, S_ENDPGM, etc.)
 
-use tracing::{debug, warn};
 use raeen_core::error::GpuError;
+use tracing::{debug, warn};
 
 /// A decoded RDNA2 instruction.
 #[derive(Debug, Clone)]

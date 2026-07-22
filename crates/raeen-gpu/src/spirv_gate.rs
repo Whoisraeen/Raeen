@@ -78,7 +78,7 @@ mod tests {
             0,
             3, // %1 = OpFunction %2 None %3
             (2 << 16) | 248,
-            4, // %4 = OpLabel
+            4,               // %4 = OpLabel
             (1 << 16) | 253, // OpReturn
             (1 << 16) | 56,  // OpFunctionEnd
         ]
@@ -144,7 +144,7 @@ mod tests {
             (2 << 16) | 249,
             9, // OpBranch %9
             (2 << 16) | 248,
-            9, // %9 = OpLabel
+            9,               // %9 = OpLabel
             (1 << 16) | 253, // OpReturn
             (1 << 16) | 56,  // OpFunctionEnd
         ]);

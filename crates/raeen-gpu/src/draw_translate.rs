@@ -966,10 +966,9 @@ fn decode_texture(
         // six faces are six block grids back to back).
         mode if crate::texture::tiling::swizzle_table(mode).is_some() => {
             let bpp_log2 = bpp.trailing_zeros();
-            let face_tiled = crate::texture::tiling::tiled_byte_count_for_mode(
-                mode, width, height, bpp_log2,
-            )
-            .expect("guarded by swizzle_table above") as usize;
+            let face_tiled =
+                crate::texture::tiling::tiled_byte_count_for_mode(mode, width, height, bpp_log2)
+                    .expect("guarded by swizzle_table above") as usize;
             let face_linear = (width * height * bpp) as usize;
             // Array-upload OOM guard (SharpEmu #476 / 224a36e): if a previous
             // draw's multi-layer read of this address overran its allocation,
@@ -1661,8 +1660,7 @@ fn prepare_stage_binding(
     // same order the SPIR-V generator and `shader_calc_binding_indices` use
     // to assign per-key bindings.
     let mut sampled_key_count = [0u64; SAMPLED_KEYS];
-    let mut sampled_key_views: [Vec<usize>; SAMPLED_KEYS] =
-        std::array::from_fn(|_| Vec::new());
+    let mut sampled_key_views: [Vec<usize>; SAMPLED_KEYS] = std::array::from_fn(|_| Vec::new());
     // Per-stage decoded-byte budget (see `stage_texture_byte_cap`): a composite
     // sampling several full-resolution scene targets decodes them all from guest
     // memory at once, and the peak host allocation can abort the process. Refuse

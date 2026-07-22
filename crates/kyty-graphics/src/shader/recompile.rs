@@ -38,7 +38,8 @@ use super::spirv::{
     storage_texture_dim_format,
 };
 use crate::shader::resources::{
-    ShaderBindResources, ShaderComputeInputInfo, ShaderPixelInputInfo, ShaderVertexInputInfo,
+    ShaderBindResources, ShaderComputeInputInfo, ShaderEmbeddedBufferFetch, ShaderPixelInputInfo,
+    ShaderVertexInputInfo,
 };
 use crate::shader::types::{
     ShaderCode, ShaderInstruction, ShaderInstructionType, ShaderLabel, ShaderOperandType,
@@ -324,6 +325,85 @@ fn recompile_buffer_load_dwordx3(
     )
 }
 
+/// Beyond Kyty: lower an `offen` MUBUF buffer load whose V# is constructed
+/// **in-shader** and points at the shader's own embedded vertex data
+/// (`shader_detect_embedded_buffer_fetch` snapshotted the window). The per-lane
+/// byte offset (`voffset`) is runtime, so each destination dword is *selected*
+/// from the captured constants by its runtime dword index — a select-chain over
+/// the window. An index outside the window yields 0 (the read degrades rather
+/// than faulting or reading an unbound descriptor). Reuses the embedded-constant
+/// capture machinery from `sload_dword_extended`; no storage buffer is bound.
+fn recompile_embedded_buffer_fetch(
+    inst: &ShaderInstruction,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    fetch: &ShaderEmbeddedBufferFetch,
+    func: &'static str,
+) -> Result<bool, ShaderRecompileError> {
+    let voff = operand_variable_to_str(inst.src[0]);
+    if voff.type_ != SpirvType::Float {
+        return Err(not_supported(func, "offen voffset is not a VGPR"));
+    }
+    let pc = inst.pc;
+    let len = fetch.window_len.min(fetch.window.len() as u32);
+    let uint = |u: u32| spirv.get_constant_uint(u);
+
+    // byte offset = voffset_bits (+ inst_offset); dword index = byte >> 2.
+    let mut text = format!(
+        "        %ebf_vo_{pc} = OpLoad %float %{vo}\n        \
+         %ebf_vou_{pc} = OpBitcast %uint %ebf_vo_{pc}\n",
+        vo = voff.value,
+    );
+    let byte_off = if fetch.inst_offset == 0 {
+        format!("ebf_vou_{pc}")
+    } else {
+        text += &format!(
+            "        %ebf_bo_{pc} = OpIAdd %uint %ebf_vou_{pc} %{off}\n",
+            off = uint(fetch.inst_offset),
+        );
+        format!("ebf_bo_{pc}")
+    };
+    text += &format!(
+        "        %ebf_di_{pc} = OpShiftRightLogical %uint %{byte_off} %{two}\n",
+        two = uint(2),
+    );
+
+    for i in 0..fetch.dwords_num as i32 {
+        let dst = operand_variable_to_str_shift(inst.dst, i);
+        if dst.type_ != SpirvType::Float {
+            return Err(not_supported(func, "unexpected embedded-fetch dst type"));
+        }
+        let idx = if i == 0 {
+            format!("ebf_di_{pc}")
+        } else {
+            text += &format!(
+                "        %ebf_idx_{pc}_{i} = OpIAdd %uint %ebf_di_{pc} %{ic}\n",
+                ic = uint(i as u32),
+            );
+            format!("ebf_idx_{pc}_{i}")
+        };
+        // acc = (idx == k) ? window[k] : acc, folded over the window (0 default).
+        let mut acc = format!("%{}", uint(0));
+        for k in 0..len {
+            text += &format!(
+                "        %ebf_eq_{pc}_{i}_{k} = OpIEqual %bool %{idx} %{kc}\n        \
+                 %ebf_sel_{pc}_{i}_{k} = OpSelect %uint %ebf_eq_{pc}_{i}_{k} %{vc} {acc}\n",
+                kc = uint(k),
+                vc = uint(fetch.window[k as usize]),
+            );
+            acc = format!("%ebf_sel_{pc}_{i}_{k}");
+        }
+        text += &format!(
+            "        %ebf_fv_{pc}_{i} = OpBitcast %float {acc}\n               \
+             OpStore %{d} %ebf_fv_{pc}_{i}\n",
+            d = dst.value,
+        );
+    }
+
+    *dst_source += &text;
+    Ok(true)
+}
+
 /// Shared body of the n-dword raw MUBUF loads: n consecutive dword loads at
 /// `(offset + vindex*stride)/4 + i` (+ per-thread `voffset` when Offen).
 fn buffer_load_dwordxn(
@@ -339,6 +419,17 @@ fn buffer_load_dwordxn(
     let Some(bind_info) = spirv.get_bind_info() else {
         return Ok(false);
     };
+
+    // Beyond Kyty: an `offen` load through an in-shader-constructed V# that
+    // points at the shader's own embedded vertex data (see
+    // `shader_detect_embedded_buffer_fetch`). Such a V# is never a captured
+    // storage-buffer descriptor, so the path below would refuse it
+    // (`buffers_num == 0`); serve the runtime-indexed read from the snapshotted
+    // embedded window instead.
+    if let Some(fetch) = bind_info.embedded_buffer_fetches.find(inst.pc) {
+        return recompile_embedded_buffer_fetch(&inst, dst_source, spirv, fetch, func);
+    }
+
     if bind_info.storage_buffers.buffers_num == 0 {
         return Ok(false);
     }
@@ -1461,6 +1552,29 @@ fn sload_dword_extended(
     let Some(bind_info) = spirv.get_bind_info() else {
         return Ok(false);
     };
+
+    // Beyond Kyty: a PC-relative embedded-constant load — the shader reading
+    // its own baked constant table. `shader_detect_embedded_constant_loads`
+    // resolved the compile-time address and captured the dwords from guest
+    // memory (the recompiler has no raw shader bytes); materialize them as
+    // constants straight into the destination SGPRs. This is independent of the
+    // EUD, so it runs before the extended-descriptor path and its base gate.
+    if let Some(load) = bind_info.embedded_constant_loads.find(inst.pc) {
+        let count = (load.dwords_num as i32).min(n);
+        for i in 0..count {
+            let dst_value = operand_variable_to_str_shift(inst.dst, i);
+            if dst_value.type_ != SpirvType::Uint {
+                return Err(not_supported(func, "unexpected embedded-load dst type"));
+            }
+            *dst_source += &format!(
+                "               OpStore %{reg} %{val}\n",
+                reg = dst_value.value,
+                val = spirv.get_constant_uint(load.values[i as usize]),
+            );
+        }
+        return Ok(true);
+    }
+
     if !bind_info.extended.used {
         return Ok(false);
     }
@@ -3653,6 +3767,77 @@ fn recompile_ds_add_u32(
 ",
         addr = addr.value,
         data = data.value,
+    );
+
+    *dst_source += &text;
+    Ok(true)
+}
+
+/// Beyond Kyty (`ds_wrxchg_rtn_b32` is `KYTY_NI` upstream): LDS atomic
+/// write-exchange returning the OLD value — `vdst = lds[a]; lds[a] = data`,
+/// via `OpAtomicExchange` on `%lds[(addr + offset) >> 2]` at Workgroup scope
+/// (2), Relaxed semantics (0). Address computation, bound clamp and the
+/// `exec_lo` guard mirror [`recompile_ds_add_u32`]; the exchange's old value is
+/// written to `vdst` (masked-off lanes skip the body and keep `vdst`). Measured
+/// on ASTRO.BOT tiled-lighting compute (raw 0xd8b40510).
+fn recompile_ds_wrxchg_rtn_b32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_DsWrxchgRtnB32_VdstVsrc0Vsrc1Vsrc2";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if !operand_is_variable(inst.dst)
+        || !operand_is_variable(inst.src[0])
+        || !operand_is_variable(inst.src[1])
+    {
+        return Err(not_supported(FUNC, "dst/addr/data are not variables"));
+    }
+    if !operand_is_constant(inst.src[2]) {
+        return Err(not_supported(FUNC, "offset is not a constant"));
+    }
+
+    let dst = operand_variable_to_str(inst.dst);
+    let addr = operand_variable_to_str(inst.src[0]);
+    let data = operand_variable_to_str(inst.src[1]);
+    if dst.type_ != SpirvType::Float
+        || addr.type_ != SpirvType::Float
+        || data.type_ != SpirvType::Float
+    {
+        return Err(not_supported(FUNC, "unexpected operand types"));
+    }
+    let offset = spirv.get_constant(inst.src[2]);
+    let clamp = spirv.get_constant_uint(spirv.lds_size_dw() - 1);
+
+    let i = format!("{index}");
+    let text = format!(
+        "
+        %ldsx_e0_{i} = OpLoad %uint %exec_lo
+        %ldsx_e1_{i} = OpINotEqual %bool %ldsx_e0_{i} %uint_0
+               OpSelectionMerge %ldsx_end_{i} None
+               OpBranchConditional %ldsx_e1_{i} %ldsx_body_{i} %ldsx_end_{i}
+        %ldsx_body_{i} = OpLabel
+        %ldsx_a_{i} = OpLoad %float %{addr}
+        %ldsx_au_{i} = OpBitcast %uint %ldsx_a_{i}
+        %ldsx_ao_{i} = OpIAdd %uint %ldsx_au_{i} %{offset}
+        %ldsx_ai_{i} = OpShiftRightLogical %uint %ldsx_ao_{i} %uint_2
+        %ldsx_ac_{i} = OpExtInst %uint %GLSL_std_450 UMin %ldsx_ai_{i} %{clamp}
+        %ldsx_p_{i} = OpAccessChain %_ptr_Workgroup_uint %lds %ldsx_ac_{i}
+        %ldsx_d_{i} = OpLoad %float %{data}
+        %ldsx_du_{i} = OpBitcast %uint %ldsx_d_{i}
+        %ldsx_old_{i} = OpAtomicExchange %uint %ldsx_p_{i} %uint_2 %uint_0 %ldsx_du_{i}
+        %ldsx_of_{i} = OpBitcast %float %ldsx_old_{i}
+               OpStore %{dst} %ldsx_of_{i}
+               OpBranch %ldsx_end_{i}
+        %ldsx_end_{i} = OpLabel
+",
+        addr = addr.value,
+        data = data.value,
+        dst = dst.value,
     );
 
     *dst_source += &text;
@@ -7004,10 +7189,24 @@ fn recompile_v_mad_u64_u32(
     if !operand_load_uint(spirv, inst.src[1], "s1_<index>", &index_str, &mut load1, -1)? {
         return Ok(false);
     }
-    if !operand_load_uint(spirv, inst.src[2], "s2lo_<index>", &index_str, &mut load2lo, 0)? {
+    if !operand_load_uint(
+        spirv,
+        inst.src[2],
+        "s2lo_<index>",
+        &index_str,
+        &mut load2lo,
+        0,
+    )? {
         return Ok(false);
     }
-    if !operand_load_uint(spirv, inst.src[2], "s2hi_<index>", &index_str, &mut load2hi, 1)? {
+    if !operand_load_uint(
+        spirv,
+        inst.src[2],
+        "s2hi_<index>",
+        &index_str,
+        &mut load2hi,
+        1,
+    )? {
         return Ok(false);
     }
 
@@ -8802,6 +9001,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     // Beyond Kyty: LDS write/read + the workgroup barrier gluing them
     // (ASTRO.BOT scene compute).
     f(recompile_ds_add_u32,   T::DsAddU32,   F::Vsrc0Vsrc1Vsrc2,    p1("")),
+    f(recompile_ds_wrxchg_rtn_b32, T::DsWrxchgRtnB32, F::VdstVsrc0Vsrc1Vsrc2, p1("")),
     f(recompile_ds_write_b32, T::DsWriteB32, F::Vsrc0Vsrc1Vsrc2,    p1("")),
     f(recompile_ds_read_b32,  T::DsReadB32,  F::SVdstSVsrc0SVsrc1,  p1("")),
     f(recompile_ds_read2_b32, T::DsRead2B32, F::Vdst2Vsrc0Vsrc1Vsrc2, p1("")),
@@ -9109,6 +9309,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     // Lt/Gt rows above. Measured in ASTRO.BOT scene CS (58 dispatches/run).
     f(recompile_vcmpx_xxx_f32, T::VCmpxLeF32,  F::SmaskVsrc0Vsrc1, p1("OpFOrdLessThanEqual")),
     f(recompile_vcmpx_xxx_f32, T::VCmpxNltF32, F::SmaskVsrc0Vsrc1, p1("OpFUnordGreaterThanEqual")),
+    f(recompile_vcmpx_xxx_f32, T::VCmpxNgeF32, F::SmaskVsrc0Vsrc1, p1("OpFUnordLessThan")),
     // Siblings measured on ASTRO.BOT scene CS: ge = ordered >=,
     // nle = !(a <= b) = unordered > (NaN → true).
     f(recompile_vcmpx_xxx_f32, T::VCmpxGeF32,  F::SmaskVsrc0Vsrc1, p1("OpFOrdGreaterThanEqual")),
@@ -9467,10 +9668,7 @@ mod tests {
     /// no dispatch-loop scaffolding in the source at all.
     #[test]
     fn zero_label_shader_keeps_the_linear_fast_path() {
-        let code = parse(
-            &[0x7E00_0280, 0x7E02_0280, S_ENDPGM],
-            ShaderType::Compute,
-        );
+        let code = parse(&[0x7E00_0280, 0x7E02_0280, S_ENDPGM], ShaderType::Compute);
         let mut input_info = ShaderComputeInputInfo::default();
         input_info.threads_num = [1, 1, 1];
         let source = spirv_generate_source(&code, None, None, Some(&input_info))
@@ -9543,8 +9741,9 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            320,
-            "204 Kyty rows plus SSubU32, SNop, the RDNA2-only rows \
+            322,
+            "204 Kyty rows plus the compute batch DsWrxchgRtnB32 and VCmpxNgeF32, and \
+             SSubU32, SNop, the RDNA2-only rows \
              (VLshlAddU32, VCmpxLtU32, VAddNcU32, VSubNcU32, VSubrevNcU32, VCvtI32F32, \
              VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad dmask1/3/7 \
              and ImageSampleLz dmask1/2/F rows, ImageStore dmask1, \
@@ -9572,8 +9771,9 @@ mod tests {
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 312,
-            "C1 implemented subset plus title-driven ports (incl. the S_XXX_I32 \
+            implemented, 314,
+            "C1 implemented subset plus title-driven ports (incl. DsWrxchgRtnB32, \
+             VCmpxNgeF32, the S_XXX_I32 \
              trio, VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad \
              dmask1/3/7 + ImageSampleLz dmask1/2/F rows, ImageStore dmask1, the \
              nine ImageSample dmask recompilers, the VCmp \
@@ -10047,6 +10247,673 @@ mod tests {
         // Vulkan driver accepts — every storage-buffer module tonight ran
         // through it. This test asserts on assembly + source shape instead.
         let _ = words;
+    }
+
+    /// Astro Bot vertex shader gap 1: MUBUF `buffer_load_dwordx4` with **offen
+    /// only** (idxen=0) — `Vdata4VaddrSvSoffsOffen`. The single vaddr register
+    /// is the per-thread byte offset (no vindex), which must add into the byte
+    /// address just like the idxen+offen twin.
+    #[test]
+    fn buffer_load_dwordx4_offen_only_recompiles() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        shader_parse(
+            0,
+            &[
+                0xE038_1000, // mubuf op 0x0e (load_dwordx4), offen only (bit12=1, bit13=0)
+                0x8001_0400, // soffset=0x80(=const 0), srsrc=s4, vdata=v4, vaddr=v0
+                0xBF80_0000,
+                0xBF80_0000,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse offen-only buffer_load_dwordx4");
+
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::BufferLoadDwordX4);
+        assert_eq!(inst.format, F::Vdata4VaddrSvSoffsOffen);
+        assert_eq!(
+            inst.src[0].size, 1,
+            "offen-only: single vaddr (voffset) reg"
+        );
+        assert_eq!(inst.dst.size, 4);
+
+        let mut input_info = ShaderPixelInputInfo::default();
+        input_info.target_output_mode[0] = 4;
+        input_info.bind.push_constant_size = 48;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("recompile offen-only buffer_load_dwordx4");
+        assert_eq!(
+            source.matches("%t110_").count(),
+            4,
+            "four consecutive dword loads:\n{source}"
+        );
+        assert!(
+            source.contains("OpIAdd %int"),
+            "the per-thread voffset adds into the address:\n{source}"
+        );
+        let _ = spirv_run(&source).expect("assemble offen-only buffer_load_dwordx4");
+    }
+
+    /// Astro Bot vertex shader gap 2 (baseline): a `s_load_dwordx8` whose base
+    /// is built PC-relative (`s_getpc_b64 s[0:1]; s_add_u32 s0, 96, s0`) — the
+    /// shader loading its own embedded constant table. The base register is NOT
+    /// the EUD base, so the recompiler refuses it by name today.
+    #[test]
+    fn s_load_dwordx8_pc_relative_baseline_refuses() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        code.set_base_address(0x1000);
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SGetpcB64,
+            format: F::Sdst2,
+            pc: 0,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 0,
+                size: 2,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::LiteralConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(0x1004),
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::LiteralConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(0),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        });
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SAddU32,
+            format: F::SVdstSVsrc0SVsrc1,
+            pc: 4,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 0,
+                size: 1,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::LiteralConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(96),
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 0,
+                    size: 1,
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        });
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SLoadDwordx8,
+            format: F::Sdst8SbaseSoffset,
+            pc: 12,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 8,
+                size: 8,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 0,
+                    size: 2,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::IntegerInlineConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(0),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        });
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            pc: 16,
+            ..Default::default()
+        });
+
+        // EUD present but at a DIFFERENT base (s16), so the PC-relative s0 base
+        // is not the EUD base and hits the refusal.
+        let mut input_info = ShaderVertexInputInfo::default();
+        input_info.bind.extended.used = true;
+        input_info.bind.extended.start_register = 16;
+
+        let err = spirv_generate_source(&code, Some(&input_info), None, None)
+            .expect_err("PC-relative s_load_dwordx8 must refuse today");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("src0 is not the EUD base register"),
+            "baseline refusal is the EUD-base gate, got: {msg}"
+        );
+    }
+
+    /// Build the measured Astro Bot pattern: `s_getpc_b64 s[0:1];
+    /// s_add_u32 s0, 96, s0; s_load_dwordx8 s[8:15], s[0:1], 0; s_endpgm`, with
+    /// the getpc following-address materialized at `0x1004` (base 0x1000). The
+    /// PC-relative load target is therefore `0x1004 + 96 = 0x1064`.
+    fn pc_relative_x8_shader() -> ShaderCode {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        code.set_base_address(0x1000);
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SGetpcB64,
+            format: F::Sdst2,
+            pc: 0,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 0,
+                size: 2,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::LiteralConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(0x1004),
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::LiteralConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(0),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        });
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SAddU32,
+            format: F::SVdstSVsrc0SVsrc1,
+            pc: 4,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 0,
+                size: 1,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::LiteralConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(96),
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 0,
+                    size: 1,
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        });
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SLoadDwordx8,
+            format: F::Sdst8SbaseSoffset,
+            pc: 12,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 8,
+                size: 8,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 0,
+                    size: 2,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::IntegerInlineConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(0),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        });
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            pc: 16,
+            ..Default::default()
+        });
+        code
+    }
+
+    /// Astro Bot vertex shader gap 2 (fix): once
+    /// `shader_detect_embedded_constant_loads` has captured the shader's own
+    /// embedded constant table from guest memory, the PC-relative
+    /// `s_load_dwordx8` materializes those eight dwords as SPIR-V constants
+    /// straight into `s[8:15]` — no EUD, no refusal.
+    #[test]
+    fn s_load_dwordx8_pc_relative_reads_embedded_constants() {
+        use std::borrow::Cow;
+
+        struct EmbeddedMem {
+            base: u64,
+            data: Vec<u32>,
+        }
+        impl crate::shader::analysis::ShaderMemory for EmbeddedMem {
+            fn dwords_at(&self, addr: u64) -> Option<Cow<'_, [u32]>> {
+                let end = self.base + self.data.len() as u64 * 4;
+                if addr >= self.base && addr < end && (addr - self.base) % 4 == 0 {
+                    return Some(Cow::Borrowed(
+                        &self.data[((addr - self.base) / 4) as usize..],
+                    ));
+                }
+                None
+            }
+        }
+
+        let code = pc_relative_x8_shader();
+
+        // The eight embedded constant dwords live at the PC-relative target
+        // (0x1004 + 96 = 0x1064).
+        let values: Vec<u32> = (0..8).map(|i| 0xC0DE_0000 + i).collect();
+        let mem = EmbeddedMem {
+            base: 0x1064,
+            data: values.clone(),
+        };
+
+        let mut input_info = ShaderVertexInputInfo::default();
+        crate::shader::analysis::shader_detect_embedded_constant_loads(
+            &code,
+            &mem,
+            &mut input_info.bind,
+        );
+
+        // The capture pass resolved exactly one PC-relative load of 8 dwords.
+        let ecl = &input_info.bind.embedded_constant_loads;
+        assert_eq!(ecl.loads_num, 1, "one PC-relative embedded load captured");
+        assert_eq!(ecl.loads[0].pc, 12);
+        assert_eq!(ecl.loads[0].dwords_num, 8);
+        assert_eq!(&ecl.loads[0].values[..8], &values[..]);
+
+        let source = spirv_generate_source(&code, Some(&input_info), None, None)
+            .expect("recompile PC-relative s_load_dwordx8");
+
+        // Each captured dword is stored straight into its destination SGPR.
+        for i in 0..8u32 {
+            assert!(
+                source.contains(&format!("OpStore %s{} %uint", 8 + i)),
+                "s{} must receive an embedded constant:\n{source}",
+                8 + i
+            );
+        }
+
+        // Assembling proves the referenced `%uint_*` constants were declared
+        // (an unregistered value would leave `unknown_uint_constant` and fail).
+        let words = spirv_run(&source).expect("assemble PC-relative s_load_dwordx8");
+        assert_eq!(words[0], 0x0723_0203, "SPIR-V magic");
+    }
+
+    /// The measured ASTRO.BOT 64-bit PC-relative idiom pairs the low-dword add
+    /// with an `s_addc_u32 s(hi), 0, s(hi)` carry. `pc_relative_base_address`
+    /// must fold that pair to the right absolute address (here forcing a real
+    /// carry across the 32-bit boundary), not bail on the high-dword write.
+    #[test]
+    fn s_load_dwordx8_pc_relative_handles_64bit_addc_carry() {
+        use std::borrow::Cow;
+
+        struct Mem64 {
+            base: u64,
+            data: Vec<u32>,
+        }
+        impl crate::shader::analysis::ShaderMemory for Mem64 {
+            fn dwords_at(&self, addr: u64) -> Option<Cow<'_, [u32]>> {
+                let end = self.base + self.data.len() as u64 * 4;
+                if addr >= self.base && addr < end && (addr - self.base) % 4 == 0 {
+                    return Some(Cow::Borrowed(
+                        &self.data[((addr - self.base) / 4) as usize..],
+                    ));
+                }
+                None
+            }
+        }
+
+        let sgpr = |id, size| ShaderOperand {
+            type_: ShaderOperandType::Sgpr,
+            register_id: id,
+            size,
+            ..Default::default()
+        };
+        let lit = |u| ShaderOperand {
+            type_: ShaderOperandType::LiteralConstant,
+            constant: crate::shader::types::ShaderConstant::from_u(u),
+            ..Default::default()
+        };
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        // getpc following-address = 0x5_FFFF_FFF0.
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SGetpcB64,
+            format: F::Sdst2,
+            pc: 0,
+            src_num: 2,
+            dst: sgpr(0, 2),
+            src: [
+                lit(0xFFFF_FFF0),
+                lit(0x5),
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        });
+        // s_add_u32 s0, 0x20, s0  → low wraps 0xFFFFFFF0+0x20 = 0x10, carry out.
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SAddU32,
+            format: F::SVdstSVsrc0SVsrc1,
+            pc: 4,
+            src_num: 2,
+            dst: sgpr(0, 1),
+            src: [
+                lit(0x20),
+                sgpr(0, 1),
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        });
+        // s_addc_u32 s1, 0, s1 → hi 5 + carry = 6.
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SAddcU32,
+            format: F::SVdstSVsrc0SVsrc1,
+            pc: 8,
+            src_num: 2,
+            dst: sgpr(1, 1),
+            src: [
+                lit(0),
+                sgpr(1, 1),
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        });
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SLoadDwordx8,
+            format: F::Sdst8SbaseSoffset,
+            pc: 12,
+            src_num: 2,
+            dst: sgpr(8, 8),
+            src: [
+                sgpr(0, 2),
+                ShaderOperand {
+                    type_: ShaderOperandType::IntegerInlineConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(0),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        });
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            pc: 16,
+            ..Default::default()
+        });
+
+        // 0x5_FFFF_FFF0 + 0x20 = 0x6_0000_0010 (carry propagated into the high
+        // dword by the u64 add, then the addc s1,0 adds nothing).
+        let values: Vec<u32> = (0..8).map(|i| 0xBEEF_0000 + i).collect();
+        let mem = Mem64 {
+            base: 0x6_0000_0010,
+            data: values.clone(),
+        };
+
+        let mut input_info = ShaderVertexInputInfo::default();
+        crate::shader::analysis::shader_detect_embedded_constant_loads(
+            &code,
+            &mem,
+            &mut input_info.bind,
+        );
+
+        let ecl = &input_info.bind.embedded_constant_loads;
+        assert_eq!(
+            ecl.loads_num, 1,
+            "the s_add/s_addc 64-bit pair must resolve, not bail"
+        );
+        assert_eq!(
+            &ecl.loads[0].values[..8],
+            &values[..],
+            "carry across the 32-bit boundary must land at 0x6_0000_0010"
+        );
+
+        let source = spirv_generate_source(&code, Some(&input_info), None, None)
+            .expect("recompile 64-bit PC-relative s_load_dwordx8");
+        let words = spirv_run(&source).expect("assemble 64-bit PC-relative s_load_dwordx8");
+        assert_eq!(words[0], 0x0723_0203, "SPIR-V magic");
+    }
+
+    /// Astro Bot gap 3 (the real live geometry blocker): the full-screen-triangle
+    /// vertex shader builds a V# in `s[0:3]` — base `s[0:1]` PC-relative, words
+    /// `s2`/`s3` from immediates — pointing at its own embedded clip-space
+    /// vertices, then reads them with `buffer_load_dwordx4 v[0:3], v4, s[0:3], 0
+    /// offen` and `buffer_load_dwordx2 v[4:5], v4, s[0:3], 16 offen`. There is
+    /// no captured storage buffer, so the recompiler refused (measured 116×
+    /// `can't recompile: BufferLoadDwordX4 [Vdata4VaddrSvSoffsOffen]` per live
+    /// frame). After `shader_detect_embedded_buffer_fetch` snapshots the window,
+    /// both loads recompile as a select over the baked vertex data.
+    #[test]
+    fn offen_buffer_load_through_in_shader_vsharp_reads_embedded_verts() {
+        use std::borrow::Cow;
+
+        struct Mem {
+            base: u64,
+            data: Vec<u32>,
+        }
+        impl crate::shader::analysis::ShaderMemory for Mem {
+            fn dwords_at(&self, addr: u64) -> Option<Cow<'_, [u32]>> {
+                let end = self.base + self.data.len() as u64 * 4;
+                if addr >= self.base && addr < end && (addr - self.base) % 4 == 0 {
+                    return Some(Cow::Borrowed(
+                        &self.data[((addr - self.base) / 4) as usize..],
+                    ));
+                }
+                None
+            }
+        }
+
+        let sgpr = |id, size| ShaderOperand {
+            type_: ShaderOperandType::Sgpr,
+            register_id: id,
+            size,
+            ..Default::default()
+        };
+        let vgpr = |id, size| ShaderOperand {
+            type_: ShaderOperandType::Vgpr,
+            register_id: id,
+            size,
+            ..Default::default()
+        };
+        let lit = |u| ShaderOperand {
+            type_: ShaderOperandType::LiteralConstant,
+            constant: crate::shader::types::ShaderConstant::from_u(u),
+            ..Default::default()
+        };
+        let inl = |u| ShaderOperand {
+            type_: ShaderOperandType::IntegerInlineConstant,
+            constant: crate::shader::types::ShaderConstant::from_u(u),
+            ..Default::default()
+        };
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        code.set_base_address(0x1000);
+        // s_getpc_b64 s[0:1] — following-address materialized at 0x1004.
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SGetpcB64,
+            format: F::Sdst2,
+            pc: 0,
+            src_num: 2,
+            dst: sgpr(0, 2),
+            src: [
+                lit(0x1004),
+                lit(0),
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        });
+        // s_add_u32 s0, 96, s0 ; s_addc_u32 s1, 0, s1  → base = 0x1064.
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SAddU32,
+            format: F::SVdstSVsrc0SVsrc1,
+            pc: 4,
+            src_num: 2,
+            dst: sgpr(0, 1),
+            src: [
+                lit(96),
+                sgpr(0, 1),
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        });
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SAddcU32,
+            format: F::SVdstSVsrc0SVsrc1,
+            pc: 8,
+            src_num: 2,
+            dst: sgpr(1, 1),
+            src: [
+                lit(0),
+                sgpr(1, 1),
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        });
+        // buffer_load_dwordx4 v[0:3], v4, s[0:3], 0 offen   (position)
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::BufferLoadDwordX4,
+            format: F::Vdata4VaddrSvSoffsOffen,
+            pc: 12,
+            src_num: 3,
+            dst: vgpr(0, 4),
+            src: [vgpr(4, 1), sgpr(0, 4), inl(0), ShaderOperand::default()],
+            ..Default::default()
+        });
+        // buffer_load_dwordx2 v[4:5], v4, s[0:3], 16 offen  (uv)
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::BufferLoadDwordX2,
+            format: F::Vdata2VaddrSvSoffsOffen,
+            pc: 16,
+            src_num: 3,
+            dst: vgpr(4, 2),
+            src: [vgpr(4, 1), sgpr(0, 4), inl(16), ShaderOperand::default()],
+            ..Default::default()
+        });
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            pc: 20,
+            ..Default::default()
+        });
+
+        // The embedded full-screen-triangle vertex table at base 0x1064:
+        // three verts (pos.xyzw, uv.xy) — the measured clip-space triangle
+        // (-1,-1),(3,-1),(-1,3).
+        let f = |x: f32| x.to_bits();
+        let verts: Vec<u32> = vec![
+            f(-1.0),
+            f(-1.0),
+            f(0.0),
+            f(1.0),
+            f(0.0),
+            f(0.0), // v0
+            f(3.0),
+            f(-1.0),
+            f(0.0),
+            f(1.0),
+            f(2.0),
+            f(0.0), // v1
+            f(-1.0),
+            f(3.0),
+            f(0.0),
+            f(1.0),
+            f(0.0),
+            f(2.0), // v2
+        ];
+        let mem = Mem {
+            base: 0x1064,
+            data: verts.clone(),
+        };
+
+        let mut input_info = ShaderVertexInputInfo::default();
+        crate::shader::analysis::shader_detect_embedded_buffer_fetch(
+            &code,
+            &mem,
+            &mut input_info.bind,
+        );
+
+        // Both offen loads through the in-shader V# were captured.
+        let ebf = &input_info.bind.embedded_buffer_fetches;
+        assert_eq!(ebf.loads_num, 2, "both offen buffer loads captured");
+        let x4 = ebf.find(12).expect("x4 load captured");
+        assert_eq!((x4.dwords_num, x4.inst_offset), (4, 0));
+        assert_eq!(&x4.window[..6], &verts[..6], "vert0 pos+uv snapshot");
+        let x2 = ebf.find(16).expect("x2 load captured");
+        assert_eq!((x2.dwords_num, x2.inst_offset), (2, 16));
+
+        // No storage buffer is bound — the pre-fix path would refuse here.
+        assert_eq!(input_info.bind.storage_buffers.buffers_num, 0);
+
+        let source = spirv_generate_source(&code, Some(&input_info), None, None)
+            .expect("recompile offen buffer load through in-shader V#");
+
+        // The loads lower to a select over the baked window, not a %buf read.
+        assert!(
+            source.contains("OpSelect %uint"),
+            "the embedded window is selected by the runtime offset:\n{source}"
+        );
+        assert!(
+            !source.contains("%buffer_load_float1"),
+            "must NOT go through the storage-buffer helper (no buffer bound)"
+        );
+        for d in 0..4u32 {
+            assert!(
+                source.contains(&format!("OpStore %v{d} ")),
+                "position dword v{d} written:\n{source}"
+            );
+        }
+
+        let words = spirv_run(&source).expect("assemble in-shader-V# offen loads");
+        assert_eq!(words[0], 0x0723_0203, "SPIR-V magic");
     }
     /// A cube-bound shader emits `OpTypeImage %float Cube` and samples with a
     /// 3-component direction — measured on Minecraft's skybox PS (type 11 T#,
@@ -10934,8 +11801,13 @@ mod tests {
         code.set_type(ShaderType::Compute);
         // `s_endpgm` must sit at instruction index >= 2, so the mad is followed
         // by two harmless scalar fillers (reused from the passing scalar test).
-        shader_parse(0, &[b0, b1, 0xBE80_1F00, 0x9935_806B, S_ENDPGM], &mut code, true)
-            .expect("parse v_mad_u64_u32");
+        shader_parse(
+            0,
+            &[b0, b1, 0xBE80_1F00, 0x9935_806B, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse v_mad_u64_u32");
         let inst = &code.get_instructions()[0];
         assert!(
             matches!(inst.type_, ShaderInstructionType::VMadU64U32),
@@ -13263,6 +14135,51 @@ mod tests {
         naga_parse_and_validate(&words, "ds_add_u32");
     }
 
+    /// ASTRO.BOT tiled-lighting compute (`ds_wrxchg_rtn_b32`, DS 0x2d, raw
+    /// 0xd8b40510, byte offset 0x510): an LDS write-exchange that returns the
+    /// old value — `vdst = lds[a]; lds[a] = data`. Lowers to an exec-guarded
+    /// `OpAtomicExchange` on the `%lds` Workgroup array, old value into `vdst`.
+    #[test]
+    fn astro_ds_wrxchg_rtn_b32_lowers_as_lds_atomic_exchange() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0x7E00_0280, // v_mov_b32 v0, 0 (addr)
+                0x7E02_0280, // v_mov_b32 v1, 0 (data)
+                0xD8B4_0510, // ds_wrxchg_rtn_b32, offset 0x510
+                0x0200_0100, // vdst=v2, data0=v1, addr=v0
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse ds_wrxchg_rtn_b32");
+        let inst = &code.get_instructions()[2];
+        assert_eq!(inst.type_, T::DsWrxchgRtnB32);
+        assert_eq!(inst.format, F::VdstVsrc0Vsrc1Vsrc2);
+        assert_eq!(inst.dst.register_id, 2, "vdst = v2 (old value)");
+        assert_eq!(inst.src[0].register_id, 0, "addr = v0");
+        assert_eq!(inst.src[1].register_id, 1, "data = v1");
+        assert_eq!(inst.src[2].constant.u, 0x510);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile ds_wrxchg_rtn_b32");
+        assert!(
+            source.contains("OpAtomicExchange %uint %ldsx_p_2 %uint_2 %uint_0 %ldsx_du_2"),
+            "LDS atomic exchange expected:\n{source}"
+        );
+        assert!(
+            source.contains("OpStore %v2 %ldsx_of_2"),
+            "the old value is written to vdst:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble ds_wrxchg_rtn_b32");
+        naga_parse_and_validate(&words, "ds_wrxchg_rtn_b32");
+    }
+
     /// Round 9 — the whole measured 693-skip bulk: the next-gen SMEM parser
     /// materializes a NULL soffset as a sign-extended 21-bit immediate in an
     /// `IntegerInlineConstant` operand, which the extended s_load path must
@@ -14005,6 +14922,52 @@ mod tests {
         // (UnsupportedInstruction) — a pre-existing upstream construct, not
         // part of this offset extension. spirv-tools accepts it.
         let _ = spirv_run(&source).expect("assemble ds_append with offset");
+    }
+
+    /// Gap 3: a `ds_append` with NO captured GDS descriptor (the real ASTRO.BOT
+    /// tiled-lighting case — the counter is addressed through M0, so no usage
+    /// slot produces a GDS pointer). Without a pointer, `Recompile_DsAppend`
+    /// returns false → "can't recompile: DsAppend". `shader_synthesize_gds_pointer`
+    /// adds one so `%gds` is declared/bound and the append lowers.
+    #[test]
+    fn ds_append_synthesizes_gds_pointer_when_uncaptured() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0xBEFC_0380, // s_mov_b32 m0, 0
+                0xD8FA_0004, // ds_append v7, offset 4, gds
+                0x0700_0000,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse ds_append");
+
+        // No GDS pointer captured — the pre-fix path refuses here.
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        assert_eq!(input_info.bind.gds_pointers.pointers_num, 0);
+        let err = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect_err("append without a GDS pointer must refuse");
+        assert!(
+            format!("{err}").contains("can't recompile"),
+            "baseline refusal, got: {err}"
+        );
+
+        // Synthesis adds the pointer; the append now lowers to the GDS atomic.
+        crate::shader::analysis::shader_synthesize_gds_pointer(&code, &mut input_info.bind);
+        assert_eq!(input_info.bind.gds_pointers.pointers_num, 1);
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile ds_append after GDS-pointer synthesis");
+        assert!(
+            source.contains("OpAtomicIAdd"),
+            "GDS append atomic:\n{source}"
+        );
+        assert!(source.contains("%gds"), "%gds must be declared:\n{source}");
+        let _ = spirv_run(&source).expect("assemble ds_append after synthesis");
     }
 
     #[test]

@@ -13,10 +13,10 @@
 use super::cache::{DrawCacheStats, DrawCaches};
 use ash::{Device, Entry, Instance, ext::debug_utils, vk};
 use parking_lot::{Mutex, MutexGuard};
+use raeen_core::error::GpuError;
 use std::ffi::{CStr, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
-use raeen_core::error::GpuError;
 
 /// Count of validation-layer messages at ERROR severity, since process start.
 ///

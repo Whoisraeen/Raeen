@@ -42,11 +42,15 @@ use super::hw_regs::{
 use super::parse::{ShaderParseError, shader_parse};
 use super::resources::{
     ShaderBindResources, ShaderBufferResource, ShaderComputeInputInfo, ShaderDirectSgprsResources,
+    ShaderEmbeddedBufferFetch, ShaderEmbeddedBufferFetches, ShaderEmbeddedConstantLoads,
     ShaderGdsResources, ShaderId, ShaderMappedData, ShaderPixelInputInfo, ShaderSamplerResources,
     ShaderSemantic, ShaderStorageResources, ShaderStorageUsage, ShaderTextureResources,
     ShaderTextureUsage, ShaderUserData, ShaderVertexInputBuffer, ShaderVertexInputInfo,
 };
-use super::types::{ShaderCode, ShaderInstructionType, ShaderOperandType, ShaderType};
+use super::types::{
+    ShaderCode, ShaderInstruction, ShaderInstructionType, ShaderOperand, ShaderOperandType,
+    ShaderType,
+};
 
 /// Typed replacement for Kyty's hard exits in `Shader.cpp`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -572,6 +576,278 @@ pub fn scalar_load_target_address(load: &ScalarLoadRef, user_sgpr: &UserSgprInfo
     Some(ptr.wrapping_add(u64::from(load.byte_offset)))
 }
 
+/// Does `inst` write scalar register `reg` (via either destination)?
+fn writes_sgpr(inst: &ShaderInstruction, reg: i32) -> bool {
+    let covers = |op: &ShaderOperand| {
+        op.type_ == ShaderOperandType::Sgpr
+            && reg >= op.register_id
+            && reg < op.register_id + op.size.max(1)
+    };
+    covers(&inst.dst) || covers(&inst.dst2)
+}
+
+/// For an `s_add_u32`, return `(constant_addend, other_sgpr)` when exactly one
+/// source is a compile-time constant and the other is an SGPR — the shape a
+/// PC-relative byte offset takes (`s_add_u32 s(b), <imm>, s(b)`).
+fn add_const_and_reg(inst: &ShaderInstruction) -> Option<(u32, i32)> {
+    let is_const = |op: &ShaderOperand| {
+        matches!(
+            op.type_,
+            ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
+        )
+    };
+    let (a, b) = (&inst.src[0], &inst.src[1]);
+    if is_const(a) && b.type_ == ShaderOperandType::Sgpr {
+        Some((a.constant.u, b.register_id))
+    } else if is_const(b) && a.type_ == ShaderOperandType::Sgpr {
+        Some((b.constant.u, a.register_id))
+    } else {
+        None
+    }
+}
+
+/// Resolve a base SGPR pair to a compile-time **PC-relative absolute address**,
+/// by walking the instructions that produced it: the nearest preceding
+/// `s_getpc_b64 s[base:base+1]` (whose absolute following address the parser
+/// materialized into `src[0]`/`src[1]`) plus the constant offset folded into it
+/// afterward.
+///
+/// The offset is the measured 64-bit idiom — `s_add_u32 s(lo), <imm>, s(lo)`
+/// (low dword) optionally followed by `s_addc_u32 s(hi), <imm>, s(hi)` (high
+/// dword + carry). Full `u64` arithmetic makes the low `s_add` propagate its
+/// own carry, so the paired `s_addc s(hi), 0, s(hi)` folds to a no-op exactly
+/// as the hardware intends. Measured on ASTRO.BOT vertex shaders (adds of
+/// 96/208/272 bytes into an embedded-data pointer).
+///
+/// Returns `None` if the base was not built this way, or was mutated by
+/// anything else (a conservative bail — the recompiler keeps its named refusal
+/// for those).
+fn pc_relative_base_address(prior: &[ShaderInstruction], base_reg: i32) -> Option<u64> {
+    use ShaderInstructionType as T;
+    let getpc_idx = prior.iter().rposition(|inst| {
+        inst.type_ == T::SGetpcB64
+            && inst.dst.type_ == ShaderOperandType::Sgpr
+            && inst.dst.register_id == base_reg
+            && inst.dst.size == 2
+    })?;
+    let getpc = &prior[getpc_idx];
+    let mut addr = u64::from(getpc.src[0].constant.u) | (u64::from(getpc.src[1].constant.u) << 32);
+    for inst in &prior[getpc_idx + 1..] {
+        let touches_lo = writes_sgpr(inst, base_reg);
+        let touches_hi = writes_sgpr(inst, base_reg + 1);
+        if !touches_lo && !touches_hi {
+            continue;
+        }
+        // Each add must write exactly one dword of the pair, add a constant to
+        // itself, and be the modeled add opcode for that dword.
+        let (want_type, reg, shift) = match (touches_lo, touches_hi) {
+            (true, false) => (T::SAddU32, base_reg, 0),
+            (false, true) => (T::SAddcU32, base_reg + 1, 32),
+            _ => return None,
+        };
+        if inst.type_ != want_type || inst.dst.register_id != reg {
+            return None;
+        }
+        let (c, other) = add_const_and_reg(inst)?;
+        if other != reg {
+            return None;
+        }
+        addr = addr.wrapping_add(u64::from(c) << shift);
+    }
+    Some(addr)
+}
+
+/// Beyond Kyty: capture **PC-relative embedded-constant** scalar loads (the
+/// shader reading its own baked constant table).
+///
+/// A shader that loads embedded constants computes the base pointer in-shader —
+/// `s_getpc_b64 s[b:b+1]` (the parser materializes the absolute following
+/// address; see `parse.rs` S_GETPC_B64) then optional `s_add_u32 s(b), <imm>,
+/// s(b)` — and reads through it with `s_load_dword{x2,x4,x8,x16} s[d..],
+/// s[b:b+1], <off>`. The base is neither user data nor the EUD, so the
+/// descriptor-table recompiler (`sload_dword_extended`) refuses it by name.
+///
+/// But the address is a compile-time constant and the target is the shader's
+/// own binary, so the loaded dwords are known now. This pass reads them from
+/// guest memory (the recompiler has no raw shader bytes) and records them in
+/// [`ShaderBindResources::embedded_constant_loads`]; the recompiler matches by
+/// `pc` and materializes them as SPIR-V constants stored into the destination
+/// SGPRs. Mirrors the standalone-pass shape of `shader_detect_eud_raw_window`.
+///
+/// Only fully-resolved loads are captured (PC-relative getpc base found, every
+/// intervening base mutation a constant add, guest memory readable); anything
+/// else is left for the recompiler's existing refusal.
+pub fn shader_detect_embedded_constant_loads(
+    code: &ShaderCode,
+    mem: &dyn ShaderMemory,
+    bind: &mut ShaderBindResources,
+) {
+    use ShaderInstructionType as T;
+
+    let insts = code.get_instructions();
+    let mut out = ShaderEmbeddedConstantLoads::default();
+    for (i, load) in insts.iter().enumerate() {
+        // Only the widths the recompiler routes through `sload_dword_extended`
+        // (where the materialization lives) — x1 has a distinct fetch-only
+        // path and x16 has no recompiler row, so capturing them would record
+        // dwords nothing can consume.
+        let dwords = match load.type_ {
+            T::SLoadDwordx2 => 2u32,
+            T::SLoadDwordx4 => 4,
+            T::SLoadDwordx8 => 8,
+            _ => continue,
+        };
+        // Base must be an SGPR pair; offset a non-negative compile-time byte
+        // constant (the shape `sload_dword_extended` reads).
+        if load.src[0].type_ != ShaderOperandType::Sgpr || load.src[0].size != 2 {
+            continue;
+        }
+        let load_off = match load.src[1].type_ {
+            ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant => {
+                if load.src[1].constant.i() < 0 {
+                    continue;
+                }
+                u64::from(load.src[1].constant.u)
+            }
+            _ => continue,
+        };
+        let Some(base_addr) = pc_relative_base_address(&insts[..i], load.src[0].register_id) else {
+            continue;
+        };
+        let addr = base_addr.wrapping_add(load_off);
+        if addr % 4 != 0 {
+            continue;
+        }
+        let Some(src) = mem.dwords_at(addr) else {
+            continue;
+        };
+        if (src.len() as u64) < u64::from(dwords) {
+            continue;
+        }
+        let slot_index = out.loads_num.max(0) as usize;
+        if slot_index >= ShaderEmbeddedConstantLoads::LOADS_MAX {
+            tracing::warn!(
+                pc = load.pc,
+                "more PC-relative embedded-constant loads than LOADS_MAX; dropping the rest"
+            );
+            break;
+        }
+        let slot = &mut out.loads[slot_index];
+        slot.pc = load.pc;
+        slot.dwords_num = dwords;
+        for (k, v) in slot.values.iter_mut().take(dwords as usize).enumerate() {
+            *v = src[k];
+        }
+        out.loads_num += 1;
+        tracing::debug!(
+            pc = load.pc,
+            addr = format_args!("{addr:#x}"),
+            dwords,
+            "captured PC-relative embedded-constant scalar load"
+        );
+    }
+    bind.embedded_constant_loads = out;
+}
+
+/// Beyond Kyty: capture `offen` MUBUF buffer loads whose buffer descriptor (V#)
+/// is **constructed inside the shader**, pointing at the shader's own embedded
+/// vertex data.
+///
+/// Measured on the ASTRO.BOT full-screen-triangle vertex shader: it builds a V#
+/// in `s[0:3]` — base `s[0:1]` PC-relative (`s_getpc_b64` + the 64-bit add
+/// idiom `pc_relative_base_address` resolves), stride/format words `s2`/`s3`
+/// from immediate moves — then reads clip-space vertices with
+/// `buffer_load_dwordx4 v[0:3], v4, s[0:3], 0 offen` /
+/// `buffer_load_dwordx2 v[4:5], v4, s[0:3], 16 offen`. The descriptor is never
+/// user-data, so the storage-buffer path finds nothing (`buffers_num == 0`) and
+/// the recompiler refuses (measured 116 `can't recompile: BufferLoadDwordX4
+/// [Vdata4VaddrSvSoffsOffen]` per live frame).
+///
+/// The embedded data is static (baked into the shader binary), so this snapshots
+/// a window of it from guest memory and records it for the recompiler to serve
+/// the runtime-indexed (`base + voffset`) read from constants. Only offen-only
+/// loads (no `idxen` vindex/stride term) whose V# base is a resolvable
+/// PC-relative pointer are captured; anything else keeps the existing refusal.
+pub fn shader_detect_embedded_buffer_fetch(
+    code: &ShaderCode,
+    mem: &dyn ShaderMemory,
+    bind: &mut ShaderBindResources,
+) {
+    use crate::shader::types::shader_instruction_format::Format as F;
+    use ShaderInstructionType as T;
+
+    let insts = code.get_instructions();
+    let mut out = ShaderEmbeddedBufferFetches::default();
+    for (i, load) in insts.iter().enumerate() {
+        // Only widths the recompiler serves through `buffer_load_dwordxn`.
+        let dwords = match load.type_ {
+            T::BufferLoadDwordX2 => 2u32,
+            T::BufferLoadDwordX3 => 3,
+            T::BufferLoadDwordX4 => 4,
+            _ => continue,
+        };
+        // offen-only (idxen == 0): address = base + voffset + inst_offset, no
+        // vindex*stride term. src[0] = voffset VGPR, src[1] = V# (SGPR quad),
+        // src[2] = the immediate byte offset.
+        if !matches!(
+            load.format,
+            F::Vdata2VaddrSvSoffsOffen | F::Vdata3VaddrSvSoffsOffen | F::Vdata4VaddrSvSoffsOffen
+        ) {
+            continue;
+        }
+        if load.src[1].type_ != ShaderOperandType::Sgpr || load.src[1].size != 4 {
+            continue;
+        }
+        let inst_offset = match load.src[2].type_ {
+            ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant => {
+                if load.src[2].constant.i() < 0 {
+                    continue;
+                }
+                load.src[2].constant.u
+            }
+            _ => continue,
+        };
+        let Some(base) = pc_relative_base_address(&insts[..i], load.src[1].register_id) else {
+            continue;
+        };
+        if base % 4 != 0 {
+            continue;
+        }
+        let Some(src) = mem.dwords_at(base) else {
+            continue;
+        };
+        let window_len = src.len().min(ShaderEmbeddedBufferFetch::WINDOW_MAX);
+        if window_len == 0 {
+            continue;
+        }
+        let slot_index = out.loads_num.max(0) as usize;
+        if slot_index >= ShaderEmbeddedBufferFetches::LOADS_MAX {
+            tracing::warn!(
+                pc = load.pc,
+                "more in-shader-V# buffer loads than LOADS_MAX; dropping the rest"
+            );
+            break;
+        }
+        let slot = &mut out.loads[slot_index];
+        slot.pc = load.pc;
+        slot.inst_offset = inst_offset;
+        slot.dwords_num = dwords;
+        slot.window_len = window_len as u32;
+        for (k, v) in slot.window.iter_mut().take(window_len).enumerate() {
+            *v = src[k];
+        }
+        out.loads_num += 1;
+        tracing::debug!(
+            pc = load.pc,
+            base = format_args!("{base:#x}"),
+            dwords,
+            window_len,
+            "captured in-shader-V# embedded buffer fetch"
+        );
+    }
+    bind.embedded_buffer_fetches = out;
+}
+
 /// The EUD dword offset a COVERED scalar load off the EUD base pair fills the
 /// SGPR range starting at `reg` from, or `None` if no such load seeds `reg`.
 ///
@@ -996,6 +1272,41 @@ pub fn shader_synthesize_default_sampler(code: &ShaderCode, bind: &mut ShaderBin
             "synthesized default (all-zero) S# for sampler-less sampled texture"
         );
     }
+
+    shader_calc_binding_indices(bind);
+}
+
+/// Beyond Kyty: a compute shader that appends/consumes through the GDS counter
+/// (`ds_append` / `ds_consume`) needs a GDS pointer resource so `%gds` is
+/// declared and the host binds the persistent GDS arena. Real Gen5 shaders
+/// address the counter through `M0`, not a captured descriptor, so no usage
+/// slot ever produces the pointer — without one, `Recompile_DsAppend` returns
+/// `false` ("can't recompile: DsAppend"). Synthesize one when the shader
+/// appends/consumes but none was captured. Mirrors
+/// [`shader_synthesize_default_sampler`]. Measured on ASTRO.BOT tiled-lighting
+/// compute (the light-list append counter).
+///
+/// Call after `shader_get_input_info_*` (binding indices are recomputed here).
+pub fn shader_synthesize_gds_pointer(code: &ShaderCode, bind: &mut ShaderBindResources) {
+    use ShaderInstructionType as T;
+
+    if bind.gds_pointers.pointers_num != 0 {
+        return;
+    }
+    if !code.has_any_of(&[T::DsAppend, T::DsConsume]) {
+        return;
+    }
+
+    // The append/consume path indexes the counter through M0; the descriptor
+    // fields are unused, so a default (all-zero) pointer suffices to declare
+    // and bind `%gds`.
+    bind.gds_pointers.pointers_num = 1;
+    bind.gds_pointers.start_register[0] = 0;
+    bind.gds_pointers.slots[0] = -1;
+    bind.gds_pointers.extended[0] = false;
+    tracing::debug!(
+        "synthesized GDS pointer for ds_append/ds_consume without a captured descriptor"
+    );
 
     shader_calc_binding_indices(bind);
 }

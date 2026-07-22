@@ -837,6 +837,120 @@ pub struct ShaderEudRawResources {
     pub required_dwords: u32,
 }
 
+/// Beyond Kyty: one `s_load_dword{,x2,x4,x8,x16}` whose base pointer is built
+/// **PC-relative** (`s_getpc_b64` + optional `s_add_u32 <imm>`) rather than
+/// from user data or the EUD — the shader loading its own embedded constant
+/// table. The absolute address is a compile-time constant (the getpc
+/// materializes it; see `parse.rs` S_GETPC_B64), so the loaded dwords are
+/// known at recompile time and materialized as SPIR-V constants directly into
+/// the destination SGPRs. Measured on ASTRO.BOT vertex shaders.
+///
+/// `shader_detect_embedded_constant_loads` reads the values out of guest
+/// memory during analysis (the recompiler has no raw shader bytes); the
+/// recompiler's `sload_dword_extended` matches by `pc` and emits the stores.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShaderEmbeddedConstantLoad {
+    /// PC of the `s_load` instruction this capture belongs to (the recompiler
+    /// matches on `ShaderInstruction::pc`).
+    pub pc: u32,
+    /// Dwords fetched: 2, 4, 8, or 16.
+    pub dwords_num: u32,
+    /// The embedded constant dwords read from the shader binary at the
+    /// PC-relative address (only `dwords_num` entries are meaningful).
+    pub values: [u32; Self::VALUES_MAX],
+}
+
+impl ShaderEmbeddedConstantLoad {
+    /// Largest SMRD load width (`s_load_dwordx16`).
+    pub const VALUES_MAX: usize = 16;
+}
+
+/// Beyond Kyty: the set of PC-relative embedded-constant scalar loads a stage
+/// performs (see [`ShaderEmbeddedConstantLoad`]).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShaderEmbeddedConstantLoads {
+    pub loads: [ShaderEmbeddedConstantLoad; Self::LOADS_MAX],
+    pub loads_num: i32,
+}
+
+impl ShaderEmbeddedConstantLoads {
+    pub const LOADS_MAX: usize = 8;
+
+    /// The captured dwords for the `s_load` at `pc`, if any.
+    #[must_use]
+    pub fn find(&self, pc: u32) -> Option<&ShaderEmbeddedConstantLoad> {
+        self.loads[..self.loads_num.max(0) as usize]
+            .iter()
+            .find(|l| l.pc == pc)
+    }
+}
+
+/// Beyond Kyty: one `offen` MUBUF buffer load whose buffer descriptor (V#) is
+/// **constructed inside the shader** — its base pointer built PC-relative
+/// (`s_getpc_b64` + the 64-bit add idiom), the descriptor words set by
+/// immediate moves — pointing at the shader's own embedded vertex data. The
+/// descriptor is never a user-data / captured descriptor, so the usual
+/// storage-buffer path finds nothing (`buffers_num == 0`) and refuses the load.
+///
+/// The embedded data is static (baked into the shader binary), so
+/// `shader_detect_embedded_buffer_fetch` snapshots a window of it from guest
+/// memory at analysis time and the recompiler serves the runtime-indexed
+/// (`base + voffset`) read from those constants — a select over the captured
+/// window keyed by the per-lane byte offset. Measured on the ASTRO.BOT
+/// full-screen-triangle vertex shader (embedded verts `(-1,-1),(3,-1),(-1,3)`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShaderEmbeddedBufferFetch {
+    /// PC of the buffer-load instruction this capture belongs to.
+    pub pc: u32,
+    /// The load's immediate byte offset (MUBUF `offset`, folded soffset).
+    pub inst_offset: u32,
+    /// Dwords the load fetches (1, 2, 3, or 4).
+    pub dwords_num: u32,
+    /// Length (in dwords) of the captured window that is meaningful.
+    pub window_len: u32,
+    /// Embedded data snapshot starting at the in-shader V# base address.
+    pub window: [u32; Self::WINDOW_MAX],
+}
+
+impl ShaderEmbeddedBufferFetch {
+    /// Cap on the captured window. Keeps the select-chain small and every
+    /// window index within the seeded `%uint_0..=32` constants; a larger
+    /// embedded buffer is left to the recompiler's refusal.
+    pub const WINDOW_MAX: usize = 32;
+}
+
+impl Default for ShaderEmbeddedBufferFetch {
+    fn default() -> Self {
+        Self {
+            pc: 0,
+            inst_offset: 0,
+            dwords_num: 0,
+            window_len: 0,
+            window: [0; Self::WINDOW_MAX],
+        }
+    }
+}
+
+/// Beyond Kyty: the set of in-shader-V# `offen` buffer loads a stage performs
+/// (see [`ShaderEmbeddedBufferFetch`]).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShaderEmbeddedBufferFetches {
+    pub loads: [ShaderEmbeddedBufferFetch; Self::LOADS_MAX],
+    pub loads_num: i32,
+}
+
+impl ShaderEmbeddedBufferFetches {
+    pub const LOADS_MAX: usize = 8;
+
+    /// The captured embedded fetch for the buffer load at `pc`, if any.
+    #[must_use]
+    pub fn find(&self, pc: u32) -> Option<&ShaderEmbeddedBufferFetch> {
+        self.loads[..self.loads_num.max(0) as usize]
+            .iter()
+            .find(|l| l.pc == pc)
+    }
+}
+
 /// Kyty: Shader.h `ShaderBindResources` (L851). Aggregated per-stage binding
 /// info: push-constant window plus every resource group.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -853,6 +967,12 @@ pub struct ShaderBindResources {
     /// Beyond Kyty (SharpEmu port): raw EUD-window fallback for scalar loads
     /// of EUD dwords no captured descriptor covers.
     pub eud_raw: ShaderEudRawResources,
+    /// Beyond Kyty: PC-relative embedded-constant scalar loads (the shader
+    /// reading its own baked constant table).
+    pub embedded_constant_loads: ShaderEmbeddedConstantLoads,
+    /// Beyond Kyty: `offen` buffer loads through an in-shader-constructed V#
+    /// that points at the shader's own embedded vertex data.
+    pub embedded_buffer_fetches: ShaderEmbeddedBufferFetches,
 }
 
 /// Kyty: Shader.h `ShaderVertexInputInfo` (L864).

@@ -22,8 +22,8 @@ pub mod shaders;
 use crate::backend::{BackendKind, GpuBackend};
 use crate::shader_bridge;
 use instance::VulkanDevice;
-use tracing::info;
 use raeen_core::error::GpuError;
+use tracing::info;
 
 pub use cache::DrawCacheStats;
 pub use instance::validation_error_count;

@@ -479,28 +479,98 @@ const RB_PLUS_64K_STANDARD: [[AddressBit; 16]; 5] = [
 const STANDARD_4K: [[AddressBit; 16]; 5] = [
     // 1 byte/element.
     [
-        ab_x(0), ab_x(1), ab_x(2), ab_x(3), ab_y(0), ab_y(1), ab_y(2), ab_y(3), ab_y(4), ab_x(4),
-        ab_y(5), ab_x(5), AB_ZERO, AB_ZERO, AB_ZERO, AB_ZERO,
+        ab_x(0),
+        ab_x(1),
+        ab_x(2),
+        ab_x(3),
+        ab_y(0),
+        ab_y(1),
+        ab_y(2),
+        ab_y(3),
+        ab_y(4),
+        ab_x(4),
+        ab_y(5),
+        ab_x(5),
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
     ],
     // 2 bytes/element.
     [
-        AB_ZERO, ab_x(0), ab_x(1), ab_x(2), ab_y(0), ab_y(1), ab_y(2), ab_x(3), ab_y(3), ab_x(4),
-        ab_y(4), ab_x(5), AB_ZERO, AB_ZERO, AB_ZERO, AB_ZERO,
+        AB_ZERO,
+        ab_x(0),
+        ab_x(1),
+        ab_x(2),
+        ab_y(0),
+        ab_y(1),
+        ab_y(2),
+        ab_x(3),
+        ab_y(3),
+        ab_x(4),
+        ab_y(4),
+        ab_x(5),
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
     ],
     // 4 bytes/element.
     [
-        AB_ZERO, AB_ZERO, ab_x(0), ab_x(1), ab_y(0), ab_y(1), ab_y(2), ab_x(2), ab_y(3), ab_x(3),
-        ab_y(4), ab_x(4), AB_ZERO, AB_ZERO, AB_ZERO, AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        ab_x(0),
+        ab_x(1),
+        ab_y(0),
+        ab_y(1),
+        ab_y(2),
+        ab_x(2),
+        ab_y(3),
+        ab_x(3),
+        ab_y(4),
+        ab_x(4),
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
     ],
     // 8 bytes/element (also BC1/BC4 blocks).
     [
-        AB_ZERO, AB_ZERO, AB_ZERO, ab_x(0), ab_y(0), ab_y(1), ab_x(1), ab_x(2), ab_y(2), ab_x(3),
-        ab_y(3), ab_x(4), AB_ZERO, AB_ZERO, AB_ZERO, AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        ab_x(0),
+        ab_y(0),
+        ab_y(1),
+        ab_x(1),
+        ab_x(2),
+        ab_y(2),
+        ab_x(3),
+        ab_y(3),
+        ab_x(4),
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
     ],
     // 16 bytes/element (also 16-byte BC blocks).
     [
-        AB_ZERO, AB_ZERO, AB_ZERO, AB_ZERO, ab_y(0), ab_y(1), ab_x(0), ab_x(1), ab_y(2), ab_x(2),
-        ab_y(3), ab_x(3), AB_ZERO, AB_ZERO, AB_ZERO, AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        ab_y(0),
+        ab_y(1),
+        ab_x(0),
+        ab_x(1),
+        ab_y(2),
+        ab_x(2),
+        ab_y(3),
+        ab_x(3),
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
     ],
 ];
 
@@ -651,7 +721,12 @@ pub fn detile_64kb(
 ) -> Option<Vec<u8>> {
     let (table, block_bytes) = swizzle_table(mode)?;
     Some(detile_64kb_with(
-        tiled, width, height, bpp_log2, table, block_bytes,
+        tiled,
+        width,
+        height,
+        bpp_log2,
+        table,
+        block_bytes,
     ))
 }
 
@@ -900,7 +975,10 @@ mod tests {
         }
 
         let back = detile_64kb(5, &tiled, w, h, bpp_log2).expect("mode 5 detiles");
-        assert_eq!(back, linear, "detile ∘ tile must be the identity for 4 KiB_S");
+        assert_eq!(
+            back, linear,
+            "detile ∘ tile must be the identity for 4 KiB_S"
+        );
         assert_ne!(tiled[..linear.len()], linear[..], "swizzle must reorder");
 
         // The 32x32x8B surface is two 4 KiB blocks; the 64 KiB Standard equation

@@ -13,8 +13,8 @@
 //! - Consume MSL emitted by the shader recompiler (see `ShaderFormat::Msl`)
 
 use crate::backend::{BackendKind, GpuBackend};
-use tracing::info;
 use raeen_core::error::GpuError;
+use tracing::info;
 
 /// Placeholder Metal backend.
 pub struct MetalBackend {

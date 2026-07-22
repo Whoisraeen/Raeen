@@ -33,10 +33,12 @@ pub use crate::hw_regs::{
 pub use analysis::{
     EudView, ShaderAnalysisError, ShaderBinaryInfo, ShaderMap, ShaderMemory, ShaderParsedUsage,
     ShaderUsageInfo, ShaderUsageSlot, get_binary_info, get_usage_slots,
-    shader_calc_binding_indices, shader_detect_buffers, shader_get_id_cs, shader_get_id_ps,
-    shader_get_id_vs, shader_get_input_info_cs, shader_get_input_info_ps, shader_get_input_info_vs,
+    shader_calc_binding_indices, shader_detect_buffers, shader_detect_embedded_buffer_fetch,
+    shader_detect_embedded_constant_loads, shader_get_id_cs, shader_get_id_ps, shader_get_id_vs,
+    shader_get_input_info_cs, shader_get_input_info_ps, shader_get_input_info_vs,
     shader_parse_attrib, shader_parse_cs, shader_parse_fetch, shader_parse_ps, shader_parse_usage,
     shader_parse_usage2, shader_parse_vs, shader_synthesize_default_sampler,
+    shader_synthesize_gds_pointer,
 };
 pub use parse::{ShaderParseError, operand_parse, shader_parse};
 pub use recompile::{
@@ -44,9 +46,10 @@ pub use recompile::{
     recomp_func_table, shader_recompile_cs, shader_recompile_ps, shader_recompile_vs, spirv_run,
 };
 pub use resources::{
-    ShaderBindResources, ShaderBufferResource, ShaderComputeInputInfo, ShaderEudRawResources,
-    ShaderId, ShaderMappedData, ShaderPixelInputInfo, ShaderSamplerResource, ShaderSemantic,
-    ShaderSharp, ShaderTextureResource, ShaderUserData, ShaderVertexInputBuffer,
+    ShaderBindResources, ShaderBufferResource, ShaderComputeInputInfo, ShaderEmbeddedBufferFetch,
+    ShaderEmbeddedBufferFetches, ShaderEmbeddedConstantLoad, ShaderEmbeddedConstantLoads,
+    ShaderEudRawResources, ShaderId, ShaderMappedData, ShaderPixelInputInfo, ShaderSamplerResource,
+    ShaderSemantic, ShaderSharp, ShaderTextureResource, ShaderUserData, ShaderVertexInputBuffer,
     ShaderVertexInputInfo,
 };
 pub use spirv::{

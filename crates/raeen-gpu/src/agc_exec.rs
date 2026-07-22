@@ -22,11 +22,11 @@ use crate::vulkan::{RenderedImage, VulkanBackend};
 use kyty_graphics::pm4;
 use kyty_graphics::run::{CommandProcessor, CpError, RunOutcome, SuspendedWait};
 use parking_lot::{Mutex, RwLock};
+use raeen_core::error::GpuError;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use tracing::{debug, warn};
-use raeen_core::error::GpuError;
 
 /// Default offscreen size for PM4-triggered M2 draws.
 pub const M2_DRAW_WIDTH: u32 = 64;
@@ -876,7 +876,9 @@ impl AgcGpuSession {
             }
             // 2B10G10R10A2 family: blue in the least-significant 10 bits.
             0x8100_0000_0000_0000 | 0x8100_0006_0000_0000 | 0x8100_0704_0000_0000 => {
-                ScanoutConv::Packed10 { red_is_least: false }
+                ScanoutConv::Packed10 {
+                    red_is_least: false,
+                }
             }
             _ => {
                 warn_unsupported_scanout(desc);
@@ -934,8 +936,7 @@ impl AgcGpuSession {
                         pixels[d + 3] = src[s + 3];
                     }
                     ScanoutConv::Packed10 { red_is_least } => {
-                        let word =
-                            u32::from_le_bytes([src[s], src[s + 1], src[s + 2], src[s + 3]]);
+                        let word = u32::from_le_bytes([src[s], src[s + 1], src[s + 2], src[s + 3]]);
                         let least = word & 0x3FF;
                         let green = (word >> 10) & 0x3FF;
                         let most = (word >> 20) & 0x3FF;
@@ -2403,7 +2404,10 @@ mod tests {
             pixels: vec![7, 8, 9, 255, 11, 12, 13, 255],
             bytes_per_pixel: 4,
         };
-        session.framebuffers.lock().insert(base, drawn_again.clone());
+        session
+            .framebuffers
+            .lock()
+            .insert(base, drawn_again.clone());
         session.present_scanout(base, Some(desc)); // drawn wins, becomes last frame
         session.framebuffers.lock().clear();
         let tiled = raeen_core::subsystems::ScanoutDescriptor {

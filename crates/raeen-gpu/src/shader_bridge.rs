@@ -17,8 +17,8 @@ use kyty_graphics::shader::{
     ShaderVertexInputInfo, shader_get_input_info_ps, shader_parse_ps, shader_recompile_ps,
 };
 use kyty_graphics::spirv_asm;
-use thiserror::Error;
 use raeen_core::error::GpuError;
+use thiserror::Error;
 
 /// Guest address used for the fixture pixel-shader blob.
 const PS_ADDR: u64 = 0x2_0000;

@@ -606,6 +606,7 @@ fn op_info(name: &str) -> Option<OpInfo> {
         // ShaderSpirv.cpp L2230-L2268), so these are plain id operands.
         "OpControlBarrier" => op(224, false, false, &[Id, Id, Id]),
         "OpMemoryBarrier" => op(225, false, false, &[Id, Id]),
+        "OpAtomicExchange" => op(229, true, true, IDR),
         "OpAtomicIAdd" => op(234, true, true, IDR),
         "OpAtomicISub" => op(235, true, true, IDR),
         // --- Control flow ------------------------------------------------------

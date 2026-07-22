@@ -1117,6 +1117,7 @@ fn shader_parse_vopc(
         0x13 => inst.type_ = T::VCmpxLeF32,
         0x14 => inst.type_ = T::VCmpxGtF32,
         0x16 => inst.type_ = T::VCmpxGeF32,
+        0x19 => inst.type_ = T::VCmpxNgeF32,
         0x1c => inst.type_ = T::VCmpxNleF32,
         0x1d => inst.type_ = T::VCmpxNeqF32,
         0x1e => inst.type_ = T::VCmpxNltF32,
@@ -1818,6 +1819,7 @@ fn shader_parse_vop3(
         0x12 => inst.type_ = T::VCmpxEqF32,
         0x13 => inst.type_ = T::VCmpxLeF32,
         0x16 => inst.type_ = T::VCmpxGeF32,
+        0x19 => inst.type_ = T::VCmpxNgeF32,
         0x1c => inst.type_ = T::VCmpxNleF32,
         0x1d => inst.type_ = T::VCmpxNeqF32,
         0x1e => inst.type_ = T::VCmpxNltF32,
@@ -3137,7 +3139,23 @@ fn shader_parse_ds(
         0x2a => return Err(ni(dst, S, "ds_or_rtn_b32", opcode, pc, b0)),
         0x2b => return Err(ni(dst, S, "ds_xor_rtn_b32", opcode, pc, b0)),
         0x2c => return Err(ni(dst, S, "ds_mskor_rtn_b32", opcode, pc, b0)),
-        0x2d => return Err(ni(dst, S, "ds_wrxchg_rtn_b32", opcode, pc, b0)),
+        // Beyond Kyty (KYTY_NI upstream): LDS atomic write-exchange returning
+        // the old value, measured on ASTRO.BOT tiled-lighting compute (raw
+        // 0xd8b40510, offset 0x510). Same operand shape as ds_write_b32 plus a
+        // return VGPR: dst = vdst (old value), src0 = address VGPR, src1 = data
+        // VGPR, src2 = the 16-bit instruction byte offset.
+        0x2d => {
+            if gds != 0 {
+                return Err(feature(S, "ds_wrxchg_rtn_b32 with gds == 1", pc));
+            }
+            inst.type_ = T::DsWrxchgRtnB32;
+            inst.format = F::VdstVsrc0Vsrc1Vsrc2;
+            inst.src[0] = operand_parse(addr + 256)?;
+            inst.src[1] = operand_parse(data0 + 256)?;
+            inst.src[2].type_ = O::LiteralConstant;
+            inst.src[2].constant.u = offset0 | (offset1 << 8);
+            inst.src_num = 3;
+        }
         0x2e => return Err(ni(dst, S, "ds_wrxchg2_rtn_b32", opcode, pc, b0)),
         0x2f => return Err(ni(dst, S, "ds_wrxchg2st64_rtn_b32", opcode, pc, b0)),
         0x30 => return Err(ni(dst, S, "ds_cmpst_rtn_b32", opcode, pc, b0)),

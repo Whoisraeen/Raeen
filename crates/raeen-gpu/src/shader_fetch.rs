@@ -196,6 +196,26 @@ impl ShaderTranslateCache {
                 let mut vs_info = ShaderVertexInputInfo::default();
                 shader_get_input_info_vs(&vs, &sh_regs, mem, &shader_map, next_gen, &mut vs_info)
                     .map_err(|e| AttemptError::from_analysis("shader_get_input_info_vs", &e))?;
+                // Beyond Kyty: capture PC-relative embedded-constant scalar
+                // loads (the shader reading its own baked constant table) so the
+                // recompiler materializes them as SPIR-V constants instead of
+                // refusing the non-EUD base. Measured on ASTRO.BOT vertex
+                // shaders (`s_getpc_b64` + `s_add_u32` + `s_load_dwordx8`).
+                kyty_graphics::shader::shader_detect_embedded_constant_loads(
+                    &code,
+                    mem,
+                    &mut vs_info.bind,
+                );
+                // Beyond Kyty: capture `offen` buffer loads through an
+                // in-shader-constructed V# that points at the shader's own
+                // embedded vertex data (the ASTRO.BOT full-screen-triangle VS),
+                // so the recompiler serves them from the baked window instead of
+                // refusing an unbound descriptor.
+                kyty_graphics::shader::shader_detect_embedded_buffer_fetch(
+                    &code,
+                    mem,
+                    &mut vs_info.bind,
+                );
                 let spirv = shader_recompile_vs(&code, &vs_info)
                     .map_err(|e| AttemptError::named(format!("shader_recompile_vs: {e}")))?;
                 Ok(TranslatedShader {
@@ -277,12 +297,32 @@ impl ShaderTranslateCache {
                 // sampler operand register instead of a whole-shader refusal;
                 // the Vulkan layer then binds its cached default sampler.
                 kyty_graphics::shader::shader_synthesize_default_sampler(&code, &mut cs_info.bind);
+                // Beyond Kyty: a CS that appends/consumes through the GDS
+                // counter without a captured GDS descriptor gets one synthesized
+                // so `%gds` is declared and bound (measured on ASTRO.BOT
+                // tiled-lighting's light-list append counter).
+                kyty_graphics::shader::shader_synthesize_gds_pointer(&code, &mut cs_info.bind);
                 // SharpEmu port: s_loads of EUD dwords no captured descriptor
                 // covers become clamped reads of a dispatch-time guest-memory
                 // window (`%eud_raw`) instead of named refusals. The detected
                 // metadata rides in `cs_info.bind.eud_raw`, which
                 // `prepare_stage_binding` uses to snapshot + bind the window.
                 kyty_graphics::shader::shader_detect_eud_raw_window(&code, &mut cs_info.bind);
+                // Beyond Kyty: the same in-shader embedded-data captures the
+                // vertex path uses — a compute shader can equally build a
+                // PC-relative scalar-load base or an in-shader V# pointing at
+                // its own baked constants (measured in ASTRO.BOT's tiled-lighting
+                // compute). Mirror `translate_vs`.
+                kyty_graphics::shader::shader_detect_embedded_constant_loads(
+                    &code,
+                    mem,
+                    &mut cs_info.bind,
+                );
+                kyty_graphics::shader::shader_detect_embedded_buffer_fetch(
+                    &code,
+                    mem,
+                    &mut cs_info.bind,
+                );
                 let spirv = shader_recompile_cs(&code, &cs_info)
                     .map_err(|e| AttemptError::named(format!("shader_recompile_cs: {e}")))?;
                 Ok(TranslatedShader {

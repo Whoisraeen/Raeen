@@ -15,9 +15,9 @@
 //! Machines without Vulkan 1.3 skip (unless `RAEEN_REQUIRE_VULKAN=1`).
 
 use kyty_graphics::pm4;
-use std::sync::Arc;
 use raeen_gpu::GpuGuestMemory;
 use raeen_gpu::agc_exec::AgcGpuSession;
+use std::sync::Arc;
 
 struct TestGpuMemory {
     start: u64,

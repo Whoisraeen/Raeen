@@ -455,11 +455,12 @@ fn captured_hdr_composite_shader_pair_submits_safely() {
         std::env::var("RAEEN_REPLAY_VS"),
         std::env::var("RAEEN_REPLAY_PS"),
     ) else {
-        eprintln!("captured_hdr_composite_shader_pair_submits_safely: SKIP — set RAEEN_REPLAY_VS/PS");
+        eprintln!(
+            "captured_hdr_composite_shader_pair_submits_safely: SKIP — set RAEEN_REPLAY_VS/PS"
+        );
         return;
     };
-    let Some(backend) = backend_or_skip("captured_hdr_composite_shader_pair_submits_safely")
-    else {
+    let Some(backend) = backend_or_skip("captured_hdr_composite_shader_pair_submits_safely") else {
         return;
     };
     let dev = backend.device().expect("backend is initialized");

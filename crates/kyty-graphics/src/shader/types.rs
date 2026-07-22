@@ -110,6 +110,11 @@ pub enum ShaderInstructionType {
     /// scene compute (raw 0xd8340000). Lowered to an `OpStore` into the
     /// `%lds` Workgroup array at `(addr + offset) >> 2`.
     DsWriteB32,
+    /// DS 0x2d: LDS atomic write-exchange, returning the OLD value — measured
+    /// in ASTRO.BOT tiled-lighting compute (raw 0xd8b40510). `vdst = lds[a];
+    /// lds[a] = data`. Lowered to `OpAtomicExchange` on the `%lds` Workgroup
+    /// array (exec-guarded like `DsAddU32`, old value written to `vdst`).
+    DsWrxchgRtnB32,
     /// DS 0xde: three consecutive LDS dwords stored from `data0..data0+2` at
     /// the 16-bit byte offset (RDNA2 ISA `DS_WRITE_B96`). Kyty `KYTY_NI`;
     /// measured on ASTRO.BOT scene compute.
@@ -297,6 +302,10 @@ pub enum ShaderInstructionType {
     /// VOPC 0x16: `exec/smask = vsrc0 >= vsrc1` (ordered). Exec-writing
     /// sibling of `VCmpGeF32`; measured in ASTRO.BOT scene CS.
     VCmpxGeF32,
+    /// VOPC 0x19: `exec/smask = !(vsrc0 >= vsrc1)` — the UNORDERED `<`
+    /// (NaN → true). Exec-writing sibling of `VCmpNgeF32`; measured in
+    /// ASTRO.BOT tiled-lighting compute (raw 0x7c32d4f9).
+    VCmpxNgeF32,
     VCmpxGeU32,
     VCmpxGtF32,
     VCmpxGtU32,

@@ -3398,7 +3398,14 @@ impl<'a> Spirv<'a> {
                     )
                     .replace(
                         "<Offset>",
-                        &format!("{}", if spill.is_some() { 0 } else { bind.push_constant_offset }),
+                        &format!(
+                            "{}",
+                            if spill.is_some() {
+                                0
+                            } else {
+                                bind.push_constant_offset
+                            }
+                        ),
                     );
                 if let Some(binding) = spill {
                     self.source += &VSHARP_UNIFORM_ANNOTATIONS
@@ -3651,6 +3658,7 @@ impl<'a> Spirv<'a> {
         use ShaderInstructionType as T;
         self.code.has_any_of(&[
             T::DsAddU32,
+            T::DsWrxchgRtnB32,
             T::DsReadB32,
             T::DsWriteB32,
             T::DsRead2B32,
@@ -4921,6 +4929,36 @@ impl<'a> Spirv<'a> {
                 }
             }
         }
+        // Beyond Kyty: PC-relative embedded-constant scalar loads materialize
+        // their captured dwords directly as uint constants (see
+        // `shader_detect_embedded_constant_loads` and `sload_dword_extended`).
+        if let Some(bind) = self.bind {
+            let ecl = &bind.embedded_constant_loads;
+            for load in &ecl.loads[..ecl.loads_num.max(0) as usize] {
+                let n = (load.dwords_num as usize).min(load.values.len());
+                for &v in &load.values[..n] {
+                    self.add_constant_uint(v);
+                }
+            }
+        }
+        // Beyond Kyty: in-shader-V# `offen` buffer loads select their result
+        // from the captured embedded window (see
+        // `shader_detect_embedded_buffer_fetch` and
+        // `recompile_embedded_buffer_fetch`). The window values are arbitrary
+        // uints; the select-chain's index compares (0..window_len), the >>2
+        // shift, and the immediate byte offset are also uint constants (window
+        // indices stay within the seeded 0..=32 range).
+        if let Some(bind) = self.bind {
+            let ebf = &bind.embedded_buffer_fetches;
+            for fetch in &ebf.loads[..ebf.loads_num.max(0) as usize] {
+                let n = (fetch.window_len as usize).min(fetch.window.len());
+                for &v in &fetch.window[..n] {
+                    self.add_constant_uint(v);
+                }
+                self.add_constant_uint(2);
+                self.add_constant_uint(fetch.inst_offset);
+            }
+        }
         Ok(())
     }
 
@@ -5238,12 +5276,13 @@ mod tests {
             "{source}"
         );
         assert!(
-            source.contains(
-                "%vsharp = OpVariable %_ptr_PushConstant_BufferResource Uniform"
-            ),
+            source.contains("%vsharp = OpVariable %_ptr_PushConstant_BufferResource Uniform"),
             "{source}"
         );
-        assert!(source.contains("OpDecorate %vsharp DescriptorSet 0"), "{source}");
+        assert!(
+            source.contains("OpDecorate %vsharp DescriptorSet 0"),
+            "{source}"
+        );
         assert!(source.contains("OpDecorate %vsharp Binding 0"), "{source}");
         assert!(!source.contains("OpTypePointer PushConstant"), "{source}");
     }

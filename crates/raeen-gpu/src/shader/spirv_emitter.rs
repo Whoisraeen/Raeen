@@ -5,9 +5,9 @@
 
 use super::ShaderType;
 use super::ir::{IrOp, IrProgram, IrValue};
+use raeen_core::error::GpuError;
 use std::collections::HashMap;
 use tracing::info;
-use raeen_core::error::GpuError;
 
 // ─── SPIR-V Magic and Constants ────────────────────────────
 const SPIRV_MAGIC: u32 = 0x07230203;

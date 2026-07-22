@@ -18,9 +18,9 @@ use super::instance::VulkanDevice;
 use super::shaders::{triangle_fragment_spirv, triangle_vertex_spirv};
 use ash::vk::Handle;
 use ash::{Device, util::Align, vk};
+use raeen_core::error::GpuError;
 use std::mem;
 use tracing::debug;
-use raeen_core::error::GpuError;
 
 /// The color the attachment is cleared to before the draw, as linear RGBA.
 ///
@@ -739,7 +739,15 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
             .map(|u| {
                 format!(
                     "T#{{base:{:#x} {}x{}x{} l{} cube{} rt:{:?} fmt:{:?} bytes:{}}}",
-                    u.guest_base, u.width, u.height, u.depth, u.layers, u.cube, u.render_target, u.format, u.pixels.len()
+                    u.guest_base,
+                    u.width,
+                    u.height,
+                    u.depth,
+                    u.layers,
+                    u.cube,
+                    u.render_target,
+                    u.format,
+                    u.pixels.len()
                 )
             })
             .collect();
@@ -777,7 +785,10 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
             })
             .collect();
         tracing::warn!(
-            rt = format_args!("{}x{} {:?} base:{:?}", state.width, state.height, state.format, state.target_base),
+            rt = format_args!(
+                "{}x{} {:?} base:{:?}",
+                state.width, state.height, state.format, state.target_base
+            ),
             topo = format_args!("{:?}", state.topology),
             cull = format_args!("{:?}/{:?}", state.cull_mode, state.front_face),
             depth = state.depth.is_some(),
@@ -886,8 +897,7 @@ fn dump_draw_state_resources(state: &DrawState) {
     let dir = std::path::Path::new(&dir);
     let write = |name: String, bytes: &[u8]| {
         let path = dir.join(name);
-        if let Err(error) = std::fs::create_dir_all(dir)
-            .and_then(|()| std::fs::write(&path, bytes))
+        if let Err(error) = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, bytes))
         {
             debug!(%error, path = %path.display(), "translated draw resource dump failed");
         }
@@ -912,7 +922,10 @@ fn dump_draw_state_resources(state: &DrawState) {
         write(format!("vertex_{index}.bin"), &buffer.bytes);
     }
     for (stage_index, stage) in state.stage_bindings.iter().enumerate() {
-        write(format!("stage_{stage_index}_push.bin"), &stage.push_constants);
+        write(
+            format!("stage_{stage_index}_push.bin"),
+            &stage.push_constants,
+        );
         if let Some(storage) = &stage.storage_buffers {
             for (index, buffer) in storage.buffers.iter().enumerate() {
                 write(format!("stage_{stage_index}_storage_{index}.bin"), buffer);
@@ -3766,12 +3779,12 @@ fn validate_graphics_interface(state: &DrawState) -> Result<(), GpuError> {
             }
             at += len;
         }
-        point_pointers.iter().any(|pointer| stores.contains(pointer))
+        point_pointers
+            .iter()
+            .any(|pointer| stores.contains(pointer))
     }
 
-    if state.topology == vk::PrimitiveTopology::POINT_LIST
-        && !writes_point_size(state.vs_spirv)
-    {
+    if state.topology == vk::PrimitiveTopology::POINT_LIST && !writes_point_size(state.vs_spirv) {
         return Err(GpuError::PipelineCreationFailed(
             "point-list draw skipped: translated vertex shader does not write gl_PointSize"
                 .to_owned(),
