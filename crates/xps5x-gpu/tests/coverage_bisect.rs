@@ -388,6 +388,7 @@ fn title_translated_ps_sweep() {
                 } else {
                     Vec::new()
                 },
+                push_uniform_binding: None,
                 storage_buffers: if sbuf { sbuf_binding() } else { None },
                 textures: if tex {
                     let mut t = tex_binding().unwrap();
@@ -441,6 +442,160 @@ fn title_translated_ps_sweep() {
         }
         eprintln!("PS SWEEP {name}: {outcome}");
     }
+}
+
+/// Replay a captured title VS/PS pair with the descriptor ABI observed on the
+/// failing ASTRO.BOT HDR composite, but with tiny deterministic resources.
+/// This separates translated-shader execution from the title's 1080p target
+/// and 2432x1368 source allocation. Gated because the SPIR-V dumps are local
+/// diagnostics, never repository fixtures.
+#[test]
+fn captured_hdr_composite_shader_pair_submits_safely() {
+    let (Ok(vs_path), Ok(ps_path)) = (
+        std::env::var("XPS5X_REPLAY_VS"),
+        std::env::var("XPS5X_REPLAY_PS"),
+    ) else {
+        eprintln!("captured_hdr_composite_shader_pair_submits_safely: SKIP — set XPS5X_REPLAY_VS/PS");
+        return;
+    };
+    let Some(backend) = backend_or_skip("captured_hdr_composite_shader_pair_submits_safely")
+    else {
+        return;
+    };
+    let dev = backend.device().expect("backend is initialized");
+    let read_spv = |path: &str| {
+        std::fs::read(path)
+            .expect("captured SPIR-V readable")
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect::<Vec<_>>()
+    };
+    let (vs, ps) = (read_spv(&vs_path), read_spv(&ps_path));
+    let (target_w, target_h) = if std::env::var_os("XPS5X_REPLAY_FULL_TARGET").is_some() {
+        (1920, 1080)
+    } else {
+        (W, H)
+    };
+    let (texture_w, texture_h) = if std::env::var_os("XPS5X_REPLAY_FULL_TEXTURE").is_some() {
+        (2432, 1368)
+    } else {
+        (4, 4)
+    };
+
+    // Full-screen triangle: position float4 + UV float2 in a 24-byte stride.
+    // The second float4 descriptor overlaps the next record exactly like the
+    // captured draw; only its first two lanes are consumed by the VS.
+    let records: [[f32; 6]; 3] = [
+        [-1.0, -1.0, 0.0, 1.0, 0.0, 1.0],
+        [3.0, -1.0, 0.0, 1.0, 2.0, 1.0],
+        [-1.0, 3.0, 0.0, 1.0, 0.0, -1.0],
+    ];
+    let mut vertex_bytes = records
+        .iter()
+        .flatten()
+        .flat_map(|f| f.to_le_bytes())
+        .collect::<Vec<_>>();
+    vertex_bytes.extend_from_slice(&[0; 8]); // final overlapped float4 tail
+    if let Ok(path) = std::env::var("XPS5X_REPLAY_VERTEX") {
+        vertex_bytes = std::fs::read(path).expect("captured vertex buffer readable");
+    }
+
+    let push_words: [u32; 16] = [
+        0x0000_0000,
+        0x0010_0000,
+        0x0000_0002,
+        0x0004_dfac,
+        0x0000_0000,
+        0xc470_0000,
+        0x0155_c25f,
+        0x91b0_0fac,
+        0x0000_0000,
+        0x0000_0000,
+        0xe07b_0000,
+        0x0005_7054,
+        0x0000_0000,
+        0x00ff_f000,
+        0x0650_0000,
+        0x0000_0000,
+    ];
+    let push_constants = push_words
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect::<Vec<_>>();
+
+    let storage_bytes = std::env::var("XPS5X_REPLAY_STORAGE")
+        .ok()
+        .map(|path| std::fs::read(path).expect("captured storage buffer readable"))
+        .unwrap_or_else(|| vec![0; 32]);
+    let texture_pixels = std::env::var("XPS5X_REPLAY_TEXTURE")
+        .ok()
+        .map(|path| std::fs::read(path).expect("captured decoded texture readable"))
+        .unwrap_or_else(|| vec![0; (texture_w * texture_h * 8) as usize]);
+    let binding = ShaderStageBinding {
+        stage: vk::ShaderStageFlags::FRAGMENT,
+        descriptor_set_slot: 0,
+        push_constant_offset: 0,
+        push_constants,
+        push_uniform_binding: None,
+        storage_buffers: Some(StorageBufferBinding {
+            binding: 0,
+            buffers: vec![storage_bytes],
+        }),
+        textures: Some(TextureBinding {
+            sampled_binding: 1,
+            sampler_binding: 3,
+            textures: vec![TextureUpload {
+                width: texture_w,
+                height: texture_h,
+                format: vk::Format::R16G16B16A16_SFLOAT,
+                pixels: texture_pixels,
+                layers: 1,
+                cube: false,
+                depth: 1,
+                render_target: None,
+                guest_base: 0,
+                sample_hash: 0,
+                cached: false,
+            }],
+            linear_filter: vec![false],
+            sampled_groups: Vec::new(),
+        }),
+        storage_images: None,
+        gds_binding: None,
+        eud_raw: None,
+    };
+
+    let target_base = std::env::var_os("XPS5X_REPLAY_PERSISTENT")
+        .is_some()
+        .then_some(0x5_3aa0_0000);
+    let state = DrawState {
+        format: vk::Format::B10G11R11_UFLOAT_PACK32,
+        topology: vk::PrimitiveTopology::TRIANGLE_STRIP,
+        target_base,
+        vertex_buffers: vec![VertexBufferData {
+            bytes: vertex_bytes,
+            stride: 24,
+        }],
+        vertex_attributes: vec![
+            VertexAttributeData {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: 0,
+            },
+            VertexAttributeData {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: 16,
+            },
+        ],
+        vertex_count: 3,
+        stage_bindings: vec![binding],
+        ..DrawState::new(target_w, target_h, &vs, &ps)
+    };
+    let output = render_draw(dev, &state).expect("captured HDR shader pair must submit safely");
+    assert!(output.color.is_some(), "colour attachment must read back");
 }
 
 /// Variable 3: the full Minecraft shape — indexed NDC quad at z=+1.0, guest

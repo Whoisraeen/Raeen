@@ -1999,6 +1999,48 @@ pub fn shader_detect_eud_raw_window(code: &ShaderCode, bind: &mut ShaderBindReso
     }
 }
 
+/// Vulkan only guarantees 128 bytes of push constants; the Windows GPUs we
+/// currently exercise commonly expose 256. Keep translated resource tables
+/// within that portable ceiling and move larger tables to a per-stage UBO.
+pub const PUSH_CONSTANT_SPILL_THRESHOLD: u32 = 256;
+
+/// Descriptor binding reserved for a resource-table UBO when the translated
+/// stage's push-constant range crosses [`PUSH_CONSTANT_SPILL_THRESHOLD`].
+/// It follows every descriptor group assigned by analysis, including the raw
+/// EUD fallback added after `shader_calc_binding_indices`.
+#[must_use]
+pub fn shader_push_constant_spill_binding(bind: &ShaderBindResources) -> Option<u32> {
+    let need = bind
+        .push_constant_offset
+        .saturating_add(bind.push_constant_size);
+    if need <= PUSH_CONSTANT_SPILL_THRESHOLD || bind.push_constant_size == 0 {
+        return None;
+    }
+
+    let mut next = 0u32;
+    let mut after = |binding: i32| {
+        next = next.max(binding.max(0) as u32 + 1);
+    };
+    if bind.storage_buffers.buffers_num > 0 {
+        after(bind.storage_buffers.binding_index);
+    }
+    if bind.textures2d.textures_num > 0 {
+        // The storage binding follows every sampled (Dim, class) group and
+        // is therefore the final binding reserved for the T# family.
+        after(bind.textures2d.binding_storage_index);
+    }
+    if bind.samplers.samplers_num > 0 {
+        after(bind.samplers.binding_index);
+    }
+    if bind.gds_pointers.pointers_num > 0 {
+        after(bind.gds_pointers.binding_index);
+    }
+    if bind.eud_raw.used {
+        after(bind.eud_raw.binding_index);
+    }
+    Some(next)
+}
+
 /// The single `OpTypeImage` Dim of the sampled-texture array
 /// (`%textures2D_S`), decided from the measured T# types: 9 (and the
 /// height-1 "1D" 8) = 2D, 10 = 3D volume, 11 = Cube, 13 = 2DArray
@@ -3291,6 +3333,10 @@ impl<'a> Spirv<'a> {
 	   OpMemberDecorate %BufferResource 0 Offset <Offset>
        OpDecorate %BufferResource Block
 "#;
+        const VSHARP_UNIFORM_ANNOTATIONS: &str = r#"
+       OpDecorate %vsharp DescriptorSet <DescriptorSet>
+       OpDecorate %vsharp Binding <BindingIndex>
+"#;
 
         if let Some(bind) = self.bind {
             if bind.storage_buffers.buffers_num > 0 {
@@ -3344,12 +3390,21 @@ impl<'a> Spirv<'a> {
                     .replace("<BindingIndex>", &format!("{}", bind.eud_raw.binding_index));
             }
             if bind.push_constant_size > 0 {
+                let spill = shader_push_constant_spill_binding(bind);
                 self.source += &VSHARP_ANNOTATIONS
                     .replace(
                         "<buffers_num>",
                         &format!("{}", bind.push_constant_size / 16),
                     )
-                    .replace("<Offset>", &format!("{}", bind.push_constant_offset));
+                    .replace(
+                        "<Offset>",
+                        &format!("{}", if spill.is_some() { 0 } else { bind.push_constant_offset }),
+                    );
+                if let Some(binding) = spill {
+                    self.source += &VSHARP_UNIFORM_ANNOTATIONS
+                        .replace("<DescriptorSet>", &format!("{}", bind.descriptor_set_slot))
+                        .replace("<BindingIndex>", &format!("{binding}"));
+                }
             }
         }
 
@@ -3427,6 +3482,7 @@ impl<'a> Spirv<'a> {
        %_arr_float_uint_1 = OpTypeArray %float %array_length
             %gl_PerVertex = OpTypeStruct %v4float %float %_arr_float_uint_1 %_arr_float_uint_1
 %_ptr_Output_gl_PerVertex = OpTypePointer Output %gl_PerVertex
+          %_ptr_Output_float = OpTypePointer Output %float
 "#;
 
         const COMPUTE_TYPES: &str = "
@@ -3500,8 +3556,8 @@ impl<'a> Spirv<'a> {
                         %vsharp_arr_uint_uint_4 = OpTypeArray %uint %vsharp_num_uint_4
 %vsharp_arr__arr_uint_uint_4_uint_<buffers_num> = OpTypeArray %vsharp_arr_uint_uint_4 %vsharp_buffers_num_uint_<buffers_num>
                                 %BufferResource = OpTypeStruct %vsharp_arr__arr_uint_uint_4_uint_<buffers_num>
-              %_ptr_PushConstant_BufferResource = OpTypePointer PushConstant %BufferResource
-                        %_ptr_PushConstant_uint = OpTypePointer PushConstant %uint
+              %_ptr_PushConstant_BufferResource = OpTypePointer <StorageClass> %BufferResource
+                        %_ptr_PushConstant_uint = OpTypePointer <StorageClass> %uint
 "#;
 
         if let Some(bind) = self.bind {
@@ -3557,10 +3613,19 @@ impl<'a> Spirv<'a> {
                 self.source += EUD_RAW_TYPES;
             }
             if bind.push_constant_size > 0 {
-                self.source += &VSHARP_TYPES.replace(
-                    "<buffers_num>",
-                    &format!("{}", bind.push_constant_size / 16),
-                );
+                self.source += &VSHARP_TYPES
+                    .replace(
+                        "<buffers_num>",
+                        &format!("{}", bind.push_constant_size / 16),
+                    )
+                    .replace(
+                        "<StorageClass>",
+                        if shader_push_constant_spill_binding(bind).is_some() {
+                            "Uniform"
+                        } else {
+                            "PushConstant"
+                        },
+                    );
             }
         }
 
@@ -3695,10 +3760,14 @@ impl<'a> Spirv<'a> {
                 );
             }
             if bind.push_constant_size > 0 {
-                vars.push(
-                    "%vsharp = OpVariable %_ptr_PushConstant_BufferResource PushConstant"
-                        .to_string(),
-                );
+                let storage = if shader_push_constant_spill_binding(bind).is_some() {
+                    "Uniform"
+                } else {
+                    "PushConstant"
+                };
+                vars.push(format!(
+                    "%vsharp = OpVariable %_ptr_PushConstant_BufferResource {storage}"
+                ));
             }
         }
 
@@ -3842,6 +3911,15 @@ impl<'a> Spirv<'a> {
            %instance_index = OpBitcast %float %instance_index_int
                            OpStore %<i> %instance_index
 "#;
+            // Vulkan requires every vertex shader used with POINT_LIST to
+            // write the PointSize member of the gl_PerVertex block. Guest
+            // shaders commonly rely on the PS5 rasterizer's default size
+            // instead, so seed the Vulkan equivalent before guest code runs.
+            // A later guest write, once translated, naturally overrides it.
+            const INIT_POINT_SIZE: &str = r#"
+       %out_point_size = OpAccessChain %_ptr_Output_float %outPerVertex %uint_1
+                           OpStore %out_point_size %float_1_000000
+"#;
             if self.vs_input_info.is_some_and(|i| i.gs_prolog) {
                 self.source += &TEXT.replace("<v>", "v5").replace("<i>", "v8");
 
@@ -3853,6 +3931,7 @@ impl<'a> Spirv<'a> {
             } else {
                 self.source += &TEXT.replace("<v>", "v0").replace("<i>", "v3");
             }
+            self.source += INIT_POINT_SIZE;
         }
 
         if self.code.get_type() == ShaderType::Pixel
@@ -5121,6 +5200,16 @@ mod tests {
         // Vertex-index prolog init (WriteLocalVariables L7311, non-gs_prolog).
         assert!(source.contains("OpStore %v0 %vertex_index"), "{source}");
         assert!(source.contains("OpStore %v3 %instance_index"), "{source}");
+        assert!(
+            source.contains(
+                "%out_point_size = OpAccessChain %_ptr_Output_float %outPerVertex %uint_1"
+            ),
+            "vertex shaders must always initialize the Vulkan PointSize builtin:\n{source}"
+        );
+        assert!(
+            source.contains("OpStore %out_point_size %float_1_000000"),
+            "vertex shaders must use a valid default point size:\n{source}"
+        );
     }
 
     #[test]
@@ -5128,6 +5217,35 @@ mod tests {
         let code = ShaderCode::new(); // type Unknown
         let err = spirv_generate_source(&code, None, None, None).unwrap_err();
         assert_eq!(err, ShaderRecompileError::UnknownShaderType);
+    }
+
+    #[test]
+    fn oversized_resource_table_uses_uniform_buffer_instead_of_push_constants() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        let mut input = ShaderComputeInputInfo {
+            threads_num: [1, 1, 1],
+            ..Default::default()
+        };
+        input.bind.push_constant_size = 272;
+
+        assert_eq!(shader_push_constant_spill_binding(&input.bind), Some(0));
+        let source = spirv_generate_source(&code, None, None, Some(&input)).unwrap();
+        assert!(
+            source.contains(
+                "%_ptr_PushConstant_BufferResource = OpTypePointer Uniform %BufferResource"
+            ),
+            "{source}"
+        );
+        assert!(
+            source.contains(
+                "%vsharp = OpVariable %_ptr_PushConstant_BufferResource Uniform"
+            ),
+            "{source}"
+        );
+        assert!(source.contains("OpDecorate %vsharp DescriptorSet 0"), "{source}");
+        assert!(source.contains("OpDecorate %vsharp Binding 0"), "{source}");
+        assert!(!source.contains("OpTypePointer PushConstant"), "{source}");
     }
 
     #[test]

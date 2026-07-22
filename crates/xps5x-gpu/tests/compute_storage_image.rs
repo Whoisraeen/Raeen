@@ -118,6 +118,7 @@ fn compute_shader_writes_are_visible_in_storage_image_readback() {
         descriptor_set_slot: 0,
         push_constant_offset: 0,
         push_constants: Vec::new(),
+        push_uniform_binding: None,
         storage_buffers: None,
         textures: None,
         storage_images: Some(StorageImageBinding {

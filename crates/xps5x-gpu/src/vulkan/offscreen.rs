@@ -263,6 +263,10 @@ pub struct ShaderStageBinding {
     pub descriptor_set_slot: u32,
     pub push_constant_offset: u32,
     pub push_constants: Vec<u8>,
+    /// When present, `push_constants` is uploaded to this UNIFORM_BUFFER
+    /// descriptor instead of passed to `vkCmdPushConstants`. The translated
+    /// SPIR-V declares the same resource table in Uniform storage class.
+    pub push_uniform_binding: Option<u32>,
     pub storage_buffers: Option<StorageBufferBinding>,
     pub textures: Option<TextureBinding>,
     /// Storage images (UAVs). Compute-only today: the graphics draw path
@@ -722,6 +726,7 @@ impl<'a> DrawState<'a> {
 /// resource/submission failure, [`GpuError::ShaderCompilationFailed`] on empty
 /// SPIR-V, [`GpuError::PipelineCreationFailed`] if the pipeline is rejected.
 pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, GpuError> {
+    dump_draw_state_resources(state);
     // Full pre-submit draw identity for device-loss forensics (XPS5X_NO_DEFER=1
     // makes each draw synchronous, so the LAST line here before a device-lost is
     // the faulting draw). Gated to keep the hot path quiet.
@@ -733,8 +738,8 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
             .flat_map(|t| t.textures.iter())
             .map(|u| {
                 format!(
-                    "T#{{base:{:#x} {}x{}x{} l{} cube{} rt:{:?} fmt:{:?}}}",
-                    u.guest_base, u.width, u.height, u.depth, u.layers, u.cube, u.render_target, u.format
+                    "T#{{base:{:#x} {}x{}x{} l{} cube{} rt:{:?} fmt:{:?} bytes:{}}}",
+                    u.guest_base, u.width, u.height, u.depth, u.layers, u.cube, u.render_target, u.format, u.pixels.len()
                 )
             })
             .collect();
@@ -748,7 +753,29 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
             .iter()
             .map(|b| format!("stride{} len{}", b.stride, b.bytes.len()))
             .collect();
-        let pcs: Vec<usize> = state.stage_bindings.iter().map(|s| s.push_constants.len()).collect();
+        let binds: Vec<String> = state
+            .stage_bindings
+            .iter()
+            .map(|s| {
+                let push_head = s
+                    .push_constants
+                    .chunks_exact(4)
+                    .take(16)
+                    .map(|w| u32::from_le_bytes(w.try_into().expect("four-byte chunk")))
+                    .map(|w| format!("{w:08x}"))
+                    .collect::<Vec<_>>();
+                let storage_lens = s
+                    .storage_buffers
+                    .as_ref()
+                    .map(|b| b.buffers.iter().map(Vec::len).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                format!(
+                    "{:?}:push{}={push_head:?}:sbuf={storage_lens:?}",
+                    s.stage,
+                    s.push_constants.len()
+                )
+            })
+            .collect();
         tracing::warn!(
             rt = format_args!("{}x{} {:?} base:{:?}", state.width, state.height, state.format, state.target_base),
             topo = format_args!("{:?}", state.topology),
@@ -758,7 +785,7 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
             indexed = state.index.is_some(),
             vs_words = state.vs_spirv.len(),
             fs_words = state.fs_spirv.len(),
-            push = format_args!("{pcs:?}"),
+            binds = format_args!("{binds:?}"),
             vbs = format_args!("{vbs:?}"),
             attrs = format_args!("{attrs:?}"),
             tex = format_args!("{tex:?}"),
@@ -835,6 +862,71 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
         dev.device_name()
     );
     Ok(DrawOutput { color, depth })
+}
+
+/// Dump one selected draw's fully translated host resources for offline
+/// replay. `XPS5X_DUMP_DRAW_TARGET` is the guest target base (hex, with or
+/// without `0x`) and `XPS5X_DUMP_DRAW_STATE` is a local output directory.
+/// This is deliberately generic: title bytes stay in the caller-selected,
+/// gitignored diagnostic directory and never become repository fixtures.
+fn dump_draw_state_resources(state: &DrawState) {
+    let (Ok(target), Ok(dir)) = (
+        std::env::var("XPS5X_DUMP_DRAW_TARGET"),
+        std::env::var("XPS5X_DUMP_DRAW_STATE"),
+    ) else {
+        return;
+    };
+    let target = target.strip_prefix("0x").unwrap_or(&target);
+    let Ok(target) = u64::from_str_radix(target, 16) else {
+        return;
+    };
+    if state.target_base != Some(target) || dir.is_empty() {
+        return;
+    }
+    let dir = std::path::Path::new(&dir);
+    let write = |name: String, bytes: &[u8]| {
+        let path = dir.join(name);
+        if let Err(error) = std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::write(&path, bytes))
+        {
+            debug!(%error, path = %path.display(), "translated draw resource dump failed");
+        }
+    };
+    write(
+        "vs.spv".to_owned(),
+        &state
+            .vs_spirv
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>(),
+    );
+    write(
+        "ps.spv".to_owned(),
+        &state
+            .fs_spirv
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>(),
+    );
+    for (index, buffer) in state.vertex_buffers.iter().enumerate() {
+        write(format!("vertex_{index}.bin"), &buffer.bytes);
+    }
+    for (stage_index, stage) in state.stage_bindings.iter().enumerate() {
+        write(format!("stage_{stage_index}_push.bin"), &stage.push_constants);
+        if let Some(storage) = &stage.storage_buffers {
+            for (index, buffer) in storage.buffers.iter().enumerate() {
+                write(format!("stage_{stage_index}_storage_{index}.bin"), buffer);
+            }
+        }
+        if let Some(textures) = &stage.textures {
+            for (index, texture) in textures.textures.iter().enumerate() {
+                write(
+                    format!("stage_{stage_index}_texture_{index}.bin"),
+                    &texture.pixels,
+                );
+            }
+        }
+    }
 }
 
 /// Deferred-readback (stage B) variant of [`render_draw`] for the title path.
@@ -2443,6 +2535,7 @@ impl<'a> Resources<'a> {
     }
 
     fn create_pipeline(&mut self, state: &DrawState) -> Result<(), GpuError> {
+        validate_graphics_interface(state)?;
         // Cached by SPIR-V content: the translate cache upstream already
         // dedups shaders, so repeated binds of one shader resolve to one
         // canonical VkShaderModule instead of a fresh module per draw.
@@ -3607,6 +3700,130 @@ impl<'a> Resources<'a> {
     }
 }
 
+/// Refuse translated stage pairs that are invalid Vulkan before they can be
+/// submitted. A bad guest shader must cost one draw, never the whole logical
+/// device. The location scan intentionally handles the direct interface
+/// variables emitted by both XPS5X and Kyty's current Gen5 recompiler.
+fn validate_graphics_interface(state: &DrawState) -> Result<(), GpuError> {
+    fn writes_point_size(words: &[u32]) -> bool {
+        let mut point_members = std::collections::HashSet::new();
+        let mut pointer_pointees = std::collections::HashMap::new();
+        let mut output_variables = std::collections::HashMap::new();
+        let mut constants = std::collections::HashMap::new();
+        let mut point_pointers = std::collections::HashSet::new();
+        let mut stores = std::collections::HashSet::new();
+        let mut at = 5;
+        while at < words.len() {
+            let header = words[at];
+            let len = (header >> 16) as usize;
+            let op = (header & 0xffff) as u16;
+            if len == 0 || at.saturating_add(len) > words.len() {
+                break;
+            }
+            let inst = &words[at..at + len];
+            match op {
+                // OpMemberDecorate %struct member BuiltIn PointSize.
+                72 if len >= 5 && inst[3] == 11 && inst[4] == 1 => {
+                    point_members.insert((inst[1], inst[2]));
+                }
+                // OpTypePointer %result Output %pointee.
+                32 if len >= 4 && inst[2] == 3 => {
+                    pointer_pointees.insert(inst[1], inst[3]);
+                }
+                // OpVariable %ptr_type %result Output.
+                59 if len >= 4 && inst[3] == 3 => {
+                    output_variables.insert(inst[2], inst[1]);
+                }
+                // OpConstant %type %result literal.
+                43 if len >= 4 => {
+                    constants.insert(inst[2], inst[3]);
+                }
+                // OpAccessChain / OpInBoundsAccessChain. The current Gen5
+                // translator accesses PointSize directly from outPerVertex.
+                65 | 66 if len >= 5 => {
+                    let base = inst[3];
+                    let Some(&pointer_type) = output_variables.get(&base) else {
+                        at += len;
+                        continue;
+                    };
+                    let Some(&pointee) = pointer_pointees.get(&pointer_type) else {
+                        at += len;
+                        continue;
+                    };
+                    let Some(&member) = constants.get(&inst[4]) else {
+                        at += len;
+                        continue;
+                    };
+                    if point_members.contains(&(pointee, member)) {
+                        point_pointers.insert(inst[2]);
+                    }
+                }
+                // OpStore %pointer %object.
+                62 if len >= 3 => {
+                    stores.insert(inst[1]);
+                }
+                _ => {}
+            }
+            at += len;
+        }
+        point_pointers.iter().any(|pointer| stores.contains(pointer))
+    }
+
+    if state.topology == vk::PrimitiveTopology::POINT_LIST
+        && !writes_point_size(state.vs_spirv)
+    {
+        return Err(GpuError::PipelineCreationFailed(
+            "point-list draw skipped: translated vertex shader does not write gl_PointSize"
+                .to_owned(),
+        ));
+    }
+
+    fn locations(words: &[u32], storage_class: u32) -> std::collections::BTreeSet<u32> {
+        let mut storage = std::collections::HashMap::new();
+        let mut decorated = Vec::new();
+        let mut at = 5;
+        while at < words.len() {
+            let header = words[at];
+            let len = (header >> 16) as usize;
+            let op = (header & 0xffff) as u16;
+            if len == 0 || at.saturating_add(len) > words.len() {
+                break;
+            }
+            let inst = &words[at..at + len];
+            match op {
+                // OpVariable: result type, result id, storage class.
+                59 if len >= 4 => {
+                    storage.insert(inst[2], inst[3]);
+                }
+                // OpDecorate %id Location N (Decoration::Location == 30).
+                71 if len >= 4 && inst[2] == 30 => decorated.push((inst[1], inst[3])),
+                _ => {}
+            }
+            at += len;
+        }
+        decorated
+            .into_iter()
+            .filter_map(|(id, location)| {
+                (storage.get(&id) == Some(&storage_class)).then_some(location)
+            })
+            .collect()
+    }
+
+    // SPIR-V StorageClass: Input=1, Output=3.
+    let vertex_outputs = locations(state.vs_spirv, 3);
+    let fragment_inputs = locations(state.fs_spirv, 1);
+    let missing = fragment_inputs
+        .difference(&vertex_outputs)
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(GpuError::PipelineCreationFailed(format!(
+            "fragment inputs {missing:?} have no matching vertex outputs"
+        )));
+    }
+    Ok(())
+}
+
 impl Drop for Resources<'_> {
     fn drop(&mut self) {
         let guest_vertex_buffers = mem::take(&mut self.guest_vertex_buffers);
@@ -3735,6 +3952,87 @@ impl Drop for Resources<'_> {
 mod tests {
     use super::super::shaders::TRIANGLE_COLOR;
     use super::*;
+
+    fn location_module(storage_class: u32, location: u32) -> Vec<u32> {
+        vec![
+            0x0723_0203,
+            0x0001_0000,
+            0,
+            100,
+            0,
+            (4 << 16) | 71, // OpDecorate %1 Location N
+            1,
+            30,
+            location,
+            (4 << 16) | 59, // OpVariable %type %1 StorageClass
+            99,
+            1,
+            storage_class,
+        ]
+    }
+
+    #[test]
+    fn graphics_interface_gate_rejects_missing_vertex_output() {
+        let vs = location_module(3, 0);
+        let fs = location_module(1, 1);
+        let state = DrawState::new(16, 16, &vs, &fs);
+        let error = validate_graphics_interface(&state).unwrap_err().to_string();
+        assert!(error.contains("fragment inputs [1]"), "{error}");
+    }
+
+    #[test]
+    fn graphics_interface_gate_accepts_matching_locations() {
+        let vs = location_module(3, 1);
+        let fs = location_module(1, 1);
+        let state = DrawState::new(16, 16, &vs, &fs);
+        validate_graphics_interface(&state).expect("matching stage interface is valid");
+    }
+
+    #[test]
+    fn graphics_interface_gate_rejects_unsafe_point_list() {
+        let vs = location_module(3, 0);
+        let fs = location_module(1, 0);
+        let mut state = DrawState::new(16, 16, &vs, &fs);
+        state.topology = vk::PrimitiveTopology::POINT_LIST;
+        let error = validate_graphics_interface(&state).unwrap_err().to_string();
+        assert!(error.contains("gl_PointSize"), "{error}");
+    }
+
+    #[test]
+    fn graphics_interface_gate_accepts_point_list_with_point_size_store() {
+        let mut vs = location_module(3, 0);
+        vs.extend_from_slice(&[
+            (5 << 16) | 72, // OpMemberDecorate %struct 1 BuiltIn PointSize
+            10,
+            1,
+            11,
+            1,
+            (4 << 16) | 32, // OpTypePointer %ptr Output %struct
+            20,
+            3,
+            10,
+            (4 << 16) | 59, // OpVariable %ptr %out Output
+            20,
+            30,
+            3,
+            (4 << 16) | 43, // OpConstant %uint %one 1
+            90,
+            40,
+            1,
+            (5 << 16) | 65, // OpAccessChain %ptr_float %point %out %one
+            91,
+            50,
+            30,
+            40,
+            (3 << 16) | 62, // OpStore %point %value
+            50,
+            60,
+        ]);
+        let fs = location_module(1, 0);
+        let mut state = DrawState::new(16, 16, &vs, &fs);
+        state.topology = vk::PrimitiveTopology::POINT_LIST;
+        validate_graphics_interface(&state).expect("PointSize store makes point-list valid");
+    }
 
     #[test]
     fn unorm8_maps_endpoints_exactly() {

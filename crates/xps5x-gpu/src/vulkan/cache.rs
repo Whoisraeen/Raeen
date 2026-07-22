@@ -664,11 +664,14 @@ impl DrawCaches {
         // Smallest free size class that fits. Don't hand a small request a
         // giant buffer (>= 8x) — that starves the big classes and bloats
         // descriptor ranges' backing for nothing.
-        let fitting = self
-            .host_pool_free
-            .range(size..)
-            .find(|(cap, list)| **cap < size.saturating_mul(8) && !list.is_empty())
-            .map(|(cap, _)| *cap);
+        let fitting = if std::env::var_os("XPS5X_NO_HOST_POOL").is_none() {
+            self.host_pool_free
+                .range(size..)
+                .find(|(cap, list)| **cap < size.saturating_mul(8) && !list.is_empty())
+                .map(|(cap, _)| *cap)
+        } else {
+            None
+        };
         if let Some(cap) = fitting {
             let list = self
                 .host_pool_free
@@ -708,7 +711,9 @@ impl DrawCaches {
             return;
         }
         if let Some(&capacity) = self.host_pool_capacity.get(&buffer.as_raw()) {
-            if self.host_pool_free_bytes + capacity <= HOST_POOL_FREE_CAP {
+            if std::env::var_os("XPS5X_NO_HOST_POOL").is_none()
+                && self.host_pool_free_bytes + capacity <= HOST_POOL_FREE_CAP
+            {
                 self.host_pool_free
                     .entry(capacity)
                     .or_default()

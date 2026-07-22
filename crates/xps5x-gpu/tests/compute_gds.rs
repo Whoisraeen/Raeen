@@ -220,6 +220,7 @@ fn gds_counter_persists_across_dispatches() {
         descriptor_set_slot: 0,
         push_constant_offset: 0,
         push_constants: Vec::new(),
+        push_uniform_binding: None,
         storage_buffers: Some(StorageBufferBinding {
             binding: 0,
             buffers: vec![vec![0u8; 4]],
@@ -270,6 +271,7 @@ fn sampled_texture_without_sampler_dispatches() {
         descriptor_set_slot: 0,
         push_constant_offset: 0,
         push_constants: Vec::new(),
+        push_uniform_binding: None,
         storage_buffers: Some(StorageBufferBinding {
             binding: 0,
             buffers: vec![vec![0u8; 4]],
@@ -338,6 +340,7 @@ fn default_nearest_sampler_binds_and_caches_across_dispatches() {
         descriptor_set_slot: 0,
         push_constant_offset: 0,
         push_constants: Vec::new(),
+        push_uniform_binding: None,
         storage_buffers: Some(StorageBufferBinding {
             binding: 0,
             buffers: vec![vec![0u8; 4]],

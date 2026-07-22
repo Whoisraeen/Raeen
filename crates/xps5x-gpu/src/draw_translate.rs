@@ -35,7 +35,9 @@ use kyty_graphics::run::{DrawError, DrawSink, IndexedDraw};
 use kyty_graphics::shader::resources::{
     ShaderBindResources, ShaderPixelInputInfo, ShaderTextureUsage, ShaderVertexInputInfo,
 };
-use kyty_graphics::shader::{spirv_get_embedded_ps, spirv_get_embedded_vs};
+use kyty_graphics::shader::{
+    shader_push_constant_spill_binding, spirv_get_embedded_ps, spirv_get_embedded_vs,
+};
 use kyty_graphics::spirv_asm;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1853,6 +1855,7 @@ fn prepare_stage_binding(
         descriptor_set_slot: bind.descriptor_set_slot,
         push_constant_offset: bind.push_constant_offset,
         push_constants,
+        push_uniform_binding: shader_push_constant_spill_binding(bind),
         storage_buffers: (storage_num != 0).then_some(StorageBufferBinding {
             binding: bind.storage_buffers.binding_index as u32,
             buffers: storage_bytes,

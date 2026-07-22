@@ -50,9 +50,10 @@ pub use resources::{
     ShaderVertexInputInfo,
 };
 pub use spirv::{
-    SampledClass, SampledDim, ShaderRecompileError, Spirv, SpirvType, SpirvValue,
-    sampled_key_ordinal, shader_detect_eud_raw_window, spirv_generate_source,
-    spirv_get_embedded_ps, spirv_get_embedded_vs,
+    PUSH_CONSTANT_SPILL_THRESHOLD, SampledClass, SampledDim, ShaderRecompileError, Spirv,
+    SpirvType, SpirvValue, sampled_key_ordinal, shader_detect_eud_raw_window,
+    shader_push_constant_spill_binding, spirv_generate_source, spirv_get_embedded_ps,
+    spirv_get_embedded_vs,
 };
 pub use types::{
     ShaderCode, ShaderConstant, ShaderControlFlowBlock, ShaderDebugPrintf, ShaderInstruction,

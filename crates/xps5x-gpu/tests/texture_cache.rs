@@ -146,6 +146,7 @@ fn draw_state<'a>(vs: &'a [u32], ps: &'a [u32], texture: TextureUpload) -> DrawS
             descriptor_set_slot: 0,
             push_constant_offset: 0,
             push_constants: vec![0u8; 8], // texture index 0, sampler index 0
+            push_uniform_binding: None,
             storage_buffers: None,
             textures: Some(TextureBinding {
                 sampled_binding: 0,

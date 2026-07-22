@@ -105,7 +105,19 @@ crates/
 
 ## Legal
 
-This project is developed through **clean-room reverse engineering**. It does not contain any proprietary Sony code, firmware, or SDK materials. Users must legally obtain their own PS5 firmware and game files.
+### Reverse Engineering & Copyright
+
+This project is developed through **clean-room reverse engineering** for the purpose of interoperability, consistent with established legal precedent (e.g., *Sony Computer Entertainment, Inc. v. Connectix Corp.*, 203 F.3d 596 (9th Cir. 2000)). XPS5X does not contain, link against, or distribute any proprietary Sony code, firmware, SDK materials, encryption keys, or copyrighted game content. Users must legally obtain their own PS5 firmware and game dumps from hardware they own.
+
+XPS5X is a research and preservation project. It is not a tool for piracy, and the maintainers do not condone or support the acquisition or distribution of copyrighted games, firmware, or system software by any means other than dumping them from your own console.
+
+### Trademark Notice
+
+"PlayStation", "PS5", "DualSense", and related marks and logos are registered trademarks of **Sony Interactive Entertainment LLC** and/or Sony Group Corporation. **XPS5X is an independent, community-developed project and is not affiliated with, sponsored by, endorsed by, or in any way officially connected to Sony Interactive Entertainment or Sony Group Corporation.**
+
+Any references to PlayStation hardware, system software, or file formats in this project — including the project name — are made solely for **nominative and descriptive purposes**: to identify the platform this software interoperates with. No PlayStation logos, fonts, symbols (△ ◯ ✕ □), or other brand assets are used in XPS5X's branding or user interface.
+
+All other trademarks and game titles referenced are the property of their respective owners.
 
 ## License
 

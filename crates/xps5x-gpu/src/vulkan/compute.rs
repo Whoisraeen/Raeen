@@ -113,6 +113,9 @@ struct ComputeResources<'a> {
     /// The raw EUD-window snapshot (SharpEmu port); per-dispatch, owned,
     /// never read back.
     eud_raw: Option<BufferAllocation>,
+    /// Oversized translated resource table, uploaded as a UBO instead of
+    /// exceeding the device's push-constant limit.
+    push_uniform: Option<BufferAllocation>,
     shader: vk::ShaderModule,
     descriptor_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
@@ -134,6 +137,7 @@ impl<'a> ComputeResources<'a> {
             samplers: Vec::new(),
             gds: vk::Buffer::null(),
             eud_raw: None,
+            push_uniform: None,
             shader: vk::ShaderModule::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
@@ -159,11 +163,13 @@ impl<'a> ComputeResources<'a> {
         let textures = state.binding.and_then(|b| b.textures.as_ref());
         let gds_binding = state.binding.and_then(|b| b.gds_binding);
         let eud_raw = state.binding.and_then(|b| b.eud_raw.as_ref());
+        let push_uniform_binding = state.binding.and_then(|b| b.push_uniform_binding);
         if storage.is_some()
             || storage_images.is_some()
             || textures.is_some()
             || gds_binding.is_some()
             || eud_raw.is_some()
+            || push_uniform_binding.is_some()
         {
             let binding = state.binding.expect("resource groups come from a binding");
             if binding.descriptor_set_slot != 0 {
@@ -298,6 +304,21 @@ impl<'a> ComputeResources<'a> {
                         .stage_flags(vk::ShaderStageFlags::COMPUTE),
                 );
             }
+            if let Some(uniform_binding) = push_uniform_binding {
+                if binding.push_constants.is_empty() {
+                    return Err(GpuError::PipelineCreationFailed(
+                        "push-uniform binding has an empty resource table".to_owned(),
+                    ));
+                }
+                self.push_uniform = Some(self.create_uniform_buffer(&binding.push_constants)?);
+                layout_bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(uniform_binding)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                );
+            }
 
             // Cached by binding signature, shared with the graphics path.
             self.descriptor_layout = self.caches.set_layout(self.dev, &layout_bindings)?;
@@ -312,6 +333,10 @@ impl<'a> ComputeResources<'a> {
                 (vk::DescriptorType::STORAGE_IMAGE, self.images.len() as u32),
                 (vk::DescriptorType::SAMPLED_IMAGE, self.sampled.len() as u32),
                 (vk::DescriptorType::SAMPLER, self.samplers.len() as u32),
+                (
+                    vk::DescriptorType::UNIFORM_BUFFER,
+                    u32::from(self.push_uniform.is_some()),
+                ),
             ]
             .into_iter()
             .filter(|&(_, count)| count != 0)
