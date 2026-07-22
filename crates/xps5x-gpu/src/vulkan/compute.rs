@@ -490,6 +490,27 @@ impl<'a> ComputeResources<'a> {
                         .buffer_info(&eud_raw_info),
                 );
             }
+            // The push-constant UBO: created above when the kernel declares a
+            // uniform binding, so `push_uniform_binding` being set implies
+            // `self.push_uniform` is populated (single-element info).
+            let push_uniform_info = self
+                .push_uniform
+                .as_ref()
+                .map(|allocation| {
+                    [vk::DescriptorBufferInfo::default()
+                        .buffer(allocation.buffer)
+                        .range(allocation.size as u64)]
+                })
+                .unwrap_or_default();
+            if let Some(uniform_binding) = push_uniform_binding {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.descriptor_set)
+                        .dst_binding(uniform_binding)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .buffer_info(&push_uniform_info),
+                );
+            }
             // SAFETY: descriptor set and every named buffer/view are live.
             unsafe { self.device().update_descriptor_sets(&writes, &[]) };
         }
@@ -620,6 +641,28 @@ impl<'a> ComputeResources<'a> {
         let (buffer, memory) = self.create_host_buffer(
             bytes.len(),
             vk::BufferUsageFlags::STORAGE_BUFFER,
+            Some(bytes),
+        )?;
+        Ok(BufferAllocation {
+            buffer,
+            memory,
+            size: bytes.len(),
+        })
+    }
+
+    /// Host-visible UBO holding the dispatch's push-constant block, for the
+    /// binding a recompiled kernel declares as a uniform buffer (rather than
+    /// spilling to an SSBO). Same host-coherent path as the storage buffer,
+    /// only the usage flag differs.
+    fn create_uniform_buffer(&self, bytes: &[u8]) -> Result<BufferAllocation, GpuError> {
+        if bytes.is_empty() {
+            return Err(GpuError::VulkanInitFailed(
+                "zero-sized compute uniform buffer".to_owned(),
+            ));
+        }
+        let (buffer, memory) = self.create_host_buffer(
+            bytes.len(),
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
             Some(bytes),
         )?;
         Ok(BufferAllocation {
@@ -1189,6 +1232,10 @@ impl Drop for ComputeResources<'_> {
                 self.device().free_memory(allocation.memory, None);
             }
             if let Some(allocation) = self.eud_raw.take() {
+                self.device().destroy_buffer(allocation.buffer, None);
+                self.device().free_memory(allocation.memory, None);
+            }
+            if let Some(allocation) = self.push_uniform.take() {
                 self.device().destroy_buffer(allocation.buffer, None);
                 self.device().free_memory(allocation.memory, None);
             }
