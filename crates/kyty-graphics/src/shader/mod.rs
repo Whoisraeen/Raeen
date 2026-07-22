@@ -59,7 +59,7 @@ pub use spirv::{
     spirv_get_embedded_vs,
 };
 pub use types::{
-    ShaderCode, ShaderConstant, ShaderControlFlowBlock, ShaderDebugPrintf, ShaderInstruction,
-    ShaderInstructionType, ShaderInstructionTypeFormat, ShaderLabel, ShaderOperand,
-    ShaderOperandType, ShaderType, shader_instruction_format,
+    DppCtrl, DppMode, ShaderCode, ShaderConstant, ShaderControlFlowBlock, ShaderDebugPrintf,
+    ShaderInstruction, ShaderInstructionType, ShaderInstructionTypeFormat, ShaderLabel,
+    ShaderOperand, ShaderOperandType, ShaderType, shader_instruction_format,
 };

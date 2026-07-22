@@ -2599,20 +2599,22 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   hero ambient zoom, bottom-bar auto-fade, switcher option drilling, search
   overlay, logo-lockup typography (segoeuib bold family).
 - ASTRO.BOT RDNA2 MUBUF boundary + scalar-resource shader blockers FIXED
-  (2026-07-22; working tree, no commit; kyty-graphics 398/398, raeen-gpu
+  (2026-07-22; working tree, no commit; kyty-graphics 399/399, raeen-gpu
   169/169 library tests):
-  * MUBUF is now kept at its public-ISA fixed 64-bit size in BOTH generation
-    attempts when SOFFSET is `0xff`; the all-ones PS5 form is normalized to
-    zero without consuming a SALU-style literal dword. The original next-gen-
-    only fix left the legacy fallback able to reproduce `branch target 0x1150`
-    inside `BufferStoreDword@0x1148` after a different next-gen failure.
+  * MUBUF is now kept at its public-ISA fixed 64-bit size when SOFFSET is
+    `0xff`; the measured all-ones PS5 form is normalized to zero without
+    consuming a SALU-style literal dword. That inferred meaning is scoped to
+    next-gen mode; legacy fallback rejects it instead of silently consuming the
+    following instruction or inheriting unmeasured PS5 semantics.
   * The remaining non-EUD `SLoadDwordx8` was not PC-relative: exact dump
     `cs_500757800_216.bin` starts `SInstPrefetch; VMovB32; VMovB32;
     SLoadDwordx8 s[16:23], s[12:13], 0`. Root cause was EUD selection order:
     the positional, readable s14:s15 candidate won before shader analysis even
-    inspected the explicit readable s12:s13 load base. Scalar-load evidence now
-    wins, snapshots the existing guest resource table at s12:s13, and feeds the
-    existing `bind.extended` runtime path; no descriptor bytes are invented.
+    inspected the explicit readable s12:s13 load base. Live-in scalar-load
+    evidence now wins, snapshots the existing guest resource table at s12:s13,
+    and feeds the existing `bind.extended` runtime path; bases written earlier
+    in-shader cannot beat the positional fallback, and no descriptor bytes are
+    invented.
   * Pixel shaders now run the same PC-relative embedded-constant capture already
     used by VS/CS, so `s_getpc_b64` + `s_load_dwordx8` tables do not fall through
     to the EUD-only path and refuse a valid non-EUD base.
@@ -2627,3 +2629,27 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
     entry-point abort in `compute_gds`; its deterministic 169-test library suite
     is green. Live ASTRO frame verification is still required before a visual-
     correctness claim.
+- ASTRO.BOT branch-boundary + type-8 RGBA32F UAV blockers FIXED (2026-07-22;
+  working tree, no commit; kyty-graphics 404/404 unit + 4 integration,
+  raeen-gpu 171/171 library tests):
+  * The MUBUF at `0x1148` was already the correct fixed 8 bytes. Its target at
+    `0x1150` is RDNA2 `s_waitcnt_vscnt` (SOPK opcode `0x17`); the parser
+    consumed it without recording an instruction, so the relooper mistook the
+    next emitted PC (`0x1154`) for the next boundary. It now emits a named
+    `SWaitcnt` boundary and a conservative device-scope SPIR-V memory barrier.
+    GFX10 `s_version` is separately decoded at SOPK opcode `1` as a metadata
+    no-op.
+  * Read-write T# type 8 is accepted only for its valid height-one shape and is
+    represented as a height-one 2D storage image, with its true 1D coordinate
+    lowered to `(x, 0)` rather than consuming an unrelated Y VGPR. Disabled
+    `image_store` channels are zero-filled, including alpha.
+    Unified format 77 now stays RGBA32F end-to-end: SPIR-V `Rgba32f`, Vulkan
+    `R32G32B32A32_SFLOAT`, and 16-byte seed/readback sizing.
+  * The active `raeen-gpu` shader cache now analyzes the live stage ABI before
+    positive lookup and keys translated modules on that binding identity. A
+    same-address shader rebound from format 71/Rgba16f to 77/Rgba32f therefore
+    cannot return stale SPIR-V or stale writeback metadata. Reduced parser and
+    full reloop/SPIR-V/Naga regressions cover the live branch sequence;
+    analysis, codegen, active-cache, Vulkan-format, and guest-memory tests cover
+    the measured 1x1 type-8/format-77 descriptor. Scoped clippy, rustfmt, and
+    diff checks are green. Live ASTRO frame verification remains required.

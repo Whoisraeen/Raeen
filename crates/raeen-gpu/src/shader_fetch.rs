@@ -14,13 +14,13 @@
 //!
 //! # Caching (positive and negative)
 //!
-//! Titles re-bind the same shaders every frame. Results are cached keyed by
-//! `(stage, guest_addr, first 16 code bytes)`; failures are cached too, so a
-//! shader the recompiler cannot handle logs **once** — with the failing
-//! instruction/reason — instead of 1600 times per run. The key deliberately
-//! ignores the input-info side (user SGPRs, buffer bindings): Kyty's full
-//! `ShaderId` covers those, and this coarser key is a documented Phase 2
-//! simplification.
+//! Titles re-bind the same shaders every frame. Code is first parsed/analyzed,
+//! then translated modules are cached by `(stage, guest_addr, full fetched
+//! window digest, analyzed stage ABI)`. The analyzed ABI includes descriptor
+//! types, exact formats, and embedded constants, so reusing one code address
+//! with different code or bindings cannot return stale SPIR-V. The cache is
+//! FIFO-bounded; analysis failures are never cached before binding identity is
+//! known.
 //!
 //! # Forensics
 //!
@@ -46,8 +46,10 @@ use kyty_graphics::shader::recompile::{
 use kyty_graphics::shader::resources::{
     ShaderComputeInputInfo, ShaderMappedData, ShaderPixelInputInfo, ShaderVertexInputInfo,
 };
+use kyty_graphics::shader::types::ShaderCode;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -56,6 +58,8 @@ use tracing::{debug, info, warn};
 const CHUNK_DWORDS: usize = 1024;
 /// Fetch cap: 256 KiB. A shader bigger than this is a mis-decode.
 const MAX_WINDOW_DWORDS: usize = 0x1_0000;
+/// Hard cap on translated modules and binding-aware failures.
+const MAX_CACHE_ENTRIES: usize = 256;
 /// `s_endpgm` — identical encoding on GCN and RDNA2 (SOPP op 1).
 const S_ENDPGM: u32 = 0xBF81_0000;
 
@@ -77,14 +81,36 @@ impl Stage {
     }
 }
 
-/// Cache key: stage + bind address + the first 16 bytes of code. The head
-/// bytes catch a title re-using an address for different code without
-/// hashing the (unknown-length) whole blob.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct CacheKey {
+/// Code identity after the bounded fetch/analyze loop. The digest covers the
+/// complete fetched window so a title rewriting bytes beyond the first four
+/// dwords cannot reuse stale SPIR-V.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+struct CodeKey {
     stage: Stage,
     addr: u64,
-    head: [u32; 4],
+    fetched_dwords: u32,
+    digest: u64,
+}
+
+impl CodeKey {
+    fn new(stage: Stage, addr: u64, fetched: &[u32]) -> Self {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        fetched.hash(&mut hasher);
+        Self {
+            stage,
+            addr,
+            fetched_dwords: u32::try_from(fetched.len()).unwrap_or(u32::MAX),
+            digest: hasher.finish(),
+        }
+    }
+}
+
+/// Active translated-module key: code identity plus the complete analyzed
+/// stage metadata that can shape SPIR-V or its host binding ABI.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CacheKey {
+    code: CodeKey,
+    binding: Box<str>,
 }
 
 /// A translated shader plus the stage resource ABI recovered during analysis.
@@ -101,22 +127,98 @@ pub struct TranslatedShader {
     pub cs_info: ShaderComputeInputInfo,
 }
 
+/// Parse/analysis result held just long enough to consult the binding-aware
+/// module cache before running the expensive SPIR-V recompiler.
+enum PreparedShader {
+    Vs {
+        code: ShaderCode,
+        info: Box<ShaderVertexInputInfo>,
+    },
+    Ps {
+        code: ShaderCode,
+        vs_info: Box<ShaderVertexInputInfo>,
+        info: Box<ShaderPixelInputInfo>,
+    },
+    Cs {
+        code: ShaderCode,
+        info: Box<ShaderComputeInputInfo>,
+    },
+}
+
+impl PreparedShader {
+    fn binding_identity(&self) -> Box<str> {
+        match self {
+            Self::Vs { info, .. } => format!("{info:?}").into_boxed_str(),
+            Self::Ps { vs_info, info, .. } => {
+                format!("vs={vs_info:?}; ps={info:?}").into_boxed_str()
+            }
+            Self::Cs { info, .. } => format!("{info:?}").into_boxed_str(),
+        }
+    }
+
+    fn recompile(&self) -> Result<Vec<u32>, AttemptError> {
+        match self {
+            Self::Vs { code, info } => {
+                let spirv = shader_recompile_vs(code, info)
+                    .map_err(|e| AttemptError::named(format!("shader_recompile_vs: {e}")))?;
+                Ok(spirv)
+            }
+            Self::Ps { code, info, .. } => {
+                let spirv = shader_recompile_ps(code, info)
+                    .map_err(|e| AttemptError::named(format!("shader_recompile_ps: {e}")))?;
+                Ok(spirv)
+            }
+            Self::Cs { code, info } => {
+                let spirv = shader_recompile_cs(code, info)
+                    .map_err(|e| AttemptError::named(format!("shader_recompile_cs: {e}")))?;
+                Ok(spirv)
+            }
+        }
+    }
+
+    /// Pair a cached module with this bind's freshly analyzed metadata. Cache
+    /// values deliberately contain no resource bases or writeback state.
+    fn into_translated(self, spirv: Arc<Vec<u32>>) -> TranslatedShader {
+        match self {
+            Self::Vs { info, .. } => TranslatedShader {
+                spirv,
+                vs_info: *info,
+                ps_info: ShaderPixelInputInfo::default(),
+                cs_info: ShaderComputeInputInfo::default(),
+            },
+            Self::Ps { vs_info, info, .. } => TranslatedShader {
+                spirv,
+                vs_info: *vs_info,
+                ps_info: *info,
+                cs_info: ShaderComputeInputInfo::default(),
+            },
+            Self::Cs { info, .. } => TranslatedShader {
+                spirv,
+                vs_info: ShaderVertexInputInfo::default(),
+                ps_info: ShaderPixelInputInfo::default(),
+                cs_info: *info,
+            },
+        }
+    }
+}
+
 /// Counters for the measurement report.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShaderCacheStats {
-    /// Distinct shaders fetched from guest memory (cache inserts).
+    /// Shader variants fetched for translation/analysis.
     pub distinct_fetched: u64,
     /// Distinct shaders that translated to SPIR-V.
     pub translated_ok: u64,
-    /// Distinct shaders whose translation failed (negative-cached).
+    /// Translation/analysis attempts that failed.
     pub translate_failed: u64,
-    /// Cache hits (either polarity) — re-binds that cost nothing.
+    /// Binding-aware module/error hits after fresh analysis.
     pub hits: u64,
 }
 
 /// Fetch + translate + cache for guest shader code.
 pub struct ShaderTranslateCache {
-    entries: HashMap<CacheKey, Result<TranslatedShader, Arc<str>>>,
+    entries: HashMap<CacheKey, Result<Arc<Vec<u32>>, Arc<str>>>,
+    insertion_order: VecDeque<CacheKey>,
     shader_map: ShaderMap,
     dump_dir: Option<PathBuf>,
     stats: ShaderCacheStats,
@@ -144,6 +246,7 @@ impl ShaderTranslateCache {
     pub fn with_dump_dir(dump_dir: Option<PathBuf>) -> Self {
         Self {
             entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
             shader_map: ShaderMap::new(),
             dump_dir,
             stats: ShaderCacheStats::default(),
@@ -159,9 +262,22 @@ impl ShaderTranslateCache {
     /// next-generation resource analysis.
     pub fn map_shader_metadata(&mut self, addr: u64, data: ShaderMappedData) {
         self.shader_map.map_user_data(addr, data);
-        // A shader may have been observed before its create call completed.
-        // Do not let that transient missing-metadata failure stay negative-cached.
-        self.entries.retain(|key, _| key.addr != addr);
+        // A create call can replace the analyzed ABI at this address. Remove
+        // prior binding-aware modules eagerly; analysis failures are not cached.
+        self.entries.retain(|key, _| key.code.addr != addr);
+        self.insertion_order.retain(|key| key.code.addr != addr);
+    }
+
+    fn insert_entry(&mut self, key: CacheKey, value: Result<Arc<Vec<u32>>, Arc<str>>) {
+        while self.entries.len() >= MAX_CACHE_ENTRIES {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                self.entries.clear();
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        self.insertion_order.push_back(key.clone());
+        self.entries.insert(key, value);
     }
 
     /// Fetch + translate the bound vertex-stage shader.
@@ -169,8 +285,8 @@ impl ShaderTranslateCache {
     /// # Errors
     ///
     /// A named reason (bad address, unreadable memory, parse/recompile
-    /// failure). Failures are negative-cached and warned **once** per
-    /// distinct shader.
+    /// failure). Post-analysis translation failures are binding-aware cached;
+    /// analysis failures are retried because descriptors/EUD can change.
     pub fn translate_vs(
         &mut self,
         vs: &VertexShaderInfo,
@@ -216,13 +332,9 @@ impl ShaderTranslateCache {
                     mem,
                     &mut vs_info.bind,
                 );
-                let spirv = shader_recompile_vs(&code, &vs_info)
-                    .map_err(|e| AttemptError::named(format!("shader_recompile_vs: {e}")))?;
-                Ok(TranslatedShader {
-                    spirv: Arc::new(spirv),
-                    vs_info,
-                    ps_info: ShaderPixelInputInfo::default(),
-                    cs_info: ShaderComputeInputInfo::default(),
+                Ok(PreparedShader::Vs {
+                    code,
+                    info: Box::new(vs_info),
                 })
             })
         })
@@ -272,13 +384,10 @@ impl ShaderTranslateCache {
                 // SharpEmu port (see `translate_cs`): default nearest/wrap S#
                 // for a PS that samples with zero captured samplers.
                 kyty_graphics::shader::shader_synthesize_default_sampler(&code, &mut ps_info.bind);
-                let spirv = shader_recompile_ps(&code, &ps_info)
-                    .map_err(|e| AttemptError::named(format!("shader_recompile_ps: {e}")))?;
-                Ok(TranslatedShader {
-                    spirv: Arc::new(spirv),
-                    vs_info,
-                    ps_info,
-                    cs_info: ShaderComputeInputInfo::default(),
+                Ok(PreparedShader::Ps {
+                    code,
+                    vs_info: Box::new(vs_info),
+                    info: Box::new(ps_info),
                 })
             })
         })
@@ -332,13 +441,9 @@ impl ShaderTranslateCache {
                     mem,
                     &mut cs_info.bind,
                 );
-                let spirv = shader_recompile_cs(&code, &cs_info)
-                    .map_err(|e| AttemptError::named(format!("shader_recompile_cs: {e}")))?;
-                Ok(TranslatedShader {
-                    spirv: Arc::new(spirv),
-                    vs_info: ShaderVertexInputInfo::default(),
-                    ps_info: ShaderPixelInputInfo::default(),
-                    cs_info,
+                Ok(PreparedShader::Cs {
+                    code,
+                    info: Box::new(cs_info),
                 })
             })
         })
@@ -349,7 +454,7 @@ impl ShaderTranslateCache {
         &mut self,
         stage: Stage,
         addr: u64,
-        run: impl Fn(&WindowMem) -> Result<TranslatedShader, AttemptError>,
+        run: impl Fn(&WindowMem) -> Result<PreparedShader, AttemptError>,
     ) -> Result<TranslatedShader, Arc<str>> {
         if addr == 0 || !addr.is_multiple_of(4) {
             // Unkeyable (no head bytes to read) — not cached, but the command
@@ -365,26 +470,18 @@ impl ShaderTranslateCache {
                 stage.as_str()
             )));
         };
-        let key = CacheKey {
-            stage,
-            addr,
-            head: [head[0], head[1], head[2], head[3]],
-        };
-        if let Some(cached) = self.entries.get(&key) {
-            self.stats.hits += 1;
-            return cached.clone();
-        }
-
-        // Distinct shader: fetch the window, dump it, translate it.
+        // Analyze on every bind before the positive-cache lookup. Descriptor
+        // type/format and embedded metadata can change while code bytes stay
+        // identical, and those fields shape generated SPIR-V.
         let mut window = WindowMem {
             base: addr,
             data: head,
         };
         let mut want = CHUNK_DWORDS;
-        let result = loop {
+        let prepared = loop {
             let grew = window.grow_to(want);
             match run(&window) {
-                Ok(t) => break Ok(t),
+                Ok(prepared) => break Ok(prepared),
                 Err(e) if e.truncated && grew && want < MAX_WINDOW_DWORDS => {
                     // The parser ran off the end and more guest memory may
                     // exist — read another bounded slice and retry.
@@ -394,21 +491,58 @@ impl ShaderTranslateCache {
             }
         };
 
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                self.stats.distinct_fetched += 1;
+                self.stats.translate_failed += 1;
+                self.dump_shader(stage, addr, &window.data);
+                let reason: Arc<str> = Arc::from(format!(
+                    "{} shader at {addr:#x} ({} bytes fetched): {}",
+                    stage.as_str(),
+                    window.data.len() * 4,
+                    e.msg
+                ));
+                warn!(
+                    stage = stage.as_str(),
+                    addr = format_args!("{addr:#x}"),
+                    reason = %reason,
+                    "guest shader analysis failed — draws binding it will be skipped"
+                );
+                return Err(reason);
+            }
+        };
+
+        let code_key = CodeKey::new(stage, addr, &window.data);
+        let key = CacheKey {
+            code: code_key,
+            binding: prepared.binding_identity(),
+        };
+        if let Some(cached) = self.entries.get(&key).cloned() {
+            self.stats.hits += 1;
+            return match cached {
+                Ok(spirv) => Ok(prepared.into_translated(spirv)),
+                Err(reason) => Err(reason),
+            };
+        }
+
         self.stats.distinct_fetched += 1;
         self.dump_shader(stage, addr, &window.data);
+
+        let result = prepared.recompile();
 
         // Validity gate: an invalid module passes vkCreateShaderModule but
         // dispatching it is UB (measured: AMD driver access violation that
         // kills the process). Refuse it here so it becomes a named, cached
         // translate failure instead of ever reaching the driver.
         let result = match result {
-            Ok(t) if crate::spirv_gate::gate_enabled() => {
-                match crate::spirv_gate::validate_spirv(&t.spirv) {
-                    Ok(()) => Ok(t),
+            Ok(spirv) if crate::spirv_gate::gate_enabled() => {
+                match crate::spirv_gate::validate_spirv(&spirv) {
+                    Ok(()) => Ok(spirv),
                     Err(reason) => Err(AttemptError {
                         msg: format!(
                             "translated ({} SPIR-V words) but the module is invalid — {reason}",
-                            t.spirv.len()
+                            spirv.len()
                         ),
                         truncated: false,
                     }),
@@ -418,17 +552,18 @@ impl ShaderTranslateCache {
         };
 
         match result {
-            Ok(t) => {
+            Ok(spirv) => {
                 self.stats.translated_ok += 1;
+                let spirv = Arc::new(spirv);
                 info!(
                     stage = stage.as_str(),
                     addr = format_args!("{addr:#x}"),
-                    spirv_words = t.spirv.len(),
+                    spirv_words = spirv.len(),
                     "guest shader fetched and translated to SPIR-V"
                 );
-                self.dump_spirv(stage, addr, &t.spirv);
-                self.entries.insert(key, Ok(t.clone()));
-                Ok(t)
+                self.dump_spirv(stage, addr, &spirv);
+                self.insert_entry(key, Ok(spirv.clone()));
+                Ok(prepared.into_translated(spirv))
             }
             Err(e) => {
                 self.stats.translate_failed += 1;
@@ -446,7 +581,7 @@ impl ShaderTranslateCache {
                     reason = %reason,
                     "guest shader translation failed — draws binding it will be skipped"
                 );
-                self.entries.insert(key, Err(reason.clone()));
+                self.insert_entry(key, Err(reason.clone()));
                 Err(reason)
             }
         }
@@ -852,11 +987,51 @@ mod tests {
         );
     }
 
-    /// Garbage bytes fail with a named reason, are negative-cached (one
-    /// translation attempt, then hits), and never panic.
     #[test]
-    fn garbage_shader_negative_caches_with_named_reason() {
-        // 0xFFFF_FFFF decodes as an unknown encoding immediately; no endpgm.
+    fn active_cache_distinguishes_storage_formats_71_and_77() {
+        let prepared = |format: u32| {
+            let mut info = ShaderComputeInputInfo::default();
+            info.bind.textures2d.textures_num = 1;
+            info.bind.textures2d.textures2d_storage_num = 1;
+            info.bind.textures2d.desc[0].textures2d_without_sampler = true;
+            info.bind.textures2d.desc[0].texture.fields[1] |= format << 20;
+            info.bind.textures2d.desc[0].texture.fields[3] |= 8 << 28;
+            PreparedShader::Cs {
+                code: ShaderCode::new(),
+                info: Box::new(info),
+            }
+        };
+        let code = CodeKey {
+            stage: Stage::Cs,
+            addr: 0x5000,
+            fetched_dwords: 4,
+            digest: 0x1234,
+        };
+        let key71 = CacheKey {
+            code,
+            binding: prepared(71).binding_identity(),
+        };
+        let key77 = CacheKey {
+            code,
+            binding: prepared(77).binding_identity(),
+        };
+        assert_ne!(key71, key77, "Rgba16f and Rgba32f modules cannot alias");
+
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        cache.insert_entry(key71, Err(Arc::from("sentinel format-71 cache entry")));
+        assert!(
+            !cache.entries.contains_key(&key77),
+            "the active module cache must miss when only the T# format changes"
+        );
+    }
+
+    /// Garbage bytes fail with a named reason and never panic or poison a
+    /// pre-binding cache.
+    #[test]
+    fn analysis_failures_are_not_cached_before_binding_identity() {
+        // 0xFFFF_FFFF decodes as an unknown encoding immediately. The legacy
+        // fallback can also fail in header analysis, so the combined failure
+        // is intentionally retried instead of poisoning a code-only cache.
         let garbage: Vec<u32> = vec![0xFFFF_FFFF; 64];
         let addr = garbage.as_ptr() as u64;
         let mut cache = ShaderTranslateCache::with_dump_dir(None);
@@ -888,10 +1063,62 @@ mod tests {
                 let s = cache.stats();
                 assert_eq!(
                     (s.distinct_fetched, s.translate_failed, s.hits),
-                    (1, 1, 1),
-                    "the second bind must be a negative-cache hit, not a re-translation"
+                    (2, 2, 0),
+                    "pre-binding analysis failures must be retried"
                 );
             },
+        );
+    }
+
+    #[test]
+    fn cache_key_hashes_the_fetched_tail_not_just_the_head() {
+        let mut blob = build_blob(VS_BODY, 0xAAAA_00F1, 0xBBBB_00F1);
+        let addr = blob.as_ptr() as u64;
+        let byte_len = std::mem::size_of_val(blob.as_slice());
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        let sh_regs = ShaderRegisters::default();
+
+        crate::guest_mem::with_test_ranges(&[(addr, byte_len)], || {
+            let first = cache
+                .translate_vs(&vs_regs_at(addr), &sh_regs)
+                .expect("initial fixture VS");
+            blob[CHUNK_DWORDS - 1] = 0xCAFE_BABE;
+            let second = cache
+                .translate_vs(&vs_regs_at(addr), &sh_regs)
+                .expect("tail-mutated fixture VS");
+            assert!(
+                !Arc::ptr_eq(&first.spirv, &second.spirv),
+                "a fetched-tail rewrite must miss the module cache"
+            );
+            let stats = cache.stats();
+            assert_eq!(
+                (stats.distinct_fetched, stats.translated_ok, stats.hits),
+                (2, 2, 0)
+            );
+        });
+    }
+
+    #[test]
+    fn active_module_cache_is_fifo_bounded() {
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        let key = |i: usize| CacheKey {
+            code: CodeKey {
+                stage: Stage::Cs,
+                addr: 0x1000 + i as u64 * 4,
+                fetched_dwords: 4,
+                digest: i as u64,
+            },
+            binding: format!("binding-{i}").into_boxed_str(),
+        };
+        for i in 0..=MAX_CACHE_ENTRIES {
+            cache.insert_entry(key(i), Ok(Arc::new(vec![i as u32])));
+        }
+        assert_eq!(cache.entries.len(), MAX_CACHE_ENTRIES);
+        assert_eq!(cache.insertion_order.len(), MAX_CACHE_ENTRIES);
+        assert!(!cache.entries.contains_key(&key(0)), "oldest entry evicted");
+        assert!(
+            cache.entries.contains_key(&key(MAX_CACHE_ENTRIES)),
+            "newest entry retained"
         );
     }
 

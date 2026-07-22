@@ -293,6 +293,47 @@ fn full_chain_ps_gcn_bytes_to_validated_spirv() {
     assert_entry_point(&module, naga::ShaderStage::Fragment, "full-chain ps");
 }
 
+/// A DPP (Data-Parallel Primitives / cross-lane) instruction inside a real
+/// binary-info blob must parse through the full analysis-driven path, not just
+/// the bare `shader_parse`. Before DPP decode, the `0xfa` src0 marker was
+/// handed to `operand_parse` and failed the whole shader ("unknown operand:
+/// 250") -- which, mid-stream, also desynced every later instruction boundary.
+/// This body is `VS_BODY` with its `v_mul_f32` swapped for a two-dword
+/// `v_add_f32 v2, v0 <dpp16>, v1`; parse must reach `s_endpgm` and carry the
+/// decoded DPP control on src0.
+#[test]
+fn dpp_instruction_parses_through_full_chain() {
+    const DPP_VS_BODY: &[u32] = &[
+        0x7E00_02FF,
+        0x3F80_0000, // v_mov_b32 v0, 1.0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x0604_02FA,
+        0xFF00_E400, // v_add_f32 v2, v0 quad_perm:[0,1,2,3], v1  (DPP16)
+        0xF800_08CF,
+        0x0302_0100, // exp pos0 v0..v3 done
+        0xF800_020F,
+        0x0302_0100, // exp param0 v0..v3
+        S_ENDPGM,
+    ];
+    let mem = TestMem {
+        regions: vec![(
+            VS_ADDR,
+            build_shader_blob(DPP_VS_BODY, &[], 0x90C9_5E2D, 0xBBBB_00DD),
+        )],
+    };
+    let code = shader_parse_vs(&vs_regs(), &sh_regs(), &mem, false).expect("shader_parse_vs (DPP)");
+    let dpp = code
+        .get_instructions()
+        .iter()
+        .find(|i| i.src[0].dpp.is_some())
+        .expect("the DPP add survived analysis-driven parse");
+    assert_eq!(
+        (dpp.src[0].type_, dpp.src[0].register_id),
+        (kyty_graphics::shader::ShaderOperandType::Vgpr, 0),
+        "real src0 (v0) recovered from the DPP control dword's low byte"
+    );
+}
+
 /// A shader blob with no `0xBEEB03FF` trailer must fail in analysis with a
 /// named error rather than producing a bogus module -- the boundary is
 /// reported, not papered over.

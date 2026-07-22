@@ -1102,6 +1102,30 @@ fn check_read_only_texture_type(
     )))
 }
 
+/// Gate for read-write storage-image T# types supported end-to-end. Type 8
+/// is a 1D image; the Vulkan/SPIR-V path represents it as a height-1 2D image,
+/// matching the already-supported sampled-image path. Type 9 is native 2D and
+/// type 10 is a 3D volume.
+fn check_read_write_texture_type(
+    t: &super::resources::ShaderTextureResource,
+    source: &str,
+) -> Result<(), ShaderAnalysisError> {
+    if (t.type_() == 8 && t.height5() == 0) || matches!(t.type_(), 9 | 10) {
+        return Ok(());
+    }
+    Err(ni_owned(format!(
+        "read-write ({source}) texture type {} is not height-1 1D (8), Texture2D (9) or 3D (10) \
+         (11=Cube 12=1DArray 13=2DArray; base={:#x} {}x{} depth={} format={} tile={})",
+        t.type_(),
+        t.base40(),
+        u32::from(t.width5()) + 1,
+        u32::from(t.height5()) + 1,
+        u32::from(t.depth()) + 1,
+        t.format(),
+        t.tile_mode(),
+    )))
+}
+
 /// Kyty: Shader.cpp `ShaderGetDirectSgpr` (L1301).
 pub fn shader_get_direct_sgpr(
     info: &mut ShaderDirectSgprsResources,
@@ -1454,12 +1478,10 @@ pub fn shader_parse_usage(
                     )?;
                     info.textures2d_readwrite += 1;
                     let last = (bind.textures2d.textures_num - 1) as usize;
-                    let ty = bind.textures2d.desc[last].texture.type_();
-                    // 9 = Texture2D; 10 = 3D volume (same storage-image
-                    // machinery as the table-1 walk — see there).
-                    if ty != 9 && ty != 10 {
-                        return Err(ni("read-write texture type != 9/10 (Texture2D/3D)"));
-                    }
+                    check_read_write_texture_type(
+                        &bind.textures2d.desc[last].texture,
+                        "usage 0x04",
+                    )?;
                 }
             }
 
@@ -1732,18 +1754,7 @@ pub fn shader_capture_eud_image_descriptors(
                         let last = (bind.textures2d.textures_num - 1) as usize;
                         let t = &bind.textures2d.desc[last].texture;
                         if want_storage {
-                            // Same gate as the declared table-1 walk: the
-                            // storage-image machinery covers 2D + 3D only.
-                            if t.type_() != 9 && t.type_() != 10 {
-                                return Err(ni_owned(format!(
-                                    "read-write (raw-EUD) texture type {} is not Texture2D (9) \
-                                     or 3D (10) (base={:#x} format={} tile={})",
-                                    t.type_(),
-                                    t.base40(),
-                                    t.format(),
-                                    t.tile_mode(),
-                                )));
-                            }
+                            check_read_write_texture_type(t, "raw-EUD")?;
                         } else {
                             check_read_only_texture_type(t)?;
                         }
@@ -2167,27 +2178,12 @@ pub fn shader_parse_usage2(
             extended_buffer,
         )?;
         info.textures2d_readwrite += 1;
-        // The storage-image (UAV) machinery covers 2D (type 9) and — round
-        // 7, 58 measured ASTRO.BOT CS dispatches — 3D volumes (type 10,
-        // measured 240x135x64 format 71): `%textures2D_L` is dim- and
-        // format-parametric and the compute path uploads/writes back the
-        // whole volume linearly. Other RW image types stay a named refusal
-        // with the full descriptor evidence.
+        // The storage-image machinery covers height-1 1D (type 8), native 2D
+        // (9), and 3D volumes (10). The compute path uploads and writes back
+        // their complete linear texels.
         let last = (bind.textures2d.textures_num - 1) as usize;
         let t = &bind.textures2d.desc[last].texture;
-        if t.type_() != 9 && t.type_() != 10 {
-            return Err(ni_owned(format!(
-                "read-write (table 1) texture type {} is not Texture2D (9) or 3D (10) \
-                 (11=Cube 12=1DArray 13=2DArray; base={:#x} {}x{} depth={} format={} tile={})",
-                t.type_(),
-                t.base40(),
-                u32::from(t.width5()) + 1,
-                u32::from(t.height5()) + 1,
-                u32::from(t.depth()) + 1,
-                t.format(),
-                t.tile_mode(),
-            )));
-        }
+        check_read_write_texture_type(t, "table 1")?;
     }
 
     for (slot, sharp) in user_data.sharp_resource_offset[2].iter().enumerate() {
@@ -3256,8 +3252,8 @@ pub fn shader_get_input_info_cs(
 /// DELIBERATE deviation from that contents-blind rule, one T# field pair:
 /// the generated SPIR-V depends on each texture descriptor's `type_()`
 /// nibble (it picks the per-Dim sampled array/coordinate arity and the
-/// storage image Dim) and on the storage `format() == 71` discriminator
-/// (`Rgba16f` vs `Rgba8` storage image format). Two binds identical except
+/// storage image Dim) and on `format()` (the storage format selects Rgba8,
+/// Rgba16f, or Rgba32f; sampled formats select numeric class). Two binds identical except
 /// there produce DIFFERENT modules, so they must not share one cache id —
 /// with the upstream id they silently aliased (wrong-Dim sampling from a
 /// cached module). Every other descriptor-content field stays out of the id,
@@ -3280,11 +3276,11 @@ fn shader_get_bind_ids(ret: &mut ShaderId, bind: &ShaderBindResources) {
         ret.ids.push(u32::from(bind.textures2d.desc[i].extended));
         ret.ids.push(bind.textures2d.desc[i].usage as u32);
         // Codegen inputs (see the fn doc): the Dim-selecting type nibble and
-        // the storage format-71 discriminator.
+        // the exact unified format used by storage/sample image codegen.
         ret.ids
             .push(u32::from(bind.textures2d.desc[i].texture.type_()));
         ret.ids
-            .push(u32::from(bind.textures2d.desc[i].texture.format() == 71));
+            .push(u32::from(bind.textures2d.desc[i].texture.format()));
     }
 
     ret.ids.push(bind.samplers.samplers_num as u32);
@@ -3674,7 +3670,7 @@ mod tests {
 
     /// The shader-cache id must key on the two T# content fields codegen
     /// depends on — the Dim-selecting `type_()` nibble and the storage
-    /// format-71 discriminator — or a 2D-bound and a 3D-bound dispatch of the
+    /// unified storage format — or a 2D-bound and a 3D-bound dispatch of the
     /// same ISA silently share one translated module (wrong-Dim sampling).
     /// Everything else about the binds below is identical.
     #[test]
@@ -3707,6 +3703,14 @@ mod tests {
             ids_of(&base),
             ids_of(&hdr),
             "format-71 discriminator must change the bind id"
+        );
+
+        let mut rgba32f = base;
+        rgba32f.textures2d.desc[0].texture.fields[1] |= 77 << 20;
+        assert_ne!(
+            ids_of(&hdr),
+            ids_of(&rgba32f),
+            "format 77/Rgba32f must not alias format 71/Rgba16f"
         );
 
         // Sanity: an untouched copy still shares the id.
@@ -4789,6 +4793,43 @@ mod tests {
         assert_eq!(bind.textures2d.textures_num, 1);
         assert_eq!(bind.textures2d.textures2d_storage_num, 1);
         assert!(bind.textures2d.desc[0].textures2d_without_sampler);
+    }
+
+    #[test]
+    fn parse_usage2_table1_accepts_type8_rgba32f_storage_image() {
+        // Live ASTRO.BOT descriptor: a read-write table-1 type-8 (1D) T#,
+        // 1x1, unified format 77 (32_32_32_32 FLOAT). The existing image
+        // pipeline represents type 8 as a height-1 2D image; analysis must
+        // admit the same shape for UAVs without losing its 16-byte texels.
+        let user_sgpr = UserSgprInfo {
+            value: {
+                let mut v = [0u32; UserSgprInfo::SGPRS_MAX];
+                v[1] = 77 << 20;
+                v[3] = 8 << 28;
+                v
+            },
+            type_: [UserSgprType::Vsharp; UserSgprInfo::SGPRS_MAX],
+            count: 8,
+        };
+        let user_data = ShaderUserData {
+            direct_resource_offset: vec![0xffff; 8],
+            sharp_resource_offset: [vec![], vec![ShaderSharp::new(0, 0)], vec![], vec![]],
+            eud_size_dw: 0,
+            srt_size_dw: 0,
+        };
+        let mut info = ShaderParsedUsage::default();
+        let mut bind = ShaderBindResources::default();
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 8, None)
+            .expect("type-8 RGBA32F UAV accepted");
+        assert_eq!(info.textures2d_readwrite, 1);
+        assert_eq!(bind.textures2d.desc[0].texture.type_(), 8);
+        assert_eq!(bind.textures2d.desc[0].texture.format(), 77);
+
+        let mut malformed = bind.textures2d.desc[0].texture;
+        malformed.fields[2] |= 1 << 14; // height5=1 => two rows, invalid 1D
+        let err = check_read_write_texture_type(&malformed, "test")
+            .expect_err("type-8 UAVs wider than one row stay refused");
+        assert!(format!("{err}").contains("height-1 1D"), "{err}");
     }
 
     #[test]

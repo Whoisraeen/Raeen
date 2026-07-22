@@ -2306,10 +2306,11 @@ pub(crate) fn sampled_key_layout(bind: &ShaderBindResources) -> Vec<SampledArray
 
 /// The single `OpTypeImage` (Dim, storage format) of the STORAGE
 /// (read-write) image array (`%textures2D_L`), decided from the measured RW
-/// T#s: type 9 = 2D, type 10 = 3D (ASTRO.BOT: 240x135x64 UAV volumes);
-/// guest format 71 (16_16_16_16 FLOAT) = `Rgba16f`, everything else keeps
-/// the legacy `Rgba8` view (the 32-bpp guest formats the upload path reads,
-/// or the zero-filled seed). Mixed dims/formats stay a named refusal — one
+/// T#s: type 8 = height-1 2D, type 9 = 2D, type 10 = 3D (ASTRO.BOT:
+/// 240x135x64 UAV volumes); guest format 71 (16_16_16_16 FLOAT) = `Rgba16f`,
+/// format 77 (32_32_32_32 FLOAT) = `Rgba32f`, everything else keeps the
+/// legacy `Rgba8` view (the 32-bpp guest formats the upload path reads, or
+/// the zero-filled seed). Mixed dims/formats stay a named refusal — one
 /// SPIR-V array type carries exactly one `OpTypeImage`.
 pub(crate) fn storage_texture_dim_format(
     bind: &ShaderBindResources,
@@ -2326,10 +2327,10 @@ pub(crate) fn storage_texture_dim_format(
             10 => SampledDim::Three,
             _ => SampledDim::Two,
         };
-        let format = if d.texture.format() == 71 {
-            "Rgba16f"
-        } else {
-            "Rgba8"
+        let format = match d.texture.format() {
+            71 => "Rgba16f",
+            77 => "Rgba32f",
+            _ => "Rgba8",
         };
         match chosen {
             None => chosen = Some((dim, format)),
@@ -2370,6 +2371,12 @@ pub(crate) fn operand_load_int(
     index: &str,
     load: &mut String,
 ) -> Result<bool, ShaderRecompileError> {
+    if op.dpp.is_some() {
+        return Err(not_supported(
+            "operand_load_int",
+            "dpp cross-lane selection",
+        ));
+    }
     if op.negate || op.absolute {
         return Err(not_supported(
             "operand_load_int",
@@ -2450,6 +2457,12 @@ pub(crate) fn operand_load_uint(
     load: &mut String,
     shift: i32,
 ) -> Result<bool, ShaderRecompileError> {
+    if op.dpp.is_some() {
+        return Err(not_supported(
+            "operand_load_uint",
+            "dpp cross-lane selection",
+        ));
+    }
     if op.negate || op.absolute {
         return Err(not_supported(
             "operand_load_uint",
@@ -2569,6 +2582,12 @@ pub(crate) fn operand_load_float(
 ) -> Result<bool, ShaderRecompileError> {
     let mut l: String;
 
+    if op.dpp.is_some() {
+        return Err(not_supported(
+            "operand_load_float",
+            "dpp cross-lane selection",
+        ));
+    }
     if op.lane_sel != 6 && operand_is_constant(op) {
         return Err(not_supported(
             "operand_load_float",
@@ -4854,6 +4873,7 @@ impl<'a> Spirv<'a> {
             self.add_constant_uint(64);
             self.add_constant_uint(72);
             self.add_constant_uint(127);
+            self.add_constant_uint(0x0b48);
             self.add_constant_uint(0x3fff);
             self.add_constant_uint(0x0000_ffff);
             self.add_constant_uint(0x00ff_ffff);
@@ -5322,6 +5342,36 @@ mod tests {
             "{load}"
         );
         assert!(load.contains("%t0_3 = OpFNegate %float %abs_3"), "{load}");
+    }
+
+    /// A DPP operand reads its value from *another lane* of the wavefront. The
+    /// recompiler has no wave-level model, so loading one silently as the local
+    /// lane would emit arithmetically wrong SPIR-V (a cross-lane reduction is
+    /// not the local operand). The parser decodes DPP so shader boundaries stay
+    /// in sync; the loaders must then refuse it by name rather than mis-compile.
+    #[test]
+    fn operand_load_refuses_dpp_cross_lane() {
+        use crate::shader::types::{DppCtrl, DppMode};
+        let spirv = Spirv::new();
+        let mut op = vgpr(1);
+        op.dpp = Some(DppCtrl {
+            mode: DppMode::Dpp16 { ctrl: 0x111 },
+            row_mask: 0xf,
+            bank_mask: 0xf,
+            bound_ctrl: false,
+            fetch_inactive: false,
+        });
+        let mut load = String::new();
+        for r in [
+            operand_load_float(&spirv, op, "t0_3", "3", &mut load),
+            operand_load_int(&spirv, op, "t0_3", "3", &mut load),
+            operand_load_uint(&spirv, op, "t0_3", "3", &mut load, -1),
+        ] {
+            assert!(
+                matches!(r, Err(ShaderRecompileError::NotSupported { .. })),
+                "DPP operand must be a named refusal, got {r:?}"
+            );
+        }
     }
 
     #[test]

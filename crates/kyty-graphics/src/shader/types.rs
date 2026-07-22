@@ -218,6 +218,8 @@ pub enum ShaderInstructionType {
     /// SOP2 0x32: pack the low 16 bits of each source into one dword.
     SPackLlB32B16,
     SSendmsg,
+    /// RDNA2 SOPK opcode 1: code-object version marker; no execution effect.
+    SVersion,
     SSetpcB64,
     SSwappcB64,
     SSubI32,
@@ -740,6 +742,35 @@ impl std::fmt::Debug for ShaderConstant {
     }
 }
 
+/// Beyond Kyty: the cross-lane pattern of a DPP (Data-Parallel Primitives)
+/// source. Two hardware sub-forms, distinguished by the VOP `src0` marker:
+/// `0xfa` (DPP16) and `0xe9`/`0xea` (DPP8/DPP8FI). shadPS4's `struct Dpp` /
+/// `DppCtrl` (GPL-2.0) were studied, not copied.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DppMode {
+    /// DPP16: a 9-bit `dpp_ctrl` selects the cross-lane pattern within each row
+    /// of 16 lanes (`quad_perm` 0x000-0x0ff, `row_shl` 0x101-0x10f, `row_shr`
+    /// 0x111-0x11f, `row_ror` 0x121-0x12f, `row_mirror` 0x140, `row_half_mirror`
+    /// 0x141). The raw control is kept; interpretation is the recompiler's job.
+    Dpp16 { ctrl: u16 },
+    /// DPP8: eight independent 3-bit lane selects, one per lane in each group of
+    /// eight (`lane_sel[i]` is the source lane for output lane `i`).
+    Dpp8 { lane_sel: [u8; 8] },
+}
+
+/// Beyond Kyty: decoded DPP control carried on a `ShaderOperand` (`src0` only —
+/// DPP is legal only as src0). Row/bank masks and `bound_ctrl` apply to DPP16;
+/// they stay zero/false for DPP8. `fetch_inactive` is DPP16's `fi` bit or the
+/// DPP8FI marker (`0xea`). See [`DppMode`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DppCtrl {
+    pub mode: DppMode,
+    pub row_mask: u8,
+    pub bank_mask: u8,
+    pub bound_ctrl: bool,
+    pub fetch_inactive: bool,
+}
+
 /// Kyty: Shader.h `ShaderOperand` (L392).
 #[derive(Copy, Clone, Debug)]
 pub struct ShaderOperand {
@@ -758,6 +789,13 @@ pub struct ShaderOperand {
     /// before the operation consumes it. Measured on ASTRO.BOT scene compute
     /// (vopc src1_sel and vop1 src0_sel).
     pub lane_sel: u8,
+    /// Beyond Kyty: DPP (Data-Parallel Primitives) cross-lane control, present
+    /// only on a DPP-form src0 (VOP1/VOP2/VOPC `src0 == 0xfa`/`0xe9`/`0xea`).
+    /// `None` is the ordinary same-lane operand. The parser decodes it so the
+    /// instruction is the correct two dwords and shader boundaries stay in
+    /// sync; the recompiler refuses it by name (no wave-level model yet). See
+    /// [`DppCtrl`].
+    pub dpp: Option<DppCtrl>,
 }
 
 impl Default for ShaderOperand {
@@ -772,6 +810,7 @@ impl Default for ShaderOperand {
             negate: false,
             clamp: false,
             lane_sel: 6,
+            dpp: None,
         }
     }
 }

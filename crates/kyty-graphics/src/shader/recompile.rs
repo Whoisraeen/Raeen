@@ -1953,8 +1953,8 @@ fn recompile_sswappc_b64(
     Ok(false)
 }
 
-/// Kyty: `Recompile_Skip` (ShaderSpirv.cpp L4707) — SWaitcnt / SSendmsg /
-/// SInstPrefetch have no SPIR-V counterpart.
+/// Kyty: `Recompile_Skip` (ShaderSpirv.cpp L4707) — metadata/message/prefetch
+/// instructions have no SPIR-V counterpart.
 fn recompile_skip(
     _index: u32,
     _code: &ShaderCode,
@@ -1963,6 +1963,22 @@ fn recompile_skip(
     _param: &Params,
     _scc_check: SccCheck,
 ) -> Result<bool, ShaderRecompileError> {
+    Ok(true)
+}
+
+/// Scalar wait-count instructions order prior vector/global-memory writes
+/// before later work. SPIR-V has no counter-specific equivalent, so use the
+/// conservative device-scope AcquireRelease barrier covering uniform,
+/// workgroup, cross-workgroup, and image memory (`semantics=0xB48`).
+fn recompile_s_waitcnt(
+    _index: u32,
+    _code: &ShaderCode,
+    dst_source: &mut String,
+    _spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    *dst_source += "\n               OpMemoryBarrier %uint_1 %uint_0x00000b48\n";
     Ok(true)
 }
 
@@ -6050,31 +6066,51 @@ fn recompile_image_load_dmask3(
 fn storage_image_coord_text(
     spirv: &Spirv<'_>,
     inst: &ShaderInstruction,
+    matched: Option<usize>,
 ) -> Result<String, ShaderRecompileError> {
     let bind_info = spirv
         .get_bind_info()
         .expect("callers check textures2d_storage_num > 0");
     let (dim, _) = storage_texture_dim_format(bind_info)?;
-    Ok(match dim {
-        SampledDim::Three => {
+    let texture_type =
+        matched.and_then(|i| bind_info.textures2d.desc.get(i).map(|d| d.texture.type_()));
+    Ok(match (dim, texture_type) {
+        // Type 8 is a true 1D image represented by a height-1 Vulkan 2D
+        // image. Its MIMG address has only x semantics: synthesize y=0 rather
+        // than reading the otherwise unrelated second Vaddr register.
+        (SampledDim::Two, Some(8)) => {
+            "         %t73_<index> = OpCompositeConstruct %v2uint %t69_<index> %uint_0".to_owned()
+        }
+        (SampledDim::Three, _) => {
+            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
             let src0_value2 = operand_variable_to_str_shift(inst.src[0], 2);
             format!(
-                "         %t75_<index> = OpLoad %float %{z}\n         \
+                "         %t70_<index> = OpLoad %float %{y}\n         \
+                 %t71_<index> = OpBitcast %uint %t70_<index>\n         \
+                 %t75_<index> = OpLoad %float %{z}\n         \
                  %t76_<index> = OpBitcast %uint %t75_<index>\n         \
                  %t73_<index> = OpCompositeConstruct %v3uint %t69_<index> %t71_<index> %t76_<index>",
+                y = src0_value1.value,
                 z = src0_value2.value
             )
         }
-        _ => "         %t73_<index> = OpCompositeConstruct %v2uint %t69_<index> %t71_<index>"
-            .to_owned(),
+        _ => {
+            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
+            format!(
+                "         %t70_<index> = OpLoad %float %{y}\n         \
+                 %t71_<index> = OpBitcast %uint %t70_<index>\n         \
+                 %t73_<index> = OpCompositeConstruct %v2uint %t69_<index> %t71_<index>",
+                y = src0_value1.value
+            )
+        }
     })
 }
 
 /// Beyond-Kyty: `image_store` with `dmask == 0x1` (single channel), measured
 /// in ASTRO.BOT scene compute (MIMG 0x08 dmask 0x1). `OpImageWrite` always
 /// takes a 4-component texel; the storage image's own format decides which
-/// components land, so the disabled channels are filled with the GCN default
-/// (0, 0, 0, 1) — harmless for the single-channel formats this dmask implies.
+/// components land. Disabled channels are zero; the dmask suppresses them and
+/// does not synthesize alpha=1.
 fn recompile_image_store_dmask1(
     index: u32,
     code: &ShaderCode,
@@ -6088,7 +6124,7 @@ fn recompile_image_store_dmask1(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_storage_num > 0 {
-            mimg_descriptor_guard(
+            let matched = mimg_descriptor_guard(
                 index,
                 spirv,
                 code,
@@ -6099,7 +6135,6 @@ fn recompile_image_store_dmask1(
             )?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
-            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
             let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
 
             if dst_value0.type_ != SpirvType::Float
@@ -6118,19 +6153,16 @@ fn recompile_image_store_dmask1(
          %t27_<index> = OpLoad %ImageL %t26_<index>
          %t67_<index> = OpLoad %float %<src0_value0>
          %t69_<index> = OpBitcast %uint %t67_<index>
-         %t70_<index> = OpLoad %float %<src0_value1>
-         %t71_<index> = OpBitcast %uint %t70_<index>
 <coord>
          %t84_<index> = OpLoad %float %<dst_value0>
-         %t88_<index> = OpCompositeConstruct %v4float %t84_<index> %float_0_000000 %float_0_000000 %float_1_000000
+         %t88_<index> = OpCompositeConstruct %v4float %t84_<index> %float_0_000000 %float_0_000000 %float_0_000000
                OpImageWrite %t27_<index> %t73_<index> %t88_<index>
 "#;
-            let coord = storage_image_coord_text(spirv, &inst)?;
+            let coord = storage_image_coord_text(spirv, &inst, matched)?;
             *dst_source += &TEXT
                 .replace("<coord>", &coord)
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
-                .replace("<src0_value1>", &src0_value1.value)
                 .replace("<src1_value0>", &src1_value0.value)
                 .replace("<dst_value0>", &dst_value0.value);
 
@@ -6143,8 +6175,8 @@ fn recompile_image_store_dmask1(
 
 /// Beyond-Kyty: `image_store` with `dmask == 0x3` (two channels), measured in
 /// ASTRO.BOT scene compute (MIMG 0x08 dmask 0x3). Same shape as the dmask1
-/// body: `OpImageWrite` takes a full 4-component texel, so the disabled
-/// channels carry the GCN default (0, 0, 0, 1).
+/// body: `OpImageWrite` takes a full 4-component texel, and the disabled
+/// channels are zero-filled.
 fn recompile_image_store_dmask3(
     index: u32,
     code: &ShaderCode,
@@ -6158,7 +6190,7 @@ fn recompile_image_store_dmask3(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_storage_num > 0 {
-            mimg_descriptor_guard(
+            let matched = mimg_descriptor_guard(
                 index,
                 spirv,
                 code,
@@ -6170,7 +6202,6 @@ fn recompile_image_store_dmask3(
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
             let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
-            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
             let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
 
             if dst_value0.type_ != SpirvType::Float
@@ -6189,20 +6220,17 @@ fn recompile_image_store_dmask3(
          %t27_<index> = OpLoad %ImageL %t26_<index>
          %t67_<index> = OpLoad %float %<src0_value0>
          %t69_<index> = OpBitcast %uint %t67_<index>
-         %t70_<index> = OpLoad %float %<src0_value1>
-         %t71_<index> = OpBitcast %uint %t70_<index>
 <coord>
          %t84_<index> = OpLoad %float %<dst_value0>
          %t85_<index> = OpLoad %float %<dst_value1>
-         %t88_<index> = OpCompositeConstruct %v4float %t84_<index> %t85_<index> %float_0_000000 %float_1_000000
+         %t88_<index> = OpCompositeConstruct %v4float %t84_<index> %t85_<index> %float_0_000000 %float_0_000000
                OpImageWrite %t27_<index> %t73_<index> %t88_<index>
 "#;
-            let coord = storage_image_coord_text(spirv, &inst)?;
+            let coord = storage_image_coord_text(spirv, &inst, matched)?;
             *dst_source += &TEXT
                 .replace("<coord>", &coord)
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
-                .replace("<src0_value1>", &src0_value1.value)
                 .replace("<src1_value0>", &src1_value0.value)
                 .replace("<dst_value0>", &dst_value0.value)
                 .replace("<dst_value1>", &dst_value1.value);
@@ -6228,7 +6256,7 @@ fn recompile_image_store_dmask_f(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_storage_num > 0 {
-            mimg_descriptor_guard(
+            let matched = mimg_descriptor_guard(
                 index,
                 spirv,
                 code,
@@ -6243,7 +6271,6 @@ fn recompile_image_store_dmask_f(
             let dst_value3 = operand_variable_to_str_shift(inst.dst, 3);
 
             let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
-            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
 
             let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
             let src1_value2 = operand_variable_to_str_shift(inst.src[1], 2);
@@ -6273,8 +6300,6 @@ fn recompile_image_store_dmask_f(
          %t27_<index> = OpLoad %ImageL %t26_<index>
          %t67_<index> = OpLoad %float %<src0_value0>
          %t69_<index> = OpBitcast %uint %t67_<index>
-         %t70_<index> = OpLoad %float %<src0_value1>
-         %t71_<index> = OpBitcast %uint %t70_<index>
 <coord>
          %t84_<index> = OpLoad %float %<dst_value0>
          %t85_<index> = OpLoad %float %<dst_value1>
@@ -6283,12 +6308,11 @@ fn recompile_image_store_dmask_f(
          %t88_<index> = OpCompositeConstruct %v4float %t84_<index> %t85_<index> %t86_<index> %t87_<index>
                OpImageWrite %t27_<index> %t73_<index> %t88_<index>
 "#;
-            let coord = storage_image_coord_text(spirv, &inst)?;
+            let coord = storage_image_coord_text(spirv, &inst, matched)?;
             *dst_source += &TEXT
                 .replace("<coord>", &coord)
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
-                .replace("<src0_value1>", &src0_value1.value)
                 .replace("<src1_value0>", &src1_value0.value)
                 .replace("<src1_value2>", &src1_value2.value)
                 .replace("<dst_value0>", &dst_value0.value)
@@ -9277,7 +9301,8 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_skip, T::SInstPrefetch, F::Imm, p1("")),
     f(recompile_skip, T::SNop,          F::Imm, p1("")),
     f(recompile_skip, T::SSendmsg,      F::Imm, p1("")),
-    f(recompile_skip, T::SWaitcnt,      F::Imm, p1("")),
+    f(recompile_s_waitcnt, T::SWaitcnt, F::Imm, p1("")),
+    f(recompile_skip, T::SVersion,      F::Imm, p1("")),
 
     f(recompile_tbuffer_load_format_x_float1, T::TBufferLoadFormatX, F::Vdata1VaddrSvSoffsIdxenFloat1, p1("")),
     ni("Recompile_TBufferLoadFormatXyzw_Vdata4Vaddr2SvSoffsOffenIdxenFloat4", 4824, T::TBufferLoadFormatXyzw, F::Vdata4Vaddr2SvSoffsOffenIdxenFloat4, p1("")),
@@ -9766,9 +9791,9 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            322,
+            323,
             "204 Kyty rows plus the compute batch DsWrxchgRtnB32 and VCmpxNgeF32, and \
-             SSubU32, SNop, the RDNA2-only rows \
+             SSubU32, SNop, SVersion, the RDNA2-only rows \
              (VLshlAddU32, VCmpxLtU32, VAddNcU32, VSubNcU32, VSubrevNcU32, VCvtI32F32, \
              VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad dmask1/3/7 \
              and ImageSampleLz dmask1/2/F rows, ImageStore dmask1, \
@@ -9796,9 +9821,9 @@ mod tests {
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 314,
+            implemented, 315,
             "C1 implemented subset plus title-driven ports (incl. DsWrxchgRtnB32, \
-             VCmpxNgeF32, the S_XXX_I32 \
+             VCmpxNgeF32, SVersion, the S_XXX_I32 \
              trio, VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad \
              dmask1/3/7 + ImageSampleLz dmask1/2/F rows, ImageStore dmask1, the \
              nine ImageSample dmask recompilers, the VCmp \
@@ -12511,12 +12536,17 @@ mod tests {
         input_info.bind.textures2d.textures2d_storage_num = 1;
         input_info.bind.textures2d.desc[0].start_register = 4;
         input_info.bind.textures2d.desc[0].textures2d_without_sampler = true;
+        input_info.bind.textures2d.desc[0].texture.fields[3] |= 9 << 28;
         let source = spirv_generate_source(&code, None, None, Some(&input_info))
             .expect("recompile image_store dmask1");
         assert!(source.contains("OpImageWrite"), "{source}");
         assert!(
-            source.contains("%float_0_000000 %float_0_000000 %float_1_000000"),
+            source.contains("%float_0_000000 %float_0_000000 %float_0_000000"),
             "{source}"
+        );
+        assert!(
+            source.contains("OpCompositeConstruct %v2uint %t69_0 %t71_0"),
+            "type-9 storage images keep x/y coordinates:\n{source}"
         );
         // Assemble-only: naga rejects the format-less storage-image write
         // (`InvalidImage`) that real Vulkan accepts via
@@ -12562,6 +12592,50 @@ mod tests {
         // Assemble-only, matching the 2D dmask1 sibling (naga rejects the
         // storage-image write shape real Vulkan accepts).
         let _ = spirv_run(&source).expect("assemble 3D storage image_store");
+    }
+
+    /// Live ASTRO.BOT table-1 UAV: type 8 (1D, represented as height-1 2D)
+    /// with unified format 77 (32_32_32_32 FLOAT). Its SPIR-V declaration
+    /// must be Rgba32f, not the old four-byte Rgba8 fallback.
+    #[test]
+    fn astro_image_store_type8_rgba32f_uses_2d_rgba32f() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF020_0100, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_store dmask1");
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_storage_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 4;
+        input_info.bind.textures2d.desc[0].textures2d_without_sampler = true;
+        input_info.bind.textures2d.desc[0].texture.fields[3] |= 8 << 28;
+        input_info.bind.textures2d.desc[0].texture.fields[1] |= 77 << 20;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile type-8 RGBA32F storage image_store");
+        assert!(
+            source.contains("OpTypeImage %float 2D 0 0 0 2 Rgba32f"),
+            "{source}"
+        );
+        assert!(
+            source.contains("OpCompositeConstruct %v2uint %t69_0 %uint_0"),
+            "type-8 storage images must synthesize y=0:\n{source}"
+        );
+        assert!(
+            !source.contains("OpCompositeConstruct %v2uint %t69_0 %t71_0"),
+            "type-8 coordinates must not consume vaddr.y:\n{source}"
+        );
+        assert!(
+            !source.contains("%t70_0 = OpLoad"),
+            "type-8 coordinates must not even read the unrelated vaddr.y register:\n{source}"
+        );
+        let _ = spirv_run(&source).expect("assemble type-8 RGBA32F image_store");
     }
 
     #[test]
@@ -13769,8 +13843,8 @@ mod tests {
             .expect("recompile image_store dmask3");
         assert!(source.contains("OpImageWrite"), "{source}");
         assert!(
-            source.contains("%t85_0 %float_0_000000 %float_1_000000"),
-            "disabled b/a channels default to (0, 1):\n{source}"
+            source.contains("%t85_0 %float_0_000000 %float_0_000000"),
+            "disabled b/a channels must both be zero:\n{source}"
         );
         // Assemble-only: naga rejects the format-less storage-image write
         // (`InvalidImage`) that real Vulkan accepts via
@@ -14251,6 +14325,45 @@ mod tests {
             "names the straddling (mis-sized) instruction at 0x4: {msg}"
         );
         assert!(msg.contains("0xc"), "names the next boundary: {msg}");
+    }
+
+    #[test]
+    fn reloop_accepts_branch_to_s_waitcnt_vscnt_after_mubuf() {
+        // Reduced live ASTRO.BOT sequence. MUBUF is 8 bytes (pc 0x4..0xc)
+        // and s_waitcnt_vscnt at 0xc is the branch target. Recording the wait
+        // preserves that boundary and its memory ordering through SPIR-V.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0xBF82_0002, // s_branch +2 -> pc 0xc
+                0xE070_2000, // buffer_store_dword, idxen
+                0xFF01_0400, // fixed-width second MUBUF dword
+                0xBBFD_0000, // s_waitcnt_vscnt at target
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse branch to s_waitcnt_vscnt");
+        let mut cs = ShaderComputeInputInfo::default();
+        cs.threads_num = [1, 1, 1];
+        cs.bind.push_constant_size = 16;
+        cs.bind.storage_buffers.buffers_num = 1;
+        cs.bind.storage_buffers.start_register[0] = 4;
+        let source = spirv_generate_source(&code, None, None, Some(&cs))
+            .expect("wait target is a real relooper boundary");
+        assert!(source.contains("OpSwitch"), "relooper is active:\n{source}");
+        assert!(
+            source.contains("OpMemoryBarrier %uint_1 %uint_0x00000b48"),
+            "vector-store wait must retain memory ordering:\n{source}"
+        );
+        // Naga does not currently implement OpMemoryBarrier in function
+        // bodies; spirv-as still verifies that the emitted instruction is a
+        // well-formed SPIR-V module.
+        let words = spirv_run(&source).expect("assemble branch-to-wait shader");
+        spirv_val_ok(&words, "branch_to_waitcnt_vscnt_after_mubuf");
     }
 
     /// Round 9 — the whole measured 693-skip bulk: the next-gen SMEM parser

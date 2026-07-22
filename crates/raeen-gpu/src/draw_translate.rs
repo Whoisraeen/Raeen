@@ -679,6 +679,10 @@ fn texture_vk_format(
         // 7 is FLOAT (same numFormat as the 36 arm above). Every draw in the
         // title's 7966-dword DCB failed on this one format.
         71 => Ok((vk::Format::R16G16B16A16_SFLOAT, 8)),
+        // 77 -> (14,7) = 32_32_32_32 FLOAT. The same unified row is already
+        // used by Gen5 vertex attributes; live ASTRO.BOT now exposes it as a
+        // 1x1 read-write T# and requires the full 16-byte texel.
+        77 => Ok((vk::Format::R32G32B32A32_SFLOAT, 16)),
         // 5 -> (dataFormat 1, numFormat 4) = 8-bit UINT (SharpEmu
         // Gfx10UnifiedFormat unified 5 -> (1u, 4u)); R8_UINT at 1 B/texel.
         // Measured on ASTRO.BOT's 1920x1080 tile=24 target sampled as a texture.
@@ -1135,8 +1139,9 @@ fn storage_image_format_is_32bpp(format: u16) -> bool {
 ///
 /// A type-10 T# is a 3D UAV (`depth` slices back to back — measured:
 /// ASTRO.BOT's 240x135x64 format-71 volumes); format 71 uploads as
-/// `R16G16B16A16_SFLOAT` (8 B/texel) matching the recompiled `Rgba16f`
-/// image, everything else keeps the RGBA8 view. The content is a
+/// `R16G16B16A16_SFLOAT` (8 B/texel), format 77 as
+/// `R32G32B32A32_SFLOAT` (16 B/texel), matching the recompiled storage-image
+/// format. Everything else keeps the RGBA8 view. The content is a
 /// best-effort seed: a UAV is typically fully overwritten by the dispatch,
 /// so an unknown format or unreadable guest range zero-fills with a
 /// once-per-process warning instead of failing the dispatch.
@@ -1159,15 +1164,15 @@ fn read_storage_image(
         )));
     }
     // Must agree with `kyty-graphics` `storage_texture_dim_format` (which
-    // declares `%ImageL` as Rgba16f exactly for guest format 71).
-    let (format, texel) = if t.format() == 71 {
-        (vk::Format::R16G16B16A16_SFLOAT, 8u64)
-    } else {
-        (vk::Format::R8G8B8A8_UNORM, 4u64)
+    // declares `%ImageL` as Rgba16f for 71 and Rgba32f for 77).
+    let (format, texel) = match t.format() {
+        71 => (vk::Format::R16G16B16A16_SFLOAT, 8u64),
+        77 => (vk::Format::R32G32B32A32_SFLOAT, 16u64),
+        _ => (vk::Format::R8G8B8A8_UNORM, 4u64),
     };
     let size = u64::from(width) * u64::from(height) * u64::from(depth) * texel;
     let base = t.base40();
-    let readable = t.format() == 71 || storage_image_format_is_32bpp(t.format());
+    let readable = matches!(t.format(), 71 | 77) || storage_image_format_is_32bpp(t.format());
     let pixels = if readable {
         // Linear read: UAV surfaces the title dispatches into are addressed
         // by the shader itself, so no de-tiling is applied to the seed.
@@ -1404,7 +1409,7 @@ fn expected_sampled_bytes(t: &kyty_graphics::shader::ShaderTextureResource) -> u
 
 /// Expected initial-content byte size of one storage-image (UAV) T#: the linear
 /// volume `width * height * depth * texel` (`texel` = 8 for format 71 RGBA16F,
-/// else 4), matching `read_storage_image`.
+/// 16 for format 77 RGBA32F, else 4), matching `read_storage_image`.
 fn expected_storage_image_bytes(t: &kyty_graphics::shader::ShaderTextureResource) -> u64 {
     let width = u64::from(u32::from(t.width5()) + 1);
     let height = u64::from(u32::from(t.height5()) + 1);
@@ -1413,7 +1418,11 @@ fn expected_storage_image_bytes(t: &kyty_graphics::shader::ShaderTextureResource
     } else {
         1
     };
-    let texel = if t.format() == 71 { 8 } else { 4 };
+    let texel = match t.format() {
+        71 => 8,
+        77 => 16,
+        _ => 4,
+    };
     width
         .saturating_mul(height)
         .saturating_mul(depth)
@@ -4051,7 +4060,7 @@ mod tests {
     /// R8G8_UNORM (2 B), 29 -> (5,7) = R16G16_SFLOAT (4 B), 65 -> (12,0) =
     /// R16G16B16A16_UNORM (8 B).
     #[test]
-    fn texture_vk_format_maps_unified_14_29_and_65() {
+    fn texture_vk_format_maps_unified_14_29_65_and_77() {
         let case = |unified: u32| {
             let mut t = kyty_graphics::shader::ShaderTextureResource::default();
             t.fields[1] |= unified << 20;
@@ -4062,6 +4071,10 @@ mod tests {
         assert_eq!(
             case(65).expect("format 65"),
             (vk::Format::R16G16B16A16_UNORM, 8)
+        );
+        assert_eq!(
+            case(77).expect("format 77"),
+            (vk::Format::R32G32B32A32_SFLOAT, 16)
         );
     }
 
@@ -4200,6 +4213,33 @@ mod tests {
         assert_eq!(upload.format, vk::Format::R16G16B16A16_SFLOAT);
         assert_eq!(upload.texel_bytes(), 8);
         assert_eq!(upload.pixels, bytes, "the whole volume seeds the upload");
+    }
+
+    /// Live ASTRO.BOT UAV descriptor: type 8 is a 1D image represented by a
+    /// height-1 Vulkan 2D image, and format 77 is RGBA32F (16 B/texel).
+    #[test]
+    fn read_storage_image_type8_rgba32f_reads_sixteen_byte_texel() {
+        let bytes: Vec<u8> = (0..16u8).map(|x| x.wrapping_mul(7)).collect();
+        let mut blob = vec![0u8; bytes.len() + 255];
+        let base = (blob.as_ptr() as u64 + 255) & !255;
+        let off = (base - blob.as_ptr() as u64) as usize;
+        blob[off..off + bytes.len()].copy_from_slice(&bytes);
+
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.update_address40(base >> 8);
+        t.fields[1] |= 77 << 20;
+        t.fields[3] |= 8 << 28;
+
+        let upload =
+            crate::guest_mem::with_test_ranges(&[(blob.as_ptr() as u64, blob.len())], || {
+                read_storage_image(&t)
+            })
+            .expect("type-8 RGBA32F UAV reads");
+        assert_eq!((upload.width, upload.height, upload.depth), (1, 1, 1));
+        assert_eq!(upload.format, vk::Format::R32G32B32A32_SFLOAT);
+        assert_eq!(upload.texel_bytes(), 16);
+        assert_eq!(upload.pixels, bytes);
+        assert_eq!(expected_storage_image_bytes(&t), 16);
     }
 
     /// A 3D T# (type 10, linear tile 0 — the measured ASTRO.BOT froxel/LUT

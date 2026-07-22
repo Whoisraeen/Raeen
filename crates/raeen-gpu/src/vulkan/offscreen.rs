@@ -146,8 +146,9 @@ pub struct StorageImageUpload {
     /// storage image (measured: ASTRO.BOT's 240x135x64 UAV volumes).
     pub depth: u32,
     /// The Vulkan texel format matching the recompiled SPIR-V's `%ImageL`
-    /// declaration: `R8G8B8A8_UNORM` (Rgba8) or `R16G16B16A16_SFLOAT`
-    /// (Rgba16f, guest T# format 71).
+    /// declaration: `R8G8B8A8_UNORM` (Rgba8), `R16G16B16A16_SFLOAT`
+    /// (Rgba16f, guest T# format 71), or `R32G32B32A32_SFLOAT`
+    /// (Rgba32f, guest T# format 77).
     pub format: vk::Format,
     /// Initial content, `width * height * depth * texel_bytes()` bytes.
     pub pixels: Vec<u8>,
@@ -159,10 +160,10 @@ impl StorageImageUpload {
     /// Bytes per texel of [`Self::format`].
     #[must_use]
     pub fn texel_bytes(&self) -> u32 {
-        if self.format == vk::Format::R16G16B16A16_SFLOAT {
-            8
-        } else {
-            4
+        match self.format {
+            vk::Format::R16G16B16A16_SFLOAT => 8,
+            vk::Format::R32G32B32A32_SFLOAT => 16,
+            _ => 4,
         }
     }
 }
@@ -3830,9 +3831,22 @@ fn validate_graphics_interface(state: &DrawState) -> Result<(), GpuError> {
         .copied()
         .collect::<Vec<_>>();
     if !missing.is_empty() {
-        return Err(GpuError::PipelineCreationFailed(format!(
-            "fragment inputs {missing:?} have no matching vertex outputs"
-        )));
+        // The pixel shader reads interpolants the vertex shader doesn't export.
+        // This is normal on GCN when a geometry/primitive (GS copy) shader
+        // supplies some params, or when the PS over-reads a param-cache slot:
+        // real hardware (and shadPS4, which has no such guard) simply feeds the
+        // fragment stage *undefined* values for the unmatched Location(s) rather
+        // than failing the draw. Refusing here dropped ALL of Astro Bot's scene
+        // geometry (measured 2026-07-22: es=0x500643f00 exports 1 param, the PS
+        // reads 2). Let the pipeline link and the driver supply undefined for the
+        // missing Location; the affected interpolant may render as garbage (a
+        // localized glitch) but the geometry draws. Validation layers (off by
+        // default) may warn — expected. Proper fix = source params from the GS
+        // copy shader; tracked separately.
+        tracing::debug!(
+            "graphics interface: fragment inputs {missing:?} have no matching \
+             vertex outputs — linking anyway (driver supplies undefined)"
+        );
     }
     Ok(())
 }
@@ -3985,12 +3999,18 @@ mod tests {
     }
 
     #[test]
-    fn graphics_interface_gate_rejects_missing_vertex_output() {
+    fn graphics_interface_gate_allows_missing_vertex_output() {
+        // A pixel shader that reads an interpolant the vertex shader doesn't
+        // export (common when a GS/copy shader supplies params, or the PS
+        // over-reads a param-cache slot) must LINK anyway: real hardware and
+        // shadPS4 feed the fragment stage undefined for the unmatched Location
+        // rather than dropping the draw. Refusing here dropped all of Astro
+        // Bot's scene geometry (measured 2026-07-22).
         let vs = location_module(3, 0);
         let fs = location_module(1, 1);
         let state = DrawState::new(16, 16, &vs, &fs);
-        let error = validate_graphics_interface(&state).unwrap_err().to_string();
-        assert!(error.contains("fragment inputs [1]"), "{error}");
+        validate_graphics_interface(&state)
+            .expect("missing vertex output must link (driver supplies undefined)");
     }
 
     #[test]

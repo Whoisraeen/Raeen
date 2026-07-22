@@ -12,8 +12,9 @@
 //! - The instruction walk is bounded by the buffer length.
 
 use super::types::{
-    ShaderCode, ShaderConstant, ShaderInstruction, ShaderInstructionType as T, ShaderLabel,
-    ShaderOperand, ShaderOperandType as O, ShaderType, shader_instruction_format::Format as F,
+    DppCtrl, DppMode, ShaderCode, ShaderConstant, ShaderInstruction, ShaderInstructionType as T,
+    ShaderLabel, ShaderOperand, ShaderOperandType as O, ShaderType,
+    shader_instruction_format::Format as F,
 };
 
 /// Typed replacement for Kyty's hard exits (ShaderParse.cpp macros L21-28).
@@ -238,6 +239,73 @@ pub fn operand_parse(code: u32) -> Result<ShaderOperand, ShaderParseError> {
     Ok(ret)
 }
 
+/// Beyond Kyty: is `src0` a DPP (Data-Parallel Primitives) marker? `0xfa`
+/// (250) = DPP16; `0xe9`/`0xea` (233/234) = DPP8/DPP8FI. Like SDWA (`0xf9`),
+/// a DPP marker means the instruction carries a second control dword and the
+/// real src0 (always a VGPR) lives in that dword's low byte. Kyty predates
+/// DPP and hands the marker straight to `operand_parse`, which errors and
+/// fails the whole shader.
+fn is_dpp_marker(src0: u32) -> bool {
+    matches!(src0, 0xfa | 0xe9 | 0xea)
+}
+
+/// Beyond Kyty: the modifier and control fields pulled from a DPP control
+/// dword. `src0` is *not* here — it is `b1 & 0xff` at every call site.
+struct DppDecoded {
+    ctrl: DppCtrl,
+    src0_neg: bool,
+    src0_abs: bool,
+    src1_neg: bool,
+    src1_abs: bool,
+}
+
+/// Beyond Kyty: decode a DPP control dword (`b1`) given its src0 `marker`.
+/// Layout mirrors shadPS4's `struct Dpp` for DPP16 and its DPP8 lane-select
+/// packing (GPL-2.0 — studied, not copied):
+///
+/// * DPP16 (`marker == 0xfa`): `src0[7:0]`, `dpp_ctrl[16:8]`, `fi[18]`,
+///   `bound_ctrl[19]`, `src0_neg[20]`, `src0_abs[21]`, `src1_neg[22]`,
+///   `src1_abs[23]`, `bank_mask[27:24]`, `row_mask[31:28]`.
+/// * DPP8/DPP8FI (`marker == 0xe9`/`0xea`): `src0[7:0]` then eight 3-bit lane
+///   selects filling `[31:8]`; no abs/neg/masks. `0xea` is fetch-inactive.
+fn decode_dpp(marker: u32, b1: u32) -> DppDecoded {
+    if marker == 0xfa {
+        DppDecoded {
+            ctrl: DppCtrl {
+                mode: DppMode::Dpp16 {
+                    ctrl: ((b1 >> 8) & 0x1ff) as u16,
+                },
+                row_mask: ((b1 >> 28) & 0xf) as u8,
+                bank_mask: ((b1 >> 24) & 0xf) as u8,
+                bound_ctrl: (b1 >> 19) & 0x1 != 0,
+                fetch_inactive: (b1 >> 18) & 0x1 != 0,
+            },
+            src0_neg: (b1 >> 20) & 0x1 != 0,
+            src0_abs: (b1 >> 21) & 0x1 != 0,
+            src1_neg: (b1 >> 22) & 0x1 != 0,
+            src1_abs: (b1 >> 23) & 0x1 != 0,
+        }
+    } else {
+        let mut lane_sel = [0u8; 8];
+        for (i, s) in lane_sel.iter_mut().enumerate() {
+            *s = ((b1 >> (8 + i * 3)) & 0x7) as u8;
+        }
+        DppDecoded {
+            ctrl: DppCtrl {
+                mode: DppMode::Dpp8 { lane_sel },
+                row_mask: 0,
+                bank_mask: 0,
+                bound_ctrl: false,
+                fetch_inactive: marker == 0xea,
+            },
+            src0_neg: false,
+            src0_abs: false,
+            src1_neg: false,
+            src1_abs: false,
+        }
+    }
+}
+
 /// Kyty: ShaderParse.cpp `shader_parse_sopc` (L84).
 fn shader_parse_sopc(
     pc: u32,
@@ -305,7 +373,7 @@ fn shader_parse_sopk(
     pc: u32,
     buffer: &[u32],
     dst: &mut ShaderCode,
-    _next_gen: bool,
+    next_gen: bool,
 ) -> Result<u32, ShaderParseError> {
     const S: &str = "sopk";
     let b0 = buffer[0];
@@ -314,13 +382,26 @@ fn shader_parse_sopk(
     let imm = (b0 & 0xffff) as u16 as i16;
     let sdst = (b0 >> 16) & 0x7f;
 
-    // Beyond Kyty: SOPK opcode 0x17 (23) is `s_version` — RDNA2 ISA: "Do
-    // nothing"; a compiler-emitted code-object version marker carrying the
-    // version in simm16. Measured on ASTRO.BOT scene compute (raw
-    // 0xbbfd0000, 59 dispatches/run). Consumed BEFORE operand parsing: its
-    // sdst field is a fixed encoding constant (0x7d here), not a register,
-    // and would fail `operand_parse`. No instruction is emitted.
-    if opcode == 0x17 {
+    // RDNA2 reassigns SOPK opcodes 1 and 0x17. Handle them before parsing the
+    // reserved `sdst` field as a register. Both still emit an instruction so
+    // branch destinations at their PC remain visible to the relooper.
+    if next_gen && matches!(opcode, 0x01 | 0x17) {
+        let mut inst = ShaderInstruction {
+            pc,
+            ..Default::default()
+        };
+        // GFX10 ISA: opcode 1 = s_version (metadata/no execution effect),
+        // opcode 0x17 = s_waitcnt_vscnt (vector-store completion wait).
+        inst.type_ = if opcode == 0x01 {
+            T::SVersion
+        } else {
+            T::SWaitcnt
+        };
+        inst.format = F::Imm;
+        inst.src[0].type_ = O::LiteralConstant;
+        inst.src[0].constant.u = i32::from(imm) as u32;
+        inst.src_num = 1;
+        dst.get_instructions_mut().push(inst);
         return Ok(1);
     }
 
@@ -1028,11 +1109,19 @@ fn shader_parse_vopc(
     let vsrc1 = (b0 >> 9) & 0xff;
 
     let sdwa = src0 == 249;
+    // DPP (src0 == 0xfa/0xe9/0xea): mutually exclusive with SDWA; also a
+    // two-dword form whose real src0 (a VGPR) is `b1 & 0xff`. See `decode_dpp`.
+    let dpp = is_dpp_marker(src0);
 
-    let mut size: u32 = if sdwa { 2 } else { 1 };
-    let b1 = if sdwa { dw(buffer, 1, pc)? } else { 0 };
+    let mut size: u32 = if sdwa || dpp { 2 } else { 1 };
+    let b1 = if sdwa || dpp { dw(buffer, 1, pc)? } else { 0 };
+    let dpp_dec = if dpp {
+        Some(decode_dpp(src0, b1))
+    } else {
+        None
+    };
 
-    src0 = if sdwa { b1 & 0xff } else { src0 };
+    src0 = if sdwa || dpp { b1 & 0xff } else { src0 };
     let sdst = if sdwa { (b1 >> 8) & 0x7f } else { 0 };
     let sd = if sdwa { (b1 >> 15) & 0x1 } else { 0 };
     let src0_sel = if sdwa { (b1 >> 16) & 0x7 } else { 6 };
@@ -1069,7 +1158,8 @@ fn shader_parse_vopc(
         pc,
         ..Default::default()
     };
-    inst.src[0] = operand_parse(src0 + if s0 == 0 { 256 } else { 0 })?;
+    // DPP src0 is always a VGPR (`s0` is an SDWA-only field, 1 here).
+    inst.src[0] = operand_parse(src0 + if s0 == 0 || dpp { 256 } else { 0 })?;
     inst.src[1] = operand_parse(vsrc1 + if s1 == 0 { 256 } else { 0 })?;
     inst.src_num = 2;
 
@@ -1079,6 +1169,17 @@ fn shader_parse_vopc(
     inst.src[1].negate = src1_neg != 0;
     inst.src[0].lane_sel = src0_sel as u8;
     inst.src[1].lane_sel = src1_sel as u8;
+
+    // DPP overrides: the control dword carries its own src0/src1 abs/neg and the
+    // cross-lane pattern (attached to src0). DPP8 has none, so this is a no-op
+    // for its modifiers.
+    if let Some(d) = &dpp_dec {
+        inst.src[0].absolute = d.src0_abs;
+        inst.src[0].negate = d.src0_neg;
+        inst.src[1].absolute = d.src1_abs;
+        inst.src[1].negate = d.src1_neg;
+        inst.src[0].dpp = Some(d.ctrl);
+    }
 
     if inst.src[0].type_ == O::LiteralConstant {
         inst.src[0].constant.u = dw(buffer, size, pc)?;
@@ -1191,9 +1292,18 @@ fn shader_parse_vop1(
     // `v_rcp_f32 v1, |v5|` (SDWA abs) this way. Mirrors the VOP2 SDWA block
     // (single source: no src1 fields).
     let sdwa = src0 == 249;
-    let mut size: u32 = if sdwa { 2 } else { 1 };
-    let b1 = if sdwa { dw(buffer, 1, pc)? } else { 0 };
-    src0 = if sdwa { b1 & 0xff } else { src0 };
+    // DPP (src0 == 0xfa/0xe9/0xea): a two-dword form like SDWA, but the second
+    // dword is a cross-lane control (single-source here — no src1). See
+    // `decode_dpp`; mirrors the VOP2 DPP block below.
+    let dpp = is_dpp_marker(src0);
+    let mut size: u32 = if sdwa || dpp { 2 } else { 1 };
+    let b1 = if sdwa || dpp { dw(buffer, 1, pc)? } else { 0 };
+    let dpp_dec = if dpp {
+        Some(decode_dpp(src0, b1))
+    } else {
+        None
+    };
+    src0 = if sdwa || dpp { b1 & 0xff } else { src0 };
     let dst_sel = if sdwa { (b1 >> 8) & 0x7 } else { 6 };
     let dst_u = if sdwa { (b1 >> 11) & 0x3 } else { 2 };
     let clmp = if sdwa { (b1 >> 13) & 0x1 } else { 0 };
@@ -1224,7 +1334,8 @@ fn shader_parse_vop1(
         pc,
         ..Default::default()
     };
-    inst.src[0] = operand_parse(src0 + if s0 == 0 { 256 } else { 0 })?;
+    // DPP src0 is always a VGPR (`s0` is an SDWA-only field, 1 here).
+    inst.src[0] = operand_parse(src0 + if s0 == 0 || dpp { 256 } else { 0 })?;
     inst.dst = operand_parse(vdst + 256)?;
     inst.src_num = 1;
 
@@ -1236,6 +1347,13 @@ fn shader_parse_vop1(
     inst.src[0].absolute = src0_abs != 0;
     inst.src[0].negate = src0_neg != 0;
     inst.src[0].lane_sel = src0_sel as u8;
+    // DPP overrides: control-dword src0 abs/neg (DPP8 has none) plus the
+    // cross-lane pattern on src0. VOP1 is single-source, so src1 is untouched.
+    if let Some(d) = &dpp_dec {
+        inst.src[0].absolute = d.src0_abs;
+        inst.src[0].negate = d.src0_neg;
+        inst.src[0].dpp = Some(d.ctrl);
+    }
     inst.dst.clamp = clmp != 0;
     inst.dst.multiplier = match omod {
         0 => 1.0,
@@ -1371,11 +1489,19 @@ fn shader_parse_vop2(
     let vsrc1 = (b0 >> 9) & 0xff;
 
     let sdwa = src0 == 249;
+    // DPP (src0 == 0xfa/0xe9/0xea): two-dword cross-lane form, mutually
+    // exclusive with SDWA. Real src0 (VGPR) is `b1 & 0xff`; see `decode_dpp`.
+    let dpp = is_dpp_marker(src0);
 
-    let mut size: u32 = if sdwa { 2 } else { 1 };
-    let b1 = if sdwa { dw(buffer, 1, pc)? } else { 0 };
+    let mut size: u32 = if sdwa || dpp { 2 } else { 1 };
+    let b1 = if sdwa || dpp { dw(buffer, 1, pc)? } else { 0 };
+    let dpp_dec = if dpp {
+        Some(decode_dpp(src0, b1))
+    } else {
+        None
+    };
 
-    src0 = if sdwa { b1 & 0xff } else { src0 };
+    src0 = if sdwa || dpp { b1 & 0xff } else { src0 };
     let dst_sel = if sdwa { (b1 >> 8) & 0x7 } else { 6 };
     let dst_u = if sdwa { (b1 >> 11) & 0x3 } else { 2 };
     let clmp = if sdwa { (b1 >> 13) & 0x1 } else { 0 };
@@ -1421,7 +1547,8 @@ fn shader_parse_vop2(
         pc,
         ..Default::default()
     };
-    inst.src[0] = operand_parse(src0 + if s0 == 0 { 256 } else { 0 })?;
+    // DPP src0 is always a VGPR (`s0` is an SDWA-only field, 1 here).
+    inst.src[0] = operand_parse(src0 + if s0 == 0 || dpp { 256 } else { 0 })?;
     inst.src[1] = operand_parse(vsrc1 + if s1 == 0 { 256 } else { 0 })?;
     inst.dst = operand_parse(vdst + 256)?;
     inst.src_num = 2;
@@ -1445,6 +1572,16 @@ fn shader_parse_vop2(
     inst.src[1].negate = src1_neg != 0;
     inst.src[0].lane_sel = src0_sel as u8;
     inst.src[1].lane_sel = src1_sel as u8;
+
+    // DPP overrides: the control dword carries its own src0/src1 abs/neg and the
+    // cross-lane pattern (attached to src0). DPP8 has no modifiers.
+    if let Some(d) = &dpp_dec {
+        inst.src[0].absolute = d.src0_abs;
+        inst.src[0].negate = d.src0_neg;
+        inst.src[1].absolute = d.src1_abs;
+        inst.src[1].negate = d.src1_neg;
+        inst.src[0].dpp = Some(d.ctrl);
+    }
 
     inst.dst.clamp = clmp != 0;
 
@@ -4164,6 +4301,191 @@ mod tests {
         assert_eq!(insts[1].pc, 8, "ds_wrxchg spans 8 bytes (2 dwords)");
     }
 
+    /// VOP2 DPP16 (`src0 == 0xfa`): a second dword carries the real src0 (a
+    /// VGPR, in its low byte) plus a 9-bit `dpp_ctrl` cross-lane pattern and
+    /// row/bank masks. Before DPP decode, `operand_parse` was handed the 0xfa
+    /// marker and failed the whole shader ("unknown operand: 250"). Mirrors the
+    /// VOP2 SDWA block; shape studied from shadPS4 `decodeDataParallelPrimitive`
+    /// (GPL-2.0, not copied). Encoding: `v_add_f32 v2, v5 row_shr:1, v3` — the
+    /// DPP dword is `row_shr` (`dpp_ctrl == 0x111`), row/bank mask 0xf,
+    /// bound_ctrl set.
+    #[test]
+    fn vop2_dpp16_decodes_and_is_two_dwords() {
+        let (code, result) = parse(
+            &[0x0604_06FA, 0xFF09_1105, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse v_add_f32 DPP16");
+        let insts = code.get_instructions();
+        assert_eq!(insts[0].type_, T::VAddF32);
+        assert_eq!(
+            insts.len(),
+            2,
+            "DPP add + s_endpgm = 2 instructions (not 3)"
+        );
+        assert_eq!(insts[1].pc, 8, "DPP16 add spans 8 bytes (2 dwords)");
+        // Real src0 comes from the low byte of the DPP dword, always a VGPR.
+        assert_eq!(
+            (insts[0].src[0].type_, insts[0].src[0].register_id),
+            (O::Vgpr, 5)
+        );
+        assert_eq!(
+            (insts[0].src[1].type_, insts[0].src[1].register_id),
+            (O::Vgpr, 3)
+        );
+        assert_eq!((insts[0].dst.type_, insts[0].dst.register_id), (O::Vgpr, 2));
+        assert_eq!(
+            insts[0].src[0].dpp,
+            Some(DppCtrl {
+                mode: DppMode::Dpp16 { ctrl: 0x111 },
+                row_mask: 0xf,
+                bank_mask: 0xf,
+                bound_ctrl: true,
+                fetch_inactive: false,
+            }),
+            "DPP16 control decoded onto src0"
+        );
+    }
+
+    /// VOP1 DPP16: single-source form (no src1 modifiers). `v_mov_b32 v1,
+    /// v7 quad_perm:[3,2,1,0]` — `dpp_ctrl == 0x1b`, the quad-permute op.
+    #[test]
+    fn vop1_dpp16_decodes() {
+        let (code, result) = parse(
+            &[0x7E02_02FA, 0xFF00_1B07, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse v_mov_b32 DPP16");
+        let insts = code.get_instructions();
+        assert_eq!(insts[0].type_, T::VMovB32);
+        assert_eq!(insts.len(), 2);
+        assert_eq!(insts[1].pc, 8, "DPP16 mov spans 8 bytes");
+        assert_eq!(
+            (insts[0].src[0].type_, insts[0].src[0].register_id),
+            (O::Vgpr, 7)
+        );
+        assert_eq!((insts[0].dst.type_, insts[0].dst.register_id), (O::Vgpr, 1));
+        assert_eq!(
+            insts[0].src[0].dpp,
+            Some(DppCtrl {
+                mode: DppMode::Dpp16 { ctrl: 0x1b },
+                row_mask: 0xf,
+                bank_mask: 0xf,
+                bound_ctrl: false,
+                fetch_inactive: false,
+            })
+        );
+    }
+
+    /// VOPC DPP16: `v_cmp_lt_f32 vcc, v6 row_mirror, v4` — `dpp_ctrl == 0x140`.
+    /// The 2-dword length must come from the shared DPP marker, independent of
+    /// the opcode arm, so a valid later branch target stays on an instruction
+    /// boundary (the `FindReloopBlocks` invariant the SDWA guards also protect).
+    #[test]
+    fn vopc_dpp16_decodes() {
+        let (code, result) = parse(
+            &[0x7C02_08FA, 0xFF01_4006, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse v_cmp_lt_f32 DPP16");
+        let insts = code.get_instructions();
+        assert_eq!(insts[0].type_, T::VCmpLtF32);
+        assert_eq!(insts.len(), 2);
+        assert_eq!(insts[1].pc, 8, "DPP16 vopc spans 8 bytes");
+        assert_eq!(
+            (insts[0].src[0].type_, insts[0].src[0].register_id),
+            (O::Vgpr, 6)
+        );
+        assert_eq!(
+            (insts[0].src[1].type_, insts[0].src[1].register_id),
+            (O::Vgpr, 4)
+        );
+        assert_eq!(insts[0].dst.type_, O::VccLo, "sd == 0 targets VCC");
+        assert_eq!(
+            insts[0].src[0].dpp,
+            Some(DppCtrl {
+                mode: DppMode::Dpp16 { ctrl: 0x140 },
+                row_mask: 0xf,
+                bank_mask: 0xf,
+                bound_ctrl: false,
+                fetch_inactive: false,
+            })
+        );
+    }
+
+    /// VOP2 DPP16 abs/neg: the DPP control dword carries its own src0/src1
+    /// abs/neg bits (distinct bit positions from SDWA). `v_add_f32 v2,
+    /// -|v5| quad_perm, |v3|` — src0_neg+src0_abs and src1_abs set.
+    #[test]
+    fn vop2_dpp16_applies_src_modifiers() {
+        // dpp_ctrl 0 (quad_perm identity base), src0=v5, src0_neg[20]=1,
+        // src0_abs[21]=1, src1_abs[23]=1, masks 0xf.
+        let b1 = 0xFF00_0000u32 | (1 << 20) | (1 << 21) | (1 << 23) | 0x05;
+        let (code, result) = parse(&[0x0604_06FA, b1, S_ENDPGM], ShaderType::Compute, true);
+        result.expect("parse v_add_f32 DPP16 with modifiers");
+        let inst = &code.get_instructions()[0];
+        assert!(inst.src[0].negate, "DPP src0_neg");
+        assert!(inst.src[0].absolute, "DPP src0_abs");
+        assert!(!inst.src[1].negate);
+        assert!(inst.src[1].absolute, "DPP src1_abs");
+    }
+
+    /// VOP2 DPP8 (`src0 == 0xe9`): eight 3-bit lane selects fill bits [31:8];
+    /// no abs/neg/masks. `v_add_f32 v2, v5 dpp8:[0,1,2,3,4,5,6,7], v3`.
+    #[test]
+    fn vop2_dpp8_decodes() {
+        let (code, result) = parse(
+            &[0x0604_06E9, 0xFAC6_8805, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse v_add_f32 DPP8");
+        let insts = code.get_instructions();
+        assert_eq!(insts[0].type_, T::VAddF32);
+        assert_eq!(insts.len(), 2);
+        assert_eq!(insts[1].pc, 8, "DPP8 add spans 8 bytes (2 dwords)");
+        assert_eq!(
+            (insts[0].src[0].type_, insts[0].src[0].register_id),
+            (O::Vgpr, 5)
+        );
+        assert_eq!(
+            insts[0].src[0].dpp,
+            Some(DppCtrl {
+                mode: DppMode::Dpp8 {
+                    lane_sel: [0, 1, 2, 3, 4, 5, 6, 7],
+                },
+                row_mask: 0,
+                bank_mask: 0,
+                bound_ctrl: false,
+                fetch_inactive: false,
+            })
+        );
+    }
+
+    /// DPP8FI (`src0 == 0xea`) is the fetch-inactive DPP8 variant — same
+    /// lane-select layout, `fetch_inactive` flagged.
+    #[test]
+    fn vop2_dpp8_fi_flags_fetch_inactive() {
+        let (code, result) = parse(
+            &[0x0604_06EA, 0xFAC6_8805, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse v_add_f32 DPP8FI");
+        let inst = &code.get_instructions()[0];
+        match inst.src[0].dpp {
+            Some(DppCtrl {
+                fetch_inactive,
+                mode: DppMode::Dpp8 { .. },
+                ..
+            }) => assert!(fetch_inactive, "0xea is DPP8 fetch-inactive"),
+            other => panic!("expected DPP8 ctrl, got {other:?}"),
+        }
+    }
+
     // ---- 1. operand_parse table (Kyty: ShaderParse.cpp L32) ----
 
     #[test]
@@ -5229,16 +5551,54 @@ mod tests {
     }
 
     #[test]
-    fn sopk_s_version_is_a_consumed_no_op() {
-        // RDNA2 `s_version` (SOPK 0x17), measured raw 0xbbfd0000 — a
-        // compiler-emitted code-object version marker. Its sdst field is a
-        // fixed encoding constant, not a register, so it must be consumed
-        // before operand parsing and emit nothing.
+    fn sopk_s_waitcnt_vscnt_is_an_emitted_wait_boundary() {
+        // RDNA2 `s_waitcnt_vscnt` (SOPK 0x17), measured raw 0xbbfd0000.
+        // Its sdst field is reserved rather than a register, so it is handled
+        // before operand parsing and emitted as the common wait type.
         let (code, result) = parse(&[0xBBFD_0000, S_ENDPGM], ShaderType::Compute, true);
-        result.expect("s_version must not fail the parse");
+        result.expect("s_waitcnt_vscnt must not fail the parse");
         let insts = code.get_instructions();
-        assert_eq!(insts.len(), 1, "s_version emits no instruction");
-        assert_eq!(insts[0].type_, T::SEndpgm);
+        assert_eq!(insts.len(), 2, "wait instruction remains a boundary");
+        assert_eq!(
+            (insts[0].pc, insts[0].type_, insts[0].format),
+            (0, T::SWaitcnt, F::Imm)
+        );
+        assert_eq!((insts[1].pc, insts[1].type_), (4, T::SEndpgm));
+    }
+
+    #[test]
+    fn sopk_s_version_is_next_gen_only() {
+        // GFX10 SOPK opcode 1 is s_version. It is metadata-only, but remains
+        // a named instruction/boundary instead of masquerading as s_movk.
+        let (code, result) = parse(&[0xB080_0001, S_ENDPGM], ShaderType::Compute, true);
+        result.expect("next-gen s_version parses");
+        assert_eq!(code.get_instructions()[0].type_, T::SVersion);
+        let (_, legacy) = parse(&[0xB080_0001, S_ENDPGM], ShaderType::Compute, false);
+        assert!(legacy.is_err(), "legacy SOPK opcode 1 is not s_version");
+    }
+
+    #[test]
+    fn branch_to_s_waitcnt_vscnt_after_mubuf_has_a_real_boundary() {
+        // Reduced form of the live ASTRO.BOT failure: the 64-bit MUBUF ends
+        // at pc 0xc, which is an s_waitcnt_vscnt and the branch target. When
+        // that wait was consumed without emitting an instruction, the next
+        // recorded boundary was 0x10 and the relooper blamed the MUBUF.
+        let words = [
+            0xBF82_0002, // s_branch +2 -> pc 0xc
+            0xE070_2000, // buffer_store_dword, idxen
+            0xFF01_0400, // fixed-width second MUBUF dword
+            0xBBFD_0000, // s_waitcnt_vscnt at the live branch target
+            S_ENDPGM,
+        ];
+        let (code, result) = parse(&words, ShaderType::Compute, true);
+        result.expect("parse branch to s_waitcnt_vscnt boundary");
+        let insts = code.get_instructions();
+        assert_eq!((insts[1].pc, insts[1].type_), (4, T::BufferStoreDword));
+        assert_eq!((insts[2].pc, insts[2].type_), (0xc, T::SWaitcnt));
+        assert!(
+            code.get_labels().iter().any(|label| label.get_dst() == 0xc),
+            "the branch target must resolve to the emitted wait boundary"
+        );
     }
 
     #[test]
