@@ -11,8 +11,8 @@ pub mod boot;
 pub mod console;
 pub mod control_center;
 pub mod home;
-pub mod ledger;
 pub mod icons;
+pub mod ledger;
 pub mod media;
 pub mod nav;
 pub mod per_game;
@@ -30,6 +30,7 @@ use home::HomeAnim;
 use nav::{NavAction, NavInput, NavMode, NavState, RailTab};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use xps5x_core::config::EmulatorConfig;
 
 enum Screen {
@@ -1374,11 +1375,19 @@ fn draw_session_overlay(
     let screen = ui.max_rect();
     ui.painter().rect_filled(screen, 0.0, theme.palette.ground);
 
+    let state = launcher.session_state(&session.handle);
+    // This is the guest process's completed VideoOut flip sequence, not an
+    // egui repaint count. The process-local counter also covers AGC-encoded
+    // flips because both paths converge on `sceVideoOutSubmitFlip`.
+    let presented_frames = session
+        .kernel
+        .as_ref()
+        .map(|kernel| kernel.video_out_flip_count.load(Ordering::Relaxed));
+
     // The title's own frames, when it has rendered any. Painted before the
     // status text so the text stays legible over a bright frame.
-    let presented = frame_view.paint(ui, screen);
+    let presented = frame_view.paint(ui, screen, presented_frames);
 
-    let state = launcher.session_state(&session.handle);
     // `session_detail` carries the engine's honest account of what actually
     // happened — a fault reason, or (for the real firmware launcher) a
     // "linked, not executed" summary — so the overlay never claims more
@@ -1404,6 +1413,13 @@ fn draw_session_overlay(
     // game. Step aside: a single dim line in the corner, so the screen is the
     // title's and the way out is still visible.
     let painter = ui.painter();
+    let presentation_bounds = match &presented {
+        present::Presented::Frame { rect } => *rect,
+        present::Presented::NoFrameYet => screen,
+    };
+    if state == SessionState::Running {
+        frame_view.paint_fps(ui, presentation_bounds);
+    }
     match presented {
         present::Presented::Frame { rect } => {
             painter.text(

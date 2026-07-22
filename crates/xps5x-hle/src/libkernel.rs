@@ -1738,6 +1738,7 @@ pub fn register(registry: &HleRegistry) {
     // scePthreadSetprio/Getprio are registered by `pthread_thread` (real
     // priority bookkeeping) — the old hle_ok_stub here dropped the value.
     registry.register("libkernel", "scePthreadSetaffinity", hle_ok_stub);
+    registry.register("libkernel", "scePthreadGetaffinity", hle_pthread_getaffinity);
     registry.register("libkernel", "scePthreadAttrSetaffinity", hle_ok_stub);
     registry.register("libkernel", "scePthreadAttrGetaffinity", hle_ok_stub);
     registry.register("libkernel", "scePthreadAttrGet", hle_ok_stub);
@@ -3628,6 +3629,18 @@ fn hle_fstat(ctx: &HleContext, args: &[u64]) -> u64 {
         if !ctx.mem.write(stat_out, &stat) {
             return SCE_KERNEL_ERROR_EFAULT;
         }
+    }
+    SCE_OK
+}
+
+/// `scePthreadGetaffinity(thread, mask_out)`: report the CPU cores this thread
+/// may run on. No scheduler binds guest threads to host cores yet, so every
+/// core a PS5 title is granted is reported available. `SceKernelCpumask` is the
+/// 64-bit ABI type; 0x7f is the 7-core mask a title sees (core 7 is the OS's).
+fn hle_pthread_getaffinity(ctx: &HleContext, args: &[u64]) -> u64 {
+    let mask_out = args.get(1).copied().unwrap_or(0);
+    if mask_out != 0 {
+        let _ = ctx.mem.write(mask_out, &0x7fu64.to_le_bytes());
     }
     SCE_OK
 }

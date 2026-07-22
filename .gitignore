@@ -82,3 +82,7 @@ Agents.md
 triangle.ppm
 *.ppm
 scratch/
+
+# Session ledger — per-game play-session records written at runtime
+# (e.g. session_ledger/ASTRO.BOT.json); machine-local user data, never commit.
+session_ledger/

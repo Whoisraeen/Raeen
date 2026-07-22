@@ -1,3 +1,55 @@
+- ASTRO.BOT post-audio "stall" diagnosed as mspace provider regression and
+  FIXED (2026-07-21; working tree, no commit; firmware 126/126):
+  * Exact wait classification with TRACE_COND + TIME_HLE: workers use the same
+    expected idle primitives/callers as the prior good run — cond waits at
+    eboot+0x11dd1 / +0x2b9119, job semaphores, and two audio event flags. Main
+    was not waiting: it spent 11.3 s inside 287,716 HLE mspace malloc calls;
+    boot stats counted 263,995 mallocs and 78,780 frees in the first 30 s.
+  * Regression comparison: `astro-cond-trace3` used the shipped libc allocator,
+    reached Resident Load at +17 s and first flip at +21 s. The current dirty
+    libc aliases made the default force-HLE mspace override capture that family;
+    a 140.6 s run never reached Resident Load. This was deterministic routing,
+    not timing or a missing condvar wake.
+  * A/B proof: `XPS5X_FORCE_HLE_MSPACE=0` on the same executable restored
+    Resident Load + flips. TDD then changed the policy to default LLE with
+    explicit `=1` HLE opt-in (`shipped_libc_mspace_prefers_lle_by_default_and_hle_is_opt_in`,
+    red then green). This keeps each stateful allocator family coherent.
+  * Fresh default proof after release rebuild, variable UNSET: Resident Load,
+    40 observed flips, zero guest faults/asserts in 45 s. Active flip window was
+    about 5.4 fps, not 120 fps; no performance claim. NEXT remains the prior
+    post-pause-menu poisoned-object fault (or the first earlier fault on a
+    longer default run), then GPU throughput.
+  * Verification: `cargo test -p xps5x-firmware` (110 unit + 10 coverage +
+    3 homebrew + 3 transitive = 126), firmware clippy `-D warnings`, firmware
+    fmt check, release GUI build. Artifacts: `scratch/astro-post-audio-sync-trace-20260721.out.log`,
+    `scratch/astro-lle-mspace-ab-20260721.out.log`, and
+    `scratch/astro-default-lle-mspace-proof-20260721.out.log`.
+
+- ASTRO.BOT zero-size global-heap false OOM FIXED (2026-07-21; working tree,
+  no commit; hle 346/346, hle clippy clean):
+  * Fresh release trace reproduced eboot+0x222f / `Memory.cpp:69` immediately
+    after material setup. The fatal HLE call was measured exactly:
+    `sceLibcMspaceMalloc(msp=0x300000000, size=0)` (caller eboot+0x27dfac)
+    returned NULL, which the title interpreted as `Out of Global Heap Memory`.
+  * TDD: new `mspace_malloc_zero_returns_distinct_non_null_allocations` failed
+    on the NULL result, then passed after the malloc wrapper normalized a
+    zero-byte request to a unique one-byte allocation. Direct memalign(0) and
+    realloc(ptr,0) semantics remain unchanged.
+  * Fresh release proof: 140.6-second `--run-eboot` run had zero ASSERT/fault/
+    RESULT lines and passed the old failure into 47 guest threads plus audio
+    initialization. `XPS5X_TRACE_FLIP` / `XPS5X_DUMP_FRAMES` measured 0 flips
+    and 0 frames, so no FPS claim is possible yet.
+  * NEXT RED GATE: post-audio synchronization stall. Repeated STALL_DUMP
+    snapshots show no in-flight HLE while nearly every guest host thread is in
+    `WaitOnAddress`; guest console stops after the last material replacement.
+    Identify the main/worker wait dependency before returning to the prior
+    Resident Load / pause-menu poisoned-object fault. Run artifacts:
+    `scratch/astro-mspace-zero-{confirm,fixed-120s}-20260721.out.log`.
+  * Verification: focused red->green test; `cargo test -p xps5x-hle` 346/346;
+    `cargo clippy -p xps5x-hle -- -D warnings`; release GUI build. Workspace
+    fmt check is red on unrelated concurrent formatting drift in graphics,
+    core, GUI, and the already-dirty HLE files.
+
 - ASTRO.BOT condvar-stall RESOLVED + three fatal-stall classes fixed; title now
   loads the PAUSE MENU (2026-07-21; hle 344, kernel 23, clippy 0, fmt clean):
   * RE of the job-post path (old task: trace module+0xdefa40): it is the

@@ -463,26 +463,21 @@ const MSPACE_FORCE_HLE_NIDS: &[u64] = &[
 /// Whether the mspace force-HLE policy is active, given the raw value of
 /// `XPS5X_FORCE_HLE_MSPACE` (`None` = unset).
 ///
-/// **Default-on, opt-out.** The policy encodes a real, current limitation of
-/// the LLE path: a shipped libc's NATIVE `sceLibcMspaceCreate` hands back a
-/// NULL mspace against our arenas and its native `sceLibcMspaceFree` then
-/// faults dereferencing it (`test byte [rbx+0x370], 2` with rbx=0 — measured
-/// on ASTRO.BOT's own `libc.prx`, whose boot depends on this). Routing the
-/// family to the self-consistent HLE (Create returns a handle Malloc/Free
-/// accept, and `hle_mspace_create` NAMES the args native create rejected)
-/// avoids the null-deref entirely.
+/// **Default-off, explicit opt-in.** A shipped libc is `PreferLle` because its
+/// stateful allocator family must stay inside one implementation. Measured on
+/// ASTRO.BOT (2026-07-21), forcing the family to HLE caused 287,716 main-thread
+/// malloc calls to consume 11.3 seconds and prevented the title from reaching
+/// Resident Load after 140 seconds. Leaving the family LLE reached Resident
+/// Load and the first flip in about 22 seconds in the same build.
 ///
-/// The variable used to be an opt-IN gate for this workaround; graduating the
-/// policy to the default inverts the gate's meaning. Set
-/// `XPS5X_FORCE_HLE_MSPACE=0` to DISABLE the policy and leave a shipped
-/// libc's mspace functions LLE — only useful when debugging the LLE arena
-/// path itself. Unset, `=1`, or any other value keeps the policy (so old
-/// invocations that exported `=1` behave exactly as before).
+/// `XPS5X_FORCE_HLE_MSPACE=1` keeps the old workaround available for titles
+/// whose shipped allocator cannot initialize against the guest arena. Unset,
+/// `=0`, and other values preserve the shipped module's coherent allocator.
 ///
 /// Pure — the env value arrives as an argument — so the decision is testable
 /// without mutating process-global state.
 fn mspace_force_hle_enabled(env_value: Option<&str>) -> bool {
-    !matches!(env_value, Some("0"))
+    matches!(env_value, Some("1"))
 }
 
 /// Force every [`MSPACE_FORCE_HLE_NIDS`] symbol of `module` to resolve HLE,
@@ -491,7 +486,7 @@ fn mspace_force_hle_enabled(env_value: Option<&str>) -> bool {
 /// so this is a no-op for it. Separated from the env read so the policy
 /// itself is unit-testable.
 fn force_hle_mspace_family(registry: &mut registry::ModuleRegistry, module: &str) {
-    tracing::debug!("mspace force-HLE policy (default-on) applied to {module}");
+    tracing::debug!("mspace force-HLE diagnostic override applied to {module}");
     for &nid in MSPACE_FORCE_HLE_NIDS {
         registry.force_hle_nid(module, nid);
     }
@@ -1123,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn mspace_family_is_forced_hle_by_default_and_opt_out_restores_lle() {
+    fn shipped_libc_mspace_prefers_lle_by_default_and_hle_is_opt_in() {
         use crate::dynlib::SymbolExport;
         use crate::registry::ModulePolicy;
 
@@ -1147,12 +1142,12 @@ mod tests {
             registry.resolve_import(&hle, "libc.prx", "libSceLibcInternal", nid)
         };
 
-        // The gate: default-ON, `=0` opts out for LLE-path debugging, every
-        // other value (including the old opt-in `=1`) keeps the policy.
-        assert!(super::mspace_force_hle_enabled(None), "default-on");
+        // A shipped libc owns its stateful allocator by default. The HLE
+        // workaround remains an explicit diagnostic opt-in.
+        assert!(!super::mspace_force_hle_enabled(None), "default-off");
         assert!(
             !super::mspace_force_hle_enabled(Some("0")),
-            "XPS5X_FORCE_HLE_MSPACE=0 disables the policy"
+            "XPS5X_FORCE_HLE_MSPACE=0 keeps the shipped allocator"
         );
         assert!(super::mspace_force_hle_enabled(Some("1")));
 
@@ -1160,7 +1155,7 @@ mod tests {
         // wins — this is the raw LLE behavior the opt-out restores.
         assert_eq!(resolve(&registry), Resolver::Lle { addr: 0x1234 });
 
-        // Default policy applied: the NID resolves HLE even though a shipped
+        // Explicit opt-in applied: the NID resolves HLE even though a shipped
         // module exports it and the module is PreferLle.
         super::force_hle_mspace_family(&mut registry, "libc.prx");
         match resolve(&registry) {
@@ -1169,7 +1164,7 @@ mod tests {
                 assert_eq!(function, "sceLibcMspaceCreate");
             }
             other => {
-                panic!("expected Resolver::Hle under the default-on mspace policy, got {other:?}")
+                panic!("expected Resolver::Hle under the opt-in mspace policy, got {other:?}")
             }
         }
     }

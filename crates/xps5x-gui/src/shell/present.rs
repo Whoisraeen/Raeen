@@ -24,6 +24,57 @@
 //! `egui_wgpu` paint-callback path. Both are real integrations (M3 swapchain
 //! territory), not an optimization of this view.
 
+use std::time::{Duration, Instant};
+
+/// Minimum wall-clock interval between rate updates. The guest flip counter is
+/// process-owned and monotonic, so measuring its delta over real elapsed time
+/// stays honest even when egui repaints faster (or slower) than the title.
+const FPS_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Default)]
+struct PresentedFrameRate {
+    baseline: Option<(Instant, u64)>,
+    fps: Option<f64>,
+}
+
+impl PresentedFrameRate {
+    fn observe(&mut self, now: Instant, presented_frames: Option<u64>) {
+        let Some(presented_frames) = presented_frames else {
+            self.reset();
+            return;
+        };
+        let Some((baseline_at, baseline_frames)) = self.baseline else {
+            self.baseline = Some((now, presented_frames));
+            return;
+        };
+
+        // A lower count means a new/reset process. Never turn that into a huge
+        // wrapped delta; establish a fresh baseline for the new title instead.
+        if presented_frames < baseline_frames {
+            self.baseline = Some((now, presented_frames));
+            self.fps = None;
+            return;
+        }
+
+        let elapsed = now.saturating_duration_since(baseline_at);
+        if elapsed < FPS_SAMPLE_INTERVAL {
+            return;
+        }
+        self.fps = Some((presented_frames - baseline_frames) as f64 / elapsed.as_secs_f64());
+        self.baseline = Some((now, presented_frames));
+    }
+
+    fn label(&self) -> String {
+        self.fps
+            .map_or_else(|| "-- FPS".to_string(), |fps| format!("{fps:.0} FPS"))
+    }
+
+    fn reset(&mut self) {
+        self.baseline = None;
+        self.fps = None;
+    }
+}
+
 /// Presents the newest rendered guest frame, if there is one.
 #[derive(Default)]
 pub(crate) struct GameFrameView {
@@ -34,6 +85,11 @@ pub(crate) struct GameFrameView {
     /// the UI repaints far faster than a title renders, and cloning 8 MB per UI
     /// frame would make the viewer cost more than the renderer.
     shown_at_draw: u64,
+    /// Process-local VideoOut flip count when the texture was refreshed. CPU
+    /// drawn scanouts can change without a GPU draw, so draw count alone misses
+    /// those real presented-frame updates.
+    shown_at_present: u64,
+    frame_rate: PresentedFrameRate,
 }
 
 /// What the viewer managed to show, so the caller can say something honest
@@ -47,10 +103,20 @@ pub(crate) enum Presented {
 
 impl GameFrameView {
     /// Paint the latest guest frame into `screen`, letterboxed.
-    pub(crate) fn paint(&mut self, ui: &egui::Ui, screen: egui::Rect) -> Presented {
+    pub(crate) fn paint(
+        &mut self,
+        ui: &egui::Ui,
+        screen: egui::Rect,
+        presented_frames: Option<u64>,
+    ) -> Presented {
+        self.frame_rate.observe(Instant::now(), presented_frames);
         let session = xps5x_gpu::AgcGpuSession::global();
         let drawn = session.draw_count();
-        if drawn != self.shown_at_draw || self.texture.is_none() {
+        let presented = presented_frames.unwrap_or(0);
+        if drawn != self.shown_at_draw
+            || presented != self.shown_at_present
+            || self.texture.is_none()
+        {
             // Deliberately does NOT `wait_idle()`: submission is asynchronous,
             // and blocking the UI thread until the GPU drained is exactly the
             // stall this Shell already had once. A viewer wants the latest frame
@@ -71,6 +137,7 @@ impl GameFrameView {
                         }
                     }
                     self.shown_at_draw = drawn;
+                    self.shown_at_present = presented;
                 }
             }
         }
@@ -88,11 +155,34 @@ impl GameFrameView {
         Presented::Frame { rect }
     }
 
+    /// Paint the measured guest presentation rate. This deliberately consumes
+    /// only `sceVideoOut` flip-count deltas; egui repaint cadence is irrelevant.
+    pub(crate) fn paint_fps(&self, ui: &egui::Ui, bounds: egui::Rect) {
+        let badge = egui::Rect::from_min_size(
+            egui::pos2(bounds.right() - 92.0, bounds.top() + 12.0),
+            egui::vec2(80.0, 30.0),
+        );
+        ui.painter().rect_filled(
+            badge,
+            6.0,
+            egui::Color32::from_rgba_unmultiplied(8, 11, 18, 210),
+        );
+        ui.painter().text(
+            badge.center(),
+            egui::Align2::CENTER_CENTER,
+            self.frame_rate.label(),
+            egui::FontId::monospace(15.0),
+            egui::Color32::WHITE,
+        );
+    }
+
     /// Drop the frame when a session ends, so the next launch cannot open on the
     /// previous title's last frame.
     pub(crate) fn clear(&mut self) {
         self.texture = None;
         self.shown_at_draw = 0;
+        self.shown_at_present = 0;
+        self.frame_rate.reset();
     }
 }
 
@@ -113,6 +203,38 @@ fn letterbox(screen: egui::Rect, content: egui::Vec2) -> egui::Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presented_frame_rate_uses_guest_flip_delta_over_real_time() {
+        let start = Instant::now();
+        let mut rate = PresentedFrameRate::default();
+        rate.observe(start, Some(10));
+        // UI repaints do not themselves add frames.
+        rate.observe(start + Duration::from_millis(250), Some(10));
+        assert_eq!(rate.label(), "-- FPS");
+        rate.observe(start + Duration::from_secs(1), Some(130));
+        assert_eq!(rate.label(), "120 FPS");
+    }
+
+    #[test]
+    fn presented_frame_rate_reports_zero_when_guest_stops_flipping() {
+        let start = Instant::now();
+        let mut rate = PresentedFrameRate::default();
+        rate.observe(start, Some(7));
+        rate.observe(start + FPS_SAMPLE_INTERVAL, Some(7));
+        assert_eq!(rate.label(), "0 FPS");
+    }
+
+    #[test]
+    fn presented_frame_rate_rebaselines_when_process_counter_resets() {
+        let start = Instant::now();
+        let mut rate = PresentedFrameRate::default();
+        rate.observe(start, Some(100));
+        rate.observe(start + Duration::from_secs(1), Some(160));
+        assert_eq!(rate.label(), "60 FPS");
+        rate.observe(start + Duration::from_secs(2), Some(2));
+        assert_eq!(rate.label(), "-- FPS");
+    }
 
     #[test]
     fn letterbox_preserves_aspect_and_fits_inside_the_screen() {

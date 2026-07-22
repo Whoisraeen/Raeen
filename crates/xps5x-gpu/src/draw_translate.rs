@@ -434,7 +434,7 @@ fn alloc_zeroed(len: usize, kind: &str) -> Result<Vec<u8>, DrawError> {
     Ok(buf)
 }
 
-fn gen5_vertex_format(format: u8) -> Result<vk::Format, DrawError> {
+fn gen5_vertex_format_and_size(format: u8) -> Result<(vk::Format, u64), DrawError> {
     // Gen5 unified-format code → Vulkan, per SharpEmu's Gfx10UnifiedFormat
     // table (the RDNA2 authority): 64 → (11,7) = 32_32_FLOAT,
     // 74 → (13,7) = 32_32_32_FLOAT, 77 → (14,7) = 32_32_32_32_FLOAT,
@@ -442,13 +442,13 @@ fn gen5_vertex_format(format: u8) -> Result<vk::Format, DrawError> {
     // 11 → (2,4) = 16 UINT (measured: Minecraft's packed per-vertex value),
     // 57 → (10,1) = 8_8_8_8 SNORM (same UI draw, next attribute).
     match format {
-        74 => Ok(vk::Format::R32G32B32_SFLOAT),
-        64 => Ok(vk::Format::R32G32_SFLOAT),
-        77 => Ok(vk::Format::R32G32B32A32_SFLOAT),
-        56 => Ok(vk::Format::R8G8B8A8_UNORM),
-        57 => Ok(vk::Format::R8G8B8A8_SNORM),
-        71 => Ok(vk::Format::R16G16B16A16_SFLOAT),
-        23 => Ok(vk::Format::R16G16_UNORM),
+        74 => Ok((vk::Format::R32G32B32_SFLOAT, 12)),
+        64 => Ok((vk::Format::R32G32_SFLOAT, 8)),
+        77 => Ok((vk::Format::R32G32B32A32_SFLOAT, 16)),
+        56 => Ok((vk::Format::R8G8B8A8_UNORM, 4)),
+        57 => Ok((vk::Format::R8G8B8A8_SNORM, 4)),
+        71 => Ok((vk::Format::R16G16B16A16_SFLOAT, 8)),
+        23 => Ok((vk::Format::R16G16_UNORM, 4)),
         // MUST be a float-convertible format, NOT an integer one. The SPIR-V
         // we generate declares EVERY vertex input as float/vecN-float
         // (`Spirv::WriteGlobalVariables` only ever emits %_ptr_Input_float /
@@ -461,11 +461,15 @@ fn gen5_vertex_format(format: u8) -> Result<vk::Format, DrawError> {
         // which is why every target stayed byte-exactly zero.
         // R16_USCALED delivers the same integer VALUE converted to float,
         // which is what a float input expects.
-        11 => Ok(vk::Format::R16_USCALED),
+        11 => Ok((vk::Format::R16_USCALED, 2)),
         other => Err(err(format!(
             "unsupported Gen5 vertex-buffer format {other}"
         ))),
     }
+}
+
+fn gen5_vertex_format(format: u8) -> Result<vk::Format, DrawError> {
+    Ok(gen5_vertex_format_and_size(format)?.0)
 }
 
 fn prepare_vertex_inputs(
@@ -486,9 +490,52 @@ fn prepare_vertex_inputs(
     let mut buffers = Vec::with_capacity(buffers_num);
     let mut attributes = Vec::with_capacity(resources_num);
     for (binding, guest) in info.buffers[..buffers_num].iter().enumerate() {
-        let size = u64::from(guest.stride)
-            .checked_mul(u64::from(guest.num_records))
+        let attr_num = usize::try_from(guest.attr_num).map_err(|_| {
+            err(format!(
+                "negative vertex attribute count {}",
+                guest.attr_num
+            ))
+        })?;
+        if attr_num > guest.attr_indices.len() {
+            return Err(err("vertex attribute count exceeds fixed array"));
+        }
+
+        let stride = u64::from(guest.stride);
+        let records = u64::from(guest.num_records);
+        let mut size = stride
+            .checked_mul(records)
             .ok_or_else(|| err("vertex buffer size overflow"))?;
+        // A merged input buffer may contain a format wider than the bytes left
+        // in its stride (ASTRO.BOT: float4 at offset 16, stride 24). GCN fetch
+        // descriptors address each attribute independently, so the final fetch
+        // extends past `stride * records`. Size the host upload to the union of
+        // every descriptor instead of exposing an out-of-bounds Vulkan read.
+        if records != 0 {
+            for ai in 0..attr_num {
+                let location = usize::try_from(guest.attr_indices[ai]).map_err(|_| {
+                    err(format!(
+                        "negative vertex attribute index {}",
+                        guest.attr_indices[ai]
+                    ))
+                })?;
+                if location >= resources_num {
+                    return Err(err(format!(
+                        "vertex attribute {location} exceeds resource count {resources_num}"
+                    )));
+                }
+                let (_, format_bytes) =
+                    gen5_vertex_format_and_size(info.resources[location].format())?;
+                let extent = u64::from(guest.attr_offsets[ai])
+                    .checked_add(
+                        stride
+                            .checked_mul(records - 1)
+                            .ok_or_else(|| err("vertex attribute extent overflow"))?,
+                    )
+                    .and_then(|n| n.checked_add(format_bytes))
+                    .ok_or_else(|| err("vertex attribute extent overflow"))?;
+                size = size.max(extent);
+            }
+        }
         let bytes = read_guest_bytes(guest.addr, size, "vertex buffer")?;
         // Coverage probe (XPS5X_TRACE_DRAWS): XPS5X_FORCE_CLEAR proved well-
         // formed quads rasterize ZERO fragments, so the suspect is the vertex
@@ -517,15 +564,6 @@ fn prepare_vertex_inputs(
             stride: guest.stride,
         });
 
-        let attr_num = usize::try_from(guest.attr_num).map_err(|_| {
-            err(format!(
-                "negative vertex attribute count {}",
-                guest.attr_num
-            ))
-        })?;
-        if attr_num > guest.attr_indices.len() {
-            return Err(err("vertex attribute count exceeds fixed array"));
-        }
         for ai in 0..attr_num {
             let location = usize::try_from(guest.attr_indices[ai]).map_err(|_| {
                 err(format!(
@@ -3208,6 +3246,44 @@ mod tests {
             16,
             "rewritten descriptor must preserve the guest stride"
         );
+    }
+
+    /// ASTRO.BOT's measured HDR composite interleaves a float4 at offset 0 and
+    /// another float4 at offset 16 in a 24-byte stride.  The second descriptor
+    /// legally overlaps the next record, so the merged host upload must cover
+    /// the final attribute fetch (80 bytes), not merely stride * records (72).
+    #[cfg(windows)]
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn interleaved_vertex_upload_covers_final_attribute_extent() {
+        let guest = vec![0x5au8; 80];
+        let base = guest.as_ptr() as u64;
+
+        let mut vs = ShaderVertexInputInfo::default();
+        vs.resources_num = 2;
+        vs.buffers_num = 1;
+        for (index, offset) in [(0usize, 0u64), (1, 16)] {
+            vs.resources[index].update_address48(base + offset);
+            vs.resources[index].fields[1] |= 24 << 16;
+            vs.resources[index].fields[2] = 3;
+            vs.resources[index].fields[3] = 77 << 12; // float4 = 16 bytes
+        }
+        vs.buffers[0].addr = base;
+        vs.buffers[0].stride = 24;
+        vs.buffers[0].num_records = 3;
+        vs.buffers[0].attr_num = 2;
+        vs.buffers[0].attr_indices[0] = 0;
+        vs.buffers[0].attr_indices[1] = 1;
+        vs.buffers[0].attr_offsets[0] = 0;
+        vs.buffers[0].attr_offsets[1] = 16;
+
+        let ranges = [(base, guest.len())];
+        let (buffers, attributes) =
+            crate::guest_mem::with_test_ranges(&ranges, || prepare_vertex_inputs(&vs))
+                .expect("measured ASTRO interleaved vertex ABI");
+        assert_eq!(buffers[0].bytes.len(), 80);
+        assert_eq!(attributes[1].format, vk::Format::R32G32B32A32_SFLOAT);
+        assert_eq!(attributes[1].offset, 16);
     }
 
     /// A linear (tile mode 0) format-56 RGBA8 T# at `base`, `w`x`h`.

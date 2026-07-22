@@ -439,6 +439,71 @@ pub fn register(registry: &HleRegistry) {
         hle_cb_dispatch_get_size,
     );
     registry.register("libSceAgc", "sceAgcCbNopGetSize", hle_cb_nop_get_size);
+    // AcquireMem packets are a fixed 8 DWORDs on both queues (SharpEmu
+    // `Pm4(8, ItNop, RAcquireMem)`, AgcExports.cs L1147/L1718), so both GetSize
+    // helpers report 32 bytes — the byte convention every other GetSize here
+    // uses (Dispatch: 5 DWORDs -> 20 bytes). GTA V (PPSA04264) sizes its
+    // command buffer with these before emitting the packet.
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbAcquireMemGetSize",
+        hle_acquire_mem_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcAcbAcquireMemGetSize",
+        hle_acquire_mem_get_size,
+    );
+    // More fixed-size command-buffer GetSize helpers GTA V (PPSA04264) sizes
+    // with. Jump = 4-DWORD INDIRECT_BUFFER (matches `hle_dcb_jump`);
+    // Rewind = 2-DWORD IT_REWIND; QueueEndOfPipeAction = 8-DWORD RELEASE_MEM
+    // (matches SharpEmu `CbReleaseMem`, `Pm4(8, ItNop, RReleaseMem)`). Byte
+    // units, per the convention above.
+    registry.register("libSceAgc", "sceAgcDcbJumpGetSize", hle_dcb_jump_get_size);
+    registry.register("libSceAgc", "sceAgcDcbRewindGetSize", hle_dcb_rewind_get_size);
+    registry.register(
+        "libSceAgc",
+        "sceAgcCbQueueEndOfPipeActionGetSize",
+        hle_queue_eop_action_get_size,
+    );
+    // `sceAgcDriverSetTFRing(ring, size)`: binds the tessellation-factor ring
+    // buffer. No tessellation path yet, so record nothing and return OK
+    // (SharpEmu `DriverSetTFRing` is the same no-op, AgcExports.cs).
+    registry.register("libSceAgcDriver", "sceAgcDriverSetTFRing", hle_ok_stub);
+    // libSceAgcDriver introspection/registration surface. These are driver
+    // bookkeeping (resource registration, capture/trace control, submission
+    // validation) with no host GPU state to touch yet; on real hardware they
+    // return OK / a benign default. Returning an Orbis ERROR instead makes a
+    // title assert (GTA V PPSA04264 traps `int 0x41` on the error return from
+    // `sceAgcDriverSetHsOffchipParam`), so accept-and-succeed. `Is*`/`Get*`
+    // return 0 = "not in progress" / "no data", which callers treat as benign.
+    for name in [
+        "sceAgcDriverSetHsOffchipParam",
+        "sceAgcDriverSetResourceUserData",
+        "sceAgcDriverGetResourceUserData",
+        "sceAgcDriverRegisterWorkloadStream",
+        "sceAgcDriverUnregisterWorkloadStream",
+        "sceAgcDriverRegisterGdsResource",
+        "sceAgcDriverUnregisterResource",
+        "sceAgcDriverUnregisterAllResourcesForOwner",
+        "sceAgcDriverUnregisterOwnerAndResources",
+        "sceAgcDriverFindResourcesPublic",
+        "sceAgcDriverGetOwnerName",
+        "sceAgcDriverGetResourceName",
+        "sceAgcDriverGetResourceType",
+        "sceAgcDriverGetResourceShaderGuid",
+        "sceAgcDriverGetResourceBaseAddressAndSizeInBytes",
+        "sceAgcDriverGetEqEventType",
+        "sceAgcDriverGetEqContextId",
+        "sceAgcDriverGetShaderDebuggingStatus",
+        "sceAgcDriverIsTraceInProgress",
+        "sceAgcDriverIsCaptureInProgress",
+        "sceAgcDriverIsSubmitValidationEnabled",
+        "sceAgcDriverRequestCaptureStart",
+        "sceAgcDriverRequestCaptureStop",
+    ] {
+        registry.register("libSceAgcDriver", name, hle_ok_stub);
+    }
     registry.register(
         "libSceAgc",
         "sceAgcDcbDrawIndexIndirect",
@@ -2419,6 +2484,38 @@ fn hle_cb_dispatch_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
 /// from the writer (its only size input is the DWORD count); byte units follow
 /// SharpEmu's GetSize convention (e.g. `DcbDmaDataGetSize`, AgcExports.cs
 /// L1955-1964). Warns once about the inference.
+/// `sceAgc{Dcb,Acb}AcquireMemGetSize()`: BYTES an ACQUIRE_MEM packet occupies —
+/// a fixed 8 DWORDs = 32 (matches the `Pm4(8, ItNop, RAcquireMem)` writers on
+/// both queues). Byte units, per the GetSize convention above.
+fn hle_acquire_mem_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    8 * 4
+}
+
+/// `sceAgcDcbJumpGetSize()`: BYTES a JUMP packet occupies — a fixed 4-DWORD
+/// INDIRECT_BUFFER chain (matches `hle_dcb_jump`). 16 bytes.
+fn hle_dcb_jump_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    4 * 4
+}
+
+/// `sceAgcDcbRewindGetSize()`: BYTES a REWIND packet occupies — a 2-DWORD
+/// IT_REWIND. 8 bytes.
+fn hle_dcb_rewind_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    2 * 4
+}
+
+/// `sceAgcCbQueueEndOfPipeActionGetSize()`: BYTES an end-of-pipe action packet
+/// occupies — a fixed 8-DWORD RELEASE_MEM (matches SharpEmu `CbReleaseMem`).
+/// 32 bytes.
+fn hle_queue_eop_action_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    8 * 4
+}
+
+/// Accept-and-ignore stub for AGC entry points with no state to record yet
+/// (e.g. `sceAgcDriverSetTFRing`). Returns Orbis OK (0).
+fn hle_ok_stub(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    0
+}
+
 fn hle_cb_nop_get_size(_ctx: &HleContext, args: &[u64]) -> u64 {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let dword_count = args.first().copied().unwrap_or(0) as u32;

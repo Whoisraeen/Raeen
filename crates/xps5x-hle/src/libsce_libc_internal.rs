@@ -21,7 +21,7 @@
 //! process under the runtime's RT0 single-active-execution invariant),
 //! lazily carved from the guest arena on first request.
 
-use crate::{HleContext, HleRegistry};
+use crate::{HleContext, HleFunction, HleRegistry};
 use std::sync::atomic::Ordering;
 use tracing::{debug, warn};
 
@@ -64,7 +64,46 @@ pub fn register(registry: &HleRegistry) {
         "__cxa_pure_virtual",
         hle_cxa_pure_virtual,
     );
-    registry.register("libSceLibcInternal", "_ZdlPv", hle_operator_delete);
+    // C++ `operator new`/`operator delete` and all their overloads. Titles
+    // import these from EITHER `libc` (ASTRO.BOT PPSA21564 imports `_Znwm` from
+    // libc) or `libSceLibcInternal` (libc.prx re-exports them), so register
+    // under both — resolution keys on the importing symbol's library.
+    for lib in ["libc", "libSceLibcInternal"] {
+        // operator new / new[] (throwing + nothrow): plain size arg.
+        for name in [
+            "_Znwm",                        // operator new(size_t)
+            "_Znam",                        // operator new[](size_t)
+            "_ZnwmRKSt9nothrow_t",          // operator new(size_t, nothrow_t)
+            "_ZnamRKSt9nothrow_t",          // operator new[](size_t, nothrow_t)
+        ] {
+            registry.register(lib, name, hle_operator_new);
+        }
+        // Aligned operator new / new[]: (size, align[, nothrow]).
+        for name in [
+            "_ZnwmSt11align_val_t",
+            "_ZnamSt11align_val_t",
+            "_ZnwmSt11align_val_tRKSt9nothrow_t",
+            "_ZnamSt11align_val_tRKSt9nothrow_t",
+        ] {
+            registry.register(lib, name, hle_operator_new_aligned);
+        }
+        // operator delete / delete[] (plain, sized, aligned, array): free the
+        // pointer, ignore the advisory size/align argument.
+        for name in [
+            "_ZdlPv",                       // operator delete(void*)
+            "_ZdaPv",                       // operator delete[](void*)
+            "_ZdlPvm",                      // sized operator delete(void*, size_t)
+            "_ZdaPvm",
+            "_ZdlPvSt11align_val_t",        // aligned operator delete
+            "_ZdaPvSt11align_val_t",
+            "_ZdlPvmSt11align_val_t",       // sized+aligned
+            "_ZdaPvmSt11align_val_t",
+            "_ZdlPvRKSt9nothrow_t",         // nothrow operator delete
+            "_ZdaPvRKSt9nothrow_t",
+        ] {
+            registry.register(lib, name, hle_operator_delete);
+        }
+    }
     // `_Stoul` is the Dinkumware STL's strtoul core — identical
     // `(nptr, endptr, base)` ABI to POSIX strtoul, so the real libc parser
     // serves it.
@@ -110,6 +149,68 @@ pub fn register(registry: &HleRegistry) {
         "sceLibcMspaceRealloc",
         hle_mspace_realloc,
     );
+    // The `sceLibcMspace*` heap family, `_Stoul`, and `__cxa_pure_virtual` are
+    // re-exported by `libc.prx`, and titles import them from `libc` (ASTRO.BOT
+    // PPSA21564 imports the whole mspace heap from libc — its `new`/STL heap
+    // rides on an mspace). Resolution keys on the importing library, so mirror
+    // every one under `libc` too. `MallocStatsFast` shares the stats handler.
+    let mspace_family: [(&str, HleFunction); 11] = [
+        ("sceLibcMspaceCreate", hle_mspace_create),
+        ("sceLibcMspaceDestroy", hle_mspace_destroy),
+        ("sceLibcMspaceFree", hle_mspace_free),
+        ("sceLibcMspaceMalloc", hle_mspace_malloc),
+        ("sceLibcMspaceCalloc", hle_mspace_calloc),
+        ("sceLibcMspaceMemalign", hle_mspace_memalign),
+        ("sceLibcMspaceRealloc", hle_mspace_realloc),
+        ("sceLibcMspaceMallocUsableSize", hle_mspace_malloc_usable_size),
+        ("sceLibcMspaceMallocStats", hle_mspace_malloc_stats),
+        ("sceLibcMspaceMallocStatsFast", hle_mspace_malloc_stats),
+        ("__cxa_pure_virtual", hle_cxa_pure_virtual),
+    ];
+    for (name, func) in mspace_family {
+        registry.register("libc", name, func);
+    }
+    // Calloc is new under libSceLibcInternal too; _Stoul under libc.
+    registry.register("libSceLibcInternal", "sceLibcMspaceCalloc", hle_mspace_calloc);
+    registry.register("libc", "_Stoul", crate::libc::hle_strtoul);
+    // `std::_Random_device()` (Dinkumware's `random_device` core) returns a
+    // fresh unsigned int the STL uses to seed a PRNG. No host entropy source is
+    // wired in; an xorshift32 gives distinct successive values, enough to seed.
+    registry.register("libc", "_ZSt14_Random_devicev", hle_std_random_device);
+    registry.register(
+        "libSceLibcInternal",
+        "_ZSt14_Random_devicev",
+        hle_std_random_device,
+    );
+}
+
+/// `sceLibcMspaceCalloc(msp, nmemb, size)`: allocate `nmemb * size` zeroed
+/// bytes from the mspace. Overflow in the product yields a null return, matching
+/// `calloc`. Mirrors `hle_mspace_malloc` then zero-fills the block.
+fn hle_mspace_calloc(ctx: &HleContext, args: &[u64]) -> u64 {
+    let nmemb = args.get(1).copied().unwrap_or(0);
+    let size = args.get(2).copied().unwrap_or(0);
+    let Some(total) = nmemb.checked_mul(size) else {
+        return 0;
+    };
+    let addr = hle_mspace_malloc(ctx, &[args.first().copied().unwrap_or(0), total]);
+    if addr != 0 && total != 0 {
+        let _ = ctx.mem.write(addr, &vec![0u8; total as usize]);
+    }
+    addr
+}
+
+/// `std::_Random_device()`: return a fresh 32-bit value (xorshift32 so the
+/// STL's repeated calls while seeding a generator each differ).
+fn hle_std_random_device(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static STATE: AtomicU32 = AtomicU32::new(0x9e37_79b9);
+    let mut x = STATE.load(Ordering::Relaxed);
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    STATE.store(x, Ordering::Relaxed);
+    u64::from(x)
 }
 
 /// `__cxa_finalize(void *dso)`: run the atexit/destructor chain registered
@@ -140,10 +241,35 @@ fn hle_cxa_pure_virtual(ctx: &HleContext, _args: &[u64]) -> u64 {
     0
 }
 
+/// `_Znwm`/`_Znam` — `operator new(size_t)` / `operator new[](size_t)` and the
+/// nothrow overloads (`...RKSt9nothrow_t`): allocate `size` bytes from the same
+/// arena as `malloc`/`operator delete`. C++ requires a UNIQUE non-null pointer
+/// even for a zero-size request, so 0 allocates 1 byte. A failed allocation
+/// should throw `std::bad_alloc`; with no C++ exception machinery the HLE hands
+/// back null (the caller faults visibly rather than corrupting silently).
+/// A C++ game cannot construct a single object without this — it is the very
+/// first thing a title's runtime touches, so a missing `_Znwm` halts boot at
+/// crt0 (measured on ASTRO.BOT PPSA21564).
+fn hle_operator_new(ctx: &HleContext, args: &[u64]) -> u64 {
+    let size = args.first().copied().unwrap_or(0).max(1);
+    ctx.alloc.alloc(size, 16).unwrap_or(0)
+}
+
+/// `_ZnwmSt11align_val_t` and friends — the aligned `operator new` overloads.
+/// The requested alignment arrives in the 2nd integer argument; honour it (a
+/// minimum of 16 matches the default `malloc` alignment).
+fn hle_operator_new_aligned(ctx: &HleContext, args: &[u64]) -> u64 {
+    let size = args.first().copied().unwrap_or(0).max(1);
+    let align = args.get(1).copied().unwrap_or(16).max(16);
+    ctx.alloc.alloc(size, align).unwrap_or(0)
+}
+
 /// `_ZdlPv` — `operator delete(void*)`: releases storage that came from the
 /// allocator behind `malloc`/`operator new` (this HLE's `ctx.alloc`, the
 /// same model `libc::hle_free` frees into). `delete nullptr` is defined as a
-/// no-op.
+/// no-op. The sized/aligned/array overloads (`_ZdlPvm`, `_ZdlPvSt11align_val_t`,
+/// `_ZdaPv`, ...) release the same way — the extra size/align argument is
+/// advisory and ignored, exactly like `free`.
 fn hle_operator_delete(ctx: &HleContext, args: &[u64]) -> u64 {
     let ptr = args.first().copied().unwrap_or(0);
     debug!("operator delete(_ZdlPv)(ptr={ptr:#x})");
@@ -316,7 +442,10 @@ fn hle_mspace_destroy(ctx: &HleContext, args: &[u64]) -> u64 {
 /// on what it returns. A half-HLE'd library is split-brained by construction.
 fn hle_mspace_malloc(ctx: &HleContext, args: &[u64]) -> u64 {
     let mspace = args.first().copied().unwrap_or(0);
-    let size = args.get(1).copied().unwrap_or(0);
+    // The platform mspace allocator may return a unique minimum allocation for
+    // malloc(0). Measured ASTRO.BOT relies on that behavior: returning NULL for
+    // its zero-byte request is interpreted as a fatal global-heap OOM.
+    let size = args.get(1).copied().unwrap_or(0).max(1);
     hle_mspace_memalign(ctx, &[mspace, MSPACE_DEFAULT_ALIGN, size])
 }
 
@@ -324,10 +453,26 @@ fn hle_mspace_memalign(ctx: &HleContext, args: &[u64]) -> u64 {
     let mspace = args.first().copied().unwrap_or(0);
     let alignment = args.get(1).copied().unwrap_or(0).max(8);
     let size = args.get(2).copied().unwrap_or(0);
-    if size == 0 || !alignment.is_power_of_two() {
+    if size == 0 {
+        warn!(
+            "sceLibcMspaceMemalign(msp={mspace:#x}, align={alignment:#x}, size=0): \
+             returning NULL (caller={:#x})",
+            ctx.caller_return_addr
+        );
+        return 0;
+    }
+    if !alignment.is_power_of_two() {
+        warn!(
+            "sceLibcMspaceMemalign(msp={mspace:#x}, align={alignment:#x}, size={size:#x}): \
+             alignment is not a power of two"
+        );
         return 0;
     }
     let Some(mut state) = ctx.kernel.libc_mspaces.get_mut(&mspace) else {
+        warn!(
+            "sceLibcMspaceMemalign(msp={mspace:#x}, align={alignment:#x}, size={size:#x}): \
+             mspace is not registered"
+        );
         return 0;
     };
     let base = state.base;
@@ -372,9 +517,32 @@ fn hle_mspace_memalign(ctx: &HleContext, args: &[u64]) -> u64 {
         return 0;
     };
     let Some(end) = aligned.checked_add(size) else {
+        warn!(
+            "sceLibcMspaceMemalign(msp={mspace:#x}, align={alignment:#x}, size={size:#x}): \
+             allocation end overflowed"
+        );
         return 0;
     };
     if end > state.capacity {
+        let free_bytes = state
+            .free_list
+            .iter()
+            .fold(0u64, |total, &(_, bytes)| total.saturating_add(bytes));
+        let largest_free = state
+            .free_list
+            .iter()
+            .map(|&(_, bytes)| bytes)
+            .max()
+            .unwrap_or(0);
+        warn!(
+            "sceLibcMspaceMemalign(msp={mspace:#x}, align={alignment:#x}, size={size:#x}): OOM \
+             capacity={:#x} next={:#x} active={:#x} free_bytes={free_bytes:#x} \
+             largest_free={largest_free:#x} free_blocks={}",
+            state.capacity,
+            state.next_offset,
+            state.active_bytes,
+            state.free_list.len()
+        );
         return 0;
     }
     let Some(address) = base.checked_add(aligned) else {
@@ -709,6 +877,27 @@ mod tests {
             "libSceLibcInternalExt",
             "sceLibcInternalHeapErrorReportForGame"
         ));
+    }
+
+    /// ASTRO.BOT's global allocator issues a zero-byte mspace allocation and
+    /// treats NULL as a fatal OOM. The platform allocator must return distinct,
+    /// freeable minimum allocations for that compatibility case.
+    #[test]
+    fn mspace_malloc_zero_returns_distinct_non_null_allocations() {
+        let kernel = xps5x_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let mspace = hle_mspace_create(&ctx, &[0, 0x1000, 0x1000, 0]);
+        assert_eq!(mspace, 0x1000);
+
+        let first = hle_mspace_malloc(&ctx, &[mspace, 0]);
+        let second = hle_mspace_malloc(&ctx, &[mspace, 0]);
+        assert_ne!(first, 0, "malloc(0) must not report a false OOM");
+        assert_ne!(second, 0, "malloc(0) must not report a false OOM");
+        assert_ne!(first, second, "live minimum allocations must be distinct");
+        assert_eq!(hle_mspace_free(&ctx, &[mspace, first]), 1);
+        assert_eq!(hle_mspace_free(&ctx, &[mspace, second]), 1);
     }
 
     /// The free list must let malloc/free churn recycle memory instead of the
