@@ -1509,6 +1509,22 @@ pub fn stage_texture_cap_skips() -> u64 {
     STAGE_TEXTURE_CAP_SKIPS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Process-wide count of draws/dispatches skipped because a bound storage-buffer
+/// V# used an element-addressing modifier (`add_tid` / `swizzle`) the recompiled
+/// SSBO access does not model yet. Distinct from [`stage_texture_cap_skips`] and
+/// from an OOB mode (which is now admitted): a growing count is the honest,
+/// title-specific measure of what an add-tid/swizzle SPIR-V follow-up would
+/// recover. See the split guard in [`prepare_stage_binding`].
+static STORAGE_ADDRESSING_SKIPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Total draws/dispatches skipped for an unsupported storage-buffer element
+/// addressing modifier (`add_tid` / `swizzle`).
+#[must_use]
+pub fn storage_addressing_skips() -> u64 {
+    STORAGE_ADDRESSING_SKIPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Expected decoded (linear) byte size of one sampled T#, computed from the
 /// descriptor WITHOUT decoding it: `width * height * bpp`, times the array-layer
 /// count (cube / 2DArray) or the volume depth (3D). Used to bound a stage's
@@ -1707,10 +1723,67 @@ fn prepare_stage_binding(
         .iter()
         .enumerate()
     {
-        if resource.add_tid() || resource.swizzle_enabled() || resource.out_of_bounds() != 0 {
+        // Split the old blanket refusal (add_tid || swizzle || OOB) into the two
+        // classes it conflated — they are NOT the same risk:
+        //
+        // * `out_of_bounds` (2-bit OOB_SELECT) only defines what an out-of-RANGE
+        //   element returns; on RDNA that is zero (and out-of-range writes are
+        //   dropped). It does NOT change in-range element addressing. We already
+        //   read exactly `stride*num_records` bytes, bind that as the SSBO, and
+        //   zero-pad to a dword multiple — so an out-of-range read already yields
+        //   0 and an out-of-range write already lands in pad we truncate off the
+        //   writeback. Admitting any OOB mode is therefore a no-op relative to what
+        //   we already do, and matches hardware's clamp-to-zero. This was the
+        //   decisive over-conservatism: Minecraft's async-compute dispatches set a
+        //   NON-ZERO OOB mode on their storage V#s and were refused outright
+        //   (~48 skips/run), and — before Fix 1 — that refusal aborted the ACB
+        //   walk and deadlocked the title's submit worker. Admit it.
+        //
+        // * `add_tid` (per-lane TID byte offset) and `swizzle` (interleaved
+        //   sub-element addressing) genuinely change WHICH bytes each invocation
+        //   touches, and the recompiled SSBO access does not model that yet.
+        //   Keep refusing them — but as a COUNTED, per-flag-LOGGED skip so a
+        //   verify run reveals exactly which modifier a title actually needs.
+        //   Fix 1 guarantees this refusal degrades to a skipped dispatch, never a
+        //   hang, so admitting OOB while deferring add_tid/swizzle is safe to ship.
+        if resource.add_tid() || resource.swizzle_enabled() {
+            let n = STORAGE_ADDRESSING_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 || (n + 1).is_power_of_two() {
+                tracing::warn!(
+                    stage = ?stage,
+                    index,
+                    add_tid = resource.add_tid(),
+                    swizzle = resource.swizzle_enabled(),
+                    out_of_bounds = resource.out_of_bounds(),
+                    stride = resource.stride(),
+                    num_records = resource.num_records(),
+                    addr = format_args!("{:#x}", resource.base48()),
+                    total_addressing_skips = n + 1,
+                    "storage buffer uses element-addressing modifier (add_tid/swizzle) — \
+                     not yet modeled in the SSBO access; skipping the draw/dispatch \
+                     (degrades to a glitch, never a hang)"
+                );
+            }
             return Err(err(format!(
-                "storage buffer {index} uses unsupported add-tid/swizzle/out-of-bounds mode"
+                "storage buffer {index} uses unsupported element addressing \
+                 (add_tid={}, swizzle={})",
+                resource.add_tid(),
+                resource.swizzle_enabled()
             )));
+        }
+        if resource.out_of_bounds() != 0 {
+            // Rate-limited breadcrumb so a verify run can confirm the OOB
+            // relaxation is what admitted these dispatches (and that no add_tid/
+            // swizzle slipped through as a different mode).
+            debug!(
+                stage = ?stage,
+                index,
+                out_of_bounds = resource.out_of_bounds(),
+                stride = resource.stride(),
+                num_records = resource.num_records(),
+                addr = format_args!("{:#x}", resource.base48()),
+                "storage buffer OOB_SELECT admitted (clamp-to-zero already modeled)"
+            );
         }
         let size = buffer_byte_size(resource).ok_or_else(|| err("storage buffer size overflow"))?;
         let mut bytes = if resource.base48() == 0 || size == 0 {

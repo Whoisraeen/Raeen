@@ -44,7 +44,27 @@ thread_local! {
     static ACTIVE_BUDGET: Cell<u64> = const { Cell::new(0) };
 }
 
-const MAX_SUBMISSION_GUEST_BYTES: u64 = 256 << 20;
+/// Cumulative guest bytes one submission may read through resource fetches
+/// (vertex/index/storage buffers, textures) before further reads are refused.
+///
+/// This is a *total-work* ceiling, not a peak-memory one: every resource read is
+/// transient (allocated, copied out, freed), and each INDIVIDUAL read is already
+/// bounded to [`MAX_RESOURCE_READ_DWORDS`] (256 MiB) AND validated against
+/// committed guest memory — that per-read cap is the real wraparound / mis-decode
+/// guard. So this cumulative budget only needs to stop a pathological stream from
+/// doing unbounded cumulative reads; it must not refuse a legitimately
+/// texture-heavy frame.
+///
+/// 256 MiB was too tight and refused real frames: Minecraft's menu submission
+/// samples its panorama skybox (measured ~25 MiB and ~63 MiB textures) across
+/// several draws in ONE submission, so the cumulative total clears 256 MiB even
+/// though no single allocation is large — the reads came back
+/// `not fully readable (readable prefix == size)`, i.e. refused by THIS cap, not
+/// by a memory fault. Raised to 2 GiB: ~10x headroom for a texture-heavy menu
+/// while still bounding a runaway/mis-decoded stream (a submission touching over
+/// 2 GiB of distinct guest resources is not a real menu). Reset per submission
+/// by [`with_guest_memory`].
+const MAX_SUBMISSION_GUEST_BYTES: u64 = 2 << 30;
 
 struct ActiveMemoryGuard {
     memory: Option<Arc<dyn GpuGuestMemory>>,
