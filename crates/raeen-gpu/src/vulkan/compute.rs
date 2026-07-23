@@ -801,6 +801,11 @@ impl<'a> ComputeResources<'a> {
                 "compute sampled texture with no pixels".to_owned(),
             ));
         }
+        // Cube `arrayLayers` must be a valid multiple of 6 (see
+        // `TextureUpload::cube_safe_layers`); pad the staging pixels to match so
+        // the copy of `img_layers` faces never overruns the buffer.
+        let img_layers = upload.cube_safe_layers();
+        let staging = upload.staging_pixels(img_layers);
         self.sampled.push(SampledAllocation {
             staging_buffer: vk::Buffer::null(),
             staging_memory: vk::DeviceMemory::null(),
@@ -810,14 +815,14 @@ impl<'a> ComputeResources<'a> {
             width: upload.width,
             height: upload.height,
             depth: upload.depth.max(1),
-            layers: upload.layers,
+            layers: img_layers,
         });
         let slot = self.sampled.len() - 1;
 
         let (staging_buffer, staging_memory) = self.create_host_buffer(
-            upload.pixels.len(),
+            staging.len(),
             vk::BufferUsageFlags::TRANSFER_SRC,
-            Some(&upload.pixels),
+            Some(&*staging),
         )?;
         self.sampled[slot].staging_buffer = staging_buffer;
         self.sampled[slot].staging_memory = staging_memory;
@@ -836,7 +841,7 @@ impl<'a> ComputeResources<'a> {
                 depth: upload.depth.max(1),
             })
             .mip_levels(1)
-            .array_layers(upload.layers)
+            .array_layers(img_layers)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
@@ -897,7 +902,7 @@ impl<'a> ComputeResources<'a> {
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
-                layer_count: upload.layers,
+                layer_count: img_layers,
             });
         // SAFETY: the view's image is live and its format/range match the
         // image's creation parameters.

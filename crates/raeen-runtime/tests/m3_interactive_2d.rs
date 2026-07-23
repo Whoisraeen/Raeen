@@ -181,12 +181,13 @@ fn register_display_buffer(kernel: &OrbisKernel) {
 }
 
 /// One run of the homebrew with a given pad state. Returns
-/// `(guest_rax, presented_frame, flip_count)`.
+/// `(guest_rax, presented_frame, flip_count)`. The frame is the `Arc` the
+/// present path hands the Shell — shared, not copied.
 fn run_with_pad(
     kernel: &OrbisKernel,
     hle: &HleRegistry,
     buttons: u32,
-) -> (u64, raeen_gpu::RenderedImage, u64) {
+) -> (u64, std::sync::Arc<raeen_gpu::RenderedImage>, u64) {
     let mut pad = [0u8; 12];
     pad[0..4].copy_from_slice(&buttons.to_le_bytes());
     pad[4] = 128; // sticks centered (well-formed ScePadData)

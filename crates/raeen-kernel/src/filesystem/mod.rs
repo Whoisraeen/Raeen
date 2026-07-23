@@ -9,11 +9,11 @@
 //! - `/dev/`       → Device files (stubbed)
 //! - `/proc/`      → Process info (stubbed)
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use raeen_core::types::Fd;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, info, warn};
-use raeen_core::types::Fd;
 
 /// A mount point mapping PS5 paths to host paths.
 #[derive(Debug, Clone)]
@@ -37,6 +37,18 @@ pub mod open_flags {
 }
 
 /// An open file descriptor.
+///
+/// Fields split by mutability: the immutable-after-open ones live directly on
+/// the struct; the per-fd state mutated during I/O lives in [`OpenFileMut`]
+/// behind a per-file `Mutex`. That split is what lets `read`/`pread`/`write`/
+/// `seek` take only the *shared* `open_files` READ lock and then lock this one
+/// file — two different fds hold two different mutexes, so their I/O runs
+/// genuinely concurrently instead of serializing on a single map-wide WRITE
+/// lock. Same fd → same mutex → serialized, preserving today's per-descriptor
+/// cursor semantics. Measured motivation: a WRITE lock on the whole open-files
+/// map taken on *every* read compounded over the asset streamer's thousands of
+/// small reads into multi-second loads (ASTRO.BOT
+/// "loading time: data/prein/haptics : 180.169").
 #[derive(Debug)]
 #[allow(dead_code)] // fd/ps5_path recorded for fstat, re-open, and debug tooling
 struct OpenFile {
@@ -46,25 +58,40 @@ struct OpenFile {
     host_path: PathBuf,
     /// PS5 path (for debugging).
     ps5_path: String,
-    /// Current file position.
-    position: u64,
-    /// File data (cached in memory; the write-back buffer for a writable fd).
-    data: Option<Vec<u8>>,
     /// Lazy read-only backing: the host file handle and its length. Present
     /// instead of `data` for a read-only fd of an existing file, so a large
     /// file streams on demand rather than being slurped whole into memory at
     /// `open`. The eager `std::fs::read` OOMs under host commit pressure —
     /// measured: ASTRO.BOT's 6.7 MiB `game_text.xml` failed to open, returned a
     /// null fd, and the game null-dereferenced it (logs/raeen.txt).
+    ///
+    /// Read as `&File` (shared), never `&mut`: reads are now positional
+    /// (`seek_read`/`read_at`), which move no cursor, so many reads can share
+    /// one handle concurrently under the map read lock without a per-call clone.
     reader: Option<(std::fs::File, u64)>,
     /// Whether the fd was opened for writing (`O_WRONLY`/`O_RDWR`).
     writable: bool,
+    /// Sorted host directory entries for directory descriptors. Immutable after
+    /// open; the walk cursor is [`OpenFileMut::directory_index`].
+    directory_entries: Option<Vec<DirectoryEntry>>,
+    /// Per-fd mutable I/O state. Its own `Mutex` so concurrent I/O on
+    /// *different* fds never contends (see the struct doc).
+    inner: Mutex<OpenFileMut>,
+}
+
+/// The mutable-during-I/O state of one open descriptor, guarded by
+/// [`OpenFile::inner`]. Deliberately small: the per-file lock is held only for
+/// cursor bookkeeping, the write-back buffer, and `fcntl`/`getdents` cursors.
+#[derive(Debug)]
+struct OpenFileMut {
+    /// Current file position.
+    position: u64,
+    /// File data (cached in memory; the write-back buffer for a writable fd).
+    data: Option<Vec<u8>>,
     /// Whether `data` has unflushed writes to persist to `host_path` on close.
     dirty: bool,
     /// Original Orbis open flags (queried/updated through `fcntl`).
     flags: i32,
-    /// Sorted host directory entries for directory descriptors.
-    directory_entries: Option<Vec<DirectoryEntry>>,
     /// Next directory entry returned by `getdents`.
     directory_index: usize,
 }
@@ -448,14 +475,16 @@ impl VirtualFileSystem {
                     fd,
                     host_path: PathBuf::new(),
                     ps5_path: path.to_string(),
-                    position: 0,
-                    data: None,
                     reader: None,
                     writable: false,
-                    dirty: false,
-                    flags,
                     directory_entries: Some(entries),
-                    directory_index: 0,
+                    inner: Mutex::new(OpenFileMut {
+                        position: 0,
+                        data: None,
+                        dirty: false,
+                        flags,
+                        directory_index: 0,
+                    }),
                 },
             );
             return Ok(fd);
@@ -555,14 +584,16 @@ impl VirtualFileSystem {
             fd,
             host_path,
             ps5_path: path.to_string(),
-            position,
-            data,
             reader,
             writable,
-            dirty,
-            flags,
             directory_entries,
-            directory_index: 0,
+            inner: Mutex::new(OpenFileMut {
+                position,
+                data,
+                dirty,
+                flags,
+                directory_index: 0,
+            }),
         };
 
         debug!("VFS open: '{path}' -> fd={fd} (writable={writable}, create={create})");
@@ -570,44 +601,47 @@ impl VirtualFileSystem {
         Ok(fd)
     }
 
-    /// Read from an open file descriptor.
+    /// Read from an open file descriptor, advancing its cursor.
+    ///
+    /// Takes only the SHARED map read lock plus this one fd's mutex, so reads on
+    /// different fds run concurrently (the old whole-map WRITE lock serialized
+    /// every read across all fds and threads). The per-file lock is held across
+    /// the positional read because `position` must advance coherently — same-fd
+    /// reads therefore chunk sequentially, exactly as before.
     pub fn read(&self, fd: Fd, count: usize) -> Result<Vec<u8>, std::io::Error> {
-        let mut files = self.open_files.write();
-        if let Some(file) = files.get_mut(&fd) {
-            if file.directory_entries.is_some() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "fd is a directory",
-                ));
-            }
-            let pos = file.position;
-            if let Some(ref data) = file.data {
-                let start = pos as usize;
-                let end = (start + count).min(data.len());
-                let result = data[start..end].to_vec();
-                file.position = end as u64;
-                Ok(result)
-            } else if let Some((handle, len)) = file.reader.as_mut() {
-                use std::io::{Read, Seek, SeekFrom};
-                // Serve at most the bytes remaining to EOF. `count` is already
-                // capped by the caller (READ_MAX_BYTES), so the transient buffer
-                // is bounded and freed as soon as the guest copies it out —
-                // unlike the whole-file buffer the eager path held for the fd's
-                // whole lifetime.
-                let want = (*len).saturating_sub(pos).min(count as u64);
-                handle.seek(SeekFrom::Start(pos))?;
-                let mut buf = Vec::new();
-                handle.take(want).read_to_end(&mut buf)?;
-                file.position = pos + buf.len() as u64;
-                Ok(buf)
-            } else {
-                Ok(Vec::new())
-            }
-        } else {
-            Err(std::io::Error::new(
+        let files = self.open_files.read();
+        let Some(file) = files.get(&fd) else {
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("fd {} not open", fd),
-            ))
+                format!("fd {fd} not open"),
+            ));
+        };
+        if file.directory_entries.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "fd is a directory",
+            ));
+        }
+        let mut inner = file.inner.lock();
+        let pos = inner.position;
+        if let Some(data) = inner.data.as_ref() {
+            let start = (pos as usize).min(data.len());
+            let end = start.saturating_add(count).min(data.len());
+            let result = data[start..end].to_vec();
+            inner.position = end as u64;
+            Ok(result)
+        } else if let Some((handle, len)) = file.reader.as_ref() {
+            // Serve at most the bytes remaining to EOF (`count` is already capped
+            // by the caller via READ_MAX_BYTES). Positional read: no `try_clone`
+            // (a per-call Windows `DuplicateHandle`/Unix `dup`) and no cursor
+            // seek — `seek_read`/`read_at` take `&File` and move nothing, so the
+            // one shared handle serves this fd's sequential stream directly.
+            let want = usize::try_from((*len).saturating_sub(pos).min(count as u64)).unwrap_or(0);
+            let buf = positional_read(handle, pos, want)?;
+            inner.position = pos + buf.len() as u64;
+            Ok(buf)
+        } else {
+            Ok(Vec::new())
         }
     }
 
@@ -616,8 +650,8 @@ impl VirtualFileSystem {
     /// fd dirty so [`close`](Self::close) flushes it to the host. A read-only
     /// fd is rejected with `PermissionDenied`; an unknown fd with `NotFound`.
     pub fn write(&self, fd: Fd, bytes: &[u8]) -> Result<usize, std::io::Error> {
-        let mut files = self.open_files.write();
-        let Some(file) = files.get_mut(&fd) else {
+        let files = self.open_files.read();
+        let Some(file) = files.get(&fd) else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("fd {fd} not open"),
@@ -629,8 +663,9 @@ impl VirtualFileSystem {
                 "fd not opened for writing",
             ));
         }
-        let buf = file.data.get_or_insert_with(Vec::new);
-        let pos = file.position as usize;
+        let mut inner = file.inner.lock();
+        let pos = inner.position as usize;
+        let buf = inner.data.get_or_insert_with(Vec::new);
         if pos > buf.len() {
             buf.resize(pos, 0); // sparse gap → zero-fill
         }
@@ -639,8 +674,8 @@ impl VirtualFileSystem {
             buf.resize(end, 0);
         }
         buf[pos..end].copy_from_slice(bytes);
-        file.position = end as u64;
-        file.dirty = true;
+        inner.position = end as u64;
+        inner.dirty = true;
         debug!("VFS write: fd={fd}, {} bytes at {pos}", bytes.len());
         Ok(bytes.len())
     }
@@ -664,23 +699,29 @@ impl VirtualFileSystem {
                 "fd is a directory",
             ));
         }
-        if let Some(ref data) = file.data {
+        // In-memory branch: read the write-back buffer coherently with a
+        // concurrent same-fd `write`, still WITHOUT touching `position`.
+        let inner = file.inner.lock();
+        if let Some(data) = inner.data.as_ref() {
             let pos = usize::try_from(offset)
                 .unwrap_or(usize::MAX)
                 .min(data.len());
             let end = pos.saturating_add(count).min(data.len());
-            Ok(data[pos..end].to_vec())
-        } else if let Some((handle, len)) = file.reader.as_ref() {
-            use std::io::{Read, Seek, SeekFrom};
-            // `pread` holds only a read lock, so it must not move the stored
-            // handle's cursor — clone it for an independent positional read.
+            return Ok(data[pos..end].to_vec());
+        }
+        drop(inner);
+        // Reader branch: `reader` is immutable after open and `positional_read`
+        // touches no per-fd state, so release the per-file lock before the read.
+        // Concurrent preads (and the sequential stream) on this same read-only fd
+        // then run without serializing on that mutex — the asset streamer issues
+        // many positional reads against one open archive handle. `seek_read`/
+        // `read_at` need neither a `try_clone` (a `DuplicateHandle`/`dup` syscall
+        // per call) nor a cursor move, so a shared `&File` is safe under the map
+        // read lock.
+        if let Some((handle, len)) = file.reader.as_ref() {
             let start = offset.min(*len);
-            let want = (*len).saturating_sub(start).min(count as u64);
-            let mut clone = handle.try_clone()?;
-            clone.seek(SeekFrom::Start(start))?;
-            let mut buf = Vec::new();
-            clone.take(want).read_to_end(&mut buf)?;
-            Ok(buf)
+            let want = usize::try_from((*len).saturating_sub(start).min(count as u64)).unwrap_or(0);
+            positional_read(handle, start, want)
         } else {
             Ok(Vec::new())
         }
@@ -691,23 +732,24 @@ impl VirtualFileSystem {
     /// `SEEK_END` (2) = relative to end-of-file. Returns the new absolute
     /// position, or an error for a bad fd / negative resulting offset.
     pub fn seek(&self, fd: Fd, offset: i64, whence: i32) -> Result<u64, std::io::Error> {
-        let mut files = self.open_files.write();
-        let Some(file) = files.get_mut(&fd) else {
+        let files = self.open_files.read();
+        let Some(file) = files.get(&fd) else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("fd {fd} not open"),
             ));
         };
-        let size = file
+        let mut inner = file.inner.lock();
+        let size = inner
             .data
             .as_ref()
             .map(|d| d.len() as u64)
             .or_else(|| file.reader.as_ref().map(|(_, len)| *len))
             .unwrap_or(0);
         let base = match whence {
-            0 => 0i64,                 // SEEK_SET
-            1 => file.position as i64, // SEEK_CUR
-            2 => size as i64,          // SEEK_END
+            0 => 0i64,                  // SEEK_SET
+            1 => inner.position as i64, // SEEK_CUR
+            2 => size as i64,           // SEEK_END
             _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -724,38 +766,45 @@ impl VirtualFileSystem {
                     "seek before start of file",
                 )
             })?;
-        file.position = target as u64;
-        Ok(file.position)
+        inner.position = target as u64;
+        Ok(inner.position)
     }
 
     /// The size in bytes of an open file's backing data (0 if the host file
     /// was absent at open time). Used by `fstat`/`lseek(SEEK_END)`.
     pub fn file_size(&self, fd: Fd) -> Option<u64> {
-        self.open_files.read().get(&fd).map(|f| {
-            f.data
+        let files = self.open_files.read();
+        let file = files.get(&fd)?;
+        let inner = file.inner.lock();
+        Some(
+            inner
+                .data
                 .as_ref()
                 .map(|d| d.len() as u64)
-                .or_else(|| f.reader.as_ref().map(|(_, len)| *len))
-                .unwrap_or(0)
-        })
+                .or_else(|| file.reader.as_ref().map(|(_, len)| *len))
+                .unwrap_or(0),
+        )
     }
 
     /// Return the descriptor's Orbis open flags.
     pub fn flags(&self, fd: Fd) -> Option<i32> {
-        self.open_files.read().get(&fd).map(|file| file.flags)
+        let files = self.open_files.read();
+        let file = files.get(&fd)?;
+        Some(file.inner.lock().flags)
     }
 
     /// Update status flags while preserving the descriptor's access mode.
     pub fn set_status_flags(&self, fd: Fd, flags: i32) -> Result<(), std::io::Error> {
         use open_flags::O_ACCMODE;
-        let mut files = self.open_files.write();
-        let Some(file) = files.get_mut(&fd) else {
+        let files = self.open_files.read();
+        let Some(file) = files.get(&fd) else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("fd {fd} not open"),
             ));
         };
-        file.flags = (file.flags & O_ACCMODE) | (flags & !O_ACCMODE);
+        let mut inner = file.inner.lock();
+        inner.flags = (inner.flags & O_ACCMODE) | (flags & !O_ACCMODE);
         Ok(())
     }
 
@@ -773,8 +822,8 @@ impl VirtualFileSystem {
                 "directory buffer is smaller than one record",
             ));
         }
-        let mut files = self.open_files.write();
-        let Some(file) = files.get_mut(&fd) else {
+        let files = self.open_files.read();
+        let Some(file) = files.get(&fd) else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("fd {fd} not open"),
@@ -786,8 +835,9 @@ impl VirtualFileSystem {
                 "fd is not a directory",
             ));
         };
-        let base = file.directory_index;
-        let Some(entry) = entries.get(file.directory_index) else {
+        let mut inner = file.inner.lock();
+        let base = inner.directory_index;
+        let Some(entry) = entries.get(inner.directory_index) else {
             return Ok((Vec::new(), base));
         };
         let name = entry.name.as_bytes();
@@ -804,8 +854,8 @@ impl VirtualFileSystem {
         record[6] = if entry.is_directory { 4 } else { 8 };
         record[7] = name_len as u8;
         record[8..8 + name_len].copy_from_slice(&name[..name_len]);
-        file.directory_index += 1;
-        file.position = file.directory_index as u64;
+        inner.directory_index += 1;
+        inner.position = inner.directory_index as u64;
         tracing::debug!(
             "getdents fd={fd}: entry[{base}] '{}' type={} -> 1 record",
             String::from_utf8_lossy(&name[..name_len]),
@@ -818,14 +868,15 @@ impl VirtualFileSystem {
     /// it. Read-only descriptors succeed; unknown descriptors return
     /// `NotFound`. This backs the guest's `fsync` durability boundary.
     pub fn sync(&self, fd: Fd) -> Result<(), std::io::Error> {
-        let mut files = self.open_files.write();
-        let Some(file) = files.get_mut(&fd) else {
+        let files = self.open_files.read();
+        let Some(file) = files.get(&fd) else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("fd {fd} not open"),
             ));
         };
-        flush_open_file(file)?;
+        let mut inner = file.inner.lock();
+        flush_open_file(&file.host_path, file.writable, &mut inner)?;
         Ok(())
     }
 
@@ -844,17 +895,18 @@ impl VirtualFileSystem {
             ));
         }
 
-        let mut files = self.open_files.write();
+        let files = self.open_files.read();
         let mut flushed = 0usize;
         let mut first_error = None;
-        for file in files.values_mut().filter(|file| {
+        for file in files.values().filter(|file| {
             file.ps5_path == root
                 || file
                     .ps5_path
                     .strip_prefix(&root)
                     .is_some_and(|suffix| suffix.starts_with('/'))
         }) {
-            match flush_open_file(file) {
+            let mut inner = file.inner.lock();
+            match flush_open_file(&file.host_path, file.writable, &mut inner) {
                 Ok(true) => flushed += 1,
                 Ok(false) => {}
                 Err(error) if first_error.is_none() => first_error = Some(error),
@@ -873,14 +925,18 @@ impl VirtualFileSystem {
     /// (the fd is still removed), matching the pragmatic behavior most guests
     /// expect from `close`.
     pub fn close(&self, fd: Fd) -> Result<(), std::io::Error> {
+        // `remove` needs the map WRITE lock — one of the few operations that
+        // still does. Once removed, we own the `OpenFile`, so the per-file mutex
+        // can be consumed without locking.
         let Some(file) = self.open_files.write().remove(&fd) else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("fd {fd} not open"),
             ));
         };
-        if file.dirty && file.writable {
-            if let Some(ref data) = file.data {
+        let inner = file.inner.into_inner();
+        if inner.dirty && file.writable {
+            if let Some(ref data) = inner.data {
                 match std::fs::write(&file.host_path, data) {
                     Ok(()) => debug!(
                         "VFS close: flushed {} bytes -> {}",
@@ -901,24 +957,77 @@ impl VirtualFileSystem {
 }
 
 /// Flush one open file's write-back buffer and report whether it was dirty.
-fn flush_open_file(file: &mut OpenFile) -> Result<bool, std::io::Error> {
-    if !file.dirty || !file.writable {
+/// Takes the immutable `host_path`/`writable` plus the locked mutable state, so
+/// callers can drive it while holding only the map READ lock and this fd's mutex.
+fn flush_open_file(
+    host_path: &Path,
+    writable: bool,
+    inner: &mut OpenFileMut,
+) -> Result<bool, std::io::Error> {
+    if !inner.dirty || !writable {
         return Ok(false);
     }
-    if let Some(ref data) = file.data {
-        std::fs::write(&file.host_path, data)?;
+    if let Some(ref data) = inner.data {
+        std::fs::write(host_path, data)?;
         std::fs::OpenOptions::new()
             .write(true)
-            .open(&file.host_path)?
+            .open(host_path)?
             .sync_all()?;
         debug!(
             "VFS sync: flushed {} bytes -> {}",
             data.len(),
-            file.host_path.display()
+            host_path.display()
         );
     }
-    file.dirty = false;
+    inner.dirty = false;
     Ok(true)
+}
+
+/// Positional read of up to `want` bytes at absolute `offset` from a shared
+/// read-only handle, looping over short reads until `want` bytes or EOF.
+///
+/// This is the per-read cost the hot path sheds. The old streaming/pread dance
+/// was `seek(offset)` + `take(want).read_to_end()` — and for `pread` a
+/// `try_clone()` first (a Windows `DuplicateHandle` / Unix `dup` syscall) purely
+/// to get an independent cursor. `seek_read`/`read_at` take `&File` and read at
+/// an explicit offset WITHOUT moving the handle's cursor, so they need neither
+/// the clone nor the seek and are safe to issue concurrently on one shared
+/// handle: the win compounds over the streamer's thousands of small reads.
+fn positional_read(
+    handle: &std::fs::File,
+    offset: u64,
+    want: usize,
+) -> Result<Vec<u8>, std::io::Error> {
+    let mut buf = vec![0u8; want];
+    let mut filled = 0usize;
+    while filled < want {
+        // `seek_read`/`read_at` may return short; loop until `want` or EOF.
+        let n = loop {
+            #[cfg(windows)]
+            let result = {
+                use std::os::windows::fs::FileExt;
+                handle.seek_read(&mut buf[filled..], offset + filled as u64)
+            };
+            #[cfg(unix)]
+            let result = {
+                use std::os::unix::fs::FileExt;
+                handle.read_at(&mut buf[filled..], offset + filled as u64)
+            };
+            match result {
+                Ok(n) => break n,
+                // A signal can interrupt the read mid-syscall; retry, as
+                // `read_to_end` did internally.
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        };
+        if n == 0 {
+            break; // EOF before `want` — return the short tail, like POSIX.
+        }
+        filled += n;
+    }
+    buf.truncate(filled);
+    Ok(buf)
 }
 
 fn normalize_mount_root(prefix: &str) -> String {
@@ -979,7 +1088,9 @@ fn combine_within_mount(mount_root: &Path, ps5_path: &str, relative: &str) -> Op
         // absolute segment would make `Path::join` discard the mount root; both
         // are escapes.
         if segment.contains(':') || Path::new(segment).is_absolute() {
-            warn!("VFS resolve: refusing drive-qualified/absolute segment in guest path '{ps5_path}'");
+            warn!(
+                "VFS resolve: refusing drive-qualified/absolute segment in guest path '{ps5_path}'"
+            );
             return None;
         }
         // A NUL or an over-long name cannot name a real host file and makes the
@@ -1130,6 +1241,113 @@ mod tests {
         // sequential cursor (which is now at EOF).
         let mid = vfs.pread(fd, 16, 1_000_000).unwrap();
         assert_eq!(mid, content[1_000_000..1_000_016]);
+
+        vfs.close(fd).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two DIFFERENT read-only fds must read concurrently. Before the
+    /// interior-mutability refactor, `read()` took the whole-map WRITE lock, so
+    /// no two reads could ever be in flight at once — that global serialization
+    /// is what compounded over the streamer's thousands of small reads into
+    /// multi-second asset loads. Different fds now hold different per-file
+    /// mutexes; the barrier maximizes overlap, and both streams must reassemble
+    /// their files byte-for-byte under it.
+    #[test]
+    fn two_fds_read_concurrently_and_reassemble_correctly() {
+        use open_flags::*;
+        use std::sync::{Arc, Barrier};
+        let dir = temp_dir("concurrent-fds");
+        let a: Vec<u8> = (0..800_000u32).map(|i| (i % 251) as u8).collect();
+        let b: Vec<u8> = (0..800_000u32)
+            .map(|i| ((i.wrapping_mul(7) + 3) % 251) as u8)
+            .collect();
+        std::fs::write(dir.join("a.bin"), &a).unwrap();
+        std::fs::write(dir.join("b.bin"), &b).unwrap();
+
+        let vfs = Arc::new(VirtualFileSystem::new());
+        vfs.set_game_directory(&dir);
+        let fda = vfs.open("/app0/a.bin", O_RDONLY, 0).unwrap();
+        let fdb = vfs.open("/app0/b.bin", O_RDONLY, 0).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let stream = |vfs: Arc<VirtualFileSystem>, fd: Fd, barrier: Arc<Barrier>| {
+            std::thread::spawn(move || {
+                barrier.wait();
+                let mut got = Vec::new();
+                loop {
+                    let chunk = vfs.read(fd, 4096).unwrap();
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    got.extend_from_slice(&chunk);
+                }
+                got
+            })
+        };
+        let ta = stream(vfs.clone(), fda, barrier.clone());
+        let tb = stream(vfs.clone(), fdb, barrier.clone());
+        assert_eq!(ta.join().unwrap(), a, "fd A must reassemble exactly");
+        assert_eq!(tb.join().unwrap(), b, "fd B must reassemble exactly");
+
+        vfs.close(fda).unwrap();
+        vfs.close(fdb).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A positional `pread` must never disturb a concurrent streaming `read`'s
+    /// cursor, even on the SAME fd. The streamer's sequential reads advance
+    /// `position` and must still reassemble the whole file, while thousands of
+    /// preads hammer fixed offsets in parallel — each returning its exact window.
+    /// (`pread` is cursor-free by design; this pins that it stays so under real
+    /// concurrency, not just sequentially.)
+    #[test]
+    fn concurrent_pread_does_not_disturb_a_streaming_reads_cursor() {
+        use open_flags::*;
+        use std::sync::Arc;
+        let dir = temp_dir("pread-vs-stream");
+        let content: Arc<Vec<u8>> = Arc::new((0..1_000_000u32).map(|i| (i % 251) as u8).collect());
+        std::fs::write(dir.join("big.bin"), content.as_slice()).unwrap();
+
+        let vfs = Arc::new(VirtualFileSystem::new());
+        vfs.set_game_directory(&dir);
+        let fd = vfs.open("/app0/big.bin", O_RDONLY, 0).unwrap();
+
+        let streamer = {
+            let (vfs, expect) = (vfs.clone(), content.clone());
+            std::thread::spawn(move || {
+                let mut got = Vec::new();
+                loop {
+                    let chunk = vfs.read(fd, 3333).unwrap();
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    got.extend_from_slice(&chunk);
+                }
+                assert_eq!(
+                    got, *expect,
+                    "streamed read must reassemble the file exactly"
+                );
+            })
+        };
+        let preader = {
+            let (vfs, expect) = (vfs.clone(), content.clone());
+            std::thread::spawn(move || {
+                for _ in 0..3000 {
+                    for off in [0u64, 100_000, 500_000, 999_990] {
+                        let want = ((expect.len() as u64 - off).min(16)) as usize;
+                        let got = vfs.pread(fd, 16, off).unwrap();
+                        assert_eq!(
+                            got,
+                            expect[off as usize..off as usize + want],
+                            "pread window at {off} must be exact"
+                        );
+                    }
+                }
+            })
+        };
+        streamer.join().unwrap();
+        preader.join().unwrap();
 
         vfs.close(fd).unwrap();
         let _ = std::fs::remove_dir_all(&dir);

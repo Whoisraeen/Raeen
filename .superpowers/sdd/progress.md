@@ -1,3 +1,68 @@
+- RE diagnosis: ASTRO.BOT +0xe03f1a NULL-base fault family (2026-07-23;
+  diagnosis only, no behavior change, no commit; doc
+  `docs/re/2026-07-22-astro-null-base-fault-e03f1a.md`; evidence
+  `scratch/astro-voicelist6-20260723.out.log` — all 3 worker faults
+  reproduced + main thread later died at the OLD +0x33f335):
+  * VERDICT: NOT an HLE return-value bug. Faulting "voice" r14 = **0xAAAAAAAC**
+    — the title allocator's 0xAA poison. The SAL voice list's 6th link struct
+    (0x1000055bc8) was allocated+linked but its next-voice field (+0x10) never
+    written; the half-linked state PERSISTS (identical dump 12 s later at
+    fault 2), so the producer never finished — not a race window.
+  * SECONDARY FAULT MECHANICS: Raeen's permissive arena reads low addresses
+    as zero, so [0xAAAAAAAC+0xe8]→0 and the visible fault is the NULL deref
+    one instruction later; real hardware faults at the poison deref itself.
+    Confidence in object model + deferral: PROVEN (register dump + direct
+    guest-memory list walk via TEMP-DIAG).
+  * NGS2 HYPOTHESIS REFUTED: site is sal_ngs2.c:1136 "NGS2 : Failed to set
+    output", but the title NEVER calls any sceNgs2*/sceAjm* function (trace
+    + all three 4096-entry rings: zero hits); audio runs via AudioOut2. Cold
+    but real ABI bug found en passant: hle_ngs2_create_out2 writes the
+    RackCreateWithAllocator out-handle to rdx; SharpEmu says r8 (args[4]).
+  * FAMILY: all 3 faults = dispatcher (0x1100xxxx) handlers iterating
+    registries with one half-built entry, ~5 s after "LevelDocument Loaded:
+    ui_pause_next [pause_menu]"; +0x33f335 recurrence says the APR
+    completion-ordering family is NOT fully closed.
+  * NEXT GATE (priority): (1) map low 4GB guest VA no-access to surface true
+    fault sites (diagnostics); (2) audit pause-menu load completion publish
+    vs registration finish (APR follow-up); (3) identify guest_thread 21 —
+    chronic >3s holder of mutex 0x300944e00 in every run, producer-wedged
+    suspect.
+  * TEMP-DIAG left in tree (marked, env-gated): RAEEN_TRACE_NGS2 arg dump in
+    libsce_media.rs; r12–r15 print + RAEEN_DUMP_VOICE_LIST walker in
+    dispatch.rs. Remove or adopt deliberately.
+
+- ASTRO.BOT post-APR-fix verification run (2026-07-22, 147 s release
+  `--run-eboot`, working tree; artifact
+  `scratch/astro-apr-fix-20260722.out.log`):
+  * OLD FAULT GONE: the pause-menu poisoned-object fault at eboot+0x33f335
+    (`r13 = 0xffffffffffffff2f`) did NOT recur through the whole LevelDocument
+    load. The APR fix was the only change since the faulting run — the
+    stale-record re-fire / silent zero-fill was the poisoning mechanism.
+  * NAME-THE-MISS: **zero** APR warns fired — every APR fileId resolved. The
+    missing-asset-via-APR theory is dead for this title.
+  * PAST THE OLD WALL: "LevelDocument Loaded: ui_pause_next [pause_menu]" at
+    +52 s; GPU work kept flowing to **36 flips / 1064 draws / 1497 dispatches**
+    (vs the old stopping point 18 / 559 / 785) — double the observed frame work.
+  * NEW FAULT CLASS SURFACED (3 worker-thread faults, all recovered — runtime
+    released held mutexes and the title kept running; "no HLE call returned an
+    Orbis error before this fault" on all three):
+    1. t43 @ +46 s, module+0xe03f1a: `mov r14,[rax+0x10]` with **rax=0** —
+       NULL deref (not the old poison pattern).
+    2. t44 @ +49 s, module+0xe47a43: `cmp byte [r15+0x29],0` read fault; chain
+       +0xf4082c <- +0xdc2a7e <- +0x10e91 <- +0xdfb602 <- +0xded2d9.
+    3. t45 @ +49 s, libc.prx+0x356ba: strcpy byte-loop reading wild
+       0xfaab60664; rsi -> "pri_hero"; chain +0xe54d3f <- +0xe53889.
+    Same family shape (workers walking object arrays with bad entries), but
+    NULL/wild now instead of -0xd1 poison. NEXT RE TARGET: these three sites —
+    start with +0xe03f1a (NULL base) and the "pri_hero" strcpy caller.
+  * UNLOGGED TERMINATION: process exited code 1 at ~147 s with the log ending
+    mid-stream (no shutdown/RESULT/fatal line, err log empty, no device-lost).
+    Cause unknown — likely a host-side crash outside the logging path; flag
+    for the next run (watchdog / longer timeout).
+  * NOTE new missing-NID surface seen at link time: sceAmprApr*Gather/Scatter/
+    Map family (7 NIDs) — register fail-soft stubs only if a runtime fault
+    names them.
+
 - Tier-0 APR async-load crash fix (2026-07-22; working tree, no commit;
   raeen-hle 354/354 + 1 pre-existing skip, raeen-kernel 32/32,
   raeen-firmware 126/126; hle+kernel clippy `-D warnings` clean; fmt clean on

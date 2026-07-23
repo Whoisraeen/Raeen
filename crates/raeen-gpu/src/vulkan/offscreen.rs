@@ -238,6 +238,68 @@ pub struct TextureUpload {
     pub cached: bool,
 }
 
+/// Rate-limited diagnostic (first 8 occurrences) for a cube upload that reaches
+/// a create site with an invalid layer count. Names the upload's identity so
+/// the upstream path that produced it — the one bypassing `decode_texture`'s
+/// cube clamp — can be found and fixed at the source.
+fn warn_bad_cube_layers_once(upload: &TextureUpload, safe: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
+        tracing::warn!(
+            layers = upload.layers,
+            safe,
+            extent = format_args!("{}x{}", upload.width, upload.height),
+            depth = upload.depth,
+            guest_base = format_args!("{:#x}", upload.guest_base),
+            render_target = ?upload.render_target,
+            cached = upload.cached,
+            pixels = upload.pixels.len(),
+            "cube texture upload has an invalid (<6 / non-multiple-of-6) layer \
+             count; clamping arrayLayers to keep the CUBE image spec-valid \
+             (prevents VK_ERROR_DEVICE_LOST). This upstream path bypassed \
+             decode_texture's cube clamp — investigate the source."
+        );
+    }
+}
+
+impl TextureUpload {
+    /// Vulkan requires a CUBE image's `arrayLayers` to be a positive multiple of
+    /// 6 (`VUID-VkImageCreateInfo-flags-08866`) and a CUBE view's `layerCount`
+    /// to be 6. `draw_translate::decode_texture` already clamps cube layers to a
+    /// whole number of cubes, but this is the AUTHORITATIVE last line of defence
+    /// at the create site: any path that hands a cube upload with fewer layers
+    /// would otherwise make the driver accept a `<6`-layer CUBE image and then
+    /// lose the device on the first sample (measured: a Minecraft draw whose
+    /// cube T# reached `vkCreateImage` with `layers == 1`). Returns the
+    /// spec-valid layer count, warning (rate-limited) when it has to bump.
+    pub(crate) fn cube_safe_layers(&self) -> u32 {
+        if self.cube && (self.layers == 0 || self.layers % 6 != 0) {
+            let safe = self.layers.max(1).next_multiple_of(6);
+            warn_bad_cube_layers_once(self, safe);
+            safe
+        } else {
+            self.layers
+        }
+    }
+
+    /// The staging pixels sized for `img_layers` faces: the decoded pixels,
+    /// zero-padded when [`Self::cube_safe_layers`] had to bump the layer count,
+    /// so the staging→image copy of `img_layers` faces never overruns the
+    /// buffer (the padded faces upload as transparent black — a render glitch at
+    /// worst, never a device loss). Borrows `pixels` unchanged in the common
+    /// case (no bump).
+    pub(crate) fn staging_pixels(&self, img_layers: u32) -> std::borrow::Cow<'_, [u8]> {
+        if img_layers <= self.layers || self.layers == 0 || self.pixels.is_empty() {
+            return std::borrow::Cow::Borrowed(&self.pixels);
+        }
+        let face_bytes = self.pixels.len() / self.layers as usize;
+        let mut padded = vec![0u8; face_bytes * img_layers as usize];
+        padded[..self.pixels.len()].copy_from_slice(&self.pixels);
+        std::borrow::Cow::Owned(padded)
+    }
+}
+
 /// The sampled-image + sampler descriptor arrays one translated stage binds.
 ///
 /// The recompiled SPIR-V declares `%textures2D_S` (an array of sampled images)
@@ -2417,19 +2479,27 @@ impl<'a> Resources<'a> {
                 "texture upload requested with no pixels".to_owned(),
             ));
         }
-        let (staging_buffer, staging_memory) = self.create_buffer_with_bytes(&upload.pixels)?;
+        // Cube `arrayLayers` must be a valid multiple of 6 (see `cube_safe_layers`);
+        // pad the staging pixels to match so the copy of `img_layers` faces never
+        // overruns the buffer. Non-cube uploads borrow `pixels` unchanged.
+        let img_layers = upload.cube_safe_layers();
+        let staging = upload.staging_pixels(img_layers);
+        let (staging_buffer, staging_memory) = self.create_buffer_with_bytes(&staging)?;
         // Persistent-texture cache (stage D): a cacheable upload donates its
         // image to the cache on draw success, so the next bind of the same
         // guest texture (same key, same content sample-hash) skips the whole
         // decode + create + upload. `RAEEN_NO_TEX_CACHE=1` disables donation.
-        let cache_key = (upload.guest_base != 0
+        // A clamped-cube anomaly (`img_layers != upload.layers`) is never donated:
+        // its key would not match a well-formed later decode of the same base.
+        let cache_key = (img_layers == upload.layers
+            && upload.guest_base != 0
             && upload.sample_hash != 0
             && std::env::var_os("RAEEN_NO_TEX_CACHE").is_none())
         .then_some(TextureKey {
             base: upload.guest_base,
             width: upload.width,
             height: upload.height,
-            layers: upload.layers,
+            layers: img_layers,
             depth: upload.depth.max(1),
             cube: upload.cube,
             array: upload.array,
@@ -2448,12 +2518,12 @@ impl<'a> Resources<'a> {
             view: vk::ImageView::null(),
             width: upload.width,
             height: upload.height,
-            layers: upload.layers,
+            layers: img_layers,
             depth: upload.depth.max(1),
             stage,
             cache_key,
             sample_hash: upload.sample_hash,
-            byte_size: upload.pixels.len() as u64,
+            byte_size: staging.len() as u64,
         });
         let slot = self.texture_uploads.len() - 1;
 
@@ -2472,7 +2542,7 @@ impl<'a> Resources<'a> {
                 depth: upload.depth.max(1),
             })
             .mip_levels(1)
-            .array_layers(upload.layers)
+            .array_layers(img_layers)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
@@ -2533,7 +2603,7 @@ impl<'a> Resources<'a> {
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
-                layer_count: upload.layers,
+                layer_count: img_layers,
             });
         // SAFETY: the view's image is live and its format/range match the
         // image's creation parameters.

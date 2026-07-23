@@ -283,7 +283,14 @@ pub struct AgcGpuSession {
     /// translation collapsed from 1057 to 409 under a shared CP. Isolating the
     /// queues keeps each one's resets from clobbering the other.
     compute_command_processor: Mutex<CommandProcessor>,
-    last_image: Mutex<Option<RenderedImage>>,
+    /// The frame the Shell presents, behind an [`Arc`] so the two hottest hand-
+    /// offs cost a refcount bump instead of an 8 MB (1080p RGBA) memcpy: the
+    /// flush store (`present_flipped`, on the guest flip thread's synchronous
+    /// critical section) and the per-frame Shell read (`shell/present.rs` calls
+    /// [`AgcGpuSession::last_image`] every repaint). The frame bytes are
+    /// immutable once presented, so sharing them is sound and no consumer needs
+    /// its own copy.
+    last_image: Mutex<Option<Arc<RenderedImage>>>,
     /// System boot splash: the package's `sce_sys/pic0.png`, decoded at launch.
     /// While `Some`, [`AgcGpuSession::last_image`] presents it instead of any
     /// title frame — a real PS5 shows this image from launch until the title
@@ -292,7 +299,11 @@ pub struct AgcGpuSession {
     /// but NOT for the most-content present fallback: that path can surface a
     /// bare cleared render target, which is exactly what the splash exists to
     /// cover.
-    splash: Mutex<Option<RenderedImage>>,
+    ///
+    /// Shared behind the same [`Arc`] as [`Self::last_image`]: the splash is a
+    /// full decoded `pic0.png`, and staging + seeding + reset previously cloned
+    /// it three times per launch.
+    splash: Mutex<Option<Arc<RenderedImage>>>,
     draw_count: Mutex<u64>,
     /// ShaderMemory Phase 2: guest shader fetch+translate results, shared
     /// across DCBs so per-frame re-binds hit the cache instead of
@@ -544,7 +555,9 @@ impl AgcGpuSession {
     /// The frame to present: the boot splash while it is up, otherwise the
     /// last image produced by a draw-bearing DCB, if any. Diagnostics
     /// (frame dumps) bypass this and always see the title's own output.
-    pub fn last_image(&self) -> Option<RenderedImage> {
+    pub fn last_image(&self) -> Option<Arc<RenderedImage>> {
+        // Both clones are `Arc` refcount bumps, not frame copies — the Shell
+        // calls this every repaint, so an 8 MB memcpy here was pure waste.
         if let Some(splash) = self.splash.lock().clone() {
             return Some(splash);
         }
@@ -557,7 +570,7 @@ impl AgcGpuSession {
     /// including the case where the new title fails to launch and never
     /// installs a session of its own (an encrypted retail SELF), leaving this
     /// already-installed session in place.
-    fn reset_presentation(&self, splash: Option<RenderedImage>) {
+    fn reset_presentation(&self, splash: Option<Arc<RenderedImage>>) {
         *self.splash.lock() = splash;
         *self.last_image.lock() = None;
         self.framebuffers.lock().clear();
@@ -578,6 +591,11 @@ impl AgcGpuSession {
     ///
     /// [`global`]: AgcGpuSession::global
     pub fn set_pending_splash(image: Option<RenderedImage>) {
+        // Wrap once so the pending slot and the current session's reset SHARE
+        // one allocation instead of each cloning the full decoded pic0.png. The
+        // public API still takes an owned `RenderedImage` — the launcher hands
+        // off a freshly-decoded image and does not keep it.
+        let image = image.map(Arc::new);
         *pending_splash().lock() = image.clone();
         let current = current_gpu_session().read().clone();
         current.reset_presentation(image);
@@ -974,8 +992,11 @@ impl AgcGpuSession {
         };
         // sRGB-encode an HDR float target (SharpEmu #448) to the RGBA8 the Shell
         // surface presents; already-8-bit frames pass through unchanged.
-        let presented = to_presentable(presented);
-        *self.last_image.lock() = Some(presented.clone());
+        // Move into the `Arc` once; the store below is then a refcount bump, not
+        // an 8 MB copy — and this runs inside the guest flip thread's
+        // synchronous flush, so the copy was pure per-flip latency.
+        let presented = Arc::new(to_presentable(presented));
+        *self.last_image.lock() = Some(Arc::clone(&presented));
         if flip_address_hit || guest_hit {
             // The title flipped to a buffer it really drew into (a GPU-drawn
             // target, or CPU-drawn pixels read straight from the flip address):
@@ -1413,8 +1434,9 @@ impl AgcGpuSession {
             let presented = scanout_image.unwrap_or_else(|| image.clone());
             // sRGB-encode an HDR float target (SharpEmu #448) before it reaches
             // the RGBA8 present surface / PPM dump; 8-bit frames pass through.
-            let presented = to_presentable(presented);
-            *self.last_image.lock() = Some(presented.clone());
+            // Into the `Arc` once (see `last_image`): the store is a bump.
+            let presented = Arc::new(to_presentable(presented));
+            *self.last_image.lock() = Some(Arc::clone(&presented));
             // Only a frame at the actual flip address takes the boot splash
             // down. The most-content fallback can surface a bare cleared
             // target — exactly what the splash exists to cover.
@@ -1883,7 +1905,7 @@ impl AgcGpuSession {
             backend.render_m2_triangle(M2_DRAW_WIDTH, M2_DRAW_HEIGHT)?
         };
 
-        *self.last_image.lock() = Some(image.clone());
+        *self.last_image.lock() = Some(Arc::new(image.clone()));
         *self.draw_count.lock() += 1;
         Ok(Some(image))
     }
@@ -1919,8 +1941,8 @@ const fn suspended_of(outcome: RunOutcome) -> Option<SuspendedWait> {
 /// inside `execute_process`, after the launcher's last chance to touch it), and
 /// every launch stages either `Some` or `None` so a previous title's splash can
 /// never leak into the next.
-fn pending_splash() -> &'static Mutex<Option<RenderedImage>> {
-    static PENDING: OnceLock<Mutex<Option<RenderedImage>>> = OnceLock::new();
+fn pending_splash() -> &'static Mutex<Option<Arc<RenderedImage>>> {
+    static PENDING: OnceLock<Mutex<Option<Arc<RenderedImage>>>> = OnceLock::new();
     PENDING.get_or_init(|| Mutex::new(None))
 }
 
@@ -2523,7 +2545,7 @@ mod tests {
         // The GPU drew content to the render target at guest base 0x1000; the
         // last-drawn image happens to be the black background.
         session.framebuffers.lock().insert(0x1000, content.clone());
-        *session.last_image.lock() = Some(black);
+        *session.last_image.lock() = Some(Arc::new(black));
 
         // Flip to the registered content buffer -> present THAT buffer.
         session.present_scanout(0x1000, None);
@@ -2536,6 +2558,39 @@ mod tests {
         // Address 0 is not a flip target and is ignored.
         session.present_scanout(0, None);
         assert_eq!(session.last_image().unwrap().pixels, content.pixels);
+    }
+
+    /// The present hand-off shares ONE allocation end to end: the flush stores
+    /// the frame, and every Shell read (`shell/present.rs` calls `last_image()`
+    /// each repaint) hands back the same `Arc` — no per-frame ~8 MB copy. This
+    /// is the fps fix's invariant AND its no-regression proof: the exact bytes
+    /// the flush produced are the bytes the Shell paints, so the frame still
+    /// reaches the window unchanged.
+    #[test]
+    fn present_hands_off_the_frame_without_copying_pixels() {
+        let session = AgcGpuSession::new(deny_memory());
+        let content = RenderedImage {
+            width: 2,
+            height: 1,
+            pixels: vec![10, 20, 30, 255, 40, 50, 60, 255],
+            bytes_per_pixel: 4,
+        };
+        session.framebuffers.lock().insert(0x2000, content.clone());
+        session.hide_splash();
+
+        // The title flips to the drawn buffer -> the flush presents it.
+        session.present_scanout(0x2000, None);
+
+        let first = session.last_image().expect("flip presented a frame");
+        let second = session.last_image().expect("frame still present");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "last_image() must hand back a shared Arc, not a per-read clone"
+        );
+        assert_eq!(
+            first.pixels, content.pixels,
+            "the Shell paints exactly the drawn frame"
+        );
     }
 
     /// The staged boot splash rides into the next process session, masks
@@ -2564,7 +2619,7 @@ mod tests {
             pixels: vec![64, 128, 0, 255],
             bytes_per_pixel: 4,
         };
-        *session.last_image.lock() = Some(fallback.clone());
+        *session.last_image.lock() = Some(Arc::new(fallback.clone()));
         assert_eq!(session.last_image().unwrap().pixels, splash.pixels);
 
         // The title declares itself ready -> present its frames.
@@ -2582,21 +2637,21 @@ mod tests {
         let session = AgcGpuSession::new(deny_memory());
         // Title A rendered a frame (its splash already came down).
         session.hide_splash();
-        *session.last_image.lock() = Some(RenderedImage {
+        *session.last_image.lock() = Some(Arc::new(RenderedImage {
             width: 1,
             height: 1,
             pixels: vec![7, 7, 7, 255],
             bytes_per_pixel: 4,
-        });
+        }));
         assert_eq!(session.last_image().unwrap().pixels, vec![7, 7, 7, 255]);
 
         // Title B staged with its own splash: A's frame is gone, B's splash shows.
-        session.reset_presentation(Some(RenderedImage {
+        session.reset_presentation(Some(Arc::new(RenderedImage {
             width: 1,
             height: 1,
             pixels: vec![2, 2, 2, 255],
             bytes_per_pixel: 4,
-        }));
+        })));
         assert_eq!(session.last_image().unwrap().pixels, vec![2, 2, 2, 255]);
 
         // Title B has no pic0: nothing to present — crucially NOT A's old frame.
@@ -2609,12 +2664,12 @@ mod tests {
     #[test]
     fn flip_to_drawn_buffer_takes_the_splash_down() {
         let session = AgcGpuSession::new(deny_memory());
-        *session.splash.lock() = Some(RenderedImage {
+        *session.splash.lock() = Some(Arc::new(RenderedImage {
             width: 1,
             height: 1,
             pixels: vec![9, 9, 9, 255],
             bytes_per_pixel: 4,
-        });
+        }));
         let content = RenderedImage {
             width: 1,
             height: 1,

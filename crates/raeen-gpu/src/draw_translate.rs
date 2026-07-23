@@ -954,7 +954,17 @@ fn decode_texture(
         return Err(err(format!("texture extent {width}x{height} out of range")));
     }
     let (cube, volume, array) = texture_view_kind(t.type_())?;
-    let mut layers = if cube || array {
+    let mut layers = if cube {
+        // A CUBE image's arrayLayers MUST be a positive multiple of 6 (Vulkan:
+        // VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT ⇒ arrayLayers ≥ 6, and a CUBE view
+        // ⇒ layer_count == 6). AMD `sq_img_rsrc_t` stores DEPTH = 6·cubes − 1,
+        // so a well-formed single cube is depth=5 → 6 (Minecraft's 1024² skybox).
+        // A malformed/misclassified cube T# with depth < 5 (measured: a Minecraft
+        // draw at DWORD 1105 carries depth=0 → 1) would otherwise create a
+        // 1-layer CUBE the driver accepts then loses the device sampling. Round
+        // up to whole cubes so the image/view are always spec-valid.
+        (u32::from(t.depth()) + 1).div_ceil(6) * 6
+    } else if array {
         u32::from(t.depth()) + 1
     } else {
         1
@@ -1058,6 +1068,31 @@ fn decode_texture(
             let src_len = face_tiled as u64 * u64::from(layers);
             let tiled = match read_guest_bytes_unaligned(t.base40(), src_len, "texture") {
                 Ok(tiled) => tiled,
+                // A CUBE view REQUIRES a multiple-of-6 layer_count; the array
+                // "drop to one base layer" path below would recreate the very
+                // <6-layer CUBE image the driver accepts then loses the device
+                // sampling. Keep the cube's layer count and read face by face,
+                // zero-filling any face whose guest bytes are unmapped.
+                Err(_) if cube => {
+                    let mut pixels =
+                        alloc_zeroed(face_linear * layers as usize, "texture decode")?;
+                    for layer in 0..layers as usize {
+                        let face_addr = t.base40() + (layer * face_tiled) as u64;
+                        if let Ok(single) =
+                            read_guest_bytes_unaligned(face_addr, face_tiled as u64, "texture")
+                        {
+                            let face = crate::texture::tiling::detile_64kb(
+                                mode, &single, width, height, bpp_log2,
+                            )
+                            .expect("table-checked above");
+                            pixels[layer * face_linear..(layer + 1) * face_linear]
+                                .copy_from_slice(&face);
+                        }
+                    }
+                    return Ok(texture_upload_from(
+                        t, width, height, format, pixels, layers, cube, array, depth, hash,
+                    ));
+                }
                 // The multi-layer array read overran the allocation: remember it
                 // so no draw retries the overrun, fall back to a single base
                 // layer, and re-probe under layers == 1 for a possible hit.

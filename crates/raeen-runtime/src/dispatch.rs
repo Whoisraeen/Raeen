@@ -1210,6 +1210,58 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
             snapshot.r10,
             snapshot.r11,
         );
+        // TEMP-DIAG (2026-07-23, ASTRO.BOT +0xe03f1a NULL-base fault diagnosis;
+        // REMOVE after the investigation): the snapshot struct already captures
+        // r12-r15 but the report never printed them — the faulting voice/list
+        // pointer lives in r14. Also, with RAEEN_DUMP_VOICE_LIST set, walk the
+        // SAL voice list observed at module+0xe7f6020 ([mgr]->+0x38->+0x10
+        // chain, node link at voice+0xe8) to show which node is half-linked.
+        tracing::warn!(
+            "TEMP-DIAG snapshot r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+            snapshot.r12, snapshot.r13, snapshot.r14, snapshot.r15,
+        );
+        if std::env::var_os("RAEEN_DUMP_VOICE_LIST").is_some() {
+            let read_q = |addr: u64| -> Option<u64> {
+                let mut b = [0u8; 8];
+                if unsafe { &*ctx.mem }.read(addr, &mut b) {
+                    Some(u64::from_le_bytes(b))
+                } else {
+                    None
+                }
+            };
+            let mut lines = String::new();
+            let mgr = read_q(0x10000e7f6020);
+            lines.push_str(&format!("mgr=[0xe7f6020]={mgr:#x?}\n"));
+            if let Some(mgr) = mgr {
+                let container = read_q(mgr.wrapping_add(0x38));
+                lines.push_str(&format!("  [mgr+0x38]={container:#x?}\n"));
+                if let Some(container) = container {
+                    let mut node = read_q(container.wrapping_add(0x10)).unwrap_or(0);
+                    for i in 0..32 {
+                        if node == 0 {
+                            lines.push_str(&format!("  node[{i}] = 0 (end)\n"));
+                            break;
+                        }
+                        let link = read_q(node.wrapping_add(0xe8));
+                        let flag120 = read_q(node.wrapping_add(0x120))
+                            .map(|v| v & 0xff);
+                        lines.push_str(&format!(
+                            "  node[{i}]={node:#x} [+0xe8]={link:#x?} [+0x120]&0xff={flag120:#x?}\n"
+                        ));
+                        match link {
+                            Some(l) if l != 0 => {
+                                node = read_q(l.wrapping_add(0x10)).unwrap_or(0)
+                            }
+                            _ => {
+                                lines.push_str("  ^^ NULL/unreadable link — half-linked node\n");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            tracing::warn!("TEMP-DIAG voice list walk:\n{lines}");
+        }
 
         // Which module was the guest actually in? A bare rip names nothing in a
         // multi-module process: eyeballing 0x1000111c640c against the wrong

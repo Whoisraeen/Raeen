@@ -348,6 +348,17 @@ fn hle_ajm_unknown_abi(_ctx: &HleContext, args: &[u64]) -> u64 {
 /// Ngs2 create-family (`System`/`Rack` create, `RackGetVoiceHandle`): the
 /// output handle lives in the **third** argument; write a fresh handle there.
 fn hle_ngs2_create_out2(ctx: &HleContext, args: &[u64]) -> u64 {
+    // TEMP-DIAG (2026-07-23, ASTRO.BOT +0xe03f1a NULL-base fault diagnosis;
+    // REMOVE after the investigation): dump the full arg vector and caller so
+    // we can verify which register really carries the out-handle pointer for
+    // each create-family member. Gated on RAEEN_TRACE_NGS2.
+    if std::env::var_os("RAEEN_TRACE_NGS2").is_some() {
+        tracing::warn!(
+            caller = format_args!("{:#x}", ctx.caller_return_addr),
+            args = ?args,
+            "TEMP-DIAG ngs2 create-family call"
+        );
+    }
     let out = args.get(2).copied().unwrap_or(0);
     if out == 0 {
         return NGS2_ERROR_INVALID_OUT_ADDRESS;

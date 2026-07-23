@@ -79,11 +79,12 @@ impl PresentedFrameRate {
 #[derive(Default)]
 pub(crate) struct GameFrameView {
     texture: Option<egui::TextureHandle>,
-    /// `draw_count` when `texture` was last refreshed. Fetching a frame clones
-    /// a full render target out of the GPU session (~8 MB at 1080p), so it is
-    /// only worth doing when a draw has actually landed since the last one —
-    /// the UI repaints far faster than a title renders, and cloning 8 MB per UI
-    /// frame would make the viewer cost more than the renderer.
+    /// `draw_count` when `texture` was last refreshed. `last_image()` is now an
+    /// `Arc` bump (no frame copy), but REFRESHING the texture still costs a full
+    /// 8 MB (1080p RGBA) `ColorImage` build plus a CPU→GPU upload into egui's
+    /// own wgpu device — a whole-frame crossing. The UI repaints far faster than
+    /// a title renders, so this gate keeps that crossing to once per new frame
+    /// (guest flip / draw) instead of once per UI repaint.
     shown_at_draw: u64,
     /// Process-local VideoOut flip count when the texture was refreshed. CPU
     /// drawn scanouts can change without a GPU draw, so draw count alone misses
