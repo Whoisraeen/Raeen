@@ -249,6 +249,16 @@ pub struct OrbisKernel {
     /// path → its resolved host path, so a later AMPR read-by-id finds the
     /// file. SharpEmu's `AmprFileRegistry` model.
     pub appr_files: DashMap<u32, String>,
+    /// APR async-read host-handle cache: APR id → an open host `File` used
+    /// for positional (`seek_read`/`read_at`) reads, so a title re-reading
+    /// one asset does not re-open it per command record. SharpEmu
+    /// `AmprExports._hostFileCache` (keyed there by host path; the APR id
+    /// already maps 1:1 to one resolved path here).
+    pub appr_file_handles: DashMap<u32, std::fs::File>,
+    /// APR ids already named by the once-per-id missing-file warn in
+    /// `sceAmprAprCommandBufferReadFile` — the "name the miss" diagnostic
+    /// stays visible without spamming one warn per frame.
+    pub appr_missing_warned: DashMap<u32, ()>,
     /// Offline epoll instances (`sceNetEpoll*`): epoll id → registered
     /// (fd, events, udata) tuples. No host-network backend exists, so a Wait
     /// always reports no events after its timeout — the honest offline model.
@@ -594,6 +604,26 @@ pub struct PthreadRwlock {
     pub writer_recursion: i32,
 }
 
+/// How many locks of each kind [`OrbisKernel::release_locks_owned_by`] freed
+/// from a dying thread. Reported in the fault-path log so the deadlock-cascade
+/// recovery is visible.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LockReleaseSummary {
+    /// Mutexes whose owner was the dead thread.
+    pub mutexes: usize,
+    /// Rwlocks whose writer was the dead thread.
+    pub rwlock_writers: usize,
+    /// Rwlock read holds the dead thread still had.
+    pub rwlock_read_holds: usize,
+}
+
+impl LockReleaseSummary {
+    /// Whether any lock at all was released (worth logging).
+    pub fn any(&self) -> bool {
+        self.mutexes != 0 || self.rwlock_writers != 0 || self.rwlock_read_holds != 0
+    }
+}
+
 /// State of a guest pthread mutex. Under Raeen's single-active-execution model
 /// there is one guest thread, so a mutex reduces to its type plus owner /
 /// recursion tracking — which is exactly correct for that model. Ported from
@@ -732,6 +762,66 @@ impl OrbisKernel {
         released
     }
 
+    /// Release EVERY lock a dying `thread` held — mutex ownership, rwlock
+    /// write-ownership, and rwlock read holds — returning how many of each were
+    /// freed. Superset of [`release_mutexes_owned_by`].
+    ///
+    /// This is the fault-path companion to the guest-called
+    /// `sceKernelDebugRaiseException` recovery. A worker thread that a
+    /// host-detected fault tears down mid-execution (a VEH-trapped null/wild
+    /// dereference that ends `dispatch::run` with `RuntimeError::Faulted`) never
+    /// runs its C++ unlock/cleanup, so any lock it held stays held forever. Now
+    /// that mutexes and rwlocks TRULY block (post the create-race fix), every
+    /// waiter on such a lock hangs indefinitely — the measured
+    /// "scePthreadMutexLock stuck >3s — deadlock" cascade on ASTRO.BOT (one
+    /// worker faults holding a mutex, 22 others wedge behind it). Clearing the
+    /// dead thread's locks lets the title limp on instead of deadlocking.
+    ///
+    /// Owner-death recovery, not a normal unlock: ownership and recursion are
+    /// cleared outright regardless of level, and a read hold gives back its full
+    /// share of the shared reader count.
+    pub fn release_locks_owned_by(&self, thread: u64) -> LockReleaseSummary {
+        let mut summary = LockReleaseSummary::default();
+
+        for mut entry in self.pthread_mutexes.iter_mut() {
+            if entry.owner == thread {
+                entry.owner = 0;
+                entry.recursion = 0;
+                summary.mutexes += 1;
+            }
+        }
+
+        // Read holds first: collect the dead thread's holds (removing them from
+        // the per-thread depth map), then give each rwlock back the reader-count
+        // share those holds contributed. `readers` is a single shared count, so
+        // a hold left behind would keep a writer locked out forever.
+        let mut dead_holds: Vec<(u64, u32)> = Vec::new();
+        self.pthread_rwlock_read_holds.retain(|&(t, rwlock_key), &mut depth| {
+            if t == thread {
+                dead_holds.push((rwlock_key, depth));
+                false
+            } else {
+                true
+            }
+        });
+        for (rwlock_key, depth) in dead_holds {
+            if let Some(mut rw) = self.pthread_rwlocks.get_mut(&rwlock_key) {
+                rw.readers = rw.readers.saturating_sub(depth as i32).max(0);
+            }
+            summary.rwlock_read_holds += 1;
+        }
+
+        for mut entry in self.pthread_rwlocks.iter_mut() {
+            if entry.writer == thread {
+                entry.writer = 0;
+                entry.writer_recursion = 0;
+                summary.rwlock_writers += 1;
+            }
+        }
+
+        summary
+    }
+
     /// Create a new kernel instance with default configuration.
     pub fn new() -> Self {
         tracing::info!("Initializing Orbis kernel HLE");
@@ -774,6 +864,8 @@ impl OrbisKernel {
             kernel_equeue_events: DashMap::new(),
             kernel_equeue_next: std::sync::atomic::AtomicU64::new(1),
             appr_files: DashMap::new(),
+            appr_file_handles: DashMap::new(),
+            appr_missing_warned: DashMap::new(),
             appr_submissions: DashMap::new(),
             appr_next_submission: std::sync::atomic::AtomicU32::new(1),
             kernel_epolls: DashMap::new(),
@@ -1363,5 +1455,61 @@ mod subsystem_resource_tests {
         assert_eq!(kernel.create_socket(), None);
         assert!(kernel.close_socket(fds[0]));
         assert!(kernel.create_socket().is_some());
+    }
+
+    /// A guest worker torn down by a host-detected fault never runs its unlock
+    /// path, so every lock it held would stay held forever and its waiters would
+    /// hang (the measured "scePthreadMutexLock stuck >3s — deadlock" cascade).
+    /// `release_locks_owned_by` must free the dead thread's mutex ownership,
+    /// rwlock write ownership, and rwlock read holds (giving back the shared
+    /// reader count) while leaving OTHER threads' locks untouched.
+    #[test]
+    fn release_locks_owned_by_frees_only_the_dead_threads_mutexes_rwlocks_and_read_holds() {
+        use super::{PthreadMutex, PthreadRwlock};
+        let kernel = OrbisKernel::new();
+        let dead = 7u64;
+        let live = 9u64;
+
+        // Two mutexes held by the dead thread, one held by a live thread.
+        kernel.pthread_mutexes.insert(0x1000, PthreadMutex { ty: 3, owner: dead, recursion: 1 });
+        kernel.pthread_mutexes.insert(0x1008, PthreadMutex { ty: 2, owner: dead, recursion: 3 });
+        kernel.pthread_mutexes.insert(0x1010, PthreadMutex { ty: 3, owner: live, recursion: 1 });
+
+        // One rwlock write-owned by the dead thread; one read-shared: the dead
+        // thread holds 2 read recursions, the live thread holds 1 — reader count
+        // is the shared sum (3).
+        kernel.pthread_rwlocks.insert(
+            0x2000,
+            PthreadRwlock { readers: 0, writer: dead, writer_recursion: 2 },
+        );
+        kernel.pthread_rwlocks.insert(
+            0x2008,
+            PthreadRwlock { readers: 3, writer: 0, writer_recursion: 0 },
+        );
+        kernel.pthread_rwlock_read_holds.insert((dead, 0x2008), 2);
+        kernel.pthread_rwlock_read_holds.insert((live, 0x2008), 1);
+
+        let summary = kernel.release_locks_owned_by(dead);
+        assert_eq!(summary.mutexes, 2);
+        assert_eq!(summary.rwlock_writers, 1);
+        assert_eq!(summary.rwlock_read_holds, 1);
+        assert!(summary.any());
+
+        // Dead thread's mutexes are cleared; the live thread's is untouched.
+        assert_eq!(kernel.pthread_mutexes.get(&0x1000).unwrap().owner, 0);
+        assert_eq!(kernel.pthread_mutexes.get(&0x1000).unwrap().recursion, 0);
+        assert_eq!(kernel.pthread_mutexes.get(&0x1008).unwrap().owner, 0);
+        assert_eq!(kernel.pthread_mutexes.get(&0x1010).unwrap().owner, live);
+
+        // The write lock is released; the read-shared lock loses the dead
+        // thread's 2 holds (3 -> 1) and keeps the live thread's hold.
+        assert_eq!(kernel.pthread_rwlocks.get(&0x2000).unwrap().writer, 0);
+        assert_eq!(kernel.pthread_rwlocks.get(&0x2000).unwrap().writer_recursion, 0);
+        assert_eq!(kernel.pthread_rwlocks.get(&0x2008).unwrap().readers, 1);
+        assert!(kernel.pthread_rwlock_read_holds.get(&(dead, 0x2008)).is_none());
+        assert_eq!(*kernel.pthread_rwlock_read_holds.get(&(live, 0x2008)).unwrap(), 1);
+
+        // Idempotent: a second call on the same (now clean) thread frees nothing.
+        assert!(!kernel.release_locks_owned_by(dead).any());
     }
 }

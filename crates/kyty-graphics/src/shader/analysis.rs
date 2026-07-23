@@ -1189,20 +1189,42 @@ fn check_read_only_texture_type(
     Ok(())
 }
 
-/// Gate for read-write storage-image T# types supported end-to-end. Type 8
-/// is a 1D image; the Vulkan/SPIR-V path represents it as a height-1 2D image,
-/// matching the already-supported sampled-image path. Type 9 is native 2D and
-/// type 10 is a 3D volume.
+/// Gate for read-write storage-image (UAV) T# types supported end-to-end.
+///
+/// - Type 8 is a 1D image; the Vulkan/SPIR-V path represents it as a height-1
+///   2D image, matching the sampled-image path. Type 9 is native 2D, type 10
+///   is a 3D volume.
+/// - Type 11 (Cube) and 13 (2DArray / NDArray) are admitted as a plain 2D
+///   storage image. Both the SPIR-V storage path
+///   ([`crate::shader::spirv`]'s `storage_texture_dim_format`, which maps
+///   `10 => 3D` and every other type to `SampledDim::Two`) and the host
+///   storage decode (`raeen-gpu` `read_storage_image`, which derives depth
+///   only for type 10 and treats everything else as depth 1) already collapse
+///   a non-3D UAV to a single depth-1 2D image by reading `type_()` — so the
+///   analysis-, SPIR-V- and bind-time views agree on `image2D` and nothing
+///   downstream builds a mismatched cube/array view. Measured: Minecraft's
+///   menu compute declares a type-13/11 storage image for the animated
+///   panorama skybox; rejecting it here aborted that compute shader, leaving
+///   the panorama BLACK while the sampled 2D menu UI (which never hits this
+///   gate) rendered. Admitting it as a 2D UAV binds layer 0 instead of
+///   erroring (M5: maximize geometry on screen, glitches OK — a multi-layer
+///   UAV surfaces only its first layer here, which is the intended
+///   approximation, not a hard limit).
+///
+/// A genuinely-unsupported storage type (1DArray 12, 2DMsaa 14, 2DMsaaArray
+/// 15, or a poison descriptor) still errors by name so the coverage gap stays
+/// visible.
 fn check_read_write_texture_type(
     t: &super::resources::ShaderTextureResource,
     source: &str,
 ) -> Result<(), ShaderAnalysisError> {
-    if (t.type_() == 8 && t.height5() == 0) || matches!(t.type_(), 9 | 10) {
+    if (t.type_() == 8 && t.height5() == 0) || matches!(t.type_(), 9 | 10 | 11 | 13) {
         return Ok(());
     }
     Err(ni_owned(format!(
-        "read-write ({source}) texture type {} is not height-1 1D (8), Texture2D (9) or 3D (10) \
-         (11=Cube 12=1DArray 13=2DArray; base={:#x} {}x{} depth={} format={} tile={})",
+        "read-write ({source}) texture type {} is not height-1 1D (8), 2D (9), 3D (10), \
+         Cube (11) or 2DArray (13) (12=1DArray 14=2DMsaa 15=2DMsaaArray; \
+         base={:#x} {}x{} depth={} format={} tile={})",
         t.type_(),
         t.base40(),
         u32::from(t.width5()) + 1,
@@ -1379,9 +1401,7 @@ pub fn shader_synthesize_default_sampler(code: &ShaderCode, bind: &mut ShaderBin
         let samp_num = usize::try_from(bind.samplers.samplers_num.max(0))
             .unwrap_or(0)
             .min(bind.samplers.start_register.len());
-        let direct = bind.samplers.start_register[..samp_num]
-            .iter()
-            .any(|&start| start == s_reg);
+        let direct = bind.samplers.start_register[..samp_num].contains(&s_reg);
         if direct || super::recompile::sampler_register_is_eud_alias(bind, code, s_reg, at) {
             continue;
         }
@@ -2936,7 +2956,10 @@ pub fn shader_parse_attrib(
             let resource = ShaderBufferResource {
                 fields: [sharp[0], sharp[1], sharp[2], sharp[3]],
             };
-            tracing::warn!(
+            // Informational: the shader still translates correctly (the V#
+            // carries the real hardware descriptor). Kept at debug so a
+            // Minecraft run does not emit this ~600x. See FIX 1 (log noise).
+            tracing::debug!(
                 semantic = sem.semantic(),
                 hardware_register = reg,
                 elements = size,
@@ -5226,6 +5249,32 @@ mod tests {
         let err = check_read_write_texture_type(&malformed, "test")
             .expect_err("type-8 UAVs wider than one row stay refused");
         assert!(format!("{err}").contains("height-1 1D"), "{err}");
+    }
+
+    #[test]
+    fn read_write_texture_type_gate_accepts_cube_and_array_as_2d() {
+        // Minecraft's menu compute declares a storage image of type 11 (Cube)
+        // and 13 (2DArray/NDArray) for the animated panorama skybox. Rejecting
+        // it aborted the compute shader and left the panorama BLACK. The gate
+        // now admits both: the SPIR-V storage path and the host storage decode
+        // both collapse a non-3D UAV to a depth-1 2D image, so binding it as a
+        // plain 2D storage image is consistent end-to-end. 8 (height-1)/9/10
+        // stay accepted; 12/14/15 stay refused so the coverage gap is visible.
+        let with_type = |ty: u32| {
+            let mut t = super::super::resources::ShaderTextureResource::default();
+            t.fields[0] = 0x1000; // plausible base
+            t.fields[1] = 10 << 20; // format 10 (8_8_8_8): plausible
+            t.fields[3] = ty << 28;
+            t
+        };
+        for ty in [8u32, 9, 10, 11, 13] {
+            check_read_write_texture_type(&with_type(ty), "table 1")
+                .unwrap_or_else(|e| panic!("read-write type {ty} must be accepted: {e}"));
+        }
+        for ty in [12u32, 14, 15] {
+            check_read_write_texture_type(&with_type(ty), "table 1")
+                .expect_err("unsupported read-write type stays a visible refusal");
+        }
     }
 
     #[test]

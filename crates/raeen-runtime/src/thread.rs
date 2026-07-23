@@ -626,6 +626,28 @@ impl GuestThreadScheduler for GuestProcessHandle {
                         || crate::stack::enter_guest(entry, stack_rsp, [arg, 0, 0, 0, 0, 0]),
                     )
                 };
+                // A worker torn down by a host-detected fault (a VEH-trapped
+                // null/wild dereference that ends `dispatch::run` with
+                // `RuntimeError::Faulted`, or any other abnormal error) never ran
+                // its C++ unlock/cleanup, so every lock it still held stays held
+                // forever. Now that mutexes and rwlocks truly block, its waiters
+                // hang indefinitely — the measured "scePthreadMutexLock stuck >3s
+                // — deadlock" cascade during ASTRO.BOT level transitions. Release
+                // the dead thread's locks so the title can limp on. Only the
+                // faulted/errored exit does this; a clean Returned/Exited already
+                // unlocked what it held.
+                if result.is_err() {
+                    let freed = process.kernel.release_locks_owned_by(handle);
+                    if freed.any() {
+                        tracing::warn!(
+                            guest_thread = handle,
+                            mutexes = freed.mutexes,
+                            rwlock_writers = freed.rwlock_writers,
+                            rwlock_read_holds = freed.rwlock_read_holds,
+                            "guest worker faulted holding locks; released them so waiters can proceed"
+                        );
+                    }
+                }
                 process
                     .kernel
                     .pthread_tls_values

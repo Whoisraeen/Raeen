@@ -196,6 +196,20 @@ pub struct TextureUpload {
     pub layers: u32,
     /// Create the view as `CUBE` (requires `layers == 6`).
     pub cube: bool,
+    /// Create the view as `VK_IMAGE_VIEW_TYPE_2D_ARRAY` (T# type 13, 2DArray).
+    ///
+    /// This is the single carrier of the emit/bind agreement for the arrayed
+    /// case: the recompiled SPIR-V declares the sampled `OpTypeImage` with
+    /// `Arrayed = 1` whenever `SampledDim::from_texture_type(t.type_())` is
+    /// `TwoArray` — a decision made purely from the T# TYPE nibble, independent
+    /// of the layer count. The bound view type MUST match, so it is decided from
+    /// this same flag (set in `draw_translate::texture_view_kind`) and never
+    /// from `layers > 1`: a 2DArray descriptor whose depth field is 0 has
+    /// `layers == 1` yet is still `Arrayed = 1` in SPIR-V. Binding a plain
+    /// `VK_IMAGE_VIEW_TYPE_2D` there is the ASTRO.BOT array/cube device-loss
+    /// (`VUID-vkCmdDispatch`: view type 2D under an `Arrayed = 1` image). A
+    /// `TYPE_2D_ARRAY` view with `layer_count == 1` is valid and matches.
+    pub array: bool,
     /// Volume depth: 1 for 2D/cube; > 1 creates a `VK_IMAGE_TYPE_3D` image
     /// with a `3D` view (measured: ASTRO.BOT's 240x135x64 froxel/LUT
     /// volumes, T# type 10).
@@ -2279,6 +2293,7 @@ impl<'a> Resources<'a> {
                             layers: upload.layers,
                             depth: upload.depth.max(1),
                             cube: upload.cube,
+                            array: upload.array,
                             format: upload.format.as_raw(),
                         };
                         let (view, hash) = self.caches.texture_entry(&key).ok_or_else(|| {
@@ -2417,6 +2432,7 @@ impl<'a> Resources<'a> {
             layers: upload.layers,
             depth: upload.depth.max(1),
             cube: upload.cube,
+            array: upload.array,
             format: upload.format.as_raw(),
         });
         if cache_key.is_some() {
@@ -2494,11 +2510,17 @@ impl<'a> Resources<'a> {
 
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
+            // View type is decided from the T#-TYPE-driven upload flags, NOT
+            // from the layer count, so it always matches the recompiled SPIR-V's
+            // `OpTypeImage` Arrayed/Dim (both come from `from_texture_type`). A
+            // 2DArray (type 13) with a single layer stays `TYPE_2D_ARRAY`
+            // (`layer_count == 1`) — binding `TYPE_2D` there was the ASTRO.BOT
+            // array/cube device-loss.
             .view_type(if upload.cube {
                 vk::ImageViewType::CUBE
             } else if volume {
                 vk::ImageViewType::TYPE_3D
-            } else if upload.layers > 1 {
+            } else if upload.array {
                 // 2DArray (T# type 13) — the recompiled SPIR-V samples an
                 // arrayed 2D image (measured: ASTRO.BOT's 1536x1536x3).
                 vk::ImageViewType::TYPE_2D_ARRAY

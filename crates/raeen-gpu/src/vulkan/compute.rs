@@ -873,11 +873,18 @@ impl<'a> ComputeResources<'a> {
 
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
+            // View type is decided from the T#-TYPE-driven upload flags, NOT
+            // from the layer count, so it always matches the recompiled SPIR-V's
+            // `OpTypeImage` Arrayed/Dim (both come from `from_texture_type`). A
+            // 2DArray (type 13) with a single layer stays `TYPE_2D_ARRAY`
+            // (`layer_count == 1`) — binding `TYPE_2D` there was the measured
+            // ASTRO.BOT `vkCmdDispatch` device-loss (view type 2D under an
+            // `Arrayed = 1` sampled image).
             .view_type(if upload.cube {
                 vk::ImageViewType::CUBE
             } else if volume {
                 vk::ImageViewType::TYPE_3D
-            } else if upload.layers > 1 {
+            } else if upload.array {
                 // 2DArray (T# type 13) — the recompiled SPIR-V samples an
                 // arrayed 2D image (measured: ASTRO.BOT's 1536x1536x3).
                 vk::ImageViewType::TYPE_2D_ARRAY

@@ -15497,6 +15497,116 @@ mod tests {
         );
     }
 
+    /// Regression guard for the REVERTED rank-8 storage-placeholder fallback
+    /// (unwired in `raeen-gpu` `shader_fetch.rs::translate_cs`).
+    ///
+    /// A compute shader that BOTH samples (`image_load`) and stores
+    /// (`image_store`) through the SAME T# register is the shape that regressed
+    /// ASTRO.BOT compute from 0 translation failures to 30. When
+    /// `shader_synthesize_placeholder_storage_texture` runs after the sampled
+    /// pass, its coverage check (`without_sampler` direct match + EUD alias) does
+    /// NOT see the sampled placeholder already parked at that register, so it
+    /// parks a SECOND `texture2D` there. `WriteLocalVariables` then seeds
+    /// `%vsharp_s{reg}` once per descriptor — TWO definitions of `%vsharp_s0`,
+    /// the assembly-fatal "duplicate definition of result id %vsharp_s0" the log
+    /// shows on 0x5006e7a00 / 0x5006ea100.
+    ///
+    /// This pins BOTH facts: stacking the two passes duplicates the result id
+    /// (why the storage pass is unwired), and the retained sampled-only path —
+    /// the shipped wiring — never emits an invalid module (it resolves through
+    /// the recompiler guard or refuses by name, never a duplicate id).
+    #[test]
+    fn storage_placeholder_at_occupied_register_duplicates_vsharp() {
+        use crate::shader::analysis::{
+            shader_synthesize_placeholder_sampled_texture,
+            shader_synthesize_placeholder_storage_texture,
+        };
+
+        // image_load (sampled) + image_store (storage), both reading their T#
+        // from the SAME register s0.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF000_0300, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_load");
+        let mut store = ShaderCode::new();
+        store.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF020_0100, 0x0060_0800, 0xBF80_0000, S_ENDPGM],
+            &mut store,
+            true,
+        )
+        .expect("parse image_store");
+        let store_inst = store.get_instructions()[0];
+        assert_eq!(store_inst.type_, T::ImageStore);
+        // Insert the store just before the load's s_endpgm.
+        code.get_instructions_mut().insert(1, store_inst);
+        // Force both MIMG T# operands to s0 to reproduce the collision.
+        code.get_instructions_mut()[0].src[1].register_id = 0;
+        code.get_instructions_mut()[1].src[1].register_id = 0;
+        assert_eq!(code.get_instructions()[0].type_, T::ImageLoad);
+        assert_eq!(code.get_instructions()[1].type_, T::ImageStore);
+
+        let base = || {
+            let mut info = ShaderComputeInputInfo::default();
+            info.threads_num = [1, 1, 1];
+            info.bind.push_constant_size = 128;
+            info
+        };
+
+        // Two-pass path (the reverted wiring): sampled placeholder then storage
+        // placeholder both park a texture2D at s0.
+        let mut both = base();
+        shader_synthesize_placeholder_sampled_texture(&code, &mut both.bind);
+        shader_synthesize_placeholder_storage_texture(&code, &mut both.bind);
+        let tex_num = both.bind.textures2d.textures_num as usize;
+        let at_s0 = both.bind.textures2d.desc[..tex_num]
+            .iter()
+            .filter(|d| d.start_register == 0)
+            .count();
+        assert_eq!(at_s0, 2, "both passes park a descriptor at s0 (the collision)");
+        let dup = spirv_generate_source(&code, None, None, Some(&both))
+            .expect("recompiles (both descriptors resolve) though the module is invalid");
+        assert_eq!(
+            dup.matches("%vsharp_s0 =").count(),
+            2,
+            "the storage placeholder duplicates the %vsharp_s0 seeding: {dup}"
+        );
+        spirv_run(&dup).expect_err("duplicate %vsharp_s0 must fail SPIR-V assembly");
+
+        // Retained sampled-only path (shipped wiring after the revert): the
+        // image_store's unresolved T# refuses by name — never an invalid module,
+        // never a duplicate id.
+        let mut sampled_only = base();
+        shader_synthesize_placeholder_sampled_texture(&code, &mut sampled_only.bind);
+        match spirv_generate_source(&code, None, None, Some(&sampled_only)) {
+            Ok(src) => {
+                assert_eq!(
+                    src.matches("%vsharp_s0 =").count(),
+                    1,
+                    "the single sampled placeholder seeds %vsharp_s0 exactly once: {src}"
+                );
+                spirv_run(&src).expect("sampled-only module assembles to valid SPIR-V");
+            }
+            Err(e) => {
+                // `spirv_generate_source` refuses BEFORE assembly, so any Err
+                // here is a clean named refusal (guard `dynamic-image-descriptor`
+                // or recompiler `can't recompile: ImageStore`) — never the
+                // duplicate-id / invalid-module the storage placeholder produced.
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("duplicate"),
+                    "sampled-only path must refuse cleanly, never a duplicate id: {msg}"
+                );
+            }
+        }
+    }
+
     /// Device-loss defusal sub-fix (iii), the measured 0x5006c5f00 shape: the
     /// MIMG's T# registers ARE captured, but a raw (uncovered-EUD)
     /// `s_load_dwordx8` overwrites them with raw guest dwords — the seeded

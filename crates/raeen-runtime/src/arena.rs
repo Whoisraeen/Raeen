@@ -1149,6 +1149,79 @@ impl GuestArena {
     /// grow here once their fixed regions fill; `mmap` lacking this fallback
     /// was an asymmetry rather than a deliberate ceiling, and ASTRO.BOT's
     /// opening 1.94 GiB `sceKernelAllocateDirectMemory` fell through the gap.
+    /// The host-backed sub-ranges of `[addr, end)` that lie OUTSIDE the
+    /// committed 4 GiB core — the pages a fixed-address [`GuestAllocator::map_at`]
+    /// may hand back holding a previous mapping's bytes.
+    ///
+    /// Orbis `sceKernelMapDirectMemory`/`sceKernelMapFlexibleMemory` return
+    /// ZEROED pages. Windows only zeroes a page on its FIRST commit, so when a
+    /// title reuses one of its own fixed VAs (ASTRO.BOT maps successive levels'
+    /// asset pools into the same `0x3_0000_0000` direct-memory window) the pages
+    /// are already committed and Windows leaves the old level's bytes in place. A
+    /// freshly-constructed object over those bytes then reads an unset pointer
+    /// field as a stale non-null value, survives its null check, and faults —
+    /// the measured level-transition worker faults. Only pages that were
+    /// host-backed BEFORE the call are stale; fresh `MEM_RESERVE|MEM_COMMIT` and
+    /// first-time `MEM_COMMIT` pages are already zeroed by Windows and are left
+    /// out, so a large first-time fixed map pays no redundant memset.
+    ///
+    /// The committed core is excluded: it backs `alloc` (malloc, which the guest
+    /// zeroes itself) and carries the inter-region guard pages, which must never
+    /// be written.
+    fn backed_ranges_outside_core(
+        state: &AllocState,
+        addr: u64,
+        end: u64,
+        core_start: u64,
+        core_end: u64,
+    ) -> Vec<(u64, u64)> {
+        let mut ranges = Vec::new();
+        let mut cursor = addr;
+        while cursor < end {
+            let Some(vma) = state.vmm.find(cursor) else {
+                break;
+            };
+            let seg_end = vma.end().min(end);
+            if seg_end <= cursor {
+                break;
+            }
+            if vma.kind.is_host_backed() {
+                // Clip the core out of `[cursor, seg_end)`: the part below the
+                // core and the part above it are both eligible.
+                let below_end = seg_end.min(core_start);
+                if cursor < below_end {
+                    ranges.push((cursor, below_end - cursor));
+                }
+                let above_start = cursor.max(core_end);
+                if above_start < seg_end {
+                    ranges.push((above_start, seg_end - above_start));
+                }
+            }
+            cursor = seg_end;
+        }
+        ranges
+    }
+
+    /// Zero the reuse ranges captured by [`backed_ranges_outside_core`], in
+    /// place. The caller must still hold the state lock — that serialises this
+    /// against `munmap`'s `MEM_RELEASE`, so a range host-backed at capture is
+    /// still backed here.
+    fn zero_reused_ranges(&self, ranges: &[(u64, u64)]) {
+        for &(start, len) in ranges {
+            if len == 0 {
+                continue;
+            }
+            // SAFETY: `[start, start + len)` was host-backed (committed
+            // read/write) in the VMA map at capture and outside the core (so no
+            // guard page), and the state lock is held across the whole `map_at`,
+            // so no concurrent `munmap` can have released it. The arena is
+            // identity-mapped, so the guest address is the host address.
+            unsafe {
+                std::ptr::write_bytes(start as *mut u8, 0, len as usize);
+            }
+        }
+    }
+
     fn grow_into_tail(
         &self,
         state: &mut AllocState,
@@ -2059,9 +2132,27 @@ impl GuestAllocator for GuestArena {
 
         let mut state = self.lock_state();
 
-        // Already backed end to end: the memory exists, so hand the address
-        // straight back.
+        // Already backed end to end: a title re-mapping a fixed VA it already
+        // holds fully backed — ASTRO.BOT re-maps successive levels' asset pools
+        // into the same 0x3_0000_0000 direct-memory window without unmapping
+        // between them. The memory exists, so hand the address straight back —
+        // but first clear the previous level's bytes, because Orbis
+        // `sceKernelMapDirectMemory`/`MapFlexibleMemory` return ZEROED pages and
+        // Windows only zeroes a page on its first commit. Left uncleared, a
+        // freshly-constructed object reads an unset pointer field as a stale
+        // non-null value, survives its null check, and faults (the measured
+        // level-transition worker faults). Only this FULL re-map is zeroed;
+        // partial-overlap extends (below) intentionally preserve the backed
+        // overlap so a growing mapping keeps its data.
         if range_all(&state.vmm, addr, end, |vma| vma.kind.is_host_backed()) {
+            let reuse = Self::backed_ranges_outside_core(
+                &state,
+                addr,
+                end,
+                self.base,
+                self.base + ARENA_SPAN,
+            );
+            self.zero_reused_ranges(&reuse);
             return Some(addr);
         }
 
@@ -2738,6 +2829,53 @@ mod tests {
         assert!(arena.write(base + 0x1f_ffff, &[0xCD]));
         assert!(arena.read(base + 0x1f_ffff, &mut byte));
         assert_eq!(byte, [0xCD], "the newly extended tail must be backed");
+    }
+
+    /// Orbis `sceKernelMapDirectMemory`/`MapFlexibleMemory` return ZEROED pages.
+    /// A title re-mapping a fixed VA it already holds fully backed (ASTRO.BOT
+    /// reuses its 0x3_0000_0000 direct-memory window across level transitions,
+    /// without unmapping between them) hits `map_at`'s fully-backed fast path,
+    /// where Windows will NOT re-zero the already-committed pages. Left stale, a
+    /// freshly-constructed object reads an unset pointer field as a leftover
+    /// non-null value, passes its null check, and faults — the measured
+    /// level-transition worker faults. The full re-map must come back zeroed.
+    #[test]
+    fn map_at_full_remap_zeroes_stale_bytes_for_orbis_contract() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let base = 0x4_0000_0000u64; // a fixed VA outside the arena core
+        let len = 0x4_0000u64; // 256 KiB
+
+        // First map: fresh reserve+commit, Windows-zeroed.
+        assert_eq!(arena.map_at(base, len, PAGE_SIZE), Some(base));
+
+        // The previous "level" scribbles a stale non-null pointer into the pool,
+        // exactly the kind of leftover field the fault walks.
+        let stale = 0xffff_ffff_ffff_ff2fu64;
+        assert!(arena.write(base + 0x10, &stale.to_le_bytes()));
+        assert!(arena.write(base + len - 8, &stale.to_le_bytes()));
+
+        // Second map at the SAME VA (no unmap between): the new level's fresh
+        // Orbis map must hand back zeroed memory, not the stale bytes.
+        assert_eq!(
+            arena.map_at(base, len, PAGE_SIZE),
+            Some(base),
+            "re-mapping a fully-backed fixed VA must still succeed"
+        );
+
+        let mut buf = [0u8; 8];
+        assert!(arena.read(base + 0x10, &mut buf));
+        assert_eq!(
+            u64::from_le_bytes(buf),
+            0,
+            "the re-mapped range must be zeroed (Orbis map contract)"
+        );
+        assert!(arena.read(base + len - 8, &mut buf));
+        assert_eq!(
+            u64::from_le_bytes(buf),
+            0,
+            "the whole re-mapped range, not just the first page, must be zeroed"
+        );
     }
 
     /// ASTRO.BOT's opening move is a fixed-address direct-memory map: its libc

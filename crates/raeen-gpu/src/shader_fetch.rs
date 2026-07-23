@@ -422,20 +422,32 @@ impl ShaderTranslateCache {
                     &code,
                     &mut cs_info.bind,
                 );
-                // Rank 8 (draw-time null-descriptor fallback): the STORAGE
-                // counterpart — an `image_store` whose T# register matches no
-                // captured UAV descriptor (a runtime/bindless UAV the static
-                // capture missed) gets a 1x1 placeholder storage T# instead of
-                // the whole shader refusing (`dynamic-image-descriptor`). The
-                // seeded index stays in bounds (no descriptor-array OOB) and
-                // `robustImageAccess2` covers the out-of-bounds texel writes.
-                // A raw-EUD-overwritten register still refuses at the guard's
-                // shape-2 check. Storage images are compute-only, so this is
-                // wired for CS only.
-                kyty_graphics::shader::shader_synthesize_placeholder_storage_texture(
-                    &code,
-                    &mut cs_info.bind,
-                );
+                // Rank 8 (draw-time null-descriptor fallback), the STORAGE
+                // counterpart, is REVERTED (unwired) — it regressed ASTRO.BOT
+                // compute from 0 shader-translation failures to 30. Its
+                // descriptor-resolution check (direct start-register match +
+                // `mimg_register_eud_alias_index`) is NARROWER than the
+                // recompiler's own `mimg_descriptor_guard`, so on registers the
+                // guard WOULD resolve via a covered EUD alias it spuriously
+                // synthesized a second 1x1 storage T#. That injected descriptor
+                //   (1) collided with the already-present descriptor at the same
+                //       register — `WriteLocalVariables` then emitted `%vsharp_sN`
+                //       twice → "duplicate definition of result id %vsharp_s0"
+                //       (0x5006e7a00, 0x5006ea100); and
+                //   (2) grew the push-constant table past
+                //       `PUSH_CONSTANT_SPILL_THRESHOLD`, spilling `%vsharp` into a
+                //       `Uniform` Block whose inner `uint[4]` array has ArrayStride
+                //       4 — invalid UBO layout (needs 16) → spirv-val reject
+                //       (0x5006fff00).
+                // Restoring the iter2 behavior (unresolved non-sampled storage
+                // descriptors refuse via the guard's `not_supported()`, keeping
+                // the working sampled-placeholder pass above) returns compute to
+                // 0 failures. A correct re-wire needs the synthesis pass's alias
+                // check to match the guard's resolution exactly AND the spill
+                // path to emit StorageBuffer (relaxed layout) instead of Uniform;
+                // both are follow-ups. See
+                // kyty-graphics recompile.rs test
+                // `storage_placeholder_at_occupied_register_duplicates_vsharp`.
                 // SharpEmu port + rank-8 broadening: a CS that SAMPLES textures
                 // gets an all-zero (nearest/wrap) S# synthesized for every
                 // sampler operand register that resolves to no captured sampler

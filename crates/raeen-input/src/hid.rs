@@ -179,6 +179,7 @@ mod imp {
         }
 
         let mut buffer = [0u8; 256];
+        let mut logged = false;
         loop {
             let mut read: u32 = 0;
             // SAFETY: `handle` is live; `buffer`/`read` are valid out-params;
@@ -195,7 +196,20 @@ mod imp {
             if ok == 0 || read == 0 {
                 break;
             }
-            if let Some(state) = parse_report(&buffer[..read as usize]) {
+            let parsed = parse_report(&buffer[..read as usize]);
+            // Diagnostic (once per connect): the report id + length + whether it
+            // parsed pins BT-minimal (0x01, len<11 → None) vs USB (0x01/64) vs
+            // full BT (0x31). If it never parses, no input reaches the guest.
+            if !logged {
+                logged = true;
+                tracing::info!(
+                    report_id = buffer[0],
+                    len = read,
+                    parsed = parsed.is_some(),
+                    "DualSense first HID input report"
+                );
+            }
+            if let Some(state) = parsed {
                 *shared.lock().unwrap() = Some(state);
             }
         }

@@ -1,3 +1,110 @@
+- Tier-0 APR async-load crash fix (2026-07-22; working tree, no commit;
+  raeen-hle 354/354 + 1 pre-existing skip, raeen-kernel 32/32,
+  raeen-firmware 126/126; hle+kernel clippy `-D warnings` clean; fmt clean on
+  touched hunks). Unblocks diagnosis of the ASTRO.BOT pause-menu
+  poisoned-object fault (eboot+0x33f335):
+  * ROOT CAUSES FIXED (audit-verified): (1) silent zero-fill + fake success
+    when `appr_host_path(file_id)` was None — the title parsed an all-zeros
+    LevelDocument with no log naming the lost asset; (2) single bare
+    `file.read` with no read-exact loop (short reads left stale guest heap);
+    (3) `apr_complete_command_buffer` never consumed `ampr_write_offsets`, so
+    a re-submit without Reset re-executed stale ReadFile records into
+    repurposed guest addresses — a second heap-poisoning mechanism.
+  * PORT (SharpEmu GPL-2.0, cited in doc comments + THIRD_PARTY_NOTICES):
+    `sceAmprAprCommandBufferReadFile` now reads EAGERLY at record-append time
+    (AmprExports.cs:255-293) via a faithful port of
+    `TryReadFileToGuestMemory` (AmprExports.cs:748-828): per-APR-id host
+    handle cache (new `OrbisKernel::appr_file_handles`), positional
+    `seek_read`/`read_at` reads, read-EXACT loop until full or EOF, 1 MiB
+    chunks, `bytesRead` recorded in the record @0x20 at append.
+    `apr_complete_command_buffer` skips ReadFile records (data already in
+    guest memory; AmprExports.cs:578-580), keeps servicing equeue +
+    write-address records, and consumes the cb's `ampr_write_offsets` entry
+    after completion so stale records can never re-fire.
+  * MISSING-FILE SEMANTICS (SharpEmu parity, AmprExports.cs:272-276):
+    unregistered fileId → NOT_FOUND (0x8002_0002), guest memory untouched,
+    no record appended — the old zero-fill-and-report-success is GONE —
+    plus a once-per-fileId `warn!` naming the id (new
+    `OrbisKernel::appr_missing_warned` rate-limit set): the name-the-miss
+    diagnostic whose absence made the ASTRO.BOT asset loss take days.
+  * TDD red→green: `apr_read_file_populates_guest_memory_at_append_not_submit`,
+    `apr_completion_does_not_reexecute_stale_readfile_records`,
+    `apr_read_file_exact_read_fills_full_destination` (100 KiB file +
+    past-EOF short-count case), and
+    `apr_read_file_missing_file_logs_and_matches_sharpemu_semantics` (replaced
+    the old `apr_read_file_zero_fills_missing_files`, which asserted the
+    removed behavior). All 4 failed before the implementation for the
+    expected reasons; all pass after.
+  * MINECRAFT PARITY (PPSA17221, live rendering title): release build +
+    90 s `--run-eboot` smoke (`scratch/mc-apr-eager-20260722.out.log`):
+    booted — 4 module_starts, 28 guest pthreads, AGC submissions flowing,
+    2924 shader translations, ZERO ERROR lines, zero guest faults, and zero
+    APR warns (the name-the-miss warn never fired: Minecraft resolves every
+    APR id it reads). Only pre-existing WARNs (NEEDED libSce*, kyty-graphics
+    flip packets, AGC version 12). Did NOT reproduce the full 64-submission /
+    60-flips baseline inside the 90 s bound (baseline was measured on longer
+    runs; activity was still progressing at kill) — success-path parity is
+    evidenced but not fully baseline-matched.
+  * NOTE: `kernel_eventflag::wait_completes_when_satisfied_else_times_out`
+    hangs at HEAD (committed ce11844 blocks forever on NULL timeout while the
+    committed test expects ETIMEDOUT) — pre-existing, unrelated; the full
+    suite was run with `--skip` for it (independently confirmed pre-existing
+    by the concurrent session's entry below).
+  * NEXT GATE: re-run ASTRO.BOT past the pause menu — the name-the-miss warn
+    should identify the lost LevelDocument asset by fileId; then re-test the
+    poisoned-object fault at eboot+0x33f335. If the warn does not fire, the
+    poison source is elsewhere (stale-record path already eliminated).
+
+
+  working tree, no commit; raeen-kernel 30/30, raeen-runtime lib 62/62,
+  raeen-hle 354/355 — the 1 non-run is the PRE-EXISTING deterministic hang
+  `kernel_eventflag::wait_completes_when_satisfied_else_times_out`, confirmed by
+  two older pre-change binaries hanging identically; kernel+runtime clippy clean
+  on touched files):
+  * TASK 2 (deadlock cascade) — CLEAR WIN. New `OrbisKernel::release_locks_owned_by`
+    (raeen-kernel/src/lib.rs) frees a dying thread's mutex ownership + rwlock
+    write ownership + rwlock read holds (giving the shared reader count back);
+    `LockReleaseSummary` reports the counts. Wired into the FAULTED worker exit
+    path only (raeen-runtime/src/thread.rs ~L631: `if result.is_err()` after
+    `dispatch::run`). Previously only the guest-called
+    `sceKernelDebugRaiseException` path released locks (mutexes only); a
+    host-detected VEH fault (`Err(RuntimeError::Faulted)`) released nothing, so
+    every waiter on a dead worker's lock hung. MEASURED headless (90 s
+    `--run-eboot`): "stuck >3s" deadlocks 21 (baseline) -> {6, 11, 4} across three
+    post-fix runs. Log shows the fix firing: "guest worker faulted holding locks;
+    released them ... guest_thread=43 mutexes=1".
+  * TASK 1 (guest-memory zero-init) — implemented, correct, but NEGATIVE for
+    fault reduction. `GuestArena::map_at` now zeroes the FULL re-map fast path
+    (a title re-mapping a fixed VA it already holds fully backed — the Orbis
+    map contract returns zeroed pages, but Windows only zeroes a page on its
+    first commit) via `backed_ranges_outside_core` + `zero_reused_ranges`
+    (raeen-runtime/src/arena.rs). Partial-overlap extends still PRESERVE bytes
+    (unchanged; `map_at_extends_an_overlapping_external_mapping` still green).
+    mmap/flexible/allocate paths audited: already zeroed by construction (fresh
+    OS reservation -> Windows zeroes first commit; munmap MEM_RELEASEs), so no
+    change needed there; plain heap `alloc`/`grow_into_tail` left non-zeroed
+    (malloc). MEASURED: fault count unchanged 3 -> 3.
+  * WHY Task 1 didn't move faults (recent-HLE ring says "no HLE call returned an
+    Orbis error before this fault" for all three; ring is per-thread, full ring
+    DEBUG-gated). The 3 stable post-fix faults are NOT reused-non-zeroed memory:
+    - eboot+0xe03f1a (read 0x10): `mov rax,[r14+0xe8]`=0 (NULL) then `[rax+0x10]`
+      — an object whose pointer field is 0/UNINITIALIZED, not stale garbage.
+      Zeroing memory can't fix a field that needs REAL data written.
+    - eboot+0xe47a43 (read 0x29): linked-list `next` = 0, walked past — same
+      uninitialized/zero signature.
+    - eboot+0x102a16ba (read 0xfaab60664): libc strcmp on a garbage char* in an
+      entity-name table — genuinely stale, but NOT cleared by map_at zeroing, so
+      that table lives in game-managed memory (mspace/heap on flexible memory, or
+      a map->munmap->map range already Windows-zeroed), not a kernel map we own.
+    The one baseline fault whose signature matched reuse (eboot+0x33f335, read
+    0xffffffffffffffff — "garbage 0x..2f survived a null check") did NOT recur in
+    3 post-fix runs, but that is within run-to-run noise (faults are
+    non-deterministic; a GIL halves them) so no claim is made. NEXT root-cause
+    lead is the ledger's existing APR async-load suspect: objects with 0/null
+    pointer fields (0xe03f1a, 0xe47a43) look UNPOPULATED — check whether APR
+    submit actually executes ReadFile/WriteAddress records into guest memory for
+    async-loaded objects, and find who writes [obj+0xe8]/list `next`.
+
 - ASTRO.BOT post-audio "stall" diagnosed as mspace provider regression and
   FIXED (2026-07-21; working tree, no commit; firmware 126/126):
   * Exact wait classification with TRACE_COND + TIME_HLE: workers use the same

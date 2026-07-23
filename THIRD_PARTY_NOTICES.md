@@ -69,8 +69,15 @@ SOFTWARE.
   (Fiber, AMPR, PlayGo), VideoOut/AGC bring-up, and **native host controller
   input** (XInput + raw-HID DualSense — `Host/Windows/WindowsXInputReader.cs`,
   `WindowsDualSenseReader.cs`, `WindowsHidNative.cs`, `Host/HostGamepadState.cs`,
-  re-implemented as `crates/raeen-input/src/{xinput,hid,native}.rs`). Patterns
-  and behavior are **re-implemented in idiomatic Rust with reference to
+  re-implemented as `crates/raeen-input/src/{xinput,hid,native}.rs`). The
+  APR/AMPR async file-I/O path is also a SharpEmu port:
+  `Ampr/AmprExports.cs` (`AprCommandBufferReadFile` eager read,
+  `TryReadFileToGuestMemory` positional read-exact loop + host-handle cache,
+  `CompleteCommandBuffer` record walk) and
+  `Kernel/KernelAprCompatExports.cs` (submit/wait), re-implemented in
+  `crates/raeen-hle/src/libsce_ampr.rs` and the
+  `apr_complete_command_buffer` in `crates/raeen-hle/src/libkernel.rs`.
+  Patterns and behavior are **re-implemented in idiomatic Rust with reference to
   SharpEmu's C# source**; no C# is transliterated or vendored. SharpEmu's tree
   is cloned locally into the git-ignored `reference/` directory for study only;
   it is **never vendored, compiled, or committed** into Raeen.

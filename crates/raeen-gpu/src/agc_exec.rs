@@ -639,10 +639,17 @@ impl AgcGpuSession {
             .map(|d| u64::from(d.pitch_pixels.max(d.width)) * u64::from(d.height) * 8)
             .unwrap_or(0);
         crate::guest_mem::register_scanout_watch(address, watch_span);
-        // Bounded fire-and-forget flip (item 7 / rank 7 — THE fps lever). The
-        // flip enqueues its present flush and returns instead of blocking the
-        // guest until the whole worker drains. See [`Self::submit_flip_flush`].
-        self.submit_flip_flush(address);
+        // TEMPORARILY REVERTED to the synchronous flip. The bounded
+        // fire-and-forget flip (`submit_flip_flush`, item 7 / rank 7) gives the
+        // guest ~11 fps of flip throughput headless (verified on Minecraft:
+        // present_index 1024/90s vs 0.4 fps synchronous), but the GUI's
+        // egui-upload present (`shell/present.rs` reads `last_image()` each
+        // paint) does NOT yet sync to the async frames, so the on-screen output
+        // went black even though the worker presents. Until the GUI present is
+        // made async-aware (repaint on flip / read the freshest completed
+        // frame), flip synchronously so the Shell window renders. The lever code
+        // below is kept intact for that follow-up.
+        self.consume_flush(Some(address), true);
     }
 
     /// Enqueue the present flush for a flip and return without waiting for the

@@ -776,6 +776,7 @@ fn texture_cache_probe(
     layers: u32,
     depth: u32,
     cube: bool,
+    array: bool,
     format: vk::Format,
 ) -> (u64, Option<TextureUpload>) {
     if std::env::var_os("RAEEN_NO_TEX_CACHE").is_some() {
@@ -795,6 +796,7 @@ fn texture_cache_probe(
                     && k.layers == layers
                     && k.depth == depth
                     && k.cube == cube
+                    && k.array == array
                     && k.format == format.as_raw()
                     && *cached_hash == hash
             })
@@ -805,6 +807,7 @@ fn texture_cache_probe(
                 pixels: Vec::new(),
                 layers,
                 cube,
+                array,
                 depth,
                 render_target: None,
                 guest_base: base,
@@ -863,6 +866,69 @@ fn sampled_key_ordinal(t: &kyty_graphics::shader::ShaderTextureResource) -> usiz
     ) as usize
 }
 
+/// The `(cube, volume, array)` view intent of a sampled T#, decided SOLELY
+/// from its TYPE nibble — the single source of truth the bound `VkImageView`
+/// type is built from so it can never disagree with the recompiled SPIR-V's
+/// `OpTypeImage` (which the emitter derives from the SAME nibble via
+/// `kyty_graphics::shader::SampledDim::from_texture_type`):
+///
+/// | T# type | `SampledDim` | view intent            | `VkImageViewType` |
+/// |---------|--------------|------------------------|-------------------|
+/// | 8, 9    | `Two`        | `(false,false,false)`  | `TYPE_2D`         |
+/// | 10      | `Three`      | `(false,true ,false)`  | `TYPE_3D`         |
+/// | 11      | `Cube`       | `(true ,false,false)`  | `CUBE`            |
+/// | 13      | `TwoArray`   | `(false,false,true )`  | `TYPE_2D_ARRAY`   |
+///
+/// The array/cube flags are TYPE-driven, NOT layer-count-driven: a 2DArray
+/// (type 13) whose depth field is 0 has one layer yet still declares
+/// `Arrayed = 1` in SPIR-V, so it MUST bind a `TYPE_2D_ARRAY` view (with
+/// `layer_count == 1`). Deriving the view from `layers > 1` instead was the
+/// ASTRO.BOT array/cube device-loss (`VUID-vkCmdDispatch`: view type 2D under
+/// an `Arrayed = 1` sampled image). The same holds for the SharpEmu #476
+/// array-upload OOM fall-back, which drops to one layer but keeps type 13.
+///
+/// Types 12/14/15 (1DArray, 2DMsaa, 2DMsaaArray) never reach here — analysis
+/// (`check_read_only_texture_type`) rewrites a plausible one to 2D and replaces
+/// the poison with a 2D placeholder before decode, so this stays a named
+/// refusal only for a genuinely-unhandled nibble.
+fn texture_view_kind(ty: u8) -> Result<(bool, bool, bool), DrawError> {
+    // Cross-check against the emitter's classifier so the two can never drift:
+    // this table and `SampledDim::from_texture_type` are the ONE decision.
+    use kyty_graphics::shader::SampledDim;
+    let kind = match ty {
+        // 8 = Texture1D. A 1D image is a 2D image one row tall, and the T#
+        // already reports height5 = 0 => height 1, so the 2D decode path
+        // handles it unchanged (measured on ASTRO.BOT: a 1x1 format-71
+        // texture, tile mode 27). Kept a distinct arm rather than folding into
+        // 9 so the disagreement is visible if a >1-row "1D" texture ever shows.
+        8 => (false, false, false),
+        // 9 = Texture2D.
+        9 => (false, false, false),
+        // 10 = 3D volume (measured: ASTRO.BOT's 240x135x64 froxel/LUT volumes).
+        10 => (false, true, false),
+        // 11 = Cube (measured: Minecraft's 1024x1024x6 skybox).
+        11 => (true, false, false),
+        // 13 = 2DArray (measured: ASTRO.BOT's 1536x1536x3 array, tile 24 — the
+        // T# depth field carries the layer count).
+        13 => (false, false, true),
+        other => {
+            return Err(err(format!(
+                "texture type {other} is not Texture2D (9), 3D (10), Cube (11) or 2DArray (13)"
+            )));
+        }
+    };
+    debug_assert_eq!(
+        (
+            SampledDim::from_texture_type(ty) == SampledDim::Cube,
+            SampledDim::from_texture_type(ty) == SampledDim::Three,
+            SampledDim::from_texture_type(ty) == SampledDim::TwoArray,
+        ),
+        kind,
+        "bind-side view kind must equal the emitter's SampledDim for type {ty}",
+    );
+    Ok(kind)
+}
+
 /// Decode one T# into linear pixels a Vulkan sampled image can hold.
 ///
 /// Formats and tile modes are added strictly from measurement: an unhandled
@@ -887,27 +953,7 @@ fn decode_texture(
     if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) {
         return Err(err(format!("texture extent {width}x{height} out of range")));
     }
-    // 9 = Texture2D, 11 = Cube (measured: Minecraft's 1024x1024x6 skybox),
-    // 10 = 3D volume (measured: ASTRO.BOT's 240x135x64 froxel/LUT volumes),
-    // 13 = 2DArray (measured: ASTRO.BOT's 1536x1536x3 array, tile 24 —
-    // the T# depth field carries the layer count).
-    let (cube, volume, array) = match t.type_() {
-        // 8 = Texture1D. A 1D image is a 2D image one row tall, and the T#
-        // already reports height5 = 0 => height 1, so the existing 2D decode
-        // path handles it unchanged (measured on ASTRO.BOT: a 1x1 format-71
-        // texture, tile mode 27). Kept a distinct arm rather than folding into
-        // 9 so the disagreement is visible if a >1-row "1D" texture ever shows.
-        8 => (false, false, false),
-        9 => (false, false, false),
-        10 => (false, true, false),
-        11 => (true, false, false),
-        13 => (false, false, true),
-        other => {
-            return Err(err(format!(
-                "texture type {other} is not Texture2D (9), 3D (10), Cube (11) or 2DArray (13)"
-            )));
-        }
-    };
+    let (cube, volume, array) = texture_view_kind(t.type_())?;
     let mut layers = if cube || array {
         u32::from(t.depth()) + 1
     } else {
@@ -945,6 +991,7 @@ fn decode_texture(
                 layers,
                 depth,
                 cube,
+                array,
                 format,
             );
             if let Some(upload) = hit {
@@ -1000,6 +1047,7 @@ fn decode_texture(
                     layers,
                     depth,
                     cube,
+                    array,
                     format,
                 )
             };
@@ -1035,6 +1083,10 @@ fn decode_texture(
                         pixels,
                         layers,
                         cube,
+                        // The array read overran and dropped to one layer, but
+                        // the T# is still type 13: the SPIR-V stays Arrayed = 1,
+                        // so the view must stay TYPE_2D_ARRAY (layer_count 1).
+                        array,
                         depth,
                         single_hash,
                     ));
@@ -1088,6 +1140,7 @@ fn decode_texture(
         pixels,
         layers,
         cube,
+        array,
         depth,
         // This path has already read and detiled the guest bytes above, so it is
         // the CPU-staging upload — not the Stage-B direct-bind of a live
@@ -1118,6 +1171,7 @@ fn texture_upload_from(
     pixels: Vec<u8>,
     layers: u32,
     cube: bool,
+    array: bool,
     depth: u32,
     sample_hash: u64,
 ) -> TextureUpload {
@@ -1128,6 +1182,7 @@ fn texture_upload_from(
         pixels,
         layers,
         cube,
+        array,
         depth,
         render_target: None,
         guest_base: t.base40(),
@@ -1149,6 +1204,7 @@ fn placeholder_texture_dummy() -> TextureUpload {
         pixels: vec![0u8; 4],
         layers: 1,
         cube: false,
+        array: false,
         depth: 1,
         render_target: None,
         guest_base: 0,
@@ -1335,6 +1391,7 @@ fn sampled_render_target(
                 pixels: Vec::new(),
                 layers: 1,
                 cube: false,
+                array: false,
                 depth: 1,
                 render_target: Some(base),
                 // Render-target binds are served by the persistent-TARGET
@@ -4238,6 +4295,36 @@ mod tests {
                 layer.as_slice(),
                 "layer {l} must detile to its original pixels"
             );
+        }
+    }
+
+    /// The bind-side sampled view kind is a pure function of the T# TYPE and
+    /// agrees, arm for arm, with the emitter's `SampledDim::from_texture_type`.
+    /// This is the invariant that keeps the bound `VkImageViewType` matching the
+    /// recompiled SPIR-V's `OpTypeImage` Arrayed/Dim — its violation was the
+    /// ASTRO.BOT array/cube `vkCmdDispatch` device-loss (view type 2D under an
+    /// `Arrayed = 1` sampled image).
+    #[test]
+    fn texture_view_kind_matches_emitter_sampled_dim() {
+        use kyty_graphics::shader::SampledDim;
+        for ty in [8u8, 9, 10, 11, 13] {
+            let (cube, volume, array) = texture_view_kind(ty).expect("accepted sampled type");
+            let dim = SampledDim::from_texture_type(ty);
+            assert_eq!(cube, dim == SampledDim::Cube, "cube flag for type {ty}");
+            assert_eq!(volume, dim == SampledDim::Three, "volume flag for type {ty}");
+            assert_eq!(array, dim == SampledDim::TwoArray, "array flag for type {ty}");
+        }
+        // Exactly type 13 is arrayed; nothing else is (8/9 = 2D, 10 = 3D volume,
+        // 11 = cube). The array flag is TYPE-driven, so a 2DArray with a single
+        // layer (depth 0) still binds TYPE_2D_ARRAY, matching Arrayed = 1.
+        assert_eq!(texture_view_kind(13).unwrap(), (false, false, true));
+        assert_eq!(texture_view_kind(9).unwrap(), (false, false, false));
+        assert_eq!(texture_view_kind(11).unwrap(), (true, false, false));
+        assert_eq!(texture_view_kind(10).unwrap(), (false, true, false));
+        // 12/14/15 never reach decode (analysis rewrites/replaces them); an
+        // unhandled nibble stays a named refusal rather than a silent 2D guess.
+        for ty in [12u8, 14, 15] {
+            assert!(texture_view_kind(ty).is_err(), "type {ty} is a named refusal");
         }
     }
 

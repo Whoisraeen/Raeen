@@ -103,6 +103,28 @@ impl std::fmt::Display for RegFile {
     }
 }
 
+/// Process-global rate limit for skipped-register warnings (FIX 1, log noise).
+///
+/// [`CommandProcessor::first`] already dedups per instance, but the graphics
+/// DCB and the async-compute ACB each own a persistent `CommandProcessor`
+/// (`raeen-gpu` `AgcExec`), so a register unknown to both is warned about once
+/// PER QUEUE — a Minecraft run leaks ~140 lines for ~70 distinct registers.
+/// This set collapses that to at most one WARN per distinct `(file, register)`
+/// for the entire process, keeping the message at WARN so the
+/// register-coverage gap stays visible while it stops spamming.
+static WARNED_SKIP_REGS: std::sync::Mutex<BTreeSet<(RegFile, u32)>> =
+    std::sync::Mutex::new(BTreeSet::new());
+
+/// True the first time this `(file, reg)` is seen process-wide; the caller
+/// emits its WARN exactly then. Recovers from a poisoned lock (a panic while
+/// deduping must not re-arm the spam).
+fn warn_skip_reg_once(file: RegFile, reg: u32) -> bool {
+    WARNED_SKIP_REGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((file, reg))
+}
+
 /// A draw that could not be translated. Never silent: the message names the
 /// register or resource that was missing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1461,7 +1483,9 @@ impl CommandProcessor {
     /// (resilience policy).
     fn set_context_register(&mut self, reg: u32, value: u32) {
         if reg as usize >= pm4::CX_NUM {
-            if self.first(SkipKey::Reg(RegFile::Context, reg)) {
+            if self.first(SkipKey::Reg(RegFile::Context, reg))
+                && warn_skip_reg_once(RegFile::Context, reg)
+            {
                 warn!(
                     reg = format_args!("{reg:#06x}"),
                     "context register index out of range — write skipped"
@@ -1905,7 +1929,9 @@ impl CommandProcessor {
             pm4::CB_BLEND_ALPHA => self.ctx.blend_color.alpha = f32::from_bits(value),
 
             _ => {
-                if self.first(SkipKey::Reg(RegFile::Context, reg)) {
+                if self.first(SkipKey::Reg(RegFile::Context, reg))
+                    && warn_skip_reg_once(RegFile::Context, reg)
+                {
                     warn!(
                         reg = format_args!("{reg:#06x}"),
                         "unknown context register — write skipped"
@@ -1941,7 +1967,9 @@ impl CommandProcessor {
         // at 0x8C runs to ES_LO at 0xC8.
         const SGPRS: u32 = 32;
         if reg as usize >= pm4::SH_NUM {
-            if self.first(SkipKey::Reg(RegFile::Shader, reg)) {
+            if self.first(SkipKey::Reg(RegFile::Shader, reg))
+                && warn_skip_reg_once(RegFile::Shader, reg)
+            {
                 warn!(
                     reg = format_args!("{reg:#06x}"),
                     "shader register index out of range — write skipped"
@@ -2078,7 +2106,9 @@ impl CommandProcessor {
             | pm4::COMPUTE_PGM_RSRC3 => {}
             pm4::COMPUTE_SHADER_CHKSUM => self.sh_ctx.cs.cs_regs.push_chksum(value),
             _ => {
-                if self.first(SkipKey::Reg(RegFile::Shader, reg)) {
+                if self.first(SkipKey::Reg(RegFile::Shader, reg))
+                    && warn_skip_reg_once(RegFile::Shader, reg)
+                {
                     warn!(
                         reg = format_args!("{reg:#06x}"),
                         "unknown shader register — write skipped"
@@ -2109,7 +2139,9 @@ impl CommandProcessor {
     /// (`VGT_PRIMITIVE_TYPE`).
     fn set_uconfig_register(&mut self, reg: u32, value: u32) {
         if reg as usize >= pm4::UC_NUM {
-            if self.first(SkipKey::Reg(RegFile::UserConfig, reg)) {
+            if self.first(SkipKey::Reg(RegFile::UserConfig, reg))
+                && warn_skip_reg_once(RegFile::UserConfig, reg)
+            {
                 warn!(
                     reg = format_args!("{reg:#06x}"),
                     "user-config register index out of range — write skipped"
@@ -2120,7 +2152,9 @@ impl CommandProcessor {
         match reg {
             pm4::VGT_PRIMITIVE_TYPE => self.ucfg.prim_type = value,
             _ => {
-                if self.first(SkipKey::Reg(RegFile::UserConfig, reg)) {
+                if self.first(SkipKey::Reg(RegFile::UserConfig, reg))
+                    && warn_skip_reg_once(RegFile::UserConfig, reg)
+                {
                     warn!(
                         reg = format_args!("{reg:#06x}"),
                         "unknown user-config register — write skipped"

@@ -5,14 +5,18 @@
 //! (self ptr @0x00, data ptr @0x08, size @0x10, aux @0x18/0x20) plus a
 //! host-tracked write cursor (`OrbisKernel::ampr_write_offsets`, keyed by the
 //! command-buffer address). This ports the construct/destruct/get/set/reset
-//! lifecycle — enough for a title to build AMPR command buffers. The actual
-//! command *content* writers (`WriteKernelEventQueue`/`WriteAddressOnCompletion`/
-//! `ReadFile`) and real submission land with the compute backend (M2-adjacent).
+//! lifecycle, the record writers (`WriteKernelEventQueue`/
+//! `WriteAddressOnCompletion`), and `AprCommandBufferReadFile`, whose file
+//! read is EAGER at record-append time (SharpEmu AmprExports.cs:255-293) —
+//! submission/completion (`raeen_hle::libkernel::apr_complete_command_buffer`)
+//! then only services the equeue/write-address records.
 
 use crate::{HleContext, HleRegistry};
-use tracing::debug;
+use tracing::{debug, warn};
 
 const OK: u64 = 0;
+const SCE_ERROR_PERMISSION_DENIED: u64 = 0x8002_0001;
+const SCE_ERROR_NOT_FOUND: u64 = 0x8002_0002;
 const SCE_ERROR_INVALID_ARGUMENT: u64 = 0x8002_0016;
 const SCE_ERROR_MEMORY_FAULT: u64 = 0x8002_000E;
 
@@ -319,18 +323,137 @@ fn hle_write_address_record(ctx: &HleContext, args: &[u64]) -> u64 {
     OK
 }
 
+/// One positional read at an absolute file offset (pread-style), so a cached
+/// handle's shared cursor is never disturbed. SharpEmu uses
+/// `RandomAccess.Read` (AmprExports.cs:796-799).
+#[cfg(windows)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buf, offset)
+}
+
+/// `read_at` for Unix hosts (`pread`).
+#[cfg(unix)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+/// `read_at` fallback for hosts without a positional-read ext trait: a
+/// private clone of the handle seeks without disturbing the cached one.
+#[cfg(not(any(windows, unix)))]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut clone = file.try_clone()?;
+    clone.seek(SeekFrom::Start(offset))?;
+    clone.read(buf)
+}
+
+/// Map a host I/O error to the SCE error SharpEmu returns for it
+/// (`TryGetCachedHostFile`/`TryReadFileToGuestMemory`: UnauthorizedAccess →
+/// PERMISSION_DENIED, other I/O → NOT_FOUND; AmprExports.cs:854-865,
+/// 813-821).
+fn apr_io_error(err: &std::io::Error) -> u64 {
+    match err.kind() {
+        std::io::ErrorKind::PermissionDenied => SCE_ERROR_PERMISSION_DENIED,
+        _ => SCE_ERROR_NOT_FOUND,
+    }
+}
+
+/// Read `size` bytes of the host file backing APR `file_id` at `file_offset`
+/// into guest `destination`, eagerly, with read-EXACT semantics: loop
+/// positional reads until the request is filled or EOF (a short count is OK
+/// only at EOF or an offset past end-of-file). Returns `Ok(bytes_read)` or
+/// the SCE error to hand the guest. Faithful port of SharpEmu
+/// `AmprExports.TryReadFileToGuestMemory` (AmprExports.cs:748-828) with its
+/// open-handle cache (`TryGetCachedHostFile`, AmprExports.cs:830-866) keyed
+/// here by APR id (`OrbisKernel::appr_file_handles`).
+fn apr_read_file_into_guest(
+    ctx: &HleContext,
+    file_id: u32,
+    host_path: &str,
+    file_offset: u64,
+    destination: u64,
+    size: u64,
+) -> Result<u64, u64> {
+    if size == 0 {
+        return Ok(0);
+    }
+    if file_offset > i64::MAX as u64 {
+        return Err(SCE_ERROR_INVALID_ARGUMENT);
+    }
+    // Cached open handle per APR id (SharpEmu `_hostFileCache`): a title
+    // re-reading one asset must not re-open it per command record.
+    if !ctx.kernel.appr_file_handles.contains_key(&file_id) {
+        match std::fs::File::open(host_path) {
+            Ok(file) => {
+                ctx.kernel.appr_file_handles.insert(file_id, file);
+            }
+            Err(err) => return Err(apr_io_error(&err)),
+        }
+    }
+    let file = ctx
+        .kernel
+        .appr_file_handles
+        .get(&file_id)
+        .ok_or(SCE_ERROR_NOT_FOUND)?;
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if file_offset >= file_len {
+        return Ok(0);
+    }
+    let mut bytes_read = 0u64;
+    let mut chunk = vec![0u8; size.min(1024 * 1024) as usize];
+    while bytes_read < size {
+        let absolute = file_offset
+            .checked_add(bytes_read)
+            .ok_or(SCE_ERROR_INVALID_ARGUMENT)?;
+        if absolute > i64::MAX as u64 {
+            return Err(SCE_ERROR_INVALID_ARGUMENT);
+        }
+        let want = ((size - bytes_read).min(chunk.len() as u64)) as usize;
+        let read = match read_at(&file, &mut chunk[..want], absolute) {
+            Ok(0) => break, // EOF
+            Ok(n) => n,
+            Err(err) => return Err(apr_io_error(&err)),
+        };
+        if !ctx.mem.write(destination + bytes_read, &chunk[..read]) {
+            return Err(SCE_ERROR_MEMORY_FAULT);
+        }
+        bytes_read += read as u64;
+    }
+    Ok(bytes_read)
+}
+
+/// The once-per-fileId "name the miss" diagnostic: an unregistered APR id
+/// means path resolution failed (or the title never resolved the path), and
+/// the asset behind this id is silently lost unless the log names it. This
+/// is the diagnostic whose absence made the ASTRO.BOT pause-menu asset loss
+/// take days to find.
+fn warn_missing_apr_file_once(ctx: &HleContext, file_id: u32) {
+    if ctx.kernel.appr_missing_warned.insert(file_id, ()).is_none() {
+        warn!(
+            "sceAmprAprCommandBufferReadFile: fileId {file_id:#010x} has no registered host path \
+             (APR path resolution failed or was never requested) — returning NOT_FOUND with guest \
+             memory untouched (SharpEmu AmprExports.cs:272-276); the asset for this id is LOST"
+        );
+    }
+}
+
 /// `sceAmprAprCommandBufferReadFile(cb, _, _, fileId, destination, size,
-/// fileOffset)`: read `size` bytes of PAK file `fileId` at `fileOffset` into
-/// guest `destination`. `fileOffset` is SysV arg7 (`args[6]`, on the stack at
-/// `[Rsp+8]`, captured by the runtime dispatch). Mirrors SharpEmu's
-/// `AprCommandBufferReadFile` for the **unregistered/missing-file** case, which
-/// is the only case in-tree: Raeen has no populated Ampr file registry, so every
-/// `fileId` is missing and the guest region is zero-filled (games queue
-/// speculative reads and only consume bytes on success paths — zero-fill, not
-/// failure, is the documented behavior). Real file-backed reads (host-path
-/// registry + PAK sequential-offset tracking) land with the I/O backend; a
-/// registered read would append a command record, which is deferred with it.
-fn hle_apr_read_file(ctx: &HleContext, args: &[u64]) -> u64 {
+/// fileOffset)`: read `size` bytes of APR file `fileId` at `fileOffset` into
+/// guest `destination` and append a ReadFile command record.
+/// `fileOffset` is SysV arg7 (`args[6]`, on the stack at `[Rsp+8]`,
+/// captured by the runtime dispatch).
+///
+/// Faithful port of SharpEmu `AprCommandBufferReadFile`
+/// (AmprExports.cs:255-293): the read happens EAGERLY at record-append time
+/// — the bytes land in guest memory before any submit — and `bytesRead` is
+/// recorded in the record at append (@0x20; `AppendReadFileRecord`,
+/// AmprExports.cs:868-887). Completion later skips the record because the
+/// data is already in place. An unregistered id is NOT_FOUND (no zero-fill,
+/// no record, guest memory untouched; AmprExports.cs:272-276) plus a
+/// once-per-id warn naming the lost asset.
+pub(crate) fn hle_apr_read_file(ctx: &HleContext, args: &[u64]) -> u64 {
     let cb = args.first().copied().unwrap_or(0);
     let file_id = args.get(3).copied().unwrap_or(0) as u32;
     let destination = args.get(4).copied().unwrap_or(0);
@@ -339,32 +462,24 @@ fn hle_apr_read_file(ctx: &HleContext, args: &[u64]) -> u64 {
     if cb == 0 || (destination == 0 && size != 0) {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
-    // A registered id appends a ReadFile record the kernel completes at
-    // submit (SharpEmu). The id was registered by sceKernelAprResolve*.
-    if ctx.kernel.appr_host_path(file_id).is_some() {
-        let mut record = [0u8; 0x30];
-        record[0x00..0x04].copy_from_slice(&1u32.to_le_bytes());
-        record[0x04..0x08].copy_from_slice(&file_id.to_le_bytes());
-        record[0x08..0x10].copy_from_slice(&destination.to_le_bytes());
-        record[0x10..0x18].copy_from_slice(&size.to_le_bytes());
-        record[0x18..0x20].copy_from_slice(&file_offset.to_le_bytes());
-        if !append_record(ctx, cb, &record) {
-            return SCE_ERROR_MEMORY_FAULT;
-        }
-        return OK;
-    }
-    // Missing-file path: zero-fill in chunks, stopping if a write faults (a
-    // partial fill still returns OK, matching the reference).
-    if destination != 0 && size > 0 {
-        let zeros = [0u8; 4096];
-        let mut written = 0u64;
-        while written < size {
-            let chunk = (size - written).min(zeros.len() as u64) as usize;
-            if !ctx.mem.write(destination + written, &zeros[..chunk]) {
-                break;
-            }
-            written += chunk as u64;
-        }
+    let Some(host_path) = ctx.kernel.appr_host_path(file_id) else {
+        warn_missing_apr_file_once(ctx, file_id);
+        return SCE_ERROR_NOT_FOUND;
+    };
+    let bytes_read =
+        match apr_read_file_into_guest(ctx, file_id, &host_path, file_offset, destination, size) {
+            Ok(n) => n,
+            Err(err) => return err,
+        };
+    let mut record = [0u8; 0x30];
+    record[0x00..0x04].copy_from_slice(&1u32.to_le_bytes());
+    record[0x04..0x08].copy_from_slice(&file_id.to_le_bytes());
+    record[0x08..0x10].copy_from_slice(&destination.to_le_bytes());
+    record[0x10..0x18].copy_from_slice(&size.to_le_bytes());
+    record[0x18..0x20].copy_from_slice(&file_offset.to_le_bytes());
+    record[0x20..0x28].copy_from_slice(&bytes_read.to_le_bytes());
+    if !append_record(ctx, cb, &record) {
+        return SCE_ERROR_MEMORY_FAULT;
     }
     OK
 }
@@ -469,19 +584,126 @@ mod tests {
         );
     }
 
+    /// Write a patterned temp host file and return its path (caller deletes).
+    fn temp_host_file(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let host = std::env::temp_dir().join(format!(
+            "raeen_ampr_test_{}_{}_{}.bin",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&host, bytes).expect("temp file");
+        host
+    }
+
+    /// The ReadFile read is EAGER: the guest destination must hold the file
+    /// bytes the moment `sceAmprAprCommandBufferReadFile` returns, before any
+    /// submit/completion (SharpEmu `AprCommandBufferReadFile`,
+    /// AmprExports.cs:255-293).
     #[test]
-    fn apr_read_file_zero_fills_missing_files() {
+    fn apr_read_file_populates_guest_memory_at_append_not_submit() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let data: Vec<u8> = (0..256u32).map(|i| (i * 7 % 251) as u8).collect();
+        let host = temp_host_file("eager", &data);
+        let id = kernel.appr_register_file("/app0/assets/eager.bin", host.display().to_string());
+
+        let cb: u64 = 0x40;
+        let buf: u64 = 0x100;
+        let dst: u64 = 0x300;
+        assert_eq!(hle_ctor(&ctx, &[cb, buf, 0x100]), cb);
+        assert_eq!(
+            hle_apr_read_file(&ctx, &[cb, 0, 0, u64::from(id), dst, 256, 0]),
+            OK
+        );
+        // BEFORE any submit: the guest destination already holds the bytes.
+        let mut guest = vec![0u8; 256];
+        assert!(ctx.mem.read(dst, &mut guest));
+        assert_eq!(guest, data, "the read must be eager at record-append time");
+        // bytesRead is recorded in the command record at append time (@0x20).
+        assert_eq!(read_u64(&ctx, buf + 0x20), 256);
+        let _ = std::fs::remove_file(&host);
+    }
+
+    /// Read-EXACT semantics: a read larger than any single host `read` call
+    /// would deliver must still fill the entire destination (loop until full
+    /// or EOF — SharpEmu `TryReadFileToGuestMemory`, AmprExports.cs:782-812).
+    #[test]
+    fn apr_read_file_exact_read_fills_full_destination() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x40000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // > 64 KiB: a naive single small read would come back short.
+        let n = 100_000usize;
+        let data: Vec<u8> = (0..n as u32).map(|i| (i * 31 % 256) as u8).collect();
+        let host = temp_host_file("exact", &data);
+        let id = kernel.appr_register_file("/app0/assets/exact.bin", host.display().to_string());
+
+        let cb: u64 = 0x100;
+        let buf: u64 = 0x1000;
+        let dst: u64 = 0x10000;
+        assert_eq!(hle_ctor(&ctx, &[cb, buf, 0x1000]), cb);
+        assert_eq!(
+            hle_apr_read_file(&ctx, &[cb, 0, 0, u64::from(id), dst, n as u64, 0]),
+            OK
+        );
+        let mut guest = vec![0u8; n];
+        assert!(ctx.mem.read(dst, &mut guest));
+        assert_eq!(guest, data, "all {n} bytes must land (read-exact loop)");
+        assert_eq!(read_u64(&ctx, buf + 0x20), n as u64);
+
+        // A request running past EOF records the short count and stops
+        // (SharpEmu: the loop breaks on a zero read; OK with partial bytes).
+        assert_eq!(
+            hle_apr_read_file(
+                &ctx,
+                &[cb, 0, 0, u64::from(id), dst, 0x2000, (n - 0x1000) as u64]
+            ),
+            OK
+        );
+        // Second record at buf+0x30; bytesRead must be the 0x1000 available.
+        assert_eq!(read_u64(&ctx, buf + 0x30 + 0x20), 0x1000);
+        let _ = std::fs::remove_file(&host);
+    }
+
+    /// Unresolvable fileId: SharpEmu returns NOT_FOUND and does NOT touch
+    /// guest memory or append a record (AmprExports.cs:272-276) — no silent
+    /// zero-fill. A once-per-fileId warn names the lost asset.
+    #[test]
+    fn apr_read_file_missing_file_logs_and_matches_sharpemu_semantics() {
         let (kernel, mem, alloc) = ctx_env();
         let ctx = test_ctx(&kernel, &mem, &alloc);
         let cb: u64 = 0x100;
         let dst: u64 = 0x200;
-        // Pre-dirty the destination so a successful zero-fill is observable.
-        assert!(ctx.mem.write(dst, &0xDEAD_BEEF_CAFE_F00Du64.to_le_bytes()));
-        // args: cb, _, _, fileId=7, destination, size=16, fileOffset=0 (args[6]).
-        assert_eq!(hle_apr_read_file(&ctx, &[cb, 0, 0, 7, dst, 16, 0]), OK);
-        assert_eq!(read_u64(&ctx, dst), 0, "first 8 bytes zeroed");
-        assert_eq!(read_u64(&ctx, dst + 8), 0, "next 8 bytes zeroed");
-        // NULL command buffer and (dst==0, size!=0) are argument errors.
+        assert_eq!(hle_ctor(&ctx, &[cb, 0x300, 0x100]), cb);
+        // Pre-dirty the destination: a missing file must leave it alone.
+        assert!(ctx.mem.write(dst, &[0xEEu8; 16]));
+        assert_eq!(
+            hle_apr_read_file(&ctx, &[cb, 0, 0, 7, dst, 16, 0]),
+            SCE_ERROR_NOT_FOUND
+        );
+        let mut probe = [0u8; 16];
+        assert!(ctx.mem.read(dst, &mut probe));
+        assert_eq!(
+            probe, [0xEEu8; 16],
+            "a missing file must not zero-fill (SharpEmu parity)"
+        );
+        // No record was appended.
+        assert_eq!(hle_get_current_offset(&ctx, &[cb]), 0);
+        // The once-per-fileId name-the-miss warn fired (the rate-limit set is
+        // the observable artifact; the log line itself names the id).
+        assert!(kernel.appr_missing_warned.contains_key(&7));
+        // A repeat stays NOT_FOUND without re-warning.
+        assert_eq!(
+            hle_apr_read_file(&ctx, &[cb, 0, 0, 7, dst, 16, 0]),
+            SCE_ERROR_NOT_FOUND
+        );
+        assert_eq!(kernel.appr_missing_warned.len(), 1);
+        // Argument validation is unchanged, and checked before the registry.
         assert_eq!(
             hle_apr_read_file(&ctx, &[0, 0, 0, 7, dst, 16, 0]),
             SCE_ERROR_INVALID_ARGUMENT
@@ -490,7 +712,11 @@ mod tests {
             hle_apr_read_file(&ctx, &[cb, 0, 0, 7, 0, 16, 0]),
             SCE_ERROR_INVALID_ARGUMENT
         );
-        // A zero-size read (dst==0 allowed) is a benign OK.
-        assert_eq!(hle_apr_read_file(&ctx, &[cb, 0, 0, 7, 0, 0, 0]), OK);
+        // SharpEmu checks the registry before the size: an unregistered id is
+        // NOT_FOUND even for a zero-size read.
+        assert_eq!(
+            hle_apr_read_file(&ctx, &[cb, 0, 0, 7, 0, 0, 0]),
+            SCE_ERROR_NOT_FOUND
+        );
     }
 }

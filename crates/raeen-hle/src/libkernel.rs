@@ -347,7 +347,13 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
                     }
                 };
             }
-            warn!(
+            // A missing file on open without O_CREAT is a NORMAL, guest-handled
+            // condition — titles probe for many optional cache/save files (e.g.
+            // Minecraft's Bedrock premium_cache / savedata, 653×/run). The guest
+            // gets ENOENT and copes; a genuinely-required missing file surfaces as
+            // a guest-visible failure elsewhere. Keep it at debug so it stops
+            // drowning the log.
+            debug!(
                 "open: '{path}' → '{}' does not exist (no O_CREAT) — ENOENT",
                 host.display()
             );
@@ -540,8 +546,12 @@ const APR_RECORD_KERNEL_EVENT_QUEUE: u32 = 2;
 const APR_RECORD_WRITE_ADDRESS: u32 = 3;
 
 /// Complete one AMPR command buffer synchronously: walk its records and do
-/// the work a console does async — read files by APR id, fire completion
-/// events, write completion addresses. SharpEmu `AmprExports.CompleteCommandBuffer`.
+/// the completion work a console does async — fire completion events and
+/// write completion addresses. ReadFile records are no-ops here because the
+/// file data was read into guest memory EAGERLY at record-append time
+/// (SharpEmu `AmprExports.CompleteCommandBuffer`, AmprExports.cs:550-608).
+/// On success the buffer's host write cursor is consumed so a re-submit
+/// without Reset cannot re-fire stale records.
 fn apr_complete_command_buffer(ctx: &HleContext, cb: u64) -> u64 {
     // The visible struct carries data ptr @0x08 / size @0x10; the write
     // cursor is host-tracked (`ampr_write_offsets`).
@@ -568,52 +578,11 @@ fn apr_complete_command_buffer(ctx: &HleContext, cb: u64) -> u64 {
         let record = buffer + offset;
         match u32::from_le_bytes(ty) {
             APR_RECORD_READ_FILE => {
-                // [0x04]=fileId [0x08]=destination [0x10]=size [0x18]=fileOffset [0x20]=bytesRead
-                let mut f = [0u8; 0x28];
-                if !ctx.mem.read(record + 4, &mut f) {
-                    return SCE_KERNEL_ERROR_EFAULT;
-                }
-                let file_id = u32::from_le_bytes(f[0..4].try_into().expect("fixed slice"));
-                let destination =
-                    u64::from_le_bytes(f[0x04..0x0c].try_into().expect("fixed slice"));
-                let size = u64::from_le_bytes(f[0x0c..0x14].try_into().expect("fixed slice"));
-                let file_offset =
-                    u64::from_le_bytes(f[0x14..0x1c].try_into().expect("fixed slice"));
-                let read = match ctx.kernel.appr_host_path(file_id).and_then(|host| {
-                    let file = std::fs::File::open(&host).ok()?;
-                    use std::io::{Read, Seek, SeekFrom};
-                    let mut file = std::io::BufReader::new(file);
-                    file.seek(SeekFrom::Start(file_offset)).ok()?;
-                    let mut buf = vec![0u8; size.min(64 << 20) as usize];
-                    let n = file.read(&mut buf).ok()?;
-                    buf.truncate(n);
-                    Some(buf)
-                }) {
-                    Some(bytes) => {
-                        let n = bytes.len() as u64;
-                        if !ctx.mem.write(destination, &bytes) {
-                            return SCE_KERNEL_ERROR_EFAULT;
-                        }
-                        n
-                    }
-                    None => {
-                        // Missing file: zero-fill (SharpEmu's documented behavior
-                        // — games queue speculative reads and consume on success).
-                        let zeros = [0u8; 4096];
-                        let mut written = 0;
-                        while written < size {
-                            let chunk = (size - written).min(zeros.len() as u64) as usize;
-                            if !ctx.mem.write(destination + written, &zeros[..chunk]) {
-                                break;
-                            }
-                            written += chunk as u64;
-                        }
-                        size
-                    }
-                };
-                if !ctx.mem.write(record + 0x20, &read.to_le_bytes()) {
-                    return SCE_KERNEL_ERROR_EFAULT;
-                }
+                // No-op at completion: the read ran EAGERLY at record-append
+                // time and the bytes (plus bytesRead @0x20) are already in
+                // guest memory — SharpEmu `AmprExports.CompleteCommandBuffer`
+                // skips ReadFile records for the same reason
+                // (AmprExports.cs:578-580).
                 offset += 0x30;
             }
             APR_RECORD_KERNEL_EVENT_QUEUE => {
@@ -663,6 +632,13 @@ fn apr_complete_command_buffer(ctx: &HleContext, cb: u64) -> u64 {
             }
         }
     }
+    // Completion consumes the buffer: drop the host write cursor so a
+    // re-submit without an explicit sceAmprAprCommandBufferReset can never
+    // re-fire stale equeue/write-address records into guest addresses the
+    // title may have repurposed (the ASTRO.BOT pause-menu heap-poisoning
+    // vector). The record bytes stay in the guest buffer; only the host
+    // cursor is dropped, so Reset + re-append is unaffected.
+    ctx.kernel.ampr_write_offsets.remove(&cb);
     SCE_OK
 }
 
@@ -4204,6 +4180,58 @@ mod tests {
             hle_apr_submit_and_get_id(&ctx, &[0x500, 0, 0]),
             SCE_KERNEL_ERROR_EINVAL
         );
+    }
+
+    /// Regression for the APR stale-record re-fire: after a command buffer
+    /// completes, its records must never execute again unless the title
+    /// explicitly rewinds via sceAmprAprCommandBufferReset. Completion also
+    /// consumes the host write cursor (`ampr_write_offsets`).
+    #[test]
+    fn apr_completion_does_not_reexecute_stale_readfile_records() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let data = [0x5Au8; 64];
+        let host = std::env::temp_dir().join(format!(
+            "raeen_apr_stale_test_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&host, data).expect("temp file");
+        let id = kernel.appr_register_file("/app0/assets/stale.bin", host.display().to_string());
+
+        // Command-buffer struct @0x100, record buffer @0x200, destination @0x300.
+        assert!(mem.write(0x108, &0x200u64.to_le_bytes())); // cb data ptr
+        assert!(mem.write(0x110, &0x100u64.to_le_bytes())); // cb size
+        kernel.ampr_write_offsets.insert(0x100, 0);
+        kernel.ampr_command_counts.insert(0x100, 0);
+        assert_eq!(
+            crate::libsce_ampr::hle_apr_read_file(
+                &ctx,
+                &[0x100, 0, 0, u64::from(id), 0x300, 64, 0]
+            ),
+            SCE_OK
+        );
+        assert_eq!(hle_apr_submit(&ctx, &[0x100, 0]), SCE_OK);
+        // First completion leaves the (eagerly read) bytes in place...
+        let mut probe = [0u8; 64];
+        assert!(mem.read(0x300, &mut probe));
+        assert_eq!(probe, data);
+        // ...and consumes the write cursor so nothing can re-fire.
+        assert!(!kernel.ampr_write_offsets.contains_key(&0x100));
+
+        // The title repurposes the destination; a re-submit WITHOUT Reset
+        // must not re-execute the stale ReadFile record into it.
+        assert!(mem.write(0x300, &[0xEEu8; 64]));
+        assert_eq!(hle_apr_submit(&ctx, &[0x100, 0]), SCE_OK);
+        assert!(mem.read(0x300, &mut probe));
+        assert_eq!(probe, [0xEEu8; 64], "stale ReadFile record re-fired");
+        let _ = std::fs::remove_file(&host);
     }
 
     /// The ForEach resolve variants register paths in the APR table without

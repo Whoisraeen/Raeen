@@ -253,6 +253,11 @@ pub(crate) struct TextureKey {
     pub layers: u32,
     pub depth: u32,
     pub cube: bool,
+    /// 2DArray (T# type 13) view intent — part of the key so a cached
+    /// `VK_IMAGE_VIEW_TYPE_2D_ARRAY` view is never served under a plain-2D
+    /// descriptor (or vice-versa) when both share the same base/extent/format
+    /// with a single layer. See `TextureUpload::array`.
+    pub array: bool,
     pub format: i32,
 }
 
