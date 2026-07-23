@@ -3217,6 +3217,7 @@ dependencies = [
  "gilrs",
  "raeen-core",
  "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

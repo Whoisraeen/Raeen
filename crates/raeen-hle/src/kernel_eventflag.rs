@@ -235,32 +235,39 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_ESRCH;
     }
 
-    // Timeout is `SceKernelUseconds*` (NULL = wait forever). Forever is capped
-    // like the equeue wait: an unbounded block on the dispatch thread hangs
-    // tests and stalls a title whose producer exited; 50ms slices keep the
-    // wait responsive and still stop the hot spin.
-    let requested_us = if timeout_ptr == 0 {
+    // Timeout is `SceKernelUseconds*` (NULL = wait forever). A NULL timeout
+    // waits forever and NEVER synthesizes ETIMEDOUT; a finite one returns
+    // ETIMEDOUT only once its real deadline passes. `wait_until` is called in
+    // bounded 50ms slices so process teardown is noticed promptly and an
+    // infinite wait stays escapable — but the guest's timeout is honored by
+    // LOOPING those slices to the real deadline, exactly like `sceKernelWaitSema`.
+    //
+    // The prior code passed a single `min(us, 50ms)` slice straight to
+    // `wait_until` and mapped its TimedOut to ETIMEDOUT, so ANY wait longer than
+    // 50ms — a forever wait, or a finite `>50ms` one — returned a spurious
+    // ETIMEDOUT after 50ms. A worker waiting on a producer slower than one slice
+    // then proceeded as if the wait had failed, reading not-yet-ready state.
+    let deadline = if timeout_ptr == 0 {
         None
     } else {
         let mut raw = [0u8; 8];
         if !ctx.mem.read(timeout_ptr, &mut raw) {
             return SCE_KERNEL_ERROR_EFAULT;
         }
-        Some(u64::from_le_bytes(raw))
+        Some(
+            std::time::Instant::now()
+                + std::time::Duration::from_micros(u64::from_le_bytes(raw)),
+        )
     };
-    let timeout = requested_us.map_or_else(
-        || std::time::Duration::from_millis(50),
-        |us| std::time::Duration::from_micros(us.min(50_000)),
-    );
-    let mut write_failed = false;
-    let mut deleted = false;
+    let write_failed = std::cell::Cell::new(false);
+    let deleted = std::cell::Cell::new(false);
     let mut ready = || {
         let Some(mut ef) = ctx.kernel.kernel_event_flags.get_mut(&handle) else {
-            deleted = true;
+            deleted.set(true);
             return true;
         };
         if result_ptr != 0 && !ctx.mem.write(result_ptr, &ef.bits.to_le_bytes()) {
-            write_failed = true;
+            write_failed.set(true);
             return true;
         }
         if is_satisfied(ef.bits, pattern, mode) {
@@ -269,24 +276,44 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
         }
         false
     };
-    let outcome = ctx.services.wait_until(
-        WaitKey {
-            class: "event-flag",
-            object: handle,
-            guest_thread: ctx.guest_threads.current_thread(),
-        },
-        timeout,
-        &|| ctx.guest_threads.process_is_terminating(),
-        &mut ready,
-    );
-    if write_failed {
-        SCE_KERNEL_ERROR_EFAULT
-    } else if deleted {
-        SCE_KERNEL_ERROR_ESRCH
-    } else if outcome == WaitOutcome::Ready {
-        OK
-    } else {
-        SCE_KERNEL_ERROR_ETIMEDOUT
+    let slice = std::time::Duration::from_millis(50);
+    loop {
+        // An infinite block must still be escapable so teardown's join doesn't
+        // hang on a parked worker (the semaphore/cond waits honor this too).
+        if ctx.guest_threads.process_is_terminating() {
+            return OK;
+        }
+        let wait = match deadline {
+            None => slice,
+            Some(dl) => {
+                let remaining = dl.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return SCE_KERNEL_ERROR_ETIMEDOUT;
+                }
+                remaining.min(slice)
+            }
+        };
+        let outcome = ctx.services.wait_until(
+            WaitKey {
+                class: "event-flag",
+                object: handle,
+                guest_thread: ctx.guest_threads.current_thread(),
+            },
+            wait,
+            &|| ctx.guest_threads.process_is_terminating(),
+            &mut ready,
+        );
+        if write_failed.get() {
+            return SCE_KERNEL_ERROR_EFAULT;
+        }
+        if deleted.get() {
+            return SCE_KERNEL_ERROR_ESRCH;
+        }
+        if outcome == WaitOutcome::Ready {
+            return OK;
+        }
+        // Slice elapsed unsatisfied: loop again — forever for a NULL timeout,
+        // otherwise until the real deadline above trips ETIMEDOUT.
     }
 }
 
@@ -424,6 +451,41 @@ mod tests {
         assert!(
             elapsed >= std::time::Duration::from_millis(25),
             "the wait must have BLOCKED for the producer, not spun (took {elapsed:?})"
+        );
+        setter.join().unwrap();
+    }
+
+    /// A NULL (forever) wait must keep waiting past the internal 50 ms slice.
+    /// The old single-slice code returned ETIMEDOUT after 50 ms even for a
+    /// forever wait, so a producer slower than one slice spuriously "timed out"
+    /// the waiter — which then proceeded on not-yet-ready state. Regression:
+    /// the producer sets the bit at 80 ms (> one slice).
+    #[test]
+    fn forever_wait_survives_past_the_internal_slice() {
+        let kernel = std::sync::Arc::new(raeen_kernel::OrbisKernel::new());
+        let mem = crate::TestMemory::new(0x400);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(kernel.as_ref(), &mem, &alloc);
+        let h = create(&ctx, 0, 0);
+        let setter = std::thread::spawn({
+            let k2 = std::sync::Arc::clone(&kernel);
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                let mem2 = crate::TestMemory::new(0x100);
+                let alloc2 = crate::TestAllocator::new(0);
+                let ctx2 = test_ctx(k2.as_ref(), &mem2, &alloc2);
+                assert_eq!(hle_set(&ctx2, &[h, 0b0001]), OK);
+            }
+        });
+        let start = std::time::Instant::now();
+        assert_eq!(
+            hle_wait(&ctx, &[h, 0b0001, WAIT_AND, 0, 0]),
+            OK,
+            "a forever wait must not time out at the 50 ms slice boundary"
+        );
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(75),
+            "must have waited for the 80 ms producer, not returned early at 50 ms"
         );
         setter.join().unwrap();
     }

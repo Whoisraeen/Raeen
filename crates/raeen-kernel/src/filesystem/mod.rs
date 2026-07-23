@@ -295,6 +295,11 @@ impl VirtualFileSystem {
     }
 
     /// Resolve a PS5 path to a host path.
+    ///
+    /// This is the guest->host sandbox boundary: every file syscall maps a guest
+    /// path here and hands the result straight to the host filesystem. A path
+    /// that matches no mount, or that would escape its mount root, resolves to
+    /// `None` (default-deny / fail-closed) — see [`combine_within_mount`].
     pub fn resolve_path(&self, ps5_path: &str) -> Option<PathBuf> {
         let mounts = self.mounts.read();
         for mount in mounts.iter() {
@@ -304,14 +309,7 @@ impl VirtualFileSystem {
                 .is_some_and(|suffix| suffix.starts_with('/'));
             if exact_root || under_root {
                 let relative = ps5_path[mount.ps5_prefix.len()..].trim_start_matches('/');
-                if relative
-                    .split(['/', '\\'])
-                    .any(|component| component == "..")
-                {
-                    warn!("VFS resolve: refusing traversing guest path '{ps5_path}'");
-                    return None;
-                }
-                return Some(mount.host_path.join(relative));
+                return combine_within_mount(&mount.host_path, ps5_path, relative);
             }
         }
         None
@@ -933,6 +931,126 @@ fn normalize_mount_root(prefix: &str) -> String {
     }
 }
 
+/// The longest single path component the host filesystems in scope accept
+/// (`NAME_MAX` on Linux, comfortably under `MAX_PATH` on Windows). A guest
+/// segment longer than this cannot name a real host file, and long enough
+/// segments make the host path calls below error; reject up front.
+const MAX_HOST_NAME_LEN: usize = 255;
+
+/// Combine a mount-relative guest path onto a mount's host root, refusing any
+/// input that would escape that root. Returns `None` (fail-closed) on denial;
+/// callers map that to `NOT_FOUND`/`PermissionDenied`.
+///
+/// Ported from SharpEmu (GPL-2.0, commit e01092a) —
+/// `KernelMemoryCompatExports.CombineWithinMount` + `EscapesMountViaReparsePoint`
+/// + `NormalizeMountRelativePath`, pinned by `KernelSandboxEscapeTests`.
+///
+/// The escape this closes: `NormalizeMountRelativePath`-style stripping of
+/// `.`/`..` splits only on separators, so a drive-qualified token like `C:`
+/// survives as a segment. `Path::join` then DISCARDS the mount root because its
+/// argument is drive-rooted, yielding a raw host path such as `C:\Windows\...`.
+/// On Windows a tail like `/app0/C:/Windows/System32/...` is therefore absolute
+/// and grants arbitrary host read/write/delete. Lexical containment alone also
+/// does not follow symlinks/junctions, so a reparse point planted inside the
+/// mount could redirect out of it.
+///
+/// Defense, in order:
+/// 1. Sanitize each segment — refuse `..` (traversal), any absolute segment, any
+///    segment containing `:` (drive/ADS qualifier), and NUL/over-long names.
+///    After this the assembled path is lexically contained *by construction*.
+/// 2. Walk each already-existing component from the root down and refuse
+///    symlinks/reparse points; components that do not exist yet (an `O_CREAT`
+///    target and its parents) carry no link to follow and are skipped.
+/// 3. Canonicalize the deepest existing ancestor and ASSERT it stays under the
+///    canonicalized mount root — this resolves Windows junctions that a plain
+///    symlink check misses, and fails closed on any canonicalization error.
+fn combine_within_mount(mount_root: &Path, ps5_path: &str, relative: &str) -> Option<PathBuf> {
+    // --- 1. Segment sanitation. ---
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in relative.split(['/', '\\']) {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            warn!("VFS resolve: refusing traversing guest path '{ps5_path}'");
+            return None;
+        }
+        // A ':' is a Windows drive or alternate-data-stream qualifier, and an
+        // absolute segment would make `Path::join` discard the mount root; both
+        // are escapes.
+        if segment.contains(':') || Path::new(segment).is_absolute() {
+            warn!("VFS resolve: refusing drive-qualified/absolute segment in guest path '{ps5_path}'");
+            return None;
+        }
+        // A NUL or an over-long name cannot name a real host file and makes the
+        // canonicalization calls below error; deny explicitly rather than lean
+        // on those to fail closed.
+        if segment.len() > MAX_HOST_NAME_LEN || segment.as_bytes().contains(&0) {
+            warn!("VFS resolve: refusing malformed segment in guest path '{ps5_path}'");
+            return None;
+        }
+        segments.push(segment);
+    }
+
+    // Assemble the candidate. Built only from plain-name segments, so it is
+    // lexically under `mount_root` by construction.
+    let mut candidate = mount_root.to_path_buf();
+    for segment in &segments {
+        candidate.push(segment);
+    }
+
+    // --- 2. Reparse/symlink walk over the existing prefix. ---
+    let mut walked = mount_root.to_path_buf();
+    let mut deepest_existing = mount_root.to_path_buf();
+    let mut tail_missing = false;
+    for segment in &segments {
+        walked.push(segment);
+        if tail_missing {
+            continue;
+        }
+        match std::fs::symlink_metadata(&walked) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                warn!("VFS resolve: refusing symlink/reparse component in guest path '{ps5_path}'");
+                return None;
+            }
+            Ok(_) => deepest_existing = walked.clone(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => tail_missing = true,
+            Err(err) => {
+                warn!(
+                    "VFS resolve: unreadable component in guest path '{ps5_path}' ({err}); denying"
+                );
+                return None;
+            }
+        }
+    }
+
+    // --- 3. Canonical containment assertion. ---
+    // If the mount root itself cannot be canonicalized it does not yet exist on
+    // the host (nothing under it exists either, so the walk above found no link
+    // to follow); the lexical containment from step 1 stands and there is
+    // nothing further to resolve. If it DOES exist, canonicalize the deepest
+    // existing ancestor — which resolves any junction the symlink check missed —
+    // and require the real on-disk location to stay under the root.
+    if let Ok(canonical_root) = std::fs::canonicalize(mount_root) {
+        match std::fs::canonicalize(&deepest_existing) {
+            Ok(real) if real.starts_with(&canonical_root) => {}
+            Ok(_) => {
+                warn!("VFS resolve: guest path '{ps5_path}' resolves outside its mount; denying");
+                return None;
+            }
+            Err(err) => {
+                warn!(
+                    "VFS resolve: cannot verify containment of guest path '{ps5_path}' ({err}); \
+                     denying"
+                );
+                return None;
+            }
+        }
+    }
+
+    Some(candidate)
+}
+
 fn fnv1a32(bytes: &[u8]) -> u32 {
     bytes.iter().fold(2_166_136_261u32, |hash, byte| {
         (hash ^ u32::from(*byte)).wrapping_mul(16_777_619)
@@ -1299,5 +1417,125 @@ mod tests {
         );
         assert!(!vfs.unmount_savedata_slot("/savedata1"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ---- Sandbox-escape regression tests (SharpEmu e01092a port). ----
+    //
+    // `resolve_path` is the guest->host boundary. A mount-relative guest path
+    // must never resolve to a host path outside its mount root, and a malformed
+    // path must fail closed (`None`) rather than throw or escape.
+
+    #[cfg(windows)]
+    fn try_symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    #[cfg(unix)]
+    fn try_symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[test]
+    fn drive_letter_injection_cannot_escape_mount() {
+        // The core Windows escape: "/app0/C:/Windows/..." carries a drive-rooted
+        // tail that `Path::join` would let REPLACE the mount root, granting raw
+        // host access. The ':' segment is refused, so every form denies.
+        let dir = temp_dir("sandbox-drive");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+        for guest in [
+            "/app0/C:/Windows/System32/drivers/etc/hosts",
+            "/app0/C:/Windows/Temp/evil.dll",
+            "/app0/data/C:/secret",
+        ] {
+            let resolved = vfs.resolve_path(guest);
+            assert!(
+                resolved.is_none(),
+                "drive-qualified guest path {guest} must be denied, got {resolved:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parent_traversal_tail_is_denied() {
+        let dir = temp_dir("sandbox-traverse");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+        assert!(vfs.resolve_path("/app0/../escape.bin").is_none());
+        assert!(vfs.resolve_path("/app0/a/../../escape.bin").is_none());
+        assert!(vfs.resolve_path("/app0/..\\escape.bin").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nul_embedded_segment_fails_closed() {
+        let dir = temp_dir("sandbox-nul");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+        assert!(
+            vfs.resolve_path("/app0/bad\0name").is_none(),
+            "a NUL-embedded segment must be denied, never handed to the host FS"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn over_long_segment_fails_closed() {
+        let dir = temp_dir("sandbox-long");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+        let guest = format!("/app0/{}", "a".repeat(40_000));
+        assert!(
+            vfs.resolve_path(&guest).is_none(),
+            "an over-long segment must be denied rather than error the host FS call"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legitimate_in_mount_path_still_resolves() {
+        let dir = temp_dir("sandbox-legit");
+        std::fs::create_dir_all(dir.join("a").join("b")).unwrap();
+        std::fs::write(dir.join("a").join("b").join("c.bin"), b"ok").unwrap();
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+
+        let resolved = vfs
+            .resolve_path("/app0/a/b/c.bin")
+            .expect("a real nested in-mount file must still resolve");
+        assert_eq!(resolved, dir.join("a").join("b").join("c.bin"));
+        assert!(resolved.starts_with(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reparse_point_inside_mount_is_denied() {
+        // A dump can plant a symlink/junction inside the mount that redirects
+        // outside it; lexical containment alone would follow it onto the host FS.
+        let outer = temp_dir("sandbox-reparse");
+        let inside = outer.join("app0");
+        let outside = outer.join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.bin"), [1, 2, 3]).unwrap();
+
+        // Creating a symlink can require privilege (Windows without Developer
+        // Mode); if it fails there is nothing to assert.
+        if try_symlink_dir(&outside, &inside.join("link")).is_err() {
+            let _ = std::fs::remove_dir_all(&outer);
+            return;
+        }
+
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&inside);
+        // Sanity: the link genuinely redirects out of the mount.
+        assert!(inside.join("link").join("secret.bin").exists());
+
+        assert!(
+            vfs.resolve_path("/app0/link/secret.bin").is_none(),
+            "a guest path traversing a reparse point out of the mount must be denied"
+        );
+        let _ = std::fs::remove_dir_all(&outer);
     }
 }

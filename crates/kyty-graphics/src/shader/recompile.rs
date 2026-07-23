@@ -4476,7 +4476,7 @@ fn eud_alias_offset(code: &ShaderCode, eud_base: i32, reg: i32, at: usize) -> Op
 /// (`eud_rel_index(start_register) == k`). This resolves the alias without
 /// inventing a descriptor or binding any uncaptured guest bytes — the bound
 /// descriptor is the already-validated captured one.
-fn mimg_register_eud_alias_index(
+pub(crate) fn mimg_register_eud_alias_index(
     bind: &ShaderBindResources,
     code: &ShaderCode,
     reg: i32,
@@ -4502,7 +4502,7 @@ fn mimg_register_eud_alias_index(
 /// [`mimg_register_eud_alias_index`]): the S# is captured at its EUD-virtual
 /// start register but read by the MIMG from a real SGPR a covered EUD `s_load`
 /// fills.
-fn sampler_register_is_eud_alias(
+pub(crate) fn sampler_register_is_eud_alias(
     bind: &ShaderBindResources,
     code: &ShaderCode,
     reg: i32,
@@ -15395,6 +15395,105 @@ mod tests {
         assert!(
             err.to_string().contains("dynamic-image-descriptor"),
             "named refusal expected, got: {err}"
+        );
+    }
+
+    /// Safe-degradation counterpart of the refusal above: after
+    /// `shader_synthesize_placeholder_sampled_texture` pre-registers a 1x1
+    /// placeholder T# at the MIMG's unmatched register, the guard resolves it
+    /// and the shader recompiles instead of skipping every dispatch. Measured
+    /// on ASTRO.BOT scene compute 0x500566b00 (image_load T# at s16, 13 skips
+    /// per level transition; the register/dmask are cosmetic — the fix is
+    /// independent of both).
+    #[test]
+    fn synthesized_placeholder_texture_resolves_unmatched_sampled_tsharp() {
+        use crate::shader::analysis::{
+            placeholder_texture_fields, shader_synthesize_placeholder_sampled_texture,
+        };
+
+        // Same image_load the refusal test uses; its T# operand matches no
+        // captured descriptor.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF000_0300, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_load");
+
+        // One captured 2D sampled texture at s16 makes image_load take the
+        // sampled path so the descriptor guard runs; the MIMG's own T# register
+        // (s4..s11) has nothing captured there and does not overlap s16..s23.
+        let mut base = ShaderComputeInputInfo::default();
+        base.threads_num = [1, 1, 1];
+        base.bind.push_constant_size = 128;
+        base.bind.textures2d.textures_num = 1;
+        base.bind.textures2d.textures2d_sampled_num = 1;
+        base.bind.textures2d.desc[0].start_register = 16;
+        base.bind.textures2d.desc[0].texture.fields = placeholder_texture_fields();
+
+        // Baseline: no synthesis => the whole shader refuses by name.
+        let err = spirv_generate_source(&code, None, None, Some(&base))
+            .expect_err("unmatched sampled T# refuses without synthesis");
+        assert!(
+            err.to_string().contains("dynamic-image-descriptor"),
+            "named refusal expected, got: {err}"
+        );
+
+        // With synthesis: a placeholder is captured at the MIMG's T# register,
+        // the guard resolves it, and the shader recompiles.
+        let t_reg = code.get_instructions()[0].src[1].register_id;
+        let mut fixed = base;
+        shader_synthesize_placeholder_sampled_texture(&code, &mut fixed.bind);
+        assert_eq!(
+            fixed.bind.textures2d.textures_num, 2,
+            "captured s8 texture plus one synthesized placeholder"
+        );
+        assert!(
+            fixed.bind.textures2d.desc[..2]
+                .iter()
+                .any(|d| d.start_register == t_reg && !d.textures2d_without_sampler),
+            "a sampled placeholder is captured at the MIMG's T# register s{t_reg}"
+        );
+        let source = spirv_generate_source(&code, None, None, Some(&fixed))
+            .expect("synthesized placeholder lets the previously-skipped shader recompile");
+        // And the produced module assembles (valid SPIR-V, not just a
+        // non-refusal): the placeholder's seeded `%vsharp_s{t_reg}` indexes the
+        // grown, bound `%textures2D_S` array in-bounds.
+        spirv_run(&source).expect("placeholder image_load assembles to valid SPIR-V");
+    }
+
+    /// The synthesis must NOT shadow a real descriptor: when the MIMG's T#
+    /// register IS already captured, no placeholder is added (idempotent) and
+    /// the real descriptor stands.
+    #[test]
+    fn synthesized_placeholder_texture_leaves_matched_tsharp_alone() {
+        use crate::shader::analysis::shader_synthesize_placeholder_sampled_texture;
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF000_0300, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_load");
+        let t_reg = code.get_instructions()[0].src[1].register_id;
+
+        let mut info = ShaderComputeInputInfo::default();
+        info.threads_num = [1, 1, 1];
+        info.bind.textures2d.textures_num = 1;
+        info.bind.textures2d.textures2d_sampled_num = 1;
+        info.bind.textures2d.desc[0].start_register = t_reg;
+        crate::shader::analysis::shader_calc_binding_indices(&mut info.bind);
+
+        shader_synthesize_placeholder_sampled_texture(&code, &mut info.bind);
+        assert_eq!(
+            info.bind.textures2d.textures_num, 1,
+            "the already-captured T# gets no shadowing placeholder"
         );
     }
 

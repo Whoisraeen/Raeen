@@ -10,3 +10,8 @@ raeen-core = { workspace = true }
 gilrs = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+
+# Native, mapping-DB-free readers (XInput + raw-HID DualSense). Windows-only;
+# the modules are #[cfg(windows)]-gated so non-Windows targets still build.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

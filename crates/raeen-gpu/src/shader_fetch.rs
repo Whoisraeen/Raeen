@@ -410,10 +410,38 @@ impl ShaderTranslateCache {
                 let mut cs_info = ShaderComputeInputInfo::default();
                 shader_get_input_info_cs(&cs, &sh_regs, mem, &shader_map, next_gen, &mut cs_info)
                     .map_err(|e| AttemptError::from_analysis("shader_get_input_info_cs", &e))?;
-                // SharpEmu port: a CS that SAMPLES textures with zero captured
-                // S#s gets one synthesized all-zero (nearest/wrap) S# per
-                // sampler operand register instead of a whole-shader refusal;
-                // the Vulkan layer then binds its cached default sampler.
+                // SharpEmu-parity safe degradation: a sampled MIMG whose T#
+                // register matches no captured descriptor (a runtime/bindless
+                // texture the static capture missed) gets a 1x1 placeholder T#
+                // at that register instead of the whole shader refusing
+                // (`dynamic-image-descriptor`). Measured on ASTRO.BOT scene
+                // compute 0x500566b00 (image_load T# at s16, 13 dispatch skips
+                // per level transition). Runs BEFORE the default-sampler synth
+                // so a synthesized sampled texture can also get a default S#.
+                kyty_graphics::shader::shader_synthesize_placeholder_sampled_texture(
+                    &code,
+                    &mut cs_info.bind,
+                );
+                // Rank 8 (draw-time null-descriptor fallback): the STORAGE
+                // counterpart — an `image_store` whose T# register matches no
+                // captured UAV descriptor (a runtime/bindless UAV the static
+                // capture missed) gets a 1x1 placeholder storage T# instead of
+                // the whole shader refusing (`dynamic-image-descriptor`). The
+                // seeded index stays in bounds (no descriptor-array OOB) and
+                // `robustImageAccess2` covers the out-of-bounds texel writes.
+                // A raw-EUD-overwritten register still refuses at the guard's
+                // shape-2 check. Storage images are compute-only, so this is
+                // wired for CS only.
+                kyty_graphics::shader::shader_synthesize_placeholder_storage_texture(
+                    &code,
+                    &mut cs_info.bind,
+                );
+                // SharpEmu port + rank-8 broadening: a CS that SAMPLES textures
+                // gets an all-zero (nearest/wrap) S# synthesized for every
+                // sampler operand register that resolves to no captured sampler
+                // — the zero-sampler case AND an unmatched register alongside
+                // captured ones — instead of a whole-shader refusal; the Vulkan
+                // layer then binds its cached default sampler.
                 kyty_graphics::shader::shader_synthesize_default_sampler(&code, &mut cs_info.bind);
                 // Beyond Kyty: a CS that appends/consumes through the GDS
                 // counter without a captured GDS descriptor gets one synthesized

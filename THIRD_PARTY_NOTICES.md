@@ -66,11 +66,14 @@ SOFTWARE.
   originating SharpEmu `file:line` in doc comments).
 - **How Raeen uses it:** A second-opinion reference alongside Kyty for PS5
   module loading (eboot/PRX/sysmodule chains), kernel-surface structure
-  (Fiber, AMPR, PlayGo), and VideoOut/AGC bring-up. Patterns and behavior are
-  **re-implemented in idiomatic Rust with reference to SharpEmu's C# source**;
-  no C# is transliterated or vendored. SharpEmu's tree is cloned locally into
-  the git-ignored `reference/` directory for study only; it is **never
-  vendored, compiled, or committed** into Raeen.
+  (Fiber, AMPR, PlayGo), VideoOut/AGC bring-up, and **native host controller
+  input** (XInput + raw-HID DualSense — `Host/Windows/WindowsXInputReader.cs`,
+  `WindowsDualSenseReader.cs`, `WindowsHidNative.cs`, `Host/HostGamepadState.cs`,
+  re-implemented as `crates/raeen-input/src/{xinput,hid,native}.rs`). Patterns
+  and behavior are **re-implemented in idiomatic Rust with reference to
+  SharpEmu's C# source**; no C# is transliterated or vendored. SharpEmu's tree
+  is cloned locally into the git-ignored `reference/` directory for study only;
+  it is **never vendored, compiled, or committed** into Raeen.
 - **NID name catalog:** SharpEmu's `scripts/ps5_names.txt` (a public symbol-name
   list) is used as candidate input to `merge_nid_catalog`, which admits a name
   only if Raeen's own SCE-NID hash reproduces the NID from it. The result is

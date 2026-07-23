@@ -480,11 +480,23 @@ fn read_sharp_fields(
                 })
                 .find(|(_, t)| *t != UserSgprType::Vsharp && *t != UserSgprType::Region)
                 .expect("!fits_typed_run implies an offending register");
-            return Err(ni_owned(format!(
-                "user sgpr type is not Vsharp/Region ({type_:?} at s{idx}; \
-                 sharp start_register={start_index}, captured={}, eud=0)",
-                user_sgpr.count,
-            )));
+            // Do NOT log at ERROR here (build the error quietly instead of via
+            // `ni_owned`): this residual is the runtime-resolved (SRT/bindless)
+            // sampled-T# shape — a sharp needs more registers than the driver
+            // captured, with no EUD. It is RECOVERED by
+            // `shader_get_texture_buffer` below (installs a placeholder T#, logs
+            // at DEBUG); the fatal storage/sampler callers surface it via
+            // `raeen-gpu`'s `shader_fetch` WARN. A construction-site ERROR was a
+            // false alarm for the recovered path — measured on ASTRO.BOT
+            // 0x100008e6aa00, which logged this 5x per level transition yet
+            // translated successfully every time.
+            return Err(ShaderAnalysisError::NotImplementedOwned {
+                what: format!(
+                    "user sgpr type is not Vsharp/Region ({type_:?} at s{idx}; \
+                     sharp start_register={start_index}, captured={}, eud=0)",
+                    user_sgpr.count,
+                ),
+            });
         }
     } else {
         // The EUD is addressed as a continuation of the user-SGPR file, so
@@ -1131,7 +1143,7 @@ fn texture_descriptor_is_unresolvable(t: &super::resources::ShaderTextureResourc
 /// untextured instead of the whole shader being skipped. Mirrors
 /// [`shader_synthesize_default_sampler`]'s all-zero S# and the null-V#-as-zero
 /// storage-buffer dummy.
-const fn placeholder_texture_fields() -> [u32; 8] {
+pub(crate) const fn placeholder_texture_fields() -> [u32; 8] {
     // fields[3]: type (bits 28..31) = 9 (Texture2D); dst_sel(X,Y,Z,W) = 0xFAC.
     // Everything else 0: base 0, format 0, width5 0 / height5 0 (1x1), tile 0.
     [0, 0, 0, (9u32 << 28) | 0xFAC, 0, 0, 0, 0]
@@ -1315,19 +1327,36 @@ pub fn shader_calc_binding_indices(bind: &mut ShaderBindResources) {
 /// untouched: `OpImageFetch` needs no sampler and the descriptor arrays are
 /// independent.
 ///
+/// Rank-8 broadening (draw-time null-descriptor fallback): the original form
+/// bailed the moment ANY sampler was captured (`samplers_num != 0`), so a
+/// sample instruction reading an S# from a register NO captured sampler
+/// occupies still refused the whole shader by name
+/// (`dynamic-image-descriptor: S# at sN matches no captured sampler`). It now
+/// synthesizes a default S# for every sample-family register that resolves to
+/// no captured sampler — a direct start-register match OR the EUD-alias walk
+/// [`mimg_descriptor_guard`] uses (via [`sampler_register_is_eud_alias`]) — so
+/// a genuinely-unresolved sampler degrades to nearest/wrap instead of being
+/// fatal, exactly as shadPS4 binds a Null()/default sampler for an unresolved
+/// S# under robustness2. A register a real sampler already covers is never
+/// shadowed (the same resolution the guard accepts is skipped here), so the
+/// zero-sampler behaviour is unchanged.
+///
 /// Call after `shader_get_input_info_*` and before
 /// `shader_detect_eud_raw_window` (both consume the sampler table this may
 /// extend); binding indices and the push-constant size are recomputed here
-/// when a sampler is synthesized.
+/// when a sampler is synthesized. The register match uses `shift_regs == 0`
+/// (the compute/pixel stages this is wired for); the `gs_prolog` +8 rebase is
+/// a vertex-stage concern this pass, like the placeholder-texture pass, does
+/// not target.
 pub fn shader_synthesize_default_sampler(code: &ShaderCode, bind: &mut ShaderBindResources) {
     use ShaderInstructionType as T;
 
-    if bind.textures2d.textures2d_sampled_num <= 0 || bind.samplers.samplers_num != 0 {
+    if bind.textures2d.textures2d_sampled_num <= 0 {
         return;
     }
 
     let mut regs: Vec<i32> = Vec::new();
-    for inst in code.get_instructions() {
+    for (at, inst) in code.get_instructions().iter().enumerate() {
         if !matches!(
             inst.type_,
             T::ImageSample
@@ -1340,9 +1369,23 @@ pub fn shader_synthesize_default_sampler(code: &ShaderCode, bind: &mut ShaderBin
         }
         // MIMG src[2] is the S# operand (ssamp * 4).
         let op = inst.src[2];
-        if op.type_ == ShaderOperandType::Sgpr && !regs.contains(&op.register_id) {
-            regs.push(op.register_id);
+        if op.type_ != ShaderOperandType::Sgpr || regs.contains(&op.register_id) {
+            continue;
         }
+        let s_reg = op.register_id;
+        // Skip a register a captured sampler already covers — never shadow a
+        // real S#. Mirror the guard: a direct start-register match OR the
+        // program-order EUD-alias walk.
+        let samp_num = usize::try_from(bind.samplers.samplers_num.max(0))
+            .unwrap_or(0)
+            .min(bind.samplers.start_register.len());
+        let direct = bind.samplers.start_register[..samp_num]
+            .iter()
+            .any(|&start| start == s_reg);
+        if direct || super::recompile::sampler_register_is_eud_alias(bind, code, s_reg, at) {
+            continue;
+        }
+        regs.push(s_reg);
     }
     if regs.is_empty() {
         return;
@@ -1369,6 +1412,282 @@ pub fn shader_synthesize_default_sampler(code: &ShaderCode, bind: &mut ShaderBin
         tracing::debug!(
             start_register = reg,
             "synthesized default (all-zero) S# for sampler-less sampled texture"
+        );
+    }
+
+    shader_calc_binding_indices(bind);
+}
+
+/// Beyond Kyty — SharpEmu-parity safe degradation: synthesize a PLACEHOLDER
+/// sampled T# for a sampled MIMG (`image_load` / `image_sample*` /
+/// `image_gather*`) whose T# operand register matches NO captured descriptor
+/// and no EUD alias — a RUNTIME-resolved (bindless / SRT-indexed) texture the
+/// static capture never saw.
+///
+/// Without this, the recompiler's `mimg_descriptor_guard` refuses the WHOLE
+/// shader by name (`dynamic-image-descriptor: Sampled T# at sN matches no
+/// captured descriptor`) and every dispatch binding it is skipped. Measured on
+/// ASTRO.BOT scene compute `0x500566b00`: an `image_load` (dmask 1) reads its
+/// T# from `s16` with no usage-table entry, causing 13 dispatch skips per level
+/// transition. This mirrors [`shader_synthesize_default_sampler`] on the
+/// TEXTURE side and the `shader_get_texture_buffer` placeholder (this file):
+/// install a valid 1x1 transparent-black `Texture2D` at the referenced register
+/// so the guard resolves it, `WriteLocalVariables` seeds `%vsharp_sN` with the
+/// placeholder's array index (delivered through the `%vsharp` push constant by
+/// `prepare_stage_binding`), and the dispatch PROCEEDS untextured instead of the
+/// whole shader being skipped (M5: maximize geometry, glitches OK).
+///
+/// The seeded index is a REAL bound descriptor, so this does NOT reintroduce the
+/// descriptor-array OOB indexing the guard's refusal was written to avoid
+/// (`mimg_descriptor_guard` doc): it eliminates the OOB by making the index
+/// valid. Coverage is decided by the SAME resolution the guard uses — a direct
+/// start-register match OR [`mimg_register_eud_alias_index`]'s program-order EUD
+/// alias walk — so a real EUD-aliased descriptor is never shadowed by a
+/// placeholder; only genuinely unresolved registers get one.
+///
+/// Scope: this rescues the "no captured descriptor" refusal (the guard's first
+/// check). A T# whose register is later OVERWRITTEN by a raw (uncovered) EUD
+/// `s_load` still, correctly, refuses at the guard's shape-2 check — the raw
+/// dwords are the true descriptor and cannot be mapped to a Vulkan array index
+/// at translate time. It also does not touch storage images (`image_store*`) or
+/// dimension queries (`image_get_resinfo`).
+///
+/// Call after `shader_get_input_info_*` and BEFORE
+/// [`shader_synthesize_default_sampler`] (a synthesized sampled texture may need
+/// a default sampler for the sample-family case). Binding indices are recomputed
+/// here. `shift_regs` is 0 for the compute/pixel stages this is wired for (the
+/// `gs_prolog` +8 rebase is a vertex-stage concern).
+pub fn shader_synthesize_placeholder_sampled_texture(
+    code: &ShaderCode,
+    bind: &mut ShaderBindResources,
+) {
+    use ShaderInstructionType as T;
+
+    // Sampled-class MIMG that reads a T# from src[1] (srsrc * 4). Storage ops
+    // (`image_store*`) and dimension queries (`image_get_resinfo`) keep their
+    // existing paths — a 1x1 dummy would be wrong for both.
+    const fn is_sampled_mimg(t: ShaderInstructionType) -> bool {
+        matches!(
+            t,
+            T::ImageLoad
+                | T::ImageSample
+                | T::ImageSampleCLz
+                | T::ImageSampleLz
+                | T::ImageSampleLzO
+                | T::ImageGather4Lz
+        )
+    }
+
+    let mut regs: Vec<i32> = Vec::new();
+    for (at, inst) in code.get_instructions().iter().enumerate() {
+        if !is_sampled_mimg(inst.type_) {
+            continue;
+        }
+        let t_op = inst.src[1];
+        if t_op.type_ != ShaderOperandType::Sgpr {
+            continue;
+        }
+        let t_reg = t_op.register_id;
+        if regs.contains(&t_reg) {
+            continue;
+        }
+        // Already resolvable by the recompiler's guard? Mirror its resolution
+        // exactly so a real (direct or EUD-aliased) descriptor is never shadowed
+        // by a placeholder. Compute/pixel: shift_regs == 0.
+        let tex_num = usize::try_from(bind.textures2d.textures_num.max(0))
+            .unwrap_or(0)
+            .min(bind.textures2d.desc.len());
+        let direct = bind.textures2d.desc[..tex_num]
+            .iter()
+            .any(|d| d.start_register == t_reg && !d.textures2d_without_sampler);
+        if direct
+            || super::recompile::mimg_register_eud_alias_index(bind, code, t_reg, at, false)
+                .is_some()
+        {
+            continue;
+        }
+        regs.push(t_reg);
+    }
+
+    if regs.is_empty() {
+        return;
+    }
+
+    for reg in regs {
+        let Ok(index) = usize::try_from(bind.textures2d.textures_num) else {
+            return;
+        };
+        if index >= ShaderTextureResources::RES_MAX {
+            // More distinct uncaptured T# registers than slots: leave the rest
+            // to the recompiler's named refusal (no silent drop).
+            break;
+        }
+        bind.textures2d.desc[index].start_register = reg;
+        bind.textures2d.desc[index].extended = false;
+        // No usage slot produced this T#; the sentinel keeps the synthesized
+        // entry distinguishable in bind-id dumps (mirrors the default S#).
+        bind.textures2d.desc[index].slot = -1;
+        bind.textures2d.desc[index].usage = ShaderTextureUsage::ReadOnly;
+        bind.textures2d.desc[index].textures2d_without_sampler = false;
+        bind.textures2d.desc[index].texture.fields = placeholder_texture_fields();
+        bind.textures2d.textures_num += 1;
+        bind.textures2d.textures2d_sampled_num += 1;
+        tracing::debug!(
+            start_register = reg,
+            "synthesized placeholder (1x1) sampled T# for a runtime/bindless texture \
+             the static capture missed"
+        );
+    }
+
+    shader_calc_binding_indices(bind);
+}
+
+/// Fields for a PLACEHOLDER storage (UAV) T#: a 1x1 dummy at guest base 0.
+///
+/// When a captured storage descriptor exists, its image Dim (type nibble) and
+/// format are copied in so `storage_texture_dim_format` still sees ONE
+/// `%ImageL` (dim, format) across the array — a placeholder of a different
+/// dim/format would make that helper refuse a mixed array, defeating the
+/// rescue. base 0 keeps the bind path from reading real guest memory: it
+/// allocates a 1x1 zero-seeded UAV, and `robustImageAccess2` (enabled on the
+/// device) discards the dispatch's out-of-bounds writes into it.
+fn placeholder_storage_fields(
+    template: Option<&super::resources::ShaderTextureResource>,
+) -> [u32; 8] {
+    let mut fields = placeholder_texture_fields();
+    if let Some(t) = template {
+        // Dim = image type nibble, fields[3] bits 28..31 (see
+        // `ShaderTextureResource::type_`).
+        fields[3] = (fields[3] & 0x0FFF_FFFF) | (t.fields[3] & 0xF000_0000);
+        // Format = fields[1] bits 20..28 (see `ShaderTextureResource::format`).
+        // Copy only those bits; the base-0 low bits stay 0.
+        const FMT_MASK: u32 = 0x1FF << 20;
+        fields[1] = (fields[1] & !FMT_MASK) | (t.fields[1] & FMT_MASK);
+    }
+    fields
+}
+
+/// Rank 8 (draw-time null-descriptor fallback) — the STORAGE counterpart of
+/// [`shader_synthesize_placeholder_sampled_texture`]: synthesize a PLACEHOLDER
+/// storage (UAV) T# for an `image_store`/`image_store_mip` whose T# operand
+/// register matches NO captured storage descriptor and no EUD alias.
+///
+/// Without this, `mimg_descriptor_guard` refuses the whole shader by name
+/// (`dynamic-image-descriptor: Storage T# at sN matches no captured
+/// descriptor`), and every dispatch binding it is skipped — the same
+/// translate-time refusal the sampled placeholder already lifted for texture
+/// reads, here extended to the write side (the broader rank-8 fix). shadPS4
+/// emits the draw and resolves such an unresolved sharp to `Null()` at bind
+/// time under robustness2 + nullDescriptor; this port's array-indexed-by-SGPR
+/// model instead installs a REAL 1x1 placeholder UAV so the seeded array index
+/// stays IN BOUNDS (no descriptor-array OOB — the exact hazard the guard's
+/// refusal was written to avoid), then leans on `robustImageAccess2` for the
+/// out-of-bounds texel writes into the 1x1 dummy.
+///
+/// Coverage is decided by the SAME resolution the guard uses — a direct
+/// start-register match OR [`super::recompile::mimg_register_eud_alias_index`]'s
+/// program-order EUD-alias walk — so a real (direct or EUD-aliased) storage
+/// descriptor is never shadowed by a placeholder; only genuinely-unresolved
+/// registers get one.
+///
+/// Genuinely-unsafe shapes still refuse and are NOT rescued here:
+/// - a T# operand that is not an SGPR range (no register to seed an index) is
+///   skipped, leaving the guard's named refusal;
+/// - a register PROVABLY overwritten by a raw (uncovered) EUD `s_load` still
+///   refuses at the guard's shape-2 check even AFTER a placeholder is added —
+///   shape 2 tests the MIMG's register, not the descriptor's capture status,
+///   so the raw dwords (the true, unmappable descriptor) keep it fatal.
+///
+/// Storage images are compute-only in the bind path
+/// (`draw_translate::prepare_stage_binding`), so this is wired for the CS
+/// stage only. Binding indices are recomputed here. `shift_regs` is 0 for
+/// compute (the `gs_prolog` +8 rebase is a vertex-stage concern).
+pub fn shader_synthesize_placeholder_storage_texture(
+    code: &ShaderCode,
+    bind: &mut ShaderBindResources,
+) {
+    use ShaderInstructionType as T;
+
+    // Storage-WRITE MIMG that reads a T# from src[1] (srsrc * 4). Sampled ops
+    // keep the sampled placeholder; `image_get_resinfo` (a dimension query)
+    // stays untouched — a 1x1 dummy would report the wrong extent.
+    const fn is_storage_write_mimg(t: ShaderInstructionType) -> bool {
+        matches!(t, T::ImageStore | T::ImageStoreMip)
+    }
+
+    let mut regs: Vec<i32> = Vec::new();
+    for (at, inst) in code.get_instructions().iter().enumerate() {
+        if !is_storage_write_mimg(inst.type_) {
+            continue;
+        }
+        let t_op = inst.src[1];
+        if t_op.type_ != ShaderOperandType::Sgpr {
+            // A non-SGPR-range T# has no register to seed an array index —
+            // leave the guard's named refusal (genuinely unresolvable here).
+            continue;
+        }
+        let t_reg = t_op.register_id;
+        if regs.contains(&t_reg) {
+            continue;
+        }
+        // Already resolvable by the guard (direct storage match or EUD alias)?
+        // Mirror it exactly so a real descriptor is never shadowed. want_storage
+        // = true.
+        let tex_num = usize::try_from(bind.textures2d.textures_num.max(0))
+            .unwrap_or(0)
+            .min(bind.textures2d.desc.len());
+        let direct = bind.textures2d.desc[..tex_num]
+            .iter()
+            .any(|d| d.start_register == t_reg && d.textures2d_without_sampler);
+        if direct
+            || super::recompile::mimg_register_eud_alias_index(bind, code, t_reg, at, true)
+                .is_some()
+        {
+            continue;
+        }
+        regs.push(t_reg);
+    }
+
+    if regs.is_empty() {
+        return;
+    }
+
+    // Share an existing storage descriptor's Dim+format so the placeholder
+    // does not create a mixed-format `%ImageL` array.
+    let template_fields = {
+        let tex_num = usize::try_from(bind.textures2d.textures_num.max(0))
+            .unwrap_or(0)
+            .min(bind.textures2d.desc.len());
+        let template = bind.textures2d.desc[..tex_num]
+            .iter()
+            .find(|d| d.textures2d_without_sampler)
+            .map(|d| &d.texture);
+        placeholder_storage_fields(template)
+    };
+
+    for reg in regs {
+        let Ok(index) = usize::try_from(bind.textures2d.textures_num) else {
+            return;
+        };
+        if index >= ShaderTextureResources::RES_MAX {
+            // More distinct uncaptured T# registers than slots: leave the rest
+            // to the recompiler's named refusal (no silent drop).
+            break;
+        }
+        bind.textures2d.desc[index].start_register = reg;
+        bind.textures2d.desc[index].extended = false;
+        // No usage slot produced this T#; the sentinel keeps the synthesized
+        // entry distinguishable in bind-id dumps (mirrors the sampled path).
+        bind.textures2d.desc[index].slot = -1;
+        bind.textures2d.desc[index].usage = ShaderTextureUsage::ReadWrite;
+        bind.textures2d.desc[index].textures2d_without_sampler = true;
+        bind.textures2d.desc[index].texture.fields = template_fields;
+        bind.textures2d.textures_num += 1;
+        bind.textures2d.textures2d_storage_num += 1;
+        tracing::debug!(
+            start_register = reg,
+            "synthesized placeholder (1x1) storage T# for a runtime/bindless UAV \
+             the static capture missed"
         );
     }
 

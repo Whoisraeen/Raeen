@@ -1385,84 +1385,52 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
     }
     let entries = ctx.trace.entries_oldest_first();
     if entries.is_empty() {
-        tracing::warn!("{err} — no HLE calls were serviced before it");
+        tracing::error!("{err} — no HLE calls were serviced before it");
         return;
     }
-    tracing::warn!(
-        "{err}\n  the {} most recent HLE call(s) before it (oldest first) — a call returning \
-         0x0 here is the usual cause of a null dereference in guest code:",
+
+    // ---- Distilled crash report: emitted FIRST and PROMINENTLY. ----
+    //
+    // The fault site (registers, module+offset, fault-site bytes, stack walk,
+    // register text previews) has already been logged above at WARN — that is
+    // part (a) of the report. What follows are the *distilled* leads a reader
+    // actually acts on: the HLE calls that returned an error, the
+    // pointer-returning calls that handed the guest a null, and the guest's own
+    // unwind chain.
+    //
+    // The full ~4096-entry ring used to be spilled right here, one `tracing::warn!`
+    // per entry — ~4096 log events, each paying a String alloc, full formatting,
+    // and a Mutex lock through the ConsoleLayer; three faults produced ~11,000
+    // WARN lines (92% of the log). It is now assembled into ONE String and
+    // emitted ONCE at DEBUG at the end of this function. Nothing is lost: the
+    // leads are promoted, the raw ring is demoted.
+
+    // Lead line, promoted to ERROR so the single most important fact is not
+    // buried among the WARN-level detail lines around it.
+    tracing::error!(
+        "{err} — {} HLE call(s) recorded before the fault; distilled leads follow at WARN, \
+         the full oldest-first ring once at DEBUG",
         entries.len()
     );
-    let mut unwind_pcs = Vec::new();
-    for &(idx, _ret, args) in &entries {
-        let is_unwind = trampolines
-            .get(idx as usize)
-            .is_some_and(|t| t.function == "sceKernelGetModuleInfoForUnwind");
-        if is_unwind && unwind_pcs.last().copied() != Some(args[0]) {
-            unwind_pcs.push(args[0]);
-        }
-    }
-    if !unwind_pcs.is_empty() {
-        let pcs = unwind_pcs
-            .iter()
-            .map(|pc| format!("{pc:#x}"))
-            .collect::<Vec<_>>()
-            .join(" -> ");
-        tracing::warn!("guest unwind PC lookups (most recent exception): {pcs}");
-    }
+
     let mem = unsafe { &*ctx.mem };
-    let mut recent_strings = Vec::new();
-    for &(idx, _ret, args) in &entries {
-        let Some(t) = trampolines.get(idx as usize) else {
-            continue;
-        };
-        let pointers: &[u64] = match t.function.as_str() {
-            "strlen" => &args[..1],
-            "strcpy" | "strncpy" => &args[1..2],
-            "strcmp" => &args[..2],
-            _ => continue,
-        };
-        for &pointer in pointers {
-            if let Some(value) = read_fault_cstr(mem, pointer) {
-                let item = format!("{}({pointer:#x})={value:?}", t.function);
-                if !recent_strings.contains(&item) {
-                    recent_strings.push(item);
-                }
-            }
-        }
-    }
-    if !recent_strings.is_empty() {
-        let start = recent_strings.len().saturating_sub(24);
-        tracing::warn!(
-            "recent guest strings observed by libc:\n    {}",
-            recent_strings[start..].join("\n    ")
-        );
-    }
+
+    // (b) HLE calls that returned an Orbis error before the fault. A guest that
+    // throws, asserts, or dereferences a null it was handed is usually reacting
+    // to one of these; picking them out by eye across 4096 entries is not a
+    // thing anyone should have to do.
     let mut failures = Vec::new();
     for &(idx, ret, _args) in &entries {
-        let marker = if is_orbis_error(ret) {
-            "  <-- ERROR"
-        } else {
-            ""
-        };
-        match trampolines.get(idx as usize) {
-            Some(t) => {
-                tracing::warn!("    {}::{} -> {ret:#x}{marker}", t.library, t.function);
-                if !marker.is_empty() {
-                    let item = format!("{}::{} -> {ret:#x}", t.library, t.function);
-                    if !failures.contains(&item) {
-                        failures.push(item);
-                    }
-                }
+        if !is_orbis_error(ret) {
+            continue;
+        }
+        if let Some(t) = trampolines.get(idx as usize) {
+            let item = format!("{}::{} -> {ret:#x}", t.library, t.function);
+            if !failures.contains(&item) {
+                failures.push(item);
             }
-            None => tracing::warn!("    <trampoline #{idx}> -> {ret:#x}{marker}"),
         }
     }
-    // The list above is thousands of lines and almost all of it succeeded. What
-    // a reader actually wants is the handful that did not: a guest that throws,
-    // asserts, or dereferences a null it was handed is usually reacting to one
-    // of these, and picking them out by eye across 4096 entries is not a thing
-    // anyone should have to do.
     if failures.is_empty() {
         tracing::warn!("no HLE call returned an Orbis error before this fault");
     } else {
@@ -1474,12 +1442,13 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
         );
     }
 
-    // A second, independent lens on the same call ring. The Orbis-error filter
-    // above only catches returns in the 0x8xxx_xxxx range; it is blind to the
-    // more common retail failure — a pointer/handle-returning call that handed
-    // back 0x0. That null is not an error code, so nothing flags it, yet it is
-    // the usual value a guest dereferences a few calls later (the faulting read
-    // of a small offset like 0x10/0x28 is `null->field`).
+    // (c) pointer-returning HLE calls that handed the guest 0x0. A second,
+    // independent lens on the same call ring. The Orbis-error filter above only
+    // catches returns in the 0x8xxx_xxxx range; it is blind to the more common
+    // retail failure — a pointer/handle-returning call that handed back 0x0.
+    // That null is not an error code, so nothing flags it, yet it is the usual
+    // value a guest dereferences a few calls later (the faulting read of a small
+    // offset like 0x10/0x28 is `null->field`).
     //
     // The registry carries no return-type metadata, so classify by
     // self-calibration from the ring itself: a function is "pointer-returning"
@@ -1527,6 +1496,89 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
             rendered,
         );
     }
+
+    // (d) guest unwind PC lookups: the addresses the guest's own C++ unwinder
+    // asked about while walking the most recent exception. The last one is
+    // typically the throw site.
+    let mut unwind_pcs = Vec::new();
+    for &(idx, _ret, args) in &entries {
+        let is_unwind = trampolines
+            .get(idx as usize)
+            .is_some_and(|t| t.function == "sceKernelGetModuleInfoForUnwind");
+        if is_unwind && unwind_pcs.last().copied() != Some(args[0]) {
+            unwind_pcs.push(args[0]);
+        }
+    }
+    if !unwind_pcs.is_empty() {
+        let pcs = unwind_pcs
+            .iter()
+            .map(|pc| format!("{pc:#x}"))
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        tracing::warn!("guest unwind PC lookups (most recent exception): {pcs}");
+    }
+
+    // Supplementary: recent NUL-terminated guest strings observed passing
+    // through libc string routines — often the assert/exception message.
+    let mut recent_strings = Vec::new();
+    for &(idx, _ret, args) in &entries {
+        let Some(t) = trampolines.get(idx as usize) else {
+            continue;
+        };
+        let pointers: &[u64] = match t.function.as_str() {
+            "strlen" => &args[..1],
+            "strcpy" | "strncpy" => &args[1..2],
+            "strcmp" => &args[..2],
+            _ => continue,
+        };
+        for &pointer in pointers {
+            if let Some(value) = read_fault_cstr(mem, pointer) {
+                let item = format!("{}({pointer:#x})={value:?}", t.function);
+                if !recent_strings.contains(&item) {
+                    recent_strings.push(item);
+                }
+            }
+        }
+    }
+    if !recent_strings.is_empty() {
+        let start = recent_strings.len().saturating_sub(24);
+        tracing::warn!(
+            "recent guest strings observed by libc:\n    {}",
+            recent_strings[start..].join("\n    ")
+        );
+    }
+
+    // ---- Full raw ring: ONE DEBUG event, not one WARN per entry. ----
+    //
+    // Assembling the whole oldest-first ring into a single String and emitting
+    // it once replaces the ~4096 log events / String allocs / Mutex locks the
+    // old per-entry loop paid on every fault. A `-> 0x0` a few lines above the
+    // fault is still the usual cause of a null dereference in guest code, so the
+    // per-entry detail is preserved verbatim — just demoted to DEBUG.
+    use std::fmt::Write as _;
+    let mut ring = String::with_capacity(entries.len() * 48);
+    let _ = write!(
+        ring,
+        "full HLE call ring before the fault ({} entries, oldest first) — a call \
+         returning 0x0 here is the usual cause of a null dereference in guest code:",
+        entries.len()
+    );
+    for &(idx, ret, _args) in &entries {
+        let marker = if is_orbis_error(ret) {
+            "  <-- ERROR"
+        } else {
+            ""
+        };
+        match trampolines.get(idx as usize) {
+            Some(t) => {
+                let _ = write!(ring, "\n    {}::{} -> {ret:#x}{marker}", t.library, t.function);
+            }
+            None => {
+                let _ = write!(ring, "\n    <trampoline #{idx}> -> {ret:#x}{marker}");
+            }
+        }
+    }
+    tracing::debug!("{ring}");
 }
 
 /// Whether an HLE return value looks like an Orbis error code rather than a

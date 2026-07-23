@@ -7,6 +7,11 @@
 pub mod adaptive_triggers;
 pub mod dualsense;
 pub mod haptics;
+pub mod hid;
+pub mod native;
+pub mod xinput;
+
+pub use native::NativeGamepads;
 
 use tracing::info;
 

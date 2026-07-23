@@ -466,6 +466,35 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcCbQueueEndOfPipeActionGetSize",
         hle_queue_eop_action_get_size,
     );
+    // Packet-sizing probe NIDs the guest RenderThread calls at startup to size
+    // its command buffers before emitting into them. Missing, these returned
+    // NOT_FOUND, leaving null packet pointers and an immediate write
+    // access-violation before any GPU work. Each returns the per-packet byte
+    // size in rax and writes NO guest memory. Ported from SharpEmu (GPL-2.0,
+    // commit 74a5198, AgcExports.cs); the export names hash to the NIDs SharpEmu
+    // declares, and the sizes are cross-checked against the writers in this file.
+    registry.register("libSceAgc", "sceAgcDcbDmaDataGetSize", hle_dma_data_get_size);
+    registry.register("libSceAgc", "sceAgcAcbDmaDataGetSize", hle_dma_data_get_size);
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbDrawIndexIndirectGetSize",
+        hle_dcb_draw_index_indirect_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetIndexCountGetSize",
+        hle_dcb_set_index_count_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbStallCommandBufferParserGetSize",
+        hle_dcb_stall_command_buffer_parser_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbGetLodStatsGetSize",
+        hle_dcb_get_lod_stats_get_size,
+    );
     // `sceAgcDriverSetTFRing(ring, size)`: binds the tessellation-factor ring
     // buffer. No tessellation path yet, so record nothing and return OK
     // (SharpEmu `DriverSetTFRing` is the same no-op, AgcExports.cs).
@@ -2508,6 +2537,50 @@ fn hle_dcb_rewind_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
 /// 32 bytes.
 fn hle_queue_eop_action_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
     8 * 4
+}
+
+/// `sceAgc{Dcb,Acb}DmaDataGetSize()`: BYTES a DMA_DATA packet occupies. Ported
+/// from SharpEmu `DcbDmaDataGetSize` / `AcbDmaDataGetSize` (AgcExports.cs, both
+/// `8 * sizeof(uint)`). The DCB writer here emits exactly 8 DWORDs
+/// (`hle_dcb_dma_data`); the ACB writer emits 7, so 32 is exact for the DCB and
+/// a safe upper bound for the ACB. Size only — no guest writes.
+fn hle_dma_data_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    8 * 4
+}
+
+/// `sceAgcDcbDrawIndexIndirectGetSize()`: BYTES a DRAW_INDEX_INDIRECT packet
+/// occupies — a fixed 5 DWORDs, matching `hle_dcb_draw_index_indirect`. Ported
+/// from SharpEmu `DcbDrawIndexIndirectGetSize` (`5 * sizeof(uint)`).
+fn hle_dcb_draw_index_indirect_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    5 * 4
+}
+
+/// `sceAgcDcbSetIndexCountGetSize()`: BYTES the INDEX_BUFFER_SIZE packet
+/// reserves. SharpEmu's `DcbSetIndexCountGetSize` returns `7 * sizeof(uint)`
+/// even though its writer (and `hle_dcb_set_index_count`) emits a 2-DWORD
+/// packet — a deliberate safe upper bound. Ported verbatim (28 >= the 8-byte
+/// writer, so the guest never under-reserves).
+fn hle_dcb_set_index_count_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    7 * 4
+}
+
+/// `sceAgcDcbStallCommandBufferParserGetSize()`: BYTES the stall packet occupies
+/// — a 2-DWORD NOP, matching `hle_dcb_stall_command_buffer_parser`. Ported from
+/// SharpEmu `DcbStallCommandBufferParserGetSize` (`2 * sizeof(uint)`).
+fn hle_dcb_stall_command_buffer_parser_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    2 * 4
+}
+
+/// `sceAgcDcbGetLodStatsGetSize(counterCount)`: BYTES a GET_LOD_STATS packet
+/// occupies. SharpEmu's `DcbGetLodStatsGetSize` returns `0x10 + counterCount*4`
+/// (counterCount in the first argument register), but both its and this crate's
+/// writer emit a FIXED 5-DWORD packet (`hle_dcb_get_lod_stats`), so that formula
+/// can under-report the emitter for small `counterCount`. Report the SharpEmu
+/// figure floored at the 20-byte writer size, so the guest never under-reserves.
+/// Size only — no guest writes.
+fn hle_dcb_get_lod_stats_get_size(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let counter_count = args.first().copied().unwrap_or(0) as u32;
+    (0x10 + u64::from(counter_count) * 4).max(5 * 4)
 }
 
 /// Accept-and-ignore stub for AGC entry points with no state to record yet
@@ -5358,6 +5431,39 @@ mod tests {
                 "{name} must be registered"
             );
         }
+    }
+
+    #[test]
+    fn agc_packet_sizing_probes_are_registered_and_return_byte_sizes() {
+        // The RenderThread calls these to size command buffers before emitting;
+        // unregistered, they returned NOT_FOUND -> null packet pointer -> AV.
+        let registry = HleRegistry::new();
+        for name in [
+            "sceAgcDcbDmaDataGetSize",
+            "sceAgcAcbDmaDataGetSize",
+            "sceAgcDcbDrawIndexIndirectGetSize",
+            "sceAgcDcbSetIndexCountGetSize",
+            "sceAgcDcbStallCommandBufferParserGetSize",
+            "sceAgcDcbGetLodStatsGetSize",
+        ] {
+            assert!(
+                registry.is_implemented("libSceAgc", name),
+                "{name} must be registered"
+            );
+        }
+
+        // Each probe returns the per-packet byte size and must not touch guest
+        // memory. Sizes match (or safely exceed) the writers in this file.
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_dma_data_get_size(&ctx, &[]), 8 * 4);
+        assert_eq!(hle_dcb_draw_index_indirect_get_size(&ctx, &[]), 5 * 4);
+        assert_eq!(hle_dcb_set_index_count_get_size(&ctx, &[]), 7 * 4);
+        assert_eq!(hle_dcb_stall_command_buffer_parser_get_size(&ctx, &[]), 2 * 4);
+        // GetLodStats: SharpEmu's 0x10 + counterCount*4, floored at the 5-DWORD
+        // (20-byte) writer so a small counterCount never under-reserves.
+        assert_eq!(hle_dcb_get_lod_stats_get_size(&ctx, &[0]), 5 * 4);
+        assert_eq!(hle_dcb_get_lod_stats_get_size(&ctx, &[8]), 0x10 + 8 * 4);
     }
 
     #[test]

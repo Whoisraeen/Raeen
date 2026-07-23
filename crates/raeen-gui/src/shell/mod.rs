@@ -118,6 +118,11 @@ pub struct Shell {
     /// the GPU texture the frame is uploaded into.
     frame_view: present::GameFrameView,
     gilrs: Option<gilrs::Gilrs>,
+    /// Native, mapping-DB-free controller readers (XInput + raw-HID
+    /// DualSense) running on background threads. Merged into the guest pad
+    /// state ahead of gilrs and the keyboard, so pads gilrs rejects with an
+    /// all-zeros UUID (Steam Input / DS4Windows / generic HID) still work.
+    native_input: raeen_input::NativeGamepads,
     /// Ids of launched titles, most-recent-first, deduplicated and capped —
     /// backs the Control Center's Switcher panel (spec §10).
     recent: Vec<String>,
@@ -262,6 +267,7 @@ impl Shell {
             session: None,
             frame_view: present::GameFrameView::default(),
             gilrs,
+            native_input: raeen_input::NativeGamepads::start(),
             recent: Vec::new(),
             config,
             config_path,
@@ -319,7 +325,7 @@ impl Shell {
         self.route_input(ctx);
         self.pump_updater_events(ctx);
         self.poll_session();
-        self.push_pad_state();
+        self.push_pad_state(ctx);
         self.tick_session_quit(ctx);
         self.tick_animations(ctx);
         self.draw(ctx);
@@ -841,7 +847,7 @@ impl Shell {
     /// session kernel via `set_pad_state`, which the guest's pad thread reads
     /// (the two share the same `Arc<OrbisKernel>`). No-op outside a session, or
     /// when the launcher shares no kernel (`StubLauncher`).
-    fn push_pad_state(&mut self) {
+    fn push_pad_state(&mut self, ctx: &egui::Context) {
         let (kernel, deadzone) = match self.session.as_ref() {
             Some(session) => match &session.kernel {
                 Some(kernel) => (kernel.clone(), self.config.input.deadzone),
@@ -849,18 +855,44 @@ impl Shell {
             },
             None => return,
         };
-        let Some(gilrs) = self.gilrs.as_mut() else {
-            return;
+        // Highest-priority source: the native, mapping-DB-free readers
+        // (XInput + raw-HID DualSense, SharpEmu-ported). These recover pads
+        // gilrs rejects with an all-zeros UUID (Steam Input / DS4Windows /
+        // generic HID), where `read_pad`'s `is_pressed` never fires. Sticks
+        // arrive raw, so apply the same configured deadzone as the gilrs path.
+        let native = self.native_input.poll().map(|mut s| {
+            s.left_stick_x = apply_deadzone(s.left_stick_x, deadzone);
+            s.left_stick_y = apply_deadzone(s.left_stick_y, deadzone);
+            s.right_stick_x = apply_deadzone(s.right_stick_x, deadzone);
+            s.right_stick_y = apply_deadzone(s.right_stick_y, deadzone);
+            s
+        });
+        // Live gamepad state — neutral if no controller is connected OR if gilrs
+        // has no button mapping for it (the all-zeros-UUID / Steam-Input / generic
+        // HID case, where `is_pressed(Button::South)` never fires). We no longer
+        // early-return when gilrs is absent, so the keyboard path below still runs.
+        let pad = if let Some(gilrs) = self.gilrs.as_mut() {
+            // Drain events so gilrs's cached per-pad state is current this frame;
+            // during a session `poll_nav_inputs` leaves the gamepad to us.
+            while gilrs.next_event().is_some() {}
+            match gilrs.gamepads().next() {
+                Some((_, gamepad)) => read_pad(&gamepad, deadzone),
+                None => raeen_input::ControllerState::default(),
+            }
+        } else {
+            raeen_input::ControllerState::default()
         };
-        // Drain events so gilrs's cached per-pad state is current this frame;
-        // during a session `poll_nav_inputs` leaves the gamepad entirely to us.
-        while gilrs.next_event().is_some() {}
-        let state = match gilrs.gamepads().next() {
-            Some((_, gamepad)) => read_pad(&gamepad, deadzone),
-            // No controller connected -> neutral (centered sticks, no buttons).
-            None => raeen_input::ControllerState::default(),
-        };
-        kernel.set_pad_state(state.to_orbis_pad_data());
+        // Merge priority: native → gilrs → keyboard. `merge_pad_states`
+        // OR-merges buttons and prefers the first non-zero analog axis, so
+        // ordering native first gives it stick priority; the keyboard fallback
+        // still reaches the guest when nothing is mapped/connected. Only active
+        // in-session (we early-returned above otherwise), so it can never fight
+        // Shell navigation.
+        let merged = merge_pad_states(
+            native.unwrap_or_default(),
+            merge_pad_states(pad, read_keyboard_pad(ctx)),
+        );
+        kernel.set_pad_state(merged.to_orbis_pad_data());
     }
 
     /// While a title runs, hold the PS/Guide button to quit back to the Shell
@@ -1216,6 +1248,17 @@ fn push_recent(recent: &mut Vec<String>, id: &str, cap: usize) {
     recent.truncate(cap);
 }
 
+/// Radial deadzone for a single analog axis, matching `read_pad`'s inline
+/// closure and `raeen_input::InputManager::apply_deadzone`. Used to condition
+/// the native (XInput / DualSense) sticks, which arrive without a deadzone.
+fn apply_deadzone(v: f32, deadzone: f32) -> f32 {
+    if v.abs() < deadzone {
+        0.0
+    } else {
+        v.signum() * (v.abs() - deadzone) / (1.0 - deadzone).max(f32::EPSILON)
+    }
+}
+
 /// Snapshot a connected gilrs gamepad into an [`raeen_input::ControllerState`],
 /// applying `deadzone` to the analog sticks. Stick Y is inverted because gilrs
 /// reports up as `+1.0` while the Orbis encoding puts up at the low byte.
@@ -1254,6 +1297,78 @@ fn read_pad(gamepad: &gilrs::Gamepad, deadzone: f32) -> raeen_input::ControllerS
         right_stick_y: dz(-axis(Axis::RightStickY)),
         l2_trigger: button_value(Button::LeftTrigger2).clamp(0.0, 1.0),
         r2_trigger: button_value(Button::RightTrigger2).clamp(0.0, 1.0),
+        ..Default::default()
+    }
+}
+
+/// Keyboard → Orbis pad fallback, OR-merged with the gamepad in
+/// [`ShellApp::push_pad_state`] so input reaches the guest even when no
+/// controller is mapped/connected (gilrs reports "No mapping found" for some
+/// driver/UUID combos, and a keyboard is always available). Layout: `WASD` =
+/// left stick, arrow keys = D-pad, `Space` = Cross (✕), `B` = Circle (○),
+/// `V` = Square (□), `C` = Triangle (△), `Q`/`E` = L1/R1, `1`/`3` = L2/R2,
+/// `Z`/`X` = L3/R3, `Enter` = Options, `Tab` = Create. Consulted only in-session.
+fn read_keyboard_pad(ctx: &egui::Context) -> raeen_input::ControllerState {
+    use egui::Key;
+    ctx.input(|i| {
+        let axis = |neg: Key, pos: Key| {
+            (if i.key_down(pos) { 1.0 } else { 0.0 }) - (if i.key_down(neg) { 1.0 } else { 0.0 })
+        };
+        raeen_input::ControllerState {
+            cross: i.key_down(Key::Space),
+            circle: i.key_down(Key::B),
+            square: i.key_down(Key::V),
+            triangle: i.key_down(Key::C),
+            l1: i.key_down(Key::Q),
+            r1: i.key_down(Key::E),
+            l3: i.key_down(Key::Z),
+            r3: i.key_down(Key::X),
+            options: i.key_down(Key::Enter),
+            create: i.key_down(Key::Tab),
+            dpad_up: i.key_down(Key::ArrowUp),
+            dpad_down: i.key_down(Key::ArrowDown),
+            dpad_left: i.key_down(Key::ArrowLeft),
+            dpad_right: i.key_down(Key::ArrowRight),
+            left_stick_x: axis(Key::A, Key::D),
+            left_stick_y: axis(Key::W, Key::S),
+            l2_trigger: if i.key_down(Key::Num1) { 1.0 } else { 0.0 },
+            r2_trigger: if i.key_down(Key::Num3) { 1.0 } else { 0.0 },
+            ..Default::default()
+        }
+    })
+}
+
+/// OR-merge two controller snapshots: buttons are logically OR'd, the non-zero
+/// analog axis wins (gamepad preferred), triggers take the max — so gamepad and
+/// keyboard input both reach the guest without one zeroing the other.
+fn merge_pad_states(
+    a: raeen_input::ControllerState,
+    b: raeen_input::ControllerState,
+) -> raeen_input::ControllerState {
+    let pick = |x: f32, y: f32| if x != 0.0 { x } else { y };
+    raeen_input::ControllerState {
+        cross: a.cross || b.cross,
+        circle: a.circle || b.circle,
+        square: a.square || b.square,
+        triangle: a.triangle || b.triangle,
+        l1: a.l1 || b.l1,
+        r1: a.r1 || b.r1,
+        l3: a.l3 || b.l3,
+        r3: a.r3 || b.r3,
+        options: a.options || b.options,
+        create: a.create || b.create,
+        ps_button: a.ps_button || b.ps_button,
+        touchpad_click: a.touchpad_click || b.touchpad_click,
+        dpad_up: a.dpad_up || b.dpad_up,
+        dpad_down: a.dpad_down || b.dpad_down,
+        dpad_left: a.dpad_left || b.dpad_left,
+        dpad_right: a.dpad_right || b.dpad_right,
+        left_stick_x: pick(a.left_stick_x, b.left_stick_x),
+        left_stick_y: pick(a.left_stick_y, b.left_stick_y),
+        right_stick_x: pick(a.right_stick_x, b.right_stick_x),
+        right_stick_y: pick(a.right_stick_y, b.right_stick_y),
+        l2_trigger: a.l2_trigger.max(b.l2_trigger),
+        r2_trigger: a.r2_trigger.max(b.r2_trigger),
         ..Default::default()
     }
 }

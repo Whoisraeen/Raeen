@@ -101,6 +101,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_IO",
     "Win32_Security",
     "Win32_System_LibraryLoader",
+    # Native, mapping-DB-free controller readers in raeen-input (SharpEmu port):
+    # XInput (Xbox) + raw-HID DualSense via SetupDi enumeration. Additive.
+    "Win32_UI_Input_XboxController",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Devices_DeviceAndDriverInstallation",
 ] }
 
 # Internal crates

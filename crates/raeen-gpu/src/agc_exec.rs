@@ -55,6 +55,92 @@ pub enum AgcExecError {
 /// when its ring buffer fills.
 const SUBMIT_QUEUE_DEPTH: usize = 8;
 
+/// Frames the guest's flip thread may have in flight before a flip blocks
+/// (item 7 / rank 7 — THE fps lever). See [`FlipSemaphore`] and
+/// [`AgcGpuSession::submit_flip_flush`].
+///
+/// `sceVideoOutSubmitFlip` no longer waits for the whole GPU worker to drain
+/// (measured ~2.3 s per flip on ASTRO.BOT — full worker-drain + fence stall,
+/// which pinned the title at ~0.4 fps). Instead the flip *enqueues* the
+/// present flush behind the already-queued draws and returns, letting the
+/// guest render the next frame while the worker catches up (CPU/GPU overlap).
+///
+/// The cap is the whole point. A naive unbounded `wait: false` was tried and
+/// REVERTED: on Minecraft the unthrottled flip stream let the title's render
+/// pool thread reuse display buffers whose flips had not completed, corrupting
+/// the title's own flip state machine — the main thread wedged ~10 s into boot
+/// on a title mutex held by that render pool thread (a pthread_sync "stuck >3s"
+/// warn named it). Real hardware bounds this with a finite pool of display
+/// buffers; this semaphore restores that backpressure. When `cap` flushes are
+/// already outstanding the flip blocks — exactly the wait that made the old
+/// synchronous form safe, but paid only when the guest is `cap` frames ahead
+/// of the GPU rather than on every single flip. 2 gives double-buffered
+/// pipelining (one frame presenting while the next is prepared) while still
+/// bounding race-ahead tightly.
+const FLIP_FRAMES_IN_FLIGHT: usize = 2;
+
+/// Counting semaphore gating how many flip flushes may be in flight
+/// ([`FLIP_FRAMES_IN_FLIGHT`]). Permits are acquired by the guest's flip thread
+/// in [`AgcGpuSession::submit_flip_flush`] and released from the GPU-completion
+/// side (the worker drops the [`FlipPermit`] once the flush executes) — never
+/// from the guest side, so the guest can never be the thread that must run to
+/// free a permit. The worker only ever *releases*, never acquires, so there is
+/// no acquire cycle and the worker always makes forward progress.
+struct FlipSemaphore {
+    /// Permits currently available (0..=`cap`).
+    available: Mutex<usize>,
+    cv: parking_lot::Condvar,
+    cap: usize,
+}
+
+impl FlipSemaphore {
+    fn new(cap: usize) -> Arc<Self> {
+        Arc::new(Self {
+            available: Mutex::new(cap),
+            cv: parking_lot::Condvar::new(),
+            cap,
+        })
+    }
+
+    /// Take a permit, blocking until one is free. Holds only this semaphore's
+    /// own mutex while parked — never a guest-visible GPU lock — so a blocked
+    /// flip thread cannot stall the worker that would release a permit.
+    fn acquire(self: &Arc<Self>) -> FlipPermit {
+        let mut available = self.available.lock();
+        while *available == 0 {
+            self.cv.wait(&mut available);
+        }
+        *available -= 1;
+        FlipPermit(Arc::clone(self))
+    }
+
+    fn release(&self) {
+        let mut available = self.available.lock();
+        // Never exceed the cap: a stray double-release must not inflate the
+        // in-flight budget.
+        if *available < self.cap {
+            *available += 1;
+        }
+        self.cv.notify_one();
+    }
+}
+
+/// RAII permit from a [`FlipSemaphore`]. Dropping it returns the permit. It
+/// rides into [`GpuWork::Flush`] and is dropped by the GPU worker after the
+/// flush executes (the fence-signal equivalent on this single-consumer path);
+/// on any inline fallback it drops on the calling thread instead. Either way
+/// the permit is always eventually returned — even if the flush panics (the
+/// permit is bound outside the worker's `catch_unwind`) or the worker shuts
+/// down with the item still queued (dropping the receiver drops the item, and
+/// thus the permit).
+struct FlipPermit(Arc<FlipSemaphore>);
+
+impl Drop for FlipPermit {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 enum GpuWork {
     Submit(Vec<u32>, bool),
     /// Land pending deferred readbacks and (when `address` is `Some`) present
@@ -69,6 +155,12 @@ enum GpuWork {
     Flush {
         address: Option<u64>,
         done: Option<std::sync::mpsc::SyncSender<()>>,
+        /// Frames-in-flight permit for the bounded fire-and-forget flip path
+        /// (item 7 / rank 7). Held from before this flush is enqueued until
+        /// the worker finishes it, then dropped on the worker thread — which
+        /// releases the permit from the GPU-completion side. `None` for
+        /// `wait_idle` and the synchronous fallback (they carry no budget).
+        permit: Option<FlipPermit>,
     },
     #[cfg(test)]
     Panic,
@@ -247,6 +339,13 @@ pub struct AgcGpuSession {
     fallback_present_base: Mutex<Option<u64>>,
     /// Flips whose address had no drawn content (drives fallback re-election).
     flip_miss_count: AtomicU64,
+    /// Bounds how many flip present-flushes may be outstanding (item 7 / rank
+    /// 7 — THE fps lever). A flip acquires a permit before enqueuing its async
+    /// flush and the worker releases it when the flush completes, so the flip
+    /// returns at vblank cadence instead of inheriting the full worker-drain
+    /// latency, yet the guest can never race more than [`FLIP_FRAMES_IN_FLIGHT`]
+    /// frames ahead of the GPU. See [`AgcGpuSession::submit_flip_flush`].
+    flip_permits: Arc<FlipSemaphore>,
 }
 
 /// Every Nth flip miss, the most-content fallback re-runs its full census
@@ -396,6 +495,7 @@ impl AgcGpuSession {
             submission_count: AtomicU64::new(0),
             fallback_present_base: Mutex::new(None),
             flip_miss_count: AtomicU64::new(0),
+            flip_permits: FlipSemaphore::new(FLIP_FRAMES_IN_FLIGHT),
         }
     }
 
@@ -539,17 +639,96 @@ impl AgcGpuSession {
             .map(|d| u64::from(d.pitch_pixels.max(d.width)) * u64::from(d.height) * 8)
             .unwrap_or(0);
         crate::guest_mem::register_scanout_watch(address, watch_span);
-        // Synchronous by design (item 4 status): the flip waits for its flush
-        // (~1-7.5 ms measured — one fence + at most one target readback). The
-        // fire-and-forget variant (`wait: false`) was tried and REVERTED: on
-        // Minecraft the unthrottled flip stream wedged the title ~10 s into
-        // boot (main thread deadlocked on a title mutex held by the flipping
-        // render pool thread, three threads spinning, flips stopped — a
-        // one-line pthread_sync "stuck >3s" warn names it), while the
-        // rendezvous form ran two clean 180 s runs at the same measured flip
-        // rate (the ~16.7 ms vblank pacer, not this wait, owns the flip
-        // period). Re-attempt only with the wedge understood.
-        self.consume_flush(Some(address), true);
+        // Bounded fire-and-forget flip (item 7 / rank 7 — THE fps lever). The
+        // flip enqueues its present flush and returns instead of blocking the
+        // guest until the whole worker drains. See [`Self::submit_flip_flush`].
+        self.submit_flip_flush(address);
+    }
+
+    /// Enqueue the present flush for a flip and return without waiting for the
+    /// worker to drain — the bounded fire-and-forget flip (item 7 / rank 7,
+    /// THE fps lever).
+    ///
+    /// ## Why this exists
+    ///
+    /// The old path called `consume_flush(Some(address), true)`, which sends a
+    /// [`GpuWork::Flush`] down the *same* ordered channel as draw submissions
+    /// and then blocks the guest's flip thread on the rendezvous until the
+    /// worker has drained every queued submit AND run the flush. A single GPU
+    /// worker drains that channel, so every flip inherited the full
+    /// worker-drain + fence-stall latency — measured ~2.3 s per flip on
+    /// ASTRO.BOT, pinning it at ~0.4 fps. The 60 Hz vblank pacer in
+    /// `libSceVideoOut` already paces flips; this synchronous wait was pure
+    /// extra latency stacked on top of it.
+    ///
+    /// This enqueues the flush the same way (still ordered AFTER every draw the
+    /// title submitted before the flip — ordering is preserved) but does NOT
+    /// wait for it. The flip returns immediately, so the guest can build the
+    /// next frame while the worker catches up: CPU work overlaps GPU work.
+    ///
+    /// ## Why it is bounded (and why unbounded wedged Minecraft)
+    ///
+    /// A prior naive `wait: false` attempt was UNBOUNDED and REVERTED: on
+    /// Minecraft the unthrottled flip stream let the title's render pool thread
+    /// reuse display buffers whose flips had not completed, corrupting the
+    /// title's own flip state machine — the main thread wedged ~10 s into boot
+    /// on a title mutex held by that render pool thread (a pthread_sync
+    /// "stuck >3s" warn named it). Real hardware bounds a title's race-ahead
+    /// with a finite pool of display buffers; the [`FlipSemaphore`] restores
+    /// that backpressure.
+    ///
+    /// ## Deadlock-safety reasoning
+    ///
+    /// - The permit is acquired BEFORE any GPU lock and while holding no
+    ///   guest-visible lock (only the semaphore's own mutex, briefly). A
+    ///   blocked flip thread therefore cannot hold a lock the worker needs to
+    ///   complete a flush and release a permit.
+    /// - The permit is released from the GPU-completion side: the worker drops
+    ///   the [`FlipPermit`] after the flush executes. The guest flip thread
+    ///   only ever *acquires*; it is never the thread that must run to free a
+    ///   permit, and the worker only ever *releases*, so there is no acquire
+    ///   cycle. The worker always makes forward progress draining the channel.
+    /// - This restores exactly the blocking that made the old synchronous form
+    ///   safe, but pays it only when the guest is [`FLIP_FRAMES_IN_FLIGHT`]
+    ///   frames ahead of the GPU — not on every flip.
+    /// - The permit is always eventually returned: the worker drops it after
+    ///   the flush (even if the flush panics — it is bound outside the worker's
+    ///   `catch_unwind`); a shutdown that leaves the item queued drops it when
+    ///   the receiver is dropped; and every inline fallback drops it here.
+    fn submit_flip_flush(&self, address: u64) {
+        if let Some(sender) = self.submit_queue.get() {
+            // Acquire the frames-in-flight permit first, holding no GPU lock.
+            // Blocks only when `FLIP_FRAMES_IN_FLIGHT` flushes are already
+            // outstanding (the hardware display-buffer backpressure).
+            let permit = self.flip_permits.acquire();
+            let enqueued = {
+                let lifecycle = self.lifecycle.lock();
+                if *lifecycle == GpuLifecycle::Open {
+                    // On success the permit rides into the worker and is
+                    // released when the flush completes. On send failure
+                    // (worker gone) `.is_ok()` drops the returned SendError —
+                    // and with it the permit — right here.
+                    sender
+                        .send(GpuWork::Flush {
+                            address: Some(address),
+                            done: None,
+                            permit: Some(permit),
+                        })
+                        .is_ok()
+                } else {
+                    // Session closing: fall through inline. `permit` drops at
+                    // the end of this `if let` block, before the inline flush.
+                    false
+                }
+            };
+            if enqueued {
+                return;
+            }
+        }
+        // No worker was ever started, the session is closing, or the send
+        // failed: run the flush inline (synchronous, but nothing is queued to
+        // wait behind). Any permit acquired above has already been released.
+        self.flush_and_present(Some(address));
     }
 
     /// Run one flush at a consumer point (flip or `wait_idle`), routed through
@@ -575,6 +754,9 @@ impl AgcGpuSession {
                     .send(GpuWork::Flush {
                         address,
                         done: done_tx,
+                        // `wait_idle` carries no flip budget — the bounded
+                        // fire-and-forget permit belongs to the flip path only.
+                        permit: None,
                     })
                     .is_ok();
                 drop(lifecycle);
@@ -1368,7 +1550,11 @@ impl AgcGpuSession {
                                     warn!("GPU submission panicked; dropping the DCB and keeping the worker alive");
                                 }
                             }
-                            GpuWork::Flush { address, done } => {
+                            GpuWork::Flush {
+                                address,
+                                done,
+                                permit,
+                            } => {
                                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     session.flush_and_present(address);
                                     // The flush lands deferred readbacks and
@@ -1387,6 +1573,15 @@ impl AgcGpuSession {
                                 if let Some(done) = done {
                                     let _ = done.send(());
                                 }
+                                // Release the frames-in-flight permit from the
+                                // GPU-completion side, AFTER the flush executed
+                                // (the fence-signal equivalent on this
+                                // single-consumer path). `permit` is bound
+                                // outside the `catch_unwind` above, so a
+                                // panicking flush still returns its budget —
+                                // never a leaked permit that would wedge the
+                                // flip thread. `None` for wait_idle flushes.
+                                drop(permit);
                             }
                             #[cfg(test)]
                             GpuWork::Panic => {
@@ -2045,6 +2240,99 @@ mod tests {
 
     fn deny_memory() -> Arc<dyn crate::guest_mem::GpuGuestMemory> {
         Arc::new(crate::guest_mem::DenyGpuMemory)
+    }
+
+    /// The frames-in-flight semaphore (item 7 / rank 7). Proves the three
+    /// properties the bounded fire-and-forget flip relies on: the cap is
+    /// enforced, a blocked acquire is unblocked by a release from ANOTHER
+    /// thread (the GPU-completion side, modelling a slow worker — no
+    /// deadlock), and permits stay balanced and capped across acquire/release.
+    #[test]
+    fn flip_semaphore_caps_in_flight_and_stays_balanced() {
+        let sem = FlipSemaphore::new(2);
+        let p1 = sem.acquire();
+        let _p2 = sem.acquire();
+        assert_eq!(*sem.available.lock(), 0, "both permits taken (cap enforced)");
+
+        // A third acquire must block until a permit is freed. Release it from
+        // a separate thread AFTER a delay — the "slow worker" case. If acquire
+        // deadlocked or the release path were broken, this test would hang.
+        let releaser_sem = Arc::clone(&sem);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(p1); // GPU-completion side returns the permit
+            drop(releaser_sem);
+        });
+        let p3 = sem.acquire(); // blocks ~50 ms, then proceeds
+        releaser.join().expect("releaser thread");
+        assert_eq!(*sem.available.lock(), 0, "reacquired the freed permit");
+
+        drop(_p2);
+        drop(p3);
+        assert_eq!(*sem.available.lock(), 2, "all permits returned");
+
+        // A stray extra release must not inflate the budget past the cap.
+        sem.release();
+        assert_eq!(*sem.available.lock(), 2, "release is capped at the max");
+    }
+
+    /// The whole bounded flip path through a real session: with a worker up,
+    /// every `present_scanout` takes the async enqueue path, and however many
+    /// flips are issued past the in-flight cap, they are all accepted (the
+    /// flip thread never wedges) and every permit is returned once the worker
+    /// drains. This is the permit acquire/release balance under the actual
+    /// worker, plus the "no deadlock past the cap" contract.
+    #[test]
+    fn bounded_flip_enqueues_async_and_returns_all_permits() {
+        let session = GpuProcessSession::create(deny_memory());
+        // Stand up the GPU worker; a worker-less session flushes inline and
+        // would never exercise the permit path.
+        session.submit_dcb_async(build_state_only_dcb(), false);
+        session.wait_idle();
+        // A framebuffer entry at the flip address so each flush presents
+        // deterministically without a Vulkan device or a guest-memory read.
+        session.framebuffers.lock().insert(
+            0x1000,
+            RenderedImage {
+                width: 1,
+                height: 1,
+                pixels: vec![7, 8, 9, 255],
+                bytes_per_pixel: 4,
+            },
+        );
+        // Far more flips than the cap: each acquires a permit before enqueuing
+        // and blocks (on the semaphore or the full channel) only transiently
+        // while the worker drains — never a wedge.
+        for _ in 0..FLIP_FRAMES_IN_FLIGHT * 8 {
+            session.present_scanout(0x1000, None);
+        }
+        // The worker is a single FIFO consumer, so this synchronous drain runs
+        // behind every flip flush; by the time it returns each flush has
+        // executed and dropped its permit.
+        session.wait_idle();
+        assert_eq!(
+            *session.flip_permits.available.lock(),
+            FLIP_FRAMES_IN_FLIGHT,
+            "every flip permit returned after the worker drained"
+        );
+        session.shutdown();
+    }
+
+    /// A flip that falls back to the inline path (no worker was ever started)
+    /// must still balance its permit — it acquires none it cannot return, and
+    /// the flush happens synchronously on the caller.
+    #[test]
+    fn worker_less_flip_stays_permit_balanced() {
+        let session = AgcGpuSession::new(deny_memory());
+        assert_eq!(*session.flip_permits.available.lock(), FLIP_FRAMES_IN_FLIGHT);
+        // No submit => no worker => inline flush. present_scanout to an empty
+        // target simply keeps the (absent) frame; the point is permit balance.
+        session.present_scanout(0xDEAD_BEEF, None);
+        assert_eq!(
+            *session.flip_permits.available.lock(),
+            FLIP_FRAMES_IN_FLIGHT,
+            "the inline fallback acquires and returns no net permits"
+        );
     }
 
     #[test]
