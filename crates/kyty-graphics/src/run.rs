@@ -31,9 +31,15 @@
 //!   whose declared length runs past the buffer ([`CpError::Truncated`]) or a
 //!   header that is not type-2/type-3 ([`CpError::NotType3`], a desynced
 //!   walk).
-//! - A draw the sink cannot honour is still a named error
-//!   ([`CpError::Draw`]) — never-silent applies to draws, and the caller
-//!   decides whether to continue the submit.
+//! - A draw the sink cannot honour ([`CpError::Draw`]) is treated like an
+//!   unknown op: named once (never-silent), counted in
+//!   [`CommandProcessor::refused_draws`], skipped by its header-encoded length,
+//!   and the walk CONTINUES. A refusal must never abandon the packets that
+//!   follow it — the completion labels/fences and later dispatches the guest
+//!   polls on for "GPU done" live there, and aborting the walk deadlocked a
+//!   title's async-compute submit worker (see [`CommandProcessor::run_resumable`]).
+//!   The sink call sites still surface [`CpError::Draw`] so a non-walk caller
+//!   (a direct `dispatch`/test) sees the named fault.
 //!
 //! # Deviations from Kyty (deliberate; see the ledger)
 //!
@@ -418,6 +424,11 @@ pub struct CommandProcessor {
     /// Number of shader-bind trace sites visited. This survives queue resets
     /// and bounds the opt-in diagnostic on frame loops.
     shader_bind_trace_count: u64,
+    /// Draws/dispatches the sink REFUSED (returned [`DrawError`]) that the walk
+    /// skipped over instead of aborting on. Cumulative across queue resets — a
+    /// per-frame reset must not zero the honest count of refused work. See the
+    /// skip-and-continue arm in [`CommandProcessor::run_resumable`].
+    refused_draws: u64,
     /// Set by the wait-packet handlers when the watched label does not satisfy
     /// the condition; consumed by the walker immediately after the packet, so
     /// [`CommandProcessor::run_resumable`] can suspend the stream there.
@@ -474,15 +485,27 @@ impl CommandProcessor {
         self.warned.len()
     }
 
+    /// How many draws/dispatches this processor refused (sink returned
+    /// [`DrawError`]) and SKIPPED — continuing the walk rather than aborting it,
+    /// so the completion packets after the refusal still executed. A growing
+    /// count is the honest measure of work the title asked for that we could not
+    /// render; it never means the stream desynced (that is [`CpError`]).
+    #[must_use]
+    pub const fn refused_draws(&self) -> u64 {
+        self.refused_draws
+    }
+
     /// Kyty: `CommandProcessor::Reset` (L519) — clears register and index
     /// state. The warn rate-limit set deliberately survives (deviation; a
     /// reset must not re-arm log spam).
     pub fn reset(&mut self) {
         let warned = std::mem::take(&mut self.warned);
         let shader_bind_trace_count = self.shader_bind_trace_count;
+        let refused_draws = self.refused_draws;
         *self = Self::new();
         self.warned = warned;
         self.shader_bind_trace_count = shader_bind_trace_count;
+        self.refused_draws = refused_draws;
     }
 
     /// True the first time `key` is seen; the caller warns exactly then.
@@ -514,9 +537,11 @@ impl CommandProcessor {
     ///
     /// # Errors
     ///
-    /// Only structural faults ([`CpError::Truncated`], [`CpError::NotType3`])
-    /// and refused draws ([`CpError::Draw`]) — unknown packets are skipped per
-    /// the module-level resilience policy.
+    /// Only structural faults ([`CpError::Truncated`], [`CpError::NotType3`]).
+    /// A refused draw ([`CpError::Draw`] from the sink) is NOT returned here —
+    /// it is counted ([`Self::refused_draws`]), logged once, and skipped so the
+    /// walk continues to the completion packets after it (module resilience
+    /// policy). Unknown packets are likewise skipped by their encoded length.
     pub fn run_with_memory(
         &mut self,
         data: &[u32],
@@ -591,7 +616,42 @@ impl CommandProcessor {
             }
 
             let body = &data[pos + 1..];
-            let consumed = self.dispatch(cmd_id, body, offset, sink, mem)?;
+            let consumed = match self.dispatch(cmd_id, body, offset, sink, mem) {
+                Ok(consumed) => consumed,
+                // A REFUSED draw/dispatch is not a stream fault. The packet is
+                // well-formed — its length lives in the header, so the walk can
+                // step over it — and every packet AFTER it must still run:
+                // RELEASE_MEM / WRITE_DATA / EVENT_WRITE_EOP completion labels,
+                // DMA_DATA copies, and the later dispatches whose storage
+                // writebacks a cross-queue `WAIT_REG_MEM` (and the guest's own
+                // submit worker) poll on for "GPU done". Aborting the walk here
+                // abandoned all of them, which is exactly the Minecraft deadlock:
+                // an async-compute dispatch bound an unsupported storage-buffer V#
+                // (add-tid / swizzle / OOB), the sink refused it, this walk
+                // aborted, the completion the guest's ACB submit worker (thread
+                // 21) waited on never came, and ~0.7 s later the main thread
+                // wedged on that thread's held mutex — 0 fps, dead pad, no more
+                // assets. So SKIP the one refused packet by its header-encoded
+                // length and keep walking; the draw degrades to a visual glitch,
+                // never a hang. STRUCTURAL faults (`Truncated` / `NotType3`)
+                // still abort — the stream is desynced and the next packet
+                // boundary is unknowable.
+                Err(CpError::Draw { offset, source }) => {
+                    self.refused_draws = self.refused_draws.saturating_add(1);
+                    if self.first(SkipKey::Note("draw_refused_skip_and_continue")) {
+                        warn!(
+                            offset,
+                            reason = %source,
+                            "refused draw/dispatch skipped — continuing the walk so the \
+                             completion packets after it still run (never-silent; later \
+                             refusals on this processor are counted via refused_draws, \
+                             not re-logged)"
+                        );
+                    }
+                    pm4::body_dw(cmd_id)
+                }
+                Err(e) => return Err(e),
+            };
 
             // Kyty wraps here on an over-long packet and only notices next
             // iteration; bail before the overrun instead.
@@ -2625,20 +2685,60 @@ mod tests {
         assert_eq!(cp.get_sh_ctx().cs.cs_regs.tidig_comp_cnt, 2);
     }
 
+    /// The sink call site still names the refusal ([`CpError::Draw`]) for a
+    /// direct (non-walk) caller — never-silent for draws is preserved at the
+    /// packet handler.
     #[test]
-    fn draw_error_from_sink_is_propagated_and_named() {
+    fn draw_error_from_sink_is_named_at_the_handler() {
         let mut cp = CommandProcessor::new();
         let mut sink = RecordingSink {
             fail: Some("no bound render target".into()),
             ..Default::default()
         };
-        let mut dcb = vec![header(7, pm4::IT_NOP, pm4::R_DRAW_INDEX_AUTO), 3, 0];
-        dcb.extend(pad(4));
-        let err = cp.run(&dcb, &mut sink).expect_err("sink refused the draw");
+        // Drive the draw handler directly (bypassing the walk's skip-and-continue
+        // policy) to prove the refusal is still surfaced as a named CpError::Draw.
+        let err = cp
+            .cp_op_draw_index_auto(header(3, pm4::IT_NOP, pm4::R_DRAW_INDEX_AUTO), &[3, 0], 0, &mut sink)
+            .expect_err("sink refused the draw");
         match err {
             CpError::Draw { source, .. } => assert!(source.0.contains("render target")),
             other => panic!("expected a named draw fault, got {other:?}"),
         }
+    }
+
+    /// FIX 1 invariant (the Minecraft async-compute unblock): a sink that
+    /// REFUSES a draw/dispatch must not abort the command-buffer walk. Every
+    /// packet AFTER the refusal — the completion labels/fences and the later
+    /// dispatches whose writebacks the guest polls on for "GPU done" — must
+    /// still run, or the title's async-compute submit worker hangs forever on a
+    /// completion that never arrives (measured: a refused ACB dispatch wedged
+    /// the whole game ~0.7 s later on a held mutex).
+    #[test]
+    fn refused_draw_is_skipped_so_the_walk_continues_to_completion_packets() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink {
+            fail: Some("no bound render target".into()),
+            ..Default::default()
+        };
+        // [refused draw][NUM_INSTANCES = 5]. The register write stands in for the
+        // completion packets that follow a real dispatch: if the walk aborted at
+        // the refusal (the old behaviour that deadlocked Minecraft), it would
+        // never execute.
+        let dcb = vec![
+            header(3, pm4::IT_NOP, pm4::R_DRAW_INDEX_AUTO),
+            3, // index_count
+            0, // flags
+            header(2, pm4::IT_NUM_INSTANCES, pm4::R_ZERO),
+            5, // num instances
+        ];
+        cp.run(&dcb, &mut sink)
+            .expect("a refused draw must be skipped, not abort the walk");
+        assert_eq!(
+            cp.num_instances(),
+            5,
+            "the packet after a refused draw must still execute (completion invariant)"
+        );
+        assert_eq!(cp.refused_draws(), 1, "the refusal must be counted");
     }
 
     /// Kyty's `dw -= s + 1` wraps on an over-long packet and reads past the end

@@ -1513,6 +1513,7 @@ impl AgcGpuSession {
                 draw_reason = draw_skip_reason.unwrap_or("(none — draw shaders translate)"),
                 dispatch_reason = dispatch_skip_reason.unwrap_or("(none)"),
                 texture_cap_skips = crate::draw_translate::stage_texture_cap_skips(),
+                storage_addressing_skips = crate::draw_translate::storage_addressing_skips(),
                 vs_addr = format_args!("{:#x}", shader_state.vs.vs_regs.data_addr),
                 es_addr = format_args!("{:#x}", shader_state.vs.es_regs.data_addr),
                 gs_addr = format_args!("{:#x}", shader_state.vs.gs_regs.data_addr),
@@ -3061,10 +3062,15 @@ mod tests {
         );
     }
 
-    /// A well-formed draw packet with no preceding register writes must be a
-    /// named fault, not a silent success or a fixture.
+    /// A well-formed draw packet with no preceding register writes must be
+    /// REFUSED — never a silent success or a fixture triangle. Under Fix 1 the
+    /// refusal no longer aborts the walk (aborting deadlocked Minecraft's
+    /// async-compute submit worker): it is named once at the handler, counted in
+    /// `refused_draws`, and skipped so the completion packets after it still run.
+    /// A non-zero `refused_draws` is the observable proof the draw did not
+    /// silently succeed and was not served by the M2 fixture path.
     #[test]
-    fn draw_without_a_bound_render_target_is_a_named_error() {
+    fn draw_without_a_bound_render_target_is_refused_and_counted() {
         struct Sink;
         impl kyty_graphics::run::DrawSink for Sink {
             fn draw_index_auto(
@@ -3084,11 +3090,12 @@ mod tests {
         dcb.resize(dcb.len() + 4, 0);
 
         let mut cp = CommandProcessor::new();
-        match cp.run(&dcb, &mut Sink) {
-            Err(CpError::Draw { source, .. }) => {
-                assert!(source.0.contains("render target"), "got {source}");
-            }
-            other => panic!("expected a named draw fault, got {other:?}"),
-        }
+        cp.run(&dcb, &mut Sink)
+            .expect("Fix 1: a refused draw must be skipped, not abort the walk");
+        assert_eq!(
+            cp.refused_draws(),
+            1,
+            "the register-less draw must be REFUSED (not silently drawn or a fixture)"
+        );
     }
 }
