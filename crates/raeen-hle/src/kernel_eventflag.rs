@@ -250,13 +250,18 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
     let deadline = if timeout_ptr == 0 {
         None
     } else {
-        let mut raw = [0u8; 8];
+        // `SceKernelUseconds` is a `uint32_t`; read 4 bytes, not 8. Reading 8
+        // pulled the adjacent guest word into the high 32 bits, ballooning a
+        // bounded wait into a near-unbounded one, and spuriously faulted a valid
+        // 4-byte timeout sitting at a page boundary. Matches the sibling readers
+        // in `kernel_semaphore.rs` and `kernel_equeue.rs`.
+        let mut raw = [0u8; 4];
         if !ctx.mem.read(timeout_ptr, &mut raw) {
             return SCE_KERNEL_ERROR_EFAULT;
         }
         Some(
             std::time::Instant::now()
-                + std::time::Duration::from_micros(u64::from_le_bytes(raw)),
+                + std::time::Duration::from_micros(u64::from(u32::from_le_bytes(raw))),
         )
     };
     let write_failed = std::cell::Cell::new(false);

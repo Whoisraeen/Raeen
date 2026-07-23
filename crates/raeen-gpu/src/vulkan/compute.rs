@@ -523,7 +523,15 @@ impl<'a> ComputeResources<'a> {
         // validation layers (measured: AMD driver access violation). Refuse
         // the dispatch by name until the SSBO spill path exists; iGPUs
         // commonly report the 256-byte spec minimum.
-        if let Some(binding) = state.binding {
+        // Skip the push-constant size check when the resource table spilled to
+        // a UBO (`push_uniform_binding` set): those bytes live in the UBO wired
+        // above, not in push constants, so the device push-constant limit does
+        // not apply. Without this gate a spilled table (>256 B) is refused on
+        // every 128/256 B-limit GPU even though the UBO path is ready, and the
+        // dispatch silently produces no output.
+        if let Some(binding) = state.binding
+            && binding.push_uniform_binding.is_none()
+        {
             let need = binding.push_constant_offset + binding.push_constants.len() as u32;
             let cap = self.dev.max_push_constants_size();
             if need > cap {
@@ -535,7 +543,10 @@ impl<'a> ComputeResources<'a> {
         }
         let push_ranges: Vec<_> = state
             .binding
-            .filter(|binding| !binding.push_constants.is_empty())
+            // A spilled table lives in the UBO, not a push-constant range.
+            .filter(|binding| {
+                !binding.push_constants.is_empty() && binding.push_uniform_binding.is_none()
+            })
             .map(|binding| {
                 vk::PushConstantRange::default()
                     .stage_flags(vk::ShaderStageFlags::COMPUTE)
@@ -1080,6 +1091,7 @@ impl<'a> ComputeResources<'a> {
             }
             if let Some(binding) = state.binding
                 && !binding.push_constants.is_empty()
+                && binding.push_uniform_binding.is_none()
             {
                 self.device().cmd_push_constants(
                     self.command_buffer,
