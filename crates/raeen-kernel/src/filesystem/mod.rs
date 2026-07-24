@@ -628,7 +628,11 @@ impl VirtualFileSystem {
             let start = (pos as usize).min(data.len());
             let end = start.saturating_add(count).min(data.len());
             let result = data[start..end].to_vec();
-            inner.position = end as u64;
+            // Advance by the bytes actually read (mirrors the reader branch
+            // below). Setting `position = end` rewound the cursor to EOF when it
+            // started past EOF, corrupting a following write's offset on an
+            // O_RDWR fd; POSIX leaves the offset unchanged on a 0-byte EOF read.
+            inner.position = pos + result.len() as u64;
             Ok(result)
         } else if let Some((handle, len)) = file.reader.as_ref() {
             // Serve at most the bytes remaining to EOF (`count` is already capped
@@ -766,6 +770,13 @@ impl VirtualFileSystem {
                     "seek before start of file",
                 )
             })?;
+        // A directory fd's enumeration cursor is `directory_index` (what
+        // `getdents` walks and mirrors into `position`), so writing `position`
+        // alone leaves the walk where it was — `lseek(dirfd, 0, SEEK_SET)`
+        // (rewinddir) would then re-enumerate nothing. Keep the two in sync.
+        if let Some(entries) = file.directory_entries.as_ref() {
+            inner.directory_index = (target as usize).min(entries.len());
+        }
         inner.position = target as u64;
         Ok(inner.position)
     }
@@ -1074,6 +1085,16 @@ const MAX_HOST_NAME_LEN: usize = 255;
 ///    canonicalized mount root — this resolves Windows junctions that a plain
 ///    symlink check misses, and fails closed on any canonicalization error.
 fn combine_within_mount(mount_root: &Path, ps5_path: &str, relative: &str) -> Option<PathBuf> {
+    // A mount with an empty host root (the stubbed `/dev`, `/proc`) has no
+    // backing directory. Building a candidate from an empty root produces a
+    // CWD-relative host path AND skips the canonical-containment assertion
+    // below (`canonicalize("")` errors), letting a guest `open("/dev/<name>")`
+    // read or create `./<name>` in the emulator's working directory. Fail
+    // closed: an unbacked mount resolves to nothing.
+    if mount_root.as_os_str().is_empty() {
+        warn!("VFS resolve: refusing guest path '{ps5_path}' under an unbacked (empty-root) mount");
+        return None;
+    }
     // --- 1. Segment sanitation. ---
     let mut segments: Vec<&str> = Vec::new();
     for segment in relative.split(['/', '\\']) {
@@ -1397,6 +1418,61 @@ mod tests {
             std::fs::read(dir.join("sparse.bin")).unwrap(),
             b"\0\0\0\0AB"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_past_eof_leaves_the_cursor_in_place() {
+        use open_flags::*;
+        let dir = temp_dir("eof-cursor");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+        let fd = vfs
+            .open("/app0/eof.bin", O_RDWR | O_CREAT | O_TRUNC, 0o644)
+            .unwrap();
+        vfs.write(fd, b"aaaa").unwrap(); // 4-byte file; cursor now at 4.
+        assert_eq!(vfs.seek(fd, 10, 0).unwrap(), 10); // SEEK_SET past EOF.
+        assert!(
+            vfs.read(fd, 8).unwrap().is_empty(),
+            "a read starting past EOF returns nothing"
+        );
+        // POSIX: a 0-byte EOF read must not move the offset. The bug rewound it
+        // to EOF (4), which then corrupted a following write on an O_RDWR fd.
+        assert_eq!(
+            vfs.seek(fd, 0, 1).unwrap(),
+            10,
+            "read past EOF must leave the cursor at 10, not rewind to EOF"
+        );
+        vfs.close(fd).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewinddir_via_lseek_restarts_enumeration() {
+        use open_flags::*;
+        let dir = temp_dir("rewinddir");
+        std::fs::write(dir.join("a.bin"), b"a").unwrap();
+        std::fs::write(dir.join("b.bin"), b"b").unwrap();
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+        let fd = vfs.open("/app0", O_RDONLY, 0).unwrap();
+
+        let drain = |fd| {
+            let mut n = 0;
+            while !vfs.getdents(fd, 4096).unwrap().0.is_empty() {
+                n += 1;
+            }
+            n
+        };
+        let first = drain(fd);
+        assert!(first >= 2, "expected at least the two files, got {first}");
+
+        // rewinddir: `lseek(dirfd, 0, SEEK_SET)` must restart the walk. Before
+        // the fix it only reset `position`, not `directory_index`, so this
+        // re-enumeration yielded nothing.
+        vfs.seek(fd, 0, 0).unwrap();
+        assert_eq!(drain(fd), first, "rewound enumeration must repeat");
+        vfs.close(fd).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

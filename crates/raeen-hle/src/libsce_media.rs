@@ -91,7 +91,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register(
         "libSceNgs2",
         "sceNgs2RackCreateWithAllocator",
-        hle_ngs2_create_out2,
+        hle_ngs2_rack_create,
     );
     registry.register("libSceNgs2", "sceNgs2RackDestroy", hle_ok);
     registry.register(
@@ -351,9 +351,16 @@ fn hle_ajm_unknown_abi(_ctx: &HleContext, args: &[u64]) -> u64 {
     OK
 }
 
-/// Ngs2 create-family (`System`/`Rack` create, `RackGetVoiceHandle`): the
-/// output handle lives in the **third** argument; write a fresh handle there.
-fn hle_ngs2_create_out2(ctx: &HleContext, args: &[u64]) -> u64 {
+/// Ngs2 create-family: write a fresh out-handle to the guest's out-pointer.
+///
+/// `sceNgs2SystemCreateWithAllocator(option, allocator, *out)` and
+/// `sceNgs2RackGetVoiceHandle(rack, voiceId, *out)` carry the out pointer in
+/// arg2 (rdx), but `sceNgs2RackCreateWithAllocator(system, rackId, option,
+/// allocator, *out)` carries it in arg4 (r8) — SharpEmu `Ngs2Exports.cs:143`.
+/// Reading the wrong slot writes the handle into an unrelated argument and
+/// leaves the guest's real out-handle uninitialized, so the guest then
+/// dereferences garbage (the NULL-base fault family).
+fn ngs2_write_out_handle(ctx: &HleContext, args: &[u64], out_index: usize) -> u64 {
     // TEMP-DIAG (2026-07-23, ASTRO.BOT +0xe03f1a NULL-base fault diagnosis;
     // REMOVE after the investigation): dump the full arg vector and caller so
     // we can verify which register really carries the out-handle pointer for
@@ -362,10 +369,11 @@ fn hle_ngs2_create_out2(ctx: &HleContext, args: &[u64]) -> u64 {
         tracing::warn!(
             caller = format_args!("{:#x}", ctx.caller_return_addr),
             args = ?args,
+            out_index,
             "TEMP-DIAG ngs2 create-family call"
         );
     }
-    let out = args.get(2).copied().unwrap_or(0);
+    let out = args.get(out_index).copied().unwrap_or(0);
     if out == 0 {
         return NGS2_ERROR_INVALID_OUT_ADDRESS;
     }
@@ -373,6 +381,16 @@ fn hle_ngs2_create_out2(ctx: &HleContext, args: &[u64]) -> u64 {
         return NGS2_ERROR_INVALID_OUT_ADDRESS;
     }
     OK
+}
+
+/// System-create and `RackGetVoiceHandle`: out-handle in arg2 (rdx).
+fn hle_ngs2_create_out2(ctx: &HleContext, args: &[u64]) -> u64 {
+    ngs2_write_out_handle(ctx, args, 2)
+}
+
+/// `sceNgs2RackCreateWithAllocator`: out-handle in arg4 (r8).
+fn hle_ngs2_rack_create(ctx: &HleContext, args: &[u64]) -> u64 {
+    ngs2_write_out_handle(ctx, args, 4)
 }
 
 #[cfg(test)]

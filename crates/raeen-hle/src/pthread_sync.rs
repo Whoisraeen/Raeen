@@ -752,42 +752,51 @@ fn hle_rwlock_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
         return EINVAL;
     };
     let current = ctx.guest_threads.current_thread();
-    {
-        let mut entry = ctx.kernel.pthread_rwlocks.get_mut(&key).unwrap();
-        if entry.writer == current && entry.writer_recursion > 0 {
-            entry.writer_recursion -= 1;
-            if entry.writer_recursion == 0 {
-                entry.writer = 0;
-            }
-            return OK;
-        }
-    }
+
+    // Release the most-recently-acquired hold first (LIFO). The only way a
+    // thread holds both a write hold and a read hold is `wrlock` then `rdlock`
+    // (a writer taking a reentrant read, admitted in `rwlock_rdlock_deadline`),
+    // so a read hold is always newer than the write hold and must be dropped
+    // first. Dropping the write hold first would clear `writer` while
+    // `readers >= 1`, silently downgrading an intended-exclusive section to a
+    // shared one — a second reader could then observe data mid-write. This
+    // mirrors KytyPS5 (`RwlockRemoveReader` first).
+    //
     // Release one of THIS thread's read holds — never another thread's. The
-    // shared `readers` count cannot say who holds a read, so a stray or
-    // duplicated unlock from a non-holder must be rejected (EPERM) instead of
-    // silently decrementing a live reader's hold and letting a writer in behind
-    // its back. The per-(thread, rwlock) depth map is the ownership check the
-    // bare count can't provide.
-    let drained = match ctx
+    // shared `readers` count cannot say who holds a read, so the per-(thread,
+    // rwlock) depth map is the ownership check the bare count can't provide.
+    let read_hold_drained = ctx
         .kernel
         .pthread_rwlock_read_holds
         .get_mut(&(current, key))
-    {
-        Some(mut depth) => {
+        .map(|mut depth| {
             *depth -= 1;
             *depth == 0
+        });
+    if let Some(drained) = read_hold_drained {
+        if drained {
+            ctx.kernel.pthread_rwlock_read_holds.remove(&(current, key));
         }
-        None => return EPERM,
-    };
-    if drained {
-        ctx.kernel.pthread_rwlock_read_holds.remove(&(current, key));
+        if let Some(mut entry) = ctx.kernel.pthread_rwlocks.get_mut(&key)
+            && entry.readers > 0
+        {
+            entry.readers -= 1;
+        }
+        return OK;
     }
-    if let Some(mut entry) = ctx.kernel.pthread_rwlocks.get_mut(&key)
-        && entry.readers > 0
-    {
-        entry.readers -= 1;
+
+    // No read hold: release the write hold (recursion first). A stray or
+    // duplicated unlock from a thread that holds neither is rejected (EPERM)
+    // rather than letting a writer in behind a live reader's back.
+    let mut entry = ctx.kernel.pthread_rwlocks.get_mut(&key).unwrap();
+    if entry.writer == current && entry.writer_recursion > 0 {
+        entry.writer_recursion -= 1;
+        if entry.writer_recursion == 0 {
+            entry.writer = 0;
+        }
+        return OK;
     }
-    OK
+    EPERM
 }
 
 /// `scePthreadRwlockattrInit`/`Destroy`: accepted (no attribute state modelled).

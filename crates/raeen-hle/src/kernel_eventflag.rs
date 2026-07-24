@@ -250,11 +250,19 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
     let deadline = if timeout_ptr == 0 {
         None
     } else {
-        let mut raw = [0u8; 8];
+        // `SceKernelUseconds` is a `uint32_t`; read 4 bytes, not 8. Reading 8
+        // pulled the adjacent guest word into the high 32 bits, ballooning a
+        // bounded wait into a near-unbounded one, and spuriously faulted a valid
+        // 4-byte timeout sitting at a page boundary. Matches the sibling readers
+        // in `kernel_semaphore.rs` and `kernel_equeue.rs`.
+        let mut raw = [0u8; 4];
         if !ctx.mem.read(timeout_ptr, &mut raw) {
             return SCE_KERNEL_ERROR_EFAULT;
         }
-        Some(std::time::Instant::now() + std::time::Duration::from_micros(u64::from_le_bytes(raw)))
+        Some(
+            std::time::Instant::now()
+                + std::time::Duration::from_micros(u64::from(u32::from_le_bytes(raw))),
+        )
     };
     let write_failed = std::cell::Cell::new(false);
     let deleted = std::cell::Cell::new(false);
@@ -408,9 +416,12 @@ mod tests {
         let h = create(&ctx, 0, 0b0001);
         // Already satisfied → OK immediately.
         assert_eq!(hle_wait(&ctx, &[h, 0b0001, WAIT_AND, 0, 0]), OK);
-        // Unsatisfied → timeout (nothing else can set it here).
+        // Unsatisfied with a finite one-millisecond SceKernelUseconds timeout
+        // expires. A NULL timeout means wait forever and must not be used for
+        // this assertion.
+        assert!(mem.write(0x120, &1_000u32.to_le_bytes()));
         assert_eq!(
-            hle_wait(&ctx, &[h, 0b1000, WAIT_AND, 0, 0]),
+            hle_wait(&ctx, &[h, 0b1000, WAIT_AND, 0, 0x120]),
             SCE_KERNEL_ERROR_ETIMEDOUT
         );
     }

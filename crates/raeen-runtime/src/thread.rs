@@ -562,6 +562,11 @@ impl GuestThreadScheduler for GuestProcessHandle {
         }
 
         let (stack_size, detached) = self.attributes(attr);
+        // Round down to a 16-byte multiple so the entry RSP (`stack_base +
+        // stack_size - 8`, over a 16-aligned base) meets the SysV AMD64 entry
+        // contract (RSP ≡ 8 mod 16). A guest-supplied odd stack size would
+        // otherwise misalign the worker's first aligned-SSE store (#GP).
+        let stack_size = stack_size & !0xF;
         let Some(stack_base) = self.arena.alloc(stack_size, 16) else {
             return SCE_KERNEL_ERROR_EAGAIN;
         };
@@ -676,6 +681,11 @@ impl GuestThreadScheduler for GuestProcessHandle {
                 result
             });
         let Ok(host) = host else {
+            // The worker closure never ran, so its in-closure cleanup will not
+            // free this thread's TCB / static-TLS block — release it here
+            // alongside the stack, or repeated spawn failures leak the guest
+            // heap one TCB at a time.
+            self.arena.free(tcb_base);
             self.arena.free(stack_base);
             return SCE_KERNEL_ERROR_EAGAIN;
         };

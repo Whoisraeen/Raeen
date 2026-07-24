@@ -100,9 +100,32 @@ pub fn parse_elf(data: &[u8]) -> Result<LoadedBinary, LoaderError> {
             goblin::elf::program_header::PT_LOAD => {
                 let offset = phdr.p_offset as usize;
                 let file_size = phdr.p_filesz as usize;
+                let mem_size = phdr.p_memsz as usize;
 
-                let segment_data = if offset + file_size <= data.len() {
-                    let mut buf = vec![0u8; phdr.p_memsz as usize];
+                // A corrupt or crafted PT_LOAD must return a LoaderError, never
+                // panic or attempt a wild allocation. Reject a p_memsz larger
+                // than any real segment (which would make the `vec!` below abort
+                // on a multi-TB request) and a p_filesz that exceeds the
+                // in-memory image (which would panic `buf[..file_size]`).
+                const MAX_SEGMENT_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+                if mem_size > MAX_SEGMENT_BYTES || file_size > mem_size {
+                    return Err(LoaderError::SegmentLoadFailed {
+                        address: phdr.p_vaddr,
+                        size: phdr.p_memsz,
+                        reason: format!(
+                            "invalid segment sizes (filesz {file_size:#x} > memsz {mem_size:#x}, \
+                             or memsz exceeds the {MAX_SEGMENT_BYTES:#x} ceiling)"
+                        ),
+                    });
+                }
+
+                // Copy the file window only if it lies fully within the input;
+                // `offset + file_size` is checked so a crafted p_offset near
+                // usize::MAX cannot wrap and index out of bounds.
+                let file_window_in_bounds =
+                    offset.checked_add(file_size).is_some_and(|end| end <= data.len());
+                let segment_data = if file_window_in_bounds {
+                    let mut buf = vec![0u8; mem_size];
                     buf[..file_size].copy_from_slice(&data[offset..offset + file_size]);
                     buf
                 } else {
@@ -113,7 +136,7 @@ pub fn parse_elf(data: &[u8]) -> Result<LoadedBinary, LoaderError> {
                         file_size,
                         data.len()
                     );
-                    vec![0u8; phdr.p_memsz as usize]
+                    vec![0u8; mem_size]
                 };
 
                 debug!(
