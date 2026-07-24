@@ -49,6 +49,29 @@ struct Registry {
 
 static REG: Mutex<Option<Registry>> = Mutex::new(None);
 
+/// Register snapshot supplied by the VEH for arbitrary-address diagnostics.
+///
+/// Export traps normally need only `rsp` to recover the caller. Keeping the
+/// additional values in one plain struct makes opt-in reverse-engineering
+/// probes useful without growing [`take_hit`] by one parameter per register.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TrapRegisters {
+    pub rsp: u64,
+    pub rbp: u64,
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+}
+
 /// Case-insensitive substring match of the env filter against a module name.
 #[must_use]
 pub fn module_matches(filter: &str, module_name: &str) -> bool {
@@ -179,9 +202,9 @@ pub fn install_addr_traps(image: &mut [u8], base: u64, addrs: &[u64]) -> usize {
 
 /// Service a breakpoint at `fault_addr` if it is one of our traps.
 ///
-/// Returns `true` if the address is (or was) a registered export trap — the
-/// caller must then resume the guest at `fault_addr` (the original byte is
-/// back in place). Returns `false` for unrelated breakpoints, or if the byte
+/// Returns `true` if the address is (or was) a registered export trap. The
+/// caller must resume at `fault_addr`, where the original byte is back in
+/// place. Returns `false` for unrelated breakpoints, or if the byte
 /// could not be restored (resuming would fault forever, so the caller should
 /// pass the exception on and let the run die loudly).
 ///
@@ -190,7 +213,7 @@ pub fn install_addr_traps(image: &mut [u8], base: u64, addrs: &[u64]) -> usize {
 /// A concurrent second fault (another thread already fetched the `int3`
 /// before the restore) finds `hit == true` and resumes silently.
 #[must_use]
-pub fn take_hit(fault_addr: u64, mem: &dyn GuestMemory, rsp: u64) -> bool {
+pub fn take_hit(fault_addr: u64, mem: &dyn GuestMemory, regs: &TrapRegisters) -> bool {
     let mut reg = REG
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -219,7 +242,7 @@ pub fn take_hit(fault_addr: u64, mem: &dyn GuestMemory, rsp: u64) -> bool {
     }
     trap.hit = true;
     let mut bytes = [0u8; 8];
-    let caller = if mem.read(rsp, &mut bytes) {
+    let caller = if mem.read(regs.rsp, &mut bytes) {
         u64::from_le_bytes(bytes)
     } else {
         0
@@ -231,6 +254,132 @@ pub fn take_hit(fault_addr: u64, mem: &dyn GuestMemory, rsp: u64) -> bool {
          (byte restored, further calls run native)",
         trap.module, trap.nid
     );
+    if trap.module == "addr-trap" && std::env::var_os("RAEEN_TRACE_STACK_GUARD").is_some() {
+        let read_u64 = |address| {
+            let mut bytes = [0u8; 8];
+            mem.read(address, &mut bytes)
+                .then(|| u64::from_le_bytes(bytes))
+        };
+        warn!(
+            "ADDR-TRAP stack guard: rbp={:#x} r13={:#x} \
+             saved[rbp-0x30]={:#x?} live[r13]={:#x?}",
+            regs.rbp,
+            regs.r13,
+            regs.rbp.checked_sub(0x30).and_then(read_u64),
+            read_u64(regs.r13),
+        );
+    }
+    if trap.module == "addr-trap" && std::env::var_os("RAEEN_TRACE_ADDR_REGS").is_some() {
+        warn!(
+            "ADDR-TRAP registers: rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} \
+             rsi={:#x} rdi={:#x} r8={:#x} r9={:#x} r12={:#x} r13={:#x} \
+             r14={:#x} r15={:#x} rbp={:#x} rsp={:#x}",
+            regs.rax,
+            regs.rbx,
+            regs.rcx,
+            regs.rdx,
+            regs.rsi,
+            regs.rdi,
+            regs.r8,
+            regs.r9,
+            regs.r12,
+            regs.r13,
+            regs.r14,
+            regs.r15,
+            regs.rbp,
+            regs.rsp,
+        );
+    }
+    if trap.module == "addr-trap" && std::env::var_os("RAEEN_TRACE_COHTML_PARSER").is_some() {
+        let read_u64 = |address| {
+            let mut bytes = [0u8; 8];
+            mem.read(address, &mut bytes)
+                .then(|| u64::from_le_bytes(bytes))
+        };
+        let read_u32 = |address| {
+            let mut bytes = [0u8; 4];
+            mem.read(address, &mut bytes)
+                .then(|| u32::from_le_bytes(bytes))
+        };
+        let stream = read_u64(regs.r14.wrapping_add(0x30));
+        let cursor = read_u32(regs.r14.wrapping_add(0x3c));
+        let around = stream.zip(cursor).and_then(|(stream, cursor)| {
+            let start = stream.wrapping_add(u64::from(cursor).saturating_sub(16));
+            let mut bytes = [0u8; 48];
+            mem.read(start, &mut bytes).then(|| {
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+        });
+        warn!(
+            "ADDR-TRAP Cohtml parser: object={:#x} stream={stream:#x?} \
+             cursor={cursor:#x?} bytes[cursor-16..cursor+32]={}",
+            regs.r14,
+            around.as_deref().unwrap_or("<unreadable>"),
+        );
+    }
+    if trap.module == "addr-trap" && std::env::var_os("RAEEN_TRACE_ADDR_MEMORY").is_some() {
+        let dump = |label: &str, center: u64| {
+            let start = center.saturating_sub(0x100);
+            let mut bytes = [0u8; 0x200];
+            if !mem.read(start, &mut bytes) {
+                return format!("{label}: unreadable around {center:#x}");
+            }
+            let rows = bytes
+                .chunks(16)
+                .enumerate()
+                .map(|(index, row)| {
+                    let address = start + (index as u64 * 16);
+                    let hex = row
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    format!("{address:#x}: {hex}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{label} around {center:#x}:\n{rows}")
+        };
+        warn!(
+            "ADDR-TRAP memory:\n{}\n{}",
+            dump("field cursor (rbx)", regs.rbx),
+            dump("deserializer (r14)", regs.r14),
+        );
+    }
+    if trap.module == "addr-trap" && std::env::var_os("RAEEN_TRACE_ADDR_FRAMES").is_some() {
+        let read_u64 = |address| {
+            let mut bytes = [0u8; 8];
+            mem.read(address, &mut bytes)
+                .then(|| u64::from_le_bytes(bytes))
+        };
+        let mut frame = regs.rbp;
+        let mut frames = Vec::new();
+        for depth in 0..12 {
+            let Some(previous) = read_u64(frame) else {
+                break;
+            };
+            let Some(return_address) = read_u64(frame.wrapping_add(8)) else {
+                break;
+            };
+            let saved = (1..=6)
+                .map(|slot| read_u64(frame.wrapping_sub(slot * 8)).unwrap_or(0))
+                .map(|value| format!("{value:#x}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            frames.push(format!(
+                "#{depth} rbp={frame:#x} ret={return_address:#x} saved[-8..-48]=[{saved}]"
+            ));
+            if previous <= frame || previous - frame > 0x10_0000 {
+                break;
+            }
+            frame = previous;
+        }
+        warn!("ADDR-TRAP frame chain:\n{}", frames.join("\n"));
+    }
     true
 }
 
@@ -317,16 +466,20 @@ mod tests {
         };
 
         // Unrelated address: not ours.
-        assert!(!take_hit(base + 0x11, &mem, base + rsp_off));
+        let regs = TrapRegisters {
+            rsp: base + rsp_off,
+            ..TrapRegisters::default()
+        };
+        assert!(!take_hit(base + 0x11, &mem, &regs));
 
         // First hit: handled, byte restored.
-        assert!(take_hit(base + 0x10, &mem, base + rsp_off));
+        assert!(take_hit(base + 0x10, &mem, &regs));
         let mut b = [0u8; 1];
         assert!(mem.read(base + 0x10, &mut b));
         assert_eq!(b[0], 0x55, "original entry byte permanently restored");
 
         // Second hit (the concurrent-race path): still handled, byte intact.
-        assert!(take_hit(base + 0x10, &mem, base + rsp_off));
+        assert!(take_hit(base + 0x10, &mem, &regs));
         assert!(mem.read(base + 0x10, &mut b));
         assert_eq!(b[0], 0x55);
     }
@@ -370,13 +523,13 @@ mod tests {
                 false
             }
         }
-        assert!(!take_hit(base + 0x4, &NoWrite, 0));
+        assert!(!take_hit(base + 0x4, &NoWrite, &TrapRegisters::default()));
         // And it stays armed: a later fault with working memory succeeds.
         let mem = TestMem {
             base,
             bytes: Mutex::new(image),
         };
-        assert!(take_hit(base + 0x4, &mem, 0));
+        assert!(take_hit(base + 0x4, &mem, &TrapRegisters::default()));
         let mut b = [0u8; 1];
         assert!(mem.read(base + 0x4, &mut b));
         assert_eq!(b[0], 0x55);

@@ -58,6 +58,9 @@ struct OpenFile {
     host_path: PathBuf,
     /// PS5 path (for debugging).
     ps5_path: String,
+    /// True for `/dev/random` and `/dev/urandom`. Reads are supplied directly
+    /// by the host OS entropy source rather than a host file.
+    random_device: bool,
     /// Lazy read-only backing: the host file handle and its length. Present
     /// instead of `data` for a read-only fd of an existing file, so a large
     /// file streams on demand rather than being slurped whole into memory at
@@ -442,6 +445,39 @@ impl VirtualFileSystem {
             ));
         }
 
+        if matches!(path, "/dev/random" | "/dev/urandom") {
+            if writable {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "random device opened for writing",
+                ));
+            }
+            let mut next = self.next_fd.write();
+            let fd = *next;
+            *next += 1;
+            self.open_files.write().insert(
+                fd,
+                OpenFile {
+                    fd,
+                    host_path: PathBuf::new(),
+                    ps5_path: path.to_string(),
+                    random_device: true,
+                    reader: None,
+                    writable: false,
+                    directory_entries: None,
+                    inner: Mutex::new(OpenFileMut {
+                        position: 0,
+                        data: None,
+                        dirty: false,
+                        flags,
+                        directory_index: 0,
+                    }),
+                },
+            );
+            debug!("VFS open: '{path}' -> fd={fd} (host entropy device)");
+            return Ok(fd);
+        }
+
         if path == "/" {
             if writable {
                 return Err(std::io::Error::new(
@@ -475,6 +511,7 @@ impl VirtualFileSystem {
                     fd,
                     host_path: PathBuf::new(),
                     ps5_path: path.to_string(),
+                    random_device: false,
                     reader: None,
                     writable: false,
                     directory_entries: Some(entries),
@@ -584,6 +621,7 @@ impl VirtualFileSystem {
             fd,
             host_path,
             ps5_path: path.to_string(),
+            random_device: false,
             reader,
             writable,
             directory_entries,
@@ -621,6 +659,12 @@ impl VirtualFileSystem {
                 std::io::ErrorKind::InvalidInput,
                 "fd is a directory",
             ));
+        }
+        if file.random_device {
+            let mut bytes = vec![0u8; count];
+            getrandom::fill(&mut bytes)
+                .map_err(|error| std::io::Error::other(format!("host entropy failed: {error}")))?;
+            return Ok(bytes);
         }
         let mut inner = file.inner.lock();
         let pos = inner.position;
@@ -702,6 +746,12 @@ impl VirtualFileSystem {
                 std::io::ErrorKind::InvalidInput,
                 "fd is a directory",
             ));
+        }
+        if file.random_device {
+            let mut bytes = vec![0u8; count];
+            getrandom::fill(&mut bytes)
+                .map_err(|error| std::io::Error::other(format!("host entropy failed: {error}")))?;
+            return Ok(bytes);
         }
         // In-memory branch: read the write-back buffer coherently with a
         // concurrent same-fd `write`, still WITHOUT touching `position`.
@@ -795,6 +845,32 @@ impl VirtualFileSystem {
                 .or_else(|| file.reader.as_ref().map(|(_, len)| *len))
                 .unwrap_or(0),
         )
+    }
+
+    /// Whether `fd` names one of the process-local entropy character devices.
+    ///
+    /// HLE `fstat` needs this distinction: reporting `/dev/random` as a
+    /// regular file makes runtimes reject an otherwise successful entropy
+    /// read.
+    #[must_use]
+    pub fn is_random_device(&self, fd: Fd) -> bool {
+        self.open_files
+            .read()
+            .get(&fd)
+            .is_some_and(|file| file.random_device)
+    }
+
+    /// Guest path associated with an open descriptor.
+    ///
+    /// This is intentionally a cloned string: callers use it only for
+    /// diagnostics, and retaining a map-lock-backed reference across I/O would
+    /// unnecessarily serialize descriptor operations.
+    #[must_use]
+    pub fn open_path(&self, fd: Fd) -> Option<String> {
+        self.open_files
+            .read()
+            .get(&fd)
+            .map(|file| file.ps5_path.clone())
     }
 
     /// Return the descriptor's Orbis open flags.
@@ -1220,6 +1296,38 @@ mod tests {
         vfs.close(fd2).unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn random_devices_stream_host_entropy_without_a_host_mount() {
+        use open_flags::*;
+        let vfs = VirtualFileSystem::new();
+
+        for path in ["/dev/random", "/dev/urandom"] {
+            let fd = vfs.open(path, O_RDONLY, 0).expect("open random device");
+            let first = vfs.read(fd, 32).expect("first entropy read");
+            let second = vfs.pread(fd, 32, 0).expect("positional entropy read");
+            assert_eq!(first.len(), 32);
+            assert_eq!(second.len(), 32);
+            assert!(vfs.is_random_device(fd));
+            assert_ne!(
+                first, second,
+                "independent reads should supply fresh entropy"
+            );
+            vfs.close(fd).expect("close random device");
+            assert!(!vfs.is_random_device(fd));
+        }
+
+        assert_eq!(
+            vfs.open("/dev/urandom", O_WRONLY, 0).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            vfs.open("/dev/not-a-device", O_RDONLY, 0)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 
     /// A read-only open must stream a large file lazily instead of buffering it

@@ -158,6 +158,14 @@ fn main() -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("--load-sprx requires a path to a .sprx/SELF file"))?;
         let bytes = std::fs::read(path)?;
         let decrypted = raeen_firmware::decrypt_self(&bytes, &raeen_firmware::NoKeysProvider)?;
+        if let Some(output) = std::env::var_os("RAEEN_DUMP_DECRYPTED_ELF") {
+            std::fs::write(&output, &decrypted.elf)?;
+            println!(
+                "decrypted ELF: {} byte(s) -> {}",
+                decrypted.elf.len(),
+                std::path::Path::new(&output).display()
+            );
+        }
         let module = raeen_firmware::parse_sprx(&decrypted.elf)?;
         let dyn_tags = match &module.dynamic {
             Some(d) => raeen_firmware::dynlib::parse_sce_dynamic(d)?,
@@ -173,6 +181,52 @@ fn main() -> anyhow::Result<()> {
                 &dyn_tags,
             )?,
         };
+        if std::env::var_os("RAEEN_DUMP_TLS_RELOCS").is_some() {
+            use std::collections::HashMap;
+
+            let modules: HashMap<u16, &str> = dynlib_data
+                .import_modules
+                .iter()
+                .map(|(index, name)| (*index, name.as_str()))
+                .collect();
+            let libraries: HashMap<u16, &str> = dynlib_data
+                .import_libs
+                .iter()
+                .map(|(index, name)| (*index, name.as_str()))
+                .collect();
+            let mut count = 0usize;
+            for relocation in &dynlib_data.relocations {
+                let r_type = relocation.info as u32;
+                if !matches!(r_type, 16..=18) {
+                    continue;
+                }
+                count += 1;
+                let symbol_index = (relocation.info >> 32) as usize;
+                let symbol = dynlib_data.symbols.get(symbol_index);
+                let provider = dynlib_data
+                    .symbol_providers
+                    .get(symbol_index)
+                    .and_then(|provider| *provider);
+                let module_name = provider
+                    .and_then(|provider| modules.get(&provider.module_index).copied())
+                    .unwrap_or("<local>");
+                let library_name = provider
+                    .and_then(|provider| libraries.get(&provider.library_index).copied())
+                    .unwrap_or("<local>");
+                println!(
+                    "tls relocation off={:#x} type={} sym={} addend={:#x} value={:#x} \
+                     import={} nid={:#018x} provider={module_name}::{library_name}",
+                    relocation.offset,
+                    r_type,
+                    symbol_index,
+                    relocation.addend,
+                    symbol.map_or(0, |symbol| symbol.value),
+                    symbol.is_some_and(|symbol| symbol.is_import),
+                    symbol.map_or(0, |symbol| symbol.nid),
+                );
+            }
+            println!("TLS relocations: {count}");
+        }
         if let Ok(value) = std::env::var("RAEEN_RELOC_OFFSET") {
             let value = value.trim_start_matches("0x");
             if let Ok(offset) = u64::from_str_radix(value, 16) {
@@ -889,13 +943,43 @@ fn main() -> anyhow::Result<()> {
         // directly to this process-scoped kernel.
         if std::env::var_os("RAEEN_RUNNER_CHILD").is_some() {
             let input_kernel = std::sync::Arc::clone(&kernel);
+            let input_script = std::env::var("RAEEN_INPUT_SCRIPT")
+                .ok()
+                .map(|spec| raeen_input::InputScript::parse(&spec))
+                .transpose()
+                .map_err(|error| anyhow::anyhow!("invalid RAEEN_INPUT_SCRIPT: {error}"))?;
             std::thread::Builder::new()
                 .name("raeen-runner-input".to_string())
                 .spawn(move || {
                     let pads = raeen_input::NativeGamepads::start();
+                    let started = std::time::Instant::now();
+                    if let Some(script) = input_script.as_ref() {
+                        tracing::info!(
+                            events = script.len(),
+                            "runner enabled deterministic controller input replay"
+                        );
+                    }
+                    let mut last_scripted_buttons = None;
                     loop {
-                        input_kernel
-                            .set_pad_state(pads.poll().unwrap_or_default().to_orbis_pad_data());
+                        let native = pads.poll().unwrap_or_default();
+                        let (state, scripted) = input_script
+                            .as_ref()
+                            .and_then(|script| script.state_at(started.elapsed()))
+                            .map_or((native, false), |state| (state, true));
+                        let encoded = state.to_orbis_pad_data();
+                        if scripted {
+                            let buttons =
+                                u32::from_le_bytes(encoded[0..4].try_into().expect("pad prefix"));
+                            if last_scripted_buttons != Some(buttons) {
+                                tracing::info!(
+                                    elapsed_ms = started.elapsed().as_millis(),
+                                    buttons = format_args!("{buttons:#010x}"),
+                                    "runner applied scripted controller state"
+                                );
+                                last_scripted_buttons = Some(buttons);
+                            }
+                        }
+                        input_kernel.set_pad_state(encoded);
                         std::thread::sleep(std::time::Duration::from_millis(4));
                     }
                 })?;

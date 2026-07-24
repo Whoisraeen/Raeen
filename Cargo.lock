@@ -3240,6 +3240,7 @@ dependencies = [
  "bitflags 2.13.0",
  "crossbeam",
  "dashmap",
+ "getrandom 0.3.4",
  "memmap2",
  "parking_lot",
  "raeen-core",

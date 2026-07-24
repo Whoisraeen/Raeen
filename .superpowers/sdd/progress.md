@@ -3067,3 +3067,30 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
     device loss. The remaining Minecraft acceptance item is a captured
     physical-button-driven menu transition and gameplay/save loop. Do not call
     the title fully playable or raise M4/M5 yet.
+
+- MINECRAFT PLAY TRANSITION NARROWED TO COHTML/V8; GUEST VMM LEAK FIXED
+  (2026-07-24; measured release run
+  `scratch/mc-vmm-hint-fix-20260724-062701`):
+  * Added deterministic, child-process input replay so title transitions can be
+    reproduced without synthesizing host UI input. The same path publishes
+    normal `raeen-input` states into the process-local kernel and is covered by
+    parser/state-timing tests.
+  * Added real `/dev/random` and `/dev/urandom` character devices backed by the
+    host entropy provider, decoded-instruction CPUID trapping with a stable PS5
+    Zen 2 profile, and alias-safe pthread mutex/rwlock state. These are general
+    runtime corrections; none is a title-specific bypass.
+  * `sceKernelReserveVirtualRange` now validates its ABI, reads the in/out
+    address hint, honors fixed placement, and releases an exact whole OS
+    reservation on `munmap`. Before the fix, V8 repeatedly reserved and leaked
+    rejected 4/8 GiB regions above 1 TiB. The measured rerun acquired 8 GiB at
+    `0x1000000000`, released it, then reacquired 4 GiB at the same hint.
+  * Pressing Cross now reproducibly enters Cohtml initialization. It still
+    aborts before gameplay in V8 9.4.146.24 snapshot deserialization with
+    `unreachable code`. Exact upstream source and the decrypted user-supplied
+    module show the unconsumed byte is legal `kOffHeapTarget` (`0x17`), which
+    must be consumed during a `kCodeBody` relocation walk but instead reaches
+    the generic root-field decoder. CPUID, pthread aliasing, TLS layout, and
+    cage placement were individually tested and do not remove the abort.
+  * HONEST STATUS: title panorama, audio output, live DualSense reads, and the
+    Cross-driven transition are measured. Gameplay, save/load, sustained frame
+    rate, and compatibility acceptance remain open; M4/M5 are not claimed.

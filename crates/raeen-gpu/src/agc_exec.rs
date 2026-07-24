@@ -2335,11 +2335,36 @@ impl kyty_graphics::run::DrawSink for StateOnlySink {
 /// Dump every accumulated render target once per throttled frame, filename
 /// keyed by the target's guest base address, plus a one-line non-black-pixel
 /// census per target so the interesting one is greppable without opening PPMs.
+fn dump_frame_due(index: u64) -> bool {
+    static DUMP_TIMER: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let started = DUMP_TIMER.get_or_init(std::time::Instant::now);
+    if std::env::var("RAEEN_DUMP_FRAME_AFTER_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u128>().ok())
+        .is_some_and(|after_ms| started.elapsed().as_millis() < after_ms)
+    {
+        return false;
+    }
+    if index <= 8 {
+        return true;
+    }
+    static INTERVAL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    match INTERVAL.get_or_init(|| {
+        std::env::var("RAEEN_DUMP_FRAME_INTERVAL")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|interval| *interval != 0)
+    }) {
+        Some(interval) => index.is_multiple_of(*interval),
+        None => index.is_power_of_two(),
+    }
+}
+
 fn maybe_dump_all_targets(targets: &[(u64, RenderedImage)], draw_index: u64) {
     let Ok(dir) = std::env::var("RAEEN_DUMP_FRAMES") else {
         return;
     };
-    if dir.is_empty() || (draw_index > 8 && !draw_index.is_power_of_two()) {
+    if dir.is_empty() || !dump_frame_due(draw_index) {
         return;
     }
     for (base, image) in targets {
@@ -2443,7 +2468,7 @@ fn maybe_dump_frame(image: &RenderedImage, draw_index: u64) {
     let Ok(dir) = std::env::var("RAEEN_DUMP_FRAMES") else {
         return;
     };
-    if dir.is_empty() || (draw_index > 8 && !draw_index.is_power_of_two()) {
+    if dir.is_empty() || !dump_frame_due(draw_index) {
         return;
     }
     let path = std::path::Path::new(&dir).join(format!("frame_{draw_index:06}.ppm"));

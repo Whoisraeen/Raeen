@@ -14,6 +14,7 @@
 
 use crate::{HleContext, HleFunction, HleRegistry};
 use raeen_kernel::{PthreadMutex, PthreadRwlock};
+use std::sync::Arc;
 use tracing::debug;
 
 // The shared mutex state machine (`lock_core`) works in POSIX errno (0 =
@@ -241,12 +242,10 @@ fn hle_mutex_init(ctx: &HleContext, args: &[u64]) -> u64 {
         return EINVAL;
     }
 
-    let state = PthreadMutex {
-        ty,
-        owner: 0,
-        recursion: 0,
-    };
-    ctx.kernel.pthread_mutexes.insert(mutex_addr, state);
+    let state = PthreadMutex::shared(ty);
+    ctx.kernel
+        .pthread_mutexes
+        .insert(mutex_addr, Arc::clone(&state));
     ctx.kernel.pthread_mutexes.insert(handle, state);
     debug!("scePthreadMutexInit(mutex={mutex_addr:#x}) -> handle {handle:#x}, type {ty}");
     OK
@@ -347,11 +346,7 @@ fn lock_core(
         // Mirrors `pthread_cond.rs::condition` (and defers the handle-alias
         // insert until the shard guard is dropped, so two colliding keys can't
         // self-deadlock).
-        let state = PthreadMutex {
-            ty: MUTEX_NORMAL,
-            owner: 0,
-            recursion: 0,
-        };
+        let state = PthreadMutex::shared(MUTEX_NORMAL);
         // Orbis mutexes are opaque pointer slots, so success must also
         // materialize *mutex; guest libc checks that pointer directly between
         // pthread calls. Only the thread that wins the vacant entry does this.
@@ -365,7 +360,7 @@ fn lock_core(
                     ctx.alloc.free(handle);
                     return EINVAL;
                 }
-                slot.insert(state);
+                slot.insert(Arc::clone(&state));
                 Some(handle)
             }
         };
@@ -381,12 +376,20 @@ fn lock_core(
     let current = ctx.guest_threads.current_thread();
     let spin_start = std::time::Instant::now();
     let mut reported = false;
+    let Some(state) = ctx
+        .kernel
+        .pthread_mutexes
+        .get(&key)
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return EINVAL;
+    };
     loop {
-        let mut entry = ctx.kernel.pthread_mutexes.get_mut(&key).unwrap();
-        if entry.owner == current {
-            return match entry.ty {
+        let mut state = state.lock();
+        if state.owner == current {
+            return match state.ty {
                 MUTEX_RECURSIVE => {
-                    entry.recursion += 1;
+                    state.recursion += 1;
                     OK
                 }
                 MUTEX_NORMAL | MUTEX_ADAPTIVE => {
@@ -395,7 +398,7 @@ fn lock_core(
                     } else {
                         // Normal self-relock is undefined; preserve the prior
                         // lenient recursion behavior for compatibility.
-                        entry.recursion += 1;
+                        state.recursion += 1;
                         OK
                     }
                 }
@@ -408,9 +411,9 @@ fn lock_core(
                 }
             };
         }
-        if entry.owner == 0 {
-            entry.owner = current;
-            entry.recursion = 1;
+        if state.owner == 0 {
+            state.owner = current;
+            state.recursion = 1;
             return OK;
         }
         if try_only || ctx.guest_threads.process_is_terminating() {
@@ -425,7 +428,7 @@ fn lock_core(
         // for the whole run, which is what stalls boot at the loading screen.)
         if !reported && spin_start.elapsed() >= std::time::Duration::from_secs(3) {
             reported = true;
-            let owner = entry.owner;
+            let owner = state.owner;
             let owner_name = ctx
                 .kernel
                 .thread_names
@@ -442,12 +445,12 @@ fn lock_core(
                 waiter_name = %self_name,
                 owner,
                 owner_name = %owner_name,
-                ty = entry.ty,
-                recursion = entry.recursion,
+                ty = state.ty,
+                recursion = state.recursion,
                 "scePthreadMutexLock stuck >3s — deadlock; naming the holder"
             );
         }
-        drop(entry);
+        drop(state);
         std::thread::yield_now();
     }
 }
@@ -461,17 +464,25 @@ fn hle_mutex_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
     let Some(key) = resolve_key(ctx, mutex_addr) else {
         return EINVAL;
     };
-    let mut entry = ctx.kernel.pthread_mutexes.get_mut(&key).unwrap();
-    let lenient = matches!(entry.ty, MUTEX_NORMAL | MUTEX_ADAPTIVE);
-    if entry.recursion <= 0 {
+    let Some(state) = ctx
+        .kernel
+        .pthread_mutexes
+        .get(&key)
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return EINVAL;
+    };
+    let mut state = state.lock();
+    let lenient = matches!(state.ty, MUTEX_NORMAL | MUTEX_ADAPTIVE);
+    if state.recursion <= 0 {
         return if lenient { OK } else { EINVAL };
     }
-    if entry.owner != ctx.guest_threads.current_thread() {
+    if state.owner != ctx.guest_threads.current_thread() {
         return EPERM;
     }
-    entry.recursion -= 1;
-    if entry.recursion == 0 {
-        entry.owner = 0;
+    state.recursion -= 1;
+    if state.recursion == 0 {
+        state.owner = 0;
     }
     OK
 }
@@ -550,14 +561,16 @@ const RWLOCK_OBJECT_SIZE: u64 = 0x100;
 
 /// Resolve the rwlock state key for a guest `pthread_rwlock_t` address.
 fn resolve_rwlock_key(ctx: &HleContext, addr: u64) -> Option<u64> {
-    if ctx.kernel.pthread_rwlocks.contains_key(&addr) {
-        return Some(addr);
+    if let Some(state) = ctx.kernel.pthread_rwlocks.get(&addr) {
+        return Some(state.lock().key);
     }
     let mut buf = [0u8; 8];
     if ctx.mem.read(addr, &mut buf) {
         let handle = u64::from_le_bytes(buf);
-        if handle != 0 && ctx.kernel.pthread_rwlocks.contains_key(&handle) {
-            return Some(handle);
+        if handle != 0
+            && let Some(state) = ctx.kernel.pthread_rwlocks.get(&handle)
+        {
+            return Some(state.lock().key);
         }
     }
     None
@@ -576,8 +589,8 @@ fn hle_rwlock_init(ctx: &HleContext, args: &[u64]) -> u64 {
     if !ctx.mem.write(addr, &handle.to_le_bytes()) {
         return EINVAL;
     }
-    let state = PthreadRwlock::default();
-    ctx.kernel.pthread_rwlocks.insert(addr, state);
+    let state = PthreadRwlock::shared(addr);
+    ctx.kernel.pthread_rwlocks.insert(addr, Arc::clone(&state));
     ctx.kernel.pthread_rwlocks.insert(handle, state);
     debug!("scePthreadRwlockInit(rwlock={addr:#x}) -> handle {handle:#x}");
     OK
@@ -592,16 +605,39 @@ fn hle_rwlock_destroy(ctx: &HleContext, args: &[u64]) -> u64 {
     let Some(key) = resolve_rwlock_key(ctx, addr) else {
         return EINVAL;
     };
-    ctx.kernel.pthread_rwlocks.remove(&key);
-    if key != addr {
-        ctx.kernel.pthread_rwlocks.remove(&addr);
+    let Some(state) = ctx
+        .kernel
+        .pthread_rwlocks
+        .get(&key)
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return EINVAL;
+    };
+    let aliases: Vec<u64> = ctx
+        .kernel
+        .pthread_rwlocks
+        .iter()
+        .filter(|entry| Arc::ptr_eq(entry.value(), &state))
+        .map(|entry| *entry.key())
+        .collect();
+    for alias in aliases {
+        ctx.kernel.pthread_rwlocks.remove(&alias);
     }
     // Drop any per-thread read-hold accounting for this rwlock too, so a
     // destroyed-and-recycled address can't inherit stale read depths.
     ctx.kernel
         .pthread_rwlock_read_holds
-        .retain(|(_, k), _| *k != key && *k != addr);
-    let _ = ctx.mem.write(addr, &0u64.to_le_bytes());
+        .retain(|(_, k), _| *k != key);
+    let mut handle_bytes = [0u8; 8];
+    let handle = if ctx.mem.read(key, &mut handle_bytes) {
+        u64::from_le_bytes(handle_bytes)
+    } else {
+        0
+    };
+    if handle != 0 {
+        ctx.alloc.free(handle);
+    }
+    let _ = ctx.mem.write(key, &0u64.to_le_bytes());
     OK
 }
 
@@ -620,7 +656,10 @@ fn resolve_or_create_rwlock(ctx: &HleContext, addr: u64) -> u64 {
     // bucket-walk fault on the reader threads. `entry().or_insert_with` publishes
     // the state exactly once and never overwrites an existing hold. Mirrors
     // `pthread_cond.rs::condition`.
-    ctx.kernel.pthread_rwlocks.entry(addr).or_default();
+    ctx.kernel
+        .pthread_rwlocks
+        .entry(addr)
+        .or_insert_with(|| PthreadRwlock::shared(addr));
     addr
 }
 
@@ -649,11 +688,19 @@ fn rwlock_rdlock_deadline(
     }
     let key = resolve_or_create_rwlock(ctx, addr);
     let current = ctx.guest_threads.current_thread();
+    let Some(state) = ctx
+        .kernel
+        .pthread_rwlocks
+        .get(&key)
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return EINVAL;
+    };
     loop {
-        let mut entry = ctx.kernel.pthread_rwlocks.get_mut(&key).unwrap();
-        if entry.writer == 0 || entry.writer == current {
-            entry.readers += 1;
-            drop(entry);
+        let mut state = state.lock();
+        if state.writer == 0 || state.writer == current {
+            state.readers += 1;
+            drop(state);
             // Record this thread's read hold so a later unlock can prove the
             // caller actually owns one before releasing it (see
             // `hle_rwlock_unlock`).
@@ -669,7 +716,7 @@ fn rwlock_rdlock_deadline(
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return ETIMEDOUT;
         }
-        drop(entry);
+        drop(state);
         std::thread::yield_now();
     }
 }
@@ -699,15 +746,23 @@ fn rwlock_wrlock_deadline(
     }
     let key = resolve_or_create_rwlock(ctx, addr);
     let current = ctx.guest_threads.current_thread();
+    let Some(state) = ctx
+        .kernel
+        .pthread_rwlocks
+        .get(&key)
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return EINVAL;
+    };
     loop {
-        let mut entry = ctx.kernel.pthread_rwlocks.get_mut(&key).unwrap();
-        if entry.writer == current {
-            entry.writer_recursion += 1;
+        let mut state = state.lock();
+        if state.writer == current {
+            state.writer_recursion += 1;
             return OK;
         }
-        if entry.writer == 0 && entry.readers == 0 {
-            entry.writer = current;
-            entry.writer_recursion = 1;
+        if state.writer == 0 && state.readers == 0 {
+            state.writer = current;
+            state.writer_recursion = 1;
             return OK;
         }
         if try_only || ctx.guest_threads.process_is_terminating() {
@@ -716,7 +771,7 @@ fn rwlock_wrlock_deadline(
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return ETIMEDOUT;
         }
-        drop(entry);
+        drop(state);
         std::thread::yield_now();
     }
 }
@@ -777,10 +832,16 @@ fn hle_rwlock_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
         if drained {
             ctx.kernel.pthread_rwlock_read_holds.remove(&(current, key));
         }
-        if let Some(mut entry) = ctx.kernel.pthread_rwlocks.get_mut(&key)
-            && entry.readers > 0
+        if let Some(state) = ctx
+            .kernel
+            .pthread_rwlocks
+            .get(&key)
+            .map(|entry| Arc::clone(entry.value()))
         {
-            entry.readers -= 1;
+            let mut state = state.lock();
+            if state.readers > 0 {
+                state.readers -= 1;
+            }
         }
         return OK;
     }
@@ -788,11 +849,19 @@ fn hle_rwlock_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
     // No read hold: release the write hold (recursion first). A stray or
     // duplicated unlock from a thread that holds neither is rejected (EPERM)
     // rather than letting a writer in behind a live reader's back.
-    let mut entry = ctx.kernel.pthread_rwlocks.get_mut(&key).unwrap();
-    if entry.writer == current && entry.writer_recursion > 0 {
-        entry.writer_recursion -= 1;
-        if entry.writer_recursion == 0 {
-            entry.writer = 0;
+    let Some(state) = ctx
+        .kernel
+        .pthread_rwlocks
+        .get(&key)
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return EINVAL;
+    };
+    let mut state = state.lock();
+    if state.writer == current && state.writer_recursion > 0 {
+        state.writer_recursion -= 1;
+        if state.writer_recursion == 0 {
+            state.writer = 0;
         }
         return OK;
     }
@@ -871,12 +940,44 @@ mod tests {
         assert_eq!(hle_mutex_lock(&ctx, &[mutex]), OK);
         // After locking, the (only) thread owns it with recursion 1.
         let key = resolve_key(&ctx, mutex).unwrap();
-        assert_eq!(kernel.pthread_mutexes.get(&key).unwrap().recursion, 1);
+        assert_eq!(
+            kernel.pthread_mutexes.get(&key).unwrap().lock().recursion,
+            1
+        );
         assert_eq!(hle_mutex_unlock(&ctx, &[mutex]), OK);
-        assert_eq!(kernel.pthread_mutexes.get(&key).unwrap().recursion, 0);
-        assert_eq!(kernel.pthread_mutexes.get(&key).unwrap().owner, 0);
+        assert_eq!(
+            kernel.pthread_mutexes.get(&key).unwrap().lock().recursion,
+            0
+        );
+        assert_eq!(kernel.pthread_mutexes.get(&key).unwrap().lock().owner, 0);
         // Unlocking an already-free normal mutex is lenient (OK).
         assert_eq!(hle_mutex_unlock(&ctx, &[mutex]), OK);
+    }
+
+    #[test]
+    fn slot_and_opaque_handle_share_one_mutex_state() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let mutex = 0x280;
+        assert_eq!(hle_mutex_init(&ctx, &[mutex, 0, 0]), OK);
+
+        let mut bytes = [0u8; 8];
+        assert!(mem.read(mutex, &mut bytes));
+        let handle = u64::from_le_bytes(bytes);
+        assert_ne!(handle, 0);
+
+        assert_eq!(hle_mutex_lock(&ctx, &[mutex]), OK);
+        assert_eq!(
+            hle_mutex_trylock(&ctx, &[handle]),
+            EBUSY,
+            "the slot and its opaque handle must not expose independent locks"
+        );
+        assert_eq!(hle_mutex_unlock(&ctx, &[handle]), OK);
+        assert_eq!(
+            hle_mutex_unlock(&ctx, &[mutex]),
+            OK,
+            "unlock through the handle must release the slot-visible state"
+        );
     }
 
     #[test]
@@ -917,11 +1018,17 @@ mod tests {
         assert_eq!(hle_mutex_lock(&ctx, &[mutex]), OK);
         assert_eq!(hle_mutex_lock(&ctx, &[mutex]), OK);
         let key = resolve_key(&ctx, mutex).unwrap();
-        assert_eq!(kernel.pthread_mutexes.get(&key).unwrap().recursion, 3);
+        assert_eq!(
+            kernel.pthread_mutexes.get(&key).unwrap().lock().recursion,
+            3
+        );
         for _ in 0..3 {
             assert_eq!(hle_mutex_unlock(&ctx, &[mutex]), OK);
         }
-        assert_eq!(kernel.pthread_mutexes.get(&key).unwrap().recursion, 0);
+        assert_eq!(
+            kernel.pthread_mutexes.get(&key).unwrap().lock().recursion,
+            0
+        );
     }
 
     #[test]
@@ -978,9 +1085,10 @@ mod tests {
         // the wait expires and reports the SCE timeout code.
         let key = resolve_rwlock_key(&ctx, rw).unwrap();
         {
-            let mut entry = kernel.pthread_rwlocks.get_mut(&key).unwrap();
-            entry.writer = 99;
-            entry.writer_recursion = 1;
+            let state = kernel.pthread_rwlocks.get(&key).unwrap();
+            let mut state = state.lock();
+            state.writer = 99;
+            state.writer_recursion = 1;
         }
         let started = std::time::Instant::now();
         assert_eq!(
@@ -1011,11 +1119,37 @@ mod tests {
         assert_eq!(hle_rwlock_rdlock(&ctx, &[rw]), OK);
         assert_eq!(hle_rwlock_rdlock(&ctx, &[rw]), OK);
         let key = resolve_rwlock_key(&ctx, rw).unwrap();
-        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().readers, 2);
+        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().lock().readers, 2);
         assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), OK);
         assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), OK);
-        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().readers, 0);
+        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().lock().readers, 0);
         // Unlocking with nothing held → EPERM.
+        assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), EPERM);
+    }
+
+    #[test]
+    fn rwlock_slot_and_opaque_handle_share_state_and_read_ownership() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let rw = 0x680;
+        assert_eq!(hle_rwlock_init(&ctx, &[rw, 0]), OK);
+
+        let mut bytes = [0u8; 8];
+        assert!(mem.read(rw, &mut bytes));
+        let handle = u64::from_le_bytes(bytes);
+        assert_ne!(handle, 0);
+
+        assert_eq!(hle_rwlock_rdlock(&ctx, &[rw]), OK);
+        assert_eq!(
+            hle_rwlock_trywrlock(&ctx, &[handle]),
+            EBUSY,
+            "a reader held through the slot must block a writer through its handle"
+        );
+        assert_eq!(
+            hle_rwlock_unlock(&ctx, &[handle]),
+            OK,
+            "read ownership must be visible through either alias"
+        );
         assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), EPERM);
     }
 
@@ -1030,13 +1164,14 @@ mod tests {
         let key = resolve_rwlock_key(&ctx, rw).unwrap();
         {
             let s = kernel.pthread_rwlocks.get(&key).unwrap();
+            let s = s.lock();
             assert_eq!(s.writer, CURRENT_THREAD);
             assert_eq!(s.writer_recursion, 2);
         }
         assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), OK);
         assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), OK);
         let s = kernel.pthread_rwlocks.get(&key).unwrap();
-        assert_eq!(s.writer, 0, "write hold released at recursion 0");
+        assert_eq!(s.lock().writer, 0, "write hold released at recursion 0");
     }
 
     #[test]
@@ -1070,13 +1205,13 @@ mod tests {
         // exactly the state its own `Rdlock` would leave: shared count bumped
         // and a per-thread depth recorded.
         const OTHER: u64 = 99;
-        kernel.pthread_rwlocks.get_mut(&key).unwrap().readers = 1;
+        kernel.pthread_rwlocks.get(&key).unwrap().lock().readers = 1;
         kernel.pthread_rwlock_read_holds.insert((OTHER, key), 1);
 
         // The test thread holds nothing, so its unlock is rejected outright and
         // touches neither the shared count nor thread 99's per-thread hold.
         assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), EPERM);
-        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().readers, 1);
+        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().lock().readers, 1);
         assert_eq!(
             *kernel.pthread_rwlock_read_holds.get(&(OTHER, key)).unwrap(),
             1

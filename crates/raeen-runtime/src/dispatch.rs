@@ -264,6 +264,7 @@ static LAST_HLE_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 static LAST_HLE_RETURN: AtomicU64 = AtomicU64::new(0);
 static TRACE_HLE: OnceLock<bool> = OnceLock::new();
 static TRACE_HLE_INDEX: OnceLock<Option<u64>> = OnceLock::new();
+static TRACE_HLE_FUNCTION: OnceLock<Option<String>> = OnceLock::new();
 static TRACE_EINVAL: OnceLock<bool> = OnceLock::new();
 
 /// `RAEEN_TIME_HLE`: accumulate per-(thread, function) time spent inside HLE
@@ -1925,7 +1926,23 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: `ctx.mem` outlives the guarded call, per `ActiveContext`.
         let mem = unsafe { &*ctx.mem };
         let fault = record.ExceptionAddress as u64;
-        if crate::export_trap::take_hit(fault, mem, context.Rsp) {
+        let trap_regs = crate::export_trap::TrapRegisters {
+            rsp: context.Rsp,
+            rbp: context.Rbp,
+            rax: context.Rax,
+            rbx: context.Rbx,
+            rcx: context.Rcx,
+            rdx: context.Rdx,
+            rsi: context.Rsi,
+            rdi: context.Rdi,
+            r8: context.R8,
+            r9: context.R9,
+            r12: context.R12,
+            r13: context.R13,
+            r14: context.R14,
+            r15: context.R15,
+        };
+        if crate::export_trap::take_hit(fault, mem, &trap_regs) {
             resume_guest_with_tls(ctx, context, mem, fault, context.Rsp);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -1935,9 +1952,27 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     if is_illegal_instruction {
         let mem = unsafe { &*ctx.mem };
         let mut marker = [0u8; 2];
-        if !mem.read(fault_addr, &mut marker)
-            || marker != raeen_firmware::dynlib::linker::SYSCALL_TRAP_BYTES
+        if mem.read(fault_addr, &mut marker)
+            && marker == raeen_firmware::dynlib::linker::CPUID_TRAP_BYTES
         {
+            let leaf = context.Rax as u32;
+            let subleaf = context.Rcx as u32;
+            let (eax, ebx, ecx, edx) = raeen_kernel::hypervisor::ps5_cpuid(leaf, subleaf);
+            context.Rax = u64::from(eax);
+            context.Rbx = u64::from(ebx);
+            context.Rcx = u64::from(ecx);
+            context.Rdx = u64::from(edx);
+            let return_rip = fault_addr.wrapping_add(marker.len() as u64);
+            if std::env::var_os("RAEEN_TRACE_CPUID").is_some() {
+                tracing::info!(
+                    "guest CPUID leaf={leaf:#010x} subleaf={subleaf:#010x} -> \
+                     eax={eax:#010x} ebx={ebx:#010x} ecx={ecx:#010x} edx={edx:#010x}"
+                );
+            }
+            resume_guest_with_tls(ctx, context, mem, return_rip, context.Rsp);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if marker != raeen_firmware::dynlib::linker::SYSCALL_TRAP_BYTES {
             // Not our syscall trap. If the bad instruction is in guest code
             // (arena range), it is a genuine undefined opcode — a wild jump into
             // data, a corrupted vtable/function-pointer call landing off-code, a
@@ -2337,8 +2372,14 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                     .ok()
                     .and_then(|value| value.parse().ok())
             });
+            let trace_function =
+                TRACE_HLE_FUNCTION.get_or_init(|| std::env::var("RAEEN_TRACE_HLE_FUNCTION").ok());
+            let trace_this_function = trace_function
+                .as_deref()
+                .is_some_and(|name| name == t.function);
             if *TRACE_HLE.get_or_init(|| std::env::var_os("RAEEN_TRACE_HLE").is_some())
                 || trace_index == Some(idx)
+                || trace_this_function
             {
                 let read_u64 = |addr| {
                     let mut bytes = [0u8; 8];
@@ -2368,7 +2409,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                     read_u64(context.R14),
                     read_u64(context.Rbp.wrapping_add(8)),
                 );
-                if trace_index == Some(idx) {
+                if trace_index == Some(idx) || trace_this_function {
                     let mut frame = context.Rbp;
                     let mut chain = Vec::new();
                     for _ in 0..12 {

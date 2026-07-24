@@ -72,10 +72,6 @@ const VMM_MIN: u64 = PAGE_SIZE;
 /// that literal address). Everything we do not own is [`VmaType::Foreign`].
 const VMM_MAX: u64 = 0x8000_0000_0000;
 
-/// First guest VA considered when the kernel chooses an address for a
-/// non-fixed mapping. This is guest VMM policy, not host ASLR policy.
-const DEFAULT_MAPPING_BASE: u64 = 0x2_0000_0000; // 8 GiB
-
 /// PS5 kernel-selected mappings first use the system-managed virtual-address
 /// window. Native title libc validates mspace storage against these bounds, so
 /// returning memory from the emulator's 16 TiB image arena is not ABI-valid.
@@ -2039,11 +2035,22 @@ impl GuestAllocator for GuestArena {
     }
 
     fn reserve(&self, length: u64, align: u64) -> Option<u64> {
+        self.reserve_with_hint(0, length, align, false)
+    }
+
+    fn reserve_with_hint(&self, hint: u64, length: u64, align: u64, fixed: bool) -> Option<u64> {
         let align = normalize_align(align.max(PAGE_SIZE))?;
         let length = align_up(length.max(1), align)?;
+        if fixed && (hint == 0 || hint % align != 0) {
+            return None;
+        }
 
         // Ask the OS for this span instead of carving it out of the arena's
-        // sparse tail.
+        // sparse tail. A non-zero address is a real placement hint in the
+        // Orbis ABI; MAP_FIXED strengthens it to an exact address. V8 uses the
+        // hint to acquire its 4 GiB-aligned pointer-compression cage. Ignoring
+        // it made the guest allocate and reject multiple 4/8 GiB reservations
+        // above 1 TiB before it happened to straddle a suitable boundary.
         //
         // Titles reserve enormously and never release — Until Dawn opens with a
         // single 512 GiB request — while `reserve`, `mmap`'s sparse growth and
@@ -2060,24 +2067,29 @@ impl GuestAllocator for GuestArena {
         // untouched — guest VA is still host VA, wherever it lands, and the
         // guest reads the address back out of the call.
         //
-        // Over-reserve by `align` and align within the block: `VirtualAlloc`'s
-        // own granularity is 64 KiB, which cannot satisfy a larger request.
-        let span = length;
-        // SAFETY: a null `lpAddress` asks the OS to choose any free range.
+        // Scan on the requested alignment before reserving. Windows requires a
+        // 64 KiB allocation-granularity base; `reserve_guest_address_space`
+        // raises smaller alignments to that granularity.
+        let start = if hint == 0 {
+            RESERVE_MIN
+        } else {
+            align_up(hint, align)?
+        };
+        let limit = if fixed {
+            start.checked_add(length)?
+        } else {
+            self.base
+        };
         // `MEM_RESERVE` with `PAGE_NOACCESS` takes address space without
         // committing memory, so a 512 GiB reservation costs no RAM. The block
-        // is recorded in `os_reservations` and released in `Drop`.
-        let block = reserve_guest_address_space(RESERVE_MIN, self.base, span, align)
-            // Fall back to the old low-first search only if the dedicated
-            // reservation window is somehow full: a placed reservation that
-            // fragments a mapping window still beats failing the call outright.
-            .or_else(|| {
-                reserve_guest_address_space(DEFAULT_MAPPING_BASE, self.base, span, align)
-            })?;
+        // is recorded in `os_reservations` and released on exact unmap or Drop.
+        let block = reserve_guest_address_space(start, limit, length, align).or_else(|| {
+            (!fixed && hint != 0)
+                .then(|| reserve_guest_address_space(RESERVE_MIN, self.base, length, align))
+                .flatten()
+        })?;
 
-        let Some(addr) = align_up(block, align) else {
-            return self.release_unusable_block(block);
-        };
+        let addr = block;
         let Some(end) = addr.checked_add(length) else {
             return self.release_unusable_block(block);
         };
@@ -2100,6 +2112,10 @@ impl GuestAllocator for GuestArena {
 
         let mut state = self.lock_state();
         state.os_reservations.push(block);
+        // An exact whole-range `munmap` can now release this OS reservation
+        // immediately instead of merely relabeling the VMA while Windows keeps
+        // the address space occupied until process teardown.
+        state.external_mappings.insert(block, length);
         // Teach the map where the OS put it. Nothing else knows: the range lands
         // in what was `Foreign` space, and only this record makes a later touch
         // demand-committable (`commit_on_demand`) rather than a fault.
@@ -2643,6 +2659,25 @@ mod tests {
         assert_eq!(second, first + len);
         // And clear of both mapping windows, which is the point of the split.
         assert!(first >= USER_MAPPING_LIMIT);
+    }
+
+    #[test]
+    fn hinted_reservation_honors_the_guest_window_and_exact_unmap_releases_it() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let hint = 0x0010_0000_0000u64; // 64 GiB, V8's measured cage hint.
+        let len = 0x0200_0000u64;
+
+        let first = arena
+            .reserve_with_hint(hint, len, raeen_core::PS5_PAGE_SIZE as u64, false)
+            .expect("hinted reservation");
+        assert_eq!(first, hint, "a free hint must be used, not discarded");
+
+        arena.munmap(first, len);
+        let second = arena
+            .reserve_with_hint(hint, len, raeen_core::PS5_PAGE_SIZE as u64, true)
+            .expect("the exact range must be reusable after whole unmap");
+        assert_eq!(second, hint);
     }
 
     /// The measured Until Dawn / Dragon Ball failure, reduced to its mechanism.

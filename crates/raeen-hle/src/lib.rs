@@ -391,6 +391,17 @@ pub trait GuestAllocator {
     fn reserve(&self, length: u64, align: u64) -> Option<u64> {
         self.mmap(length, align)
     }
+    /// Reserve address space while honoring an optional placement hint. With
+    /// `fixed`, `hint` is mandatory and the returned address must equal it.
+    /// Native runtimes override this; small test allocators retain the old
+    /// placement behavior by default.
+    fn reserve_with_hint(&self, hint: u64, length: u64, align: u64, fixed: bool) -> Option<u64> {
+        if fixed && hint == 0 {
+            None
+        } else {
+            self.reserve(length, align)
+        }
+    }
     /// Commit a mapping at a caller-selected address inside a prior virtual
     /// reservation. Test allocators reject fixed mappings by default.
     fn map_at(&self, addr: u64, length: u64, align: u64) -> Option<u64> {

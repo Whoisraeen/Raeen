@@ -68,6 +68,14 @@ pub const UNRESOLVED_STUB_BASE: u64 = 0x0000_5000_0000_0000;
 /// normal compiler abort instruction.
 pub const SYSCALL_TRAP_BYTES: [u8; 2] = [0x0F, 0x04];
 
+/// Private two-byte invalid instruction substituted for a decoded guest
+/// `cpuid`. Direct execution would otherwise expose the host CPU (Zen 4,
+/// Intel, or a compatibility layer) to software built for the PS5's custom
+/// Zen 2. The runtime VEH recognizes this marker and supplies the PS5 model.
+/// `0F 0C` is undefined in x86-64 and distinct from the syscall marker and
+/// compiler-emitted `UD2`.
+pub const CPUID_TRAP_BYTES: [u8; 2] = [0x0F, 0x0C];
+
 const R_X86_64_64: u32 = 1;
 const R_X86_64_GLOB_DAT: u32 = 6;
 const R_X86_64_JUMP_SLOT: u32 = 7;
@@ -642,6 +650,13 @@ fn link_inner(
             module.name
         );
     }
+    let patched_cpuid = patch_guest_cpuid(module, &mut image)?;
+    if patched_cpuid > 0 {
+        tracing::info!(
+            "{}: patched {patched_cpuid} native CPUID instruction(s) into PS5-model traps",
+            module.name
+        );
+    }
 
     Ok(LinkedModule {
         image,
@@ -690,6 +705,27 @@ fn link_inner(
 /// immediate or embedded table, and changing those bytes silently corrupts
 /// otherwise unrelated guest code/data.
 fn patch_guest_syscalls(module: &SprxModule, image: &mut [u8]) -> Result<usize, FirmwareError> {
+    patch_guest_instruction(
+        module,
+        image,
+        Mnemonic::Syscall,
+        SYSCALL_TRAP_BYTES,
+        "syscall",
+    )
+}
+
+/// Replace decoded guest `cpuid` instructions with the private PS5-model trap.
+fn patch_guest_cpuid(module: &SprxModule, image: &mut [u8]) -> Result<usize, FirmwareError> {
+    patch_guest_instruction(module, image, Mnemonic::Cpuid, CPUID_TRAP_BYTES, "CPUID")
+}
+
+fn patch_guest_instruction(
+    module: &SprxModule,
+    image: &mut [u8],
+    mnemonic: Mnemonic,
+    replacement: [u8; 2],
+    name: &str,
+) -> Result<usize, FirmwareError> {
     let mut sites = Vec::new();
     for segment in module
         .segments
@@ -718,12 +754,12 @@ fn patch_guest_syscalls(module: &SprxModule, image: &mut [u8]) -> Result<usize, 
         let mut decoder = Decoder::with_ip(64, bytes, segment.vaddr, DecoderOptions::NONE);
         while decoder.can_decode() {
             let instruction = decoder.decode();
-            if instruction.mnemonic() != Mnemonic::Syscall {
+            if instruction.mnemonic() != mnemonic {
                 continue;
             }
             if instruction.len() != 2 {
                 return Err(FirmwareError::MalformedDynlibData(format!(
-                    "decoded syscall at {:#x} has impossible length {}",
+                    "decoded {name} at {:#x} has impossible length {}",
                     instruction.ip(),
                     instruction.len()
                 )));
@@ -741,7 +777,7 @@ fn patch_guest_syscalls(module: &SprxModule, image: &mut [u8]) -> Result<usize, 
     sites.sort_unstable();
     sites.dedup();
     for site in &sites {
-        image[*site..*site + SYSCALL_TRAP_BYTES.len()].copy_from_slice(&SYSCALL_TRAP_BYTES);
+        image[*site..*site + replacement.len()].copy_from_slice(&replacement);
     }
     Ok(sites.len())
 }
@@ -1358,6 +1394,19 @@ mod tests {
             link_module(&module, &DynlibData::default(), &registry, &hle, 0).expect("links");
 
         assert_eq!(&linked.image[..2], &[0x0F, 0x05]);
+    }
+
+    #[test]
+    fn decoded_cpuid_is_trapped_without_corrupting_the_same_bytes_in_an_immediate() {
+        let (hle, registry) = empty_registry();
+        let mut module = test_module(8);
+        // mov eax, 0x0000a20f ; cpuid ; ret
+        module.segments[0].data = vec![0xB8, 0x0F, 0xA2, 0x00, 0x00, 0x0F, 0xA2, 0xC3];
+        let linked =
+            link_module(&module, &DynlibData::default(), &registry, &hle, 0).expect("links");
+
+        assert_eq!(&linked.image[1..3], &[0x0F, 0xA2]);
+        assert_eq!(&linked.image[5..7], &CPUID_TRAP_BYTES);
     }
 
     #[test]

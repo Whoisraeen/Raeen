@@ -9,9 +9,11 @@ pub mod dualsense;
 pub mod haptics;
 pub mod hid;
 pub mod native;
+pub mod scripted;
 pub mod xinput;
 
 pub use native::NativeGamepads;
+pub use scripted::InputScript;
 
 use tracing::info;
 

@@ -23,7 +23,7 @@
 
 use crate::{GuestCallCompletion, GuestCallRequest, HleContext, HleRegistry};
 use std::sync::atomic::Ordering;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// `SCE_OK` — the PS5 convention for "this call succeeded".
 const SCE_OK: u64 = 0;
@@ -61,6 +61,13 @@ const MAIN_TLS_MODULE_ID: u64 = 1;
 /// caller sees "negative", which is the honest signal here).
 const WRITE_EBADF: u64 = (-9i64) as u64;
 
+fn trace_file_io(ctx: &HleContext) -> bool {
+    std::env::var("RAEEN_TRACE_FILE_IO_AFTER_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u128>().ok())
+        .is_some_and(|after_ms| ctx.kernel.uptime().as_millis() >= after_ms)
+}
+
 /// Real `write(fd, buf, count)` / `sceKernelWrite` for the console
 /// descriptors (M1-C): fd 1 (stdout) and fd 2 (stderr) copy `count` guest
 /// bytes (bounded by [`WRITE_MAX_BYTES`]) to the kernel
@@ -90,6 +97,15 @@ fn hle_write(ctx: &HleContext, args: &[u64]) -> u64 {
     // descriptor (real write-back on close — savedata/output files persist).
     if fd == 1 || fd == 2 {
         ctx.kernel.console.write_bytes(&bytes);
+        if bytes
+            .windows(b"Fatal error".len())
+            .any(|window| window == b"Fatal error")
+            || bytes
+                .windows(b"unreachable code".len())
+                .any(|window| window == b"unreachable code")
+        {
+            report_guest_fatal_console(ctx, &bytes);
+        }
         return capped;
     }
     match ctx.services.write(fd as i32, &bytes) {
@@ -99,6 +115,46 @@ fn hle_write(ctx: &HleContext, args: &[u64]) -> u64 {
             WRITE_EBADF
         }
     }
+}
+
+/// Surface the call boundary around a fatal message emitted by a guest
+/// runtime. The recent-call ring is populated only for diagnostic runs
+/// (`RAEEN_TRACE_EINVAL` or `RAEEN_TRAP_CXA_THROW`), so normal execution pays
+/// only the bounded substring check in [`hle_write`].
+fn report_guest_fatal_console(ctx: &HleContext, bytes: &[u8]) {
+    let thread = ctx.guest_threads.current_thread();
+    let message = String::from_utf8_lossy(bytes);
+    let recent = ctx
+        .kernel
+        .recent_hle_calls
+        .get(&thread)
+        .map(|ring| ring.lock().iter().cloned().collect::<Vec<_>>().join(" <- "))
+        .unwrap_or_default();
+    let mut chain = Vec::new();
+    for slot in 0..128u64 {
+        let mut word = [0u8; 8];
+        if !ctx
+            .mem
+            .read(ctx.caller_rsp.wrapping_add(slot * 8), &mut word)
+        {
+            break;
+        }
+        let address = u64::from_le_bytes(word);
+        if (0x1000_0000_0000..0x1000_2000_0000).contains(&address) {
+            chain.push(format!("{address:#x}"));
+            if chain.len() >= 24 {
+                break;
+            }
+        }
+    }
+    warn!(
+        "guest fatal console on thread {thread}: {:?}; writer_ra={:#x}; recent=[{}]; \
+         stack=[{}]",
+        message.trim(),
+        ctx.caller_return_addr,
+        recent,
+        chain.join(" "),
+    );
 }
 
 /// `EBADF` (bad file descriptor) as a sign-extended negative return.
@@ -322,7 +378,13 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
     // creates it). O_CREAT is bit 0x200 in the Orbis/BSD flag set.
     const O_CREAT: i32 = 0x200;
     let creating = flags & O_CREAT != 0;
-    match ctx.kernel.filesystem.resolve_path(&path) {
+    let built_in_device = matches!(path.as_str(), "/dev/random" | "/dev/urandom");
+    let resolved = if built_in_device {
+        None
+    } else {
+        ctx.kernel.filesystem.resolve_path(&path)
+    };
+    match resolved {
         Some(host) if host.exists() || creating => {}
         Some(host) => {
             // Font-file fallback. The title reads its fonts with its OWN
@@ -360,10 +422,11 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
             return FILE_ENOENT;
         }
         None if path == "/" && !creating => {}
-        None => {
+        None if !built_in_device => {
             warn!("open: '{path}' matches no VFS mount — ENOENT");
             return FILE_ENOENT;
         }
+        None => {}
     }
 
     match ctx.services.open(&path, flags, mode) {
@@ -373,6 +436,15 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
             // fine" indistinguishable in a boot trace — the exact ambiguity that
             // hid whether the Ore-UI menu HTML is ever loaded.
             debug!("open: '{path}' -> fd {fd}");
+            if trace_file_io(ctx) {
+                info!(
+                    elapsed_ms = ctx.kernel.uptime().as_millis(),
+                    "file trace: open path='{path}' flags={flags:#x} mode={mode:#o} -> fd={fd}"
+                );
+            }
+            if built_in_device && std::env::var_os("RAEEN_TRACE_ENTROPY").is_some() {
+                info!("entropy device open: path='{path}' flags={flags:#x} -> fd={fd}");
+            }
             fd as u64
         }
         Err(e) => {
@@ -403,12 +475,40 @@ fn hle_read(ctx: &HleContext, args: &[u64]) -> u64 {
     let buf = args.get(1).copied().unwrap_or(0);
     let count = args.get(2).copied().unwrap_or(0).min(READ_MAX_BYTES);
     debug!("read(fd={fd}, buf={buf:#x}, count={count:#x})");
+    let traced_path = trace_file_io(ctx)
+        .then(|| ctx.kernel.filesystem.open_path(fd))
+        .flatten();
+    let entropy = ctx.kernel.filesystem.is_random_device(fd);
+    let traced_guard = entropy
+        .then(|| {
+            std::env::var("RAEEN_TRACE_GUARD_ADDR")
+                .ok()
+                .and_then(|value| {
+                    u64::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok()
+                })
+        })
+        .flatten();
+    let read_guard = |address| {
+        let mut bytes = [0u8; 8];
+        ctx.mem
+            .read(address, &mut bytes)
+            .then(|| u64::from_le_bytes(bytes))
+    };
+    let guard_before = traced_guard.and_then(read_guard);
 
     let Ok(n) = usize::try_from(count) else {
         return FILE_EINVAL;
     };
     match ctx.services.read(fd, n) {
         Ok(bytes) => {
+            if let Some(path) = traced_path.as_deref() {
+                info!(
+                    elapsed_ms = ctx.kernel.uptime().as_millis(),
+                    "file trace: read fd={fd} path='{path}' guest_buf={buf:#x} \
+                     count={count:#x} -> {:#x} byte(s)",
+                    bytes.len()
+                );
+            }
             if bytes.is_empty() {
                 return 0; // EOF (or an empty file) — a valid short read.
             }
@@ -418,6 +518,15 @@ fn hle_read(ctx: &HleContext, args: &[u64]) -> u64 {
                     bytes.len()
                 );
                 return FILE_EFAULT;
+            }
+            if entropy && std::env::var_os("RAEEN_TRACE_ENTROPY").is_some() {
+                info!(
+                    "entropy device read: fd={fd} guest_buf={buf:#x} count={count:#x} -> {} \
+                     byte(s), guard={:#x?}->{:#x?}",
+                    bytes.len(),
+                    guard_before,
+                    traced_guard.and_then(read_guard),
+                );
             }
             bytes.len() as u64
         }
@@ -440,6 +549,9 @@ fn hle_pread(ctx: &HleContext, args: &[u64]) -> u64 {
     let count = args.get(2).copied().unwrap_or(0).min(READ_MAX_BYTES);
     let offset = args.get(3).copied().unwrap_or(0);
     debug!("pread(fd={fd}, buf={buf:#x}, count={count:#x}, offset={offset:#x})");
+    let traced_path = trace_file_io(ctx)
+        .then(|| ctx.kernel.filesystem.open_path(fd))
+        .flatten();
 
     if (offset as i64) < 0 {
         return FILE_EINVAL;
@@ -449,6 +561,14 @@ fn hle_pread(ctx: &HleContext, args: &[u64]) -> u64 {
     };
     match ctx.kernel.filesystem.pread(fd, n, offset) {
         Ok(bytes) => {
+            if let Some(path) = traced_path.as_deref() {
+                info!(
+                    elapsed_ms = ctx.kernel.uptime().as_millis(),
+                    "file trace: pread fd={fd} path='{path}' guest_buf={buf:#x} \
+                     count={count:#x} offset={offset:#x} -> {:#x} byte(s)",
+                    bytes.len()
+                );
+            }
             if bytes.is_empty() {
                 return 0; // EOF (or a read wholly past it) — a valid short read.
             }
@@ -1851,6 +1971,12 @@ fn hle_getargv(ctx: &HleContext, _args: &[u64]) -> u64 {
 // Memory
 // ---------------------------------------------------------------------
 
+fn trace_guest_vmm(message: std::fmt::Arguments<'_>) {
+    if std::env::var_os("RAEEN_TRACE_GUEST_VMM").is_some() {
+        warn!("guest VMM: {message}");
+    }
+}
+
 /// Real signature: `sceKernelAllocateDirectMemory(off_t searchStart, off_t
 /// searchEnd, size_t len, size_t alignment, int memoryType, off_t
 /// *physAddrOut)`.
@@ -1944,6 +2070,10 @@ fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
         return HLE_ERROR;
     };
     ctx.kernel.memory.record_mapping(addr, len, DEFAULT_PROT);
+    trace_guest_vmm(format_args!(
+        "allocate-direct search={search_start:#x}..{search_end:#x} len={len:#x} \
+         align={alignment:#x} type={memory_type} -> phys={addr:#x}"
+    ));
 
     if !ctx.mem.write(phys_addr_out, &addr.to_le_bytes()) {
         warn!("sceKernelAllocateDirectMemory: physAddrOut {phys_addr_out:#x} out of bounds");
@@ -1989,6 +2119,7 @@ fn hle_release_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     if std::env::var_os("RAEEN_TRACE_DIRECT_MEMORY").is_some() {
         warn!("direct-memory trace: release phys={start:#x} len={len:#x}");
     }
+    trace_guest_vmm(format_args!("release-direct phys={start:#x} len={len:#x}"));
     // `start` is a physical-memory OFFSET; 0 is a perfectly valid one (a title
     // whose direct-memory pool begins at physical 0 releases [0, len)). Only a
     // zero length is invalid. Rejecting start==0 returned SCE EINVAL, and the
@@ -2088,6 +2219,10 @@ fn hle_map_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
         return HLE_ERROR;
     };
     ctx.kernel.memory.record_mapping(mapped, len, prot);
+    trace_guest_vmm(format_args!(
+        "map-direct requested={requested:#x} phys={direct_memory_start:#x} len={len:#x} \
+         align={alignment:#x} prot={prot:#x} -> {mapped:#x}"
+    ));
     if !ctx.mem.write(addr_out, &mapped.to_le_bytes()) {
         if requested != 0 {
             ctx.alloc.munmap(mapped, len);
@@ -2152,6 +2287,10 @@ fn hle_batch_map(ctx: &HleContext, args: &[u64]) -> u64 {
                  len={length:#x} prot={prot:#x}"
             );
         }
+        trace_guest_vmm(format_args!(
+            "batch[{i}] op={operation} start={start:#x} phys={offset:#x} \
+             len={length:#x} prot={prot:#x}"
+        ));
         let ok = match operation {
             OP_MAP_DIRECT | OP_MAP_FLEXIBLE => {
                 if length == 0 {
@@ -2225,6 +2364,9 @@ fn hle_map_flexible_memory(ctx: &HleContext, args: &[u64]) -> u64 {
         return HLE_ERROR;
     };
     ctx.kernel.memory.record_mapping(addr, len, prot);
+    trace_guest_vmm(format_args!(
+        "map-flexible len={len:#x} prot={prot:#x} -> {addr:#x}"
+    ));
 
     if addr_out != 0 && !ctx.mem.write(addr_out, &addr.to_le_bytes()) {
         warn!("sceKernelMapFlexibleMemory: addrOut {addr_out:#x} out of bounds");
@@ -2246,6 +2388,7 @@ fn hle_munmap(ctx: &HleContext, args: &[u64]) -> u64 {
     let addr = args.first().copied().unwrap_or(0);
     let len = args.get(1).copied().unwrap_or(0);
     debug!("sceKernelMunmap(addr={addr:#x}, len={len:#x})");
+    trace_guest_vmm(format_args!("unmap addr={addr:#x} len={len:#x}"));
 
     ctx.alloc.munmap(addr, len);
     ctx.kernel.memory.remove_mapping(addr);
@@ -2279,6 +2422,9 @@ fn hle_mmap(ctx: &HleContext, args: &[u64]) -> u64 {
         return 0;
     };
     ctx.kernel.memory.record_mapping(mapped, len, prot);
+    trace_guest_vmm(format_args!(
+        "mmap hint={addr:#x} len={len:#x} prot={prot:#x} flags={flags:#x} -> {mapped:#x}"
+    ));
     mapped
 }
 
@@ -2923,6 +3069,9 @@ fn hle_posix_mprotect(ctx: &HleContext, args: &[u64]) -> u64 {
     let len = args.get(1).copied().unwrap_or(0);
     let prot = args.get(2).copied().unwrap_or(0) as u32;
     debug!("mprotect(addr={addr:#x}, len={len:#x}, prot={prot:#x})");
+    trace_guest_vmm(format_args!(
+        "mprotect addr={addr:#x} len={len:#x} prot={prot:#x}"
+    ));
     // Apply the protection when enforcement is on; a no-op otherwise (the arena
     // default). POSIX `mprotect` returns 0 on success.
     if ctx.mem.protect(addr, len, prot) {
@@ -2940,6 +3089,9 @@ fn hle_kernel_mprotect(ctx: &HleContext, args: &[u64]) -> u64 {
     let len = args.get(1).copied().unwrap_or(0);
     let prot = args.get(2).copied().unwrap_or(0) as u32;
     debug!("sceKernelMprotect(addr={addr:#x}, len={len:#x}, prot={prot:#x})");
+    trace_guest_vmm(format_args!(
+        "kernel-mprotect addr={addr:#x} len={len:#x} prot={prot:#x}"
+    ));
     if ctx.mem.protect(addr, len, prot) {
         SCE_OK
     } else {
@@ -3205,19 +3357,34 @@ fn hle_check_reachability(ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_reserve_virtual_range(ctx: &HleContext, args: &[u64]) -> u64 {
     let addr_inout = args.first().copied().unwrap_or(0);
     let len = args.get(1).copied().unwrap_or(0);
-    let align = args
-        .get(3)
-        .copied()
-        .unwrap_or(0)
-        .max(raeen_core::PS5_PAGE_SIZE as u64);
+    let flags = args.get(2).copied().unwrap_or(0) as u32;
+    let page = raeen_core::PS5_PAGE_SIZE as u64;
+    let requested_align = args.get(3).copied().unwrap_or(0);
     if addr_inout == 0 || len == 0 {
         return SCE_KERNEL_ERROR_EINVAL;
     }
-    let Some(addr) = ctx.alloc.reserve(len, align) else {
+    if len % page != 0
+        || (requested_align != 0 && (!requested_align.is_power_of_two() || requested_align < page))
+    {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let align = requested_align.max(page);
+    let mut requested_bytes = [0u8; 8];
+    if !ctx.mem.read(addr_inout, &mut requested_bytes) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    let requested = u64::from_le_bytes(requested_bytes);
+    const MAP_FIXED: u32 = 0x10;
+    let fixed = flags & MAP_FIXED != 0;
+    let Some(addr) = ctx.alloc.reserve_with_hint(requested, len, align, fixed) else {
         warn!("sceKernelReserveVirtualRange: address-space reservation failed (len={len:#x})");
         return HLE_ERROR;
     };
     ctx.kernel.memory.record_mapping(addr, len, 0);
+    trace_guest_vmm(format_args!(
+        "reserve hint={requested:#x} len={len:#x} flags={flags:#x} \
+         align={align:#x} fixed={fixed} -> {addr:#x}"
+    ));
     if !ctx.mem.write(addr_inout, &addr.to_le_bytes()) {
         ctx.alloc.munmap(addr, len);
         ctx.kernel.memory.remove_mapping(addr);
@@ -3427,6 +3594,7 @@ fn hle_mkdir(ctx: &HleContext, args: &[u64]) -> u64 {
 const ORBIS_STAT_SIZE: usize = 120;
 const ORBIS_MODE_DIRECTORY: u16 = 0x41ff;
 const ORBIS_MODE_REGULAR: u16 = 0x81ff;
+const ORBIS_MODE_CHARACTER: u16 = 0x21ff;
 
 /// `sceKernelStat(path, stat_out)`: report real metadata for any mounted VFS
 /// path. The 120-byte layout is the public Orbis/FreeBSD ABI used by titles.
@@ -3440,6 +3608,9 @@ fn hle_stat(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_EFAULT;
     };
     let path = String::from_utf8_lossy(&path_bytes);
+    if matches!(path.as_ref(), "/dev/random" | "/dev/urandom") {
+        return write_orbis_device_stat(ctx, stat_out);
+    }
     match ctx.kernel.filesystem.metadata(&path) {
         Ok(metadata) => write_orbis_stat(ctx, stat_out, &metadata),
         Err(error) => {
@@ -3453,6 +3624,18 @@ fn hle_stat(ctx: &HleContext, args: &[u64]) -> u64 {
             }
             SCE_KERNEL_ERROR_ENOENT
         }
+    }
+}
+
+fn write_orbis_device_stat(ctx: &HleContext, stat_out: u64) -> u64 {
+    let mut stat = [0u8; ORBIS_STAT_SIZE];
+    stat[4..8].copy_from_slice(&1u32.to_le_bytes());
+    stat[8..10].copy_from_slice(&ORBIS_MODE_CHARACTER.to_le_bytes());
+    stat[10..12].copy_from_slice(&1u16.to_le_bytes());
+    if ctx.mem.write(stat_out, &stat) {
+        SCE_OK
+    } else {
+        SCE_KERNEL_ERROR_EFAULT
     }
 }
 
@@ -3638,17 +3821,25 @@ fn hle_path_metadata_accept(ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_fstat(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0);
     let stat_out = args.get(1).copied().unwrap_or(0);
-    let size = if fd <= 2 {
+    let character_device = fd <= 2 || ctx.kernel.filesystem.is_random_device(fd as i32);
+    let size = if character_device {
         0
-    } else if let Some(size) = ctx.kernel.filesystem.file_size(fd as i32) {
-        size
+    } else if let Some(file_size) = ctx.kernel.filesystem.file_size(fd as i32) {
+        file_size
     } else {
         warn!("fstat(fd={fd}): no file table backing — EBADF");
         return WRITE_EBADF;
     };
     if stat_out != 0 {
         let mut stat = [0u8; ORBIS_STAT_SIZE];
-        stat[8..10].copy_from_slice(&ORBIS_MODE_REGULAR.to_le_bytes());
+        stat[8..10].copy_from_slice(
+            &(if character_device {
+                ORBIS_MODE_CHARACTER
+            } else {
+                ORBIS_MODE_REGULAR
+            })
+            .to_le_bytes(),
+        );
         stat[10..12].copy_from_slice(&1u16.to_le_bytes());
         stat[72..80].copy_from_slice(&size.to_le_bytes());
         stat[80..88].copy_from_slice(&size.div_ceil(512).to_le_bytes());
@@ -3701,12 +3892,29 @@ fn hle_pthread_once(ctx: &HleContext, args: &[u64]) -> u64 {
     if !ctx.mem.read(init, &mut entry_probe) {
         return SCE_KERNEL_ERROR_EFAULT;
     }
+    let trace_once = std::env::var_os("RAEEN_TRACE_PTHREAD_ONCE").is_some();
+    let mut logged_wait = false;
     loop {
         match ctx.mem.atomic_load_u32(once) {
-            Some(ONCE_DONE) => return SCE_OK,
+            Some(ONCE_DONE) => {
+                if trace_once {
+                    info!(
+                        "pthread_once trace: thread={} once={once:#x} init={init:#x} already done",
+                        ctx.guest_threads.current_thread()
+                    );
+                }
+                return SCE_OK;
+            }
             Some(ONCE_IN_PROGRESS) => {
                 if ctx.guest_threads.process_is_terminating() {
                     return SCE_KERNEL_ERROR_EAGAIN;
+                }
+                if trace_once && !logged_wait {
+                    info!(
+                        "pthread_once trace: thread={} once={once:#x} init={init:#x} waiting",
+                        ctx.guest_threads.current_thread()
+                    );
+                    logged_wait = true;
                 }
                 std::thread::yield_now();
             }
@@ -3739,6 +3947,12 @@ fn hle_pthread_once(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_EAGAIN;
     }
 
+    if trace_once {
+        info!(
+            "pthread_once trace: thread={} once={once:#x} init={init:#x} claimed callback",
+            ctx.guest_threads.current_thread()
+        );
+    }
     debug!("pthread_once(once={once:#x}, init={init:#x}) -> deferred guest call");
     SCE_OK
 }
@@ -5231,6 +5445,37 @@ mod tests {
         assert_eq!(hle_sce_open(&ctx, &[0x300, 0, 0]), 0x8002_0002);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dev_urandom_opens_and_fills_guest_memory() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x100, b"/dev/urandom\0"));
+        let fd = hle_open(&ctx, &[0x100, 0, 0]);
+        assert!(
+            (fd as i64) >= 3,
+            "random device open returned {}",
+            fd as i64
+        );
+        assert_eq!(hle_stat(&ctx, &[0x100, 0x300]), SCE_OK);
+        assert_eq!(hle_fstat(&ctx, &[fd, 0x400]), SCE_OK);
+        let mut path_mode = [0u8; 2];
+        let mut fd_mode = [0u8; 2];
+        assert!(mem.read(0x308, &mut path_mode));
+        assert!(mem.read(0x408, &mut fd_mode));
+        assert_eq!(u16::from_le_bytes(path_mode), ORBIS_MODE_CHARACTER);
+        assert_eq!(u16::from_le_bytes(fd_mode), ORBIS_MODE_CHARACTER);
+
+        assert!(mem.write(0x200, &[0xAA; 32]));
+        assert_eq!(hle_read(&ctx, &[fd, 0x200, 32]), 32);
+        let mut random = [0xAA; 32];
+        assert!(mem.read(0x200, &mut random));
+        assert_ne!(random, [0xAA; 32], "entropy read must overwrite the buffer");
+        assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
     }
 
     /// `pread` reads at an absolute offset WITHOUT moving the cursor — a

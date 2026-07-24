@@ -1,10 +1,11 @@
 //! HLE libScePad — Controller input interface.
 
 use crate::{HleContext, HleRegistry};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tracing::{debug, info, warn};
 
 static FIRST_GUEST_PAD_READ: AtomicBool = AtomicBool::new(false);
+static LAST_TRACED_GUEST_BUTTONS: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// Register libScePad HLE functions.
 pub fn register(registry: &HleRegistry) {
@@ -279,14 +280,22 @@ fn hle_pad_read_state(ctx: &HleContext, args: &[u64]) -> u64 {
         .kernel
         .pad_state()
         .unwrap_or_else(|| raeen_input::ControllerState::default().to_orbis_pad_data());
+    let buttons = u32::from_le_bytes(prefix[0..4].try_into().expect("fixed prefix"));
+    if std::env::var_os("RAEEN_TRACE_PAD").is_some()
+        && LAST_TRACED_GUEST_BUTTONS.swap(buttons, Ordering::Relaxed) != buttons
+    {
+        info!(
+            handle,
+            data = format_args!("{data:#x}"),
+            buttons = format_args!("{buttons:#010x}"),
+            "guest consumed a new controller button state"
+        );
+    }
     if !FIRST_GUEST_PAD_READ.swap(true, Ordering::Relaxed) {
         info!(
             handle,
             data = format_args!("{data:#x}"),
-            buttons = format_args!(
-                "{:#010x}",
-                u32::from_le_bytes(prefix[0..4].try_into().expect("fixed prefix"))
-            ),
+            buttons = format_args!("{buttons:#010x}"),
             left_stick = ?&prefix[4..6],
             right_stick = ?&prefix[6..8],
             "first guest controller read consumed the host pad snapshot"
