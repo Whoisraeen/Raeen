@@ -1188,6 +1188,21 @@ fn main() -> anyhow::Result<()> {
                 &addrs,
             );
         }
+        // `RAEEN_REPEAT_TRAP_ADDR` is the repeatable form for code paths that
+        // execute more than once. The runtime accepts only instructions it can
+        // emulate exactly without changing flags or memory (currently
+        // `mov r32, imm32`), and skips every other site loudly.
+        if let Ok(list) = std::env::var("RAEEN_REPEAT_TRAP_ADDR") {
+            let addrs: Vec<u64> = list
+                .split(',')
+                .filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                .collect();
+            raeen_runtime::export_trap::install_repeating_addr_traps(
+                &mut linked.image,
+                raeen_runtime::GUEST_ARENA_BASE,
+                &addrs,
+            );
+        }
         let linked = std::sync::Arc::new(linked);
         info!(
             "loaded: entry={:#x} image={:#x} byte(s) resolved={} unresolved={}",

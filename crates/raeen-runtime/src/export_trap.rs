@@ -1,4 +1,4 @@
-//! One-shot **module-export call trap** (diagnostic, env-gated).
+//! Module-export and arbitrary-address traps (diagnostic, env-gated).
 //!
 //! Answers "does the title ever CALL into this module's exports, and from
 //! where?" with near-zero overhead. Gated by `RAEEN_TRAP_MODULE_EXPORTS=<sub>`
@@ -17,8 +17,11 @@
 //!    same RIP. Every later call runs the untouched original at native speed.
 //!
 //! Unlike [`crate::native_trap`] (a log-every-call detour through relocated
-//! prologue stubs), this is a one-shot presence probe: it never needs the
-//! prologue to be position-independent and costs one fault per export ever.
+//! prologue stubs), export and ordinary address traps are one-shot presence
+//! probes: they never need the prologue to be position-independent and cost one
+//! fault per site ever. `RAEEN_REPEAT_TRAP_ADDR` is the deliberately narrow
+//! exception: supported side-effect-free instructions are emulated while their
+//! breakpoint remains armed.
 //!
 //! Deliberately free of `windows_sys`: pure bookkeeping over [`GuestMemory`],
 //! so the mechanics unit-test on any host. The VEH glue lives in `dispatch`.
@@ -26,6 +29,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
 use raeen_hle::GuestMemory;
 use tracing::{debug, warn};
 
@@ -36,9 +40,51 @@ struct ExportTrap {
     module: String,
     nid: u64,
     orig: u8,
+    repeat_action: Option<RepeatAction>,
     /// One-shot: set on the first hit (byte restored). A concurrent second
     /// fault on the same address resumes silently — see [`take_hit`].
     hit: bool,
+    /// Per-site count. Repeatable probes can suppress their early diagnostics
+    /// with `RAEEN_REPEAT_TRAP_LOG_AFTER` while still emulating every hit.
+    hit_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepeatAction {
+    Mov32 {
+        register: TrapRegister,
+        value: u32,
+        len: u8,
+    },
+}
+
+/// Register write required when a repeatable diagnostic trap emulates the
+/// side-effect-free instruction it replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrapRegister {
+    Rax,
+    Rcx,
+    Rdx,
+    Rbx,
+    Rsp,
+    Rbp,
+    Rsi,
+    Rdi,
+    R8,
+    R9,
+    R10,
+    R11,
+    R12,
+    R13,
+    R14,
+    R15,
+}
+
+/// How the VEH should resume after servicing one of our breakpoints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrapHit {
+    pub resume_rip: u64,
+    pub register_write: Option<(TrapRegister, u64)>,
 }
 
 #[derive(Default)]
@@ -148,7 +194,9 @@ pub fn install_module_exports(
                 module: module_name.to_string(),
                 nid,
                 orig,
+                repeat_action: None,
                 hit: false,
+                hit_count: 0,
             },
         );
         installed += 1;
@@ -167,6 +215,22 @@ pub fn install_module_exports(
 /// is `addr-trap`, so a hit logs the address + caller like any export trap.
 /// `addrs` are module-relative (0-based); `base` is the guest arena base.
 pub fn install_addr_traps(image: &mut [u8], base: u64, addrs: &[u64]) -> usize {
+    install_addr_traps_inner(image, base, addrs, false)
+}
+
+/// Arm repeatable arbitrary-address probes.
+///
+/// Repeating a software breakpoint normally requires single-stepping the
+/// restored instruction, which conflicts with Raeen's FS-base rearm
+/// trampoline. Instead, this diagnostic accepts only instructions that can be
+/// emulated exactly without memory or flag side effects. It currently supports
+/// `mov r32, imm32`, leaves the `int3` armed, and resumes after the original
+/// instruction. Unsupported addresses are skipped loudly.
+pub fn install_repeating_addr_traps(image: &mut [u8], base: u64, addrs: &[u64]) -> usize {
+    install_addr_traps_inner(image, base, addrs, true)
+}
+
+fn install_addr_traps_inner(image: &mut [u8], base: u64, addrs: &[u64], repeating: bool) -> usize {
     let mut reg = REG
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -184,6 +248,18 @@ pub fn install_addr_traps(image: &mut [u8], base: u64, addrs: &[u64]) -> usize {
         if orig == INT3 {
             continue;
         }
+        let repeat_action = if repeating {
+            let Some(action) = decode_repeat_action(&image[off..], addr) else {
+                warn!(
+                    "export_trap: repeatable address {addr:#x} is not a supported \
+                     side-effect-free instruction; skipping"
+                );
+                continue;
+            };
+            Some(action)
+        } else {
+            None
+        };
         image[off] = INT3;
         r.traps.insert(
             addr,
@@ -191,20 +267,64 @@ pub fn install_addr_traps(image: &mut [u8], base: u64, addrs: &[u64]) -> usize {
                 module: "addr-trap".to_string(),
                 nid: value,
                 orig,
+                repeat_action,
                 hit: false,
+                hit_count: 0,
             },
         );
         installed += 1;
     }
-    warn!("export_trap: armed {installed} arbitrary-address one-shot trap(s)");
+    let kind = if repeating { "repeatable" } else { "one-shot" };
+    warn!("export_trap: armed {installed} arbitrary-address {kind} trap(s)");
     installed
+}
+
+fn decode_repeat_action(bytes: &[u8], ip: u64) -> Option<RepeatAction> {
+    let mut decoder = Decoder::with_ip(
+        64,
+        bytes.get(..15.min(bytes.len()))?,
+        ip,
+        DecoderOptions::NONE,
+    );
+    let instruction = decoder.decode();
+    if instruction.is_invalid()
+        || instruction.mnemonic() != Mnemonic::Mov
+        || instruction.op0_kind() != OpKind::Register
+        || instruction.op1_kind() != OpKind::Immediate32
+    {
+        return None;
+    }
+    let register = match instruction.op0_register() {
+        Register::EAX => TrapRegister::Rax,
+        Register::ECX => TrapRegister::Rcx,
+        Register::EDX => TrapRegister::Rdx,
+        Register::EBX => TrapRegister::Rbx,
+        Register::ESP => TrapRegister::Rsp,
+        Register::EBP => TrapRegister::Rbp,
+        Register::ESI => TrapRegister::Rsi,
+        Register::EDI => TrapRegister::Rdi,
+        Register::R8D => TrapRegister::R8,
+        Register::R9D => TrapRegister::R9,
+        Register::R10D => TrapRegister::R10,
+        Register::R11D => TrapRegister::R11,
+        Register::R12D => TrapRegister::R12,
+        Register::R13D => TrapRegister::R13,
+        Register::R14D => TrapRegister::R14,
+        Register::R15D => TrapRegister::R15,
+        _ => return None,
+    };
+    Some(RepeatAction::Mov32 {
+        register,
+        value: instruction.immediate32(),
+        len: instruction.len() as u8,
+    })
 }
 
 /// Service a breakpoint at `fault_addr` if it is one of our traps.
 ///
-/// Returns `true` if the address is (or was) a registered export trap. The
-/// caller must resume at `fault_addr`, where the original byte is back in
-/// place. Returns `false` for unrelated breakpoints, or if the byte
+/// Returns a resume disposition if the address is (or was) a registered trap.
+/// One-shot callers resume at `fault_addr`, where the original byte is back in
+/// place. Returns `None` for unrelated breakpoints, or if the byte
 /// could not be restored (resuming would fault forever, so the caller should
 /// pass the exception on and let the run die loudly).
 ///
@@ -213,34 +333,62 @@ pub fn install_addr_traps(image: &mut [u8], base: u64, addrs: &[u64]) -> usize {
 /// A concurrent second fault (another thread already fetched the `int3`
 /// before the restore) finds `hit == true` and resumes silently.
 #[must_use]
-pub fn take_hit(fault_addr: u64, mem: &dyn GuestMemory, regs: &TrapRegisters) -> bool {
+pub fn take_hit(fault_addr: u64, mem: &dyn GuestMemory, regs: &TrapRegisters) -> Option<TrapHit> {
     let mut reg = REG
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(r) = reg.as_mut() else {
-        return false;
-    };
+    let r = reg.as_mut()?;
     let hits_so_far = r.hits;
-    let Some(trap) = r.traps.get_mut(&fault_addr) else {
-        return false;
-    };
+    let trap = r.traps.get_mut(&fault_addr)?;
     if trap.hit {
         // Lost the race with the restoring thread — the original byte is
         // already back; just re-execute it.
-        return true;
+        return Some(TrapHit {
+            resume_rip: fault_addr,
+            register_write: None,
+        });
     }
-    // `patch_code`, not `write`: this restores a byte in the CODE image, which
-    // is read-only under W^X. `patch_code` lifts the write bar transiently; it
-    // is a plain write when W^X is off.
-    if !mem.patch_code(fault_addr, &[trap.orig]) {
-        warn!(
-            "export_trap: {} nid={:#018x} hit at {fault_addr:#x} but the original byte could \
+    let disposition = if let Some(RepeatAction::Mov32 {
+        register,
+        value,
+        len,
+    }) = trap.repeat_action
+    {
+        TrapHit {
+            resume_rip: fault_addr.wrapping_add(u64::from(len)),
+            // A 32-bit x86 register write zero-extends into the corresponding
+            // 64-bit register.
+            register_write: Some((register, u64::from(value))),
+        }
+    } else {
+        // `patch_code`, not `write`: this restores a byte in the CODE image, which
+        // is read-only under W^X. `patch_code` lifts the write bar transiently; it
+        // is a plain write when W^X is off.
+        if !mem.patch_code(fault_addr, &[trap.orig]) {
+            warn!(
+                "export_trap: {} nid={:#018x} hit at {fault_addr:#x} but the original byte could \
              not be restored — passing the breakpoint on",
-            trap.module, trap.nid
-        );
-        return false;
+                trap.module, trap.nid
+            );
+            return None;
+        }
+        trap.hit = true;
+        TrapHit {
+            resume_rip: fault_addr,
+            register_write: None,
+        }
+    };
+    trap.hit_count = trap.hit_count.saturating_add(1);
+    let repeat_log_after = std::env::var("RAEEN_REPEAT_TRAP_LOG_AFTER")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let verbose = trap.repeat_action.is_none() || trap.hit_count >= repeat_log_after;
+    if !verbose {
+        r.hits = r.hits.saturating_add(1);
+        return Some(disposition);
     }
-    trap.hit = true;
     let mut bytes = [0u8; 8];
     let caller = if mem.read(regs.rsp, &mut bytes) {
         u64::from_le_bytes(bytes)
@@ -249,11 +397,19 @@ pub fn take_hit(fault_addr: u64, mem: &dyn GuestMemory, regs: &TrapRegisters) ->
     };
     let n = hits_so_far + 1;
     r.hits = n;
-    warn!(
-        "EXPORT-TRAP hit #{n}: {} nid={:#018x} entry={fault_addr:#x} caller={caller:#x} \
-         (byte restored, further calls run native)",
-        trap.module, trap.nid
-    );
+    if trap.repeat_action.is_some() {
+        warn!(
+            "EXPORT-TRAP hit #{n}: {} nid={:#018x} entry={fault_addr:#x} caller={caller:#x} \
+             (instruction emulated, repeatable trap remains armed)",
+            trap.module, trap.nid
+        );
+    } else {
+        warn!(
+            "EXPORT-TRAP hit #{n}: {} nid={:#018x} entry={fault_addr:#x} caller={caller:#x} \
+             (byte restored, further calls run native)",
+            trap.module, trap.nid
+        );
+    }
     if trap.module == "addr-trap" && std::env::var_os("RAEEN_TRACE_STACK_GUARD").is_some() {
         let read_u64 = |address| {
             let mut bytes = [0u8; 8];
@@ -320,6 +476,50 @@ pub fn take_hit(fault_addr: u64, mem: &dyn GuestMemory, regs: &TrapRegisters) ->
             regs.r14,
             around.as_deref().unwrap_or("<unreadable>"),
         );
+        if trap.repeat_action.is_some() {
+            let code = regs.rsi;
+            let compression_base = code & 0xffff_ffff_0000_0000;
+            let relocation_compressed = read_u32(code.wrapping_add(3));
+            let relocation = relocation_compressed
+                .map(u64::from)
+                .map(|value| compression_base | value);
+            let relocation_length_smi =
+                relocation.and_then(|address| read_u32(address.wrapping_add(3)));
+            let relocation_length = relocation_length_smi.map(|value| value >> 1);
+            let hex = |address: u64, length: usize| {
+                let mut bytes = vec![0u8; length];
+                mem.read(address, &mut bytes).then(|| {
+                    bytes
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+            };
+            let code_bytes = hex(code.saturating_sub(1), 0x90);
+            let relocation_object =
+                relocation.and_then(|address| hex(address.saturating_sub(1), 0x40));
+            let relocation_bytes =
+                relocation
+                    .zip(relocation_length)
+                    .and_then(|(address, length)| {
+                        usize::try_from(length)
+                            .ok()
+                            .map(|length| length.min(0x100))
+                            .and_then(|length| hex(address.wrapping_add(7), length))
+                    });
+            warn!(
+                "ADDR-TRAP Cohtml code: tagged={code:#x} compression_base={compression_base:#x} \
+                 relocation_compressed={relocation_compressed:#x?} relocation={relocation:#x?} \
+                 relocation_length_smi={relocation_length_smi:#x?} \
+                 relocation_length={relocation_length:#x?}\n\
+                 code[-1..+0x8f]={}\nrelocation_object[-1..+0x3f]={}\n\
+                 relocation_data={}",
+                code_bytes.as_deref().unwrap_or("<unreadable>"),
+                relocation_object.as_deref().unwrap_or("<unreadable>"),
+                relocation_bytes.as_deref().unwrap_or("<unreadable>"),
+            );
+        }
     }
     if trap.module == "addr-trap" && std::env::var_os("RAEEN_TRACE_ADDR_MEMORY").is_some() {
         let dump = |label: &str, center: u64| {
@@ -380,7 +580,7 @@ pub fn take_hit(fault_addr: u64, mem: &dyn GuestMemory, regs: &TrapRegisters) ->
         }
         warn!("ADDR-TRAP frame chain:\n{}", frames.join("\n"));
     }
-    true
+    Some(disposition)
 }
 
 #[cfg(test)]
@@ -470,16 +670,16 @@ mod tests {
             rsp: base + rsp_off,
             ..TrapRegisters::default()
         };
-        assert!(!take_hit(base + 0x11, &mem, &regs));
+        assert!(take_hit(base + 0x11, &mem, &regs).is_none());
 
         // First hit: handled, byte restored.
-        assert!(take_hit(base + 0x10, &mem, &regs));
+        assert!(take_hit(base + 0x10, &mem, &regs).is_some());
         let mut b = [0u8; 1];
         assert!(mem.read(base + 0x10, &mut b));
         assert_eq!(b[0], 0x55, "original entry byte permanently restored");
 
         // Second hit (the concurrent-race path): still handled, byte intact.
-        assert!(take_hit(base + 0x10, &mem, &regs));
+        assert!(take_hit(base + 0x10, &mem, &regs).is_some());
         assert!(mem.read(base + 0x10, &mut b));
         assert_eq!(b[0], 0x55);
     }
@@ -507,6 +707,30 @@ mod tests {
     }
 
     #[test]
+    fn repeatable_mov_immediate_is_emulated_and_remains_armed() {
+        let base = 0x7250_0000_0000;
+        let mut image = vec![0u8; 0x40];
+        // mov edx, 0x1f3e
+        image[0x10..0x15].copy_from_slice(&[0xba, 0x3e, 0x1f, 0, 0]);
+        assert_eq!(install_repeating_addr_traps(&mut image, base, &[0x10]), 1);
+        assert_eq!(image[0x10], INT3);
+        let mem = TestMem {
+            base,
+            bytes: Mutex::new(image),
+        };
+
+        for _ in 0..2 {
+            let hit = take_hit(base + 0x10, &mem, &TrapRegisters::default())
+                .expect("repeatable trap handled");
+            assert_eq!(hit.resume_rip, base + 0x15);
+            assert_eq!(hit.register_write, Some((TrapRegister::Rdx, 0x1f3e)));
+            let mut byte = [0u8; 1];
+            assert!(mem.read(base + 0x10, &mut byte));
+            assert_eq!(byte[0], INT3, "repeatable breakpoint remains armed");
+        }
+    }
+
+    #[test]
     fn unrestorable_byte_is_not_claimed() {
         let base = 0x7300_0000_0000;
         let mut image = vec![0u8; 0x20];
@@ -523,13 +747,13 @@ mod tests {
                 false
             }
         }
-        assert!(!take_hit(base + 0x4, &NoWrite, &TrapRegisters::default()));
+        assert!(take_hit(base + 0x4, &NoWrite, &TrapRegisters::default()).is_none());
         // And it stays armed: a later fault with working memory succeeds.
         let mem = TestMem {
             base,
             bytes: Mutex::new(image),
         };
-        assert!(take_hit(base + 0x4, &mem, &TrapRegisters::default()));
+        assert!(take_hit(base + 0x4, &mem, &TrapRegisters::default()).is_some());
         let mut b = [0u8; 1];
         assert!(mem.read(base + 0x4, &mut b));
         assert_eq!(b[0], 0x55);

@@ -309,9 +309,19 @@ fn run_isolated_child(
     path: &Path,
     control: &std::sync::Arc<std::sync::Mutex<ProcessControl>>,
 ) -> SessionOutcome {
+    let frame_receiver = match raeen_gpu::frame_ipc::FrameIpcReceiver::create() {
+        Ok(receiver) => std::sync::Arc::new(receiver),
+        Err(error) => {
+            return SessionOutcome::Faulted(format!(
+                "Cannot create isolated runner frame bridge: {error}"
+            ));
+        }
+    };
+    raeen_gpu::frame_ipc::install_receiver(std::sync::Arc::clone(&frame_receiver));
     let executable = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {
+            raeen_gpu::frame_ipc::clear_receiver(&frame_receiver);
             return SessionOutcome::Faulted(format!("Cannot locate raeen runner: {error}"));
         }
     };
@@ -319,6 +329,7 @@ fn run_isolated_child(
         .arg("--run-eboot")
         .arg(path)
         .env("RAEEN_RUNNER_CHILD", "1")
+        .env(raeen_gpu::frame_ipc::FRAME_IPC_ENV, frame_receiver.name())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
@@ -326,6 +337,7 @@ fn run_isolated_child(
     {
         Ok(child) => child,
         Err(error) => {
+            raeen_gpu::frame_ipc::clear_receiver(&frame_receiver);
             return SessionOutcome::Faulted(format!("Cannot start isolated runner: {error}"));
         }
     };
@@ -334,6 +346,7 @@ fn run_isolated_child(
         Ok(job) => job,
         Err(error) => {
             let _ = child.kill();
+            raeen_gpu::frame_ipc::clear_receiver(&frame_receiver);
             return SessionOutcome::Faulted(error);
         }
     };
@@ -357,6 +370,7 @@ fn run_isolated_child(
             match state.runner.as_mut().expect("runner published").try_wait() {
                 Ok(status) => status,
                 Err(error) => {
+                    raeen_gpu::frame_ipc::clear_receiver(&frame_receiver);
                     return SessionOutcome::Faulted(format!(
                         "Cannot query isolated runner: {error}"
                     ));
@@ -364,6 +378,7 @@ fn run_isolated_child(
             }
         };
         if let Some(status) = status {
+            raeen_gpu::frame_ipc::clear_receiver(&frame_receiver);
             let mut state = control.lock().unwrap();
             state.runner.take();
             if let Some(job) = state.job.take() {

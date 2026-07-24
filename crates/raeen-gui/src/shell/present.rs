@@ -30,6 +30,15 @@ use std::time::{Duration, Instant};
 /// process-owned and monotonic, so measuring its delta over real elapsed time
 /// stays honest even when egui repaints faster (or slower) than the title.
 const FPS_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+/// Keep the child-runner sequence space distinct from the Shell's process-local
+/// `AgcGpuSession::present_epoch()`. Both counters start near zero; without a
+/// source bit, the first remote frame could numerically equal the splash epoch
+/// and leave the splash texture cached until a second game frame arrived.
+const REMOTE_EPOCH_BIT: u64 = 1 << 63;
+
+fn display_epoch(local_epoch: u64, remote: Option<&raeen_gpu::frame_ipc::RemoteFrame>) -> u64 {
+    remote.map_or(local_epoch, |frame| frame.epoch | REMOTE_EPOCH_BIT)
+}
 
 #[derive(Default)]
 struct PresentedFrameRate {
@@ -119,6 +128,7 @@ impl GameFrameView {
     ) -> Presented {
         self.frame_rate.observe(Instant::now(), presented_frames);
         let session = raeen_gpu::AgcGpuSession::global();
+        let remote = raeen_gpu::frame_ipc::latest_remote_frame();
         // Refresh on the GPU worker's published-frame epoch, NOT the guest-side
         // flip counter (`presented_frames`, still used only for the FPS badge):
         // under the bounded async flip the guest flips ahead of the frames the
@@ -126,14 +136,17 @@ impl GameFrameView {
         // upload while `last_image` is still an older/None frame. The epoch
         // advances only when a COMPLETE frame is published, so the texture only
         // ever receives whole, finished frames — never a half-read one.
-        let epoch = session.present_epoch();
+        let epoch = display_epoch(session.present_epoch(), remote.as_ref());
         if epoch != self.shown_at_epoch || self.texture.is_none() {
             // Deliberately does NOT `wait_idle()`: submission is asynchronous,
             // and blocking the UI thread until the GPU drained is exactly the
             // stall this Shell already had once. A viewer wants the latest frame
             // that exists, not a consistent one — a torn or one-frame-stale
             // image is invisible to a human and costs nothing.
-            if let Some(image) = session.last_image() {
+            let image = remote
+                .map(|frame| frame.image)
+                .or_else(|| session.last_image());
+            if let Some(image) = image {
                 let size = [image.width as usize, image.height as usize];
                 if size[0] > 0 && size[1] > 0 && image.pixels.len() == size[0] * size[1] * 4 {
                     let color = egui::ColorImage::from_rgba_unmultiplied(size, &image.pixels);
@@ -271,5 +284,23 @@ mod tests {
     fn degenerate_content_falls_back_to_the_screen_rect() {
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 400.0));
         assert_eq!(letterbox(screen, egui::vec2(0.0, 0.0)), screen);
+    }
+
+    #[test]
+    fn first_remote_frame_cannot_alias_the_local_splash_epoch() {
+        let remote = raeen_gpu::frame_ipc::RemoteFrame {
+            epoch: 2,
+            image: std::sync::Arc::new(raeen_gpu::RenderedImage {
+                width: 1,
+                height: 1,
+                pixels: vec![4, 3, 2, 255],
+                bytes_per_pixel: 4,
+            }),
+        };
+        assert_ne!(display_epoch(2, Some(&remote)), display_epoch(2, None));
+        assert_eq!(
+            display_epoch(2, Some(&remote)),
+            REMOTE_EPOCH_BIT | remote.epoch
+        );
     }
 }

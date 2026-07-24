@@ -1942,8 +1942,29 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             r14: context.R14,
             r15: context.R15,
         };
-        if crate::export_trap::take_hit(fault, mem, &trap_regs) {
-            resume_guest_with_tls(ctx, context, mem, fault, context.Rsp);
+        if let Some(hit) = crate::export_trap::take_hit(fault, mem, &trap_regs) {
+            if let Some((register, value)) = hit.register_write {
+                use crate::export_trap::TrapRegister;
+                match register {
+                    TrapRegister::Rax => context.Rax = value,
+                    TrapRegister::Rcx => context.Rcx = value,
+                    TrapRegister::Rdx => context.Rdx = value,
+                    TrapRegister::Rbx => context.Rbx = value,
+                    TrapRegister::Rsp => context.Rsp = value,
+                    TrapRegister::Rbp => context.Rbp = value,
+                    TrapRegister::Rsi => context.Rsi = value,
+                    TrapRegister::Rdi => context.Rdi = value,
+                    TrapRegister::R8 => context.R8 = value,
+                    TrapRegister::R9 => context.R9 = value,
+                    TrapRegister::R10 => context.R10 = value,
+                    TrapRegister::R11 => context.R11 = value,
+                    TrapRegister::R12 => context.R12 = value,
+                    TrapRegister::R13 => context.R13 = value,
+                    TrapRegister::R14 => context.R14 = value,
+                    TrapRegister::R15 => context.R15 = value,
+                }
+            }
+            resume_guest_with_tls(ctx, context, mem, hit.resume_rip, context.Rsp);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         return EXCEPTION_CONTINUE_SEARCH;

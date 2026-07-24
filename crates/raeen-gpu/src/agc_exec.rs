@@ -391,6 +391,10 @@ pub struct AgcGpuSession {
     /// flip). Bounded to [`MAX_SCANOUT_SNAPSHOTS`] entries (a title cycles
     /// through only a handful of display buffers). See [`Self::present_scanout`].
     guest_scanout_snapshots: Mutex<std::collections::HashMap<u64, Arc<Vec<u8>>>>,
+    /// Child-runner -> Shell shared-memory publisher. `None` for the Shell's
+    /// bootstrap session and in-process tests; the isolated runner receives
+    /// the mapping name through [`crate::frame_ipc::FRAME_IPC_ENV`].
+    frame_publisher: Option<crate::frame_ipc::FrameIpcPublisher>,
 }
 
 /// Cap on how many live guest-scanout snapshots
@@ -457,7 +461,21 @@ impl std::ops::Deref for GpuProcessSession {
 impl GpuProcessSession {
     #[must_use]
     fn create(memory: Arc<dyn crate::guest_mem::GpuGuestMemory>) -> Self {
-        let session = AgcGpuSession::new(memory);
+        Self::create_with_frame_publisher(memory, false)
+    }
+
+    #[must_use]
+    fn create_with_frame_publisher(
+        memory: Arc<dyn crate::guest_mem::GpuGuestMemory>,
+        publish_to_shell: bool,
+    ) -> Self {
+        let mut session = AgcGpuSession::new(memory);
+        // Only the real process session publishes to the isolated-runner
+        // bridge. The child also lazily creates a bootstrap/global session;
+        // attaching both would violate the bridge's single-writer contract.
+        if publish_to_shell {
+            session.frame_publisher = crate::frame_ipc::FrameIpcPublisher::open_from_env();
+        }
         // Seed the boot splash the launcher staged for this launch (cloned,
         // not taken: an unrelated session created concurrently must not steal
         // the splash from the launch it was staged for).
@@ -567,13 +585,14 @@ impl AgcGpuSession {
             flip_permits: FlipSemaphore::new(FLIP_FRAMES_IN_FLIGHT),
             present_epoch: AtomicU64::new(0),
             guest_scanout_snapshots: Mutex::new(std::collections::HashMap::new()),
+            frame_publisher: None,
         }
     }
 
     /// Create isolated GPU state for a new guest process.
     #[must_use]
     pub fn new_process(memory: Arc<dyn crate::guest_mem::GpuGuestMemory>) -> GpuProcessSession {
-        GpuProcessSession::create(memory)
+        GpuProcessSession::create_with_frame_publisher(memory, true)
     }
 
     /// Make `session` visible to Shell presentation without transferring the
@@ -616,6 +635,9 @@ impl AgcGpuSession {
         // selected this returns the same `Arc`, so the "every presented frame is
         // COMPLETE" invariant and the default present cost are both unchanged.
         let presented = crate::present_plugin::apply_to_image(presented);
+        if let Some(publisher) = &self.frame_publisher {
+            publisher.publish(&presented);
+        }
         *self.last_image.lock() = Some(presented);
         self.present_epoch.fetch_add(1, Ordering::Relaxed);
     }

@@ -3094,3 +3094,28 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   * HONEST STATUS: title panorama, audio output, live DualSense reads, and the
     Cross-driven transition are measured. Gameplay, save/load, sustained frame
     rate, and compatibility acceptance remain open; M4/M5 are not claimed.
+- MINECRAFT ISOLATED-RUNNER FRAME PRESENTATION RESTORED
+  (2026-07-24; working tree, release Shell run):
+  * ROOT CAUSE: runner isolation moved retail execution and
+    `AgcGpuSession::last_image` into a child process, but the Shell continued
+    polling its own process-local GPU session. Offscreen dumps could render
+    correctly while the real client area had no path to receive those pixels.
+  * FIX: new `raeen-gpu::frame_ipc` creates a unique pagefile-backed Windows
+    mapping per launch. The child publishes complete RGBA8 frames through a
+    sequence-locked latest-frame slot; the Shell copies only when the sequence
+    is stable before/after the copy and otherwise keeps its cached last complete
+    frame. The child remains crash-isolated under the Job Object.
+  * REGRESSION COVERAGE: shared mapping round-trip; malformed frame cannot
+    replace the last complete frame; local splash epoch cannot alias the first
+    remote epoch. `raeen-gpu` bridge tests 2/2, `raeen-gui` 157/157, focused
+    presenter tests 7/7, clippy `-D warnings`, fmt, and release build are green.
+    The full GPU integration run's parallel Vulkan validation setup aborted in
+    `coverage_bisect`; that binary passes 7/7 when rerun serially.
+  * MEASURED UI EVIDENCE:
+    `scratch/minecraft-frame-ipc-single-writer.png` shows Minecraft's own
+    loading spinner/progress bar in the Shell; the final run logged exactly one
+    child connection, and
+    `scratch/minecraft-frame-ipc-single-writer-title.png` shows the complete
+    Minecraft logo, animated-panorama frame, Steve model, version text and
+    "Get started" menu. This closes the black client-area transport regression,
+    not Minecraft gameplay or M4/M5.

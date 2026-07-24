@@ -524,6 +524,37 @@ fn reserve_guest_address_space(start: u64, limit: u64, length: u64, align: u64) 
                     unsafe {
                         VirtualFree(raw, 0, MEM_RELEASE);
                     }
+                } else {
+                    // Another guest thread can reserve this same candidate
+                    // between our `VirtualQuery` and `VirtualAlloc`. The stale
+                    // query may describe one enormous free region all the way
+                    // to `limit`; advancing to that old region end would then
+                    // report false exhaustion after losing a single race.
+                    //
+                    // Re-query the candidate. If it changed underneath us,
+                    // continue immediately after the winner's new region. If
+                    // it is still free, this was a genuine OS refusal and the
+                    // normal region advance below remains the bounded failure
+                    // path (rather than spinning forever).
+                    let mut current: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                    let current_size = unsafe {
+                        VirtualQuery(
+                            candidate as *const c_void,
+                            &mut current,
+                            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                        )
+                    };
+                    if current_size != 0 && current.State != MEM_FREE {
+                        let current_end =
+                            (current.BaseAddress as u64).checked_add(current.RegionSize as u64)?;
+                        let next =
+                            align_up(current_end.max(cursor.saturating_add(1)), placement_align)?;
+                        if next <= cursor {
+                            return None;
+                        }
+                        cursor = next;
+                        continue;
+                    }
                 }
             }
         }
