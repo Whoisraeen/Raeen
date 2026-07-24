@@ -10,9 +10,9 @@
 //! - **ONION+**: CPU-cached, GPU coherent. For shared data.
 
 use parking_lot::RwLock;
+use raeen_core::types::{GpuAddr, MemSize, VAddr};
 use std::collections::BTreeMap;
 use tracing::{debug, info};
-use raeen_core::types::{GpuAddr, MemSize, VAddr};
 
 /// GPU memory region descriptor.
 #[derive(Debug, Clone)]

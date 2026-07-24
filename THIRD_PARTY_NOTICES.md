@@ -62,8 +62,12 @@ SOFTWARE.
 - **Upstream:** https://github.com/sharpemu/sharpemu (formerly par274/sharpemu)
 - **License:** GPL-2.0-or-later (compatible with Raeen's GPL-2.0-only)
 - **Copyright:** © SharpEmu authors
-- **Reference synced:** 2026-07-21 to upstream `main` @ 6aa78bb (ports cite the
-  originating SharpEmu `file:line` in doc comments).
+- **Reference synced:** 2026-07-23 to upstream `main` @ 6db095e (tag
+  `v0.0.2-beta.5`) — brings working AudioOut2 audio (GTA V), AGC cross-queue
+  `WAIT_REG_MEM` label work (`Agc/GpuWaitRegistry.cs`), and PR #587's Gen5 flat
+  (global) memory + 3D-texture shader support (`Shader/*`, PSSL SEG-field
+  FLAT-address decode → SPIR-V global-memory access). Ports cite the
+  originating SharpEmu `file:line` in doc comments.
 - **How Raeen uses it:** A second-opinion reference alongside Kyty for PS5
   module loading (eboot/PRX/sysmodule chains), kernel-surface structure
   (Fiber, AMPR, PlayGo), VideoOut/AGC bring-up, and **native host controller
@@ -77,6 +81,10 @@ SOFTWARE.
   `Kernel/KernelAprCompatExports.cs` (submit/wait), re-implemented in
   `crates/raeen-hle/src/libsce_ampr.rs` and the
   `apr_complete_command_buffer` in `crates/raeen-hle/src/libkernel.rs`.
+  Raeen's executable leaf-import gateway was also designed after auditing
+  SharpEmu's native import trampoline state/ABI preservation; Raeen's
+  implementation is original Rust plus generated x86-64 code and retains the
+  existing VEH route for context-changing calls.
   Patterns and behavior are **re-implemented in idiomatic Rust with reference to
   SharpEmu's C# source**; no C# is transliterated or vendored. SharpEmu's tree
   is cloned locally into the git-ignored `reference/` directory for study only;

@@ -76,6 +76,15 @@ pub struct GraphicsConfig {
     /// Target frame-pacing rate in Hz — the guest vblank cadence, clamped to
     /// 24–480 (60 = native PS5). Drives `RAEEN_VBLANK_HZ`.
     pub frame_limit: u32,
+    /// Present-path plugin (upscaler / frame generator) to apply, by name.
+    /// `"off"` is the zero-cost identity path. Other names come from
+    /// `raeen_gpu::AgcGpuSession::present_plugins()` — the built-in
+    /// vendor-neutral plugins plus any user-supplied (BYO) plugin registered at
+    /// startup. Raeen ships/fetches no proprietary plugin (see `plugins/`).
+    pub upscaler: String,
+    /// Present-time upscale factor the active upscaler targets (1.0 = native).
+    /// Distinct from `resolution_scale`, which scales the guest draws.
+    pub present_upscale: f32,
 }
 
 impl Default for GraphicsConfig {
@@ -87,6 +96,8 @@ impl Default for GraphicsConfig {
             gpu_device_index: 0,
             validation_layers: false,
             frame_limit: 60,
+            upscaler: "off".to_string(),
+            present_upscale: 1.0,
         }
     }
 }

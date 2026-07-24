@@ -42,10 +42,9 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register("libSceHttp", "sceHttpTerm", hle_http_term);
     registry.register("libSceHttp2", "sceHttp2Init", hle_http2_init);
-    registry.register_nid(
+    registry.register(
         "libSceHttp2",
         "sceHttp2CreateTemplate",
-        0xfb00_aded_f0a2_8e09,
         hle_http2_create_template,
     );
     registry.register(
@@ -258,14 +257,7 @@ mod tests {
 
         let registry = HleRegistry::new();
         register(&registry);
-        assert!(
-            registry
-                .registered_nid_overrides()
-                .iter()
-                .any(|(nid, key)| {
-                    *nid == 0xfb00_aded_f0a2_8e09 && key == "libSceHttp2::sceHttp2CreateTemplate"
-                })
-        );
+        assert!(registry.is_implemented("libSceHttp2", "sceHttp2CreateTemplate"));
 
         assert_eq!(hle_http2_term(&ctx, &[1]), OK);
         assert!(!kernel.http2_templates.contains_key(&0x1001));

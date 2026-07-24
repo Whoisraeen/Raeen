@@ -91,12 +91,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceNet", "sceNetEpollControl", hle_epoll_control);
     registry.register("libSceNet", "sceNetEpollWait", hle_epoll_wait);
     registry.register("libSceNet", "sceNetEpollDestroy", hle_epoll_destroy);
-    registry.register_nid(
-        "libSceNetCtl",
-        "sceNetCtlGetInfo",
-        0xa1bb_b175_38b0_905f,
-        hle_ctl_get_info,
-    );
+    registry.register("libSceNetCtl", "sceNetCtlGetInfo", hle_ctl_get_info);
 }
 
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
@@ -611,14 +606,7 @@ mod tests {
         );
 
         let registry = HleRegistry::new();
-        assert!(
-            registry
-                .registered_nid_overrides()
-                .iter()
-                .any(|(nid, key)| {
-                    *nid == 0xa1bb_b175_38b0_905f && key == "libSceNetCtl::sceNetCtlGetInfo"
-                })
-        );
+        assert!(registry.is_implemented("libSceNetCtl", "sceNetCtlGetInfo"));
     }
 
     #[test]

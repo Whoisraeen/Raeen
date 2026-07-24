@@ -111,22 +111,22 @@ pub fn parse_report(report: &[u8]) -> Option<ControllerState> {
 
 #[cfg(windows)]
 mod imp {
-    use super::{parse_report, ControllerState, DUALSENSE_EDGE_PID, DUALSENSE_PID, SONY_VID};
+    use super::{ControllerState, DUALSENSE_EDGE_PID, DUALSENSE_PID, SONY_VID, parse_report};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use windows_sys::core::GUID;
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+        DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, SP_DEVICE_INTERFACE_DATA,
         SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
-        SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
-        SP_DEVICE_INTERFACE_DATA,
+        SetupDiGetDeviceInterfaceDetailW,
     };
     use windows_sys::Win32::Devices::HumanInterfaceDevice::{
-        HidD_GetAttributes, HidD_GetFeature, HidD_GetHidGuid, HIDD_ATTRIBUTES,
+        HIDD_ATTRIBUTES, HidD_GetAttributes, HidD_GetFeature, HidD_GetHidGuid,
     };
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
     };
+    use windows_sys::core::GUID;
 
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -387,7 +387,7 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{spawn, Shared};
+pub use imp::{Shared, spawn};
 
 #[cfg(test)]
 mod tests {
@@ -424,7 +424,10 @@ mod tests {
     #[test]
     fn rejects_unknown_or_short_reports() {
         assert!(parse_report(&[]).is_none());
-        assert!(parse_report(&[0x02, 0, 0, 0]).is_none(), "unknown report id");
+        assert!(
+            parse_report(&[0x02, 0, 0, 0]).is_none(),
+            "unknown report id"
+        );
         assert!(parse_report(&[0x01, 0, 0]).is_none(), "too short for 0x01");
         assert!(
             parse_report(&[0x31, 0, 0, 0, 0]).is_none(),
@@ -470,7 +473,10 @@ mod tests {
     fn sticks_and_triggers_scale() {
         let report = usb_report(0, 255, 128, 128, 255, 0, 0x08, 0, 0);
         let s = parse_report(&report).expect("valid USB report");
-        assert!((s.left_stick_x + 1.0).abs() < 1e-2, "byte 0 -> -1 (left/up)");
+        assert!(
+            (s.left_stick_x + 1.0).abs() < 1e-2,
+            "byte 0 -> -1 (left/up)"
+        );
         assert!((s.left_stick_y - 1.0).abs() < 1e-2, "byte 255 -> +1 (down)");
         assert_eq!(s.right_stick_x, 0.0, "byte 128 -> center");
         assert_eq!(s.l2_trigger, 1.0, "full L2");

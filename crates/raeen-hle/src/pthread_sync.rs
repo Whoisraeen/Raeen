@@ -13,8 +13,8 @@
 //! transfer ownership from another guest thread.
 
 use crate::{HleContext, HleFunction, HleRegistry};
-use tracing::debug;
 use raeen_kernel::{PthreadMutex, PthreadRwlock};
+use tracing::debug;
 
 // The shared mutex state machine (`lock_core`) works in POSIX errno (0 =
 // success); the `libScePosix` pthread_* entry points return these directly.
@@ -768,7 +768,11 @@ fn hle_rwlock_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
     // silently decrementing a live reader's hold and letting a writer in behind
     // its back. The per-(thread, rwlock) depth map is the ownership check the
     // bare count can't provide.
-    let drained = match ctx.kernel.pthread_rwlock_read_holds.get_mut(&(current, key)) {
+    let drained = match ctx
+        .kernel
+        .pthread_rwlock_read_holds
+        .get_mut(&(current, key))
+    {
         Some(mut depth) => {
             *depth -= 1;
             *depth == 0

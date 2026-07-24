@@ -5,8 +5,8 @@
 //! mapping; no entry payload is copied or decrypted here.
 
 use crate::slb2::{Slb2Entry, parse_slb2};
-use std::path::Path;
 use raeen_core::error::{FirmwareError, LoaderError};
+use std::path::Path;
 
 enum Backing {
     Mmap(memmap2::Mmap),

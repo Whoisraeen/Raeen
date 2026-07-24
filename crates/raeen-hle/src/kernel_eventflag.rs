@@ -254,10 +254,7 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
         if !ctx.mem.read(timeout_ptr, &mut raw) {
             return SCE_KERNEL_ERROR_EFAULT;
         }
-        Some(
-            std::time::Instant::now()
-                + std::time::Duration::from_micros(u64::from_le_bytes(raw)),
-        )
+        Some(std::time::Instant::now() + std::time::Duration::from_micros(u64::from_le_bytes(raw)))
     };
     let write_failed = std::cell::Cell::new(false);
     let deleted = std::cell::Cell::new(false);

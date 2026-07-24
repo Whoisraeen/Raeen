@@ -38,9 +38,9 @@ pub use raeen_core::types::ModuleInfo;
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
+use raeen_core::diagnostics::DiagnosticRecorder;
 use std::collections::HashMap;
 use std::sync::Arc;
-use raeen_core::diagnostics::DiagnosticRecorder;
 
 /// Captured guest console output (M1-C): everything the guest writes via
 /// `printf`/`puts`/`write(1|2, ...)` lands here, byte-for-byte, so the
@@ -167,6 +167,10 @@ pub struct OrbisKernel {
     /// this so a title reads its real process-parameter block (SDK version,
     /// etc.) instead of a stub pointer.
     proc_param_addr: std::sync::atomic::AtomicU64,
+    /// Process entry arguments recorded from the runtime-built initial stack.
+    /// `getargc` and `getargv` expose these to libc module initializers.
+    process_argc: std::sync::atomic::AtomicU64,
+    process_argv: std::sync::atomic::AtomicU64,
     /// Real ELF ranges and exception tables for the currently executing
     /// process. The runtime replaces this atomically before entering `_start`.
     unwind_modules: RwLock<Vec<UnwindModuleInfo>>,
@@ -796,14 +800,15 @@ impl OrbisKernel {
         // share those holds contributed. `readers` is a single shared count, so
         // a hold left behind would keep a writer locked out forever.
         let mut dead_holds: Vec<(u64, u32)> = Vec::new();
-        self.pthread_rwlock_read_holds.retain(|&(t, rwlock_key), &mut depth| {
-            if t == thread {
-                dead_holds.push((rwlock_key, depth));
-                false
-            } else {
-                true
-            }
-        });
+        self.pthread_rwlock_read_holds
+            .retain(|&(t, rwlock_key), &mut depth| {
+                if t == thread {
+                    dead_holds.push((rwlock_key, depth));
+                    false
+                } else {
+                    true
+                }
+            });
         for (rwlock_key, depth) in dead_holds {
             if let Some(mut rw) = self.pthread_rwlocks.get_mut(&rwlock_key) {
                 rw.readers = rw.readers.saturating_sub(depth as i32).max(0);
@@ -842,6 +847,8 @@ impl OrbisKernel {
             recent_hle_calls: DashMap::new(),
             in_flight_hle: DashMap::new(),
             proc_param_addr: std::sync::atomic::AtomicU64::new(0),
+            process_argc: std::sync::atomic::AtomicU64::new(0),
+            process_argv: std::sync::atomic::AtomicU64::new(0),
             unwind_modules: RwLock::new(Vec::new()),
             pad_state: parking_lot::Mutex::new(None),
             pthread_mutexes: DashMap::new(),
@@ -1145,6 +1152,22 @@ impl OrbisKernel {
     pub fn proc_param_addr(&self) -> u64 {
         self.proc_param_addr
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record the argc value and guest `char **argv` table built for `_start`.
+    pub fn set_process_args(&self, argc: u64, argv: u64) {
+        self.process_argv
+            .store(argv, std::sync::atomic::Ordering::Release);
+        self.process_argc
+            .store(argc, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Return the process entry arguments, or `(0, 0)` before process setup.
+    pub fn process_args(&self) -> (u64, u64) {
+        (
+            self.process_argc.load(std::sync::atomic::Ordering::Acquire),
+            self.process_argv.load(std::sync::atomic::Ordering::Acquire),
+        )
     }
 
     /// Register a loaded module with the kernel.
@@ -1471,20 +1494,49 @@ mod subsystem_resource_tests {
         let live = 9u64;
 
         // Two mutexes held by the dead thread, one held by a live thread.
-        kernel.pthread_mutexes.insert(0x1000, PthreadMutex { ty: 3, owner: dead, recursion: 1 });
-        kernel.pthread_mutexes.insert(0x1008, PthreadMutex { ty: 2, owner: dead, recursion: 3 });
-        kernel.pthread_mutexes.insert(0x1010, PthreadMutex { ty: 3, owner: live, recursion: 1 });
+        kernel.pthread_mutexes.insert(
+            0x1000,
+            PthreadMutex {
+                ty: 3,
+                owner: dead,
+                recursion: 1,
+            },
+        );
+        kernel.pthread_mutexes.insert(
+            0x1008,
+            PthreadMutex {
+                ty: 2,
+                owner: dead,
+                recursion: 3,
+            },
+        );
+        kernel.pthread_mutexes.insert(
+            0x1010,
+            PthreadMutex {
+                ty: 3,
+                owner: live,
+                recursion: 1,
+            },
+        );
 
         // One rwlock write-owned by the dead thread; one read-shared: the dead
         // thread holds 2 read recursions, the live thread holds 1 — reader count
         // is the shared sum (3).
         kernel.pthread_rwlocks.insert(
             0x2000,
-            PthreadRwlock { readers: 0, writer: dead, writer_recursion: 2 },
+            PthreadRwlock {
+                readers: 0,
+                writer: dead,
+                writer_recursion: 2,
+            },
         );
         kernel.pthread_rwlocks.insert(
             0x2008,
-            PthreadRwlock { readers: 3, writer: 0, writer_recursion: 0 },
+            PthreadRwlock {
+                readers: 3,
+                writer: 0,
+                writer_recursion: 0,
+            },
         );
         kernel.pthread_rwlock_read_holds.insert((dead, 0x2008), 2);
         kernel.pthread_rwlock_read_holds.insert((live, 0x2008), 1);
@@ -1504,10 +1556,28 @@ mod subsystem_resource_tests {
         // The write lock is released; the read-shared lock loses the dead
         // thread's 2 holds (3 -> 1) and keeps the live thread's hold.
         assert_eq!(kernel.pthread_rwlocks.get(&0x2000).unwrap().writer, 0);
-        assert_eq!(kernel.pthread_rwlocks.get(&0x2000).unwrap().writer_recursion, 0);
+        assert_eq!(
+            kernel
+                .pthread_rwlocks
+                .get(&0x2000)
+                .unwrap()
+                .writer_recursion,
+            0
+        );
         assert_eq!(kernel.pthread_rwlocks.get(&0x2008).unwrap().readers, 1);
-        assert!(kernel.pthread_rwlock_read_holds.get(&(dead, 0x2008)).is_none());
-        assert_eq!(*kernel.pthread_rwlock_read_holds.get(&(live, 0x2008)).unwrap(), 1);
+        assert!(
+            kernel
+                .pthread_rwlock_read_holds
+                .get(&(dead, 0x2008))
+                .is_none()
+        );
+        assert_eq!(
+            *kernel
+                .pthread_rwlock_read_holds
+                .get(&(live, 0x2008))
+                .unwrap(),
+            1
+        );
 
         // Idempotent: a second call on the same (now clean) thread frees nothing.
         assert!(!kernel.release_locks_owned_by(dead).any());

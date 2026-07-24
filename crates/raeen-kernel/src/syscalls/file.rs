@@ -4,8 +4,8 @@
 //! through the virtual filesystem layer.
 
 use crate::OrbisKernel;
-use tracing::{debug, warn};
 use raeen_core::error::KernelError;
+use tracing::{debug, warn};
 
 /// sys_read — Read from a file descriptor.
 pub fn sys_read(

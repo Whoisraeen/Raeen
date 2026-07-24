@@ -1311,7 +1311,6 @@ pub fn register(registry: &HleRegistry) {
     // __cxa_throw is used. Registered by NID (for import redirection) AND by
     // name (so a runtime-patched jump into an appended trampoline dispatches
     // here via the VEH's name-based hle.call).
-    registry.register_nid("libc", "__cxa_throw", 0xbe4b_ae2d_f867_4992, hle_cxa_throw);
     registry.register("libc", "__cxa_throw", hle_cxa_throw);
 
     // -- File I/O (real, VFS-backed) --
@@ -1331,12 +1330,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libScePosix", "write", hle_posix_write);
     registry.register("libScePosix", "close", hle_posix_close);
     registry.register("libScePosix", "lseek", hle_posix_lseek);
-    registry.register_nid(
-        "libkernel",
-        "sceKernelFsync",
-        0x7d3c_7aea_5e62_5880,
-        hle_sce_fsync,
-    );
+    registry.register("libkernel", "sceKernelFsync", hle_sce_fsync);
     registry.register("libkernel", "sceKernelGetdents", hle_sce_getdents);
     registry.register("libkernel", "sceKernelGetdirentries", hle_sce_getdirentries);
     registry.register("libkernel", "getdirentries", hle_posix_getdirentries);
@@ -1628,6 +1622,11 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "sceKernelMprotect", hle_kernel_mprotect);
     registry.register(
         "libkernel",
+        "sceKernelMtypeprotect",
+        hle_kernel_mtypeprotect,
+    );
+    registry.register(
+        "libkernel",
         "sceKernelCheckReachability",
         hle_check_reachability,
     );
@@ -1714,7 +1713,11 @@ pub fn register(registry: &HleRegistry) {
     // scePthreadSetprio/Getprio are registered by `pthread_thread` (real
     // priority bookkeeping) — the old hle_ok_stub here dropped the value.
     registry.register("libkernel", "scePthreadSetaffinity", hle_ok_stub);
-    registry.register("libkernel", "scePthreadGetaffinity", hle_pthread_getaffinity);
+    registry.register(
+        "libkernel",
+        "scePthreadGetaffinity",
+        hle_pthread_getaffinity,
+    );
     registry.register("libkernel", "scePthreadAttrSetaffinity", hle_ok_stub);
     registry.register("libkernel", "scePthreadAttrGetaffinity", hle_ok_stub);
     registry.register("libkernel", "scePthreadAttrGet", hle_ok_stub);
@@ -1771,6 +1774,8 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register("libkernel", "getpid", hle_getpid);
     registry.register("libkernel", "sceKernelGetProcessId", hle_getpid);
+    registry.register("libkernel", "getargc", hle_getargc);
+    registry.register("libkernel", "getargv", hle_getargv);
     registry.register("libkernel", "sceKernelGetGPI", hle_get_gpi);
 }
 
@@ -1825,6 +1830,21 @@ fn hle_get_compiled_sdk_version(ctx: &HleContext, args: &[u64]) -> u64 {
 pub(crate) fn hle_getpid(_ctx: &HleContext, _args: &[u64]) -> u64 {
     debug!("getpid() -> {GUEST_PID:#x}");
     GUEST_PID
+}
+
+/// Return the process argument count recorded from the runtime-built initial
+/// stack. Semantics cross-checked against shadPS4's GPL-2.0 kernel exports.
+fn hle_getargc(ctx: &HleContext, _args: &[u64]) -> u64 {
+    let (argc, _) = ctx.kernel.process_args();
+    debug!("getargc() -> {argc}");
+    argc
+}
+
+/// Return the guest address of the process `char **argv` table.
+fn hle_getargv(ctx: &HleContext, _args: &[u64]) -> u64 {
+    let (_, argv) = ctx.kernel.process_args();
+    debug!("getargv() -> {argv:#x}");
+    argv
 }
 
 // ---------------------------------------------------------------------
@@ -2927,6 +2947,30 @@ fn hle_kernel_mprotect(ctx: &HleContext, args: &[u64]) -> u64 {
     }
 }
 
+/// `sceKernelMtypeprotect(void *addr, size_t len, int type, int prot)`.
+///
+/// The memory type selects/cache-tags the direct-memory pool on hardware.
+/// Raeen does not yet expose that tag to the GPU memory tracker, but the host
+/// protection transition is real and matches the shared mprotect path. This
+/// behavior is cross-checked against SharpEmu and KytyPS5 (GPL-2.0/MIT).
+fn hle_kernel_mtypeprotect(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    let len = args.get(1).copied().unwrap_or(0);
+    let memory_type = args.get(2).copied().unwrap_or(0) as u32;
+    let prot = args.get(3).copied().unwrap_or(0) as u32;
+    debug!(
+        "sceKernelMtypeprotect(addr={addr:#x}, len={len:#x}, type={memory_type:#x}, prot={prot:#x})"
+    );
+    if addr == 0 || len == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    if ctx.mem.protect(addr, len, prot) {
+        SCE_OK
+    } else {
+        SCE_KERNEL_ERROR_EINVAL
+    }
+}
+
 /// Real signature: `sceKernelMapDirectMemory2(void **addrOut, size_t len, int
 /// type, int prot, int flags, off_t directMemoryStart, size_t alignment)`.
 ///
@@ -3400,6 +3444,13 @@ fn hle_stat(ctx: &HleContext, args: &[u64]) -> u64 {
         Ok(metadata) => write_orbis_stat(ctx, stat_out, &metadata),
         Err(error) => {
             debug!("sceKernelStat('{path}') failed: {error}");
+            if std::env::var_os("RAEEN_DIAG_STAT_MISS").is_some() {
+                static REPORTED: std::sync::LazyLock<dashmap::DashMap<String, ()>> =
+                    std::sync::LazyLock::new(dashmap::DashMap::new);
+                if REPORTED.len() < 256 && REPORTED.insert(path.to_string(), ()).is_none() {
+                    warn!("sceKernelStat('{path}') -> ENOENT ({error})");
+                }
+            }
             SCE_KERNEL_ERROR_ENOENT
         }
     }
@@ -4603,6 +4654,7 @@ mod tests {
             ("libkernel", "__pthread_cxa_finalize"),
             ("libkernel", "__elf_phdr_match_addr"),
             ("libkernel", "sceKernelMprotect"),
+            ("libkernel", "sceKernelMtypeprotect"),
             ("libkernel", "sceKernelCheckReachability"),
             ("libkernel", "sceKernelUuidCreate"),
             ("libkernel", "sceKernelConvertUtcToLocaltime"),
@@ -4976,14 +5028,7 @@ mod tests {
         assert_eq!(std::fs::read(tmp.join("save.dat")).unwrap(), b"PROGRESS");
 
         let registry = HleRegistry::new();
-        assert!(
-            registry
-                .registered_nid_overrides()
-                .iter()
-                .any(|(nid, key)| {
-                    *nid == 0x7d3c_7aea_5e62_5880 && key == "libkernel::sceKernelFsync"
-                })
-        );
+        assert!(registry.is_implemented("libkernel", "sceKernelFsync"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -5373,6 +5418,18 @@ mod tests {
             hle_getpid(&ctx, &[]),
             "pid is stable"
         );
+    }
+
+    #[test]
+    fn getargc_and_getargv_return_runtime_process_stack_state() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        kernel.set_process_args(3, 0x1234_5008);
+        let mem = crate::TestMemory::new(0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(hle_getargc(&ctx, &[]), 3);
+        assert_eq!(hle_getargv(&ctx, &[]), 0x1234_5008);
     }
 
     /// Process-time counters advance monotonically and agree on their domain.

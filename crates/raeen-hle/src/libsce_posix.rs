@@ -40,7 +40,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libScePosix", "clock_gettime", posix_clock_gettime);
     registry.register("libScePosix", "usleep", posix_usleep);
     registry.register("libScePosix", "getpid", libkernel::hle_getpid);
-    registry.register_nid("libScePosix", "fcntl", 0xf276_35f5_b2a8_8999, posix_fcntl);
+    registry.register("libScePosix", "fcntl", posix_fcntl);
 
     // The `libkernel` module exports these POSIX names under BOTH its
     // `libScePosix` library and its `libkernel` library, and resolution is
@@ -225,12 +225,7 @@ mod tests {
         assert_eq!(posix_fcntl(&ctx, &[socket as u32 as u64, 1]), 1);
 
         let registry = HleRegistry::new();
-        assert!(
-            registry
-                .registered_nid_overrides()
-                .iter()
-                .any(|(nid, key)| { *nid == 0xf276_35f5_b2a8_8999 && key == "libScePosix::fcntl" })
-        );
+        assert!(registry.is_implemented("libScePosix", "fcntl"));
         kernel.filesystem.close(fd).unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
     }

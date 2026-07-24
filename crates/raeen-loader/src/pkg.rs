@@ -9,8 +9,8 @@
 //! **Note:** Raeen only handles decrypted/extracted PKG contents.
 //! Users must extract PKG files externally using appropriate tools.
 
-use tracing::{debug, info, warn};
 use raeen_core::error::LoaderError;
+use tracing::{debug, info, warn};
 
 /// PKG magic bytes: 0x7F 'C' 'N' 'T'.
 const PKG_MAGIC: [u8; 4] = [0x7F, b'C', b'N', b'T'];

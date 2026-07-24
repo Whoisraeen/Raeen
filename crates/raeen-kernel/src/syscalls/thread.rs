@@ -4,8 +4,8 @@
 //! to host OS threading primitives.
 
 use crate::OrbisKernel;
-use tracing::{debug, warn};
 use raeen_core::error::KernelError;
+use tracing::{debug, warn};
 
 /// sys_thr_new — Create a new thread.
 pub fn sys_thr_new(

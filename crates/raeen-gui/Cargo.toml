@@ -33,6 +33,14 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 ureq = { workspace = true }
+# Optional BYO upscaler plugin (git-ignored, not part of the repo). Present only
+# on a machine that has plugins/upscale/. Pulled in by `--features upscale-plugins`.
+raeen-upscale = { path = "../../plugins/upscale", optional = true }
+
+[features]
+# Opt-in: compile in the BYO all-in-one upscaler plugin (DLSS/FSR/XeSS + spatial)
+# and register its backends at startup. Requires plugins/upscale/ to be present.
+upscale-plugins = ["dep:raeen-upscale"]
 
 [target.'cfg(windows)'.dependencies]
 # Local wall-clock for the Shell's top-bar time (Win32 GetLocalTime) — the

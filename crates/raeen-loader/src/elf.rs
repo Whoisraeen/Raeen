@@ -6,8 +6,8 @@
 //! loadable segments and dynamic linking information.
 
 use crate::{LoadedBinary, LoadedSegment};
-use tracing::{debug, info, warn};
 use raeen_core::error::LoaderError;
+use tracing::{debug, info, warn};
 
 /// PS5-specific ELF OS/ABI value.
 #[allow(dead_code)] // reserved: e_ident[EI_OSABI] validation not yet enforced

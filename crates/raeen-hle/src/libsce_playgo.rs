@@ -31,6 +31,18 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libScePlayGo", "scePlayGoClose", hle_ok);
     registry.register("libScePlayGo", "scePlayGoGetLocus", hle_get_locus);
     registry.register("libScePlayGo", "scePlayGoGetChunkId", hle_get_chunk_id);
+    // PS5 spelling observed in Avatar. Its measured register shape is the
+    // same four-argument count/list query (handle, list, capacity, out count).
+    registry.register(
+        "libScePlayGo",
+        "scePlayGoGetInstallChunkId",
+        hle_get_chunk_id,
+    );
+    registry.register(
+        "libScePlayGo",
+        "scePlayGoGetSupportedOptionalChunk",
+        hle_get_supported_optional_chunk,
+    );
     registry.register("libScePlayGo", "scePlayGoGetProgress", hle_get_progress);
     registry.register("libScePlayGo", "scePlayGoGetToDoList", hle_get_todo_list);
     registry.register("libScePlayGo", "scePlayGoGetEta", hle_ok);
@@ -115,9 +127,12 @@ fn hle_get_chunk_id(ctx: &HleContext, args: &[u64]) -> u64 {
     }
 
     let available: u64 = 1; // no PlayGo metadata parsed yet — one present chunk
-    let write = |value: u64| ctx.mem.write(out_entries, &value.to_le_bytes());
+    // `outEntries` is a uint32_t*. Writing a u64 here corrupts the adjacent
+    // four bytes of the caller's stack (SharpEmu's implementation also writes
+    // exactly UInt32).
+    let write = |value: u32| ctx.mem.write(out_entries, &value.to_le_bytes());
     if out_chunk_id_list == 0 {
-        if !write(available) {
+        if !write(available as u32) {
             warn!("scePlayGoGetChunkId: outEntries {out_entries:#x} not writable");
             return PLAYGO_ERROR_BAD_POINTER;
         }
@@ -126,8 +141,30 @@ fn hle_get_chunk_id(ctx: &HleContext, args: &[u64]) -> u64 {
     let to_write = number_of_entries.min(available) as usize;
     let ids = vec![0u16; to_write];
     let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
-    if !ctx.mem.write(out_chunk_id_list, &bytes) || !write(to_write as u64) {
+    if !ctx.mem.write(out_chunk_id_list, &bytes) || !write(to_write as u32) {
         warn!("scePlayGoGetChunkId: out buffers not writable");
+        return PLAYGO_ERROR_BAD_POINTER;
+    }
+    SCE_OK
+}
+
+/// PS5 `scePlayGoGetSupportedOptionalChunk(handle, outIds, outEntries)`.
+/// Avatar first calls it in count-only mode (`outIds == NULL`). Raeen has no
+/// parsed optional-chunk metadata, so report an empty supported set without
+/// manufacturing chunk ids.
+fn hle_get_supported_optional_chunk(ctx: &HleContext, args: &[u64]) -> u64 {
+    const PLAYGO_ERROR_BAD_POINTER: u64 = 0x80B2_000A;
+    let handle = args.first().copied().unwrap_or(0);
+    let out_ids = args.get(1).copied().unwrap_or(0);
+    let out_entries = args.get(2).copied().unwrap_or(0);
+    debug!(
+        "scePlayGoGetSupportedOptionalChunk(handle={handle}, outIds={out_ids:#x}, outEntries={out_entries:#x})"
+    );
+    if out_entries == 0 {
+        return PLAYGO_ERROR_BAD_POINTER;
+    }
+    if !ctx.mem.write(out_entries, &0u32.to_le_bytes()) {
+        warn!("scePlayGoGetSupportedOptionalChunk: outEntries {out_entries:#x} not writable");
         return PLAYGO_ERROR_BAD_POINTER;
     }
     SCE_OK
@@ -224,6 +261,8 @@ mod tests {
         assert!(mem.read(0x400, &mut e));
         assert_eq!(u32::from_le_bytes(e), 1);
 
+        assert!(HleRegistry::new().is_implemented("libScePlayGo", "scePlayGoGetInstallChunkId"));
+
         // List mode: one uint16 id written, *outEntries = 1.
         assert_eq!(hle_get_chunk_id(&ctx, &[1, 0x500, 4, 0x400]), SCE_OK);
         let mut id = [0u8; 2];
@@ -234,6 +273,23 @@ mod tests {
         // outEntries == 0 → BAD_POINTER; list with 0 entries → BAD_SIZE.
         assert_eq!(hle_get_chunk_id(&ctx, &[1, 0, 0, 0]), 0x80B2_000A);
         assert_eq!(hle_get_chunk_id(&ctx, &[1, 0x500, 0, 0x400]), 0x80B2_000B);
+    }
+
+    #[test]
+    fn supported_optional_chunk_count_is_empty_and_bounded() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x400, &u32::MAX.to_le_bytes()));
+        assert_eq!(
+            hle_get_supported_optional_chunk(&ctx, &[1, 0, 0x400]),
+            SCE_OK
+        );
+        let mut count = [0u8; 4];
+        assert!(mem.read(0x400, &mut count));
+        assert_eq!(u32::from_le_bytes(count), 0);
     }
 
     #[test]

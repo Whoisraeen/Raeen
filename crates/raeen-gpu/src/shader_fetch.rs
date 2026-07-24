@@ -44,7 +44,8 @@ use kyty_graphics::shader::recompile::{
     shader_recompile_cs, shader_recompile_ps, shader_recompile_vs,
 };
 use kyty_graphics::shader::resources::{
-    ShaderComputeInputInfo, ShaderMappedData, ShaderPixelInputInfo, ShaderVertexInputInfo,
+    ShaderBindResources, ShaderComputeInputInfo, ShaderMappedData, ShaderPixelInputInfo,
+    ShaderVertexInputInfo,
 };
 use kyty_graphics::shader::types::ShaderCode;
 use std::borrow::Cow;
@@ -110,7 +111,7 @@ impl CodeKey {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CacheKey {
     code: CodeKey,
-    binding: Box<str>,
+    binding: Box<[u32]>,
 }
 
 /// A translated shader plus the stage resource ABI recovered during analysis.
@@ -146,14 +147,77 @@ enum PreparedShader {
 }
 
 impl PreparedShader {
-    fn binding_identity(&self) -> Box<str> {
+    fn binding_identity(&self) -> Box<[u32]> {
+        let mut id = Vec::with_capacity(192);
         match self {
-            Self::Vs { info, .. } => format!("{info:?}").into_boxed_str(),
-            Self::Ps { vs_info, info, .. } => {
-                format!("vs={vs_info:?}; ps={info:?}").into_boxed_str()
+            Self::Vs { info, .. } => {
+                id.extend([
+                    info.fetch_external.into(),
+                    info.fetch_embedded.into(),
+                    info.fetch_inline.into(),
+                    info.gs_prolog.into(),
+                    info.resources_num as u32,
+                    info.export_count as u32,
+                    info.fetch_shader_reg as u32,
+                    info.fetch_attrib_reg as u32,
+                    info.fetch_buffer_reg as u32,
+                ]);
+                for i in bounded_count(info.resources_num, info.resources.len()) {
+                    let resource = info.resources[i];
+                    let dst = info.resources_dst[i];
+                    id.extend([
+                        dst.register_start as u32,
+                        dst.registers_num as u32,
+                        dst.semantic as u32,
+                        u32::from(resource.stride()),
+                        resource.swizzle_enabled().into(),
+                        u32::from(resource.dst_sel_x()),
+                        u32::from(resource.dst_sel_y()),
+                        u32::from(resource.dst_sel_z()),
+                        u32::from(resource.dst_sel_w()),
+                        u32::from(resource.format()),
+                        u32::from(resource.out_of_bounds()),
+                        resource.add_tid().into(),
+                    ]);
+                }
+                id.push(info.buffers_num as u32);
+                for i in bounded_count(info.buffers_num, info.buffers.len()) {
+                    let buffer = info.buffers[i];
+                    id.extend([buffer.attr_num as u32, buffer.stride]);
+                    for j in bounded_count(buffer.attr_num, buffer.attr_indices.len()) {
+                        id.extend([buffer.attr_indices[j] as u32, buffer.attr_offsets[j]]);
+                    }
+                }
+                append_bind_identity(&mut id, &info.bind);
             }
-            Self::Cs { info, .. } => format!("{info:?}").into_boxed_str(),
+            Self::Ps { info, .. } => {
+                id.extend([
+                    info.input_num,
+                    info.ps_pos_xy.into(),
+                    info.ps_pixel_kill_enable.into(),
+                    info.ps_early_z.into(),
+                    info.ps_execute_on_noop.into(),
+                ]);
+                let inputs = usize::try_from(info.input_num)
+                    .unwrap_or(usize::MAX)
+                    .min(info.interpolator_settings.len());
+                id.extend_from_slice(&info.interpolator_settings[..inputs]);
+                id.extend(info.target_output_mode.map(u32::from));
+                append_bind_identity(&mut id, &info.bind);
+            }
+            Self::Cs { info, .. } => {
+                id.extend([
+                    info.workgroup_register as u32,
+                    info.thread_ids_num as u32,
+                    info.lds_size_dw,
+                ]);
+                for i in 0..3 {
+                    id.extend([info.threads_num[i], info.group_id[i].into()]);
+                }
+                append_bind_identity(&mut id, &info.bind);
+            }
         }
+        id.into_boxed_slice()
     }
 
     fn recompile(&self) -> Result<Vec<u32>, AttemptError> {
@@ -199,6 +263,130 @@ impl PreparedShader {
                 cs_info: *info,
             },
         }
+    }
+}
+
+fn bounded_count(count: i32, capacity: usize) -> std::ops::Range<usize> {
+    0..usize::try_from(count).unwrap_or(0).min(capacity)
+}
+
+/// Append only metadata that can change generated SPIR-V or its descriptor
+/// ABI. Guest addresses, resource extents, record counts, sampler state, and
+/// direct-SGPR values are bind-time data and deliberately excluded.
+///
+/// This follows Kyty's `ShaderGetBindIds` rule. Raeen adds the fields its
+/// expanded recompiler introduced after that upstream function: texture
+/// dimension/format, sampler-less storage classification, EUD/global-memory
+/// declarations, and embedded shader constants.
+fn append_bind_identity(id: &mut Vec<u32>, bind: &ShaderBindResources) {
+    id.extend([
+        bind.push_constant_offset,
+        bind.push_constant_size,
+        bind.descriptor_set_slot,
+        bind.storage_buffers.buffers_num as u32,
+        bind.storage_buffers.binding_index as u32,
+    ]);
+    for i in bounded_count(
+        bind.storage_buffers.buffers_num,
+        bind.storage_buffers.buffers.len(),
+    ) {
+        id.extend([
+            bind.storage_buffers.slots[i] as u32,
+            bind.storage_buffers.start_register[i] as u32,
+            bind.storage_buffers.extended[i].into(),
+            bind.storage_buffers.usages[i] as u32,
+        ]);
+    }
+
+    id.extend([
+        bind.textures2d.textures_num as u32,
+        bind.textures2d.textures2d_sampled_num as u32,
+        bind.textures2d.textures2d_storage_num as u32,
+        bind.textures2d.binding_sampled_index as u32,
+        bind.textures2d.binding_storage_index as u32,
+    ]);
+    for desc in &bind.textures2d.desc
+        [..bounded_count(bind.textures2d.textures_num, bind.textures2d.desc.len()).end]
+    {
+        id.extend([
+            desc.slot as u32,
+            desc.start_register as u32,
+            desc.extended.into(),
+            desc.usage as u32,
+            desc.textures2d_without_sampler.into(),
+            u32::from(desc.texture.type_()),
+            u32::from(desc.texture.format()),
+        ]);
+    }
+
+    id.extend([
+        bind.samplers.samplers_num as u32,
+        bind.samplers.binding_index as u32,
+    ]);
+    for i in bounded_count(bind.samplers.samplers_num, bind.samplers.samplers.len()) {
+        id.extend([
+            bind.samplers.slots[i] as u32,
+            bind.samplers.start_register[i] as u32,
+            bind.samplers.extended[i].into(),
+        ]);
+    }
+
+    id.extend([
+        bind.gds_pointers.pointers_num as u32,
+        bind.gds_pointers.binding_index as u32,
+    ]);
+    for i in bounded_count(
+        bind.gds_pointers.pointers_num,
+        bind.gds_pointers.pointers.len(),
+    ) {
+        id.extend([
+            bind.gds_pointers.slots[i] as u32,
+            bind.gds_pointers.start_register[i] as u32,
+            bind.gds_pointers.extended[i].into(),
+        ]);
+    }
+
+    id.push(bind.direct_sgprs.sgprs_num as u32);
+    for i in bounded_count(bind.direct_sgprs.sgprs_num, bind.direct_sgprs.sgprs.len()) {
+        id.push(bind.direct_sgprs.start_register[i] as u32);
+    }
+    id.extend([
+        bind.extended.used.into(),
+        bind.extended.slot as u32,
+        bind.extended.start_register as u32,
+        bind.eud_raw.used.into(),
+        bind.eud_raw.binding_index as u32,
+        bind.eud_raw.required_dwords,
+        bind.global_mem.used.into(),
+        bind.global_mem.binding_index as u32,
+    ]);
+
+    id.push(bind.embedded_constant_loads.loads_num as u32);
+    for load in &bind.embedded_constant_loads.loads[..bounded_count(
+        bind.embedded_constant_loads.loads_num,
+        bind.embedded_constant_loads.loads.len(),
+    )
+    .end]
+    {
+        id.extend([load.pc, load.dwords_num]);
+        let count = usize::try_from(load.dwords_num)
+            .unwrap_or(usize::MAX)
+            .min(load.values.len());
+        id.extend_from_slice(&load.values[..count]);
+    }
+
+    id.push(bind.embedded_buffer_fetches.loads_num as u32);
+    for load in &bind.embedded_buffer_fetches.loads[..bounded_count(
+        bind.embedded_buffer_fetches.loads_num,
+        bind.embedded_buffer_fetches.loads.len(),
+    )
+    .end]
+    {
+        id.extend([load.pc, load.inst_offset, load.dwords_num, load.window_len]);
+        let count = usize::try_from(load.window_len)
+            .unwrap_or(usize::MAX)
+            .min(load.window.len());
+        id.extend_from_slice(&load.window[..count]);
     }
 }
 
@@ -1065,6 +1253,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn module_identity_excludes_runtime_resource_payloads_but_bind_keeps_them_fresh() {
+        let prepared = |buffer_addr: u64, texture_addr: u64, records: u32| {
+            let mut info = ShaderComputeInputInfo::default();
+            info.bind.storage_buffers.buffers_num = 1;
+            info.bind.storage_buffers.buffers[0].update_address48(buffer_addr);
+            info.bind.storage_buffers.buffers[0].fields[2] = records;
+            info.bind.textures2d.textures_num = 1;
+            info.bind.textures2d.textures2d_sampled_num = 1;
+            info.bind.textures2d.desc[0]
+                .texture
+                .update_address40(texture_addr);
+            info.bind.textures2d.desc[0].texture.fields[2] = records << 14;
+            info.bind.textures2d.desc[0].texture.fields[3] |= 9 << 28;
+            info.bind.samplers.samplers_num = 1;
+            info.bind.samplers.samplers[0].fields = [records; 4];
+            PreparedShader::Cs {
+                code: ShaderCode::new(),
+                info: Box::new(info),
+            }
+        };
+
+        let first = prepared(0x1111_2222_3000, 0x2222_3333_4000, 64);
+        let second = prepared(0xAAAA_BBBB_C000, 0xBBBB_CCCC_D000, 4096);
+        assert_eq!(
+            first.binding_identity(),
+            second.binding_identity(),
+            "guest addresses, extents, record counts, and sampler payloads are bind-time state"
+        );
+
+        let translated = second.into_translated(Arc::new(vec![0x0723_0203]));
+        assert_eq!(
+            translated.cs_info.bind.storage_buffers.buffers[0].base48(),
+            0xAAAA_BBBB_C000,
+            "a cache hit must still return the current bind's descriptor metadata"
+        );
+        assert_eq!(
+            translated.cs_info.bind.storage_buffers.buffers[0].num_records(),
+            4096
+        );
+    }
+
     /// Garbage bytes fail with a named reason and never panic or poison a
     /// pre-binding cache.
     #[test]
@@ -1148,7 +1378,7 @@ mod tests {
                 fetched_dwords: 4,
                 digest: i as u64,
             },
-            binding: format!("binding-{i}").into_boxed_str(),
+            binding: vec![i as u32].into_boxed_slice(),
         };
         for i in 0..=MAX_CACHE_ENTRIES {
             cache.insert_entry(key(i), Ok(Arc::new(vec![i as u32])));

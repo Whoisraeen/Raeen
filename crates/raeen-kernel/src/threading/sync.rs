@@ -4,9 +4,9 @@
 //! mutexes, and read-write locks.
 
 use parking_lot::Mutex;
+use raeen_core::types::KernelHandle;
 use std::collections::HashMap;
 use tracing::debug;
-use raeen_core::types::KernelHandle;
 
 /// Emulated PS5 event flag.
 #[derive(Debug)]

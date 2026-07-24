@@ -867,6 +867,23 @@ fn main() -> anyhow::Result<()> {
         let db = raeen_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
         let mut registry = raeen_firmware::ModuleRegistry::new(db);
         let kernel = std::sync::Arc::new(raeen_kernel::OrbisKernel::new());
+        // The isolated runner cannot borrow the Shell's in-process kernel.
+        // Keep physical controller input live by polling the native XInput /
+        // DualSense readers inside the child and publishing their snapshots
+        // directly to this process-scoped kernel.
+        if std::env::var_os("RAEEN_RUNNER_CHILD").is_some() {
+            let input_kernel = std::sync::Arc::clone(&kernel);
+            std::thread::Builder::new()
+                .name("raeen-runner-input".to_string())
+                .spawn(move || {
+                    let pads = raeen_input::NativeGamepads::start();
+                    loop {
+                        input_kernel
+                            .set_pad_state(pads.poll().unwrap_or_default().to_orbis_pad_data());
+                        std::thread::sleep(std::time::Duration::from_millis(4));
+                    }
+                })?;
+        }
         // Load as a whole process: the eboot plus every DT_NEEDED .prx that
         // ships beside it (M1-D). A real title's imports are overwhelmingly
         // satisfied by those bundled libraries, not by HLE.
@@ -1327,6 +1344,11 @@ fn main() -> anyhow::Result<()> {
         } else {
             info!("guest console ({} byte(s)):\n{console}", console.len());
         }
+        if std::env::var_os("RAEEN_RUNNER_CHILD").is_some()
+            && let Err(error) = outcome
+        {
+            return Err(anyhow::anyhow!("isolated guest run failed: {error}"));
+        }
         return Ok(());
     }
 
@@ -1361,6 +1383,14 @@ fn main() -> anyhow::Result<()> {
         config.graphics.resolution_scale,
         config.graphics.gpu_device_index,
     );
+    // Register the BYO upscaler plugin's backends (DLSS/FSR/XeSS + spatial), if
+    // this build opted into it, BEFORE applying the saved selection so a
+    // persisted choice like "fsr" resolves. No-op unless `upscale-plugins` is on.
+    #[cfg(feature = "upscale-plugins")]
+    raeen_upscale::register_all();
+    // Apply the persisted present-plugin (upscaler / frame gen) selection so a
+    // saved choice is live from startup, not only after the user re-touches it.
+    shell::apply_present_plugin(&config.graphics);
 
     // Bring up host audio output and apply the persisted Audio settings (Master
     // Volume / Audio Enabled). The guest's sceAudioOutOutput feeds this sink;

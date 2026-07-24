@@ -10,8 +10,8 @@
 //! the user to decrypt them externally using their own hardware keys.
 
 use crate::LoadedBinary;
-use tracing::{debug, info, warn};
 use raeen_core::error::LoaderError;
+use tracing::{debug, info, warn};
 
 /// SELF file magic: 0x4F15D17E ("OISED" / "SELF" rearranged). This project's
 /// in-tree fixtures use it; see [`is_self_magic`] for the real-hardware ones.

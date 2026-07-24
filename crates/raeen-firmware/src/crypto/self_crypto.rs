@@ -21,9 +21,9 @@
 use crate::crypto::{KeyProvider, KeyRequest, SegmentKey, require_key};
 use aes::Aes128;
 use aes::cipher::{Array, BlockCipherEncrypt, BlockModeDecrypt, KeyInit, KeyIvInit};
-use tracing::{debug, info};
 use raeen_core::error::{FirmwareError, LoaderError};
 use raeen_loader::self_format::{SelfEntry, SelfHeader};
+use tracing::{debug, info};
 
 /// SELF magic used by this crate's in-tree fixtures. The real-hardware magics
 /// are accepted too — every container variant is recognized via

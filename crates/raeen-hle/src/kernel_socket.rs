@@ -34,20 +34,10 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libScePosix", "connect", hle_connect);
     registry.register("libScePosix", "getsockname", hle_getsockname);
     registry.register("libScePosix", "inet_pton", hle_inet_pton);
-    registry.register_nid(
-        "libScePosix",
-        "setsockopt",
-        0x7c5c_4693_1176_6d5a,
-        hle_setsockopt,
-    );
+    registry.register("libScePosix", "setsockopt", hle_setsockopt);
     registry.register("libkernel", "bzero", hle_bzero);
     registry.register("libkernel", "inet_pton", hle_inet_pton);
-    registry.register_nid(
-        "libScePosix",
-        "inet_ntop",
-        0xe634_42b3_66b1_b6be,
-        hle_inet_ntop,
-    );
+    registry.register("libScePosix", "inet_ntop", hle_inet_ntop);
     registry.register("libkernel", "htons", hle_htons);
 
     // POSIX socket surface the measured title (Minecraft) imports from
@@ -526,14 +516,7 @@ mod tests {
         assert_eq!(hle_inet_ntop(&ctx, &[AF_INET, 0x40, 0x90, 4]), 0);
 
         let registry = HleRegistry::new();
-        assert!(
-            registry
-                .registered_nid_overrides()
-                .iter()
-                .any(|(nid, key)| {
-                    *nid == 0xe634_42b3_66b1_b6be && key == "libScePosix::inet_ntop"
-                })
-        );
+        assert!(registry.is_implemented("libScePosix", "inet_ntop"));
     }
 
     #[test]
@@ -652,13 +635,6 @@ mod tests {
         assert_eq!(hle_setsockopt(&ctx, &[0x999, 0, 0, 0, 0]), MINUS_ONE);
 
         let registry = HleRegistry::new();
-        assert!(
-            registry
-                .registered_nid_overrides()
-                .iter()
-                .any(|(nid, key)| {
-                    *nid == 0x7c5c_4693_1176_6d5a && key == "libScePosix::setsockopt"
-                })
-        );
+        assert!(registry.is_implemented("libScePosix", "setsockopt"));
     }
 }

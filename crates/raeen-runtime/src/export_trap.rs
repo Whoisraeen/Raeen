@@ -26,8 +26,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use tracing::{debug, warn};
 use raeen_hle::GuestMemory;
+use tracing::{debug, warn};
 
 /// The trapping instruction planted on each export's entry byte.
 pub const INT3: u8 = 0xCC;

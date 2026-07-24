@@ -1,3 +1,73 @@
+- Present-path plugin ABI — upscaler / frame-gen framework (2026-07-23;
+  working tree, no commit):
+  * NEW `crates/raeen-gpu/src/present_plugin/{mod,builtin}.rs`: a generic,
+    vendor-neutral `PresentPlugin` trait (`name`/`capabilities`/`process`) with
+    `PresentFrame` (color + OPTIONAL depth/motion planes for the future
+    PM4-extracted motion-vector moat), `PluginFrame`, `PluginOutput`
+    (primary + reserved `generated` frame-gen list), `PresentContext`,
+    `Capabilities`. Process-wide `Registry` (register/select/list/
+    set_output_scale) behind a global; built-in reference plugins
+    `Passthrough` (identity) + `NearestUpscale` (real nearest-neighbour
+    resample) prove the boundary is a *general* upscaler ABI, not a DLSS socket.
+  * HOOK: `AgcGpuSession::publish_frame` (the single present chokepoint) now
+    runs `present_plugin::apply_to_image`. Default is a ZERO-COST identity —
+    with no plugin selected it returns the same `Arc` (no copy, no behaviour
+    change). Shell-facing API sits next to `set_runtime_config`:
+    `register_present_plugin` / `select_present_plugin` / `clear_present_plugin`
+    / `present_plugins` / `active_present_plugin` / `set_present_output_scale`.
+  * LICENSE BOUNDARY (GPL-2.0): Raeen ships ONLY the vendor-neutral built-ins.
+    Proprietary plugins (DLSS/Streamline) are BYO-and-unblessed — never
+    vendored, fetched, branded, or named "supported". New git-ignored
+    `plugins/` tree (`.gitignore`: `/plugins/*` + `!/plugins/README.md`) hosts
+    user-supplied plugin crates; committed `plugins/README.md` documents the
+    trait, the sketch, and the copyleft rationale. `git check-ignore` verified
+    (`plugins/dlss/*` IGNORED, README TRACKED).
+  * GREEN: 6/6 new unit tests; clippy `-D warnings` clean; fmt clean; M3
+    interactive present-path regression still passes; raeen-gui builds.
+  * FOLLOW-UPS (not done): FSR 3.1 (MIT) reference impl replacing NearestUpscale;
+    PM4-side depth/motion-vector extraction (populate `PresentFrame.depth/motion`);
+    Settings ▸ Video dropdown wiring; frame-gen scheduling of `generated`;
+    stable C-ABI `dlopen` layer for no-recompile dynamic loading.
+- Runner isolation + zero-fault leaf HLE gateway (2026-07-23; working tree,
+  no commit):
+  * SHELL CONTAINMENT: production `FirmwareLauncher` now starts the existing
+    headless `--run-eboot` path as a child process and assigns it to a Windows
+    kill-on-close Job Object. A hard-abort acceptance test proves the parent
+    survives. `quit` kills the child; native XInput/DualSense polling runs
+    inside it so process isolation does not remove physical-pad input.
+  * EXECUTABLE THUNKS: linker-visible eight-byte slots now contain rel32 calls
+    to generated shared bridges. Reviewed leaf libc calls use a SysV gateway
+    on a private 256 KiB host stack with six register args, eight stack args
+    and XMM0-7 forwarded. Unclassified/context-changing calls reconstruct
+    their index and jump to a separate no-access slow region, preserving the
+    existing VEH/CONTEXT path for exit, fibers, native traps and callbacks.
+  * MEASURED: one million `strlen` imports: VEH 4024.471 ms / 248,480 calls/s /
+    1,000,000 exceptions; direct 625.773 ms / 1,598,025 calls/s / zero HLE
+    exceptions = 6.4x dispatch speedup. The ordinary 1,000-call regression
+    also proves direct=1000 and VEH=0.
+  * HONEST GATE: this closes the requested runtime slice, not M2/M3. Those
+    remain OPEN until real screenshotable Vulkan presentation and interactive
+    2D homebrew acceptance evidence pass.
+
+- Reference gap-closure audit (2026-07-23; working tree, no commit):
+  * HONEST GATES: M2/M3 downgraded from CLOSED to OPEN. Their current AGC
+    triangle and interactive-2D proofs execute synthesized guests, which
+    violates the acceptance-gate's explicit synthetic-only prohibition.
+  * NID INTEGRITY: added a build-fail audit over the complete explicit override
+    set (reviewed count, provider canonicalization, callable target, nonzero
+    identity, and intentional name-hash mismatch). It found 25 redundant
+    `register_nid` calls whose known names already hash to the literal NID;
+    those now use ordinary name-derived registration. Only 11 intentional
+    Gen5/provider-private/unknown overrides remain. Verification: raeen-hle
+    368/368 with the one documented pre-existing eventflag hang skipped.
+  * ROADMAP: `docs/reference-gap-closure-roadmap.md` orders runner-process crash
+    containment, ABI-correct zero-fault HLE thunks, measured HLE breadth,
+    retail shader/GPU/swapchain work, media/controller output, portability and
+    REUSE/SPDX automation. Direct thunks are not a two-instruction patch:
+    SharpEmu's reference saves the SysV register/XMM/AL state, switches ABI and
+    calls a gateway; Raeen must additionally preserve its guest FS/TLS and
+    context-changing slow paths.
+
 - RE diagnosis: ASTRO.BOT +0xe03f1a NULL-base fault family (2026-07-23;
   diagnosis only, no behavior change, no commit; doc
   `docs/re/2026-07-22-astro-null-base-fault-e03f1a.md`; evidence
@@ -268,8 +338,11 @@
     whether APR submit executes ReadFile/WriteAddress records for real.
     Run artifacts: scratch/astro-cond-trace{,2,3}-20260721.log.
 
-- M3 GATE MET (2026-07-20) — interactive 2D homebrew: pad + CPU-2D draw + flip +
-  present-from-guest-memory, all exercised by a running synthesized guest.
+- M3 INFRASTRUCTURE PROOF (2026-07-20; gate remains OPEN) — pad + CPU-2D draw +
+  flip + present-from-guest-memory, all exercised by a running synthesized
+  guest. This is useful end-to-end coverage, but the acceptance-gate explicitly
+  forbids completing a milestone from a synthetic-only path. A toolchain-built
+  interactive 2D homebrew driven through the Shell is still required.
   * present-from-guest-memory (the real feature): a flip whose display buffer has
     NO GPU-drawn render target now builds the presented frame by reading the guest
     bytes at that address as pixels, using the registered VideoOut attribute
@@ -2597,13 +2670,14 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   named 'dynamic-image-descriptor' skip (SharpEmu evaluator :654-662), never
   a device-loss submit; (iv) storage-image contract validation deferred.
 
-- MILESTONE M3 CLOSED (2026-07-21): interactive 2D homebrew + pad + VideoOut flip.
+- M3 SYNTHETIC PROOF ONLY (2026-07-21; milestone OPEN): pad + VideoOut flip.
   present-from-guest-memory (SharpEmu GuestImageWantsInitialData) makes CPU-drawn
   2D visible; acceptance test crates/raeen-runtime/tests/m3_interactive_2d.rs runs
   a real synthesized guest (scePadReadState -> CPU framebuffer by input -> flip)
   and asserts output changes with input + flip advanced + last_image reflects it.
-  Pad/audio HLE already tested. NEXT GATE: M4 (commercial 2D title to interactive
-  menu with useful crash/NID/GPU logs) — blockers per per-title memories.
+  Pad/audio HLE already tested. This does NOT satisfy Raeen's acceptance-gate:
+  NEXT GATE remains M3, using a toolchain-built interactive 2D homebrew through
+  the Shell and a real VideoOut presentation path. M4 cannot be claimed first.
   CAVEAT: this commit bundled concurrent stage-D GPU texture cache whose FPS is
   UNVERIFIED (Minecraft after-run flips 43->22, build 969->59us) — re-measure via
   RAEEN_NO_TEX_CACHE A/B and revert if it regresses.
@@ -2825,3 +2899,72 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
     analysis, codegen, active-cache, Vulkan-format, and guest-memory tests cover
     the measured 1x1 type-8/format-77 descriptor. Scoped clippy, rustfmt, and
     diff checks are green. Live ASTRO frame verification remains required.
+- PERSISTENT DEPTH TARGETS + LIVE DB REGISTER WIRING (2026-07-23; working tree,
+  no commit; raeen-gpu 182/182 library + 4/4 Vulkan depth tests):
+  * `DB_DEPTH_CONTROL`, `DB_Z_INFO`, `DB_STENCIL_INFO`, and
+    `DB_Z_WRITE_BASE` now produce a real Vulkan `DepthState`. Images,
+    allocations, views, and readback buffers persist under
+    `(guest base, extent, format)`; repeated draws LOAD prior contents unless
+    guest clear flags request CLEAR. Same-base extent/format changes evict
+    safely after the immediate depth fence.
+  * Radeon 760M validation proves miss=1/hit=1 and a second clear/readback.
+    Depth draws still use immediate submit/fence/readback; depth-only draws,
+    HTile, and tiled guest-depth import/export remain open. This advances M2/M3
+    infrastructure but does not close either acceptance gate.
+- FRESH RETAIL PROBES + ASTRO PIXEL MIMG FRONTIER (2026-07-23; working tree,
+  no commit):
+  * Minecraft release probe (`scratch/minecraft-depth-20260723.out.log`,
+    45 seconds) stayed alive with 0 errors, 0 shader analysis/translation
+    failures, 0 draw skips, and no return of `s_sub_u32`; cumulative colour
+    target hits exceeded 2,100 with 3 misses. The same shader addresses were
+    nevertheless translated repeatedly because runtime binding addresses still
+    shape the cache identity: module-key normalization is the next measured
+    performance slice.
+  * Astro release probe (`scratch/astro-depth-20260723.out.log`, 45 seconds)
+    reached 6 presents and 146 deferred draws. All three original user-reported
+    failures are absent: no bad reloop boundary, no fixed-EUD-base refusal, and
+    no type-8 texture refusal.
+  * Ported KytyPS5's RDNA2 MIMG opcode meanings for the measured pixel forms:
+    ordinary `image_sample` dmask 2 and `image_sample_lz_o` dmask 1/2. The
+    offset path preserves packed signed XY offset extraction, explicit LOD 0,
+    and per-dmask channel selection. Parser, SPIR-V assembly, and Naga
+    regressions are green; full kyty-graphics is 438/438 and clippy
+    `-D warnings` is clean. Post-fix probe removes opcode 0x20/dmask2; opcode
+    0x37 advanced from the first dmask1 occurrence to the later dmask2 form,
+    which is now implemented and awaits the next release A/B.
+  * Remaining measured Astro blockers: PS read/write storage buffers;
+    `%vsharp_s0` duplicate declarations; Uniform-array stride 4 (must use a
+    legal storage layout); undefined `%buffer_store_float1`; and shader-module
+    cache churn. No M2/M3 closure claim.
+- STRUCTURAL SHADER CACHE + ASTRO GEN5 PS STORAGE (2026-07-23; working tree,
+  no commit; kyty-graphics 438/438, raeen-gpu 190/190 library tests; scoped
+  clippy clean):
+  * The active translated-module cache now follows Kyty's `ShaderGetBindIds`
+    rule: the key contains codegen/descriptor ABI structure but excludes
+    per-bind guest addresses, resource extents/counts, sampler payloads, and
+    direct-SGPR values. Texture dimension/format, embedded constants,
+    EUD/global-memory declarations, LDS size, and every stage codegen flag
+    remain keyed. Cache hits return the current analysis metadata, so Vulkan
+    descriptors never reuse stale guest bases. The cache stays FIFO-bounded at
+    256 entries.
+  * Minecraft release A/B
+    (`scratch/minecraft-cache-structural-20260723.out.log`, 40 s) stayed at
+    0 errors / 0 shader failures, reached target hits at present 8 and present
+    256, while compile events fell from >2,100 in the prior probe to 81 across
+    8 shader addresses (remaining events are distinct structural variants).
+  * Fixed three newly exposed Astro module defects: push-table spills use a
+    tightly packed `StorageBuffer` instead of invalid std140 `Uniform` stride
+    4; V#/T#/S# seeding uses descriptor-slot-qualified SSA ids so overlapping
+    SGPR ranges assemble; multi-dword/typed buffer stores include their
+    transitive `%buffer_store_float1` helper.
+  * Gen5 pixel read-write storage buffers now pass analysis and bind as
+    fragment-visible Vulkan `STORAGE_BUFFER`s; the PS4/legacy rejection stays.
+    Astro release A/B (`scratch/astro-psrw-20260723.out.log`, 42 s) reached
+    6 presents with 55 successful translations, 0 translation failures, and
+    0 shader-analysis errors. The prior PS-RW rejection, duplicate vsharp,
+    stride-4, and undefined-store failures are all absent.
+  * Honest remaining limitation: deferred graphics storage buffers are uploaded
+    and visible to fragment shaders, but GPU writes are not copied back into
+    guest memory at batch retirement yet. M2/M3 therefore remain open; next
+    correctness slice is fragment-SSBO writeback plus non-synthetic visible/
+    interactive acceptance evidence.

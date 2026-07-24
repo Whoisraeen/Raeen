@@ -69,6 +69,11 @@ pub struct DrawCacheStats {
     pub shader_module_misses: u64,
     pub target_hits: u64,
     pub target_misses: u64,
+    /// Persistent depth/stencil attachment reuse. A hit avoids
+    /// `vkCreateImage` + allocation + view creation for a draw that reuses
+    /// the same guest `DB_Z_WRITE_BASE`, extent, and format.
+    pub depth_target_hits: u64,
+    pub depth_target_misses: u64,
     pub seed_uploads_skipped: u64,
     pub deferred_draws: u64,
     pub batch_flushes: u64,
@@ -238,6 +243,27 @@ pub(crate) struct PersistentTarget {
     pub content: TargetContent,
 }
 
+/// Identity of one guest depth/stencil surface. Like [`TargetKey`], creation
+/// parameters are part of the key so reprogramming an address cannot serve an
+/// incompatible Vulkan image.
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
+pub(crate) struct DepthTargetKey {
+    pub base: u64,
+    pub width: u32,
+    pub height: u32,
+    pub format: i32,
+}
+
+/// Device-side depth/stencil attachment retained across draws.
+#[derive(Clone, Copy)]
+pub(crate) struct PersistentDepthTarget {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub view: vk::ImageView,
+    pub readback_buffer: vk::Buffer,
+    pub readback_memory: vk::DeviceMemory,
+}
+
 /// A guest texture kept alive on the device across draws (stage D item 1).
 ///
 /// The key is the SOURCE identity: the T#'s guest base address plus every
@@ -343,6 +369,7 @@ pub(crate) struct DrawCaches {
     /// Keyed by linear-vs-nearest — the only sampler state decoded today.
     samplers: HashMap<bool, vk::Sampler>,
     targets: HashMap<TargetKey, PersistentTarget>,
+    depth_targets: HashMap<DepthTargetKey, PersistentDepthTarget>,
     /// Persistent guest textures (stage D item 1) — see [`PersistentTexture`]
     /// for the invalidation contract.
     textures: HashMap<TextureKey, PersistentTexture>,
@@ -869,6 +896,48 @@ impl DrawCaches {
         self.targets.insert(key, target);
     }
 
+    pub(crate) fn acquire_depth_target(
+        &mut self,
+        key: &DepthTargetKey,
+    ) -> Option<PersistentDepthTarget> {
+        let entry = self.depth_targets.get(key).copied()?;
+        self.stats.depth_target_hits += 1;
+        Some(entry)
+    }
+
+    pub(crate) fn insert_depth_target(
+        &mut self,
+        key: DepthTargetKey,
+        target: PersistentDepthTarget,
+    ) {
+        self.stats.depth_target_misses += 1;
+        self.depth_targets.insert(key, target);
+    }
+
+    /// Remove stale images when the guest reprograms one depth base with a
+    /// different extent/format. Immediate depth draws fence-wait before the
+    /// next cache acquisition, so no submitted work can still name them.
+    pub(crate) fn evict_depth_targets_for_base(
+        &mut self,
+        device: &ash::Device,
+        base: u64,
+        keep: &DepthTargetKey,
+    ) {
+        let stale: Vec<_> = self
+            .depth_targets
+            .keys()
+            .filter(|key| key.base == base && *key != keep)
+            .copied()
+            .collect();
+        for key in stale {
+            if let Some(target) = self.depth_targets.remove(&key) {
+                // SAFETY: depth-bearing draws currently use the immediate path,
+                // whose fence completed before the cache lock was released.
+                unsafe { destroy_depth_target(device, &target) };
+            }
+        }
+    }
+
     /// The cached texture for `key`, if one is live: its view (bindable with
     /// no barrier — the image rests in `SHADER_READ_ONLY_OPTIMAL`) and the
     /// sample-hash its content was uploaded under. Stamps the LRU clock.
@@ -1326,6 +1395,9 @@ impl DrawCaches {
             for (_, target) in self.targets.drain() {
                 destroy_target(device, &target);
             }
+            for (_, target) in self.depth_targets.drain() {
+                destroy_depth_target(device, &target);
+            }
             for (_, texture) in self.textures.drain() {
                 device.destroy_image_view(texture.view, None);
                 device.destroy_image(texture.image, None);
@@ -1422,6 +1494,17 @@ unsafe fn destroy_target(device: &ash::Device, target: &PersistentTarget) {
     }
 }
 
+unsafe fn destroy_depth_target(device: &ash::Device, target: &PersistentDepthTarget) {
+    // SAFETY: forwarded from the caller's no-live-work contract.
+    unsafe {
+        device.destroy_image_view(target.view, None);
+        device.destroy_image(target.image, None);
+        device.free_memory(target.memory, None);
+        device.destroy_buffer(target.readback_buffer, None);
+        device.free_memory(target.readback_memory, None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1484,5 +1567,24 @@ mod tests {
         };
         assert_ne!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn depth_target_keys_include_guest_identity_extent_and_format() {
+        let a = DepthTargetKey {
+            base: 0x4000,
+            width: 1280,
+            height: 720,
+            format: vk::Format::D32_SFLOAT.as_raw(),
+        };
+        assert_ne!(a, DepthTargetKey { base: 0x8000, ..a });
+        assert_ne!(a, DepthTargetKey { width: 1920, ..a });
+        assert_ne!(
+            a,
+            DepthTargetKey {
+                format: vk::Format::D16_UNORM.as_raw(),
+                ..a
+            }
+        );
     }
 }

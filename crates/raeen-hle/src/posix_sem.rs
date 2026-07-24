@@ -19,9 +19,9 @@
 //! [`crate::libkernel::set_guest_errno`].
 
 use crate::{HleContext, HleRegistry};
+use raeen_kernel::PosixSem;
 use std::sync::Arc;
 use tracing::debug;
-use raeen_kernel::PosixSem;
 
 const OK: u64 = 0;
 const MINUS_ONE: u64 = u64::MAX;

@@ -1,92 +1,121 @@
-//! The trampoline guard region: a `PAGE_NOACCESS` reservation over
-//! `[HLE_TRAMPOLINE_BASE, ..)` so a guest `call [import_slot]` through an
-//! HLE-resolved relocation slot faults deterministically (design doc §2/§4),
-//! plus the faulting-address → [`HleTrampoline`] lookup the VEH uses to
-//! service that fault.
+//! Executable HLE import slots plus the legacy fault-dispatch guard.
+//!
+//! Linker-visible slots remain eight bytes wide at
+//! [`HLE_TRAMPOLINE_BASE`]. Each contains a relative call to one of two nearby
+//! bridges. Reviewed leaf imports use the zero-fault direct bridge; every
+//! other import reconstructs its slot index and jumps into a separate
+//! `PAGE_NOACCESS` range so the existing VEH path retains full machine-context
+//! control.
 
 use core::ffi::c_void;
 
-use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, VirtualAlloc,
-    VirtualFree,
-};
-
 use raeen_firmware::{HLE_TRAMPOLINE_BASE, HleTrampoline};
+use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+use windows_sys::Win32::System::Memory::{
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS,
+    PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+};
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::RuntimeError;
 
-/// x86-64 Windows' page size (see `mem.rs`'s equivalent constant).
 const PAGE_SIZE: u64 = 4096;
-
-/// Executable helper kept separate from the no-access HLE guard. Windows can
-/// discard a user-written FS base while returning from a vectored exception;
-/// resuming at this stub makes WRFSBASE the first guest-side instruction.
+const SLOT_SIZE: u64 = 8;
+const SLOT_CODE_LEN: u64 = 5;
 const TLS_REARM_TRAMPOLINE_BASE: u64 = HLE_TRAMPOLINE_BASE - 0x1_0000;
 
+/// Per-index no-access targets for the compatibility VEH path.
+pub(crate) const HLE_SLOW_TRAMPOLINE_BASE: u64 = HLE_TRAMPOLINE_BASE + 0x1000_0000;
+
 // wrfsbase r11; pop r11; ret
-//
-// The VEH stages the original R11 and fault RIP on the guest stack and puts
-// the desired TCB in R11. The stub restores FS, restores R11, and returns to
-// the faulting instruction with every guest register and flag unchanged.
 const TLS_REARM_CODE: [u8; 8] = [0xF3, 0x49, 0x0F, 0xAE, 0xD3, 0x41, 0x5B, 0xC3];
 
-/// A `PAGE_NOACCESS` reservation covering `trampoline_count` HLE trampoline
-/// slots (8 bytes each) starting at [`HLE_TRAMPOLINE_BASE`], plus an invalid
-/// diagnostic sentinel at index `count` and a controlled return trampoline at
-/// index `count + 1`. Reserved, not committed — unmapped and reserved memory
-/// already faults on access exactly like committed `PAGE_NOACCESS` memory,
-/// so no commit is needed for this guard's purpose. Freed via `VirtualFree`
-/// on `Drop`.
 pub(crate) struct TrampolineGuard {
-    base: u64,
-    /// Actual reserved length in bytes (page-rounded; always `>=` the
-    /// logical `trampoline_count * 8 + 16` span).
+    code_base: u64,
+    slow_base: u64,
     len: u64,
     return_trampoline: u64,
     tls_rearm_trampoline: u64,
 }
 
 impl TrampolineGuard {
-    /// Reserve the guard region for a module with `trampoline_count`
-    /// distinct HLE trampolines.
-    pub(crate) fn reserve(trampoline_count: usize) -> Result<Self, RuntimeError> {
-        // Keep index `count` as the invalid-trampoline diagnostic sentinel.
-        // A normal guest return targets the following guarded slot.
-        let return_trampoline = HLE_TRAMPOLINE_BASE + (trampoline_count as u64 + 1) * 8;
-        let logical_len = (trampoline_count as u64) * 8 + 16;
-        let reserved_len = logical_len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    pub(crate) fn reserve(trampolines: &[HleTrampoline]) -> Result<Self, RuntimeError> {
+        let count = trampolines.len();
+        let logical_len = count as u64 * SLOT_SIZE + 16;
+        let slow_len = logical_len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        let return_trampoline = HLE_SLOW_TRAMPOLINE_BASE + (count as u64 + 1) * SLOT_SIZE;
 
-        // SAFETY: `HLE_TRAMPOLINE_BASE` is a fixed, page-aligned (indeed
-        // 64 KiB-aligned) high sentinel address (design doc §2/§7), passed
-        // as an explicit non-null `lpAddress`. `VirtualAlloc` with an
-        // explicit address either reserves exactly that address range or
-        // fails (returns null) — it never silently relocates elsewhere.
-        // `MEM_RESERVE` (no `MEM_COMMIT`) with `PAGE_NOACCESS` is a
-        // well-formed request; the reservation is freed exactly once in
-        // `Drop`.
-        let raw = unsafe {
+        let slow = unsafe {
             VirtualAlloc(
-                HLE_TRAMPOLINE_BASE as *const c_void,
-                reserved_len as usize,
+                HLE_SLOW_TRAMPOLINE_BASE as *const c_void,
+                slow_len as usize,
                 MEM_RESERVE,
                 PAGE_NOACCESS,
             )
         };
-        if raw.is_null() {
-            // Per design doc §2 step 2: report if the fixed address is
-            // unusable rather than silently relocating (which would break
-            // the deterministic HLE_TRAMPOLINE_BASE-relative addressing the
-            // LM1 linker already baked into the module's relocation slots).
+        if slow.is_null() {
             return Err(RuntimeError::MapFailed);
         }
-        debug_assert_eq!(
-            raw as u64, HLE_TRAMPOLINE_BASE,
-            "VirtualAlloc with an explicit lpAddress must return that exact address on success"
-        );
 
-        // SAFETY: this fixed page is disjoint from the HLE guard and guest
-        // arena. It is committed executable so the VEH can resume through the
-        // eight-byte register-preserving re-arm stub copied below.
+        // Leave room after the compact slots for both generated bridges.
+        let code_len = (logical_len + 512).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        let code = unsafe {
+            VirtualAlloc(
+                HLE_TRAMPOLINE_BASE as *const c_void,
+                code_len as usize,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        if code.is_null() {
+            unsafe { VirtualFree(slow, 0, MEM_RELEASE) };
+            return Err(RuntimeError::MapFailed);
+        }
+
+        let slow_bridge = HLE_TRAMPOLINE_BASE + logical_len;
+        let direct_bridge = slow_bridge + 64;
+        let slow_code = slow_bridge_code();
+        let direct_code = direct_bridge_code();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                slow_code.as_ptr(),
+                slow_bridge as *mut u8,
+                slow_code.len(),
+            );
+            core::ptr::copy_nonoverlapping(
+                direct_code.as_ptr(),
+                direct_bridge as *mut u8,
+                direct_code.len(),
+            );
+        }
+        for (index, trampoline) in trampolines.iter().enumerate() {
+            let slot = HLE_TRAMPOLINE_BASE + index as u64 * SLOT_SIZE;
+            write_call_slot(
+                slot,
+                if direct_leaf(trampoline) {
+                    direct_bridge
+                } else {
+                    slow_bridge
+                },
+            );
+        }
+        // Index `count` is the invalid-trampoline diagnostic sentinel.
+        write_call_slot(HLE_TRAMPOLINE_BASE + count as u64 * SLOT_SIZE, slow_bridge);
+
+        let mut old_protect = 0;
+        if unsafe { VirtualProtect(code, code_len as usize, PAGE_EXECUTE_READ, &mut old_protect) }
+            == 0
+        {
+            unsafe {
+                VirtualFree(code, 0, MEM_RELEASE);
+                VirtualFree(slow, 0, MEM_RELEASE);
+            }
+            return Err(RuntimeError::MapFailed);
+        }
+        unsafe {
+            FlushInstructionCache(GetCurrentProcess(), code, code_len as usize);
+        }
+
         let rearm = unsafe {
             VirtualAlloc(
                 TLS_REARM_TRAMPOLINE_BASE as *const c_void,
@@ -96,13 +125,12 @@ impl TrampolineGuard {
             )
         };
         if rearm.is_null() {
-            // SAFETY: `raw` is the exact successful guard reservation above.
-            unsafe { VirtualFree(raw, 0, MEM_RELEASE) };
+            unsafe {
+                VirtualFree(code, 0, MEM_RELEASE);
+                VirtualFree(slow, 0, MEM_RELEASE);
+            }
             return Err(RuntimeError::MapFailed);
         }
-        // SAFETY: `rearm` points to a freshly committed writable page at least
-        // TLS_REARM_CODE.len() bytes long, and the source is a non-overlapping
-        // static byte array.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 TLS_REARM_CODE.as_ptr(),
@@ -112,25 +140,22 @@ impl TrampolineGuard {
         }
 
         Ok(Self {
-            base: HLE_TRAMPOLINE_BASE,
-            len: reserved_len,
+            code_base: HLE_TRAMPOLINE_BASE,
+            slow_base: HLE_SLOW_TRAMPOLINE_BASE,
+            len: slow_len,
             return_trampoline,
             tls_rearm_trampoline: TLS_REARM_TRAMPOLINE_BASE,
         })
     }
 
-    /// The guard region's base address (== [`HLE_TRAMPOLINE_BASE`] on a
-    /// successful `reserve`).
     pub(crate) fn base(&self) -> u64 {
-        self.base
+        self.slow_base
     }
 
-    /// The guard region's actual (page-rounded) length in bytes.
     pub(crate) fn len(&self) -> u64 {
         self.len
     }
 
-    /// Dedicated guarded address used as the return target for guest calls.
     pub(crate) fn return_trampoline(&self) -> u64 {
         self.return_trampoline
     }
@@ -142,23 +167,90 @@ impl TrampolineGuard {
 
 impl Drop for TrampolineGuard {
     fn drop(&mut self) {
-        // SAFETY: `self.base` is the exact pointer `VirtualAlloc` returned
-        // in `reserve`, freed exactly once here with `dwSize = 0` as
-        // `MEM_RELEASE` requires.
         unsafe {
-            VirtualFree(self.base as *mut c_void, 0, MEM_RELEASE);
+            VirtualFree(self.code_base as *mut c_void, 0, MEM_RELEASE);
+            VirtualFree(self.slow_base as *mut c_void, 0, MEM_RELEASE);
             VirtualFree(self.tls_rearm_trampoline as *mut c_void, 0, MEM_RELEASE);
         }
     }
 }
 
-/// Map a faulting address within the trampoline region to the
-/// [`HleTrampoline`] it names: `idx = (fault_addr - HLE_TRAMPOLINE_BASE) /
-/// 8`, indexed into `trampolines`. Returns `None` if `fault_addr` precedes
-/// [`HLE_TRAMPOLINE_BASE`] or names an index past `trampolines.len()` (an
-/// unmapped/unresolved trampoline slot).
 pub(crate) fn resolve(fault_addr: u64, trampolines: &[HleTrampoline]) -> Option<&HleTrampoline> {
-    let offset = fault_addr.checked_sub(HLE_TRAMPOLINE_BASE)?;
-    let idx = usize::try_from(offset / 8).ok()?;
+    let offset = fault_addr.checked_sub(HLE_SLOW_TRAMPOLINE_BASE)?;
+    let idx = usize::try_from(offset / SLOT_SIZE).ok()?;
     trampolines.get(idx)
+}
+
+fn direct_leaf(trampoline: &HleTrampoline) -> bool {
+    if std::env::var_os("RAEEN_DISABLE_DIRECT_HLE").is_some() {
+        return false;
+    }
+    matches!(
+        trampoline.function.as_str(),
+        "strlen" | "strcmp" | "strncmp" | "memcmp" | "bcmp"
+    )
+}
+
+fn write_call_slot(slot: u64, target: u64) {
+    let displacement = i32::try_from(target as i128 - (slot + SLOT_CODE_LEN) as i128)
+        .expect("generated HLE bridges remain within rel32 range");
+    let mut code = [0x90u8; SLOT_SIZE as usize];
+    code[0] = 0xE8;
+    code[1..5].copy_from_slice(&displacement.to_le_bytes());
+    unsafe {
+        core::ptr::copy_nonoverlapping(code.as_ptr(), slot as *mut u8, code.len());
+    }
+}
+
+fn slow_bridge_code() -> Vec<u8> {
+    // Drop the bridge's internal return address before jumping to the
+    // corresponding no-access slot. The VEH therefore sees the exact stack
+    // shape it saw before executable slots existed.
+    let mut code = vec![0x48, 0x8B, 0x04, 0x24, 0x49, 0xBB]; // mov rax,[rsp]; mov r11,imm64
+    code.extend_from_slice(&(HLE_TRAMPOLINE_BASE + 5).to_le_bytes());
+    code.extend_from_slice(&[0x4C, 0x29, 0xD8, 0x49, 0xBB]); // sub rax,r11; mov r11,imm64
+    code.extend_from_slice(&HLE_SLOW_TRAMPOLINE_BASE.to_le_bytes());
+    code.extend_from_slice(&[
+        0x4C, 0x01, 0xD8, // add rax,r11
+        0x48, 0x83, 0xC4, 0x08, // add rsp,8
+        0xFF, 0xE0, // jmp rax
+    ]);
+    code
+}
+
+fn direct_bridge_code() -> Vec<u8> {
+    // fs:0x7f0 points at DirectThreadState { context, host_stack_top }.
+    let mut c = vec![
+        0x64, 0x4C, 0x8B, 0x1C, 0x25, 0xF0, 0x07, 0x00, 0x00, // mov r11,fs:[7f0]
+        0x49, 0x89, 0xE2, // mov r10,rsp
+        0x49, 0x8B, 0x63, 0x08, // mov rsp,[r11+8]
+        0x48, 0x83, 0xE4, 0xF0, // and rsp,-16
+        0x48, 0x83, 0xEC, 0x60, // sub rsp,96
+        0x48, 0x89, 0x44, 0x24, 0x18, // mov [rsp+24],rax
+        0x49, 0x8B, 0x03, // mov rax,[r11]
+        0x48, 0x89, 0x44, 0x24, 0x10, // mov [rsp+16],rax
+        0x4C, 0x89, 0x54, 0x24, 0x08, // mov [rsp+8],r10
+        0x49, 0x8B, 0x02, // mov rax,[r10]
+        0x49, 0xBB, // mov r11,base+5
+    ];
+    c.extend_from_slice(&(HLE_TRAMPOLINE_BASE + 5).to_le_bytes());
+    c.extend_from_slice(&[
+        0x4C, 0x29, 0xD8, // sub rax,r11
+        0x48, 0xC1, 0xE8, 0x03, // shr rax,3
+        0x48, 0x89, 0x04, 0x24, // mov [rsp],rax
+    ]);
+    for n in 0u8..8 {
+        c.extend_from_slice(&[0x66, 0x0F, 0xD6, 0x44 | (n << 3), 0x24, 32 + n * 8]);
+    }
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax,gateway
+    c.extend_from_slice(
+        &(crate::dispatch::direct_hle_gateway as *const () as usize as u64).to_le_bytes(),
+    );
+    c.extend_from_slice(&[
+        0xFF, 0xD0, // call rax
+        0x4C, 0x8B, 0x54, 0x24, 0x08, // mov r10,[rsp+8]
+        0x49, 0x8D, 0x62, 0x08, // lea rsp,[r10+8]
+        0xC3, // ret to the original guest caller
+    ]);
+    c
 }

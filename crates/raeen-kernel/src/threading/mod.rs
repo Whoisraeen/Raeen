@@ -6,10 +6,10 @@
 pub mod sync;
 
 use parking_lot::RwLock;
-use std::collections::HashMap;
-use tracing::{debug, info};
 use raeen_core::error::KernelError;
 use raeen_core::types::Tid;
+use std::collections::HashMap;
+use tracing::{debug, info};
 
 /// Information about an emulated PS5 thread.
 #[derive(Debug, Clone)]

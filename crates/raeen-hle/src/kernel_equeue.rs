@@ -35,16 +35,10 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "sceKernelAddUserEvent", hle_add_user_event);
     registry.register("libkernel", "sceKernelAddUserEventEdge", hle_add_user_event);
     registry.register("libkernel", "sceKernelAddAmprEvent", hle_add_ampr_event);
-    registry.register_nid(
-        "libkernel",
-        "sceKernelAddReadEvent",
-        0x5470_92de_b09d_d0f3,
-        hle_add_read_event,
-    );
-    registry.register_nid(
+    registry.register("libkernel", "sceKernelAddReadEvent", hle_add_read_event);
+    registry.register(
         "libkernel",
         "sceKernelDeleteReadEvent",
-        0x2712_78b5_f80a_9570,
         hle_delete_read_event,
     );
     registry.register("libkernel", "sceKernelAddWriteEvent", hle_add_write_event);
@@ -523,22 +517,8 @@ mod tests {
         );
 
         let registry = HleRegistry::new();
-        assert!(
-            registry
-                .registered_nid_overrides()
-                .iter()
-                .any(|(nid, key)| {
-                    *nid == 0x5470_92de_b09d_d0f3 && key == "libkernel::sceKernelAddReadEvent"
-                })
-        );
-        assert!(
-            registry
-                .registered_nid_overrides()
-                .iter()
-                .any(|(nid, key)| {
-                    *nid == 0x2712_78b5_f80a_9570 && key == "libkernel::sceKernelDeleteReadEvent"
-                })
-        );
+        assert!(registry.is_implemented("libkernel", "sceKernelAddReadEvent"));
+        assert!(registry.is_implemented("libkernel", "sceKernelDeleteReadEvent"));
     }
 
     #[test]

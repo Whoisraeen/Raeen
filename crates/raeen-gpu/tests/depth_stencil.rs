@@ -50,6 +50,7 @@ fn backend_or_skip(name: &str) -> Option<VulkanBackend> {
 /// reads back `clear`.
 fn cleared_depth_state(format: vk::Format, clear: f32) -> DepthState<'static> {
     DepthState {
+        target_base: None,
         format,
         test_enable: false,
         write_enable: false,
@@ -65,6 +66,41 @@ fn cleared_depth_state(format: vk::Format, clear: f32) -> DepthState<'static> {
         initial: None,
         initial_stencil: None,
     }
+}
+
+#[test]
+fn persistent_depth_target_reuses_image_for_same_guest_surface() {
+    let Some(backend) =
+        backend_or_skip("persistent_depth_target_reuses_image_for_same_guest_surface")
+    else {
+        return;
+    };
+    let dev = backend.device().expect("backend is initialized");
+    let vs = triangle_vertex_spirv();
+    let ps = triangle_fragment_spirv();
+
+    for clear in [0.25, 0.75] {
+        let state = DrawState {
+            vertices: Some(&TRIANGLE_VERTICES),
+            vertex_count: TRIANGLE_VERTICES.len() as u32,
+            depth: Some(DepthState {
+                target_base: Some(0x1234_0000),
+                ..cleared_depth_state(vk::Format::D32_SFLOAT, clear)
+            }),
+            ..DrawState::new(W, H, &vs, &ps)
+        };
+        let output = render_draw(dev, &state).expect("persistent depth draw");
+        let image = output.depth.expect("depth readback");
+        let actual = image.depth_at(0, 0).expect("depth texel");
+        assert!((actual - clear).abs() <= DEPTH_TOLERANCE);
+    }
+
+    let stats = dev.draw_cache_stats();
+    assert_eq!(stats.depth_target_misses, 1, "first bind creates the image");
+    assert_eq!(
+        stats.depth_target_hits, 1,
+        "second bind reuses the same image/view/allocation"
+    );
 }
 
 #[test]

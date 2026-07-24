@@ -49,15 +49,15 @@ pub use recompile::{
 pub use resources::{
     ShaderBindResources, ShaderBufferResource, ShaderComputeInputInfo, ShaderEmbeddedBufferFetch,
     ShaderEmbeddedBufferFetches, ShaderEmbeddedConstantLoad, ShaderEmbeddedConstantLoads,
-    ShaderEudRawResources, ShaderId, ShaderMappedData, ShaderPixelInputInfo, ShaderSamplerResource,
-    ShaderSemantic, ShaderSharp, ShaderTextureResource, ShaderUserData, ShaderVertexInputBuffer,
-    ShaderVertexInputInfo,
+    ShaderEudRawResources, ShaderGlobalMemResources, ShaderId, ShaderMappedData,
+    ShaderPixelInputInfo, ShaderSamplerResource, ShaderSemantic, ShaderSharp,
+    ShaderTextureResource, ShaderUserData, ShaderVertexInputBuffer, ShaderVertexInputInfo,
 };
 pub use spirv::{
     PUSH_CONSTANT_SPILL_THRESHOLD, SampledClass, SampledDim, ShaderRecompileError, Spirv,
     SpirvType, SpirvValue, sampled_key_ordinal, shader_detect_eud_raw_window,
-    shader_push_constant_spill_binding, spirv_generate_source, spirv_get_embedded_ps,
-    spirv_get_embedded_vs,
+    shader_detect_flat_global_window, shader_push_constant_spill_binding, spirv_generate_source,
+    spirv_get_embedded_ps, spirv_get_embedded_vs,
 };
 pub use types::{
     DppCtrl, DppMode, ShaderCode, ShaderConstant, ShaderControlFlowBlock, ShaderDebugPrintf,

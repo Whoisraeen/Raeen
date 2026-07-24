@@ -31,6 +31,7 @@ pub(crate) mod draw_translate;
 pub mod gnm;
 mod guest_mem;
 pub mod metal;
+pub mod present_plugin;
 pub mod shader;
 pub mod shader_bridge;
 pub(crate) mod shader_fetch;
@@ -44,5 +45,8 @@ pub use agc_exec::{AgcGpuSession, GpuProcessSession, ScissorHalf, build_cp_draw_
 pub use backend::{BackendKind, GpuBackend, ShaderFormat, create_backend, default_backend_kind};
 pub use contracts::{ShaderMappedData, ShaderSemantic, ShaderSharp, ShaderUserData};
 pub use guest_mem::GpuGuestMemory;
+pub use present_plugin::{
+    Capabilities, PluginFrame, PluginOutput, PresentContext, PresentFrame, PresentPlugin,
+};
 pub use shader_fetch::ShaderCacheStats;
 pub use vulkan::offscreen::RenderedImage;

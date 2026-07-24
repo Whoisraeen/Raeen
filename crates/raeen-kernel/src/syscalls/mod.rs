@@ -10,8 +10,8 @@ pub mod process;
 pub mod thread;
 
 use crate::OrbisKernel;
-use tracing::{debug, warn};
 use raeen_core::error::KernelError;
+use tracing::{debug, warn};
 
 // ─── FreeBSD / Orbis syscall numbers ───────────────────────────────
 // These are based on FreeBSD 11 (PS5 kernel base) with Sony extensions.

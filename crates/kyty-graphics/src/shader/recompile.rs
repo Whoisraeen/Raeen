@@ -3580,6 +3580,192 @@ fn recompile_buffer_store_format_x_flexible(
     )
 }
 
+/// Beyond Kyty (SharpEmu PR #587): lower a FLAT-class (FLAT / GLOBAL) direct
+/// guest-memory load/store to a `%global_mem` window access.
+///
+/// The window is a `uint[]` SSBO whose first two dwords are the window's guest
+/// base address (host-filled) and whose remaining dwords are the window bytes.
+/// A 64-bit guest address becomes a dword index by
+/// `((addr_lo - base_lo) >> 2)` — a 32-bit subtraction, exactly as SharpEmu's
+/// `ISub` (`Gen5SpirvTranslator.cs`): the wrap absorbs any carry and the window
+/// is < 4 GiB, so the low dword alone is exact. The address itself is
+/// reconstructed per `ShaderInstruction::uses_flat_address`: a FLAT op reads
+/// the whole address from the VGPR pair (`src[0]`); a GLOBAL op adds the SGPR
+/// base pair (`src[1]`) to the 32-bit VGPR offset. `src[2]` is the instruction
+/// immediate offset. Loads past the bound length yield 0; stores past it drop
+/// (RDNA out-of-bounds behaviour).
+fn flat_mem(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    func: &'static str,
+    dwords: i32,
+    is_store: bool,
+) -> Result<bool, ShaderRecompileError> {
+    let inst = inst_at(code, index, func)?;
+
+    let Some(bind) = spirv.get_bind_info() else {
+        return Ok(false);
+    };
+    if !bind.global_mem.used {
+        // Detection (`shader_detect_flat_global_window`) must have declared the
+        // window whenever a FLAT-class op is present; refuse by name rather
+        // than reference an undeclared `%global_mem`.
+        return Err(not_supported(func, "global_mem window not declared"));
+    }
+
+    let addr = operand_variable_to_str_shift(inst.src[0], 0);
+    if addr.type_ != SpirvType::Float {
+        return Err(not_supported(func, "unexpected FLAT address VGPR type"));
+    }
+
+    let off_c = spirv.get_constant_uint(inst.src[2].constant.u);
+    let two_c = spirv.get_constant_uint(2);
+    let i = format!("{index}");
+    let mut text = String::new();
+
+    // Window base low dword (%global_mem[0]).
+    text += &format!(
+        "        %flat_bp_{i} = OpAccessChain %_ptr_StorageBuffer_uint %global_mem %int_0 %uint_0
+        %flat_base_{i} = OpLoad %uint %flat_bp_{i}
+        %flat_a0_{i} = OpLoad %float %{av}
+        %flat_a1_{i} = OpBitcast %uint %flat_a0_{i}
+",
+        av = addr.value
+    );
+
+    // Full byte address: FLAT reads it whole from the VGPR pair; GLOBAL adds
+    // the SGPR base pair to the 32-bit VGPR offset.
+    if inst.uses_flat_address {
+        text += &format!("        %flat_ab_{i} = OpIAdd %uint %flat_a1_{i} %uint_0\n");
+    } else {
+        let base = operand_variable_to_str_shift(inst.src[1], 0);
+        if base.type_ != SpirvType::Uint {
+            return Err(not_supported(func, "unexpected GLOBAL SGPR base type"));
+        }
+        text += &format!(
+            "        %flat_sb_{i} = OpLoad %uint %{bv}
+        %flat_ab_{i} = OpIAdd %uint %flat_sb_{i} %flat_a1_{i}
+",
+            bv = base.value
+        );
+    }
+
+    // byte offset into the window, then dword index (+2 skips the base header).
+    text += &format!(
+        "        %flat_ao_{i} = OpIAdd %uint %flat_ab_{i} %{off_c}
+        %flat_bo_{i} = OpISub %uint %flat_ao_{i} %flat_base_{i}
+        %flat_di_{i} = OpShiftRightLogical %uint %flat_bo_{i} %{two_c}
+        %flat_bi_{i} = OpIAdd %uint %flat_di_{i} %{two_c}
+        %flat_len_{i} = OpArrayLength %uint %global_mem 0
+        %flat_lenm1_{i} = OpISub %uint %flat_len_{i} %uint_1
+"
+    );
+
+    for k in 0..dwords {
+        let kc = spirv.get_constant_uint(u32::try_from(k).unwrap_or(0));
+        let dv = operand_variable_to_str_shift(inst.dst, k);
+        if dv.type_ != SpirvType::Float {
+            return Err(not_supported(func, "unexpected FLAT data VGPR type"));
+        }
+        text += &format!(
+            "        %flat_idx_{i}_{k} = OpIAdd %uint %flat_bi_{i} %{kc}
+        %flat_cidx_{i}_{k} = OpExtInst %uint %GLSL_std_450 UMin %flat_idx_{i}_{k} %flat_lenm1_{i}
+        %flat_ptr_{i}_{k} = OpAccessChain %_ptr_StorageBuffer_uint %global_mem %int_0 %flat_cidx_{i}_{k}
+        %flat_inb_{i}_{k} = OpULessThan %bool %flat_idx_{i}_{k} %flat_len_{i}
+"
+        );
+        if is_store {
+            // Out-of-bounds stores drop; in-bounds stores write the dword. (A
+            // full exec-mask guard is a later refinement — inactive lanes are
+            // not masked here.)
+            text += &format!(
+                "        %flat_dv0_{i}_{k} = OpLoad %float %{dv}
+        %flat_dv1_{i}_{k} = OpBitcast %uint %flat_dv0_{i}_{k}
+               OpSelectionMerge %flat_sm_{i}_{k} None
+               OpBranchConditional %flat_inb_{i}_{k} %flat_st_{i}_{k} %flat_sm_{i}_{k}
+        %flat_st_{i}_{k} = OpLabel
+               OpStore %flat_ptr_{i}_{k} %flat_dv1_{i}_{k}
+               OpBranch %flat_sm_{i}_{k}
+        %flat_sm_{i}_{k} = OpLabel
+",
+                dv = dv.value
+            );
+        } else {
+            text += &format!(
+                "        %flat_lv_{i}_{k} = OpLoad %uint %flat_ptr_{i}_{k}
+        %flat_res_{i}_{k} = OpSelect %uint %flat_inb_{i}_{k} %flat_lv_{i}_{k} %uint_0
+        %flat_fv_{i}_{k} = OpBitcast %float %flat_res_{i}_{k}
+               OpStore %{dv} %flat_fv_{i}_{k}
+",
+                dv = dv.value
+            );
+        }
+    }
+
+    *dst_source += &text;
+    Ok(true)
+}
+
+macro_rules! flat_mem_recompiler {
+    ($name:ident, $func:literal, $dwords:literal, $is_store:literal) => {
+        fn $name(
+            index: u32,
+            code: &ShaderCode,
+            dst_source: &mut String,
+            spirv: &Spirv<'_>,
+            _param: &Params,
+            _scc_check: SccCheck,
+        ) -> Result<bool, ShaderRecompileError> {
+            flat_mem(index, code, dst_source, spirv, $func, $dwords, $is_store)
+        }
+    };
+}
+
+flat_mem_recompiler!(
+    recompile_flat_load_dword,
+    "Recompile_FlatLoadDword",
+    1,
+    false
+);
+flat_mem_recompiler!(
+    recompile_flat_load_dwordx2,
+    "Recompile_FlatLoadDwordX2",
+    2,
+    false
+);
+flat_mem_recompiler!(
+    recompile_flat_load_dwordx3,
+    "Recompile_FlatLoadDwordX3",
+    3,
+    false
+);
+flat_mem_recompiler!(
+    recompile_flat_load_dwordx4,
+    "Recompile_FlatLoadDwordX4",
+    4,
+    false
+);
+flat_mem_recompiler!(
+    recompile_flat_store_dword,
+    "Recompile_FlatStoreDword",
+    1,
+    true
+);
+flat_mem_recompiler!(
+    recompile_flat_store_dwordx2,
+    "Recompile_FlatStoreDwordX2",
+    2,
+    true
+);
+flat_mem_recompiler!(
+    recompile_flat_store_dwordx4,
+    "Recompile_FlatStoreDwordX4",
+    4,
+    true
+);
+
 /// Beyond Kyty (`buffer_store_format_xyzw` is `KYTY_NI` upstream,
 /// ShaderParse.cpp L2630): 4-channel formatted store through the
 /// `tbuffer_store_format_xyzw` helper, all four addressing modes. The single
@@ -4953,6 +5139,19 @@ fn recompile_image_sample_dmask1(
     image_sample_channels(index, code, dst_source, spirv, FUNC, &[(46, 0)])
 }
 
+/// Beyond Kyty: ordinary implicit-LOD sample selecting only channel Y.
+fn recompile_image_sample_dmask2(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSample_Vdata1Vaddr3StSsDmask2";
+    image_sample_channels(index, code, dst_source, spirv, FUNC, &[(46, 1)])
+}
+
 /// Kyty: `Recompile_ImageSample_Vdata1Vaddr3StSsDmask8` (ShaderSpirv.cpp
 /// L2525).
 #[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
@@ -5691,16 +5890,15 @@ fn recompile_image_gather4_lz_dmask1(
 /// Kyty: `Recompile_ImageSampleLzO_Vdata3Vaddr4StSsDmask7` (ShaderSpirv.cpp
 /// L2887).
 #[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
-fn recompile_image_sample_lzo_dmask7(
+fn image_sample_lzo_channels(
     index: u32,
     code: &ShaderCode,
     dst_source: &mut String,
     spirv: &Spirv<'_>,
-    _param: &Params,
-    _scc_check: SccCheck,
+    func: &'static str,
+    channels: &[u32],
 ) -> Result<bool, ShaderRecompileError> {
-    const FUNC: &str = "Recompile_ImageSampleLzO_Vdata3Vaddr4StSsDmask7";
-    let inst = inst_at(code, index, FUNC)?;
+    let inst = inst_at(code, index, func)?;
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_sampled_num > 0 && bind_info.samplers.samplers_num > 0 {
@@ -5709,31 +5907,27 @@ fn recompile_image_sample_lzo_dmask7(
                 spirv,
                 code,
                 &inst,
-                FUNC,
+                func,
                 MimgDescriptorClass::Sampled,
                 true,
             )?;
-            let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
-            let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
-            let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
             let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
             let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
             let src0_value2 = operand_variable_to_str_shift(inst.src[0], 2);
             let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
             let src2_value0 = operand_variable_to_str_shift(inst.src[2], 0);
 
-            if dst_value0.type_ != SpirvType::Float
-                || src0_value0.type_ != SpirvType::Float
+            if src0_value0.type_ != SpirvType::Float
                 || src1_value0.type_ != SpirvType::Uint
                 || src2_value0.type_ != SpirvType::Uint
             {
-                return Err(not_supported(FUNC, "unexpected operand types"));
+                return Err(not_supported(func, "unexpected operand types"));
             }
 
             // TODO() check VSKIP
             // TODO() check LOD_CLAMPED
 
-            const TEXT: &str = r#"
+            const HEAD: &str = r#"
          %t24_<index> = OpLoad %uint %<src1_value0>
          %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageS %textures2D_S %t24_<index>
          %t27_<index> = OpLoad %ImageS %t26_<index>
@@ -5761,33 +5955,36 @@ fn recompile_image_sample_lzo_dmask7(
 
          %t43_<index> = OpImageSampleExplicitLod %v4float %t38_<index> %142_<index> Lod %float_0_000000
                OpStore %temp_v4float %t43_<index>
-         %t46_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_0
-         %t47_<index> = OpLoad %float %t46_<index>
-               OpStore %<dst_value0> %t47_<index>
-         %t50_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_1
-         %t51_<index> = OpLoad %float %t50_<index>
-               OpStore %<dst_value1> %t51_<index>
-         %t54_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_2
-         %t55_<index> = OpLoad %float %t54_<index>
-               OpStore %<dst_value2> %t55_<index>
+"#;
+            const TAIL: &str = r#"         %lzo_component_<index>_<slot> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_<channel>
+         %lzo_value_<index>_<slot> = OpLoad %float %lzo_component_<index>_<slot>
+               OpStore %<dst_value> %lzo_value_<index>_<slot>
 "#;
             // The offset math builds a 2D coordinate and queries a v2int size,
             // so this body is 2D-only; a mixed shader whose LzO T# is 3D/Cube
             // is a named refusal rather than a wrong-Dim sample.
-            let (suffix, dim, class) = sampled_site_route(spirv, matched, FUNC)?;
+            let (suffix, dim, class) = sampled_site_route(spirv, matched, func)?;
             if dim != SampledDim::Two {
-                return Err(not_supported(FUNC, "offset sample of a non-2D texture"));
+                return Err(not_supported(func, "offset sample of a non-2D texture"));
             }
-            let mut body = TEXT
+            let mut text = HEAD.to_string();
+            for (slot, channel) in channels.iter().copied().enumerate() {
+                let dst_value = operand_variable_to_str_shift(inst.dst, slot as i32);
+                if dst_value.type_ != SpirvType::Float {
+                    return Err(not_supported(func, "unexpected destination type"));
+                }
+                text += &TAIL
+                    .replace("<slot>", &slot.to_string())
+                    .replace("<channel>", &channel.to_string())
+                    .replace("<dst_value>", &dst_value.value);
+            }
+            let mut body = text
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
                 .replace("<src0_value1>", &src0_value1.value)
                 .replace("<src0_value2>", &src0_value2.value)
                 .replace("<src1_value0>", &src1_value0.value)
-                .replace("<src2_value0>", &src2_value0.value)
-                .replace("<dst_value0>", &dst_value0.value)
-                .replace("<dst_value1>", &dst_value1.value)
-                .replace("<dst_value2>", &dst_value2.value);
+                .replace("<src2_value0>", &src2_value0.value);
             route_sampled_ids(&mut body, suffix);
             route_sampled_class(&mut body, class);
             *dst_source += &body;
@@ -5797,6 +5994,42 @@ fn recompile_image_sample_lzo_dmask7(
     }
 
     Ok(false)
+}
+
+fn recompile_image_sample_lzo_dmask1(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSampleLzO_Vdata1Vaddr4StSsDmask1";
+    image_sample_lzo_channels(index, code, dst_source, spirv, FUNC, &[0])
+}
+
+fn recompile_image_sample_lzo_dmask2(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSampleLzO_Vdata1Vaddr4StSsDmask2";
+    image_sample_lzo_channels(index, code, dst_source, spirv, FUNC, &[1])
+}
+
+fn recompile_image_sample_lzo_dmask7(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSampleLzO_Vdata3Vaddr4StSsDmask7";
+    image_sample_lzo_channels(index, code, dst_source, spirv, FUNC, &[0, 1, 2])
 }
 
 /// ASTRO.BOT's `image_get_resinfo` dmask=xy form. Query the selected mip's
@@ -8978,6 +9211,16 @@ use crate::shader::types::shader_instruction_format::Format as F;
 /// order. `param` strings are verbatim SPIR-V template fragments.
 #[rustfmt::skip]
 static G_RECOMP_FUNC: &[RecompilerFunc] = &[
+    // Beyond Kyty (SharpEmu PR #587): FLAT-class direct guest-memory access via
+    // the `%global_mem` window. One row per width; FLAT vs GLOBAL addressing is
+    // selected inside the body by `ShaderInstruction::uses_flat_address`.
+    f(recompile_flat_load_dword,   T::FlatLoadDword,    F::FlatAddr, p1("")),
+    f(recompile_flat_load_dwordx2, T::FlatLoadDwordX2,  F::FlatAddr, p1("")),
+    f(recompile_flat_load_dwordx3, T::FlatLoadDwordX3,  F::FlatAddr, p1("")),
+    f(recompile_flat_load_dwordx4, T::FlatLoadDwordX4,  F::FlatAddr, p1("")),
+    f(recompile_flat_store_dword,  T::FlatStoreDword,   F::FlatAddr, p1("")),
+    f(recompile_flat_store_dwordx2,T::FlatStoreDwordX2, F::FlatAddr, p1("")),
+    f(recompile_flat_store_dwordx4,T::FlatStoreDwordX4, F::FlatAddr, p1("")),
     f(recompile_buffer_load_dword_vdata1,    T::BufferLoadDword,   F::Vdata1VaddrSvSoffsIdxen, p1("")),
     // Beyond Kyty (it NIs the opcode) — measured on Minecraft's menu VS.
     f(recompile_buffer_load_dwordx4,         T::BufferLoadDwordX4, F::Vdata4VaddrSvSoffsIdxen, p1("")),
@@ -9088,6 +9331,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     // recompilers were already ported (shared dmask body + Lz/LzO); the
     // downstream texture upload feeds the %textures2D_S/%samplers arrays.
     f(recompile_image_sample_dmask1,     T::ImageSample,    F::Vdata1Vaddr3StSsDmask1, p1("")),
+    f(recompile_image_sample_dmask2,     T::ImageSample,    F::Vdata1Vaddr3StSsDmask2, p1("")),
     f(recompile_image_sample_dmask8,     T::ImageSample,    F::Vdata1Vaddr3StSsDmask8, p1("")),
     f(recompile_image_sample_dmask3,     T::ImageSample,    F::Vdata2Vaddr3StSsDmask3, p1("")),
     f(recompile_image_sample_dmask5,     T::ImageSample,    F::Vdata2Vaddr3StSsDmask5, p1("")),
@@ -9106,6 +9350,8 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_image_sample_lz_dmask3,  T::ImageSampleLz,  F::Vdata2Vaddr3StSsDmask3, p1("")),
     f(recompile_image_sample_lz_dmask7,  T::ImageSampleLz,  F::Vdata3Vaddr3StSsDmask7, p1("")),
     f(recompile_image_sample_lz_dmask_f, T::ImageSampleLz,  F::Vdata4Vaddr3StSsDmaskF, p1("")),
+    f(recompile_image_sample_lzo_dmask1, T::ImageSampleLzO, F::Vdata1Vaddr4StSsDmask1, p1("")),
+    f(recompile_image_sample_lzo_dmask2, T::ImageSampleLzO, F::Vdata1Vaddr4StSsDmask2, p1("")),
     f(recompile_image_sample_lzo_dmask7, T::ImageSampleLzO, F::Vdata3Vaddr4StSsDmask7, p1("")),
     // Beyond Kyty: four-texel single-channel gather at LOD 0 (ASTRO.BOT
     // scene compute, MIMG 0x47 dmask 0x1).
@@ -9791,8 +10037,10 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            323,
-            "204 Kyty rows plus the compute batch DsWrxchgRtnB32 and VCmpxNgeF32, and \
+            333,
+            "the seven beyond-Kyty FLAT-class rows (SharpEmu PR #587: \
+             FlatLoadDword/X2/X3/X4 + FlatStoreDword/X2/X4), and \
+             204 Kyty rows plus the compute batch DsWrxchgRtnB32 and VCmpxNgeF32, and \
              SSubU32, SNop, SVersion, the RDNA2-only rows \
              (VLshlAddU32, VCmpxLtU32, VAddNcU32, VSubNcU32, VSubrevNcU32, VCvtI32F32, \
              VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad dmask1/3/7 \
@@ -9817,12 +10065,14 @@ mod tests {
              scene-composite batch: VXnorB32, VAddCoCiU32, SAndn1SaveexecB64 \
              and VMadU64U32, and the composite-frontier batch: the integer \
              min/max quartet (VMinU32/VMaxU32/VMinI32/VMaxI32), the four \
-             BufferStoreDwordX2 rows, and VBfeU32 wired from staged"
+             BufferStoreDwordX2 rows, VBfeU32 wired from staged, and the \
+             ASTRO.BOT pixel ImageSample dmask2 + ImageSampleLzO dmask1/2 rows"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 315,
-            "C1 implemented subset plus title-driven ports (incl. DsWrxchgRtnB32, \
+            implemented, 325,
+            "the seven FLAT-class rows (SharpEmu PR #587), and the \
+             C1 implemented subset plus title-driven ports (incl. DsWrxchgRtnB32, \
              VCmpxNgeF32, SVersion, the S_XXX_I32 \
              trio, VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad \
              dmask1/3/7 + ImageSampleLz dmask1/2/F rows, ImageStore dmask1, the \
@@ -9843,8 +10093,8 @@ mod tests {
               rows, DsReadB96, and the round-9 batch: VRcpIflagF32, DsAddU32, \
               and the RDNA2 scene-composite batch: VXnorB32, VAddCoCiU32, \
               SAndn1SaveexecB64, VMadU64U32, and the composite-frontier batch: \
-              the integer min/max quartet, four BufferStoreDwordX2 rows, and \
-              VBfeU32)"
+              the integer min/max quartet, four BufferStoreDwordX2 rows, \
+              VBfeU32, ImageSample dmask2, and ImageSampleLzO dmask1/2)"
         );
         assert_eq!(
             ni, 8,
@@ -12162,6 +12412,55 @@ mod tests {
     }
 
     #[test]
+    fn astro_pixel_sample_dmask2_and_lzo_dmask1_recompile() {
+        for (raw, expected_op, expected_channel, label) in [
+            (0xF080_0200, "OpImageSampleImplicitLod", 1, "sample dmask2"),
+            (
+                0xF0DC_0100,
+                "OpImageSampleExplicitLod",
+                0,
+                "sample_lz_o dmask1",
+            ),
+            (
+                0xF0DC_0200,
+                "OpImageSampleExplicitLod",
+                1,
+                "sample_lz_o dmask2",
+            ),
+        ] {
+            let mut code = ShaderCode::new();
+            code.set_type(ShaderType::Pixel);
+            shader_parse(
+                0,
+                &[raw, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+                &mut code,
+                true,
+            )
+            .unwrap_or_else(|e| panic!("parse {label}: {e}"));
+            let mut input_info = ShaderPixelInputInfo::default();
+            input_info.target_output_mode[0] = 4;
+            input_info.bind.push_constant_size = 64;
+            input_info.bind.textures2d.textures_num = 1;
+            input_info.bind.textures2d.textures2d_sampled_num = 1;
+            input_info.bind.textures2d.desc[0].start_register = 4;
+            input_info.bind.samplers.samplers_num = 1;
+            input_info.bind.samplers.start_register[0] = 12;
+            input_info.bind.samplers.binding_index = 1;
+            let source = spirv_generate_source(&code, None, Some(&input_info), None)
+                .unwrap_or_else(|e| panic!("recompile {label}: {e}"));
+            assert!(source.contains(expected_op), "{label}:\n{source}");
+            assert!(
+                source.contains(&format!(
+                    "OpAccessChain %_ptr_Function_float %temp_v4float %uint_{expected_channel}"
+                )),
+                "{label} must select the measured output channel:\n{source}"
+            );
+            let words = spirv_run(&source).unwrap_or_else(|e| panic!("assemble {label}: {e}"));
+            naga_parse_and_validate(&words, label);
+        }
+    }
+
+    #[test]
     fn astro_image_load_dmask3_fetches_two_channels() {
         let mut code = ShaderCode::new();
         code.set_type(ShaderType::Compute);
@@ -13920,11 +14219,11 @@ mod tests {
         let source = spirv_generate_source(&code, None, None, Some(&input_info))
             .expect("recompile CS with direct sgprs");
         assert!(
-            source.contains("OpStore %s0 %vsharp_value_s0"),
+            source.contains("OpStore %s0 %vsharp_value_b0_f0"),
             "s0 seeded from push constants:\n{source}"
         );
         assert!(
-            source.contains("OpStore %s1 %vsharp_value_s1"),
+            source.contains("OpStore %s1 %vsharp_value_b0_f1"),
             "s1 seeded from push constants:\n{source}"
         );
         let words = spirv_run(&source).expect("assemble CS with direct sgprs");
@@ -14364,6 +14663,112 @@ mod tests {
         // well-formed SPIR-V module.
         let words = spirv_run(&source).expect("assemble branch-to-wait shader");
         spirv_val_ok(&words, "branch_to_waitcnt_vscnt_after_mubuf");
+    }
+
+    // ---- FLAT-class recompile (SharpEmu PR #587 `Gen5FlatMemoryTests`) ----
+
+    /// A FLAT-segment `flat_load_dword v5, v[2:3]` lowers to a `%global_mem`
+    /// window access: the VGPR pair is the whole address, converted to a dword
+    /// index and read with an out-of-bounds clamp.
+    #[test]
+    fn flat_load_dword_recompiles_to_global_window() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // Two v_mov padding ops keep s_endpgm at instruction index >= 2 (the
+        // endpgm handler looks back two instructions); the FLAT op stays at 0.
+        shader_parse(
+            0,
+            &[0xDC30_0000, 0x057F_0002, 0x7E02_0280, 0x7E02_0280, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse flat_load_dword");
+        assert!(code.get_instructions()[0].uses_flat_address);
+
+        let mut cs = ShaderComputeInputInfo::default();
+        cs.threads_num = [1, 1, 1];
+        crate::shader::spirv::shader_detect_flat_global_window(&code, &mut cs.bind);
+        assert!(cs.bind.global_mem.used, "detection declares the window");
+
+        let source =
+            spirv_generate_source(&code, None, None, Some(&cs)).expect("recompile flat load");
+        assert!(
+            source.contains("%global_mem = OpVariable %_ptr_StorageBuffer_GlobalMem StorageBuffer"),
+            "declares the window SSBO:\n{source}"
+        );
+        assert!(
+            source.contains("OpArrayLength %uint %global_mem 0"),
+            "clamps against the window length:\n{source}"
+        );
+        assert!(
+            source.contains("OpAccessChain %_ptr_StorageBuffer_uint %global_mem %int_0"),
+            "reads the window at a computed dword index:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble flat load module");
+        spirv_val_ok(&words, "flat_load_dword_global_window");
+    }
+
+    /// A GLOBAL-segment `global_load_dword v5, v2, s[8:9]` adds the SGPR base
+    /// pair to the 32-bit VGPR offset (SharpEmu `UsesFlatAddress == false`).
+    #[test]
+    fn global_load_dword_recompiles_with_sgpr_base() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xDC30_8000, 0x0508_0002, 0x7E02_0280, 0x7E02_0280, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse global_load_dword");
+        assert!(!code.get_instructions()[0].uses_flat_address);
+
+        let mut cs = ShaderComputeInputInfo::default();
+        cs.threads_num = [1, 1, 1];
+        crate::shader::spirv::shader_detect_flat_global_window(&code, &mut cs.bind);
+
+        let source =
+            spirv_generate_source(&code, None, None, Some(&cs)).expect("recompile global load");
+        // The SGPR base pair dword is loaded and added to the VGPR offset.
+        assert!(
+            source.contains("%flat_sb_0 = OpLoad %uint")
+                && source.contains("%flat_ab_0 = OpIAdd %uint %flat_sb_0"),
+            "adds the SGPR base to the VGPR offset:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble global load module");
+        spirv_val_ok(&words, "global_load_dword_sgpr_base");
+    }
+
+    /// A FLAT-segment `flat_store_dword v[2:3], v6` drops out-of-bounds writes
+    /// and stores in-bounds ones into the window.
+    #[test]
+    fn flat_store_dword_recompiles_to_global_window() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xDC70_0000, 0x007F_0602, 0x7E02_0280, 0x7E02_0280, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse flat_store_dword");
+
+        let mut cs = ShaderComputeInputInfo::default();
+        cs.threads_num = [1, 1, 1];
+        crate::shader::spirv::shader_detect_flat_global_window(&code, &mut cs.bind);
+
+        let source =
+            spirv_generate_source(&code, None, None, Some(&cs)).expect("recompile flat store");
+        assert!(
+            source.contains("OpStore %flat_ptr_0_0"),
+            "stores the dword into the window:\n{source}"
+        );
+        assert!(
+            source.contains("OpBranchConditional %flat_inb_0_0"),
+            "drops out-of-bounds stores:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble flat store module");
+        spirv_val_ok(&words, "flat_store_dword_global_window");
     }
 
     /// Round 9 — the whole measured 693-skip bulk: the next-gen SMEM parser
@@ -15506,17 +15911,18 @@ mod tests {
     /// `shader_synthesize_placeholder_storage_texture` runs after the sampled
     /// pass, its coverage check (`without_sampler` direct match + EUD alias) does
     /// NOT see the sampled placeholder already parked at that register, so it
-    /// parks a SECOND `texture2D` there. `WriteLocalVariables` then seeds
-    /// `%vsharp_s{reg}` once per descriptor — TWO definitions of `%vsharp_s0`,
-    /// the assembly-fatal "duplicate definition of result id %vsharp_s0" the log
-    /// shows on 0x5006e7a00 / 0x5006ea100.
+    /// parks a SECOND `texture2D` there. `WriteLocalVariables` must use
+    /// descriptor-slot-qualified temporary ids while storing both snapshots
+    /// into the shared SGPR. Register-qualified ids used to define
+    /// `%vsharp_s0` twice and made ASTRO.BOT 0x5006e7a00 / 0x5006ea100
+    /// assembly-fatal.
     ///
-    /// This pins BOTH facts: stacking the two passes duplicates the result id
-    /// (why the storage pass is unwired), and the retained sampled-only path —
-    /// the shipped wiring — never emits an invalid module (it resolves through
-    /// the recompiler guard or refuses by name, never a duplicate id).
+    /// This pins BOTH facts: stacking the two passes targets one SGPR twice,
+    /// and descriptor-slot-qualified ids keep that legal. The storage pass
+    /// remains unwired because choosing which aliased descriptor wins is a
+    /// semantic question, not an assembly one.
     #[test]
-    fn storage_placeholder_at_occupied_register_duplicates_vsharp() {
+    fn storage_placeholder_at_occupied_register_uses_unique_seed_ids() {
         use crate::shader::analysis::{
             shader_synthesize_placeholder_sampled_texture,
             shader_synthesize_placeholder_storage_texture,
@@ -15569,15 +15975,18 @@ mod tests {
             .iter()
             .filter(|d| d.start_register == 0)
             .count();
-        assert_eq!(at_s0, 2, "both passes park a descriptor at s0 (the collision)");
-        let dup = spirv_generate_source(&code, None, None, Some(&both))
-            .expect("recompiles (both descriptors resolve) though the module is invalid");
         assert_eq!(
-            dup.matches("%vsharp_s0 =").count(),
-            2,
-            "the storage placeholder duplicates the %vsharp_s0 seeding: {dup}"
+            at_s0, 2,
+            "both passes park a descriptor at s0 (the collision)"
         );
-        spirv_run(&dup).expect_err("duplicate %vsharp_s0 must fail SPIR-V assembly");
+        let dup = spirv_generate_source(&code, None, None, Some(&both))
+            .expect("both descriptors resolve");
+        assert_eq!(
+            dup.matches("OpStore %s0 %vsharp_value_").count(),
+            2,
+            "both aliased descriptors seed s0 in descriptor order: {dup}"
+        );
+        spirv_run(&dup).expect("descriptor-slot-qualified seeding must assemble");
 
         // Retained sampled-only path (shipped wiring after the revert): the
         // image_store's unresolved T# refuses by name — never an invalid module,
@@ -15587,7 +15996,7 @@ mod tests {
         match spirv_generate_source(&code, None, None, Some(&sampled_only)) {
             Ok(src) => {
                 assert_eq!(
-                    src.matches("%vsharp_s0 =").count(),
+                    src.matches("OpStore %s0 %vsharp_value_").count(),
                     1,
                     "the single sampled placeholder seeds %vsharp_s0 exactly once: {src}"
                 );

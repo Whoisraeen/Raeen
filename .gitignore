@@ -28,6 +28,11 @@ desktop.ini
 # Shader cache (generated at runtime)
 shader_cache/
 
+# Compatibility runner evidence is machine-local and may contain proprietary
+# paths or logs. Only sanitized, measured summaries are publishable.
+artifacts/
+compat/local/
+
 # User configuration (generated at runtime)
 config.toml
 
@@ -68,6 +73,14 @@ themes/*
 # (e.g. Kyty, MIT). NEVER committed: we re-implement in Rust from these,
 # with attribution in THIRD_PARTY_NOTICES.md, never vendoring their trees.
 reference/
+
+# Out-of-tree / BYO present plugins (upscalers, frame-gen). Proprietary
+# plugins — e.g. an NVIDIA DLSS/Streamline shim — implement the vendor-neutral
+# `raeen_gpu::present_plugin` ABI but are NEVER distributed by Raeen: they are
+# hosted separately and dropped in here by a user. Everything under plugins/ is
+# ignored except the committed README that documents the boundary.
+/plugins/*
+!/plugins/README.md
 
 #AI
 .claude/

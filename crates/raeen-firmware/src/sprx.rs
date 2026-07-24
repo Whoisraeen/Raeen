@@ -14,8 +14,8 @@
 //! truncated input returns a [`FirmwareError`], never panics.
 
 use goblin::elf::program_header::{PT_DYNAMIC, PT_GNU_EH_FRAME, PT_LOAD, PT_TLS, ProgramHeader};
-use tracing::{debug, info, warn};
 use raeen_core::error::FirmwareError;
+use tracing::{debug, info, warn};
 
 /// PS5-specific ELF types (mirrors `raeen_loader::elf`; not re-exported
 /// from there, so restated here).

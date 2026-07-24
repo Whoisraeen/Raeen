@@ -13,7 +13,7 @@
 //! do f32, is never fatal — audio just stays silent.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -35,6 +35,19 @@ static DEVICE_RATE: AtomicU32 = AtomicU32::new(0);
 /// ~250 ms of stereo at 48 kHz. Submissions beyond this drop the oldest
 /// samples, so a slow/stalled consumer can never grow memory without bound.
 const MAX_RING_SAMPLES: usize = 48_000 * 2 / 4;
+
+/// Number of [`submit`] calls the guest audio path has made. Incremented on
+/// every call — including before [`init`], where `submit` is otherwise a silent
+/// no-op — so its diagnostics ("is any guest lib actually feeding audio?") and
+/// cross-crate tests (the HLE AudioOut / AudioOut2 push path asserting it
+/// reached the host mixer) have an observable signal even without a device.
+static SUBMIT_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// How many times [`submit`] has been called this process. See [`SUBMIT_CALLS`].
+#[must_use]
+pub fn submit_call_count() -> u64 {
+    SUBMIT_CALLS.load(Ordering::Relaxed)
+}
 
 /// Streaming linear-resampler state (guest rate → device rate), carried across
 /// [`submit`] calls so the read phase is continuous and buffer boundaries stay
@@ -190,6 +203,7 @@ fn fill(out: &mut [f32], out_channels: usize, ring: &Ring) {
 /// the ring — dropping the oldest if the consumer is behind so memory stays
 /// bounded. A no-op until [`init`], or when muted.
 pub fn submit(src_rate: u32, samples: &[f32]) {
+    SUBMIT_CALLS.fetch_add(1, Ordering::Relaxed);
     let Some(ring) = RING.get() else {
         return;
     };

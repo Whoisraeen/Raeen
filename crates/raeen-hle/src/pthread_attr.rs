@@ -10,8 +10,8 @@
 //! address and the opaque handle `Init` allocates and writes into `*attr`.
 
 use crate::{HleContext, HleRegistry};
-use tracing::debug;
 use raeen_kernel::PthreadAttr;
+use tracing::debug;
 
 const OK: u64 = 0;
 const EINVAL: u64 = 22;

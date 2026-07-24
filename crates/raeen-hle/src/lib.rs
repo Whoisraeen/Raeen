@@ -63,6 +63,7 @@ pub mod libsce_rtc;
 pub mod libsce_save_data;
 pub mod libsce_save_data_dialog;
 pub mod libsce_share;
+pub mod libsce_signin_dialog;
 pub mod libsce_ssl;
 pub mod libsce_sysmodule;
 pub mod libsce_system_service;
@@ -77,9 +78,9 @@ pub mod pthread_thread;
 pub mod pthread_tls;
 
 use dashmap::DashMap;
-use tracing::{debug, info, warn};
 use raeen_core::diagnostics::DiagnosticKind;
 use raeen_core::subsystems::{GpuSubmissionSubsystem, KernelSubsystems};
+use tracing::{debug, info, warn};
 
 /// Access to the guest (emulated PS5) address space from an HLE function.
 ///
@@ -620,6 +621,10 @@ impl HleRegistry {
         libsce_system_service::register(&registry);
         libsce_text_to_speech2::register(&registry);
         libsce_user_service::register(&registry);
+        // PSN sign-in dialog: completes immediately (always signed in) so a
+        // title gated on sign-in proceeds to open the pad. Minecraft lists
+        // libSceSigninDialog.prx as NEEDED.
+        libsce_signin_dialog::register(&registry);
         libsce_audio_out::register(&registry);
         libsce_save_data::register(&registry);
         libsce_save_data_dialog::register(&registry);
@@ -1175,6 +1180,67 @@ mod tests {
             nid,
             "libBeta::unknownBeta".to_string()
         )));
+    }
+
+    /// Build-fail integrity gate for every explicit NID override.
+    ///
+    /// `register_nid` is deliberately *not* a second spelling of `register`:
+    /// it is reserved for observed Gen5/provider-private identities whose
+    /// recovered label does not hash to the imported NID, or for exports whose
+    /// real name is still unknown. Consequently, asserting `nid_of(label) ==
+    /// explicit_nid` would reject every legitimate override. The meaningful
+    /// invariants are that the complete reviewed set is present, each binding
+    /// names a callable implementation, and none could have used ordinary
+    /// name-derived registration.
+    #[test]
+    fn explicit_nid_overrides_are_reachable_and_intentional() {
+        use sha1::{Digest, Sha1};
+
+        const SCE_NID_SALT: [u8; 16] = [
+            0x51, 0x8D, 0x64, 0xA6, 0x35, 0xDE, 0xD8, 0xC1, 0xE6, 0xB0, 0x39, 0xB1, 0xC3, 0xE5,
+            0x52, 0x30,
+        ];
+        let nid_of = |name: &str| {
+            let mut hasher = Sha1::new();
+            hasher.update(name.as_bytes());
+            hasher.update(SCE_NID_SALT);
+            let digest = hasher.finalize();
+            u64::from_le_bytes(digest[0..8].try_into().unwrap())
+        };
+
+        let registry = HleRegistry::new();
+        let bindings = registry.registered_provider_nid_overrides();
+        assert_eq!(
+            bindings.len(),
+            11,
+            "the explicit-NID surface changed; review every added/removed binding and update \
+             this audited count"
+        );
+
+        let mut redundant = Vec::new();
+        for (provider, nid, key) in bindings {
+            let (library, function) = key
+                .split_once("::")
+                .expect("explicit NID labels must be library::function");
+            assert_ne!(nid, 0, "{key} must not use the reserved zero NID");
+            assert_eq!(
+                provider,
+                canonical_provider_name(library),
+                "{key} was indexed under the wrong provider"
+            );
+            assert!(
+                registry.functions.contains_key(&key),
+                "{key} has an explicit NID but no callable implementation"
+            );
+            if nid == nid_of(function) {
+                redundant.push(key);
+            }
+        }
+        assert!(
+            redundant.is_empty(),
+            "these explicit bindings hash normally and must use register(), not register_nid(): \
+             {redundant:#?}"
+        );
     }
 
     /// **A NID cannot tell two libraries apart.** It hashes the function name

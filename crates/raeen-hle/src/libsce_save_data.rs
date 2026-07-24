@@ -90,42 +90,26 @@ pub fn register(registry: &HleRegistry) {
             hle_transferring_mount,
         );
     }
-    registry.register_nid(
+    registry.register(
         "libSceSaveData_native",
         "sceSaveDataCreateTransactionResource",
-        0x8234_5936_7c34_24f1,
         hle_create_transaction_resource,
     );
-    registry.register_nid(
+    registry.register(
         "libSceSaveData_native",
         "sceSaveDataDeleteTransactionResource",
-        0x9495_10b9_a2aa_a0a6,
         hle_delete_transaction_resource,
     );
-    registry.register_nid(
-        "libSceSaveData_native",
-        "sceSaveDataPrepare",
-        0xb030_81ae_673a_d575,
-        hle_prepare,
-    );
-    registry.register_nid(
+    registry.register("libSceSaveData_native", "sceSaveDataPrepare", hle_prepare);
+    registry.register(
         "libSceSaveData_native",
         "sceSaveDataSetParam",
-        0xf39c_ee97_ffde_197b,
         hle_set_param,
     );
-    registry.register_nid(
-        "libSceSaveData_native",
-        "sceSaveDataCommit",
-        0x89ee_ea85_9e17_d027,
-        hle_commit,
-    );
-    // The measured ASTRO.BOT import: Setup2 from libSceSaveData_native carries a
-    // library-private NID the name→NID DB may not cover, so pin it explicitly.
-    registry.register_nid(
+    registry.register("libSceSaveData_native", "sceSaveDataCommit", hle_commit);
+    registry.register(
         "libSceSaveData_native",
         "sceSaveDataSetupSaveDataMemory2",
-        0xa10c_9211_47e0_5d10,
         hle_setup_save_data_memory2,
     );
 }
@@ -775,18 +759,15 @@ mod tests {
 
         let registry = HleRegistry::new();
         register(&registry);
-        let overrides = registry.registered_nid_overrides();
-        assert!(overrides.iter().any(|(nid, key)| {
-            *nid == 0x8234_5936_7c34_24f1
-                && key == "libSceSaveData_native::sceSaveDataCreateTransactionResource"
-        }));
-        assert!(overrides.iter().any(|(nid, key)| {
-            *nid == 0x9495_10b9_a2aa_a0a6
-                && key == "libSceSaveData_native::sceSaveDataDeleteTransactionResource"
-        }));
-        assert!(overrides.iter().any(|(nid, key)| {
-            *nid == 0xb030_81ae_673a_d575 && key == "libSceSaveData_native::sceSaveDataPrepare"
-        }));
+        assert!(registry.is_implemented(
+            "libSceSaveData_native",
+            "sceSaveDataCreateTransactionResource"
+        ));
+        assert!(registry.is_implemented(
+            "libSceSaveData_native",
+            "sceSaveDataDeleteTransactionResource"
+        ));
+        assert!(registry.is_implemented("libSceSaveData_native", "sceSaveDataPrepare"));
     }
 
     #[test]
@@ -812,15 +793,7 @@ mod tests {
 
         let registry = HleRegistry::new();
         register(&registry);
-        assert!(
-            registry
-                .registered_nid_overrides()
-                .iter()
-                .any(|(nid, key)| {
-                    *nid == 0xf39c_ee97_ffde_197b
-                        && key == "libSceSaveData_native::sceSaveDataSetParam"
-                })
-        );
+        assert!(registry.is_implemented("libSceSaveData_native", "sceSaveDataSetParam"));
     }
 
     #[test]
@@ -951,15 +924,7 @@ mod tests {
 
         let registry = HleRegistry::new();
         register(&registry);
-        assert!(
-            registry
-                .registered_nid_overrides()
-                .iter()
-                .any(|(nid, key)| {
-                    *nid == 0x89ee_ea85_9e17_d027
-                        && key == "libSceSaveData_native::sceSaveDataCommit"
-                })
-        );
+        assert!(registry.is_implemented("libSceSaveData_native", "sceSaveDataCommit"));
 
         let _ = std::fs::remove_dir_all(root);
     }

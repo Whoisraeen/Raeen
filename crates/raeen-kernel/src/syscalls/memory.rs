@@ -3,8 +3,8 @@
 //! Translates PS5 mmap/munmap/mprotect to host memory operations.
 
 use crate::OrbisKernel;
-use tracing::debug;
 use raeen_core::error::KernelError;
+use tracing::debug;
 
 /// sys_mmap — Map pages of memory.
 pub fn sys_mmap(

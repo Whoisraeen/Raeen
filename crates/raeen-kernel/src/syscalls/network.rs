@@ -4,8 +4,8 @@
 //! Most PS5 games use libSceNet.sprx rather than raw syscalls.
 
 use crate::OrbisKernel;
-use tracing::debug;
 use raeen_core::error::KernelError;
+use tracing::debug;
 
 /// Stub implementation for network syscalls.
 ///

@@ -28,14 +28,40 @@ use boot::BootSequence;
 use egui::Key;
 use home::HomeAnim;
 use nav::{NavAction, NavInput, NavMode, NavState, RailTab};
+use raeen_core::config::EmulatorConfig;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use raeen_core::config::EmulatorConfig;
 
 enum Screen {
     Boot(BootSequence),
     Home,
+}
+
+/// The selectable values for the Video ▸ Upscaler row: the `"off"` sentinel
+/// followed by every registered present plugin (built-in vendor-neutral
+/// plugins plus any user-supplied BYO plugin registered this run).
+pub(crate) fn present_plugin_options() -> Vec<String> {
+    let mut options = vec!["off".to_string()];
+    options.extend(
+        raeen_gpu::AgcGpuSession::present_plugins()
+            .into_iter()
+            .map(|(name, _caps)| name),
+    );
+    options
+}
+
+/// Apply the persisted present-plugin selection + upscale factor to the GPU
+/// crate (the same process-wide sink the present path reads). `"off"` — and a
+/// persisted plugin that is no longer registered — both restore the zero-cost
+/// identity present path rather than silently pretending a plugin is active.
+pub(crate) fn apply_present_plugin(graphics: &raeen_core::config::GraphicsConfig) {
+    let active = graphics.upscaler != "off"
+        && raeen_gpu::AgcGpuSession::select_present_plugin(&graphics.upscaler);
+    if !active {
+        raeen_gpu::AgcGpuSession::clear_present_plugin();
+    }
+    raeen_gpu::AgcGpuSession::set_present_output_scale(graphics.present_upscale);
 }
 
 /// A game session launched from Home, tracked until it exits.
@@ -569,6 +595,23 @@ impl Shell {
                     4320,
                 )
             }
+            (0, 9) => {
+                // Cycle the present plugin (upscaler / frame gen) and apply live.
+                let options = present_plugin_options();
+                self.config.graphics.upscaler =
+                    settings::cycle_upscaler(&self.config.graphics.upscaler, delta, &options);
+                apply_present_plugin(&self.config.graphics);
+            }
+            (0, 10) => {
+                self.config.graphics.present_upscale = settings::adjust_stepped(
+                    self.config.graphics.present_upscale,
+                    delta,
+                    0.25,
+                    1.0,
+                    4.0,
+                );
+                apply_present_plugin(&self.config.graphics);
+            }
             (1, 0) => {
                 self.config.audio.enabled = !self.config.audio.enabled;
                 raeen_audio::output::set_enabled(self.config.audio.enabled);
@@ -942,6 +985,7 @@ impl Shell {
             effective.graphics.resolution_scale,
             effective.graphics.gpu_device_index,
         );
+        apply_present_plugin(&effective.graphics);
         raeen_core::logging::set_level(if effective.debug.logging {
             effective.debug.log_level.as_str()
         } else {

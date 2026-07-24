@@ -75,28 +75,21 @@ pub fn register(registry: &HleRegistry) {
         "sceVideoOutGetVblankStatus",
         hle_get_vblank_status,
     );
-    registry.register_nid(
-        "libSceVideoOut",
-        "sceVideoOutWaitVblank",
-        0x8fa4_5a01_495a_2efd,
-        hle_wait_vblank,
-    );
+    registry.register("libSceVideoOut", "sceVideoOutWaitVblank", hle_wait_vblank);
     registry.register(
         "libSceVideoOut",
         "sceVideoOutAddFlipEvent",
         hle_add_flip_event,
     );
     registry.register("libSceVideoOut", "sceVideoOutSetBufferAttribute", hle_ok);
-    registry.register_nid(
+    registry.register(
         "libSceVideoOut",
         "sceVideoOutSetBufferAttribute2",
-        0x3e34_b9b8_04b0_715f,
         hle_set_buffer_attribute2,
     );
-    registry.register_nid(
+    registry.register(
         "libSceVideoOut",
         "sceVideoOutRegisterBuffers2",
-        0xaca0_54b6_046b_b5b9,
         hle_register_buffers2,
     );
     // Color pipeline + flip-state queries (measured ASTRO.BOT imports).
@@ -916,14 +909,7 @@ mod tests {
         assert_eq!(hle_wait_vblank(&ctx, &[99]), VIDEO_OUT_ERROR_INVALID_HANDLE);
 
         let registry = HleRegistry::new();
-        assert!(
-            registry
-                .registered_nid_overrides()
-                .iter()
-                .any(|(nid, key)| {
-                    *nid == 0x8fa4_5a01_495a_2efd && key == "libSceVideoOut::sceVideoOutWaitVblank"
-                })
-        );
+        assert!(registry.is_implemented("libSceVideoOut", "sceVideoOutWaitVblank"));
     }
 
     #[test]
@@ -1096,13 +1082,8 @@ mod tests {
         );
 
         let registry = HleRegistry::new();
-        let overrides = registry.registered_nid_overrides();
-        assert!(overrides.iter().any(|(nid, key)| {
-            *nid == 0xaca0_54b6_046b_b5b9 && key == "libSceVideoOut::sceVideoOutRegisterBuffers2"
-        }));
-        assert!(overrides.iter().any(|(nid, key)| {
-            *nid == 0x3e34_b9b8_04b0_715f && key == "libSceVideoOut::sceVideoOutSetBufferAttribute2"
-        }));
+        assert!(registry.is_implemented("libSceVideoOut", "sceVideoOutRegisterBuffers2"));
+        assert!(registry.is_implemented("libSceVideoOut", "sceVideoOutSetBufferAttribute2"));
     }
 
     /// SharpEmu `VideoOutIsOutputSupported` parity on a 60 Hz display.

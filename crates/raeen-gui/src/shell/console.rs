@@ -87,10 +87,9 @@ impl ConsolePane {
         ui.visuals_mut().override_text_color = Some(egui::Color32::from_rgb(208, 214, 222));
         // Log rows at 14px: the 12px default is below Consolas' comfortable
         // floor at 1:1 DPI (reads as blur, not smallness).
-        ui.style_mut().text_styles.insert(
-            egui::TextStyle::Monospace,
-            egui::FontId::monospace(14.0),
-        );
+        ui.style_mut()
+            .text_styles
+            .insert(egui::TextStyle::Monospace, egui::FontId::monospace(14.0));
 
         ui.horizontal(|ui| {
             ui.label(

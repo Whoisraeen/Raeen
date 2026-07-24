@@ -69,6 +69,36 @@ pub enum ShaderInstructionType {
     /// (ShaderParse.cpp L2630); the single most frequent ASTRO.BOT shader
     /// failure (925 dispatches in the measured 30s window).
     BufferStoreFormatXyzw,
+
+    // --- FLAT-class memory (FLAT / GLOBAL segments, encoding 0x37) ---
+    //
+    // Beyond Kyty (its SI/GNM parser has no FLAT class): a GFX10/RDNA2
+    // FLAT-class load/store that addresses guest memory *directly* by a
+    // complete 64-bit pointer rather than through a bound V# descriptor.
+    // Ported from SharpEmu PR #587 (`Gen5ShaderTranslator.DecodeFlat`,
+    // GPL-2.0). The FLAT segment carries the whole 64-bit address in the VGPR
+    // pair `(addr, addr+1)`; the GLOBAL segment adds a 32-bit VGPR offset to an
+    // SGPR base pair. `ShaderInstruction::uses_flat_address` records which form
+    // this instruction decoded to (true = address is a VGPR pair). Unblocks
+    // GTA V Enhanced's frontend / legal-text shaders and any title whose
+    // compiler emits flat/global addressing.
+    /// FLAT 0x08 `flat_load_ubyte` — single zero-extended byte load.
+    FlatLoadUbyte,
+    /// FLAT 0x0c `flat_load_dword` — one 32-bit dword load.
+    FlatLoadDword,
+    /// FLAT 0x0d `flat_load_dwordx2` — two consecutive dwords.
+    FlatLoadDwordX2,
+    /// FLAT 0x0f `flat_load_dwordx3` — three consecutive dwords.
+    FlatLoadDwordX3,
+    /// FLAT 0x0e `flat_load_dwordx4` — four consecutive dwords.
+    FlatLoadDwordX4,
+    /// FLAT 0x1c `flat_store_dword` — one dword store (data in `dst`).
+    FlatStoreDword,
+    /// FLAT 0x1d `flat_store_dwordx2` — two consecutive dword store.
+    FlatStoreDwordX2,
+    /// FLAT 0x1e `flat_store_dwordx4` — four consecutive dword store.
+    FlatStoreDwordX4,
+
     /// DS 0x00: LDS atomic dword add without return (RDNA2 ISA `DS_ADD_U32`).
     /// Kyty leaves the whole DS family except append/consume `KYTY_NI`;
     /// measured on ASTRO.BOT scene compute (raw 0xd8000514, 58 skips/run).
@@ -564,6 +594,11 @@ pub mod shader_instruction_format {
         Pos3Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[POS3, S0, S1, S2, S3]),
         PrimVsrc0OffOffOffDone = format_define(&[PRIM, S0, OFF, OFF, OFF, DONE]),
         Saddr = format_define(&[S0A2]),
+        /// Beyond Kyty (SharpEmu PR #587): FLAT-class memory operand shape —
+        /// `dst` (load dest / store data), `src[0]` VGPR address (a 64-bit pair
+        /// when flat-addressed, else a 32-bit offset), `src[1]` SGPR base pair
+        /// (NULL when flat-addressed), `src[2]` immediate byte offset.
+        FlatAddr = format_define(&[D, S0A2, S1A2, S2]),
         Sdst2 = format_define(&[DA2]),
         SdstSbaseSoffset = format_define(&[D, S0A2, S1]),
         Sdst16SvSoffset = format_define(&[DA16, S0A4, S1]),
@@ -586,6 +621,12 @@ pub mod shader_instruction_format {
         /// measured on ASTRO.BOT `image_sample_lz` (MIMG 0x27 dmask 0x2).
         Vdata1Vaddr3StSsDmask2 = format_define(&[D, S0A3, S1A8, S2A4, DMASK_2]),
         Vdata1Vaddr3StSsDmask8 = format_define(&[D, S0A3, S1A8, S2A4, DMASK_8]),
+        /// Beyond Kyty: one-channel `image_sample_lz_o` with packed offset
+        /// plus 2D coordinates. Measured on ASTRO.BOT PS MIMG 0x37 dmask 0x1.
+        Vdata1Vaddr4StSsDmask1 = format_define(&[D, S0A4, S1A8, S2A4, DMASK_1]),
+        /// Same offset sample selecting channel Y; exposed after the dmask-1
+        /// instruction in the same measured ASTRO.BOT pixel shader.
+        Vdata1Vaddr4StSsDmask2 = format_define(&[D, S0A4, S1A8, S2A4, DMASK_2]),
         Vdata1VaddrSvSoffsIdxen = format_define(&[D, S0, S1A4, S2, IDXEN]),
         // Beyond Kyty: MUBUF single-dword addressing variants for idxen==0
         // and/or offen==1 (upstream EXIT_NOT_IMPLEMENTEDs both flags,
@@ -841,6 +882,14 @@ pub struct ShaderInstruction {
     /// export is `0xf`, a partial one (e.g. a `vec2` texcoord) `0x3`. Set by
     /// `shader_parse_exp`; the recompiler writes 0 to the disabled channels.
     pub export_enable: u32,
+    /// Beyond Kyty (SharpEmu PR #587 `Gen5GlobalMemoryControl.UsesFlatAddress`):
+    /// only meaningful for the FLAT-class ops (`Flat*`). `true` when the guest
+    /// address is a complete 64-bit pointer held in the VGPR pair
+    /// `(src[0], src[0]+1)` — the FLAT segment, or a GLOBAL segment whose SADDR
+    /// was NULL. `false` when a GLOBAL op supplies an SGPR base pair (`src[1]`)
+    /// and `src[0]` is a 32-bit per-lane offset. Gates the address computation
+    /// in the recompiler exactly as SharpEmu gates its SPIR-V emission.
+    pub uses_flat_address: bool,
 }
 
 /// Kyty: Shader.h `ShaderLabel` (L420). `dst = pc + 4 + src[0].constant.i`.

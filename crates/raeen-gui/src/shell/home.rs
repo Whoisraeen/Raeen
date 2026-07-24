@@ -26,8 +26,8 @@ use crate::library::{
 use crate::theme::Theme;
 use egui::epaint::RectShape;
 use egui::{Align2, Color32, FontId, Mesh, Pos2, Rect, Shape, Stroke, StrokeKind, vec2};
-use std::collections::HashMap;
 use raeen_core::config::ControllerIconStyle;
+use std::collections::HashMap;
 
 /// Animated values resolved once per frame by `shell/mod.rs`.
 pub struct HomeAnim {
@@ -175,7 +175,12 @@ fn draw_hero(
     // (crossfading) 4-corner mesh gradient that approximates key-art glow.
     match theme_bg {
         Some(texture) => {
-            painter.image(texture.id(), rect, cover_uv(texture, aspect), Color32::WHITE);
+            painter.image(
+                texture.id(),
+                rect,
+                cover_uv(texture, aspect),
+                Color32::WHITE,
+            );
         }
         None => {
             let top_right = g.hi;
@@ -708,7 +713,11 @@ fn draw_context_block(
                 theme.palette.text_dim,
             );
             let w = identity_galley.size().x;
-            painter.galley(Pos2::new(x, stats_top), identity_galley, theme.palette.text_dim);
+            painter.galley(
+                Pos2::new(x, stats_top),
+                identity_galley,
+                theme.palette.text_dim,
+            );
             x += w;
         }
         painter.text(

@@ -25,7 +25,7 @@ use crate::shader_fetch::{ShaderTranslateCache, TranslatedShader};
 use crate::vulkan::compute::{ComputeState, dispatch_compute};
 use crate::vulkan::instance::VulkanDevice;
 use crate::vulkan::offscreen::{
-    BlendState, CLEAR_COLOR, DrawState, EudRawBinding, RenderedImage, SampledGroup,
+    BlendState, CLEAR_COLOR, DepthState, DrawState, EudRawBinding, RenderedImage, SampledGroup,
     ShaderStageBinding, StorageBufferBinding, StorageImageBinding, StorageImageUpload,
     TextureBinding, TextureUpload, VertexAttributeData, VertexBufferData,
 };
@@ -181,6 +181,93 @@ fn blend_state_from_regs(ctx: &Context) -> Result<BlendState, DrawError> {
             ctx.blend_color.alpha,
         ],
     })
+}
+
+fn depth_state_from_regs(ctx: &Context) -> Result<Option<DepthState<'static>>, DrawError> {
+    let control = &ctx.depth_control;
+    if !control.z_enable && !control.stencil_enable {
+        return Ok(None);
+    }
+    let target = &ctx.depth_render_target;
+    if target.z_write_base_addr == 0 {
+        return Err(err(
+            "depth/stencil enabled but DB_Z_WRITE_BASE is 0 — refusing an unbacked attachment",
+        ));
+    }
+    let combined = target.z_info.format * 2 + target.stencil_info.format;
+    let format = match combined {
+        2 => vk::Format::D16_UNORM,
+        3 => vk::Format::D24_UNORM_S8_UINT,
+        6 => vk::Format::D32_SFLOAT,
+        7 => vk::Format::D32_SFLOAT_S8_UINT,
+        other => {
+            return Err(err(format!(
+                "unsupported depth/stencil format code {other} \
+                 (DB_Z_INFO={} DB_STENCIL_INFO={})",
+                target.z_info.format, target.stencil_info.format
+            )));
+        }
+    };
+    let stencil = &ctx.stencil_control;
+    let mask = &ctx.stencil_mask;
+    let op = |fail: u8, pass: u8, depth_fail: u8, compare: u8, back: bool| {
+        vk::StencilOpState::default()
+            .fail_op(vk::StencilOp::from_raw(i32::from(fail)))
+            .pass_op(vk::StencilOp::from_raw(i32::from(pass)))
+            .depth_fail_op(vk::StencilOp::from_raw(i32::from(depth_fail)))
+            .compare_op(vk::CompareOp::from_raw(i32::from(compare)))
+            .compare_mask(u32::from(if back {
+                mask.stencil_mask_bf
+            } else {
+                mask.stencil_mask
+            }))
+            .write_mask(u32::from(if back {
+                mask.stencil_writemask_bf
+            } else {
+                mask.stencil_writemask
+            }))
+            .reference(u32::from(if back {
+                mask.stencil_testval_bf
+            } else {
+                mask.stencil_testval
+            }))
+    };
+    let front = op(
+        stencil.stencil_fail,
+        stencil.stencil_zpass,
+        stencil.stencil_zfail,
+        control.stencilfunc,
+        false,
+    );
+    let back = if control.backface_enable {
+        op(
+            stencil.stencil_fail_bf,
+            stencil.stencil_zpass_bf,
+            stencil.stencil_zfail_bf,
+            control.stencilfunc_bf,
+            true,
+        )
+    } else {
+        front
+    };
+    let vp = &ctx.screen_viewport.viewports[0];
+    Ok(Some(DepthState {
+        target_base: Some(target.z_write_base_addr),
+        format,
+        test_enable: control.z_enable,
+        write_enable: control.z_write_enable && !target.depth_view.depth_write_disable,
+        compare_op: vk::CompareOp::from_raw(i32::from(control.zfunc)),
+        stencil_test_enable: control.stencil_enable,
+        stencil_front: front,
+        stencil_back: back,
+        clear_depth: ctx.render_control.depth_clear_enable,
+        clear_stencil: ctx.render_control.stencil_clear_enable,
+        clear_depth_value: ctx.depth_clear_value,
+        clear_stencil_value: u32::from(ctx.stencil_clear_value),
+        viewport_depth: [vp.zoffset, vp.zoffset + vp.zscale],
+        initial: None,
+        initial_stencil: None,
+    }))
 }
 
 /// Map `CB_COLOR0_INFO`'s format/channel_type/channel_order triple to Vulkan.
@@ -1074,8 +1161,7 @@ fn decode_texture(
                 // sampling. Keep the cube's layer count and read face by face,
                 // zero-filling any face whose guest bytes are unmapped.
                 Err(_) if cube => {
-                    let mut pixels =
-                        alloc_zeroed(face_linear * layers as usize, "texture decode")?;
+                    let mut pixels = alloc_zeroed(face_linear * layers as usize, "texture decode")?;
                     for layer in 0..layers as usize {
                         let face_addr = t.base40() + (layer * face_tiled) as u64;
                         if let Ok(single) =
@@ -2278,11 +2364,8 @@ pub fn draw_state_from_regs<'a>(
         target_base: None,
         // The caller (draw_common) fills this in for an indexed draw.
         index: None,
-        // This register-driven composite path is colour-only for now; the
-        // depth/stencil attachment is wired in `render_draw` but not yet fed
-        // from the PM4 DB_* registers (a future `depth_state_from_regs`).
         color_output: true,
-        depth: None,
+        depth: depth_state_from_regs(ctx)?,
     })
 }
 
@@ -3055,6 +3138,29 @@ mod tests {
             ),
             "the extent must come from ATTRIB2, not the fixture constants"
         );
+    }
+
+    #[test]
+    fn depth_registers_reach_the_live_draw_state_and_name_the_guest_surface() {
+        let mut ctx = ctx_96x48();
+        ctx.depth_control.z_enable = true;
+        ctx.depth_control.z_write_enable = true;
+        ctx.depth_control.zfunc = vk::CompareOp::LESS.as_raw() as u8;
+        ctx.depth_render_target.z_info.format = 3; // 3 * 2 + 0 = D32_SFLOAT.
+        ctx.depth_render_target.z_write_base_addr = 0x9000_0000;
+        ctx.render_control.depth_clear_enable = true;
+        ctx.depth_clear_value = 0.625;
+
+        let state = draw_state_from_regs(&ctx, &ucfg_rect(), 3, SPIRV, SPIRV)
+            .expect("depth-bearing register state");
+        let depth = state.depth.expect("depth attachment is wired");
+        assert_eq!(depth.target_base, Some(0x9000_0000));
+        assert_eq!(depth.format, vk::Format::D32_SFLOAT);
+        assert!(depth.test_enable);
+        assert!(depth.write_enable);
+        assert_eq!(depth.compare_op, vk::CompareOp::LESS);
+        assert!(depth.clear_depth);
+        assert_eq!(depth.clear_depth_value, 0.625);
     }
 
     #[test]
@@ -4205,7 +4311,10 @@ mod tests {
         assert_eq!(tex.format, vk::Format::R8G8B8A8_UNORM);
         assert_eq!(tex.pixels, vec![0u8; 4], "transparent black");
         assert_eq!(tex.layers, 1);
-        assert_eq!(tex.guest_base, 0, "base 0 disables the persistent-texture cache");
+        assert_eq!(
+            tex.guest_base, 0,
+            "base 0 disables the persistent-texture cache"
+        );
         // A base-0 T# with a garbage type still yields the dummy (the base-0
         // check precedes any type/format decode).
         t.fields[3] = 15 << 28;
@@ -4419,8 +4528,16 @@ mod tests {
             let (cube, volume, array) = texture_view_kind(ty).expect("accepted sampled type");
             let dim = SampledDim::from_texture_type(ty);
             assert_eq!(cube, dim == SampledDim::Cube, "cube flag for type {ty}");
-            assert_eq!(volume, dim == SampledDim::Three, "volume flag for type {ty}");
-            assert_eq!(array, dim == SampledDim::TwoArray, "array flag for type {ty}");
+            assert_eq!(
+                volume,
+                dim == SampledDim::Three,
+                "volume flag for type {ty}"
+            );
+            assert_eq!(
+                array,
+                dim == SampledDim::TwoArray,
+                "array flag for type {ty}"
+            );
         }
         // Exactly type 13 is arrayed; nothing else is (8/9 = 2D, 10 = 3D volume,
         // 11 = cube). The array flag is TYPE-driven, so a 2DArray with a single
@@ -4432,7 +4549,10 @@ mod tests {
         // 12/14/15 never reach decode (analysis rewrites/replaces them); an
         // unhandled nibble stays a named refusal rather than a silent 2D guess.
         for ty in [12u8, 14, 15] {
-            assert!(texture_view_kind(ty).is_err(), "type {ty} is a named refusal");
+            assert!(
+                texture_view_kind(ty).is_err(),
+                "type {ty} is a named refusal"
+            );
         }
     }
 

@@ -71,10 +71,10 @@ pub fn register(registry: &HleRegistry) {
     for lib in ["libc", "libSceLibcInternal"] {
         // operator new / new[] (throwing + nothrow): plain size arg.
         for name in [
-            "_Znwm",                        // operator new(size_t)
-            "_Znam",                        // operator new[](size_t)
-            "_ZnwmRKSt9nothrow_t",          // operator new(size_t, nothrow_t)
-            "_ZnamRKSt9nothrow_t",          // operator new[](size_t, nothrow_t)
+            "_Znwm",               // operator new(size_t)
+            "_Znam",               // operator new[](size_t)
+            "_ZnwmRKSt9nothrow_t", // operator new(size_t, nothrow_t)
+            "_ZnamRKSt9nothrow_t", // operator new[](size_t, nothrow_t)
         ] {
             registry.register(lib, name, hle_operator_new);
         }
@@ -90,15 +90,15 @@ pub fn register(registry: &HleRegistry) {
         // operator delete / delete[] (plain, sized, aligned, array): free the
         // pointer, ignore the advisory size/align argument.
         for name in [
-            "_ZdlPv",                       // operator delete(void*)
-            "_ZdaPv",                       // operator delete[](void*)
-            "_ZdlPvm",                      // sized operator delete(void*, size_t)
+            "_ZdlPv",  // operator delete(void*)
+            "_ZdaPv",  // operator delete[](void*)
+            "_ZdlPvm", // sized operator delete(void*, size_t)
             "_ZdaPvm",
-            "_ZdlPvSt11align_val_t",        // aligned operator delete
+            "_ZdlPvSt11align_val_t", // aligned operator delete
             "_ZdaPvSt11align_val_t",
-            "_ZdlPvmSt11align_val_t",       // sized+aligned
+            "_ZdlPvmSt11align_val_t", // sized+aligned
             "_ZdaPvmSt11align_val_t",
-            "_ZdlPvRKSt9nothrow_t",         // nothrow operator delete
+            "_ZdlPvRKSt9nothrow_t", // nothrow operator delete
             "_ZdaPvRKSt9nothrow_t",
         ] {
             registry.register(lib, name, hle_operator_delete);
@@ -162,7 +162,10 @@ pub fn register(registry: &HleRegistry) {
         ("sceLibcMspaceCalloc", hle_mspace_calloc),
         ("sceLibcMspaceMemalign", hle_mspace_memalign),
         ("sceLibcMspaceRealloc", hle_mspace_realloc),
-        ("sceLibcMspaceMallocUsableSize", hle_mspace_malloc_usable_size),
+        (
+            "sceLibcMspaceMallocUsableSize",
+            hle_mspace_malloc_usable_size,
+        ),
         ("sceLibcMspaceMallocStats", hle_mspace_malloc_stats),
         ("sceLibcMspaceMallocStatsFast", hle_mspace_malloc_stats),
         ("__cxa_pure_virtual", hle_cxa_pure_virtual),
@@ -171,7 +174,11 @@ pub fn register(registry: &HleRegistry) {
         registry.register("libc", name, func);
     }
     // Calloc is new under libSceLibcInternal too; _Stoul under libc.
-    registry.register("libSceLibcInternal", "sceLibcMspaceCalloc", hle_mspace_calloc);
+    registry.register(
+        "libSceLibcInternal",
+        "sceLibcMspaceCalloc",
+        hle_mspace_calloc,
+    );
     registry.register("libc", "_Stoul", crate::libc::hle_strtoul);
     // `std::_Random_device()` (Dinkumware's `random_device` core) returns a
     // fresh unsigned int the STL uses to seed a PRNG. No host entropy source is

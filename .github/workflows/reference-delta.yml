@@ -1,0 +1,35 @@
+name: Daily reference delta
+
+on:
+  schedule:
+    - cron: "17 11 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Clone read-only reference inputs
+        shell: bash
+        run: |
+          mkdir -p reference
+          git clone --filter=blob:none https://github.com/InoriRus/Kyty reference/kyty
+          git clone --filter=blob:none https://github.com/Nmzik/KytyPS5 reference/kytyps5
+          git clone --filter=blob:none https://github.com/par274/sharpemu reference/sharpemu
+          git clone --filter=blob:none https://github.com/shadps4-emu/shadPS4 reference/shadps4
+
+      - name: Generate delta report
+        run: cargo xtask refs report --fetch --output artifacts/reference-delta/latest.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reference-delta
+          path: artifacts/reference-delta/latest.md
+          retention-days: 30

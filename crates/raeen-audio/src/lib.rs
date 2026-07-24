@@ -6,6 +6,7 @@
 
 pub mod hrtf;
 pub mod output;
+pub mod pcm;
 pub mod tempest;
 
 use tracing::info;

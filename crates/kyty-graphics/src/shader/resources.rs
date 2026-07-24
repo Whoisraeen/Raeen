@@ -837,6 +837,28 @@ pub struct ShaderEudRawResources {
     pub required_dwords: u32,
 }
 
+/// Beyond Kyty (SharpEmu PR #587): the guest-memory window backing the
+/// FLAT-class (FLAT / GLOBAL) direct-address load/stores. Where a V# storage
+/// buffer is a bounded descriptor, a FLAT op carries a complete 64-bit guest
+/// pointer (or an SGPR base pair plus a per-lane offset) and reads/writes guest
+/// memory directly — SharpEmu's "global memory binding"
+/// (`Gen5SpirvTranslator.cs`). The recompiler serves it from a single uint
+/// runtime-array SSBO (`%global_mem`) whose first two dwords are the window's
+/// guest base address (host-filled at bind time) and whose remaining dwords are
+/// the window contents; the shader converts a 64-bit address to a dword index
+/// by `((addr_lo - base_lo) >> 2)` (32-bit subtraction, exactly as SharpEmu's
+/// `ISub` does — the wrap absorbs any carry, and the window is < 4 GiB). Reads
+/// past the bound length clamp to 0 and stores past it drop, matching RDNA
+/// out-of-bounds behaviour. `used`/`binding_index` are assigned by
+/// `shader_detect_flat_global_window` after every other resource group.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShaderGlobalMemResources {
+    /// A FLAT-class op is present: declare + bind the `%global_mem` SSBO.
+    pub used: bool,
+    /// Vulkan binding index of `%global_mem` (after the raw-EUD fallback).
+    pub binding_index: i32,
+}
+
 /// Beyond Kyty: one `s_load_dword{,x2,x4,x8,x16}` whose base pointer is built
 /// **PC-relative** (`s_getpc_b64` + optional `s_add_u32 <imm>`) rather than
 /// from user data or the EUD — the shader loading its own embedded constant
@@ -967,6 +989,9 @@ pub struct ShaderBindResources {
     /// Beyond Kyty (SharpEmu port): raw EUD-window fallback for scalar loads
     /// of EUD dwords no captured descriptor covers.
     pub eud_raw: ShaderEudRawResources,
+    /// Beyond Kyty (SharpEmu PR #587): the `%global_mem` window backing
+    /// FLAT-class (FLAT / GLOBAL) direct-address memory ops.
+    pub global_mem: ShaderGlobalMemResources,
     /// Beyond Kyty: PC-relative embedded-constant scalar loads (the shader
     /// reading its own baked constant table).
     pub embedded_constant_loads: ShaderEmbeddedConstantLoads,

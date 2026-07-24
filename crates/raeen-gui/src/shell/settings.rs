@@ -20,8 +20,8 @@
 use super::nav::NavState;
 use crate::theme::Theme;
 use egui::{Align, Layout, RichText, UiBuilder};
-use std::path::Path;
 use raeen_core::config::EmulatorConfig;
+use std::path::Path;
 
 /// Pointer selection reported to the Shell after the Settings surface draws.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +46,32 @@ pub const SETTINGS_SECTION_NAMES: [&str; 8] = [
 /// Game Folders section grows by one row per configured folder plus a
 /// trailing "Add Folder" row, so this takes the current folder count.
 pub fn settings_row_counts(game_folder_count: usize) -> Vec<usize> {
-    vec![9, 3, 3, game_folder_count + 1, 1, 1, 2, 8]
+    vec![11, 3, 3, game_folder_count + 1, 1, 1, 2, 8]
+}
+
+/// The user-facing label for a present-plugin config value: `"off"` reads as
+/// `Off`, any other name is shown verbatim (the plugin's own id).
+#[must_use]
+pub fn upscaler_label(name: &str) -> String {
+    if name == "off" {
+        "Off".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Cycle the selected present-plugin name through `options` by `delta` steps
+/// (wrapping). `options` is the "off" sentinel followed by the registered
+/// plugin names. Pure so it is unit-testable without the global GPU registry.
+#[must_use]
+pub fn cycle_upscaler(current: &str, delta: i32, options: &[String]) -> String {
+    if options.is_empty() {
+        return current.to_string();
+    }
+    let idx = options.iter().position(|o| o == current).unwrap_or(0) as i32;
+    let n = options.len() as i32;
+    let next = (((idx + delta) % n) + n) % n;
+    options[next as usize].clone()
 }
 
 /// Frame-limit presets the Video ▸ Frame Limit row cycles through (guest vblank
@@ -343,10 +368,27 @@ fn draw_video(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, config: &Emulato
         "Window Height",
         format!("{} px", config.general.window_height),
     );
+    row(
+        ui,
+        theme,
+        nav,
+        9,
+        "Upscaler / Frame Gen",
+        upscaler_label(&config.graphics.upscaler),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        10,
+        "Upscale Factor",
+        format!("{:.2}x", config.graphics.present_upscale),
+    );
     ui.add_space(10.0);
     ui.label(
         RichText::new(
-            "Window size applies when Fullscreen is Off. Frame Limit and GPU Device apply on the next launch.",
+            "Window size applies when Fullscreen is Off. Frame Limit and GPU Device apply on the next launch. \
+             Upscaler applies live; only Raeen's built-in plugins ship — proprietary ones (e.g. DLSS) are user-supplied.",
         )
         .color(theme.palette.text_faint)
         .size(12.0),
@@ -621,13 +663,31 @@ mod tests {
     #[test]
     fn other_sections_row_counts_are_fixed() {
         let counts = settings_row_counts(5);
-        assert_eq!(counts[0], 9); // Video (+ Frame Limit, GPU Device, Window W/H)
+        assert_eq!(counts[0], 11); // Video (+ Frame Limit, GPU Device, Window W/H, Upscaler, Factor)
         assert_eq!(counts[1], 3); // Audio
         assert_eq!(counts[2], 3); // Controller
         assert_eq!(counts[4], 1); // Key Provider
         assert_eq!(counts[5], 1); // Theme
         assert_eq!(counts[6], 2); // System (version + updater action)
         assert_eq!(counts[7], 8); // Advanced (Logging, Log Level, 3 traces/dumps + 3 more)
+    }
+
+    #[test]
+    fn cycle_upscaler_wraps_and_labels() {
+        let opts = vec![
+            "off".to_string(),
+            "passthrough".to_string(),
+            "nearest".to_string(),
+        ];
+        assert_eq!(cycle_upscaler("off", 1, &opts), "passthrough");
+        assert_eq!(cycle_upscaler("nearest", 1, &opts), "off"); // wraps top -> bottom
+        assert_eq!(cycle_upscaler("off", -1, &opts), "nearest"); // wraps bottom -> top
+        // Unknown current name starts from the first option.
+        assert_eq!(cycle_upscaler("bogus", 1, &opts), "passthrough");
+        // Empty option set is a no-op.
+        assert_eq!(cycle_upscaler("off", 1, &[]), "off");
+        assert_eq!(upscaler_label("off"), "Off");
+        assert_eq!(upscaler_label("nearest"), "nearest");
     }
 
     #[test]

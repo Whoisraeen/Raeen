@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "references": [
+    {
+      "name": "Kyty",
+      "directory": "reference/kyty",
+      "upstream_branch": "main",
+      "baseline_revision": "4733b7e",
+      "license": "MIT",
+      "url": "https://github.com/InoriRus/Kyty"
+    },
+    {
+      "name": "KytyPS5",
+      "directory": "reference/kytyps5",
+      "upstream_branch": "main",
+      "baseline_revision": "8587638",
+      "license": "MIT/Kyty lineage; verify changed files before porting",
+      "url": "https://github.com/Nmzik/KytyPS5"
+    },
+    {
+      "name": "SharpEmu",
+      "directory": "reference/sharpemu",
+      "upstream_branch": "main",
+      "baseline_revision": "6db095e",
+      "license": "GPL-2.0",
+      "url": "https://github.com/par274/sharpemu"
+    },
+    {
+      "name": "shadPS4",
+      "directory": "reference/shadps4",
+      "upstream_branch": "main",
+      "baseline_revision": "9f31e64",
+      "license": "GPL-2.0",
+      "url": "https://github.com/shadps4-emu/shadPS4"
+    }
+  ]
+}

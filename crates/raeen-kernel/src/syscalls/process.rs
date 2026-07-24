@@ -3,8 +3,8 @@
 //! Handles nanosleep, sysctl, and other process-level operations.
 
 use crate::OrbisKernel;
-use tracing::debug;
 use raeen_core::error::KernelError;
+use tracing::debug;
 
 /// sys_nanosleep — High-resolution sleep.
 pub fn sys_nanosleep(

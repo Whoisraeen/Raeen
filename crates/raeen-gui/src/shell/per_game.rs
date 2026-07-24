@@ -26,9 +26,9 @@ use super::nav::NavState;
 use super::settings;
 use crate::theme::Theme;
 use egui::{Align, Layout, RichText, UiBuilder};
+use raeen_core::config::EmulatorConfig;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use raeen_core::config::EmulatorConfig;
 
 /// Number of rows the Game Options overlay exposes: four override fields plus
 /// a trailing "Reset to Global Defaults" row.

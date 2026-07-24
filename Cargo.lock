@@ -3180,6 +3180,7 @@ dependencies = [
  "raeen-kernel",
  "raeen-loader",
  "raeen-runtime",
+ "raeen-upscale",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3276,6 +3277,14 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "raeen-upscale"
+version = "0.1.0"
+dependencies = [
+ "raeen-gpu",
+ "tracing",
 ]
 
 [[package]]
@@ -5294,6 +5303,18 @@ name = "xml-rs"
 version = "0.8.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha1",
+ "toml",
+ "windows-sys 0.59.0",
+]
 
 [[package]]
 name = "yoke"

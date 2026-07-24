@@ -38,8 +38,9 @@ hypothesis was measured FALSE — see Queue Coordination below).
 
 | Milestone | Status |
 |---|---|
-| M0, M1, M2 | CLOSED (acceptance-tested; do not re-prove) |
-| M3 | Pieces exist (flips, vblank events, pad HLE); formal gate unclaimed; no true swapchain |
+| M0, M1 | CLOSED (acceptance-tested; do not re-prove) |
+| M2 | Synthetic Vulkan/AGC triangle proof exists; gate OPEN until non-synthetic acceptance evidence |
+| M3 | Synthetic interactive-2D proof exists; gate OPEN; no true swapchain |
 | M4 | Minecraft is the candidate — blocked ONLY on PSN auth stub (§4.2) |
 | M5 | ASTRO.BOT renders verified title pixels; scene gated on queue coordination (§4.1) |
 

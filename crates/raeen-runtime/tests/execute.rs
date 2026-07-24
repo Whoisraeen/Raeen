@@ -25,7 +25,7 @@ use raeen_hle::{HleContext, HleRegistry};
 use raeen_kernel::OrbisKernel;
 use raeen_runtime::{
     GUEST_ARENA_BASE, RunOutcome, RuntimeError, execute_linked, execute_process,
-    execute_process_shared, fsbase_rearm_count,
+    execute_process_shared, fsbase_rearm_count, hle_dispatch_metrics,
 };
 
 const R_X86_64_JUMP_SLOT: u64 = 7;
@@ -108,6 +108,112 @@ fn write_entry_stub(buf: &mut [u8], entry_off: usize, slot_off: usize) {
     buf[entry_off + 1] = 0x15;
     buf[entry_off + 2..entry_off + 6].copy_from_slice(&disp32.to_le_bytes());
     buf[entry_off + 6] = 0xC3; // ret
+}
+
+fn direct_strlen_module(iterations: u32) -> LinkedModule {
+    const SLOT_OFF: usize = 0x80;
+    const STRING_OFF: usize = 0x100;
+    let mut image = vec![0u8; 0x180];
+    let string_addr = GUEST_ARENA_BASE + STRING_OFF as u64;
+    let mut off = 0usize;
+    image[off..off + 2].copy_from_slice(&[0x41, 0xBC]); // mov r12d,imm32
+    image[off + 2..off + 6].copy_from_slice(&iterations.to_le_bytes());
+    off += 6;
+    let loop_off = off;
+    image[off..off + 2].copy_from_slice(&[0x48, 0xBF]); // mov rdi,imm64
+    image[off + 2..off + 10].copy_from_slice(&string_addr.to_le_bytes());
+    off += 10;
+    let next = off as i64 + 6;
+    let disp = (SLOT_OFF as i64 - next) as i32;
+    image[off..off + 2].copy_from_slice(&[0xFF, 0x15]);
+    image[off + 2..off + 6].copy_from_slice(&disp.to_le_bytes());
+    off += 6;
+    image[off..off + 3].copy_from_slice(&[0x49, 0xFF, 0xCC]); // dec r12
+    off += 3;
+    image[off..off + 2].copy_from_slice(&[0x75, (loop_off as i8 - (off as i8 + 2)) as u8]);
+    off += 2;
+    image[off] = 0xC3;
+    image[SLOT_OFF..SLOT_OFF + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+    image[STRING_OFF..STRING_OFF + 6].copy_from_slice(b"raeen\0");
+
+    LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: vec![HleTrampoline {
+            library: "libc".to_string(),
+            function: "strlen".to_string(),
+            addr: HLE_TRAMPOLINE_BASE,
+        }],
+        entry: 0,
+        tls: None,
+        tls_layout: Vec::new(),
+        procparam_offset: None,
+        unwind_modules: Vec::new(),
+    }
+}
+
+#[test]
+fn executable_leaf_thunk_dispatches_without_veh() {
+    if !fsgsbase_available() {
+        return;
+    }
+    let before = hle_dispatch_metrics();
+    let value = execute_linked(
+        &direct_strlen_module(1_000),
+        &HleRegistry::new(),
+        &OrbisKernel::new(),
+        0,
+        &[],
+    )
+    .expect("direct strlen loop must return");
+    let after = hle_dispatch_metrics();
+    assert_eq!(value, 5);
+    assert_eq!(after.direct - before.direct, 1_000);
+    // VEH is process-global and other integration tests execute in parallel,
+    // so only the isolated benchmark below can assert an exact zero VEH delta.
+    assert!(after.veh >= before.veh);
+}
+
+#[test]
+#[ignore = "manual one-million-call performance benchmark"]
+fn benchmark_one_million_executable_hle_calls() {
+    if !fsgsbase_available() {
+        return;
+    }
+    let before = hle_dispatch_metrics();
+    let started = std::time::Instant::now();
+    let value = execute_linked(
+        &direct_strlen_module(1_000_000),
+        &HleRegistry::new(),
+        &OrbisKernel::new(),
+        0,
+        &[],
+    )
+    .expect("benchmark guest must return");
+    let elapsed = started.elapsed();
+    let after = hle_dispatch_metrics();
+    assert_eq!(value, 5);
+    let direct = after.direct - before.direct;
+    let veh = after.veh - before.veh;
+    if std::env::var_os("RAEEN_DISABLE_DIRECT_HLE").is_some() {
+        assert_eq!(veh, 1_000_000);
+        assert_eq!(direct, 0);
+    } else {
+        assert_eq!(direct, 1_000_000);
+        assert_eq!(veh, 0);
+    }
+    eprintln!(
+        "HLE_BENCH mode={} iterations=1000000 elapsed_ms={:.3} calls_per_second={:.0} veh={} direct={}",
+        if direct == 0 { "veh" } else { "direct" },
+        elapsed.as_secs_f64() * 1_000.0,
+        1_000_000.0 / elapsed.as_secs_f64(),
+        veh,
+        direct,
+    );
 }
 
 /// Add the provider tables a real SCE symbol carries. Runtime fixtures used

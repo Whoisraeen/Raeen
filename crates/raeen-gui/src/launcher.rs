@@ -7,12 +7,14 @@
 //! navigation or rendering code.
 
 use crate::library::LaunchTarget;
+use raeen_core::error::FirmwareError;
 use std::collections::HashMap;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use raeen_core::error::FirmwareError;
 
 /// Opaque handle to a launched session, returned by [`GameLauncher::launch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -173,6 +175,7 @@ impl GameLauncher for StubLauncher {
 /// identity-maps a module's image at that fixed base (guest address `A` is
 /// host address `A`), so a mismatched link base would make any
 /// `R_X86_64_RELATIVE` relocation resolve to the wrong host address.
+#[cfg_attr(not(test), allow(dead_code))]
 const DEFAULT_LOAD_BASE: u64 = raeen_runtime::GUEST_ARENA_BASE;
 
 /// `argv[0]` every launched module sees (M1-A, crt0/process environment):
@@ -182,6 +185,7 @@ const DEFAULT_LOAD_BASE: u64 = raeen_runtime::GUEST_ARENA_BASE;
 /// filesystem mapping layer (host dir ↔ `/app0`) comes with save-data/file
 /// I/O work, but the argv convention is stable now.
 #[cfg(target_os = "windows")]
+#[cfg_attr(not(test), allow(dead_code))]
 const GUEST_ARGV0: &str = "/app0/eboot.bin";
 
 /// What came of trying to load+link (and, on Windows, run) one module for a
@@ -211,6 +215,7 @@ enum SessionOutcome {
     /// function — malformed for a real program (`_start` is entered via
     /// `jmp` with no return address; see `raeen_runtime::execute_process`),
     /// tolerated and reported honestly rather than treated as a fault.
+    #[cfg_attr(not(test), allow(dead_code))]
     Ran {
         returned: u64,
         resolved: usize,
@@ -227,6 +232,9 @@ enum SessionOutcome {
         resolved: usize,
         unresolved: usize,
     },
+    /// The isolated production runner exited cleanly. Import counts stay in
+    /// the child's measured report instead of being fabricated in the Shell.
+    RunnerExited { code: i32 },
     /// Anything that stopped short of a successful run: no module file at
     /// the target path, an encrypted module with no matching key, a genuine
     /// parse/link error, an unresolved HLE import actually called, or a
@@ -245,7 +253,137 @@ enum SessionOutcome {
 #[derive(Default)]
 struct ProcessControl {
     handle: Option<std::sync::Weak<raeen_runtime::GuestProcess>>,
+    runner: Option<std::process::Child>,
+    job: Option<usize>,
     quit_requested: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ProcessControl {
+    fn drop(&mut self) {
+        if let Some(child) = self.runner.as_mut() {
+            let _ = child.kill();
+        }
+        if let Some(job) = self.job.take() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(job as *mut core::ffi::c_void);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn create_runner_job(child: &std::process::Child) -> Result<usize, String> {
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    let job = unsafe { CreateJobObjectW(core::ptr::null(), core::ptr::null()) };
+    if job.is_null() {
+        return Err("Cannot create runner Job Object".to_string());
+    }
+    let mut limits = unsafe { core::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let configured = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            core::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    } != 0;
+    let assigned =
+        configured && unsafe { AssignProcessToJobObject(job, child.as_raw_handle()) } != 0;
+    if !assigned {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+        return Err("Cannot assign runner to its kill-on-close Job Object".to_string());
+    }
+    Ok(job as usize)
+}
+
+#[cfg(target_os = "windows")]
+#[cfg_attr(test, allow(dead_code))]
+fn run_isolated_child(
+    path: &Path,
+    control: &std::sync::Arc<std::sync::Mutex<ProcessControl>>,
+) -> SessionOutcome {
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            return SessionOutcome::Faulted(format!("Cannot locate raeen runner: {error}"));
+        }
+    };
+    let mut child = match std::process::Command::new(executable)
+        .arg("--run-eboot")
+        .arg(path)
+        .env("RAEEN_RUNNER_CHILD", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return SessionOutcome::Faulted(format!("Cannot start isolated runner: {error}"));
+        }
+    };
+
+    let job = match create_runner_job(&child) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill();
+            return SessionOutcome::Faulted(error);
+        }
+    };
+    if job == 0 {
+        let _ = child.kill();
+        return SessionOutcome::Faulted("Cannot create runner Job Object".to_string());
+    }
+
+    {
+        let mut state = control.lock().unwrap();
+        if state.quit_requested {
+            let _ = child.kill();
+        }
+        state.runner = Some(child);
+        state.job = Some(job);
+    }
+
+    loop {
+        let status = {
+            let mut state = control.lock().unwrap();
+            match state.runner.as_mut().expect("runner published").try_wait() {
+                Ok(status) => status,
+                Err(error) => {
+                    return SessionOutcome::Faulted(format!(
+                        "Cannot query isolated runner: {error}"
+                    ));
+                }
+            }
+        };
+        if let Some(status) = status {
+            let mut state = control.lock().unwrap();
+            state.runner.take();
+            if let Some(job) = state.job.take() {
+                unsafe {
+                    windows_sys::Win32::Foundation::CloseHandle(job as *mut core::ffi::c_void);
+                }
+            }
+            return if status.success() {
+                SessionOutcome::RunnerExited {
+                    code: status.code().unwrap_or(0),
+                }
+            } else {
+                SessionOutcome::Faulted(format!(
+                    "Isolated runner stopped with {status}; the Shell survived. See logs/raeen.log \
+                     for the guest fault and recent-HLE report."
+                ))
+            };
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
 }
 
 struct FirmwareSession {
@@ -312,6 +450,7 @@ impl FirmwareSession {
 /// Loaded exports, handles, mounts, diagnostics, and clocks therefore belong
 /// to exactly one guest process and cannot leak into a later title.
 pub struct FirmwareLauncher {
+    #[cfg_attr(not(test), allow(dead_code))]
     hle: std::sync::Arc<raeen_hle::HleRegistry>,
     sessions: Mutex<HashMap<u64, FirmwareSession>>,
     next_id: Mutex<u64>,
@@ -336,6 +475,7 @@ impl FirmwareLauncher {
     ///
     /// `kernel` and `registry` belong to this one session. The immutable HLE
     /// export table is shared; mutable HLE/kernel state is process-scoped.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn load_and_run(
         hle: &std::sync::Arc<raeen_hle::HleRegistry>,
         kernel: &std::sync::Arc<raeen_kernel::OrbisKernel>,
@@ -524,10 +664,15 @@ impl GameLauncher for FirmwareLauncher {
                 let process = std::sync::Arc::new(std::sync::Mutex::new(ProcessControl::default()));
                 #[cfg(target_os = "windows")]
                 let worker_process = std::sync::Arc::clone(&process);
+                #[cfg(test)]
                 let hle = std::sync::Arc::clone(&self.hle);
+                #[cfg(test)]
                 let kernel = std::sync::Arc::new(raeen_kernel::OrbisKernel::new());
+                #[cfg(test)]
                 let session_kernel = std::sync::Arc::clone(&kernel);
+                #[cfg(test)]
                 let nid_db = raeen_firmware::dynlib::nid::NidDatabase::from_hle(&hle);
+                #[cfg(test)]
                 let mut registry = raeen_firmware::ModuleRegistry::new(nid_db);
                 let path = path.clone();
                 let worker = std::thread::Builder::new()
@@ -535,14 +680,22 @@ impl GameLauncher for FirmwareLauncher {
                     .spawn(move || {
                         // The receiver going away (session closed) is not an
                         // error worth reporting — nobody is listening.
-                        let _ = tx.send(FirmwareLauncher::load_and_run(
+                        #[cfg(test)]
+                        let outcome = FirmwareLauncher::load_and_run(
                             &hle,
                             &kernel,
                             &mut registry,
                             &path,
                             #[cfg(target_os = "windows")]
-                            worker_process,
-                        ));
+                            std::sync::Arc::clone(&worker_process),
+                        );
+                        #[cfg(all(target_os = "windows", not(test)))]
+                        let outcome = run_isolated_child(&path, &worker_process);
+                        #[cfg(not(target_os = "windows"))]
+                        let outcome = SessionOutcome::Faulted(
+                            "Native runner is not implemented on this platform".to_string(),
+                        );
+                        let _ = tx.send(outcome);
                     })
                     .map_err(|e| LaunchError::Failed(format!("cannot start session: {e}")))?;
                 FirmwareSession {
@@ -551,7 +704,10 @@ impl GameLauncher for FirmwareLauncher {
                     worker: Some(worker),
                     #[cfg(target_os = "windows")]
                     process,
+                    #[cfg(test)]
                     kernel: Some(session_kernel),
+                    #[cfg(not(test))]
+                    kernel: None,
                     quit_requested: false,
                 }
             }
@@ -599,7 +755,9 @@ impl GameLauncher for FirmwareLauncher {
             // overlay shows the outcome until the user quits — the Shell
             // auto-returns Home the moment it polls `Exited` (see
             // `shell/mod.rs`), which would flash past the detail text.
-            Some(SessionOutcome::Exited { .. }) => SessionState::Running,
+            Some(SessionOutcome::Exited { .. } | SessionOutcome::RunnerExited { .. }) => {
+                SessionState::Running
+            }
             Some(SessionOutcome::Faulted(_)) => SessionState::Faulted,
         }
     }
@@ -636,6 +794,10 @@ impl GameLauncher for FirmwareLauncher {
             } => format!(
                 "Ran to exit({code:#x}) — {resolved} HLE imports resolved, {unresolved} unresolved \
                  (early runtime — full game execution needs more HLE breadth)"
+            ),
+            SessionOutcome::RunnerExited { code } => format!(
+                "Isolated runner exited cleanly with host status {code}; measured compatibility \
+                 details are in logs/raeen.log"
             ),
             SessionOutcome::Faulted(message) => message.clone(),
         };
@@ -683,6 +845,9 @@ impl GameLauncher for FirmwareLauncher {
                     {
                         process.request_termination(0);
                     }
+                    if let Some(runner) = control.runner.as_mut() {
+                        let _ = runner.kill();
+                    }
                 }
                 Ok(())
             }
@@ -695,6 +860,36 @@ impl GameLauncher for FirmwareLauncher {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn isolated_runner_crash_does_not_kill_shell() {
+        if std::env::var_os("RAEEN_RUNNER_CRASH_PROBE").is_some() {
+            std::process::abort();
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "launcher::tests::isolated_runner_crash_does_not_kill_shell",
+                "--nocapture",
+            ])
+            .env("RAEEN_RUNNER_CRASH_PROBE", "1")
+            .spawn()
+            .expect("crash-probe runner must start");
+        let job = create_runner_job(&child).expect("runner must enter kill-on-close Job Object");
+        let status = child.wait().expect("runner status must be observable");
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(job as *mut core::ffi::c_void);
+        }
+        assert!(
+            !status.success(),
+            "the deliberate runner abort must be visible"
+        );
+        // Reaching this assertion is the acceptance property: the parent
+        // Shell/test process survived the child's hard crash.
+        assert_eq!(2 + 2, 4);
+    }
 
     fn target() -> LaunchTarget {
         LaunchTarget::Game {

@@ -11,8 +11,9 @@
 //! Presentation to a real swapchain is a separate, later concern.
 
 use super::cache::{
-    BlendKey, DepthPipelineKey, DrawCaches, GraphicsPipelineKey, PendingDrawResources,
-    PersistentTarget, PersistentTexture, StencilKey, TargetContent, TargetKey, TextureKey,
+    BlendKey, DepthPipelineKey, DepthTargetKey, DrawCaches, GraphicsPipelineKey,
+    PendingDrawResources, PersistentDepthTarget, PersistentTarget, PersistentTexture, StencilKey,
+    TargetContent, TargetKey, TextureKey,
 };
 use super::instance::VulkanDevice;
 use super::shaders::{triangle_fragment_spirv, triangle_vertex_spirv};
@@ -274,7 +275,7 @@ impl TextureUpload {
     /// cube T# reached `vkCreateImage` with `layers == 1`). Returns the
     /// spec-valid layer count, warning (rate-limited) when it has to bump.
     pub(crate) fn cube_safe_layers(&self) -> u32 {
-        if self.cube && (self.layers == 0 || self.layers % 6 != 0) {
+        if self.cube && (self.layers == 0 || !self.layers.is_multiple_of(6)) {
             let safe = self.layers.max(1).next_multiple_of(6);
             warn_bad_cube_layers_once(self, safe);
             safe
@@ -340,9 +341,11 @@ pub struct ShaderStageBinding {
     pub descriptor_set_slot: u32,
     pub push_constant_offset: u32,
     pub push_constants: Vec<u8>,
-    /// When present, `push_constants` is uploaded to this UNIFORM_BUFFER
+    /// When present, `push_constants` is uploaded to this STORAGE_BUFFER
     /// descriptor instead of passed to `vkCmdPushConstants`. The translated
-    /// SPIR-V declares the same resource table in Uniform storage class.
+    /// SPIR-V declares the same tightly packed resource table in
+    /// StorageBuffer storage class (Uniform/std140 cannot represent its
+    /// four-byte inner array stride).
     pub push_uniform_binding: Option<u32>,
     pub storage_buffers: Option<StorageBufferBinding>,
     pub textures: Option<TextureBinding>,
@@ -483,6 +486,9 @@ pub struct IndexBinding<'a> {
 /// the pipeline's depth-stencil state, and the depth readback.
 #[derive(Debug, Clone)]
 pub struct DepthState<'a> {
+    /// Guest `DB_Z_WRITE_BASE`. Nonzero enables the persistent depth-target
+    /// cache, keyed together with extent and format.
+    pub target_base: Option<u64>,
     /// The depth attachment's format, from `DB_Z_INFO.format * 2 +
     /// DB_STENCIL_INFO.format` (Kyty GraphicsRender.cpp L3829): D16_UNORM (2),
     /// D24_UNORM_S8_UINT (3), D32_SFLOAT (6), D32_SFLOAT_S8_UINT (7).
@@ -1467,6 +1473,12 @@ struct Resources<'a> {
     depth_image: vk::Image,
     depth_memory: vk::DeviceMemory,
     depth_view: vk::ImageView,
+    /// False when the depth image/readback pair belongs to `DrawCaches`.
+    owns_depth_target: bool,
+    depth_target_key: Option<DepthTargetKey>,
+    /// A cache hit means the image rests in TRANSFER_SRC layout from the
+    /// previous draw's readback, rather than UNDEFINED like a fresh image.
+    depth_target_cached: bool,
     /// Prior depth/stencil contents for a LOAD seed (null when both planes
     /// CLEAR — the attachment then starts undefined by design).
     depth_upload_buffer: vk::Buffer,
@@ -1513,6 +1525,9 @@ impl<'a> Resources<'a> {
             depth_image: vk::Image::null(),
             depth_memory: vk::DeviceMemory::null(),
             depth_view: vk::ImageView::null(),
+            owns_depth_target: false,
+            depth_target_key: None,
+            depth_target_cached: false,
             depth_upload_buffer: vk::Buffer::null(),
             depth_upload_memory: vk::DeviceMemory::null(),
             depth_readback_buffer: vk::Buffer::null(),
@@ -1528,6 +1543,17 @@ impl<'a> Resources<'a> {
 
     fn device(&self) -> &Device {
         self.dev.device()
+    }
+
+    fn effective_depth_loads(&self, depth: &DepthState) -> (bool, bool) {
+        let (seed_depth, seed_stencil) = depth_loads(depth);
+        (
+            seed_depth || (self.depth_target_cached && !depth.clear_depth),
+            seed_stencil
+                || (self.depth_target_cached
+                    && has_stencil_plane(depth.format)
+                    && !depth.clear_stencil),
+        )
     }
 
     fn build(&mut self, state: &DrawState) -> Result<(), GpuError> {
@@ -1554,8 +1580,7 @@ impl<'a> Resources<'a> {
             }
         }
         if let Some(depth) = &state.depth {
-            self.create_depth_target(state.width, state.height, depth.format)?;
-            self.create_depth_buffers(state.width, state.height, depth)?;
+            self.create_depth_resources(state.width, state.height, depth)?;
         }
         if let Some(vertices) = state.vertices {
             self.create_vertex_buffer(vertices)?;
@@ -1575,6 +1600,55 @@ impl<'a> Resources<'a> {
     /// Create the depth attachment image and its view. Usage covers the draw
     /// itself, the post-draw readback (TRANSFER_SRC), and seeding prior
     /// contents (TRANSFER_DST).
+    fn create_depth_resources(
+        &mut self,
+        width: u32,
+        height: u32,
+        depth: &DepthState,
+    ) -> Result<(), GpuError> {
+        if let Some(base) = depth.target_base.filter(|base| *base != 0) {
+            let key = DepthTargetKey {
+                base,
+                width,
+                height,
+                format: depth.format.as_raw(),
+            };
+            self.caches
+                .evict_depth_targets_for_base(self.dev.device(), base, &key);
+            if let Some(entry) = self.caches.acquire_depth_target(&key) {
+                self.depth_image = entry.image;
+                self.depth_memory = entry.memory;
+                self.depth_view = entry.view;
+                self.depth_readback_buffer = entry.readback_buffer;
+                self.depth_readback_memory = entry.readback_memory;
+                self.depth_target_key = Some(key);
+                self.depth_target_cached = true;
+                self.owns_depth_target = false;
+                self.create_depth_buffers(width, height, depth)?;
+                return Ok(());
+            }
+            self.owns_depth_target = true;
+            self.create_depth_target(width, height, depth.format)?;
+            self.create_depth_buffers(width, height, depth)?;
+            self.caches.insert_depth_target(
+                key,
+                PersistentDepthTarget {
+                    image: self.depth_image,
+                    memory: self.depth_memory,
+                    view: self.depth_view,
+                    readback_buffer: self.depth_readback_buffer,
+                    readback_memory: self.depth_readback_memory,
+                },
+            );
+            self.owns_depth_target = false;
+            self.depth_target_key = Some(key);
+            return Ok(());
+        }
+        self.owns_depth_target = true;
+        self.create_depth_target(width, height, depth.format)?;
+        self.create_depth_buffers(width, height, depth)
+    }
+
     fn create_depth_target(
         &mut self,
         width: u32,
@@ -1720,6 +1794,9 @@ impl<'a> Resources<'a> {
             self.depth_upload_memory = memory;
         }
 
+        if self.depth_readback_buffer != vk::Buffer::null() {
+            return Ok(());
+        }
         // Same cached-host preference as the colour readback (`create_readback_buffer`).
         let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
         let (buffer, memory) = self
@@ -3182,14 +3259,19 @@ impl<'a> Resources<'a> {
         // undefined and is cleared by the render pass, so it needs no seed.
         if let Some(depth) = &state.depth {
             let aspect = depth_aspect_mask(depth.format);
-            let (depth_load, stencil_load) = depth_loads(depth);
+            let (depth_load, stencil_load) = self.effective_depth_loads(depth);
             if self.depth_upload_buffer != vk::Buffer::null() {
+                let old_layout = if self.depth_target_cached {
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                } else {
+                    vk::ImageLayout::UNDEFINED
+                };
                 self.image_barrier_layers(
                     aspect,
                     self.depth_image,
                     1,
                     ImageTransition {
-                        old_layout: vk::ImageLayout::UNDEFINED,
+                        old_layout,
                         new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         src_access: vk::AccessFlags::empty(),
                         dst_access: vk::AccessFlags::TRANSFER_WRITE,
@@ -3245,17 +3327,30 @@ impl<'a> Resources<'a> {
                     },
                 );
             } else {
+                let old_layout = if self.depth_target_cached {
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                } else {
+                    vk::ImageLayout::UNDEFINED
+                };
                 self.image_barrier_layers(
                     aspect,
                     self.depth_image,
                     1,
                     ImageTransition {
-                        old_layout: vk::ImageLayout::UNDEFINED,
+                        old_layout,
                         new_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                        src_access: vk::AccessFlags::empty(),
+                        src_access: if self.depth_target_cached {
+                            vk::AccessFlags::TRANSFER_READ
+                        } else {
+                            vk::AccessFlags::empty()
+                        },
                         dst_access: vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
                             | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
-                        src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+                        src_stage: if self.depth_target_cached {
+                            vk::PipelineStageFlags::TRANSFER
+                        } else {
+                            vk::PipelineStageFlags::TOP_OF_PIPE
+                        },
                         dst_stage: vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
                     },
                 );
@@ -3305,7 +3400,7 @@ impl<'a> Resources<'a> {
         // carries both planes (aspect from `depth_aspect_mask`), so depth and
         // stencil reference the same view.
         let depth_attachment = state.depth.as_ref().map(|depth| {
-            let (depth_load, _) = depth_loads(depth);
+            let (depth_load, _) = self.effective_depth_loads(depth);
             depth_stencil_attachment(self.depth_view, depth_load, depth)
         });
         let stencil_attachment = state
@@ -3313,7 +3408,7 @@ impl<'a> Resources<'a> {
             .as_ref()
             .filter(|depth| has_stencil_plane(depth.format) && depth.stencil_test_enable)
             .map(|depth| {
-                let (_, stencil_load) = depth_loads(depth);
+                let (_, stencil_load) = self.effective_depth_loads(depth);
                 depth_stencil_attachment(self.depth_view, stencil_load, depth)
             });
 
@@ -4042,14 +4137,16 @@ impl Drop for Resources<'_> {
                     d.free_memory(self.image_memory, None);
                 }
             }
-            if self.depth_view != vk::ImageView::null() {
-                d.destroy_image_view(self.depth_view, None);
-            }
-            if self.depth_image != vk::Image::null() {
-                d.destroy_image(self.depth_image, None);
-            }
-            if self.depth_memory != vk::DeviceMemory::null() {
-                d.free_memory(self.depth_memory, None);
+            if self.owns_depth_target {
+                if self.depth_view != vk::ImageView::null() {
+                    d.destroy_image_view(self.depth_view, None);
+                }
+                if self.depth_image != vk::Image::null() {
+                    d.destroy_image(self.depth_image, None);
+                }
+                if self.depth_memory != vk::DeviceMemory::null() {
+                    d.free_memory(self.depth_memory, None);
+                }
             }
             if self.depth_upload_buffer != vk::Buffer::null() {
                 d.destroy_buffer(self.depth_upload_buffer, None);
@@ -4057,11 +4154,13 @@ impl Drop for Resources<'_> {
             if self.depth_upload_memory != vk::DeviceMemory::null() {
                 d.free_memory(self.depth_upload_memory, None);
             }
-            if self.depth_readback_buffer != vk::Buffer::null() {
-                d.destroy_buffer(self.depth_readback_buffer, None);
-            }
-            if self.depth_readback_memory != vk::DeviceMemory::null() {
-                d.free_memory(self.depth_readback_memory, None);
+            if self.owns_depth_target {
+                if self.depth_readback_buffer != vk::Buffer::null() {
+                    d.destroy_buffer(self.depth_readback_buffer, None);
+                }
+                if self.depth_readback_memory != vk::DeviceMemory::null() {
+                    d.free_memory(self.depth_readback_memory, None);
+                }
             }
         }
     }

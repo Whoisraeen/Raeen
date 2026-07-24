@@ -89,7 +89,19 @@ use crate::hw_regs::{
 };
 use crate::pm4;
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
+
+/// A process-monotonic, always-nonzero value for `RELEASE_MEM` DATA_SEL 3/4
+/// (GPU timestamp). SharpEmu writes `Stopwatch.GetTimestamp()` here
+/// (AgcExports.cs:5395-5397 / 5469-5471); the guest only needs a nonzero,
+/// non-decreasing completion value, so a plain counter is deterministic and
+/// sufficient. Starts at 1 so a "became nonzero" poll is satisfied by the first
+/// release.
+fn next_release_timestamp() -> u64 {
+    static RELEASE_CLOCK: AtomicU64 = AtomicU64::new(0);
+    RELEASE_CLOCK.fetch_add(1, Ordering::Relaxed) + 1
+}
 
 /// Which register file an unknown offset belonged to.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -433,6 +445,20 @@ pub struct CommandProcessor {
     /// the condition; consumed by the walker immediately after the packet, so
     /// [`CommandProcessor::run_resumable`] can suspend the stream there.
     pending_wait: Option<WaitSpec>,
+    /// Completion labels this walk's producer packets (`WRITE_DATA`,
+    /// `RELEASE_MEM`) actually wrote to guest memory, as `(address, value)`.
+    /// Drained by the embedder ([`Self::take_produced_labels`]) after a walk so
+    /// it can latch cross-queue `WAIT_REG_MEM` waiters against the value *at
+    /// write time*.
+    ///
+    /// Faithful adaptation of SharpEmu `GpuWaitRegistry.RecordProduced`
+    /// (GpuWaitRegistry.cs:385-400): the guest frequently resets a completion
+    /// label back to 0 immediately after signalling it (to arm the next frame),
+    /// so re-reading live guest memory at wake time can miss the transient
+    /// satisfied window. Recording the produced value lets the embedder resume
+    /// the waiter even after the label was reset. Bounded by
+    /// [`Self::MAX_PRODUCED_LABELS`].
+    produced_labels: Vec<(u64, u64)>,
 }
 
 impl CommandProcessor {
@@ -502,10 +528,39 @@ impl CommandProcessor {
         let warned = std::mem::take(&mut self.warned);
         let shader_bind_trace_count = self.shader_bind_trace_count;
         let refused_draws = self.refused_draws;
+        // Producer labels written before an in-stream queue reset must survive
+        // it: the embedder still needs to latch waiters against them, and a
+        // per-frame `R_DRAW_RESET` between the producer packet and the drain
+        // must not silently drop the wakeup.
+        let produced_labels = std::mem::take(&mut self.produced_labels);
         *self = Self::new();
         self.warned = warned;
         self.shader_bind_trace_count = shader_bind_trace_count;
         self.refused_draws = refused_draws;
+        self.produced_labels = produced_labels;
+    }
+
+    /// Cap on completion labels retained between drains, so a pathological
+    /// increment `WRITE_DATA` cannot grow the vector without bound (real
+    /// completion labels are one or two dwords).
+    const MAX_PRODUCED_LABELS: usize = 64;
+
+    /// Drain the completion labels the walk(s) since the last drain produced
+    /// (see [`Self::produced_labels`]). The embedder latches these against
+    /// suspended cross-queue waiters *before* re-reading live guest memory, so a
+    /// same-submission label reset cannot lose the wakeup.
+    #[must_use]
+    pub fn take_produced_labels(&mut self) -> Vec<(u64, u64)> {
+        std::mem::take(&mut self.produced_labels)
+    }
+
+    /// Record a `(address, value)` a producer packet just wrote to guest memory.
+    /// Ignored past [`Self::MAX_PRODUCED_LABELS`] entries (the write still
+    /// happened; only the latch record is capped).
+    fn record_produced(&mut self, address: u64, value: u64) {
+        if self.produced_labels.len() < Self::MAX_PRODUCED_LABELS {
+            self.produced_labels.push((address, value));
+        }
     }
 
     /// True the first time `key` is seen; the caller warns exactly then.
@@ -743,21 +798,27 @@ impl CommandProcessor {
             pm4::IT_DRAW_INDEX_INDIRECT | pm4::IT_DRAW_INDEX_INDIRECT_MULTI => {
                 self.cp_op_draw_indirect(cmd_id, body, offset, sink, mem, true)
             }
-            // Kyty ports these with 22 EXIT_NOT_IMPLEMENTED sites between them;
-            // nothing on the minimal draw path observes their effects. Their
-            // side effects (waits, label writes) are handled by the HLE submit
-            // layer where needed.
             // The wait family is honoured: parse, evaluate against the label,
             // and suspend the walk when unmet (see cp_op_wait_mem).
             pm4::IT_WAIT_REG_MEM => {
                 self.cp_op_wait_mem(cmd_id, body, offset, WaitForm::Standard, mem)
             }
+            // The label PRODUCERS: a cross-queue `WAIT_REG_MEM` blocks until one
+            // of these writes its completion label to guest memory. Consuming
+            // them "without effect" (the old behaviour) is exactly why
+            // Minecraft's cross-queue waits were never satisfied — the DCB
+            // parked forever on a label no producer wrote, and only the
+            // dead-wait force-resume broke it (a glitch render). Execute them.
+            pm4::IT_WRITE_DATA => self.cp_op_write_data(cmd_id, body, offset, true, mem),
+            pm4::IT_RELEASE_MEM => self.cp_op_release_mem(cmd_id, body, offset, true, mem),
+            // These carry no guest-memory completion label on the RDNA2/AGC
+            // draw path (EVENT_WRITE triggers kernel event queues, handled by
+            // the HLE submit layer; ACQUIRE_MEM/CLEAR_STATE/etc. are cache/state
+            // ops a draw never observes). Consumed by encoded length.
             pm4::IT_ACQUIRE_MEM
-            | pm4::IT_RELEASE_MEM
             | pm4::IT_EVENT_WRITE
             | pm4::IT_EVENT_WRITE_EOP
             | pm4::IT_EVENT_WRITE_EOS
-            | pm4::IT_WRITE_DATA
             | pm4::IT_DMA_DATA
             | pm4::IT_CONTEXT_CONTROL
             | pm4::IT_CLEAR_STATE
@@ -898,14 +959,16 @@ impl CommandProcessor {
             // Label waits: honoured — parse, evaluate, suspend when unmet.
             pm4::R_WAIT_MEM_32 => self.cp_op_wait_mem(cmd_id, body, offset, WaitForm::Mem32, mem),
             pm4::R_WAIT_MEM_64 => self.cp_op_wait_mem(cmd_id, body, offset, WaitForm::Mem64, mem),
-            // Sync / flip / memory ops: consumed, not honoured. A draw never
-            // observes them, and their side effects (flip queues) are already
-            // applied by the HLE submit decode.
-            pm4::R_WRITE_DATA
-            | pm4::R_ACQUIRE_MEM
-            | pm4::R_RELEASE_MEM
-            | pm4::R_WAIT_FLIP_DONE
-            | pm4::R_FLIP => {
+            // The AGC (NOP-wrapped) label PRODUCERS — the async-compute queue's
+            // completion signals a cross-queue `WAIT_REG_MEM` polls on. Execute
+            // them so those waits are genuinely satisfied (see the IT_* forms in
+            // `dispatch`).
+            pm4::R_WRITE_DATA => self.cp_op_write_data(cmd_id, body, offset, false, mem),
+            pm4::R_RELEASE_MEM => self.cp_op_release_mem(cmd_id, body, offset, false, mem),
+            // Sync / flip ops: consumed, not honoured. A draw never observes
+            // them, and their side effects (flip queues) are already applied by
+            // the HLE submit decode.
+            pm4::R_ACQUIRE_MEM | pm4::R_WAIT_FLIP_DONE | pm4::R_FLIP => {
                 if self.first(SkipKey::Custom(r.0)) {
                     warn!(
                         cmd_id = format_args!("{cmd_id:#010x}"),
@@ -1037,6 +1100,165 @@ impl CommandProcessor {
                         byte_count,
                         offset,
                         "DMA_DATA source/destination not accessible guest memory — skipped"
+                    );
+                }
+            }
+        }
+        Ok(body_len)
+    }
+
+    /// Execute a `WRITE_DATA` packet — the GPU writes an immediate payload of
+    /// dwords straight to guest memory, the way a producing queue publishes a
+    /// completion label a cross-queue `WAIT_REG_MEM` then polls on.
+    ///
+    /// Port of SharpEmu `ApplySubmittedWriteData` + `DecodeStandardWriteDataControl`
+    /// / `DecodeAgcWriteDataControl` (AgcExports.cs:4494-4577). Body layout is
+    /// the same for both forms: `[control, dst_lo, dst_hi, value0, value1, …]`;
+    /// only the control-word decode differs (`standard` = raw `IT_WRITE_DATA`,
+    /// else the AGC `IT_NOP`+`R_WRITE_DATA` byte-packed wrapper). Writes only
+    /// when the destination selector picks memory (1, 2, 4 or 5); the address
+    /// increments per dword unless the packet disables it (all values land on
+    /// the same address then, last wins — hardware behaviour). Each written
+    /// dword is recorded for the cross-queue wait latch ([`Self::record_produced`]).
+    fn cp_op_write_data(
+        &mut self,
+        cmd_id: u32,
+        body: &[u32],
+        offset: u32,
+        standard: bool,
+        mem: Option<&dyn GuestMemory>,
+    ) -> Result<u32, CpError> {
+        let body_len = pm4::body_dw(cmd_id);
+        let control = Self::body_at(body, 0, offset)?;
+        let dst = u64::from(Self::body_at(body, 1, offset)?)
+            | (u64::from(Self::body_at(body, 2, offset)?) << 32);
+        // dwordCount = total - 4 = body_dw - 3 (header + control + dst_lo/hi).
+        let dword_count = body_len.saturating_sub(3);
+        let (destination, increment) = if standard {
+            // GFX10 PKT3_WRITE_DATA: DST_SEL in bits 11:8, ADDR_INCR is bit 16
+            // (0 => increment). The reserved low byte must NOT be read as DST_SEL
+            // (SharpEmu regression note, AgcExports.cs:4560-4563).
+            ((control >> 8) & 0xF, (control & (1 << 16)) == 0)
+        } else {
+            // AGC byte-packed: DST_SEL is the low byte, ADDR_INCR the third byte.
+            (control & 0xFF, ((control >> 16) & 0xFF) == 0)
+        };
+        let writes_memory = matches!(destination, 1 | 2 | 4 | 5);
+        if !writes_memory || dword_count == 0 || dst == 0 {
+            return Ok(body_len);
+        }
+        let Some(mem) = mem else {
+            if self.first(SkipKey::Note("write_data_needs_memory")) {
+                warn!(
+                    offset,
+                    dst = format_args!("{dst:#x}"),
+                    "WRITE_DATA needs a GuestMemory writer — label not written"
+                );
+            }
+            return Ok(body_len);
+        };
+        for index in 0..dword_count {
+            let value = Self::body_at(body, 3 + index as usize, offset)?;
+            let addr = if increment {
+                dst + u64::from(index) * 4
+            } else {
+                dst
+            };
+            if mem.write_bytes(addr, &value.to_le_bytes()) {
+                self.record_produced(addr, u64::from(value));
+            } else {
+                if self.first(SkipKey::Note("write_data_unwritable")) {
+                    warn!(
+                        offset,
+                        addr = format_args!("{addr:#x}"),
+                        "WRITE_DATA destination not writable guest memory — skipped"
+                    );
+                }
+                break;
+            }
+        }
+        Ok(body_len)
+    }
+
+    /// Execute a `RELEASE_MEM` (end-of-pipe) packet — the RDNA2/AGC way a queue
+    /// signals "GPU work up to here is done" by writing a completion label to
+    /// guest memory, which a cross-queue `WAIT_REG_MEM` polls on. This is the
+    /// producer Minecraft's graphics queue waits on; consuming it "without
+    /// effect" left the label unwritten and the wait permanently unmet.
+    ///
+    /// Port of SharpEmu `ApplySubmittedReleaseMem` (AGC, AgcExports.cs:5430-5496)
+    /// and `ApplySubmittedStandardReleaseMem` + `DecodeStandardReleaseMemControl`
+    /// (standard, AgcExports.cs:5349-5428). Both forms share the body layout
+    /// `[event, control, dst_lo, dst_hi, data_lo, data_hi]` (body[0] is the
+    /// event/GCR field the memory write ignores); only the control decode and
+    /// the destination-selector gate differ. `DATA_SEL` picks the write width:
+    /// 1 = 32-bit immediate, 2 = 64-bit immediate, 3/4 = a sampled GPU timestamp
+    /// (the payload is ignored; a nonzero monotonic value is what the guest
+    /// polls for). The immediate forms are recorded for the wait latch.
+    fn cp_op_release_mem(
+        &mut self,
+        cmd_id: u32,
+        body: &[u32],
+        offset: u32,
+        standard: bool,
+        mem: Option<&dyn GuestMemory>,
+    ) -> Result<u32, CpError> {
+        let body_len = pm4::body_dw(cmd_id);
+        let control = Self::body_at(body, 1, offset)?;
+        let dst = u64::from(Self::body_at(body, 2, offset)?)
+            | (u64::from(Self::body_at(body, 3, offset)?) << 32);
+        let (dst_sel_ok, data_sel) = if standard {
+            // DST_SEL bits 17:16 (memory = 0 or 1); DATA_SEL bits 31:29.
+            (
+                matches!((control >> 16) & 0x3, 0 | 1),
+                (control >> 29) & 0x7,
+            )
+        } else {
+            // AGC form: DATA_SEL is the byte at bits 23:16; no DST_SEL gate.
+            (true, (control >> 16) & 0xFF)
+        };
+        if !dst_sel_ok || dst == 0 {
+            return Ok(body_len);
+        }
+        let Some(mem) = mem else {
+            if self.first(SkipKey::Note("release_mem_needs_memory")) {
+                warn!(
+                    offset,
+                    dst = format_args!("{dst:#x}"),
+                    "RELEASE_MEM needs a GuestMemory writer — label not written"
+                );
+            }
+            return Ok(body_len);
+        };
+        match data_sel {
+            1 => {
+                let value = Self::body_at(body, 4, offset)?;
+                if mem.write_bytes(dst, &value.to_le_bytes()) {
+                    self.record_produced(dst, u64::from(value));
+                }
+            }
+            2 => {
+                let value = u64::from(Self::body_at(body, 4, offset)?)
+                    | (u64::from(Self::body_at(body, 5, offset)?) << 32);
+                if mem.write_bytes(dst, &value.to_le_bytes()) {
+                    self.record_produced(dst, value);
+                }
+            }
+            3 | 4 => {
+                // Hardware samples the GPU clock at the release point; the guest
+                // uses the nonzero value as submit-completion state. A process-
+                // monotonic counter is nonzero and strictly increasing, which is
+                // what a "became nonzero" / ">= earlier sample" poll needs. Not
+                // recorded for the equality latch (it is a counter, not a
+                // specific reference the waiter compares equal to).
+                let ts = next_release_timestamp();
+                let _ = mem.write_bytes(dst, &ts.to_le_bytes());
+            }
+            _ => {
+                if self.first(SkipKey::Note("release_mem_data_sel")) {
+                    warn!(
+                        offset,
+                        data_sel, "RELEASE_MEM with no-write DATA_SEL — label not written"
                     );
                 }
             }
@@ -2698,7 +2920,12 @@ mod tests {
         // Drive the draw handler directly (bypassing the walk's skip-and-continue
         // policy) to prove the refusal is still surfaced as a named CpError::Draw.
         let err = cp
-            .cp_op_draw_index_auto(header(3, pm4::IT_NOP, pm4::R_DRAW_INDEX_AUTO), &[3, 0], 0, &mut sink)
+            .cp_op_draw_index_auto(
+                header(3, pm4::IT_NOP, pm4::R_DRAW_INDEX_AUTO),
+                &[3, 0],
+                0,
+                &mut sink,
+            )
             .expect_err("sink refused the draw");
         match err {
             CpError::Draw { source, .. } => assert!(source.0.contains("render target")),
@@ -3756,5 +3983,247 @@ mod tests {
             .expect("legacy walk");
         assert_eq!(sink.draws.len(), 1, "legacy walk still reaches the draw");
         assert_eq!(mem.words.borrow()[0], 0, "and never writes the label");
+    }
+
+    // ---- Label PRODUCERS: WRITE_DATA / RELEASE_MEM (SharpEmu
+    // ApplySubmittedWriteData / ApplySubmittedReleaseMem) ----
+
+    /// Guest memory that both reads dwords (for `WAIT_REG_MEM`) and writes bytes
+    /// (for the `WRITE_DATA`/`RELEASE_MEM` producers), so one test can play both
+    /// the consumer and the producer.
+    struct RwMem {
+        base: u64,
+        words: std::cell::RefCell<Vec<u32>>,
+    }
+
+    impl RwMem {
+        fn new(base: u64, len: usize) -> Self {
+            Self {
+                base,
+                words: std::cell::RefCell::new(vec![0u32; len]),
+            }
+        }
+        fn word(&self, index: usize) -> u32 {
+            self.words.borrow()[index]
+        }
+    }
+
+    impl GuestMemory for RwMem {
+        fn read_dwords(&self, addr: u64, count: u32) -> Option<Vec<u32>> {
+            let rel = addr.checked_sub(self.base)?;
+            if rel % 4 != 0 {
+                return None;
+            }
+            let start = usize::try_from(rel / 4).ok()?;
+            let end = start.checked_add(count as usize)?;
+            self.words.borrow().get(start..end).map(<[u32]>::to_vec)
+        }
+
+        fn write_bytes(&self, addr: u64, bytes: &[u8]) -> bool {
+            let Some(rel) = addr.checked_sub(self.base) else {
+                return false;
+            };
+            if rel % 4 != 0 || bytes.len() % 4 != 0 {
+                return false;
+            }
+            let start = usize::try_from(rel / 4).expect("in range");
+            let mut words = self.words.borrow_mut();
+            for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+                let Some(slot) = words.get_mut(start + i) else {
+                    return false;
+                };
+                *slot = u32::from_le_bytes(chunk.try_into().expect("4 bytes"));
+            }
+            true
+        }
+    }
+
+    /// AGC `IT_NOP`+`R_WRITE_DATA`: `[control, dst_lo, dst_hi, value]`. Control
+    /// low byte is DST_SEL (1 = memory), third byte is ADDR_INCR (0 = increment).
+    fn write_data_agc(addr: u64, value: u32) -> Vec<u32> {
+        vec![
+            header(5, pm4::IT_NOP, pm4::R_WRITE_DATA),
+            1, // dst_sel = 1 (memory), addr-increment enabled
+            addr as u32,
+            (addr >> 32) as u32,
+            value,
+        ]
+    }
+
+    /// AGC `IT_NOP`+`R_RELEASE_MEM`: `[event, control, dst_lo, dst_hi, data_lo,
+    /// data_hi]`. Control DATA_SEL byte (bits 23:16) = 1 → 32-bit immediate.
+    fn release_mem_agc(addr: u64, value: u32) -> Vec<u32> {
+        vec![
+            header(7, pm4::IT_NOP, pm4::R_RELEASE_MEM),
+            0,       // event/GCR field (ignored by the memory write)
+            1 << 16, // control: DATA_SEL = 1
+            addr as u32,
+            (addr >> 32) as u32,
+            value, // data_lo
+            0,     // data_hi
+        ]
+    }
+
+    /// Both `WRITE_DATA` forms write the label to guest memory and record it for
+    /// the cross-queue wait latch. The old behaviour consumed the packet without
+    /// effect, which is why cross-queue waits were never satisfied.
+    #[test]
+    fn write_data_writes_the_label_in_both_forms() {
+        // AGC form.
+        let mem = RwMem::new(0x9000, 4);
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&write_data_agc(0x9000, 0x2A), &mut sink, Some(&mem))
+            .expect("producer must not fault");
+        assert_eq!(mem.word(0), 0x2A, "AGC WRITE_DATA wrote the label");
+        assert_eq!(cp.take_produced_labels(), vec![(0x9000, 0x2A)]);
+
+        // Standard IT_WRITE_DATA: DST_SEL in bits 11:8 (1 = memory), ADDR_INCR
+        // bit 16 clear = increment.
+        let mem = RwMem::new(0x9000, 4);
+        let dcb = vec![
+            header(5, pm4::IT_WRITE_DATA, pm4::R_ZERO),
+            1 << 8, // DST_SEL = 1
+            0x9004u32,
+            0,
+            0x5B,
+        ];
+        let mut cp = CommandProcessor::new();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("producer must not fault");
+        assert_eq!(mem.word(1), 0x5B, "standard WRITE_DATA wrote the label");
+        assert_eq!(cp.take_produced_labels(), vec![(0x9004, 0x5B)]);
+    }
+
+    /// Both `RELEASE_MEM` forms write a 32-bit immediate completion label.
+    #[test]
+    fn release_mem_writes_the_label_in_both_forms() {
+        // AGC form.
+        let mem = RwMem::new(0x9000, 4);
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&release_mem_agc(0x9000, 7), &mut sink, Some(&mem))
+            .expect("producer must not fault");
+        assert_eq!(mem.word(0), 7, "AGC RELEASE_MEM wrote the label");
+        assert_eq!(cp.take_produced_labels(), vec![(0x9000, 7)]);
+
+        // Standard IT_RELEASE_MEM: DST_SEL bits 17:16 = 0 (memory), DATA_SEL
+        // bits 31:29 = 1 (32-bit immediate). 8 total dwords (the trailing
+        // INT_CTXID dword the decoder ignores).
+        let mem = RwMem::new(0x9000, 4);
+        let dcb = vec![
+            header(8, pm4::IT_RELEASE_MEM, pm4::R_ZERO),
+            0,          // event
+            1u32 << 29, // control: DATA_SEL = 1, DST_SEL = 0 (memory)
+            0x9008u32,
+            0,
+            9, // data_lo
+            0, // data_hi
+            0, // int_ctxid (ignored)
+        ];
+        let mut cp = CommandProcessor::new();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("producer must not fault");
+        assert_eq!(mem.word(2), 9, "standard RELEASE_MEM wrote the label");
+        assert_eq!(cp.take_produced_labels(), vec![(0x9008, 9)]);
+    }
+
+    /// A 64-bit `RELEASE_MEM` (DATA_SEL 2) writes both dwords and records the
+    /// 64-bit value; a timestamp form (DATA_SEL 3) writes a nonzero value but is
+    /// not recorded for the equality latch.
+    #[test]
+    fn release_mem_data_sel_variants() {
+        let mem = RwMem::new(0x9000, 4);
+        let dcb = vec![
+            header(7, pm4::IT_NOP, pm4::R_RELEASE_MEM),
+            0,
+            2 << 16, // DATA_SEL = 2 (64-bit)
+            0x9000u32,
+            0,
+            0xDEAD_BEEF,
+            0x0000_0001,
+        ];
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem)).unwrap();
+        assert_eq!(mem.word(0), 0xDEAD_BEEF, "64-bit low dword");
+        assert_eq!(mem.word(1), 0x0000_0001, "64-bit high dword");
+        assert_eq!(
+            cp.take_produced_labels(),
+            vec![(0x9000, 0x1_DEAD_BEEF)],
+            "64-bit value recorded for the latch"
+        );
+
+        let mem = RwMem::new(0x9000, 4);
+        let dcb = vec![
+            header(7, pm4::IT_NOP, pm4::R_RELEASE_MEM),
+            0,
+            3 << 16, // DATA_SEL = 3 (GPU timestamp)
+            0x9000u32,
+            0,
+            0,
+            0,
+        ];
+        let mut cp = CommandProcessor::new();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem)).unwrap();
+        assert_ne!(mem.word(0), 0, "timestamp form writes a nonzero value");
+        assert!(
+            cp.take_produced_labels().is_empty(),
+            "timestamp is a counter, not an equality-latched label"
+        );
+    }
+
+    /// A producer with no `GuestMemory` writer is skipped (one warn), never a
+    /// stream fault — read-only embedders keep working.
+    #[test]
+    fn producers_without_memory_are_skipped() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let mut dcb = write_data_agc(0x9000, 1);
+        dcb.extend(release_mem_agc(0x9000, 1));
+        dcb.extend(state_and_draw());
+        cp.run(&dcb, &mut sink)
+            .expect("producers without memory must not kill the DCB");
+        assert_eq!(sink.draws.len(), 1, "the stream still reaches the draw");
+        assert!(cp.take_produced_labels().is_empty());
+    }
+
+    /// End to end at the CP layer: a `WAIT_REG_MEM` suspends, a producer buffer
+    /// writes the label, and re-running from the resume point completes — no
+    /// force-satisfy anywhere. This is the exact cross-queue gate that black-
+    /// screened Minecraft, proven on one command processor.
+    #[test]
+    fn wait_then_producer_write_lets_the_walk_resume() {
+        let mem = RwMem::new(0x9000, 4);
+        // Consumer: wait for label(0x9000) == 1, then a draw.
+        let mut consumer = wait32(0x9000, !0, 3, 1);
+        consumer.extend(state_and_draw());
+        let resume_at = consumer.len() - state_and_draw().len();
+
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let outcome = cp
+            .run_resumable(&consumer, 0, &mut sink, Some(&mem))
+            .expect("wait must not fault");
+        assert!(
+            matches!(outcome, RunOutcome::Suspended(_)),
+            "unmet wait suspends"
+        );
+        assert!(sink.draws.is_empty(), "work behind the wait must not run");
+        assert_eq!(mem.word(0), 0, "the label is never force-written");
+
+        // Producer: a WRITE_DATA on the same memory writes the label.
+        let mut producer_cp = CommandProcessor::new();
+        producer_cp
+            .run_with_memory(&write_data_agc(0x9000, 1), &mut sink, Some(&mem))
+            .expect("producer must not fault");
+        assert_eq!(mem.word(0), 1, "the producer wrote the label");
+
+        // Resume from where the consumer stopped: it now completes and draws.
+        let outcome = cp
+            .run_resumable(&consumer, resume_at, &mut sink, Some(&mem))
+            .expect("resumed walk");
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(sink.draws.len(), 1, "the resumed remainder draws");
     }
 }

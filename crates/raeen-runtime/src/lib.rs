@@ -58,14 +58,14 @@ pub mod vmm;
 /// Windows discarded at a context switch (see `dispatch::fsbase_rearm_count`).
 /// Windows-only, like the rest of the execution core.
 #[cfg(target_os = "windows")]
-pub use dispatch::fsbase_rearm_count;
+pub use dispatch::{HleDispatchMetrics, fsbase_rearm_count, hle_dispatch_metrics};
 
-use thiserror::Error;
 use raeen_firmware::LinkedModule;
 #[cfg(target_os = "windows")]
 use raeen_firmware::ModuleInitRole;
 use raeen_hle::{GuestMemory, HleRegistry};
 use raeen_kernel::OrbisKernel;
+use thiserror::Error;
 
 /// How a guest call ended (design doc §3/§4, wall #1): [`execute_linked`]'s
 /// function-mode calls only ever produce `Returned` (mapped straight to its
@@ -399,7 +399,7 @@ pub fn execute_linked(
             .map_or(0, |off| GUEST_ARENA_BASE + off),
     );
     let entry_ptr = arena.entry_ptr(entry_offset)?;
-    let guard = trampoline::TrampolineGuard::reserve(module.hle_trampolines.len())?;
+    let guard = trampoline::TrampolineGuard::reserve(&module.hle_trampolines)?;
     let guest_rsp = arena
         .stack_top()
         .checked_sub(8)
@@ -540,7 +540,7 @@ pub fn execute_process(
     let _call_lock = dispatch::call_lock();
     let arena = std::sync::Arc::new(arena::GuestArena::new(&module.image)?);
     arena::maybe_enable_wx_image(&arena, &module.executable_ranges);
-    let guard = trampoline::TrampolineGuard::reserve(module.hle_trampolines.len())?;
+    let guard = trampoline::TrampolineGuard::reserve(&module.hle_trampolines)?;
     let gpu = raeen_gpu::AgcGpuSession::new_process(arena.clone());
     raeen_gpu::AgcGpuSession::install_process(&gpu);
     let result = execute_process_mapped(
@@ -601,7 +601,7 @@ fn execute_process_shared_inner(
     let arena = std::sync::Arc::new(arena::GuestArena::new(&module.image)?);
     arena::maybe_enable_wx_image(&arena, &module.executable_ranges);
     let guard = std::sync::Arc::new(trampoline::TrampolineGuard::reserve(
-        module.hle_trampolines.len(),
+        &module.hle_trampolines,
     )?);
     let process = thread::GuestProcess::create(module, hle, kernel, arena, guard);
     on_start(process.clone());
@@ -825,6 +825,11 @@ fn execute_process_mapped(
     // `process::build_process_stack` writes only through `&arena` (bounds-
     // checked `GuestMemory`), never panicking on `argv`/`envp` content.
     let process_rsp = process::build_process_stack(arena.stack_top(), argv, envp, arena)?;
+    // The process stack starts with argc followed immediately by the argv
+    // pointer table. libc's getargc/getargv may run in a dependency
+    // initializer before the executable's `_start`, so publish it now.
+    let process_argv = process_rsp.checked_add(8).ok_or(RuntimeError::MapFailed)?;
+    kernel.set_process_args(argv.len() as u64, process_argv);
     // Dependency initializers are ordinary called functions. Give them a
     // return slot below the process-parameter block; the guarded address in
     // that slot lets dispatch recover the host context without retaining a

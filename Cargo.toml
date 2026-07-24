@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "xtask",
     "crates/raeen-core",
     "crates/raeen-loader",
     "crates/raeen-kernel",
@@ -17,6 +18,11 @@ members = [
     "crates/kyty-math",
     "crates/kyty-graphics",
 ]
+# BYO, git-ignored present plugins (upscalers/frame-gen). Excluded from the
+# workspace so `cargo build --workspace` never requires them; they are pulled in
+# only as an OPTIONAL path dependency behind raeen-gui's `upscale-plugins`
+# feature. See plugins/README.md.
+exclude = ["plugins"]
 
 [workspace.package]
 version = "0.1.0"
@@ -98,6 +104,7 @@ windows-sys = { version = "0.59", features = [
     # file IO, threading/sync). Additive — does not affect existing crates.
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",
+    "Win32_System_JobObjects",
     "Win32_System_IO",
     "Win32_Security",
     "Win32_System_LibraryLoader",

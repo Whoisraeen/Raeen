@@ -92,6 +92,14 @@ pub mod pad_button {
 /// here (they'd need their exact per-SDK offsets).
 pub const ORBIS_PAD_DATA_PREFIX_LEN: usize = 12;
 
+/// Total size in bytes of a complete Orbis/Prospero `ScePadData` struct — the
+/// full buffer `scePadReadState` fills. Verified against shadPS4 `pad.h`,
+/// KytyPS5 `padData.h` (`static_assert(sizeof == 120)`), and OpenOrbis. The
+/// `connected` flag lives at `0x4C` and `connectedCount` at `0x68`, well past
+/// the 12-byte input prefix — so `hle_pad_read_state` must write the WHOLE
+/// struct or the guest reads `connected` as garbage and drops all input.
+pub const ORBIS_PAD_DATA_LEN: usize = 120;
+
 /// Map an analog stick axis (`-1.0..=1.0`, this crate's convention) to the
 /// Orbis `u8` encoding (`0`=min, `128`=center, `255`=max).
 fn stick_to_u8(v: f32) -> u8 {

@@ -3529,7 +3529,12 @@ pub fn shader_get_input_info_ps(
     if usage.fetch || usage.vertex_buffer || usage.vertex_attrib {
         return Err(ni("ps: fetch / vertex buffer / vertex attrib"));
     }
-    if usage.storage_buffers_readwrite > 0 {
+    // Kyty's PS4-era path rejects pixel-stage writable buffers outright.
+    // Gen5 titles use fragment UAV/SSBO access (measured on ASTRO.BOT
+    // 0x500652400). The recompiler's MUBUF store helpers are stage-agnostic,
+    // and Raeen's graphics descriptor path binds STORAGE_BUFFER resources
+    // with FRAGMENT visibility, so retain the legacy guard only.
+    if usage.storage_buffers_readwrite > 0 && !next_gen {
         return Err(ni("ps: read-write storage buffers"));
     }
     if usage.gds_pointers > 0 {

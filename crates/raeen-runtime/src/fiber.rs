@@ -15,9 +15,9 @@
 //! The entry is `void(*)(u64 arg_on_initialize /*rdi*/, u64 arg_on_run /*rsi*/)`
 //! and must never return.
 
-use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 use raeen_hle::GuestMemory;
 use raeen_kernel::{FiberThreadState, GuestRegs, OrbisKernel};
+use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 
 const OFF_STATE: u64 = 0x04;
 const OFF_ENTRY: u64 = 0x08;

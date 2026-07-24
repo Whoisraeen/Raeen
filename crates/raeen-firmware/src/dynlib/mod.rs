@@ -24,8 +24,8 @@ pub mod linker;
 pub mod nid;
 pub mod nid_names;
 
-use tracing::{debug, info, warn};
 use raeen_core::error::FirmwareError;
+use tracing::{debug, info, warn};
 
 /// SCE dynamic tags (see module docs). Values are the community-documented
 /// common set; `PT_DYNAMIC` also carries plenty of standard ELF tags this

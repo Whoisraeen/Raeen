@@ -258,6 +258,8 @@ fn ensure_veh() -> Result<(), RuntimeError> {
 static FSBASE_REARMS: AtomicU64 = AtomicU64::new(0);
 static HLE_ENTERS: AtomicU64 = AtomicU64::new(0);
 static HLE_EXITS: AtomicU64 = AtomicU64::new(0);
+static HLE_VEH_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+static HLE_DIRECT_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static LAST_HLE_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 static LAST_HLE_RETURN: AtomicU64 = AtomicU64::new(0);
 static TRACE_HLE: OnceLock<bool> = OnceLock::new();
@@ -283,6 +285,25 @@ const CALL_STATS_BOOT_WINDOW: std::time::Duration = std::time::Duration::from_se
 /// [`FSBASE_REARMS`]. Monotonic; never reset.
 pub fn fsbase_rearm_count() -> u64 {
     FSBASE_REARMS.load(Ordering::Relaxed)
+}
+
+/// Monotonic HLE dispatch counters used by compatibility reports and the
+/// direct-vs-VEH benchmark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HleDispatchMetrics {
+    pub entered: u64,
+    pub exited: u64,
+    pub veh: u64,
+    pub direct: u64,
+}
+
+pub fn hle_dispatch_metrics() -> HleDispatchMetrics {
+    HleDispatchMetrics {
+        entered: HLE_ENTERS.load(Ordering::Relaxed),
+        exited: HLE_EXITS.load(Ordering::Relaxed),
+        veh: HLE_VEH_DISPATCHES.load(Ordering::Relaxed),
+        direct: HLE_DIRECT_DISPATCHES.load(Ordering::Relaxed),
+    }
 }
 
 /// Acquire [`CALL_LOCK`] for the entire [`crate::execute_linked`] pipeline.
@@ -620,6 +641,18 @@ struct ActiveContext {
     armed: Cell<bool>,
 }
 
+/// Runtime-private slot in the guest TCB used only by the generated direct
+/// bridge. It deliberately lives at the end of Raeen's 0x800-byte TCB
+/// allocation, outside the ABI fields at the front.
+const DIRECT_STATE_TCB_OFFSET: u64 = 0x7f0;
+const DIRECT_HOST_STACK_SIZE: usize = 256 * 1024;
+
+#[repr(C)]
+struct DirectThreadState {
+    context: *mut ActiveContext,
+    host_stack_top: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct GuestCallbackFrame {
     original_return: u64,
@@ -811,6 +844,113 @@ thread_local! {
     static ACTIVE_CONTEXT: Cell<*mut ActiveContext> = const { Cell::new(ptr::null_mut()) };
 }
 
+/// Target of the generated executable leaf-import bridge. The bridge switches
+/// to a private host stack before entering this function.
+#[allow(clippy::too_many_arguments)]
+pub(crate) extern "sysv64" fn direct_hle_gateway(
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    index: u64,
+    guest_bridge_rsp: u64,
+    context: u64,
+    _guest_rax: u64,
+    xmm0: u64,
+    xmm1: u64,
+    xmm2: u64,
+    xmm3: u64,
+    xmm4: u64,
+    xmm5: u64,
+    xmm6: u64,
+    xmm7: u64,
+) -> u64 {
+    let dispatch = || {
+        let ctx = unsafe { &*(context as *const ActiveContext) };
+        let trampolines = unsafe { &*ctx.trampolines };
+        let Some(t) = trampolines.get(index as usize) else {
+            ctx.error
+                .set(Some(RuntimeError::UnresolvedTrampoline(index)));
+            return 0;
+        };
+        let hle = unsafe { &*ctx.hle };
+        let kernel = unsafe { &*ctx.kernel };
+        let mem = unsafe { &*ctx.mem };
+        let alloc = unsafe { &*ctx.alloc };
+
+        let mut args = [0u64; 14];
+        args[..6].copy_from_slice(&[a0, a1, a2, a3, a4, a5]);
+        // The slot call pushed an internal return address. The original guest
+        // return is next, followed by SysV argument seven.
+        for i in 0..8 {
+            let mut bytes = [0u8; 8];
+            if mem.read(guest_bridge_rsp + 16 + i as u64 * 8, &mut bytes) {
+                args[6 + i] = u64::from_le_bytes(bytes);
+            }
+        }
+        let mut caller = [0u8; 8];
+        let caller_return_addr = if mem.read(guest_bridge_rsp + 8, &mut caller) {
+            u64::from_le_bytes(caller)
+        } else {
+            0
+        };
+        LAST_HLE_RETURN.store(caller_return_addr, Ordering::Relaxed);
+        LAST_HLE_INDEX.store(index, Ordering::Relaxed);
+        HLE_ENTERS.fetch_add(1, Ordering::Relaxed);
+        HLE_DIRECT_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+        let _hle_yield = GuestGilYield::during_hle();
+
+        let hle_ctx = HleContext {
+            kernel,
+            services: kernel,
+            gpu: unsafe { &*ctx.gpu },
+            mem,
+            alloc,
+            guest_calls: ctx,
+            guest_threads: ctx,
+            caller_return_addr,
+            caller_rsp: guest_bridge_rsp + 8,
+            float_args: [xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7],
+        };
+        ctx.active_hle
+            .set(Some((index, args[..6].try_into().unwrap())));
+        let result = hle
+            .call(&hle_ctx, &t.library, &t.function, &args)
+            .unwrap_or(0);
+        ctx.active_hle.set(None);
+
+        if let Some(request) = ctx.pending_guest_call.take() {
+            if let Some(completion) = request.completion {
+                let _ = mem.atomic_store_u32(completion.address, completion.failure_u32);
+            }
+            tracing::error!(
+                "{}::{} requested a guest callback through the direct leaf gateway",
+                t.library,
+                t.function
+            );
+        }
+        if ctx.process_is_terminating() || ctx.thread_exit.get().is_some() {
+            tracing::error!(
+                "{}::{} changed execution context through the direct leaf gateway",
+                t.library,
+                t.function
+            );
+        }
+
+        ctx.trace
+            .push(index as u32, result, [args[0], args[1], args[2]]);
+        HLE_EXITS.fetch_add(1, Ordering::Relaxed);
+        result
+    };
+
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(dispatch)).unwrap_or_else(|_| {
+        tracing::error!("HLE handler panicked inside executable thunk gateway; aborting runner");
+        std::process::abort()
+    })
+}
+
 /// Call the guest — via `call_guest`, invoked exactly once — servicing any
 /// HLE trampoline calls it makes via a VEH for the duration of the call
 /// (design doc §2), and distinguishing three ways that call can end: a
@@ -933,6 +1073,13 @@ pub(crate) unsafe fn run(
         )
     };
 
+    let direct_host_stack = vec![0u8; DIRECT_HOST_STACK_SIZE].into_boxed_slice();
+    let direct_host_stack_top = direct_host_stack.as_ptr() as u64 + direct_host_stack.len() as u64;
+    let mut direct_state = Box::new(DirectThreadState {
+        context: ptr::null_mut(),
+        host_stack_top: direct_host_stack_top,
+    });
+
     let ctx = ActiveContext {
         trampolines: trampolines as *const [HleTrampoline],
         unresolved_stubs: unresolved_stubs as *const [UnresolvedStub],
@@ -966,6 +1113,15 @@ pub(crate) unsafe fn run(
         exited: Cell::new(false),
         armed: Cell::new(false),
     };
+    direct_state.context = &ctx as *const ActiveContext as *mut ActiveContext;
+    if let Some(tcb_addr) = tcb
+        && !mem.write(
+            tcb_addr + DIRECT_STATE_TCB_OFFSET,
+            &(direct_state.as_ref() as *const DirectThreadState as u64).to_le_bytes(),
+        )
+    {
+        return Err(RuntimeError::MapFailed);
+    }
 
     ensure_veh()?;
 
@@ -1099,6 +1255,10 @@ pub(crate) unsafe fn run(
         }
     }
 
+    if let Some(tcb_addr) = tcb {
+        let _ = mem.write(tcb_addr + DIRECT_STATE_TCB_OFFSET, &0u64.to_le_bytes());
+    }
+
     ACTIVE_CONTEXT.with(|slot| slot.set(ptr::null_mut()));
 
     // Design doc §4: on the resumed arrival, an exit-family termination is
@@ -1218,7 +1378,10 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
         // chain, node link at voice+0xe8) to show which node is half-linked.
         tracing::warn!(
             "TEMP-DIAG snapshot r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
-            snapshot.r12, snapshot.r13, snapshot.r14, snapshot.r15,
+            snapshot.r12,
+            snapshot.r13,
+            snapshot.r14,
+            snapshot.r15,
         );
         if std::env::var_os("RAEEN_DUMP_VOICE_LIST").is_some() {
             let read_q = |addr: u64| -> Option<u64> {
@@ -1243,15 +1406,12 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
                             break;
                         }
                         let link = read_q(node.wrapping_add(0xe8));
-                        let flag120 = read_q(node.wrapping_add(0x120))
-                            .map(|v| v & 0xff);
+                        let flag120 = read_q(node.wrapping_add(0x120)).map(|v| v & 0xff);
                         lines.push_str(&format!(
                             "  node[{i}]={node:#x} [+0xe8]={link:#x?} [+0x120]&0xff={flag120:#x?}\n"
                         ));
                         match link {
-                            Some(l) if l != 0 => {
-                                node = read_q(l.wrapping_add(0x10)).unwrap_or(0)
-                            }
+                            Some(l) if l != 0 => node = read_q(l.wrapping_add(0x10)).unwrap_or(0),
                             _ => {
                                 lines.push_str("  ^^ NULL/unreadable link — half-linked node\n");
                                 break;
@@ -1623,7 +1783,11 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
         };
         match trampolines.get(idx as usize) {
             Some(t) => {
-                let _ = write!(ring, "\n    {}::{} -> {ret:#x}{marker}", t.library, t.function);
+                let _ = write!(
+                    ring,
+                    "\n    {}::{} -> {ret:#x}{marker}",
+                    t.library, t.function
+                );
             }
             None => {
                 let _ = write!(ring, "\n    <trampoline #{idx}> -> {ret:#x}{marker}");
@@ -2154,6 +2318,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             }
             LAST_HLE_INDEX.store(idx, Ordering::Relaxed);
             HLE_ENTERS.fetch_add(1, Ordering::Relaxed);
+            HLE_VEH_DISPATCHES.fetch_add(1, Ordering::Relaxed);
             // Yield the diagnostic guest GIL for the duration of this HLE call so
             // a blocking wait (semaphore/mutex/cond) lets another guest thread
             // run; re-acquired when `_hle_yield` drops at the end of this arm,
@@ -2484,8 +2649,10 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             // returns, but still service the call as a 0-returning stub so
             // we can safely resume (design doc §7 step 2's suggested
             // approach) rather than needing an unwind-style abort.
+            let linker_visible = raeen_firmware::HLE_TRAMPOLINE_BASE
+                .wrapping_add(fault_addr.wrapping_sub(ctx.region_base));
             ctx.error
-                .set(Some(RuntimeError::UnresolvedTrampoline(fault_addr)));
+                .set(Some(RuntimeError::UnresolvedTrampoline(linker_visible)));
             0
         }
     };

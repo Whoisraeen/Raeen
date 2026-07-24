@@ -3141,6 +3141,134 @@ fn shader_parse_mubuf(
     Ok(size)
 }
 
+/// GFX10/RDNA2 FLAT-class decoder (FLAT / GLOBAL / SCRATCH segments, encoding
+/// `0x37`). Kyty's SI/GNM parser has no FLAT class; ported from SharpEmu PR
+/// #587 (`Gen5ShaderTranslator.DecodeFlat`, GPL-2.0).
+///
+/// Encoding (little-endian, two dwords):
+/// * word0: `offset[12:0]`, `seg[15:14]` (0 = FLAT, 1 = SCRATCH, 2 = GLOBAL),
+///   `glc[16]`, `slc[17]`, `op[24:18]`, `enc[31:26] = 0x37`.
+/// * word1: `addr[7:0]` (VGPR), `data[15:8]` (VGPR store source),
+///   `saddr[22:16]` (SGPR base; `0x7f` = NULL), `vdst[31:24]` (VGPR load dest).
+///
+/// The FLAT segment holds the whole 64-bit address in the VGPR pair
+/// `(addr, addr+1)`; a GLOBAL op with a real SADDR uses an SGPR base pair plus
+/// a 32-bit VGPR offset. `SharpEmu`'s `UsesFlatAddress` (true for the FLAT
+/// segment, and for a GLOBAL segment whose SADDR is NULL) rides on
+/// [`ShaderInstruction::uses_flat_address`]. `glc`/`slc`/`dlc` are ignored —
+/// the recompiler serves all of guest memory from one coherent window.
+fn shader_parse_flat(
+    pc: u32,
+    buffer: &[u32],
+    dst: &mut ShaderCode,
+    next_gen: bool,
+) -> Result<u32, ShaderParseError> {
+    const S: &str = "flat";
+    let b0 = buffer[0];
+    let b1 = dw(buffer, 1, pc)?;
+
+    // The FLAT class is an RDNA2 (next-gen/PS5) encoding; a legacy stream
+    // reaching 0x37 is a decode error, not a FLAT op.
+    if !next_gen {
+        return Err(feature(S, "FLAT-class encoding on legacy", pc));
+    }
+
+    let offset = b0 & 0x1fff; // [12:0]
+    let seg = (b0 >> 14) & 0x3; // [15:14]
+    let opcode = (b0 >> 18) & 0x7f; // [24:18]
+
+    let addr = b1 & 0xff; // [7:0]  VGPR
+    let data = (b1 >> 8) & 0xff; // [15:8] VGPR store data
+    let saddr = (b1 >> 16) & 0x7f; // [22:16] SGPR base (0x7f = NULL)
+    let vdst = (b1 >> 24) & 0xff; // [31:24] VGPR load dest
+
+    // Segment selects the addressing form (SharpEmu Gen5 `segment` switch).
+    let uses_flat_segment = match seg {
+        0x0 => true,                                          // FLAT
+        0x2 => false,                                         // GLOBAL
+        0x1 => return Err(feature(S, "scratch segment", pc)), // stack spill — not hot path
+        _ => return Err(feature(S, "reserved segment", pc)),
+    };
+    let saddr_null = saddr == 0x7f;
+    // The address is a full 64-bit VGPR pair for the FLAT segment, or a GLOBAL
+    // op that left SADDR NULL. Otherwise SADDR names the base pair and the VGPR
+    // is a 32-bit per-lane offset (SharpEmu `UsesFlatAddress`).
+    let flat_addressing = uses_flat_segment || saddr_null;
+
+    let mut inst = ShaderInstruction {
+        pc,
+        uses_flat_address: flat_addressing,
+        ..Default::default()
+    };
+    inst.format = F::FlatAddr;
+    inst.src_num = 3;
+
+    // src[0]: VGPR address (pair when flat-addressed, else a 32-bit offset).
+    inst.src[0] = operand_parse(addr + 256)?;
+    inst.src[0].size = if flat_addressing { 2 } else { 1 };
+
+    // src[1]: SGPR base pair, or NULL when the VGPR carries the whole address.
+    if flat_addressing {
+        inst.src[1] = ShaderOperand {
+            type_: O::Null,
+            size: 2,
+            ..Default::default()
+        };
+    } else {
+        inst.src[1] = operand_parse(saddr)?;
+        inst.src[1].size = 2;
+    }
+
+    // src[2]: immediate byte offset. GLOBAL/SCRATCH sign-extend the 13-bit
+    // field; FLAT uses the unsigned low 11 bits (GFX10 reserves bits 12:11).
+    let off_val = if uses_flat_segment {
+        offset & 0x7ff
+    } else {
+        (((offset & 0x1fff) << 19) as i32 >> 19) as u32
+    };
+    inst.src[2] = ShaderOperand {
+        type_: O::IntegerInlineConstant,
+        constant: ShaderConstant::from_u(off_val),
+        size: 0,
+        ..Default::default()
+    };
+
+    // Opcode suffix -> operation + dword width (SharpEmu Gen5 `suffix` switch).
+    let (type_, dst_size, is_store, name) = match opcode {
+        0x08 => (T::FlatLoadUbyte, 1, false, "flat_load_ubyte"),
+        0x0c => (T::FlatLoadDword, 1, false, "flat_load_dword"),
+        0x0d => (T::FlatLoadDwordX2, 2, false, "flat_load_dwordx2"),
+        0x0e => (T::FlatLoadDwordX4, 4, false, "flat_load_dwordx4"),
+        0x0f => (T::FlatLoadDwordX3, 3, false, "flat_load_dwordx3"),
+        0x1c => (T::FlatStoreDword, 1, true, "flat_store_dword"),
+        0x1d => (T::FlatStoreDwordX2, 2, true, "flat_store_dwordx2"),
+        0x1e => (T::FlatStoreDwordX4, 4, true, "flat_store_dwordx4"),
+        // Named-NI for the byte/short/atomic suffixes SharpEmu also decodes but
+        // that no measured PS5 hot-path shader has needed yet.
+        0x09 => return Err(ni(dst, S, "flat_load_sbyte", opcode, pc, b0)),
+        0x0a => return Err(ni(dst, S, "flat_load_ushort", opcode, pc, b0)),
+        0x0b => return Err(ni(dst, S, "flat_load_sshort", opcode, pc, b0)),
+        0x18 => return Err(ni(dst, S, "flat_store_byte", opcode, pc, b0)),
+        0x1a => return Err(ni(dst, S, "flat_store_short", opcode, pc, b0)),
+        0x1f => return Err(ni(dst, S, "flat_store_dwordx3", opcode, pc, b0)),
+        0x32 => return Err(ni(dst, S, "flat_atomic_add", opcode, pc, b0)),
+        0x38 => return Err(ni(dst, S, "flat_atomic_umax", opcode, pc, b0)),
+        _ => return Err(unknown_op(dst, S, opcode, pc, b0)),
+    };
+    // Name is carried only for the (unreachable here) NI arms above; keep it
+    // referenced so the match's binding is not flagged unused.
+    let _ = name;
+
+    inst.type_ = type_;
+    // Load writes VDST; store reads the DATA VGPR (mirrors MUBUF's `vdata`).
+    inst.dst = operand_parse(if is_store { data } else { vdst } + 256)?;
+    inst.dst.size = dst_size;
+
+    dst.get_instructions_mut().push(inst);
+
+    Ok(2)
+}
+
 /// Kyty: ShaderParse.cpp `shader_parse_ds` (L2722). Kyty only implements the
 /// GDS append/consume pair; everything else is named-NI.
 #[allow(clippy::too_many_lines)]
@@ -3722,6 +3850,10 @@ fn shader_parse_mimg(
                     inst.format = F::Vdata1Vaddr3StSsDmask1;
                     inst.dst.size = 1;
                 }
+                0x2 => {
+                    inst.format = F::Vdata1Vaddr3StSsDmask2;
+                    inst.dst.size = 1;
+                }
                 0x3 => {
                     inst.format = F::Vdata2Vaddr3StSsDmask3;
                     inst.dst.size = 2;
@@ -3847,9 +3979,20 @@ fn shader_parse_mimg(
             inst.src[0].size = 4;
             inst.src[1].size = 8;
             inst.src[2].size = 4;
-            if dmask == 0x7 {
-                inst.format = F::Vdata3Vaddr4StSsDmask7;
-                inst.dst.size = 3;
+            match dmask {
+                0x1 => {
+                    inst.format = F::Vdata1Vaddr4StSsDmask1;
+                    inst.dst.size = 1;
+                }
+                0x2 => {
+                    inst.format = F::Vdata1Vaddr4StSsDmask2;
+                    inst.dst.size = 1;
+                }
+                0x7 => {
+                    inst.format = F::Vdata3Vaddr4StSsDmask7;
+                    inst.dst.size = 3;
+                }
+                _ => {}
             }
         }
         0x38 => return Err(ni(dst, S, "image_sample_c_o", opcode, pc, b0)),
@@ -4163,6 +4306,9 @@ pub fn shader_parse(
                     shader_parse_vop3(pc, buffer, dst, next_gen)?
                 }
                 0x36 => shader_parse_ds(pc, buffer, dst, next_gen)?,
+                // Beyond Kyty (SharpEmu PR #587): FLAT-class (FLAT/GLOBAL)
+                // direct guest-memory access, encoding 0x37.
+                0x37 => shader_parse_flat(pc, buffer, dst, next_gen)?,
                 0x38 => shader_parse_mubuf(pc, buffer, dst, next_gen)?,
                 0x3a => shader_parse_mtbuf(pc, buffer, dst, next_gen)?,
                 0x3c => shader_parse_mimg(pc, buffer, dst, next_gen)?,
@@ -4948,6 +5094,197 @@ mod tests {
         );
     }
 
+    // ---- FLAT-class decode (SharpEmu PR #587 `Gen5FlatMemoryTests`) ----
+
+    /// A FLAT-segment `flat_load_dword v5, v[2:3]`: the whole 64-bit address is
+    /// the VGPR pair, SADDR is NULL, and `uses_flat_address` is set.
+    #[test]
+    fn flat_load_dword_flat_segment_decodes() {
+        // word0: enc 0x37<<26 | op 0x0c<<18 | seg 0 => 0xDC300000.
+        // word1: vdst v5<<24 | saddr NULL 0x7f<<16 | addr v2 => 0x057F0002.
+        let (code, result) = parse(
+            &[0xDC30_0000, 0x057F_0002, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse flat_load_dword");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::FlatLoadDword);
+        assert_eq!(inst.format, F::FlatAddr);
+        assert!(
+            inst.uses_flat_address,
+            "FLAT segment addresses via VGPR pair"
+        );
+        assert_eq!(
+            (inst.src[0].type_, inst.src[0].register_id, inst.src[0].size),
+            (O::Vgpr, 2, 2)
+        );
+        assert_eq!(inst.src[1].type_, O::Null);
+        assert_eq!(
+            (inst.src[2].type_, inst.src[2].constant.u),
+            (O::IntegerInlineConstant, 0)
+        );
+        assert_eq!(
+            (inst.dst.type_, inst.dst.register_id, inst.dst.size),
+            (O::Vgpr, 5, 1)
+        );
+    }
+
+    /// A GLOBAL-segment `global_load_dword v5, v2, s[8:9]`: the base is an SGPR
+    /// pair, the VGPR is a 32-bit offset, and `uses_flat_address` is clear.
+    #[test]
+    fn global_load_dword_with_sgpr_base_decodes() {
+        // word0: enc | op 0x0c<<18 | seg 2<<14 => 0xDC308000.
+        // word1: vdst v5<<24 | saddr s8<<16 | addr v2 => 0x05080002.
+        let (code, result) = parse(
+            &[0xDC30_8000, 0x0508_0002, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse global_load_dword");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::FlatLoadDword);
+        assert!(
+            !inst.uses_flat_address,
+            "GLOBAL with SADDR uses an SGPR base"
+        );
+        assert_eq!(
+            (inst.src[0].type_, inst.src[0].register_id, inst.src[0].size),
+            (O::Vgpr, 2, 1)
+        );
+        assert_eq!(
+            (inst.src[1].type_, inst.src[1].register_id, inst.src[1].size),
+            (O::Sgpr, 8, 2)
+        );
+        assert_eq!(
+            (inst.dst.type_, inst.dst.register_id, inst.dst.size),
+            (O::Vgpr, 5, 1)
+        );
+    }
+
+    /// `flat_store_dword v[2:3], v6`: the store DATA VGPR lands in `dst`.
+    #[test]
+    fn flat_store_dword_decodes() {
+        // word0: enc | op 0x1c<<18 | seg 0 => 0xDC700000.
+        // word1: saddr NULL 0x7f<<16 | data v6<<8 | addr v2 => 0x007F0602.
+        let (code, result) = parse(
+            &[0xDC70_0000, 0x007F_0602, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse flat_store_dword");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::FlatStoreDword);
+        assert!(inst.uses_flat_address);
+        assert_eq!(
+            (inst.src[0].type_, inst.src[0].register_id, inst.src[0].size),
+            (O::Vgpr, 2, 2)
+        );
+        assert_eq!(
+            (inst.dst.type_, inst.dst.register_id, inst.dst.size),
+            (O::Vgpr, 6, 1)
+        );
+    }
+
+    /// The FLAT widths x2/x3/x4 size their destinations correctly.
+    #[test]
+    fn flat_load_dword_widths_size_destination() {
+        for (op, ty, size) in [
+            (0x0du32, T::FlatLoadDwordX2, 2i32),
+            (0x0f, T::FlatLoadDwordX3, 3),
+            (0x0e, T::FlatLoadDwordX4, 4),
+        ] {
+            let word0 = 0xDC00_0000 | (op << 18);
+            let (code, result) = parse(&[word0, 0x057F_0002, S_ENDPGM], ShaderType::Compute, true);
+            result.unwrap_or_else(|e| panic!("parse flat width op={op:#x}: {e}"));
+            let inst = &code.get_instructions()[0];
+            assert_eq!(inst.type_, ty, "op={op:#x}");
+            assert_eq!(inst.dst.size, size, "op={op:#x}");
+        }
+    }
+
+    /// GLOBAL/SCRATCH sign-extend the 13-bit immediate offset; an all-ones
+    /// field decodes to -1.
+    #[test]
+    fn global_load_dword_negative_offset_sign_extends() {
+        // word0: enc | op 0x0c<<18 | seg 2<<14 | offset 0x1fff => 0xDC309FFF.
+        let (code, result) = parse(
+            &[0xDC30_9FFF, 0x0508_0002, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse global_load_dword offset");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.src[2].constant.i(), -1);
+        assert_eq!(inst.src[2].constant.u, 0xFFFF_FFFF);
+    }
+
+    /// A FLAT op must not abort the whole parse — the shader keeps decoding to
+    /// its terminator (the regression FLAT closed: `UnknownEncoding` at 0x37
+    /// killed every downstream analysis).
+    #[test]
+    fn flat_load_does_not_kill_shader_parse() {
+        let (code, result) = parse(
+            &[0xDC30_0000, 0x057F_0002, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("flat parse");
+        let insts = code.get_instructions();
+        assert_eq!(insts.len(), 2);
+        assert_eq!(insts[0].type_, T::FlatLoadDword);
+        assert_eq!(insts[1].type_, T::SEndpgm);
+    }
+
+    /// The FLAT class is an RDNA2 encoding; a legacy stream at 0x37 is refused.
+    #[test]
+    fn flat_on_legacy_is_refused() {
+        let (_, result) = parse(
+            &[0xDC30_0000, 0x057F_0002, S_ENDPGM],
+            ShaderType::Compute,
+            false,
+        );
+        assert_eq!(
+            result,
+            Err(ShaderParseError::NotImplementedFeature {
+                family: "flat",
+                feature: "FLAT-class encoding on legacy",
+                pc: 0,
+            })
+        );
+    }
+
+    /// SCRATCH (stack-spill) addressing is refused by name — not on the hot path.
+    #[test]
+    fn flat_scratch_segment_is_refused() {
+        // seg 1<<14 => 0x4000.
+        let (_, result) = parse(
+            &[0xDC30_4000, 0x057F_0002, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        assert_eq!(
+            result,
+            Err(ShaderParseError::NotImplementedFeature {
+                family: "flat",
+                feature: "scratch segment",
+                pc: 0,
+            })
+        );
+    }
+
+    /// An unmodeled FLAT suffix is a named refusal, never a silent wrong decode.
+    #[test]
+    fn flat_unknown_opcode_is_refused() {
+        // op 0x7f (not in the suffix table).
+        let word0 = 0xDC00_0000 | (0x7f << 18);
+        let (_, result) = parse(&[word0, 0x057F_0002, S_ENDPGM], ShaderType::Compute, true);
+        assert!(matches!(
+            result,
+            Err(ShaderParseError::UnknownOpcode { family: "flat", .. })
+        ));
+    }
+
     #[test]
     fn mimg_image_sample_dmask_f() {
         let (code, _) = parse_vs(&[0xF080_0F00, 0x0061_0800, S_ENDPGM]);
@@ -5466,15 +5803,53 @@ mod tests {
 
     #[test]
     fn mimg_unknown_dmask_is_error() {
-        // image_sample with dmask=0x2: no format in Kyty's switch (L3201).
-        let (_, result) = parse(&[0xF080_0200, 0x0061_0800], ShaderType::Vertex, false);
+        // image_sample with an as-yet-unwired single-channel Z dmask.
+        let (_, result) = parse(&[0xF080_0400, 0x0061_0800], ShaderType::Vertex, false);
         assert_eq!(
             result,
             Err(ShaderParseError::UnknownMimgFormat {
                 opcode: 0x20,
-                dmask: 2,
+                dmask: 4,
                 pc: 0
             })
+        );
+    }
+
+    #[test]
+    fn astro_pixel_mimg_dmask1_and_dmask2_variants_decode() {
+        let (sample, result) = parse(
+            &[0xF080_0200, 0x0061_0800, S_ENDPGM],
+            ShaderType::Pixel,
+            true,
+        );
+        result.expect("image_sample dmask 0x2");
+        assert_eq!(sample.get_instructions()[0].type_, T::ImageSample);
+        assert_eq!(
+            sample.get_instructions()[0].format,
+            F::Vdata1Vaddr3StSsDmask2
+        );
+
+        let (sample_lzo, result) = parse(
+            &[0xF0DC_0100, 0x0061_0800, S_ENDPGM],
+            ShaderType::Pixel,
+            true,
+        );
+        result.expect("image_sample_lz_o dmask 0x1");
+        assert_eq!(sample_lzo.get_instructions()[0].type_, T::ImageSampleLzO);
+        assert_eq!(
+            sample_lzo.get_instructions()[0].format,
+            F::Vdata1Vaddr4StSsDmask1
+        );
+
+        let (sample_lzo_y, result) = parse(
+            &[0xF0DC_0200, 0x0061_0800, S_ENDPGM],
+            ShaderType::Pixel,
+            true,
+        );
+        result.expect("image_sample_lz_o dmask 0x2");
+        assert_eq!(
+            sample_lzo_y.get_instructions()[0].format,
+            F::Vdata1Vaddr4StSsDmask2
         );
     }
 

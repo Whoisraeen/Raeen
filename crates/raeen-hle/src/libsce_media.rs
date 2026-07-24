@@ -47,7 +47,11 @@ pub fn register(registry: &HleRegistry) {
     // complete synchronously, and NO samples are decoded — silence, not a hang.
     // These are Bink/AJM hot-path calls, so none of them WARN per call.
     registry.register("libSceAjm", "sceAjmBatchInitialize", hle_ok);
-    registry.register("libSceAjm", "sceAjmBatchJobDecode", hle_ajm_batch_job_decode);
+    registry.register(
+        "libSceAjm",
+        "sceAjmBatchJobDecode",
+        hle_ajm_batch_job_decode,
+    );
     registry.register("libSceAjm", "sceAjmBatchStart", hle_ajm_batch_start);
     registry.register(
         "libSceAjm",
@@ -267,11 +271,13 @@ fn try_append_batch_job(ctx: &HleContext, info: u64, job_size: u64) -> bool {
     }
     let job_address = buffer + offset;
     clear_guest_memory(ctx, job_address, job_size);
-    ctx.mem
-        .write(info + AJM_BATCH_INFO_LAST_GOOD_JOB_FIELD, &job_address.to_le_bytes())
-        && ctx
-            .mem
-            .write(info + AJM_BATCH_INFO_OFFSET_FIELD, &(offset + job_size).to_le_bytes())
+    ctx.mem.write(
+        info + AJM_BATCH_INFO_LAST_GOOD_JOB_FIELD,
+        &job_address.to_le_bytes(),
+    ) && ctx.mem.write(
+        info + AJM_BATCH_INFO_OFFSET_FIELD,
+        &(offset + job_size).to_le_bytes(),
+    )
 }
 
 /// Zero an AjmBatchError sideband (`error_code`, `job_addr`, `cmd_offset`,

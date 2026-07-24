@@ -202,9 +202,7 @@ pub struct ConsoleBuffer {
 impl ConsoleBuffer {
     fn new(cap: usize) -> Self {
         Self {
-            lines: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
-                cap.min(1024),
-            )),
+            lines: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(cap.min(1024))),
             next_seq: std::sync::atomic::AtomicU64::new(0),
             cap,
         }

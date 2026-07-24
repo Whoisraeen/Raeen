@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Whoisraeen/Raeen/compat/schema-v1.json",
+  "title": "Raeen sanitized compatibility run report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_unix_ms", "machine_id", "results"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_unix_ms": { "type": "integer", "minimum": 0 },
+    "machine_id": {
+      "type": "string",
+      "pattern": "^machine-[0-9a-f]{12}$",
+      "description": "One-way machine-class fingerprint; never a hostname."
+    },
+    "results": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/result" }
+    }
+  },
+  "$defs": {
+    "nullableInteger": {
+      "type": ["integer", "null"]
+    },
+    "nullableNumber": {
+      "type": ["number", "null"]
+    },
+    "nullableString": {
+      "type": ["string", "null"]
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "measured_unix_ms",
+        "run_id",
+        "build_revision",
+        "profile",
+        "game_id",
+        "title",
+        "content_sha1",
+        "stage",
+        "metrics",
+        "evidence"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "measured_unix_ms": { "type": "integer", "minimum": 0 },
+        "run_id": { "type": "string", "pattern": "^run-[0-9]+$" },
+        "build_revision": { "type": "string" },
+        "profile": { "type": "string" },
+        "game_id": { "type": "string" },
+        "title": { "type": "string" },
+        "content_sha1": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "stage": {
+          "enum": [
+            "detected",
+            "launching",
+            "rendering",
+            "crashed",
+            "timed_out",
+            "exited",
+            "refused"
+          ]
+        },
+        "metrics": { "$ref": "#/$defs/metrics" },
+        "evidence": { "$ref": "#/$defs/evidence" }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wall_ms",
+        "cpu_ms",
+        "peak_working_set_bytes",
+        "exit_code",
+        "flip_events",
+        "shader_errors",
+        "gpu_errors",
+        "audio_errors",
+        "input_events",
+        "observed_fps"
+      ],
+      "properties": {
+        "wall_ms": { "type": "integer", "minimum": 0 },
+        "cpu_ms": { "$ref": "#/$defs/nullableInteger" },
+        "peak_working_set_bytes": { "$ref": "#/$defs/nullableInteger" },
+        "exit_code": { "$ref": "#/$defs/nullableInteger" },
+        "flip_events": { "type": "integer", "minimum": 0 },
+        "shader_errors": { "type": "integer", "minimum": 0 },
+        "gpu_errors": { "type": "integer", "minimum": 0 },
+        "audio_errors": { "type": "integer", "minimum": 0 },
+        "input_events": { "type": "integer", "minimum": 0 },
+        "observed_fps": { "$ref": "#/$defs/nullableNumber" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "log_sha1",
+        "blocker_signature",
+        "first_blocker",
+        "measured"
+      ],
+      "properties": {
+        "log_sha1": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "blocker_signature": { "$ref": "#/$defs/nullableString" },
+        "first_blocker": {
+          "allOf": [
+            { "$ref": "#/$defs/nullableString" },
+            {
+              "description": "Maximum 500 characters; absolute roots and long hexadecimal addresses are normalized."
+            }
+          ]
+        },
+        "measured": { "const": true }
+      }
+    }
+  }
+}

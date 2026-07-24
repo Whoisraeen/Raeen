@@ -28,6 +28,35 @@ pub struct ComputeOutputs {
     pub images: Vec<Vec<u8>>,
 }
 
+/// Choose the Vulkan inline push range for a translated resource table.
+///
+/// A spill binding means the shader declares the table as a descriptor-backed
+/// storage buffer. Descriptor creation uploads those bytes, so the pipeline
+/// must not also declare an invalid over-cap push range.
+fn inline_push_constant_range(
+    offset: u32,
+    size: usize,
+    spill_binding: Option<u32>,
+    cap: u32,
+) -> Result<Option<(u32, u32)>, GpuError> {
+    if size == 0 || spill_binding.is_some() {
+        return Ok(None);
+    }
+    let size = u32::try_from(size).map_err(|_| {
+        GpuError::PipelineCreationFailed("push-constant resource table exceeds u32".to_owned())
+    })?;
+    let need = offset.checked_add(size).ok_or_else(|| {
+        GpuError::PipelineCreationFailed("push-constant range overflow".to_owned())
+    })?;
+    if need > cap {
+        return Err(GpuError::PipelineCreationFailed(format!(
+            "push constants {need} B exceed the device maxPushConstantsSize {cap} B \
+             and the translated shader declares no spill SSBO"
+        )));
+    }
+    Ok(Some((offset, size)))
+}
+
 pub fn dispatch_compute(
     dev: &VulkanDevice,
     state: &ComputeState<'_>,
@@ -310,11 +339,11 @@ impl<'a> ComputeResources<'a> {
                         "push-uniform binding has an empty resource table".to_owned(),
                     ));
                 }
-                self.push_uniform = Some(self.create_uniform_buffer(&binding.push_constants)?);
+                self.push_uniform = Some(self.create_storage_buffer(&binding.push_constants)?);
                 layout_bindings.push(
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(uniform_binding)
-                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                         .descriptor_count(1)
                         .stage_flags(vk::ShaderStageFlags::COMPUTE),
                 );
@@ -328,15 +357,12 @@ impl<'a> ComputeResources<'a> {
                     vk::DescriptorType::STORAGE_BUFFER,
                     self.storage.len() as u32
                         + u32::from(!self.gds.is_null())
-                        + u32::from(self.eud_raw.is_some()),
+                        + u32::from(self.eud_raw.is_some())
+                        + u32::from(self.push_uniform.is_some()),
                 ),
                 (vk::DescriptorType::STORAGE_IMAGE, self.images.len() as u32),
                 (vk::DescriptorType::SAMPLED_IMAGE, self.sampled.len() as u32),
                 (vk::DescriptorType::SAMPLER, self.samplers.len() as u32),
-                (
-                    vk::DescriptorType::UNIFORM_BUFFER,
-                    u32::from(self.push_uniform.is_some()),
-                ),
             ]
             .into_iter()
             .filter(|&(_, count)| count != 0)
@@ -490,8 +516,8 @@ impl<'a> ComputeResources<'a> {
                         .buffer_info(&eud_raw_info),
                 );
             }
-            // The push-constant UBO: created above when the kernel declares a
-            // uniform binding, so `push_uniform_binding` being set implies
+            // The push-constant spill SSBO: created above when the kernel
+            // declares a spill binding, so `push_uniform_binding` being set implies
             // `self.push_uniform` is populated (single-element info).
             let push_uniform_info = self
                 .push_uniform
@@ -507,7 +533,7 @@ impl<'a> ComputeResources<'a> {
                     vk::WriteDescriptorSet::default()
                         .dst_set(self.descriptor_set)
                         .dst_binding(uniform_binding)
-                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                         .buffer_info(&push_uniform_info),
                 );
             }
@@ -523,24 +549,23 @@ impl<'a> ComputeResources<'a> {
         // validation layers (measured: AMD driver access violation). Refuse
         // the dispatch by name until the SSBO spill path exists; iGPUs
         // commonly report the 256-byte spec minimum.
-        if let Some(binding) = state.binding {
-            let need = binding.push_constant_offset + binding.push_constants.len() as u32;
-            let cap = self.dev.max_push_constants_size();
-            if need > cap {
-                return Err(GpuError::PipelineCreationFailed(format!(
-                    "push constants {need} B exceed the device maxPushConstantsSize {cap} B \
-                     (SSBO spill not implemented)"
-                )));
-            }
-        }
         let push_ranges: Vec<_> = state
             .binding
-            .filter(|binding| !binding.push_constants.is_empty())
             .map(|binding| {
+                inline_push_constant_range(
+                    binding.push_constant_offset,
+                    binding.push_constants.len(),
+                    binding.push_uniform_binding,
+                    self.dev.max_push_constants_size(),
+                )
+            })
+            .transpose()?
+            .flatten()
+            .map(|(offset, size)| {
                 vk::PushConstantRange::default()
                     .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                    .offset(binding.push_constant_offset)
-                    .size(binding.push_constants.len() as u32)
+                    .offset(offset)
+                    .size(size)
             })
             .into_iter()
             .collect();
@@ -641,28 +666,6 @@ impl<'a> ComputeResources<'a> {
         let (buffer, memory) = self.create_host_buffer(
             bytes.len(),
             vk::BufferUsageFlags::STORAGE_BUFFER,
-            Some(bytes),
-        )?;
-        Ok(BufferAllocation {
-            buffer,
-            memory,
-            size: bytes.len(),
-        })
-    }
-
-    /// Host-visible UBO holding the dispatch's push-constant block, for the
-    /// binding a recompiled kernel declares as a uniform buffer (rather than
-    /// spilling to an SSBO). Same host-coherent path as the storage buffer,
-    /// only the usage flag differs.
-    fn create_uniform_buffer(&self, bytes: &[u8]) -> Result<BufferAllocation, GpuError> {
-        if bytes.is_empty() {
-            return Err(GpuError::VulkanInitFailed(
-                "zero-sized compute uniform buffer".to_owned(),
-            ));
-        }
-        let (buffer, memory) = self.create_host_buffer(
-            bytes.len(),
-            vk::BufferUsageFlags::UNIFORM_BUFFER,
             Some(bytes),
         )?;
         Ok(BufferAllocation {
@@ -1080,6 +1083,7 @@ impl<'a> ComputeResources<'a> {
             }
             if let Some(binding) = state.binding
                 && !binding.push_constants.is_empty()
+                && binding.push_uniform_binding.is_none()
             {
                 self.device().cmd_push_constants(
                     self.command_buffer,
@@ -1296,5 +1300,33 @@ impl Drop for ComputeResources<'_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inline_push_constant_range;
+
+    #[test]
+    fn minecraft_304_byte_resource_table_uses_spill_ssbo() {
+        assert_eq!(
+            inline_push_constant_range(0, 304, Some(4), 256).expect("spill is valid"),
+            None
+        );
+    }
+
+    #[test]
+    fn oversized_inline_resource_table_is_refused() {
+        let error = inline_push_constant_range(0, 304, None, 256)
+            .expect_err("missing spill must remain invalid");
+        assert!(error.to_string().contains("declares no spill SSBO"));
+    }
+
+    #[test]
+    fn small_resource_table_stays_inline() {
+        assert_eq!(
+            inline_push_constant_range(16, 128, None, 256).expect("inline range is valid"),
+            Some((16, 128))
+        );
     }
 }

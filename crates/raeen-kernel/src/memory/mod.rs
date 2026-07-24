@@ -8,10 +8,10 @@ pub mod gpu_memory;
 pub mod virtual_memory;
 
 use parking_lot::RwLock;
-use std::collections::BTreeMap;
-use tracing::{debug, info, warn};
 use raeen_core::error::KernelError;
 use raeen_core::types::{MemoryProtection, MemoryRegion, Ps5MemoryType, VAddr};
+use std::collections::BTreeMap;
+use tracing::{debug, info, warn};
 
 /// Manages the emulated PS5 virtual address space.
 pub struct VirtualMemoryManager {

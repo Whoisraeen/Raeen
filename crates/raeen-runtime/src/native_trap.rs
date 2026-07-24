@@ -23,10 +23,10 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use tracing::warn;
-use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 use raeen_firmware::HleTrampoline;
 use raeen_hle::GuestMemory;
+use tracing::warn;
+use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 
 use crate::GUEST_ARENA_BASE;
 

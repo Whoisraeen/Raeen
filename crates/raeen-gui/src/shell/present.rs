@@ -79,17 +79,24 @@ impl PresentedFrameRate {
 #[derive(Default)]
 pub(crate) struct GameFrameView {
     texture: Option<egui::TextureHandle>,
-    /// `draw_count` when `texture` was last refreshed. `last_image()` is now an
-    /// `Arc` bump (no frame copy), but REFRESHING the texture still costs a full
-    /// 8 MB (1080p RGBA) `ColorImage` build plus a CPU→GPU upload into egui's
-    /// own wgpu device — a whole-frame crossing. The UI repaints far faster than
-    /// a title renders, so this gate keeps that crossing to once per new frame
-    /// (guest flip / draw) instead of once per UI repaint.
-    shown_at_draw: u64,
-    /// Process-local VideoOut flip count when the texture was refreshed. CPU
-    /// drawn scanouts can change without a GPU draw, so draw count alone misses
-    /// those real presented-frame updates.
-    shown_at_present: u64,
+    /// The GPU session's `present_epoch` when `texture` was last refreshed.
+    /// `last_image()` is now an `Arc` bump (no frame copy), but REFRESHING the
+    /// texture still costs a full 8 MB (1080p RGBA) `ColorImage` build plus a
+    /// CPU→GPU upload into egui's own wgpu device — a whole-frame crossing. The
+    /// UI repaints far faster than a title renders, so this gate keeps that
+    /// crossing to once per newly PUBLISHED complete frame.
+    ///
+    /// The epoch advances only when the GPU worker publishes a COMPLETE
+    /// (fence-read-back or flip-time-snapshot) frame — or a splash comes down —
+    /// so it is the async-flip-safe refresh signal: it never fires while
+    /// `last_image` is a half-read frame, and it does not chase the guest-side
+    /// VideoOut flip counter, which under the bounded async flip races ahead of
+    /// the frames the worker has actually finished. This is what lets the Shell
+    /// follow the freshest completed frame instead of black-screening on the
+    /// async path. It also subsumes the old draw-count and flip-count triggers:
+    /// a CPU-drawn scanout that changes with no GPU draw still bumps the epoch
+    /// when it is published.
+    shown_at_epoch: u64,
     frame_rate: PresentedFrameRate,
 }
 
@@ -112,12 +119,15 @@ impl GameFrameView {
     ) -> Presented {
         self.frame_rate.observe(Instant::now(), presented_frames);
         let session = raeen_gpu::AgcGpuSession::global();
-        let drawn = session.draw_count();
-        let presented = presented_frames.unwrap_or(0);
-        if drawn != self.shown_at_draw
-            || presented != self.shown_at_present
-            || self.texture.is_none()
-        {
+        // Refresh on the GPU worker's published-frame epoch, NOT the guest-side
+        // flip counter (`presented_frames`, still used only for the FPS badge):
+        // under the bounded async flip the guest flips ahead of the frames the
+        // worker has actually read back, so gating on the flip counter would
+        // upload while `last_image` is still an older/None frame. The epoch
+        // advances only when a COMPLETE frame is published, so the texture only
+        // ever receives whole, finished frames — never a half-read one.
+        let epoch = session.present_epoch();
+        if epoch != self.shown_at_epoch || self.texture.is_none() {
             // Deliberately does NOT `wait_idle()`: submission is asynchronous,
             // and blocking the UI thread until the GPU drained is exactly the
             // stall this Shell already had once. A viewer wants the latest frame
@@ -137,8 +147,7 @@ impl GameFrameView {
                             ));
                         }
                     }
-                    self.shown_at_draw = drawn;
-                    self.shown_at_present = presented;
+                    self.shown_at_epoch = epoch;
                 }
             }
         }
@@ -181,8 +190,7 @@ impl GameFrameView {
     /// previous title's last frame.
     pub(crate) fn clear(&mut self) {
         self.texture = None;
-        self.shown_at_draw = 0;
-        self.shown_at_present = 0;
+        self.shown_at_epoch = 0;
         self.frame_rate.reset();
     }
 }

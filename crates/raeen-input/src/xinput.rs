@@ -84,10 +84,10 @@ pub fn translate(pad: &XPadRaw) -> ControllerState {
 
 #[cfg(windows)]
 mod imp {
-    use super::{translate, ControllerState, XPadRaw};
+    use super::{ControllerState, XPadRaw, translate};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use windows_sys::Win32::UI::Input::XboxController::{XInputGetState, XINPUT_STATE};
+    use windows_sys::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputGetState};
 
     const ERROR_SUCCESS: u32 = 0;
     const SLOT_COUNT: u32 = 4;
@@ -151,7 +151,7 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{spawn, Shared};
+pub use imp::{Shared, spawn};
 
 #[cfg(test)]
 mod tests {
@@ -200,7 +200,10 @@ mod tests {
         assert_eq!(s.l2_trigger, 1.0, "full left trigger -> 1.0");
         assert_eq!(s.r2_trigger, 0.0, "released right trigger -> 0.0");
         // The pipeline's orbis encoding sets the digital L2 bit at >0.5.
-        assert_eq!(s.orbis_buttons() & crate::pad_button::L2, crate::pad_button::L2);
+        assert_eq!(
+            s.orbis_buttons() & crate::pad_button::L2,
+            crate::pad_button::L2
+        );
         assert_eq!(s.orbis_buttons() & crate::pad_button::R2, 0);
     }
 
@@ -218,7 +221,10 @@ mod tests {
         // XInput up is +32767; inverted to -1 so the Orbis low byte means up.
         assert!((s.left_stick_y + 1.0).abs() < 1e-3, "Y up -> -1 (inverted)");
         assert!((s.right_stick_x + 1.0).abs() < 1e-3, "X left -> -1");
-        assert!((s.right_stick_y - 1.0).abs() < 1e-3, "Y down -> +1 (inverted)");
+        assert!(
+            (s.right_stick_y - 1.0).abs() < 1e-3,
+            "Y down -> +1 (inverted)"
+        );
 
         // Centered stick round-trips to the Orbis center byte (128).
         let center = translate(&XPadRaw::default()).to_orbis_pad_data();

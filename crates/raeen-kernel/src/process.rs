@@ -9,10 +9,10 @@
 //! homebrew ELF (milestone M1).
 
 use crate::OrbisKernel;
-use tracing::{debug, info};
 use raeen_core::error::{KernelError, RaeenError};
 use raeen_core::types::{MemoryProtection, ModuleInfo, VAddr};
 use raeen_loader::{LoadedBinary, LoadedSegment, self_format};
+use tracing::{debug, info};
 
 /// A loaded executable image in the emulated address space.
 #[derive(Debug, Clone)]

@@ -189,6 +189,12 @@ struct SuspendedBuffer {
     /// How many producer re-check rounds have seen this wait still unmet —
     /// drives the rate-limited dead-wait warn.
     recheck_rounds: u64,
+    /// Latched satisfied by [`AgcGpuSession::latch_produced_waits`] when a
+    /// producer packet wrote a satisfying value THIS submission — even if the
+    /// guest has since reset the label to arm the next frame (SharpEmu
+    /// `GpuWaitRegistry.LatchSatisfiedByValue`). A live re-read at wake time
+    /// would miss that transient window.
+    latched: bool,
 }
 
 /// Per-queue wait state: at most one suspended buffer, plus the submissions
@@ -228,6 +234,15 @@ const MAX_RESUME_PASSES: u32 = 64;
 /// After this many producer re-check rounds with the wait still unmet, warn
 /// (then again at each doubling) so dead waits are visible in logs.
 const STALE_WAIT_RECHECK_ROUNDS: u64 = 512;
+
+/// After TWICE the "possible dead wait" window with the wait STILL unmet, the
+/// label's producer is treated as one that will never run, and the buffer is
+/// FORCE-RESUMED instead of left parked forever. A genuinely dead `WAIT_REG_MEM`
+/// otherwise deadlocks the title's GPU submit worker and, through the mutex it
+/// holds, the guest main thread parked behind it (measured: ASTRO.BOT
+/// `mutex=0x300944e00 owner=21` stuck on a `dcb` label its producer never wrote).
+/// Force-resuming degrades to a possible rendering glitch, never a permanent hang.
+const DEAD_WAIT_FORCE_RESUME_ROUNDS: u64 = STALE_WAIT_RECHECK_ROUNDS * 2;
 
 /// Cumulative wait/suspend counters (diagnostics + tests).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -357,7 +372,33 @@ pub struct AgcGpuSession {
     /// latency, yet the guest can never race more than [`FLIP_FRAMES_IN_FLIGHT`]
     /// frames ahead of the GPU. See [`AgcGpuSession::submit_flip_flush`].
     flip_permits: Arc<FlipSemaphore>,
+    /// Monotonic counter advanced every time a COMPLETE frame is published to
+    /// [`Self::last_image`] (or a splash transition changes what
+    /// [`Self::last_image`] returns). The Shell (`shell/present.rs`) refreshes
+    /// its egui texture exactly when this advances, so it always shows the
+    /// freshest completed frame the GPU worker has finished — instead of
+    /// chasing the guest-side VideoOut flip counter, which with the bounded
+    /// async flip races ahead of the frames actually read back. This is the
+    /// "read the freshest completed frame" the async present path needs so it
+    /// never shows a stale/black frame. See [`Self::present_epoch`].
+    present_epoch: AtomicU64,
+    /// Guest display-buffer byte snapshots taken on the flip thread (keyed by
+    /// flip address) so the async present-from-guest-memory path reads a
+    /// COMPLETE frame captured at flip time — not live guest memory the title
+    /// has since begun reusing for its next frame. This is what keeps the
+    /// bounded async flip from ever presenting a partially-cleared/reused
+    /// buffer (the regression that black-screened the earlier fire-and-forget
+    /// flip). Bounded to [`MAX_SCANOUT_SNAPSHOTS`] entries (a title cycles
+    /// through only a handful of display buffers). See [`Self::present_scanout`].
+    guest_scanout_snapshots: Mutex<std::collections::HashMap<u64, Arc<Vec<u8>>>>,
 }
+
+/// Cap on how many live guest-scanout snapshots
+/// ([`AgcGpuSession::guest_scanout_snapshots`]) are retained. A title flips
+/// through a small display-buffer ring (2–3 buffers); this bounds retired
+/// buffers from accumulating. When exceeded the map is cleared, degrading at
+/// most one later flip to a live read (the pre-async behaviour), never leaking.
+const MAX_SCANOUT_SNAPSHOTS: usize = 8;
 
 /// Every Nth flip miss, the most-content fallback re-runs its full census
 /// (full flush + scan) instead of trusting the remembered target, so content
@@ -507,6 +548,8 @@ impl AgcGpuSession {
             fallback_present_base: Mutex::new(None),
             flip_miss_count: AtomicU64::new(0),
             flip_permits: FlipSemaphore::new(FLIP_FRAMES_IN_FLIGHT),
+            present_epoch: AtomicU64::new(0),
+            guest_scanout_snapshots: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -533,6 +576,39 @@ impl AgcGpuSession {
     /// How many PM4-triggered draws have completed successfully.
     pub fn draw_count(&self) -> u64 {
         *self.draw_count.lock()
+    }
+
+    /// Monotonic count of published complete frames (and splash transitions).
+    /// The Shell refreshes its on-screen texture when this advances, so it
+    /// always shows the freshest COMPLETE frame the GPU worker has finished —
+    /// never a half-read async frame, and never chasing the guest-side flip
+    /// counter that races ahead of the worker under the bounded async flip.
+    /// See the [`present_epoch`](Self::present_epoch) field.
+    pub fn present_epoch(&self) -> u64 {
+        self.present_epoch.load(Ordering::Relaxed)
+    }
+
+    /// Publish a fully-read-back (fence-complete) or snapshot-complete frame as
+    /// the presented image and advance [`Self::present_epoch`] so the Shell
+    /// refreshes. This is the ONLY way a title frame reaches `last_image`, so
+    /// the invariant "every presented frame is a COMPLETE frame" holds by
+    /// construction — the guarantee the async flip must not break.
+    fn publish_frame(&self, presented: Arc<RenderedImage>) {
+        // Offer the finished frame to the active present plugin (upscaler /
+        // frame-gen). The default is a zero-cost identity — with no plugin
+        // selected this returns the same `Arc`, so the "every presented frame is
+        // COMPLETE" invariant and the default present cost are both unchanged.
+        let presented = crate::present_plugin::apply_to_image(presented);
+        *self.last_image.lock() = Some(presented);
+        self.present_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Advance the present epoch without changing `last_image` — for splash
+    /// transitions, which change what [`Self::last_image`] returns (splash vs.
+    /// title frame) without writing the `last_image` field, so the Shell still
+    /// needs a refresh signal.
+    fn bump_present_epoch(&self) {
+        self.present_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Guest shader fetch/translate counters (ShaderMemory Phase 2).
@@ -576,6 +652,12 @@ impl AgcGpuSession {
         self.framebuffers.lock().clear();
         *self.scanout_address.lock() = None;
         *self.draw_count.lock() = 0;
+        // Drop stale flip-time snapshots from the previous title so they can
+        // never be presented under the new one.
+        self.guest_scanout_snapshots.lock().clear();
+        // What `last_image()` returns just changed (new splash, or nothing) —
+        // signal the Shell to refresh.
+        self.bump_present_epoch();
     }
 
     /// Stage the boot splash for the next launched process (see
@@ -622,10 +704,53 @@ impl AgcGpuSession {
         *gpu_runtime_config().read()
     }
 
+    /// Register a present-path plugin (upscaler / frame generator). Out-of-tree,
+    /// user-supplied plugin crates — an FSR/XeSS pass, or a BYO DLSS shim Raeen
+    /// never ships or fetches — call this to add themselves. The plugin then
+    /// becomes selectable by [`Self::select_present_plugin`]. See
+    /// [`crate::present_plugin`] for the clean-room/license boundary.
+    pub fn register_present_plugin(plugin: Box<dyn crate::present_plugin::PresentPlugin>) {
+        crate::present_plugin::register(plugin);
+    }
+
+    /// Activate a registered present plugin by name; returns `false` (changing
+    /// nothing) if no plugin with that name is registered.
+    pub fn select_present_plugin(name: &str) -> bool {
+        crate::present_plugin::select(name)
+    }
+
+    /// Restore the zero-cost identity present path (no active plugin).
+    pub fn clear_present_plugin() {
+        crate::present_plugin::select_none();
+    }
+
+    /// `(name, capabilities)` for every registered present plugin — for a
+    /// Settings ▸ Video dropdown.
+    #[must_use]
+    pub fn present_plugins() -> Vec<(String, crate::present_plugin::Capabilities)> {
+        crate::present_plugin::list()
+    }
+
+    /// The active present plugin's name, or `None` for the identity path.
+    #[must_use]
+    pub fn active_present_plugin() -> Option<String> {
+        crate::present_plugin::active()
+    }
+
+    /// Set the present-time upscale factor an active upscaler should target
+    /// (`1.0` = native). Distinct from the *render* resolution scale.
+    pub fn set_present_output_scale(scale: f32) {
+        crate::present_plugin::set_output_scale(scale);
+    }
+
     /// Take the boot splash down (`sceSystemServiceHideSplashScreen`, or a
     /// flip to a buffer with real drawn content).
     pub fn hide_splash(&self) {
         *self.splash.lock() = None;
+        // The splash coming down changes what `last_image()` returns (the title
+        // frame now shows through) — refresh the Shell even if `last_image`
+        // itself was not just rewritten.
+        self.bump_present_epoch();
     }
 
     /// Select the guest display buffer the title flipped to
@@ -657,17 +782,82 @@ impl AgcGpuSession {
             .map(|d| u64::from(d.pitch_pixels.max(d.width)) * u64::from(d.height) * 8)
             .unwrap_or(0);
         crate::guest_mem::register_scanout_watch(address, watch_span);
-        // TEMPORARILY REVERTED to the synchronous flip. The bounded
-        // fire-and-forget flip (`submit_flip_flush`, item 7 / rank 7) gives the
-        // guest ~11 fps of flip throughput headless (verified on Minecraft:
-        // present_index 1024/90s vs 0.4 fps synchronous), but the GUI's
-        // egui-upload present (`shell/present.rs` reads `last_image()` each
-        // paint) does NOT yet sync to the async frames, so the on-screen output
-        // went black even though the worker presents. Until the GUI present is
-        // made async-aware (repaint on flip / read the freshest completed
-        // frame), flip synchronously so the Shell window renders. The lever code
-        // below is kept intact for that follow-up.
-        self.consume_flush(Some(address), true);
+        // Capture the guest display buffer NOW, on the flip thread, while its
+        // bytes are the frame the title just finished. The async flush enqueued
+        // below runs LATER on the GPU worker, by which time the title may have
+        // begun reusing this buffer for its next frame — so the present-from-
+        // guest-memory path (a CPU-/DMA-composed scanout with no GPU render
+        // target at the flip address) must read this snapshot, not live memory.
+        // Snapshot only when no drawn GPU target already backs this address:
+        // GPU-target titles keep their frame in a render target read back under
+        // a fence (ordering-complete on the single worker), so they never need
+        // it and pay no snapshot cost. This is the fix for the earlier fire-
+        // and-forget flip presenting a partially-cleared/reused buffer.
+        // Read `framebuffers` in its own statement so the guard is dropped
+        // before the snapshot read below (never held across another lock).
+        let backed_by_target = self.framebuffers.lock().contains_key(&address);
+        if let Some(desc) = descriptor
+            && !backed_by_target
+            && let Some(bytes) = self.read_scanout_bytes(address, &desc)
+        {
+            let mut snaps = self.guest_scanout_snapshots.lock();
+            if snaps.len() >= MAX_SCANOUT_SNAPSHOTS {
+                snaps.clear();
+            }
+            snaps.insert(address, Arc::new(bytes));
+        }
+        // Enqueue the present flush and return WITHOUT waiting for the GPU
+        // worker to drain it — the bounded fire-and-forget flip (item 7 / rank
+        // 7, THE fps lever). The guest's flip thread no longer pays the per-flip
+        // readback + `wait_for_fences` stall; the worker reads back and presents
+        // in the background while the guest builds the next frame, bounded to
+        // `FLIP_FRAMES_IN_FLIGHT` outstanding flushes. The Shell shows the most
+        // recent COMPLETE frame the worker has published (`present_epoch` drives
+        // its texture refresh), so it can never surface a half-read frame.
+        self.submit_flip_flush(address);
+    }
+
+    /// Read the raw bytes of a guest display buffer for present-from-guest-
+    /// memory: `pitch * height * 4` bytes at `address`, bounds- and
+    /// authority-checked against guest memory. `None` when the descriptor is
+    /// degenerate, the geometry is out of range, or the guest range is
+    /// unreadable. Shared by the flip-time snapshot ([`Self::present_scanout`])
+    /// and the live fallback ([`Self::present_from_guest_memory`]). The tiling
+    /// mode and pixel format are validated by the caller (the snapshot is a raw
+    /// byte copy; only the size matters here).
+    fn read_scanout_bytes(
+        &self,
+        address: u64,
+        desc: &raeen_core::subsystems::ScanoutDescriptor,
+    ) -> Option<Vec<u8>> {
+        if address == 0 || desc.width == 0 || desc.height == 0 || desc.tiling_mode > 1 {
+            return None;
+        }
+        let width = desc.width;
+        let pitch = if desc.pitch_pixels != 0 {
+            desc.pitch_pixels
+        } else {
+            width
+        };
+        if pitch < width {
+            return None;
+        }
+        let total = (pitch as u64 * 4).checked_mul(desc.height as u64)?;
+        // Refuse an absurd read (8K x 8K x 4 = 256 MiB is the ceiling).
+        if total > (256 << 20) {
+            return None;
+        }
+        let memory = self.guest_memory.lock().clone()?;
+        if !memory.validate_gpu_range(address, total, false) {
+            return None;
+        }
+        let mut src = Vec::<u8>::new();
+        src.try_reserve_exact(total as usize).ok()?;
+        src.resize(total as usize, 0);
+        if !memory.read_gpu(address, &mut src) {
+            return None;
+        }
+        Some(src)
     }
 
     /// Enqueue the present flush for a flip and return without waiting for the
@@ -996,7 +1186,7 @@ impl AgcGpuSession {
         // an 8 MB copy — and this runs inside the guest flip thread's
         // synchronous flush, so the copy was pure per-flip latency.
         let presented = Arc::new(to_presentable(presented));
-        *self.last_image.lock() = Some(Arc::clone(&presented));
+        self.publish_frame(Arc::clone(&presented));
         if flip_address_hit || guest_hit {
             // The title flipped to a buffer it really drew into (a GPU-drawn
             // target, or CPU-drawn pixels read straight from the flip address):
@@ -1112,16 +1302,25 @@ impl AgcGpuSession {
             warn_unsupported_scanout(desc);
             return None;
         }
-        let memory = self.guest_memory.lock().clone()?;
-        if !memory.validate_gpu_range(address, total, false) {
-            return None;
-        }
-        let mut src = Vec::<u8>::new();
-        src.try_reserve_exact(total as usize).ok()?;
-        src.resize(total as usize, 0);
-        if !memory.read_gpu(address, &mut src) {
-            return None;
-        }
+        // Prefer the snapshot captured on the flip thread — a COMPLETE frame at
+        // this address, taken before the title could begin reusing the buffer —
+        // so the async flush never presents a partially-cleared/reused buffer.
+        // Fall back to a live read only when no snapshot was taken (a
+        // `wait_idle` flush, or the flip-time heuristic saw a GPU target back
+        // this address); that matches the pre-async behaviour for paths that
+        // never raced.
+        let src: Arc<Vec<u8>> = {
+            let snap = self
+                .guest_scanout_snapshots
+                .lock()
+                .get(&address)
+                .filter(|b| b.len() == total as usize)
+                .cloned();
+            match snap {
+                Some(bytes) => bytes,
+                None => Arc::new(self.read_scanout_bytes(address, desc)?),
+            }
+        };
         let mut pixels = Vec::<u8>::new();
         pixels
             .try_reserve_exact(width as usize * height as usize * 4)
@@ -1283,6 +1482,9 @@ impl AgcGpuSession {
                 &mut sink,
                 Some(&crate::guest_mem::IdentityGuestMemory),
             )?;
+            let produced = cp.take_produced_labels();
+            drop(cp);
+            self.latch_produced_waits(&produced);
             return Ok((None, suspended_of(outcome)));
         }
 
@@ -1311,6 +1513,8 @@ impl AgcGpuSession {
             &mut sink,
             Some(&crate::guest_mem::IdentityGuestMemory),
         );
+        let produced = cp.take_produced_labels();
+        self.latch_produced_waits(&produced);
         // Carry any compute shader this submission observed forward to the next.
         if let Some(cs) = sink.current_compute {
             *self.last_compute_shader.lock() = Some(cs);
@@ -1436,7 +1640,7 @@ impl AgcGpuSession {
             // the RGBA8 present surface / PPM dump; 8-bit frames pass through.
             // Into the `Arc` once (see `last_image`): the store is a bump.
             let presented = Arc::new(to_presentable(presented));
-            *self.last_image.lock() = Some(Arc::clone(&presented));
+            self.publish_frame(Arc::clone(&presented));
             // Only a frame at the actual flip address takes the boot splash
             // down. The most-content fallback can surface a bare cleared
             // target — exactly what the splash exists to cover.
@@ -1750,9 +1954,35 @@ impl AgcGpuSession {
                     wait: suspended.wait,
                     deferred_present,
                     recheck_rounds: 0,
+                    latched: false,
                 });
             }
             Err(e) => warn!(error = %e, "AGC DCB draw skipped"),
+        }
+    }
+
+    /// Mark any suspended cross-queue waiter satisfied when a producer packet
+    /// (`WRITE_DATA`/`RELEASE_MEM`, drained from the CP via `take_produced_labels`)
+    /// wrote a value meeting its condition this submission — the write-time latch
+    /// that survives the guest resetting the label same-frame (SharpEmu
+    /// `GpuWaitRegistry.RecordProduced`/`LatchSatisfiedByValue`). The label is
+    /// never force-written; a genuinely dead wait still parks and is handled by
+    /// the dead-wait force-resume net.
+    fn latch_produced_waits(&self, produced: &[(u64, u64)]) {
+        if produced.is_empty() {
+            return;
+        }
+        let mut ws = self.wait_states.lock();
+        for is_compute in [false, true] {
+            let queue = ws.queue_mut(is_compute);
+            if let Some(buffer) = queue.suspended.as_mut()
+                && !buffer.latched
+                && produced.iter().any(|&(address, value)| {
+                    address == buffer.wait.address && buffer.wait.satisfied_by(value)
+                })
+            {
+                buffer.latched = true;
+            }
         }
     }
 
@@ -1783,12 +2013,18 @@ impl AgcGpuSession {
                     match queue.suspended.as_mut() {
                         None => None,
                         Some(buffer) => {
-                            let satisfied = crate::guest_mem::with_guest_memory(&memory, || {
-                                buffer
-                                    .wait
-                                    .read_label(&crate::guest_mem::IdentityGuestMemory)
-                                    .is_some_and(|value| buffer.wait.satisfied_by(value))
-                            });
+                            // Latched (a producer wrote a satisfying value this
+                            // submission, even if the guest has since reset the
+                            // label) OR the live label currently satisfies. Both
+                            // are genuine — the label is never force-written
+                            // (SharpEmu `LatchSatisfiedByValue` + `CollectSatisfied`).
+                            let satisfied = buffer.latched
+                                || crate::guest_mem::with_guest_memory(&memory, || {
+                                    buffer
+                                        .wait
+                                        .read_label(&crate::guest_mem::IdentityGuestMemory)
+                                        .is_some_and(|value| buffer.wait.satisfied_by(value))
+                                });
                             if satisfied {
                                 queue.suspended.take()
                             } else {
@@ -1810,7 +2046,28 @@ impl AgcGpuSession {
                                          (its producer never ran)"
                                     );
                                 }
-                                None
+                                if rounds >= DEAD_WAIT_FORCE_RESUME_ROUNDS {
+                                    // Confirmed dead: the producer has not run in
+                                    // twice the "possible dead wait" window, so it
+                                    // never will. Left parked, this WAIT_REG_MEM
+                                    // deadlocks the title's GPU submit worker and the
+                                    // guest main thread parked behind it forever.
+                                    // Force-resume so the queue drains — a possible
+                                    // glitch, never a permanent hang.
+                                    warn!(
+                                        queue = if is_compute { "acb" } else { "dcb" },
+                                        label = format_args!("{:#x}", buffer.wait.address),
+                                        reference = format_args!("{:#x}", buffer.wait.reference),
+                                        compare = buffer.wait.compare,
+                                        rounds,
+                                        parked_behind = queue.pending.len(),
+                                        "FORCE-RESUMING a dead WAIT_REG_MEM to avoid a \
+                                         permanent GPU deadlock — its producer never ran"
+                                    );
+                                    queue.suspended.take()
+                                } else {
+                                    None
+                                }
                             }
                         }
                     }
@@ -1906,7 +2163,7 @@ impl AgcGpuSession {
             backend.render_m2_triangle(M2_DRAW_WIDTH, M2_DRAW_HEIGHT)?
         };
 
-        *self.last_image.lock() = Some(Arc::new(image.clone()));
+        self.publish_frame(Arc::new(image.clone()));
         *self.draw_count.lock() += 1;
         Ok(Some(image))
     }
@@ -2282,7 +2539,11 @@ mod tests {
         let sem = FlipSemaphore::new(2);
         let p1 = sem.acquire();
         let _p2 = sem.acquire();
-        assert_eq!(*sem.available.lock(), 0, "both permits taken (cap enforced)");
+        assert_eq!(
+            *sem.available.lock(),
+            0,
+            "both permits taken (cap enforced)"
+        );
 
         // A third acquire must block until a permit is freed. Release it from
         // a separate thread AFTER a delay — the "slow worker" case. If acquire
@@ -2354,7 +2615,10 @@ mod tests {
     #[test]
     fn worker_less_flip_stays_permit_balanced() {
         let session = AgcGpuSession::new(deny_memory());
-        assert_eq!(*session.flip_permits.available.lock(), FLIP_FRAMES_IN_FLIGHT);
+        assert_eq!(
+            *session.flip_permits.available.lock(),
+            FLIP_FRAMES_IN_FLIGHT
+        );
         // No submit => no worker => inline flush. present_scanout to an empty
         // target simply keeps the (absent) frame; the point is permit balance.
         session.present_scanout(0xDEAD_BEEF, None);
@@ -2594,6 +2858,90 @@ mod tests {
         );
     }
 
+    /// `present_scanout` now enqueues the flush and returns WITHOUT the per-flip
+    /// `wait_for_fences` stall (the fps lever), and publishes only COMPLETE
+    /// frames. For a GPU-drawn target (the Minecraft path) the presented frame
+    /// is exactly the drawn frame — never a partial/black one — and every
+    /// publish advances `present_epoch`, the signal the Shell refreshes its
+    /// on-screen texture on. This is the async flip's no-regression proof: the
+    /// bytes the flush produced are the bytes that reach the window.
+    #[test]
+    fn async_flip_publishes_the_complete_drawn_frame_and_bumps_the_epoch() {
+        let session = AgcGpuSession::new(deny_memory());
+        let content = RenderedImage {
+            width: 2,
+            height: 1,
+            pixels: vec![11, 22, 33, 255, 44, 55, 66, 255],
+            bytes_per_pixel: 4,
+        };
+        session.framebuffers.lock().insert(0x3000, content.clone());
+        session.hide_splash();
+        let before = session.present_epoch();
+
+        // No worker is started in-test, so the async enqueue runs the flush
+        // inline — but through the same `submit_flip_flush` path the guest flip
+        // thread now takes, exercising the publish + epoch invariants.
+        session.present_scanout(0x3000, None);
+
+        let img = session.last_image().expect("async flip presented a frame");
+        assert_eq!(
+            img.pixels, content.pixels,
+            "the presented frame is exactly the drawn frame — complete, never partial"
+        );
+        assert!(
+            session.present_epoch() > before,
+            "publishing a complete frame advances the present epoch the Shell refreshes on"
+        );
+    }
+
+    /// The bounded async flip returns before the GPU worker reads the frame
+    /// back, so a title can begin reusing its display buffer while the worker
+    /// still owes a present. The present-from-guest-memory path must therefore
+    /// read the COMPLETE frame captured on the flip thread (the snapshot), never
+    /// whatever the title has since written — the partially-cleared/reused
+    /// buffer that black-screened the earlier fire-and-forget flip.
+    #[test]
+    fn async_present_from_guest_memory_reads_the_flip_time_snapshot_not_a_reused_buffer() {
+        const BASE: u64 = 0x4000;
+        // Live guest memory now holds the title's NEXT frame (cleared) — the
+        // buffer has been reused since the flip.
+        let cleared = vec![0u8, 0, 0, 0, 0, 0, 0, 0];
+        let session =
+            AgcGpuSession::new(Arc::new(MutableScanoutMemory::new(BASE, cleared.clone())));
+        let desc = raeen_core::subsystems::ScanoutDescriptor {
+            width: 2,
+            height: 1,
+            pitch_pixels: 2,
+            pixel_format: 0x8000_2200, // A8B8G8R8 -> RGBA in memory
+            tiling_mode: 0,
+        };
+        // The flip thread captured the frame the title had just finished.
+        let frame_a = vec![10u8, 20, 30, 255, 40, 50, 60, 255];
+        session
+            .guest_scanout_snapshots
+            .lock()
+            .insert(BASE, Arc::new(frame_a.clone()));
+
+        let img = session
+            .present_from_guest_memory(BASE, &desc)
+            .expect("a snapshot present yields a frame");
+        assert_eq!(
+            img.pixels, frame_a,
+            "present reads the flip-time snapshot, never the reused (cleared) live buffer"
+        );
+
+        // With no snapshot it falls back to a live read (the pre-async path) —
+        // proving the snapshot, not some unrelated state, was the source above.
+        session.guest_scanout_snapshots.lock().clear();
+        let live_img = session
+            .present_from_guest_memory(BASE, &desc)
+            .expect("live fallback yields a frame");
+        assert_eq!(
+            live_img.pixels, cleared,
+            "with no snapshot the live (now cleared) buffer is read"
+        );
+    }
+
     /// The staged boot splash rides into the next process session, masks
     /// fallback-presented frames, and comes down on `hide_splash`
     /// (`sceSystemServiceHideSplashScreen`).
@@ -2808,6 +3156,53 @@ mod tests {
             unsafe {
                 std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
             }
+            true
+        }
+    }
+
+    /// Guest memory backing a single display buffer with an owned byte vector
+    /// (no host-pointer identity), so a present test can model the title having
+    /// reused the buffer for its next frame while an async flip is still owed.
+    struct MutableScanoutMemory {
+        base: u64,
+        bytes: Mutex<Vec<u8>>,
+    }
+
+    impl MutableScanoutMemory {
+        fn new(base: u64, bytes: Vec<u8>) -> Self {
+            Self {
+                base,
+                bytes: Mutex::new(bytes),
+            }
+        }
+    }
+
+    impl crate::guest_mem::GpuGuestMemory for MutableScanoutMemory {
+        fn validate_gpu_range(&self, addr: u64, len: u64, _write: bool) -> bool {
+            addr == self.base && (len as usize) <= self.bytes.lock().len()
+        }
+
+        fn read_gpu(&self, addr: u64, out: &mut [u8]) -> bool {
+            if addr != self.base {
+                return false;
+            }
+            let bytes = self.bytes.lock();
+            if out.len() > bytes.len() {
+                return false;
+            }
+            out.copy_from_slice(&bytes[..out.len()]);
+            true
+        }
+
+        fn write_gpu(&self, addr: u64, data: &[u8]) -> bool {
+            if addr != self.base {
+                return false;
+            }
+            let mut bytes = self.bytes.lock();
+            if data.len() > bytes.len() {
+                return false;
+            }
+            bytes[..data.len()].copy_from_slice(data);
             true
         }
     }

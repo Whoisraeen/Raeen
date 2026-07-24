@@ -99,10 +99,15 @@ const COMPUTE_PGM_LO: u32 = 0x20C;
 const COMPUTE_PGM_HI: u32 = 0x20D;
 const SPI_SHADER_PGM_LO_PS: u32 = 0x008;
 const SPI_SHADER_PGM_HI_PS: u32 = 0x009;
+const SPI_SHADER_PGM_LO_VS: u32 = 0x048;
+const SPI_SHADER_PGM_HI_VS: u32 = 0x049;
 const SPI_SHADER_PGM_LO_GS: u32 = 0x08A;
 const SPI_SHADER_PGM_HI_GS: u32 = 0x08B;
 const SPI_SHADER_PGM_LO_ES: u32 = 0x0C8;
 const SPI_SHADER_PGM_HI_ES: u32 = 0x0C9;
+const SPI_SHADER_PGM_LO_HS: u32 = 0x108;
+const SPI_SHADER_PGM_HI_HS: u32 = 0x109;
+const SPI_SHADER_PGM_RSRC1_HS: u32 = 0x10A;
 const SPI_SHADER_PGM_LO_LS: u32 = 0x148;
 const SPI_SHADER_PGM_HI_LS: u32 = 0x149;
 /// `SPI_PS_INPUT_CNTL_0` register offset (32 interpolant slots follow).
@@ -118,6 +123,7 @@ const VGT_PRIMITIVE_TYPE: u32 = 0x242;
 
 /// Register the libSceAgc DCB command emitters.
 pub fn register(registry: &HleRegistry) {
+    registry.register("libSceAgc", "sceAgcGetPacketSize", hle_get_packet_size);
     registry.register("libSceAgc", "sceAgcDcbSetIndexSize", hle_dcb_set_index_size);
     registry.register(
         "libSceAgc",
@@ -144,14 +150,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceAgc", "sceAgcDcbPopMarker", hle_dcb_pop_marker);
     registry.register("libSceAgc", "sceAgcCbDispatch", hle_cb_dispatch);
     registry.register("libSceAgc", "sceAgcCbNop", hle_cb_nop);
-    // Gen5 retail imports use this observed NID (`wr23dPKyWc0`). As with
-    // sceAgcInit, the recovered export name does not derive to that identity.
-    registry.register_nid(
-        "libSceAgc",
-        "sceAgcCbReleaseMem",
-        0xc2bd_b774_f2b2_59cd,
-        hle_cb_release_mem,
-    );
+    registry.register("libSceAgc", "sceAgcCbReleaseMem", hle_cb_release_mem);
     registry.register("libSceAgc", "sceAgcDcbSetFlip", hle_dcb_set_flip);
     // Measured ASTRO.BOT: the first libSceAgc import it actually calls. Base-PS5
     // (non-Trinity) is the branch that goes on to submit a DCB — see
@@ -255,16 +254,14 @@ pub fn register(registry: &HleRegistry) {
         0xfca4_7359_e915_d76d,
         hle_unknown_krz_wek_v120,
     );
-    registry.register_nid(
+    registry.register(
         "libSceAgcDriver",
         "sceAgcDriverRegisterOwner",
-        0x5ff3_66e4_a2d1_11e8,
         hle_driver_register_owner,
     );
-    registry.register_nid(
+    registry.register(
         "libSceAgcDriver",
         "sceAgcDriverRegisterResource",
-        0x5b9c_f879_9ae3_11ab,
         hle_driver_register_resource,
     );
     registry.register(
@@ -295,36 +292,30 @@ pub fn register(registry: &HleRegistry) {
         hle_dcb_set_base_indirect_args,
     );
     // Driver submission lives in libSceAgcDriver for Gen5 retail binaries.
-    // Keep the legacy libSceAgc registration for older fixtures, but bind
-    // both observed retail identities explicitly.
-    registry.register_nid(
+    // Keep the legacy libSceAgc registration for older fixtures.
+    registry.register(
         "libSceAgcDriver",
         "sceAgcDriverSubmitDcb",
-        0x5209_4921_98c6_b2c3,
         hle_driver_submit_dcb,
     );
-    registry.register_nid(
+    registry.register(
         "libSceAgcDriver",
         "sceAgcDriverAgrSubmitDcb",
-        0x0211_afa4_84eb_7f83,
         hle_driver_submit_dcb,
     );
     // Same story for async-compute submission and GPU event registration: both
     // were implemented but registered ONLY under `libSceAgc`, while the measured
     // ASTRO.BOT title imports them from `libSceAgcDriver`. Resolution is
     // provider-aware, so the implementations were unreachable — the title
-    // reported them missing at the first GPU submission. NIDs are the measured
-    // retail identities, not derived from these labels.
-    registry.register_nid(
+    // reported them missing at the first GPU submission.
+    registry.register(
         "libSceAgcDriver",
         "sceAgcDriverSubmitAcb",
-        0x8124_67af_bf45_f2d4,
         hle_driver_submit_acb,
     );
-    registry.register_nid(
+    registry.register(
         "libSceAgcDriver",
         "sceAgcDriverAddEqEvent",
-        0xc36a_c986_60fe_76c1,
         hle_driver_add_eq_event,
     );
     registry.register("libSceAgc", "sceAgcDriverSubmitDcb", hle_driver_submit_dcb);
@@ -460,7 +451,11 @@ pub fn register(registry: &HleRegistry) {
     // (matches SharpEmu `CbReleaseMem`, `Pm4(8, ItNop, RReleaseMem)`). Byte
     // units, per the convention above.
     registry.register("libSceAgc", "sceAgcDcbJumpGetSize", hle_dcb_jump_get_size);
-    registry.register("libSceAgc", "sceAgcDcbRewindGetSize", hle_dcb_rewind_get_size);
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbRewindGetSize",
+        hle_dcb_rewind_get_size,
+    );
     registry.register(
         "libSceAgc",
         "sceAgcCbQueueEndOfPipeActionGetSize",
@@ -473,8 +468,16 @@ pub fn register(registry: &HleRegistry) {
     // size in rax and writes NO guest memory. Ported from SharpEmu (GPL-2.0,
     // commit 74a5198, AgcExports.cs); the export names hash to the NIDs SharpEmu
     // declares, and the sizes are cross-checked against the writers in this file.
-    registry.register("libSceAgc", "sceAgcDcbDmaDataGetSize", hle_dma_data_get_size);
-    registry.register("libSceAgc", "sceAgcAcbDmaDataGetSize", hle_dma_data_get_size);
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbDmaDataGetSize",
+        hle_dma_data_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcAcbDmaDataGetSize",
+        hle_dma_data_get_size,
+    );
     registry.register(
         "libSceAgc",
         "sceAgcDcbDrawIndexIndirectGetSize",
@@ -601,6 +604,28 @@ pub fn register(registry: &HleRegistry) {
         registry.register("libSceAgc", name, implementation);
         registry.register("libSceAgcDriver", name, implementation);
     }
+}
+
+/// Return the total DWORD length encoded by a Gen5 PM4 packet header.
+///
+/// KytyPS5 treats its private `0x3fff10xx` marker as a one-DWORD packet;
+/// every ordinary type-3 packet uses COUNT+2 from bits 29:16. Reading through
+/// `GuestMemory` keeps malformed guest pointers contained.
+fn hle_get_packet_size(ctx: &HleContext, args: &[u64]) -> u64 {
+    let packet = args.first().copied().unwrap_or(0);
+    let mut header = [0u8; 4];
+    if packet == 0 || !ctx.mem.read(packet, &mut header) {
+        warn!("sceAgcGetPacketSize: packet {packet:#x} is not readable");
+        return 0;
+    }
+    let header = u32::from_le_bytes(header);
+    let dwords = if (header & 0x3fff_ff00) == 0x3fff_1000 {
+        1
+    } else {
+        ((header >> 16) & 0x3fff) + 2
+    };
+    debug!("sceAgcGetPacketSize(packet={packet:#x}, header={header:#010x}) -> {dwords}");
+    u64::from(dwords)
 }
 
 /// Resource-registration maximum name length (`sceAgcDriver...`).
@@ -1143,13 +1168,13 @@ fn next_gpu_timestamp(ctx: &HleContext) -> u64 {
     use std::sync::atomic::Ordering;
     let now = u64::try_from(ctx.services.monotonic_elapsed().as_nanos()).unwrap_or(u64::MAX);
     let mut next = now.max(1);
-    let _ = ctx
-        .kernel
-        .agc_gpu_timestamp
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
-            next = now.max(prev.saturating_add(1));
-            Some(next)
-        });
+    let _ =
+        ctx.kernel
+            .agc_gpu_timestamp
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+                next = now.max(prev.saturating_add(1));
+                Some(next)
+            });
     next
 }
 
@@ -1690,6 +1715,15 @@ fn read_u32_or_zero(ctx: &HleContext, addr: u64) -> u32 {
     }
 }
 
+fn read_u8_or_zero(ctx: &HleContext, addr: u64) -> u8 {
+    let mut value = [0u8; 1];
+    if ctx.mem.read(addr, &mut value) {
+        value[0]
+    } else {
+        0
+    }
+}
+
 /// Read a `u64` from guest memory, or 0 if unreadable.
 fn read_u64_or_zero(ctx: &HleContext, addr: u64) -> u64 {
     let mut b = [0u8; 8];
@@ -1838,7 +1872,19 @@ fn read_shader_mapped_data(ctx: &HleContext, header: u64) -> Option<raeen_gpu::S
     })
 }
 
-/// Bind a shader's code allocation into the first two SH-register entries.
+/// Known Gen5 program-register pairs. GTA V's hull headers demonstrated why
+/// the table must be searched: PGM_LO/HI are not necessarily entries 0/1.
+const SHADER_PROGRAM_REGISTER_PAIRS: [(u32, u32); 7] = [
+    (COMPUTE_PGM_LO, COMPUTE_PGM_HI),
+    (SPI_SHADER_PGM_LO_PS, SPI_SHADER_PGM_HI_PS),
+    (SPI_SHADER_PGM_LO_VS, SPI_SHADER_PGM_HI_VS),
+    (SPI_SHADER_PGM_LO_ES, SPI_SHADER_PGM_HI_ES),
+    (SPI_SHADER_PGM_LO_GS, SPI_SHADER_PGM_HI_GS),
+    (SPI_SHADER_PGM_LO_HS, SPI_SHADER_PGM_HI_HS),
+    (SPI_SHADER_PGM_LO_LS, SPI_SHADER_PGM_HI_LS),
+];
+
+/// Bind a shader's code allocation into its SH program-register entries.
 ///
 /// AGC compiler output deliberately stores zero in the program-base values.
 /// `sceAgcCreateShader` is the relocation boundary that replaces those
@@ -1867,23 +1913,54 @@ fn patch_shader_program_registers(ctx: &HleContext, header: u64, code: u64) -> b
         0 => (COMPUTE_PGM_LO, COMPUTE_PGM_HI),
         1 => (SPI_SHADER_PGM_LO_PS, SPI_SHADER_PGM_HI_PS),
         2 | 6 => (SPI_SHADER_PGM_LO_ES, SPI_SHADER_PGM_HI_ES),
+        3 => (SPI_SHADER_PGM_LO_VS, SPI_SHADER_PGM_HI_VS),
         4 => (SPI_SHADER_PGM_LO_GS, SPI_SHADER_PGM_HI_GS),
+        5 => (SPI_SHADER_PGM_LO_HS, SPI_SHADER_PGM_HI_HS),
         7 => (SPI_SHADER_PGM_LO_LS, SPI_SHADER_PGM_HI_LS),
         _ => return false,
     };
-    let mut lo_register = [0u8; 4];
-    let mut hi_register = [0u8; 4];
-    if !ctx.mem.read(registers, &mut lo_register)
-        || !ctx.mem.read(registers + 8, &mut hi_register)
-        || u32::from_le_bytes(lo_register) != expected_lo
-        || u32::from_le_bytes(hi_register) != expected_hi
-    {
+
+    let count = usize::from(register_count[0]);
+    let mut entries = Vec::with_capacity(count);
+    for index in 0..count {
+        let address = registers + index as u64 * 8;
+        let mut raw = [0u8; 4];
+        if !ctx.mem.read(address, &mut raw) {
+            return false;
+        }
+        entries.push((address, u32::from_le_bytes(raw)));
+    }
+
+    let find_pair = |lo: u32, hi: u32| {
+        let lo_entry = entries.iter().find(|(_, register)| *register == lo)?;
+        let hi_entry = entries.iter().find(|(_, register)| *register == hi)?;
+        Some((lo_entry.0, hi_entry.0))
+    };
+    let pair = find_pair(expected_lo, expected_hi).or_else(|| {
+        SHADER_PROGRAM_REGISTER_PAIRS
+            .iter()
+            .find_map(|&(lo, hi)| find_pair(lo, hi))
+    });
+
+    let Some((lo_address, hi_address)) = pair else {
+        // GTA V Enhanced hull headers can begin with RSRC1/RSRC2 and omit
+        // PGM_LO/HI entirely. Later SetShRegisterDirect commands publish the
+        // program address, so rejecting the object here leaves a null shader
+        // handle and makes SGA initialization assert.
+        return shader_type[0] == 5
+            && matches!(
+                entries.first().map(|(_, register)| *register),
+                Some(SPI_SHADER_PGM_RSRC1_HS | SPI_SHADER_PGM_LO_HS)
+            );
+    };
+
+    if lo_address == hi_address {
         return false;
     }
 
     let lo_value = ((code >> 8) as u32).to_le_bytes();
     let hi_value = ((code >> 40) as u32 & 0xff).to_le_bytes();
-    ctx.mem.write(registers + 4, &lo_value) && ctx.mem.write(registers + 12, &hi_value)
+    ctx.mem.write(lo_address + 4, &lo_value) && ctx.mem.write(hi_address + 4, &hi_value)
 }
 
 /// `sceAgcCreateShader(destination, header, code)`: validate the shader header
@@ -1939,6 +2016,23 @@ fn hle_create_shader(ctx: &HleContext, args: &[u64]) -> u64 {
         }
     }
     if !patch_shader_program_registers(ctx, header, code) {
+        static WARNED_SHADER_TYPES: std::sync::atomic::AtomicU16 =
+            std::sync::atomic::AtomicU16::new(0);
+        let shader_type = read_u8_or_zero(ctx, header + SHADER_TYPE_OFFSET);
+        let type_bit = 1u16.checked_shl(u32::from(shader_type)).unwrap_or(0);
+        let first_register = read_u64_or_zero(ctx, header + SHADER_SH_REGISTERS_OFFSET);
+        let first_register = read_u32_or_zero(ctx, first_register);
+        if type_bit == 0
+            || WARNED_SHADER_TYPES.fetch_or(type_bit, std::sync::atomic::Ordering::Relaxed)
+                & type_bit
+                == 0
+        {
+            warn!(
+                "sceAgcCreateShader: cannot bind program registers: type={shader_type} \
+                 count={} first_register={first_register:#x}",
+                read_u8_or_zero(ctx, header + SHADER_NUM_SH_REGISTERS_OFFSET)
+            );
+        }
         return SCE_ERROR_INVALID_ARGUMENT;
     }
     let Some(mapped_data) = read_shader_mapped_data(ctx, header) else {
@@ -3781,7 +3875,7 @@ fn hle_unknown_krz_wek_v120(_ctx: &HleContext, args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_ctx;
+    use crate::{GuestMemory, test_ctx};
 
     fn ctx_env() -> (
         raeen_kernel::OrbisKernel,
@@ -3805,6 +3899,19 @@ mod tests {
         let mut b = [0u8; 4];
         assert!(ctx.mem.read(addr, &mut b));
         u32::from_le_bytes(b)
+    }
+
+    #[test]
+    fn get_packet_size_decodes_pm4_length_and_private_marker() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let ordinary = 0xC005_1010u32;
+        assert!(mem.write(0x100, &ordinary.to_le_bytes()));
+        assert_eq!(hle_get_packet_size(&ctx, &[0x100]), 7);
+
+        assert!(mem.write(0x104, &0x3fff_1000u32.to_le_bytes()));
+        assert_eq!(hle_get_packet_size(&ctx, &[0x104]), 1);
+        assert_eq!(hle_get_packet_size(&ctx, &[0]), 0);
     }
 
     fn read_u64(ctx: &HleContext, addr: u64) -> u64 {
@@ -4085,14 +4192,7 @@ mod tests {
 
         let registry = HleRegistry::new();
         register(&registry);
-        assert!(
-            registry
-                .registered_nid_overrides()
-                .iter()
-                .any(|(nid, key)| {
-                    *nid == 0xc2bd_b774_f2b2_59cd && key == "libSceAgc::sceAgcCbReleaseMem"
-                })
-        );
+        assert!(registry.is_implemented("libSceAgc", "sceAgcCbReleaseMem"));
     }
 
     #[test]
@@ -4791,41 +4891,10 @@ mod tests {
         assert_eq!(metadata.resource_type, 3);
         assert_eq!(metadata.flags, 7);
         let registry = HleRegistry::new();
-        assert!(
-            registry
-                .registered_nid_overrides()
-                .iter()
-                .any(|(nid, key)| {
-                    *nid == 0x5ff3_66e4_a2d1_11e8
-                        && key == "libSceAgcDriver::sceAgcDriverRegisterOwner"
-                })
-        );
-        assert!(
-            registry
-                .registered_nid_overrides()
-                .iter()
-                .any(|(nid, key)| {
-                    *nid == 0x5b9c_f879_9ae3_11ab
-                        && key == "libSceAgcDriver::sceAgcDriverRegisterResource"
-                })
-        );
-        assert!(
-            registry
-                .registered_nid_overrides()
-                .iter()
-                .any(|(nid, key)| {
-                    *nid == 0x5209_4921_98c6_b2c3 && key == "libSceAgcDriver::sceAgcDriverSubmitDcb"
-                })
-        );
-        assert!(
-            registry
-                .registered_nid_overrides()
-                .iter()
-                .any(|(nid, key)| {
-                    *nid == 0x0211_afa4_84eb_7f83
-                        && key == "libSceAgcDriver::sceAgcDriverAgrSubmitDcb"
-                })
-        );
+        assert!(registry.is_implemented("libSceAgcDriver", "sceAgcDriverRegisterOwner"));
+        assert!(registry.is_implemented("libSceAgcDriver", "sceAgcDriverRegisterResource"));
+        assert!(registry.is_implemented("libSceAgcDriver", "sceAgcDriverSubmitDcb"));
+        assert!(registry.is_implemented("libSceAgcDriver", "sceAgcDriverAgrSubmitDcb"));
         // AddEqEvent on an unknown queue → NOT_FOUND; on a real one → OK.
         assert_eq!(
             hle_driver_add_eq_event(&ctx, &[0xDEAD, 5, 9]),
@@ -5083,6 +5152,42 @@ mod tests {
             hle_create_shader(&ctx, &[dest, header, code]),
             SCE_ERROR_INVALID_ARGUMENT
         );
+    }
+
+    #[test]
+    fn create_shader_accepts_gta_hull_header_without_program_pair() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let header = 0x200u64;
+        let destination = 0x100u64;
+        let code = 0x1234_5678_9000u64;
+        let sh_relative = 0x100u64;
+        let sh_registers = header + SHADER_SH_REGISTERS_OFFSET + sh_relative;
+
+        assert!(ctx.mem.write(header, &SHADER_FILE_HEADER.to_le_bytes()));
+        assert!(ctx.mem.write(header + 4, &SHADER_VERSION.to_le_bytes()));
+        assert!(ctx.mem.write(
+            header + SHADER_SH_REGISTERS_OFFSET,
+            &sh_relative.to_le_bytes()
+        ));
+        // GTA V Enhanced type-5 headers begin with HS RSRC1/RSRC2 and may
+        // publish PGM_LO/HI later through SetShRegisterDirect.
+        assert!(
+            ctx.mem
+                .write(sh_registers, &SPI_SHADER_PGM_RSRC1_HS.to_le_bytes())
+        );
+        assert!(ctx.mem.write(
+            sh_registers + 8,
+            &(SPI_SHADER_PGM_RSRC1_HS + 1).to_le_bytes()
+        ));
+        assert!(ctx.mem.write(header + SHADER_TYPE_OFFSET, &[5]));
+        assert!(ctx.mem.write(header + SHADER_NUM_SH_REGISTERS_OFFSET, &[2]));
+
+        assert_eq!(hle_create_shader(&ctx, &[destination, header, code]), 0);
+        assert_eq!(read_u32(&ctx, sh_registers), SPI_SHADER_PGM_RSRC1_HS);
+        let mut object = [0u8; 8];
+        assert!(ctx.mem.read(destination, &mut object));
+        assert_eq!(u64::from_le_bytes(object), header);
     }
 
     #[test]
@@ -5459,7 +5564,10 @@ mod tests {
         assert_eq!(hle_dma_data_get_size(&ctx, &[]), 8 * 4);
         assert_eq!(hle_dcb_draw_index_indirect_get_size(&ctx, &[]), 5 * 4);
         assert_eq!(hle_dcb_set_index_count_get_size(&ctx, &[]), 7 * 4);
-        assert_eq!(hle_dcb_stall_command_buffer_parser_get_size(&ctx, &[]), 2 * 4);
+        assert_eq!(
+            hle_dcb_stall_command_buffer_parser_get_size(&ctx, &[]),
+            2 * 4
+        );
         // GetLodStats: SharpEmu's 0x10 + counterCount*4, floored at the 5-DWORD
         // (20-byte) writer so a small counterCount never under-reserves.
         assert_eq!(hle_dcb_get_lod_stats_get_size(&ctx, &[0]), 5 * 4);

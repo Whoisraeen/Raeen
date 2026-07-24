@@ -35,8 +35,8 @@ use std::fmt;
 
 use crate::hw_regs::UserSgprInfo;
 use crate::shader::resources::{
-    ShaderBindResources, ShaderComputeInputInfo, ShaderEudRawResources, ShaderPixelInputInfo,
-    ShaderVertexInputInfo,
+    ShaderBindResources, ShaderComputeInputInfo, ShaderEudRawResources, ShaderGlobalMemResources,
+    ShaderPixelInputInfo, ShaderVertexInputInfo,
 };
 use crate::shader::types::{
     ShaderCode, ShaderConstant, ShaderInstruction, ShaderInstructionType, ShaderOperand,
@@ -1999,6 +1999,63 @@ pub fn shader_detect_eud_raw_window(code: &ShaderCode, bind: &mut ShaderBindReso
     }
 }
 
+/// Beyond Kyty (SharpEmu PR #587): decide whether a stage needs the
+/// `%global_mem` window (a FLAT-class direct-address op is present) and place
+/// its descriptor binding after every other group, including the raw-EUD
+/// fallback. Mirrors the standalone-pass shape of
+/// [`shader_detect_eud_raw_window`] and must run AFTER it so the binding index
+/// follows `eud_raw`'s.
+pub fn shader_detect_flat_global_window(code: &ShaderCode, bind: &mut ShaderBindResources) {
+    use ShaderInstructionType as T;
+
+    bind.global_mem = ShaderGlobalMemResources::default();
+
+    let uses_flat = code.get_instructions().iter().any(|inst| {
+        matches!(
+            inst.type_,
+            T::FlatLoadUbyte
+                | T::FlatLoadDword
+                | T::FlatLoadDwordX2
+                | T::FlatLoadDwordX3
+                | T::FlatLoadDwordX4
+                | T::FlatStoreDword
+                | T::FlatStoreDwordX2
+                | T::FlatStoreDwordX4
+        )
+    });
+    if !uses_flat {
+        return;
+    }
+
+    // Next binding index after every group `shader_calc_binding_indices`
+    // assigned, then the raw-EUD fallback (GDS takes the last index without
+    // advancing the counter, so it contributes +1 like the others).
+    let mut binding_index = 0;
+    if bind.storage_buffers.buffers_num > 0 {
+        binding_index += 1;
+    }
+    if bind.textures2d.textures_num > 0 {
+        binding_index += 2;
+    }
+    if bind.samplers.samplers_num > 0 {
+        binding_index += 1;
+    }
+    if bind.gds_pointers.pointers_num > 0 {
+        binding_index += 1;
+    }
+    if bind.eud_raw.used {
+        binding_index += 1;
+    }
+    bind.global_mem = ShaderGlobalMemResources {
+        used: true,
+        binding_index,
+    };
+    tracing::debug!(
+        binding_index,
+        "flat/global window: FLAT-class op reads guest memory directly"
+    );
+}
+
 /// Vulkan only guarantees 128 bytes of push constants; the Windows GPUs we
 /// currently exercise commonly expose 256. Keep translated resource tables
 /// within that portable ceiling and move larger tables to a per-stage UBO.
@@ -2037,6 +2094,9 @@ pub fn shader_push_constant_spill_binding(bind: &ShaderBindResources) -> Option<
     }
     if bind.eud_raw.used {
         after(bind.eud_raw.binding_index);
+    }
+    if bind.global_mem.used {
+        after(bind.global_mem.binding_index);
     }
     Some(next)
 }
@@ -3163,6 +3223,9 @@ impl<'a> Spirv<'a> {
             if bind.eud_raw.used {
                 vars.push("%eud_raw".to_string());
             }
+            if bind.global_mem.used {
+                vars.push("%global_mem".to_string());
+            }
             if bind.push_constant_size > 0 {
                 vars.push("%vsharp".to_string());
             }
@@ -3366,13 +3429,22 @@ impl<'a> Spirv<'a> {
                OpDecorate %eud_raw DescriptorSet <DescriptorSet>
                OpDecorate %eud_raw Binding <BindingIndex>
 "#;
+        // SharpEmu PR #587: the FLAT-class guest-memory window SSBO (a uint
+        // runtime array; dwords [0..2] are the window base, the rest are data).
+        const GLOBAL_MEM_ANNOTATIONS: &str = r#"
+               OpDecorate %globalmem_runtimearr_uint ArrayStride 4
+               OpMemberDecorate %GlobalMem 0 Offset 0
+               OpDecorate %GlobalMem Block
+               OpDecorate %global_mem DescriptorSet <DescriptorSet>
+               OpDecorate %global_mem Binding <BindingIndex>
+"#;
         const VSHARP_ANNOTATIONS: &str = r#"
        OpDecorate %vsharp_arr_uint_uint_4 ArrayStride 4
        OpDecorate %vsharp_arr__arr_uint_uint_4_uint_<buffers_num> ArrayStride 16
 	   OpMemberDecorate %BufferResource 0 Offset <Offset>
        OpDecorate %BufferResource Block
 "#;
-        const VSHARP_UNIFORM_ANNOTATIONS: &str = r#"
+        const VSHARP_SPILL_ANNOTATIONS: &str = r#"
        OpDecorate %vsharp DescriptorSet <DescriptorSet>
        OpDecorate %vsharp Binding <BindingIndex>
 "#;
@@ -3428,6 +3500,14 @@ impl<'a> Spirv<'a> {
                     .replace("<DescriptorSet>", &format!("{}", bind.descriptor_set_slot))
                     .replace("<BindingIndex>", &format!("{}", bind.eud_raw.binding_index));
             }
+            if bind.global_mem.used {
+                self.source += &GLOBAL_MEM_ANNOTATIONS
+                    .replace("<DescriptorSet>", &format!("{}", bind.descriptor_set_slot))
+                    .replace(
+                        "<BindingIndex>",
+                        &format!("{}", bind.global_mem.binding_index),
+                    );
+            }
             if bind.push_constant_size > 0 {
                 let spill = shader_push_constant_spill_binding(bind);
                 self.source += &VSHARP_ANNOTATIONS
@@ -3447,7 +3527,7 @@ impl<'a> Spirv<'a> {
                         ),
                     );
                 if let Some(binding) = spill {
-                    self.source += &VSHARP_UNIFORM_ANNOTATIONS
+                    self.source += &VSHARP_SPILL_ANNOTATIONS
                         .replace("<DescriptorSet>", &format!("{}", bind.descriptor_set_slot))
                         .replace("<BindingIndex>", &format!("{binding}"));
                 }
@@ -3596,6 +3676,13 @@ impl<'a> Spirv<'a> {
             %_ptr_StorageBuffer_EudRaw = OpTypePointer StorageBuffer %EudRaw
 "#;
 
+        // SharpEmu PR #587: the FLAT-class guest-memory window SSBO type.
+        const GLOBAL_MEM_TYPES: &str = r#"
+            %globalmem_runtimearr_uint = OpTypeRuntimeArray %uint
+                    %GlobalMem = OpTypeStruct %globalmem_runtimearr_uint
+            %_ptr_StorageBuffer_GlobalMem = OpTypePointer StorageBuffer %GlobalMem
+"#;
+
         const VSHARP_TYPES: &str = r#"
          %vsharp_buffers_num_uint_<buffers_num> = OpConstant %uint <buffers_num>
                              %vsharp_num_uint_4 = OpConstant %uint 4
@@ -3658,6 +3745,9 @@ impl<'a> Spirv<'a> {
             if bind.eud_raw.used {
                 self.source += EUD_RAW_TYPES;
             }
+            if bind.global_mem.used {
+                self.source += GLOBAL_MEM_TYPES;
+            }
             if bind.push_constant_size > 0 {
                 self.source += &VSHARP_TYPES
                     .replace(
@@ -3667,7 +3757,7 @@ impl<'a> Spirv<'a> {
                     .replace(
                         "<StorageClass>",
                         if shader_push_constant_spill_binding(bind).is_some() {
-                            "Uniform"
+                            "StorageBuffer"
                         } else {
                             "PushConstant"
                         },
@@ -3806,9 +3896,15 @@ impl<'a> Spirv<'a> {
                     "%eud_raw = OpVariable %_ptr_StorageBuffer_EudRaw StorageBuffer".to_string(),
                 );
             }
+            if bind.global_mem.used {
+                vars.push(
+                    "%global_mem = OpVariable %_ptr_StorageBuffer_GlobalMem StorageBuffer"
+                        .to_string(),
+                );
+            }
             if bind.push_constant_size > 0 {
                 let storage = if shader_push_constant_spill_binding(bind).is_some() {
-                    "Uniform"
+                    "StorageBuffer"
                 } else {
                     "PushConstant"
                 };
@@ -4030,9 +4126,9 @@ impl<'a> Spirv<'a> {
 
         if let Some(bind) = self.bind {
             const TEXT: &str = r#"
-         %vsharp_<reg> = OpAccessChain %_ptr_PushConstant_uint %vsharp %int_0 %int_<buffer> %int_<field>
-         %vsharp_value_<reg> = OpLoad %uint %vsharp_<reg>
-               OpStore %<reg> %vsharp_value_<reg>
+         %vsharp_b<buffer>_f<field> = OpAccessChain %_ptr_PushConstant_uint %vsharp %int_0 %int_<buffer> %int_<field>
+         %vsharp_value_b<buffer>_f<field> = OpLoad %uint %vsharp_b<buffer>_f<field>
+               OpStore %<reg> %vsharp_value_b<buffer>_f<field>
 		"#;
 
             let mut buffer_index: i32 = 0;
@@ -4791,6 +4887,7 @@ impl<'a> Spirv<'a> {
         if has_buffers
             && self.code.has_any_of(&[
                 T::BufferStoreDword,
+                T::BufferStoreDwordX2,
                 T::BufferStoreDwordX4,
                 T::BufferStoreFormatX,
                 T::BufferStoreFormatXy,
@@ -4803,6 +4900,10 @@ impl<'a> Spirv<'a> {
         }
 
         if has_buffers && self.code.has_any_of(&[T::BufferStoreFormatXyzw]) {
+            // `TBUFFER_STORE_FORMAT_XYZW` decomposes the typed store through
+            // `buffer_store_float1`; include that transitive helper even when
+            // no scalar store opcode appears in the guest stream.
+            self.source += BUFFER_STORE_FLOAT1;
             self.source += BUFFER_STORE_FLOAT4;
             self.source += TBUFFER_STORE_FORMAT_XYZW;
         }
@@ -5298,7 +5399,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_resource_table_uses_uniform_buffer_instead_of_push_constants() {
+    fn oversized_resource_table_uses_storage_buffer_instead_of_push_constants() {
         let mut code = ShaderCode::new();
         code.set_type(ShaderType::Compute);
         let mut input = ShaderComputeInputInfo {
@@ -5311,12 +5412,12 @@ mod tests {
         let source = spirv_generate_source(&code, None, None, Some(&input)).unwrap();
         assert!(
             source.contains(
-                "%_ptr_PushConstant_BufferResource = OpTypePointer Uniform %BufferResource"
+                "%_ptr_PushConstant_BufferResource = OpTypePointer StorageBuffer %BufferResource"
             ),
             "{source}"
         );
         assert!(
-            source.contains("%vsharp = OpVariable %_ptr_PushConstant_BufferResource Uniform"),
+            source.contains("%vsharp = OpVariable %_ptr_PushConstant_BufferResource StorageBuffer"),
             "{source}"
         );
         assert!(
