@@ -14,7 +14,7 @@
 
 use ash::vk;
 use raeen_gpu::backend::GpuBackend;
-use raeen_gpu::vulkan::offscreen::{DepthState, DrawState, render_draw};
+use raeen_gpu::vulkan::offscreen::{CLEAR_COLOR, DepthState, DrawState, render_draw, unorm8};
 use raeen_gpu::vulkan::shaders::{triangle_fragment_spirv, triangle_vertex_spirv};
 use raeen_gpu::vulkan::{VulkanBackend, validation_error_count};
 
@@ -285,4 +285,62 @@ fn stencil_attachment_clears_and_reads_back() {
         );
         eprintln!("stencil_attachment_clears_and_reads_back: SKIP — no D/S format supported");
     }
+}
+
+#[test]
+fn persistent_zero_stencil_equal_test_keeps_rasterizing() {
+    let Some(backend) = backend_or_skip("persistent_zero_stencil_equal_test_keeps_rasterizing")
+    else {
+        return;
+    };
+    let dev = backend.device().expect("backend is initialized");
+    let stencil_op = vk::StencilOpState::default()
+        .fail_op(vk::StencilOp::KEEP)
+        .pass_op(vk::StencilOp::KEEP)
+        .depth_fail_op(vk::StencilOp::KEEP)
+        .compare_op(vk::CompareOp::EQUAL)
+        .compare_mask(0xF0)
+        .write_mask(0xFF)
+        .reference(0);
+    let vs = triangle_vertex_spirv();
+    let ps = triangle_fragment_spirv();
+
+    for clear_stencil in [true, false] {
+        let depth_state = DepthState {
+            target_base: Some(0x5678_0000),
+            format: vk::Format::D32_SFLOAT_S8_UINT,
+            stencil_test_enable: true,
+            stencil_front: stencil_op,
+            stencil_back: stencil_op,
+            clear_stencil,
+            clear_stencil_value: 0,
+            ..cleared_depth_state(vk::Format::D32_SFLOAT_S8_UINT, 1.0)
+        };
+        let state = DrawState {
+            vertices: Some(&TRIANGLE_VERTICES),
+            vertex_count: TRIANGLE_VERTICES.len() as u32,
+            depth: Some(depth_state),
+            ..DrawState::new(W, H, &vs, &ps)
+        };
+        let output = render_draw(dev, &state).expect("zero-stencil EQUAL draw");
+        let image = output.color.expect("colour attachment");
+        let clear = unorm8(CLEAR_COLOR);
+        assert!(
+            image
+                .pixels
+                .chunks_exact(4)
+                .any(|pixel| pixel != clear.as_slice()),
+            "stencil EQUAL(ref=0, mask=0xf0) rejected every fragment \
+             (clear_stencil={clear_stencil})"
+        );
+        assert_eq!(
+            output
+                .depth
+                .expect("depth/stencil readback")
+                .stencil_at(W / 2, H / 2),
+            Some(0)
+        );
+    }
+
+    assert_eq!(validation_error_count(), 0);
 }

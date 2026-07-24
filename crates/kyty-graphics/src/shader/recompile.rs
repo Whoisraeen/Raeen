@@ -1027,10 +1027,10 @@ fn recompile_exp_pos0(
     const FUNC: &str = "Recompile_Exp_Pos0Vsrc0Vsrc1Vsrc2Vsrc3Done";
     let inst = inst_at(code, index, FUNC)?;
 
-    // Coverage probe (RAEEN_TRACE_DRAWS). RAEEN_FORCE_CLEAR proved a correct
-    // full-screen NDC quad rasterizes ZERO fragments, so the suspect is the
-    // position export. If this never fires for a title's VS, the shader never
-    // writes gl_Position at all and nothing can cover a pixel.
+    // Coverage probe (RAEEN_TRACE_DRAWS). A force-clear run can establish that
+    // a draw produced no colour, but cannot distinguish vertex coverage from
+    // cull/depth/stencil rejection. This line answers only the narrower
+    // question: did translation encounter a POS0 export at all?
     if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
         use std::sync::atomic::{AtomicU32, Ordering};
         static POS0_SEEN: AtomicU32 = AtomicU32::new(0);
@@ -1039,10 +1039,11 @@ fn recompile_exp_pos0(
             tracing::warn!(
                 n,
                 srcs_are_variables = inst.src[..4].iter().all(|s| operand_is_variable(*s)),
-                // The VGPRs the export READS. The fetch WRITES to the VGPR named
-                // by sem.hardware_mapping() (measured: 9, 12, 13). If these
-                // disagree the export reads never-written registers (zeros) and
-                // every vertex collapses to the origin — zero coverage.
+                // The VGPRs the export READS. These need not equal the fetch
+                // destinations because ordinary shader arithmetic commonly
+                // writes the final position to different VGPRs. Correlate this
+                // with the gated `Fetch* recompiled` lines below before
+                // diagnosing an unwritten-register collapse.
                 src_regs = format_args!(
                     "[{}, {}, {}, {}]",
                     inst.src[0].register_id,
@@ -2934,6 +2935,24 @@ fn recompile_fetch(
                 FUNC,
                 format!("invalid fetch dst.size: {n_dst} (attrib {attrib_id})"),
             ));
+        }
+
+        if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static FETCH_SEEN: AtomicU32 = AtomicU32::new(0);
+            let n = FETCH_SEEN.fetch_add(1, Ordering::Relaxed);
+            if n < 24 {
+                tracing::warn!(
+                    n,
+                    attrib_id,
+                    attrib_position = attrib_pos,
+                    fetch_dst_start = inst.dst.register_id,
+                    fetch_dst_size = n_dst,
+                    semantic_hw_start = r.register_start,
+                    semantic_hw_size = n_attr,
+                    "TRACE_DRAWS: Fetch* recompiled (vertex attribute VGPR write)"
+                );
+            }
         }
 
         // GCN vertex fetch tolerates either direction of width mismatch:

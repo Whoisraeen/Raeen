@@ -26,6 +26,11 @@ proprietary SDK/headers, using only the community sources credited below.
   `sceAgcGetRegisterDefaults2[Internal]`) are a faithful port of Kyty's
   `Graphics.cpp` `g_cx/sh/uc_reg_info1/2` tables with register names resolved
   against Kyty's `Pm4.h`.
+- **Behavioral mapping:** `raeen-gpu`'s Gen5 stencil conversion follows Kyty's
+  explicit AMD-operation mapping rather than treating AMD and Vulkan enum
+  values as layout-compatible. Raeen's Rust implementation additionally
+  validates unsupported operations and preserves the guest's separate test and
+  operation reference values.
 
 MIT is compatible with GPL-2.0: MIT-derived portions may be combined into this
 GPL-2.0-only work, and this notice preserves the required MIT attribution for

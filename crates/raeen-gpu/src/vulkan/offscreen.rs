@@ -3372,16 +3372,11 @@ impl<'a> Resources<'a> {
         let color_attachment = vk::RenderingAttachmentInfo::default()
             .image_view(self.image_view)
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            // `RAEEN_FORCE_CLEAR=1` is the COVERAGE PROBE: it forces every draw
-            // to CLEAR instead of LOAD, so the target ends as pure CLEAR_COLOR
-            // unless some draw actually produced a fragment. It answers the one
-            // question a black frame cannot — "is nothing being drawn, or is
-            // something being drawn in black?" — without shader surgery.
-            // MEASURED on Minecraft: 12,083 draws, final frame 100% uniform
-            // CLEAR_COLOR (2,073,600/2,073,600 pixels) => ZERO coverage; not a
-            // single fragment from any draw. It also proves the clear reaches
-            // the image and the RGBA8 readback/dump is faithful (blue came back
-            // 0xBF exactly).
+            // `RAEEN_FORCE_CLEAR=1` is an attachment/readback probe: it forces
+            // every draw to CLEAR instead of LOAD. A uniform final clear proves
+            // that the clear and readback path work and that no draw changed
+            // the colour attachment. It does NOT isolate the vertex shader:
+            // culling, depth, or stencil can reject otherwise-valid geometry.
             .load_op(if std::env::var_os("RAEEN_FORCE_CLEAR").is_some() {
                 vk::AttachmentLoadOp::CLEAR
             } else if self.load_from_gpu || state.initial.is_some() {

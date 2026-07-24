@@ -203,6 +203,78 @@ fn blend_state_from_regs(ctx: &Context) -> Result<BlendState, DrawError> {
     })
 }
 
+/// Convert one Gen5 stencil operation to Vulkan and report the reference value
+/// needed by a REPLACE-class operation.
+///
+/// The two enums are not layout-compatible. In particular, AMD 2/3/4 are
+/// Ones/ReplaceTest/ReplaceOp, while Vulkan 2 is the single REPLACE opcode;
+/// AMD wrap operations are 8/9 while Vulkan's are 6/7. Casting the raw value
+/// silently turned Minecraft's stencil setup into different operations.
+fn gen5_stencil_op(
+    op: u8,
+    test_value: u8,
+    operation_value: u8,
+) -> Result<(vk::StencilOp, Option<u32>), DrawError> {
+    let mapped = match op {
+        0 => (vk::StencilOp::KEEP, None),
+        1 => (vk::StencilOp::ZERO, None),
+        2 => (vk::StencilOp::REPLACE, Some(u32::from(u8::MAX))),
+        3 => (vk::StencilOp::REPLACE, Some(u32::from(test_value))),
+        4 => (vk::StencilOp::REPLACE, Some(u32::from(operation_value))),
+        5 => (vk::StencilOp::INCREMENT_AND_CLAMP, None),
+        6 => (vk::StencilOp::DECREMENT_AND_CLAMP, None),
+        7 => (vk::StencilOp::INVERT, None),
+        8 => (vk::StencilOp::INCREMENT_AND_WRAP, None),
+        9 => (vk::StencilOp::DECREMENT_AND_WRAP, None),
+        other => {
+            return Err(err(format!(
+                "unsupported Gen5 stencil operation {other} (supported: 0 Keep, 1 Zero, \
+                 2 Ones, 3 ReplaceTest, 4 ReplaceOp, 5/6 clamp, 7 Invert, 8/9 wrap)"
+            )));
+        }
+    };
+    Ok(mapped)
+}
+
+fn gen5_stencil_state(
+    operations: [u8; 3],
+    compare: u8,
+    values: [u8; 4],
+) -> Result<vk::StencilOpState, DrawError> {
+    let [fail, pass, depth_fail] = operations;
+    let [test_value, compare_mask, write_mask, operation_value] = values;
+    let (fail_op, fail_reference) = gen5_stencil_op(fail, test_value, operation_value)?;
+    let (pass_op, pass_reference) = gen5_stencil_op(pass, test_value, operation_value)?;
+    let (depth_fail_op, depth_fail_reference) =
+        gen5_stencil_op(depth_fail, test_value, operation_value)?;
+    let replace_reference = [fail_reference, pass_reference, depth_fail_reference]
+        .into_iter()
+        .flatten()
+        .next();
+    if let Some(reference) = replace_reference
+        && [fail_reference, pass_reference, depth_fail_reference]
+            .into_iter()
+            .flatten()
+            .any(|candidate| candidate != reference)
+    {
+        return Err(err(
+            "stencil operations require conflicting Vulkan reference values",
+        ));
+    }
+
+    // Vulkan has one reference for both comparison and REPLACE. When no
+    // REPLACE-class op consumes it, retain the guest comparison value.
+    let reference = replace_reference.unwrap_or(u32::from(test_value));
+    Ok(vk::StencilOpState::default()
+        .fail_op(fail_op)
+        .pass_op(pass_op)
+        .depth_fail_op(depth_fail_op)
+        .compare_op(vk::CompareOp::from_raw(i32::from(compare)))
+        .compare_mask(u32::from(compare_mask))
+        .write_mask(u32::from(write_mask))
+        .reference(reference))
+}
+
 fn depth_state_from_regs(ctx: &Context) -> Result<Option<DepthState<'static>>, DrawError> {
     let control = &ctx.depth_control;
     if !control.z_enable && !control.stencil_enable {
@@ -230,43 +302,35 @@ fn depth_state_from_regs(ctx: &Context) -> Result<Option<DepthState<'static>>, D
     };
     let stencil = &ctx.stencil_control;
     let mask = &ctx.stencil_mask;
-    let op = |fail: u8, pass: u8, depth_fail: u8, compare: u8, back: bool| {
-        vk::StencilOpState::default()
-            .fail_op(vk::StencilOp::from_raw(i32::from(fail)))
-            .pass_op(vk::StencilOp::from_raw(i32::from(pass)))
-            .depth_fail_op(vk::StencilOp::from_raw(i32::from(depth_fail)))
-            .compare_op(vk::CompareOp::from_raw(i32::from(compare)))
-            .compare_mask(u32::from(if back {
-                mask.stencil_mask_bf
-            } else {
-                mask.stencil_mask
-            }))
-            .write_mask(u32::from(if back {
-                mask.stencil_writemask_bf
-            } else {
-                mask.stencil_writemask
-            }))
-            .reference(u32::from(if back {
-                mask.stencil_testval_bf
-            } else {
-                mask.stencil_testval
-            }))
-    };
-    let front = op(
-        stencil.stencil_fail,
-        stencil.stencil_zpass,
-        stencil.stencil_zfail,
+    let front = gen5_stencil_state(
+        [
+            stencil.stencil_fail,
+            stencil.stencil_zpass,
+            stencil.stencil_zfail,
+        ],
         control.stencilfunc,
-        false,
-    );
+        [
+            mask.stencil_testval,
+            mask.stencil_mask,
+            mask.stencil_writemask,
+            mask.stencil_opval,
+        ],
+    )?;
     let back = if control.backface_enable {
-        op(
-            stencil.stencil_fail_bf,
-            stencil.stencil_zpass_bf,
-            stencil.stencil_zfail_bf,
+        gen5_stencil_state(
+            [
+                stencil.stencil_fail_bf,
+                stencil.stencil_zpass_bf,
+                stencil.stencil_zfail_bf,
+            ],
             control.stencilfunc_bf,
-            true,
-        )
+            [
+                mask.stencil_testval_bf,
+                mask.stencil_mask_bf,
+                mask.stencil_writemask_bf,
+                mask.stencil_opval_bf,
+            ],
+        )?
     } else {
         front
     };
@@ -455,6 +519,38 @@ fn fetch_index_buffer(draw: &IndexedDraw) -> Result<(Vec<u8>, vk::IndexType), Dr
     }
 }
 
+/// Number of vertex records addressable by this draw.
+///
+/// Uploading the V# descriptor's full `num_records` is catastrophically
+/// wasteful for UI ring buffers: Minecraft exposes roughly 4 MiB but a quad
+/// indexes only records 0..=3. Vulkan cannot read beyond the largest submitted
+/// index, so the exact safe upload is `(max_index + 1) * stride`.
+fn required_vertex_records(
+    index: Option<(&[u8], vk::IndexType)>,
+    vertex_count: u32,
+) -> Result<u32, DrawError> {
+    let Some((bytes, index_type)) = index else {
+        return Ok(vertex_count);
+    };
+    let max = match index_type {
+        vk::IndexType::UINT16 => bytes
+            .chunks_exact(2)
+            .map(|b| u32::from(u16::from_le_bytes([b[0], b[1]])))
+            .max(),
+        vk::IndexType::UINT32 => bytes
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .max(),
+        other => {
+            return Err(err(format!(
+                "unsupported Vulkan index type {other:?} while sizing vertex upload"
+            )));
+        }
+    };
+    max.and_then(|index| index.checked_add(1))
+        .ok_or_else(|| err("indexed draw has no addressable vertex records"))
+}
+
 /// Read `size` guest bytes starting at an arbitrary (possibly unaligned)
 /// address.
 ///
@@ -585,8 +681,16 @@ fn gen5_vertex_format(format: u8) -> Result<vk::Format, DrawError> {
     Ok(gen5_vertex_format_and_size(format)?.0)
 }
 
+#[cfg(test)]
 fn prepare_vertex_inputs(
     info: &ShaderVertexInputInfo,
+) -> Result<(Vec<VertexBufferData>, Vec<VertexAttributeData>), DrawError> {
+    prepare_vertex_inputs_limited(info, None)
+}
+
+fn prepare_vertex_inputs_limited(
+    info: &ShaderVertexInputInfo,
+    record_limit: Option<u32>,
 ) -> Result<(Vec<VertexBufferData>, Vec<VertexAttributeData>), DrawError> {
     let buffers_num = usize::try_from(info.buffers_num)
         .map_err(|_| err(format!("negative vertex buffer count {}", info.buffers_num)))?;
@@ -614,7 +718,14 @@ fn prepare_vertex_inputs(
         }
 
         let stride = u64::from(guest.stride);
-        let records = u64::from(guest.num_records);
+        if record_limit.is_some_and(|required| required > guest.num_records) {
+            return Err(err(format!(
+                "draw addresses {} vertex records but V# binding {binding} exposes only {}",
+                record_limit.unwrap_or_default(),
+                guest.num_records
+            )));
+        }
+        let records = u64::from(record_limit.unwrap_or(guest.num_records));
         let mut size = stride
             .checked_mul(records)
             .ok_or_else(|| err("vertex buffer size overflow"))?;
@@ -650,11 +761,10 @@ fn prepare_vertex_inputs(
             }
         }
         let bytes = read_guest_bytes(guest.addr, size, "vertex buffer")?;
-        // Coverage probe (RAEEN_TRACE_DRAWS): RAEEN_FORCE_CLEAR proved well-
-        // formed quads rasterize ZERO fragments, so the suspect is the vertex
-        // DATA behind the V#. Report the descriptor and whether the guest bytes
-        // are actually non-zero — an all-zero buffer collapses every vertex to
-        // the origin and would explain zero coverage exactly.
+        // Vertex-input probe (RAEEN_TRACE_DRAWS). Report the descriptor and
+        // whether the guest bytes are actually non-zero. This can identify an
+        // all-zero input buffer, but does not by itself prove whether later
+        // raster state accepted or rejected the transformed primitives.
         if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
             use std::sync::atomic::{AtomicU32, Ordering};
             static VB_SEEN: AtomicU32 = AtomicU32::new(0);
@@ -695,11 +805,11 @@ fn prepare_vertex_inputs(
                 format: gen5_vertex_format(info.resources[location].format())?,
                 offset: guest.attr_offsets[ai],
             };
-            // Coverage probe (RAEEN_TRACE_DRAWS). Data + gl_Position + draw
-            // state are all confirmed correct yet coverage is ZERO, so the
-            // remaining link is this binding. `location` must be the SAME index
-            // space the shader declares (`OpDecorate %attr{i} Location {i}` over
-            // 0..resources_num) and the format/offset must match the V#.
+            // Vertex-binding probe (RAEEN_TRACE_DRAWS). `location` must use the
+            // same index space the shader declares (`OpDecorate %attr{i}
+            // Location {i}` over 0..resources_num), and the format/offset must
+            // match the V#. This reports that link without treating it as a
+            // complete fragment-coverage verdict.
             if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static ATTR_SEEN: AtomicU32 = AtomicU32::new(0);
@@ -2326,8 +2436,9 @@ pub fn draw_state_from_regs<'a>(
         cull_mode = vk::CullModeFlags::NONE;
     }
     // PA_SU_SC_MODE_CNTL.FACE: 0 = counter-clockwise is the front face,
-    // 1 = clockwise is. Must travel with cull_mode — culling against the wrong
-    // winding removes exactly the geometry it should keep.
+    // 1 = clockwise is. Kyty, SharpEmu, and shadPS4 all map this directly to
+    // Vulkan; negative viewport height is already part of Vulkan's
+    // framebuffer-space winding calculation and must not be applied twice.
     let front_face = if ctx.mode_control.face {
         vk::FrontFace::CLOCKWISE
     } else {
@@ -2562,7 +2673,9 @@ impl OffscreenDrawSink<'_> {
         // Supersamples the whole draw (target + viewport + scissor together);
         // a factor of 1.0 — the default — is an exact no-op.
         state.scale_resolution(crate::agc_exec::AgcGpuSession::runtime_config().resolution_scale);
-        let (vertex_buffers, vertex_attributes) = prepare_vertex_inputs(&shaders.vs_info)?;
+        let vertex_records = required_vertex_records(index, state.vertex_count)?;
+        let (vertex_buffers, vertex_attributes) =
+            prepare_vertex_inputs_limited(&shaders.vs_info, Some(vertex_records))?;
         state.vertex_buffers = vertex_buffers;
         state.vertex_attributes = vertex_attributes;
         // Coverage probe (RAEEN_TRACE_DRAWS). Vertex data, attribute bindings,
@@ -3149,6 +3262,47 @@ mod tests {
     use super::*;
     use kyty_graphics::hw_regs::{ColorAttrib2, ComputeShaderInfo};
 
+    #[test]
+    fn gen5_stencil_operations_map_explicitly_to_vulkan() {
+        let expected = [
+            vk::StencilOp::KEEP,
+            vk::StencilOp::ZERO,
+            vk::StencilOp::REPLACE,
+            vk::StencilOp::REPLACE,
+            vk::StencilOp::REPLACE,
+            vk::StencilOp::INCREMENT_AND_CLAMP,
+            vk::StencilOp::DECREMENT_AND_CLAMP,
+            vk::StencilOp::INVERT,
+            vk::StencilOp::INCREMENT_AND_WRAP,
+            vk::StencilOp::DECREMENT_AND_WRAP,
+        ];
+        for (guest, expected) in expected.into_iter().enumerate() {
+            let (actual, reference) =
+                gen5_stencil_op(guest as u8, 0x2A, 0x55).expect("known Gen5 op");
+            assert_eq!(actual, expected, "guest stencil op {guest}");
+            assert_eq!(
+                reference,
+                match guest {
+                    2 => Some(0xFF),
+                    3 => Some(0x2A),
+                    4 => Some(0x55),
+                    _ => None,
+                },
+                "guest stencil op {guest} reference"
+            );
+        }
+        assert!(gen5_stencil_op(10, 0, 0).is_err());
+    }
+
+    #[test]
+    fn keep_only_stencil_state_preserves_comparison_reference() {
+        let state = gen5_stencil_state([0, 0, 0], 2, [0x2A, 0xF0, 0xFF, 0x55]).expect("KEEP state");
+        assert_eq!(state.compare_op, vk::CompareOp::EQUAL);
+        assert_eq!(state.reference, 0x2A);
+        assert_eq!(state.compare_mask, 0xF0);
+        assert_eq!(state.write_mask, 0xFF);
+    }
+
     /// GNM V# byte-size semantics: `stride == 0` marks a RAW buffer whose
     /// `num_records` is the size in BYTES (shadPS4 `Buffer::GetSize`); any
     /// other stride multiplies. An odd total is legitimate — the upload pads
@@ -3313,6 +3467,20 @@ mod tests {
         .expect("readable index buffer");
         assert_eq!(ty, vk::IndexType::UINT16);
         assert_eq!(&bytes[..12], bytemuck_le(&indices).as_slice());
+    }
+
+    #[test]
+    fn indexed_quad_limits_vertex_upload_to_largest_referenced_record() {
+        let indices = [1u16, 2, 0, 0, 2, 3];
+        let bytes = indices
+            .iter()
+            .flat_map(|index| index.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            required_vertex_records(Some((&bytes, vk::IndexType::UINT16)), 6)
+                .expect("valid quad indices"),
+            4
+        );
     }
 
     /// 8-bit indices are widened to 16-bit — Vulkan has no guaranteed UINT8.
@@ -3676,6 +3844,33 @@ mod tests {
             16,
             "rewritten descriptor must preserve the guest stride"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn vertex_upload_honors_draw_record_limit_instead_of_full_ring_buffer() {
+        let guest = [0x5au8; 160];
+        let base = guest.as_ptr() as u64;
+        let mut vs = ShaderVertexInputInfo::default();
+        vs.resources_num = 1;
+        vs.buffers_num = 1;
+        vs.resources[0].update_address48(base);
+        vs.resources[0].fields[1] |= 20 << 16;
+        vs.resources[0].fields[2] = 8;
+        vs.resources[0].fields[3] = 71 << 12;
+        vs.buffers[0].addr = base;
+        vs.buffers[0].stride = 20;
+        vs.buffers[0].num_records = 8;
+        vs.buffers[0].attr_num = 1;
+        vs.buffers[0].attr_indices[0] = 0;
+
+        let ranges = [(base, guest.len())];
+        let (buffers, _) = crate::guest_mem::with_test_ranges(&ranges, || {
+            prepare_vertex_inputs_limited(&vs, Some(4))
+        })
+        .expect("four-record UI quad");
+        assert_eq!(buffers[0].bytes.len(), 80);
     }
 
     /// ASTRO.BOT's measured HDR composite interleaves a float4 at offset 0 and

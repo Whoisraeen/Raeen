@@ -2968,3 +2968,31 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
     guest memory at batch retirement yet. M2/M3 therefore remain open; next
     correctness slice is fragment-SSBO writeback plus non-synthetic visible/
     interactive acceptance evidence.
+- MINECRAFT PRESENTING RESTORED + BLACK-FRAME FORENSICS (2026-07-24; working
+  tree, no commit; kyty-graphics 439/439, raeen-gpu 198/198 library + 5/5
+  serial Vulkan depth/stencil tests; scoped library clippy clean):
+  * Root cause was raster state, not a missing POS0 export. Raeen cast AMD
+    Gen5 stencil opcodes directly to Vulkan even though the enums diverge after
+    Keep/Zero (AMD ReplaceTest/ReplaceOp and wrap codes became unrelated or
+    invalid Vulkan operations). The draw path now maps all ten Gen5 operations
+    explicitly, carries both test/op reference values, and rejects unsupported
+    codes by name. `PA_SU_SC_MODE_CNTL.FACE` remains the reference-consistent
+    direct mapping; applying an extra negative-viewport inversion culled the
+    Minecraft UI and was removed.
+  * Present selection no longer treats the mere existence of a flipped target
+    as proof it contains a frame. It prefers visible RGB in the exact scanout,
+    temporarily selects a visible intermediate when the final composite is
+    pending, and emits rate-limited `PRESENT ROUTING` or `BLACK FRAME` console
+    diagnostics with target/shader/draw counters. The exact Minecraft flip
+    buffers become `target_visible=true` on the following composites.
+  * Indexed UI draws now upload only through the largest referenced vertex
+    index. Minecraft's six-index quad therefore uploads four 20-byte records
+    (80 bytes) instead of the V# ring's roughly 4 MiB capacity per draw.
+  * Production release proof, with no `RAEEN_NO_CULL`/`RAEEN_NO_STENCIL`
+    bypasses: `scratch/mc-production-stencil-fix-20260724/frame_000512.ppm`
+    is a real 1920x1080 Minecraft loading screen (spinner + partially filled
+    progress bar), and subsequent logs show both scanouts visible. The tightened
+    `RAEEN_TRACE_DRAWS` probe reports actual `Fetch*` destination VGPRs as well
+    as POS0 sources; it rules out the proposed gs-prolog VGPR-collapse theory
+    for this shader. This is visible retail-title progress, not proof of
+    gameplay, interaction, universal presentation, or an M2/M3/M5 gate.

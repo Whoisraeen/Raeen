@@ -400,6 +400,23 @@ pub struct AgcGpuSession {
 /// most one later flip to a live read (the pre-async behaviour), never leaking.
 const MAX_SCANOUT_SNAPSHOTS: usize = 8;
 
+/// Count pixels with visible colour, optionally sampling every `stride`th
+/// pixel. Alpha alone is not visible over the Shell's black background and
+/// must not make a cleared RGBA target look content-bearing.
+fn visible_pixel_count(image: &RenderedImage, stride: usize) -> usize {
+    let bpp = image.bytes_per_pixel.max(1) as usize;
+    image
+        .pixels
+        .chunks_exact(bpp)
+        .step_by(stride.max(1))
+        .filter(|pixel| pixel.iter().take(3).any(|&channel| channel != 0))
+        .count()
+}
+
+fn has_visible_content(image: &RenderedImage) -> bool {
+    visible_pixel_count(image, 16) != 0
+}
+
 /// Every Nth flip miss, the most-content fallback re-runs its full census
 /// (full flush + scan) instead of trusting the remembered target, so content
 /// migrating to a different render target is picked up within N flips.
@@ -1047,11 +1064,8 @@ impl AgcGpuSession {
                     && !framebuffers.contains_key(&addr)
                 {
                     let misses = self.flip_miss_count.fetch_add(1, Ordering::Relaxed);
-                    let remembered_has_content = remembered.is_some_and(|r| {
-                        framebuffers
-                            .get(&r)
-                            .is_some_and(|img| img.pixels.iter().step_by(64).any(|&b| b != 0))
-                    });
+                    let remembered_has_content = remembered
+                        .is_some_and(|r| framebuffers.get(&r).is_some_and(has_visible_content));
                     if !remembered_has_content || misses.is_multiple_of(FALLBACK_REELECT_INTERVAL) {
                         match crate::vulkan::offscreen::flush_deferred_draws(device) {
                             Ok(flushed) => insert_all(&mut framebuffers, flushed),
@@ -1081,9 +1095,13 @@ impl AgcGpuSession {
     /// takes the boot splash down.
     fn present_flipped(&self, address: u64) {
         let remembered = *self.fallback_present_base.lock();
-        let (image, fallback, fallback_base, keys) = {
+        let (image, fallback, fallback_base, keys, flip_target_known) = {
             let fb = self.framebuffers.lock();
-            let image = fb.get(&address).cloned();
+            let flip_target_known = fb.contains_key(&address);
+            let image = fb
+                .get(&address)
+                .filter(|image| has_visible_content(image))
+                .cloned();
             let (fallback, fallback_base) = if image.is_none() {
                 // Steady state: present the remembered fallback target while
                 // it still has content — no census, no scan of other targets
@@ -1091,7 +1109,7 @@ impl AgcGpuSession {
                 // the filtered flush).
                 let kept = remembered
                     .and_then(|r| fb.get(&r).map(|img| (r, img)))
-                    .filter(|(_, img)| img.pixels.iter().step_by(64).any(|&b| b != 0))
+                    .filter(|(_, img)| has_visible_content(img))
                     .map(|(r, img)| (Some(r), img.clone()));
                 match kept {
                     Some((base, img)) => (Some(img), base),
@@ -1103,8 +1121,7 @@ impl AgcGpuSession {
                         let elected = fb
                             .iter()
                             .map(|(base, img)| {
-                                let nonzero =
-                                    img.pixels.iter().step_by(64).filter(|&&b| b != 0).count();
+                                let nonzero = visible_pixel_count(img, 16);
                                 (nonzero, *base, img)
                             })
                             .filter(|(nonzero, _, _)| *nonzero > 0)
@@ -1119,12 +1136,14 @@ impl AgcGpuSession {
             } else {
                 (None, None)
             };
-            let keys = if std::env::var_os("RAEEN_TRACE_FLIP").is_some() {
+            let keys = if std::env::var_os("RAEEN_TRACE_FLIP").is_some()
+                || (image.is_none() && fallback.is_none())
+            {
                 Some(fb.keys().map(|k| format!("{k:#x}")).collect::<Vec<_>>())
             } else {
                 None
             };
-            (image, fallback, fallback_base, keys)
+            (image, fallback, fallback_base, keys, flip_target_known)
         };
         if image.is_none() {
             // Remember (or clear) the fallback winner so the next flip's
@@ -1150,10 +1169,9 @@ impl AgcGpuSession {
         // flip address in guest memory, not in any drawn target. Prefer it over
         // the most-content census fallback — but only when it has content, so an
         // empty scanout never regresses a drawn target to black.
-        let guest_has_content = guest_present
-            .as_ref()
-            .is_some_and(|img| img.pixels.iter().step_by(64).any(|&b| b != 0));
+        let guest_has_content = guest_present.as_ref().is_some_and(has_visible_content);
         let guest_hit = guest_has_content;
+        let fallback_hit = fallback.is_some();
         // RAEEN_TRACE_FLIP: does the buffer the title flipped to have drawn
         // content, and what render targets exist? Answers whether black frames
         // are a routing miss (content is in another target) or a genuinely
@@ -1161,12 +1179,53 @@ impl AgcGpuSession {
         if let Some(keys) = keys {
             tracing::info!(
                 scanout = format_args!("{address:#x}"),
-                had_content = image.is_some(),
+                target_known = flip_target_known,
+                target_visible = image.is_some(),
                 render_targets = ?keys,
                 "present_scanout: title flipped to this buffer"
             );
         }
         let flip_address_hit = image.is_some();
+        if !flip_address_hit && fallback_hit {
+            static ROUTING_WARNINGS: AtomicU64 = AtomicU64::new(0);
+            let occurrence = ROUTING_WARNINGS.fetch_add(1, Ordering::Relaxed) + 1;
+            if occurrence <= 8 || occurrence.is_power_of_two() {
+                warn!(
+                    occurrence,
+                    scanout = format_args!("{address:#x}"),
+                    scanout_target_known = flip_target_known,
+                    fallback_target = format_args!("{:#x}", fallback_base.unwrap_or(0)),
+                    "PRESENT ROUTING: flipped scanout has no visible colour; presenting a \
+                     content-bearing intermediate target (final copy/composite to scanout \
+                     is missing or still pending)"
+                );
+            }
+        }
+        if !flip_address_hit && !guest_has_content && !fallback_hit {
+            static BLACK_FRAME_WARNINGS: AtomicU64 = AtomicU64::new(0);
+            let occurrence = BLACK_FRAME_WARNINGS.fetch_add(1, Ordering::Relaxed) + 1;
+            if occurrence <= 8 || occurrence.is_power_of_two() {
+                let render_targets = self
+                    .framebuffers
+                    .lock()
+                    .keys()
+                    .map(|base| format!("{base:#x}"))
+                    .collect::<Vec<_>>();
+                warn!(
+                    occurrence,
+                    scanout = format_args!("{address:#x}"),
+                    scanout_target_known = flip_target_known,
+                    render_targets = ?render_targets,
+                    completed_draws = *self.draw_count.lock(),
+                    shader_skips = *self.shader_skip_count.lock(),
+                    shader_cache = ?self.shader_stats(),
+                    descriptor = ?*self.scanout_descriptor.lock(),
+                    "BLACK FRAME: the flipped scanout, guest-memory scanout, and every \
+                     available GPU render target contain no visible RGB colour; inspect \
+                     preceding draw/shader skip warnings (or a missing final GPU copy)"
+                );
+            }
+        }
         // Priority: a target drawn at the flip address; then the guest scanout
         // when it holds real pixels; then the census fallback; then the guest
         // scanout as a last resort even if empty.
@@ -1599,7 +1658,10 @@ impl AgcGpuSession {
         // is where the composite landed. `None` keeps the last-drawn baseline.
         let (flip_address_hit, scanout_image) = {
             let addr = *self.scanout_address.lock();
-            let at_flip_address = addr.and_then(|a| framebuffers.get(&a).cloned());
+            let at_flip_address = addr
+                .and_then(|a| framebuffers.get(&a))
+                .filter(|image| has_visible_content(image))
+                .cloned();
             let flip_address_hit = at_flip_address.is_some();
             let image = at_flip_address.or_else(|| {
                 // The title fills its VideoOut scanout buffer by a copy/DMA we do
@@ -1610,7 +1672,7 @@ impl AgcGpuSession {
                 // per target; only runs when the flip address has no drawn image.
                 framebuffers
                     .values()
-                    .map(|img| (img.pixels.iter().filter(|&&b| b != 0).count(), img))
+                    .map(|img| (visible_pixel_count(img, 1), img))
                     .filter(|(nonzero, _)| *nonzero > 0)
                     .max_by_key(|(nonzero, _)| *nonzero)
                     .map(|(_, img)| img.clone())
@@ -1634,7 +1696,7 @@ impl AgcGpuSession {
             // Present the VideoOut scanout buffer when the title has flipped to
             // one that has been drawn; otherwise fall back to the last-drawn
             // target (the pre-existing baseline).
-            let scanout_hit = scanout_image.is_some();
+            let scanout_hit = flip_address_hit;
             let presented = scanout_image.unwrap_or_else(|| image.clone());
             // sRGB-encode an HDR float target (SharpEmu #448) before it reaches
             // the RGBA8 present surface / PPM dump; 8-bit frames pass through.
@@ -2282,11 +2344,7 @@ fn maybe_dump_all_targets(targets: &[(u64, RenderedImage)], draw_index: u64) {
     }
     for (base, image) in targets {
         let bpp = image.bytes_per_pixel.max(1) as usize;
-        let non_black = image
-            .pixels
-            .chunks_exact(bpp)
-            .filter(|px| px.iter().take(3).any(|&b| b != 0))
-            .count();
+        let non_black = visible_pixel_count(image, 1);
         let path =
             std::path::Path::new(&dir).join(format!("target_{base:012x}_{draw_index:06}.ppm"));
         let mut ppm = format!("P6\n{} {}\n255\n", image.width, image.height).into_bytes();
@@ -2823,6 +2881,45 @@ mod tests {
         // Address 0 is not a flip target and is ignored.
         session.present_scanout(0, None);
         assert_eq!(session.last_image().unwrap().pixels, content.pixels);
+    }
+
+    /// A render-target entry at the flip address is not automatically a valid
+    /// frame. Minecraft keeps cleared scanout targets while drawing its UI to
+    /// an intermediate target; existence-only routing presented the cleared
+    /// buffer and suppressed the visible UI forever.
+    #[test]
+    fn black_flipped_target_falls_back_to_visible_intermediate_target() {
+        let session = AgcGpuSession::new(deny_memory());
+        let black_scanout = RenderedImage {
+            width: 2,
+            height: 1,
+            pixels: vec![0, 0, 0, 255, 0, 0, 0, 255],
+            bytes_per_pixel: 4,
+        };
+        let visible_ui = RenderedImage {
+            width: 2,
+            height: 1,
+            pixels: vec![0, 40, 0, 255, 0, 0, 90, 255],
+            bytes_per_pixel: 4,
+        };
+        session.framebuffers.lock().insert(0x1000, black_scanout);
+        session
+            .framebuffers
+            .lock()
+            .insert(0x2000, visible_ui.clone());
+
+        session.present_scanout(0x1000, None);
+
+        assert_eq!(
+            session.last_image().expect("fallback frame").pixels,
+            visible_ui.pixels,
+            "a cleared scanout must not suppress a visible intermediate target"
+        );
+        assert_eq!(
+            *session.fallback_present_base.lock(),
+            Some(0x2000),
+            "the content-bearing intermediate becomes the steady-state fallback"
+        );
     }
 
     /// The present hand-off shares ONE allocation end to end: the flush stores
