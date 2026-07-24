@@ -1194,22 +1194,12 @@ fn check_read_only_texture_type(
 /// - Type 8 is a 1D image; the Vulkan/SPIR-V path represents it as a height-1
 ///   2D image, matching the sampled-image path. Type 9 is native 2D, type 10
 ///   is a 3D volume.
-/// - Type 11 (Cube) and 13 (2DArray / NDArray) are admitted as a plain 2D
-///   storage image. Both the SPIR-V storage path
-///   ([`crate::shader::spirv`]'s `storage_texture_dim_format`, which maps
-///   `10 => 3D` and every other type to `SampledDim::Two`) and the host
-///   storage decode (`raeen-gpu` `read_storage_image`, which derives depth
-///   only for type 10 and treats everything else as depth 1) already collapse
-///   a non-3D UAV to a single depth-1 2D image by reading `type_()` — so the
-///   analysis-, SPIR-V- and bind-time views agree on `image2D` and nothing
-///   downstream builds a mismatched cube/array view. Measured: Minecraft's
-///   menu compute declares a type-13/11 storage image for the animated
-///   panorama skybox; rejecting it here aborted that compute shader, leaving
-///   the panorama BLACK while the sampled 2D menu UI (which never hits this
-///   gate) rendered. Admitting it as a 2D UAV binds layer 0 instead of
-///   erroring (M5: maximize geometry on screen, glitches OK — a multi-layer
-///   UAV surfaces only its first layer here, which is the intended
-///   approximation, not a hard limit).
+/// - Types 11 (Cube) and 13 (2DArray / NDArray) are represented as writable
+///   2D arrays. The SPIR-V declaration, three-component ImageStore coordinate,
+///   Vulkan view, per-layer upload/readback, and guest retile all preserve the
+///   array layer. Measured: Minecraft's menu compute assembles six
+///   1024x1024 panorama faces through this path; collapsing that descriptor to
+///   a plain 2D image left all six guest faces black.
 ///
 /// A genuinely-unsupported storage type (1DArray 12, 2DMsaa 14, 2DMsaaArray
 /// 15, or a poison descriptor) still errors by name so the coverage gap stays
@@ -5261,10 +5251,10 @@ mod tests {
         // Minecraft's menu compute declares a storage image of type 11 (Cube)
         // and 13 (2DArray/NDArray) for the animated panorama skybox. Rejecting
         // it aborted the compute shader and left the panorama BLACK. The gate
-        // now admits both: the SPIR-V storage path and the host storage decode
-        // both collapse a non-3D UAV to a depth-1 2D image, so binding it as a
-        // plain 2D storage image is consistent end-to-end. 8 (height-1)/9/10
-        // stay accepted; 12/14/15 stay refused so the coverage gap is visible.
+        // now admits both: the SPIR-V and Vulkan paths represent them as
+        // writable 2D arrays and preserve the third address component as the
+        // layer. 8 (height-1)/9/10 stay accepted; 12/14/15 stay refused so the
+        // coverage gap is visible.
         let with_type = |ty: u32| {
             let mut t = super::super::resources::ShaderTextureResource::default();
             t.fields[0] = 0x1000; // plausible base

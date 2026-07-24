@@ -31,7 +31,7 @@ use std::sync::OnceLock;
 
 pub use super::spirv::ShaderRecompileError;
 use super::spirv::{
-    SampledClass, SampledDim, Spirv, SpirvType, not_supported, operand_is_constant,
+    SampledClass, SampledDim, Spirv, SpirvType, SpirvValue, not_supported, operand_is_constant,
     operand_is_exec, operand_is_variable, operand_load_float, operand_load_int, operand_load_uint,
     operand_variable_to_str, operand_variable_to_str_shift, sampled_key_of, sampled_key_suffix,
     sampled_keys_present, spirv_generate_source, spirv_get_embedded_ps, spirv_get_embedded_vs,
@@ -55,6 +55,17 @@ pub enum SccCheck {
     OverflowAdd,
     OverflowSub,
     CarryOut,
+}
+
+/// Resolve one GFX10 MIMG address component. With no NSA payload, components
+/// are consecutive from VADDR as on GCN. With NSA, component zero still uses
+/// VADDR and components 1+ use the explicitly encoded VGPR byte array.
+fn mimg_address_value(inst: &ShaderInstruction, component: usize) -> SpirvValue {
+    if component > 0 && inst.mimg_nsa_dwords != 0 {
+        operand_variable_to_str_shift(inst.mimg_nsa_addr[component - 1], 0)
+    } else {
+        operand_variable_to_str_shift(inst.src[0], component as i32)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5055,8 +5066,8 @@ fn image_sample_channels(
                 MimgDescriptorClass::Sampled,
                 true,
             )?;
-            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
-            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
+            let src0_value0 = mimg_address_value(&inst, 0);
+            let src0_value1 = mimg_address_value(&inst, 1);
             let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
             let src2_value0 = operand_variable_to_str_shift(inst.src[2], 0);
 
@@ -5930,9 +5941,9 @@ fn image_sample_lzo_channels(
                 MimgDescriptorClass::Sampled,
                 true,
             )?;
-            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
-            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
-            let src0_value2 = operand_variable_to_str_shift(inst.src[0], 2);
+            let src0_value0 = mimg_address_value(&inst, 0);
+            let src0_value1 = mimg_address_value(&inst, 1);
+            let src0_value2 = mimg_address_value(&inst, 2);
             let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
             let src2_value0 = operand_variable_to_str_shift(inst.src[2], 0);
 
@@ -6155,11 +6166,11 @@ fn image_load_channels(
                 false,
             )?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
-            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
-            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
-            // The third address VGPR carries z (3D) or the array layer
-            // (2DArray); only referenced when the fetched T# is non-2D.
-            let src0_value2 = operand_variable_to_str_shift(inst.src[0], 2);
+            let src0_value0 = mimg_address_value(&inst, 0);
+            let src0_value1 = mimg_address_value(&inst, 1);
+            // The third address component carries z (3D) or the array layer
+            // (2DArray); NSA may name a non-consecutive VGPR.
+            let src0_value2 = mimg_address_value(&inst, 2);
             let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
 
             if dst_value0.type_ != SpirvType::Float
@@ -6203,13 +6214,20 @@ fn image_load_channels(
                     "OpCompositeConstruct %v2uint %t69_<index> %t71_<index>"
                 )
                 .to_string(),
-                SampledDim::TwoArray | SampledDim::Three => format!(
-                    "         %t72_<index> = OpLoad %float %{z}\n         \
-                     %t72u_<index> = OpBitcast %uint %t72_<index>\n         \
-                     %t73_<index> = OpCompositeConstruct %v3uint \
-                     %t69_<index> %t71_<index> %t72u_<index>",
-                    z = src0_value2.value
-                ),
+                SampledDim::TwoArray | SampledDim::Three if inst.src[0].size >= 3 => {
+                    format!(
+                        "         %t72_<index> = OpLoad %float %{z}\n         \
+                         %t72u_<index> = OpBitcast %uint %t72_<index>\n         \
+                         %t73_<index> = OpCompositeConstruct %v3uint \
+                         %t69_<index> %t71_<index> %t72u_<index>",
+                        z = src0_value2.value
+                    )
+                }
+                SampledDim::TwoArray | SampledDim::Three => concat!(
+                    "         %t73_<index> = OpCompositeConstruct %v3uint ",
+                    "%t69_<index> %t71_<index> %uint_0"
+                )
+                .to_string(),
                 SampledDim::Cube => {
                     return Err(not_supported(func, "texel fetch of a cube texture"));
                 }
@@ -6311,10 +6329,12 @@ fn recompile_image_load_dmask3(
 
 /// The integer texel-coordinate construction (`%t73_<index>`) for a
 /// storage-image (UAV) write: `v2uint (x, y)` for a 2D UAV, `v3uint
-/// (x, y, z)` for a 3D one — the third MIMG `Vaddr3` address VGPR carries
-/// z (round 7: ASTRO.BOT's 240x135x64 UAV volumes). The returned text
-/// still carries `<index>` placeholders; substitute `<coord>` before
-/// `<index>`.
+/// (x, y, z)` for a 3D one, and `v3uint (x, y, layer)` for a 2D array.
+/// When the instruction's GFX10 DIM supplies only x/y but the descriptor view
+/// is arrayed, z/layer is zero. The view's BASE_ARRAY selects the actual
+/// subresource (Minecraft's panorama-copy shader). A genuine DIM_2D_ARRAY or
+/// DIM_3D instruction carries the third address VGPR. The returned text still
+/// carries `<index>` placeholders; substitute `<coord>` before `<index>`.
 fn storage_image_coord_text(
     spirv: &Spirv<'_>,
     inst: &ShaderInstruction,
@@ -6333,9 +6353,9 @@ fn storage_image_coord_text(
         (SampledDim::Two, Some(8)) => {
             "         %t73_<index> = OpCompositeConstruct %v2uint %t69_<index> %uint_0".to_owned()
         }
-        (SampledDim::Three, _) => {
-            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
-            let src0_value2 = operand_variable_to_str_shift(inst.src[0], 2);
+        (SampledDim::TwoArray | SampledDim::Three, _) if inst.src[0].size >= 3 => {
+            let src0_value1 = mimg_address_value(inst, 1);
+            let src0_value2 = mimg_address_value(inst, 2);
             format!(
                 "         %t70_<index> = OpLoad %float %{y}\n         \
                  %t71_<index> = OpBitcast %uint %t70_<index>\n         \
@@ -6346,8 +6366,17 @@ fn storage_image_coord_text(
                 z = src0_value2.value
             )
         }
+        (SampledDim::TwoArray | SampledDim::Three, _) => {
+            let src0_value1 = mimg_address_value(inst, 1);
+            format!(
+                "         %t70_<index> = OpLoad %float %{y}\n         \
+                 %t71_<index> = OpBitcast %uint %t70_<index>\n         \
+                 %t73_<index> = OpCompositeConstruct %v3uint %t69_<index> %t71_<index> %uint_0",
+                y = src0_value1.value
+            )
+        }
         _ => {
-            let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
+            let src0_value1 = mimg_address_value(inst, 1);
             format!(
                 "         %t70_<index> = OpLoad %float %{y}\n         \
                  %t71_<index> = OpBitcast %uint %t70_<index>\n         \
@@ -6356,6 +6385,55 @@ fn storage_image_coord_text(
             )
         }
     })
+}
+
+/// Return the descriptor-array index for the storage T# already resolved by
+/// [`mimg_descriptor_guard`].
+///
+/// The guest SGPR still carries the rewritten descriptor dword 0 in the usual
+/// case, but it is not an unambiguous source when a sampled and a storage T#
+/// occupy the same register range. `WriteLocalVariables` must seed that shared
+/// SGPR twice and the later descriptor wins. Minecraft's panorama copy shader
+/// has exactly that shape at s24: the storage T# is followed in binding order
+/// by a sampled T#, so loading s24 indexed a one-element `%textures2D_L` with
+/// 1 and every image write was discarded. The guard has already proved which
+/// captured descriptor this instruction uses, so select its class-local host
+/// array slot directly.
+fn storage_descriptor_index_constant(
+    spirv: &Spirv<'_>,
+    matched: Option<usize>,
+    func: &'static str,
+) -> Result<String, ShaderRecompileError> {
+    let bind = spirv
+        .get_bind_info()
+        .ok_or_else(|| not_supported(func, "storage descriptor has no binding table"))?;
+    let matched =
+        matched.ok_or_else(|| not_supported(func, "storage descriptor was not resolved"))?;
+    let texture_num = usize::try_from(bind.textures2d.textures_num.max(0))
+        .unwrap_or(0)
+        .min(bind.textures2d.desc.len());
+    let Some(desc) = bind
+        .textures2d
+        .desc
+        .get(matched)
+        .filter(|_| matched < texture_num)
+    else {
+        return Err(not_supported(
+            func,
+            format!("storage descriptor index {matched} is outside the binding table"),
+        ));
+    };
+    if !desc.textures2d_without_sampler {
+        return Err(not_supported(
+            func,
+            format!("descriptor {matched} is sampled, not storage"),
+        ));
+    }
+    let class_index = bind.textures2d.desc[..matched]
+        .iter()
+        .filter(|d| d.textures2d_without_sampler)
+        .count() as u32;
+    Ok(spirv.get_constant_uint(class_index))
 }
 
 /// Beyond-Kyty: `image_store` with `dmask == 0x1` (single channel), measured
@@ -6387,12 +6465,8 @@ fn recompile_image_store_dmask1(
             )?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
-            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
 
-            if dst_value0.type_ != SpirvType::Float
-                || src0_value0.type_ != SpirvType::Float
-                || src1_value0.type_ != SpirvType::Uint
-            {
+            if dst_value0.type_ != SpirvType::Float || src0_value0.type_ != SpirvType::Float {
                 return Err(not_supported(FUNC, "unexpected operand types"));
             }
 
@@ -6400,8 +6474,7 @@ fn recompile_image_store_dmask1(
             // TODO() swizzle channels
 
             const TEXT: &str = r#"
-         %t24_<index> = OpLoad %uint %<src1_value0>
-         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageL %textures2D_L %t24_<index>
+         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageL %textures2D_L %<storage_index>
          %t27_<index> = OpLoad %ImageL %t26_<index>
          %t67_<index> = OpLoad %float %<src0_value0>
          %t69_<index> = OpBitcast %uint %t67_<index>
@@ -6411,11 +6484,12 @@ fn recompile_image_store_dmask1(
                OpImageWrite %t27_<index> %t73_<index> %t88_<index>
 "#;
             let coord = storage_image_coord_text(spirv, &inst, matched)?;
+            let storage_index = storage_descriptor_index_constant(spirv, matched, FUNC)?;
             *dst_source += &TEXT
                 .replace("<coord>", &coord)
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
-                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<storage_index>", &storage_index)
                 .replace("<dst_value0>", &dst_value0.value);
 
             return Ok(true);
@@ -6454,12 +6528,8 @@ fn recompile_image_store_dmask3(
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
             let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
-            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
 
-            if dst_value0.type_ != SpirvType::Float
-                || src0_value0.type_ != SpirvType::Float
-                || src1_value0.type_ != SpirvType::Uint
-            {
+            if dst_value0.type_ != SpirvType::Float || src0_value0.type_ != SpirvType::Float {
                 return Err(not_supported(FUNC, "unexpected operand types"));
             }
 
@@ -6467,8 +6537,7 @@ fn recompile_image_store_dmask3(
             // TODO() swizzle channels
 
             const TEXT: &str = r#"
-         %t24_<index> = OpLoad %uint %<src1_value0>
-         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageL %textures2D_L %t24_<index>
+         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageL %textures2D_L %<storage_index>
          %t27_<index> = OpLoad %ImageL %t26_<index>
          %t67_<index> = OpLoad %float %<src0_value0>
          %t69_<index> = OpBitcast %uint %t67_<index>
@@ -6479,11 +6548,12 @@ fn recompile_image_store_dmask3(
                OpImageWrite %t27_<index> %t73_<index> %t88_<index>
 "#;
             let coord = storage_image_coord_text(spirv, &inst, matched)?;
+            let storage_index = storage_descriptor_index_constant(spirv, matched, FUNC)?;
             *dst_source += &TEXT
                 .replace("<coord>", &coord)
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
-                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<storage_index>", &storage_index)
                 .replace("<dst_value0>", &dst_value0.value)
                 .replace("<dst_value1>", &dst_value1.value);
 
@@ -6524,13 +6594,9 @@ fn recompile_image_store_dmask_f(
 
             let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
 
-            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
             let src1_value2 = operand_variable_to_str_shift(inst.src[1], 2);
 
-            if dst_value0.type_ != SpirvType::Float
-                || src0_value0.type_ != SpirvType::Float
-                || src1_value0.type_ != SpirvType::Uint
-            {
+            if dst_value0.type_ != SpirvType::Float || src0_value0.type_ != SpirvType::Float {
                 return Err(not_supported(FUNC, "unexpected operand types"));
             }
 
@@ -6540,7 +6606,6 @@ fn recompile_image_store_dmask_f(
             // TODO() convert SRGB -> LINEAR if SRGB format was replaced with UNORM
 
             const TEXT: &str = r#"
-         %t24_<index> = OpLoad %uint %<src1_value0>
          %t25_<index> = OpLoad %uint %<src1_value2>
 		%t143_<index> = OpShiftRightLogical %uint %t25_<index> %uint_0
         %t145_<index> = OpBitwiseAnd %uint %t143_<index> %uint_0x00003fff
@@ -6548,7 +6613,7 @@ fn recompile_image_store_dmask_f(
         %t149_<index> = OpShiftRightLogical %uint %t25_<index> %uint_14
         %t150_<index> = OpBitwiseAnd %uint %t149_<index> %uint_0x00003fff
         %t151_<index> = OpIAdd %uint %t150_<index> %uint_1
-         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageL %textures2D_L %t24_<index>
+         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageL %textures2D_L %<storage_index>
          %t27_<index> = OpLoad %ImageL %t26_<index>
          %t67_<index> = OpLoad %float %<src0_value0>
          %t69_<index> = OpBitcast %uint %t67_<index>
@@ -6561,11 +6626,12 @@ fn recompile_image_store_dmask_f(
                OpImageWrite %t27_<index> %t73_<index> %t88_<index>
 "#;
             let coord = storage_image_coord_text(spirv, &inst, matched)?;
+            let storage_index = storage_descriptor_index_constant(spirv, matched, FUNC)?;
             *dst_source += &TEXT
                 .replace("<coord>", &coord)
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
-                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<storage_index>", &storage_index)
                 .replace("<src1_value2>", &src1_value2.value)
                 .replace("<dst_value0>", &dst_value0.value)
                 .replace("<dst_value1>", &dst_value1.value)
@@ -6595,6 +6661,15 @@ fn recompile_image_store_mip_dmask_f(
 
     if let Some(bind_info) = spirv.get_bind_info() {
         if bind_info.textures2d.textures2d_storage_num > 0 {
+            let matched = mimg_descriptor_guard(
+                index,
+                spirv,
+                code,
+                &inst,
+                FUNC,
+                MimgDescriptorClass::Storage,
+                false,
+            )?;
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
             let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
@@ -6604,13 +6679,9 @@ fn recompile_image_store_mip_dmask_f(
             let src0_value1 = operand_variable_to_str_shift(inst.src[0], 1);
             let src0_value2 = operand_variable_to_str_shift(inst.src[0], 2);
 
-            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
             let src1_value2 = operand_variable_to_str_shift(inst.src[1], 2);
 
-            if dst_value0.type_ != SpirvType::Float
-                || src0_value0.type_ != SpirvType::Float
-                || src1_value0.type_ != SpirvType::Uint
-            {
+            if dst_value0.type_ != SpirvType::Float || src0_value0.type_ != SpirvType::Float {
                 return Err(not_supported(FUNC, "unexpected operand types"));
             }
 
@@ -6620,7 +6691,6 @@ fn recompile_image_store_mip_dmask_f(
             // TODO() convert SRGB -> LINEAR if SRGB format was replaced with UNORM
 
             const TEXT: &str = r#"
-         %t24_<index> = OpLoad %uint %<src1_value0>
          %t25_<index> = OpLoad %uint %<src1_value2>
 		%t143_<index> = OpShiftRightLogical %uint %t25_<index> %uint_0
         %t145_<index> = OpBitwiseAnd %uint %t143_<index> %uint_0x00003fff
@@ -6628,7 +6698,7 @@ fn recompile_image_store_mip_dmask_f(
         %t149_<index> = OpShiftRightLogical %uint %t25_<index> %uint_14
         %t150_<index> = OpBitwiseAnd %uint %t149_<index> %uint_0x00003fff
         %t151_<index> = OpIAdd %uint %t150_<index> %uint_1
-         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageL %textures2D_L %t24_<index>
+         %t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageL %textures2D_L %<storage_index>
          %t27_<index> = OpLoad %ImageL %t26_<index>
          %t67_<index> = OpLoad %float %<src0_value0>
          %t69_<index> = OpBitcast %uint %t67_<index>
@@ -6646,12 +6716,13 @@ fn recompile_image_store_mip_dmask_f(
          %t88_<index> = OpCompositeConstruct %v4float %t84_<index> %t85_<index> %t86_<index> %t87_<index>
                OpImageWrite %t27_<index> %t172_<index> %t88_<index>
 "#;
+            let storage_index = storage_descriptor_index_constant(spirv, matched, FUNC)?;
             *dst_source += &TEXT
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
                 .replace("<src0_value1>", &src0_value1.value)
                 .replace("<src0_value2>", &src0_value2.value)
-                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<storage_index>", &storage_index)
                 .replace("<src1_value2>", &src1_value2.value)
                 .replace("<dst_value0>", &dst_value0.value)
                 .replace("<dst_value1>", &dst_value1.value)
@@ -8355,9 +8426,7 @@ fn recompile_vcmpx_xxx_i32(
     if dst_value0.type_ != SpirvType::Uint {
         return Err(not_supported(FUNC, "dst is not uint"));
     }
-    if operand_is_exec(inst.dst) {
-        return Err(not_supported(FUNC, "exec destination"));
-    }
+    let exec_only = operand_is_exec(inst.dst);
 
     let mut load0 = String::new();
     let mut load1 = String::new();
@@ -8369,23 +8438,33 @@ fn recompile_vcmpx_xxx_i32(
         return Ok(false);
     }
 
-    // TODO() check VSKIP
-    // TODO() check EXEC
+    // GFX10 VCMPX is EXEC-only; legacy encodings also write their scalar
+    // destination. In either case an already-disabled lane must stay disabled,
+    // so intersect the comparison with the current EXEC value.
+    let destination = if exec_only {
+        String::new()
+    } else {
+        format!(
+            "          OpStore %{} %t6_<index>\n          OpStore %{} %uint_0",
+            dst_value0.value, dst_value1.value
+        )
+    };
 
     const TEXT: &str = r#"
           <load0>
           <load1>
           %t2_<index> = <param> %bool %t0_<index> %t1_<index>
-          %t3_<index> = OpSelect %uint %t2_<index> %uint_1 %uint_0
-          OpStore %<dst0> %t3_<index>
-          OpStore %<dst1> %uint_0
-          OpStore %exec_lo %t3_<index>
+          %t3_<index> = OpLoad %uint %exec_lo
+          %t4_<index> = OpINotEqual %bool %t3_<index> %uint_0
+          %t5_<index> = OpLogicalAnd %bool %t2_<index> %t4_<index>
+          %t6_<index> = OpSelect %uint %t5_<index> %uint_1 %uint_0
+          <destination>
+          OpStore %exec_lo %t6_<index>
           OpStore %exec_hi %uint_0
           <execz>
 "#;
     *dst_source += &TEXT
-        .replace("<dst0>", &dst_value0.value)
-        .replace("<dst1>", &dst_value1.value)
+        .replace("<destination>", &destination)
         .replace("<load0>", &load0)
         .replace("<load1>", &load1)
         .replace("<param>", param[0].unwrap_or(""))
@@ -8421,9 +8500,7 @@ fn recompile_vcmpx_xxx_u32(
     if dst_value0.type_ != SpirvType::Uint {
         return Err(not_supported(FUNC, "dst is not uint"));
     }
-    if operand_is_exec(inst.dst) {
-        return Err(not_supported(FUNC, "exec destination"));
-    }
+    let exec_only = operand_is_exec(inst.dst);
 
     let mut load0 = String::new();
     let mut load1 = String::new();
@@ -8435,23 +8512,32 @@ fn recompile_vcmpx_xxx_u32(
         return Ok(false);
     }
 
-    // TODO() check VSKIP
-    // TODO() check EXEC
+    // GFX10 VCMPX is EXEC-only; legacy encodings also write their scalar
+    // destination. Preserve inactive lanes across consecutive comparisons.
+    let destination = if exec_only {
+        String::new()
+    } else {
+        format!(
+            "          OpStore %{} %t6_<index>\n          OpStore %{} %uint_0",
+            dst_value0.value, dst_value1.value
+        )
+    };
 
     const TEXT: &str = r#"
           <load0>
           <load1>
           %t2_<index> = <param> %bool %t0_<index> %t1_<index>
-          %t3_<index> = OpSelect %uint %t2_<index> %uint_1 %uint_0
-          OpStore %<dst0> %t3_<index>
-          OpStore %<dst1> %uint_0
-          OpStore %exec_lo %t3_<index>
+          %t3_<index> = OpLoad %uint %exec_lo
+          %t4_<index> = OpINotEqual %bool %t3_<index> %uint_0
+          %t5_<index> = OpLogicalAnd %bool %t2_<index> %t4_<index>
+          %t6_<index> = OpSelect %uint %t5_<index> %uint_1 %uint_0
+          <destination>
+          OpStore %exec_lo %t6_<index>
           OpStore %exec_hi %uint_0
           <execz>
 "#;
     *dst_source += &TEXT
-        .replace("<dst0>", &dst_value0.value)
-        .replace("<dst1>", &dst_value1.value)
+        .replace("<destination>", &destination)
         .replace("<load0>", &load0)
         .replace("<load1>", &load1)
         .replace("<param>", param[0].unwrap_or(""))
@@ -8486,9 +8572,7 @@ fn recompile_vcmpx_xxx_f32(
     if dst_value0.type_ != SpirvType::Uint {
         return Err(not_supported(FUNC, "dst is not uint"));
     }
-    if operand_is_exec(inst.dst) {
-        return Err(not_supported(FUNC, "exec destination"));
-    }
+    let exec_only = operand_is_exec(inst.dst);
 
     let mut load0 = String::new();
     let mut load1 = String::new();
@@ -8500,23 +8584,32 @@ fn recompile_vcmpx_xxx_f32(
         return Ok(false);
     }
 
-    // TODO() check VSKIP
-    // TODO() check EXEC
+    // GFX10 VCMPX is EXEC-only; legacy encodings also write their scalar
+    // destination. Preserve inactive lanes across consecutive comparisons.
+    let destination = if exec_only {
+        String::new()
+    } else {
+        format!(
+            "          OpStore %{} %t6_<index>\n          OpStore %{} %uint_0",
+            dst_value0.value, dst_value1.value
+        )
+    };
 
     const TEXT: &str = r#"
           <load0>
           <load1>
           %t2_<index> = <param> %bool %t0_<index> %t1_<index>
-          %t3_<index> = OpSelect %uint %t2_<index> %uint_1 %uint_0
-          OpStore %<dst0> %t3_<index>
-          OpStore %<dst1> %uint_0
-          OpStore %exec_lo %t3_<index>
+          %t3_<index> = OpLoad %uint %exec_lo
+          %t4_<index> = OpINotEqual %bool %t3_<index> %uint_0
+          %t5_<index> = OpLogicalAnd %bool %t2_<index> %t4_<index>
+          %t6_<index> = OpSelect %uint %t5_<index> %uint_1 %uint_0
+          <destination>
+          OpStore %exec_lo %t6_<index>
           OpStore %exec_hi %uint_0
           <execz>
 "#;
     *dst_source += &TEXT
-        .replace("<dst0>", &dst_value0.value)
-        .replace("<dst1>", &dst_value1.value)
+        .replace("<destination>", &destination)
         .replace("<load0>", &load0)
         .replace("<load1>", &load1)
         .replace("<param>", param[0].unwrap_or(""))
@@ -12912,6 +13005,123 @@ mod tests {
         let _ = spirv_run(&source).expect("assemble 3D storage image_store");
     }
 
+    /// Minecraft's panorama builder uses DIM_2D and selects one face through
+    /// T#.BASE_ARRAY. The type-13 view remains arrayed, but the SPIR-V layer
+    /// coordinate must be zero instead of loading the unrelated vaddr+2.
+    #[test]
+    fn minecraft_dim2d_store_to_array_view_synthesizes_zero_layer() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF020_0108, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_store dmask1");
+        // Minecraft binds sampled s0, storage s24, then sampled s24. The last
+        // descriptor therefore overwrites the shared s24 local during the
+        // prolog; the store must use the storage descriptor resolved by the
+        // guard, not reload that ambiguous SGPR.
+        code.get_instructions_mut()[0].src[1].register_id = 24;
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.textures2d.textures_num = 3;
+        input_info.bind.textures2d.textures2d_sampled_num = 2;
+        input_info.bind.textures2d.textures2d_storage_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 0;
+        input_info.bind.textures2d.desc[0].texture.fields[3] |= 9 << 28;
+        input_info.bind.textures2d.desc[1].start_register = 24;
+        input_info.bind.textures2d.desc[1].textures2d_without_sampler = true;
+        input_info.bind.textures2d.desc[1].texture.fields[3] |= 13 << 28;
+        input_info.bind.textures2d.desc[2].start_register = 24;
+        input_info.bind.textures2d.desc[2].texture.fields[3] |= 9 << 28;
+        crate::shader::analysis::shader_calc_binding_indices(&mut input_info.bind);
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile array storage image_store");
+        assert!(
+            source.contains("OpTypeImage %float 2D 0 1 0 2 Rgba8"),
+            "{source}"
+        );
+        assert!(
+            source.contains("OpCompositeConstruct %v3uint %t69_0 %t71_0 %uint_0"),
+            "DIM_2D must address layer zero within the BASE_ARRAY view:\n{source}"
+        );
+        assert!(
+            !source.contains("OpLoad %float %v2"),
+            "vaddr+2 is not part of DIM_2D:\n{source}"
+        );
+        assert!(
+            source.contains("OpAccessChain %_ptr_UniformConstant_ImageL %textures2D_L %uint_0"),
+            "the storage T# is %textures2D_L[0], even though sampled s24 seeds \
+             the shared local last:\n{source}"
+        );
+        assert!(
+            !source.contains("OpLoad %uint %s24"),
+            "the store must not reload the class-ambiguous s24 local:\n{source}"
+        );
+        let _ = spirv_run(&source).expect("assemble array storage image_store");
+    }
+
+    #[test]
+    fn minecraft_nsa_image_load_uses_explicit_y_vgpr() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF000_0F0A, 0x0000_0003, 0x0000_0000, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse Minecraft NSA image_load");
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 32;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 0;
+        input_info.bind.textures2d.desc[0].texture.fields[3] |= 13 << 28;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile Minecraft NSA image_load");
+        assert!(
+            source.contains("OpLoad %float %v0"),
+            "NSA byte zero explicitly names v0 as the Y coordinate:\n{source}"
+        );
+        assert!(
+            source.contains("OpCompositeConstruct %v3uint %t69_0 %t71_0 %uint_0"),
+            "DIM_2D uses x/y plus layer zero in the array view:\n{source}"
+        );
+        let _ = spirv_run(&source).expect("assemble NSA image_load");
+    }
+
+    #[test]
+    fn image_store_dim2darray_keeps_vgpr_layer_coordinate() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF020_0118, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse DIM_2D_ARRAY image_store");
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_storage_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 4;
+        input_info.bind.textures2d.desc[0].textures2d_without_sampler = true;
+        input_info.bind.textures2d.desc[0].texture.fields[3] |= 13 << 28;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile DIM_2D_ARRAY image_store");
+        assert!(
+            source.contains("OpLoad %float %v2"),
+            "DIM_2D_ARRAY must load vaddr+2 as the layer:\n{source}"
+        );
+        let _ = spirv_run(&source).expect("assemble array storage image_store");
+    }
+
     /// Live ASTRO.BOT table-1 UAV: type 8 (1D, represented as height-1 2D)
     /// with unified format 77 (32_32_32_32 FLOAT). Its SPIR-V declaration
     /// must be Rgba32f, not the old four-byte Rgba8 fallback.
@@ -13068,6 +13278,55 @@ mod tests {
             Some("OpFOrdLessThan"),
             "VCmpxLtF32 must stay ordered <"
         );
+    }
+
+    #[test]
+    fn gfx10_vcmpx_preserves_vcc_and_intersects_current_exec() {
+        // Minecraft's panorama/cubemap copy shader loads {width,height} into
+        // VCC, then uses two consecutive GFX10 VCMPX comparisons. The first
+        // reads VCC_HI and the second reads VCC_LO. GFX10 VCMPX is EXEC-only:
+        // writing VCC after the first comparison turns the second bound into
+        // the float bit-pattern 0/1 and leaves no useful lanes.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0x7c28_046b, // v_cmpx_gt_f32 exec, vcc_hi, v2
+                0x7c28_026a, // v_cmpx_gt_f32 exec, vcc_lo, v1
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse consecutive GFX10 VCMPX");
+        assert!(
+            code.get_instructions()[..2]
+                .iter()
+                .all(|inst| inst.dst.type_ == ShaderOperandType::ExecLo),
+            "the Gen5 decoder must route VCMPX to EXEC, not VCC"
+        );
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile consecutive GFX10 VCMPX");
+        assert!(
+            source.contains("OpLoad %uint %vcc_hi")
+                && source.contains("OpLoad %uint %vcc_lo")
+                && source.matches("OpBitcast %float").count() >= 2,
+            "both preserved bounds must remain readable:\n{source}"
+        );
+        assert!(
+            !source.contains("OpStore %vcc_lo %t6_") && !source.contains("OpStore %vcc_hi %uint_0"),
+            "GFX10 VCMPX must not overwrite VCC:\n{source}"
+        );
+        assert!(
+            source.matches("OpLogicalAnd %bool").count() >= 2,
+            "each comparison must intersect its predicate with current EXEC:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble GFX10 VCMPX");
+        naga_parse_and_validate(&words, "gfx10_vcmpx_exec_only");
     }
 
     #[test]

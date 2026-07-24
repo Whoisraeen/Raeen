@@ -1388,6 +1388,25 @@ fn decode_texture(
             );
         }
     }
+    if (cube || array) && std::env::var_os("RAEEN_TRACE_TEXTURES").is_some() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static LAYERED_SEEN: AtomicU32 = AtomicU32::new(0);
+        if LAYERED_SEEN.fetch_add(1, Ordering::Relaxed) < 24 {
+            let non_zero = pixels.iter().filter(|&&byte| byte != 0).count();
+            tracing::info!(
+                base = format_args!("{:#x}", t.base40()),
+                texture_type = t.type_(),
+                extent = format_args!("{width}x{height}x{layers}"),
+                format = t.format(),
+                tile_mode = t.tile_mode(),
+                bytes = pixels.len(),
+                non_zero,
+                cube,
+                array,
+                "layered sampled texture decoded"
+            );
+        }
+    }
     Ok(TextureUpload {
         width,
         height,
@@ -1480,7 +1499,11 @@ fn storage_image_format_is_32bpp(format: u16) -> bool {
 /// Read one storage-image (UAV) T#'s extent and initial guest content.
 ///
 /// A type-10 T# is a 3D UAV (`depth` slices back to back — measured:
-/// ASTRO.BOT's 240x135x64 format-71 volumes); format 71 uploads as
+/// ASTRO.BOT's 240x135x64 format-71 volumes). Types 11/13 are writable
+/// 2D-array views spanning `BASE_ARRAY..=LAST_ARRAY` (the latter is exposed
+/// by `depth()`). Minecraft builds its panorama with six one-layer views:
+/// base/last 0/0 through 5/5.
+/// Format 71 uploads as
 /// `R16G16B16A16_SFLOAT` (8 B/texel), format 77 as
 /// `R32G32B32A32_SFLOAT` (16 B/texel), matching the recompiled storage-image
 /// format. Everything else keeps the RGBA8 view. The content is a
@@ -1497,12 +1520,23 @@ fn read_storage_image(
     } else {
         1
     };
+    let array = matches!(t.type_(), 11 | 13);
+    let base_array = if array { u32::from(t.base_array5()) } else { 0 };
+    let last_array = u32::from(t.depth());
+    let layers = if array {
+        last_array
+            .checked_sub(base_array)
+            .map_or(0, |last_from_base| last_from_base + 1)
+    } else {
+        1
+    };
     if !(1..=16384).contains(&width)
         || !(1..=16384).contains(&height)
         || !(1..=2048).contains(&depth)
+        || !(1..=2048).contains(&layers)
     {
         return Err(err(format!(
-            "storage image extent {width}x{height}x{depth} out of range"
+            "storage image extent {width}x{height}x{depth}x{layers} out of range"
         )));
     }
     // Must agree with `kyty-graphics` `storage_texture_dim_format` (which
@@ -1512,13 +1546,69 @@ fn read_storage_image(
         77 => (vk::Format::R32G32B32A32_SFLOAT, 16u64),
         _ => (vk::Format::R8G8B8A8_UNORM, 4u64),
     };
-    let size = u64::from(width) * u64::from(height) * u64::from(depth) * texel;
-    let base = t.base40();
+    let size = u64::from(width) * u64::from(height) * u64::from(depth) * u64::from(layers) * texel;
+    let allocation_base = t.base40();
+    let linear_layer_bytes = u64::from(width) * u64::from(height) * texel;
+    let guest_layer_bytes = if array && t.tile_mode() != 0 {
+        crate::texture::tiling::tiled_byte_count_for_mode(
+            t.tile_mode(),
+            width,
+            height,
+            (texel as u32).trailing_zeros(),
+        )
+        .map_or(linear_layer_bytes, u64::from)
+    } else {
+        linear_layer_bytes
+    };
+    let base =
+        allocation_base.saturating_add(guest_layer_bytes.saturating_mul(u64::from(base_array)));
     let readable = matches!(t.format(), 71 | 77) || storage_image_format_is_32bpp(t.format());
     let pixels = if readable {
-        // Linear read: UAV surfaces the title dispatches into are addressed
-        // by the shader itself, so no de-tiling is applied to the seed.
-        read_guest_bytes(base, size, "storage image").ok()
+        if depth > 1 || t.tile_mode() == 0 {
+            read_guest_bytes(base, size, "storage image").ok()
+        } else if crate::texture::tiling::swizzle_table(t.tile_mode()).is_some() {
+            // Storage arrays are guest-visible tiled surfaces just like the
+            // sampled view that consumes them later. Detile every layer before
+            // uploading it to the host storage image; writeback performs the
+            // exact inverse. This is the path Minecraft uses to assemble its
+            // six 1024x1024 panorama faces.
+            let bpp_log2 = (texel as u32).trailing_zeros();
+            let face_tiled = crate::texture::tiling::tiled_byte_count_for_mode(
+                t.tile_mode(),
+                width,
+                height,
+                bpp_log2,
+            )
+            .expect("guarded by swizzle_table") as usize;
+            let face_linear = (u64::from(width) * u64::from(height) * texel) as usize;
+            read_guest_bytes(
+                base,
+                (face_tiled as u64).saturating_mul(u64::from(layers)),
+                "storage image",
+            )
+            .ok()
+            .and_then(|tiled| {
+                let mut linear = alloc_zeroed(
+                    face_linear.saturating_mul(layers as usize),
+                    "linear storage-image array",
+                )
+                .ok()?;
+                for layer in 0..layers as usize {
+                    let face = crate::texture::tiling::detile_64kb(
+                        t.tile_mode(),
+                        &tiled[layer * face_tiled..(layer + 1) * face_tiled],
+                        width,
+                        height,
+                        bpp_log2,
+                    )
+                    .expect("table-checked above");
+                    linear[layer * face_linear..(layer + 1) * face_linear].copy_from_slice(&face);
+                }
+                Some(linear)
+            })
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -1530,7 +1620,7 @@ fn read_storage_image(
             if !WARNED.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
                     base = format_args!("{base:#x}"),
-                    extent = format_args!("{width}x{height}x{depth}"),
+                    extent = format_args!("{width}x{height}x{depth}x{layers}"),
                     format = t.format(),
                     readable,
                     "storage image initial content unavailable (unknown format \
@@ -1543,14 +1633,88 @@ fn read_storage_image(
             alloc_zeroed(size as usize, "storage image seed")?
         }
     };
+    if matches!(t.type_(), 11 | 13) && std::env::var_os("RAEEN_TRACE_TEXTURES").is_some() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static LAYERED_STORAGE_SEEN: AtomicU32 = AtomicU32::new(0);
+        if LAYERED_STORAGE_SEEN.fetch_add(1, Ordering::Relaxed) < 24 {
+            tracing::info!(
+                base = format_args!("{base:#x}"),
+                allocation_base = format_args!("{allocation_base:#x}"),
+                texture_type = t.type_(),
+                base_array,
+                last_array,
+                descriptor_depth = u32::from(t.depth()) + 1,
+                extent = format_args!("{width}x{height}x{depth}x{layers}"),
+                format = t.format(),
+                tile_mode = t.tile_mode(),
+                bytes = pixels.len(),
+                non_zero = pixels.iter().any(|&byte| byte != 0),
+                "layered storage texture decoded for a 2D-array UAV"
+            );
+        }
+    }
     Ok(StorageImageUpload {
         width,
         height,
         depth,
+        layers,
+        array,
+        tile_mode: t.tile_mode(),
         format,
         pixels,
         guest_base: base,
     })
+}
+
+/// Convert a linear host storage-image readback back to the guest descriptor's
+/// swizzled layout. The inverse is performed in [`read_storage_image`].
+fn encode_storage_image_writeback(
+    width: u32,
+    height: u32,
+    depth: u32,
+    layers: u32,
+    tile_mode: u8,
+    texel: u32,
+    linear: &[u8],
+) -> Result<Vec<u8>, DrawError> {
+    if depth > 1 || tile_mode == 0 {
+        let mut guest = alloc_zeroed(linear.len(), "linear storage-image writeback")?;
+        guest.copy_from_slice(linear);
+        return Ok(guest);
+    }
+    let bpp_log2 = texel.trailing_zeros();
+    let face_linear = width as usize * height as usize * texel as usize;
+    let expected = face_linear.saturating_mul(layers as usize);
+    if linear.len() < expected {
+        return Err(err(format!(
+            "storage image readback is {} B, smaller than {width}x{height}x{layers}x{texel} \
+             ({expected} B)",
+            linear.len()
+        )));
+    }
+    let face_tiled =
+        crate::texture::tiling::tiled_byte_count_for_mode(tile_mode, width, height, bpp_log2)
+            .ok_or_else(|| {
+                err(format!(
+                    "storage-image writeback tile mode {tile_mode} not implemented"
+                ))
+            })? as usize;
+    let mut tiled = alloc_zeroed(
+        face_tiled.saturating_mul(layers as usize),
+        "storage image tiled writeback",
+    )?;
+    for layer in 0..layers as usize {
+        let face = &linear[layer * face_linear..(layer + 1) * face_linear];
+        let output = &mut tiled[layer * face_tiled..(layer + 1) * face_tiled];
+        if !crate::texture::tiling::tile_64kb_into(tile_mode, face, output, width, height, bpp_log2)
+        {
+            return Err(err(format!(
+                "storage-image writeback tile mode {tile_mode} could not encode \
+                 {width}x{height} layer {layer}"
+            )));
+        }
+    }
+    Ok(tiled)
 }
 
 /// What the texture-decode path may consult about live render targets while
@@ -1675,6 +1839,23 @@ fn render_target_pixels(base: u64, width: u32, height: u32) -> Option<Vec<u8>> {
     })
 }
 
+/// Whether a decoded sampled texture can be replaced by the CPU framebuffer
+/// snapshot at the same guest base.
+///
+/// The framebuffer map contains one plain 2D attachment. It cannot stand in for
+/// a cube, array, or volume even when the first face happens to share the same
+/// base and extent. Minecraft exposed the consequence: a six-face 1024x1024
+/// cube (24 MiB) was replaced with one 4 MiB render-target snapshot while
+/// retaining `layers == 6`, so `vkCmdCopyBufferToImage` read past the staging
+/// buffer and reset the device.
+fn can_replace_with_render_target_pixels(upload: &TextureUpload) -> bool {
+    upload.render_target.is_none()
+        && !upload.cube
+        && !upload.array
+        && upload.layers == 1
+        && upload.depth == 1
+}
+
 /// The byte size a V# addresses, per GNM/RDNA V# semantics: `stride == 0`
 /// means a RAW buffer whose `num_records` IS the size in bytes; otherwise
 /// the size is records × stride (shadPS4 `video_core/amdgpu/resource.h`
@@ -1766,14 +1947,24 @@ fn expected_sampled_bytes(t: &kyty_graphics::shader::ShaderTextureResource) -> u
         .saturating_mul(extent)
 }
 
-/// Expected initial-content byte size of one storage-image (UAV) T#: the linear
-/// volume `width * height * depth * texel` (`texel` = 8 for format 71 RGBA16F,
-/// 16 for format 77 RGBA32F, else 4), matching `read_storage_image`.
+/// Expected linear byte size of one storage-image (UAV) T#:
+/// `width * height * depth * layers * texel` (`texel` = 8 for format 71
+/// RGBA16F, 16 for format 77 RGBA32F, else 4), matching
+/// `read_storage_image`.
 fn expected_storage_image_bytes(t: &kyty_graphics::shader::ShaderTextureResource) -> u64 {
     let width = u64::from(u32::from(t.width5()) + 1);
     let height = u64::from(u32::from(t.height5()) + 1);
     let depth = if t.type_() == 10 {
         u64::from(u32::from(t.depth()) + 1)
+    } else {
+        1
+    };
+    let layers = if matches!(t.type_(), 11 | 13) {
+        u64::from(
+            u32::from(t.depth())
+                .checked_sub(u32::from(t.base_array5()))
+                .map_or(0, |last_from_base| last_from_base + 1),
+        )
     } else {
         1
     };
@@ -1785,6 +1976,7 @@ fn expected_storage_image_bytes(t: &kyty_graphics::shader::ShaderTextureResource
     width
         .saturating_mul(height)
         .saturating_mul(depth)
+        .saturating_mul(layers)
         .saturating_mul(texel)
 }
 
@@ -2158,7 +2350,7 @@ fn prepare_stage_binding(
             // CPU fallback for what the direct binding cannot serve (the
             // draw's own target — a feedback loop — or an extent/format
             // mismatch): substitute the framebuffer map's rendered pixels.
-            if decoded.render_target.is_none()
+            if can_replace_with_render_target_pixels(&decoded)
                 && let Some(px) =
                     render_target_pixels(desc.texture.base40(), decoded.width, decoded.height)
             {
@@ -2915,8 +3107,30 @@ impl OffscreenDrawSink<'_> {
         // flush (end of submission, presentation, or a feedback fallback).
         // `Ok(Some(image))` is the immediate-fallback path (readback now),
         // preserving the old per-draw behaviour.
-        let immediate = crate::vulkan::offscreen::render_draw_deferred(self.dev, &state)
-            .map_err(|e| err(format!("offscreen draw failed: {e}")))?;
+        let immediate =
+            crate::vulkan::offscreen::render_draw_deferred(self.dev, &state).map_err(|e| {
+                let depth = state.depth.as_ref().map(|d| {
+                    (
+                        d.target_base,
+                        d.format,
+                        d.test_enable,
+                        d.write_enable,
+                        d.stencil_test_enable,
+                    )
+                });
+                err(format!(
+                    "offscreen draw failed: {e}; vs={vs_addr:#x} ps={ps_addr:#x} \
+                     target={rt_base:#x} {}x{} format={:?} prim={} vertices={} indexed={} \
+                     depth={depth:?} stage_bindings={}",
+                    state.width,
+                    state.height,
+                    state.format,
+                    ucfg.prim_type,
+                    state.vertex_count,
+                    index.is_some(),
+                    state.stage_bindings.len()
+                ))
+            })?;
         drop(state);
         match immediate {
             Some(image) => {
@@ -3073,6 +3287,42 @@ impl DrawSink for OffscreenDrawSink<'_> {
         let prepared = has_binding
             .then(|| prepare_stage_binding(bind, vk::ShaderStageFlags::COMPUTE))
             .transpose()?;
+        if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() && bind.textures2d.textures_num != 0 {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SEEN: AtomicU32 = AtomicU32::new(0);
+            if SEEN.fetch_add(1, Ordering::Relaxed) < 24 {
+                let push_dwords = prepared
+                    .as_ref()
+                    .map(|binding| {
+                        binding
+                            .push_constants
+                            .chunks_exact(4)
+                            .map(|field| u32::from_le_bytes(field.try_into().unwrap()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                tracing::warn!(
+                    cs_addr = format_args!("{:#x}", cs.cs_regs.data_addr),
+                    groups = format_args!("{}x{}x{}", groups[0], groups[1], groups[2]),
+                    threads = format_args!(
+                        "{}x{}x{}",
+                        cs.cs_regs.num_thread_x,
+                        cs.cs_regs.num_thread_y,
+                        cs.cs_regs.num_thread_z
+                    ),
+                    push_constant_offset = bind.push_constant_offset,
+                    push_constant_size = bind.push_constant_size,
+                    storage_buffers = bind.storage_buffers.buffers_num,
+                    textures = bind.textures2d.textures_num,
+                    sampled_images = bind.textures2d.textures2d_sampled_num,
+                    storage_images = bind.textures2d.textures2d_storage_num,
+                    samplers = bind.samplers.samplers_num,
+                    direct_sgprs = bind.direct_sgprs.sgprs_num,
+                    push_dwords = ?push_dwords,
+                    "TRACE_DRAWS: compute binding ABI"
+                );
+            }
+        }
         let storage_num = usize::try_from(bind.storage_buffers.buffers_num)
             .map_err(|_| err("negative compute storage-buffer count"))?;
         if storage_num > bind.storage_buffers.buffers.len() {
@@ -3095,14 +3345,24 @@ impl DrawSink for OffscreenDrawSink<'_> {
         // (guest base, width, height, vk format) per output image, in the same
         // order `ComputeOutputs::images` returns them — carries enough to
         // register a content-bearing writeback as a presentable census entry.
-        let guest_image_outputs: Vec<(u64, u32, u32, vk::Format)> = prepared
+        let guest_image_outputs: Vec<(u64, u32, u32, u32, u32, u8, vk::Format)> = prepared
             .as_ref()
             .and_then(|binding| binding.storage_images.as_ref())
             .map(|images| {
                 images
                     .images
                     .iter()
-                    .map(|img| (img.guest_base, img.width, img.height, img.format))
+                    .map(|img| {
+                        (
+                            img.guest_base,
+                            img.width,
+                            img.height,
+                            img.depth,
+                            img.layers,
+                            img.tile_mode,
+                            img.format,
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -3181,6 +3441,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
                     addr = format_args!("{addr:#x}"),
                     len = bytes.len(),
                     nonzero,
+                    head = format_args!("{:02x?}", &bytes[..bytes.len().min(32)]),
                     "TRACE_DRAWS: compute writeback"
                 );
             }
@@ -3192,7 +3453,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 )));
             }
         }
-        for ((addr, img_w, img_h, img_format), bytes) in
+        for ((addr, img_w, img_h, img_depth, img_layers, tile_mode, img_format), bytes) in
             guest_image_outputs.into_iter().zip(outputs.images)
         {
             let nonzero = bytes.iter().any(|&b| b != 0);
@@ -3244,11 +3505,19 @@ impl DrawSink for OffscreenDrawSink<'_> {
                     );
                 }
             }
-            if !crate::guest_mem::write_bytes_checked(addr, &bytes) {
+            let texel = match img_format {
+                vk::Format::R16G16B16A16_SFLOAT => 8,
+                vk::Format::R32G32B32A32_SFLOAT => 16,
+                _ => 4,
+            };
+            let guest_bytes = encode_storage_image_writeback(
+                img_w, img_h, img_depth, img_layers, tile_mode, texel, &bytes,
+            )?;
+            if !crate::guest_mem::write_bytes_checked(addr, &guest_bytes) {
                 return Err(err(format!(
                     "compute storage-image writeback range {addr:#x}..{:#x} is not writable \
                      guest memory",
-                    addr.saturating_add(bytes.len() as u64)
+                    addr.saturating_add(guest_bytes.len() as u64)
                 )));
             }
         }
@@ -4635,6 +4904,41 @@ mod tests {
         assert_eq!((tex.width, tex.height), (1, 1));
     }
 
+    fn replacement_candidate(cube: bool, array: bool, layers: u32, depth: u32) -> TextureUpload {
+        TextureUpload {
+            width: 8,
+            height: 8,
+            format: vk::Format::R8G8B8A8_UNORM,
+            pixels: vec![0; 8 * 8 * 4],
+            layers,
+            cube,
+            array,
+            depth,
+            render_target: None,
+            guest_base: 0x1000,
+            sample_hash: 1,
+            cached: false,
+        }
+    }
+
+    /// A framebuffer entry is one 2D attachment, never an alias for every face
+    /// of a cube/array or every slice of a volume.
+    #[test]
+    fn render_target_pixel_fallback_only_accepts_plain_2d_uploads() {
+        assert!(can_replace_with_render_target_pixels(
+            &replacement_candidate(false, false, 1, 1)
+        ));
+        assert!(!can_replace_with_render_target_pixels(
+            &replacement_candidate(true, false, 6, 1)
+        ));
+        assert!(!can_replace_with_render_target_pixels(
+            &replacement_candidate(false, true, 1, 1)
+        ));
+        assert!(!can_replace_with_render_target_pixels(
+            &replacement_candidate(false, false, 1, 4)
+        ));
+    }
+
     /// The COLOUR-BUFFER (CB_COLOR_INFO) format table is a different table from
     /// the texture (T#) one — same data-format numbering, different consumer.
     /// Every accepted entry must also have a `readback_bpp` size or the
@@ -4867,6 +5171,129 @@ mod tests {
                 "type {ty} is a named refusal"
             );
         }
+    }
+
+    /// Minecraft's panorama compute writes a type-13 `SW_64KB_S` storage
+    /// array and later samples the same guest bytes as six faces. The host
+    /// dispatch therefore needs a lossless two-way layout conversion for
+    /// every layer, not a linear write into tiled guest memory.
+    #[test]
+    fn storage_image_2darray_detile_and_writeback_round_trip_every_layer() {
+        let (w, h, bpp_log2, layer_count) = (8u32, 8u32, 2u32, 3u32);
+        let bpp = 1usize << bpp_log2;
+        let layers: Vec<Vec<u8>> = (0..layer_count as u8)
+            .map(|layer| {
+                (0..(w * h) as usize * bpp)
+                    .map(|i| layer.wrapping_mul(73).wrapping_add((i % 67) as u8))
+                    .collect()
+            })
+            .collect();
+        let tiled: Vec<u8> = layers
+            .iter()
+            .flat_map(|layer| crate::texture::tiling::tile_64kb_s(layer, w, h, bpp_log2))
+            .collect();
+        let mut blob = vec![0u8; tiled.len() + 255];
+        let base = (blob.as_ptr() as u64 + 255) & !255;
+        let off = (base - blob.as_ptr() as u64) as usize;
+        blob[off..off + tiled.len()].copy_from_slice(&tiled);
+
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.update_address40(base >> 8);
+        t.fields[1] |= 56 << 20; // unified format 8_8_8_8 UNORM
+        t.fields[1] |= ((w - 1) & 3) << 30;
+        t.fields[2] = (w - 1) >> 2;
+        t.fields[2] |= (h - 1) << 14;
+        t.fields[3] |= 9 << 20; // SWIZZLE_MODE 9 = SW_64KB_S
+        t.fields[3] |= 13 << 28; // type = 2DArray
+        t.fields[4] = layer_count - 1;
+
+        let upload =
+            crate::guest_mem::with_test_ranges(&[(blob.as_ptr() as u64, blob.len())], || {
+                read_storage_image(&t)
+            })
+            .expect("2D-array storage image detiles");
+        assert!(upload.array, "the Vulkan view must remain arrayed");
+        assert_eq!(upload.layers, layer_count);
+        assert_eq!(upload.depth, 1);
+        assert_eq!(
+            upload.pixels,
+            layers.into_iter().flatten().collect::<Vec<_>>(),
+            "all guest layers detile to tightly-packed host rows"
+        );
+
+        let guest = encode_storage_image_writeback(
+            upload.width,
+            upload.height,
+            upload.depth,
+            upload.layers,
+            upload.tile_mode,
+            upload.texel_bytes(),
+            &upload.pixels,
+        )
+        .expect("host readback retiles");
+        assert_eq!(
+            guest, tiled,
+            "writeback must reconstruct every original guest swizzle block"
+        );
+    }
+
+    #[test]
+    fn storage_image_base_array_selects_one_guest_layer() {
+        let (w, h, bpp_log2) = (8u32, 8u32, 2u32);
+        let bpp = 1usize << bpp_log2;
+        let layers: Vec<Vec<u8>> = (0..3u8)
+            .map(|layer| {
+                (0..(w * h) as usize * bpp)
+                    .map(|i| layer.wrapping_mul(73).wrapping_add((i % 67) as u8))
+                    .collect()
+            })
+            .collect();
+        let tiled_layers: Vec<Vec<u8>> = layers
+            .iter()
+            .map(|layer| crate::texture::tiling::tile_64kb_s(layer, w, h, bpp_log2))
+            .collect();
+        let tiled: Vec<u8> = tiled_layers.iter().flatten().copied().collect();
+        let mut blob = vec![0u8; tiled.len() + 255];
+        let allocation_base = (blob.as_ptr() as u64 + 255) & !255;
+        let off = (allocation_base - blob.as_ptr() as u64) as usize;
+        blob[off..off + tiled.len()].copy_from_slice(&tiled);
+
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.update_address40(allocation_base >> 8);
+        t.fields[1] |= 56 << 20;
+        t.fields[1] |= ((w - 1) & 3) << 30;
+        t.fields[2] = (w - 1) >> 2;
+        t.fields[2] |= (h - 1) << 14;
+        t.fields[3] |= 9 << 20;
+        t.fields[3] |= 13 << 28;
+        // Exactly Minecraft's per-face descriptor shape: BASE_ARRAY and
+        // LAST_ARRAY both name the one face this dispatch updates.
+        t.fields[4] = 2 | (2 << 16);
+
+        let upload =
+            crate::guest_mem::with_test_ranges(&[(blob.as_ptr() as u64, blob.len())], || {
+                read_storage_image(&t)
+            })
+            .expect("selected array layer detiles");
+        assert_eq!(upload.layers, 1);
+        assert_eq!(upload.pixels, layers[2]);
+        assert_eq!(
+            upload.guest_base,
+            allocation_base + (2 * tiled_layers[0].len()) as u64,
+            "writeback starts at BASE_ARRAY, preserving earlier faces"
+        );
+
+        let guest = encode_storage_image_writeback(
+            upload.width,
+            upload.height,
+            upload.depth,
+            upload.layers,
+            upload.tile_mode,
+            upload.texel_bytes(),
+            &upload.pixels,
+        )
+        .expect("selected layer retiles");
+        assert_eq!(guest, tiled_layers[2]);
     }
 
     /// A 3D storage-image (UAV) T# — type 10, format 71 (the measured

@@ -68,6 +68,46 @@ Extraction status:
   libc `cosf`/`time`/`ctype` tables (#542); Astro Bot AGC stack (#528, +520 lines to
   `AgcExports`: swapchain fallback, title clear). Port when the relevant subsystem needs it.
 
+### Minecraft graphics/audio/input closure slice 2026-07-24
+
+- **GFX10 MIMG DIM/NSA and writable arrays — DONE (measured).** The active
+  `kyty-graphics` parser now decodes GFX10 `DIM` and NSA extension DWORDs,
+  accounts for their real instruction length, and supplies explicit address
+  VGPRs to sample/load/store lowering. Writable cube/2D-array descriptors use
+  arrayed SPIR-V coordinates and honor `BASE_ARRAY..=LAST_ARRAY`; graphics and
+  compute storage-image uploads/writeback preserve every layer and its guest
+  tiling. GFX10 `VCMPX` now intersects EXEC without incorrectly overwriting
+  VCC. The instruction semantics were cross-checked against SharpEmu's RDNA2
+  tables and KytyPS5's shader path; the Rust lowering and regression fixtures
+  are original.
+- **Resource-class-local storage indices — DONE (measured).** A Minecraft
+  compute shader reused `s24` for a storage descriptor and a later sampled
+  descriptor. Dynamic use of the rewritten descriptor DWORD selected sampled
+  slot 1 from a one-element storage array, silently discarding every
+  `ImageStore`. Storage image access now resolves its exact analyzed descriptor
+  to a class-local constant index. Six panorama cube faces write non-zero guest
+  data in a real run.
+- **Cube upload safety — DONE (measured).** CPU render-target snapshots may
+  replace only plain, one-layer 2D uploads. A framebuffer image can no longer
+  replace a cube/array/volume at an aliased base while retaining the larger
+  layer count. The Vulkan create sites independently size and zero-pad sampled
+  staging bytes from the declared extent/format/layers. This removes the
+  measured Minecraft validation failure
+  `VUID-vkCmdCopyBufferToImage-pRegions-00171` (24 MiB six-face copy from a
+  4 MiB staging buffer) and prevents the associated device reset.
+- **AudioOut2 production ABI — DONE for Minecraft's measured PCM route.**
+  SharpEmu's Gen5 context/port layout and pacing were adapted to Raeen's HLE
+  memory model; ACM/media descriptor outputs are initialized, and the isolated
+  title runner starts the same cpal host output as the Shell. A release run
+  produced non-silent 48 kHz PCM on the host.
+- **DualSense route — host side DONE, title consumption OPEN.** The isolated
+  runner polls Raeen's native XInput/raw-HID backend and publishes the full
+  120-byte Orbis pad state through `libScePad`; the layout is cross-checked
+  against shadPS4 and KytyPS5. Minecraft's five Pad imports are HLE-resolved and
+  a real DualSense connected/parsed, but a targeted run had not called
+  `scePadOpen`/`scePadReadState` by present 1024. Do not claim gameplay input
+  until a measured guest call and button-driven menu transition are captured.
+
 ### Remaining-work classification (as of the latest batch)
 
 Every **self-contained, verifiable** module in both references is `done`/`skip`

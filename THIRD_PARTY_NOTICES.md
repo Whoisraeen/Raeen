@@ -86,6 +86,13 @@ SOFTWARE.
   `Kernel/KernelAprCompatExports.cs` (submit/wait), re-implemented in
   `crates/raeen-hle/src/libsce_ampr.rs` and the
   `apr_complete_command_buffer` in `crates/raeen-hle/src/libkernel.rs`.
+  The Gen5 AudioOut2 context/port parameter layout and grain pacing in
+  `crates/raeen-hle/src/libsce_audio_out2.rs`, plus GFX10 MIMG DIM/NSA field
+  meanings used by `crates/kyty-graphics/src/shader/parse.rs`, were also
+  behaviorally re-implemented after comparison with SharpEmu. Raeen's
+  resource-class-local descriptor indexing, layered guest tiling/writeback,
+  and Vulkan staging-size guard are original Rust fixes derived from its own
+  Minecraft traces and Vulkan validation output.
   Raeen's executable leaf-import gateway was also designed after auditing
   SharpEmu's native import trampoline state/ABI preservation; Raeen's
   implementation is original Rust plus generated x86-64 code and retains the

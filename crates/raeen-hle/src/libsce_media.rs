@@ -42,11 +42,17 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceAjm", "sceAjmModuleUnregister", hle_ok);
     registry.register("libSceAjm", "sceAjmInstanceCreate", hle_ajm_instance_create);
     registry.register("libSceAjm", "sceAjmInstanceDestroy", hle_ok);
-    // Batch surface, ported from SharpEmu's silence stubs (GPL-2.0, AjmExports.cs
-    // commits 2272b9b + d3600c9): the guest owns the batch storage, batches
-    // complete synchronously, and NO samples are decoded — silence, not a hang.
-    // These are Bink/AJM hot-path calls, so none of them WARN per call.
-    registry.register("libSceAjm", "sceAjmBatchInitialize", hle_ok);
+    // Batch surface, ported from SharpEmu's silence stubs (GPL-2.0,
+    // AjmExports.cs commits 2272b9b + d3600c9), with BatchInitialize's
+    // five-u64 descriptor layout independently reimplemented from KytyPS5.
+    // The guest owns the batch storage, batches complete synchronously, and NO
+    // samples are decoded — silence, not a hang. These are Bink/AJM hot-path
+    // calls, so none of them WARN per call.
+    registry.register(
+        "libSceAjm",
+        "sceAjmBatchInitialize",
+        hle_ajm_batch_initialize,
+    );
     registry.register(
         "libSceAjm",
         "sceAjmBatchJobDecode",
@@ -168,6 +174,27 @@ const AJM_DECODE_SIDEBAND_BYTES: usize = 32;
 /// bogus `outputSize` cannot make us clear an unbounded span (SharpEmu's
 /// `MaxSilentPcmBytes`).
 const AJM_MAX_SILENT_PCM_BYTES: u64 = 1 << 20;
+
+/// `sceAjmBatchInitialize(buffer, size, info)`: initialize the five-u64
+/// `AjmBatchInfo` descriptor (`buffer`, zero offset, capacity, and two null
+/// last-good-job pointers). Returning success without this write left
+/// Minecraft's per-grain codec builder reading stale descriptor fields.
+fn hle_ajm_batch_initialize(ctx: &HleContext, args: &[u64]) -> u64 {
+    let buffer = args.first().copied().unwrap_or(0);
+    let size = args.get(1).copied().unwrap_or(0);
+    let info = args.get(2).copied().unwrap_or(0);
+    if buffer == 0 || info == 0 {
+        return AJM_ERROR_INVALID_PARAMETER;
+    }
+    let mut descriptor = [0u8; 40];
+    descriptor[0..8].copy_from_slice(&buffer.to_le_bytes());
+    descriptor[16..24].copy_from_slice(&size.to_le_bytes());
+    if ctx.mem.write(info, &descriptor) {
+        OK
+    } else {
+        AJM_ERROR_INVALID_PARAMETER
+    }
+}
 
 /// `sceAjmBatchStart(context, info, priority, error_out, batchid_out)`
 /// (SharpEmu `AjmBatchStart`, NID `5tOfnaClcqM`): the batch "completes"
@@ -426,6 +453,33 @@ mod tests {
         let mut b = [0u8; 4];
         assert!(mem.read(0x40, &mut b));
         assert!(u32::from_le_bytes(b) != 0, "a context id was written");
+    }
+
+    #[test]
+    fn ajm_batch_initialize_writes_the_real_descriptor() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(
+            hle_ajm_batch_initialize(&ctx, &[0, 0x80, 0x40]),
+            AJM_ERROR_INVALID_PARAMETER
+        );
+        assert_eq!(
+            hle_ajm_batch_initialize(&ctx, &[0x80, 0x40, 0]),
+            AJM_ERROR_INVALID_PARAMETER
+        );
+        assert_eq!(hle_ajm_batch_initialize(&ctx, &[0x80, 0x40, 0x20]), OK);
+        let mut descriptor = [0xCD; 40];
+        assert!(mem.read(0x20, &mut descriptor));
+        assert_eq!(
+            u64::from_le_bytes(descriptor[0..8].try_into().unwrap()),
+            0x80
+        );
+        assert_eq!(u64::from_le_bytes(descriptor[8..16].try_into().unwrap()), 0);
+        assert_eq!(
+            u64::from_le_bytes(descriptor[16..24].try_into().unwrap()),
+            0x40
+        );
+        assert_eq!(descriptor[24..], [0; 16]);
     }
 
     #[test]

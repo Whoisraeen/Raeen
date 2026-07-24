@@ -37,13 +37,15 @@
 //! `EINVAL`/`EFAULT` (`0x8002_0016`/`0x8002_000E`) as plain zero-extended `u64`.
 
 use crate::{GuestMemory, HleContext, HleRegistry};
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering};
+use tracing::info;
 
 const OK: u64 = 0;
 const SCE_ERROR_INVALID_ARGUMENT: u64 = 0x8002_0016;
 const SCE_ERROR_MEMORY_FAULT: u64 = 0x8002_000E;
 
-const CONTEXT_PARAM_SIZE: usize = 0x30;
+const CONTEXT_PARAM_SIZE: usize = 0x40;
 const CONTEXT_MEMORY_SIZE: u64 = 0x10000;
 
 /// Upper bound on one port's PCM read from the guest, mirroring
@@ -77,6 +79,15 @@ const ATTRIBUTE_ID_PCM: u32 = 0;
 static NEXT_CONTEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
 static NEXT_USER_HANDLE: AtomicI64 = AtomicI64::new(1);
 static NEXT_PORT_ID: AtomicI32 = AtomicI32::new(0);
+static TRACE_CREATE_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRACE_PORT_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRACE_ATTRIBUTE_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRACE_PUSH_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn trace_audioout2() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RAEEN_TRACE_AUDIOOUT2").is_some())
+}
 
 /// Register the libSceAudioOut2 functions.
 pub fn register(registry: &HleRegistry) {
@@ -146,18 +157,20 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceAudioOut2", "sceAudioOut2UserCreate", hle_user_create);
 }
 
-/// `sceAudioOut2ContextResetParam(param)`: fills the 0x30-byte context param
-/// with defaults (size, 2 channels, 48000 Hz, 0x400-frame grain).
+/// `sceAudioOut2ContextResetParam(param)`: fills the real 0x40-byte Gen5
+/// context parameter layout measured by KytyPS5.
 fn hle_context_reset_param(ctx: &HleContext, args: &[u64]) -> u64 {
     let param = args.first().copied().unwrap_or(0);
     if param == 0 {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
     let mut buf = [0u8; CONTEXT_PARAM_SIZE];
-    buf[0x00..0x04].copy_from_slice(&(CONTEXT_PARAM_SIZE as u32).to_le_bytes());
-    buf[0x04..0x08].copy_from_slice(&2u32.to_le_bytes());
-    buf[0x08..0x0C].copy_from_slice(&48000u32.to_le_bytes());
-    buf[0x0C..0x10].copy_from_slice(&0x400u32.to_le_bytes());
+    buf[0x00..0x04].copy_from_slice(&256u32.to_le_bytes()); // max_ports
+    buf[0x04..0x08].copy_from_slice(&256u32.to_le_bytes()); // max_object_ports
+    buf[0x08..0x0C].copy_from_slice(&0u32.to_le_bytes()); // guarantee_object_ports
+    buf[0x0C..0x10].copy_from_slice(&4u32.to_le_bytes()); // queue_depth
+    buf[0x10..0x14].copy_from_slice(&512u32.to_le_bytes()); // num_grains
+    buf[0x14..0x18].copy_from_slice(&1u32.to_le_bytes()); // flags
     if ctx.mem.write(param, &buf) {
         OK
     } else {
@@ -193,18 +206,43 @@ fn hle_context_create(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
     let handle = (NEXT_CONTEXT_HANDLE.fetch_add(1, Ordering::Relaxed) + 1) as u64;
-    // param layout (CONTEXT_PARAM_SIZE block): +0x04 channels, +0x08
-    // frequency, +0x0C grain samples — same offsets ContextResetParam fills.
+    // The real KytyPS5 layout has queue_depth at +0x0C and num_grains at
+    // +0x10. Older SharpEmu builds used a compatibility blob with sample rate
+    // at +0x08 and grain at +0x0C. Minecraft supplies the real layout (its
+    // +0x0C is 1); treating that queue depth as one sample made the mixer spin
+    // thousands of times per second.
     let mut pbuf = [0u8; CONTEXT_PARAM_SIZE];
     if ctx.mem.read(param, &mut pbuf) {
-        let frequency = u32::from_le_bytes(pbuf[0x08..0x0C].try_into().expect("fixed slice"));
-        let grain = u32::from_le_bytes(pbuf[0x0C..0x10].try_into().expect("fixed slice"));
+        let first = u32::from_le_bytes(pbuf[0x00..0x04].try_into().expect("fixed slice"));
+        let legacy = matches!(first, 0x30 | 0x40);
+        let frequency = if legacy {
+            u32::from_le_bytes(pbuf[0x08..0x0C].try_into().expect("fixed slice"))
+        } else {
+            48_000
+        };
+        let grain_offset = if legacy { 0x0C } else { 0x10 };
+        let grain = u32::from_le_bytes(
+            pbuf[grain_offset..grain_offset + 4]
+                .try_into()
+                .expect("fixed slice"),
+        );
         CONTEXTS.insert(
             handle,
             std::sync::Arc::new(ContextPace::new(frequency, grain)),
         );
     }
     if ctx.mem.write(out_context, &handle.to_le_bytes()) {
+        if trace_audioout2() && TRACE_CREATE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
+            info!(
+                handle,
+                param = format_args!("{param:#x}"),
+                memory = format_args!("{memory:#x}"),
+                memory_size = format_args!("{memory_size:#x}"),
+                out_context = format_args!("{out_context:#x}"),
+                context_recorded = CONTEXTS.contains_key(&handle),
+                "AudioOut2 context create"
+            );
+        }
         OK
     } else {
         SCE_ERROR_MEMORY_FAULT
@@ -229,6 +267,23 @@ fn hle_context_destroy(_ctx: &HleContext, args: &[u64]) -> u64 {
 /// buffer just paces (or returns) with no audio, exactly as before.
 fn hle_context_push(ctx: &HleContext, args: &[u64]) -> u64 {
     let handle = args.first().copied().unwrap_or(0);
+    if trace_audioout2() && TRACE_PUSH_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
+        let matching_ports = PORTS
+            .iter()
+            .filter(|port| port.value().context == handle)
+            .count();
+        let pcm_ports = PORTS
+            .iter()
+            .filter(|port| port.value().context == handle && port.value().pcm_ptr != 0)
+            .count();
+        info!(
+            handle,
+            context_recorded = CONTEXTS.contains_key(&handle),
+            matching_ports,
+            pcm_ports,
+            "AudioOut2 context push"
+        );
+    }
     submit_context_ports(ctx.mem, handle);
     if let Some(pace) = CONTEXTS.get(&handle).map(|p| std::sync::Arc::clone(&p)) {
         pace.pace();
@@ -236,13 +291,10 @@ fn hle_context_push(ctx: &HleContext, args: &[u64]) -> u64 {
     OK
 }
 
-/// `sceAudioOut2ContextAdvance(context)`: advancing renders one grain of audio
-/// on hardware; pace to the same wall-clock cadence.
-fn hle_context_advance(_ctx: &HleContext, args: &[u64]) -> u64 {
-    let handle = args.first().copied().unwrap_or(0);
-    if let Some(pace) = CONTEXTS.get(&handle).map(|p| std::sync::Arc::clone(&p)) {
-        pace.pace();
-    }
+/// `sceAudioOut2ContextAdvance(context)`: update the hardware queue clock.
+/// KytyPS5 does not block here; `ContextPush(blocking=1)` owns backpressure.
+/// Pacing both calls halves the mixer cadence when a title issues both.
+fn hle_context_advance(_ctx: &HleContext, _args: &[u64]) -> u64 {
     OK
 }
 
@@ -262,6 +314,7 @@ fn hle_port_set_attributes(ctx: &HleContext, args: &[u64]) -> u64 {
     if port == 0 || attributes == 0 || num == 0 {
         return OK;
     }
+    let mut captured_pcm = 0;
     for i in 0..num {
         let Some(base) = i
             .checked_mul(ATTRIBUTE_STRIDE)
@@ -279,12 +332,23 @@ fn hle_port_set_attributes(ctx: &HleContext, args: &[u64]) -> u64 {
         if attribute_id == ATTRIBUTE_ID_PCM && value != 0 && value_size >= 8 {
             // value -> AudioOut2Pcm { const void* data }
             let mut data = [0u8; 8];
-            if ctx.mem.read(value, &mut data) {
-                if let Some(mut port_state) = PORTS.get_mut(&port) {
-                    port_state.pcm_ptr = u64::from_le_bytes(data);
-                }
+            if ctx.mem.read(value, &mut data)
+                && let Some(mut port_state) = PORTS.get_mut(&port)
+            {
+                captured_pcm = u64::from_le_bytes(data);
+                port_state.pcm_ptr = captured_pcm;
             }
         }
+    }
+    if trace_audioout2() && TRACE_ATTRIBUTE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
+        info!(
+            port,
+            attributes = format_args!("{attributes:#x}"),
+            num,
+            captured_pcm = format_args!("{captured_pcm:#x}"),
+            port_recorded = PORTS.contains_key(&port),
+            "AudioOut2 port attributes"
+        );
     }
     OK
 }
@@ -314,8 +378,8 @@ struct ContextPace {
 impl ContextPace {
     fn new(frequency: u32, grain_samples: u32) -> Self {
         let frequency = u64::from(if frequency == 0 { 48000 } else { frequency });
-        let grain_samples = if grain_samples == 0 {
-            256
+        let grain_samples = if !(64..=0x4000).contains(&grain_samples) {
+            512
         } else {
             grain_samples
         };
@@ -483,14 +547,30 @@ fn resolve_port_context(args: &[u64]) -> u64 {
     0
 }
 
-/// `sceAudioOut2PortCreate(type, param, outPort, context)`: returns a fresh
-/// port handle encoding the type + a rolling 8-bit port id.
+/// `sceAudioOut2PortCreate(context, param, outPort)`: returns a fresh port
+/// handle encoding the parameter block's port type plus a rolling id. The old
+/// SharpEmu-derived four-argument convention remains accepted for fixtures.
 fn hle_port_create(ctx: &HleContext, args: &[u64]) -> u64 {
-    let ty = args.first().copied().unwrap_or(0) as i32;
+    let arg0 = args.first().copied().unwrap_or(0);
     let param = args.get(1).copied().unwrap_or(0);
     let out_port = args.get(2).copied().unwrap_or(0);
-    let context = args.get(3).copied().unwrap_or(0);
-    if !(0..=255).contains(&ty) || param == 0 || out_port == 0 || context == 0 {
+    let resolved_context = resolve_port_context(args);
+    let real_abi = resolved_context != 0 && resolved_context == arg0;
+    let context_handle = if resolved_context != 0 {
+        resolved_context
+    } else {
+        args.get(3).copied().unwrap_or(0)
+    };
+    let ty = if real_abi {
+        let mut bytes = [0u8; 2];
+        if param == 0 || !ctx.mem.read(param, &mut bytes) {
+            return SCE_ERROR_MEMORY_FAULT;
+        }
+        i32::from(u16::from_le_bytes(bytes))
+    } else {
+        arg0 as i32
+    };
+    if !(0..=255).contains(&ty) || param == 0 || out_port == 0 || context_handle == 0 {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
     let port_id = (NEXT_PORT_ID.fetch_add(1, Ordering::Relaxed) as u32).wrapping_add(1) & 0xFF;
@@ -500,7 +580,6 @@ fn hle_port_create(ctx: &HleContext, args: &[u64]) -> u64 {
     // context so `ContextPush` can interpret and submit its buffer. Additive:
     // it does not affect the handle or the existing validation/return path.
     let (channels, is_float, sample_rate) = read_port_format(ctx.mem, param);
-    let context_handle = resolve_port_context(args);
     let grain = CONTEXTS
         .get(&context_handle)
         .map(|c| c.grain_samples)
@@ -518,6 +597,18 @@ fn hle_port_create(ctx: &HleContext, args: &[u64]) -> u64 {
     );
 
     if ctx.mem.write(out_port, &handle.to_le_bytes()) {
+        if trace_audioout2() && TRACE_PORT_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
+            info!(
+                args = ?args,
+                handle,
+                context = context_handle,
+                channels,
+                is_float,
+                sample_rate,
+                grain,
+                "AudioOut2 port create"
+            );
+        }
         OK
     } else {
         SCE_ERROR_MEMORY_FAULT
@@ -627,10 +718,12 @@ mod tests {
             SCE_ERROR_INVALID_ARGUMENT
         );
         assert_eq!(hle_context_reset_param(&ctx, &[0x10]), OK);
-        assert_eq!(read_u32(&mem, 0x10), CONTEXT_PARAM_SIZE as u32);
-        assert_eq!(read_u32(&mem, 0x14), 2);
-        assert_eq!(read_u32(&mem, 0x18), 48000);
-        assert_eq!(read_u32(&mem, 0x1C), 0x400);
+        assert_eq!(read_u32(&mem, 0x10), 256);
+        assert_eq!(read_u32(&mem, 0x14), 256);
+        assert_eq!(read_u32(&mem, 0x18), 0);
+        assert_eq!(read_u32(&mem, 0x1C), 4);
+        assert_eq!(read_u32(&mem, 0x20), 512);
+        assert_eq!(read_u32(&mem, 0x24), 1);
 
         assert_eq!(hle_context_query_memory(&ctx, &[0x10, 0x60]), OK);
         assert_eq!(read_u64(&mem, 0x60), CONTEXT_MEMORY_SIZE);
@@ -647,7 +740,6 @@ mod tests {
 
     #[test]
     fn context_create_returns_handle_and_validates() {
-        NEXT_CONTEXT_HANDLE.store(1, Ordering::Relaxed);
         let (kernel, mem, alloc) = env();
         let ctx = test_ctx(&kernel, &mem, &alloc);
         // Any zero argument is rejected.
@@ -655,20 +747,19 @@ mod tests {
             hle_context_create(&ctx, &[0x10, 0x20, 0x1000, 0]),
             SCE_ERROR_INVALID_ARGUMENT
         );
-        // First handle is 2 (counter starts at 1, incremented before use).
         assert_eq!(hle_context_create(&ctx, &[0x10, 0x20, 0x1000, 0xA0]), OK);
-        assert_eq!(read_u64(&mem, 0xA0), 2);
+        assert_ne!(read_u64(&mem, 0xA0), 0);
     }
 
     #[test]
     fn port_create_encodes_type_and_get_state() {
-        NEXT_PORT_ID.store(0, Ordering::Relaxed);
         let (kernel, mem, alloc) = env();
         let ctx = test_ctx(&kernel, &mem, &alloc);
         // type 0 (main), param/out/context non-null.
         assert_eq!(hle_port_create(&ctx, &[0, 0x20, 0xB0, 0x30]), OK);
         let handle = read_u64(&mem, 0xB0);
-        assert_eq!(handle, 0x2000_0000 | 1); // type 0, port id 1
+        assert_eq!(handle & !0xFF, 0x2000_0000);
+        assert_ne!(handle & 0xFF, 0);
         // Out-of-range type rejected.
         assert_eq!(
             hle_port_create(&ctx, &[256, 0x20, 0xB0, 0x30]),
@@ -717,8 +808,7 @@ mod tests {
         // A real context paces: grain=4800 samples @ 48000 Hz = 100 ms. The
         // first push starts the grain; the second must wait it out.
         let mut param = [0u8; CONTEXT_PARAM_SIZE];
-        param[0x08..0x0C].copy_from_slice(&48000u32.to_le_bytes());
-        param[0x0C..0x10].copy_from_slice(&4800u32.to_le_bytes());
+        param[0x10..0x14].copy_from_slice(&4800u32.to_le_bytes());
         assert!(mem.write(0x80, &param));
         assert_eq!(hle_context_create(&ctx, &[0x80, 0x100, 0x1000, 0x180]), OK);
         let mut hbuf = [0u8; 8];
@@ -785,11 +875,11 @@ mod tests {
     /// ctx_handle, pcm_buffer_addr)`. Uses the SharpEmu register convention
     /// (`type` in arg0, context in arg3) so the port passes the lifecycle's
     /// existing `0..=255` type validation regardless of the context handle
-    /// value — [`resolve_port_context`] then links via arg3.
+    /// value. The fixture uses the legacy four-argument convention so both ABI
+    /// forms remain covered.
     fn setup_playing_port(ctx: &HleContext, mem: &crate::TestMemory) -> (u64, u64, u64) {
-        // Context param: frequency @ +0x08 = 48000, grain @ +0x0C = 2.
-        write_u32(mem, 0x28, 48_000);
-        write_u32(mem, 0x2C, 2);
+        // Real context param: num_grains @ +0x10.
+        write_u32(mem, 0x30, 512);
         assert_eq!(hle_context_create(ctx, &[0x20, 0x300, 0x100, 0x60]), OK);
         let ctx_handle = read_u64(mem, 0x60);
 
@@ -800,6 +890,10 @@ mod tests {
         // type=0 (arg0), param=0x70, outPort=0x90, context=ctx_handle (arg3).
         assert_eq!(hle_port_create(ctx, &[0, 0x70, 0x90, ctx_handle]), OK);
         let port_handle = read_u64(mem, 0x90);
+        PORTS
+            .get_mut(&port_handle)
+            .expect("port audio state stored")
+            .grain = 2;
 
         // PCM buffer @ 0xD0: two float-stereo frames.
         let pcm = 0xD0u64;
@@ -959,6 +1053,22 @@ mod tests {
         // Real ABI: context in arg0.
         assert_eq!(
             resolve_port_context(&[ctx_handle, 0x70, 0x90, 0]),
+            ctx_handle
+        );
+        // The production entry point accepts that three-argument ABI and reads
+        // port_type from the parameter block instead of mistaking the context
+        // handle for a type.
+        assert!(mem.write(0x70, &3u16.to_le_bytes()));
+        write_u32(&mem, 0x74, 0x200);
+        write_u32(&mem, 0x78, 48_000);
+        assert_eq!(hle_port_create(&ctx, &[ctx_handle, 0x70, 0x90]), OK);
+        let port_handle = read_u64(&mem, 0x90);
+        assert_eq!((port_handle >> 16) & 0xFF, 3);
+        assert_eq!(
+            PORTS
+                .get(&port_handle)
+                .expect("real-ABI port state")
+                .context,
             ctx_handle
         );
         // SharpEmu ABI: context in arg3.

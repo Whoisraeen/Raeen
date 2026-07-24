@@ -76,6 +76,47 @@ const STORE_PATTERN_CS: &str = "\
     OpReturn\n\
     OpFunctionEnd\n";
 
+/// Array-storage acceptance shader: dispatch Z selects the destination layer.
+/// Layer 0 becomes green and layer 1 red, proving the third image coordinate,
+/// 2D-array view, barriers, copies, and full-layer readback all agree.
+const STORE_ARRAY_CS: &str = "\
+    OpCapability Shader\n\
+    OpMemoryModel Logical GLSL450\n\
+    OpEntryPoint GLCompute %main \"main\" %gid %images\n\
+    OpExecutionMode %main LocalSize 2 2 1\n\
+    OpDecorate %gid BuiltIn GlobalInvocationId\n\
+    OpDecorate %images DescriptorSet 0\n\
+    OpDecorate %images Binding 0\n\
+    %void = OpTypeVoid\n\
+    %fnty = OpTypeFunction %void\n\
+    %uint = OpTypeInt 32 0\n\
+    %float = OpTypeFloat 32\n\
+    %v3uint = OpTypeVector %uint 3\n\
+    %v4float = OpTypeVector %float 4\n\
+    %imgL = OpTypeImage %float 2D 0 1 0 2 Rgba8\n\
+    %uint_1 = OpConstant %uint 1\n\
+    %uint_0 = OpConstant %uint 0\n\
+    %float_0 = OpConstant %float 0.000000\n\
+    %float_1 = OpConstant %float 1.000000\n\
+    %arr = OpTypeArray %imgL %uint_1\n\
+    %ptr_arr = OpTypePointer UniformConstant %arr\n\
+    %ptr_img = OpTypePointer UniformConstant %imgL\n\
+    %ptr_gid = OpTypePointer Input %v3uint\n\
+    %images = OpVariable %ptr_arr UniformConstant\n\
+    %gid = OpVariable %ptr_gid Input\n\
+    %main = OpFunction %void None %fnty\n\
+    %entry = OpLabel\n\
+    %coord = OpLoad %v3uint %gid\n\
+    %z = OpCompositeExtract %uint %coord 2\n\
+    %red = OpConvertUToF %float %z\n\
+    %green = OpFSub %float %float_1 %red\n\
+    %color = OpCompositeConstruct %v4float %red %green %float_0 %float_1\n\
+    %pimg = OpAccessChain %ptr_img %images %uint_0\n\
+    %img = OpLoad %imgL %pimg\n\
+    OpImageWrite %img %coord %color\n\
+    OpReturn\n\
+    OpFunctionEnd\n";
+
 fn backend_or_skip() -> Option<VulkanBackend> {
     let mut backend = VulkanBackend::new(true);
     match backend.init() {
@@ -127,6 +168,9 @@ fn compute_shader_writes_are_visible_in_storage_image_readback() {
                 width: 2,
                 height: 2,
                 depth: 1,
+                layers: 1,
+                array: false,
+                tile_mode: 0,
                 format: vk::Format::R8G8B8A8_UNORM,
                 pixels: vec![0xEE; 16],
                 guest_base: 0,
@@ -171,5 +215,104 @@ fn compute_shader_writes_are_visible_in_storage_image_readback() {
         validation_error_count(),
         0,
         "Vulkan validation reported errors during the storage-image dispatch"
+    );
+}
+
+#[test]
+fn compute_shader_writes_every_2d_array_layer() {
+    let Some(backend) = backend_or_skip() else {
+        return;
+    };
+    let dev = backend.device().expect("backend is initialized");
+    let spirv = kyty_graphics::spirv_asm::assemble(STORE_ARRAY_CS)
+        .expect("array storage-image compute shader assembles");
+    let binding = ShaderStageBinding {
+        stage: vk::ShaderStageFlags::COMPUTE,
+        descriptor_set_slot: 0,
+        push_constant_offset: 0,
+        push_constants: Vec::new(),
+        push_uniform_binding: None,
+        storage_buffers: None,
+        textures: None,
+        storage_images: Some(StorageImageBinding {
+            binding: 0,
+            images: vec![StorageImageUpload {
+                width: 2,
+                height: 2,
+                depth: 1,
+                layers: 2,
+                array: true,
+                tile_mode: 0,
+                format: vk::Format::R8G8B8A8_UNORM,
+                pixels: vec![0xEE; 32],
+                guest_base: 0,
+            }],
+        }),
+        gds_binding: None,
+        eud_raw: None,
+    };
+    let outputs = dispatch_compute(
+        dev,
+        &ComputeState {
+            groups: [1, 1, 2],
+            spirv: &spirv,
+            binding: Some(&binding),
+        },
+    )
+    .expect("array storage-image compute dispatch");
+    let pixels = &outputs.images[0];
+    assert_eq!(pixels.len(), 32, "two tightly packed 2x2 RGBA8 layers");
+    for pixel in pixels[..16].chunks_exact(4) {
+        assert_eq!(pixel, [0, 255, 0, 255], "layer 0 is green");
+    }
+    for pixel in pixels[16..].chunks_exact(4) {
+        assert_eq!(pixel, [255, 0, 0, 255], "layer 1 is red");
+    }
+
+    // Arrayed is part of the SPIR-V image type, not a consequence of
+    // layer_count > 1. Minecraft creates the panorama output incrementally,
+    // beginning with a one-layer type-13 descriptor. Exercise that exact
+    // boundary so the bind path cannot regress to a TYPE_2D view.
+    let one_layer_binding = ShaderStageBinding {
+        stage: vk::ShaderStageFlags::COMPUTE,
+        descriptor_set_slot: 0,
+        push_constant_offset: 0,
+        push_constants: Vec::new(),
+        push_uniform_binding: None,
+        storage_buffers: None,
+        textures: None,
+        storage_images: Some(StorageImageBinding {
+            binding: 0,
+            images: vec![StorageImageUpload {
+                width: 2,
+                height: 2,
+                depth: 1,
+                layers: 1,
+                array: true,
+                tile_mode: 0,
+                format: vk::Format::R8G8B8A8_UNORM,
+                pixels: vec![0xEE; 16],
+                guest_base: 0,
+            }],
+        }),
+        gds_binding: None,
+        eud_raw: None,
+    };
+    let one_layer = dispatch_compute(
+        dev,
+        &ComputeState {
+            groups: [1, 1, 1],
+            spirv: &spirv,
+            binding: Some(&one_layer_binding),
+        },
+    )
+    .expect("one-layer array storage-image compute dispatch");
+    for pixel in one_layer.images[0].chunks_exact(4) {
+        assert_eq!(pixel, [0, 255, 0, 255], "the sole array layer is green");
+    }
+    assert_eq!(
+        validation_error_count(),
+        0,
+        "Vulkan validation reported errors during the array-storage dispatch"
     );
 }

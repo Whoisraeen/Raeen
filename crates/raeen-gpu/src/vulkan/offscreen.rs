@@ -146,14 +146,29 @@ pub struct StorageImageUpload {
     /// Volume depth: 1 for a 2D UAV; > 1 creates a `VK_IMAGE_TYPE_3D`
     /// storage image (measured: ASTRO.BOT's 240x135x64 UAV volumes).
     pub depth: u32,
+    /// Array layers: 1 for 2D/3D, or the selected
+    /// `T#.BASE_ARRAY..=T#.LAST_ARRAY` span for a type-13 2D-array storage
+    /// image. Type-11 writable cubes use the same 2D-array storage
+    /// representation; sampled cube views remain a separate path.
+    pub layers: u32,
+    /// The guest descriptor is arrayed (type 11 or 13). This remains true
+    /// even when `layers == 1`: SPIR-V's `Arrayed` operand is part of the
+    /// image type, so Vulkan must bind a `TYPE_2D_ARRAY` view for a one-layer
+    /// array instead of silently changing it to `TYPE_2D`.
+    pub array: bool,
+    /// Guest swizzle mode. Compute works on a linear host image; writeback
+    /// retiles each array layer to this layout before publishing guest bytes.
+    pub tile_mode: u8,
     /// The Vulkan texel format matching the recompiled SPIR-V's `%ImageL`
     /// declaration: `R8G8B8A8_UNORM` (Rgba8), `R16G16B16A16_SFLOAT`
     /// (Rgba16f, guest T# format 71), or `R32G32B32A32_SFLOAT`
     /// (Rgba32f, guest T# format 77).
     pub format: vk::Format,
-    /// Initial content, `width * height * depth * texel_bytes()` bytes.
+    /// Initial linear content,
+    /// `width * height * depth * layers * texel_bytes()` bytes.
     pub pixels: Vec<u8>,
-    /// Guest base address for the post-dispatch writeback.
+    /// Guest address of the selected base array layer for post-dispatch
+    /// writeback (not necessarily the allocation's layer-zero address).
     pub guest_base: u64,
 }
 
@@ -264,6 +279,42 @@ fn warn_bad_cube_layers_once(upload: &TextureUpload, safe: u32) {
     }
 }
 
+/// Bytes per texel for sampled texture uploads accepted by
+/// `draw_translate::texture_vk_format`.
+fn texture_texel_bytes(format: vk::Format) -> Result<u32, GpuError> {
+    match format {
+        vk::Format::R8_UNORM | vk::Format::R8_UINT => Ok(1),
+        vk::Format::R16_UNORM | vk::Format::R8G8_UNORM => Ok(2),
+        vk::Format::B10G11R11_UFLOAT_PACK32
+        | vk::Format::R8G8B8A8_UNORM
+        | vk::Format::R32_SFLOAT
+        | vk::Format::R16G16_SFLOAT => Ok(4),
+        vk::Format::R16G16B16A16_UNORM | vk::Format::R16G16B16A16_SFLOAT => Ok(8),
+        vk::Format::R32G32B32A32_SFLOAT => Ok(16),
+        other => Err(GpuError::VulkanInitFailed(format!(
+            "sampled texture format {other:?} has no texel byte size mapping"
+        ))),
+    }
+}
+
+fn warn_short_texture_upload_once(upload: &TextureUpload, required: usize) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
+        tracing::warn!(
+            supplied = upload.pixels.len(),
+            required,
+            extent = format_args!("{}x{}x{}", upload.width, upload.height, upload.depth),
+            layers = upload.layers,
+            cube = upload.cube,
+            array = upload.array,
+            guest_base = format_args!("{:#x}", upload.guest_base),
+            "sampled texture upload is shorter than its declared image; padding \
+             missing texels with zero to prevent a staging-buffer overrun"
+        );
+    }
+}
+
 impl TextureUpload {
     /// Vulkan requires a CUBE image's `arrayLayers` to be a positive multiple of
     /// 6 (`VUID-VkImageCreateInfo-flags-08866`) and a CUBE view's `layerCount`
@@ -284,20 +335,35 @@ impl TextureUpload {
         }
     }
 
-    /// The staging pixels sized for `img_layers` faces: the decoded pixels,
-    /// zero-padded when [`Self::cube_safe_layers`] had to bump the layer count,
-    /// so the staging→image copy of `img_layers` faces never overruns the
-    /// buffer (the padded faces upload as transparent black — a render glitch at
-    /// worst, never a device loss). Borrows `pixels` unchanged in the common
-    /// case (no bump).
-    pub(crate) fn staging_pixels(&self, img_layers: u32) -> std::borrow::Cow<'_, [u8]> {
-        if img_layers <= self.layers || self.layers == 0 || self.pixels.is_empty() {
-            return std::borrow::Cow::Borrowed(&self.pixels);
+    /// The staging pixels sized for the image dimensions Vulkan will copy.
+    /// Undersized inputs are zero-padded whether they came from a clamped cube
+    /// layer count or from an upstream pixel-vector mismatch. This is the
+    /// authoritative last line of defence against a copy region exceeding its
+    /// staging buffer (`VUID-vkCmdCopyBufferToImage-pRegions-00171`, measured
+    /// on Minecraft's title-panorama cube).
+    pub(crate) fn staging_pixels(
+        &self,
+        img_layers: u32,
+    ) -> Result<std::borrow::Cow<'_, [u8]>, GpuError> {
+        let texel_bytes = texture_texel_bytes(self.format)? as usize;
+        let required = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|n| n.checked_mul(self.depth.max(1) as usize))
+            .and_then(|n| n.checked_mul(img_layers.max(1) as usize))
+            .and_then(|n| n.checked_mul(texel_bytes))
+            .ok_or_else(|| {
+                GpuError::VulkanInitFailed(format!(
+                    "sampled texture staging size overflow for {}x{}x{} layers={} format={:?}",
+                    self.width, self.height, self.depth, img_layers, self.format
+                ))
+            })?;
+        if self.pixels.len() >= required || self.pixels.is_empty() {
+            return Ok(std::borrow::Cow::Borrowed(&self.pixels));
         }
-        let face_bytes = self.pixels.len() / self.layers as usize;
-        let mut padded = vec![0u8; face_bytes * img_layers as usize];
+        warn_short_texture_upload_once(self, required);
+        let mut padded = vec![0u8; required];
         padded[..self.pixels.len()].copy_from_slice(&self.pixels);
-        std::borrow::Cow::Owned(padded)
+        Ok(std::borrow::Cow::Owned(padded))
     }
 }
 
@@ -2567,7 +2633,7 @@ impl<'a> Resources<'a> {
         // pad the staging pixels to match so the copy of `img_layers` faces never
         // overruns the buffer. Non-cube uploads borrow `pixels` unchanged.
         let img_layers = upload.cube_safe_layers();
-        let staging = upload.staging_pixels(img_layers);
+        let staging = upload.staging_pixels(img_layers)?;
         let (staging_buffer, staging_memory) = self.create_buffer_with_bytes(&staging)?;
         // Persistent-texture cache (stage D): a cacheable upload donates its
         // image to the cache on draw success, so the next bind of the same
@@ -4196,6 +4262,45 @@ mod tests {
             1,
             storage_class,
         ]
+    }
+
+    fn sampled_upload(pixels: Vec<u8>, layers: u32, cube: bool) -> TextureUpload {
+        TextureUpload {
+            width: 2,
+            height: 2,
+            format: vk::Format::R8G8B8A8_UNORM,
+            pixels,
+            layers,
+            cube,
+            array: false,
+            depth: 1,
+            render_target: None,
+            guest_base: 0x3368_0000,
+            sample_hash: 1,
+            cached: false,
+        }
+    }
+
+    /// Vulkan copies all declared faces even if an upstream fallback supplied
+    /// only one. The staging guard must make that copy memory-safe.
+    #[test]
+    fn cube_staging_pixels_pad_one_face_to_all_six_faces() {
+        let face = vec![0x5a; 2 * 2 * 4];
+        let upload = sampled_upload(face.clone(), 6, true);
+        let staging = upload.staging_pixels(upload.cube_safe_layers()).unwrap();
+        assert_eq!(staging.len(), face.len() * 6);
+        assert_eq!(&staging[..face.len()], face);
+        assert!(staging[face.len()..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn complete_texture_staging_borrows_without_reallocation() {
+        let pixels = vec![0x31; 2 * 2 * 4 * 6];
+        let upload = sampled_upload(pixels, 6, true);
+        assert!(matches!(
+            upload.staging_pixels(6).unwrap(),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

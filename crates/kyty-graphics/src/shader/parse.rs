@@ -17,6 +17,35 @@ use super::types::{
     shader_instruction_format::Format as F,
 };
 
+/// GFX10 `VCMPX` instructions write EXEC only. Older generations also exposed
+/// a scalar compare destination, so the generation-aware decoders use this
+/// predicate after selecting the opcode.
+const fn is_vcmpx_instruction(type_: T) -> bool {
+    matches!(
+        type_,
+        T::VCmpxLtF32
+            | T::VCmpxEqF32
+            | T::VCmpxLeF32
+            | T::VCmpxGtF32
+            | T::VCmpxGeF32
+            | T::VCmpxNgeF32
+            | T::VCmpxNleF32
+            | T::VCmpxNeqF32
+            | T::VCmpxNltF32
+            | T::VCmpxLtI32
+            | T::VCmpxEqI32
+            | T::VCmpxLeI32
+            | T::VCmpxGtI32
+            | T::VCmpxNeI32
+            | T::VCmpxGeI32
+            | T::VCmpxLtU32
+            | T::VCmpxEqU32
+            | T::VCmpxGtU32
+            | T::VCmpxNeU32
+            | T::VCmpxGeU32
+    )
+}
+
 /// Typed replacement for Kyty's hard exits (ShaderParse.cpp macros L21-28).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShaderParseError {
@@ -1099,7 +1128,7 @@ fn shader_parse_vopc(
     pc: u32,
     buffer: &[u32],
     dst: &mut ShaderCode,
-    _next_gen: bool,
+    next_gen: bool,
 ) -> Result<u32, ShaderParseError> {
     const S: &str = "vopc";
     let b0 = buffer[0];
@@ -1264,6 +1293,15 @@ fn shader_parse_vopc(
             }
             return Err(unknown_op(dst, S, opcode, pc, b0));
         }
+    }
+
+    // RDNA/GFX10 VCMPX is EXEC-only. Retaining the legacy VCC destination
+    // corrupts live scalar data: Minecraft deliberately loads width/height
+    // into VCC and performs two consecutive VCMPX bounds checks, reading
+    // VCC_HI and then VCC_LO. SharpEmu and KytyPS5's native Gen5 decoder both
+    // route these opcodes to EXEC_LO.
+    if next_gen && is_vcmpx_instruction(inst.type_) {
+        inst.dst.type_ = O::ExecLo;
     }
 
     dst.get_instructions_mut().push(inst);
@@ -2499,6 +2537,13 @@ fn shader_parse_vop3(
         }
     }
 
+    // VOP3-encoded VCMPX has the same GFX10 EXEC-only destination as the
+    // compact VOPC form above.
+    if next_gen && is_vcmpx_instruction(inst.type_) {
+        inst.dst.type_ = O::ExecLo;
+        inst.dst.size = 2;
+    }
+
     // Kyty L2236-2260: abs/clamp application depends on whether dst2 was set.
     if inst.dst2.type_ == O::Unknown {
         if (abs & 0x1) != 0 {
@@ -3687,14 +3732,15 @@ fn shader_parse_mimg(
     pc: u32,
     buffer: &[u32],
     dst: &mut ShaderCode,
-    _next_gen: bool,
+    next_gen: bool,
 ) -> Result<u32, ShaderParseError> {
     const S: &str = "mimg";
     let b0 = buffer[0];
     let b1 = dw(buffer, 1, pc)?;
 
     let slc = (b0 >> 25) & 0x1;
-    let opcode = (b0 >> 18) & 0x7f;
+    let opcode = ((b0 >> 18) & 0x7f) | (u32::from(next_gen) * ((b0 & 0x1) << 7));
+    let nsa_dwords = if next_gen { (b0 >> 1) & 0x3 } else { 0 };
     let lwe = (b0 >> 17) & 0x1;
     let tff = (b0 >> 16) & 0x1;
     let r128 = (b0 >> 15) & 0x1;
@@ -3702,6 +3748,25 @@ fn shader_parse_mimg(
     let glc = (b0 >> 13) & 0x1;
     let unrm = (b0 >> 12) & 0x1;
     let dmask = (b0 >> 8) & 0xf;
+    // GFX10/RDNA2 moves the image dimension into MIMG word 0 bits [5:3].
+    // It is the source of truth for the number of address VGPRs consumed by
+    // image_load/store; the T# resource type instead describes the view. In
+    // particular, Minecraft uses DIM_2D with a type-13 array descriptor and
+    // selects the destination face through T#.BASE_ARRAY. Treating every
+    // operation as Vaddr3 reads the next, unrelated VGPR as an array layer.
+    //
+    // DIM 0/4 are reserved. Keep the old three-component shape for those
+    // encodings so legacy GCN fixtures (which did not populate GFX10 DIM)
+    // remain parseable; real GFX10 DIM values follow KytyPS5 ImageOps.cpp.
+    let image_coord_components = if next_gen {
+        match (b0 >> 3) & 0x7 {
+            1 | 6 => 2,         // 2D / 2D MSAA
+            2 | 3 | 5 | 7 => 3, // 3D / 2D array variants
+            _ => 3,
+        }
+    } else {
+        3
+    };
 
     let ssamp = (b1 >> 21) & 0x1f; // S#
     let srsrc = (b1 >> 16) & 0x1f; // T#
@@ -3731,7 +3796,7 @@ fn shader_parse_mimg(
         return Err(feature(S, "unrm == 1", pc));
     }
 
-    let size: u32 = 2;
+    let size: u32 = 2 + nsa_dwords;
 
     let mut inst = ShaderInstruction {
         pc,
@@ -3742,11 +3807,20 @@ fn shader_parse_mimg(
     inst.src[0] = operand_parse(vaddr + 256)?;
     inst.src[1] = operand_parse(srsrc * 4)?;
     inst.src[2] = operand_parse(ssamp * 4)?;
+    inst.mimg_nsa_dwords = nsa_dwords as u8;
+    for word_index in 0..nsa_dwords {
+        let nsa = dw(buffer, 2 + word_index, pc)?;
+        for byte_index in 0..4 {
+            let component = (word_index * 4 + byte_index) as usize;
+            let vgpr = (nsa >> (byte_index * 8)) & 0xff;
+            inst.mimg_nsa_addr[component] = operand_parse(vgpr + 256)?;
+        }
+    }
 
     match opcode {
         0x00 => {
             inst.type_ = T::ImageLoad;
-            inst.src[0].size = 3;
+            inst.src[0].size = image_coord_components;
             inst.src[1].size = 8;
             inst.src_num = 2;
             match dmask {
@@ -3778,7 +3852,7 @@ fn shader_parse_mimg(
         0x05 => return Err(ni(dst, S, "image_load_mip_pck_sgn", opcode, pc, b0)),
         0x08 => {
             inst.type_ = T::ImageStore;
-            inst.src[0].size = 3;
+            inst.src[0].size = image_coord_components;
             inst.src[1].size = 8;
             inst.src_num = 2;
             match dmask {
@@ -3803,7 +3877,7 @@ fn shader_parse_mimg(
         }
         0x09 => {
             inst.type_ = T::ImageStoreMip;
-            inst.src[0].size = 4;
+            inst.src[0].size = image_coord_components + 1;
             inst.src[1].size = 8;
             inst.src_num = 2;
             if dmask == 0xf {
@@ -5329,6 +5403,62 @@ mod tests {
     }
 
     #[test]
+    fn minecraft_mimg_dim_controls_address_vgpr_count() {
+        // Exact DIM-bearing words from Minecraft's panorama copy shader.
+        // Both operations are DIM_2D (bits [5:3] == 1), even though their
+        // runtime T# descriptors are type-13 arrays. BASE_ARRAY selects the
+        // face; vaddr+2 is not part of either instruction.
+        let (load_code, load_result) = parse(
+            &[0xF000_0F0A, 0x0000_0003, 0x0000_0000, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        load_result.expect("parse Minecraft NSA image_load");
+        let load = &load_code.get_instructions()[0];
+        assert_eq!(load.type_, T::ImageLoad);
+        assert_eq!(load.src[0].size, 2);
+        assert_eq!(load.mimg_nsa_dwords, 1);
+        assert_eq!(
+            load.mimg_nsa_addr[0].register_id, 0,
+            "the NSA dword explicitly selects v0 as Y"
+        );
+        assert_eq!(load_code.get_instructions().len(), 2);
+        assert_eq!(load_code.get_instructions()[1].type_, T::SEndpgm);
+        assert_eq!(
+            load_code.get_instructions()[1].pc,
+            12,
+            "the end marker follows the three-dword MIMG; the NSA payload \
+             must not decode as a fake VOP instruction"
+        );
+
+        let (store_code, store_result) = parse(
+            &[0xF020_0F08, 0x0006_0004, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        store_result.expect("parse Minecraft image_store");
+        let store = &store_code.get_instructions()[0];
+        assert_eq!(store.type_, T::ImageStore);
+        assert_eq!(
+            store.src[0].size, 2,
+            "DIM_2D consumes only x/y address VGPRs"
+        );
+        assert_eq!(store.mimg_nsa_dwords, 0);
+
+        let (code, result) = parse(
+            &[0xF020_0F18, 0x0006_0004, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse DIM_2D_ARRAY image_store");
+        assert_eq!(
+            code.get_instructions()[0].src[0].size,
+            3,
+            "DIM_2D_ARRAY consumes x/y/layer"
+        );
+    }
+
+    #[test]
     fn astro_exp_pos1_partial_export_decodes() {
         // Measured: exp target 0x0d (pos1) with en=0x4, done=0, compr=0,
         // vm=0 — an auxiliary position export (clip/cull distance per
@@ -5871,6 +6001,67 @@ mod tests {
         assert_eq!(inst.type_, T::ImageLoad);
         assert_eq!(inst.format, F::Vdata3Vaddr3StDmask7);
         assert_eq!(inst.dst.size, 3);
+    }
+
+    #[test]
+    fn minecraft_nsa_copy_shader_keeps_every_instruction_boundary() {
+        // The live Minecraft panorama/cubemap copy kernel. All four MIMG
+        // instructions carry NSA payload dwords, so preserving their exact
+        // lengths is essential: treating an NSA payload as VOP changes both
+        // the coordinates and every later branch/instruction boundary.
+        let words = [
+            0xbfa0_0001,
+            0xd746_0001,
+            0x0405_060f,
+            0xd746_0000,
+            0x0401_060e,
+            0xf424_1a84,
+            0xfa00_0000,
+            0x7e04_0d01,
+            0x7e02_0d00,
+            0xbf8c_c07f,
+            0x7c28_046b,
+            0x7c28_026a,
+            0xbf88_0013,
+            0xf42c_0404,
+            0xfa00_0010,
+            0xbf8c_c07f,
+            0x0606_0210,
+            0x0600_0411,
+            0x0602_0214,
+            0x0604_0415,
+            0xf40c_0606,
+            0xfa00_0000,
+            0x7e06_1103,
+            0x7e00_1100,
+            0x7e08_1101,
+            0x7e0a_1102,
+            0xf000_0f0a,
+            0x0000_0003,
+            0x0000_0000,
+            0xbf8c_0070,
+            0xf020_0f08,
+            0x0006_0004,
+            S_ENDPGM,
+        ];
+        let (code, result) = parse(&words, ShaderType::Compute, true);
+        result.expect("parse Minecraft NSA copy shader");
+        let instructions = code.get_instructions();
+        assert_eq!(
+            instructions.iter().map(|inst| inst.pc).collect::<Vec<_>>(),
+            [
+                0x00, 0x04, 0x0c, 0x14, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34, 0x3c, 0x40, 0x44,
+                0x48, 0x4c, 0x50, 0x58, 0x5c, 0x60, 0x64, 0x68, 0x74, 0x78, 0x80,
+            ]
+        );
+        assert_eq!(instructions[7].type_, T::VCmpxGtF32);
+        assert_eq!(instructions[7].src[0].type_, O::VccHi);
+        assert_eq!(instructions[7].dst.type_, O::ExecLo);
+        assert_eq!(instructions[8].type_, T::VCmpxGtF32);
+        assert_eq!(instructions[8].src[0].type_, O::VccLo);
+        assert_eq!(instructions[8].dst.type_, O::ExecLo);
+        assert_eq!(instructions[21].type_, T::ImageLoad);
+        assert_eq!(instructions[23].type_, T::ImageStore);
     }
 
     #[test]

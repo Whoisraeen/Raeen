@@ -107,6 +107,8 @@ struct ImageAllocation {
     height: u32,
     /// Volume depth (1 for a 2D UAV).
     depth: u32,
+    /// Array layers (1 for a 2D/3D UAV).
+    layers: u32,
     /// Bytes per texel (4 = RGBA8, 8 = RGBA16F).
     texel: u32,
 }
@@ -678,14 +680,17 @@ impl<'a> ComputeResources<'a> {
     /// One UAV: staging buffer + device-local image + view + readback
     /// buffer, in the upload's own format; `depth > 1` builds a
     /// `VK_IMAGE_TYPE_3D` volume (measured: ASTRO.BOT's 240x135x64 RGBA16F
-    /// UAVs). Pushed with null handles up front so `Drop` cleans up any
+    /// UAVs), while `array` builds a `TYPE_2D_ARRAY` view even for one layer.
+    /// Pushed with null handles up front so `Drop` cleans up any
     /// partially-built entry on the error paths.
     fn create_storage_image(&mut self, upload: &StorageImageUpload) -> Result<(), GpuError> {
         let depth = upload.depth.max(1);
+        let layers = upload.layers.max(1);
         let texel = upload.texel_bytes();
         let size = (upload.width as usize)
             * (upload.height as usize)
             * (depth as usize)
+            * (layers as usize)
             * (texel as usize);
         if size == 0 || upload.pixels.len() != size {
             return Err(GpuError::VulkanInitFailed(format!(
@@ -707,6 +712,7 @@ impl<'a> ComputeResources<'a> {
             width: upload.width,
             height: upload.height,
             depth,
+            layers,
             texel,
         });
         let slot = self.images.len() - 1;
@@ -732,7 +738,7 @@ impl<'a> ComputeResources<'a> {
                 depth,
             })
             .mip_levels(1)
-            .array_layers(1)
+            .array_layers(layers)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(
@@ -770,6 +776,8 @@ impl<'a> ComputeResources<'a> {
             .image(image)
             .view_type(if depth > 1 {
                 vk::ImageViewType::TYPE_3D
+            } else if upload.array {
+                vk::ImageViewType::TYPE_2D_ARRAY
             } else {
                 vk::ImageViewType::TYPE_2D
             })
@@ -779,7 +787,7 @@ impl<'a> ComputeResources<'a> {
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
-                layer_count: 1,
+                layer_count: layers,
             });
         // SAFETY: the view's image is live and its format/range match the
         // image's creation parameters.
@@ -808,7 +816,7 @@ impl<'a> ComputeResources<'a> {
         // `TextureUpload::cube_safe_layers`); pad the staging pixels to match so
         // the copy of `img_layers` faces never overruns the buffer.
         let img_layers = upload.cube_safe_layers();
-        let staging = upload.staging_pixels(img_layers);
+        let staging = upload.staging_pixels(img_layers)?;
         self.sampled.push(SampledAllocation {
             staging_buffer: vk::Buffer::null(),
             staging_memory: vk::DeviceMemory::null(),
@@ -916,12 +924,12 @@ impl<'a> ComputeResources<'a> {
     }
 
     fn record_and_submit(&self, state: &ComputeState<'_>) -> Result<(), GpuError> {
-        let full_color = vk::ImageSubresourceRange {
+        let full_color = |allocation: &ImageAllocation| vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,
-            layer_count: 1,
+            layer_count: allocation.layers,
         };
         let copy_region = |allocation: &ImageAllocation| {
             vk::BufferImageCopy::default()
@@ -929,7 +937,7 @@ impl<'a> ComputeResources<'a> {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     mip_level: 0,
                     base_array_layer: 0,
-                    layer_count: 1,
+                    layer_count: allocation.layers,
                 })
                 .image_extent(vk::Extent3D {
                     width: allocation.width,
@@ -962,7 +970,7 @@ impl<'a> ComputeResources<'a> {
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(allocation.image)
-                    .subresource_range(full_color);
+                    .subresource_range(full_color(allocation));
                 self.device().cmd_pipeline_barrier(
                     self.command_buffer,
                     vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -987,7 +995,7 @@ impl<'a> ComputeResources<'a> {
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(allocation.image)
-                    .subresource_range(full_color);
+                    .subresource_range(full_color(allocation));
                 self.device().cmd_pipeline_barrier(
                     self.command_buffer,
                     vk::PipelineStageFlags::TRANSFER,
@@ -1130,7 +1138,7 @@ impl<'a> ComputeResources<'a> {
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(allocation.image)
-                    .subresource_range(full_color);
+                    .subresource_range(full_color(allocation));
                 self.device().cmd_pipeline_barrier(
                     self.command_buffer,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1226,6 +1234,7 @@ impl<'a> ComputeResources<'a> {
                 let size = (allocation.width as usize)
                     * (allocation.height as usize)
                     * (allocation.depth as usize)
+                    * (allocation.layers as usize)
                     * (allocation.texel as usize);
                 self.read_host_memory(allocation.readback_memory, size)
             })

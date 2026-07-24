@@ -862,6 +862,22 @@ fn main() -> anyhow::Result<()> {
         let path = args
             .get(pos + 1)
             .ok_or_else(|| anyhow::anyhow!("--run-eboot requires a path to an eboot.bin"))?;
+        // The Shell executes retail titles in this child process. Process-local
+        // subsystem state configured by the Shell does not cross that boundary:
+        // without bringing up cpal here, every sceAudioOut/AudioOut2 submission
+        // was silently dropped because the host ring had never been created.
+        // Load the same persisted settings as the Shell so mute and master
+        // volume remain authoritative in both launch modes.
+        let runner_config =
+            raeen_core::config::EmulatorConfig::load(std::path::Path::new("config.toml"))?;
+        raeen_audio::output::set_volume(runner_config.audio.volume);
+        raeen_audio::output::set_enabled(runner_config.audio.enabled);
+        raeen_audio::output::init();
+        info!(
+            enabled = runner_config.audio.enabled,
+            volume = runner_config.audio.volume,
+            "runner host audio configured"
+        );
         let bytes = std::fs::read(path)?;
         let hle = std::sync::Arc::new(raeen_hle::HleRegistry::new());
         let db = raeen_firmware::dynlib::nid::NidDatabase::from_hle(&hle);

@@ -2996,3 +2996,51 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
     as POS0 sources; it rules out the proposed gs-prolog VGPR-collapse theory
     for this shader. This is visible retail-title progress, not proof of
     gameplay, interaction, universal presentation, or an M2/M3/M5 gate.
+
+- MINECRAFT TITLE PANORAMA + AUDIO REACHED; INPUT ACCEPTANCE STILL OPEN
+  (2026-07-24; working tree, real release runs):
+  * Fixed GFX10 MIMG instruction sizing and addressing: `DIM` comes from
+    word0[5:3], `NSA` adds 0–3 DWORDs to the instruction and supplies explicit
+    address VGPR bytes, and array/cube image operations carry the correct
+    coordinate width. `ImageStore` now supports arrayed v3uint coordinates,
+    storage uploads honor `BASE_ARRAY..=LAST_ARRAY`, and each layer detiles and
+    retiles independently. Corrected GFX10 `VCMPX` to update EXEC while
+    preserving VCC. Exact parser/lowering/storage regressions are green.
+  * Found the panorama's silent-write root cause: storage and sampled resources
+    both used `s24`; a later sampled-descriptor rewrite changed DWORD0 to
+    sampled slot 1, so the one-entry storage array was indexed out of bounds.
+    Storage images now use the exact analyzed descriptor's class-local constant
+    index. Real traces show all six 1024x1024 cube writes at `0x33680000+`
+    becoming non-zero.
+  * Vulkan validation then identified a separate scanout-composite device loss:
+    the generic CPU render-target fallback replaced a decoded six-face cube's
+    24 MiB pixels with a one-face 4 MiB framebuffer snapshot but left
+    `layers=6`; `vkCmdCopyBufferToImage` copied 24 MiB from that 4 MiB buffer
+    (`VUID-vkCmdCopyBufferToImage-pRegions-00171`). The fallback is now limited
+    to plain one-layer 2D textures, and both graphics/compute Vulkan upload
+    paths independently size and zero-pad staging data from the declared image.
+    Three focused regressions cover the substitution gate and one-face/six-face
+    staging mismatch.
+  * Measured release evidence:
+    `scratch/mc-cube-fix-20260724-023344/frames/frame_001024.ppm` is a real
+    1920x1080 Minecraft loading scanout; `frame_002048.ppm` is the complete
+    title screen with Minecraft logo, Steve model, UI text/buttons, and the
+    rendered animated panorama. The run reached exact scanout
+    `0x20040000` with `scanout_hit=true` and no device loss.
+  * The isolated runner now initializes cpal from persisted settings. Minecraft
+    produced a real non-silent 48 kHz PCM submission (observed peaks 0.00219
+    and 0.66420 in separate release runs). AudioOut2 uses the Gen5 structure
+    layout/pacing; ACM and media out-parameters are initialized.
+  * Raw-HID DualSense discovery and a valid 64-byte report were measured.
+    `libScePad` writes the full 120-byte state and the child publishes native
+    input to its process-local kernel. However, a targeted
+    `raeen_hle::libsce_pad=debug` run reached present 1024 without Minecraft
+    calling `scePadOpen` or `scePadReadState`. All five imported Pad NIDs are
+    HLE-resolved, so the remaining acceptance item is to capture a real guest
+    Pad call and a button-driven transition from “Get started” into gameplay.
+  * HONEST STATUS: Minecraft now renders its title assets and produces host
+    audio, but it is not yet “fully playable.” The measured title-screen run
+    took roughly 199 seconds to present index 2048 (about 10 presents/s
+    averaged across boot), far short of the 120 FPS north star. M4/M5 remain
+    open; no compatibility status is raised without a measured interactive
+    report.

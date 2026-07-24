@@ -2367,7 +2367,8 @@ pub(crate) fn sampled_key_layout(bind: &ShaderBindResources) -> Vec<SampledArray
 /// The single `OpTypeImage` (Dim, storage format) of the STORAGE
 /// (read-write) image array (`%textures2D_L`), decided from the measured RW
 /// T#s: type 8 = height-1 2D, type 9 = 2D, type 10 = 3D (ASTRO.BOT:
-/// 240x135x64 UAV volumes); guest format 71 (16_16_16_16 FLOAT) = `Rgba16f`,
+/// 240x135x64 UAV volumes), and types 11/13 = writable 2D arrays
+/// (Minecraft's panorama builder); guest format 71 (16_16_16_16 FLOAT) = `Rgba16f`,
 /// format 77 (32_32_32_32 FLOAT) = `Rgba32f`, everything else keeps the
 /// legacy `Rgba8` view (the 32-bpp guest formats the upload path reads, or
 /// the zero-filled seed). Mixed dims/formats stay a named refusal — one
@@ -2385,6 +2386,7 @@ pub(crate) fn storage_texture_dim_format(
         }
         let dim = match d.texture.type_() {
             10 => SampledDim::Three,
+            11 | 13 => SampledDim::TwoArray,
             _ => SampledDim::Two,
         };
         let format = match d.texture.format() {

@@ -1,7 +1,10 @@
 //! HLE libScePad — Controller input interface.
 
 use crate::{HleContext, HleRegistry};
-use tracing::{debug, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{debug, info, warn};
+
+static FIRST_GUEST_PAD_READ: AtomicBool = AtomicBool::new(false);
 
 /// Register libScePad HLE functions.
 pub fn register(registry: &HleRegistry) {
@@ -276,6 +279,19 @@ fn hle_pad_read_state(ctx: &HleContext, args: &[u64]) -> u64 {
         .kernel
         .pad_state()
         .unwrap_or_else(|| raeen_input::ControllerState::default().to_orbis_pad_data());
+    if !FIRST_GUEST_PAD_READ.swap(true, Ordering::Relaxed) {
+        info!(
+            handle,
+            data = format_args!("{data:#x}"),
+            buttons = format_args!(
+                "{:#010x}",
+                u32::from_le_bytes(prefix[0..4].try_into().expect("fixed prefix"))
+            ),
+            left_stick = ?&prefix[4..6],
+            right_stick = ?&prefix[6..8],
+            "first guest controller read consumed the host pad snapshot"
+        );
+    }
     let full = compose_pad_data(&prefix);
     if data != 0 && !ctx.mem.write(data, &full) {
         warn!("scePadReadState: ScePadData out-buffer {data:#x} not writable");

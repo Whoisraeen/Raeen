@@ -42,6 +42,10 @@ const MAX_RING_SAMPLES: usize = 48_000 * 2 / 4;
 /// cross-crate tests (the HLE AudioOut / AudioOut2 push path asserting it
 /// reached the host mixer) have an observable signal even without a device.
 static SUBMIT_CALLS: AtomicU64 = AtomicU64::new(0);
+/// One-shot diagnostic proving that guest PCM contains an audible sample.
+/// The first submission is commonly an intentional silence buffer, so logging
+/// only call one cannot distinguish a live decoder from a silence stub.
+static NON_SILENT_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// How many times [`submit`] has been called this process. See [`SUBMIT_CALLS`].
 #[must_use]
@@ -203,7 +207,31 @@ fn fill(out: &mut [f32], out_channels: usize, ring: &Ring) {
 /// the ring — dropping the oldest if the consumer is behind so memory stays
 /// bounded. A no-op until [`init`], or when muted.
 pub fn submit(src_rate: u32, samples: &[f32]) {
-    SUBMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+    let call = SUBMIT_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    let peak = samples.iter().fold(0.0f32, |peak, sample| {
+        if sample.is_finite() {
+            peak.max(sample.abs())
+        } else {
+            peak
+        }
+    });
+    if call == 1 {
+        info!(
+            src_rate,
+            stereo_samples = samples.len(),
+            peak,
+            "first guest PCM submission reached host audio"
+        );
+    }
+    if peak > 1.0e-6 && !NON_SILENT_LOGGED.swap(true, Ordering::Relaxed) {
+        info!(
+            call,
+            src_rate,
+            stereo_samples = samples.len(),
+            peak,
+            "first non-silent guest PCM submission reached host audio"
+        );
+    }
     let Some(ring) = RING.get() else {
         return;
     };

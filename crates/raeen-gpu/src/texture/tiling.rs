@@ -604,9 +604,8 @@ pub const fn swizzle_64kb_table(mode: u8) -> Option<&'static [[AddressBit; 16]; 
 /// XOR consumes — do not reduce them mod the block size.
 ///
 /// The production detile hoists the two axis terms out of its loops (SharpEmu
-/// #483); this whole-offset form is retained as the reference the round-trip
-/// tiler and the known-answer pins check the factoring against.
-#[cfg(test)]
+/// #483); this whole-offset form is retained for the inverse writeback tiler
+/// and the known-answer pins that check the factoring.
 fn gfx10_pattern_offset(x: u32, y: u32, pattern: &[AddressBit; 16]) -> u64 {
     // Each output bit is parity(x & XMask) XOR parity(y & YMask), and parity
     // distributes over XOR, so the whole offset factors into two independent
@@ -741,28 +740,24 @@ pub fn tiled_byte_count_for_mode(mode: u8, width: u32, height: u32, bpp_log2: u3
 }
 
 /// Tile a linear surface into a 64 KiB-block swizzle — the exact inverse of
-/// [`detile_64kb_with`], used by the round-trip consistency tests.
-#[cfg(test)]
+/// [`detile_64kb_with`]. Production storage-image writeback uses
+/// [`tile_64kb_into`]; this allocating wrapper is convenient for tests.
 pub fn tile_64kb_r_x(linear: &[u8], width: u32, height: u32, bpp_log2: u32) -> Vec<u8> {
     tile_64kb_with(linear, width, height, bpp_log2, &RB_PLUS_64K_RENDER_X)
 }
 
-/// `SW_64KB_S` twin of [`tile_64kb_r_x`], for the Standard-layout round-trip.
-#[cfg(test)]
+/// `SW_64KB_S` twin of [`tile_64kb_r_x`].
 pub fn tile_64kb_s(linear: &[u8], width: u32, height: u32, bpp_log2: u32) -> Vec<u8> {
     tile_64kb_with(linear, width, height, bpp_log2, &RB_PLUS_64K_STANDARD)
 }
 
-/// `SW_64KB_Z_X` twin of [`tile_64kb_r_x`] (SWIZZLE_MODE 24), for the
-/// 2DArray decode round-trip test.
-#[cfg(test)]
+/// `SW_64KB_Z_X` twin of [`tile_64kb_r_x`] (SWIZZLE_MODE 24).
 pub fn tile_64kb_z_x(linear: &[u8], width: u32, height: u32, bpp_log2: u32) -> Vec<u8> {
     tile_64kb_with(linear, width, height, bpp_log2, &RB_PLUS_64K_DEPTH_X)
 }
 
 /// Tile a linear surface into a 64 KiB-block swizzle — the exact inverse of
-/// [`detile_64kb_with`], used by the round-trip consistency tests.
-#[cfg(test)]
+/// [`detile_64kb_with`].
 fn tile_64kb_with(
     linear: &[u8],
     width: u32,
@@ -787,6 +782,55 @@ fn tile_64kb_with(
         }
     }
     out
+}
+
+/// Retile one linear surface into an already-allocated guest swizzle buffer.
+///
+/// This is the non-allocating production inverse used after storage-image
+/// readback. `false` means the mode is unsupported or either slice is shorter
+/// than the exact linear/tiled extent.
+pub fn tile_64kb_into(
+    mode: u8,
+    linear: &[u8],
+    tiled: &mut [u8],
+    width: u32,
+    height: u32,
+    bpp_log2: u32,
+) -> bool {
+    let Some((table, block_bytes)) = swizzle_table(mode) else {
+        return false;
+    };
+    let bpp = 1usize << bpp_log2;
+    let Some(linear_len) = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(bpp))
+    else {
+        return false;
+    };
+    let Some(tiled_len) = tiled_byte_count_for_mode(mode, width, height, bpp_log2)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+    else {
+        return false;
+    };
+    if linear.len() < linear_len || tiled.len() < tiled_len {
+        return false;
+    }
+
+    tiled[..tiled_len].fill(0);
+    let pattern = &table[bpp_log2 as usize];
+    let (bw, bh) = block_dimensions(block_bytes as u32, bpp_log2);
+    let blocks_per_row = u64::from(width.div_ceil(bw));
+    for yy in 0..height {
+        let block_y = u64::from(yy / bh);
+        let src_row = yy as usize * width as usize * bpp;
+        for xx in 0..width {
+            let block_index = block_y * blocks_per_row + u64::from(xx / bw);
+            let dst = block_index * block_bytes + gfx10_pattern_offset(xx, yy, pattern);
+            let src = src_row + xx as usize * bpp;
+            tiled[dst as usize..dst as usize + bpp].copy_from_slice(&linear[src..src + bpp]);
+        }
+    }
+    true
 }
 
 #[cfg(test)]

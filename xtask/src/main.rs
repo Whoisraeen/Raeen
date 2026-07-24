@@ -525,13 +525,15 @@ fn registry_roots_from_path(path: &str) -> Vec<String> {
 
 fn first_blocker(text: &str, roots: &[String]) -> Option<String> {
     text.lines()
-        .find(|line| {
-            line.contains("ERROR")
-                || line.contains("panicked")
-                || line.contains("not supported")
-                || line.contains("not implemented")
-        })
+        .find(|line| is_blocker_line(line))
         .map(|line| sanitize_line(line, roots))
+}
+
+fn is_blocker_line(line: &str) -> bool {
+    line.contains("ERROR")
+        || line.contains("panicked")
+        || (line.contains("WARN")
+            && (line.contains("not supported") || line.contains("not implemented")))
 }
 
 fn sanitize_line(line: &str, roots: &[String]) -> String {
@@ -629,6 +631,7 @@ fn compat_publish(args: &[String]) -> Result<()> {
             .evidence
             .first_blocker
             .as_deref()
+            .filter(|line| is_blocker_line(line))
             .unwrap_or("none observed")
             .to_string();
         // Re-sanitize on publication as a defense in depth: older measured
@@ -986,6 +989,18 @@ mod tests {
         assert!(!value.contains(r"E:\PS5"));
         assert!(!value.contains("556760000"));
         assert!(value.contains("0x10"));
+    }
+
+    #[test]
+    fn informational_capability_messages_are_not_compatibility_blockers() {
+        let log = concat!(
+            "INFO guest: IPv6 not supported\n",
+            "INFO guest: continuing offline\n",
+            "WARN shader: opcode not supported\n",
+        );
+        assert!(!is_blocker_line("INFO guest: IPv6 not supported"));
+        let blocker = first_blocker(log, &[]).expect("warning is a blocker");
+        assert_eq!(blocker, "WARN shader: opcode not supported");
     }
 
     #[test]

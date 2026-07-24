@@ -890,6 +890,12 @@ pub struct ShaderInstruction {
     /// and `src[0]` is a 32-bit per-lane offset. Gates the address computation
     /// in the recompiler exactly as SharpEmu gates its SPIR-V emission.
     pub uses_flat_address: bool,
+    /// GFX10 MIMG non-sequential-address (NSA) payload. Address component zero
+    /// always comes from `src[0]`; when this count is non-zero, subsequent
+    /// components come from these explicitly encoded VGPRs instead of
+    /// consecutive registers. One dword carries four byte-sized VGPR ids.
+    pub mimg_nsa_dwords: u8,
+    pub mimg_nsa_addr: [ShaderOperand; 12],
 }
 
 /// Kyty: Shader.h `ShaderLabel` (L420). `dst = pc + 4 + src[0].constant.i`.
