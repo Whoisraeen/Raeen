@@ -78,6 +78,26 @@ fn color_output_disabled(ctx: &Context) -> bool {
     ctx.render_target_mask == 0
 }
 
+/// Opt-in shader-address filter for late-title draw forensics.
+///
+/// `RAEEN_TRACE_SHADER_ADDR=0x1234,0x5678` selects a draw when either its VS
+/// or PS address matches. Keeping this separate from `RAEEN_TRACE_DRAWS`
+/// avoids consuming every rate limiter on boot clears before a UI shader is
+/// first bound.
+fn trace_selected_shader(vs: u64, ps: u64) -> bool {
+    let Some(raw) = std::env::var_os("RAEEN_TRACE_SHADER_ADDR") else {
+        return false;
+    };
+    raw.to_string_lossy().split(',').any(|part| {
+        let part = part.trim();
+        let digits = part
+            .strip_prefix("0x")
+            .or_else(|| part.strip_prefix("0X"))
+            .unwrap_or(part);
+        u64::from_str_radix(digits, 16).is_ok_and(|addr| addr == vs || addr == ps)
+    })
+}
+
 /// Map `CB_TARGET_MASK`'s MRT0 nibble to Vulkan's colour write mask.
 ///
 /// Bit per channel, R in bit 0 through A in bit 3 — the same shape Vulkan uses,
@@ -257,7 +277,11 @@ fn depth_state_from_regs(ctx: &Context) -> Result<Option<DepthState<'static>>, D
         test_enable: control.z_enable,
         write_enable: control.z_write_enable && !target.depth_view.depth_write_disable,
         compare_op: vk::CompareOp::from_raw(i32::from(control.zfunc)),
-        stencil_test_enable: control.stencil_enable,
+        // Diagnostic bisection only: lets a real-title run distinguish an
+        // empty frame caused by stencil rejection from shader/geometry faults.
+        // Production behaviour remains register-derived when unset.
+        stencil_test_enable: control.stencil_enable
+            && std::env::var_os("RAEEN_NO_STENCIL").is_none(),
         stencil_front: front,
         stencil_back: back,
         clear_depth: ctx.render_control.depth_clear_enable,
@@ -1908,8 +1932,14 @@ fn prepare_stage_binding(
         );
         if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
             use std::sync::atomic::{AtomicU32, Ordering};
-            static SEEN: AtomicU32 = AtomicU32::new(0);
-            if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
+            static COMPUTE_SEEN: AtomicU32 = AtomicU32::new(0);
+            static GRAPHICS_SEEN: AtomicU32 = AtomicU32::new(0);
+            let (seen, limit) = if stage == vk::ShaderStageFlags::COMPUTE {
+                (&COMPUTE_SEEN, 8)
+            } else {
+                (&GRAPHICS_SEEN, 32)
+            };
+            if seen.fetch_add(1, Ordering::Relaxed) < limit {
                 tracing::warn!(
                     stage = ?stage,
                     addr = format_args!("{:#x}", resource.base48()),
@@ -2032,9 +2062,12 @@ fn prepare_stage_binding(
                         stage = ?stage,
                         index,
                         base = format_args!("{:#x}", desc.texture.base40()),
+                        raw = format_args!("{:08x?}", desc.texture.fields),
                         width = decoded.width,
                         height = decoded.height,
                         vk_format = ?decoded.format,
+                        direct_target = ?decoded.render_target,
+                        decoded_bytes = decoded.pixels.len(),
                         "TRACE_DRAWS: texture decoded"
                     );
                 }
@@ -2628,15 +2661,9 @@ impl OffscreenDrawSink<'_> {
         })?;
 
         // One-shot forensic: what does a real Minecraft draw actually bind?
-        // CORRECTED 2026-07-20: this used to claim "geometry covers the screen
-        // and the PS shades black". That is REFUTED — with RAEEN_FORCE_CLEAR=1
-        // (see offscreen.rs) Minecraft's final frame is 100% uniform
-        // CLEAR_COLOR, so NOT ONE draw produces a fragment. There is no
-        // coverage, and the PS is therefore never invoked; chasing the PS
-        // inputs from here is the wrong wall. What this trace is still good
-        // for: it shows the draws ARE well-formed (measured: textured/storage
-        // -fed quads, prim=4 verts=6 and prim=6 verts=4, 1 vertex buffer,
-        // 1-2 attributes), which is what pins the failure on VERTEX POSITIONS.
+        // A force-clear experiment alone cannot prove zero fragment coverage:
+        // a fragment shader or blend state may legitimately write that same
+        // colour. Treat this as a state census, not a coverage verdict.
         // Gated to the first few draws (RAEEN_TRACE_DRAWS) so it never floods.
         if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
             use std::sync::atomic::{AtomicU32, Ordering};
@@ -2647,6 +2674,9 @@ impl OffscreenDrawSink<'_> {
                 tracing::warn!(
                     prim = ucfg.prim_type,
                     verts = state.vertex_count,
+                    target_base = format_args!("{rt_base:#x}"),
+                    target_extent = format_args!("{}x{}", state.width, state.height),
+                    target_format = ?state.format,
                     guest_vbufs = state.vertex_buffers.len(),
                     vattrs = state.vertex_attributes.len(),
                     ps_tex = ps.textures2d.textures_num,
@@ -2658,6 +2688,94 @@ impl OffscreenDrawSink<'_> {
                     vs_sbuf = vs.storage_buffers.buffers_num,
                     vs_pushc = vs.push_constant_size,
                     "TRACE_DRAWS: real draw bind profile"
+                );
+            }
+        }
+
+        let vs_addr = sh.vs.vs_regs.data_addr;
+        let ps_addr = sh.ps.ps_regs.data_addr;
+        if trace_selected_shader(vs_addr, ps_addr) {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SELECTED_SEEN: AtomicU32 = AtomicU32::new(0);
+            let selected = SELECTED_SEEN.fetch_add(1, Ordering::Relaxed);
+            if selected < 32 {
+                let vertex_heads: Vec<_> = state
+                    .vertex_buffers
+                    .iter()
+                    .map(|buffer| {
+                        (
+                            buffer.stride,
+                            buffer.bytes.len(),
+                            buffer.bytes[..buffer.bytes.len().min(64)].to_vec(),
+                        )
+                    })
+                    .collect();
+                let stage_resources: Vec<_> = state
+                    .stage_bindings
+                    .iter()
+                    .map(|binding| {
+                        (
+                            binding.stage,
+                            binding.descriptor_set_slot,
+                            binding.push_constants.len(),
+                            binding
+                                .storage_buffers
+                                .as_ref()
+                                .map_or(0, |buffers| buffers.buffers.len()),
+                            binding
+                                .textures
+                                .as_ref()
+                                .map_or(0, |textures| textures.textures.len()),
+                        )
+                    })
+                    .collect();
+                let depth_summary = state.depth.as_ref().map(|depth| {
+                    (
+                        depth.target_base,
+                        depth.format,
+                        depth.test_enable,
+                        depth.write_enable,
+                        depth.compare_op,
+                        depth.stencil_test_enable,
+                        depth.stencil_front,
+                        depth.stencil_back,
+                        depth.clear_depth,
+                        depth.clear_stencil,
+                        depth.clear_stencil_value,
+                        depth.viewport_depth,
+                    )
+                });
+                let index_head = index.map(|(bytes, index_type)| {
+                    (
+                        index_type,
+                        bytes.len(),
+                        bytes[..bytes.len().min(32)].to_vec(),
+                    )
+                });
+                tracing::warn!(
+                    selected,
+                    vs_addr = format_args!("{vs_addr:#x}"),
+                    es_addr = format_args!("{:#x}", sh.vs.es_regs.data_addr),
+                    gs_addr = format_args!("{:#x}", sh.vs.gs_regs.data_addr),
+                    ps_addr = format_args!("{ps_addr:#x}"),
+                    prim = ucfg.prim_type,
+                    count = state.vertex_count,
+                    indexed = index.is_some(),
+                    index_head = ?index_head,
+                    target_base = format_args!("{rt_base:#x}"),
+                    extent = format_args!("{}x{}", state.width, state.height),
+                    viewport = ?state.viewport,
+                    scissor = ?state.scissor,
+                    topology = ?state.topology,
+                    cull = ?state.cull_mode,
+                    face = ?state.front_face,
+                    write_mask = ?state.color_write_mask,
+                    blend = ?state.blend,
+                    depth = ?depth_summary,
+                    attributes = ?state.vertex_attributes,
+                    vertex_heads = ?vertex_heads,
+                    stage_resources = ?stage_resources,
+                    "TRACE_SHADER_ADDR: selected draw state"
                 );
             }
         }
@@ -3568,7 +3686,7 @@ mod tests {
     #[test]
     #[allow(clippy::field_reassign_with_default)]
     fn interleaved_vertex_upload_covers_final_attribute_extent() {
-        let guest = vec![0x5au8; 80];
+        let guest = [0x5au8; 80];
         let base = guest.as_ptr() as u64;
 
         let mut vs = ShaderVertexInputInfo::default();

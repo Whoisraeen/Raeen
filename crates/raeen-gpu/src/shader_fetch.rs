@@ -15,8 +15,8 @@
 //! # Caching (positive and negative)
 //!
 //! Titles re-bind the same shaders every frame. Code is first parsed/analyzed,
-//! then translated modules are cached by `(stage, guest_addr, full fetched
-//! window digest, analyzed stage ABI)`. The analyzed ABI includes descriptor
+//! then translated modules are cached by `(stage, guest_addr, parsed-code
+//! digest, analyzed stage ABI)`. The analyzed ABI includes descriptor
 //! types, exact formats, and embedded constants, so reusing one code address
 //! with different code or bindings cannot return stale SPIR-V. The cache is
 //! FIFO-bounded; analysis failures are never cached before binding identity is
@@ -83,8 +83,9 @@ impl Stage {
 }
 
 /// Code identity after the bounded fetch/analyze loop. The digest covers the
-/// complete fetched window so a title rewriting bytes beyond the first four
-/// dwords cannot reuse stale SPIR-V.
+/// parsed instruction stream, not the entire 4-KiB fetch window: Minecraft
+/// places transient shader/resource allocations next to one another and was
+/// retranslating the same shaders every frame when adjacent bytes changed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct CodeKey {
     stage: Stage,
@@ -147,6 +148,20 @@ enum PreparedShader {
 }
 
 impl PreparedShader {
+    /// Number of source dwords that actually belong to the parsed instruction
+    /// stream. The parser's final instruction is the terminating `s_endpgm`
+    /// (or fetch-shader `s_setpc_b64`), so its PC identifies the exact stable
+    /// prefix. Resource metadata and embedded values outside this prefix are
+    /// already represented by [`Self::binding_identity`].
+    fn parsed_code_dwords(&self) -> usize {
+        let code = match self {
+            Self::Vs { code, .. } | Self::Ps { code, .. } | Self::Cs { code, .. } => code,
+        };
+        code.get_instructions()
+            .last()
+            .map_or(0, |instruction| instruction.pc as usize / 4 + 1)
+    }
+
     fn binding_identity(&self) -> Box<[u32]> {
         let mut id = Vec::with_capacity(192);
         match self {
@@ -741,7 +756,16 @@ impl ShaderTranslateCache {
             }
         };
 
-        let code_key = CodeKey::new(stage, addr, &window.data);
+        let parsed_dwords = prepared.parsed_code_dwords();
+        // Embedded shaders have no fetched instruction list; retain the small
+        // head identity for them. Normal title shaders hash only the exact
+        // parsed prefix, eliminating false misses from adjacent guest writes.
+        let identity_dwords = if parsed_dwords == 0 {
+            window.data.len().min(4)
+        } else {
+            parsed_dwords.min(window.data.len())
+        };
+        let code_key = CodeKey::new(stage, addr, &window.data[..identity_dwords]);
         let key = CacheKey {
             code: code_key,
             binding: prepared.binding_identity(),
@@ -1341,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_hashes_the_fetched_tail_not_just_the_head() {
+    fn cache_key_ignores_adjacent_tail_but_detects_parsed_code_rewrites() {
         let mut blob = build_blob(VS_BODY, 0xAAAA_00F1, 0xBBBB_00F1);
         let addr = blob.as_ptr() as u64;
         let byte_len = std::mem::size_of_val(blob.as_slice());
@@ -1357,13 +1381,22 @@ mod tests {
                 .translate_vs(&vs_regs_at(addr), &sh_regs)
                 .expect("tail-mutated fixture VS");
             assert!(
-                !Arc::ptr_eq(&first.spirv, &second.spirv),
-                "a fetched-tail rewrite must miss the module cache"
+                Arc::ptr_eq(&first.spirv, &second.spirv),
+                "bytes beyond the parsed shader must not invalidate its module"
+            );
+            let body_dword = 3;
+            blob[body_dword] ^= 1;
+            let third = cache
+                .translate_vs(&vs_regs_at(addr), &sh_regs)
+                .expect("code-mutated fixture VS");
+            assert!(
+                !Arc::ptr_eq(&second.spirv, &third.spirv),
+                "a parsed instruction rewrite must miss the module cache"
             );
             let stats = cache.stats();
             assert_eq!(
                 (stats.distinct_fetched, stats.translated_ok, stats.hits),
-                (2, 2, 0)
+                (2, 2, 1)
             );
         });
     }

@@ -31,6 +31,7 @@ pub mod libkernel;
 pub mod libsce_acm;
 pub mod libsce_agc;
 pub(crate) mod libsce_agc_reg_defaults;
+pub(crate) mod libsce_agc_reg_defaults_v10;
 pub mod libsce_ampr;
 pub mod libsce_app_content;
 pub mod libsce_audio_out;

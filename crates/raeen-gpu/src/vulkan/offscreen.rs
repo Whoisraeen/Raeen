@@ -874,6 +874,10 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
             ),
             topo = format_args!("{:?}", state.topology),
             cull = format_args!("{:?}/{:?}", state.cull_mode, state.front_face),
+            viewport = format_args!("{:?}", state.viewport),
+            scissor = format_args!("{:?}", state.scissor),
+            color_write_mask = format_args!("{:?}", state.color_write_mask),
+            blend = format_args!("{:?}", state.blend),
             depth = state.depth.is_some(),
             vcount = state.vertex_count,
             indexed = state.index.is_some(),
@@ -1051,7 +1055,10 @@ pub fn render_draw_deferred(
     if force_immediate
         || state.target_base.is_none()
         || !state.color_output
-        || state.depth.is_some()
+        || state
+            .depth
+            .as_ref()
+            .is_some_and(|depth| depth.target_base.is_none())
     {
         return Ok(render_draw(dev, state)?.color);
     }
@@ -1140,21 +1147,21 @@ pub fn flush_deferred_draws_filtered(
     if !caches.batch_open() {
         return Ok(Vec::new());
     }
-    let (pending, touched, evicted) = caches.take_batch();
+    let (pending, touched, evicted, evicted_depth) = caches.take_batch();
     let (read_now, keep): (Vec<TargetKey>, Vec<TargetKey>) = match only_bases {
         Some(bases) => touched.into_iter().partition(|k| bases.contains(&k.base)),
         None => (touched, Vec::new()),
     };
     // Nothing pending to fence and the filter selected nothing: put the
     // unread targets back and do no GPU work at all.
-    if pending.is_empty() && read_now.is_empty() && evicted.is_empty() {
+    if pending.is_empty() && read_now.is_empty() && evicted.is_empty() && evicted_depth.is_empty() {
         caches.requeue_touched(keep);
         return Ok(Vec::new());
     }
     let pending_draws = pending.len();
     match record_and_read_flush(dev, &mut caches, &read_now) {
         Ok(images) => {
-            caches.retire_batch(dev, pending, evicted);
+            caches.retire_batch(dev, pending, evicted, evicted_depth);
             let kept_gpu_side = keep.len();
             caches.requeue_touched(keep);
             caches.stats.batch_flushes += 1;
@@ -1181,7 +1188,7 @@ pub fn flush_deferred_draws_filtered(
             for key in read_now.iter().chain(keep.iter()) {
                 caches.mark_target_unknown(key);
             }
-            caches.retire_batch(dev, pending, evicted);
+            caches.retire_batch(dev, pending, evicted, evicted_depth);
             Err(e)
         }
     }
@@ -3616,31 +3623,34 @@ impl<'a> Resources<'a> {
                     dst_stage: vk::PipelineStageFlags::TRANSFER,
                 },
             );
-            let mut regions = vec![depth_copy_region(
-                width,
-                height,
-                vk::ImageAspectFlags::DEPTH,
-                0,
-            )];
-            if has_stencil_plane(depth.format) {
-                let offset = depth_plane_bytes(width, height, depth.format)?;
-                regions.push(depth_copy_region(
+            if !self.batched {
+                let mut regions = vec![depth_copy_region(
                     width,
                     height,
-                    vk::ImageAspectFlags::STENCIL,
-                    offset,
-                ));
-            }
-            // SAFETY: the depth image is in TRANSFER_SRC per the barrier above,
-            // and `depth_readback_buffer` was sized for exactly these planes.
-            unsafe {
-                self.device().cmd_copy_image_to_buffer(
-                    self.command_buffer,
-                    self.depth_image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    self.depth_readback_buffer,
-                    &regions,
-                );
+                    vk::ImageAspectFlags::DEPTH,
+                    0,
+                )];
+                if has_stencil_plane(depth.format) {
+                    let offset = depth_plane_bytes(width, height, depth.format)?;
+                    regions.push(depth_copy_region(
+                        width,
+                        height,
+                        vk::ImageAspectFlags::STENCIL,
+                        offset,
+                    ));
+                }
+                // SAFETY: the depth image is in TRANSFER_SRC per the barrier
+                // above, and `depth_readback_buffer` was sized for exactly
+                // these planes.
+                unsafe {
+                    self.device().cmd_copy_image_to_buffer(
+                        self.command_buffer,
+                        self.depth_image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        self.depth_readback_buffer,
+                        &regions,
+                    );
+                }
             }
         }
 
@@ -3726,10 +3736,12 @@ impl<'a> Resources<'a> {
         take_buffer(&mut self.vertex_buffer, &mut self.vertex_memory);
         take_buffer(&mut self.index_buffer, &mut self.index_memory);
         take_buffer(&mut self.depth_upload_buffer, &mut self.depth_upload_memory);
-        take_buffer(
-            &mut self.depth_readback_buffer,
-            &mut self.depth_readback_memory,
-        );
+        if self.owns_depth_target {
+            take_buffer(
+                &mut self.depth_readback_buffer,
+                &mut self.depth_readback_memory,
+            );
+        }
         for (buffer, memory) in self.guest_vertex_buffers.drain(..) {
             res.buffers.push((buffer, memory));
         }
@@ -3764,7 +3776,9 @@ impl<'a> Resources<'a> {
                     .push((texture.image, texture.memory, texture.view));
             }
         }
-        if self.depth_image != vk::Image::null() || self.depth_view != vk::ImageView::null() {
+        if self.owns_depth_target
+            && (self.depth_image != vk::Image::null() || self.depth_view != vk::ImageView::null())
+        {
             res.images.push((
                 mem::replace(&mut self.depth_image, vk::Image::null()),
                 mem::replace(&mut self.depth_memory, vk::DeviceMemory::null()),

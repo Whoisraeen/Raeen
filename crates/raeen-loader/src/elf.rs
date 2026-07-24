@@ -122,8 +122,9 @@ pub fn parse_elf(data: &[u8]) -> Result<LoadedBinary, LoaderError> {
                 // Copy the file window only if it lies fully within the input;
                 // `offset + file_size` is checked so a crafted p_offset near
                 // usize::MAX cannot wrap and index out of bounds.
-                let file_window_in_bounds =
-                    offset.checked_add(file_size).is_some_and(|end| end <= data.len());
+                let file_window_in_bounds = offset
+                    .checked_add(file_size)
+                    .is_some_and(|end| end <= data.len());
                 let segment_data = if file_window_in_bounds {
                     let mut buf = vec![0u8; mem_size];
                     buf[..file_size].copy_from_slice(&data[offset..offset + file_size]);

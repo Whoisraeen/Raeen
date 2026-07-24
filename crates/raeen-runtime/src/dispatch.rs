@@ -1775,7 +1775,7 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
          returning 0x0 here is the usual cause of a null dereference in guest code:",
         entries.len()
     );
-    for &(idx, ret, _args) in &entries {
+    for &(idx, ret, args) in &entries {
         let marker = if is_orbis_error(ret) {
             "  <-- ERROR"
         } else {
@@ -1785,14 +1785,22 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
             Some(t) => {
                 let _ = write!(
                     ring,
-                    "\n    {}::{} -> {ret:#x}{marker}",
-                    t.library, t.function
+                    "\n    {}::{}({args:x?}) -> {ret:#x}{marker}",
+                    t.library, t.function,
                 );
             }
             None => {
                 let _ = write!(ring, "\n    <trampoline #{idx}> -> {ret:#x}{marker}");
             }
         }
+    }
+    if std::env::var_os("RAEEN_CRASH_RING_WARN").is_some() {
+        let tail = ring
+            .lines()
+            .skip(entries.len().saturating_sub(64) + 1)
+            .collect::<Vec<_>>()
+            .join("\n");
+        tracing::warn!("last HLE calls before the fault (diagnostic):\n{tail}");
     }
     tracing::debug!("{ring}");
 }

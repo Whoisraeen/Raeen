@@ -744,6 +744,7 @@ impl CommandProcessor {
             pm4::IT_SET_CONTEXT_REG => self.cp_op_set_context_reg(cmd_id, body, offset),
             pm4::IT_SET_SH_REG => self.cp_op_set_shader_reg(cmd_id, body, offset),
             pm4::IT_SET_UCONFIG_REG => self.cp_op_set_uconfig_reg(cmd_id, body, offset),
+            pm4::IT_SET_UCONFIG_REG_INDEX => self.cp_op_set_uconfig_reg_index(cmd_id, body, offset),
             pm4::IT_DRAW_INDEX_AUTO => self.cp_op_draw_index_auto(cmd_id, body, offset, sink),
             pm4::IT_DISPATCH_DIRECT => self.cp_op_dispatch_direct(cmd_id, body, offset, sink),
             // Kyty: cp_op_draw_index (L2757), raw IT form 0xc0042700.
@@ -2417,6 +2418,25 @@ impl CommandProcessor {
         Ok(count as u32 + 1)
     }
 
+    /// `IT_SET_UCONFIG_REG_INDEX`: indexed user-config writes encode the
+    /// register in the low 16 bits of the first body DWORD and carry the
+    /// index/control selector in its high bits. Minecraft receives this packet
+    /// from KytyPS5's `GraphicsUnknownKRzWekV120`.
+    fn cp_op_set_uconfig_reg_index(
+        &mut self,
+        cmd_id: u32,
+        body: &[u32],
+        offset: u32,
+    ) -> Result<u32, CpError> {
+        let reg = Self::body_at(body, 0, offset)? & 0xffff;
+        let values = &body[1..];
+        let count = Self::reg_count(cmd_id, values, offset)?;
+        for (i, &value) in values.iter().enumerate().take(count) {
+            self.set_uconfig_register(reg + i as u32, value);
+        }
+        Ok(count as u32 + 1)
+    }
+
     /// Kyty: `g_hw_uc_func` / `g_hw_uc_indirect_func` — one entry
     /// (`VGT_PRIMITIVE_TYPE`).
     fn set_uconfig_register(&mut self, reg: u32, value: u32) {
@@ -2433,6 +2453,7 @@ impl CommandProcessor {
         }
         match reg {
             pm4::VGT_PRIMITIVE_TYPE => self.ucfg.prim_type = value,
+            pm4::VGT_INDEX_TYPE => self.index_type_and_size = value,
             _ => {
                 if self.first(SkipKey::Reg(RegFile::UserConfig, reg))
                     && warn_skip_reg_once(RegFile::UserConfig, reg)
@@ -3273,6 +3294,25 @@ mod tests {
         assert_eq!(cp.index_type_and_size(), 2);
         assert_eq!(cp.index_base(), 0x1_0000_5000);
         assert_eq!(cp.index_buffer_size(), 600);
+    }
+
+    #[test]
+    fn indexed_uconfig_packet_updates_vgt_index_type() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            header(3, pm4::IT_SET_UCONFIG_REG_INDEX, pm4::R_ZERO),
+            0x2000_0000 | pm4::VGT_INDEX_TYPE,
+            0x4483,
+        ];
+        cp.run(&dcb, &mut sink)
+            .expect("indexed user-config register write");
+        assert_eq!(cp.index_type_and_size(), 0x4483);
+        assert_eq!(
+            cp.distinct_skips(),
+            0,
+            "the packet must not degrade to skip"
+        );
     }
 
     /// Kyty: `cp_op_draw_reset` → `CommandProcessor::Reset`. Register and

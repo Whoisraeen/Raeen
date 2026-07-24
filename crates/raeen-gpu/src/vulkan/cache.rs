@@ -398,6 +398,8 @@ pub(crate) struct DrawCaches {
     /// referenced by pending command buffers, so destruction waits for the
     /// flush's fence.
     deferred_target_destroys: Vec<PersistentTarget>,
+    /// Same retirement rule for persistent depth/stencil targets.
+    deferred_depth_target_destroys: Vec<PersistentDepthTarget>,
     /// Upload ring (stage C item 3): recycled HOST_VISIBLE|HOST_COHERENT
     /// buffers for per-draw guest data (vertex/index/storage/seed/texture
     /// staging). Free entries keyed by capacity (a power of two); a draw takes
@@ -915,8 +917,8 @@ impl DrawCaches {
     }
 
     /// Remove stale images when the guest reprograms one depth base with a
-    /// different extent/format. Immediate depth draws fence-wait before the
-    /// next cache acquisition, so no submitted work can still name them.
+    /// different extent/format. During a deferred batch, park them until the
+    /// shared fence; otherwise no submitted work can still name them.
     pub(crate) fn evict_depth_targets_for_base(
         &mut self,
         device: &ash::Device,
@@ -931,9 +933,13 @@ impl DrawCaches {
             .collect();
         for key in stale {
             if let Some(target) = self.depth_targets.remove(&key) {
-                // SAFETY: depth-bearing draws currently use the immediate path,
-                // whose fence completed before the cache lock was released.
-                unsafe { destroy_depth_target(device, &target) };
+                if self.batch_open() {
+                    self.deferred_depth_target_destroys.push(target);
+                } else {
+                    // SAFETY: no deferred batch is open and synchronous work
+                    // fence-waits before releasing this cache lock.
+                    unsafe { destroy_depth_target(device, &target) };
+                }
             }
         }
     }
@@ -1208,11 +1214,13 @@ impl DrawCaches {
         Vec<PendingDrawResources>,
         Vec<TargetKey>,
         Vec<PersistentTarget>,
+        Vec<PersistentDepthTarget>,
     ) {
         (
             std::mem::take(&mut self.pending),
             std::mem::take(&mut self.touched),
             std::mem::take(&mut self.deferred_target_destroys),
+            std::mem::take(&mut self.deferred_depth_target_destroys),
         )
     }
 
@@ -1223,6 +1231,7 @@ impl DrawCaches {
         dev: &VulkanDevice,
         pending: Vec<PendingDrawResources>,
         evicted: Vec<PersistentTarget>,
+        evicted_depth: Vec<PersistentDepthTarget>,
     ) {
         for res in pending {
             if res.command_buffer != vk::CommandBuffer::null() {
@@ -1259,6 +1268,11 @@ impl DrawCaches {
             // SAFETY: fence waited (above); the entry left the map when it
             // was evicted, so this is the sole remaining handle set.
             unsafe { destroy_target(dev.device(), &target) };
+        }
+        for target in evicted_depth {
+            // SAFETY: the same shared fence covers the command buffers that
+            // last referenced this evicted persistent depth target.
+            unsafe { destroy_depth_target(dev.device(), &target) };
         }
         // Evicted cached textures parked while the batch was open: the flush
         // fence covered every command buffer that referenced them.

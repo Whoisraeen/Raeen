@@ -15,10 +15,11 @@
 //!
 //! Machines without Vulkan 1.3 skip (unless `RAEEN_REQUIRE_VULKAN=1`).
 
+use ash::vk;
 use kyty_graphics::spirv_asm::assemble;
 use raeen_gpu::backend::GpuBackend;
 use raeen_gpu::vulkan::offscreen::{
-    CLEAR_COLOR, DrawState, ShaderStageBinding, TextureBinding, TextureUpload,
+    CLEAR_COLOR, DepthState, DrawState, ShaderStageBinding, TextureBinding, TextureUpload,
     flush_deferred_draws, render_draw, render_draw_deferred, unorm8,
 };
 use raeen_gpu::vulkan::{
@@ -209,6 +210,66 @@ fn deferred_batch_reads_back_once_and_composes_byte_identically() {
 
     // A second flush with nothing pending is a no-op.
     assert!(flush_deferred_draws(dev).expect("empty flush").is_empty());
+    assert_eq!(validation_error_count(), 0, "no Vulkan validation errors");
+}
+
+/// Minecraft's hot path: a named depth target must stay GPU-resident across
+/// deferred draws. The batch performs one colour readback at flush and no
+/// per-draw fence/readback merely because depth testing is present.
+#[test]
+fn persistent_depth_target_stays_deferred_across_draws() {
+    let Some(backend) = backend_or_skip() else {
+        return;
+    };
+    let dev = backend.device().expect("backend is initialized");
+    let vs = triangle_vertex_spirv();
+    let ps = triangle_fragment_spirv();
+    const COLOR_BASE: u64 = 0xDEFE_3000;
+    const DEPTH_BASE: u64 = 0xDEFE_4000;
+
+    let make_state = |clear_depth| DrawState {
+        vertices: Some(&TRIANGLE_VERTICES),
+        vertex_count: TRIANGLE_VERTICES.len() as u32,
+        target_base: Some(COLOR_BASE),
+        depth: Some(DepthState {
+            target_base: Some(DEPTH_BASE),
+            format: vk::Format::D32_SFLOAT,
+            test_enable: true,
+            write_enable: true,
+            compare_op: vk::CompareOp::LESS_OR_EQUAL,
+            stencil_test_enable: false,
+            stencil_front: vk::StencilOpState::default(),
+            stencil_back: vk::StencilOpState::default(),
+            clear_depth,
+            clear_stencil: false,
+            clear_depth_value: 1.0,
+            clear_stencil_value: 0,
+            viewport_depth: [0.0, 1.0],
+            initial: None,
+            initial_stencil: None,
+        }),
+        ..DrawState::new(W, H, &vs, &ps)
+    };
+
+    let before = dev.draw_cache_stats();
+    assert!(
+        render_draw_deferred(dev, &make_state(true))
+            .expect("first depth draw submits")
+            .is_none()
+    );
+    assert!(
+        render_draw_deferred(dev, &make_state(false))
+            .expect("second depth draw submits")
+            .is_none()
+    );
+    let mid = dev.draw_cache_stats();
+    assert_eq!(mid.deferred_draws - before.deferred_draws, 2);
+    assert_eq!(mid.depth_target_misses - before.depth_target_misses, 1);
+    assert_eq!(mid.depth_target_hits - before.depth_target_hits, 1);
+
+    let flushed = flush_deferred_draws(dev).expect("depth batch flushes");
+    assert_eq!(flushed.len(), 1, "one colour target is read once");
+    assert_eq!(flushed[0].0, COLOR_BASE);
     assert_eq!(validation_error_count(), 0, "no Vulkan validation errors");
 }
 

@@ -23,6 +23,8 @@ use tracing::{debug, error, warn};
 // DrawCommandBuffer struct field offsets (bytes).
 const CB_CURSOR_UP: u64 = 0x10; // u64 — current write pointer (advances up)
 const CB_CURSOR_DOWN: u64 = 0x18; // u64 — end/limit
+const CB_CALLBACK: u64 = 0x20; // u64 — guest grow callback
+const CB_USER_DATA: u64 = 0x28; // u64 — callback user data
 const CB_RESERVED_DW: u64 = 0x30; // u32 — reserved tail dwords
 
 // Agc PM4 IT (instruction type) opcodes + register sub-discriminators.
@@ -244,10 +246,9 @@ pub fn register(registry: &HleRegistry) {
         hle_dcb_dispatch_indirect,
     );
     registry.register("libSceAgc", "sceAgcSuspendPoint", hle_suspend_point);
-    // Known ONLY by its NID (`-KRzWekV120`, measured from Minecraft PPSA17221):
-    // its identity is unknown — not present in Kyty or SharpEmu. A loud stub
-    // returning 0; the NID must be explicit because hashing the placeholder
-    // label yields a different NID (see `register_nid`).
+    // KytyPS5 names this only by its NID (`-KRzWekV120`) and implements it as
+    // a three-DWORD command-buffer packet. The NID must remain explicit
+    // because hashing the synthetic label yields a different identity.
     registry.register_nid(
         "libSceAgc",
         "sceAgcUnknownKRzWekV120",
@@ -674,8 +675,16 @@ fn hle_get_resource_max_name_length(ctx: &HleContext, args: &[u64]) -> u64 {
     0
 }
 
-/// `sceAgcSuspendPoint()`: a no-op suspension marker; succeeds.
-fn hle_suspend_point(_ctx: &HleContext, _args: &[u64]) -> u64 {
+/// `sceAgcSuspendPoint()`: wait until all previously submitted GPU work has
+/// completed.
+///
+/// KytyPS5 implements this as `GraphicsRunDone()`.  Returning immediately here
+/// lets the guest recycle or free command/resource memory while Raeen's
+/// asynchronous GPU worker is still reading and writing it.  Minecraft exposed
+/// that race as compute writeback into a block concurrently being released by
+/// guest libc.
+fn hle_suspend_point(ctx: &HleContext, _args: &[u64]) -> u64 {
+    ctx.gpu.wait_idle();
     0
 }
 
@@ -2359,16 +2368,44 @@ fn hle_dcb_acquire_mem(ctx: &HleContext, args: &[u64]) -> u64 {
     let size_bytes = args.get(5).copied().unwrap_or(0);
     let poll_cycles = args.get(6).copied().unwrap_or(0) as u32;
     let no_size = size_bytes == u64::MAX;
-    if cb == 0
-        || engine > 1
+    if cb == 0 {
+        warn!("agc: sceAgcDcbAcquireMem received a null command buffer");
+        return 0;
+    }
+    // KytyPS5 diagnoses these conditions but still emits the hardware packet.
+    // Retail callers rely on that permissive behavior; rejecting them here
+    // hands a null packet pointer back to guest code that immediately writes
+    // through it.
+    if engine > 1
         || (!no_size && size_bytes & 0xFF != 0)
         || (!no_size && size_bytes >> 40 != 0)
         || base_address & 0xFF != 0
         || base_address >> 40 != 0
     {
-        return 0;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static WARNINGS: AtomicU32 = AtomicU32::new(0);
+        if WARNINGS.fetch_add(1, Ordering::Relaxed) < 4 {
+            warn!(
+                "agc: sceAgcDcbAcquireMem emitting permissively: cb={cb:#x} engine={engine:#x} \
+                 base={base_address:#x} size={size_bytes:#x}"
+            );
+        }
     }
     let Some(addr) = alloc_command_dwords(ctx, cb, 8) else {
+        let read_u64 = |offset| {
+            let mut bytes = [0u8; 8];
+            ctx.mem
+                .read(cb + offset, &mut bytes)
+                .then(|| u64::from_le_bytes(bytes))
+        };
+        warn!(
+            "agc: sceAgcDcbAcquireMem allocation failed: cb={cb:#x} cursor_up={:?} \
+             cursor_down={:?} callback={:?} user_data={:?}",
+            read_u64(CB_CURSOR_UP).map(|v| format!("{v:#x}")),
+            read_u64(CB_CURSOR_DOWN).map(|v| format!("{v:#x}")),
+            read_u64(CB_CALLBACK).map(|v| format!("{v:#x}")),
+            read_u64(CB_USER_DATA).map(|v| format!("{v:#x}")),
+        );
         return 0;
     };
     let size_field = if no_size { 0 } else { (size_bytes >> 8) as u32 };
@@ -3469,10 +3506,12 @@ use crate::libsce_agc_reg_defaults::{
     CX_REG_INFO1, CX_REG_INFO2, RegisterDefaultInfo, SH_REG_INFO1, SH_REG_INFO2, UC_REG_INFO1,
     UC_REG_INFO2,
 };
+use crate::libsce_agc_reg_defaults_v10::{CompactRegisterDefaultsV10, INTERNAL_V10, PUBLIC_V10};
 
 /// `RegisterDefaults` header size. Layout (Kyty, `offsetof(count) == 0x38`
 /// asserted against the real SDK):
-/// `{ tbl0..tbl3: *[*ShaderRegister] (0x00..0x20), unknown[2]: u64 (0x20),
+/// `{ tbl0..tbl3: *[*ShaderRegister] (0x00..0x20),
+///    tbl0..tbl3_register_count: u32 (0x20..0x30),
 ///    types: *u32 (0x30), count: u32 (0x38), pad (0x3C) }`.
 const REG_DEFAULTS_HEADER_BYTES: u64 = 0x40;
 /// `offsetof(RegisterDefaults, count)` — pinned by test against 0x38.
@@ -3508,7 +3547,7 @@ fn put_u64(image: &mut [u8], off: u64, v: u64) {
 /// (then)        index triples (type_hash, id*4 + table, 0) — Kyty's
 ///               g_tbl_index1/2, count = number of triples
 /// ```
-fn materialize_register_defaults(ctx: &HleContext) -> Option<u64> {
+fn materialize_register_defaults_v8(ctx: &HleContext) -> Option<u64> {
     let sets: [[&[RegisterDefaultInfo]; 3]; 2] = [
         [CX_REG_INFO1, SH_REG_INFO1, UC_REG_INFO1],
         [CX_REG_INFO2, SH_REG_INFO2, UC_REG_INFO2],
@@ -3550,6 +3589,12 @@ fn materialize_register_defaults(ctx: &HleContext) -> Option<u64> {
         let mut triples = 0u64;
         for (g, table) in groups.iter().enumerate() {
             put_u64(&mut image, header + g as u64 * 8, base + ptr_off[s][g]);
+            // KytyPS5 `RegisterDefaults`: these are the number of
+            // ShaderRegister records reachable through the table, NOT the
+            // number of pointer-table entries. Leaving 0x20..0x2c zero made
+            // version-12 callers skip the default register stream entirely.
+            let register_count = table.iter().map(|(_, regs)| regs.len() as u32).sum::<u32>();
+            put_u32(&mut image, header + 0x20 + g as u64 * 4, register_count);
             for (i, (type_hash, regs)) in table.iter().enumerate() {
                 let entry = info_off[s][g] + i as u64 * REG_INFO_ENTRY_BYTES;
                 put_u32(&mut image, entry, *type_hash);
@@ -3565,7 +3610,7 @@ fn materialize_register_defaults(ctx: &HleContext) -> Option<u64> {
                 triples += 1;
             }
         }
-        // tbl3 (0x18) and unknown[2] (0x20) stay zero.
+        // tbl3 (0x18) and its register count (0x2c) stay zero.
         put_u64(&mut image, header + 0x30, base + idx_off[s]);
         put_u32(
             &mut image,
@@ -3581,15 +3626,100 @@ fn materialize_register_defaults(ctx: &HleContext) -> Option<u64> {
     Some(base)
 }
 
+/// Materialize KytyPS5's compact v10 register-default representation exactly.
+/// AGC API version 12 deliberately aliases this data set in the reference.
+fn materialize_register_defaults_v10(ctx: &HleContext) -> Option<u64> {
+    let sets: [&CompactRegisterDefaultsV10; 2] = [&PUBLIC_V10, &INTERNAL_V10];
+    let mut reg_off = [[0u64; 4]; 2];
+    let mut ptr_off = [[0u64; 4]; 2];
+    let mut types_off = [0u64; 2];
+    let mut cursor = 2 * REG_DEFAULTS_HEADER_BYTES;
+
+    for (set_index, set) in sets.iter().enumerate() {
+        for (table_index, registers) in set.registers.iter().enumerate() {
+            reg_off[set_index][table_index] = cursor;
+            cursor += registers.len() as u64 * 8;
+        }
+    }
+    cursor = (cursor + 7) & !7;
+    for (set_index, set) in sets.iter().enumerate() {
+        for (table_index, pointers) in set.pointer_offsets.iter().enumerate() {
+            ptr_off[set_index][table_index] = cursor;
+            cursor += pointers.len() as u64 * 8;
+        }
+    }
+    for (set_index, set) in sets.iter().enumerate() {
+        types_off[set_index] = cursor;
+        cursor += set.types.len() as u64 * 4;
+    }
+
+    let base = ctx.alloc.alloc(cursor, 8)?;
+    if base == 0 {
+        return None;
+    }
+    let mut image = vec![0u8; cursor as usize];
+    for (set_index, set) in sets.iter().enumerate() {
+        let header = set_index as u64 * REG_DEFAULTS_HEADER_BYTES;
+        for table_index in 0..4 {
+            let registers = set.registers[table_index];
+            let pointers = set.pointer_offsets[table_index];
+            if !pointers.is_empty() {
+                put_u64(
+                    &mut image,
+                    header + table_index as u64 * 8,
+                    base + ptr_off[set_index][table_index],
+                );
+            }
+            put_u32(
+                &mut image,
+                header + 0x20 + table_index as u64 * 4,
+                registers.len() as u32,
+            );
+            for (index, &(register, value)) in registers.iter().enumerate() {
+                let entry = reg_off[set_index][table_index] + index as u64 * 8;
+                put_u32(&mut image, entry, register);
+                put_u32(&mut image, entry + 4, value);
+            }
+            for (index, &register_offset) in pointers.iter().enumerate() {
+                debug_assert!((register_offset as usize) < registers.len());
+                put_u64(
+                    &mut image,
+                    ptr_off[set_index][table_index] + index as u64 * 8,
+                    base + reg_off[set_index][table_index] + u64::from(register_offset) * 8,
+                );
+            }
+        }
+        put_u64(&mut image, header + 0x30, base + types_off[set_index]);
+        debug_assert_eq!(set.types.len() % 3, 0);
+        put_u32(
+            &mut image,
+            header + REG_DEFAULTS_COUNT_OFFSET,
+            (set.types.len() / 3) as u32,
+        );
+        for (index, &value) in set.types.iter().enumerate() {
+            put_u32(&mut image, types_off[set_index] + index as u64 * 4, value);
+        }
+    }
+    if !ctx.mem.write(base, &image) {
+        ctx.alloc.free(base);
+        return None;
+    }
+    debug!(
+        "AGC v10/v12 register defaults materialized at {base:#x} ({} bytes)",
+        image.len()
+    );
+    Some(base)
+}
+
 /// Materialize-once, then serve the cached guest address plus `offset`.
 fn register_defaults_base(ctx: &HleContext, args: &[u64], offset: u64) -> u64 {
     use std::sync::atomic::Ordering;
 
     let version = args.first().copied().unwrap_or(0) as u32;
-    if version != 8 {
+    if !matches!(version, 8 | 10 | 12) {
         warn!(
-            "sceAgcGetRegisterDefaults2: unexpected version {version} (reference \
-             asserts 8) — returning the version-8 tables anyway"
+            "sceAgcGetRegisterDefaults2: unsupported version {version} — \
+             using the legacy version-8 tables"
         );
     }
     let mut base = ctx
@@ -3597,7 +3727,12 @@ fn register_defaults_base(ctx: &HleContext, args: &[u64], offset: u64) -> u64 {
         .agc_register_defaults_addr
         .load(Ordering::Acquire);
     if base == 0 {
-        let Some(built) = materialize_register_defaults(ctx) else {
+        let built = if matches!(version, 10 | 12) {
+            materialize_register_defaults_v10(ctx)
+        } else {
+            materialize_register_defaults_v8(ctx)
+        };
+        let Some(built) = built else {
             warn!("sceAgcGetRegisterDefaults2: guest materialization failed — returning null");
             return 0;
         };
@@ -3857,19 +3992,36 @@ fn hle_cb_set_sh_register_range_get_size(_ctx: &HleContext, args: &[u64]) -> u64
     u64::from(num_values) + 4
 }
 
-/// NID `-KRzWekV120` (`0xfca47359e915d76d`, measured from Minecraft
-/// PPSA17221): identity unknown — not present in Kyty, SharpEmu, or public
-/// NID tables. Warns loudly once and returns 0.
-fn hle_unknown_krz_wek_v120(_ctx: &HleContext, args: &[u64]) -> u64 {
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if warn_once(&WARNED) {
-        warn!(
-            "libSceAgc NID 0xfca47359e915d76d (-KRzWekV120): UNKNOWN function called \
-             (args={args:x?}) — stub returns 0; identify and implement before trusting \
-             rendering"
-        );
+/// KytyPS5's `GraphicsUnknownKRzWekV120(dcb, arg1, arg2, arg3)`.
+///
+/// The public name is still unknown, but the packet encoding is measured:
+/// `0xc0017a00, 0x20000243, 0x400 | arg1[1:0] | arg2[1:0]<<6 |
+/// arg3[0]<<14`. Returning the old command address matches the other AGC
+/// command-buffer writers.
+fn hle_unknown_krz_wek_v120(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    if cb == 0 {
+        return 0;
     }
-    0
+    let arg1 = args.get(1).copied().unwrap_or(0) as u32;
+    let arg2 = args.get(2).copied().unwrap_or(0) as u32;
+    let arg3 = args.get(3).copied().unwrap_or(0) as u32;
+    let Some(addr) = alloc_command_dwords(ctx, cb, 3) else {
+        return 0;
+    };
+    let dwords = [
+        0xc001_7a00,
+        0x2000_0243,
+        0x400 | (arg1 & 0x3) | ((arg2 & 0x3) << 6) | ((arg3 & 0x1) << 14),
+    ];
+    if !dwords
+        .iter()
+        .enumerate()
+        .all(|(index, value)| ctx.mem.write(addr + index as u64 * 4, &value.to_le_bytes()))
+    {
+        return 0;
+    }
+    addr
 }
 
 #[cfg(test)]
@@ -4408,11 +4560,13 @@ mod tests {
         // no-size sentinel writes 0 in the size field.
         let ret2 = hle_dcb_acquire_mem(&ctx, &[cb, 0, 0, 0, base, u64::MAX, 40]);
         assert_eq!(read_u32(&ctx, ret2 + 8), 0, "no-size → 0");
-        // engine > 1 rejected.
-        assert_eq!(
-            hle_dcb_acquire_mem(&ctx, &[cb, 2, 0, 0, base, 0x100, 40]),
-            0
-        );
+        // KytyPS5 warns but emits for out-of-range/unaligned fields, masking
+        // the engine to the hardware's single bit.
+        let ret3 = hle_dcb_acquire_mem(&ctx, &[cb, 2, 0, 0, base + 1, 0x101, 40]);
+        assert_ne!(ret3, 0);
+        assert_eq!(read_u32(&ctx, ret3 + 4), 0);
+        assert_eq!(read_u32(&ctx, ret3 + 8), 1);
+        assert_eq!(read_u32(&ctx, ret3 + 16), (base >> 8) as u32);
     }
 
     #[test]
@@ -4452,7 +4606,7 @@ mod tests {
             hle_get_resource_max_name_length(&ctx, &[0]),
             SCE_ERROR_INVALID_ARGUMENT
         );
-        // SuspendPoint is a no-op success.
+        // SuspendPoint succeeds (the no-GPU test backend drains immediately).
         assert_eq!(hle_suspend_point(&ctx, &[]), 0);
         // DrawIndexOffset: 5-dword packet (count, offset, count, masked flags).
         let d = hle_dcb_draw_index_offset(&ctx, &[cb, 0x10, 6, 0xE000_0001]);
@@ -4598,6 +4752,7 @@ mod tests {
         #[derive(Default)]
         struct RecordingGpu {
             submissions: std::sync::Mutex<Vec<(Vec<u32>, raeen_core::subsystems::GpuQueue)>>,
+            waits: std::sync::atomic::AtomicUsize,
         }
         impl raeen_core::subsystems::GpuSubmissionSubsystem for RecordingGpu {
             fn submit(&self, words: Vec<u32>, queue: raeen_core::subsystems::GpuQueue) {
@@ -4615,7 +4770,10 @@ mod tests {
                 _descriptor: Option<raeen_core::subsystems::ScanoutDescriptor>,
             ) {
             }
-            fn wait_idle(&self) {}
+            fn wait_idle(&self) {
+                self.waits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             fn stats(&self) -> raeen_core::subsystems::GpuSubmissionStats {
                 raeen_core::subsystems::GpuSubmissionStats {
                     submitted: self.submissions.lock().unwrap().len() as u64,
@@ -4649,6 +4807,14 @@ mod tests {
         assert_eq!(submissions.len(), 1);
         assert_eq!(submissions[0].0, words);
         assert_eq!(submissions[0].1, raeen_core::subsystems::GpuQueue::Graphics);
+        drop(submissions);
+        assert_eq!(gpu.waits.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(hle_suspend_point(&ctx, &[]), 0);
+        assert_eq!(
+            gpu.waits.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "SuspendPoint must drain asynchronous GPU work before guest memory is recycled"
+        );
     }
 
     /// SharpEmu `DcbJump` parity: 4-DWORD INDIRECT_BUFFER chain packet, with
@@ -5344,15 +5510,35 @@ mod tests {
         assert_eq!(read_u32(&ctx, base + 0x38), 78 + 29 + 20, "set-1 triples");
         assert_eq!(read_u32(&ctx, internal + 0x38), 4 + 15 + 3, "set-2 triples");
 
-        // tbl0..tbl2 and types are non-null guest pointers; tbl3 and
-        // unknown[2] stay zero.
+        // tbl0..tbl2 and types are non-null guest pointers; tbl3 stays zero.
+        // The four u32s at 0x20 are register counts (not reserved padding).
         let tbl0 = read_u64(&ctx, base);
         assert_ne!(tbl0, 0);
         assert_ne!(read_u64(&ctx, base + 8), 0);
         assert_ne!(read_u64(&ctx, base + 0x10), 0);
         assert_eq!(read_u64(&ctx, base + 0x18), 0);
-        assert_eq!(read_u64(&ctx, base + 0x20), 0);
-        assert_eq!(read_u64(&ctx, base + 0x28), 0);
+        assert_eq!(
+            read_u32(&ctx, base + 0x20),
+            CX_REG_INFO1
+                .iter()
+                .map(|(_, regs)| regs.len() as u32)
+                .sum::<u32>()
+        );
+        assert_eq!(
+            read_u32(&ctx, base + 0x24),
+            SH_REG_INFO1
+                .iter()
+                .map(|(_, regs)| regs.len() as u32)
+                .sum::<u32>()
+        );
+        assert_eq!(
+            read_u32(&ctx, base + 0x28),
+            UC_REG_INFO1
+                .iter()
+                .map(|(_, regs)| regs.len() as u32)
+                .sum::<u32>()
+        );
+        assert_eq!(read_u32(&ctx, base + 0x2c), 0);
         let types = read_u64(&ctx, base + 0x30);
         assert_ne!(types, 0);
 
@@ -5378,6 +5564,51 @@ mod tests {
         let first_cx2 = read_u64(&ctx, read_u64(&ctx, internal));
         assert_eq!(read_u32(&ctx, first_cx2), 0x0E, "DB_DFSM_CONTROL offset");
         assert_eq!(read_u32(&ctx, first_cx2 - 4), 0x8FB4_EDB5, "type hash");
+    }
+
+    #[test]
+    fn register_defaults_version_12_uses_exact_kytyps5_v10_compact_tables() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x10000);
+        let alloc = crate::TestAllocator::new(0x800);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let public = hle_get_register_defaults2(&ctx, &[12]);
+        let internal = hle_get_register_defaults2_internal(&ctx, &[12]);
+        assert_ne!(public, 0);
+        assert_eq!(internal, public + REG_DEFAULTS_HEADER_BYTES);
+
+        for (table, expected) in PUBLIC_V10.registers.iter().enumerate() {
+            assert_eq!(
+                read_u32(&ctx, public + 0x20 + table as u64 * 4),
+                expected.len() as u32,
+                "public table {table} register count"
+            );
+        }
+        assert_eq!(read_u32(&ctx, public + 0x38), 128);
+        assert_eq!(read_u32(&ctx, internal + 0x38), 28);
+        assert_eq!(read_u64(&ctx, public + 0x18), 0, "public tbl3 is empty");
+        assert_ne!(
+            read_u64(&ctx, internal + 0x18),
+            0,
+            "internal tbl3 must be exposed"
+        );
+
+        // Pointer entries address the raw compact ShaderRegister arrays; the
+        // first public table entry and first type triple must be byte-exact.
+        let public_tbl0_first = read_u64(&ctx, read_u64(&ctx, public));
+        assert_eq!(
+            read_u32(&ctx, public_tbl0_first),
+            PUBLIC_V10.registers[0][0].0
+        );
+        assert_eq!(
+            read_u32(&ctx, public_tbl0_first + 4),
+            PUBLIC_V10.registers[0][0].1
+        );
+        let public_types = read_u64(&ctx, public + 0x30);
+        assert_eq!(read_u32(&ctx, public_types), PUBLIC_V10.types[0]);
+        assert_eq!(read_u32(&ctx, public_types + 4), PUBLIC_V10.types[1]);
+        assert_eq!(read_u32(&ctx, public_types + 8), PUBLIC_V10.types[2]);
     }
 
     #[test]
@@ -5475,12 +5706,25 @@ mod tests {
     }
 
     #[test]
-    fn debug_raise_exception_and_unknown_stubs_log_and_return_ok() {
+    fn debug_raise_exception_and_unknown_stub_log_and_return_ok() {
         let (kernel, mem, alloc) = ctx_env();
         let ctx = test_ctx(&kernel, &mem, &alloc);
         assert_eq!(hle_debug_raise_exception(&ctx, &[0xDEAD, 1, 2]), 0);
         assert_eq!(hle_set_range_predication(&ctx, &[1, 2, 3]), 0);
-        assert_eq!(hle_unknown_krz_wek_v120(&ctx, &[]), 0);
+    }
+
+    #[test]
+    fn unknown_krz_wek_v120_emits_the_kytyps5_packet() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        assert_eq!(hle_unknown_krz_wek_v120(&ctx, &[cb, 3, 2, 1]), 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), 0xc001_7a00);
+        assert_eq!(read_u32(&ctx, 0x404), 0x2000_0243);
+        assert_eq!(read_u32(&ctx, 0x408), 0x400 | 3 | (2 << 6) | (1 << 14));
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x40c);
+        assert_eq!(hle_unknown_krz_wek_v120(&ctx, &[0, 1, 2, 3]), 0);
     }
 
     #[test]

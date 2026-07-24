@@ -225,6 +225,78 @@ fn title_translated_vs_covers_the_measured_quad() {
     );
 }
 
+/// Replay Minecraft's final composite vertex shader with the exact captured
+/// two-attribute stream. This is intentionally gated on a local shader dump:
+/// retail shader bytes are diagnostics and never repository fixtures.
+#[test]
+fn minecraft_composite_vs_covers_captured_quad() {
+    let Ok(vs_path) = std::env::var("RAEEN_MINECRAFT_COMPOSITE_VS") else {
+        eprintln!(
+            "minecraft_composite_vs_covers_captured_quad: SKIP — set \
+             RAEEN_MINECRAFT_COMPOSITE_VS"
+        );
+        return;
+    };
+    let Some(backend) = backend_or_skip("minecraft_composite_vs_covers_captured_quad") else {
+        return;
+    };
+    let dev = backend.device().expect("backend is initialized");
+    let raw = std::fs::read(&vs_path).expect("composite VS must be readable");
+    assert_eq!(raw.len() % 4, 0, "SPIR-V byte length must be word-aligned");
+    let vs: Vec<u32> = raw
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let ps = triangle_fragment_spirv();
+
+    // Captured from Minecraft's 0x20040000 composite: position float4 and
+    // texture-coordinate float3 in a 28-byte stride.
+    let records: [[f32; 7]; 4] = [
+        [0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+        [1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 2.0],
+        [0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 3.0],
+    ];
+    let bytes = records
+        .iter()
+        .flatten()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    let index_bytes: Vec<u8> = QUAD_INDICES.iter().flat_map(|i| i.to_le_bytes()).collect();
+    let state = DrawState {
+        viewport: [0.0, H as f32, W as f32, -(H as f32)],
+        vertex_buffers: vec![VertexBufferData { bytes, stride: 28 }],
+        vertex_attributes: vec![
+            VertexAttributeData {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: 0,
+            },
+            VertexAttributeData {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 16,
+            },
+        ],
+        vertex_count: QUAD_INDICES.len() as u32,
+        index: Some(IndexBinding {
+            bytes: &index_bytes,
+            index_type: vk::IndexType::UINT16,
+        }),
+        ..DrawState::new(W, H, &vs, &ps)
+    };
+    let output = render_draw(dev, &state).expect("captured composite VS draw must render");
+    let image = output.color.expect("colour draw produces an image");
+    let covered = non_clear_pixels(&image);
+    assert!(
+        covered > 0,
+        "Minecraft's composite VS produced zero fragments with its exact \
+         captured vertex stream"
+    );
+}
+
 /// Variable 5: the TITLE'S translated pixel shaders, swept against the title
 /// VS on the covering quad. Gated on `RAEEN_TITLE_SHADER_DIR` (a
 /// `RAEEN_DUMP_SHADERS` directory). The VS is exonerated (variable 4 covers

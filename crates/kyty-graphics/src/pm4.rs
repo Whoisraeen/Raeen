@@ -91,6 +91,7 @@ pub const IT_SET_CONTEXT_REG: ItOp = ItOp(0x69);
 pub const IT_SET_SH_REG: ItOp = ItOp(0x76);
 pub const IT_SET_QUEUE_REG: ItOp = ItOp(0x78);
 pub const IT_SET_UCONFIG_REG: ItOp = ItOp(0x79);
+pub const IT_SET_UCONFIG_REG_INDEX: ItOp = ItOp(0x7A);
 pub const IT_WRITE_CONST_RAM: ItOp = ItOp(0x81);
 pub const IT_DUMP_CONST_RAM: ItOp = ItOp(0x83);
 pub const IT_INCREMENT_CE_COUNTER: ItOp = ItOp(0x84);
@@ -333,6 +334,7 @@ pub mod compute_pgm_rsrc2 {
 // ---- User-config (UC) register indices ----------------------------------
 
 pub const VGT_PRIMITIVE_TYPE: u32 = 0x242;
+pub const VGT_INDEX_TYPE: u32 = 0x243;
 
 // ---- Bitfield accessors (Kyty: KYTY_PM4_GET) ----------------------------
 
