@@ -180,6 +180,11 @@ pub struct OrbisKernel {
     /// pad. The Shell updates this each frame from its `InputManager`; the
     /// HLE `scePadReadState` reads it. See [`set_pad_state`](Self::set_pad_state).
     pad_state: parking_lot::Mutex<Option<[u8; 12]>>,
+    /// Whether libSceUserService has delivered this process's initial login
+    /// event. A new guest process gets a fresh kernel and therefore a fresh
+    /// event; keeping this here avoids a host-global flag leaking across
+    /// consecutive title launches.
+    user_service_login_event_delivered: std::sync::atomic::AtomicBool,
     /// Guest pthread mutex state, keyed by both the guest `pthread_mutex_t`
     /// address and its allocated opaque handle (both map to the same logical
     /// mutex). Manipulated by the HLE `pthread_sync` module — per-process
@@ -851,6 +856,7 @@ impl OrbisKernel {
             process_argv: std::sync::atomic::AtomicU64::new(0),
             unwind_modules: RwLock::new(Vec::new()),
             pad_state: parking_lot::Mutex::new(None),
+            user_service_login_event_delivered: std::sync::atomic::AtomicBool::new(false),
             pthread_mutexes: DashMap::new(),
             pthread_mutex_attrs: DashMap::new(),
             pthread_rwlocks: DashMap::new(),
@@ -948,6 +954,29 @@ impl OrbisKernel {
     /// boot window and a steady-state window.
     pub fn uptime(&self) -> std::time::Duration {
         self.started_at.elapsed()
+    }
+
+    /// Claim the process's initial UserService login event.
+    ///
+    /// Returns `true` for exactly one caller. If that caller cannot write the
+    /// event to guest memory it must call
+    /// [`restore_initial_user_login_event`](Self::restore_initial_user_login_event)
+    /// so a later valid request can consume it.
+    pub fn claim_initial_user_login_event(&self) -> bool {
+        self.user_service_login_event_delivered
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Make a failed initial-login delivery available to the next caller.
+    pub fn restore_initial_user_login_event(&self) {
+        self.user_service_login_event_delivered
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// Replace the loaded-process unwind table. Entries with empty or

@@ -89,7 +89,10 @@ SOFTWARE.
   The Gen5 AudioOut2 context/port parameter layout and grain pacing in
   `crates/raeen-hle/src/libsce_audio_out2.rs`, plus GFX10 MIMG DIM/NSA field
   meanings used by `crates/kyty-graphics/src/shader/parse.rs`, were also
-  behaviorally re-implemented after comparison with SharpEmu. Raeen's
+  behaviorally re-implemented after comparison with SharpEmu. UserService's
+  retail-style primary-user id and one-shot login-event behavior were
+  re-implemented in `crates/raeen-hle/src/libsce_user_service.rs`; the event
+  ABI was independently cross-checked against KytyPS5 and shadPS4. Raeen's
   resource-class-local descriptor indexing, layered guest tiling/writeback,
   and Vulkan staging-size guard are original Rust fixes derived from its own
   Minecraft traces and Vulkan validation output.

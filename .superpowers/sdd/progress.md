@@ -3044,3 +3044,26 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
     averaged across boot), far short of the 120 FPS north star. M4/M5 remain
     open; no compatibility status is raised without a measured interactive
     report.
+
+- MINECRAFT USER LOGIN + LIVE DUALSENSE CONSUMPTION REACHED
+  (2026-07-24; release run `scratch/mc-login-input-20260724-030815`):
+  * Root cause: Raeen's `sceUserServiceGetEvent` always returned
+    `SCE_USER_SERVICE_ERROR_NO_EVENT`. Current SharpEmu and KytyPS5 deliver one
+    Login event first; shadPS4 also models login/logout through an event queue.
+    Minecraft waits for that transition before entering its Pad path.
+  * UserService now returns the retail-style primary id `0x10000000`, stores
+    login-delivery state in the process-owned `OrbisKernel`, writes the
+    eight-byte `{Login, userId}` ABI exactly once, and returns `NO_EVENT`
+    afterward. Failed guest-memory writes restore the claim; new processes get
+    fresh state. Five focused tests cover payload, one-shot, retry, and
+    process isolation.
+  * Measured end-to-end route: raw-HID DualSense connected, its first 64-byte
+    report parsed, Minecraft consumed the UserService login event, opened Pad
+    handle 1, and its first guest controller read consumed live host state
+    (`buttons=0`, sticks `[129,133]` / `[132,132]`). This closes title
+    consumption of physical input, not merely NID resolution.
+  * Rendering stayed intact: present 1024 and 2048 both hit exact scanout
+    `0x20040000`; `frame_002048.png` is the complete title panorama/UI with no
+    device loss. The remaining Minecraft acceptance item is a captured
+    physical-button-driven menu transition and gameplay/save loop. Do not call
+    the title fully playable or raise M4/M5 yet.

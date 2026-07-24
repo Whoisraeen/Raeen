@@ -2,22 +2,22 @@
 //!
 //! Homebrew and games call this at startup to learn the signed-in user id,
 //! which they then pass to `scePadOpen`, save-data, trophy, etc. Raeen
-//! models a single local user. Constants (primary user id `1000`, the
-//! `NO_EVENT` code) are cross-checked against SharpEmu's `UserServiceExports`.
+//! models a single local user. The retail-style primary id and one-shot login
+//! event are cross-checked against SharpEmu, KytyPS5, and shadPS4.
 
 use crate::{HleContext, HleRegistry};
 use tracing::{debug, warn};
 
 /// `SCE_OK`.
 const SCE_OK: u64 = 0;
-/// The single local user's id (matches SharpEmu's `PrimaryUserId`). Games
-/// pass this to `scePadOpen`/save-data/etc.
-const PRIMARY_USER_ID: i32 = 1000;
+/// The single local user's retail-style id (matches current SharpEmu).
+/// The high nibble encodes local slot 0; small emulator-local ids can map to
+/// slot -1 in retail middleware and prevent the title from opening a pad.
+const PRIMARY_USER_ID: i32 = 0x1000_0000;
 /// `SCE_USER_SERVICE_USER_ID_INVALID`.
 const INVALID_USER_ID: i32 = -1;
-/// `SCE_USER_SERVICE_ERROR_NO_EVENT` — returned by `GetEvent` when the queue
-/// is empty (which it always is here); a title's event loop reads until it
-/// sees this.
+/// `SCE_USER_SERVICE_ERROR_NO_EVENT` — returned after the process's initial
+/// login event has been consumed.
 const ERROR_NO_EVENT: u64 = 0x8096_0007;
 /// `SCE_USER_SERVICE_ERROR_INVALID_ARGUMENT`.
 const ERROR_INVALID_ARGUMENT: u64 = 0x8096_0005;
@@ -63,7 +63,7 @@ pub fn register(registry: &HleRegistry) {
         hle_get_game_presets,
     );
     // `sceUserServiceGetPlatformPrivacySetting(parameterId, int32_t *value)`
-    // — SharpEmu `UserServiceExports`: parameterId 1000 (the primary user)
+    // — SharpEmu `UserServiceExports`: parameterId 1000
     // gets value 0 ("no restriction"). SharpEmu's name is a recovered label
     // for the measured NID `D-CzAxQL0XI` (0x0ff0b303140bd172) — it does NOT
     // hash to that NID, so the binding must be explicit (`register_nid`).
@@ -82,7 +82,18 @@ pub fn register(registry: &HleRegistry) {
 
 /// See the registration comment: privacy setting 0 = unrestricted.
 fn hle_get_platform_privacy_setting(ctx: &HleContext, args: &[u64]) -> u64 {
-    write_user_setting_i32(ctx, args, 0, "sceUserServiceGetPlatformPrivacySetting")
+    const PRIVACY_PARAMETER_ID: i32 = 1000;
+    let parameter_id = args.first().copied().unwrap_or(0) as i32;
+    let out_ptr = args.get(1).copied().unwrap_or(0);
+    if parameter_id != PRIVACY_PARAMETER_ID {
+        return ERROR_INVALID_ARGUMENT;
+    }
+    if out_ptr == 0 || !ctx.mem.write(out_ptr, &0i32.to_le_bytes()) {
+        warn!("sceUserServiceGetPlatformPrivacySetting: out-ptr {out_ptr:#x} not writable");
+        return ERROR_INVALID_ARGUMENT;
+    }
+    debug!("sceUserServiceGetPlatformPrivacySetting(parameterId={parameter_id}) -> 0");
+    SCE_OK
 }
 
 /// Shared body of the `(userId, int32_t *out)` user-setting getters
@@ -204,11 +215,32 @@ fn hle_get_user_name(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
-/// `sceUserServiceGetEvent(SceUserServiceEvent *event)`: the event queue is
-/// always empty (single, always-logged-in local user), so this reports
-/// `NO_EVENT` — a title's login/logout event loop reads until it sees this.
-fn hle_get_event(_ctx: &HleContext, _args: &[u64]) -> u64 {
-    ERROR_NO_EVENT
+/// `sceUserServiceGetEvent(SceUserServiceEvent *event)`: deliver the initial
+/// local-user login once, then report `NO_EVENT`. Retail titles commonly wait
+/// for this transition before opening `libScePad`.
+fn hle_get_event(ctx: &HleContext, args: &[u64]) -> u64 {
+    let event_ptr = args.first().copied().unwrap_or(0);
+    if event_ptr == 0 {
+        return ERROR_INVALID_ARGUMENT;
+    }
+    if !ctx.kernel.claim_initial_user_login_event() {
+        return ERROR_NO_EVENT;
+    }
+
+    let mut event = [0u8; 8];
+    // SceUserServiceEventType::Login
+    event[0..4].copy_from_slice(&0i32.to_le_bytes());
+    event[4..8].copy_from_slice(&PRIMARY_USER_ID.to_le_bytes());
+    if !ctx.mem.write(event_ptr, &event) {
+        ctx.kernel.restore_initial_user_login_event();
+        warn!("sceUserServiceGetEvent: event out-ptr {event_ptr:#x} not writable");
+        return ERROR_INVALID_ARGUMENT;
+    }
+    tracing::info!(
+        user_id = PRIMARY_USER_ID,
+        "sceUserServiceGetEvent delivered the initial local-user login"
+    );
+    SCE_OK
 }
 
 #[cfg(test)]
@@ -242,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn user_name_written_and_event_queue_empty() {
+    fn user_name_and_one_shot_login_event() {
         let kernel = raeen_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
         let alloc = crate::TestAllocator::new(0);
@@ -261,8 +293,31 @@ mod tests {
             hle_get_user_name(&ctx, &[42, 0x100, 32]),
             ERROR_INVALID_ARGUMENT
         );
-        // Event loop terminates on NO_EVENT.
+        assert_eq!(hle_get_event(&ctx, &[0x200]), SCE_OK);
+        let mut event = [0u8; 8];
+        assert!(mem.read(0x200, &mut event));
+        assert_eq!(i32::from_le_bytes(event[0..4].try_into().unwrap()), 0);
+        assert_eq!(
+            i32::from_le_bytes(event[4..8].try_into().unwrap()),
+            PRIMARY_USER_ID
+        );
+        // Event loop terminates after consuming the initial login.
         assert_eq!(hle_get_event(&ctx, &[0x200]), ERROR_NO_EVENT);
+    }
+
+    #[test]
+    fn login_event_is_process_scoped_and_failed_write_does_not_consume_it() {
+        for _ in 0..2 {
+            let kernel = raeen_kernel::OrbisKernel::new();
+            let mem = crate::TestMemory::new(0x100);
+            let alloc = crate::TestAllocator::new(0);
+            let ctx = test_ctx(&kernel, &mem, &alloc);
+
+            assert_eq!(hle_get_event(&ctx, &[0]), ERROR_INVALID_ARGUMENT);
+            assert_eq!(hle_get_event(&ctx, &[0x1000]), ERROR_INVALID_ARGUMENT);
+            assert_eq!(hle_get_event(&ctx, &[0x20]), SCE_OK);
+            assert_eq!(hle_get_event(&ctx, &[0x20]), ERROR_NO_EVENT);
+        }
     }
 
     /// Accessibility/preset getters answer the primary user with SharpEmu's
@@ -300,6 +355,18 @@ mod tests {
         );
         assert_eq!(
             hle_get_accessibility_vibration(&ctx, &[uid, 0]),
+            ERROR_INVALID_ARGUMENT
+        );
+
+        // Platform privacy uses parameter id 1000, not the retail user id.
+        assert_eq!(
+            hle_get_platform_privacy_setting(&ctx, &[1000, 0x300]),
+            SCE_OK
+        );
+        assert!(mem.read(0x300, &mut v));
+        assert_eq!(i32::from_le_bytes(v), 0, "unrestricted privacy default");
+        assert_eq!(
+            hle_get_platform_privacy_setting(&ctx, &[uid, 0x300]),
             ERROR_INVALID_ARGUMENT
         );
     }
