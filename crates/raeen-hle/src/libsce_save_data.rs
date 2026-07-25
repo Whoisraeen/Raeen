@@ -63,6 +63,12 @@ pub fn register(registry: &HleRegistry) {
         );
         registry.register(library, "sceSaveDataPrepare", hle_prepare);
         registry.register(library, "sceSaveDataSetParam", hle_set_param);
+        // Save-slot icon (the thumbnail shown in the system save browser).
+        // Minecraft writes one while creating a world: leaving it unresolved
+        // killed the save worker mid-write, and the world-load then waited
+        // forever on a thread that no longer existed.
+        registry.register(library, "sceSaveDataSaveIcon", hle_save_icon);
+        registry.register(library, "sceSaveDataLoadIcon", hle_load_icon);
         // Mountless per-user "save data memory" blob API.
         registry.register(
             library,
@@ -269,15 +275,31 @@ fn hle_commit(ctx: &HleContext, args: &[u64]) -> u64 {
             .save_data_transaction_resources
             .contains_key(&resource)
     {
-        warn!(
-            commit = mount_point,
-            arg1 = args.get(1).copied().unwrap_or(0),
-            arg2 = args.get(2).copied().unwrap_or(0),
-            resource,
-            bytes = ?request,
-            "sceSaveDataCommit received an unknown request layout"
-        );
-        return 0x809F_000B;
+        // FAIL OPEN, not closed. Refusing an unrecognized layout with
+        // `ERROR_INTERNAL` fails a commit whose data the VFS has usually
+        // already persisted, and a title that treats commit failure as
+        // "the save did not land" then retries or waits forever. Measured on
+        // Minecraft's world creation: this fired with `resource=4` (a
+        // transaction id it never obtained from
+        // `sceSaveDataCreateTransactionResource`, so a third ABI generation)
+        // immediately before the world-load stalled. Flushing every active
+        // container is exactly what the resource form below does, and the
+        // worst case of doing it for an unknown layout is a redundant sync.
+        // The warning stays — it names the layout so the real shape can be
+        // decoded — but it is now rate-limited and non-fatal.
+        static UNKNOWN_LAYOUT_WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !UNKNOWN_LAYOUT_WARNED.swap(true, Ordering::Relaxed) {
+            warn!(
+                commit = mount_point,
+                arg1 = args.get(1).copied().unwrap_or(0),
+                arg2 = args.get(2).copied().unwrap_or(0),
+                resource,
+                bytes = ?request,
+                "sceSaveDataCommit received an unknown request layout — flushing every \
+                 active save container anyway (fail-open); further occurrences are silent"
+            );
+        }
     }
 
     // Direct form: flush that one mount. Resource form: the mount is
@@ -313,6 +335,143 @@ fn hle_commit(ctx: &HleContext, args: &[u64]) -> u64 {
 /// Parse a NUL-terminated `/savedataN` mount-point string from the head of a
 /// 16-byte-or-larger request block. Returns `None` when the bytes are not a
 /// save-data mount point (the native opaque-descriptor form).
+/// Largest icon Raeen will move in either direction. A save-slot thumbnail is
+/// a small PNG (the system browser shows it at 228x128); this only exists so a
+/// wild `bufSize`/`dataSize` cannot drive a giant allocation or write.
+const SAVE_DATA_ICON_MAX: u64 = 8 * 1024 * 1024;
+
+/// Guest path of a mount's icon, relative to its mount point.
+///
+/// The save slot's `sce_sys` directory is the same place the package keeps its
+/// metadata, and `icon0.png` is the standard name (shadPS4 resolves the same
+/// file through `SaveInstance::GetIconPath`).
+fn icon_guest_path(mount_prefix: &str) -> String {
+    format!("{mount_prefix}/sce_sys/icon0.png")
+}
+
+/// Read the `SceSaveDataMountPoint*` argument into its `/savedataN` prefix.
+fn mount_point_arg(ctx: &HleContext, ptr: u64) -> Option<String> {
+    if ptr == 0 {
+        return None;
+    }
+    let mut raw = [0u8; 16];
+    ctx.mem.read(ptr, &mut raw).then_some(())?;
+    savedata_prefix(&raw)
+}
+
+/// `SceSaveDataIcon` = `{ void *buf; size_t bufSize; size_t dataSize; u8 _[32] }`
+/// (shadPS4 `savedata.cpp:128-133`). Returns `(buf, bufSize, dataSize)`.
+fn read_icon_struct(ctx: &HleContext, ptr: u64) -> Option<(u64, u64, u64)> {
+    let mut raw = [0u8; 24];
+    if ptr == 0 || !ctx.mem.read(ptr, &mut raw) {
+        return None;
+    }
+    let field = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().expect("fixed"));
+    Some((field(0), field(1), field(2)))
+}
+
+/// `sceSaveDataSaveIcon(const SceSaveDataMountPoint *mountPoint,
+/// const SceSaveDataIcon *icon)`: write the slot's thumbnail.
+///
+/// Ports shadPS4's `sceSaveDataSaveIcon` (`savedata.cpp:1372-1405`,
+/// GPL-2.0): validate the pointers, then write `min(bufSize, dataSize)` bytes
+/// from the guest buffer to the mount's `sce_sys/icon0.png`.
+///
+/// MEASURED: Minecraft calls this while creating a world (`rdi -> "/savedata1"`).
+/// It was unresolved, so the call landed on the stub guard page and killed the
+/// save worker *while it held locks* — the runtime released them, but the
+/// world-load then polled a save that could never complete (a clean 11 s
+/// heartbeat on `/savedata0` forever, while the GPU kept presenting).
+fn hle_save_icon(ctx: &HleContext, args: &[u64]) -> u64 {
+    let mount_ptr = args.first().copied().unwrap_or(0);
+    let icon_ptr = args.get(1).copied().unwrap_or(0);
+    let Some((buf, buf_size, data_size)) = read_icon_struct(ctx, icon_ptr) else {
+        return ERROR_PARAMETER;
+    };
+    if buf == 0 {
+        return ERROR_PARAMETER;
+    }
+    let Some(prefix) = mount_point_arg(ctx, mount_ptr) else {
+        return ERROR_PARAMETER;
+    };
+    let len = buf_size.min(data_size).min(SAVE_DATA_ICON_MAX);
+    let Ok(len_usize) = usize::try_from(len) else {
+        return ERROR_PARAMETER;
+    };
+    let mut bytes = vec![0u8; len_usize];
+    if len_usize != 0 && !ctx.mem.read(buf, &mut bytes) {
+        return ERROR_PARAMETER;
+    }
+    let guest_path = icon_guest_path(&prefix);
+    let Some(host_path) = ctx.kernel.filesystem.resolve_path(&guest_path) else {
+        warn!("sceSaveDataSaveIcon: cannot resolve {guest_path}");
+        return ERROR_NOT_FOUND;
+    };
+    if let Some(parent) = host_path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        warn!(
+            "sceSaveDataSaveIcon: cannot create {}: {error}",
+            parent.display()
+        );
+        return ERROR_INTERNAL;
+    }
+    match std::fs::write(&host_path, &bytes) {
+        Ok(()) => {
+            debug!("sceSaveDataSaveIcon({prefix}) -> {len} byte(s)");
+            SCE_OK
+        }
+        Err(error) => {
+            warn!(
+                "sceSaveDataSaveIcon: write {} failed: {error}",
+                host_path.display()
+            );
+            ERROR_INTERNAL
+        }
+    }
+}
+
+/// `sceSaveDataLoadIcon(const SceSaveDataMountPoint *mountPoint,
+/// SceSaveDataIcon *icon)`: read the slot's thumbnail back.
+///
+/// Ports shadPS4's `sceSaveDataLoadIcon` (`savedata.cpp:1227-1254` +
+/// `OrbisSaveDataIcon::LoadIcon`): set `dataSize` to the file's real size and
+/// copy `min(bufSize, dataSize)` bytes into the guest buffer. A slot with no
+/// icon yet is `NOT_FOUND`, not a fabricated image.
+fn hle_load_icon(ctx: &HleContext, args: &[u64]) -> u64 {
+    let mount_ptr = args.first().copied().unwrap_or(0);
+    let icon_ptr = args.get(1).copied().unwrap_or(0);
+    let Some((buf, buf_size, _)) = read_icon_struct(ctx, icon_ptr) else {
+        return ERROR_PARAMETER;
+    };
+    if buf == 0 {
+        return ERROR_PARAMETER;
+    }
+    let Some(prefix) = mount_point_arg(ctx, mount_ptr) else {
+        return ERROR_PARAMETER;
+    };
+    let guest_path = icon_guest_path(&prefix);
+    let Some(host_path) = ctx.kernel.filesystem.resolve_path(&guest_path) else {
+        return ERROR_NOT_FOUND;
+    };
+    let Ok(bytes) = std::fs::read(&host_path) else {
+        debug!("sceSaveDataLoadIcon({prefix}): no icon yet");
+        return ERROR_NOT_FOUND;
+    };
+    // `dataSize` reports the file's REAL size even when the guest buffer is
+    // shorter — that is how a caller learns the buffer it must allocate.
+    let data_size = bytes.len() as u64;
+    if !ctx.mem.write(icon_ptr + 16, &data_size.to_le_bytes()) {
+        return ERROR_PARAMETER;
+    }
+    let copy = buf_size.min(data_size).min(SAVE_DATA_ICON_MAX) as usize;
+    if copy != 0 && !ctx.mem.write(buf, &bytes[..copy]) {
+        return ERROR_PARAMETER;
+    }
+    debug!("sceSaveDataLoadIcon({prefix}) -> {copy} of {data_size} byte(s)");
+    SCE_OK
+}
+
 fn savedata_prefix(request: &[u8]) -> Option<String> {
     let head = &request[..request.len().min(16)];
     let len = head.iter().position(|byte| *byte == 0)?;
@@ -737,6 +896,109 @@ fn save_name_matches_pattern(value: &str, pattern: &str) -> bool {
 mod tests {
     use super::*;
     use crate::{GuestMemory, test_ctx};
+
+    /// Minecraft's world creation calls `sceSaveDataSaveIcon`; it must be
+    /// registered under the name whose NID the title imports
+    /// (`0x73cf18cb9e0cc74c` / `c88Yy54Mx0w`, confirmed against shadPS4's
+    /// `savedata.cpp:1840`), or the call lands on the stub guard page and
+    /// kills the save worker mid-write. `LoadIcon` is its twin
+    /// (`0x7068cedf0337576f` / `cGjO3wM3V28`, `savedata.cpp:1824`).
+    #[test]
+    fn save_and_load_icon_are_registered_under_both_libraries() {
+        let reg = HleRegistry::new();
+        for library in ["libSceSaveData", "libSceSaveData_native"] {
+            assert!(
+                reg.is_implemented(library, "sceSaveDataSaveIcon"),
+                "{library}::sceSaveDataSaveIcon must resolve"
+            );
+        }
+        assert!(reg.is_implemented("libSceSaveData", "sceSaveDataLoadIcon"));
+    }
+
+    /// Round-trip: saving an icon writes it under the mount, and loading it
+    /// back reports the file's REAL size in `dataSize` (that is how a caller
+    /// with a short buffer learns what to allocate) while copying only what
+    /// fits. A slot with no icon is `NOT_FOUND`, never a fabricated image.
+    #[test]
+    fn save_icon_round_trips_and_reports_the_real_size() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let dir = std::env::temp_dir().join(format!("raeen-icon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp savedata root");
+        kernel.filesystem.set_savedata_directory(&dir);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // mountPoint = "/savedata0"; icon = { buf, bufSize, dataSize }.
+        let mount_ptr = 0x100u64;
+        assert!(mem.write(mount_ptr, b"/savedata0\0\0\0\0\0\0"));
+        let buf = 0x200u64;
+        let payload = b"\x89PNG\r\n\x1a\nRAEEN-ICON";
+        assert!(mem.write(buf, payload));
+        let icon_ptr = 0x300u64;
+        let mut icon = [0u8; 24];
+        icon[0..8].copy_from_slice(&buf.to_le_bytes());
+        icon[8..16].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        icon[16..24].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        assert!(mem.write(icon_ptr, &icon));
+
+        // Nothing saved yet.
+        assert_eq!(hle_load_icon(&ctx, &[mount_ptr, icon_ptr]), ERROR_NOT_FOUND);
+
+        assert_eq!(hle_save_icon(&ctx, &[mount_ptr, icon_ptr]), SCE_OK);
+
+        // Load into a SHORTER buffer: dataSize must still be the real size.
+        let short_buf = 0x400u64;
+        let mut short_icon = [0u8; 24];
+        short_icon[0..8].copy_from_slice(&short_buf.to_le_bytes());
+        short_icon[8..16].copy_from_slice(&4u64.to_le_bytes());
+        assert!(mem.write(icon_ptr, &short_icon));
+        assert_eq!(hle_load_icon(&ctx, &[mount_ptr, icon_ptr]), SCE_OK);
+
+        let mut back = [0u8; 24];
+        assert!(mem.read(icon_ptr, &mut back));
+        assert_eq!(
+            u64::from_le_bytes(back[16..24].try_into().unwrap()),
+            payload.len() as u64,
+            "dataSize reports the file's real size, not the copied count"
+        );
+        let mut copied = [0u8; 4];
+        assert!(mem.read(short_buf, &mut copied));
+        assert_eq!(&copied, &payload[..4], "only what fits is copied");
+
+        // A null buffer or an unmountable point is a parameter error.
+        assert_eq!(hle_save_icon(&ctx, &[mount_ptr, 0]), ERROR_PARAMETER);
+        assert_eq!(hle_save_icon(&ctx, &[0, icon_ptr]), ERROR_PARAMETER);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unrecognized commit layout must FAIL OPEN. Refusing it fails a
+    /// commit whose bytes the VFS has usually already persisted, and a title
+    /// that reads that as "the save did not land" stalls — measured on
+    /// Minecraft's world creation (`resource=4`, a transaction id it never
+    /// obtained from `sceSaveDataCreateTransactionResource`).
+    #[test]
+    fn commit_with_an_unknown_layout_flushes_instead_of_failing() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // Neither a "/savedataN" string nor a known transaction resource —
+        // exactly the shape the measured run reported.
+        let request = 0x100u64;
+        let mut bytes = [0u8; 64];
+        bytes[0] = 4;
+        assert!(mem.write(request, &bytes));
+
+        assert_ne!(
+            hle_commit(&ctx, &[request, 110, 4]),
+            ERROR_INTERNAL,
+            "an unknown layout must not fail the commit"
+        );
+    }
 
     #[test]
     fn transaction_resources_are_process_local_and_releasable() {
