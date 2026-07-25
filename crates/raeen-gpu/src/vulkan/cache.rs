@@ -40,10 +40,13 @@
 //! the fence, command buffer, and descriptor pool at the next acquisition
 //! legal.
 
-use super::instance::VulkanDevice;
+use super::{instance::VulkanDevice, offscreen::SamplerState};
 use ash::vk::{self, Handle};
 use raeen_core::error::GpuError;
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Weak},
+};
 
 /// Cache-effectiveness counters, cumulative since device creation.
 ///
@@ -92,6 +95,24 @@ pub struct DrawCacheStats {
     pub texture_cache_hits: u64,
     pub texture_cache_misses: u64,
     pub texture_cache_evictions: u64,
+    /// Persistent compute-UAV effectiveness. A hit reuses the device image,
+    /// view, allocation, and readback buffer. A new per-submission snapshot
+    /// still uploads current guest bytes; repeated ordered dispatches sharing
+    /// that exact snapshot retain the GPU-newer contents in-place.
+    pub compute_image_hits: u64,
+    pub compute_image_misses: u64,
+    pub compute_image_evictions: u64,
+    /// Persistent UAV binds that kept the GPU-newer ordered contents instead
+    /// of staging the same per-submission seed again.
+    pub compute_image_uploads_skipped: u64,
+    /// Guest-addressed compute SSBOs retained across dispatches. A hit avoids
+    /// allocation; `compute_buffer_uploads_skipped` additionally means the
+    /// complete guest snapshot matched the cache's authoritative shadow, so
+    /// no map/copy upload was needed.
+    pub compute_buffer_hits: u64,
+    pub compute_buffer_misses: u64,
+    pub compute_buffer_evictions: u64,
+    pub compute_buffer_uploads_skipped: u64,
     /// Batch descriptor pools created (stage D item 2): deferred draws
     /// allocate from shared per-batch pools reset at retire, so this stops
     /// growing once a steady frame's worth of capacity exists.
@@ -116,6 +137,16 @@ struct PipelineLayoutKey {
     set_layouts: Vec<u64>,
     /// (stage flags, offset, size) per push-constant range.
     push_ranges: Vec<(u32, u32, u32)>,
+}
+
+/// Successful cross-stage interface checks.  The check walks both SPIR-V
+/// modules and builds temporary location maps, so doing it before every
+/// pipeline-cache lookup made a cache hit surprisingly expensive.
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
+struct GraphicsInterfaceKey {
+    vs: u64,
+    fs: u64,
+    topology: i32,
 }
 
 /// `VkStencilOpState`, reduced to hashable raw values.
@@ -318,6 +349,78 @@ pub(crate) struct PersistentTexture {
     pub last_use: u64,
 }
 
+/// Identity of a compute storage image whose Vulkan allocation can be reused.
+///
+/// `base` is included because the guest address is the resource's stable
+/// identity across dispatches. Shape and format stay in the key so a title
+/// reprogramming one address with a different view can never receive an
+/// incompatible image.
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
+pub(crate) struct ComputeImageKey {
+    pub base: u64,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub layers: u32,
+    pub array: bool,
+    pub format: i32,
+}
+
+/// Device-lifetime half of one compute UAV. The dispatch owns only its upload
+/// staging buffer; these handles remain in [`DrawCaches`] until eviction.
+#[derive(Clone)]
+pub(crate) struct PersistentComputeImage {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub view: vk::ImageView,
+    pub readback_buffer: vk::Buffer,
+    pub readback_memory: vk::DeviceMemory,
+    pub bytes: u64,
+    pub last_use: u64,
+    /// Weak identity of the decoded per-submission seed last uploaded. While
+    /// it upgrades and matches, later ordered dispatches must consume the
+    /// GPU-newer image rather than overwrite it with stale guest bytes.
+    pub last_snapshot: Weak<Vec<u8>>,
+}
+
+/// Guest publication metadata for a storage image written by one or more
+/// deferred compute dispatches. The persistent image's readback buffer is
+/// overwritten in queue order, so one entry per key publishes the final
+/// dispatch result after the shared batch fence.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ComputeImageWriteback {
+    pub key: ComputeImageKey,
+    pub tile_mode: u8,
+    pub texel: u32,
+}
+
+/// Stable identity of a guest compute SSBO. The padded descriptor byte size is
+/// part of the key so reprogramming an address with a different range cannot
+/// alias an incompatible Vulkan buffer.
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
+pub(crate) struct ComputeBufferKey {
+    pub base: u64,
+    pub size: usize,
+}
+
+/// Host-visible compute SSBO plus the exact bytes it currently contains.
+///
+/// The complete shadow is the cache's invalidation contract: every bind
+/// compares the freshly captured guest bytes against it. This deliberately
+/// avoids the sampled-hash shortcut used by read-only textures, which would
+/// be unsound for writable/global-memory shader resources.
+pub(crate) struct PersistentComputeBuffer {
+    pub buffer: vk::Buffer,
+    pub memory: vk::DeviceMemory,
+    pub shadow: Vec<u8>,
+    /// Weak identity of the submission-owned snapshot last validated against
+    /// `shadow`. It can only match while that exact Arc is still alive, so
+    /// allocator address reuse across submissions cannot produce a false hit.
+    pub last_snapshot: Weak<Vec<u8>>,
+    pub guest_size: usize,
+    pub last_use: u64,
+}
+
 /// The grown-on-demand descriptor pool (see [`DrawCaches::descriptor_pool`]).
 struct PoolState {
     pool: vk::DescriptorPool,
@@ -363,11 +466,12 @@ pub(crate) struct DrawCaches {
     shader_modules: HashMap<Vec<u32>, vk::ShaderModule>,
     set_layouts: HashMap<Vec<LayoutBindingKey>, vk::DescriptorSetLayout>,
     pipeline_layouts: HashMap<PipelineLayoutKey, vk::PipelineLayout>,
+    validated_graphics_interfaces: HashSet<GraphicsInterfaceKey>,
     graphics_pipelines: HashMap<GraphicsPipelineKey, vk::Pipeline>,
     /// Keyed by (canonical module handle, canonical layout handle).
     compute_pipelines: HashMap<(u64, u64), vk::Pipeline>,
     /// Keyed by linear-vs-nearest — the only sampler state decoded today.
-    samplers: HashMap<bool, vk::Sampler>,
+    samplers: HashMap<SamplerState, vk::Sampler>,
     targets: HashMap<TargetKey, PersistentTarget>,
     depth_targets: HashMap<DepthTargetKey, PersistentDepthTarget>,
     /// Persistent guest textures (stage D item 1) — see [`PersistentTexture`]
@@ -377,6 +481,18 @@ pub(crate) struct DrawCaches {
     texture_bytes: u64,
     /// Monotonic LRU clock for `textures`.
     texture_clock: u64,
+    /// Compute storage images persist across dispatches. Their complete input
+    /// is still uploaded and their output read back on every dispatch; this
+    /// cache removes only Vulkan create/allocate/view/free churn.
+    compute_images: HashMap<ComputeImageKey, PersistentComputeImage>,
+    compute_image_bytes: u64,
+    compute_image_clock: u64,
+    compute_buffers: HashMap<ComputeBufferKey, PersistentComputeBuffer>,
+    compute_buffer_bytes: u64,
+    compute_buffer_clock: u64,
+    /// Compute SSBOs evicted while recorded/submitted batch command buffers
+    /// may still reference them. Destroyed only after the shared batch fence.
+    deferred_compute_buffer_destroys: Vec<PersistentComputeBuffer>,
     /// Cached texture images evicted while pending command buffers may still
     /// reference them; destroyed at the batch retire (post-fence).
     deferred_image_destroys: Vec<(vk::Image, vk::DeviceMemory, vk::ImageView)>,
@@ -389,6 +505,16 @@ pub(crate) struct DrawCaches {
     gds: Option<(vk::Buffer, vk::DeviceMemory)>,
     /// Deferred draws whose GPU work is submitted but not yet fence-waited.
     pending: Vec<PendingDrawResources>,
+    /// One primary command buffer kept in RECORDING state for the whole PM4
+    /// batch. Draws and compute dispatches append to it in guest order; the
+    /// flip closes it and submits it once before the readback command.
+    batch_recording: Option<vk::CommandBuffer>,
+    /// Guest-addressed SSBOs writable by at least one pending compute command.
+    /// Read-only cache entries never need a post-fence host scan.
+    pending_compute_writes: HashSet<ComputeBufferKey>,
+    /// Persistent storage images written by pending compute commands. Values
+    /// carry the guest swizzle needed to publish the final linear readback.
+    pending_compute_image_writes: HashMap<ComputeImageKey, ComputeImageWriteback>,
     /// Targets drawn by the pending deferred draws, in draw order (last draw
     /// of a target keeps it at the back). Flush reads each back exactly once.
     touched: Vec<TargetKey>,
@@ -428,11 +554,21 @@ const HOST_POOL_FREE_CAP: u64 = 256 * 1024 * 1024;
 /// textures cannot pin device memory without bound.
 const TEXTURE_CACHE_CAP: u64 = 256 * 1024 * 1024;
 
+/// Compute UAVs can be substantially larger than sampled textures (for
+/// example full-resolution RGBA16F intermediates). Keep a separate bounded
+/// budget so a streaming title cannot turn allocation reuse into a leak.
+const COMPUTE_IMAGE_CACHE_CAP: u64 = 512 * 1024 * 1024;
+
+/// Writable/global-memory buffers are commonly several MiB each. Keep their
+/// host-visible allocations and CPU shadows under an independent bounded LRU.
+const COMPUTE_BUFFER_CACHE_CAP: u64 = 512 * 1024 * 1024;
+
 /// Usage union for pooled host buffers. One pool serves every per-draw guest
 /// upload, so each buffer carries the union of the usages those uploads need;
 /// extra usage bits on a buffer are free on desktop drivers.
 pub(crate) const HOST_POOL_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
     vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
+        | vk::BufferUsageFlags::TRANSFER_DST.as_raw()
         | vk::BufferUsageFlags::VERTEX_BUFFER.as_raw()
         | vk::BufferUsageFlags::INDEX_BUFFER.as_raw()
         | vk::BufferUsageFlags::STORAGE_BUFFER.as_raw(),
@@ -530,6 +666,32 @@ impl DrawCaches {
         Ok(layout)
     }
 
+    /// Run the SPIR-V cross-stage interface gate once for a canonical
+    /// (VS, FS, topology) tuple.
+    ///
+    /// Shader modules are device-cache handles, so equal SPIR-V has equal
+    /// handles for this cache's lifetime.  A failed validation is deliberately
+    /// not cached: diagnostics and future recovery retain the old behavior.
+    pub(crate) fn validate_graphics_interface_once(
+        &mut self,
+        vs: vk::ShaderModule,
+        fs: vk::ShaderModule,
+        topology: vk::PrimitiveTopology,
+        validate: impl FnOnce() -> Result<(), GpuError>,
+    ) -> Result<(), GpuError> {
+        let key = GraphicsInterfaceKey {
+            vs: vs.as_raw(),
+            fs: fs.as_raw(),
+            topology: topology.as_raw(),
+        };
+        if self.validated_graphics_interfaces.contains(&key) {
+            return Ok(());
+        }
+        validate()?;
+        self.validated_graphics_interfaces.insert(key);
+        Ok(())
+    }
+
     /// A cached graphics pipeline, if one exists for `key` (counts a hit).
     pub(crate) fn lookup_graphics_pipeline(
         &mut self,
@@ -584,6 +746,7 @@ impl DrawCaches {
         })?[0];
         self.stats.compute_pipeline_misses += 1;
         self.compute_pipelines.insert(key, pipeline);
+        dev.note_pipeline_compiled();
         Ok(pipeline)
     }
 
@@ -592,29 +755,24 @@ impl DrawCaches {
     pub(crate) fn sampler(
         &mut self,
         dev: &VulkanDevice,
-        linear: bool,
+        state: SamplerState,
     ) -> Result<vk::Sampler, GpuError> {
-        if let Some(&sampler) = self.samplers.get(&linear) {
+        if let Some(&sampler) = self.samplers.get(&state) {
             return Ok(sampler);
         }
-        let filter = if linear {
-            vk::Filter::LINEAR
-        } else {
-            vk::Filter::NEAREST
-        };
         let info = vk::SamplerCreateInfo::default()
-            .mag_filter(filter)
-            .min_filter(filter)
-            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-            .address_mode_u(vk::SamplerAddressMode::REPEAT)
-            .address_mode_v(vk::SamplerAddressMode::REPEAT)
-            .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .mag_filter(state.mag_filter)
+            .min_filter(state.min_filter)
+            .mipmap_mode(state.mipmap_mode)
+            .address_mode_u(state.address_mode_u)
+            .address_mode_v(state.address_mode_v)
+            .address_mode_w(state.address_mode_w)
             .max_lod(0.0);
         // SAFETY: plain sampler on a live device; retained in this cache and
         // destroyed exactly once in `destroy`.
         let sampler = unsafe { dev.device().create_sampler(&info, None) }
             .map_err(|e| GpuError::VulkanInitFailed(format!("vkCreateSampler: {e}")))?;
-        self.samplers.insert(linear, sampler);
+        self.samplers.insert(state, sampler);
         Ok(sampler)
     }
 
@@ -698,10 +856,11 @@ impl DrawCaches {
         // Smallest free size class that fits. Don't hand a small request a
         // giant buffer (>= 8x) — that starves the big classes and bloats
         // descriptor ranges' backing for nothing.
+        let requested_class = size.next_power_of_two().max(256);
         let fitting = if std::env::var_os("RAEEN_NO_HOST_POOL").is_none() {
             self.host_pool_free
                 .range(size..)
-                .find(|(cap, list)| **cap < size.saturating_mul(8) && !list.is_empty())
+                .find(|(cap, list)| **cap < requested_class.saturating_mul(8) && !list.is_empty())
                 .map(|(cap, _)| *cap)
         } else {
             None
@@ -719,7 +878,7 @@ impl DrawCaches {
             self.stats.host_pool_hits += 1;
             return Ok(entry);
         }
-        let capacity = size.next_power_of_two().max(256);
+        let capacity = requested_class;
         let (buffer, memory) = create_host_buffer(dev, capacity)?;
         self.host_pool_capacity.insert(buffer.as_raw(), capacity);
         self.stats.host_pool_misses += 1;
@@ -1003,6 +1162,412 @@ impl DrawCaches {
         self.textures.insert(key, texture);
     }
 
+    /// Reuse or create a guest-addressed compute SSBO and make its content
+    /// exactly `bytes`.
+    ///
+    /// A complete byte comparison is intentional. Guest CPU writes have no
+    /// generation counter yet, and a sparse hash is not a valid invalidation
+    /// contract for writable shader resources.
+    pub(crate) fn acquire_compute_buffer(
+        &mut self,
+        dev: &VulkanDevice,
+        key: ComputeBufferKey,
+        snapshot: &Arc<Vec<u8>>,
+        guest_size: usize,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory), GpuError> {
+        let bytes = snapshot.as_slice();
+        debug_assert_ne!(key.base, 0);
+        debug_assert_eq!(key.size, bytes.len());
+        debug_assert!(guest_size <= key.size);
+        self.compute_buffer_clock += 1;
+        let clock = self.compute_buffer_clock;
+        if let Some(entry) = self.compute_buffers.get_mut(&key) {
+            entry.last_use = clock;
+            entry.guest_size = guest_size;
+            self.stats.compute_buffer_hits += 1;
+            if entry
+                .last_snapshot
+                .upgrade()
+                .is_some_and(|previous| Arc::ptr_eq(&previous, snapshot))
+            {
+                // The command processor captured this guest allocation once
+                // for the whole PM4 submission. Later dispatches sharing that
+                // exact Arc cannot observe intervening guest CPU writes, and
+                // must preserve any GPU writes already queued into the
+                // persistent buffer. Avoid re-scanning up to 4 MiB here.
+                self.stats.compute_buffer_uploads_skipped += 1;
+                return Ok((entry.buffer, entry.memory));
+            }
+            if entry.shadow == bytes {
+                entry.last_snapshot = Arc::downgrade(snapshot);
+                self.stats.compute_buffer_uploads_skipped += 1;
+                return Ok((entry.buffer, entry.memory));
+            }
+            map_copy_compute_buffer(dev, entry.memory, bytes)?;
+            entry.shadow.copy_from_slice(bytes);
+            entry.last_snapshot = Arc::downgrade(snapshot);
+            return Ok((entry.buffer, entry.memory));
+        }
+
+        // Never evict an SSBO while the active batch may still reference it:
+        // besides invalidating a recorded command buffer, eviction before the
+        // fence would discard shader output before guest writeback. A batch may
+        // temporarily exceed the steady-state budget; post-fence pruning below
+        // restores the cap safely.
+        while !self.batch_open()
+            && self.compute_buffer_bytes.saturating_add(key.size as u64) > COMPUTE_BUFFER_CACHE_CAP
+        {
+            let Some((&lru_key, _)) = self
+                .compute_buffers
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_use)
+            else {
+                break;
+            };
+            let old = self
+                .compute_buffers
+                .remove(&lru_key)
+                .expect("compute buffer LRU key was just found");
+            self.compute_buffer_bytes = self
+                .compute_buffer_bytes
+                .saturating_sub(old.shadow.len() as u64);
+            if self.batch_open() {
+                self.deferred_compute_buffer_destroys.push(old);
+            } else {
+                destroy_compute_buffer(dev.device(), old);
+            }
+            self.stats.compute_buffer_evictions += 1;
+        }
+
+        let (buffer, memory) = create_host_buffer(dev, key.size as u64)?;
+        if let Err(error) = map_copy_compute_buffer(dev, memory, bytes) {
+            // SAFETY: creation succeeded but the allocation has never been
+            // submitted or published into the cache.
+            unsafe {
+                dev.device().destroy_buffer(buffer, None);
+                dev.device().free_memory(memory, None);
+            }
+            return Err(error);
+        }
+        let shadow = bytes.to_vec();
+        self.compute_buffer_bytes = self
+            .compute_buffer_bytes
+            .saturating_add(shadow.len() as u64);
+        self.compute_buffers.insert(
+            key,
+            PersistentComputeBuffer {
+                buffer,
+                memory,
+                shadow,
+                last_snapshot: Arc::downgrade(snapshot),
+                guest_size,
+                last_use: clock,
+            },
+        );
+        self.stats.compute_buffer_misses += 1;
+        Ok((buffer, memory))
+    }
+
+    /// Restore the steady-state SSBO cache budget after the batch fence and
+    /// guest writeback. At this point no command buffer references an evicted
+    /// entry and its GPU output has already been published.
+    pub(crate) fn prune_compute_buffers(&mut self, dev: &VulkanDevice) {
+        while self.compute_buffer_bytes > COMPUTE_BUFFER_CACHE_CAP {
+            let Some((&lru_key, _)) = self
+                .compute_buffers
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_use)
+            else {
+                break;
+            };
+            let old = self
+                .compute_buffers
+                .remove(&lru_key)
+                .expect("compute buffer LRU key was just found");
+            self.compute_buffer_bytes = self
+                .compute_buffer_bytes
+                .saturating_sub(old.shadow.len() as u64);
+            destroy_compute_buffer(dev.device(), old);
+            self.stats.compute_buffer_evictions += 1;
+        }
+    }
+
+    /// Apply the sparse post-dispatch delta to the authoritative CPU shadow.
+    /// The bind path already made the shadow equal to the initial guest bytes,
+    /// so only shader-written spans need copying.
+    pub(crate) fn update_compute_buffer_shadow(
+        &mut self,
+        key: ComputeBufferKey,
+        dirty: &[super::compute::ComputeDirtySpan],
+    ) {
+        let Some(entry) = self.compute_buffers.get_mut(&key) else {
+            return;
+        };
+        for span in dirty {
+            let end = span
+                .offset
+                .saturating_add(span.bytes.len())
+                .min(entry.shadow.len());
+            if span.offset < end {
+                entry.shadow[span.offset..end].copy_from_slice(&span.bytes[..end - span.offset]);
+            }
+        }
+    }
+
+    /// Publish GPU-written persistent compute buffers after the shared batch
+    /// fence. Only changed 4 KiB pages reach guest memory; the cache shadow is
+    /// advanced in lockstep so the next submission can validate CPU writes
+    /// against exact bytes.
+    pub(crate) fn flush_compute_buffers_to_guest(
+        &mut self,
+        dev: &VulkanDevice,
+    ) -> Result<(usize, usize), GpuError> {
+        const PAGE: usize = 4096;
+        let mut dirty_bytes = 0usize;
+        let mut dirty_spans = 0usize;
+        let writable = std::mem::take(&mut self.pending_compute_writes);
+        for key in writable {
+            let Some(entry) = self.compute_buffers.get_mut(&key) else {
+                continue;
+            };
+            // SAFETY: the caller's shared queue fence completed and this
+            // allocation is HOST_VISIBLE|COHERENT for its full shadow size.
+            let ptr = unsafe {
+                dev.device().map_memory(
+                    entry.memory,
+                    0,
+                    entry.shadow.len() as u64,
+                    vk::MemoryMapFlags::empty(),
+                )
+            }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("compute batch vkMapMemory: {e}")))?;
+            let result =
+                unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), entry.shadow.len()) };
+            let mut at = 0usize;
+            while at < entry.guest_size {
+                let end = at.saturating_add(PAGE).min(entry.guest_size);
+                if result[at..end] == entry.shadow[at..end] {
+                    at = end;
+                    continue;
+                }
+                let start = at;
+                at = end;
+                while at < entry.guest_size {
+                    let next = at.saturating_add(PAGE).min(entry.guest_size);
+                    if result[at..next] == entry.shadow[at..next] {
+                        break;
+                    }
+                    at = next;
+                }
+                let address = key.base.saturating_add(start as u64);
+                crate::guest_mem::trace_scanout_fill(address, at - start, "compute-batch-storage");
+                if !crate::guest_mem::write_bytes_checked(address, &result[start..at]) {
+                    unsafe { dev.device().unmap_memory(entry.memory) };
+                    return Err(GpuError::VulkanInitFailed(format!(
+                        "deferred compute writeback {address:#x}..{:#x} is not writable guest \
+                         memory",
+                        address.saturating_add((at - start) as u64)
+                    )));
+                }
+                entry.shadow[start..at].copy_from_slice(&result[start..at]);
+                dirty_bytes += at - start;
+                dirty_spans += 1;
+            }
+            unsafe { dev.device().unmap_memory(entry.memory) };
+        }
+        Ok((dirty_bytes, dirty_spans))
+    }
+
+    /// Publish the final result of every storage image written by the pending
+    /// batch. Each dispatch copied its result into the persistent readback
+    /// buffer in queue order; after the shared fence the buffer therefore
+    /// contains the last writer's complete linear image. A CPU guest-memory
+    /// mirror is best-effort because GPU-only images remain valid inputs for
+    /// later draws and valid presentation candidates.
+    pub(crate) fn flush_compute_images_to_guest(
+        &mut self,
+        dev: &VulkanDevice,
+    ) -> Result<(usize, Vec<(u64, crate::RenderedImage)>), GpuError> {
+        let pending = std::mem::take(&mut self.pending_compute_image_writes);
+        let mut written = 0usize;
+        let mut presentable = Vec::new();
+        for (key, writeback) in pending {
+            let Some(entry) = self.compute_images.get(&key).cloned() else {
+                continue;
+            };
+            let linear_size = key
+                .width
+                .checked_mul(key.height)
+                .and_then(|n| n.checked_mul(key.depth))
+                .and_then(|n| n.checked_mul(key.layers))
+                .and_then(|n| n.checked_mul(writeback.texel))
+                .map(|n| n as usize)
+                .ok_or_else(|| {
+                    GpuError::VulkanInitFailed(format!(
+                        "deferred compute image {:#x} extent overflow",
+                        key.base
+                    ))
+                })?;
+            // SAFETY: the shared batch fence completed. The persistent
+            // readback allocation is HOST_VISIBLE|COHERENT and was created for
+            // exactly this image's linear byte size.
+            let ptr = unsafe {
+                dev.device().map_memory(
+                    entry.readback_memory,
+                    0,
+                    linear_size as u64,
+                    vk::MemoryMapFlags::empty(),
+                )
+            }
+            .map_err(|e| {
+                GpuError::VulkanInitFailed(format!("compute image batch vkMapMemory: {e}"))
+            })?;
+            let linear = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), linear_size) };
+            let nonzero = linear.iter().any(|&byte| byte != 0);
+            if nonzero
+                && matches!(
+                    vk::Format::from_raw(key.format),
+                    vk::Format::R8G8B8A8_UNORM | vk::Format::R16G16B16A16_SFLOAT
+                )
+                && key.depth == 1
+                && key.layers == 1
+                && crate::guest_mem::is_scanout_candidate(key.base, linear_size)
+            {
+                let mut pixels = Vec::new();
+                if pixels.try_reserve_exact(linear_size).is_err() {
+                    unsafe { dev.device().unmap_memory(entry.readback_memory) };
+                    return Err(GpuError::VulkanInitFailed(format!(
+                        "deferred compute image {:#x} present copy allocation failed",
+                        key.base
+                    )));
+                }
+                pixels.extend_from_slice(linear);
+                presentable.push((
+                    key.base,
+                    crate::RenderedImage {
+                        width: key.width,
+                        height: key.height,
+                        pixels,
+                        bytes_per_pixel: writeback.texel,
+                    },
+                ));
+            }
+            let guest = encode_compute_image_writeback(writeback, linear);
+            unsafe { dev.device().unmap_memory(entry.readback_memory) };
+            let guest = guest?;
+            if crate::guest_mem::mirror_compute_image_to_guest(
+                key.base,
+                &guest,
+                "compute-batch-image",
+            ) == crate::guest_mem::ComputeImageGuestMirror::Written
+            {
+                written = written.saturating_add(guest.len());
+            }
+        }
+        Ok((written, presentable))
+    }
+
+    /// Reuse a compute UAV allocation with exactly the requested guest
+    /// identity and Vulkan shape. Returns whether the caller must upload its
+    /// seed. Rebinding the exact same submission snapshot preserves GPU-newer
+    /// ordered contents and skips the redundant staging copy.
+    pub(crate) fn compute_image_entry(
+        &mut self,
+        key: &ComputeImageKey,
+        snapshot: &Arc<Vec<u8>>,
+    ) -> Option<(PersistentComputeImage, bool)> {
+        self.compute_image_clock += 1;
+        let clock = self.compute_image_clock;
+        let entry = self.compute_images.get_mut(key)?;
+        entry.last_use = clock;
+        self.stats.compute_image_hits += 1;
+        let upload = !entry
+            .last_snapshot
+            .upgrade()
+            .is_some_and(|previous| Arc::ptr_eq(&previous, snapshot));
+        if upload {
+            entry.last_snapshot = Arc::downgrade(snapshot);
+        } else {
+            self.stats.compute_image_uploads_skipped += 1;
+        }
+        Some((entry.clone(), upload))
+    }
+
+    /// Retain a newly-created compute UAV and enforce a bounded LRU budget.
+    ///
+    /// An open deferred batch may still reference any retained UAV. Like the
+    /// SSBO cache, it may temporarily exceed its steady-state cap; pruning
+    /// runs only after the shared fence and guest publication.
+    pub(crate) fn insert_compute_image(
+        &mut self,
+        dev: &VulkanDevice,
+        key: ComputeImageKey,
+        mut image: PersistentComputeImage,
+    ) {
+        if let Some(old) = self.compute_images.remove(&key) {
+            self.compute_image_bytes = self.compute_image_bytes.saturating_sub(old.bytes);
+            self.destroy_compute_image(dev, old);
+            self.stats.compute_image_evictions += 1;
+        }
+        while !self.batch_open()
+            && self.compute_image_bytes.saturating_add(image.bytes) > COMPUTE_IMAGE_CACHE_CAP
+        {
+            let Some((&lru_key, _)) = self
+                .compute_images
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_use)
+            else {
+                break;
+            };
+            let old = self
+                .compute_images
+                .remove(&lru_key)
+                .expect("compute image LRU key was just found");
+            self.compute_image_bytes = self.compute_image_bytes.saturating_sub(old.bytes);
+            self.destroy_compute_image(dev, old);
+            self.stats.compute_image_evictions += 1;
+        }
+        self.compute_image_clock += 1;
+        image.last_use = self.compute_image_clock;
+        self.compute_image_bytes = self.compute_image_bytes.saturating_add(image.bytes);
+        self.compute_images.insert(key, image);
+        self.stats.compute_image_misses += 1;
+    }
+
+    /// Restore the steady-state UAV budget after every pending storage-image
+    /// result has been copied to guest memory and no queued command buffer can
+    /// reference an evicted entry.
+    pub(crate) fn prune_compute_images(&mut self, dev: &VulkanDevice) {
+        while self.compute_image_bytes > COMPUTE_IMAGE_CACHE_CAP {
+            let Some((&lru_key, _)) = self
+                .compute_images
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_use)
+            else {
+                break;
+            };
+            let old = self
+                .compute_images
+                .remove(&lru_key)
+                .expect("compute image LRU key was just found");
+            self.compute_image_bytes = self.compute_image_bytes.saturating_sub(old.bytes);
+            self.destroy_compute_image(dev, old);
+            self.stats.compute_image_evictions += 1;
+        }
+    }
+
+    fn destroy_compute_image(&mut self, dev: &VulkanDevice, image: PersistentComputeImage) {
+        // SAFETY: synchronous compute guarantees no command buffer references
+        // these handles; the cache entry has already been removed.
+        unsafe {
+            let device = dev.device();
+            device.destroy_image_view(image.view, None);
+            device.destroy_image(image.image, None);
+            device.free_memory(image.memory, None);
+        }
+        self.release_host_buffer(dev, image.readback_buffer, image.readback_memory);
+    }
+
     /// Destroy an evicted texture's handles now if no deferred batch is open
     /// (every command buffer that referenced them fence-completed), otherwise
     /// park them for the batch retire.
@@ -1164,32 +1729,71 @@ impl DrawCaches {
         self.touched.iter().any(|k| k.base == base)
     }
 
-    /// A primary command buffer for one deferred draw: recycled from the free
-    /// list, or freshly allocated. Not yet in the recording state.
+    /// The primary command buffer shared by every deferred draw/dispatch in the
+    /// current PM4 batch. It is begun once here and remains in RECORDING state
+    /// until [`Self::finish_batch_recording`] at the flip boundary.
     pub(crate) fn batch_command_buffer(
         &mut self,
         dev: &VulkanDevice,
     ) -> Result<vk::CommandBuffer, GpuError> {
-        if let Some(cb) = self.free_command_buffers.pop() {
+        if let Some(cb) = self.batch_recording {
             return Ok(cb);
         }
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(dev.command_pool())
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        // SAFETY: the pool belongs to this device and access is serialized by
-        // the cache lock (see module docs).
-        let buffers = unsafe { dev.device().allocate_command_buffers(&alloc_info) }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("batch command buffer alloc: {e}")))?;
-        buffers.first().copied().ok_or_else(|| {
-            GpuError::VulkanInitFailed("no batch command buffer returned".to_owned())
-        })
+        let cb = if let Some(cb) = self.free_command_buffers.pop() {
+            cb
+        } else {
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(dev.command_pool())
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            // SAFETY: the pool belongs to this device and access is serialized
+            // by the cache lock (see module docs).
+            let buffers =
+                unsafe { dev.device().allocate_command_buffers(&alloc_info) }.map_err(|e| {
+                    GpuError::VulkanInitFailed(format!("batch command buffer alloc: {e}"))
+                })?;
+            buffers.first().copied().ok_or_else(|| {
+                GpuError::VulkanInitFailed("no batch command buffer returned".to_owned())
+            })?
+        };
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: `cb` is fence-retired or newly allocated from a
+        // RESET_COMMAND_BUFFER pool, and the cache lock serializes recording.
+        if let Err(error) = unsafe { dev.device().begin_command_buffer(cb, &begin) } {
+            self.free_command_buffers.push(cb);
+            return Err(GpuError::VulkanInitFailed(format!(
+                "batch vkBeginCommandBuffer: {error}"
+            )));
+        }
+        self.batch_recording = Some(cb);
+        Ok(cb)
     }
 
-    /// Return a command buffer acquired via [`Self::batch_command_buffer`]
-    /// that was never submitted (the draw failed before submission).
-    pub(crate) fn recycle_command_buffer(&mut self, cb: vk::CommandBuffer) {
-        self.free_command_buffers.push(cb);
+    /// Close the current shared recording and attach its sole command-buffer
+    /// handle to the pending resource batch for submit/recycle at the fence.
+    pub(crate) fn finish_batch_recording(&mut self, dev: &VulkanDevice) -> Result<(), GpuError> {
+        let Some(cb) = self.batch_recording.take() else {
+            return Ok(());
+        };
+        // SAFETY: `batch_command_buffer` began `cb`, and every append happened
+        // under this same cache lock. It has not been submitted.
+        if let Err(error) = unsafe { dev.device().end_command_buffer(cb) } {
+            self.batch_recording = Some(cb);
+            return Err(GpuError::VulkanInitFailed(format!(
+                "batch vkEndCommandBuffer: {error}"
+            )));
+        }
+        if let Some(resources) = self.pending.first_mut() {
+            debug_assert_eq!(resources.command_buffer, vk::CommandBuffer::null());
+            resources.command_buffer = cb;
+        } else {
+            self.pending.push(PendingDrawResources {
+                command_buffer: cb,
+                ..PendingDrawResources::default()
+            });
+        }
+        Ok(())
     }
 
     /// Record a successfully submitted deferred draw: its per-draw resources
@@ -1206,18 +1810,41 @@ impl DrawCaches {
         self.stats.deferred_draws += 1;
     }
 
+    /// Retain resources for deferred compute work that has no render-target
+    /// identity. The next graphics/flip flush fences these command buffers on
+    /// the same queue and retires their descriptor/upload resources together.
+    pub(crate) fn commit_deferred_resources(
+        &mut self,
+        res: PendingDrawResources,
+        writable: impl IntoIterator<Item = ComputeBufferKey>,
+        image_writes: impl IntoIterator<Item = ComputeImageWriteback>,
+    ) {
+        self.pending.push(res);
+        self.pending_compute_writes.extend(writable);
+        self.pending_compute_image_writes
+            .extend(image_writes.into_iter().map(|write| (write.key, write)));
+    }
+
+    pub(crate) fn discard_pending_compute_writes(&mut self) {
+        self.pending_compute_writes.clear();
+        self.pending_compute_image_writes.clear();
+    }
+
     /// Take the whole pending batch for a flush: per-draw resources, touched
     /// targets (draw order), and targets whose destruction was deferred.
     pub(crate) fn take_batch(
         &mut self,
     ) -> (
         Vec<PendingDrawResources>,
+        usize,
         Vec<TargetKey>,
         Vec<PersistentTarget>,
         Vec<PersistentDepthTarget>,
     ) {
+        debug_assert!(self.batch_recording.is_none());
         (
             std::mem::take(&mut self.pending),
+            0,
             std::mem::take(&mut self.touched),
             std::mem::take(&mut self.deferred_target_destroys),
             std::mem::take(&mut self.deferred_depth_target_destroys),
@@ -1285,6 +1912,11 @@ impl DrawCaches {
                 d.destroy_image(image, None);
                 d.free_memory(memory, None);
             }
+        }
+        for buffer in std::mem::take(&mut self.deferred_compute_buffer_destroys) {
+            // SAFETY: the shared fence covered every command buffer that
+            // referenced this cache entry before its eviction.
+            destroy_compute_buffer(dev.device(), buffer);
         }
         // Batch descriptor pools: every set allocated from them belonged to
         // the just-retired draws, whose fence was waited — reset for the next
@@ -1369,6 +2001,9 @@ impl DrawCaches {
                     }
                 }
             }
+            if let Some(command_buffer) = self.batch_recording.take() {
+                device.free_command_buffers(command_pool, &[command_buffer]);
+            }
             self.touched.clear();
             for target in self.deferred_target_destroys.drain(..) {
                 destroy_target(device, &target);
@@ -1418,6 +2053,21 @@ impl DrawCaches {
                 device.free_memory(texture.memory, None);
             }
             self.texture_bytes = 0;
+            for (_, image) in self.compute_images.drain() {
+                device.destroy_image_view(image.view, None);
+                device.destroy_image(image.image, None);
+                device.free_memory(image.memory, None);
+                device.destroy_buffer(image.readback_buffer, None);
+                device.free_memory(image.readback_memory, None);
+            }
+            self.compute_image_bytes = 0;
+            for (_, buffer) in self.compute_buffers.drain() {
+                destroy_compute_buffer(device, buffer);
+            }
+            self.compute_buffer_bytes = 0;
+            for buffer in self.deferred_compute_buffer_destroys.drain(..) {
+                destroy_compute_buffer(device, buffer);
+            }
             for (image, memory, view) in self.deferred_image_destroys.drain(..) {
                 device.destroy_image_view(view, None);
                 device.destroy_image(image, None);
@@ -1443,6 +2093,14 @@ impl DrawCaches {
 
 /// Create one pooled host-visible|coherent buffer of `capacity` bytes with the
 /// pool's usage union.
+///
+/// Prefer `HOST_CACHED`: compute storage buffers are both upload sources and
+/// guest writeback targets. Mapping an uncached host-visible heap and copying
+/// a multi-megabyte writable V# can be tens of milliseconds on an iGPU
+/// (measured: Minecraft's 4 MiB menu compute output). Cached coherent memory
+/// keeps direct descriptor access while making the post-fence CPU readback a
+/// normal cached memcpy. Devices without that combination retain the previous
+/// host-visible/coherent fallback.
 fn create_host_buffer(
     dev: &VulkanDevice,
     capacity: u64,
@@ -1463,11 +2121,13 @@ fn create_host_buffer(
         unsafe { dev.device().destroy_buffer(buffer, None) };
         e
     };
+    let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
     let type_index = dev
         .find_memory_type(
             reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            host | vk::MemoryPropertyFlags::HOST_CACHED,
         )
+        .or_else(|_| dev.find_memory_type(reqs.memory_type_bits, host))
         .map_err(cleanup)?;
     let alloc = vk::MemoryAllocateInfo::default()
         .allocation_size(reqs.size)
@@ -1489,6 +2149,102 @@ fn create_host_buffer(
         )));
     }
     Ok((buffer, memory))
+}
+
+fn encode_compute_image_writeback(
+    writeback: ComputeImageWriteback,
+    linear: &[u8],
+) -> Result<Vec<u8>, GpuError> {
+    let key = writeback.key;
+    if key.depth > 1 || writeback.tile_mode == 0 {
+        let mut guest = Vec::new();
+        guest.try_reserve_exact(linear.len()).map_err(|_| {
+            GpuError::VulkanInitFailed(format!(
+                "deferred compute image {:#x} linear writeback allocation failed",
+                key.base
+            ))
+        })?;
+        guest.extend_from_slice(linear);
+        return Ok(guest);
+    }
+    let bpp_log2 = writeback.texel.trailing_zeros();
+    let face_linear = key.width as usize * key.height as usize * writeback.texel as usize;
+    let expected = face_linear.saturating_mul(key.layers as usize);
+    if linear.len() < expected {
+        return Err(GpuError::VulkanInitFailed(format!(
+            "deferred compute image {:#x} readback is {} B; expected at least {expected} B",
+            key.base,
+            linear.len()
+        )));
+    }
+    let face_tiled = crate::texture::tiling::tiled_byte_count_for_mode(
+        writeback.tile_mode,
+        key.width,
+        key.height,
+        bpp_log2,
+    )
+    .ok_or_else(|| {
+        GpuError::VulkanInitFailed(format!(
+            "deferred compute image tile mode {} is not implemented",
+            writeback.tile_mode
+        ))
+    })? as usize;
+    let total = face_tiled.saturating_mul(key.layers as usize);
+    let mut tiled = Vec::new();
+    tiled.try_reserve_exact(total).map_err(|_| {
+        GpuError::VulkanInitFailed(format!(
+            "deferred compute image {:#x} tiled writeback allocation failed",
+            key.base
+        ))
+    })?;
+    tiled.resize(total, 0);
+    for layer in 0..key.layers as usize {
+        let face = &linear[layer * face_linear..(layer + 1) * face_linear];
+        let output = &mut tiled[layer * face_tiled..(layer + 1) * face_tiled];
+        if !crate::texture::tiling::tile_64kb_into(
+            writeback.tile_mode,
+            face,
+            output,
+            key.width,
+            key.height,
+            bpp_log2,
+        ) {
+            return Err(GpuError::VulkanInitFailed(format!(
+                "deferred compute image tile mode {} could not encode {}x{} layer {layer}",
+                writeback.tile_mode, key.width, key.height
+            )));
+        }
+    }
+    Ok(tiled)
+}
+
+fn map_copy_compute_buffer(
+    dev: &VulkanDevice,
+    memory: vk::DeviceMemory,
+    bytes: &[u8],
+) -> Result<(), GpuError> {
+    // SAFETY: compute-buffer cache allocations are HOST_VISIBLE|COHERENT,
+    // cache access is serialized, and callers only update them after the
+    // preceding synchronous dispatch fence completed.
+    let ptr = unsafe {
+        dev.device()
+            .map_memory(memory, 0, bytes.len() as u64, vk::MemoryMapFlags::empty())
+    }
+    .map_err(|e| GpuError::VulkanInitFailed(format!("compute buffer vkMapMemory: {e}")))?;
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+        dev.device().unmap_memory(memory);
+    }
+    Ok(())
+}
+
+fn destroy_compute_buffer(device: &ash::Device, buffer: PersistentComputeBuffer) {
+    // SAFETY: caller guarantees no pending queue work references this cache
+    // entry and removes it from the sole owning map before calling.
+    unsafe {
+        device.destroy_buffer(buffer.buffer, None);
+        device.free_memory(buffer.memory, None);
+    }
 }
 
 /// Destroy one persistent target's handles.
@@ -1564,6 +2320,82 @@ mod tests {
             ..base.clone()
         };
         assert_ne!(base, different_shader);
+    }
+
+    #[test]
+    fn graphics_interface_validation_is_once_per_canonical_pair_and_topology() {
+        use std::cell::Cell;
+
+        let mut caches = DrawCaches::default();
+        let validations = Cell::new(0_u32);
+        let vs = vk::ShaderModule::from_raw(0x100);
+        let fs = vk::ShaderModule::from_raw(0x200);
+
+        for _ in 0..3 {
+            caches
+                .validate_graphics_interface_once(
+                    vs,
+                    fs,
+                    vk::PrimitiveTopology::TRIANGLE_LIST,
+                    || {
+                        validations.set(validations.get() + 1);
+                        Ok(())
+                    },
+                )
+                .expect("valid interface");
+        }
+        assert_eq!(validations.get(), 1);
+
+        caches
+            .validate_graphics_interface_once(vs, fs, vk::PrimitiveTopology::POINT_LIST, || {
+                validations.set(validations.get() + 1);
+                Ok(())
+            })
+            .expect("topology-specific validation");
+        assert_eq!(validations.get(), 2);
+    }
+
+    #[test]
+    fn compute_image_reuses_only_the_same_live_submission_snapshot() {
+        let mut caches = DrawCaches::default();
+        let key = ComputeImageKey {
+            base: 0x8000,
+            width: 4,
+            height: 4,
+            depth: 1,
+            layers: 1,
+            array: false,
+            format: vk::Format::R8G8B8A8_UNORM.as_raw(),
+        };
+        let snapshot = Arc::new(vec![0x11; 64]);
+        caches.compute_images.insert(
+            key,
+            PersistentComputeImage {
+                image: vk::Image::null(),
+                memory: vk::DeviceMemory::null(),
+                view: vk::ImageView::null(),
+                readback_buffer: vk::Buffer::null(),
+                readback_memory: vk::DeviceMemory::null(),
+                bytes: 64,
+                last_use: 0,
+                last_snapshot: Arc::downgrade(&snapshot),
+            },
+        );
+
+        let (_, upload) = caches
+            .compute_image_entry(&key, &snapshot)
+            .expect("cached image");
+        assert!(!upload, "the same live snapshot keeps GPU-newer content");
+        assert_eq!(caches.stats.compute_image_uploads_skipped, 1);
+
+        let next_submission = Arc::new(vec![0x11; 64]);
+        let (_, upload) = caches
+            .compute_image_entry(&key, &next_submission)
+            .expect("cached image");
+        assert!(
+            upload,
+            "equal bytes from a different submission need a fresh upload"
+        );
     }
 
     #[test]

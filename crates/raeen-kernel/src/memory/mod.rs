@@ -9,7 +9,7 @@ pub mod virtual_memory;
 
 use parking_lot::RwLock;
 use raeen_core::error::KernelError;
-use raeen_core::types::{MemoryProtection, MemoryRegion, Ps5MemoryType, VAddr};
+use raeen_core::types::{MappingKind, MemoryProtection, MemoryRegion, Ps5MemoryType, VAddr};
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
@@ -78,6 +78,9 @@ impl VirtualMemoryManager {
             protection,
             memory_type: Ps5MemoryType::Onion, // Default to CPU-cached.
             name: None,
+            kind: MappingKind::Anonymous,
+            direct_offset: 0,
+            direct_memory_type: 0,
         };
 
         debug!(
@@ -125,6 +128,27 @@ impl VirtualMemoryManager {
     /// arena itself), not through this VMM. `is_mapped`/`region_containing`
     /// still work, since those only ever consult `regions`.
     pub fn record_mapping(&self, addr: VAddr, size: u64, prot: u32) {
+        self.record_mapping_of_kind(addr, size, prot, MappingKind::Anonymous, 0, 0);
+    }
+
+    /// [`Self::record_mapping`], but recording what kind of mapping this is and
+    /// (for direct memory) the physical offset and allocation type it came
+    /// from, so `sceKernelVirtualQuery` can report the region the way the
+    /// guest mapped it.
+    ///
+    /// Titles read their own mappings back. Minecraft's embedded V8 maps direct
+    /// memory and immediately queries the range to confirm the kernel agrees;
+    /// answering "anonymous, offset 0, type 0" for memory it had just mapped as
+    /// direct type 12 violated its invariant and tripped `UNREACHABLE()`.
+    pub fn record_mapping_of_kind(
+        &self,
+        addr: VAddr,
+        size: u64,
+        prot: u32,
+        kind: MappingKind,
+        direct_offset: u64,
+        direct_memory_type: i32,
+    ) {
         let aligned_size = align_up(size, raeen_core::PS5_PAGE_SIZE as u64);
         let protection = MemoryProtection::from_bits_truncate(prot);
 
@@ -134,6 +158,9 @@ impl VirtualMemoryManager {
             protection,
             memory_type: Ps5MemoryType::Onion,
             name: Some("arena_mmap".to_string()),
+            kind,
+            direct_offset,
+            direct_memory_type,
         };
 
         debug!(
@@ -220,6 +247,14 @@ impl VirtualMemoryManager {
     /// Find the mapped region containing `addr`, if any.
     ///
     /// Returns a clone of the region metadata (not the backing bytes).
+    /// The `type` a direct-memory range was allocated with, looked up by its
+    /// physical (direct-memory) address. `None` if nothing is recorded there.
+    #[must_use]
+    pub fn direct_allocation_type(&self, phys: VAddr) -> Option<i32> {
+        self.region_containing(phys)
+            .map(|region| region.direct_memory_type)
+    }
+
     pub fn region_containing(&self, addr: VAddr) -> Option<MemoryRegion> {
         self.regions
             .read()
@@ -264,6 +299,9 @@ impl VirtualMemoryManager {
             // distinguishes resource segments from code/data.
             memory_type: Ps5MemoryType::Onion,
             name: Some("loaded_segment".to_string()),
+            kind: MappingKind::Anonymous,
+            direct_offset: 0,
+            direct_memory_type: 0,
         };
 
         let mut backing_data = vec![0u8; aligned_size as usize];

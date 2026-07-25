@@ -92,6 +92,16 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 
+fn trace_shader_binds_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RAEEN_TRACE_SHADER_BINDS").is_some())
+}
+
+fn trace_indirect_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RAEEN_TRACE_INDIRECT").is_some())
+}
+
 /// A process-monotonic, always-nonzero value for `RELEASE_MEM` DATA_SEL 3/4
 /// (GPU timestamp). SharpEmu writes `Stopwatch.GetTimestamp()` here
 /// (AgcExports.cs:5395-5397 / 5469-5471); the guest only needs a nonzero,
@@ -569,7 +579,7 @@ impl CommandProcessor {
     }
 
     fn trace_shader_bind(&mut self) -> bool {
-        if std::env::var_os("RAEEN_TRACE_SHADER_BINDS").is_none() {
+        if !trace_shader_binds_enabled() {
             return false;
         }
         self.shader_bind_trace_count = self.shader_bind_trace_count.saturating_add(1);
@@ -1677,7 +1687,7 @@ impl CommandProcessor {
         // packet and the table head for the first N packets with any
         // out-of-file offset — mis-decoded layout vs stale/raced memory is
         // decidable from this line alone.
-        if std::env::var_os("RAEEN_TRACE_INDIRECT").is_some() {
+        if trace_indirect_enabled() {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SEEN: AtomicU32 = AtomicU32::new(0);
             let oob = pairs

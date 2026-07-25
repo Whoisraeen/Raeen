@@ -1,17 +1,21 @@
 //! One-shot Vulkan compute dispatch for translated guest shaders.
 //!
 //! Guest storage buffers are uploaded into host-visible coherent Vulkan
-//! buffers, and guest storage images (UAVs) into device-local
-//! `R8G8B8A8_UNORM` images via staging buffers. After the queue fence both
-//! are read back; the caller owns copying those bytes back into
-//! identity-mapped guest memory.
+//! buffers, and guest storage images (UAVs) into device-local images via
+//! staging buffers. After the queue fence, only buffers whose guest usage is
+//! `ReadWrite` plus all storage images are read back; the caller owns copying
+//! those bytes back into identity-mapped guest memory.
 
-use super::cache::DrawCaches;
+use super::cache::{
+    ComputeBufferKey, ComputeImageKey, ComputeImageWriteback, DrawCaches, PendingDrawResources,
+    PersistentComputeImage,
+};
 use super::instance::VulkanDevice;
 use super::offscreen::{ShaderStageBinding, StorageImageUpload, TextureUpload};
 use ash::vk::Handle;
 use ash::{Device, vk};
 use raeen_core::error::GpuError;
+use std::sync::Arc;
 
 pub struct ComputeState<'a> {
     pub groups: [u32; 3],
@@ -21,11 +25,51 @@ pub struct ComputeState<'a> {
 
 /// Post-dispatch device content, in the binding's declaration order.
 pub struct ComputeOutputs {
-    /// One entry per storage buffer (`StorageBufferBinding.buffers` order).
-    pub buffers: Vec<Vec<u8>>,
+    /// One entry per writable storage buffer, preserving
+    /// `StorageBufferBinding.buffers` order after read-only entries are
+    /// filtered out.
+    pub buffers: Vec<ComputeBufferOutput>,
     /// One entry per storage image (`StorageImageBinding.images` order),
     /// RGBA8 tightly packed rows.
     pub images: Vec<Vec<u8>>,
+}
+
+/// One changed byte range in a writable compute storage buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputeDirtySpan {
+    pub offset: usize,
+    pub bytes: Vec<u8>,
+}
+
+/// Sparse post-dispatch storage-buffer content.
+///
+/// The compute path uploaded `initial` before dispatch. Returning only pages
+/// that differ avoids allocating/copying/writing a complete multi-megabyte V#
+/// when a small workgroup touched a handful of dwords.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputeBufferOutput {
+    pub size: usize,
+    pub dirty: Vec<ComputeDirtySpan>,
+}
+
+impl ComputeBufferOutput {
+    /// Reconstruct the complete buffer for Vulkan integration tests and
+    /// diagnostics. The production guest writeback consumes `dirty` directly.
+    #[must_use]
+    pub fn materialize(&self, initial: &[u8]) -> Vec<u8> {
+        let mut bytes = initial[..initial.len().min(self.size)].to_vec();
+        bytes.resize(self.size, 0);
+        for span in &self.dirty {
+            let end = span
+                .offset
+                .saturating_add(span.bytes.len())
+                .min(bytes.len());
+            if span.offset < end {
+                bytes[span.offset..end].copy_from_slice(&span.bytes[..end - span.offset]);
+            }
+        }
+        bytes
+    }
 }
 
 /// Choose the Vulkan inline push range for a translated resource table.
@@ -75,27 +119,185 @@ pub fn dispatch_compute(
         )));
     }
 
+    let timing = crate::diagnostics::gpu_env().time_compute;
+    let total_at = timing.then(std::time::Instant::now);
     // Same locking contract as `render_draw`: the cache lock spans the whole
     // synchronous dispatch, including the fence wait, so the cached pipeline,
     // command buffer, fence, and descriptor pool are reused soundly.
     let mut caches = dev.draw_caches();
     let mut resources = ComputeResources::new(dev, &mut caches);
+    let phase_at = timing.then(std::time::Instant::now);
     resources.build(state)?;
+    let build = phase_at.map_or(std::time::Duration::ZERO, |at| at.elapsed());
+    let phase_at = timing.then(std::time::Instant::now);
     resources.record_and_submit(state)?;
-    Ok(ComputeOutputs {
-        buffers: resources.read_storage()?,
+    let submit_wait = phase_at.map_or(std::time::Duration::ZERO, |at| at.elapsed());
+    let phase_at = timing.then(std::time::Instant::now);
+    let outputs = ComputeOutputs {
+        buffers: resources.read_storage(
+            state
+                .binding
+                .and_then(|binding| binding.storage_buffers.as_ref()),
+        )?,
         images: resources.read_images()?,
-    })
+    };
+    let map_copy = phase_at.map_or(std::time::Duration::ZERO, |at| at.elapsed());
+    let storage_bytes = state
+        .binding
+        .and_then(|binding| binding.storage_buffers.as_ref())
+        .map_or(0usize, |storage| {
+            storage.buffers.iter().map(|bytes| bytes.len()).sum()
+        });
+    let image_bytes = state
+        .binding
+        .and_then(|binding| binding.storage_images.as_ref())
+        .map_or(0usize, |images| {
+            images.images.iter().map(|image| image.pixels.len()).sum()
+        });
+    let sampled_bytes = state
+        .binding
+        .and_then(|binding| binding.textures.as_ref())
+        .map_or(0usize, |textures| {
+            textures
+                .textures
+                .iter()
+                .map(|texture| texture.pixels.len())
+                .sum()
+        });
+    let image_count = resources.images.len();
+    let sampled_count = resources.sampled.len();
+    let dirty_storage_bytes: usize = outputs
+        .buffers
+        .iter()
+        .flat_map(|output| &output.dirty)
+        .map(|span| span.bytes.len())
+        .sum();
+    let dirty_storage_spans: usize = outputs
+        .buffers
+        .iter()
+        .map(|output| output.dirty.len())
+        .sum();
+    let phase_at = timing.then(std::time::Instant::now);
+    drop(resources);
+    let retire = phase_at.map_or(std::time::Duration::ZERO, |at| at.elapsed());
+    if let Some(total_at) = total_at {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static DISPATCHES: AtomicU64 = AtomicU64::new(0);
+        static SLOW: AtomicU64 = AtomicU64::new(0);
+        let n = DISPATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+        let total = total_at.elapsed();
+        let slow_n = (total >= std::time::Duration::from_millis(10))
+            .then(|| SLOW.fetch_add(1, Ordering::Relaxed) + 1);
+        if n.is_multiple_of(512) || slow_n.is_some_and(|slow| slow <= 32 || slow.is_power_of_two())
+        {
+            tracing::warn!(
+                dispatch = n,
+                slow_dispatch = slow_n,
+                groups = format_args!(
+                    "{}x{}x{}",
+                    state.groups[0], state.groups[1], state.groups[2]
+                ),
+                storage_bytes,
+                dirty_storage_bytes,
+                dirty_storage_spans,
+                image_count,
+                image_bytes,
+                sampled_count,
+                sampled_bytes,
+                build_us = build.as_micros(),
+                submit_wait_us = submit_wait.as_micros(),
+                map_copy_us = map_copy.as_micros(),
+                retire_us = retire.as_micros(),
+                total_us = total.as_micros(),
+                "TIME_COMPUTE: synchronous dispatch phase split"
+            );
+        }
+    }
+    Ok(outputs)
+}
+
+/// Submit a guest-addressed compute packet without a per-dispatch fence.
+///
+/// Command buffers and descriptor/upload resources join the shared deferred
+/// batch. Persistent guest-addressed SSBOs preserve visibility between queued
+/// dispatches; the next flip/submission flush fences them once.
+pub fn dispatch_compute_deferred(
+    dev: &VulkanDevice,
+    state: &ComputeState<'_>,
+) -> Result<(), GpuError> {
+    let timing = crate::diagnostics::gpu_env().time_compute;
+    let total_at = timing.then(std::time::Instant::now);
+    let binding = state.binding.ok_or_else(|| {
+        GpuError::PipelineCreationFailed(
+            "deferred compute requires an explicit resource binding".to_owned(),
+        )
+    })?;
+    let storage = binding.storage_buffers.as_ref();
+    let images = binding.storage_images.as_ref();
+    if storage.is_none() && images.is_none() {
+        return Err(GpuError::PipelineCreationFailed(
+            "deferred compute requires guest-addressed storage buffers or images".to_owned(),
+        ));
+    }
+    if storage.is_some_and(|storage| storage.guest_bases.contains(&0))
+        || images.is_some_and(|images| images.images.iter().any(|image| image.guest_base == 0))
+    {
+        return Err(GpuError::PipelineCreationFailed(
+            "deferred compute cannot retain synthetic/null guest resources".to_owned(),
+        ));
+    }
+
+    let mut caches = dev.draw_caches();
+    let mut resources = ComputeResources::new(dev, &mut caches);
+    resources.batched = true;
+    let build_at = timing.then(std::time::Instant::now);
+    resources.build(state)?;
+    let build = build_at.map_or(std::time::Duration::ZERO, |at| at.elapsed());
+    let record_at = timing.then(std::time::Instant::now);
+    resources.record_and_submit(state)?;
+    let record = record_at.map_or(std::time::Duration::ZERO, |at| at.elapsed());
+    let commit_at = timing.then(std::time::Instant::now);
+    resources.commit_to_batch()?;
+    let commit = commit_at.map_or(std::time::Duration::ZERO, |at| at.elapsed());
+    drop(resources);
+    if let Some(total_at) = total_at {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static DEFERRED_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+        let dispatch = DEFERRED_DISPATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+        if dispatch.is_multiple_of(512) {
+            tracing::warn!(
+                dispatch,
+                groups = format_args!(
+                    "{}x{}x{}",
+                    state.groups[0], state.groups[1], state.groups[2]
+                ),
+                build_us = build.as_micros(),
+                record_us = record.as_micros(),
+                commit_us = commit.as_micros(),
+                total_us = total_at.elapsed().as_micros(),
+                compute_buffer_hits = caches.stats.compute_buffer_hits,
+                compute_buffer_misses = caches.stats.compute_buffer_misses,
+                compute_buffer_uploads_skipped = caches.stats.compute_buffer_uploads_skipped,
+                compute_image_hits = caches.stats.compute_image_hits,
+                compute_image_misses = caches.stats.compute_image_misses,
+                compute_image_uploads_skipped = caches.stats.compute_image_uploads_skipped,
+                "TIME_COMPUTE: deferred dispatch phase split"
+            );
+        }
+    }
+    Ok(())
 }
 
 struct BufferAllocation {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     size: usize,
+    persistent_key: Option<ComputeBufferKey>,
 }
 
 /// One storage image plus its upload staging and readback buffers.
 struct ImageAllocation {
+    key: ComputeImageKey,
     staging_buffer: vk::Buffer,
     staging_memory: vk::DeviceMemory,
     image: vk::Image,
@@ -111,6 +313,20 @@ struct ImageAllocation {
     layers: u32,
     /// Bytes per texel (4 = RGBA8, 8 = RGBA16F).
     texel: u32,
+    /// The image/view/allocation/readback pair lives in `DrawCaches`; this
+    /// dispatch owns only its staging upload.
+    persistent: bool,
+    /// A freshly-created cache entry starts in UNDEFINED. Cache hits rest in
+    /// TRANSFER_SRC_OPTIMAL after the preceding dispatch's readback copy.
+    fresh: bool,
+    /// Whether this dispatch must seed the image from `staging_buffer`.
+    /// False for a repeated descriptor in one PM4 submission: the persistent
+    /// image already holds the preceding ordered dispatch's newer result.
+    upload_seed: bool,
+    /// Duplicate descriptor slots may alias the same guest UAV. They still
+    /// need a descriptor entry, but only the first slot records layout
+    /// transitions and one readback copy for the shared Vulkan image.
+    records_commands: bool,
 }
 
 /// One sampled (read-only) texture: staging buffer + device-local image +
@@ -155,6 +371,9 @@ struct ComputeResources<'a> {
     pipeline: vk::Pipeline,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
+    batched: bool,
+    deferred_write_keys: Vec<ComputeBufferKey>,
+    deferred_image_writes: Vec<ComputeImageWriteback>,
 }
 
 impl<'a> ComputeResources<'a> {
@@ -177,6 +396,9 @@ impl<'a> ComputeResources<'a> {
             pipeline: vk::Pipeline::null(),
             command_buffer: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
+            batched: false,
+            deferred_write_keys: Vec::new(),
+            deferred_image_writes: Vec::new(),
         }
     }
 
@@ -216,8 +438,35 @@ impl<'a> ComputeResources<'a> {
                         "compute storage descriptor array is empty".to_owned(),
                     ));
                 }
-                for bytes in &storage.buffers {
-                    self.storage.push(self.create_storage_buffer(bytes)?);
+                if storage.guest_bases.len() != storage.buffers.len()
+                    || storage.guest_sizes.len() != storage.buffers.len()
+                    || storage.writable.len() != storage.buffers.len()
+                {
+                    return Err(GpuError::PipelineCreationFailed(format!(
+                        "compute storage buffers ({}) / guest bases ({}) / guest sizes ({}) / \
+                         writeback flags ({}) must have identical counts",
+                        storage.buffers.len(),
+                        storage.guest_bases.len(),
+                        storage.guest_sizes.len(),
+                        storage.writable.len()
+                    )));
+                }
+                for (index, ((bytes, &base), &guest_size)) in storage
+                    .buffers
+                    .iter()
+                    .zip(&storage.guest_bases)
+                    .zip(&storage.guest_sizes)
+                    .enumerate()
+                {
+                    let allocation =
+                        self.create_storage_buffer(bytes, base, guest_size, Some(bytes))?;
+                    if self.batched
+                        && storage.writable[index]
+                        && let Some(key) = allocation.persistent_key
+                    {
+                        self.deferred_write_keys.push(key);
+                    }
+                    self.storage.push(allocation);
                 }
                 layout_bindings.push(
                     vk::DescriptorSetLayoutBinding::default()
@@ -234,7 +483,22 @@ impl<'a> ComputeResources<'a> {
                     ));
                 }
                 for upload in &images.images {
-                    self.create_storage_image(upload)?;
+                    let records_commands = self.create_storage_image(upload)?;
+                    if self.batched && records_commands {
+                        self.deferred_image_writes.push(ComputeImageWriteback {
+                            key: ComputeImageKey {
+                                base: upload.guest_base,
+                                width: upload.width,
+                                height: upload.height,
+                                depth: upload.depth.max(1),
+                                layers: upload.layers.max(1),
+                                array: upload.array,
+                                format: upload.format.as_raw(),
+                            },
+                            tile_mode: upload.tile_mode,
+                            texel: upload.texel_bytes(),
+                        });
+                    }
                 }
                 layout_bindings.push(
                     vk::DescriptorSetLayoutBinding::default()
@@ -255,7 +519,7 @@ impl<'a> ComputeResources<'a> {
             // bind textures but zero samplers). Each descriptor array is
             // created only when non-empty, mirroring the SPIR-V exactly.
             if let Some(textures) = textures {
-                if textures.textures.is_empty() && textures.linear_filter.is_empty() {
+                if textures.textures.is_empty() && textures.samplers.is_empty() {
                     return Err(GpuError::PipelineCreationFailed(
                         "compute sampled-texture and sampler descriptor arrays are both empty"
                             .to_owned(),
@@ -288,9 +552,10 @@ impl<'a> ComputeResources<'a> {
                         }
                     }
                 }
-                if !textures.linear_filter.is_empty() {
-                    for &linear in &textures.linear_filter {
-                        self.samplers.push(self.caches.sampler(self.dev, linear)?);
+                if !textures.samplers.is_empty() {
+                    for &sampler_state in &textures.samplers {
+                        self.samplers
+                            .push(self.caches.sampler(self.dev, sampler_state)?);
                     }
                     layout_bindings.push(
                         vk::DescriptorSetLayoutBinding::default()
@@ -326,7 +591,8 @@ impl<'a> ComputeResources<'a> {
                         window.bytes.len()
                     )));
                 }
-                self.eud_raw = Some(self.create_storage_buffer(&window.bytes)?);
+                self.eud_raw =
+                    Some(self.create_storage_buffer(&window.bytes, 0, window.bytes.len(), None)?);
                 layout_bindings.push(
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(window.binding)
@@ -341,7 +607,12 @@ impl<'a> ComputeResources<'a> {
                         "push-uniform binding has an empty resource table".to_owned(),
                     ));
                 }
-                self.push_uniform = Some(self.create_storage_buffer(&binding.push_constants)?);
+                self.push_uniform = Some(self.create_storage_buffer(
+                    &binding.push_constants,
+                    0,
+                    binding.push_constants.len(),
+                    None,
+                )?);
                 layout_bindings.push(
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(uniform_binding)
@@ -374,9 +645,14 @@ impl<'a> ComputeResources<'a> {
                     .descriptor_count(count)
             })
             .collect();
-            // The persistent pool, reset for this dispatch (the previous
-            // draw/dispatch that used it fence-completed under the lock).
-            self.descriptor_pool = self.caches.descriptor_pool(self.dev, 1, &pool_sizes)?;
+            self.descriptor_pool = if self.batched {
+                self.caches
+                    .batch_descriptor_pool(self.dev, 1, &pool_sizes)?
+            } else {
+                // The persistent pool is safe only for synchronous dispatches;
+                // its acquisition resets every previously allocated set.
+                self.caches.descriptor_pool(self.dev, 1, &pool_sizes)?
+            };
             let layouts = [self.descriptor_layout];
             let alloc_info = vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(self.descriptor_pool)
@@ -581,15 +857,19 @@ impl<'a> ComputeResources<'a> {
             self.caches
                 .compute_pipeline(self.dev, self.shader, self.pipeline_layout)?;
 
-        let (command_buffer, fence) = self.caches.submit_resources(self.dev)?;
-        self.command_buffer = command_buffer;
-        self.fence = fence;
+        if self.batched {
+            self.command_buffer = self.caches.batch_command_buffer(self.dev)?;
+        } else {
+            let (command_buffer, fence) = self.caches.submit_resources(self.dev)?;
+            self.command_buffer = command_buffer;
+            self.fence = fence;
+        }
         Ok(())
     }
 
     /// Host-visible coherent buffer, optionally filled with `fill`.
     fn create_host_buffer(
-        &self,
+        &mut self,
         size: usize,
         usage: vk::BufferUsageFlags,
         fill: Option<&[u8]>,
@@ -599,57 +879,28 @@ impl<'a> ComputeResources<'a> {
                 "zero-sized compute host buffer".to_owned(),
             ));
         }
-        let info = vk::BufferCreateInfo::default()
-            .size(size as u64)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        // SAFETY: create info is local and the device is live.
-        let buffer = unsafe { self.device().create_buffer(&info, None) }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("vkCreateBuffer: {e}")))?;
-        // SAFETY: buffer is a live handle from this device.
-        let req = unsafe { self.device().get_buffer_memory_requirements(buffer) };
-        let memory_type = match self.dev.find_memory_type(
-            req.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                // SAFETY: destroying the just-created, never-bound buffer.
-                unsafe { self.device().destroy_buffer(buffer, None) };
-                return Err(e);
-            }
-        };
-        let alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(req.size)
-            .memory_type_index(memory_type);
-        // SAFETY: requirements and memory type belong to this buffer/device.
-        let memory = match unsafe { self.device().allocate_memory(&alloc, None) } {
-            Ok(m) => m,
-            Err(e) => {
-                // SAFETY: destroying the just-created, never-bound buffer.
-                unsafe { self.device().destroy_buffer(buffer, None) };
-                return Err(GpuError::VulkanInitFailed(format!("vkAllocateMemory: {e}")));
-            }
-        };
-        // SAFETY: buffer and allocation are compatible live handles.
-        if let Err(e) = unsafe { self.device().bind_buffer_memory(buffer, memory, 0) } {
-            // SAFETY: destroying the just-created buffer and its allocation.
-            unsafe {
-                self.device().destroy_buffer(buffer, None);
-                self.device().free_memory(memory, None);
-            }
-            return Err(GpuError::VulkanInitFailed(format!(
-                "vkBindBufferMemory: {e}"
-            )));
-        }
+        debug_assert!(
+            super::cache::HOST_POOL_USAGE.contains(usage),
+            "compute host-buffer usage must be covered by the shared pool"
+        );
+        // The draw and compute paths share one size-classed host-visible
+        // upload/readback pool. Every pooled buffer carries the union of the
+        // usages above, so a staging allocation can later serve storage or
+        // transfer readback without recreation.
+        let (buffer, memory) = self.caches.acquire_host_buffer(self.dev, size as u64)?;
         if let Some(bytes) = fill {
             debug_assert_eq!(bytes.len(), size);
             // SAFETY: host-visible allocation is mapped for the filled range.
-            let ptr = unsafe {
+            let ptr = match unsafe {
                 self.device()
                     .map_memory(memory, 0, size as u64, vk::MemoryMapFlags::empty())
-            }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("vkMapMemory: {e}")))?;
+            } {
+                Ok(ptr) => ptr,
+                Err(e) => {
+                    self.caches.release_host_buffer(self.dev, buffer, memory);
+                    return Err(GpuError::VulkanInitFailed(format!("vkMapMemory: {e}")));
+                }
+            };
             // SAFETY: mapped range is at least `size`; pointers do not overlap.
             unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
@@ -659,21 +910,38 @@ impl<'a> ComputeResources<'a> {
         Ok((buffer, memory))
     }
 
-    fn create_storage_buffer(&self, bytes: &[u8]) -> Result<BufferAllocation, GpuError> {
+    fn create_storage_buffer(
+        &mut self,
+        bytes: &[u8],
+        guest_base: u64,
+        guest_size: usize,
+        snapshot: Option<&Arc<Vec<u8>>>,
+    ) -> Result<BufferAllocation, GpuError> {
         if bytes.is_empty() {
             return Err(GpuError::VulkanInitFailed(
                 "zero-sized compute storage buffer".to_owned(),
             ));
         }
-        let (buffer, memory) = self.create_host_buffer(
-            bytes.len(),
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            Some(bytes),
-        )?;
+        let persistent_key = (guest_base != 0).then_some(ComputeBufferKey {
+            base: guest_base,
+            size: bytes.len(),
+        });
+        let (buffer, memory) = if let Some(key) = persistent_key {
+            let snapshot = snapshot.expect("guest-addressed buffers have submission snapshots");
+            self.caches
+                .acquire_compute_buffer(self.dev, key, snapshot, guest_size)?
+        } else {
+            self.create_host_buffer(
+                bytes.len(),
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                Some(bytes),
+            )?
+        };
         Ok(BufferAllocation {
             buffer,
             memory,
             size: bytes.len(),
+            persistent_key,
         })
     }
 
@@ -683,7 +951,7 @@ impl<'a> ComputeResources<'a> {
     /// UAVs), while `array` builds a `TYPE_2D_ARRAY` view even for one layer.
     /// Pushed with null handles up front so `Drop` cleans up any
     /// partially-built entry on the error paths.
-    fn create_storage_image(&mut self, upload: &StorageImageUpload) -> Result<(), GpuError> {
+    fn create_storage_image(&mut self, upload: &StorageImageUpload) -> Result<bool, GpuError> {
         let depth = upload.depth.max(1);
         let layers = upload.layers.max(1);
         let texel = upload.texel_bytes();
@@ -701,7 +969,70 @@ impl<'a> ComputeResources<'a> {
                 upload.pixels.len()
             )));
         }
+        let key = ComputeImageKey {
+            base: upload.guest_base,
+            width: upload.width,
+            height: upload.height,
+            depth,
+            layers,
+            array: upload.array,
+            format: upload.format.as_raw(),
+        };
+        if let Some(owner) = self.images.iter().find(|allocation| allocation.key == key) {
+            self.images.push(ImageAllocation {
+                key,
+                staging_buffer: vk::Buffer::null(),
+                staging_memory: vk::DeviceMemory::null(),
+                image: owner.image,
+                memory: owner.memory,
+                view: owner.view,
+                readback_buffer: owner.readback_buffer,
+                readback_memory: owner.readback_memory,
+                width: owner.width,
+                height: owner.height,
+                depth: owner.depth,
+                layers: owner.layers,
+                texel: owner.texel,
+                persistent: true,
+                fresh: false,
+                upload_seed: false,
+                records_commands: false,
+            });
+            return Ok(false);
+        }
+        if let Some((cached, upload_seed)) = self.caches.compute_image_entry(&key, &upload.pixels) {
+            let (staging_buffer, staging_memory) = if upload_seed {
+                self.create_host_buffer(
+                    size,
+                    vk::BufferUsageFlags::TRANSFER_SRC,
+                    Some(&upload.pixels),
+                )?
+            } else {
+                (vk::Buffer::null(), vk::DeviceMemory::null())
+            };
+            self.images.push(ImageAllocation {
+                key,
+                staging_buffer,
+                staging_memory,
+                image: cached.image,
+                memory: cached.memory,
+                view: cached.view,
+                readback_buffer: cached.readback_buffer,
+                readback_memory: cached.readback_memory,
+                width: upload.width,
+                height: upload.height,
+                depth,
+                layers,
+                texel,
+                persistent: true,
+                fresh: false,
+                upload_seed,
+                records_commands: true,
+            });
+            return Ok(true);
+        }
         self.images.push(ImageAllocation {
+            key,
             staging_buffer: vk::Buffer::null(),
             staging_memory: vk::DeviceMemory::null(),
             image: vk::Image::null(),
@@ -714,6 +1045,10 @@ impl<'a> ComputeResources<'a> {
             depth,
             layers,
             texel,
+            persistent: false,
+            fresh: true,
+            upload_seed: true,
+            records_commands: true,
         });
         let slot = self.images.len() - 1;
 
@@ -799,7 +1134,22 @@ impl<'a> ComputeResources<'a> {
             self.create_host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST, None)?;
         self.images[slot].readback_buffer = readback_buffer;
         self.images[slot].readback_memory = readback_memory;
-        Ok(())
+        self.caches.insert_compute_image(
+            self.dev,
+            key,
+            PersistentComputeImage {
+                image: self.images[slot].image,
+                memory: self.images[slot].memory,
+                view: self.images[slot].view,
+                readback_buffer: self.images[slot].readback_buffer,
+                readback_memory: self.images[slot].readback_memory,
+                bytes: size as u64,
+                last_use: 0,
+                last_snapshot: Arc::downgrade(&upload.pixels),
+            },
+        );
+        self.images[slot].persistent = true;
+        Ok(true)
     }
 
     /// One sampled texture: staging buffer + device-local image + view, in
@@ -945,52 +1295,90 @@ impl<'a> ComputeResources<'a> {
                     depth: allocation.depth,
                 })
         };
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // SAFETY: the cached command buffer is not pending — its previous
-        // submission fence-completed under the cache lock — and the pool was
-        // created RESET_COMMAND_BUFFER, so begin implicitly resets it.
-        unsafe {
-            self.device()
-                .begin_command_buffer(self.command_buffer, &begin)
+        if !self.batched {
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            // SAFETY: the cached command buffer is not pending — its previous
+            // submission fence-completed under the cache lock — and the pool was
+            // created RESET_COMMAND_BUFFER, so begin implicitly resets it.
+            unsafe {
+                self.device()
+                    .begin_command_buffer(self.command_buffer, &begin)
+            }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("vkBeginCommandBuffer: {e}")))?;
         }
-        .map_err(|e| GpuError::VulkanInitFailed(format!("vkBeginCommandBuffer: {e}")))?;
         // SAFETY: pipeline/layout/sets/images are live and the command buffer
         // is recording; barriers and copies name handles this bundle retains
         // until after the fence wait.
         unsafe {
             // Upload every UAV's initial content and move it to GENERAL, the
             // layout the STORAGE_IMAGE descriptor promised.
-            for allocation in &self.images {
-                let to_transfer = vk::ImageMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::empty())
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(allocation.image)
-                    .subresource_range(full_color(allocation));
-                self.device().cmd_pipeline_barrier(
-                    self.command_buffer,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[to_transfer],
-                );
-                self.device().cmd_copy_buffer_to_image(
-                    self.command_buffer,
-                    allocation.staging_buffer,
-                    allocation.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[copy_region(allocation)],
-                );
+            for allocation in self
+                .images
+                .iter()
+                .filter(|allocation| allocation.records_commands)
+            {
+                let (old_layout, src_access, src_stage) = if allocation.upload_seed {
+                    let old_layout = if allocation.fresh {
+                        vk::ImageLayout::UNDEFINED
+                    } else {
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                    };
+                    let src_access = if allocation.fresh {
+                        vk::AccessFlags::empty()
+                    } else {
+                        vk::AccessFlags::TRANSFER_READ
+                    };
+                    let src_stage = if allocation.fresh {
+                        vk::PipelineStageFlags::TOP_OF_PIPE
+                    } else {
+                        vk::PipelineStageFlags::TRANSFER
+                    };
+                    let to_transfer = vk::ImageMemoryBarrier::default()
+                        .src_access_mask(src_access)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .old_layout(old_layout)
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(allocation.image)
+                        .subresource_range(full_color(allocation));
+                    self.device().cmd_pipeline_barrier(
+                        self.command_buffer,
+                        src_stage,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_transfer],
+                    );
+                    self.device().cmd_copy_buffer_to_image(
+                        self.command_buffer,
+                        allocation.staging_buffer,
+                        allocation.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[copy_region(allocation)],
+                    );
+                    (
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::PipelineStageFlags::TRANSFER,
+                    )
+                } else {
+                    // The prior dispatch copied its result to the persistent
+                    // readback buffer and left the image in TRANSFER_SRC.
+                    // Keep that GPU-newer result; only transition it back to
+                    // GENERAL for this ordered dispatch.
+                    (
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::PipelineStageFlags::TRANSFER,
+                    )
+                };
                 let to_general = vk::ImageMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .src_access_mask(src_access)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .old_layout(old_layout)
                     .new_layout(vk::ImageLayout::GENERAL)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -998,7 +1386,7 @@ impl<'a> ComputeResources<'a> {
                     .subresource_range(full_color(allocation));
                 self.device().cmd_pipeline_barrier(
                     self.command_buffer,
-                    vk::PipelineStageFlags::TRANSFER,
+                    src_stage,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),
                     &[],
@@ -1113,7 +1501,7 @@ impl<'a> ComputeResources<'a> {
             // (a pipeline barrier's second scope covers subsequent
             // submissions on this queue; the fence alone only orders
             // device-to-host visibility).
-            if !self.gds.is_null() {
+            if !self.gds.is_null() || !self.storage.is_empty() {
                 let gds_flush = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
@@ -1129,7 +1517,11 @@ impl<'a> ComputeResources<'a> {
             }
 
             // Copy every UAV back out for the guest-memory writeback.
-            for allocation in &self.images {
+            for allocation in self
+                .images
+                .iter()
+                .filter(|allocation| allocation.records_commands)
+            {
                 let to_readback = vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
@@ -1172,20 +1564,77 @@ impl<'a> ComputeResources<'a> {
                     &[],
                 );
             }
-            self.device().end_command_buffer(self.command_buffer)
+            if self.batched {
+                Ok(())
+            } else {
+                self.device().end_command_buffer(self.command_buffer)
+            }
         }
         .map_err(|e| GpuError::VulkanInitFailed(format!("vkEndCommandBuffer: {e}")))?;
-        let command_buffers = [self.command_buffer];
-        let submits = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
-        // SAFETY: all submission handles are live; fence is unsignaled.
-        unsafe {
-            self.device()
-                .queue_submit(self.dev.queue(), &submits, self.fence)
+        if self.batched {
+            // Do not submit one command buffer at a time. The batch flush
+            // submits every recorded draw/dispatch command buffer in PM4
+            // order with one vkQueueSubmit and one fence. Merely omitting the
+            // per-dispatch fence still paid the driver's queue-submit cost
+            // hundreds of times per frame.
+            Ok(())
+        } else {
+            let command_buffers = [self.command_buffer];
+            let submits = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+            // SAFETY: every handle belongs to this device, the command buffer
+            // is executable and the reusable fence is currently unsignaled.
+            unsafe {
+                self.device()
+                    .queue_submit(self.dev.queue(), &submits, self.fence)
+            }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("vkQueueSubmit: {e}")))?;
+            // SAFETY: waiting on this submission's live fence.
+            unsafe { self.device().wait_for_fences(&[self.fence], true, u64::MAX) }
+                .map_err(|e| GpuError::VulkanInitFailed(format!("vkWaitForFences: {e}")))
         }
-        .map_err(|e| GpuError::VulkanInitFailed(format!("vkQueueSubmit: {e}")))?;
-        // SAFETY: waiting on this submission's live fence.
-        unsafe { self.device().wait_for_fences(&[self.fence], true, u64::MAX) }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("vkWaitForFences: {e}")))
+    }
+
+    fn commit_to_batch(&mut self) -> Result<(), GpuError> {
+        debug_assert!(self.batched);
+        // The cache owns the shared recording handle until the flip closes it.
+        self.command_buffer = vk::CommandBuffer::null();
+        let mut pending = PendingDrawResources {
+            command_buffer: vk::CommandBuffer::null(),
+            descriptor_pool: vk::DescriptorPool::null(),
+            buffers: Vec::new(),
+            images: Vec::new(),
+        };
+        for allocation in [&mut self.eud_raw, &mut self.push_uniform] {
+            if let Some(allocation) = allocation.take() {
+                debug_assert!(allocation.persistent_key.is_none());
+                pending.buffers.push((allocation.buffer, allocation.memory));
+            }
+        }
+        while let Some(allocation) = self.images.pop() {
+            if !allocation.staging_buffer.is_null() || !allocation.staging_memory.is_null() {
+                pending
+                    .buffers
+                    .push((allocation.staging_buffer, allocation.staging_memory));
+            }
+            debug_assert!(
+                allocation.persistent,
+                "deferred storage images must live in the persistent cache"
+            );
+        }
+        while let Some(allocation) = self.sampled.pop() {
+            pending
+                .buffers
+                .push((allocation.staging_buffer, allocation.staging_memory));
+            pending
+                .images
+                .push((allocation.image, allocation.memory, allocation.view));
+        }
+        self.caches.commit_deferred_resources(
+            pending,
+            std::mem::take(&mut self.deferred_write_keys),
+            std::mem::take(&mut self.deferred_image_writes),
+        );
+        Ok(())
     }
 
     /// Map one host-coherent allocation and copy `size` bytes out.
@@ -1207,24 +1656,127 @@ impl<'a> ComputeResources<'a> {
             unsafe { self.device().unmap_memory(memory) };
             GpuError::VulkanInitFailed(format!(
                 "compute readback: {size} B host allocation failed (out of memory) — \
-                 skipping the dispatch instead of aborting"
+                skipping the dispatch instead of aborting"
             ))
         })?;
-        bytes.resize(size, 0);
-        // SAFETY: source mapped range and destination allocation both cover
-        // `size` bytes and cannot overlap.
+        // Do not `resize(size, 0)` before the copy: that wrote the entire
+        // multi-megabyte destination once with zeroes and immediately wrote
+        // it again with the GPU result. Measured Minecraft dispatches return
+        // a 4 MiB V# every call; the redundant first pass was inside the
+        // 18-22 ms `map_copy` wall. Capacity is allocated but length remains
+        // zero until `copy_nonoverlapping` initializes every byte.
+        //
+        // SAFETY: `try_reserve_exact` made at least `size` bytes writable at
+        // `as_mut_ptr`; the source mapping covers exactly `size`, cannot
+        // overlap this host allocation, and the copy initializes the whole
+        // future slice before `set_len` exposes it.
         unsafe {
             std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), bytes.as_mut_ptr(), size);
+            bytes.set_len(size);
             self.device().unmap_memory(memory);
         }
         Ok(bytes)
     }
 
-    fn read_storage(&self) -> Result<Vec<Vec<u8>>, GpuError> {
-        self.storage
-            .iter()
-            .map(|allocation| self.read_host_memory(allocation.memory, allocation.size))
-            .collect()
+    fn read_storage(
+        &mut self,
+        storage: Option<&super::offscreen::StorageBufferBinding>,
+    ) -> Result<Vec<ComputeBufferOutput>, GpuError> {
+        let Some(storage_binding) = storage else {
+            return Ok(Vec::new());
+        };
+        if storage_binding.writable.len() != self.storage.len()
+            || storage_binding.buffers.len() != self.storage.len()
+            || storage_binding.guest_bases.len() != self.storage.len()
+            || storage_binding.guest_sizes.len() != self.storage.len()
+        {
+            return Err(GpuError::PipelineCreationFailed(format!(
+                "compute storage inputs ({}) / guest bases ({}) / guest sizes ({}) / writeback \
+                 flags ({}) do not match buffer count ({})",
+                storage_binding.buffers.len(),
+                storage_binding.guest_bases.len(),
+                storage_binding.guest_sizes.len(),
+                storage_binding.writable.len(),
+                self.storage.len()
+            )));
+        }
+        let mut outputs = Vec::new();
+        for (index, initial) in storage_binding.buffers.iter().enumerate() {
+            if !storage_binding.writable[index] {
+                continue;
+            }
+            let allocation = &self.storage[index];
+            let key = allocation.persistent_key;
+            let output = self.read_storage_dirty(allocation.memory, allocation.size, initial)?;
+            if let Some(key) = key {
+                self.caches.update_compute_buffer_shadow(key, &output.dirty);
+            }
+            outputs.push(output);
+        }
+        Ok(outputs)
+    }
+
+    /// Map a cached coherent storage allocation and retain only changed
+    /// 4 KiB pages. Page granularity keeps the comparison linear and cheap
+    /// while coalescing adjacent writes into one guest-memory copy.
+    fn read_storage_dirty(
+        &self,
+        memory: vk::DeviceMemory,
+        size: usize,
+        initial: &[u8],
+    ) -> Result<ComputeBufferOutput, GpuError> {
+        if initial.len() != size {
+            return Err(GpuError::PipelineCreationFailed(format!(
+                "compute storage initial bytes ({}) do not match allocation size ({size})",
+                initial.len()
+            )));
+        }
+        let ptr = unsafe {
+            self.device()
+                .map_memory(memory, 0, size as u64, vk::MemoryMapFlags::empty())
+        }
+        .map_err(|e| GpuError::VulkanInitFailed(format!("vkMapMemory: {e}")))?;
+        // SAFETY: the fence completed before this call, the coherent mapping
+        // covers `size`, and it remains live until the explicit unmap below.
+        let result = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), size) };
+        const PAGE: usize = 4096;
+        let mut dirty = Vec::new();
+        let mut at = 0usize;
+        while at < size {
+            let end = at.saturating_add(PAGE).min(size);
+            if result[at..end] == initial[at..end] {
+                at = end;
+                continue;
+            }
+            let start = at;
+            at = end;
+            while at < size {
+                let next = at.saturating_add(PAGE).min(size);
+                if result[at..next] == initial[at..next] {
+                    break;
+                }
+                at = next;
+            }
+            let mut bytes = Vec::new();
+            if bytes.try_reserve_exact(at - start).is_err() {
+                // SAFETY: close the mapping before returning the allocation
+                // failure as a degradable dispatch error.
+                unsafe { self.device().unmap_memory(memory) };
+                return Err(GpuError::VulkanInitFailed(format!(
+                    "compute dirty writeback: {} B host allocation failed",
+                    at - start
+                )));
+            }
+            bytes.extend_from_slice(&result[start..at]);
+            dirty.push(ComputeDirtySpan {
+                offset: start,
+                bytes,
+            });
+        }
+        // SAFETY: balances the successful map above after all borrowed slices
+        // have had their final use.
+        unsafe { self.device().unmap_memory(memory) };
+        Ok(ComputeBufferOutput { size, dirty })
     }
 
     fn read_images(&self) -> Result<Vec<Vec<u8>>, GpuError> {
@@ -1248,65 +1800,77 @@ impl Drop for ComputeResources<'_> {
         // the next draw/dispatch: fence, command buffer, pipeline, pipeline
         // layout, descriptor pool, descriptor layout, shader module, samplers.
         //
-        // SAFETY: every handle destroyed below was created from this device
-        // for this dispatch alone and is destroyed once, after synchronous
-        // fence completion or a failed build.
-        unsafe {
-            while let Some(allocation) = self.storage.pop() {
-                self.device().destroy_buffer(allocation.buffer, None);
-                self.device().free_memory(allocation.memory, None);
+        // Every host buffer came from the shared pool. The dispatch fence was
+        // waited before a success reaches here; a pre-submit build failure
+        // also leaves them unreferenced, so returning them is safe.
+        while let Some(allocation) = self.storage.pop() {
+            if allocation.persistent_key.is_none() {
+                self.caches
+                    .release_host_buffer(self.dev, allocation.buffer, allocation.memory);
             }
-            if let Some(allocation) = self.eud_raw.take() {
-                self.device().destroy_buffer(allocation.buffer, None);
-                self.device().free_memory(allocation.memory, None);
-            }
-            if let Some(allocation) = self.push_uniform.take() {
-                self.device().destroy_buffer(allocation.buffer, None);
-                self.device().free_memory(allocation.memory, None);
-            }
-            self.samplers.clear();
-            while let Some(allocation) = self.sampled.pop() {
+        }
+        if self.batched && self.command_buffer != vk::CommandBuffer::null() {
+            self.command_buffer = vk::CommandBuffer::null();
+        }
+        if let Some(allocation) = self.eud_raw.take() {
+            self.caches
+                .release_host_buffer(self.dev, allocation.buffer, allocation.memory);
+        }
+        if let Some(allocation) = self.push_uniform.take() {
+            self.caches
+                .release_host_buffer(self.dev, allocation.buffer, allocation.memory);
+        }
+        self.samplers.clear();
+        while let Some(allocation) = self.sampled.pop() {
+            // SAFETY: sampled images are still per-dispatch and the fence has
+            // completed (or submission never happened); children are
+            // destroyed before parents.
+            unsafe {
+                let device = self.dev.device();
                 if !allocation.view.is_null() {
-                    self.device().destroy_image_view(allocation.view, None);
+                    device.destroy_image_view(allocation.view, None);
                 }
                 if !allocation.image.is_null() {
-                    self.device().destroy_image(allocation.image, None);
+                    device.destroy_image(allocation.image, None);
                 }
                 if !allocation.memory.is_null() {
-                    self.device().free_memory(allocation.memory, None);
-                }
-                if !allocation.staging_buffer.is_null() {
-                    self.device()
-                        .destroy_buffer(allocation.staging_buffer, None);
-                }
-                if !allocation.staging_memory.is_null() {
-                    self.device().free_memory(allocation.staging_memory, None);
+                    device.free_memory(allocation.memory, None);
                 }
             }
-            while let Some(allocation) = self.images.pop() {
-                if !allocation.view.is_null() {
-                    self.device().destroy_image_view(allocation.view, None);
+            self.caches.release_host_buffer(
+                self.dev,
+                allocation.staging_buffer,
+                allocation.staging_memory,
+            );
+        }
+        while let Some(allocation) = self.images.pop() {
+            if !allocation.staging_buffer.is_null() || !allocation.staging_memory.is_null() {
+                self.caches.release_host_buffer(
+                    self.dev,
+                    allocation.staging_buffer,
+                    allocation.staging_memory,
+                );
+            }
+            if !allocation.persistent {
+                // A partial creation error before cache insertion still owns
+                // whatever non-null handles it reached.
+                unsafe {
+                    let device = self.dev.device();
+                    if !allocation.view.is_null() {
+                        device.destroy_image_view(allocation.view, None);
+                    }
+                    if !allocation.image.is_null() {
+                        device.destroy_image(allocation.image, None);
+                    }
+                    if !allocation.memory.is_null() {
+                        device.free_memory(allocation.memory, None);
+                    }
                 }
-                if !allocation.image.is_null() {
-                    self.device().destroy_image(allocation.image, None);
-                }
-                if !allocation.memory.is_null() {
-                    self.device().free_memory(allocation.memory, None);
-                }
-                if !allocation.staging_buffer.is_null() {
-                    self.device()
-                        .destroy_buffer(allocation.staging_buffer, None);
-                }
-                if !allocation.staging_memory.is_null() {
-                    self.device().free_memory(allocation.staging_memory, None);
-                }
-                if !allocation.readback_buffer.is_null() {
-                    self.device()
-                        .destroy_buffer(allocation.readback_buffer, None);
-                }
-                if !allocation.readback_memory.is_null() {
-                    self.device().free_memory(allocation.readback_memory, None);
-                }
+                self.caches.release_host_buffer(
+                    self.dev,
+                    allocation.readback_buffer,
+                    allocation.readback_memory,
+                );
             }
         }
     }

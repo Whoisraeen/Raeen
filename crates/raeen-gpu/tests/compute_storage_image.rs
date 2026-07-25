@@ -172,7 +172,7 @@ fn compute_shader_writes_are_visible_in_storage_image_readback() {
                 array: false,
                 tile_mode: 0,
                 format: vk::Format::R8G8B8A8_UNORM,
-                pixels: vec![0xEE; 16],
+                pixels: vec![0xEE; 16].into(),
                 guest_base: 0,
             }],
         }),
@@ -218,6 +218,81 @@ fn compute_shader_writes_are_visible_in_storage_image_readback() {
     );
 }
 
+/// Minecraft dispatches the same panorama UAVs repeatedly. Reusing the exact
+/// image shape must avoid a second image/allocation/view/readback creation
+/// while preserving the complete upload -> dispatch -> guest-visible
+/// readback contract.
+#[test]
+fn compute_storage_image_allocations_are_reused_across_dispatches() {
+    let Some(backend) = backend_or_skip() else {
+        return;
+    };
+    let dev = backend.device().expect("backend is initialized");
+    let spirv = kyty_graphics::spirv_asm::assemble(STORE_PATTERN_CS)
+        .expect("storage-image compute shader assembles");
+    let binding = ShaderStageBinding {
+        stage: vk::ShaderStageFlags::COMPUTE,
+        descriptor_set_slot: 0,
+        push_constant_offset: 0,
+        push_constants: Vec::new(),
+        push_uniform_binding: None,
+        storage_buffers: None,
+        textures: None,
+        storage_images: Some(StorageImageBinding {
+            binding: 0,
+            images: vec![StorageImageUpload {
+                width: 2,
+                height: 2,
+                depth: 1,
+                layers: 1,
+                array: false,
+                tile_mode: 0,
+                format: vk::Format::R8G8B8A8_UNORM,
+                pixels: vec![0xEE; 16].into(),
+                guest_base: 0x3368_0000,
+            }],
+        }),
+        gds_binding: None,
+        eud_raw: None,
+    };
+    let state = ComputeState {
+        groups: [1, 1, 1],
+        spirv: &spirv,
+        binding: Some(&binding),
+    };
+
+    let before = dev.draw_cache_stats();
+    let first = dispatch_compute(dev, &state).expect("first storage-image dispatch");
+    let after_first = dev.draw_cache_stats();
+    let second = dispatch_compute(dev, &state).expect("second storage-image dispatch");
+    let after_second = dev.draw_cache_stats();
+
+    assert_eq!(
+        first.images, second.images,
+        "reuse cannot change output bytes"
+    );
+    assert_eq!(
+        after_first.compute_image_misses,
+        before.compute_image_misses + 1,
+        "first shape allocates one persistent UAV"
+    );
+    assert_eq!(
+        after_second.compute_image_hits,
+        after_first.compute_image_hits + 1,
+        "second dispatch reuses its persistent UAV"
+    );
+    assert_eq!(
+        after_second.compute_image_uploads_skipped,
+        after_first.compute_image_uploads_skipped + 1,
+        "the same live UAV snapshot should skip a redundant staging upload"
+    );
+    assert_eq!(
+        validation_error_count(),
+        0,
+        "Vulkan validation reported errors while reusing the compute UAV"
+    );
+}
+
 #[test]
 fn compute_shader_writes_every_2d_array_layer() {
     let Some(backend) = backend_or_skip() else {
@@ -244,7 +319,7 @@ fn compute_shader_writes_every_2d_array_layer() {
                 array: true,
                 tile_mode: 0,
                 format: vk::Format::R8G8B8A8_UNORM,
-                pixels: vec![0xEE; 32],
+                pixels: vec![0xEE; 32].into(),
                 guest_base: 0,
             }],
         }),
@@ -291,7 +366,7 @@ fn compute_shader_writes_every_2d_array_layer() {
                 array: true,
                 tile_mode: 0,
                 format: vk::Format::R8G8B8A8_UNORM,
-                pixels: vec![0xEE; 16],
+                pixels: vec![0xEE; 16].into(),
                 guest_base: 0,
             }],
         }),

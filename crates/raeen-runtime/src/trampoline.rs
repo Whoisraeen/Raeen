@@ -2,10 +2,10 @@
 //!
 //! Linker-visible slots remain eight bytes wide at
 //! [`HLE_TRAMPOLINE_BASE`]. Each contains a relative call to one of two nearby
-//! bridges. Reviewed leaf imports use the zero-fault direct bridge; every
-//! other import reconstructs its slot index and jumps into a separate
-//! `PAGE_NOACCESS` range so the existing VEH path retains full machine-context
-//! control.
+//! bridges. Reviewed context-preserving imports use the zero-fault direct
+//! bridge; imports that need a captured machine context reconstruct their slot
+//! index and jump into a separate `PAGE_NOACCESS` range so the existing VEH
+//! path retains full control-transfer semantics.
 
 use core::ffi::c_void;
 
@@ -92,7 +92,7 @@ impl TrampolineGuard {
             let slot = HLE_TRAMPOLINE_BASE + index as u64 * SLOT_SIZE;
             write_call_slot(
                 slot,
-                if direct_leaf(trampoline) {
+                if direct_dispatchable(trampoline) {
                     direct_bridge
                 } else {
                     slow_bridge
@@ -181,13 +181,89 @@ pub(crate) fn resolve(fault_addr: u64, trampolines: &[HleTrampoline]) -> Option<
     trampolines.get(idx)
 }
 
-fn direct_leaf(trampoline: &HleTrampoline) -> bool {
+/// Imports proven not to request a nested guest callback or replace the live
+/// guest machine context may run through the executable gateway.  This list is
+/// deliberately measured rather than broad: Minecraft's 231-second call-stat
+/// capture put these functions at the top of the VEH path (tens of millions of
+/// calls), while every entry is an ordinary return-value/memory operation.
+///
+/// Blocking synchronization and socket calls are safe here: the gateway has
+/// already switched to the per-thread host stack and `direct_hle_gateway`
+/// releases the diagnostic guest GIL around the handler.  Exit, fibers,
+/// `pthread_once`, module initializers, and fatal-exception handlers remain on
+/// VEH because they can replace the context or schedule a guest callback.
+fn direct_dispatchable(trampoline: &HleTrampoline) -> bool {
     if std::env::var_os("RAEEN_DISABLE_DIRECT_HLE").is_some() {
         return false;
     }
     matches!(
         trampoline.function.as_str(),
-        "strlen" | "strcmp" | "strncmp" | "memcmp" | "bcmp"
+        // libc leaves.
+        "strlen"
+            | "strcmp"
+            | "strncmp"
+            | "memcmp"
+            | "bcmp"
+            // Thread identity/TLS and errno.
+            | "scePthreadGetspecific"
+            | "pthread_getspecific"
+            | "scePthreadSetspecific"
+            | "pthread_setspecific"
+            | "scePthreadGetthreadid"
+            | "scePthreadSelf"
+            | "pthread_self"
+            | "__error"
+            | "__errno_location"
+            | "__tls_get_addr"
+            // The measured synchronization hot path. These calls may block,
+            // but never transfer execution to guest code.
+            | "scePthreadMutexLock"
+            | "scePthreadMutexTrylock"
+            | "scePthreadMutexUnlock"
+            | "pthread_mutex_lock"
+            | "pthread_mutex_trylock"
+            | "pthread_mutex_unlock"
+            | "scePthreadRwlockRdlock"
+            | "scePthreadRwlockWrlock"
+            | "scePthreadRwlockTryrdlock"
+            | "scePthreadRwlockTrywrlock"
+            | "scePthreadRwlockUnlock"
+            | "pthread_rwlock_rdlock"
+            | "pthread_rwlock_wrlock"
+            | "pthread_rwlock_tryrdlock"
+            | "pthread_rwlock_trywrlock"
+            | "pthread_rwlock_unlock"
+            | "scePthreadCondWait"
+            | "scePthreadCondTimedwait"
+            | "scePthreadCondSignal"
+            | "scePthreadCondBroadcast"
+            | "pthread_cond_wait"
+            | "pthread_cond_timedwait"
+            | "pthread_cond_signal"
+            | "pthread_cond_broadcast"
+            // Clock/status polling and non-blocking network polling.
+            | "gettimeofday"
+            | "clock_gettime"
+            | "sceKernelGetProcessTime"
+            | "sceKernelGetProcessTimeCounter"
+            | "sceKernelGetProcessTimeCounterFrequency"
+            | "recvfrom"
+            // Semaphore/audio loops visible in the same title capture.
+            | "sceKernelWaitSema"
+            | "sceKernelSignalSema"
+            | "sceAudioOut2ContextPush"
+            | "sceAudioOut2ContextAdvance"
+            | "sceAudioOut2PortSetAttributes"
+            | "sceAjmBatchInitialize"
+            // AGC packet emitters: guest-memory writes only; actual GPU work
+            // remains asynchronous in the command submission subsystem.
+            | "sceAgcSetCxRegIndirectPatchAddRegisters"
+            | "sceAgcGetDataPacketPayloadAddress"
+            | "sceAgcCbSetShRegisterRangeDirect"
+            | "sceAgcDcbEventWrite"
+            | "sceAgcSetShRegIndirectPatchAddRegisters"
+            | "sceAgcDcbAcquireMem"
+            | "sceAgcDcbDrawIndexOffset"
     )
 }
 
@@ -253,4 +329,51 @@ fn direct_bridge_code() -> Vec<u8> {
         0xC3, // ret to the original guest caller
     ]);
     c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trampoline(library: &str, function: &str) -> HleTrampoline {
+        HleTrampoline {
+            library: library.to_owned(),
+            function: function.to_owned(),
+            addr: HLE_TRAMPOLINE_BASE,
+        }
+    }
+
+    #[test]
+    fn measured_ordinary_calls_use_the_direct_gateway() {
+        for (library, function) in [
+            ("libkernel", "scePthreadGetthreadid"),
+            ("libkernel", "scePthreadGetspecific"),
+            ("libScePosix", "pthread_mutex_lock"),
+            ("libScePosix", "pthread_mutex_unlock"),
+            ("libScePosix", "recvfrom"),
+            ("libSceAgc", "sceAgcDcbAcquireMem"),
+        ] {
+            assert!(
+                direct_dispatchable(&trampoline(library, function)),
+                "{library}::{function}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_changing_calls_stay_on_veh() {
+        for (library, function) in [
+            ("libkernel", "scePthreadExit"),
+            ("libScePosix", "pthread_once"),
+            ("libkernel", "sceKernelLoadStartModule"),
+            ("libSceFiber", "sceFiberSwitch"),
+            ("libc", "__cxa_throw"),
+            ("libkernel", "sceKernelDebugRaiseException"),
+        ] {
+            assert!(
+                !direct_dispatchable(&trampoline(library, function)),
+                "{library}::{function}"
+            );
+        }
+    }
 }

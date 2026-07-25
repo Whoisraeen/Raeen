@@ -22,18 +22,19 @@
 //!   must not hide every other draw.
 
 use crate::shader_fetch::{ShaderTranslateCache, TranslatedShader};
-use crate::vulkan::compute::{ComputeState, dispatch_compute};
+use crate::vulkan::compute::{ComputeState, dispatch_compute, dispatch_compute_deferred};
 use crate::vulkan::instance::VulkanDevice;
 use crate::vulkan::offscreen::{
     BlendState, CLEAR_COLOR, DepthState, DrawState, EudRawBinding, RenderedImage, SampledGroup,
-    ShaderStageBinding, StorageBufferBinding, StorageImageBinding, StorageImageUpload,
-    TextureBinding, TextureUpload, VertexAttributeData, VertexBufferData,
+    SamplerState, ShaderStageBinding, StorageBufferBinding, StorageImageBinding,
+    StorageImageUpload, TextureBinding, TextureUpload, VertexAttributeData, VertexBufferData,
 };
 use ash::vk;
 use kyty_graphics::hw_regs::{ComputeShaderInfo, Context, Shader, UserConfig};
 use kyty_graphics::run::{DrawError, DrawSink, IndexedDraw};
 use kyty_graphics::shader::resources::{
-    ShaderBindResources, ShaderPixelInputInfo, ShaderTextureUsage, ShaderVertexInputInfo,
+    ShaderBindResources, ShaderPixelInputInfo, ShaderSamplerResource, ShaderTextureUsage,
+    ShaderVertexInputInfo,
 };
 use kyty_graphics::shader::{
     shader_push_constant_spill_binding, spirv_get_embedded_ps, spirv_get_embedded_vs,
@@ -84,11 +85,17 @@ fn color_output_disabled(ctx: &Context) -> bool {
 /// or PS address matches. Keeping this separate from `RAEEN_TRACE_DRAWS`
 /// avoids consuming every rate limiter on boot clears before a UI shader is
 /// first bound.
-fn trace_selected_shader(vs: u64, ps: u64) -> bool {
-    let Some(raw) = std::env::var_os("RAEEN_TRACE_SHADER_ADDR") else {
+fn shader_addr_selected(variable: &str, vs: u64, ps: u64) -> bool {
+    let env = crate::diagnostics::gpu_env();
+    let raw = match variable {
+        "RAEEN_TRACE_SHADER_ADDR" => env.trace_shader_addr.as_deref(),
+        "RAEEN_SOLID_PS_ADDR" => env.solid_ps_addr.as_deref(),
+        _ => None,
+    };
+    let Some(raw) = raw else {
         return false;
     };
-    raw.to_string_lossy().split(',').any(|part| {
+    raw.split(',').any(|part| {
         let part = part.trim();
         let digits = part
             .strip_prefix("0x")
@@ -96,6 +103,10 @@ fn trace_selected_shader(vs: u64, ps: u64) -> bool {
             .unwrap_or(part);
         u64::from_str_radix(digits, 16).is_ok_and(|addr| addr == vs || addr == ps)
     })
+}
+
+fn trace_selected_shader(vs: u64, ps: u64) -> bool {
+    shader_addr_selected("RAEEN_TRACE_SHADER_ADDR", vs, ps)
 }
 
 /// Map `CB_TARGET_MASK`'s MRT0 nibble to Vulkan's colour write mask.
@@ -335,17 +346,23 @@ fn depth_state_from_regs(ctx: &Context) -> Result<Option<DepthState<'static>>, D
         front
     };
     let vp = &ctx.screen_viewport.viewports[0];
+    // Diagnostic bisection only: if missing geometry reappears with both depth
+    // reads and writes disabled, the draw reached rasterization and the defect
+    // is in attachment lifetime/clear/compare state rather than vertex
+    // translation. Never changes production behaviour when unset.
+    let disable_depth = crate::diagnostics::gpu_env().no_depth;
     Ok(Some(DepthState {
         target_base: Some(target.z_write_base_addr),
         format,
-        test_enable: control.z_enable,
-        write_enable: control.z_write_enable && !target.depth_view.depth_write_disable,
+        test_enable: control.z_enable && !disable_depth,
+        write_enable: control.z_write_enable
+            && !target.depth_view.depth_write_disable
+            && !disable_depth,
         compare_op: vk::CompareOp::from_raw(i32::from(control.zfunc)),
         // Diagnostic bisection only: lets a real-title run distinguish an
         // empty frame caused by stencil rejection from shader/geometry faults.
         // Production behaviour remains register-derived when unset.
-        stencil_test_enable: control.stencil_enable
-            && std::env::var_os("RAEEN_NO_STENCIL").is_none(),
+        stencil_test_enable: control.stencil_enable && !crate::diagnostics::gpu_env().no_stencil,
         stencil_front: front,
         stencil_back: back,
         clear_depth: ctx.render_control.depth_clear_enable,
@@ -411,6 +428,37 @@ fn assemble_embedded(id: u32, stage: &str) -> Result<Vec<u32>, DrawError> {
     spirv_asm::assemble(source).map_err(|e| err(format!("assembling embedded {stage}: {e}")))
 }
 
+/// Diagnostic-only opaque fragment shader for proving whether selected
+/// geometry reaches rasterization independently of the title PS's sampling and
+/// discard path. `RAEEN_SOLID_PS_ADDR=<hex>[,...]` selects exact guest PS
+/// addresses; production never calls this when the variable is unset.
+fn assemble_solid_diagnostic_ps() -> Result<Vec<u32>, DrawError> {
+    const SOURCE: &str = r#"
+               OpCapability Shader
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %4 "main" %9
+               OpExecutionMode %4 OriginUpperLeft
+               OpDecorate %9 Location 0
+       %void = OpTypeVoid
+          %3 = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+          %9 = OpVariable %_ptr_Output_v4float Output
+    %float_0 = OpConstant %float 0
+    %float_1 = OpConstant %float 1
+         %11 = OpConstantComposite %v4float %float_1 %float_0 %float_1 %float_1
+          %4 = OpFunction %void None %3
+          %5 = OpLabel
+               OpStore %9 %11
+               OpReturn
+               OpFunctionEnd
+"#;
+    spirv_asm::assemble(SOURCE)
+        .map_err(|e| err(format!("assembling diagnostic solid fragment shader: {e}")))
+}
+
 /// Both stages' SPIR-V, each either embedded or fetched from guest memory.
 #[derive(Debug)]
 struct ResolvedShaders {
@@ -450,6 +498,19 @@ fn resolve_shaders(
     let (ps, ps_info) = if sh.ps.ps_embedded {
         (
             Arc::new(assemble_embedded(sh.ps.ps_embedded_id, "ps")?),
+            ShaderPixelInputInfo::default(),
+        )
+    } else if shader_addr_selected("RAEEN_SOLID_PS_ADDR", 0, sh.ps.ps_regs.data_addr) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SOLID_PS_SEEN: AtomicU32 = AtomicU32::new(0);
+        if SOLID_PS_SEEN.fetch_add(1, Ordering::Relaxed) < 4 {
+            tracing::warn!(
+                ps_addr = format_args!("{:#x}", sh.ps.ps_regs.data_addr),
+                "using diagnostic solid fragment shader for selected guest PS"
+            );
+        }
+        (
+            Arc::new(assemble_solid_diagnostic_ps()?),
             ShaderPixelInputInfo::default(),
         )
     } else {
@@ -547,8 +608,11 @@ fn required_vertex_records(
             )));
         }
     };
-    max.and_then(|index| index.checked_add(1))
-        .ok_or_else(|| err("indexed draw has no addressable vertex records"))
+    // An empty index buffer addresses no record at all; fall back to the draw's
+    // vertex count rather than refusing it (the pre-limit behaviour).
+    Ok(max
+        .and_then(|index| index.checked_add(1))
+        .unwrap_or(vertex_count))
 }
 
 /// Read `size` guest bytes starting at an arbitrary (possibly unaligned)
@@ -581,9 +645,7 @@ fn read_guest_bytes(addr: u64, size: u64, kind: &str) -> Result<Vec<u8>, DrawErr
             "{kind} at {addr:#x} has invalid byte size {size}"
         )));
     }
-    let count = u32::try_from(size / 4)
-        .map_err(|_| err(format!("{kind} at {addr:#x} is too large: {size} bytes")))?;
-    let words = crate::guest_mem::read_dwords_validated(addr, count).ok_or_else(|| {
+    let bytes = crate::guest_mem::read_bytes_validated(addr, size).ok_or_else(|| {
         // A zero-ish prefix means the base itself is wild (mis-decoded
         // pointer); a page-aligned interior cut means the tail is
         // reserved-but-uncommitted (lazy guest memory); a prefix equal to the
@@ -595,24 +657,14 @@ fn read_guest_bytes(addr: u64, size: u64, kind: &str) -> Result<Vec<u8>, DrawErr
             addr.saturating_add(size)
         ))
     })?;
-    // Fallible: a full-resolution texture is tens of MiB; under host memory
-    // pressure the byte buffer must degrade to a named skip, not abort. The
-    // dword read above (`read_dwords_validated`) already reserves fallibly.
-    let mut bytes: Vec<u8> = Vec::new();
-    bytes.try_reserve_exact(size as usize).map_err(|_| {
-        err(format!(
-            "{kind} at {addr:#x}: {size} B host allocation failed (out of memory) — skipping"
-        ))
-    })?;
-    bytes.extend(words.into_iter().flat_map(u32::to_le_bytes));
-    if let Ok(dir) = std::env::var("RAEEN_DUMP_GPU_RESOURCES")
+    if let Some(dir) = crate::diagnostics::gpu_env().dump_gpu_resources.as_deref()
         && !dir.is_empty()
     {
         let safe_kind = kind.replace(' ', "_");
-        let path = std::path::Path::new(&dir).join(format!("{safe_kind}_{addr:012x}_{size}.bin"));
+        let path = std::path::Path::new(dir).join(format!("{safe_kind}_{addr:012x}_{size}.bin"));
         if !path.exists()
             && let Err(error) =
-                std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &bytes))
+                std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, &bytes))
         {
             debug!(%error, path = %path.display(), "guest GPU resource dump failed");
         }
@@ -658,19 +710,12 @@ fn gen5_vertex_format_and_size(format: u8) -> Result<(vk::Format, u64), DrawErro
         57 => Ok((vk::Format::R8G8B8A8_SNORM, 4)),
         71 => Ok((vk::Format::R16G16B16A16_SFLOAT, 8)),
         23 => Ok((vk::Format::R16G16_UNORM, 4)),
-        // MUST be a float-convertible format, NOT an integer one. The SPIR-V
-        // we generate declares EVERY vertex input as float/vecN-float
-        // (`Spirv::WriteGlobalVariables` only ever emits %_ptr_Input_float /
-        // v2float / v3float / v4float), and Vulkan requires the attribute
-        // format's numeric type to match the shader input's. R16_UINT against
-        // a float32 input is an INVALID pipeline — measured on Minecraft, the
-        // validation layer reports "pVertexAttributeDescriptions[1].format
-        // (VK_FORMAT_R16_UINT) at Location 1 does not match [Input variable,
-        // Location 1] type of (float32)" and the draw contributes NO fragment,
-        // which is why every target stayed byte-exactly zero.
-        // R16_USCALED delivers the same integer VALUE converted to float,
-        // which is what a float input expects.
-        11 => Ok((vk::Format::R16_USCALED, 2)),
+        // Unified 11 is (FMT_16, UINT), not USCALED. The guest fetch writes
+        // the raw integer bits into its VGPR; Minecraft immediately uses
+        // integer bit operations on this value to form its skinning-matrix
+        // address. The shader translator declares this attribute as uint and
+        // bitcasts it into the float-backed VGPR representation.
+        11 => Ok((vk::Format::R16_UINT, 2)),
         other => Err(err(format!(
             "unsupported Gen5 vertex-buffer format {other}"
         ))),
@@ -718,14 +763,33 @@ fn prepare_vertex_inputs_limited(
         }
 
         let stride = u64::from(guest.stride);
-        if record_limit.is_some_and(|required| required > guest.num_records) {
-            return Err(err(format!(
-                "draw addresses {} vertex records but V# binding {binding} exposes only {}",
-                record_limit.unwrap_or_default(),
+        // Upload only the records this draw can address — but an index that runs
+        // PAST the V# is clamped, never refused. Hardware tolerates it (the
+        // fetch reads zero under the `robustBufferAccess` this device enables),
+        // and refusing dropped the entire draw: a primitive-restart sentinel
+        // (0xFFFF / 0xFFFFFFFF — this pipeline does not enable restart, so the
+        // sentinel is walked as a real index) made `required` 65536 and silently
+        // erased every restart-using draw, counted only as a refusal.
+        let records = u64::from(match record_limit {
+            Some(required) if required > guest.num_records => {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static OVER_RANGE: AtomicU64 = AtomicU64::new(0);
+                let occurrence = OVER_RANGE.fetch_add(1, Ordering::Relaxed) + 1;
+                if occurrence <= 4 || occurrence.is_power_of_two() {
+                    debug!(
+                        occurrence,
+                        required,
+                        exposed = guest.num_records,
+                        binding,
+                        "indexed draw addresses more vertex records than its V# exposes — \
+                         clamping the upload (out-of-range fetches read zero)"
+                    );
+                }
                 guest.num_records
-            )));
-        }
-        let records = u64::from(record_limit.unwrap_or(guest.num_records));
+            }
+            Some(required) => required,
+            None => guest.num_records,
+        });
         let mut size = stride
             .checked_mul(records)
             .ok_or_else(|| err("vertex buffer size overflow"))?;
@@ -765,7 +829,7 @@ fn prepare_vertex_inputs_limited(
         // whether the guest bytes are actually non-zero. This can identify an
         // all-zero input buffer, but does not by itself prove whether later
         // raster state accepted or rejected the transformed primitives.
-        if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
+        if crate::diagnostics::gpu_env().trace_draws {
             use std::sync::atomic::{AtomicU32, Ordering};
             static VB_SEEN: AtomicU32 = AtomicU32::new(0);
             if VB_SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
@@ -810,7 +874,7 @@ fn prepare_vertex_inputs_limited(
             // Location {i}` over 0..resources_num), and the format/offset must
             // match the V#. This reports that link without treating it as a
             // complete fragment-coverage verdict.
-            if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
+            if crate::diagnostics::gpu_env().trace_draws {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static ATTR_SEEN: AtomicU32 = AtomicU32::new(0);
                 if ATTR_SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
@@ -908,6 +972,37 @@ fn texture_vk_format(
         // Gfx10UnifiedFormat unified 5 -> (1u, 4u)); R8_UINT at 1 B/texel.
         // Measured on ASTRO.BOT's 1920x1080 tile=24 target sampled as a texture.
         5 => Ok((vk::Format::R8_UINT, 1)),
+        // ---- Block-compressed (BC) family ----
+        //
+        // The unified codes 169-182 are the GFX10 image-only BC encodings; they
+        // have no legacy DATA_FORMAT equivalent, so SharpEmu's
+        // `Gfx10UnifiedFormat` maps each to itself and the BC identity lives in
+        // its guest-format table (`Gpu/Metal/MetalGuestFormats.cs:157-170`) with
+        // block sizes from `Agc/AgcExports.cs:8226-8231` (169/170/175/176 = 8
+        // bytes, the rest 16). The sRGB pairs differ only in the numeric class,
+        // which the shader's sampled type never sees.
+        //
+        // The second element of the returned tuple is bytes per ADDRESSABLE
+        // ELEMENT, and for BC an element is a 4x4 texel block — so these are
+        // block bytes, and every size/tiling computation downstream runs in
+        // block units (see `format_block_extent`). That is also why the 8- and
+        // 16-byte rows of the swizzle tables already carry the comment "also
+        // BC1/BC4 blocks": a tiled BC surface swizzles its blocks with exactly
+        // the same equations, at an element size the tables already cover.
+        169 => Ok((vk::Format::BC1_RGBA_UNORM_BLOCK, 8)),
+        170 => Ok((vk::Format::BC1_RGBA_SRGB_BLOCK, 8)),
+        171 => Ok((vk::Format::BC2_UNORM_BLOCK, 16)),
+        172 => Ok((vk::Format::BC2_SRGB_BLOCK, 16)),
+        173 => Ok((vk::Format::BC3_UNORM_BLOCK, 16)),
+        174 => Ok((vk::Format::BC3_SRGB_BLOCK, 16)),
+        175 => Ok((vk::Format::BC4_UNORM_BLOCK, 8)),
+        176 => Ok((vk::Format::BC4_SNORM_BLOCK, 8)),
+        177 => Ok((vk::Format::BC5_UNORM_BLOCK, 16)),
+        178 => Ok((vk::Format::BC5_SNORM_BLOCK, 16)),
+        179 => Ok((vk::Format::BC6H_UFLOAT_BLOCK, 16)),
+        180 => Ok((vk::Format::BC6H_SFLOAT_BLOCK, 16)),
+        181 => Ok((vk::Format::BC7_UNORM_BLOCK, 16)),
+        182 => Ok((vk::Format::BC7_SRGB_BLOCK, 16)),
         other => Err(err(format!(
             "texture format {other} not implemented \
              (base={:#x} {}x{} pitch={} tile={} levels={})",
@@ -1000,7 +1095,7 @@ fn texture_cache_probe(
     array: bool,
     format: vk::Format,
 ) -> (u64, Option<TextureUpload>) {
-    if std::env::var_os("RAEEN_NO_TEX_CACHE").is_some() {
+    if crate::diagnostics::gpu_env().no_tex_cache {
         return (0, None);
     }
     let Some(hash) = sampling_scope(|_| guest_sample_hash(base, src_len)) else {
@@ -1097,11 +1192,11 @@ fn sampled_key_ordinal(t: &kyty_graphics::shader::ShaderTextureResource) -> usiz
 /// |---------|--------------|------------------------|-------------------|
 /// | 8, 9    | `Two`        | `(false,false,false)`  | `TYPE_2D`         |
 /// | 10      | `Three`      | `(false,true ,false)`  | `TYPE_3D`         |
-/// | 11      | `Cube`       | `(true ,false,false)`  | `CUBE`            |
+/// | 11      | `TwoArray`   | `(false,false,true )`  | `TYPE_2D_ARRAY`   |
 /// | 13      | `TwoArray`   | `(false,false,true )`  | `TYPE_2D_ARRAY`   |
 ///
-/// The array/cube flags are TYPE-driven, NOT layer-count-driven: a 2DArray
-/// (type 13) whose depth field is 0 has one layer yet still declares
+/// The array/volume flags are TYPE-driven, NOT layer-count-driven: a 2DArray
+/// (type 11 or 13) whose depth field is 0 has one layer yet still declares
 /// `Arrayed = 1` in SPIR-V, so it MUST bind a `TYPE_2D_ARRAY` view (with
 /// `layer_count == 1`). Deriving the view from `layers > 1` instead was the
 /// ASTRO.BOT array/cube device-loss (`VUID-vkCmdDispatch`: view type 2D under
@@ -1127,8 +1222,11 @@ fn texture_view_kind(ty: u8) -> Result<(bool, bool, bool), DrawError> {
         9 => (false, false, false),
         // 10 = 3D volume (measured: ASTRO.BOT's 240x135x64 froxel/LUT volumes).
         10 => (false, true, false),
-        // 11 = Cube (measured: Minecraft's 1024x1024x6 skybox).
-        11 => (true, false, false),
+        // 11 = guest Cube, sampled as a 2D array. RDNA's V_CUBE* sequence
+        // already turns the direction into (s,t,face) before image_sample;
+        // a Vulkan CUBE view would interpret those values as a direction a
+        // second time and smear Minecraft's panorama radially.
+        11 => (false, false, true),
         // 13 = 2DArray (measured: ASTRO.BOT's 1536x1536x3 array, tile 24 — the
         // T# depth field carries the layer count).
         13 => (false, false, true),
@@ -1159,6 +1257,9 @@ fn texture_view_kind(ty: u8) -> Result<(bool, bool, bool), DrawError> {
 fn decode_texture(
     t: &kyty_graphics::shader::ShaderTextureResource,
 ) -> Result<TextureUpload, DrawError> {
+    let _decode_timer = crate::vulkan::offscreen::StageTimer::start(
+        &crate::vulkan::offscreen::DRAW_STAGE_DECODE_NS,
+    );
     // A placeholder T# (base 0) stands in for a descriptor shader analysis
     // could not resolve — the all-ones "type 15 / format 511" poison a
     // runtime-/SRT-bound descriptor reads back as, replaced upstream by
@@ -1196,6 +1297,15 @@ fn decode_texture(
     }
 
     let (format, bpp) = texture_vk_format(t)?;
+    // Guest layout, tiling and staging all address ELEMENTS, which for a
+    // block-compressed format is a 4x4 texel block rather than a texel. The
+    // `VkImage` keeps the texel extent (`width`/`height`); everything that
+    // touches bytes below uses these. For every uncompressed format the block
+    // extent is 1 and these are exactly `width`/`height`, so the arithmetic is
+    // unchanged for the formats that worked before.
+    let block_extent = crate::vulkan::offscreen::format_block_extent(format);
+    let elements_wide = width.div_ceil(block_extent);
+    let elements_high = height.div_ceil(block_extent);
 
     // Persistent-texture cache probe (stage D): hashed against the SOURCE
     // bytes (pitch-padded / tiled, exactly what each branch would read), so a
@@ -1212,8 +1322,11 @@ fn decode_texture(
             // volume is `depth` such slices back to back (slice pitch =
             // pitch * height for a linear T# — the measured ASTRO.BOT
             // volumes are tile 0).
-            let pitch = u32::from(t.pitch()).max(width);
-            let src_len = u64::from(pitch) * u64::from(height) * u64::from(depth) * u64::from(bpp);
+            // A BC T#'s pitch is in texels like its width, so it converts to
+            // elements the same way.
+            let pitch = u32::from(t.pitch()).max(width).div_ceil(block_extent);
+            let src_len =
+                u64::from(pitch) * u64::from(elements_high) * u64::from(depth) * u64::from(bpp);
             let (hash, hit) = texture_cache_probe(
                 t.base40(),
                 src_len,
@@ -1229,13 +1342,13 @@ fn decode_texture(
                 return Ok(upload);
             }
             let tiled = read_guest_bytes_unaligned(t.base40(), src_len, "texture")?;
-            let row = (width * bpp) as usize;
+            let row = (elements_wide * bpp) as usize;
             let src_row = (pitch * bpp) as usize;
-            let src_slice = src_row * height as usize;
-            let dst_slice = row * height as usize;
+            let src_slice = src_row * elements_high as usize;
+            let dst_slice = row * elements_high as usize;
             let mut pixels = alloc_zeroed(dst_slice * depth as usize, "texture decode")?;
             for z in 0..depth as usize {
-                for y in 0..height as usize {
+                for y in 0..elements_high as usize {
                     let src = z * src_slice + y * src_row;
                     let dst = z * dst_slice + y * row;
                     pixels[dst..dst + row].copy_from_slice(&tiled[src..src + row]);
@@ -1258,10 +1371,27 @@ fn decode_texture(
         // six faces are six block grids back to back).
         mode if crate::texture::tiling::swizzle_table(mode).is_some() => {
             let bpp_log2 = bpp.trailing_zeros();
-            let face_tiled =
-                crate::texture::tiling::tiled_byte_count_for_mode(mode, width, height, bpp_log2)
-                    .expect("guarded by swizzle_table above") as usize;
-            let face_linear = (width * height * bpp) as usize;
+            // `trailing_zeros` is a log2 only for a power of two: a 3-byte
+            // element would read as 1 byte per texel and a 32-byte one would
+            // index past the last swizzle-table row. Refuse by name.
+            // A tiled BC surface swizzles its 4x4 BLOCKS with the same
+            // equations at an element size the tables already cover (8/16 B),
+            // so the whole detile runs on element dimensions.
+            let Some(face_tiled) = crate::texture::tiling::tiled_byte_count_for_mode(
+                mode,
+                elements_wide,
+                elements_high,
+                bpp_log2,
+            ) else {
+                return Err(err(format!(
+                    "texture tile mode {mode} with {bpp}-byte elements is not a supported \
+                     swizzle element size (base={:#x} {width}x{height} format={})",
+                    t.base40(),
+                    t.format()
+                )));
+            };
+            let face_tiled = face_tiled as usize;
+            let face_linear = (elements_wide * elements_high * bpp) as usize;
             // Array-upload OOM guard (SharpEmu #476 / 224a36e): if a previous
             // draw's multi-layer read of this address overran its allocation,
             // never retry — drop to a single base layer up front. layers == 1
@@ -1351,13 +1481,20 @@ fn decode_texture(
             let mut pixels = alloc_zeroed(face_linear * layers as usize, "texture decode")?;
             for layer in 0..layers as usize {
                 let src = &tiled[layer * face_tiled..(layer + 1) * face_tiled];
-                let face = crate::texture::tiling::detile_64kb(mode, src, width, height, bpp_log2)
-                    .expect("table-checked above");
+                let face = crate::texture::tiling::detile_64kb(
+                    mode,
+                    src,
+                    elements_wide,
+                    elements_high,
+                    bpp_log2,
+                )
+                .expect("mode and element size both checked above");
                 pixels[layer * face_linear..(layer + 1) * face_linear].copy_from_slice(&face);
             }
             (pixels, hash)
         }
         other => {
+            note_unsupported_tile_mode(other, t.format());
             return Err(err(format!(
                 "texture tile mode {other} not implemented \
                  (base={:#x} {width}x{height} format={})",
@@ -1373,7 +1510,7 @@ fn decode_texture(
     // "no coverage" in every frame probe. If these log all-zero, the GPU is
     // correctly rendering an EMPTY UI and the blocker is upstream (Gameface
     // never paints the menu), not in the GPU at all.
-    if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
+    if crate::diagnostics::gpu_env().trace_draws {
         use std::sync::atomic::{AtomicU32, Ordering};
         static TEX_SEEN: AtomicU32 = AtomicU32::new(0);
         if TEX_SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
@@ -1388,11 +1525,25 @@ fn decode_texture(
             );
         }
     }
-    if (cube || array) && std::env::var_os("RAEEN_TRACE_TEXTURES").is_some() {
+    if (cube || array) && crate::diagnostics::gpu_env().trace_textures {
         use std::sync::atomic::{AtomicU32, Ordering};
         static LAYERED_SEEN: AtomicU32 = AtomicU32::new(0);
-        if LAYERED_SEEN.fetch_add(1, Ordering::Relaxed) < 24 {
+        if width >= 512 || height >= 512 || LAYERED_SEEN.fetch_add(1, Ordering::Relaxed) < 24 {
             let non_zero = pixels.iter().filter(|&&byte| byte != 0).count();
+            let draw = sampling_scope(|scope| {
+                Some((
+                    scope.vs_addr,
+                    scope.ps_addr,
+                    scope.primitive,
+                    scope.vertex_count,
+                    scope.indexed,
+                    scope.first_attribute,
+                    scope.first_stride,
+                    scope.index_type,
+                    scope.vertex_head.clone(),
+                    scope.index_head.clone(),
+                ))
+            });
             tracing::info!(
                 base = format_args!("{:#x}", t.base40()),
                 texture_type = t.type_(),
@@ -1403,6 +1554,7 @@ fn decode_texture(
                 non_zero,
                 cube,
                 array,
+                draw = ?draw,
                 "layered sampled texture decoded"
             );
         }
@@ -1633,10 +1785,13 @@ fn read_storage_image(
             alloc_zeroed(size as usize, "storage image seed")?
         }
     };
-    if matches!(t.type_(), 11 | 13) && std::env::var_os("RAEEN_TRACE_TEXTURES").is_some() {
+    if matches!(t.type_(), 11 | 13) && crate::diagnostics::gpu_env().trace_textures {
         use std::sync::atomic::{AtomicU32, Ordering};
         static LAYERED_STORAGE_SEEN: AtomicU32 = AtomicU32::new(0);
-        if LAYERED_STORAGE_SEEN.fetch_add(1, Ordering::Relaxed) < 24 {
+        if width >= 512
+            || height >= 512
+            || LAYERED_STORAGE_SEEN.fetch_add(1, Ordering::Relaxed) < 24
+        {
             tracing::info!(
                 base = format_args!("{base:#x}"),
                 allocation_base = format_args!("{allocation_base:#x}"),
@@ -1661,7 +1816,7 @@ fn read_storage_image(
         array,
         tile_mode: t.tile_mode(),
         format,
-        pixels,
+        pixels: Arc::new(pixels),
         guest_base: base,
     })
 }
@@ -1730,9 +1885,20 @@ fn encode_storage_image_writeback(
 ///   the current attachment as a texture is a feedback loop); takes the CPU
 ///   fallback instead.
 struct SamplingScope {
-    map: *const HashMap<u64, RenderedImage>,
+    map: *const HashMap<u64, Arc<RenderedImage>>,
     live: Vec<(u64, u32, u32, i32)>,
     self_base: u64,
+    resolution_scale: f32,
+    vs_addr: u64,
+    ps_addr: u64,
+    primitive: u32,
+    vertex_count: u32,
+    indexed: bool,
+    first_attribute: Option<VertexAttributeData>,
+    first_stride: Option<u32>,
+    index_type: Option<vk::IndexType>,
+    vertex_head: Vec<u8>,
+    index_head: Vec<u8>,
     /// Snapshot of the persistent-texture cache (stage D): every cached
     /// texture's key and content sample-hash. `decode_texture` consults it to
     /// skip the guest read + detile + upload for a texture whose fresh
@@ -1780,6 +1946,34 @@ fn sampling_scope<R>(f: impl FnOnce(&SamplingScope) -> Option<R>) -> Option<R> {
     })
 }
 
+fn scaled_sampling_extent(width: u32, height: u32, factor: f32) -> (u32, u32) {
+    let factor = if factor.is_finite() {
+        factor.clamp(0.5, 4.0)
+    } else {
+        1.0
+    };
+    let scale = |value: u32| ((value as f32 * factor).round() as u32).max(1);
+    (scale(width), scale(height))
+}
+
+fn matching_live_target(
+    live: &[(u64, u32, u32, i32)],
+    base: u64,
+    width: u32,
+    height: u32,
+    format: i32,
+    resolution_scale: f32,
+) -> Option<(u32, u32)> {
+    let scaled = scaled_sampling_extent(width, height, resolution_scale);
+    live.iter()
+        .find(|(b, w, h, f)| *b == base && *w == width && *h == height && *f == format)
+        .or_else(|| {
+            live.iter()
+                .find(|(b, w, h, f)| *b == base && (*w, *h) == scaled && *f == format)
+        })
+        .map(|(_, width, height, _)| (*width, *height))
+}
+
 /// A [`TextureUpload`] that binds the persistent GPU image of a live render
 /// target directly, when this T# names one (stage B). `None` falls through to
 /// the guest-memory decode / CPU-pixels fallback.
@@ -1799,26 +1993,30 @@ fn sampled_render_target(
             // Feedback loop: the CPU-pixels fallback handles it.
             return None;
         }
-        scope
-            .live
-            .iter()
-            .find(|(b, w, h, f)| *b == base && *w == width && *h == height && *f == format.as_raw())
-            .map(|_| TextureUpload {
-                width,
-                height,
-                format,
-                pixels: Vec::new(),
-                layers: 1,
-                cube: false,
-                array: false,
-                depth: 1,
-                render_target: Some(base),
-                // Render-target binds are served by the persistent-TARGET
-                // machinery; the texture cache plays no part.
-                guest_base: 0,
-                sample_hash: 0,
-                cached: false,
-            })
+        matching_live_target(
+            &scope.live,
+            base,
+            width,
+            height,
+            format.as_raw(),
+            scope.resolution_scale,
+        )
+        .map(|(target_width, target_height)| TextureUpload {
+            width: target_width,
+            height: target_height,
+            format,
+            pixels: Vec::new(),
+            layers: 1,
+            cube: false,
+            array: false,
+            depth: 1,
+            render_target: Some(base),
+            // Render-target binds are served by the persistent-TARGET
+            // machinery; the texture cache plays no part.
+            guest_base: 0,
+            sample_hash: 0,
+            cached: false,
+        })
     })
 }
 
@@ -1828,14 +2026,17 @@ fn sampled_render_target(
 /// serve: the draw's own target (feedback loop) and extent/format mismatches.
 /// The content lives in the framebuffer map, not the guest memory
 /// `decode_texture` reads (render targets are never written back).
-fn render_target_pixels(base: u64, width: u32, height: u32) -> Option<Vec<u8>> {
+fn render_target_pixels(base: u64, width: u32, height: u32) -> Option<(u32, u32, Vec<u8>)> {
     sampling_scope(|scope| {
         // SAFETY: `scope.map` points at the sink's framebuffer map, alive and
         // unmutated for the published span (see `SAMPLING_SCOPE`).
         let map = unsafe { &*scope.map };
+        let scaled = scaled_sampling_extent(width, height, scope.resolution_scale);
         map.get(&base)
-            .filter(|img| img.width == width && img.height == height)
-            .map(|img| img.pixels.clone())
+            .filter(|img| {
+                (img.width, img.height) == (width, height) || (img.width, img.height) == scaled
+            })
+            .map(|img| (img.width, img.height, img.pixels.clone()))
     })
 }
 
@@ -1985,6 +2186,36 @@ fn expected_storage_image_bytes(t: &kyty_graphics::shader::ShaderTextureResource
 /// at 16 MiB (`reference/sharpemu/src/SharpEmu.ShaderCompiler/`
 /// `Gen5ShaderScalarEvaluator.cs:1952-1960` — the 256 KiB/page-round window —
 /// and `:69` — `MaxGlobalMemoryBindingBytes` = 16 MiB).
+/// Report each distinct unsupported `(tile_mode, format)` pair exactly once.
+///
+/// A texture whose swizzle mode has no ported equation makes [`decode_texture`]
+/// refuse, the draw drop, and the frame come back as the BLACK FRAME warning in
+/// `agc_exec.rs` — with nothing naming *which* mode was responsible. Raeen
+/// implements swizzle modes 5/9/24/27; SharpEmu additionally models 1/4/8 via a
+/// block table (`reference/sharpemu/src/SharpEmu.Libs/Agc/GnmTiling.cs:821-861`,
+/// whose own comment concedes it is a model rather than a transcribed AddrLib
+/// PATINFO table). Porting that is only worth its inexactness if a real title
+/// actually binds those modes — this line is what turns that into a measurement
+/// instead of a guess. Rate-limited per pair, so a per-draw miss cannot flood.
+fn note_unsupported_tile_mode(mode: u8, format: u16) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u8, u16)>>> = Mutex::new(None);
+    let first = SEEN
+        .lock()
+        .map(|mut set| set.get_or_insert_with(HashSet::new).insert((mode, format)))
+        .unwrap_or(false);
+    if first {
+        tracing::warn!(
+            tile_mode = mode,
+            format,
+            "unsupported texture swizzle mode — this draw is DROPPED (a likely BLACK FRAME \
+             contributor); Raeen implements modes 5/9/24/27. Further textures with this \
+             (mode, format) are silent."
+        );
+    }
+}
+
 fn eud_raw_window_want_bytes(required_dwords: u32) -> u64 {
     const MIN_BYTES: u64 = 256 * 1024;
     const MAX_BYTES: u64 = 16 * 1024 * 1024;
@@ -2075,9 +2306,78 @@ fn prepare_eud_raw_binding(bind: &ShaderBindResources) -> EudRawBinding {
     }
 }
 
+fn sampler_address_mode(clamp: u8) -> vk::SamplerAddressMode {
+    match clamp {
+        // SQ_TEX_WRAP / SQ_TEX_MIRROR.
+        0 => vk::SamplerAddressMode::REPEAT,
+        1 => vk::SamplerAddressMode::MIRRORED_REPEAT,
+        // SQ_TEX_CLAMP_LAST_TEXEL. Minecraft uses this for its 64x64 skin
+        // atlas; treating it as REPEAT samples the opposite atlas edge.
+        2 => vk::SamplerAddressMode::CLAMP_TO_EDGE,
+        // Vulkan has no separate "mirror once + last texel/half border/border"
+        // modes. MIRROR_CLAMP_TO_EDGE preserves the one-mirror coordinate rule
+        // and is the closest representable behaviour.
+        3 | 5 | 7 => vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE,
+        // HALF_BORDER and BORDER both use the descriptor's border colour.
+        4 | 6 => vk::SamplerAddressMode::CLAMP_TO_BORDER,
+        _ => vk::SamplerAddressMode::REPEAT,
+    }
+}
+
+fn sampler_filter(filter: u8) -> vk::Filter {
+    match filter {
+        // Point and anisotropic-point retain nearest texel selection. Full
+        // anisotropy needs the guest ratio and device feature wired together;
+        // it must not silently turn point sampling into bilinear filtering.
+        0 | 2 => vk::Filter::NEAREST,
+        1 | 3 => vk::Filter::LINEAR,
+        _ => vk::Filter::NEAREST,
+    }
+}
+
+fn sampler_state(sampler: &ShaderSamplerResource) -> SamplerState {
+    SamplerState {
+        mag_filter: sampler_filter(sampler.xy_mag_filter()),
+        min_filter: sampler_filter(sampler.xy_min_filter()),
+        mipmap_mode: if sampler.mip_filter() == 2 {
+            vk::SamplerMipmapMode::LINEAR
+        } else {
+            vk::SamplerMipmapMode::NEAREST
+        },
+        address_mode_u: sampler_address_mode(sampler.clamp_x()),
+        address_mode_v: sampler_address_mode(sampler.clamp_y()),
+        address_mode_w: sampler_address_mode(sampler.clamp_z()),
+    }
+}
+
 fn prepare_stage_binding(
     bind: &ShaderBindResources,
     stage: vk::ShaderStageFlags,
+) -> Result<ShaderStageBinding, DrawError> {
+    prepare_stage_binding_inner(bind, stage, None, None)
+}
+
+type ComputeStorageSnapshots = HashMap<(u64, usize), Arc<Vec<u8>>>;
+type ComputeImageSnapshots = HashMap<[u32; 8], StorageImageUpload>;
+
+fn prepare_compute_stage_binding(
+    bind: &ShaderBindResources,
+    storage_snapshots: &mut ComputeStorageSnapshots,
+    image_snapshots: &mut ComputeImageSnapshots,
+) -> Result<ShaderStageBinding, DrawError> {
+    prepare_stage_binding_inner(
+        bind,
+        vk::ShaderStageFlags::COMPUTE,
+        Some(storage_snapshots),
+        Some(image_snapshots),
+    )
+}
+
+fn prepare_stage_binding_inner(
+    bind: &ShaderBindResources,
+    stage: vk::ShaderStageFlags,
+    mut compute_snapshots: Option<&mut ComputeStorageSnapshots>,
+    mut compute_image_snapshots: Option<&mut ComputeImageSnapshots>,
 ) -> Result<ShaderStageBinding, DrawError> {
     // Textures and samplers: decode every bound T#/S# and carry them to the
     // Vulkan layer. The push constants must carry the REWRITTEN descriptors
@@ -2131,6 +2431,8 @@ fn prepare_stage_binding(
 
     let mut push_constants = Vec::with_capacity(bind.push_constant_size as usize);
     let mut storage_bytes = Vec::with_capacity(storage_num);
+    let mut storage_bases = Vec::with_capacity(storage_num);
+    let mut storage_sizes = Vec::with_capacity(storage_num);
     for (index, resource) in bind.storage_buffers.buffers[..storage_num]
         .iter()
         .enumerate()
@@ -2198,7 +2500,21 @@ fn prepare_stage_binding(
             );
         }
         let size = buffer_byte_size(resource).ok_or_else(|| err("storage buffer size overflow"))?;
-        let mut bytes = if resource.base48() == 0 || size == 0 {
+        let base = resource.base48();
+        let padded_size = if base == 0 || size == 0 {
+            4
+        } else {
+            (size as usize).div_ceil(4) * 4
+        };
+        let snapshot_key = (base, padded_size);
+        let cached = compute_snapshots
+            .as_deref()
+            .and_then(|snapshots| snapshots.get(&snapshot_key))
+            .cloned();
+        let cache_hit = cached.is_some();
+        let mut bytes = if cache_hit {
+            Vec::new()
+        } else if resource.base48() == 0 || size == 0 {
             // A null V# (base 0 or zero byte size): RDNA out-of-bounds
             // semantics make every read return 0 and drop every write, and
             // titles legitimately dispatch shaders whose analysis bound such
@@ -2215,15 +2531,41 @@ fn prepare_stage_binding(
             );
             vec![0u8; 4]
         } else {
-            read_guest_bytes(resource.base48(), size, "storage buffer")?
+            read_guest_bytes(resource.base48(), size, "storage buffer").map_err(|source| {
+                err(format!(
+                    "storage buffer {index} descriptor rejected \
+                     (stage={stage:?}, start_register={}, slot={}, usage={:?}, \
+                     extended={}, fields=[{:#010x}, {:#010x}, {:#010x}, {:#010x}], \
+                     base={base:#x}, stride={}, num_records={}, size={size:#x}): {source}",
+                    bind.storage_buffers.start_register[index],
+                    bind.storage_buffers.slots[index],
+                    bind.storage_buffers.usages[index],
+                    bind.storage_buffers.extended[index],
+                    resource.fields[0],
+                    resource.fields[1],
+                    resource.fields[2],
+                    resource.fields[3],
+                    resource.stride(),
+                    resource.num_records(),
+                ))
+            })?
         };
         // The SSBO view is an array of 32-bit elements, so pad the upload to
         // a dword multiple (a V# byte size need not be one — the recompiler
         // dropped Kyty's alignment EXIT). The writeback truncates back to
         // `size` so the pad bytes never reach guest memory.
-        let padded = bytes.len().div_ceil(4) * 4;
-        bytes.resize(padded, 0);
-        let all_zero = bytes.iter().all(|&b| b == 0);
+        if !cache_hit {
+            bytes.resize(padded_size, 0);
+        }
+        let bytes = cached.unwrap_or_else(|| {
+            let bytes = Arc::new(bytes);
+            if base != 0
+                && let Some(snapshots) = compute_snapshots.as_deref_mut()
+            {
+                snapshots.insert(snapshot_key, Arc::clone(&bytes));
+            }
+            bytes
+        });
         debug!(
             stage = ?stage,
             index,
@@ -2232,7 +2574,11 @@ fn prepare_stage_binding(
             head = format_args!("{:02x?}", &bytes[..bytes.len().min(16)]),
             "stage storage buffer read"
         );
-        if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
+        if crate::diagnostics::gpu_env().trace_draws {
+            // This is a diagnostic-only O(n) scan. Minecraft binds multi-MiB
+            // V# resources many times per frame; computing it unconditionally
+            // consumed several milliseconds even though the trace was off.
+            let all_zero = bytes.iter().all(|&b| b == 0);
             use std::sync::atomic::{AtomicU32, Ordering};
             static COMPUTE_SEEN: AtomicU32 = AtomicU32::new(0);
             static GRAPHICS_SEEN: AtomicU32 = AtomicU32::new(0);
@@ -2255,6 +2601,8 @@ fn prepare_stage_binding(
             }
         }
         storage_bytes.push(bytes);
+        storage_bases.push(resource.base48());
+        storage_sizes.push(size as usize);
 
         // Kyty rewrites the descriptor's guest base to the Vulkan descriptor
         // array index before exposing the four dwords as push constants.
@@ -2308,8 +2656,19 @@ fn prepare_stage_binding(
             if stage_decoded_bytes > texture_byte_cap {
                 return Err(refuse_over_cap(stage_decoded_bytes, stage));
             }
-            let upload = read_storage_image(&desc.texture)?;
-            if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
+            let upload = if let Some(cached) = compute_image_snapshots
+                .as_deref()
+                .and_then(|snapshots| snapshots.get(&desc.texture.fields))
+            {
+                cached.clone()
+            } else {
+                let upload = read_storage_image(&desc.texture)?;
+                if let Some(snapshots) = compute_image_snapshots.as_deref_mut() {
+                    snapshots.insert(desc.texture.fields, upload.clone());
+                }
+                upload
+            };
+            if crate::diagnostics::gpu_env().trace_draws {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static SEEN: AtomicU32 = AtomicU32::new(0);
                 if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
@@ -2351,12 +2710,14 @@ fn prepare_stage_binding(
             // draw's own target — a feedback loop — or an extent/format
             // mismatch): substitute the framebuffer map's rendered pixels.
             if can_replace_with_render_target_pixels(&decoded)
-                && let Some(px) =
+                && let Some((width, height, px)) =
                     render_target_pixels(desc.texture.base40(), decoded.width, decoded.height)
             {
+                decoded.width = width;
+                decoded.height = height;
                 decoded.pixels = px;
             }
-            if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
+            if crate::diagnostics::gpu_env().trace_draws {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static SEEN: AtomicU32 = AtomicU32::new(0);
                 if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
@@ -2422,11 +2783,12 @@ fn prepare_stage_binding(
         )));
     }
 
-    // S#s: only the mag-filter bit is honoured today; the rewritten descriptor
-    // carries the sampler-array index in dword 0.
-    let mut linear_filter = Vec::with_capacity(sampler_num);
+    // S#s: preserve each axis' address mode and the independent min/mag/mip
+    // filters. The rewritten descriptor carries only the sampler-array index
+    // in dword 0; Vulkan receives the decoded state out-of-band.
+    let mut samplers = Vec::with_capacity(sampler_num);
     for (index, sampler) in bind.samplers.samplers[..sampler_num].iter().enumerate() {
-        linear_filter.push(sampler.xy_mag_filter() != 0);
+        samplers.push(sampler_state(sampler));
         let mut rewritten = *sampler;
         rewritten.update_index(index as u32);
         for field in rewritten.fields {
@@ -2483,16 +2845,24 @@ fn prepare_stage_binding(
         storage_buffers: (storage_num != 0).then_some(StorageBufferBinding {
             binding: bind.storage_buffers.binding_index as u32,
             buffers: storage_bytes,
+            guest_bases: storage_bases,
+            guest_sizes: storage_sizes,
+            writable: bind.storage_buffers.usages[..storage_num]
+                .iter()
+                .map(|usage| {
+                    *usage == kyty_graphics::shader::resources::ShaderStorageUsage::ReadWrite
+                })
+                .collect(),
         }),
         // Present when EITHER array is non-empty: a shader legitimately
         // binds textures without samplers (texel fetch) or samplers without
         // sampled textures — the Vulkan layer creates each descriptor array
         // independently, exactly as the SPIR-V declared them.
-        textures: (!textures.is_empty() || !linear_filter.is_empty()).then_some(TextureBinding {
+        textures: (!textures.is_empty() || !samplers.is_empty()).then_some(TextureBinding {
             sampled_binding: bind.textures2d.binding_sampled_index as u32,
             sampler_binding: bind.samplers.binding_index as u32,
             textures,
-            linear_filter,
+            samplers,
             sampled_groups,
         }),
         storage_images: (!storage_images.is_empty()).then_some(StorageImageBinding {
@@ -2504,6 +2874,48 @@ fn prepare_stage_binding(
         // from the captured EUD base pointer; unreadable degrades to zeros.
         eud_raw: bind.eud_raw.used.then(|| prepare_eud_raw_binding(bind)),
     })
+}
+
+/// Report, once per distinct set, which `CB_COLOR` slots a draw has bound.
+///
+/// Raeen attaches only `render_targets[0]`. Whether that actually loses output
+/// depends on a question the logs could not answer: does the title bind slots
+/// 1-7 *simultaneously* (true MRT, so everything past slot 0 is silently
+/// dropped), or does it merely render to different single targets in
+/// successive passes (in which case slot 0 is the whole story and MRT is a red
+/// herring)? The render-target census shows several distinct target addresses
+/// either way, so it cannot distinguish the two. This can: it reports the set
+/// of slots live *within one draw*.
+fn note_active_color_slots(ctx: &Context) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<u8>>> = Mutex::new(None);
+
+    let mut mask = 0u8;
+    for (slot, rt) in ctx.render_targets.iter().enumerate() {
+        if rt.base.addr != 0 {
+            mask |= 1 << slot;
+        }
+    }
+    // Slot 0 alone is the ordinary case and says nothing; only report a draw
+    // that binds anything above it.
+    if mask & !1 == 0 {
+        return;
+    }
+    let first = SEEN
+        .lock()
+        .map(|mut set| set.get_or_insert_with(HashSet::new).insert(mask))
+        .unwrap_or(false);
+    if first {
+        let slots: Vec<usize> = (0..8).filter(|s| mask & (1 << s) != 0).collect();
+        tracing::warn!(
+            slot_mask = format_args!("{mask:#010b}"),
+            ?slots,
+            target_mask = format_args!("{:#x}", ctx.render_target_mask),
+            "draw binds MULTIPLE colour render targets — Raeen attaches only slot 0, \
+             so every attachment above it is dropped"
+        );
+    }
 }
 
 /// Build a [`DrawState`] from decoded register state.
@@ -2518,30 +2930,57 @@ pub fn draw_state_from_regs<'a>(
     fs_spirv: &'a [u32],
 ) -> Result<DrawState<'a>, DrawError> {
     let rt = &ctx.render_targets[0];
-
-    if rt.base.addr == 0 {
+    note_active_color_slots(ctx);
+    let color_output = !color_output_disabled(ctx);
+    let depth = depth_state_from_regs(ctx)?;
+    if !color_output && depth.is_none() {
         return Err(err(
-            "no bound render target: CB_COLOR0_BASE is 0 (NoColorOutput)",
+            "draw has neither colour nor depth/stencil output enabled",
         ));
     }
-    // A fully-disabled target is handled by the caller (`color_output_disabled`)
-    // before this point; reaching here with 0 would silently draw nothing.
-    if ctx.render_target_mask == 0 {
-        return Err(err("CB_TARGET_MASK is 0 — colour output disabled"));
-    }
-    let color_write_mask = vulkan_color_write_mask(ctx.render_target_mask);
 
-    // The PS5 extent lives in ATTRIB2 and stores width/height minus one.
-    let width = rt.attrib2.width + 1;
-    let height = rt.attrib2.height + 1;
-    if rt.attrib2.width == 0 || rt.attrib2.height == 0 {
-        return Err(err(format!(
-            "CB_COLOR0_ATTRIB2 gives a degenerate extent {width}x{height} — \
-             the render target extent was never programmed"
-        )));
-    }
-
-    let format = vulkan_format(rt.info.format, rt.info.channel_type, rt.info.channel_order)?;
+    let (width, height, format, color_write_mask) = if color_output {
+        if rt.base.addr == 0 {
+            return Err(err(
+                "no bound render target: CB_COLOR0_BASE is 0 (NoColorOutput)",
+            ));
+        }
+        // The PS5 colour extent lives in ATTRIB2 and stores width/height minus
+        // one.
+        let width = rt.attrib2.width + 1;
+        let height = rt.attrib2.height + 1;
+        if rt.attrib2.width == 0 || rt.attrib2.height == 0 {
+            return Err(err(format!(
+                "CB_COLOR0_ATTRIB2 gives a degenerate extent {width}x{height} — \
+                 the render target extent was never programmed"
+            )));
+        }
+        (
+            width,
+            height,
+            vulkan_format(rt.info.format, rt.info.channel_type, rt.info.channel_order)?,
+            vulkan_color_write_mask(ctx.render_target_mask),
+        )
+    } else {
+        // A depth-only prepass/clear has no meaningful CB_COLOR0 state. Size
+        // the render area from DB_DEPTH_SIZE_XY, which stores max X/Y just like
+        // ColorAttrib2. `format` is unused because the Vulkan pipeline declares
+        // zero colour attachments when `color_output` is false.
+        let size = ctx.depth_render_target.size;
+        let width = u32::from(size.x_max) + 1;
+        let height = u32::from(size.y_max) + 1;
+        if size.x_max == 0 || size.y_max == 0 {
+            return Err(err(format!(
+                "depth-only draw has degenerate DB_DEPTH_SIZE_XY {width}x{height}"
+            )));
+        }
+        (
+            width,
+            height,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ColorComponentFlags::empty(),
+        )
+    };
 
     // Kyty: CreatePipelineInternal — viewport from scale/offset.
     let vp = &ctx.screen_viewport.viewports[0];
@@ -2624,7 +3063,7 @@ pub fn draw_state_from_regs<'a>(
     // in-tree with cull NONE covers 4096/4096 (tests/coverage_bisect.rs), so
     // culling is the LAST field separating the in-tree render from the
     // title's black frame. This switch is the yes/no for that mechanism.
-    if std::env::var_os("RAEEN_NO_CULL").is_some() {
+    if crate::diagnostics::gpu_env().no_cull {
         cull_mode = vk::CullModeFlags::NONE;
     }
     // PA_SU_SC_MODE_CNTL.FACE: 0 = counter-clockwise is the front face,
@@ -2637,7 +3076,11 @@ pub fn draw_state_from_regs<'a>(
         vk::FrontFace::COUNTER_CLOCKWISE
     };
 
-    let blend = blend_state_from_regs(ctx)?;
+    let blend = if color_output {
+        blend_state_from_regs(ctx)?
+    } else {
+        BlendState::default()
+    };
 
     // Why-is-it-black diagnostic. Every GEOMETRIC degeneracy above (zero target
     // mask, degenerate extent, zero-area viewport, empty scissor) is already a
@@ -2700,8 +3143,8 @@ pub fn draw_state_from_regs<'a>(
         target_base: None,
         // The caller (draw_common) fills this in for an indexed draw.
         index: None,
-        color_output: true,
-        depth: depth_state_from_regs(ctx)?,
+        color_output,
+        depth,
     })
 }
 
@@ -2723,7 +3166,7 @@ pub struct OffscreenDrawSink<'a> {
     /// Each draw seeds its attachment with the target's prior pixels and
     /// stores the result back, so draws compose into a frame instead of each
     /// one starting from a cleared target.
-    framebuffers: &'a mut HashMap<u64, RenderedImage>,
+    framebuffers: &'a mut HashMap<u64, Arc<RenderedImage>>,
     pub last: Option<RenderedImage>,
     /// `CB_COLOR0_BASE` of the last draw's render target. With deferred
     /// readback (stage B) `last` is only populated by immediate-fallback
@@ -2761,6 +3204,20 @@ pub struct OffscreenDrawSink<'a> {
     /// the session before a submission runs and read back after, so it persists
     /// across the per-submission sink lifetime.
     pub current_compute: Option<ComputeShaderInfo>,
+    /// Complete guest SSBO snapshots captured once per PM4 submission. Later
+    /// dispatches share the same allocation and sparse shader writebacks are
+    /// folded into it, matching GPU-visible resource lifetime without copying
+    /// multi-megabyte buffers for every packet.
+    compute_storage_snapshots: ComputeStorageSnapshots,
+    /// Storage-image counterparts of `compute_storage_snapshots`. The decoded
+    /// linear pixels are shared by every matching descriptor in this PM4
+    /// submission; the Vulkan cache uses Arc identity to preserve GPU-newer
+    /// contents between ordered dispatches instead of re-uploading the seed.
+    compute_image_snapshots: ComputeImageSnapshots,
+    /// At least one storage-only compute packet joined the deferred queue.
+    /// The session uses this to fence/write back once at the end of this PM4
+    /// submission, before transient guest allocations may be released.
+    pub queued_compute: bool,
 }
 
 impl<'a> OffscreenDrawSink<'a> {
@@ -2768,7 +3225,7 @@ impl<'a> OffscreenDrawSink<'a> {
     pub fn new(
         dev: &'a VulkanDevice,
         cache: &'a mut ShaderTranslateCache,
-        framebuffers: &'a mut HashMap<u64, RenderedImage>,
+        framebuffers: &'a mut HashMap<u64, Arc<RenderedImage>>,
     ) -> Self {
         Self {
             dev,
@@ -2785,6 +3242,9 @@ impl<'a> OffscreenDrawSink<'a> {
             last_dispatch_skip_reason: None,
             queue_is_compute: false,
             current_compute: None,
+            compute_storage_snapshots: HashMap::new(),
+            compute_image_snapshots: HashMap::new(),
+            queued_compute: false,
         }
     }
 }
@@ -2827,11 +3287,18 @@ impl OffscreenDrawSink<'_> {
         count: u32,
         index: Option<(&[u8], vk::IndexType)>,
     ) -> Result<(), DrawError> {
-        // A zero colour mask is a legitimate depth-only/no-colour draw, not a
-        // malformed DCB. Until the depth backend is wired, consume it without
-        // aborting later colour draws in the same submission.
-        if color_output_disabled(ctx) {
-            debug!("draw consumed without colour output (depth path pending)");
+        let _draw_timer = crate::vulkan::offscreen::StageTimer::start(
+            &crate::vulkan::offscreen::DRAW_STAGE_DRAWCOMMON_NS,
+        );
+        // A zero colour mask with depth/stencil disabled is a state-carrying
+        // no-op. With depth/stencil enabled it is a real z-prepass/clear and
+        // must reach the now-wired depth backend; dropping it leaves a stale
+        // persistent depth surface that can reject later colour geometry.
+        if color_output_disabled(ctx)
+            && !ctx.depth_control.z_enable
+            && !ctx.depth_control.stencil_enable
+        {
+            debug!("draw consumed with neither colour nor depth/stencil output");
             return Ok(());
         }
         // VGT_PRIMITIVE_TYPE 0 (NONE) draws nothing on hardware — the packet
@@ -2842,6 +3309,9 @@ impl OffscreenDrawSink<'_> {
             debug!("draw consumed: VGT_PRIMITIVE_TYPE NONE");
             return Ok(());
         }
+        let resolve_timer = crate::vulkan::offscreen::StageTimer::start(
+            &crate::vulkan::offscreen::DRAW_STAGE_RESOLVE_NS,
+        );
         let shaders = if sh.vs.vs_embedded && sh.ps.ps_embedded {
             // The embedded pair is the Phase 1 / M2 invariant: a failure here
             // is a broken fixture and must abort loudly.
@@ -2859,7 +3329,11 @@ impl OffscreenDrawSink<'_> {
                 }
             }
         };
+        drop(resolve_timer);
 
+        let setup_timer = crate::vulkan::offscreen::StageTimer::start(
+            &crate::vulkan::offscreen::DRAW_STAGE_SETUP_NS,
+        );
         let mut state = draw_state_from_regs(ctx, ucfg, count, &shaders.vs, &shaders.ps)?;
         // Internal-resolution scaling (Settings ▸ Video ▸ Resolution Scale).
         // Supersamples the whole draw (target + viewport + scissor together);
@@ -2870,12 +3344,13 @@ impl OffscreenDrawSink<'_> {
             prepare_vertex_inputs_limited(&shaders.vs_info, Some(vertex_records))?;
         state.vertex_buffers = vertex_buffers;
         state.vertex_attributes = vertex_attributes;
+        drop(setup_timer);
         // Coverage probe (RAEEN_TRACE_DRAWS). Vertex data, attribute bindings,
         // gl_Position and draw state are all confirmed correct yet coverage is
         // ZERO. An all-zero index buffer collapses every primitive to a single
         // vertex — degenerate triangles cover no pixel — and would look exactly
         // like this. Report whether the draw is indexed and what the indices are.
-        if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
+        if crate::diagnostics::gpu_env().trace_draws {
             use std::sync::atomic::{AtomicU32, Ordering};
             static IDX_SEEN: AtomicU32 = AtomicU32::new(0);
             if IDX_SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
@@ -2897,7 +3372,11 @@ impl OffscreenDrawSink<'_> {
             state.index = Some(crate::vulkan::IndexBinding { bytes, index_type });
         }
 
-        let rt_base = ctx.render_targets[0].base.addr;
+        let rt_base = if state.color_output {
+            ctx.render_targets[0].base.addr
+        } else {
+            0
+        };
         let stage_binds = [
             (&shaders.vs_info.bind, vk::ShaderStageFlags::VERTEX),
             (&shaders.ps_info.bind, vk::ShaderStageFlags::FRAGMENT),
@@ -2908,12 +3387,15 @@ impl OffscreenDrawSink<'_> {
         // batch first so the framebuffer map is current. Named, counted via
         // the flush stats; measured composites sample OTHER targets, so this
         // stays off the hot path.
-        let samples_own_target = stage_binds.iter().any(|(bind, _)| {
-            let n = usize::try_from(bind.textures2d.textures_num).unwrap_or(0);
-            bind.textures2d.desc[..n.min(bind.textures2d.desc.len())]
-                .iter()
-                .any(|d| d.usage != ShaderTextureUsage::ReadWrite && d.texture.base40() == rt_base)
-        });
+        let samples_own_target = state.color_output
+            && stage_binds.iter().any(|(bind, _)| {
+                let n = usize::try_from(bind.textures2d.textures_num).unwrap_or(0);
+                bind.textures2d.desc[..n.min(bind.textures2d.desc.len())]
+                    .iter()
+                    .any(|d| {
+                        d.usage != ShaderTextureUsage::ReadWrite && d.texture.base40() == rt_base
+                    })
+            });
         if samples_own_target && self.dev.draw_caches().base_is_batch_dirty(rt_base) {
             self.flush_deferred_into_framebuffers()?;
         }
@@ -2925,6 +3407,9 @@ impl OffscreenDrawSink<'_> {
         // temporaries in a single expression would deadlock — the first
         // guard lives to the end of the statement while the second lock()
         // waits on it.
+        let census_timer = crate::vulkan::offscreen::StageTimer::start(
+            &crate::vulkan::offscreen::DRAW_STAGE_CENSUS_NS,
+        );
         let (live, cached_textures) = {
             let caches = self.dev.draw_caches();
             (
@@ -2941,12 +3426,53 @@ impl OffscreenDrawSink<'_> {
                 caches.cached_texture_hashes(),
             )
         };
+        drop(census_timer);
+        // NGG exposes its vertex program through the ES register block; the
+        // legacy VS block remains zero. Report the effective shader address so
+        // a layered-texture trace can be matched to the correct SPIR-V dump.
+        let vs_addr = if sh.vs.vs_regs.data_addr != 0 {
+            sh.vs.vs_regs.data_addr
+        } else {
+            sh.vs.es_regs.data_addr
+        };
+        let ps_addr = sh.ps.ps_regs.data_addr;
+        let trace_textures = crate::diagnostics::gpu_env().trace_textures;
+        let vertex_head = if trace_textures {
+            state
+                .vertex_buffers
+                .first()
+                .map(|buffer| buffer.bytes[..buffer.bytes.len().min(96)].to_vec())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let index_head = if trace_textures {
+            index
+                .map(|(bytes, _)| bytes[..bytes.len().min(96)].to_vec())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let scope = SamplingScope {
             map: std::ptr::from_ref(self.framebuffers),
             live,
             self_base: rt_base,
+            resolution_scale: crate::agc_exec::AgcGpuSession::runtime_config().resolution_scale,
+            vs_addr,
+            ps_addr,
+            primitive: ucfg.prim_type,
+            vertex_count: state.vertex_count,
+            indexed: index.is_some(),
+            first_attribute: state.vertex_attributes.first().copied(),
+            first_stride: state.vertex_buffers.first().map(|buffer| buffer.stride),
+            index_type: index.map(|(_, index_type)| index_type),
+            vertex_head,
+            index_head,
             cached_textures,
         };
+        let bind_timer = crate::vulkan::offscreen::StageTimer::start(
+            &crate::vulkan::offscreen::DRAW_STAGE_BIND_NS,
+        );
         with_sampling_scope(&scope, || -> Result<(), DrawError> {
             for (bind, stage) in stage_binds {
                 if bind.push_constant_size != 0
@@ -2964,13 +3490,14 @@ impl OffscreenDrawSink<'_> {
             }
             Ok(())
         })?;
+        drop(bind_timer);
 
         // One-shot forensic: what does a real Minecraft draw actually bind?
         // A force-clear experiment alone cannot prove zero fragment coverage:
         // a fragment shader or blend state may legitimately write that same
         // colour. Treat this as a state census, not a coverage verdict.
         // Gated to the first few draws (RAEEN_TRACE_DRAWS) so it never floods.
-        if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
+        if crate::diagnostics::gpu_env().trace_draws {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SEEN: AtomicU32 = AtomicU32::new(0);
             if SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
@@ -2997,9 +3524,10 @@ impl OffscreenDrawSink<'_> {
             }
         }
 
-        let vs_addr = sh.vs.vs_regs.data_addr;
-        let ps_addr = sh.ps.ps_regs.data_addr;
-        if trace_selected_shader(vs_addr, ps_addr) {
+        let trace_minecraft_model = crate::diagnostics::gpu_env().trace_model
+            && matches!(shaders.vs.len(), 16_848 | 16_852)
+            && matches!(shaders.ps.len(), 5_184 | 5_187);
+        if trace_selected_shader(vs_addr, ps_addr) || trace_minecraft_model {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SELECTED_SEEN: AtomicU32 = AtomicU32::new(0);
             let selected = SELECTED_SEEN.fetch_add(1, Ordering::Relaxed);
@@ -3019,14 +3547,19 @@ impl OffscreenDrawSink<'_> {
                     .stage_bindings
                     .iter()
                     .map(|binding| {
+                        let storage_heads: Vec<_> = binding
+                            .storage_buffers
+                            .iter()
+                            .flat_map(|storage| storage.buffers.iter())
+                            .map(|bytes| (bytes.len(), bytes[..bytes.len().min(96)].to_vec()))
+                            .collect();
                         (
                             binding.stage,
                             binding.descriptor_set_slot,
+                            binding.push_constant_offset,
                             binding.push_constants.len(),
-                            binding
-                                .storage_buffers
-                                .as_ref()
-                                .map_or(0, |buffers| buffers.buffers.len()),
+                            binding.push_constants[..binding.push_constants.len().min(96)].to_vec(),
+                            storage_heads,
                             binding
                                 .textures
                                 .as_ref()
@@ -3034,6 +3567,118 @@ impl OffscreenDrawSink<'_> {
                         )
                     })
                     .collect();
+                let texture_summaries: Vec<_> = state
+                    .stage_bindings
+                    .iter()
+                    .filter_map(|binding| binding.textures.as_ref())
+                    .flat_map(|binding| binding.textures.iter())
+                    .map(|texture| {
+                        let (alpha_nonzero, alpha_opaque) =
+                            if texture.format == vk::Format::R8G8B8A8_UNORM {
+                                (
+                                    texture
+                                        .pixels
+                                        .chunks_exact(4)
+                                        .filter(|pixel| pixel[3] != 0)
+                                        .count(),
+                                    texture
+                                        .pixels
+                                        .chunks_exact(4)
+                                        .filter(|pixel| pixel[3] == u8::MAX)
+                                        .count(),
+                                )
+                            } else {
+                                (0, 0)
+                            };
+                        (
+                            texture.guest_base,
+                            texture.width,
+                            texture.height,
+                            texture.format,
+                            texture.layers,
+                            texture.pixels.len(),
+                            alpha_nonzero,
+                            alpha_opaque,
+                            texture.cached,
+                            texture.pixels[..texture.pixels.len().min(96)].to_vec(),
+                        )
+                    })
+                    .collect();
+                let sampler_summaries: Vec<_> =
+                    [("vs", &shaders.vs_info.bind), ("ps", &shaders.ps_info.bind)]
+                        .into_iter()
+                        .flat_map(|(stage, bind)| {
+                            let count = usize::try_from(bind.samplers.samplers_num)
+                                .unwrap_or_default()
+                                .min(bind.samplers.samplers.len());
+                            bind.samplers.samplers[..count].iter().enumerate().map(
+                                move |(index, sampler)| {
+                                    (
+                                        stage,
+                                        index,
+                                        sampler.fields,
+                                        sampler.clamp_x(),
+                                        sampler.clamp_y(),
+                                        sampler.clamp_z(),
+                                        sampler.force_unorm_coords(),
+                                        sampler.xy_mag_filter(),
+                                        sampler.xy_min_filter(),
+                                        sampler.mip_filter(),
+                                    )
+                                },
+                            )
+                        })
+                        .collect();
+                let uv_alpha_samples: Vec<_> = state
+                    .vertex_attributes
+                    .iter()
+                    .find(|attribute| {
+                        attribute.location == 4 && attribute.format == vk::Format::R16G16_UNORM
+                    })
+                    .and_then(|attribute| {
+                        let vertex = state.vertex_buffers.get(attribute.binding as usize)?;
+                        let texture = state
+                            .stage_bindings
+                            .iter()
+                            .filter_map(|binding| binding.textures.as_ref())
+                            .flat_map(|binding| binding.textures.iter())
+                            .find(|texture| {
+                                texture.format == vk::Format::R8G8B8A8_UNORM
+                                    && !texture.pixels.is_empty()
+                            })?;
+                        let stride = vertex.stride as usize;
+                        let offset = attribute.offset as usize;
+                        (stride >= offset + 4 && texture.width != 0 && texture.height != 0).then(
+                            || {
+                                vertex
+                                    .bytes
+                                    .chunks(stride)
+                                    .take(64)
+                                    .filter_map(|record| {
+                                        let uv = record.get(offset..offset + 4)?;
+                                        let u = u16::from_le_bytes([uv[0], uv[1]]);
+                                        let v = u16::from_le_bytes([uv[2], uv[3]]);
+                                        let x = (u64::from(u) * u64::from(texture.width - 1)
+                                            / u64::from(u16::MAX))
+                                            as u32;
+                                        let y = (u64::from(v) * u64::from(texture.height - 1)
+                                            / u64::from(u16::MAX))
+                                            as u32;
+                                        let at = (u64::from(y) * u64::from(texture.width)
+                                            + u64::from(x))
+                                            as usize
+                                            * 4;
+                                        texture
+                                            .pixels
+                                            .get(at + 3)
+                                            .copied()
+                                            .map(|alpha| (u, v, x, y, alpha))
+                                    })
+                                    .collect()
+                            },
+                        )
+                    })
+                    .unwrap_or_default();
                 let depth_summary = state.depth.as_ref().map(|depth| {
                     (
                         depth.target_base,
@@ -3080,6 +3725,9 @@ impl OffscreenDrawSink<'_> {
                     attributes = ?state.vertex_attributes,
                     vertex_heads = ?vertex_heads,
                     stage_resources = ?stage_resources,
+                    texture_summaries = ?texture_summaries,
+                    sampler_summaries = ?sampler_summaries,
+                    uv_alpha_samples = ?uv_alpha_samples,
                     "TRACE_SHADER_ADDR: selected draw state"
                 );
             }
@@ -3088,9 +3736,13 @@ impl OffscreenDrawSink<'_> {
         // Compose into the guest render target: seed with its prior pixels
         // (taken from the framebuffer map) so this draw adds to the frame
         // instead of starting over on a cleared attachment.
-        let prior = self
-            .framebuffers
-            .remove(&rt_base)
+        let backend_timer = crate::vulkan::offscreen::StageTimer::start(
+            &crate::vulkan::offscreen::DRAW_STAGE_BACKEND_NS,
+        );
+        let prior = state
+            .color_output
+            .then(|| self.framebuffers.remove(&rt_base))
+            .flatten()
             .filter(|p| p.width == state.width && p.height == state.height);
         if let Some(p) = &prior {
             state.initial = Some(&p.pixels);
@@ -3101,12 +3753,13 @@ impl OffscreenDrawSink<'_> {
         // readback of this target (this map is only ever written with
         // readbacks), so the backend may LOAD the persistent GPU copy
         // instead of re-uploading these bytes.
-        state.target_base = Some(rt_base);
+        state.target_base = state.color_output.then_some(rt_base);
         // Stage B: the draw is submitted with its readback DEFERRED —
         // `Ok(None)` means the pixels land in the framebuffer map at the next
         // flush (end of submission, presentation, or a feedback fallback).
         // `Ok(Some(image))` is the immediate-fallback path (readback now),
         // preserving the old per-draw behaviour.
+        let color_output = state.color_output;
         let immediate =
             crate::vulkan::offscreen::render_draw_deferred(self.dev, &state).map_err(|e| {
                 let depth = state.depth.as_ref().map(|d| {
@@ -3131,10 +3784,11 @@ impl OffscreenDrawSink<'_> {
                     state.stage_bindings.len()
                 ))
             })?;
+        drop(backend_timer);
         drop(state);
         match immediate {
             Some(image) => {
-                self.framebuffers.insert(rt_base, image.clone());
+                self.framebuffers.insert(rt_base, Arc::new(image.clone()));
                 self.last = Some(image);
             }
             None => {
@@ -3147,7 +3801,9 @@ impl OffscreenDrawSink<'_> {
                 }
             }
         }
-        self.last_target = Some(rt_base);
+        if color_output {
+            self.last_target = Some(rt_base);
+        }
         self.draws += 1;
         Ok(())
     }
@@ -3158,7 +3814,7 @@ impl OffscreenDrawSink<'_> {
         let flushed = crate::vulkan::offscreen::flush_deferred_draws(self.dev)
             .map_err(|e| err(format!("deferred-draw flush failed: {e}")))?;
         for (base, image) in flushed {
-            self.framebuffers.insert(base, image);
+            self.framebuffers.insert(base, Arc::new(image));
         }
         Ok(())
     }
@@ -3209,6 +3865,11 @@ impl DrawSink for OffscreenDrawSink<'_> {
         groups: [u32; 3],
         mode: u32,
     ) -> Result<(), DrawError> {
+        let _dispatch_timer = crate::vulkan::offscreen::StageTimer::start(
+            &crate::vulkan::offscreen::DRAW_STAGE_DISPATCH_NS,
+        );
+        crate::vulkan::offscreen::DRAW_STAGE_DISPATCH_N
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The legacy Kyty AGC wrapper emits 0. Retail RDNA2 command streams
         // also carry COMPUTE_SHADER_EN (bit 0) and CS_W32_EN (bit 6), yielding
         // the measured 0x41; ASTRO.BOT additionally sets USE_THREAD_DIMENSIONS
@@ -3231,7 +3892,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
         // bisect device-loss culprits: a lethal dispatch resets the whole
         // device and every later draw in the session fails, so isolating one
         // program by address is the fastest way to pin the killer.
-        if let Ok(list) = std::env::var("RAEEN_SKIP_CS") {
+        if let Some(list) = crate::diagnostics::gpu_env().skip_cs.as_deref() {
             let addr = format!("{:#x}", cs.cs_regs.data_addr);
             if list
                 .split(',')
@@ -3243,6 +3904,9 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 return Ok(());
             }
         }
+        let translate_timer = crate::vulkan::offscreen::StageTimer::start(
+            &crate::vulkan::offscreen::DRAW_STAGE_CS_TRANSLATE_NS,
+        );
         let translated = match self.cache.translate_cs(&cs, &ctx.sh_regs) {
             Ok(shader) => shader,
             Err(error) => {
@@ -3263,6 +3927,10 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 return Ok(());
             }
         };
+        drop(translate_timer);
+        let prepare_timer = crate::vulkan::offscreen::StageTimer::start(
+            &crate::vulkan::offscreen::DRAW_STAGE_CS_PREPARE_NS,
+        );
         let bind = &translated.cs_info.bind;
         // The round-10 tex-no-sampler quarantine is GONE. The measured
         // device loss (0x5006c5f00: sampled textures + zero samplers +
@@ -3285,9 +3953,15 @@ impl DrawSink for OffscreenDrawSink<'_> {
             || bind.direct_sgprs.sgprs_num != 0
             || bind.extended.used;
         let prepared = has_binding
-            .then(|| prepare_stage_binding(bind, vk::ShaderStageFlags::COMPUTE))
+            .then(|| {
+                prepare_compute_stage_binding(
+                    bind,
+                    &mut self.compute_storage_snapshots,
+                    &mut self.compute_image_snapshots,
+                )
+            })
             .transpose()?;
-        if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() && bind.textures2d.textures_num != 0 {
+        if crate::diagnostics::gpu_env().trace_draws && bind.textures2d.textures_num != 0 {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SEEN: AtomicU32 = AtomicU32::new(0);
             if SEEN.fetch_add(1, Ordering::Relaxed) < 24 {
@@ -3333,7 +4007,11 @@ impl DrawSink for OffscreenDrawSink<'_> {
         // back over guest memory beyond the V#.
         let guest_outputs: Vec<(u64, usize)> = bind.storage_buffers.buffers[..storage_num]
             .iter()
-            .map(|resource| {
+            .zip(&bind.storage_buffers.usages[..storage_num])
+            .filter(|(_, usage)| {
+                **usage == kyty_graphics::shader::resources::ShaderStorageUsage::ReadWrite
+            })
+            .map(|(resource, _)| {
                 (
                     resource.base48(),
                     buffer_byte_size(resource).unwrap_or(0) as usize,
@@ -3385,13 +4063,54 @@ impl DrawSink for OffscreenDrawSink<'_> {
             samplers = prepared
                 .as_ref()
                 .and_then(|p| p.textures.as_ref())
-                .map_or(0, |t| t.linear_filter.len()),
+                .map_or(0, |t| t.samplers.len()),
             images = prepared
                 .as_ref()
                 .and_then(|p| p.storage_images.as_ref())
                 .map_or(0, |i| i.images.len()),
             "compute dispatch submitting"
         );
+        let deferred = !crate::diagnostics::gpu_env().no_defer_compute
+            && prepared.as_ref().is_some_and(|binding| {
+                let storage_ok = binding
+                    .storage_buffers
+                    .as_ref()
+                    .is_none_or(|storage| storage.guest_bases.iter().all(|&base| base != 0));
+                let images_ok = binding
+                    .storage_images
+                    .as_ref()
+                    .is_none_or(|images| images.images.iter().all(|image| image.guest_base != 0));
+                let has_guest_resource = binding
+                    .storage_buffers
+                    .as_ref()
+                    .is_some_and(|storage| !storage.buffers.is_empty())
+                    || binding
+                        .storage_images
+                        .as_ref()
+                        .is_some_and(|images| !images.images.is_empty());
+                storage_ok && images_ok && has_guest_resource
+            });
+        drop(prepare_timer);
+        let backend_timer = crate::vulkan::offscreen::StageTimer::start(
+            &crate::vulkan::offscreen::DRAW_STAGE_CS_BACKEND_NS,
+        );
+        if deferred {
+            dispatch_compute_deferred(
+                self.dev,
+                &ComputeState {
+                    groups,
+                    spirv: &translated.spirv,
+                    binding: prepared.as_ref(),
+                },
+            )
+            .map_err(|error| err(format!("deferred Vulkan compute dispatch failed: {error}")))?;
+            self.queued_compute = true;
+            self.dispatches += 1;
+            return Ok(());
+        }
+        let dispatch_at = crate::diagnostics::gpu_env()
+            .time_compute
+            .then(std::time::Instant::now);
         let outputs = dispatch_compute(
             self.dev,
             &ComputeState {
@@ -3401,6 +4120,26 @@ impl DrawSink for OffscreenDrawSink<'_> {
             },
         )
         .map_err(|error| err(format!("Vulkan compute dispatch failed: {error}")))?;
+        drop(backend_timer);
+        if let Some(dispatch_at) = dispatch_at {
+            let elapsed = dispatch_at.elapsed();
+            if elapsed >= std::time::Duration::from_millis(10) {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static SLOW: AtomicU64 = AtomicU64::new(0);
+                let n = SLOW.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 16 || n.is_power_of_two() {
+                    tracing::warn!(
+                        slow_dispatch = n,
+                        cs_addr = format_args!("{:#x}", cs.cs_regs.data_addr),
+                        groups = format_args!("{}x{}x{}", groups[0], groups[1], groups[2]),
+                        elapsed_us = elapsed.as_micros(),
+                        guest_outputs = ?guest_outputs,
+                        guest_image_outputs = ?guest_image_outputs,
+                        "TIME_COMPUTE: slow guest resource identity"
+                    );
+                }
+            }
+        }
         if outputs.buffers.len() != guest_outputs.len() {
             return Err(err(format!(
                 "compute writeback returned {} buffers for {} guest outputs",
@@ -3415,7 +4154,11 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 guest_image_outputs.len()
             )));
         }
-        for ((addr, real_len), bytes) in guest_outputs.into_iter().zip(outputs.buffers) {
+        // The Vulkan dispatch is fence-complete and all output identities were
+        // copied above. Release binding Arcs before folding sparse deltas into
+        // the submission cache so `Arc::make_mut` stays allocation-free.
+        drop(prepared);
+        for ((addr, real_len), output) in guest_outputs.into_iter().zip(outputs.buffers) {
             // A null V# (base 0 or zero size) was bound as a zero dummy;
             // hardware drops its writes (RDNA OOB semantics), so skip the
             // writeback explicitly — `write_bytes_checked` would refuse
@@ -3427,30 +4170,62 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 );
                 continue;
             }
-            // Truncate off the dword-alignment pad (see `guest_outputs`).
-            let bytes = &bytes[..bytes.len().min(real_len)];
+            // Keep the submission snapshot authoritative for the next
+            // dispatch that binds this guest allocation. `Arc::make_mut`
+            // copies only if an earlier binding still holds a live reference;
+            // the synchronous dispatch returned before this point, so in the
+            // steady path the snapshot is uniquely owned by the cache.
+            if let Some(snapshot) = self.compute_storage_snapshots.get_mut(&(addr, output.size)) {
+                let snapshot = Arc::make_mut(snapshot);
+                for span in &output.dirty {
+                    let end = span
+                        .offset
+                        .saturating_add(span.bytes.len())
+                        .min(snapshot.len());
+                    if span.offset < end {
+                        snapshot[span.offset..end]
+                            .copy_from_slice(&span.bytes[..end - span.offset]);
+                    }
+                }
+            }
+            let dirty_bytes: usize = output
+                .dirty
+                .iter()
+                .map(|span| span.bytes.len().min(real_len.saturating_sub(span.offset)))
+                .sum();
             debug!(
                 addr = format_args!("{addr:#x}"),
-                len = bytes.len(),
-                head = format_args!("{:02x?}", &bytes[..bytes.len().min(16)]),
-                "compute storage writeback"
+                real_len,
+                dirty_spans = output.dirty.len(),
+                dirty_bytes,
+                "compute sparse storage writeback"
             );
-            if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
-                let nonzero = bytes.iter().any(|&b| b != 0);
+            if crate::diagnostics::gpu_env().trace_draws {
                 tracing::warn!(
                     addr = format_args!("{addr:#x}"),
-                    len = bytes.len(),
-                    nonzero,
-                    head = format_args!("{:02x?}", &bytes[..bytes.len().min(32)]),
-                    "TRACE_DRAWS: compute writeback"
+                    real_len,
+                    dirty_spans = output.dirty.len(),
+                    dirty_bytes,
+                    "TRACE_DRAWS: sparse compute writeback"
                 );
             }
-            crate::guest_mem::trace_scanout_fill(addr, bytes.len(), "compute-storage");
-            if !crate::guest_mem::write_bytes_checked(addr, bytes) {
-                return Err(err(format!(
-                    "compute storage writeback range {addr:#x}..{:#x} is not writable guest memory",
-                    addr.saturating_add(bytes.len() as u64)
-                )));
+            for span in output.dirty {
+                if span.offset >= real_len {
+                    continue;
+                }
+                // Truncate the final dirty page at the V#'s real byte length,
+                // excluding Vulkan's dword-alignment pad.
+                let bytes =
+                    &span.bytes[..span.bytes.len().min(real_len.saturating_sub(span.offset))];
+                let span_addr = addr.saturating_add(span.offset as u64);
+                crate::guest_mem::trace_scanout_fill(span_addr, bytes.len(), "compute-storage");
+                if !crate::guest_mem::write_bytes_checked(span_addr, bytes) {
+                    return Err(err(format!(
+                        "compute storage writeback range {span_addr:#x}..{:#x} is not writable \
+                         guest memory",
+                        span_addr.saturating_add(bytes.len() as u64)
+                    )));
+                }
             }
         }
         for ((addr, img_w, img_h, img_depth, img_layers, tile_mode, img_format), bytes) in
@@ -3463,7 +4238,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 nonzero,
                 "compute storage-image writeback"
             );
-            if std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
+            if crate::diagnostics::gpu_env().trace_draws {
                 tracing::warn!(
                     addr = format_args!("{addr:#x}"),
                     len = bytes.len(),
@@ -3471,16 +4246,18 @@ impl DrawSink for OffscreenDrawSink<'_> {
                     "TRACE_DRAWS: compute image writeback"
                 );
             }
-            crate::guest_mem::trace_scanout_fill(addr, bytes.len(), "compute-image");
             // Promote a content-bearing 8-bit UAV writeback into the present
-            // census: ASTRO-class titles compose their scene with compute
+            // census only when it matches a known scanout address/size:
+            // ASTRO-class titles compose their scene with compute
             // dispatches into guest memory — never a GPU render pass we capture
             // — so without this the frame the census elects is always some flat
             // cleared draw target and the real pixels stay invisible. Only
             // R8G8B8A8 is promoted (already the Shell's RGBA byte order); HDR
             // (R16F) intermediates are left to the draw/scanout paths. Keyed by
             // guest base so a re-dispatch to the same UAV replaces in place.
-            if nonzero {
+            // Square texture atlases and mip targets stay GPU-resident but are
+            // never allowed to replace the displayed frame.
+            if nonzero && crate::guest_mem::is_scanout_candidate(addr, bytes.len()) {
                 // R8G8B8A8 is already the Shell's RGBA byte order; the HDR
                 // R16G16B16A16_SFLOAT scene/composite buffers are sRGB-encoded to
                 // RGBA8 by `to_presentable` at present time (bytes_per_pixel == 8
@@ -3496,12 +4273,12 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 if bpp != 0 && want > 0 && want <= (128 << 20) && bytes.len() >= want {
                     self.framebuffers.insert(
                         addr,
-                        RenderedImage {
+                        Arc::new(RenderedImage {
                             width: img_w,
                             height: img_h,
                             pixels: bytes[..want].to_vec(),
                             bytes_per_pixel: bpp as u32,
-                        },
+                        }),
                     );
                 }
             }
@@ -3513,13 +4290,10 @@ impl DrawSink for OffscreenDrawSink<'_> {
             let guest_bytes = encode_storage_image_writeback(
                 img_w, img_h, img_depth, img_layers, tile_mode, texel, &bytes,
             )?;
-            if !crate::guest_mem::write_bytes_checked(addr, &guest_bytes) {
-                return Err(err(format!(
-                    "compute storage-image writeback range {addr:#x}..{:#x} is not writable \
-                     guest memory",
-                    addr.saturating_add(guest_bytes.len() as u64)
-                )));
-            }
+            // A storage image can be GPU-only. The content-bearing result was
+            // retained above for later sampling/presentation, so an unavailable
+            // CPU guest mirror must not discard the dispatch.
+            crate::guest_mem::mirror_compute_image_to_guest(addr, &guest_bytes, "compute-image");
         }
         self.dispatches += 1;
         Ok(())
@@ -3752,6 +4526,17 @@ mod tests {
         );
     }
 
+    /// An empty index buffer addresses no record; sizing falls back to the
+    /// draw's vertex count rather than refusing the draw outright.
+    #[test]
+    fn empty_index_buffer_falls_back_to_the_vertex_count() {
+        assert_eq!(
+            required_vertex_records(Some((&[], vk::IndexType::UINT16)), 6)
+                .expect("an empty index buffer is not a refusal"),
+            6
+        );
+    }
+
     /// 8-bit indices are widened to 16-bit — Vulkan has no guaranteed UINT8.
     #[test]
     fn fetch_index_buffer_widens_8bit_to_16bit() {
@@ -3882,11 +4667,33 @@ mod tests {
     fn zero_target_mask_is_a_colorless_draw_policy_not_a_broken_dcb() {
         let mut ctx = ctx_96x48();
         ctx.render_target_mask = 0;
+        ctx.depth_control.z_enable = true;
+        ctx.depth_control.z_write_enable = true;
+        ctx.depth_control.zfunc = vk::CompareOp::LESS.as_raw() as u8;
+        ctx.depth_render_target.z_write_base_addr = 0x2_0000;
+        ctx.depth_render_target.z_info.format = 3;
+        ctx.depth_render_target.stencil_info.format = 1;
+        ctx.depth_render_target.size.x_max = 95;
+        ctx.depth_render_target.size.y_max = 47;
         assert!(color_output_disabled(&ctx));
-        assert!(
-            draw_state_from_regs(&ctx, &ucfg_rect(), 3, SPIRV, SPIRV).is_err(),
-            "the colour renderer must still reject it if called directly"
+        let state = draw_state_from_regs(&ctx, &ucfg_rect(), 3, SPIRV, SPIRV)
+            .expect("depth-only draw reaches the wired depth backend");
+        assert!(!state.color_output);
+        assert_eq!((state.width, state.height), (96, 48));
+        assert!(state.color_write_mask.is_empty());
+        assert_eq!(
+            state.depth.expect("depth state").target_base,
+            Some(0x2_0000)
         );
+    }
+
+    #[test]
+    fn zero_target_mask_without_depth_or_stencil_is_a_named_no_output_error() {
+        let mut ctx = ctx_96x48();
+        ctx.render_target_mask = 0;
+        let error = draw_state_from_regs(&ctx, &ucfg_rect(), 3, SPIRV, SPIRV)
+            .expect_err("no attachment can receive the draw");
+        assert!(error.0.contains("neither colour nor depth/stencil"));
     }
 
     /// A zero viewport rasterizes nothing and reports no error anywhere in
@@ -4030,6 +4837,23 @@ mod tests {
         assert!(vulkan_format(0xb, 0, 0).is_err());
     }
 
+    #[test]
+    fn minecraft_skin_sampler_preserves_point_and_clamp_last_texel() {
+        // Captured from Minecraft's live 64x64 player-skin draw. Clamp mode 2
+        // is CLAMP_LAST_TEXEL on every axis; the old host path discarded it
+        // and always created REPEAT samplers.
+        let guest = ShaderSamplerResource {
+            fields: [1682, 16_773_120, 100_663_296, 1_073_741_824],
+        };
+        let host = sampler_state(&guest);
+        assert_eq!(host.mag_filter, vk::Filter::NEAREST);
+        assert_eq!(host.min_filter, vk::Filter::NEAREST);
+        assert_eq!(host.mipmap_mode, vk::SamplerMipmapMode::NEAREST);
+        assert_eq!(host.address_mode_u, vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        assert_eq!(host.address_mode_v, vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        assert_eq!(host.address_mode_w, vk::SamplerAddressMode::CLAMP_TO_EDGE);
+    }
+
     #[cfg(windows)]
     #[test]
     // Nested array/struct field setup (`vs.resources[0].fields[3]`, `vs.buffers[0]`)
@@ -4098,13 +4922,18 @@ mod tests {
         let storage = binding.storage_buffers.expect("descriptor set");
         assert_eq!(storage.binding, 0);
         assert_eq!(
+            storage.writable,
+            vec![false],
+            "an unspecified/read-only V# is an input, not a guest writeback"
+        );
+        assert_eq!(
             storage.buffers,
-            vec![
+            vec![Arc::new(
                 storage_words
                     .iter()
                     .flat_map(|w| w.to_le_bytes())
                     .collect::<Vec<_>>()
-            ]
+            )]
         );
         assert_eq!(binding.push_constants.len(), 16);
         assert_eq!(&binding.push_constants[0..4], &[0, 0, 0, 0]);
@@ -4140,6 +4969,41 @@ mod tests {
         })
         .expect("four-record UI quad");
         assert_eq!(buffers[0].bytes.len(), 80);
+    }
+
+    /// A primitive-restart sentinel (`0xFFFF`) is walked as a REAL index — this
+    /// pipeline never enables restart — so sizing by it yields 65536 records.
+    /// That must CLAMP to what the V# exposes, not refuse: refusing dropped the
+    /// whole draw and silently erased every restart-using primitive.
+    #[cfg(windows)]
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn over_range_index_clamps_the_upload_instead_of_refusing_the_draw() {
+        let guest = [0x5au8; 160];
+        let base = guest.as_ptr() as u64;
+        let mut vs = ShaderVertexInputInfo::default();
+        vs.resources_num = 1;
+        vs.buffers_num = 1;
+        vs.resources[0].update_address48(base);
+        vs.resources[0].fields[1] |= 20 << 16;
+        vs.resources[0].fields[2] = 8;
+        vs.resources[0].fields[3] = 71 << 12;
+        vs.buffers[0].addr = base;
+        vs.buffers[0].stride = 20;
+        vs.buffers[0].num_records = 8;
+        vs.buffers[0].attr_num = 1;
+        vs.buffers[0].attr_indices[0] = 0;
+
+        let ranges = [(base, guest.len())];
+        let (buffers, _) = crate::guest_mem::with_test_ranges(&ranges, || {
+            prepare_vertex_inputs_limited(&vs, Some(65536))
+        })
+        .expect("an over-range index clamps rather than refusing the draw");
+        assert_eq!(
+            buffers[0].bytes.len(),
+            160,
+            "clamped to the V#'s 8 records x 20-byte stride"
+        );
     }
 
     /// ASTRO.BOT's measured HDR composite interleaves a float4 at offset 0 and
@@ -4318,7 +5182,7 @@ mod tests {
         assert_eq!(storage.images[0].width, W);
         assert_eq!(storage.images[0].height, H);
         assert_eq!(storage.images[0].guest_base, base + 256);
-        assert_eq!(storage.images[0].pixels, uav);
+        assert_eq!(storage.images[0].pixels.as_ref(), &uav);
 
         // Push constants: 3 x 32 bytes in desc[] order; dword 0 of each is
         // the PER-ARRAY index — sampled 0, storage 0, sampled 1.
@@ -4730,7 +5594,7 @@ mod tests {
         let upload = read_storage_image(&t).expect("zero-filled storage image");
         assert_eq!((upload.width, upload.height), (4, 4));
         assert_eq!(upload.guest_base, 0x10000);
-        assert_eq!(upload.pixels, vec![0u8; 64]);
+        assert_eq!(upload.pixels.as_ref(), &vec![0u8; 64]);
     }
 
     /// The classic alpha-over blend: SRC_ALPHA / ONE_MINUS_SRC_ALPHA / ADD.
@@ -4819,14 +5683,11 @@ mod tests {
             vk::Format::R16G16B16A16_SFLOAT
         );
         assert_eq!(gen5_vertex_format(23).unwrap(), vk::Format::R16G16_UNORM);
-        // 11 → (2,4) = 16 UINT (Minecraft's packed per-vertex value).
-        // Format 11 is a 16-bit INTEGER on hardware, but every vertex input we
-        // generate is declared float, and Vulkan requires the numeric types to
-        // match. USCALED delivers the same value as a float; UINT makes the
-        // pipeline invalid and the draw silently contributes no fragment
-        // (measured on Minecraft via the validation layer).
-        assert_eq!(gen5_vertex_format(11).unwrap(), vk::Format::R16_USCALED);
-        for f in [64u8, 74, 77, 56, 57, 71, 23, 11] {
+        // 11 → (2,4) = 16 UINT (Minecraft's packed bone index). Its shader
+        // input is declared uint by kyty-graphics and bitcast into the
+        // float-backed guest VGPR, preserving the raw integer value.
+        assert_eq!(gen5_vertex_format(11).unwrap(), vk::Format::R16_UINT);
+        for f in [64u8, 74, 77, 56, 57, 71, 23] {
             let vf = gen5_vertex_format(f).unwrap();
             assert!(
                 !format!("{vf:?}").contains("UINT") && !format!("{vf:?}").contains("SINT"),
@@ -4902,6 +5763,44 @@ mod tests {
         t.fields[3] = 15 << 28;
         let tex = decode_texture(&t).expect("base-0 dummy is type-agnostic");
         assert_eq!((tex.width, tex.height), (1, 1));
+    }
+
+    #[test]
+    fn sampled_render_target_matches_the_scaled_live_extent() {
+        let format = vk::Format::R8G8B8A8_UNORM.as_raw();
+        let live = [
+            (0x31c0_0000, 960, 540, format),
+            (
+                0x31c0_0000,
+                960,
+                540,
+                vk::Format::R16G16B16A16_SFLOAT.as_raw(),
+            ),
+            (0x9999_0000, 960, 540, format),
+        ];
+        assert_eq!(
+            matching_live_target(&live, 0x31c0_0000, 1920, 1080, format, 0.5),
+            Some((960, 540)),
+            "a native T# must bind the resolution-scaled persistent target"
+        );
+        assert_eq!(
+            matching_live_target(&live, 0x31c0_0000, 1920, 1080, format, 1.0),
+            None,
+            "a mismatched extent is not an alias when scaling is disabled"
+        );
+    }
+
+    #[test]
+    fn sampled_render_target_prefers_an_exact_extent() {
+        let format = vk::Format::R8G8B8A8_UNORM.as_raw();
+        let live = [
+            (0x31c0_0000, 960, 540, format),
+            (0x31c0_0000, 1920, 1080, format),
+        ];
+        assert_eq!(
+            matching_live_target(&live, 0x31c0_0000, 1920, 1080, format, 0.5),
+            Some((1920, 1080))
+        );
     }
 
     fn replacement_candidate(cube: bool, array: bool, layers: u32, depth: u32) -> TextureUpload {
@@ -5029,10 +5928,11 @@ mod tests {
         );
     }
 
-    /// A cube T# (type 11, six faces, SWIZZLE_MODE 9 = SW_64KB_S — the
-    /// measured skybox shape) decodes every face and marks the upload CUBE.
+    /// A guest cube T# (type 11, six faces, SWIZZLE_MODE 9 = SW_64KB_S)
+    /// decodes every face and exposes the guest-computed `(s,t,face)` through
+    /// a six-layer 2D-array upload.
     #[test]
-    fn decode_texture_cube_decodes_all_six_faces() {
+    fn decode_guest_cube_as_six_layer_2d_array() {
         let (w, h, bpp_log2) = (8u32, 8u32, 2u32);
         let bpp = 1usize << bpp_log2;
         // Six faces with distinct first-byte-per-face content.
@@ -5066,7 +5966,8 @@ mod tests {
             decode_texture(&t)
         })
         .expect("cube texture decodes");
-        assert!(tex.cube);
+        assert!(!tex.cube);
+        assert!(tex.array);
         assert_eq!(tex.layers, 6);
         assert_eq!((tex.width, tex.height), (w, h));
         let face_bytes = (w * h) as usize * bpp;
@@ -5156,12 +6057,12 @@ mod tests {
                 "array flag for type {ty}"
             );
         }
-        // Exactly type 13 is arrayed; nothing else is (8/9 = 2D, 10 = 3D volume,
-        // 11 = cube). The array flag is TYPE-driven, so a 2DArray with a single
-        // layer (depth 0) still binds TYPE_2D_ARRAY, matching Arrayed = 1.
+        // Guest cube type 11 and explicit array type 13 are both arrayed.
+        // The array flag is TYPE-driven, so a single-layer descriptor still
+        // binds TYPE_2D_ARRAY, matching SPIR-V Arrayed = 1.
         assert_eq!(texture_view_kind(13).unwrap(), (false, false, true));
         assert_eq!(texture_view_kind(9).unwrap(), (false, false, false));
-        assert_eq!(texture_view_kind(11).unwrap(), (true, false, false));
+        assert_eq!(texture_view_kind(11).unwrap(), (false, false, true));
         assert_eq!(texture_view_kind(10).unwrap(), (false, true, false));
         // 12/14/15 never reach decode (analysis rewrites/replaces them); an
         // unhandled nibble stays a named refusal rather than a silent 2D guess.
@@ -5216,8 +6117,8 @@ mod tests {
         assert_eq!(upload.layers, layer_count);
         assert_eq!(upload.depth, 1);
         assert_eq!(
-            upload.pixels,
-            layers.into_iter().flatten().collect::<Vec<_>>(),
+            upload.pixels.as_ref(),
+            &layers.into_iter().flatten().collect::<Vec<_>>(),
             "all guest layers detile to tightly-packed host rows"
         );
 
@@ -5276,7 +6177,7 @@ mod tests {
             })
             .expect("selected array layer detiles");
         assert_eq!(upload.layers, 1);
-        assert_eq!(upload.pixels, layers[2]);
+        assert_eq!(upload.pixels.as_ref(), &layers[2]);
         assert_eq!(
             upload.guest_base,
             allocation_base + (2 * tiled_layers[0].len()) as u64,
@@ -5327,7 +6228,11 @@ mod tests {
         assert_eq!((upload.width, upload.height, upload.depth), (w, h, d));
         assert_eq!(upload.format, vk::Format::R16G16B16A16_SFLOAT);
         assert_eq!(upload.texel_bytes(), 8);
-        assert_eq!(upload.pixels, bytes, "the whole volume seeds the upload");
+        assert_eq!(
+            upload.pixels.as_ref(),
+            &bytes,
+            "the whole volume seeds the upload"
+        );
     }
 
     /// Live ASTRO.BOT UAV descriptor: type 8 is a 1D image represented by a
@@ -5353,7 +6258,7 @@ mod tests {
         assert_eq!((upload.width, upload.height, upload.depth), (1, 1, 1));
         assert_eq!(upload.format, vk::Format::R32G32B32A32_SFLOAT);
         assert_eq!(upload.texel_bytes(), 16);
-        assert_eq!(upload.pixels, bytes);
+        assert_eq!(upload.pixels.as_ref(), &bytes);
         assert_eq!(expected_storage_image_bytes(&t), 16);
     }
 

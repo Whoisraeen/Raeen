@@ -924,6 +924,13 @@ fn main() -> anyhow::Result<()> {
         // volume remain authoritative in both launch modes.
         let runner_config =
             raeen_core::config::EmulatorConfig::load(std::path::Path::new("config.toml"))?;
+        raeen_gpu::AgcGpuSession::set_runtime_config(
+            runner_config.graphics.validation_layers,
+            runner_config.graphics.resolution_scale,
+            runner_config.graphics.gpu_device_index,
+            runner_config.graphics.shader_cache,
+            runner_config.paths.shader_cache_dir.clone(),
+        );
         raeen_audio::output::set_volume(runner_config.audio.volume);
         raeen_audio::output::set_enabled(runner_config.audio.enabled);
         raeen_audio::output::init();
@@ -938,9 +945,11 @@ fn main() -> anyhow::Result<()> {
         let mut registry = raeen_firmware::ModuleRegistry::new(db);
         let kernel = std::sync::Arc::new(raeen_kernel::OrbisKernel::new());
         // The isolated runner cannot borrow the Shell's in-process kernel.
-        // Keep physical controller input live by polling the native XInput /
-        // DualSense readers inside the child and publishing their snapshots
-        // directly to this process-scoped kernel.
+        // Read the Shell's merged native/gilrs/keyboard state from the
+        // bidirectional frame mapping. This avoids opening a second raw-HID
+        // reader in the child, which can consume DualSense reports before the
+        // Shell sees them. A child-native reader remains the fallback for
+        // direct runner launches without the Shell bridge.
         if std::env::var_os("RAEEN_RUNNER_CHILD").is_some() {
             let input_kernel = std::sync::Arc::clone(&kernel);
             let input_script = std::env::var("RAEEN_INPUT_SCRIPT")
@@ -951,7 +960,10 @@ fn main() -> anyhow::Result<()> {
             std::thread::Builder::new()
                 .name("raeen-runner-input".to_string())
                 .spawn(move || {
-                    let pads = raeen_input::NativeGamepads::start();
+                    let shared_input = raeen_gpu::frame_ipc::FrameIpcInputReader::open_from_env();
+                    let pads = shared_input
+                        .is_none()
+                        .then(raeen_input::NativeGamepads::start);
                     let started = std::time::Instant::now();
                     if let Some(script) = input_script.as_ref() {
                         tracing::info!(
@@ -959,25 +971,40 @@ fn main() -> anyhow::Result<()> {
                             "runner enabled deterministic controller input replay"
                         );
                     }
-                    let mut last_scripted_buttons = None;
+                    let mut last_buttons = None;
                     loop {
-                        let native = pads.poll().unwrap_or_default();
-                        let (state, scripted) = input_script
+                        let scripted = input_script
                             .as_ref()
-                            .and_then(|script| script.state_at(started.elapsed()))
-                            .map_or((native, false), |state| (state, true));
-                        let encoded = state.to_orbis_pad_data();
-                        if scripted {
-                            let buttons =
-                                u32::from_le_bytes(encoded[0..4].try_into().expect("pad prefix"));
-                            if last_scripted_buttons != Some(buttons) {
-                                tracing::info!(
-                                    elapsed_ms = started.elapsed().as_millis(),
-                                    buttons = format_args!("{buttons:#010x}"),
-                                    "runner applied scripted controller state"
-                                );
-                                last_scripted_buttons = Some(buttons);
-                            }
+                            .and_then(|script| script.state_at(started.elapsed()));
+                        let is_scripted = scripted.is_some();
+                        let encoded = if let Some(state) = scripted {
+                            state.to_orbis_pad_data()
+                        } else if let Some(state) =
+                            shared_input.as_ref().and_then(|input| input.latest())
+                        {
+                            state
+                        } else {
+                            pads.as_ref()
+                                .and_then(raeen_input::NativeGamepads::poll)
+                                .unwrap_or_default()
+                                .to_orbis_pad_data()
+                        };
+                        let buttons =
+                            u32::from_le_bytes(encoded[0..4].try_into().expect("pad prefix"));
+                        if last_buttons != Some(buttons) {
+                            tracing::info!(
+                                elapsed_ms = started.elapsed().as_millis(),
+                                buttons = format_args!("{buttons:#010x}"),
+                                source = if is_scripted {
+                                    "script"
+                                } else if shared_input.is_some() {
+                                    "shell-ipc"
+                                } else {
+                                    "child-native"
+                                },
+                                "runner applied controller state"
+                            );
+                            last_buttons = Some(buttons);
                         }
                         input_kernel.set_pad_state(encoded);
                         std::thread::sleep(std::time::Duration::from_millis(4));
@@ -1001,6 +1028,21 @@ fn main() -> anyhow::Result<()> {
         let savedata_dir = std::path::Path::new("savedata").join(title_dir);
         for writable_dir in [&temp_dir, &download_dir, &savedata_dir] {
             std::fs::create_dir_all(writable_dir)?;
+        }
+        // Bedrock writes this zero-byte marker while global resource packs are
+        // being initialized. A killed isolated runner cannot execute the
+        // title's normal unlink, so the next boot interprets the orphan as a
+        // prior resource crash and raises "Global Resources Reset" even though
+        // every packaged asset is present. There is no payload to preserve:
+        // recover only this exact empty session marker, only while no prior
+        // title process is alive (we are inside the newly-created runner).
+        let recovered_locks = recover_stale_resource_init_locks(&savedata_dir)?;
+        if recovered_locks > 0 {
+            info!(
+                recovered_locks,
+                root = %savedata_dir.display(),
+                "recovered stale global-resource initialization marker(s)"
+            );
         }
         kernel.filesystem.set_temp_directory(&temp_dir);
         kernel.filesystem.set_download_directory(&download_dir);
@@ -1390,9 +1432,13 @@ fn main() -> anyhow::Result<()> {
                     }
                     boot.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));
                     steady.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));
+                    // Full list, not a top-N: the poll being hunted can be a
+                    // per-frame call (40 Hz x 80 s ~ 3200) that a top-40 cut
+                    // hides below allocator/timing noise, and the decisive
+                    // signal is often a function present in STEADY but absent
+                    // from BOOT (it started with a screen transition).
                     let render = |v: &[(u64, String)]| {
                         v.iter()
-                            .take(40)
                             .map(|(n, f)| format!("  {n:>9}  {f}"))
                             .collect::<Vec<_>>()
                             .join("\n")
@@ -1497,6 +1543,8 @@ fn main() -> anyhow::Result<()> {
         config.graphics.validation_layers,
         config.graphics.resolution_scale,
         config.graphics.gpu_device_index,
+        config.graphics.shader_cache,
+        config.paths.shader_cache_dir.clone(),
     );
     // Register the BYO upscaler plugin's backends (DLSS/FSR/XeSS + spatial), if
     // this build opted into it, BEFORE applying the saved selection so a
@@ -1590,4 +1638,58 @@ fn main() -> anyhow::Result<()> {
 
     info!("Raeen shutting down");
     Ok(())
+}
+
+fn recover_stale_resource_init_locks(root: &std::path::Path) -> std::io::Result<usize> {
+    let mut directories = vec![root.to_path_buf()];
+    if root.exists() {
+        for entry in std::fs::read_dir(root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                directories.push(entry.path());
+            }
+        }
+    }
+    let mut recovered = 0;
+    for directory in directories {
+        let marker = directory.join("resource_init_lock");
+        match std::fs::metadata(&marker) {
+            Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {
+                std::fs::remove_file(&marker)?;
+                recovered += 1;
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    path = %marker.display(),
+                    "resource initialization marker contains data; preserving it"
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(recovered)
+}
+
+#[cfg(test)]
+mod resource_recovery_tests {
+    use super::recover_stale_resource_init_locks;
+
+    #[test]
+    fn empty_session_marker_is_removed_but_nonempty_data_is_preserved() {
+        let root =
+            std::env::temp_dir().join(format!("raeen-resource-lock-test-{}", std::process::id()));
+        let slot = root.join("BedrockUserSettingsStorage");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&slot).expect("slot");
+        let stale = slot.join("resource_init_lock");
+        std::fs::write(&stale, []).expect("empty marker");
+        assert_eq!(recover_stale_resource_init_locks(&root).unwrap(), 1);
+        assert!(!stale.exists());
+
+        std::fs::write(&stale, b"payload").expect("nonempty marker");
+        assert_eq!(recover_stale_resource_init_locks(&root).unwrap(), 0);
+        assert_eq!(std::fs::read(&stale).unwrap(), b"payload");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

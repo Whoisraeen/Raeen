@@ -2103,8 +2103,13 @@ pub fn shader_push_constant_spill_binding(bind: &ShaderBindResources) -> Option<
 
 /// The single `OpTypeImage` Dim of the sampled-texture array
 /// (`%textures2D_S`), decided from the measured T# types: 9 (and the
-/// height-1 "1D" 8) = 2D, 10 = 3D volume, 11 = Cube, 13 = 2DArray
-/// (Dim 2D with `arrayed = 1` — ASTRO.BOT's 1536x1536x3 array). Storage
+/// height-1 "1D" 8) = 2D, 10 = 3D volume, and 11/13 = 2DArray.
+/// A GCN cube sample is already lowered by the guest's
+/// `V_CUBE{SC,TC,MA,ID}` sequence into `(s, t, face)`, so type 11 must remain
+/// a six-layer 2D array in SPIR-V. Declaring it `Dim Cube` makes Vulkan
+/// reinterpret `(s,t,face)` as a direction and produces radial face smearing.
+/// Both cases use Dim 2D with `arrayed = 1` (including ASTRO.BOT's
+/// 1536x1536x3 arrays). Storage
 /// (read-write) descriptors are excluded — `%textures2D_L` is its own 2D
 /// array.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -2116,6 +2121,21 @@ pub enum SampledDim {
 }
 
 impl SampledDim {
+    /// Result type of `OpImageQuerySizeLod` for this dim.
+    ///
+    /// The query returns one component per addressable dimension, plus one for
+    /// an array layer: 2D is `%v2int`, 2DArray and 3D are `%v3int` (the third
+    /// component being the layer count or the depth), and a non-arrayed Cube is
+    /// `%v2int`. Getting this wrong is not cosmetic — SPIR-V fixes the result
+    /// width, so a `%v2int` query against a 3D image is an invalid module the
+    /// validator rejects and the driver may fault on.
+    pub(crate) const fn query_size_type(self) -> &'static str {
+        match self {
+            Self::Two | Self::Cube => "%v2int",
+            Self::TwoArray | Self::Three => "%v3int",
+        }
+    }
+
     /// SPIR-V `Dim` token and the sample-coordinate component count.
     pub(crate) const fn dim_str(self) -> &'static str {
         match self {
@@ -2158,14 +2178,15 @@ impl SampledDim {
     }
 
     /// The Dim of a single measured T# `type_()` (9/8 = 2D, 10 = 3D,
-    /// 11 = Cube, 13 = 2DArray). The shared classifier used by
+    /// 11/13 = 2DArray). Type 11 is a guest cube descriptor, but its image
+    /// instructions consume the `(s,t,face)` result of `V_CUBE*`, not a raw
+    /// direction vector. The shared classifier used by
     /// `sampled_keys_present`, the per-descriptor sample-site router, and the
     /// host so all three agree on which array a T# belongs to.
     pub const fn from_texture_type(ty: u8) -> Self {
         match ty {
             10 => Self::Three,
-            11 => Self::Cube,
-            13 => Self::TwoArray,
+            11 | 13 => Self::TwoArray,
             _ => Self::Two,
         }
     }
@@ -3247,7 +3268,14 @@ impl<'a> Spirv<'a> {
                     if info.ps_pos_xy {
                         vars.push("%gl_FragCoord".to_string());
                     }
-                    if info.ps_early_z {
+                    // Vulkan's EarlyFragmentTests makes depth/stencil writes
+                    // happen before the fragment shader and they are not
+                    // undone by OpKill. PS5 shaders with KILL_ENABLE rely on
+                    // transparent fragments not occluding later/base geometry
+                    // (Minecraft's expanded skin overlays are a measured
+                    // example), so let Vulkan perform its normal late-write
+                    // scheduling whenever the shader can discard.
+                    if info.ps_early_z && !info.ps_pixel_kill_enable {
                         execution_modes
                             .push("OpExecutionMode %main EarlyFragmentTests\n".to_string());
                     }
@@ -3555,6 +3583,7 @@ impl<'a> Spirv<'a> {
                        %v3uint = OpTypeVector %uint 3
                        %v4uint = OpTypeVector %uint 4
                         %v2int = OpTypeVector %int 2
+                        %v3int = OpTypeVector %int 3
                         %v4int = OpTypeVector %int 4
                  %undef_v2uint = OpUndef %v2uint
                %_ptr_Input_int = OpTypePointer Input %int
@@ -3939,20 +3968,27 @@ impl<'a> Spirv<'a> {
             ShaderType::Vertex => {
                 if let Some(info) = self.vs_input_info {
                     for i in 0..info.resources_num as usize {
-                        match info.resources_dst[i].registers_num {
-                            1 => {
+                        let raw_uint = info.resources[i].format() == 11;
+                        match (info.resources_dst[i].registers_num, raw_uint) {
+                            (1, true) => {
+                                vars.push(format!("%attr{i} = OpVariable %_ptr_Input_uint Input"))
+                            }
+                            (1, false) => {
                                 vars.push(format!("%attr{i} = OpVariable %_ptr_Input_float Input"))
                             }
-                            2 => vars
+                            (2, false) => vars
                                 .push(format!("%attr{i} = OpVariable %_ptr_Input_v2float Input")),
-                            3 => vars
+                            (3, false) => vars
                                 .push(format!("%attr{i} = OpVariable %_ptr_Input_v3float Input")),
-                            4 => vars
+                            (4, false) => vars
                                 .push(format!("%attr{i} = OpVariable %_ptr_Input_v4float Input")),
-                            n => {
+                            (n, _) => {
                                 return Err(not_supported(
                                     "Spirv::WriteGlobalVariables",
-                                    format!("invalid registers_num: {n}"),
+                                    format!(
+                                        "invalid registers_num/input format: {n}/{}",
+                                        info.resources[i].format()
+                                    ),
                                 ));
                             }
                         }
@@ -5390,6 +5426,29 @@ mod tests {
         assert!(
             source.contains("OpStore %out_point_size %float_1_000000"),
             "vertex shaders must use a valid default point size:\n{source}"
+        );
+    }
+
+    #[test]
+    fn kill_capable_pixel_shader_does_not_force_early_depth_writes() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        let mut info = ShaderPixelInputInfo {
+            ps_early_z: true,
+            ps_pixel_kill_enable: true,
+            ..Default::default()
+        };
+        let source = spirv_generate_source(&code, None, Some(&info), None).unwrap();
+        assert!(
+            !source.contains("EarlyFragmentTests"),
+            "discarded fragments must not commit early depth/stencil writes:\n{source}"
+        );
+
+        info.ps_pixel_kill_enable = false;
+        let source = spirv_generate_source(&code, None, Some(&info), None).unwrap();
+        assert!(
+            source.contains("OpExecutionMode %main EarlyFragmentTests"),
+            "a non-discarding early-Z shader should preserve the guest mode:\n{source}"
         );
     }
 

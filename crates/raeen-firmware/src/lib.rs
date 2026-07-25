@@ -186,6 +186,33 @@ fn align_up_16k(v: u64) -> u64 {
 /// alone exports 99.4% of the eboot's import relocations.
 const DEPENDENCY_SUBDIRS: &[&str] = &["sce_module"];
 
+/// How deep under the app directory the `.prx` index walk descends.
+///
+/// Titles nest their modules only a couple of levels (`Media/Modules`,
+/// `Media/Plugins`), so 4 is generous; the bound exists so a pathological
+/// tree — or a save/content directory full of unrelated files — cannot turn
+/// process load into an unbounded filesystem walk.
+const MODULE_SCAN_MAX_DEPTH: usize = 4;
+
+/// Directories the index walk never descends into, matched case-insensitively
+/// against a single path component.
+///
+/// `sce_sys/` is package metadata (icons, `param.json`, `pic0.png`) and never
+/// holds modules. The rest are bulk content directories where a recursive walk
+/// buys nothing but IO.
+const MODULE_SCAN_SKIP_DIRS: &[&str] = &["sce_sys", "savedata", "streamingassets"];
+
+/// App-relative directories whose `.prx` files initialize **before** `_start`
+/// even when no `DT_NEEDED` entry names them, matched case-insensitively
+/// against the directory path relative to the app root.
+///
+/// This is the standard Unity-on-PS5 layout: `Media/Modules` holds modules the
+/// title expects already started (its IL2CPP assemblies and platform shim),
+/// while `Media/Plugins` holds native plugins it activates itself through
+/// `sceKernelLoadStartModule`. SharpEmu's loader classifies the same two
+/// directories the same way (`SharpEmuRuntime.cs:636-645`, `StartAtBoot`).
+const EAGER_PLUGIN_DIRS: &[&str] = &["media/modules"];
+
 /// Bounds on the transitive `DT_NEEDED` walk (see [`load_process`]).
 ///
 /// The walk is a fixpoint over a visit-set, so cycles and diamonds terminate
@@ -199,6 +226,15 @@ const DEPENDENCY_SUBDIRS: &[&str] = &["sce_module"];
 /// walk starts and can never be cut by it.
 const MAX_DEPENDENCY_DEPTH: usize = 8;
 const MAX_LOADED_MODULES: usize = 64;
+
+/// Size of the guest arena's image region (`raeen_runtime::arena::IMAGE_SIZE`),
+/// mirrored here so the process loader can name an over-budget composition
+/// itself rather than letting it surface as an opaque map failure.
+///
+/// `raeen-firmware` does not depend on `raeen-runtime` (the dependency runs the
+/// other way), so this is a checked duplicate, pinned by
+/// `composed_image_budget_matches_the_guest_arena_image_region`.
+pub const GUEST_IMAGE_REGION_BYTES: u64 = 0x4000_0000; // 1 GiB
 
 /// A module decoded far enough to link: SELF -> ELF -> `.sprx` -> dynlib data.
 struct DecodedModule {
@@ -237,6 +273,11 @@ struct ModuleRequest {
     /// stay unresolved, and for a transitive miss that is the dependency that
     /// required it, not the eboot.
     required_by: String,
+    /// Exact file this request already resolved to, when it came from the
+    /// directory index rather than a `DT_NEEDED` name. Carrying it avoids
+    /// re-finding the file by basename, which would pick the wrong one when a
+    /// title ships two same-named modules in different directories.
+    path: Option<std::path::PathBuf>,
 }
 
 /// A per-process stack-protector canary: derived from
@@ -407,9 +448,218 @@ fn decrypt_and_decode(
     Ok(DecodedModule { module, dynlib })
 }
 
+/// One `.prx`/`.sprx` found by the app-directory index walk.
+struct IndexedModule {
+    /// File name as it sits on disk, e.g. `libfmod.prx`.
+    name: String,
+    /// Absolute path to the file.
+    path: std::path::PathBuf,
+    /// Lowercased directory path relative to the app root, `/`-separated and
+    /// empty for the app root itself, e.g. `media/plugins`. Used both for
+    /// eager/lazy classification and for stable ordering.
+    rel_dir: String,
+}
+
+/// Every `.prx`/`.sprx` shipped anywhere under the app directory, indexed once
+/// per process load.
+///
+/// Titles do not keep all their modules in one place. The system modules a
+/// title overrides live in `sce_module/`, but engine-owned modules live
+/// wherever the engine puts them — for Unity that is `Media/Modules` (IL2CPP
+/// assemblies, platform shim) and `Media/Plugins` (native plugins). Searching
+/// only the app root and `sce_module/` made every one of those a missing file:
+/// the module was never placed, its exports never registered, and the guest's
+/// later `sceKernelLoadStartModule` had nothing to find.
+struct ModuleIndex {
+    entries: Vec<IndexedModule>,
+}
+
+impl ModuleIndex {
+    /// Walk `dir` to [`MODULE_SCAN_MAX_DEPTH`], collecting every `.prx`/`.sprx`.
+    ///
+    /// Symlinks are not followed (a link loop would otherwise defeat the depth
+    /// bound), [`MODULE_SCAN_SKIP_DIRS`] are pruned, and an unreadable
+    /// directory is skipped rather than failing the load — a title with an
+    /// unreadable content directory should still boot.
+    fn build(dir: &std::path::Path) -> Self {
+        let mut entries = Vec::new();
+        Self::walk(dir, dir, 0, &mut entries);
+        // Stable, shallowest-first order so pre-placement offsets and log
+        // output do not depend on filesystem enumeration order.
+        entries.sort_by(|a, b| {
+            let depth = |e: &IndexedModule| {
+                e.rel_dir.matches('/').count() + usize::from(!e.rel_dir.is_empty())
+            };
+            depth(a)
+                .cmp(&depth(b))
+                .then_with(|| a.rel_dir.cmp(&b.rel_dir))
+                .then_with(|| {
+                    a.name
+                        .to_ascii_lowercase()
+                        .cmp(&b.name.to_ascii_lowercase())
+                })
+        });
+        Self { entries }
+    }
+
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        depth: usize,
+        out: &mut Vec<IndexedModule>,
+    ) {
+        if depth > MODULE_SCAN_MAX_DEPTH {
+            return;
+        }
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            // `file_type` on the entry does not follow symlinks, so a link
+            // loop can never be recursed into.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                let component = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                if MODULE_SCAN_SKIP_DIRS.contains(&component.as_str()) {
+                    continue;
+                }
+                Self::walk(root, &path, depth + 1, out);
+            } else if file_type.is_file()
+                && path.extension().is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("prx") || ext.eq_ignore_ascii_case("sprx")
+                })
+            {
+                let rel_dir = path
+                    .parent()
+                    .and_then(|parent| parent.strip_prefix(root).ok())
+                    .map(|rel| {
+                        rel.components()
+                            .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    })
+                    .unwrap_or_default();
+                out.push(IndexedModule {
+                    name: entry.file_name().to_string_lossy().into_owned(),
+                    path,
+                    rel_dir,
+                });
+            }
+        }
+    }
+
+    /// The indexed file whose name matches `needed` after canonicalization
+    /// (case- and extension-insensitive), shallowest-first.
+    ///
+    /// Canonical matching is what lets a `DT_NEEDED` of `PS5Util.prx` find a
+    /// file named `ps5util.prx`, and a guest path ending `.sprx` find the
+    /// `.prx` actually shipped.
+    fn find(&self, needed: &str) -> Option<&IndexedModule> {
+        let want = registry::canonical_module_name(needed);
+        self.entries
+            .iter()
+            .find(|entry| registry::canonical_module_name(&entry.name) == want)
+    }
+}
+
+/// Whether an indexed module's directory means "initialize before `_start`".
+fn is_eager_plugin_dir(rel_dir: &str) -> bool {
+    EAGER_PLUGIN_DIRS.contains(&rel_dir)
+}
+
+/// Indices into `pending` ordered so every module's own `DT_NEEDED`
+/// dependencies initialize **before** it — a post-order depth-first walk of
+/// the NEEDED graph.
+///
+/// The load walk is breadth-first, which is right for *placing* modules but
+/// wrong for *initializing* them: it yields the main module's `DT_NEEDED` list
+/// in declaration order. Measured on Subnautica Below Zero, that ran
+/// `Il2CppUserAssemblies.prx`'s `module_start` first and its own `libc.prx`
+/// third — so IL2CPP's initializer called into a libc whose `module_start` had
+/// not run, and died calling a still-null function pointer. A real loader
+/// initializes dependencies first, and the guest assumes it.
+///
+/// Modules not in `pending` (HLE-covered or missing) are simply not edges.
+/// A NEEDED cycle cannot be satisfied in any order; it is broken at the
+/// back-edge with a warning, leaving the rest of the order intact.
+fn topological_init_order(pending: &[PendingDep]) -> Vec<usize> {
+    let graph: Vec<(&str, &[String])> = pending
+        .iter()
+        .map(|p| (p.name.as_str(), p.decoded.dynlib.needed_modules.as_slice()))
+        .collect();
+    init_order_of(&graph)
+}
+
+/// [`topological_init_order`] over a plain `(name, needed)` graph, so the
+/// ordering rule can be tested without building ELF fixtures.
+fn init_order_of(modules: &[(&str, &[String])]) -> Vec<usize> {
+    /// Depth-first visit marks.
+    const UNVISITED: u8 = 0;
+    const IN_PROGRESS: u8 = 1;
+    const DONE: u8 = 2;
+
+    fn visit(
+        idx: usize,
+        modules: &[(&str, &[String])],
+        index_of: &std::collections::HashMap<String, usize>,
+        mark: &mut [u8],
+        order: &mut Vec<usize>,
+    ) {
+        if mark[idx] != UNVISITED {
+            return;
+        }
+        mark[idx] = IN_PROGRESS;
+        for needed in modules[idx].1 {
+            let Some(&dep) = index_of.get(&registry::canonical_module_name(needed)) else {
+                continue; // HLE-covered or not shipped — no ordering constraint
+            };
+            if dep == idx {
+                continue;
+            }
+            if mark[dep] == IN_PROGRESS {
+                tracing::warn!(
+                    "NEEDED cycle: {} <-> {} — initializing {} first and breaking the cycle",
+                    modules[idx].0,
+                    modules[dep].0,
+                    modules[dep].0
+                );
+                continue;
+            }
+            visit(dep, modules, index_of, mark, order);
+        }
+        mark[idx] = DONE;
+        order.push(idx);
+    }
+
+    let index_of: std::collections::HashMap<String, usize> = modules
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| (registry::canonical_module_name(name), i))
+        .collect();
+    let mut mark = vec![UNVISITED; modules.len()];
+    let mut order = Vec::with_capacity(modules.len());
+    // Seed in load order so the result is deterministic and, for a graph with
+    // no constraints, identical to the old behaviour.
+    for idx in 0..modules.len() {
+        visit(idx, modules, &index_of, &mut mark, &mut order);
+    }
+    order
+}
+
 /// Locate a `DT_NEEDED` module's file: `dir/<needed>` first, then each of
-/// [`DEPENDENCY_SUBDIRS`]. `None` if it ships nowhere we look.
-fn find_dependency_file(dir: &std::path::Path, needed: &str) -> Option<std::path::PathBuf> {
+/// [`DEPENDENCY_SUBDIRS`], then anywhere the [`ModuleIndex`] walk found it.
+/// `None` if it ships nowhere we look.
+///
+/// The explicit probes come first so the documented precedence (app root, then
+/// `sce_module/`) is preserved exactly; the index only ever *adds* reach.
+fn find_dependency_file(
+    dir: &std::path::Path,
+    needed: &str,
+    index: &ModuleIndex,
+) -> Option<std::path::PathBuf> {
     let direct = dir.join(needed);
     if direct.is_file() {
         return Some(direct);
@@ -420,7 +670,7 @@ fn find_dependency_file(dir: &std::path::Path, needed: &str) -> Option<std::path
             return Some(p);
         }
     }
-    None
+    index.find(needed).map(|entry| entry.path.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -613,6 +863,17 @@ pub fn load_process(
         .map(|(lib, _)| lib)
         .collect();
 
+    // Index every `.prx`/`.sprx` under the app directory once. Both the
+    // `DT_NEEDED` search and the optional-plugin pre-placement scan below read
+    // it, so a title that keeps its modules in engine-specific subdirectories
+    // (Unity's `Media/Modules`, `Media/Plugins`) is served by the same walk.
+    let module_index = ModuleIndex::build(dir);
+    tracing::debug!(
+        "app module index: {} .prx/.sprx under {}",
+        module_index.entries.len(),
+        dir.display()
+    );
+
     let mut next_offset = align_up_16k(dynlib::linker::image_size(&module)? as u64);
     let mut dependencies = Vec::new();
     let mut dep_images: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -650,36 +911,46 @@ pub fn load_process(
                 eager_init: true,
                 depth: 1,
                 required_by: main_display_name.clone(),
+                path: None,
             });
         }
     }
     // App-owned PRX plugins may be loaded later through
     // `sceKernelLoadStartModule`/`Dlsym` and therefore do not appear in the
-    // eboot's DT_NEEDED list. Place every root-level PRX in the process image
-    // now, without running its initializer, so runtime loading can resolve
-    // real exports without mutating executable layout mid-flight.
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        let mut optional: Vec<String> = entries
-            .flatten()
-            .filter_map(|entry| {
-                let path = entry.path();
-                path.extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("prx"))
-                    .then(|| entry.file_name().to_string_lossy().into_owned())
-            })
-            .collect();
-        optional.sort_by_key(|name| name.to_ascii_lowercase());
-        for name in optional {
-            if visited.insert(registry::canonical_module_name(&name)) {
-                tracing::info!("optional app PRX {name}: preplacing for runtime LoadStartModule");
-                queue.push_back(ModuleRequest {
-                    name,
-                    eager_init: false,
-                    depth: 1,
-                    required_by: "root-level plugin scan".to_string(),
-                });
-            }
+    // eboot's DT_NEEDED list. Place every PRX shipped anywhere under the app
+    // directory in the process image now, so runtime loading can resolve real
+    // exports without mutating executable layout mid-flight.
+    //
+    // The scan used to cover the app root only. Unity titles keep nothing
+    // there: their modules live in `Media/Modules` and `Media/Plugins`, so
+    // every one of them was a missing file and the guest's LoadStartModule
+    // got a code-less pseudo-handle back.
+    for entry in &module_index.entries {
+        if !visited.insert(registry::canonical_module_name(&entry.name)) {
+            continue;
         }
+        let eager_init = is_eager_plugin_dir(&entry.rel_dir);
+        let where_ = if entry.rel_dir.is_empty() {
+            "app root".to_string()
+        } else {
+            entry.rel_dir.clone()
+        };
+        tracing::info!(
+            "optional app PRX {} ({where_}): preplacing for runtime LoadStartModule{}",
+            entry.name,
+            if eager_init {
+                ", initializing before _start"
+            } else {
+                ""
+            }
+        );
+        queue.push_back(ModuleRequest {
+            name: entry.name.clone(),
+            eager_init,
+            depth: 1,
+            required_by: format!("plugin scan ({where_})"),
+            path: Some(entry.path.clone()),
+        });
     }
 
     // Reserve the HLE data page FIRST: its symbols must be registered before
@@ -698,15 +969,21 @@ pub fn load_process(
     while let Some(request) = queue.pop_front() {
         let needed = request.name.as_str();
         let stem = needed.trim_end_matches(".sprx").trim_end_matches(".prx");
-        let Some(path) = find_dependency_file(dir, needed) else {
+        let resolved = match &request.path {
+            Some(path) => Some(path.clone()),
+            None => find_dependency_file(dir, needed, &module_index),
+        };
+        let Some(path) = resolved else {
             if hle_libs.contains(stem) {
                 tracing::info!("NEEDED {needed}: no file shipped; covered by HLE library '{stem}'");
             } else {
                 tracing::warn!(
                     "NEEDED {needed} (required by {}): no HLE library named '{stem}' and no file \
-                     in {} or its sce_module/ — its imports will not resolve",
+                     anywhere under {} (searched the app root, sce_module/, and {} indexed \
+                     .prx/.sprx) — its imports will not resolve",
                     request.required_by,
-                    dir.display()
+                    dir.display(),
+                    module_index.entries.len()
                 );
             }
             continue;
@@ -800,6 +1077,7 @@ pub fn load_process(
                 eager_init: request.eager_init,
                 depth: request.depth + 1,
                 required_by: request.name.clone(),
+                path: None,
             });
         }
 
@@ -811,6 +1089,27 @@ pub fn load_process(
             decoded: dep,
         });
         next_offset = align_up_16k(next_offset + image_len);
+    }
+
+    // The plugin scan reaches every `.prx` under the app directory, so a title
+    // shipping a large module set can now compose an image the guest arena
+    // cannot map. `GuestArena::new` would reject it as a bare `MapFailed`,
+    // which says nothing about which modules were placed or how big they are;
+    // name the overflow here instead, with the per-module sizes, so the fix is
+    // obvious.
+    if next_offset > GUEST_IMAGE_REGION_BYTES {
+        tracing::error!(
+            "composed process image is {next_offset} bytes, over the {GUEST_IMAGE_REGION_BYTES}-byte \
+             guest image region — the guest arena will refuse to map it"
+        );
+        for p in &pending {
+            tracing::error!(
+                "  placed {} at +{:#x} ({} bytes)",
+                p.name,
+                p.offset,
+                dynlib::linker::image_size(&p.decoded.module).unwrap_or(0)
+            );
+        }
     }
 
     // Between the passes: assign every module with a (non-empty) `PT_TLS` its
@@ -936,12 +1235,15 @@ pub fn load_process(
     // module id against it.
     linked.tls_layout = tls_layout;
 
-    // Each dependency's `module_start` (DT_INIT), in load order — dependencies
-    // before the main module, which is what a real loader does and what the
-    // guest assumes: the eboot's own constructors use objects a dependency's
-    // constructors were supposed to create. `module_inits` runs before the
-    // process entry; see `dynlib::DT_INIT`.
-    for p in &pending {
+    // Each dependency's `module_start` (DT_INIT), dependencies-first — which
+    // is what a real loader does and what the guest assumes, at two levels:
+    // every dependency runs before the main module (the eboot's constructors
+    // use objects a dependency's constructors were supposed to create), and
+    // each dependency runs after the dependencies IT names (see
+    // `topological_init_order` for the measured failure when it did not).
+    // `module_inits` runs before the process entry; see `dynlib::DT_INIT`.
+    for idx in topological_init_order(&pending) {
+        let p = &pending[idx];
         if !p.eager_init {
             continue;
         }
@@ -1017,6 +1319,231 @@ mod tests {
     #[test]
     fn crate_name_is_set() {
         assert_eq!(super::CRATE_NAME, "raeen-firmware");
+    }
+
+    /// A throwaway directory tree, removed on drop.
+    struct TempTree(std::path::PathBuf);
+
+    impl TempTree {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SEQ: AtomicU32 = AtomicU32::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "raeen-{tag}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("create temp tree");
+            Self(root)
+        }
+
+        /// Create `rel` (with parents) holding one byte — the index only ever
+        /// looks at names and extensions, never contents.
+        fn touch(&self, rel: &str) -> std::path::PathBuf {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().expect("file has a parent"))
+                .expect("create parent dirs");
+            std::fs::write(&path, b"\0").expect("write fixture file");
+            path
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The regression that made Subnautica Below Zero (Unity/IL2CPP) exit one
+    /// second into boot: its modules ship under `Media/Modules` and
+    /// `Media/Plugins`, which the old app-root + `sce_module/` search never
+    /// looked at, so `Il2CppUserAssemblies.prx` — the whole game's logic —
+    /// was never placed and `sceKernelLoadStartModule` returned a code-less
+    /// pseudo-handle.
+    #[test]
+    fn module_index_finds_prx_in_unity_subdirectories() {
+        let tree = TempTree::new("modindex");
+        tree.touch("Media/Modules/Il2CppUserAssemblies.prx");
+        tree.touch("Media/Modules/PS5Util.prx");
+        tree.touch("Media/Plugins/libfmod.prx");
+        tree.touch("sce_module/libc.prx");
+        tree.touch("rootplugin.prx");
+        // Non-modules must not be indexed.
+        tree.touch("Media/Resources/data.dat");
+
+        let index = super::ModuleIndex::build(tree.path());
+        let mut found: Vec<&str> = index.entries.iter().map(|e| e.name.as_str()).collect();
+        found.sort_unstable();
+        assert_eq!(
+            found,
+            [
+                "Il2CppUserAssemblies.prx",
+                "PS5Util.prx",
+                "libc.prx",
+                "libfmod.prx",
+                "rootplugin.prx"
+            ],
+            "every shipped .prx under the app dir must be indexed"
+        );
+
+        // Lookup is canonical: case- and extension-insensitive, so a
+        // `DT_NEEDED` or guest path spelled differently still resolves.
+        assert_eq!(
+            index.find("ps5util.PRX").map(|e| e.name.as_str()),
+            Some("PS5Util.prx")
+        );
+        assert_eq!(
+            index
+                .find("Il2CppUserAssemblies.sprx")
+                .map(|e| e.name.as_str()),
+            Some("Il2CppUserAssemblies.prx")
+        );
+        assert!(index.find("libSceNotShipped.prx").is_none());
+    }
+
+    #[test]
+    fn module_index_prunes_metadata_dirs_and_bounds_depth() {
+        let tree = TempTree::new("modindex-bounds");
+        tree.touch("sce_sys/should_not_load.prx");
+        tree.touch("savedata/should_not_load.prx");
+        tree.touch("Media/Plugins/real.prx");
+        // One component deeper than the walk descends.
+        let too_deep = "a/b/c/d/e/buried.prx";
+        tree.touch(too_deep);
+
+        let index = super::ModuleIndex::build(tree.path());
+        let names: Vec<&str> = index.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["real.prx"],
+            "package metadata, save data, and over-deep paths must be pruned"
+        );
+    }
+
+    /// Unity expects `Media/Modules` already started at `_start` but activates
+    /// `Media/Plugins` itself through `sceKernelLoadStartModule`; SharpEmu's
+    /// loader classifies the same two directories the same way.
+    #[test]
+    fn media_modules_initialize_eagerly_while_other_dirs_stay_lazy() {
+        assert!(super::is_eager_plugin_dir("media/modules"));
+        assert!(!super::is_eager_plugin_dir("media/plugins"));
+        assert!(!super::is_eager_plugin_dir(""), "app root stays lazy");
+        assert!(!super::is_eager_plugin_dir("sce_module"));
+    }
+
+    fn needed(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    /// Subnautica Below Zero's real graph. Load (breadth-first) order is
+    /// `Il2CppUserAssemblies`, `PS5Util`, `libc` — the eboot's `DT_NEEDED`
+    /// declaration order — but IL2CPP needs both of the others, so running its
+    /// `module_start` first called into an uninitialized libc and faulted on a
+    /// null function pointer. Initialization must invert that.
+    #[test]
+    fn dependencies_initialize_before_the_modules_that_need_them() {
+        let il2cpp = needed(&["PS5Util.prx", "libc.prx", "libkernel"]);
+        let ps5util = needed(&["libkernel", "libc.prx"]);
+        let libc = needed(&["libkernel"]);
+        let modules: Vec<(&str, &[String])> = vec![
+            ("Il2CppUserAssemblies.prx", &il2cpp),
+            ("PS5Util.prx", &ps5util),
+            ("libc.prx", &libc),
+        ];
+
+        let order = super::init_order_of(&modules);
+        let position = |name: &str| {
+            order
+                .iter()
+                .position(|&i| modules[i].0 == name)
+                .expect("every module is scheduled exactly once")
+        };
+        assert_eq!(order.len(), modules.len(), "no module may be dropped");
+        assert!(
+            position("libc.prx") < position("PS5Util.prx"),
+            "libc must initialize before the module that needs it"
+        );
+        assert!(
+            position("PS5Util.prx") < position("Il2CppUserAssemblies.prx"),
+            "PS5Util must initialize before IL2CPP"
+        );
+        assert!(
+            position("libc.prx") < position("Il2CppUserAssemblies.prx"),
+            "libc must initialize before IL2CPP"
+        );
+    }
+
+    /// `libkernel` is HLE-covered and never in `pending`; naming it must not
+    /// constrain or drop anything. With no real edges the order is unchanged
+    /// from the load order, so titles that were working cannot be reordered.
+    #[test]
+    fn unshipped_dependencies_impose_no_ordering_and_drop_nothing() {
+        let a = needed(&["libkernel", "libSceNetCtl"]);
+        let b = needed(&["libkernel"]);
+        let modules: Vec<(&str, &[String])> = vec![("a.prx", &a), ("b.prx", &b)];
+        assert_eq!(super::init_order_of(&modules), vec![0, 1]);
+    }
+
+    /// A NEEDED cycle cannot be satisfied in any order. It must be broken
+    /// rather than looping forever or dropping a module.
+    #[test]
+    fn needed_cycles_are_broken_without_dropping_a_module() {
+        let a = needed(&["b.prx"]);
+        let b = needed(&["a.prx"]);
+        let modules: Vec<(&str, &[String])> = vec![("a.prx", &a), ("b.prx", &b)];
+
+        let order = super::init_order_of(&modules);
+        assert_eq!(order.len(), 2, "a cycle must not drop a module");
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1], "each module scheduled exactly once");
+    }
+
+    /// A module naming itself must not deadlock or duplicate.
+    #[test]
+    fn self_referential_needed_is_ignored() {
+        let a = needed(&["a.prx"]);
+        let modules: Vec<(&str, &[String])> = vec![("a.prx", &a)];
+        assert_eq!(super::init_order_of(&modules), vec![0]);
+    }
+
+    /// The index only ever *adds* reach — the documented app-root-then-
+    /// `sce_module/` precedence must still win, so a title that overrides a
+    /// system module at the root keeps overriding it.
+    #[test]
+    fn dependency_search_prefers_app_root_then_sce_module_then_the_index() {
+        let tree = TempTree::new("modsearch");
+        let root_copy = tree.touch("libc.prx");
+        tree.touch("sce_module/libc.prx");
+        tree.touch("Media/Plugins/libc.prx");
+        let sce_module_only = tree.touch("sce_module/libSceJobManager.prx");
+        let index_only = tree.touch("Media/Modules/PS5Util.prx");
+
+        let index = super::ModuleIndex::build(tree.path());
+        assert_eq!(
+            super::find_dependency_file(tree.path(), "libc.prx", &index),
+            Some(root_copy),
+            "an app-root module outranks every other copy"
+        );
+        assert_eq!(
+            super::find_dependency_file(tree.path(), "libSceJobManager.prx", &index),
+            Some(sce_module_only),
+            "sce_module/ is searched before the index"
+        );
+        assert_eq!(
+            super::find_dependency_file(tree.path(), "PS5Util.prx", &index),
+            Some(index_only),
+            "a module shipped only in a nested directory is now reachable"
+        );
+        assert_eq!(
+            super::find_dependency_file(tree.path(), "libSceNotShipped.prx", &index),
+            None
+        );
     }
 
     #[test]

@@ -419,6 +419,13 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
                 "open: '{path}' → '{}' does not exist (no O_CREAT) — ENOENT",
                 host.display()
             );
+            if trace_file_io(ctx) || std::env::var_os("RAEEN_TRACE_MISSING_FILES").is_some() {
+                info!(
+                    elapsed_ms = ctx.kernel.uptime().as_millis(),
+                    host = %host.display(),
+                    "file trace: missing path='{path}' flags={flags:#x} mode={mode:#o} -> ENOENT"
+                );
+            }
             return FILE_ENOENT;
         }
         None if path == "/" && !creating => {}
@@ -2069,7 +2076,17 @@ fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
             .fetch_sub(len, std::sync::atomic::Ordering::Relaxed);
         return HLE_ERROR;
     };
-    ctx.kernel.memory.record_mapping(addr, len, DEFAULT_PROT);
+    // Remember the allocation's `type` against its physical range, so the
+    // mapping made from it can echo that type back through
+    // `sceKernelVirtualQuery`.
+    ctx.kernel.memory.record_mapping_of_kind(
+        addr,
+        len,
+        DEFAULT_PROT,
+        raeen_core::types::MappingKind::Direct,
+        addr,
+        i32::try_from(memory_type).unwrap_or(0),
+    );
     trace_guest_vmm(format_args!(
         "allocate-direct search={search_start:#x}..{search_end:#x} len={len:#x} \
          align={alignment:#x} type={memory_type} -> phys={addr:#x}"
@@ -2218,7 +2235,20 @@ fn hle_map_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
         warn!("sceKernelMapDirectMemory: cannot map len={len:#x} at requested={requested:#x}");
         return HLE_ERROR;
     };
-    ctx.kernel.memory.record_mapping(mapped, len, prot);
+    // Record it as DIRECT, carrying the physical offset and the type the guest
+    // allocated it with — a title reads its own mappings back, and
+    // `sceKernelVirtualQuery` must agree with the map it just performed.
+    ctx.kernel.memory.record_mapping_of_kind(
+        mapped,
+        len,
+        prot,
+        raeen_core::types::MappingKind::Direct,
+        direct_memory_start,
+        ctx.kernel
+            .memory
+            .direct_allocation_type(direct_memory_start)
+            .unwrap_or(0),
+    );
     trace_guest_vmm(format_args!(
         "map-direct requested={requested:#x} phys={direct_memory_start:#x} len={len:#x} \
          align={alignment:#x} prot={prot:#x} -> {mapped:#x}"
@@ -3315,10 +3345,25 @@ fn hle_virtual_query(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_EFAULT;
     };
 
+    // `SceKernelVirtualQueryInfo`, 72 bytes (shadPS4
+    // `core/libraries/kernel/memory.h` `OrbisVirtualQueryInfo`):
+    //   0x00 start, 0x08 end, 0x10 offset, 0x18 protection, 0x1C memory_type,
+    //   0x20 flags (is_flexible|is_direct|is_stack|is_pooled|is_committed),
+    //   0x21 name[32].
+    //
+    // `offset`, `memory_type` and every kind bit used to be left zero, so a
+    // direct-memory mapping read back as anonymous, type 0, offset 0. Titles
+    // do not just make mappings, they verify them: Minecraft's embedded V8
+    // maps direct memory (measured type 12) and queries the range immediately
+    // afterwards — the disagreement tripped its `UNREACHABLE()` and killed the
+    // process the moment the UI handled a button press.
     let mut payload = [0u8; INFO_SIZE];
     payload[0..8].copy_from_slice(&region.vaddr.to_le_bytes());
     payload[8..16].copy_from_slice(&end.to_le_bytes());
+    payload[16..24].copy_from_slice(&region.direct_offset.to_le_bytes());
     payload[24..28].copy_from_slice(&region.protection.bits().to_le_bytes());
+    payload[28..32].copy_from_slice(&region.direct_memory_type.to_le_bytes());
+    payload[32] |= region.kind.query_flag_bit();
     if !region.protection.is_empty() {
         payload[32] |= 0x10; // is_committed
     }
@@ -3377,7 +3422,10 @@ fn hle_reserve_virtual_range(ctx: &HleContext, args: &[u64]) -> u64 {
     const MAP_FIXED: u32 = 0x10;
     let fixed = flags & MAP_FIXED != 0;
     let Some(addr) = ctx.alloc.reserve_with_hint(requested, len, align, fixed) else {
-        warn!("sceKernelReserveVirtualRange: address-space reservation failed (len={len:#x})");
+        warn!(
+            "sceKernelReserveVirtualRange: address-space reservation failed \
+             (hint={requested:#x}, len={len:#x}, flags={flags:#x}, align={align:#x}, fixed={fixed})"
+        );
         return HLE_ERROR;
     };
     ctx.kernel.memory.record_mapping(addr, len, 0);
@@ -4294,6 +4342,72 @@ mod tests {
     /// DirectMemoryQuery reports the recorded allocation containing (or, with
     /// flags==1, following) the queried offset — shadPS4's OrbisQueryInfo
     /// `{start, end, memoryType}` — and EACCES for unallocated space.
+    #[test]
+    /// A direct-memory mapping must read back through `sceKernelVirtualQuery`
+    /// as what the guest actually mapped: `is_direct` set, the physical offset
+    /// echoed at 0x10, and the allocation `type` at 0x1C. All three used to be
+    /// zero, so a title verifying its own mapping saw "anonymous, type 0,
+    /// offset 0" — which is what tripped Minecraft's embedded V8 into
+    /// `UNREACHABLE()` on the first button press.
+    ///
+    /// Layout pinned against shadPS4's `OrbisVirtualQueryInfo`
+    /// (`core/libraries/kernel/memory.h`): start, end, offset, protection,
+    /// memory_type, flags{flexible,direct,stack,pooled,committed}, name[32].
+    #[test]
+    fn virtual_query_reports_direct_mappings_with_offset_and_type() {
+        const IS_DIRECT: u8 = 0x02;
+        const IS_COMMITTED: u8 = 0x10;
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let phys = 0x5b_c1_0000u64;
+        let mapped = 0x40_0000u64;
+        kernel.memory.record_mapping_of_kind(
+            mapped,
+            0x8000,
+            0x3,
+            raeen_core::types::MappingKind::Direct,
+            phys,
+            12, // the type Minecraft's allocator measured
+        );
+
+        assert_eq!(
+            hle_virtual_query(&ctx, &[mapped + 0x1000, 0, 0x100, 72]),
+            SCE_OK
+        );
+        let mut info = [0u8; 72];
+        assert!(mem.read(0x100, &mut info));
+
+        assert_eq!(u64::from_le_bytes(info[0..8].try_into().unwrap()), mapped);
+        assert_eq!(
+            u64::from_le_bytes(info[8..16].try_into().unwrap()),
+            mapped + 0x8000
+        );
+        assert_eq!(
+            u64::from_le_bytes(info[16..24].try_into().unwrap()),
+            phys,
+            "offset must echo the direct-memory physical start"
+        );
+        assert_eq!(
+            i32::from_le_bytes(info[28..32].try_into().unwrap()),
+            12,
+            "memory_type must echo the allocation type"
+        );
+        assert_eq!(info[32] & IS_DIRECT, IS_DIRECT, "is_direct must be set");
+        assert_eq!(info[32] & IS_COMMITTED, IS_COMMITTED);
+
+        // An anonymous mapping still reports no kind bits and no offset/type.
+        kernel.memory.record_mapping(0x80_0000, 0x4000, 0x3);
+        assert_eq!(hle_virtual_query(&ctx, &[0x80_0000, 0, 0x200, 72]), SCE_OK);
+        let mut anon = [0u8; 72];
+        assert!(mem.read(0x200, &mut anon));
+        assert_eq!(u64::from_le_bytes(anon[16..24].try_into().unwrap()), 0);
+        assert_eq!(i32::from_le_bytes(anon[28..32].try_into().unwrap()), 0);
+        assert_eq!(anon[32] & IS_DIRECT, 0, "anonymous is not direct");
+    }
+
     #[test]
     fn direct_memory_query_reports_recorded_regions() {
         let kernel = raeen_kernel::OrbisKernel::new();

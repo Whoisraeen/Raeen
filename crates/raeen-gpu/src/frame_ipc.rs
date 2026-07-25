@@ -3,13 +3,15 @@
 //! The retail-title runner lives in a child process so a guest or driver crash
 //! cannot take down the Shell. Process-local [`crate::AgcGpuSession`] state
 //! therefore cannot be observed by the Shell directly. This module provides a
-//! single-producer/single-consumer, pagefile-backed shared-memory slot for the
-//! latest complete RGBA8 frame.
+//! pagefile-backed shared-memory slots for the latest complete RGBA8 frame and
+//! the Shell's latest 12-byte Orbis pad snapshot.
 //!
-//! A sequence lock keeps the hot path to one frame copy in the child and one
-//! copy in the Shell. If the child begins replacing a frame while the Shell is
-//! reading it, the Shell discards that copy and keeps its cached last complete
-//! frame. It never uploads a torn frame.
+//! A sequence lock plus two shared slots keeps the hot path to one frame copy
+//! in the child and one copy in the Shell. The child always writes the slot
+//! opposite the previously-published frame, so a normal Shell upload can run
+//! concurrently with the next guest frame instead of racing one hot slot. If
+//! the child laps the Shell, the sequence re-check discards that copy and keeps
+//! the cached last complete frame. It never uploads a torn frame.
 
 use crate::RenderedImage;
 use parking_lot::{Mutex, RwLock};
@@ -38,12 +40,16 @@ mod platform {
     };
 
     const MAGIC: u32 = u32::from_le_bytes(*b"RAEF");
-    const VERSION: u32 = 1;
-    const HEADER_BYTES: usize = 64;
-    // Covers an 8K RGBA8 frame (132.7 MiB) with room to spare. The mapping is
-    // pagefile-backed virtual address space; only touched pages consume commit.
-    const PIXEL_CAPACITY: usize = 256 * 1024 * 1024;
-    const MAPPING_BYTES: usize = HEADER_BYTES + PIXEL_CAPACITY;
+    const VERSION: u32 = 4;
+    // Input occupies bytes 48..60. Keep the independent VideoOut counter
+    // naturally aligned at 64 and start pixel slots after the full header.
+    const HEADER_BYTES: usize = 72;
+    // One slot covers an 8K RGBA8 frame (126.6 MiB) with room to spare. Keeping
+    // each slot tight makes the two-slot mapping only slightly larger than the
+    // old single 256-MiB slot.
+    const PIXEL_CAPACITY: usize = 136 * 1024 * 1024;
+    const FRAME_SLOTS: usize = 2;
+    const MAPPING_BYTES: usize = HEADER_BYTES + PIXEL_CAPACITY * FRAME_SLOTS;
 
     const MAGIC_OFFSET: usize = 0;
     const VERSION_OFFSET: usize = 4;
@@ -52,6 +58,10 @@ mod platform {
     const HEIGHT_OFFSET: usize = 20;
     const LENGTH_OFFSET: usize = 24;
     const BPP_OFFSET: usize = 32;
+    const INPUT_SEQUENCE_OFFSET: usize = 40;
+    const INPUT_DATA_OFFSET: usize = 48;
+    const INPUT_BYTES: usize = 12;
+    const PRESENT_COUNT_OFFSET: usize = 64;
 
     struct Mapping {
         handle: HANDLE,
@@ -142,9 +152,10 @@ mod platform {
             unsafe { &*self.view.add(offset).cast::<AtomicU64>() }
         }
 
-        fn pixels(&self) -> *mut u8 {
-            // SAFETY: HEADER_BYTES is inside the live MAPPING_BYTES view.
-            unsafe { self.view.add(HEADER_BYTES) }
+        fn pixels(&self, slot: usize) -> *mut u8 {
+            debug_assert!(slot < FRAME_SLOTS);
+            // SAFETY: both fixed-capacity slots are inside MAPPING_BYTES.
+            unsafe { self.view.add(HEADER_BYTES + slot * PIXEL_CAPACITY) }
         }
     }
 
@@ -187,6 +198,12 @@ mod platform {
             mapping
                 .atomic_u64(SEQUENCE_OFFSET)
                 .store(0, Ordering::Release);
+            mapping
+                .atomic_u64(INPUT_SEQUENCE_OFFSET)
+                .store(0, Ordering::Release);
+            mapping
+                .atomic_u64(PRESENT_COUNT_OFFSET)
+                .store(0, Ordering::Release);
             Ok(Self {
                 name,
                 mapping,
@@ -196,6 +213,37 @@ mod platform {
 
         pub fn name(&self) -> &str {
             &self.name
+        }
+
+        /// Publish the Shell's merged native/gilrs/keyboard snapshot for the
+        /// isolated runner. A separate seqlock keeps this bidirectional field
+        /// independent from the child-owned frame slot.
+        pub fn publish_pad_state(&self, state: [u8; INPUT_BYTES]) {
+            let sequence = self
+                .mapping
+                .atomic_u64(INPUT_SEQUENCE_OFFSET)
+                .load(Ordering::Relaxed);
+            let writing = if sequence & 1 == 0 {
+                sequence.wrapping_add(1)
+            } else {
+                sequence.wrapping_add(2)
+            };
+            self.mapping
+                .atomic_u64(INPUT_SEQUENCE_OFFSET)
+                .store(writing, Ordering::Release);
+            // SAFETY: the input field is a fixed 12-byte range fully contained
+            // in the header and does not overlap an atomic field.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    state.as_ptr(),
+                    self.mapping.view.add(INPUT_DATA_OFFSET),
+                    INPUT_BYTES,
+                );
+            }
+            std::sync::atomic::fence(Ordering::Release);
+            self.mapping
+                .atomic_u64(INPUT_SEQUENCE_OFFSET)
+                .store(writing.wrapping_add(1), Ordering::Release);
         }
 
         /// Return the newest complete frame, or the cached prior frame if the
@@ -253,12 +301,13 @@ mod platform {
             }
 
             let mut pixels = vec![0; len];
+            let slot = ((first / 2) as usize) % FRAME_SLOTS;
             // SAFETY: the validated length is within PIXEL_CAPACITY, both
             // buffers are valid for `len` bytes and do not overlap. The
             // sequence re-check below rejects a copy concurrent with a write.
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    self.mapping.pixels().cast_const(),
+                    self.mapping.pixels(slot).cast_const(),
                     pixels.as_mut_ptr(),
                     len,
                 );
@@ -292,6 +341,116 @@ mod platform {
             }
             *cache = Some(frame.clone());
             Some(frame)
+        }
+
+        /// Child VideoOut flips observed across the process boundary. Unlike
+        /// the frame-slot sequence, this advances even when the newest complete
+        /// image is byte-identical to the prior one or presentation temporarily
+        /// reuses the last good frame.
+        pub fn present_count(&self) -> Option<u64> {
+            if self
+                .mapping
+                .atomic_u32(MAGIC_OFFSET)
+                .load(Ordering::Acquire)
+                != MAGIC
+                || self
+                    .mapping
+                    .atomic_u32(VERSION_OFFSET)
+                    .load(Ordering::Relaxed)
+                    != VERSION
+            {
+                return None;
+            }
+            Some(
+                self.mapping
+                    .atomic_u64(PRESENT_COUNT_OFFSET)
+                    .load(Ordering::Acquire),
+            )
+        }
+    }
+
+    /// Child-owned reader for the Shell's merged controller snapshot.
+    pub struct FrameIpcInputReader {
+        mapping: Mapping,
+        cached: Mutex<Option<(u64, [u8; INPUT_BYTES])>>,
+    }
+
+    impl FrameIpcInputReader {
+        pub fn open_from_env() -> Option<Self> {
+            let name = std::env::var(FRAME_IPC_ENV).ok()?;
+            match Mapping::open(&name) {
+                Ok(mapping) => {
+                    tracing::info!(
+                        mapping = %name,
+                        "isolated runner connected to Shell input IPC"
+                    );
+                    Some(Self {
+                        mapping,
+                        cached: Mutex::new(None),
+                    })
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        mapping = %name,
+                        "cannot open Shell input IPC mapping"
+                    );
+                    None
+                }
+            }
+        }
+
+        /// Return the newest complete snapshot, retaining the prior snapshot
+        /// if the Shell is updating the slot concurrently.
+        pub fn latest(&self) -> Option<[u8; INPUT_BYTES]> {
+            let mut cached = self.cached.lock();
+            let first = self
+                .mapping
+                .atomic_u64(INPUT_SEQUENCE_OFFSET)
+                .load(Ordering::Acquire);
+            if first == 0 || first & 1 != 0 {
+                return cached.as_ref().map(|(_, state)| *state);
+            }
+            if cached
+                .as_ref()
+                .is_some_and(|(sequence, _)| *sequence == first)
+            {
+                return cached.as_ref().map(|(_, state)| *state);
+            }
+            if self
+                .mapping
+                .atomic_u32(MAGIC_OFFSET)
+                .load(Ordering::Relaxed)
+                != MAGIC
+                || self
+                    .mapping
+                    .atomic_u32(VERSION_OFFSET)
+                    .load(Ordering::Relaxed)
+                    != VERSION
+            {
+                return cached.as_ref().map(|(_, state)| *state);
+            }
+
+            let mut state = [0; INPUT_BYTES];
+            // SAFETY: the source and destination are valid non-overlapping
+            // 12-byte ranges. The sequence re-check rejects concurrent writes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.mapping.view.add(INPUT_DATA_OFFSET).cast_const(),
+                    state.as_mut_ptr(),
+                    INPUT_BYTES,
+                );
+            }
+            std::sync::atomic::fence(Ordering::Acquire);
+            let second = self
+                .mapping
+                .atomic_u64(INPUT_SEQUENCE_OFFSET)
+                .load(Ordering::Acquire);
+            if first != second || second & 1 != 0 {
+                return cached.as_ref().map(|(_, state)| *state);
+            }
+            *cached = Some((second, state));
+            Some(state)
         }
     }
 
@@ -343,6 +502,8 @@ mod platform {
             } else {
                 sequence.wrapping_add(2)
             };
+            let complete = writing.wrapping_add(1);
+            let slot = ((complete / 2) as usize) % FRAME_SLOTS;
             self.mapping
                 .atomic_u64(SEQUENCE_OFFSET)
                 .store(writing, Ordering::Release);
@@ -364,14 +525,23 @@ mod platform {
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     image.pixels.as_ptr(),
-                    self.mapping.pixels(),
+                    self.mapping.pixels(slot),
                     image.pixels.len(),
                 );
             }
             std::sync::atomic::fence(Ordering::Release);
             self.mapping
                 .atomic_u64(SEQUENCE_OFFSET)
-                .store(writing.wrapping_add(1), Ordering::Release);
+                .store(complete, Ordering::Release);
+        }
+
+        /// Record one guest VideoOut presentation independently of image
+        /// publication. This keeps the Shell FPS counter alive for static or
+        /// repeatedly-reused images.
+        pub(crate) fn mark_presented(&self) {
+            self.mapping
+                .atomic_u64(PRESENT_COUNT_OFFSET)
+                .fetch_add(1, Ordering::Release);
         }
     }
 
@@ -400,6 +570,19 @@ mod platform {
         }
 
         #[test]
+        fn present_counter_advances_without_republishing_pixels() {
+            let receiver = FrameIpcReceiver::create().expect("create mapping");
+            let publisher = FrameIpcPublisher {
+                mapping: Mapping::open(receiver.name()).expect("open child mapping"),
+            };
+            assert_eq!(receiver.present_count(), Some(0));
+            publisher.mark_presented();
+            publisher.mark_presented();
+            assert_eq!(receiver.present_count(), Some(2));
+            assert!(receiver.latest().is_none());
+        }
+
+        #[test]
         fn invalid_frame_never_replaces_the_last_complete_frame() {
             let receiver = FrameIpcReceiver::create().expect("create mapping");
             let publisher = FrameIpcPublisher {
@@ -421,6 +604,43 @@ mod platform {
             let kept = receiver.latest().expect("cached frame");
             assert_eq!(kept.epoch, accepted.epoch);
             assert_eq!(kept.image.pixels, accepted.image.pixels);
+        }
+
+        #[test]
+        fn double_buffer_publishes_the_newest_complete_slot() {
+            let receiver = FrameIpcReceiver::create().expect("create mapping");
+            let publisher = FrameIpcPublisher {
+                mapping: Mapping::open(receiver.name()).expect("open child mapping"),
+            };
+            for value in [1, 2, 3] {
+                publisher.publish(&RenderedImage {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![value, 0, 0, 255],
+                    bytes_per_pixel: 4,
+                });
+                let remote = receiver.latest().expect("published frame");
+                assert_eq!(remote.image.pixels, [value, 0, 0, 255]);
+            }
+        }
+
+        #[test]
+        fn shell_pad_snapshot_round_trips_to_isolated_runner() {
+            let receiver = FrameIpcReceiver::create().expect("create mapping");
+            let reader = FrameIpcInputReader {
+                mapping: Mapping::open(receiver.name()).expect("open child mapping"),
+                cached: Mutex::new(None),
+            };
+            assert_eq!(reader.latest(), None);
+
+            let mut pressed = [0u8; INPUT_BYTES];
+            pressed[0..4].copy_from_slice(&0x0000_4000u32.to_le_bytes());
+            pressed[4..8].copy_from_slice(&[0, 255, 128, 128]);
+            receiver.publish_pad_state(pressed);
+            assert_eq!(reader.latest(), Some(pressed));
+
+            receiver.publish_pad_state([0; INPUT_BYTES]);
+            assert_eq!(reader.latest(), Some([0; INPUT_BYTES]));
         }
     }
 }
@@ -447,6 +667,24 @@ mod platform {
         pub fn latest(&self) -> Option<RemoteFrame> {
             None
         }
+
+        pub fn present_count(&self) -> Option<u64> {
+            None
+        }
+
+        pub fn publish_pad_state(&self, _state: [u8; 12]) {}
+    }
+
+    pub struct FrameIpcInputReader;
+
+    impl FrameIpcInputReader {
+        pub fn open_from_env() -> Option<Self> {
+            None
+        }
+
+        pub fn latest(&self) -> Option<[u8; 12]> {
+            None
+        }
     }
 
     pub(crate) struct FrameIpcPublisher;
@@ -457,11 +695,13 @@ mod platform {
         }
 
         pub(crate) fn publish(&self, _image: &RenderedImage) {}
+
+        pub(crate) fn mark_presented(&self) {}
     }
 }
 
 pub(crate) use platform::FrameIpcPublisher;
-pub use platform::FrameIpcReceiver;
+pub use platform::{FrameIpcInputReader, FrameIpcReceiver};
 
 fn active_receiver() -> &'static RwLock<Option<Arc<FrameIpcReceiver>>> {
     static ACTIVE: std::sync::OnceLock<RwLock<Option<Arc<FrameIpcReceiver>>>> =
@@ -493,4 +733,24 @@ pub fn latest_remote_frame() -> Option<RemoteFrame> {
         .read()
         .as_ref()
         .and_then(|receiver| receiver.latest())
+}
+
+/// Latest child VideoOut flip count, independent of whether frame pixels
+/// changed. Used by the Shell's FPS badge for isolated retail runners.
+pub fn latest_remote_present_count() -> Option<u64> {
+    active_receiver()
+        .read()
+        .as_ref()
+        .and_then(|receiver| receiver.present_count())
+}
+
+/// Publish one merged Shell controller snapshot to the active isolated title.
+/// Returns false when no child frame/input bridge is installed.
+pub fn publish_pad_state(state: [u8; 12]) -> bool {
+    let active = active_receiver().read();
+    let Some(receiver) = active.as_ref() else {
+        return false;
+    };
+    receiver.publish_pad_state(state);
+    true
 }

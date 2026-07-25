@@ -23,17 +23,21 @@ const NP_REACHABILITY_UNAVAILABLE: u32 = 0;
 /// Register libSceNpManager HLE functions.
 pub fn register(registry: &HleRegistry) {
     registry.register("libSceNpManager", "sceNpGetState", hle_get_state);
-    registry.register("libSceNpManager", "sceNpCheckCallback", hle_ok);
-    registry.register("libSceNpManager", "sceNpCheckCallbackForLib", hle_ok);
+    registry.register("libSceNpManager", "sceNpCheckCallback", hle_check_callback);
+    registry.register(
+        "libSceNpManager",
+        "sceNpCheckCallbackForLib",
+        hle_check_callback,
+    );
     registry.register(
         "libSceNpManager",
         "sceNpRegisterStateCallback",
-        hle_register_callback,
+        hle_register_callback_legacy,
     );
     registry.register(
         "libSceNpManager",
         "sceNpRegisterStateCallbackA",
-        hle_register_callback,
+        hle_register_callback_a,
     );
     registry.register("libSceNpManager", "sceNpUnregisterStateCallback", hle_ok);
     // `sceNpRegisterNpReachabilityStateCallback(callback, userdata)`: accept the
@@ -71,7 +75,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register(
         "libSceNpManagerForToolkit",
         "sceNpRegisterStateCallbackForToolkit",
-        hle_register_callback,
+        hle_register_callback_a,
     );
 
     // libSceNpAuthAuthorizedAppDialog — the PSN "authorize this app" popup.
@@ -166,11 +170,125 @@ fn hle_get_state(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
-/// `sceNpRegisterStateCallback(callback, userdata)`: accepts the callback
-/// (returns a callback id `0`); it simply never fires, since the account
-/// state never changes from `SIGNED_OUT`.
-fn hle_register_callback(_ctx: &HleContext, _args: &[u64]) -> u64 {
+/// The one local user Raeen models (matches `libsce_user_service`).
+const PRIMARY_USER_ID: u64 = 0x1000_0000;
+
+/// `sceNpRegisterStateCallback(callback, userdata)` — the legacy 4-argument
+/// form, invoked `(userId, state, SceNpId *npId, void *userdata)`.
+///
+/// The callback is recorded so `sceNpCheckCallback` can deliver the current
+/// account state to it. Titles register a state callback and then wait for
+/// the initial state event rather than polling `sceNpGetState`; a callback
+/// that never fires strands them (Minecraft's post-menu Ore-UI page).
+fn hle_register_callback_legacy(ctx: &HleContext, args: &[u64]) -> u64 {
+    register_np_state_callback(ctx, args, true)
+}
+
+/// `sceNpRegisterStateCallbackA` / `...ForToolkit` — the 3-argument form,
+/// invoked `(userId, state, void *userdata)` (no `npId`).
+fn hle_register_callback_a(ctx: &HleContext, args: &[u64]) -> u64 {
+    register_np_state_callback(ctx, args, false)
+}
+
+fn register_np_state_callback(ctx: &HleContext, args: &[u64], legacy_np_id_arg: bool) -> u64 {
+    let entry = args.first().copied().unwrap_or(0);
+    let userdata = args.get(1).copied().unwrap_or(0);
+    if entry == 0 {
+        return ERROR_INVALID_ARGUMENT;
+    }
+    let mut callbacks = ctx.kernel.np_state_callbacks.lock();
+    // De-dupe: a title that re-registers the same entry must not queue two
+    // deliveries (the real kernel rejects a duplicate; recording it once is
+    // enough for our purposes).
+    if !callbacks.iter().any(|cb| cb.entry == entry) {
+        callbacks.push(raeen_kernel::NpStateCallbackRegistration {
+            entry,
+            userdata,
+            legacy_np_id_arg,
+            notified: false,
+        });
+        debug!(
+            "sceNpRegisterStateCallback(entry={entry:#x}, userdata={userdata:#x}, legacy={legacy_np_id_arg}) \
+             — queued initial SIGNED_OUT delivery"
+        );
+    }
     SCE_OK // callback id 0
+}
+
+/// `sceNpCheckCallback()`: the title's pump for queued NP callbacks. On real
+/// hardware this is where the system delivers the account-state event it
+/// queued at registration, on the title's own thread (shadPS4
+/// `np_manager.cpp` `DispatchPendingNpStateCallbacks`, called from
+/// `sceNpCheckCallback`).
+///
+/// Raeen delivers exactly one un-notified callback per pump — the deferred
+/// guest-call channel carries one call per dispatch, and the title pumps this
+/// repeatedly, so multiple callbacks drain across successive pumps. The state
+/// delivered is `SIGNED_OUT`, consistent with `sceNpGetState`: an offline
+/// console genuinely reports signed-out, and the point is that the event
+/// FIRES so the UI's "waiting for account state" gate opens, not that it
+/// reports online.
+fn hle_check_callback(ctx: &HleContext, _args: &[u64]) -> u64 {
+    let pending = {
+        let mut callbacks = ctx.kernel.np_state_callbacks.lock();
+        match callbacks.iter_mut().find(|cb| !cb.notified) {
+            Some(cb) => {
+                let snapshot = *cb;
+                cb.notified = true;
+                Some(snapshot)
+            }
+            None => None,
+        }
+    };
+    let Some(cb) = pending else {
+        return SCE_OK;
+    };
+
+    // Legacy: (userId, state, npId*, userdata); A/toolkit: (userId, state,
+    // userdata). npId is NULL — a signed-out account has no online id.
+    let args = if cb.legacy_np_id_arg {
+        [
+            PRIMARY_USER_ID,
+            u64::from(NP_STATE_SIGNED_OUT),
+            0,
+            cb.userdata,
+            0,
+            0,
+        ]
+    } else {
+        [
+            PRIMARY_USER_ID,
+            u64::from(NP_STATE_SIGNED_OUT),
+            cb.userdata,
+            0,
+            0,
+            0,
+        ]
+    };
+    if !ctx.guest_calls.request(crate::GuestCallRequest {
+        entry: cb.entry,
+        args,
+        completion: None,
+    }) {
+        // Another deferred call is already pending this dispatch; un-mark so
+        // the next pump retries. The title pumps continuously, so this is a
+        // one-tick delay, not a lost event.
+        if let Some(slot) = ctx
+            .kernel
+            .np_state_callbacks
+            .lock()
+            .iter_mut()
+            .find(|c| c.entry == cb.entry)
+        {
+            slot.notified = false;
+        }
+        return SCE_OK;
+    }
+    debug!(
+        "sceNpCheckCallback: delivering SIGNED_OUT to NP state callback {:#x}",
+        cb.entry
+    );
+    SCE_OK
 }
 
 /// `sceNpGetOnlineId(SceUserServiceUserId userId, SceNpOnlineId *onlineId)`:
@@ -314,6 +432,91 @@ mod tests {
             "libSceNpManagerForToolkit",
             "sceNpRegisterStateCallbackForToolkit"
         ));
+    }
+
+    /// A registered NP state callback must be DELIVERED the initial account
+    /// state through `sceNpCheckCallback`, once, with the right per-form ABI —
+    /// not silently accepted and never fired. This was Minecraft's post-menu
+    /// wall: it registered a state callback and pumped `sceNpCheckCallback`
+    /// ~10x/s forever with a blank UI, waiting for an event that never came.
+    #[test]
+    fn state_callback_is_delivered_the_initial_state_through_check_callback() {
+        use crate::{GuestCallRequest, GuestCallScheduler};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Recorder {
+            calls: Mutex<Vec<GuestCallRequest>>,
+        }
+        impl GuestCallScheduler for Recorder {
+            fn request(&self, request: GuestCallRequest) -> bool {
+                self.calls.lock().unwrap().push(request);
+                true
+            }
+        }
+
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let recorder = Recorder::default();
+        let mut ctx = test_ctx(&kernel, &mem, &alloc);
+        ctx.guest_calls = &recorder;
+
+        // Legacy 4-arg form: (userId, state, npId*, userdata).
+        assert_eq!(
+            hle_register_callback_legacy(&ctx, &[0xCAFE, 0x1234]),
+            SCE_OK
+        );
+        // No delivery until the title pumps.
+        assert!(recorder.calls.lock().unwrap().is_empty());
+
+        assert_eq!(hle_check_callback(&ctx, &[]), SCE_OK);
+        let calls = recorder.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one delivery");
+        assert_eq!(calls[0].entry, 0xCAFE);
+        assert_eq!(calls[0].args[0], PRIMARY_USER_ID);
+        assert_eq!(calls[0].args[1], u64::from(NP_STATE_SIGNED_OUT));
+        assert_eq!(calls[0].args[2], 0, "legacy npId arg is NULL");
+        assert_eq!(calls[0].args[3], 0x1234, "userdata after npId");
+        drop(calls);
+
+        // A second pump must NOT re-deliver — the event is one-shot.
+        assert_eq!(hle_check_callback(&ctx, &[]), SCE_OK);
+        assert_eq!(recorder.calls.lock().unwrap().len(), 1, "delivered once");
+    }
+
+    /// The A/toolkit 3-arg form places userdata immediately after state, with
+    /// no `npId` slot — delivering the legacy layout to it would hand the
+    /// callback the NULL npId as its userdata.
+    #[test]
+    fn a_form_callback_omits_the_np_id_argument() {
+        use crate::{GuestCallRequest, GuestCallScheduler};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Recorder {
+            calls: Mutex<Vec<GuestCallRequest>>,
+        }
+        impl GuestCallScheduler for Recorder {
+            fn request(&self, request: GuestCallRequest) -> bool {
+                self.calls.lock().unwrap().push(request);
+                true
+            }
+        }
+
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let recorder = Recorder::default();
+        let mut ctx = test_ctx(&kernel, &mem, &alloc);
+        ctx.guest_calls = &recorder;
+
+        assert_eq!(hle_register_callback_a(&ctx, &[0xBEEF, 0x99]), SCE_OK);
+        assert_eq!(hle_check_callback(&ctx, &[]), SCE_OK);
+        let calls = recorder.calls.lock().unwrap();
+        assert_eq!(calls[0].entry, 0xBEEF);
+        assert_eq!(calls[0].args[1], u64::from(NP_STATE_SIGNED_OUT));
+        assert_eq!(calls[0].args[2], 0x99, "userdata directly after state");
     }
 
     #[test]

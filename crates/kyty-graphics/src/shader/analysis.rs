@@ -2003,7 +2003,27 @@ fn trace_eud_evidence(
     declared: i32,
     mem: &impl ShaderMemory,
 ) {
-    if std::env::var_os("RAEEN_TRACE_EUD").is_none() {
+    let Ok(filter) = std::env::var("RAEEN_TRACE_EUD") else {
+        return;
+    };
+    // `1`/`all` retain the original all-shader dump. A comma-separated
+    // address list narrows the otherwise very noisy per-bind evidence to the
+    // failing shader(s), e.g. `RAEEN_TRACE_EUD=0x16fff700`. Minecraft can bind
+    // tens of thousands of UI draws before the first transition; without this
+    // filter the log reaches its safety cap before the interesting bind.
+    let filter = filter.trim();
+    if !filter.is_empty()
+        && filter != "1"
+        && !filter.eq_ignore_ascii_case("all")
+        && !filter.split(',').any(|raw| {
+            let raw = raw.trim();
+            let raw = raw
+                .strip_prefix("0x")
+                .or_else(|| raw.strip_prefix("0X"))
+                .unwrap_or(raw);
+            u64::from_str_radix(raw, 16).ok() == Some(shader_addr)
+        })
+    {
         return;
     }
     // One compound line per shader so evidence can never be cross-attributed
@@ -2209,9 +2229,248 @@ pub fn shader_capture_eud_image_descriptors(
     Ok(())
 }
 
+/// Capture buffer V# descriptors that the shader loads from its raw EUD
+/// window, and discard stale table entries that no decoded buffer access can
+/// reach.
+///
+/// Gen5 usage tables describe a resource *slot*, but the live descriptor can
+/// be delivered later by a covered scalar load:
+///
+/// `s_load_dwordx4 s[resource:resource+3], s[eud:eud+1], byte_offset`
+///
+/// The static table walk cannot see that provenance and, when its declared
+/// register is the EUD pointer itself, reads dword 0 as a V#. Minecraft's
+/// post-title UI does exactly this: dword 0 is non-descriptor data while the
+/// real 16-byte V# starts at dword 8. Binding both is not harmless because the
+/// bogus first descriptor is validated/prepared before the shader can run.
+///
+/// This pass is deliberately proof-driven:
+/// - only decoded MUBUF/MTBUF/SBUFFER resource operands are considered;
+/// - only an exact covered `s_load_dwordx4/x8` from the recovered EUD pair
+///   supplies a descriptor;
+/// - the four captured dwords must be nonzero and buffer-typed;
+/// - stale extended entries are pruned only when every decoded buffer operand
+///   resolves either directly or through one of those covered loads.
+///
+/// Direct descriptors and unresolved/aliased programs retain the conservative
+/// table result.
+pub fn shader_capture_eud_storage_buffers(
+    code: &ShaderCode,
+    bind: &mut ShaderBindResources,
+    user_sgpr: &UserSgprInfo,
+    eud: EudView<'_>,
+    mem: &impl ShaderMemory,
+) -> Result<(), ShaderAnalysisError> {
+    use crate::shader::types::ShaderInstructionType as T;
+
+    if !bind.extended.used {
+        return Ok(());
+    }
+
+    let resource_operand = |inst: &ShaderInstruction| -> Option<(i32, bool)> {
+        let (operand, writes) = match inst.type_ {
+            T::BufferLoadDword
+            | T::BufferLoadDwordX2
+            | T::BufferLoadDwordX3
+            | T::BufferLoadDwordX4
+            | T::BufferLoadUbyte
+            | T::BufferLoadFormatX
+            | T::BufferLoadFormatXy
+            | T::BufferLoadFormatXyz
+            | T::BufferLoadFormatXyzw
+            | T::TBufferLoadFormatX
+            | T::TBufferLoadFormatXyzw => (inst.src[1], false),
+            T::BufferStoreDword
+            | T::BufferStoreDwordX2
+            | T::BufferStoreDwordX4
+            | T::BufferStoreFormatX
+            | T::BufferStoreFormatXy
+            | T::BufferStoreFormatXyz
+            | T::BufferStoreFormatXyzw => (inst.src[1], true),
+            T::SBufferLoadDword
+            | T::SBufferLoadDwordx2
+            | T::SBufferLoadDwordx4
+            | T::SBufferLoadDwordx8
+            | T::SBufferLoadDwordx16 => (inst.src[0], false),
+            _ => return None,
+        };
+        (operand.type_ == ShaderOperandType::Sgpr).then_some((operand.register_id, writes))
+    };
+
+    let mut resource_regs = Vec::<(i32, bool)>::new();
+    for inst in code.get_instructions() {
+        if let Some((reg, writes)) = resource_operand(inst) {
+            if let Some((_, old_writes)) = resource_regs.iter_mut().find(|(r, _)| *r == reg) {
+                *old_writes |= writes;
+            } else {
+                resource_regs.push((reg, writes));
+            }
+        }
+    }
+    if resource_regs.is_empty() {
+        return Ok(());
+    }
+
+    let eud_base = bind.extended.start_register;
+    let sgprs_max = UserSgprInfo::SGPRS_MAX as i32;
+    let rel_of = |start: i32| -> Option<i32> {
+        if start >= sgprs_max {
+            Some(start - sgprs_max)
+        } else if start >= eud_base {
+            Some(start - eud_base)
+        } else {
+            None
+        }
+    };
+
+    let existing_num = usize::try_from(bind.storage_buffers.buffers_num.max(0))
+        .unwrap_or(0)
+        .min(bind.storage_buffers.buffers.len());
+    let existing = bind.storage_buffers;
+    let fallback_slot = (0..existing_num)
+        .find(|&i| existing.extended[i])
+        .map_or(existing.buffers_num, |i| existing.slots[i]);
+    let fallback_usage =
+        if (0..existing_num).any(|i| existing.usages[i] == ShaderStorageUsage::ReadWrite) {
+            ShaderStorageUsage::ReadWrite
+        } else {
+            ShaderStorageUsage::ReadOnly
+        };
+
+    let mut dynamic = Vec::<(i32, i32, ShaderStorageUsage)>::new();
+    for &(reg, writes) in &resource_regs {
+        for load in code.get_instructions() {
+            if !matches!(load.type_, T::SLoadDwordx4 | T::SLoadDwordx8)
+                || load.src[0].type_ != ShaderOperandType::Sgpr
+                || load.src[0].register_id != eud_base
+                || load.dst.type_ != ShaderOperandType::Sgpr
+                || load.dst.register_id != reg
+                || !matches!(
+                    load.src[1].type_,
+                    ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
+                )
+                || load.src[1].constant.i() < 0
+            {
+                continue;
+            }
+            let offset = (load.src[1].constant.u >> 2) as i32;
+            let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
+            let Some(fields) = eud.data.get(offset_usize..offset_usize.saturating_add(4)) else {
+                continue;
+            };
+            if fields == [0, 0, 0, 0] || !sharp_dword3_is_buffer(fields[3]) {
+                continue;
+            }
+            let candidate = ShaderBufferResource {
+                fields: fields.try_into().expect("four-dword V# slice"),
+            };
+            if mem.dwords_at(candidate.base48()).is_none() {
+                tracing::debug!(
+                    eud_dword = offset,
+                    base = format_args!("{:#x}", candidate.base48()),
+                    "raw-EUD buffer-shaped tuple does not point to readable guest memory"
+                );
+                continue;
+            }
+            let usage = if writes || fallback_usage == ShaderStorageUsage::ReadWrite {
+                ShaderStorageUsage::ReadWrite
+            } else {
+                ShaderStorageUsage::ReadOnly
+            };
+            if let Some((_, _, old_usage)) = dynamic.iter_mut().find(|(old, _, _)| *old == offset) {
+                if usage == ShaderStorageUsage::ReadWrite {
+                    *old_usage = usage;
+                }
+            } else {
+                dynamic.push((offset, fallback_slot, usage));
+            }
+        }
+    }
+    if dynamic.is_empty() {
+        return Ok(());
+    }
+
+    let every_operand_resolved = resource_regs.iter().all(|(reg, _)| {
+        (0..existing_num).any(|i| !existing.extended[i] && existing.start_register[i] == *reg)
+            || code.get_instructions().iter().any(|load| {
+                matches!(load.type_, T::SLoadDwordx4 | T::SLoadDwordx8)
+                    && load.src[0].type_ == ShaderOperandType::Sgpr
+                    && load.src[0].register_id == eud_base
+                    && load.dst.type_ == ShaderOperandType::Sgpr
+                    && load.dst.register_id == *reg
+                    && matches!(
+                        load.src[1].type_,
+                        ShaderOperandType::LiteralConstant
+                            | ShaderOperandType::IntegerInlineConstant
+                    )
+                    && dynamic
+                        .iter()
+                        .any(|(offset, _, _)| *offset == (load.src[1].constant.u >> 2) as i32)
+            })
+    });
+
+    // Rebuild the compact array so an unreachable bogus descriptor is never
+    // prepared by the Vulkan binding path. Direct descriptors always stay.
+    let mut compact = ShaderStorageResources::default();
+    for i in 0..existing_num {
+        let readable = mem.dwords_at(existing.buffers[i].base48()).is_some();
+        let keep = !existing.extended[i]
+            || (readable
+                && (!every_operand_resolved
+                    || rel_of(existing.start_register[i])
+                        .is_some_and(|rel| dynamic.iter().any(|(offset, _, _)| *offset == rel))));
+        if !keep {
+            tracing::debug!(
+                start_register = existing.start_register[i],
+                slot = existing.slots[i],
+                base = format_args!("{:#x}", existing.buffers[i].base48()),
+                "discarding unreachable EUD storage descriptor"
+            );
+            continue;
+        }
+        let out = compact.buffers_num as usize;
+        compact.buffers[out] = existing.buffers[i];
+        compact.usages[out] = existing.usages[i];
+        compact.slots[out] = existing.slots[i];
+        compact.start_register[out] = existing.start_register[i];
+        compact.extended[out] = existing.extended[i];
+        compact.buffers_num += 1;
+    }
+    bind.storage_buffers = compact;
+
+    let mut unused_flags = [false; UserSgprInfo::SGPRS_MAX];
+    for (offset, slot, usage) in dynamic {
+        let current_num = usize::try_from(bind.storage_buffers.buffers_num.max(0))
+            .unwrap_or(0)
+            .min(bind.storage_buffers.buffers.len());
+        if (0..current_num).any(|i| {
+            bind.storage_buffers.extended[i]
+                && rel_of(bind.storage_buffers.start_register[i]) == Some(offset)
+        }) {
+            continue;
+        }
+        shader_get_storage_buffer(
+            &mut bind.storage_buffers,
+            &mut unused_flags,
+            sgprs_max + offset,
+            slot,
+            usage,
+            user_sgpr,
+            Some(eud),
+        )?;
+        tracing::debug!(
+            eud_dword = offset,
+            slot,
+            ?usage,
+            "captured raw-EUD storage descriptor from covered load"
+        );
+    }
+
+    Ok(())
+}
+
 /// Kyty: Shader.cpp `ShaderParseUsage2` (L1505) — the PS5 path over the
-/// `ShaderUserData` direct/sharp mapping tables (no EUD/SRT yet, exactly as
-/// upstream).
+/// `ShaderUserData` direct/sharp mapping tables.
 pub fn shader_parse_usage2(
     user_data: &ShaderUserData,
     info: &mut ShaderParsedUsage,
@@ -3482,26 +3741,46 @@ pub fn shader_get_input_info_ps(
             i32::from(regs.ps_regs.rsrc2.user_sgpr),
             mem,
         );
+        let eud_buf = read_extended_user_data(
+            user_data,
+            &regs.ps_user_sgpr,
+            i32::from(regs.ps_regs.rsrc2.user_sgpr),
+            mem,
+            regs.ps_regs.data_addr,
+            next_gen,
+        );
+        let eud_view = eud_buf.as_ref().map(|(data, base_dw)| EudView {
+            data,
+            base_dw: *base_dw,
+        });
         shader_parse_usage2(
             user_data,
             &mut usage,
             &mut ps_info.bind,
             &regs.ps_user_sgpr,
             i32::from(regs.ps_regs.rsrc2.user_sgpr),
-            read_extended_user_data(
-                user_data,
-                &regs.ps_user_sgpr,
-                i32::from(regs.ps_regs.rsrc2.user_sgpr),
-                mem,
-                regs.ps_regs.data_addr,
-                next_gen,
-            )
-            .as_ref()
-            .map(|(data, base_dw)| EudView {
-                data,
-                base_dw: *base_dw,
-            }),
+            eud_view,
         )?;
+        if let Some(view) = eud_view {
+            let mut code = ShaderCode::new();
+            if let Some(src) = mem.dwords_at(regs.ps_regs.data_addr)
+                && shader_parse(0, &src, &mut code, next_gen).is_ok()
+            {
+                shader_capture_eud_storage_buffers(
+                    &code,
+                    &mut ps_info.bind,
+                    &regs.ps_user_sgpr,
+                    view,
+                    mem,
+                )?;
+                shader_capture_eud_image_descriptors(
+                    &code,
+                    &mut ps_info.bind,
+                    &regs.ps_user_sgpr,
+                    view,
+                )?;
+            }
+        }
     } else {
         let code = mem
             .dwords_at(regs.ps_regs.data_addr)
@@ -3616,6 +3895,13 @@ pub fn shader_get_input_info_cs(
                     &regs.cs_user_sgpr,
                     view,
                 )?;
+                shader_capture_eud_storage_buffers(
+                    &code,
+                    &mut info.bind,
+                    &regs.cs_user_sgpr,
+                    view,
+                    mem,
+                )?;
             }
         }
     } else {
@@ -3656,6 +3942,104 @@ pub fn shader_get_input_info_cs(
     shader_calc_binding_indices(&mut info.bind);
 
     Ok(())
+}
+
+/// Refine conservative Gen5 storage-buffer usage with the compute shader's
+/// decoded MUBUF accesses.
+///
+/// Usage tables describe a descriptor table's capability, not necessarily
+/// what one shader does with every entry. Treating every table-1 / untyped
+/// V# as writable forces a full device-to-host copy after every dispatch even
+/// when the shader only loads it. This is particularly expensive for large
+/// global resource heaps.
+///
+/// The refinement is deliberately narrow:
+/// - every V# must be a direct SGPR descriptor (no EUD aliasing);
+/// - every decoded store descriptor must resolve to one of those V#s;
+/// - a candidate must be read directly, never stored directly, and its SGPR
+///   descriptor quad must never be overwritten by the shader.
+///
+/// If any of those proofs is absent, the conservative `ReadWrite` usage is
+/// retained. SPIR-V resource layout is unchanged; this only suppresses
+/// needless guest writeback for proven input-only descriptors.
+pub fn shader_refine_compute_storage_usage(code: &ShaderCode, bind: &mut ShaderBindResources) {
+    use ShaderInstructionType as T;
+
+    let count = usize::try_from(bind.storage_buffers.buffers_num)
+        .unwrap_or(0)
+        .min(bind.storage_buffers.buffers.len());
+    if count == 0 || bind.storage_buffers.extended[..count].iter().any(|&x| x) {
+        return;
+    }
+
+    let starts = &bind.storage_buffers.start_register[..count];
+    let mut loads = Vec::new();
+    let mut stores = Vec::new();
+    for inst in code.get_instructions() {
+        let is_load = matches!(
+            inst.type_,
+            T::BufferLoadDword
+                | T::BufferLoadDwordX2
+                | T::BufferLoadDwordX3
+                | T::BufferLoadDwordX4
+                | T::BufferLoadUbyte
+                | T::BufferLoadFormatX
+                | T::BufferLoadFormatXy
+                | T::BufferLoadFormatXyz
+                | T::BufferLoadFormatXyzw
+        );
+        let is_store = matches!(
+            inst.type_,
+            T::BufferStoreDword
+                | T::BufferStoreDwordX2
+                | T::BufferStoreDwordX4
+                | T::BufferStoreFormatX
+                | T::BufferStoreFormatXy
+                | T::BufferStoreFormatXyz
+                | T::BufferStoreFormatXyzw
+        );
+        if (is_load || is_store) && inst.src[1].type_ == ShaderOperandType::Sgpr {
+            if is_load {
+                loads.push(inst.src[1].register_id);
+            } else {
+                stores.push(inst.src[1].register_id);
+            }
+        }
+    }
+
+    // An unresolved store may access one of the descriptors through an alias
+    // assembled in other SGPRs. Without full scalar dataflow, retain every
+    // conservative write flag in that case.
+    if stores.iter().any(|reg| !starts.contains(reg)) {
+        return;
+    }
+
+    let descriptor_overwritten = |start: i32| {
+        let end = start.saturating_add(4);
+        code.get_instructions().iter().any(|inst| {
+            [inst.dst, inst.dst2].into_iter().any(|dst| {
+                if dst.type_ != ShaderOperandType::Sgpr {
+                    return false;
+                }
+                let dst_end = dst.register_id.saturating_add(dst.size.max(1));
+                dst.register_id < end && dst_end > start
+            })
+        })
+    };
+
+    for (index, &start) in starts.iter().enumerate() {
+        if bind.storage_buffers.usages[index] != ShaderStorageUsage::ReadWrite {
+            continue;
+        }
+        if loads.contains(&start) && !stores.contains(&start) && !descriptor_overwritten(start) {
+            bind.storage_buffers.usages[index] = ShaderStorageUsage::ReadOnly;
+            tracing::debug!(
+                start_register = start,
+                slot = bind.storage_buffers.slots[index],
+                "compute storage V# proven load-only by decoded MUBUF accesses"
+            );
+        }
+    }
 }
 
 /// Kyty: Shader.cpp `ShaderGetBindIds` (L2679). The id keys on the *binding
@@ -6544,6 +6928,84 @@ mod tests {
         );
     }
 
+    /// Minecraft's post-title fragment shader declares a table-1 V# at the
+    /// EUD base (s28), but its scalar program loads the descriptor actually
+    /// used by MUBUF from byte offset 0x20. Dword 0 contains the exact
+    /// non-descriptor tuple observed in the runner; dword 8 contains the
+    /// valid three-record V#. The stale declaration must not survive binding.
+    #[test]
+    fn raw_eud_storage_uses_covered_load_instead_of_declared_dword_zero() {
+        use crate::shader::types::ShaderInstructionType as T;
+
+        let mut bind = ShaderBindResources::default();
+        bind.extended.used = true;
+        bind.extended.start_register = 28;
+        bind.storage_buffers.buffers_num = 1;
+        bind.storage_buffers.start_register[0] = 28;
+        bind.storage_buffers.extended[0] = true;
+        bind.storage_buffers.slots[0] = 1;
+        bind.storage_buffers.usages[0] = ShaderStorageUsage::ReadWrite;
+        bind.storage_buffers.buffers[0].fields =
+            [0x0000_0692, 0x00ff_f000, 0x0600_0000, 0x4000_0000];
+
+        let mut bad_load0 = covered_load(T::SLoadDwordx4, 12, 4, 0x0);
+        bad_load0.src[0] = sgpr_op(28, 2);
+        let mut bad_load4 = covered_load(T::SLoadDwordx4, 12, 4, 0x10);
+        bad_load4.src[0] = sgpr_op(28, 2);
+        let mut live_load = covered_load(T::SLoadDwordx4, 12, 4, 0x20);
+        live_load.src[0] = sgpr_op(28, 2);
+        let mut buffer_load = ShaderInstruction {
+            type_: T::BufferLoadDword,
+            ..Default::default()
+        };
+        buffer_load.src[1] = sgpr_op(12, 4);
+
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut().push(bad_load0);
+        code.get_instructions_mut().push(bad_load4);
+        code.get_instructions_mut().push(live_load);
+        code.get_instructions_mut().push(buffer_load);
+
+        let mut eud = vec![0u32; 32];
+        eud[..4].copy_from_slice(&[0x0000_0692, 0x00ff_f000, 0x0600_0000, 0x4000_0000]);
+        eud[4..8].copy_from_slice(&[0x0000_0692, 0x00ff_f000, 0x0600_0000, 0x4000_0000]);
+        let valid = [0x16f9_d9c0, 0x0010_0000, 0x0000_0003, 0x0004_dfac];
+        eud[8..12].copy_from_slice(&valid);
+        let user_sgpr = UserSgprInfo {
+            value: [0u32; UserSgprInfo::SGPRS_MAX],
+            type_: [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX],
+            count: 30,
+        };
+        let mem = TestMem {
+            regions: vec![(u64::from(valid[0]), vec![0; 16])],
+        };
+
+        shader_capture_eud_storage_buffers(
+            &code,
+            &mut bind,
+            &user_sgpr,
+            EudView {
+                data: &eud,
+                base_dw: 28,
+            },
+            &mem,
+        )
+        .expect("covered EUD V# must replace the stale declaration");
+
+        assert_eq!(bind.storage_buffers.buffers_num, 1);
+        assert_eq!(
+            bind.storage_buffers.start_register[0],
+            UserSgprInfo::SGPRS_MAX as i32 + 8
+        );
+        assert!(bind.storage_buffers.extended[0]);
+        assert_eq!(bind.storage_buffers.slots[0], 1);
+        assert_eq!(
+            bind.storage_buffers.usages[0],
+            ShaderStorageUsage::ReadWrite
+        );
+        assert_eq!(bind.storage_buffers.buffers[0].fields, valid);
+    }
+
     /// The pair scan must not invent pointers: no readable pair -> None.
     #[test]
     fn eud_adjacent_pair_scan_refuses_unbacked_pairs() {
@@ -6568,6 +7030,62 @@ mod tests {
         assert_eq!(
             read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true),
             None
+        );
+    }
+
+    #[test]
+    fn compute_storage_usage_proves_large_input_read_only() {
+        use crate::shader::types::ShaderInstructionType as T;
+
+        let mut bind = ShaderBindResources::default();
+        bind.storage_buffers.buffers_num = 2;
+        bind.storage_buffers.start_register[..2].copy_from_slice(&[0, 4]);
+        bind.storage_buffers.usages[..2].fill(ShaderStorageUsage::ReadWrite);
+
+        let mut code = ShaderCode::new();
+        let mut load = ShaderInstruction {
+            type_: T::BufferLoadDword,
+            ..Default::default()
+        };
+        load.src[1] = sgpr_op(0, 4);
+        code.get_instructions_mut().push(load);
+        let mut store = ShaderInstruction {
+            type_: T::BufferStoreDword,
+            ..Default::default()
+        };
+        store.src[1] = sgpr_op(4, 4);
+        code.get_instructions_mut().push(store);
+
+        shader_refine_compute_storage_usage(&code, &mut bind);
+        assert_eq!(
+            bind.storage_buffers.usages[..2],
+            [ShaderStorageUsage::ReadOnly, ShaderStorageUsage::ReadWrite],
+            "a load-only input must not be copied back; the actual store target remains writable"
+        );
+
+        // An unresolved store may be an SGPR alias of either descriptor. The
+        // narrow proof must fail closed and preserve both write flags.
+        bind.storage_buffers.usages[..2].fill(ShaderStorageUsage::ReadWrite);
+        code.get_instructions_mut().last_mut().unwrap().src[1] = sgpr_op(12, 4);
+        shader_refine_compute_storage_usage(&code, &mut bind);
+        assert_eq!(
+            bind.storage_buffers.usages[..2],
+            [ShaderStorageUsage::ReadWrite, ShaderStorageUsage::ReadWrite]
+        );
+
+        // A shader that mutates the input descriptor quad also cannot use the
+        // direct-register proof.
+        code.get_instructions_mut().last_mut().unwrap().src[1] = sgpr_op(4, 4);
+        let mut mutate = ShaderInstruction {
+            type_: T::SMovB32,
+            ..Default::default()
+        };
+        mutate.dst = sgpr_op(0, 1);
+        code.get_instructions_mut().push(mutate);
+        shader_refine_compute_storage_usage(&code, &mut bind);
+        assert_eq!(
+            bind.storage_buffers.usages[0],
+            ShaderStorageUsage::ReadWrite
         );
     }
 }

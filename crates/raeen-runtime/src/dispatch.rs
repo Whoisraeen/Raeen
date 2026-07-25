@@ -902,6 +902,29 @@ pub(crate) extern "sysv64" fn direct_hle_gateway(
         HLE_ENTERS.fetch_add(1, Ordering::Relaxed);
         HLE_DIRECT_DISPATCHES.fetch_add(1, Ordering::Relaxed);
         let _hle_yield = GuestGilYield::during_hle();
+        let timed = *TIME_HLE.get_or_init(|| std::env::var_os("RAEEN_TIME_HLE").is_some());
+        let started = timed.then(std::time::Instant::now);
+        let function_key = (timed
+            || *CALL_STATS.get_or_init(|| std::env::var_os("RAEEN_CALL_STATS").is_some()))
+        .then(|| format!("{}::{}", t.library, t.function));
+        if *CALL_STATS.get().expect("initialized above") {
+            let counters = kernel
+                .hle_call_counts
+                .entry(function_key.as_ref().expect("call-stat key").clone())
+                .or_default();
+            let (boot, steady) = counters.value();
+            if kernel.uptime() < CALL_STATS_BOOT_WINDOW {
+                boot.fetch_add(1, Ordering::Relaxed);
+            } else {
+                steady.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if timed {
+            kernel.in_flight_hle.insert(
+                ctx.current_thread(),
+                function_key.as_ref().expect("timing key").clone(),
+            );
+        }
 
         let hle_ctx = HleContext {
             kernel,
@@ -920,6 +943,19 @@ pub(crate) extern "sysv64" fn direct_hle_gateway(
         let result = hle
             .call(&hle_ctx, &t.library, &t.function, &args)
             .unwrap_or(0);
+        if timed {
+            kernel.in_flight_hle.remove(&ctx.current_thread());
+            let micros = started.map_or(0, |s| s.elapsed().as_micros());
+            let mut entry = kernel
+                .hle_call_time
+                .entry((
+                    ctx.current_thread(),
+                    function_key.as_ref().expect("timing key").clone(),
+                ))
+                .or_default();
+            entry.0 += 1;
+            entry.1 += micros;
+        }
         ctx.active_hle.set(None);
 
         if let Some(request) = ctx.pending_guest_call.take() {

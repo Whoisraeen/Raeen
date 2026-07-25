@@ -71,7 +71,16 @@ the decoder but never executed — the "559 draws" figure overstates reality.
 5. **Scanout tiling/format skips → black frames** — `agc_exec.rs` skips
    unsupported tile modes ("never faked"). Port KytyPS5 **GPU compute detiler**
    (`tile.cpp` 1,644 + `gpuTiler.cpp` 537, recently perf-fixed) + Kyty's
-   `TileTextureInfo_*.inc` tables; Raeen's `tiling.rs` is CPU-only, 2 modes.
+   `TileTextureInfo_*.inc` tables.
+   **CORRECTED 2026-07-24:** the claim "Raeen's `tiling.rs` is CPU-only, 2 modes"
+   was already stale. It implements **4** modes (5/9/24/27) at 5 element sizes,
+   and those equations were verified **bit-for-bit identical** to SharpEmu's
+   (320/320 table entries; 8/8 simulated surfaces byte-identical) — see the
+   2026-07-24 refresh in `docs/reference-port-ledger.md`. Still CPU-only, and
+   still missing modes 1/4/8; a rate-limited `(tile_mode, format)` diagnostic on
+   the refusal path now names which modes titles actually bind, so that port is
+   gated on measurement rather than assumption. The bigger real gap here is that
+   `texture_vk_format` has **no block-compressed (BC) format arms at all**.
 
 ## Tier 3 — ordered GPU side effects (correctness foundation)
 

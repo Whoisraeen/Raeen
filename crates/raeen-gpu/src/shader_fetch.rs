@@ -61,6 +61,12 @@ const CHUNK_DWORDS: usize = 1024;
 const MAX_WINDOW_DWORDS: usize = 0x1_0000;
 /// Hard cap on translated modules and binding-aware failures.
 const MAX_CACHE_ENTRIES: usize = 256;
+/// Bump whenever generated SPIR-V or the binding-identity contract changes.
+// v2: guest Cube descriptors remain Vulkan 2D arrays, but their V_CUBE*
+// generated S/T coordinates are rebased from the guest [1, 2] convention to
+// Vulkan's [0, 1].  Reusing v1 modules silently restores Minecraft's flat
+// green panorama, so this codegen change must get a fresh namespace.
+const DISK_CACHE_VERSION: u32 = 2;
 /// `s_endpgm` — identical encoding on GCN and RDNA2 (SOPP op 1).
 const S_ENDPGM: u32 = 0xBF81_0000;
 
@@ -416,6 +422,10 @@ pub struct ShaderCacheStats {
     pub translate_failed: u64,
     /// Binding-aware module/error hits after fresh analysis.
     pub hits: u64,
+    /// Positive modules restored from the versioned on-disk cache.
+    pub disk_hits: u64,
+    /// Positive modules committed to the versioned on-disk cache.
+    pub disk_writes: u64,
 }
 
 /// Fetch + translate + cache for guest shader code.
@@ -424,6 +434,7 @@ pub struct ShaderTranslateCache {
     insertion_order: VecDeque<CacheKey>,
     shader_map: ShaderMap,
     dump_dir: Option<PathBuf>,
+    persistent_dir: Option<PathBuf>,
     stats: ShaderCacheStats,
 }
 
@@ -441,17 +452,39 @@ impl ShaderTranslateCache {
             .ok()
             .filter(|d| !d.is_empty())
             .map(PathBuf::from);
-        Self::with_dump_dir(dump_dir)
+        let config = crate::agc_exec::AgcGpuSession::runtime_config();
+        // Draw tracing instruments the recompiler itself (POS0 exports,
+        // embedded Fetch* VGPR writes). A persistent SPIR-V hit bypasses those
+        // probes and used to make a traced run falsely report that neither path
+        // executed. Keep the in-process cache, but force the first bind through
+        // translation whenever tracing is explicitly requested.
+        let persistent_dir = persistent_cache_enabled(
+            config.shader_cache,
+            std::env::var_os("RAEEN_TRACE_DRAWS").is_some(),
+        )
+        .then(|| {
+            config
+                .shader_cache_dir
+                .join(format!("spirv-v{DISK_CACHE_VERSION}"))
+        });
+        Self::with_dirs(dump_dir, persistent_dir)
     }
 
     /// Cache with an explicit dump directory (tests; `None` disables dumps).
     #[must_use]
+    #[cfg(test)]
     pub fn with_dump_dir(dump_dir: Option<PathBuf>) -> Self {
+        Self::with_dirs(dump_dir, None)
+    }
+
+    #[must_use]
+    fn with_dirs(dump_dir: Option<PathBuf>, persistent_dir: Option<PathBuf>) -> Self {
         Self {
             entries: HashMap::new(),
             insertion_order: VecDeque::new(),
             shader_map: ShaderMap::new(),
             dump_dir,
+            persistent_dir,
             stats: ShaderCacheStats::default(),
         }
     }
@@ -613,6 +646,16 @@ impl ShaderTranslateCache {
                 let mut cs_info = ShaderComputeInputInfo::default();
                 shader_get_input_info_cs(&cs, &sh_regs, mem, &shader_map, next_gen, &mut cs_info)
                     .map_err(|e| AttemptError::from_analysis("shader_get_input_info_cs", &e))?;
+                // A Gen5 resource table can declare a large V# in its
+                // read-write table even when this particular shader only
+                // loads it. Prove direct load-only descriptors from the
+                // decoded MUBUF operands before binding identity/codegen so
+                // the compute backend does not copy an untouched heap back
+                // to guest memory after every dispatch.
+                kyty_graphics::shader::shader_refine_compute_storage_usage(
+                    &code,
+                    &mut cs_info.bind,
+                );
                 // SharpEmu-parity safe degradation: a sampled MIMG whose T#
                 // register matches no captured descriptor (a runtime/bindless
                 // texture the static capture missed) gets a 1x1 placeholder T#
@@ -777,6 +820,12 @@ impl ShaderTranslateCache {
                 Err(reason) => Err(reason),
             };
         }
+        if let Some(spirv) = self.load_persistent(&key) {
+            self.stats.hits += 1;
+            self.stats.disk_hits += 1;
+            self.insert_entry(key, Ok(Arc::clone(&spirv)));
+            return Ok(prepared.into_translated(spirv));
+        }
 
         self.stats.distinct_fetched += 1;
         self.dump_shader(stage, addr, &window.data);
@@ -814,6 +863,9 @@ impl ShaderTranslateCache {
                     "guest shader fetched and translated to SPIR-V"
                 );
                 self.dump_spirv(stage, addr, &spirv);
+                if self.store_persistent(&key, &spirv) {
+                    self.stats.disk_writes += 1;
+                }
                 self.insert_entry(key, Ok(spirv.clone()));
                 Ok(prepared.into_translated(spirv))
             }
@@ -835,6 +887,131 @@ impl ShaderTranslateCache {
                 );
                 self.insert_entry(key, Err(reason.clone()));
                 Err(reason)
+            }
+        }
+    }
+
+    fn persistent_path(&self, key: &CacheKey) -> Option<PathBuf> {
+        let dir = self.persistent_dir.as_ref()?;
+        // The guest address is deliberately absent: a future relocated arena
+        // must still reuse byte-identical shaders. The two digests cover the
+        // parsed source and every ABI field that can shape generated SPIR-V.
+        let mut binding_hasher = std::collections::hash_map::DefaultHasher::new();
+        key.binding.hash(&mut binding_hasher);
+        Some(dir.join(format!(
+            "{}-{:08x}-{:016x}-{:016x}.spv",
+            key.code.stage.as_str(),
+            key.code.fetched_dwords,
+            key.code.digest,
+            binding_hasher.finish()
+        )))
+    }
+
+    fn load_persistent(&self, key: &CacheKey) -> Option<Arc<Vec<u32>>> {
+        let path = self.persistent_path(key)?;
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                debug!(%error, path = %path.display(), "persistent shader-cache read failed");
+                return None;
+            }
+        };
+        if bytes.len() < 20 || !bytes.len().is_multiple_of(4) {
+            warn!(
+                path = %path.display(),
+                bytes = bytes.len(),
+                "discarding malformed persistent shader cache entry"
+            );
+            let _ = std::fs::remove_file(path);
+            return None;
+        }
+        let spirv: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte SPIR-V word")))
+            .collect();
+        if spirv.first().copied() != Some(0x0723_0203) {
+            warn!(
+                path = %path.display(),
+                "discarding persistent shader cache entry with bad SPIR-V magic"
+            );
+            let _ = std::fs::remove_file(path);
+            return None;
+        }
+        if crate::spirv_gate::gate_enabled()
+            && let Err(reason) = crate::spirv_gate::validate_spirv(&spirv)
+        {
+            warn!(
+                path = %path.display(),
+                %reason,
+                "discarding invalid persistent shader cache entry"
+            );
+            let _ = std::fs::remove_file(path);
+            return None;
+        }
+        debug!(
+            path = %path.display(),
+            words = spirv.len(),
+            "persistent shader cache hit"
+        );
+        Some(Arc::new(spirv))
+    }
+
+    fn store_persistent(&self, key: &CacheKey, spirv: &[u32]) -> bool {
+        let Some(path) = self.persistent_path(key) else {
+            return false;
+        };
+        if path.exists() {
+            return false;
+        }
+        let Some(dir) = path.parent() else {
+            return false;
+        };
+        if let Err(error) = std::fs::create_dir_all(dir) {
+            warn!(
+                %error,
+                path = %dir.display(),
+                "persistent shader-cache directory creation failed"
+            );
+            return false;
+        }
+        let bytes: Vec<u8> = spirv.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+        if let Err(error) = std::fs::write(&temp, bytes) {
+            warn!(
+                %error,
+                path = %temp.display(),
+                "persistent shader-cache write failed"
+            );
+            return false;
+        }
+        match std::fs::rename(&temp, &path) {
+            Ok(()) => {
+                debug!(
+                    path = %path.display(),
+                    words = spirv.len(),
+                    "persistent shader cache stored"
+                );
+                true
+            }
+            Err(error) if path.exists() => {
+                // Another process won the content-addressed cache race.
+                let _ = std::fs::remove_file(temp);
+                debug!(
+                    %error,
+                    path = %path.display(),
+                    "persistent shader cache already stored"
+                );
+                false
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(temp);
+                warn!(
+                    %error,
+                    path = %path.display(),
+                    "persistent shader-cache commit failed"
+                );
+                false
             }
         }
     }
@@ -874,6 +1051,10 @@ impl ShaderTranslateCache {
             Err(e) => warn!(error = %e, path = %path.display(), "SPIR-V dump failed"),
         }
     }
+}
+
+const fn persistent_cache_enabled(config_enabled: bool, tracing_draws: bool) -> bool {
+    config_enabled && !tracing_draws
 }
 
 /// How many leading dwords of the fetched window to dump.
@@ -986,6 +1167,13 @@ fn attempt_generations<T>(
 mod tests {
     use super::*;
     use kyty_graphics::hw_regs::PsStageRegisters;
+
+    #[test]
+    fn draw_trace_bypasses_persistent_spirv_but_not_normal_configuration() {
+        assert!(persistent_cache_enabled(true, false));
+        assert!(!persistent_cache_enabled(true, true));
+        assert!(!persistent_cache_enabled(false, false));
+    }
 
     /// Minimal GCN vertex shader (the `kyty-graphics` recompile fixture):
     /// v_mov v0, 1.0; v_mov v1, 0; v_mul v2, v0, v1; exp pos0; exp param0;
@@ -1123,6 +1311,39 @@ mod tests {
                 assert_eq!((s.distinct_fetched, s.translated_ok, s.hits), (1, 1, 1));
             },
         );
+    }
+
+    #[test]
+    fn guest_vs_round_trips_through_the_persistent_cache() {
+        let blob = build_blob(VS_BODY, 0xAAAA_00D1, 0xBBBB_00D1);
+        let addr = blob.as_ptr() as u64;
+        let dir = std::env::temp_dir().join(format!(
+            "raeen-shader-cache-test-{}-{:x}",
+            std::process::id(),
+            addr
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sh_regs = ShaderRegisters::default();
+
+        crate::guest_mem::with_test_ranges(
+            &[(addr, std::mem::size_of_val(blob.as_slice()))],
+            || {
+                let mut writer = ShaderTranslateCache::with_dirs(None, Some(dir.clone()));
+                let first = writer
+                    .translate_vs(&vs_regs_at(addr), &sh_regs)
+                    .expect("initial translation");
+                assert_eq!(writer.stats().disk_writes, 1);
+
+                let mut reader = ShaderTranslateCache::with_dirs(None, Some(dir.clone()));
+                let second = reader
+                    .translate_vs(&vs_regs_at(addr), &sh_regs)
+                    .expect("persistent hit");
+                assert_eq!(first.spirv, second.spirv);
+                assert_eq!(reader.stats().disk_hits, 1);
+                assert_eq!(reader.stats().translated_ok, 0);
+            },
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -62,6 +62,37 @@ pub fn register(registry: &HleRegistry) {
         "sceUserServiceGetGamePresets",
         hle_get_game_presets,
     );
+    registry.register(
+        "libSceUserService",
+        "sceUserServiceGetAgeLevel",
+        hle_get_age_level,
+    );
+    // The rest of the accessibility getter family, same `(userId, int32_t *out)`
+    // shape and same SharpEmu defaults (`UserServiceExports.cs:227-273`): every
+    // accessibility aid off. Registered as a family rather than one-per-fault
+    // because a title that reads one reads several, and each miss costs a whole
+    // measure/build/re-run cycle (Subnautica walked GetAgeLevel ->
+    // GetAccessibilityChatTranscription one import at a time).
+    registry.register(
+        "libSceUserService",
+        "sceUserServiceGetAccessibilityChatTranscription",
+        hle_get_accessibility_chat_transcription,
+    );
+    registry.register(
+        "libSceUserService",
+        "sceUserServiceGetAccessibilityPressAndHoldDelay",
+        hle_get_accessibility_press_and_hold_delay,
+    );
+    registry.register(
+        "libSceUserService",
+        "sceUserServiceGetAccessibilityZoomEnabled",
+        hle_get_accessibility_zoom_enabled,
+    );
+    registry.register(
+        "libSceUserService",
+        "sceUserServiceGetAccessibilityZoomFollowFocus",
+        hle_get_accessibility_zoom_follow_focus,
+    );
     // `sceUserServiceGetPlatformPrivacySetting(parameterId, int32_t *value)`
     // — SharpEmu `UserServiceExports`: parameterId 1000
     // gets value 0 ("no restriction"). SharpEmu's name is a recovered label
@@ -116,6 +147,57 @@ fn write_user_setting_i32(ctx: &HleContext, args: &[u64], value: i32, name: &str
 /// 0 = the user has NOT reduced adaptive-trigger effects (default).
 fn hle_get_accessibility_trigger_effect(ctx: &HleContext, args: &[u64]) -> u64 {
     write_user_setting_i32(ctx, args, 0, "sceUserServiceGetAccessibilityTriggerEffect")
+}
+
+/// `sceUserServiceGetAgeLevel(userId, int32_t *out)`: the account's age level,
+/// which titles gate age-restricted content and online features on.
+///
+/// 18 = an adult account with nothing restricted, matching SharpEmu
+/// (`UserServiceExports.cs:184-190`, `WriteUserSettingInt32(ctx, 18, …)`).
+/// Measured as Subnautica Below Zero's blocker immediately after its Unity
+/// launcher banner.
+fn hle_get_age_level(ctx: &HleContext, args: &[u64]) -> u64 {
+    const ADULT_AGE_LEVEL: i32 = 18;
+    write_user_setting_i32(ctx, args, ADULT_AGE_LEVEL, "sceUserServiceGetAgeLevel")
+}
+
+/// `sceUserServiceGetAccessibilityChatTranscription(userId, int32_t *out)`:
+/// 0 = chat transcription off (SharpEmu default).
+fn hle_get_accessibility_chat_transcription(ctx: &HleContext, args: &[u64]) -> u64 {
+    write_user_setting_i32(
+        ctx,
+        args,
+        0,
+        "sceUserServiceGetAccessibilityChatTranscription",
+    )
+}
+
+/// `sceUserServiceGetAccessibilityPressAndHoldDelay(userId, int32_t *out)`:
+/// 0 = the standard press-and-hold delay, not an extended one.
+fn hle_get_accessibility_press_and_hold_delay(ctx: &HleContext, args: &[u64]) -> u64 {
+    write_user_setting_i32(
+        ctx,
+        args,
+        0,
+        "sceUserServiceGetAccessibilityPressAndHoldDelay",
+    )
+}
+
+/// `sceUserServiceGetAccessibilityZoomEnabled(userId, int32_t *out)`:
+/// 0 = screen zoom off.
+fn hle_get_accessibility_zoom_enabled(ctx: &HleContext, args: &[u64]) -> u64 {
+    write_user_setting_i32(ctx, args, 0, "sceUserServiceGetAccessibilityZoomEnabled")
+}
+
+/// `sceUserServiceGetAccessibilityZoomFollowFocus(userId, int32_t *out)`:
+/// 0 = zoom does not follow focus.
+fn hle_get_accessibility_zoom_follow_focus(ctx: &HleContext, args: &[u64]) -> u64 {
+    write_user_setting_i32(
+        ctx,
+        args,
+        0,
+        "sceUserServiceGetAccessibilityZoomFollowFocus",
+    )
 }
 
 /// `sceUserServiceGetAccessibilityVibration(userId, int32_t *out)`:
@@ -247,6 +329,78 @@ fn hle_get_event(ctx: &HleContext, args: &[u64]) -> u64 {
 mod tests {
     use super::*;
     use crate::{GuestMemory, test_ctx};
+
+    /// Subnautica Below Zero dies on this import right after its Unity
+    /// launcher banner. It must report an unrestricted adult account.
+    ///
+    /// The companion assertion — that name-derived registration lands on the
+    /// NID the title actually imports (`0xc28369bbee3944b9`, encoded
+    /// `woNpu+45RLk`) — lives in `raeen-firmware`, which owns NID hashing and
+    /// provider-aware resolution.
+    #[test]
+    fn age_level_reports_an_adult_account() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(
+            hle_get_age_level(&ctx, &[PRIMARY_USER_ID as u64, 0x100]),
+            SCE_OK
+        );
+        let mut age = [0u8; 4];
+        assert!(mem.read(0x100, &mut age));
+        assert_eq!(i32::from_le_bytes(age), 18);
+
+        // A non-primary user and an unwritable out-pointer must be refused
+        // rather than silently reporting an age.
+        assert_ne!(hle_get_age_level(&ctx, &[0xdead, 0x100]), SCE_OK);
+        assert_ne!(
+            hle_get_age_level(&ctx, &[PRIMARY_USER_ID as u64, 0]),
+            SCE_OK
+        );
+    }
+
+    /// The remaining accessibility getters all report "aid disabled", matching
+    /// SharpEmu. Registered and tested as a family so a title reading several
+    /// of them does not cost one measure/build/re-run cycle per import.
+    #[test]
+    fn remaining_accessibility_getters_report_aids_disabled() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let family: [(&str, fn(&HleContext, &[u64]) -> u64); 4] = [
+            (
+                "ChatTranscription",
+                hle_get_accessibility_chat_transcription,
+            ),
+            (
+                "PressAndHoldDelay",
+                hle_get_accessibility_press_and_hold_delay,
+            ),
+            ("ZoomEnabled", hle_get_accessibility_zoom_enabled),
+            ("ZoomFollowFocus", hle_get_accessibility_zoom_follow_focus),
+        ];
+
+        for (name, handler) in family {
+            assert_eq!(
+                handler(&ctx, &[PRIMARY_USER_ID as u64, 0x100]),
+                SCE_OK,
+                "{name} must succeed for the primary user"
+            );
+            let mut value = [0u8; 4];
+            assert!(mem.read(0x100, &mut value));
+            assert_eq!(i32::from_le_bytes(value), 0, "{name} must report disabled");
+
+            assert_ne!(
+                handler(&ctx, &[PRIMARY_USER_ID as u64, 0]),
+                SCE_OK,
+                "{name} must refuse a null out-pointer"
+            );
+        }
+    }
 
     #[test]
     fn initial_user_and_login_list() {

@@ -126,9 +126,16 @@ impl GameFrameView {
         screen: egui::Rect,
         presented_frames: Option<u64>,
     ) -> Presented {
-        self.frame_rate.observe(Instant::now(), presented_frames);
         let session = raeen_gpu::AgcGpuSession::global();
         let remote = raeen_gpu::frame_ipc::latest_remote_frame();
+        // The isolated runner owns the real VideoOut counter. Share it
+        // separately from frame pixels so a static/reused complete image still
+        // reports live presentation cadence instead of `0 FPS`. The old frame
+        // sequence remains a compatibility fallback for a pre-v4 child.
+        let measured_frames = raeen_gpu::frame_ipc::latest_remote_present_count()
+            .or_else(|| remote.as_ref().map(|frame| frame.epoch / 2))
+            .or(presented_frames);
+        self.frame_rate.observe(Instant::now(), measured_frames);
         // Refresh on the GPU worker's published-frame epoch, NOT the guest-side
         // flip counter (`presented_frames`, still used only for the FPS badge):
         // under the bounded async flip the guest flips ahead of the frames the
@@ -302,5 +309,14 @@ mod tests {
             display_epoch(2, Some(&remote)),
             REMOTE_EPOCH_BIT | remote.epoch
         );
+    }
+
+    #[test]
+    fn remote_sequence_exports_the_child_present_count_for_fps() {
+        let start = Instant::now();
+        let mut rate = PresentedFrameRate::default();
+        rate.observe(start, Some(10 / 2));
+        rate.observe(start + Duration::from_secs(1), Some(130 / 2));
+        assert_eq!(rate.label(), "60 FPS");
     }
 }

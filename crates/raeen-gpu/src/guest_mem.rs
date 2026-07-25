@@ -20,6 +20,23 @@ use std::sync::{Arc, Mutex};
 pub trait GpuGuestMemory: Send + Sync {
     fn validate_gpu_range(&self, addr: u64, len: u64, write: bool) -> bool;
     fn read_gpu(&self, addr: u64, out: &mut [u8]) -> bool;
+    /// Copy guest bytes into uninitialized host storage.
+    ///
+    /// # Safety
+    ///
+    /// Returning `true` promises that every element of `out` was initialized.
+    /// The default initializes the slice before delegating to [`Self::read_gpu`];
+    /// identity-mapped process authorities may override this to copy directly.
+    unsafe fn read_gpu_uninit(&self, addr: u64, out: &mut [std::mem::MaybeUninit<u8>]) -> bool {
+        for byte in out.iter_mut() {
+            byte.write(0);
+        }
+        // SAFETY: every element was initialized to zero above, and u8 accepts
+        // every bit pattern.
+        let initialized =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), out.len()) };
+        self.read_gpu(addr, initialized)
+    }
     fn write_gpu(&self, addr: u64, data: &[u8]) -> bool;
 }
 
@@ -127,12 +144,7 @@ impl GuestMemory for IdentityGuestMemory {
     /// a 1080p scanout buffer is ~8 MiB — far beyond the pointer-read cap but
     /// a legitimate resource-sized transfer).
     fn read_bytes(&self, addr: u64, len: u64) -> Option<Vec<u8>> {
-        if len == 0 || !len.is_multiple_of(4) {
-            return None;
-        }
-        let count = u32::try_from(len / 4).ok()?;
-        let dwords = read_dwords_validated(addr, count)?;
-        Some(dwords.iter().flat_map(|w| w.to_le_bytes()).collect())
+        read_bytes_validated(addr, len)
     }
 
     fn write_bytes(&self, addr: u64, bytes: &[u8]) -> bool {
@@ -202,6 +214,36 @@ pub(crate) fn read_dwords_validated(addr: u64, count: u32) -> Option<Vec<u32>> {
     Some(out)
 }
 
+/// Process-authorized resource read directly into bytes.
+///
+/// This has the same address, size, submission-budget, and memory-authority
+/// contract as [`read_dwords_validated`] but avoids the old two-allocation
+/// `Vec<u32> -> Vec<u8>` conversion in texture/storage/vertex hot paths.
+pub(crate) fn read_bytes_validated(addr: u64, len: u64) -> Option<Vec<u8>> {
+    if len == 0 || !len.is_multiple_of(4) || addr == 0 || !addr.is_multiple_of(4) {
+        return None;
+    }
+    let count = u32::try_from(len / 4).ok()?;
+    if count == 0 || count > MAX_RESOURCE_READ_DWORDS || !charge_guest_bytes(len) {
+        return None;
+    }
+    let bytes = usize::try_from(len).ok()?;
+    let mut out = Vec::<u8>::new();
+    out.try_reserve_exact(bytes).ok()?;
+    let spare = &mut out.spare_capacity_mut()[..bytes];
+    // SAFETY: `read_gpu_uninit` may return true only after initializing every
+    // byte in `spare`; the length is exposed only on that success path.
+    let accepted = with_active_memory(|memory| unsafe {
+        memory.validate_gpu_range(addr, len, false) && memory.read_gpu_uninit(addr, spare)
+    })?;
+    if !accepted {
+        return None;
+    }
+    // SAFETY: the accepted authority call initialized all `bytes` elements.
+    unsafe { out.set_len(bytes) };
+    Some(out)
+}
+
 /// Scene→scanout fill trace (SharpEmu port task #5). The title composites its
 /// HDR scene into a set of render targets, then flips to a *different* display
 /// buffer (e.g. ASTRO.BOT renders to 0x53a.../0x539... but flips to
@@ -235,6 +277,26 @@ pub(crate) fn register_scanout_watch(addr: u64, byte_len: u64) {
             watch.push((addr, span));
         }
     }
+}
+
+/// Whether a compute storage image can be a display/composite candidate.
+///
+/// Titles also use compute storage images for square atlases, mip generation,
+/// and detiling. Putting every non-zero UAV into the presentation census lets
+/// those resources replace the real frame. An exact VideoOut address is always
+/// eligible; an intermediate at another address is eligible only when its byte
+/// extent matches a known, explicitly sized scanout.
+pub(crate) fn is_scanout_candidate(addr: u64, byte_len: usize) -> bool {
+    if addr == 0 || byte_len == 0 {
+        return false;
+    }
+    SCANOUT_WATCH.lock().is_ok_and(|watch| {
+        watch.iter().any(|&(base, span)| {
+            addr == base
+                || (span != SCANOUT_WATCH_DEFAULT_SPAN
+                    && (span == byte_len as u64 || span / 2 == byte_len as u64))
+        })
+    })
 }
 
 /// Report a guest write that lands in a watched flipped display buffer, tagged
@@ -286,6 +348,51 @@ pub(crate) fn write_bytes_checked(addr: u64, bytes: &[u8]) -> bool {
         memory.validate_gpu_range(addr, bytes.len() as u64, true) && memory.write_gpu(addr, bytes)
     })
     .unwrap_or(false)
+}
+
+/// Result of trying to mirror a completed compute storage image into guest
+/// memory.
+///
+/// Storage images can be GPU-only allocations: later draws consume their
+/// persistent Vulkan image even when no CPU-visible guest mapping exists.
+/// Refusing the whole submission in that case discards a valid compositor
+/// result. Storage-buffer writeback deliberately does not use this policy
+/// because guest CPU code may depend on those bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ComputeImageGuestMirror {
+    Written,
+    GpuOnly,
+}
+
+/// Best-effort CPU mirror for a compute storage image.
+///
+/// [`ComputeImageGuestMirror::GpuOnly`] is a successful GPU publication: the
+/// caller must retain the persistent GPU/readback result for later sampling or
+/// presentation. The warning is process-rate-limited (first, then powers of
+/// two) because titles commonly reuse the same GPU-only image every frame.
+pub(crate) fn mirror_compute_image_to_guest(
+    addr: u64,
+    bytes: &[u8],
+    source: &'static str,
+) -> ComputeImageGuestMirror {
+    trace_scanout_fill(addr, bytes.len(), source);
+    if write_bytes_checked(addr, bytes) {
+        return ComputeImageGuestMirror::Written;
+    }
+
+    static GPU_ONLY_IMAGES: AtomicU64 = AtomicU64::new(0);
+    let count = GPU_ONLY_IMAGES.fetch_add(1, Ordering::Relaxed) + 1;
+    if count == 1 || count.is_power_of_two() {
+        tracing::warn!(
+            count,
+            base = format_args!("{addr:#x}"),
+            end = format_args!("{:#x}", addr.saturating_add(bytes.len() as u64)),
+            len = bytes.len(),
+            source,
+            "compute storage image has no writable CPU guest mirror; retaining GPU-resident result"
+        );
+    }
+    ComputeImageGuestMirror::GpuOnly
 }
 
 /// Install a bounded host-allocation authority for unit tests that model
@@ -393,6 +500,18 @@ mod tests {
     }
 
     #[test]
+    fn reads_resource_bytes_without_dword_conversion() {
+        let mut data: Vec<u32> = vec![0xAABB_CCDD, 0x0102_0304, 0x1122_3344];
+        let addr = data.as_ptr() as u64;
+        let expected: Vec<u8> = data.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let memory = memory_for(&mut data);
+        let got = with_guest_memory(&memory, || {
+            read_bytes_validated(addr, expected.len() as u64)
+        });
+        assert_eq!(got, Some(expected));
+    }
+
+    #[test]
     fn refuses_null_unaligned_zero_and_oversized() {
         let mut data: Vec<u32> = vec![1, 2];
         let addr = data.as_ptr() as u64;
@@ -427,6 +546,51 @@ mod tests {
             addr, &bytes
         )));
         assert_eq!(data, replacement);
+    }
+
+    #[test]
+    fn compute_image_guest_mirror_keeps_gpu_only_results_non_fatal() {
+        let bytes = [0x11, 0x22, 0x33, 0x44];
+        assert_eq!(
+            mirror_compute_image_to_guest(0x4441_0000, &bytes, "test-compute-image"),
+            ComputeImageGuestMirror::GpuOnly,
+            "a GPU-only image is retained even without a CPU guest mapping"
+        );
+
+        let mut destination = [0u8; 4];
+        let addr = destination.as_mut_ptr() as u64;
+        let memory: Arc<dyn GpuGuestMemory> = Arc::new(HostRange {
+            start: addr,
+            len: destination.len() as u64,
+        });
+        let publication = with_guest_memory(&memory, || {
+            mirror_compute_image_to_guest(addr, &bytes, "test-compute-image")
+        });
+        assert_eq!(publication, ComputeImageGuestMirror::Written);
+        assert_eq!(destination, bytes);
+    }
+
+    #[test]
+    fn compute_presentation_rejects_non_scanout_atlases() {
+        let scanout = 0x7f10_0000;
+        let frame_bytes = 1920 * 1080 * 4;
+        // VideoOut registers the conservative 8-B/px upper bound. Both an
+        // RGBA16F image (the full span) and an RGBA8 image (half) match it.
+        register_scanout_watch(scanout, (frame_bytes * 2) as u64);
+
+        assert!(is_scanout_candidate(scanout, frame_bytes));
+        assert!(
+            is_scanout_candidate(0x7f90_0000, frame_bytes),
+            "a full-size RGBA8 intermediate can be the missing final composite"
+        );
+        assert!(
+            is_scanout_candidate(0x7f91_0000, frame_bytes * 2),
+            "a full-size RGBA16F intermediate can be the missing final composite"
+        );
+        assert!(
+            !is_scanout_candidate(0x7fa0_0000, 1024 * 1024 * 4),
+            "a square compute atlas must never replace a widescreen frame"
+        );
     }
 
     #[test]

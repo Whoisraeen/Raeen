@@ -37,9 +37,9 @@ pub use analysis::{
     shader_detect_embedded_constant_loads, shader_get_id_cs, shader_get_id_ps, shader_get_id_vs,
     shader_get_input_info_cs, shader_get_input_info_ps, shader_get_input_info_vs,
     shader_parse_attrib, shader_parse_cs, shader_parse_fetch, shader_parse_ps, shader_parse_usage,
-    shader_parse_usage2, shader_parse_vs, shader_synthesize_default_sampler,
-    shader_synthesize_gds_pointer, shader_synthesize_placeholder_sampled_texture,
-    shader_synthesize_placeholder_storage_texture,
+    shader_parse_usage2, shader_parse_vs, shader_refine_compute_storage_usage,
+    shader_synthesize_default_sampler, shader_synthesize_gds_pointer,
+    shader_synthesize_placeholder_sampled_texture, shader_synthesize_placeholder_storage_texture,
 };
 pub use parse::{ShaderParseError, operand_parse, shader_parse};
 pub use recompile::{

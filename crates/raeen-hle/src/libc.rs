@@ -764,11 +764,52 @@ fn hle_strtok(ctx: &HleContext, args: &[u64]) -> u64 {
 ///
 /// Like the register-slice path, only *integer* varargs are walked; a `%f`
 /// would need the XMM save area, which no caller has required yet.
+#[derive(Clone, Copy)]
 struct GuestVaList<'a> {
     mem: &'a dyn crate::GuestMemory,
     gp_offset: u32,
+    /// Byte offset of the next unconsumed XMM slot in the register save area.
+    /// Variadic floats travel in XMM registers, tracked independently of
+    /// `gp_offset` — see [`GuestVaListFloats`].
+    fp_offset: u32,
     overflow_arg_area: u64,
     reg_save_area: u64,
+}
+
+/// The floating-point half of a `va_list`, walked alongside the integer half.
+///
+/// SysV splits variadic arguments across two register files, so a `va_list`
+/// carries two independent cursors. Yielding both from one iterator would
+/// desynchronize them; this borrows the same list and advances only
+/// `fp_offset`.
+struct GuestVaListFloats<'a, 'b>(&'b mut GuestVaList<'a>);
+
+impl Iterator for GuestVaListFloats<'_, '_> {
+    type Item = f64;
+
+    fn next(&mut self) -> Option<f64> {
+        /// The XMM save area follows the six GP slots...
+        const FP_SAVE_START: u32 = 48;
+        /// ...and holds eight 16-byte slots.
+        const FP_SAVE_END: u32 = FP_SAVE_START + 8 * 16;
+
+        let list = &mut *self.0;
+        let addr = if list.fp_offset < FP_SAVE_END {
+            let addr = list.reg_save_area.checked_add(u64::from(list.fp_offset))?;
+            list.fp_offset += 16;
+            addr
+        } else {
+            // Spilled to the stack: doubles occupy one 8-byte slot each.
+            let addr = list.overflow_arg_area;
+            list.overflow_arg_area = addr.checked_add(8)?;
+            addr
+        };
+        let mut word = [0u8; 8];
+        if !list.mem.read(addr, &mut word) {
+            return None;
+        }
+        Some(f64::from_bits(u64::from_le_bytes(word)))
+    }
 }
 
 impl<'a> GuestVaList<'a> {
@@ -781,6 +822,7 @@ impl<'a> GuestVaList<'a> {
         Some(Self {
             mem,
             gp_offset: u32::from_le_bytes(head[0..4].try_into().ok()?),
+            fp_offset: u32::from_le_bytes(head[4..8].try_into().ok()?),
             overflow_arg_area: u64::from_le_bytes(head[8..16].try_into().ok()?),
             reg_save_area: u64::from_le_bytes(head[16..24].try_into().ok()?),
         })
@@ -832,7 +874,18 @@ fn hle_vsnprintf(ctx: &HleContext, args: &[u64]) -> u64 {
         warn!("vsnprintf: unreadable va_list at {ap:#x}");
         return 0;
     };
-    let formatted = crate::fmt::format_c(&fmt, &mut varargs, ctx.mem);
+    // The two register files are walked by independent cursors, so the float
+    // view gets its own copy of the list rather than aliasing the integer one.
+    //
+    // LIMIT: both copies own an `overflow_arg_area` cursor. Arguments that fit
+    // in registers — the first six integers and eight floats, which covers
+    // essentially every real `printf` — are exact; a call that spills BOTH
+    // kinds to the stack would have the two cursors read the same slots. Left
+    // as-is deliberately: the alternative is a shared-cursor rewrite of
+    // `format_c`'s signature for a case no measured title reaches.
+    let mut float_list = varargs;
+    let mut floats = GuestVaListFloats(&mut float_list);
+    let formatted = crate::fmt::format_c(&fmt, &mut varargs, &mut floats, ctx.mem);
     let full_len = formatted.len() as u64;
 
     if size > 0 {
@@ -1240,7 +1293,9 @@ fn hle_snprintf(ctx: &HleContext, args: &[u64]) -> u64 {
         return 0;
     };
     let mut varargs = args.iter().skip(3).copied();
-    let formatted = crate::fmt::format_c(&fmt, &mut varargs, ctx.mem);
+    // Variadic floats arrived in XMM0-7, captured separately from the GP args.
+    let mut floats = ctx.float_args.iter().map(|bits| f64::from_bits(*bits));
+    let formatted = crate::fmt::format_c(&fmt, &mut varargs, &mut floats, ctx.mem);
     let full_len = formatted.len() as u64;
 
     if size > 0 {
@@ -1274,7 +1329,9 @@ fn hle_printf(ctx: &HleContext, args: &[u64]) -> u64 {
         return u64::MAX; // EOF-ish negative return, the real error signal
     };
     let mut varargs = args.iter().skip(1).copied();
-    let formatted = crate::fmt::format_c(&fmt, &mut varargs, ctx.mem);
+    // Variadic floats arrived in XMM0-7, captured separately from the GP args.
+    let mut floats = ctx.float_args.iter().map(|bits| f64::from_bits(*bits));
+    let formatted = crate::fmt::format_c(&fmt, &mut varargs, &mut floats, ctx.mem);
     ctx.kernel.console.write_bytes(&formatted);
     formatted.len() as u64
 }

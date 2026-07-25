@@ -63,6 +63,66 @@ Extraction status:
   (`cargo check -p kyty-graphics` green). *Production host-window wiring of the flat
   shaders (shader_fetch.rs) is a follow-up — decode no longer dies, but the full
   render path for flat shaders is not yet exercised end-to-end.* Refs: SharpEmu #587.
+### SharpEmu refresh 2026-07-24 (21f964a → 26c5029, 3 commits)
+
+Two GPU commits + one audio. Both GPU commits were compared against Raeen
+mechanically (table diff + algorithm simulation) rather than by inspection.
+
+- **#592 `a158960` GPU compute detile** — **tiling math needs NOTHING.** Raeen's
+  swizzle tables were verified **bit-for-bit identical** to SharpEmu's for every
+  mode both implement: all 4 tables × 5 bpp rows × 16 address bits = 320 entries
+  decoded to `(xmask, ymask)` pairs, **0 mismatches**; and both detile algorithms
+  simulated on the 8 vectors from `GnmTilingDetileTests.cs` are **byte-identical**.
+  SharpEmu's `x & XMask` is a lookup-table optimization, mathematically inert.
+  **Corrects a stale claim** in `docs/rendering-blockers-and-port-plan-2026-07-22.md`
+  ("Raeen's `tiling.rs` is CPU-only, 2 modes"): it has **4** modes (5/9/24/27) at
+  5 element sizes. Bpp coverage is **equal**, not broader — SharpEmu's tables always
+  had 5 rows; "4bpp" in that commit title refers only to its GPU kernel's scope.
+  **Integrated:** row-parallel CPU detile (rayon, ≥512×512-element threshold,
+  mirroring `GnmTiling.cs:533-539`) + a non-power-of-two element-size guard
+  (`bpp_log2_is_supported`; callers derive bpp via `trailing_zeros`, so a 3-byte
+  element silently read as 1 byte and a 32-byte element indexed **past** the last
+  table row — a latent panic) + a rate-limited `(tile_mode, format)` diagnostic on
+  the refusal path, so which modes titles actually use becomes a measurement.
+  **Deliberately NOT ported:** the GPU compute pass. It is well-specified and
+  Raeen's deferred-batch machinery fits it (~700-1000 lines), but it addresses
+  *texture-upload* CPU cost, which is not in Tier 4's measured top-8 — the
+  bottlenecks are per-flip readback (4.1) and per-submit fence waits (4.2). Do
+  those first. **Queued, gated on the new diagnostic:** block-table modes 1/4/8
+  (SharpEmu's own comment concedes it is a *model*, not a transcribed AddrLib
+  PATINFO table — port only if a title is measured using them); mip-chain base
+  placement (Raeen always reads `t.base40()`, so any `last_level > 0` texture
+  would sample from the wrong offset — gate on measuring a title that binds one);
+  a GPU-vs-CPU golden test (port as a `#[test]`, not a runtime env-var self-test).
+- **#587 `5228335` Gen5 flat memory + 3D images** — the FLAT half was **already
+  ported** in `c0f6303` (`parse.rs:3189-3309`, `recompile.rs:3696-3807`), and the
+  3D depth-transport half is **already covered** (`draw_translate.rs:1263` ≡
+  SharpEmu's `GetTextureVolumeDepth`, threaded to `TYPE_3D` + `extent.depth`).
+  **Integrated:** `image_get_resinfo` no longer refuses non-2D descriptors. It
+  hard-refused anything but plain 2D, which failed the **whole shader recompile**
+  and dropped the draw — and it caught **2D-array as well as 3D**, i.e. every cube
+  T# (types 11/13 lower to 2DArray). `OpImageQuerySizeLod`'s result width is fixed
+  by the image's dim, so the query type now follows the descriptor (`%v3int` for
+  3D/2DArray, `%v2int` for 2D); only x/y are stored either way. Added `%v3int` to
+  the type preamble. **Deliberately NOT ported:** SharpEmu's rule that the MIMG
+  `DIM` field *overrides* the descriptor. Raeen already decodes DIM
+  (`parse.rs:3761-3769`) and uses it to gate whether a real third address VGPR
+  exists, while taking the SPIR-V `Dim` from the T# nibble — descriptor-wins is
+  defensible and already tested; SharpEmu's DIM-wins is unverified as more correct.
+  **Queued:** `VkImageType` from the type nibble rather than `depth > 1`
+  (`offscreen.rs:2972`, `compute.rs:1191`) — a type-10 T# with `depth()==0` gets
+  SPIR-V `Dim3D` but a 2D image, the mismatch class blamed for an ASTRO.BOT device
+  loss (unverified whether any title emits it); tiled 3D texture upload
+  (`draw_translate.rs:1316` is an honest named refusal today, not a silent
+  slice-0 under-read); tiled 3D UAV detile; FLAT D16 opcodes 0x19/0x1b/0x20-0x25.
+- **#605 `26c5029` `sceAudioOutOutputs`** — not reviewed (out of this pass's scope).
+
+**Adjacent gap found while comparing, bigger than anything in either commit:**
+`texture_vk_format` (`draw_translate.rs:909-985`) has **no block-compressed format
+arms at all** (no BC1/BC5/BC7). Most retail PS5 textures are BC. The 8/16-byte rows
+of Raeen's swizzle tables are commented "also BC1/BC4 blocks" but are unreachable
+for real BC textures. Not a SharpEmu port — a Raeen gap worth its own task.
+
 - **Queued (moderate value):** kernel getdents-on-file-fd (#546), Posix `-1`/errno +
   open `EACCES` (#567), APR `ResolveFilepathsWithPrefixToIdsAndFileSizes` (#534);
   libc `cosf`/`time`/`ctype` tables (#542); Astro Bot AGC stack (#528, +520 lines to
@@ -80,6 +140,12 @@ Extraction status:
   VCC. The instruction semantics were cross-checked against SharpEmu's RDNA2
   tables and KytyPS5's shader path; the Rust lowering and regression fixtures
   are original.
+- **Guest cubemap `(s,t,face)` lowering — DONE (measured Minecraft panorama).**
+  Type-11 T# descriptors now share the 2D-array SPIR-V/Vulkan path with type 13.
+  The guest's `V_CUBE{SC,TC,MA,ID}` sequence has already converted a direction
+  into face coordinates; the former Vulkan `Cube` view interpreted those
+  values as a second direction and produced radial face smearing. Cross-checked
+  against SharpEmu/KytyPS5 and pinned by shader plus six-layer upload tests.
 - **Resource-class-local storage indices — DONE (measured).** A Minecraft
   compute shader reused `s24` for a storage descriptor and a later sampled
   descriptor. Dynamic use of the rewritten descriptor DWORD selected sampled

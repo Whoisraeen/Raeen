@@ -101,6 +101,29 @@ fn clock_gettime_resolves_from_the_libkernel_provider_the_title_names() {
     }
 }
 
+/// Subnautica Below Zero's first blocker once its modules load and its Unity
+/// launcher runs. The NID was measured from the failing run; shadPS4's
+/// `aerolib.inl` independently maps the same encoded form (`woNpu+45RLk`) to
+/// this name, so this also pins that our hash agrees with that spelling — a
+/// disagreement would register a different identity than the title imports and
+/// leave the run dying on exactly the same import.
+#[test]
+fn sce_user_service_get_age_level_resolves_from_the_libsceuserservice_provider() {
+    const GET_AGE_LEVEL_NID: u64 = 0xc283_69bb_ee39_44b9;
+    assert_eq!(nid_of("sceUserServiceGetAgeLevel"), GET_AGE_LEVEL_NID);
+
+    let hle = HleRegistry::new();
+    let registry = ModuleRegistry::new(NidDatabase::from_hle(&hle));
+
+    match registry.resolve(&hle, "libSceUserService", GET_AGE_LEVEL_NID) {
+        Resolver::Hle { function, .. } => assert_eq!(function, "sceUserServiceGetAgeLevel"),
+        other => panic!(
+            "sceUserServiceGetAgeLevel imported from provider 'libSceUserService' must \
+             resolve to an HLE function; got {other:?}"
+        ),
+    }
+}
+
 /// The first `libSceAgc` import ASTRO.BOT actually calls once boot reaches GPU
 /// init. The NID was measured from the retail title; the name was recovered from
 /// SharpEmu's `aerolib` catalogue, so this also pins that our NID hash agrees

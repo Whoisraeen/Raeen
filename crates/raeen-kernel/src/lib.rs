@@ -111,6 +111,27 @@ impl Console {
     }
 }
 
+/// One guest-registered NP state callback and its delivery status.
+///
+/// The two registration spellings carry DIFFERENT argument layouts, so the
+/// form must be remembered or the delivery scrambles the callback's view of
+/// its own userdata: legacy `sceNpRegisterStateCallback` is
+/// `(userId, state, SceNpId *npId, void *userdata)` while the A/toolkit forms
+/// are `(userId, state, void *userdata)` (shadPS4 `np_manager.h:34-40`).
+/// Delivering the 4-argument layout to a 3-argument callback would hand it the
+/// (NULL) `npId` as its userdata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NpStateCallbackRegistration {
+    /// Guest entry point of the callback.
+    pub entry: u64,
+    /// The `userdata` pointer given at registration, passed back verbatim.
+    pub userdata: u64,
+    /// Legacy 4-argument form (`npId` pointer before `userdata`).
+    pub legacy_np_id_arg: bool,
+    /// The initial state has been scheduled through `sceNpCheckCallback`.
+    pub notified: bool,
+}
+
 /// The emulated PS5 kernel state.
 ///
 /// Holds all kernel-level state: memory map, file descriptors,
@@ -264,6 +285,20 @@ pub struct OrbisKernel {
     /// `AmprExports._hostFileCache` (keyed there by host path; the APR id
     /// already maps 1:1 to one resolved path here).
     pub appr_file_handles: DashMap<u32, std::fs::File>,
+    /// Guest-registered NP (PSN) state callbacks awaiting delivery of the
+    /// initial account state through `sceNpCheckCallback`.
+    ///
+    /// On real hardware the system queues the current sign-in state at
+    /// registration and invokes the callback on the title's own thread the
+    /// next time it pumps `sceNpCheckCallback` (shadPS4
+    /// `np_manager.cpp` `DispatchPendingNpStateCallbacks`, whose init comment
+    /// says exactly this: events are "delivered on the game's thread during
+    /// sceNpCheckCallback"). Registering the callback but never firing it
+    /// starves any title whose UI waits for the state event rather than
+    /// polling `sceNpGetState` — measured on Minecraft's post-"Get started"
+    /// screen, which pumps `sceNpCheckCallback` ~10x/s forever with a blank
+    /// page.
+    pub np_state_callbacks: parking_lot::Mutex<Vec<NpStateCallbackRegistration>>,
     /// APR ids already named by the once-per-id missing-file warn in
     /// `sceAmprAprCommandBufferReadFile` — the "name the miss" diagnostic
     /// stays visible without spamming one warn per frame.
@@ -926,6 +961,7 @@ impl OrbisKernel {
             kernel_equeue_next: std::sync::atomic::AtomicU64::new(1),
             appr_files: DashMap::new(),
             appr_file_handles: DashMap::new(),
+            np_state_callbacks: parking_lot::Mutex::new(Vec::new()),
             appr_missing_warned: DashMap::new(),
             appr_submissions: DashMap::new(),
             appr_next_submission: std::sync::atomic::AtomicU32::new(1),

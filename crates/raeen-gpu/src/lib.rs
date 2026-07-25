@@ -27,6 +27,7 @@ pub mod agc;
 pub mod agc_exec;
 pub mod backend;
 pub mod contracts;
+mod diagnostics;
 pub(crate) mod draw_translate;
 pub mod frame_ipc;
 pub mod gnm;

@@ -156,6 +156,31 @@ fn direct_strlen_module(iterations: u32) -> LinkedModule {
     }
 }
 
+fn direct_import_module(library: &str, function: &str) -> LinkedModule {
+    const SLOT_OFF: usize = 0x80;
+    let mut image = vec![0u8; 0x100];
+    write_entry_stub(&mut image, 0, SLOT_OFF);
+    image[SLOT_OFF..SLOT_OFF + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+    LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: vec![HleTrampoline {
+            library: library.to_owned(),
+            function: function.to_owned(),
+            addr: HLE_TRAMPOLINE_BASE,
+        }],
+        entry: 0,
+        tls: None,
+        tls_layout: Vec::new(),
+        procparam_offset: None,
+        unwind_modules: Vec::new(),
+    }
+}
+
 #[test]
 fn executable_leaf_thunk_dispatches_without_veh() {
     if !fsgsbase_available() {
@@ -172,9 +197,36 @@ fn executable_leaf_thunk_dispatches_without_veh() {
     .expect("direct strlen loop must return");
     let after = hle_dispatch_metrics();
     assert_eq!(value, 5);
-    assert_eq!(after.direct - before.direct, 1_000);
+    // Dispatch counters are process-global and the integration binary runs
+    // tests in parallel; another direct-enabled fixture can add calls during
+    // this window. This guest itself contributes exactly `iterations`, so the
+    // lower bound is the race-free assertion.
+    assert!(after.direct - before.direct >= 1_000);
     // VEH is process-global and other integration tests execute in parallel,
     // so only the isolated benchmark below can assert an exact zero VEH delta.
+    assert!(after.veh >= before.veh);
+}
+
+#[test]
+fn executable_ordinary_thunk_dispatches_without_veh() {
+    if !fsgsbase_available() || std::env::var_os("RAEEN_DISABLE_DIRECT_HLE").is_some() {
+        return;
+    }
+    let before = hle_dispatch_metrics();
+    let value = execute_linked(
+        &direct_import_module("libkernel", "sceKernelGetProcessTimeCounterFrequency"),
+        &HleRegistry::new(),
+        &OrbisKernel::new(),
+        0,
+        &[],
+    )
+    .expect("ordinary direct HLE call must return");
+    let after = hle_dispatch_metrics();
+    assert_eq!(value, 1_000_000_000);
+    // Process-global counters can include a concurrent integration test. The
+    // classification unit test pins this function to the direct bridge; here
+    // we prove that executing it contributes a direct dispatch.
+    assert!(after.direct > before.direct);
     assert!(after.veh >= before.veh);
 }
 

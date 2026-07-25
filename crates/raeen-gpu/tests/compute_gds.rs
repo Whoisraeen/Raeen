@@ -119,7 +119,7 @@ const FETCH_NO_SAMPLER_CS: &str = "\
 /// vec2(0.5)).r * 255 + 0.5)` — the recompiled sample-family shape: SEPARATE
 /// sampled-image and sampler descriptor arrays. With an all-zero synthesized
 /// S# the host binds the cached default nearest/wrap sampler
-/// (`linear_filter = [false]`), the SharpEmu default-sampler port.
+/// (`SamplerState::nearest_repeat()`), the default-sampler port.
 const SAMPLE_DEFAULT_SAMPLER_CS: &str = "\
     OpCapability Shader\n\
     OpMemoryModel Logical GLSL450\n\
@@ -223,7 +223,10 @@ fn gds_counter_persists_across_dispatches() {
         push_uniform_binding: None,
         storage_buffers: Some(StorageBufferBinding {
             binding: 0,
-            buffers: vec![vec![0u8; 4]],
+            buffers: vec![std::sync::Arc::new(vec![0u8; 4])],
+            guest_bases: vec![0x1234_0000],
+            guest_sizes: vec![4],
+            writable: vec![true],
         }),
         textures: None,
         storage_images: None,
@@ -236,18 +239,36 @@ fn gds_counter_persists_across_dispatches() {
         binding: Some(&binding),
     };
 
+    let before = dev.draw_cache_stats();
     let first = dispatch_compute(dev, &state).expect("first GDS dispatch");
+    let after_first = dev.draw_cache_stats();
     assert_eq!(
-        first.buffers[0],
+        first.buffers[0].materialize(&[0u8; 4]),
         0u32.to_le_bytes().to_vec(),
         "first dispatch must read the zero-initialized GDS counter"
     );
     let second = dispatch_compute(dev, &state).expect("second GDS dispatch");
+    let after_second = dev.draw_cache_stats();
     assert_eq!(
-        second.buffers[0],
+        second.buffers[0].materialize(&[0u8; 4]),
         1u32.to_le_bytes().to_vec(),
         "second dispatch must observe the first dispatch's GDS increment — \
-         the arena must persist across dispatches"
+        the arena must persist across dispatches"
+    );
+    assert_eq!(
+        after_first.compute_buffer_misses,
+        before.compute_buffer_misses + 1,
+        "first guest identity allocates one persistent compute buffer"
+    );
+    assert_eq!(
+        after_second.compute_buffer_hits,
+        after_first.compute_buffer_hits + 1,
+        "second dispatch reuses the same guest-addressed buffer"
+    );
+    assert_eq!(
+        after_second.compute_buffer_uploads_skipped,
+        after_first.compute_buffer_uploads_skipped + 1,
+        "an unchanged complete guest snapshot skips the second upload"
     );
     assert_eq!(validation_error_count(), 0, "validation must stay clean");
 }
@@ -274,7 +295,10 @@ fn sampled_texture_without_sampler_dispatches() {
         push_uniform_binding: None,
         storage_buffers: Some(StorageBufferBinding {
             binding: 0,
-            buffers: vec![vec![0u8; 4]],
+            buffers: vec![std::sync::Arc::new(vec![0u8; 4])],
+            guest_bases: vec![0],
+            guest_sizes: vec![4],
+            writable: vec![true],
         }),
         textures: Some(TextureBinding {
             sampled_binding: 1,
@@ -295,7 +319,7 @@ fn sampled_texture_without_sampler_dispatches() {
                 sample_hash: 0,
                 cached: false,
             }],
-            linear_filter: Vec::new(),
+            samplers: Vec::new(),
             sampled_groups: Vec::new(),
         }),
         storage_images: None,
@@ -312,7 +336,7 @@ fn sampled_texture_without_sampler_dispatches() {
     )
     .expect("texel-fetch dispatch with zero samplers");
     assert_eq!(
-        outputs.buffers[0],
+        outputs.buffers[0].materialize(&[0u8; 4]),
         0x40u32.to_le_bytes().to_vec(),
         "the fetched red texel must round-trip through the sampled-image array"
     );
@@ -324,7 +348,7 @@ fn sampled_texture_without_sampler_dispatches() {
 /// L6314-6322 binds an on-the-fly sampler when none was captured; L8121-8156
 /// caches one `VkSampler` per S# state, all-zero decoding to nearest/wrap):
 /// a sample-family CS with a synthesized all-zero S# binds the cached
-/// default nearest/wrap sampler (`linear_filter = [false]`). Two dispatches
+/// default nearest/wrap sampler (`SamplerState::nearest_repeat()`). Two dispatches
 /// prove creation AND the per-device cache-hit path, with clean validation.
 #[test]
 fn default_nearest_sampler_binds_and_caches_across_dispatches() {
@@ -344,7 +368,10 @@ fn default_nearest_sampler_binds_and_caches_across_dispatches() {
         push_uniform_binding: None,
         storage_buffers: Some(StorageBufferBinding {
             binding: 0,
-            buffers: vec![vec![0u8; 4]],
+            buffers: vec![std::sync::Arc::new(vec![0u8; 4])],
+            guest_bases: vec![0],
+            guest_sizes: vec![4],
+            writable: vec![true],
         }),
         textures: Some(TextureBinding {
             sampled_binding: 1,
@@ -364,7 +391,7 @@ fn default_nearest_sampler_binds_and_caches_across_dispatches() {
                 cached: false,
             }],
             // The synthesized all-zero S#: xy_mag_filter == 0 -> nearest.
-            linear_filter: vec![false],
+            samplers: vec![raeen_gpu::vulkan::offscreen::SamplerState::nearest_repeat()],
             sampled_groups: Vec::new(),
         }),
         storage_images: None,
@@ -379,13 +406,13 @@ fn default_nearest_sampler_binds_and_caches_across_dispatches() {
 
     let first = dispatch_compute(dev, &state).expect("first sampled dispatch (sampler creation)");
     assert_eq!(
-        first.buffers[0],
+        first.buffers[0].materialize(&[0u8; 4]),
         0x40u32.to_le_bytes().to_vec(),
         "the sampled red texel must round-trip through the default nearest sampler"
     );
     let second = dispatch_compute(dev, &state).expect("second sampled dispatch (cached sampler)");
     assert_eq!(
-        second.buffers[0],
+        second.buffers[0].materialize(&[0u8; 4]),
         0x40u32.to_le_bytes().to_vec(),
         "the cached default sampler must serve repeat dispatches identically"
     );

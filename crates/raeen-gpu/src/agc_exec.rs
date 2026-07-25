@@ -329,7 +329,7 @@ pub struct AgcGpuSession {
     /// Persistent per-render-target pixels (keyed by `CB_COLOR0_BASE`), so
     /// draws compose into a frame across DCBs instead of each starting from
     /// a cleared attachment.
-    framebuffers: Mutex<std::collections::HashMap<u64, RenderedImage>>,
+    framebuffers: Mutex<std::collections::HashMap<u64, Arc<RenderedImage>>>,
     /// Guest display-buffer address the title last flipped to
     /// (`sceVideoOutSubmitFlip` → `present_scanout`). When set and a render
     /// target with this base exists, it — not the last-drawn target — is what
@@ -409,16 +409,64 @@ const MAX_SCANOUT_SNAPSHOTS: usize = 8;
 /// must not make a cleared RGBA target look content-bearing.
 fn visible_pixel_count(image: &RenderedImage, stride: usize) -> usize {
     let bpp = image.bytes_per_pixel.max(1) as usize;
+    let colour = colour_span(bpp);
     image
         .pixels
         .chunks_exact(bpp)
         .step_by(stride.max(1))
-        .filter(|pixel| pixel.iter().take(3).any(|&channel| channel != 0))
+        .filter(|pixel| pixel.iter().take(colour).any(|&channel| channel != 0))
         .count()
+}
+
+/// Leading bytes of one texel that carry COLOUR, given the texel's size. Alpha
+/// is excluded on purpose: alpha alone is not visible over the Shell's black
+/// background and must not make a cleared target look content-bearing.
+///
+/// RGBA16F (`bytes_per_pixel == 8` — the HDR target [`to_presentable`] converts)
+/// spends TWO bytes per channel, so its colour span is the first SIX. Testing
+/// three would cover red plus only the low half of green and never look at blue
+/// at all; half-float `1.0` is `0x3C00`, whose little-endian low byte is zero,
+/// so a pure-green or blue-dominant HDR frame scanned as entirely black and was
+/// discarded as "never drawn".
+const fn colour_span(bytes_per_pixel: usize) -> usize {
+    match bytes_per_pixel {
+        // R16G16B16A16: R, G, B are the first three 16-bit channels.
+        8 => 6,
+        // RGBA8 / BGRA8: skip the alpha byte.
+        4 => 3,
+        // Anything else carries no alpha to exclude.
+        other => other,
+    }
 }
 
 fn has_visible_content(image: &RenderedImage) -> bool {
     visible_pixel_count(image, 16) != 0
+}
+
+/// Select the smallest target set a flush consumer needs on the CPU.
+///
+/// A VideoOut flip names the new scanout directly and also needs the elected
+/// intermediate target when the final copy is not decoded. A suspend point
+/// (`requested_scanout == None`) needs command/compute completion but no CPU
+/// pixels; selecting no targets lets it fence pending work without stealing
+/// the flip's one filtered readback. Other touched targets stay GPU-side and
+/// the existing flip-miss census reads them only when routing genuinely moves.
+fn presentation_filter_bases(requested_scanout: Option<u64>, fallback: Option<u64>) -> Vec<u64> {
+    let mut bases = Vec::with_capacity(2);
+    let Some(base) = requested_scanout.filter(|base| *base != 0) else {
+        return bases;
+    };
+    bases.push(base);
+    if let Some(base) = fallback.filter(|base| *base != 0 && !bases.contains(base)) {
+        bases.push(base);
+    }
+    bases
+}
+
+/// Whether a submission must fence compute immediately instead of letting the
+/// ordered worker batch it to a real lifetime boundary.
+const fn submission_compute_flush_required(queued_compute: bool, deferred_present: bool) -> bool {
+    queued_compute && !deferred_present
 }
 
 /// Every Nth flip miss, the most-content fallback re-runs its full census
@@ -730,17 +778,21 @@ impl AgcGpuSession {
         validation_layers: bool,
         resolution_scale: f32,
         gpu_device_index: u32,
+        shader_cache: bool,
+        shader_cache_dir: std::path::PathBuf,
     ) {
         *gpu_runtime_config().write() = GpuRuntimeConfig {
             validation_layers,
             resolution_scale,
             gpu_device_index,
+            shader_cache,
+            shader_cache_dir,
         };
     }
 
     /// The current process-wide GPU settings (see [`Self::set_runtime_config`]).
     pub(crate) fn runtime_config() -> GpuRuntimeConfig {
-        *gpu_runtime_config().read()
+        gpu_runtime_config().read().clone()
     }
 
     /// Register a present-path plugin (upscaler / frame generator). Out-of-tree,
@@ -808,6 +860,12 @@ impl AgcGpuSession {
     ) {
         if address == 0 {
             return;
+        }
+        // The isolated Shell cannot observe this runner's kernel flip counter.
+        // Advance a dedicated shared counter for every real VideoOut flip,
+        // independently of whether frame pixels changed.
+        if let Some(publisher) = &self.frame_publisher {
+            publisher.mark_presented();
         }
         *self.scanout_address.lock() = Some(address);
         *self.scanout_descriptor.lock() = descriptor;
@@ -1037,41 +1095,60 @@ impl AgcGpuSession {
     /// present the scanout buffer. Runs on the GPU worker thread via
     /// [`GpuWork::Flush`], or inline when no worker exists.
     fn flush_and_present(&self, address: Option<u64>) {
+        // Did this flush actually read back the flipped target — i.e. did the
+        // GPU render into the buffer the title is presenting? That is the
+        // honest "the title drew this frame" signal, and it is what lets
+        // `present_flipped` accept a frame that is legitimately BLACK (a
+        // fade-out, a night scene) instead of mistaking it for a never-drawn
+        // buffer and presenting a stale target in its place.
+        let mut flip_target_drawn = false;
         {
             let guard = self.backend.lock();
             if let Some(device) = guard.as_ref().and_then(|b| b.device()) {
                 let mut framebuffers = self.framebuffers.lock();
-                let insert_all =
-                    |fb: &mut std::collections::HashMap<u64, RenderedImage>,
-                     flushed: Vec<(u64, RenderedImage)>| {
-                        for (base, img) in flushed {
-                            fb.insert(base, img);
+                let insert_all = |fb: &mut std::collections::HashMap<u64, Arc<RenderedImage>>,
+                                  flushed: Vec<(u64, RenderedImage)>,
+                                  drawn: &mut bool| {
+                    for (base, img) in flushed {
+                        if Some(base) == address {
+                            *drawn = true;
                         }
-                    };
+                        fb.insert(base, Arc::new(img));
+                    }
+                };
                 // The all-targets dump needs every target's CPU pixels, so it
                 // forces a full readback; otherwise a flip reads back ONLY the
                 // flipped target plus the remembered fallback target — every
                 // other dirty target stays GPU-side.
                 let remembered = *self.fallback_present_base.lock();
-                let filter: Option<Vec<u64>> =
-                    if std::env::var_os("RAEEN_DUMP_ALL_TARGETS").is_some() {
-                        None
-                    } else {
-                        address.map(|a| {
-                            let mut bases = vec![a];
-                            if let Some(r) = remembered
-                                && r != a
-                            {
-                                bases.push(r);
-                            }
-                            bases
-                        })
-                    };
-                match crate::vulkan::offscreen::flush_deferred_draws_filtered(
-                    device,
-                    filter.as_deref(),
-                ) {
-                    Ok(flushed) => insert_all(&mut framebuffers, flushed),
+                let filter: Option<Vec<u64>> = if crate::diagnostics::gpu_env().dump_all_targets {
+                    None
+                } else {
+                    Some(presentation_filter_bases(address, remembered))
+                };
+                // Deferred compute publication writes back to guest SSBOs/UAVs.
+                // A flip/suspend flush runs as a separate worker item, outside
+                // `execute_dcb_cp_routed`'s submission-scoped authority guard.
+                // Reinstall the owning process's memory authority here or
+                // every valid writeback is rejected as "not writable".
+                let memory = self.guest_memory.lock().clone();
+                let flushed = if let Some(memory) = memory {
+                    crate::guest_mem::with_guest_memory(&memory, || {
+                        crate::vulkan::offscreen::flush_deferred_draws_filtered(
+                            device,
+                            filter.as_deref(),
+                        )
+                    })
+                } else {
+                    crate::vulkan::offscreen::flush_deferred_draws_filtered(
+                        device,
+                        filter.as_deref(),
+                    )
+                };
+                match flushed {
+                    Ok(flushed) => {
+                        insert_all(&mut framebuffers, flushed, &mut flip_target_drawn);
+                    }
                     Err(e) => {
                         warn!(error = %e, "deferred-draw flush failed — presenting the last flushed frame");
                     }
@@ -1086,11 +1163,16 @@ impl AgcGpuSession {
                     && !framebuffers.contains_key(&addr)
                 {
                     let misses = self.flip_miss_count.fetch_add(1, Ordering::Relaxed);
-                    let remembered_has_content = remembered
-                        .is_some_and(|r| framebuffers.get(&r).is_some_and(has_visible_content));
+                    let remembered_has_content = remembered.is_some_and(|r| {
+                        framebuffers
+                            .get(&r)
+                            .is_some_and(|image| has_visible_content(image))
+                    });
                     if !remembered_has_content || misses.is_multiple_of(FALLBACK_REELECT_INTERVAL) {
                         match crate::vulkan::offscreen::flush_deferred_draws(device) {
-                            Ok(flushed) => insert_all(&mut framebuffers, flushed),
+                            Ok(flushed) => {
+                                insert_all(&mut framebuffers, flushed, &mut flip_target_drawn);
+                            }
                             Err(e) => {
                                 warn!(error = %e, "full deferred-draw flush failed at a flip miss");
                             }
@@ -1104,25 +1186,32 @@ impl AgcGpuSession {
             }
         }
         if let Some(address) = address {
-            self.present_flipped(address);
+            self.present_flipped(address, flip_target_drawn);
         }
     }
 
     /// Present the buffer the title flipped to, after the flush landed its
-    /// pixels: the frame at the flip address when it has drawn content, else
-    /// the drawn target with the most content (the composite — the title
-    /// fills its scanout buffer by a copy/DMA we do not yet capture, so the
-    /// flip address is often an empty target). Never regresses `last_image`
-    /// when nothing has content, and only a frame at the actual flip address
-    /// takes the boot splash down.
-    fn present_flipped(&self, address: u64) {
+    /// pixels: the frame at the flip address when the GPU drew into it this
+    /// flush (`flip_target_drawn`) or it has visible content, else the drawn
+    /// target with the most content (the composite — the title fills its
+    /// scanout buffer by a copy/DMA we do not yet capture, so the flip address
+    /// is often an empty target). Never regresses `last_image` when nothing has
+    /// content, and only a frame at the actual flip address takes the boot
+    /// splash down.
+    ///
+    /// `flip_target_drawn` is what keeps a legitimately BLACK frame — a
+    /// fade-out, a night scene, a dark loading screen — from being mistaken for
+    /// a never-drawn buffer: pixel content alone cannot tell those apart, and
+    /// judging by content froze such frames on the last bright image (and left
+    /// the boot splash up for a title that opens dark).
+    fn present_flipped(&self, address: u64, flip_target_drawn: bool) {
         let remembered = *self.fallback_present_base.lock();
         let (image, fallback, fallback_base, keys, flip_target_known) = {
             let fb = self.framebuffers.lock();
             let flip_target_known = fb.contains_key(&address);
             let image = fb
                 .get(&address)
-                .filter(|image| has_visible_content(image))
+                .filter(|image| flip_target_drawn || has_visible_content(image))
                 .cloned();
             let (fallback, fallback_base) = if image.is_none() {
                 // Steady state: present the remembered fallback target while
@@ -1132,7 +1221,7 @@ impl AgcGpuSession {
                 let kept = remembered
                     .and_then(|r| fb.get(&r).map(|img| (r, img)))
                     .filter(|(_, img)| has_visible_content(img))
-                    .map(|(r, img)| (Some(r), img.clone()));
+                    .map(|(r, img)| (Some(r), Arc::clone(img)));
                 match kept {
                     Some((base, img)) => (Some(img), base),
                     None => {
@@ -1148,7 +1237,7 @@ impl AgcGpuSession {
                             })
                             .filter(|(nonzero, _, _)| *nonzero > 0)
                             .max_by_key(|(nonzero, _, _)| *nonzero)
-                            .map(|(_, base, img)| (base, img.clone()));
+                            .map(|(_, base, img)| (base, Arc::clone(img)));
                         match elected {
                             Some((base, img)) => (Some(img), Some(base)),
                             None => (None, None),
@@ -1158,9 +1247,18 @@ impl AgcGpuSession {
             } else {
                 (None, None)
             };
-            let keys = if std::env::var_os("RAEEN_TRACE_FLIP").is_some()
-                || (image.is_none() && fallback.is_none())
-            {
+            // RAEEN_TRACE_FLIP shows EVERY flip — an explicit opt-in wants the
+            // whole stream. The automatic nothing-to-present case is rate
+            // limited exactly like the BLACK FRAME warning below it: it fires
+            // on every flip otherwise, and buried each run's log under hundreds
+            // of near-identical lines.
+            let keys = if crate::diagnostics::gpu_env().trace_flip || {
+                image.is_none() && fallback.is_none() && {
+                    static SCANOUT_LOGS: AtomicU64 = AtomicU64::new(0);
+                    let occurrence = SCANOUT_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+                    occurrence <= 8 || occurrence.is_power_of_two()
+                }
+            } {
                 Some(fb.keys().map(|k| format!("{k:#x}")).collect::<Vec<_>>())
             } else {
                 None
@@ -1179,19 +1277,36 @@ impl AgcGpuSession {
         // is filled by an uncaptured copy/DMA while its real pixels live in
         // another render target — keeps presenting that target instead of the
         // (empty) guest scanout bytes.
+        // Some Gen5 titles render the completed scene into an intermediate but
+        // issue their final display copy through a PM4 path that is not decoded
+        // yet. We already selected that exact content-bearing target above;
+        // for compatible linear RGBA/BGRA scanouts, perform the missing final
+        // copy into the guest's real flip buffer. This turns the fallback into
+        // persistent scanout state (and lets subsequent CPU/GPU consumers see
+        // the same bytes) instead of merely painting the wrong-address target.
+        if image.is_none()
+            && let (Some(fallback), Some(desc)) =
+                (fallback.as_ref(), *self.scanout_descriptor.lock())
+        {
+            let presentable = to_presentable_arc(Arc::clone(fallback));
+            self.compose_presentable_to_scanout(address, &desc, &presentable);
+        }
         let guest_present = if image.is_none() {
             let desc = *self.scanout_descriptor.lock();
             desc.and_then(|desc| self.present_from_guest_memory(address, &desc))
         } else {
             None
-        };
+        }
+        .map(Arc::new);
         // The guest scanout is authoritative when it actually holds pixels:
         // ASTRO-class titles compose their display buffer by compute/DMA writes
         // we do not capture as a render target, so the real frame lives at the
         // flip address in guest memory, not in any drawn target. Prefer it over
         // the most-content census fallback — but only when it has content, so an
         // empty scanout never regresses a drawn target to black.
-        let guest_has_content = guest_present.as_ref().is_some_and(has_visible_content);
+        let guest_has_content = guest_present
+            .as_ref()
+            .is_some_and(|image| has_visible_content(image));
         let guest_hit = guest_has_content;
         let fallback_hit = fallback.is_some();
         // RAEEN_TRACE_FLIP: does the buffer the title flipped to have drawn
@@ -1208,7 +1323,7 @@ impl AgcGpuSession {
             );
         }
         let flip_address_hit = image.is_some();
-        if !flip_address_hit && fallback_hit {
+        if !flip_address_hit && !guest_has_content && fallback_hit {
             static ROUTING_WARNINGS: AtomicU64 = AtomicU64::new(0);
             let occurrence = ROUTING_WARNINGS.fetch_add(1, Ordering::Relaxed) + 1;
             if occurrence <= 8 || occurrence.is_power_of_two() {
@@ -1266,7 +1381,7 @@ impl AgcGpuSession {
         // Move into the `Arc` once; the store below is then a refcount bump, not
         // an 8 MB copy — and this runs inside the guest flip thread's
         // synchronous flush, so the copy was pure per-flip latency.
-        let presented = Arc::new(to_presentable(presented));
+        let presented = to_presentable_arc(presented);
         self.publish_frame(Arc::clone(&presented));
         if flip_address_hit || guest_hit {
             // The title flipped to a buffer it really drew into (a GPU-drawn
@@ -1286,15 +1401,105 @@ impl AgcGpuSession {
             );
         }
         maybe_dump_frame(&presented, present_index);
-        if std::env::var_os("RAEEN_DUMP_ALL_TARGETS").is_some() {
+        if crate::diagnostics::gpu_env().dump_all_targets {
             let targets: Vec<(u64, RenderedImage)> = self
                 .framebuffers
                 .lock()
                 .iter()
-                .map(|(base, img)| (*base, img.clone()))
+                .map(|(base, img)| (*base, (**img).clone()))
                 .collect();
             maybe_dump_all_targets(&targets, present_index);
         }
+    }
+
+    /// Copy an already-presentable RGBA8 intermediate into a compatible real
+    /// VideoOut buffer. Returns false for any format/layout that cannot be
+    /// represented exactly; those continue through the existing fallback.
+    fn compose_presentable_to_scanout(
+        &self,
+        address: u64,
+        desc: &raeen_core::subsystems::ScanoutDescriptor,
+        image: &RenderedImage,
+    ) -> bool {
+        if address == 0
+            || desc.tiling_mode > 1
+            || image.bytes_per_pixel != 4
+            || image.width == 0
+            || image.height == 0
+            || desc.width == 0
+            || desc.height == 0
+            || (image.width as usize)
+                .checked_mul(image.height as usize)
+                .and_then(|pixels| pixels.checked_mul(4))
+                != Some(image.pixels.len())
+        {
+            return false;
+        }
+        #[derive(Clone, Copy)]
+        enum Order {
+            Rgba,
+            Bgra,
+        }
+        let order = match desc.pixel_format {
+            0x8000_2000 | 0x8000_2200 | 0x8000_0000_2200_0000 => Order::Rgba,
+            0x8000_0000 | 0x8000_0200 | 0x8000_0000_0000_0000 => Order::Bgra,
+            _ => return false,
+        };
+        let pitch = if desc.pitch_pixels == 0 {
+            desc.width
+        } else {
+            desc.pitch_pixels
+        };
+        if pitch < desc.width {
+            return false;
+        }
+        let row_bytes = pitch as usize * 4;
+        let Some(total) = row_bytes.checked_mul(desc.height as usize) else {
+            return false;
+        };
+        if total > (256 << 20) {
+            return false;
+        }
+        let mut scanout = vec![0; total];
+        for y in 0..desc.height as usize {
+            let source_y = y * image.height as usize / desc.height as usize;
+            let destination = &mut scanout[y * row_bytes..y * row_bytes + desc.width as usize * 4];
+            for x in 0..desc.width as usize {
+                let source_x = x * image.width as usize / desc.width as usize;
+                let source_at = (source_y * image.width as usize + source_x) * 4;
+                let src = &image.pixels[source_at..source_at + 4];
+                let dst = &mut destination[x * 4..x * 4 + 4];
+                match order {
+                    Order::Rgba => dst.copy_from_slice(src),
+                    Order::Bgra => {
+                        dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
+                    }
+                }
+            }
+        }
+        let wrote = self
+            .guest_memory
+            .lock()
+            .as_ref()
+            .is_some_and(|memory| memory.write_gpu(address, &scanout));
+        if !wrote {
+            return false;
+        }
+        self.guest_scanout_snapshots
+            .lock()
+            .insert(address, Arc::new(scanout));
+        static COMPOSITE_LOGS: AtomicU64 = AtomicU64::new(0);
+        let occurrence = COMPOSITE_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+        if occurrence == 1 || occurrence.is_power_of_two() {
+            tracing::info!(
+                occurrence,
+                scanout = format_args!("{address:#x}"),
+                width = desc.width,
+                height = desc.height,
+                "completed intermediate-to-VideoOut scanout copy"
+            );
+        }
+        true
     }
 
     /// Build a [`RenderedImage`] by reading the guest bytes at a flipped
@@ -1594,6 +1799,14 @@ impl AgcGpuSession {
             &mut sink,
             Some(&crate::guest_mem::IdentityGuestMemory),
         );
+        if submission_compute_flush_required(sink.queued_compute, deferred_present) {
+            // Synchronous/test callers have no ordered worker consumer, so
+            // fence here. The title worker keeps compute work GPU-side across
+            // adjacent DCB/ACB submissions and fences at the real lifetime
+            // boundary (`sceAgcSuspendPoint`, flip, wait_idle, or shutdown).
+            // Passing an empty target filter keeps render targets GPU-side.
+            crate::vulkan::offscreen::flush_deferred_draws_filtered(device, Some(&[]))?;
+        }
         let produced = cp.take_produced_labels();
         self.latch_produced_waits(&produced);
         // Carry any compute shader this submission observed forward to the next.
@@ -1647,7 +1860,7 @@ impl AgcGpuSession {
         match crate::vulkan::offscreen::flush_deferred_draws(device) {
             Ok(flushed) => {
                 for (base, img) in flushed {
-                    framebuffers.insert(base, img);
+                    framebuffers.insert(base, Arc::new(img));
                 }
             }
             Err(e) => {
@@ -1660,16 +1873,16 @@ impl AgcGpuSession {
         if let Some(base) = last_target
             && let Some(img) = framebuffers.get(&base)
         {
-            image = Some(img.clone());
+            image = Some((**img).clone());
         }
         // Snapshot every accumulated render target while the guard is still
         // held (re-locking `self.framebuffers` here would deadlock — the guard
         // lives to end of scope), for the optional all-targets dump below.
         let all_targets: Option<Vec<(u64, RenderedImage)>> = image.as_ref().and_then(|_| {
-            std::env::var_os("RAEEN_DUMP_ALL_TARGETS").map(|_| {
+            crate::diagnostics::gpu_env().dump_all_targets.then(|| {
                 framebuffers
                     .iter()
-                    .map(|(base, img)| (*base, img.clone()))
+                    .map(|(base, img)| (*base, (**img).clone()))
                     .collect()
             })
         });
@@ -1697,7 +1910,7 @@ impl AgcGpuSession {
                     .map(|img| (visible_pixel_count(img, 1), img))
                     .filter(|(nonzero, _)| *nonzero > 0)
                     .max_by_key(|(nonzero, _)| *nonzero)
-                    .map(|(_, img)| img.clone())
+                    .map(|(_, img)| Arc::clone(img))
             });
             (flip_address_hit, image)
         };
@@ -1719,11 +1932,11 @@ impl AgcGpuSession {
             // one that has been drawn; otherwise fall back to the last-drawn
             // target (the pre-existing baseline).
             let scanout_hit = flip_address_hit;
-            let presented = scanout_image.unwrap_or_else(|| image.clone());
+            let presented = scanout_image.unwrap_or_else(|| Arc::new(image.clone()));
             // sRGB-encode an HDR float target (SharpEmu #448) before it reaches
             // the RGBA8 present surface / PPM dump; 8-bit frames pass through.
             // Into the `Arc` once (see `last_image`): the store is a bump.
-            let presented = Arc::new(to_presentable(presented));
+            let presented = to_presentable_arc(presented);
             self.publish_frame(Arc::clone(&presented));
             // Only a frame at the actual flip address takes the boot splash
             // down. The most-content fallback can surface a bare cleared
@@ -1848,10 +2061,32 @@ impl AgcGpuSession {
             let spawned = std::thread::Builder::new()
                 .name("raeen-gpu".to_owned())
                 .spawn(move || {
-                    while let Ok(work) = rx.recv() {
+                    // RAEEN_TIME_WORKER: windowed worker-occupancy split. `idle`
+                    // is time blocked in `recv` (waiting for the guest to submit
+                    // the next frame's work); `submit_busy`/`flush_busy` is time
+                    // running the GPU path. High idle% => guest/CPU-bound (the
+                    // worker starves for work); low idle% => GPU-worker-bound.
+                    // Summarized every 32 flips, then the window resets to track
+                    // steady state rather than smear the boot burst into it.
+                    let timing = crate::diagnostics::gpu_env().time_worker;
+                    let mut idle = std::time::Duration::ZERO;
+                    let mut submit_busy = std::time::Duration::ZERO;
+                    let mut flush_busy = std::time::Duration::ZERO;
+                    let mut window_submits: u64 = 0;
+                    let mut present_total: u64 = 0;
+                    loop {
+                        let recv_at = std::time::Instant::now();
+                        let work = match rx.recv() {
+                            Ok(work) => work,
+                            Err(_) => break,
+                        };
+                        if timing {
+                            idle += recv_at.elapsed();
+                        }
                         match work {
                             GpuWork::Submit(words, is_compute) => {
                                 let _completion = InFlightCompletion(&session);
+                                let busy_at = std::time::Instant::now();
                                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     // Stage C: worker submissions defer
                                     // presentation — the flush (readback +
@@ -1860,12 +2095,16 @@ impl AgcGpuSession {
                                     // the old flush-per-submission cadence so
                                     // frame-dump diagnostics stay faithful.
                                     let deferred_present =
-                                        std::env::var_os("RAEEN_DUMP_FRAMES").is_none();
+                                        crate::diagnostics::gpu_env().dump_frames.is_none();
                                     session.worker_submit(words, is_compute, deferred_present);
                                 }))
                                 .is_err()
                                 {
                                     warn!("GPU submission panicked; dropping the DCB and keeping the worker alive");
+                                }
+                                if timing {
+                                    submit_busy += busy_at.elapsed();
+                                    window_submits += 1;
                                 }
                             }
                             GpuWork::Flush {
@@ -1873,6 +2112,14 @@ impl AgcGpuSession {
                                 done,
                                 permit,
                             } => {
+                                // A suspend flush fences pending work but is not
+                                // a displayed VideoOut frame. Count only named
+                                // scanout flips in the frame-time denominator;
+                                // Minecraft issues both, and treating suspend
+                                // fences as frames made worker telemetry report
+                                // roughly twice the measured shared-IPC FPS.
+                                let is_present = address.is_some();
+                                let busy_at = std::time::Instant::now();
                                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     session.flush_and_present(address);
                                     // The flush lands deferred readbacks and
@@ -1900,6 +2147,42 @@ impl AgcGpuSession {
                                 // never a leaked permit that would wedge the
                                 // flip thread. `None` for wait_idle flushes.
                                 drop(permit);
+                                if timing {
+                                    flush_busy += busy_at.elapsed();
+                                    if is_present {
+                                        present_total += 1;
+                                    }
+                                    if is_present && present_total.is_multiple_of(32) {
+                                        let wall = idle + submit_busy + flush_busy;
+                                        let busy = submit_busy + flush_busy;
+                                        let pct = |d: std::time::Duration| {
+                                            let w = wall.as_secs_f64();
+                                            if w > 0.0 {
+                                                100.0 * d.as_secs_f64() / w
+                                            } else {
+                                                0.0
+                                            }
+                                        };
+                                        warn!(
+                                            flips = present_total,
+                                            submits = window_submits,
+                                            window_ms = wall.as_millis() as u64,
+                                            idle_pct = format_args!("{:.0}", pct(idle)),
+                                            busy_pct = format_args!("{:.0}", pct(busy)),
+                                            submit_pct = format_args!("{:.0}", pct(submit_busy)),
+                                            flush_pct = format_args!("{:.0}", pct(flush_busy)),
+                                            frame_ms =
+                                                format_args!("{:.1}", wall.as_secs_f64() * 1000.0 / 32.0),
+                                            worker_ms =
+                                                format_args!("{:.1}", busy.as_secs_f64() * 1000.0 / 32.0),
+                                            "WORKER TIMING: idle=waiting-on-guest, busy=GPU worker; high idle_pct => guest/CPU-bound"
+                                        );
+                                        idle = std::time::Duration::ZERO;
+                                        submit_busy = std::time::Duration::ZERO;
+                                        flush_busy = std::time::Duration::ZERO;
+                                        window_submits = 0;
+                                    }
+                                }
                             }
                             #[cfg(test)]
                             GpuWork::Panic => {
@@ -2293,13 +2576,17 @@ fn pending_splash() -> &'static Mutex<Option<Arc<RenderedImage>>> {
 /// backend is created (validation) and where each guest draw is sized
 /// (resolution scale) — the two settings the user can drive from Settings ▸
 /// Video that the GPU path can honour today.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct GpuRuntimeConfig {
     pub validation_layers: bool,
     pub resolution_scale: f32,
     /// Physical-device selection: 0 = auto (best-scored), n ≥ 1 selects the
     /// n-th usable device (1-based), falling back to auto when out of range.
     pub gpu_device_index: u32,
+    /// Persist translated SPIR-V and driver pipeline binaries between runs.
+    pub shader_cache: bool,
+    /// Root of the versioned shader and Vulkan pipeline caches.
+    pub shader_cache_dir: std::path::PathBuf,
 }
 
 impl Default for GpuRuntimeConfig {
@@ -2308,6 +2595,8 @@ impl Default for GpuRuntimeConfig {
             validation_layers: false,
             resolution_scale: 1.0,
             gpu_device_index: 0,
+            shader_cache: true,
+            shader_cache_dir: std::path::PathBuf::from("shader_cache"),
         }
     }
 }
@@ -2383,7 +2672,7 @@ fn dump_frame_due(index: u64) -> bool {
 }
 
 fn maybe_dump_all_targets(targets: &[(u64, RenderedImage)], draw_index: u64) {
-    let Ok(dir) = std::env::var("RAEEN_DUMP_FRAMES") else {
+    let Some(dir) = crate::diagnostics::gpu_env().dump_frames.as_deref() else {
         return;
     };
     if dir.is_empty() || !dump_frame_due(draw_index) {
@@ -2393,7 +2682,7 @@ fn maybe_dump_all_targets(targets: &[(u64, RenderedImage)], draw_index: u64) {
         let bpp = image.bytes_per_pixel.max(1) as usize;
         let non_black = visible_pixel_count(image, 1);
         let path =
-            std::path::Path::new(&dir).join(format!("target_{base:012x}_{draw_index:06}.ppm"));
+            std::path::Path::new(dir).join(format!("target_{base:012x}_{draw_index:06}.ppm"));
         let mut ppm = format!("P6\n{} {}\n255\n", image.width, image.height).into_bytes();
         ppm.reserve(image.pixels.len() / bpp * 3);
         // First 3 bytes of each pixel as approximate RGB — exact for the 4-byte
@@ -2402,7 +2691,7 @@ fn maybe_dump_all_targets(targets: &[(u64, RenderedImage)], draw_index: u64) {
         for px in image.pixels.chunks_exact(bpp) {
             ppm.extend_from_slice(&px[..3]);
         }
-        let _ = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &ppm));
+        let _ = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, &ppm));
         tracing::info!(
             base = format_args!("{base:#x}"),
             non_black_pixels = non_black,
@@ -2482,24 +2771,35 @@ fn to_presentable(image: RenderedImage) -> RenderedImage {
     }
 }
 
+/// Arc-aware present conversion. The overwhelmingly common RGBA8 path keeps
+/// the render-target allocation shared between the framebuffer census,
+/// isolated-runner IPC, and `last_image`; only HDR targets allocate an RGBA8
+/// conversion. This removes one full-frame memcpy from every ordinary flip.
+fn to_presentable_arc(image: Arc<RenderedImage>) -> Arc<RenderedImage> {
+    if image.bytes_per_pixel != 8 {
+        return image;
+    }
+    Arc::new(to_presentable((*image).clone()))
+}
+
 /// Number of frames presented since process start — the frame-dump sampling
 /// index (see the call site for why the draw counter cannot serve this role).
 static PRESENT_INDEX: AtomicU64 = AtomicU64::new(0);
 
 fn maybe_dump_frame(image: &RenderedImage, draw_index: u64) {
-    let Ok(dir) = std::env::var("RAEEN_DUMP_FRAMES") else {
+    let Some(dir) = crate::diagnostics::gpu_env().dump_frames.as_deref() else {
         return;
     };
     if dir.is_empty() || !dump_frame_due(draw_index) {
         return;
     }
-    let path = std::path::Path::new(&dir).join(format!("frame_{draw_index:06}.ppm"));
+    let path = std::path::Path::new(dir).join(format!("frame_{draw_index:06}.ppm"));
     let mut ppm = format!("P6\n{} {}\n255\n", image.width, image.height).into_bytes();
     ppm.reserve(image.pixels.len() / 4 * 3);
     for rgba in image.pixels.chunks_exact(4) {
         ppm.extend_from_slice(&rgba[..3]);
     }
-    match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &ppm)) {
+    match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, &ppm)) {
         Ok(()) => tracing::info!(
             path = %path.display(),
             width = image.width,
@@ -2689,12 +2989,12 @@ mod tests {
         // deterministically without a Vulkan device or a guest-memory read.
         session.framebuffers.lock().insert(
             0x1000,
-            RenderedImage {
+            Arc::new(RenderedImage {
                 width: 1,
                 height: 1,
                 pixels: vec![7, 8, 9, 255],
                 bytes_per_pixel: 4,
-            },
+            }),
         );
         // Far more flips than the cap: each acquires a permit before enqueuing
         // and blocks (on the semaphore or the full channel) only transiently
@@ -2914,7 +3214,10 @@ mod tests {
         };
         // The GPU drew content to the render target at guest base 0x1000; the
         // last-drawn image happens to be the black background.
-        session.framebuffers.lock().insert(0x1000, content.clone());
+        session
+            .framebuffers
+            .lock()
+            .insert(0x1000, Arc::new(content.clone()));
         *session.last_image.lock() = Some(Arc::new(black));
 
         // Flip to the registered content buffer -> present THAT buffer.
@@ -2949,11 +3252,14 @@ mod tests {
             pixels: vec![0, 40, 0, 255, 0, 0, 90, 255],
             bytes_per_pixel: 4,
         };
-        session.framebuffers.lock().insert(0x1000, black_scanout);
         session
             .framebuffers
             .lock()
-            .insert(0x2000, visible_ui.clone());
+            .insert(0x1000, Arc::new(black_scanout));
+        session
+            .framebuffers
+            .lock()
+            .insert(0x2000, Arc::new(visible_ui.clone()));
 
         session.present_scanout(0x1000, None);
 
@@ -2966,6 +3272,120 @@ mod tests {
             *session.fallback_present_base.lock(),
             Some(0x2000),
             "the content-bearing intermediate becomes the steady-state fallback"
+        );
+    }
+
+    /// An HDR (RGBA16F) texel spends TWO bytes per channel, so its colour span
+    /// is six bytes. Testing three covered red plus only the LOW half of green
+    /// and never reached blue — and half-float `1.0` is `0x3C00`, whose
+    /// little-endian low byte is zero — so a pure-green or blue-dominant HDR
+    /// frame scanned as entirely black and was discarded as never-drawn.
+    #[test]
+    fn hdr_green_and_blue_frames_count_as_visible_content() {
+        let one = 0x3C00u16.to_le_bytes(); // half-float 1.0
+        let off = [0u8, 0];
+        let texel = |r: [u8; 2], g: [u8; 2], b: [u8; 2]| RenderedImage {
+            width: 1,
+            height: 1,
+            pixels: [r, g, b, one].concat(),
+            bytes_per_pixel: 8,
+        };
+
+        assert!(
+            has_visible_content(&texel(off, one, off)),
+            "a pure-green HDR frame is visible colour"
+        );
+        assert!(
+            has_visible_content(&texel(off, off, one)),
+            "a pure-blue HDR frame is visible colour"
+        );
+        assert!(
+            has_visible_content(&texel(one, off, off)),
+            "a pure-red HDR frame is visible colour"
+        );
+        // The alpha exclusion still holds: a cleared HDR target carrying only
+        // opaque alpha is not content.
+        assert!(
+            !has_visible_content(&texel(off, off, off)),
+            "alpha alone is not visible over the Shell's black background"
+        );
+    }
+
+    #[test]
+    fn suspend_readback_filter_reuses_known_presentation_targets() {
+        assert_eq!(
+            presentation_filter_bases(None, Some(0x31bf_0000)),
+            Vec::<u64>::new(),
+            "suspend fences work but defers CPU pixels to the next flip"
+        );
+        assert_eq!(
+            presentation_filter_bases(Some(0x1f7d_0000), Some(0x31bf_0000)),
+            vec![0x1f7d_0000, 0x31bf_0000],
+            "an explicit flip reads its scanout and the routed fallback"
+        );
+        assert_eq!(
+            presentation_filter_bases(Some(0x31bf_0000), Some(0x31bf_0000)),
+            vec![0x31bf_0000],
+            "the same scanout/fallback target is read only once"
+        );
+        assert!(
+            presentation_filter_bases(None, None).is_empty(),
+            "a pre-first-flip suspend fences work without speculative target readback"
+        );
+    }
+
+    #[test]
+    fn worker_compute_batches_until_an_ordered_lifetime_boundary() {
+        assert!(
+            submission_compute_flush_required(true, false),
+            "synchronous callers need submission-local guest visibility"
+        );
+        assert!(
+            !submission_compute_flush_required(true, true),
+            "the ordered worker must batch adjacent compute submissions until suspend/flip"
+        );
+        assert!(
+            !submission_compute_flush_required(false, false),
+            "a submission with no queued compute has nothing to fence"
+        );
+    }
+
+    /// A frame the GPU actually rendered into is presented even when it is
+    /// entirely black — a fade-out, a night scene, a dark loading screen.
+    /// Pixel content alone cannot tell "drew black" from "never drawn", so
+    /// judging by content froze such frames on the last bright image.
+    #[test]
+    fn black_frame_the_gpu_drew_into_is_presented_not_replaced() {
+        let session = AgcGpuSession::new(deny_memory());
+        let drawn_black = RenderedImage {
+            width: 2,
+            height: 1,
+            pixels: vec![0, 0, 0, 255, 0, 0, 0, 255],
+            bytes_per_pixel: 4,
+        };
+        let stale_bright = RenderedImage {
+            width: 2,
+            height: 1,
+            pixels: vec![0, 40, 0, 255, 0, 0, 90, 255],
+            bytes_per_pixel: 4,
+        };
+        session
+            .framebuffers
+            .lock()
+            .insert(0x1000, Arc::new(drawn_black.clone()));
+        session
+            .framebuffers
+            .lock()
+            .insert(0x2000, Arc::new(stale_bright));
+
+        // `true` = this flush read the flipped target back, i.e. the GPU
+        // rendered into the very buffer the title is presenting.
+        session.present_flipped(0x1000, true);
+
+        assert_eq!(
+            session.last_image().expect("presented frame").pixels,
+            drawn_black.pixels,
+            "a black frame the title actually drew must not be replaced by a stale target"
         );
     }
 
@@ -2984,7 +3404,10 @@ mod tests {
             pixels: vec![10, 20, 30, 255, 40, 50, 60, 255],
             bytes_per_pixel: 4,
         };
-        session.framebuffers.lock().insert(0x2000, content.clone());
+        session
+            .framebuffers
+            .lock()
+            .insert(0x2000, Arc::new(content.clone()));
         session.hide_splash();
 
         // The title flips to the drawn buffer -> the flush presents it.
@@ -3018,7 +3441,10 @@ mod tests {
             pixels: vec![11, 22, 33, 255, 44, 55, 66, 255],
             bytes_per_pixel: 4,
         };
-        session.framebuffers.lock().insert(0x3000, content.clone());
+        session
+            .framebuffers
+            .lock()
+            .insert(0x3000, Arc::new(content.clone()));
         session.hide_splash();
         let before = session.present_epoch();
 
@@ -3169,7 +3595,10 @@ mod tests {
             pixels: vec![10, 20, 30, 255],
             bytes_per_pixel: 4,
         };
-        session.framebuffers.lock().insert(0x1000, content.clone());
+        session
+            .framebuffers
+            .lock()
+            .insert(0x1000, Arc::new(content.clone()));
 
         // Flip to an undrawn buffer: splash stays up.
         session.present_scanout(0xDEAD_BEEF, None);
@@ -3215,7 +3644,10 @@ mod tests {
             pixels: vec![1, 2, 3, 255, 4, 5, 6, 255],
             bytes_per_pixel: 4,
         };
-        session.framebuffers.lock().insert(base, drawn.clone());
+        session
+            .framebuffers
+            .lock()
+            .insert(base, Arc::new(drawn.clone()));
         session.present_scanout(base, Some(desc));
         assert_eq!(
             session.last_image().unwrap().pixels,
@@ -3250,7 +3682,7 @@ mod tests {
         session
             .framebuffers
             .lock()
-            .insert(base, drawn_again.clone());
+            .insert(base, Arc::new(drawn_again.clone()));
         session.present_scanout(base, Some(desc)); // drawn wins, becomes last frame
         session.framebuffers.lock().clear();
         let tiled = raeen_core::subsystems::ScanoutDescriptor {
@@ -3262,6 +3694,68 @@ mod tests {
             session.last_image().unwrap().pixels,
             drawn_again.pixels,
             "an unsupported tiling mode must not replace the last frame"
+        );
+    }
+
+    #[test]
+    fn missing_final_composite_lands_in_the_real_scanout_buffer() {
+        let mut backing = vec![0u8; 8];
+        let base = backing.as_mut_ptr() as u64;
+        let session = AgcGpuSession::new(Arc::new(HostRangeMemory {
+            start: base,
+            len: backing.len() as u64,
+        }));
+        let desc = raeen_core::subsystems::ScanoutDescriptor {
+            width: 2,
+            height: 1,
+            pitch_pixels: 2,
+            pixel_format: 0x8000_0000_2200_0000,
+            tiling_mode: 0,
+        };
+        let intermediate = RenderedImage {
+            width: 2,
+            height: 1,
+            pixels: vec![10, 20, 30, 255, 40, 50, 60, 255],
+            bytes_per_pixel: 4,
+        };
+        assert!(session.compose_presentable_to_scanout(base, &desc, &intermediate));
+        assert_eq!(
+            backing, intermediate.pixels,
+            "the compatibility composite must update guest-visible VideoOut memory"
+        );
+        let scanned = session
+            .present_from_guest_memory(base, &desc)
+            .expect("composed scanout");
+        assert_eq!(scanned.pixels, intermediate.pixels);
+    }
+
+    #[test]
+    fn final_composite_scales_internal_resolution_to_video_out() {
+        let mut backing = vec![0u8; 16];
+        let base = backing.as_mut_ptr() as u64;
+        let session = AgcGpuSession::new(Arc::new(HostRangeMemory {
+            start: base,
+            len: backing.len() as u64,
+        }));
+        let desc = raeen_core::subsystems::ScanoutDescriptor {
+            width: 4,
+            height: 1,
+            pitch_pixels: 4,
+            pixel_format: 0x8000_0000_2200_0000,
+            tiling_mode: 0,
+        };
+        let internal = RenderedImage {
+            width: 2,
+            height: 1,
+            pixels: vec![10, 20, 30, 255, 40, 50, 60, 255],
+            bytes_per_pixel: 4,
+        };
+        assert!(session.compose_presentable_to_scanout(base, &desc, &internal));
+        assert_eq!(
+            backing,
+            vec![
+                10, 20, 30, 255, 10, 20, 30, 255, 40, 50, 60, 255, 40, 50, 60, 255
+            ]
         );
     }
 

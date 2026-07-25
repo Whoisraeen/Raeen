@@ -333,7 +333,7 @@ fn sampled_render_target_binds_the_gpu_image_within_a_batch() {
                     sample_hash: 0,
                     cached: false,
                 }],
-                linear_filter: vec![false],
+                samplers: vec![raeen_gpu::vulkan::offscreen::SamplerState::nearest_repeat()],
                 sampled_groups: Vec::new(),
             }),
             storage_images: None,

@@ -21,7 +21,7 @@
       "name": "SharpEmu",
       "directory": "reference/sharpemu",
       "upstream_branch": "main",
-      "baseline_revision": "6db095e",
+      "baseline_revision": "26c5029",
       "license": "GPL-2.0",
       "url": "https://github.com/par274/sharpemu"
     },

@@ -351,13 +351,16 @@ fn title_translated_ps_sweep() {
     let sbuf_binding = move || {
         Some(StorageBufferBinding {
             binding: 0,
-            buffers: vec![if zero {
+            buffers: vec![std::sync::Arc::new(if zero {
                 vec![0u8; 256]
             } else {
                 (0..64)
                     .flat_map(|_| 1.0f32.to_le_bytes())
                     .collect::<Vec<u8>>()
-            }],
+            })],
+            guest_bases: vec![0],
+            guest_sizes: vec![256],
+            writable: vec![false],
         })
     };
     let tex_binding = move || {
@@ -378,7 +381,7 @@ fn title_translated_ps_sweep() {
                 sample_hash: 0,
                 cached: false,
             }],
-            linear_filter: vec![false],
+            samplers: vec![raeen_gpu::vulkan::offscreen::SamplerState::nearest_repeat()],
             sampled_groups: Vec::new(),
         })
     };
@@ -613,7 +616,10 @@ fn captured_hdr_composite_shader_pair_submits_safely() {
         push_uniform_binding: None,
         storage_buffers: Some(StorageBufferBinding {
             binding: 0,
-            buffers: vec![storage_bytes],
+            buffers: vec![std::sync::Arc::new(storage_bytes)],
+            guest_bases: vec![0],
+            guest_sizes: vec![256],
+            writable: vec![false],
         }),
         textures: Some(TextureBinding {
             sampled_binding: 1,
@@ -632,7 +638,7 @@ fn captured_hdr_composite_shader_pair_submits_safely() {
                 sample_hash: 0,
                 cached: false,
             }],
-            linear_filter: vec![false],
+            samplers: vec![raeen_gpu::vulkan::offscreen::SamplerState::nearest_repeat()],
             sampled_groups: Vec::new(),
         }),
         storage_images: None,

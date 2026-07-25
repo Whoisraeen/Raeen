@@ -154,6 +154,48 @@ fn depth_attachment_clears_and_reads_back() {
 }
 
 #[test]
+fn depth_only_draw_has_no_colour_attachment_and_persists_depth() {
+    let Some(backend) =
+        backend_or_skip("depth_only_draw_has_no_colour_attachment_and_persists_depth")
+    else {
+        return;
+    };
+    let dev = backend.device().expect("backend is initialized");
+    let vs = triangle_vertex_spirv();
+    let ps = triangle_fragment_spirv();
+    let mut state = DrawState {
+        vertices: Some(&TRIANGLE_VERTICES),
+        vertex_count: TRIANGLE_VERTICES.len() as u32,
+        depth: Some(DepthState {
+            target_base: Some(0x2234_0000),
+            ..cleared_depth_state(vk::Format::D32_SFLOAT, 0.625)
+        }),
+        ..DrawState::new(W, H, &vs, &ps)
+    };
+    state.color_output = false;
+    state.color_write_mask = vk::ColorComponentFlags::empty();
+    state.target_base = None;
+
+    let output = render_draw(dev, &state).expect("depth-only draw must render");
+    assert!(
+        output.color.is_none(),
+        "a depth-only pipeline must not synthesize a colour attachment"
+    );
+    let depth = output
+        .depth
+        .expect("depth-only draw must return its depth plane");
+    for (x, y) in [(0, 0), (W / 2, H / 2), (W - 1, H - 1)] {
+        let actual = depth.depth_at(x, y).expect("depth texel");
+        assert!((actual - 0.625).abs() <= DEPTH_TOLERANCE);
+    }
+    assert_eq!(
+        validation_error_count(),
+        0,
+        "Vulkan validation reported errors during the depth-only draw"
+    );
+}
+
+#[test]
 fn depth_attachment_loads_prior_contents() {
     let Some(backend) = backend_or_skip("depth_attachment_loads_prior_contents") else {
         return;

@@ -15,6 +15,7 @@ use ash::{Device, Entry, Instance, ext::debug_utils, vk};
 use parking_lot::{Mutex, MutexGuard};
 use raeen_core::error::GpuError;
 use std::ffi::{CStr, c_void};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
@@ -60,6 +61,11 @@ pub struct VulkanDevice {
     command_pool: vk::CommandPool,
     /// Driver-side cache of compiled pipeline binaries, reused across draws.
     pipeline_cache: vk::PipelineCache,
+    /// Exact generated cache file for this vendor/device/driver tuple.
+    pipeline_cache_path: Option<PathBuf>,
+    /// Number of fresh pipelines compiled in this process. Used to checkpoint
+    /// the driver blob during long-running/force-terminated title sessions.
+    pipeline_cache_generation: AtomicU64,
     /// Application-side caches of long-lived draw/dispatch resources
     /// (pipelines, layouts, shader modules, persistent render targets,
     /// command buffer/fence, descriptor pool). See [`super::cache`] for the
@@ -105,11 +111,12 @@ impl VulkanDevice {
         let entry = unsafe { Entry::load() }
             .map_err(|e| GpuError::VulkanInitFailed(format!("Vulkan loader unavailable: {e}")))?;
 
-        let (instance, validation_enabled) = Self::create_instance(&entry, validation)?;
+        let (instance, validation_enabled, debug_utils_enabled) =
+            Self::create_instance(&entry, validation)?;
 
         // Attach the debug messenger before device selection so that
         // validation errors during the remaining setup are still reported.
-        let debug = if validation_enabled {
+        let debug = if debug_utils_enabled {
             Self::create_debug_messenger(&entry, &instance)
         } else {
             None
@@ -139,12 +146,9 @@ impl VulkanDevice {
 
         // SAFETY: same handle validity as above; the call only fills the
         // returned struct.
-        let max_push_constants_size = unsafe {
-            instance
-                .get_physical_device_properties(physical_device)
-                .limits
-                .max_push_constants_size
-        };
+        let physical_properties =
+            unsafe { instance.get_physical_device_properties(physical_device) };
+        let max_push_constants_size = physical_properties.limits.max_push_constants_size;
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family_index)
@@ -170,9 +174,49 @@ impl VulkanDevice {
         // of times a frame; without this each rebind recompiles from SPIR-V.
         // A failed cache is non-fatal — fall back to no cache.
         // SAFETY: `device` is valid; the default create-info is inert.
-        let pipeline_cache =
-            unsafe { device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) }
-                .unwrap_or(vk::PipelineCache::null());
+        let runtime = crate::agc_exec::AgcGpuSession::runtime_config();
+        let pipeline_cache_path = runtime.shader_cache.then(|| {
+            runtime.shader_cache_dir.join("vulkan").join(format!(
+                "{:04x}-{:04x}-{:08x}.bin",
+                physical_properties.vendor_id,
+                physical_properties.device_id,
+                physical_properties.driver_version
+            ))
+        });
+        let initial_cache = pipeline_cache_path
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+            .filter(|bytes| !bytes.is_empty());
+        let create_cache = |initial: Option<&[u8]>| {
+            let mut info = vk::PipelineCacheCreateInfo::default();
+            if let Some(bytes) = initial {
+                info = info.initial_data(bytes);
+            }
+            // SAFETY: `device` is valid and initial bytes stay alive for this
+            // synchronous Vulkan call.
+            unsafe { device.create_pipeline_cache(&info, None) }
+        };
+        let pipeline_cache = match create_cache(initial_cache.as_deref()) {
+            Ok(cache) => {
+                if let (Some(path), Some(bytes)) = (&pipeline_cache_path, &initial_cache) {
+                    info!(
+                        path = %path.display(),
+                        bytes = bytes.len(),
+                        "restored persistent Vulkan pipeline cache"
+                    );
+                }
+                cache
+            }
+            Err(error) if initial_cache.is_some() => {
+                warn!(
+                    %error,
+                    path = %pipeline_cache_path.as_ref().expect("initial cache has path").display(),
+                    "persistent Vulkan pipeline cache rejected; rebuilding"
+                );
+                create_cache(None).unwrap_or(vk::PipelineCache::null())
+            }
+            Err(_) => vk::PipelineCache::null(),
+        };
 
         info!(
             "Vulkan device ready: {device_name} (validation={validation_enabled}, depth_range_unrestricted={depth_range_unrestricted}, graphics queue family {queue_family_index})"
@@ -187,6 +231,8 @@ impl VulkanDevice {
             queue_family_index,
             command_pool,
             pipeline_cache,
+            pipeline_cache_path,
+            pipeline_cache_generation: AtomicU64::new(0),
             caches: Mutex::new(DrawCaches::default()),
             memory_properties,
             debug,
@@ -224,6 +270,40 @@ impl VulkanDevice {
     /// failed — that is still a valid argument.
     pub(crate) fn pipeline_cache(&self) -> vk::PipelineCache {
         self.pipeline_cache
+    }
+
+    /// Checkpoint the driver cache after fresh pipeline creation. Isolated
+    /// runners are commonly terminated by the Shell and therefore may not run
+    /// `Drop`; sparse power-of-two checkpoints preserve almost all compilation
+    /// work without writing on every pipeline.
+    pub(crate) fn note_pipeline_compiled(&self) {
+        let generation = self
+            .pipeline_cache_generation
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        if generation > 4 && !generation.is_power_of_two() {
+            return;
+        }
+        let (Some(path), false) = (
+            self.pipeline_cache_path.as_ref(),
+            self.pipeline_cache == vk::PipelineCache::null(),
+        ) else {
+            return;
+        };
+        // SAFETY: the pipeline cache belongs to this live device. External
+        // synchronization is provided by the draw-cache mutex held by callers.
+        match unsafe { self.device.get_pipeline_cache_data(self.pipeline_cache) } {
+            Ok(bytes) if !bytes.is_empty() => {
+                if let Err(error) = persist_pipeline_cache(path, &bytes) {
+                    debug!(
+                        %error,
+                        path = %path.display(),
+                        "Vulkan pipeline-cache checkpoint failed"
+                    );
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The long-lived draw/dispatch resource caches (stage A).
@@ -317,7 +397,10 @@ impl VulkanDevice {
             })
     }
 
-    fn create_instance(entry: &Entry, validation: bool) -> Result<(Instance, bool), GpuError> {
+    fn create_instance(
+        entry: &Entry,
+        validation: bool,
+    ) -> Result<(Instance, bool, bool), GpuError> {
         let app_info = vk::ApplicationInfo::default()
             .application_name(c"Raeen")
             .application_version(vk::make_api_version(0, 0, 1, 0))
@@ -339,8 +422,10 @@ impl VulkanDevice {
             layers.push(VALIDATION_LAYER.as_ptr());
         }
 
+        let debug_utils_available =
+            validation_available && Self::has_instance_extension(entry, debug_utils::NAME);
         let mut extensions: Vec<*const i8> = Vec::new();
-        if validation_available && Self::has_instance_extension(entry, debug_utils::NAME) {
+        if debug_utils_available {
             extensions.push(debug_utils::NAME.as_ptr());
         }
 
@@ -358,7 +443,7 @@ impl VulkanDevice {
             ))
         })?;
 
-        Ok((instance, validation_available))
+        Ok((instance, validation_available, debug_utils_available))
     }
 
     fn has_validation_layer(entry: &Entry) -> bool {
@@ -669,6 +754,30 @@ impl Drop for VulkanDevice {
                 .get_mut()
                 .destroy(&self.device, self.command_pool);
             if self.pipeline_cache != vk::PipelineCache::null() {
+                if let Some(path) = &self.pipeline_cache_path {
+                    match self.device.get_pipeline_cache_data(self.pipeline_cache) {
+                        Ok(bytes) if !bytes.is_empty() => {
+                            if let Err(error) = persist_pipeline_cache(path, &bytes) {
+                                warn!(
+                                    %error,
+                                    path = %path.display(),
+                                    "persistent Vulkan pipeline-cache commit failed"
+                                );
+                            } else {
+                                debug!(
+                                    path = %path.display(),
+                                    bytes = bytes.len(),
+                                    "persistent Vulkan pipeline cache stored"
+                                );
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => warn!(
+                            %error,
+                            "vkGetPipelineCacheData failed during device teardown"
+                        ),
+                    }
+                }
                 self.device
                     .destroy_pipeline_cache(self.pipeline_cache, None);
             }
@@ -680,6 +789,19 @@ impl Drop for VulkanDevice {
             self.instance.destroy_instance(None);
         }
     }
+}
+
+fn persist_pipeline_cache(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("pipeline cache path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temp, bytes)?;
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    std::fs::rename(temp, path)
 }
 
 /// Routes validation-layer messages into `tracing`.

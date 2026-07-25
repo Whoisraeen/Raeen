@@ -1,3 +1,292 @@
+- NP STATE CALLBACK NOW DELIVERED (real fix, insufficient for the blank page)
+  + recvfrom exonerated (2026-07-24; raeen-hle 390/390, raeen-kernel 36/36,
+  clippy `-D warnings` clean):
+  * REAL BUG FIXED: `sceNpRegisterStateCallback{,A,ForToolkit}` recorded nothing
+    and `sceNpCheckCallback` was `hle_ok` — so a title that registers an NP
+    state callback and pumps `sceNpCheckCallback` waiting for the initial
+    account-state event waited forever. Now the registration is recorded
+    (`OrbisKernel::np_state_callbacks`, new `NpStateCallbackRegistration`) and
+    the first pump delivers the current state (SIGNED_OUT, consistent with
+    `sceNpGetState`) to the guest callback via the deferred guest-call channel,
+    once, with the correct per-form ABI: legacy = `(userId, state, npId*,
+    userdata)`, A/toolkit = `(userId, state, userdata)`. shadPS4
+    `np_manager.cpp DispatchPendingNpStateCallbacks` cited. 2 focused tests
+    (recording GuestCallScheduler) pin the delivery + the per-form arg layout.
+  * MEASURED EFFECT: the guest reacted — Minecraft registers via
+    `sceNpRegisterStateCallbackA` (the 3-arg form, so the form-tracking is
+    load-bearing) and `recvfrom` dropped 15.2M -> 9.7M steady. But the
+    post-"Get started" page STILL renders blank (frame_004096 captured). So the
+    NP state event was a genuine missing handshake but NOT the page's gate.
+  * recvfrom RULED OUT as the gate: it climbs into the millions during the
+    30-40 s window while the WORKING menu is on screen and BEFORE the press, so
+    it is RakNet (two "RakThread"s) idle-polling a UDP socket that never
+    receives — background noise, not the blank-page cause. The earlier
+    "15M recvfrom starves the UI" theory is now fully retired (the GIL is
+    off-by-default AND recvfrom is unrelated).
+  * HONEST STATUS: the blank post-menu page remains OPEN and is the documented
+    multi-session-RE blocker (progress.md ~2196 "Getting a Minecraft menu pixel
+    is multi-session RE"). cohtml renders the menu fine, so the engine works;
+    the post-press view loads no content. Next real lead is NOT another HLE
+    guess — it is to find what the Ore-UI page is waiting on (a view-creation
+    call that never comes, an asset/route it can't load, or a JS-side gate),
+    e.g. via `RAEEN_TRAP_MODULE_EXPORTS=cohtml` diffing which cohtml exports
+    fire before vs after the press, or dumping the cohtml View's loaded URL.
+
+- TEXTURE CACHE DEFAULTED OFF — Minecraft renders textured out of the box
+  (2026-07-24; raeen-gpu 229/229, clippy `-D warnings` clean, fmt clean):
+  * `diagnostics.rs`: `no_tex_cache: !on("RAEEN_TEX_CACHE")` — the persistent
+    sampled-texture cache is now opt-IN. Verified by frame capture: with NO env
+    vars set, Minecraft's panorama renders fully textured
+    (scratchpad `default_2048.png`); previously it needed
+    `RAEEN_NO_TEX_CACHE=1`.
+  * HONEST: this is a MITIGATION, not a root cause. The cache is measurably
+    guilty (cache ON: flat untextured, 5/12 sampled probes all-zero; cache OFF:
+    fully textured, 0/12) but the MECHANISM is still unknown, and the two
+    obvious theories are DISPROVED — the sample hash is whole-range (exact) for
+    the failing 1 KiB texture, and `sampled_render_target` already runs BEFORE
+    `decode_texture`, so the cache cannot short-circuit a live render-target
+    bind. Recorded in the task with the remaining avenues. Restoring the perf
+    win (build 969 -> 59 us) requires a capture with `RAEEN_TEX_CACHE=1` that is
+    pixel-identical to the default.
+  * CORRECTION to the earlier entry below: the claim that 15M `recvfrom` calls
+    starve the UI via "the global CALL_LOCK + guest-GIL" is WEAKER than stated.
+    The guest GIL is behind `RAEEN_SINGLE_THREAD_GUEST` (dispatch.rs:321-379)
+    and is OFF by default, and `CALL_LOCK` is taken by `execute_linked` for the
+    whole pipeline rather than per HLE call — so HLE calls are not globally
+    serialized in a normal run. The 15M-call spin is real and worth bounding,
+    but it is NOT established as the cause of the blank UI page.
+
+- MINECRAFT RENDERING: texture cache proven guilty; panorama fixed; blank
+  post-press page isolated as a SEPARATE bug (2026-07-24; frame-capture
+  evidence, no commit):
+  * PANORAMA FIXED (user-confirmed). Cause was the `image_get_resinfo` non-2D
+    refusal ported this session: the panorama is a type-11 cube lowered to
+    2DArray, and resinfo refused anything but plain 2D — which failed the WHOLE
+    shader recompile and dropped those draws, not just the query.
+  * TEXTURE CACHE IS A REAL BUG — PROVEN WITH PIXELS. `RAEEN_NO_TEX_CACHE=1` +
+    `RAEEN_DUMP_FRAMES` + scripted cross: the dumped menu frame renders
+    PERFECTLY — full textured panorama, logo, Steve's skin, green "Get started",
+    version text. With the cache ON the same scene is flat untextured geometry.
+    Probes: cache ON = 5/12 sampled textures all-zero (base=0x23140000);
+    cache OFF = 0/12. This ANSWERS the open question
+    `rendering-blockers-and-port-plan-2026-07-22.md` demanded be settled before
+    further perf work ("the stage-D texture cache is UNVERIFIED — run the
+    `RAEEN_NO_TEX_CACHE` A/B first; if it regresses, revert it"): it regresses.
+    Do NOT just delete it (real perf win, build 969 -> 59 us) — fix the
+    invalidation. Open sub-question recorded in the task: whether the guest
+    bytes legitimately stay zero because the content is produced by a GPU pass
+    we never read back (cache innocent, missing writeback) versus the sparse
+    sample hash missing the change.
+  * MRT RULED OUT — a new `note_active_color_slots` diagnostic
+    (`draw_translate.rs`) reports any draw binding CB_COLOR slots above 0. It
+    fired ZERO times across a full run, so Minecraft renders one target at a
+    time and the large block of skipped CB_COLOR1-7 context registers is a red
+    herring. This killed a ~large MRT implementation before it was written.
+  * BLANK POST-PRESS PAGE IS SEPARATE AND STILL OPEN. `frame_004096` captured
+    after the press WITH the cache disabled is still a flat light-grey page —
+    so the cache is not its cause. No guest console output and no new asset
+    VFS reads follow the press (only savedata writes), so the Ore-UI/cohtml
+    page navigates and renders empty. Next lead: why the HTML page paints its
+    background but no content.
+  * TOOLING: frame dumps are PPM (`RAEEN_DUMP_FRAMES=<dir>`, power-of-two
+    draw indices, 960x540 here); a PowerShell PPM->PNG converter lives in the
+    session scratchpad for viewing them.
+
+- MINECRAFT BUTTON-PRESS CRASH FIXED — `sceKernelVirtualQuery` under-reported
+  direct mappings (2026-07-24; working tree, no commit; raeen-hle 388/388,
+  raeen-gpu 227/227):
+  * SYMPTOM: pressing X at the "Get started" menu did nothing and killed the
+    title. Reported as an input bug; it was not one.
+  * INPUT IS FINE — PROVEN. Reproduced deterministically with
+    `RAEEN_RUNNER_CHILD=1 RAEEN_INPUT_SCRIPT="0:neutral;50000:cross;50400:neutral"`
+    + `RAEEN_TRACE_PAD=1`: the runner applied `buttons=0x00004000`
+    (SCE_PAD_BUTTON_CROSS) at t=50.003 s and the guest read `0x00004000`
+    through `scePadReadState` **8 ms later**. Host -> IPC -> kernel -> guest is
+    complete and correct. (NOTE: scripted input only runs when
+    `RAEEN_RUNNER_CHILD` is set — a headless `--run-eboot` without it silently
+    has no input thread at all.)
+  * WHAT ACTUALLY HAPPENED: 65 ms after the guest read the press, Minecraft's
+    embedded V8 (in `libcohtml.Prospero.prx`, the Gameface UI module; message
+    written via `libc.prx`) printed `# Fatal error in , line 0 / # unreachable
+    code` and the process exited **code 3**. Empty file + line 0 = a
+    release-build V8 `UNREACHABLE()`. This was ALSO the cause of the earlier
+    "pressed X and it crashed" report whose log ended mid-stream with no fault
+    line and no Windows Error Reporting event.
+  * ROOT CAUSE (found via the `RAEEN_TRACE_EINVAL`-gated HLE ring): the last
+    calls before the fatal were `AllocateDirectMemory -> MapDirectMemory ->
+    **VirtualQuery**` — V8 maps direct memory and immediately queries the range
+    back to verify it. `hle_virtual_query` filled only start/end/protection/
+    is_committed of the 72-byte `SceKernelVirtualQueryInfo`, leaving `offset`
+    (0x10), `memory_type` (0x1C) and every kind bit (0x20) ZERO. So memory the
+    guest had just mapped as DIRECT, type 12, phys 0x5bc10000 read back as
+    "anonymous, type 0, offset 0". V8's invariant check failed -> UNREACHABLE.
+    Every allocate/map SUCCEEDED; nothing was failing, the read-back just
+    disagreed with the write.
+  * FIX: `MemoryRegion` gained `kind: MappingKind` (Anonymous/Direct/Flexible/
+    Stack/Pooled, with `query_flag_bit()` matching shadPS4's bit order),
+    `direct_offset` and `direct_memory_type`; new
+    `VirtualMemoryManager::record_mapping_of_kind` +
+    `direct_allocation_type(phys)`. `hle_allocate_direct_memory` now records the
+    allocation's `type` against its physical range and
+    `hle_map_direct_memory` records the mapping as Direct carrying the physical
+    offset and that type. `hle_virtual_query` writes offset at 0x10,
+    memory_type at 0x1C, and ORs in the kind bit at 0x20. Layout pinned against
+    shadPS4 `core/libraries/kernel/memory.h` `OrbisVirtualQueryInfo`.
+  * MEASURED AFTER: same scripted run, two X presses — **zero** "unreachable
+    code", process ran the full 80 s (exit 124 timeout, not 3), guest read every
+    transition `0 -> 0x4000 -> 0 -> 0x4000 -> 0`, and GPU work kept flowing
+    ACROSS the presses (draws 15,210 -> 45,458; flips 2,048 -> 4,096).
+  * HONEST LIMIT: the title survives the press and keeps rendering, but no new
+    guest console output followed it, so "advances to the next screen" is NOT
+    demonstrated — only "no longer dies". The missing panorama is a SEPARATE,
+    still-open bug (ruled out as a texture-format/tile-mode refusal: zero
+    unsupported-swizzle diagnostics, zero format refusals, zero draw skips).
+
+- SHARPEMU GPU/SHADER REFRESH 21f964a → 26c5029 (2026-07-24; working tree, no
+  commit; raeen-gpu lib 227/227, kyty-graphics 450+1+4, clippy `-D warnings`
+  clean on both by project convention, fmt clean):
+  * METHOD: both GPU commits compared MECHANICALLY, not by inspection — the
+    swizzle tables were decoded to `(xmask, ymask)` pairs on both sides (4
+    tables × 5 bpp rows × 16 bits = 320 entries, **0 mismatches**) and both
+    detile algorithms were re-simulated on the 8 vectors from SharpEmu's own
+    `GnmTilingDetileTests.cs` (**8/8 byte-identical**). This is what turned two
+    assumed gaps into "already covered" and found the real ones elsewhere.
+  * THREE STALE CLAIMS CORRECTED. (a) `rendering-blockers-and-port-plan`'s
+    "`tiling.rs` is CPU-only, 2 modes" — it has **4** (5/9/24/27) at 5 element
+    sizes, equations bit-identical to SharpEmu. (b) Bpp coverage is **equal**,
+    not broader (my own earlier claim): SharpEmu's tables always had 5 rows;
+    "4bpp" in the commit title is its GPU kernel's scope. (c) the port ledger's
+    "flat-shader render path not exercised end-to-end / renderer priority #1" —
+    the FLAT decode landed in `c0f6303` and the 3D depth transport is covered.
+  * INTEGRATED (#592): row-parallel CPU detile (rayon, ≥512×512-element
+    threshold, mirroring `GnmTiling.cs:533-539`) — every output row is an
+    independent destination slice, proven by a round-trip test that runs the
+    parallel branch and the serial branch on the same surface; a
+    non-power-of-two element-size guard (`bpp_log2_is_supported`) — callers
+    derive bpp with `trailing_zeros`, so a 3-byte element was silently read as
+    1 byte and a 32-byte element indexed **one past** the last table row, a
+    latent panic, both now named refusals; and a rate-limited
+    `(tile_mode, format)` warning on the refusal path so the modes titles
+    actually bind become a MEASUREMENT (the refusal drops the draw and shows up
+    only as the BLACK FRAME warning, naming nothing).
+  * INTEGRATED (#587): `image_get_resinfo` no longer refuses non-2D. It
+    hard-refused anything but plain 2D, and that failed the **whole shader
+    recompile** — dropping the draw, not just the query — and caught **2D-array
+    as well as 3D**, i.e. every cube T# (types 11/13 lower to 2DArray, which is
+    exactly Minecraft's panorama). `OpImageQuerySizeLod`'s result width is fixed
+    by the image's dim, so the query type now follows the descriptor (`%v3int`
+    for 3D/2DArray, `%v2int` for 2D); only x/y are stored either way. Added
+    `%v3int` to the type preamble. Test asserts all three descriptor types
+    recompile, emit the right query type, and pass naga validation.
+  * DELIBERATELY NOT PORTED, with reasons: the GPU compute detile pass (well
+    specified, Raeen's deferred-batch machinery fits it, ~700-1000 lines — but
+    it targets *texture-upload* CPU cost, which is NOT in Tier 4's measured
+    top-8; per-flip readback and per-submit fence waits are); SharpEmu's rule
+    that MIMG `DIM` **overrides** the descriptor (Raeen already decodes DIM and
+    uses it to gate the third address VGPR while taking `Dim` from the T#
+    nibble — descriptor-wins is defensible and tested, DIM-wins is unverified).
+  * QUEUED, EACH GATED ON A MEASUREMENT: block-table modes 1/4/8 (SharpEmu's own
+    comment concedes it is a *model*, not a transcribed AddrLib PATINFO table —
+    port only if the new diagnostic shows a title using them); mip-chain base
+    placement (Raeen always reads `t.base40()`, so any `last_level > 0` texture
+    samples from the wrong offset); `VkImageType` from the type nibble rather
+    than `depth > 1` (a type-10 T# with `depth()==0` gets SPIR-V `Dim3D` but a
+    2D image — the mismatch class blamed for an ASTRO.BOT device loss); tiled 3D
+    upload/UAV detile (today an honest named refusal, not a silent under-read);
+    FLAT D16 opcodes 0x19/0x1b/0x20-0x25.
+  * ADJACENT GAP FOUND, BIGGER THAN EITHER COMMIT: `texture_vk_format`
+    (`draw_translate.rs:909-985`) has **no block-compressed format arms at all**
+    (no BC1/BC5/BC7). Most retail PS5 textures are BC. Not a SharpEmu port — a
+    Raeen gap deserving its own task.
+  * DOCS: `THIRD_PARTY_NOTICES.md` (both commits attributed, GPL-2.0→GPL-2.0),
+    `docs/reference-port-ledger.md` (new 2026-07-24 refresh section),
+    `compat/reference-state.json` SharpEmu baseline 6db095e → 26c5029,
+    `rendering-blockers-and-port-plan-2026-07-22.md` stale claim corrected
+    in place.
+  * NOT DONE: Minecraft A/B still outstanding and now covers these GPU changes
+    too (the resinfo path affects 2DArray = its panorama). `#605`
+    `sceAudioOutOutputs` not reviewed (out of scope for a GPU/shader pass).
+
+- SUBNAUTICA UNBLOCKED: nested-directory `.prx` discovery + dependency-first
+  module init (2026-07-24; working tree, no commit; raeen-hle 386/386,
+  raeen-firmware 119+11+3+3, raeen-runtime 68+45+1, raeen-kernel 36+2 — 674
+  tests, 0 failures):
+  * MEASURED 8-TITLE BASELINE FIRST (build df38544, `cargo xtask compat run
+    --tier all --timeout 180`, saved to scratchpad `baseline-df38544.json`).
+    Minecraft 2048 flips / ASTRO.BOT 0 flips timeout / Until Dawn + Dragon Ball
+    guest fault `read 0xa` / Avatar `stage=rendering` 1 flip then
+    `libScePlayGoDialog` unimplemented import / GTA V fault after 2733 HLE calls
+    / A Plague Tale host crash `0xC0000094` STATUS_INTEGER_DIVIDE_BY_ZERO /
+    Subnautica exit at 1 s.
+  * ROOT CAUSE 1 (search path, NOT a missing loader): Raeen already had the
+    whole file-backed load -> link -> register -> LoadStartModule chain. It
+    searched `<app>/` and `<app>/sce_module/` only (`DEPENDENCY_SUBDIRS`), but
+    Unity ships modules in `Media/Modules` + `Media/Plugins`. So Subnautica's
+    `Il2CppUserAssemblies.prx` — the ENTIRE game's C# compiled to native, 67 MB
+    / 260 exports — was never placed and `sceKernelLoadStartModule` returned a
+    code-less pseudo-handle. NEW `ModuleIndex` (bounded depth-4 recursive walk,
+    prunes `sce_sys`/`savedata`/`streamingassets`, no symlink following,
+    canonical case/extension-insensitive lookup) backs both the `DT_NEEDED`
+    search and the plugin pre-placement scan. Explicit app-root -> `sce_module/`
+    precedence preserved; the index only ADDS reach. `Media/Modules` classified
+    eager, everything else lazy — byte-for-byte SharpEmu's `StartAtBoot` split
+    (`SharpEmuRuntime.cs:636-645`). All 8 of Subnautica's `.prx` now load.
+  * ROOT CAUSE 2 (GENERAL, affects every title shipping `.prx`): module
+    initializers ran in breadth-first load order, i.e. the eboot's `DT_NEEDED`
+    declaration order. Subnautica's order was Il2Cpp -> PS5Util -> **libc**,
+    but Il2Cpp NEEDs both — so IL2CPP's `module_start` called into a libc whose
+    own `module_start` had not run and died on a null function pointer
+    (`guest fault at 0x0 (execute 0x0)`, libc.prx frames on the stack). NEW
+    `topological_init_order` (post-order DFS over the NEEDED graph) makes
+    dependencies initialize before dependents; order is now libc -> PS5Util ->
+    Il2Cpp. Cycles are broken at the back-edge with a warning, never dropping a
+    module; unshipped/HLE-covered NEEDEDs impose no constraint, so a graph with
+    no real edges keeps the old order (no reordering risk for working titles).
+  * ALSO: image-budget guard (recursive scan can pull in far more modules — an
+    over-budget composition now names itself with per-module sizes instead of
+    surfacing as an opaque arena `MapFailed`); `GUEST_IMAGE_REGION_BYTES`
+    mirrored from `arena::IMAGE_SIZE` and pinned by a cross-crate test, since
+    firmware cannot depend on runtime.
+  * HLE: `sceUserServiceGetAgeLevel` (18) + the remaining accessibility getter
+    family — ChatTranscription / PressAndHoldDelay / ZoomEnabled /
+    ZoomFollowFocus (all 0), SharpEmu `UserServiceExports.cs:227-273` values.
+    Registered as a FAMILY rather than one-per-fault: each miss otherwise costs
+    a whole measure/build/re-run cycle. NID pinned in firmware
+    (`0xc28369bbee3944b9`, cross-checked against shadPS4 `aerolib.inl`).
+  * PRINTF FLOATS (real gap, was flooding A Plague Tale's log): `%f %F %e %E
+    %g %G` implemented with C spelling (two-digit signed exponent, `%g`
+    trailing-zero trimming, `nan`/`inf`/`INF`). `format_c` now takes a SECOND,
+    independent iterator for floats, because SysV passes variadic floats in XMM
+    and integers in GP — consuming a float from the GP sequence would
+    desynchronize every later integer conversion. `printf`/`snprintf` feed it
+    from `ctx.float_args` (XMM0-7); `vsnprintf` gained the `va_list`
+    `fp_offset` cursor (`GuestVaListFloats`) the old code ignored. The module
+    header's claim that "the dispatcher does not capture XMM" was STALE —
+    `float_args` had been added earlier.
+  * SUBNAUTICA TRAJECTORY (measured, each a separate release run): 1 s exit ->
+    all modules load + Il2Cpp `module_start` faults null -> init order fixed,
+    Il2Cpp init SUCCEEDS and the title prints its own Unity launcher banner
+    (311 bytes of guest console: "Argument Count = 1 / LAUNCHER CONTROL ...") ->
+    `sceUserServiceGetAgeLevel` -> `GetAccessibilityChatTranscription` ->
+    now `scePadDeviceClassGetExtendedInformation`. Real game code is running.
+  * NOT DONE / NEXT: (a) re-run the full 8-title sweep on this build — the
+    init-order fix is general and may move other titles, but that is UNMEASURED
+    and no claim is made; (b) Minecraft A/B is REQUIRED before trusting the
+    printf change (the user was playing it, so it was not run); (c) the shared
+    UE5 `read 0xa` fault (Until Dawn + Dragon Ball, identical signature, both
+    after `sceKernelWaitEqueue` ETIMEDOUT) is the top remaining multi-title
+    blocker; (d) A Plague Tale's host divide-by-zero is OUR bug, not the
+    title's.
+  * BUILD GOTCHA (cost several cycles): a running `raeen.exe` — including the
+    user's own Shell — makes `cargo build` fail with `failed to remove file
+    target\release\raeen.exe / Access is denied`, AND `cargo build ... | tail`
+    reports tail's exit code (0), so the failure is invisible and the next run
+    silently measures a STALE binary. Redirect to a file and capture `$?`.
+    `tasklist` name-filtering missed a holder that a module scan
+    (`Get-Process | %{ $_.Modules }`) found. Session workaround: a separate
+    `CARGO_TARGET_DIR` (`../Raeen-target-dev`) so development never touches the
+    binary the user is running.
+
 - Present-path plugin ABI — upscaler / frame-gen framework (2026-07-23;
   working tree, no commit):
   * NEW `crates/raeen-gpu/src/present_plugin/{mod,builtin}.rs`: a generic,
@@ -3119,3 +3408,59 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
     Minecraft logo, animated-panorama frame, Steve model, version text and
     "Get started" menu. This closes the black client-area transport regression,
     not Minecraft gameplay or M4/M5.
+
+- MINECRAFT PANORAMA CUBEMAP LOWERING + COMPUTE WRITEBACK FIXED
+  (2026-07-24; working tree, release Shell/profile runs):
+  * ROOT CAUSE (rendering): RDNA's `V_CUBE*` sequence already converts a
+    direction to `(s, t, face)` before `image_sample`. Raeen bound guest
+    texture type 11 as a Vulkan cube, so Vulkan interpreted those values as a
+    direction a second time and produced the measured radial panorama smear.
+    Type 11 now lowers to a six-layer `2DArray` in both SPIR-V and Vulkan.
+  * LIVE EVIDENCE: `scratch/minecraft-panorama-2darray-live.png` shows the
+    complete sharp panorama, logo, Steve, buttons, and version text through the
+    isolated Shell client. The shared presenter reported a measured 4 FPS at
+    that menu; correctness is fixed, but the 60 FPS target remains open.
+  * ROOT CAUSE (compute correctness/performance): the host discarded
+    `ShaderStorageUsage` and read every compute V# back into guest memory,
+    including `ReadOnly` and `Constant` inputs. Writeback now preserves the
+    translated usage table and returns only `ReadWrite` buffers.
+  * MEASURED PROFILE: before the usage fix the first 35 seconds reached about
+    672 flips; the same release/profile run after it reached about 1,376 flips.
+    The remaining slow phase is still compute submission (about 21-23 ms per
+    dispatch, 94-96% worker busy), not texture decode. Command/resource
+    lifetime batching is the next measured performance wall.
+  * VERIFICATION: `kyty-graphics` 445/445 tests and the complete
+    `raeen-gpu` unit + Vulkan integration suite are green; release Shell build
+    is green. This does not claim Minecraft gameplay or M4/M5.
+
+- MINECRAFT FOUR-PATH RELIABILITY SLICE (2026-07-24; working tree, two release
+  Shell runs):
+  * FINAL COMPOSITE: when a title's undecoded final copy leaves a visible
+    intermediate and an empty linear RGBA/BGRA VideoOut buffer, the presenter
+    now writes that intermediate into the real guest-visible scanout. The copy
+    scales the configured internal resolution (measured 1440x810 at 0.75x) to
+    the registered 1920x1080 display and preserves pitch/channel order. The
+    measured rerun copied every subsequent frame into alternating
+    `0x1f7d0000`/`0x20040000`; the prior `PRESENT ROUTING` warning stopped once
+    content began. Exact-copy and scaled-copy regressions are covered.
+  * PERSISTENT CACHES: translated SPIR-V is content/ABI-addressed under
+    `shader_cache/spirv-v1`; malformed entries are validated and discarded.
+    The Vulkan driver cache is keyed by vendor/device/driver and checkpointed
+    after sparse pipeline generations so force-terminated child runners still
+    retain it. On the measured warm run all five boot shaders were disk hits
+    (`translated_ok=0`, `disk_hits=5`) and a 22,184-byte AMD pipeline blob was
+    present.
+  * SHARED PRESENT/INPUT: the Windows child/Shell mapping is protocol v3 with
+    two 136-MiB RGBA8 slots, so the next child copy no longer overwrites the
+    slot the Shell normally reads. Stable-sequence validation still rejects a
+    lapped/torn copy. The same bidirectional mapping continued to report
+    `runner applied controller state ... source="shell-ipc"`.
+  * GLOBAL RESOURCES: an interrupted Bedrock runner left an exact zero-byte
+    `resource_init_lock`; the new runner safely removes only that empty session
+    marker before mounting save data. The live rerun logged one recovered
+    marker; packaged resources and nonempty files are never altered.
+  * VERIFICATION: `raeen-gpu` 216/216, `raeen-gui` focused suite plus new
+    resource-lock test, GPU clippy `-D warnings`, fmt, and release build are
+    green. Live evidence is `scratch/minecraft-scaled-scanout-live.png`.
+    Presentation was measured at 4 FPS (later 2 FPS during loading), so the
+    60-FPS/menu/gameplay acceptance remains open and M4/M5 are not claimed.

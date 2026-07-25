@@ -20,7 +20,7 @@ use super::shaders::{triangle_fragment_spirv, triangle_vertex_spirv};
 use ash::vk::Handle;
 use ash::{Device, util::Align, vk};
 use raeen_core::error::GpuError;
-use std::mem;
+use std::{mem, sync::Arc};
 use tracing::debug;
 
 /// The color the attachment is cleared to before the draw, as linear RGBA.
@@ -114,7 +114,21 @@ pub struct VertexAttributeData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageBufferBinding {
     pub binding: u32,
-    pub buffers: Vec<Vec<u8>>,
+    /// Submission-owned snapshots. `Arc` makes repeated descriptors for the
+    /// same guest allocation cheap: the command processor captures the bytes
+    /// once and every dispatch in that PM4 submission shares them.
+    pub buffers: Vec<std::sync::Arc<Vec<u8>>>,
+    /// Stable guest identity for each descriptor. A zero address denotes a
+    /// synthetic/null/test buffer and deliberately bypasses the persistent
+    /// compute-buffer cache.
+    pub guest_bases: Vec<u64>,
+    /// Unpadded guest byte lengths, parallel to `buffers`. Vulkan descriptor
+    /// storage is dword-padded; deferred writeback must never publish that pad.
+    pub guest_sizes: Vec<usize>,
+    /// One flag per `buffers` entry. Only `ReadWrite` guest V# descriptors
+    /// need a post-dispatch host readback; `ReadOnly` and `Constant` entries
+    /// are inputs and must never be copied back over guest memory.
+    pub writable: Vec<bool>,
 }
 
 /// The raw EUD-window fallback SSBO (SharpEmu port): a dispatch-time
@@ -166,7 +180,10 @@ pub struct StorageImageUpload {
     pub format: vk::Format,
     /// Initial linear content,
     /// `width * height * depth * layers * texel_bytes()` bytes.
-    pub pixels: Vec<u8>,
+    /// Shared per-submission snapshot. Repeated dispatches binding the same
+    /// descriptor retain this allocation and can prove that the persistent
+    /// GPU image already carries newer ordered contents.
+    pub pixels: Arc<Vec<u8>>,
     /// Guest address of the selected base array layer for post-dispatch
     /// writeback (not necessarily the allocation's layer-zero address).
     pub guest_base: u64,
@@ -279,8 +296,39 @@ fn warn_bad_cube_layers_once(upload: &TextureUpload, safe: u32) {
     }
 }
 
-/// Bytes per texel for sampled texture uploads accepted by
-/// `draw_translate::texture_vk_format`.
+/// Width/height, in texels, of one addressable element of `format`.
+///
+/// 1 for every uncompressed format — one element is one texel. 4 for the
+/// block-compressed (BC) family, whose smallest addressable unit is a 4x4
+/// texel block: a 1024x1024 BC7 image is 256x256 *elements* of 16 bytes, not
+/// 1024x1024 of anything. Every size, tiling, and staging computation has to
+/// run in elements; only the `VkImage` extent stays in texels.
+///
+/// Ports SharpEmu's block/element split (`Agc/AgcExports.cs`
+/// `TryGetTextureElementLayout`, `elementsWide = (width + 3) / 4`).
+pub(crate) const fn format_block_extent(format: vk::Format) -> u32 {
+    match format {
+        vk::Format::BC1_RGBA_UNORM_BLOCK
+        | vk::Format::BC1_RGBA_SRGB_BLOCK
+        | vk::Format::BC2_UNORM_BLOCK
+        | vk::Format::BC2_SRGB_BLOCK
+        | vk::Format::BC3_UNORM_BLOCK
+        | vk::Format::BC3_SRGB_BLOCK
+        | vk::Format::BC4_UNORM_BLOCK
+        | vk::Format::BC4_SNORM_BLOCK
+        | vk::Format::BC5_UNORM_BLOCK
+        | vk::Format::BC5_SNORM_BLOCK
+        | vk::Format::BC6H_UFLOAT_BLOCK
+        | vk::Format::BC6H_SFLOAT_BLOCK
+        | vk::Format::BC7_UNORM_BLOCK
+        | vk::Format::BC7_SRGB_BLOCK => 4,
+        _ => 1,
+    }
+}
+
+/// Bytes per addressable element for sampled texture uploads accepted by
+/// `draw_translate::texture_vk_format` — per texel for uncompressed formats,
+/// per 4x4 block for the BC family.
 fn texture_texel_bytes(format: vk::Format) -> Result<u32, GpuError> {
     match format {
         vk::Format::R8_UNORM | vk::Format::R8_UINT => Ok(1),
@@ -291,6 +339,23 @@ fn texture_texel_bytes(format: vk::Format) -> Result<u32, GpuError> {
         | vk::Format::R16G16_SFLOAT => Ok(4),
         vk::Format::R16G16B16A16_UNORM | vk::Format::R16G16B16A16_SFLOAT => Ok(8),
         vk::Format::R32G32B32A32_SFLOAT => Ok(16),
+        // BC blocks: 8 bytes for the two-colour-endpoint families (BC1/BC4),
+        // 16 for everything else. Matches SharpEmu's
+        // `GetBlockCompressedBlockBytes` (`Agc/AgcExports.cs:8226-8231`).
+        vk::Format::BC1_RGBA_UNORM_BLOCK
+        | vk::Format::BC1_RGBA_SRGB_BLOCK
+        | vk::Format::BC4_UNORM_BLOCK
+        | vk::Format::BC4_SNORM_BLOCK => Ok(8),
+        vk::Format::BC2_UNORM_BLOCK
+        | vk::Format::BC2_SRGB_BLOCK
+        | vk::Format::BC3_UNORM_BLOCK
+        | vk::Format::BC3_SRGB_BLOCK
+        | vk::Format::BC5_UNORM_BLOCK
+        | vk::Format::BC5_SNORM_BLOCK
+        | vk::Format::BC6H_UFLOAT_BLOCK
+        | vk::Format::BC6H_SFLOAT_BLOCK
+        | vk::Format::BC7_UNORM_BLOCK
+        | vk::Format::BC7_SRGB_BLOCK => Ok(16),
         other => Err(GpuError::VulkanInitFailed(format!(
             "sampled texture format {other:?} has no texel byte size mapping"
         ))),
@@ -346,8 +411,15 @@ impl TextureUpload {
         img_layers: u32,
     ) -> Result<std::borrow::Cow<'_, [u8]>, GpuError> {
         let texel_bytes = texture_texel_bytes(self.format)? as usize;
-        let required = (self.width as usize)
-            .checked_mul(self.height as usize)
+        // Sizes run in ELEMENTS: for a BC format one element is a 4x4 texel
+        // block, so a 1024x1024 BC7 surface stages 256*256*16 bytes, not
+        // 1024*1024*16. Sizing it in texels would demand (and zero-pad to) 16x
+        // the real data and make every BC upload look catastrophically short.
+        let block = format_block_extent(self.format) as usize;
+        let elements_wide = (self.width as usize).div_ceil(block);
+        let elements_high = (self.height as usize).div_ceil(block);
+        let required = elements_wide
+            .checked_mul(elements_high)
             .and_then(|n| n.checked_mul(self.depth.max(1) as usize))
             .and_then(|n| n.checked_mul(img_layers.max(1) as usize))
             .and_then(|n| n.checked_mul(texel_bytes))
@@ -373,13 +445,37 @@ impl TextureUpload {
 /// and `%samplers` (an array of samplers) and indexes them with the values the
 /// push constants carry, so the arrays here must match the analyzer's counts
 /// exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SamplerState {
+    pub mag_filter: vk::Filter,
+    pub min_filter: vk::Filter,
+    pub mipmap_mode: vk::SamplerMipmapMode,
+    pub address_mode_u: vk::SamplerAddressMode,
+    pub address_mode_v: vk::SamplerAddressMode,
+    pub address_mode_w: vk::SamplerAddressMode,
+}
+
+impl SamplerState {
+    #[must_use]
+    pub const fn nearest_repeat() -> Self {
+        Self {
+            mag_filter: vk::Filter::NEAREST,
+            min_filter: vk::Filter::NEAREST,
+            mipmap_mode: vk::SamplerMipmapMode::NEAREST,
+            address_mode_u: vk::SamplerAddressMode::REPEAT,
+            address_mode_v: vk::SamplerAddressMode::REPEAT,
+            address_mode_w: vk::SamplerAddressMode::REPEAT,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextureBinding {
     pub sampled_binding: u32,
     pub sampler_binding: u32,
     pub textures: Vec<TextureUpload>,
-    /// One entry per S#; only linear-vs-nearest is honoured today.
-    pub linear_filter: Vec<bool>,
+    /// One fully-decoded host state per guest S#.
+    pub samplers: Vec<SamplerState>,
     /// Per-Dim sampled-image descriptor groups for a MIXED-dim shader. The
     /// recompiled SPIR-V declares one `%textures2D_S<dim>` array per present
     /// Dim (2D, 3D, Cube, 2DArray), each at its own binding; a group's
@@ -879,7 +975,7 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
     // Full pre-submit draw identity for device-loss forensics (RAEEN_NO_DEFER=1
     // makes each draw synchronous, so the LAST line here before a device-lost is
     // the faulting draw). Gated to keep the hot path quiet.
-    if std::env::var_os("RAEEN_TRACE_DRAW_STATE").is_some() {
+    if crate::diagnostics::gpu_env().trace_draw_state {
         let tex: Vec<String> = state
             .stage_bindings
             .iter()
@@ -924,7 +1020,12 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
                 let storage_lens = s
                     .storage_buffers
                     .as_ref()
-                    .map(|b| b.buffers.iter().map(Vec::len).collect::<Vec<_>>())
+                    .map(|b| {
+                        b.buffers
+                            .iter()
+                            .map(|bytes| bytes.len())
+                            .collect::<Vec<_>>()
+                    })
                     .unwrap_or_default();
                 format!(
                     "{:?}:push{}={push_head:?}:sbuf={storage_lens:?}",
@@ -982,7 +1083,7 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
     // wait — that is the contract that makes the cached command buffer,
     // fence, and descriptor pool reusable (see `super::cache` module docs).
     let mut caches = dev.draw_caches();
-    let timing = std::env::var_os("RAEEN_TIME_DRAW").is_some();
+    let timing = crate::diagnostics::gpu_env().time_draw;
     let mut res = Resources::new(dev, &mut caches);
     let t0 = std::time::Instant::now();
     res.build(state)?;
@@ -1034,20 +1135,21 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
 /// This is deliberately generic: title bytes stay in the caller-selected,
 /// gitignored diagnostic directory and never become repository fixtures.
 fn dump_draw_state_resources(state: &DrawState) {
-    let (Ok(target), Ok(dir)) = (
-        std::env::var("RAEEN_DUMP_DRAW_TARGET"),
-        std::env::var("RAEEN_DUMP_DRAW_STATE"),
+    let env = crate::diagnostics::gpu_env();
+    let (Some(target), Some(dir)) = (
+        env.dump_draw_target.as_deref(),
+        env.dump_draw_state.as_deref(),
     ) else {
         return;
     };
-    let target = target.strip_prefix("0x").unwrap_or(&target);
+    let target = target.strip_prefix("0x").unwrap_or(target);
     let Ok(target) = u64::from_str_radix(target, 16) else {
         return;
     };
     if state.target_base != Some(target) || dir.is_empty() {
         return;
     }
-    let dir = std::path::Path::new(&dir);
+    let dir = std::path::Path::new(dir);
     let write = |name: String, bytes: &[u8]| {
         let path = dir.join(name);
         if let Err(error) = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, bytes))
@@ -1097,10 +1199,10 @@ fn dump_draw_state_resources(state: &DrawState) {
 
 /// Deferred-readback (stage B) variant of [`render_draw`] for the title path.
 ///
-/// The draw's commands are recorded into a per-draw command buffer and
-/// submitted **without** a fence wait and **without** reading the target back;
-/// the persistent target is marked GPU-newer and the pixels land in one batch
-/// readback at the next [`flush_deferred_draws`]. This is what turns
+/// The draw's commands are recorded into a per-draw command buffer without
+/// submitting or reading the target back. The persistent target is marked
+/// GPU-newer; the flush submits every recorded draw/dispatch in order with one
+/// queue call and fence, then performs one batch readback. This is what turns
 /// per-draw fence+readback cost (measured 11–12 ms/draw on ASTRO.BOT) into a
 /// per-flush cost.
 ///
@@ -1117,7 +1219,7 @@ pub fn render_draw_deferred(
     dev: &VulkanDevice,
     state: &DrawState,
 ) -> Result<Option<RenderedImage>, GpuError> {
-    let force_immediate = std::env::var_os("RAEEN_NO_DEFER").is_some();
+    let force_immediate = crate::diagnostics::gpu_env().no_defer;
     if force_immediate
         || state.target_base.is_none()
         || !state.color_output
@@ -1139,7 +1241,7 @@ pub fn render_draw_deferred(
             "vertex and fragment SPIR-V must be non-empty".to_owned(),
         ));
     }
-    let timing = std::env::var_os("RAEEN_TIME_DRAW").is_some();
+    let timing = crate::diagnostics::gpu_env().time_draw;
     let mut caches = dev.draw_caches();
     let mut res = Resources::new(dev, &mut caches);
     res.batched = true;
@@ -1148,21 +1250,30 @@ pub fn render_draw_deferred(
     let t_build = t0.elapsed();
     let t1 = std::time::Instant::now();
     res.record_and_submit(state)?;
-    res.commit_to_batch();
+    res.commit_to_batch()?;
     let t_submit = t1.elapsed();
     drop(res);
     if timing {
-        let stats = caches.stats;
-        tracing::warn!(
-            build_us = t_build.as_micros(),
-            submit_us = t_submit.as_micros(),
-            deferred_draws = stats.deferred_draws,
-            sampled_target_binds = stats.sampled_target_binds,
-            texture_cache_hits = stats.texture_cache_hits,
-            texture_cache_misses = stats.texture_cache_misses,
-            batch_pool_creates = stats.batch_pool_creates,
-            "TIME_DRAW: deferred draw (no fence wait, no readback — the flush pays those once)"
-        );
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TIMED_DRAWS: AtomicU64 = AtomicU64::new(0);
+        let draw = TIMED_DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
+        // Per-draw warnings materially perturb a title that records dozens of
+        // draws per frame. Sample sparsely so this diagnostic can identify the
+        // build-vs-record wall without becoming that wall itself.
+        if draw.is_multiple_of(512) {
+            let stats = caches.stats;
+            tracing::warn!(
+                draw,
+                build_us = t_build.as_micros(),
+                submit_us = t_submit.as_micros(),
+                deferred_draws = stats.deferred_draws,
+                sampled_target_binds = stats.sampled_target_binds,
+                texture_cache_hits = stats.texture_cache_hits,
+                texture_cache_misses = stats.texture_cache_misses,
+                batch_pool_creates = stats.batch_pool_creates,
+                "TIME_DRAW: deferred draw (no fence wait, no readback — the flush pays those once)"
+            );
+        }
     }
     Ok(None)
 }
@@ -1207,13 +1318,15 @@ pub fn flush_deferred_draws_filtered(
     dev: &VulkanDevice,
     only_bases: Option<&[u64]>,
 ) -> Result<Vec<(u64, RenderedImage)>, GpuError> {
-    let timing = std::env::var_os("RAEEN_TIME_DRAW").is_some();
+    let timing =
+        crate::diagnostics::gpu_env().time_draw || crate::diagnostics::gpu_env().time_compute;
     let t0 = std::time::Instant::now();
     let mut caches = dev.draw_caches();
+    caches.finish_batch_recording(dev)?;
     if !caches.batch_open() {
         return Ok(Vec::new());
     }
-    let (pending, touched, evicted, evicted_depth) = caches.take_batch();
+    let (pending, already_submitted, touched, evicted, evicted_depth) = caches.take_batch();
     let (read_now, keep): (Vec<TargetKey>, Vec<TargetKey>) = match only_bases {
         Some(bases) => touched.into_iter().partition(|k| bases.contains(&k.base)),
         None => (touched, Vec::new()),
@@ -1225,19 +1338,65 @@ pub fn flush_deferred_draws_filtered(
         return Ok(Vec::new());
     }
     let pending_draws = pending.len();
-    match record_and_read_flush(dev, &mut caches, &read_now) {
-        Ok(images) => {
+    let gpu_at = std::time::Instant::now();
+    match record_and_read_flush(dev, &mut caches, &pending, already_submitted, &read_now) {
+        Ok(mut images) => {
+            let gpu_flush = gpu_at.elapsed();
+            let publish_at = std::time::Instant::now();
+            let (compute_dirty_bytes, compute_dirty_spans) =
+                match caches.flush_compute_buffers_to_guest(dev) {
+                    Ok(stats) => stats,
+                    Err(error) => {
+                        for key in read_now.iter().chain(keep.iter()) {
+                            caches.mark_target_unknown(key);
+                        }
+                        caches.retire_batch(dev, pending, evicted, evicted_depth);
+                        return Err(error);
+                    }
+                };
+            let (compute_image_bytes, compute_images) =
+                match caches.flush_compute_images_to_guest(dev) {
+                    Ok(outputs) => outputs,
+                    Err(error) => {
+                        for key in read_now.iter().chain(keep.iter()) {
+                            caches.mark_target_unknown(key);
+                        }
+                        caches.retire_batch(dev, pending, evicted, evicted_depth);
+                        return Err(error);
+                    }
+                };
+            let compute_image_outputs = compute_images.len();
+            images.extend(compute_images);
+            let compute_publish = publish_at.elapsed();
+            caches.prune_compute_buffers(dev);
+            caches.prune_compute_images(dev);
+            let retire_at = std::time::Instant::now();
             caches.retire_batch(dev, pending, evicted, evicted_depth);
+            let retire = retire_at.elapsed();
             let kept_gpu_side = keep.len();
             caches.requeue_touched(keep);
             caches.stats.batch_flushes += 1;
             caches.stats.target_readbacks += images.len() as u64;
             if timing {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static FLUSHES: AtomicU64 = AtomicU64::new(0);
+                let flush = FLUSHES.fetch_add(1, Ordering::Relaxed) + 1;
+                if !flush.is_multiple_of(64) {
+                    return Ok(images);
+                }
                 tracing::warn!(
+                    flush,
                     flush_us = t0.elapsed().as_micros(),
+                    gpu_flush_us = gpu_flush.as_micros(),
+                    compute_publish_us = compute_publish.as_micros(),
+                    retire_us = retire.as_micros(),
                     pending_draws,
                     targets_read = images.len(),
                     targets_kept_gpu_side = kept_gpu_side,
+                    compute_dirty_bytes,
+                    compute_dirty_spans,
+                    compute_image_bytes,
+                    compute_image_outputs,
                     "TIME_DRAW: deferred-batch flush (one fence + one readback per selected target)"
                 );
             }
@@ -1254,6 +1413,7 @@ pub fn flush_deferred_draws_filtered(
             for key in read_now.iter().chain(keep.iter()) {
                 caches.mark_target_unknown(key);
             }
+            caches.discard_pending_compute_writes();
             caches.retire_batch(dev, pending, evicted, evicted_depth);
             Err(e)
         }
@@ -1268,6 +1428,8 @@ pub fn flush_deferred_draws_filtered(
 fn record_and_read_flush(
     dev: &VulkanDevice,
     caches: &mut DrawCaches,
+    pending: &[PendingDrawResources],
+    already_submitted: usize,
     touched: &[TargetKey],
 ) -> Result<Vec<(u64, RenderedImage)>, GpuError> {
     let device = dev.device();
@@ -1317,10 +1479,24 @@ fn record_and_read_flush(
     let host_barrier = vk::MemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
         .dst_access_mask(vk::AccessFlags::HOST_READ);
+    // Preserve exact PM4 order by putting every recorded deferred
+    // draw/dispatch command buffer before the flush command buffer in ONE
+    // VkSubmitInfo. This removes the per-packet vkQueueSubmit driver cost while
+    // keeping the existing resource lifetime and one-fence contract.
+    let mut command_buffers = Vec::with_capacity(pending.len().saturating_add(1));
+    debug_assert!(already_submitted <= pending.len());
+    command_buffers.extend(
+        pending
+            .iter()
+            .skip(already_submitted)
+            .map(|resources| resources.command_buffer)
+            .filter(|buffer| *buffer != vk::CommandBuffer::null()),
+    );
+    command_buffers.push(command_buffer);
+
     // SAFETY: recording; then end/submit/wait with live handles from this
-    // device. The fence wait covers the whole batch: a fence signal
-    // happens-after all queue operations submitted earlier in submission
-    // order, which includes every deferred draw's command buffer.
+    // device. Every pending resource remains owned by the batch until this
+    // fence signals, and the command buffers are ordered as they were recorded.
     unsafe {
         device.cmd_pipeline_barrier(
             command_buffer,
@@ -1334,7 +1510,6 @@ fn record_and_read_flush(
         device
             .end_command_buffer(command_buffer)
             .map_err(|e| GpuError::VulkanInitFailed(format!("flush vkEndCommandBuffer: {e}")))?;
-        let command_buffers = [command_buffer];
         let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
         device
             .queue_submit(dev.queue(), &[submit], fence)
@@ -1567,6 +1742,156 @@ struct Resources<'a> {
     fence: vk::Fence,
 }
 
+// RAEEN_TIME_WORKER: per-draw `build()` stage timers (nanoseconds, process-
+// global), summarized every 512 draws. Splits the setup cost into
+// image/seed/depth/vbuf/stage-resources/pipeline/command so the dominant call
+// is named from evidence rather than guessed.
+static DRAW_STAGE_TARGET_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DRAW_STAGE_SEED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DRAW_STAGE_DEPTH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DRAW_STAGE_VBUF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DRAW_STAGE_STAGE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DRAW_STAGE_PIPELINE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DRAW_STAGE_CMD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DRAW_STAGE_DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Upstream worker_submit costs, OUTSIDE the offscreen `build()`: whole-draw
+// translate (PM4 → DrawState, incl. vertex fetch), guest texture decode
+// (detile), and compute dispatch. `build` is only ~5% of the worker, so these
+// name where the rest goes. `drawcommon` is the per-draw total (translate +
+// render); `decode` and the build stages are subsets of it.
+pub(crate) static DRAW_STAGE_DRAWCOMMON_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_DECODE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_RESOLVE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_SETUP_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_CENSUS_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_BIND_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_BACKEND_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_DISPATCH_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_DISPATCH_N: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_CS_TRANSLATE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_CS_PREPARE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_CS_BACKEND_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn draw_stage_timing_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::diagnostics::gpu_env().time_worker)
+}
+
+/// Scope timer: adds elapsed ns to `counter` on drop when `RAEEN_TIME_WORKER`
+/// is set. Captures every early-return path of the instrumented function.
+pub(crate) struct StageTimer(
+    Option<std::time::Instant>,
+    &'static std::sync::atomic::AtomicU64,
+);
+impl StageTimer {
+    pub(crate) fn start(counter: &'static std::sync::atomic::AtomicU64) -> Self {
+        Self(
+            draw_stage_timing_enabled().then(std::time::Instant::now),
+            counter,
+        )
+    }
+}
+impl Drop for StageTimer {
+    fn drop(&mut self) {
+        if let Some(start) = self.0 {
+            self.1.fetch_add(
+                start.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+fn draw_stage_add(counter: &std::sync::atomic::AtomicU64, start: Option<std::time::Instant>) {
+    if let Some(start) = start {
+        counter.fetch_add(
+            start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+fn draw_stage_tick() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = DRAW_STAGE_DRAWS.fetch_add(1, Relaxed) + 1;
+    if !n.is_multiple_of(512) {
+        return;
+    }
+    let target = DRAW_STAGE_TARGET_NS.swap(0, Relaxed);
+    let seed = DRAW_STAGE_SEED_NS.swap(0, Relaxed);
+    let depth = DRAW_STAGE_DEPTH_NS.swap(0, Relaxed);
+    let vbuf = DRAW_STAGE_VBUF_NS.swap(0, Relaxed);
+    let stage = DRAW_STAGE_STAGE_NS.swap(0, Relaxed);
+    let pipeline = DRAW_STAGE_PIPELINE_NS.swap(0, Relaxed);
+    let cmd = DRAW_STAGE_CMD_NS.swap(0, Relaxed);
+    let build = target + seed + depth + vbuf + stage + pipeline + cmd;
+    let drawcommon = DRAW_STAGE_DRAWCOMMON_NS.swap(0, Relaxed);
+    let decode = DRAW_STAGE_DECODE_NS.swap(0, Relaxed);
+    let resolve = DRAW_STAGE_RESOLVE_NS.swap(0, Relaxed);
+    let setup = DRAW_STAGE_SETUP_NS.swap(0, Relaxed);
+    let census = DRAW_STAGE_CENSUS_NS.swap(0, Relaxed);
+    let bind = DRAW_STAGE_BIND_NS.swap(0, Relaxed);
+    let backend = DRAW_STAGE_BACKEND_NS.swap(0, Relaxed);
+    let dispatch = DRAW_STAGE_DISPATCH_NS.swap(0, Relaxed);
+    let dispatches = DRAW_STAGE_DISPATCH_N.swap(0, Relaxed);
+    let cs_translate = DRAW_STAGE_CS_TRANSLATE_NS.swap(0, Relaxed);
+    let cs_prepare = DRAW_STAGE_CS_PREPARE_NS.swap(0, Relaxed);
+    let cs_backend = DRAW_STAGE_CS_BACKEND_NS.swap(0, Relaxed);
+    let bpct = |x: u64| x.saturating_mul(100).checked_div(build).unwrap_or(0);
+    let dpct = |x: u64| x.saturating_mul(100).checked_div(drawcommon).unwrap_or(0);
+    let per_draw_us = |x: u64| x / 1000 / 512;
+    let per_disp_us = |x: u64| (x / 1000).checked_div(dispatches).unwrap_or(0);
+    tracing::warn!(
+        draws = 512,
+        drawcommon_us = per_draw_us(drawcommon),
+        decode_us = per_draw_us(decode),
+        decode_of_draw_pct = dpct(decode),
+        build_us = per_draw_us(build),
+        build_of_draw_pct = dpct(build),
+        dispatches = dispatches,
+        dispatch_us = per_disp_us(dispatch),
+        dispatch_total_ms = dispatch / 1_000_000,
+        drawcommon_total_ms = drawcommon / 1_000_000,
+        "DRAW COST: per-draw draw_common vs its texture-decode + build subsets, and compute dispatch (per 512 draws; RAEEN_TIME_WORKER)"
+    );
+    tracing::warn!(
+        resolve_us = per_draw_us(resolve),
+        setup_us = per_draw_us(setup),
+        census_us = per_draw_us(census),
+        bind_us = per_draw_us(bind),
+        backend_us = per_draw_us(backend),
+        "DRAW COMMON STAGES: shader resolve, state/vertex setup, cache census, resource binding, and Vulkan backend (per draw)"
+    );
+    tracing::warn!(
+        dispatches,
+        translate_us = per_disp_us(cs_translate),
+        prepare_us = per_disp_us(cs_prepare),
+        backend_us = per_disp_us(cs_backend),
+        "COMPUTE STAGES: shader analysis/cache, guest-resource preparation, and Vulkan backend (per dispatch)"
+    );
+    tracing::warn!(
+        pipeline_pct = bpct(pipeline),
+        pipeline_us = per_draw_us(pipeline),
+        stage_pct = bpct(stage),
+        vbuf_pct = bpct(vbuf),
+        target_pct = bpct(target),
+        depth_pct = bpct(depth),
+        "DRAW STAGES: build() internal split (% of build)"
+    );
+}
+
 impl<'a> Resources<'a> {
     fn new(dev: &'a VulkanDevice, caches: &'a mut DrawCaches) -> Self {
         Self {
@@ -1630,6 +1955,7 @@ impl<'a> Resources<'a> {
     }
 
     fn build(&mut self, state: &DrawState) -> Result<(), GpuError> {
+        let t = draw_stage_timing_enabled();
         if state.color_output {
             let bpp = readback_bpp(state.format)? as usize;
             if let Some(initial) = state.initial {
@@ -1643,30 +1969,49 @@ impl<'a> Resources<'a> {
                     )));
                 }
             }
+            let s = t.then(std::time::Instant::now);
             self.create_render_target(state, bpp as u32)?;
+            draw_stage_add(&DRAW_STAGE_TARGET_NS, s);
             if let Some(initial) = state.initial
                 && !self.load_from_gpu
             {
+                let s = t.then(std::time::Instant::now);
                 let (buffer, memory) = self.create_buffer_with_bytes(initial)?;
                 self.upload_buffer = buffer;
                 self.upload_memory = memory;
+                draw_stage_add(&DRAW_STAGE_SEED_NS, s);
             }
         }
         if let Some(depth) = &state.depth {
+            let s = t.then(std::time::Instant::now);
             self.create_depth_resources(state.width, state.height, depth)?;
+            draw_stage_add(&DRAW_STAGE_DEPTH_NS, s);
         }
-        if let Some(vertices) = state.vertices {
-            self.create_vertex_buffer(vertices)?;
+        {
+            let s = t.then(std::time::Instant::now);
+            if let Some(vertices) = state.vertices {
+                self.create_vertex_buffer(vertices)?;
+            }
+            if let Some(index) = &state.index {
+                let (buffer, memory) = self.create_buffer_with_bytes(index.bytes)?;
+                self.index_buffer = buffer;
+                self.index_memory = memory;
+            }
+            self.create_guest_vertex_buffers(state)?;
+            draw_stage_add(&DRAW_STAGE_VBUF_NS, s);
         }
-        if let Some(index) = &state.index {
-            let (buffer, memory) = self.create_buffer_with_bytes(index.bytes)?;
-            self.index_buffer = buffer;
-            self.index_memory = memory;
-        }
-        self.create_guest_vertex_buffers(state)?;
+        let s = t.then(std::time::Instant::now);
         self.create_stage_resources(state)?;
+        draw_stage_add(&DRAW_STAGE_STAGE_NS, s);
+        let s = t.then(std::time::Instant::now);
         self.create_pipeline(state)?;
+        draw_stage_add(&DRAW_STAGE_PIPELINE_NS, s);
+        let s = t.then(std::time::Instant::now);
         self.create_command_resources()?;
+        draw_stage_add(&DRAW_STAGE_CMD_NS, s);
+        if t {
+            draw_stage_tick();
+        }
         Ok(())
     }
 
@@ -2299,7 +2644,7 @@ impl<'a> Resources<'a> {
                 // (texel-fetch needs no sampler). Each descriptor array is
                 // created only when non-empty, mirroring exactly what the
                 // SPIR-V declared.
-                if textures.textures.is_empty() && textures.linear_filter.is_empty() {
+                if textures.textures.is_empty() && textures.samplers.is_empty() {
                     return Err(GpuError::PipelineCreationFailed(
                         "sampled-image and sampler descriptor arrays are both empty".to_owned(),
                     ));
@@ -2328,12 +2673,12 @@ impl<'a> Resources<'a> {
                         }
                     }
                 }
-                if !textures.linear_filter.is_empty() {
+                if !textures.samplers.is_empty() {
                     bindings.push(
                         vk::DescriptorSetLayoutBinding::default()
                             .binding(textures.sampler_binding)
                             .descriptor_type(vk::DescriptorType::SAMPLER)
-                            .descriptor_count(textures.linear_filter.len() as u32)
+                            .descriptor_count(textures.samplers.len() as u32)
                             .stage_flags(stage.stage),
                     );
                 }
@@ -2380,7 +2725,7 @@ impl<'a> Resources<'a> {
                     stage
                         .textures
                         .as_ref()
-                        .map_or(0, |textures| textures.linear_filter.len() as u32)
+                        .map_or(0, |textures| textures.samplers.len() as u32)
                 }),
             ),
         ]
@@ -2557,10 +2902,11 @@ impl<'a> Resources<'a> {
                         })
                         .collect();
                 }
-                for &linear in &textures.linear_filter {
-                    self.samplers.push(self.caches.sampler(self.dev, linear)?);
+                for &sampler_state in &textures.samplers {
+                    self.samplers
+                        .push(self.caches.sampler(self.dev, sampler_state)?);
                 }
-                let first_sampler = self.samplers.len() - textures.linear_filter.len();
+                let first_sampler = self.samplers.len() - textures.samplers.len();
                 sampler_infos = self.samplers[first_sampler..]
                     .iter()
                     .map(|&sampler| vk::DescriptorImageInfo::default().sampler(sampler))
@@ -2598,7 +2944,7 @@ impl<'a> Resources<'a> {
                         }
                     }
                 }
-                if !textures.linear_filter.is_empty() {
+                if !textures.samplers.is_empty() {
                     writes.push(
                         vk::WriteDescriptorSet::default()
                             .dst_set(set)
@@ -2644,17 +2990,17 @@ impl<'a> Resources<'a> {
         let cache_key = (img_layers == upload.layers
             && upload.guest_base != 0
             && upload.sample_hash != 0
-            && std::env::var_os("RAEEN_NO_TEX_CACHE").is_none())
-        .then_some(TextureKey {
-            base: upload.guest_base,
-            width: upload.width,
-            height: upload.height,
-            layers: img_layers,
-            depth: upload.depth.max(1),
-            cube: upload.cube,
-            array: upload.array,
-            format: upload.format.as_raw(),
-        });
+            && !crate::diagnostics::gpu_env().no_tex_cache)
+            .then_some(TextureKey {
+                base: upload.guest_base,
+                width: upload.width,
+                height: upload.height,
+                layers: img_layers,
+                depth: upload.depth.max(1),
+                cube: upload.cube,
+                array: upload.array,
+                format: upload.format.as_raw(),
+            });
         if cache_key.is_some() {
             self.caches.stats.texture_cache_misses += 1;
         }
@@ -2791,12 +3137,21 @@ impl<'a> Resources<'a> {
     }
 
     fn create_pipeline(&mut self, state: &DrawState) -> Result<(), GpuError> {
-        validate_graphics_interface(state)?;
         // Cached by SPIR-V content: the translate cache upstream already
         // dedups shaders, so repeated binds of one shader resolve to one
         // canonical VkShaderModule instead of a fresh module per draw.
         self.vertex_module = self.caches.shader_module(self.dev, state.vs_spirv)?;
         self.fragment_module = self.caches.shader_module(self.dev, state.fs_spirv)?;
+        // Parsing both modules to compare stage interfaces allocates several
+        // maps/sets.  Canonical module handles let the device cache prove that
+        // an identical pair/topology was already accepted, removing that
+        // repeated CPU work from every graphics-pipeline cache hit.
+        self.caches.validate_graphics_interface_once(
+            self.vertex_module,
+            self.fragment_module,
+            state.topology,
+            || validate_graphics_interface(state),
+        )?;
 
         // Same guard as the compute path: over-cap push constants are invalid
         // usage (UB without validation). Refuse the draw by name until the
@@ -3055,6 +3410,7 @@ impl<'a> Resources<'a> {
             GpuError::PipelineCreationFailed("driver returned no pipeline".to_owned())
         })?;
         self.caches.store_graphics_pipeline(key, pipeline);
+        self.dev.note_pipeline_compiled();
         self.pipeline = pipeline;
         Ok(())
     }
@@ -3122,18 +3478,28 @@ impl<'a> Resources<'a> {
 
     fn record_and_submit(&mut self, state: &DrawState) -> Result<(), GpuError> {
         let (width, height) = (state.width, state.height);
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // Resolve the only fallible recording-time calculation before a
+        // deferred draw appends anything to the shared batch command buffer.
+        let stencil_plane_offset = state
+            .depth
+            .as_ref()
+            .filter(|depth| has_stencil_plane(depth.format))
+            .map(|depth| depth_plane_bytes(width, height, depth.format))
+            .transpose()?;
+        if !self.batched {
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
-        // SAFETY: the command buffer is not pending — the previous submission
-        // through it fence-completed under the cache lock — and the pool was
-        // created RESET_COMMAND_BUFFER, so begin implicitly resets it. It is
-        // recorded only under the cache lock (one recorder at a time).
-        unsafe {
-            self.device()
-                .begin_command_buffer(self.command_buffer, &begin_info)
+            // SAFETY: the command buffer is not pending — the previous submission
+            // through it fence-completed under the cache lock — and the pool was
+            // created RESET_COMMAND_BUFFER, so begin implicitly resets it. It is
+            // recorded only under the cache lock (one recorder at a time).
+            unsafe {
+                self.device()
+                    .begin_command_buffer(self.command_buffer, &begin_info)
+            }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("vkBeginCommandBuffer: {e}")))?;
         }
-        .map_err(|e| GpuError::VulkanInitFailed(format!("vkBeginCommandBuffer: {e}")))?;
 
         // Upload guest textures into their device-local images before any
         // rendering samples them: UNDEFINED -> TRANSFER_DST, staging copy,
@@ -3362,7 +3728,7 @@ impl<'a> Resources<'a> {
                     ));
                 }
                 if stencil_load {
-                    let offset = depth_plane_bytes(width, height, depth.format)?;
+                    let offset = stencil_plane_offset.expect("stencil format has an offset");
                     regions.push(depth_copy_region(
                         width,
                         height,
@@ -3443,7 +3809,7 @@ impl<'a> Resources<'a> {
             // that the clear and readback path work and that no draw changed
             // the colour attachment. It does NOT isolate the vertex shader:
             // culling, depth, or stencil can reject otherwise-valid geometry.
-            .load_op(if std::env::var_os("RAEEN_FORCE_CLEAR").is_some() {
+            .load_op(if crate::diagnostics::gpu_env().force_clear {
                 vk::AttachmentLoadOp::CLEAR
             } else if self.load_from_gpu || state.initial.is_some() {
                 // `load_from_gpu` alone must force a LOAD: with deferred
@@ -3692,7 +4058,7 @@ impl<'a> Resources<'a> {
                     0,
                 )];
                 if has_stencil_plane(depth.format) {
-                    let offset = depth_plane_bytes(width, height, depth.format)?;
+                    let offset = stencil_plane_offset.expect("stencil format has an offset");
                     regions.push(depth_copy_region(
                         width,
                         height,
@@ -3735,31 +4101,29 @@ impl<'a> Resources<'a> {
                 );
             }
         }
-        // SAFETY: the command buffer is in the recording state.
+        if self.batched {
+            // Deferred: the executable command buffer is retained but not
+            // submitted yet. The flush submits every pending draw/dispatch in
+            // PM4 order with one queue call and one fence.
+            return Ok(());
+        }
+
+        // SAFETY: the immediate command buffer is in the recording state.
         unsafe {
             self.device()
                 .end_command_buffer(self.command_buffer)
                 .map_err(|e| GpuError::VulkanInitFailed(format!("vkEndCommandBuffer: {e}")))?;
         }
-
         let command_buffers = [self.command_buffer];
         let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
 
         // SAFETY: the command buffer is recorded and not already pending; the
-        // fence (null in batched mode) is unsignaled and unused; the queue
-        // came from this device.
+        // fence is unsignaled and belongs to this device.
         unsafe {
             self.device()
                 .queue_submit(self.dev.queue(), &[submit], self.fence)
         }
         .map_err(|e| GpuError::VulkanInitFailed(format!("vkQueueSubmit failed: {e}")))?;
-
-        if self.batched {
-            // Deferred: no fence, no wait. The flush submits one fence after
-            // the whole batch; queue submission order guarantees this draw's
-            // completion when that fence signals.
-            return Ok(());
-        }
 
         // Wait for the GPU. u64::MAX = no timeout; a hang here means a driver
         // fault, which surfaces as a hung test rather than silent bad pixels.
@@ -3773,13 +4137,17 @@ impl<'a> Resources<'a> {
     /// successful deferred submission, and record the target as
     /// [`TargetContent::GpuNewer`]. After this, `Drop` finds only null
     /// handles and destroys nothing.
-    fn commit_to_batch(&mut self) {
+    fn commit_to_batch(&mut self) -> Result<(), GpuError> {
         debug_assert!(self.batched, "only batched draws defer their resources");
         let key = self
             .target_key
             .expect("deferred draws always name a persistent target");
+        // The cache owns the one shared recording handle. This draw contributes
+        // only resources; `finish_batch_recording` attaches that handle to the
+        // first pending entry at the flip boundary.
+        self.command_buffer = vk::CommandBuffer::null();
         let mut res = PendingDrawResources {
-            command_buffer: mem::replace(&mut self.command_buffer, vk::CommandBuffer::null()),
+            command_buffer: vk::CommandBuffer::null(),
             // The draw's sets live in a shared batch pool (stage D item 2),
             // reset by the cache at the batch retire — nothing to transfer.
             descriptor_pool: vk::DescriptorPool::null(),
@@ -3851,6 +4219,7 @@ impl<'a> Resources<'a> {
         for (cache_key, entry) in donations {
             self.caches.insert_texture(self.dev, cache_key, entry);
         }
+        Ok(())
     }
 
     /// Immediate-path counterpart of the donation in [`Self::commit_to_batch`]:
@@ -4127,14 +4496,11 @@ impl Drop for Resources<'_> {
         // with every per-draw handle already moved into the pending batch
         // (`commit_to_batch`), so nothing is destroyed early.
         //
-        // A batched draw that FAILED never submitted its command buffer
-        // (every batched-mode error site is before `vkQueueSubmit`, and a
-        // failed submit leaves nothing pending), so its owned handles can be
-        // destroyed immediately and its command buffer recycled.
+        // A batched draw borrows the cache-owned shared recording handle. Clear
+        // this local alias on an error path; the cache closes/recycles the
+        // handle at the batch boundary.
         if self.batched && self.command_buffer != vk::CommandBuffer::null() {
-            let cb = self.command_buffer;
             self.command_buffer = vk::CommandBuffer::null();
-            self.caches.recycle_command_buffer(cb);
         }
         // Guest-data buffers came from the upload ring: return them (no
         // submitted GPU work references them — see the safety argument below;

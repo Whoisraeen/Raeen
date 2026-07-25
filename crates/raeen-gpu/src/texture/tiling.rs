@@ -690,18 +690,37 @@ fn detile_64kb_with(
     let x_term_by_column: Vec<u64> = (0..width)
         .map(|xx| pattern_axis_term(xx, pattern, true))
         .collect();
-    for yy in 0..height {
+
+    // One output row per iteration, and rows never share destination bytes, so
+    // the loop parallelizes exactly. Above the threshold the row work dominates
+    // the split cost; below it, rayon's overhead would exceed the copy. Ported
+    // from SharpEmu's `Parallel.For` over the same loop
+    // (`reference/sharpemu/src/SharpEmu.Libs/Agc/GnmTiling.cs:533-539`), which
+    // gates on the same order of element count.
+    const PARALLEL_MIN_ELEMENTS: u64 = 512 * 512;
+    let row_bytes = width as usize * bpp;
+    let detile_row = |yy: u32, row: &mut [u8]| {
         let block_y = u64::from(yy / bh);
-        let dest_row = yy as usize * width as usize * bpp;
         // The Y term is constant across the row; hoist it out of the inner loop.
         let y_term = pattern_axis_term(yy, pattern, false);
         for xx in 0..width {
             let block_index = block_y * blocks_per_row + u64::from(xx / bw);
             let src = block_index * block_bytes + (x_term_by_column[xx as usize] ^ y_term);
-            let dst = dest_row + xx as usize * bpp;
+            let dst = xx as usize * bpp;
             if src as usize + bpp <= tiled.len() {
-                out[dst..dst + bpp].copy_from_slice(&tiled[src as usize..src as usize + bpp]);
+                row[dst..dst + bpp].copy_from_slice(&tiled[src as usize..src as usize + bpp]);
             }
+        }
+    };
+
+    if u64::from(width) * u64::from(height) >= PARALLEL_MIN_ELEMENTS {
+        use rayon::prelude::*;
+        out.par_chunks_mut(row_bytes)
+            .enumerate()
+            .for_each(|(yy, row)| detile_row(yy as u32, row));
+    } else {
+        for (yy, row) in out.chunks_mut(row_bytes).enumerate() {
+            detile_row(yy as u32, row);
         }
     }
     out
@@ -719,6 +738,9 @@ pub fn detile_64kb(
     bpp_log2: u32,
 ) -> Option<Vec<u8>> {
     let (table, block_bytes) = swizzle_table(mode)?;
+    if !bpp_log2_is_supported(bpp_log2) {
+        return None;
+    }
     Some(detile_64kb_with(
         tiled,
         width,
@@ -729,12 +751,34 @@ pub fn detile_64kb(
     ))
 }
 
+/// Whether a bytes-per-element log2 has a row in the swizzle tables.
+///
+/// Callers derive this with `bytes.trailing_zeros()`, which is only a log2 for
+/// a power of two and is silently wrong otherwise: a 3-byte (24-bit) element
+/// yields 0 and would be detiled as 1 byte per texel, and a 32-byte element
+/// yields 5 — one past the last table row, which would panic on the index.
+/// The tables carry exactly the five RDNA2 element sizes (1/2/4/8/16 bytes), so
+/// anything else is refused by name here and the caller reports an unsupported
+/// texture instead of corrupting or crashing.
+///
+/// SharpEmu guards the same way with `BitLog2` returning -1 for a non-power-of-
+/// two (`reference/sharpemu/src/SharpEmu.Libs/Agc/GnmTiling.cs`).
+pub const fn bpp_log2_is_supported(bpp_log2: u32) -> bool {
+    (bpp_log2 as usize) < SWIZZLE_TABLE_ROWS
+}
+
+/// Rows in every swizzle table: element sizes 1, 2, 4, 8, 16 bytes.
+pub const SWIZZLE_TABLE_ROWS: usize = 5;
+
 /// Bytes a supported GFX10 tiled surface occupies for `mode` — whole swizzle
 /// blocks in each direction (a surface smaller than a block still owns the whole
 /// block). `None` for an unsupported mode. Block size (4 KiB vs 64 KiB) comes
 /// from [`swizzle_table`].
 pub fn tiled_byte_count_for_mode(mode: u8, width: u32, height: u32, bpp_log2: u32) -> Option<u64> {
     let (_, block_bytes) = swizzle_table(mode)?;
+    if !bpp_log2_is_supported(bpp_log2) {
+        return None;
+    }
     let (bw, bh) = block_dimensions(block_bytes as u32, bpp_log2);
     Some(u64::from(width.div_ceil(bw)) * u64::from(height.div_ceil(bh)) * block_bytes)
 }
@@ -881,6 +925,66 @@ mod tests {
     fn linear_mode_is_passthrough() {
         let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
         assert_eq!(detile(&data, 2, 1, 4, TilingMode::Linear), data);
+    }
+
+    /// Callers derive `bpp_log2` with `trailing_zeros()`, which is a log2 only
+    /// for a power of two. A 3-byte element yields 0 (would silently detile as
+    /// 1 byte per texel) and a 32-byte element yields 5 — one past the last
+    /// table row, which would have panicked on the index. Both must be refused.
+    #[test]
+    fn unsupported_element_sizes_are_refused_not_guessed() {
+        assert_eq!(SWIZZLE_TABLE_ROWS, 5, "1, 2, 4, 8, 16 bytes per element");
+        for supported in 0..SWIZZLE_TABLE_ROWS as u32 {
+            assert!(bpp_log2_is_supported(supported));
+            assert!(tiled_byte_count_for_mode(27, 64, 64, supported).is_some());
+        }
+        for bad in [SWIZZLE_TABLE_ROWS as u32, 6, 31] {
+            assert!(!bpp_log2_is_supported(bad));
+            assert!(
+                tiled_byte_count_for_mode(27, 64, 64, bad).is_none(),
+                "element size log2 {bad} has no table row"
+            );
+            assert!(
+                detile_64kb(27, &[0u8; 4096], 64, 64, bad).is_none(),
+                "detile must refuse element size log2 {bad} rather than panic"
+            );
+        }
+        // An unsupported MODE still refuses regardless of element size.
+        assert!(tiled_byte_count_for_mode(4, 64, 64, 2).is_none());
+    }
+
+    /// The row-parallel detile must produce byte-identical output to the serial
+    /// path. Exercised at a size ABOVE the parallel threshold (512*512
+    /// elements) so the rayon branch is the one under test, and compared
+    /// against a tile/detile round trip.
+    #[test]
+    fn parallel_detile_matches_the_serial_result() {
+        // 1024x512 @ 4 B/el = 524_288 elements, over the threshold.
+        let (width, height, bpp_log2) = (1024u32, 512u32, 2u32);
+        let bpp = 1usize << bpp_log2;
+        let linear: Vec<u8> = (0..width as usize * height as usize * bpp)
+            .map(|i| (i * 2654435761usize >> 7) as u8)
+            .collect();
+
+        let tiled = tile_64kb_r_x(&linear, width, height, bpp_log2);
+        let round_tripped =
+            detile_64kb(27, &tiled, width, height, bpp_log2).expect("mode 27 is supported");
+        assert_eq!(
+            round_tripped, linear,
+            "parallel detile must invert the tiler exactly"
+        );
+
+        // And the same surface below the threshold takes the serial branch.
+        let (sw, sh) = (64u32, 64u32);
+        let small: Vec<u8> = (0..sw as usize * sh as usize * bpp)
+            .map(|i| i as u8)
+            .collect();
+        let small_tiled = tile_64kb_r_x(&small, sw, sh, bpp_log2);
+        assert_eq!(
+            detile_64kb(27, &small_tiled, sw, sh, bpp_log2).expect("mode 27"),
+            small,
+            "serial branch must agree with the parallel one"
+        );
     }
 
     /// Known-answer pins for the PS5/Oberon `SW_64KB_R_X` equation at 4 B/el

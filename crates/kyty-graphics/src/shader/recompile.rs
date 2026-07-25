@@ -1031,7 +1031,7 @@ fn recompile_exp_pos0(
     index: u32,
     code: &ShaderCode,
     dst_source: &mut String,
-    _spirv: &Spirv<'_>,
+    spirv: &Spirv<'_>,
     _param: &Params,
     _scc_check: SccCheck,
 ) -> Result<bool, ShaderRecompileError> {
@@ -1089,19 +1089,23 @@ fn recompile_exp_pos0(
     // reports ZERO validation messages, yet no primitive covers a pixel — so
     // the suspect is the VALUES the translated VS computes. Pixels under this
     // flag => the generated VS body is at fault; still black => the fault is
-    // below the shader. Assumes a vec3 attr0 (the measured stride-12 quad);
-    // other shapes will fail to assemble, which is fine for a gated probe.
+    // below the shader. Match attr0's declared scalar/vector type so this
+    // diagnostic remains valid when a title switches vertex layouts.
     if std::env::var_os("RAEEN_VS_PASSTHROUGH").is_some() {
-        const PASS: &str = r#"
-         %p0_<index> = OpLoad %v3float %attr0
-         %px_<index> = OpCompositeExtract %float %p0_<index> 0
-         %py_<index> = OpCompositeExtract %float %p0_<index> 1
-         %pz_<index> = OpCompositeExtract %float %p0_<index> 2
-         %pv_<index> = OpCompositeConstruct %v4float %px_<index> %py_<index> %pz_<index> %float_1_000000
-         %pa_<index> = OpAccessChain %_ptr_Output_v4float %outPerVertex %int_per_vertex_0
-               OpStore %pa_<index> %pv_<index>
-"#;
-        *dst_source += &PASS.replace("<index>", &format!("{index}"));
+        let info = spirv
+            .get_vs_input_info()
+            .ok_or_else(|| not_supported(FUNC, "VS passthrough has no vertex input info"))?;
+        if info.resources_num <= 0 {
+            return Err(not_supported(
+                FUNC,
+                "VS passthrough has no input attribute 0",
+            ));
+        }
+        *dst_source += &vs_passthrough_source(
+            index,
+            info.resources_dst[0].registers_num,
+            info.resources[0].format() == 11,
+        )?;
         return Ok(true);
     }
 
@@ -1123,6 +1127,49 @@ fn recompile_exp_pos0(
         .replace("<src3>", &src3_value.value);
 
     Ok(true)
+}
+
+fn vs_passthrough_source(
+    index: u32,
+    registers_num: i32,
+    raw_uint: bool,
+) -> Result<String, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_Exp_Pos0Vsrc0Vsrc1Vsrc2Vsrc3Done";
+    let load = match (registers_num, raw_uint) {
+        (1, false) => format!(
+            "         %px_{index} = OpLoad %float %attr0\n\
+             %pv_{index} = OpCompositeConstruct %v4float %px_{index} %float_0_000000 %float_0_000000 %float_1_000000\n"
+        ),
+        (1, true) => format!(
+            "         %pu_{index} = OpLoad %uint %attr0\n\
+             %px_{index} = OpBitcast %float %pu_{index}\n\
+             %pv_{index} = OpCompositeConstruct %v4float %px_{index} %float_0_000000 %float_0_000000 %float_1_000000\n"
+        ),
+        (2, false) => format!(
+            "         %p0_{index} = OpLoad %v2float %attr0\n\
+             %px_{index} = OpCompositeExtract %float %p0_{index} 0\n\
+             %py_{index} = OpCompositeExtract %float %p0_{index} 1\n\
+             %pv_{index} = OpCompositeConstruct %v4float %px_{index} %py_{index} %float_0_000000 %float_1_000000\n"
+        ),
+        (3, false) => format!(
+            "         %p0_{index} = OpLoad %v3float %attr0\n\
+             %px_{index} = OpCompositeExtract %float %p0_{index} 0\n\
+             %py_{index} = OpCompositeExtract %float %p0_{index} 1\n\
+             %pz_{index} = OpCompositeExtract %float %p0_{index} 2\n\
+             %pv_{index} = OpCompositeConstruct %v4float %px_{index} %py_{index} %pz_{index} %float_1_000000\n"
+        ),
+        (4, false) => format!("         %pv_{index} = OpLoad %v4float %attr0\n"),
+        (n, _) => {
+            return Err(not_supported(
+                FUNC,
+                format!("VS passthrough invalid attr0 registers_num/format: {n}/raw={raw_uint}"),
+            ));
+        }
+    };
+    Ok(format!(
+        "{load}         %pa_{index} = OpAccessChain %_ptr_Output_v4float %outPerVertex %int_per_vertex_0\n\
+                       OpStore %pa_{index} %pv_{index}\n"
+    ))
 }
 
 /// Beyond Kyty: auxiliary position exports pos1..pos3 (exp targets
@@ -2971,11 +3018,22 @@ fn recompile_fetch(
         // channels beyond the fetch are dropped into a scratch. Beyond Kyty
         // (upstream EXITs on any mismatch). Measured on Minecraft's menu VS:
         // attrib 2 as 2ch feeding a vec3 (fill z=0.0) and as 4ch (drop w).
-        let (temp_ty, load_ty, helper) = match n_attr {
-            1 => ("%temp_float", "%float", "%fetch_f1_f1_"),
-            2 => ("%temp_v2float", "%v2float", "%fetch_f1_f1_vf2_"),
-            3 => ("%temp_v3float", "%v3float", "%fetch_f1_f1_f1_vf3_"),
-            _ => ("%temp_v4float", "%v4float", "%fetch_f1_f1_f1_f1_vf4_"),
+        let raw_uint = info.resources[attrib_pos].format() == 11;
+        let (temp_ty, load_ty, helper) = match (n_attr, raw_uint) {
+            (1, true) => ("%temp_float", "%uint", "%fetch_f1_f1_"),
+            (1, false) => ("%temp_float", "%float", "%fetch_f1_f1_"),
+            (2, false) => ("%temp_v2float", "%v2float", "%fetch_f1_f1_vf2_"),
+            (3, false) => ("%temp_v3float", "%v3float", "%fetch_f1_f1_f1_vf3_"),
+            (4, false) => ("%temp_v4float", "%v4float", "%fetch_f1_f1_f1_f1_vf4_"),
+            _ => {
+                return Err(not_supported(
+                    FUNC,
+                    format!(
+                        "raw integer vertex format {} with {n_attr} channels",
+                        info.resources[attrib_pos].format()
+                    ),
+                ));
+            }
         };
         let mut params = String::new();
         for i in 0..n_attr {
@@ -2987,10 +3045,21 @@ fn recompile_fetch(
                 params += "%temp_float ";
             }
         }
+        let raw_bitcast = if raw_uint {
+            "%t1_f_<index> = OpBitcast %float %t1_<index>
+"
+        } else {
+            ""
+        };
+        let stored_value = if raw_uint {
+            "%t1_f_<index>"
+        } else {
+            "%t1_<index>"
+        };
         let mut text = format!(
             "
         %t1_<index> = OpLoad {load_ty} %<attr>
-                       OpStore {temp_ty} %t1_<index>
+        {raw_bitcast}       OpStore {temp_ty} {stored_value}
         %t2_<index> = OpFunctionCall %void {helper} {params}{temp_ty}
 ",
         );
@@ -4817,6 +4886,22 @@ fn sampled_site_route(
     Ok((sampled_key_suffix(dim, class), dim, class))
 }
 
+/// Whether the sampled descriptor resolved for this MIMG is a guest cube
+/// (T# type 11). Guest cube samples are represented as Vulkan 2D-array views:
+/// the GCN `V_CUBE*` sequence has already selected the face, but the guest
+/// hardware convention leaves S/T in [1, 2]. Vulkan's normalized 2D-array
+/// coordinates are [0, 1], so sample-coordinate builders use this bit to
+/// subtract one from S/T while preserving the third (face) component.
+fn sampled_site_is_guest_cube(spirv: &Spirv<'_>, matched: Option<usize>) -> bool {
+    let Some(i) = matched else {
+        return false;
+    };
+    spirv
+        .get_bind_info()
+        .and_then(|bind| bind.textures2d.desc.get(i))
+        .is_some_and(|desc| desc.texture.type_() == 11)
+}
+
 /// Rewrite the four sampled-image identifiers in a freshly-built MIMG body to
 /// the per-Dim suffixed names, routing the sample to the array matching the
 /// T#'s Dim in a mixed shader. `suffix == ""` (homogeneous) is a no-op.
@@ -5104,19 +5189,33 @@ fn image_sample_channels(
             // route) come from THIS sample's own T#, not a shader-wide
             // decision.
             let (suffix, dim, class) = sampled_site_route(spirv, matched, func)?;
+            let guest_cube = sampled_site_is_guest_cube(spirv, matched);
             let coord = if dim.coord_components() == 3 {
                 let src0_value2 = operand_variable_to_str_shift(inst.src[0], 2);
                 if src0_value2.type_ != SpirvType::Float {
                     return Err(not_supported(func, "unexpected cube/3d coord type"));
                 }
-                format!(
-                    "         %t39_<index> = OpLoad %float %{}
+                if guest_cube {
+                    format!(
+                        "         %t39_<index> = OpLoad %float %{}
+         %t40_<index> = OpLoad %float %{}
+         %t41_<index> = OpLoad %float %{}
+         %t39_cube_<index> = OpFSub %float %t39_<index> %float_1_000000
+         %t40_cube_<index> = OpFSub %float %t40_<index> %float_1_000000
+         %t42_<index> = OpCompositeConstruct %v3float %t39_cube_<index> %t40_cube_<index> %t41_<index>
+",
+                        src0_value0.value, src0_value1.value, src0_value2.value
+                    )
+                } else {
+                    format!(
+                        "         %t39_<index> = OpLoad %float %{}
          %t40_<index> = OpLoad %float %{}
          %t41_<index> = OpLoad %float %{}
          %t42_<index> = OpCompositeConstruct %v3float %t39_<index> %t40_<index> %t41_<index>
 ",
-                    src0_value0.value, src0_value1.value, src0_value2.value
-                )
+                        src0_value0.value, src0_value1.value, src0_value2.value
+                    )
+                }
             } else {
                 format!(
                     "         %t39_<index> = OpLoad %float %{}
@@ -5444,6 +5543,7 @@ fn sample_coord_snippet(
     dim: SampledDim,
     src0: crate::shader::types::ShaderOperand,
     func: &'static str,
+    guest_cube: bool,
 ) -> Result<String, ShaderRecompileError> {
     let c0 = operand_variable_to_str_shift(src0, 0);
     let c1 = operand_variable_to_str_shift(src0, 1);
@@ -5455,14 +5555,27 @@ fn sample_coord_snippet(
         if c2.type_ != SpirvType::Float {
             return Err(not_supported(func, "unexpected cube/3d coord type"));
         }
-        format!(
-            "         %t39_<index> = OpLoad %float %{}
+        if guest_cube {
+            format!(
+                "         %t39_<index> = OpLoad %float %{}
+         %t40_<index> = OpLoad %float %{}
+         %t41_<index> = OpLoad %float %{}
+         %t39_cube_<index> = OpFSub %float %t39_<index> %float_1_000000
+         %t40_cube_<index> = OpFSub %float %t40_<index> %float_1_000000
+         %t42_<index> = OpCompositeConstruct %v3float %t39_cube_<index> %t40_cube_<index> %t41_<index>
+",
+                c0.value, c1.value, c2.value
+            )
+        } else {
+            format!(
+                "         %t39_<index> = OpLoad %float %{}
          %t40_<index> = OpLoad %float %{}
          %t41_<index> = OpLoad %float %{}
          %t42_<index> = OpCompositeConstruct %v3float %t39_<index> %t40_<index> %t41_<index>
 ",
-            c0.value, c1.value, c2.value
-        )
+                c0.value, c1.value, c2.value
+            )
+        }
     } else {
         format!(
             "         %t39_<index> = OpLoad %float %{}
@@ -5538,7 +5651,12 @@ fn recompile_image_sample_lz_dmask7(
                OpStore %<dst_value2> %t55_<index>
 "#;
             let (suffix, dim, class) = sampled_site_route(spirv, matched, FUNC)?;
-            let coord = sample_coord_snippet(dim, inst.src[0], FUNC)?;
+            let coord = sample_coord_snippet(
+                dim,
+                inst.src[0],
+                FUNC,
+                sampled_site_is_guest_cube(spirv, matched),
+            )?;
             let mut body = TEXT
                 .replace("<coord>", &coord)
                 .replace("<index>", &format!("{index}"))
@@ -5626,7 +5744,12 @@ fn recompile_image_sample_lz_dmask_f(
                OpStore %<dst_value3> %t58_<index>
 "#;
             let (suffix, dim, class) = sampled_site_route(spirv, matched, FUNC)?;
-            let coord = sample_coord_snippet(dim, inst.src[0], FUNC)?;
+            let coord = sample_coord_snippet(
+                dim,
+                inst.src[0],
+                FUNC,
+                sampled_site_is_guest_cube(spirv, matched),
+            )?;
             let mut body = TEXT
                 .replace("<coord>", &coord)
                 .replace("<index>", &format!("{index}"))
@@ -5703,7 +5826,12 @@ fn image_sample_lz_single_channel(
                OpStore %<dst_value0> %t47_<index>
 "#;
             let (suffix, dim, class) = sampled_site_route(spirv, matched, func)?;
-            let coord = sample_coord_snippet(dim, inst.src[0], func)?;
+            let coord = sample_coord_snippet(
+                dim,
+                inst.src[0],
+                func,
+                sampled_site_is_guest_cube(spirv, matched),
+            )?;
             let mut body = TEXT
                 .replace("<coord>", &coord)
                 .replace("<index>", &format!("{index}"))
@@ -5779,7 +5907,12 @@ fn recompile_image_sample_lz_dmask3(
                OpStore %<dst_value1> %t51_<index>
 "#;
             let (suffix, dim, class) = sampled_site_route(spirv, matched, FUNC)?;
-            let coord = sample_coord_snippet(dim, inst.src[0], FUNC)?;
+            let coord = sample_coord_snippet(
+                dim,
+                inst.src[0],
+                FUNC,
+                sampled_site_is_guest_cube(spirv, matched),
+            )?;
             let mut body = TEXT
                 .replace("<coord>", &coord)
                 .replace("<index>", &format!("{index}"))
@@ -6104,14 +6237,20 @@ fn recompile_image_get_resinfo_dmask3(
         false,
     )?;
 
-    // The query extracts a v2int size, so this body is 2D-only; a mixed
-    // shader whose resinfo T# is 3D/Cube is a named refusal. The numeric
-    // class routes only the array ids — `OpImageQuerySizeLod` returns
-    // `%v2int` for every sampled component type, so no result retyping.
+    // `OpImageQuerySizeLod`'s result width is fixed by the image's dim — 2D
+    // yields `%v2int`, while 2DArray and 3D yield `%v3int` (layer count or
+    // depth in the third component). This dmask form only writes x and y, so
+    // the extracts are the same for every dim; only the query's result TYPE
+    // has to follow the descriptor, and emitting the wrong one is an invalid
+    // module rather than a wrong number.
+    //
+    // This used to refuse anything but plain 2D, which failed the WHOLE shader
+    // recompile (dropping the draw), not just the query — and it caught
+    // 2DArray as well as 3D, i.e. every cube descriptor, since type 11/13
+    // lower to 2DArray (`SampledDim::from_texture_type`). SharpEmu sizes the
+    // query the same way (`Gen5SpirvTranslator.cs` @5228335:3296,3307,3320).
+    // The numeric class routes only the array ids.
     let (resinfo_suffix, resinfo_dim, _) = sampled_site_route(spirv, matched, FUNC)?;
-    if resinfo_dim != SampledDim::Two {
-        return Err(not_supported(FUNC, "resinfo of a non-2D texture"));
-    }
 
     let index_str = format!("{index}");
     const TEXT: &str = r#"
@@ -6120,7 +6259,7 @@ fn recompile_image_get_resinfo_dmask3(
          %t2_<index> = OpLoad %ImageS %t1_<index>
          %t3_<index> = OpLoad %float %<lod>
          %t4_<index> = OpBitcast %int %t3_<index>
-         %t5_<index> = OpImageQuerySizeLod %v2int %t2_<index> %t4_<index>
+         %t5_<index> = OpImageQuerySizeLod <size_ty> %t2_<index> %t4_<index>
          %t6_<index> = OpCompositeExtract %int %t5_<index> 0
          %t7_<index> = OpBitcast %float %t6_<index>
                OpStore %<dst_x> %t7_<index>
@@ -6130,6 +6269,7 @@ fn recompile_image_get_resinfo_dmask3(
 "#;
     let mut body = TEXT
         .replace("<index>", &index_str)
+        .replace("<size_ty>", resinfo_dim.query_size_type())
         .replace("<texture>", &texture.value)
         .replace("<lod>", &lod.value)
         .replace("<dst_x>", &dst_x.value)
@@ -11337,11 +11477,11 @@ mod tests {
         let words = spirv_run(&source).expect("assemble in-shader-V# offen loads");
         assert_eq!(words[0], 0x0723_0203, "SPIR-V magic");
     }
-    /// A cube-bound shader emits `OpTypeImage %float Cube` and samples with a
-    /// 3-component direction — measured on Minecraft's skybox PS (type 11 T#,
-    /// `ImageSample [Vdata4Vaddr3StSsDmaskF]`).
+    /// A guest cube descriptor emits an arrayed 2D image and samples with the
+    /// 3-component `(s,t,face)` coordinate — measured on Minecraft's skybox
+    /// PS (type 11 T#, `ImageSample [Vdata4Vaddr3StSsDmaskF]`).
     #[test]
-    fn cube_texture_emits_cube_image_and_vec3_coords() {
+    fn guest_cube_texture_emits_2d_array_image_and_face_coords() {
         let mut code = ShaderCode::new();
         code.set_type(ShaderType::Pixel);
         let sample = ShaderInstruction {
@@ -11398,12 +11538,18 @@ mod tests {
         let source = spirv_generate_source(&code, None, Some(&input_info), None)
             .expect("recompile cube sample");
         assert!(
-            source.contains("OpTypeImage %float Cube"),
-            "the cube image type:\n{source}"
+            source.contains("OpTypeImage %float 2D 0 1"),
+            "guest cube faces must bind as an arrayed 2D image:\n{source}"
         );
         assert!(
             source.contains("OpCompositeConstruct %v3float"),
-            "3-component cube direction:\n{source}"
+            "3-component (s,t,face) coordinate:\n{source}"
+        );
+        assert!(
+            source.contains("OpFSub %float %t39_0 %float_1_000000")
+                && source.contains("OpFSub %float %t40_0 %float_1_000000"),
+            "guest cube S/T must be rebased from the PS5 [1,2] convention \
+             to Vulkan 2D-array normalized [0,1] coordinates:\n{source}"
         );
         let _ = spirv_run(&source).expect("assemble cube sample");
     }
@@ -12337,6 +12483,53 @@ mod tests {
         assert!(source.contains("OpImageQuerySizeLod %v2int"), "{source}");
         let words = spirv_run(&source).expect("assemble image_get_resinfo");
         naga_parse_and_validate(&words, "image_get_resinfo");
+    }
+
+    /// `image_get_resinfo` against a non-2D descriptor used to refuse, which
+    /// failed the WHOLE shader recompile and dropped the draw — and it caught
+    /// 2DArray as well as 3D, i.e. every cube T# (type 11/13 lower to
+    /// 2DArray). `OpImageQuerySizeLod`'s result width is fixed by the image's
+    /// dim, so the query type must follow the descriptor: 3D and 2DArray yield
+    /// `%v3int`, plain 2D `%v2int`. Only x and y are stored either way.
+    #[test]
+    fn image_get_resinfo_sizes_the_query_from_the_descriptor_dim() {
+        // (texture type nibble, expected OpImageQuerySizeLod result type)
+        for (texture_type, want_ty) in [(9u32, "%v2int"), (10, "%v3int"), (13, "%v3int")] {
+            let mut code = ShaderCode::new();
+            code.set_type(ShaderType::Compute);
+            shader_parse(
+                0,
+                &[0xF038_0308, 0x0001_0400, 0xBF80_0000, S_ENDPGM],
+                &mut code,
+                true,
+            )
+            .expect("parse image_get_resinfo");
+            let mut input_info = ShaderComputeInputInfo::default();
+            input_info.threads_num = [1, 1, 1];
+            input_info.bind.push_constant_size = 64;
+            input_info.bind.textures2d.textures_num = 1;
+            input_info.bind.textures2d.textures2d_sampled_num = 1;
+            input_info.bind.textures2d.desc[0].start_register = 4;
+            input_info.bind.textures2d.desc[0].texture.fields[3] |= texture_type << 28;
+
+            let source = spirv_generate_source(&code, None, None, Some(&input_info))
+                .unwrap_or_else(|e| {
+                    panic!("texture type {texture_type} must recompile, got {e:?}")
+                });
+            assert!(
+                source.contains(&format!("OpImageQuerySizeLod {want_ty}")),
+                "texture type {texture_type} must query {want_ty}\n{source}"
+            );
+            // Still an xy query: the third component is never stored.
+            assert!(
+                source.contains("OpCompositeExtract %int %t5_0 0")
+                    && source.contains("OpCompositeExtract %int %t5_0 1"),
+                "texture type {texture_type} must still store x and y\n{source}"
+            );
+            let words = spirv_run(&source)
+                .unwrap_or_else(|e| panic!("texture type {texture_type} must assemble: {e:?}"));
+            naga_parse_and_validate(&words, "image_get_resinfo_non_2d");
+        }
     }
 
     #[test]
@@ -13967,6 +14160,80 @@ mod tests {
         // End-to-end: recompile -> assemble -> naga parse + validate.
         let words = shader_recompile_vs(&code, &input_info).expect("recompile vs");
         naga_parse_and_validate(&words, "minimal vs");
+    }
+
+    #[test]
+    fn vertex_passthrough_matches_declared_attribute_width() {
+        let vec3 = vs_passthrough_source(7, 3, false).expect("vec3 passthrough");
+        assert!(vec3.contains("%p0_7 = OpLoad %v3float %attr0"), "{vec3}");
+        assert!(
+            vec3.contains("OpCompositeConstruct %v4float %px_7 %py_7 %pz_7 %float_1_000000"),
+            "{vec3}"
+        );
+
+        let vec4 = vs_passthrough_source(9, 4, false).expect("vec4 passthrough");
+        assert!(vec4.contains("%pv_9 = OpLoad %v4float %attr0"), "{vec4}");
+        assert!(
+            !vec4.contains("OpLoad %v3float"),
+            "a vec4 input must not be loaded through a vec3 pointer:\n{vec4}"
+        );
+        assert!(vec4.contains("OpStore %pa_9 %pv_9"), "{vec4}");
+    }
+
+    #[test]
+    fn uint16_vertex_fetch_preserves_raw_guest_vgpr_bits() {
+        // Minecraft's model V# uses unified format 11 = (FMT_16, UINT) for
+        // its bone index. The guest shader consumes that VGPR with integer
+        // bit operations, so a numeric float conversion (5 -> 5.0f bits)
+        // selects a bogus matrix. Vulkan also requires the interface type to
+        // agree with R16_UINT. Load uint, then bitcast once into Raeen's
+        // float-backed VGPR representation.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        let mut fetch = ShaderInstruction {
+            type_: T::FetchX,
+            format: F::Vdata1VaddrSvSoffsIdxen,
+            src_num: 3,
+            ..Default::default()
+        };
+        fetch.dst = ShaderOperand {
+            type_: ShaderOperandType::Vgpr,
+            register_id: 4,
+            size: 1,
+            ..Default::default()
+        };
+        fetch.src[2] = ShaderOperand {
+            type_: ShaderOperandType::IntegerInlineConstant,
+            constant: crate::shader::types::ShaderConstant::from_i(1),
+            size: 1,
+            ..Default::default()
+        };
+        code.get_instructions_mut().push(fetch);
+
+        let mut info = ShaderVertexInputInfo {
+            resources_num: 1,
+            fetch_embedded: true,
+            gs_prolog: true,
+            ..Default::default()
+        };
+        info.resources[0].fields[3] = 11 << 12;
+        info.resources_dst[0].semantic = 1;
+        info.resources_dst[0].register_start = 13;
+        info.resources_dst[0].registers_num = 1;
+
+        let source = spirv_generate_source(&code, Some(&info), None, None).unwrap();
+        assert!(
+            source.contains("%attr0 = OpVariable %_ptr_Input_uint Input"),
+            "format 11 must expose a uint Vulkan interface:\n{source}"
+        );
+        assert!(
+            source.contains("OpLoad %uint %attr0") && source.contains("OpBitcast %float %t1_1_0"),
+            "the uint fetch must preserve raw bits in the float-backed VGPR:\n{source}"
+        );
+
+        // This synthetic Fetch* omits the scalar prolog registers a complete
+        // shader carries. Source-level assertions are intentional here; the
+        // live Minecraft verification exercises the assembled Vulkan module.
     }
 
     // ---- 3. acceptance: minimal PS ----------------------------------------

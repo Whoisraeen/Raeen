@@ -24,6 +24,11 @@ bytemuck = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 raw-window-handle = { workspace = true }
+# Row-parallel texture detiling. Detiling is per-texel work over millions of
+# elements on the frame's critical path (a 1024x1024x6 panorama is 6.3 M), and
+# every output row is an independent destination slice. SharpEmu parallelizes
+# the same loop above the same order of threshold (`GnmTiling.cs:533-539`).
+rayon = { workspace = true }
 
 # guest_mem: VirtualQuery-validated reads of the identity-mapped guest arena
 # for the PM4 command processor's pointer-carrying packets.

@@ -152,7 +152,7 @@ fn draw_state<'a>(vs: &'a [u32], ps: &'a [u32], texture: TextureUpload) -> DrawS
                 sampled_binding: 0,
                 sampler_binding: 1,
                 textures: vec![texture],
-                linear_filter: vec![false],
+                samplers: vec![raeen_gpu::vulkan::offscreen::SamplerState::nearest_repeat()],
                 sampled_groups: Vec::new(),
             }),
             storage_images: None,

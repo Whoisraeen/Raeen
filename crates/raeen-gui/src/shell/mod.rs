@@ -886,16 +886,13 @@ impl Shell {
     /// Forward the physical gamepad's live state into the running guest each
     /// frame — the input producer that makes the guest's `scePadReadState`
     /// return real input. Analog sticks get Settings ▸ Controller ▸ Deadzone
-    /// applied; the encoded 12-byte `ScePadData` prefix is written into the
-    /// session kernel via `set_pad_state`, which the guest's pad thread reads
-    /// (the two share the same `Arc<OrbisKernel>`). No-op outside a session, or
-    /// when the launcher shares no kernel (`StubLauncher`).
+    /// applied; the encoded 12-byte `ScePadData` prefix is written to the local
+    /// session kernel and to the isolated runner's shared-memory input slot.
+    /// This keeps one canonical host-device reader in the Shell while ensuring
+    /// the child process's guest kernel receives the same snapshot.
     fn push_pad_state(&mut self, ctx: &egui::Context) {
         let (kernel, deadzone) = match self.session.as_ref() {
-            Some(session) => match &session.kernel {
-                Some(kernel) => (kernel.clone(), self.config.input.deadzone),
-                None => return,
-            },
+            Some(session) => (session.kernel.clone(), self.config.input.deadzone),
             None => return,
         };
         // Highest-priority source: the native, mapping-DB-free readers
@@ -935,7 +932,11 @@ impl Shell {
             native.unwrap_or_default(),
             merge_pad_states(pad, read_keyboard_pad(ctx)),
         );
-        kernel.set_pad_state(merged.to_orbis_pad_data());
+        let encoded = merged.to_orbis_pad_data();
+        if let Some(kernel) = kernel {
+            kernel.set_pad_state(encoded);
+        }
+        raeen_gpu::frame_ipc::publish_pad_state(encoded);
     }
 
     /// While a title runs, hold the PS/Guide button to quit back to the Shell
@@ -984,6 +985,8 @@ impl Shell {
             effective.graphics.validation_layers,
             effective.graphics.resolution_scale,
             effective.graphics.gpu_device_index,
+            effective.graphics.shader_cache,
+            effective.paths.shader_cache_dir.clone(),
         );
         apply_present_plugin(&effective.graphics);
         raeen_core::logging::set_level(if effective.debug.logging {

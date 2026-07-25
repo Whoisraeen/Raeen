@@ -1942,6 +1942,24 @@ impl raeen_gpu::GpuGuestMemory for GuestArena {
         GuestMemory::read(self, addr, out)
     }
 
+    unsafe fn read_gpu_uninit(&self, addr: u64, out: &mut [std::mem::MaybeUninit<u8>]) -> bool {
+        if !<Self as raeen_gpu::GpuGuestMemory>::validate_gpu_range(
+            self,
+            addr,
+            out.len() as u64,
+            false,
+        ) {
+            return false;
+        }
+        // SAFETY: the validated identity-mapped guest range covers `out.len()`
+        // readable bytes, and the destination owns equal reserved capacity.
+        // `ptr::copy` also remains sound in the theoretical overlap case.
+        unsafe {
+            std::ptr::copy(addr as *const u8, out.as_mut_ptr().cast::<u8>(), out.len());
+        }
+        true
+    }
+
     fn write_gpu(&self, addr: u64, data: &[u8]) -> bool {
         GuestMemory::write(self, addr, data)
     }
@@ -2106,11 +2124,28 @@ impl GuestAllocator for GuestArena {
         } else {
             align_up(hint, align)?
         };
-        let limit = if fixed {
-            start.checked_add(length)?
-        } else {
-            self.base
-        };
+        let requested_end = start.checked_add(length)?;
+
+        // A fixed child reservation may carve a named subrange out of a larger
+        // reservation the same guest already owns. V8 does this for its cage
+        // and Minecraft's asset heaps: reserve the parent span, then reserve
+        // fixed 32–196 MiB regions inside it. Calling `VirtualAlloc(MEM_RESERVE)`
+        // again over those pages must fail because Windows already reports
+        // them as MEM_RESERVE; that is not a guest conflict. Treat a range
+        // wholly contained in one of this arena's OS reservations as an
+        // idempotent successful carve. The VMA is already Reserved and later
+        // fixed maps commit pages inside the parent normally.
+        if fixed {
+            let state = self.lock_state();
+            let inside_owned_reservation = state.external_mappings.iter().any(|(&base, &span)| {
+                base.checked_add(span)
+                    .is_some_and(|end| start >= base && requested_end <= end)
+            });
+            if inside_owned_reservation {
+                return Some(start);
+            }
+        }
+        let limit = if fixed { requested_end } else { self.base };
         // `MEM_RESERVE` with `PAGE_NOACCESS` takes address space without
         // committing memory, so a 512 GiB reservation costs no RAM. The block
         // is recorded in `os_reservations` and released on exact unmap or Drop.
@@ -2484,6 +2519,20 @@ impl GuestAllocator for GuestArena {
 mod tests {
     use super::*;
 
+    /// `raeen-firmware` composes the process image and must be able to say
+    /// "this image is too big for the guest arena" itself, but it cannot
+    /// depend on `raeen-runtime` (the dependency runs this way). It therefore
+    /// mirrors [`IMAGE_SIZE`] as a public constant; this pins the two together
+    /// so growing one can never silently leave the other behind.
+    #[test]
+    fn composed_image_budget_matches_the_guest_arena_image_region() {
+        assert_eq!(
+            IMAGE_SIZE,
+            raeen_firmware::GUEST_IMAGE_REGION_BYTES,
+            "firmware's image budget must equal the arena's image region"
+        );
+    }
+
     /// (a) `new` succeeds and `entry_ptr` bounds-checks against the real
     /// image length.
     #[test]
@@ -2709,6 +2758,38 @@ mod tests {
             .reserve_with_hint(hint, len, raeen_core::PS5_PAGE_SIZE as u64, true)
             .expect("the exact range must be reusable after whole unmap");
         assert_eq!(second, hint);
+    }
+
+    #[test]
+    fn fixed_child_reservation_inside_owned_parent_is_idempotent() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let parent = arena
+            .reserve_with_hint(
+                RESERVE_MIN,
+                0x2000_0000,
+                raeen_core::PS5_PAGE_SIZE as u64,
+                false,
+            )
+            .expect("parent reservation");
+        let child = parent + 0x0800_0000;
+
+        assert_eq!(
+            arena.reserve_with_hint(child, 0x0200_0000, raeen_core::PS5_PAGE_SIZE as u64, true,),
+            Some(child),
+            "V8/Minecraft-style fixed child carve must reuse the owned reservation"
+        );
+        assert!(
+            arena
+                .reserve_with_hint(
+                    parent + 0x1f00_0000,
+                    0x0200_0000,
+                    raeen_core::PS5_PAGE_SIZE as u64,
+                    true,
+                )
+                .is_none(),
+            "a child that extends beyond the owned parent must not alias it"
+        );
     }
 
     /// The measured Until Dawn / Dragon Ball failure, reduced to its mechanism.

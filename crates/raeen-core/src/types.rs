@@ -91,6 +91,56 @@ pub struct MemoryRegion {
     pub memory_type: Ps5MemoryType,
     /// Optional name/label for debugging.
     pub name: Option<String>,
+    /// How this region came to exist, as `sceKernelVirtualQuery` reports it.
+    ///
+    /// A title does not only *make* mappings, it *reads them back*: it maps
+    /// direct memory and then queries the range to confirm the kernel agrees
+    /// about what it is. Reporting every mapping as anonymous made that
+    /// read-back disagree with the map the guest had just performed.
+    pub kind: MappingKind,
+    /// For a direct-memory mapping, the physical (direct-memory) offset it was
+    /// mapped from — `sceKernelMapDirectMemory`'s `directMemoryStart`, which
+    /// `sceKernelVirtualQuery` echoes back in its `offset` field. Zero for
+    /// mappings with no direct-memory backing.
+    pub direct_offset: u64,
+    /// The `type` argument the guest allocated this direct memory with
+    /// (`sceKernelAllocateDirectMemory`), echoed back as the query's
+    /// `memory_type`. Zero when the region has no allocation type.
+    pub direct_memory_type: i32,
+}
+
+/// What kind of mapping a region is, mirroring the one-bit-each flags in
+/// Orbis's `SceKernelVirtualQueryInfo` (`is_flexible`, `is_direct`, `is_stack`,
+/// `is_pooled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MappingKind {
+    /// Plain anonymous mapping — none of the query's kind bits set.
+    #[default]
+    Anonymous,
+    /// Backed by a direct-memory allocation (`is_direct`).
+    Direct,
+    /// Flexible memory (`is_flexible`).
+    Flexible,
+    /// A thread stack (`is_stack`).
+    Stack,
+    /// Pooled memory (`is_pooled`).
+    Pooled,
+}
+
+impl MappingKind {
+    /// The bit this kind sets in the query info's flags byte at offset 0x20.
+    /// Bit order is `is_flexible, is_direct, is_stack, is_pooled, is_committed`
+    /// (shadPS4 `core/libraries/kernel/memory.h` `OrbisVirtualQueryInfo`).
+    #[must_use]
+    pub const fn query_flag_bit(self) -> u8 {
+        match self {
+            Self::Anonymous => 0x00,
+            Self::Flexible => 0x01,
+            Self::Direct => 0x02,
+            Self::Stack => 0x04,
+            Self::Pooled => 0x08,
+        }
+    }
 }
 
 /// PS5 module information (loaded .sprx or .elf).

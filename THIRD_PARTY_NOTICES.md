@@ -89,7 +89,11 @@ SOFTWARE.
   The Gen5 AudioOut2 context/port parameter layout and grain pacing in
   `crates/raeen-hle/src/libsce_audio_out2.rs`, plus GFX10 MIMG DIM/NSA field
   meanings used by `crates/kyty-graphics/src/shader/parse.rs`, were also
-  behaviorally re-implemented after comparison with SharpEmu. UserService's
+  behaviorally re-implemented after comparison with SharpEmu.
+  Type-11 guest cubemaps are lowered to six-layer Vulkan 2D-array views after
+  comparing SharpEmu/KytyPS5's `(s,t,face)` image path and Raeen's measured
+  Minecraft shader; the Rust implementation and regression tests are original.
+  UserService's
   retail-style primary-user id and one-shot login-event behavior were
   re-implemented in `crates/raeen-hle/src/libsce_user_service.rs`; the event
   ABI was independently cross-checked against KytyPS5 and shadPS4. Raeen's
@@ -100,6 +104,18 @@ SOFTWARE.
   SharpEmu's native import trampoline state/ABI preservation; Raeen's
   implementation is original Rust plus generated x86-64 code and retains the
   existing VEH route for context-changing calls.
+  From upstream `5228335` (PR #587, "Gen5 flat memory and 3D images"):
+  `OpImageQuerySizeLod`'s result vector is sized from the descriptor's
+  dimensionality (`%v3int` for 3D and 2D-array, `%v2int` for 2D) in
+  `crates/kyty-graphics/src/shader/{spirv,recompile}.rs`, after comparing
+  SharpEmu's `Gen5SpirvTranslator.cs`; the Rust emitter and its regression
+  tests are original. From upstream `a158960` (PR #592, "GPU compute detile"):
+  the row-parallel split of the CPU detile loop in
+  `crates/raeen-gpu/src/texture/tiling.rs` follows SharpEmu's `Parallel.For`
+  over the same loop in `Agc/GnmTiling.cs`, and the non-power-of-two
+  element-size guard mirrors its `BitLog2` refusal. Raeen's swizzle-equation
+  tables were verified independently equivalent to SharpEmu's for the modes
+  both implement (5/9/24/27) and were **not** changed by that comparison.
   Patterns and behavior are **re-implemented in idiomatic Rust with reference to
   SharpEmu's C# source**; no C# is transliterated or vendored. SharpEmu's tree
   is cloned locally into the git-ignored `reference/` directory for study only;
