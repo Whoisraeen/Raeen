@@ -78,6 +78,31 @@ pub fn register(registry: &HleRegistry) {
         hle_register_callback_a,
     );
 
+    // libSceNpAuth — process-local request lifecycle with an honest offline
+    // result. Minecraft creates this request on a worker while entering its
+    // local-world flow; leaving the provider unresolved kills that worker and
+    // strands the main thread on its completion condition forever.
+    registry.register(
+        "libSceNpAuth",
+        "sceNpAuthCreateRequest",
+        hle_np_auth_create_request,
+    );
+    registry.register(
+        "libSceNpAuth",
+        "sceNpAuthGetAuthorizationCodeV3",
+        hle_np_auth_get_authorization_code_v3,
+    );
+    registry.register(
+        "libSceNpAuth",
+        "sceNpAuthDeleteRequest",
+        hle_np_auth_delete_request,
+    );
+    registry.register(
+        "libSceNpAuthAuthorizedApp",
+        "sceNpAuthGetAuthorizedAppCode",
+        hle_np_auth_get_authorized_app_code,
+    );
+
     // libSceNpAuthAuthorizedAppDialog — the PSN "authorize this app" popup.
     // Names recovered via the SharpEmu catalogue merge (the whole set appeared
     // as unnamed unresolved imports in a real 2026-07-16 run). Raeen has no host
@@ -118,6 +143,57 @@ pub fn register(registry: &HleRegistry) {
 static AUTH_DIALOG_STATUS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 const AUTH_STATUS_INITIALIZED: i32 = 1;
 const AUTH_STATUS_FINISHED: i32 = 3;
+const NP_ERROR_SIGNED_OUT: u64 = 0x8055_0006;
+const NP_AUTH_ERROR_INVALID_ARGUMENT: u64 = 0x8055_0301;
+const NP_AUTH_ERROR_REQUEST_NOT_FOUND: u64 = 0x8055_0306;
+
+/// Allocate an offline auth request. The id range and lifetime are
+/// cross-checked against shadPS4's GPL-2.0 `libSceNpAuth` implementation; the
+/// state lives on `OrbisKernel`, so consecutive guest processes cannot leak
+/// handles into one another.
+fn hle_np_auth_create_request(ctx: &HleContext, _args: &[u64]) -> u64 {
+    let id = ctx
+        .kernel
+        .np_auth_next_request
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .wrapping_add(1);
+    ctx.kernel.np_auth_requests.insert(id, ());
+    debug!("sceNpAuthCreateRequest() -> {id:#x} (offline)");
+    id as u32 as u64
+}
+
+/// Complete a synchronous authorization-code request as signed out. This is
+/// the real state Raeen exposes through `sceNpGetState`; returning it here lets
+/// the title disable online services and continue its local-world path.
+fn hle_np_auth_get_authorization_code_v3(ctx: &HleContext, args: &[u64]) -> u64 {
+    let request = args.first().copied().unwrap_or(0) as i32;
+    let params = args.get(1).copied().unwrap_or(0);
+    let code = args.get(2).copied().unwrap_or(0);
+    if params == 0 || code == 0 {
+        return NP_AUTH_ERROR_INVALID_ARGUMENT;
+    }
+    if !ctx.kernel.np_auth_requests.contains_key(&request) {
+        return NP_AUTH_ERROR_REQUEST_NOT_FOUND;
+    }
+    debug!("sceNpAuthGetAuthorizationCodeV3({request:#x}) -> SIGNED_OUT");
+    NP_ERROR_SIGNED_OUT
+}
+
+fn hle_np_auth_delete_request(ctx: &HleContext, args: &[u64]) -> u64 {
+    let request = args.first().copied().unwrap_or(0) as i32;
+    if ctx.kernel.np_auth_requests.remove(&request).is_none() {
+        return NP_AUTH_ERROR_REQUEST_NOT_FOUND;
+    }
+    SCE_OK
+}
+
+/// Authorized-app codes are PSN-issued credentials. An offline process has no
+/// code to return, so expose the same signed-out state as the base auth
+/// provider. This is preferable to fabricating a credential and lets local
+/// gameplay take the title's normal offline branch.
+fn hle_np_auth_get_authorized_app_code(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    NP_ERROR_SIGNED_OUT
+}
 
 fn hle_auth_dialog_initialize(_ctx: &HleContext, _args: &[u64]) -> u64 {
     AUTH_DIALOG_STATUS.store(
@@ -380,6 +456,38 @@ fn hle_get_reachability(ctx: &HleContext, args: &[u64]) -> u64 {
 mod tests {
     use super::*;
     use crate::{GuestMemory, test_ctx};
+
+    #[test]
+    fn np_auth_request_lifecycle_reports_offline_without_faulting() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let request = hle_np_auth_create_request(&ctx, &[]);
+        assert_eq!(request, 0x1000_0001);
+        assert_eq!(
+            hle_np_auth_get_authorization_code_v3(&ctx, &[request, 0x100, 0x200]),
+            NP_ERROR_SIGNED_OUT
+        );
+        assert_eq!(hle_np_auth_delete_request(&ctx, &[request]), SCE_OK);
+        assert_eq!(
+            hle_np_auth_delete_request(&ctx, &[request]),
+            NP_AUTH_ERROR_REQUEST_NOT_FOUND
+        );
+
+        let registry = HleRegistry::new();
+        for function in [
+            "sceNpAuthCreateRequest",
+            "sceNpAuthGetAuthorizationCodeV3",
+            "sceNpAuthDeleteRequest",
+        ] {
+            assert!(registry.is_implemented("libSceNpAuth", function));
+        }
+        assert!(
+            registry.is_implemented("libSceNpAuthAuthorizedApp", "sceNpAuthGetAuthorizedAppCode")
+        );
+    }
 
     /// The authorized-app dialog completes immediately: Open moves the status
     /// to FINISHED, GetStatus/UpdateStatus report it, and GetResult writes a

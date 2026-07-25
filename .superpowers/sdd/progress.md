@@ -1,3 +1,39 @@
+- MINECRAFT WORLD-ENTRY PERFORMANCE + DEAD-WORKER FIXES (2026-07-25; no
+  commit; HLE 392/392, GPU 233/233, scoped clippy `-D warnings` + fmt clean,
+  release Shell built):
+  * Persistent sampled-texture caching is default-on again after a real
+    correctness A/B: Minecraft's panorama, menu text/icons and world thumbnail
+    remained correct in the GUI. Worker-frame time fell from ~100-115 ms to
+    ~22-29 ms and the visible Worlds screen measured 38-42 FPS. The cache key
+    now includes tile layout, preventing identical guest bytes decoded under
+    incompatible linear/SW_64KB layouts; `RAEEN_NO_TEX_CACHE=1` remains the
+    diagnostic escape hatch.
+  * Offline RakNet `recv`/`recvfrom` now backs off 1 ms on EWOULDBLOCK instead
+    of hot-spinning. Measured replay: 17,883,821 calls -> 54,703 over the same
+    interval (~178x fewer), with normalized child CPU about one-third lower.
+  * Infinite pthread condition waits no longer manufacture a guest-visible
+    spurious wake every 10 ms. They remain in the host condvar until a real
+    generation change/deadline/process termination, so every idle Minecraft
+    worker no longer traps through mutex+predicate+wait at 100 Hz. A focused
+    cross-thread wake test pins the behavior.
+  * ROOT CAUSE OF THE POST-WORLD 0-FPS STALL FOUND: async workers faulted on
+    three unresolved imports, then the main thread waited forever on their
+    completion condition. Added process-scoped offline `libSceNpAuth`
+    Create/GetAuthorizationCodeV3/Delete, offline
+    `libSceNpAuthAuthorizedApp::sceNpAuthGetAuthorizedAppCode`, and aliased
+    `sceSaveDataTransferringMountPs4` to the existing honest no-foreign-save
+    result. Clean-room behavior cross-checked against GPL-2.0 shadPS4; no
+    credentials are fabricated.
+  * MEASURED EFFECT: before the fix, workers faulted at 37-39 s and the title
+    stopped flipping after saved-world Cross. After the fix, the same
+    deterministic replay had zero unimplemented-import/worker faults through
+    the world selection and advanced to present/submission 4096 immediately
+    afterward (111,623 draws / 74,524 dispatches recorded), so the 0-FPS
+    dead-worker stall is removed.
+  * HONEST STATUS: active world-loading/render work is now running, but a
+    screenshot proving recognizable gameplay and the launch->move->save loop
+    are still OPEN. Do not call this full gameplay or stable 60 FPS yet.
+
 - NP STATE CALLBACK NOW DELIVERED (real fix, insufficient for the blank page)
   + recvfrom exonerated (2026-07-24; raeen-hle 390/390, raeen-kernel 36/36,
   clippy `-D warnings` clean):

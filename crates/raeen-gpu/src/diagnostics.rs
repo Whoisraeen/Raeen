@@ -30,6 +30,7 @@ pub(crate) struct GpuEnv {
     pub skip_cs: Option<String>,
     pub solid_ps_addr: Option<String>,
     pub trace_shader_addr: Option<String>,
+    pub trace_shader_words: Option<String>,
 }
 
 impl GpuEnv {
@@ -47,26 +48,14 @@ impl GpuEnv {
             no_defer_compute: on("RAEEN_NO_DEFER_COMPUTE"),
             no_depth: on("RAEEN_NO_DEPTH"),
             no_stencil: on("RAEEN_NO_STENCIL"),
-            // The persistent sampled-texture cache is OFF unless explicitly
-            // asked for. It is a measured correctness regression: with the
-            // cache on, Minecraft's panorama and menu render as flat
-            // untextured geometry and 5 of 12 sampled-texture probes read
-            // all-zero; with it off the same frame renders completely
-            // (textured panorama, logo, skin, buttons) and 0 of 12 read
-            // all-zero. Frame captures both ways, 2026-07-24.
-            //
-            // This is the A/B `docs/rendering-blockers-and-port-plan-2026-07-22.md`
-            // demanded be settled before further perf work — it regresses, so
-            // the default flips to correctness while the invalidation bug is
-            // found. The mechanism is NOT yet understood and the obvious
-            // theories are already disproved: the sample hash is whole-range
-            // (exact) for ranges up to 4 KiB, which covers the measured 1 KiB
-            // texture, and `sampled_render_target` is consulted BEFORE
-            // `decode_texture`, so the cache does not short-circuit a live
-            // render-target bind. Do not re-enable by default until a frame
-            // capture shows the cache on rendering identically to the cache
-            // off. `RAEEN_TEX_CACHE=1` restores it for that comparison.
-            no_tex_cache: !on("RAEEN_TEX_CACHE"),
+            // Persistent sampled textures are the title-path default. A
+            // 2026-07-25 Minecraft A/B after the compute-to-graphics
+            // publication fix showed the cached path rendering the panorama
+            // and menu correctly while reducing steady worker frame time from
+            // ~100-115 ms to ~23-26 ms. Keep an explicit correctness/perf
+            // bisection switch: `RAEEN_NO_TEX_CACHE=1` restores per-draw guest
+            // decode and upload.
+            no_tex_cache: on("RAEEN_NO_TEX_CACHE"),
             time_compute: on("RAEEN_TIME_COMPUTE"),
             time_draw: on("RAEEN_TIME_DRAW"),
             time_worker: on("RAEEN_TIME_WORKER"),
@@ -78,6 +67,7 @@ impl GpuEnv {
             skip_cs: std::env::var("RAEEN_SKIP_CS").ok(),
             solid_ps_addr: std::env::var("RAEEN_SOLID_PS_ADDR").ok(),
             trace_shader_addr: std::env::var("RAEEN_TRACE_SHADER_ADDR").ok(),
+            trace_shader_words: std::env::var("RAEEN_TRACE_SHADER_WORDS").ok(),
         }
     }
 }

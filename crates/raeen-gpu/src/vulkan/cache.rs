@@ -1830,6 +1830,16 @@ impl DrawCaches {
         self.pending_compute_image_writes.clear();
     }
 
+    /// Whether deferred compute has guest-addressed outputs that a following
+    /// graphics draw may consume as an index/vertex/resource buffer.
+    ///
+    /// Draw translation currently fetches those inputs from the identity-mapped
+    /// guest bytes. The ordered Vulkan batch may keep unrelated work GPU-side,
+    /// but it must publish these outputs before the CPU-side fetch occurs.
+    pub(crate) fn has_pending_compute_writebacks(&self) -> bool {
+        !self.pending_compute_writes.is_empty() || !self.pending_compute_image_writes.is_empty()
+    }
+
     /// Take the whole pending batch for a flush: per-draw resources, touched
     /// targets (draw order), and targets whose destruction was deferred.
     pub(crate) fn take_batch(
@@ -2320,6 +2330,28 @@ mod tests {
             ..base.clone()
         };
         assert_ne!(base, different_shader);
+    }
+
+    #[test]
+    fn pending_compute_writebacks_form_a_graphics_resource_boundary() {
+        let mut caches = DrawCaches::default();
+        assert!(!caches.has_pending_compute_writebacks());
+
+        caches.commit_deferred_resources(
+            PendingDrawResources::default(),
+            [ComputeBufferKey {
+                base: 0x4000,
+                size: 0x100,
+            }],
+            std::iter::empty(),
+        );
+        assert!(
+            caches.has_pending_compute_writebacks(),
+            "a GPU-newer guest SSBO must be published before a following draw reads it"
+        );
+
+        caches.discard_pending_compute_writes();
+        assert!(!caches.has_pending_compute_writebacks());
     }
 
     #[test]

@@ -443,6 +443,46 @@ fn has_visible_content(image: &RenderedImage) -> bool {
     visible_pixel_count(image, 16) != 0
 }
 
+/// Whether every colour texel is identical (alpha is ignored).
+///
+/// A uniform scanout can be a legitimate fade/clear, but it is not evidence
+/// that a missing final composite landed. Minecraft's second screen draws a
+/// light-gray clear into both VideoOut buffers while its actual menu lives in a
+/// non-uniform intermediate target. Treating any non-black scanout as
+/// authoritative hid that menu.
+fn is_visually_uniform(image: &RenderedImage) -> bool {
+    let bpp = image.bytes_per_pixel.max(1) as usize;
+    let colour = colour_span(bpp).min(bpp);
+    let mut pixels = image.pixels.chunks_exact(bpp);
+    let Some(first) = pixels.next() else {
+        return true;
+    };
+    pixels.all(|pixel| pixel[..colour] == first[..colour])
+}
+
+/// Elect a content-bearing, non-uniform intermediate target.
+///
+/// Uniform clears are deliberately excluded even when every pixel is nonzero:
+/// their old visible-pixel score always beat a partially occupied UI target.
+fn elect_detailed_target(
+    framebuffers: &std::collections::HashMap<u64, Arc<RenderedImage>>,
+    exclude: Option<u64>,
+) -> Option<(u64, Arc<RenderedImage>)> {
+    framebuffers
+        .iter()
+        .filter(|(base, image)| {
+            // Election is a rare routing census, not the steady-state flip
+            // path. Use an exact visibility check so a sparse UI cannot
+            // disappear merely because every 16th sampled texel is black.
+            Some(**base) != exclude
+                && visible_pixel_count(image, 1) != 0
+                && !is_visually_uniform(image)
+        })
+        .map(|(base, image)| (visible_pixel_count(image, 16), *base, image))
+        .max_by_key(|(nonzero, _, _)| *nonzero)
+        .map(|(_, base, image)| (base, Arc::clone(image)))
+}
+
 /// Select the smallest target set a flush consumer needs on the CPU.
 ///
 /// A VideoOut flip names the new scanout directly and also needs the elected
@@ -1153,34 +1193,51 @@ impl AgcGpuSession {
                         warn!(error = %e, "deferred-draw flush failed — presenting the last flushed frame");
                     }
                 }
-                // Flip miss: the flipped address has no drawn content. The
-                // most-content fallback presents the remembered target when it
-                // still has fresh content; a FULL flush + census re-election
-                // runs on the first miss, whenever the remembered target went
-                // dark, and every FALLBACK_REELECT_INTERVAL misses (content
-                // migrating to another render target is caught within that).
-                if let Some(addr) = address
-                    && !framebuffers.contains_key(&addr)
-                {
-                    let misses = self.flip_miss_count.fetch_add(1, Ordering::Relaxed);
-                    let remembered_has_content = remembered.is_some_and(|r| {
-                        framebuffers
-                            .get(&r)
-                            .is_some_and(|image| has_visible_content(image))
-                    });
-                    if !remembered_has_content || misses.is_multiple_of(FALLBACK_REELECT_INTERVAL) {
-                        match crate::vulkan::offscreen::flush_deferred_draws(device) {
-                            Ok(flushed) => {
-                                insert_all(&mut framebuffers, flushed, &mut flip_target_drawn);
+                // Routing miss: either the flipped address has no drawn
+                // target, or it contains only a uniform clear and the CPU map
+                // has no detailed target yet. The latter is Minecraft's
+                // screen transition: filtered readback kept landing the gray
+                // VideoOut buffers while the completed UI remained GPU-side.
+                //
+                // A FULL flush + census runs immediately for an unknown
+                // route, then periodically. Once a detailed fallback is
+                // remembered, the normal filtered path reads only it and the
+                // scanout. Periodic re-election catches content moving to a
+                // different target without turning solid fades into a
+                // full-readback-every-frame performance regression.
+                if let Some(addr) = address {
+                    let scanout_missing = !framebuffers.contains_key(&addr);
+                    let uniform_without_detail =
+                        framebuffers.get(&addr).is_some_and(|image| {
+                            has_visible_content(image) && is_visually_uniform(image)
+                        }) && elect_detailed_target(&framebuffers, Some(addr)).is_none();
+                    if scanout_missing || uniform_without_detail {
+                        let misses = self.flip_miss_count.fetch_add(1, Ordering::Relaxed);
+                        let remembered_has_detail = remembered.is_some_and(|r| {
+                            framebuffers.get(&r).is_some_and(|image| {
+                                has_visible_content(image) && !is_visually_uniform(image)
+                            })
+                        });
+                        let needs_full_census = if scanout_missing {
+                            !remembered_has_detail
+                                || misses.is_multiple_of(FALLBACK_REELECT_INTERVAL)
+                        } else {
+                            misses.is_multiple_of(FALLBACK_REELECT_INTERVAL)
+                        };
+                        if needs_full_census {
+                            match crate::vulkan::offscreen::flush_deferred_draws(device) {
+                                Ok(flushed) => {
+                                    insert_all(&mut framebuffers, flushed, &mut flip_target_drawn);
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "full deferred-draw flush failed at a flip miss");
+                                }
                             }
-                            Err(e) => {
-                                warn!(error = %e, "full deferred-draw flush failed at a flip miss");
-                            }
+                            // Force `present_flipped` to re-run its census over
+                            // the freshly-landed pixels instead of trusting the
+                            // remembered winner.
+                            *self.fallback_present_base.lock() = None;
                         }
-                        // Force `present_flipped` to re-run its census over
-                        // the freshly-landed pixels instead of trusting the
-                        // remembered winner.
-                        *self.fallback_present_base.lock() = None;
                     }
                 }
             }
@@ -1209,35 +1266,44 @@ impl AgcGpuSession {
         let (image, fallback, fallback_base, keys, flip_target_known) = {
             let fb = self.framebuffers.lock();
             let flip_target_known = fb.contains_key(&address);
-            let image = fb
+            let scanout_image = fb
                 .get(&address)
                 .filter(|image| flip_target_drawn || has_visible_content(image))
                 .cloned();
+            // A uniform scanout clear yields when a richer target exists. With
+            // no richer target it remains authoritative, preserving solid
+            // fades. A GPU-drawn black frame always remains authoritative:
+            // unlike Minecraft's opaque gray clear, it may be an intentional
+            // fade/night frame and cannot be distinguished from one by pixels.
+            let detailed_over_uniform = scanout_image
+                .as_ref()
+                .filter(|image| has_visible_content(image) && is_visually_uniform(image))
+                .and_then(|_| elect_detailed_target(&fb, Some(address)));
+            let image = if detailed_over_uniform.is_some() {
+                None
+            } else {
+                scanout_image
+            };
             let (fallback, fallback_base) = if image.is_none() {
                 // Steady state: present the remembered fallback target while
                 // it still has content — no census, no scan of other targets
                 // (whose entries may be deliberately stale, kept GPU-side by
                 // the filtered flush).
-                let kept = remembered
-                    .and_then(|r| fb.get(&r).map(|img| (r, img)))
-                    .filter(|(_, img)| has_visible_content(img))
-                    .map(|(r, img)| (Some(r), Arc::clone(img)));
+                let kept = detailed_over_uniform.or_else(|| {
+                    remembered.and_then(|r| {
+                        fb.get(&r)
+                            .filter(|img| has_visible_content(img) && !is_visually_uniform(img))
+                            .map(|img| (r, Arc::clone(img)))
+                    })
+                });
                 match kept {
-                    Some((base, img)) => (Some(img), base),
+                    Some((base, img)) => (Some(img), Some(base)),
                     None => {
                         // Census election, sub-sampled (every 64th byte):
                         // exact counts cost a full scan of every 8 MB target
                         // per flip. Which target has the MOST content
                         // survives sub-sampling.
-                        let elected = fb
-                            .iter()
-                            .map(|(base, img)| {
-                                let nonzero = visible_pixel_count(img, 16);
-                                (nonzero, *base, img)
-                            })
-                            .filter(|(nonzero, _, _)| *nonzero > 0)
-                            .max_by_key(|(nonzero, _, _)| *nonzero)
-                            .map(|(_, base, img)| (base, Arc::clone(img)));
+                        let elected = elect_detailed_target(&fb, Some(address));
                         match elected {
                             Some((base, img)) => (Some(img), Some(base)),
                             None => (None, None),
@@ -1301,13 +1367,21 @@ impl AgcGpuSession {
         // The guest scanout is authoritative when it actually holds pixels:
         // ASTRO-class titles compose their display buffer by compute/DMA writes
         // we do not capture as a render target, so the real frame lives at the
-        // flip address in guest memory, not in any drawn target. Prefer it over
-        // the most-content census fallback — but only when it has content, so an
-        // empty scanout never regresses a drawn target to black.
+        // flip address in guest memory, not in any drawn target. A uniform
+        // guest clear must not hide a detailed intermediate, however; Minecraft
+        // leaves its registered scanouts gray while the next UI is complete in
+        // another target.
         let guest_has_content = guest_present
             .as_ref()
             .is_some_and(|image| has_visible_content(image));
-        let guest_hit = guest_has_content;
+        let fallback_has_detail = fallback
+            .as_ref()
+            .is_some_and(|image| !is_visually_uniform(image));
+        let guest_is_uniform = guest_present
+            .as_ref()
+            .is_none_or(|image| is_visually_uniform(image));
+        let guest_preferred = guest_has_content && !(fallback_has_detail && guest_is_uniform);
+        let guest_hit = guest_preferred;
         let fallback_hit = fallback.is_some();
         // RAEEN_TRACE_FLIP: does the buffer the title flipped to have drawn
         // content, and what render targets exist? Answers whether black frames
@@ -1323,7 +1397,7 @@ impl AgcGpuSession {
             );
         }
         let flip_address_hit = image.is_some();
-        if !flip_address_hit && !guest_has_content && fallback_hit {
+        if !flip_address_hit && !guest_preferred && fallback_hit {
             static ROUTING_WARNINGS: AtomicU64 = AtomicU64::new(0);
             let occurrence = ROUTING_WARNINGS.fetch_add(1, Ordering::Relaxed) + 1;
             if occurrence <= 8 || occurrence.is_power_of_two() {
@@ -1332,13 +1406,13 @@ impl AgcGpuSession {
                     scanout = format_args!("{address:#x}"),
                     scanout_target_known = flip_target_known,
                     fallback_target = format_args!("{:#x}", fallback_base.unwrap_or(0)),
-                    "PRESENT ROUTING: flipped scanout has no visible colour; presenting a \
-                     content-bearing intermediate target (final copy/composite to scanout \
-                     is missing or still pending)"
+                    "PRESENT ROUTING: flipped scanout is empty or only a uniform clear; \
+                     presenting a content-bearing intermediate target (final copy/composite \
+                     to scanout is missing or still pending)"
                 );
             }
         }
-        if !flip_address_hit && !guest_has_content && !fallback_hit {
+        if !flip_address_hit && !guest_preferred && !fallback_hit {
             static BLACK_FRAME_WARNINGS: AtomicU64 = AtomicU64::new(0);
             let occurrence = BLACK_FRAME_WARNINGS.fetch_add(1, Ordering::Relaxed) + 1;
             if occurrence <= 8 || occurrence.is_power_of_two() {
@@ -1363,12 +1437,13 @@ impl AgcGpuSession {
                 );
             }
         }
-        // Priority: a target drawn at the flip address; then the guest scanout
-        // when it holds real pixels; then the census fallback; then the guest
-        // scanout as a last resort even if empty.
+        // Priority: a detailed target drawn at the flip address; then a
+        // non-uniform guest scanout; then the detailed census fallback; then
+        // the guest scanout as a last resort (including legitimate solid
+        // fades when no detailed target exists).
         let presented = if let Some(img) = image {
             Some(img)
-        } else if guest_has_content {
+        } else if guest_preferred {
             guest_present
         } else {
             fallback.or(guest_present)
@@ -1803,7 +1878,8 @@ impl AgcGpuSession {
             // Synchronous/test callers have no ordered worker consumer, so
             // fence here. The title worker keeps compute work GPU-side across
             // adjacent DCB/ACB submissions and fences at the real lifetime
-            // boundary (`sceAgcSuspendPoint`, flip, wait_idle, or shutdown).
+            // boundary (the first dependent draw, `sceAgcSuspendPoint`, flip,
+            // wait_idle, or shutdown).
             // Passing an empty target filter keeps render targets GPU-side.
             crate::vulkan::offscreen::flush_deferred_draws_filtered(device, Some(&[]))?;
         }
@@ -3275,6 +3351,72 @@ mod tests {
         );
     }
 
+    /// Minecraft's next screen clears both registered VideoOut buffers to an
+    /// opaque light gray while drawing the actual menu into an intermediate.
+    /// A visible-pixel score ranks that clear as a perfect frame, so routing
+    /// must prefer the non-uniform UI even when the scanout was drawn this
+    /// flush.
+    #[test]
+    fn uniform_scanout_yields_to_detailed_intermediate_target() {
+        let session = AgcGpuSession::new(deny_memory());
+        let gray_scanout = RenderedImage {
+            width: 2,
+            height: 2,
+            pixels: [229, 231, 234, 255].repeat(4),
+            bytes_per_pixel: 4,
+        };
+        let detailed_ui = RenderedImage {
+            width: 2,
+            height: 2,
+            pixels: vec![
+                0, 0, 0, 255, 240, 240, 240, 255, 20, 80, 140, 255, 0, 0, 0, 255,
+            ],
+            bytes_per_pixel: 4,
+        };
+        session
+            .framebuffers
+            .lock()
+            .insert(0x1000, Arc::new(gray_scanout));
+        session
+            .framebuffers
+            .lock()
+            .insert(0x2000, Arc::new(detailed_ui.clone()));
+
+        session.present_flipped(0x1000, true);
+
+        assert_eq!(
+            session.last_image().expect("detailed frame").pixels,
+            detailed_ui.pixels,
+            "a uniform VideoOut clear must not hide a completed UI intermediate"
+        );
+        assert_eq!(*session.fallback_present_base.lock(), Some(0x2000));
+    }
+
+    /// With no detailed target to replace it, a solid frame remains valid.
+    /// This preserves intentional fades and loading-screen clears.
+    #[test]
+    fn uniform_scanout_remains_valid_without_a_detailed_target() {
+        let session = AgcGpuSession::new(deny_memory());
+        let solid = RenderedImage {
+            width: 2,
+            height: 1,
+            pixels: [12, 24, 36, 255].repeat(2),
+            bytes_per_pixel: 4,
+        };
+        session
+            .framebuffers
+            .lock()
+            .insert(0x1000, Arc::new(solid.clone()));
+
+        session.present_flipped(0x1000, true);
+
+        assert_eq!(
+            session.last_image().expect("solid frame").pixels,
+            solid.pixels
+        );
+        assert_eq!(*session.fallback_present_base.lock(), None);
+    }
+
     /// An HDR (RGBA16F) texel spends TWO bytes per channel, so its colour span
     /// is six bytes. Testing three covered red plus only the LOW half of green
     /// and never reached blue — and half-float `1.0` is `0x3C00`, whose
@@ -3342,7 +3484,8 @@ mod tests {
         );
         assert!(
             !submission_compute_flush_required(true, true),
-            "the ordered worker must batch adjacent compute submissions until suspend/flip"
+            "the ordered worker batches adjacent compute submissions; the draw sink fences at \
+             the first compute-to-graphics dependency, otherwise suspend/flip does"
         );
         assert!(
             !submission_compute_flush_required(false, false),

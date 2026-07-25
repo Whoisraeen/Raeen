@@ -963,7 +963,7 @@ mod tests {
         let (width, height, bpp_log2) = (1024u32, 512u32, 2u32);
         let bpp = 1usize << bpp_log2;
         let linear: Vec<u8> = (0..width as usize * height as usize * bpp)
-            .map(|i| (i * 2654435761usize >> 7) as u8)
+            .map(|i| ((i * 2654435761usize) >> 7) as u8)
             .collect();
 
         let tiled = tile_64kb_r_x(&linear, width, height, bpp_log2);

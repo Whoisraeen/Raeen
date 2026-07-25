@@ -299,6 +299,13 @@ pub struct OrbisKernel {
     /// screen, which pumps `sceNpCheckCallback` ~10x/s forever with a blank
     /// page.
     pub np_state_callbacks: parking_lot::Mutex<Vec<NpStateCallbackRegistration>>,
+    /// Live offline NP-auth request handles. Authentication never reaches a
+    /// host service, but titles still expect Create/Get/Delete to have a
+    /// coherent process-local lifetime instead of faulting on unresolved
+    /// imports.
+    pub np_auth_requests: DashMap<i32, ()>,
+    /// Next NP-auth request id; the first issued id is `0x1000_0001`.
+    pub np_auth_next_request: std::sync::atomic::AtomicI32,
     /// APR ids already named by the once-per-id missing-file warn in
     /// `sceAmprAprCommandBufferReadFile` — the "name the miss" diagnostic
     /// stays visible without spamming one warn per frame.
@@ -962,6 +969,8 @@ impl OrbisKernel {
             appr_files: DashMap::new(),
             appr_file_handles: DashMap::new(),
             np_state_callbacks: parking_lot::Mutex::new(Vec::new()),
+            np_auth_requests: DashMap::new(),
+            np_auth_next_request: std::sync::atomic::AtomicI32::new(0x1000_0000),
             appr_missing_warned: DashMap::new(),
             appr_submissions: DashMap::new(),
             appr_next_submission: std::sync::atomic::AtomicU32::new(1),

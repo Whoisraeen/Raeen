@@ -1032,13 +1032,41 @@ pub fn shader_get_sampler(
     let index = info.samplers_num as usize;
 
     let mut fields = [0u32; 4];
-    let eud_resident = read_sharp_fields(
+    let eud_resident = match read_sharp_fields(
         direct_sgprs,
         start_index,
         user_sgpr,
         extended_buffer,
         &mut fields,
-    )?;
+    ) {
+        Ok(eud_resident) => eud_resident,
+        Err(e @ ShaderAnalysisError::NotImplementedOwned { .. }) => {
+            // A sampler can be supplied at runtime through SRT/bindless state
+            // even though the static Gen5 user-data capture names its SGPR
+            // start. Minecraft's second-screen PS declares S# at s28 but only
+            // captures through s29, so the old strict four-dword read skipped
+            // every menu draw. The Vulkan binding path already has a safe
+            // all-zero nearest/wrap sampler; install that same descriptor here
+            // instead of failing analysis.
+            if let Ok(start) = usize::try_from(start_index) {
+                for flag in direct_sgprs
+                    .iter_mut()
+                    .take((start + fields.len()).min(UserSgprInfo::SGPRS_MAX))
+                    .skip(start.min(UserSgprInfo::SGPRS_MAX))
+                {
+                    *flag = false;
+                }
+            }
+            tracing::debug!(
+                start_index,
+                slot,
+                reason = %e,
+                "runtime-resolved sampler unavailable in static capture; using default S#"
+            );
+            false
+        }
+        Err(e) => return Err(e),
+    };
 
     info.start_register[index] = start_index;
     info.extended[index] = eud_resident;
@@ -3587,7 +3615,10 @@ pub fn shader_get_input_info_vs(
     if usage.extended_buffer {
         return Err(ni("vs: extended buffer"));
     }
-    if usage.samplers > 0 {
+    // Kyty's VS-sampler EXIT is a PS4-era invariant. Gen5 vertex stages may
+    // sample textures, and Raeen's SPIR-V sampler declarations plus Vulkan
+    // stage binding are stage-agnostic (the same path already used by PS/CS).
+    if usage.samplers > 0 && !ps5 {
         return Err(ni("vs: samplers"));
     }
     if usage.gds_pointers > 0 {
@@ -5951,6 +5982,30 @@ mod tests {
         );
     }
 
+    /// A runtime-resolved sampler may be named at the tail of the user-SGPR
+    /// file without all four descriptor dwords being captured. The sampled
+    /// draw must receive the safe default S# instead of failing analysis.
+    #[test]
+    fn incomplete_runtime_sampler_uses_default_descriptor() {
+        let mut user_sgpr = UserSgprInfo::default();
+        user_sgpr.set(28, 0x1234_5678, UserSgprType::Vsharp);
+        user_sgpr.set(29, 0x9abc_def0, UserSgprType::Vsharp);
+        user_sgpr.count = 30;
+        let mut direct = [false; UserSgprInfo::SGPRS_MAX];
+        direct[..30].fill(true);
+        let mut samplers = ShaderSamplerResources::default();
+
+        shader_get_sampler(&mut samplers, &mut direct, 28, 3, &user_sgpr, None)
+            .expect("runtime sampler must degrade to the default S#");
+
+        assert_eq!(samplers.samplers_num, 1);
+        assert_eq!(samplers.start_register[0], 28);
+        assert_eq!(samplers.slots[0], 3);
+        assert_eq!(samplers.samplers[0].fields, [0; 4]);
+        assert!(!samplers.extended[0]);
+        assert!(!direct[28] && !direct[29]);
+    }
+
     /// The V#-vs-T# disambiguation must key on the descriptor TYPE, not the
     /// whole dword3 nibble: a buffer V# with OOB_SELECT=3 reads nibble 3 and
     /// was misrouted into the texture path ("read-only texture type 3", 57
@@ -6494,6 +6549,63 @@ mod tests {
         shader_get_input_info_cs(&regs, &sh, &mem, &map, true, &mut info)
             .expect("next-gen CS with an IMM_SAMPLER must analyse");
         assert_eq!(info.bind.samplers.samplers_num, 1);
+    }
+
+    /// Gen5 vertex stages use the same stage-agnostic sampler binding as PS
+    /// and CS. Kyty's PS4-era VS sampler gate must not skip those draws.
+    #[test]
+    fn vs_next_gen_sampler_is_allowed() {
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[4] = 0x1111_0000;
+        let mut type_ = [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX];
+        type_[4..8].fill(UserSgprType::Vsharp);
+        let regs = VertexShaderInfo {
+            es_regs: crate::shader::hw_regs::EsStageRegisters { data_addr: 0x6000 },
+            gs_regs: crate::shader::hw_regs::GsStageRegisters {
+                rsrc2: crate::shader::hw_regs::GsShaderResource2 { user_sgpr: 8 },
+                chksum: 1,
+                ..Default::default()
+            },
+            gs_user_sgpr: UserSgprInfo {
+                value,
+                type_,
+                count: 8,
+            },
+            ..Default::default()
+        };
+        let mem = TestMem {
+            regions: vec![(0x6000, vec![S_ENDPGM])],
+        };
+        let mut direct = vec![0xffff_u16; 8];
+        direct[1] = 4;
+        let mut map = ShaderMap::new();
+        map.map_user_data(
+            0x6000,
+            ShaderMappedData {
+                user_data: Some(ShaderUserData {
+                    direct_resource_offset: direct,
+                    sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+                    eud_size_dw: 0,
+                    srt_size_dw: 0,
+                }),
+                input_semantics: vec![],
+            },
+        );
+        let mut info = ShaderVertexInputInfo::default();
+
+        shader_get_input_info_vs(
+            &regs,
+            &ShaderRegisters::default(),
+            &mem,
+            &map,
+            true,
+            &mut info,
+        )
+        .expect("next-gen VS with an IMM_SAMPLER must analyse");
+
+        assert!(info.gs_prolog);
+        assert_eq!(info.bind.samplers.samplers_num, 1);
+        assert_eq!(info.bind.samplers.start_register[0], 4);
     }
 
     /// Gen5 CS end-to-end: an inline-SRT shader analyses to completion, with

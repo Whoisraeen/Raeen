@@ -109,6 +109,34 @@ fn trace_selected_shader(vs: u64, ps: u64) -> bool {
     shader_addr_selected("RAEEN_TRACE_SHADER_ADDR", vs, ps)
 }
 
+/// Address-independent companion to [`trace_selected_shader`].
+///
+/// Guest shader addresses move when a title is relaunched after another
+/// process, while the translated program sizes remain stable. Accept
+/// `RAEEN_TRACE_SHADER_WORDS=vs:4103,ps:1142` so a late-screen shader can be
+/// selected without first consuming all of the boot-time trace limiters just
+/// to discover its address.
+fn trace_shader_words_selected(vs_words: usize, ps_words: usize) -> bool {
+    crate::diagnostics::gpu_env()
+        .trace_shader_words
+        .as_deref()
+        .is_some_and(|raw| {
+            raw.split(',').any(|part| {
+                let Some((stage, words)) = part.trim().split_once(':') else {
+                    return false;
+                };
+                let Ok(words) = words.trim().parse::<usize>() else {
+                    return false;
+                };
+                match stage.trim().to_ascii_lowercase().as_str() {
+                    "vs" => words == vs_words,
+                    "ps" => words == ps_words,
+                    _ => false,
+                }
+            })
+        })
+}
+
 /// Map `CB_TARGET_MASK`'s MRT0 nibble to Vulkan's colour write mask.
 ///
 /// Bit per channel, R in bit 0 through A in bit 3 — the same shape Vulkan uses,
@@ -1017,8 +1045,8 @@ fn texture_vk_format(
 }
 
 /// Sparse sample-hash of a guest byte range for the persistent-texture cache
-/// (stage D): FNV-1a over the range length plus 64 evenly-strided 64-byte
-/// chunks and the final 64 bytes — ~4 KiB of guest reads regardless of
+/// (stage D): FNV-1a over the range length, tile mode, 64 evenly-strided
+/// 64-byte chunks, and the final 64 bytes — ~4 KiB of guest reads regardless of
 /// texture size (a whole-range hash for ranges up to 4 KiB). Never returns 0
 /// (0 is the "no hash / not cacheable" sentinel), and returns `None` when the
 /// guest range is not readable — the caller then decodes uncached and produces
@@ -1035,7 +1063,7 @@ fn texture_vk_format(
 /// texture cache — no cheap range index over it exists today — so they are
 /// covered by the same per-bind rehash. `RAEEN_NO_TEX_CACHE=1` restores
 /// per-draw decode + upload wholesale.
-fn guest_sample_hash(base: u64, len: u64) -> Option<u64> {
+fn guest_sample_hash(base: u64, len: u64, tile_mode: u8) -> Option<u64> {
     const CHUNKS: u64 = 64;
     const CHUNK_BYTES: u64 = 64;
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1050,6 +1078,10 @@ fn guest_sample_hash(base: u64, len: u64) -> Option<u64> {
         return None;
     }
     let mut h = mix(FNV_OFFSET, &len.to_le_bytes());
+    // Source bytes are not enough to identify decoded content: the same
+    // allocation produces different pixels under linear, SW_64KB_S, and
+    // SW_64KB_R_X addressing.
+    h = mix(h, &[tile_mode]);
     if len <= CHUNKS * CHUNK_BYTES {
         let bytes = read_guest_bytes_unaligned(base, len, "texture sample-hash").ok()?;
         h = mix(h, &bytes);
@@ -1093,12 +1125,13 @@ fn texture_cache_probe(
     depth: u32,
     cube: bool,
     array: bool,
+    tile_mode: u8,
     format: vk::Format,
 ) -> (u64, Option<TextureUpload>) {
     if crate::diagnostics::gpu_env().no_tex_cache {
         return (0, None);
     }
-    let Some(hash) = sampling_scope(|_| guest_sample_hash(base, src_len)) else {
+    let Some(hash) = sampling_scope(|_| guest_sample_hash(base, src_len, tile_mode)) else {
         return (0, None);
     };
     let hit = sampling_scope(|scope| {
@@ -1336,6 +1369,7 @@ fn decode_texture(
                 depth,
                 cube,
                 array,
+                t.tile_mode(),
                 format,
             );
             if let Some(upload) = hit {
@@ -1409,6 +1443,7 @@ fn decode_texture(
                     depth,
                     cube,
                     array,
+                    t.tile_mode(),
                     format,
                 )
             };
@@ -3273,6 +3308,34 @@ impl OffscreenDrawSink<'_> {
         }
     }
 
+    /// Fence and publish only when deferred compute produced guest-addressed
+    /// data that the next graphics draw can read.
+    ///
+    /// The batch stays open across compute-only submissions for throughput,
+    /// but index and vertex fetch still happen on the CPU from guest memory.
+    /// Without this dependency boundary Minecraft's second-screen UI saw
+    /// all-zero generated indices/vertices and collapsed every triangle.
+    fn flush_compute_for_graphics_read(&mut self) -> Result<(), DrawError> {
+        let pending = {
+            let caches = self.dev.draw_caches();
+            caches.has_pending_compute_writebacks()
+        };
+        if !pending {
+            return Ok(());
+        }
+
+        // An empty render-target filter fences the ordered batch and publishes
+        // compute SSBO/UAV outputs without paying to read unrelated colour
+        // targets back. Storage-image outputs are returned and become valid
+        // framebuffer/texture sources for this draw.
+        let flushed = crate::vulkan::offscreen::flush_deferred_draws_filtered(self.dev, Some(&[]))
+            .map_err(|e| err(format!("compute-to-graphics resource barrier failed: {e}")))?;
+        for (base, image) in flushed {
+            self.framebuffers.insert(base, Arc::new(image));
+        }
+        Ok(())
+    }
+
     /// The body shared by the auto and indexed draw paths.
     ///
     /// `index` is `None` for a vertex-order draw and `Some((bytes, type))` for
@@ -3527,7 +3590,10 @@ impl OffscreenDrawSink<'_> {
         let trace_minecraft_model = crate::diagnostics::gpu_env().trace_model
             && matches!(shaders.vs.len(), 16_848 | 16_852)
             && matches!(shaders.ps.len(), 5_184 | 5_187);
-        if trace_selected_shader(vs_addr, ps_addr) || trace_minecraft_model {
+        if trace_selected_shader(vs_addr, ps_addr)
+            || trace_shader_words_selected(shaders.vs.len(), shaders.ps.len())
+            || trace_minecraft_model
+        {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SELECTED_SEEN: AtomicU32 = AtomicU32::new(0);
             let selected = SELECTED_SEEN.fetch_add(1, Ordering::Relaxed);
@@ -3829,6 +3895,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
         index_count: u32,
         _flags: u32,
     ) -> Result<(), DrawError> {
+        self.flush_compute_for_graphics_read()?;
         self.draw_common(ctx, ucfg, sh, index_count, None)
     }
 
@@ -3847,6 +3914,9 @@ impl DrawSink for OffscreenDrawSink<'_> {
         sh: &Shader,
         draw: &IndexedDraw,
     ) -> Result<(), DrawError> {
+        // This must precede `fetch_index_buffer`: generated indices live in
+        // guest memory only after the deferred compute writeback is published.
+        self.flush_compute_for_graphics_read()?;
         let (index_bytes, index_type) = fetch_index_buffer(draw)?;
         self.draw_common(
             ctx,
@@ -5698,6 +5768,30 @@ mod tests {
         assert_eq!(gen5_vertex_format(57).unwrap(), vk::Format::R8G8B8A8_SNORM);
         let e = gen5_vertex_format(0).expect_err("unknown formats stay named");
         assert!(format!("{e}").contains('0'));
+    }
+
+    #[test]
+    fn texture_cache_hash_includes_the_tile_layout() {
+        let bytes: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let base = bytes.as_ptr() as u64;
+        let (linear, swizzle_s, swizzle_rx, repeat) =
+            crate::guest_mem::with_test_ranges(&[(base, bytes.len())], || {
+                (
+                    guest_sample_hash(base, bytes.len() as u64, 0).unwrap(),
+                    guest_sample_hash(base, bytes.len() as u64, 9).unwrap(),
+                    guest_sample_hash(base, bytes.len() as u64, 27).unwrap(),
+                    guest_sample_hash(base, bytes.len() as u64, 27).unwrap(),
+                )
+            });
+        assert_ne!(
+            linear, swizzle_s,
+            "linear bytes must not reuse a tiled image"
+        );
+        assert_ne!(
+            swizzle_s, swizzle_rx,
+            "distinct GFX10 swizzles must not share a cached decode"
+        );
+        assert_eq!(swizzle_rx, repeat, "the same layout stays cacheable");
     }
 
     /// A tiled T# (SWIZZLE_MODE 27 = SW_64KB_R_X, format 56 = 8_8_8_8 UNORM —

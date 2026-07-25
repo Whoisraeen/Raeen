@@ -318,14 +318,16 @@ fn wait_core(ctx: &HleContext, args: &[u64], timeout: Option<std::time::Duration
             timed_out = true;
             break;
         }
-        let wait = state.changed.wait_for(&mut generation, slice);
-        // POSIX explicitly permits spurious condition-variable wakeups. Treat
-        // the bounded host wait as one so an orphaned/stale guest waiter can
-        // re-check its own predicate, while still polling process termination
-        // without pinning a host thread forever inside the VEH.
-        if timeout.is_none() && wait.timed_out() {
-            break;
-        }
+        let _wait = state.changed.wait_for(&mut generation, slice);
+        // The bounded host wait exists only so process termination is observed
+        // promptly; a slice timeout is not a reason to bounce back into guest
+        // code.  The previous implementation deliberately surfaced one
+        // spurious guest wake every 10 ms.  With Minecraft's worker set that
+        // meant every idle thread repeatedly reacquired its guest mutex,
+        // checked a predicate and trapped back into this HLE call at 100 Hz.
+        // A condition variable *may* wake spuriously, but POSIX does not require
+        // us to manufacture wakeups.  Stay parked until a real generation
+        // change, a real deadline, or process termination.
     }
     let woken = *generation != observed;
     drop(generation);
@@ -720,16 +722,27 @@ mod tests {
     }
 
     #[test]
-    fn static_wait_materializes_an_opaque_handle_and_can_wake_spuriously() {
+    fn static_wait_materializes_an_opaque_handle_and_requires_a_real_wake() {
         let (kernel, mem, alloc) = fixture();
         let ctx = test_ctx(&kernel, &mem, &alloc);
         let cond = 0x100;
         let mutex = 0x200;
         assert_eq!(crate::pthread_sync::mutex_lock_for_cond(&ctx, mutex), OK);
+        let state = condition(&ctx, cond).expect("static condition materialized");
 
         let started = std::time::Instant::now();
-        assert_eq!(hle_cond_wait(&ctx, &[cond, mutex]), OK);
-        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                *state.generation.lock() += 1;
+                state.changed.notify_one();
+            });
+            assert_eq!(hle_cond_wait(&ctx, &[cond, mutex]), OK);
+        });
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(20),
+            "an infinite wait must not return merely because its host polling slice expired"
+        );
 
         let mut bytes = [0u8; 8];
         assert!(mem.read(cond, &mut bytes));

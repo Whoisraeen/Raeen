@@ -84,14 +84,28 @@ fn hle_accept(ctx: &HleContext, args: &[u64]) -> u64 {
     MINUS_ONE
 }
 
+/// One millisecond keeps an empty offline socket responsive while preventing
+/// a guest nonblocking receive loop from monopolizing a host core. Measured on
+/// Minecraft's RakThread: the immediate-return path issued 17,883,821
+/// `recvfrom` calls in roughly two minutes.
+const OFFLINE_RECV_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1);
+
+pub(crate) fn backoff_offline_recv(ctx: &HleContext) {
+    if !ctx.guest_threads.process_is_terminating() {
+        ctx.services.sleep(OFFLINE_RECV_BACKOFF);
+    }
+}
+
 /// `recv(fd, buf, len, flags)` / `recvfrom(..., addr, addrlen)`: no data can
-/// ever arrive on an offline socket — `EWOULDBLOCK`, never a fake payload and
-/// never a blocking wait that nothing can satisfy.
+/// ever arrive on an offline socket — briefly yield, then return
+/// `EWOULDBLOCK`; never invent a payload or park forever on an event that
+/// cannot occur.
 fn hle_recv(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
     if !ctx.services.socket_exists(fd) {
         return MINUS_ONE;
     }
+    backoff_offline_recv(ctx);
     debug!("recv/recvfrom(fd={fd:#x}) -> EWOULDBLOCK (offline)");
     crate::libkernel::set_guest_errno(ctx, EWOULDBLOCK);
     MINUS_ONE
@@ -532,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn offline_posix_socket_surface_never_blocks_and_never_connects() {
+    fn offline_posix_socket_surface_bounds_empty_receive_polling_and_never_connects() {
         use crate::GuestMemory;
         let kernel = raeen_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
@@ -545,7 +559,12 @@ mod tests {
         // listen accepts; accept/recv report EWOULDBLOCK instead of blocking.
         assert_eq!(hle_listen(&ctx, &[fd, 8]), OK);
         assert_eq!(hle_accept(&ctx, &[fd, 0, 0]), MINUS_ONE);
+        let recv_started = std::time::Instant::now();
         assert_eq!(hle_recv(&ctx, &[fd, 0x100, 16, 0]), MINUS_ONE);
+        assert!(
+            recv_started.elapsed() >= OFFLINE_RECV_BACKOFF,
+            "an empty offline receive must yield instead of becoming a host-core spin"
+        );
         let errno_slot = crate::libkernel::hle_error_addr(&ctx, &[]);
         let mut errno = [0u8; 4];
         assert!(mem.read(errno_slot, &mut errno));

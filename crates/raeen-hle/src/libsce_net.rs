@@ -195,6 +195,7 @@ fn hle_net_recv(ctx: &HleContext, args: &[u64]) -> u64 {
     if !ctx.services.socket_exists(fd) {
         return NET_ERROR_EBADF;
     }
+    crate::kernel_socket::backoff_offline_recv(ctx);
     crate::libkernel::set_guest_errno(ctx, 35); // EWOULDBLOCK
     NET_ERROR_EWOULDBLOCK
 }

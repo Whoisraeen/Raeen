@@ -89,6 +89,11 @@ pub fn register(registry: &HleRegistry) {
             "sceSaveDataTransferringMount",
             hle_transferring_mount,
         );
+        registry.register(
+            library,
+            "sceSaveDataTransferringMountPs4",
+            hle_transferring_mount,
+        );
     }
     registry.register(
         "libSceSaveData_native",
@@ -845,6 +850,20 @@ mod tests {
         let ctx = test_ctx(&kernel, &mem, &alloc);
         assert_eq!(hle_mount(&ctx, &[0, 0x200]), ERROR_PARAMETER);
         assert_eq!(hle_mount(&ctx, &[0x100, 0]), ERROR_PARAMETER);
+    }
+
+    #[test]
+    fn ps4_transfer_mount_alias_reports_no_foreign_save_instead_of_faulting() {
+        let registry = HleRegistry::new();
+        assert!(
+            registry.is_implemented("libSceSaveData_native", "sceSaveDataTransferringMountPs4")
+        );
+
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = crate::test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_transferring_mount(&ctx, &[0x100]), ERROR_NOT_FOUND);
     }
 
     #[test]
