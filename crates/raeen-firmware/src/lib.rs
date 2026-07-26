@@ -13,6 +13,7 @@ pub const CRATE_NAME: &str = "raeen-firmware";
 
 pub mod crypto;
 pub mod dynlib;
+mod process_cache;
 pub mod pup;
 pub mod registry;
 pub mod report;
@@ -129,7 +130,7 @@ pub fn load_module(
 }
 
 /// One dependency loaded alongside the main module.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LoadedDependency {
     /// The `DT_NEEDED` name, e.g. `libfmod.prx`.
     pub name: String,
@@ -141,15 +142,29 @@ pub struct LoadedDependency {
     pub unresolved: usize,
 }
 
+/// Export snapshot needed to reconstruct the process module registry on a
+/// persistent linked-image cache hit. Kept independently of unwind metadata:
+/// a valid module may export symbols without carrying `.eh_frame`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LoadedModuleExports {
+    pub name: String,
+    pub image_offset: u64,
+    pub exports: Vec<dynlib::SymbolExport>,
+    pub prefer_lle: bool,
+}
+
 /// A whole process: the main module plus its file-backed `.prx` dependencies,
 /// composed into one image (M1-D).
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LoadedProcess {
     /// The composed image: main module at offset 0, each dependency at its
     /// `image_offset`. Feed this to `raeen_runtime::GuestArena`.
     pub linked: dynlib::linker::LinkedModule,
     /// The dependencies that were file-loaded, in load order.
     pub dependencies: Vec<LoadedDependency>,
+    /// Every successfully linked module's exports and placement, including the
+    /// main executable, for warm-cache registry reconstruction.
+    pub module_exports: Vec<LoadedModuleExports>,
 }
 
 fn append_main_initializer(
@@ -876,6 +891,48 @@ fn apply_diagnostic_overrides(registry: &mut registry::ModuleRegistry, module: &
 /// initialized in (DT_NEEDED order). If a title is measured to need strict
 /// reverse-topological `module_start` ordering, that is a separate change to
 /// the `module_inits` schedule, not to this walk.
+fn restore_cached_registry(
+    process: &mut LoadedProcess,
+    hle_data_offset: u64,
+    registry: &mut registry::ModuleRegistry,
+    base: u64,
+) -> bool {
+    // The HLE data page contains a per-process stack canary. Never reuse that
+    // mutable value from the on-disk image: rebuild the page, refresh its bytes
+    // in place, and register its data exports at the cached address.
+    let page = build_hle_data_page(registry, base.wrapping_add(hle_data_offset));
+    let Ok(offset) = usize::try_from(hle_data_offset) else {
+        return false;
+    };
+    let Some(end) = offset.checked_add(page.len()) else {
+        return false;
+    };
+    let Some(destination) = process.linked.image.get_mut(offset..end) else {
+        return false;
+    };
+    destination.copy_from_slice(&page);
+
+    let force_mspace =
+        mspace_force_hle_enabled(std::env::var("RAEEN_FORCE_HLE_MSPACE").ok().as_deref());
+    for module in &process.module_exports {
+        if module.prefer_lle {
+            registry.set_policy(&module.name, registry::ModulePolicy::PreferLle);
+        }
+        if module.prefer_lle && force_mspace {
+            force_hle_mspace_family(registry, &module.name);
+        }
+        if module.prefer_lle {
+            apply_diagnostic_overrides(registry, &module.name);
+        }
+        registry.register_module_exports_at(
+            &module.name,
+            &module.exports,
+            base.wrapping_add(module.image_offset),
+        );
+    }
+    true
+}
+
 pub fn load_process(
     bytes: &[u8],
     dir: &std::path::Path,
@@ -884,9 +941,33 @@ pub fn load_process(
     hle: &raeen_hle::HleRegistry,
     base: u64,
 ) -> Result<LoadedProcess, FirmwareError> {
+    let load_started = std::time::Instant::now();
     // Parse (not yet link) the main module: we need its NEEDED list and its
     // image size before anything can be placed above it.
     let decrypted = crypto::self_crypto::decrypt_self(bytes, provider)?;
+
+    // Index before parsing/linking so a warm launch can validate the complete
+    // app-module manifest and return a cached composed image immediately.
+    let module_index = ModuleIndex::build(dir);
+    tracing::debug!(
+        "app module index: {} .prx/.sprx under {}",
+        module_index.entries.len(),
+        dir.display()
+    );
+    let process_cache_key = process_cache::key(&decrypted.elf, &module_index, base, hle);
+    if let Some(mut hit) = process_cache::load(&process_cache_key) {
+        if restore_cached_registry(&mut hit.process, hit.hle_data_offset, registry, base) {
+            tracing::info!(
+                elapsed_ms = load_started.elapsed().as_millis(),
+                image_bytes = hit.process.linked.image.len(),
+                dependencies = hit.process.dependencies.len(),
+                "linked-image cache hit"
+            );
+            return Ok(hit.process);
+        }
+        tracing::warn!("linked-image cache metadata was structurally stale; rebuilding");
+    }
+
     let module = sprx::parse_sprx(&decrypted.elf)?;
     let dyn_tags = match &module.dynamic {
         Some(d) => dynlib::parse_sce_dynamic(d)?,
@@ -904,19 +985,9 @@ pub fn load_process(
         .map(|(lib, _)| lib)
         .collect();
 
-    // Index every `.prx`/`.sprx` under the app directory once. Both the
-    // `DT_NEEDED` search and the optional-plugin pre-placement scan below read
-    // it, so a title that keeps its modules in engine-specific subdirectories
-    // (Unity's `Media/Modules`, `Media/Plugins`) is served by the same walk.
-    let module_index = ModuleIndex::build(dir);
-    tracing::debug!(
-        "app module index: {} .prx/.sprx under {}",
-        module_index.entries.len(),
-        dir.display()
-    );
-
     let mut next_offset = align_up_16k(dynlib::linker::image_size(&module)? as u64);
     let mut dependencies = Vec::new();
+    let mut module_exports = Vec::new();
     let mut dep_images: Vec<(u64, Vec<u8>)> = Vec::new();
     let mut dep_unwind_modules = Vec::new();
     // Decoded and placed in pass 1, linked in pass 2 (see "Two passes" above).
@@ -1224,6 +1295,12 @@ pub fn load_process(
             exports: p.decoded.dynlib.exports.len(),
             unresolved: linked.unresolved.len(),
         });
+        module_exports.push(LoadedModuleExports {
+            name: p.name.clone(),
+            image_offset: p.offset,
+            exports: p.decoded.dynlib.exports.clone(),
+            prefer_lle: true,
+        });
         dep_unwind_modules.extend(linked.unwind_modules.into_iter().map(|mut unwind| {
             unwind.name = p.name.clone();
             unwind.image_offset = p.offset.wrapping_add(unwind.image_offset);
@@ -1245,6 +1322,12 @@ pub fn load_process(
         &mut tables,
         main_tls_assignment,
     )?;
+    module_exports.push(LoadedModuleExports {
+        name: module.name.clone(),
+        image_offset: 0,
+        exports: dynlib_data.exports.clone(),
+        prefer_lle: false,
+    });
 
     // Compose: main module already occupies [0, its image len); splice each
     // dependency in at its offset.
@@ -1346,10 +1429,17 @@ pub fn load_process(
         );
     }
 
-    Ok(LoadedProcess {
+    let process = LoadedProcess {
         linked,
         dependencies,
-    })
+        module_exports,
+    };
+    process_cache::store(&process_cache_key, hle_data_offset, &process);
+    tracing::info!(
+        elapsed_ms = load_started.elapsed().as_millis(),
+        "cold process load complete"
+    );
+    Ok(process)
 }
 
 #[cfg(test)]

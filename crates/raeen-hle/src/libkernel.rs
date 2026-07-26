@@ -506,36 +506,38 @@ fn hle_read(ctx: &HleContext, args: &[u64]) -> u64 {
     let Ok(n) = usize::try_from(count) else {
         return FILE_EINVAL;
     };
-    match ctx.services.read(fd, n) {
-        Ok(bytes) => {
+    let mut read_result = None;
+    let guest_fill = ctx.mem.fill_write(buf, n, &mut |out| {
+        let result = ctx.services.read_into(fd, out);
+        let read = result.as_ref().copied().unwrap_or(0);
+        read_result = Some(result);
+        read
+    });
+    let Some(filled) = guest_fill else {
+        warn!("read: guest buffer {buf:#x} (+{n}) not writable — EFAULT");
+        return FILE_EFAULT;
+    };
+    match read_result.unwrap_or(Ok(filled)) {
+        Ok(read) => {
+            debug_assert_eq!(filled, read);
             if let Some(path) = traced_path.as_deref() {
                 info!(
                     elapsed_ms = ctx.kernel.uptime().as_millis(),
                     "file trace: read fd={fd} path='{path}' guest_buf={buf:#x} \
                      count={count:#x} -> {:#x} byte(s)",
-                    bytes.len()
+                    read
                 );
-            }
-            if bytes.is_empty() {
-                return 0; // EOF (or an empty file) — a valid short read.
-            }
-            if !ctx.mem.write(buf, &bytes) {
-                warn!(
-                    "read: guest buffer {buf:#x} (+{}) not writable — EFAULT",
-                    bytes.len()
-                );
-                return FILE_EFAULT;
             }
             if entropy && std::env::var_os("RAEEN_TRACE_ENTROPY").is_some() {
                 info!(
                     "entropy device read: fd={fd} guest_buf={buf:#x} count={count:#x} -> {} \
                      byte(s), guard={:#x?}->{:#x?}",
-                    bytes.len(),
+                    read,
                     guard_before,
                     traced_guard.and_then(read_guard),
                 );
             }
-            bytes.len() as u64
+            read as u64
         }
         Err(e) => {
             warn!("read: fd {fd} failed: {e} — EBADF");
@@ -566,27 +568,29 @@ fn hle_pread(ctx: &HleContext, args: &[u64]) -> u64 {
     let Ok(n) = usize::try_from(count) else {
         return FILE_EINVAL;
     };
-    match ctx.kernel.filesystem.pread(fd, n, offset) {
-        Ok(bytes) => {
+    let mut read_result = None;
+    let guest_fill = ctx.mem.fill_write(buf, n, &mut |out| {
+        let result = ctx.kernel.filesystem.pread_into(fd, out, offset);
+        let read = result.as_ref().copied().unwrap_or(0);
+        read_result = Some(result);
+        read
+    });
+    let Some(filled) = guest_fill else {
+        warn!("pread: guest buffer {buf:#x} (+{n}) not writable — EFAULT");
+        return FILE_EFAULT;
+    };
+    match read_result.unwrap_or(Ok(filled)) {
+        Ok(read) => {
+            debug_assert_eq!(filled, read);
             if let Some(path) = traced_path.as_deref() {
                 info!(
                     elapsed_ms = ctx.kernel.uptime().as_millis(),
                     "file trace: pread fd={fd} path='{path}' guest_buf={buf:#x} \
                      count={count:#x} offset={offset:#x} -> {:#x} byte(s)",
-                    bytes.len()
+                    read
                 );
             }
-            if bytes.is_empty() {
-                return 0; // EOF (or a read wholly past it) — a valid short read.
-            }
-            if !ctx.mem.write(buf, &bytes) {
-                warn!(
-                    "pread: guest buffer {buf:#x} (+{}) not writable — EFAULT",
-                    bytes.len()
-                );
-                return FILE_EFAULT;
-            }
-            bytes.len() as u64
+            read as u64
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => FILE_EBADF,
         Err(_) => FILE_EINVAL,
@@ -1919,6 +1923,24 @@ pub fn register(registry: &HleRegistry) {
         "sceKernelDebugRaiseExceptionOnReleaseMode",
         hle_debug_raise_exception,
     );
+    for library in ["libkernel", "libkernel_unity"] {
+        registry.register(
+            library,
+            "sceKernelInstallExceptionHandler",
+            hle_install_exception_handler,
+        );
+        registry.register(
+            library,
+            "sceKernelRemoveExceptionHandler",
+            hle_remove_exception_handler,
+        );
+        registry.register_incomplete(
+            library,
+            "sceKernelRaiseException",
+            hle_raise_exception,
+            "handler state is modeled but asynchronous guest-thread delivery is not implemented",
+        );
+    }
     registry.register(
         "libkernel",
         "sceKernelDebugWriteCppExceptionInfo",
@@ -3851,6 +3873,55 @@ fn hle_debug_raise_exception(ctx: &HleContext, args: &[u64]) -> u64 {
     // gets reported as OUR wild-jump bug. Exit the calling thread instead;
     // other threads keep running so the run stays observable.
     ctx.guest_threads.request_exit(code);
+    SCE_OK
+}
+
+fn exception_signal_allowed(signum: i32) -> bool {
+    matches!(signum, 1 | 4 | 8 | 10 | 11 | 30)
+}
+
+/// Install/remove preserve process-visible handler state. The native runtime
+/// does not yet inject an asynchronous guest callback, so Raise acknowledges a
+/// valid request and logs when delivery would have been required.
+fn hle_install_exception_handler(ctx: &HleContext, args: &[u64]) -> u64 {
+    const SCE_KERNEL_ERROR_EAGAIN: u64 = 0x8002_000B;
+    let signum = args.first().copied().unwrap_or(u64::MAX) as i32;
+    let handler = args.get(1).copied().unwrap_or(0);
+    if !exception_signal_allowed(signum) || handler == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    match ctx.kernel.exception_handlers.entry(signum) {
+        dashmap::mapref::entry::Entry::Occupied(_) => SCE_KERNEL_ERROR_EAGAIN,
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(handler);
+            SCE_OK
+        }
+    }
+}
+
+fn hle_remove_exception_handler(ctx: &HleContext, args: &[u64]) -> u64 {
+    let signum = args.first().copied().unwrap_or(u64::MAX) as i32;
+    if !exception_signal_allowed(signum) {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    ctx.kernel.exception_handlers.remove(&signum);
+    SCE_OK
+}
+
+fn hle_raise_exception(ctx: &HleContext, args: &[u64]) -> u64 {
+    let target_thread = args.first().copied().unwrap_or(0);
+    let signum = args.get(1).copied().unwrap_or(u64::MAX) as i32;
+    if target_thread == 0 || !(0..128).contains(&signum) {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    if let Some(handler) = ctx.kernel.exception_handlers.get(&signum) {
+        warn!(
+            target_thread = format_args!("{target_thread:#x}"),
+            signum,
+            handler = format_args!("{:#x}", *handler),
+            "sceKernelRaiseException: guest handler is registered but asynchronous delivery is not implemented; acknowledging"
+        );
+    }
     SCE_OK
 }
 
@@ -6108,6 +6179,39 @@ mod tests {
     }
 
     #[test]
+    fn read_efault_does_not_consume_the_file_cursor() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x400);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let tmp =
+            std::env::temp_dir().join(format!("raeen-hle-read-efault-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("data.bin"), b"FIRST_SECOND").unwrap();
+        kernel.filesystem.set_game_directory(&tmp);
+
+        assert!(mem.write(0x20, b"/app0/data.bin\0"));
+        let fd = hle_open(&ctx, &[0x20, 0, 0]);
+        assert!((fd as i64) >= 3);
+
+        assert_eq!(
+            hle_read(&ctx, &[fd, 0x3ff, 5]) as i64,
+            -14,
+            "an invalid guest destination must return EFAULT"
+        );
+        assert_eq!(hle_read(&ctx, &[fd, 0x100, 5]), 5);
+        let mut first = [0u8; 5];
+        assert!(mem.read(0x100, &mut first));
+        assert_eq!(
+            &first, b"FIRST",
+            "EFAULT must be detected before the host read advances the fd"
+        );
+
+        assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn dev_urandom_opens_and_fills_guest_memory() {
         let kernel = raeen_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
@@ -6680,6 +6784,33 @@ mod tests {
         assert!(
             !kernel.memory.is_mapped(addr),
             "sceKernelMunmap must remove the VMM mapping record"
+        );
+    }
+
+    #[test]
+    fn exception_handler_family_validates_and_preserves_process_state() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(hle_install_exception_handler(&ctx, &[30, 0x1234]), SCE_OK);
+        assert_eq!(kernel.exception_handlers.get(&30).map(|v| *v), Some(0x1234));
+        assert_eq!(
+            hle_install_exception_handler(&ctx, &[30, 0x5678]),
+            0x8002_000B
+        );
+        assert_eq!(
+            kernel.exception_handlers.get(&30).map(|v| *v),
+            Some(0x1234),
+            "a duplicate registration must not replace the installed handler"
+        );
+        assert_eq!(hle_raise_exception(&ctx, &[1, 30]), SCE_OK);
+        assert_eq!(hle_remove_exception_handler(&ctx, &[30]), SCE_OK);
+        assert!(!kernel.exception_handlers.contains_key(&30));
+        assert_eq!(
+            hle_install_exception_handler(&ctx, &[2, 0x1234]),
+            SCE_KERNEL_ERROR_EINVAL
         );
     }
 }

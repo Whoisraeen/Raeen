@@ -41,6 +41,11 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register(
         "libScePad",
+        "scePadDeviceClassGetExtendedInformation",
+        hle_pad_device_class_get_extended_information,
+    );
+    registry.register(
+        "libScePad",
         "scePadSetTriggerEffect",
         hle_pad_set_trigger_effect,
     );
@@ -107,6 +112,23 @@ fn hle_pad_get_controller_information(ctx: &HleContext, args: &[u64]) -> u64 {
     info[0x10..0x14].copy_from_slice(&0i32.to_le_bytes()); // deviceClass: standard
     if !ctx.mem.write(info_ptr, &info) {
         warn!("scePadGetControllerInformation: info out-ptr {info_ptr:#x} not writable");
+        return PAD_ERROR_INVALID_ARG;
+    }
+    0
+}
+
+/// `scePadDeviceClassGetExtendedInformation(handle, info)`: report the primary
+/// pad as a standard DualSense and clear the device-class union. The 0x20-byte
+/// layout is cross-checked against shadPS4 and SharpEmu; deviceClass is the
+/// leading i32 and zero means a standard controller rather than a special
+/// guitar/drum/wheel peripheral.
+fn hle_pad_device_class_get_extended_information(ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0);
+    let info_ptr = args.get(1).copied().unwrap_or(0);
+    if handle != PRIMARY_PAD_HANDLE {
+        return PAD_ERROR_INVALID_HANDLE;
+    }
+    if info_ptr == 0 || !ctx.mem.write(info_ptr, &[0u8; 0x20]) {
         return PAD_ERROR_INVALID_ARG;
     }
     0
@@ -415,6 +437,14 @@ mod tests {
         );
         assert_eq!(info[0x0B], 1, "connectedCount");
         assert_eq!(info[0x0C], 1, "connected");
+        assert!(mem.write(0x200, &[0xEE; 0x20]));
+        assert_eq!(
+            hle_pad_device_class_get_extended_information(&ctx, &[1, 0x200]),
+            0
+        );
+        let mut extended = [0xEE; 0x20];
+        assert!(mem.read(0x200, &mut extended));
+        assert_eq!(extended, [0; 0x20], "standard-pad class data is empty");
         assert_eq!(
             hle_pad_get_controller_information(&ctx, &[2, 0x100]),
             PAD_ERROR_INVALID_HANDLE

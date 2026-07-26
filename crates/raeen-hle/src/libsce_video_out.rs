@@ -157,6 +157,14 @@ pub fn register(registry: &HleRegistry) {
         "sceVideoOutVrrUnpegFromFixedRate",
         hle_vrr_fixed_rate,
     );
+    // Host input sampling is already immediate; there is no display-latency
+    // controller to wait on, so this synchronization hint completes now.
+    registry.register_incomplete(
+        "libSceVideoOut",
+        "sceVideoOutLatencyControlWaitBeforeInput",
+        hle_ok,
+        "latency controller is not modeled; synchronization hint completes immediately",
+    );
 }
 
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {

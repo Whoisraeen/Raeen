@@ -3129,10 +3129,13 @@ dependencies = [
  "cbc",
  "goblin",
  "iced-x86",
+ "memchr",
  "memmap2",
  "raeen-core",
  "raeen-hle",
  "raeen-loader",
+ "serde",
+ "serde_json",
  "sha1",
  "tracing",
 ]

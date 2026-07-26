@@ -822,6 +822,10 @@ impl CommandProcessor {
             // dead-wait force-resume broke it (a glitch render). Execute them.
             pm4::IT_WRITE_DATA => self.cp_op_write_data(cmd_id, body, offset, true, mem),
             pm4::IT_RELEASE_MEM => self.cp_op_release_mem(cmd_id, body, offset, true, mem),
+            // The standard DMA op: a real guest-memory copy/fill a later
+            // packet in the same stream observes, so it must run in PM4 order
+            // here — not only in the HLE's eager submit-time decode.
+            pm4::IT_DMA_DATA => self.cp_op_it_dma_data(cmd_id, body, offset, mem),
             // These carry no guest-memory completion label on the RDNA2/AGC
             // draw path (EVENT_WRITE triggers kernel event queues, handled by
             // the HLE submit layer; ACQUIRE_MEM/CLEAR_STATE/etc. are cache/state
@@ -830,7 +834,6 @@ impl CommandProcessor {
             | pm4::IT_EVENT_WRITE
             | pm4::IT_EVENT_WRITE_EOP
             | pm4::IT_EVENT_WRITE_EOS
-            | pm4::IT_DMA_DATA
             | pm4::IT_CONTEXT_CONTROL
             | pm4::IT_CLEAR_STATE
             | pm4::IT_PFP_SYNC_ME => {
@@ -1111,6 +1114,120 @@ impl CommandProcessor {
                         byte_count,
                         offset,
                         "DMA_DATA source/destination not accessible guest memory — skipped"
+                    );
+                }
+            }
+        }
+        Ok(body_len)
+    }
+
+    /// Execute a standard `IT_DMA_DATA` (0x50) packet — the same guest-memory
+    /// copy/fill the AGC `R_DMA_DATA` custom op performs, in the standard PM4
+    /// encoding. Until this existed the packet was consumed without effect on
+    /// this walk and only the HLE's eager submit-time decode applied it, so a
+    /// packet earlier in the stream never observed the DMA'd data in PM4
+    /// order.
+    ///
+    /// Layout (KytyPS5 `CpOpDmaData`, pm4Handlers.cpp L2241; the model the
+    /// `raeen_gpu::agc::decode_submission` eager decoder already uses): body
+    /// `[control, src_lo, src_hi, dst_lo, dst_hi, command]`, `command` low 21
+    /// bits = `num_bytes`, `src_sel` = control>>29 & 3, `dst_sel` =
+    /// control>>20 & 3. Selectors 0 and 3 both mean guest memory; `src_sel` 2
+    /// is a 32-bit pattern fill with `src_lo` the value. Only the plain
+    /// guest-memory copy and the pattern fill are honoured, under the same
+    /// guards as the eager decoder (so the gate-off duplicate is the same
+    /// write twice). GDS/immediate forms, short packets, absent/read-only
+    /// [`GuestMemory`], and unreadable/unwritable ranges are consumed
+    /// silently or skip with one rate-limited warn each — never a stream
+    /// error (same posture as `cp_op_dma_data`).
+    fn cp_op_it_dma_data(
+        &mut self,
+        cmd_id: u32,
+        body: &[u32],
+        offset: u32,
+        mem: Option<&dyn GuestMemory>,
+    ) -> Result<u32, CpError> {
+        let body_len = pm4::body_dw(cmd_id);
+        // The modeled layouts need the full 6-dword body; anything shorter is
+        // not a form we model — consume it by its encoded length like any
+        // other unmodeled packet.
+        if body_len < 6 {
+            if self.first(SkipKey::Note("IT_DMA_DATA short packet")) {
+                warn!(
+                    cmd_id = format_args!("{cmd_id:#010x}"),
+                    body_dw = body_len,
+                    offset,
+                    "IT_DMA_DATA shorter than the modeled layout — consumed without effect"
+                );
+            }
+            return Ok(body_len);
+        }
+        let control = Self::body_at(body, 0, offset)?;
+        let num_bytes = Self::body_at(body, 5, offset)? & 0x1f_ffff;
+        let src_sel = (control >> 29) & 0x3;
+        let dst_sel = (control >> 20) & 0x3;
+        let dst = u64::from(Self::body_at(body, 3, offset)?)
+            | (u64::from(Self::body_at(body, 4, offset)?) << 32);
+        let fill = src_sel == 2 && matches!(dst_sel, 0 | 3);
+        let copy = matches!(src_sel, 0 | 3) && matches!(dst_sel, 0 | 3);
+        // Guards mirror the eager decoder exactly: an unmodeled selector form
+        // (GDS, …) or a degenerate packet is consumed without effect.
+        if !(fill || copy) || dst == 0 || num_bytes == 0 {
+            return Ok(body_len);
+        }
+        let Some(mem) = mem else {
+            if self.first(SkipKey::Note("IT_DMA_DATA needs GuestMemory")) {
+                warn!(offset, "IT_DMA_DATA needs a GuestMemory accessor — skipped");
+            }
+            return Ok(body_len);
+        };
+        if fill {
+            let value = Self::body_at(body, 1, offset)?;
+            // Whole dwords only, mirroring the HLE eager fill byte-for-byte
+            // (hardware requires num_bytes % 4 == 0; KytyPS5 EXITs otherwise).
+            let mut bytes = Vec::with_capacity(num_bytes as usize & !3);
+            for _ in 0..num_bytes / 4 {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            if mem.write_bytes(dst, &bytes) {
+                debug!(
+                    dst = format_args!("{dst:#x}"),
+                    value = format_args!("{value:#x}"),
+                    num_bytes,
+                    "IT_DMA_DATA fill executed"
+                );
+            } else if self.first(SkipKey::Note("IT_DMA_DATA fill unwritable")) {
+                warn!(
+                    dst = format_args!("{dst:#x}"),
+                    num_bytes,
+                    offset,
+                    "IT_DMA_DATA fill destination not writable guest memory — skipped"
+                );
+            }
+            return Ok(body_len);
+        }
+        let src = u64::from(Self::body_at(body, 1, offset)?)
+            | (u64::from(Self::body_at(body, 2, offset)?) << 32);
+        if src == 0 {
+            return Ok(body_len);
+        }
+        match mem.read_bytes(src, u64::from(num_bytes)) {
+            Some(bytes) if mem.write_bytes(dst, &bytes) => {
+                debug!(
+                    src = format_args!("{src:#x}"),
+                    dst = format_args!("{dst:#x}"),
+                    num_bytes,
+                    "IT_DMA_DATA copy executed"
+                );
+            }
+            _ => {
+                if self.first(SkipKey::Note("IT_DMA_DATA range unreadable/unwritable")) {
+                    warn!(
+                        src = format_args!("{src:#x}"),
+                        dst = format_args!("{dst:#x}"),
+                        num_bytes,
+                        offset,
+                        "IT_DMA_DATA source/destination not accessible guest memory — skipped"
                     );
                 }
             }
@@ -3101,7 +3218,8 @@ mod tests {
         assert_eq!(sink.draws.len(), 1);
     }
 
-    /// Byte-addressed read/write test memory for DMA_DATA copies.
+    /// Byte-addressed read/write test memory for DMA_DATA copies; dwords are
+    /// read byte-accurately so the same fixture also backs wait labels.
     struct DmaMem {
         base: u64,
         bytes: std::cell::RefCell<Vec<u8>>,
@@ -3116,8 +3234,14 @@ mod tests {
     }
 
     impl GuestMemory for DmaMem {
-        fn read_dwords(&self, _addr: u64, _count: u32) -> Option<Vec<u32>> {
-            None
+        fn read_dwords(&self, addr: u64, count: u32) -> Option<Vec<u32>> {
+            let range = self.range(addr, u64::from(count) * 4)?;
+            Some(
+                self.bytes.borrow()[range]
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
+                    .collect(),
+            )
         }
 
         fn read_bytes(&self, addr: u64, len: u64) -> Option<Vec<u8>> {
@@ -3210,6 +3334,141 @@ mod tests {
         cp.run(&dcb, &mut sink)
             .expect("DMA without memory must not kill the DCB");
         assert_eq!(sink.draws.len(), 1, "the stream continues to the draw");
+    }
+
+    /// The standard `IT_DMA_DATA` layout executes its guest-memory copy and
+    /// 32-bit pattern fill in-stream; an unmodeled selector form (GDS dst) is
+    /// consumed without effect.
+    #[test]
+    fn it_dma_data_executes_copy_and_fill_in_stream() {
+        let mem = DmaMem {
+            base: 0x9000,
+            bytes: std::cell::RefCell::new((0u8..192).collect()),
+        };
+        // src = base (bytes 0..16); dst regions initially hold 64.., 96.., 128..
+        let (src, dst_copy, dst_fill, dst_gds) = (0x9000u64, 0x9040u64, 0x9080u64, 0x9060u64);
+
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            // Copy, mem→mem (src_sel 0, dst_sel 0): both selectors zero.
+            header(7, pm4::IT_DMA_DATA, pm4::R_ZERO),
+            0,
+            src as u32,
+            (src >> 32) as u32,
+            dst_copy as u32,
+            (dst_copy >> 32) as u32,
+            16, // command: num_bytes = 16
+            // Fill (src_sel 2, dst_sel 3 = MemoryUsingL2): src_lo is the pattern.
+            header(7, pm4::IT_DMA_DATA, pm4::R_ZERO),
+            (2 << 29) | (3 << 20),
+            0xABAB_ABAB,
+            0,
+            dst_fill as u32,
+            (dst_fill >> 32) as u32,
+            16,
+            // GDS destination (dst_sel 1): not modeled — consumed silently.
+            header(7, pm4::IT_DMA_DATA, pm4::R_ZERO),
+            1 << 20,
+            src as u32,
+            (src >> 32) as u32,
+            dst_gds as u32,
+            (dst_gds >> 32) as u32,
+            16,
+        ];
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("DMA packets must not kill the DCB");
+
+        let bytes = mem.bytes.borrow();
+        let pattern: Vec<u8> = (0u8..16).collect();
+        assert_eq!(&bytes[0x40..0x50], &pattern[..], "standard copy landed");
+        assert_eq!(
+            &bytes[0x80..0x90],
+            &[0xABu8; 16][..],
+            "standard fill landed"
+        );
+        assert_eq!(
+            bytes[0x60..0x70],
+            (96u8..112).collect::<Vec<u8>>()[..],
+            "GDS form must not write"
+        );
+    }
+
+    /// Without a GuestMemory accessor a standard `IT_DMA_DATA` packet is
+    /// skipped (one warn), never a stream error — read-only embedders keep
+    /// working.
+    #[test]
+    fn it_dma_data_without_memory_is_skipped() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let mut dcb = vec![
+            header(7, pm4::IT_DMA_DATA, pm4::R_ZERO),
+            0,
+            0x9000,
+            0,
+            0x9040,
+            0,
+            16,
+        ];
+        dcb.extend(state_and_draw());
+        cp.run(&dcb, &mut sink)
+            .expect("DMA without memory must not kill the DCB");
+        assert_eq!(sink.draws.len(), 1, "the stream continues to the draw");
+    }
+
+    /// In-order proof: a standard `IT_DMA_DATA` copy lands before the packets
+    /// after it evaluate. One stream stages a label with WRITE_DATA, DMA-copies
+    /// it onto the address a later WAIT_MEM_32 polls, then draws — the walk
+    /// completes with no suspend. The control stream without the DMA suspends
+    /// on the same wait, proving the DMA'd data is what satisfied it.
+    #[test]
+    fn it_dma_data_runs_in_pm4_order_before_a_later_wait() {
+        let mem = DmaMem {
+            base: 0x9000,
+            bytes: std::cell::RefCell::new(vec![0u8; 0x200]),
+        };
+        let (label, staging) = (0x9000u64, 0x9100u64);
+
+        // Control: the wait on label == 0x2A with the label never written
+        // suspends — the wait genuinely gates on memory contents.
+        let mut control = wait32(label, !0, 3, 0x2A);
+        control.extend(state_and_draw());
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let outcome = cp
+            .run_resumable(&control, 0, &mut sink, Some(&mem))
+            .expect("control wait must not fault");
+        assert!(
+            matches!(outcome, RunOutcome::Suspended(_)),
+            "unmet wait suspends"
+        );
+        assert!(sink.draws.is_empty(), "work behind the wait must not run");
+
+        // Full stream: WRITE_DATA stages 0x2A, the DMA copies it onto the
+        // label, the wait then observes it and the draw behind the wait runs.
+        let mut dcb = write_data_agc(staging, 0x2A);
+        dcb.extend([
+            header(7, pm4::IT_DMA_DATA, pm4::R_ZERO),
+            0, // mem→mem
+            staging as u32,
+            (staging >> 32) as u32,
+            label as u32,
+            (label >> 32) as u32,
+            4, // command: num_bytes = 4
+        ]);
+        dcb.extend(wait32(label, !0, 3, 0x2A));
+        dcb.extend(state_and_draw());
+
+        let mut cp = CommandProcessor::new();
+        let outcome = cp
+            .run_resumable(&dcb, 0, &mut sink, Some(&mem))
+            .expect("in-order stream must not fault");
+        assert_eq!(
+            outcome,
+            RunOutcome::Completed,
+            "the DMA'd label satisfied the wait in-stream"
+        );
+        assert_eq!(sink.draws.len(), 1, "work behind the wait ran");
     }
 
     /// Once per distinct op per instance: the same unknown op twice warns once

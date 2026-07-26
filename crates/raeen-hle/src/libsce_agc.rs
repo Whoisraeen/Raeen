@@ -502,7 +502,12 @@ pub fn register(registry: &HleRegistry) {
     // `sceAgcDriverSetTFRing(ring, size)`: binds the tessellation-factor ring
     // buffer. No tessellation path yet, so record nothing and return OK
     // (SharpEmu `DriverSetTFRing` is the same no-op, AgcExports.cs).
-    registry.register("libSceAgcDriver", "sceAgcDriverSetTFRing", hle_ok_stub);
+    registry.register_incomplete(
+        "libSceAgcDriver",
+        "sceAgcDriverSetTFRing",
+        hle_ok_stub,
+        "tessellation-factor ring is accepted but not bound to host GPU state",
+    );
     // libSceAgcDriver introspection/registration surface. These are driver
     // bookkeeping (resource registration, capture/trace control, submission
     // validation) with no host GPU state to touch yet; on real hardware they
@@ -535,7 +540,12 @@ pub fn register(registry: &HleRegistry) {
         "sceAgcDriverRequestCaptureStart",
         "sceAgcDriverRequestCaptureStop",
     ] {
-        registry.register("libSceAgcDriver", name, hle_ok_stub);
+        registry.register_incomplete(
+            "libSceAgcDriver",
+            name,
+            hle_ok_stub,
+            "driver bookkeeping/capture surface has no host implementation",
+        );
     }
     registry.register(
         "libSceAgc",
@@ -1187,6 +1197,19 @@ fn next_gpu_timestamp(ctx: &HleContext) -> u64 {
     next
 }
 
+/// `RAEEN_DEFER_GPU_SIDE_EFFECTS=1` (transition gate, default OFF): stop
+/// applying CP-executed guest-memory side effects eagerly at submit.
+/// WRITE_DATA/RELEASE_MEM labels, RELEASE_MEM timestamps, and standard
+/// `IT_DMA_DATA` copies/fills are already written in PM4 order on the GPU
+/// worker (`cp_op_write_data` / `cp_op_release_mem` / `cp_op_it_dma_data` in
+/// kyty-graphics), so the eager duplicates race the in-order writes — and the
+/// two timestamp clocks can disagree. Side effects with no in-order executor
+/// yet (events, EOP interrupts, flips) still run here. Read per call, like
+/// the `RAEEN_TRACE_*` gates, so tests can flip it per case.
+fn defer_gpu_side_effects() -> bool {
+    std::env::var_os("RAEEN_DEFER_GPU_SIDE_EFFECTS").is_some()
+}
+
 fn submit_command_buffer(
     ctx: &HleContext,
     command_address: u64,
@@ -1211,72 +1234,88 @@ fn submit_command_buffer(
         return SCE_ERROR_INVALID_ARGUMENT;
     };
 
-    for write in &decoded.memory_writes {
-        if !ctx.mem.write(write.address, &write.data) {
-            tracing::warn!(
-                address = write.address,
-                bytes = write.data.len(),
-                packet_offset = write.packet_offset,
-                "AGC synchronization write targeted unreadable guest memory"
-            );
-            return SCE_ERROR_INVALID_ARGUMENT;
+    // WRITE_DATA / RELEASE_MEM labels and RELEASE_MEM timestamps are ALSO
+    // executed in PM4 order on the GPU worker (`cp_op_write_data` /
+    // `cp_op_release_mem` in kyty-graphics): the eager loops below duplicate
+    // them, racing the worker (the two timestamp clocks can even disagree).
+    // Until the ordered path is the proven default, both stay on — the eager
+    // copy keeps guest-CPU label polling alive (regression rules 1-2) — and
+    // `RAEEN_DEFER_GPU_SIDE_EFFECTS` selects the worker-only behavior.
+    let defer = defer_gpu_side_effects();
+    if !defer {
+        for write in &decoded.memory_writes {
+            if !ctx.mem.write(write.address, &write.data) {
+                tracing::warn!(
+                    address = write.address,
+                    bytes = write.data.len(),
+                    packet_offset = write.packet_offset,
+                    "AGC synchronization write targeted unreadable guest memory"
+                );
+                return SCE_ERROR_INVALID_ARGUMENT;
+            }
         }
-    }
-    // RELEASE_MEM `data_selection` 3 fences: hardware writes the GPU core
-    // clock counter — non-zero and monotonic. Writing the packet's zero
-    // immediate instead left titles polling a fence stuck at zero (measured:
-    // ASTRO.BOT render thread parked forever holding its context mutex).
-    for ts in &decoded.timestamp_writes {
-        let value = next_gpu_timestamp(ctx);
-        if !ctx.mem.write(ts.address, &value.to_le_bytes()) {
-            tracing::warn!(
-                address = ts.address,
-                packet_offset = ts.packet_offset,
-                "AGC timestamp fence targeted unreadable guest memory"
-            );
-            return SCE_ERROR_INVALID_ARGUMENT;
+        // RELEASE_MEM `data_selection` 3 fences: hardware writes the GPU core
+        // clock counter — non-zero and monotonic. Writing the packet's zero
+        // immediate instead left titles polling a fence stuck at zero (measured:
+        // ASTRO.BOT render thread parked forever holding its context mutex).
+        for ts in &decoded.timestamp_writes {
+            let value = next_gpu_timestamp(ctx);
+            if !ctx.mem.write(ts.address, &value.to_le_bytes()) {
+                tracing::warn!(
+                    address = ts.address,
+                    packet_offset = ts.packet_offset,
+                    "AGC timestamp fence targeted unreadable guest memory"
+                );
+                return SCE_ERROR_INVALID_ARGUMENT;
+            }
         }
     }
     // IT_DMA_DATA side effects: real guest-memory copies and pattern fills
-    // (texture/buffer uploads). Applied inline at submit: the guest-visible
-    // result matches hardware ordering closely enough for the titles measured.
-    for copy in &decoded.memory_copies {
-        let mut bytes = vec![0u8; copy.num_bytes as usize];
-        if !ctx.mem.read(copy.src, &mut bytes) {
-            tracing::warn!(
-                src = copy.src,
-                dst = copy.dst,
-                bytes = copy.num_bytes,
-                packet_offset = copy.packet_offset,
-                "AGC DMA copy read from unreadable guest memory"
-            );
-            return SCE_ERROR_INVALID_ARGUMENT;
+    // (texture/buffer uploads) are ALSO executed in PM4 order on the GPU
+    // worker (`cp_op_it_dma_data` in kyty-graphics), so the eager loops below
+    // duplicate them. Until the ordered path is the proven default, both stay
+    // on — the duplicate writes the same bytes to the same address, so the
+    // overlap is idempotent — and `RAEEN_DEFER_GPU_SIDE_EFFECTS` selects the
+    // worker-only behavior.
+    if !defer {
+        for copy in &decoded.memory_copies {
+            let mut bytes = vec![0u8; copy.num_bytes as usize];
+            if !ctx.mem.read(copy.src, &mut bytes) {
+                tracing::warn!(
+                    src = copy.src,
+                    dst = copy.dst,
+                    bytes = copy.num_bytes,
+                    packet_offset = copy.packet_offset,
+                    "AGC DMA copy read from unreadable guest memory"
+                );
+                return SCE_ERROR_INVALID_ARGUMENT;
+            }
+            if !ctx.mem.write(copy.dst, &bytes) {
+                tracing::warn!(
+                    src = copy.src,
+                    dst = copy.dst,
+                    bytes = copy.num_bytes,
+                    packet_offset = copy.packet_offset,
+                    "AGC DMA copy targeted unreadable guest memory"
+                );
+                return SCE_ERROR_INVALID_ARGUMENT;
+            }
         }
-        if !ctx.mem.write(copy.dst, &bytes) {
-            tracing::warn!(
-                src = copy.src,
-                dst = copy.dst,
-                bytes = copy.num_bytes,
-                packet_offset = copy.packet_offset,
-                "AGC DMA copy targeted unreadable guest memory"
-            );
-            return SCE_ERROR_INVALID_ARGUMENT;
-        }
-    }
-    for fill in &decoded.memory_fills {
-        let dwords = fill.num_bytes as usize / 4;
-        let mut bytes = Vec::with_capacity(dwords * 4);
-        for _ in 0..dwords {
-            bytes.extend_from_slice(&fill.value.to_le_bytes());
-        }
-        if !ctx.mem.write(fill.address, &bytes) {
-            tracing::warn!(
-                address = fill.address,
-                bytes = fill.num_bytes,
-                packet_offset = fill.packet_offset,
-                "AGC DMA fill targeted unreadable guest memory"
-            );
-            return SCE_ERROR_INVALID_ARGUMENT;
+        for fill in &decoded.memory_fills {
+            let dwords = fill.num_bytes as usize / 4;
+            let mut bytes = Vec::with_capacity(dwords * 4);
+            for _ in 0..dwords {
+                bytes.extend_from_slice(&fill.value.to_le_bytes());
+            }
+            if !ctx.mem.write(fill.address, &bytes) {
+                tracing::warn!(
+                    address = fill.address,
+                    bytes = fill.num_bytes,
+                    packet_offset = fill.packet_offset,
+                    "AGC DMA fill targeted unreadable guest memory"
+                );
+                return SCE_ERROR_INVALID_ARGUMENT;
+            }
         }
     }
     for event_id in &decoded.events {
@@ -1298,6 +1337,10 @@ fn submit_command_buffer(
     // Over-signaling is safe under the eager-completion model ("done" is
     // already true when submit returns), but revisit if a title registers
     // distinct events for graphics vs compute EOP and routes on data/ident.
+    // Under `RAEEN_DEFER_GPU_SIDE_EFFECTS` completion is no longer eager while
+    // these events still fire at submit — that over-signal is the known
+    // remainder, tracked as the events/EOP/flip step of the
+    // ordered-side-effects plan.
     if !decoded.eop_interrupts.is_empty() {
         let count = decoded.eop_interrupts.len() as u32;
         let last_context = decoded
@@ -4074,6 +4117,10 @@ mod tests {
 
     #[test]
     fn submit_signals_timestamp_fences_and_eop_interrupts() {
+        // Serializes with the side-effect env-gate tests (asserts the eager
+        // default policy) — see `SIDEFX_ENV_LOCK`.
+        let _guard = SIDEFX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("RAEEN_DEFER_GPU_SIDE_EFFECTS") };
         let (kernel, mem, alloc) = ctx_env();
         let ctx = test_ctx(&kernel, &mem, &alloc);
         // DCB at 0x900: one data_selection=3 (GPU timestamp) RELEASE_MEM
@@ -4815,6 +4862,142 @@ mod tests {
             gpu.waits.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "SuspendPoint must drain asynchronous GPU work before guest memory is recycled"
+        );
+    }
+
+    /// The env gate mutates submit behavior process-wide, and this module has
+    /// tests asserting BOTH policies. Serialize every side-effect submit test
+    /// on this lock so a parallel `cargo test` run cannot flip the gate under
+    /// another test's assertions.
+    static SIDEFX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// PM4 type-3 headers for the packets exercised below, from kyty's
+    /// `pm4::header(total_dw, op, r)` = `0xC000_0000 | (total_dw-2)<<16 |
+    /// op<<8 | (r&0x3f)<<2` (raeen-hle does not link kyty-graphics):
+    /// 5-dword IT_NOP/R_WRITE_DATA(0x15) and 7-dword IT_DMA_DATA(0x50).
+    const HDR_WRITE_DATA_1DW: u32 = 0xC000_0000 | (3 << 16) | (0x10 << 8) | (0x15 << 2);
+    const HDR_DMA_DATA: u32 = 0xC000_0000 | (5 << 16) | (0x50 << 8);
+
+    /// Minimal GPU sink: records submissions so the test can prove the
+    /// decoded buffer still went down the pipeline.
+    struct NoopGpu {
+        submissions: std::sync::atomic::AtomicUsize,
+    }
+    impl raeen_core::subsystems::GpuSubmissionSubsystem for NoopGpu {
+        fn submit(&self, _words: Vec<u32>, _queue: raeen_core::subsystems::GpuQueue) {
+            self.submissions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn map_shader_metadata(
+            &self,
+            _code_address: u64,
+            _data: raeen_core::subsystems::ShaderMappedData,
+        ) {
+        }
+        fn present_scanout(
+            &self,
+            _address: u64,
+            _descriptor: Option<raeen_core::subsystems::ScanoutDescriptor>,
+        ) {
+        }
+        fn wait_idle(&self) {}
+        fn stats(&self) -> raeen_core::subsystems::GpuSubmissionStats {
+            raeen_core::subsystems::GpuSubmissionStats {
+                submitted: self.submissions.load(std::sync::atomic::Ordering::Relaxed) as u64,
+                ..Default::default()
+            }
+        }
+    }
+
+    /// A DCB with one WRITE_DATA label (0x900 <- 0xAB) followed by one
+    /// standard IT_DMA_DATA copy (0xA00 -> 0xDEAD_0000, 8 bytes; the dst is
+    /// unmapped in TestMemory) at 0xB00, plus the submit descriptor at 0x280.
+    fn write_side_effect_dcb(ctx: &HleContext) {
+        let words = [
+            HDR_WRITE_DATA_1DW,
+            1, // control: destination 1 (memory), increment per dword
+            0x900,
+            0,    // label address
+            0xAB, // label value
+            HDR_DMA_DATA,
+            0, // control: src Memory(0), dst Memory(0)
+            0xA00,
+            0, // src
+            0xDEAD_0000,
+            0, // dst (unmapped)
+            8, // num_bytes
+        ];
+        let mut bytes = Vec::with_capacity(words.len() * 4);
+        for w in words {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        assert!(ctx.mem.write(0xB00, &bytes));
+        assert!(ctx.mem.write(0x280, &0xB00u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x288, &12u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x900, &0u64.to_le_bytes()));
+    }
+
+    /// Default policy (gate OFF): the eager path is preserved — the label IS
+    /// written at submit, and a faulting DMA copy fails the submission.
+    #[test]
+    fn submit_applies_side_effects_eagerly_by_default() {
+        let _guard = SIDEFX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("RAEEN_DEFER_GPU_SIDE_EFFECTS") };
+        let (kernel, mem, alloc) = ctx_env();
+        let gpu = NoopGpu {
+            submissions: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let ctx = crate::test_ctx_with_gpu(&kernel, &mem, &alloc, &gpu);
+        write_side_effect_dcb(&ctx);
+
+        assert_eq!(
+            hle_driver_submit_dcb(&ctx, &[0x280]),
+            SCE_ERROR_INVALID_ARGUMENT,
+            "fail-closed default: the unmapped DMA dst must fail the submit"
+        );
+        assert_eq!(
+            read_u64(&ctx, 0x900),
+            0xAB,
+            "the label write is eager by default (it ran before the DMA fault)"
+        );
+    }
+
+    /// Gate ON: the eager duplicate disappears — the worker owns the label
+    /// write now, so submit leaves it alone — and the faulting DMA copy
+    /// fails OPEN instead of erroring the submission.
+    #[test]
+    fn defer_gate_defers_labels_and_fails_open_on_bad_dma() {
+        let _guard = SIDEFX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct EnvReset;
+        impl Drop for EnvReset {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("RAEEN_DEFER_GPU_SIDE_EFFECTS") };
+            }
+        }
+        unsafe { std::env::set_var("RAEEN_DEFER_GPU_SIDE_EFFECTS", "1") };
+        let _reset = EnvReset;
+
+        let (kernel, mem, alloc) = ctx_env();
+        let gpu = NoopGpu {
+            submissions: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let ctx = crate::test_ctx_with_gpu(&kernel, &mem, &alloc, &gpu);
+        write_side_effect_dcb(&ctx);
+
+        assert_eq!(
+            hle_driver_submit_dcb(&ctx, &[0x280]),
+            0,
+            "fail-open under the gate: the unmapped DMA dst must not fail the submit"
+        );
+        assert_eq!(
+            read_u64(&ctx, 0x900),
+            0,
+            "under the gate the label write is deferred to the GPU worker"
+        );
+        assert_eq!(
+            gpu.submissions.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the decoded buffer must still reach the GPU pipeline"
         );
     }
 

@@ -647,6 +647,14 @@ impl VirtualFileSystem {
     /// the positional read because `position` must advance coherently — same-fd
     /// reads therefore chunk sequentially, exactly as before.
     pub fn read(&self, fd: Fd, count: usize) -> Result<Vec<u8>, std::io::Error> {
+        let mut bytes = vec![0u8; count];
+        let read = self.read_into(fd, &mut bytes)?;
+        bytes.truncate(read);
+        Ok(bytes)
+    }
+
+    /// Allocation-free sequential read into caller-owned storage.
+    pub fn read_into(&self, fd: Fd, out: &mut [u8]) -> Result<usize, std::io::Error> {
         let files = self.open_files.read();
         let Some(file) = files.get(&fd) else {
             return Err(std::io::Error::new(
@@ -661,35 +669,36 @@ impl VirtualFileSystem {
             ));
         }
         if file.random_device {
-            let mut bytes = vec![0u8; count];
-            getrandom::fill(&mut bytes)
+            getrandom::fill(out)
                 .map_err(|error| std::io::Error::other(format!("host entropy failed: {error}")))?;
-            return Ok(bytes);
+            return Ok(out.len());
         }
         let mut inner = file.inner.lock();
         let pos = inner.position;
         if let Some(data) = inner.data.as_ref() {
             let start = (pos as usize).min(data.len());
-            let end = start.saturating_add(count).min(data.len());
-            let result = data[start..end].to_vec();
+            let end = start.saturating_add(out.len()).min(data.len());
+            let read = end - start;
+            out[..read].copy_from_slice(&data[start..end]);
             // Advance by the bytes actually read (mirrors the reader branch
             // below). Setting `position = end` rewound the cursor to EOF when it
             // started past EOF, corrupting a following write's offset on an
             // O_RDWR fd; POSIX leaves the offset unchanged on a 0-byte EOF read.
-            inner.position = pos + result.len() as u64;
-            Ok(result)
+            inner.position = pos + read as u64;
+            Ok(read)
         } else if let Some((handle, len)) = file.reader.as_ref() {
             // Serve at most the bytes remaining to EOF (`count` is already capped
             // by the caller via READ_MAX_BYTES). Positional read: no `try_clone`
             // (a per-call Windows `DuplicateHandle`/Unix `dup`) and no cursor
             // seek — `seek_read`/`read_at` take `&File` and move nothing, so the
             // one shared handle serves this fd's sequential stream directly.
-            let want = usize::try_from((*len).saturating_sub(pos).min(count as u64)).unwrap_or(0);
-            let buf = positional_read(handle, pos, want)?;
-            inner.position = pos + buf.len() as u64;
-            Ok(buf)
+            let want =
+                usize::try_from((*len).saturating_sub(pos).min(out.len() as u64)).unwrap_or(0);
+            let read = positional_read_into(handle, pos, &mut out[..want])?;
+            inner.position = pos + read as u64;
+            Ok(read)
         } else {
-            Ok(Vec::new())
+            Ok(0)
         }
     }
 
@@ -734,6 +743,14 @@ impl VirtualFileSystem {
     /// cursor. Reads past end-of-file return the short (possibly empty) tail,
     /// like POSIX.
     pub fn pread(&self, fd: Fd, count: usize, offset: u64) -> Result<Vec<u8>, std::io::Error> {
+        let mut bytes = vec![0u8; count];
+        let read = self.pread_into(fd, &mut bytes, offset)?;
+        bytes.truncate(read);
+        Ok(bytes)
+    }
+
+    /// Allocation-free positional read into caller-owned storage.
+    pub fn pread_into(&self, fd: Fd, out: &mut [u8], offset: u64) -> Result<usize, std::io::Error> {
         let files = self.open_files.read();
         let Some(file) = files.get(&fd) else {
             return Err(std::io::Error::new(
@@ -748,10 +765,9 @@ impl VirtualFileSystem {
             ));
         }
         if file.random_device {
-            let mut bytes = vec![0u8; count];
-            getrandom::fill(&mut bytes)
+            getrandom::fill(out)
                 .map_err(|error| std::io::Error::other(format!("host entropy failed: {error}")))?;
-            return Ok(bytes);
+            return Ok(out.len());
         }
         // In-memory branch: read the write-back buffer coherently with a
         // concurrent same-fd `write`, still WITHOUT touching `position`.
@@ -760,8 +776,10 @@ impl VirtualFileSystem {
             let pos = usize::try_from(offset)
                 .unwrap_or(usize::MAX)
                 .min(data.len());
-            let end = pos.saturating_add(count).min(data.len());
-            return Ok(data[pos..end].to_vec());
+            let end = pos.saturating_add(out.len()).min(data.len());
+            let read = end - pos;
+            out[..read].copy_from_slice(&data[pos..end]);
+            return Ok(read);
         }
         drop(inner);
         // Reader branch: `reader` is immutable after open and `positional_read`
@@ -774,10 +792,11 @@ impl VirtualFileSystem {
         // read lock.
         if let Some((handle, len)) = file.reader.as_ref() {
             let start = offset.min(*len);
-            let want = usize::try_from((*len).saturating_sub(start).min(count as u64)).unwrap_or(0);
-            positional_read(handle, start, want)
+            let want =
+                usize::try_from((*len).saturating_sub(start).min(out.len() as u64)).unwrap_or(0);
+            positional_read_into(handle, start, &mut out[..want])
         } else {
-            Ok(Vec::new())
+            Ok(0)
         }
     }
 
@@ -1159,25 +1178,24 @@ fn flush_open_file(
 /// an explicit offset WITHOUT moving the handle's cursor, so they need neither
 /// the clone nor the seek and are safe to issue concurrently on one shared
 /// handle: the win compounds over the streamer's thousands of small reads.
-fn positional_read(
+fn positional_read_into(
     handle: &std::fs::File,
     offset: u64,
-    want: usize,
-) -> Result<Vec<u8>, std::io::Error> {
-    let mut buf = vec![0u8; want];
+    out: &mut [u8],
+) -> Result<usize, std::io::Error> {
     let mut filled = 0usize;
-    while filled < want {
+    while filled < out.len() {
         // `seek_read`/`read_at` may return short; loop until `want` or EOF.
         let n = loop {
             #[cfg(windows)]
             let result = {
                 use std::os::windows::fs::FileExt;
-                handle.seek_read(&mut buf[filled..], offset + filled as u64)
+                handle.seek_read(&mut out[filled..], offset + filled as u64)
             };
             #[cfg(unix)]
             let result = {
                 use std::os::unix::fs::FileExt;
-                handle.read_at(&mut buf[filled..], offset + filled as u64)
+                handle.read_at(&mut out[filled..], offset + filled as u64)
             };
             match result {
                 Ok(n) => break n,
@@ -1192,8 +1210,7 @@ fn positional_read(
         }
         filled += n;
     }
-    buf.truncate(filled);
-    Ok(buf)
+    Ok(filled)
 }
 
 fn normalize_mount_root(prefix: &str) -> String {
@@ -1373,6 +1390,33 @@ mod tests {
         let fd2 = vfs.open("/app0/save.bin", O_RDONLY, 0).unwrap();
         assert_eq!(vfs.read(fd2, 8).unwrap(), b"SAVEDATA");
         vfs.close(fd2).unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_into_and_pread_into_fill_callers_buffer_without_cursor_interference() {
+        use open_flags::O_RDONLY;
+        let dir = temp_dir("read-into");
+        std::fs::write(dir.join("stream.bin"), b"0123456789").unwrap();
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+        let fd = vfs.open("/app0/stream.bin", O_RDONLY, 0).unwrap();
+
+        let mut first = [0xEE; 4];
+        assert_eq!(vfs.read_into(fd, &mut first).unwrap(), 4);
+        assert_eq!(&first, b"0123");
+
+        let mut positional = [0xEE; 3];
+        assert_eq!(vfs.pread_into(fd, &mut positional, 7).unwrap(), 3);
+        assert_eq!(&positional, b"789");
+
+        let mut second = [0xEE; 4];
+        assert_eq!(vfs.read_into(fd, &mut second).unwrap(), 4);
+        assert_eq!(
+            &second, b"4567",
+            "pread_into must not disturb the sequential cursor"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

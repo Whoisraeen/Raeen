@@ -100,6 +100,37 @@ pub trait GuestMemory {
     /// nothing) if the write would fall outside the guest's mapped memory.
     fn write(&self, guest_addr: u64, data: &[u8]) -> bool;
 
+    /// Fill a validated writable guest range from caller-provided I/O.
+    ///
+    /// The callback returns how many leading bytes it initialized. Native
+    /// identity-mapped backends override this and expose the guest range
+    /// directly, eliminating the VFS `Vec` plus guest copy. The default keeps
+    /// test and alternate backends safe by staging and then calling [`write`].
+    /// Returning `None` means the guest range was invalid or the callback
+    /// reported more bytes than it was given.
+    fn fill_write(
+        &self,
+        guest_addr: u64,
+        len: usize,
+        fill: &mut dyn FnMut(&mut [u8]) -> usize,
+    ) -> Option<usize> {
+        let len_u64 = u64::try_from(len).ok()?;
+        let range = GuestRange::new(GuestAddress::new(guest_addr), len_u64)?;
+        if !self.validate_range(range, GuestAccess::Write) {
+            return None;
+        }
+        let mut staging = vec![0u8; len];
+        let written = fill(&mut staging);
+        if written > staging.len() {
+            return None;
+        }
+        if written == 0 || self.write(guest_addr, &staging[..written]) {
+            Some(written)
+        } else {
+            None
+        }
+    }
+
     /// Write into the guest CODE image (instrumentation patches: export-trap
     /// `int3`, `native_trap` prologues, one-shot restores). Distinct from
     /// [`write`] because a W^X backend makes the code image read-only, so a
@@ -594,6 +625,12 @@ pub struct HleRegistry {
     /// gateway's float bridge — so a float-returning handler's `u64` (the
     /// result's bit pattern) reaches the guest in the right register.
     float_returns: DashSet<String>,
+    /// Registered compatibility shims whose ABI is callable but whose real
+    /// subsystem behavior is intentionally incomplete.
+    ///
+    /// Keeping this beside the function map prevents coverage tooling from
+    /// presenting "resolved import" as "correctly implemented".
+    incomplete: DashMap<String, &'static str>,
 }
 
 impl HleRegistry {
@@ -604,6 +641,7 @@ impl HleRegistry {
             functions: DashMap::new(),
             nid_overrides: DashMap::new(),
             float_returns: DashSet::new(),
+            incomplete: DashMap::new(),
         };
 
         // Register all implemented HLE functions.
@@ -689,6 +727,41 @@ impl HleRegistry {
         let key = format!("{}::{}", library, function);
         debug!("HLE register: {}", key);
         self.functions.insert(key, implementation);
+    }
+
+    /// Register a callable compatibility shim while recording why it is not a
+    /// complete implementation. Coverage reports surface these entries in a
+    /// separate table.
+    pub fn register_incomplete(
+        &self,
+        library: &str,
+        function: &str,
+        implementation: HleFunction,
+        reason: &'static str,
+    ) {
+        let key = format!("{}::{}", library, function);
+        debug!("HLE register (incomplete): {key}: {reason}");
+        self.functions.insert(key.clone(), implementation);
+        self.incomplete.insert(key, reason);
+    }
+
+    /// Sorted `(library, function, reason)` rows for coverage/report tooling.
+    pub fn incomplete_registrations(&self) -> Vec<(String, String, String)> {
+        let mut rows = self
+            .incomplete
+            .iter()
+            .filter_map(|entry| {
+                entry.key().split_once("::").map(|(library, function)| {
+                    (
+                        library.to_string(),
+                        function.to_string(),
+                        (*entry.value()).to_string(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
     }
 
     /// Register an HLE function whose result is a `float`/`double` — SysV
@@ -1173,12 +1246,36 @@ mod tests {
         }
     }
 
+    /// Phase 1 inventory harvested from the eight-title Phase 0 run.
+    ///
+    /// Keep this as one family-level gate: resolving only the first fault would
+    /// force another full title run for each subsequent import.
+    #[test]
+    fn phase1_live_log_import_batch_is_registered() {
+        let registry = HleRegistry::new();
+        for (library, function) in [
+            ("libScePlayGoDialog", "scePlayGoDialogUpdateStatus"),
+            ("libScePlayGo", "scePlayGoGetOptionalChunk"),
+            ("libSceVideoOut", "sceVideoOutLatencyControlWaitBeforeInput"),
+            ("libScePad", "scePadDeviceClassGetExtendedInformation"),
+            ("libkernel", "scePthreadAttrGetstackaddr"),
+            ("libkernel_unity", "sceKernelInstallExceptionHandler"),
+            ("libkernel_unity", "sceKernelRaiseException"),
+        ] {
+            assert!(
+                registry.is_implemented(library, function),
+                "Phase 1 live-log import must resolve: {library}::{function}"
+            );
+        }
+    }
+
     #[test]
     fn registered_names_reflects_manual_registration() {
         let registry = HleRegistry {
             functions: DashMap::new(),
             nid_overrides: DashMap::new(),
             float_returns: DashSet::new(),
+            incomplete: DashMap::new(),
         };
         fn stub(_ctx: &HleContext, _args: &[u64]) -> u64 {
             0
@@ -1189,6 +1286,34 @@ mod tests {
         assert_eq!(
             names,
             vec![("libFoo".to_string(), "someFunction".to_string())]
+        );
+    }
+
+    #[test]
+    fn incomplete_registrations_are_reported_separately_from_resolution() {
+        let registry = HleRegistry {
+            functions: DashMap::new(),
+            nid_overrides: DashMap::new(),
+            float_returns: DashSet::new(),
+            incomplete: DashMap::new(),
+        };
+        fn shim(_ctx: &HleContext, _args: &[u64]) -> u64 {
+            0
+        }
+        registry.register_incomplete(
+            "libFoo",
+            "compatShim",
+            shim,
+            "test backend intentionally absent",
+        );
+        assert!(registry.is_implemented("libFoo", "compatShim"));
+        assert_eq!(
+            registry.incomplete_registrations(),
+            vec![(
+                "libFoo".to_string(),
+                "compatShim".to_string(),
+                "test backend intentionally absent".to_string()
+            )]
         );
     }
 
@@ -1204,6 +1329,7 @@ mod tests {
             functions: DashMap::new(),
             nid_overrides: DashMap::new(),
             float_returns: DashSet::new(),
+            incomplete: DashMap::new(),
         };
         let nid = 0x1234_5678_9abc_def0;
         registry.register_nid("libAlpha", "unknownAlpha", nid, first);
@@ -1326,6 +1452,7 @@ mod tests {
             functions: DashMap::new(),
             nid_overrides: DashMap::new(),
             float_returns: DashSet::new(),
+            incomplete: DashMap::new(),
         };
         // Same name, two libraries, SAME impl -> not a conflict.
         registry.register("libOne", "shared", a);

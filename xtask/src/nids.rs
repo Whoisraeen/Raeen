@@ -121,12 +121,23 @@ struct UnionMissing {
 }
 
 #[derive(Serialize)]
+struct IncompleteRegistration {
+    library: String,
+    function: String,
+    reason: String,
+}
+
+#[derive(Serialize)]
 struct CoverageReport {
     schema_version: u32,
     generated_unix_ms: u128,
     build_revision: String,
     dictionary_entries: usize,
     hle_registered: usize,
+    /// Callable compatibility shims that resolve imports but do not implement
+    /// the complete subsystem behavior. Kept explicit so import coverage is
+    /// never published as behavioral correctness.
+    registered_but_not_implemented: Vec<IncompleteRegistration>,
     games: Vec<GameCoverage>,
     /// Unresolved (provider, NID) across all analyzable games, most-shared
     /// first — the priority order for new HLE work.
@@ -595,6 +606,15 @@ pub fn coverage(args: &[String]) -> Result<()> {
     };
 
     let hle = HleRegistry::new();
+    let registered_but_not_implemented = hle
+        .incomplete_registrations()
+        .into_iter()
+        .map(|(library, function, reason)| IncompleteRegistration {
+            library,
+            function,
+            reason,
+        })
+        .collect::<Vec<_>>();
     let mut coverages = Vec::new();
     for game in &games {
         coverages.push(analyze_game(game, &hle, full));
@@ -672,13 +692,23 @@ pub fn coverage(args: &[String]) -> Result<()> {
         );
     }
 
+    println!();
+    println!(
+        "== REGISTERED BUT NOT FULLY IMPLEMENTED ({}) ==",
+        registered_but_not_implemented.len()
+    );
+    for row in &registered_but_not_implemented {
+        println!("  {}::{} — {}", row.library, row.function, row.reason);
+    }
+
     let report = CoverageReport {
-        schema_version: 1,
+        schema_version: 2,
         generated_unix_ms: now_ms(),
         build_revision: git_output(&["rev-parse", "--short=12", "HEAD"])
             .unwrap_or_else(|_| "unknown".into()),
         dictionary_entries: nid_names::len(),
         hle_registered: hle.registered_names().len(),
+        registered_but_not_implemented,
         games: coverages,
         union_unresolved,
     };

@@ -72,6 +72,16 @@ pub trait EventSubsystem: Send + Sync {
 pub trait VfsSubsystem: Send + Sync {
     fn open(&self, path: &str, flags: i32, mode: u32) -> std::io::Result<i32>;
     fn read(&self, fd: i32, count: usize) -> std::io::Result<Vec<u8>>;
+    /// Fill caller-owned storage from `fd`, advancing its cursor.
+    ///
+    /// Backends should override this to avoid allocating an intermediate
+    /// `Vec`. The default preserves compatibility with small test doubles.
+    fn read_into(&self, fd: i32, out: &mut [u8]) -> std::io::Result<usize> {
+        let bytes = self.read(fd, out.len())?;
+        let count = bytes.len().min(out.len());
+        out[..count].copy_from_slice(&bytes[..count]);
+        Ok(count)
+    }
     fn write(&self, fd: i32, bytes: &[u8]) -> std::io::Result<usize>;
     fn sync(&self, fd: i32) -> std::io::Result<()>;
     fn close(&self, fd: i32) -> std::io::Result<()>;

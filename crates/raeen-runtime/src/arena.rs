@@ -1839,6 +1839,35 @@ impl GuestMemory for GuestArena {
         true
     }
 
+    fn fill_write(
+        &self,
+        guest_addr: u64,
+        len: usize,
+        fill: &mut dyn FnMut(&mut [u8]) -> usize,
+    ) -> Option<usize> {
+        if len == 0 {
+            return (fill(&mut []) == 0).then_some(0);
+        }
+        let len_u64 = u64::try_from(len).ok()?;
+        let end = guest_addr.checked_add(len_u64)?;
+        if !self.ensure_range_backed_for_write(guest_addr, end) {
+            return None;
+        }
+        let state = self.lock_state();
+        if !Self::range_is_committed_locked(&state, guest_addr, end) {
+            return None;
+        }
+        // SAFETY: the arena owns every committed byte in the validated range
+        // and identity maps guest address A to host address A. The address-space
+        // lock remains held across the callback, so unmap cannot release it.
+        // Native guest threads may race these bytes exactly as they may race
+        // `GuestMemory::write`; conflicting access is guest synchronization's
+        // responsibility.
+        let out = unsafe { core::slice::from_raw_parts_mut(guest_addr as *mut u8, len) };
+        let written = fill(out);
+        (written <= len).then_some(written)
+    }
+
     fn validate_range(&self, range: GuestRange, _access: GuestAccess) -> bool {
         let Some(end) = range.end() else {
             return false;
@@ -3378,6 +3407,34 @@ mod tests {
         let mut out = [0u8; 32];
         assert!(arena.read(addr, &mut out));
         assert_eq!(out, pattern);
+    }
+
+    #[test]
+    fn guest_memory_fill_write_uses_validated_storage_and_rejects_before_io() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let addr = arena.alloc(16, 16).expect("heap alloc should succeed");
+        let mut calls = 0;
+        let written = arena.fill_write(addr, 16, &mut |out| {
+            calls += 1;
+            out[..6].copy_from_slice(b"DIRECT");
+            6
+        });
+        assert_eq!(written, Some(6));
+        assert_eq!(calls, 1);
+        let mut bytes = [0u8; 6];
+        assert!(arena.read(addr, &mut bytes));
+        assert_eq!(&bytes, b"DIRECT");
+
+        let invalid = arena.fill_write(1, 16, &mut |_| {
+            calls += 1;
+            16
+        });
+        assert_eq!(invalid, None);
+        assert_eq!(
+            calls, 1,
+            "invalid guest memory must be rejected before host I/O runs"
+        );
     }
 
     /// Inter-region guard pages are `PAGE_NOACCESS`, and the heap allocator

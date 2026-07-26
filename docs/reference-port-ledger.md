@@ -40,6 +40,30 @@ Claude `/goal` (≤200 chars):
 > The "delete when fully ported" condition applies only to trees that exist on
 > disk.
 
+### Phase 1 live-import batch 2026-07-25
+
+- **SharpEmu `74a5198`, `2272b9b`, `d3600c9` re-audit — DONE.** The required
+  AGC `*GetSize` probes and AJM BatchInitialize/JobDecode/StartBuffer/Wait/Cancel
+  paths were already present with exact packet-size tests and bounded
+  guest-memory writes. They are now classified honestly: AJM's silence decode
+  and synthetic completion appear in the generated registered-but-not-
+  implemented table instead of counting as full codec support.
+- **Pad extended device information — DONE.** Adapted the public 0x20-byte
+  standard-controller layout after comparing SharpEmu and GPL-2.0 shadPS4.
+  `scePadDeviceClassGetExtendedInformation` validates the primary handle,
+  clears the full guest output, and reports standard DualSense device class.
+- **pthread stack address + exception-handler compatibility — DONE/BOUNDED.**
+  SharpEmu and shadPS4 were used to cross-check `scePthreadAttrGetstackaddr`
+  state and the allowed exception signals. Raeen now retains stack address and
+  size in its existing attribute object and owns exception registrations in
+  the process kernel. Raising a registered exception is still explicitly
+  incomplete because asynchronous delivery into the target guest thread does
+  not exist.
+- **PlayGoDialog compatibility — DONE/BOUNDED.** shadPS4's public dialog
+  status/result constants were cross-checked; Raeen implements the complete
+  polling family as an immediately-completing headless dialog. This unblocks
+  titles without claiming a host PlayGo UI.
+
 ### SharpEmu refresh 2026-07-23 (559b7f0 → 6db095e, tag `v0.0.2-beta.5`, 21 commits)
 
 Upstream landed **working AudioOut2 audio (GTA V)** + **AGC cross-queue label** work.

@@ -50,7 +50,7 @@ pub struct SprxSegment {
 /// (variant-II x86-64 TLS: the block sits immediately *below* the TCB the
 /// FS base points at), and the linker resolves `TPOFF64`/`DTPOFF64`
 /// relocations against this template's layout.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TlsTemplate {
     /// `p_vaddr` — where the template's file bytes live in the image
     /// (informational; TLS offsets are template-relative, not image-relative).
@@ -69,7 +69,7 @@ pub struct TlsTemplate {
 /// runtime rebase them exactly like `PT_LOAD`; keeping them in the loader
 /// avoids title-specific address tables and lets the guest C++ runtime find
 /// exception tables for every loaded executable or PRX.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UnwindInfo {
     /// `PT_GNU_EH_FRAME` (`.eh_frame_hdr`) virtual address, or zero.
     pub eh_frame_hdr_vaddr: u64,
@@ -124,7 +124,7 @@ impl TlsTemplate {
 /// thread-local written through one model read back zero through the other —
 /// surfacing as a null-pointer crash deep inside the title's UI renderer with
 /// nothing pointing at TLS.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StaticTlsModule {
     /// Module name, for diagnostics.
     pub name: String,

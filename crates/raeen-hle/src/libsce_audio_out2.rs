@@ -44,6 +44,7 @@ use tracing::info;
 const OK: u64 = 0;
 const SCE_ERROR_INVALID_ARGUMENT: u64 = 0x8002_0016;
 const SCE_ERROR_MEMORY_FAULT: u64 = 0x8002_000E;
+const SCE_AUDIO_OUT2_ERROR_PORT_FULL: u64 = 0x8026_8012;
 
 const CONTEXT_PARAM_SIZE: usize = 0x40;
 const CONTEXT_MEMORY_SIZE: u64 = 0x10000;
@@ -423,6 +424,10 @@ static CONTEXTS: std::sync::LazyLock<dashmap::DashMap<u64, std::sync::Arc<Contex
 struct PortAudio {
     /// Owning context handle — the one `ContextPush` matches against.
     context: u64,
+    /// Gen5 `AudioOut2PortParam.port_type`. Real ABI handles are small rolling
+    /// integers, so the type lives in process-owned state rather than in
+    /// SharpEmu's synthetic compatibility handle bits.
+    port_type: u16,
     /// Source channels per frame (1 mono, 2 stereo, 8 for 7.1, …).
     channels: u32,
     /// `true` for float32 samples, `false` for signed 16-bit.
@@ -573,8 +578,19 @@ fn hle_port_create(ctx: &HleContext, args: &[u64]) -> u64 {
     if !(0..=255).contains(&ty) || param == 0 || out_port == 0 || context_handle == 0 {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
-    let port_id = (NEXT_PORT_ID.fetch_add(1, Ordering::Relaxed) as u32).wrapping_add(1) & 0xFF;
-    let handle = 0x2000_0000u64 | ((ty as u32 as u64) << 16) | port_id as u64;
+    let next_port = NEXT_PORT_ID.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if real_abi && !(1..=256).contains(&next_port) {
+        return SCE_AUDIO_OUT2_ERROR_PORT_FULL;
+    }
+    let port_id = (next_port as u32) & 0xFF;
+    let handle = if real_abi {
+        // KytyPS5's measured Gen5 ABI returns a small rolling id
+        // (`g_audioout2_next_port`, starting at 1). Keep SharpEmu's encoded
+        // compatibility handle only for its legacy four-argument convention.
+        next_port as u64
+    } else {
+        0x2000_0000u64 | ((ty as u32 as u64) << 16) | port_id as u64
+    };
 
     // Record the port's PCM format (from its AudioOut2PortParam) and owning
     // context so `ContextPush` can interpret and submit its buffer. Additive:
@@ -588,6 +604,7 @@ fn hle_port_create(ctx: &HleContext, args: &[u64]) -> u64 {
         handle,
         PortAudio {
             context: context_handle,
+            port_type: ty as u16,
             channels,
             is_float,
             sample_rate,
@@ -623,15 +640,19 @@ fn hle_port_destroy(_ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 /// `sceAudioOut2PortGetState(handle, state)`: fills a 0x20-byte state struct
-/// derived from the port type encoded in `handle` (type 2 = a
-/// personal/controller port: 1 channel; otherwise a main port: 2 channels).
+/// derived from the recorded Gen5 port type (type 2 = a personal/controller
+/// port: 1 channel; otherwise a main port: 2 channels). Unknown legacy handles
+/// fall back to SharpEmu's synthetic type bits.
 fn hle_port_get_state(ctx: &HleContext, args: &[u64]) -> u64 {
     let handle = args.first().copied().unwrap_or(0);
     let state = args.get(1).copied().unwrap_or(0);
     if handle == 0 || state == 0 {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
-    let ty = ((handle >> 16) & 0xFF) as i32;
+    let ty = PORTS
+        .get(&handle)
+        .map(|port| i32::from(port.port_type))
+        .unwrap_or_else(|| ((handle >> 16) & 0xFF) as i32);
     let mut buf = [0u8; 0x20];
     let output: u16 = if ty == 2 { 0x40 } else { 0x01 };
     let channels: u8 = if ty == 2 { 1 } else { 2 };
@@ -1006,6 +1027,7 @@ mod tests {
         // MAX_PCM_BYTES, so no read is attempted.
         let port = PortAudio {
             context: 0,
+            port_type: 0,
             channels: MAX_CHANNELS,
             is_float: true,
             sample_rate: 48_000,
@@ -1043,6 +1065,7 @@ mod tests {
     #[test]
     fn resolve_port_context_links_via_either_abi() {
         NEXT_CONTEXT_HANDLE.store(1, Ordering::Relaxed);
+        NEXT_PORT_ID.store(0, Ordering::Relaxed);
         let (kernel, mem, alloc) = big_env();
         let ctx = test_ctx(&kernel, &mem, &alloc);
         write_u32(&mem, 0x28, 48_000);
@@ -1058,12 +1081,15 @@ mod tests {
         // The production entry point accepts that three-argument ABI and reads
         // port_type from the parameter block instead of mistaking the context
         // handle for a type.
-        assert!(mem.write(0x70, &3u16.to_le_bytes()));
+        assert!(mem.write(0x70, &2u16.to_le_bytes()));
         write_u32(&mem, 0x74, 0x200);
         write_u32(&mem, 0x78, 48_000);
         assert_eq!(hle_port_create(&ctx, &[ctx_handle, 0x70, 0x90]), OK);
         let port_handle = read_u64(&mem, 0x90);
-        assert_eq!((port_handle >> 16) & 0xFF, 3);
+        assert!(
+            (1..=256).contains(&port_handle),
+            "the real Gen5 ABI returns KytyPS5's small rolling port handle, got {port_handle:#x}"
+        );
         assert_eq!(
             PORTS
                 .get(&port_handle)
@@ -1071,6 +1097,26 @@ mod tests {
                 .context,
             ctx_handle
         );
+        assert_eq!(hle_port_get_state(&ctx, &[port_handle, 0xB8]), OK);
+        let mut state = [0u8; 0x20];
+        assert!(mem.read(0xB8, &mut state));
+        assert_eq!(
+            u16::from_le_bytes(state[0..2].try_into().expect("fixed slice")),
+            0x40,
+            "the port type remains available through process-owned port state"
+        );
+        assert_eq!(state[2], 1, "personal/controller ports are mono");
+
+        // ASTRO.BOT's third real-ABI port is an object-port class (0x0100).
+        // That is a valid u16 Gen5 port type even though it cannot fit in
+        // SharpEmu's synthetic 8-bit type field.
+        assert!(mem.write(0x70, &0x0100u16.to_le_bytes()));
+        assert_eq!(
+            hle_port_create(&ctx, &[ctx_handle, 0x70, 0xD8]),
+            OK,
+            "real Gen5 object-port types must not inherit legacy 8-bit validation"
+        );
+        assert!((1..=256).contains(&read_u64(&mem, 0xD8)));
         // SharpEmu ABI: context in arg3.
         assert_eq!(
             resolve_port_context(&[0, 0x70, 0x90, ctx_handle]),

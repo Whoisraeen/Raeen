@@ -48,24 +48,37 @@ pub fn register(registry: &HleRegistry) {
     // The guest owns the batch storage, batches complete synchronously, and NO
     // samples are decoded — silence, not a hang. These are Bink/AJM hot-path
     // calls, so none of them WARN per call.
-    registry.register(
+    registry.register_incomplete(
         "libSceAjm",
         "sceAjmBatchInitialize",
         hle_ajm_batch_initialize,
+        "batch descriptor is modeled but no codec backend is attached",
     );
-    registry.register(
+    registry.register_incomplete(
         "libSceAjm",
         "sceAjmBatchJobDecode",
         hle_ajm_batch_job_decode,
+        "silence compatibility decode; compressed audio is not decoded",
     );
     registry.register("libSceAjm", "sceAjmBatchStart", hle_ajm_batch_start);
-    registry.register(
+    registry.register_incomplete(
         "libSceAjm",
         "sceAjmBatchStartBuffer",
         hle_ajm_batch_start_buffer,
+        "batch completes synchronously without executing codec jobs",
     );
-    registry.register("libSceAjm", "sceAjmBatchWait", hle_ajm_batch_wait);
-    registry.register("libSceAjm", "sceAjmBatchCancel", hle_ok);
+    registry.register_incomplete(
+        "libSceAjm",
+        "sceAjmBatchWait",
+        hle_ajm_batch_wait,
+        "batch completion is synthetic because codec jobs are not executed",
+    );
+    registry.register_incomplete(
+        "libSceAjm",
+        "sceAjmBatchCancel",
+        hle_ok,
+        "no asynchronous AJM work exists to cancel",
+    );
     registry.register("libSceAjm", "sceAjmBatchErrorDump", hle_ok);
     // The remaining PS5-only batch-*builder* names have no public ABI; keep the
     // unblock stub that logs its arguments once so a real run records the shape

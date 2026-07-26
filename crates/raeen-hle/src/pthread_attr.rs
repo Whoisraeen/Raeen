@@ -39,6 +39,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadAttrGetstacksize", hle_get_stacksize);
     registry.register("libkernel", "scePthreadAttrSetstack", hle_set_stack);
     registry.register("libkernel", "scePthreadAttrGetstack", hle_get_stack);
+    registry.register("libkernel", "scePthreadAttrGetstackaddr", hle_get_stackaddr);
     registry.register(
         "libkernel",
         "scePthreadAttrSetsolosched",
@@ -198,9 +199,11 @@ fn hle_set_stacksize(ctx: &HleContext, args: &[u64]) -> u64 {
 /// asserts (engine `Thread.cpp:120`) and then faults if it returns an error.
 /// Record the size like `scePthreadAttrSetstacksize` and return OK.
 fn hle_set_stack(ctx: &HleContext, args: &[u64]) -> u64 {
+    let address = args.get(1).copied().unwrap_or(0);
     let size = args.get(2).copied().unwrap_or(0);
     with_attr(ctx, args.first().copied().unwrap_or(0), |a| {
-        a.stack_size = size
+        a.stack_address = address;
+        a.stack_size = size;
     })
 }
 
@@ -261,12 +264,9 @@ fn hle_get_guardsize(ctx: &HleContext, args: &[u64]) -> u64 {
 /// read back the stack configuration recorded by `scePthreadAttrSetstack` /
 /// `scePthreadAttrSetstacksize`.
 ///
-/// The address reads back as 0 on purpose: `scePthreadAttrSetstack` does NOT
-/// honor a guest-chosen stack base (the runtime's scheduler owns stack
-/// allocation — see its comment), so the attr object holds no base and 0 is
-/// the truthful stored value. Echoing the requested base back would report a
-/// stack the created thread never uses. The SIZE is real — it was recorded
-/// and is what creation will ask the scheduler for.
+/// The attribute object preserves both requested fields. Thread creation may
+/// still choose a scheduler-owned stack; that execution policy does not change
+/// the ABI requirement that attribute getters return what the guest configured.
 fn hle_get_stack(ctx: &HleContext, args: &[u64]) -> u64 {
     let attr = args.first().copied().unwrap_or(0);
     let addr_out = args.get(1).copied().unwrap_or(0);
@@ -277,9 +277,23 @@ fn hle_get_stack(ctx: &HleContext, args: &[u64]) -> u64 {
     let Some(state) = read_attr(ctx, attr) else {
         return EINVAL;
     };
-    if !ctx.mem.write(addr_out, &0u64.to_le_bytes())
+    if !ctx.mem.write(addr_out, &state.stack_address.to_le_bytes())
         || !ctx.mem.write(size_out, &state.stack_size.to_le_bytes())
     {
+        return EINVAL;
+    }
+    OK
+}
+
+/// `scePthreadAttrGetstackaddr(attr, void **stackAddrOut)`: the single-field
+/// form used by Unity's pthread wrapper.
+fn hle_get_stackaddr(ctx: &HleContext, args: &[u64]) -> u64 {
+    let attr = args.first().copied().unwrap_or(0);
+    let out = args.get(1).copied().unwrap_or(0);
+    let Some(state) = read_attr(ctx, attr) else {
+        return EINVAL;
+    };
+    if out == 0 || !ctx.mem.write(out, &state.stack_address.to_le_bytes()) {
         return EINVAL;
     }
     OK
@@ -371,12 +385,12 @@ mod tests {
     }
 
     #[test]
-    fn getstack_reports_the_recorded_size_and_no_base() {
+    fn getstack_family_round_trips_the_recorded_address_and_size() {
         let (kernel, mem, alloc) = ctx_env();
         let ctx = test_ctx(&kernel, &mem, &alloc);
         let attr = 0x300;
         hle_attr_init(&ctx, &[attr]);
-        // Setstack records only the size (the base is not honored).
+        // Attribute getters round-trip both configured fields.
         assert_eq!(hle_set_stack(&ctx, &[attr, 0xDEAD_0000, 0x20_0000]), OK);
         let addr_out = 0x400;
         let size_out = 0x408;
@@ -385,14 +399,18 @@ mod tests {
         let mut s = [0u8; 8];
         assert!(mem.read(addr_out, &mut a));
         assert!(mem.read(size_out, &mut s));
-        assert_eq!(u64::from_le_bytes(a), 0, "no guest-chosen base is honored");
+        assert_eq!(u64::from_le_bytes(a), 0xDEAD_0000);
         assert_eq!(u64::from_le_bytes(s), 0x20_0000);
+        assert_eq!(hle_get_stackaddr(&ctx, &[attr, addr_out]), OK);
+        assert!(mem.read(addr_out, &mut a));
+        assert_eq!(u64::from_le_bytes(a), 0xDEAD_0000);
         // NULL out-pointers and unknown attrs are EINVAL.
         assert_eq!(hle_get_stack(&ctx, &[attr, 0, size_out]), EINVAL);
         assert_eq!(hle_get_stack(&ctx, &[0x900, addr_out, size_out]), EINVAL);
 
         let registry = HleRegistry::new();
         assert!(registry.is_implemented("libkernel", "scePthreadAttrGetstack"));
+        assert!(registry.is_implemented("libkernel", "scePthreadAttrGetstackaddr"));
     }
 
     #[test]

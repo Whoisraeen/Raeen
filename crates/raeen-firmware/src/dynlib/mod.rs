@@ -137,7 +137,7 @@ pub struct SymbolRef {
 
 /// One export: a defined symbol this module provides to others, at a given
 /// (module-relative) virtual address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SymbolExport {
     pub nid: u64,
     pub value: u64,

@@ -10,6 +10,7 @@
 //! `PlayGoExports`.
 
 use crate::{HleContext, HleRegistry};
+use std::sync::atomic::{AtomicI32, Ordering};
 use tracing::{debug, warn};
 
 /// `SCE_OK`.
@@ -19,6 +20,8 @@ const SCE_OK: u64 = 0;
 const LOCUS_LOCAL_FAST: u8 = 3;
 /// A fixed PlayGo handle handed back by `scePlayGoOpen`.
 const PLAYGO_HANDLE: u32 = 1;
+const DIALOG_STATUS_NONE: i32 = 0;
+static PLAYGO_DIALOG_STATUS: AtomicI32 = AtomicI32::new(DIALOG_STATUS_NONE);
 /// Cap on how many chunk loci one `scePlayGoGetLocus` will write, bounding
 /// the host staging buffer against a wild `numberOfEntries`.
 const MAX_ENTRIES: u64 = 1 << 16;
@@ -43,6 +46,12 @@ pub fn register(registry: &HleRegistry) {
         "scePlayGoGetSupportedOptionalChunk",
         hle_get_supported_optional_chunk,
     );
+    registry.register_incomplete(
+        "libScePlayGo",
+        "scePlayGoGetOptionalChunk",
+        hle_get_supported_optional_chunk,
+        "ABI inferred; reports no optional chunks because PlayGo metadata is not parsed",
+    );
     registry.register("libScePlayGo", "scePlayGoGetProgress", hle_get_progress);
     registry.register("libScePlayGo", "scePlayGoGetToDoList", hle_get_todo_list);
     registry.register("libScePlayGo", "scePlayGoGetEta", hle_ok);
@@ -55,6 +64,52 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libScePlayGo", "scePlayGoSetInstallSpeed", hle_ok);
     registry.register("libScePlayGo", "scePlayGoSetTodoList", hle_ok);
     registry.register("libScePlayGo", "scePlayGoPrefetch", hle_ok);
+
+    // Register the complete dialog family together. Raeen has no host PlayGo
+    // popup; the headless compatibility behavior matches shadPS4: calls
+    // succeed, status remains NONE, and GetResult reports the proceed value.
+    registry.register_incomplete(
+        "libScePlayGoDialog",
+        "scePlayGoDialogInitialize",
+        hle_playgo_dialog_initialize,
+        "headless compatibility dialog; no host PlayGo UI",
+    );
+    registry.register_incomplete(
+        "libScePlayGoDialog",
+        "scePlayGoDialogTerminate",
+        hle_playgo_dialog_close,
+        "headless compatibility dialog; no host PlayGo UI",
+    );
+    registry.register_incomplete(
+        "libScePlayGoDialog",
+        "scePlayGoDialogOpen",
+        hle_playgo_dialog_open,
+        "headless compatibility dialog; no host PlayGo UI",
+    );
+    registry.register_incomplete(
+        "libScePlayGoDialog",
+        "scePlayGoDialogClose",
+        hle_playgo_dialog_close,
+        "headless compatibility dialog; no host PlayGo UI",
+    );
+    registry.register_incomplete(
+        "libScePlayGoDialog",
+        "scePlayGoDialogGetStatus",
+        hle_playgo_dialog_status,
+        "headless compatibility dialog; no host PlayGo UI",
+    );
+    registry.register_incomplete(
+        "libScePlayGoDialog",
+        "scePlayGoDialogUpdateStatus",
+        hle_playgo_dialog_status,
+        "headless compatibility dialog; no host PlayGo UI",
+    );
+    registry.register_incomplete(
+        "libScePlayGoDialog",
+        "scePlayGoDialogGetResult",
+        hle_playgo_dialog_get_result,
+        "headless compatibility dialog; no host PlayGo UI",
+    );
 }
 
 /// A generic success stub for the PlayGo calls whose only meaningful effect
@@ -209,6 +264,44 @@ fn hle_get_language_mask(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
+fn hle_playgo_dialog_initialize(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    PLAYGO_DIALOG_STATUS.store(DIALOG_STATUS_NONE, Ordering::Relaxed);
+    SCE_OK
+}
+
+fn hle_playgo_dialog_open(_ctx: &HleContext, args: &[u64]) -> u64 {
+    const COMMON_DIALOG_ERROR_ARG_NULL: u64 = 0x80B8_000D;
+    if args.first().copied().unwrap_or(0) == 0 {
+        return COMMON_DIALOG_ERROR_ARG_NULL;
+    }
+    PLAYGO_DIALOG_STATUS.store(DIALOG_STATUS_NONE, Ordering::Relaxed);
+    SCE_OK
+}
+
+fn hle_playgo_dialog_close(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    PLAYGO_DIALOG_STATUS.store(DIALOG_STATUS_NONE, Ordering::Relaxed);
+    SCE_OK
+}
+
+fn hle_playgo_dialog_status(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    PLAYGO_DIALOG_STATUS.load(Ordering::Relaxed) as u32 as u64
+}
+
+fn hle_playgo_dialog_get_result(ctx: &HleContext, args: &[u64]) -> u64 {
+    const COMMON_DIALOG_ERROR_ARG_NULL: u64 = 0x80B8_000D;
+    let result = args.first().copied().unwrap_or(0);
+    if result == 0 {
+        return COMMON_DIALOG_ERROR_ARG_NULL;
+    }
+    let mut bytes = [0u8; 0x28];
+    // shadPS4's compatibility result uses value 3 to let titles proceed.
+    bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+    if !ctx.mem.write(result, &bytes) {
+        return COMMON_DIALOG_ERROR_ARG_NULL;
+    }
+    SCE_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +398,21 @@ mod tests {
         let progress = u64::from_le_bytes(p[0..8].try_into().unwrap());
         let total = u64::from_le_bytes(p[8..16].try_into().unwrap());
         assert_eq!(progress, total, "progress == total means install complete");
+    }
+
+    #[test]
+    fn playgo_dialog_family_is_headless_and_returns_proceed_result() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_playgo_dialog_initialize(&ctx, &[]), SCE_OK);
+        assert_eq!(hle_playgo_dialog_open(&ctx, &[0x100]), SCE_OK);
+        assert_eq!(hle_playgo_dialog_status(&ctx, &[]), 0);
+        assert_eq!(hle_playgo_dialog_get_result(&ctx, &[0x200]), SCE_OK);
+        let mut result = [0u8; 8];
+        assert!(mem.read(0x200, &mut result));
+        assert_eq!(u32::from_le_bytes(result[4..8].try_into().unwrap()), 3);
+        assert_eq!(hle_playgo_dialog_open(&ctx, &[0]), 0x80B8_000D);
     }
 }

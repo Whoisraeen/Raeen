@@ -260,6 +260,12 @@ pub struct OrbisKernel {
     /// Guest pthread thread-attribute objects, keyed by both the guest
     /// `pthread_attr_t` address and its allocated handle.
     pub pthread_attrs: DashMap<u64, PthreadAttr>,
+    /// Process exception handlers installed through
+    /// `sceKernelInstallExceptionHandler`, keyed by Orbis signal number.
+    ///
+    /// Delivery is a runtime concern; keeping the registration in process
+    /// state still gives install/remove/raise coherent ABI behavior.
+    pub exception_handlers: DashMap<i32, u64>,
     /// Kernel event flags, keyed by handle.
     pub kernel_event_flags: DashMap<u64, EventFlag>,
     /// Next event-flag handle to hand out.
@@ -632,6 +638,9 @@ pub struct PthreadAttr {
     pub detach_state: i32,
     /// Requested stack size in bytes (default 1 MiB).
     pub stack_size: u64,
+    /// Guest-requested stack base. The current scheduler may allocate its own
+    /// stack, but attribute getters must still round-trip the configured value.
+    pub stack_address: u64,
     /// Guard-page size in bytes (default 4 KiB).
     pub guard_size: u64,
     /// Scheduling policy (default 1).
@@ -651,6 +660,7 @@ impl Default for PthreadAttr {
         Self {
             detach_state: 0,
             stack_size: 0x10_0000,
+            stack_address: 0,
             guard_size: 0x1000,
             sched_policy: 1,
             sched_priority: 700,
@@ -976,6 +986,7 @@ impl OrbisKernel {
             pthread_conds: DashMap::new(),
             pthread_condattr_clocks: DashMap::new(),
             pthread_attrs: DashMap::new(),
+            exception_handlers: DashMap::new(),
             kernel_event_flags: DashMap::new(),
             kernel_event_flag_next: std::sync::atomic::AtomicU64::new(1),
             kernel_event_flag_live: std::sync::atomic::AtomicU32::new(0),
@@ -1609,6 +1620,10 @@ impl raeen_core::subsystems::VfsSubsystem for OrbisKernel {
 
     fn read(&self, fd: i32, count: usize) -> std::io::Result<Vec<u8>> {
         self.filesystem.read(fd, count)
+    }
+
+    fn read_into(&self, fd: i32, out: &mut [u8]) -> std::io::Result<usize> {
+        self.filesystem.read_into(fd, out)
     }
 
     fn write(&self, fd: i32, bytes: &[u8]) -> std::io::Result<usize> {

@@ -1,3 +1,63 @@
+- BATTLE-READY WORKFLOW PHASE 1 GREEN — HLE BREADTH + LOAD PATH
+  (2026-07-25; working tree at `01f7b613911a+dirty`, no commit; Phase 2 may
+  now start):
+  * INVENTORY + FAMILY BATCH: the Phase 0 nine-binary harvest found seven
+    actually-called missing imports in Avatar/Subnautica. All seven are
+    registered by family with bounded guest-memory-aware behavior:
+    PlayGo/Dialog, VideoOut latency control, standard DualSense class
+    information, pthread stack attributes, and kernel exception registration/
+    acknowledgement. Unsupported asynchronous exception delivery, host dialog
+    UI/PlayGo metadata, and latency-controller semantics stay explicitly
+    incomplete.
+  * HONEST COVERAGE: `HleRegistry::register_incomplete` plus schema-v2
+    `cargo xtask nids coverage` emits a deterministic
+    `registered_but_not_implemented` table. The sanitized
+    `artifacts/compat/phase1-nid-coverage.json` covers all nine binaries and
+    reports 40 incomplete registrations. The hash-gated name hunt scanned
+    48,660,122 candidates without admitting guesses; eight measured imports
+    remain anonymous. Required AGC sizing and AJM silence-path audits remain
+    classified as incomplete where they do not implement real driver/codec
+    behavior.
+  * DIRECT VFS READS: `VfsSubsystem`, `VirtualFileSystem`, HLE guest memory,
+    and `GuestArena` now support validated caller-buffer reads. Retail reads no
+    longer clone handles, allocate/copy a staging `Vec`, or hold a global write
+    lock. Invalid guest output ranges fail before host I/O, so `read(EFAULT)`
+    no longer consumes the shared file cursor; `pread` remains positional.
+  * LINK/LOAD CACHE: syscall/CPUID patching prefilters raw opcodes; relocation
+    linking resolves each provider/NID/table-marker once per imported symbol.
+    A version/source/HLE/input/dependency-keyed persistent cache stores the
+    decrypted+linked+patched image as raw bytes plus bounded JSON metadata under
+    a gitignored machine-local directory. Cache restore refreshes per-process
+    HLE data and replays every module export, including modules without unwind
+    records. Corrupt or structurally invalid entries fail open to a cold load.
+    The cache may contain decrypted user-owned executable bytes and must never
+    be committed or published.
+  * MEASURED EXIT GATE: isolated release SHA-256
+    `EA891F1C76FA7B27E6ED899755EA5DE1564061373675F013E8F82AF5899D875F`
+    produced
+    `artifacts/compat/phase1-final.json` / `run-1785034944986`. Seven of eight
+    distinct titles exceeded 30 seconds (seven of nine registered binaries;
+    the second Dragon Ball image exits early), with zero
+    unimplemented-import-death or called-unresolved markers. Minecraft ran
+    180.4 s and retained exactly 8192 flips, matching Phase 0. ASTRO's fresh
+    cold process load was 7612 ms versus the workflow's ~27 s baseline
+    (71.8% reduction). Avatar improved from the Phase 0 57.8 s shader crash to
+    a 180.6 s timeout with 132 flips, but still reports 8565 unsupported-shader
+    errors; this is not a gameplay claim.
+  * WARM-CACHE CAVEAT: a controlled ASTRO relaunch did hit the persistent cache
+    and restored its 272,886,072-byte image/two dependencies, but measured
+    6495 ms. That is only a modest improvement over the 7612 ms cold path, not
+    the workflow's aspirational tens-of-milliseconds result. The formal Phase 1
+    gate is green; eliminating large-image read/hash/materialization cost
+    remains a measured optimization, not hidden success.
+  * VERIFICATION: raeen-core 10/10; raeen-kernel 40/40 plus two homebrew tests;
+    raeen-hle 428/428; raeen-firmware 123 library + 11 NID + 3 homebrew + 3
+    transitive tests; raeen-runtime 75/75 library + 46/46 native execution
+    (one manual benchmark ignored) + M3 fixture; scoped clippy across the
+    touched core/kernel/HLE/firmware/runtime crates is clean with
+    `-D warnings`; formatting is clean. Phase 1 is compatibility/load evidence,
+    not a new M2-M5 compatibility claim.
+
 - BATTLE-READY WORKFLOW PHASE 0 GREEN (2026-07-25; working tree at
   `01f7b613911a+dirty`, no commit; Phase 1 NOT STARTED):
   * TASK 0.1: rewrote the local `AGENTS.md` from current commercial-title

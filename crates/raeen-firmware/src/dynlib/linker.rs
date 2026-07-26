@@ -111,7 +111,7 @@ pub struct TlsAssignment {
 /// One HLE import resolved during linking: which `library::function` a
 /// relocation's slot now points at, via its deterministic trampoline
 /// address.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HleTrampoline {
     pub library: String,
     pub function: String,
@@ -137,7 +137,7 @@ pub struct HleTrampoline {
 /// Measured on a retail title, 87414 import relocations break down as 86592
 /// `R_X86_64_64`, 64 `GLOB_DAT`, and **758** `JUMP_SLOT`. The honest size of
 /// the HLE gap is 758, not 87414.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UnresolvedImport {
     pub nid: u64,
     /// The ELF relocation type (`R_X86_64_*`) of the slot left unresolved.
@@ -151,7 +151,7 @@ pub struct UnresolvedImport {
 /// This is the reverse map the runtime needs: a fault at `addr` names `nid`,
 /// and `library` says which library should have supplied it — turning an
 /// opaque access violation into "implement this function next".
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UnresolvedStub {
     pub nid: u64,
     /// The importing library's name (from the module's import-library table),
@@ -173,7 +173,7 @@ pub struct UnresolvedStub {
 /// `mov rdx,[rcx]; lea rcx,[rdx+0x10]; jnz` cycle at `module+0x7426c00`). A
 /// `.prx` dependency has no crt0 that re-enters, so its initializer is the
 /// loader's to run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ModuleInitRole {
     /// A file-backed `DT_NEEDED` dependency's `module_start`. The loader owns
     /// this call in every entry mode — nothing else runs it.
@@ -199,7 +199,7 @@ impl std::fmt::Display for ModuleInitRole {
 /// `run_ini_fini`, MIT © InoriRus) is
 /// `int module_start(size_t args, const void *argp, module_func_t func)`,
 /// SysV, called with `(0, NULL, NULL)` for a plain load.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModuleInit {
     /// The `.prx` this belongs to, for diagnostics.
     pub name: String,
@@ -212,7 +212,7 @@ pub struct ModuleInit {
 }
 
 /// One ELF's load range and exception tables within a composed process image.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LinkedUnwindModule {
     pub name: String,
     /// Placement of this ELF in [`LinkedModule::image`].
@@ -227,8 +227,9 @@ pub struct LinkedUnwindModule {
 
 /// The result of [`link_module`]: a flat, relocated image plus a record of
 /// what each symbol relocation resolved to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LinkedModule {
+    #[serde(skip)]
     pub image: Vec<u8>,
     pub base: u64,
     /// Image-relative `(offset, mem_size)` of the main module's PF_X
@@ -482,6 +483,17 @@ fn link_inner(
         .map(|(id, n)| (*id, n.as_str()))
         .collect();
 
+    #[derive(Clone, Copy)]
+    enum CachedImport {
+        Hle(u64),
+        Lle(u64),
+        Unresolved { nid: u64, stub: u64 },
+    }
+    // A large C++ title may carry hundreds of thousands of relocations but
+    // only tens of thousands of symbols. Provider lookup, NID resolution, and
+    // marker allocation are symbol properties, so perform them once per r_sym.
+    let mut import_cache: HashMap<usize, CachedImport> = HashMap::new();
+
     for reloc in &dynlib.relocations {
         let r_type = (reloc.info & 0xFFFF_FFFF) as u32;
         let r_sym = reloc.info >> 32;
@@ -562,78 +574,92 @@ fn link_inner(
                     continue;
                 }
 
-                // Dispatch policy belongs to the module that PROVIDES this
-                // import. Using `module.name` (the consumer) split a shipped
-                // libc between LLE and HLE depending on which object called
-                // it, leaving C++ runtime globals owned by different worlds.
-                let provider_ref = dynlib
-                    .symbol_providers
-                    .get(r_sym as usize)
-                    .and_then(Option::as_ref)
-                    .or_else(|| {
-                        // Compatibility for hand-built fixtures predating the
-                        // aligned provider table. A unique NID is unambiguous;
-                        // duplicate-NID imports must carry per-symbol data.
-                        let mut matching = dynlib
-                            .imports
-                            .iter()
-                            .filter(|provider| provider.nid == symbol.nid);
-                        let provider = matching.next()?;
-                        matching.next().is_none().then_some(provider)
-                    });
-                let provider_library = provider_ref
-                    .and_then(|provider| lib_names.get(&provider.library_index).copied());
-                let provider_module = provider_ref
-                    .and_then(|provider| module_names.get(&provider.module_index).copied())
-                    .or(provider_library);
-                let resolver = if let Some(provider_module) = provider_module {
-                    // Forensic (RAEEN_TRACE_DRAWS): name the import whose PLT stub
-                    // (GOT slot module-vaddr 0xE123280) returns EINVAL and kills the
-                    // Streaming Pool threads. Logs the NID + provider so the failing
-                    // function can be identified and fixed.
-                    if reloc.offset == 0xE12_3280 && std::env::var_os("RAEEN_TRACE_DRAWS").is_some()
-                    {
-                        tracing::warn!(
-                            offset = format_args!("{:#x}", reloc.offset),
-                            nid = format_args!("{:#018x}", symbol.nid),
-                            provider = provider_module,
-                            "TRACE_DRAWS: PLT-0xb5 import (returns EINVAL, kills Streaming Pool)"
-                        );
-                    }
-                    registry.resolve_import(
-                        hle,
-                        provider_module,
-                        provider_library.unwrap_or(provider_module),
-                        symbol.nid,
-                    )
+                let cached = if let Some(cached) = import_cache.get(&sym_index) {
+                    *cached
                 } else {
-                    // The symbol's provider indices resolve to no name in any
-                    // import table — hand-built fixtures carry `#A#A` indices
-                    // without the tables those indices address, so the import
-                    // has no provider identity to key policy or LLE exports
-                    // on. Falling back to the consumer module's own name here
-                    // would leave every such import unresolved; resolve
-                    // against the provider-free NID view instead.
-                    registry.resolve_unattributed(hle, &module.name, symbol.nid)
+                    // Dispatch policy belongs to the module that PROVIDES this
+                    // import. Resolve provider identity and the NID once.
+                    let provider_ref = dynlib
+                        .symbol_providers
+                        .get(sym_index)
+                        .and_then(Option::as_ref)
+                        .or_else(|| {
+                            // Compatibility for hand-built fixtures predating
+                            // the aligned provider table. A unique NID is
+                            // unambiguous; duplicates require per-symbol data.
+                            let mut matching = dynlib
+                                .imports
+                                .iter()
+                                .filter(|provider| provider.nid == symbol.nid);
+                            let provider = matching.next()?;
+                            matching.next().is_none().then_some(provider)
+                        });
+                    let provider_library = provider_ref
+                        .and_then(|provider| lib_names.get(&provider.library_index).copied());
+                    let provider_module = provider_ref
+                        .and_then(|provider| module_names.get(&provider.module_index).copied())
+                        .or(provider_library);
+                    let resolver = if let Some(provider_module) = provider_module {
+                        registry.resolve_import(
+                            hle,
+                            provider_module,
+                            provider_library.unwrap_or(provider_module),
+                            symbol.nid,
+                        )
+                    } else {
+                        registry.resolve_unattributed(hle, &module.name, symbol.nid)
+                    };
+                    let cached = match resolver {
+                        Resolver::Hle { library, function } => {
+                            CachedImport::Hle(tables.hle_addr(library, function))
+                        }
+                        Resolver::Lle { addr } => CachedImport::Lle(addr),
+                        Resolver::Unresolved => CachedImport::Unresolved {
+                            nid: symbol.nid,
+                            stub: tables
+                                .stub_addr(symbol.nid, provider_library.map(str::to_string)),
+                        },
+                    };
+                    import_cache.insert(sym_index, cached);
+                    cached
                 };
-                match resolver {
-                    Resolver::Hle { library, function } => {
-                        let addr = tables.hle_addr(library, function);
+
+                // Preserve the opt-in forensic for the one measured PLT slot;
+                // it stays outside the hot path unless explicitly requested.
+                if reloc.offset == 0xE12_3280 && std::env::var_os("RAEEN_TRACE_DRAWS").is_some() {
+                    let provider = dynlib
+                        .symbol_providers
+                        .get(sym_index)
+                        .and_then(Option::as_ref)
+                        .and_then(|provider| {
+                            module_names
+                                .get(&provider.module_index)
+                                .copied()
+                                .or_else(|| lib_names.get(&provider.library_index).copied())
+                        })
+                        .unwrap_or("<unattributed>");
+                    tracing::warn!(
+                        offset = format_args!("{:#x}", reloc.offset),
+                        nid = format_args!("{:#018x}", symbol.nid),
+                        provider,
+                        "TRACE_DRAWS: PLT-0xb5 import (returns EINVAL, kills Streaming Pool)"
+                    );
+                }
+
+                match cached {
+                    CachedImport::Hle(addr) => {
                         if r_type == R_X86_64_64 {
                             addr.wrapping_add(reloc.addend as u64)
                         } else {
                             addr
                         }
                     }
-                    Resolver::Lle { addr } => addr.wrapping_add(reloc.addend as u64),
-                    Resolver::Unresolved => {
-                        let nid = symbol.nid;
+                    CachedImport::Lle(addr) => addr.wrapping_add(reloc.addend as u64),
+                    CachedImport::Unresolved { nid, stub } => {
                         unresolved.push(UnresolvedImport { nid, r_type });
-                        // Deliberately NOT `+ addend`, unlike the HLE arm: the
-                        // stub address IS the symbol's identity, and the
-                        // runtime inverts it by exact slot. An addend would
-                        // land mid-slot and lose the NID — the whole point.
-                        tables.stub_addr(nid, provider_library.map(str::to_string))
+                        // Deliberately NOT `+ addend`: the stub address is the
+                        // exact identity the runtime inverts back to this NID.
+                        stub
                     }
                 }
             }
@@ -709,6 +735,7 @@ fn patch_guest_syscalls(module: &SprxModule, image: &mut [u8]) -> Result<usize, 
         module,
         image,
         Mnemonic::Syscall,
+        [0x0F, 0x05],
         SYSCALL_TRAP_BYTES,
         "syscall",
     )
@@ -716,13 +743,21 @@ fn patch_guest_syscalls(module: &SprxModule, image: &mut [u8]) -> Result<usize, 
 
 /// Replace decoded guest `cpuid` instructions with the private PS5-model trap.
 fn patch_guest_cpuid(module: &SprxModule, image: &mut [u8]) -> Result<usize, FirmwareError> {
-    patch_guest_instruction(module, image, Mnemonic::Cpuid, CPUID_TRAP_BYTES, "CPUID")
+    patch_guest_instruction(
+        module,
+        image,
+        Mnemonic::Cpuid,
+        [0x0F, 0xA2],
+        CPUID_TRAP_BYTES,
+        "CPUID",
+    )
 }
 
 fn patch_guest_instruction(
     module: &SprxModule,
     image: &mut [u8],
     mnemonic: Mnemonic,
+    opcode: [u8; 2],
     replacement: [u8; 2],
     name: &str,
 ) -> Result<usize, FirmwareError> {
@@ -751,7 +786,22 @@ fn patch_guest_instruction(
                 image.len()
             ))
         })?;
-        let mut decoder = Decoder::with_ip(64, bytes, segment.vaddr, DecoderOptions::NONE);
+        // Most executable dependency segments contain no syscall/CPUID at all.
+        // A SIMD memmem prefilter skips iced-x86 entirely for those segments.
+        // For a segment with candidates, stop after the final raw opcode:
+        // linear decode from the segment start still proves instruction
+        // boundaries, so an `0F 05` embedded in an immediate/table is never
+        // patched, while the often-large tail after the last candidate is free.
+        let Some(last_candidate) = memchr::memmem::rfind(bytes, &opcode) else {
+            continue;
+        };
+        let decode_len = last_candidate + opcode.len();
+        let mut decoder = Decoder::with_ip(
+            64,
+            &bytes[..decode_len],
+            segment.vaddr,
+            DecoderOptions::NONE,
+        );
         while decoder.can_decode() {
             let instruction = decoder.decode();
             if instruction.mnemonic() != mnemonic {
