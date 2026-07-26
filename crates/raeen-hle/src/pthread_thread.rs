@@ -41,6 +41,36 @@ pub fn register(registry: &HleRegistry) {
     // a later Getprio had nothing truthful to report.
     registry.register("libkernel", "scePthreadSetprio", hle_setprio);
     registry.register("libkernel", "scePthreadGetprio", hle_getprio);
+    // Full sched-param bookkeeping: like Setprio/Getprio but carrying the
+    // policy alongside the priority, through the POSIX `sched_param` struct
+    // ABI. Same storage class (`thread_priorities`, plus the matching
+    // `thread_sched_policies`) — recorded, never mapped onto host scheduling.
+    registry.register("libkernel", "scePthreadGetschedparam", hle_getschedparam);
+    registry.register("libkernel", "scePthreadSetschedparam", hle_setschedparam);
+    // The POSIX spellings return a bare positive errno instead of the
+    // `0x8002_xxxx` SCE encoding, so they get the adapting wrappers. Both
+    // providers: the sce->POSIX naming lesson (`clock_gettime`) is that a
+    // title may import the plain name from either library.
+    registry.register(
+        "libScePosix",
+        "pthread_getschedparam",
+        hle_posix_getschedparam,
+    );
+    registry.register(
+        "libkernel",
+        "pthread_getschedparam",
+        hle_posix_getschedparam,
+    );
+    registry.register(
+        "libScePosix",
+        "pthread_setschedparam",
+        hle_posix_setschedparam,
+    );
+    registry.register(
+        "libkernel",
+        "pthread_setschedparam",
+        hle_posix_setschedparam,
+    );
 
     // POSIX spellings — different NIDs, same semantics, and these are the ones
     // a real title imports (from `libScePosix`). `pthread_self` returns the
@@ -132,6 +162,90 @@ fn hle_getprio(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_EFAULT;
     }
     OK
+}
+
+/// The priority a thread with no recorded setting reports (the default
+/// attribute priority, 700).
+fn thread_priority_or_default(ctx: &HleContext, thread: u64) -> i32 {
+    ctx.kernel
+        .thread_priorities
+        .get(&thread)
+        .map(|p| *p)
+        .unwrap_or(raeen_kernel::PthreadAttr::default().sched_priority)
+}
+
+/// `scePthreadGetschedparam(thread, int *policyOut, struct sched_param
+/// *paramOut)`: report the thread's scheduling policy and priority as recorded
+/// by `scePthreadSetschedparam` (defaults: the `PthreadAttr` policy/priority,
+/// same values a real thread inherits from its creation attributes).
+/// `sched_param`'s first — and only ABI-relevant — member is the `int`
+/// `sched_priority` at offset 0 (SharpEmu's `PthreadGetschedparam`,
+/// GPL-2.0, reads/writes exactly that word).
+fn hle_getschedparam(ctx: &HleContext, args: &[u64]) -> u64 {
+    let thread = resolve_thread(ctx, args.first().copied().unwrap_or(0));
+    let policy_out = args.get(1).copied().unwrap_or(0);
+    let param_out = args.get(2).copied().unwrap_or(0);
+    if policy_out == 0 || param_out == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let policy = ctx
+        .kernel
+        .thread_sched_policies
+        .get(&thread)
+        .map(|p| *p)
+        .unwrap_or(raeen_kernel::PthreadAttr::default().sched_policy);
+    let priority = thread_priority_or_default(ctx, thread);
+    if !ctx.mem.write(policy_out, &policy.to_le_bytes())
+        || !ctx.mem.write(param_out, &priority.to_le_bytes())
+    {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    OK
+}
+
+/// `scePthreadSetschedparam(thread, int policy, const struct sched_param
+/// *param)`: record the requested policy and the priority carried in
+/// `param->sched_priority`. Raeen does not map guest priorities onto host
+/// scheduling (only contention order could differ, never correctness — the
+/// same bookkeeping model as `scePthreadSetprio` above), but both values must
+/// be RECORDED so `scePthreadGetschedparam` reads back what was set.
+fn hle_setschedparam(ctx: &HleContext, args: &[u64]) -> u64 {
+    let thread = resolve_thread(ctx, args.first().copied().unwrap_or(0));
+    let policy = args.get(1).copied().unwrap_or(0) as i32;
+    let param = args.get(2).copied().unwrap_or(0);
+    if param == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let mut priority = [0u8; 4];
+    if !ctx.mem.read(param, &mut priority) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    let priority = i32::from_le_bytes(priority);
+    ctx.kernel.thread_sched_policies.insert(thread, policy);
+    ctx.kernel.thread_priorities.insert(thread, priority);
+    OK
+}
+
+/// Adapt the SCE sched-param return (`0` / `0x8002_00xx`) to the POSIX
+/// `pthread_*schedparam` convention (`0` / bare positive errno).
+fn sce_to_posix_errno(rc: u64) -> u64 {
+    if rc & 0xffff_0000 == 0x8002_0000 {
+        rc & 0xffff
+    } else {
+        rc
+    }
+}
+
+/// `pthread_getschedparam(thread, policyOut, paramOut)` — POSIX spelling,
+/// positive-errno return.
+fn hle_posix_getschedparam(ctx: &HleContext, args: &[u64]) -> u64 {
+    sce_to_posix_errno(hle_getschedparam(ctx, args))
+}
+
+/// `pthread_setschedparam(thread, policy, param)` — POSIX spelling,
+/// positive-errno return.
+fn hle_posix_setschedparam(ctx: &HleContext, args: &[u64]) -> u64 {
+    sce_to_posix_errno(hle_setschedparam(ctx, args))
 }
 
 /// `scePthreadSelf()`: the calling thread's handle (the one guest thread).
@@ -265,6 +379,59 @@ mod tests {
         let registry = HleRegistry::new();
         assert!(registry.is_implemented("libkernel", "scePthreadSetprio"));
         assert!(registry.is_implemented("libkernel", "scePthreadGetprio"));
+    }
+
+    #[test]
+    fn schedparam_round_trips_policy_and_priority_with_sane_defaults() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // Defaults before any Set: the PthreadAttr policy (1) / priority (700).
+        assert_eq!(hle_getschedparam(&ctx, &[CURRENT_THREAD, 0x40, 0x48]), OK);
+        let mut word = [0u8; 4];
+        assert!(crate::GuestMemory::read(&mem, 0x40, &mut word));
+        assert_eq!(i32::from_le_bytes(word), 1, "default policy");
+        assert!(crate::GuestMemory::read(&mem, 0x48, &mut word));
+        assert_eq!(i32::from_le_bytes(word), 700, "default priority");
+
+        // Setschedparam records both fields; Getschedparam reads them back
+        // (thread 0 = "me", and the priority arrives via sched_param[0]).
+        assert!(crate::GuestMemory::write(&mem, 0x50, &300i32.to_le_bytes()));
+        assert_eq!(hle_setschedparam(&ctx, &[0, 2, 0x50]), OK);
+        assert_eq!(hle_getschedparam(&ctx, &[CURRENT_THREAD, 0x40, 0x48]), OK);
+        assert!(crate::GuestMemory::read(&mem, 0x40, &mut word));
+        assert_eq!(i32::from_le_bytes(word), 2);
+        assert!(crate::GuestMemory::read(&mem, 0x48, &mut word));
+        assert_eq!(i32::from_le_bytes(word), 300);
+        // Setschedparam also feeds the Getprio readback (one priority store).
+        assert_eq!(hle_getprio(&ctx, &[CURRENT_THREAD, 0x40]), OK);
+        assert!(crate::GuestMemory::read(&mem, 0x40, &mut word));
+        assert_eq!(i32::from_le_bytes(word), 300);
+
+        // NULL pointers are EINVAL (SCE) / bare errno (POSIX), never a write.
+        assert_eq!(
+            hle_getschedparam(&ctx, &[CURRENT_THREAD, 0, 0x48]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
+        assert_eq!(hle_setschedparam(&ctx, &[0, 1, 0]), SCE_KERNEL_ERROR_EINVAL);
+        assert_eq!(
+            hle_posix_getschedparam(&ctx, &[CURRENT_THREAD, 0, 0x48]),
+            22
+        );
+        assert_eq!(hle_posix_setschedparam(&ctx, &[0, 1, 0]), 22);
+        // An unmapped param pointer is EFAULT (SCE) / EFAULT's errno (POSIX).
+        assert_eq!(
+            hle_setschedparam(&ctx, &[0, 1, 0xDEAD_0000]),
+            SCE_KERNEL_ERROR_EFAULT
+        );
+        assert_eq!(hle_posix_setschedparam(&ctx, &[0, 1, 0xDEAD_0000]), 14);
+
+        let registry = HleRegistry::new();
+        assert!(registry.is_implemented("libkernel", "scePthreadGetschedparam"));
+        assert!(registry.is_implemented("libkernel", "scePthreadSetschedparam"));
+        assert!(registry.is_implemented("libScePosix", "pthread_getschedparam"));
+        assert!(registry.is_implemented("libScePosix", "pthread_setschedparam"));
+        assert!(registry.is_implemented("libkernel", "pthread_getschedparam"));
+        assert!(registry.is_implemented("libkernel", "pthread_setschedparam"));
     }
 
     #[test]

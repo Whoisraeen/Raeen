@@ -41,6 +41,8 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libScePosix", "usleep", posix_usleep);
     registry.register("libScePosix", "getpid", libkernel::hle_getpid);
     registry.register("libScePosix", "fcntl", posix_fcntl);
+    registry.register("libScePosix", "sleep", posix_sleep);
+    registry.register("libkernel", "sleep", posix_sleep);
 
     // The `libkernel` module exports these POSIX names under BOTH its
     // `libScePosix` library and its `libkernel` library, and resolution is
@@ -99,6 +101,33 @@ fn posix_clock_gettime(ctx: &HleContext, args: &[u64]) -> u64 {
 /// implementation.
 fn posix_usleep(ctx: &HleContext, args: &[u64]) -> u64 {
     sce_to_posix(libkernel::hle_usleep(ctx, args))
+}
+
+/// POSIX `sleep(unsigned int seconds)`: really sleeps the host thread,
+/// returning 0 once the full interval elapsed — or the number of UNSLEPT
+/// seconds if the guest process began terminating mid-sleep (the teardown
+/// case maps onto POSIX's "interrupted by a signal" shape: the caller is
+/// going away, and a partial count is the honest report of what was slept).
+///
+/// The wait is sliced so teardown is noticed within 100 ms rather than after
+/// the whole interval — a `sleep(3600)` during shutdown must not pin a dying
+/// process open. Unlike `usleep` there is no duration cap: the guest asked
+/// for seconds-scale blocking and a real console would honor it.
+fn posix_sleep(ctx: &HleContext, args: &[u64]) -> u64 {
+    let seconds = args.first().copied().unwrap_or(0);
+    debug!("sleep(seconds={seconds})");
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+    let mut remaining = std::time::Duration::from_secs(seconds);
+    while !remaining.is_zero() {
+        if ctx.guest_threads.process_is_terminating() {
+            // POSIX reports the unslept whole seconds (rounded up).
+            return u64::try_from(remaining.as_millis().div_ceil(1000)).unwrap_or(u64::MAX);
+        }
+        let slice = remaining.min(SLICE);
+        ctx.services.sleep(slice);
+        remaining = remaining.saturating_sub(slice);
+    }
+    0
 }
 
 /// POSIX `fcntl(fd, command, argument)` for descriptor/status flag commands.
@@ -228,5 +257,30 @@ mod tests {
         assert!(registry.is_implemented("libScePosix", "fcntl"));
         kernel.filesystem.close(fd).unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sleep_really_sleeps_and_is_registered_under_both_providers() {
+        use crate::{TestAllocator, TestMemory, test_ctx};
+
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = TestMemory::new(0x100);
+        let alloc = TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // sleep(0) completes without waiting.
+        let started = std::time::Instant::now();
+        assert_eq!(posix_sleep(&ctx, &[0]), 0);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+
+        // A completed interval returns 0 after really sleeping it through
+        // (the kernel's sleep service is a real host sleep).
+        let started = std::time::Instant::now();
+        assert_eq!(posix_sleep(&ctx, &[1]), 0);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(900));
+
+        let registry = HleRegistry::new();
+        assert!(registry.is_implemented("libScePosix", "sleep"));
+        assert!(registry.is_implemented("libkernel", "sleep"));
     }
 }

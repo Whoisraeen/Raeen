@@ -174,6 +174,15 @@ fn register_posix(registry: &HleRegistry) {
     register_posix_abi(registry, "pthread_mutexattr_init", hle_mutexattr_init);
     register_posix_abi(registry, "pthread_mutexattr_destroy", hle_mutexattr_destroy);
     register_posix_abi(registry, "pthread_mutexattr_settype", hle_mutexattr_settype);
+    // `pthread_mutexattr_setprotocol` shares the sce body's ABI and return
+    // convention (0 / positive errno), so the alias is exact — see
+    // `hle_mutexattr_setprotocol` for why the protocol is validated but not
+    // modelled. Measured missing from a retail import table.
+    register_posix_abi(
+        registry,
+        "pthread_mutexattr_setprotocol",
+        hle_mutexattr_setprotocol,
+    );
 
     register_posix_abi(registry, "pthread_rwlock_init", hle_rwlock_init);
     register_posix_abi(registry, "pthread_rwlock_destroy", hle_rwlock_destroy);
@@ -904,6 +913,7 @@ mod tests {
                 "pthread_rwlock_rdlock",
                 "pthread_rwlock_wrlock",
                 "pthread_rwlock_unlock",
+                "pthread_mutexattr_setprotocol",
             ] {
                 assert!(
                     registry.is_implemented(provider, name),
@@ -911,6 +921,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mutexattr_setprotocol_validates_the_protocol_range() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let attr = 0x200;
+        assert_eq!(hle_mutexattr_init(&ctx, &[attr]), OK);
+        // PRIO_NONE / PRIO_INHERIT / PRIO_PROTECT are all accepted...
+        for protocol in [0u64, 1, 2] {
+            assert_eq!(hle_mutexattr_setprotocol(&ctx, &[attr, protocol]), OK);
+        }
+        // ...and anything out of range is POSIX EINVAL.
+        assert_eq!(hle_mutexattr_setprotocol(&ctx, &[attr, 3]), EINVAL);
+        assert_eq!(hle_mutexattr_setprotocol(&ctx, &[0, 1]), EINVAL);
     }
 
     #[test]

@@ -1086,9 +1086,32 @@ fn guest_sample_hash(base: u64, len: u64, tile_mode: u8) -> Option<u64> {
         let bytes = read_guest_bytes_unaligned(base, len, "texture sample-hash").ok()?;
         h = mix(h, &bytes);
     } else {
-        let stride = len / CHUNKS;
-        for i in 0..CHUNKS {
+        // Scale the probe with the surface instead of always sampling a flat
+        // 4 KiB. A fixed 64x64-byte probe covers 0.1% of a 4 MiB font atlas,
+        // so a title that rasterizes a few new glyphs into an existing atlas
+        // almost never perturbs a sampled window: the hash is unchanged, the
+        // cache reports a hit, and the STALE atlas stays bound. That is
+        // exactly what "missing glyphs" looks like on screen — characters
+        // uploaded early render, ones added later never appear (measured on
+        // Minecraft's world-creation page: W/S/E/D/P/N/H/Y/b/f/g/w/x all
+        // absent while C/G/M and most lowercase rendered).
+        //
+        // Sample ~1/64th of the surface, bounded so the cost stays far below
+        // a full re-decode: a 4 MiB atlas now probes 64 KiB across 1024
+        // windows (16x the linear density, 64x the byte coverage) and a
+        // 16 MiB one is capped at 512 KiB. Still probabilistic — the exact
+        // fix is write-tracking the guest pages (Tier 5 page-dirty tracking)
+        // — but it moves a routine miss to an unlikely one.
+        const MIN_SAMPLED: u64 = CHUNKS * CHUNK_BYTES; // 4 KiB floor
+        const MAX_SAMPLED: u64 = 512 * 1024;
+        let sampled = (len / 64).clamp(MIN_SAMPLED, MAX_SAMPLED);
+        let chunks = (sampled / CHUNK_BYTES).max(CHUNKS);
+        let stride = (len / chunks).max(CHUNK_BYTES);
+        for i in 0..chunks {
             let offset = i * stride;
+            if offset >= len {
+                break;
+            }
             let size = CHUNK_BYTES.min(len - offset);
             let bytes =
                 read_guest_bytes_unaligned(base + offset, size, "texture sample-hash").ok()?;

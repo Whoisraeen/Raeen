@@ -4,6 +4,13 @@ Three parallel audits: (1) in-tree rendering/FPS bug hunt, (2) Kyty/KytyPS5 port
 inventory, (3) SharpEmu port inventory. Cross-verified; agents checked each
 candidate against the current working tree.
 
+> **Currency notice (2026-07-25):** claims carry a `CORRECTED <date>` line when
+> re-verified against the tree after 2026-07-22. Anything without one is
+> 2026-07-22/24 vintage — verify it against the tree before using it to
+> prioritize. Tier 0 and the Tier 2 depth/BC claims below were re-audited
+> 2026-07-25 and are **done**; Tier 1 (except the R_VS/R_PS embedded arms),
+> Tier 2 MRT, Tier 3, Tier 4 remain open and now drive the active work queue.
+
 **Corrections to prior assumptions:**
 - `R_DMA_DATA` is **no longer unconsumed** — the ledger entry is partially stale.
   ACB form executes in `kyty-graphics/src/run.rs:811` → `cp_op_dma_data`; IT form
@@ -18,6 +25,13 @@ candidate against the current working tree.
 ---
 
 ## Tier 0 — the current crash (pause-menu poisoned-object fault)
+
+> **DONE (2026-07-25 re-audit).** The SharpEmu APR model was ported 2026-07-23
+> (`Ampr/AmprExports.cs` eager `AprCommandBufferReadFile`,
+> `TryReadFileToGuestMemory` positional read-exact + host-handle cache,
+> `CompleteCommandBuffer` record walk → `crates/raeen-hle/src/libsce_ampr.rs` +
+> `apr_complete_command_buffer` in `libkernel.rs`; see `THIRD_PARTY_NOTICES.md`).
+> Kept for history; the three bugs below are the reference for what the port fixed.
 
 The APR suspicion was half-wrong: records **do** execute — but three real bugs:
 
@@ -62,6 +76,11 @@ the decoder but never executed — the "559 draws" figure overstates reality.
    `depth: None`; DB_* registers are latched (`run.rs:1651-1830`) but never
    consumed. Every 3D draw renders with no depth test → submission-order
    overdraw. Fatal for in-game correctness.
+   **CORRECTED 2026-07-25: STALE, depth is attached now.** `depth_state_from_regs`
+   (`draw_translate.rs:317-385`) consumes `depth_control` + `depth_render_target`,
+   validates `DB_Z_WRITE_BASE`, maps depth/stencil format codes, and builds a real
+   depth/stencil state (with a `RAEEN_NO_DEPTH` bisection gate). MRT (next item)
+   remains open.
 2. **MRT ignored** — only `render_targets[0]` bound (`draw_translate.rs:1934`);
    CB_COLOR1-7 latched but never attached.
 3. **Cull/FACE winding risk with Y-flipped viewport** — code self-documents
@@ -79,8 +98,11 @@ the decoder but never executed — the "559 draws" figure overstates reality.
    2026-07-24 refresh in `docs/reference-port-ledger.md`. Still CPU-only, and
    still missing modes 1/4/8; a rate-limited `(tile_mode, format)` diagnostic on
    the refusal path now names which modes titles actually bind, so that port is
-   gated on measurement rather than assumption. The bigger real gap here is that
-   `texture_vk_format` has **no block-compressed (BC) format arms at all**.
+   gated on measurement rather than assumption. ~~The bigger real gap here is that
+   `texture_vk_format` has **no block-compressed (BC) format arms at all**.~~
+   **CORRECTED 2026-07-25: STALE, BC is covered.** `texture_vk_format` has full
+   BC1–BC7 arms (`draw_translate.rs:1018-1033`, codes 169–182 incl. sRGB/snorm/
+   BC6H-half variants) and `texture/formats.rs` maps Bc1/Bc3/Bc7 tiling formats.
 
 ## Tier 3 — ordered GPU side effects (correctness foundation)
 
@@ -163,13 +185,20 @@ Measured ~185 ms/flip. Causes, in likely order of cost:
 
 ## Suggested order of attack
 
-1. APR: eager read + `read_exact` + clear write offsets + name-the-miss logging
-   (unblocks current crash; small).
+**Updated 2026-07-25** (Tier 0 + Tier 2 depth/BC done):
+
+1. ~~APR: eager read + `read_exact` + clear write offsets + name-the-miss
+   logging~~ — **DONE 2026-07-23** (Tier 0).
 2. PM4 Tier 1 holes + reference clock (KytyPS5 `pm4Handlers.cpp`; same file,
    same test harness — land together).
-3. Ordered side effects (Tier 3) — foundation for everything after.
+3. Ordered side effects (Tier 3) — foundation for everything after; **this is
+   the active work item** — no perf work should stack on top of incorrect
+   completion signaling.
 4. GPU-side present + submission batching (Tier 4.1+4.2) — the FPS unlock.
-5. Depth attachment + MRT + detiler (Tier 2) — 3D correctness.
+   Real swapchain present must stay env-gated and default-OFF for Minecraft
+   (rule 2 below).
+5. MRT + detiler modes 1/4/8 (Tier 2 remainder; ~~depth~~ and ~~BC formats~~
+   done — see corrections above).
 6. Tier 5 structural phase.
 
 ---

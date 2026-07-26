@@ -39,7 +39,15 @@ pub(crate) struct TrampolineGuard {
 }
 
 impl TrampolineGuard {
-    pub(crate) fn reserve(trampolines: &[HleTrampoline]) -> Result<Self, RuntimeError> {
+    /// `returns_float` marks trampolines whose HLE result travels in guest
+    /// XMM0 (SysV float/double return) — the runtime forwards
+    /// [`raeen_hle::HleRegistry::returns_float`]. Direct-dispatchable float
+    /// imports then use the float bridge twin below, so the direct gateway
+    /// and the VEH path deliver the result register-identically.
+    pub(crate) fn reserve(
+        trampolines: &[HleTrampoline],
+        returns_float: impl Fn(&HleTrampoline) -> bool,
+    ) -> Result<Self, RuntimeError> {
         let count = trampolines.len();
         let logical_len = count as u64 * SLOT_SIZE + 16;
         let slow_len = logical_len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
@@ -57,7 +65,7 @@ impl TrampolineGuard {
             return Err(RuntimeError::MapFailed);
         }
 
-        // Leave room after the compact slots for both generated bridges.
+        // Leave room after the compact slots for the generated bridges.
         let code_len = (logical_len + 512).div_ceil(PAGE_SIZE) * PAGE_SIZE;
         let code = unsafe {
             VirtualAlloc(
@@ -72,10 +80,21 @@ impl TrampolineGuard {
             return Err(RuntimeError::MapFailed);
         }
 
-        let slow_bridge = HLE_TRAMPOLINE_BASE + logical_len;
-        let direct_bridge = slow_bridge + 64;
         let slow_code = slow_bridge_code();
         let direct_code = direct_bridge_code();
+        let float_code = direct_bridge_code_float();
+        let slow_bridge = HLE_TRAMPOLINE_BASE + logical_len;
+        // Space the bridges by their MEASURED lengths (rounded up), never a
+        // bare constant: the slow bridge is 36 bytes but the direct/float
+        // bridges are well over 64, and a tighter spacing silently splices
+        // one bridge into another (that regression is exactly why the
+        // lengths are asserted below).
+        let direct_bridge = slow_bridge + (slow_code.len() as u64).div_ceil(64) * 64;
+        let float_bridge = direct_bridge + (direct_code.len() as u64).div_ceil(64) * 64;
+        debug_assert!(
+            float_bridge + float_code.len() as u64 <= HLE_TRAMPOLINE_BASE + logical_len + 512,
+            "generated bridges must fit the reserved slack after the slots"
+        );
         unsafe {
             core::ptr::copy_nonoverlapping(
                 slow_code.as_ptr(),
@@ -87,13 +106,22 @@ impl TrampolineGuard {
                 direct_bridge as *mut u8,
                 direct_code.len(),
             );
+            core::ptr::copy_nonoverlapping(
+                float_code.as_ptr(),
+                float_bridge as *mut u8,
+                float_code.len(),
+            );
         }
         for (index, trampoline) in trampolines.iter().enumerate() {
             let slot = HLE_TRAMPOLINE_BASE + index as u64 * SLOT_SIZE;
             write_call_slot(
                 slot,
                 if direct_dispatchable(trampoline) {
-                    direct_bridge
+                    if returns_float(trampoline) {
+                        float_bridge
+                    } else {
+                        direct_bridge
+                    }
                 } else {
                     slow_bridge
                 },
@@ -264,6 +292,45 @@ fn direct_dispatchable(trampoline: &HleTrampoline) -> bool {
             | "sceAgcSetShRegIndirectPatchAddRegisters"
             | "sceAgcDcbAcquireMem"
             | "sceAgcDcbDrawIndexOffset"
+            // libc float/double-returning leaves (SysV: the result travels in
+            // XMM0, so `reserve` routes these to the float bridge twin — see
+            // `direct_bridge_code_float`). Pure compute plus bounded guest
+            // reads (strtod/atof), exactly the strlen/memcmp shape above; a
+            // math-heavy title would otherwise pay an exception round-trip
+            // per `cosf`/`powf`.
+            | "acosf"
+            | "asin"
+            | "asinf"
+            | "atan"
+            | "atan2"
+            | "atan2f"
+            | "atanf"
+            | "atof"
+            | "cos"
+            | "cosf"
+            | "difftime"
+            | "exp"
+            | "exp2"
+            | "exp2f"
+            | "expf"
+            | "fmod"
+            | "fmodf"
+            | "ldexpf"
+            | "log"
+            | "log10"
+            | "log10f"
+            | "log2"
+            | "log2f"
+            | "logf"
+            | "nextafterf"
+            | "pow"
+            | "powf"
+            | "sin"
+            | "sinf"
+            | "strtod"
+            | "tan"
+            | "tanf"
+            | "tanhf"
     )
 }
 
@@ -295,9 +362,14 @@ fn slow_bridge_code() -> Vec<u8> {
 }
 
 fn direct_bridge_code() -> Vec<u8> {
-    // fs:0x7f0 points at DirectThreadState { context, host_stack_top }.
+    // GS:0x28 is the x64 TEB's application-owned ArbitraryUserPointer. `run`
+    // installs DirectThreadState there for the duration of guest execution.
+    // Unlike the guest FS base, Windows preserves GS/TEB across preemption.
+    // Reading the state through FS made the direct gateway intermittently use
+    // unrelated TEB bytes after Windows cleared guest FS, crashing retail
+    // titles inside this bridge before the HLE handler was reached.
     let mut c = vec![
-        0x64, 0x4C, 0x8B, 0x1C, 0x25, 0xF0, 0x07, 0x00, 0x00, // mov r11,fs:[7f0]
+        0x65, 0x4C, 0x8B, 0x1C, 0x25, 0x28, 0x00, 0x00, 0x00, // mov r11,gs:[28]
         0x49, 0x89, 0xE2, // mov r10,rsp
         0x49, 0x8B, 0x63, 0x08, // mov rsp,[r11+8]
         0x48, 0x83, 0xE4, 0xF0, // and rsp,-16
@@ -329,6 +401,24 @@ fn direct_bridge_code() -> Vec<u8> {
         0xC3, // ret to the original guest caller
     ]);
     c
+}
+
+/// The float-returning twin of [`direct_bridge_code`]: identical machine
+/// code plus one `movq xmm0, rax` (`66 48 0F 6E C0`) immediately after the
+/// gateway call, so a `double`/`float` HLE result reaches the guest in the
+/// SysV floating-point return register. [`TrampolineGuard::reserve`] picks
+/// this bridge for imports its `returns_float` predicate marks — the same
+/// registration-time marker the VEH writeback consults
+/// (`dispatch::apply_hle_result`), so both call paths hand the result back
+/// register-identically.
+fn direct_bridge_code_float() -> Vec<u8> {
+    let mut code = direct_bridge_code();
+    let call_at = code
+        .windows(2)
+        .position(|w| w == [0xFF, 0xD0])
+        .expect("direct bridge contains the gateway call");
+    code.splice(call_at + 2..call_at + 2, [0x66, 0x48, 0x0F, 0x6E, 0xC0]);
+    code
 }
 
 #[cfg(test)]
@@ -375,5 +465,47 @@ mod tests {
                 "{library}::{function}"
             );
         }
+    }
+
+    /// The libc float-returning leaves are ordinary compute/read leaves:
+    /// they qualify for the zero-fault direct gateway, and `reserve` routes
+    /// them to the float bridge twin via the registry's marker.
+    #[test]
+    fn float_returning_libc_leaves_use_the_direct_gateway() {
+        for function in ["cosf", "pow", "atan2", "strtod", "difftime", "ldexpf"] {
+            assert!(
+                direct_dispatchable(&trampoline("libc", function)),
+                "libc::{function} must be direct-dispatchable"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_bridge_reads_state_from_preemption_stable_teb_slot() {
+        let direct = direct_bridge_code();
+        assert_eq!(
+            &direct[..9],
+            &[0x65, 0x4C, 0x8B, 0x1C, 0x25, 0x28, 0x00, 0x00, 0x00],
+            "direct bridge must read GS:[0x28], never the preemption-unstable guest FS base"
+        );
+    }
+
+    /// The float bridge is byte-for-byte the direct bridge with a single
+    /// `movq xmm0, rax` spliced in after the gateway call — the SysV
+    /// float-return delivery the VEH path performs in `apply_hle_result`.
+    #[test]
+    fn float_bridge_is_direct_bridge_plus_movq_xmm0_rax() {
+        const MOVQ: [u8; 5] = [0x66, 0x48, 0x0F, 0x6E, 0xC0];
+        let direct = direct_bridge_code();
+        let float = direct_bridge_code_float();
+        assert_eq!(float.len(), direct.len() + MOVQ.len());
+        let call_at = direct
+            .windows(2)
+            .position(|w| w == [0xFF, 0xD0])
+            .expect("direct bridge contains the gateway call");
+        assert_eq!(float[call_at + 2..call_at + 2 + 5], MOVQ);
+        // Everything around the splice is identical.
+        assert_eq!(float[..call_at + 2], direct[..call_at + 2]);
+        assert_eq!(float[call_at + 2 + 5..], direct[call_at + 2..]);
     }
 }

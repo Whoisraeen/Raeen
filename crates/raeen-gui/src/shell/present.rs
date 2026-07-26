@@ -107,6 +107,7 @@ pub(crate) struct GameFrameView {
     /// when it is published.
     shown_at_epoch: u64,
     frame_rate: PresentedFrameRate,
+    present_timing: Option<raeen_gpu::PresentTiming>,
 }
 
 /// What the viewer managed to show, so the caller can say something honest
@@ -151,11 +152,13 @@ impl GameFrameView {
             // that exists, not a consistent one — a torn or one-frame-stale
             // image is invisible to a human and costs nothing.
             let image = remote
-                .map(|frame| frame.image)
+                .as_ref()
+                .map(|frame| std::sync::Arc::clone(&frame.image))
                 .or_else(|| session.last_image());
             if let Some(image) = image {
                 let size = [image.width as usize, image.height as usize];
                 if size[0] > 0 && size[1] > 0 && image.pixels.len() == size[0] * size[1] * 4 {
+                    let upload_at = Instant::now();
                     let color = egui::ColorImage::from_rgba_unmultiplied(size, &image.pixels);
                     match &mut self.texture {
                         Some(texture) => texture.set(color, egui::TextureOptions::LINEAR),
@@ -166,6 +169,25 @@ impl GameFrameView {
                                 egui::TextureOptions::LINEAR,
                             ));
                         }
+                    }
+                    let mut timing = remote
+                        .as_ref()
+                        .map_or_else(|| session.present_timing(), |frame| frame.timing);
+                    timing.egui_upload_us = upload_at.elapsed().as_micros() as u64;
+                    self.present_timing = Some(timing);
+                    let timing_epoch = remote
+                        .as_ref()
+                        .map_or_else(|| session.present_epoch(), |frame| frame.epoch);
+                    if timing_epoch <= 16 || timing_epoch.is_power_of_two() {
+                        tracing::info!(
+                            epoch = timing_epoch,
+                            worker_drain_us = timing.worker_drain_us,
+                            fence_wait_us = timing.fence_wait_us,
+                            readback_us = timing.readback_us,
+                            srgb_encode_us = timing.srgb_encode_us,
+                            egui_upload_us = timing.egui_upload_us,
+                            "PRESENT TIMING: latest completed frame"
+                        );
                     }
                     self.shown_at_epoch = epoch;
                 }
@@ -189,8 +211,8 @@ impl GameFrameView {
     /// only `sceVideoOut` flip-count deltas; egui repaint cadence is irrelevant.
     pub(crate) fn paint_fps(&self, ui: &egui::Ui, bounds: egui::Rect) {
         let badge = egui::Rect::from_min_size(
-            egui::pos2(bounds.right() - 92.0, bounds.top() + 12.0),
-            egui::vec2(80.0, 30.0),
+            egui::pos2(bounds.right() - 372.0, bounds.top() + 12.0),
+            egui::vec2(360.0, 48.0),
         );
         ui.painter().rect_filled(
             badge,
@@ -198,11 +220,26 @@ impl GameFrameView {
             egui::Color32::from_rgba_unmultiplied(8, 11, 18, 210),
         );
         ui.painter().text(
-            badge.center(),
-            egui::Align2::CENTER_CENTER,
+            egui::pos2(badge.right() - 10.0, badge.top() + 8.0),
+            egui::Align2::RIGHT_TOP,
             self.frame_rate.label(),
             egui::FontId::monospace(15.0),
             egui::Color32::WHITE,
+        );
+        let timing = self.present_timing.unwrap_or_default();
+        ui.painter().text(
+            egui::pos2(badge.left() + 10.0, badge.bottom() - 8.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!(
+                "drain {:.1}  fence {:.1}  read {:.1}  sRGB {:.1}  UI {:.1} ms",
+                timing.worker_drain_us as f64 / 1000.0,
+                timing.fence_wait_us as f64 / 1000.0,
+                timing.readback_us as f64 / 1000.0,
+                timing.srgb_encode_us as f64 / 1000.0,
+                timing.egui_upload_us as f64 / 1000.0,
+            ),
+            egui::FontId::monospace(11.0),
+            egui::Color32::from_gray(205),
         );
     }
 
@@ -212,6 +249,7 @@ impl GameFrameView {
         self.texture = None;
         self.shown_at_epoch = 0;
         self.frame_rate.reset();
+        self.present_timing = None;
     }
 }
 
@@ -297,6 +335,7 @@ mod tests {
     fn first_remote_frame_cannot_alias_the_local_splash_epoch() {
         let remote = raeen_gpu::frame_ipc::RemoteFrame {
             epoch: 2,
+            timing: raeen_gpu::PresentTiming::default(),
             image: std::sync::Arc::new(raeen_gpu::RenderedImage {
                 width: 1,
                 height: 1,

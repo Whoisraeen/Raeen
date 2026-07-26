@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn percent_f_formats_doubles_with_c_default_precision() {
         assert_eq!(fmt_with_floats("v=%f", &[], &[1.5]), "v=1.500000");
-        assert_eq!(fmt_with_floats("v=%.2f", &[], &[3.14159]), "v=3.14");
+        assert_eq!(fmt_with_floats("v=%.2f", &[], &[1.23456]), "v=1.23");
         assert_eq!(fmt_with_floats("v=%.0f", &[], &[2.5]), "v=2");
         assert_eq!(fmt_with_floats("v=%f", &[], &[-0.25]), "v=-0.250000");
     }

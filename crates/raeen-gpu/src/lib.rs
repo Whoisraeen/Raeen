@@ -43,7 +43,9 @@ pub mod vulkan;
 
 #[allow(deprecated)]
 pub use agc_exec::build_m2_draw_dcb;
-pub use agc_exec::{AgcGpuSession, GpuProcessSession, ScissorHalf, build_cp_draw_dcb};
+pub use agc_exec::{
+    AgcGpuSession, GpuProcessSession, PresentTiming, ScissorHalf, build_cp_draw_dcb,
+};
 pub use backend::{BackendKind, GpuBackend, ShaderFormat, create_backend, default_backend_kind};
 pub use contracts::{ShaderMappedData, ShaderSemantic, ShaderSharp, ShaderUserData};
 pub use guest_mem::GpuGuestMemory;

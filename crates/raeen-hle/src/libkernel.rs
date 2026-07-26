@@ -601,6 +601,89 @@ fn hle_sce_pread(ctx: &HleContext, args: &[u64]) -> u64 {
     file_result_sce(hle_pread(ctx, args))
 }
 
+/// Real `pwrite(fd, buf, nbyte, offset)` / `sceKernelPwrite` (VFS-backed):
+/// writes up to `nbyte` bytes at absolute `offset` WITHOUT moving the
+/// descriptor's cursor — the write-side twin of [`hle_pread`]. The VFS
+/// write-back buffer makes the bytes durable on fsync/close, exactly as
+/// `write` does. Bad fd (or a read-only one) → `EBADF`; negative offset →
+/// `EINVAL`; unreadable guest buffer → `EFAULT`.
+fn hle_pwrite(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    let buf = args.get(1).copied().unwrap_or(0);
+    let count = args.get(2).copied().unwrap_or(0).min(WRITE_MAX_BYTES);
+    let offset = args.get(3).copied().unwrap_or(0);
+    debug!("pwrite(fd={fd}, buf={buf:#x}, count={count:#x}, offset={offset:#x})");
+
+    if (offset as i64) < 0 {
+        return FILE_EINVAL;
+    }
+    if count > 0 && buf == 0 {
+        return FILE_EFAULT;
+    }
+    let Ok(n) = usize::try_from(count) else {
+        return FILE_EINVAL;
+    };
+    let mut bytes = vec![0u8; n];
+    if !ctx.mem.read(buf, &mut bytes) {
+        warn!("pwrite: guest buffer [{buf:#x}, +{count:#x}) is not readable — EFAULT");
+        return FILE_EFAULT;
+    }
+    match ctx.kernel.filesystem.pwrite(fd, &bytes, offset) {
+        Ok(written) => written as u64,
+        Err(e) => {
+            use std::io::ErrorKind;
+            match e.kind() {
+                // Unknown fd, or one not opened for writing (POSIX reports
+                // both as EBADF for pwrite).
+                ErrorKind::NotFound | ErrorKind::PermissionDenied => FILE_EBADF,
+                _ => FILE_EINVAL,
+            }
+        }
+    }
+}
+
+fn hle_posix_pwrite(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_posix(ctx, hle_pwrite(ctx, args))
+}
+
+fn hle_sce_pwrite(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_sce(hle_pwrite(ctx, args))
+}
+
+/// Real `ftruncate(fd, length)` / `sceKernelFtruncate` (VFS-backed): resize
+/// the OPEN descriptor to `length` bytes. The VFS resizes the descriptor's
+/// write-back buffer (drop the tail / zero-fill the extension), so the new
+/// length survives the flush-on-close — truncating the host file out from
+/// under a dirty buffer would be undone the moment it flushed. Bad fd (or a
+/// read-only one) → `EBADF`; negative length → `EINVAL`.
+fn hle_ftruncate(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0) as i32;
+    let length = args.get(1).copied().unwrap_or(0);
+    debug!("ftruncate(fd={fd}, length={length:#x})");
+
+    if (length as i64) < 0 {
+        return FILE_EINVAL;
+    }
+    match ctx.kernel.filesystem.ftruncate(fd, length) {
+        Ok(()) => SCE_OK,
+        Err(e) => {
+            use std::io::ErrorKind;
+            match e.kind() {
+                ErrorKind::NotFound | ErrorKind::PermissionDenied => FILE_EBADF,
+                _ => io_error_to_file_result(&e),
+            }
+        }
+    }
+}
+
+fn hle_posix_ftruncate(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_posix(ctx, hle_ftruncate(ctx, args))
+}
+
+fn hle_sce_ftruncate(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_sce(hle_ftruncate(ctx, args))
+}
+
 /// Real `close(fd)` / `sceKernelClose`: closes the VFS descriptor. Unknown
 /// fd → `EBADF`.
 fn hle_close(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -1414,6 +1497,11 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register(
         "libkernel",
+        "sceKernelCheckedReleaseDirectMemory",
+        hle_checked_release_direct_memory,
+    );
+    registry.register(
+        "libkernel",
         "sceKernelMapDirectMemory",
         hle_map_direct_memory,
     );
@@ -1471,6 +1559,14 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "sceKernelPread", hle_sce_pread);
     registry.register("libkernel", "pread", hle_posix_pread);
     registry.register("libScePosix", "pread", hle_posix_pread);
+    // pwrite/ftruncate: the write-side positional and resize calls, registered
+    // under the same provider pair as pread (resolution is provider-aware).
+    registry.register("libkernel", "sceKernelPwrite", hle_sce_pwrite);
+    registry.register("libkernel", "pwrite", hle_posix_pwrite);
+    registry.register("libScePosix", "pwrite", hle_posix_pwrite);
+    registry.register("libkernel", "sceKernelFtruncate", hle_sce_ftruncate);
+    registry.register("libkernel", "ftruncate", hle_posix_ftruncate);
+    registry.register("libScePosix", "ftruncate", hle_posix_ftruncate);
     registry.register(
         "libkernel",
         "sceKernelAioInitializeParam",
@@ -1684,7 +1780,10 @@ pub fn register(registry: &HleRegistry) {
     // registered: with one guest thread every possible return value lies,
     // and an unresolved import at least names itself. See `pthread_cond`'s
     // module docs and `pthread_sync::register_posix` (M1-E).
-    registry.register("libScePosix", "pthread_setschedparam", hle_ok_stub);
+    // pthread_setschedparam/pthread_getschedparam are registered by
+    // `pthread_thread` (real sched-param bookkeeping, which runs after this
+    // function and wins) — the old hle_ok_stub here dropped the value, the
+    // same lesson as scePthreadSetprio below.
     registry.register("libScePosix", "fstat", hle_fstat);
 
     // -- Measured Minecraft libc.prx / eboot imports (real PS5 export names,
@@ -1779,6 +1878,12 @@ pub fn register(registry: &HleRegistry) {
         hle_module_info_unavailable,
     );
     registry.register("libkernel", "sceKernelVirtualQuery", hle_virtual_query);
+    registry.register("libkernel", "sceKernelIsStack", hle_is_stack);
+    registry.register(
+        "libkernel",
+        "sceKernelQueryMemoryProtection",
+        hle_query_memory_protection,
+    );
     registry.register(
         "libkernel",
         "sceKernelReserveVirtualRange",
@@ -1833,6 +1938,15 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "sceKernelUtimes", hle_path_metadata_accept);
     registry.register("libkernel", "sceKernelStat", hle_stat);
     registry.register("libkernel", "sceKernelFstat", hle_fstat);
+    // Plain POSIX spellings of the same two metadata calls — different NIDs
+    // from the sce* forms, registered under both providers (the measured
+    // imports name `libScePosix`; `unlink`/`rmdir` above show libkernel
+    // exports the plain spellings too). `-1` + `errno` convention, like
+    // `hle_posix_unlink`.
+    registry.register("libkernel", "rename", hle_posix_rename);
+    registry.register("libScePosix", "rename", hle_posix_rename);
+    registry.register("libkernel", "stat", hle_posix_stat);
+    registry.register("libScePosix", "stat", hle_posix_stat);
     // pthread surface libc/fmod touch during init — attr/priority/affinity
     // bookkeeping has no scheduler to talk to yet, so recording nothing and
     // returning success is faithful enough for a single-thread world.
@@ -1904,6 +2018,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "getargc", hle_getargc);
     registry.register("libkernel", "getargv", hle_getargv);
     registry.register("libkernel", "sceKernelGetGPI", hle_get_gpi);
+    registry.register("libkernel", "sceKernelSetGPO", hle_set_gpo);
 }
 
 /// `sceKernelGetGPI()`: read the General Purpose **Input** lines.
@@ -1919,6 +2034,24 @@ pub fn register(registry: &HleRegistry) {
 /// encoded `4oXYe9Xmk0Q`), reached from its allocator-init path.
 fn hle_get_gpi(_ctx: &HleContext, _args: &[u64]) -> u64 {
     debug!("sceKernelGetGPI() -> 0 (no devkit GPI switches on retail)");
+    SCE_OK
+}
+
+/// `sceKernelSetGPO(bits)`: drive the General Purpose **Output** lines.
+///
+/// GPO is the output half of the same devkit-only mechanism as GPI (see
+/// [`hle_get_gpi`]): on development kits these lines drive external hardware
+/// (LEDs/switches on the test rig); a retail console has nothing wired to
+/// them, so setting them is a defined no-op that succeeds. Accepting the call
+/// is therefore the **real retail behavior** — the bits genuinely go nowhere
+/// because there is genuinely nothing to receive them. Unlike SharpEmu we do
+/// NOT loop the value back into `sceKernelGetGPI`: output state is not input
+/// state, and folding it into GPI would report switches that were never set.
+fn hle_set_gpo(_ctx: &HleContext, args: &[u64]) -> u64 {
+    debug!(
+        "sceKernelSetGPO(bits={:#x}) -> 0 (no devkit GPO lines on retail)",
+        args.first().copied().unwrap_or(0)
+    );
     SCE_OK
 }
 
@@ -2158,6 +2291,51 @@ fn hle_release_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
         |v| Some(v.saturating_sub(len)),
     );
     SCE_OK
+}
+
+/// `sceKernelCheckedReleaseDirectMemory(start, len)`: the strict twin of
+/// `sceKernelReleaseDirectMemory`. The unchecked form is best-effort by
+/// contract (freeing an untracked range is a successful no-op, see above);
+/// the CHECKED form validates and refuses:
+///
+/// * `start`/`len` must be page-aligned (`EINVAL`) — cross-checked against
+///   SharpEmu's `KernelCheckedReleaseDirectMemory` (GPL-2.0);
+/// * the whole range must lie inside one TRACKED direct-memory allocation,
+///   else `ENOENT` — a title probing with a wild or double-freed range gets
+///   a real refusal instead of a silent "success".
+///
+/// A zero length is valid and releases nothing (`SCE_OK`), as on the
+/// unchecked path.
+fn hle_checked_release_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
+    let start = args.first().copied().unwrap_or(0);
+    let len = args.get(1).copied().unwrap_or(0);
+    debug!("sceKernelCheckedReleaseDirectMemory(start={start:#x}, len={len:#x})");
+
+    let page_size = raeen_core::PS5_PAGE_SIZE as u64;
+    if start % page_size != 0 || len % page_size != 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    if len == 0 {
+        return SCE_OK;
+    }
+    let Some(end) = start.checked_add(len) else {
+        return SCE_KERNEL_ERROR_EINVAL;
+    };
+    let covers = ctx
+        .kernel
+        .memory
+        .region_containing(start)
+        .filter(|region| region.kind == raeen_core::types::MappingKind::Direct)
+        .and_then(|region| region.vaddr.checked_add(region.size))
+        .is_some_and(|region_end| end <= region_end);
+    if !covers {
+        debug!(
+            "sceKernelCheckedReleaseDirectMemory: [{start:#x}, {end:#x}) is not a tracked \
+             direct-memory allocation — ENOENT"
+        );
+        return SCE_KERNEL_ERROR_ENOENT;
+    }
+    hle_release_direct_memory(ctx, args)
 }
 
 fn hle_map_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -3376,6 +3554,77 @@ fn hle_virtual_query(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
+/// `sceKernelIsStack(addr, startOut, endOut)`: report whether `addr` lies in
+/// a region the kernel tracks as a thread STACK. Returns 1 with the region's
+/// bounds when it does; 0 otherwise.
+///
+/// Raeen records no `MappingKind::Stack` regions today (guest stacks are
+/// arena-owned, outside the VMM's region table), so the honest answer for
+/// every current query is 0. The outputs are still ZEROED in that case rather
+/// than left untouched: the caller (libc's VM allocator probing whether a
+/// range is a pthread stack) consumes them unconditionally, and stale stack
+/// garbage there becomes an invalid fixed-range reservation — the failure
+/// SharpEmu's `KernelIsStack` (GPL-2.0) documents, whose always-zero answer
+/// this matches for non-stack ranges.
+fn hle_is_stack(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    let start_out = args.get(1).copied().unwrap_or(0);
+    let end_out = args.get(2).copied().unwrap_or(0);
+    debug!("sceKernelIsStack(addr={addr:#x}, startOut={start_out:#x}, endOut={end_out:#x})");
+
+    let region = ctx.kernel.memory.region_containing(addr);
+    let stack = region.filter(|r| r.kind == raeen_core::types::MappingKind::Stack);
+    let (start, end) = match &stack {
+        Some(region) => (region.vaddr, region.vaddr.saturating_add(region.size)),
+        None => (0, 0),
+    };
+    if start_out != 0 && !ctx.mem.write(start_out, &start.to_le_bytes()) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    if end_out != 0 && !ctx.mem.write(end_out, &end.to_le_bytes()) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    u64::from(stack.is_some())
+}
+
+/// `sceKernelQueryMemoryProtection(addr, startOut, endOut, protOut)`: report
+/// the bounds and protection bits of the tracked mapping containing `addr`,
+/// from the same region table `sceKernelVirtualQuery` reads. Any out-pointer
+/// may be NULL. An address inside no tracked mapping is `ENOENT` (matching
+/// SharpEmu's `KernelQueryMemoryProtection`, GPL-2.0) — distinguishing
+/// "unmapped" from "mapped with no access", which `EACCES` would not.
+///
+/// `endOut` is the region's INCLUSIVE last byte (`base + size - 1`), the
+/// convention SharpEmu documents for this call; `sceKernelVirtualQuery`'s
+/// exclusive end is a different ABI and does not apply here.
+fn hle_query_memory_protection(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    let start_out = args.get(1).copied().unwrap_or(0);
+    let end_out = args.get(2).copied().unwrap_or(0);
+    let prot_out = args.get(3).copied().unwrap_or(0);
+    debug!(
+        "sceKernelQueryMemoryProtection(addr={addr:#x}, startOut={start_out:#x}, \
+         endOut={end_out:#x}, protOut={prot_out:#x})"
+    );
+
+    let Some(region) = ctx.kernel.memory.region_containing(addr) else {
+        debug!("sceKernelQueryMemoryProtection: {addr:#x} is in no tracked mapping — ENOENT");
+        return SCE_KERNEL_ERROR_ENOENT;
+    };
+    let inclusive_end = region.vaddr.saturating_add(region.size).saturating_sub(1);
+    let prot = region.protection.bits() as i32;
+    if start_out != 0 && !ctx.mem.write(start_out, &region.vaddr.to_le_bytes()) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    if end_out != 0 && !ctx.mem.write(end_out, &inclusive_end.to_le_bytes()) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    if prot_out != 0 && !ctx.mem.write(prot_out, &prot.to_le_bytes()) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    SCE_OK
+}
+
 /// `sceKernelCheckReachability(addr, ...)`: verify that the leading byte of
 /// the supplied guest address is mapped. Public symbol lists expose the name
 /// but not a stronger ABI contract; this bounded probe is therefore the
@@ -3675,6 +3924,13 @@ fn hle_stat(ctx: &HleContext, args: &[u64]) -> u64 {
     }
 }
 
+/// POSIX `stat(path, stat_out)`: the `-1` + `errno` twin of
+/// [`hle_stat`]'s SCE return convention, for the plain POSIX spelling
+/// imported from `libScePosix`.
+fn hle_posix_stat(ctx: &HleContext, args: &[u64]) -> u64 {
+    sce_result_posix(ctx, hle_stat(ctx, args))
+}
+
 fn write_orbis_device_stat(ctx: &HleContext, stat_out: u64) -> u64 {
     let mut stat = [0u8; ORBIS_STAT_SIZE];
     stat[4..8].copy_from_slice(&1u32.to_le_bytes());
@@ -3830,6 +4086,10 @@ fn hle_posix_rmdir(ctx: &HleContext, args: &[u64]) -> u64 {
 
 fn hle_sce_rename(ctx: &HleContext, args: &[u64]) -> u64 {
     file_result_sce(hle_rename_core(ctx, args))
+}
+
+fn hle_posix_rename(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_posix(ctx, hle_rename_core(ctx, args))
 }
 
 fn hle_sce_truncate(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -4342,7 +4602,7 @@ mod tests {
     /// DirectMemoryQuery reports the recorded allocation containing (or, with
     /// flags==1, following) the queried offset — shadPS4's OrbisQueryInfo
     /// `{start, end, memoryType}` — and EACCES for unallocated space.
-    #[test]
+    ///
     /// A direct-memory mapping must read back through `sceKernelVirtualQuery`
     /// as what the guest actually mapped: `is_direct` set, the physical offset
     /// echoed at 0x10, and the allocation `type` at 0x1C. All three used to be
@@ -4362,7 +4622,7 @@ mod tests {
         let alloc = crate::TestAllocator::new(0);
         let ctx = test_ctx(&kernel, &mem, &alloc);
 
-        let phys = 0x5b_c1_0000u64;
+        let phys = 0x5bc1_0000u64;
         let mapped = 0x40_0000u64;
         kernel.memory.record_mapping_of_kind(
             mapped,
@@ -5449,6 +5709,292 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `pwrite`/`ftruncate` through the HLE surface: positional writes land at
+    /// their offset without moving the cursor, truncation resizes the open
+    /// descriptor (and survives the flush-on-close), and the SCE/POSIX return
+    /// conventions wrap the same core.
+    #[test]
+    fn pwrite_and_ftruncate_go_through_the_vfs_like_write_and_truncate() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        // Nonzero alloc base: the POSIX adapters write `errno` through an
+        // arena-allocated slot, and address 0 reads as "no errno slot".
+        let alloc = crate::TestAllocator::new(0x800);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let tmp = std::env::temp_dir().join(format!("raeen-hle-pwrite-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        kernel.filesystem.set_game_directory(&tmp);
+
+        // open("/app0/blob.bin", O_RDWR|O_CREAT|O_TRUNC) and seed it.
+        assert!(mem.write(0x100, b"/app0/blob.bin\0"));
+        use raeen_kernel::filesystem::open_flags::*;
+        let flags = (O_RDWR | O_CREAT | O_TRUNC) as u64;
+        let fd = hle_open(&ctx, &[0x100, flags, 0o644]);
+        assert!((fd as i64) >= 3, "open must return a real fd, got {fd:#x}");
+        assert!(mem.write(0x200, b"aaaa"));
+        assert_eq!(hle_write(&ctx, &[fd, 0x200, 4]), 4);
+
+        // sceKernelPwrite at offset 1: lands at the offset, cursor stays at 4.
+        assert!(mem.write(0x210, b"ZZ"));
+        assert_eq!(hle_sce_pwrite(&ctx, &[fd, 0x210, 2, 1]), 2);
+        assert_eq!(
+            hle_lseek(&ctx, &[fd, 0, 1]),
+            4,
+            "pwrite must not move the cursor"
+        );
+        let mut back = [0u8; 4];
+        assert_eq!(hle_pread(&ctx, &[fd, 0x300, 4, 0]), 4);
+        assert!(mem.read(0x300, &mut back));
+        assert_eq!(&back, b"aZZa");
+
+        // POSIX pwrite failure shape: a negative offset is -1 + EINVAL (22).
+        assert_eq!(
+            hle_posix_pwrite(&ctx, &[fd, 0x210, 2, u64::MAX]),
+            (-1i64) as u64
+        );
+        let errno_slot = hle_error_addr(&ctx, &[]);
+        let mut errno = [0u8; 4];
+        assert!(mem.read(errno_slot, &mut errno));
+        assert_eq!(i32::from_le_bytes(errno), 22, "errno must hold EINVAL");
+
+        // sceKernelFtruncate shortens the open descriptor; the cursor is
+        // untouched (POSIX keeps the file offset), the flush keeps 3 bytes.
+        assert_eq!(hle_sce_ftruncate(&ctx, &[fd, 3]), SCE_OK);
+        assert_eq!(
+            hle_lseek(&ctx, &[fd, 0, 1]),
+            4,
+            "ftruncate must not move the cursor"
+        );
+        assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
+        assert_eq!(std::fs::read(tmp.join("blob.bin")).unwrap(), b"aZZ");
+
+        // ftruncate on a read-only fd is EBADF (SCE encoding); a negative
+        // length is EINVAL.
+        let fd = hle_open(&ctx, &[0x100, O_RDONLY as u64, 0]);
+        assert!((fd as i64) >= 3);
+        assert_eq!(hle_sce_ftruncate(&ctx, &[fd, 1]), 0x8002_0009);
+        assert_eq!(
+            hle_posix_ftruncate(&ctx, &[fd, (-1i64) as u64]),
+            (-1i64) as u64
+        );
+        assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
+        // Unknown fds are EBADF for both calls.
+        assert_eq!(hle_sce_pwrite(&ctx, &[0x7fff, 0x210, 1, 0]), 0x8002_0009);
+        assert_eq!(hle_sce_ftruncate(&ctx, &[0x7fff, 1]), 0x8002_0009);
+
+        let registry = HleRegistry::new();
+        for (lib, name) in [
+            ("libkernel", "sceKernelPwrite"),
+            ("libkernel", "pwrite"),
+            ("libScePosix", "pwrite"),
+            ("libkernel", "sceKernelFtruncate"),
+            ("libkernel", "ftruncate"),
+            ("libScePosix", "ftruncate"),
+        ] {
+            assert!(
+                registry.is_implemented(lib, name),
+                "{lib}::{name} must be registered"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The plain POSIX spellings `rename`/`stat`: same VFS behavior as the
+    /// sce* forms, `-1` + `errno` on failure.
+    #[test]
+    fn posix_rename_and_stat_adapt_the_sce_metadata_calls() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x800);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let tmp = std::env::temp_dir().join(format!("raeen-hle-posixfs-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("old.dat"), b"0123456789").unwrap();
+        kernel.filesystem.set_game_directory(&tmp);
+
+        // rename() moves the real host file; a missing source is -1 + ENOENT.
+        assert!(mem.write(0x100, b"/app0/old.dat\0"));
+        assert!(mem.write(0x140, b"/app0/new.dat\0"));
+        assert_eq!(hle_posix_rename(&ctx, &[0x100, 0x140]), 0);
+        assert_eq!(std::fs::read(tmp.join("new.dat")).unwrap(), b"0123456789");
+        assert_eq!(hle_posix_rename(&ctx, &[0x100, 0x140]), (-1i64) as u64);
+        let errno_slot = hle_error_addr(&ctx, &[]);
+        let mut errno = [0u8; 4];
+        assert!(mem.read(errno_slot, &mut errno));
+        assert_eq!(i32::from_le_bytes(errno), 2, "errno must hold ENOENT");
+
+        // stat() writes the 120-byte Orbis record (regular-file mode + size).
+        assert_eq!(hle_posix_stat(&ctx, &[0x140, 0x400]), 0);
+        let mut mode = [0u8; 2];
+        assert!(mem.read(0x400 + 8, &mut mode));
+        assert_eq!(u16::from_le_bytes(mode), ORBIS_MODE_REGULAR);
+        let mut size = [0u8; 8];
+        assert!(mem.read(0x400 + 72, &mut size));
+        assert_eq!(u64::from_le_bytes(size), 10);
+        // A missing path is -1 + ENOENT.
+        assert!(mem.write(0x180, b"/app0/absent.dat\0"));
+        assert_eq!(hle_posix_stat(&ctx, &[0x180, 0x400]), (-1i64) as u64);
+        assert!(mem.read(errno_slot, &mut errno));
+        assert_eq!(i32::from_le_bytes(errno), 2);
+
+        let registry = HleRegistry::new();
+        for (lib, name) in [
+            ("libkernel", "rename"),
+            ("libScePosix", "rename"),
+            ("libkernel", "stat"),
+            ("libScePosix", "stat"),
+        ] {
+            assert!(
+                registry.is_implemented(lib, name),
+                "{lib}::{name} must be registered"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `sceKernelQueryMemoryProtection` reports the tracked mapping's bounds
+    /// (inclusive end) and protection bits; `sceKernelIsStack` answers 1 with
+    /// bounds only for a region recorded as a stack.
+    #[test]
+    fn memory_protection_query_and_is_stack_read_the_region_table() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // A direct mapping, R+W.
+        kernel.memory.record_mapping_of_kind(
+            0x10_0000,
+            0x4000,
+            0x3,
+            raeen_core::types::MappingKind::Direct,
+            0x80,
+            12,
+        );
+        assert_eq!(
+            hle_query_memory_protection(&ctx, &[0x10_0100, 0x100, 0x108, 0x110]),
+            SCE_OK
+        );
+        let mut words = [0u8; 24];
+        assert!(mem.read(0x100, &mut words));
+        assert_eq!(
+            u64::from_le_bytes(words[0..8].try_into().unwrap()),
+            0x10_0000
+        );
+        assert_eq!(
+            u64::from_le_bytes(words[8..16].try_into().unwrap()),
+            0x10_0000 + 0x4000 - 1,
+            "end is the inclusive last byte"
+        );
+        assert_eq!(i32::from_le_bytes(words[16..20].try_into().unwrap()), 0x3);
+        // NULL out-pointers are permitted; an untracked address is ENOENT.
+        assert_eq!(
+            hle_query_memory_protection(&ctx, &[0x10_0100, 0, 0, 0]),
+            SCE_OK
+        );
+        assert_eq!(
+            hle_query_memory_protection(&ctx, &[0x30_0000, 0x100, 0x108, 0x110]),
+            SCE_KERNEL_ERROR_ENOENT
+        );
+
+        // IsStack: 0 (with zeroed outputs) for a non-stack region...
+        assert!(mem.write(0x120, &0xAAAA_AAAAu64.to_le_bytes()));
+        assert!(mem.write(0x128, &0xBBBB_BBBBu64.to_le_bytes()));
+        assert_eq!(hle_is_stack(&ctx, &[0x10_0100, 0x120, 0x128]), 0);
+        let mut out = [0u8; 16];
+        assert!(mem.read(0x120, &mut out));
+        assert_eq!(out, [0u8; 16], "non-stack outputs must be zeroed");
+        // ...and 1 with the region bounds for a recorded stack.
+        kernel.memory.record_mapping_of_kind(
+            0x20_0000,
+            0x8000,
+            0x3,
+            raeen_core::types::MappingKind::Stack,
+            0,
+            0,
+        );
+        assert_eq!(hle_is_stack(&ctx, &[0x20_4000, 0x120, 0x128]), 1);
+        assert!(mem.read(0x120, &mut out));
+        assert_eq!(u64::from_le_bytes(out[0..8].try_into().unwrap()), 0x20_0000);
+        assert_eq!(
+            u64::from_le_bytes(out[8..16].try_into().unwrap()),
+            0x20_0000 + 0x8000
+        );
+
+        let registry = HleRegistry::new();
+        for name in [
+            "sceKernelIsStack",
+            "sceKernelQueryMemoryProtection",
+            "sceKernelCheckedReleaseDirectMemory",
+            "sceKernelSetGPO",
+        ] {
+            assert!(
+                registry.is_implemented("libkernel", name),
+                "libkernel::{name} must be registered"
+            );
+        }
+    }
+
+    /// `sceKernelCheckedReleaseDirectMemory` validates where the unchecked
+    /// form is best-effort: misaligned → EINVAL, untracked → ENOENT, and a
+    /// real allocation releases (returning its budget) exactly once.
+    #[test]
+    fn checked_release_direct_memory_validates_then_releases() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x40000);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let page = raeen_core::PS5_PAGE_SIZE as u64;
+        // Misalignment and zero-length contract.
+        assert_eq!(
+            hle_checked_release_direct_memory(&ctx, &[0x123, page]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
+        assert_eq!(
+            hle_checked_release_direct_memory(&ctx, &[0x40000, 0x123]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
+        assert_eq!(hle_checked_release_direct_memory(&ctx, &[0, 0]), SCE_OK);
+        // An untracked (or already-released) range is ENOENT...
+        assert_eq!(
+            hle_checked_release_direct_memory(&ctx, &[0x40000, page]),
+            SCE_KERNEL_ERROR_ENOENT
+        );
+
+        // ...while a real direct allocation releases cleanly.
+        assert_eq!(
+            hle_allocate_direct_memory(&ctx, &[0, u64::MAX, page * 2, 0, 0, 0x600]),
+            SCE_OK
+        );
+        let mut phys_bytes = [0u8; 8];
+        assert!(mem.read(0x600, &mut phys_bytes));
+        let phys = u64::from_le_bytes(phys_bytes);
+        assert_eq!(phys % page, 0, "direct allocations are page-aligned");
+        assert_eq!(
+            hle_checked_release_direct_memory(&ctx, &[phys, page * 2]),
+            SCE_OK
+        );
+        assert!(
+            !kernel.memory.is_mapped(phys),
+            "the release must drop the region record"
+        );
+        // A second checked release of the same range is now ENOENT (the
+        // unchecked form stays a successful no-op by contract).
+        assert_eq!(
+            hle_checked_release_direct_memory(&ctx, &[phys, page * 2]),
+            SCE_KERNEL_ERROR_ENOENT
+        );
+        assert_eq!(hle_release_direct_memory(&ctx, &[phys, page * 2]), SCE_OK);
+
+        // SetGPO succeeds on retail (no devkit output lines to drive).
+        assert_eq!(hle_set_gpo(&ctx, &[0xFF]), SCE_OK);
     }
 
     #[test]

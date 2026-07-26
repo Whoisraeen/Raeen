@@ -781,6 +781,85 @@ impl VirtualFileSystem {
         }
     }
 
+    /// Positional write (`pwrite`): write `bytes` at absolute `offset` WITHOUT
+    /// moving the descriptor's position — the write-side twin of
+    /// [`pread`](Self::pread), for streaming loaders that issue ordered writes
+    /// against one shared fd from several threads. A read-only fd is rejected
+    /// with `PermissionDenied`; an unknown fd with `NotFound`.
+    ///
+    /// Extends the write-back buffer (zero-filling any sparse gap, like POSIX)
+    /// and marks the fd dirty so [`close`](Self::close) persists it, exactly as
+    /// [`write`](Self::write) does — only the cursor handling differs.
+    pub fn pwrite(&self, fd: Fd, bytes: &[u8], offset: u64) -> Result<usize, std::io::Error> {
+        let files = self.open_files.read();
+        let Some(file) = files.get(&fd) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("fd {fd} not open"),
+            ));
+        };
+        if !file.writable {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fd not opened for writing",
+            ));
+        }
+        let pos = usize::try_from(offset).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "offset too large")
+        })?;
+        let mut inner = file.inner.lock();
+        let buf = inner.data.get_or_insert_with(Vec::new);
+        if pos > buf.len() {
+            buf.resize(pos, 0); // sparse gap → zero-fill
+        }
+        let end = pos.checked_add(bytes.len()).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "offset overflow")
+        })?;
+        if end > buf.len() {
+            buf.resize(end, 0);
+        }
+        buf[pos..end].copy_from_slice(bytes);
+        inner.dirty = true;
+        debug!("VFS pwrite: fd={fd}, {} bytes at {pos}", bytes.len());
+        Ok(bytes.len())
+    }
+
+    /// Truncate (or zero-extend) an OPEN descriptor to `len` bytes
+    /// (`ftruncate`). Resizes the fd's write-back buffer so the new length
+    /// survives the flush-on-close: shrinking drops the tail, extending
+    /// zero-fills — both matching POSIX. A read-only fd is rejected with
+    /// `PermissionDenied`; an unknown fd with `NotFound`.
+    ///
+    /// Note the extension is materialized in the buffer (the same allocation
+    /// exposure `write` already accepts when a guest seeks far past EOF and
+    /// writes): this VFS has no sparse-file representation.
+    pub fn ftruncate(&self, fd: Fd, len: u64) -> Result<(), std::io::Error> {
+        let files = self.open_files.read();
+        let Some(file) = files.get(&fd) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("fd {fd} not open"),
+            ));
+        };
+        if !file.writable {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fd not opened for writing",
+            ));
+        }
+        let len = usize::try_from(len).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "length too large")
+        })?;
+        let mut inner = file.inner.lock();
+        let buf = inner.data.get_or_insert_with(Vec::new);
+        buf.resize(len, 0);
+        // A truncation past the cursor leaves the cursor where it was (POSIX
+        // keeps the file offset unchanged), so no `position` update here.
+        inner.dirty = true;
+        debug!("VFS ftruncate: fd={fd} -> {len} bytes");
+        Ok(())
+    }
+
     /// Reposition an open file descriptor. `whence` follows POSIX:
     /// `SEEK_SET` (0) = absolute, `SEEK_CUR` (1) = relative to current,
     /// `SEEK_END` (2) = relative to end-of-file. Returns the new absolute
@@ -1294,6 +1373,89 @@ mod tests {
         let fd2 = vfs.open("/app0/save.bin", O_RDONLY, 0).unwrap();
         assert_eq!(vfs.read(fd2, 8).unwrap(), b"SAVEDATA");
         vfs.close(fd2).unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pwrite_writes_at_an_offset_without_moving_the_cursor() {
+        use open_flags::*;
+        let dir = temp_dir("pwrite");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+
+        let fd = vfs
+            .open("/app0/blob.bin", O_RDWR | O_CREAT | O_TRUNC, 0o644)
+            .unwrap();
+        assert_eq!(vfs.write(fd, b"aaaa").unwrap(), 4);
+        // Positional write at offset 1 leaves the cursor at 4.
+        assert_eq!(vfs.pwrite(fd, b"ZZ", 1).unwrap(), 2);
+        assert_eq!(vfs.seek(fd, 0, 1).unwrap(), 4, "cursor unmoved by pwrite");
+        // pwrite into the buffered content reads back through pread...
+        assert_eq!(vfs.pread(fd, 4, 0).unwrap(), b"aZZa");
+        // ...and persists through the flush-on-close.
+        vfs.close(fd).unwrap();
+        assert_eq!(std::fs::read(dir.join("blob.bin")).unwrap(), b"aZZa");
+
+        // A sparse pwrite zero-fills the gap, like POSIX.
+        let fd = vfs
+            .open("/app0/sparse.bin", O_RDWR | O_CREAT | O_TRUNC, 0o644)
+            .unwrap();
+        assert_eq!(vfs.pwrite(fd, b"end", 6).unwrap(), 3);
+        assert_eq!(vfs.pread(fd, 9, 0).unwrap(), b"\0\0\0\0\0\0end");
+        vfs.close(fd).unwrap();
+
+        // Read-only and unknown fds are rejected.
+        let fd = vfs.open("/app0/blob.bin", O_RDONLY, 0).unwrap();
+        assert_eq!(
+            vfs.pwrite(fd, b"x", 0).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        vfs.close(fd).unwrap();
+        assert_eq!(
+            vfs.pwrite(0x7fff, b"x", 0).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ftruncate_shrinks_and_zero_extends_the_open_descriptor() {
+        use open_flags::*;
+        let dir = temp_dir("ftruncate");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+
+        let fd = vfs
+            .open("/app0/file.bin", O_RDWR | O_CREAT | O_TRUNC, 0o644)
+            .unwrap();
+        assert_eq!(vfs.write(fd, b"0123456789").unwrap(), 10);
+        // Shrink drops the tail and survives the flush.
+        vfs.ftruncate(fd, 4).unwrap();
+        assert_eq!(vfs.file_size(fd), Some(4));
+        vfs.close(fd).unwrap();
+        assert_eq!(std::fs::read(dir.join("file.bin")).unwrap(), b"0123");
+
+        // Extend zero-fills; POSIX leaves the file offset alone.
+        let fd = vfs.open("/app0/file.bin", O_RDWR, 0).unwrap();
+        vfs.ftruncate(fd, 6).unwrap();
+        assert_eq!(vfs.file_size(fd), Some(6));
+        assert_eq!(vfs.pread(fd, 6, 0).unwrap(), b"0123\0\0");
+        vfs.close(fd).unwrap();
+        assert_eq!(std::fs::read(dir.join("file.bin")).unwrap(), b"0123\0\0");
+
+        // Read-only and unknown fds are rejected.
+        let fd = vfs.open("/app0/file.bin", O_RDONLY, 0).unwrap();
+        assert_eq!(
+            vfs.ftruncate(fd, 1).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        vfs.close(fd).unwrap();
+        assert_eq!(
+            vfs.ftruncate(0x7fff, 1).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

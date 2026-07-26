@@ -371,7 +371,7 @@ mod tests {
         let alloc = crate::TestAllocator::new(0);
         let ctx = test_ctx(&kernel, &mem, &alloc);
 
-        let family: [(&str, fn(&HleContext, &[u64]) -> u64); 4] = [
+        let family: [(&str, crate::HleFunction); 4] = [
             (
                 "ChatTranscription",
                 hle_get_accessibility_chat_transcription,

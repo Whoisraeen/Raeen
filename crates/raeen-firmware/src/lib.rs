@@ -37,28 +37,30 @@ pub use sprx::{
 
 use raeen_core::error::FirmwareError;
 
-/// End-to-end LM1 pipeline: SELF decrypt-or-passthrough -> `.sprx` parse ->
-/// `PT_SCE_DYNLIBDATA` decode -> export registration -> link.
+/// The decoded static view of a module: its parsed `.sprx` structure plus the
+/// decoded dynamic tables (imports, exports, relocations, NEEDED names).
+#[derive(Debug, Clone)]
+pub struct InspectedModule {
+    /// The parsed module (segments, entry, TLS template, …).
+    pub module: sprx::SprxModule,
+    /// The decoded dynamic tables: imports, exports, relocations, NEEDED
+    /// dependency names, and the import library/module name maps.
+    pub dynlib: dynlib::DynlibData,
+}
+
+/// SELF decrypt-or-passthrough -> `.sprx` parse -> dynamic-table decode, with
+/// no relocation and no HLE: the static view of what a module imports,
+/// exports, and needs. [`load_module`] is built on this, so a diagnostics
+/// tool and the loader can never disagree about a module's contents.
 ///
-/// This is the convenience chain Task 6 handed off: [`crypto::decrypt_self`]
-/// (missing-key is a genuine, propagated `Err` — a caller with no matching
-/// key gets `FirmwareError::MissingKey` here, not a partial result), then
-/// [`sprx::parse_sprx`], then (if the module has a `PT_DYNAMIC` segment)
-/// [`dynlib::parse_sce_dynamic`] + [`dynlib::parse_dynlibdata`] — a module
-/// with no `dynamic`/`dynlib_data` is treated as having zero imports/
-/// exports/relocations, not an error. The decoded exports are registered
-/// into `registry` (so later-loaded modules can resolve LLE imports against
-/// this one), then [`dynlib::linker::link_module`] performs the actual
-/// relocation. An unresolved import NID is recorded in the returned
-/// [`LinkedModule::unresolved`] and logged, non-fatal — only a genuine
-/// parse/decrypt/link error propagates as `Err`.
-pub fn load_module(
+/// Errors propagate exactly as in [`load_module`]: an encrypted SELF with no
+/// matching key is a genuine, propagated `Err` (a caller with no key gets
+/// `FirmwareError::MissingKey`, not a partial result); a module with no
+/// `dynamic`/`dynlib_data` decodes as zero imports/exports/relocations.
+pub fn inspect_module(
     bytes: &[u8],
     provider: &dyn crypto::KeyProvider,
-    registry: &mut registry::ModuleRegistry,
-    hle: &raeen_hle::HleRegistry,
-    base: u64,
-) -> Result<dynlib::linker::LinkedModule, FirmwareError> {
+) -> Result<InspectedModule, FirmwareError> {
     let decrypted = crypto::self_crypto::decrypt_self(bytes, provider)?;
     let module = sprx::parse_sprx(&decrypted.elf)?;
     let dyn_tags = match &module.dynamic {
@@ -71,10 +73,32 @@ pub fn load_module(
     // standard `DT_STRTAB`/`DT_SYMTAB`/... tags holding **virtual addresses**.
     // Try the standard model first; fall back to the blob.
     let standard = dynlib::standard_dynamic_view(&module.segments, &dyn_tags);
-    let dynlib_data = match &standard {
+    let dynlib = match &standard {
         Some((image, tags)) => dynlib::parse_dynlibdata(image, tags)?,
         None => dynlib::parse_dynlibdata(module.dynlib_data.as_deref().unwrap_or(&[]), &dyn_tags)?,
     };
+    Ok(InspectedModule { module, dynlib })
+}
+
+/// End-to-end LM1 pipeline: [`inspect_module`] (SELF decrypt-or-passthrough ->
+/// `.sprx` parse -> `PT_SCE_DYNLIBDATA` decode) -> export registration -> link.
+///
+/// The decoded exports are registered into `registry` (so later-loaded modules
+/// can resolve LLE imports against this one), then [`dynlib::linker::link_module`]
+/// performs the actual relocation. An unresolved import NID is recorded in the
+/// returned [`LinkedModule::unresolved`] and logged, non-fatal — only a genuine
+/// parse/decrypt/link error propagates as `Err`.
+pub fn load_module(
+    bytes: &[u8],
+    provider: &dyn crypto::KeyProvider,
+    registry: &mut registry::ModuleRegistry,
+    hle: &raeen_hle::HleRegistry,
+    base: u64,
+) -> Result<dynlib::linker::LinkedModule, FirmwareError> {
+    let InspectedModule {
+        module,
+        dynlib: dynlib_data,
+    } = inspect_module(bytes, provider)?;
 
     // M1-D (wall #4): surface the NEEDED dependency chain loudly instead of
     // silently dropping it. Imports resolve by NID against the HLE registry
@@ -425,6 +449,23 @@ fn build_hle_data_page(registry: &mut registry::ModuleRegistry, page_base: u64) 
         page.len()
     );
     page
+}
+
+/// The `(provider, symbol)` data exports [`build_hle_data_page`] registers, in
+/// static form for tools that model import resolution without building a
+/// process image (e.g. `cargo xtask nids coverage`). Kept in sync by
+/// `tests::hle_data_page_resolves_every_listed_export`.
+pub fn hle_data_page_export_names() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("libkernel", "__stack_chk_guard"),
+        ("libkernel", "in6addr_any"),
+        ("libkernel", "in6addr_loopback"),
+        ("libkernel", "__progname"),
+        ("libkernel", "Need_sceLibcInternal"),
+        ("libSceNet", "in6addr_any"),
+        ("libSceNet", "in6addr_loopback"),
+        ("libSceLibcInternal", "Need_sceLibcInternal"),
+    ]
 }
 
 /// SELF decrypt-or-passthrough -> `parse_sprx` -> dynamic decode, handling both
@@ -1568,6 +1609,26 @@ mod tests {
         let mut expected = [0u8; 16];
         expected[15] = 1;
         assert_eq!(&page[loopback_offset..loopback_offset + 16], &expected);
+    }
+
+    /// The static `(provider, symbol)` view [`hle_data_page_export_names`]
+    /// must never drift from what the page actually registers: it exists so
+    /// diagnostics (NID coverage) model the same resolution the loader does.
+    #[test]
+    fn hle_data_page_resolves_every_listed_export() {
+        let hle = raeen_hle::HleRegistry::new();
+        let mut registry = ModuleRegistry::new(NidDatabase::from_hle(&hle));
+        let _page = super::build_hle_data_page(&mut registry, 0x1000);
+        for (provider, name) in super::hle_data_page_export_names() {
+            let nid = nid_of(name);
+            assert!(
+                matches!(
+                    registry.resolve_import(&hle, provider, provider, nid),
+                    Resolver::Lle { .. }
+                ),
+                "{provider}::{name} is listed but does not resolve as guest data"
+            );
+        }
     }
 
     #[test]

@@ -642,22 +642,58 @@ struct ActiveContext {
     armed: Cell<bool>,
 }
 
-/// Runtime-private slot in the guest TCB used only by the generated direct
-/// bridge. It deliberately lives at the end of Raeen's 0x800-byte TCB
-/// allocation, outside the ABI fields at the front.
-const DIRECT_STATE_TCB_OFFSET: u64 = 0x7f0;
 const DIRECT_HOST_STACK_SIZE: usize = 256 * 1024;
 
 #[repr(C)]
 struct DirectThreadState {
     context: *mut ActiveContext,
     host_stack_top: u64,
+    previous_teb_slot: u64,
+}
+
+/// Read the x64 TEB's `NT_TIB.ArbitraryUserPointer` (`GS:[0x28]`).
+///
+/// Windows owns and preserves GS as the TEB base across context switches,
+/// while Raeen deliberately replaces FS with the guest TCB. The arbitrary
+/// pointer field is the application-owned per-thread slot used by the direct
+/// HLE bridge so a preemption cannot turn its state pointer into unrelated TEB
+/// bytes. The previous value is restored when the guarded guest call ends.
+fn direct_state_slot() -> u64 {
+    let value: u64;
+    // SAFETY: on Windows x86-64 GS addresses the current thread's valid TEB;
+    // offset 0x28 is the pointer-sized ArbitraryUserPointer field. This is a
+    // read only and neither changes the segment base nor dereferences `value`.
+    unsafe {
+        core::arch::asm!(
+            "mov {value}, qword ptr gs:[0x28]",
+            value = out(reg) value,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    value
+}
+
+fn set_direct_state_slot(value: u64) {
+    // SAFETY: same TEB layout invariant as `direct_state_slot`. The field is
+    // explicitly application-owned, the value points at a live boxed
+    // DirectThreadState, and `run` restores the prior value before returning.
+    unsafe {
+        core::arch::asm!(
+            "mov qword ptr gs:[0x28], {value}",
+            value = in(reg) value,
+            options(nostack, preserves_flags)
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct GuestCallbackFrame {
     original_return: u64,
     hle_result: u64,
+    /// Whether the HLE call that scheduled this callback was registered
+    /// float-returning — the result lands in guest XMM0 as well as RAX
+    /// when the frame completes (see [`apply_hle_result`]).
+    float_return: bool,
     completion: Option<GuestCallCompletion>,
 }
 
@@ -823,6 +859,31 @@ struct AlignedContext(CONTEXT);
 
 fn never_returns(value: core::convert::Infallible) -> ! {
     match value {}
+}
+
+/// Deliver an HLE call's result to the suspended guest context: always in
+/// RAX, and — when the function was registered float-returning
+/// ([`raeen_hle::HleRegistry::register_float`]) — ALSO in XMM0, the SysV
+/// floating-point return register. Without the second write a `double`/
+/// `float` result would never reach the caller: SysV does not look in RAX
+/// for it. Used by every HLE writeback site on the VEH path; the direct
+/// gateway performs the same delivery in its generated float bridge
+/// (`trampoline::direct_bridge_code_float`), keeping the two call paths
+/// register-identical.
+fn apply_hle_result(context: &mut CONTEXT, result: u64, float_return: bool) {
+    context.Rax = result;
+    if float_return {
+        // SAFETY: identical invariant to the float-argument capture further
+        // down — `Anonymous` unions the per-register view with `FltSave`
+        // (XSAVE_FORMAT) over the same bytes, and the VEH's exception
+        // context is CONTEXT_FULL (CONTEXT_ALL_AMD64), so slot 0's Low/High
+        // are valid to write; the resume commits the whole record to the
+        // thread. High is zeroed so an f32 result's upper lane is
+        // deterministic rather than stale argument bits.
+        let xmm0 = unsafe { &mut context.Anonymous.FltSave.XmmRegisters[0] };
+        xmm0.Low = result;
+        xmm0.High = 0;
+    }
 }
 
 thread_local! {
@@ -1115,6 +1176,7 @@ pub(crate) unsafe fn run(
     let mut direct_state = Box::new(DirectThreadState {
         context: ptr::null_mut(),
         host_stack_top: direct_host_stack_top,
+        previous_teb_slot: 0,
     });
 
     let ctx = ActiveContext {
@@ -1151,14 +1213,6 @@ pub(crate) unsafe fn run(
         armed: Cell::new(false),
     };
     direct_state.context = &ctx as *const ActiveContext as *mut ActiveContext;
-    if let Some(tcb_addr) = tcb
-        && !mem.write(
-            tcb_addr + DIRECT_STATE_TCB_OFFSET,
-            &(direct_state.as_ref() as *const DirectThreadState as u64).to_le_bytes(),
-        )
-    {
-        return Err(RuntimeError::MapFailed);
-    }
 
     ensure_veh()?;
 
@@ -1233,6 +1287,8 @@ pub(crate) unsafe fn run(
     //     }`, set by `veh_callback` before it restored us here.
     if !ctx.resumed.get() {
         ctx.resumed.set(true);
+        direct_state.previous_teb_slot = direct_state_slot();
+        set_direct_state_slot(direct_state.as_ref() as *const DirectThreadState as u64);
         if ctx.tls_active.get() {
             // SAFETY: `ctx.tls_active` is only `true` when
             // `fsgsbase_available()` returned `true` (checked above, before
@@ -1292,9 +1348,7 @@ pub(crate) unsafe fn run(
         }
     }
 
-    if let Some(tcb_addr) = tcb {
-        let _ = mem.write(tcb_addr + DIRECT_STATE_TCB_OFFSET, &0u64.to_le_bytes());
-    }
+    set_direct_state_slot(direct_state.previous_teb_slot);
 
     ACTIVE_CONTEXT.with(|slot| slot.set(ptr::null_mut()));
 
@@ -2147,7 +2201,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             if let Some(completion) = frame.completion {
                 let _ = mem.atomic_store_u32(completion.address, completion.success_u32);
             }
-            context.Rax = frame.hle_result;
+            apply_hle_result(context, frame.hle_result, frame.float_return);
             resume_guest_with_tls(ctx, context, mem, frame.original_return, context.Rsp);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -2291,41 +2345,57 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         // Only the first was handled before, which meant a data import left at
         // a stub reported an anonymous `Faulted` at whatever innocent
         // instruction happened to read it — hiding the actual missing symbol.
-        // Resume-with-error on a CALLED unresolved import (opt-in via
-        // RAEEN_RESUME_ON_MISSING). The guest jumped straight INTO a missing-NID
-        // stub (Rip *is* the stub), i.e. it CALLed a system function we don't
-        // implement. Rather than abort the whole title, return a generic Orbis
-        // error in RAX and continue at the caller's return address — this is how
-        // SharpEmu sails past optional/unstubbed calls to reach a title's
-        // splash/video-out (measured: unblocks ASTRO.BOT past scePngDecDecode).
-        // Only the CALLED case is safe to fake; a data READ of a stub can't be
-        // (no valid value to hand back), so it still faults below.
-        static RESUME_ON_MISSING: OnceLock<bool> = OnceLock::new();
-        static MISSING_IMPORT_CALLS: AtomicU64 = AtomicU64::new(0);
-        if *RESUME_ON_MISSING.get_or_init(|| std::env::var_os("RAEEN_RESUME_ON_MISSING").is_some())
-            && let Some(s) = stub::resolve(fault_addr, stubs)
-        {
-            // SAFETY: `ctx.mem` is the live guest memory view for this
-            // guarded call (same invariant used elsewhere in this handler).
+        // A CALLED unresolved import is a compatibility-inventory event by
+        // default, not an immediate process terminator. Return zero and resume
+        // at the caller so one 180-second run can expose the complete missing
+        // NID surface instead of stopping at the first optional service.
+        //
+        // `RAEEN_STRICT_NIDS=1` restores the hard-fail behavior for ABI
+        // development and acceptance tests. Data READs remain hard failures:
+        // unlike a call, there is no return address and no honest value to
+        // synthesize for an unresolved imported object.
+        static STRICT_NIDS: OnceLock<bool> = OnceLock::new();
+        if let Some(s) = stub::resolve(fault_addr, stubs) {
+            // SAFETY: `ctx.mem` and `ctx.kernel` are the live process objects
+            // installed by `run`; the VEH is synchronous on that same thread.
             let mem = unsafe { &*ctx.mem };
+            let kernel = unsafe { &*ctx.kernel };
             let mut ret = [0u8; 8];
-            if mem.read(context.Rsp, &mut ret) {
-                let n = MISSING_IMPORT_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
-                if n <= 8 || n.is_power_of_two() {
-                    tracing::warn!(
-                        nid = format_args!("{:#018x}", s.nid),
-                        library = s.library.as_deref().unwrap_or("<unknown>"),
-                        function = raeen_firmware::dynlib::nid_names::describe(s.nid),
-                        count = n,
-                        "unresolved import CALLED — returning SCE error and resuming \
-                         (RAEEN_RESUME_ON_MISSING)"
-                    );
-                }
-                context.Rip = u64::from_le_bytes(ret);
+            let has_return = mem.read(context.Rsp, &mut ret);
+            let return_addr = has_return.then(|| u64::from_le_bytes(ret));
+            let caller = return_addr.and_then(|addr| kernel.unwind_module_for_addr(addr));
+            let calling_module = caller
+                .as_ref()
+                .map_or_else(|| "<unknown>".to_owned(), |module| module.name.clone());
+            let caller_offset = caller
+                .as_ref()
+                .zip(return_addr)
+                .map(|(module, addr)| addr.saturating_sub(module.start));
+            let library = s.library.as_deref().unwrap_or("<unknown>");
+            let function = raeen_firmware::dynlib::nid_names::describe(s.nid);
+            let (first_occurrence, count) =
+                kernel.record_unresolved_nid_call(s.nid, &function, library, &calling_module);
+            let strict =
+                *STRICT_NIDS.get_or_init(|| std::env::var_os("RAEEN_STRICT_NIDS").is_some());
+            if first_occurrence {
+                tracing::warn!(
+                    nid = format_args!("{:#018x}", s.nid),
+                    library,
+                    function,
+                    calling_module,
+                    caller_offset = caller_offset.map(|offset| format!("{offset:#x}")),
+                    count,
+                    strict,
+                    "UNRESOLVED NID CALLED"
+                );
+            }
+            if !strict && let Some(return_addr) = return_addr {
+                context.Rip = return_addr;
                 context.Rsp = context.Rsp.wrapping_add(8);
-                // Generic SCE error (negative i32) — safer than faking
-                // success, which would hand the caller uninitialized output.
-                context.Rax = 0x8000_0000;
+                // Phase 0 deliberately uses the least-assumptive success
+                // value. Implemented HLE must replace this before compatibility
+                // can be published; the inventory makes every gap visible.
+                context.Rax = 0;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
@@ -2409,7 +2479,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     let mem = unsafe { &*ctx.mem };
     let alloc = unsafe { &*ctx.alloc };
 
-    let result = match trampoline::resolve(fault_addr, trampolines) {
+    let (result, float_return) = match trampoline::resolve(fault_addr, trampolines) {
         Some(t) => {
             let idx = fault_addr.wrapping_sub(ctx.region_base) / 8;
             let mut return_bytes = [0u8; 8];
@@ -2746,7 +2816,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             // this history is the only thing that names the culprit (see
             // `CallTrace`). Index, not name — no allocation in the VEH.
             ctx.trace.push(idx as u32, ret, [args[0], args[1], args[2]]);
-            ret
+            (ret, hle.returns_float(&t.library, &t.function))
         }
         None => {
             // A call landed in the guarded region but names no known
@@ -2759,7 +2829,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 .wrapping_add(fault_addr.wrapping_sub(ctx.region_base));
             ctx.error
                 .set(Some(RuntimeError::UnresolvedTrampoline(linker_visible)));
-            0
+            (0, false)
         }
     };
 
@@ -2774,6 +2844,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             ctx.callback_frames.borrow_mut().push(GuestCallbackFrame {
                 original_return: u64::from_le_bytes(original_return),
                 hle_result: result,
+                float_return,
                 completion: request.completion,
             });
             let callback_rsp = context.Rsp;
@@ -2793,7 +2864,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         }
     }
 
-    context.Rax = result;
+    apply_hle_result(context, result, float_return);
 
     // Emulate the `call` instruction's target returning. The CPU already
     // pushed the return address before faulting on the instruction fetch at
@@ -2819,4 +2890,63 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     resume_guest_with_tls(ctx, context, mem, ret_addr, return_rsp);
 
     EXCEPTION_CONTINUE_EXECUTION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_state_teb_slot_round_trips_without_touching_guest_fs() {
+        let original = direct_state_slot();
+        let marker = 0x5241_4545_4E50_4830;
+        set_direct_state_slot(marker);
+        assert_eq!(direct_state_slot(), marker);
+        set_direct_state_slot(original);
+        assert_eq!(direct_state_slot(), original);
+    }
+
+    /// The float-return channel on the VEH path: a float-marked HLE result
+    /// lands in guest XMM0 (and RAX); an ordinary result touches RAX only.
+    /// This is the exact writeback both the main HLE return and the nested
+    /// guest-callback return perform.
+    #[test]
+    fn apply_hle_result_writes_xmm0_only_for_float_returns() {
+        const ONE_F64: u64 = 0x3FF0_0000_0000_0000; // 1.0
+
+        // SAFETY: CONTEXT is a plain repr(C) POD (Copy); an all-zero record
+        // is a valid starting state for this write-only test, and the union
+        // reads below view bytes the helper just wrote.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        apply_hle_result(&mut context, ONE_F64, true);
+        assert_eq!(context.Rax, ONE_F64);
+        // SAFETY: per the zeroing note above — `Anonymous` aliases `FltSave`
+        // with the per-register view over the same live bytes.
+        let xmm0 = unsafe { &context.Anonymous.FltSave.XmmRegisters[0] };
+        assert_eq!(xmm0.Low, ONE_F64, "the f64 bits must reach guest XMM0");
+        assert_eq!(xmm0.High, 0);
+
+        // SAFETY: same POD zeroing reasoning.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        apply_hle_result(&mut context, 7, false);
+        assert_eq!(context.Rax, 7);
+        // SAFETY: same union-view reasoning.
+        let xmm0 = unsafe { &context.Anonymous.FltSave.XmmRegisters[0] };
+        assert_eq!(xmm0.Low, 0, "integer results leave guest XMM0 untouched");
+    }
+
+    /// An f32 result's bits arrive zero-extended, with the upper lane of
+    /// XMM0 cleared (not stale argument state).
+    #[test]
+    fn apply_hle_result_zero_extends_f32_bits() {
+        const ONE_F32_BITS: u64 = 0x3F80_0000; // 1.0f32, zero-extended
+        // SAFETY: same POD zeroing reasoning as the sibling test.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        apply_hle_result(&mut context, ONE_F32_BITS, true);
+        // SAFETY: same union-view reasoning.
+        let xmm0 = unsafe { &context.Anonymous.FltSave.XmmRegisters[0] };
+        assert_eq!(xmm0.Low, ONE_F32_BITS);
+        assert_eq!(f32::from_bits(xmm0.Low as u32), 1.0);
+        assert_eq!(xmm0.High, 0);
+    }
 }

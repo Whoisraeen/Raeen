@@ -492,8 +492,10 @@ mod tests {
     #[test]
     fn log_level_override_wins_over_global() {
         let g = global();
-        let mut pg = PerGameSettings::default();
-        pg.log_level = Some("trace".to_string());
+        let pg = PerGameSettings {
+            log_level: Some("trace".to_string()),
+            ..PerGameSettings::default()
+        };
         assert_eq!(pg.effective(&g).debug.log_level, "trace");
     }
 

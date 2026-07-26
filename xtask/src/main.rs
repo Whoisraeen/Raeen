@@ -1,3 +1,4 @@
+mod nids;
 mod schema;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -49,6 +50,8 @@ fn main() -> Result<()> {
         compat_compare(rest)
     } else if area == "refs" && command == "report" {
         refs_report(rest)
+    } else if area == "nids" && command == "coverage" {
+        nids::coverage(rest)
     } else if area == "acceptance" && command == "run" {
         acceptance_run(rest)
     } else if area == "--help" || area == "-h" {
@@ -69,6 +72,7 @@ fn print_help() {
   cargo xtask compat compare --baseline PATH [--current PATH]
   cargo xtask compat publish [--input PATH] [--output compat/COMPATIBILITY.md]
   cargo xtask refs report [--state compat/reference-state.json] [--output PATH] [--fetch]
+  cargo xtask nids coverage [--registry PATH] [--eboot PATH] [--output PATH] [--full]
   cargo xtask acceptance run [--output PATH] [--timeout SECONDS]
 
 Raw logs, executable paths, and local machine details stay under gitignored artifacts/.

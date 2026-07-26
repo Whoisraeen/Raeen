@@ -966,7 +966,7 @@ mod tests {
         assert_eq!(hle_context_push(&ctx, &[ctx_handle, 0]), OK);
         let after = raeen_audio::output::submit_call_count();
         assert!(
-            after >= before + 1,
+            after > before,
             "push must invoke the stereo-f32 submit path ({before} -> {after})"
         );
     }

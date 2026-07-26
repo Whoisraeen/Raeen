@@ -47,6 +47,19 @@ pub enum AgcExecError {
     AddressSpaceUnavailable,
 }
 
+/// Always-on, low-overhead wall-clock breakdown for the latest completed
+/// VideoOut frame. Values are microseconds so the child runner can copy them
+/// through shared memory without floating-point or allocation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PresentTiming {
+    pub worker_drain_us: u64,
+    pub fence_wait_us: u64,
+    pub readback_us: u64,
+    pub srgb_encode_us: u64,
+    /// Filled by the Shell after `ColorImage` construction and texture upload.
+    pub egui_upload_us: u64,
+}
+
 /// How many submitted DCBs may be in flight before a submitter blocks.
 ///
 /// Backpressure is not optional: a title submits faster than this session
@@ -154,6 +167,9 @@ enum GpuWork {
     /// flip latent, which is standard swapchain behaviour.
     Flush {
         address: Option<u64>,
+        /// When this ordered flush entered the worker queue. The delta at
+        /// dequeue is the guest-visible worker-drain backlog.
+        queued_at: std::time::Instant,
         done: Option<std::sync::mpsc::SyncSender<()>>,
         /// Frames-in-flight permit for the bounded fire-and-forget flip path
         /// (item 7 / rank 7). Held from before this flush is enqueued until
@@ -395,6 +411,12 @@ pub struct AgcGpuSession {
     /// bootstrap session and in-process tests; the isolated runner receives
     /// the mapping name through [`crate::frame_ipc::FRAME_IPC_ENV`].
     frame_publisher: Option<crate::frame_ipc::FrameIpcPublisher>,
+    /// Latest completed-frame timing, stored as independent relaxed atomics so
+    /// the HUD read and child IPC publish need no mutex on the flip hot path.
+    present_worker_drain_us: AtomicU64,
+    present_fence_wait_us: AtomicU64,
+    present_readback_us: AtomicU64,
+    present_srgb_encode_us: AtomicU64,
 }
 
 /// Cap on how many live guest-scanout snapshots
@@ -674,6 +696,10 @@ impl AgcGpuSession {
             present_epoch: AtomicU64::new(0),
             guest_scanout_snapshots: Mutex::new(std::collections::HashMap::new()),
             frame_publisher: None,
+            present_worker_drain_us: AtomicU64::new(0),
+            present_fence_wait_us: AtomicU64::new(0),
+            present_readback_us: AtomicU64::new(0),
+            present_srgb_encode_us: AtomicU64::new(0),
         }
     }
 
@@ -712,6 +738,18 @@ impl AgcGpuSession {
         self.present_epoch.load(Ordering::Relaxed)
     }
 
+    /// Timing breakdown attached to the newest completed frame.
+    #[must_use]
+    pub fn present_timing(&self) -> PresentTiming {
+        PresentTiming {
+            worker_drain_us: self.present_worker_drain_us.load(Ordering::Relaxed),
+            fence_wait_us: self.present_fence_wait_us.load(Ordering::Relaxed),
+            readback_us: self.present_readback_us.load(Ordering::Relaxed),
+            srgb_encode_us: self.present_srgb_encode_us.load(Ordering::Relaxed),
+            egui_upload_us: 0,
+        }
+    }
+
     /// Publish a fully-read-back (fence-complete) or snapshot-complete frame as
     /// the presented image and advance [`Self::present_epoch`] so the Shell
     /// refreshes. This is the ONLY way a title frame reaches `last_image`, so
@@ -724,7 +762,7 @@ impl AgcGpuSession {
         // COMPLETE" invariant and the default present cost are both unchanged.
         let presented = crate::present_plugin::apply_to_image(presented);
         if let Some(publisher) = &self.frame_publisher {
-            publisher.publish(&presented);
+            publisher.publish(&presented, self.present_timing());
         }
         *self.last_image.lock() = Some(presented);
         self.present_epoch.fetch_add(1, Ordering::Relaxed);
@@ -1063,6 +1101,7 @@ impl AgcGpuSession {
                     sender
                         .send(GpuWork::Flush {
                             address: Some(address),
+                            queued_at: std::time::Instant::now(),
                             done: None,
                             permit: Some(permit),
                         })
@@ -1080,6 +1119,7 @@ impl AgcGpuSession {
         // No worker was ever started, the session is closing, or the send
         // failed: run the flush inline (synchronous, but nothing is queued to
         // wait behind). Any permit acquired above has already been released.
+        self.present_worker_drain_us.store(0, Ordering::Relaxed);
         self.flush_and_present(Some(address));
     }
 
@@ -1105,6 +1145,7 @@ impl AgcGpuSession {
                 let sent = sender
                     .send(GpuWork::Flush {
                         address,
+                        queued_at: std::time::Instant::now(),
                         done: done_tx,
                         // `wait_idle` carries no flip budget — the bounded
                         // fire-and-forget permit belongs to the flip path only.
@@ -1127,6 +1168,7 @@ impl AgcGpuSession {
                 }
             }
         }
+        self.present_worker_drain_us.store(0, Ordering::Relaxed);
         self.flush_and_present(address);
     }
 
@@ -1135,6 +1177,9 @@ impl AgcGpuSession {
     /// present the scanout buffer. Runs on the GPU worker thread via
     /// [`GpuWork::Flush`], or inline when no worker exists.
     fn flush_and_present(&self, address: Option<u64>) {
+        self.present_fence_wait_us.store(0, Ordering::Relaxed);
+        self.present_readback_us.store(0, Ordering::Relaxed);
+        self.present_srgb_encode_us.store(0, Ordering::Relaxed);
         // Did this flush actually read back the flipped target — i.e. did the
         // GPU render into the buffer the title is presenting? That is the
         // honest "the title drew this frame" signal, and it is what lets
@@ -1174,20 +1219,24 @@ impl AgcGpuSession {
                 let memory = self.guest_memory.lock().clone();
                 let flushed = if let Some(memory) = memory {
                     crate::guest_mem::with_guest_memory(&memory, || {
-                        crate::vulkan::offscreen::flush_deferred_draws_filtered(
+                        crate::vulkan::offscreen::flush_deferred_draws_filtered_timed(
                             device,
                             filter.as_deref(),
                         )
                     })
                 } else {
-                    crate::vulkan::offscreen::flush_deferred_draws_filtered(
+                    crate::vulkan::offscreen::flush_deferred_draws_filtered_timed(
                         device,
                         filter.as_deref(),
                     )
                 };
                 match flushed {
                     Ok(flushed) => {
-                        insert_all(&mut framebuffers, flushed, &mut flip_target_drawn);
+                        self.present_fence_wait_us
+                            .store(flushed.timing.fence_wait_us, Ordering::Relaxed);
+                        self.present_readback_us
+                            .store(flushed.timing.readback_us, Ordering::Relaxed);
+                        insert_all(&mut framebuffers, flushed.images, &mut flip_target_drawn);
                     }
                     Err(e) => {
                         warn!(error = %e, "deferred-draw flush failed — presenting the last flushed frame");
@@ -1225,9 +1274,19 @@ impl AgcGpuSession {
                             misses.is_multiple_of(FALLBACK_REELECT_INTERVAL)
                         };
                         if needs_full_census {
-                            match crate::vulkan::offscreen::flush_deferred_draws(device) {
+                            match crate::vulkan::offscreen::flush_deferred_draws_filtered_timed(
+                                device, None,
+                            ) {
                                 Ok(flushed) => {
-                                    insert_all(&mut framebuffers, flushed, &mut flip_target_drawn);
+                                    self.present_fence_wait_us
+                                        .fetch_add(flushed.timing.fence_wait_us, Ordering::Relaxed);
+                                    self.present_readback_us
+                                        .fetch_add(flushed.timing.readback_us, Ordering::Relaxed);
+                                    insert_all(
+                                        &mut framebuffers,
+                                        flushed.images,
+                                        &mut flip_target_drawn,
+                                    );
                                 }
                                 Err(e) => {
                                     warn!(error = %e, "full deferred-draw flush failed at a flip miss");
@@ -1354,7 +1413,10 @@ impl AgcGpuSession {
             && let (Some(fallback), Some(desc)) =
                 (fallback.as_ref(), *self.scanout_descriptor.lock())
         {
+            let encode_at = std::time::Instant::now();
             let presentable = to_presentable_arc(Arc::clone(fallback));
+            self.present_srgb_encode_us
+                .fetch_add(encode_at.elapsed().as_micros() as u64, Ordering::Relaxed);
             self.compose_presentable_to_scanout(address, &desc, &presentable);
         }
         let guest_present = if image.is_none() {
@@ -1456,7 +1518,10 @@ impl AgcGpuSession {
         // Move into the `Arc` once; the store below is then a refcount bump, not
         // an 8 MB copy — and this runs inside the guest flip thread's
         // synchronous flush, so the copy was pure per-flip latency.
+        let encode_at = std::time::Instant::now();
         let presented = to_presentable_arc(presented);
+        self.present_srgb_encode_us
+            .fetch_add(encode_at.elapsed().as_micros() as u64, Ordering::Relaxed);
         self.publish_frame(Arc::clone(&presented));
         if flip_address_hit || guest_hit {
             // The title flipped to a buffer it really drew into (a GPU-drawn
@@ -1468,10 +1533,15 @@ impl AgcGpuSession {
         }
         let present_index = PRESENT_INDEX.fetch_add(1, Ordering::Relaxed) + 1;
         if present_index <= 8 || present_index.is_power_of_two() {
+            let timing = self.present_timing();
             tracing::info!(
                 scanout_hit = flip_address_hit,
                 present_index,
                 scanout = format_args!("{address:#x}"),
+                worker_drain_us = timing.worker_drain_us,
+                fence_wait_us = timing.fence_wait_us,
+                readback_us = timing.readback_us,
+                srgb_encode_us = timing.srgb_encode_us,
                 "present: dumping the scanned-out frame"
             );
         }
@@ -2012,7 +2082,10 @@ impl AgcGpuSession {
             // sRGB-encode an HDR float target (SharpEmu #448) before it reaches
             // the RGBA8 present surface / PPM dump; 8-bit frames pass through.
             // Into the `Arc` once (see `last_image`): the store is a bump.
+            let encode_at = std::time::Instant::now();
             let presented = to_presentable_arc(presented);
+            self.present_srgb_encode_us
+                .store(encode_at.elapsed().as_micros() as u64, Ordering::Relaxed);
             self.publish_frame(Arc::clone(&presented));
             // Only a frame at the actual flip address takes the boot splash
             // down. The most-content fallback can surface a bare cleared
@@ -2185,6 +2258,7 @@ impl AgcGpuSession {
                             }
                             GpuWork::Flush {
                                 address,
+                                queued_at,
                                 done,
                                 permit,
                             } => {
@@ -2195,6 +2269,10 @@ impl AgcGpuSession {
                                 // fences as frames made worker telemetry report
                                 // roughly twice the measured shared-IPC FPS.
                                 let is_present = address.is_some();
+                                session.present_worker_drain_us.store(
+                                    queued_at.elapsed().as_micros() as u64,
+                                    Ordering::Relaxed,
+                                );
                                 let busy_at = std::time::Instant::now();
                                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     session.flush_and_present(address);

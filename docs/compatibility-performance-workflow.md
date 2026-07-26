@@ -70,8 +70,29 @@ Copy-Item artifacts\compat\latest.json compat\local\baseline.json
 cargo xtask compat compare --baseline compat/local/baseline.json
 ```
 
-## Nightly driver
+## NID coverage per title
 
+Static, no execution: parse each title's `eboot.bin` plus every on-disk
+NEEDED `.prx`/`.sprx` (the same `inspect_module` path the loader uses), then
+classify every unique (provider, NID) import exactly like the linker — HLE
+registration, LLE via the title's own shipped modules (keyed by file name,
+mirroring `load_process`), else unresolved. Render-path libraries
+(`libSceAgc*`, `libSceVideoOut*`, `libSceGnm*`, `libSceShader*`) are broken
+out separately:
+
+```powershell
+cargo xtask nids coverage                 # every registered title
+cargo xtask nids coverage --eboot PATH    # one executable + its .prx chain
+cargo xtask nids coverage --full          # also list every unresolved import
+```
+
+The local report is `artifacts/compat/nid-coverage.json` (gitignored; names
+titles/modules, never publish raw). "Resolved" means *a symbol is
+registered or shipped* — it is not evidence the implementation is correct
+(coverage ≠ rendering). Anonymous NIDs are dictionary-fill targets for
+`crates/raeen-firmware/examples/hunt_nid_names.rs`.
+
+## Nightly driver
 The nightly tier automatically selects one executable for each role:
 
 - Astro Bot;

@@ -13,7 +13,7 @@
 //! the child laps the Shell, the sequence re-check discards that copy and keeps
 //! the cached last complete frame. It never uploads a torn frame.
 
-use crate::RenderedImage;
+use crate::{RenderedImage, agc_exec::PresentTiming};
 use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 
@@ -26,6 +26,7 @@ pub const FRAME_IPC_ENV: &str = "RAEEN_FRAME_IPC";
 pub struct RemoteFrame {
     pub epoch: u64,
     pub image: Arc<RenderedImage>,
+    pub timing: PresentTiming,
 }
 
 #[cfg(target_os = "windows")]
@@ -40,10 +41,10 @@ mod platform {
     };
 
     const MAGIC: u32 = u32::from_le_bytes(*b"RAEF");
-    const VERSION: u32 = 4;
+    const VERSION: u32 = 5;
     // Input occupies bytes 48..60. Keep the independent VideoOut counter
     // naturally aligned at 64 and start pixel slots after the full header.
-    const HEADER_BYTES: usize = 72;
+    const HEADER_BYTES: usize = 104;
     // One slot covers an 8K RGBA8 frame (126.6 MiB) with room to spare. Keeping
     // each slot tight makes the two-slot mapping only slightly larger than the
     // old single 256-MiB slot.
@@ -62,6 +63,10 @@ mod platform {
     const INPUT_DATA_OFFSET: usize = 48;
     const INPUT_BYTES: usize = 12;
     const PRESENT_COUNT_OFFSET: usize = 64;
+    const WORKER_DRAIN_US_OFFSET: usize = 72;
+    const FENCE_WAIT_US_OFFSET: usize = 80;
+    const READBACK_US_OFFSET: usize = 88;
+    const SRGB_ENCODE_US_OFFSET: usize = 96;
 
     struct Mapping {
         handle: HANDLE,
@@ -204,6 +209,14 @@ mod platform {
             mapping
                 .atomic_u64(PRESENT_COUNT_OFFSET)
                 .store(0, Ordering::Release);
+            for offset in [
+                WORKER_DRAIN_US_OFFSET,
+                FENCE_WAIT_US_OFFSET,
+                READBACK_US_OFFSET,
+                SRGB_ENCODE_US_OFFSET,
+            ] {
+                mapping.atomic_u64(offset).store(0, Ordering::Relaxed);
+            }
             Ok(Self {
                 name,
                 mapping,
@@ -287,6 +300,25 @@ mod platform {
                 .atomic_u64(LENGTH_OFFSET)
                 .load(Ordering::Relaxed) as usize;
             let bpp = self.mapping.atomic_u32(BPP_OFFSET).load(Ordering::Relaxed);
+            let timing = PresentTiming {
+                worker_drain_us: self
+                    .mapping
+                    .atomic_u64(WORKER_DRAIN_US_OFFSET)
+                    .load(Ordering::Relaxed),
+                fence_wait_us: self
+                    .mapping
+                    .atomic_u64(FENCE_WAIT_US_OFFSET)
+                    .load(Ordering::Relaxed),
+                readback_us: self
+                    .mapping
+                    .atomic_u64(READBACK_US_OFFSET)
+                    .load(Ordering::Relaxed),
+                srgb_encode_us: self
+                    .mapping
+                    .atomic_u64(SRGB_ENCODE_US_OFFSET)
+                    .load(Ordering::Relaxed),
+                egui_upload_us: 0,
+            };
             let expected = (width as usize)
                 .checked_mul(height as usize)
                 .and_then(|pixels| pixels.checked_mul(bpp as usize));
@@ -323,6 +355,7 @@ mod platform {
 
             let frame = RemoteFrame {
                 epoch: second,
+                timing,
                 image: Arc::new(RenderedImage {
                     width,
                     height,
@@ -474,7 +507,7 @@ mod platform {
             }
         }
 
-        pub(crate) fn publish(&self, image: &RenderedImage) {
+        pub(crate) fn publish(&self, image: &RenderedImage, timing: PresentTiming) {
             if image.bytes_per_pixel != 4
                 || image.pixels.is_empty()
                 || image.pixels.len() > PIXEL_CAPACITY
@@ -519,6 +552,18 @@ mod platform {
             self.mapping
                 .atomic_u32(BPP_OFFSET)
                 .store(image.bytes_per_pixel, Ordering::Relaxed);
+            self.mapping
+                .atomic_u64(WORKER_DRAIN_US_OFFSET)
+                .store(timing.worker_drain_us, Ordering::Relaxed);
+            self.mapping
+                .atomic_u64(FENCE_WAIT_US_OFFSET)
+                .store(timing.fence_wait_us, Ordering::Relaxed);
+            self.mapping
+                .atomic_u64(READBACK_US_OFFSET)
+                .store(timing.readback_us, Ordering::Relaxed);
+            self.mapping
+                .atomic_u64(SRGB_ENCODE_US_OFFSET)
+                .store(timing.srgb_encode_us, Ordering::Relaxed);
             // SAFETY: the image length was validated against PIXEL_CAPACITY,
             // both buffers are live and non-overlapping. The odd sequence keeps
             // the receiver from accepting this slot until the release below.
@@ -561,11 +606,19 @@ mod platform {
                 pixels: vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 9, 8, 7, 255],
                 bytes_per_pixel: 4,
             };
-            publisher.publish(&image);
+            let timing = PresentTiming {
+                worker_drain_us: 11,
+                fence_wait_us: 22,
+                readback_us: 33,
+                srgb_encode_us: 44,
+                egui_upload_us: 0,
+            };
+            publisher.publish(&image, timing);
             let remote = receiver.latest().expect("published frame");
             assert_eq!(remote.image.width, 2);
             assert_eq!(remote.image.height, 2);
             assert_eq!(remote.image.pixels, image.pixels);
+            assert_eq!(remote.timing, timing);
             assert_eq!(receiver.latest().unwrap().epoch, remote.epoch);
         }
 
@@ -588,19 +641,25 @@ mod platform {
             let publisher = FrameIpcPublisher {
                 mapping: Mapping::open(receiver.name()).expect("open child mapping"),
             };
-            publisher.publish(&RenderedImage {
-                width: 1,
-                height: 1,
-                pixels: vec![1, 2, 3, 255],
-                bytes_per_pixel: 4,
-            });
+            publisher.publish(
+                &RenderedImage {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 2, 3, 255],
+                    bytes_per_pixel: 4,
+                },
+                PresentTiming::default(),
+            );
             let accepted = receiver.latest().expect("first frame");
-            publisher.publish(&RenderedImage {
-                width: 2,
-                height: 2,
-                pixels: vec![0; 3],
-                bytes_per_pixel: 4,
-            });
+            publisher.publish(
+                &RenderedImage {
+                    width: 2,
+                    height: 2,
+                    pixels: vec![0; 3],
+                    bytes_per_pixel: 4,
+                },
+                PresentTiming::default(),
+            );
             let kept = receiver.latest().expect("cached frame");
             assert_eq!(kept.epoch, accepted.epoch);
             assert_eq!(kept.image.pixels, accepted.image.pixels);
@@ -613,12 +672,15 @@ mod platform {
                 mapping: Mapping::open(receiver.name()).expect("open child mapping"),
             };
             for value in [1, 2, 3] {
-                publisher.publish(&RenderedImage {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![value, 0, 0, 255],
-                    bytes_per_pixel: 4,
-                });
+                publisher.publish(
+                    &RenderedImage {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![value, 0, 0, 255],
+                        bytes_per_pixel: 4,
+                    },
+                    PresentTiming::default(),
+                );
                 let remote = receiver.latest().expect("published frame");
                 assert_eq!(remote.image.pixels, [value, 0, 0, 255]);
             }
@@ -694,7 +756,7 @@ mod platform {
             None
         }
 
-        pub(crate) fn publish(&self, _image: &RenderedImage) {}
+        pub(crate) fn publish(&self, _image: &RenderedImage, _timing: PresentTiming) {}
 
         pub(crate) fn mark_presented(&self) {}
     }

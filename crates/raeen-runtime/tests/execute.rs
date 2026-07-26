@@ -821,25 +821,10 @@ fn detached_worker_is_reaped_before_the_fixed_guest_arena_is_reused() {
     }
 }
 
-/// A guest `call` to a per-NID unresolved stub must name **which import** the
-/// guest wanted — not just report an address.
-///
-/// This is the acceptance test for moving the fault off `0x5000_0000_0000`.
-/// Every unresolved symbol used to share that one sentinel, so the runtime
-/// could only say `Faulted { addr: 0x5000_0000_0000 }` — true, recovered, and
-/// useless: it named nothing to go implement. Here the guest calls the stub
-/// belonging to table index 2, and the runtime reports *that entry's* NID.
-///
-/// Measured motivation: on a real title this turns the launch outcome from
-/// `Faulted { addr: 0x5000_0000_0000 }` into "guest called nid
-/// 0x6f3404c72d7cf592 from library 'libc'".
-#[test]
-fn call_to_unresolved_stub_reports_which_import_the_guest_wanted() {
+fn unresolved_stub_module() -> (LinkedModule, u64, u64) {
     const ENTRY_OFF: usize = 0x0;
     const SLOT_OFF: usize = 0x10;
     const WANTED_NID: u64 = 0x6F34_04C7_2D7C_F592;
-
-    let hle = HleRegistry::new();
 
     let mut image = vec![0u8; 0x100];
     write_entry_stub(&mut image, ENTRY_OFF, SLOT_OFF);
@@ -866,38 +851,74 @@ fn call_to_unresolved_stub_reports_which_import_the_guest_wanted() {
         },
     ];
 
-    let linked = LinkedModule {
-        image,
-        base: GUEST_ARENA_BASE,
-        executable_ranges: Vec::new(),
-        unresolved: Vec::new(),
-        unresolved_stubs: stubs,
-        module_inits: Vec::new(),
-        hle_trampolines: Vec::<HleTrampoline>::new(),
-        entry: ENTRY_OFF as u64,
-        tls: None,
-        tls_layout: Vec::new(),
-        procparam_offset: None,
-        unwind_modules: Vec::new(),
-    };
+    (
+        LinkedModule {
+            image,
+            base: GUEST_ARENA_BASE,
+            executable_ranges: Vec::new(),
+            unresolved: Vec::new(),
+            unresolved_stubs: stubs,
+            module_inits: Vec::new(),
+            hle_trampolines: Vec::<HleTrampoline>::new(),
+            entry: ENTRY_OFF as u64,
+            tls: None,
+            tls_layout: Vec::new(),
+            procparam_offset: None,
+            unwind_modules: Vec::new(),
+        },
+        WANTED_NID,
+        stub_addr,
+    )
+}
 
-    let kernel = OrbisKernel::new();
-    let err = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).unwrap_err();
+/// A guest `call` to a per-NID unresolved stub is a compatibility inventory
+/// event by default: it resumes at the caller with `rax = 0`.
+///
+/// Here the guest calls table index 2 rather than the base slot. The kernel
+/// inventory test separately pins NID/library/calling-module deduplication;
+/// this native fixture proves the runtime performs the call/return stack
+/// repair instead of terminating at the sentinel.
+#[test]
+fn call_to_unresolved_stub_resumes_with_zero_by_default() {
+    let (linked, _, _) = unresolved_stub_module();
+    let value = execute_linked(&linked, &HleRegistry::new(), &OrbisKernel::new(), 0, &[])
+        .expect("default unresolved-call policy must resume");
+    assert_eq!(value, 0, "unresolved call must synthesize rax=0");
+}
 
+/// The strict switch is validated in a child test process so its process-wide
+/// OnceLock and environment cannot race the default-policy tests.
+#[test]
+fn strict_nids_restores_named_hard_failure() {
+    const CHILD: &str = "RAEEN_STRICT_NIDS_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("integration-test executable path"),
+        )
+        .args([
+            "--exact",
+            "strict_nids_restores_named_hard_failure",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("RAEEN_STRICT_NIDS", "1")
+        .status()
+        .expect("launch isolated strict-NID test process");
+        assert!(status.success(), "strict-NID child failed: {status}");
+        return;
+    }
+
+    let (linked, wanted_nid, stub_addr) = unresolved_stub_module();
+    let err = execute_linked(&linked, &HleRegistry::new(), &OrbisKernel::new(), 0, &[])
+        .expect_err("strict mode must retain the named hard failure");
     assert_eq!(
         err,
         RuntimeError::UnimplementedImport {
-            nid: WANTED_NID,
-            library: Some("libc".to_string()),
+            nid: wanted_nid,
+            library: Some("libc".to_owned()),
             stub_addr,
             rip: stub_addr,
-        },
-        "the fault must name the import, not just an address"
-    );
-    // The old behaviour, pinned as gone.
-    assert!(
-        !matches!(err, RuntimeError::Faulted { .. }),
-        "an unresolved-import call must not degrade to an anonymous Faulted"
+        }
     );
 }
 

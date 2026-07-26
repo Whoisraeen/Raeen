@@ -162,6 +162,49 @@ attribution as that license requires.
 
 ---
 
+## ps5-payload-dev/sdk — PS5 payload SDK (NID candidate source, names only)
+
+- **Upstream:** https://github.com/ps5-payload-dev/sdk
+- **License:** GPL-3.0-only (repo-wide; `include/freebsd` files are BSD) —
+  **incompatible for code**: nothing from this project is compiled, linked, or
+  vendored into Raeen. Its tree is cloned locally into the git-ignored
+  `reference/ps5-payload-sdk` directory only.
+- **How Raeen uses it:** symbol *identifiers* from its public headers were used
+  as **candidates** for the NID dictionary, via `merge_nid_catalog`. A
+  candidate is admitted only when Raeen's own `dynlib::nid::nid_of()`
+  reproduces a real NID from it — so what lands in
+  `crates/raeen-firmware/src/dynlib/nid_names.txt` is factual hash data (a
+  short functional identifier plus its independently recomputed SHA-1
+  preimage), not copied SDK content. Measured 2026-07-25: 35,181 of 37,345
+  candidates added new hash-verified names. This is the same admission rule
+  `.agents/skills/clean-room` grants for community NID databases; no SDK code,
+  headers, or build files were incorporated.
+
+## idc/ps4libdoc — PS4 library documentation (consulted; nothing incorporated)
+
+- **Upstream:** https://github.com/idc/ps4libdoc
+- **License:** none stated in the repository.
+- **Measured result:** its 42,010-name `known_names.txt` was run through the
+  same hash-gated merge on 2026-07-25 and added **zero** new names — the
+  existing shadPS4/SharpEmu-derived catalog already covered every entry.
+  Nothing from this source is incorporated; it is recorded here because it was
+  evaluated as a candidate source.
+
+## Mesa AddrLib — AMD surface-layout reference (acquired; no code incorporated yet)
+
+- **Upstream:** https://gitlab.freedesktop.org/mesa/mesa
+- **Pinned reference:** `main` at `3e2d8517b897026377267c09975db83525d2fc95`
+  in git-ignored `reference/mesa`.
+- **License:** the acquired `src/amd/addrlib/` files carry
+  `SPDX-License-Identifier: MIT` and AMD copyright notices. The reference's
+  `licenses/MIT` text is retained in the local clone.
+- **How Raeen uses it:** Phase 0 establishes this as the authoritative,
+  machine-pinned source for later clean-room AddrLib tiling work. No Mesa code
+  or tables have been copied into Raeen in this phase. Any later transcription
+  must cite the exact source file/revision and preserve its MIT attribution.
+
+---
+
 ## Compiled Rust crate dependencies
 
 Unlike the clean-room reference sources above (studied but never linked),

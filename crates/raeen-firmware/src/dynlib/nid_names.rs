@@ -30,23 +30,36 @@
 //!
 //! ## Provenance
 //!
-//! Candidates come from two community sources, both admitted only through the
+//! Candidates come from community sources, each admitted only through the
 //! hash gate above (existing names win every collision, so the first source
-//! stays authoritative where the two overlap):
+//! stays authoritative where two overlap):
 //!
 //! - shadPS4's `src/core/aerolib/aerolib.inl` (GPL-2.0-or-later, © 2024 shadPS4
 //!   Emulator Project) — 94,247 of its 94,276 entries pass.
 //! - SharpEmu's `scripts/ps5_names.txt` (GPL-2.0-or-later) — a ~154k candidate
 //!   name list; folding it in through the same gate added 55,658 new
-//!   hash-verified names (149,905 total), recovering symbols the first source
-//!   lacked, notably the whole `libSceNpAuthAuthorizedAppDialog` set and
+//!   hash-verified names, recovering symbols the first source lacked, notably
+//!   the whole `libSceNpAuthAuthorizedAppDialog` set and
 //!   `sceAgcGetIsTrinityMode`. `.L*` assembler-locals and `/`-prefixed path
 //!   artifacts are dropped (never cross-module NIDs).
+//! - ps5-payload-dev/sdk public headers (GPL-3.0 — **identifiers only**, no
+//!   code; see `THIRD_PARTY_NOTICES.md`) — 37,345 header identifiers fed
+//!   through the gate on 2026-07-25 added 35,181 new hash-verified names
+//!   (185,087 total). This is a name source, not a code source.
+//! - idc/ps4libdoc `known_names.txt` (no stated license) — measured the same
+//!   day: **zero** new names; the catalog already covered all 42,010.
+//! - `hunt_nid_names` (our own token-vocabulary dictionary attack, run
+//!   2026-07-25 against the nine anonymous NIDs in the nine-game coverage
+//!   report) — recovered `sceSaveDataPrepareForTransferring`; the remaining
+//!   eight (six `sceAgc*`, one `sceAudioIn*`, one `sceVideoRecording*`) use
+//!   tokens no public vocabulary contains and stay anonymous until RE work
+//!   identifies them. `HleRegistry::register_nid` is the route for those.
 //!
-//! Both are permitted by `.claude/skills/clean-room` ("NID names from community
+//! All are permitted by `.agents/skills/clean-room` ("NID names from community
 //! databases OK") and attributed in `THIRD_PARTY_NOTICES.md`. Regenerate the
-//! first source with `gen_nid_names.py`; fold in the second with the
-//! `merge_nid_catalog` example (both kept beside the data for auditability).
+//! first source with `gen_nid_names.py`; fold in a name list with the
+//! `merge_nid_catalog` example; hunt specific anonymous NIDs with the
+//! `hunt_nid_names` example (all kept beside the data for auditability).
 //!
 //! These are public symbol names, not Sony code — no SDK headers, blobs, or
 //! keys are involved.
@@ -78,8 +91,8 @@ fn table() -> &'static HashMap<u64, &'static str> {
 ///
 /// A `Some` is authoritative: the name provably hashes to `nid`. A `None` means
 /// the dictionary did not contain it — the NID may still be a real, callable
-/// import (PS5-only libraries such as `libSceAgc` are the usual gap, since the
-/// dictionary is PS4-derived).
+/// import (PS5-internal `libSceAgc` helpers are the measured gap: they use
+/// name tokens no public vocabulary contains).
 pub fn name_of(nid: u64) -> Option<&'static str> {
     table().get(&nid).copied()
 }
@@ -106,7 +119,7 @@ mod tests {
     /// THE safety property this module rests on: every name in the table is a
     /// verified SHA-1 preimage of its NID, recomputed by our own hasher. If a
     /// single entry failed, the dictionary would be untrusted input rather than
-    /// proven fact — so this test checks all ~94k, not a sample.
+    /// proven fact — so this test checks the whole table, not a sample.
     #[test]
     fn all_names_hash_to_their_nid() {
         let mut checked = 0usize;

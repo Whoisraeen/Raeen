@@ -27,6 +27,13 @@ Claude `/goal` (≤200 chars):
 | KytyPS5 | `reference/kytyps5` | GPL-2.0 + Kyty MIT lineage | https://github.com/Nmzik/KytyPS5 | `active` | all useful PS5 deltas done/skip |
 | shadPS4 | `reference/shadps4` | GPL-2.0 | https://github.com/shadps4-emu/shadPS4 | `active` | all useful Orbis/Vulkan deltas done/skip |
 | PS5SDK | `reference/ps5sdk` | GPL-2.0 | https://github.com/PS5Dev/PS5SDK | `not-cloned` | clone when building the M1 toolchain Hello World fixture |
+| ps5-payload-dev/sdk | `reference/ps5-payload-sdk` | GPL-3.0 (**identifiers only** — never code) | https://github.com/ps5-payload-dev/sdk | `dictionary-source` | not a port tree; keep or delete freely |
+| idc/ps4libdoc | `reference/ps4libdoc` | none stated | https://github.com/idc/ps4libdoc | `consulted` (2026-07-25: added 0 names) | not a port tree; keep or delete freely |
+
+> **Dictionary-only references:** `ps5-payload-sdk` and `ps4libdoc` feed
+> hash-gated NID name candidates (`merge_nid_catalog`); no code is ever ported
+> from them, so the port-status lifecycle above does not apply. See
+> `crates/raeen-firmware/src/dynlib/nid_names.rs` provenance.
 
 > **Actual audited reference scope:** Kyty, SharpEmu, KytyPS5, and shadPS4.
 > PS5SDK remains optional until the M1 compiler-produced fixture needs it.

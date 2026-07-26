@@ -5331,6 +5331,8 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "raeen-firmware",
+ "raeen-hle",
  "serde",
  "serde_json",
  "sha1",

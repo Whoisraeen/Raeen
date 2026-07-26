@@ -147,6 +147,12 @@ pub struct OrbisKernel {
     pub filesystem: Arc<filesystem::VirtualFileSystem>,
     /// Stable, process-scoped HLE/wait/event/task/GPU event stream.
     pub diagnostics: Arc<DiagnosticRecorder>,
+    /// Distinct unresolved callable imports observed by this guest process,
+    /// keyed by `(NID, resolved name, import library, calling module)` and
+    /// counted. Keeping this process-owned makes the default fail-soft policy produce a
+    /// complete, de-duplicated compatibility inventory without one title
+    /// suppressing another title's first occurrence.
+    unresolved_nid_calls: DashMap<(u64, String, String, String), u64>,
     /// Monotonic epoch owned by this guest process rather than a host-global
     /// static, so consecutive title launches do not inherit elapsed time.
     started_at: std::time::Instant,
@@ -165,6 +171,11 @@ pub struct OrbisKernel {
     /// guest thread id. Recorded so `scePthreadGetprio` reads back exactly
     /// what the title set; Raeen does not map these onto host scheduling.
     pub thread_priorities: DashMap<u64, i32>,
+    /// Guest thread scheduling policies (`scePthreadSetschedparam`), keyed by
+    /// guest thread id. Same bookkeeping class as [`Self::thread_priorities`]:
+    /// recorded so `scePthreadGetschedparam` reports the policy the title set,
+    /// defaulting to `PthreadAttr::default().sched_policy` when never set.
+    pub thread_sched_policies: DashMap<u64, i32>,
     /// Host (OS) thread handle for each guest thread id, recorded as the thread
     /// starts. Purely diagnostic: it lets a sampler suspend a guest thread and
     /// read its RIP, which is the ONLY way to see where a title is stuck when it
@@ -627,6 +638,12 @@ pub struct PthreadAttr {
     pub sched_policy: i32,
     /// Scheduling priority.
     pub sched_priority: i32,
+    /// SCE-specific "solo scheduler" flag (`scePthreadAttrSetsolosched`): the
+    /// title asks that the thread run on a dedicated scheduling context. Pure
+    /// bookkeeping — Raeen maps guest threads onto host threads, which are
+    /// already independently scheduled, so the flag has no host action but is
+    /// recorded so it reads back exactly as set.
+    pub solo_sched: bool,
 }
 
 impl Default for PthreadAttr {
@@ -637,6 +654,7 @@ impl Default for PthreadAttr {
             guard_size: 0x1000,
             sched_policy: 1,
             sched_priority: 700,
+            solo_sched: false,
         }
     }
 }
@@ -931,6 +949,7 @@ impl OrbisKernel {
             threads: Arc::new(threading::ThreadManager::new()),
             filesystem: Arc::new(filesystem::VirtualFileSystem::new()),
             diagnostics: Arc::new(DiagnosticRecorder::from_env()),
+            unresolved_nid_calls: DashMap::new(),
             started_at: std::time::Instant::now(),
             modules: DashMap::new(),
             lle_module_exports: DashMap::new(),
@@ -938,6 +957,7 @@ impl OrbisKernel {
             syscall_stats: DashMap::new(),
             thread_names: DashMap::new(),
             thread_priorities: DashMap::new(),
+            thread_sched_policies: DashMap::new(),
             host_thread_handles: DashMap::new(),
             recent_hle_calls: DashMap::new(),
             in_flight_hle: DashMap::new(),
@@ -1100,6 +1120,55 @@ impl OrbisKernel {
             .iter()
             .find(|module| module.start <= addr && addr < module.end)
             .cloned()
+    }
+
+    /// Record one call through an unresolved import.
+    ///
+    /// Returns `(first_occurrence, count)`. The caller uses the first bit to
+    /// emit one structured warning per distinct compatibility gap while the
+    /// count preserves hot-call information for the process-exit inventory.
+    pub fn record_unresolved_nid_call(
+        &self,
+        nid: u64,
+        function: &str,
+        library: &str,
+        calling_module: &str,
+    ) -> (bool, u64) {
+        let mut entry = self
+            .unresolved_nid_calls
+            .entry((
+                nid,
+                function.to_owned(),
+                library.to_owned(),
+                calling_module.to_owned(),
+            ))
+            .or_insert(0);
+        *entry = entry.saturating_add(1);
+        (*entry == 1, *entry)
+    }
+
+    /// Emit the complete process-local unresolved-call inventory as one
+    /// deterministic event. First-occurrence warnings remain useful when a
+    /// timed compatibility run is externally terminated before clean teardown.
+    pub fn log_unresolved_nid_inventory(&self) {
+        let mut inventory = self
+            .unresolved_nid_calls
+            .iter()
+            .map(|entry| {
+                let ((nid, function, library, calling_module), count) = entry.pair();
+                format!(
+                    "{nid:#018x} {function} library={library} caller={calling_module} calls={count}"
+                )
+            })
+            .collect::<Vec<_>>();
+        inventory.sort();
+        if !inventory.is_empty() {
+            tracing::warn!(
+                entries = inventory.len(),
+                inventory = ?inventory,
+                "UNRESOLVED NID INVENTORY: default fail-soft calls observed"
+            );
+        }
     }
 
     /// Create an event flag with `attributes` and `initial_bits`, returning its
@@ -1601,6 +1670,25 @@ mod subsystem_resource_tests {
         assert_eq!(kernel.create_socket(), None);
         assert!(kernel.close_socket(fds[0]));
         assert!(kernel.create_socket().is_some());
+    }
+
+    #[test]
+    fn unresolved_nid_inventory_deduplicates_per_process_and_calling_module() {
+        let kernel = OrbisKernel::new();
+        assert_eq!(
+            kernel.record_unresolved_nid_call(0x1234, "sceExample", "libSceExample", "eboot.bin"),
+            (true, 1)
+        );
+        assert_eq!(
+            kernel.record_unresolved_nid_call(0x1234, "sceExample", "libSceExample", "eboot.bin"),
+            (false, 2)
+        );
+        assert_eq!(
+            kernel.record_unresolved_nid_call(0x1234, "sceExample", "libSceExample", "plugin.prx"),
+            (true, 1),
+            "a second calling module is a distinct compatibility gap"
+        );
+        assert_eq!(kernel.unresolved_nid_calls.len(), 2);
     }
 
     /// A guest worker torn down by a host-detected fault never runs its unlock

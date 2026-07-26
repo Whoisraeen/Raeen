@@ -1,3 +1,64 @@
+- BATTLE-READY WORKFLOW PHASE 0 GREEN (2026-07-25; working tree at
+  `01f7b613911a+dirty`, no commit; Phase 1 NOT STARTED):
+  * TASK 0.1: rewrote the local `AGENTS.md` from current commercial-title
+    reality. It now identifies M4-class compatibility/diagnostics rather than
+    obsolete M1 bring-up, points at `.agents/skills` + `.codex/agents`, records
+    the measured baseline and enforces isolated Cargo targets. The file is
+    intentionally workspace-local under the repository's existing
+    case-insensitive `Agents.md` ignore rule.
+  * TASK 0.2: callable unresolved NIDs now fail soft by default, log structured
+    NID/resolved-name/import-library/calling-module data once per process key,
+    return `RAX=0`, repair the guest call stack and continue.
+    `RAEEN_STRICT_NIDS=1` retains hard failure; unresolved data imports remain
+    hard failures because no honest object value can be synthesized. The
+    process kernel owns the deduplicated counted inventory and logs its sorted
+    summary on orderly teardown.
+  * RETAIL BUG FOUND BY THE EXIT GATE: the executable HLE bridge stored
+    `DirectThreadState*` at guest `FS:[0x7f0]`. Windows clears guest FS on
+    preemption, so retail initializers faulted inside the bridge at
+    `0x4000...` before fail-soft dispatch. A controlled Subnautica A/B was
+    1.9 s with direct thunks versus a clean 45.1 s timeout with them disabled.
+    The bridge now uses the x64 TEB's application-owned, preemption-stable
+    `GS:[0x28]` slot, preserves/restores its prior value, and has generated-byte
+    plus TEB round-trip regressions. The fixed direct path also timed out
+    cleanly at 45.1 s.
+  * TASK 0.3: verified the 4096-call crash ring is emitted as one DEBUG event;
+    default INFO reports lead with one distilled ERROR plus bounded WARN
+    context. No per-call ring spam appeared in the measured logs.
+  * TASK 0.4: added always-on per-frame microsecond timing for worker queue
+    drain, Vulkan fence wait, readback and sRGB encode; IPC v5 transports it to
+    the Shell, where egui conversion/texture upload is measured. Native GUI
+    acceptance visibly showed
+    `drain 0.0  fence 0.4  read 0.6  sRGB 0.0  UI 0.8 ms` on a real Minecraft
+    loading frame (`scratch/phase0-minecraft-hud.png`).
+  * TASK 0.5: verified the existing fail-closed VFS resolution covers drive
+    letters, parent traversal, malformed input and symlink/junction escape,
+    while legitimate contained create paths remain green (raeen-kernel 39/39).
+  * TASK 0.6 / CLEAN ROOM: shallow sparse Mesa reference acquired at
+    `3e2d8517b897026377267c09975db83525d2fc95` under gitignored
+    `reference/mesa`; AddrLib per-file MIT headers checked and Mesa state/notice
+    recorded. Ghidra 12.1.2 + JDK 21 installed externally under
+    `C:\Users\whoisraeen\Tools`; the GPL-3.0 GhidraOrbis PRX/SELF loader is
+    installed externally only and no incompatible code entered Raeen.
+  * PHASE 0 EXIT EVIDENCE: release `cargo xtask compat run --tier all
+    --timeout 180` produced sanitized
+    `artifacts/compat/phase0-final.json` / `run-1785019657785` for all eight
+    named titles (nine binaries because both Dragon Ball variants are
+    registered). Minecraft = 180.4 s / 8192 flips / 1737 MiB / no blocker
+    (prior baseline 2048 flips, so no presentation regression); Subnautica =
+    180.1 s / four unique called NIDs each logged once / no blocker; Astro =
+    180.2 s; GTA V = 180.1 s. Honest negative results: Until Dawn still exits
+    at 4.7 s, one Dragon Ball variant has the UE5 read-`0xa` worker fault while
+    the process survives 180.1 s, its decrypted duplicate exits at 4.4 s,
+    A Plague Tale crashes at 34.0 s, and Avatar reaches 102 flips then crashes
+    at 57.8 s on unsupported `s_load_dwordx16`.
+  * VERIFICATION: raeen-gpu 233/233, raeen-kernel 39/39,
+    raeen-runtime 74/74 library + 46/46 native execution (one manual benchmark
+    ignored) + M3 fixture,
+    raeen-gui 160/160; scoped clippy for kernel/runtime/GPU/GUI is clean with
+    `-D warnings`. Phase 0 is instrumentation/containment evidence, not a new
+    M2-M5 compatibility claim.
+
 - MINECRAFT WORLD-ENTRY PERFORMANCE + DEAD-WORKER FIXES (2026-07-25; no
   commit; HLE 392/392, GPU 233/233, scoped clippy `-D warnings` + fmt clean,
   release Shell built):
@@ -3500,3 +3561,61 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
     green. Live evidence is `scratch/minecraft-scaled-scanout-live.png`.
     Presentation was measured at 4 FPS (later 2 FPS during loading), so the
     60-FPS/menu/gameplay acceptance remains open and M4/M5 are not claimed.
+
+## 2026-07-25 — NID coverage tooling + dictionary fill
+
+* NEW `raeen_firmware::inspect_module`: static half of `load_module` (SELF
+  passthrough -> sprx parse -> dynlib decode), so diagnostics and the loader
+  share one code path. `load_module` now calls it. raeen-firmware 119/119,
+  xtask 5/5, clippy+fmt green.
+* NEW `cargo xtask nids coverage [--eboot PATH] [--full]`: per-game NID
+  coverage over eboot + on-disk NEEDED .prx chain, classified with the
+  linker's own rules (HLE via live HleRegistry, LLE via shipped modules,
+  else unresolved), render-path libs broken out. Local report:
+  `artifacts/compat/nid-coverage.json` (gitignored).
+* FIX (tool + doc): LLE export keying — PS5 `PT_SCE_MODULE_PARAM` carries
+  NID-encoded strings, no ASCII name; module identity is the FILE name
+  (matches `load_process`). Corrected stale `SprxModule::name` doc.
+* MEASURED (9 images, 8 titles): union unresolved 2,779 -> 735 once LLE
+  keyed right (e.g. Minecraft 556 -> 92). 7/8 titles: render-path imports
+  100% symbol-resolved (registration, NOT working behavior). GTA V is the
+  render-path holdout: 107 libSceAgc unresolved (all but 7 dictionary-named).
+  Union anonymous: 9 NIDs total.
+* DICTIONARY: ps5-payload-sdk headers (GPL-3.0, identifiers only, hash gate)
+  +35,181 verified names; idc/ps4libdoc measured +0 (fully redundant);
+  `hunt_nid_names` token attack (58.9M candidates) recovered
+  `sceSaveDataPrepareForTransferring`; 8 NIDs remain anonymous (6 sceAgc*,
+  1 sceAudioIn*, 1 sceVideoRecording*) — register_nid route. Catalog now
+  185,088 entries; provenance in nid_names.rs + THIRD_PARTY_NOTICES.md;
+  refs logged in docs/reference-port-ledger.md.
+* NEXT: GTA V's 107 named AGC functions are the measured M2/M5 work queue;
+  cross-game HLE gap is service libs (NpWebApi2, Http2, AvPlayer, Ampr).
+
+## 2026-07-25 (cont.) — Missing-import resolution, tier A
+
+* POLICY: no blanket stubs. Tiers: A = real host-backed impls; B = honest
+  offline semantics (later); C = milestone work (GTA 107 AGC) / impossible
+  (8 anonymous NIDs). Stubbing 735 to zero would poison the blocker signal.
+* libc batch (delegated): 64/140 implemented in raeen-hle/src/libc.rs — CRT
+  internals, stdio+format/scan engines, strto, time/locale, C++ ABI throws,
+  mutex/syslock/atomics. Skips with reasons: 33 libm blocked on missing
+  XMM0 float-return channel; 19 data objects; 5 unwinder; qsort (needs sync
+  guest callback); 17 layout-risky Dinkumware internals.
+* libkernel/posix batch (delegated): 16/23 — pwrite/ftruncate/rename/stat/
+  QueryMemoryProtection/CheckedReleaseDirectMemory/IsStack/SetGPO/
+  schedparam/solosched/getstack/mutexattr_setprotocol/sleep (+minimal
+  raeen-kernel VFS pwrite/ftruncate). Skips: 5 AIO (no infra — do not fake),
+  __progname/__stack_chk_guard (already resolved via firmware HLE data page).
+* FIX coverage blind spot: `hle_data_page_export_names()` (raeen-firmware)
+  exposes data-page exports; `nids coverage` models them; consistency test
+  `hle_data_page_resolves_every_listed_export`.
+* FIX 8 pre-existing clippy 1.97 lints (gate green again): stray duplicated
+  #[test] + hex grouping (libkernel), >= y+1 (audio_out2), deprecated DCB
+  fixture allow (libsce_agc), PI-approx test value (fmt), redundant must_use
+  (save_data_dialog), complex type (user_service), manual is_multiple_of
+  (hle lib.rs).
+* MEASURED: union unresolved 735 -> 650; HLE resolved up in every title
+  (Plague Tale 357->422). IN FLIGHT: XMM0 float-return channel + ~36 libm
+  handlers (agent-0 resumed).
+* raeen-hle 420, raeen-kernel 38, raeen-firmware 120, xtask 5 tests green;
+  clippy+fmt green on touched crates.

@@ -1350,19 +1350,6 @@ mod firmware_launcher_tests {
             buf
         }
 
-        /// `call qword ptr [rip+disp32]; ret` at `entry_off`, calling through
-        /// the pointer slot at `slot_off`. Mirrors `execute.rs`'s
-        /// `write_entry_stub`.
-        fn write_entry_stub(buf: &mut [u8], entry_off: usize, slot_off: usize) {
-            let rip_after_instr = entry_off as i64 + 6; // FF 15 <disp32> is 6 bytes.
-            let disp32 = (slot_off as i64 - rip_after_instr) as i32;
-
-            buf[entry_off] = 0xFF;
-            buf[entry_off + 1] = 0x15;
-            buf[entry_off + 2..entry_off + 6].copy_from_slice(&disp32.to_le_bytes());
-            buf[entry_off + 6] = 0xC3; // ret
-        }
-
         /// The `PT_SCE_DYNLIBDATA` blob (strtab + one undefined `Elf64_Sym` +
         /// one JMPREL `Elf64_Rela`) and matching `PT_DYNAMIC` bytes for a
         /// single import identified by `import_nid`. Mirrors
@@ -1416,13 +1403,31 @@ mod firmware_launcher_tests {
             (blob, dynamic)
         }
 
-        /// A plaintext-SELF-wrapped `.sprx` whose entry (offset 0) calls the
-        /// import `import_nid` through a real JUMP_SLOT relocation.
+        /// A plaintext-SELF-wrapped `.sprx` whose entry calls an unresolved
+        /// import, forwards its return value to `exit`, and therefore proves
+        /// the default unresolved-call path resumed with `rax = 0`.
         fn build_executable_sprx(import_nid: u64) -> Vec<u8> {
-            let (dynlib_blob, dynamic_bytes) = build_dynlib_and_dynamic(import_nid);
+            const SLOT_UNRESOLVED_OFF: usize = 0x40;
+            const SLOT_EXIT_OFF: usize = 0x48;
+            let exit_nid = raeen_firmware::dynlib::nid::nid_of("exit");
+            let (dynlib_blob, dynamic_bytes) = build_dynlib_and_dynamic_multi(&[
+                (import_nid, SLOT_UNRESOLVED_OFF as u64),
+                (exit_nid, SLOT_EXIT_OFF as u64),
+            ]);
 
             let mut load_bytes = vec![0u8; 0x100];
-            write_entry_stub(&mut load_bytes, 0x0, RELOC_SLOT_OFFSET as usize);
+            // call qword ptr [rip+disp32] -> unresolved slot
+            let call1_disp32 = (SLOT_UNRESOLVED_OFF as i64 - 6) as i32;
+            load_bytes[0] = 0xFF;
+            load_bytes[1] = 0x15;
+            load_bytes[2..6].copy_from_slice(&call1_disp32.to_le_bytes());
+            // mov rdi, rax — unresolved calls resume with zero by default.
+            load_bytes[6..9].copy_from_slice(&[0x48, 0x89, 0xC7]);
+            // call qword ptr [rip+disp32] -> exit slot (never returns)
+            let call2_disp32 = (SLOT_EXIT_OFF as i64 - 15) as i32;
+            load_bytes[9] = 0xFF;
+            load_bytes[10] = 0x15;
+            load_bytes[11..15].copy_from_slice(&call2_disp32.to_le_bytes());
 
             let elf = build_elf_with_entry(
                 ET_SCE_DYNAMIC,
@@ -1587,19 +1592,12 @@ mod firmware_launcher_tests {
             let _ = std::fs::remove_dir_all(&tmp);
         }
 
-        /// A guest `call` to an import nobody registered must tell the user
-        /// **which function is missing**, by name and library — not just that
-        /// something faulted.
-        ///
-        /// The linker gives each distinct unresolved NID its own stub address
-        /// (`UNRESOLVED_STUB_BASE + i*8`); calling one is a genuine access
-        /// violation outside RT0's trampoline guard, which the VEH recovers and
-        /// then maps back through the stub table. Before that per-NID scheme
-        /// every missing import shared one address and this test could only
-        /// assert "Faulted at 0x5000000000000" — a message that named nothing
-        /// and gave nobody a next step.
+        /// A guest call to an unresolved import is inventoried and resumes with
+        /// zero by default. The following imported `exit` receives that zero,
+        /// proving the compatibility miss did not become a process fault.
+        /// `RAEEN_STRICT_NIDS=1` retains fail-fast debugging.
         #[test]
-        fn play_faults_cleanly_when_the_module_calls_an_unresolved_import() {
+        fn play_resumes_after_an_unresolved_import_by_default() {
             let hle = raeen_hle::HleRegistry::new();
             let bogus_nid =
                 raeen_firmware::dynlib::nid::nid_of("totallyUnknownFunctionNobodyRegistered");
@@ -1621,20 +1619,17 @@ mod firmware_launcher_tests {
                 .launch(&LaunchTarget::Game { path })
                 .expect("launch always returns a handle");
 
-            assert_eq!(settled_state(&launcher, &handle), SessionState::Faulted);
+            assert_eq!(settled_state(&launcher, &handle), SessionState::Running);
             let detail = launcher
                 .session_detail(&handle)
-                .expect("fault carries a message");
-            // The message must NAME the missing import, not just an address.
-            let encoded = raeen_firmware::dynlib::nid::encode_nid(bogus_nid);
+                .expect("completed run carries a message");
             assert!(
-                detail.contains("Unimplemented import") && detail.contains(&encoded),
-                "the fault must name the missing import ({encoded}); got: {detail}"
+                detail.starts_with("Ran to exit(0x0)"),
+                "unresolved call must resume with rax=0; got: {detail}"
             );
-            // Pin the old, useless message as gone.
             assert!(
-                !detail.starts_with("Faulted at 0x"),
-                "an unresolved-import call must not degrade to a bare address: {detail}"
+                detail.contains("1 unresolved"),
+                "the run must retain the unresolved-link inventory: {detail}"
             );
 
             let _ = std::fs::remove_dir_all(&tmp);

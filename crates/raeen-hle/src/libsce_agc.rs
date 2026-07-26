@@ -4748,6 +4748,7 @@ mod tests {
     /// M2 HLE seam: `SubmitDcb` remains a thin ABI adapter and forwards the
     /// exact command buffer to the process-owned GPU submission interface.
     #[test]
+    #[allow(deprecated)] // the M2 fixture DCB is exactly what this seam test drives
     fn submit_dcb_with_draw_drives_m2_gpu_session() {
         #[derive(Default)]
         struct RecordingGpu {

@@ -150,8 +150,12 @@ pub fn static_tls_total(layout: &[StaticTlsModule]) -> u64 {
 /// the raw `PT_SCE_DYNLIBDATA` blob for [`crate::dynlib`] to decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SprxModule {
-    /// Module name, derived from `PT_SCE_MODULE_PARAM` if trivially
-    /// available, else `"module"`.
+    /// Placeholder module name (`"module"`). On PS5 the
+    /// `PT_SCE_MODULE_PARAM` payload carries NID-encoded strings, not an
+    /// ASCII name, so there is nothing to extract here: a module's identity
+    /// for LLE export registration is its **file name** (NEEDED/import-module
+    /// names are file stems — see `load_process`, which keys dependency
+    /// exports by the NEEDED file name).
     pub name: String,
     /// The ELF `e_type` (one of `ET_SCE_EXEC`/`ET_SCE_DYNEXEC`/`ET_SCE_DYNAMIC`).
     pub e_type: u16,
@@ -320,7 +324,9 @@ pub fn parse_sprx(elf: &[u8]) -> Result<SprxModule, FirmwareError> {
     }
 
     if has_module_param {
-        debug!("PT_SCE_MODULE_PARAM present but name extraction is not yet implemented");
+        // The payload is NID-encoded metadata (no ASCII name) — see
+        // `SprxModule::name`. Nothing to decode for the load path today.
+        debug!("PT_SCE_MODULE_PARAM present (NID-encoded; no ASCII name to extract)");
     }
     if segments.is_empty() {
         warn!("Parsed .sprx module has no PT_LOAD segments");

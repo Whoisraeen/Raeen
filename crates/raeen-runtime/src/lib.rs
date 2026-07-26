@@ -399,7 +399,9 @@ pub fn execute_linked(
             .map_or(0, |off| GUEST_ARENA_BASE + off),
     );
     let entry_ptr = arena.entry_ptr(entry_offset)?;
-    let guard = trampoline::TrampolineGuard::reserve(&module.hle_trampolines)?;
+    let guard = trampoline::TrampolineGuard::reserve(&module.hle_trampolines, |t| {
+        hle.returns_float(&t.library, &t.function)
+    })?;
     let guest_rsp = arena
         .stack_top()
         .checked_sub(8)
@@ -540,7 +542,9 @@ pub fn execute_process(
     let _call_lock = dispatch::call_lock();
     let arena = std::sync::Arc::new(arena::GuestArena::new(&module.image)?);
     arena::maybe_enable_wx_image(&arena, &module.executable_ranges);
-    let guard = trampoline::TrampolineGuard::reserve(&module.hle_trampolines)?;
+    let guard = trampoline::TrampolineGuard::reserve(&module.hle_trampolines, |t| {
+        hle.returns_float(&t.library, &t.function)
+    })?;
     let gpu = raeen_gpu::AgcGpuSession::new_process(arena.clone());
     raeen_gpu::AgcGpuSession::install_process(&gpu);
     let result = execute_process_mapped(
@@ -555,6 +559,7 @@ pub fn execute_process(
         envp,
     );
     gpu.shutdown();
+    kernel.log_unresolved_nid_inventory();
     result
 }
 
@@ -602,6 +607,7 @@ fn execute_process_shared_inner(
     arena::maybe_enable_wx_image(&arena, &module.executable_ranges);
     let guard = std::sync::Arc::new(trampoline::TrampolineGuard::reserve(
         &module.hle_trampolines,
+        |t| hle.returns_float(&t.library, &t.function),
     )?);
     let process = thread::GuestProcess::create(module, hle, kernel, arena, guard);
     on_start(process.clone());
@@ -628,6 +634,7 @@ fn execute_process_shared_inner(
         Err(_) => 1,
     };
     process.terminate_and_reap(fallback_code);
+    process.kernel.log_unresolved_nid_inventory();
     if process_exit_was_requested {
         Ok(RunOutcome::Exited(
             process.requested_exit_code().unwrap_or(fallback_code),

@@ -136,8 +136,10 @@ mod tests {
 
     #[test]
     fn play_time_text_tiers() {
-        let mut l = TitleLedger::default();
-        l.total_play_secs = 59;
+        let mut l = TitleLedger {
+            total_play_secs: 59,
+            ..TitleLedger::default()
+        };
         assert!(l.play_time_text().is_none());
         l.total_play_secs = 60 * 8;
         assert_eq!(l.play_time_text().as_deref(), Some("8m played"));

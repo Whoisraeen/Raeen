@@ -214,7 +214,6 @@ mod tests {
     /// The returned guard must be held (bind it, don't discard it) for the rest
     /// of the test. Poisoning is ignored so that one failing test reports one
     /// failure instead of cascading into the others.
-    #[must_use]
     fn acquire_dialog() -> MutexGuard<'static, ()> {
         let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         STATUS.store(STATUS_NONE, Ordering::Relaxed);

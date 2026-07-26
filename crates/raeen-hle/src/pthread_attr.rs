@@ -38,6 +38,12 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadAttrSetstacksize", hle_set_stacksize);
     registry.register("libkernel", "scePthreadAttrGetstacksize", hle_get_stacksize);
     registry.register("libkernel", "scePthreadAttrSetstack", hle_set_stack);
+    registry.register("libkernel", "scePthreadAttrGetstack", hle_get_stack);
+    registry.register(
+        "libkernel",
+        "scePthreadAttrSetsolosched",
+        hle_set_solo_sched,
+    );
     registry.register("libkernel", "scePthreadAttrSetguardsize", hle_set_guardsize);
     registry.register("libkernel", "scePthreadAttrGetguardsize", hle_get_guardsize);
     registry.register(
@@ -85,6 +91,14 @@ fn register_posix(registry: &HleRegistry) {
         "libScePosix",
         "pthread_attr_getguardsize",
         hle_get_guardsize,
+    );
+    // The `_np` spelling is how libkernel names the non-POSIX-standard
+    // solo-scheduler knob for middleware compiled against plain headers —
+    // a distinct NID (a NID hashes the name alone) over the same body.
+    registry.register(
+        "libScePosix",
+        "pthread_attr_setsolosched_np",
+        hle_set_solo_sched,
     );
 }
 
@@ -243,6 +257,48 @@ fn hle_get_guardsize(ctx: &HleContext, args: &[u64]) -> u64 {
     OK
 }
 
+/// `scePthreadAttrGetstack(attr, void **stackAddrOut, size_t *stackSizeOut)`:
+/// read back the stack configuration recorded by `scePthreadAttrSetstack` /
+/// `scePthreadAttrSetstacksize`.
+///
+/// The address reads back as 0 on purpose: `scePthreadAttrSetstack` does NOT
+/// honor a guest-chosen stack base (the runtime's scheduler owns stack
+/// allocation — see its comment), so the attr object holds no base and 0 is
+/// the truthful stored value. Echoing the requested base back would report a
+/// stack the created thread never uses. The SIZE is real — it was recorded
+/// and is what creation will ask the scheduler for.
+fn hle_get_stack(ctx: &HleContext, args: &[u64]) -> u64 {
+    let attr = args.first().copied().unwrap_or(0);
+    let addr_out = args.get(1).copied().unwrap_or(0);
+    let size_out = args.get(2).copied().unwrap_or(0);
+    if addr_out == 0 || size_out == 0 {
+        return EINVAL;
+    }
+    let Some(state) = read_attr(ctx, attr) else {
+        return EINVAL;
+    };
+    if !ctx.mem.write(addr_out, &0u64.to_le_bytes())
+        || !ctx.mem.write(size_out, &state.stack_size.to_le_bytes())
+    {
+        return EINVAL;
+    }
+    OK
+}
+
+/// `scePthreadAttrSetsolosched(attr, int solo)` /
+/// `pthread_attr_setsolosched_np(attr, solo)`: the SCE-specific "solo
+/// scheduler" attr flag — the title asks that the thread be scheduled on its
+/// own context rather than sharing one. Raeen maps guest threads onto host
+/// threads, which are already independently scheduled, so there is no host
+/// action to take; the flag is pure attr bookkeeping and reads back exactly
+/// as set (same storage class as `sched_policy` above).
+fn hle_set_solo_sched(ctx: &HleContext, args: &[u64]) -> u64 {
+    let solo = args.get(1).copied().unwrap_or(0) != 0;
+    with_attr(ctx, args.first().copied().unwrap_or(0), |a| {
+        a.solo_sched = solo
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +368,50 @@ mod tests {
         let mut buf = [0u8; 8];
         assert!(mem.read(attr, &mut buf));
         assert_eq!(u64::from_le_bytes(buf), 0, "destroy zeroes the handle");
+    }
+
+    #[test]
+    fn getstack_reports_the_recorded_size_and_no_base() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let attr = 0x300;
+        hle_attr_init(&ctx, &[attr]);
+        // Setstack records only the size (the base is not honored).
+        assert_eq!(hle_set_stack(&ctx, &[attr, 0xDEAD_0000, 0x20_0000]), OK);
+        let addr_out = 0x400;
+        let size_out = 0x408;
+        assert_eq!(hle_get_stack(&ctx, &[attr, addr_out, size_out]), OK);
+        let mut a = [0u8; 8];
+        let mut s = [0u8; 8];
+        assert!(mem.read(addr_out, &mut a));
+        assert!(mem.read(size_out, &mut s));
+        assert_eq!(u64::from_le_bytes(a), 0, "no guest-chosen base is honored");
+        assert_eq!(u64::from_le_bytes(s), 0x20_0000);
+        // NULL out-pointers and unknown attrs are EINVAL.
+        assert_eq!(hle_get_stack(&ctx, &[attr, 0, size_out]), EINVAL);
+        assert_eq!(hle_get_stack(&ctx, &[0x900, addr_out, size_out]), EINVAL);
+
+        let registry = HleRegistry::new();
+        assert!(registry.is_implemented("libkernel", "scePthreadAttrGetstack"));
+    }
+
+    #[test]
+    fn setsolosched_records_the_flag_on_the_attr() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let attr = 0x300;
+        hle_attr_init(&ctx, &[attr]);
+        // Default off; set → stored; cleared → stored.
+        assert!(!kernel.pthread_attrs.get(&attr).unwrap().solo_sched);
+        assert_eq!(hle_set_solo_sched(&ctx, &[attr, 1]), OK);
+        assert!(kernel.pthread_attrs.get(&attr).unwrap().solo_sched);
+        assert_eq!(hle_set_solo_sched(&ctx, &[attr, 0]), OK);
+        assert!(!kernel.pthread_attrs.get(&attr).unwrap().solo_sched);
+        // A null attr address is EINVAL.
+        assert_eq!(hle_set_solo_sched(&ctx, &[0, 1]), EINVAL);
+
+        let registry = HleRegistry::new();
+        assert!(registry.is_implemented("libkernel", "scePthreadAttrSetsolosched"));
+        assert!(registry.is_implemented("libScePosix", "pthread_attr_setsolosched_np"));
     }
 }

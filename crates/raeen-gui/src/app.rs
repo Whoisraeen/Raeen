@@ -150,7 +150,7 @@ mod tests {
         let lib = base.join("lib");
         make_game(&lib, "Solo");
 
-        let once = scan_game_folders(&[lib.clone()]);
+        let once = scan_game_folders(std::slice::from_ref(&lib));
         let twice = scan_game_folders(&[lib.clone(), lib]);
 
         assert_eq!(

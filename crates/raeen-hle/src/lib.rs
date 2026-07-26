@@ -78,7 +78,7 @@ pub mod pthread_sync;
 pub mod pthread_thread;
 pub mod pthread_tls;
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use raeen_core::diagnostics::DiagnosticKind;
 use raeen_core::subsystems::{GpuSubmissionSubsystem, KernelSubsystems};
 use tracing::{debug, info, warn};
@@ -588,6 +588,12 @@ pub struct HleRegistry {
     /// Explicit NID → `"library::function"` bindings for functions whose real
     /// name is unknown — see [`HleRegistry::register_nid`].
     nid_overrides: DashMap<(String, u64), String>,
+    /// The `"library::function"` keys whose SysV result travels in XMM0
+    /// (a `float`/`double` return) rather than RAX. The runtime consults
+    /// this on BOTH dispatch paths — the VEH writeback and the direct
+    /// gateway's float bridge — so a float-returning handler's `u64` (the
+    /// result's bit pattern) reaches the guest in the right register.
+    float_returns: DashSet<String>,
 }
 
 impl HleRegistry {
@@ -597,6 +603,7 @@ impl HleRegistry {
         let registry = Self {
             functions: DashMap::new(),
             nid_overrides: DashMap::new(),
+            float_returns: DashSet::new(),
         };
 
         // Register all implemented HLE functions.
@@ -682,6 +689,27 @@ impl HleRegistry {
         let key = format!("{}::{}", library, function);
         debug!("HLE register: {}", key);
         self.functions.insert(key, implementation);
+    }
+
+    /// Register an HLE function whose result is a `float`/`double` — SysV
+    /// returns it in **XMM0**, not RAX. Identical to [`Self::register`],
+    /// plus a marker the runtime consults on both dispatch paths (VEH
+    /// writeback and the direct gateway's float bridge) so the handler's
+    /// `u64` — the result's bit pattern — is written into guest XMM0.
+    /// Handlers must return `f64::to_bits` of the value (or
+    /// `u64::from(f32::to_bits(..))` for a `float`).
+    pub fn register_float(&self, library: &str, function: &str, implementation: HleFunction) {
+        let key = format!("{}::{}", library, function);
+        debug!("HLE register (float return): {}", key);
+        self.functions.insert(key.clone(), implementation);
+        self.float_returns.insert(key);
+    }
+
+    /// Whether `library::function` was registered float-returning (see
+    /// [`Self::register_float`]). Unknown names report `false`.
+    pub fn returns_float(&self, library: &str, function: &str) -> bool {
+        let key = format!("{}::{}", library, function);
+        self.float_returns.contains(&key)
     }
 
     /// Register a function whose real name is **unknown**, binding it to an
@@ -965,7 +993,7 @@ impl GuestAllocator for TestAllocator {
         if addr == 0 {
             return self.mmap(length, align);
         }
-        if addr % align.max(1) != 0 {
+        if !addr.is_multiple_of(align.max(1)) {
             return None;
         }
         Some(addr)
@@ -1150,6 +1178,7 @@ mod tests {
         let registry = HleRegistry {
             functions: DashMap::new(),
             nid_overrides: DashMap::new(),
+            float_returns: DashSet::new(),
         };
         fn stub(_ctx: &HleContext, _args: &[u64]) -> u64 {
             0
@@ -1174,6 +1203,7 @@ mod tests {
         let registry = HleRegistry {
             functions: DashMap::new(),
             nid_overrides: DashMap::new(),
+            float_returns: DashSet::new(),
         };
         let nid = 0x1234_5678_9abc_def0;
         registry.register_nid("libAlpha", "unknownAlpha", nid, first);
@@ -1295,6 +1325,7 @@ mod tests {
         let registry = HleRegistry {
             functions: DashMap::new(),
             nid_overrides: DashMap::new(),
+            float_returns: DashSet::new(),
         };
         // Same name, two libraries, SAME impl -> not a conflict.
         registry.register("libOne", "shared", a);

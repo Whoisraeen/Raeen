@@ -32,6 +32,14 @@
       "baseline_revision": "9f31e64",
       "license": "GPL-2.0",
       "url": "https://github.com/shadps4-emu/shadPS4"
+    },
+    {
+      "name": "Mesa",
+      "directory": "reference/mesa",
+      "upstream_branch": "main",
+      "baseline_revision": "3e2d851",
+      "license": "MIT for src/amd/addrlib (verify each file before porting)",
+      "url": "https://gitlab.freedesktop.org/mesa/mesa"
     }
   ]
 }

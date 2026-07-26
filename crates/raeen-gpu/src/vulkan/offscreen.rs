@@ -1318,13 +1318,39 @@ pub fn flush_deferred_draws_filtered(
     dev: &VulkanDevice,
     only_bases: Option<&[u64]>,
 ) -> Result<Vec<(u64, RenderedImage)>, GpuError> {
+    flush_deferred_draws_filtered_timed(dev, only_bases).map(|flush| flush.images)
+}
+
+/// Cheap always-on timing for the two blocking host portions of a deferred
+/// present flush. Queue-drain and colour conversion are measured by the AGC
+/// session; this layer owns the Vulkan fence and host readback.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DeferredFlushTiming {
+    pub fence_wait_us: u64,
+    pub readback_us: u64,
+}
+
+/// Timed form used by the presentation HUD. Public callers keep the legacy
+/// image-only wrapper above so diagnostics do not leak into the rendering API.
+pub(crate) struct DeferredFlush {
+    pub images: Vec<(u64, RenderedImage)>,
+    pub timing: DeferredFlushTiming,
+}
+
+pub(crate) fn flush_deferred_draws_filtered_timed(
+    dev: &VulkanDevice,
+    only_bases: Option<&[u64]>,
+) -> Result<DeferredFlush, GpuError> {
     let timing =
         crate::diagnostics::gpu_env().time_draw || crate::diagnostics::gpu_env().time_compute;
     let t0 = std::time::Instant::now();
     let mut caches = dev.draw_caches();
     caches.finish_batch_recording(dev)?;
     if !caches.batch_open() {
-        return Ok(Vec::new());
+        return Ok(DeferredFlush {
+            images: Vec::new(),
+            timing: DeferredFlushTiming::default(),
+        });
     }
     let (pending, already_submitted, touched, evicted, evicted_depth) = caches.take_batch();
     let (read_now, keep): (Vec<TargetKey>, Vec<TargetKey>) = match only_bases {
@@ -1335,12 +1361,15 @@ pub fn flush_deferred_draws_filtered(
     // unread targets back and do no GPU work at all.
     if pending.is_empty() && read_now.is_empty() && evicted.is_empty() && evicted_depth.is_empty() {
         caches.requeue_touched(keep);
-        return Ok(Vec::new());
+        return Ok(DeferredFlush {
+            images: Vec::new(),
+            timing: DeferredFlushTiming::default(),
+        });
     }
     let pending_draws = pending.len();
     let gpu_at = std::time::Instant::now();
     match record_and_read_flush(dev, &mut caches, &pending, already_submitted, &read_now) {
-        Ok(mut images) => {
+        Ok((mut images, flush_timing)) => {
             let gpu_flush = gpu_at.elapsed();
             let publish_at = std::time::Instant::now();
             let (compute_dirty_bytes, compute_dirty_spans) =
@@ -1381,26 +1410,30 @@ pub fn flush_deferred_draws_filtered(
                 use std::sync::atomic::{AtomicU64, Ordering};
                 static FLUSHES: AtomicU64 = AtomicU64::new(0);
                 let flush = FLUSHES.fetch_add(1, Ordering::Relaxed) + 1;
-                if !flush.is_multiple_of(64) {
-                    return Ok(images);
+                if flush.is_multiple_of(64) {
+                    tracing::warn!(
+                        flush,
+                        flush_us = t0.elapsed().as_micros(),
+                        gpu_flush_us = gpu_flush.as_micros(),
+                        fence_wait_us = flush_timing.fence_wait_us,
+                        readback_us = flush_timing.readback_us,
+                        compute_publish_us = compute_publish.as_micros(),
+                        retire_us = retire.as_micros(),
+                        pending_draws,
+                        targets_read = images.len(),
+                        targets_kept_gpu_side = kept_gpu_side,
+                        compute_dirty_bytes,
+                        compute_dirty_spans,
+                        compute_image_bytes,
+                        compute_image_outputs,
+                        "TIME_DRAW: deferred-batch flush (one fence + one readback per selected target)"
+                    );
                 }
-                tracing::warn!(
-                    flush,
-                    flush_us = t0.elapsed().as_micros(),
-                    gpu_flush_us = gpu_flush.as_micros(),
-                    compute_publish_us = compute_publish.as_micros(),
-                    retire_us = retire.as_micros(),
-                    pending_draws,
-                    targets_read = images.len(),
-                    targets_kept_gpu_side = kept_gpu_side,
-                    compute_dirty_bytes,
-                    compute_dirty_spans,
-                    compute_image_bytes,
-                    compute_image_outputs,
-                    "TIME_DRAW: deferred-batch flush (one fence + one readback per selected target)"
-                );
             }
-            Ok(images)
+            Ok(DeferredFlush {
+                images,
+                timing: flush_timing,
+            })
         }
         Err(e) => {
             // The batch's command buffers may still be executing: wait the
@@ -1431,7 +1464,7 @@ fn record_and_read_flush(
     pending: &[PendingDrawResources],
     already_submitted: usize,
     touched: &[TargetKey],
-) -> Result<Vec<(u64, RenderedImage)>, GpuError> {
+) -> Result<(Vec<(u64, RenderedImage)>, DeferredFlushTiming), GpuError> {
     let device = dev.device();
     let live: Vec<(TargetKey, PersistentTarget, u32)> = touched
         .iter()
@@ -1497,6 +1530,7 @@ fn record_and_read_flush(
     // SAFETY: recording; then end/submit/wait with live handles from this
     // device. Every pending resource remains owned by the batch until this
     // fence signals, and the command buffers are ordered as they were recorded.
+    let fence_wait_at = std::time::Instant::now();
     unsafe {
         device.cmd_pipeline_barrier(
             command_buffer,
@@ -1518,7 +1552,9 @@ fn record_and_read_flush(
             .wait_for_fences(&[fence], true, u64::MAX)
             .map_err(|e| GpuError::VulkanInitFailed(format!("flush vkWaitForFences: {e}")))?;
     }
+    let fence_wait_us = fence_wait_at.elapsed().as_micros() as u64;
 
+    let readback_at = std::time::Instant::now();
     let mut images = Vec::with_capacity(live.len());
     for (key, target, bpp) in &live {
         let size = (key.width as usize) * (key.height as usize) * (*bpp as usize);
@@ -1558,7 +1594,13 @@ fn record_and_read_flush(
             },
         ));
     }
-    Ok(images)
+    Ok((
+        images,
+        DeferredFlushTiming {
+            fence_wait_us,
+            readback_us: readback_at.elapsed().as_micros() as u64,
+        },
+    ))
 }
 
 /// Draw one triangle offscreen at `width` x `height` and read back the pixels.
