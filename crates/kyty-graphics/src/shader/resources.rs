@@ -650,6 +650,8 @@ pub struct ShaderVertexInputBuffer {
     pub addr: u64,
     pub stride: u32,
     pub num_records: u32,
+    /// Gen5 attribute fetch selector: 0 = per-vertex, 1 = per-instance.
+    pub fetch_index: u32,
     pub attr_num: i32,
     pub attr_indices: [i32; Self::ATTR_MAX],
     pub attr_offsets: [u32; Self::ATTR_MAX],
@@ -664,6 +666,8 @@ impl ShaderVertexInputBuffer {
 pub struct ShaderVertexDestination {
     pub register_start: i32,
     pub registers_num: i32,
+    /// Gen5 attribute fetch selector: 0 = vertex index, 1 = instance index.
+    pub fetch_index: u32,
     /// Attrib-table index (`ShaderSemantic::semantic()`) this resource came
     /// from. Beyond Kyty, which stores resources by array POSITION and then
     /// looks them up by attrib id in `Recompile_Fetch` — the two agree only
@@ -686,6 +690,7 @@ impl Default for ShaderVertexDestination {
         Self {
             register_start: 0,
             registers_num: 0,
+            fetch_index: 0,
             semantic: Self::UNSET_SEMANTIC,
         }
     }
@@ -715,6 +720,13 @@ pub enum ShaderTextureUsage {
 pub struct ShaderStorageResources {
     pub buffers: [ShaderBufferResource; Self::BUFFERS_MAX],
     pub usages: [ShaderStorageUsage; Self::BUFFERS_MAX],
+    /// Smallest byte prefix proven sufficient for this binding's scalar
+    /// constant-buffer loads. Zero means the shader uses a dynamic offset (or
+    /// no access was decoded), so the full descriptor extent is required.
+    ///
+    /// This is bind-time upload metadata only; it does not alter the SPIR-V
+    /// descriptor ABI or shader-cache identity.
+    pub required_bytes: [u32; Self::BUFFERS_MAX],
     pub slots: [i32; Self::BUFFERS_MAX],
     pub start_register: [i32; Self::BUFFERS_MAX],
     pub extended: [bool; Self::BUFFERS_MAX],

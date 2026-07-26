@@ -92,6 +92,21 @@ const SUBMIT_QUEUE_DEPTH: usize = 8;
 /// bounding race-ahead tightly.
 const FLIP_FRAMES_IN_FLIGHT: usize = 2;
 
+/// Parse the opt-in bounded async-flip switch.
+///
+/// Keep the default synchronous until the Phase 2 gate has three consecutive
+/// 180-second Minecraft runs without the historical title-mutex wedge. The
+/// implementation is already bounded and completion-released, but a single
+/// successful run is not enough evidence to change the production default.
+fn async_flip_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 /// Counting semaphore gating how many flip flushes may be in flight
 /// ([`FLIP_FRAMES_IN_FLIGHT`]). Permits are acquired by the guest's flip thread
 /// in [`AgcGpuSession::submit_flip_flush`] and released from the GPU-completion
@@ -388,6 +403,10 @@ pub struct AgcGpuSession {
     /// latency, yet the guest can never race more than [`FLIP_FRAMES_IN_FLIGHT`]
     /// frames ahead of the GPU. See [`AgcGpuSession::submit_flip_flush`].
     flip_permits: Arc<FlipSemaphore>,
+    /// Phase 2 safety gate. Opt in with `RAEEN_ASYNC_FLIP=1` until three
+    /// consecutive 180-second Minecraft runs prove the bounded path does not
+    /// reproduce the historical title-mutex wedge.
+    async_flip: bool,
     /// Monotonic counter advanced every time a COMPLETE frame is published to
     /// [`Self::last_image`] (or a splash transition changes what
     /// [`Self::last_image`] returns). The Shell (`shell/present.rs`) refreshes
@@ -669,6 +688,16 @@ impl raeen_core::subsystems::GpuSubmissionSubsystem for GpuProcessSession {
 
 impl AgcGpuSession {
     fn new(memory: Arc<dyn crate::guest_mem::GpuGuestMemory>) -> Self {
+        Self::new_with_async_flip(
+            memory,
+            async_flip_enabled(std::env::var_os("RAEEN_ASYNC_FLIP").as_deref()),
+        )
+    }
+
+    fn new_with_async_flip(
+        memory: Arc<dyn crate::guest_mem::GpuGuestMemory>,
+        async_flip: bool,
+    ) -> Self {
         Self {
             lifecycle: Mutex::new(GpuLifecycle::Open),
             guest_memory: Mutex::new(Some(memory)),
@@ -693,6 +722,7 @@ impl AgcGpuSession {
             fallback_present_base: Mutex::new(None),
             flip_miss_count: AtomicU64::new(0),
             flip_permits: FlipSemaphore::new(FLIP_FRAMES_IN_FLIGHT),
+            async_flip,
             present_epoch: AtomicU64::new(0),
             guest_scanout_snapshots: Mutex::new(std::collections::HashMap::new()),
             frame_publisher: None,
@@ -882,6 +912,25 @@ impl AgcGpuSession {
         crate::present_plugin::register(plugin);
     }
 
+    /// Load and register every out-of-tree present plugin in `dir`, returning
+    /// the names registered. Nothing is *activated* — selection stays the
+    /// user's choice via [`Self::select_present_plugin`].
+    ///
+    /// This is the runtime (`dlopen`/`LoadLibrary`) path: a plugin is a separate
+    /// binary the **user** supplies, never linked into the distributed Raeen
+    /// artifact. A missing directory is not an error (having no `plugins/` is
+    /// the normal case); every refused candidate is logged with its reason.
+    ///
+    /// # Safety
+    ///
+    /// Executes arbitrary native code from `dir` inside this process. Only call
+    /// this on a directory whose contents the user controls — see
+    /// [`crate::present_plugin::cabi`] for the full trust boundary.
+    pub unsafe fn load_present_plugins_from(dir: &std::path::Path) -> Vec<String> {
+        // SAFETY: delegated to this function's caller.
+        unsafe { crate::present_plugin::cabi::load_and_register_dir(dir) }
+    }
+
     /// Activate a registered present plugin by name; returns `false` (changing
     /// nothing) if no plugin with that name is registered.
     pub fn select_present_plugin(name: &str) -> bool {
@@ -971,7 +1020,8 @@ impl AgcGpuSession {
         // Read `framebuffers` in its own statement so the guard is dropped
         // before the snapshot read below (never held across another lock).
         let backed_by_target = self.framebuffers.lock().contains_key(&address);
-        if let Some(desc) = descriptor
+        if self.async_flip
+            && let Some(desc) = descriptor
             && !backed_by_target
             && let Some(bytes) = self.read_scanout_bytes(address, &desc)
         {
@@ -981,15 +1031,23 @@ impl AgcGpuSession {
             }
             snaps.insert(address, Arc::new(bytes));
         }
-        // Enqueue the present flush and return WITHOUT waiting for the GPU
-        // worker to drain it — the bounded fire-and-forget flip (item 7 / rank
-        // 7, THE fps lever). The guest's flip thread no longer pays the per-flip
-        // readback + `wait_for_fences` stall; the worker reads back and presents
-        // in the background while the guest builds the next frame, bounded to
-        // `FLIP_FRAMES_IN_FLIGHT` outstanding flushes. The Shell shows the most
-        // recent COMPLETE frame the worker has published (`present_epoch` drives
-        // its texture refresh), so it can never surface a half-read frame.
-        self.submit_flip_flush(address);
+        if self.async_flip {
+            // Enqueue the present flush and return WITHOUT waiting for the GPU
+            // worker to drain it — the bounded fire-and-forget flip (item 7 /
+            // rank 7, THE fps lever). The guest's flip thread no longer pays
+            // the per-flip readback + `wait_for_fences` stall; the worker reads
+            // back and presents in the background while the guest builds the
+            // next frame, bounded to `FLIP_FRAMES_IN_FLIGHT` outstanding
+            // flushes. The Shell shows the most recent COMPLETE frame the
+            // worker has published (`present_epoch` drives its texture
+            // refresh), so it can never surface a half-read frame.
+            self.submit_flip_flush(address);
+        } else {
+            // Safety baseline while Phase 2's three-run no-wedge gate remains
+            // open. Preserve the old synchronous completion contract unless
+            // the launch explicitly opts into `RAEEN_ASYNC_FLIP=1`.
+            self.consume_flush(Some(address), true);
+        }
     }
 
     /// Read the raw bytes of a guest display buffer for present-from-guest-
@@ -1409,23 +1467,33 @@ impl AgcGpuSession {
         // copy into the guest's real flip buffer. This turns the fallback into
         // persistent scanout state (and lets subsequent CPU/GPU consumers see
         // the same bytes) instead of merely painting the wrong-address target.
-        if image.is_none()
+        let composed_present = if image.is_none()
             && let (Some(fallback), Some(desc)) =
                 (fallback.as_ref(), *self.scanout_descriptor.lock())
         {
             let encode_at = std::time::Instant::now();
-            let presentable = to_presentable_arc(Arc::clone(fallback));
+            let presentable = try_to_presentable_arc(Arc::clone(fallback));
             self.present_srgb_encode_us
                 .fetch_add(encode_at.elapsed().as_micros() as u64, Ordering::Relaxed);
-            self.compose_presentable_to_scanout(address, &desc, &presentable);
-        }
-        let guest_present = if image.is_none() {
-            let desc = *self.scanout_descriptor.lock();
-            desc.and_then(|desc| self.present_from_guest_memory(address, &desc))
+            presentable.filter(|presentable| {
+                self.compose_presentable_to_scanout(address, &desc, presentable)
+            })
         } else {
             None
-        }
-        .map(Arc::new);
+        };
+        let guest_present = if image.is_none() {
+            // A successful compatibility composite already owns the exact,
+            // complete RGBA frame the Shell needs. Publishing that Arc directly
+            // avoids allocating another 8 MiB buffer merely to decode the guest
+            // scanout bytes we wrote one line above.
+            composed_present.or_else(|| {
+                let desc = *self.scanout_descriptor.lock();
+                desc.and_then(|desc| self.present_from_guest_memory(address, &desc))
+                    .map(Arc::new)
+            })
+        } else {
+            None
+        };
         // The guest scanout is authoritative when it actually holds pixels:
         // ASTRO-class titles compose their display buffer by compute/DMA writes
         // we do not capture as a render target, so the real frame lives at the
@@ -1519,7 +1587,10 @@ impl AgcGpuSession {
         // an 8 MB copy — and this runs inside the guest flip thread's
         // synchronous flush, so the copy was pure per-flip latency.
         let encode_at = std::time::Instant::now();
-        let presented = to_presentable_arc(presented);
+        let Some(presented) = try_to_presentable_arc(presented) else {
+            warn_present_allocation_failed();
+            return;
+        };
         self.present_srgb_encode_us
             .fetch_add(encode_at.elapsed().as_micros() as u64, Ordering::Relaxed);
         self.publish_frame(Arc::clone(&presented));
@@ -1605,34 +1676,47 @@ impl AgcGpuSession {
         if total > (256 << 20) {
             return false;
         }
-        let mut scanout = vec![0; total];
-        for y in 0..desc.height as usize {
-            let source_y = y * image.height as usize / desc.height as usize;
-            let destination = &mut scanout[y * row_bytes..y * row_bytes + desc.width as usize * 4];
-            for x in 0..desc.width as usize {
-                let source_x = x * image.width as usize / desc.width as usize;
-                let source_at = (source_y * image.width as usize + source_x) * 4;
-                let src = &image.pixels[source_at..source_at + 4];
-                let dst = &mut destination[x * 4..x * 4 + 4];
-                match order {
-                    Order::Rgba => dst.copy_from_slice(src),
-                    Order::Bgra => {
-                        dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
+        // The overwhelmingly common native RGBA case is already tightly
+        // packed. Write it directly instead of allocating/copying a second
+        // full scanout frame.
+        let direct = matches!(order, Order::Rgba)
+            && pitch == desc.width
+            && (image.width, image.height) == (desc.width, desc.height);
+        let scanout = if direct {
+            None
+        } else {
+            let Some(mut scanout) = try_zeroed_bytes(total) else {
+                warn_present_allocation_failed();
+                return false;
+            };
+            for y in 0..desc.height as usize {
+                let source_y = y * image.height as usize / desc.height as usize;
+                let destination =
+                    &mut scanout[y * row_bytes..y * row_bytes + desc.width as usize * 4];
+                for x in 0..desc.width as usize {
+                    let source_x = x * image.width as usize / desc.width as usize;
+                    let source_at = (source_y * image.width as usize + source_x) * 4;
+                    let src = &image.pixels[source_at..source_at + 4];
+                    let dst = &mut destination[x * 4..x * 4 + 4];
+                    match order {
+                        Order::Rgba => dst.copy_from_slice(src),
+                        Order::Bgra => {
+                            dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
+                        }
                     }
                 }
             }
-        }
+            Some(scanout)
+        };
+        let bytes = scanout.as_deref().unwrap_or(&image.pixels);
         let wrote = self
             .guest_memory
             .lock()
             .as_ref()
-            .is_some_and(|memory| memory.write_gpu(address, &scanout));
+            .is_some_and(|memory| memory.write_gpu(address, bytes));
         if !wrote {
             return false;
         }
-        self.guest_scanout_snapshots
-            .lock()
-            .insert(address, Arc::new(scanout));
         static COMPOSITE_LOGS: AtomicU64 = AtomicU64::new(0);
         let occurrence = COMPOSITE_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
         if occurrence == 1 || occurrence.is_power_of_two() {
@@ -2083,7 +2167,14 @@ impl AgcGpuSession {
             // the RGBA8 present surface / PPM dump; 8-bit frames pass through.
             // Into the `Arc` once (see `last_image`): the store is a bump.
             let encode_at = std::time::Instant::now();
-            let presented = to_presentable_arc(presented);
+            let Some(presented) = try_to_presentable_arc(presented) else {
+                {
+                    let mut draws = self.draw_count.lock();
+                    *draws += drawn;
+                }
+                warn_present_allocation_failed();
+                return Ok((Some(image), suspended));
+            };
             self.present_srgb_encode_us
                 .store(encode_at.elapsed().as_micros() as u64, Ordering::Relaxed);
             self.publish_frame(Arc::clone(&presented));
@@ -2240,12 +2331,12 @@ impl AgcGpuSession {
                                     // Stage C: worker submissions defer
                                     // presentation — the flush (readback +
                                     // present) runs once per FLIP, not once
-                                    // per submission. RAEEN_DUMP_FRAMES keeps
-                                    // the old flush-per-submission cadence so
-                                    // frame-dump diagnostics stay faithful.
-                                    let deferred_present =
-                                        crate::diagnostics::gpu_env().dump_frames.is_none();
-                                    session.worker_submit(words, is_compute, deferred_present);
+                                    // per submission. Frame dumps are taken
+                                    // from that completed present below; a
+                                    // diagnostic must not silently restore the
+                                    // old flush-per-submission performance
+                                    // wall or cease to represent real pacing.
+                                    session.worker_submit(words, is_compute, true);
                                 }))
                                 .is_err()
                                 {
@@ -2892,20 +2983,35 @@ fn linear_to_srgb_u8(c: f32) -> u8 {
     (encoded * 255.0 + 0.5) as u8
 }
 
+/// Allocate an initialized byte buffer without invoking Rust's aborting
+/// allocation-error handler. Full-HD presentation buffers are 8 MiB; under
+/// memory pressure a missed frame must preserve the previous completed frame,
+/// not terminate the isolated runner.
+fn try_zeroed_bytes(len: usize) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).ok()?;
+    bytes.resize(len, 0);
+    Some(bytes)
+}
+
 /// Convert a render target to the RGBA8 bytes the Shell present surface and the
 /// PPM frame dump expect. An `R16G16B16A16_SFLOAT` HDR target (8 bytes/pixel)
 /// is unpacked and sRGB-encoded (SharpEmu #448); everything already 4 bytes per
-/// pixel is presented unchanged. Takes ownership so the common 8-bit path costs
-/// nothing.
-fn to_presentable(image: RenderedImage) -> RenderedImage {
+/// pixel is shared unchanged.
+///
+/// The conversion reads the source through its `Arc` instead of cloning the
+/// whole 16 MiB 1080p HDR frame before allocating the 8 MiB output.
+fn try_to_presentable_arc(image: Arc<RenderedImage>) -> Option<Arc<RenderedImage>> {
     if image.bytes_per_pixel != 8 {
-        return image;
+        return Some(image);
     }
-    let px_count = (image.width as usize).saturating_mul(image.height as usize);
-    if image.pixels.len() < px_count.saturating_mul(8) {
-        return image;
+    let px_count = (image.width as usize).checked_mul(image.height as usize)?;
+    let input_bytes = px_count.checked_mul(8)?;
+    let output_bytes = px_count.checked_mul(4)?;
+    if image.pixels.len() < input_bytes {
+        return None;
     }
-    let mut pixels = vec![0u8; px_count * 4];
+    let mut pixels = try_zeroed_bytes(output_bytes)?;
     for (texel, out) in image.pixels.chunks_exact(8).zip(pixels.chunks_exact_mut(4)) {
         let r = half_to_f32(u16::from_le_bytes([texel[0], texel[1]]));
         let g = half_to_f32(u16::from_le_bytes([texel[2], texel[3]]));
@@ -2917,23 +3023,24 @@ fn to_presentable(image: RenderedImage) -> RenderedImage {
         // Alpha is a coverage value, not light — keep it linear.
         out[3] = (a.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
     }
-    RenderedImage {
+    Some(Arc::new(RenderedImage {
         width: image.width,
         height: image.height,
         pixels,
         bytes_per_pixel: 4,
-    }
+    }))
 }
 
-/// Arc-aware present conversion. The overwhelmingly common RGBA8 path keeps
-/// the render-target allocation shared between the framebuffer census,
-/// isolated-runner IPC, and `last_image`; only HDR targets allocate an RGBA8
-/// conversion. This removes one full-frame memcpy from every ordinary flip.
-fn to_presentable_arc(image: Arc<RenderedImage>) -> Arc<RenderedImage> {
-    if image.bytes_per_pixel != 8 {
-        return image;
+fn warn_present_allocation_failed() {
+    static WARNINGS: AtomicU64 = AtomicU64::new(0);
+    let occurrence = WARNINGS.fetch_add(1, Ordering::Relaxed) + 1;
+    if occurrence <= 8 || occurrence.is_power_of_two() {
+        warn!(
+            occurrence,
+            "presentation frame allocation failed under host memory pressure; \
+             preserving the last complete frame"
+        );
     }
-    Arc::new(to_presentable((*image).clone()))
 }
 
 /// Number of frames presented since process start — the frame-dump sampling
@@ -3083,9 +3190,27 @@ pub fn build_cp_draw_dcb(width: u32, height: u32, half: ScissorHalf) -> Vec<u32>
 mod tests {
     use super::*;
     use raeen_core::subsystems::GpuSubmissionSubsystem;
+    use std::ffi::OsStr;
 
     fn deny_memory() -> Arc<dyn crate::guest_mem::GpuGuestMemory> {
         Arc::new(crate::guest_mem::DenyGpuMemory)
+    }
+
+    #[test]
+    fn async_flip_is_opt_in_and_accepts_explicit_true_spellings() {
+        assert!(!async_flip_enabled(None), "production default stays safe");
+        for enabled in ["1", "true", "YES", " on "] {
+            assert!(
+                async_flip_enabled(Some(OsStr::new(enabled))),
+                "{enabled:?} should enable the bounded path"
+            );
+        }
+        for disabled in ["0", "false", "off", "invalid"] {
+            assert!(
+                !async_flip_enabled(Some(OsStr::new(disabled))),
+                "{disabled:?} must keep synchronous presentation"
+            );
+        }
     }
 
     /// The frames-in-flight semaphore (item 7 / rank 7). Proves the three
@@ -3134,7 +3259,10 @@ mod tests {
     /// worker, plus the "no deadlock past the cap" contract.
     #[test]
     fn bounded_flip_enqueues_async_and_returns_all_permits() {
-        let session = GpuProcessSession::create(deny_memory());
+        let session = GpuProcessSession(Arc::new(AgcGpuSession::new_with_async_flip(
+            deny_memory(),
+            true,
+        )));
         // Stand up the GPU worker; a worker-less session flushes inline and
         // would never exercise the permit path.
         session.submit_dcb_async(build_state_only_dcb(), false);
@@ -3213,7 +3341,7 @@ mod tests {
             pixels,
             bytes_per_pixel: 8,
         };
-        let out = to_presentable(hdr);
+        let out = try_to_presentable_arc(Arc::new(hdr)).expect("small HDR conversion");
         assert_eq!(out.bytes_per_pixel, 4, "float target becomes RGBA8");
         assert_eq!(out.pixels.len(), 4);
         assert_eq!(out.pixels[0], 255, "linear 1.0 -> sRGB 255");
@@ -3238,9 +3366,82 @@ mod tests {
             pixels: vec![1, 2, 3, 255, 4, 5, 6, 255],
             bytes_per_pixel: 4,
         };
-        let out = to_presentable(frame.clone());
+        let input = Arc::new(frame.clone());
+        let out = try_to_presentable_arc(Arc::clone(&input)).expect("RGBA passthrough");
+        assert!(
+            Arc::ptr_eq(&out, &input),
+            "the common RGBA8 path must not copy a frame"
+        );
         assert_eq!(out.pixels, frame.pixels);
         assert_eq!(out.bytes_per_pixel, 4);
+    }
+
+    #[test]
+    fn synchronous_flip_does_not_retain_an_async_scanout_snapshot() {
+        let mut backing = vec![1u8, 2, 3, 255, 4, 5, 6, 255];
+        let base = backing.as_mut_ptr() as u64;
+        let session = AgcGpuSession::new_with_async_flip(
+            Arc::new(HostRangeMemory {
+                start: base,
+                len: backing.len() as u64,
+            }),
+            false,
+        );
+        let desc = raeen_core::subsystems::ScanoutDescriptor {
+            width: 2,
+            height: 1,
+            pitch_pixels: 2,
+            pixel_format: 0x8000_0000_2200_0000,
+            tiling_mode: 0,
+        };
+
+        session.present_scanout(base, Some(desc));
+
+        assert!(
+            session.guest_scanout_snapshots.lock().is_empty(),
+            "the synchronous path consumes guest memory before the flip returns; \
+             retaining an async race-avoidance snapshot is an 8 MiB-per-buffer waste"
+        );
+    }
+
+    #[test]
+    fn fallback_composite_publishes_the_complete_intermediate_without_redecoding_it() {
+        let mut scanout = vec![0u8; 8];
+        let scanout_base = scanout.as_mut_ptr() as u64;
+        let session = AgcGpuSession::new_with_async_flip(
+            Arc::new(HostRangeMemory {
+                start: scanout_base,
+                len: scanout.len() as u64,
+            }),
+            false,
+        );
+        let desc = raeen_core::subsystems::ScanoutDescriptor {
+            width: 2,
+            height: 1,
+            pitch_pixels: 2,
+            pixel_format: 0x8000_0000_2200_0000,
+            tiling_mode: 0,
+        };
+        let intermediate = Arc::new(RenderedImage {
+            width: 2,
+            height: 1,
+            pixels: vec![10, 20, 30, 255, 90, 80, 70, 255],
+            bytes_per_pixel: 4,
+        });
+        session
+            .framebuffers
+            .lock()
+            .insert(0x1234_0000, Arc::clone(&intermediate));
+
+        session.present_scanout(scanout_base, Some(desc));
+
+        let presented = session.last_image().expect("fallback frame is published");
+        assert!(
+            Arc::ptr_eq(&presented, &intermediate),
+            "the compatibility composite already owns a complete RGBA frame; reading the \
+             just-written guest scanout back allocated and copied a second full frame"
+        );
+        assert_eq!(scanout, intermediate.pixels);
     }
 
     /// A DCB that only writes registers: no draw and no dispatch, so

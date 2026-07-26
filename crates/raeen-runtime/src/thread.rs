@@ -25,6 +25,25 @@ const SCE_KERNEL_ERROR_ESRCH: u64 = 0x8002_0003;
 const SCE_KERNEL_ERROR_EAGAIN: u64 = 0x8002_000B;
 const SCE_KERNEL_ERROR_EINVAL: u64 = 0x8002_0016;
 
+const GUEST_PTHREAD_MIN_STACK_SIZE: u64 = 0x1_0000;
+const GUEST_PTHREAD_MAX_STACK_SIZE: u64 = 0x400_0000;
+
+/// Emulator-owned space below the stack size visible through pthread attrs.
+///
+/// Minecraft requests a 1 MiB stack for its streaming pool, then calls a
+/// compiler-produced function with a fixed 0x14a778-byte frame while opening a
+/// world. Allocating exactly the reported size crosses the stack base before
+/// the function can run. KytyPS5 independently models the platform with a
+/// separate 1 MiB runtime reserve for emulator-owned stacks; keep that
+/// headroom out of `PthreadAttr::stack_size` so Set/Get still round-trip the
+/// title's value exactly.
+const GUEST_PTHREAD_RUNTIME_HEADROOM: u64 = 0x10_0000;
+
+fn allocated_guest_stack_size(requested: u64) -> u64 {
+    requested.clamp(GUEST_PTHREAD_MIN_STACK_SIZE, GUEST_PTHREAD_MAX_STACK_SIZE)
+        + GUEST_PTHREAD_RUNTIME_HEADROOM
+}
+
 struct GuestThread {
     join: Option<JoinHandle<Result<RunOutcome, RuntimeError>>>,
     detached: bool,
@@ -437,7 +456,7 @@ impl GuestProcess {
             .flatten();
         let requested = state.map_or(0x10_0000, |state| state.stack_size);
         (
-            requested.clamp(0x1_0000, 0x400_0000),
+            allocated_guest_stack_size(requested),
             state.is_some_and(|state| state.detach_state != 0),
         )
     }
@@ -601,7 +620,13 @@ impl GuestThreadScheduler for GuestProcessHandle {
         let host = std::thread::Builder::new()
             .name(format!("raeen-guest-{handle}"))
             .spawn(move || {
-                tracing::info!(guest_thread = handle, entry, "guest pthread started");
+                tracing::info!(
+                    guest_thread = handle,
+                    entry,
+                    stack_base,
+                    stack_size,
+                    "guest pthread started"
+                );
                 process.kernel.diagnostics.record(
                     handle,
                     DiagnosticKind::TaskOwned,
@@ -777,5 +802,32 @@ impl GuestThreadScheduler for GuestProcessHandle {
 
     fn process_is_terminating(&self) -> bool {
         self.terminating.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GUEST_PTHREAD_MAX_STACK_SIZE, GUEST_PTHREAD_MIN_STACK_SIZE, GUEST_PTHREAD_RUNTIME_HEADROOM,
+        allocated_guest_stack_size,
+    };
+
+    #[test]
+    fn runtime_owned_pthread_stack_adds_headroom_without_changing_requested_size() {
+        let requested = 0x10_0000;
+        assert_eq!(allocated_guest_stack_size(requested), 0x20_0000);
+        assert_eq!(requested, 0x10_0000);
+    }
+
+    #[test]
+    fn runtime_owned_pthread_stack_clamps_request_before_adding_headroom() {
+        assert_eq!(
+            allocated_guest_stack_size(1),
+            GUEST_PTHREAD_MIN_STACK_SIZE + GUEST_PTHREAD_RUNTIME_HEADROOM
+        );
+        assert_eq!(
+            allocated_guest_stack_size(u64::MAX),
+            GUEST_PTHREAD_MAX_STACK_SIZE + GUEST_PTHREAD_RUNTIME_HEADROOM
+        );
     }
 }

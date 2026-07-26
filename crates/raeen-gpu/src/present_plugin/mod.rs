@@ -33,6 +33,7 @@
 //! legitimate architecture rather than a copyleft-evasion device.
 
 pub mod builtin;
+pub mod cabi;
 
 use parking_lot::Mutex;
 use std::collections::BTreeMap;

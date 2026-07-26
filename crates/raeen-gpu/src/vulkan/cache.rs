@@ -222,8 +222,8 @@ pub(crate) struct GraphicsPipelineKey {
     pub front_face: i32,
     pub color_write_mask: u32,
     pub blend: BlendKey,
-    /// (binding, stride) — input rate is always per-vertex here.
-    pub vertex_bindings: Vec<(u32, u32)>,
+    /// (binding, stride, input rate).
+    pub vertex_bindings: Vec<(u32, u32, i32)>,
     /// (location, binding, format, offset).
     pub vertex_attributes: Vec<(u32, u32, i32, u32)>,
 }
@@ -256,6 +256,26 @@ pub(crate) enum TargetContent {
     Unknown,
 }
 
+/// Last successfully recorded layout of a persistent colour target.
+///
+/// Deferred draws keep an image attachment-resident until it is actually
+/// sampled or copied to the host. `Undefined` means the prior contents/layout
+/// are not trustworthy and the next writer must discard them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetLayout {
+    Undefined,
+    TransferSrc,
+    ColorAttachment,
+}
+
+/// Last successfully recorded layout of a persistent depth/stencil target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DepthTargetLayout {
+    Undefined,
+    TransferSrc,
+    DepthStencilAttachment,
+}
+
 /// The device-side half of one guest render target: the attachment image and
 /// the host-visible buffer its pixels are read back through.
 ///
@@ -272,6 +292,7 @@ pub(crate) struct PersistentTarget {
     pub readback_buffer: vk::Buffer,
     pub readback_memory: vk::DeviceMemory,
     pub content: TargetContent,
+    pub layout: TargetLayout,
 }
 
 /// Identity of one guest depth/stencil surface. Like [`TargetKey`], creation
@@ -293,6 +314,7 @@ pub(crate) struct PersistentDepthTarget {
     pub view: vk::ImageView,
     pub readback_buffer: vk::Buffer,
     pub readback_memory: vk::DeviceMemory,
+    pub layout: DepthTargetLayout,
 }
 
 /// A guest texture kept alive on the device across draws (stage D item 1).
@@ -539,6 +561,11 @@ pub(crate) struct DrawCaches {
     /// pooled buffer (recycle) from an ad-hoc one (destroy) and knows which
     /// size class it returns to.
     host_pool_capacity: HashMap<u64, u64>,
+    /// Persistently-mapped address of every live pooled allocation, keyed by
+    /// raw memory handle. Stored as an integer so the mutex-owned cache remains
+    /// `Send`; it is converted back to a pointer only while the allocation is
+    /// fence-idle.
+    host_pool_mapped: HashMap<u64, usize>,
     /// Total bytes sitting FREE in the pool, for the recycle cap.
     host_pool_free_bytes: u64,
     pub stats: DrawCacheStats,
@@ -851,7 +878,7 @@ impl DrawCaches {
         &mut self,
         dev: &VulkanDevice,
         size: u64,
-    ) -> Result<(vk::Buffer, vk::DeviceMemory), GpuError> {
+    ) -> Result<(vk::Buffer, vk::DeviceMemory, usize), GpuError> {
         debug_assert!(size > 0, "zero-sized host buffer request");
         // Smallest free size class that fits. Don't hand a small request a
         // giant buffer (>= 8x) — that starves the big classes and bloats
@@ -876,13 +903,41 @@ impl DrawCaches {
             }
             self.host_pool_free_bytes -= cap;
             self.stats.host_pool_hits += 1;
-            return Ok(entry);
+            let mapped = *self
+                .host_pool_mapped
+                .get(&entry.1.as_raw())
+                .expect("pooled host buffer must remain persistently mapped");
+            return Ok((entry.0, entry.1, mapped));
         }
         let capacity = requested_class;
         let (buffer, memory) = create_host_buffer(dev, capacity)?;
+        let mapped = match unsafe {
+            dev.device()
+                .map_memory(memory, 0, capacity, vk::MemoryMapFlags::empty())
+        } {
+            Ok(ptr) => ptr as usize,
+            Err(e) => {
+                // SAFETY: neither handle has escaped or been referenced by a
+                // GPU submission, so creation can be rolled back immediately.
+                unsafe {
+                    dev.device().destroy_buffer(buffer, None);
+                    dev.device().free_memory(memory, None);
+                }
+                return Err(GpuError::VulkanInitFailed(format!(
+                    "persistent vkMapMemory failed: {e}"
+                )));
+            }
+        };
         self.host_pool_capacity.insert(buffer.as_raw(), capacity);
+        self.host_pool_mapped.insert(memory.as_raw(), mapped);
         self.stats.host_pool_misses += 1;
-        Ok((buffer, memory))
+        Ok((buffer, memory, mapped))
+    }
+
+    /// Return the persistent mapping for a pooled allocation. The caller must
+    /// have fence ownership before reading or writing through this address.
+    pub(crate) fn mapped_host_memory(&self, memory: vk::DeviceMemory) -> Option<usize> {
+        self.host_pool_mapped.get(&memory.as_raw()).copied()
     }
 
     /// Return a buffer to the pool (if it came from [`Self::acquire_host_buffer`])
@@ -917,9 +972,13 @@ impl DrawCaches {
             // Over the cap: fall through to destruction.
             self.host_pool_capacity.remove(&buffer.as_raw());
         }
+        let was_mapped = self.host_pool_mapped.remove(&memory.as_raw()).is_some();
         // SAFETY: caller guarantees no pending GPU work references the pair;
         // both handles were created from this device and are destroyed once.
         unsafe {
+            if was_mapped && memory != vk::DeviceMemory::null() {
+                dev.device().unmap_memory(memory);
+            }
             if buffer != vk::Buffer::null() {
                 dev.device().destroy_buffer(buffer, None);
             }
@@ -1668,13 +1727,20 @@ impl DrawCaches {
     pub(crate) fn mark_target_synced(&mut self, key: &TargetKey) {
         if let Some(target) = self.targets.get_mut(key) {
             target.content = TargetContent::Synced;
+            target.layout = TargetLayout::TransferSrc;
         }
     }
 
     /// The persistent image + view for `key`, if one is live — used to bind a
     /// render target directly as a sampled descriptor (stage B).
-    pub(crate) fn target_image(&self, key: &TargetKey) -> Option<(vk::Image, vk::ImageView)> {
-        self.targets.get(key).map(|t| (t.image, t.view))
+    pub(crate) fn target_image(
+        &self,
+        key: &TargetKey,
+    ) -> Option<(vk::Image, vk::ImageView, TargetLayout)> {
+        self.targets
+            .get(key)
+            .filter(|target| target.content != TargetContent::Unknown)
+            .map(|target| (target.image, target.view, target.layout))
     }
 
     /// A copy of the whole persistent-target entry for `key` (flush readback).
@@ -1687,6 +1753,23 @@ impl DrawCaches {
     pub(crate) fn mark_target_unknown(&mut self, key: &TargetKey) {
         if let Some(target) = self.targets.get_mut(key) {
             target.content = TargetContent::Unknown;
+            target.layout = TargetLayout::Undefined;
+        }
+    }
+
+    pub(crate) fn mark_target_layout(&mut self, key: &TargetKey, layout: TargetLayout) {
+        if let Some(target) = self.targets.get_mut(key) {
+            target.layout = layout;
+        }
+    }
+
+    pub(crate) fn mark_depth_target_layout(
+        &mut self,
+        key: &DepthTargetKey,
+        layout: DepthTargetLayout,
+    ) {
+        if let Some(target) = self.depth_targets.get_mut(key) {
+            target.layout = layout;
         }
     }
 
@@ -1800,12 +1883,18 @@ impl DrawCaches {
     /// join the pending list, the target joins the touched list (moved to the
     /// back so flush order follows last-draw order), and the target's GPU
     /// image becomes the sole content authority.
-    pub(crate) fn commit_deferred_draw(&mut self, res: PendingDrawResources, key: TargetKey) {
+    pub(crate) fn commit_deferred_draw(
+        &mut self,
+        res: PendingDrawResources,
+        key: TargetKey,
+        layout: TargetLayout,
+    ) {
         self.pending.push(res);
         self.touched.retain(|k| *k != key);
         self.touched.push(key);
         if let Some(target) = self.targets.get_mut(&key) {
             target.content = TargetContent::GpuNewer;
+            target.layout = layout;
         }
         self.stats.deferred_draws += 1;
     }
@@ -1996,6 +2085,10 @@ impl DrawCaches {
                     device.destroy_descriptor_pool(res.descriptor_pool, None);
                 }
                 for (buffer, memory) in res.buffers {
+                    if self.host_pool_mapped.remove(&memory.as_raw()).is_some() {
+                        device.unmap_memory(memory);
+                    }
+                    self.host_pool_capacity.remove(&buffer.as_raw());
                     device.destroy_buffer(buffer, None);
                     device.free_memory(memory, None);
                 }
@@ -2091,11 +2184,15 @@ impl DrawCaches {
             // list (or by `Resources::Drop` before teardown).
             for (_, list) in std::mem::take(&mut self.host_pool_free) {
                 for (buffer, memory) in list {
+                    if self.host_pool_mapped.remove(&memory.as_raw()).is_some() {
+                        device.unmap_memory(memory);
+                    }
                     device.destroy_buffer(buffer, None);
                     device.free_memory(memory, None);
                 }
             }
             self.host_pool_capacity.clear();
+            self.host_pool_mapped.clear();
             self.host_pool_free_bytes = 0;
         }
     }
@@ -2314,7 +2411,7 @@ mod tests {
                 dst_alpha: vk::BlendFactor::ZERO.as_raw(),
                 alpha_op: vk::BlendOp::ADD.as_raw(),
             },
-            vertex_bindings: vec![(0, 16)],
+            vertex_bindings: vec![(0, 16, vk::VertexInputRate::VERTEX.as_raw())],
             vertex_attributes: vec![(0, 0, vk::Format::R32G32B32A32_SFLOAT.as_raw(), 0)],
         };
         assert_eq!(base, base.clone());
@@ -2330,6 +2427,12 @@ mod tests {
             ..base.clone()
         };
         assert_ne!(base, different_shader);
+
+        let different_input_rate = GraphicsPipelineKey {
+            vertex_bindings: vec![(0, 16, vk::VertexInputRate::INSTANCE.as_raw())],
+            ..base.clone()
+        };
+        assert_ne!(base, different_input_rate);
     }
 
     #[test]

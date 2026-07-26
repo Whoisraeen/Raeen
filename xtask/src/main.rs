@@ -407,14 +407,35 @@ fn run_one(
     command
         .arg("--run-eboot")
         .arg(local_path)
-        .env("RAEEN_VBLANK_HZ", "1000")
-        .env("RAEEN_TIME_DRAW", "1")
-        .env("RAEEN_CALL_STATS", "1")
+        // One telemetry line per 32 completed presents is cheap enough for a
+        // performance run and gives the report a reliable recent-window FPS.
+        // `RAEEN_TIME_DRAW` logs every draw/DCB and materially perturbs the
+        // workload it is supposed to measure, so callers must opt into that
+        // heavier diagnostic separately.
+        .env("RAEEN_TIME_WORKER", "1")
         .env("RAEEN_COMPAT_RUN_ID", run_id)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    if profile != "max-fps" {
-        command.env_remove("RAEEN_VBLANK_HZ");
+    if profile == "max-fps" {
+        command
+            // `0` is the explicit HLE benchmark sentinel: advance vblank
+            // counters/events without sleeping. Values above the supported
+            // 480 Hz range fall back to 60 Hz, so the former `1000` sentinel
+            // silently measured a paced run.
+            .env("RAEEN_VBLANK_HZ", "0")
+            // Full HLE call accounting touches every guest-to-host call and
+            // emits large summaries. It is useful for compatibility triage,
+            // but it perturbs the performance profile it is meant to measure.
+            .env_remove("RAEEN_CALL_STATS")
+            // Phase 2's bounded path is production-default OFF until its
+            // three-run no-wedge gate is green. The max-fps profile is an
+            // explicit opt-in measurement, so enable it here.
+            .env("RAEEN_ASYNC_FLIP", "1");
+    } else {
+        command
+            .env_remove("RAEEN_VBLANK_HZ")
+            .env_remove("RAEEN_ASYNC_FLIP")
+            .env("RAEEN_CALL_STATS", "1");
     }
     let mut child = command
         .spawn()
@@ -440,8 +461,12 @@ fn run_one(
     // field name and `=`. Strip it once before every metric/blocker scan so a
     // measured `total_flips=32` cannot be misreported as zero.
     let text = strip_ansi(&String::from_utf8_lossy(&log));
-    let flip_events =
-        max_metric(&text, "total_flips").max(count_any(&text, &["sceVideoOutSubmitFlip"]));
+    let flip_events = max_metric(&text, "total_flips")
+        // The low-overhead worker window is emitted every 32 completed
+        // presents; AGC's `total_flips` progress line is power-of-two sampled
+        // and can otherwise under-report a long run by almost 2x.
+        .max(max_metric(&text, "flips"))
+        .max(count_any(&text, &["sceVideoOutSubmitFlip"]));
     let shader_errors = count_lines(&text, |line| {
         line.contains("shader") && (line.contains("ERROR") || line.contains("not supported"))
     });
@@ -483,7 +508,7 @@ fn run_one(
             gpu_errors,
             audio_errors,
             input_events,
-            observed_fps: None,
+            observed_fps: observed_fps(&text),
         },
         evidence: Evidence {
             log_sha1: sha1_bytes(&log),
@@ -517,6 +542,33 @@ fn max_metric(text: &str, name: &str) -> u64 {
         })
         .max()
         .unwrap_or(0)
+}
+
+/// Derive completed-present FPS from the worker's low-overhead 32-frame
+/// windows. Use the median of the eight most recent windows (up to 256 frames)
+/// so launch transients do not replace the title's steady-state measurement
+/// and one scheduler spike cannot manufacture or erase a gate pass.
+fn observed_fps(text: &str) -> Option<f64> {
+    let prefix = "frame_ms=";
+    let values = text
+        .split_whitespace()
+        .filter_map(|token| token.strip_prefix(prefix))
+        .filter_map(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect::<Vec<_>>();
+    let recent = values.len().saturating_sub(8);
+    let mut recent = values[recent..].to_vec();
+    if recent.is_empty() {
+        return None;
+    }
+    recent.sort_by(f64::total_cmp);
+    let middle = recent.len() / 2;
+    let frame_ms = if recent.len().is_multiple_of(2) {
+        (recent[middle - 1] + recent[middle]) / 2.0
+    } else {
+        recent[middle]
+    };
+    Some((10000.0 / frame_ms).round() / 10.0)
 }
 
 fn registry_roots_from_path(path: &str) -> Vec<String> {
@@ -1015,6 +1067,32 @@ mod tests {
         );
         let text = strip_ansi(log);
         assert_eq!(max_metric(&text, "total_flips"), 19);
+    }
+
+    #[test]
+    fn worker_flip_counter_captures_completed_windows_between_power_of_two_logs() {
+        let log = "total_flips=4096\nWORKER TIMING: flips=5632 frame_ms=15.0\n";
+        assert_eq!(
+            max_metric(log, "total_flips").max(max_metric(log, "flips")),
+            5632
+        );
+    }
+
+    #[test]
+    fn worker_windows_publish_recent_median_fps() {
+        let log = concat!(
+            "frame_ms=100.0\n",
+            "\u{1b}[32mframe_ms\u{1b}[0m=16.0\n",
+            "frame_ms=16.0\n",
+            "frame_ms=16.0\n",
+            "frame_ms=16.0\n",
+            "frame_ms=16.0\n",
+            "frame_ms=16.0\n",
+            "frame_ms=16.0\n",
+            "frame_ms=16.0\n",
+        );
+        assert_eq!(observed_fps(&strip_ansi(log)), Some(62.5));
+        assert_eq!(observed_fps("no completed-present telemetry"), None);
     }
 
     #[test]

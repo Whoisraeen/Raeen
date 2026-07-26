@@ -38,14 +38,215 @@ under its own license. So the rule is strict and non-negotiable:
 For the full reasoning see `docs/strategy/2026-07-23-go-to-ps5-emulator.md`
 (§4.1) and the module docs in `present_plugin/mod.rs`.
 
-## Writing a plugin (sketch)
+## Two ways to write a plugin
 
-A plugin is a crate that depends on `raeen-gpu` and implements the trait:
+| | In-tree Rust trait | **Out-of-tree C ABI** |
+|---|---|---|
+| Shape | crate compiled into `raeen-gpu` | standalone `.dll`/`.so`/`.dylib` |
+| Loading | `register_present_plugin(...)` | dropped in `plugins/`, `dlopen`ed at startup |
+| Rebuild Raeen? | yes | **no** |
+| Language | Rust | anything with C linkage |
+| For proprietary code | **no** — this links it | **yes** — nothing is linked |
+
+**Use the C ABI for anything you cannot license under GPL-2.0.** It is the only
+shape where the plugin is never linked into the Raeen artifact.
+
+## The C ABI
+
+Raeen scans `plugins/` at startup for files with the platform's shared-library
+extension, loads each, and looks up one exported symbol:
+
+```c
+const RaeenPluginV1 *raeen_plugin_v1(void);
+```
+
+Return a pointer to a statically-lived struct whose `abi_version` is `1`.
+Raeen then calls `create()` once, `name()` and `capabilities()` to describe the
+plugin, `process()` per presented frame, `release_output()` after copying each
+result, and `destroy()` at teardown.
+
+```c
+#include <stddef.h>
+#include <stdint.h>
+
+#define RAEEN_PLUGIN_ABI_VERSION 1u
+
+#define RAEEN_CAP_UPSCALE              (1u << 0)
+#define RAEEN_CAP_FRAME_GEN            (1u << 1)
+#define RAEEN_CAP_WANTS_DEPTH          (1u << 2)
+#define RAEEN_CAP_WANTS_MOTION_VECTORS (1u << 3)
+
+#define RAEEN_OK 0
+
+typedef struct { uint32_t width, height, bytes_per_texel, _reserved;
+                 const uint8_t *data; size_t len; } RaeenAuxPlane;
+
+typedef struct { uint32_t width, height, bytes_per_pixel, _reserved;
+                 const uint8_t *color; size_t color_len;
+                 const RaeenAuxPlane *depth;    /* NULL today */
+                 const RaeenAuxPlane *motion;   /* NULL today */
+                 uint64_t frame_index; } RaeenPresentFrame;
+
+typedef struct { float output_scale; uint32_t hdr; } RaeenPresentContext;
+
+typedef struct { uint32_t width, height, bytes_per_pixel, _reserved;
+                 const uint8_t *pixels; size_t pixels_len; } RaeenPluginFrame;
+
+typedef struct { RaeenPluginFrame primary;
+                 const RaeenPluginFrame *generated;  /* reserved */
+                 size_t generated_count; } RaeenPluginOutput;
+
+typedef struct {
+    uint32_t abi_version, _reserved;
+    void  *(*create)(void);
+    void   (*destroy)(void *inst);
+    size_t (*name)(void *inst, uint8_t *buf, size_t cap);
+    uint32_t (*capabilities)(void *inst);
+    int32_t (*process)(void *inst, const RaeenPresentFrame *frame,
+                       const RaeenPresentContext *ctx, RaeenPluginOutput *out);
+    void   (*release_output)(void *inst, RaeenPluginOutput *out);
+} RaeenPluginV1;
+```
+
+### Rules Raeen enforces
+
+Break any of these and the frame is refused (the source frame is presented
+unchanged) with a warning naming your plugin — never a silent no-op:
+
+- `name` writes **at most `cap` bytes** and returns the count. No NUL needed.
+  Return `0` or more than `cap` and the plugin is refused at load.
+- `process` returns `RAEEN_OK` on success. **Any other value means "declined"** —
+  a normal, cheap outcome for a temporal plugin that is still warming up.
+- `bytes_per_pixel` on output must be **4** (display formats) or **8** (HDR
+  `R16G16B16A16`).
+- `pixels_len` must equal `width * height * bytes_per_pixel` **exactly**.
+- Output edges are capped at 16384 and the buffer at 1 GiB.
+- You may change the output resolution — that is what an upscaler is for.
+
+### Memory ownership
+
+**You allocate the output; you free it.** Raeen copies the pixels it needs and
+then calls `release_output`, always — including when it rejected your output as
+malformed. Neither side ever frees the other's allocation, so the two may use
+different allocators, CRTs, and languages.
+
+> **What Raeen cannot check:** `pixels_len` and the dimensions are both *your*
+> claims. Raeen verifies they agree with each other, but nothing can verify
+> either against your allocation's real size. Report a length you did not
+> allocate and Raeen will read past your buffer. This is intrinsic to a C plugin
+> boundary and is why plugins are user-supplied and opt-in.
+
+## Working example — start here
+
+A **complete, compiling, tested** reference plugin ships at
+[`docs/examples/present-plugin-example.rs`](../docs/examples/present-plugin-example.rs):
+a nearest-neighbour upscaler that honours `output_scale`, declines at native
+scale, and manages its output memory correctly. It is deliberately
+dependency-free and single-file, so it builds with one command:
+
+```bash
+rustc --edition 2024 --crate-type cdylib --crate-name raeen_example_plugin -O --out-dir plugins docs/examples/present-plugin-example.rs
+```
+
+Restart Raeen and it appears in **Settings ▸ Video** as `example-nearest`.
+
+That file is not a sketch: the integration test
+`crates/raeen-gpu/tests/present_plugin_dylib.rs` compiles **that exact source**
+into a real shared library and loads it through the same `scan_dir` the Shell
+uses, asserting the upscale is a correct 2D nearest map, that a declined frame
+comes back as the source, and that 250 consecutive frames neither leak nor
+fault. Copy it as your starting point.
+
+## Sketch of the same thing, inline
+
+`Cargo.toml`:
+
+```toml
+[lib]
+crate-type = ["cdylib"]
+```
+
+`src/lib.rs` — a passthrough that proves the wiring:
+
+```rust
+use std::ffi::c_void;
+
+#[repr(C)]
+pub struct RaeenPluginFrame {
+    width: u32, height: u32, bytes_per_pixel: u32, _reserved: u32,
+    pixels: *const u8, pixels_len: usize,
+}
+// ... the remaining #[repr(C)] structs, mirrored from the header above ...
+
+unsafe extern "C" fn create() -> *mut c_void { Box::into_raw(Box::new(())).cast() }
+unsafe extern "C" fn destroy(i: *mut c_void) {
+    if !i.is_null() { drop(unsafe { Box::from_raw(i.cast::<()>()) }); }
+}
+
+unsafe extern "C" fn name(_i: *mut c_void, buf: *mut u8, cap: usize) -> usize {
+    let n = b"my-upscaler";
+    if cap < n.len() { return usize::MAX; }
+    unsafe { std::ptr::copy_nonoverlapping(n.as_ptr(), buf, n.len()) };
+    n.len()
+}
+
+unsafe extern "C" fn capabilities(_i: *mut c_void) -> u32 { 1 /* UPSCALE */ }
+
+unsafe extern "C" fn process(
+    _i: *mut c_void, frame: *const RaeenPresentFrame,
+    _ctx: *const RaeenPresentContext, out: *mut RaeenPluginOutput,
+) -> i32 {
+    let (frame, out) = unsafe { (&*frame, &mut *out) };
+    let src = unsafe { std::slice::from_raw_parts(frame.color, frame.color_len) };
+    let pixels = src.to_vec();                    // your real work goes here
+    let len = pixels.len();
+    out.primary = RaeenPluginFrame {
+        width: frame.width, height: frame.height,
+        bytes_per_pixel: frame.bytes_per_pixel, _reserved: 0,
+        pixels: Box::into_raw(pixels.into_boxed_slice()).cast(), pixels_len: len,
+    };
+    out.generated = std::ptr::null();
+    out.generated_count = 0;
+    0 // RAEEN_OK
+}
+
+unsafe extern "C" fn release_output(_i: *mut c_void, out: *mut RaeenPluginOutput) {
+    let out = unsafe { &mut *out };
+    if out.primary.pixels.is_null() { return; }
+    drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+        out.primary.pixels.cast_mut(), out.primary.pixels_len)) });
+    out.primary.pixels = std::ptr::null();
+}
+
+static VTABLE: RaeenPluginV1 = RaeenPluginV1 {
+    abi_version: 1, _reserved: 0,
+    create, destroy, name, capabilities, process, release_output,
+};
+
+#[no_mangle]
+pub extern "C" fn raeen_plugin_v1() -> *const RaeenPluginV1 { &VTABLE }
+```
+
+## Installing
+
+Build, then drop the artifact in this directory:
+
+```
+plugins/my-upscaler.dll     (Windows)
+plugins/libmy-upscaler.so   (Linux)
+```
+
+Restart Raeen. The plugin appears in **Settings ▸ Video** by the name it
+reported. Refusals are logged with the reason and the filename — check the log
+if yours does not appear.
+
+## In-tree Rust plugins
+
+A GPL-2.0-compatible plugin (an MIT FSR pass, a community experiment) can skip
+the C ABI and implement the trait directly:
 
 ```rust
 use raeen_gpu::{PresentPlugin, PresentFrame, PresentContext, PluginOutput, Capabilities};
-
-pub struct MyUpscaler { /* ... */ }
 
 impl PresentPlugin for MyUpscaler {
     fn name(&self) -> &str { "my-upscaler" }
@@ -53,19 +254,21 @@ impl PresentPlugin for MyUpscaler {
         Capabilities { upscale: true, ..Default::default() }
     }
     fn process(&mut self, frame: &PresentFrame<'_>, ctx: &PresentContext) -> PluginOutput {
-        // ... produce the upscaled / generated frame(s) ...
         PluginOutput::identity(frame) // placeholder
     }
 }
-```
 
-Register and select it at startup:
-
-```rust
 raeen_gpu::AgcGpuSession::register_present_plugin(Box::new(MyUpscaler::new()));
-raeen_gpu::AgcGpuSession::select_present_plugin("my-upscaler");
 ```
 
-> Note: today the ABI is a compiled-in Rust trait (a plugin crate is built
-> alongside Raeen by a user who opts in). A stable C-ABI `dlopen` layer for
-> fully dynamic, no-recompile loading is a planned follow-up.
+## Current limits
+
+- **Frames are CPU pixel buffers**, not GPU textures. Real hardware upscalers
+  (DLSS, FSR3, XeSS) run as GPU passes and want a `VkImage`; a GPU-handle ABI
+  (v2) is planned and depends on the GPU-side present path landing first.
+- **`depth` and `motion` are always NULL.** The fields and capability bits exist
+  so an MV-aware plugin can be written against a stable ABI now; PM4-side
+  extraction is the follow-up that populates them.
+- **`generated` frames are validated but not presented.** Frame-gen pacing is
+  not implemented, so a frame generator can be developed and its output checked,
+  but the extra frames are not yet scheduled for display.

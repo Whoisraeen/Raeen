@@ -642,19 +642,26 @@ fn hle_get_vblank_status(ctx: &HleContext, args: &[u64]) -> u64 {
 
 /// Nominal display refresh period. Default 60 Hz matches the base-console
 /// display contract; `RAEEN_VBLANK_HZ=120` selects the PS5's 120 Hz output
-/// mode. MEASURED (stage C): the old unconditional 16.667 ms sleep was the
+/// mode. `RAEEN_VBLANK_HZ=0` is the explicit unpaced benchmark mode used by
+/// `cargo xtask compat run --profile max-fps`; it still advances the guest's
+/// vblank sequence and events, but does not sleep. The Shell only exposes
+/// 24–480 Hz, so production launches cannot select this accidentally.
+///
+/// MEASURED (stage C): the old unconditional 16.667 ms sleep was the
 /// whole-title FPS ceiling — Minecraft's flip loop paced off this wait while
 /// the GPU path had ~8x headroom (min flip interval 2.03 ms vs p50 16.5 ms).
-fn vblank_period() -> std::time::Duration {
-    static PERIOD: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
-    *PERIOD.get_or_init(|| {
-        let hz = std::env::var("RAEEN_VBLANK_HZ")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|hz| (24..=480).contains(hz))
-            .unwrap_or(60);
-        std::time::Duration::from_nanos(1_000_000_000 / hz)
-    })
+fn configured_vblank_period(value: Option<&str>) -> Option<std::time::Duration> {
+    match value.and_then(|value| value.parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(hz @ 24..=480) => Some(std::time::Duration::from_nanos(1_000_000_000 / hz)),
+        _ => Some(std::time::Duration::from_nanos(1_000_000_000 / 60)),
+    }
+}
+
+fn vblank_period() -> Option<std::time::Duration> {
+    static PERIOD: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *PERIOD
+        .get_or_init(|| configured_vblank_period(std::env::var("RAEEN_VBLANK_HZ").ok().as_deref()))
 }
 
 /// Wait until the next vblank edge on the process-wide schedule.
@@ -669,9 +676,11 @@ fn vblank_period() -> std::time::Duration {
 /// costs scheduler wakeups on the one thread the title parks here, which is
 /// what a vblank wait is for.
 fn wait_next_vblank_edge() {
+    let Some(period) = vblank_period() else {
+        return;
+    };
     static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let epoch = *EPOCH.get_or_init(std::time::Instant::now);
-    let period = vblank_period();
     let elapsed = epoch.elapsed();
     let next = (elapsed.as_nanos() / period.as_nanos() + 1) as u64;
     let deadline = std::time::Duration::from_nanos(next.saturating_mul(period.as_nanos() as u64));
@@ -902,6 +911,21 @@ mod tests {
         assert!(count > before, "flip count must advance after SubmitFlip");
         assert_eq!(flip_arg, 0xABCD, "the submitted flipArg is reported back");
         assert_eq!(pending, 0, "no flip pending → render loop proceeds");
+    }
+
+    #[test]
+    fn vblank_period_has_an_explicit_unpaced_benchmark_mode() {
+        assert_eq!(configured_vblank_period(Some("0")), None);
+        assert_eq!(
+            configured_vblank_period(Some("120")),
+            Some(std::time::Duration::from_nanos(1_000_000_000 / 120))
+        );
+        for invalid in [None, Some("23"), Some("481"), Some("not-a-rate")] {
+            assert_eq!(
+                configured_vblank_period(invalid),
+                Some(std::time::Duration::from_nanos(1_000_000_000 / 60))
+            );
+        }
     }
 
     #[test]

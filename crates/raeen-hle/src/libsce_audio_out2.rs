@@ -575,7 +575,8 @@ fn hle_port_create(ctx: &HleContext, args: &[u64]) -> u64 {
     } else {
         arg0 as i32
     };
-    if !(0..=255).contains(&ty) || param == 0 || out_port == 0 || context_handle == 0 {
+    if (!real_abi && !(0..=255).contains(&ty)) || param == 0 || out_port == 0 || context_handle == 0
+    {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
     let next_port = NEXT_PORT_ID.fetch_add(1, Ordering::Relaxed).wrapping_add(1);

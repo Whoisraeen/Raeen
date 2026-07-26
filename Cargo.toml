@@ -47,6 +47,11 @@ rayon = "1"
 parking_lot = "0.12"
 dashmap = "6"
 crossbeam = "0.8"
+# Runtime loading of user-supplied, out-of-tree present plugins (upscalers /
+# frame generators). Deliberately runtime `dlopen`/`LoadLibrary` rather than a
+# build-time dependency: a proprietary plugin must never be linked into the
+# distributed GPL-2.0 artifact. See `plugins/README.md`.
+libloading = "0.8"
 
 # ELF / Binary parsing
 goblin = "0.9"

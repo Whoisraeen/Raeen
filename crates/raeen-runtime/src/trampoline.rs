@@ -292,6 +292,36 @@ fn direct_dispatchable(trampoline: &HleTrampoline) -> bool {
             | "sceAgcSetShRegIndirectPatchAddRegisters"
             | "sceAgcDcbAcquireMem"
             | "sceAgcDcbDrawIndexOffset"
+            | "sceAgcSetCxRegIndirectPatchSetAddress"
+            | "sceAgcSetShRegIndirectPatchSetAddress"
+            | "sceAgcSetUcRegIndirectPatchAddRegisters"
+            | "sceAgcSetUcRegIndirectPatchSetAddress"
+            | "sceAgcDcbSetCxRegistersIndirect"
+            | "sceAgcDcbSetShRegistersIndirect"
+            | "sceAgcDcbSetUcRegistersIndirect"
+            | "sceAgcCreatePrimState"
+            | "sceAgcCreateInterpolantMapping"
+            | "sceAgcCbReleaseMem"
+            | "sceAgcDcbWriteData"
+            | "sceAgcAcbWriteData"
+            | "sceAgcDcbWaitRegMem"
+            | "sceAgcWaitRegMemPatchAddress"
+            | "sceAgcQueueEndOfPipeActionPatchAddress"
+            | "sceAgcWriteDataPatchAddress"
+            | "sceAgcCbNop"
+            | "sceAgcCbDispatch"
+            | "sceAgcDcbDrawIndexAuto"
+            | "sceAgcDcbSetIndexBuffer"
+            | "sceAgcDcbSetIndexCount"
+            | "sceAgcDcbWaitUntilSafeForRendering"
+            | "sceAgcDcbSetFlip"
+            | "sceAgcUnknownKRzWekV120"
+            // These three are ordinary blocking/submission boundaries. They
+            // neither invoke guest callbacks nor replace the live context;
+            // the gateway already owns a host stack and permits blocking.
+            | "sceAgcSuspendPoint"
+            | "sceAgcDriverSubmitDcb"
+            | "sceAgcDriverSubmitAcb"
             // libc float/double-returning leaves (SysV: the result travels in
             // XMM0, so `reserve` routes these to the float bridge twin — see
             // `direct_bridge_code_float`). Pure compute plus bounded guest
@@ -442,6 +472,10 @@ mod tests {
             ("libScePosix", "pthread_mutex_unlock"),
             ("libScePosix", "recvfrom"),
             ("libSceAgc", "sceAgcDcbAcquireMem"),
+            ("libSceAgc", "sceAgcCreatePrimState"),
+            ("libSceAgc", "sceAgcDcbWriteData"),
+            ("libSceAgc", "sceAgcDcbSetFlip"),
+            ("libSceAgcDriver", "sceAgcDriverSubmitDcb"),
         ] {
             assert!(
                 direct_dispatchable(&trampoline(library, function)),

@@ -24,6 +24,9 @@ bytemuck = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 raw-window-handle = { workspace = true }
+# Runtime loading of user-supplied present plugins. Runtime-only by design: the
+# distributed Raeen artifact links no proprietary plugin code.
+libloading = { workspace = true }
 # Row-parallel texture detiling. Detiling is per-texel work over millions of
 # elements on the frame's critical path (a 1024x1024x6 panorama is 6.3 M), and
 # every output row is an independent destination slice. SharpEmu parallelizes

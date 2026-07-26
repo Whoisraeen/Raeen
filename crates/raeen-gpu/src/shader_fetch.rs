@@ -19,8 +19,10 @@
 //! digest, analyzed stage ABI)`. The analyzed ABI includes descriptor
 //! types, exact formats, and embedded constants, so reusing one code address
 //! with different code or bindings cannot return stale SPIR-V. The cache is
-//! FIFO-bounded; analysis failures are never cached before binding identity is
-//! known.
+//! FIFO-bounded. Pre-binding analysis failures use a short bounded backoff:
+//! metadata changes invalidate them immediately and stable binds retry
+//! periodically, avoiding a per-draw parser/log hot loop without permanently
+//! poisoning a shader whose descriptors arrive later.
 //!
 //! # Forensics
 //!
@@ -36,8 +38,8 @@ use kyty_graphics::hw_regs::{
 };
 use kyty_graphics::shader::analysis::{
     SHADER_BINARY_INFO_SENTINEL, ShaderAnalysisError, ShaderMap, ShaderMemory,
-    shader_get_input_info_cs, shader_get_input_info_ps, shader_get_input_info_vs, shader_parse_cs,
-    shader_parse_ps, shader_parse_vs,
+    shader_get_input_info_cs_decoded, shader_get_input_info_ps_decoded,
+    shader_get_input_info_vs_decoded, shader_parse_cs, shader_parse_ps, shader_parse_vs,
 };
 use kyty_graphics::shader::parse::ShaderParseError;
 use kyty_graphics::shader::recompile::{
@@ -61,6 +63,13 @@ const CHUNK_DWORDS: usize = 1024;
 const MAX_WINDOW_DWORDS: usize = 0x1_0000;
 /// Hard cap on translated modules and binding-aware failures.
 const MAX_CACHE_ENTRIES: usize = 256;
+/// Stable binds skipped after a pre-binding analysis failure before retrying.
+///
+/// A title can submit the same unsupported shader tens of thousands of times
+/// while loading. Retrying every bind spent nine CPU cores and emitted 30,734
+/// duplicate failures in one measured Minecraft run. This remains deliberately
+/// finite because descriptor/EUD state can change without a shader-create call.
+const ANALYSIS_FAILURE_RETRY_BINDS: u16 = 255;
 /// Bump whenever generated SPIR-V or the binding-identity contract changes.
 // v2: guest Cube descriptors remain Vulkan 2D arrays, but their V_CUBE*
 // generated S/T coordinates are rebased from the guest [1, 2] convention to
@@ -121,6 +130,175 @@ struct CacheKey {
     binding: Box<[u32]>,
 }
 
+#[derive(Clone, Debug)]
+struct AnalysisFailure {
+    reason: Arc<str>,
+    skips_remaining: u16,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedCodeEntry {
+    code_key: CodeKey,
+    next_gen: bool,
+    register_tag: u64,
+    code: ShaderCode,
+}
+
+/// Decoded instruction streams validated against their exact guest-byte
+/// prefix on every reuse. Resource/EUD analysis still runs per bind; only the
+/// stage-static ISA decode is retained.
+#[derive(Default)]
+struct ParsedCodeCache {
+    entries: VecDeque<ParsedCodeEntry>,
+    hits: u64,
+    misses: u64,
+}
+
+impl ParsedCodeCache {
+    fn get_or_parse(
+        &mut self,
+        stage: Stage,
+        addr: u64,
+        next_gen: bool,
+        register_tag: u64,
+        mem: &impl ShaderMemory,
+        parse: impl FnOnce() -> Result<ShaderCode, ShaderAnalysisError>,
+    ) -> Result<ShaderCode, ShaderAnalysisError> {
+        let source = mem.dwords_at(addr);
+        if let Some(source) = source.as_deref() {
+            for entry in self.entries.iter().rev().filter(|entry| {
+                entry.code_key.stage == stage
+                    && entry.code_key.addr == addr
+                    && entry.next_gen == next_gen
+                    && entry.register_tag == register_tag
+            }) {
+                let dwords = entry.code_key.fetched_dwords as usize;
+                if let Some(prefix) = source.get(..dwords)
+                    && CodeKey::new(stage, addr, prefix) == entry.code_key
+                {
+                    self.hits += 1;
+                    if crate::diagnostics::gpu_env().time_draw {
+                        crate::vulkan::offscreen::DRAW_STAGE_PARSE_HITS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return Ok(entry.code.clone());
+                }
+            }
+        }
+
+        self.misses += 1;
+        if crate::diagnostics::gpu_env().time_draw {
+            crate::vulkan::offscreen::DRAW_STAGE_PARSE_MISSES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let code = parse()?;
+        let parsed_dwords = shader_code_dwords(&code);
+        if parsed_dwords != 0
+            && let Some(source) = mem.dwords_at(addr)
+            && let Some(prefix) = source.get(..parsed_dwords)
+        {
+            while self.entries.len() >= MAX_CACHE_ENTRIES {
+                self.entries.pop_front();
+            }
+            self.entries.push_back(ParsedCodeEntry {
+                code_key: CodeKey::new(stage, addr, prefix),
+                next_gen,
+                register_tag,
+                code: code.clone(),
+            });
+        }
+        Ok(code)
+    }
+
+    fn parse_vs(
+        &mut self,
+        regs: &VertexShaderInfo,
+        sh_regs: &ShaderRegisters,
+        mem: &impl ShaderMemory,
+        next_gen: bool,
+    ) -> Result<ShaderCode, ShaderAnalysisError> {
+        let gs_instead_of_vs = regs.vs_regs.data_addr == 0
+            && regs.gs_regs.data_addr == 0
+            && regs.es_regs.data_addr != 0
+            && regs.gs_regs.chksum != 0;
+        let addr = if gs_instead_of_vs {
+            regs.es_regs.data_addr
+        } else {
+            regs.vs_regs.data_addr
+        };
+        let register_tag = parse_register_tag(&[
+            u64::from(regs.vs_embedded),
+            u64::from(regs.vs_embedded_id),
+            u64::from(regs.vs_regs.rsrc2.user_sgpr),
+            u64::from(regs.vs_user_sgpr.count),
+            u64::from(regs.gs_regs.rsrc2.user_sgpr),
+            u64::from(regs.gs_user_sgpr.count),
+            regs.gs_regs.chksum,
+        ]);
+        self.get_or_parse(Stage::Vs, addr, next_gen, register_tag, mem, || {
+            shader_parse_vs(regs, sh_regs, mem, next_gen)
+        })
+    }
+
+    fn parse_ps(
+        &mut self,
+        regs: &PixelShaderInfo,
+        sh_regs: &ShaderRegisters,
+        mem: &impl ShaderMemory,
+        next_gen: bool,
+    ) -> Result<ShaderCode, ShaderAnalysisError> {
+        let register_tag = parse_register_tag(&[
+            u64::from(regs.ps_embedded),
+            u64::from(regs.ps_embedded_id),
+            u64::from(regs.ps_regs.rsrc2.user_sgpr),
+            u64::from(regs.ps_user_sgpr.count),
+            regs.ps_regs.chksum,
+        ]);
+        self.get_or_parse(
+            Stage::Ps,
+            regs.ps_regs.data_addr,
+            next_gen,
+            register_tag,
+            mem,
+            || shader_parse_ps(regs, sh_regs, mem, next_gen),
+        )
+    }
+
+    fn parse_cs(
+        &mut self,
+        regs: &ComputeShaderInfo,
+        sh_regs: &ShaderRegisters,
+        mem: &impl ShaderMemory,
+        next_gen: bool,
+    ) -> Result<ShaderCode, ShaderAnalysisError> {
+        let register_tag = parse_register_tag(&[
+            u64::from(regs.cs_regs.user_sgpr),
+            u64::from(regs.cs_user_sgpr.count),
+            regs.cs_regs.chksum,
+        ]);
+        self.get_or_parse(
+            Stage::Cs,
+            regs.cs_regs.data_addr,
+            next_gen,
+            register_tag,
+            mem,
+            || shader_parse_cs(regs, sh_regs, mem, next_gen),
+        )
+    }
+}
+
+fn shader_code_dwords(code: &ShaderCode) -> usize {
+    code.get_instructions()
+        .last()
+        .map_or(0, |instruction| instruction.pc as usize / 4 + 1)
+}
+
+fn parse_register_tag(values: &[u64]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    values.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// A translated shader plus the stage resource ABI recovered during analysis.
 ///
 /// Both fields are retained because Vulkan pipeline creation and descriptor
@@ -163,9 +341,7 @@ impl PreparedShader {
         let code = match self {
             Self::Vs { code, .. } | Self::Ps { code, .. } | Self::Cs { code, .. } => code,
         };
-        code.get_instructions()
-            .last()
-            .map_or(0, |instruction| instruction.pc as usize / 4 + 1)
+        shader_code_dwords(code)
     }
 
     fn binding_identity(&self) -> Box<[u32]> {
@@ -189,6 +365,7 @@ impl PreparedShader {
                     id.extend([
                         dst.register_start as u32,
                         dst.registers_num as u32,
+                        dst.fetch_index,
                         dst.semantic as u32,
                         u32::from(resource.stride()),
                         resource.swizzle_enabled().into(),
@@ -204,7 +381,7 @@ impl PreparedShader {
                 id.push(info.buffers_num as u32);
                 for i in bounded_count(info.buffers_num, info.buffers.len()) {
                     let buffer = info.buffers[i];
-                    id.extend([buffer.attr_num as u32, buffer.stride]);
+                    id.extend([buffer.attr_num as u32, buffer.stride, buffer.fetch_index]);
                     for j in bounded_count(buffer.attr_num, buffer.attr_indices.len()) {
                         id.extend([buffer.attr_indices[j] as u32, buffer.attr_offsets[j]]);
                     }
@@ -420,18 +597,25 @@ pub struct ShaderCacheStats {
     pub translated_ok: u64,
     /// Translation/analysis attempts that failed.
     pub translate_failed: u64,
-    /// Binding-aware module/error hits after fresh analysis.
+    /// Binding-aware module/error hits plus provisional analysis backoff hits.
     pub hits: u64,
     /// Positive modules restored from the versioned on-disk cache.
     pub disk_hits: u64,
     /// Positive modules committed to the versioned on-disk cache.
     pub disk_writes: u64,
+    /// Exact-byte-validated decoded instruction stream reuses.
+    pub parse_hits: u64,
+    /// ISA decode attempts (including bounded-window growth retries).
+    pub parse_misses: u64,
 }
 
 /// Fetch + translate + cache for guest shader code.
 pub struct ShaderTranslateCache {
     entries: HashMap<CacheKey, Result<Arc<Vec<u32>>, Arc<str>>>,
     insertion_order: VecDeque<CacheKey>,
+    analysis_failures: HashMap<CodeKey, AnalysisFailure>,
+    analysis_failure_order: VecDeque<CodeKey>,
+    parsed_code: ParsedCodeCache,
     shader_map: ShaderMap,
     dump_dir: Option<PathBuf>,
     persistent_dir: Option<PathBuf>,
@@ -482,6 +666,9 @@ impl ShaderTranslateCache {
         Self {
             entries: HashMap::new(),
             insertion_order: VecDeque::new(),
+            analysis_failures: HashMap::new(),
+            analysis_failure_order: VecDeque::new(),
+            parsed_code: ParsedCodeCache::default(),
             shader_map: ShaderMap::new(),
             dump_dir,
             persistent_dir,
@@ -491,7 +678,11 @@ impl ShaderTranslateCache {
 
     #[must_use]
     pub fn stats(&self) -> ShaderCacheStats {
-        self.stats
+        ShaderCacheStats {
+            parse_hits: self.parsed_code.hits,
+            parse_misses: self.parsed_code.misses,
+            ..self.stats
+        }
     }
 
     /// Register metadata relocated by `sceAgcCreateShader` for later
@@ -499,9 +690,13 @@ impl ShaderTranslateCache {
     pub fn map_shader_metadata(&mut self, addr: u64, data: ShaderMappedData) {
         self.shader_map.map_user_data(addr, data);
         // A create call can replace the analyzed ABI at this address. Remove
-        // prior binding-aware modules eagerly; analysis failures are not cached.
+        // prior binding-aware modules eagerly. Mapped user data can also make a
+        // shader at another address analyzable, so invalidate all provisional
+        // pre-binding failures.
         self.entries.retain(|key, _| key.code.addr != addr);
         self.insertion_order.retain(|key| key.code.addr != addr);
+        self.analysis_failures.clear();
+        self.analysis_failure_order.clear();
     }
 
     fn insert_entry(&mut self, key: CacheKey, value: Result<Arc<Vec<u32>>, Arc<str>>) {
@@ -516,13 +711,34 @@ impl ShaderTranslateCache {
         self.entries.insert(key, value);
     }
 
+    fn insert_analysis_failure(&mut self, key: CodeKey, reason: Arc<str>) {
+        if !self.analysis_failures.contains_key(&key) {
+            while self.analysis_failures.len() >= MAX_CACHE_ENTRIES {
+                let Some(oldest) = self.analysis_failure_order.pop_front() else {
+                    self.analysis_failures.clear();
+                    break;
+                };
+                self.analysis_failures.remove(&oldest);
+            }
+            self.analysis_failure_order.push_back(key);
+        }
+        self.analysis_failures.insert(
+            key,
+            AnalysisFailure {
+                reason,
+                skips_remaining: ANALYSIS_FAILURE_RETRY_BINDS,
+            },
+        );
+    }
+
     /// Fetch + translate the bound vertex-stage shader.
     ///
     /// # Errors
     ///
     /// A named reason (bad address, unreadable memory, parse/recompile
     /// failure). Post-analysis translation failures are binding-aware cached;
-    /// analysis failures are retried because descriptors/EUD can change.
+    /// analysis failures are retried after a bounded backoff (or immediately
+    /// when shader metadata changes) because descriptors/EUD can change.
     pub fn translate_vs(
         &mut self,
         vs: &VertexShaderInfo,
@@ -541,13 +757,22 @@ impl ShaderTranslateCache {
         let shader_map = self.shader_map.clone();
         let vs = *vs;
         let sh_regs = *sh_regs;
-        self.translate(Stage::Vs, addr, move |mem| {
+        self.translate(Stage::Vs, addr, move |mem, parsed_code| {
             attempt_generations(|next_gen| {
-                let code = shader_parse_vs(&vs, &sh_regs, mem, next_gen)
+                let code = parsed_code
+                    .parse_vs(&vs, &sh_regs, mem, next_gen)
                     .map_err(|e| AttemptError::from_analysis("shader_parse_vs", &e))?;
                 let mut vs_info = ShaderVertexInputInfo::default();
-                shader_get_input_info_vs(&vs, &sh_regs, mem, &shader_map, next_gen, &mut vs_info)
-                    .map_err(|e| AttemptError::from_analysis("shader_get_input_info_vs", &e))?;
+                shader_get_input_info_vs_decoded(
+                    &vs,
+                    &sh_regs,
+                    mem,
+                    &shader_map,
+                    next_gen,
+                    Some(&code),
+                    &mut vs_info,
+                )
+                .map_err(|e| AttemptError::from_analysis("shader_get_input_info_vs", &e))?;
                 // Beyond Kyty: capture PC-relative embedded-constant scalar
                 // loads (the shader reading its own baked constant table) so the
                 // recompiler materializes them as SPIR-V constants instead of
@@ -567,6 +792,11 @@ impl ShaderTranslateCache {
                     &code,
                     mem,
                     &mut vs_info.bind,
+                );
+                kyty_graphics::shader::shader_measure_constant_buffer_accesses_shifted(
+                    &code,
+                    &mut vs_info.bind,
+                    if vs_info.gs_prolog { 8 } else { 0 },
                 );
                 Ok(PreparedShader::Vs {
                     code,
@@ -593,18 +823,20 @@ impl ShaderTranslateCache {
         let ps = *ps;
         let sh_regs = *sh_regs;
         let vs_info = *vs_info;
-        self.translate(Stage::Ps, addr, move |mem| {
+        self.translate(Stage::Ps, addr, move |mem, parsed_code| {
             attempt_generations(|next_gen| {
-                let code = shader_parse_ps(&ps, &sh_regs, mem, next_gen)
+                let code = parsed_code
+                    .parse_ps(&ps, &sh_regs, mem, next_gen)
                     .map_err(|e| AttemptError::from_analysis("shader_parse_ps", &e))?;
                 let mut ps_info = ShaderPixelInputInfo::default();
-                shader_get_input_info_ps(
+                shader_get_input_info_ps_decoded(
                     &ps,
                     &sh_regs,
                     &vs_info,
                     mem,
                     &shader_map,
                     next_gen,
+                    Some(&code),
                     &mut ps_info,
                 )
                 .map_err(|e| AttemptError::from_analysis("shader_get_input_info_ps", &e))?;
@@ -617,9 +849,23 @@ impl ShaderTranslateCache {
                     mem,
                     &mut ps_info.bind,
                 );
+                // A title can supply a sampled T# through a runtime/bindless
+                // path that static usage-table analysis cannot capture. The
+                // compute stage already degrades that shape to a real bound
+                // 1x1 descriptor; pixel shaders need the same guard-safe
+                // fallback or one missing material texture drops the entire
+                // draw (measured on Minecraft world PS 0x16ff8c00).
+                kyty_graphics::shader::shader_synthesize_placeholder_sampled_texture(
+                    &code,
+                    &mut ps_info.bind,
+                );
                 // SharpEmu port (see `translate_cs`): default nearest/wrap S#
                 // for a PS that samples with zero captured samplers.
                 kyty_graphics::shader::shader_synthesize_default_sampler(&code, &mut ps_info.bind);
+                kyty_graphics::shader::shader_measure_constant_buffer_accesses(
+                    &code,
+                    &mut ps_info.bind,
+                );
                 Ok(PreparedShader::Ps {
                     code,
                     vs_info: Box::new(vs_info),
@@ -639,13 +885,22 @@ impl ShaderTranslateCache {
         let shader_map = self.shader_map.clone();
         let cs = *cs;
         let sh_regs = *sh_regs;
-        self.translate(Stage::Cs, addr, move |mem| {
+        self.translate(Stage::Cs, addr, move |mem, parsed_code| {
             attempt_generations(|next_gen| {
-                let code = shader_parse_cs(&cs, &sh_regs, mem, next_gen)
+                let code = parsed_code
+                    .parse_cs(&cs, &sh_regs, mem, next_gen)
                     .map_err(|e| AttemptError::from_analysis("shader_parse_cs", &e))?;
                 let mut cs_info = ShaderComputeInputInfo::default();
-                shader_get_input_info_cs(&cs, &sh_regs, mem, &shader_map, next_gen, &mut cs_info)
-                    .map_err(|e| AttemptError::from_analysis("shader_get_input_info_cs", &e))?;
+                shader_get_input_info_cs_decoded(
+                    &cs,
+                    &sh_regs,
+                    mem,
+                    &shader_map,
+                    next_gen,
+                    Some(&code),
+                    &mut cs_info,
+                )
+                .map_err(|e| AttemptError::from_analysis("shader_get_input_info_cs", &e))?;
                 // A Gen5 resource table can declare a large V# in its
                 // read-write table even when this particular shader only
                 // loads it. Prove direct load-only descriptors from the
@@ -727,6 +982,10 @@ impl ShaderTranslateCache {
                     mem,
                     &mut cs_info.bind,
                 );
+                kyty_graphics::shader::shader_measure_constant_buffer_accesses(
+                    &code,
+                    &mut cs_info.bind,
+                );
                 Ok(PreparedShader::Cs {
                     code,
                     info: Box::new(cs_info),
@@ -740,7 +999,7 @@ impl ShaderTranslateCache {
         &mut self,
         stage: Stage,
         addr: u64,
-        run: impl Fn(&WindowMem) -> Result<PreparedShader, AttemptError>,
+        run: impl Fn(&WindowMem, &mut ParsedCodeCache) -> Result<PreparedShader, AttemptError>,
     ) -> Result<TranslatedShader, Arc<str>> {
         if addr == 0 || !addr.is_multiple_of(4) {
             // Unkeyable (no head bytes to read) — not cached, but the command
@@ -756,6 +1015,17 @@ impl ShaderTranslateCache {
                 stage.as_str()
             )));
         };
+        let analysis_key = CodeKey::new(stage, addr, &head);
+        if let Some(failure) = self.analysis_failures.get_mut(&analysis_key) {
+            if failure.skips_remaining != 0 {
+                failure.skips_remaining -= 1;
+                self.stats.hits += 1;
+                return Err(Arc::clone(&failure.reason));
+            }
+            self.analysis_failures.remove(&analysis_key);
+            self.analysis_failure_order
+                .retain(|key| *key != analysis_key);
+        }
         // Analyze on every bind before the positive-cache lookup. Descriptor
         // type/format and embedded metadata can change while code bytes stay
         // identical, and those fields shape generated SPIR-V.
@@ -766,7 +1036,7 @@ impl ShaderTranslateCache {
         let mut want = CHUNK_DWORDS;
         let prepared = loop {
             let grew = window.grow_to(want);
-            match run(&window) {
+            match run(&window, &mut self.parsed_code) {
                 Ok(prepared) => break Ok(prepared),
                 Err(e) if e.truncated && grew && want < MAX_WINDOW_DWORDS => {
                     // The parser ran off the end and more guest memory may
@@ -795,9 +1065,13 @@ impl ShaderTranslateCache {
                     reason = %reason,
                     "guest shader analysis failed — draws binding it will be skipped"
                 );
+                self.insert_analysis_failure(analysis_key, Arc::clone(&reason));
                 return Err(reason);
             }
         };
+        self.analysis_failures.remove(&analysis_key);
+        self.analysis_failure_order
+            .retain(|key| *key != analysis_key);
 
         let parsed_dwords = prepared.parsed_code_dwords();
         // Embedded shaders have no fetched instruction list; retain the small
@@ -1147,7 +1421,7 @@ impl AttemptError {
 /// info → recompile pipeline as next-gen first and fall back to the legacy
 /// trailer pipeline, reporting **both** named reasons on failure.
 fn attempt_generations<T>(
-    run: impl Fn(bool) -> Result<T, AttemptError>,
+    mut run: impl FnMut(bool) -> Result<T, AttemptError>,
 ) -> Result<T, AttemptError> {
     let e_next = match run(true) {
         Ok(v) => return Ok(v),
@@ -1309,6 +1583,12 @@ mod tests {
                 assert_eq!(t.spirv, t2.spirv);
                 let s = cache.stats();
                 assert_eq!((s.distinct_fetched, s.translated_ok, s.hits), (1, 1, 1));
+                assert_eq!(
+                    (s.parse_hits, s.parse_misses),
+                    (1, 3),
+                    "the second legacy bind must reuse its validated decoded instruction stream; \
+                     the cheap next-gen rejection is retried"
+                );
             },
         );
     }
@@ -1540,13 +1820,13 @@ mod tests {
         );
     }
 
-    /// Garbage bytes fail with a named reason and never panic or poison a
-    /// pre-binding cache.
+    /// Garbage bytes fail with a named reason and use a finite pre-binding
+    /// backoff rather than re-running analysis for every draw.
     #[test]
-    fn analysis_failures_are_not_cached_before_binding_identity() {
+    fn analysis_failures_back_off_then_retry() {
         // 0xFFFF_FFFF decodes as an unknown encoding immediately. The legacy
-        // fallback can also fail in header analysis, so the combined failure
-        // is intentionally retried instead of poisoning a code-only cache.
+        // fallback can also fail in header analysis, so the combined failure is
+        // provisional rather than a permanent code-only cache entry.
         let garbage: Vec<u32> = vec![0xFFFF_FFFF; 64];
         let addr = garbage.as_ptr() as u64;
         let mut cache = ShaderTranslateCache::with_dump_dir(None);
@@ -1573,14 +1853,68 @@ mod tests {
                         &sh_regs,
                         &ShaderVertexInputInfo::default(),
                     )
-                    .expect_err("still failing");
+                    .expect_err("backoff returns the same named failure");
                 assert_eq!(e1, e2);
                 let s = cache.stats();
                 assert_eq!(
                     (s.distinct_fetched, s.translate_failed, s.hits),
-                    (2, 2, 0),
-                    "pre-binding analysis failures must be retried"
+                    (1, 1, 1),
+                    "the first stable rebind must not rerun analysis"
                 );
+
+                for _ in 1..ANALYSIS_FAILURE_RETRY_BINDS {
+                    cache
+                        .translate_ps(
+                            &ps_regs_at(addr),
+                            &sh_regs,
+                            &ShaderVertexInputInfo::default(),
+                        )
+                        .expect_err("bounded backoff remains a named failure");
+                }
+                cache
+                    .translate_ps(
+                        &ps_regs_at(addr),
+                        &sh_regs,
+                        &ShaderVertexInputInfo::default(),
+                    )
+                    .expect_err("analysis must retry after the bounded backoff");
+                let s = cache.stats();
+                assert_eq!(
+                    (s.distinct_fetched, s.translate_failed, s.hits),
+                    (2, 2, u64::from(ANALYSIS_FAILURE_RETRY_BINDS)),
+                    "pre-binding failures must still retry periodically"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn shader_metadata_invalidates_analysis_failure_backoff() {
+        let garbage: Vec<u32> = vec![0xFFFF_FFFF; 64];
+        let addr = garbage.as_ptr() as u64;
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        let sh_regs = ShaderRegisters::default();
+
+        crate::guest_mem::with_test_ranges(
+            &[(addr, std::mem::size_of_val(garbage.as_slice()))],
+            || {
+                cache
+                    .translate_ps(
+                        &ps_regs_at(addr),
+                        &sh_regs,
+                        &ShaderVertexInputInfo::default(),
+                    )
+                    .expect_err("garbage must not translate");
+                cache.map_shader_metadata(addr + 0x1000, ShaderMappedData::default());
+                cache
+                    .translate_ps(
+                        &ps_regs_at(addr),
+                        &sh_regs,
+                        &ShaderVertexInputInfo::default(),
+                    )
+                    .expect_err("metadata invalidation must force a fresh attempt");
+                let s = cache.stats();
+                assert_eq!((s.distinct_fetched, s.translate_failed, s.hits), (2, 2, 0));
             },
         );
     }

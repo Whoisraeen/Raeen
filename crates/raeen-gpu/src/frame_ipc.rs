@@ -332,7 +332,16 @@ mod platform {
                 return cache.clone();
             }
 
-            let mut pixels = vec![0; len];
+            let mut pixels = Vec::new();
+            if pixels.try_reserve_exact(len).is_err() {
+                tracing::warn!(
+                    bytes = len,
+                    "Shell frame IPC allocation failed under host memory pressure; \
+                     preserving the last complete frame"
+                );
+                return cache.clone();
+            }
+            pixels.resize(len, 0);
             let slot = ((first / 2) as usize) % FRAME_SLOTS;
             // SAFETY: the validated length is within PIXEL_CAPACITY, both
             // buffers are valid for `len` bytes and do not overlap. The

@@ -481,6 +481,34 @@ fn savedata_prefix(request: &[u8]) -> Option<String> {
         .then(|| text.to_owned())
 }
 
+/// Bedrock keeps its console save container mounted through `libSceSaveData`
+/// while its storage adapter performs ordinary LevelDB I/O through
+/// `/minecraftWorlds/<world-id>`.
+///
+/// MEASURED (Minecraft PPSA17221, 2026-07-26): mounting
+/// `BedrockWorldxDe5FqCkuF8@P1` at `/savedata1` is followed immediately by
+/// opens below `/minecraftWorlds/xDe5FqCkuF8@/db`. The service mount result
+/// contains only `/savedata1`; this second path is the process-lifetime
+/// application-filesystem view that the save worker populates, unmounts, and
+/// then hands to LevelDB. Keep the convention narrow so arbitrary unmounted
+/// guest paths remain denied by the VFS.
+fn bedrock_world_guest_alias(dir_name: &str) -> Option<String> {
+    let encoded = dir_name.strip_prefix("BedrockWorld")?;
+    let marker = encoded.rfind('P')?;
+    let (world_id, player) = encoded.split_at(marker);
+    let player = player.strip_prefix('P')?;
+    if world_id.is_empty()
+        || !world_id.ends_with('@')
+        || player.is_empty()
+        || !player.bytes().all(|byte| byte.is_ascii_digit())
+        || world_id.contains(['/', '\\', '\0'])
+        || world_id.contains("..")
+    {
+        return None;
+    }
+    Some(format!("/minecraftWorlds/{world_id}"))
+}
+
 /// Allocate a process-local transaction resource and retain the requested
 /// working-memory size for lifecycle validation.
 fn hle_create_transaction_resource(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -851,13 +879,23 @@ fn hle_mount(ctx: &HleContext, args: &[u64]) -> u64 {
     if !existed && std::fs::create_dir_all(&slot_path).is_err() {
         return ERROR_INTERNAL;
     }
-    let prefix = match ctx.kernel.filesystem.mount_savedata_slot(dir_name) {
-        Ok((prefix, _path)) => prefix,
+    let (prefix, slot_path) = match ctx.kernel.filesystem.mount_savedata_slot(dir_name) {
+        Ok(mount) => mount,
         Err(error) => {
             warn!("sceSaveDataMount3('{dir_name}') failed: {error}");
             return ERROR_INTERNAL;
         }
     };
+    if let Some(alias) = bedrock_world_guest_alias(dir_name) {
+        // This view deliberately outlives `/savedataN`: Minecraft commits and
+        // unmounts the service container before its LevelDB thread opens the
+        // application path. The VFS itself is process-local, so the alias
+        // cannot leak into another title.
+        ctx.kernel
+            .filesystem
+            .mount(&alias, &slot_path.to_string_lossy());
+        debug!("sceSaveDataMount3('{dir_name}') -> persistent alias {alias}");
+    }
 
     // SceSaveDataMountResult (64 bytes): mountPoint.data[16] at offset 0,
     // then mountStatus/requiredBlocks/... (left zero).
@@ -1101,6 +1139,49 @@ mod tests {
         assert_eq!(hle_unmount(&ctx, &[0x400]), ERROR_NOT_FOUND);
         assert_eq!(hle_unmount(&ctx, &[0]), ERROR_PARAMETER);
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bedrock_world_mount_keeps_leveldb_view_after_service_unmount() {
+        assert_eq!(
+            bedrock_world_guest_alias("BedrockWorldxDe5FqCkuF8@P1").as_deref(),
+            Some("/minecraftWorlds/xDe5FqCkuF8@")
+        );
+        assert!(bedrock_world_guest_alias("BedrockUserSettingsStorage").is_none());
+        assert!(bedrock_world_guest_alias("BedrockWorld../escape@P1").is_none());
+
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let root =
+            std::env::temp_dir().join(format!("raeen-save-bedrock-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        kernel.filesystem.set_savedata_directory(&root);
+
+        assert!(mem.write(0x100, &1i32.to_le_bytes()));
+        assert!(mem.write(0x108, &0x300u64.to_le_bytes()));
+        assert!(mem.write(0x120, &MOUNT_MODE_CREATE2.to_le_bytes()));
+        assert!(mem.write(0x300, b"BedrockWorldxDe5FqCkuF8@P1\0"));
+        assert_eq!(hle_mount(&ctx, &[0x100, 0x200]), SCE_OK);
+        let slot = root.join("BedrockWorldxDe5FqCkuF8@P1");
+        assert_eq!(
+            kernel
+                .filesystem
+                .resolve_path("/minecraftWorlds/xDe5FqCkuF8@/db/P/CURRENT"),
+            Some(slot.join("db/P/CURRENT"))
+        );
+
+        assert!(mem.write(0x400, b"/savedata0\0"));
+        assert_eq!(hle_unmount(&ctx, &[0x400]), SCE_OK);
+        assert_eq!(
+            kernel
+                .filesystem
+                .resolve_path("/minecraftWorlds/xDe5FqCkuF8@/db/P/CURRENT"),
+            Some(slot.join("db/P/CURRENT")),
+            "the app-storage view must outlive the transient /savedataN mount"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

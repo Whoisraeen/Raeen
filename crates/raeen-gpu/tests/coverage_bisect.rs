@@ -89,6 +89,7 @@ fn guest_triangle_state<'a>(vs: &'a [u32], ps: &'a [u32]) -> DrawState<'a> {
         vertex_buffers: vec![VertexBufferData {
             bytes: vec4s_to_bytes(&TRIANGLE_VERTICES),
             stride: 16,
+            per_instance: false,
         }],
         vertex_attributes: vec![VertexAttributeData {
             location: 0,
@@ -197,7 +198,11 @@ fn title_translated_vs_covers_the_measured_quad() {
 
     let state = DrawState {
         viewport: [0.0, H as f32, W as f32, -(H as f32)],
-        vertex_buffers: vec![VertexBufferData { bytes, stride: 12 }],
+        vertex_buffers: vec![VertexBufferData {
+            bytes,
+            stride: 12,
+            per_instance: false,
+        }],
         vertex_attributes: vec![VertexAttributeData {
             location: 0,
             binding: 0,
@@ -265,7 +270,11 @@ fn minecraft_composite_vs_covers_captured_quad() {
     let index_bytes: Vec<u8> = QUAD_INDICES.iter().flat_map(|i| i.to_le_bytes()).collect();
     let state = DrawState {
         viewport: [0.0, H as f32, W as f32, -(H as f32)],
-        vertex_buffers: vec![VertexBufferData { bytes, stride: 28 }],
+        vertex_buffers: vec![VertexBufferData {
+            bytes,
+            stride: 28,
+            per_instance: false,
+        }],
         vertex_attributes: vec![
             VertexAttributeData {
                 location: 0,
@@ -489,6 +498,7 @@ fn title_translated_ps_sweep() {
                 vertex_buffers: vec![VertexBufferData {
                     bytes: quad_bytes.clone(),
                     stride: 12,
+                    per_instance: false,
                 }],
                 vertex_attributes: vec![VertexAttributeData {
                     location: 0,
@@ -656,6 +666,7 @@ fn captured_hdr_composite_shader_pair_submits_safely() {
         vertex_buffers: vec![VertexBufferData {
             bytes: vertex_bytes,
             stride: 24,
+            per_instance: false,
         }],
         vertex_attributes: vec![
             VertexAttributeData {
@@ -696,6 +707,7 @@ fn indexed_fullscreen_quad_with_y_flip_covers_everything() {
         vertex_buffers: vec![VertexBufferData {
             bytes: vec4s_to_bytes(&QUAD_VERTICES),
             stride: 16,
+            per_instance: false,
         }],
         vertex_attributes: vec![VertexAttributeData {
             location: 0,

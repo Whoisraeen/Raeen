@@ -1,3 +1,104 @@
+- PRESENT-PLUGIN C ABI + RUNTIME LOADING — BYO plugins no longer require
+  rebuilding Raeen (2026-07-25; working tree, no commit; raeen-gpu 248/248
+  incl. 12 new, clippy `-D warnings` clean on raeen-gpu + raeen-gui, fmt clean):
+  * CLOSES the follow-up recorded in the 2026-07-23 plugin-ABI entry ("stable
+    C-ABI `dlopen` layer for no-recompile dynamic loading"). Until now
+    `PresentPlugin` was a Rust trait, so a plugin had to be COMPILED INTO
+    `raeen-gpu` — exactly the linking arrangement `plugins/README.md` forbids
+    for proprietary code. A plugin is now a separate user-supplied binary
+    loaded at runtime; the distributed artifact links none of it.
+  * NEW `crates/raeen-gpu/src/present_plugin/cabi.rs`: `#[repr(C)]`
+    `RaeenPluginV1` vtable (create/destroy/name/capabilities/process/
+    release_output), ABI version 1, single exported entry `raeen_plugin_v1`.
+    `DynamicPlugin` adapts a loaded vtable to the in-tree trait;
+    `load_from_path` / `scan_dir` / `load_and_register_dir` do the
+    `LoadLibrary`/`dlopen` work. `libloading` 0.8 added (workspace + raeen-gpu).
+  * OWNERSHIP RULE: the plugin allocates output pixels and frees them via
+    `release_output`, which Raeen calls whenever `process` returned success —
+    INCLUDING when Raeen then rejects the output. Neither side frees the
+    other's allocation, so the two may use different allocators/CRTs/languages.
+    Pinned by `output_is_released_back_to_the_plugin_after_every_frame` (8
+    frames, unfreed count must return to 0) and by the rejection test.
+  * NAME-BOUNDED BY DESIGN: `name` writes into a caller-supplied 128-byte
+    buffer and returns the count, rather than returning `const char *` — a
+    returned pointer would force Raeen to scan for a NUL a buggy plugin might
+    never place.
+  * FINDING (test caught a real limit in my own validation, not a code bug):
+    `copy_frame` verifies `pixels_len == width*height*bpp`, but BOTH are the
+    plugin's own claims. A plugin that under-allocates and reports a
+    *consistent* pair (4-byte buffer described as 2x2x4) is UNDETECTABLE — the
+    first version of the lying-plugin test did exactly that and produced a real
+    16-byte read off a 4-byte allocation (heap garbage in the assert output).
+    No portable mechanism can ask a foreign allocator a block's true size, so
+    the test was changed to model the DETECTABLE lie (length disagreeing with
+    dimensions, which is refused) and the residual risk is documented
+    prominently on `copy_frame` and in `plugins/README.md`. This is the same
+    exposure every C plugin ABI carries and is why loading is user-gated.
+  * VALIDATION that IS enforced (each a refusal + named warning, never a silent
+    no-op): null vtable, ABI mismatch (checked BEFORE any other vtable call —
+    on a version mismatch the struct read may not be the struct written), null
+    `create`, empty/over-long/non-UTF-8 name (instance destroyed on the refusal
+    path, not leaked), null pixels, zero or >16384 edge, bytes-per-pixel not 4
+    or 8, length disagreeing with dimensions, >1 GiB buffer, >8 generated
+    frames. `copy_frame_rejects_every_malformed_descriptor` covers 6 shapes.
+  * WIRED (not dead code): `AgcGpuSession::load_present_plugins_from(dir)` +
+    a startup scan of `plugins/` in `raeen-gui/src/main.rs`, ordered BEFORE
+    `apply_present_plugin` so a persisted selection naming an out-of-tree
+    plugin resolves. The Settings ▸ Video dropdown already existed and now
+    lists loaded plugins. Missing directory = empty, not an error.
+  * LICENSE BOUNDARY re-verified: `git check-ignore` confirms
+    `plugins/my-upscaler.dll` and `plugins/dlss/shim.dll` IGNORED,
+    `plugins/README.md` TRACKED. README rewritten with the full C header, the
+    enforced rules, a working Rust `cdylib` example, and install steps.
+  * END-TO-END PROOF (closes the earlier "no real `.dll` round-tripped" gap):
+    NEW `docs/examples/present-plugin-example.rs` — a complete, dependency-free
+    nearest-neighbour upscaler, single-file so a bare `rustc` builds it. NEW
+    `crates/raeen-gpu/tests/present_plugin_dylib.rs` (3 tests) compiles THAT
+    EXACT FILE into a real cdylib with `rustc` (not `cargo` — a nested cargo
+    contends for the target-dir lock and can deadlock), then loads it through
+    the same `scan_dir` the Shell uses. Asserts the 2x upscale is a correct 2D
+    nearest map (all four source texels land in the right blocks, so a row/
+    column smear would fail), that a declined frame returns the source
+    pixel-for-pixel, and that 250 consecutive frames neither leak nor fault.
+    The shipped example is therefore the verified artifact.
+  * SHELL-LEVEL PROOF (measured, not reasoned): built the example into
+    `plugins/` and ran the debug Shell 12 s. Log:
+    `registered out-of-tree present plugin plugin=example-nearest
+    source=plugins\raeen_example_plugin.dll capabilities=Capabilities {
+    upscale: true, ... }` then `loaded user-supplied present plugins count=1
+    plugins=["example-nearest"]`. rustc's `.exp`/`.lib`/`.pdb` siblings are
+    correctly ignored by the extension filter.
+  * FINDING — REPO DOES NOT BUILD FROM A CLEAN CLONE (pre-existing, unrelated
+    to this work, found while building a baseline worktree):
+    `crates/raeen-gui/Cargo.toml:38` declares
+    `raeen-upscale = { path = "../../plugins/upscale", optional = true }`, but
+    `plugins/*` is gitignored, so `plugins/upscale/` is not in the repo. Cargo
+    resolves path dependencies at manifest-load time even when optional, so a
+    fresh `git clone` fails workspace resolution with "failed to read
+    plugins/upscale/Cargo.toml" — `cargo build` cannot run at all. The new C
+    ABI removes the reason to have a plugin as a workspace member; migrating
+    `raeen-upscale` to a loaded binary (or tracking it) would fix this.
+  * FINDING — `shader_memory_phase2::guest_memory_pixel_shader_draws_green` is
+    ENVIRONMENT-DEPENDENT, not a regression. Sequence measured this session:
+    passed at clean HEAD in a fresh worktree; then failed at clean HEAD (3
+    runs) AND at clean HEAD + only this session's changes (3 runs), with the
+    only variable being elapsed time and a `raeen.exe` having been run in
+    between (PID 13960 still resident at the last measurement). Since clean
+    HEAD fails identically, this work is exonerated. An earlier note in this
+    session attributing the failure to the uncommitted `RAEEN_ASYNC_FLIP`
+    work in `agc_exec.rs` was WRONG and is retracted — that hypothesis was
+    formed before the clean-HEAD re-measurement. Real open question: why a
+    resident `raeen.exe` (or whatever else changed) flips a Vulkan offscreen
+    shader test that does not skip on device acquisition.
+  * NOT DONE / HONEST LIMITS: (b) frames are
+    still CPU pixel buffers, so real GPU upscalers (DLSS/FSR3/XeSS) cannot use
+    this yet — a `VkImage`-handle ABI v2 is gated on the GPU-side present path.
+    (c) `depth`/`motion` remain NULL (PM4 extraction not started). (d)
+    `generated` frames are validated and copied but never scheduled for
+    display. (e) No Minecraft A/B was run — the present path is unchanged when
+    no plugin is selected (identity `Arc` return), but that is reasoning, not
+    a measurement.
+
 - BATTLE-READY WORKFLOW PHASE 1 GREEN — HLE BREADTH + LOAD PATH
   (2026-07-25; working tree at `01f7b613911a+dirty`, no commit; Phase 2 may
   now start):
@@ -3679,3 +3780,44 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   handlers (agent-0 resumed).
 * raeen-hle 420, raeen-kernel 38, raeen-firmware 120, xtask 5 tests green;
   clippy+fmt green on touched crates.
+
+## 2026-07-25/26 (cont.) — five-item program: fail-soft, UE5, swapchain, ordered side effects, doc
+
+* ITEM 5 (doc): rendering-blockers-and-port-plan-2026-07-22.md corrected, not
+  deleted — Tier 0 marked DONE (APR port 07-23), Tier 2 depth/BC claims
+  CORRECTED-stale (depth_state_from_regs + BC1-7 arms exist), order-of-attack
+  updated, currency notice added. Regression rules preserved (load-bearing).
+* ITEM 1 (fail-soft): already in-tree from a prior uncommitted session —
+  called-but-unresolved NIDs return 0 + resume by default with per-NID
+  inventory (record_unresolved_nid_call); RAEEN_STRICT_NIDS=1 restores
+  hard-fail; data reads stay hard failures. Activated on release rebuild.
+* XMM0 float-return channel landed (agent): register_float marker + both
+  dispatch paths (VEH apply_hle_result writes FltSave xmm0; direct gateway
+  routes to a float bridge with movq xmm0,rax); 33 libm handlers registered
+  with real implementations. hle 427->430, runtime 74+46, all gates green.
+* ITEM 4 (ordered GPU side effects): design pass done (explore) — found two
+  unreported bugs: the two DMA forms had OPPOSITE ordering (standard eager,
+  AGC worker-only), timestamps double-written from two clocks. Steps 0+1
+  landed: RAEEN_DEFER_GPU_SIDE_EFFECTS gate (default OFF) + fail-open under
+  gate + dual-policy tests (SIDEFX_ENV_LOCK serializes). Step 2 landed
+  (agent): standard IT_DMA_DATA executes in-stream (cp_op_it_dma_data in
+  kyty-graphics run.rs, mirrors AGC arm) + eager duplicates gated;
+  kyty-graphics 456, hle 430 green. Steps 3-5 (clock unify, events/EOP,
+  flip-pending) staged; step 3 needs A/B (ASTRO timestamp-fence regression
+  territory). NOTE: ~91 pre-existing clippy-1.97 lints in kyty-graphics
+  (mostly recompile.rs) red at HEAD — separate cleanup pass owed.
+* ITEM 2 (UE5) root-cause progress: Until Dawn = NOT a read-0xa; deterministic
+  __stack_chk_fail after Open/Fstat/Getdents on /app0/deepfiles (empty dir
+  returning 0x200 TWICE = overflow smell), then our hle_stack_chk_fail
+  WRONGLY RETURNS 0 -> guest walks into UD2. Dragon Ball = crash-only (zero
+  unresolved-NID calls): worker threads dereference a count (rax=2 -> 0x20)
+  as a list pointer at module+0x241c820 (99-entry task-gather loop) after
+  WaitEqueue timeouts. Two fixes delegated (stack_chk_fail non-return +
+  getdents/fstat layout audit vs shadPS4; DB fault-region disassembly).
+* ITEM 3 (swapchain): design pass in flight (explore) — present flow seams,
+  WSI requirements, SharpEmu MAILBOX model, MC default-OFF policy.
+* BASELINE: repeated environmental failures (other session shares
+  target\debug\xtask.exe lock; cygwin fork exhaustion; pipe exit-code
+  masking). Workaround: scratch/run-baseline-parts.py chunked per-game driver
+  invoking the prebuilt binary directly, merging into latest.json on full
+  success. Other session's runs left intact (never kill theirs).

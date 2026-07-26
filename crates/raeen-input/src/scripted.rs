@@ -5,7 +5,7 @@
 //! `RAEEN_INPUT_SCRIPT` can supply semicolon-separated state snapshots:
 //!
 //! ```text
-//! 0:neutral;180000:cross;180250:neutral;185000:cross+options
+//! 0:neutral;180000:cross;180250:neutral;185000:ls_up+r2
 //! ```
 //!
 //! Timestamps are milliseconds since the runner's input thread started. Each
@@ -114,6 +114,14 @@ fn parse_state(buttons: &str, event_index: usize) -> Result<ControllerState, Str
             "left" | "dpad_left" => state.dpad_left = true,
             "right" | "dpad_right" => state.dpad_right = true,
             "touchpad" | "touch_pad" => state.touchpad_click = true,
+            "ls_left" | "left_stick_left" => state.left_stick_x = -1.0,
+            "ls_right" | "left_stick_right" => state.left_stick_x = 1.0,
+            "ls_up" | "left_stick_up" => state.left_stick_y = -1.0,
+            "ls_down" | "left_stick_down" => state.left_stick_y = 1.0,
+            "rs_left" | "right_stick_left" => state.right_stick_x = -1.0,
+            "rs_right" | "right_stick_right" => state.right_stick_x = 1.0,
+            "rs_up" | "right_stick_up" => state.right_stick_y = -1.0,
+            "rs_down" | "right_stick_down" => state.right_stick_y = 1.0,
             _ => {
                 return Err(format!(
                     "input event {event_index} names unknown button '{raw_button}'"
@@ -165,6 +173,18 @@ mod tests {
             script.state_at(Duration::ZERO).unwrap().orbis_buttons(),
             pad_button::CROSS | pad_button::OPTIONS | pad_button::TOUCH_PAD
         );
+    }
+
+    #[test]
+    fn analog_direction_tokens_drive_both_sticks() {
+        let script = InputScript::parse("0:ls_up+ls_right+rs_down+rs_left").unwrap();
+        let state = script.state_at(Duration::ZERO).unwrap();
+        assert_eq!(state.left_stick_x, 1.0);
+        assert_eq!(state.left_stick_y, -1.0);
+        assert_eq!(state.right_stick_x, -1.0);
+        assert_eq!(state.right_stick_y, 1.0);
+        let encoded = state.to_orbis_pad_data();
+        assert_eq!(&encoded[4..8], &[255, 0, 0, 255]);
     }
 
     #[test]

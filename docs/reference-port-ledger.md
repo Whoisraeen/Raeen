@@ -192,11 +192,16 @@ for real BC textures. Not a SharpEmu port — a Raeen gap worth its own task.
   measured Minecraft validation failure
   `VUID-vkCmdCopyBufferToImage-pRegions-00171` (24 MiB six-face copy from a
   4 MiB staging buffer) and prevents the associated device reset.
-- **AudioOut2 production ABI — DONE for Minecraft's measured PCM route.**
-  SharpEmu's Gen5 context/port layout and pacing were adapted to Raeen's HLE
-  memory model; ACM/media descriptor outputs are initialized, and the isolated
-  title runner starts the same cpal host output as the Shell. A release run
-  produced non-silent 48 kHz PCM on the host.
+- **AudioOut2 production ABI — DONE for Minecraft's measured PCM route and
+  ASTRO.BOT's Gen5 object ports.** SharpEmu's context/port layout and pacing
+  were adapted to Raeen's HLE memory model, then the real three-argument ABI
+  was cross-checked against KytyPS5: it returns small rolling port ids and its
+  16-bit port type includes object port `0x0100`. The older SharpEmu-style
+  encoded handle remains fixture-compatible. ACM/media descriptor outputs are
+  initialized, and the isolated title runner starts the same cpal host output
+  as the Shell. Release runs produced non-silent 48 kHz PCM on the host; an
+  ASTRO.BOT trace passed AudioOut2 initialization and reached AGC submissions
+  plus VideoOut flips.
 - **DualSense route — title consumption DONE; interaction acceptance OPEN.**
   SharpEmu and KytyPS5 both deliver an initial UserService login event before
   returning `NO_EVENT`; shadPS4 likewise queues login events. Raeen previously
@@ -363,7 +368,7 @@ Second-opinion PS5 emu (C#). Re-implement in Rust; do not vendor C#.
 | NpManagerForToolkit (state callback) | Np | `raeen-hle` | `done` | (uncommitted) | added to `libsce_np.rs`: `sceNpRegisterStateCallbackForToolkit` under the sibling `libSceNpManagerForToolkit` library, sharing the offline Np-state callback handler. 1 NID; 1 test |
 | Http / Http2 (HTTP-client ctx/template lifecycle) | Network | `raeen-hle` | `done` | (uncommitted) | new `libsce_http.rs`: port of `HttpExports`+`Http2Exports`. Init allocates+records monotonic context ids (returned in rax; 0-pool → lib codes 0x804311FE/0x80436016), CreateTemplate validates the context (0x80431100) + allocates a 0x1001+ template id, Term cascade-removes a context's templates, Delete/Term validate ids. Registries in `OrbisKernel` (per process). **No host network — no transfer ever sent.** 6 NIDs; 2 tests |
 | Ssl (SSL/TLS context lifecycle) | Network | `raeen-hle` | `done` | (uncommitted) | new `libsce_ssl.rs`: port of `SslExports`. Init allocates+records a monotonic context id (0-pool → 0x8095F008), Term validates+removes (0x8095F006), Close is unconditional OK. Registry in `OrbisKernel`. **No TLS handshake performed (no net backend).** 3 NIDs; 1 test |
-| AudioOut2 (Gen5 audio ctx/port lifecycle) | Audio | `raeen-hle` | `done` | (uncommitted) | new `libsce_audio_out2.rs`: port of `AudioOut2Exports` (distinct from older libSceAudioOut). ResetParam fills the 0x30-byte param (2ch/48kHz/0x400 grain, prefix-only per SharpEmu's Quake-canary note), QueryMemory→0x10000, Context/User/Port Create hand back opaque handles (port handle encodes type + rolling 8-bit id), PortGetState/GetSpeakerInfo fill their structs, Destroy→OK. **PCM now plays: `ContextPush` → `pcm.rs` s16/float→stereo convert → `raeen_audio::output::submit` (cpal), matching libSceAudioOut.** 11 NIDs; 4 tests |
+| AudioOut2 (Gen5 audio ctx/port lifecycle) | Audio | `raeen-hle` | `done` | (uncommitted) | `libsce_audio_out2.rs`: SharpEmu lifecycle/PCM adaptation, with the real three-argument ABI cross-checked against KytyPS5. ResetParam fills the 0x30-byte param (2ch/48kHz/0x400 grain, prefix-only per SharpEmu's Quake-canary note), QueryMemory→0x10000, Context/User Create return opaque handles, and real PortCreate returns KytyPS5-style small rolling ids while accepting the full 16-bit type field (measured ASTRO.BOT object port `0x0100`); the older SharpEmu encoded handle remains only for legacy fixtures. PortGetState/GetSpeakerInfo fill their structs, Destroy→OK. **PCM plays: `ContextPush` → `pcm.rs` s16/float→stereo convert → `raeen_audio::output::submit` (cpal), matching libSceAudioOut.** ASTRO.BOT now passes its AudioOut2 retry wall and reaches AGC submissions/flips. 11 NIDs; tests include the object-port ABI. |
 | Coredump (crash-handler registration) | Kernel | `raeen-hle` | `done` | (uncommitted) | new `libsce_coredump.rs`: port of `sceCoredumpRegisterCoredumpHandler`. Records handler ptr + user context; never invoked (no crash-path guest callback yet). 1 NID; 1 test |
 | ShareUtility (content-param handshake) | Share | `raeen-hle` | `done` | (uncommitted) | new `libsce_share.rs`: port of `ShareExports` under SharpEmu's **`libSceShareUtility`** LibraryName. Initialize validates (0 mem → EINVAL) + sets flag; SetContentParam reads+retains the NUL-terminated UTF-8 string (EFAULT if unreadable/unterminated). Supersedes the mis-named `libSceShare` stub in `libsce_peripheral.rs`. 2 NIDs; 3 tests |
 | libScePosix (POSIX pthread_exit alias) | Kernel | `raeen-hle` | `done` | (uncommitted) | added to `libkernel.rs`: SharpEmu's sole `libScePosix` export `pthread_exit` is aliased onto the existing `scePthreadExit` handler (no duplicated logic). 1 NID |
@@ -378,6 +383,8 @@ Second-opinion PS5 emu (C#). Re-implement in Rust; do not vendor C#.
 
 | Area | Target | Status | Notes |
 |------|--------|--------|-------|
+| Runtime-owned pthread stack headroom | `raeen-runtime` | `done` | `(working tree)` Ported the separate 1 MiB runtime reserve from KytyPS5's `PthreadCreate` model while leaving guest-visible `PthreadAttr::stack_size` unchanged. Measured Minecraft proof: the streaming pool requests 1 MiB, then world creation enters an eboot function with a fixed `0x14a778`-byte frame; exact-size allocation crossed Raeen's image/heap guard. Two focused sizing tests pin the separation. |
+| Gen5 per-instance vertex attributes (`fetch_index`) | `kyty-graphics` → `raeen-gpu` | `done` | `(working tree)` Ported KytyPS5's PS5 attribute behavior: preserve `fetch_index` through semantic analysis and buffer grouping, prevent vertex/instance resources from merging, include it in shader/pipeline cache identity, and map `1` to Vulkan `VertexInputRate::INSTANCE`. Measured Minecraft proof: world VS `0x17010400` previously failed analysis on `attrib: fetch_index != 0`, dropping terrain draws. Focused analysis, binding, and pipeline-key tests pin the path. |
 | PS5 deltas over Kyty (SRT, pthread, VM, LibUlt, …) | merge into kyty-* / raeen-* | `todo` | study; don’t blind-merge |
 | Commercial boot paths | docs + HLE/GPU | `todo` | |
 

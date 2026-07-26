@@ -1551,6 +1551,25 @@ fn main() -> anyhow::Result<()> {
     // persisted choice like "fsr" resolves. No-op unless `upscale-plugins` is on.
     #[cfg(feature = "upscale-plugins")]
     raeen_upscale::register_all();
+    // Load user-supplied, out-of-tree present plugins from the git-ignored
+    // `plugins/` tree via the stable C ABI. Raeen ships none of these and
+    // fetches none: a plugin is a separate binary the user placed there, loaded
+    // at runtime so nothing proprietary is ever linked into this artifact (see
+    // `plugins/README.md`). Runs BEFORE the persisted selection is applied so a
+    // saved choice naming an out-of-tree plugin resolves.
+    //
+    // SAFETY: loading executes native code from `plugins/`, which is a
+    // user-controlled directory alongside the executable — the documented,
+    // opt-in trust boundary for BYO plugins. Refusals are logged, not fatal.
+    let plugins_dir = std::path::Path::new("plugins");
+    let loaded = unsafe { raeen_gpu::AgcGpuSession::load_present_plugins_from(plugins_dir) };
+    if !loaded.is_empty() {
+        tracing::info!(
+            count = loaded.len(),
+            plugins = ?loaded,
+            "loaded user-supplied present plugins"
+        );
+    }
     // Apply the persisted present-plugin (upscaler / frame gen) selection so a
     // saved choice is live from startup, not only after the user re-touches it.
     shell::apply_present_plugin(&config.graphics);

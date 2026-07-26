@@ -11,9 +11,9 @@
 //! Presentation to a real swapchain is a separate, later concern.
 
 use super::cache::{
-    BlendKey, DepthPipelineKey, DepthTargetKey, DrawCaches, GraphicsPipelineKey,
+    BlendKey, DepthPipelineKey, DepthTargetKey, DepthTargetLayout, DrawCaches, GraphicsPipelineKey,
     PendingDrawResources, PersistentDepthTarget, PersistentTarget, PersistentTexture, StencilKey,
-    TargetContent, TargetKey, TextureKey,
+    TargetContent, TargetKey, TargetLayout, TextureKey,
 };
 use super::instance::VulkanDevice;
 use super::shaders::{triangle_fragment_spirv, triangle_vertex_spirv};
@@ -99,6 +99,8 @@ pub fn unorm8(color: [f32; 4]) -> [u8; 4] {
 pub struct VertexBufferData {
     pub bytes: Vec<u8>,
     pub stride: u32,
+    /// `true` when Gen5 `fetch_index` selects the instance index.
+    pub per_instance: bool,
 }
 
 /// Vulkan's interpretation of one analyzed guest vertex attribute.
@@ -1090,6 +1092,7 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
     let t_build = t0.elapsed();
     let t1 = std::time::Instant::now();
     res.record_and_submit(state)?;
+    res.commit_auxiliary_layouts(false);
     // The fence was waited (immediate mode): cache-eligible texture uploads
     // are complete on the device and can join the persistent-texture cache.
     res.donate_textures_to_cache();
@@ -1207,26 +1210,42 @@ fn dump_draw_state_resources(state: &DrawState) {
 /// per-flush cost.
 ///
 /// Returns `Ok(None)` when the draw was deferred. Returns `Ok(Some(image))`
-/// when the draw fell back to the immediate path — no `target_base`, a depth
-/// attachment (not yet batched), or `RAEEN_NO_DEFER=1` (the A/B switch) — in
-/// which case the readback happened now, exactly as [`render_draw`]. A
-/// depth-only fallback draw returns `Ok(None)` with nothing deferred.
+/// when the draw fell back to the immediate path — an unnamed output or
+/// `RAEEN_NO_DEFER=1` (the A/B switch) — in which case the readback happened
+/// now, exactly as [`render_draw`]. Persistent depth-only passes are deferred:
+/// their cache-owned image remains the content authority and no caller uses
+/// the immediate CPU depth readback.
 ///
 /// # Errors
 ///
 /// Same as [`render_draw`].
+fn has_only_named_persistent_outputs(
+    color_output: bool,
+    named_color: bool,
+    depth_output: bool,
+    named_depth: bool,
+) -> bool {
+    (!color_output || named_color) && (!depth_output || named_depth) && (named_color || named_depth)
+}
+
 pub fn render_draw_deferred(
     dev: &VulkanDevice,
     state: &DrawState,
 ) -> Result<Option<RenderedImage>, GpuError> {
     let force_immediate = crate::diagnostics::gpu_env().no_defer;
+    let named_color = state.color_output && state.target_base.is_some();
+    let named_depth = state
+        .depth
+        .as_ref()
+        .and_then(|depth| depth.target_base)
+        .is_some();
     if force_immediate
-        || state.target_base.is_none()
-        || !state.color_output
-        || state
-            .depth
-            .as_ref()
-            .is_some_and(|depth| depth.target_base.is_none())
+        || !has_only_named_persistent_outputs(
+            state.color_output,
+            named_color,
+            state.depth.is_some(),
+            named_depth,
+        )
     {
         return Ok(render_draw(dev, state)?.color);
     }
@@ -1471,6 +1490,15 @@ fn record_and_read_flush(
         .filter_map(|key| caches.target_entry(key).map(|t| (*key, t)))
         .map(|(key, t)| readback_bpp(vk::Format::from_raw(key.format)).map(|bpp| (key, t, bpp)))
         .collect::<Result<_, _>>()?;
+    if let Some((key, _, _)) = live
+        .iter()
+        .find(|(_, target, _)| target.layout == TargetLayout::Undefined)
+    {
+        return Err(GpuError::VulkanInitFailed(format!(
+            "flush target {:#x} has no trustworthy Vulkan layout",
+            key.base
+        )));
+    }
 
     let (command_buffer, fence) = caches.submit_resources(dev)?;
     let begin_info =
@@ -1481,6 +1509,37 @@ fn record_and_read_flush(
     unsafe { device.begin_command_buffer(command_buffer, &begin_info) }
         .map_err(|e| GpuError::VulkanInitFailed(format!("flush vkBeginCommandBuffer: {e}")))?;
     for (key, target, _) in &live {
+        if let Some(transition) = colour_target_readback_transition(target.layout) {
+            let barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(transition.old_layout)
+                .new_layout(transition.new_layout)
+                .src_access_mask(transition.src_access)
+                .dst_access_mask(transition.dst_access)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(target.image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            // SAFETY: the flush command buffer is recording; the transition
+            // starts from the cache-tracked layout produced by the last
+            // successful deferred draw.
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    transition.src_stage,
+                    transition.dst_stage,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+            }
+        }
         let region = vk::BufferImageCopy::default()
             .buffer_offset(0)
             .buffer_row_length(0)
@@ -1496,9 +1555,9 @@ fn record_and_read_flush(
                 height: key.height,
                 depth: 1,
             });
-        // SAFETY: every persistent image rests in TRANSFER_SRC_OPTIMAL
-        // between draws (each draw's tail transition guarantees it), and the
-        // readback buffer was sized width*height*bpp at target creation.
+        // SAFETY: the target either already rested in TRANSFER_SRC or the
+        // barrier above moved its last attachment write there; the readback
+        // buffer was sized width*height*bpp at target creation.
         unsafe {
             device.cmd_copy_image_to_buffer(
                 command_buffer,
@@ -1685,6 +1744,52 @@ struct ImageTransition {
     dst_stage: vk::PipelineStageFlags,
 }
 
+fn colour_target_attachment_transition(layout: TargetLayout) -> ImageTransition {
+    match layout {
+        TargetLayout::Undefined => ImageTransition {
+            old_layout: vk::ImageLayout::UNDEFINED,
+            new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            src_access: vk::AccessFlags::empty(),
+            dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | vk::AccessFlags::COLOR_ATTACHMENT_READ,
+            src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+            dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        },
+        TargetLayout::TransferSrc => ImageTransition {
+            old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            src_access: vk::AccessFlags::TRANSFER_READ,
+            dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | vk::AccessFlags::COLOR_ATTACHMENT_READ,
+            src_stage: vk::PipelineStageFlags::TRANSFER,
+            dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        },
+        TargetLayout::ColorAttachment => ImageTransition {
+            old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            src_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | vk::AccessFlags::COLOR_ATTACHMENT_READ,
+            src_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        },
+    }
+}
+
+fn colour_target_readback_transition(layout: TargetLayout) -> Option<ImageTransition> {
+    match layout {
+        TargetLayout::ColorAttachment => Some(ImageTransition {
+            old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            src_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            dst_access: vk::AccessFlags::TRANSFER_READ,
+            src_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            dst_stage: vk::PipelineStageFlags::TRANSFER,
+        }),
+        TargetLayout::TransferSrc | TargetLayout::Undefined => None,
+    }
+}
+
 /// The pipeline stage a sampled image must become visible to, for the shader
 /// stage that samples it.
 fn shader_stage_to_pipeline(stage: vk::ShaderStageFlags) -> vk::PipelineStageFlags {
@@ -1734,10 +1839,12 @@ struct Resources<'a> {
     /// attachment LOADs from the GPU copy and the upload staging never
     /// happens.
     load_from_gpu: bool,
+    /// Layout captured when the persistent colour target was acquired.
+    target_layout: TargetLayout,
     /// Persistent-target images this draw samples as textures (deduplicated).
     /// Transitioned TRANSFER_SRC → SHADER_READ_ONLY before rendering and back
     /// after, preserving the between-draws layout invariant.
-    sampled_targets: Vec<vk::Image>,
+    sampled_targets: Vec<(TargetKey, vk::Image, TargetLayout)>,
     vertex_buffer: vk::Buffer,
     vertex_memory: vk::DeviceMemory,
     /// Uploaded index buffer for an indexed draw; null for an auto draw.
@@ -1769,6 +1876,8 @@ struct Resources<'a> {
     /// A cache hit means the image rests in TRANSFER_SRC layout from the
     /// previous draw's readback, rather than UNDEFINED like a fresh image.
     depth_target_cached: bool,
+    /// Layout captured when the persistent depth/stencil target was acquired.
+    depth_target_layout: DepthTargetLayout,
     /// Prior depth/stencil contents for a LOAD seed (null when both planes
     /// CLEAR — the attachment then starts undefined by design).
     depth_upload_buffer: vk::Buffer,
@@ -1784,7 +1893,7 @@ struct Resources<'a> {
     fence: vk::Fence,
 }
 
-// RAEEN_TIME_WORKER: per-draw `build()` stage timers (nanoseconds, process-
+// RAEEN_TIME_DRAW: per-draw `build()` stage timers (nanoseconds, process-
 // global), summarized every 512 draws. Splits the setup cost into
 // image/seed/depth/vbuf/stage-resources/pipeline/command so the dominant call
 // is named from evidence rather than guessed.
@@ -1807,6 +1916,14 @@ pub(crate) static DRAW_STAGE_DECODE_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_RESOLVE_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_RESOLVE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_RESOLVE_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_PARSE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_PARSE_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_SETUP_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_CENSUS_NS: std::sync::atomic::AtomicU64 =
@@ -1828,10 +1945,10 @@ pub(crate) static DRAW_STAGE_CS_BACKEND_NS: std::sync::atomic::AtomicU64 =
 
 fn draw_stage_timing_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::diagnostics::gpu_env().time_worker)
+    *ON.get_or_init(|| crate::diagnostics::gpu_env().time_draw)
 }
 
-/// Scope timer: adds elapsed ns to `counter` on drop when `RAEEN_TIME_WORKER`
+/// Scope timer: adds elapsed ns to `counter` on drop when `RAEEN_TIME_DRAW`
 /// is set. Captures every early-return path of the instrumented function.
 pub(crate) struct StageTimer(
     Option<std::time::Instant>,
@@ -1882,6 +1999,10 @@ fn draw_stage_tick() {
     let drawcommon = DRAW_STAGE_DRAWCOMMON_NS.swap(0, Relaxed);
     let decode = DRAW_STAGE_DECODE_NS.swap(0, Relaxed);
     let resolve = DRAW_STAGE_RESOLVE_NS.swap(0, Relaxed);
+    let resolve_hits = DRAW_STAGE_RESOLVE_HITS.swap(0, Relaxed);
+    let resolve_misses = DRAW_STAGE_RESOLVE_MISSES.swap(0, Relaxed);
+    let parse_hits = DRAW_STAGE_PARSE_HITS.swap(0, Relaxed);
+    let parse_misses = DRAW_STAGE_PARSE_MISSES.swap(0, Relaxed);
     let setup = DRAW_STAGE_SETUP_NS.swap(0, Relaxed);
     let census = DRAW_STAGE_CENSUS_NS.swap(0, Relaxed);
     let bind = DRAW_STAGE_BIND_NS.swap(0, Relaxed);
@@ -1906,10 +2027,14 @@ fn draw_stage_tick() {
         dispatch_us = per_disp_us(dispatch),
         dispatch_total_ms = dispatch / 1_000_000,
         drawcommon_total_ms = drawcommon / 1_000_000,
-        "DRAW COST: per-draw draw_common vs its texture-decode + build subsets, and compute dispatch (per 512 draws; RAEEN_TIME_WORKER)"
+        "DRAW COST: per-draw draw_common vs its texture-decode + build subsets, and compute dispatch (per 512 draws; RAEEN_TIME_DRAW)"
     );
     tracing::warn!(
         resolve_us = per_draw_us(resolve),
+        resolve_hits,
+        resolve_misses,
+        parse_hits,
+        parse_misses,
         setup_us = per_draw_us(setup),
         census_us = per_draw_us(census),
         bind_us = per_draw_us(bind),
@@ -1946,6 +2071,7 @@ impl<'a> Resources<'a> {
             owns_target: false,
             target_key: None,
             load_from_gpu: false,
+            target_layout: TargetLayout::Undefined,
             sampled_targets: Vec::new(),
             vertex_buffer: vk::Buffer::null(),
             vertex_memory: vk::DeviceMemory::null(),
@@ -1968,6 +2094,7 @@ impl<'a> Resources<'a> {
             owns_depth_target: false,
             depth_target_key: None,
             depth_target_cached: false,
+            depth_target_layout: DepthTargetLayout::Undefined,
             depth_upload_buffer: vk::Buffer::null(),
             depth_upload_memory: vk::DeviceMemory::null(),
             depth_readback_buffer: vk::Buffer::null(),
@@ -2082,7 +2209,8 @@ impl<'a> Resources<'a> {
                 self.depth_readback_buffer = entry.readback_buffer;
                 self.depth_readback_memory = entry.readback_memory;
                 self.depth_target_key = Some(key);
-                self.depth_target_cached = true;
+                self.depth_target_layout = entry.layout;
+                self.depth_target_cached = entry.layout != DepthTargetLayout::Undefined;
                 self.owns_depth_target = false;
                 self.create_depth_buffers(width, height, depth)?;
                 return Ok(());
@@ -2098,6 +2226,7 @@ impl<'a> Resources<'a> {
                     view: self.depth_view,
                     readback_buffer: self.depth_readback_buffer,
                     readback_memory: self.depth_readback_memory,
+                    layout: DepthTargetLayout::Undefined,
                 },
             );
             self.owns_depth_target = false;
@@ -2300,6 +2429,7 @@ impl<'a> Resources<'a> {
                 self.readback_memory = entry.readback_memory;
                 self.owns_target = false;
                 self.target_key = Some(key);
+                self.target_layout = entry.layout;
                 // `entry.content` carries the pre-acquisition value:
                 // - Synced: the GPU image equals the last readback, which is
                 //   exactly what the caller passes as `initial` (contract on
@@ -2333,6 +2463,7 @@ impl<'a> Resources<'a> {
                     readback_buffer: self.readback_buffer,
                     readback_memory: self.readback_memory,
                     content: TargetContent::Unknown,
+                    layout: TargetLayout::Undefined,
                 },
             );
             self.owns_target = false;
@@ -2541,28 +2672,13 @@ impl<'a> Resources<'a> {
             ));
         }
         let size = bytes.len() as vk::DeviceSize;
-        let (buffer, memory) = self.caches.acquire_host_buffer(self.dev, size)?;
-        let map_result = unsafe {
-            self.device()
-                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-        };
-        let ptr = match map_result {
-            Ok(ptr) => ptr,
-            Err(e) => {
-                // Never yet referenced by GPU work — return it to the pool.
-                self.caches.release_host_buffer(self.dev, buffer, memory);
-                return Err(GpuError::VulkanInitFailed(format!(
-                    "vkMapMemory failed: {e}"
-                )));
-            }
-        };
+        let (buffer, memory, mapped) = self.caches.acquire_host_buffer(self.dev, size)?;
 
-        // SAFETY: `memory` is HOST_VISIBLE|HOST_COHERENT and mapped for
-        // `bytes.len()` bytes (the pooled allocation is at least that big).
-        // No GPU submission can reference it yet.
+        // SAFETY: the pooled allocation is persistently mapped, coherent, and
+        // at least `bytes.len()` bytes. Fence-tracked checkout guarantees that
+        // no submitted GPU work can reference this buffer while it is written.
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
-            self.device().unmap_memory(memory);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped as *mut u8, bytes.len());
         }
         Ok((buffer, memory))
     }
@@ -2860,21 +2976,26 @@ impl<'a> Resources<'a> {
                             height: upload.height,
                             format: upload.format.as_raw(),
                         };
-                        let (image, view) = self.caches.target_image(&key).ok_or_else(|| {
-                            GpuError::PipelineCreationFailed(format!(
-                                "sampled render target {base:#x} ({}x{}) is no longer a \
+                        let (image, view, layout) =
+                            self.caches.target_image(&key).ok_or_else(|| {
+                                GpuError::PipelineCreationFailed(format!(
+                                    "sampled render target {base:#x} ({}x{}) is no longer a \
                                      live persistent target",
-                                upload.width, upload.height
-                            ))
-                        })?;
+                                    upload.width, upload.height
+                                ))
+                            })?;
                         if image == self.image {
                             return Err(GpuError::PipelineCreationFailed(format!(
                                 "draw samples its own render target {base:#x} (feedback \
                                  loop) — the caller must use the CPU-pixels fallback"
                             )));
                         }
-                        if !self.sampled_targets.contains(&image) {
-                            self.sampled_targets.push(image);
+                        if !self
+                            .sampled_targets
+                            .iter()
+                            .any(|(_, candidate, _)| *candidate == image)
+                        {
+                            self.sampled_targets.push((key, image, layout));
                         }
                         self.caches.stats.sampled_target_binds += 1;
                         views.push(view);
@@ -3241,7 +3362,11 @@ impl<'a> Resources<'a> {
                         vk::VertexInputBindingDescription::default()
                             .binding(binding as u32)
                             .stride(data.stride)
-                            .input_rate(vk::VertexInputRate::VERTEX)
+                            .input_rate(if data.per_instance {
+                                vk::VertexInputRate::INSTANCE
+                            } else {
+                                vk::VertexInputRate::VERTEX
+                            })
                     })
                     .collect(),
                 state
@@ -3313,7 +3438,7 @@ impl<'a> Resources<'a> {
             },
             vertex_bindings: vertex_bindings
                 .iter()
-                .map(|b| (b.binding, b.stride))
+                .map(|b| (b.binding, b.stride, b.input_rate.as_raw()))
                 .collect(),
             vertex_attributes: vertex_attributes
                 .iter()
@@ -3619,17 +3744,34 @@ impl<'a> Resources<'a> {
         // after rendering (below) to keep the invariant. The layout
         // transition itself publishes the prior draw's attachment writes
         // (already made available by that draw's tail barrier).
-        for &image in &self.sampled_targets {
+        for &(_, image, layout) in &self.sampled_targets {
+            let (old_layout, src_access, src_stage) = match layout {
+                TargetLayout::TransferSrc => (
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_READ,
+                    vk::PipelineStageFlags::TRANSFER,
+                ),
+                TargetLayout::ColorAttachment => (
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                ),
+                TargetLayout::Undefined => {
+                    return Err(GpuError::PipelineCreationFailed(
+                        "sampled persistent target has an undefined layout".to_owned(),
+                    ));
+                }
+            };
             self.image_barrier_layers(
                 vk::ImageAspectFlags::COLOR,
                 image,
                 1,
                 ImageTransition {
-                    old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    old_layout,
                     new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    src_access: vk::AccessFlags::empty(),
+                    src_access,
                     dst_access: vk::AccessFlags::SHADER_READ,
-                    src_stage: vk::PipelineStageFlags::TRANSFER,
+                    src_stage,
                     dst_stage: vk::PipelineStageFlags::VERTEX_SHADER
                         | vk::PipelineStageFlags::FRAGMENT_SHADER,
                 },
@@ -3707,31 +3849,12 @@ impl<'a> Resources<'a> {
                 //   making available.
                 // - otherwise: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL, which
                 //   discards existing contents — fine, the pass clears anyway.
-                let (old_layout, src_stage) = if self.load_from_gpu {
-                    (
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        vk::PipelineStageFlags::TRANSFER,
-                    )
+                let transition = if self.load_from_gpu {
+                    colour_target_attachment_transition(self.target_layout)
                 } else {
-                    (
-                        vk::ImageLayout::UNDEFINED,
-                        vk::PipelineStageFlags::TOP_OF_PIPE,
-                    )
+                    colour_target_attachment_transition(TargetLayout::Undefined)
                 };
-                self.image_barrier_layers(
-                    vk::ImageAspectFlags::COLOR,
-                    self.image,
-                    1,
-                    ImageTransition {
-                        old_layout,
-                        new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                        src_access: vk::AccessFlags::empty(),
-                        dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                            | vk::AccessFlags::COLOR_ATTACHMENT_READ,
-                        src_stage,
-                        dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    },
-                );
+                self.image_barrier_layers(vk::ImageAspectFlags::COLOR, self.image, 1, transition);
             }
         }
 
@@ -3742,10 +3865,23 @@ impl<'a> Resources<'a> {
             let aspect = depth_aspect_mask(depth.format);
             let (depth_load, stencil_load) = self.effective_depth_loads(depth);
             if self.depth_upload_buffer != vk::Buffer::null() {
-                let old_layout = if self.depth_target_cached {
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL
-                } else {
-                    vk::ImageLayout::UNDEFINED
+                let (old_layout, src_access, src_stage) = match self.depth_target_layout {
+                    DepthTargetLayout::Undefined => (
+                        vk::ImageLayout::UNDEFINED,
+                        vk::AccessFlags::empty(),
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                    ),
+                    DepthTargetLayout::TransferSrc => (
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::PipelineStageFlags::TRANSFER,
+                    ),
+                    DepthTargetLayout::DepthStencilAttachment => (
+                        vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                        vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                        vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                    ),
                 };
                 self.image_barrier_layers(
                     aspect,
@@ -3754,9 +3890,9 @@ impl<'a> Resources<'a> {
                     ImageTransition {
                         old_layout,
                         new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        src_access: vk::AccessFlags::empty(),
+                        src_access,
                         dst_access: vk::AccessFlags::TRANSFER_WRITE,
-                        src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+                        src_stage,
                         dst_stage: vk::PipelineStageFlags::TRANSFER,
                     },
                 );
@@ -3808,10 +3944,23 @@ impl<'a> Resources<'a> {
                     },
                 );
             } else {
-                let old_layout = if self.depth_target_cached {
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL
-                } else {
-                    vk::ImageLayout::UNDEFINED
+                let (old_layout, src_access, src_stage) = match self.depth_target_layout {
+                    DepthTargetLayout::Undefined => (
+                        vk::ImageLayout::UNDEFINED,
+                        vk::AccessFlags::empty(),
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                    ),
+                    DepthTargetLayout::TransferSrc => (
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::PipelineStageFlags::TRANSFER,
+                    ),
+                    DepthTargetLayout::DepthStencilAttachment => (
+                        vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                        vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                        vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                    ),
                 };
                 self.image_barrier_layers(
                     aspect,
@@ -3820,18 +3969,10 @@ impl<'a> Resources<'a> {
                     ImageTransition {
                         old_layout,
                         new_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                        src_access: if self.depth_target_cached {
-                            vk::AccessFlags::TRANSFER_READ
-                        } else {
-                            vk::AccessFlags::empty()
-                        },
+                        src_access,
                         dst_access: vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
                             | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
-                        src_stage: if self.depth_target_cached {
-                            vk::PipelineStageFlags::TRANSFER
-                        } else {
-                            vk::PipelineStageFlags::TOP_OF_PIPE
-                        },
+                        src_stage,
                         dst_stage: vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
                     },
                 );
@@ -4003,7 +4144,7 @@ impl<'a> Resources<'a> {
         // invariant (TRANSFER_SRC_OPTIMAL). Reads need no availability
         // operation; the execution dependency alone orders the transition
         // after the shader reads.
-        for &image in &self.sampled_targets {
+        for &(_, image, _) in &self.sampled_targets {
             self.image_barrier_layers(
                 vk::ImageAspectFlags::COLOR,
                 image,
@@ -4020,12 +4161,10 @@ impl<'a> Resources<'a> {
             );
         }
 
-        // COLOR_ATTACHMENT_OPTIMAL -> TRANSFER_SRC_OPTIMAL. In immediate mode
-        // this feeds the copy out; in batched mode there is no copy, but the
-        // transition still runs so the persistent image always rests in
-        // TRANSFER_SRC between draws (the next draw's LOAD barrier and the
-        // flush's copy both start from that layout).
-        if state.color_output {
+        // Immediate mode transitions for its readback now. Deferred persistent
+        // targets remain attachment-resident; the next draw uses a same-layout
+        // dependency and only the eventual filtered flush pays this transition.
+        if state.color_output && !self.batched {
             self.image_barrier_layers(
                 vk::ImageAspectFlags::COLOR,
                 self.image,
@@ -4077,7 +4216,9 @@ impl<'a> Resources<'a> {
         // Depth/stencil copy out: DEPTH_STENCIL_ATTACHMENT_OPTIMAL ->
         // TRANSFER_SRC, then copy the depth plane (and stencil plane, if any)
         // into the readback buffer at the layout `read_back_depth` expects.
-        if let Some(depth) = &state.depth {
+        if let Some(depth) = &state.depth
+            && !self.batched
+        {
             let aspect = depth_aspect_mask(depth.format);
             self.image_barrier_layers(
                 aspect,
@@ -4176,14 +4317,18 @@ impl<'a> Resources<'a> {
     }
 
     /// Transfer every per-draw handle into the caches' pending batch after a
-    /// successful deferred submission, and record the target as
-    /// [`TargetContent::GpuNewer`]. After this, `Drop` finds only null
-    /// handles and destroys nothing.
+    /// successful deferred submission. Colour draws record their target as
+    /// [`TargetContent::GpuNewer`]; persistent depth-only passes retain only
+    /// ordered resources because their cache-owned image is already the
+    /// authority. After this, `Drop` finds only null handles and destroys
+    /// nothing.
     fn commit_to_batch(&mut self) -> Result<(), GpuError> {
         debug_assert!(self.batched, "only batched draws defer their resources");
-        let key = self
-            .target_key
-            .expect("deferred draws always name a persistent target");
+        if self.target_key.is_none() && self.depth_target_key.is_none() {
+            return Err(GpuError::VulkanInitFailed(
+                "deferred draw has neither a persistent colour nor depth target".to_owned(),
+            ));
+        }
         // The cache owns the one shared recording handle. This draw contributes
         // only resources; `finish_batch_recording` attaches that handle to the
         // first pending entry at the flip boundary.
@@ -4256,12 +4401,41 @@ impl<'a> Resources<'a> {
                 mem::replace(&mut self.depth_view, vk::ImageView::null()),
             ));
         }
-        self.caches.commit_deferred_draw(res, key);
+        self.commit_auxiliary_layouts(true);
+        if let Some(key) = self.target_key {
+            self.caches
+                .commit_deferred_draw(res, key, TargetLayout::ColorAttachment);
+        } else {
+            // Depth-only work still belongs to the ordered batch and its
+            // resources must live through the shared fence. No colour target
+            // needs joining the touched/readback list.
+            self.caches.commit_deferred_resources(res, [], []);
+        }
         // Batch is now open: evictions inside insert_texture defer safely.
         for (cache_key, entry) in donations {
             self.caches.insert_texture(self.dev, cache_key, entry);
         }
         Ok(())
+    }
+
+    /// Publish image layouts only after recording succeeded. A failed draw
+    /// leaves the cache's prior layout intact because its shared command
+    /// buffer is never committed as an executable batch entry.
+    fn commit_auxiliary_layouts(&mut self, batched: bool) {
+        for (key, _, _) in &self.sampled_targets {
+            self.caches
+                .mark_target_layout(key, TargetLayout::TransferSrc);
+        }
+        if let Some(key) = self.depth_target_key {
+            self.caches.mark_depth_target_layout(
+                &key,
+                if batched {
+                    DepthTargetLayout::DepthStencilAttachment
+                } else {
+                    DepthTargetLayout::TransferSrc
+                },
+            );
+        }
     }
 
     /// Immediate-path counterpart of the donation in [`Self::commit_to_batch`]:
@@ -4654,6 +4828,21 @@ mod tests {
     use super::super::shaders::TRIANGLE_COLOR;
     use super::*;
 
+    #[test]
+    fn persistent_depth_only_output_is_batch_eligible() {
+        assert!(has_only_named_persistent_outputs(false, false, true, true));
+        assert!(has_only_named_persistent_outputs(true, true, false, false));
+        assert!(has_only_named_persistent_outputs(true, true, true, true));
+
+        assert!(!has_only_named_persistent_outputs(
+            false, false, true, false
+        ));
+        assert!(!has_only_named_persistent_outputs(true, false, true, true));
+        assert!(!has_only_named_persistent_outputs(
+            false, false, false, false
+        ));
+    }
+
     fn location_module(storage_class: u32, location: u32) -> Vec<u32> {
         vec![
             0x0723_0203,
@@ -4861,5 +5050,42 @@ mod tests {
         assert_eq!(img.pixel(1, 1), Some([4, 4, 4, 4]));
         assert_eq!(img.pixel(2, 0), None);
         assert_eq!(img.pixel(0, 2), None);
+    }
+
+    #[test]
+    fn batched_colour_target_stays_attachment_resident_between_draws() {
+        let transition = colour_target_attachment_transition(TargetLayout::ColorAttachment);
+        assert_eq!(
+            transition.old_layout,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        );
+        assert_eq!(
+            transition.new_layout,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        );
+        assert_eq!(
+            transition.src_access,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+        );
+        assert!(
+            transition
+                .dst_access
+                .contains(vk::AccessFlags::COLOR_ATTACHMENT_READ)
+        );
+    }
+
+    #[test]
+    fn flushed_colour_target_returns_to_transfer_source_layout() {
+        let transition = colour_target_readback_transition(TargetLayout::ColorAttachment)
+            .expect("attachment-resident target needs one readback transition");
+        assert_eq!(
+            transition.old_layout,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        );
+        assert_eq!(transition.new_layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        assert!(
+            colour_target_readback_transition(TargetLayout::TransferSrc).is_none(),
+            "an already-readable target must not receive a redundant barrier"
+        );
     }
 }

@@ -62,6 +62,23 @@ SOFTWARE.
 
 ---
 
+## KytyPS5 — active PS5 Kyty fork (reference & porting source)
+
+- **Upstream:** https://github.com/Nmzik/KytyPS5
+- **License:** GPL-2.0 with Kyty/MIT lineage
+- **How Raeen uses it:** PS5-specific GPU, VM, pthread, and HLE behavior is
+  compared selectively rather than merged wholesale. Raeen's runtime-owned
+  pthread allocation adds a separate 1 MiB reserve after observing Minecraft
+  enter a fixed 0x14a778-byte stack frame on a thread whose guest-visible
+  attribute remains 1 MiB. This is an idiomatic Rust re-implementation of
+  KytyPS5's separate `PTHREAD_STACK_EXTRA` behavior. Raeen also follows
+  KytyPS5's Gen5 vertex-attribute handling by carrying the AGC `fetch_index`
+  selector into Vulkan's per-vertex/per-instance input rate; the Rust data
+  model, cache keys, and tests are original. No C++ is vendored or compiled
+  into Raeen.
+
+---
+
 ## SharpEmu — PS5 emulator (reference & porting source)
 
 - **Upstream:** https://github.com/sharpemu/sharpemu (formerly par274/sharpemu)

@@ -30,11 +30,14 @@ use crate::vulkan::offscreen::{
     StorageImageUpload, TextureBinding, TextureUpload, VertexAttributeData, VertexBufferData,
 };
 use ash::vk;
-use kyty_graphics::hw_regs::{ComputeShaderInfo, Context, Shader, UserConfig};
+use kyty_graphics::hw_regs::{
+    ComputeShaderInfo, Context, PixelShaderInfo, Shader, ShaderRegisters, UserConfig,
+    VertexShaderInfo,
+};
 use kyty_graphics::run::{DrawError, DrawSink, IndexedDraw};
 use kyty_graphics::shader::resources::{
-    ShaderBindResources, ShaderPixelInputInfo, ShaderSamplerResource, ShaderTextureUsage,
-    ShaderVertexInputInfo,
+    ShaderBindResources, ShaderPixelInputInfo, ShaderSamplerResource, ShaderStorageUsage,
+    ShaderTextureUsage, ShaderVertexInputInfo,
 };
 use kyty_graphics::shader::{
     shader_push_constant_spill_binding, spirv_get_embedded_ps, spirv_get_embedded_vs,
@@ -488,12 +491,91 @@ fn assemble_solid_diagnostic_ps() -> Result<Vec<u32>, DrawError> {
 }
 
 /// Both stages' SPIR-V, each either embedded or fetched from guest memory.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ResolvedShaders {
     vs: Arc<Vec<u32>>,
     ps: Arc<Vec<u32>>,
     vs_info: ShaderVertexInputInfo,
     ps_info: ShaderPixelInputInfo,
+}
+
+/// Everything [`resolve_shaders`] reads from the mutable PM4 register files.
+///
+/// The shader translation cache already avoids recompilation, but resolving a
+/// cache hit still walks both stage analyses and clones their metadata on every
+/// draw. Minecraft repeats the same few exact bindings hundreds of times in a
+/// submission, so retain the completed pair for that submission only. Keeping
+/// this key exact avoids guessing which register fields a future translator
+/// revision may begin consulting.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct ResolvedShaderKey {
+    vs: VertexShaderInfo,
+    ps: PixelShaderInfo,
+    regs: ShaderRegisters,
+}
+
+impl ResolvedShaderKey {
+    fn new(ctx: &Context, sh: &Shader) -> Self {
+        Self {
+            vs: sh.vs,
+            ps: sh.ps,
+            regs: ctx.sh_regs,
+        }
+    }
+}
+
+const RESOLVED_SHADER_MEMO_CAPACITY: usize = 32;
+
+/// Small submission-local LRU of successful shader resolutions.
+///
+/// Guest writes and compute dispatches clear it before a later draw can
+/// observe modified shader code or embedded resource metadata. Failed
+/// translations deliberately stay in [`ShaderTranslateCache`]'s named
+/// negative cache rather than becoming an uninspectable entry here.
+#[derive(Default)]
+struct ResolvedShaderMemo {
+    entries: Vec<(ResolvedShaderKey, ResolvedShaders)>,
+    hits: u64,
+    misses: u64,
+}
+
+impl ResolvedShaderMemo {
+    fn get(&mut self, key: ResolvedShaderKey) -> Option<ResolvedShaders> {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| *candidate == key)
+        else {
+            self.misses += 1;
+            crate::vulkan::offscreen::DRAW_STAGE_RESOLVE_MISSES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        };
+        self.hits += 1;
+        crate::vulkan::offscreen::DRAW_STAGE_RESOLVE_HITS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let entry = self.entries.remove(index);
+        let shaders = entry.1.clone();
+        self.entries.push(entry);
+        Some(shaders)
+    }
+
+    fn insert(&mut self, key: ResolvedShaderKey, shaders: ResolvedShaders) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| *candidate == key)
+        {
+            self.entries.remove(index);
+        } else if self.entries.len() == RESOLVED_SHADER_MEMO_CAPACITY {
+            self.entries.remove(0);
+        }
+        self.entries.push((key, shaders));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 /// Resolve the bound VS/PS to SPIR-V through the embedded table or the
@@ -877,6 +959,7 @@ fn prepare_vertex_inputs_limited(
         buffers.push(VertexBufferData {
             bytes,
             stride: guest.stride,
+            per_instance: guest.fetch_index != 0,
         });
 
         for ai in 0..attr_num {
@@ -1130,6 +1213,53 @@ fn guest_sample_hash(base: u64, len: u64, tile_mode: u8) -> Option<u64> {
     Some(h.max(1))
 }
 
+/// Guest texture probes already computed in the current PM4 submission.
+///
+/// A cache hit used to re-read and hash up to 512 KiB on every draw even
+/// though almost all draws in a submission bind the same handful of immutable
+/// resources. The command stream is the ownership boundary: CPU-side resource
+/// updates require a later submit, while compute and PM4 memory writes call
+/// [`GuestSampleHashMemo::clear`] before a later draw can reuse an entry.
+#[derive(Default)]
+struct GuestSampleHashMemo {
+    values: std::cell::RefCell<HashMap<(u64, u64, u8), u64>>,
+}
+
+impl GuestSampleHashMemo {
+    fn get_or_compute(&self, base: u64, len: u64, tile_mode: u8) -> Option<u64> {
+        let key = (base, len, tile_mode);
+        if let Some(hash) = self.values.borrow().get(&key).copied() {
+            return Some(hash);
+        }
+        let hash = guest_sample_hash(base, len, tile_mode)?;
+        self.values.borrow_mut().insert(key, hash);
+        Some(hash)
+    }
+
+    fn clear(&self) {
+        self.values.borrow_mut().clear();
+    }
+
+    /// Drop only probes whose guest byte range can be changed by a compute
+    /// output. Read-only dispatches and writes into unrelated allocations do
+    /// not invalidate immutable texture hashes for the whole submission.
+    fn invalidate_ranges(&self, writes: &[(u64, u64)]) {
+        if writes.is_empty() {
+            return;
+        }
+        self.values.borrow_mut().retain(|&(base, len, _), _| {
+            let end = base.saturating_add(len);
+            !writes.iter().any(|&(write_base, write_len)| {
+                if base == 0 || len == 0 || write_base == 0 || write_len == 0 {
+                    return false;
+                }
+                let write_end = write_base.saturating_add(write_len);
+                base < write_end && write_base < end
+            })
+        });
+    }
+}
+
 /// Consult the persistent-texture cache before decoding a T# (stage D).
 ///
 /// Returns the fresh sample-hash of the guest source range (0 when caching is
@@ -1154,7 +1284,13 @@ fn texture_cache_probe(
     if crate::diagnostics::gpu_env().no_tex_cache {
         return (0, None);
     }
-    let Some(hash) = sampling_scope(|_| guest_sample_hash(base, src_len, tile_mode)) else {
+    let Some(hash) = sampling_scope(|scope| {
+        // SAFETY: `draw_common` publishes a pointer to its sink-owned memo for
+        // exactly the synchronous lifetime of this scope. See
+        // `sampling_scope` for the matching same-thread lifetime invariant.
+        let memo = unsafe { &*scope.sample_hash_memo };
+        memo.get_or_compute(base, src_len, tile_mode)
+    }) else {
         return (0, None);
     };
     let hit = sampling_scope(|scope| {
@@ -1962,6 +2098,8 @@ struct SamplingScope {
     /// skip the guest read + detile + upload for a texture whose fresh
     /// sample-hash matches; empty when the cache is empty or disabled.
     cached_textures: Vec<(crate::vulkan::cache::TextureKey, u64)>,
+    /// Submission-local sample-hash memo owned by the active draw sink.
+    sample_hash_memo: *const GuestSampleHashMemo,
 }
 
 thread_local! {
@@ -2518,7 +2656,10 @@ fn prepare_stage_binding_inner(
         //   verify run reveals exactly which modifier a title actually needs.
         //   Fix 1 guarantees this refusal degrades to a skipped dispatch, never a
         //   hang, so admitting OOB while deferring add_tid/swizzle is safe to ship.
-        if resource.add_tid() || resource.swizzle_enabled() {
+        let usage = bind.storage_buffers.usages[index];
+        if usage != ShaderStorageUsage::Constant
+            && (resource.add_tid() || resource.swizzle_enabled())
+        {
             let n = STORAGE_ADDRESSING_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 8 || (n + 1).is_power_of_two() {
                 tracing::warn!(
@@ -2557,7 +2698,27 @@ fn prepare_stage_binding_inner(
                 "storage buffer OOB_SELECT admitted (clamp-to-zero already modeled)"
             );
         }
-        let size = buffer_byte_size(resource).ok_or_else(|| err("storage buffer size overflow"))?;
+        let descriptor_size =
+            buffer_byte_size(resource).ok_or_else(|| err("storage buffer size overflow"))?;
+        let measured_prefix = u64::from(bind.storage_buffers.required_bytes[index]);
+        let size = if usage == ShaderStorageUsage::Constant && measured_prefix != 0 {
+            measured_prefix
+        } else {
+            descriptor_size
+        };
+        if usage == ShaderStorageUsage::Constant
+            && (resource.add_tid() || resource.swizzle_enabled())
+        {
+            debug!(
+                stage = ?stage,
+                index,
+                add_tid = resource.add_tid(),
+                swizzle = resource.swizzle_enabled(),
+                descriptor_size,
+                required_bytes = size,
+                "scalar constant-buffer load ignores MUBUF element-addressing modifiers"
+            );
+        }
         let base = resource.base48();
         let padded_size = if base == 0 || size == 0 {
             4
@@ -3272,6 +3433,13 @@ pub struct OffscreenDrawSink<'a> {
     /// submission; the Vulkan cache uses Arc identity to preserve GPU-newer
     /// contents between ordered dispatches instead of re-uploading the seed.
     compute_image_snapshots: ComputeImageSnapshots,
+    /// Texture source hashes already sampled in this PM4 submission. Compute
+    /// and packet memory-write boundaries invalidate it before a later draw.
+    texture_sample_hashes: GuestSampleHashMemo,
+    /// Completed VS+PS resolutions for exact register states in this PM4
+    /// submission. This avoids repeating stage analysis for every draw while
+    /// retaining write-boundary correctness.
+    resolved_shaders: ResolvedShaderMemo,
     /// At least one storage-only compute packet joined the deferred queue.
     /// The session uses this to fence/write back once at the end of this PM4
     /// submission, before transient guest allocations may be released.
@@ -3302,6 +3470,8 @@ impl<'a> OffscreenDrawSink<'a> {
             current_compute: None,
             compute_storage_snapshots: HashMap::new(),
             compute_image_snapshots: HashMap::new(),
+            texture_sample_hashes: GuestSampleHashMemo::default(),
+            resolved_shaders: ResolvedShaderMemo::default(),
             queued_compute: false,
         }
     }
@@ -3346,6 +3516,8 @@ impl OffscreenDrawSink<'_> {
         if !pending {
             return Ok(());
         }
+        self.texture_sample_hashes.clear();
+        self.resolved_shaders.clear();
 
         // An empty render-target filter fences the ordered batch and publishes
         // compute SSBO/UAV outputs without paying to read unrelated colour
@@ -3357,6 +3529,20 @@ impl OffscreenDrawSink<'_> {
             self.framebuffers.insert(base, Arc::new(image));
         }
         Ok(())
+    }
+
+    fn resolve_shaders_cached(
+        &mut self,
+        ctx: &Context,
+        sh: &Shader,
+    ) -> Result<ResolvedShaders, DrawError> {
+        let key = ResolvedShaderKey::new(ctx, sh);
+        if let Some(shaders) = self.resolved_shaders.get(key) {
+            return Ok(shaders);
+        }
+        let shaders = resolve_shaders(self.cache, ctx, sh)?;
+        self.resolved_shaders.insert(key, shaders.clone());
+        Ok(shaders)
     }
 
     /// The body shared by the auto and indexed draw paths.
@@ -3398,12 +3584,13 @@ impl OffscreenDrawSink<'_> {
         let resolve_timer = crate::vulkan::offscreen::StageTimer::start(
             &crate::vulkan::offscreen::DRAW_STAGE_RESOLVE_NS,
         );
+        let resolved = self.resolve_shaders_cached(ctx, sh);
         let shaders = if sh.vs.vs_embedded && sh.ps.ps_embedded {
             // The embedded pair is the Phase 1 / M2 invariant: a failure here
             // is a broken fixture and must abort loudly.
-            resolve_shaders(self.cache, ctx, sh)?
+            resolved?
         } else {
-            match resolve_shaders(self.cache, ctx, sh) {
+            match resolved {
                 Ok(s) => s,
                 Err(e) => {
                     // Named degradation: skip this draw, keep the DCB going.
@@ -3555,6 +3742,7 @@ impl OffscreenDrawSink<'_> {
             vertex_head,
             index_head,
             cached_textures,
+            sample_hash_memo: std::ptr::from_ref(&self.texture_sample_hashes),
         };
         let bind_timer = crate::vulkan::offscreen::StageTimer::start(
             &crate::vulkan::offscreen::DRAW_STAGE_BIND_NS,
@@ -3910,6 +4098,11 @@ impl OffscreenDrawSink<'_> {
 }
 
 impl DrawSink for OffscreenDrawSink<'_> {
+    fn guest_memory_write_boundary(&mut self) {
+        self.texture_sample_hashes.clear();
+        self.resolved_shaders.clear();
+    }
+
     fn draw_index_auto(
         &mut self,
         ctx: &Context,
@@ -4137,6 +4330,28 @@ impl DrawSink for OffscreenDrawSink<'_> {
                     .collect()
             })
             .unwrap_or_default();
+        // Invalidate exactly what this dispatch can write. The old blanket
+        // clear ran for every dispatch, including read-only compute, and made
+        // the submission-local texture hash memo ineffective in Minecraft
+        // (hundreds of dispatches interleave the same immutable texture
+        // binds). Storage-buffer ranges are known exactly; storage-image
+        // swizzle padding is not carried by `StorageImageUpload`, so retain
+        // the conservative full texture clear for any writable image.
+        let writable_buffer_ranges: Vec<(u64, u64)> = guest_outputs
+            .iter()
+            .filter_map(|&(base, len)| (base != 0 && len != 0).then_some((base, len as u64)))
+            .collect();
+        let writes_guest_memory =
+            !writable_buffer_ranges.is_empty() || !guest_image_outputs.is_empty();
+        if writes_guest_memory {
+            self.resolved_shaders.clear();
+            if guest_image_outputs.is_empty() {
+                self.texture_sample_hashes
+                    .invalidate_ranges(&writable_buffer_ranges);
+            } else {
+                self.texture_sample_hashes.clear();
+            }
+        }
         // Forensic breadcrumb: device loss surfaces LAZILY (the next
         // vkQueueSubmit reports it), so identifying a lethal dispatch needs
         // the pre-submit identity of every dispatch in the log.
@@ -4976,6 +5191,7 @@ mod tests {
         vs.buffers[0].addr = vertex_words.as_ptr() as u64;
         vs.buffers[0].stride = 12;
         vs.buffers[0].num_records = 4;
+        vs.buffers[0].fetch_index = 1;
         vs.buffers[0].attr_num = 1;
         vs.buffers[0].attr_indices[0] = 0;
 
@@ -4995,6 +5211,10 @@ mod tests {
         assert_eq!(buffers.len(), 1);
         assert_eq!(buffers[0].bytes.len(), 48);
         assert_eq!(buffers[0].stride, 12);
+        assert!(
+            buffers[0].per_instance,
+            "Gen5 fetch_index=1 must reach a Vulkan per-instance binding"
+        );
         assert_eq!(attributes.len(), 1);
         assert_eq!(attributes[0].format, vk::Format::R32G32B32_SFLOAT);
 
@@ -5035,6 +5255,44 @@ mod tests {
             16,
             "rewritten descriptor must preserve the guest stride"
         );
+    }
+
+    /// Minecraft's in-world PS scalar-loads one dword at byte offset 8 from a
+    /// constant V#. Its descriptor also carries ADD_TID + swizzle and an
+    /// enormous stride/record product. Those flags affect MUBUF element
+    /// addressing, not SBUFFER scalar loads; binding only the measured
+    /// 12-byte prefix must proceed without attempting a multi-gigabyte upload.
+    #[cfg(windows)]
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn scalar_constant_buffer_ignores_mubuf_flags_and_uploads_touched_prefix() {
+        let guest = [
+            0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+        ];
+        let base = guest.as_ptr() as u64;
+
+        let mut bind = ShaderBindResources::default();
+        bind.push_constant_size = 16;
+        bind.storage_buffers.buffers_num = 1;
+        bind.storage_buffers.binding_index = 0;
+        bind.storage_buffers.usages[0] = ShaderStorageUsage::Constant;
+        bind.storage_buffers.required_bytes[0] = 12;
+        let resource = &mut bind.storage_buffers.buffers[0];
+        resource.update_address48(base);
+        resource.fields[1] |= (896 << 16) | (1 << 31); // stride + swizzle
+        resource.fields[2] = 5_226_499;
+        resource.fields[3] |= 1 << 23; // ADD_TID
+
+        let ranges = [(base, guest.len())];
+        let binding = crate::guest_mem::with_test_ranges(&ranges, || {
+            prepare_stage_binding(&bind, vk::ShaderStageFlags::FRAGMENT)
+        })
+        .expect("scalar constant V# must ignore MUBUF-only addressing flags");
+
+        let storage = binding.storage_buffers.expect("constant-buffer binding");
+        assert_eq!(storage.buffers, vec![Arc::new(guest.to_vec())]);
+        assert_eq!(storage.guest_sizes, vec![guest.len()]);
+        assert_eq!(storage.writable, vec![false]);
     }
 
     #[cfg(windows)]
@@ -5815,6 +6073,97 @@ mod tests {
             "distinct GFX10 swizzles must not share a cached decode"
         );
         assert_eq!(swizzle_rx, repeat, "the same layout stays cacheable");
+    }
+
+    #[test]
+    fn submission_texture_hash_memo_reuses_then_invalidates_a_probe() {
+        let mut bytes: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let base = bytes.as_ptr() as u64;
+        let memo = GuestSampleHashMemo::default();
+        let first = crate::guest_mem::with_test_ranges(&[(base, bytes.len())], || {
+            memo.get_or_compute(base, bytes.len() as u64, 27)
+                .expect("first probe")
+        });
+
+        bytes[0] ^= 0xff;
+        let reused = crate::guest_mem::with_test_ranges(&[(base, bytes.len())], || {
+            memo.get_or_compute(base, bytes.len() as u64, 27)
+                .expect("memo hit")
+        });
+        assert_eq!(first, reused, "the submission-local probe must be reused");
+
+        memo.clear();
+        let refreshed = crate::guest_mem::with_test_ranges(&[(base, bytes.len())], || {
+            memo.get_or_compute(base, bytes.len() as u64, 27)
+                .expect("probe after invalidation")
+        });
+        assert_ne!(
+            first, refreshed,
+            "a write boundary must force a fresh guest-memory probe"
+        );
+    }
+
+    #[test]
+    fn texture_hash_memo_invalidates_only_overlapping_compute_writes() {
+        let mut a: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let mut b: Vec<u8> = (0..1024).map(|i| (i % 239) as u8).collect();
+        let a_base = a.as_ptr() as u64;
+        let b_base = b.as_ptr() as u64;
+        let memo = GuestSampleHashMemo::default();
+        let ranges = [(a_base, a.len()), (b_base, b.len())];
+        let (a_first, b_first) = crate::guest_mem::with_test_ranges(&ranges, || {
+            (
+                memo.get_or_compute(a_base, a.len() as u64, 27).unwrap(),
+                memo.get_or_compute(b_base, b.len() as u64, 27).unwrap(),
+            )
+        });
+
+        a[0] ^= 0xff;
+        b[0] ^= 0xff;
+        memo.invalidate_ranges(&[(a_base, a.len() as u64)]);
+        let (a_after, b_after) = crate::guest_mem::with_test_ranges(&ranges, || {
+            (
+                memo.get_or_compute(a_base, a.len() as u64, 27).unwrap(),
+                memo.get_or_compute(b_base, b.len() as u64, 27).unwrap(),
+            )
+        });
+
+        assert_ne!(a_first, a_after, "overlapping output must rehash");
+        assert_eq!(b_first, b_after, "disjoint sampled texture stays memoized");
+    }
+
+    #[test]
+    fn submission_shader_memo_reuses_only_exact_state_and_clears_at_boundaries() {
+        let ctx = Context::default();
+        let sh = Shader::default();
+        let key = ResolvedShaderKey::new(&ctx, &sh);
+        let shaders = ResolvedShaders {
+            vs: Arc::new(vec![1, 2, 3]),
+            ps: Arc::new(vec![4, 5, 6]),
+            vs_info: ShaderVertexInputInfo::default(),
+            ps_info: ShaderPixelInputInfo::default(),
+        };
+        let mut memo = ResolvedShaderMemo::default();
+
+        assert!(memo.get(key).is_none());
+        memo.insert(key, shaders.clone());
+        let reused = memo.get(key).expect("exact state must be memoized");
+        assert!(Arc::ptr_eq(&reused.vs, &shaders.vs));
+        assert!(Arc::ptr_eq(&reused.ps, &shaders.ps));
+        assert_eq!((memo.hits, memo.misses), (1, 1));
+
+        let mut changed = sh.clone();
+        changed.ps.ps_embedded = true;
+        assert!(
+            memo.get(ResolvedShaderKey::new(&ctx, &changed)).is_none(),
+            "a stage-register change must not reuse the old resolution"
+        );
+
+        memo.clear();
+        assert!(
+            memo.get(key).is_none(),
+            "a guest/compute write boundary must invalidate the resolution"
+        );
     }
 
     /// A tiled T# (SWIZZLE_MODE 27 = SW_64KB_R_X, format 56 = 8_8_8_8 UNORM —

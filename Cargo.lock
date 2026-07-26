@@ -3151,6 +3151,7 @@ dependencies = [
  "dashmap",
  "gpu-allocator",
  "kyty-graphics",
+ "libloading",
  "parking_lot",
  "raeen-core",
  "raw-window-handle",

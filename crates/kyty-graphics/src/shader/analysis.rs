@@ -44,8 +44,9 @@ use super::resources::{
     ShaderBindResources, ShaderBufferResource, ShaderComputeInputInfo, ShaderDirectSgprsResources,
     ShaderEmbeddedBufferFetch, ShaderEmbeddedBufferFetches, ShaderEmbeddedConstantLoads,
     ShaderGdsResources, ShaderId, ShaderMappedData, ShaderPixelInputInfo, ShaderSamplerResources,
-    ShaderSemantic, ShaderStorageResources, ShaderStorageUsage, ShaderTextureResources,
-    ShaderTextureUsage, ShaderUserData, ShaderVertexInputBuffer, ShaderVertexInputInfo,
+    ShaderSemantic, ShaderSharp, ShaderStorageResources, ShaderStorageUsage,
+    ShaderTextureResources, ShaderTextureUsage, ShaderUserData, ShaderVertexInputBuffer,
+    ShaderVertexInputInfo,
 };
 use super::types::{
     ShaderCode, ShaderInstruction, ShaderInstructionType, ShaderOperand, ShaderOperandType,
@@ -3028,7 +3029,9 @@ pub fn shader_detect_buffers(
 
             let stride = u64::from(b.stride);
 
-            if stride == u64::from(r.stride()) {
+            if stride == u64::from(r.stride())
+                && b.fetch_index == info.resources_dst[ri].fetch_index
+            {
                 let rbase = if ps5 { r.base48() } else { r.base44() };
                 let base = rbase.min(b.addr);
                 let offset1 = rbase - base;
@@ -3059,6 +3062,7 @@ pub fn shader_detect_buffers(
             info.buffers[bi].addr = if ps5 { r.base48() } else { r.base44() };
             info.buffers[bi].stride = u32::from(r.stride());
             info.buffers[bi].num_records = r.num_records();
+            info.buffers[bi].fetch_index = info.resources_dst[ri].fetch_index;
             info.buffers[bi].attr_num = 1;
             info.buffers[bi].attr_indices[0] = ri as i32;
         }
@@ -3279,10 +3283,6 @@ pub fn shader_parse_attrib(
             folded[0] = base as u32;
             folded[1] = (folded[1] & 0xFFFF_0000) | ((base >> 32) as u32 & 0xFFFF);
         }
-        if fetch_index != 0 {
-            return Err(ni("attrib: fetch_index != 0"));
-        }
-
         if info.resources_num as usize >= ShaderVertexInputInfo::RES_MAX {
             return Err(ni("attrib: too many vertex resources"));
         }
@@ -3290,6 +3290,7 @@ pub fn shader_parse_attrib(
         let n = info.resources_num as usize;
         info.resources_dst[n].register_start = reg as i32;
         info.resources_dst[n].registers_num = size as i32;
+        info.resources_dst[n].fetch_index = fetch_index;
         // Record which attrib-table entry this slot came from. `recompile_fetch`
         // resolves by this, NOT by array position — Minecraft's semantics table
         // is gapped (positions 0,1,2 carry semantics 0,2,3).
@@ -3323,6 +3324,7 @@ fn read_extended_user_data(
     mem: &impl ShaderMemory,
     shader_addr: u64,
     next_gen: bool,
+    decoded_code: Option<&ShaderCode>,
 ) -> Option<(Vec<u32>, i32)> {
     let size = user_data.eud_size_dw as usize;
     if size == 0 {
@@ -3363,22 +3365,27 @@ fn read_extended_user_data(
     // A shader that is unmapped or unparseable yields no scalar-load bases,
     // but must NOT abort the resolver — strategy 3 below works from the
     // captured registers alone.
-    let mut code = ShaderCode::new();
-    match mem.dwords_at(shader_addr) {
-        Some(src) => {
-            if let Err(e) = shader_parse(0, &src, &mut code, next_gen) {
+    let mut parsed_code = ShaderCode::new();
+    let code = if let Some(code) = decoded_code {
+        code
+    } else {
+        match mem.dwords_at(shader_addr) {
+            Some(src) => {
+                if let Err(e) = shader_parse(0, &src, &mut parsed_code, next_gen) {
+                    if trace {
+                        tracing::warn!("TRACE_EUD2 {shader_addr:#x}: shader_parse failed: {e}");
+                    }
+                }
+            }
+            None => {
                 if trace {
-                    tracing::warn!("TRACE_EUD2 {shader_addr:#x}: shader_parse failed: {e}");
+                    tracing::warn!("TRACE_EUD2 {shader_addr:#x}: shader code not mapped");
                 }
             }
         }
-        None => {
-            if trace {
-                tracing::warn!("TRACE_EUD2 {shader_addr:#x}: shader code not mapped");
-            }
-        }
-    }
-    let loads = find_scalar_load_bases(&code);
+        &parsed_code
+    };
+    let loads = find_scalar_load_bases(code);
     // Only a live-in base pair is evidence for an EUD pointer supplied in the
     // dispatch user data. A pair written earlier by the shader (for example by
     // s_getpc_b64 plus address arithmetic) must not outrank the positional EUD
@@ -3514,6 +3521,23 @@ pub fn shader_get_input_info_vs(
     next_gen: bool,
     info: &mut ShaderVertexInputInfo,
 ) -> Result<(), ShaderAnalysisError> {
+    shader_get_input_info_vs_decoded(regs, sh, mem, shader_map, next_gen, None, info)
+}
+
+/// [`shader_get_input_info_vs`] with the already-decoded vertex program.
+///
+/// The runtime fetch path parses the program before resource analysis. Passing
+/// it here avoids reparsing every bind and lets the NGG user-data normalizer
+/// prove the scalar-register offset from actual SBUFFER operands.
+pub fn shader_get_input_info_vs_decoded(
+    regs: &VertexShaderInfo,
+    sh: &ShaderRegisters,
+    mem: &impl ShaderMemory,
+    shader_map: &ShaderMap,
+    next_gen: bool,
+    decoded_code: Option<&ShaderCode>,
+    info: &mut ShaderVertexInputInfo,
+) -> Result<(), ShaderAnalysisError> {
     info.export_count = sh.get_export_count() as i32;
     info.bind.push_constant_offset = 0;
     info.bind.push_constant_size = 0;
@@ -3564,12 +3588,29 @@ pub fn shader_get_input_info_vs(
 
         info.gs_prolog = true;
 
+        let rebased_user_data = decoded_code
+            .and_then(|code| rebase_ngg_constant_sharps(user_data, code, user_sgpr, user_sgpr_num));
+        let user_data = rebased_user_data.as_ref().unwrap_or(user_data);
+
         trace_eud_evidence(
             "vs(gs)",
             shader_addr,
             user_data,
             user_sgpr,
             user_sgpr_num,
+            mem,
+        );
+        // A Gen5 vertex program executes in the ES/GS stage and therefore
+        // consumes `gs_user_sgpr`. Keep the legacy VS bank in the filtered
+        // forensic trace as well: if an AGC packet was decoded into the wrong
+        // bank, the paired lines prove where the missing descriptor actually
+        // landed without weakening normal analysis or guessing a mirror rule.
+        trace_eud_evidence(
+            "vs(unselected-vs-bank)",
+            shader_addr,
+            user_data,
+            &regs.vs_user_sgpr,
+            i32::from(regs.vs_regs.rsrc2.user_sgpr),
             mem,
         );
         shader_parse_usage2(
@@ -3585,6 +3626,7 @@ pub fn shader_get_input_info_vs(
                 mem,
                 shader_addr,
                 next_gen,
+                decoded_code,
             )
             .as_ref()
             .map(|(data, base_dw)| EudView {
@@ -3705,6 +3747,94 @@ pub fn shader_get_input_info_vs(
     Ok(())
 }
 
+/// Rebase an NGG constant-buffer sharp from scalar-register numbering to the
+/// captured user-data window when the decoded program proves the mapping.
+///
+/// GFX10 NGG reserves scalar registers `s0..s7` for its hardware prologue.
+/// SharpEmu models this explicitly by copying hardware user-data slot 0 into
+/// scalar register `s8` (`NggUserDataScalarRegisterBase = 8`) before evaluating
+/// the shader. AGC metadata encountered in Minecraft's terrain VS names its
+/// constant V# at `s8`, while `SPI_SHADER_PGM_RSRC2_GS.USER_SGPR == 8` and the
+/// captured typed V# occupies hardware slots 0..3. The shader itself then
+/// executes `s_buffer_load_* ... s[8:11]`.
+///
+/// Kyty's emitter already adds the same +8 when seeding VS resources. Resource
+/// analysis therefore has to store the hardware slot (0), not read past the
+/// captured file at metadata register 8. This helper only rebases when all
+/// three facts agree:
+/// - the metadata register is outside the captured user-data window;
+/// - an SBUFFER instruction actually consumes that scalar-register quad; and
+/// - subtracting eight lands on a complete typed V#/Region quad.
+///
+/// Any ambiguous shape is left untouched for the existing evidence-rich
+/// refusal; this is not a general guessed mirror rule.
+fn rebase_ngg_constant_sharps(
+    user_data: &ShaderUserData,
+    code: &ShaderCode,
+    user_sgpr: &UserSgprInfo,
+    user_sgpr_num: i32,
+) -> Option<ShaderUserData> {
+    use ShaderInstructionType as T;
+
+    const NGG_SCALAR_BASE: usize = 8;
+    let sbuffer_regs: Vec<usize> = code
+        .get_instructions()
+        .iter()
+        .filter(|inst| {
+            matches!(
+                inst.type_,
+                T::SBufferLoadDword
+                    | T::SBufferLoadDwordx2
+                    | T::SBufferLoadDwordx4
+                    | T::SBufferLoadDwordx8
+                    | T::SBufferLoadDwordx16
+            ) && inst.src[0].type_ == ShaderOperandType::Sgpr
+        })
+        .filter_map(|inst| usize::try_from(inst.src[0].register_id).ok())
+        .collect();
+    if sbuffer_regs.is_empty() {
+        return None;
+    }
+
+    let captured = usize::try_from(user_sgpr_num.max(0))
+        .unwrap_or(0)
+        .min(user_sgpr.count as usize)
+        .min(UserSgprInfo::SGPRS_MAX);
+    let typed_quad = |start: usize| {
+        start + 4 <= captured
+            && user_sgpr.type_[start..start + 4]
+                .iter()
+                .all(|t| matches!(t, UserSgprType::Vsharp | UserSgprType::Region))
+    };
+
+    let mut normalized = None;
+    for (slot, sharp) in user_data.sharp_resource_offset[3].iter().enumerate() {
+        if sharp.offset_dw() == 0x7fff || sharp.size() != 1 {
+            continue;
+        }
+        let scalar_reg = usize::from(sharp.offset_dw());
+        if scalar_reg < captured
+            || scalar_reg < NGG_SCALAR_BASE
+            || !sbuffer_regs.contains(&scalar_reg)
+        {
+            continue;
+        }
+        let hardware_slot = scalar_reg - NGG_SCALAR_BASE;
+        if !typed_quad(hardware_slot) {
+            continue;
+        }
+        let data = normalized.get_or_insert_with(|| user_data.clone());
+        data.sharp_resource_offset[3][slot] = ShaderSharp::new(hardware_slot as u16, sharp.size());
+        tracing::debug!(
+            slot,
+            scalar_register = scalar_reg,
+            hardware_slot,
+            "NGG constant V# rebased from scalar register to captured user-data slot"
+        );
+    }
+    normalized
+}
+
 /// Kyty: Shader.cpp `ShaderGetInputInfoPS` (L1744).
 pub fn shader_get_input_info_ps(
     regs: &PixelShaderInfo,
@@ -3713,6 +3843,25 @@ pub fn shader_get_input_info_ps(
     mem: &impl ShaderMemory,
     shader_map: &ShaderMap,
     next_gen: bool,
+    ps_info: &mut ShaderPixelInputInfo,
+) -> Result<(), ShaderAnalysisError> {
+    shader_get_input_info_ps_decoded(regs, sh, vs_info, mem, shader_map, next_gen, None, ps_info)
+}
+
+/// [`shader_get_input_info_ps`] with the already-decoded pixel program.
+///
+/// The runtime fetch path has already exact-byte validated this code. Reusing
+/// it avoids reparsing the ISA while resolving and capturing EUD resources;
+/// descriptor contents are still read fresh from guest memory on every bind.
+#[allow(clippy::too_many_arguments)]
+pub fn shader_get_input_info_ps_decoded(
+    regs: &PixelShaderInfo,
+    sh: &ShaderRegisters,
+    vs_info: &ShaderVertexInputInfo,
+    mem: &impl ShaderMemory,
+    shader_map: &ShaderMap,
+    next_gen: bool,
+    decoded_code: Option<&ShaderCode>,
     ps_info: &mut ShaderPixelInputInfo,
 ) -> Result<(), ShaderAnalysisError> {
     if regs.ps_embedded {
@@ -3779,6 +3928,7 @@ pub fn shader_get_input_info_ps(
             mem,
             regs.ps_regs.data_addr,
             next_gen,
+            decoded_code,
         );
         let eud_view = eud_buf.as_ref().map(|(data, base_dw)| EudView {
             data,
@@ -3793,23 +3943,31 @@ pub fn shader_get_input_info_ps(
             eud_view,
         )?;
         if let Some(view) = eud_view {
-            let mut code = ShaderCode::new();
-            if let Some(src) = mem.dwords_at(regs.ps_regs.data_addr)
-                && shader_parse(0, &src, &mut code, next_gen).is_ok()
-            {
+            let mut capture = |code: &ShaderCode| -> Result<(), ShaderAnalysisError> {
                 shader_capture_eud_storage_buffers(
-                    &code,
+                    code,
                     &mut ps_info.bind,
                     &regs.ps_user_sgpr,
                     view,
                     mem,
                 )?;
                 shader_capture_eud_image_descriptors(
-                    &code,
+                    code,
                     &mut ps_info.bind,
                     &regs.ps_user_sgpr,
                     view,
                 )?;
+                Ok(())
+            };
+            if let Some(code) = decoded_code {
+                capture(code)?;
+            } else {
+                let mut code = ShaderCode::new();
+                if let Some(src) = mem.dwords_at(regs.ps_regs.data_addr)
+                    && shader_parse(0, &src, &mut code, next_gen).is_ok()
+                {
+                    capture(&code)?;
+                }
             }
         }
     } else {
@@ -3853,10 +4011,26 @@ pub fn shader_get_input_info_ps(
 /// too (kept for API parity).
 pub fn shader_get_input_info_cs(
     regs: &ComputeShaderInfo,
+    sh: &ShaderRegisters,
+    mem: &impl ShaderMemory,
+    shader_map: &ShaderMap,
+    next_gen: bool,
+    info: &mut ShaderComputeInputInfo,
+) -> Result<(), ShaderAnalysisError> {
+    shader_get_input_info_cs_decoded(regs, sh, mem, shader_map, next_gen, None, info)
+}
+
+/// [`shader_get_input_info_cs`] with the already-decoded compute program.
+///
+/// Resource values remain per-dispatch snapshots; only redundant ISA parsing
+/// inside EUD discovery/capture is skipped.
+pub fn shader_get_input_info_cs_decoded(
+    regs: &ComputeShaderInfo,
     _sh: &ShaderRegisters,
     mem: &impl ShaderMemory,
     shader_map: &ShaderMap,
     next_gen: bool,
+    decoded_code: Option<&ShaderCode>,
     info: &mut ShaderComputeInputInfo,
 ) -> Result<(), ShaderAnalysisError> {
     info.threads_num[0] = regs.cs_regs.num_thread_x;
@@ -3897,6 +4071,7 @@ pub fn shader_get_input_info_cs(
             mem,
             regs.cs_regs.data_addr,
             next_gen,
+            decoded_code,
         );
         let eud_view = eud_buf.as_ref().map(|(data, base_dw)| EudView {
             data,
@@ -3916,23 +4091,31 @@ pub fn shader_get_input_info_cs(
         // that does not parse skips the pass; translate fails it by name
         // later anyway.
         if let Some(view) = eud_view {
-            let mut code = ShaderCode::new();
-            if let Some(src) = mem.dwords_at(regs.cs_regs.data_addr)
-                && shader_parse(0, &src, &mut code, next_gen).is_ok()
-            {
+            let mut capture = |code: &ShaderCode| -> Result<(), ShaderAnalysisError> {
                 shader_capture_eud_image_descriptors(
-                    &code,
+                    code,
                     &mut info.bind,
                     &regs.cs_user_sgpr,
                     view,
                 )?;
                 shader_capture_eud_storage_buffers(
-                    &code,
+                    code,
                     &mut info.bind,
                     &regs.cs_user_sgpr,
                     view,
                     mem,
                 )?;
+                Ok(())
+            };
+            if let Some(code) = decoded_code {
+                capture(code)?;
+            } else {
+                let mut code = ShaderCode::new();
+                if let Some(src) = mem.dwords_at(regs.cs_regs.data_addr)
+                    && shader_parse(0, &src, &mut code, next_gen).is_ok()
+                {
+                    capture(&code)?;
+                }
             }
         }
     } else {
@@ -4073,6 +4256,90 @@ pub fn shader_refine_compute_storage_usage(code: &ShaderCode, bind: &mut ShaderB
     }
 }
 
+/// Bound the guest-memory snapshot used for scalar constant-buffer loads.
+///
+/// `s_buffer_load_dword{xN}` addresses a V# as a byte-addressed constant
+/// buffer. The V#'s `ADD_TID` and swizzle bits belong to MUBUF element
+/// addressing and do not participate in these scalar loads. Some Gen5 titles
+/// leave those overlapping descriptor bits set while also carrying a very
+/// large stride/record tuple; uploading `stride * num_records` in that case is
+/// both semantically unnecessary and can request gigabytes for a load that
+/// touches only a few dwords.
+///
+/// For each `Constant` V# whose descriptor SGPR is read only at compile-time
+/// offsets, record the highest byte touched. A dynamic offset leaves
+/// `required_bytes` at zero, deliberately falling back to the full descriptor
+/// extent at bind time.
+pub fn shader_measure_constant_buffer_accesses(code: &ShaderCode, bind: &mut ShaderBindResources) {
+    shader_measure_constant_buffer_accesses_shifted(code, bind, 0);
+}
+
+/// [`shader_measure_constant_buffer_accesses`] with a stage scalar-register
+/// base. NGG vertex programs expose hardware user slot 0 as scalar `s8`;
+/// pixel and compute stages pass zero.
+pub fn shader_measure_constant_buffer_accesses_shifted(
+    code: &ShaderCode,
+    bind: &mut ShaderBindResources,
+    register_shift: i32,
+) {
+    use ShaderInstructionType as T;
+
+    let count = usize::try_from(bind.storage_buffers.buffers_num)
+        .unwrap_or(0)
+        .min(bind.storage_buffers.buffers.len());
+    bind.storage_buffers.required_bytes[..count].fill(0);
+
+    let mut seen = [false; ShaderStorageResources::BUFFERS_MAX];
+    let mut dynamic = [false; ShaderStorageResources::BUFFERS_MAX];
+    for inst in code.get_instructions() {
+        let dwords = match inst.type_ {
+            T::SBufferLoadDword => 1u32,
+            T::SBufferLoadDwordx2 => 2,
+            T::SBufferLoadDwordx4 => 4,
+            T::SBufferLoadDwordx8 => 8,
+            T::SBufferLoadDwordx16 => 16,
+            _ => continue,
+        };
+        if inst.src[0].type_ != ShaderOperandType::Sgpr {
+            continue;
+        }
+        let Some(index) = (0..count).find(|&index| {
+            bind.storage_buffers.usages[index] == ShaderStorageUsage::Constant
+                && bind.storage_buffers.start_register[index].saturating_add(register_shift)
+                    == inst.src[0].register_id
+        }) else {
+            continue;
+        };
+        seen[index] = true;
+        let offset = match inst.src[1].type_ {
+            ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
+                if inst.src[1].constant.i() >= 0 =>
+            {
+                inst.src[1].constant.u
+            }
+            _ => {
+                dynamic[index] = true;
+                continue;
+            }
+        };
+        let Some(end) = dwords
+            .checked_mul(4)
+            .and_then(|width| offset.checked_add(width))
+        else {
+            dynamic[index] = true;
+            continue;
+        };
+        bind.storage_buffers.required_bytes[index] =
+            bind.storage_buffers.required_bytes[index].max(end);
+    }
+
+    for index in 0..count {
+        if dynamic[index] || !seen[index] {
+            bind.storage_buffers.required_bytes[index] = 0;
+        }
+    }
+}
+
 /// Kyty: Shader.cpp `ShaderGetBindIds` (L2679). The id keys on the *binding
 /// layout* (counts, slots, start registers, extended/usage flags), NOT on
 /// descriptor contents — upstream deliberately commented out the
@@ -4197,6 +4464,7 @@ pub fn shader_get_id_vs(
 
         ret.ids.push(rd.register_start as u32);
         ret.ids.push(rd.registers_num as u32);
+        ret.ids.push(rd.fetch_index);
         ret.ids.push(u32::from(r.stride()));
         ret.ids.push(u32::from(r.swizzle_enabled()));
         ret.ids.push(u32::from(r.dst_sel_x()));
@@ -4219,6 +4487,7 @@ pub fn shader_get_id_vs(
         let b = &input_info.buffers[i];
         ret.ids.push(b.attr_num as u32);
         ret.ids.push(b.stride);
+        ret.ids.push(b.fetch_index);
         for j in 0..b.attr_num as usize {
             ret.ids.push(b.attr_indices[j] as u32);
             ret.ids.push(b.attr_offsets[j]);
@@ -4845,17 +5114,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_attrib_still_rejects_fetch_index() {
-        // fetch_index changes how the vertex/instance index feeds the fetch and
-        // is not yet modelled; the measured case carried a junk V# anyway.
+    fn parse_attrib_records_instance_fetch_index() {
+        // KytyPS5 carries fetch_index=1 through to a Vulkan per-instance input
+        // binding. Minecraft uses this for world geometry.
         let sem = ShaderSemantic { raw: 4 << 8 };
         let attrib = [2u32 | (1 << 26)]; // fetch_index = 1
         let buffer = vec![0u32; 12];
         let mut info = ShaderVertexInputInfo::default();
-        assert!(matches!(
-            shader_parse_attrib(&mut info, &[sem], &attrib, &buffer),
-            Err(ShaderAnalysisError::NotImplemented { .. })
-        ));
+        shader_parse_attrib(&mut info, &[sem], &attrib, &buffer).unwrap();
+        assert_eq!(info.resources_num, 1);
+        assert_eq!(info.resources_dst[0].fetch_index, 1);
     }
 
     // ---- 4. ShaderDetectBuffers ----
@@ -4899,6 +5167,19 @@ mod tests {
         assert_eq!(info.buffers[1].addr, 0x1010);
         assert_eq!(info.buffers[0].attr_num, 1);
         assert_eq!(info.buffers[1].attr_num, 1);
+    }
+
+    #[test]
+    fn detect_buffers_does_not_merge_vertex_and_instance_inputs() {
+        let mut info = ShaderVertexInputInfo::default();
+        info.resources[0] = vsharp(0x1000, 16, 100);
+        info.resources[1] = vsharp(0x1008, 16, 100);
+        info.resources_dst[1].fetch_index = 1;
+        info.resources_num = 2;
+        shader_detect_buffers(&mut info, false).unwrap();
+        assert_eq!(info.buffers_num, 2);
+        assert_eq!(info.buffers[0].fetch_index, 0);
+        assert_eq!(info.buffers[1].fetch_index, 1);
     }
 
     #[test]
@@ -5239,6 +5520,94 @@ mod tests {
         assert_eq!(info.workgroup_register, 4);
         assert_eq!(info.bind.storage_buffers.buffers_num, 1);
         assert_eq!(info.bind.push_constant_size, 16);
+    }
+
+    #[test]
+    fn input_info_cs_decoded_does_not_refetch_shader_for_eud() {
+        use std::cell::Cell;
+
+        struct CountingMem {
+            inner: TestMem,
+            shader_addr: u64,
+            shader_reads: Cell<u32>,
+        }
+
+        impl ShaderMemory for CountingMem {
+            fn dwords_at(&self, addr: u64) -> Option<Cow<'_, [u32]>> {
+                if addr == self.shader_addr {
+                    self.shader_reads.set(self.shader_reads.get() + 1);
+                }
+                self.inner.dwords_at(addr)
+            }
+        }
+
+        let shader_addr = 0x6000;
+        let eud_addr = 0x7000;
+        let mut user_values = [0u32; UserSgprInfo::SGPRS_MAX];
+        // Strategy 2: the pair immediately after the two declared user SGPRs.
+        user_values[2] = eud_addr as u32;
+        let regs = ComputeShaderInfo {
+            cs_regs: crate::shader::hw_regs::CsStageRegisters {
+                data_addr: shader_addr,
+                num_thread_x: 8,
+                num_thread_y: 8,
+                num_thread_z: 1,
+                user_sgpr: 2,
+                ..Default::default()
+            },
+            cs_user_sgpr: UserSgprInfo {
+                value: user_values,
+                count: 4,
+                ..Default::default()
+            },
+        };
+        let mem = CountingMem {
+            inner: TestMem {
+                regions: vec![
+                    (shader_addr, vec![S_ENDPGM, 0]),
+                    (
+                        eud_addr,
+                        vec![0; super::super::spirv::EXTENDED_MAPPING_DWORDS],
+                    ),
+                ],
+            },
+            shader_addr,
+            shader_reads: Cell::new(0),
+        };
+        let mut map = ShaderMap::new();
+        map.map_user_data(
+            shader_addr,
+            ShaderMappedData {
+                user_data: Some(ShaderUserData {
+                    direct_resource_offset: vec![0xffff; 8],
+                    sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+                    eud_size_dw: 4,
+                    srt_size_dw: 0,
+                }),
+                input_semantics: vec![],
+            },
+        );
+        let mut decoded = ShaderCode::new();
+        decoded.set_type(ShaderType::Compute);
+        shader_parse(0, &[S_ENDPGM], &mut decoded, true).expect("fixture shader parses");
+
+        let mut info = ShaderComputeInputInfo::default();
+        shader_get_input_info_cs_decoded(
+            &regs,
+            &ShaderRegisters::default(),
+            &mem,
+            &map,
+            true,
+            Some(&decoded),
+            &mut info,
+        )
+        .expect("decoded next-gen CS analyses");
+
+        assert_eq!(
+            mem.shader_reads.get(),
+            0,
+            "an exact decoded program must serve EUD discovery and capture without refetching ISA"
+        );
     }
 
     #[test]
@@ -6695,7 +7064,7 @@ mod tests {
             ],
         };
         let (eud, base_dw) =
-            read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true)
+            read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true, None)
                 .expect("strategy 3 must recover the (s12, s13) pair");
         assert_eq!(
             eud,
@@ -6754,7 +7123,7 @@ mod tests {
             regions: vec![(shader_addr, body), (eud_base, eud)],
         };
         let (buf, base_dw) =
-            read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true)
+            read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true, None)
                 .expect("strategy 2 must recover the EUD via the load base pair");
         assert_eq!(base_dw, 12);
         assert_eq!(
@@ -6810,7 +7179,7 @@ mod tests {
         };
 
         let (buf, base_dw) =
-            read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true)
+            read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true, None)
                 .expect("one of the two readable EUD candidates must be selected");
         assert_eq!(base_dw, 12, "the explicit s_load base must win");
         assert_eq!(buf, vec![0xAAAA_0001; 8]);
@@ -6858,7 +7227,7 @@ mod tests {
         };
 
         let (buf, base_dw) =
-            read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true)
+            read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true, None)
                 .expect("the positional EUD fallback is readable");
         assert_eq!(base_dw, 14, "the shader overwrites s0:s1 before loading");
         assert_eq!(buf, vec![0xBBBB_0002; 8]);
@@ -7140,7 +7509,7 @@ mod tests {
             regions: vec![(shader_addr, vec![S_ENDPGM])],
         };
         assert_eq!(
-            read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true),
+            read_extended_user_data(&user_data, &user_sgpr, 14, &mem, shader_addr, true, None),
             None
         );
     }
@@ -7198,6 +7567,85 @@ mod tests {
         assert_eq!(
             bind.storage_buffers.usages[0],
             ShaderStorageUsage::ReadWrite
+        );
+    }
+
+    #[test]
+    fn scalar_constant_buffer_records_only_the_touched_prefix() {
+        use crate::shader::types::ShaderInstructionType as T;
+
+        let mut bind = ShaderBindResources::default();
+        bind.storage_buffers.buffers_num = 1;
+        bind.storage_buffers.start_register[0] = 12;
+        bind.storage_buffers.usages[0] = ShaderStorageUsage::Constant;
+
+        let mut load = ShaderInstruction {
+            type_: T::SBufferLoadDword,
+            ..Default::default()
+        };
+        load.src[0] = sgpr_op(12, 4);
+        load.src[1].type_ = ShaderOperandType::IntegerInlineConstant;
+        load.src[1].constant.u = 8;
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut().push(load);
+
+        shader_measure_constant_buffer_accesses(&code, &mut bind);
+        assert_eq!(
+            bind.storage_buffers.required_bytes[0], 12,
+            "offset 8 plus one dword needs only the first 12 bytes"
+        );
+
+        code.get_instructions_mut()[0].src[1] = sgpr_op(20, 1);
+        shader_measure_constant_buffer_accesses(&code, &mut bind);
+        assert_eq!(
+            bind.storage_buffers.required_bytes[0], 0,
+            "a dynamic scalar offset must fall back to the full V# extent"
+        );
+
+        bind.storage_buffers.start_register[0] = 0;
+        code.get_instructions_mut()[0].src[0] = sgpr_op(8, 4);
+        code.get_instructions_mut()[0].src[1].type_ = ShaderOperandType::IntegerInlineConstant;
+        code.get_instructions_mut()[0].src[1].constant.u = 8;
+        shader_measure_constant_buffer_accesses_shifted(&code, &mut bind, 8);
+        assert_eq!(
+            bind.storage_buffers.required_bytes[0], 12,
+            "NGG hardware slot 0 must match the shader's scalar s8 resource operand"
+        );
+    }
+
+    #[test]
+    fn ngg_constant_sharp_rebases_proven_scalar_s8_to_hardware_user_slot_zero() {
+        use crate::shader::resources::{ShaderSharp, ShaderUserData};
+        use crate::shader::types::ShaderInstructionType as T;
+
+        let mut user_data = ShaderUserData::default();
+        user_data.sharp_resource_offset[3].push(ShaderSharp::new(8, 1));
+        let mut user_sgpr = UserSgprInfo {
+            count: 8,
+            ..Default::default()
+        };
+        user_sgpr.type_[0..4].fill(UserSgprType::Vsharp);
+
+        let mut load = ShaderInstruction {
+            type_: T::SBufferLoadDwordx8,
+            ..Default::default()
+        };
+        load.src[0] = sgpr_op(8, 4);
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut().push(load);
+
+        let normalized = rebase_ngg_constant_sharps(&user_data, &code, &user_sgpr, 8)
+            .expect("decoded s8 SBUFFER + typed hardware slot 0 proves the NGG rebase");
+        assert_eq!(
+            normalized.sharp_resource_offset[3][0].offset_dw(),
+            0,
+            "the emitter later restores the NGG +8 scalar-register base"
+        );
+
+        code.get_instructions_mut().clear();
+        assert!(
+            rebase_ngg_constant_sharps(&user_data, &code, &user_sgpr, 8).is_none(),
+            "metadata alone must not invent the rebase without a matching decoded access"
         );
     }
 }

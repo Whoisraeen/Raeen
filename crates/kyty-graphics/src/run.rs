@@ -364,6 +364,14 @@ pub struct DrawIndirectArgs {
 /// signatures. The whole register state is passed by reference; the
 /// implementor decides what it needs.
 pub trait DrawSink {
+    /// A PM4 packet that can write guest memory was consumed.
+    ///
+    /// The command processor does not know which embedder-side decoded
+    /// resources alias that range, so sinks with submission-local guest-memory
+    /// caches must conservatively invalidate them. The default keeps simple
+    /// recording/test sinks source-compatible.
+    fn guest_memory_write_boundary(&mut self) {}
+
     /// Kyty: `GraphicsRenderDrawIndexAuto` (GraphicsRender.cpp).
     fn draw_index_auto(
         &mut self,
@@ -749,7 +757,15 @@ impl CommandProcessor {
         mem: Option<&dyn GuestMemory>,
     ) -> Result<u32, CpError> {
         let op = pm4::op(cmd_id);
-        match op {
+        let guest_memory_write_boundary = matches!(
+            op,
+            pm4::IT_WRITE_DATA | pm4::IT_RELEASE_MEM | pm4::IT_DMA_DATA
+        ) || (op == pm4::IT_NOP
+            && matches!(
+                pm4::r_code(cmd_id),
+                pm4::R_WRITE_DATA | pm4::R_RELEASE_MEM | pm4::R_DMA_DATA
+            ));
+        let result = match op {
             pm4::IT_NOP => self.cp_op_nop(cmd_id, body, offset, sink, mem),
             pm4::IT_SET_CONTEXT_REG => self.cp_op_set_context_reg(cmd_id, body, offset),
             pm4::IT_SET_SH_REG => self.cp_op_set_shader_reg(cmd_id, body, offset),
@@ -859,7 +875,14 @@ impl CommandProcessor {
                 }
                 Ok(pm4::body_dw(cmd_id))
             }
+        };
+        if guest_memory_write_boundary && result.is_ok() {
+            // This is deliberately conservative: malformed/unwritable packets
+            // may clear a cache unnecessarily, but a real write must never
+            // leave stale decoded guest resources bound later in the stream.
+            sink.guest_memory_write_boundary();
         }
+        result
     }
 
     /// Kyty: `cp_op_nop` (L3156) — the AGC dialect's whole custom-op space
@@ -2612,10 +2635,15 @@ mod tests {
     struct RecordingSink {
         draws: Vec<(u32, u32, u32, bool, bool)>,
         dispatches: Vec<([u32; 3], u32, u64, [u32; 3], u8, u32)>,
+        guest_memory_write_boundaries: u32,
         fail: Option<String>,
     }
 
     impl DrawSink for RecordingSink {
+        fn guest_memory_write_boundary(&mut self) {
+            self.guest_memory_write_boundaries += 1;
+        }
+
         fn draw_index_auto(
             &mut self,
             _ctx: &Context,
@@ -3312,6 +3340,10 @@ mod tests {
             bytes[0x60..0x70],
             (96u8..112).collect::<Vec<u8>>()[..],
             "non-memory selector must not write"
+        );
+        assert_eq!(
+            sink.guest_memory_write_boundaries, 3,
+            "every potentially writing packet conservatively invalidates sink caches"
         );
     }
 

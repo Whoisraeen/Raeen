@@ -887,24 +887,13 @@ impl<'a> ComputeResources<'a> {
         // upload/readback pool. Every pooled buffer carries the union of the
         // usages above, so a staging allocation can later serve storage or
         // transfer readback without recreation.
-        let (buffer, memory) = self.caches.acquire_host_buffer(self.dev, size as u64)?;
+        let (buffer, memory, mapped) = self.caches.acquire_host_buffer(self.dev, size as u64)?;
         if let Some(bytes) = fill {
             debug_assert_eq!(bytes.len(), size);
-            // SAFETY: host-visible allocation is mapped for the filled range.
-            let ptr = match unsafe {
-                self.device()
-                    .map_memory(memory, 0, size as u64, vk::MemoryMapFlags::empty())
-            } {
-                Ok(ptr) => ptr,
-                Err(e) => {
-                    self.caches.release_host_buffer(self.dev, buffer, memory);
-                    return Err(GpuError::VulkanInitFailed(format!("vkMapMemory: {e}")));
-                }
-            };
-            // SAFETY: mapped range is at least `size`; pointers do not overlap.
+            // SAFETY: pooled allocations stay coherently mapped for their
+            // lifetime, cover at least `size`, and are fence-idle at checkout.
             unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
-                self.device().unmap_memory(memory);
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped as *mut u8, bytes.len());
             }
         }
         Ok((buffer, memory))
@@ -1637,23 +1626,39 @@ impl<'a> ComputeResources<'a> {
         Ok(())
     }
 
-    /// Map one host-coherent allocation and copy `size` bytes out.
-    fn read_host_memory(&self, memory: vk::DeviceMemory, size: usize) -> Result<Vec<u8>, GpuError> {
-        // SAFETY: host-coherent allocation is no longer used by the queue
-        // (fence signaled) and is mapped for its initialized range.
+    /// Return a pooled persistent mapping when available, otherwise establish
+    /// a transient mapping. The boolean reports whether the caller must unmap.
+    fn host_memory_address(
+        &self,
+        memory: vk::DeviceMemory,
+        size: usize,
+    ) -> Result<(usize, bool), GpuError> {
+        if let Some(mapped) = self.caches.mapped_host_memory(memory) {
+            return Ok((mapped, false));
+        }
+        // SAFETY: callers invoke this only after the queue fence signals, and
+        // the allocation is HOST_VISIBLE and covers `size`.
         let ptr = unsafe {
             self.device()
                 .map_memory(memory, 0, size as u64, vk::MemoryMapFlags::empty())
         }
         .map_err(|e| GpuError::VulkanInitFailed(format!("vkMapMemory: {e}")))?;
+        Ok((ptr as usize, true))
+    }
+
+    /// Copy `size` bytes out of one fence-idle host-coherent allocation.
+    fn read_host_memory(&self, memory: vk::DeviceMemory, size: usize) -> Result<Vec<u8>, GpuError> {
+        let (mapped, must_unmap) = self.host_memory_address(memory, size)?;
         // Fallible host allocation: a large compute readback under host memory
         // pressure must DEGRADE (return an error the dispatch path skips on),
         // never abort the whole process via the infallible allocator. Same
         // "degrade, not abort" policy as `draw_translate::alloc_zeroed`.
         let mut bytes: Vec<u8> = Vec::new();
         bytes.try_reserve_exact(size).map_err(|_| {
-            // SAFETY: unmap the mapping we opened above before bailing.
-            unsafe { self.device().unmap_memory(memory) };
+            if must_unmap {
+                // SAFETY: balances the transient mapping opened above.
+                unsafe { self.device().unmap_memory(memory) };
+            }
             GpuError::VulkanInitFailed(format!(
                 "compute readback: {size} B host allocation failed (out of memory) — \
                 skipping the dispatch instead of aborting"
@@ -1671,9 +1676,11 @@ impl<'a> ComputeResources<'a> {
         // overlap this host allocation, and the copy initializes the whole
         // future slice before `set_len` exposes it.
         unsafe {
-            std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), bytes.as_mut_ptr(), size);
+            std::ptr::copy_nonoverlapping(mapped as *const u8, bytes.as_mut_ptr(), size);
             bytes.set_len(size);
-            self.device().unmap_memory(memory);
+            if must_unmap {
+                self.device().unmap_memory(memory);
+            }
         }
         Ok(bytes)
     }
@@ -1731,14 +1738,10 @@ impl<'a> ComputeResources<'a> {
                 initial.len()
             )));
         }
-        let ptr = unsafe {
-            self.device()
-                .map_memory(memory, 0, size as u64, vk::MemoryMapFlags::empty())
-        }
-        .map_err(|e| GpuError::VulkanInitFailed(format!("vkMapMemory: {e}")))?;
+        let (mapped, must_unmap) = self.host_memory_address(memory, size)?;
         // SAFETY: the fence completed before this call, the coherent mapping
-        // covers `size`, and it remains live until the explicit unmap below.
-        let result = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), size) };
+        // covers `size`, and it remains live through the comparison below.
+        let result = unsafe { std::slice::from_raw_parts(mapped as *const u8, size) };
         const PAGE: usize = 4096;
         let mut dirty = Vec::new();
         let mut at = 0usize;
@@ -1759,9 +1762,10 @@ impl<'a> ComputeResources<'a> {
             }
             let mut bytes = Vec::new();
             if bytes.try_reserve_exact(at - start).is_err() {
-                // SAFETY: close the mapping before returning the allocation
-                // failure as a degradable dispatch error.
-                unsafe { self.device().unmap_memory(memory) };
+                if must_unmap {
+                    // SAFETY: balances the transient mapping opened above.
+                    unsafe { self.device().unmap_memory(memory) };
+                }
                 return Err(GpuError::VulkanInitFailed(format!(
                     "compute dirty writeback: {} B host allocation failed",
                     at - start
@@ -1773,9 +1777,11 @@ impl<'a> ComputeResources<'a> {
                 bytes,
             });
         }
-        // SAFETY: balances the successful map above after all borrowed slices
-        // have had their final use.
-        unsafe { self.device().unmap_memory(memory) };
+        if must_unmap {
+            // SAFETY: balances the transient mapping after borrowed slices'
+            // final use. Persistent pooled mappings deliberately stay live.
+            unsafe { self.device().unmap_memory(memory) };
+        }
         Ok(ComputeBufferOutput { size, dirty })
     }
 

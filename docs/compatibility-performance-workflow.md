@@ -50,8 +50,9 @@ cargo xtask compat run --tier all --profile max-fps --timeout 180
 ```
 
 The runner launches `raeen.exe --run-eboot`, disables the synthetic vblank
-wait, enables draw/call telemetry, captures stdout and stderr without pipe
-deadlocks, enforces a timeout, and measures:
+wait, opts the max-FPS profile into bounded async flip, enables low-overhead
+32-frame worker telemetry, captures stdout and stderr without pipe deadlocks,
+enforces a timeout, and measures:
 
 - wall time, process CPU time, peak working set, and exit status;
 - observed VideoOut flip events;
@@ -60,8 +61,17 @@ deadlocks, enforces a timeout, and measures:
 
 Raw evidence is stored under `artifacts/compat/raw/`. The sanitized run report
 is `artifacts/compat/latest.json` and conforms to
-`compat/schema-v1.json`. `observed_fps` stays null until Raeen emits a reliable
-machine-readable frame-time series; flip counts are not mislabeled as FPS.
+`compat/schema-v1.json`. `observed_fps` is the median of the eight most recent
+completed-present worker windows (up to 256 frames), rounded to 0.1 FPS. It
+stays null when the title never produces that telemetry; raw flip counts are
+never mislabeled as FPS. The much heavier per-draw tracer remains available by
+setting `RAEEN_TIME_DRAW=1` explicitly, but is not enabled by the performance
+runner because its log traffic perturbs the measured workload.
+Full HLE call accounting is likewise disabled for `max-fps`; other
+compatibility profiles retain it for triage.
+The unpaced profile uses the explicit `RAEEN_VBLANK_HZ=0` benchmark sentinel;
+normal and UI-configured launches remain limited to the production 24–480 Hz
+range and default to drift-compensated 60 Hz.
 
 Save a local baseline and compare later builds:
 
