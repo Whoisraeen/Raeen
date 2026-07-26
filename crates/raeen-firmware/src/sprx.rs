@@ -201,6 +201,7 @@ pub struct SprxModule {
 /// `elf`; a truncated or otherwise malformed image returns
 /// [`FirmwareError::MalformedDynlibData`], never panics.
 pub fn parse_sprx(elf: &[u8]) -> Result<SprxModule, FirmwareError> {
+    let parse_started = std::time::Instant::now();
     // A real title's section-header table is routinely stripped or stale: its
     // `e_shoff` points past the file (Dragon Ball: 0x1eead2a0 in a 0xa17f1d8
     // file). goblin parses sections eagerly and fails ("bad offset ..."), but
@@ -210,6 +211,18 @@ pub fn parse_sprx(elf: &[u8]) -> Result<SprxModule, FirmwareError> {
     let elf: &[u8] = &sanitized;
     let parsed = goblin::elf::Elf::parse(elf)
         .map_err(|e| FirmwareError::MalformedDynlibData(format!("ELF parse error: {e}")))?;
+    if std::env::var_os("RAEEN_TIME_LINK").is_some() {
+        tracing::info!(
+            elf_bytes = elf.len(),
+            elapsed_us = parse_started.elapsed().as_micros(),
+            program_headers = parsed.program_headers.len(),
+            section_headers = parsed.section_headers.len(),
+            dynamic_symbols = parsed.dynsyms.len(),
+            dynamic_relocations =
+                parsed.dynrelas.len() + parsed.dynrels.len() + parsed.pltrelocs.len(),
+            "TIME_LINK: eager goblin ELF parse"
+        );
+    }
 
     let e_type = parsed.header.e_type;
     if !matches!(e_type, ET_SCE_EXEC | ET_SCE_DYNEXEC | ET_SCE_DYNAMIC) {

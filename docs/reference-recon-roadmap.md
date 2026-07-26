@@ -45,16 +45,46 @@ so 3D draws → the large structural pieces.**
 
 | # | Item | Impact/Effort | Port from |
 |---|------|---------------|-----------|
-| 8 | Move invalid-descriptor from translate-time refuse → draw-time null fallback (robustness2 already on) | high / med | shadPS4 GetSharp Null() |
-| 9 | Read sampled mip 0 from GFX10 mip-chain tail offset | high / med | SharpEmu 6ee445f |
-| 10 | Sample 2D array / cube / 3D textures with real layers | high / med | SharpEmu 25d741b |
-| 11 | Bind all enabled render targets (MRT, render_target_mask) | high / med | Kyty GraphicsRender.cpp |
+| 8 | ~~Move invalid-descriptor from translate-time refuse → draw-time null fallback~~ **DONE for the sampled path; storage counterpart TRIED AND REVERTED** — see note below | — | shadPS4 GetSharp Null() |
+| 9 | Read sampled mip 0 from GFX10 mip-chain tail offset | high / med — **OPEN, verified 2026-07-26**: every upload path still reads `t.base40()` (`draw_translate.rs:1462,1523,1537,1556,1582,1592`), so any `last_level > 0` texture samples from the wrong offset | SharpEmu 6ee445f |
+| 10 | ~~Sample 2D array / cube / 3D textures with real layers~~ **DONE, verified 2026-07-26** — `SampledDim::Cube`, type-11 guest Cube lowered to 2DArray, multiple-of-6 `layer_count` enforcement, `sq_img_rsrc_t` DEPTH = 6·cubes−1 (`draw_translate.rs:1393-1667`). This is what fixed Minecraft's panorama. | — | SharpEmu 25d741b |
+| 11 | Bind all enabled render targets (MRT, render_target_mask) | high / med — **OPEN but MEASURED IRRELEVANT for Minecraft**: `note_active_color_slots` fired ZERO times across a full run, so it binds one target at a time. `render_target_mask` already drives the color write mask (`:3181`) but only `render_targets[0]` is attached (`:3151`). Measure another title before building this. | Kyty GraphicsRender.cpp |
 | 20 | Persistent GPU texture/buffer cache + page-fault dirty tracking + overlap aliasing | high / **large** | KytyPS5 memoryTracker + Kyty GpuMemory.cpp |
 | 21 | Descriptor resolution by dataflow trace over flattened SRT/EUD (TrackSharp) | high / **large** | shadPS4 resource_tracking + flatten_extended_userdata pass |
 | 22 | Async compute rings (MapComputeQueue / DingDong / N-queue arbitration) | high / **large** | Kyty GraphicsRun.cpp + KytyPS5 graphicsRun.cpp |
 | 23 | Bink2 FMV via FFmpeg host backend (depends on rank 6) | high / **large** | SharpEmu Bink/* (559b7f0) |
 | 29 | MSAA sample count + resolve; broader GFX10 tiling swizzle coverage | med / med | SharpEmu GnmTiling |
 | 30 | GPU-EOP flips embedded in command completion (needs rank 19) | med / med | KytyPS5 sync.h + videoOut.cpp |
+
+### Rank 8 status (verified against the code 2026-07-26 — do not re-recommend)
+
+**Sampled path: DONE and wired in production.** `shader_synthesize_placeholder_sampled_texture`
+(`kyty-graphics/src/shader/analysis.rs:1499`) installs a real 1x1 transparent-black
+`Texture2D` at an unresolved T# register so `mimg_descriptor_guard` resolves it and the
+draw/dispatch PROCEEDS untextured instead of the whole shader being refused. Wired at
+`raeen-gpu/src/shader_fetch.rs:858` (pixel) and `:922` (compute), paired with
+`shader_synthesize_default_sampler` for the S# side. Measured: Minecraft world PS
+`0x16ff8c00`; ASTRO.BOT scene compute `0x500566b00` (`image_load` T# at `s16`), which was
+costing 13 dispatch skips per level transition.
+
+**Storage counterpart: TRIED, MEASURED WORSE, REVERTED** (`shader_fetch.rs:930`) — it took
+ASTRO.BOT compute from 0 shader-translation failures to **30**, because its
+descriptor-resolution check is narrower than the sampled one's. Do not re-land it without
+first widening that check and re-measuring ASTRO.BOT.
+
+**Genuinely still open, in the same area:**
+- **Vertex stage is not wired** — the placeholder runs for PS and CS only. A VS whose
+  sampled T# is runtime-resolved still refuses, killing the draw. Needs the `gs_prolog`
+  `shift_regs` +8 rebase handled (see the function's doc). UNMEASURED: add a
+  vertex-stage-refusal counter and confirm a real title hits it before implementing.
+- `image_get_resinfo` dimension queries — a 1x1 dummy returns wrong dimensions, which is
+  plausibly worse than skipping. Deliberately untouched.
+- Guard shape-2 (a raw uncovered EUD `s_load` overwriting the sharp's registers) — the raw
+  dwords are the true descriptor and cannot be mapped to a Vulkan array index at translate
+  time. Correctly refuses.
+
+**Rank 21 (descriptor dataflow trace) subsumes all three** and is the principled fix; these
+are point mitigations.
 
 ## Load speed / module load
 

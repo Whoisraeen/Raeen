@@ -23,7 +23,7 @@ Claude `/goal` (≤200 chars):
 | Reference | Path | License | Upstream | Status | Delete when |
 |-----------|------|---------|----------|--------|-------------|
 | Kyty | `reference/kyty` | MIT | https://github.com/InoriRus/Kyty | `active` | all rows done/skip |
-| SharpEmu | `reference/sharpemu` | GPL-2.0 | https://github.com/par274/sharpemu | `active` | all rows done/skip |
+| SharpEmu | `reference/sharpemu` | GPL-2.0 | https://github.com/sharpemu/sharpemu | `active` | all rows done/skip |
 | KytyPS5 | `reference/kytyps5` | GPL-2.0 + Kyty MIT lineage | https://github.com/Nmzik/KytyPS5 | `active` | all useful PS5 deltas done/skip |
 | shadPS4 | `reference/shadps4` | GPL-2.0 | https://github.com/shadps4-emu/shadPS4 | `active` | all useful Orbis/Vulkan deltas done/skip |
 | PS5SDK | `reference/ps5sdk` | GPL-2.0 | https://github.com/PS5Dev/PS5SDK | `not-cloned` | clone when building the M1 toolchain Hello World fixture |
@@ -39,6 +39,48 @@ Claude `/goal` (≤200 chars):
 > PS5SDK remains optional until the M1 compiler-produced fixture needs it.
 > The "delete when fully ported" condition applies only to trees that exist on
 > disk.
+
+### All-reference refresh 2026-07-26
+
+- **Fast-forwarded:** SharpEmu `21f964a -> 0535783` (8 commits), shadPS4
+  `8161049 -> d976c33` (7 commits), and Mesa `3e2d851 -> 780727e` (12 commits).
+  Kyty `4733b7e`, KytyPS5 `8587638`, OpenOrbis `0a1aaf9`, ps4libdoc
+  `8bff486`, and ps5-payload-sdk `a0d2bc6` were already current. V8's pinned
+  detached checkout fetched without moving. `ghidra-orbis` has one local
+  modification, so its origin was fetched but its worktree was deliberately
+  not merged.
+- **SharpEmu `5b602c0` detile cache identity/resource pooling — ALREADY
+  COVERED.** Raeen's `TextureKey` already includes guest base, extent, layer
+  count, volume depth, cube/array intent, and format; its Vulkan paths already
+  retain persistent texture/host-buffer resources. No duplicate port.
+- **SharpEmu `8f94562` large-region reserve and `99004a3` HOST_CACHED guest
+  buffers — ALREADY COVERED.** Raeen reserves its large guest arena sparsely
+  with on-demand commit, and its mapped compute/readback buffers prefer
+  `HOST_VISIBLE|HOST_COHERENT|HOST_CACHED` with a compatible fallback.
+- **SharpEmu `e1a3b92` semaphore-busy suppression — NO SEMANTIC PORT.** The
+  upstream change only suppresses an expected error in its call logger. Raeen
+  already returns the non-blocking busy result from `sceKernelPollSema`; hiding
+  it globally would reduce blocker evidence.
+- **shadPS4 `26f4270` condition-variable stale-wake fix — PORTED (working
+  tree).** Audit found Raeen's global generation made one
+  `pthread_cond_signal` visible to every waiter on its next 10 ms bounded host
+  wake, effectively turning signal-one into a delayed broadcast. Raeen now
+  uses an original Rust FIFO of per-waiter wake objects, implements exact
+  `scePthreadCondSignalto`, resolves signal/timeout races under one queue lock,
+  and retains bounded termination polling. The regression first failed against
+  the generation model and now proves only the oldest waiter wakes.
+- **shadPS4 `38272a4` renderer fixes — REVIEWED/DEFERRED.** Its 40-bit buffer
+  mask and null-base filtering apply to the PS4 resource layout; Raeen's Gen5
+  V#/T# accessors are separately decoded and should not inherit that mask
+  blindly. The buffer-cache rollback has no direct analogue in Raeen's current
+  upload path.
+- **shadPS4 `0afb317` image-view minimum LOD — REVIEWED/DEFERRED PENDING
+  MEASUREMENT.** Raeen decodes the PS5 `min_lod_warn5` field but has no evidence
+  that it is equivalent to PS4's T# `min_lod`; enabling
+  `VK_EXT_image_view_min_lod` without a captured title descriptor would be a
+  speculative semantic change.
+- **Mesa delta — NO AMD CHANGE.** `3e2d851..780727e` contains no files under
+  `src/amd`; AddrLib/register/PM4 source used by Raeen is unchanged.
 
 ### Phase 1 live-import batch 2026-07-25
 
@@ -423,3 +465,4 @@ Pattern reference for Orbis HLE (memory, libkernel, linker). Port selectively; n
 | 2026-07-23 | Applied Kyty's `ShaderGetBindIds` structural-cache principle to Raeen's active SPIR-V cache, extended for Raeen's Gen5 texture dimension/format, embedded constants, EUD/global-memory and LDS codegen. Runtime guest addresses and descriptor payloads no longer churn modules; fresh analyzed metadata still drives every bind. Minecraft A/B fell from >2,100 compile events to 81/8 addresses with present 256 and no failures. Also removed Kyty's PS4-era writable-pixel-buffer restriction only for Gen5, because Raeen's existing graphics descriptor path already carries fragment-visible storage buffers. Astro A/B reached 6 presents with zero translation/analysis errors. Fragment SSBO guest-memory writeback remains open; no M2/M3 closure claim. |
 | 2026-07-24 | Ported Kyty's explicit Gen5 stencil-operation conversion into `raeen-gpu` instead of casting the AMD opcode to Vulkan. This preserves AMD Ones/ReplaceTest/ReplaceOp, clamp/invert/wrap, and the distinct test/operation reference values; the old cast caused Minecraft's stencil-tested UI to rasterize no fragments. Added persistent-stencil regression coverage. Also added original content-aware scanout selection, black-frame/pending-composite diagnostics, bounded indexed vertex uploads, and correlated `Fetch*`/POS0 tracing. A no-bypass release probe produced a real Minecraft loading frame and then visible exact scanouts; this is not a gameplay or milestone-closure claim. |
 | 2026-07-24 | Replaced UserService's permanent `NO_EVENT` with a process-scoped initial Login event and moved the primary local user to the retail-style `0x10000000` id used by current SharpEmu; KytyPS5 and shadPS4 independently confirm the login-event transition. A release Minecraft run then consumed the event, opened Pad handle 1, and read a live raw-HID DualSense snapshot. The same run preserved the complete title panorama at present 2048. Button-driven transition/gameplay acceptance remains open. |
+| 2026-07-26 | Fetched every configured reference and fast-forwarded SharpEmu to `0535783`, shadPS4 to `d976c33`, and Mesa to `780727e`; unchanged and locally modified/detached trees were preserved. Audited every new commit. Ported only shadPS4 `26f4270`'s waiter-ownership principle as Raeen-native FIFO pthread-cond state after a failing two-waiter regression proved Raeen's generation counter turned signal-one into broadcast. SharpEmu host-cached buffers, detile cache identity/pooling, and sparse reserve deltas were already covered; Mesa had no AMD delta. |

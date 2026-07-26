@@ -241,6 +241,13 @@ const MODULE_SCAN_MAX_DEPTH: usize = 4;
 /// buys nothing but IO.
 const MODULE_SCAN_SKIP_DIRS: &[&str] = &["sce_sys", "savedata", "streamingassets"];
 
+/// Top-level package directories that contain bulk title assets rather than
+/// loadable modules. Keep this root-only: an engine-owned module directory may
+/// legitimately contain a nested folder named `data`, while the package-root
+/// `data/` trees measured in Minecraft and ASTRO contain no `.prx`/`.sprx` and
+/// cost seconds to enumerate.
+const MODULE_SCAN_ROOT_SKIP_DIRS: &[&str] = &["data"];
+
 /// App-relative directories whose `.prx` files initialize **before** `_start`
 /// even when no `DT_NEEDED` entry names them, matched case-insensitively
 /// against the directory path relative to the app root.
@@ -579,7 +586,13 @@ impl ModuleIndex {
             let path = entry.path();
             if file_type.is_dir() {
                 let component = entry.file_name().to_string_lossy().to_ascii_lowercase();
-                if MODULE_SCAN_SKIP_DIRS.contains(&component.as_str()) {
+                if MODULE_SCAN_SKIP_DIRS.contains(&component.as_str())
+                    || (depth == 0 && MODULE_SCAN_ROOT_SKIP_DIRS.contains(&component.as_str()))
+                {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "module index pruned known bulk-content directory"
+                    );
                     continue;
                 }
                 Self::walk(root, &path, depth + 1, out);
@@ -944,17 +957,40 @@ pub fn load_process(
     let load_started = std::time::Instant::now();
     // Parse (not yet link) the main module: we need its NEEDED list and its
     // image size before anything can be placed above it.
+    let decrypt_started = std::time::Instant::now();
     let decrypted = crypto::self_crypto::decrypt_self(bytes, provider)?;
+    if std::env::var_os("RAEEN_TIME_LINK").is_some() {
+        tracing::info!(
+            elapsed_us = decrypt_started.elapsed().as_micros(),
+            elf_bytes = decrypted.elf.len(),
+            "TIME_LINK: SELF decrypt/passthrough"
+        );
+    }
 
     // Index before parsing/linking so a warm launch can validate the complete
     // app-module manifest and return a cached composed image immediately.
+    let index_started = std::time::Instant::now();
     let module_index = ModuleIndex::build(dir);
+    if std::env::var_os("RAEEN_TIME_LINK").is_some() {
+        tracing::info!(
+            elapsed_us = index_started.elapsed().as_micros(),
+            modules = module_index.entries.len(),
+            "TIME_LINK: app module index"
+        );
+    }
     tracing::debug!(
         "app module index: {} .prx/.sprx under {}",
         module_index.entries.len(),
         dir.display()
     );
+    let cache_key_started = std::time::Instant::now();
     let process_cache_key = process_cache::key(&decrypted.elf, &module_index, base, hle);
+    if std::env::var_os("RAEEN_TIME_LINK").is_some() {
+        tracing::info!(
+            elapsed_us = cache_key_started.elapsed().as_micros(),
+            "TIME_LINK: linked-image cache key"
+        );
+    }
     if let Some(mut hit) = process_cache::load(&process_cache_key) {
         if restore_cached_registry(&mut hit.process, hit.hle_data_offset, registry, base) {
             tracing::info!(
@@ -1674,6 +1710,34 @@ mod tests {
         assert_eq!(
             super::find_dependency_file(tree.path(), "libSceNotShipped.prx", &index),
             None
+        );
+    }
+
+    #[test]
+    fn module_index_prunes_bulk_data_but_keeps_known_module_directories() {
+        let tree = TempTree::new("modindex-prune");
+        let system = tree.touch("sce_module/libSystem.prx");
+        let eager = tree.touch("Media/Modules/EngineRuntime.prx");
+        let plugin = tree.touch("Media/Plugins/OptionalPlugin.sprx");
+        tree.touch("data/world/chunks/ShouldNotBeIndexed.prx");
+
+        let index = super::ModuleIndex::build(tree.path());
+
+        assert_eq!(
+            index.find("libSystem.prx").map(|entry| &entry.path),
+            Some(&system)
+        );
+        assert_eq!(
+            index.find("EngineRuntime.prx").map(|entry| &entry.path),
+            Some(&eager)
+        );
+        assert_eq!(
+            index.find("OptionalPlugin.sprx").map(|entry| &entry.path),
+            Some(&plugin)
+        );
+        assert!(
+            index.find("ShouldNotBeIndexed.prx").is_none(),
+            "the package data tree is bulk game content, not a module root"
         );
     }
 

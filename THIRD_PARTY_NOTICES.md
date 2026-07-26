@@ -84,8 +84,9 @@ SOFTWARE.
 - **Upstream:** https://github.com/sharpemu/sharpemu (formerly par274/sharpemu)
 - **License:** GPL-2.0-or-later (compatible with Raeen's GPL-2.0-only)
 - **Copyright:** © SharpEmu authors
-- **Reference synced:** 2026-07-23 to upstream `main` @ 6db095e (tag
-  `v0.0.2-beta.5`) — brings working AudioOut2 audio (GTA V), AGC cross-queue
+- **Reference synced:** 2026-07-26 to upstream `main` @ `0535783` (the
+  `v0.0.2-beta.5` work is included) — brings working AudioOut2 audio (GTA V),
+  AGC cross-queue
   `WAIT_REG_MEM` label work (`Agc/GpuWaitRegistry.cs`), and PR #587's Gen5 flat
   (global) memory + 3D-texture shader support (`Shader/*`, PSSL SEG-field
   FLAT-address decode → SPIR-V global-memory access). Ports cite the
@@ -156,6 +157,11 @@ re-implementations are license-compatible; this notice preserves attribution.
 - **Copyright:** © 2024 shadPS4 Emulator Project and contributors
 - **How Raeen uses it:** Primarily an Orbis HLE reference (memory, libkernel,
   linker, Vulkan), re-implemented in Rust rather than transliterated.
+  The 2026-07-26 refresh to `d976c33` exposed the stale-wake failure class in a
+  condition-wide generation counter: a signal intended for one waiter can be
+  observed by every waiter. Raeen's FIFO/per-waiter Rust condition queue and
+  tests are an original implementation informed by shadPS4 commit `26f4270`;
+  no C++ is copied.
 
   **Data incorporated in-tree:** `crates/raeen-firmware/src/dynlib/nid_names.txt`
   is derived from shadPS4's `src/core/aerolib/aerolib.inl` — a generated table
@@ -210,7 +216,7 @@ attribution as that license requires.
 ## Mesa AddrLib — AMD surface-layout reference (acquired; no code incorporated yet)
 
 - **Upstream:** https://gitlab.freedesktop.org/mesa/mesa
-- **Pinned reference:** `main` at `3e2d8517b897026377267c09975db83525d2fc95`
+- **Pinned reference:** `main` at `780727e68adc`
   in git-ignored `reference/mesa`.
 - **License:** the acquired `src/amd/addrlib/` files carry
   `SPDX-License-Identifier: MIT` and AMD copyright notices. The reference's

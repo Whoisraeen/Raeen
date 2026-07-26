@@ -1,3 +1,177 @@
+- ALL-REFERENCE REFRESH + PTHREAD CONDITION FIFO (2026-07-26; working tree at
+  `ef2e7dc15665+dirty`, no commit):
+  * FETCH/PULL: fast-forwarded SharpEmu `21f964a -> 0535783` (8 commits),
+    shadPS4 `8161049 -> d976c33` (7), and Mesa `3e2d851 -> 780727e` (12).
+    Kyty, KytyPS5, OpenOrbis, ps4libdoc, and ps5-payload-sdk were already
+    current. V8 remained on its intentional detached pin. `ghidra-orbis` has
+    one local edit, so only its origin metadata was fetched; no merge was
+    attempted over that work.
+  * AUDIT NEGATIVES: Mesa's delta contains zero `src/amd` changes. SharpEmu's
+    new host-cached guest buffer, detile cache identity/resource pooling, and
+    sparse large-region reserve work are already present in Raeen's Vulkan
+    pools/`TextureKey` and sparse guest arena, so no duplicate ports landed.
+    shadPS4's PS4 minimum-LOD and buffer-sharp changes were not copied into the
+    PS5 descriptor path without measured semantic evidence.
+  * BUG FOUND from shadPS4 `26f4270`: Raeen's pthread condition state used one
+    global generation. `signal` incremented it and notified one host waiter,
+    but every other waiter observed the changed generation on its next 10 ms
+    bounded polling wake—turning signal-one into a delayed broadcast.
+  * FIX: original Rust FIFO/per-waiter wake objects in `raeen-kernel`; wait
+    registration remains atomic with guest-mutex release, signal/timeout races
+    resolve under one queue lock, broadcast drains the queue, and
+    `scePthreadCondSignalto` selects the requested guest thread instead of
+    approximating arbitrary signal-one. The two-waiter regression failed first
+    against the generation model, then passed with the FIFO.
+  * VERIFIED: `raeen-kernel` 41 + 2 integration tests, `raeen-hle` 433 tests,
+    `raeen-runtime` 77 + 46 execution + interactive-2D tests all green; clippy
+    `-D warnings` green for kernel/HLE/runtime; isolated release build green.
+  * MINECRAFT A/B: `max-fps`, release, 180.395 s, **11,392 flips / 68.3
+    observed FPS / 1.170 GB peak**, zero shader/GPU/audio errors, no blocker or
+    wedge (`scratch/reference-refresh-minecraft-max-fps.json`,
+    `run-1785076269737`). Immediate pre-slice comparison was 10,368 flips /
+    56.7 FPS / 1.468 GB peak. This proves no regression and records an observed
+    +9.9% flip count; run variance means the FIFO is not claimed as the sole
+    cause.
+
+- PHASE 1 LOAD-PATH CONTINUATION — measured profiling replaced the proposed
+  relocation parallelism with two higher-ROI fixes (2026-07-26; working tree at
+  `ef2e7dc15665+dirty`, no commit; Phase 1 was already green and this does not
+  start Phase 2):
+  * RELOCATION HYPOTHESIS REJECTED: with `RAEEN_NO_LINK_CACHE=1` and the new
+    env-gated `RAEEN_TIME_LINK=1` telemetry, ASTRO applied **560,259
+    relocations in 3.584 ms** (~156 million/s). A second sample was 2.628 ms.
+    Adding Rayon would target under 0.1% of the measured 6.762 s cold load,
+    add scheduling/ordering risk around shared import state, and cannot produce
+    a material launch-time win, so no parallel relocation code/dependency was
+    added.
+  * ACTUAL WALL: `ModuleIndex::build` spent **5,177.928 ms** recursively
+    enumerating the package-root `data/` tree to find only the same two
+    modules. Direct corpus checks found **zero `.prx`/`.sprx` files** in both
+    Minecraft's and ASTRO's top-level `data/` trees; enumerating them alone
+    cost about 9.9 s and 18.8 s respectively from PowerShell.
+  * FIX: module discovery now prunes package-root `data/` only, while retaining
+    `sce_module`, `Media/Modules`, `Media/Plugins`, and nested engine paths.
+    `module_index_prunes_bulk_data_but_keeps_known_module_directories` first
+    failed on the old traversal, then passed with the bounded rule.
+  * COLD A/B (same ASTRO executable, isolated release build, link cache
+    disabled): module indexing fell **5,177.9 ms -> 41.1 ms** (99.2%); total
+    process load fell **6,762 ms -> 1,529 ms** (77.4%). Both runs found the
+    same two modules and reached the same runtime stage with four flips in the
+    30 s probe. Reports: `scratch/phase1-relocation-profile/
+    serial-phase-profile.json` (`run-1785073643413`) and
+    `data-prune-profile.json` (`run-1785074007187`).
+  * SYSCALL/CPUID PREFILTER FINISHED: the pre-existing SIMD opcode prefilter
+    still decoded the 251 MB main executable twice—once for `syscall`, once for
+    `cpuid`. Both traps now share one iced-x86 instruction-boundary pass.
+    `syscall_and_cpuid_share_one_executable_decode_pass` proves real opcodes are
+    patched and matching bytes inside immediates remain untouched. The measured
+    main-image patch stage fell from an inferred **727.7 ms -> 498.3 ms**
+    (31.5%); whole-load time varied between runs, so no second whole-load claim
+    is made. Report: `one-pass-profile.json` (`run-1785074291213`).
+  * MINECRAFT A/B GREEN, compared on the exact recorded `max-fps` profile:
+    baseline `artifacts/compat/phase1-final.json` was **8,192 flips / 180.363 s
+    / 1.880 GB peak**; this build produced **10,368 flips / 180.342 s / 56.7
+    observed FPS / 1.468 GB peak**, with zero shader/GPU/audio errors
+    (`scratch/phase1-relocation-profile/minecraft-max-fps-final.json`,
+    `run-1785074928163`). That is 26.6% more flips and 21.9% lower peak working
+    set for this measured run, not a universal performance claim. The default
+    paced `compatibility` profile separately produced 5,952 flips and 21.2
+    observed FPS; it is recorded but not compared to the `max-fps` baseline.
+  * VERIFIED: `cargo test -p raeen-firmware` (125 library + 17 integration,
+    all green), `cargo test -p raeen-runtime` (77 unit + 46 execution + the
+    interactive-2D acceptance test; one manual benchmark ignored), firmware
+    clippy with `-D warnings`, isolated release `raeen-gui` build, fmt check,
+    and `git diff --check` all exit 0.
+
+- CLEAN CLONE + CI UNBROKEN — `plugins/upscale` moved in-tree to
+  `crates/raeen-upscale` (2026-07-26; working tree, no commit; fmt clean,
+  `cargo clippy --workspace -- -D warnings` exit 0 / zero warnings):
+  * THE BUG, measured with a control rather than reasoned: `c0f6303`
+    (2026-07-23 21:16) added
+    `raeen-upscale = { path = "../../plugins/upscale", optional = true }` to
+    `crates/raeen-gui/Cargo.toml`, but `.gitignore:82` is `/plugins/*`, so
+    `plugins/upscale/` was NEVER IN THE REPOSITORY. Cargo resolves path
+    dependencies at manifest-load time regardless of `optional` and regardless
+    of `[workspace] exclude`, so a fresh checkout dies at resolution:
+    `failed to get raeen-upscale as a dependency ... failed to read
+    plugins/upscale/Cargo.toml`.
+  * IMPACT: `ci.yml` runs `actions/checkout@v4` then fmt/clippy/test over the
+    workspace, so **every CI run failed at resolution for 15 commits (~3 days)**
+    and produced zero signal, and **no clean clone could build at all**. All
+    "green" claims in that window were local-only, valid only on a machine with
+    an untracked `plugins/upscale/`. Found by accident while building a baseline
+    worktree for an unrelated regression check.
+  * WHY `exclude` DID NOT SAVE IT (the trap, now documented in `Cargo.toml`):
+    `exclude` only stops a directory being a workspace *member*. A path
+    *dependency* from a member still has to resolve. Comment added at the
+    `exclude` line telling future work not to reintroduce a path dep under
+    `plugins/`.
+  * PROOF (control + treatment in the same fresh worktree, `plugins/` holding
+    only `README.md`): unfixed HEAD `cargo metadata` → **exit 101** with the
+    resolution error; with the fix → **exit 0**. Note `cargo metadata
+    --no-deps` does NOT reproduce it (it skips dependency resolution) — an
+    earlier probe using `--no-deps` gave a false pass and was corrected.
+  * FIX: `plugins/upscale` → `crates/raeen-upscale`, added to `[workspace]
+    members`, `raeen-gui` path → `../raeen-upscale`, crate switched to
+    `version/edition/license.workspace` (edition 2021 → 2024, compiles clean),
+    its own `Cargo.lock`/`target/` dropped. `plugins/` is now reserved for
+    user-supplied plugin BINARIES loaded through the C ABI, which is what
+    `plugins/README.md` always said it was for.
+  * APPROACH CHANGED AFTER READING THE CODE: the plan was to convert this crate
+    to a C-ABI loaded plugin. Inspection showed it is pure Rust, GPL-2.0-only,
+    with NO proprietary dependencies — the `fsr`/`dlss`/`xess` backends only
+    *probe* for a vendor runtime by filename (`nvngx_dlss.dll`, …) and report
+    unavailable; nothing links or loads one. Converting would have been a
+    586-line rewrite AND would have taken working GPL-clean spatial upscalers
+    away from users. Moving it in-tree is both smaller and better.
+  * LATENT BREAKAGE SURFACED: because the crate was workspace-EXCLUDED, it had
+    never been covered by `clippy --workspace -- -D warnings` or
+    `test --workspace`. Including it immediately produced **4 clippy errors**
+    (`default()` on a unit struct, a collapsible `if` → let-chain, two
+    `identity_op` `* 1` in a test) — i.e. adding it would have broken CI a
+    second way. All fixed; its **7 tests now run in CI for the first time**.
+  * VERIFIED: `cargo fmt --all -- --check` exit 0; `cargo clippy --workspace --
+    -D warnings` exit 0, zero warnings; `cargo build -p raeen-gui --features
+    upscale-plugins` succeeds (the opt-in path still works).
+  * MY OWN FLAKY TEST, CAUGHT BY THE NEWLY-WORKING GATE AND FIXED: the first
+    `cargo test --workspace` after the resolution fix exited **101** — not on the
+    known GPU test, but on `present_plugin_dylib::a_real_plugin_survives_many_
+    frames_without_leaking_or_faulting`:
+    `LoadLibraryExW Os { code: 4551, "An Application Control policy has blocked
+    this file." }`. Windows Application Control refused a freshly-written
+    unsigned DLL in `%TEMP%`; two of the three tests loaded first and the third
+    was blocked, so it is reputation-based and NONDETERMINISTIC on identical
+    code — the same defect class this session criticized in
+    `guest_memory_pixel_shader_draws_green`, introduced by me hours earlier.
+    Three changes: (1) compile the example **once** for the suite behind a
+    `OnceLock` instead of three times — each distinct fresh unsigned binary is
+    an independent chance to be blocked; (2) write it under
+    `<target>/<profile>/raeen-plugin-dylib-test` instead of `%TEMP%`, which
+    Application Control scrutinizes far harder than build output (and it now
+    cleans with `cargo clean`); (3) new `policy_blocked()` treats an
+    executable-policy refusal as a loud `SKIP:` rather than a failure, matching
+    OS code 4551 in the `Debug` rendering so the check is locale-independent.
+    Stable across 5 consecutive runs and ~2.5x faster (one rustc, not three).
+    HONEST LIMIT: on a host with strict Application Control these 3 tests SKIP
+    instead of verifying — visible in output, not silent.
+  * EXIT-CODE MASKING, AGAIN, VIA A NEW ROUTE: the background-task notification
+    for that run reported "exit code 0" because the shell pipeline's last
+    command was a `grep`. Cargo's real 101 was only visible because the script
+    wrote `TEST_EXIT=$?` into the log. Same trap the ledger already documents
+    for `| tail`, arriving through task-runner summaries.
+  * FINAL GATE STATE (this build): `cargo test --workspace` = **1285 passed,
+    22 suites, 1 suite FAILED** — the sole failure is the pre-existing,
+    environment-dependent `guest_memory_pixel_shader_draws_green` (proven this
+    session to fail identically at clean HEAD, see its own entry). fmt exit 0;
+    `clippy --workspace -- -D warnings` exit 0, zero warnings. So CI moves from
+    "cannot resolve, zero signal on every gate" to "compiles, lints clean, 1285
+    tests green, one known-flaky GPU test red."
+  * NOTE: a separate 15 GiB scratch `CARGO_TARGET_DIR` used earlier in the
+    session developed corrupted fingerprints (cargo reported deps fresh while
+    passing `--extern` paths rustc could not resolve, failing `raeen-gpu` with
+    `can't find crate for raeen_core`). Unrelated to this change — the same
+    build succeeds in the default `target/`. Dir deleted.
+
 - PRESENT-PLUGIN C ABI + RUNTIME LOADING — BYO plugins no longer require
   rebuilding Raeen (2026-07-25; working tree, no commit; raeen-gpu 248/248
   incl. 12 new, clippy `-D warnings` clean on raeen-gpu + raeen-gui, fmt clean):

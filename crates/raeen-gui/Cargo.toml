@@ -33,13 +33,16 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 ureq = { workspace = true }
-# Optional BYO upscaler plugin (git-ignored, not part of the repo). Present only
-# on a machine that has plugins/upscale/. Pulled in by `--features upscale-plugins`.
-raeen-upscale = { path = "../../plugins/upscale", optional = true }
+# Optional in-tree upscaler backends (spatial + vendor-runtime probes). In the
+# repo and in CI, so a clean clone always resolves; still opt-in at compile time
+# via `--features upscale-plugins`.
+raeen-upscale = { path = "../raeen-upscale", optional = true }
 
 [features]
-# Opt-in: compile in the BYO all-in-one upscaler plugin (DLSS/FSR/XeSS + spatial)
-# and register its backends at startup. Requires plugins/upscale/ to be present.
+# Opt-in: compile in the in-tree upscaler backends (spatial bilinear/bicubic/
+# sharpen, plus FSR/DLSS/XeSS vendor-runtime probes) and register them at
+# startup. Off by default so the standard build carries only the vendor-neutral
+# built-ins; nothing proprietary is linked either way.
 upscale-plugins = ["dep:raeen-upscale"]
 
 [target.'cfg(windows)'.dependencies]

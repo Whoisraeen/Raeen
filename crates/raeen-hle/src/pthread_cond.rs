@@ -1,6 +1,6 @@
 //! Host-backed pthread condition variables for concurrent native guest
 //! workers. Wait atomically releases the associated guest mutex while holding
-//! the condition generation lock, sleeps, then reacquires before returning.
+//! the condition wait-queue lock, sleeps, then reacquires before returning.
 
 use tracing::debug;
 
@@ -34,8 +34,8 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadCondBroadcast", hle_cond_broadcast);
     // The SCE spelling of destroy belongs with the rest of the real state
     // machine. `libkernel` previously bound it to a no-op that shared its
-    // handler with `CondInit`, so destroying a condition left its state (and any
-    // waiters' generation) behind.
+    // handler with `CondInit`, so destroying a condition left its state and
+    // wait queue behind.
     registry.register("libkernel", "scePthreadCondDestroy", hle_cond_destroy);
     registry.register("libScePosix", "pthread_condattr_init", hle_condattr_init);
     registry.register(
@@ -279,19 +279,26 @@ fn wait_core(ctx: &HleContext, args: &[u64], timeout: Option<std::time::Duration
     let Some(state) = condition(ctx, cond) else {
         return EINVAL;
     };
-    let mut generation = state.generation.lock();
-    let observed = *generation;
+    // Join the FIFO before releasing the guest mutex. Signal/broadcast take the
+    // same queue lock, so no wake can land in the unlock-to-wait gap.
+    let waiter = state.enqueue_waiter(ctx.guest_threads.current_thread());
     let unlock = crate::pthread_sync::mutex_unlock_for_cond(ctx, mutex);
     if unlock != OK {
+        state.cancel_waiter(&waiter);
         return unlock;
     }
     let started = std::time::Instant::now();
     let mut timed_out = false;
     let mut reported = false;
-    while *generation == observed && !ctx.guest_threads.process_is_terminating() {
-        // Forensic: a waiter that never sees its generation move is waiting on a
-        // condition nobody signals. Name the cond + the waiter so it can be
-        // matched against RAEEN_TRACE_COND's signal side.
+    let mut woken = false;
+    loop {
+        if ctx.guest_threads.process_is_terminating() {
+            state.cancel_waiter(&waiter);
+            break;
+        }
+        // Forensic: a waiter that is never selected is waiting on a condition
+        // nobody signals. Name the cond + waiter so it can be matched against
+        // RAEEN_TRACE_COND's signal side.
         if !reported
             && started.elapsed() >= std::time::Duration::from_secs(3)
             && std::env::var_os("RAEEN_TRACE_COND").is_some()
@@ -306,7 +313,7 @@ fn wait_core(ctx: &HleContext, args: &[u64], timeout: Option<std::time::Duration
                 cond = format_args!("{cond:#x}"),
                 waiter = ctx.guest_threads.current_thread(),
                 waiter_name = %name,
-                generation = observed,
+                queued = state.waiter_count(),
                 "TRACE_COND: waiting >3s — this cond has not been signalled"
             );
         }
@@ -315,10 +322,20 @@ fn wait_core(ctx: &HleContext, args: &[u64], timeout: Option<std::time::Duration
             .unwrap_or(std::time::Duration::from_millis(10))
             .min(std::time::Duration::from_millis(10));
         if timeout.is_some() && slice.is_zero() {
-            timed_out = true;
+            // Signal and timeout can race. Removing under the FIFO lock wins
+            // the timeout; if the waiter is already absent, a signaler removed
+            // and woke it while holding that same lock.
+            if state.cancel_waiter(&waiter) {
+                timed_out = true;
+            } else {
+                woken = waiter.is_signaled();
+            }
             break;
         }
-        let _wait = state.changed.wait_for(&mut generation, slice);
+        if waiter.wait_for_signal(slice) {
+            woken = true;
+            break;
+        }
         // The bounded host wait exists only so process termination is observed
         // promptly; a slice timeout is not a reason to bounce back into guest
         // code.  The previous implementation deliberately surfaced one
@@ -326,11 +343,9 @@ fn wait_core(ctx: &HleContext, args: &[u64], timeout: Option<std::time::Duration
         // meant every idle thread repeatedly reacquired its guest mutex,
         // checked a predicate and trapped back into this HLE call at 100 Hz.
         // A condition variable *may* wake spuriously, but POSIX does not require
-        // us to manufacture wakeups.  Stay parked until a real generation
-        // change, a real deadline, or process termination.
+        // us to manufacture wakeups. Stay parked until this FIFO waiter is
+        // selected, a real deadline, or process termination.
     }
-    let woken = *generation != observed;
-    drop(generation);
     note_wait_outcome(ctx, cond, woken);
     let relock = crate::pthread_sync::mutex_lock_for_cond(ctx, mutex);
     if relock != OK {
@@ -339,8 +354,8 @@ fn wait_core(ctx: &HleContext, args: &[u64], timeout: Option<std::time::Duration
     if timed_out { ETIMEDOUT } else { OK }
 }
 
-/// How long a waiter must go without its generation ever moving before it is
-/// reported as starved.
+/// How long a waiter must go without being selected before it is reported as
+/// starved.
 const COND_STARVED_AFTER: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Scan the waiting thread's stack for plausible guest return addresses and
@@ -398,7 +413,7 @@ static COND_STREAKS: std::sync::LazyLock<std::sync::Mutex<CondStreaks>> =
 /// The single-call check in [`wait_core`] cannot see this: an infinite wait
 /// deliberately returns after a 10 ms slice as a permitted spurious wakeup, so
 /// no individual call ever looks long. A starved waiter is therefore a *streak*
-/// of calls that never observe a generation change — which is exactly the shape
+/// of calls that never receive a real wake — which is exactly the shape
 /// of a stalled engine task graph (every worker parked, producer waiting on a
 /// completion nobody posts). Reported once per (cond, thread).
 fn note_wait_outcome(ctx: &HleContext, cond: u64, woken: bool) {
@@ -453,8 +468,7 @@ fn hle_cond_signal(ctx: &HleContext, args: &[u64]) -> u64 {
     let Some(state) = condition(ctx, cond) else {
         return EINVAL;
     };
-    *state.generation.lock() += 1;
-    state.changed.notify_one();
+    state.signal_one();
     trace_signal(ctx, cond, "signal");
     OK
 }
@@ -485,19 +499,22 @@ fn trace_signal(ctx: &HleContext, cond: u64, kind: &str) {
 
 /// `scePthreadCondSignalto(cond, thread)` — wake one SPECIFIC waiting thread.
 ///
-/// Raeen's condition state is a shared generation counter, not a per-waiter
-/// parking lot, so it cannot target an individual thread: this signals ONE
-/// waiter (`notify_one`) like `scePthreadCondSignal`. That is safe — every
-/// waiter re-checks its own predicate on wake (POSIX permits spurious
-/// wakeups), so the worst case is an extra loop iteration by the wrong
-/// thread, never a lost wakeup. The approximation is logged at debug.
+/// The FIFO stores the guest thread id with every waiter, so this selects the
+/// requested thread instead of waking an arbitrary worker.
 fn hle_cond_signalto(ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!(
-        "scePthreadCondSignalto(cond={:#x}, thread={}) -> signal-one approximation",
-        args.first().copied().unwrap_or(0),
-        args.get(1).copied().unwrap_or(0)
-    );
-    hle_cond_signal(ctx, args)
+    let cond = args.first().copied().unwrap_or(0);
+    let thread = args.get(1).copied().unwrap_or(0);
+    if cond == 0 || thread == 0 {
+        return EINVAL;
+    }
+    let Some(state) = condition(ctx, cond) else {
+        return EINVAL;
+    };
+    if !state.signal_thread(thread) {
+        debug!("scePthreadCondSignalto(cond={cond:#x}, thread={thread}) -> no matching waiter");
+    }
+    trace_signal(ctx, cond, "signalto");
+    OK
 }
 
 /// `pthread_cond_broadcast(cond)` — wake all waiters. Same reasoning as
@@ -510,8 +527,7 @@ fn hle_cond_broadcast(ctx: &HleContext, args: &[u64]) -> u64 {
     let Some(state) = condition(ctx, cond) else {
         return EINVAL;
     };
-    *state.generation.lock() += 1;
-    state.changed.notify_all();
+    state.broadcast();
     trace_signal(ctx, cond, "broadcast");
     OK
 }
@@ -580,6 +596,21 @@ mod tests {
         let ctx = test_ctx(&kernel, &mem, &alloc);
         assert_eq!(hle_cond_signal(&ctx, &[0x1000]), OK);
         assert_eq!(hle_cond_broadcast(&ctx, &[0x1000]), OK);
+    }
+
+    #[test]
+    fn signalto_selects_the_requested_guest_thread() {
+        let (kernel, mem, alloc) = fixture();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cond = 0x1000;
+        let state = condition(&ctx, cond).expect("static condition materialized");
+        let first = state.enqueue_waiter(11);
+        let second = state.enqueue_waiter(22);
+
+        assert_eq!(hle_cond_signalto(&ctx, &[cond, 22]), OK);
+        assert!(!first.is_signaled());
+        assert!(second.is_signaled());
+        assert_eq!(state.waiter_count(), 1);
     }
 
     #[test]
@@ -734,8 +765,7 @@ mod tests {
         std::thread::scope(|scope| {
             scope.spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(30));
-                *state.generation.lock() += 1;
-                state.changed.notify_one();
+                state.signal_one();
             });
             assert_eq!(hle_cond_wait(&ctx, &[cond, mutex]), OK);
         });

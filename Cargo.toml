@@ -13,15 +13,24 @@ members = [
     "crates/raeen-gui",
     "crates/raeen-firmware",
     "crates/raeen-runtime",
+    "crates/raeen-upscale",
     # Kyty port (docs/superpowers/plans/2026-07-13-kyty-full-port.md)
     "crates/kyty-core",
     "crates/kyty-math",
     "crates/kyty-graphics",
 ]
-# BYO, git-ignored present plugins (upscalers/frame-gen). Excluded from the
-# workspace so `cargo build --workspace` never requires them; they are pulled in
-# only as an OPTIONAL path dependency behind raeen-gui's `upscale-plugins`
-# feature. See plugins/README.md.
+# `plugins/` holds user-supplied present-plugin BINARIES, loaded at runtime
+# through the C ABI (`raeen-gpu::present_plugin::cabi`) — never Cargo path
+# dependencies. Excluded so a user dropping a crate in there cannot join the
+# workspace by accident. See plugins/README.md.
+#
+# NOTE: `exclude` alone is NOT enough to keep an out-of-tree directory from
+# breaking the build. Until 2026-07-26 `raeen-gui` carried an *optional* path
+# dependency on the git-ignored `plugins/upscale`, and Cargo resolves path
+# dependencies at manifest-load time regardless of `exclude` or of whether the
+# feature is enabled — so every clean clone and every CI run failed workspace
+# resolution outright. That crate now lives at `crates/raeen-upscale`. Do not
+# reintroduce a path dependency on anything under `plugins/`.
 exclude = ["plugins"]
 
 [workspace.package]

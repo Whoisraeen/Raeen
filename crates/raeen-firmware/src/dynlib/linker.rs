@@ -493,6 +493,7 @@ fn link_inner(
     // only tens of thousands of symbols. Provider lookup, NID resolution, and
     // marker allocation are symbol properties, so perform them once per r_sym.
     let mut import_cache: HashMap<usize, CachedImport> = HashMap::new();
+    let relocation_started = std::time::Instant::now();
 
     for reloc in &dynlib.relocations {
         let r_type = (reloc.info & 0xFFFF_FFFF) as u32;
@@ -668,19 +669,47 @@ fn link_inner(
 
         write_slot(&mut image, reloc.offset, value)?;
     }
-
-    let patched_syscalls = patch_guest_syscalls(module, &mut image)?;
-    if patched_syscalls > 0 {
+    if std::env::var_os("RAEEN_TIME_LINK").is_some() {
+        let elapsed = relocation_started.elapsed();
+        let elapsed_us = elapsed.as_micros();
+        let relocations_per_second = if elapsed.is_zero() {
+            0
+        } else {
+            (dynlib.relocations.len() as f64 / elapsed.as_secs_f64()) as u64
+        };
         tracing::info!(
-            "{}: patched {patched_syscalls} native syscall instruction(s) into Orbis traps",
-            module.name
+            module = %module.name,
+            relocations = dynlib.relocations.len(),
+            elapsed_us,
+            relocations_per_second,
+            "TIME_LINK: serial relocation application"
         );
     }
-    let patched_cpuid = patch_guest_cpuid(module, &mut image)?;
-    if patched_cpuid > 0 {
+
+    let trap_patch_started = std::time::Instant::now();
+    let patched_traps = patch_guest_traps(module, &mut image)?;
+    if patched_traps.syscalls > 0 {
         tracing::info!(
-            "{}: patched {patched_cpuid} native CPUID instruction(s) into PS5-model traps",
-            module.name
+            "{}: patched {} native syscall instruction(s) into Orbis traps",
+            module.name,
+            patched_traps.syscalls
+        );
+    }
+    if patched_traps.cpuids > 0 {
+        tracing::info!(
+            "{}: patched {} native CPUID instruction(s) into PS5-model traps",
+            module.name,
+            patched_traps.cpuids
+        );
+    }
+    if std::env::var_os("RAEEN_TIME_LINK").is_some() {
+        tracing::info!(
+            module = %module.name,
+            elapsed_us = trap_patch_started.elapsed().as_micros(),
+            decoded_segments = patched_traps.decoded_segments,
+            syscalls = patched_traps.syscalls,
+            cpuids = patched_traps.cpuids,
+            "TIME_LINK: one-pass guest trap patch"
         );
     }
 
@@ -726,42 +755,27 @@ fn link_inner(
     })
 }
 
-/// Decode file-backed executable segments and replace only instruction-boundary
-/// `syscall`s. A raw byte search is not safe: `0F 05` can occur inside an
-/// immediate or embedded table, and changing those bytes silently corrupts
-/// otherwise unrelated guest code/data.
-fn patch_guest_syscalls(module: &SprxModule, image: &mut [u8]) -> Result<usize, FirmwareError> {
-    patch_guest_instruction(
-        module,
-        image,
-        Mnemonic::Syscall,
-        [0x0F, 0x05],
-        SYSCALL_TRAP_BYTES,
-        "syscall",
-    )
+/// Decode file-backed executable segments once and replace only
+/// instruction-boundary `syscall`/`cpuid` instructions. Raw opcode bytes can
+/// occur inside immediates or embedded tables, so they are only a SIMD
+/// prefilter/bound; iced-x86 remains the authority on instruction boundaries.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GuestTrapPatchStats {
+    syscalls: usize,
+    cpuids: usize,
+    decoded_segments: usize,
 }
 
-/// Replace decoded guest `cpuid` instructions with the private PS5-model trap.
-fn patch_guest_cpuid(module: &SprxModule, image: &mut [u8]) -> Result<usize, FirmwareError> {
-    patch_guest_instruction(
-        module,
-        image,
-        Mnemonic::Cpuid,
-        [0x0F, 0xA2],
-        CPUID_TRAP_BYTES,
-        "CPUID",
-    )
-}
-
-fn patch_guest_instruction(
+fn patch_guest_traps(
     module: &SprxModule,
     image: &mut [u8],
-    mnemonic: Mnemonic,
-    opcode: [u8; 2],
-    replacement: [u8; 2],
-    name: &str,
-) -> Result<usize, FirmwareError> {
-    let mut sites = Vec::new();
+) -> Result<GuestTrapPatchStats, FirmwareError> {
+    const SYSCALL_OPCODE: [u8; 2] = [0x0F, 0x05];
+    const CPUID_OPCODE: [u8; 2] = [0x0F, 0xA2];
+
+    let mut syscall_sites = Vec::new();
+    let mut cpuid_sites = Vec::new();
+    let mut decoded_segments = 0usize;
     for segment in module
         .segments
         .iter()
@@ -786,16 +800,13 @@ fn patch_guest_instruction(
                 image.len()
             ))
         })?;
-        // Most executable dependency segments contain no syscall/CPUID at all.
-        // A SIMD memmem prefilter skips iced-x86 entirely for those segments.
-        // For a segment with candidates, stop after the final raw opcode:
-        // linear decode from the segment start still proves instruction
-        // boundaries, so an `0F 05` embedded in an immediate/table is never
-        // patched, while the often-large tail after the last candidate is free.
-        let Some(last_candidate) = memchr::memmem::rfind(bytes, &opcode) else {
+        let last_syscall = memchr::memmem::rfind(bytes, &SYSCALL_OPCODE);
+        let last_cpuid = memchr::memmem::rfind(bytes, &CPUID_OPCODE);
+        let Some(last_candidate) = last_syscall.into_iter().chain(last_cpuid).max() else {
             continue;
         };
-        let decode_len = last_candidate + opcode.len();
+        decoded_segments += 1;
+        let decode_len = last_candidate + SYSCALL_OPCODE.len();
         let mut decoder = Decoder::with_ip(
             64,
             &bytes[..decode_len],
@@ -804,12 +815,19 @@ fn patch_guest_instruction(
         );
         while decoder.can_decode() {
             let instruction = decoder.decode();
-            if instruction.mnemonic() != mnemonic {
-                continue;
-            }
+            let sites = match instruction.mnemonic() {
+                Mnemonic::Syscall => &mut syscall_sites,
+                Mnemonic::Cpuid => &mut cpuid_sites,
+                _ => continue,
+            };
             if instruction.len() != 2 {
                 return Err(FirmwareError::MalformedDynlibData(format!(
-                    "decoded {name} at {:#x} has impossible length {}",
+                    "decoded {} at {:#x} has impossible length {}",
+                    if instruction.mnemonic() == Mnemonic::Syscall {
+                        "syscall"
+                    } else {
+                        "CPUID"
+                    },
                     instruction.ip(),
                     instruction.len()
                 )));
@@ -817,19 +835,28 @@ fn patch_guest_instruction(
             let offset =
                 usize::try_from(instruction.ip().saturating_sub(segment.vaddr)).map_err(|_| {
                     FirmwareError::MalformedDynlibData(
-                        "decoded syscall offset overflows usize".to_string(),
+                        "decoded guest trap offset overflows usize".to_string(),
                     )
                 })?;
             sites.push(start + offset);
         }
     }
 
-    sites.sort_unstable();
-    sites.dedup();
-    for site in &sites {
-        image[*site..*site + replacement.len()].copy_from_slice(&replacement);
+    syscall_sites.sort_unstable();
+    syscall_sites.dedup();
+    cpuid_sites.sort_unstable();
+    cpuid_sites.dedup();
+    for site in &syscall_sites {
+        image[*site..*site + SYSCALL_TRAP_BYTES.len()].copy_from_slice(&SYSCALL_TRAP_BYTES);
     }
-    Ok(sites.len())
+    for site in &cpuid_sites {
+        image[*site..*site + CPUID_TRAP_BYTES.len()].copy_from_slice(&CPUID_TRAP_BYTES);
+    }
+    Ok(GuestTrapPatchStats {
+        syscalls: syscall_sites.len(),
+        cpuids: cpuid_sites.len(),
+        decoded_segments,
+    })
 }
 
 /// The template-relative offset a TLS relocation's symbol contributes:
@@ -1457,6 +1484,27 @@ mod tests {
 
         assert_eq!(&linked.image[1..3], &[0x0F, 0xA2]);
         assert_eq!(&linked.image[5..7], &CPUID_TRAP_BYTES);
+    }
+
+    #[test]
+    fn syscall_and_cpuid_share_one_executable_decode_pass() {
+        let mut module = test_module(15);
+        // mov eax, 0x0000050f ; syscall ; mov eax, 0x0000a20f ; cpuid ; ret
+        module.segments[0].data = vec![
+            0xB8, 0x0F, 0x05, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0x0F, 0xA2, 0x00, 0x00, 0x0F, 0xA2,
+            0xC3,
+        ];
+        let mut image = module.segments[0].data.clone();
+
+        let stats = patch_guest_traps(&module, &mut image).expect("patches traps");
+
+        assert_eq!(stats.decoded_segments, 1);
+        assert_eq!(stats.syscalls, 1);
+        assert_eq!(stats.cpuids, 1);
+        assert_eq!(&image[1..3], &[0x0F, 0x05]);
+        assert_eq!(&image[5..7], &SYSCALL_TRAP_BYTES);
+        assert_eq!(&image[8..10], &[0x0F, 0xA2]);
+        assert_eq!(&image[12..14], &CPUID_TRAP_BYTES);
     }
 
     #[test]

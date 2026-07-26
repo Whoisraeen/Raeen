@@ -1,0 +1,29 @@
+# raeen-upscale — in-tree upscaler backends for the present-plugin ABI.
+#
+# Original Rust, GPL-2.0-only, with NO proprietary dependencies: the `fsr` /
+# `dlss` / `xess` backends only *probe* for a vendor runtime by filename and
+# report unavailable when it is absent — they neither link nor load one. The
+# `bilinear` / `bicubic` / `sharpen` backends are complete and always available.
+#
+# This crate lived under the git-ignored `plugins/` tree until 2026-07-26. That
+# broke every clean clone and every CI run: `[workspace] exclude` keeps a
+# directory from being a *member*, but raeen-gui's OPTIONAL path dependency on
+# it still had to resolve at manifest-load time, and the directory was not in
+# the repository. `plugins/` is now reserved for genuinely user-supplied plugin
+# BINARIES loaded through the C ABI (see plugins/README.md); GPL-clean Rust
+# backends that Raeen ships belong here.
+[package]
+name = "raeen-upscale"
+description = "Upscaler backends for Raeen's present-plugin ABI: spatial (bilinear/bicubic/sharpen) + vendor-runtime probes (FSR/DLSS/XeSS)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# The present-plugin ABI (`PresentPlugin`, `PresentFrame`, `PluginOutput`).
+raeen-gpu = { workspace = true }
+tracing = { workspace = true }

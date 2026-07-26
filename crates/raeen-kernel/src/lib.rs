@@ -754,13 +754,55 @@ pub struct PosixSem {
     pub posted: parking_lot::Condvar,
 }
 
-/// Host-backed generation wait queue for one guest pthread condition.
+/// One guest thread parked on a [`PthreadCond`].
+///
+/// A waiter owns its wake bit so `pthread_cond_signal` can wake exactly one
+/// queued thread. A condition-wide generation counter cannot provide that
+/// contract: once incremented, every waiter observes the new generation on its
+/// next bounded host wake and a signal-one silently becomes a broadcast.
+#[derive(Debug)]
+pub struct PthreadCondWaiter {
+    thread: u64,
+    signaled: parking_lot::Mutex<bool>,
+    changed: parking_lot::Condvar,
+}
+
+impl PthreadCondWaiter {
+    fn new(thread: u64) -> Self {
+        Self {
+            thread,
+            signaled: parking_lot::Mutex::new(false),
+            changed: parking_lot::Condvar::new(),
+        }
+    }
+
+    fn wake(&self) {
+        *self.signaled.lock() = true;
+        self.changed.notify_one();
+    }
+
+    /// Whether this waiter has been selected by signal/broadcast.
+    #[must_use]
+    pub fn is_signaled(&self) -> bool {
+        *self.signaled.lock()
+    }
+
+    /// Sleep for one bounded host slice, returning true only after a real
+    /// condition-variable wake selected this waiter.
+    #[must_use]
+    pub fn wait_for_signal(&self, timeout: std::time::Duration) -> bool {
+        let mut signaled = self.signaled.lock();
+        if !*signaled {
+            self.changed.wait_for(&mut signaled, timeout);
+        }
+        *signaled
+    }
+}
+
+/// Host-backed FIFO wait queue for one guest pthread condition.
 #[derive(Debug, Default)]
 pub struct PthreadCond {
-    /// Incremented by signal/broadcast while holding `generation`'s mutex.
-    pub generation: parking_lot::Mutex<u64>,
-    /// Waiters sleep here until the generation changes.
-    pub changed: parking_lot::Condvar,
+    waiters: parking_lot::Mutex<std::collections::VecDeque<std::sync::Arc<PthreadCondWaiter>>>,
     /// Which clock this condition's `pthread_cond_timedwait` deadlines are on,
     /// as chosen by `pthread_condattr_setclock` before `pthread_cond_init`.
     ///
@@ -774,6 +816,96 @@ pub struct PthreadCond {
     /// `false` (the `Default`) is `CLOCK_REALTIME` — the POSIX default, and the
     /// right answer for a statically-initialized cond that never saw an attr.
     pub monotonic: std::sync::atomic::AtomicBool,
+}
+
+impl PthreadCond {
+    /// Join the condition's FIFO before the caller releases its guest mutex.
+    #[must_use]
+    pub fn enqueue_waiter(&self, thread: u64) -> std::sync::Arc<PthreadCondWaiter> {
+        let waiter = std::sync::Arc::new(PthreadCondWaiter::new(thread));
+        self.waiters.lock().push_back(waiter.clone());
+        waiter
+    }
+
+    /// Remove a waiter that timed out or whose process is terminating.
+    ///
+    /// False means a signaler already removed it and, because wake selection is
+    /// completed while holding the same queue lock, its private wake bit is
+    /// ready to observe.
+    pub fn cancel_waiter(&self, waiter: &std::sync::Arc<PthreadCondWaiter>) -> bool {
+        let mut waiters = self.waiters.lock();
+        let Some(position) = waiters
+            .iter()
+            .position(|candidate| std::sync::Arc::ptr_eq(candidate, waiter))
+        else {
+            return false;
+        };
+        waiters.remove(position);
+        true
+    }
+
+    /// Wake the oldest queued waiter, preserving pthread signal-one semantics.
+    pub fn signal_one(&self) -> bool {
+        let mut waiters = self.waiters.lock();
+        let Some(waiter) = waiters.pop_front() else {
+            return false;
+        };
+        waiter.wake();
+        true
+    }
+
+    /// Wake the queued waiter belonging to one guest thread.
+    pub fn signal_thread(&self, thread: u64) -> bool {
+        let mut waiters = self.waiters.lock();
+        let Some(position) = waiters.iter().position(|waiter| waiter.thread == thread) else {
+            return false;
+        };
+        let waiter = waiters
+            .remove(position)
+            .expect("position came from the same locked queue");
+        waiter.wake();
+        true
+    }
+
+    /// Wake and remove every currently queued waiter.
+    pub fn broadcast(&self) -> usize {
+        let mut waiters = self.waiters.lock();
+        let count = waiters.len();
+        for waiter in waiters.drain(..) {
+            waiter.wake();
+        }
+        count
+    }
+
+    /// Number of currently parked waiters, primarily for diagnostics/tests.
+    #[must_use]
+    pub fn waiter_count(&self) -> usize {
+        self.waiters.lock().len()
+    }
+}
+
+#[cfg(test)]
+mod pthread_cond_wait_queue_tests {
+    use super::PthreadCond;
+
+    #[test]
+    fn signal_wakes_only_the_oldest_waiter() {
+        let cond = PthreadCond::default();
+        let first = cond.enqueue_waiter(11);
+        let second = cond.enqueue_waiter(22);
+
+        assert!(cond.signal_one());
+        assert!(first.is_signaled());
+        assert!(
+            !second.is_signaled(),
+            "one condition signal must not become a delayed broadcast"
+        );
+        assert_eq!(cond.waiter_count(), 1);
+
+        assert!(cond.signal_one());
+        assert!(second.is_signaled());
+        assert_eq!(cond.waiter_count(), 0);
+    }
 }
 
 /// Runtime-rebased ELF metadata used by `sceKernelGetModuleInfoForUnwind`.

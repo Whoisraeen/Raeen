@@ -1440,12 +1440,79 @@ fn texture_view_kind(ty: u8) -> Result<(bool, bool, bool), DrawError> {
     Ok(kind)
 }
 
+/// Count of `decode_texture` calls whose T# selected a non-zero mip as the base
+/// of its view (`base_level > 0`) — i.e. draws currently sampling the WRONG LOD.
+/// See [`note_mip_view_base_level`]. Read by diagnostics; never resets.
+pub static MIP_VIEW_BASE_LEVEL_IGNORED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Name the miss when a T# asks for a view starting at a non-zero mip.
+///
+/// `ShaderTextureResource::base_level()` is decoded but **consumed nowhere**:
+/// [`decode_texture`] always reads from `base40()` and always uses the mip-0
+/// extent (`width5()+1` x `height5()+1`). So a descriptor selecting
+/// `base_level = N` is served mip 0's bytes at mip 0's dimensions — silently the
+/// wrong content, which is exactly the failure mode this module's doc comment
+/// forbids for formats and tile modes.
+///
+/// ## Why this counts instead of correcting
+///
+/// Correcting it means locating mip N inside the guest mip chain.
+/// [`crate::texture::tiling::tiled_byte_count_for_mode`] can size an individual
+/// level, so a per-level sum gets close — but real GFX10 chains pack the small
+/// levels into a **mip tail** where that sum is wrong, and the tail threshold is
+/// not derivable from anything in this tree. Emitting a guessed offset would
+/// sample unrelated memory: strictly worse than the current wrong-but-consistent
+/// mip 0, and worse than saying so.
+///
+/// It is also **unmeasured**: no tracked title is known to set `base_level > 0`.
+/// This counter is how that gets decided — run a title, read the count, and
+/// implement the addressing only if it fires. Same discipline the tile-mode
+/// refusal diagnostic established (port gated on measurement, not assumption).
+///
+/// Rate-limited per `(base_level, last_level)` pair so a hot draw loop cannot
+/// flood the log; the counter still increments on every call.
+fn note_mip_view_base_level(t: &kyty_graphics::shader::ShaderTextureResource) {
+    let base_level = t.base_level();
+    if base_level == 0 {
+        return;
+    }
+    MIP_VIEW_BASE_LEVEL_IGNORED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static WARNED: Mutex<Option<HashSet<(u8, u8)>>> = Mutex::new(None);
+    let key = (base_level, t.last_level());
+    let first = WARNED
+        .lock()
+        .map(|mut set| set.get_or_insert_with(HashSet::new).insert(key))
+        .unwrap_or(false);
+    if first {
+        tracing::warn!(
+            base_level,
+            last_level = t.last_level(),
+            base = format_args!("{:#x}", t.base40()),
+            width = u32::from(t.width5()) + 1,
+            height = u32::from(t.height5()) + 1,
+            tile_mode = t.tile_mode(),
+            "T# selects a non-zero mip as its view base, but mip addressing is \
+             NOT implemented — serving mip 0 at mip 0's extent, so this draw \
+             samples the WRONG LOD (degrade, not refuse). Further hits on this \
+             (base_level, last_level) pair are silent; see \
+             MIP_VIEW_BASE_LEVEL_IGNORED for the total."
+        );
+    }
+}
+
 /// Decode one T# into linear pixels a Vulkan sampled image can hold.
 ///
 /// Formats and tile modes are added strictly from measurement: an unhandled
 /// value is a named error carrying every raw field, so a run against the title
 /// states exactly what to implement next — a guessed format number would render
 /// silently-wrong colours, which is worse than an honest skip.
+///
+/// **Known gap, deliberately not guessed:** a T# whose `base_level > 0` is
+/// served mip 0 — see [`note_mip_view_base_level`].
 fn decode_texture(
     t: &kyty_graphics::shader::ShaderTextureResource,
 ) -> Result<TextureUpload, DrawError> {
@@ -1462,6 +1529,7 @@ fn decode_texture(
     if t.base40() == 0 {
         return Ok(placeholder_texture_dummy());
     }
+    note_mip_view_base_level(t);
     let width = u32::from(t.width5()) + 1;
     let height = u32::from(t.height5()) + 1;
     if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) {
@@ -6497,6 +6565,90 @@ mod tests {
                 "layer {l} must detile to its original pixels"
             );
         }
+    }
+
+    /// Recon rank 9: a T# selecting a non-zero mip as its view base is served
+    /// mip 0 at mip 0's extent, because `base_level()` is consumed nowhere.
+    ///
+    /// This pins the CURRENT, KNOWN-WRONG behaviour together with the counter
+    /// that makes it visible. It is deliberately not an assertion that mip
+    /// addressing works — it does not. Locating mip N needs the GFX10 mip-tail
+    /// layout, which is not derivable from anything in this tree, and a guessed
+    /// offset would sample unrelated memory (worse than a consistent mip 0).
+    ///
+    /// When mip addressing IS implemented, this test should fail and be
+    /// rewritten to assert the mip-N extent and contents. Until then the counter
+    /// is how a real title decides whether that work is needed at all.
+    #[test]
+    fn nonzero_base_level_is_counted_and_still_serves_mip_zero() {
+        use std::sync::atomic::Ordering;
+
+        let (w, h, bpp) = (8u32, 8u32, 4usize);
+        let pixels: Vec<u8> = (0..(w * h) as usize * bpp)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        // `base40()` truncates to 256 bytes, so the guest base must be
+        // 256-aligned or the decode reads BELOW the registered test range.
+        let tiled = crate::texture::tiling::tile_64kb_s(&pixels, w, h, 2);
+        let mut blob = vec![0u8; tiled.len() + 255];
+        let base = (blob.as_ptr() as u64 + 255) & !255;
+        let off = (base - blob.as_ptr() as u64) as usize;
+        blob[off..off + tiled.len()].copy_from_slice(&tiled);
+
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.update_address40(base >> 8);
+        t.fields[1] |= 10 << 20; // unified format 10 = 8_8_8_8 UNORM
+        t.fields[1] |= ((w - 1) & 3) << 30;
+        t.fields[2] = (w - 1) >> 2;
+        t.fields[2] |= (h - 1) << 14;
+        t.fields[3] |= 9 << 20; // SWIZZLE_MODE 9 = SW_64KB_S
+        t.fields[3] |= 9 << 28; // type = Texture2D
+        // The whole point: view starts at mip 2 of a 4-level chain.
+        t.fields[3] |= 2 << 12; // base_level = 2
+        t.fields[3] |= 3 << 16; // last_level = 3
+        assert_eq!(t.base_level(), 2, "the fixture must really set base_level");
+        assert_eq!(t.last_level(), 3);
+
+        let before = MIP_VIEW_BASE_LEVEL_IGNORED.load(Ordering::Relaxed);
+        let tex = crate::guest_mem::with_test_ranges(&[(blob.as_ptr() as u64, blob.len())], || {
+            decode_texture(&t)
+        })
+        .expect("a mipped T# must still decode (degrade, not refuse)");
+        let after = MIP_VIEW_BASE_LEVEL_IGNORED.load(Ordering::Relaxed);
+
+        assert_eq!(
+            after,
+            before + 1,
+            "a non-zero base_level must be COUNTED, so a title run reveals whether \
+             mip addressing is worth implementing"
+        );
+        // Documents the defect precisely: mip 2 of an 8x8 chain is 2x2, but the
+        // decode still produces the mip-0 extent from the mip-0 bytes.
+        assert_eq!(
+            (tex.width, tex.height),
+            (w, h),
+            "KNOWN WRONG: mip 2 of 8x8 is 2x2; base_level is ignored so the \
+             mip-0 extent is served. Rewrite this assertion when mip addressing lands."
+        );
+        assert_eq!(tex.pixels, pixels, "the bytes served are mip 0's");
+
+        // And a base_level of 0 must not touch the counter.
+        let mut plain = kyty_graphics::shader::ShaderTextureResource::default();
+        plain.update_address40(base >> 8);
+        plain.fields[1] |= 10 << 20;
+        plain.fields[1] |= ((w - 1) & 3) << 30;
+        plain.fields[2] = (w - 1) >> 2;
+        plain.fields[2] |= (h - 1) << 14;
+        plain.fields[3] |= 9 << 20;
+        plain.fields[3] |= 9 << 28;
+        let before = MIP_VIEW_BASE_LEVEL_IGNORED.load(Ordering::Relaxed);
+        let _ =
+            crate::guest_mem::with_test_ranges(&[(base, blob.len())], || decode_texture(&plain));
+        assert_eq!(
+            MIP_VIEW_BASE_LEVEL_IGNORED.load(Ordering::Relaxed),
+            before,
+            "base_level 0 is the ordinary case and must not be counted"
+        );
     }
 
     /// The bind-side sampled view kind is a pure function of the T# TYPE and
