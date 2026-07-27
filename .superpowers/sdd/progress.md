@@ -4644,3 +4644,42 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   explicitly NOT an M5 claim.
 * Earlier in-world hang did NOT reproduce post-fix; task reframed from
   "fix deadlock" to "re-verify over a longer session before investing".
+
+## 2026-07-27 (worktree agent) — ITEM 2 (UE5/Until Dawn): stack_chk_fail non-return + getdents/fstat layout fix
+
+* FIX 1 — hle_stack_chk_fail never returns (raeen-hle/src/libc.rs): reports
+  thread+name, guest ra, recent HLE calls, stack code-addr chain (shared
+  helper guest_stack_code_addrs factored into lib.rs, reused by
+  DebugRaiseException), releases dying thread's mutexes, then
+  request_exit(STACK_CHK_FAIL_EXIT_CODE=0xa002_0006; pub const) with
+  request_process_exit escalation fallback — dispatcher restores recovery
+  ctx at the HLE boundary so control NEVER returns to the smashed frame.
+  Tests: recording-scheduler unit test (libc.rs) + runtime acceptance
+  stack_chk_fail_unwinds_the_guest_instead_of_returning (poison tail after
+  the call; old stub surfaced POISON, i.e. the walk-into-UD2 that masked
+  Until Dawn's real cause).
+* FIX 2 — getdents packed-dirent rewrite (raeen-kernel filesystem):
+  AUDITED vs shadPS4 (reference/shadps4 NormalDirectory + file_system.cpp).
+  BUG (root cause of the 0x200-twice overflow smell): we returned ONE
+  512-byte record per call with d_reclen=512; sizeof(Orbis dirent)=264, so
+  any guest copying a record by d_reclen overflows a stack dirent by 248
+  bytes -> canary smash. Real layout: packed records d_reclen=align4(8+
+  namlen+1), records never cross 512-byte blocks, last record per block
+  absorbs slack, whole blocks per call, 0 at EOF. Empty dir = ONE 0x200
+  block (. + .. packed, reclen 12+500) then 0 — shadPS4 DOES prepend dots
+  (IterateDirectory), our dots kept (also added to "/" root listing).
+  Dir cursor is now the byte offset in position (rewinddir = lseek 0 works;
+  SEEK_END = 512-aligned listing size, matching shadPS4 lseek/fstat).
+* FIX 2b — hle_fstat directory support (raeen-hle/libkernel.rs): dir fds
+  reported ORBIS_MODE_REGULAR size 0 blksize 512 (never S_IFDIR). Now
+  S_IFDIR 0x41ff, st_size=packed listing size, st_blocks=8,
+  st_blksize=0x8000 (shadPS4 NormalDirectory::fstat values). New
+  VirtualFileSystem::is_directory(fd). CONFIRMED-CORRECT in audit: stat
+  struct offsets (mode@8 size@72 blocks@80 blksize@88), path-based
+  hle_stat dir values (65536/128/65536 = shadPS4 posix_stat), nbytes<512
+  EINVAL, nonzero d_fileno, basep semantics (byte offset before call).
+* Tests: raeen-kernel 43+2 (3 new: empty-dir repro, packed-block audit,
+  multi-block boundary), raeen-hle 445 (fstat-dir + stack_chk unit; getdents
+  test rewritten to walk packed records), raeen-runtime 77+1+47+1 (new
+  acceptance), raeen-firmware 125+11+3+3 — all green; fmt green; clippy
+  green on touched crates (kyty-graphics MSRV lint pre-existing, untouched).

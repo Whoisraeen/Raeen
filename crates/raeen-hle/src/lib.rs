@@ -518,6 +518,39 @@ pub trait GuestThreadScheduler {
     }
 }
 
+/// The thread-exit code a guest thread terminated by the HLE
+/// `__stack_chk_fail` reports: `0xa002_xxxx` fatal-family (like the
+/// `__cxa_throw` trap's `0xa002_0008`), low bits = SIGABRT (6) — the signal
+/// a real `__stack_chk_fail` dies of. Public so the runtime's acceptance
+/// test can assert the guest unwound with exactly this code instead of
+/// executing the bytes after the (noreturn) call site.
+pub const STACK_CHK_FAIL_EXIT_CODE: u64 = 0xa002_0006;
+
+/// Bounded, read-only walk of the calling guest thread's stack collecting
+/// values that look like return addresses into the composed guest image
+/// (`0x1000_0000_0000 .. +~128 GiB` window used by the linker), so a fatal
+/// report can name the call chain INTO the failing function. Diagnostic
+/// only; empty when the caller's RSP is unknown (tests, direct calls).
+pub(crate) fn guest_stack_code_addrs(ctx: &HleContext) -> Vec<String> {
+    let mut chain = Vec::new();
+    if ctx.caller_rsp == 0 {
+        return chain;
+    }
+    for i in 0..256u64 {
+        let mut buf = [0u8; 8];
+        if !ctx.mem.read(ctx.caller_rsp.wrapping_add(i * 8), &mut buf) {
+            break;
+        }
+        let val = u64::from_le_bytes(buf);
+        // Return addresses land inside the composed guest image
+        // (0x1000_0000_0000 .. +~300 MB); stack data / small ints don't.
+        if (0x1000_0000_0000..0x1000_2000_0000).contains(&val) {
+            chain.push(format!("{val:#x}"));
+        }
+    }
+    chain
+}
+
 /// Everything an HLE function may touch: the emulated kernel (memory,
 /// threads, filesystem, ...), the guest's address space, and the guest
 /// allocator.
