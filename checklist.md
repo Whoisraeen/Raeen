@@ -182,8 +182,14 @@ top-down, update statuses in place, and keep it committed.**
 - **Where:** `crates/kyty-graphics` pipeline creation path, `raeen-gpu`.
 
 ### 15. In-Shell perf HUD
-- [~] IN PROGRESS — delegated to `shell-ui` agent (worktree), 2026-07-27
-  (bundled with item 18).
+- [x] CODE DONE 2026-07-27 (commit `c6f4ed6`, merged `8a31528`; raeen-gui 185
+  green post-merge). F3 toggle + Settings ▸ Advanced row; FrameTimeStats
+  120-sample window off published-frame epochs; painter+rects top-right HUD
+  (FPS, avg/worst frame ms, flip FPS, upload/drain/fence/read/sRGB ms); no
+  puffin dependency; persisted as `general.perf_hud`.
+- [ ] LIVE VERIFY pending (verify skill, real title): F3 on/off over Minecraft,
+  plausible numbers, Settings row tracks, HUD absent on fault overlay,
+  portrait-display capture gotcha.
 - **What:** toggleable overlay: FPS, frame time (avg/p99), guest CPU core
   usage, upload/present µs (values already measured ad-hoc via puffin scopes
   `execute_dcb_cp` / `publish_frame` / `shell_update` and `egui_upload_us`).
@@ -206,11 +212,13 @@ top-down, update statuses in place, and keep it committed.**
   Tier-B necessity AND user delight.
 
 ### 18. Screenshot hotkey
-- [~] IN PROGRESS — delegated to `shell-ui` agent (worktree), 2026-07-27
-  (bundled with item 15).
-- **What:** hotkey + pad chord dumps the current presented frame (Shell
-  already owns the published frame buffer) to `screenshots/` with title id +
-  timestamp; toast on success (egui-notify already wired).
+- [x] CODE DONE 2026-07-27 (commit `c6f4ed6`, merged `8a31528`). F12 anywhere +
+  pad Create rising edge in-session (press still forwarded to guest); dumps
+  published guest frame to `screenshots/<id>_<UTC>.png` (image crate, refuses
+  non-RGBA8/truncated); toasts; `screenshots/` gitignored. 4 tests + config
+  persistence test.
+- [ ] LIVE VERIFY pending: F12/Create toast + PNG on disk during a session;
+  no-session info toast on Home.
 
 ### 19. DualSense passthrough
 - [ ] Rumble first (gilrs ff or hidapi), then haptics/adaptive triggers via
@@ -219,8 +227,11 @@ top-down, update statuses in place, and keep it committed.**
   audit).
 
 ### 20. Auto-updater
-- [ ] Close the loop on the existing "update staged" toast: download →
-  hash-verify → swap on next restart. Windows-first.
+- [x] LANDED VIA PARALLEL SESSION (Codex, commit `0e77a65` lineage):
+  `crates/raeen-gui/src/updater.rs` — release parsing (rejects plain-HTTP,
+  bad JSON/tags), swap script (waits, swaps, relaunches, self-deletes),
+  Inno Setup installer assets. Tests green in the 185-test raeen-gui suite.
+- [ ] Verify end-to-end against a real GitHub release when one exists.
 
 ### 21. Video clip capture (stretch, after 18)
 - [ ] Rolling ring of recent frames → mp4 on hotkey. Only after screenshot +
