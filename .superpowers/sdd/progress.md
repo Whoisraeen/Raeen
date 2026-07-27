@@ -4624,3 +4624,23 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
 * NOTE: the parallel Codex session committed most of this session's earlier
   work (37d0449 plugin ABI v2/GPU frames, d87765a crash reporting+sysinfo,
   b3e7277 sound packs+memmap, 6a13734 savedata/video sync).
+
+## 2026-07-27 (final) — M4 MET; direct-sgprs fix takes Minecraft 4 -> 56 FPS
+* SHADER FIX (commit d21e727): `ps: direct sgprs` was a STAGE ASYMMETRY, not
+  missing functionality. VS never rejected direct user SGPRs; CS already
+  exempted `next_gen`; PS rejected unconditionally — while the consuming
+  push-constant path (shader_calc_binding_indices -> push_constant_size) is
+  stage-agnostic. One guard + a test (next_gen allowed / legacy still
+  rejected). 477 kyty-graphics tests green.
+  MEASURED IN-GAME: Minecraft in-world **56 FPS** (baseline 4 FPS) with real
+  block textures instead of flat colour. The two fixes compound: parking
+  (eef31c1) freed the cores, direct-sgprs (d21e727) stopped skipping the
+  draws.
+* M4: **MET**. Acceptance artifact written: `docs/m4-acceptance-minecraft.md`
+  (reproduce steps, the five observations, and the "logs are actionable"
+  clause demonstrated BY OUTCOME — both blockers this session were located
+  from log lines alone). Honest limitations recorded: not a perf claim, no
+  soak test, rendering recognisable-not-correct, synthetic pad input, and
+  explicitly NOT an M5 claim.
+* Earlier in-world hang did NOT reproduce post-fix; task reframed from
+  "fix deadlock" to "re-verify over a longer session before investing".
