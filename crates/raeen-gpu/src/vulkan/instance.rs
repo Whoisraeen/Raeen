@@ -93,6 +93,12 @@ pub struct VulkanDevice {
     depth_range_unrestricted: bool,
     /// Whether the validation layer was actually enabled.
     validation_enabled: bool,
+    /// `VK_EXT_external_memory_host` support: the required host-pointer
+    /// alignment when the extension is enabled, `None` when it is absent.
+    /// `Some` is what lets the present path import the frame-IPC mapping and
+    /// copy the finished frame straight into it (phase 1 of the GPU-resident
+    /// present plan).
+    imported_host_pointer_alignment: Option<vk::DeviceSize>,
 }
 
 impl VulkanDevice {
@@ -132,14 +138,20 @@ impl VulkanDevice {
         // From here on, any early return must not leak the instance, so each
         // fallible step cleans up explicitly via `destroy_partial`.
         let result = Self::pick_and_create_device(&entry, &instance);
-        let (physical_device, device, queue_family_index, device_name, depth_range_unrestricted) =
-            match result {
-                Ok(v) => v,
-                Err(e) => {
-                    Self::destroy_partial(&instance, debug);
-                    return Err(e);
-                }
-            };
+        let (
+            physical_device,
+            device,
+            queue_family_index,
+            device_name,
+            depth_range_unrestricted,
+            imported_host_pointer_alignment,
+        ) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                Self::destroy_partial(&instance, debug);
+                return Err(e);
+            }
+        };
 
         // SAFETY: `queue_family_index` came from the queue-family enumeration
         // for `physical_device` and was requested in `device`'s create info
@@ -265,6 +277,7 @@ impl VulkanDevice {
             debug,
             device_name,
             depth_range_unrestricted,
+            imported_host_pointer_alignment,
             max_push_constants_size,
             validation_enabled,
         })
@@ -368,6 +381,21 @@ impl VulkanDevice {
     /// Needed by the presentation path to check surface support on this family.
     pub fn queue_family_index(&self) -> u32 {
         self.queue_family_index
+    }
+
+    /// Host-pointer alignment required to import ordinary host memory as
+    /// `VkDeviceMemory` (`VK_EXT_external_memory_host`), or `None` when the
+    /// device lacks the extension.
+    ///
+    /// A `Some(align)` means the present path *can* import the frame-IPC
+    /// shared mapping and have the GPU copy finished frames straight into the
+    /// slot the Shell reads, instead of copying image -> staging buffer ->
+    /// `Vec` -> IPC slot. The importing pointer must be `align`-aligned and
+    /// the imported size a multiple of it. Measured on a Radeon 760M:
+    /// available, `align == 4096` (one page).
+    #[must_use]
+    pub(crate) fn imported_host_pointer_alignment(&self) -> Option<vk::DeviceSize> {
+        self.imported_host_pointer_alignment
     }
 
     /// The device's sub-allocating memory allocator (`None` if creation
@@ -536,7 +564,17 @@ impl VulkanDevice {
     fn pick_and_create_device(
         _entry: &Entry,
         instance: &Instance,
-    ) -> Result<(vk::PhysicalDevice, Device, u32, String, bool), GpuError> {
+    ) -> Result<
+        (
+            vk::PhysicalDevice,
+            Device,
+            u32,
+            String,
+            bool,
+            Option<vk::DeviceSize>,
+        ),
+        GpuError,
+    > {
         // SAFETY: `instance` is live; enumeration only fills a Vec of handles.
         let devices = unsafe { instance.enumerate_physical_devices() }
             .map_err(|e| GpuError::VulkanInitFailed(format!("device enumeration failed: {e}")))?;
@@ -606,12 +644,22 @@ impl VulkanDevice {
         // defined (return 0), so one bad guest dispatch degrades to a wrong
         // pixel instead of taking the device down.
         let robustness2 = has_device_ext(c"VK_EXT_robustness2");
+        // VK_EXT_external_memory_host lets us import ordinary host memory (the
+        // frame-IPC shared mapping) as VkDeviceMemory, so the present readback
+        // can `vkCmdCopyImageToBuffer` STRAIGHT into the slot the Shell reads —
+        // collapsing the readback copy and the IPC memcpy into one GPU-side
+        // copy. See docs/superpowers/plans/2026-07-27-gpu-resident-present.md
+        // (phase 1). Absent it, the existing copy path is used unchanged.
+        let external_memory_host = has_device_ext(c"VK_EXT_external_memory_host");
         let mut extension_names: Vec<*const i8> = Vec::new();
         if depth_range_unrestricted {
             extension_names.push(c"VK_EXT_depth_range_unrestricted".as_ptr());
         }
         if robustness2 {
             extension_names.push(c"VK_EXT_robustness2".as_ptr());
+        }
+        if external_memory_host {
+            extension_names.push(c"VK_EXT_external_memory_host".as_ptr());
         }
 
         let priorities = [1.0f32];
@@ -687,12 +735,30 @@ impl VulkanDevice {
         let device = unsafe { instance.create_device(physical_device, &create_info, None) }
             .map_err(|e| GpuError::VulkanInitFailed(format!("vkCreateDevice failed: {e}")))?;
 
+        // Query the host-pointer alignment the driver demands for imported
+        // memory; without the extension there is nothing to import into.
+        let imported_host_pointer_alignment = external_memory_host.then(|| {
+            let mut host_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut host_props);
+            // SAFETY: `pd` is valid for this instance; the chain is a live local.
+            unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+            host_props.min_imported_host_pointer_alignment
+        });
+        info!(
+            "VK_EXT_external_memory_host: {}",
+            match imported_host_pointer_alignment {
+                Some(a) => format!("available (min host-pointer alignment {a} B)"),
+                None => "unavailable — present keeps the buffered copy path".to_string(),
+            }
+        );
+
         Ok((
             physical_device,
             device,
             queue_family_index,
             device_name,
             depth_range_unrestricted,
+            imported_host_pointer_alignment,
         ))
     }
 

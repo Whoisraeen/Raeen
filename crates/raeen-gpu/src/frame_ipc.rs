@@ -41,16 +41,36 @@ mod platform {
     };
 
     const MAGIC: u32 = u32::from_le_bytes(*b"RAEF");
-    const VERSION: u32 = 5;
-    // Input occupies bytes 48..60. Keep the independent VideoOut counter
-    // naturally aligned at 64 and start pixel slots after the full header.
-    const HEADER_BYTES: usize = 104;
+    // v6: the header was padded from 104 B to a full page so every pixel slot
+    // starts page-aligned (see `HEADER_BYTES`). Field offsets are unchanged —
+    // only the padding after them grew — but a v5 peer would read pixels at
+    // the wrong offset, so the version gate must reject it.
+    const VERSION: u32 = 6;
+    // Input occupies bytes 48..60 and the timing counters run to 104; the rest
+    // of this page is padding.
+    //
+    // A FULL PAGE, not the 104 B the fields need, so that each pixel slot
+    // begins on a page boundary. `VK_EXT_external_memory_host` can only import
+    // a host pointer aligned to `minImportedHostPointerAlignment` (measured:
+    // 4096 B on a Radeon 760M), and phase 1 of the GPU-resident present plan
+    // imports a slot so the GPU can copy the finished frame straight into it
+    // instead of going image -> staging buffer -> Vec -> memcpy here. At the
+    // old 104 B header every slot started at 104 mod 4096 and was therefore
+    // unimportable. `PIXEL_CAPACITY` is itself a multiple of the page size, so
+    // aligning the header aligns every slot.
+    const HEADER_BYTES: usize = 4096;
     // One slot covers an 8K RGBA8 frame (126.6 MiB) with room to spare. Keeping
     // each slot tight makes the two-slot mapping only slightly larger than the
     // old single 256-MiB slot.
     const PIXEL_CAPACITY: usize = 136 * 1024 * 1024;
     const FRAME_SLOTS: usize = 2;
     const MAPPING_BYTES: usize = HEADER_BYTES + PIXEL_CAPACITY * FRAME_SLOTS;
+
+    /// Host-pointer alignment every pixel slot satisfies. Kept as a named
+    /// constant so the import path can assert against it and so a future
+    /// header change that breaks alignment fails the test below, not a driver
+    /// call at runtime.
+    pub(crate) const SLOT_ALIGNMENT: usize = 4096;
 
     const MAGIC_OFFSET: usize = 0;
     const VERSION_OFFSET: usize = 4;
@@ -602,6 +622,45 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Every pixel slot must start on a `SLOT_ALIGNMENT` boundary, or
+        /// `VK_EXT_external_memory_host` cannot import it and the GPU-resident
+        /// present fast path silently degrades to the buffered copy.
+        ///
+        /// This is a layout invariant, so it is asserted on the constants
+        /// rather than on a live mapping: a future header edit that adds a
+        /// field and pushes `HEADER_BYTES` off a page boundary fails here
+        /// instead of at a driver call on someone's machine.
+        #[test]
+        fn every_pixel_slot_is_import_aligned() {
+            assert!(
+                SLOT_ALIGNMENT.is_power_of_two(),
+                "alignment must be a power of two"
+            );
+            assert_eq!(
+                HEADER_BYTES % SLOT_ALIGNMENT,
+                0,
+                "header must be a whole number of pages so slot 0 is aligned"
+            );
+            assert_eq!(
+                PIXEL_CAPACITY % SLOT_ALIGNMENT,
+                0,
+                "slot stride must be a multiple of the alignment so every later slot stays aligned"
+            );
+            for slot in 0..FRAME_SLOTS {
+                let offset = HEADER_BYTES + slot * PIXEL_CAPACITY;
+                assert_eq!(
+                    offset % SLOT_ALIGNMENT,
+                    0,
+                    "slot {slot} starts at {offset}, which is not {SLOT_ALIGNMENT}-aligned"
+                );
+            }
+            // The header fields must still fit in the padded header.
+            assert!(
+                SRGB_ENCODE_US_OFFSET + 8 <= HEADER_BYTES,
+                "header fields overflow the padded header"
+            );
+        }
 
         #[test]
         fn complete_frame_round_trips_between_runner_and_shell_mapping() {

@@ -32,13 +32,59 @@ The readback (1) additionally serializes the GPU behind a fence.
   CPU-kind delivery is live; the contract does not change when GPU frames
   arrive — the host just starts setting `RAEEN_HOST_GPU_FRAMES`.
 
+## Phase 1 groundwork — LANDED and measured (2026-07-27)
+
+Two prerequisites are done, both tested:
+
+- **The capability exists here.** `VK_EXT_external_memory_host` is detected
+  and enabled on the logical device, and
+  `minImportedHostPointerAlignment` is queried and exposed as
+  `VulkanDevice::imported_host_pointer_alignment()`. **Measured on the dev
+  machine's Radeon 760M: available, alignment 4096 B (one page).** Pinned by
+  `crates/raeen-gpu/tests/external_memory_host.rs`, which passes (reporting)
+  on devices without the extension rather than failing.
+- **The IPC slots are now importable.** They were not: `HEADER_BYTES` was
+  104, so every slot began at `104 mod 4096` and no slot pointer could ever
+  be imported. The header is padded to a full page (**IPC version 5 → 6**;
+  field offsets unchanged, only the padding after them grew), so slot 0 is
+  page-aligned and — since `PIXEL_CAPACITY` is itself a page multiple — so is
+  every later slot. Invariant pinned by
+  `frame_ipc::platform::tests::every_pixel_slot_is_import_aligned`.
+
+## The real obstacle to finishing phase 1 (measured, not assumed)
+
+It is **not** Vulkan — it is frame ownership. `RenderedImage.pixels` is an
+owned `Vec<u8>`, and **~143 sites across 8 files** read it: the present
+plugin ABI (which hands `&[u8]` to out-of-tree plugins), the GPU-resource and
+frame dumps, `last_image()`, the compute writeback path, the Shell's upload,
+and the test suite.
+
+If the GPU copies straight into the IPC slot, the runner never materialises
+that `Vec`, so every one of those consumers needs a source. Two candidate
+designs, neither trivial:
+
+- **Borrowed frames** — make `RenderedImage` hold either an owned `Vec` or a
+  borrow of the mapped slot. Touches every consumer's signature and adds a
+  lifetime to a type that currently crosses an `Arc` and a process boundary.
+- **Read-on-demand** — keep the copy, but only when a consumer actually asks
+  (no plugin, no dump ⇒ no CPU touch at all). Smaller blast radius, and it
+  preserves the fast path for the common case, at the cost of a branch and a
+  cached-copy slot.
+
+Read-on-demand looks correct: the *common* frame has no plugin and no dump,
+so it should cost zero CPU copies, while a plugin frame pays exactly one.
+
+**Do not attempt the remaining wiring as a quick change.** It is a
+frame-ownership refactor with a live crash-isolation boundary underneath it,
+and it wants its own session and its own soak test.
+
 ## Remaining phases
 
 1. **Kill the child-side CPU hop into the slot** (keeps the process split):
-   import the IPC mapping into Vulkan via `VK_EXT_external_memory_host` and
-   `vkCmdCopyImageToBuffer` straight into the shared slot — readback and IPC
-   copy become one GPU-side copy. Slot/seqlock discipline must move to the
-   GPU timeline (write the sequence number after the copy's fence).
+   `vkCmdCopyImageToBuffer` straight into the imported shared slot — readback
+   and IPC copy become one GPU-side copy. Slot/seqlock discipline must move to
+   the GPU timeline (write the sequence number after the copy's fence).
+   *Blocked on the frame-ownership decision above, not on any driver feature.*
 2. **Cross-process GPU sharing** (removes the CPU from the path entirely):
    child exports the color image (`VK_KHR_external_memory_win32`, keyed
    mutex or timeline-semaphore sync), Shell imports it into egui's wgpu
