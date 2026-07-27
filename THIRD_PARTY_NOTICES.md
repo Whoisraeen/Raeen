@@ -262,6 +262,19 @@ Only licenses compatible with GPL-2.0-only are used.
 
 ---
 
+## Algorithms implemented from published descriptions (no code copied)
+
+- **AMD FidelityFX Super Resolution 1.0 (FSR1)** — MIT (GPL-2.0 compatible).
+  `raeen-upscale`'s `fsr` backend (`spatial::fsr1`) implements FSR1's two-pass
+  *approach* — EASU (edge-adaptive spatial upsampling) followed by RCAS
+  (robust contrast-adaptive sharpening) — written from the published
+  description of the algorithm. **AMD's shader source was not copied or
+  ported**, so the result is FSR1-*class* and deliberately not bit-identical
+  to AMD's implementation. FSR1 is spatial-only: no motion vectors, no vendor
+  runtime, which is why it can ship in-tree at all where DLSS and XeSS cannot.
+
+---
+
 ## Not incorporated (ecosystem references only)
 
 The following projects were evaluated. Their **code is not used** in Raeen —

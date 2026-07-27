@@ -22,25 +22,35 @@
 //! | `bilinear`  | 2×2 linear spatial upscale                   | ✅ yes        |
 //! | `bicubic`   | 4×4 Catmull-Rom spatial upscale (sharper)    | ✅ yes        |
 //! | `sharpen`   | unsharp pass at native resolution            | ✅ yes        |
-//! | `fsr`       | AMD FidelityFX Super Resolution              | ⏳ vendor+MV  |
+//! | `fsr`       | FSR1-class edge-adaptive upscale (EASU+RCAS) | ✅ yes        |
 //! | `dlss`      | NVIDIA DLSS Super Resolution                 | ⏳ vendor+MV  |
 //! | `xess`      | Intel XeSS                                    | ⏳ vendor+MV  |
 //!
-//! ## Honest status of the vendor backends
+//! ## Why `fsr` works but `dlss`/`xess` do not
 //!
-//! `fsr` / `dlss` / `xess` are **GPU + motion-vector** techniques. Two things
-//! must exist for them to run for real: (1) the vendor runtime (`nvngx_dlss.dll`
-//! for DLSS, the FidelityFX runtime for FSR, `libxess.dll` for XeSS), which the
-//! **user** supplies — Raeen never ships or fetches it; and (2) per-pixel motion
-//! vectors + depth exposed to the plugin, which the present ABI reserves
-//! (`PresentFrame::motion`/`depth`) but does not yet populate (they come from
-//! the PM4 stream — a follow-up in the main app).
+//! They are not the same kind of thing, and lumping them together was wrong.
 //!
-//! Until both are present, each vendor backend detects its runtime, logs its
-//! state **once**, and produces a real image via the best spatial path
-//! (`bicubic`) so selecting it is never a black screen. This is deliberate: the
-//! selection + hook are real now; the vendor inference activates transparently
-//! once its two prerequisites land.
+//! **FSR1 is spatial.** It needs no motion vectors, no history, and no vendor
+//! runtime — just the current frame. It is also MIT-licensed, and MIT is
+//! GPL-2.0 compatible, so it can live in-tree. `fsr` therefore runs for real
+//! today: an EASU-class edge-adaptive upsample followed by an RCAS-class
+//! contrast-adaptive sharpen (see [`spatial::fsr1`]). This is an original
+//! implementation written against the published description of that two-pass
+//! approach, not a port of AMD's shader source, so it is FSR1-*class* rather
+//! than bit-identical.
+//!
+//! **DLSS and XeSS are temporal and closed.** Each needs (1) a vendor runtime
+//! (`nvngx_dlss.dll`, `libxess.dll`) that the **user** supplies — Raeen never
+//! ships or fetches it — and (2) per-pixel motion vectors + depth, which the
+//! present ABI reserves (`PresentFrame::motion`/`depth`) but does not yet
+//! populate (they come from the PM4 stream — a follow-up in the main app).
+//! Until both exist they detect their runtime, log their state **once**, and
+//! produce a real image via `bicubic` so selecting one is never a black
+//! screen. DLSS additionally requires NVIDIA RTX hardware, so it cannot run on
+//! an AMD or Intel GPU at all regardless of this crate.
+//!
+//! FSR2/3 are temporal like DLSS and are therefore **not** what `fsr` runs;
+//! they would need the same motion-vector work.
 //!
 //! ## License
 //!
@@ -200,6 +210,11 @@ impl Vendor {
     }
 }
 
+/// RCAS sharpness for the FSR1 path. AMD's own default sits mid-range;
+/// stronger values start to look crunchy on the 2D UI layers that PS5 titles
+/// composite at native resolution.
+const FSR_SHARPNESS: f32 = 0.5;
+
 /// A vendor (DLSS/FSR/XeSS) upscaler. Real inference needs the vendor runtime
 /// on disk **and** motion vectors from the ABI; until both are present it logs
 /// its state once and produces a real image via the bicubic spatial path.
@@ -238,6 +253,13 @@ impl VendorUpscaler {
         if self.logged.swap(true, Ordering::Relaxed) {
             return;
         }
+        if matches!(self.vendor, Vendor::Fsr) {
+            // FSR1 is spatial — no runtime, no motion vectors, no fallback.
+            tracing::info!(
+                "raeen-upscale/fsr: running FSR1-class edge-adaptive upscale                  (EASU + RCAS) in-tree — no vendor runtime required"
+            );
+            return;
+        }
         let have_runtime = self.runtime_present();
         let have_mv = frame.motion.is_some() && frame.depth.is_some();
         if have_runtime && have_mv {
@@ -266,28 +288,50 @@ impl PresentPlugin for VendorUpscaler {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             upscale: true,
-            frame_gen: matches!(self.vendor, Vendor::Dlss | Vendor::Fsr),
-            wants_depth: true,
-            wants_motion_vectors: true,
+            // FSR1 (what we actually run for `fsr`) is a spatial technique: it
+            // generates no frames and needs neither depth nor motion vectors.
+            // Advertising otherwise would make the Shell claim capabilities
+            // this build cannot deliver. DLSS/XeSS keep the temporal wants,
+            // which is exactly why they still cannot run here.
+            frame_gen: matches!(self.vendor, Vendor::Dlss),
+            wants_depth: !matches!(self.vendor, Vendor::Fsr),
+            wants_motion_vectors: !matches!(self.vendor, Vendor::Fsr),
+            gpu_frames: false,
         }
     }
     fn process(&mut self, frame: &PresentFrame<'_>, ctx: &PresentContext) -> PluginOutput {
         self.log_state_once(frame);
-        // Prerequisites for real vendor inference are not both met yet; produce
-        // a genuine image via the best spatial path so the selection is usable.
         let (dw, dh) = target_dims(frame, ctx);
         if (dw, dh) == (frame.width, frame.height) {
             return PluginOutput::identity(frame);
         }
-        let pixels = spatial::resample(
-            frame.color,
-            frame.width,
-            frame.height,
-            dw,
-            dh,
-            frame.bytes_per_pixel,
-            Kernel::Bicubic,
-        );
+        let pixels = if matches!(self.vendor, Vendor::Fsr) {
+            // FSR1 runs for real, in-tree, right now: it is spatial, so it
+            // needs no vendor runtime and no motion vectors — the two things
+            // that block DLSS/XeSS. See `spatial::fsr1`.
+            spatial::fsr1(
+                frame.color,
+                frame.width,
+                frame.height,
+                dw,
+                dh,
+                frame.bytes_per_pixel,
+                FSR_SHARPNESS,
+            )
+        } else {
+            // DLSS/XeSS: prerequisites (vendor runtime + motion vectors) are
+            // not met, so produce a genuine image via the best spatial path
+            // rather than a black frame.
+            spatial::resample(
+                frame.color,
+                frame.width,
+                frame.height,
+                dw,
+                dh,
+                frame.bytes_per_pixel,
+                Kernel::Bicubic,
+            )
+        };
         PluginOutput {
             primary: PluginFrame {
                 width: dw,

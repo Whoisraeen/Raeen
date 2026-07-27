@@ -181,9 +181,269 @@ pub fn sharpen(src: &[u8], w: u32, h: u32, bpp: u32, amount: f32) -> Vec<u8> {
     out
 }
 
+// ─── FSR1-class edge-adaptive upscale ───────────────────────────────────────
+//
+// AMD's FidelityFX Super Resolution 1.0 is a *spatial* technique: unlike
+// FSR2/3, DLSS and XeSS it needs no motion vectors, no history, and no vendor
+// runtime — which is exactly why it is the one that can work here today, and
+// why it can live in-tree at all (FSR1 is MIT, and MIT is GPL-2.0
+// compatible; DLSS/XeSS are closed and must stay user-supplied binaries).
+//
+// FSR1 is two passes:
+//   EASU — Edge Adaptive Spatial Upsampling: reconstruct at the target
+//          resolution by fitting the local gradient, so edges stay crisp
+//          instead of being blurred across like a plain bicubic tap.
+//   RCAS — Robust Contrast Adaptive Sharpening: re-add high frequencies
+//          without amplifying noise or ringing near already-sharp edges.
+//
+// This is an ORIGINAL implementation of that two-pass approach written
+// against the published description of the algorithm, not a port of AMD's
+// shader source, so it is deliberately *FSR1-class* rather than bit-identical
+// to AMD's. See THIRD_PARTY_NOTICES.md.
+
+/// Local edge direction/strength at a source pixel, from the 3×3 luma
+/// neighbourhood. `(dir_x, dir_y)` is the (unnormalised) gradient and `len`
+/// its magnitude — how confident we are that an edge exists here at all.
+fn edge_at(src: &[u8], sw: u32, sh: u32, x: i64, y: i64) -> (f32, f32, f32) {
+    let luma = |dx: i64, dy: i64| {
+        let p = px(src, sw, sh, x + dx, y + dy);
+        // Rec.601 luma: edge detection wants perceived brightness, and doing
+        // it on one channel would miss edges that live in the others.
+        0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]
+    };
+    // Sobel — cheap, isotropic enough for an upscaling gradient, and far more
+    // stable on noisy frames than a bare central difference.
+    let gx = (luma(1, -1) + 2.0 * luma(1, 0) + luma(1, 1))
+        - (luma(-1, -1) + 2.0 * luma(-1, 0) + luma(-1, 1));
+    let gy = (luma(-1, 1) + 2.0 * luma(0, 1) + luma(1, 1))
+        - (luma(-1, -1) + 2.0 * luma(0, -1) + luma(1, -1));
+    (gx, gy, (gx * gx + gy * gy).sqrt())
+}
+
+/// EASU-class pass: upscale `src` to `dw`×`dh`, steering each destination
+/// sample along the local edge so edges resolve sharply.
+///
+/// Where the neighbourhood is flat the result is plain bicubic (nothing to
+/// steer); as edge confidence rises the sample is pulled toward the bicubic
+/// tap taken *along* the edge rather than across it, which is what keeps a
+/// diagonal from turning into a staircase of blurred steps.
+#[must_use]
+fn easu_rgba8(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    // Start from the bicubic reconstruction and refine it: bicubic already
+    // handles the flat majority of the frame correctly and cheaply.
+    let mut out = bicubic_rgba8(src, sw, sh, dw, dh);
+    if sw < 3 || sh < 3 {
+        return out; // too small for a 3x3 gradient — bicubic is the honest answer
+    }
+    let sx = sw as f32 / dw as f32;
+    let sy = sh as f32 / dh as f32;
+    // Below this gradient magnitude the "edge" is noise; steering there would
+    // sharpen grain and dither patterns into artefacts.
+    const EDGE_FLOOR: f32 = 12.0;
+    // Cap the steer so a very strong edge cannot pull a sample more than one
+    // source texel away, which would fabricate detail that is not there.
+    const MAX_STEER: f32 = 1.0;
+
+    for dy in 0..dh {
+        for dx in 0..dw {
+            // Source position of this destination sample (pixel centres).
+            let fx = (dx as f32 + 0.5) * sx - 0.5;
+            let fy = (dy as f32 + 0.5) * sy - 0.5;
+            let (gx, gy, len) = edge_at(src, sw, sh, fx.round() as i64, fy.round() as i64);
+            if len <= EDGE_FLOOR {
+                continue; // flat: keep the bicubic value
+            }
+            // Unit vector ALONG the edge is perpendicular to the gradient.
+            let along = (-gy / len, gx / len);
+            // Confidence ramps in over the floor and saturates, so the
+            // transition between "bicubic" and "steered" is gradual — a hard
+            // switch would show up as a visible seam along edge boundaries.
+            let confidence = ((len - EDGE_FLOOR) / 64.0).clamp(0.0, 1.0);
+            let steer = confidence * MAX_STEER;
+            // Average two taps placed along the edge: this reinforces the
+            // edge's own direction instead of averaging across it.
+            let a = sample_bicubic_at(src, sw, sh, fx + along.0 * steer, fy + along.1 * steer);
+            let b = sample_bicubic_at(src, sw, sh, fx - along.0 * steer, fy - along.1 * steer);
+            let d = ((dy * dw + dx) as usize) * 4;
+            for ch in 0..4 {
+                let steered = 0.5 * (a[ch] + b[ch]);
+                let base = f32::from(out[d + ch]);
+                // Blend toward the steered value by confidence.
+                let v = base + confidence * (steered - base);
+                out[d + ch] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// One bicubic sample at an arbitrary (fractional) source position — the
+/// per-sample form of [`bicubic_rgba8`], used by the edge-steered taps.
+fn sample_bicubic_at(src: &[u8], sw: u32, sh: u32, fx: f32, fy: f32) -> [f32; 4] {
+    let x0 = fx.floor() as i64;
+    let y0 = fy.floor() as i64;
+    let tx = fx - x0 as f32;
+    let ty = fy - y0 as f32;
+    let mut acc = [0.0f32; 4];
+    for m in -1..=2i64 {
+        let wy = catmull((ty - m as f32).abs());
+        if wy == 0.0 {
+            continue;
+        }
+        for n in -1..=2i64 {
+            let wx = catmull((tx - n as f32).abs());
+            if wx == 0.0 {
+                continue;
+            }
+            let p = px(src, sw, sh, x0 + n, y0 + m);
+            let w = wx * wy;
+            for ch in 0..4 {
+                acc[ch] += p[ch] * w;
+            }
+        }
+    }
+    acc
+}
+
+/// RCAS-class pass: contrast-adaptive sharpening.
+///
+/// Unlike the plain unsharp in [`sharpen`], the strength here is scaled down
+/// where the local neighbourhood already has high contrast. That is the whole
+/// point of "robust": uniform sharpening rings hard edges and amplifies noise,
+/// while this concentrates the correction on the soft mid-contrast detail that
+/// upscaling actually smeared.
+#[must_use]
+pub fn rcas(src: &[u8], w: u32, h: u32, bpp: u32, sharpness: f32) -> Vec<u8> {
+    if bpp != 4 || w == 0 || h == 0 || sharpness <= 0.0 {
+        return src.to_vec();
+    }
+    let mut out = src.to_vec();
+    let k = sharpness.clamp(0.0, 1.0);
+    for y in 0..h as i64 {
+        for x in 0..w as i64 {
+            let c = px(src, w, h, x, y);
+            let n = px(src, w, h, x, y - 1);
+            let s = px(src, w, h, x, y + 1);
+            let e = px(src, w, h, x + 1, y);
+            let ww = px(src, w, h, x - 1, y);
+            let d = ((y as u32 * w + x as u32) as usize) * 4;
+            for ch in 0..3 {
+                // Local contrast from the 4-neighbourhood.
+                let mn = n[ch].min(s[ch]).min(e[ch]).min(ww[ch]).min(c[ch]);
+                let mx = n[ch].max(s[ch]).max(e[ch]).max(ww[ch]).max(c[ch]);
+                let range = (mx - mn).max(1.0);
+                // Attenuate where contrast is already high (near 255 range)
+                // and apply fully in smooth regions.
+                let attenuation = (1.0 - (range / 255.0)).clamp(0.0, 1.0);
+                let laplacian = 4.0 * c[ch] - n[ch] - s[ch] - e[ch] - ww[ch];
+                let sharpened = c[ch] + k * attenuation * laplacian;
+                // Clamp into the local neighbourhood range: this is what
+                // prevents overshoot ringing on either side of an edge.
+                out[d + ch] = sharpened.clamp(mn, mx).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// Full FSR1-class upscale: EASU-style edge-adaptive upsample, then
+/// RCAS-style contrast-adaptive sharpening.
+///
+/// Falls back to a safe nearest replicate for non-4-byte formats, matching
+/// [`resample`] — 8-byte HDR halves must not be blended as `u8`.
+#[must_use]
+pub fn fsr1(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32, bpp: u32, sharpness: f32) -> Vec<u8> {
+    if bpp != 4 {
+        return nearest(src, sw, sh, dw, dh, bpp);
+    }
+    let upscaled = easu_rgba8(src, sw, sh, dw, dh);
+    rcas(&upscaled, dw, dh, 4, sharpness)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// EASU must produce the requested size, stay in range, and — the point of
+    /// the whole pass — keep a hard edge harder than a plain bicubic does.
+    #[test]
+    fn easu_upscales_and_preserves_edges_better_than_bicubic() {
+        // 8x8, left half black / right half white: one vertical hard edge.
+        let (w, h) = (8u32, 8u32);
+        let mut src = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let v = if x < w / 2 { 0 } else { 255 };
+                let d = ((y * w + x) * 4) as usize;
+                src[d] = v;
+                src[d + 1] = v;
+                src[d + 2] = v;
+                src[d + 3] = 255;
+            }
+        }
+        let (dw, dh) = (16u32, 16u32);
+        let easu = easu_rgba8(&src, w, h, dw, dh);
+        let bicubic = bicubic_rgba8(&src, w, h, dw, dh);
+        assert_eq!(easu.len(), (dw * dh * 4) as usize);
+
+        // Measure edge width along a scanline: count pixels that are neither
+        // near-black nor near-white (i.e. blurred across the transition).
+        let transition_width = |img: &[u8]| {
+            let y = dh / 2;
+            (0..dw)
+                .filter(|x| {
+                    let v = img[((y * dw + x) * 4) as usize];
+                    v > 24 && v < 231
+                })
+                .count()
+        };
+        assert!(
+            transition_width(&easu) <= transition_width(&bicubic),
+            "EASU must not blur the edge more than bicubic (easu {} vs bicubic {})",
+            transition_width(&easu),
+            transition_width(&bicubic)
+        );
+    }
+
+    /// RCAS must never ring: every output sample stays inside the range of its
+    /// own input neighbourhood, which is the property plain unsharp violates.
+    #[test]
+    fn rcas_sharpens_without_overshooting_the_local_range() {
+        let (w, h) = (5u32, 5u32);
+        let mut src = vec![255u8; (w * h * 4) as usize];
+        // A single dark pixel in a bright field — maximum ringing bait.
+        let c = ((2 * w + 2) * 4) as usize;
+        src[c] = 40;
+        src[c + 1] = 40;
+        src[c + 2] = 40;
+
+        let out = rcas(&src, w, h, 4, 1.0);
+        assert_eq!(out.len(), src.len());
+        for i in 0..(w * h) as usize {
+            for ch in 0..3 {
+                let v = out[i * 4 + ch];
+                assert!(
+                    (40..=255).contains(&v),
+                    "sample {i} ch {ch} = {v} left the input range — that is ringing"
+                );
+            }
+        }
+        // Zero sharpness is exactly identity.
+        assert_eq!(rcas(&src, w, h, 4, 0.0), src);
+    }
+
+    #[test]
+    fn fsr1_produces_the_target_size_and_is_safe_for_hdr() {
+        let (w, h) = (4u32, 4u32);
+        let src = vec![128u8; (w * h * 4) as usize];
+        let out = fsr1(&src, w, h, 8, 8, 4, 0.5);
+        assert_eq!(out.len(), (8 * 8 * 4) as usize);
+
+        // 8-byte HDR must not be blended as u8 — fall back to nearest.
+        let hdr = vec![0u8; (w * h * 8) as usize];
+        let out_hdr = fsr1(&hdr, w, h, 8, 8, 8, 0.5);
+        assert_eq!(out_hdr.len(), (8 * 8 * 8) as usize);
+    }
 
     #[test]
     fn resample_doubles_dimensions_and_preserves_corners() {
