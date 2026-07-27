@@ -2634,6 +2634,23 @@ fn shader_parse_exp(
         0x0d => inst.format = F::Pos1Vsrc0Vsrc1Vsrc2Vsrc3,
         0x0e => inst.format = F::Pos2Vsrc0Vsrc1Vsrc2Vsrc3,
         0x0f => inst.format = F::Pos3Vsrc0Vsrc1Vsrc2Vsrc3,
+        // EXP target 9 = `null`. Beyond Kyty (ShaderParse.cpp EXITs here).
+        // A pixel shader that exports no colour — depth-only, or one whose
+        // only colour path is `discard` — must still terminate its export
+        // sequence, and does so with `exp null off,off,off,off done vm`.
+        // Measured: ASTRO.BOT, which produced 83 shader-translation failures
+        // on the 2026-07-27 sweep, all of this shape (`en=0x0 done=1 compr=0
+        // vm=1`).
+        //
+        // Gated on `en == 0` rather than on the exact done/vm/compr triple:
+        // with no channel enabled the export writes nothing whatever those
+        // bits say, so accepting the family is a property of the encoding, not
+        // a guess about one title. A null target WITH channels enabled would
+        // be contradictory and still falls through to the named error.
+        0x09 if en == 0 => {
+            inst.format = F::NullOffOffOffOffVmDone;
+            inst.src_num = 0;
+        }
         0x14 if done != 0 && en == 0x1 => {
             inst.format = F::PrimVsrc0OffOffOffDone;
             inst.src_num = 1;
@@ -5483,6 +5500,57 @@ mod tests {
         assert_eq!(
             code.get_instructions()[0].format,
             F::Pos2Vsrc0Vsrc1Vsrc2Vsrc3
+        );
+    }
+
+    /// EXP target 9 (`null`) — the export a pixel shader uses to terminate its
+    /// export sequence without writing colour.
+    ///
+    /// Measured on the 2026-07-27 sweep: ASTRO.BOT produced **83**
+    /// shader-translation failures, all reported as
+    /// `unknown exp target: 0x09 ... (en=0x0 done=1 compr=0 vm=1)`. Kyty EXITs
+    /// on this target, so every shader containing one was refused whole and
+    /// every draw using it dropped.
+    #[test]
+    fn astro_exp_null_target_decodes() {
+        // en=0, target=9<<4, compr=0, done=1<<11, vm=1<<12 → 0x1890.
+        let (code, result) = parse(
+            &[0xF800_1890, 0x0000_0000, S_ENDPGM],
+            ShaderType::Pixel,
+            true,
+        );
+        result.expect("exp null must parse, not refuse the whole shader");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::Exp);
+        assert_eq!(inst.format, F::NullOffOffOffOffVmDone);
+        assert_eq!(inst.export_enable, 0, "the null target enables no channels");
+        assert_eq!(
+            inst.src_num, 0,
+            "nothing is exported, so there are no sources"
+        );
+
+        // The family is accepted on `en == 0` alone: a null export writes
+        // nothing whatever done/vm/compr say, so the plain `exp null` form
+        // (done=0, vm=0) must decode too rather than becoming the next
+        // whole-shader refusal.
+        let (code, result) = parse(
+            &[0xF800_0090, 0x0000_0000, S_ENDPGM],
+            ShaderType::Pixel,
+            true,
+        );
+        result.expect("bare exp null must parse");
+        assert_eq!(code.get_instructions()[0].format, F::NullOffOffOffOffVmDone);
+
+        // A null target WITH channels enabled is contradictory and must still
+        // be a named error — accepting it would hide a real decode gap.
+        let (_, result) = parse(
+            &[0xF800_189F, 0x0302_0100, S_ENDPGM],
+            ShaderType::Pixel,
+            true,
+        );
+        assert!(
+            result.is_err(),
+            "exp null with en != 0 is malformed and must not be silently accepted"
         );
     }
 

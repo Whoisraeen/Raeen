@@ -535,6 +535,11 @@ pub mod shader_instruction_format {
     pub const MRT0: u64 = 38;
     pub const PRIM: u64 = 39;
     pub const OFF: u64 = 40;
+    /// EXP target 9 — the `null` export target. Beyond Kyty, which EXITs on it.
+    /// A pixel shader that writes no colour (depth-only, or one whose only
+    /// colour path is `discard`) still has to terminate its export sequence,
+    /// and does so with `exp null off,off,off,off done vm`.
+    pub const NULL_TGT: u64 = 56;
     pub const COMPR: u64 = 41;
     pub const VM: u64 = 42;
     /// label_%u
@@ -593,6 +598,9 @@ pub mod shader_instruction_format {
         Pos2Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[POS2, S0, S1, S2, S3]),
         Pos3Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[POS3, S0, S1, S2, S3]),
         PrimVsrc0OffOffOffDone = format_define(&[PRIM, S0, OFF, OFF, OFF, DONE]),
+        /// `exp null off,off,off,off [done] [vm]` — EXP target 9 with no
+        /// channels enabled. Exports nothing; see [`NULL_TGT`].
+        NullOffOffOffOffVmDone = format_define(&[NULL_TGT, OFF, OFF, OFF, OFF, VM, DONE]),
         Saddr = format_define(&[S0A2]),
         /// Beyond Kyty (SharpEmu PR #587): FLAT-class memory operand shape —
         /// `dst` (load dest / store data), `src[0]` VGPR address (a 64-bit pair

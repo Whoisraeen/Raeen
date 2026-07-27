@@ -1195,6 +1195,39 @@ fn recompile_exp_pos_aux(
     Ok(true)
 }
 
+/// `exp null off,off,off,off [done] [vm]` — accept and drop.
+///
+/// Beyond Kyty, which EXITs on EXP target 9. The null target exports nothing,
+/// so there is no SPIR-V to emit: the instruction exists only to terminate the
+/// shader's export sequence on hardware. Dropping it is not a degradation — it
+/// is the complete and correct translation, because SPIR-V has no equivalent
+/// concept and the function's `OpReturn` already ends the shader.
+///
+/// Refusing it, by contrast, failed the WHOLE shader recompile and dropped
+/// every draw using it — the same whole-shader-refusal failure mode as the
+/// `image_get_resinfo` non-2D gate and the partial-`en` param export.
+/// Measured: 83 shader-translation failures on ASTRO.BOT (2026-07-27 sweep).
+fn recompile_exp_null(
+    index: u32,
+    code: &ShaderCode,
+    _dst_source: &mut String,
+    _spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_Exp_NullOffOffOffOffVmDone";
+    let inst = inst_at(code, index, FUNC)?;
+    // The parser only builds this format with no channels enabled; assert the
+    // invariant rather than silently emitting nothing for a real export.
+    if inst.export_enable != 0 || inst.src_num != 0 {
+        return Err(not_supported(
+            FUNC,
+            "null export with enabled channels or sources",
+        ));
+    }
+    Ok(true)
+}
+
 /// Kyty: `Recompile_Exp_PrimVsrc0OffOffOffDone` (ShaderSpirv.cpp L2461).
 fn recompile_exp_prim(
     index: u32,
@@ -9556,6 +9589,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_ds_write_b128, T::DsWriteB128, F::Vsrc0Vsrc14Vsrc2, p1("")),
     f(recompile_s_barrier,    T::SBarrier,   F::Empty,              p1("")),
 
+    f(recompile_exp_null,                           T::Exp, F::NullOffOffOffOffVmDone,         p1("")),
     f(recompile_exp_mrt0_off_off_compr_vm_done,     T::Exp, F::Mrt0OffOffComprVmDone,          p1("")),
     f(recompile_exp_mrt0_vsrc0_vsrc1_compr_vm_done, T::Exp, F::Mrt0Vsrc0Vsrc1ComprVmDone,      p1("")),
     f(recompile_exp_mrt0_vsrc0123_vm_done,          T::Exp, F::Mrt0Vsrc0Vsrc1Vsrc2Vsrc3VmDone, p1("")),
@@ -10289,8 +10323,8 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            333,
-            "the seven beyond-Kyty FLAT-class rows (SharpEmu PR #587: \
+            334,
+            "the beyond-Kyty exp-null row (EXP target 9, ASTRO.BOT),              the seven beyond-Kyty FLAT-class rows (SharpEmu PR #587: \
              FlatLoadDword/X2/X3/X4 + FlatStoreDword/X2/X4), and \
              204 Kyty rows plus the compute batch DsWrxchgRtnB32 and VCmpxNgeF32, and \
              SSubU32, SNop, SVersion, the RDNA2-only rows \
@@ -10322,7 +10356,7 @@ mod tests {
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 325,
+            implemented, 326,
             "the seven FLAT-class rows (SharpEmu PR #587), and the \
              C1 implemented subset plus title-driven ports (incl. DsWrxchgRtnB32, \
              VCmpxNgeF32, SVersion, the S_XXX_I32 \
@@ -10346,7 +10380,7 @@ mod tests {
               and the RDNA2 scene-composite batch: VXnorB32, VAddCoCiU32, \
               SAndn1SaveexecB64, VMadU64U32, and the composite-frontier batch: \
               the integer min/max quartet, four BufferStoreDwordX2 rows, \
-              VBfeU32, ImageSample dmask2, and ImageSampleLzO dmask1/2)"
+              VBfeU32, ImageSample dmask2, ImageSampleLzO dmask1/2, and the               exp-null row: EXP target 9 accepted and dropped)"
         );
         assert_eq!(
             ni, 8,
