@@ -190,11 +190,10 @@ top-down, update statuses in place, and keep it committed.**
   only on full success) + `baseline diff <old> [new] [--strict]` (stage/
   exit/flip/fps + unresolved-NID deltas with newly-missing/-resolved lists;
   Evidence gains optional `unresolved_nids`, old reports round-trip).
-  REMAINING to close: (a) one LIVE `baseline run` against real installed
-  games to validate the port (then delete scratch/run-baseline-parts.py);
-  (b) add the SUPERSEDED header to the python script in the main checkout
-  (worktree isolation blocked that edit — exact text in the ledger session
-  entry).
+  Merged to main (commit `c065b11`); 25/25 green post-merge. SUPERSEDED
+  header added to scratch/run-baseline-parts.py (main session, 2026-07-27).
+  REMAINING to close: one LIVE `baseline run` against real installed games
+  to validate the port (then delete scratch/run-baseline-parts.py).
 - **Why:** regression tripwire while AGC/stub work churns; feeds item 11.
 
 ### 11. Compatibility badges in the Shell library
