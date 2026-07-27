@@ -1541,11 +1541,63 @@ fn hle_exit(_ctx: &HleContext, args: &[u64]) -> u64 {
     0
 }
 
-fn hle_stack_chk_fail(_ctx: &HleContext, _args: &[u64]) -> u64 {
-    // Real `__stack_chk_fail` aborts the process on stack-smash detection.
-    // The stub just logs — it cannot terminate the guest process.
-    debug!("__stack_chk_fail() [stub: does not actually terminate the process]");
-    0
+/// Real `__stack_chk_fail` never returns: the compiler emits the call as the
+/// last instruction of a smashed function's epilogue, so returning "executes"
+/// whatever bytes follow — measured on Until Dawn, that walk-off landed in a
+/// UD2 and got reported as OUR fault while the real cause (the corrupted
+/// canary) vanished from the log. Report everything actionable, then unwind
+/// the calling guest thread exactly like the other guest-fatal handlers
+/// (`__cxa_throw` trap, `sceKernelDebugRaiseException`): `request_exit`
+/// makes the dispatcher restore the recovery context, so control never
+/// returns to the guest frame.
+fn hle_stack_chk_fail(ctx: &HleContext, _args: &[u64]) -> u64 {
+    let thread = ctx.guest_threads.current_thread();
+    let name = ctx
+        .kernel
+        .thread_names
+        .get(&thread)
+        .map_or_else(|| "<unnamed>".to_owned(), |entry| entry.clone());
+    tracing::error!(
+        "__stack_chk_fail: guest stack canary smashed on thread {thread} ('{name}'), \
+         guest ra={:#x} — terminating the calling guest thread (exit code {:#x}); \
+         the frame that called this is the one that overflowed",
+        ctx.caller_return_addr,
+        crate::STACK_CHK_FAIL_EXIT_CODE,
+    );
+    // The exact HLE calls this guest thread made before the smash — the most
+    // reliable "what was it doing" signal (host threads are pooled).
+    if let Some(ring) = ctx.kernel.recent_hle_calls.get(&thread) {
+        let recent = ring.lock().iter().cloned().collect::<Vec<_>>().join(" ");
+        if !recent.is_empty() {
+            tracing::error!("  recent HLE calls: {recent}");
+        }
+    }
+    let chain = crate::guest_stack_code_addrs(ctx);
+    if !chain.is_empty() {
+        tracing::error!("  fatal-thread stack code-addrs: {}", chain.join(" "));
+    }
+    // A thread killed mid-execution never runs its cleanup; release any
+    // spin-loop mutexes it holds so the rest of the process can keep making
+    // observable progress (same EOWNERDEAD-style recovery as the
+    // DebugRaiseException path).
+    let released = ctx.kernel.release_mutexes_owned_by(thread);
+    if released > 0 {
+        warn!("  released {released} mutex(es) held by dying thread {thread} ('{name}')");
+    }
+    if !ctx
+        .guest_threads
+        .request_exit(crate::STACK_CHK_FAIL_EXIT_CODE)
+    {
+        // No per-thread unwind available (should not happen on the runtime
+        // dispatch path): escalate to process termination rather than hand
+        // control back to a smashed frame.
+        ctx.guest_threads
+            .request_process_exit(crate::STACK_CHK_FAIL_EXIT_CODE);
+    }
+    // Unreachable by the guest: the dispatcher observes the exit request at
+    // the HLE boundary and restores the recovery context instead of
+    // delivering this value.
+    crate::STACK_CHK_FAIL_EXIT_CODE
 }
 
 /// Real `memalign(alignment, size)` allocates `size` bytes aligned to
@@ -4095,9 +4147,9 @@ fn hle_catch_return_from_main(ctx: &HleContext, args: &[u64]) -> u64 {
 /// `_Assert(expr, file, line)`: Dinkumware's `assert()` core — prints
 /// "Assertion failed: ..." and aborts. The message goes to the kernel
 /// console (stderr's home in this process) and the host log with the caller
-/// address; the abort itself follows this file's established noreturn-stub
-/// pattern (`hle_abort`/`hle_stack_chk_fail`): log loudly and return 0 so
-/// diagnostics keep flowing.
+/// address; the abort itself follows `hle_abort`'s noreturn-stub pattern:
+/// log loudly and return 0 so diagnostics keep flowing
+/// (`hle_stack_chk_fail` no longer returns — it unwinds the guest thread).
 fn hle_dinkum_assert(ctx: &HleContext, args: &[u64]) -> u64 {
     let expr = args.first().copied().unwrap_or(0);
     let file = args.get(1).copied().unwrap_or(0);
@@ -4319,6 +4371,107 @@ mod tests {
         let mut buf = [0xFFu8; 32];
         assert!(mem.read(addr, &mut buf));
         assert!(buf.iter().all(|&b| b == 0), "calloc zeroes its block");
+    }
+
+    /// `__stack_chk_fail` is `noreturn` on hardware: the handler must unwind
+    /// the calling guest thread (via `request_exit`, which the dispatcher
+    /// turns into a recovery-context restore) rather than hand a return value
+    /// back to a smashed frame. The old stub returned 0, so the guest walked
+    /// off the call site into UD2 and the smash was misreported as a wild
+    /// jump (measured: Until Dawn after getdents on /app0/deepfiles).
+    #[test]
+    fn stack_chk_fail_requests_guest_thread_exit_instead_of_returning() {
+        use crate::{
+            GpuSubmissionSubsystem, GuestCallRequest, GuestCallScheduler, GuestThreadScheduler,
+            HleContext, STACK_CHK_FAIL_EXIT_CODE,
+        };
+
+        struct NoGpu;
+        impl GpuSubmissionSubsystem for NoGpu {
+            fn submit(&self, _words: Vec<u32>, _queue: raeen_core::subsystems::GpuQueue) {}
+            fn map_shader_metadata(
+                &self,
+                _code_address: u64,
+                _data: raeen_core::subsystems::ShaderMappedData,
+            ) {
+            }
+            fn present_scanout(
+                &self,
+                _address: u64,
+                _descriptor: Option<raeen_core::subsystems::ScanoutDescriptor>,
+            ) {
+            }
+            fn wait_idle(&self) {}
+            fn stats(&self) -> raeen_core::subsystems::GpuSubmissionStats {
+                raeen_core::subsystems::GpuSubmissionStats::default()
+            }
+        }
+        struct NoGuestCalls;
+        impl GuestCallScheduler for NoGuestCalls {
+            fn request(&self, _request: GuestCallRequest) -> bool {
+                false
+            }
+        }
+        /// Records the exit request the handler must make.
+        struct RecordingThreads {
+            exit_requested: std::cell::Cell<Option<u64>>,
+        }
+        impl GuestThreadScheduler for RecordingThreads {
+            fn create(&self, _thread_out: u64, _attr: u64, _entry: u64, _arg: u64) -> u64 {
+                0x8002_000B
+            }
+            fn join(&self, _thread: u64, _retval_out: u64) -> u64 {
+                0x8002_0003
+            }
+            fn detach(&self, _thread: u64) -> u64 {
+                0x8002_0003
+            }
+            fn request_exit(&self, retval: u64) -> bool {
+                self.exit_requested.set(Some(retval));
+                true
+            }
+            fn current_thread(&self) -> u64 {
+                1
+            }
+            fn request_process_exit(&self, _code: u64) {
+                panic!("with a working thread scheduler the handler must not escalate");
+            }
+            fn process_is_terminating(&self) -> bool {
+                false
+            }
+        }
+
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let gpu = NoGpu;
+        let guest_calls = NoGuestCalls;
+        let threads = RecordingThreads {
+            exit_requested: std::cell::Cell::new(None),
+        };
+        let ctx = HleContext {
+            kernel: &kernel,
+            services: &kernel,
+            gpu: &gpu,
+            mem: &mem,
+            alloc: &alloc,
+            guest_calls: &guest_calls,
+            guest_threads: &threads,
+            caller_return_addr: 0,
+            caller_rsp: 0,
+            float_args: [0; 8],
+        };
+
+        let ret = hle_stack_chk_fail(&ctx, &[]);
+        assert_eq!(
+            threads.exit_requested.get(),
+            Some(STACK_CHK_FAIL_EXIT_CODE),
+            "the handler must unwind the guest thread with the fatal exit code"
+        );
+        assert_ne!(
+            ret, 0,
+            "the (never-delivered) return value must not look like success"
+        );
     }
 
     #[test]

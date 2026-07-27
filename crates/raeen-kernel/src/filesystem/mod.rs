@@ -74,9 +74,11 @@ struct OpenFile {
     reader: Option<(std::fs::File, u64)>,
     /// Whether the fd was opened for writing (`O_WRONLY`/`O_RDWR`).
     writable: bool,
-    /// Sorted host directory entries for directory descriptors. Immutable after
-    /// open; the walk cursor is [`OpenFileMut::directory_index`].
-    directory_entries: Option<Vec<DirectoryEntry>>,
+    /// Packed Orbis dirent blocks for directory descriptors (see
+    /// [`pack_dirents`]), snapshot at open. Immutable after open; the walk
+    /// cursor is the byte offset in [`OpenFileMut::position`], exactly like a
+    /// regular file — which is also what `lseek` on a directory fd moves.
+    dirents: Option<Vec<u8>>,
     /// Per-fd mutable I/O state. Its own `Mutex` so concurrent I/O on
     /// *different* fds never contends (see the struct doc).
     inner: Mutex<OpenFileMut>,
@@ -95,14 +97,76 @@ struct OpenFileMut {
     dirty: bool,
     /// Original Orbis open flags (queried/updated through `fcntl`).
     flags: i32,
-    /// Next directory entry returned by `getdents`.
-    directory_index: usize,
 }
 
 #[derive(Debug, Clone)]
 struct DirectoryEntry {
     name: String,
     is_directory: bool,
+}
+
+/// One directory block: real Orbis `getdents` (FreeBSD `DIRBLKSIZ`) returns
+/// whole 512-byte blocks of packed variable-length records.
+const DIRENT_BLOCK: usize = 512;
+/// Fixed dirent header: `d_fileno`(u32) `d_reclen`(u16) `d_type`(u8)
+/// `d_namlen`(u8), followed by the NUL-terminated `d_name`.
+const DIRENT_HEADER: usize = 8;
+
+/// Pack directory entries into Orbis dirent blocks, mirroring shadPS4's
+/// `NormalDirectory::RebuildDirents` (itself mirroring FreeBSD directory
+/// blocks): each record is `d_reclen = align4(8 + namlen + 1)` bytes, records
+/// never cross a 512-byte block boundary, and the last record of each block
+/// absorbs the block's slack into its `d_reclen` so records tile every block
+/// exactly. The total is always a multiple of 512 — this is also the
+/// `st_size` a directory fd reports.
+///
+/// The previous model (one 512-byte record per call with `d_reclen == 512`)
+/// overflowed real guests: `sizeof(dirent)` is 264, and a parser that copies
+/// a record by its `d_reclen` into a stack-allocated `dirent` writes 248
+/// bytes past it — measured as Until Dawn's deterministic
+/// `__stack_chk_fail` after listing an empty `/app0/deepfiles`.
+fn pack_dirents(entries: &[DirectoryEntry]) -> Vec<u8> {
+    let mut bin: Vec<u8> = Vec::new();
+    let mut last_reclen_at: Option<usize> = None;
+    for entry in entries {
+        let name = entry.name.as_bytes();
+        let namlen = name.len().min(255);
+        let reclen = (DIRENT_HEADER + namlen + 1).next_multiple_of(4);
+        let mut offset = bin.len();
+        let block_end = (offset / DIRENT_BLOCK + 1) * DIRENT_BLOCK;
+        if offset + reclen > block_end {
+            // Would cross a block boundary: extend the previous record over
+            // the slack and start this one at the next block.
+            if let Some(at) = last_reclen_at {
+                let old = u16::from_le_bytes([bin[at], bin[at + 1]]);
+                let padded = old + (block_end - offset) as u16;
+                bin[at..at + 2].copy_from_slice(&padded.to_le_bytes());
+            }
+            bin.resize(block_end, 0);
+            offset = block_end;
+        }
+        bin.resize(offset + reclen, 0);
+        // `d_fileno` must be NON-ZERO — a real filesystem never hands out
+        // inode 0, and code that treats 0 as "invalid entry" will mis-parse
+        // it. fnv1a of the name can be 0 for some inputs, so force a bit.
+        let fileno = fnv1a32(&name[..namlen]) | 1;
+        bin[offset..offset + 4].copy_from_slice(&fileno.to_le_bytes());
+        bin[offset + 4..offset + 6].copy_from_slice(&(reclen as u16).to_le_bytes());
+        bin[offset + 6] = if entry.is_directory { 4 } else { 8 }; // DT_DIR / DT_REG
+        bin[offset + 7] = namlen as u8;
+        bin[offset + 8..offset + 8 + namlen].copy_from_slice(&name[..namlen]);
+        // The NUL terminator and align-to-4 padding are already zero.
+        last_reclen_at = Some(offset + 4);
+    }
+    // Round the final block up and let its last record absorb the slack.
+    if let Some(at) = last_reclen_at {
+        let ceiling = bin.len().next_multiple_of(DIRENT_BLOCK);
+        let slack = (ceiling - bin.len()) as u16;
+        let old = u16::from_le_bytes([bin[at], bin[at + 1]]);
+        bin[at..at + 2].copy_from_slice(&(old + slack).to_le_bytes());
+        bin.resize(ceiling, 0);
+    }
+    bin
 }
 
 /// Virtual filesystem mapping PS5 paths to host directories.
@@ -464,13 +528,12 @@ impl VirtualFileSystem {
                     random_device: true,
                     reader: None,
                     writable: false,
-                    directory_entries: None,
+                    dirents: None,
                     inner: Mutex::new(OpenFileMut {
                         position: 0,
                         data: None,
                         dirty: false,
                         flags,
-                        directory_index: 0,
                     }),
                 },
             );
@@ -502,6 +565,18 @@ impl VirtualFileSystem {
                 .collect();
             entries.sort_by_key(|entry| entry.name.to_ascii_lowercase());
             entries.dedup_by(|a, b| a.name.eq_ignore_ascii_case(&b.name));
+            // Same dot-entry prefix a real directory listing carries.
+            let mut with_dots = Vec::with_capacity(entries.len() + 2);
+            with_dots.push(DirectoryEntry {
+                is_directory: true,
+                name: ".".to_string(),
+            });
+            with_dots.push(DirectoryEntry {
+                is_directory: true,
+                name: "..".to_string(),
+            });
+            with_dots.extend(entries);
+            let entries = with_dots;
             let mut next = self.next_fd.write();
             let fd = *next;
             *next += 1;
@@ -514,13 +589,12 @@ impl VirtualFileSystem {
                     random_device: false,
                     reader: None,
                     writable: false,
-                    directory_entries: Some(entries),
+                    dirents: Some(pack_dirents(&entries)),
                     inner: Mutex::new(OpenFileMut {
                         position: 0,
                         data: None,
                         dirty: false,
                         flags,
-                        directory_index: 0,
                     }),
                 },
             );
@@ -539,7 +613,7 @@ impl VirtualFileSystem {
                 "directory opened for writing",
             ));
         }
-        let directory_entries = if is_directory {
+        let dirents = if is_directory {
             let mut entries = std::fs::read_dir(&host_path)?
                 .filter_map(Result::ok)
                 .filter_map(|entry| {
@@ -565,7 +639,7 @@ impl VirtualFileSystem {
                 name: "..".to_string(),
             });
             with_dots.extend(entries);
-            Some(with_dots)
+            Some(pack_dirents(&with_dots))
         } else {
             None
         };
@@ -624,13 +698,12 @@ impl VirtualFileSystem {
             random_device: false,
             reader,
             writable,
-            directory_entries,
+            dirents,
             inner: Mutex::new(OpenFileMut {
                 position,
                 data,
                 dirty,
                 flags,
-                directory_index: 0,
             }),
         };
 
@@ -662,7 +735,7 @@ impl VirtualFileSystem {
                 format!("fd {fd} not open"),
             ));
         };
-        if file.directory_entries.is_some() {
+        if file.dirents.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "fd is a directory",
@@ -758,7 +831,7 @@ impl VirtualFileSystem {
                 format!("fd {fd} not open"),
             ));
         };
-        if file.directory_entries.is_some() {
+        if file.dirents.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "fd is a directory",
@@ -897,6 +970,10 @@ impl VirtualFileSystem {
             .as_ref()
             .map(|d| d.len() as u64)
             .or_else(|| file.reader.as_ref().map(|(_, len)| *len))
+            // A directory's "size" is its packed dirent listing (always a
+            // multiple of 512), so lseek(SEEK_END) reports what getdents
+            // walks — mirroring shadPS4's NormalDirectory.
+            .or_else(|| file.dirents.as_ref().map(|b| b.len() as u64))
             .unwrap_or(0);
         let base = match whence {
             0 => 0i64,                  // SEEK_SET
@@ -918,13 +995,9 @@ impl VirtualFileSystem {
                     "seek before start of file",
                 )
             })?;
-        // A directory fd's enumeration cursor is `directory_index` (what
-        // `getdents` walks and mirrors into `position`), so writing `position`
-        // alone leaves the walk where it was — `lseek(dirfd, 0, SEEK_SET)`
-        // (rewinddir) would then re-enumerate nothing. Keep the two in sync.
-        if let Some(entries) = file.directory_entries.as_ref() {
-            inner.directory_index = (target as usize).min(entries.len());
-        }
+        // A directory fd's enumeration cursor IS `position` (the byte offset
+        // into its packed dirent blocks), so `lseek(dirfd, 0, SEEK_SET)`
+        // (rewinddir) restarts the walk with no extra bookkeeping.
         inner.position = target as u64;
         Ok(inner.position)
     }
@@ -941,8 +1014,24 @@ impl VirtualFileSystem {
                 .as_ref()
                 .map(|d| d.len() as u64)
                 .or_else(|| file.reader.as_ref().map(|(_, len)| *len))
+                // Directories report their packed dirent listing size
+                // (512-aligned), matching shadPS4's directory fstat/lseek.
+                .or_else(|| file.dirents.as_ref().map(|b| b.len() as u64))
                 .unwrap_or(0),
         )
+    }
+
+    /// Whether `fd` is an open directory descriptor.
+    ///
+    /// HLE `fstat` needs this: a directory must report `S_IFDIR` in
+    /// `st_mode`, not pose as a zero-length regular file — UE5-style
+    /// directory walkers branch on it between "list further" and "read".
+    #[must_use]
+    pub fn is_directory(&self, fd: Fd) -> bool {
+        self.open_files
+            .read()
+            .get(&fd)
+            .is_some_and(|file| file.dirents.is_some())
     }
 
     /// Whether `fd` names one of the process-local entropy character devices.
@@ -993,18 +1082,18 @@ impl VirtualFileSystem {
         Ok(())
     }
 
-    /// Return one fixed-size Gen5 dirent per call.
-    ///
-    /// PS5's kernel-facing directory ABI uses a 512-byte record even when the
-    /// caller supplies a larger buffer. Advancing one entry at a time is
-    /// important: retail code commonly treats every successful call as one
-    /// complete record rather than walking packed BSD-style variable records.
+    /// Return as many whole 512-byte directory blocks of packed Orbis dirent
+    /// records as fit the caller's buffer (see [`pack_dirents`] for the
+    /// record/block layout), advancing the descriptor's byte cursor. Returns
+    /// `(payload, base)` where `base` is the byte offset before this call —
+    /// the value `getdirentries` stores through `basep`. An exhausted
+    /// directory returns an empty payload (guest return 0), never a synthetic
+    /// record.
     pub fn getdents(&self, fd: Fd, requested: usize) -> Result<(Vec<u8>, usize), std::io::Error> {
-        const DIRENT_SIZE: usize = 512;
-        if requested < DIRENT_SIZE {
+        if requested < DIRENT_BLOCK {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "directory buffer is smaller than one record",
+                "directory buffer is smaller than one directory block",
             ));
         }
         let files = self.open_files.read();
@@ -1014,39 +1103,27 @@ impl VirtualFileSystem {
                 format!("fd {fd} not open"),
             ));
         };
-        let Some(entries) = file.directory_entries.as_ref() else {
+        let Some(dirents) = file.dirents.as_ref() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "fd is not a directory",
             ));
         };
         let mut inner = file.inner.lock();
-        let base = inner.directory_index;
-        let Some(entry) = entries.get(inner.directory_index) else {
+        let base = usize::try_from(inner.position).unwrap_or(usize::MAX);
+        if base >= dirents.len() {
             return Ok((Vec::new(), base));
-        };
-        let name = entry.name.as_bytes();
-        let name_len = name.len().min(255);
-        // Orbis `dirent`: d_fileno(u32), d_reclen(u16), d_type(u8),
-        // d_namlen(u8), d_name[]. `d_fileno` must be NON-ZERO — a real
-        // filesystem never hands out inode 0, and code that treats 0 as
-        // "invalid entry" will mis-parse it. fnv1a of the name can be 0 for
-        // some inputs, so force the low bit.
-        let fileno = fnv1a32(&name[..name_len]) | 1;
-        let mut record = vec![0u8; DIRENT_SIZE];
-        record[0..4].copy_from_slice(&fileno.to_le_bytes());
-        record[4..6].copy_from_slice(&(DIRENT_SIZE as u16).to_le_bytes());
-        record[6] = if entry.is_directory { 4 } else { 8 };
-        record[7] = name_len as u8;
-        record[8..8 + name_len].copy_from_slice(&name[..name_len]);
-        inner.directory_index += 1;
-        inner.position = inner.directory_index as u64;
+        }
+        // Whole blocks only: records are padded to block boundaries, so any
+        // 512-multiple is also a record boundary.
+        let take = (dirents.len() - base).min(requested / DIRENT_BLOCK * DIRENT_BLOCK);
+        let payload = dirents[base..base + take].to_vec();
+        inner.position += take as u64;
         tracing::debug!(
-            "getdents fd={fd}: entry[{base}] '{}' type={} -> 1 record",
-            String::from_utf8_lossy(&name[..name_len]),
-            if entry.is_directory { "dir" } else { "file" }
+            "getdents fd={fd}: {take} bytes of packed dirents at offset {base} (of {})",
+            dirents.len()
         );
-        Ok((record, base))
+        Ok((payload, base))
     }
 
     /// Persist an open descriptor's dirty write-back buffer without closing
@@ -1773,13 +1850,20 @@ mod tests {
 
         let drain = |fd| {
             let mut n = 0;
-            while !vfs.getdents(fd, 4096).unwrap().0.is_empty() {
-                n += 1;
+            loop {
+                let (bytes, _) = vfs.getdents(fd, 4096).unwrap();
+                if bytes.is_empty() {
+                    break;
+                }
+                n += parse_dirent_blocks(&bytes).len();
             }
             n
         };
         let first = drain(fd);
-        assert!(first >= 2, "expected at least the two files, got {first}");
+        assert!(
+            first >= 4,
+            "expected the two dot entries plus the two files, got {first}"
+        );
 
         // rewinddir: `lseek(dirfd, 0, SEEK_SET)` must restart the walk. Before
         // the fix it only reset `position`, not `directory_index`, so this
@@ -1849,6 +1933,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&game_dir);
     }
 
+    /// Walk packed Orbis dirent records: `d_fileno`(u32) `d_reclen`(u16)
+    /// `d_type`(u8) `d_namlen`(u8) `d_name[]`, records padded so none crosses
+    /// a 512-byte block boundary (FreeBSD `DIRBLKSIZ` semantics, mirrored by
+    /// shadPS4's `NormalDirectory`). Asserts the structural invariants a real
+    /// guest parser depends on, then returns `(d_type, name, d_reclen)`.
+    fn parse_dirent_blocks(bytes: &[u8]) -> Vec<(u8, String, u16)> {
+        assert!(
+            bytes.len().is_multiple_of(512),
+            "getdents returns whole 512-byte directory blocks, got {}",
+            bytes.len()
+        );
+        let mut records = Vec::new();
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let fileno = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            let reclen =
+                u16::from_le_bytes(bytes[offset + 4..offset + 6].try_into().unwrap()) as usize;
+            let d_type = bytes[offset + 6];
+            let namlen = bytes[offset + 7] as usize;
+            assert_ne!(fileno, 0, "d_fileno must be non-zero");
+            assert!(reclen > 8 + namlen, "d_reclen must cover the record");
+            // The overflow that smashed Until Dawn's canary: a record whose
+            // d_reclen walks past the bytes the call actually returned.
+            assert!(
+                offset + reclen <= bytes.len(),
+                "d_reclen {reclen} at offset {offset} exceeds returned payload {}",
+                bytes.len()
+            );
+            // Records never cross a 512-byte directory-block boundary.
+            assert_eq!(
+                offset / 512,
+                (offset + reclen - 1) / 512,
+                "record at {offset} (reclen {reclen}) crosses a 512-byte block boundary"
+            );
+            assert_eq!(
+                bytes[offset + 8 + namlen],
+                0,
+                "d_name must be NUL-terminated"
+            );
+            records.push((
+                d_type,
+                std::str::from_utf8(&bytes[offset + 8..offset + 8 + namlen])
+                    .unwrap()
+                    .to_string(),
+                reclen as u16,
+            ));
+            offset += reclen;
+        }
+        assert_eq!(offset, bytes.len(), "records must tile the blocks exactly");
+        records
+    }
+
     #[test]
     fn directory_open_getdents_and_fcntl_flags_are_stateful() {
         use open_flags::*;
@@ -1860,24 +1996,16 @@ mod tests {
 
         let fd = vfs.open("/app0", O_RDONLY, 0).unwrap();
         assert_eq!(vfs.flags(fd), Some(O_RDONLY));
-        // Four entries now: the two synthetic dot-dirs Orbis always yields
-        // first (`.`, `..`), then the real `packs` and `stone.txt`.
-        let mut kinds_and_names = Vec::new();
-        for expected_base in 0..4 {
-            let (bytes, base) = vfs.getdents(fd, 1024).unwrap();
-            assert_eq!(bytes.len(), 512);
-            assert_eq!(base, expected_base);
-            assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 512);
-            // Every d_fileno must be non-zero.
-            assert_ne!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 0);
-            let name_len = bytes[7] as usize;
-            kinds_and_names.push((
-                bytes[6],
-                std::str::from_utf8(&bytes[8..8 + name_len])
-                    .unwrap()
-                    .to_string(),
-            ));
-        }
+        // Four entries: the two synthetic dot-dirs Orbis always yields first
+        // (`.`, `..`), then the real `packs` and `stone.txt` — all packed
+        // into ONE 512-byte block returned by ONE call.
+        let (bytes, base) = vfs.getdents(fd, 1024).unwrap();
+        assert_eq!(base, 0, "basep is the byte offset before the call");
+        assert_eq!(bytes.len(), 512);
+        let mut kinds_and_names: Vec<(u8, String)> = parse_dirent_blocks(&bytes)
+            .into_iter()
+            .map(|(d_type, name, _)| (d_type, name))
+            .collect();
         kinds_and_names.sort_by(|a, b| a.1.cmp(&b.1));
         assert_eq!(
             kinds_and_names,
@@ -1890,9 +2018,98 @@ mod tests {
         );
         let (eof, base) = vfs.getdents(fd, 512).unwrap();
         assert!(eof.is_empty());
-        assert_eq!(base, 4);
+        assert_eq!(base, 512, "EOF basep reports the final byte offset");
+        // lseek(SEEK_END) on a directory reports the 512-aligned dirent size.
+        assert_eq!(vfs.seek(fd, 0, 2).unwrap(), 512);
+        vfs.seek(fd, 0, 0).unwrap();
         vfs.set_status_flags(fd, O_APPEND).unwrap();
         assert_eq!(vfs.flags(fd), Some(O_APPEND | O_RDONLY));
+        vfs.close(fd).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Until Dawn regression (ledger 2026-07-25/26 ITEM 2): an EMPTY
+    /// `/app0/deepfiles` directory returned 0x200 bytes TWICE — one 512-byte
+    /// record per dot entry, each claiming `d_reclen == 512`. A guest that
+    /// copies a record by `d_reclen` into a `sizeof(dirent)`-sized (264-byte)
+    /// stack struct overflows by 248 bytes and trips `__stack_chk_fail`.
+    /// Real Orbis (and shadPS4) packs `.` and `..` into ONE 512-byte block —
+    /// so: one 0x200 return, then 0.
+    #[test]
+    fn empty_directory_returns_one_dot_block_then_eof() {
+        use open_flags::*;
+        let dir = temp_dir("getdents-empty");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+        let fd = vfs.open("/app0", O_RDONLY, 0).unwrap();
+
+        let (first, base) = vfs.getdents(fd, 0x1000).unwrap();
+        assert_eq!(base, 0);
+        assert_eq!(first.len(), 512, "dot entries pack into one block");
+        let records = parse_dirent_blocks(&first);
+        assert_eq!(records.len(), 2, "exactly `.` and `..`");
+        assert_eq!(records[0].0, 4);
+        assert_eq!(records[0].1, ".");
+        assert_eq!(records[1].0, 4);
+        assert_eq!(records[1].1, "..");
+        // The final record absorbs the block slack into its d_reclen
+        // (FreeBSD directory-block semantics): 12 + 500 = 512.
+        assert_eq!(records[0].2, 12);
+        assert_eq!(records[1].2, 500);
+
+        let (second, base) = vfs.getdents(fd, 0x1000).unwrap();
+        assert!(
+            second.is_empty(),
+            "an exhausted directory must return 0 bytes, not another 0x200"
+        );
+        assert_eq!(base, 512);
+        vfs.close(fd).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Directories larger than one block: records never cross a 512-byte
+    /// boundary, each block's last record absorbs the slack, and a 512-byte
+    /// caller buffer walks the listing one block per call with byte basep.
+    #[test]
+    fn getdents_packs_multiple_blocks_without_boundary_crossings() {
+        use open_flags::*;
+        let dir = temp_dir("getdents-blocks");
+        // 8 names of ~120 chars: reclen align4(8+120+1)=132; ~3 per block →
+        // guarantees several blocks together with the dot entries.
+        let mut expected: Vec<String> = (0..8).map(|i| format!("{i}{}", "x".repeat(119))).collect();
+        for name in &expected {
+            std::fs::write(dir.join(name), b"y").unwrap();
+        }
+        expected.push(".".to_string());
+        expected.push("..".to_string());
+        expected.sort();
+
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+        let fd = vfs.open("/app0", O_RDONLY, 0).unwrap();
+
+        let total = vfs.seek(fd, 0, 2).unwrap();
+        assert!(total > 512, "fixture must span multiple blocks");
+        assert!(total.is_multiple_of(512));
+        vfs.seek(fd, 0, 0).unwrap();
+
+        let mut names = Vec::new();
+        let mut expected_base = 0u64;
+        loop {
+            let (bytes, base) = vfs.getdents(fd, 512).unwrap();
+            if bytes.is_empty() {
+                break;
+            }
+            assert_eq!(base as u64, expected_base, "basep advances by bytes");
+            assert_eq!(bytes.len(), 512, "a 512-byte buffer gets one block");
+            for (_, name, _) in parse_dirent_blocks(&bytes) {
+                names.push(name);
+            }
+            expected_base += 512;
+        }
+        assert_eq!(expected_base, total);
+        names.sort();
+        assert_eq!(names, expected);
         vfs.close(fd).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

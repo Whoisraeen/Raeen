@@ -4012,23 +4012,9 @@ fn hle_debug_raise_exception(ctx: &HleContext, args: &[u64]) -> u64 {
     // Walk the caller's stack for return addresses into the loaded image, so
     // the call chain INTO libc's terminate handler (and thus the throw
     // origin) is greppable. Diagnostic only; bounded and read-only.
-    if ctx.caller_rsp != 0 {
-        let mut chain = Vec::new();
-        for i in 0..256u64 {
-            let mut buf = [0u8; 8];
-            if !ctx.mem.read(ctx.caller_rsp.wrapping_add(i * 8), &mut buf) {
-                break;
-            }
-            let val = u64::from_le_bytes(buf);
-            // Return addresses land inside the composed guest image
-            // (0x1000_0000_0000 .. +~300 MB); stack data / small ints don't.
-            if (0x1000_0000_0000..0x1000_2000_0000).contains(&val) {
-                chain.push(format!("{val:#x}"));
-            }
-        }
-        if !chain.is_empty() {
-            warn!("  fatal-thread stack code-addrs: {}", chain.join(" "));
-        }
+    let chain = crate::guest_stack_code_addrs(ctx);
+    if !chain.is_empty() {
+        warn!("  fatal-thread stack code-addrs: {}", chain.join(" "));
     }
     // A thread killed mid-execution never runs its C++ cleanup, so any mutex
     // it holds would stay locked forever — and our mutex lock is a spin-loop
@@ -4373,11 +4359,16 @@ fn hle_path_metadata_accept(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 /// `fstat`/`sceKernelFstat(fd, stat_out)`: report regular-file size for VFS
-/// descriptors and a zero-sized character-like record for console fds.
+/// descriptors, a directory record (`S_IFDIR`, dirent-listing size, 0x8000
+/// block size — shadPS4's directory fstat values) for directory fds, and a
+/// zero-sized character-like record for console fds. A directory posing as a
+/// zero-length regular file (the old behavior) breaks directory walkers that
+/// branch on `st_mode`.
 fn hle_fstat(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0);
     let stat_out = args.get(1).copied().unwrap_or(0);
     let character_device = fd <= 2 || ctx.kernel.filesystem.is_random_device(fd as i32);
+    let directory = !character_device && ctx.kernel.filesystem.is_directory(fd as i32);
     let size = if character_device {
         0
     } else if let Some(file_size) = ctx.kernel.filesystem.file_size(fd as i32) {
@@ -4388,18 +4379,20 @@ fn hle_fstat(ctx: &HleContext, args: &[u64]) -> u64 {
     };
     if stat_out != 0 {
         let mut stat = [0u8; ORBIS_STAT_SIZE];
-        stat[8..10].copy_from_slice(
-            &(if character_device {
-                ORBIS_MODE_CHARACTER
-            } else {
-                ORBIS_MODE_REGULAR
-            })
-            .to_le_bytes(),
-        );
+        let mode = if character_device {
+            ORBIS_MODE_CHARACTER
+        } else if directory {
+            ORBIS_MODE_DIRECTORY
+        } else {
+            ORBIS_MODE_REGULAR
+        };
+        stat[8..10].copy_from_slice(&mode.to_le_bytes());
         stat[10..12].copy_from_slice(&1u16.to_le_bytes());
         stat[72..80].copy_from_slice(&size.to_le_bytes());
-        stat[80..88].copy_from_slice(&size.div_ceil(512).to_le_bytes());
-        stat[88..92].copy_from_slice(&512u32.to_le_bytes());
+        let blocks: u64 = if directory { 8 } else { size.div_ceil(512) };
+        stat[80..88].copy_from_slice(&blocks.to_le_bytes());
+        let blksize: u32 = if directory { 0x8000 } else { 512 };
+        stat[88..92].copy_from_slice(&blksize.to_le_bytes());
         if !ctx.mem.write(stat_out, &stat) {
             return SCE_KERNEL_ERROR_EFAULT;
         }
@@ -6611,6 +6604,7 @@ mod tests {
         let registry = HleRegistry::new();
         let stale_arg4 = [0xA5u8; 8];
         assert!(mem.write(0x200, &stale_arg4));
+        // `.`, `..`, `packs`, `manifest.json` pack into ONE 512-byte block.
         assert_eq!(
             registry.call(
                 &ctx,
@@ -6627,16 +6621,79 @@ mod tests {
             after, stale_arg4,
             "three-argument sceKernelGetdents must not treat stale RCX as getdirentries basep"
         );
-        let mut first = [0u8; 512];
-        assert!(mem.read(0x400, &mut first));
-        let first_len = u16::from_le_bytes(first[4..6].try_into().unwrap()) as usize;
-        assert_eq!(first_len, 512);
-        assert!(matches!(first[6], 4 | 8));
-        assert_ne!(first[7], 0);
-        assert_eq!(hle_getdents(&ctx, &[fd, 0x400, 1024], false), 512);
-        assert_eq!(hle_getdents(&ctx, &[fd, 0x400, 1024], false), 512);
-        assert_eq!(hle_getdents(&ctx, &[fd, 0x400, 1024], false), 512);
+        // Walk the packed records: every d_reclen stays inside the returned
+        // payload (a d_reclen of 512 per record is exactly the overflow that
+        // smashed Until Dawn's stack canary), and the four names appear.
+        let mut block = [0u8; 512];
+        assert!(mem.read(0x400, &mut block));
+        let mut names = Vec::new();
+        let mut offset = 0usize;
+        while offset < block.len() {
+            let reclen =
+                u16::from_le_bytes(block[offset + 4..offset + 6].try_into().unwrap()) as usize;
+            let namlen = block[offset + 7] as usize;
+            assert!(matches!(block[offset + 6], 4 | 8));
+            assert!(reclen >= 8 + namlen + 1, "d_reclen covers the record");
+            assert!(
+                offset + reclen <= block.len(),
+                "d_reclen must stay inside the returned payload"
+            );
+            names.push(
+                std::str::from_utf8(&block[offset + 8..offset + 8 + namlen])
+                    .unwrap()
+                    .to_string(),
+            );
+            offset += reclen;
+        }
+        names.sort();
+        assert_eq!(names, [".", "..", "manifest.json", "packs"]);
+        // The listing was fully consumed by the first call: EOF is 0 bytes.
         assert_eq!(hle_getdents(&ctx, &[fd, 0x400, 1024], false), 0);
+        assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A directory descriptor must fstat as a directory: `S_IFDIR` mode, the
+    /// packed-dirent listing size, and shadPS4's directory block geometry —
+    /// not as a zero-length regular file.
+    #[test]
+    fn fstat_reports_directory_mode_size_and_block_geometry() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let tmp = std::env::temp_dir().join(format!("raeen-hle-fstat-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("save.dat"), b"s").unwrap();
+        kernel.filesystem.set_game_directory(&tmp);
+
+        assert!(mem.write(0x100, b"/app0\0"));
+        let fd = hle_open(&ctx, &[0x100, 0, 0]);
+        assert!((fd as i64) >= 3);
+
+        assert_eq!(hle_fstat(&ctx, &[fd, 0x200]), SCE_OK);
+        let mut stat = [0u8; ORBIS_STAT_SIZE];
+        assert!(mem.read(0x200, &mut stat));
+        assert_eq!(
+            u16::from_le_bytes(stat[8..10].try_into().unwrap()),
+            ORBIS_MODE_DIRECTORY,
+            "a directory fd must report S_IFDIR, not a regular file"
+        );
+        let size = u64::from_le_bytes(stat[72..80].try_into().unwrap());
+        assert!(
+            size >= 512 && size.is_multiple_of(512),
+            "st_size is the 512-aligned dirent listing, got {size}"
+        );
+        assert_eq!(
+            u64::from_le_bytes(stat[80..88].try_into().unwrap()),
+            8,
+            "st_blocks"
+        );
+        assert_eq!(
+            u32::from_le_bytes(stat[88..92].try_into().unwrap()),
+            0x8000,
+            "st_blksize"
+        );
         assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
         let _ = std::fs::remove_dir_all(&tmp);
     }
