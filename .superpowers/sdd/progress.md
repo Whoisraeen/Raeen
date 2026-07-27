@@ -4663,3 +4663,35 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   context regs, MRT1-7/fast-clear unimplemented), MVP scoped to Minecraft's
   shaders, no soak/perf/playability claim, synthetic pad input, evidence not
   re-run live for this record.
+## 2026-07-27 (shell) — Perf HUD overlay + F12/Create screenshot capture
+* perf-hud: complete. Settings ▸ Advanced ▸ "Performance HUD (F3)" (row 8,
+  named const ADVANCED_ROW_PERF_HUD) + F3 hotkey following the F11 pattern
+  (both route through apply_setting_adjust, config bit stays in sync;
+  persisted as general.perf_hud, serde-default off for old configs).
+  GameFrameView gains FrameTimeStats: a 120-sample rolling window of
+  per-frame ms derived from published-frame epochs (rebaselines on the
+  REMOTE_EPOCH_BIT source flip and on counter resets; frames published
+  between Shell repaints share elapsed time evenly). paint_perf_hud is
+  painter+explicit-rects in the top-right corner slot (semi-transparent,
+  supersedes — never stacks with — the plain FPS badge): epoch-derived FPS,
+  avg/worst frame ms, flip-count FPS, upload ms, drain/fence/read/sRGB ms.
+  No puffin dependency — everything reads the always-available PresentTiming
+  counters. 5 FrameTimeStats tests.
+* screenshot: complete. F12 anywhere + the pad Create button's rising edge
+  in-session (Create IS the PS5 screenshot button; the press is still
+  forwarded to the guest). Dumps the currently published guest frame (same
+  sources/priority as GameFrameView::paint: remote IPC frame, else local
+  session last_image) to screenshots/<sanitized-title-id>_<UTC
+  YYYYMMDD-HHMMSS-mmm>.png via the existing image workspace dep (png
+  feature already on). Refuses non-RGBA8/truncated frames with a reasoned
+  error; no session or no published frame -> info toast (never captures the
+  Shell UI itself). Success/failure toasts via the TopLeft-anchored
+  egui-notify. screenshots/ gitignored (frames of user-owned titles).
+  4 screenshot tests (UTC filename vs known epochs, hostile-id
+  sanitization, PNG decode round-trip, refusals) + 1 config persistence
+  test.
+* Tests: raeen-gui 184 (was 174), raeen-core 11, raeen-gpu suite green,
+  cargo fmt clean. clippy not run (AppControl, os error 4551) — cargo check
+  clean. NOT live-verified (worktree; display occupied) — needs a
+  main-session verify pass: F3 toggle + HUD legibility over a running
+  title, F12/Create toast + PNG on disk, Settings row focus/click.

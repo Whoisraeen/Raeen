@@ -17,6 +17,7 @@ pub mod media;
 pub mod nav;
 pub mod per_game;
 pub(crate) mod present;
+pub(crate) mod screenshot;
 pub mod settings;
 pub mod sounds;
 
@@ -281,6 +282,10 @@ pub struct Shell {
     game_options_target_id: Option<String>,
     /// Press-and-hold state for the in-session pad quit (SharpEmu PR #415).
     session_quit_hold: QuitHold,
+    /// Last frame's merged Create-button state, so an in-session press takes
+    /// exactly one screenshot on its rising edge (the button is still
+    /// forwarded to the guest — Create IS the PS5's screenshot button).
+    pad_create_was_down: bool,
 
     /// Auto-updater state machine (Settings → System). Worker threads
     /// (check/download) report back over the mpsc channel; `update()` pumps
@@ -405,6 +410,7 @@ impl Shell {
             game_options_draft: per_game::PerGameSettings::default(),
             game_options_target_id: None,
             session_quit_hold: QuitHold::default(),
+            pad_create_was_down: false,
             updater_state: UpdaterState::default(),
             updater_tx,
             updater_rx,
@@ -533,6 +539,22 @@ impl Shell {
         // Video ▸ Fullscreen (which also keeps the config bit in sync).
         if ctx.input(|i| i.key_pressed(Key::F11)) {
             self.apply_setting_adjust(ctx, settings::SECTION_VIDEO, 1, 1);
+        }
+        // F3 toggles the performance HUD, same effect as Settings ▸ Advanced ▸
+        // Performance HUD (which also keeps the config bit in sync) — the F11
+        // pattern exactly.
+        if ctx.input(|i| i.key_pressed(Key::F3)) {
+            self.apply_setting_adjust(
+                ctx,
+                settings::SECTION_ADVANCED,
+                settings::ADVANCED_ROW_PERF_HUD,
+                1,
+            );
+        }
+        // F12 captures the currently published guest frame (the pad's Create
+        // button does the same in-session — see `push_pad_state`).
+        if ctx.input(|i| i.key_pressed(Key::F12)) {
+            self.take_screenshot();
         }
 
         self.route_input(ctx);
@@ -914,6 +936,9 @@ impl Shell {
             }
             (settings::SECTION_ADVANCED, 7) => {
                 self.config.debug.stall_dump = !self.config.debug.stall_dump
+            }
+            (settings::SECTION_ADVANCED, settings::ADVANCED_ROW_PERF_HUD) => {
+                self.config.general.perf_hud = !self.config.general.perf_hud
             }
             _ => {}
         }
@@ -1297,7 +1322,12 @@ impl Shell {
     fn push_pad_state(&mut self, ctx: &egui::Context) {
         let (kernel, deadzone) = match self.session.as_ref() {
             Some(session) => (session.kernel.clone(), self.config.input.deadzone),
-            None => return,
+            None => {
+                // No session: nothing to forward, and the Create-button
+                // screenshot edge must re-arm for the next launch.
+                self.pad_create_was_down = false;
+                return;
+            }
         };
         // Highest-priority source: the native, mapping-DB-free readers
         // (XInput + raw-HID DualSense, SharpEmu-ported). These recover pads
@@ -1336,11 +1366,56 @@ impl Shell {
             native.unwrap_or_default(),
             merge_pad_states(pad, read_keyboard_pad(ctx)),
         );
+        // Create's rising edge takes a screenshot (the PS5's own mapping for
+        // that button) — the press is STILL forwarded to the guest below, so
+        // a title that reads Create sees it exactly as before.
+        if merged.create && !self.pad_create_was_down {
+            self.take_screenshot();
+        }
+        self.pad_create_was_down = merged.create;
         let encoded = merged.to_orbis_pad_data();
         if let Some(kernel) = kernel {
             kernel.set_pad_state(encoded);
         }
         raeen_gpu::frame_ipc::publish_pad_state(encoded);
+    }
+
+    /// Capture the currently published guest frame to `screenshots/
+    /// <title-id>_<timestamp>.png` and toast the outcome. With no running
+    /// session or no published frame there is deliberately nothing to
+    /// capture — this never falls back to grabbing the Shell UI itself.
+    fn take_screenshot(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            self.toasts.info("No game running — nothing to capture");
+            return;
+        };
+        // Same frame sources, same priority, as `GameFrameView::paint`: the
+        // isolated runner's shared frame first, else the in-process session's
+        // latest published image.
+        let image = raeen_gpu::frame_ipc::latest_remote_frame()
+            .map(|frame| frame.image)
+            .or_else(|| raeen_gpu::AgcGpuSession::global().last_image());
+        let Some(image) = image else {
+            self.toasts
+                .info("No frame published yet — nothing to capture");
+            return;
+        };
+        let title_id = session.item_id.clone();
+        match screenshot::save(
+            &image,
+            std::path::Path::new(screenshot::SCREENSHOTS_ROOT),
+            &title_id,
+        ) {
+            Ok(path) => {
+                tracing::info!(path = %path.display(), "screenshot saved");
+                self.toasts
+                    .success(format!("Screenshot saved — {}", path.display()));
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "screenshot failed");
+                self.toasts.error(format!("Screenshot failed: {err}"));
+            }
+        }
     }
 
     /// While a title runs, hold the PS/Guide button to quit back to the Shell
@@ -1564,6 +1639,7 @@ impl Shell {
                     &mut self.frame_view,
                     self.session_quit_hold.progress(),
                     self.render_state.as_ref(),
+                    self.config.general.perf_hud,
                 );
                 return;
             }
@@ -2096,6 +2172,7 @@ fn draw_session_overlay(
     frame_view: &mut present::GameFrameView,
     quit_progress: f32,
     render_state: Option<&eframe::egui_wgpu::RenderState>,
+    perf_hud: bool,
 ) {
     let screen = ui.max_rect();
     ui.painter().rect_filled(screen, 0.0, theme.palette.ground);
@@ -2143,7 +2220,13 @@ fn draw_session_overlay(
         present::Presented::NoFrameYet => screen,
     };
     if state == SessionState::Running {
-        frame_view.paint_fps(ui, presentation_bounds);
+        // The HUD occupies the badge's corner slot and is a superset of it,
+        // so exactly one of the two draws — never both stacked.
+        if perf_hud {
+            frame_view.paint_perf_hud(ui, presentation_bounds);
+        } else {
+            frame_view.paint_fps(ui, presentation_bounds);
+        }
     }
     match presented {
         present::Presented::Frame { rect } => {
