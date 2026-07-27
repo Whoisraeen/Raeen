@@ -4808,3 +4808,30 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
 * Phase B (NOT started, next wall): PM4 compute-queue execution — ACBs reach
   hle_driver_submit_acb but only the graphics-queue CP path executes; then
   re-run GTA V to move the UD2 assert.
+## 2026-07-27 (worktree agent) — checklist 13: kyty-graphics + raeen-gpu clippy debt paid
+* kyty-graphics: 87 clippy-1.97 lint instances -> 0 under
+  `--all-targets -- -D warnings`. Breakdown: 82 field_reassign_with_default
+  (ALL in #[cfg(test)] fixtures of recompile.rs + analysis.rs — covered by
+  two module-scoped #[allow]s with justification: fixtures assign direct,
+  nested, and indexed fields, which a struct-literal rewrite cannot express);
+  4 clone_on_copy fixed (push(sample/min.clone()) -> push(sample/min),
+  ShaderInstruction is Copy); 1 incompatible_msrv fixed in
+  examples/shader_probe.rs (is_multiple_of -> % 4). The lib-side
+  analysis.rs:3195 MSRV lint was fixed on main (d030259) and merged in —
+  not re-touched here.
+* raeen-gpu: 8 lint instances -> 0. Fixed mechanically: never_loop in
+  tests/external_memory_host.rs (first-device probe -> into_iter().next()),
+  assertions_on_constants in frame_ipc.rs (-> const block, now a
+  compile-time header-overflow guard), type_complexity in
+  vulkan/instance.rs (PickedDevice type alias). Allowed with justification:
+  3 dead_code (SLOT_ALIGNMENT const, imported_host_pointer_alignment
+  field + accessor — all deliberately plumbed by ea6efd0 for GPU-resident
+  present phase 1, consumer lands in phase 1 wiring) and 2 deprecated
+  (pm4_snapshot pins the deprecated build_m2_draw_dcb bytes on purpose).
+* Tests: kyty-graphics 477/477 (baseline preserved), raeen-gpu 308/308,
+  fmt clean. Clippy ran locally (no AppControl block this session).
+* Workspace gate NOT yet green — remaining debt is outside this task's
+  two-crate scope: raeen-gui (type_complexity launcher.rs:61,
+  doc_lazy_continuation sounds.rs:113, needless_range_loop sounds.rs:199 —
+  these 3 fail the exact CI invocation `clippy --workspace -- -D warnings`)
+  and raeen-input (too_many_arguments hid.rs:398, lib test target only).

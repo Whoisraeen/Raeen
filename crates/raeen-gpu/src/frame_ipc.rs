@@ -70,6 +70,9 @@ mod platform {
     /// constant so the import path can assert against it and so a future
     /// header change that breaks alignment fails the test below, not a driver
     /// call at runtime.
+    // Read by the alignment test today; the phase-1 host-pointer import path
+    // (gpu-resident present plan) is the non-test consumer.
+    #[allow(dead_code)]
     pub(crate) const SLOT_ALIGNMENT: usize = 4096;
 
     const MAGIC_OFFSET: usize = 0;
@@ -655,11 +658,14 @@ mod platform {
                     "slot {slot} starts at {offset}, which is not {SLOT_ALIGNMENT}-aligned"
                 );
             }
-            // The header fields must still fit in the padded header.
-            assert!(
-                SRGB_ENCODE_US_OFFSET + 8 <= HEADER_BYTES,
-                "header fields overflow the padded header"
-            );
+            // The header fields must still fit in the padded header (checked
+            // at compile time; both operands are constants).
+            const {
+                assert!(
+                    SRGB_ENCODE_US_OFFSET + 8 <= HEADER_BYTES,
+                    "header fields overflow the padded header"
+                );
+            }
         }
 
         #[test]

@@ -98,8 +98,22 @@ pub struct VulkanDevice {
     /// `Some` is what lets the present path import the frame-IPC mapping and
     /// copy the finished frame straight into it (phase 1 of the GPU-resident
     /// present plan).
+    // Plumbed in commit ea6efd0; the phase-1 present path is the consumer.
+    #[allow(dead_code)]
     imported_host_pointer_alignment: Option<vk::DeviceSize>,
 }
+
+/// Result of physical-device selection: `(physical_device, device,
+/// graphics_queue_family, name, depth_range_unrestricted,
+/// imported_host_pointer_alignment)`.
+type PickedDevice = (
+    vk::PhysicalDevice,
+    Device,
+    u32,
+    String,
+    bool,
+    Option<vk::DeviceSize>,
+);
 
 impl VulkanDevice {
     /// Bring up a Vulkan 1.3 device.
@@ -394,6 +408,8 @@ impl VulkanDevice {
     /// the imported size a multiple of it. Measured on a Radeon 760M:
     /// available, `align == 4096` (one page).
     #[must_use]
+    // Accessor for the phase-1 GPU-resident present path (not wired up yet).
+    #[allow(dead_code)]
     pub(crate) fn imported_host_pointer_alignment(&self) -> Option<vk::DeviceSize> {
         self.imported_host_pointer_alignment
     }
@@ -559,22 +575,13 @@ impl VulkanDevice {
 
     /// Select a physical device and create the logical device on it.
     ///
-    /// Returns `(physical_device, device, graphics_queue_family, name,
-    /// depth_range_unrestricted)`.
+    /// Returns [`PickedDevice`]: `(physical_device, device,
+    /// graphics_queue_family, name, depth_range_unrestricted,
+    /// imported_host_pointer_alignment)`.
     fn pick_and_create_device(
         _entry: &Entry,
         instance: &Instance,
-    ) -> Result<
-        (
-            vk::PhysicalDevice,
-            Device,
-            u32,
-            String,
-            bool,
-            Option<vk::DeviceSize>,
-        ),
-        GpuError,
-    > {
+    ) -> Result<PickedDevice, GpuError> {
         // SAFETY: `instance` is live; enumeration only fills a Vec of handles.
         let devices = unsafe { instance.enumerate_physical_devices() }
             .map_err(|e| GpuError::VulkanInitFailed(format!("device enumeration failed: {e}")))?;

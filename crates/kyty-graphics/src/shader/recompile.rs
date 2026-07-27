@@ -10153,6 +10153,11 @@ pub fn shader_recompile_cs(
     spirv_run(&source)
 }
 #[cfg(test)]
+// Test fixtures build shader input structs field-by-field (direct, nested, and
+// indexed fields); the struct-literal rewrite cannot express the nested/indexed
+// assignments, so it would leave a mixed style across ~80 fixtures for no
+// behavior change.
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::shader::parse::shader_parse;
@@ -11598,7 +11603,7 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..3 {
-            code.get_instructions_mut().push(sample.clone());
+            code.get_instructions_mut().push(sample);
         }
         code.get_instructions_mut().push(ShaderInstruction {
             type_: T::SEndpgm,
@@ -11675,7 +11680,7 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..3 {
-            code.get_instructions_mut().push(sample.clone());
+            code.get_instructions_mut().push(sample);
         }
         code.get_instructions_mut().push(ShaderInstruction {
             type_: T::SEndpgm,
@@ -11752,7 +11757,7 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..3 {
-            code.get_instructions_mut().push(sample.clone());
+            code.get_instructions_mut().push(sample);
         }
         code.get_instructions_mut().push(ShaderInstruction {
             type_: T::SEndpgm,
@@ -13163,7 +13168,7 @@ mod tests {
         };
         // Two ops so s_endpgm lands at instruction index >= 2.
         for _ in 0..2 {
-            code.get_instructions_mut().push(min.clone());
+            code.get_instructions_mut().push(min);
         }
         code.get_instructions_mut().push(ShaderInstruction {
             type_: T::SEndpgm,

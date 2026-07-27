@@ -5041,6 +5041,10 @@ pub fn shader_parse_cs(
     Ok(code)
 }
 #[cfg(test)]
+// Test fixtures build ShaderInstruction field-by-field including nested/indexed
+// operands, which a struct-literal rewrite cannot express; allow the stylistic
+// lint rather than split the setup into mixed styles.
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::shader::hw_regs::VsStageRegisters;

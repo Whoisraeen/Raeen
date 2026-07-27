@@ -33,7 +33,14 @@ fn probe() -> Option<(String, bool, vk::DeviceSize)> {
     // SAFETY: `instance` is live for the whole block.
     let result = unsafe {
         let mut found = None;
-        for pd in instance.enumerate_physical_devices().ok()? {
+        // Only the first enumerated device is probed (same one Raeen picks by
+        // default), so take it directly instead of a loop that never loops.
+        if let Some(pd) = instance
+            .enumerate_physical_devices()
+            .ok()?
+            .into_iter()
+            .next()
+        {
             let props = instance.get_physical_device_properties(pd);
             let name = props
                 .device_name_as_c_str()
@@ -53,7 +60,6 @@ fn probe() -> Option<(String, bool, vk::DeviceSize)> {
                 align = host.min_imported_host_pointer_alignment;
             }
             found = Some((name, has, align));
-            break;
         }
         found
     };
