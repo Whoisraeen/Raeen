@@ -55,6 +55,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, CONTEXT, CONTEXT_ALL_AMD64, EXCEPTION_CONTINUE_EXECUTION,
     EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS, GetThreadContext, RtlCaptureContext,
+    RtlRestoreContext,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentThreadId, OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT,
@@ -1029,17 +1030,35 @@ pub(crate) extern "sysv64" fn direct_hle_gateway(
                 t.function
             );
         }
-        if ctx.process_is_terminating() || ctx.thread_exit.get().is_some() {
-            tracing::error!(
-                "{}::{} changed execution context through the direct leaf gateway",
-                t.library,
-                t.function
-            );
-        }
-
         ctx.trace
             .push(index as u32, result, [args[0], args[1], args[2]]);
         HLE_EXITS.fetch_add(1, Ordering::Relaxed);
+
+        // Another guest thread can terminate the process while this worker is
+        // inside an executable leaf thunk. The VEH path observes that flag at
+        // every HLE boundary and restores `recovery_ctx`; the direct path must
+        // do the same instead of returning to guest code forever. The old
+        // error-only branch left the worker alive after the main thread
+        // faulted, producing millions of calls and filling the 64 MiB log in
+        // seconds during process teardown.
+        if ctx.process_is_terminating() {
+            ctx.exited.set(true);
+            // SAFETY: `direct_hle_gateway` is reachable only while `run` has
+            // armed this ActiveContext and populated `recovery_ctx`. Restoring
+            // it abandons the guest/direct-host stacks and resumes `run` at
+            // the same recovery point used by `veh_callback`.
+            unsafe { RtlRestoreContext(ctx.recovery_ctx, ptr::null()) };
+            std::process::abort();
+        }
+        if let Some(retval) = ctx.thread_exit.take() {
+            ctx.retval.set(retval);
+            ctx.returned.set(true);
+            // SAFETY: identical recovery-context invariant to the process-exit
+            // branch above; this mirrors the VEH pthread-exit path.
+            unsafe { RtlRestoreContext(ctx.recovery_ctx, ptr::null()) };
+            std::process::abort();
+        }
+
         result
     };
 

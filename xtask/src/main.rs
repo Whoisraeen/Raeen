@@ -427,9 +427,10 @@ fn run_one(
             // emits large summaries. It is useful for compatibility triage,
             // but it perturbs the performance profile it is meant to measure.
             .env_remove("RAEEN_CALL_STATS")
-            // Phase 2's bounded path is production-default OFF until its
-            // three-run no-wedge gate is green. The max-fps profile is an
-            // explicit opt-in measurement, so enable it here.
+            // Phase 2's bounded async flip has been the production default
+            // since the three-run no-wedge gate went green (2026-07-26). Set
+            // it explicitly so a measured run never depends on the host
+            // environment either way.
             .env("RAEEN_ASYNC_FLIP", "1");
     } else {
         command

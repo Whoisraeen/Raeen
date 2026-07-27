@@ -74,8 +74,15 @@ SOFTWARE.
   KytyPS5's separate `PTHREAD_STACK_EXTRA` behavior. Raeen also follows
   KytyPS5's Gen5 vertex-attribute handling by carrying the AGC `fetch_index`
   selector into Vulkan's per-vertex/per-instance input rate; the Rust data
-  model, cache keys, and tests are original. No C++ is vendored or compiled
-  into Raeen.
+  model, cache keys, and tests are original. AudioOut2's context-memory sizing
+  and speaker-array lifecycle/coefficient behavior are likewise behaviorally
+  re-implemented in Rust from `src/libs/libAudio2.cpp`; this closes GTA V's
+  measured undersized-allocation and unresolved speaker-array initialization
+  path. GTA V's Gen5 AGC fixed packet sizes, direct Cx/Sh/Uc register writers,
+  and DCB/ACB conditional-execution packet layout are behaviorally
+  re-implemented from `src/libs/agc.cpp`; SharpEmu independently confirms the
+  by-value `{u32 offset, u32 value}` direct-register ABI. No C++ is vendored or
+  compiled into Raeen.
 
 ---
 

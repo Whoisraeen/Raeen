@@ -154,8 +154,26 @@ pub trait PresentPlugin: Send + Sync {
     /// What this plugin does, for UI labelling and input gathering.
     fn capabilities(&self) -> Capabilities;
 
+    /// Where this plugin was loaded from: `Some(path)` for an out-of-tree
+    /// binary (`cabi::DynamicPlugin`), `None` for a plugin compiled into the
+    /// artifact (built-ins, in-tree Rust plugins). Shown by the Shell's
+    /// Plugins UI so a user can tell built-in from BYO at a glance.
+    fn source_path(&self) -> Option<&std::path::Path> {
+        None
+    }
+
     /// Transform one complete source frame into the frame(s) to present.
     fn process(&mut self, frame: &PresentFrame<'_>, ctx: &PresentContext) -> PluginOutput;
+}
+
+/// Everything the Shell's Plugins UI needs to describe one registered plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginInfo {
+    pub name: String,
+    pub capabilities: Capabilities,
+    /// `Some(path)` for a user-supplied out-of-tree binary, `None` for a
+    /// built-in / in-tree plugin.
+    pub source: Option<std::path::PathBuf>,
 }
 
 /// The process-wide plugin registry: the set of registered plugins, which one
@@ -201,6 +219,17 @@ impl Registry {
         self.plugins
             .iter()
             .map(|(name, plugin)| (name.clone(), plugin.capabilities()))
+            .collect()
+    }
+
+    fn list_info(&self) -> Vec<PluginInfo> {
+        self.plugins
+            .iter()
+            .map(|(name, plugin)| PluginInfo {
+                name: name.clone(),
+                capabilities: plugin.capabilities(),
+                source: plugin.source_path().map(std::path::Path::to_path_buf),
+            })
             .collect()
     }
 
@@ -252,6 +281,34 @@ pub fn active() -> Option<String> {
 #[must_use]
 pub fn list() -> Vec<(String, Capabilities)> {
     registry().lock().list()
+}
+
+/// Full [`PluginInfo`] (name, capabilities, source path) for every registered
+/// plugin — for the Shell's Plugins UI.
+#[must_use]
+pub fn list_info() -> Vec<PluginInfo> {
+    registry().lock().list_info()
+}
+
+/// Refusals from the most recent out-of-tree plugin scan, one human-readable
+/// line per refused candidate. Replaced (not appended) on every scan so the UI
+/// always shows the current state of `plugins/`, and empty when the last scan
+/// refused nothing.
+fn load_failures_store() -> &'static Mutex<Vec<String>> {
+    static FAILURES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Replace the recorded refusals from the latest plugin-directory scan.
+pub(crate) fn set_load_failures(failures: Vec<String>) {
+    *load_failures_store().lock() = failures;
+}
+
+/// The latest scan's refusals — why each candidate in `plugins/` was not
+/// loaded. For the Shell's Plugins UI; the same information is also logged.
+#[must_use]
+pub fn load_failures() -> Vec<String> {
+    load_failures_store().lock().clone()
 }
 
 /// Set the present-time upscale factor an upscaler plugin should target
@@ -341,6 +398,36 @@ mod tests {
             motion: None,
             frame_index: 0,
         }
+    }
+
+    #[test]
+    fn list_info_reports_builtins_with_no_source_path() {
+        let reg = Registry::new();
+        let infos = reg.list_info();
+        let passthrough = infos
+            .iter()
+            .find(|i| i.name == "passthrough")
+            .expect("passthrough is a built-in");
+        assert_eq!(
+            passthrough.source, None,
+            "built-ins are compiled in, not loaded from a file"
+        );
+        assert_eq!(passthrough.capabilities, Capabilities::default());
+        let nearest = infos
+            .iter()
+            .find(|i| i.name == "nearest")
+            .expect("nearest is a built-in");
+        assert!(nearest.capabilities.upscale);
+    }
+
+    #[test]
+    fn load_failures_replace_rather_than_accumulate() {
+        set_load_failures(vec!["first scan: bad plugin".to_string()]);
+        assert_eq!(load_failures(), vec!["first scan: bad plugin".to_string()]);
+        // A clean rescan clears the record — refusals never linger after the
+        // user removes the offending file.
+        set_load_failures(Vec::new());
+        assert!(load_failures().is_empty());
     }
 
     #[test]

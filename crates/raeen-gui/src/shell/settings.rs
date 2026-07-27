@@ -31,22 +31,89 @@ pub enum SettingsClick {
 }
 
 /// Section names, in the order `nav::NavState::settings_section` indexes.
-pub const SETTINGS_SECTION_NAMES: [&str; 8] = [
+pub const SETTINGS_SECTION_NAMES: [&str; 9] = [
     "Video",
     "Audio",
     "Controller",
     "Game Folders",
     "Key Provider",
     "Theme",
+    "Plugins",
     "System",
     "Advanced",
 ];
 
+// Section indices, named so `shell/mod.rs`'s `(section, row)` dispatch and
+// this file's draw dispatch cannot drift apart when a section is inserted.
+pub const SECTION_VIDEO: usize = 0;
+pub const SECTION_AUDIO: usize = 1;
+pub const SECTION_CONTROLLER: usize = 2;
+pub const SECTION_GAME_FOLDERS: usize = 3;
+pub const SECTION_KEY_PROVIDER: usize = 4;
+pub const SECTION_THEME: usize = 5;
+pub const SECTION_PLUGINS: usize = 6;
+pub const SECTION_SYSTEM: usize = 7;
+pub const SECTION_ADVANCED: usize = 8;
+
+/// Rows the Plugins section appends after its per-plugin rows: "Rescan
+/// Plugins Folder" and "Open Plugins Folder".
+pub const PLUGIN_ACTION_ROWS: usize = 2;
+
 /// Number of rows in each section, in `SETTINGS_SECTION_NAMES` order. The
 /// Game Folders section grows by one row per configured folder plus a
-/// trailing "Add Folder" row, so this takes the current folder count.
-pub fn settings_row_counts(game_folder_count: usize) -> Vec<usize> {
-    vec![11, 3, 3, game_folder_count + 1, 1, 1, 2, 8]
+/// trailing "Add Folder" row; the Plugins section grows by one row per
+/// registered present plugin plus its two fixed action rows — so this takes
+/// both live counts.
+pub fn settings_row_counts(game_folder_count: usize, plugin_count: usize) -> Vec<usize> {
+    vec![
+        11,
+        3,
+        3,
+        game_folder_count + 1,
+        1,
+        1,
+        plugin_count + PLUGIN_ACTION_ROWS,
+        2,
+        8,
+    ]
+}
+
+/// One registered present plugin, pre-resolved by the Shell into plain display
+/// strings so this module stays free of `raeen-gpu` types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginRowInfo {
+    /// The plugin's self-reported name (also the selection key).
+    pub name: String,
+    /// Human-readable capability summary ("Upscale · Frame Gen", …).
+    pub capabilities: String,
+    /// Where it came from: "built-in" or the binary's file name.
+    pub source: String,
+    /// Whether this plugin is the active present plugin right now.
+    pub active: bool,
+}
+
+/// Human-readable capability summary for a plugin row. All-false capabilities
+/// read as "Passthrough" (the plugin transforms nothing).
+#[must_use]
+pub fn capability_label(caps: &raeen_gpu::Capabilities) -> String {
+    let mut parts = Vec::new();
+    if caps.upscale {
+        parts.push("Upscale");
+    }
+    if caps.frame_gen {
+        parts.push("Frame Gen");
+    }
+    if caps.wants_depth {
+        parts.push("Depth");
+    }
+    if caps.wants_motion_vectors {
+        parts.push("Motion Vectors");
+    }
+    if parts.is_empty() {
+        "Passthrough".to_string()
+    } else {
+        parts.join(" · ")
+    }
 }
 
 /// The user-facing label for a present-plugin config value: `"off"` reads as
@@ -182,6 +249,8 @@ pub fn draw(
     new_folder_input: &mut String,
     key_provider_input: &mut String,
     updater: &crate::updater::UpdaterState,
+    plugins: &[PluginRowInfo],
+    plugin_failures: &[String],
 ) -> Option<SettingsClick> {
     let screen = ui.max_rect();
     ui.painter().rect_filled(screen, 0.0, theme.palette.ground);
@@ -221,14 +290,17 @@ pub fn draw(
             ui.vertical(|ui| {
                 ui.set_width(560.0);
                 match nav.settings_section {
-                    0 => draw_video(ui, theme, nav, config),
-                    1 => draw_audio(ui, theme, nav, config),
-                    2 => draw_input(ui, theme, nav, config),
-                    3 => draw_game_folders(ui, theme, nav, config, new_folder_input),
-                    4 => draw_key_provider(ui, theme, nav, key_provider_input),
-                    5 => draw_theme(ui, theme, nav, config),
-                    6 => draw_system(ui, theme, nav, updater),
-                    7 => draw_debug(ui, theme, nav, config),
+                    SECTION_VIDEO => draw_video(ui, theme, nav, config),
+                    SECTION_AUDIO => draw_audio(ui, theme, nav, config),
+                    SECTION_CONTROLLER => draw_input(ui, theme, nav, config),
+                    SECTION_GAME_FOLDERS => {
+                        draw_game_folders(ui, theme, nav, config, new_folder_input)
+                    }
+                    SECTION_KEY_PROVIDER => draw_key_provider(ui, theme, nav, key_provider_input),
+                    SECTION_THEME => draw_theme(ui, theme, nav, config),
+                    SECTION_PLUGINS => draw_plugins(ui, theme, nav, plugins, plugin_failures),
+                    SECTION_SYSTEM => draw_system(ui, theme, nav, updater),
+                    SECTION_ADVANCED => draw_debug(ui, theme, nav, config),
                     _ => {}
                 }
             });
@@ -265,12 +337,14 @@ pub fn draw(
                 ui.id().with(("settings-section", section)),
                 egui::Sense::click(),
             )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
         {
             return Some(SettingsClick::Section(section));
         }
     }
-    let row_count = settings_row_counts(config.paths.game_folders.len())[nav.settings_section];
+    let row_count =
+        settings_row_counts(config.paths.game_folders.len(), plugins.len())[nav.settings_section];
     for row_index in 0..row_count {
         let rect = egui::Rect::from_min_size(
             egui::pos2(screen.left() + 294.0, section_top + row_index as f32 * 28.0),
@@ -283,6 +357,7 @@ pub fn draw(
                     .with(("settings-row", nav.settings_section, row_index)),
                 egui::Sense::click(),
             )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
         {
             return Some(SettingsClick::Row(row_index));
@@ -534,6 +609,67 @@ fn draw_theme(ui: &mut egui::Ui, theme: &Theme, nav: &NavState, config: &Emulato
     );
 }
 
+/// Plugins section: one row per registered present plugin (name on the left;
+/// capabilities, origin, and the Active marker on the right), then the two
+/// action rows. Confirm on a plugin row activates it (or deactivates it when
+/// already active); the Shell owns that logic — this only draws.
+fn draw_plugins(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    nav: &NavState,
+    plugins: &[PluginRowInfo],
+    plugin_failures: &[String],
+) {
+    for (i, plugin) in plugins.iter().enumerate() {
+        let value = if plugin.active {
+            format!("{} · {} · Active", plugin.capabilities, plugin.source)
+        } else {
+            format!("{} · {}", plugin.capabilities, plugin.source)
+        };
+        row(ui, theme, nav, i, &plugin.name, value);
+    }
+    row(
+        ui,
+        theme,
+        nav,
+        plugins.len(),
+        "Rescan Plugins Folder",
+        String::new(),
+    );
+    row(
+        ui,
+        theme,
+        nav,
+        plugins.len() + 1,
+        "Open Plugins Folder",
+        String::new(),
+    );
+    ui.add_space(10.0);
+    ui.label(
+        RichText::new(
+            "Confirm activates a plugin (again to deactivate). Built-ins ship with Raeen; \
+             everything else is user-supplied in plugins/ and loaded at startup or on rescan.",
+        )
+        .color(theme.palette.text_faint)
+        .size(12.0),
+    );
+    if !plugin_failures.is_empty() {
+        ui.add_space(10.0);
+        ui.label(
+            RichText::new("Refused on the last scan:")
+                .color(theme.palette.text)
+                .size(13.0),
+        );
+        for failure in plugin_failures {
+            ui.label(
+                RichText::new(format!("\u{2022} {failure}"))
+                    .color(theme.palette.text_faint)
+                    .size(12.0),
+            );
+        }
+    }
+}
+
 /// System section: current version + the updater's single action row
 /// ("Check for Updates" → "Download Update" → "Restart & Update" depending
 /// on [`crate::updater::UpdaterState`]).
@@ -651,25 +787,71 @@ mod tests {
 
     #[test]
     fn section_names_and_row_counts_stay_in_step() {
-        assert_eq!(settings_row_counts(0).len(), SETTINGS_SECTION_NAMES.len());
+        assert_eq!(
+            settings_row_counts(0, 0).len(),
+            SETTINGS_SECTION_NAMES.len()
+        );
+    }
+
+    #[test]
+    fn section_constants_match_the_names_table() {
+        assert_eq!(SETTINGS_SECTION_NAMES[SECTION_VIDEO], "Video");
+        assert_eq!(SETTINGS_SECTION_NAMES[SECTION_AUDIO], "Audio");
+        assert_eq!(SETTINGS_SECTION_NAMES[SECTION_CONTROLLER], "Controller");
+        assert_eq!(SETTINGS_SECTION_NAMES[SECTION_GAME_FOLDERS], "Game Folders");
+        assert_eq!(SETTINGS_SECTION_NAMES[SECTION_KEY_PROVIDER], "Key Provider");
+        assert_eq!(SETTINGS_SECTION_NAMES[SECTION_THEME], "Theme");
+        assert_eq!(SETTINGS_SECTION_NAMES[SECTION_PLUGINS], "Plugins");
+        assert_eq!(SETTINGS_SECTION_NAMES[SECTION_SYSTEM], "System");
+        assert_eq!(SETTINGS_SECTION_NAMES[SECTION_ADVANCED], "Advanced");
     }
 
     #[test]
     fn game_folders_row_count_tracks_the_configured_folder_count() {
-        assert_eq!(settings_row_counts(0)[3], 1); // just the "Add Folder" row
-        assert_eq!(settings_row_counts(2)[3], 3); // 2 folders + "Add Folder"
+        assert_eq!(settings_row_counts(0, 0)[SECTION_GAME_FOLDERS], 1); // just the "Add Folder" row
+        assert_eq!(settings_row_counts(2, 0)[SECTION_GAME_FOLDERS], 3); // 2 folders + "Add Folder"
+    }
+
+    #[test]
+    fn plugins_row_count_tracks_the_registered_plugin_count() {
+        // No plugins: just the Rescan + Open Folder action rows.
+        assert_eq!(settings_row_counts(0, 0)[SECTION_PLUGINS], 2);
+        // The built-in pair plus the action rows.
+        assert_eq!(settings_row_counts(0, 2)[SECTION_PLUGINS], 4);
     }
 
     #[test]
     fn other_sections_row_counts_are_fixed() {
-        let counts = settings_row_counts(5);
-        assert_eq!(counts[0], 11); // Video (+ Frame Limit, GPU Device, Window W/H, Upscaler, Factor)
-        assert_eq!(counts[1], 3); // Audio
-        assert_eq!(counts[2], 3); // Controller
-        assert_eq!(counts[4], 1); // Key Provider
-        assert_eq!(counts[5], 1); // Theme
-        assert_eq!(counts[6], 2); // System (version + updater action)
-        assert_eq!(counts[7], 8); // Advanced (Logging, Log Level, 3 traces/dumps + 3 more)
+        let counts = settings_row_counts(5, 3);
+        assert_eq!(counts[SECTION_VIDEO], 11); // Video (+ Frame Limit, GPU Device, Window W/H, Upscaler, Factor)
+        assert_eq!(counts[SECTION_AUDIO], 3); // Audio
+        assert_eq!(counts[SECTION_CONTROLLER], 3); // Controller
+        assert_eq!(counts[SECTION_KEY_PROVIDER], 1); // Key Provider
+        assert_eq!(counts[SECTION_THEME], 1); // Theme
+        assert_eq!(counts[SECTION_SYSTEM], 2); // System (version + updater action)
+        assert_eq!(counts[SECTION_ADVANCED], 8); // Advanced (Logging, Log Level, 3 traces/dumps + 3 more)
+    }
+
+    #[test]
+    fn capability_label_names_each_capability_and_passthrough() {
+        use raeen_gpu::Capabilities;
+        assert_eq!(capability_label(&Capabilities::default()), "Passthrough");
+        assert_eq!(
+            capability_label(&Capabilities {
+                upscale: true,
+                ..Default::default()
+            }),
+            "Upscale"
+        );
+        assert_eq!(
+            capability_label(&Capabilities {
+                upscale: true,
+                frame_gen: true,
+                wants_depth: true,
+                wants_motion_vectors: true,
+            }),
+            "Upscale · Frame Gen · Depth · Motion Vectors"
+        );
     }
 
     #[test]

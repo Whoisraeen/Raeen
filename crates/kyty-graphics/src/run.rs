@@ -825,6 +825,7 @@ impl CommandProcessor {
             pm4::IT_DRAW_INDEX_INDIRECT | pm4::IT_DRAW_INDEX_INDIRECT_MULTI => {
                 self.cp_op_draw_indirect(cmd_id, body, offset, sink, mem, true)
             }
+            pm4::IT_COND_EXEC => self.cp_op_cond_exec(cmd_id, body, offset, mem),
             // The wait family is honoured: parse, evaluate against the label,
             // and suspend the walk when unmet (see cp_op_wait_mem).
             pm4::IT_WAIT_REG_MEM => {
@@ -883,6 +884,59 @@ impl CommandProcessor {
             sink.guest_memory_write_boundary();
         }
         result
+    }
+
+    /// Conditional execution packet: a zero 32-bit label skips the following
+    /// packet range, while a non-zero label falls through. The returned count
+    /// includes the guarded dwords only on the skip path, so the outer stream
+    /// walker resumes at the first unguarded command.
+    fn cp_op_cond_exec(
+        &mut self,
+        cmd_id: u32,
+        body: &[u32],
+        offset: u32,
+        mem: Option<&dyn GuestMemory>,
+    ) -> Result<u32, CpError> {
+        let packet_body = pm4::body_dw(cmd_id);
+        if packet_body < 4 {
+            return Err(CpError::Truncated {
+                offset,
+                need: 5,
+                remaining: packet_body + 1,
+            });
+        }
+        let address = u64::from(Self::body_at(body, 0, offset)? & 0xffff_fffc)
+            | (u64::from(Self::body_at(body, 1, offset)?) << 32);
+        let skip_dwords = Self::body_at(body, 3, offset)? & 0x3fff;
+
+        let Some(mem) = mem else {
+            if self.first(SkipKey::Note("cond_exec_without_guest_memory")) {
+                warn!(
+                    address = format_args!("{address:#x}"),
+                    offset,
+                    "COND_EXEC label cannot be read without guest memory — guarded commands executed"
+                );
+            }
+            return Ok(packet_body);
+        };
+        let Some(value) = mem
+            .read_dwords(address, 1)
+            .and_then(|words| words.first().copied())
+        else {
+            if self.first(SkipKey::Note("cond_exec_unreadable_label")) {
+                warn!(
+                    address = format_args!("{address:#x}"),
+                    offset, "COND_EXEC label is unreadable — guarded commands executed"
+                );
+            }
+            return Ok(packet_body);
+        };
+
+        Ok(if value == 0 {
+            packet_body.saturating_add(skip_dwords)
+        } else {
+            packet_body
+        })
     }
 
     /// Kyty: `cp_op_nop` (L3156) — the AGC dialect's whole custom-op space
@@ -2634,10 +2688,13 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink {
         draws: Vec<(u32, u32, u32, bool, bool)>,
-        dispatches: Vec<([u32; 3], u32, u64, [u32; 3], u8, u32)>,
+        dispatches: Vec<RecordedDispatch>,
         guest_memory_write_boundaries: u32,
         fail: Option<String>,
     }
+
+    /// (group_xyz, unused, direct_address, dims, mode, tag) recorded per dispatch.
+    type RecordedDispatch = ([u32; 3], u32, u64, [u32; 3], u8, u32);
 
     impl DrawSink for RecordingSink {
         fn guest_memory_write_boundary(&mut self) {
@@ -2687,6 +2744,52 @@ mod tests {
             ));
             Ok(())
         }
+    }
+
+    #[test]
+    fn cond_exec_skips_the_guarded_dwords_when_the_label_is_zero() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let label_addr = 0x1000u64;
+        let mem = BufMem {
+            base: label_addr,
+            words: vec![0],
+        };
+        let dcb = vec![
+            header(5, pm4::IT_COND_EXEC, pm4::R_ZERO),
+            label_addr as u32,
+            (label_addr >> 32) as u32,
+            0,
+            3,
+            header(3, pm4::IT_DRAW_INDEX_AUTO, pm4::R_ZERO),
+            111,
+            0,
+            header(3, pm4::IT_DRAW_INDEX_AUTO, pm4::R_ZERO),
+            222,
+            0,
+        ];
+
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("conditional stream must execute");
+        assert_eq!(
+            sink.draws.iter().map(|draw| draw.0).collect::<Vec<_>>(),
+            vec![222],
+            "zero label must skip exactly the guarded command"
+        );
+
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let mem = BufMem {
+            base: label_addr,
+            words: vec![1],
+        };
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("non-zero conditional stream must execute");
+        assert_eq!(
+            sink.draws.iter().map(|draw| draw.0).collect::<Vec<_>>(),
+            vec![111, 222],
+            "non-zero label must execute the guarded command"
+        );
     }
 
     /// A sink that records the full [`IndexedDraw`], overriding the default
@@ -3066,14 +3169,7 @@ mod tests {
         cp.run(&dcb, &mut sink).expect("compute dispatch");
         assert_eq!(
             sink.dispatches,
-            [(
-                [11, 12, 13],
-                0,
-                0x12_2345_6789_00,
-                [8, 4, 2],
-                9,
-                0xCAFE_BABE,
-            )]
+            [([11, 12, 13], 0, 0x1223_4567_8900, [8, 4, 2], 9, 0xCAFE_BABE,)]
         );
         assert_eq!(cp.get_sh_ctx().cs.cs_regs.vgprs, 5);
         assert_eq!(cp.get_sh_ctx().cs.cs_regs.sgprs, 7);
@@ -3167,17 +3263,9 @@ mod tests {
         let mut sink = RecordingSink::default();
         // cull_front=1, cull_back=0, face=1, poly_mode=2, front_ptype=5,
         // back_ptype=3, offset_front=1, offset_back=0, vtx_window=1,
-        // provoking_last=1, persp_corr_dis=0.
-        let value = 1
-            | (0 << 1)
-            | (1 << 2)
-            | (2 << 3)
-            | (5 << 5)
-            | (3 << 8)
-            | (1 << 11)
-            | (0 << 12)
-            | (1 << 16)
-            | (1 << 19);
+        // provoking_last=1, persp_corr_dis=0 (zero-valued fields omitted).
+        let value =
+            1 | (1 << 2) | (2 << 3) | (5 << 5) | (3 << 8) | (1 << 11) | (1 << 16) | (1 << 19);
         let dcb = vec![
             header(3, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
             pm4::PA_SU_SC_MODE_CNTL,

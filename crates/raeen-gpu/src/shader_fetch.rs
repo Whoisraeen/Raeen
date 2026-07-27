@@ -840,6 +840,18 @@ impl ShaderTranslateCache {
                     &mut ps_info,
                 )
                 .map_err(|e| AttemptError::from_analysis("shader_get_input_info_ps", &e))?;
+                // Minecraft gameplay resolves its material T# with
+                // `s_load_dwordx8 s[14:21], s[12:13], 0` while declaring no
+                // EUD window. Evaluate bounded constant-offset loads through
+                // live user-data pointers before the generic placeholder pass
+                // so the real texture descriptor reaches both codegen and the
+                // Vulkan binding table.
+                kyty_graphics::shader::shader_capture_runtime_scalar_loads(
+                    &code,
+                    mem,
+                    &ps.ps_user_sgpr,
+                    &mut ps_info.bind,
+                );
                 // PC-relative scalar constant tables are stage-agnostic. VS
                 // and CS already run this capture; omitting it here left PS
                 // `s_load_dwordx8` instructions to the EUD-only fallback,

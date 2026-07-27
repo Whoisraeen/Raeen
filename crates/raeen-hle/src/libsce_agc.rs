@@ -42,7 +42,10 @@ const IT_DISPATCH_INDIRECT: u32 = 0x16;
 const IT_SET_BASE: u32 = 0x11;
 const IT_EVENT_WRITE: u32 = 0x46;
 const IT_WAIT_REG_MEM: u32 = 0x3C;
+const IT_SET_CONTEXT_REG: u32 = 0x69;
 const IT_SET_SH_REG: u32 = 0x76;
+const IT_SET_UCONFIG_REG: u32 = 0x79;
+const IT_COND_EXEC: u32 = 0x22;
 // Standard PM4 type-3 opcodes for packets the title emits through the newer
 // Gen5 entry points (the Agc dialect reuses the standard opcode numbering —
 // compare IT_DISPATCH_DIRECT/IT_INDEX_TYPE/IT_SET_BASE above).
@@ -201,6 +204,23 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceAgc", "sceAgcDcbWaitRegMem", hle_dcb_wait_reg_mem);
     registry.register("libSceAgc", "sceAgcDcbDmaData", hle_dcb_dma_data);
     registry.register("libSceAgc", "sceAgcDcbAcquireMem", hle_dcb_acquire_mem);
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetCxRegisterDirect",
+        hle_dcb_set_cx_register_direct,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetShRegisterDirect",
+        hle_dcb_set_sh_register_direct,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetUcRegisterDirect",
+        hle_dcb_set_uc_register_direct,
+    );
+    registry.register("libSceAgc", "sceAgcDcbCondExec", hle_dcb_cond_exec);
+    registry.register("libSceAgc", "sceAgcAcbCondExec", hle_dcb_cond_exec);
     registry.register(
         "libSceAgc",
         "sceAgcDcbSetCxRegistersIndirect",
@@ -498,6 +518,58 @@ pub fn register(registry: &HleRegistry) {
         "libSceAgc",
         "sceAgcDcbGetLodStatsGetSize",
         hle_dcb_get_lod_stats_get_size,
+    );
+    // GTA V's remaining Gen5 command-buffer sizing family. These return
+    // BYTES, not DWORDs. The fixed sizes match KytyPS5 `src/libs/agc.cpp`
+    // and the corresponding writers in this file. Keeping every writer's
+    // allocation probe nonzero prevents the title from under-reserving its
+    // PM4 backing store before the first render submission.
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetNumInstancesGetSize",
+        hle_get_size_2_dwords,
+    );
+    for name in [
+        "sceAgcDcbSetCxRegisterDirectGetSize",
+        "sceAgcDcbSetShRegisterDirectGetSize",
+        "sceAgcDcbSetUcRegisterDirectGetSize",
+        "sceAgcDcbSetIndexSizeGetSize",
+        "sceAgcDcbSetIndexBufferGetSize",
+        "sceAgcDcbDrawIndexAutoGetSize",
+        "sceAgcDcbDispatchIndirectGetSize",
+    ] {
+        registry.register("libSceAgc", name, hle_get_size_3_dwords);
+    }
+    for name in [
+        "sceAgcDcbSetCxRegistersIndirectGetSize",
+        "sceAgcDcbSetShRegistersIndirectGetSize",
+        "sceAgcDcbSetUcRegistersIndirectGetSize",
+        "sceAgcDcbDrawIndexOffsetGetSize",
+        "sceAgcDcbDrawIndirectGetSize",
+        "sceAgcDcbCondExecGetSize",
+        "sceAgcAcbCondExecGetSize",
+    ] {
+        registry.register("libSceAgc", name, hle_get_size_5_dwords);
+    }
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbDrawIndexGetSize",
+        hle_get_size_6_dwords,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbDrawIndexMultiInstancedGetSize",
+        hle_get_size_9_dwords,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbWriteDataGetSize",
+        hle_dcb_write_data_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbWaitOnAddressGetSize",
+        hle_dcb_wait_on_address_get_size,
     );
     // `sceAgcDriverSetTFRing(ring, size)`: binds the tessellation-factor ring
     // buffer. No tessellation path yet, so record nothing and return OK
@@ -2164,6 +2236,73 @@ fn hle_init(_ctx: &HleContext, args: &[u64]) -> u64 {
     0
 }
 
+/// Shared body for `sceAgcDcbSet{Cx,Sh,Uc}RegisterDirect(dcb, register)`.
+///
+/// The SysV ABI passes `ShaderRegister { u32 offset, u32 value }` by value in
+/// the second integer argument register, so `args[1]` contains both fields.
+/// Gen5 AGC uses ordinary SET_*_REG packets here; the command processor
+/// consumes all three opcodes directly.
+fn dcb_set_register_direct(ctx: &HleContext, args: &[u64], op: u32) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let packed_register = args.get(1).copied().unwrap_or(0);
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 3) else {
+        return 0;
+    };
+    let register_offset = packed_register as u32 & 0xffff;
+    let register_value = (packed_register >> 32) as u32;
+    let ok = ctx.mem.write(addr, &pm4(3, op, R_ZERO).to_le_bytes())
+        && ctx.mem.write(addr + 4, &register_offset.to_le_bytes())
+        && ctx.mem.write(addr + 8, &register_value.to_le_bytes());
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
+fn hle_dcb_set_cx_register_direct(ctx: &HleContext, args: &[u64]) -> u64 {
+    dcb_set_register_direct(ctx, args, IT_SET_CONTEXT_REG)
+}
+
+fn hle_dcb_set_sh_register_direct(ctx: &HleContext, args: &[u64]) -> u64 {
+    dcb_set_register_direct(ctx, args, IT_SET_SH_REG)
+}
+
+fn hle_dcb_set_uc_register_direct(ctx: &HleContext, args: &[u64]) -> u64 {
+    dcb_set_register_direct(ctx, args, IT_SET_UCONFIG_REG)
+}
+
+/// `sceAgc{Dcb,Acb}CondExec(cb, label, numDwords)`: execute the following
+/// `numDwords` only when the 32-bit guest label is non-zero.
+fn hle_dcb_cond_exec(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let label = args.get(1).copied().unwrap_or(0);
+    let num_dwords = args.get(2).copied().unwrap_or(0);
+    if cb == 0 || label == 0 || label & 3 != 0 || num_dwords > 0x3fff {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 5) else {
+        return 0;
+    };
+    let ok = ctx
+        .mem
+        .write(addr, &pm4(5, IT_COND_EXEC, R_ZERO).to_le_bytes())
+        && ctx
+            .mem
+            .write(addr + 4, &(label as u32 & 0xffff_fffc).to_le_bytes())
+        && ctx
+            .mem
+            .write(addr + 8, &((label >> 32) as u32).to_le_bytes())
+        && ctx.mem.write(addr + 12, &0u32.to_le_bytes())
+        && ctx.mem.write(addr + 16, &(num_dwords as u32).to_le_bytes());
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
 /// Shared body for `sceAgcDcbSet{Cx,Sh,Uc}RegistersIndirect(dcb, registers,
 /// registerCount)`: emit a 4-DWORD packet (count + registers address lo/hi)
 /// tagged with the register-space discriminator `packet_register`.
@@ -2755,6 +2894,47 @@ fn hle_dcb_stall_command_buffer_parser_get_size(_ctx: &HleContext, _args: &[u64]
 fn hle_dcb_get_lod_stats_get_size(_ctx: &HleContext, args: &[u64]) -> u64 {
     let counter_count = args.first().copied().unwrap_or(0) as u32;
     (0x10 + u64::from(counter_count) * 4).max(5 * 4)
+}
+
+/// Fixed Gen5 command-buffer sizes, in ABI-visible BYTES. KytyPS5's
+/// `GraphicsDcb*GetSize` functions return these exact values and the matching
+/// Raeen writers reserve the same DWORD counts.
+fn hle_get_size_2_dwords(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    2 * 4
+}
+
+fn hle_get_size_3_dwords(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    3 * 4
+}
+
+fn hle_get_size_5_dwords(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    5 * 4
+}
+
+fn hle_get_size_6_dwords(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    6 * 4
+}
+
+fn hle_get_size_9_dwords(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    9 * 4
+}
+
+/// `sceAgcDcbWriteDataGetSize(numDwords)`: four header/address DWORDs followed
+/// by the inline payload. KytyPS5: `4 * num_dwords + 16`.
+fn hle_dcb_write_data_get_size(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let num_dwords = args.first().copied().unwrap_or(0) as u32;
+    16 + u64::from(num_dwords) * 4
+}
+
+/// `sceAgcDcbWaitOnAddressGetSize(size)`: KytyPS5 deliberately reserves
+/// 14 DWORDs for a 32-bit wait and 16 for a 64-bit wait. Preserve that safe
+/// upper-bound ABI rather than shrinking it to the internal packet length.
+fn hle_dcb_wait_on_address_get_size(_ctx: &HleContext, args: &[u64]) -> u64 {
+    match args.first().copied().unwrap_or(u64::MAX) {
+        0 => 14 * 4,
+        1 => 16 * 4,
+        _ => 0,
+    }
 }
 
 /// Accept-and-ignore stub for AGC entry points with no state to record yet
@@ -6000,6 +6180,121 @@ mod tests {
         // (20-byte) writer so a small counterCount never under-reserves.
         assert_eq!(hle_dcb_get_lod_stats_get_size(&ctx, &[0]), 5 * 4);
         assert_eq!(hle_dcb_get_lod_stats_get_size(&ctx, &[8]), 0x10 + 8 * 4);
+    }
+
+    #[test]
+    fn gta_gen5_packet_sizing_family_is_registered() {
+        // GTA V imports these before building its first render command buffers.
+        // A fail-soft zero is not benign: it under-reserves the backing buffer
+        // and the corresponding writer can overwrite the following packet.
+        let registry = HleRegistry::new();
+        for name in [
+            "sceAgcDcbSetCxRegisterDirectGetSize",
+            "sceAgcDcbSetShRegisterDirectGetSize",
+            "sceAgcDcbSetUcRegisterDirectGetSize",
+            "sceAgcDcbSetCxRegistersIndirectGetSize",
+            "sceAgcDcbSetShRegistersIndirectGetSize",
+            "sceAgcDcbSetUcRegistersIndirectGetSize",
+            "sceAgcDcbSetIndexSizeGetSize",
+            "sceAgcDcbSetIndexBufferGetSize",
+            "sceAgcDcbSetNumInstancesGetSize",
+            "sceAgcDcbDrawIndexGetSize",
+            "sceAgcDcbDrawIndexMultiInstancedGetSize",
+            "sceAgcDcbDrawIndexAutoGetSize",
+            "sceAgcDcbDrawIndexOffsetGetSize",
+            "sceAgcDcbDrawIndirectGetSize",
+            "sceAgcDcbDispatchIndirectGetSize",
+            "sceAgcDcbCondExecGetSize",
+            "sceAgcAcbCondExecGetSize",
+            "sceAgcDcbWriteDataGetSize",
+            "sceAgcDcbWaitOnAddressGetSize",
+        ] {
+            assert!(
+                registry.is_implemented("libSceAgc", name),
+                "GTA V packet-sizing import {name} must be registered"
+            );
+        }
+
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_get_size_2_dwords(&ctx, &[]), 8);
+        assert_eq!(hle_get_size_3_dwords(&ctx, &[]), 12);
+        assert_eq!(hle_get_size_5_dwords(&ctx, &[]), 20);
+        assert_eq!(hle_get_size_6_dwords(&ctx, &[]), 24);
+        assert_eq!(hle_get_size_9_dwords(&ctx, &[]), 36);
+        assert_eq!(hle_dcb_write_data_get_size(&ctx, &[0]), 16);
+        assert_eq!(hle_dcb_write_data_get_size(&ctx, &[7]), 44);
+        assert_eq!(hle_dcb_wait_on_address_get_size(&ctx, &[0]), 56);
+        assert_eq!(hle_dcb_wait_on_address_get_size(&ctx, &[1]), 64);
+        assert_eq!(hle_dcb_wait_on_address_get_size(&ctx, &[2]), 0);
+    }
+
+    #[test]
+    fn gta_direct_register_writers_are_registered() {
+        let registry = HleRegistry::new();
+        for name in [
+            "sceAgcDcbSetCxRegisterDirect",
+            "sceAgcDcbSetShRegisterDirect",
+            "sceAgcDcbSetUcRegisterDirect",
+        ] {
+            assert!(
+                registry.is_implemented("libSceAgc", name),
+                "GTA V direct-register import {name} must be registered"
+            );
+        }
+
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let packed = (0xDEAD_BEEFu64 << 32) | 0x1234_5678;
+
+        let cx = hle_dcb_set_cx_register_direct(&ctx, &[cb, packed]);
+        assert_eq!(cx, 0x400);
+        assert_eq!(read_u32(&ctx, cx), pm4(3, IT_SET_CONTEXT_REG, R_ZERO));
+        assert_eq!(read_u32(&ctx, cx + 4), 0x5678);
+        assert_eq!(read_u32(&ctx, cx + 8), 0xDEAD_BEEF);
+
+        let sh = hle_dcb_set_sh_register_direct(&ctx, &[cb, packed]);
+        assert_eq!(sh, 0x40C);
+        assert_eq!(read_u32(&ctx, sh), pm4(3, IT_SET_SH_REG, R_ZERO));
+        assert_eq!(read_u32(&ctx, sh + 4), 0x5678);
+        assert_eq!(read_u32(&ctx, sh + 8), 0xDEAD_BEEF);
+
+        let uc = hle_dcb_set_uc_register_direct(&ctx, &[cb, packed]);
+        assert_eq!(uc, 0x418);
+        assert_eq!(read_u32(&ctx, uc), pm4(3, IT_SET_UCONFIG_REG, R_ZERO));
+        assert_eq!(read_u32(&ctx, uc + 4), 0x5678);
+        assert_eq!(read_u32(&ctx, uc + 8), 0xDEAD_BEEF);
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x424);
+    }
+
+    #[test]
+    fn gta_cond_exec_writers_are_registered() {
+        let registry = HleRegistry::new();
+        for name in ["sceAgcDcbCondExec", "sceAgcAcbCondExec"] {
+            assert!(
+                registry.is_implemented("libSceAgc", name),
+                "GTA V conditional-execution import {name} must be registered"
+            );
+        }
+
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let label = 0x0000_00AB_CDEF_1000u64;
+        assert_eq!(hle_dcb_cond_exec(&ctx, &[cb, label, 0x123]), 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(5, IT_COND_EXEC, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), label as u32);
+        assert_eq!(read_u32(&ctx, 0x408), (label >> 32) as u32);
+        assert_eq!(read_u32(&ctx, 0x40C), 0);
+        assert_eq!(read_u32(&ctx, 0x410), 0x123);
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x414);
+
+        assert_eq!(hle_dcb_cond_exec(&ctx, &[cb, 0, 1]), 0);
+        assert_eq!(hle_dcb_cond_exec(&ctx, &[cb, label + 1, 1]), 0);
+        assert_eq!(hle_dcb_cond_exec(&ctx, &[cb, label, 0x4000]), 0);
     }
 
     #[test]

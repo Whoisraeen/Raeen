@@ -499,6 +499,10 @@ impl PresentPlugin for DynamicPlugin {
         self.capabilities
     }
 
+    fn source_path(&self) -> Option<&Path> {
+        Some(&self.source)
+    }
+
     fn process(&mut self, frame: &PresentFrame<'_>, ctx: &PresentContext) -> PluginOutput {
         // SAFETY: validated at construction and the backing library is alive.
         let vt = unsafe { *self.vtable };
@@ -707,6 +711,7 @@ pub unsafe fn load_and_register_dir(dir: &Path) -> Vec<String> {
     // SAFETY: delegated to this function's caller.
     let results = unsafe { scan_dir(dir) };
     let mut registered = Vec::new();
+    let mut failures = Vec::new();
 
     for result in results {
         match result {
@@ -723,9 +728,13 @@ pub unsafe fn load_and_register_dir(dir: &Path) -> Vec<String> {
             }
             Err(err) => {
                 tracing::warn!(error = %err, "refused a present plugin candidate");
+                failures.push(err.to_string());
             }
         }
     }
+    // Replace, don't append: a rescan reports the directory as it is now, and
+    // a clean rescan clears refusals from a plugin the user since removed.
+    super::set_load_failures(failures);
     registered
 }
 

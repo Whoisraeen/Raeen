@@ -810,9 +810,11 @@ mod tests {
 
     #[test]
     fn reset_restores_nonzero_defaults() {
-        let mut ctx = Context::default();
-        ctx.line_width = 8.0;
-        ctx.render_target_mask = 0xF;
+        let mut ctx = Context {
+            line_width: 8.0,
+            render_target_mask: 0xF,
+            ..Default::default()
+        };
         ctx.reset();
         assert_eq!(ctx.line_width, 1.0);
         assert_eq!(ctx.render_target_mask, 0);

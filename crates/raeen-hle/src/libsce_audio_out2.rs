@@ -47,7 +47,8 @@ const SCE_ERROR_MEMORY_FAULT: u64 = 0x8002_000E;
 const SCE_AUDIO_OUT2_ERROR_PORT_FULL: u64 = 0x8026_8012;
 
 const CONTEXT_PARAM_SIZE: usize = 0x40;
-const CONTEXT_MEMORY_SIZE: u64 = 0x10000;
+const CONTEXT_MEMORY_BASE_SIZE: u64 = 0x10000;
+const CONTEXT_MEMORY_QUEUE_STRIDE: u64 = 0x590;
 
 /// Upper bound on one port's PCM read from the guest, mirroring
 /// [`crate::libsce_audio_out`]'s `MAX_OUTPUT_BYTES`. A grain of 0x4000 frames ×
@@ -65,6 +66,14 @@ const MAX_CHANNELS: u32 = 16;
 /// Clamp on the `AudioOut2PortSetAttributes` attribute count we will walk, so a
 /// malformed `num` can't spin the parse loop. Real callers pass a handful.
 const MAX_ATTRIBUTES: u64 = 64;
+
+/// KytyPS5 keeps 32 process-local speaker-array slots.
+const MAX_SPEAKER_ARRAYS: usize = 32;
+
+/// A real speaker array is bounded to 32 speakers. Leave room for higher-order
+/// ambisonics coefficients while rejecting a corrupt count before allocating
+/// or writing an unbounded guest buffer.
+const MAX_SPEAKER_COEFFICIENTS: u64 = 256;
 
 /// `AudioOut2Attribute` stride: `{ u32 id; i32 reserved; const void* value;
 /// size_t value_size }` = 4 + 4 + 8 + 8 on the guest's LP64 ABI.
@@ -151,6 +160,26 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register(
         "libSceAudioOut2",
+        "sceAudioOut2GetSpeakerArrayMemorySize",
+        hle_get_speaker_array_memory_size,
+    );
+    registry.register(
+        "libSceAudioOut2",
+        "sceAudioOut2SpeakerArrayCreate",
+        hle_speaker_array_create,
+    );
+    registry.register(
+        "libSceAudioOut2",
+        "sceAudioOut2SpeakerArrayDestroy",
+        hle_speaker_array_destroy,
+    );
+    registry.register(
+        "libSceAudioOut2",
+        "sceAudioOut2GetSpeakerArrayAmbisonicsCoefficients",
+        hle_get_speaker_array_ambisonics_coefficients,
+    );
+    registry.register(
+        "libSceAudioOut2",
         "sceAudioOut2PortDestroy",
         hle_port_destroy,
     );
@@ -180,14 +209,28 @@ fn hle_context_reset_param(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 /// `sceAudioOut2ContextQueryMemory(param, outMemorySize)`: reports the
-/// context's required working-memory size (0x10000).
+/// context's required working-memory size.
+///
+/// The queue storage is part of this allocation. KytyPS5's live Gen5
+/// implementation computes `0x10000 + queue_depth * 0x590`, defaulting a zero
+/// queue depth to four. Returning only the fixed prefix truncated GTA V's
+/// AudioOut2 allocation by 0x1640 bytes and its audio initialization asserted
+/// immediately after creating the first port.
 fn hle_context_query_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     let param = args.first().copied().unwrap_or(0);
     let out_size = args.get(1).copied().unwrap_or(0);
     if param == 0 || out_size == 0 {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
-    if ctx.mem.write(out_size, &CONTEXT_MEMORY_SIZE.to_le_bytes()) {
+    let mut queue_depth_bytes = [0u8; 4];
+    if !ctx.mem.read(param + 0x0C, &mut queue_depth_bytes) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    let queue_depth = u32::from_le_bytes(queue_depth_bytes);
+    let queue_depth = if queue_depth == 0 { 4 } else { queue_depth };
+    let memory_size = CONTEXT_MEMORY_BASE_SIZE
+        .saturating_add(u64::from(queue_depth).saturating_mul(CONTEXT_MEMORY_QUEUE_STRIDE));
+    if ctx.mem.write(out_size, &memory_size.to_le_bytes()) {
         OK
     } else {
         SCE_ERROR_MEMORY_FAULT
@@ -685,6 +728,97 @@ fn hle_get_speaker_info(ctx: &HleContext, args: &[u64]) -> u64 {
     }
 }
 
+/// `sceAudioOut2GetSpeakerArrayMemorySize(numSpeakers, is3D, isAmbisonics)`.
+///
+/// This is the exact bounded sizing rule used by KytyPS5's PS5 AudioOut2
+/// implementation. GTA V calls it during engine startup; leaving the NID
+/// unresolved returned zero and caused an undersized speaker-array allocation.
+fn hle_get_speaker_array_memory_size(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let num_speakers = args.first().copied().unwrap_or(0).clamp(1, 32);
+    let is_3d = args.get(1).copied().unwrap_or(0) as u8;
+    let is_ambisonics = args.get(2).copied().unwrap_or(0) as u8;
+    let per_speaker = if is_ambisonics != 0 { 0x100 } else { 0x40 };
+    0x400 + num_speakers * per_speaker + if is_3d != 0 { 0x200 } else { 0 }
+}
+
+/// Process-local speaker-array slots. Handles are opaque guest values: the
+/// high tag prevents collisions with AudioOut2's small context/port handles,
+/// while the low bits identify the fixed KytyPS5-style slot.
+static SPEAKER_ARRAYS: std::sync::Mutex<[bool; MAX_SPEAKER_ARRAYS]> =
+    std::sync::Mutex::new([false; MAX_SPEAKER_ARRAYS]);
+
+/// `sceAudioOut2SpeakerArrayCreate(outHandle, vbapParams, ambiParams)`.
+///
+/// KytyPS5 treats both parameter blocks as optional, allocates one of 32
+/// process-local slots, and initializes a two-speaker array. Raeen only needs
+/// the opaque lifecycle here; coefficient generation is handled separately.
+fn hle_speaker_array_create(ctx: &HleContext, args: &[u64]) -> u64 {
+    let out_handle = args.first().copied().unwrap_or(0);
+    if out_handle == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+
+    let mut slots = SPEAKER_ARRAYS.lock().expect("speaker-array mutex");
+    let Some(slot) = slots.iter().position(|used| !*used) else {
+        return SCE_AUDIO_OUT2_ERROR_PORT_FULL;
+    };
+    slots[slot] = true;
+    let handle = 0x3000_0000u64 | (slot as u64 + 1);
+    if ctx.mem.write(out_handle, &handle.to_le_bytes()) {
+        OK
+    } else {
+        slots[slot] = false;
+        SCE_ERROR_MEMORY_FAULT
+    }
+}
+
+/// `sceAudioOut2SpeakerArrayDestroy(handle)`: release a matching slot and
+/// tolerate stale/unknown opaque handles, as KytyPS5 does.
+fn hle_speaker_array_destroy(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0);
+    let slot = (handle & 0x0fff_ffff).wrapping_sub(1) as usize;
+    if handle & 0xf000_0000 == 0x3000_0000 && slot < MAX_SPEAKER_ARRAYS {
+        SPEAKER_ARRAYS.lock().expect("speaker-array mutex")[slot] = false;
+    }
+    OK
+}
+
+/// `sceAudioOut2GetSpeakerArrayAmbisonicsCoefficients(
+/// handle, channel, coefficients, count)`.
+///
+/// The live KytyPS5 implementation initializes the whole output to zero and
+/// puts the normalization coefficient in lane zero (`sqrt(1/2)` for W-channel
+/// aliases 0/64, unity otherwise). The handle is opaque and intentionally not
+/// rejected; the reference implementation also treats this as a pure bounded
+/// coefficient fill.
+fn hle_get_speaker_array_ambisonics_coefficients(ctx: &HleContext, args: &[u64]) -> u64 {
+    let channel = args.get(1).copied().unwrap_or(0) as u32;
+    let coefficients = args.get(2).copied().unwrap_or(0);
+    let count = args.get(3).copied().unwrap_or(0);
+    if count > MAX_SPEAKER_COEFFICIENTS {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    if count == 0 {
+        return OK;
+    }
+    if coefficients == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+
+    let mut output = vec![0u8; count as usize * std::mem::size_of::<f32>()];
+    let first = if matches!(channel, 0 | 64) {
+        0.707_106_77f32
+    } else {
+        1.0f32
+    };
+    output[..4].copy_from_slice(&first.to_le_bytes());
+    if ctx.mem.write(coefficients, &output) {
+        OK
+    } else {
+        SCE_ERROR_MEMORY_FAULT
+    }
+}
+
 /// `sceAudioOut2UserCreate(userId, outUser)`: returns a fresh user handle for a
 /// recognized user id (0, 1, 255, or 1000).
 fn hle_user_create(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -730,6 +864,12 @@ mod tests {
         u64::from_le_bytes(b)
     }
 
+    fn read_f32(mem: &crate::TestMemory, addr: u64) -> f32 {
+        let mut b = [0u8; 4];
+        assert!(mem.read(addr, &mut b));
+        f32::from_le_bytes(b)
+    }
+
     #[test]
     fn reset_param_and_query_memory_and_speaker_info() {
         let (kernel, mem, alloc) = env();
@@ -748,7 +888,16 @@ mod tests {
         assert_eq!(read_u32(&mem, 0x24), 1);
 
         assert_eq!(hle_context_query_memory(&ctx, &[0x10, 0x60]), OK);
-        assert_eq!(read_u64(&mem, 0x60), CONTEXT_MEMORY_SIZE);
+        assert_eq!(
+            read_u64(&mem, 0x60),
+            CONTEXT_MEMORY_BASE_SIZE + 4 * CONTEXT_MEMORY_QUEUE_STRIDE
+        );
+        assert!(mem.write(0x1C, &9u32.to_le_bytes()));
+        assert_eq!(hle_context_query_memory(&ctx, &[0x10, 0x60]), OK);
+        assert_eq!(
+            read_u64(&mem, 0x60),
+            CONTEXT_MEMORY_BASE_SIZE + 9 * CONTEXT_MEMORY_QUEUE_STRIDE
+        );
         assert_eq!(
             hle_context_query_memory(&ctx, &[0, 0x60]),
             SCE_ERROR_INVALID_ARGUMENT
@@ -758,6 +907,63 @@ mod tests {
         assert_eq!(read_u32(&mem, 0x80), 1);
         assert_eq!(read_u32(&mem, 0x84), 2);
         assert_eq!(read_u32(&mem, 0x88), 48000);
+    }
+
+    #[test]
+    fn speaker_array_memory_size_is_registered_and_matches_gen5_sizing() {
+        let registry = HleRegistry::new();
+        for name in [
+            "sceAudioOut2GetSpeakerArrayMemorySize",
+            "sceAudioOut2SpeakerArrayCreate",
+            "sceAudioOut2SpeakerArrayDestroy",
+            "sceAudioOut2GetSpeakerArrayAmbisonicsCoefficients",
+        ] {
+            assert!(
+                registry.is_implemented("libSceAudioOut2", name),
+                "GTA V's AudioOut2 speaker-array import {name} must be registered"
+            );
+        }
+
+        let (kernel, mem, alloc) = env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_get_speaker_array_memory_size(&ctx, &[0, 0, 0]), 0x440);
+        assert_eq!(hle_get_speaker_array_memory_size(&ctx, &[2, 1, 0]), 0x680);
+        assert_eq!(hle_get_speaker_array_memory_size(&ctx, &[64, 0, 1]), 0x2400);
+    }
+
+    #[test]
+    fn speaker_array_lifecycle_and_ambisonics_coefficients_are_bounded() {
+        *SPEAKER_ARRAYS.lock().expect("speaker-array mutex") = [false; MAX_SPEAKER_ARRAYS];
+        let (kernel, mem, alloc) = env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(
+            hle_speaker_array_create(&ctx, &[0, 0, 0]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(hle_speaker_array_create(&ctx, &[0x40, 0, 0]), OK);
+        let handle = read_u64(&mem, 0x40);
+        assert_eq!(handle, 0x3000_0001);
+
+        assert_eq!(
+            hle_get_speaker_array_ambisonics_coefficients(&ctx, &[handle, 0, 0x80, 4]),
+            OK
+        );
+        assert!((read_f32(&mem, 0x80) - 0.707_106_77).abs() < f32::EPSILON);
+        assert_eq!(read_f32(&mem, 0x84), 0.0);
+        assert_eq!(read_f32(&mem, 0x88), 0.0);
+        assert_eq!(read_f32(&mem, 0x8C), 0.0);
+
+        assert_eq!(
+            hle_get_speaker_array_ambisonics_coefficients(
+                &ctx,
+                &[handle, 1, 0x80, MAX_SPEAKER_COEFFICIENTS + 1]
+            ),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(hle_speaker_array_destroy(&ctx, &[handle]), OK);
+        assert_eq!(hle_speaker_array_create(&ctx, &[0x48, 0, 0]), OK);
+        assert_eq!(read_u64(&mem, 0x48), handle, "destroyed slots are reusable");
     }
 
     #[test]

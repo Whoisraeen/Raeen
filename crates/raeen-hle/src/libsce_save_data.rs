@@ -12,7 +12,7 @@
 
 use crate::{HleContext, HleRegistry};
 use std::sync::atomic::Ordering;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// `SCE_OK`.
 const SCE_OK: u64 = 0;
@@ -25,6 +25,17 @@ const ERROR_INTERNAL: u64 = 0x809F_000B;
 const ERROR_MEMORY_NOT_READY: u64 = 0x809F_0012;
 /// Save-memory blob ceiling (SharpEmu: 64 MiB).
 const SAVE_DATA_MEMORY_MAX: u64 = 64 * 1024 * 1024;
+/// Deterministic virtual quota exposed through the save-data ABI.
+///
+/// PS5-facing Kyty uses 16,384 32-KiB blocks (512 MiB). Advertising a much
+/// larger synthetic value is not harmless: Minecraft converts this value
+/// through a 32-bit byte count in its storage policy, so Raeen's former
+/// 32-GiB value overflowed and was reported as "almost out of storage".
+const SAVE_DATA_BLOCK_SIZE: u64 = 32 * 1024;
+const SAVE_DATA_TOTAL_BLOCKS: u64 = 16_384;
+const SAVE_DATA_PARAM_SIZE: usize = 0x530;
+const SAVE_DATA_SEARCH_INFO_SIZE: usize = 48;
+const SAVE_DATA_MOUNT3_HEAD_SIZE: usize = 0x2c;
 const MOUNT_MODE_CREATE: u32 = 1 << 2;
 const MOUNT_MODE_CREATE2: u32 = 1 << 5;
 /// `SceSaveDataMountResult` size in bytes.
@@ -618,19 +629,31 @@ fn hle_get_mount_info(ctx: &HleContext, args: &[u64]) -> u64 {
     if !ctx.mem.read(mount_point, &mut mount_bytes) {
         return 0x8002_000E;
     }
-    let valid = savedata_prefix(&mount_bytes)
-        .is_some_and(|mount| ctx.kernel.filesystem.resolve_path(&mount).is_some());
-    if !valid {
+    let Some(host_path) =
+        savedata_prefix(&mount_bytes).and_then(|mount| ctx.kernel.filesystem.resolve_path(&mount))
+    else {
         return 0x809F_000B;
-    }
+    };
 
-    // 1,048,576 32-KiB blocks = 32 GiB. This is a deterministic virtual
-    // quota, not a claim about host free space; actual writes remain bounded
-    // by the host filesystem and surface their real I/O errors.
-    let blocks = 1_048_576u64;
-    let mut result = [0u8; 48];
-    result[..8].copy_from_slice(&blocks.to_le_bytes());
-    result[8..16].copy_from_slice(&blocks.to_le_bytes());
+    // This is a deterministic virtual quota, not a claim about host free
+    // space; actual writes still surface their real host I/O errors.
+    let Ok(result) = save_data_capacity_info(&host_path) else {
+        return ERROR_INTERNAL;
+    };
+    if std::env::var_os("RAEEN_TRACE_SAVEDATA").is_some() {
+        let blocks = u64::from_le_bytes(result[..8].try_into().expect("fixed slice"));
+        let free_blocks = u64::from_le_bytes(result[8..16].try_into().expect("fixed slice"));
+        info!(
+            mount = %String::from_utf8_lossy(
+                &mount_bytes[..mount_bytes.iter().position(|byte| *byte == 0).unwrap_or(16)]
+            ),
+            path = %host_path.display(),
+            blocks,
+            free_blocks,
+            used_blocks = blocks.saturating_sub(free_blocks),
+            "sceSaveDataGetMountInfo capacity"
+        );
+    }
     if !ctx.mem.write(info, &result) {
         return 0x8002_000E;
     }
@@ -658,6 +681,8 @@ fn hle_dir_name_search(ctx: &HleContext, args: &[u64]) -> u64 {
     }
     let names_out = u64::from_le_bytes(result_bytes[8..16].try_into().expect("fixed slice"));
     let capacity = u32::from_le_bytes(result_bytes[16..20].try_into().expect("fixed slice"));
+    let params_out = u64::from_le_bytes(result_bytes[24..32].try_into().expect("fixed slice"));
+    let infos_out = u64::from_le_bytes(result_bytes[32..40].try_into().expect("fixed slice"));
     let pattern_ptr = u64::from_le_bytes(cond_bytes[16..24].try_into().expect("fixed slice"));
     let pattern = if pattern_ptr == 0 {
         String::new()
@@ -676,7 +701,7 @@ fn hle_dir_name_search(ctx: &HleContext, args: &[u64]) -> u64 {
         }
     };
     let root = ctx.kernel.filesystem.savedata_root();
-    let mut names: Vec<String> = match std::fs::read_dir(root) {
+    let mut names: Vec<String> = match std::fs::read_dir(&root) {
         Ok(entries) => entries
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_ok_and(|ty| ty.is_dir()))
@@ -698,6 +723,16 @@ fn hle_dir_name_search(ctx: &HleContext, args: &[u64]) -> u64 {
         names.reverse();
     }
     let set_count = names.len().min(capacity as usize);
+    if std::env::var_os("RAEEN_TRACE_SAVEDATA").is_some() {
+        info!(
+            hits = names.len(),
+            set_count,
+            capacity,
+            params = format_args!("{params_out:#x}"),
+            infos = format_args!("{infos_out:#x}"),
+            "sceSaveDataDirNameSearch result"
+        );
+    }
     if !ctx.mem.write(result, &(names.len() as u32).to_le_bytes())
         || !ctx
             .mem
@@ -708,15 +743,74 @@ fn hle_dir_name_search(ctx: &HleContext, args: &[u64]) -> u64 {
     if set_count != 0 && names_out == 0 {
         return ERROR_PARAMETER;
     }
-    for (index, name) in names.into_iter().take(set_count).enumerate() {
+    for (index, name) in names.iter().take(set_count).enumerate() {
         let mut encoded = [0u8; 32];
         encoded[..name.len()].copy_from_slice(name.as_bytes());
         if !ctx.mem.write(names_out + index as u64 * 32, &encoded) {
             return 0x8002_000E;
         }
+        if params_out != 0
+            && !ctx.mem.write(
+                params_out + index as u64 * SAVE_DATA_PARAM_SIZE as u64,
+                &[0; SAVE_DATA_PARAM_SIZE],
+            )
+        {
+            return 0x8002_000E;
+        }
+        if infos_out != 0 {
+            let info = match save_data_capacity_info(&root.join(name)) {
+                Ok(info) => info,
+                Err(error) => {
+                    warn!("sceSaveDataDirNameSearch: failed to size '{name}': {error}");
+                    return ERROR_INTERNAL;
+                }
+            };
+            if !ctx.mem.write(
+                infos_out + index as u64 * SAVE_DATA_SEARCH_INFO_SIZE as u64,
+                &info,
+            ) {
+                return 0x8002_000E;
+            }
+        }
     }
     debug!("sceSaveDataDirNameSearchPs4 -> {set_count} entr(ies)");
     SCE_OK
+}
+
+fn save_data_capacity_info(
+    path: &std::path::Path,
+) -> std::io::Result<[u8; SAVE_DATA_SEARCH_INFO_SIZE]> {
+    let used_bytes = save_data_directory_bytes(path)?;
+    let used_blocks = used_bytes
+        .saturating_add(SAVE_DATA_BLOCK_SIZE - 1)
+        .checked_div(SAVE_DATA_BLOCK_SIZE)
+        .unwrap_or(0);
+    let free_blocks = SAVE_DATA_TOTAL_BLOCKS.saturating_sub(used_blocks);
+    let mut info = [0u8; SAVE_DATA_SEARCH_INFO_SIZE];
+    info[..8].copy_from_slice(&SAVE_DATA_TOTAL_BLOCKS.to_le_bytes());
+    info[8..16].copy_from_slice(&free_blocks.to_le_bytes());
+    Ok(info)
+}
+
+fn save_data_directory_bytes(path: &std::path::Path) -> std::io::Result<u64> {
+    let mut bytes = 0u64;
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            bytes = bytes.saturating_add(save_data_directory_bytes(&entry.path())?);
+        } else if file_type.is_file() {
+            bytes = bytes.saturating_add(entry.metadata()?.len());
+        }
+        // Symlinks and other special files are deliberately not followed:
+        // save accounting must remain inside the title's sandbox.
+    }
+    Ok(bytes)
 }
 
 /// `sceSaveDataDelete(const SceSaveDataDelete*)`: delete one directory below
@@ -823,6 +917,31 @@ fn hle_unmount(ctx: &HleContext, args: &[u64]) -> u64 {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct SaveDataMount3Head {
+    user_id: i32,
+    dir_name_ptr: u64,
+    blocks: u64,
+    system_blocks: u64,
+    mount_mode: u32,
+    resource: i32,
+}
+
+fn parse_save_data_mount3_head(request: &[u8; SAVE_DATA_MOUNT3_HEAD_SIZE]) -> SaveDataMount3Head {
+    SaveDataMount3Head {
+        user_id: i32::from_le_bytes(request[..4].try_into().expect("fixed slice")),
+        dir_name_ptr: u64::from_le_bytes(request[0x08..0x10].try_into().expect("fixed slice")),
+        blocks: u64::from_le_bytes(request[0x10..0x18].try_into().expect("fixed slice")),
+        system_blocks: u64::from_le_bytes(request[0x18..0x20].try_into().expect("fixed slice")),
+        mount_mode: u32::from_le_bytes(request[0x20..0x24].try_into().expect("fixed slice")),
+        // Native PS5 Mount3 has a four-byte pad at 0x24 and the signed
+        // transaction resource at 0x28. Treating the pad as `resource` hid
+        // the real handle from diagnostics and disagreed with the ABI used by
+        // KytyPS5.
+        resource: i32::from_le_bytes(request[0x28..0x2c].try_into().expect("fixed slice")),
+    }
+}
+
 /// `sceSaveDataMount{,2,3}(const SceSaveDataMount* mount,
 /// SceSaveDataMountResult* result)`: writes the mount-point path
 /// (`/savedata0`) into `result`'s leading 16-byte field and returns OK. The
@@ -836,17 +955,18 @@ fn hle_mount(ctx: &HleContext, args: &[u64]) -> u64 {
         return ERROR_PARAMETER;
     }
 
-    let mut request = [0u8; 0x2c];
+    let mut request = [0u8; SAVE_DATA_MOUNT3_HEAD_SIZE];
     if !ctx.mem.read(mount_ptr, &mut request) {
         return 0x8002_000E;
     }
-    let user_id = i32::from_le_bytes(request[..4].try_into().expect("fixed slice"));
-    let dir_name_ptr = u64::from_le_bytes(request[0x08..0x10].try_into().expect("fixed slice"));
-    let blocks = u64::from_le_bytes(request[0x10..0x18].try_into().expect("fixed slice"));
-    let system_blocks = u64::from_le_bytes(request[0x18..0x20].try_into().expect("fixed slice"));
-    let mount_mode = u32::from_le_bytes(request[0x20..0x24].try_into().expect("fixed slice"));
-    let resource = u32::from_le_bytes(request[0x24..0x28].try_into().expect("fixed slice"));
-    let mode = u32::from_le_bytes(request[0x28..0x2c].try_into().expect("fixed slice"));
+    let SaveDataMount3Head {
+        user_id,
+        dir_name_ptr,
+        blocks,
+        system_blocks,
+        mount_mode,
+        resource,
+    } = parse_save_data_mount3_head(&request);
     if user_id < 0 || dir_name_ptr == 0 {
         return ERROR_PARAMETER;
     }
@@ -908,7 +1028,7 @@ fn hle_mount(ctx: &HleContext, args: &[u64]) -> u64 {
         return ERROR_PARAMETER;
     }
     debug!(
-        "sceSaveDataMount3(user={user_id}, dir='{dir_name}', blocks={blocks}, system_blocks={system_blocks}, mount_mode={mount_mode:#x}, resource={resource}, mode={mode}) -> {prefix}"
+        "sceSaveDataMount3(user={user_id}, dir='{dir_name}', blocks={blocks}, system_blocks={system_blocks}, mount_mode={mount_mode:#x}, resource={resource}) -> {prefix}"
     );
     SCE_OK
 }
@@ -1143,6 +1263,31 @@ mod tests {
     }
 
     #[test]
+    fn native_mount3_reads_resource_after_the_padding_field() {
+        let mut request = [0u8; SAVE_DATA_MOUNT3_HEAD_SIZE];
+        request[..4].copy_from_slice(&7i32.to_le_bytes());
+        request[0x08..0x10].copy_from_slice(&0x1234_5678u64.to_le_bytes());
+        request[0x10..0x18].copy_from_slice(&64u64.to_le_bytes());
+        request[0x18..0x20].copy_from_slice(&8u64.to_le_bytes());
+        request[0x20..0x24].copy_from_slice(&MOUNT_MODE_CREATE2.to_le_bytes());
+        request[0x24..0x28].copy_from_slice(&0x7f7f_7f7fu32.to_le_bytes());
+        request[0x28..0x2c].copy_from_slice(&42i32.to_le_bytes());
+
+        assert_eq!(
+            parse_save_data_mount3_head(&request),
+            SaveDataMount3Head {
+                user_id: 7,
+                dir_name_ptr: 0x1234_5678,
+                blocks: 64,
+                system_blocks: 8,
+                mount_mode: MOUNT_MODE_CREATE2,
+                resource: 42,
+            },
+            "the 0x24 padding must never be mistaken for the resource handle"
+        );
+    }
+
+    #[test]
     fn bedrock_world_mount_keeps_leveldb_view_after_service_unmount() {
         assert_eq!(
             bedrock_world_guest_alias("BedrockWorldxDe5FqCkuF8@P1").as_deref(),
@@ -1225,11 +1370,8 @@ mod tests {
         assert_eq!(hle_get_mount_info(&ctx, &[0x10, 0x100]), SCE_OK);
         let mut info = [0u8; 48];
         assert!(mem.read(0x100, &mut info));
-        assert_eq!(u64::from_le_bytes(info[..8].try_into().unwrap()), 1_048_576);
-        assert_eq!(
-            u64::from_le_bytes(info[8..16].try_into().unwrap()),
-            1_048_576
-        );
+        assert_eq!(u64::from_le_bytes(info[..8].try_into().unwrap()), 16_384);
+        assert_eq!(u64::from_le_bytes(info[8..16].try_into().unwrap()), 16_384);
         assert_eq!(&info[16..], &[0; 32]);
 
         let registry = HleRegistry::new();
@@ -1319,7 +1461,7 @@ mod tests {
     #[test]
     fn dir_name_search_reports_empty_and_enumerates_slots() {
         let kernel = raeen_kernel::OrbisKernel::new();
-        let mem = crate::TestMemory::new(0x1000);
+        let mem = crate::TestMemory::new(0x4000);
         let alloc = crate::TestAllocator::new(0);
         let ctx = test_ctx(&kernel, &mem, &alloc);
         let root = std::env::temp_dir().join(format!("raeen-save-search-{}", std::process::id()));
@@ -1335,15 +1477,35 @@ mod tests {
         assert_eq!(u32::from_le_bytes(count), 0);
 
         std::fs::create_dir_all(root.join("slotA")).unwrap();
+        std::fs::write(root.join("slotA/payload.bin"), vec![0x5a; 32 * 1024 + 1]).unwrap();
         std::fs::create_dir_all(root.join("games")).unwrap();
         assert!(mem.write(0x110, &0x380u64.to_le_bytes()));
         assert!(mem.write(0x380, b"slot%\0"));
+        assert!(mem.write(0x218, &0x800u64.to_le_bytes()));
+        assert!(mem.write(0x220, &0x1000u64.to_le_bytes()));
+        assert!(mem.write(0x800, &[0xCC; 0x530]));
+        assert!(mem.write(0x1000, &[0xCC; 48]));
         assert_eq!(hle_dir_name_search(&ctx, &[0x100, 0x200]), SCE_OK);
         assert!(mem.read(0x200, &mut count));
         assert_eq!(u32::from_le_bytes(count), 1);
         let mut name = [0u8; 32];
         assert!(mem.read(0x300, &mut name));
         assert_eq!(&name[..5], b"slotA");
+        let mut param = [0u8; 0x530];
+        assert!(mem.read(0x800, &mut param));
+        assert_eq!(
+            param, [0; 0x530],
+            "optional save parameters must never expose stale guest bytes"
+        );
+        let mut info = [0u8; 48];
+        assert!(mem.read(0x1000, &mut info));
+        assert_eq!(u64::from_le_bytes(info[..8].try_into().unwrap()), 16_384);
+        assert_eq!(
+            u64::from_le_bytes(info[8..16].try_into().unwrap()),
+            16_382,
+            "a 32-KiB-plus-one-byte save consumes two virtual blocks"
+        );
+        assert_eq!(&info[16..], &[0; 32]);
 
         let _ = std::fs::remove_dir_all(root);
     }

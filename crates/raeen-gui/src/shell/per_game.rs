@@ -383,6 +383,7 @@ pub fn draw(
                 ui.id().with(("game-option", row)),
                 egui::Sense::click(),
             )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
         {
             return Some(GameOptionsClick::Row(row));

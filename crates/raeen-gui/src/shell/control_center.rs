@@ -16,6 +16,20 @@ use super::nav::{NavMode, NavState};
 use crate::theme::Theme;
 use egui::{Align2, Color32, FontId, Mesh, Pos2, Rect, Shape, Stroke, StrokeKind, vec2};
 
+/// Pointer interaction reported by the Control Center overlay for the Shell
+/// to act on — mouse users get the same reach as the pad here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CcClick {
+    /// A card in the icon row was clicked (index into [`ITEMS`]).
+    Card(usize),
+    /// An option line in the focused card's panel was clicked (index into
+    /// that card's option list — Power's Rest/Restart/Turn Off).
+    Option(usize),
+    /// The dimmed backdrop outside the cards and panel was clicked — close
+    /// the overlay.
+    Dismiss,
+}
+
 /// What a Control Center card's summary panel renders.
 pub enum CcPanelKind {
     /// A single status line (`CcItem::sub`, or its live override).
@@ -118,9 +132,9 @@ pub fn draw(
     open_amount: f32,
     recent_titles: &[String],
     live: &CcLive,
-) {
+) -> Option<CcClick> {
     if open_amount <= 0.0 {
-        return;
+        return None;
     }
     let screen = ui.max_rect();
     let painter = ui.painter();
@@ -171,6 +185,8 @@ pub fn draw(
 
     // Focused card's summary panel: a rounded card floating above the row,
     // anchored near the focused icon but clamped to the content margins.
+    let mut panel_rect = None;
+    let mut option_rects = Vec::new();
     if let Some(focused) = ITEMS.get(nav.cc_index) {
         let panel_ctx = PanelRenderCtx {
             open_amount,
@@ -179,11 +195,14 @@ pub fn draw(
             live,
         };
         let focused_cx = row_start_x + nav.cc_index as f32 * (item_size + gap) + item_size / 2.0;
-        draw_panel_card(
+        let (rect, options) = draw_panel_card(
             painter, theme, screen, focused_cx, row_y, content_x, focused, &panel_ctx,
         );
+        panel_rect = Some(rect);
+        option_rects = options;
     }
 
+    let mut card_rects = Vec::with_capacity(ITEMS.len());
     for (i, item) in ITEMS.iter().enumerate() {
         let focused = i == nav.cc_index;
         let x = row_start_x + i as f32 * (item_size + gap) + item_size / 2.0;
@@ -224,7 +243,47 @@ pub fn draw(
                 theme.palette.text.gamma_multiply(open_amount),
             );
         }
+        card_rects.push(Rect::from_center_size(
+            center,
+            vec2(radius * 2.0, radius * 2.0),
+        ));
     }
+
+    // Pointer reach, only once the overlay is essentially open — during the
+    // open/close slide a click still belongs to whatever is underneath.
+    if open_amount < 0.5 {
+        return None;
+    }
+    let mut click = None;
+    for (i, rect) in option_rects.iter().enumerate() {
+        if ui
+            .interact(*rect, ui.id().with(("cc-option", i)), egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            click = Some(CcClick::Option(i));
+        }
+    }
+    for (i, rect) in card_rects.iter().enumerate() {
+        if ui
+            .interact(*rect, ui.id().with(("cc-card", i)), egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            click = click.or(Some(CcClick::Card(i)));
+        }
+    }
+    if click.is_none()
+        && ui.input(|i| i.pointer.primary_clicked())
+        && let Some(pos) = ui.input(|i| i.pointer.interact_pos())
+    {
+        let over_panel = panel_rect.is_some_and(|r| r.contains(pos));
+        let over_card = card_rects.iter().any(|r| r.contains(pos));
+        if !over_panel && !over_card {
+            click = Some(CcClick::Dismiss);
+        }
+    }
+    click
 }
 
 /// The bits of per-frame state a panel needs that aren't the item itself or
@@ -249,7 +308,9 @@ fn panel_line_count(item: &CcItem, recent_titles: &[String]) -> usize {
 }
 
 /// The focused card's summary panel: a rounded card floating above the icon
-/// row, horizontally anchored near the focused icon.
+/// row, horizontally anchored near the focused icon. Returns the panel's rect
+/// and one rect per selectable option line (empty for display-only panels) so
+/// the caller can make them clickable.
 #[allow(clippy::too_many_arguments)]
 fn draw_panel_card(
     painter: &egui::Painter,
@@ -260,7 +321,7 @@ fn draw_panel_card(
     margin_x: f32,
     item: &CcItem,
     ctx: &PanelRenderCtx,
-) {
+) -> (Rect, Vec<Rect>) {
     const PANEL_W: f32 = 380.0;
     const PAD: f32 = 20.0;
     const TITLE_H: f32 = 32.0;
@@ -293,13 +354,23 @@ fn draw_panel_card(
         FontId::proportional(20.0),
         theme.palette.text.gamma_multiply(open),
     );
-    draw_panel_content(
-        painter,
-        theme,
-        Pos2::new(rect.left() + PAD, rect.top() + PAD + TITLE_H),
-        item,
-        ctx,
-    );
+    let content_origin = Pos2::new(rect.left() + PAD, rect.top() + PAD + TITLE_H);
+    draw_panel_content(painter, theme, content_origin, item, ctx);
+
+    // Selectable option lines (Power's list), matching `draw_panel_content`'s
+    // 24.0 line advance for `CcPanelKind::Power`.
+    let option_rects = match &item.panel {
+        CcPanelKind::Power(options) => (0..options.len())
+            .map(|i| {
+                Rect::from_min_size(
+                    Pos2::new(content_origin.x, content_origin.y + i as f32 * 24.0),
+                    vec2(PANEL_W - PAD * 2.0, 24.0),
+                )
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    (rect, option_rects)
 }
 
 /// Vertical two-stop gradient (egui has no CSS gradients, so build a

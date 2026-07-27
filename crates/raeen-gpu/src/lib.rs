@@ -50,7 +50,8 @@ pub use backend::{BackendKind, GpuBackend, ShaderFormat, create_backend, default
 pub use contracts::{ShaderMappedData, ShaderSemantic, ShaderSharp, ShaderUserData};
 pub use guest_mem::GpuGuestMemory;
 pub use present_plugin::{
-    Capabilities, PluginFrame, PluginOutput, PresentContext, PresentFrame, PresentPlugin,
+    Capabilities, PluginFrame, PluginInfo, PluginOutput, PresentContext, PresentFrame,
+    PresentPlugin,
 };
 pub use shader_fetch::ShaderCacheStats;
 pub use vulkan::offscreen::RenderedImage;

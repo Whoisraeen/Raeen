@@ -24,7 +24,7 @@ use kyty_graphics::run::{CommandProcessor, CpError, RunOutcome, SuspendedWait};
 use parking_lot::{Mutex, RwLock};
 use raeen_core::error::GpuError;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use thiserror::Error;
 use tracing::{debug, warn};
 
@@ -92,17 +92,18 @@ const SUBMIT_QUEUE_DEPTH: usize = 8;
 /// bounding race-ahead tightly.
 const FLIP_FRAMES_IN_FLIGHT: usize = 2;
 
-/// Parse the opt-in bounded async-flip switch.
-///
-/// Keep the default synchronous until the Phase 2 gate has three consecutive
-/// 180-second Minecraft runs without the historical title-mutex wedge. The
-/// implementation is already bounded and completion-released, but a single
-/// successful run is not enough evidence to change the production default.
+/// Bounded async flip is the production default: the Phase 2.1 gate (three
+/// consecutive 180-second Minecraft runs without the historical title-mutex
+/// wedge) went green 2026-07-26 — runs `run-1785110215494` (12192 flips),
+/// `run-1785111755329` (10432), and `run-1785111946064` (9920), all with
+/// flips still flowing in the final window, zero "stuck >3s" warnings, and
+/// per-flip worker drain of 16–24 µs. `RAEEN_ASYNC_FLIP=0` is the opt-out
+/// back to the synchronous flip for A/B diagnosis of any future wedge.
 fn async_flip_enabled(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_some_and(|value| {
+    !value.is_some_and(|value| {
         matches!(
             value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
+            "0" | "false" | "no" | "off"
         )
     })
 }
@@ -403,9 +404,9 @@ pub struct AgcGpuSession {
     /// latency, yet the guest can never race more than [`FLIP_FRAMES_IN_FLIGHT`]
     /// frames ahead of the GPU. See [`AgcGpuSession::submit_flip_flush`].
     flip_permits: Arc<FlipSemaphore>,
-    /// Phase 2 safety gate. Opt in with `RAEEN_ASYNC_FLIP=1` until three
-    /// consecutive 180-second Minecraft runs prove the bounded path does not
-    /// reproduce the historical title-mutex wedge.
+    /// Bounded async-flip switch. Default ON since 2026-07-26 (the three-run
+    /// no-wedge Minecraft gate went green); `RAEEN_ASYNC_FLIP=0` opts back
+    /// out to the synchronous flip for A/B diagnosis.
     async_flip: bool,
     /// Monotonic counter advanced every time a COMPLETE frame is published to
     /// [`Self::last_image`] (or a splash transition changes what
@@ -436,7 +437,20 @@ pub struct AgcGpuSession {
     present_fence_wait_us: AtomicU64,
     present_readback_us: AtomicU64,
     present_srgb_encode_us: AtomicU64,
+    /// One-entry-per-target cache of HDR→sRGB present encodes, keyed by the
+    /// source `Arc`'s identity. A title that flips without redrawing (menus,
+    /// loading screens, the remembered-fallback present path) re-presents the
+    /// same `Arc<RenderedImage>` for many consecutive flips; re-encoding its
+    /// 8.3 Mpx every flip was pure latency. The `Weak` validates the key
+    /// against pointer reuse (ABA): a hit requires upgrading to the SAME Arc.
+    /// Bounded to a handful of entries — a display-buffer ring plus the
+    /// fallback target is all that recurs.
+    present_encode_cache: Mutex<PresentEncodeCache>,
 }
+
+/// Cached HDR→sRGB present encodes: (source `Arc` pointer key, weak source for
+/// ABA validation, encoded image). See [`AgcGpuSession::present_encode_cache`].
+type PresentEncodeCache = Vec<(usize, Weak<RenderedImage>, Arc<RenderedImage>)>;
 
 /// Cap on how many live guest-scanout snapshots
 /// ([`AgcGpuSession::guest_scanout_snapshots`]) are retained. A title flips
@@ -730,6 +744,7 @@ impl AgcGpuSession {
             present_fence_wait_us: AtomicU64::new(0),
             present_readback_us: AtomicU64::new(0),
             present_srgb_encode_us: AtomicU64::new(0),
+            present_encode_cache: Mutex::new(Vec::new()),
         }
     }
 
@@ -949,6 +964,20 @@ impl AgcGpuSession {
         crate::present_plugin::list()
     }
 
+    /// Full plugin descriptions (name, capabilities, source path) for every
+    /// registered present plugin — for the Shell's Plugins UI.
+    #[must_use]
+    pub fn present_plugin_infos() -> Vec<crate::present_plugin::PluginInfo> {
+        crate::present_plugin::list_info()
+    }
+
+    /// Why each refused candidate in the latest `plugins/` scan was not
+    /// loaded, one human-readable line per refusal.
+    #[must_use]
+    pub fn present_plugin_load_failures() -> Vec<String> {
+        crate::present_plugin::load_failures()
+    }
+
     /// The active present plugin's name, or `None` for the identity path.
     #[must_use]
     pub fn active_present_plugin() -> Option<String> {
@@ -1043,9 +1072,8 @@ impl AgcGpuSession {
             // refresh), so it can never surface a half-read frame.
             self.submit_flip_flush(address);
         } else {
-            // Safety baseline while Phase 2's three-run no-wedge gate remains
-            // open. Preserve the old synchronous completion contract unless
-            // the launch explicitly opts into `RAEEN_ASYNC_FLIP=1`.
+            // Synchronous completion contract, kept as the `RAEEN_ASYNC_FLIP=0`
+            // A/B fallback: the flip waits for the whole worker drain.
             self.consume_flush(Some(address), true);
         }
     }
@@ -1378,6 +1406,38 @@ impl AgcGpuSession {
     /// a never-drawn buffer: pixel content alone cannot tell those apart, and
     /// judging by content froze such frames on the last bright image (and left
     /// the boot splash up for a title that opens dark).
+    /// sRGB-encode an HDR target for presentation, reusing a cached encode when
+    /// the SAME `Arc<RenderedImage>` is presented again (a title flipping
+    /// without redrawing, or the remembered-fallback path re-presenting its
+    /// target). Non-HDR images pass through uncached, as before.
+    fn to_presentable_cached(&self, image: Arc<RenderedImage>) -> Option<Arc<RenderedImage>> {
+        if image.bytes_per_pixel != 8 {
+            return Some(image);
+        }
+        let key = Arc::as_ptr(&image) as usize;
+        {
+            let cache = self.present_encode_cache.lock();
+            for (stored_key, source, encoded) in cache.iter() {
+                if *stored_key == key
+                    && source
+                        .upgrade()
+                        .is_some_and(|source| Arc::ptr_eq(&source, &image))
+                {
+                    return Some(Arc::clone(encoded));
+                }
+            }
+        }
+        let encoded = try_to_presentable_arc(Arc::clone(&image))?;
+        let mut cache = self.present_encode_cache.lock();
+        // A display-buffer ring plus the fallback target is all that recurs;
+        // clear rather than grow without bound.
+        if cache.len() >= 8 {
+            cache.clear();
+        }
+        cache.push((key, Arc::downgrade(&image), Arc::clone(&encoded)));
+        Some(encoded)
+    }
+
     fn present_flipped(&self, address: u64, flip_target_drawn: bool) {
         let remembered = *self.fallback_present_base.lock();
         let (image, fallback, fallback_base, keys, flip_target_known) = {
@@ -1472,7 +1532,7 @@ impl AgcGpuSession {
                 (fallback.as_ref(), *self.scanout_descriptor.lock())
         {
             let encode_at = std::time::Instant::now();
-            let presentable = try_to_presentable_arc(Arc::clone(fallback));
+            let presentable = self.to_presentable_cached(Arc::clone(fallback));
             self.present_srgb_encode_us
                 .fetch_add(encode_at.elapsed().as_micros() as u64, Ordering::Relaxed);
             presentable.filter(|presentable| {
@@ -1587,7 +1647,7 @@ impl AgcGpuSession {
         // an 8 MB copy — and this runs inside the guest flip thread's
         // synchronous flush, so the copy was pure per-flip latency.
         let encode_at = std::time::Instant::now();
-        let Some(presented) = try_to_presentable_arc(presented) else {
+        let Some(presented) = self.to_presentable_cached(presented) else {
             warn_present_allocation_failed();
             return;
         };
@@ -2167,7 +2227,7 @@ impl AgcGpuSession {
             // the RGBA8 present surface / PPM dump; 8-bit frames pass through.
             // Into the `Arc` once (see `last_image`): the store is a bump.
             let encode_at = std::time::Instant::now();
-            let Some(presented) = try_to_presentable_arc(presented) else {
+            let Some(presented) = self.to_presentable_cached(presented) else {
                 {
                     let mut draws = self.draw_count.lock();
                     *draws += drawn;
@@ -2983,6 +3043,33 @@ fn linear_to_srgb_u8(c: f32) -> u8 {
     (encoded * 255.0 + 0.5) as u8
 }
 
+/// Lookup tables from a binary16 half's raw bit pattern to the presented byte,
+/// built once from the scalar reference functions above. An HDR present
+/// otherwise pays three `powf` calls per pixel on every flip (8.3 Mpx × 3 on a
+/// 1080p target). The mapping is deterministic per bit pattern — including
+/// NaN/Inf patterns, which collapse exactly as the scalar path does — so the
+/// tables are exact, not an approximation.
+struct HalfPresentLuts {
+    /// half bits → sRGB-encoded byte (colour channels).
+    srgb: Box<[u8; 65536]>,
+    /// half bits → linear-scaled byte (alpha: coverage, not light).
+    linear: Box<[u8; 65536]>,
+}
+
+fn half_present_luts() -> &'static HalfPresentLuts {
+    static LUTS: OnceLock<HalfPresentLuts> = OnceLock::new();
+    LUTS.get_or_init(|| {
+        let mut srgb = Box::new([0u8; 65536]);
+        let mut linear = Box::new([0u8; 65536]);
+        for (bits, (srgb_out, linear_out)) in srgb.iter_mut().zip(linear.iter_mut()).enumerate() {
+            let value = half_to_f32(bits as u16);
+            *srgb_out = linear_to_srgb_u8(value);
+            *linear_out = (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        }
+        HalfPresentLuts { srgb, linear }
+    })
+}
+
 /// Allocate an initialized byte buffer without invoking Rust's aborting
 /// allocation-error handler. Full-HD presentation buffers are 8 MiB; under
 /// memory pressure a missed frame must preserve the previous completed frame,
@@ -3012,16 +3099,17 @@ fn try_to_presentable_arc(image: Arc<RenderedImage>) -> Option<Arc<RenderedImage
         return None;
     }
     let mut pixels = try_zeroed_bytes(output_bytes)?;
+    let luts = half_present_luts();
     for (texel, out) in image.pixels.chunks_exact(8).zip(pixels.chunks_exact_mut(4)) {
-        let r = half_to_f32(u16::from_le_bytes([texel[0], texel[1]]));
-        let g = half_to_f32(u16::from_le_bytes([texel[2], texel[3]]));
-        let b = half_to_f32(u16::from_le_bytes([texel[4], texel[5]]));
-        let a = half_to_f32(u16::from_le_bytes([texel[6], texel[7]]));
-        out[0] = linear_to_srgb_u8(r);
-        out[1] = linear_to_srgb_u8(g);
-        out[2] = linear_to_srgb_u8(b);
+        let r = u16::from_le_bytes([texel[0], texel[1]]);
+        let g = u16::from_le_bytes([texel[2], texel[3]]);
+        let b = u16::from_le_bytes([texel[4], texel[5]]);
+        let a = u16::from_le_bytes([texel[6], texel[7]]);
+        out[0] = luts.srgb[r as usize];
+        out[1] = luts.srgb[g as usize];
+        out[2] = luts.srgb[b as usize];
         // Alpha is a coverage value, not light — keep it linear.
-        out[3] = (a.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        out[3] = luts.linear[a as usize];
     }
     Some(Arc::new(RenderedImage {
         width: image.width,
@@ -3197,18 +3285,21 @@ mod tests {
     }
 
     #[test]
-    fn async_flip_is_opt_in_and_accepts_explicit_true_spellings() {
-        assert!(!async_flip_enabled(None), "production default stays safe");
-        for enabled in ["1", "true", "YES", " on "] {
+    fn async_flip_defaults_on_with_an_explicit_opt_out() {
+        assert!(
+            async_flip_enabled(None),
+            "bounded async flip is the production default (Phase 2.1 gate green 2026-07-26)"
+        );
+        for enabled in ["1", "true", "YES", " on ", "invalid"] {
             assert!(
                 async_flip_enabled(Some(OsStr::new(enabled))),
-                "{enabled:?} should enable the bounded path"
+                "{enabled:?} should leave the bounded path enabled"
             );
         }
-        for disabled in ["0", "false", "off", "invalid"] {
+        for disabled in ["0", "false", "no", "off", " OFF "] {
             assert!(
                 !async_flip_enabled(Some(OsStr::new(disabled))),
-                "{disabled:?} must keep synchronous presentation"
+                "{disabled:?} must restore synchronous presentation"
             );
         }
     }
@@ -3354,6 +3445,27 @@ mod tests {
         );
         assert_eq!(out.pixels[2], 0, "linear 0.0 -> 0");
         assert_eq!(out.pixels[3], 255, "alpha stays linear");
+    }
+
+    /// The LUT present path must be exact, not approximate: every one of the
+    /// 65536 binary16 patterns must produce the same byte as the scalar
+    /// reference (half decode + transfer function), including NaN/Inf patterns.
+    #[test]
+    fn half_present_luts_match_the_scalar_reference_for_every_pattern() {
+        let luts = half_present_luts();
+        for bits in 0..=u16::MAX {
+            let value = half_to_f32(bits);
+            assert_eq!(
+                luts.srgb[bits as usize],
+                linear_to_srgb_u8(value),
+                "sRGB LUT diverges at half {bits:#06x}"
+            );
+            assert_eq!(
+                luts.linear[bits as usize],
+                (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+                "linear LUT diverges at half {bits:#06x}"
+            );
+        }
     }
 
     /// An already-8-bit frame passes through `to_presentable` unchanged (the

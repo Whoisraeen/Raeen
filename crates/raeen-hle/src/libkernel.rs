@@ -21,7 +21,10 @@
 //! `sceKernelMunmap` mirrors this on the way out. Broadening the rest is
 //! future work, not a limitation of the dispatch signature anymore.
 
-use crate::{GuestCallCompletion, GuestCallRequest, HleContext, HleRegistry};
+use crate::{
+    GuestAccess, GuestAddress, GuestCallCompletion, GuestCallRequest, GuestRange, HleContext,
+    HleRegistry, MAX_HLE_BULK_BYTES,
+};
 use std::sync::atomic::Ordering;
 use tracing::{debug, info, warn};
 
@@ -37,7 +40,7 @@ const HLE_ERROR: u64 = 0xFFFF_FFFF;
 /// Cap on how many bytes one `write` call will copy out of guest memory —
 /// keeps a wild `count` from ballooning a host buffer. Generous for
 /// console output.
-const WRITE_MAX_BYTES: u64 = 1 << 20; // 1 MiB
+const WRITE_CHUNK_BYTES: u64 = 1 << 20; // 1 MiB
 
 /// Per-module dynamic TLS storage used by `__tls_get_addr`. This matches the
 /// compatibility-layer size used by SharpEmu and is deliberately bounded so
@@ -70,7 +73,7 @@ fn trace_file_io(ctx: &HleContext) -> bool {
 
 /// Real `write(fd, buf, count)` / `sceKernelWrite` for the console
 /// descriptors (M1-C): fd 1 (stdout) and fd 2 (stderr) copy `count` guest
-/// bytes (bounded by [`WRITE_MAX_BYTES`]) to the kernel
+/// bytes (streamed through [`WRITE_CHUNK_BYTES`] staging) to the kernel
 /// [`raeen_kernel::Console`] and return `count`. Any other fd has no
 /// backing file table yet — logged loudly, returns [`WRITE_EBADF`], never
 /// pretends to have written.
@@ -80,41 +83,74 @@ fn hle_write(ctx: &HleContext, args: &[u64]) -> u64 {
     let count = args.get(2).copied().unwrap_or(0);
     debug!("write(fd={fd}, buf={buf:#x}, count={count:#x})");
 
-    let capped = count.min(WRITE_MAX_BYTES);
-    let Ok(len) = usize::try_from(capped) else {
-        return WRITE_EBADF;
-    };
-    let mut bytes = vec![0u8; len];
-    if !ctx.mem.read(buf, &mut bytes) {
-        warn!("write: guest buffer [{buf:#x}, +{capped:#x}) is not readable — EFAULT-ish EBADF");
-        return WRITE_EBADF;
+    if count > MAX_HLE_BULK_BYTES {
+        warn!(
+            "write: refusing attacker-sized transfer count={count:#x}, \
+             maximum={MAX_HLE_BULK_BYTES:#x}"
+        );
+        return FILE_EINVAL;
     }
-    if capped < count {
-        warn!("write: count {count:#x} capped to {capped:#x} (WRITE_MAX_BYTES)");
+    let Some(range) = GuestRange::new(GuestAddress::new(buf), count) else {
+        return FILE_EFAULT;
+    };
+    if !ctx.mem.validate_range(range, GuestAccess::Read) {
+        warn!("write: guest buffer [{buf:#x}, +{count:#x}) is not readable — EFAULT");
+        return FILE_EFAULT;
     }
 
-    // fd 1/2 are the console; everything else routes to a VFS-backed file
-    // descriptor (real write-back on close — savedata/output files persist).
-    if fd == 1 || fd == 2 {
-        ctx.kernel.console.write_bytes(&bytes);
-        if bytes
-            .windows(b"Fatal error".len())
-            .any(|window| window == b"Fatal error")
-            || bytes
-                .windows(b"unreachable code".len())
-                .any(|window| window == b"unreachable code")
-        {
-            report_guest_fatal_console(ctx, &bytes);
+    // The 1 MiB value bounds host staging only. Stream the complete valid
+    // guest request so large save records are not silently truncated.
+    let mut staging = vec![0u8; count.min(WRITE_CHUNK_BYTES) as usize];
+    let mut transferred = 0u64;
+    while transferred < count {
+        let chunk_len = (count - transferred).min(WRITE_CHUNK_BYTES) as usize;
+        let chunk = &mut staging[..chunk_len];
+        if !ctx.mem.read(buf + transferred, chunk) {
+            return if transferred == 0 {
+                FILE_EFAULT
+            } else {
+                transferred
+            };
         }
-        return capped;
-    }
-    match ctx.services.write(fd as i32, &bytes) {
-        Ok(n) => n as u64,
-        Err(e) => {
-            warn!("write: fd {fd} failed: {e} — EBADF");
-            WRITE_EBADF
+
+        let written = if fd == 1 || fd == 2 {
+            ctx.kernel.console.write_bytes(chunk);
+            if chunk
+                .windows(b"Fatal error".len())
+                .any(|window| window == b"Fatal error")
+                || chunk
+                    .windows(b"unreachable code".len())
+                    .any(|window| window == b"unreachable code")
+            {
+                report_guest_fatal_console(ctx, chunk);
+            }
+            chunk_len
+        } else {
+            match ctx.services.write(fd as i32, chunk) {
+                Ok(written) if written <= chunk_len => written,
+                Ok(_) => {
+                    return if transferred == 0 {
+                        FILE_EIO
+                    } else {
+                        transferred
+                    };
+                }
+                Err(error) => {
+                    warn!("write: fd {fd} failed after {transferred:#x} byte(s): {error}");
+                    return if transferred == 0 {
+                        WRITE_EBADF
+                    } else {
+                        transferred
+                    };
+                }
+            }
+        };
+        transferred += written as u64;
+        if written < chunk_len {
+            break;
         }
     }
+    transferred
 }
 
 /// Surface the call boundary around a fatal message emitted by a guest
@@ -172,7 +208,14 @@ const FILE_ENOMEM: u64 = (-12i64) as u64;
 /// `EACCES` (permission denied) as a sign-extended negative return.
 const FILE_EACCES: u64 = (-13i64) as u64;
 /// Cap on a single `read` transfer into guest memory (bounds host staging).
-const READ_MAX_BYTES: u64 = 16 << 20; // 16 MiB
+/// Per-iteration transfer size for `read`/`pread`.
+///
+/// A request may be much larger (up to [`MAX_HLE_BULK_BYTES`]); chunking keeps
+/// alternate/test `GuestMemory` backends from allocating the whole request at
+/// once. This is not an ABI-visible cap. GTA V reads its 25,445,380-byte
+/// `rpf.cache` in one call, so silently clamping the call to 16 MiB drops the
+/// tail of the archive index and makes valid packaged shaders appear missing.
+const READ_CHUNK_BYTES: u64 = 1 << 20; // 1 MiB
 
 /// Store a POSIX errno value in the calling guest thread's `__error()` slot.
 pub(crate) fn set_guest_errno(ctx: &HleContext, errno: i32) {
@@ -474,13 +517,14 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 /// Real `read(fd, buf, count)` / `sceKernelRead` (VFS-backed): reads up to
-/// `count` bytes (capped by [`READ_MAX_BYTES`]) from the open descriptor and
-/// writes them into the guest buffer, returning the byte count actually read
-/// (0 at EOF). Bad fd → `EBADF`; unwritable buffer → `EFAULT`.
+/// `count` bytes from the open descriptor and writes them into the guest
+/// buffer, returning the byte count actually read (0 at EOF). Large valid
+/// requests are streamed in bounded chunks instead of being silently
+/// truncated. Bad fd → `EBADF`; unwritable buffer → `EFAULT`.
 fn hle_read(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
     let buf = args.get(1).copied().unwrap_or(0);
-    let count = args.get(2).copied().unwrap_or(0).min(READ_MAX_BYTES);
+    let count = args.get(2).copied().unwrap_or(0);
     debug!("read(fd={fd}, buf={buf:#x}, count={count:#x})");
     let traced_path = trace_file_io(ctx)
         .then(|| ctx.kernel.filesystem.open_path(fd))
@@ -503,46 +547,117 @@ fn hle_read(ctx: &HleContext, args: &[u64]) -> u64 {
     };
     let guard_before = traced_guard.and_then(read_guard);
 
-    let Ok(n) = usize::try_from(count) else {
+    if count > MAX_HLE_BULK_BYTES {
         return FILE_EINVAL;
+    }
+    let Some(range) = GuestRange::new(GuestAddress::new(buf), count) else {
+        return FILE_EFAULT;
     };
+    if !ctx.mem.validate_range(range, GuestAccess::Write) {
+        warn!("read: guest buffer {buf:#x} (+{count}) not writable — EFAULT");
+        return FILE_EFAULT;
+    }
+
+    let mut transferred = 0u64;
+    while transferred < count {
+        let chunk_len = (count - transferred).min(READ_CHUNK_BYTES) as usize;
+        let Some(chunk_addr) = buf.checked_add(transferred) else {
+            return if transferred == 0 {
+                FILE_EFAULT
+            } else {
+                transferred
+            };
+        };
+        let mut read_result = None;
+        let guest_fill = ctx.mem.fill_write(chunk_addr, chunk_len, &mut |out| {
+            let result = ctx.services.read_into(fd, out);
+            let read = result.as_ref().copied().unwrap_or(0);
+            read_result = Some(result);
+            read
+        });
+        let Some(filled) = guest_fill else {
+            return if transferred == 0 {
+                FILE_EFAULT
+            } else {
+                transferred
+            };
+        };
+        match read_result.unwrap_or(Ok(filled)) {
+            Ok(read) if read <= chunk_len => {
+                debug_assert_eq!(filled, read);
+                transferred += read as u64;
+                if read < chunk_len {
+                    break;
+                }
+            }
+            Ok(_) => {
+                return if transferred == 0 {
+                    FILE_EIO
+                } else {
+                    transferred
+                };
+            }
+            Err(error) => {
+                if transferred == 0 {
+                    warn!("read: fd {fd} failed: {error} — EBADF");
+                    return FILE_EBADF;
+                }
+                break;
+            }
+        }
+    }
+
+    if let Some(path) = traced_path.as_deref() {
+        info!(
+            elapsed_ms = ctx.kernel.uptime().as_millis(),
+            "file trace: read fd={fd} path='{path}' guest_buf={buf:#x} \
+             count={count:#x} -> {transferred:#x} byte(s)"
+        );
+    }
+    if entropy && std::env::var_os("RAEEN_TRACE_ENTROPY").is_some() {
+        info!(
+            "entropy device read: fd={fd} guest_buf={buf:#x} count={count:#x} -> {} \
+             byte(s), guard={:#x?}->{:#x?}",
+            transferred,
+            guard_before,
+            traced_guard.and_then(read_guard),
+        );
+    }
+    transferred
+}
+
+fn pread_error(error: &std::io::Error) -> u64 {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        FILE_EBADF
+    } else {
+        FILE_EINVAL
+    }
+}
+
+fn pread_chunk(
+    ctx: &HleContext,
+    fd: i32,
+    guest_addr: u64,
+    len: usize,
+    offset: u64,
+) -> Result<usize, u64> {
     let mut read_result = None;
-    let guest_fill = ctx.mem.fill_write(buf, n, &mut |out| {
-        let result = ctx.services.read_into(fd, out);
+    let guest_fill = ctx.mem.fill_write(guest_addr, len, &mut |out| {
+        let result = ctx.kernel.filesystem.pread_into(fd, out, offset);
         let read = result.as_ref().copied().unwrap_or(0);
         read_result = Some(result);
         read
     });
     let Some(filled) = guest_fill else {
-        warn!("read: guest buffer {buf:#x} (+{n}) not writable — EFAULT");
-        return FILE_EFAULT;
+        return Err(FILE_EFAULT);
     };
     match read_result.unwrap_or(Ok(filled)) {
-        Ok(read) => {
+        Ok(read) if read <= len => {
             debug_assert_eq!(filled, read);
-            if let Some(path) = traced_path.as_deref() {
-                info!(
-                    elapsed_ms = ctx.kernel.uptime().as_millis(),
-                    "file trace: read fd={fd} path='{path}' guest_buf={buf:#x} \
-                     count={count:#x} -> {:#x} byte(s)",
-                    read
-                );
-            }
-            if entropy && std::env::var_os("RAEEN_TRACE_ENTROPY").is_some() {
-                info!(
-                    "entropy device read: fd={fd} guest_buf={buf:#x} count={count:#x} -> {} \
-                     byte(s), guard={:#x?}->{:#x?}",
-                    read,
-                    guard_before,
-                    traced_guard.and_then(read_guard),
-                );
-            }
-            read as u64
+            Ok(read)
         }
-        Err(e) => {
-            warn!("read: fd {fd} failed: {e} — EBADF");
-            FILE_EBADF
-        }
+        Ok(_) => Err(FILE_EIO),
+        Err(error) => Err(pread_error(&error)),
     }
 }
 
@@ -555,7 +670,7 @@ fn hle_read(ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_pread(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
     let buf = args.get(1).copied().unwrap_or(0);
-    let count = args.get(2).copied().unwrap_or(0).min(READ_MAX_BYTES);
+    let count = args.get(2).copied().unwrap_or(0);
     let offset = args.get(3).copied().unwrap_or(0);
     debug!("pread(fd={fd}, buf={buf:#x}, count={count:#x}, offset={offset:#x})");
     let traced_path = trace_file_io(ctx)
@@ -565,36 +680,54 @@ fn hle_pread(ctx: &HleContext, args: &[u64]) -> u64 {
     if (offset as i64) < 0 {
         return FILE_EINVAL;
     }
-    let Ok(n) = usize::try_from(count) else {
+    if count > MAX_HLE_BULK_BYTES {
         return FILE_EINVAL;
-    };
-    let mut read_result = None;
-    let guest_fill = ctx.mem.fill_write(buf, n, &mut |out| {
-        let result = ctx.kernel.filesystem.pread_into(fd, out, offset);
-        let read = result.as_ref().copied().unwrap_or(0);
-        read_result = Some(result);
-        read
-    });
-    let Some(filled) = guest_fill else {
-        warn!("pread: guest buffer {buf:#x} (+{n}) not writable — EFAULT");
+    }
+    let Some(range) = GuestRange::new(GuestAddress::new(buf), count) else {
         return FILE_EFAULT;
     };
-    match read_result.unwrap_or(Ok(filled)) {
-        Ok(read) => {
-            debug_assert_eq!(filled, read);
-            if let Some(path) = traced_path.as_deref() {
-                info!(
-                    elapsed_ms = ctx.kernel.uptime().as_millis(),
-                    "file trace: pread fd={fd} path='{path}' guest_buf={buf:#x} \
-                     count={count:#x} offset={offset:#x} -> {:#x} byte(s)",
-                    read
-                );
-            }
-            read as u64
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => FILE_EBADF,
-        Err(_) => FILE_EINVAL,
+    if !ctx.mem.validate_range(range, GuestAccess::Write) {
+        warn!("pread: guest buffer {buf:#x} (+{count}) not writable — EFAULT");
+        return FILE_EFAULT;
     }
+
+    let mut transferred = 0u64;
+    while transferred < count {
+        let chunk_len = (count - transferred).min(READ_CHUNK_BYTES) as usize;
+        let Some(chunk_addr) = buf.checked_add(transferred) else {
+            return if transferred == 0 {
+                FILE_EFAULT
+            } else {
+                transferred
+            };
+        };
+        let Some(chunk_offset) = offset.checked_add(transferred) else {
+            return if transferred == 0 {
+                FILE_EINVAL
+            } else {
+                transferred
+            };
+        };
+        match pread_chunk(ctx, fd, chunk_addr, chunk_len, chunk_offset) {
+            Ok(read) => {
+                transferred += read as u64;
+                if read < chunk_len {
+                    break;
+                }
+            }
+            Err(error) if transferred == 0 => return error,
+            Err(_) => break,
+        }
+    }
+
+    if let Some(path) = traced_path.as_deref() {
+        info!(
+            elapsed_ms = ctx.kernel.uptime().as_millis(),
+            "file trace: pread fd={fd} path='{path}' guest_buf={buf:#x} \
+             count={count:#x} offset={offset:#x} -> {transferred:#x} byte(s)"
+        );
+    }
+    transferred
 }
 
 fn hle_posix_pread(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -614,36 +747,72 @@ fn hle_sce_pread(ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_pwrite(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
     let buf = args.get(1).copied().unwrap_or(0);
-    let count = args.get(2).copied().unwrap_or(0).min(WRITE_MAX_BYTES);
+    let count = args.get(2).copied().unwrap_or(0);
     let offset = args.get(3).copied().unwrap_or(0);
     debug!("pwrite(fd={fd}, buf={buf:#x}, count={count:#x}, offset={offset:#x})");
 
     if (offset as i64) < 0 {
         return FILE_EINVAL;
     }
-    if count > 0 && buf == 0 {
-        return FILE_EFAULT;
-    }
-    let Ok(n) = usize::try_from(count) else {
+    if count > MAX_HLE_BULK_BYTES {
         return FILE_EINVAL;
+    }
+    let Some(range) = GuestRange::new(GuestAddress::new(buf), count) else {
+        return FILE_EFAULT;
     };
-    let mut bytes = vec![0u8; n];
-    if !ctx.mem.read(buf, &mut bytes) {
+    if !ctx.mem.validate_range(range, GuestAccess::Read) {
         warn!("pwrite: guest buffer [{buf:#x}, +{count:#x}) is not readable — EFAULT");
         return FILE_EFAULT;
     }
-    match ctx.kernel.filesystem.pwrite(fd, &bytes, offset) {
-        Ok(written) => written as u64,
-        Err(e) => {
-            use std::io::ErrorKind;
-            match e.kind() {
-                // Unknown fd, or one not opened for writing (POSIX reports
-                // both as EBADF for pwrite).
-                ErrorKind::NotFound | ErrorKind::PermissionDenied => FILE_EBADF,
-                _ => FILE_EINVAL,
+
+    let mut staging = vec![0u8; count.min(WRITE_CHUNK_BYTES) as usize];
+    let mut transferred = 0u64;
+    while transferred < count {
+        let chunk_len = (count - transferred).min(WRITE_CHUNK_BYTES) as usize;
+        let chunk = &mut staging[..chunk_len];
+        if !ctx.mem.read(buf + transferred, chunk) {
+            return if transferred == 0 {
+                FILE_EFAULT
+            } else {
+                transferred
+            };
+        }
+        let Some(chunk_offset) = offset.checked_add(transferred) else {
+            return if transferred == 0 {
+                FILE_EINVAL
+            } else {
+                transferred
+            };
+        };
+        match ctx.kernel.filesystem.pwrite(fd, chunk, chunk_offset) {
+            Ok(written) if written <= chunk_len => {
+                transferred += written as u64;
+                if written < chunk_len {
+                    break;
+                }
+            }
+            Ok(_) => {
+                return if transferred == 0 {
+                    FILE_EIO
+                } else {
+                    transferred
+                };
+            }
+            Err(error) => {
+                use std::io::ErrorKind;
+                let result = match error.kind() {
+                    ErrorKind::NotFound | ErrorKind::PermissionDenied => FILE_EBADF,
+                    _ => FILE_EINVAL,
+                };
+                return if transferred == 0 {
+                    result
+                } else {
+                    transferred
+                };
             }
         }
     }
+    transferred
 }
 
 fn hle_posix_pwrite(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -1248,7 +1417,7 @@ fn hle_apr_get_file_size(ctx: &HleContext, args: &[u64]) -> u64 {
 fn hle_getdents(ctx: &HleContext, args: &[u64], has_basep: bool) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
     let buffer = args.get(1).copied().unwrap_or(0);
-    let requested = args.get(2).copied().unwrap_or(0).min(READ_MAX_BYTES);
+    let requested = args.get(2).copied().unwrap_or(0).min(MAX_HLE_BULK_BYTES);
     // `sceKernelGetdents`/POSIX `getdents` have only three arguments. RCX is
     // therefore caller-clobbered garbage at the HLE trap and must never be
     // interpreted as an output pointer. Only the four-argument
@@ -2249,7 +2418,15 @@ fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
 
     if !ctx.mem.write(phys_addr_out, &addr.to_le_bytes()) {
         warn!("sceKernelAllocateDirectMemory: physAddrOut {phys_addr_out:#x} out of bounds");
+        // Full rollback: the arena mapping AND the budget charge were both
+        // made above — leaving either behind leaks it for the process
+        // lifetime (a title probing out-param validity would otherwise
+        // inflate its own measured footprint until ENOMEM).
+        ctx.alloc.munmap(addr, len);
         ctx.kernel.memory.remove_mapping(addr);
+        ctx.kernel
+            .direct_memory_allocated
+            .fetch_sub(len, std::sync::atomic::Ordering::Relaxed);
         return HLE_ERROR;
     }
     if std::env::var_os("RAEEN_TRACE_DIRECT_MEMORY").is_some() {
@@ -5693,6 +5870,41 @@ mod tests {
     }
 
     #[test]
+    fn savedata_write_larger_than_one_mib_is_not_truncated() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let payload_len = (WRITE_CHUNK_BYTES + 0x34567) as usize;
+        let mem = crate::TestMemory::new(payload_len + 0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let tmp =
+            std::env::temp_dir().join(format!("raeen-hle-large-savewrite-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        kernel.filesystem.set_game_directory(&tmp);
+
+        assert!(mem.write(0x100, b"/app0/large-save.dat\0"));
+        use raeen_kernel::filesystem::open_flags::*;
+        let fd = hle_open(&ctx, &[0x100, (O_WRONLY | O_CREAT | O_TRUNC) as u64, 0o644]);
+        assert!((fd as i64) >= 3, "open must return a real fd, got {fd:#x}");
+
+        let payload = vec![0xA5; payload_len];
+        assert!(mem.write(0x800, &payload));
+        assert_eq!(
+            hle_write(&ctx, &[fd, 0x800, payload_len as u64]),
+            payload_len as u64,
+            "a valid large save write must report the full transfer"
+        );
+        assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
+        assert_eq!(
+            std::fs::read(tmp.join("large-save.dat")).unwrap(),
+            payload,
+            "the bytes after the old 1 MiB staging limit must reach the host file"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn rename_truncate_unlink_and_rmdir_mutate_the_host_through_the_vfs() {
         let kernel = raeen_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
@@ -6068,6 +6280,45 @@ mod tests {
         assert_eq!(hle_set_gpo(&ctx, &[0xFF]), SCE_OK);
     }
 
+    /// A failed `physAddrOut` write must roll back EVERYTHING the allocate
+    /// charged: the arena mapping, the region record, and the direct-memory
+    /// budget. Before the fix the budget refund was missing, so a title
+    /// probing out-param validity leaked its measured footprint to ENOMEM.
+    #[test]
+    fn allocate_direct_memory_out_write_failure_refunds_budget_and_arena() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let page = raeen_core::PS5_PAGE_SIZE as u64;
+        let before = kernel
+            .direct_memory_allocated
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // physAddrOut = 0x2000 is outside the 0x1000-byte test memory.
+        assert_eq!(
+            hle_allocate_direct_memory(&ctx, &[0, u64::MAX, page, 0, 0, 0x2000]),
+            HLE_ERROR
+        );
+        let after = kernel
+            .direct_memory_allocated
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(before, after, "failed out-write must refund the budget");
+        // And the arena mapping must be gone: a retry with a VALID out param
+        // must see the full budget and succeed.
+        assert_eq!(
+            hle_allocate_direct_memory(&ctx, &[0, u64::MAX, page, 0, 0, 0x600]),
+            SCE_OK
+        );
+        assert_eq!(
+            kernel
+                .direct_memory_allocated
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before + page,
+            "only the successful allocate stays charged"
+        );
+    }
+
     #[test]
     fn getrusage_zero_fills_and_map_direct_memory2_reorders_arguments() {
         let kernel = raeen_kernel::OrbisKernel::new();
@@ -6278,6 +6529,59 @@ mod tests {
         // Negative offset → EINVAL; bad fd → EBADF.
         assert_eq!(hle_pread(&ctx, &[fd, 0x220, 5, u64::MAX]) as i64, -22);
         assert_eq!(hle_pread(&ctx, &[999, 0x220, 5, 0]) as i64, -9);
+
+        assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_and_pread_stream_past_the_old_sixteen_mib_cap() {
+        const OLD_CAP: usize = 16 << 20;
+        let payload_len = OLD_CAP + 0x23456;
+        let guest_buf = 0x1000u64;
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(payload_len + guest_buf as usize);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let tmp = std::env::temp_dir().join(format!("raeen-hle-large-read-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let payload: Vec<u8> = (0..payload_len)
+            .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+            .collect();
+        std::fs::write(tmp.join("archive-index.bin"), &payload).unwrap();
+        kernel.filesystem.set_game_directory(&tmp);
+
+        assert!(mem.write(0x100, b"/app0/archive-index.bin\0"));
+        let fd = hle_open(&ctx, &[0x100, 0, 0]);
+        assert!((fd as i64) >= 3);
+
+        assert_eq!(
+            hle_pread(&ctx, &[fd, guest_buf, payload_len as u64, 0]),
+            payload_len as u64,
+            "pread must not report the old 16 MiB clamp as a successful short read"
+        );
+        let mut actual = vec![0u8; payload_len];
+        assert!(mem.read(guest_buf, &mut actual));
+        assert_eq!(actual, payload);
+
+        actual.fill(0);
+        assert_eq!(
+            hle_read(&ctx, &[fd, guest_buf, payload_len as u64]),
+            payload_len as u64,
+            "sequential read must stream the full archive index too"
+        );
+        assert!(mem.read(guest_buf, &mut actual));
+        assert_eq!(actual, payload);
+
+        assert_eq!(
+            hle_pread(
+                &ctx,
+                &[fd, guest_buf, MAX_HLE_BULK_BYTES.saturating_add(1), 0],
+            ),
+            FILE_EINVAL,
+            "attacker-sized reads remain bounded instead of allocating"
+        );
 
         assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
         let _ = std::fs::remove_dir_all(&tmp);

@@ -3968,7 +3968,12 @@ impl<'a> Spirv<'a> {
             ShaderType::Vertex => {
                 if let Some(info) = self.vs_input_info {
                     for i in 0..info.resources_num as usize {
-                        let raw_uint = info.resources[i].format() == 11;
+                        let raw_uint = matches!(
+                            SampledClass::from_unified_format(u16::from(
+                                info.resources[i].format()
+                            )),
+                            SampledClass::Uint
+                        );
                         match (info.resources_dst[i].registers_num, raw_uint) {
                             (1, true) => {
                                 vars.push(format!("%attr{i} = OpVariable %_ptr_Input_uint Input"))

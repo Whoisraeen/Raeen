@@ -69,6 +69,8 @@ pub struct HomeResponse {
     pub clicked_tile: Option<usize>,
     /// The top-bar settings gear was clicked.
     pub gear_clicked: bool,
+    /// A navigation pill was clicked (one of the `nav::PILL_*` indices).
+    pub clicked_pill: Option<usize>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -109,6 +111,7 @@ pub fn draw(
     let gear_rect = draw_topbar(&painter, theme, screen);
     let gear_clicked = ui
         .interact(gear_rect, ui.id().with("topbar-gear"), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
         .clicked();
 
     // The pills/rail/context band uses fixed 1080p-reference anchors; on a
@@ -120,7 +123,17 @@ pub fn draw(
     // stays glued to the edges.
     let band_shift = (screen.height() - 1080.0).max(0.0) * 0.38;
 
-    draw_nav_pills(&painter, theme, screen, nav, band_shift);
+    let pill_rects = draw_nav_pills(&painter, theme, screen, nav, band_shift);
+    let mut clicked_pill = None;
+    for (i, rect) in pill_rects.into_iter().enumerate() {
+        if ui
+            .interact(rect, ui.id().with(("nav-pill", i)), egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            clicked_pill = Some(i);
+        }
+    }
 
     let focused_size = theme.metrics.tile_size * theme.metrics.tile_focus_scale;
     let rail_rect = Rect::from_min_size(
@@ -147,6 +160,7 @@ pub fn draw(
     HomeResponse {
         clicked_tile,
         gear_clicked,
+        clicked_pill,
     }
 }
 
@@ -354,14 +368,16 @@ fn draw_topbar(painter: &egui::Painter, theme: &Theme, screen: Rect) -> Rect {
 /// Settings / "…". The active pill tracks the rail's Games/Media tab. When
 /// pill focus is live (`NavMode::Pills`, entered with Up from the rail),
 /// the focused pill wears an accent ring and a brighter fill; Confirm
-/// activates it (see `nav::apply_pills`).
+/// activates it (see `nav::apply_pills`). Returns each focusable pill's
+/// screen rect (in `nav::PILL_*` order) so the caller can make them
+/// clickable without disturbing this painter-driven layout.
 fn draw_nav_pills(
     painter: &egui::Painter,
     theme: &Theme,
     screen: Rect,
     nav: &NavState,
     band_shift: f32,
-) {
+) -> Vec<Rect> {
     let y = screen.top() + PILLS_TOP + band_shift;
     let inactive_bg = Color32::from_rgba_unmultiplied(255, 255, 255, 20);
     let focused_bg = Color32::from_rgba_unmultiplied(255, 255, 255, 44);
@@ -387,6 +403,7 @@ fn draw_nav_pills(
         ("Settings", false),
     ];
     debug_assert_eq!(labels.len(), nav::PILL_COUNT);
+    let mut pill_rects = Vec::with_capacity(labels.len());
     for (i, (label, active)) in labels.into_iter().enumerate() {
         let focused = nav.mode == NavMode::Pills && i == nav.pill_index;
         let text_color = if active {
@@ -417,8 +434,10 @@ fn draw_nav_pills(
             );
         }
         painter.galley(rect.center() - galley_size / 2.0, galley, text_color);
+        pill_rects.push(rect);
         x += w + PILL_GAP;
     }
+    pill_rects
 }
 
 fn draw_rail(
@@ -482,6 +501,7 @@ fn draw_rail(
                 ui.id().with(("home-tile", i)),
                 egui::Sense::click(),
             )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
         {
             clicked = Some(i);

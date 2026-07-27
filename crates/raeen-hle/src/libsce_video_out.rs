@@ -667,14 +667,17 @@ fn vblank_period() -> Option<std::time::Duration> {
 /// Wait until the next vblank edge on the process-wide schedule.
 ///
 /// Edges are anchored to a fixed epoch (`epoch + n·period`), not to "now +
-/// period": per-call relative sleeps drift and quantize. Windows' default
-/// timer resolution (~15.6 ms) rounds ANY shorter `thread::sleep` up to a
-/// full tick — the stage-C measurement saw exactly that signature (20.2 ms
-/// intervals from a 16.7 ms sleep) — so the tail of the wait is a
-/// yield-spin: coarse-sleep only while more than a full timer tick remains,
-/// then yield to the edge. At 120 Hz the whole 8.3 ms wait yields; that
-/// costs scheduler wakeups on the one thread the title parks here, which is
-/// what a vblank wait is for.
+/// period": per-call relative sleeps drift and quantize. The wait itself is
+/// drift-compensated accurate sleep (concept from shadPS4's
+/// `AccurateSleep`/`Timer`, GPL-2.0 — reimplemented): an absolute deadline, a
+/// high-resolution OS wait for the bulk, and a bounded final spin so a late
+/// signal never overshoots a full edge. Windows' default timer resolution
+/// (~15.6 ms) rounds ANY shorter `thread::sleep` up to a full tick — the
+/// stage-C measurement saw exactly that signature (20.2 ms intervals from a
+/// 16.7 ms sleep) — so the bulk wait goes through a high-resolution waitable
+/// timer (~0.5 ms) instead of `Sleep`, and only the last millisecond spins.
+/// That removes up to a whole tick of yield-spin per wait from the guest core
+/// the title parks here. At 120 Hz the whole 8.3 ms wait is one timer signal.
 fn wait_next_vblank_edge() {
     let Some(period) = vblank_period() else {
         return;
@@ -684,6 +687,10 @@ fn wait_next_vblank_edge() {
     let elapsed = epoch.elapsed();
     let next = (elapsed.as_nanos() / period.as_nanos() + 1) as u64;
     let deadline = std::time::Duration::from_nanos(next.saturating_mul(period.as_nanos() as u64));
+    /// The final slice of every wait is a spin: an OS signal can arrive early,
+    /// and overshooting an edge is worse than spinning a millisecond.
+    const SPIN_REMAINDER: std::time::Duration = std::time::Duration::from_millis(1);
+    /// Coarse-sleep granularity of the no-high-res-timer fallback.
     const TIMER_TICK: std::time::Duration = std::time::Duration::from_millis(17);
     loop {
         let now = epoch.elapsed();
@@ -691,11 +698,94 @@ fn wait_next_vblank_edge() {
             return;
         }
         let remaining = deadline - now;
-        if remaining > TIMER_TICK {
-            std::thread::sleep(remaining - TIMER_TICK);
-        } else {
+        if remaining <= SPIN_REMAINDER {
             std::thread::yield_now();
+            continue;
         }
+        #[cfg(windows)]
+        let served = precise_wait::wait(remaining - SPIN_REMAINDER);
+        #[cfg(not(windows))]
+        let served = false;
+        if !served {
+            // Fallback without a high-resolution timer: coarse-sleep, never
+            // past the spin window, and re-derive the remaining time each lap.
+            std::thread::sleep((remaining - SPIN_REMAINDER).min(TIMER_TICK));
+        }
+    }
+}
+
+/// High-resolution waitable-timer sleep (Windows 10 1803+). One unnamed
+/// manual-reset timer per waiting thread, created lazily; thread exit closes
+/// it. A process may park several guest threads in `sceVideoOutWaitVblank` /
+/// kernel waits, so the handle is thread-local, never shared.
+#[cfg(windows)]
+mod precise_wait {
+    use std::time::Duration;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Threading::{
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CREATE_WAITABLE_TIMER_MANUAL_RESET,
+        CreateWaitableTimerExW, SetWaitableTimer, TIMER_MODIFY_STATE, WaitForSingleObject,
+    };
+
+    /// Wait indefinitely for one object; not exported by windows-sys 0.59.
+    const INFINITE: u32 = 0xFFFF_FFFF;
+
+    /// Object-access right to wait on a handle; not exported by windows-sys 0.59.
+    const SYNCHRONIZATION: u32 = 0x0010_0000;
+
+    thread_local! {
+        static HIGH_RES_TIMER: Option<HighResTimer> = HighResTimer::new();
+    }
+
+    struct HighResTimer(HANDLE);
+
+    impl HighResTimer {
+        fn new() -> Option<Self> {
+            // SAFETY: creating an unnamed manual-reset timer; null attributes
+            // and name are valid. The high-resolution flag is ignored on
+            // Windows builds that predate it, degrading to a normal timer.
+            let handle = unsafe {
+                CreateWaitableTimerExW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    CREATE_WAITABLE_TIMER_MANUAL_RESET | CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_MODIFY_STATE | SYNCHRONIZATION,
+                )
+            };
+            (!handle.is_null()).then_some(Self(handle))
+        }
+
+        fn wait(&self, remaining: Duration) {
+            // Negative due time = relative, in 100 ns units.
+            let due = -((remaining.as_nanos() / 100).min(i64::MAX as u128) as i64);
+            // SAFETY: `self.0` is a live timer owned by this thread; the
+            // due-time pointer is valid; no APC completion routine is used.
+            let ok = unsafe { SetWaitableTimer(self.0, &due, 0, None, std::ptr::null(), 0) };
+            if ok != 0 {
+                // SAFETY: waiting on this thread's own timer; it signals at
+                // the due time, so INFINITE cannot hang.
+                unsafe { WaitForSingleObject(self.0, INFINITE) };
+            }
+        }
+    }
+
+    impl Drop for HighResTimer {
+        fn drop(&mut self) {
+            // SAFETY: closing a handle this thread created and owns.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// Sleep for `remaining` at sub-millisecond precision. Returns `false`
+    /// when no high-resolution timer could be created (caller falls back).
+    pub fn wait(remaining: Duration) -> bool {
+        HIGH_RES_TIMER.with(|timer| {
+            let Some(timer) = timer else {
+                return false;
+            };
+            timer.wait(remaining);
+            true
+        })
     }
 }
 
@@ -926,6 +1016,31 @@ mod tests {
                 Some(std::time::Duration::from_nanos(1_000_000_000 / 60))
             );
         }
+    }
+
+    /// Two consecutive vblank waits must land one full period apart: the first
+    /// anchors to the next edge, the second to the edge after. A wait that
+    /// returned early (broken timer) or a full tick late (uncompensated drift)
+    /// fails the window. Skipped in the unpaced benchmark mode, where the wait
+    /// contract is explicitly void.
+    #[test]
+    fn consecutive_vblank_waits_land_one_period_apart() {
+        let Some(period) = vblank_period() else {
+            eprintln!("unpaced benchmark mode (RAEEN_VBLANK_HZ=0): skipping");
+            return;
+        };
+        wait_next_vblank_edge();
+        let start = std::time::Instant::now();
+        wait_next_vblank_edge();
+        let interval = start.elapsed();
+        assert!(
+            interval >= period - std::time::Duration::from_millis(3),
+            "wait returned {interval:?} after the previous edge — early vs period {period:?}"
+        );
+        assert!(
+            interval <= period + std::time::Duration::from_millis(10),
+            "wait took {interval:?} for one period {period:?} — late signal or drift"
+        );
     }
 
     #[test]

@@ -42,11 +42,11 @@ use super::hw_regs::{
 use super::parse::{ShaderParseError, shader_parse};
 use super::resources::{
     ShaderBindResources, ShaderBufferResource, ShaderComputeInputInfo, ShaderDirectSgprsResources,
-    ShaderEmbeddedBufferFetch, ShaderEmbeddedBufferFetches, ShaderEmbeddedConstantLoads,
-    ShaderGdsResources, ShaderId, ShaderMappedData, ShaderPixelInputInfo, ShaderSamplerResources,
-    ShaderSemantic, ShaderSharp, ShaderStorageResources, ShaderStorageUsage,
-    ShaderTextureResources, ShaderTextureUsage, ShaderUserData, ShaderVertexInputBuffer,
-    ShaderVertexInputInfo,
+    ShaderEmbeddedBufferFetch, ShaderEmbeddedBufferFetches, ShaderEmbeddedConstantLoad,
+    ShaderEmbeddedConstantLoads, ShaderGdsResources, ShaderId, ShaderMappedData,
+    ShaderPixelInputInfo, ShaderSamplerResources, ShaderSemantic, ShaderSharp,
+    ShaderStorageResources, ShaderStorageUsage, ShaderTextureResources, ShaderTextureUsage,
+    ShaderUserData, ShaderVertexInputBuffer, ShaderVertexInputInfo,
 };
 use super::types::{
     ShaderCode, ShaderInstruction, ShaderInstructionType, ShaderOperand, ShaderOperandType,
@@ -227,10 +227,11 @@ impl ShaderMap {
         Self::default()
     }
 
-    /// Kyty: `ShaderMapUserData` (L110). Like `unordered_map::insert`, an
-    /// existing entry for `addr` is kept.
+    /// KytyPS5: `ShaderMapUserData` assigns through `operator[]`, replacing an
+    /// existing entry. Shader-code allocations are reusable, so the mapped
+    /// header at an address must always describe its most recent creation.
     pub fn map_user_data(&mut self, addr: u64, data: ShaderMappedData) {
-        self.map.entry(addr).or_insert(data);
+        self.map.insert(addr, data);
     }
 
     #[must_use]
@@ -599,6 +600,172 @@ fn writes_sgpr(inst: &ShaderInstruction, reg: i32) -> bool {
     covers(&inst.dst) || covers(&inst.dst2)
 }
 
+/// Resolve scalar loads through a live-in user-SGPR pointer and snapshot their
+/// values for SPIR-V translation.
+///
+/// Gen5 SRT shaders do not always expose an Extended User Data size. Minecraft
+/// gameplay PS `0x1700c000` is the measured minimal case:
+///
+/// ```text
+/// s_load_dwordx8 s[14:21], s[12:13], 0
+/// image_sample ... s[14:21], ...
+/// ```
+///
+/// `s12:s13` is a bind-time guest pointer, while the usage table only says that
+/// a T# eventually resides at s14. With `eud_size_dw == 0`, the EUD resolver
+/// cannot create a view and the old recompiler refused the non-EUD base before
+/// any terrain material could sample. This pass evaluates only the bounded,
+/// side-effect-free part required by that ABI: constant-offset x2/x4/x8 loads
+/// through a pointer pair that has not been written earlier in the shader.
+///
+/// Captured loads share the existing per-PC constant-load representation, so
+/// `sload_dword_extended` materializes the exact dwords into the destination
+/// SGPRs. When an x8 result is subsequently consumed as a sampled MIMG T#, the
+/// same snapshot replaces the static placeholder (or adds a direct texture
+/// binding). Dynamic offsets and shader-produced base pointers remain on their
+/// named refusal paths.
+pub fn shader_capture_runtime_scalar_loads(
+    code: &ShaderCode,
+    mem: &impl ShaderMemory,
+    user_sgpr: &UserSgprInfo,
+    bind: &mut ShaderBindResources,
+) {
+    use ShaderInstructionType as T;
+
+    const fn width(type_: ShaderInstructionType) -> Option<usize> {
+        match type_ {
+            T::SLoadDwordx2 => Some(2),
+            T::SLoadDwordx4 => Some(4),
+            T::SLoadDwordx8 => Some(8),
+            _ => None,
+        }
+    }
+
+    const fn sampled_mimg(type_: ShaderInstructionType) -> bool {
+        matches!(
+            type_,
+            T::ImageLoad
+                | T::ImageSample
+                | T::ImageSampleCLz
+                | T::ImageSampleLz
+                | T::ImageSampleLzO
+                | T::ImageGather4Lz
+        )
+    }
+
+    let instructions = code.get_instructions();
+    let mut texture_changed = false;
+
+    for (at, load) in instructions.iter().enumerate() {
+        let Some(dwords) = width(load.type_) else {
+            continue;
+        };
+        if load.src[0].type_ != ShaderOperandType::Sgpr
+            || load.src[0].size != 2
+            || load.dst.type_ != ShaderOperandType::Sgpr
+            || !matches!(
+                load.src[1].type_,
+                ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
+            )
+            || load.src[1].constant.i() < 0
+        {
+            continue;
+        }
+        let base_reg = load.src[0].register_id;
+        if instructions[..at]
+            .iter()
+            .any(|prior| writes_sgpr(prior, base_reg) || writes_sgpr(prior, base_reg + 1))
+        {
+            continue;
+        }
+        let base = match usize::try_from(base_reg) {
+            Ok(base)
+                if base + 1 < UserSgprInfo::SGPRS_MAX && base + 1 < user_sgpr.count as usize =>
+            {
+                base
+            }
+            _ => continue,
+        };
+        let pointer =
+            u64::from(user_sgpr.value[base]) | (u64::from(user_sgpr.value[base + 1]) << 32);
+        let address = pointer.wrapping_add(u64::from(load.src[1].constant.u));
+        if pointer == 0 || address & 0x3 != 0 {
+            continue;
+        }
+        let Some(source) = mem.dwords_at(address) else {
+            continue;
+        };
+        if source.len() < dwords {
+            continue;
+        }
+
+        if bind.embedded_constant_loads.find(load.pc).is_none() {
+            let Ok(slot) = usize::try_from(bind.embedded_constant_loads.loads_num.max(0)) else {
+                continue;
+            };
+            if slot >= ShaderEmbeddedConstantLoads::LOADS_MAX {
+                break;
+            }
+            let capture = &mut bind.embedded_constant_loads.loads[slot];
+            *capture = ShaderEmbeddedConstantLoad::default();
+            capture.pc = load.pc;
+            capture.dwords_num = dwords as u32;
+            capture.values[..dwords].copy_from_slice(&source[..dwords]);
+            bind.embedded_constant_loads.loads_num += 1;
+        }
+
+        if dwords != 8 {
+            continue;
+        }
+        let dst_reg = load.dst.register_id;
+        let used_as_sampled_texture = instructions[at + 1..].iter().any(|candidate| {
+            sampled_mimg(candidate.type_)
+                && candidate.src[1].type_ == ShaderOperandType::Sgpr
+                && candidate.src[1].register_id == dst_reg
+        });
+        if !used_as_sampled_texture || sharp_dword3_is_buffer(source[3]) {
+            continue;
+        }
+
+        let mut fields = [0u32; 8];
+        fields.copy_from_slice(&source[..8]);
+        let mut texture = super::resources::ShaderTextureResource { fields };
+        if check_read_only_texture_type(&mut texture).is_err() {
+            continue;
+        }
+
+        let count = usize::try_from(bind.textures2d.textures_num.max(0))
+            .unwrap_or(0)
+            .min(bind.textures2d.desc.len());
+        if let Some(existing) = bind.textures2d.desc[..count]
+            .iter_mut()
+            .find(|desc| desc.start_register == dst_reg && !desc.textures2d_without_sampler)
+        {
+            existing.texture = texture;
+            existing.extended = false;
+            texture_changed = true;
+            continue;
+        }
+        if count >= ShaderTextureResources::RES_MAX {
+            continue;
+        }
+        let desc = &mut bind.textures2d.desc[count];
+        desc.start_register = dst_reg;
+        desc.extended = false;
+        desc.slot = -1;
+        desc.usage = ShaderTextureUsage::ReadOnly;
+        desc.textures2d_without_sampler = false;
+        desc.texture = texture;
+        bind.textures2d.textures_num += 1;
+        bind.textures2d.textures2d_sampled_num += 1;
+        texture_changed = true;
+    }
+
+    if texture_changed {
+        shader_calc_binding_indices(bind);
+    }
+}
+
 /// For an `s_add_u32`, return `(constant_addend, other_sgpr)` when exactly one
 /// source is a compile-time constant and the other is an SGPR — the shape a
 /// PC-relative byte offset takes (`s_add_u32 s(b), <imm>, s(b)`).
@@ -698,7 +865,10 @@ pub fn shader_detect_embedded_constant_loads(
     use ShaderInstructionType as T;
 
     let insts = code.get_instructions();
-    let mut out = ShaderEmbeddedConstantLoads::default();
+    // Runtime/SRT scalar loads may already have been captured from live user
+    // data. Preserve those per-PC snapshots and append PC-relative constants;
+    // both routes are consumed by the same recompiler materialization path.
+    let mut out = bind.embedded_constant_loads;
     for (i, load) in insts.iter().enumerate() {
         // Only the widths the recompiler routes through `sload_dword_extended`
         // (where the materialization lives) — x1 has a distinct fetch-only
@@ -710,6 +880,9 @@ pub fn shader_detect_embedded_constant_loads(
             T::SLoadDwordx8 => 8,
             _ => continue,
         };
+        if out.find(load.pc).is_some() {
+            continue;
+        }
         // Base must be an SGPR pair; offset a non-negative compile-time byte
         // constant (the shape `sload_dword_extended` reads).
         if load.src[0].type_ != ShaderOperandType::Sgpr || load.src[0].size != 2 {
@@ -2780,13 +2953,41 @@ pub fn shader_parse_usage2(
         // read-only storage buffer — mirroring the direct-usage 0x00/flags==0
         // path above.
         let mut peek = [0u32; 8];
-        read_sharp_fields(
+        if let Err(error) = read_sharp_fields(
             &mut direct_sgprs,
             i32::from(sharp.offset_dw()),
             user_sgpr,
             extended_buffer,
             &mut peek,
-        )?;
+        ) {
+            // A size-0 table-0 entry is a read-only resource, but a
+            // runtime/SRT-bound descriptor cannot be inspected here to
+            // distinguish V# from T#. Do not abort before the texture
+            // helper's established non-fatal path: install its valid 1x1 T#
+            // placeholder and let instruction-driven synthesis replace it
+            // when a later decoded image operand identifies the real
+            // descriptor. Measured on Minecraft gameplay PS 0x1700c000:
+            // slot 0 starts at s14 while only s0..s15 are captured.
+            tracing::debug!(
+                slot,
+                start_register = sharp.offset_dw(),
+                error = %error,
+                "usage2: unresolved table-0 resource treated as runtime texture"
+            );
+            shader_get_texture_buffer(
+                &mut bind.textures2d,
+                &mut direct_sgprs,
+                i32::from(sharp.offset_dw()),
+                slot as i32,
+                ShaderTextureUsage::ReadOnly,
+                user_sgpr,
+                extended_buffer,
+            )?;
+            info.textures2d_readonly += 1;
+            let last = (bind.textures2d.textures_num - 1) as usize;
+            check_read_only_texture_type(&mut bind.textures2d.desc[last].texture)?;
+            continue;
+        }
         if sharp_dword3_is_buffer(peek[3]) {
             shader_get_storage_buffer(
                 &mut bind.storage_buffers,
@@ -3499,6 +3700,35 @@ fn read_extended_user_data(
             return Some((buf, i as i32));
         }
     }
+
+    // Strategy 4 — PS5 title-address allocations below 4 GiB are carried as
+    // ordinary zero-extended 64-bit pointers. Minecraft's measured gameplay
+    // VS (0x16ffd700, declared/captured=8, eud_size_dw=12) supplies its EUD
+    // through the tail pair `(s6, s7) = (0x16fad784, 0)`. Strategy 3 rejected
+    // that valid pointer solely because its false-positive guard required a
+    // nonzero high dword, so the draw was skipped and terrain lost its
+    // textures. Try zero-high pairs last, in reverse register order: the
+    // platform convention puts the spill pointer at the tail of the user-data
+    // file, while earlier low-address pairs may describe adjacent tables.
+    for i in (0..count.saturating_sub(1)).rev() {
+        if user_sgpr.value[i + 1] != 0 {
+            continue;
+        }
+        let pointer = u64::from(user_sgpr.value[i]);
+        // Exclude null/small scalar constants before asking guest memory.
+        if pointer < 0x1_0000 || pointer & 0x3 != 0 {
+            continue;
+        }
+        if let Some(buf) = read_at(pointer) {
+            tracing::debug!(
+                shader_addr = format_args!("{shader_addr:#x}"),
+                pair_register = i,
+                pointer = format_args!("{pointer:#x}"),
+                "EUD recovered from a zero-extended 32-bit tail pointer (strategy 4)"
+            );
+            return Some((buf, i as i32));
+        }
+    }
     None
 }
 
@@ -3800,11 +4030,24 @@ fn rebase_ngg_constant_sharps(
         .unwrap_or(0)
         .min(user_sgpr.count as usize)
         .min(UserSgprInfo::SGPRS_MAX);
-    let typed_quad = |start: usize| {
-        start + 4 <= captured
-            && user_sgpr.type_[start..start + 4]
-                .iter()
-                .all(|t| matches!(t, UserSgprType::Vsharp | UserSgprType::Region))
+    let captured_buffer_quad = |start: usize| {
+        if start + 4 > captured {
+            return false;
+        }
+        let typed = user_sgpr.type_[start..start + 4]
+            .iter()
+            .all(|t| matches!(t, UserSgprType::Vsharp | UserSgprType::Region));
+        let fields = &user_sgpr.value[start..start + 4];
+        // The `hu` R_ZERO marker is optional metadata in the command stream:
+        // some measured Minecraft AGC draws write a real V# without it, so
+        // the values are captured but their type tags remain Unknown. The
+        // decoded SBUFFER operand + AGC constant-sharp table already prove
+        // the semantic; require a non-null buffer-shaped descriptor before
+        // accepting that untyped form. Binding later performs the full guest
+        // range/stride validation.
+        let untyped_buffer =
+            fields.iter().any(|field| *field != 0) && sharp_dword3_is_buffer(fields[3]);
+        typed || untyped_buffer
     };
 
     let mut normalized = None;
@@ -3820,7 +4063,7 @@ fn rebase_ngg_constant_sharps(
             continue;
         }
         let hardware_slot = scalar_reg - NGG_SCALAR_BASE;
-        if !typed_quad(hardware_slot) {
+        if !captured_buffer_quad(hardware_slot) {
             continue;
         }
         let data = normalized.get_or_insert_with(|| user_data.clone());
@@ -5808,9 +6051,11 @@ mod tests {
     }
 
     #[test]
-    fn shader_map_insert_keeps_existing() {
-        // Kyty: ShaderMapUserData uses unordered_map::insert (L114), which
-        // does not overwrite an existing key.
+    fn shader_map_replaces_metadata_when_code_address_is_reused() {
+        // Current KytyPS5: ShaderMapUserData assigns through operator[] and
+        // replaces an existing key. Commercial titles recycle shader-code
+        // allocations; keeping the first header can attach vertex metadata to
+        // a later pixel shader at the same address.
         let mut map = ShaderMap::new();
         let a = ShaderMappedData {
             user_data: None,
@@ -5821,8 +6066,9 @@ mod tests {
             input_semantics: vec![ShaderSemantic { raw: 2 }],
         };
         map.map_user_data(0x1000, a.clone());
-        map.map_user_data(0x1000, b);
-        assert_eq!(map.find(0x1000), Some(&a));
+        map.map_user_data(0x1000, b.clone());
+        assert_eq!(map.find(0x1000), Some(&b));
+        assert_ne!(map.find(0x1000), Some(&a));
         assert_eq!(map.find(0x2000), None);
     }
 
@@ -6138,6 +6384,37 @@ mod tests {
         check_read_only_texture_type(&mut info.desc[0].texture).expect("placeholder accepted");
     }
 
+    #[test]
+    fn parse_usage2_runtime_table0_texture_uses_placeholder() {
+        // Minecraft gameplay PS 0x1700c000 declares table-0 slot 0 at s14,
+        // while the draw only captures s0..s15. The T# therefore cannot be
+        // inspected statically (s16..s21 are runtime/SRT-bound). The Gen5
+        // table walk must reach `shader_get_texture_buffer`'s established
+        // placeholder path instead of rejecting the entire draw in its
+        // descriptor-kind preflight.
+        let mut user_sgpr = UserSgprInfo::default();
+        user_sgpr.set(14, 0x1700_0000, UserSgprType::Vsharp);
+        user_sgpr.set(15, 0x0000_0000, UserSgprType::Vsharp);
+        let mut user_data = ShaderUserData {
+            direct_resource_offset: vec![0xffff; 8],
+            ..Default::default()
+        };
+        user_data.sharp_resource_offset[0].push(ShaderSharp::new(14, 0));
+        let mut info = ShaderParsedUsage::default();
+        let mut bind = ShaderBindResources::default();
+
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 16, None)
+            .expect("runtime-bound table-0 T# must not reject the shader");
+
+        assert_eq!(info.textures2d_readonly, 1);
+        assert_eq!(bind.textures2d.textures_num, 1);
+        assert_eq!(bind.textures2d.desc[0].start_register, 14);
+        assert_eq!(
+            bind.textures2d.desc[0].texture.fields,
+            placeholder_texture_fields()
+        );
+    }
+
     /// Manual disassembly harness (no-op unless `RAEEN_DISASM_FILE` names a
     /// dumped `.bin`): parses the shader and prints its instruction types and
     /// recovered scalar-load bases. Used to read the EUD/SRT CS's descriptor
@@ -6240,6 +6517,84 @@ mod tests {
             dwords: 2,
         };
         assert_eq!(scalar_load_target_address(&out_of_range, &user_sgpr), None);
+    }
+
+    #[test]
+    fn runtime_scalar_load_replaces_placeholder_texture_and_survives_embedded_pass() {
+        use crate::shader::types::ShaderInstructionType as T;
+
+        // Synthetic equivalent of Minecraft gameplay PS 0x1700c000:
+        // bind-time s12:s13 points at a T#, s_load_dwordx8 installs it into
+        // s14:s21, and the following MIMG samples through that register range.
+        let mut load = ShaderInstruction {
+            pc: 0x0c,
+            type_: T::SLoadDwordx8,
+            ..Default::default()
+        };
+        load.src[0] = sgpr_op(12, 2);
+        load.src[1] = imm_op(0);
+        load.src_num = 2;
+        load.dst = sgpr_op(14, 8);
+
+        let mut sample = ShaderInstruction {
+            pc: 0x14,
+            type_: T::ImageSampleLz,
+            ..Default::default()
+        };
+        sample.src[1] = sgpr_op(14, 8);
+        sample.src[2] = sgpr_op(4, 4);
+        sample.src_num = 3;
+
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut().extend([load, sample]);
+
+        let fields = [
+            0x0020_0000,
+            10 << 20,
+            0x000f_000f,
+            (9 << 28) | 0x0fac,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let mem = TestMem {
+            regions: vec![(0x0020_0000, fields.to_vec())],
+        };
+        let mut user_sgpr = UserSgprInfo::default();
+        user_sgpr.set(12, 0x0020_0000, UserSgprType::Unknown);
+        user_sgpr.set(13, 0, UserSgprType::Unknown);
+
+        // The static table walk knows a T# will land at s14, but cannot read
+        // s14..s21 from the 16 captured user SGPRs and installs a placeholder.
+        let mut bind = ShaderBindResources::default();
+        bind.textures2d.textures_num = 1;
+        bind.textures2d.textures2d_sampled_num = 1;
+        bind.textures2d.desc[0].start_register = 14;
+        bind.textures2d.desc[0].usage = ShaderTextureUsage::ReadOnly;
+        bind.textures2d.desc[0].texture.fields = placeholder_texture_fields();
+
+        shader_capture_runtime_scalar_loads(&code, &mem, &user_sgpr, &mut bind);
+
+        let captured = bind
+            .embedded_constant_loads
+            .find(0x0c)
+            .expect("runtime scalar load captured by instruction PC");
+        assert_eq!(captured.dwords_num, 8);
+        assert_eq!(captured.values[..8], fields);
+        assert_eq!(bind.textures2d.textures_num, 1);
+        assert_eq!(bind.textures2d.desc[0].texture.fields, fields);
+
+        // The PC-relative detector runs immediately afterward in the runtime
+        // path; it must append rather than erase the live SRT snapshot.
+        shader_detect_embedded_constant_loads(&code, &mem, &mut bind);
+        assert_eq!(
+            bind.embedded_constant_loads
+                .find(0x0c)
+                .expect("runtime capture retained")
+                .values[..8],
+            fields
+        );
     }
 
     /// A sharp at s16 with NO extended buffer is a direct read from the Gen5
@@ -7076,6 +7431,53 @@ mod tests {
         );
     }
 
+    /// Minecraft keeps this gameplay shader and its EUD below 4 GiB, so the
+    /// high half of the EUD pointer is zero. The tail pair is authoritative
+    /// even when an earlier pointer into the same readable table exists.
+    #[test]
+    fn eud_zero_extended_tail_pair_recovers_measured_minecraft_pointer() {
+        let eud_base = 0x16fa_d784u64;
+        let shader_addr = 0x16ff_d700u64;
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[..8].copy_from_slice(&[
+            0x16fa_d9f0,
+            0x0010_0000,
+            4,
+            0x0004_dfac,
+            (eud_base + 12) as u32, // readable adjacent table, but not EUD base
+            0,
+            eud_base as u32, // measured EUD tail pair
+            0,
+        ]);
+        let user_sgpr = UserSgprInfo {
+            value,
+            type_: [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX],
+            count: 8,
+        };
+        let user_data = ShaderUserData {
+            direct_resource_offset: vec![],
+            sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+            eud_size_dw: 12,
+            srt_size_dw: 0,
+        };
+        let mut eud = vec![0u32; super::super::spirv::EXTENDED_MAPPING_DWORDS + 3];
+        eud[0] = 0xAAAA_0000;
+        eud[3] = 0xBBBB_0003;
+        let mem = TestMem {
+            regions: vec![(shader_addr, vec![S_ENDPGM]), (eud_base, eud)],
+        };
+
+        let (captured, base_dw) =
+            read_extended_user_data(&user_data, &user_sgpr, 8, &mem, shader_addr, true, None)
+                .expect("a readable zero-extended tail pointer must recover the EUD");
+        assert_eq!(base_dw, 6);
+        assert_eq!(
+            captured[0], 0xAAAA_0000,
+            "the earlier in-range pointer must not shift the EUD by three dwords"
+        );
+        assert_eq!(captured[3], 0xBBBB_0003);
+    }
+
     /// EUD resolver strategy 2 must snapshot the EUD at the load's BASE-PAIR
     /// value, not at base+offset: a load's byte offset selects a descriptor
     /// WITHIN the buffer, and the virtual-register mapping (sharp at
@@ -7646,6 +8048,45 @@ mod tests {
         assert!(
             rebase_ngg_constant_sharps(&user_data, &code, &user_sgpr, 8).is_none(),
             "metadata alone must not invent the rebase without a matching decoded access"
+        );
+    }
+
+    #[test]
+    fn ngg_constant_sharp_accepts_a_valid_untyped_captured_descriptor() {
+        use crate::shader::resources::{ShaderSharp, ShaderUserData};
+        use crate::shader::types::ShaderInstructionType as T;
+
+        let mut user_data = ShaderUserData::default();
+        user_data.sharp_resource_offset[3].push(ShaderSharp::new(8, 1));
+        let mut user_sgpr = UserSgprInfo {
+            count: 8,
+            ..Default::default()
+        };
+        // Some AGC streams omit the optional `hu` marker that labels a user
+        // SGPR write as Vsharp. The descriptor bytes remain authoritative.
+        user_sgpr.value[..4].copy_from_slice(&[
+            0x0050_0000, // base low
+            0x0004_0000, // base high + stride
+            0x0000_0100, // records
+            0x0111_0000, // buffer descriptor type nibble
+        ]);
+
+        let mut load = ShaderInstruction {
+            type_: T::SBufferLoadDwordx16,
+            ..Default::default()
+        };
+        load.src[0] = sgpr_op(8, 4);
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut().push(load);
+
+        let normalized = rebase_ngg_constant_sharps(&user_data, &code, &user_sgpr, 8)
+            .expect("decoded s8 SBUFFER plus a captured buffer V# proves the NGG rebase");
+        assert_eq!(normalized.sharp_resource_offset[3][0].offset_dw(), 0);
+
+        user_sgpr.value[..4].fill(0);
+        assert!(
+            rebase_ngg_constant_sharps(&user_data, &code, &user_sgpr, 8).is_none(),
+            "an untyped all-zero quad must not be promoted into a resource"
         );
     }
 }

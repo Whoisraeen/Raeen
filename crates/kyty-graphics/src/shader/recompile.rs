@@ -868,35 +868,75 @@ fn recompile_exp_mrt0_vsrc0_vsrc1_compr_vm_done(
         return Err(not_supported(FUNC, "target_output_mode[0] != 4"));
     }
 
-    if !operand_is_variable(inst.src[0]) || !operand_is_variable(inst.src[1]) {
-        return Err(not_supported(FUNC, "sources are not variables"));
+    // `en` selects individual channels after each packed source is unpacked.
+    // A disabled pair's source fields are don't-care, so requiring/loading
+    // both packed VGPRs rejects valid partial exports and can read an
+    // unwritten register. Disabled colour channels use the export defaults
+    // (0, 0, 0, 1), matching the KytyPS5 emitter.
+    let en = inst.export_enable;
+    let mut text = String::new();
+    let mut channels = [
+        "%float_0_000000".to_owned(),
+        "%float_0_000000".to_owned(),
+        "%float_0_000000".to_owned(),
+        "%float_1_000000".to_owned(),
+    ];
+
+    if en & 0x3 != 0 {
+        if !operand_is_variable(inst.src[0]) {
+            return Err(not_supported(
+                FUNC,
+                "enabled packed RG source is not a variable",
+            ));
+        }
+        let src0 = operand_variable_to_str(inst.src[0]).value;
+        text += &format!(
+            "         %t1_<index> = OpLoad %float %{src0}\n\
+             %t2_<index> = OpBitcast %uint %t1_<index>\n\
+             %t3_<index> = OpExtInst %v2float %GLSL_std_450 UnpackHalf2x16 %t2_<index>\n"
+        );
+        if en & 0x1 != 0 {
+            text += "         %t4_<index> = OpCompositeExtract %float %t3_<index> 0\n";
+            channels[0] = "%t4_<index>".to_owned();
+        }
+        if en & 0x2 != 0 {
+            text += "         %t5_<index> = OpCompositeExtract %float %t3_<index> 1\n";
+            channels[1] = "%t5_<index>".to_owned();
+        }
     }
 
-    let src0_value = operand_variable_to_str(inst.src[0]);
-    let src1_value = operand_variable_to_str(inst.src[1]);
+    if en & 0xc != 0 {
+        if !operand_is_variable(inst.src[1]) {
+            return Err(not_supported(
+                FUNC,
+                "enabled packed BA source is not a variable",
+            ));
+        }
+        let src1 = operand_variable_to_str(inst.src[1]).value;
+        text += &format!(
+            "         %t6_<index> = OpLoad %float %{src1}\n\
+             %t7_<index> = OpBitcast %uint %t6_<index>\n\
+             %t8_<index> = OpExtInst %v2float %GLSL_std_450 UnpackHalf2x16 %t7_<index>\n"
+        );
+        if en & 0x4 != 0 {
+            text += "         %t9_<index> = OpCompositeExtract %float %t8_<index> 0\n";
+            channels[2] = "%t9_<index>".to_owned();
+        }
+        if en & 0x8 != 0 {
+            text += "         %t10_<index> = OpCompositeExtract %float %t8_<index> 1\n";
+            channels[3] = "%t10_<index>".to_owned();
+        }
+    }
 
     // TODO() check VSKIP
     // TODO() check EXEC
 
-    const TEXT: &str = r#"
-         %t1_<index> = OpLoad %float %<src0>
-         %t2_<index> = OpBitcast %uint %t1_<index>
-         %t3_<index> = OpExtInst %v2float %GLSL_std_450 UnpackHalf2x16 %t2_<index>
-         %t4_<index> = OpCompositeExtract %float %t3_<index> 0
-         %t5_<index> = OpCompositeExtract %float %t3_<index> 1
-         %t6_<index> = OpLoad %float %<src1>
-         %t7_<index> = OpBitcast %uint %t6_<index>
-         %t8_<index> = OpExtInst %v2float %GLSL_std_450 UnpackHalf2x16 %t7_<index>
-         %t9_<index> = OpCompositeExtract %float %t8_<index> 0
-         %t10_<index> = OpCompositeExtract %float %t8_<index> 1
-         %t11_<index> = OpCompositeConstruct %v4float %t4_<index> %t5_<index> %t9_<index> %t10_<index>
-               OpStore %outColor %t11_<index>
-"#;
-
-    *dst_source += &TEXT
-        .replace("<index>", &format!("{index}"))
-        .replace("<src0>", &src0_value.value)
-        .replace("<src1>", &src1_value.value);
+    text += &format!(
+        "         %t11_<index> = OpCompositeConstruct %v4float {} {} {} {}\n\
+                       OpStore %outColor %t11_<index>\n",
+        channels[0], channels[1], channels[2], channels[3]
+    );
+    *dst_source += &text.replace("<index>", &format!("{index}"));
 
     Ok(true)
 }
@@ -1104,7 +1144,10 @@ fn recompile_exp_pos0(
         *dst_source += &vs_passthrough_source(
             index,
             info.resources_dst[0].registers_num,
-            info.resources[0].format() == 11,
+            matches!(
+                SampledClass::from_unified_format(u16::from(info.resources[0].format())),
+                SampledClass::Uint
+            ),
         )?;
         return Ok(true);
     }
@@ -3051,7 +3094,10 @@ fn recompile_fetch(
         // channels beyond the fetch are dropped into a scratch. Beyond Kyty
         // (upstream EXITs on any mismatch). Measured on Minecraft's menu VS:
         // attrib 2 as 2ch feeding a vec3 (fill z=0.0) and as 4ch (drop w).
-        let raw_uint = info.resources[attrib_pos].format() == 11;
+        let raw_uint = matches!(
+            SampledClass::from_unified_format(u16::from(info.resources[attrib_pos].format())),
+            SampledClass::Uint
+        );
         let (temp_ty, load_ty, helper) = match (n_attr, raw_uint) {
             (1, true) => ("%temp_float", "%uint", "%fetch_f1_f1_"),
             (1, false) => ("%temp_float", "%float", "%fetch_f1_f1_"),
@@ -12755,6 +12801,12 @@ mod tests {
         for (raw, expected_op, expected_channel, label) in [
             (0xF080_0200, "OpImageSampleImplicitLod", 1, "sample dmask2"),
             (
+                0xF080_0109,
+                "OpImageSampleImplicitLod",
+                0,
+                "GTA image_sample_a dmask1",
+            ),
+            (
                 0xF0DC_0100,
                 "OpImageSampleExplicitLod",
                 0,
@@ -14265,6 +14317,20 @@ mod tests {
             "the uint fetch must preserve raw bits in the float-backed VGPR:\n{source}"
         );
 
+        // GTA V uses the same raw integer semantics with unified format 5 =
+        // (FMT_8, UINT). The Vulkan input is R8_UINT, but the guest VGPR still
+        // receives the raw integer bits rather than a numeric float convert.
+        info.resources[0].fields[3] = 5 << 12;
+        let source = spirv_generate_source(&code, Some(&info), None, None).unwrap();
+        assert!(
+            source.contains("%attr0 = OpVariable %_ptr_Input_uint Input"),
+            "format 5 must expose a uint Vulkan interface:\n{source}"
+        );
+        assert!(
+            source.contains("OpLoad %uint %attr0") && source.contains("OpBitcast %float %t1_1_0"),
+            "the GTA R8_UINT fetch must preserve raw bits:\n{source}"
+        );
+
         // This synthetic Fetch* omits the scalar prolog registers a complete
         // shader carries. Source-level assertions are intentional here; the
         // live Minecraft verification exercises the assembled Vulkan module.
@@ -14513,6 +14579,49 @@ mod tests {
         assert!(source.contains("OpStore %outColor"), "{source}");
         let words = spirv_run(&source).expect("assemble uncompressed mrt0 export");
         naga_parse_and_validate(&words, "exp mrt0 compr=0 en=3");
+    }
+
+    /// GTA V emits a compressed FP16 MRT0 export with only RG enabled. The
+    /// second packed source is a don't-care operand; BA must use the GCN
+    /// defaults (0, 1) without loading an unwritten VGPR.
+    #[test]
+    fn gta_exp_mrt0_compressed_partial_en_recompiles() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        shader_parse(
+            0,
+            &[
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0xF800_1C03, // exp mrt0 v0, v1 (en=0x3 compr=1 vm=1 done=1)
+                0x0000_0100,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse GTA compressed partial-en MRT0 export");
+
+        let inst = &code.get_instructions()[1];
+        assert_eq!(inst.type_, T::Exp);
+        assert_eq!(inst.format, F::Mrt0Vsrc0Vsrc1ComprVmDone);
+        assert_eq!(inst.export_enable, 0x3);
+
+        let mut input_info = ShaderPixelInputInfo::default();
+        input_info.target_output_mode[0] = 4; // SPI_SHADER_FP16_ABGR
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("recompile GTA compressed partial-en MRT0 export");
+        assert!(
+            source.contains(
+                "OpCompositeConstruct %v4float %t4_1 %t5_1 %float_0_000000 %float_1_000000"
+            ),
+            "disabled BA channels must default to (0, 1):\n{source}"
+        );
+        assert!(
+            !source.contains("OpLoad %float %v1"),
+            "disabled packed source must not read unwritten v1:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble compressed partial MRT0 export");
+        naga_parse_and_validate(&words, "GTA exp mrt0 compr=1 en=3");
     }
 
     /// The full uncompressed form (`en=0xf`, mode 9) keeps its old shape:

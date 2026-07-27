@@ -186,6 +186,17 @@ fn build_guest_ps_dcb(width: u32, height: u32, ps_addr: u64) -> Vec<u32> {
     dcb
 }
 
+/// Disable the persistent shader cache for this test process. The disk cache
+/// defaults ON (`shader_cache/` under the CWD), so a *previous* run of this
+/// binary leaves the fixture PS's SPIR-V on disk; the next run then disk-hits
+/// instead of translating and the `translated_ok` assertion fails — state
+/// pollution, not a regression. These tests assert the translate path itself,
+/// so they must run cacheless. Process-wide and idempotent, safe from both
+/// tests in any order.
+fn disable_persistent_shader_cache() {
+    AgcGpuSession::set_runtime_config(false, 1.0, 0, false, std::path::PathBuf::new());
+}
+
 fn require_or_skip(err: &impl std::fmt::Display) -> bool {
     if std::env::var_os("RAEEN_REQUIRE_VULKAN").is_some() {
         panic!("RAEEN_REQUIRE_VULKAN is set but the Phase 2 draw failed: {err}");
@@ -198,6 +209,7 @@ fn require_or_skip(err: &impl std::fmt::Display) -> bool {
 /// SPIR-V recompile → Vulkan draw → green pixels.
 #[test]
 fn guest_memory_pixel_shader_draws_green() {
+    disable_persistent_shader_cache();
     let blob = place_aligned(&build_shader_blob(PS_BODY_SOLID_GREEN, 0xA0A0, 0xB0B0));
     let (width, height) = (64u32, 32u32);
     let dcb = build_guest_ps_dcb(width, height, blob.addr);
@@ -233,6 +245,7 @@ fn guest_memory_pixel_shader_draws_green() {
 /// the draw (named, once) and leave the DCB — and the process — alive.
 #[test]
 fn untranslatable_guest_shader_skips_the_draw_not_the_dcb() {
+    disable_persistent_shader_cache();
     // No s_endpgm, no trailer, not valid GCN: 4 KiB of 0xFFFFFFFF.
     let garbage = vec![0xFFFF_FFFFu32; 1024 + 64];
     let blob = place_aligned(&garbage[..1024]);

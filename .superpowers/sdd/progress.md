@@ -1,5 +1,442 @@
-- ALL-REFERENCE REFRESH + PTHREAD CONDITION FIFO (2026-07-26; working tree at
-  `ef2e7dc15665+dirty`, no commit):
+- GTA V LOAD + AUDIOOUT2 BLOCKER SLICE (2026-07-27; working tree at
+  `b9c2daf+dirty`, no commit; pre-fix live trace `logs/raeen.log.1`):
+  * FIX: `read`/`pread` no longer silently clamp a valid guest request to
+    16 MiB. Transfers up to the existing 256 MiB HLE safety ceiling are
+    range-validated once and streamed through 1 MiB staging chunks. Live GTA
+    proof: `/app0/rpf.cache` now returns its complete `0x1844404` bytes
+    instead of `0x1000000`; the false missing packaged-shader assertion
+    disappeared. A `16 MiB + 0x23456` regression covers sequential and
+    positional reads.
+  * NEW MEASURED WALL: GTA advanced to AudioOut2 init, then asserted at module
+    `+0x26320c8` after 4,096 recorded HLE calls. Its context allocation was
+    only `0x10000`, then `sceAudioOut2GetSpeakerArrayMemorySize`
+    (`0x1b560e2832585f66`) returned fail-soft zero immediately before the
+    assertion. `sceRemoteplayInitialize` was the only other called unresolved
+    NID. No flips were observed in this short init run.
+  * FIX: KytyPS5's live Gen5 sizing is now used:
+    `0x10000 + queue_depth * 0x590` (`0x11640` at reset defaults). GTA's full
+    four-import speaker-array family is registered: bounded memory sizing,
+    32-slot create/destroy, and zero-initialized ambisonics coefficients with
+    the reference W-channel normalization. Attribution updated in
+    `docs/reference-port-ledger.md` and `THIRD_PARTY_NOTICES.md`; no C++ copied.
+  * GTA-ONLY AGC COVERAGE: sanitized static coverage over the installed GTA V
+    build began at 672 HLE / 468 LLE / 289 unresolved imports, with only
+    134/241 render-path imports resolved. The KytyPS5-cross-checked packet-size
+    family (+19), direct Cx/Sh/Uc register writers (+3), and DCB/ACB
+    conditional-execution writers (+2) move that to 696 HLE / 468 LLE / 265
+    unresolved and 158/241 render-path imports resolved (83 remain, all
+    `libSceAgc`). This is import/implementation evidence, not a rendered-frame
+    claim.
+  * FIX: direct register writers unpack the by-value
+    `{u32 offset, u32 value}` SysV argument and emit standard 3-DWORD
+    SET_CONTEXT/SET_SH/SET_UCONFIG packets already consumed by
+    `kyty-graphics`. Conditional execution emits KytyPS5's exact 5-DWORD
+    packet; the command processor now reads the 32-bit guest label, skips the
+    guarded DWORD range only when it is zero, and fails open with a
+    rate-limited diagnostic when memory is unavailable.
+  * VERIFY (AGC slice): `kyty-graphics` 465/465 and `raeen-hle` 443/443.
+    Targeted registration/emission/skip tests were observed red before the
+    implementations and green afterward. `cargo clippy` could not start
+    because Windows Application Control blocked `cargo-clippy` (OS error
+    4551), not because of a reported Rust lint.
+  * VERIFY: `raeen-hle` 439/439; focused AudioOut2 14/14; touched-crate clippy
+    (`--no-deps -D warnings`) green; isolated release
+    `target/codex-save-fix/release/raeen.exe` built successfully. Full
+    dependency clippy remains red only on a pre-existing dirty-tree
+    `kyty-graphics/src/shader/analysis.rs` lint
+    (`user_sgpr.count.max(0)`), intentionally not overwritten here.
+  * HONESTY / BLOCKER: the post-AudioOut2 GTA rerun is NOT measured. Windows
+    Enterprise Application Control began rejecting the freshly rebuilt
+    unsigned executable (Code Integrity events 3033/3077, policy
+    `{0283ac0f-fff1-49ae-ada1-8a933130cad6}`), including an approved elevated
+    launch. Do not claim GTA passed `+0x26320c8` until the user runs/signs the
+    release and captures a new report. GTA—not Minecraft—is the active title.
+
+- 4.4 BLANK POST-MENU PAGE — COHTML EXPORT TRAP (2026-07-26; working tree at
+  `b9c2daf+dirty`, no commit; runs `run-1785112776063` / `run-1785113013865`):
+  * METHOD: `RAEEN_TRAP_MODULE_EXPORTS=cohtml` armed 264 one-shot int3 traps
+    on libcohtml.Prospero.prx exports (54 data / 34 duplicate skipped);
+    scripted Cross at t=45 s. Run 1 silently had NO input thread — compat
+    `--run-eboot` only spawns the scripted-input thread when
+    `RAEEN_RUNNER_CHILD=1` is in the environment (main.rs:953); run 2 added
+    it and the press is confirmed applied (`buttons=0x00004000` at
+    elapsed_ms=45002, released 45303).
+  * RESULT: exactly 16 export hits, ALL between t=2.6 s and t=5.3 s (module
+    init), ZERO for the remaining 145 s — before AND after the confirmed
+    press. All 16 NIDs are anonymous in the 185k dictionary (Gameface
+    proprietary). Conclusion: eboot→cohtml EXPORT crossings are init-only;
+    menu rendering and press navigation do not cross that boundary (Gameface
+    is driven via vtables/created objects, not exports). The trap boundary
+    was the wrong level for the navigation question; the signal is negative
+    but clean. Next probe: `libRenoirCore.PS5.prx` (64 exports, Minecraft's
+    Ore-UI middleware) with the same recipe, then the cohtml View URL dump.
+  * RECIPE (proven): `RAEEN_RUNNER_CHILD=1 RAEEN_TRAP_MODULE_EXPORTS=<sub>
+    RAEEN_INPUT_SCRIPT='0:neutral;45000:cross;45300:neutral' cargo xtask
+    compat run --registry artifacts/compat/registry-mc-only.json --timeout
+    150`. Analysis: `scratch/analyze_export_trap.py <raw stdout log>`.
+
+- 4.4 RENOIR TRAP — SECOND CLEAN NEGATIVE + SYNTHESIS (2026-07-26; run
+  `run-1785113208206`, same proven recipe with `RAEEN_TRAP_MODULE_EXPORTS=renoir`):
+  * RESULT: 9 export hits, ALL at t=2.85–3.18 s (init), zero for the
+    remaining 147 s across a confirmed press. Both UI libraries are therefore
+    EXPORT-silent after init: Minecraft drives Gameface/Renoir entirely
+    through C++ vtable interfaces on objects created during startup. Export
+    traps are structurally blind to the navigation path — this probe class
+    is exhausted for 4.4.
+  * SYNTHESIZED 4.4 STATE (all measured, this + prior sessions): input
+    reaches the guest correctly; the page navigates and paints its
+    background but no content; NO new asset VFS reads follow the press;
+    neither UI library receives any post-init export call. Prior RE already
+    built V8-snapshot diagnostics into the trap path (`export_trap.rs`
+    ADDR-TRAP Cohtml parser/code/relocation handlers, and the pinned
+    `reference/v8-9.4` tree) — consistent with the page's JS bundle failing
+    to load or execute inside the View while the chrome paints. The two
+    leads that remain, in order: (1) dump the cohtml View's loaded URL +
+    ready state from guest memory (needs the View object address — Ghidra on
+    the eboot's cohtml-vtable call sites, Phase 4.1's toolchain); (2) trace
+    the V8 script load for the post-press route with the existing ADDR-TRAP
+    deserializer probes. Both are explicitly multi-session RE; do not
+    substitute further HLE guesses.
+
+- 4.4 V8 DESERIALIZER — MECHANISM NAILED FROM UPSTREAM SOURCE (2026-07-26;
+  source walk of `reference/v8-9.4` at HEAD `6301cc0db1cf` = exactly
+  9.4.146.24, the version inside libcohtml.Prospero.prx):
+  * ABORT SITE: `src/snapshot/deserializer.cc:953-956` — `case
+    kInternalReference: case kOffHeapTarget: UNREACHABLE()` inside
+    `ReadSingleBytecodeData`. These bytes are legal ONLY during RelocInfo
+    iteration; the abort is the generic root decoder meeting a reloc byte.
+  * WHY THE WALK CONSUMES NOTHING: the relocation walk
+    (`deserializer.cc:1063-1068`) iterates the Code object's relocation
+    ByteArray, whose length is whatever the `kRelocationInfoOffset` header
+    slot resolved to (`deserializer.cc:1043-1044`). The prior probe
+    (`scratch/mc-reloc-header-20260724-072245`) measured
+    `relocation_length_smi = 0` with nonzero data beyond it — the slot
+    resolved to the WRONG OBJECT (or a zeroed region), not to a corrupted
+    right object. There is NO flag/version/CPU gate that can skip the walk;
+    zero entries means a wrong object reference.
+  * WRONG-OBJECT CANDIDATES (from the source): (a) a `kBackref` index that
+    lands on the wrong `back_refs_` entry (release builds have NO bounds
+    check, `deserializer.cc:548-558`); (b) an unresolved
+    `kRegisterPendingForwardRef` leaving `Smi::uninitialized_deserialization_
+    value()` in the slot (`deserializer.cc:973-1002`); (c) a root-constants
+    reference resolving to `empty_byte_array`. All three are deterministic
+    functions of the stream + build config — so the divergence is most
+    likely IN THE STREAM BYTES the guest reads or in a build-config
+    constant (pointer compression / SnapshotSpace encoding / field offsets)
+    that differs between the snapshot producer and the running build while
+    the version-STRING check still passes (`snapshot.cc:626-643` checks
+    only the version string + checksum; there is NO CPU-feature bitmask in
+    this version).
+  * KEY QUESTION OPEN: where does the second (post-press) deserialization's
+    stream come from — the module's embedded blob (then bytes are
+    deterministic and the failure is config/state) or a runtime-read file
+    (then VFS content is suspect)? The first (menu) isolate deserializes
+    FINE from the same module, which points at second-isolate state or a
+    second, different stream.
+  * NEXT PROBE RUNNING: `RAEEN_TRAP_ADDR=103d7a04` (the exact abort site,
+    image-relative) + scripted Cross. Hit => the broken deserializer path
+    is still reached post-press and the blank page is downstream of it;
+    no hit => the current blank page never reaches V8 deserialization and
+    the failure moved earlier.
+
+- 4.4 V8 ABORT SITE NEVER REACHED NOW (2026-07-26; run `run-1785127248677`):
+  `RAEEN_TRAP_ADDR=103d7a04` (the 2026-07-24 `deserializer.cc:956` abort
+  site) armed 1 trap; ZERO hits in 150 s across a confirmed Cross press
+  (applied at elapsed_ms=45003). The deserializer failure the 07-24 RE
+  cornered is no longer on the post-press path — the blank page either
+  never reaches V8 deserialization (failure moved earlier) or
+  deserialization now succeeds and the page is blank downstream (dead
+  JS/content). Discriminator running: traps at three return addresses
+  inside the 07-24 deserialization frame chain (`103d6a40`, `103ea2b6`,
+  `103e566a`) — a boot-time hit is the positive control (menu isolate),
+  a post-press hit means the second deserialization runs.
+
+- 4.4 PATH TRAPS SILENT + FRAME A/B RUNNING (2026-07-26; runs
+  `run-1785127248677`, `run-1785127460504`):
+  * The abort site (`103d7a04`) AND three frame-chain return addresses
+    (`103d6a40`, `103ea2b6`, `103e566a`) from the 07-24 deserialization
+    backtrace all armed cleanly and fired ZERO times in 150 s — including
+    at BOOT, where the menu's V8 isolate must initialize. So those
+    addresses belong to a cached-script deserialization path that neither
+    the boot menu nor the current post-press flow executes; the 07-24
+    failure shape is gone entirely, and nothing V8-flavoured runs
+    post-press now. Behaviour CHANGE between 07-24 and today is
+    unattributed (Phase 0/1 HLE breadth, link cache, pthread cond FIFO —
+    no bisect yet; do not claim a fix, the page is still blank).
+  * RUNNING: `RAEEN_DUMP_FRAMES` + scripted Cross at 45 s to answer the
+    more basic question visually — does the page even CHANGE at the press
+    in the current build (navigation happens, renders empty) or is it
+    pixel-identical pre/post press (navigation never starts)?
+
+- 4.4 RESOLVED — MINECRAFT MAIN MENU RENDERS POST-PRESS (2026-07-27; run
+  `run-1785129*`, frame evidence `scratch/phase4-frames-20260727/`):
+  * VISUAL PROOF: `RAEEN_DUMP_FRAMES` + scripted Cross at elapsed 45.003 s
+    (applied 04:48:38): frame_002048 (04:48:08, pre-press) is the black
+    loading phase; frame_004096 (04:48:52, 14 s post-press) is the
+    COMPLETE main menu — Play/Settings/Store/Dressing Room buttons,
+    "Sign in to PlayStation Network", animated panorama, Steve, "X Select"
+    prompt, version v1.21.43; frame_008192 (04:50:00) confirms it is
+    stable with the panorama still animating.
+  * The blank post-menu page documented 2026-07-24 ("navigates and
+    renders empty") is GONE in the current tree. Attribution: the fix
+    arrived with the user's in-progress dirty-tree graphics work (the
+    `analysis.rs` EUD zero-extended tail-pointer recovery / draw_translate
+    changes — the same work that took Minecraft 8192 -> 12192 flips in
+    the re-verify sweep). The 07-24 V8 deserializer abort is likewise no
+    longer reached (probes above) — consistent with the page's JS now
+    executing far enough to build the menu DOM.
+  * CONSEQUENCE: scripted in-world measurement is UNBLOCKED. Next: extend
+    the input script past the main menu (Play -> world creation) with
+    frame-verified timing, then the Phase 2 "Minecraft >= 60 FPS
+    in-world" gate is measurable for the first time.
+
+- MC PLAY SCREEN + WORLD-LIST RENDER (2026-07-27; run `run-1785128*`,
+  frames `scratch/phase4-world-20260727/`):
+  * Scripted Cross at 45 s (Get started -> main menu, renders fully) and
+    75 s opened the PLAY screen: Worlds/Friends/Servers tabs, Create New,
+    Realms offline notice (expected without PSN), and a live world list —
+    TWO "My World" survival saves (07/27/26 0.44 MB, 07/25/26 0.01 MB;
+    savedata read path works, and a world was already created on 07/27 by
+    an earlier session). A third Cross at 95 s left the screen unchanged
+    (frame_008192) — no default-focus activation on this screen.
+  * IN-PROGRESS EDIT COLLISION (resolved): the user's in-flight
+    `libkernel.rs` chunked-read work (GTA V `rpf.cache` 25 MB read)
+    removed `READ_MAX_BYTES` but left one use in `hle_getdents`; completed
+    as `.min(MAX_HLE_BULK_BYTES)` per the new convention. raeen-hle
+    437/437 green. `compat/COMPATIBILITY.md` republished from the
+    re-verify (9 rows; generator stamps HEAD `b9c2daf5501d`, tree was
+    dirty — read them as `b9c2daf5501d+dirty`).
+  * RUNNING: load the 07/27 world (Cross 45 s, Cross 75 s, ls_down 100 s,
+    Cross 108 s) with frame dumps — first in-world FPS measurement attempt.
+
+- MC WORLD LOAD FAILS WITH "Launch failed" DIALOG (2026-07-27; runs
+  `run-1785128995368` + trace run):
+  * Navigation is SOLVED and reproducible: Cross 45 s (main menu), Cross
+    75 s (Play screen), ls_down x2 (Create New -> Realms notice -> first
+    world row), Cross 112 s selects "My World" (07/27, 0.44 MB). Focus
+    order measured one probe at a time: 1 down = Realms notice, 2 = first
+    world row.
+  * The game mounts the world (`VFS: /savedata0/ -> savedata\PPSA17221-
+    app\BedrockWorldHNj1yfs13Kw@P1`) then shows "Launch failed — There was
+    a problem loading this world" ~seconds later, with ZERO error/warn
+    lines from the VFS/savedata path at default log levels. This is the
+    next measured blocker for the in-world FPS gate — a world-LOAD
+    failure, not navigation, not rendering. Note: Minecraft worlds are
+    LevelDB stores (db/*.ldb, MANIFEST, LOG, LOCK) — suspect VFS
+    directory/rename semantics around LevelDB open before anything else.
+  * DIAGNOSTIC RUNNING: `RAEEN_TRACE_FILE_IO_AFTER_MS=105000` (per-call
+    file tracing from just before the press) to name the exact failing
+    open/stat/rename.
+
+- MC WORLD-DIR FORENSICS + TRACE-RUN FLAKE (2026-07-27):
+  * BOTH existing "My World" saves are CREATION HUSKS, not loadable
+    worlds: `BedrockWorldHNj1yfs13Kw@P1` is an EMPTY directory (no
+    level.dat); `BedrockWorldfD72jnHh4GA@P1` has level.dat + a skeleton
+    LevelDB (CURRENT + MANIFEST-000010 only, no .ldb data, no LOG/LOCK).
+    `BedrockLevelInfoCache` holds an entry per husk. So the "Launch
+    failed" dialog on the first world is CORRECT guest behaviour for a
+    husk, not (yet) a proven emulator bug — and the husks themselves are
+    the fingerprint of an earlier world-CREATION attempt that failed
+    part-way (suspect the savedata write path during creation, unproven).
+  * The `RAEEN_TRACE_FILE_IO_AFTER_MS=105000` run went LOG-SILENT at
+    ~75.5 s (process alive to the 150 s kill; guest submissions, GPU
+    worker telemetry, and the input thread all stopped together) — a
+    whole-guest stall at menu-load time, ONE occurrence, not reproduced
+    in the three adjacent runs with the same press script. Recorded as a
+    flake to watch, not a diagnosis.
+  * RUNNING: Create New activation probe with dense interval dumps
+    (`RAEEN_DUMP_FRAME_AFTER_MS=70000 RAEEN_DUMP_FRAME_INTERVAL=300`) to
+    see what the Cross on "Create New" actually does.
+
+- MC PLAY-SCREEN FOCUS MODEL (2026-07-27; frame-verified probes):
+  * Initial focus on the Play screen is the Worlds TAB (green fill), NOT
+    "Create New" — a blind Cross there is a no-op (tab already active).
+  * Measured so far: down x1 -> Realms offline notice; down x2 -> first
+    world row (activation proven — "Launch failed" on the husk);
+    up x1 from Realms -> FRIENDS tab focus (spatial focus navigation
+    skips "Create New" in both directions probed). "Create New" has not
+    been reached by direction pad input yet; a full 4-down/4-up chain
+    probe with 250-present dumps is running to map the vertical order
+    definitively (is Create New in the chain at all?).
+  * All screens render correctly throughout (tabs, dialogs, lists) —
+    this is purely an input-navigation problem for scripted measurement,
+    not a rendering gap.
+
+- MC IN-WORLD: WORLD LOADS, PLAYER CONNECTS+SPAWNS, SLOW STREAMING
+  (2026-07-27; run `run-1785130*`, frames `scratch/phase4-loadreal2-20260727/`):
+  * REPRODUCIBLE LAUNCH SCRIPT: Cross 45 s (menu), Cross 75 s (Play),
+    ls_down x2 (100 s, 104 s), Cross 112 s — loads "My World"
+    (`BedrockWorldfD72jnHh4GA@P1`; the empty husk world was moved to
+    `scratch/husk-backup/` — reversible, no data existed in it).
+  * MEASURED PROGRESSION: world mounts, guest logs "Opening level
+    'minecraftWorlds/fD72jnHh4GA@/db'" (LevelDB skeleton opened), MC_SERVER
+    thread starts, DBStorage snapshot create/release OK, "Player
+    connected." at T+192 s, fresh level.dat (2899 B) + levelname.txt
+    WRITTEN to disk (savedata write path works end-to-end), "Player
+    Spawned" at T+~3 min. Loading screen renders throughout with a
+    slowly-advancing progress bar.
+  * OPEN BLOCKER — STREAMING MUTEX CONVOY: title mutex `0x100aa691098`
+    (ty=3) is contended by all 7 Streaming Pool threads; the "stuck >3s"
+    warns name a ROTATING owner (3 -> 2 -> 4 -> 8 -> 2), i.e. NOT a hard
+    deadlock — a convoy of long hold times while chunk work is serialized.
+    Streaming is real but glacial (spawn at ~3 min post-connect; loading
+    bar still moving at kill time). Unproven whether this is just slow
+    worldgen+LevelDB on the VFS, an HLE wait-primitive quantization
+    inflating each hold, or the skeleton LevelDB forcing full regen.
+  * MINOR VFS ODDITY: `unlink('/savedata0/level.dat')` and
+    `/savedata1/fD72jnHh4GA@/level.dat` failed "not found" while
+    level.dat existed; the write succeeded anyway seconds later. Two
+    different savedata mount spellings are in play (world-root vs
+    world-id-relative) — worth a look, non-blocking.
+  * FLAKE WATCH: one earlier run (`run-1785129597039`) went log-silent at
+    ~75 s for no diagnosed reason; not reproduced since.
+  * NEXT: long 600 s run to determine whether streaming converges
+    in-world; if it does, the Phase 2 in-world FPS gate is finally
+    measurable. If it convoys forever, the next probe is where each
+    hold's time goes (chunk decode vs LevelDB read vs wait primitives).
+
+- MC IN-WORLD CRASH ROOT CAUSE — DIRECT-MEMORY BUDGET EXHAUSTION
+  (2026-07-27; run `run-1785131*`, crashed at 466.3 s):
+  * DISTILLED REPORT NAMED IT CLEANLY: during in-world streaming the
+    title's `sceKernelAllocateMainDirectMemory` hit `0x8002000B`
+    (EAGAIN — the 13.5 GiB `PS5_DIRECT_MEMORY_SIZE` budget, enforced at
+    `libkernel.rs:2371-2395`) and later returned 0x0 x2; Streaming
+    Pool(1) then faulted writing a direct VA in a libc SSE copy loop,
+    and a second thread executed the guest's deliberate
+    `mov dword [0], 0xDEADC0DE` poison abort. The crash report's
+    "HLE calls that returned an ERROR before this fault" section worked
+    exactly as designed.
+  * THE QUESTION: on real hardware Minecraft streams within budget, so
+    either the title releases through a path that does not decrement
+    `direct_memory_allocated`, or Raeen over-charges. Code audit found
+    ONE genuine accounting leak: the physAddrOut-write-failure path
+    (`libkernel.rs:2419-2423`) removes the mapping and returns HLE_ERROR
+    WITHOUT refunding the budget (the mmap-failure path right above does
+    `fetch_sub`) — small, not the main leak. Map paths do not (and
+    should not) charge the budget; `AvailableDirectMemorySize` reports
+    honestly. MEASUREMENT RUNNING: `RAEEN_TRACE_DIRECT_MEMORY=1` 600 s
+    run to get the per-call allocate/release ledger with sizes.
+
+- MC DIRECT-MEMORY LEDGER — THE BUDGET IS NOT THE BUG (2026-07-27;
+  `RAEEN_TRACE_DIRECT_MEMORY=1` run `run-1785132354613`, survived 600 s):
+  * MEASURED LEDGER: 3902 allocates = 25.90 GiB, 1115 releases = 12.68
+    GiB, net live set 13.22 GiB vs budget 13.5 GiB. ALL allocations are
+    memoryType=12; the bulk is 785 x 32 MiB blocks (24.5 GiB gross).
+    Both release paths (plain + CheckedRelease) decrement correctly —
+    the kernel accounting has no big leak (the small physAddrOut rollback
+    leak was fixed separately with a regression test).
+  * KEY FACT: this run NEVER hit ENOMEM (survived to the 600 s kill);
+    the crash run crossed 13.5 GiB by ~a hair. The title's live set
+    converges to ~13.2 GiB — it sizes itself to available memory and
+    rides the edge on purpose. A budget bump would only paper over the
+    real mechanism; the budget correctly models hardware.
+  * MECHANISM HYPOTHESIS (unproven, consistent with all evidence): the
+    streaming mutex convoy delays chunk CONSUMPTION and therefore the
+    title's frees, while worldgen keeps allocating at full rate —
+    allocations outpace frees until a transient ENOMEM, which the guest
+    handles with a deliberate `0xDEADC0DE` poison abort. On hardware the
+    same code streams fast enough that frees keep up. If true, the fix
+    is the convoy/slow-streaming, not memory accounting.
+  * NEXT LEADS (ranked): (1) where does each convoy hold spend its time —
+    LevelDB reads through the VFS (suspect open/read amplification on
+    small chunk reads), decompression, or worldgen compute;
+    (2) the skeleton-LevelDB factor — a husk-derived world forces full
+    regen churn; a world created FRESH through the working creation flow
+    (once Create New is reached) may stream far less.
+
+- PHASE 2.1 GATE GREEN — ASYNC FLIP NOW DEFAULT (2026-07-26; working tree at
+
+  * Also observed pre-crash: the streaming mutex convoy persists and
+    worsens (present cadence collapsed to ~5 fps near the end) — likely
+    the same memory pressure from the title's side.
+
+
+
+
+
+
+
+
+
+
+  `b9c2daf+dirty`, no commit):
+  * THREE-RUN NO-WEDGE EVIDENCE (release builds, max-fps profile =
+    `RAEEN_ASYNC_FLIP=1`): `run-1785110215494` Minecraft 12192 flips,
+    `run-1785111755329` 10432 flips, `run-1785111946064` 9920 flips — all
+    timed_out cleanly at 180 s with flips still flowing in the final
+    sub-second window, zero "stuck >3s" warnings, zero blockers. (Runs 2/3
+    had an idle Shell GUI resident; their ~15 % lower flip counts vs run 1
+    are unattributed between that and the 2.3/2.4 changes — recorded as
+    noise, not a regression claim.)
+  * MEASURED EFFECT: per-flip worker drain 16–24 µs (ASTRO's synchronous
+    path measured ~2.3 s in the Phase 0 diagnosis); fence wait 0.386–1.649 ms
+    against a 17.5–19.3 ms frame (~2–9 %, NO LONGER DOMINANT — worker
+    occupancy is submit_pct 52–54 / flush_pct 18–19 / idle ~28, so PM4
+    translation/recording is now the binding constraint, not the fence);
+    readback 0.294–0.596 ms; srgb_encode 0 µs on Minecraft's 8-bit presents.
+  * DEFAULT FLIPPED: `async_flip_enabled(None)` now returns true;
+    `RAEEN_ASYNC_FLIP=0/false/no/off` is the documented A/B opt-out. The
+    2026-07-20 wedge was never root-caused to a named mutex; the bound
+    (cap-2 FlipSemaphore + flip-time scanout snapshots + panic-safe permit
+    release) is the mitigation the gate measured. If ANY future wedge shows
+    a "stuck >3s" warn, its mutex key + owner name are the diagnosis path —
+    do not revert the default without that record. AGENTS.md and the xtask
+    profile comment updated to match.
+  * 2.2 SCOPING DECISION (command-buffer ring): DEFERRED with evidence. The
+    ring's Phase 2 purpose was killing the dominant fence stall; after 2.1
+    the fence wait is 2–9 % of frame time and submission-side translation
+    dominates. Building N=8 fenced segments now would be unmeasured-value
+    work; revisit when the timing HUD shows fence_wait dominant again.
+  * VERIFICATION: raeen-gpu 262 lib tests green (incl. the rewritten
+    default-on test), clippy `-D warnings` green, fmt clean.
+  * PRIOR-PROBE HONESTY NOTE: the 2026-07-26 05:08 "create-world" probe
+    (build `5bcf76c353b8`, observed_fps 52.5) dumped BLACK frames
+    (frame_000008/000032 verified) — it is NOT a credible in-world FPS
+    measurement. The "Minecraft ≥60 FPS in-world" gate item remains
+    unmeasured and is coupled to the Phase 4.4 blank post-menu page.
+  * RECON #9 MEASURED NEGATIVE: the `MIP_VIEW_BASE_LEVEL_IGNORED` tripwire
+    fired ZERO times across the full 9-binary re-verify sweep — no tracked
+    title selects a non-zero mip view base, so the GFX10 mip-tail addressing
+    port (SharpEmu 6ee445f) is NOT justified by measurement. The counter
+    stays as the tripwire; `docs/reference-recon-roadmap.md` #9 updated from
+    "OPEN" to "MEASURED IRRELEVANT for the corpus". Same discipline as #11
+    (MRT) — implement when a title trips it, not before.
+
+- PHASE 1 RE-VERIFY + PHASE 2 START (2026-07-26; working tree at
+  `b9c2daf+dirty`, no commit; measurements on isolated release builds):
+  * PHASE 1 GATE RE-VERIFIED on the current tree (`run-1785110215494`,
+    `artifacts/compat/phase1-reverify-b9c2daf-dirty.json`, exe SHA-256
+    `453db9d562885b325e3d0e7357b776cf2416ced1e80773f2894dc42536065eb1`):
+    6/8 distinct titles >30 s, zero unimplemented-import deaths, and every
+    first-blocker signature matches the ledger (UE5 `read 0xa`/execute fault,
+    GTA V fault after exactly 2733 HLE calls, Avatar `s_load_dwordx16`,
+    Subnautica async-exception acknowledgement). The dirty tree's in-progress
+    graphics work IMPROVED three titles: Minecraft 8192 -> 12192 flips (no
+    wedge), ASTRO.BOT 0 -> 96 flips, Avatar shader errors 8565 -> 1777 with
+    132 -> 137 flips. A Plague Tale still dies with no in-log crash record
+    (the known host-side death, Phase 4.2) at 29.3 s vs 33.5 s — same crash
+    class, marginally earlier; watch it.
+  * NOTE — max-fps compat profile already opts into `RAEEN_ASYNC_FLIP=1`
+    (xtask/src/main.rs), so the 12192-flip Minecraft run above is ALSO gated
+    async-flip no-wedge run #1 of the 3-run Phase 2.1 gate.
+  * 2.4 sRGB PRESENT COST: replaced the per-pixel `powf` HDR->sRGB encode with
+    exact 64 KiB LUTs keyed by binary16 bit pattern (a new test locks all
+    65536 patterns to the scalar reference, NaN/Inf included), and added an
+    Arc-identity encode cache (Weak-validated, bounded to 8 entries) so a
+    title flipping without redrawing no longer re-encodes 8.3 Mpx per flip.
+    raeen-gpu 262 lib tests green; clippy `-D warnings` green; fmt clean.
+    Pipeline-cache serialization (recon #28) and the cheaper guest-mem
+    present pass / sticky flip-miss fallback (recon #27) were verified
+    ALREADY LANDED — do not redo.
+  * 2.3 VBLANK PACING: `sceVideoOutWaitVblank` no longer yield-spins up to a
+    full ~15.6 ms Windows timer tick per wait. Epoch-anchored absolute
+    schedule kept; the bulk wait now uses a per-thread high-resolution
+    waitable timer (CreateWaitableTimerExW HIGH_RESOLUTION, concept from
+    shadPS4 AccurateSleep — reimplemented, no code copied) with only the
+    final 1 ms spinning; falls back to coarse-sleep when no hi-res timer is
+    available. New test pins two consecutive waits one period apart.
+    raeen-hle 436 lib tests green; clippy `-D warnings` green; fmt clean.
+
   * FETCH/PULL: fast-forwarded SharpEmu `21f964a -> 0535783` (8 commits),
     shadPS4 `8161049 -> d976c33` (7), and Mesa `3e2d851 -> 780727e` (12).
     Kyty, KytyPS5, OpenOrbis, ps4libdoc, and ps5-payload-sdk were already
@@ -3995,3 +4432,32 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   masking). Workaround: scratch/run-baseline-parts.py chunked per-game driver
   invoking the prebuilt binary directly, merging into latest.json on full
   success. Other session's runs left intact (never kill theirs).
+
+## 2026-07-27 — Shell UI/UX: full pointer+pad+keyboard reach, Plugins UI
+* shell-input: complete (uncommitted; raeen-gui 166/166, raeen-gpu
+  present_plugin 22/22 green). Left-stick menu nav (StickNav hysteresis
+  0.6/0.4, unit-tested), DualSense Options button (gilrs Start) -> per-game
+  overlay, WASD/Space/Backspace keyboard alternates, F11 fullscreen toggle.
+* shell-pointer: complete. Nav pills clickable (HomeResponse.clicked_pill),
+  Control Center cards/options clickable + backdrop click dismisses
+  (control_center::CcClick), pointing-hand hover cursors on all interactive
+  rects (tiles, gear, pills, settings, per-game, CC). Verified on-device via
+  PostMessage drive + screenshots (portrait 1080x1920 display: CC row sits
+  at y~1830 — capture the window bottom, not the top 1080 rows).
+* BUG FIXED (pre-existing): tick_animations closed the Control Center when
+  drilling into a card's option list — cc_open target now covers
+  NavMode::ControlCenterOption too (mod.rs).
+* settings-plugins: complete. New Settings ▸ Plugins section (SECTION_*
+  consts introduced; Plugins=6, System=7, Advanced=8) listing every present
+  plugin with capability labels, source (built-in vs dll name), Active
+  marker; Confirm/click toggles active + applies live; Rescan Plugins Folder
+  (re-runs load_present_plugins_from) and Open Plugins Folder rows; load
+  refusals surfaced in-UI. raeen-gpu: PresentPlugin::source_path,
+  PluginInfo/list_info, per-scan load_failures store + AgcGpuSession
+  wrappers. Verified live incl. real BYO raeen_example_plugin.dll.
+* KNOWN-RED (pre-existing, not this session): raeen-gpu
+  tests/shader_memory_phase2 guest_memory_pixel_shader_draws_green fails at
+  HEAD+earlier-uncommitted shader_fetch/draw_translate edits (verified by
+  stashing this session's gpu changes — still fails). Spawned follow-up task.
+  Also: Application Control policy blocks cargo-clippy + some fresh test
+  exes (kyty-graphics gcn_to_spirv) — environmental, os error 4551.

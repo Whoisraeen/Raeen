@@ -524,7 +524,14 @@ impl ResolvedShaderKey {
     }
 }
 
-const RESOLVED_SHADER_MEMO_CAPACITY: usize = 32;
+/// A Minecraft gameplay frame resolves roughly 120 distinct exact VS/PS
+/// register states before repeating them on the next frame. A 32-entry LRU
+/// therefore thrashed completely: the measured in-world profile reported
+/// `resolve_hits=0` while both parsed shader caches were 100% hot, spending
+/// 80-95 us per draw re-running resource analysis. Keep two full frames'
+/// working set so the exact-state safety contract remains unchanged while
+/// repeated frame bindings can hit.
+const RESOLVED_SHADER_MEMO_CAPACITY: usize = 256;
 
 /// Small submission-local LRU of successful shader resolutions.
 ///
@@ -537,6 +544,121 @@ struct ResolvedShaderMemo {
     entries: Vec<(ResolvedShaderKey, ResolvedShaders)>,
     hits: u64,
     misses: u64,
+}
+
+/// The fetcher never reads more than 256 KiB for one guest shader. Treat that
+/// complete bounded window as a dependency so a compute write can invalidate
+/// code safely without throwing away unrelated shader analyses.
+const SHADER_CODE_DEPENDENCY_BYTES: u64 = 256 * 1024;
+
+fn ranges_overlap(a_base: u64, a_len: u64, b_base: u64, b_len: u64) -> bool {
+    a_len != 0
+        && b_len != 0
+        && a_base < b_base.saturating_add(b_len)
+        && b_base < a_base.saturating_add(a_len)
+}
+
+fn eud_descriptor_end_dword(start_register: i32, width: u64, eud_base: i32) -> Option<u64> {
+    let start = u64::try_from(start_register).ok()?;
+    let relative = if start >= kyty_graphics::hw_regs::UserSgprInfo::SGPRS_MAX as u64 {
+        start - kyty_graphics::hw_regs::UserSgprInfo::SGPRS_MAX as u64
+    } else {
+        start.checked_sub(u64::try_from(eud_base).ok()?)?
+    };
+    Some(relative.saturating_add(width))
+}
+
+/// Exact guest-memory descriptor window captured into one analyzed bind.
+///
+/// Direct user-SGPR descriptors are already part of [`ResolvedShaderKey`].
+/// Only EUD-resident descriptors depend on mutable guest memory; retaining
+/// their precise span lets compute writes to texture/vertex *contents* keep
+/// the analysis while writes to the descriptor table still invalidate it.
+fn bind_eud_dependency(bind: &ShaderBindResources) -> Option<(u64, u64)> {
+    if !bind.extended.used {
+        return None;
+    }
+    let base = bind.extended.data.base();
+    if base == 0 {
+        return None;
+    }
+    let eud_base = bind.extended.start_register;
+    let mut end_dwords = 2u64;
+    for index in 0..bind.storage_buffers.buffers_num.max(0) as usize {
+        if bind.storage_buffers.extended[index] {
+            let Some(end) =
+                eud_descriptor_end_dword(bind.storage_buffers.start_register[index], 4, eud_base)
+            else {
+                return Some((base, 16 * 1024 * 1024));
+            };
+            end_dwords = end_dwords.max(end);
+        }
+    }
+    for index in 0..bind.textures2d.textures_num.max(0) as usize {
+        let descriptor = &bind.textures2d.desc[index];
+        if descriptor.extended {
+            let Some(end) = eud_descriptor_end_dword(descriptor.start_register, 8, eud_base) else {
+                return Some((base, 16 * 1024 * 1024));
+            };
+            end_dwords = end_dwords.max(end);
+        }
+    }
+    for index in 0..bind.samplers.samplers_num.max(0) as usize {
+        if bind.samplers.extended[index] {
+            let Some(end) =
+                eud_descriptor_end_dword(bind.samplers.start_register[index], 4, eud_base)
+            else {
+                return Some((base, 16 * 1024 * 1024));
+            };
+            end_dwords = end_dwords.max(end);
+        }
+    }
+    for index in 0..bind.gds_pointers.pointers_num.max(0) as usize {
+        if bind.gds_pointers.extended[index] {
+            let Some(end) =
+                eud_descriptor_end_dword(bind.gds_pointers.start_register[index], 1, eud_base)
+            else {
+                return Some((base, 16 * 1024 * 1024));
+            };
+            end_dwords = end_dwords.max(end);
+        }
+    }
+    if bind.eud_raw.used {
+        end_dwords = end_dwords
+            .max(eud_raw_window_want_bytes(bind.eud_raw.required_dwords).saturating_add(3) / 4);
+    }
+    Some((base, end_dwords.saturating_mul(4)))
+}
+
+fn resolved_shader_depends_on_ranges(
+    key: &ResolvedShaderKey,
+    shaders: &ResolvedShaders,
+    writes: &[(u64, u64)],
+) -> bool {
+    let mut code = [0u64; 4];
+    let code_count = if key.vs.vs_embedded {
+        0
+    } else {
+        code[0] = key.vs.vs_regs.data_addr;
+        code[1] = key.vs.es_regs.data_addr;
+        code[2] = key.vs.gs_regs.data_addr;
+        3
+    };
+    let ps_index = code_count;
+    if !key.ps.ps_embedded {
+        code[ps_index] = key.ps.ps_regs.data_addr;
+    }
+    let code_count = code_count + usize::from(!key.ps.ps_embedded);
+    let vs_eud = bind_eud_dependency(&shaders.vs_info.bind);
+    let ps_eud = bind_eud_dependency(&shaders.ps_info.bind);
+
+    writes.iter().any(|&(write_base, write_len)| {
+        code[..code_count].iter().any(|&program| {
+            program != 0
+                && ranges_overlap(program, SHADER_CODE_DEPENDENCY_BYTES, write_base, write_len)
+        }) || vs_eud.is_some_and(|(base, len)| ranges_overlap(base, len, write_base, write_len))
+            || ps_eud.is_some_and(|(base, len)| ranges_overlap(base, len, write_base, write_len))
+    })
 }
 
 impl ResolvedShaderMemo {
@@ -575,6 +697,14 @@ impl ResolvedShaderMemo {
 
     fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    fn invalidate_ranges(&mut self, writes: &[(u64, u64)]) {
+        if writes.is_empty() {
+            return;
+        }
+        self.entries
+            .retain(|(key, shaders)| !resolved_shader_depends_on_ranges(key, shaders, writes));
     }
 }
 
@@ -810,6 +940,7 @@ fn gen5_vertex_format_and_size(format: u8) -> Result<(vk::Format, u64), DrawErro
     // table (the RDNA2 authority): 64 → (11,7) = 32_32_FLOAT,
     // 74 → (13,7) = 32_32_32_FLOAT, 77 → (14,7) = 32_32_32_32_FLOAT,
     // 56 → (10,0) = 8_8_8_8 UNORM, 71 → (12,7) = 16_16_16_16_FLOAT,
+    // 5 → (1,4) = 8 UINT (measured: GTA V's first submitted DCB),
     // 11 → (2,4) = 16 UINT (measured: Minecraft's packed per-vertex value),
     // 57 → (10,1) = 8_8_8_8 SNORM (same UI draw, next attribute).
     match format {
@@ -820,6 +951,10 @@ fn gen5_vertex_format_and_size(format: u8) -> Result<(vk::Format, u64), DrawErro
         57 => Ok((vk::Format::R8G8B8A8_SNORM, 4)),
         71 => Ok((vk::Format::R16G16B16A16_SFLOAT, 8)),
         23 => Ok((vk::Format::R16G16_UNORM, 4)),
+        // Unified 5 is (FMT_8, UINT). GTA's shader consumes the raw integer
+        // bits, so the Vulkan interface must be R8_UINT rather than a
+        // normalized/float approximation.
+        5 => Ok((vk::Format::R8_UINT, 1)),
         // Unified 11 is (FMT_16, UINT), not USCALED. The guest fetch writes
         // the raw integer bits into its VGPR; Minecraft immediately uses
         // integer bit operations on this value to form its skinning-matrix
@@ -3585,7 +3720,6 @@ impl OffscreenDrawSink<'_> {
             return Ok(());
         }
         self.texture_sample_hashes.clear();
-        self.resolved_shaders.clear();
 
         // An empty render-target filter fences the ordered batch and publishes
         // compute SSBO/UAV outputs without paying to read unrelated colour
@@ -4412,7 +4546,15 @@ impl DrawSink for OffscreenDrawSink<'_> {
         let writes_guest_memory =
             !writable_buffer_ranges.is_empty() || !guest_image_outputs.is_empty();
         if writes_guest_memory {
-            self.resolved_shaders.clear();
+            if guest_image_outputs.is_empty() {
+                self.resolved_shaders
+                    .invalidate_ranges(&writable_buffer_ranges);
+            } else {
+                // Storage-image swizzle padding is not carried by
+                // `StorageImageUpload`, so its complete guest write range is
+                // not yet known precisely.
+                self.resolved_shaders.clear();
+            }
             if guest_image_outputs.is_empty() {
                 self.texture_sample_hashes
                     .invalidate_ranges(&writable_buffer_ranges);
@@ -6106,6 +6248,9 @@ mod tests {
         // input is declared uint by kyty-graphics and bitcast into the
         // float-backed guest VGPR, preserving the raw integer value.
         assert_eq!(gen5_vertex_format(11).unwrap(), vk::Format::R16_UINT);
+        // GTA V's first live DCB uses unified 5 -> (1,4) = 8 UINT.
+        assert_eq!(gen5_vertex_format(5).unwrap(), vk::Format::R8_UINT);
+        assert_eq!(gen5_vertex_format_and_size(5).unwrap().1, 1);
         for f in [64u8, 74, 77, 56, 57, 71, 23] {
             let vf = gen5_vertex_format(f).unwrap();
             assert!(
@@ -6231,6 +6376,79 @@ mod tests {
         assert!(
             memo.get(key).is_none(),
             "a guest/compute write boundary must invalidate the resolution"
+        );
+    }
+
+    #[test]
+    fn submission_shader_memo_holds_a_full_commercial_frame_working_set() {
+        let ctx = Context::default();
+        let shaders = ResolvedShaders {
+            vs: Arc::new(vec![1, 2, 3]),
+            ps: Arc::new(vec![4, 5, 6]),
+            vs_info: ShaderVertexInputInfo::default(),
+            ps_info: ShaderPixelInputInfo::default(),
+        };
+        let mut memo = ResolvedShaderMemo::default();
+        let working_set = 128u32;
+
+        for value in 0..working_set {
+            let mut sh = Shader::default();
+            sh.ps.ps_user_sgpr.count = 1;
+            sh.ps.ps_user_sgpr.value[0] = value;
+            memo.insert(ResolvedShaderKey::new(&ctx, &sh), shaders.clone());
+        }
+        for value in 0..working_set {
+            let mut sh = Shader::default();
+            sh.ps.ps_user_sgpr.count = 1;
+            sh.ps.ps_user_sgpr.value[0] = value;
+            assert!(
+                memo.get(ResolvedShaderKey::new(&ctx, &sh)).is_some(),
+                "frame binding {value} was evicted before the next frame"
+            );
+        }
+        assert_eq!(memo.hits, u64::from(working_set));
+        assert_eq!(memo.misses, 0);
+    }
+
+    #[test]
+    fn submission_shader_memo_invalidates_only_overlapping_compute_writes() {
+        let ctx = Context::default();
+        let mut sh = Shader::default();
+        sh.vs.vs_regs.data_addr = 0x10_0000;
+        sh.ps.ps_regs.data_addr = 0x20_0000;
+        let key = ResolvedShaderKey::new(&ctx, &sh);
+        let mut shaders = ResolvedShaders {
+            vs: Arc::new(vec![1, 2, 3]),
+            ps: Arc::new(vec![4, 5, 6]),
+            vs_info: ShaderVertexInputInfo::default(),
+            ps_info: ShaderPixelInputInfo::default(),
+        };
+        shaders.vs_info.bind.extended.used = true;
+        shaders.vs_info.bind.extended.start_register = 12;
+        shaders.vs_info.bind.extended.data.update_address(0x80_0000);
+        shaders.vs_info.bind.storage_buffers.buffers_num = 1;
+        shaders.vs_info.bind.storage_buffers.extended[0] = true;
+        shaders.vs_info.bind.storage_buffers.start_register[0] = 12;
+
+        let mut memo = ResolvedShaderMemo::default();
+        memo.insert(key, shaders.clone());
+        memo.invalidate_ranges(&[(0x40_0000, 0x1000)]);
+        assert!(
+            memo.get(key).is_some(),
+            "an unrelated compute output must retain shader analysis"
+        );
+
+        memo.invalidate_ranges(&[(0x80_0004, 4)]);
+        assert!(
+            memo.get(key).is_none(),
+            "an EUD descriptor write must invalidate shader analysis"
+        );
+
+        memo.insert(key, shaders);
+        memo.invalidate_ranges(&[(0x10_0100, 4)]);
+        assert!(
+            memo.get(key).is_none(),
+            "a guest shader-code write must invalidate shader analysis"
         );
     }
 

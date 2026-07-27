@@ -88,6 +88,65 @@ struct ActiveSession {
 /// Cap on the Switcher's recent-titles history (spec §10).
 const MAX_RECENT_TITLES: usize = 6;
 
+/// Stick deflection that registers as a menu-navigation step.
+const STICK_NAV_PRESS: f32 = 0.6;
+/// Deflection the stick must fall back under before it can step again —
+/// lower than [`STICK_NAV_PRESS`] so jitter right at the press threshold
+/// never double-steps.
+const STICK_NAV_RELEASE: f32 = 0.4;
+
+/// Turns analog left-stick motion into discrete [`NavInput`] steps, one per
+/// flick: crossing [`STICK_NAV_PRESS`] emits, and nothing emits again on that
+/// axis until the stick returns under [`STICK_NAV_RELEASE`] (or flicks to the
+/// opposite side). Pure and egui/gilrs-free so it is unit-testable.
+#[derive(Debug, Default)]
+struct StickNav {
+    latched_x: i8,
+    latched_y: i8,
+}
+
+impl StickNav {
+    /// One axis step: `-1`/`1` on a fresh press past the threshold, `None`
+    /// while held, released, or jittering between the two thresholds.
+    fn step_axis(latched: &mut i8, value: f32) -> Option<i8> {
+        let dir = if value >= STICK_NAV_PRESS {
+            1
+        } else if value <= -STICK_NAV_PRESS {
+            -1
+        } else if value.abs() < STICK_NAV_RELEASE {
+            0
+        } else {
+            // Between release and press: keep whatever is latched.
+            *latched
+        };
+        let fresh = dir != 0 && dir != *latched;
+        *latched = dir;
+        fresh.then_some(dir)
+    }
+
+    /// Horizontal stick motion (`+1.0` = right) → Left/Right.
+    fn update_x(&mut self, value: f32) -> Option<NavInput> {
+        Self::step_axis(&mut self.latched_x, value).map(|dir| {
+            if dir < 0 {
+                NavInput::Left
+            } else {
+                NavInput::Right
+            }
+        })
+    }
+
+    /// Vertical stick motion (gilrs reports up as `+1.0`) → Up/Down.
+    fn update_y(&mut self, value: f32) -> Option<NavInput> {
+        Self::step_axis(&mut self.latched_y, value).map(|dir| {
+            if dir < 0 {
+                NavInput::Down
+            } else {
+                NavInput::Up
+            }
+        })
+    }
+}
+
 /// Seconds the PS/Guide button must be held during a session to quit back to
 /// the Shell. A hold (not a tap) so the button still reaches the guest for its
 /// normal in-game use; only a deliberate press-and-hold exits.
@@ -149,6 +208,9 @@ pub struct Shell {
     /// state ahead of gilrs and the keyboard, so pads gilrs rejects with an
     /// all-zeros UUID (Steam Input / DS4Windows / generic HID) still work.
     native_input: raeen_input::NativeGamepads,
+    /// Latched left-stick state so analog flicks navigate menus like the
+    /// D-pad, one step per flick (see [`StickNav`]).
+    stick_nav: StickNav,
     /// Ids of launched titles, most-recent-first, deduplicated and capped —
     /// backs the Control Center's Switcher panel (spec §10).
     recent: Vec<String>,
@@ -252,7 +314,10 @@ impl Shell {
         // caller ever hands the Shell a library without one, Confirm on
         // that index simply never matches and nothing opens Settings.
         let settings_tile_index = library.iter().position(|item| item.id == "settings");
-        let settings_row_counts = settings::settings_row_counts(config.paths.game_folders.len());
+        let settings_row_counts = settings::settings_row_counts(
+            config.paths.game_folders.len(),
+            raeen_gpu::AgcGpuSession::present_plugins().len(),
+        );
         let nav = NavState::with_cc_options(rail_len, cc_len, cc_option_counts)
             .with_settings(settings_tile_index, settings_row_counts)
             .with_media_rail_len(library_media.len())
@@ -294,6 +359,7 @@ impl Shell {
             frame_view: present::GameFrameView::default(),
             gilrs,
             native_input: raeen_input::NativeGamepads::start(),
+            stick_nav: StickNav::default(),
             recent: Vec::new(),
             config,
             config_path,
@@ -346,6 +412,11 @@ impl Shell {
         // checked before nav routing so nothing can shadow it.
         if ctx.input(|i| i.key_pressed(Key::F10)) {
             self.console.open = !self.console.open;
+        }
+        // F11 toggles fullscreen from any screen, same effect as Settings ▸
+        // Video ▸ Fullscreen (which also keeps the config bit in sync).
+        if ctx.input(|i| i.key_pressed(Key::F11)) {
+            self.apply_setting_adjust(ctx, settings::SECTION_VIDEO, 1, 1);
         }
 
         self.route_input(ctx);
@@ -631,22 +702,34 @@ impl Shell {
                 self.config.input.controller_icon_style =
                     self.config.input.controller_icon_style.cycle(delta)
             }
-            (5, 0) => self.cycle_theme(ctx, delta),
-            (7, 0) => {
+            (settings::SECTION_THEME, 0) => self.cycle_theme(ctx, delta),
+            (settings::SECTION_ADVANCED, 0) => {
                 self.config.debug.logging = !self.config.debug.logging;
                 self.apply_log_settings();
             }
-            (7, 1) => {
+            (settings::SECTION_ADVANCED, 1) => {
                 self.config.debug.log_level =
                     settings::cycle_log_level(&self.config.debug.log_level, delta);
                 self.apply_log_settings();
             }
-            (7, 2) => self.config.debug.trace_syscalls = !self.config.debug.trace_syscalls,
-            (7, 3) => self.config.debug.dump_gpu_commands = !self.config.debug.dump_gpu_commands,
-            (7, 4) => self.config.debug.dump_shaders = !self.config.debug.dump_shaders,
-            (7, 5) => self.config.debug.dump_frames = !self.config.debug.dump_frames,
-            (7, 6) => self.config.debug.call_stats = !self.config.debug.call_stats,
-            (7, 7) => self.config.debug.stall_dump = !self.config.debug.stall_dump,
+            (settings::SECTION_ADVANCED, 2) => {
+                self.config.debug.trace_syscalls = !self.config.debug.trace_syscalls
+            }
+            (settings::SECTION_ADVANCED, 3) => {
+                self.config.debug.dump_gpu_commands = !self.config.debug.dump_gpu_commands
+            }
+            (settings::SECTION_ADVANCED, 4) => {
+                self.config.debug.dump_shaders = !self.config.debug.dump_shaders
+            }
+            (settings::SECTION_ADVANCED, 5) => {
+                self.config.debug.dump_frames = !self.config.debug.dump_frames
+            }
+            (settings::SECTION_ADVANCED, 6) => {
+                self.config.debug.call_stats = !self.config.debug.call_stats
+            }
+            (settings::SECTION_ADVANCED, 7) => {
+                self.config.debug.stall_dump = !self.config.debug.stall_dump
+            }
             _ => {}
         }
     }
@@ -669,11 +752,51 @@ impl Shell {
     /// Confirm semantics.
     fn apply_setting_activate(&mut self, ctx: &egui::Context, section: usize, row: usize) {
         match section {
-            0 | 1 | 2 | 5 | 7 => self.apply_setting_adjust(ctx, section, row, 1),
-            3 => self.activate_game_folder_row(row),
-            6 => self.activate_system_row(ctx, row),
-            _ => {} // Key Provider (4): pure text-entry, nothing to "confirm".
+            settings::SECTION_VIDEO
+            | settings::SECTION_AUDIO
+            | settings::SECTION_CONTROLLER
+            | settings::SECTION_THEME
+            | settings::SECTION_ADVANCED => self.apply_setting_adjust(ctx, section, row, 1),
+            settings::SECTION_GAME_FOLDERS => self.activate_game_folder_row(row),
+            settings::SECTION_PLUGINS => self.activate_plugin_row(row),
+            settings::SECTION_SYSTEM => self.activate_system_row(ctx, row),
+            _ => {} // Key Provider: pure text-entry, nothing to "confirm".
         }
+    }
+
+    /// Confirm within the Plugins section: a plugin row toggles that plugin
+    /// active/inactive (and applies it live); the two trailing action rows
+    /// rescan `plugins/` and open it in the host file manager.
+    fn activate_plugin_row(&mut self, row: usize) {
+        let plugins = raeen_gpu::AgcGpuSession::present_plugin_infos();
+        if let Some(plugin) = plugins.get(row) {
+            self.config.graphics.upscaler = if self.config.graphics.upscaler == plugin.name {
+                "off".to_string()
+            } else {
+                plugin.name.clone()
+            };
+            apply_present_plugin(&self.config.graphics);
+        } else if row == plugins.len() {
+            self.rescan_plugins();
+        } else if row == plugins.len() + 1 {
+            open_plugins_folder();
+        }
+    }
+
+    /// Re-scan `plugins/` for out-of-tree present plugins without a restart.
+    /// New binaries register, refusals are re-recorded for the Plugins UI, and
+    /// the section's row count follows the registry.
+    fn rescan_plugins(&mut self) {
+        // SAFETY: same trust boundary as the startup load in `main.rs` —
+        // `plugins/` is the documented, user-controlled BYO plugin directory,
+        // and rescanning is an explicit user action on that same directory.
+        let loaded = unsafe {
+            raeen_gpu::AgcGpuSession::load_present_plugins_from(std::path::Path::new("plugins"))
+        };
+        tracing::info!(count = loaded.len(), plugins = ?loaded, "plugins folder rescanned");
+        // The persisted selection may name a plugin that just (re)appeared.
+        apply_present_plugin(&self.config.graphics);
+        self.refresh_settings_row_counts();
     }
 
     /// Confirm within the System section. Row 0 (Version) is display-only;
@@ -717,9 +840,16 @@ impl Shell {
         } else if row < folder_count {
             self.config.paths.game_folders.remove(row);
         }
+        self.refresh_settings_row_counts();
+    }
+
+    /// Re-derive the Settings nav's per-section row counts from the live
+    /// folder and plugin counts (both sections grow and shrink at runtime).
+    fn refresh_settings_row_counts(&mut self) {
         self.nav
             .set_settings_row_counts(settings::settings_row_counts(
                 self.config.paths.game_folders.len(),
+                raeen_gpu::AgcGpuSession::present_plugins().len(),
             ));
     }
 
@@ -787,22 +917,25 @@ impl Shell {
 
         if !widget_has_focus {
             ctx.input(|i| {
-                if i.key_pressed(Key::ArrowLeft) {
+                // WASD mirrors the arrows for keyboard-first users; both are
+                // guarded by `widget_has_focus`, so typing in a text field
+                // never navigates.
+                if i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::A) {
                     inputs.push(NavInput::Left);
                 }
-                if i.key_pressed(Key::ArrowRight) {
+                if i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::D) {
                     inputs.push(NavInput::Right);
                 }
-                if i.key_pressed(Key::ArrowUp) {
+                if i.key_pressed(Key::ArrowUp) || i.key_pressed(Key::W) {
                     inputs.push(NavInput::Up);
                 }
-                if i.key_pressed(Key::ArrowDown) {
+                if i.key_pressed(Key::ArrowDown) || i.key_pressed(Key::S) {
                     inputs.push(NavInput::Down);
                 }
-                if i.key_pressed(Key::Enter) {
+                if i.key_pressed(Key::Enter) || i.key_pressed(Key::Space) {
                     inputs.push(NavInput::Confirm);
                 }
-                if i.key_pressed(Key::Escape) {
+                if i.key_pressed(Key::Escape) || i.key_pressed(Key::Backspace) {
                     inputs.push(NavInput::Back);
                 }
                 if i.key_pressed(Key::C) {
@@ -863,8 +996,10 @@ impl Shell {
                     }
                     // Triangle/North (the "Options" affordance on the Home
                     // button-hint bar) opens the focused game's per-game
-                    // settings overlay.
-                    gilrs::EventType::ButtonPressed(gilrs::Button::North, _) => {
+                    // settings overlay. Start is the DualSense Options button
+                    // itself, so it does the same.
+                    gilrs::EventType::ButtonPressed(gilrs::Button::North, _)
+                    | gilrs::EventType::ButtonPressed(gilrs::Button::Start, _) => {
                         inputs.push(NavInput::Options)
                     }
                     // Shoulder buttons (L1/R1) both toggle the two-item
@@ -874,6 +1009,15 @@ impl Shell {
                     }
                     gilrs::EventType::ButtonPressed(gilrs::Button::RightTrigger, _) => {
                         inputs.push(NavInput::Tab)
+                    }
+                    // Left stick navigates menus like the D-pad: a flick past
+                    // the press threshold emits one step; the stick must
+                    // return toward center before it can emit again.
+                    gilrs::EventType::AxisChanged(gilrs::Axis::LeftStickX, value, _) => {
+                        inputs.extend(self.stick_nav.update_x(value));
+                    }
+                    gilrs::EventType::AxisChanged(gilrs::Axis::LeftStickY, value, _) => {
+                        inputs.extend(self.stick_nav.update_y(value));
                     }
                     _ => {}
                 }
@@ -1101,12 +1245,19 @@ impl Shell {
         animating |= self.focus_pop.tick(dt);
         animating |= self.hero_t.tick(dt);
 
-        self.cc_open
-            .set_target(if self.nav.mode == NavMode::ControlCenter {
+        // Drilling into a card's option list (ControlCenterOption) must keep
+        // the overlay open — it is the same surface, only input routing
+        // differs.
+        self.cc_open.set_target(
+            if matches!(
+                self.nav.mode,
+                NavMode::ControlCenter | NavMode::ControlCenterOption
+            ) {
                 1.0
             } else {
                 0.0
-            });
+            },
+        );
         animating |= self.cc_open.tick(dt);
 
         if animating {
@@ -1133,8 +1284,10 @@ impl Shell {
         let frame = egui::Frame::NONE.fill(theme.palette.ground);
         let mut clicked_home_tile = None;
         let mut clicked_gear = false;
+        let mut clicked_pill = None;
         let mut clicked_setting = None;
         let mut clicked_game_option = None;
+        let mut clicked_cc = None;
 
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             if let Some(session) = &self.session {
@@ -1168,6 +1321,8 @@ impl Shell {
             }
 
             if self.nav.mode == NavMode::Settings {
+                let plugins = plugin_row_infos();
+                let plugin_failures = raeen_gpu::AgcGpuSession::present_plugin_load_failures();
                 clicked_setting = settings::draw(
                     ui,
                     &theme,
@@ -1176,6 +1331,8 @@ impl Shell {
                     &mut self.settings_new_folder_input,
                     &mut self.settings_key_provider_input,
                     &self.updater_state,
+                    &plugins,
+                    &plugin_failures,
                 );
                 return;
             }
@@ -1203,6 +1360,7 @@ impl Shell {
             );
             clicked_home_tile = home_response.clicked_tile;
             clicked_gear = home_response.gear_clicked;
+            clicked_pill = home_response.clicked_pill;
 
             let recent_titles = self.recent_titles();
             // Live card values — real config volume and the real connected
@@ -1222,7 +1380,7 @@ impl Shell {
                     .and_then(|g| g.gamepads().next().map(|(_, pad)| pad.name().to_string()))
                     .unwrap_or_else(|| "No controller connected".to_string()),
             };
-            control_center::draw(
+            clicked_cc = control_center::draw(
                 ui,
                 &theme,
                 &self.nav,
@@ -1236,6 +1394,52 @@ impl Shell {
             self.nav.settings_section = 0;
             self.nav.settings_row = 0;
             self.enter_settings();
+        }
+        if let Some(pill) = clicked_pill {
+            // Clicking a pill focuses and activates it in one go — the same
+            // path a pad Confirm takes, so tab switching / opening Settings
+            // stay in one place (`nav::apply_pills`).
+            self.nav.mode = NavMode::Pills;
+            self.nav.pill_index = pill;
+            if self.nav.apply(NavInput::Confirm) == NavAction::OpenSettings {
+                self.enter_settings();
+            }
+        }
+        if let Some(click) = clicked_cc
+            && matches!(
+                self.nav.mode,
+                NavMode::ControlCenter | NavMode::ControlCenterOption
+            )
+        {
+            match click {
+                control_center::CcClick::Card(index) => {
+                    // Focus the clicked card; a second meaning (drilling into
+                    // its option list) comes from the same Confirm the pad
+                    // uses, so display-only cards simply focus.
+                    self.nav.mode = NavMode::ControlCenter;
+                    self.nav.cc_index = index;
+                    self.nav.apply(NavInput::Confirm);
+                }
+                control_center::CcClick::Option(option) => {
+                    // Drill into the focused card's list if not already there,
+                    // select the clicked line, and activate it.
+                    if self.nav.mode == NavMode::ControlCenter {
+                        self.nav.apply(NavInput::Confirm);
+                    }
+                    if self.nav.mode == NavMode::ControlCenterOption {
+                        self.nav.cc_option_index = option;
+                        if let NavAction::ActivateOption { card, option } =
+                            self.nav.apply(NavInput::Confirm)
+                        {
+                            self.handle_cc_option(ctx, card, option);
+                        }
+                    }
+                }
+                control_center::CcClick::Dismiss => {
+                    // Same as pressing Guide: close the overlay entirely.
+                    self.nav.apply(NavInput::Guide);
+                }
+            }
         }
         if let Some(index) = clicked_home_tile {
             self.nav.mode = NavMode::Home;
@@ -1257,7 +1461,10 @@ impl Shell {
                     self.nav.settings_row = row;
                     // Text-entry sections retain native egui widget behavior;
                     // clicking other rows has the same meaning as Confirm.
-                    if !matches!(self.nav.settings_section, 3 | 4) {
+                    if !matches!(
+                        self.nav.settings_section,
+                        settings::SECTION_GAME_FOLDERS | settings::SECTION_KEY_PROVIDER
+                    ) {
                         self.apply_setting_activate(ctx, self.nav.settings_section, row);
                     }
                 }
@@ -1293,6 +1500,51 @@ fn push_recent(recent: &mut Vec<String>, id: &str, cap: usize) {
     recent.retain(|existing| existing != id);
     recent.insert(0, id.to_string());
     recent.truncate(cap);
+}
+
+/// Resolve the live plugin registry into the display rows the Settings ▸
+/// Plugins section draws. Active is the registry's word (what is actually
+/// running), not the config's (what is persisted) — the two can differ when a
+/// persisted plugin is no longer registered.
+fn plugin_row_infos() -> Vec<settings::PluginRowInfo> {
+    let active = raeen_gpu::AgcGpuSession::active_present_plugin();
+    raeen_gpu::AgcGpuSession::present_plugin_infos()
+        .into_iter()
+        .map(|info| settings::PluginRowInfo {
+            capabilities: settings::capability_label(&info.capabilities),
+            source: info.source.as_deref().map_or_else(
+                || "built-in".to_string(),
+                |p| {
+                    p.file_name().map_or_else(
+                        || p.display().to_string(),
+                        |f| f.to_string_lossy().into_owned(),
+                    )
+                },
+            ),
+            active: active.as_deref() == Some(info.name.as_str()),
+            name: info.name,
+        })
+        .collect()
+}
+
+/// Open the BYO `plugins/` directory in the host's file manager, creating it
+/// first so the user always lands somewhere real. Failures are logged, never
+/// fatal — this is a convenience, not a load-bearing path.
+fn open_plugins_folder() {
+    let dir = std::path::Path::new("plugins");
+    if let Err(err) = std::fs::create_dir_all(dir) {
+        tracing::warn!(error = %err, "could not create plugins/ directory");
+        return;
+    }
+    #[cfg(windows)]
+    let result = std::process::Command::new("explorer").arg(dir).spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(dir).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(dir).spawn();
+    if let Err(err) = result {
+        tracing::warn!(error = %err, "could not open plugins/ in the file manager");
+    }
 }
 
 /// Radial deadzone for a single analog axis, matching `read_pad`'s inline
@@ -1645,6 +1897,43 @@ fn draw_session_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stick_nav_emits_once_per_flick_with_hysteresis() {
+        let mut nav = StickNav::default();
+        // Ramping up: nothing until the press threshold.
+        assert_eq!(nav.update_x(0.3), None);
+        assert_eq!(nav.update_x(0.7), Some(NavInput::Right));
+        // Held past the threshold: no repeat.
+        assert_eq!(nav.update_x(0.9), None);
+        assert_eq!(nav.update_x(1.0), None);
+        // Jitter back between release (0.4) and press (0.6): still latched.
+        assert_eq!(nav.update_x(0.5), None);
+        assert_eq!(nav.update_x(0.7), None);
+        // Full release re-arms the axis.
+        assert_eq!(nav.update_x(0.1), None);
+        assert_eq!(nav.update_x(0.8), Some(NavInput::Right));
+    }
+
+    #[test]
+    fn stick_nav_opposite_flick_emits_without_a_center_stop() {
+        let mut nav = StickNav::default();
+        assert_eq!(nav.update_x(0.8), Some(NavInput::Right));
+        // Snapping straight across to the other side is a fresh step.
+        assert_eq!(nav.update_x(-0.8), Some(NavInput::Left));
+        assert_eq!(nav.update_x(-0.9), None);
+    }
+
+    #[test]
+    fn stick_nav_y_up_is_up_and_axes_are_independent() {
+        let mut nav = StickNav::default();
+        // gilrs reports up as +1.0.
+        assert_eq!(nav.update_y(0.8), Some(NavInput::Up));
+        assert_eq!(nav.update_y(0.0), None);
+        assert_eq!(nav.update_y(-0.8), Some(NavInput::Down));
+        // A held vertical deflection never blocks the horizontal axis.
+        assert_eq!(nav.update_x(0.8), Some(NavInput::Right));
+    }
 
     #[test]
     fn push_recent_orders_most_recent_first() {

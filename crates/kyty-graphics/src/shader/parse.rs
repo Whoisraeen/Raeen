@@ -2609,7 +2609,10 @@ fn shader_parse_exp(
             if done != 0 && compr != 0 && vm != 0 && en == 0x0 {
                 inst.format = F::Mrt0OffOffComprVmDone;
                 inst.src_num = 0;
-            } else if done != 0 && compr != 0 && vm != 0 && en == 0xf {
+            } else if done != 0 && compr != 0 && vm != 0 && en != 0 {
+                // Compressed exports always carry two packed source operands;
+                // `en` selects individual unpacked channels. GTA V emits
+                // en=0x3 (RG only), leaving BA at the export defaults.
                 inst.format = F::Mrt0Vsrc0Vsrc1ComprVmDone;
                 inst.src_num = 2;
             } else if done != 0 && compr == 0 && vm != 0 && en != 0 {
@@ -3931,7 +3934,10 @@ fn shader_parse_mimg(
         0x1d => return Err(ni(dst, S, "image_atomic_fcmpswap", opcode, pc, b0)),
         0x1e => return Err(ni(dst, S, "image_atomic_fmin", opcode, pc, b0)),
         0x1f => return Err(ni(dst, S, "image_atomic_fmax", opcode, pc, b0)),
-        0x20 => {
+        // GFX10 `image_sample_a` (0xa0) is the bit-7 variant of the ordinary
+        // sample. KytyPS5's ImageOps table maps both to ImageSample with the
+        // same flags and operand shape; GTA V uses 0xa0 in its first PS.
+        0x20 | 0xa0 => {
             inst.type_ = T::ImageSample;
             inst.src[0].size = 3;
             inst.src[1].size = 8;
@@ -4144,10 +4150,8 @@ fn shader_parse_mimg(
         0x6f => return Err(ni(dst, S, "image_sample_c_cd_cl_o", opcode, pc, b0)),
         0x7e => return Err(ni(dst, S, "image_rsrc256", opcode, pc, b0)),
         0x7f => return Err(ni(dst, S, "image_sampler", opcode, pc, b0)),
-        // Kyty's table continues with 0xA0-0xDE `_a` variants
-        // (ShaderParse.cpp L3162-3193); they are unreachable with the
-        // (buffer[0] >> 18) & 0x7f decode Kyty itself uses, so the port folds
-        // them into UnknownOpcode.
+        // Other `_a` variants remain named unsupported until measured and
+        // paired with their exact operand flags.
         _ => return Err(unknown_op(dst, S, opcode, pc, b0)),
     }
 
@@ -5395,6 +5399,23 @@ mod tests {
     }
 
     #[test]
+    fn gta_image_sample_a_decodes_as_a_sample() {
+        // Exact first dword from GTA V's first rejected pixel shader. GFX10
+        // opcode bit 7 lives in word0 bit 0, producing MIMG 0xa0
+        // (`image_sample_a`) instead of the legacy 0x20 `image_sample`.
+        let (code, result) = parse(
+            &[0xF080_0109, 0x0061_0800, S_ENDPGM],
+            ShaderType::Pixel,
+            true,
+        );
+        result.expect("GTA image_sample_a must parse");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::ImageSample);
+        assert_eq!(inst.format, F::Vdata1Vaddr3StSsDmask1);
+        assert_eq!(inst.dst.size, 1);
+    }
+
+    #[test]
     fn astro_mimg_new_dmask_forms_decode() {
         // The three MIMG operand-format gaps measured on ASTRO.BOT scene
         // compute: image_sample_lz (0x27) dmask 0x1/0x2, image_load (0x00)
@@ -5511,6 +5532,24 @@ mod tests {
     /// `unknown exp target: 0x09 ... (en=0x0 done=1 compr=0 vm=1)`. Kyty EXITs
     /// on this target, so every shader containing one was refused whole and
     /// every draw using it dropped.
+    #[test]
+    fn gta_exp_mrt0_compressed_partial_export_decodes() {
+        // Measured GTA V pixel shader hash0=0x21000070:
+        // exp mrt0 v0, v0 compr vm done, en=0x3. Compressed exports retain two
+        // packed source operands even when only the first pair is enabled.
+        let (code, result) = parse(
+            &[0xF800_1C03, 0x0000_0000, S_ENDPGM],
+            ShaderType::Pixel,
+            true,
+        );
+        result.expect("parse GTA compressed partial-mask MRT0 export");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::Exp);
+        assert_eq!(inst.format, F::Mrt0Vsrc0Vsrc1ComprVmDone);
+        assert_eq!(inst.src_num, 2);
+        assert_eq!(inst.export_enable, 0x3);
+    }
+
     #[test]
     fn astro_exp_null_target_decodes() {
         // en=0, target=9<<4, compr=0, done=1<<11, vm=1<<12 → 0x1890.
