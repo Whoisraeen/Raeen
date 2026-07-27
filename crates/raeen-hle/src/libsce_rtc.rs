@@ -86,6 +86,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceRtc", "sceRtcGetDayOfWeek", hle_get_day_of_week);
     registry.register("libSceRtc", "sceRtcCheckValid", hle_check_valid);
     registry.register("libSceRtc", "sceRtcGetTick", hle_get_tick);
+    registry.register("libSceRtc", "sceRtcGetTime_t", hle_get_time_t);
     registry.register("libSceRtc", "sceRtcSetTick", hle_set_tick);
     registry.register("libSceRtc", "sceRtcSetTime_t", hle_set_time_t);
     registry.register("libSceRtc", "sceRtcFormatRFC3339", hle_format_rfc3339);
@@ -336,6 +337,26 @@ fn hle_get_tick(ctx: &HleContext, args: &[u64]) -> u64 {
     };
     let tick = datetime_to_tick(&dt);
     if !ctx.mem.write(out_ptr, &tick.to_le_bytes()) {
+        return ERR_INVALID_POINTER;
+    }
+    OK
+}
+
+/// `sceRtcGetTime_t(const SceRtcDateTime *in, time_t *out)`: convert a
+/// calendar date-time to Unix seconds. Pre-epoch date-times clamp to 0
+/// (shadPS4 `rtc.cpp` does the same — re-derived, not ported).
+fn hle_get_time_t(ctx: &HleContext, args: &[u64]) -> u64 {
+    let in_ptr = args.first().copied().unwrap_or(0);
+    let out_ptr = args.get(1).copied().unwrap_or(0);
+    if in_ptr == 0 || out_ptr == 0 {
+        return ERR_INVALID_POINTER;
+    }
+    let Some(dt) = read_datetime(ctx, in_ptr) else {
+        return ERR_INVALID_POINTER;
+    };
+    let tick = datetime_to_tick(&dt);
+    let time_t = tick.saturating_sub(UNIX_EPOCH_TICKS) / MICROSECONDS_PER_SECOND;
+    if !ctx.mem.write(out_ptr, &time_t.to_le_bytes()) {
         return ERR_INVALID_POINTER;
     }
     OK

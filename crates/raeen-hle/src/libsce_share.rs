@@ -59,7 +59,19 @@ pub fn register(registry: &HleRegistry) {
     for lib in ["libSceShareUtility", "libSceShare"] {
         registry.register(lib, "sceShareRegisterContentEventCallback", hle_ok);
         registry.register(lib, "sceShareUnregisterContentEventCallback", hle_ok);
+        // Terminate clears the init flag; Permit/Prohibit toggle capture
+        // policy on a Share backend that does not exist — the request is
+        // accepted (the policy holds vacuously: nothing can be captured).
+        registry.register(lib, "sceShareTerminate", hle_terminate);
+        registry.register(lib, "sceShareFeaturePermit", hle_ok);
+        registry.register(lib, "sceShareFeatureProhibit", hle_ok);
     }
+}
+
+/// `sceShareTerminate()`: clear the initialized flag.
+fn hle_terminate(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    INITIALIZED.store(0, Ordering::Relaxed);
+    OK
 }
 
 /// Accept-and-ignore for registrations that can never produce an event offline.

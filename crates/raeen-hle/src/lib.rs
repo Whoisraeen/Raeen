@@ -45,16 +45,19 @@ pub mod libsce_fiber;
 pub mod libsce_font;
 pub mod libsce_gnm_driver;
 pub mod libsce_http;
+pub mod libsce_ime_dialog;
 pub mod libsce_json;
 pub mod libsce_libc_internal;
 pub mod libsce_media;
 pub mod libsce_net;
 pub mod libsce_np;
+pub mod libsce_np_commerce;
 pub mod libsce_np_entitlement;
 pub mod libsce_np_session_signaling;
 pub mod libsce_np_trophy2;
 pub mod libsce_np_universal_data;
 pub mod libsce_np_web_api2;
+pub mod libsce_online_misc;
 pub mod libsce_pad;
 pub mod libsce_peripheral;
 pub mod libsce_playgo;
@@ -71,6 +74,8 @@ pub mod libsce_system_service;
 pub mod libsce_text_to_speech2;
 pub mod libsce_user_service;
 pub mod libsce_video_out;
+pub mod libsce_voice;
+pub mod libsce_web_browser_dialog;
 pub mod posix_sem;
 pub mod pthread_attr;
 pub mod pthread_cond;
@@ -739,6 +744,11 @@ impl HleRegistry {
         libsce_np_trophy2::register(&registry);
         libsce_np_universal_data::register(&registry);
         libsce_np_web_api2::register(&registry);
+        libsce_np_commerce::register(&registry);
+        libsce_voice::register(&registry);
+        libsce_ime_dialog::register(&registry);
+        libsce_web_browser_dialog::register(&registry);
+        libsce_online_misc::register(&registry);
         libsce_np_entitlement::register(&registry);
         libsce_np_session_signaling::register(&registry);
         libsce_http::register(&registry);
@@ -1411,9 +1421,13 @@ mod tests {
 
         let registry = HleRegistry::new();
         let bindings = registry.registered_provider_nid_overrides();
+        // 2026-07-27: +1 — libSceVideoRecordingP 0x8904ba0d4b4bc9b1, a
+        // measured anonymous import (no dictionary name survives the hash
+        // gate), bound in libsce_online_misc.rs to the disabled-recorder
+        // refusal.
         assert_eq!(
             bindings.len(),
-            11,
+            12,
             "the explicit-NID surface changed; review every added/removed binding and update \
              this audited count"
         );

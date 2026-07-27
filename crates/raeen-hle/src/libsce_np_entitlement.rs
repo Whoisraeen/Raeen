@@ -41,6 +41,60 @@ pub fn register(registry: &HleRegistry) {
         "sceNpEntitlementAccessGetSkuFlag",
         hle_get_sku_flag,
     );
+
+    // Consumable-entitlement flow (Tier B, 2026-07-27; measured GTA V
+    // imports). Consuming an entitlement is a PSN transaction — offline it
+    // refuses with the Np SIGNED_OUT error, so no request ever exists for the
+    // poll/abort/delete entry points to find. NOTHING here fabricates a
+    // consumed entitlement or a transaction. The lib's own error values are
+    // not publicly documented: SIGNED_OUT uses the shared Np space and the
+    // not-found path the generic kernel spelling (uncertain codes, marked).
+    registry.register(
+        "libSceNpEntitlementAccess",
+        "sceNpEntitlementAccessRequestConsumeUnifiedEntitlement",
+        hle_consume_offline,
+    );
+    registry.register(
+        "libSceNpEntitlementAccess",
+        "sceNpEntitlementAccessGenerateTransactionId",
+        hle_consume_offline,
+    );
+    registry.register(
+        "libSceNpEntitlementAccess",
+        "sceNpEntitlementAccessPollConsumeEntitlement",
+        hle_request_not_found,
+    );
+    registry.register(
+        "libSceNpEntitlementAccess",
+        "sceNpEntitlementAccessAbortRequest",
+        hle_request_not_found,
+    );
+    registry.register(
+        "libSceNpEntitlementAccess",
+        "sceNpEntitlementAccessDeleteRequest",
+        hle_request_not_found,
+    );
+}
+
+/// `ORBIS_NP_ERROR_SIGNED_OUT` (shadPS4 `np_error.h`) — the honest offline
+/// refusal for PSN transactions.
+const NP_ERROR_SIGNED_OUT: u64 = 0x8055_0006;
+/// Generic kernel ENOENT — uncertain code (the lib's own not-found value is
+/// undocumented); used for request-keyed calls when no request can exist.
+const SCE_ERROR_NOT_FOUND: u64 = 0x8002_0002;
+
+/// Consume/transaction entry points refuse offline — starting a PSN
+/// entitlement transaction signed out is impossible, and no transaction id is
+/// written (the out-struct layout is undocumented, and a fabricated id would
+/// be a credential).
+fn hle_consume_offline(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    tracing::debug!("sceNpEntitlementAccess consume/transaction -> SIGNED_OUT (offline)");
+    NP_ERROR_SIGNED_OUT
+}
+
+/// Request-keyed calls: creation refuses above, so no request exists.
+fn hle_request_not_found(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    SCE_ERROR_NOT_FOUND
 }
 
 /// `sceNpEntitlementAccessInitialize(initParam, bootParam)`: when `bootParam`

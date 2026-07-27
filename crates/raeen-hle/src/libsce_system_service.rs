@@ -88,6 +88,32 @@ pub fn register(registry: &HleRegistry) {
         "sceSystemServiceReceiveEvent",
         hle_receive_event,
     );
+    // Player (profile) dialog overlay (measured GTA V imports). The param
+    // initializer only touches caller memory whose layout is undocumented, so
+    // it is acknowledged without writing; Launch has no host overlay to show,
+    // so it is refused with the documented PARAMETER error — the title treats
+    // the profile popup as unavailable and continues, rather than waiting on
+    // an overlay that can never close.
+    registry.register(
+        "libSceSystemService",
+        "sceSystemServiceInitializePlayerDialogParam",
+        hle_ok,
+    );
+    registry.register_incomplete(
+        "libSceSystemService",
+        "sceSystemServiceLaunchPlayerDialog",
+        hle_launch_player_dialog,
+        "no host overlay: the player dialog refuses to launch",
+    );
+}
+
+/// `sceSystemServiceLaunchPlayerDialog(param)`: no overlay exists to display.
+fn hle_launch_player_dialog(_ctx: &HleContext, args: &[u64]) -> u64 {
+    tracing::debug!(
+        "sceSystemServiceLaunchPlayerDialog(param={:#x}) -> ERROR_PARAMETER (no host overlay)",
+        args.first().copied().unwrap_or(0)
+    );
+    ERROR_PARAMETER
 }
 
 /// `sceSystemServiceHideSplashScreen()`: the title declares its own rendering

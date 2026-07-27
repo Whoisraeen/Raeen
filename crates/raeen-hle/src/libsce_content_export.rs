@@ -97,6 +97,16 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceContentExport", "sceContentExportStart", hle_ok);
     registry.register("libSceContentExport", "sceContentExportFinish", hle_ok);
     registry.register("libSceContentExport", "sceContentExportFromData", hle_ok);
+    // File-sourced exports (measured GTA V imports): same accept-and-drop
+    // model as FromData above — the "export to the console media gallery"
+    // side effect has no host equivalent, and the title only observes the
+    // return code.
+    registry.register("libSceContentExport", "sceContentExportFromFile", hle_ok);
+    registry.register(
+        "libSceContentExport",
+        "sceContentExportFromFileWithThumbnail",
+        hle_ok,
+    );
 }
 
 #[cfg(test)]

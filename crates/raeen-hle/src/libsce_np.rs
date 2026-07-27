@@ -69,6 +69,55 @@ pub fn register(registry: &HleRegistry) {
         hle_get_account_id_a,
     );
     registry.register("libSceNpManager", "sceNpGameIntentInitialize", hle_ok);
+
+    // Sync/async NP request lifecycle (Tier B, 2026-07-27). Model re-derived
+    // from shadPS4's GPL-2.0 `np_manager.cpp`: a request is a real tracked
+    // handle; a check operation *completes* it with the offline result
+    // (`SIGNED_OUT`), which an async request reports as OK immediately and
+    // hands the real result to `sceNpPollAsync` — so a title polling an async
+    // PSN check terminates promptly with the honest offline answer instead of
+    // spinning on an unresolved import. Nothing fabricates a signed-in state.
+    registry.register(
+        "libSceNpManager",
+        "sceNpCreateAsyncRequest",
+        hle_create_async_request,
+    );
+    registry.register("libSceNpManager", "sceNpDeleteRequest", hle_delete_request);
+    registry.register("libSceNpManager", "sceNpAbortRequest", hle_abort_request);
+    registry.register("libSceNpManager", "sceNpPollAsync", hle_poll_async);
+    registry.register(
+        "libSceNpManager",
+        "sceNpCheckNpReachability",
+        hle_check_offline_request,
+    );
+    registry.register(
+        "libSceNpManager",
+        "sceNpCheckPremium",
+        hle_check_offline_request,
+    );
+    registry.register(
+        "libSceNpManager",
+        "sceNpGetAccountAge",
+        hle_check_offline_request,
+    );
+    // Premium (PS Plus) events never fire on a signed-out console: notifying
+    // usage is accepted and dropped; the callback registers and stays silent —
+    // the same model as the reachability callback above.
+    registry.register(
+        "libSceNpManager",
+        "sceNpNotifyPremiumFeature",
+        hle_notify_premium_feature,
+    );
+    registry.register(
+        "libSceNpManager",
+        "sceNpRegisterPremiumEventCallback",
+        hle_register_premium_callback,
+    );
+    registry.register(
+        "libSceNpManager",
+        "sceNpUnregisterPremiumEventCallback",
+        hle_ok,
+    );
     // libSceNpManagerForToolkit is a sibling library (same offline Np state);
     // its state callback registration behaves like the base one. Ported from
     // SharpEmu's `NpManagerExports` (GPL-2.0).
@@ -102,6 +151,20 @@ pub fn register(registry: &HleRegistry) {
         "sceNpAuthGetAuthorizedAppCode",
         hle_np_auth_get_authorized_app_code,
     );
+    // Async variants (measured GTA V imports). Same offline model as the
+    // NpManager request family: creation succeeds with a real id, the poll
+    // finishes immediately with SIGNED_OUT — every auth outcome offline.
+    registry.register(
+        "libSceNpAuth",
+        "sceNpAuthCreateAsyncRequest",
+        hle_np_auth_create_request,
+    );
+    registry.register(
+        "libSceNpAuth",
+        "sceNpAuthAbortRequest",
+        hle_np_auth_abort_request,
+    );
+    registry.register("libSceNpAuth", "sceNpAuthPollAsync", hle_np_auth_poll_async);
 
     // libSceNpAuthAuthorizedAppDialog — the PSN "authorize this app" popup.
     // Names recovered via the SharpEmu catalogue merge (the whole set appeared
@@ -195,6 +258,39 @@ fn hle_np_auth_get_authorized_app_code(_ctx: &HleContext, _args: &[u64]) -> u64 
     NP_ERROR_SIGNED_OUT
 }
 
+/// `sceNpAuthAbortRequest(req_id)`: acknowledged — offline auth requests
+/// complete instantly, so there is never in-flight work to cancel; an unknown
+/// id reports not-found.
+fn hle_np_auth_abort_request(ctx: &HleContext, args: &[u64]) -> u64 {
+    let request = args.first().copied().unwrap_or(0) as i32;
+    if !ctx.kernel.np_auth_requests.contains_key(&request) {
+        return NP_AUTH_ERROR_REQUEST_NOT_FOUND;
+    }
+    SCE_OK
+}
+
+/// `sceNpAuthPollAsync(req_id, s32 *result)`: finishes immediately — every
+/// offline auth outcome is `SIGNED_OUT`, delivered through the result
+/// pointer with an OK return so the title's poll loop terminates promptly.
+fn hle_np_auth_poll_async(ctx: &HleContext, args: &[u64]) -> u64 {
+    let request = args.first().copied().unwrap_or(0) as i32;
+    let result_ptr = args.get(1).copied().unwrap_or(0);
+    if result_ptr == 0 {
+        return NP_AUTH_ERROR_INVALID_ARGUMENT;
+    }
+    if !ctx.kernel.np_auth_requests.contains_key(&request) {
+        return NP_AUTH_ERROR_REQUEST_NOT_FOUND;
+    }
+    if !ctx
+        .mem
+        .write(result_ptr, &(NP_ERROR_SIGNED_OUT as u32).to_le_bytes())
+    {
+        return NP_AUTH_ERROR_INVALID_ARGUMENT;
+    }
+    debug!("sceNpAuthPollAsync(req={request:#x}) -> OK, result=SIGNED_OUT");
+    SCE_OK
+}
+
 fn hle_auth_dialog_initialize(_ctx: &HleContext, _args: &[u64]) -> u64 {
     AUTH_DIALOG_STATUS.store(
         AUTH_STATUS_INITIALIZED,
@@ -228,6 +324,185 @@ fn hle_auth_dialog_get_result(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    SCE_OK
+}
+
+// --- NP request lifecycle (shadPS4-derived offline model) ------------------
+
+/// `ORBIS_NP_ERROR_INVALID_SIZE` (shadPS4 `np_error.h`).
+const NP_ERROR_INVALID_SIZE: u64 = 0x8055_0011;
+/// `ORBIS_NP_ERROR_ABORTED`.
+const NP_ERROR_ABORTED: u64 = 0x8055_0012;
+/// `ORBIS_NP_ERROR_REQUEST_NOT_FOUND`.
+const NP_ERROR_REQUEST_NOT_FOUND: u64 = 0x8055_0014;
+/// `ORBIS_NP_ERROR_INVALID_ID`.
+const NP_ERROR_INVALID_ID: u64 = 0x8055_0015;
+
+#[derive(Clone, Copy, PartialEq)]
+enum NpRequestState {
+    /// Created; no check operation has run on it yet.
+    Ready,
+    /// A check operation completed it; `result` holds the outcome.
+    Complete,
+    /// Aborted before completion.
+    Aborted,
+}
+
+#[derive(Clone, Copy)]
+struct NpRequest {
+    is_async: bool,
+    state: NpRequestState,
+    /// The i32 outcome `sceNpPollAsync` reports (`SIGNED_OUT` offline).
+    result: u32,
+}
+
+/// Live NP requests. Process-global like the module's other registries; ids
+/// are nonzero and monotonic.
+static NP_REQUESTS: std::sync::Mutex<Option<std::collections::HashMap<i32, NpRequest>>> =
+    std::sync::Mutex::new(None);
+static NP_NEXT_REQUEST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
+/// `sceNpCreateAsyncRequest(const SceNpCreateAsyncRequestParameter *param)`:
+/// a null param is an argument error and a zero leading `size` field an
+/// invalid-size error (shadPS4 validates `param->size` exactly; the exact
+/// struct size is SDK-dependent, so only the never-valid zero is rejected
+/// here). Returns a real request id.
+fn hle_create_async_request(ctx: &HleContext, args: &[u64]) -> u64 {
+    let param = args.first().copied().unwrap_or(0);
+    if param == 0 {
+        return ERROR_INVALID_ARGUMENT;
+    }
+    let mut size_bytes = [0u8; 8];
+    if !ctx.mem.read(param, &mut size_bytes) {
+        return ERROR_INVALID_ARGUMENT;
+    }
+    if u64::from_le_bytes(size_bytes) == 0 {
+        return NP_ERROR_INVALID_SIZE;
+    }
+    let id = NP_NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    NP_REQUESTS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(
+            id,
+            NpRequest {
+                is_async: true,
+                state: NpRequestState::Ready,
+                result: 0,
+            },
+        );
+    debug!("sceNpCreateAsyncRequest() -> {id:#x}");
+    id as u32 as u64
+}
+
+/// Complete `req_id` with the offline outcome and return what the caller
+/// sees: an async request reports OK now (the result travels through
+/// `sceNpPollAsync`); a sync request reports the outcome directly.
+fn complete_np_request_offline(req_id: i32, outcome: u32) -> u64 {
+    let mut requests = NP_REQUESTS.lock().unwrap();
+    let Some(req) = requests.as_mut().and_then(|map| map.get_mut(&req_id)) else {
+        return NP_ERROR_REQUEST_NOT_FOUND;
+    };
+    match req.state {
+        NpRequestState::Aborted => NP_ERROR_ABORTED,
+        NpRequestState::Complete => ERROR_INVALID_ARGUMENT,
+        NpRequestState::Ready => {
+            req.state = NpRequestState::Complete;
+            req.result = outcome;
+            if req.is_async {
+                SCE_OK
+            } else {
+                u64::from(outcome)
+            }
+        }
+    }
+}
+
+/// `sceNpCheckNpReachability` / `sceNpCheckPremium` / `sceNpGetAccountAge`
+/// `(req_id, ...)`: request-keyed PSN checks. Offline they complete the
+/// request with `SIGNED_OUT` — no reachability, no premium answer, and no
+/// fabricated account age (age is PSN account data Raeen does not have).
+fn hle_check_offline_request(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let req_id = args.first().copied().unwrap_or(0) as i32;
+    let ret = complete_np_request_offline(req_id, NP_ERROR_SIGNED_OUT as u32);
+    debug!("sceNp check(req={req_id:#x}) -> {ret:#x} (offline: SIGNED_OUT)");
+    ret
+}
+
+/// `sceNpAbortRequest(req_id)`: an already-complete request ignores the abort
+/// (OK, matching shadPS4); a pending one is marked aborted with the `ABORTED`
+/// result for a subsequent poll.
+fn hle_abort_request(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let req_id = args.first().copied().unwrap_or(0) as i32;
+    let mut requests = NP_REQUESTS.lock().unwrap();
+    let Some(req) = requests.as_mut().and_then(|map| map.get_mut(&req_id)) else {
+        return NP_ERROR_REQUEST_NOT_FOUND;
+    };
+    if req.state != NpRequestState::Complete {
+        req.state = NpRequestState::Aborted;
+        req.result = NP_ERROR_ABORTED as u32;
+    }
+    SCE_OK
+}
+
+/// `sceNpDeleteRequest(req_id)`: release the request.
+fn hle_delete_request(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let req_id = args.first().copied().unwrap_or(0) as i32;
+    match NP_REQUESTS
+        .lock()
+        .unwrap()
+        .as_mut()
+        .and_then(|m| m.remove(&req_id))
+    {
+        Some(_) => SCE_OK,
+        None => NP_ERROR_REQUEST_NOT_FOUND,
+    }
+}
+
+/// `sceNpPollAsync(req_id, s32 *result)`: the request completed at
+/// check-call time, so the poll finishes immediately — OK with the stored
+/// offline result. A request nothing was started on (`Ready`), or a sync
+/// request, is `INVALID_ID` (shadPS4's rule).
+fn hle_poll_async(ctx: &HleContext, args: &[u64]) -> u64 {
+    let req_id = args.first().copied().unwrap_or(0) as i32;
+    let result_ptr = args.get(1).copied().unwrap_or(0);
+    if result_ptr == 0 {
+        return ERROR_INVALID_ARGUMENT;
+    }
+    let requests = NP_REQUESTS.lock().unwrap();
+    let Some(req) = requests.as_ref().and_then(|map| map.get(&req_id)) else {
+        return NP_ERROR_REQUEST_NOT_FOUND;
+    };
+    if !req.is_async || req.state == NpRequestState::Ready {
+        return NP_ERROR_INVALID_ID;
+    }
+    if !ctx.mem.write(result_ptr, &req.result.to_le_bytes()) {
+        return ERROR_INVALID_ARGUMENT;
+    }
+    debug!(
+        "sceNpPollAsync(req={req_id:#x}) -> OK, result={:#x}",
+        req.result
+    );
+    SCE_OK
+}
+
+/// `sceNpNotifyPremiumFeature(const SceNpNotifyPremiumFeatureParameter *)`:
+/// the usage notification is accepted and dropped — there is no PSN to
+/// notify, and the call carries no answer the title depends on.
+fn hle_notify_premium_feature(_ctx: &HleContext, args: &[u64]) -> u64 {
+    if args.first().copied().unwrap_or(0) == 0 {
+        return ERROR_INVALID_ARGUMENT;
+    }
+    SCE_OK
+}
+
+/// `sceNpRegisterPremiumEventCallback(callback, userdata)`: accept and stay
+/// silent — premium (PS Plus) events only fire on a live PSN connection.
+fn hle_register_premium_callback(_ctx: &HleContext, args: &[u64]) -> u64 {
+    if args.first().copied().unwrap_or(0) == 0 {
+        return ERROR_INVALID_ARGUMENT;
+    }
     SCE_OK
 }
 
@@ -489,6 +764,41 @@ mod tests {
         );
     }
 
+    /// The async auth poll terminates immediately with SIGNED_OUT — a title
+    /// polling an offline auth request never spins.
+    #[test]
+    fn np_auth_async_poll_finishes_immediately_signed_out() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let req = hle_np_auth_create_request(&ctx, &[0x100]);
+        assert_eq!(hle_np_auth_poll_async(&ctx, &[req, 0x200]), SCE_OK);
+        let mut result = [0u8; 4];
+        assert!(mem.read(0x200, &mut result));
+        assert_eq!(u32::from_le_bytes(result), NP_ERROR_SIGNED_OUT as u32);
+        assert_eq!(hle_np_auth_abort_request(&ctx, &[req]), SCE_OK);
+        assert_eq!(hle_np_auth_delete_request(&ctx, &[req]), SCE_OK);
+        assert_eq!(
+            hle_np_auth_poll_async(&ctx, &[req, 0x200]),
+            NP_AUTH_ERROR_REQUEST_NOT_FOUND
+        );
+        assert_eq!(
+            hle_np_auth_abort_request(&ctx, &[req]),
+            NP_AUTH_ERROR_REQUEST_NOT_FOUND
+        );
+
+        let registry = HleRegistry::new();
+        for function in [
+            "sceNpAuthCreateAsyncRequest",
+            "sceNpAuthAbortRequest",
+            "sceNpAuthPollAsync",
+        ] {
+            assert!(registry.is_implemented("libSceNpAuth", function));
+        }
+    }
+
     /// The authorized-app dialog completes immediately: Open moves the status
     /// to FINISHED, GetStatus/UpdateStatus report it, and GetResult writes a
     /// success result — a title polling the dialog proceeds instead of hanging.
@@ -517,6 +827,109 @@ mod tests {
         assert_eq!(i32::from_le_bytes(r), 0, "result field reports success");
         // A null result pointer is tolerated.
         assert_eq!(hle_auth_dialog_get_result(&ctx, &[0]), SCE_OK);
+    }
+
+    /// The async request lifecycle terminates promptly with the honest
+    /// offline result: create -> check completes it (returning OK because it
+    /// is async) -> poll immediately reports SIGNED_OUT -> delete releases.
+    /// No polling loop can hang and no signed-in state is fabricated.
+    #[test]
+    fn async_np_request_completes_immediately_with_signed_out() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // Param block with a nonzero leading size field.
+        assert!(mem.write(0x100, &16u64.to_le_bytes()));
+        assert_eq!(hle_create_async_request(&ctx, &[0]), ERROR_INVALID_ARGUMENT);
+        // Zero size field -> INVALID_SIZE.
+        assert!(mem.write(0x200, &0u64.to_le_bytes()));
+        assert_eq!(
+            hle_create_async_request(&ctx, &[0x200]),
+            NP_ERROR_INVALID_SIZE
+        );
+
+        let req = hle_create_async_request(&ctx, &[0x100]);
+        assert!(req > 0 && req < 0x8000_0000, "a real request id: {req:#x}");
+
+        // Polling before any check ran is INVALID_ID (shadPS4 rule).
+        assert_eq!(hle_poll_async(&ctx, &[req, 0x300]), NP_ERROR_INVALID_ID);
+
+        // The check completes the async request and returns OK.
+        assert_eq!(hle_check_offline_request(&ctx, &[req, 0x1000_0000]), SCE_OK);
+
+        // Poll now finishes immediately with the offline result.
+        assert_eq!(hle_poll_async(&ctx, &[req, 0x300]), SCE_OK);
+        let mut result = [0u8; 4];
+        assert!(mem.read(0x300, &mut result));
+        assert_eq!(
+            u32::from_le_bytes(result),
+            NP_ERROR_SIGNED_OUT as u32,
+            "the async outcome is the honest offline error"
+        );
+        // Null result pointer refused.
+        assert_eq!(hle_poll_async(&ctx, &[req, 0]), ERROR_INVALID_ARGUMENT);
+
+        assert_eq!(hle_delete_request(&ctx, &[req]), SCE_OK);
+        assert_eq!(hle_delete_request(&ctx, &[req]), NP_ERROR_REQUEST_NOT_FOUND);
+        assert_eq!(
+            hle_poll_async(&ctx, &[req, 0x300]),
+            NP_ERROR_REQUEST_NOT_FOUND
+        );
+    }
+
+    /// Abort marks a pending request; the poll then reports ABORTED, and an
+    /// abort after completion is ignored (OK).
+    #[test]
+    fn abort_request_reports_aborted_through_poll() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x100, &16u64.to_le_bytes()));
+        let req = hle_create_async_request(&ctx, &[0x100]);
+        assert_eq!(hle_abort_request(&ctx, &[req]), SCE_OK);
+        assert_eq!(hle_poll_async(&ctx, &[req, 0x300]), SCE_OK);
+        let mut result = [0u8; 4];
+        assert!(mem.read(0x300, &mut result));
+        assert_eq!(u32::from_le_bytes(result), NP_ERROR_ABORTED as u32);
+        // A check against an aborted request reports ABORTED.
+        assert_eq!(hle_check_offline_request(&ctx, &[req, 0]), NP_ERROR_ABORTED);
+        assert_eq!(hle_delete_request(&ctx, &[req]), SCE_OK);
+        // Unknown ids everywhere -> REQUEST_NOT_FOUND.
+        assert_eq!(
+            hle_abort_request(&ctx, &[0x7FFF]),
+            NP_ERROR_REQUEST_NOT_FOUND
+        );
+        assert_eq!(
+            hle_check_offline_request(&ctx, &[0x7FFF, 0]),
+            NP_ERROR_REQUEST_NOT_FOUND
+        );
+    }
+
+    /// Every measured GTA V libSceNpManager import resolves.
+    #[test]
+    fn measured_np_manager_imports_are_registered() {
+        let registry = HleRegistry::new();
+        for name in [
+            "sceNpCreateAsyncRequest",
+            "sceNpDeleteRequest",
+            "sceNpAbortRequest",
+            "sceNpPollAsync",
+            "sceNpCheckNpReachability",
+            "sceNpCheckPremium",
+            "sceNpGetAccountAge",
+            "sceNpNotifyPremiumFeature",
+            "sceNpRegisterPremiumEventCallback",
+            "sceNpUnregisterPremiumEventCallback",
+        ] {
+            assert!(
+                registry.is_implemented("libSceNpManager", name),
+                "{name} must be registered"
+            );
+        }
     }
 
     #[test]

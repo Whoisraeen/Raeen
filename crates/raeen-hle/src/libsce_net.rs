@@ -64,6 +64,12 @@ pub fn register(registry: &HleRegistry) {
     // network threads import the whole family and would otherwise jump to the
     // unresolved-import stub.
     registry.register("libSceNet", "sceNetSocket", hle_net_socket);
+    registry.register_incomplete(
+        "libSceNet",
+        "sceNetGetSockInfo",
+        hle_net_get_sock_info,
+        "diagnostic socket-info query acknowledged; info layout not modeled",
+    );
     registry.register("libSceNet", "sceNetSocketClose", hle_net_socket_close);
     registry.register("libSceNet", "sceNetBind", hle_net_bind);
     registry.register("libSceNet", "sceNetConnect", hle_net_connect);
@@ -87,6 +93,8 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceNetCtl", "sceNetCtlCheckCallback", hle_ok);
     registry.register("libSceNetCtl", "sceNetCtlRegisterCallback", hle_ok);
     registry.register("libSceNetCtl", "sceNetCtlRegisterCallbackV6", hle_ok);
+    registry.register("libSceNetCtl", "sceNetCtlUnregisterCallback", hle_ok);
+    registry.register("libSceNetCtl", "sceNetCtlGetResult", hle_ctl_get_result);
     registry.register("libSceNet", "sceNetEpollCreate", hle_epoll_create);
     registry.register("libSceNet", "sceNetEpollControl", hle_epoll_control);
     registry.register("libSceNet", "sceNetEpollWait", hle_epoll_wait);
@@ -391,6 +399,21 @@ fn hle_ether_ntostr(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
+/// `sceNetGetSockInfo(id, SceNetSockInfo *info, ...)`: a diagnostics query
+/// (netstat-style). shadPS4 acknowledges it without writing and boots retail
+/// titles; the `SceNetSockInfo` layout is not modeled here, so the same
+/// acknowledge-only behavior is kept and logged once (registered incomplete).
+fn hle_net_get_sock_info(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        debug!(
+            "sceNetGetSockInfo(id={}) -> OK (diagnostic only; info not written)",
+            args.first().copied().unwrap_or(0) as i32
+        );
+    }
+    SCE_OK
+}
+
 /// `sceNetCtlGetState(int *state)`: reports `DISCONNECTED` — no network.
 fn hle_ctl_get_state(ctx: &HleContext, args: &[u64]) -> u64 {
     let state_ptr = args.first().copied().unwrap_or(0);
@@ -401,6 +424,18 @@ fn hle_ctl_get_state(ctx: &HleContext, args: &[u64]) -> u64 {
             .write(state_ptr, &NET_CTL_STATE_DISCONNECTED.to_le_bytes())
     {
         debug!("sceNetCtlGetState: state out-ptr {state_ptr:#x} not writable");
+    }
+    SCE_OK
+}
+
+/// `sceNetCtlGetResult(int eventType, int *errorCode)`: report no error for
+/// the (disconnected) state event — the disconnect is a state, not a failure
+/// code. A null out-pointer is the documented invalid-address error. Matches
+/// shadPS4's `sceNetCtlGetResult` (GPL-2.0, re-derived).
+fn hle_ctl_get_result(ctx: &HleContext, args: &[u64]) -> u64 {
+    let error_ptr = args.get(1).copied().unwrap_or(0);
+    if error_ptr == 0 || !ctx.mem.write(error_ptr, &0i32.to_le_bytes()) {
+        return NET_CTL_ERROR_INVALID_ADDRESS;
     }
     SCE_OK
 }

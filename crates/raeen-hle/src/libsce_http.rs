@@ -21,6 +21,8 @@ use std::sync::atomic::Ordering;
 const OK: u64 = 0;
 const HTTP_ERROR_INVALID_ID: u64 = 0x8043_1100;
 const HTTP_ERROR_INVALID_VALUE: u64 = 0x8043_11FE;
+/// `ORBIS_HTTP_ERROR_OUT_OF_SIZE` (shadPS4 `http_error.h`).
+const HTTP_ERROR_OUT_OF_SIZE: u64 = 0x8043_1104;
 const HTTP2_ERROR_INVALID_ID: u64 = 0x8043_6004;
 const HTTP2_ERROR_INVALID_ARGUMENT: u64 = 0x8043_6016;
 /// `SCE_HTTP2_ERROR_CANNOT_CONNECT` — no host-network backend exists, so a
@@ -41,6 +43,7 @@ pub fn register(registry: &HleRegistry) {
         hle_http_delete_template,
     );
     registry.register("libSceHttp", "sceHttpTerm", hle_http_term);
+    registry.register("libSceHttp", "sceHttpUriEscape", hle_http_uri_escape);
     registry.register("libSceHttp2", "sceHttp2Init", hle_http2_init);
     registry.register(
         "libSceHttp2",
@@ -106,6 +109,74 @@ fn hle_http_term(ctx: &HleContext, args: &[u64]) -> u64 {
     ctx.kernel
         .http_templates
         .retain(|_, owner| *owner != context_id);
+    OK
+}
+
+/// Bound on the input string scanned by [`hle_http_uri_escape`], so a guest
+/// string missing its NUL cannot walk the whole address space.
+const URI_ESCAPE_MAX_INPUT: usize = 64 * 1024;
+
+/// `sceHttpUriEscape(char *out, size_t *require, size_t prepare, const char
+/// *in)` — a REAL implementation (RFC 3986 percent-encoding of everything but
+/// the unreserved set). Purely local string work, no network. Behavior
+/// cross-checked against shadPS4's GPL-2.0 `http.cpp` (re-derived): `require`
+/// receives the needed size including the NUL; a null `out` only computes the
+/// size; an undersized `prepare` is an out-of-size error.
+fn hle_http_uri_escape(ctx: &HleContext, args: &[u64]) -> u64 {
+    let out = args.first().copied().unwrap_or(0);
+    let require = args.get(1).copied().unwrap_or(0);
+    let prepare = args.get(2).copied().unwrap_or(0);
+    let input = args.get(3).copied().unwrap_or(0);
+    if input == 0 {
+        return HTTP_ERROR_INVALID_VALUE;
+    }
+    // Read the guest string, bounded.
+    let mut bytes = Vec::new();
+    let mut cursor = input;
+    loop {
+        let mut chunk = [0u8; 64];
+        if !ctx.mem.read(cursor, &mut chunk) {
+            return HTTP_ERROR_INVALID_VALUE;
+        }
+        if let Some(nul) = chunk.iter().position(|&b| b == 0) {
+            bytes.extend_from_slice(&chunk[..nul]);
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > URI_ESCAPE_MAX_INPUT {
+            return HTTP_ERROR_INVALID_VALUE;
+        }
+        cursor += chunk.len() as u64;
+    }
+    let is_unreserved =
+        |c: u8| c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c == b'.' || c == b'~';
+    let mut escaped = Vec::with_capacity(bytes.len());
+    for &c in &bytes {
+        if is_unreserved(c) {
+            escaped.push(c);
+        } else {
+            escaped.push(b'%');
+            escaped.push(b"0123456789ABCDEF"[usize::from(c >> 4)]);
+            escaped.push(b"0123456789ABCDEF"[usize::from(c & 0xF)]);
+        }
+    }
+    escaped.push(0);
+    if require != 0
+        && !ctx
+            .mem
+            .write(require, &(escaped.len() as u64).to_le_bytes())
+    {
+        return HTTP_ERROR_INVALID_VALUE;
+    }
+    if out == 0 {
+        return OK; // size-query mode
+    }
+    if (prepare as usize) < escaped.len() {
+        return HTTP_ERROR_OUT_OF_SIZE;
+    }
+    if !ctx.mem.write(out, &escaped) {
+        return HTTP_ERROR_INVALID_VALUE;
+    }
     OK
 }
 
@@ -196,6 +267,43 @@ mod tests {
             crate::TestMemory::new(0x10),
             crate::TestAllocator::new(0),
         )
+    }
+
+    /// `sceHttpUriEscape` is a real percent-encoder: unreserved bytes pass,
+    /// everything else becomes `%XX`, `require` reports the size including
+    /// NUL, a null `out` is size-query mode, and an undersized `prepare` is
+    /// an out-of-size error.
+    #[test]
+    fn http_uri_escape_percent_encodes() {
+        use crate::GuestMemory;
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x100, b"a b/c~\0"));
+        // Size query: "a%20b%2Fc~" + NUL = 11.
+        assert_eq!(hle_http_uri_escape(&ctx, &[0, 0x200, 0, 0x100]), OK);
+        let mut req = [0u8; 8];
+        assert!(mem.read(0x200, &mut req));
+        assert_eq!(u64::from_le_bytes(req), 11);
+
+        // Undersized buffer refused.
+        assert_eq!(
+            hle_http_uri_escape(&ctx, &[0x300, 0, 10, 0x100]),
+            HTTP_ERROR_OUT_OF_SIZE
+        );
+        // Correctly sized buffer receives the escaped NUL-terminated string.
+        assert_eq!(hle_http_uri_escape(&ctx, &[0x300, 0, 11, 0x100]), OK);
+        let mut out = [0u8; 11];
+        assert!(mem.read(0x300, &mut out));
+        assert_eq!(&out, b"a%20b%2Fc~\0");
+
+        // Null input string refused.
+        assert_eq!(
+            hle_http_uri_escape(&ctx, &[0x300, 0, 11, 0]),
+            HTTP_ERROR_INVALID_VALUE
+        );
     }
 
     #[test]

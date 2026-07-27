@@ -79,6 +79,11 @@ pub fn register(registry: &HleRegistry) {
         // killed the save worker mid-write, and the world-load then waited
         // forever on a thread that no longer existed.
         registry.register(library, "sceSaveDataSaveIcon", hle_save_icon);
+        // The PS5 `ByPath` variant (measured GTA V import) passes the save
+        // directory path string where the mount-point struct sits in the base
+        // form; `mount_point_arg` reads the same leading "/savedataN" bytes
+        // either way, so the handler is shared.
+        registry.register(library, "sceSaveDataSaveIconByPath", hle_save_icon);
         registry.register(library, "sceSaveDataLoadIcon", hle_load_icon);
         // Mountless per-user "save data memory" blob API.
         registry.register(
