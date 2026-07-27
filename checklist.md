@@ -35,7 +35,12 @@ top-down, update statuses in place, and keep it committed.**
 ## P0 — Critical path (engine)
 
 ### 1. M5 acceptance evaluation + record (Minecraft)
-- [~] IN PROGRESS — delegated to `milestone-driver` agent (worktree), 2026-07-27.
+- [x] DONE 2026-07-27 — **M5 MET** on committed evidence (commit `f56132f`,
+  merged `40396ab`). `docs/m5-acceptance-minecraft.md` written; ledger updated;
+  CLAUDE.md milestone table updated (M4+M5 CLOSED). Evidence: 477 kyty-graphics
+  tests green incl. the d21e727 direct-SGPR gate test + retail-free
+  GCN→validated-SPIR-V chain. All M0–M5 gates now closed — future "milestones"
+  are correctness/breadth (items 2, 16) and stability (item 9).
 - **What:** Evaluate honestly (acceptance-gate skill) whether M5 — "one 3D
   title produces recognizable frames (glitches OK); shader MVP for that
   title" — is already met by the Minecraft evidence (in-world 3D render, real
