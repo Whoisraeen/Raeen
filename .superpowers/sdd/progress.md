@@ -4591,3 +4591,36 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   (external_memory_win32 -> wgpu-hal import), (3) set RAEEN_HOST_GPU_FRAMES
   + GPU plugin passes, (4) PM4 motion-vector/depth extraction (the moat).
   Phases 3-4 gated on M4/M5 titles rendering — no queue jumping.
+
+## 2026-07-27 (late) — Sync starvation fixed; Minecraft reaches IN-WORLD
+* SPIN->PARK (commit eef31c1, fmt ba3c9ce): every contended guest mutex/rwlock
+  wait was a `yield_now()` loop burning a full host core per blocked thread.
+  New `PthreadMutexShared`/`PthreadRwlockShared` pair state with a host
+  condvar; waiters park (bounded 10ms re-check), unlock + owner-death
+  recovery notify. `pthread_once` -> 200us backoff. VideoOut's <=1ms terminal
+  vblank spin deliberately LEFT (edge accuracy, not starvation).
+  MEASURED: in-game CPU all-cores-busy -> 0.42 of 12 cores.
+* MILESTONE EVIDENCE (Minecraft, user-owned retail PS5 title):
+  - Interactive menu, input proven: D-pad moved focus Play->Store->Play,
+    Cross opened the Worlds screen (screenshots in session scratchpad).
+  - Save-data host map WORKS: VFS `/savedata0/ -> savedata\PPS<id>-app\
+    BedrockWorld<...>`; the persisted world lists AND loads.
+  - Actionable logs proven by outcome: the deadlock warning named the exact
+    mutex/owner/waiter that led directly to the fix above.
+  - IN-WORLD REACHED: rendered 3D world with HUD (hearts, hotbar, Emote
+    prompt, trees/water) — was previously stalled at 4 FPS.
+* REMAINING BLOCKER (top priority): a genuine deadlock, NOT spin starvation.
+  In-world the MINECRAFT main thread sits >3s on mutex 0x1019a1d48c0 /
+  0x1019a1d32e0 with frames frozen and only 0.42 cores busy. Needs the
+  holder's HLE call path instrumented (RAEEN_TRACE_HLE + owner name).
+* PM4 register triage: the "143x unknown context register" is 143 DISTINCT
+  registers, one first-sighting log each (already deduped) — mostly per-MRT
+  colour-buffer sub-registers (DCC/CMASK/FMASK/CLEAR_WORD, MRT1-7 blocks).
+  Skipping compression metadata is safe/intentional; MRT1-7 + fast-clear are
+  real but NOT Minecraft blockers. Quiet debt, not an active bug.
+* CI: `.github/workflows/ci.yml` ALREADY runs fmt + clippy -D warnings +
+  workspace tests on windows-latest. Caught a rustfmt violation locally that
+  the AppControl-blocked environment would have missed.
+* NOTE: the parallel Codex session committed most of this session's earlier
+  work (37d0449 plugin ABI v2/GPU frames, d87765a crash reporting+sysinfo,
+  b3e7277 sound packs+memmap, 6a13734 savedata/video sync).
