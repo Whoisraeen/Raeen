@@ -1201,10 +1201,28 @@ mod tests {
         assert_eq!(hle_rwlock_rdlock(&ctx, &[rw]), OK);
         assert_eq!(hle_rwlock_rdlock(&ctx, &[rw]), OK);
         let key = resolve_rwlock_key(&ctx, rw).unwrap();
-        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().state.lock().readers, 2);
+        assert_eq!(
+            kernel
+                .pthread_rwlocks
+                .get(&key)
+                .unwrap()
+                .state
+                .lock()
+                .readers,
+            2
+        );
         assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), OK);
         assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), OK);
-        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().state.lock().readers, 0);
+        assert_eq!(
+            kernel
+                .pthread_rwlocks
+                .get(&key)
+                .unwrap()
+                .state
+                .lock()
+                .readers,
+            0
+        );
         // Unlocking with nothing held → EPERM.
         assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), EPERM);
     }
@@ -1291,13 +1309,28 @@ mod tests {
         // exactly the state its own `Rdlock` would leave: shared count bumped
         // and a per-thread depth recorded.
         const OTHER: u64 = 99;
-        kernel.pthread_rwlocks.get(&key).unwrap().state.lock().readers = 1;
+        kernel
+            .pthread_rwlocks
+            .get(&key)
+            .unwrap()
+            .state
+            .lock()
+            .readers = 1;
         kernel.pthread_rwlock_read_holds.insert((OTHER, key), 1);
 
         // The test thread holds nothing, so its unlock is rejected outright and
         // touches neither the shared count nor thread 99's per-thread hold.
         assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), EPERM);
-        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().state.lock().readers, 1);
+        assert_eq!(
+            kernel
+                .pthread_rwlocks
+                .get(&key)
+                .unwrap()
+                .state
+                .lock()
+                .readers,
+            1
+        );
         assert_eq!(
             *kernel.pthread_rwlock_read_holds.get(&(OTHER, key)).unwrap(),
             1
